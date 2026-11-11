@@ -1,4 +1,223 @@
 {
+  "timeSync": {
+    "title": "Zeit",
+    "loading": "Zeitstatus wird geladen…",
+    "error": "Zeitstatus konnte nicht geladen werden.",
+    "retry": "Erneut versuchen",
+    "unknown": "Unbekannt",
+    "yes": "Ja",
+    "no": "Nein",
+    "site": "Standort",
+    "policy": "Richtlinie",
+    "states": {
+      "not_reported": "Noch keine Zeitdaten — Agent-Update für die Zeitsynchronisierung erforderlich",
+      "unsupported_os": "Auf diesem Betriebssystem noch nicht unterstützt"
+    },
+    "health": {
+      "healthy": "Fehlerfrei",
+      "warning": "Warnung",
+      "critical": "Kritisch",
+      "unknown": "Unbekannt"
+    },
+    "severity": {
+      "critical": "Kritisch",
+      "warning": "Warnung",
+      "info": "Hinweis"
+    },
+    "received": "Empfangen: {{at}}",
+    "collected": "Erfasst: {{at}}",
+    "stale": "Veraltet — der letzte Zeitbericht wurde vor mehr als 90 Minuten empfangen.",
+    "expected": "Erwartet: {{windows}} ({{iana}}), aus {{source}}: {{name}}",
+    "expectedPolicy": "Erwartet: {{windows}} ({{iana}}), aus Richtlinie {{name}} — überschreibt die Zeitzone des Standorts",
+    "managedBadge": "Durch Gruppenrichtlinie verwaltet",
+    "unset": {
+      "site_utc_default": "Keine erwartete Zeitzone (Standort verwendet den UTC-Standard)",
+      "no_site": "Keine erwartete Zeitzone (kein Standort zugewiesen)",
+      "unmapped": "Keine erwartete Zeitzone (für die Zeitzone des Standorts gibt es keine Windows-Zuordnung)"
+    },
+    "noFindings": "Keine Zeitbefunde in diesem Bericht.",
+    "events": "Aktuelle Zeitereignisse ({{count}})",
+    "noEvents": "Keine aktuellen Zeitereignisse.",
+    "eventHeading": "Ereignis {{id}} · Stufe {{level}}",
+    "noMessage": "Keine Ereignismeldung.",
+    "fields": {
+      "source": "Zeitquelle",
+      "sourceKind": "Art der Quelle",
+      "lastSync": "Letzte erfolgreiche Synchronisierung",
+      "method": "Erfassungsmethode",
+      "lastError": "Letzter Synchronisierungsfehler",
+      "stratum": "NTP-Ebene",
+      "poll": "Tatsächliches Abfrageintervall (Sekunden)",
+      "syncType": "Synchronisierungstyp",
+      "ntpServer": "NTP-Serverkonfiguration",
+      "hosts": "Ermittelte NTP-Hosts",
+      "specialPoll": "Spezielles Abfrageintervall (Sekunden)",
+      "serviceState": "Windows-Zeitdienst",
+      "serviceStartType": "Dienststart",
+      "policyManaged": "Durch Gruppenrichtlinie verwaltet",
+      "policyManagedValues": "Gruppenrichtlinienwerte",
+      "hostProvider": "Zeitanbieter des VM-Hosts aktiviert",
+      "joinType": "Beitrittstyp",
+      "role": "Domänenrolle",
+      "domain": "Domäne",
+      "forest": "Gesamtstruktur",
+      "pdc": "PDC",
+      "windowsId": "Aktuelle Windows-Zeitzone",
+      "bias": "Zeitversatz (Minuten)",
+      "autoUpdate": "Automatische Zeitzone"
+    },
+    "values": {
+      "NT5DS": "Domänenhierarchie (NT5DS)",
+      "NTP": "NTP-Gegenstellen",
+      "NoSync": "Keine Synchronisierung",
+      "AllSync": "Alle Quellen",
+      "ntp_peer": "NTP-Gegenstelle",
+      "domain_peer": "Domänengegenstelle",
+      "local_clock": "Lokale Uhr",
+      "free_running": "Freilaufende Uhr",
+      "vm_host": "VM-Host",
+      "unknown": "Unbekannt",
+      "provider_api": "Windows-Anbieter-API",
+      "w32tm_tokens": "Windows-Zeitstatustoken",
+      "events": "Time-Service-Ereignisse",
+      "unavailable": "Nicht verfügbar",
+      "none": "Nicht beigetreten",
+      "workplace": "Am Arbeitsplatz registriert",
+      "azure_ad": "Microsoft Entra beigetreten",
+      "on_prem_ad": "Active Directory beigetreten",
+      "hybrid_azure_ad": "Hybrider Entra-Beitritt",
+      "workgroup": "Arbeitsgruppe",
+      "entra_only": "Nur Entra",
+      "member": "Domänenmitglied",
+      "dc": "Domänencontroller",
+      "pdc_emulator": "PDC-Emulator",
+      "forest_root_pdc_emulator": "PDC-Emulator der Gesamtstruktur-Stammdomäne",
+      "running": "Wird ausgeführt",
+      "stopped": "Beendet",
+      "start_pending": "Wird gestartet",
+      "stop_pending": "Wird beendet",
+      "paused": "Angehalten",
+      "not_installed": "Nicht installiert",
+      "auto": "Automatisch",
+      "delayed_auto": "Automatisch (verzögert)",
+      "manual": "Manuell",
+      "trigger_manual": "Manuell (Triggerstart)",
+      "disabled": "Deaktiviert",
+      "on": "Ein",
+      "off": "Aus"
+    },
+    "findings": {
+      "pdc_no_external_source": {
+        "label": "Der PDC der Gesamtstruktur-Stammdomäne hat keine externe Quelle",
+        "hint": "Legen Sie NTP-Server auf {device} fest — das Gerät ist der PDC der Gesamtstruktur-Stammdomäne, dem alle Domänenmitglieder folgen."
+      },
+      "source_local_clock": {
+        "label": "Lokale Uhr wird verwendet",
+        "hint": "Synchronisiert mit der eigenen Uhr. Konfigurieren Sie eine NTP-Quelle (oder prüfen Sie bei Domänenbeitritt den Domänencontroller)."
+      },
+      "dc_vm_host_sync": {
+        "label": "Domänencontroller synchronisiert mit dem VM-Host",
+        "hint": "Deaktivieren Sie auf diesem Domänencontroller den Zeitanbieter des VM-Hosts."
+      },
+      "ntp_server_unresolvable": {
+        "label": "NTP-Servername ist ungültig oder nicht auflösbar",
+        "hint": "NTP-Server {host} kann nicht aufgelöst werden oder hat keinen gültigen Namen — korrigieren Sie den Namen oder DNS."
+      },
+      "ntp_peer_unreachable": {
+        "label": "NTP-Gegenstelle ist nicht erreichbar",
+        "hint": "Keine Antwort von {source} — prüfen Sie ausgehendes UDP auf Port 123."
+      },
+      "domain_source_unavailable": {
+        "label": "Domänenzeitquelle nicht verfügbar",
+        "hint": "Keine Domänenzeitquelle gefunden — prüfen Sie die Erreichbarkeit des Domänencontrollers."
+      },
+      "member_not_on_hierarchy": {
+        "label": "Domänenhierarchie wird nicht verwendet",
+        "hint": "Der Domäne beigetreten, verwendet jedoch nicht die Domänenhierarchie."
+      },
+      "sync_disabled": {
+        "label": "Zeitsynchronisierung ist deaktiviert",
+        "hint": "Der Windows-Zeitdienst ist deaktiviert."
+      },
+      "sync_stale": {
+        "label": "Keine aktuelle erfolgreiche Synchronisierung",
+        "hint": "Keine erfolgreiche Synchronisierung seit {lastSuccessfulSyncAt}."
+      },
+      "correction_refused": {
+        "label": "Zeitkorrektur wurde abgelehnt",
+        "hint": "Die Uhr weicht zu stark ab, als dass Windows sie selbst korrigieren könnte; synchronisieren Sie erneut oder korrigieren Sie sie manuell."
+      },
+      "timezone_mismatch": {
+        "label": "Zeitzone weicht von der erwarteten Zeitzone ab",
+        "hint": "Die Zeitzone ist {actual}, erwartet wird {expected} (aus {site or policy})."
+      },
+      "policy_not_applied": {
+        "label": "Zeitrichtlinie wurde nicht angewendet",
+        "hint": "Zeitrichtlinie konnte nicht angewendet werden: {error}."
+      },
+      "policy_conflict_gpo": {
+        "label": "Gruppenrichtlinie steuert die Zeiteinstellungen",
+        "hint": "W32Time wird durch Gruppenrichtlinie verwaltet; Breeze ändert die Einstellungen nicht."
+      }
+    },
+    "management": {
+      "title": "Zeitsynchronisierung",
+      "description": "Windows-Zeitrichtlinie und Zeitzoneneinstellungen mit Berücksichtigung der Domäne",
+      "domainRule": "Arbeitsgruppen, reine Entra-Geräte und der PDC der Gesamtstruktur-Stammdomäne verwenden die konfigurierten NTP-Server. Domänenmitglieder, Domänencontroller und andere PDC-Emulatoren verwenden die Domänenhierarchie. Unbekannte Rollen werden übersprungen.",
+      "gpoWins": "Gruppenrichtlinien haben Vorrang. Breeze ändert keine W32Time-Einstellungen, die durch Gruppenrichtlinien verwaltet werden.",
+      "enforceNtp": "Zeitsynchronisierung erzwingen",
+      "ntpServers": "NTP-Server — ein Hostname oder eine IP-Adresse pro Zeile, höchstens 5",
+      "pollInterval": "Abfrageintervall (Minuten, 15–1440)",
+      "expectedTimezone": "Erwartete Zeitzone",
+      "site": "Zeitzone des Standorts übernehmen",
+      "pinned": "Eine Zeitzone festlegen",
+      "pinnedZone": "Festgelegte Zeitzone",
+      "pinOverrides": "Die festgelegte Zeitzone hat Vorrang vor der Zeitzone des Standorts.",
+      "autoFix": "Zeitzone automatisch korrigieren",
+      "invalidServers": "Verwenden Sie höchstens 5 gültige NTP-Hosts ohne Optionen oder Ports. Zum Erzwingen ist mindestens ein Host erforderlich.",
+      "invalidInterval": "Geben Sie eine ganze Zahl zwischen 15 und 1440 ein.",
+      "invalidZone": "Wählen Sie eine Zeitzone mit Windows-Zuordnung.",
+      "policySource": "Aus Richtlinie {{name}} — hat Vorrang vor der Zeitzone des Standorts",
+      "unnamedPolicy": "Unbenannte Richtlinie"
+    },
+    "actions": {
+      "resync": "Erneut synchronisieren",
+      "setTimezone": "Erwartete Zeitzone einstellen",
+      "applyPolicy": "Zeitrichtlinie jetzt anwenden",
+      "bulkResync": "Ausgewählte Geräte erneut synchronisieren",
+      "bulkSetTimezone": "Ausgewählte Geräte auf ihre erwartete Zeitzone einstellen",
+      "queued": "Zeitbefehl eingereiht",
+      "failed": "Zeitbefehl konnte nicht eingereiht werden",
+      "awaiting": "Eingereiht — wartet auf Ausführung",
+      "offline": "Offline eingereiht — läuft nach 1 Stunde ab",
+      "delivered": "Zugestellt — wartet auf Ausführung",
+      "noExpected": "Übersprungen — keine erwartete Zeitzone",
+      "select": "Gerät auswählen",
+      "outcomes": "Befehlsergebnisse",
+      "checking": "Aktuell erwartete Zeitzone wird geprüft"
+    },
+    "enforcement": {
+      "title": "Letztes Ergebnis der Zeitrichtlinie",
+      "none": "Noch kein Durchsetzungsergebnis gemeldet",
+      "ntp": "Zeitsynchronisierung",
+      "timezone": "Zeitzone",
+      "ok": "Angewendet oder bereits konform",
+      "failed": "Fehlgeschlagen",
+      "skipped": "Übersprungen",
+      "before": "Vorher",
+      "after": "Nachher",
+      "reportedAt": "Gemeldet am",
+      "applied": "Angewendet",
+      "already_compliant": "Bereits konform",
+      "role_unknown": "Übersprungen, da die Domänenrolle unbekannt ist",
+      "conflict_gpo": "Übersprungen, da Gruppenrichtlinien Vorrang haben",
+      "readback_mismatch": "Die zurückgelesenen Werte entsprechen nicht der angeforderten Richtlinie",
+      "exec_failed": "Der Windows-Befehl ist fehlgeschlagen",
+      "invalid_settings": "Die Einstellungen waren ungültig",
+      "auto_timezone_on": "Die automatische Zeitzoneneinstellung von Windows ist aktiviert",
+      "no_expected_timezone": "Es ist keine erwartete Zeitzone konfiguriert"
+    }
+  },
   "aiActivity": {
     "title": "KI-Aktivität",
     "count": "{{count}} Aktionen in den letzten {{days}} Tagen ausgelöst",
@@ -73,7 +292,7 @@
     "n30Days": "30 Tagen",
     "n90Days": "90 Tagen",
     "n1Year": "1 Jahr",
-    "afterThisWindowTheDownloadedInstaller": "Nach diesem Zeitraum akzeptieren der heruntergeladene Installer und der freigegebene Link keine neuen Registrierungen mehr. Bereits registrierte Geräte bleiben verbunden.",
+    "afterThisWindowTheDownloadedInstaller": "Nach diesem Zeitraum akzeptieren der heruntergeladene Installer und der freigegebene Link keine neuen Registrierungen mehr. Ein heruntergeladener Installer funktioniert höchstens 30 Tage, und jeder Download über den freigegebenen Link enthält ein Token, das bis zu 30 Tage gültig ist. Bereits registrierte Geräte bleiben verbunden.",
     "generatingInstaller": "Installer wird generiert...",
     "downloaded": "Heruntergeladen",
     "generatingLink": "Link wird generiert...",
@@ -99,6 +318,15 @@
     "generatingToken": "Token wird generiert...",
     "multiFactorAuthenticationIsRequiredTo3": "Zum Generieren von Installationstokens ist eine Multi-Faktor-Authentifizierung erforderlich.",
     "generateNewToken": "Neues Token generieren",
+    "generateNewLink": "Neuen Link generieren",
+    "cliTokenReuse": "Zuvor generiert. Gültig bis {{date}}, sofern nicht alle Geräteregistrierungen bereits verwendet wurden.",
+    "cliTokenReuseVerified": "Zuvor generiert. Gültig bis {{date}}.",
+    "linkReuse": "Zuvor für {{platform}} generiert. Gültig bis {{date}}.",
+    "generateToken": "Token generieren",
+    "cliTokenNotGenerated": "Noch kein Token. Wählen Sie Standort, Anzahl der Geräte und Ablauf aus und generieren Sie dann ein Token. Jedes Token ist ein aktiver Registrierungsschlüssel.",
+    "cliCommandNeedsToken": "Generieren Sie zuerst ein Token. Der Installationsbefehl erscheint hier, sobald ein Token vorhanden ist – bis dahin gibt es nichts auszuführen.",
+    "copyCommand": "Befehl kopieren",
+    "cliTokenSite": "Mit diesem Token registrierte Geräte werden {{site}} zugeordnet.",
     "singleUseValidForOneDevice": "Einmalige Verwendung — gültig für ein Gerät. Für jedes weitere Gerät ein neues Token generieren.",
     "linux": "Linux",
     "windows2": "Windows",
@@ -130,25 +358,28 @@
     "currentSite": "Aktueller Standort",
     "newSite": "Neuer Standort",
     "loadingSites": "Standorte werden geladen...",
-    "thisOrganizationOnlyHasOneSite": "Diese Organisation hat nur einen Standort. Unter Einstellungen → Organisationen weitere Standorte hinzufügen, um Verschiebungen zu ermöglichen.",
+    "thisOrganizationOnlyHasOneSite": "Diese Organisation hat nur einen Standort. Auf der Registerkarte „Standorte“ der Organisation (Organisationen → Organisation öffnen → Standorte) weitere Standorte hinzufügen, um Verschiebungen zu ermöglichen.",
     "current": "(aktuell)",
     "cancel": "Abbrechen",
-    "moving": "Wird verschoben..."
-  },
-  "createGroupModal": {
-    "failedToCreateGroup": "Gruppe konnte nicht erstellt werden",
-    "newDeviceGroup": "Neue Gerätegruppe",
-    "name": "Name",
-    "eGProductionServers": "z. B. Produktionsserver",
-    "type": "Typ",
-    "static": "Statisch",
-    "dynamic": "Dynamisch",
-    "manuallyAddAndRemoveDevicesAfter": "Geräte nach der Erstellung manuell hinzufügen und entfernen.",
-    "devicesAreAutoAssignedBasedOn": "Geräte werden anhand von Filterregeln automatisch zugewiesen.",
-    "filterRules": "Filterregeln",
-    "cancel": "Abbrechen",
-    "creating": "Wird erstellt...",
-    "createGroup": "Gruppe erstellen"
+    "moving": "Wird verschoben...",
+    "toADifferentSite": "an einen anderen Standort.",
+    "deviceMovedByOther": "Dieses Gerät wurde von jemand anderem verschoben – laden Sie die Seite neu, um den aktuellen Standort zu sehen",
+    "policyNote": "Durch das Verschieben ändern sich die Konfigurationsrichtlinien, Wartungsfenster, Alarmweiterleitung und Berichte des Standorts, die für {{device}} gelten. Breeze verschiebt es nicht automatisch zurück.",
+    "bulkIntro": "{{count}} ausgewählte Geräte an einen anderen Standort innerhalb von {{org}} verschieben.",
+    "bulkIntro_one": "{{count}} ausgewähltes Gerät an einen anderen Standort innerhalb von {{org}} verschieben.",
+    "bulkIntro_other": "{{count}} ausgewählte Geräte an einen anderen Standort innerhalb von {{org}} verschieben.",
+    "bulkIntroNoOrg": "{{count}} ausgewählte Geräte an einen anderen Standort verschieben.",
+    "bulkIntroNoOrg_one": "{{count}} ausgewähltes Gerät an einen anderen Standort verschieben.",
+    "bulkIntroNoOrg_other": "{{count}} ausgewählte Geräte an einen anderen Standort verschieben.",
+    "devicesFromSites": "{{count}} Geräte von {{siteCount}} Standorten",
+    "devicesFromSites_one": "{{count}} Gerät von {{siteCount}} Standorten",
+    "devicesFromSites_other": "{{count}} Geräte von {{siteCount}} Standorten",
+    "selectSite": "Standort auswählen",
+    "moveDevices": "{{count}} Geräte verschieben",
+    "moveDevices_one": "{{count}} Gerät verschieben",
+    "moveDevices_other": "{{count}} Geräte verschieben",
+    "bulkPolicyNote": "Durch das Verschieben ändern sich die Konfigurationsrichtlinien, Wartungsfenster, Alarmweiterleitung und Berichte des Standorts, die für diese Geräte gelten. Breeze verschiebt sie nicht automatisch zurück.",
+    "failedToMoveDevices": "Geräte konnten nicht verschoben werden"
   },
   "decommissionedHiddenHint": {
     "label": "{{count}} Entfernte ausgeblendet",
@@ -157,6 +388,7 @@
     "hide": "ausblenden"
   },
   "deviceActions": {
+    "moreActions": "Weitere Aktionen",
     "unavailable": {
       "offline": "Gerät ist offline",
       "maintenance": "Gerät befindet sich im Wartungsmodus",
@@ -202,6 +434,18 @@
         "message": "{{hostname}} entfernen? Das Gerät wird aus Ihrer aktiven Flotte genommen und nicht mehr überwacht. Der Verlauf bleibt erhalten, und Sie können es später wiederherstellen.",
         "confirm": "Entfernen"
       },
+      "forcePermanentDelete": {
+        "confirm": "Trotzdem löschen",
+        "reason": {
+          "agentReturned": "Eine Deinstallation wurde zuvor abgeschlossen, aber der Agent hat sich seitdem wieder gemeldet (er wurde neu installiert).",
+          "cancelled": "Die Agent-Deinstallation wurde abgebrochen, bevor sie ausgeführt wurde.",
+          "expired": "Der Agent hat die Deinstallation vor Ablauf der Frist nie abgeholt.",
+          "failed": "Der Deinstallationsbefehl wurde auf dem Gerät ausgeführt, meldete aber einen Fehler.",
+          "none": "Für dieses Gerät wurde keine Agent-Deinstallation eingeplant (es wurde entfernt und der Agent blieb installiert)."
+        },
+        "risk": "Wenn Sie {{hostname}} jetzt löschen, kann der Agent installiert und aktiv bleiben, ohne dass ihn jemand verwaltet. Dies kann nicht rückgängig gemacht werden.",
+        "title": "Der Agent hat die Entfernung nicht bestätigt"
+      },
       "permanentDelete": {
         "title": "{{hostname}} endgültig löschen?",
         "message": "Damit wird der gesamte Verlauf dieses Geräts gelöscht — Tickets, Alarme, Patch- und Backup-Datensätze. Dies kann nicht rückgängig gemacht werden.",
@@ -216,6 +460,14 @@
         "title": "Homebrew installieren",
         "message": "Installiert Homebrew als der aktuell angemeldete Benutzer mit einer fest gepinnten, per Prüfsumme verifizierten Kopie des offiziellen Installationsprogramms. Erfordert eine Konsolensitzung mit Administratorrechten und eine aktive oder kennwortlose sudo-Berechtigung; andernfalls schlägt die Installation fehl und der Fehler wird zurückgemeldet.",
         "confirm": "Homebrew installieren"
+      },
+      "restartAgent": {
+        "title": "Breeze-Agent neu starten?",
+        "message": "Den Watchdog auf {{hostname}} anweisen, den Breeze-Agent-Dienst neu zu starten. Der Watchdog übernimmt das beim nächsten Check-in, meist innerhalb einer Minute, und meldet sich nur, solange der Agent nicht läuft.",
+        "watchdogLastSeen": "Letzte Meldung des Watchdogs: {{date}}.",
+        "watchdogStale": "Der Watchdog hat sich zuletzt {{date}} gemeldet, zu lange her, um die Anfrage anzunehmen; sie wird abgelehnt, bis er sich wieder meldet.",
+        "watchdogNeverSeen": "Der Watchdog hat sich noch nicht gemeldet; die Anfrage wird abgelehnt, bis er sich meldet.",
+        "confirm": "Agent neu starten"
       },
       "bulkDeleteManual": {
         "title": "{{count}} manuelle Assets löschen?",
@@ -246,9 +498,13 @@
     },
     "runScript": "Skript ausführen",
     "remoteTools": "Remote-Tools",
-    "reRunAgentInventoryCollectorsSo": "Bestandsdatenerfassung des Agents erneut ausführen, damit die Benutzeroberfläche aktuelle Hardware-, Software- und Netzwerkdaten erhält, ohne auf den nächsten Heartbeat-Zyklus zu warten",
+    "reRunAgentInventoryCollectorsSo": "Bestandsdaten jetzt neu erfassen",
     "refresh": "Aktualisieren",
     "reboot": "Neu starten",
+    "forceRebootNow": "Jetzt erzwungen neu starten",
+    "forceRebootHint": "Sofort neu starten und laufende Apps schließen. Nicht gespeicherte Arbeit geht verloren.",
+    "forceRebootAgentUpgradeRequired": "Agent-Update erforderlich: Der erzwungene Neustart benötigt Agent {{version}} oder neuer",
+    "forceRebootQueued": "Erzwungener Neustart für {{hostname}} in die Warteschlange gestellt. Er läuft, sobald auf dem Gerät nichts anderes mehr läuft.",
     "wake": "Aufwecken",
     "rebootToSafeMode": "Im abgesicherten Modus neu starten",
     "deploySoftware": "Software bereitstellen",
@@ -264,7 +520,11 @@
     "power": "Energie",
     "shutdown": "Herunterfahren",
     "deviceSettings": "Geräteeinstellungen",
-    "installHomebrew": "Homebrew installieren"
+    "installHomebrew": "Homebrew installieren",
+    "restartAgent": "Agent neu starten",
+    "runVendorUpdates": "Herstellerupdates ausführen",
+    "runVendorUpdatesHint": "Führt das Update-Tool des Herstellers auf diesem Gerät aus.",
+    "runVendorUpdatesAgentUpgradeRequired": "Agent-Upgrade erforderlich: Herstellerupdates benötigen Agent {{version}} oder neuer"
   },
   "deviceActivityFeed": {
     "activity": "Aktivität",
@@ -334,6 +594,7 @@
     "metricAnomalies": "Metrische Anomalien",
     "anomalyDetectionIsDisabledForThis": "Die Anomalieerkennung ist für diese Organisation deaktiviert.",
     "anomalyDetectionDisabled": "Anomalieerkennung deaktiviert",
+    "anomalyDetectionDisabledHint": "Aktiviere sie in den <orgLink>Organisationseinstellungen</orgLink> → KI.",
     "showingTheLinkedAnomalyAndRecent": "Zeigt die verknüpfte Anomalie und den aktuellen Anomalieverlauf an",
     "openSignalsDetectedFromMetricRollups": "Aus Metrik-Rollups erkannte offene Signale",
     "refreshAnomalies": "Anomalien aktualisieren",
@@ -350,7 +611,51 @@
     "confidence": "Vertrauen",
     "dismiss": "Schließen",
     "resolve": "Lösen",
-    "promote": "Fördern"
+    "promote": "Fördern",
+    "filterOpen": "Offen",
+    "filterRecentlyClosed": "Kürzlich geschlossen",
+    "filterAll": "Alle",
+    "showRecentlyClosed": "Kürzlich geschlossene anzeigen",
+    "couldNotUpdateEpisode": "Anomalie konnte nicht aktualisiert werden",
+    "episodeDismissed": "7 Tage lang verworfen",
+    "episodeResolved": "Anomalie behoben",
+    "episodePromoted": "Anomalie zu Alarm hochgestuft",
+    "snoozeStopped": "Stummschaltung beendet",
+    "dismissFor7Days": "7 Tage verwerfen",
+    "promoteToAlert": "Zu Alarm hochstufen",
+    "stopSnoozing": "Stummschaltung beenden",
+    "ongoingSince": "Andauernd seit {{when}}",
+    "recurrenceNth": "{{nth}} Mal in 7 Tagen",
+    "dismissedSnoozedUntil": "Verworfen · stummgeschaltet bis {{when}}",
+    "detectionsCount": "{{count}} Erkennungen",
+    "closeReason": {
+      "cleared": "behoben",
+      "expiredOffline": "abgelaufen: Gerät nicht gesehen",
+      "expiredNoData": "abgelaufen: keine Daten für diese Metrik",
+      "expiredOfflineSince": "abgelaufen: Gerät nicht gesehen seit {{when}}",
+      "detectionOff": "geschlossen: Erkennung deaktiviert",
+      "user": "aufgelöst",
+      "userDismissed": "verworfen",
+      "snoozed": "stummgeschaltet"
+    },
+    "processDetailNotAvailable": "Prozessdetails für diese Metrik nicht verfügbar.",
+    "topByAtPeak": "Top nach {{dimension}} beim Höchstwert: {{list}}",
+    "sentence": {
+      "spike": "{{metric}} lag {{duration}} lang bei {{range}}, normal {{baseline}}.",
+      "processMax": "Ein Prozess erreichte {{value}}, normal {{baseline}}.",
+      "processSum": "Die Top-Prozesse zusammen nutzten {{value}}, normal {{baseline}}.",
+      "drop": "{{metric}} fiel {{duration}} lang auf {{value}}, normal {{baseline}}.",
+      "growth": "{{metric}} stieg über {{duration}} von {{from}} auf {{to}}."
+    },
+    "membersColumns": {
+      "window": "Zeitfenster",
+      "metric": "Metrik",
+      "score": "Punktzahl"
+    },
+    "membersTruncated": "Die ersten {{count}} Erkennungen werden angezeigt.",
+    "failedToLoadDetections": "Erkennungen konnten nicht geladen werden",
+    "legacyDetectionNote": "Diese Erkennung stammt aus der Zeit vor der Episodengruppierung.",
+    "v1ShadowPerEpisodeNote": "Diese Episode wird zum Vergleich auch vom v1-Schattenmodell bewertet."
   },
   "deviceBillingCard": {
     "title": "Abrechnung",
@@ -557,7 +862,8 @@
       "generated": "Generiert",
       "noSoftwareData": "Keine Softwaredaten",
       "configuration": "Konfiguration"
-    }
+    },
+    "timeRangeSelectLabel": "Zeitraum"
   },
   "deviceComplianceTab": {
     "failedToLoadComplianceStatus": "Der Konformitätsstatus konnte nicht geladen werden",
@@ -591,7 +897,15 @@
     "loadingDevice": "Gerät wird geladen...",
     "backToDevices": "Zurück zu den Geräten",
     "goBack": "Zurück",
-    "devices": "Geräte"
+    "devices": "Geräte",
+    "devicesCrumbOtherOrg": "Öffnet den Tab „Geräte“ von {{deviceOrg}}; Ihre Arbeitsorganisation bleibt {{workingOrg}}",
+    "devicesCrumbOtherOrgUnnamed": "Öffnet den Tab „Geräte“ von {{deviceOrg}}; Ihre Arbeitsorganisation ändert sich nicht",
+    "switchOrgFailed": "Organisation konnte nicht gewechselt werden. Bitte erneut versuchen.",
+    "restartAgent": {
+      "queued": "Neustart des Agents für {{hostname}} angefordert. Der Watchdog führt ihn beim nächsten Check-in aus.",
+      "alreadyPending": "Für {{hostname}} wartet bereits ein Agent-Neustart auf den Watchdog.",
+      "failed": "Neustart des Agents für {{hostname}} konnte nicht angefordert werden"
+    }
   },
   "deviceDetails": {
     "overview": "Übersicht",
@@ -640,12 +954,15 @@
     "changeHistoryTitle": "Erfasste Konfigurations- und Inventaränderungen für dieses Gerät",
     "diskCleanup": "Datenträgerbereinigung",
     "diskUsageAnalysisAndCleanup": "Analyse und Bereinigung der Festplattennutzung",
-    "bootPerf": "Boot-Perf",
+    "bootPerf": "Startleistung",
+    "systemRestore": "Systemwiederherstellung",
     "startupTimeAndBootProcessAnalysis": "Analyse der Startzeit und des Bootvorgangs",
     "backup": "Sicherung",
     "backupStatusJobsSnapshotsAndVerification": "Sicherungsstatus, Jobs, Snapshots und Überprüfung",
     "theOsReportsAPendingReboot": "Das Betriebssystem meldet einen ausstehenden Neustart (Markierungen für Windows-Registrierung/Linux-Neustart erforderlich).",
     "rebootPending": "Neustart steht aus",
+    "backupRunning": "Sicherung läuft",
+    "backupRunningTooltip": "Auf diesem Gerät läuft eine Sicherung. Den Fortschritt sehen Sie auf der Registerkarte „Sicherung“.",
     "restartScheduled": "Neustart geplant",
     "restartInProgress": "Wird neu gestartet",
     "restartScheduledFor": "Neustart geplant für {{time}}",
@@ -656,6 +973,7 @@
     "restartCannotBePostponed": "Kann nicht verschoben werden",
     "restartSourcePatchJob": "Angefordert durch eine Patch-Installation",
     "restartSourceMaintenanceWindow": "Angefordert durch ein Wartungsfenster",
+    "restartSourceOemUpdates": "Angefordert durch einen Herstellerupdate-Lauf",
     "restartSourceManual": "Angefordert durch einen Techniker",
     "restartSourceUnknown": "Geplanter Neustart",
     "agentV": "Agent v",
@@ -666,14 +984,22 @@
     "strip": "Streifen",
     "networkAsset": "Netzwerk-Asset",
     "networkAssets": "Netzwerk-Assets",
-    "operatorTasks": "Operator-Aufgaben",
-    "operatorTasksForThisDevice": "KI-Operator-Aufgaben für dieses Gerät",
+    "operatorTasks": "KI-Aufgaben",
+    "operatorTasksForThisDevice": "KI-Aufgaben für dieses Gerät",
     "tabGroups": {
       "monitoring": "Überwachung",
       "inventory": "Inventar",
       "management": "Verwaltung",
       "history": "Verlauf & Netzwerk",
       "extensions": "Erweiterungen"
+    },
+    "workloads": "Workloads",
+    "workloadsTitle": "Container und virtuelle Maschinen auf diesem Host",
+    "offlineLastSeen": "Offline · zuletzt gesehen {{ago}}",
+    "locatedIn": "bei <org/> › <site/>",
+    "scopeCue": {
+      "viewing": "Sie sehen ein Gerät von {{org}}",
+      "switch": "Zu {{org}} wechseln"
     }
   },
   "deviceEdrPanel": {
@@ -697,7 +1023,9 @@
     "sentineloneWillCutTheDeviceOff": "SentinelOne trennt das Gerät vom Netzwerk, bis Sie die Isolierung aufheben. Aktive Sitzungen werden gelöscht.",
     "sentineloneWillRestoreThisDeviceS": "SentinelOne stellt die Netzwerkkonnektivität dieses Geräts wieder her.",
     "cancel": "Abbrechen",
-    "isolate": "Isolieren"
+    "isolate": "Isolieren",
+    "managedSecurityAgents": "Verwaltete Sicherheits-Agents",
+    "since": "Seit {{date}}"
   },
   "deviceEffectiveConfigTab": {
     "loadingEffectiveConfiguration": "Effektive Konfiguration wird geladen...",
@@ -724,7 +1052,18 @@
     "level": "Ebene",
     "policy2": "Richtlinie",
     "features": "Funktionen",
-    "inheritedFrom": "Geerbt von {{name}}"
+    "inheritedFrom": "Geerbt von {{name}}",
+    "patchApproval": {
+      "label": "Genehmigung",
+      "byRing": "durch den verknüpften Update-Ring festgelegt",
+      "manualOnly": "nur manuelle Genehmigungen (kein Update-Ring verknüpft)"
+    },
+    "containment": {
+      "extraDestinations": "Zusätzliche Ziele während der Isolierung",
+      "invalid": "Die Eindämmungseinstellungen dieser Richtlinie sind ungültig. Bei der Isolierung gelten daher die festen Standardwerte ohne zusätzliche Ziele."
+    },
+    "chainResolutionRule": "Zuerst entscheidet die Ebene: Gerät vor Gerätegruppe, dann Standort, Organisation und Partner. Die Priorität (niedrigere Zahl gewinnt) entscheidet nur zwischen Richtlinien auf derselben Ebene. Durchgestrichene Funktionen wurden von einer näheren Richtlinie überschrieben.",
+    "featureOverriddenBy": "Überschrieben von {{policy}}"
   },
   "deviceEventLogViewer": {
     "failedToFetchActivities": "Aktivitäten konnten nicht abgerufen werden",
@@ -800,6 +1139,7 @@
     }
   },
   "deviceFilesystemTab": {
+    "deviceIsOfflineScansRequireAConnectedAgent": "Gerät ist offline. Scans erfordern einen verbundenen Agenten.",
     "resultPartial": "Teilweise abgeschlossen",
     "resultSkippedLinks": "Übersprungene Links: {{count}}",
     "errorAgentUpdateRequired": "Aktualisieren Sie den Agenten auf Version {{minAgentVersion}} oder neuer, um die Bereinigung auszuführen.",
@@ -884,6 +1224,7 @@
     "clearCategory": "Auswahl aufheben",
     "columnPath": "Pfad",
     "columnSize": "Größe",
+    "selectionLimit": "Ein einzelner Bereinigungslauf kann höchstens {{max}} Elemente löschen. „Alle auswählen“ füllt die Auswahl bis zu diesem Limit auf, die größten zuerst. Löschen Sie diese und führen Sie die Bereinigungsvorschau erneut aus, um den Rest zu bearbeiten.",
     "selectionSummary": "{{count}} ausgewählt · {{size}}",
     "executeSelected": "Auswahl löschen ({{count}})",
     "confirmTitle": "Bereinigungsziele endgültig löschen",
@@ -908,7 +1249,10 @@
     "historyKindFiles": "Dateibereinigung",
     "historyKindSystem": "Systembereinigung",
     "historyReclaimed": "{{size}} freigegeben",
-    "historyCandidates": "{{count}} Kandidaten",
+    "historyCandidates_one": "{{count}} Kandidat",
+    "historyCandidates_other": "{{count}} Kandidaten",
+    "historyActions_one": "{{count}} Aktion",
+    "historyActions_other": "{{count}} Aktionen",
     "status": {
       "previewed": "Vorschau",
       "running": "Läuft",
@@ -922,6 +1266,8 @@
   "deviceFilterToolbar": {
     "searchDevices": "Geräte suchen",
     "quickFilters": "Schnellfilter",
+    "scrollChipsLeft": "Filter nach links scrollen",
+    "scrollChipsRight": "Filter nach rechts scrollen",
     "addFilter": "Filter hinzufügen",
     "advanced": "Erweitert",
     "clear": "Zurücksetzen"
@@ -952,6 +1298,12 @@
     "quotedByQuotes": "Diese Gruppe wird von {{count}} offenen Angebot(en) bepreist: {{names}}. Entfernen Sie zuerst diese Angebotspositionen.",
     "quotedByQuotesCount": "Diese Gruppe wird von {{count}} offenen Angebot(en) bepreist. Entfernen Sie zuerst diese Angebotspositionen.",
     "failedToRunScriptOnGroups": "Das Skript konnte nicht für Gruppen ausgeführt werden",
+    "bulkScriptMembershipFailed": "Die Geräte der Gruppe {{group}} konnten nicht geladen werden",
+    "bulkScriptNoDevices": "Die ausgewählten Gruppen enthalten keine Geräte, auf denen Sie ein Skript ausführen können.",
+    "bulkScriptTooManyDevices": "Die ausgewählten Gruppen enthalten {{count}} Geräte; ein Skript kann auf höchstens {{max}} gleichzeitig ausgeführt werden. Wählen Sie weniger Gruppen aus.",
+    "bulkScriptNoneQueued": "Das Skript wurde auf keinem Gerät eingereiht ({{reasons}}).",
+    "bulkScriptPartiallyQueued": "{{admitted}} von {{total}} Geräten eingereiht; {{refused}} nicht zugelassen ({{reasons}}).",
+    "bulkScriptQueued": "{{script}} auf {{count}} Gerät(en) eingereiht.",
     "failedToApplyPolicyToGroups": "Die Richtlinie konnte nicht auf Gruppen angewendet werden",
     "failedToMoveDevice": "Gerät konnte nicht verschoben werden",
     "loadingGroupMembership": "Gruppenmitgliedschaft wird geladen...",
@@ -971,6 +1323,7 @@
     "noDeviceGroupsYetCreateOne": "Noch keine Gerätegruppen. Erstellen Sie eine, um mit der Organisation von Geräten zu beginnen.",
     "createYourFirstGroup": "Erstellen Sie Ihre erste Gruppe",
     "selectAllGroups": "Wählen Sie alle Gruppen aus",
+    "selectGroup": "Gruppe {{name}} auswählen",
     "dynamic": "Dynamisch",
     "static": "Statisch",
     "device": "Gerät",
@@ -1019,7 +1372,14 @@
     "assignAPolicyTo": "Weisen Sie eine Richtlinie zu",
     "policy2": "Richtlinie",
     "selectAPolicy": "Wählen Sie eine Richtlinie aus",
-    "applying": "Wird angewendet..."
+    "applying": "Wird angewendet...",
+    "ownerFilterAll": "Alle Gruppen",
+    "ownerFilterOrganization": "Organisationsgruppen",
+    "ownerFilterPartner": "Alle Org.",
+    "noGroupsMatchFilter": "Keine Gruppen entsprechen diesem Filter.",
+    "managedByPartner": "Von Ihrem Dienstleister verwaltet. Mitgliedschaftsregeln werden nicht angezeigt; Sie sehen die Geräte Ihrer Organisation.",
+    "partnerDynamicType": "Dynamisch · Alle Org.",
+    "partnerDeleteWarning": "Dadurch wird die Gruppe aus allen Organisationen entfernt und ihre Richtlinienzuweisungen werden gelöscht."
   },
   "deviceHardwareInventory": {
     "failedToFetchHardwareInventory": "Das Abrufen des Hardwareinventars ist fehlgeschlagen",
@@ -1035,6 +1395,7 @@
     "drive": "Laufwerk",
     "size": "Größe",
     "used": "Verwendet",
+    "usedPercent": "Belegt %",
     "health": "Zustand",
     "noDiskInventoryReported": "Kein Festplatteninventar gemeldet.",
     "networkAdapters": "Netzwerkadapter",
@@ -1043,9 +1404,95 @@
     "primary": "Primär",
     "ipAddress": "IP-Adresse",
     "macAddress": "MAC Adresse",
-    "linkSpeed": "Verbindungsgeschwindigkeit"
+    "linkSpeed": "Verbindungsgeschwindigkeit",
+    "memorySlotsUsed": "{{used}} von {{total}} Steckplätzen belegt",
+    "memorySpeedConfigured": "{{speed}} (konfiguriert)",
+    "memorySpeedRated": "{{speed}} (Nennwert)",
+    "onPackageMemory": "Im Prozessorgehäuse verbauter Arbeitsspeicher",
+    "memoryModules": "Speichermodule",
+    "memoryNotReported": "Noch nicht gemeldet – Agent-Update erforderlich",
+    "noMemoryModulesReported": "Keine Speichermodule gemeldet.",
+    "memoryModulesOnPackage": "Der Speicher ist im Gehäuse verlötet (On-Package) — es gibt keine austauschbaren Steckplätze zu melden.",
+    "memoryMaxCapacity": "Maximal unterstützte Kapazität: {{capacity}}",
+    "slot": "Steckplatz",
+    "capacity": "Kapazität",
+    "memoryType": "Typ",
+    "speed": "Geschwindigkeit",
+    "manufacturer": "Hersteller",
+    "partNumber": "Teilenummer",
+    "serialNumber": "Seriennummer",
+    "emptySlot": "Leer",
+    "ratedSpeed": "Nennwert {{speed}}"
   },
   "deviceInfoTab": {
+    "updateStuck": "Das Agent-Update auf {{target}} scheint festzuhängen: {{attempts}} Versuche seit {{since}}, und das Gerät ist noch auf seiner alten Version. Der Updater versucht es bei jedem Heartbeat erneut; prüfen Sie die Agent-Protokolle oder das Gerät selbst, falls es keine sendet.",
+    "updateOfferWithheld": "Update-Angebote werden für dieses Gerät zurückgehalten (seit {{since}}): Es lässt sich nicht bestätigen, dass der Agent-Build die von diesem Server bereitgestellte Edition akzeptiert, daher bleibt er auf seiner aktuellen Version. Stellen Sie ihn mit einem Installer der bereitgestellten Edition oder einem Agent-Release wieder her, das seine Edition meldet.",
+    "helperInstallIssue": {
+      "awaitingServerOffer": "Breeze Assist ist aktiviert, aber nicht installiert (seit {{since}}): Der Server hat diesem Gerät keine Breeze-Assist-Version zur Installation angeboten, daher bleibt es ohne Installation. Prüfen Sie, ob für die Plattform dieses Geräts ein Breeze-Assist-Build veröffentlicht ist.",
+      "installAbandoned": "Breeze Assist ist aktiviert, aber nicht installiert (seit {{since}}): Die Installation der angebotenen Version ist wiederholt fehlgeschlagen, daher hat der Agent weitere Versuche pausiert. Er versucht es nach einigen Stunden oder bei einer neueren Version erneut; der Installationsfehler steht im Agent-Log.",
+      "webview2Outdated": "Breeze Assist ist installiert, wird vom Agent aber nicht gestartet (seit {{since}}): Die WebView2 Runtime dieses Geräts ist älter, als Breeze Assist benötigt. Bis die WebView2 Runtime aktualisiert ist, erscheinen Abfragen als Standard-Windows-Dialoge. Das Agent-Log nennt die gefundene Version.",
+      "crashLoop": "Breeze Assist wurde direkt nach dem Start immer wieder beendet (seit {{since}}), daher startet der Agent es nicht mehr neu. Er versucht es nach 6 Stunden erneut oder sobald eine neue Breeze-Assist-Version installiert ist. Die Exit-Codes stehen im Agent-Log.",
+      "unmanagedInstall": "Breeze Assist wurde auf diesem Gerät nicht von Breeze installiert (seit {{since}}). In der Richtlinie dieses Geräts ist die Bereitstellung aus, daher lässt der Agent diese Installation unverändert: Er startet, aktualisiert und entfernt sie nicht. Schalten Sie die Bereitstellung ein, damit der Agent sie verwaltet.",
+      "unknown": "Breeze Assist ist aktiviert, aber nicht installiert (seit {{since}})."
+    },
+    "assistStatus": {
+      "label": "Breeze Assist",
+      "installed": "Installiert",
+      "unavailable": "Nicht verfügbar: {{reason}}",
+      "notDeployed": "Nicht bereitgestellt",
+      "reason": {
+        "webview2Outdated": "WebView2 Runtime zu alt",
+        "crashLoop": "wird immer wieder beendet",
+        "unmanagedInstall": "nicht von Breeze installiert",
+        "awaitingServerOffer": "noch nicht installiert",
+        "installAbandoned": "Installation fehlgeschlagen",
+        "unknown": "siehe Agent-Log"
+      }
+    },
+    "watchdogInstall": {
+      "gaveUp": "Der Watchdog konnte nicht automatisch installiert werden (seit {{since}}): {{reason}}. Führen Sie zum erneuten Versuch <code>breeze-agent service install --watchdog</code> auf dem Host aus.",
+      "unsupported": "Die automatische Watchdog-Installation wird auf diesem Host nicht unterstützt (seit {{since}}).",
+      "reason": {
+        "network": "der Download war nicht erreichbar",
+        "server": "der Server hat den Download abgelehnt",
+        "policy": "der Download wurde durch die Netzwerkrichtlinie blockiert",
+        "signature": "die Signaturprüfung des heruntergeladenen Watchdogs ist fehlgeschlagen",
+        "checksum": "die Integritätsprüfung des heruntergeladenen Watchdogs ist fehlgeschlagen",
+        "devBuild": "dies ist ein Entwicklungs-Build",
+        "unsupportedOs": "dieses Betriebssystem wird nicht unterstützt",
+        "installCmd": "der Installationsbefehl ist fehlgeschlagen",
+        "locked": "eine andere Installation lief bereits",
+        "unknown": "ein unbekannter Fehler ist aufgetreten"
+      }
+    },
+    "logShipping": {
+      "label": "Log-Übertragung",
+      "state": {
+        "healthy": "In Ordnung",
+        "quiet": "Ruhig",
+        "failing": "Fehlerhaft"
+      },
+      "tooltip": {
+        "healthy": "Der Agent überträgt seine Logs normal.",
+        "quiet": "Der Agent hat zuletzt keine Übertragungsversuche unternommen, daher gibt es nichts zu melden.",
+        "failing": "Log-Übertragungen schlagen seit {{since}} fehl. Grund: {{reason}}"
+      },
+      "reason": {
+        "http": "Der Server hat HTTP {{status}} zurückgegeben",
+        "timeout": "Zeitüberschreitung bei der Anfrage",
+        "dns": "Der Servername konnte nicht aufgelöst werden",
+        "connectionRefused": "Die Verbindung wurde abgelehnt",
+        "tls": "Die sichere Verbindung ist fehlgeschlagen",
+        "authRejected": "Der Server hat die Agent-Anmeldedaten abgelehnt",
+        "urlUnresolved": "Die Serveradresse konnte nicht ermittelt werden",
+        "other": "Anderer Übertragungsfehler",
+        "unspecified": "Nicht angegeben"
+      }
+    },
+    "logsNotArriving": {
+      "label": "Protokolle nach Stufenanhebung",
+      "text": "Seit der Anhebung der Protokollstufe wurden keine Protokolle empfangen ({{since}})."
+    },
     "gpu": "GPU",
     "text": "—",
     "failedToFetchDeviceDetails": "Gerätedetails konnten nicht abgerufen werden",
@@ -1064,6 +1511,7 @@
     "cancel": "Abbrechen",
     "editDisplayName": "Anzeigenamen bearbeiten",
     "serialNumber": "Seriennummer",
+    "productSku": "Produktnummer",
     "manufacturer": "Hersteller",
     "model": "Modell",
     "deviceRole": "Geräterolle",
@@ -1120,6 +1568,7 @@
     "agent": "Agent",
     "agentVersion": "Agent-Version",
     "watchdogVersion": "Watchdog-Version",
+    "helperVersion": "Helper-Version",
     "status": "Status",
     "lastSeen": "Zuletzt gesehen",
     "enrolled": "Registriert",
@@ -1137,14 +1586,15 @@
     "missing": "Fehlt",
     "reason": "Grund",
     "lastChecked": "Zuletzt überprüft",
-    "thisMacIsBelowTheMacos": "Dieser Mac liegt unterhalb der macOS 14+-Grenze für den nativen Anmeldefenster-Desktop-Pfad.",
+    "reasonLoginWindow": "Anmeldefenster (macOS)",
     "loginWindowReachabilityIsOnlyAdvertised": "Die Erreichbarkeit des Anmeldefensters wird nur für verwaltete Installationen mit bereitgestelltem Desktop-Helper angekündigt.",
     "theNativeLoginWindowDesktopPath": "Der native Desktop-Pfad im Anmeldefenster ist hinter der Berechtigungsgenehmigung von Apple geschützt.",
     "theNativeLoginWindowDesktopPath2": "Der native Desktop-Pfad für das Anmeldefenster ist auf diesem Gerät noch nicht bereit.",
     "tags": "Schlagworte",
     "customFields": "Benutzerdefinierte Felder",
     "text2": "*",
-    "edit": "Bearbeiten"
+    "edit": "Bearbeiten",
+    "roleNotAssessed": "Rolle noch nicht bewertet"
   },
   "deviceIpHistoryTab": {
     "true": "wahr",
@@ -1226,10 +1676,12 @@
       "os": "Betriebssystem",
       "role": "Rolle",
       "status": "Status",
+      "attention": "Handlungsbedarf",
       "cpu": "CPU %",
       "ram": "RAM %",
       "lastSeen": "Zuletzt gesehen",
       "serial": "Seriennummer",
+      "productSku": "Produktnummer",
       "assetTag": "Asset-Tag",
       "location": "Standort",
       "source": "Quelle"
@@ -1247,6 +1699,7 @@
       "ram": "Nach RAM-Auslastung sortieren",
       "lastSeen": "Sortieren nach der zuletzt gesehenen Zeit",
       "serial": "Nach Seriennummer sortieren",
+      "productSku": "Nach Produktnummer sortieren",
       "assetTag": "Nach Asset-Tag sortieren",
       "location": "Nach Standort sortieren",
       "source": "Nach Quelle sortieren"
@@ -1322,11 +1775,17 @@
     "on": "auf",
     "multiBootMachinesTuckExpectedOffline": "Multi-Boot-Maschinen: Legen Sie erwartete Offline-Boot-Profile als dünne Streifen unter ihre Online-Geschwister. Aus = flache Liste.",
     "collapseLinkedInactiveProfiles": "Verknüpfte inaktive Profile ausblenden",
+    "exportCsv": "CSV exportieren",
+    "exportCsvSelected": "CSV exportieren ({{count}} ausgewählt)",
+    "exportingCsv": "Exportiere…",
+    "exportCsvFailed": "Die Geräteliste konnte nicht exportiert werden. Bitte erneut versuchen.",
+    "exportCsvAttentionPartial": "Exportiert, aber offene Alarme und Tickets konnten für einige Geräte nicht geladen werden – diese Zellen enthalten „unavailable“.",
     "columns": "Spalten",
     "visibleInOrder": "Sichtbar (in der Reihenfolge)",
     "moveUp": "Nach oben verschieben",
     "moveDown": "Nach unten verschieben",
     "hidden": "Versteckt",
+    "customFields": "Benutzerdefinierte Felder",
     "resetToDefaults": "Auf Standardeinstellungen zurücksetzen",
     "selected": "ausgewählt",
     "bulkActions": "Massenaktionen",
@@ -1384,11 +1843,79 @@
       "unifi": "UniFi",
       "manual": "Manuell"
     },
+    "updateWithheld": "Updates zurückgehalten",
+    "updateStuck": "Update hängt",
+    "updateStuckTooltip": "Dieses Gerät versucht seit über einer Stunde erfolglos, sein Agent-Update auf {{target}} abzuschließen.",
+    "updateWithheldTooltip": "Der Server bietet diesem Gerät keine Updates an, weil sich nicht bestätigen lässt, dass sein Agent-Build die bereitgestellte Edition akzeptiert. Er bleibt bis zur Wiederherstellung auf seiner aktuellen Version.",
+    "helperNotInstalled": "Nicht installiert",
+    "helperUnavailable": "Assist nicht verfügbar",
+    "helperInstallIssueTooltip": {
+      "awaitingServerOffer": "Breeze Assist ist aktiviert, aber nicht installiert: Der Server hat diesem Gerät keine Breeze-Assist-Version zur Installation angeboten.",
+      "installAbandoned": "Breeze Assist ist aktiviert, aber nicht installiert: Die Installation der angebotenen Version ist wiederholt fehlgeschlagen, weitere Versuche sind pausiert.",
+      "webview2Outdated": "Breeze Assist ist installiert, wird aber nicht gestartet: Die WebView2 Runtime des Geräts ist zu alt.",
+      "crashLoop": "Breeze Assist wurde direkt nach dem Start immer wieder beendet; der Agent versucht es nach 6 Stunden erneut.",
+      "unmanagedInstall": "Breeze Assist wurde nicht von Breeze installiert und die Bereitstellung ist aus, daher lässt der Agent es unverändert.",
+      "unknown": "Breeze Assist ist aktiviert, aber nicht installiert."
+    },
     "agentVersionRelation": {
       "equalTooltip": "Entspricht der effektiven Version {{version}}",
       "aheadTooltip": "Vor dem Pin {{version}}",
       "behindTooltip": "Hinter dem Pin {{version}}"
-    }
+    },
+    "attention": {
+      "alerts": {
+        "critical_one": "{{count}} kritisch",
+        "critical_other": "{{count}} kritisch",
+        "high_one": "{{count}} hoch",
+        "high_other": "{{count}} hoch",
+        "medium_one": "{{count}} mittel",
+        "medium_other": "{{count}} mittel",
+        "low_one": "{{count}} niedrig",
+        "low_other": "{{count}} niedrig",
+        "info_one": "{{count}} Info",
+        "info_other": "{{count}} Infos"
+      },
+      "tickets_one": "{{count}} offenes Ticket",
+      "tickets_other": "{{count}} offene Tickets",
+      "alertsTitle": "Offene Warnungen: {{breakdown}}",
+      "none": "Nichts offen",
+      "unavailable": "Anzahl der Warnungen und Tickets nicht verfügbar",
+      "loading": "Anzahl der Warnungen und Tickets wird geladen"
+    },
+    "columnChooser": {
+      "title": "Spalten",
+      "searchLabel": "Spalten filtern",
+      "searchPlaceholder": "Spalten filtern…",
+      "noMatches": "Keine Spalten passen zu „{{query}}“",
+      "alwaysShown": "Immer sichtbar",
+      "showColumn": "{{column}} einblenden",
+      "hideColumn": "{{column}} ausblenden",
+      "moveColumnUp": "{{column}} nach oben verschieben",
+      "moveColumnDown": "{{column}} nach unten verschieben",
+      "gate": {
+        "agentOnlyFleet": "Bei reinen Agent-Flotten ausgeblendet",
+        "networkOnlyView": "Ausgeblendet, solange nur Netzwerkgeräte aufgeführt sind",
+        "noManualAssets": "Nur sichtbar, wenn manuelle Assets aufgeführt sind"
+      },
+      "groups": {
+        "identity": "Identität",
+        "platform": "Plattform",
+        "health": "Zustand",
+        "versions": "Versionen",
+        "network": "Netzwerk",
+        "inventory": "Inventar"
+      }
+    },
+    "countLine_one": "{{shown}} von {{count}} Gerät",
+    "countLine_other": "{{shown}} von {{count}} Geräten",
+    "noMatchesTitle": "Keine Geräte passen zu diesen Filtern",
+    "moveToSite": "An Standort verschieben",
+    "moveSelectedToSite": "An Standort verschieben",
+    "moveSiteMixedOrgs": "Die ausgewählten Geräte gehören zu mehr als einer Organisation",
+    "moveSiteOverCap": "Wählen Sie höchstens {{count}} Geräte zum gleichzeitigen Verschieben aus",
+    "addToGroup": "Zu Gruppe hinzufügen…",
+    "removeFromGroup": "Aus Gruppe entfernen…",
+    "groupMembershipOverCap": "Wählen Sie höchstens {{count}} Geräte aus, um die Gruppenmitgliedschaft gleichzeitig zu ändern"
   },
   "deviceLogsTab": {
     "failedToFetchDeviceLogs": "Geräteprotokolle konnten nicht abgerufen werden",
@@ -1410,7 +1937,10 @@
     "s": "s",
     "loadingDeviceLogs": "Geräteprotokolle werden geladen...",
     "noLogsMatchTheSelectedFilters": "Keine Protokolle entsprechen den ausgewählten Filtern.",
-    "noDeviceLogsRecordedYet": "Es wurden noch keine Geräteprotokolle aufgezeichnet."
+    "noDeviceLogsRecordedYet": "Es wurden noch keine Geräteprotokolle aufgezeichnet.",
+    "linkedWindow": "Zeigt das Zuverlässigkeits-Bewertungsfenster {{from}} – {{to}}",
+    "linkedWindowWithSource": "Zeigt das Zuverlässigkeits-Bewertungsfenster {{from}} – {{to}} für {{source}}",
+    "clearLinkedFilter": "Link-Filter zurücksetzen"
   },
   "deviceManagementTab": {
     "loadingManagementPosture": "Verwaltungsstatus wird geladen...",
@@ -1492,12 +2022,17 @@
     "title": "Aktive Netzwerkverbindungen"
   },
   "devicePatchStatusTab": {
+    "released": "Veröffentlicht am {{date}}",
     "compliance": {
       "compliant": "{{percent}} % konform",
       "description": "Ausstehende vs. installierte Updates",
       "installed": "{{count}} installiert",
       "pending": "{{count}} ausstehend",
-      "title": "Patch-Konformität"
+      "title": "Patch-Konformität",
+      "imagesNotChecked_one": "{{count}} Container-Image nicht geprüft",
+      "imagesNotChecked_other": "{{count}} Container-Images nicht geprüft",
+      "imagesBehind_one": "{{count}} Container-Image veraltet",
+      "imagesBehind_other": "{{count}} Container-Images veraltet"
     },
     "confirm": {
       "install": "Installieren",
@@ -1561,11 +2096,14 @@
     "loading": "Patch-Status wird geladen...",
     "notDownloadedTitle": "Noch nicht heruntergeladen – die Installation dauert länger",
     "notices": {
+      "installCommandEnded": "Der Installationsbefehl wurde beendet ({{status}}), bevor das Gerät ein Ergebnis gemeldet hat. Details finden Sie im Befehlsverlauf des Geräts.",
+      "installFinishedWithIssues": "Installation abgeschlossen: {{installed}} installiert, {{failed}} fehlgeschlagen, {{awaitingRestart}} warten auf einen Neustart, {{unresolved}} noch nicht bestätigt. Details finden Sie in den Patch-Zeilen.",
       "installLongerThanExpected": "Die Installation dauert länger als erwartet. macOS-Updates können mehr als 30 Minuten dauern. Aktualisieren Sie die Seite später, um den Status zu überprüfen.",
       "installPatchFailed": "Die Installation von {{name}} ist fehlgeschlagen",
       "installPatchQueued": "Installation steht für „{{name}}“ in der Warteschlange",
       "installPatchQueuedDetail": "Installation steht für „{{name}}“{{dispatchSuffix}} in der Warteschlange.",
       "installQueuedForPatches": "{{label}} in der Warteschlange für {{count}} Patches{{commandSuffix}}{{dispatchSuffix}}.",
+      "installStatusUnavailable": "Der Installationsstatus konnte nicht geprüft werden, da die Patch-Liste nicht geladen wurde. Aktualisieren Sie die Seite, um den aktuellen Status zu sehen.",
       "installedSuccessfully": "{{installed}} Patches wurden erfolgreich installiert. {{pending}} steht noch aus.",
       "installingPolling": "Patches werden installiert... Updates werden abgefragt.",
       "noPendingForLabel": "Für {{label}} sind keine ausstehenden Patches verfügbar.",
@@ -1587,7 +2125,46 @@
       "source": "Quelle"
     },
     "thirdParty": "Drittanbieter",
-    "uncategorized": "Nicht kategorisiert"
+    "uncategorized": "Nicht kategorisiert",
+    "installFailure": {
+      "badge": "Installation fehlgeschlagen",
+      "noReason": "Kein Grund vom Agent gemeldet",
+      "failedAt": "Letzter Installationsversuch fehlgeschlagen: {{when}}"
+    },
+    "awaitingRestart": {
+      "badge": "Installiert, Neustart erforderlich",
+      "installedAt": "Installiert am {{when}}. Bleibt bis zum Neustart des Geräts als ausstehend aufgeführt."
+    },
+    "approval": {
+      "approved": "Genehmigt",
+      "approvedTitle": "Manuell genehmigt.",
+      "autoApproved": "Automatisch genehmigt",
+      "autoApprovedTitle": "Vom Update-Ring {{ring}} genehmigt. Der nächste geplante Patch-Lauf installiert es.",
+      "deferred": "Zurückgestellt",
+      "deferredNoDateTitle": "Der Update-Ring {{ring}} hat ein Zurückstellungsfenster, aber dieser Patch hat kein Veröffentlichungsdatum, an dem es gemessen werden kann. Er bleibt daher zurückgehalten. Genehmigen Sie ihn manuell, um ihn zu installieren.",
+      "deferredUntil": "Automatische Genehmigung am {{date}}",
+      "deferredUntilTitle": "Der Update-Ring {{ring}} hält neue Patches für sein Zurückstellungsfenster zurück. Dieser wird am {{date}} genehmigt und mit dem nächsten geplanten Patch-Lauf danach installiert.",
+      "excluded": "Durch Richtlinie ausgeschlossen",
+      "managedByVendorUpdates": "Von Hersteller-Updates verwaltet",
+      "managedByVendorUpdatesTitle": "Das Update-Tool des Herstellers liefert dies auf diesem Gerät, daher überspringen geplante Patch-Läufe es.",
+      "excludedSourceTitle": "Die Quellen der Patch-Richtlinie umfassen diesen Patch nicht, daher überspringen geplante Patch-Läufe ihn.",
+      "excludedCategoryTitle": "Der Update-Ring {{ring}} schließt die Kategorie dieses Patches aus, daher überspringen geplante Patch-Läufe ihn.",
+      "excludedAppRuleTitle": "Eine App-Sperr- oder Pin-Regel des verknüpften Update-Rings hält diesen Patch zurück, daher überspringen geplante Patch-Läufe ihn.",
+      "excludedRingReferenceTitle": "Zurückgehalten: Die Patch-Richtlinie dieses Geräts verweist auf einen Update-Ring, der nicht mehr existiert oder für diesen Partner nicht verfügbar ist. Korrigieren Sie den Update-Ring der Richtlinie, um das Patchen fortzusetzen.",
+      "excludedUserScopeTitle": "Nicht installierbar: Es handelt sich um eine Installation pro Benutzer, die Breeze noch nicht anwenden kann, daher installiert kein Patch-Lauf sie.",
+      "excludedFeatureUpdateTitle": "Update-Ring {{ring}} blockiert diese Windows-Funktionsversion (oder heftet Geräte an eine andere an), daher überspringen geplante Patch-Läufe sie.",
+      "excludedDeclinedTitle": "Abgelehnt: Dieser Patch wurde ausdrücklich abgelehnt, daher installiert ihn die automatische Genehmigung des Rings nicht. Genehmigen Sie ihn erneut, um ihn zuzulassen.",
+      "pending": "Genehmigung ausstehend",
+      "needsApprovalRingTitle": "Der Update-Ring {{ring}} genehmigt diesen Patch nicht automatisch. Genehmigen Sie ihn manuell, um ihn zu installieren.",
+      "needsApprovalNoRingTitle": "Mit der Patch-Richtlinie dieses Geräts ist kein Update-Ring verknüpft, daher wird dieser Patch nur nach manueller Genehmigung installiert.",
+      "unnamedRing": "der verknüpfte Update-Ring",
+      "ringLine": "Genehmigungen folgen dem Update-Ring: {{ring}}",
+      "noRingLine": "Für dieses Gerät gilt kein Update-Ring. Patches werden nur nach manueller Genehmigung installiert.",
+      "unavailable": "Die Genehmigungen des Update-Rings konnten nicht ausgewertet werden. Die Kennzeichnungen zeigen nur manuelle Genehmigungen.",
+      "autoApprovedUserScopeTitle": "{{ring}} genehmigt diesen Patch, aber es handelt sich um eine Installation pro Benutzer, die Breeze noch nicht anwenden kann.",
+      "otherRingApprovalTitle": "Dieser Patch hat eine manuelle Genehmigung für einen anderen Update-Ring, die für {{ring}} nicht gilt. Geplante Läufe überspringen ihn hier; die Schaltfläche „Installieren“ akzeptiert ihn trotzdem."
+    },
+    "installPatchRingManagedTitle": "{{name}} wird vom Update-Ring {{ring}} verwaltet und mit dem nächsten geplanten Patch-Lauf installiert. Für eine sofortige Installation ist eine manuelle Genehmigung erforderlich."
   },
   "devicePerformanceGraphs": {
     "description": "CPU, RAM, Festplattennutzung und Netzwerkbandbreite im Zeitverlauf",
@@ -1606,13 +2183,15 @@
       "cpu": "CPU",
       "disk": "Festplatte",
       "download": "Herunterladen",
-      "ram": "Ram",
+      "ram": "Arbeitsspeicher",
       "readThroughput": "Lesedurchsatz",
       "upload": "Hochladen",
       "writeThroughput": "Schreibdurchsatz"
     },
     "networkBandwidth": "Netzwerkbandbreite",
-    "title": "Leistungsdiagramme"
+    "title": "Leistungsdiagramme",
+    "noSamples": "Keine Messwerte in den letzten {{range}}",
+    "offlineSince": "Gerät offline · zuletzt gesehen {{ago}}"
   },
   "devicePeripheralsTab": {
     "actions": {
@@ -1654,7 +2233,7 @@
   "devicePlaybookHistory": {
     "duration": "Dauer: {{duration}}",
     "empty": "Für dieses Gerät wurden keine Playbook-Ausführungen gefunden.",
-    "emptyHelp": "Playbooks können über den KI-Assistenten ausgelöst werden, um Behebungsaufgaben zu automatisieren.",
+    "emptyHelp": "Playbooks können über Breeze AI ausgelöst werden, um Behebungsaufgaben zu automatisieren.",
     "loading": "Playbook-Verlauf wird geladen...",
     "noStepResults": "Es wurden keine Schrittergebnisse aufgezeichnet.",
     "rollbackExecuted": "Rollback wurde ausgeführt",
@@ -1689,7 +2268,7 @@
     "details": "Details",
     "disabled": "Die Zuverlässigkeitsbewertung ist für diese Organisation deaktiviert.",
     "distinctEvents": "Einzelne Ereignisse aus dem Jahr {{window}}.",
-    "empty": "Noch kein Zuverlässigkeits-Snapshot verfügbar.",
+    "empty": "Noch keine Zuverlässigkeitsdaten",
     "errors": {
       "loadDetail": "Zuverlässigkeitsdetails konnten nicht geladen werden",
       "loadScore": "Der Zuverlässigkeitswert konnte nicht geladen werden",
@@ -1746,7 +2325,54 @@
     },
     "updated": "Aktualisiert {{date}}",
     "uptimeWindow": "{{days}}d Betriebszeit",
-    "youngDeviceTooltip": "Dieses Gerät wurde vor {{age}} Tag(en) registriert, daher umfassen die {{days}}-Tagesfenster nur die bisherige Lebensdauer."
+    "youngDeviceTooltip": "Dieses Gerät wurde vor {{age}} Tag(en) registriert, daher umfassen die {{days}}-Tagesfenster nur die bisherige Lebensdauer.",
+    "baseline": {
+      "reasons": {
+        "reimaged": "Neu aufgesetzt",
+        "remediated": "Behoben",
+        "hardware_replaced": "Hardware ersetzt"
+      },
+      "bannerProvisional": "Bewertung seit {{reason}} am {{date}} durch {{who}} — vorläufig, {{days}} von {{required}} Tagen gemeldet",
+      "bannerMature_one": "Bewertung seit {{reason}} am {{date}} durch {{who}} ({{count}} Tag)",
+      "bannerMature_other": "Bewertung seit {{reason}} am {{date}} durch {{who}} ({{count}} Tage)",
+      "system": "Breeze (automatisch)",
+      "someone": "einen Techniker",
+      "provisional": "Vorläufig",
+      "beforeAfterTitle": "Vorher → seitdem",
+      "basedOnDays_one": "Vorher-Wert basiert auf {{count}} Tag Verlauf",
+      "basedOnDays_other": "Vorher-Wert basiert auf {{count}} Tagen Verlauf",
+      "history": "Markierungsverlauf",
+      "historyLoadError": "Der Markierungsverlauf konnte nicht geladen werden.",
+      "retry": "Erneut versuchen",
+      "cleared": "Aufgehoben",
+      "markWorkDone": "Arbeit als erledigt markieren",
+      "dialogTitle": "Arbeit an diesem Gerät als erledigt markieren",
+      "dialogDescription": "Die Zuverlässigkeitsbewertung beginnt ab diesem Zeitpunkt neu, sodass Abstürze und Ausfälle von vor der Arbeit nicht mehr zählen. Die Bewertung bleibt vorläufig, bis Daten für 14 Tage gemeldet wurden.",
+      "reasonLabel": "Durchgeführte Arbeit",
+      "whenLabel": "Abschluss der Arbeit",
+      "noteLabel": "Notiz",
+      "noteRequiredHint": "Pflichtfeld bei „Behoben“: Beschreiben Sie, was behoben wurde.",
+      "save": "Markierung speichern",
+      "saved": "Markierung gespeichert – die Bewertung beginnt ab diesem Zeitpunkt neu",
+      "saveError": "Die Markierung konnte nicht gespeichert werden",
+      "tooOld": "Die Markierung darf höchstens 30 Tage zurückliegen.",
+      "inFuture": "Die Markierung darf nicht in der Zukunft liegen.",
+      "noteRequired": "Beschreiben Sie die Behebung in der Notiz.",
+      "clear": "Aufheben",
+      "clearTitle": "Diese Markierung aufheben?",
+      "clearMessage": "Die Bewertung verwendet diese Markierung nicht mehr und greift auf die vorherige Markierung oder den gesamten Geräteverlauf zurück. Die Markierung bleibt als aufgehoben im Verlauf.",
+      "clearConfirm": "Markierung aufheben",
+      "clearError": "Die Markierung konnte nicht aufgehoben werden",
+      "clearedToast": "Markierung aufgehoben",
+      "activeBadge": "Aktiv",
+      "savedNotActive": "Markierung gespeichert. Eine spätere Markierung ist weiterhin wirksam, daher hat sich die Punktzahl nicht geändert.",
+      "clearNotFound": "Diese Markierung existiert nicht mehr.",
+      "clearAlreadyCleared": "Diese Markierung wurde bereits aufgehoben."
+    },
+    "eventLogLinkExact": "Im Ereignisprotokoll anzeigen",
+    "eventLogLinkWindow": "Ereignisprotokoll öffnen",
+    "eventLogLinkTitle": "Ereignisprotokoll, {{from}} – {{to}}",
+    "eventLogLinkTitleWithSource": "Ereignisprotokoll für {{source}}, {{from}} – {{to}}"
   },
   "deviceScriptHistory": {
     "copyToClipboard": "In die Zwischenablage kopieren",
@@ -1764,20 +2390,29 @@
     "noOutput": "Keine Ausgabe",
     "output": "Ausgabe",
     "refreshing": "Wird aktualisiert...",
-    "running": "Wird ausgeführt...",
     "runAgain": "Erneut ausführen",
+    "runCount_one": "{{count}} Ausführung",
+    "runCount_other": "{{count}} Ausführungen",
+    "running": "Wird ausgeführt...",
     "scriptFallback": "Skript",
     "stderr": "Standardfehler (stderr)",
     "stdout": "Standardausgabe (stdout)",
     "table": {
       "completed": "Abgeschlossen",
       "duration": "Dauer",
+      "lastOutput": "Letzte Ausgabe",
+      "lastRun": "Letzte Ausführung",
       "script": "Skript",
       "started": "Begonnen",
       "status": "Status"
     },
     "title": "Skriptausführungsverlauf",
-    "unnamedScript": "Unbenanntes Skript"
+    "unnamedScript": "Unbenanntes Skript",
+    "view": {
+      "all": "Alle Ausführungen",
+      "label": "Skriptansicht",
+      "latest": "Letztes pro Skript"
+    }
   },
   "deviceSecurityTab": {
     "detected": "Erkannt: {{date}}",
@@ -1795,7 +2430,9 @@
       "completed": "Abgeschlossen",
       "failed": "Fehlgeschlagen",
       "queued": "In der Warteschlange",
-      "running": "Wird ausgeführt"
+      "running": "Wird ausgeführt",
+      "cancelled": "Abgebrochen",
+      "expired": "Abgelaufen"
     },
     "scanType": "{{type}} scannen",
     "scanTypes": {
@@ -1817,7 +2454,13 @@
       "quarantined": "Unter Quarantäne gestellt",
       "removed": "Entfernt"
     },
-    "threatsFound": "Gefundene Bedrohungen: {{count}}"
+    "threatsFound": "Gefundene Bedrohungen: {{count}}",
+    "waitingForSlot": "Wartet auf einen freien Scan-Platz. Läuft ab: {{date}}.",
+    "cancelScan": "Scan abbrechen",
+    "scanCancelled": "Scan abgebrochen",
+    "cancelScanFailed": "Der Scan konnte nicht abgebrochen werden",
+    "scanAlreadyRunning": "Der Scan läuft bereits auf dem Gerät und kann nicht abgebrochen werden.",
+    "scanAlreadyQueued": "Für dieses Gerät ist bereits ein Scan in der Warteschlange."
   },
   "deviceSettingsModal": {
     "addTagPlaceholder": "Tag hinzufügen...",
@@ -1829,9 +2472,11 @@
     "displayName": "Anzeigename",
     "errors": {
       "loadSites": "Die Standorte konnten nicht geladen werden",
-      "saveSettings": "Einstellungen konnten nicht gespeichert werden"
+      "saveSettings": "Einstellungen konnten nicht gespeichert werden",
+      "siteChanged": "Dieses Gerät wurde von jemand anderem verschoben – laden Sie die Seite neu, um den aktuellen Standort zu sehen"
     },
     "hostname": "Hostname: {{hostname}}",
+    "saved": "Geräteeinstellungen gespeichert",
     "permanentlyDelete": "Endgültig löschen",
     "restoreDevice": "Gerät wiederherstellen",
     "saveChanges": "Änderungen speichern",
@@ -1894,9 +2539,13 @@
     "updatesAvailable_other": "{{count}} Updates verfügbar"
   },
   "deviceUserIdleStat": {
+    "active": "Aktiv",
+    "asOf": "Stand: {{time}}",
     "label": "Benutzer im Leerlauf",
+    "locked": "Gesperrt",
     "retryAria": "Der Ruhezustand konnte nicht geladen werden – versuchen Sie es erneut",
-    "retryTitle": "Der Ruhezustand konnte nicht geladen werden – klicken Sie, um es erneut zu versuchen"
+    "retryTitle": "Der Ruhezustand konnte nicht geladen werden – klicken Sie, um es erneut zu versuchen",
+    "unknown": "Unbekannt"
   },
   "deviceVulnerabilitiesTab": {
     "actions": {
@@ -1941,7 +2590,7 @@
     "showFindings": "Befunde anzeigen",
     "stats": {
       "accepted": "Akzeptiert",
-      "kev": "Kev",
+      "kev": "Bekanntermaßen ausgenutzt",
       "mitigated": "Abgemildert",
       "open": "Offen",
       "patchReady": "Patch bereit",
@@ -1959,9 +2608,9 @@
     "statusLabel": "Statusetikett",
     "table": {
       "actions": "Aktionen",
-      "cve": "Cve",
-      "cvss": "Lebenslauf",
-      "kev": "Kev",
+      "cve": "CVE",
+      "cvss": "CVSS",
+      "kev": "KEV",
       "risk": "Risiko",
       "severity": "Schweregrad",
       "status": "Status"
@@ -1977,7 +2626,7 @@
     "loadFailed": "Garantie konnte nicht geladen werden.",
     "lookupUnavailable": "Für diesen Hersteller ist keine Garantiesuche verfügbar",
     "manufacturer": "Hersteller",
-    "noInformation": "Keine Garantieinformationen",
+    "noInformation": "Keine Garantie hinterlegt",
     "renews": "Erneuert",
     "serialNumber": "Seriennummer",
     "source": "Quelle: {{source}}",
@@ -2002,7 +2651,17 @@
       "refreshFailed": "Garantieaktualisierung fehlgeschlagen: {{error}}",
       "refreshing": "Garantie wird aktualisiert…",
       "stillInProgress": "Die Garantieaktualisierung ist noch im Gange; Die Karte wird aktualisiert, wenn der Vorgang abgeschlossen ist.",
-      "updated": "Garantieinformationen aktualisiert."
+      "updated": "Garantieinformationen aktualisiert.",
+      "agentCollected": "Die Garantie dieses Geräts wird vom Breeze-Agenten erfasst, daher kann eine Herstellerabfrage nichts Neueres liefern.",
+      "noVendorLookupKept": "Für diesen Hersteller ist keine Garantieabfrage verfügbar. Die vorhandenen Garantiedaten wurden beibehalten."
+    },
+    "lookUp": "Abfragen",
+    "sources": {
+      "agentCmsl": "Agent (HP-CMSL)",
+      "agentPlist": "Agent (macOS-plist)",
+      "import": "Importiert",
+      "importVendorEarlier": "Importiert (Hersteller meldet früheres Enddatum)",
+      "provider": "Hersteller-API"
     }
   },
   "devicesPage": {
@@ -2015,14 +2674,15 @@
       "shutdown": "Herunterfahren"
     },
     "addDevice": "Gerät hinzufügen",
-    "importFromRmm": "Von einer anderen RMM importieren",
+    "importFromRmm": "Benutzerdefinierte Felder aus einer anderen RMM importieren",
     "bulkPurge": {
       "andMore": "und {{count}} weitere",
       "confirm": "Endgültig löschen",
       "message": "Das lässt sich nicht rückgängig machen. Alle Datensätze dieser Geräte — Verlauf, Warnungen, Skripte, Sitzungen — werden mit ihnen gelöscht. Tickets bleiben erhalten und werden getrennt.",
       "multipleOrgs": "Diese Auswahl umfasst {{count}} Organisationen. Prüfen Sie den Organisationsbereich, bevor Sie fortfahren.",
-      "title": "{{count}} Gerät(e) endgültig löschen?",
-      "typeCount": "Zur Bestätigung {{count}} eingeben"
+      "typeCount": "Zur Bestätigung {{count}} eingeben",
+      "title_one": "{{count}} Gerät endgültig löschen?",
+      "title_other": "{{count}} Geräte endgültig löschen?"
     },
     "confirmRunAction": "Führen Sie {{script}} aus",
     "confirmScriptRun": "Bestätigen Sie die Ausführung des Skripts",
@@ -2049,31 +2709,21 @@
       "agentOnlyActionManual": "Diese Aktion gilt nur für Agent-Geräte. Manuelle Assets haben keinen Agenten.",
       "alreadyPendingTail": "Tail ist bereits ausstehend",
       "bulkActionFailed": "Massenaktion fehlgeschlagen",
-      "bulkAllDecommissioned": "Alle {{total}} ausgewählten Geräte sind bereits entfernt.",
-      "bulkCommandPartialFailed": "{{action}} an {{count}} Gerät(e) gesendet{{queuedTail}}{{skippedTail}}; {{failed}} fehlgeschlagen: {{failureSummary}}",
-      "bulkCommandSent": "{{action}} an {{count}} Gerät(e) gesendet{{queuedTail}}{{skippedTail}}",
-      "bulkDecommissionAllFailed": "Entfernen für alle {{count}} Geräte fehlgeschlagen: {{devices}}",
-      "bulkDecommissionFailed": "{{succeeded}} Gerät(e) entfernt; bei {{failed}} fehlgeschlagen: {{devices}}",
-      "bulkDecommissioned": "{{count}} Gerät(e) entfernt",
-      "bulkMaintenanceAllFailed": "Der Wartungsmodus konnte für alle {{count}} Geräte nicht aktualisiert werden: {{devices}}",
-      "bulkMaintenanceSomeFailed": "Wartungsmodus für {{succeeded}} Gerät(e) {{verb}}; bei {{failed}} fehlgeschlagen: {{devices}}",
       "bulkMaintenanceSuccess": "Wartungsmodus für {{count}} Geräte {{verb}}",
       "bulkMaintenanceSuccess_one": "Wartungsmodus für {{count}} Gerät {{verb}}",
       "bulkMaintenanceSuccess_other": "Wartungsmodus für {{count}} Geräte {{verb}}",
-      "bulkPurgeDone": "{{count}} Gerät(e) endgültig gelöscht",
-      "bulkPurgeDoneWithSkips": "{{purged}} Gerät(e) endgültig gelöscht; {{skipped}} übersprungen ({{reasons}})",
       "bulkPurgeFailed": "Endgültiges Löschen fehlgeschlagen: {{reason}}",
-      "bulkPurgeNoneDeleted": "Kein Gerät wurde gelöscht: {{reasons}}",
-      "bulkPurgeStarted": "{{count}} Gerät(e) werden endgültig gelöscht …",
-      "bulkRestoreAllFailed": "Wiederherstellung aller {{count}} Gerät(e) fehlgeschlagen",
-      "bulkRestoreSomeFailed": "{{succeeded}} Gerät(e) wiederhergestellt; {{failed}} fehlgeschlagen",
-      "bulkRestoreUninstallAlreadySent": "Bei {{count}} Gerät(en) wurde die Deinstallation bereits gesendet — auf diesen Maschinen muss der Agent ggf. neu installiert werden.",
-      "bulkRestored": "{{count}} Gerät(e) wiederhergestellt",
+      "bulkPurgeNoneDeleted": "Kein Gerät wurde gelöscht. {{reasons}}",
+      "bulkPurgeSkipOther_one": "{{count}} übersprungen, Grund: {{code}}.",
+      "bulkPurgeSkipOther_other": "{{count}} übersprungen, Grund: {{code}}.",
+      "bulkPurgeSkipUninstallNotConfirmed_one": "{{count}} übersprungen, weil der Agent die Deinstallation nie bestätigt hat. Löschen Sie es einzeln über die Geräteseite.",
+      "bulkPurgeSkipUninstallNotConfirmed_other": "{{count}} übersprungen, weil die Agents die Deinstallation nie bestätigt haben. Löschen Sie sie einzeln über die Geräteseite.",
       "bulkWakeAllFailed": "Aufwecken aller Geräte fehlgeschlagen",
       "bulkWakeSent": "Aufweckbefehle gesendet",
       "bulkWakeSomeFailed": "Aufwecken einiger Geräte fehlgeschlagen",
       "commandQueued": "{{action}} eingereiht — wird ausgeführt, wenn {{hostname}} wieder verbunden ist",
       "commandSent": "{{action}} an {{hostname}} gesendet",
+      "commandCancelled": "{{action}} wurde nicht an {{hostname}} gesendet: Befehl abgebrochen ({{reason}})",
       "compareNeedsTwo": "Der Vergleich benötigt mindestens 2 Agent-Geräte.",
       "decommissionCancelled": "Entfernen abgebrochen",
       "decommissionFailed": "Entfernen fehlgeschlagen",
@@ -2115,7 +2765,48 @@
       "nonAgentSkipped": "{{count}} Geräte ohne Agent übersprungen — diese Aktion gilt nur für Agent-Geräte.",
       "bulkManualDeleted": "{{count}} manuelle Assets gelöscht.",
       "bulkManualDeleteAllFailed": "Löschen aller {{count}} manuellen Assets fehlgeschlagen: {{devices}}.",
-      "bulkManualDeleteSomeFailed": "{{succeeded}} gelöscht; {{failed}} fehlgeschlagen: {{devices}}."
+      "bulkManualDeleteSomeFailed": "{{succeeded}} gelöscht; {{failed}} fehlgeschlagen: {{devices}}.",
+      "bulkAllDecommissioned_one": "{{count}} ausgewähltes Gerät ist bereits entfernt.",
+      "bulkAllDecommissioned_other": "Alle {{count}} ausgewählten Geräte sind bereits entfernt.",
+      "bulkCommandPartialFailed_one": "{{action}} an {{count}} Gerät gesendet{{queuedTail}}{{skippedTail}}; {{failed}} fehlgeschlagen: {{failureSummary}}",
+      "bulkCommandPartialFailed_other": "{{action}} an {{count}} Geräte gesendet{{queuedTail}}{{skippedTail}}; {{failed}} fehlgeschlagen: {{failureSummary}}",
+      "bulkCommandSent_one": "{{action}} an {{count}} Gerät gesendet{{queuedTail}}{{skippedTail}}",
+      "bulkCommandSent_other": "{{action}} an {{count}} Geräte gesendet{{queuedTail}}{{skippedTail}}",
+      "bulkDecommissionAllFailed_one": "Entfernen für {{count}} Gerät fehlgeschlagen: {{devices}}",
+      "bulkDecommissionAllFailed_other": "Entfernen für alle {{count}} Geräte fehlgeschlagen: {{devices}}",
+      "bulkDecommissionFailed_one": "{{count}} Gerät entfernt; bei {{failed}} fehlgeschlagen: {{devices}}",
+      "bulkDecommissionFailed_other": "{{count}} Geräte entfernt; bei {{failed}} fehlgeschlagen: {{devices}}",
+      "bulkDecommissioned_one": "{{count}} Gerät entfernt",
+      "bulkDecommissioned_other": "{{count}} Geräte entfernt",
+      "bulkMaintenanceAllFailed_one": "Der Wartungsmodus konnte für {{count}} Gerät nicht aktualisiert werden: {{devices}}",
+      "bulkMaintenanceAllFailed_other": "Der Wartungsmodus konnte für alle {{count}} Geräte nicht aktualisiert werden: {{devices}}",
+      "bulkMaintenanceSomeFailed_one": "Wartungsmodus für {{count}} Gerät {{verb}}; bei {{failed}} fehlgeschlagen: {{devices}}",
+      "bulkMaintenanceSomeFailed_other": "Wartungsmodus für {{count}} Geräte {{verb}}; bei {{failed}} fehlgeschlagen: {{devices}}",
+      "bulkPurgeDone_one": "{{count}} Gerät endgültig gelöscht",
+      "bulkPurgeDone_other": "{{count}} Geräte endgültig gelöscht",
+      "bulkPurgeDoneWithSkips_one": "{{count}} Gerät endgültig gelöscht; {{reasons}}",
+      "bulkPurgeDoneWithSkips_other": "{{count}} Geräte endgültig gelöscht; {{reasons}}",
+      "bulkPurgeStarted_one": "{{count}} Gerät wird endgültig gelöscht …",
+      "bulkPurgeStarted_other": "{{count}} Geräte werden endgültig gelöscht …",
+      "bulkRestoreAllFailed_one": "Wiederherstellung von {{count}} Gerät fehlgeschlagen",
+      "bulkRestoreAllFailed_other": "Wiederherstellung aller {{count}} Geräte fehlgeschlagen",
+      "bulkRestoreSomeFailed_one": "{{count}} Gerät wiederhergestellt; {{failed}} fehlgeschlagen",
+      "bulkRestoreSomeFailed_other": "{{count}} Geräte wiederhergestellt; {{failed}} fehlgeschlagen",
+      "bulkRestoreUninstallAlreadySent_one": "Bei {{count}} Gerät wurde die Deinstallation bereits gesendet — auf dieser Maschine muss der Agent ggf. neu installiert werden.",
+      "bulkRestoreUninstallAlreadySent_other": "Bei {{count}} Geräten wurde die Deinstallation bereits gesendet — auf diesen Maschinen muss der Agent ggf. neu installiert werden.",
+      "bulkRestored_one": "{{count}} Gerät wiederhergestellt",
+      "bulkRestored_other": "{{count}} Geräte wiederhergestellt",
+      "bulkMoveSiteSuccess": "{{count}} Geräte befinden sich jetzt am Standort {{site}}",
+      "bulkMoveSiteSuccess_one": "{{count}} Gerät befindet sich jetzt am Standort {{site}}",
+      "bulkMoveSiteSuccess_other": "{{count}} Geräte befinden sich jetzt am Standort {{site}}",
+      "bulkMoveSiteSomeFailed": "{{moved}} von {{total}} Geräten nach {{site}} verschoben. Nicht verschoben: {{devices}}",
+      "bulkMoveSiteAllFailed": "Es wurden keine Geräte nach {{site}} verschoben. Nicht verschoben: {{devices}}",
+      "bulkMoveSiteNotMovedConflict": "{{devices}} (der Standort hat sich nach dem Laden der Liste geändert; die Liste wurde aktualisiert, bitte erneut versuchen)",
+      "bulkMoveSiteNotMovedForbidden": "{{devices}} (kein Zugriff auf den aktuellen Standort oder den Zielstandort)",
+      "bulkMoveSiteNotMovedNotFound": "{{devices}} (nicht mehr gefunden; das Gerät wurde möglicherweise gelöscht)",
+      "bulkMoveSiteNotMovedError": "{{devices}} (ein unerwarteter Fehler ist aufgetreten; bitte erneut versuchen)",
+      "deviceMovedToSite": "{{hostname}} an einen neuen Standort verschoben",
+      "bulkWakeResult": "An {{sent}} gesendet, {{skipped}} übersprungen"
     },
     "tryAgain": "Versuchen Sie es erneut",
     "unknownDevice": "Unbekannt",
@@ -2123,8 +2814,9 @@
     "unknownSite": "Unbekannte Standort",
     "viewInstallationGuide": "Installationsanleitung ansehen",
     "confirmDecommissionedSkip": {
-      "message": "{{skipped}} von {{total}} ausgewählten Geräten sind entfernt und werden übersprungen – sie haben keinen verwalteten Agenten mehr. Mit den verbleibenden {{eligible}} Gerät(en) fortfahren? Geräte, die offline sind, führen dies bei der nächsten Anmeldung aus.",
-      "title": "Einige ausgewählte Geräte sind entfernt"
+      "title": "Einige ausgewählte Geräte sind entfernt",
+      "message_one": "{{skipped}} von {{total}} ausgewählten Geräten sind entfernt und werden übersprungen – sie haben keinen verwalteten Agenten mehr. Mit {{count}} verbleibendem Gerät fortfahren? Geräte, die offline sind, führen dies bei der nächsten Anmeldung aus.",
+      "message_other": "{{skipped}} von {{total}} ausgewählten Geräten sind entfernt und werden übersprungen – sie haben keinen verwalteten Agenten mehr. Mit den verbleibenden {{count}} Geräten fortfahren? Geräte, die offline sind, führen dies bei der nächsten Anmeldung aus."
     },
     "hiddenNonAgentNotice": "{{count}} {{class}} ausgeblendet — {{fields}} gilt nur für Agent-Geräte.",
     "hiddenNonAgentClassLabel": {
@@ -2137,6 +2829,37 @@
       "installAgent": "Agent installieren…",
       "addNetworkAsset": "Netzwerk-Asset hinzufügen…",
       "addManualAsset": "Asset manuell hinzufügen…"
+    },
+    "confirmBulkCommand": {
+      "message": "{{action}} wird an {{count}} Gerät(e) {{scope}} gesendet.",
+      "messageSplit": "{{action}} wird an {{count}} Gerät(e) {{scope}} gesendet: {{online}} jetzt online · {{queued}} für den nächsten Check-in vorgemerkt.",
+      "scopeMulti": "in {{count}} Organisationen ({{orgs}})",
+      "scopeSingle": "bei {{org}}",
+      "title": "{{action}}: {{count}} Gerät(e)?",
+      "verbs": {
+        "lock": "Sperren",
+        "maintenanceOff": "Wartung beenden",
+        "reboot": "Neustart",
+        "reboot_safe_mode": "Neustart im abgesicherten Modus",
+        "shutdown": "Herunterfahren",
+        "wake": "Aufwecken"
+      }
+    },
+    "emptyOrgTitle": "Noch keine Geräte in {{org}}",
+    "emptyOrgTitleUnnamed": "Noch keine Geräte in dieser Organisation",
+    "emptyOrgDescription": "Installieren Sie den Agent auf einem Rechner dieser Organisation, um ihn zu überwachen, oder wechseln Sie zu allen Organisationen, um den Rest Ihrer Flotte zu sehen.",
+    "viewAllOrganizations": "Alle Organisationen anzeigen",
+    "importFromRmmShort": "Importieren",
+    "wakeSkipReasons": {
+      "online": "bereits online",
+      "relayUnavailable": "ohne erreichbaren Agenten am Standort",
+      "missingMac": "ohne gespeicherte MAC-Adresse (Agent hat sich noch nicht gemeldet)",
+      "missingSubnet": "ohne nutzbare IPv4-Daten",
+      "ipv6": "nur mit IPv6-Daten",
+      "relayDisconnected": "Relay-Verbindung beim Senden getrennt — erneut versuchen",
+      "missingTarget": "nicht gefunden oder Zugriff verweigert",
+      "removed": "entfernt",
+      "invalidRelay": "mit ungültiger Relay-Auswahl"
     }
   },
   "filterAddDropdown": {
@@ -2196,7 +2919,8 @@
         "cpuCores": "CPU Kerne",
         "ramTotalMb": "RAM (MB)",
         "diskTotalGb": "Festplattengröße (GB)",
-        "gpuModel": "GPU Modell"
+        "gpuModel": "GPU Modell",
+        "health": "Hardware-Zustand"
       },
       "network": {
         "ipAddress": "IP-Adresse",
@@ -2210,7 +2934,20 @@
       },
       "software": {
         "installed": "Software installiert ist",
-        "notInstalled": "Fehlende Software"
+        "notInstalled": "Fehlende Software",
+        "version": "Softwareversion",
+        "vendor": "Softwareanbieter"
+      },
+      "logShippingFailing": "Log-Übertragung fehlerhaft",
+      "networkIsolation": {
+        "active": "Isoliert"
+      },
+      "helperVersion": "Helper-Version",
+      "deviceFunction": "Gerätefunktion",
+      "hostsWorkloads": "Hostet Workloads",
+      "workloadRuntimes": "Workload-Laufzeiten",
+      "warranty": {
+        "status": "Garantiestatus"
       }
     }
   },
@@ -2264,7 +3001,8 @@
         "cpuCores": "CPU Kerne",
         "ramTotalMb": "RAM (MB)",
         "diskTotalGb": "Festplattengröße (GB)",
-        "gpuModel": "GPU Modell"
+        "gpuModel": "GPU Modell",
+        "health": "Hardware-Zustand"
       },
       "network": {
         "ipAddress": "IP-Adresse",
@@ -2278,7 +3016,13 @@
       },
       "software": {
         "installed": "Software installiert ist",
-        "notInstalled": "Fehlende Software"
+        "notInstalled": "Fehlende Software",
+        "version": "Softwareversion",
+        "vendor": "Softwareanbieter"
+      },
+      "logShippingFailing": "Log-Übertragung fehlerhaft",
+      "networkIsolation": {
+        "active": "Isoliert"
       }
     }
   },
@@ -2295,8 +3039,10 @@
     "title": "Verknüpfungen filtern"
   },
   "filterPreviewFooter": {
+    "awaitingValue": "Wählen Sie einen Wert, um passende Geräte zu sehen",
     "counting": "…zählen",
-    "matches": "~{{count}} Geräte stimmen überein",
+    "matches_one": "~{{count}} Gerät stimmt überein",
+    "matches_other": "~{{count}} Geräte stimmen überein",
     "unavailable": "Vorschau nicht verfügbar"
   },
   "filterSentenceBuilder": {
@@ -2349,7 +3095,8 @@
         "cpuCores": "CPU Kerne",
         "ramTotalMb": "RAM (MB)",
         "diskTotalGb": "Festplattengröße (GB)",
-        "gpuModel": "GPU Modell"
+        "gpuModel": "GPU Modell",
+        "health": "Hardware-Zustand"
       },
       "network": {
         "ipAddress": "IP-Adresse",
@@ -2363,7 +3110,13 @@
       },
       "software": {
         "installed": "Software installiert ist",
-        "notInstalled": "Fehlende Software"
+        "notInstalled": "Fehlende Software",
+        "version": "Softwareversion",
+        "vendor": "Softwareanbieter"
+      },
+      "logShippingFailing": "Log-Übertragung fehlerhaft",
+      "networkIsolation": {
+        "active": "Isoliert"
       }
     }
   },
@@ -2434,6 +3187,29 @@
     "cancel": "Abbrechen",
     "genericError": "Wartungsmodus konnte nicht gestartet werden."
   },
+  "forceRebootDialog": {
+    "title": "Jetzt erzwungen neu starten",
+    "description": "Startet {{hostname}} sofort neu und schließt laufende Apps, statt auf sie zu warten.",
+    "hostnameLabel": "Gerät",
+    "osLabel": "Betriebssystem",
+    "commandLabel": "Befehl",
+    "noEffectOnOs": "Unter {{os}} wartet ein Neustart nie auf Apps; dies entspricht also einem normalen sofortigen Neustart.",
+    "warning": "Nicht gespeicherte Arbeit in geöffneten Apps auf diesem Gerät geht verloren. Der Neustart wartet weiterhin auf Befehle, die bereits auf dem Gerät laufen.",
+    "typeHostname": "Geben Sie zur Bestätigung {{hostname}} ein",
+    "stepUpHeading": "Bestätigen Sie Ihre Identität",
+    "stepUpPasskeyNote": "Sie bestätigen mit Ihrem Passkey.",
+    "stepUpCodeLabel": "Authenticator-Code",
+    "noStepUpFactor": "Fügen Sie Ihrem Konto eine Authenticator-App oder einen Passkey hinzu, bevor Sie ein Gerät erzwungen neu starten.",
+    "mfaRequired": "Schließen Sie zuerst die MFA-Anmeldung ab und versuchen Sie es erneut.",
+    "stepUpFailed": "Die Bestätigung ist fehlgeschlagen. Geben Sie einen neuen Code ein und versuchen Sie es erneut.",
+    "deviceOffline": "Dieses Gerät ist nicht online. Ein erzwungener Neustart wird nur an ein Gerät gesendet, das jetzt online ist.",
+    "agentUpgradeRequired": "Der Agent dieses Geräts ist für einen erzwungenen Neustart zu alt. Aktualisieren Sie zuerst den Agent.",
+    "genericError": "Der erzwungene Neustart konnte nicht gesendet werden.",
+    "cancel": "Abbrechen",
+    "confirm": "Jetzt erzwungen neu starten",
+    "submitStepUp": "Bestätigen und erzwungen neu starten",
+    "submitting": "Wird gesendet…"
+  },
   "moveDeviceOrgDialog": {
     "title": "In eine andere Organisation verschieben",
     "description": "Verschiebt {{hostname}} aus {{orgName}}. Verlauf, Tickets und Richtlinien wandern mit, und der Agent verbindet sich unter der neuen Organisation neu.",
@@ -2459,7 +3235,10 @@
     "submitStepUp": "Bestätigen und verschieben",
     "submitting": "Wird ausgeführt…",
     "cancel": "Abbrechen",
-    "genericError": "Das Gerät konnte nicht verschoben werden."
+    "genericError": "Das Gerät konnte nicht verschoben werden.",
+    "timeout": "Das Verschieben dauert länger als erwartet und wird auf dem Server möglicherweise noch abgeschlossen. Warten Sie eine Minute und laden Sie die Seite dann neu, um zu prüfen, in welcher Organisation sich das Gerät befindet, bevor Sie es erneut versuchen.",
+    "pamMoveActive": "Auf diesem Gerät läuft eine Sitzung mit privilegiertem Zugriff (PAM), deren Bereinigung noch nicht abgeschlossen ist. Warten Sie, bis sie beendet ist, und verschieben Sie das Gerät dann erneut.",
+    "pamMoveBlocked": "Dieses Gerät hat einen PAM-Verlauf (privilegierter Zugriff), und das Verschieben von PAM-Geräten zwischen Organisationen ist in dieser Bereitstellung nicht aktiviert."
   },
   "networkDeviceDetailPage": {
     "approval": {
@@ -2657,7 +3436,9 @@
           "networkGear": "Netzwerkgeräte",
           "peripherals": "Peripheriegeräte",
           "other": "Sonstige"
-        }
+        },
+        "site": "Standort",
+        "changeSite": "Standort ändern…"
       },
       "monitoring": {
         "description": "SNMP-Datenerfassung und Netzwerkprüfungen konfigurieren.",
@@ -2670,15 +3451,12 @@
         "invalidPort": "Der Port muss eine ganze Zahl zwischen 1 und 65535 sein.",
         "pause": "Abfragen pausieren",
         "resume": "Abfragen fortsetzen",
-        "disable": "Gesamte Überwachung deaktivieren",
-        "disableTitle": "Gesamte Überwachung deaktivieren?",
-        "disableMessage": "SNMP-Abfragen und Netzwerkprüfungen für dieses Asset werden deaktiviert.",
+        "disable": "SNMP-Überwachung deaktivieren",
+        "disableTitle": "SNMP-Überwachung deaktivieren?",
+        "disableMessage": "SNMP-Abfragen für dieses Asset beenden? Netzwerkprüfungen werden weiterhin unter Monitore verwaltet.",
         "checksTitle": "Netzwerkprüfungen",
         "noChecks": "Keine Netzwerkprüfungen konfiguriert.",
         "addCheck": "Prüfung hinzufügen",
-        "removeCheck": "Prüfung entfernen",
-        "removeCheckTitle": "Netzwerkprüfung entfernen?",
-        "removeCheckMessage": "Netzwerkprüfung „{{name}}“ entfernen? Dies kann nicht rückgängig gemacht werden.",
         "never": "nie",
         "leaveBlankToKeep": "Gespeichert — leer lassen, um den aktuellen Wert beizubehalten",
         "snmpVersion": "SNMP-Version",
@@ -2721,7 +3499,8 @@
           "tcp_port": "TCP-Port",
           "http_check": "HTTP-Prüfung",
           "dns_check": "DNS-Prüfung"
-        }
+        },
+        "addCheckHint": "Prüfung hinzufügen öffnet den Monitor-Editor mit diesem Asset."
       },
       "link": {
         "description": "Verknüpfen Sie dieses erkannte Asset mit dem verwalteten Gerät, das derselben Maschine entspricht.",
@@ -2764,12 +3543,13 @@
         "snmpSaveFailed": "Die SNMP-Einstellungen konnten nicht gespeichert werden",
         "pollingPaused": "SNMP-Abfragen pausiert",
         "pollingResumed": "SNMP-Abfragen fortgesetzt",
-        "monitoringDisabled": "Überwachung für dieses Asset deaktiviert",
-        "monitoringDisableFailed": "Die Überwachung konnte nicht deaktiviert werden",
-        "checkCreated": "Netzwerkprüfung hinzugefügt",
-        "checkCreateFailed": "Die Netzwerkprüfung konnte nicht hinzugefügt werden",
-        "checkRemoved": "Netzwerkprüfung entfernt",
-        "checkRemoveFailed": "Die Netzwerkprüfung konnte nicht entfernt werden"
+        "monitoringDisabled": "SNMP-Überwachung deaktiviert",
+        "monitoringDisableFailed": "SNMP-Überwachung konnte nicht deaktiviert werden",
+        "siteChanged": "Nach {{site}} verschoben.",
+        "siteChangeFailed": "Das Asset konnte nicht an den neuen Standort verschoben werden",
+        "siteChangedUnlinked": "Die Verknüpfung mit dem Agent-Gerät wurde entfernt, da sich dieses Gerät an einem anderen Standort befindet.",
+        "siteChangedPolicies_one": "{{count}} Topologie-Überwachungsrichtlinie wurde deaktiviert.",
+        "siteChangedPolicies_other": "{{count}} Topologie-Überwachungsrichtlinien wurden deaktiviert."
       }
     },
     "header": {
@@ -2855,6 +3635,8 @@
     "health": {
       "empty": {
         "title": "Es wird noch nichts überwacht",
+        "titleWithCheck": "Keine SNMP-Integritätsdaten",
+        "descriptionWithCheck": "Für dieses Gerät ist eine Netzwerkprüfung aktiv, daher wird die Erreichbarkeit weiterhin erfasst. Aktivieren Sie SNMP, um zusätzlich Integritätsdaten zu erfassen.",
         "action": "Überwachung einrichten",
         "benefit": {
           "printer": "Aktivieren Sie SNMP, um Toner- und Tintenstände, Papierfächer, Seitenzähler und Druckerfehler anzuzeigen.",
@@ -2978,6 +3760,7 @@
     "ariaLabel": "Filter schnell hinzufügen",
     "chips": {
       "critical": "Kritisch",
+      "logShippingFailing": "Log-Übertragung fehlerhaft",
       "lowDisk": "Wenig Festplattenspeicher",
       "needsPatches": "Benötigt Patches",
       "notSeen7d": "Nicht gesehen 7 T.",
@@ -3275,7 +4058,15 @@
     "cancelled": "Aktion in der Warteschlange abgebrochen",
     "cancelFailed": "Abbrechen der Aktion in der Warteschlange fehlgeschlagen",
     "loadFailed": "Warteschlangenaktionen konnten nicht geladen werden.",
-    "empty": "Keine ausstehenden Aktionen"
+    "empty": "Keine ausstehenden Aktionen",
+    "powerHold": {
+      "title": "{{action}} wartet auf einen laufenden Befehl",
+      "body": "{{action}} wird gesendet, sobald das Gerät seine laufenden Befehle abgeschlossen hat. {{command}} läuft seit {{minutes}} Min. ohne Ergebnis.",
+      "markFailed": "Als fehlgeschlagen markieren",
+      "markFailedIn": "Sie können ihn in {{minutes}} Min. als fehlgeschlagen markieren.",
+      "markedFailed": "Befehl als fehlgeschlagen markiert",
+      "markFailedFailed": "Befehl konnte nicht als fehlgeschlagen markiert werden"
+    }
   },
   "manualAssetModal": {
     "addTitle": "Manuellen Asset hinzufügen",
@@ -3356,6 +4147,903 @@
     "toasts": {
       "created": "Netzwerk-Asset erstellt",
       "createFailed": "Netzwerk-Asset konnte nicht erstellt werden"
+    }
+  },
+  "hardwareHealth": {
+    "title": "Speicher & RAID",
+    "hardware": "Geräte",
+    "ok": "In Ordnung",
+    "warning": "Warnung",
+    "critical": "Kritisch",
+    "unknown": "Unbekannt",
+    "loading": "Hardwarezustand wird geladen…",
+    "error": "Hardwarezustand konnte nicht geladen werden.",
+    "retry": "Erneut versuchen",
+    "noReport": "Noch kein Hardwarebericht empfangen.",
+    "noTools": "Keine RAID- oder Laufwerksdiagnose erkannt — geprüft: {{sources}}",
+    "disabled": "Hardwareüberwachung ist durch Richtlinie {{policy}} deaktiviert",
+    "collected": "Erfasst {{time}}",
+    "notSeen": "Nicht gesehen seit {{time}}",
+    "predictive": "Vorhergesagter Ausfall",
+    "virtualDisks": "Virtuelle Laufwerke",
+    "physicalDisks": "Physische Laufwerke",
+    "osDisks": "Für das Betriebssystem sichtbare Laufwerke",
+    "backed": "Durch virtuelles RAID-Laufwerk bereitgestellt",
+    "enclosures": "Gehäuse: {{total}}",
+    "identity": "Modell / Seriennummer / Firmware",
+    "diskIdentity": "Steckplatz / Modell / Seriennummer / Medium / Schnittstelle",
+    "size": "Größe",
+    "state": "Status",
+    "telemetry": "Temperatur / Medienfehler / andere Fehler / Betriebsstunden",
+    "progress": "Fortschritt von {{name}}",
+    "sources": "Quellen",
+    "unavailable": "Nicht installiert",
+    "failed": "Fehler: {{error}}",
+    "backingOff": "Pause bis {{time}}",
+    "superseded": "Ersetzt durch {{winner}}",
+    "sourceSuperseded": "Ersetzt",
+    "sourceDisabled": "Deaktiviert",
+    "partial": "Teilbericht",
+    "docs": "Installationsanleitung",
+    "events": "Hardwareereignisse",
+    "noEvents": "Keine Hardwareereignisse erfasst.",
+    "noComponents": "Keine Speicherkomponenten gemeldet. Quellen prüfen.",
+    "managementController": "Management-Controller",
+    "bmcVendor": "Hersteller",
+    "bmcFirmware": "Firmwareversion",
+    "bmcIp": "IP-Adresse",
+    "bmcMac": "MAC-Adresse",
+    "bmcOtherSite": "Management-Controller am Standort {{site}} gefunden",
+    "bmcObserved": "Zuletzt gemeldet: {{time}}; tägliche Erfassung.",
+    "bmcHost": "Management-Controller für {{name}}",
+    "bmcAgentReport": "— vom Agenten des Hosts gemeldet",
+    "bmcAssociation": "Dieser Management-Controller ist seinem Host zugeordnet und bleibt ein eigenständiges Netzwerkgerät.",
+    "bmcConfirmUnlink": "Zuordnung des Management-Controllers entfernen? Die automatische Verknüpfung bleibt für dieses Gerät deaktiviert, bis Sie es erneut verknüpfen."
+  },
+  "unassignedDevices": {
+    "title": "Nicht zugewiesene Geräte",
+    "description": "Geräte, die mit einem Partner-Bereitstellungsschlüssel registriert wurden, warten hier, bis Sie sie einer Kundenorganisation zuweisen.",
+    "refresh": "Aktualisieren",
+    "bulkAssign": "Auswahl zuweisen ({{count}})",
+    "reportedCaption": "Rechnername, Betriebssystem, Seriennummer, MAC-Adresse und Modell werden vom jeweiligen Gerät gemeldet und nicht überprüft.",
+    "loading": "Geräte werden geladen…",
+    "loadFailed": "Nicht zugewiesene Geräte konnten nicht geladen werden.",
+    "empty": "Keine Geräte warten auf eine Zuweisung.",
+    "selectAll": "Alle Geräte auswählen",
+    "selectRow": "{{hostname}} auswählen",
+    "never": "Nie",
+    "assign": "Zuweisen",
+    "columns": {
+      "hostname": "Rechnername",
+      "os": "Betriebssystem",
+      "serial": "Seriennummer",
+      "mac": "MAC-Adresse",
+      "deployKey": "Bereitstellungsschlüssel",
+      "parkedAt": "Wartet seit",
+      "lastSeen": "Zuletzt gesehen"
+    },
+    "selectionCap": "Pro Stapel können höchstens {{max}} Geräte zugewiesen werden."
+  },
+  "assignParkedDialog": {
+    "titleSingle": "{{hostname}} zuweisen",
+    "titleBulk": "{{count}} Geräte zuweisen",
+    "description": "Das Gerät wird Teil der gewählten Organisation und des Standorts und erhält deren Konfiguration.",
+    "identityCaption": "Vom Gerät gemeldet — nicht überprüft",
+    "hostnameLabel": "Rechnername",
+    "osLabel": "Betriebssystem",
+    "serialLabel": "Seriennummer",
+    "macLabel": "MAC-Adresse",
+    "modelLabel": "Modellbezeichnung",
+    "targetOrgLabel": "Organisation",
+    "targetOrgPlaceholder": "Wählen Sie eine Organisation",
+    "targetSiteLabel": "Standort",
+    "targetSitePlaceholder": "Wählen Sie einen Standort",
+    "loadingSites": "Standorte werden geladen…",
+    "noSites": "Diese Organisation hat keine Standorte.",
+    "noOrgs": "Keine Organisation kann Geräte aufnehmen.",
+    "possession": "Ich habe auf anderem Weg bestätigt, dass dieses Gerät zu diesem Kunden gehört",
+    "collisionHeading": "An diesem Standort gibt es bereits ein Gerät mit diesem Rechnernamen.",
+    "collisionAccept": "Trotzdem zuweisen und eine Identitätskonflikt-Warnung auslösen",
+    "stepUpHeading": "Bestätigen Sie Ihre Identität",
+    "stepUpIntro": "Bestätigen Sie die Zuweisung mit Ihrem zweiten Faktor.",
+    "stepUpCodeLabel": "Authentifizierungscode",
+    "stepUpPasskeyNote": "Ihr Passkey wird angefordert, wenn Sie fortfahren.",
+    "stepUpRetry": "Diese Bestätigung wurde nicht akzeptiert. Versuchen Sie es erneut.",
+    "noStepUpFactor": "Richten Sie eine Authentifizierungs-App oder einen Passkey ein, um Geräte zuzuweisen.",
+    "cancel": "Abbrechen",
+    "close": "Schließen",
+    "submit": "Zuweisen",
+    "submitStepUp": "Bestätigen und zuweisen",
+    "submitting": "Wird zugewiesen…",
+    "genericError": "Das Gerät konnte nicht zugewiesen werden.",
+    "successSingle": "{{hostname}} wurde {{orgName}} zugewiesen",
+    "bulkSummary": "{{ok}} von {{total}} Geräten zugewiesen",
+    "resultOk": "Zugewiesen",
+    "resultCodes": {
+      "DEVICE_NOT_FOUND": "Nicht gefunden",
+      "DEVICE_NOT_PARKED": "Bereits zugewiesen",
+      "DEVICE_NOT_ASSIGNABLE": "Wird entfernt",
+      "DEVICE_PARKING_EXPIRED": "Abgelaufen",
+      "TARGET_ORG_INVALID": "Organisation kann keine Geräte aufnehmen",
+      "TARGET_SITE_INVALID": "Standort nicht verfügbar",
+      "DEVICE_IDENTITY_COLLISION": "Rechnername existiert am Standort bereits",
+      "PARTNER_DEVICE_LIMIT_REACHED": "Gerätelimit erreicht",
+      "STEP_UP_REQUIRED": "Bestätigung erforderlich",
+      "ASSIGNMENT_FAILED": "Fehlgeschlagen"
+    }
+  },
+  "timeFleet": {
+    "title": "Zeitsynchronisierung",
+    "subtitle": "Beobachtete Windows-Zeitkonfiguration und Synchronisierungsbefunde.",
+    "view": "Ansicht",
+    "list": "Geräte",
+    "byDomain": "Nach AD-Domäne",
+    "health": "Zustand",
+    "finding": "Befund",
+    "findings": "Befunde",
+    "role": "Rolle",
+    "organization": "Organisation",
+    "site": "Standort",
+    "all": "Alle",
+    "refresh": "Aktualisieren",
+    "device": "Gerät",
+    "source": "Zeitquelle",
+    "received": "Zuletzt empfangen",
+    "stale": "Veraltet",
+    "noData": "Noch keine Zeitdaten",
+    "unknown": "Unbekannt",
+    "never": "Nie",
+    "none": "Keine",
+    "noDomain": "Keine AD-Domäne gemeldet",
+    "pdcContext": "Der PDC wird zur Einordnung oben angezeigt und kann außerhalb der ausgewählten Filter oder Seite liegen.",
+    "pdcMissing": "Der PDC ist nicht im zugänglichen Gerätebestand registriert. Möglicherweise fehlen Ihnen die Zugriffsrechte.",
+    "exportCurrent": "Aktuellen Stand als CSV exportieren",
+    "exportHistory": "Tagesdaten als CSV exportieren",
+    "from": "Von (UTC)",
+    "to": "Bis (UTC)",
+    "evidence": "Vom Breeze-Agenten gemeldete beobachtete Synchronisierung; Tage ohne Bericht werden als Lücken aufgeführt. Exportieren Sie bis zu 400 UTC-Tage. Die Filter wählen den aktuellen Gerätebestand aus.",
+    "rangeError": "Wählen Sie einen Zeitraum von 1 bis 400 UTC-Tagen.",
+    "exportError": "Der Nachweisexport ist fehlgeschlagen. Versuchen Sie es erneut.",
+    "siteError": "Die Standorte konnten nicht geladen werden. Aktualisieren Sie die Ansicht, um es erneut zu versuchen.",
+    "loading": "Zeitsynchronisierungsdaten werden geladen…",
+    "loadError": "Die Zeitsynchronisierungsdaten konnten nicht geladen werden.",
+    "retry": "Erneut versuchen",
+    "empty": "Keine zugänglichen Windows-Geräte entsprechen diesen Filtern.",
+    "count": "{{count}} passendes Gerät",
+    "count_other": "{{count}} passende Geräte",
+    "previous": "Zurück",
+    "next": "Weiter",
+    "page": "Seite {{page}}",
+    "healthLabels": {
+      "healthy": "In Ordnung",
+      "warning": "Warnung",
+      "critical": "Kritisch",
+      "unknown": "Unbekannt"
+    },
+    "roles": {
+      "workgroup": "Arbeitsgruppe",
+      "entra_only": "Nur Entra",
+      "member": "Domänenmitglied",
+      "dc": "Domänencontroller",
+      "pdc_emulator": "PDC-Emulator der Domäne",
+      "forest_root_pdc_emulator": "PDC-Emulator der Gesamtstruktur-Stammdomäne",
+      "unknown": "Unbekannt"
+    }
+  },
+  "workloads": {
+    "loadFailed": "Workloads für dieses Gerät konnten nicht geladen werden.",
+    "retry": "Erneut versuchen",
+    "agentTooOld": "Agent zu alt – aktualisieren Sie den Agent, damit Workloads gemeldet werden.",
+    "noRuntimes": "Auf diesem Gerät wurde keine Container- oder VM-Runtime erkannt.",
+    "runtimes": {
+      "docker": "Docker",
+      "podman": "Podman",
+      "hyperv": "Hyper-V",
+      "proxmox": "Proxmox VE",
+      "containerd": "containerd"
+    },
+    "version": "Version {{version}}",
+    "versionUnknown": "Version unbekannt",
+    "detection": {
+      "absent": "Nicht installiert",
+      "unknown": "Erkennung nicht eindeutig"
+    },
+    "status": {
+      "ok": "Wird erfasst",
+      "disabled": "Erfassung ist aus – aktivieren Sie Workload-Inventar in einer Konfigurationsrichtlinie",
+      "unavailable": "Runtime läuft nicht",
+      "permission_denied": "Zugriff verweigert",
+      "error": "Erfassung fehlgeschlagen",
+      "unsupported": "Auf diesem Gerät nicht unterstützt"
+    },
+    "detectOnly": "Nur erkannt – Workloads für diese Runtime werden nicht aufgelistet.",
+    "counts": "{{total}} Workloads · {{running}} laufend · {{stopped}} gestoppt",
+    "partial": "Teilweiser Snapshot – einige Details konnten nicht gelesen werden, daher werden die erfassten Daten angezeigt.",
+    "truncated": "Angezeigt werden {{reported}} von {{observed}} Workloads, die die Runtime gemeldet hat.",
+    "lastError": "Letzter Fehler: {{error}}",
+    "lastCollected": "Zuletzt erfasst {{time}}",
+    "empty": "Keine Workloads gemeldet.",
+    "columns": {
+      "name": "Name",
+      "state": "Status",
+      "image": "Image / Gast-OS",
+      "compose": "Compose-Projekt",
+      "started": "Gestartet",
+      "imageStatus": "Image-Status"
+    },
+    "states": {
+      "running": "Läuft",
+      "stopped": "Gestoppt",
+      "paused": "Pausiert",
+      "restarting": "Wird neu gestartet",
+      "other": "Sonstige"
+    },
+    "policy": {
+      "title": "Workload-Inventar",
+      "description": "Container und virtuelle Maschinen auf Container- und VM-Hosts auflisten",
+      "offNote": "Runtimes werden immer erkannt, aber die Workload-Auflistung bleibt aus, bis eine Richtlinie sie aktiviert.",
+      "enabled": "Workloads auflisten",
+      "runtimesHeading": "Aufzulistende Runtimes",
+      "agentSupport": "Die Hyper-V- und Proxmox-VE-Schalter wirken nur auf Agenten, die diese Treiber enthalten; ältere Agenten ignorieren sie.",
+      "interval": "Erfassungsintervall (Minuten)",
+      "invalidInterval": "Das Intervall muss eine ganze Zahl von Minuten zwischen {{min}} und {{max}} sein."
+    },
+    "imageStatus": {
+      "behind": "Veraltet",
+      "current": "Aktuell",
+      "pinned": "Fixiert",
+      "local": "Lokaler Build",
+      "not_found": "Tag nicht gefunden",
+      "not_checked": "Nicht geprüft"
+    },
+    "imageStatusReason": {
+      "pending": "Noch nicht geprüft",
+      "private": "Private Registry – Anmeldedaten erforderlich",
+      "unsupported_registry": "Registry wird nicht unterstützt",
+      "provenance_unknown": "Herkunft unbekannt — der Image-Name wird an keine Registry gesendet",
+      "error": "Registry-Prüfung fehlgeschlagen – wird wiederholt",
+      "behind": "Für diesen Tag ist ein neueres Image veröffentlicht",
+      "current": "Entspricht der Registry",
+      "pinned": "Auf einen Digest fixiert – kein Vergleich möglich",
+      "local": "Lokal erstellt – kein Registry-Digest",
+      "not_found": "Der Tag existiert in der Registry nicht mehr"
+    },
+    "imageFilter": {
+      "label": "Image-Status",
+      "all": "Alle",
+      "empty": "Keine Workloads mit diesem Image-Status."
+    }
+  },
+  "deviceEdrGenericSection": {
+    "title": "Weitere EDR-Anbieter",
+    "loadError": "Einige EDR-Anbieterdaten konnten nicht geladen werden.",
+    "duplicateNotice": "Über zwei Konsolen verknüpft: Dieses Gerät erscheint in mehr als einer {{provider}}-Verbindung.",
+    "openDetections": "Offene Erkennungen",
+    "coverageHeading": "Die Abdeckung ist möglicherweise unvollständig",
+    "fields": {
+      "health": "Zustand",
+      "status": "Status",
+      "isolation": "Isolierung",
+      "agentVersion": "Agent-Version",
+      "lastSeen": "Zuletzt gesehen"
+    },
+    "health": {
+      "healthy": "Gesund",
+      "degraded": "Eingeschränkt",
+      "unhealthy": "Fehlerhaft",
+      "unknown": "Unbekannt"
+    },
+    "online": {
+      "online": "Online",
+      "offline": "Offline",
+      "unknown": "Unbekannt"
+    },
+    "isolation": {
+      "isolated": "Isoliert",
+      "not_isolated": "Nicht isoliert",
+      "pending": "Ausstehend",
+      "unknown": "Unbekannt"
+    },
+    "severity": {
+      "critical": "Kritisch",
+      "high": "Hoch",
+      "medium": "Mittel",
+      "low": "Niedrig",
+      "info": "Information",
+      "unknown": "Unbekannt"
+    },
+    "detectionStatus": {
+      "open": "Offen",
+      "in_progress": "In Bearbeitung",
+      "mitigated": "Eingedämmt",
+      "resolved": "Behoben",
+      "false_positive": "Fehlalarm",
+      "dismissed": "Verworfen",
+      "unknown": "Unbekannt"
+    },
+    "actions": {
+      "label": {
+        "isolate": "Gerät isolieren",
+        "unisolate": "Isolierung aufheben",
+        "scan": "Scan starten",
+        "update_agent": "Agent aktualisieren"
+      },
+      "unavailable": "Nicht verfügbar",
+      "mfaRequired": "Mit MFA bestätigen, um Reaktionsaktionen auszuführen",
+      "error": "Die Reaktionsaktion konnte nicht angefordert werden.",
+      "requested": "{{action}} für {{device}} angefordert",
+      "inProgress": "Für dieses Gerät läuft bereits eine andere Reaktionsaktion.",
+      "confirming": "Angefordert — Bestätigung durch {{vendor}} läuft",
+      "reasonLabel": "Grund (optional)",
+      "confirm": {
+        "isolate": {
+          "title": "{{device}} isolieren?",
+          "message": "{{vendor}} isoliert {{device}}: Das Gerät verliert den Netzwerkzugriff, außer auf {{vendor}}. Die Isolierung kann später aufgehoben werden."
+        },
+        "unisolate": {
+          "title": "Isolierung von {{device}} aufheben?",
+          "message": "{{vendor}} stellt den normalen Netzwerkzugriff für {{device}} wieder her."
+        }
+      }
+    },
+    "history": {
+      "heading": "Letzte Reaktionsaktionen",
+      "checking": "Wird geprüft",
+      "aiBadge": "KI",
+      "status": {
+        "queued": "In Warteschlange",
+        "submitted": "In Bearbeitung",
+        "succeeded": "Erfolgreich",
+        "failed": "Fehlgeschlagen"
+      }
+    }
+  },
+  "endpointMessages": {
+    "dialogTitle": "Nachricht an Benutzer senden",
+    "sendAction": "Nachricht senden",
+    "fields": {
+      "title": "Titel",
+      "body": "Nachricht",
+      "severity": "Dringlichkeit",
+      "requiresAck": "Bestätigung erforderlich",
+      "expiry": "Läuft ab"
+    },
+    "severity": {
+      "info": "Information",
+      "warning": "Warnung",
+      "critical": "Kritisch"
+    },
+    "expiry": {
+      "h1": "1 Stunde",
+      "h4": "4 Stunden",
+      "h24": "24 Stunden",
+      "h72": "72 Stunden",
+      "untilClosed": "Bis zum Schließen (max. 7 Tage)"
+    },
+    "preview": {
+      "heading": "Vorschau",
+      "sender": "Von Ihrem Unternehmen",
+      "footer": "Gesendet von Ihrem IT-Dienstleister",
+      "acknowledge": "Bestätigen"
+    },
+    "recipients": "Empfänger: {{count}} Geräte",
+    "columns": {
+      "device": "Gerät",
+      "delivery": "Zustellung"
+    },
+    "capability": {
+      "assist_card": "Assist-Karte (Konsolensitzung) oder native Benachrichtigung als Alternative",
+      "native": "Native Benachrichtigung",
+      "unsupported": "Nicht unterstützte Agent-Version - wird nicht zugestellt"
+    },
+    "confirm": {
+      "text": "Diese Nachricht wird an {{count}} Geräte gesendet. Prüfen Sie die Karte unten.",
+      "send": "An {{count}} Geräte senden"
+    },
+    "result": {
+      "summary": "{{queued}} in Warteschlange, {{failed}} fehlgeschlagen",
+      "queued": "In Warteschlange",
+      "failed": "Fehlgeschlagen"
+    },
+    "actions": {
+      "send": "Nachricht senden",
+      "sending": "Wird gesendet...",
+      "cancel": "Abbrechen",
+      "back": "Zurück",
+      "close": "Schließen"
+    },
+    "errors": {
+      "send_failed": "Die Nachricht konnte nicht gesendet werden. Versuchen Sie es erneut.",
+      "agent_unsupported": "Der Agent auf diesem Gerät unterstützt noch keine Nachrichten.",
+      "no_permission": "Sie haben keine Berechtigung, diesem Gerät Nachrichten zu senden.",
+      "offline_rejected": "Das Gerät ist offline und die Nachricht wurde nicht eingereiht.",
+      "rate_limited": "Zu viele Nachrichten in letzter Zeit. Versuchen Sie es später erneut.",
+      "cap_exceeded": "Dieser Versand überschreitet das zulässige Limit.",
+      "feature_disabled": "Endpunkt-Nachrichten sind für diese Organisation nicht aktiviert.",
+      "queue_failed": "Die Nachricht konnte für dieses Gerät nicht eingereiht werden.",
+      "in_progress": "Diese Nachricht wird bereits gesendet. Warten Sie einen Moment und prüfen Sie dann das Ergebnis.",
+      "unavailable": "Das Senden von Nachrichten ist vorübergehend nicht verfügbar. Versuchen Sie es in Kürze erneut.",
+      "no_devices_resolved": "Für diese Auswahl wurden keine Geräte gefunden.",
+      "idempotency_conflict": "Diese Nachrichten-ID wurde bereits für eine andere Nachricht verwendet. Bearbeiten Sie die Nachricht und senden Sie sie erneut."
+    },
+    "issues": {
+      "html": "HTML ist im Nachrichtentext nicht erlaubt.",
+      "images": "Bilder sind im Nachrichtentext nicht erlaubt.",
+      "httpsLinks": "Links im Nachrichtentext müssen https verwenden.",
+      "referenceLinks": "Verweis-Links sind nicht erlaubt. Verwenden Sie stattdessen Inline-Links.",
+      "titleHtml": "HTML ist im Titel nicht erlaubt.",
+      "titleLinks": "Links sind im Titel nicht erlaubt.",
+      "invalid": "Die Nachricht enthält nicht erlaubte Inhalte."
+    },
+    "history": {
+      "title": "Endpunkt-Nachrichten",
+      "description": "Nachrichten an Personen an ihren Geräten und was mit jeder davon passiert ist.",
+      "empty": "Es wurden noch keine Nachrichten gesendet.",
+      "loading": "Wird geladen...",
+      "loadFailed": "Nachrichten konnten nicht geladen werden.",
+      "retry": "Erneut versuchen",
+      "loadMore": "Mehr laden",
+      "selectPrompt": "Wählen Sie eine Nachricht aus, um die Zustelldetails zu sehen.",
+      "detailLoadFailed": "Diese Nachricht konnte nicht geladen werden.",
+      "notFound": "Diese Nachricht wurde nicht gefunden.",
+      "noAccess": "Sie haben keine Berechtigung, Endpunkt-Nachrichten anzuzeigen.",
+      "purgedTitle": "Inhalt entfernt",
+      "purgedBody": "Der Nachrichtentext wurde nach 90 Tagen entfernt. Der Zustellverlauf bleibt erhalten.",
+      "purgedListTitle": "(Inhalt entfernt)",
+      "badgeRetracted": "Zurückgezogen",
+      "badgeAi": "KI",
+      "devicesLabel": "Geräte: {{count}}",
+      "fields": {
+        "body": "Nachricht",
+        "deliveries": "Geräte",
+        "host": "Gerät",
+        "status": "Status",
+        "surface": "Angezeigt in",
+        "error": "Fehler",
+        "sent": "Gesendet",
+        "expires": "Läuft ab",
+        "delivered": "Zugestellt",
+        "displayed": "Angezeigt",
+        "acknowledged": "Bestätigt",
+        "dismissed": "Geschlossen",
+        "retracted": "Zurückgezogen",
+        "receipts": "Quittungen",
+        "noReceipts": "Keine",
+        "requiresAck": "Bestätigung erforderlich"
+      },
+      "receiptEvents": {
+        "displayed": "Angezeigt",
+        "acknowledged": "Bestätigt",
+        "dismissed": "Geschlossen",
+        "expired": "Abgelaufen"
+      },
+      "surface": {
+        "assist": "Assist-Karte",
+        "native": "Native Benachrichtigung"
+      },
+      "statuses": {
+        "queued": "In Warteschlange",
+        "delivered": "Zugestellt",
+        "displayed": "Angezeigt",
+        "acknowledged": "Bestätigt",
+        "dismissed": "Geschlossen",
+        "expired": "Abgelaufen",
+        "retracted": "Zurückgezogen",
+        "failed": "Fehlgeschlagen",
+        "superseded": "Ersetzt"
+      },
+      "actions": {
+        "retract": "Zurückziehen",
+        "retracting": "Wird zurückgezogen...",
+        "resend": "An fehlgeschlagene oder abgelaufene erneut senden",
+        "resending": "Wird gesendet..."
+      },
+      "retractConfirm": {
+        "title": "Diese Nachricht zurückziehen?",
+        "message": "Auf Geräten, die sie gerade anzeigen, wird sie entfernt. Geräte, die sie noch nicht erhalten haben, bekommen sie nicht mehr.",
+        "confirm": "Zurückziehen"
+      },
+      "messages": {
+        "retractSuccess": "Nachricht zurückgezogen.",
+        "retractPartial": "Nachricht zurückgezogen, aber {{count}} Geräte konnten nicht aktualisiert werden.",
+        "retractFailed": "Die Nachricht konnte nicht zurückgezogen werden.",
+        "resendSuccess": "Nachricht erneut gesendet. Geräte: {{count}}.",
+        "resendFailed": "Die Nachricht konnte nicht erneut gesendet werden."
+      },
+      "resendErrors": {
+        "retracted": "Diese Nachricht wurde zurückgezogen und kann nicht erneut gesendet werden.",
+        "body_purged": "Der Nachrichtentext wurde entfernt, daher kann sie nicht erneut gesendet werden.",
+        "in_progress": "Ein Versand für diese Nachricht läuft bereits.",
+        "idempotency_conflict": "Dieser erneute Versand wurde bereits mit anderen Angaben übermittelt.",
+        "nothing_to_resend": "Keine fehlgeschlagenen oder abgelaufenen Geräte zum erneuten Senden."
+      }
+    }
+  },
+  "endpointChat": {
+    "tabLabel": "Live-Chat",
+    "tabTitle": "Live-Chat mit der Person an diesem Gerät",
+    "unsupported": "Kein Chat auf diesem Gerät. Der Chat benötigt Breeze Assist in einer Windows-Konsolensitzung.",
+    "footer": "Der Benutzer sieht dies als Chatfenster. Ein Chat gewährt nie Fernzugriff.",
+    "startHeading": "Chat starten",
+    "firstMessageLabel": "Erste Nachricht",
+    "startChat": "Chat starten",
+    "starting": "Wird gestartet...",
+    "recentHeading": "Letzte Chats",
+    "empty": "Noch keine Chats mit diesem Gerät.",
+    "loadFailed": "Chats konnten nicht geladen werden.",
+    "loading": "Wird geladen...",
+    "back": "Zurück zu den Chats",
+    "endChat": "Chat beenden",
+    "ending": "Wird beendet...",
+    "messageLabel": "Nachricht",
+    "send": "Senden",
+    "sending": "Wird gesendet...",
+    "openExisting": "Bestehenden Chat öffnen",
+    "user": "Benutzer",
+    "technician": "Techniker",
+    "fromUser": "{{name}} (Benutzer)",
+    "undelivered": "Nicht zugestellt",
+    "status": {
+      "opening": "Warten, bis der Benutzer das Chatfenster sieht...",
+      "open": "Chat geöffnet",
+      "closed": "Dieser Chat wurde beendet.",
+      "expired": "Dieser Chat wurde nach 30 Minuten Inaktivität beendet.",
+      "failed": "Der Chat konnte nicht gestartet werden."
+    },
+    "statusShort": {
+      "opening": "Wird geöffnet",
+      "open": "Offen",
+      "closed": "Beendet",
+      "expired": "Abgelaufen",
+      "failed": "Fehlgeschlagen"
+    },
+    "errors": {
+      "chat_requires_assist": "Der Chat benötigt Breeze Assist in einer Windows-Konsolensitzung.",
+      "agent_unsupported": "Der Agent auf diesem Gerät unterstützt Chat noch nicht.",
+      "device_offline": "Das Gerät ist offline. Versuchen Sie es erneut, wenn es online ist.",
+      "platform_unsupported": "Chat ist nur auf Windows-Geräten verfügbar.",
+      "conversation_active": "Mit diesem Gerät läuft bereits ein Chat.",
+      "rate_limited": "In letzter Zeit wurden zu viele Chats oder Nachrichten gesendet. Versuchen Sie es später erneut.",
+      "open_timeout": "Das Gerät hat nicht rechtzeitig geantwortet, daher wurde der Chat nicht gestartet.",
+      "chat_window_failed": "Das Gerät konnte das Chatfenster nicht anzeigen.",
+      "conversation_not_open": "Dieser Chat ist nicht mehr geöffnet.",
+      "feature_disabled": "Chat ist für diese Organisation nicht aktiviert.",
+      "no_permission": "Sie haben keine Berechtigung, mit diesem Gerät zu chatten.",
+      "device_not_found": "Dieses Gerät wurde nicht gefunden.",
+      "generic": "Beim Chat ist etwas schiefgelaufen. Versuchen Sie es erneut.",
+      "open_failed": "Der Chat konnte nicht gestartet werden. Versuchen Sie es erneut.",
+      "send_failed": "Die Nachricht konnte nicht gesendet werden. Versuchen Sie es erneut.",
+      "close_failed": "Der Chat konnte nicht beendet werden. Versuchen Sie es erneut."
+    },
+    "updatesPaused": "Live-Aktualisierungen pausiert — neuer Versuch läuft",
+    "closeNotAnnounced": "Der Chat ist hier geschlossen. Das Chatfenster des Benutzers bleibt möglicherweise geöffnet, bis sich sein Gerät erneut verbindet oder er antwortet.",
+    "unavailable": "Dieser Chat ist nicht mehr verfügbar"
+  },
+  "deviceOverviewState": {
+    "label": "Gerätestatus",
+    "lastCheckIn": "Letzte Meldung {{ago}}",
+    "openAlerts_one": "{{count}} offene Warnung",
+    "openAlerts_other": "{{count}} offene Warnungen",
+    "openTickets_one": "{{count}} offenes Ticket",
+    "openTickets_other": "{{count}} offene Tickets",
+    "noOpenAlerts": "Keine offenen Warnungen",
+    "untitledAlert": "Warnung gemeldet",
+    "alertsUnavailable": "Offene Warnungen konnten nicht geladen werden",
+    "viewAlerts": "Warnungen anzeigen"
+  },
+  "physicalPlacementCard": {
+    "title": "Physischer Standort",
+    "room": "Raum",
+    "rack": "Rack",
+    "rackUnit": "Rack-Einheit",
+    "heightU": "Höhe (HE)",
+    "add": "Standort hinzufügen",
+    "edit": "Bearbeiten",
+    "save": "Speichern",
+    "saving": "Wird gespeichert...",
+    "cancel": "Abbrechen",
+    "remove": "Standort entfernen",
+    "loadFailed": "Physischer Standort konnte nicht geladen werden.",
+    "linkedNotice": "Dieses Asset ist mit einem verwalteten Gerät verknüpft. Bearbeiten Sie den Standort auf <deviceLink>{{name}}</deviceLink>.",
+    "openDevice": "dem Gerät",
+    "removeConfirm": {
+      "title": "Physischen Standort entfernen?",
+      "message": "Dadurch werden Raum, Rack, Höheneinheit und Höhe für dieses Asset gelöscht."
+    },
+    "validation": {
+      "roomTooLong": "Der Raum darf höchstens 255 Zeichen lang sein.",
+      "rackTooLong": "Das Rack darf höchstens 128 Zeichen lang sein.",
+      "unitRange": "Geben Sie eine ganze Zahl von 1 bis 100 ein."
+    },
+    "toasts": {
+      "saved": "Physischer Standort gespeichert",
+      "removed": "Physischer Standort entfernt",
+      "saveFailed": "Physischer Standort konnte nicht gespeichert werden",
+      "concurrent": "Der Standort wurde anderweitig geändert. Die aktuellen Werte wurden neu geladen; versuchen Sie es erneut.",
+      "authorityDevice": "Dieses Asset ist jetzt mit einem verwalteten Gerät verknüpft. Bearbeiten Sie den Standort auf dem Gerät.",
+      "mfaRequired": "Zum Ändern des physischen Standorts ist eine Multi-Faktor-Authentifizierung erforderlich."
+    }
+  },
+  "assetCircuitCard": {
+    "title": "WAN und Leitung",
+    "loadFailed": "WAN- und Leitungsinformationen konnten nicht geladen werden.",
+    "empty": "Für dieses Asset ist keine Leitung erfasst oder für Sie sichtbar.",
+    "provider": "Anbieter",
+    "cid": "Leitungs-ID",
+    "bandwidth": "Bandbreite",
+    "serviceType": "Diensttyp",
+    "administrativeStatus": "Administrativer Status",
+    "sitesServed": "Von dieser Leitung versorgte Standorte",
+    "terminationSite": "Abschlussstandort: {{site}} (von {{asset}} / {{iface}})",
+    "terminationSiteBare": "Abschlussstandort: {{site}}",
+    "terminationUnassigned": "Abschluss nicht zugewiesen",
+    "terminationNeedsReassociation": "Abschluss muss neu zugeordnet werden",
+    "interfaces": "Schnittstellen",
+    "noInterfaces": "Keine Schnittstellen erfasst.",
+    "wanBadge": "WAN",
+    "retiredBadge": "Außer Betrieb",
+    "markWan": "Als WAN markieren",
+    "unmarkWan": "WAN entfernen",
+    "truncated": "Es werden nur einige Schnittstellen angezeigt.",
+    "unmarkConfirm": {
+      "title": "WAN-Rolle entfernen?",
+      "message": "{{name}} wird nicht mehr als WAN-Schnittstelle behandelt."
+    },
+    "status": {
+      "active": "Aktiv",
+      "planned": "Geplant",
+      "suspended": "Ausgesetzt",
+      "disconnected": "Getrennt"
+    },
+    "toasts": {
+      "marked": "Schnittstelle als WAN markiert",
+      "unmarked": "WAN-Rolle entfernt",
+      "failed": "WAN-Rolle konnte nicht aktualisiert werden",
+      "mfaRequired": "Zum Ändern der WAN-Rolle ist eine Multi-Faktor-Authentifizierung erforderlich.",
+      "hasTermination": "Diese Schnittstelle hat einen aktiven Leitungsabschluss. Verschieben oder entfernen Sie zuerst den Abschluss.",
+      "retired": "Diese Schnittstelle ist außer Betrieb und kann nicht mehr geändert werden.",
+      "notFound": "Schnittstelle nicht gefunden. Die Liste wurde neu geladen.",
+      "permissionDenied": "Sie haben keine Berechtigung, die Topologie zu ändern."
+    }
+  },
+  "partnerGroups": {
+    "ownerScope": "Gruppeneigentümer",
+    "organization": "Diese Organisation",
+    "partner": "Alle Organisationen",
+    "dynamicOnly": "partnerweit, nur dynamisch",
+    "scopeHint": "Die Mitgliedschaft wird in jeder von Ihnen verwalteten Organisation ausgewertet; statische Mitgliedschaft, Standorte sowie Gruppen- und Organisationsfilter sind nicht verfügbar.",
+    "allOrgs": "Alle Org.",
+    "pending": "Mitgliedschaft wird aktualisiert…",
+    "current": "Zuletzt ausgewertet: {{time}}",
+    "notEvaluated": "Noch nicht ausgewertet",
+    "partial_one": "{{count}} Organisation nicht ausgewertet · letzte erfolgreiche Auswertung {{time}}",
+    "partial_other": "{{count}} Organisationen nicht ausgewertet · letzte erfolgreiche Auswertung {{time}}",
+    "retryHint": "Breeze versucht es für diese Organisationen automatisch erneut. Das Speichern des Gruppenfilters startet eine neue Auswertung.",
+    "showMembers": "Mitglieder anzeigen",
+    "hideMembers": "Mitglieder ausblenden",
+    "device": "Gerät",
+    "organizationColumn": "Organisation",
+    "status": "Zustand",
+    "loading": "Mitglieder werden geladen…",
+    "membersError": "Gruppenmitglieder konnten nicht geladen werden.",
+    "retry": "Erneut versuchen",
+    "emptyMembers": "Keine Geräte in dieser Gruppe."
+  },
+  "bulkGroupMembership": {
+    "titleAdd": "Zu Gruppe hinzufügen",
+    "titleRemove": "Aus Gruppe entfernen",
+    "selectionSummary": "Ausgewählte Geräte: {{n}} · Organisation: {{org}}",
+    "groupLabel": "Statische Gruppe",
+    "selectGroup": "Gruppe auswählen",
+    "loadingGroups": "Gruppen werden geladen…",
+    "noGroups": "Keine statische Gruppe dieser Organisation kann diese Auswahl aufnehmen.",
+    "scopeHint": "Es werden nur statische Gruppen dieser Organisation angezeigt. Eine Standortgruppe erscheint nur, wenn sich alle ausgewählten Geräte an diesem Standort befinden. Dynamische Gruppen werden nicht angezeigt: Ihre Regeln bestimmen die Mitglieder.",
+    "cancel": "Abbrechen",
+    "saving": "Wird gespeichert…",
+    "submitAdd": "Geräte hinzufügen",
+    "submitRemove": "Geräte entfernen",
+    "failedToLoadGroups": "Gruppen konnten nicht geladen werden",
+    "failedToUpdate": "Gruppenmitgliedschaft konnte nicht aktualisiert werden",
+    "addResult": "{{group}}: {{added}} hinzugefügt, {{skipped}} bereits in der Gruppe",
+    "removeResult": "{{group}}: {{removed}} entfernt, {{notMember}} waren nicht in der Gruppe",
+    "removeResultForbidden": "{{group}}: {{removed}} entfernt, {{notMember}} waren nicht in der Gruppe. Nicht entfernt (kein Zugriff auf den Standort des Geräts): {{devices}}",
+    "andMore": "{{names}} und {{n}} weitere"
+  },
+  "networkIsolation": {
+    "heading": "Netzwerkisolierung",
+    "isolate": "Vom Netzwerk isolieren…",
+    "release": "Isolierung aufheben…",
+    "release_queued": "Aufheben (wartet auf erneute Geräteverbindung)",
+    "startTitle": "Vom Netzwerk isolieren",
+    "releaseTitle": "Netzwerkisolierung aufheben",
+    "startDescription": "Netzwerkverkehr außer der Breeze-Verwaltung blockieren.",
+    "releaseDescription": "Entfernung der Breeze-Isolierungsregeln anfordern. Ein Offline-Gerät erhält die Freigabe beim erneuten Verbinden.",
+    "serverWarning": "Dies ist ein Serverbetriebssystem. Die Isolierung kann Dienste für andere Geräte unterbrechen.",
+    "reason": "Begründung",
+    "ttlHours": "Dauer (Stunden)",
+    "incidentId": "Bestehende Vorfall-ID (optional)",
+    "incidentTitle": "Titel des neuen Vorfalls",
+    "remoteRelay": "Remotedesktop über das Relay erreichbar halten",
+    "startSuccess": "Netzwerkisolierung angefordert",
+    "releaseSuccess": "Aufhebung der Isolierung angefordert",
+    "mutationError": "Netzwerkisolierung konnte nicht aktualisiert werden. Versuchen Sie es erneut.",
+    "loadError": "Netzwerkisolierung konnte nicht geladen werden. Versuchen Sie es erneut.",
+    "unavailable": "Die Eignung für Netzwerkisolierung ist nicht verfügbar.",
+    "extend": "Isolierung verlängern",
+    "extendTitle": "Netzwerkisolierung verlängern",
+    "extendSuccess": "Isolierungsablauf verlängert",
+    "isolatedExpires": "Isoliert · läuft in {{hours}} Std. ab",
+    "acknowledge": "Lokale Aufhebung bestätigen",
+    "acknowledgeSuccess": "Lokale Aufhebung bestätigt",
+    "acknowledgeError": "Lokale Aufhebung konnte nicht bestätigt werden",
+    "showCode": "Notfallcodes anzeigen",
+    "hideCode": "Notfallcodes ausblenden",
+    "codeCurrent": "Aktueller Code",
+    "codeNext": "Code für die nächste Stunde",
+    "codeValidUntil": "Aktueller Code gültig bis {{date}}",
+    "codeError": "Notfallcodes konnten nicht geladen werden. Versuchen Sie es erneut.",
+    "incidentHeading": "Netzwerkisolierung",
+    "retry": "Isolierungsstatus erneut laden",
+    "filterLabel": "Isoliert",
+    "states": {
+      "requested": "Isolierung angefordert",
+      "dispatched": "Isolierung gesendet",
+      "applying": "Isolierung wird angewendet",
+      "applied": "Isolierung wird geprüft",
+      "verified": "Isolierung geprüft",
+      "release_requested": "Aufhebung angefordert",
+      "released": "Isolierung aufgehoben",
+      "expired": "Isolierung abgelaufen",
+      "failed": "Isolierung fehlgeschlagen",
+      "released_locally": "Lokal aufgehoben · Bestätigung erforderlich",
+      "self_released": "Selbst aufgehoben · Bestätigung erforderlich",
+      "uninstalled": "Agent deinstalliert"
+    },
+    "refusal": {
+      "feature_disabled": "Neue Netzwerkisolierungen sind deaktiviert.",
+      "partner_not_enabled": "Netzwerkisolierung ist für diesen Partner nicht aktiviert.",
+      "agent_below_gate": "Aktualisieren Sie auf eine Agent-Version mit Netzwerkisolierung.",
+      "agent_not_ready": "Der Agent ist noch nicht bereit, Netzwerkisolierung durchzusetzen.",
+      "device_lifecycle": "Der Lebenszyklusstatus dieses Geräts verhindert eine neue Isolierung.",
+      "unsupported_platform": "Diese Plattform unterstützt keine Netzwerkisolierung.",
+      "trust_restricted": "Der Vertrauensstatus des Partners verhindert neue Isolierungen.",
+      "isolation_already_active": "Dieses Gerät hat bereits eine aktive Isolierung.",
+      "isolation_unacknowledged": "Bestätigen Sie die vorherige lokale Aufhebung, bevor Sie erneut isolieren.",
+      "incident_mismatch": "Wählen Sie einen offenen Vorfall aus der Organisation dieses Geräts.",
+      "site_forbidden": "Sie haben keinen Zugriff auf den Standort dieses Geräts.",
+      "device_not_found": "Dieses Gerät wurde nicht gefunden.",
+      "isolation_not_found": "Diese Isolierung wurde nicht gefunden.",
+      "relay_unavailable": "Kein Remotedesktop-Relay verfügbar. Deaktivieren Sie die Relay-Option oder konfigurieren Sie TURN.",
+      "invalid_allowlist": "Die Isolierungsfreigabeliste des Servers ist ungültig. Wenden Sie sich an Ihre Administration.",
+      "invalid_allowlist_server_url_missing": "Dieses Gerät hat keine Agent-Server-URL und AGENT_SERVER_URL ist auf dem Server nicht gesetzt. Setzen Sie AGENT_SERVER_URL und versuchen Sie es erneut.",
+      "invalid_allowlist_server_url_invalid": "Die Agent-Server-URL dieses Geräts ist keine gültige http(s)-URL. Prüfen Sie die Server-URL des Geräts oder AGENT_SERVER_URL.",
+      "invalid_allowlist_backup_url_invalid": "AGENT_BACKUP_SERVER_URL ist keine gültige http(s)-URL. Korrigieren Sie sie und versuchen Sie es erneut.",
+      "invalid_allowlist_relay_config_invalid": "Die TURN-Relay-Einstellungen (TURN_HOST, TURN_TLS_HOST, TURN_PORT, TURN_TLS_PORT) sind ungültig. Korrigieren Sie sie oder deaktivieren Sie die Relay-Option.",
+      "invalid_allowlist_policy_invalid": "Die gespeicherte Eindämmungsrichtlinie enthält einen ungültigen oder zu großen Allowlist-Eintrag. Prüfen Sie die erlaubten Ziele der Richtlinie.",
+      "isolation_conflict": "Die Isolierung hat sich geändert. Aktualisieren Sie den Status und versuchen Sie es erneut.",
+      "isolation_secret_unavailable": "Wiederherstellungscodes sind vorübergehend nicht verfügbar. Wenden Sie sich an Ihre Administration.",
+      "approval_mismatch": "Die Genehmigung passt nicht zu dieser Isolierungsanfrage.",
+      "device_offline": "Das Gerät ist offline. Aktualisieren Sie den Status, bevor Sie die Isolierung starten.",
+      "device_decommissioned": "Ein außer Betrieb genommenes Gerät kann keine neue Isolierung starten.",
+      "device_pending_assignment": "Weisen Sie dieses Gerät vor der Isolierung einer Organisation zu.",
+      "backup_helper_update_required": "Aktualisieren Sie den Backup-Helfer, bevor Sie die Isolierung starten."
+    }
+  },
+  "runVendorUpdatesDialog": {
+    "title": "Herstellerupdates ausführen",
+    "description": "Führt das Update-Tool von {{vendor}} jetzt auf {{hostname}} aus. Es kann Treiber und Anwendungen installieren sowie BIOS und Firmware flashen.",
+    "rebootLegend": "Wenn die Updates einen Neustart benötigen",
+    "whenFinishedLabel": "Nach Abschluss neu starten",
+    "whenFinishedDescription": "Breeze startet das Gerät nach dem Lauf neu, mit der Warnung, die seine Patch-Richtlinie festlegt. BIOS- und Firmware-Updates sind eingeschlossen.",
+    "leaveToMeLabel": "Neustart mir überlassen",
+    "leaveToMeDescription": "Breeze startet das Gerät nicht neu. Jemand startet es später neu, um die Updates abzuschließen.",
+    "skippedNote": "BIOS- und Firmware-Updates werden bei dieser Auswahl übersprungen, weil sie einen Neustart benötigen, den Breeze steuert. Treiber und Anwendungen werden weiterhin ausgeführt.",
+    "confirm": "Updates ausführen",
+    "submitting": "Wird gestartet...",
+    "cancel": "Abbrechen",
+    "genericError": "Herstellerupdates konnten auf diesem Gerät nicht gestartet werden.",
+    "queued": "Herstellerupdates auf {{hostname}} gestartet.",
+    "queuedSkipped": "Herstellerupdates auf {{hostname}} gestartet. BIOS und Firmware wurden übersprungen.",
+    "refusal": {
+      "flagOff": "Herstellerupdates sind für diese Organisation nicht aktiviert.",
+      "laneClosed": "Herstellerupdates sind für den Hersteller dieses Geräts noch nicht verfügbar.",
+      "killSwitch": "Herstellerupdates sind für den Hersteller dieses Geräts pausiert.",
+      "agentTooOld": "Der Agent dieses Geräts ist für Herstellerupdates zu alt. Aktualisieren Sie den Agent auf {{version}} oder neuer.",
+      "notApplicable": "Herstellerupdates gelten nicht für dieses Gerät.",
+      "notSupported": "Das Tool des Herstellers unterstützt dieses Modell nicht.",
+      "ephemeral": "Herstellerupdates laufen nicht auf Quick-Support-Geräten.",
+      "parked": "Weisen Sie dieses Gerät einer Organisation zu, bevor Sie Herstellerupdates ausführen.",
+      "offline": "Das Gerät ist nicht online. Herstellerupdates starten nur auf einem Gerät, das gerade online ist.",
+      "runInFlight": "Auf diesem Gerät läuft bereits ein Herstellerupdate-Lauf.",
+      "noOpenCategories": "Mit dieser Auswahl kann nichts ausgeführt werden. Hier sind nur BIOS und Firmware verfügbar: Wählen Sie „Nach Abschluss neu starten“.",
+      "decommissioned": "Dieses Gerät ist außer Betrieb genommen, daher kann nichts an es gesendet werden.",
+      "cancelledAtClaim": "Der Lauf wurde abgebrochen, bevor er das Gerät erreichte. Versuchen Sie es erneut."
+    }
+  },
+  "vendorUpdates": {
+    "title": "Herstellerupdates",
+    "refreshState": "Aktualisieren",
+    "loadError": "Herstellerupdates für dieses Gerät konnten nicht geladen werden.",
+    "retryLoad": "Erneut versuchen",
+    "empty": "Auf diesem Gerät wurde noch kein Herstellerupdate ausgeführt.",
+    "state": {
+      "upToDate": "Auf dem neuesten Stand",
+      "overdue": "Überfällig",
+      "failing": "Fehlgeschlagen",
+      "notSupported": "Nicht unterstützt",
+      "notManaged": "Nicht verwaltet",
+      "waitingForReboot": "Wartet auf Neustart",
+      "rebootOverdue": "Neustart überfällig"
+    },
+    "stateDescription": {
+      "upToDate": "Der letzte geplante Lauf wurde abgeschlossen.",
+      "overdue": "Seit Fälligkeit des Zeitplans wurde kein Lauf abgeschlossen.",
+      "failing": "Der letzte Lauf wurde nicht abgeschlossen. Unten steht, was zu tun ist.",
+      "notSupported": "Das Tool des Herstellers unterstützt dieses Modell nicht.",
+      "notManaged": "Keine Richtlinie plant hier Herstellerupdates. Sie können sie weiterhin bei Bedarf ausführen.",
+      "notOffered": "Herstellerupdates sind auf diesem Gerät derzeit nicht verfügbar.",
+      "waitingForReboot": "Die Updates sind installiert und werden nach dem nächsten Neustart wirksam.",
+      "rebootOverdue": "Ein Neustart steht seit mehr als drei Tagen aus."
+    },
+    "lastRunHeading": "Letzter Lauf",
+    "outcomeLabel": "Ergebnis",
+    "noOutcomeYet": "Warten auf Rückmeldung des Geräts",
+    "errorCodeLabel": "Fehlercode",
+    "toolVersionLabel": "Tool-Version",
+    "lastAttemptLabel": "Gestartet",
+    "installedLabel": "Installiert",
+    "failedLabel": "Fehlgeschlagen",
+    "rebootLabel": "Neustart",
+    "rebootPendingSince": "Neustart erforderlich seit {{date}}",
+    "rebootNotNeeded": "Kein Neustart erforderlich",
+    "outcome": {
+      "success": "Erfolgreich",
+      "successRebootRequired": "Erfolgreich, Neustart erforderlich",
+      "noUpdates": "Keine Updates gefunden",
+      "partial": "Teilweise installiert",
+      "failed": "Nicht abgeschlossen",
+      "notSupported": "Modell nicht unterstützt",
+      "toolUnavailable": "Tool nicht verfügbar",
+      "blockedOnBattery": "Blockiert: im Akkubetrieb",
+      "blockedRebootPending": "Blockiert: Neustart ausstehend",
+      "blockedNoRecoveryKey": "Blockiert: kein Wiederherstellungsschlüssel",
+      "retryLater": "Wird erneut versucht",
+      "interrupted": "Unterbrochen"
+    },
+    "outcomeHelp": {
+      "partial": "Einige Updates wurden installiert, andere nicht. Prüfen Sie die fehlgeschlagenen Einträge unten und führen Sie die Herstellerupdates dann erneut aus.",
+      "failed": "Das Tool des Herstellers wurde nicht abgeschlossen. Prüfen Sie den Fehlercode und führen Sie die Herstellerupdates dann erneut aus.",
+      "notSupported": "Das Tool des Herstellers unterstützt dieses Modell nicht, daher fragt Breeze nicht mehr an, bis sich die Tool-Version oder das Modell ändert.",
+      "toolUnavailable": "Das Update-Tool des Herstellers ist nicht installiert und konnte nicht abgerufen werden. Prüfen Sie, ob das Gerät die Download-Seite des Herstellers erreichen kann.",
+      "blockedOnBattery": "BIOS und Firmware laufen nur am Netzteil mit ausreichendem Akkustand. Schließen Sie das Gerät an und führen Sie die Herstellerupdates dann erneut aus.",
+      "blockedRebootPending": "Auf dem Gerät steht bereits ein Neustart aus. Führen Sie die Herstellerupdates erneut aus, sobald es neu gestartet wurde.",
+      "blockedNoRecoveryKey": "BIOS und Firmware bleiben blockiert, bis Breeze den aktuellen BitLocker-Wiederherstellungsschlüssel dieses Geräts besitzt. Sichern Sie den Schlüssel in Breeze und führen Sie die Herstellerupdates dann erneut aus.",
+      "retryLater": "Das Tool des Herstellers hat darum gebeten, es später erneut zu versuchen. Breeze hat nichts auf dem Gerät geändert.",
+      "interrupted": "Der Lauf wurde vor dem Abschluss gestoppt, meist weil das Gerät neu gestartet wurde oder der Agent angehalten wurde. Führen Sie die Herstellerupdates erneut aus."
+    },
+    "categoriesHeading": "Was auf diesem Gerät ausgeführt werden kann",
+    "category": {
+      "bios": "BIOS",
+      "firmware": "Firmware",
+      "driver": "Treiber",
+      "application": "Anwendungen"
+    },
+    "gateOpen": "Verfügbar",
+    "gateClosed": "Bei {{vendor}} noch nicht verfügbar. Breeze aktiviert jeden Update-Typ erst, nachdem er auf echter Hardware getestet wurde.",
+    "itemResult": {
+      "installed": "installiert",
+      "failed": "fehlgeschlagen",
+      "skipped": "übersprungen"
+    },
+    "history": {
+      "heading": "Lauf-Verlauf",
+      "loadError": "Der Lauf-Verlauf konnte nicht geladen werden.",
+      "noResult": "Kein lesbares Ergebnis",
+      "bySchedule": "Zeitplan",
+      "byUnknown": "Unbekannt",
+      "range": "{{from}}-{{to}} von {{total}}",
+      "previousPage": "Zurück",
+      "nextPage": "Weiter"
     }
   }
 }

@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { periodSchema } from '@breeze/shared';
+import { CURRENCY_CODES, isZeroDecimal, periodSchema } from '@breeze/shared';
 
 /**
  * Per-report-type config schemas (#3198 spec §6). Moved here from
@@ -102,6 +102,23 @@ export const hardwareLifecycleConfigSchema = legacyReportConfigSchema.extend({
 });
 
 /**
+ * Config for the Backup status report (Cove email layout, #6013). `sites`
+ * follows the whole-report site-scope convention of the other org-scoped
+ * curated types (feeds `assertRequestedScopeWithinAuthority`'s generic
+ * `config.sites` check).
+ *
+ * `includeDevicesWithoutBackup` DEFAULTS TRUE — unlike the web overview's
+ * `onlyWithBackup` default, this report mirrors Cove's "All devices" email and
+ * exists to surface coverage GAPS. `sources` requires at least one entry: an
+ * empty selection would silently produce a zero-row report.
+ */
+export const backupStatusReportConfigSchema = legacyReportConfigSchema.extend({
+  sites: z.array(z.string().guid()).optional().default([]),
+  includeDevicesWithoutBackup: z.boolean().optional().default(true),
+  sources: z.array(z.enum(['breeze', 'provider'])).min(1).optional().default(['breeze', 'provider']),
+});
+
+/**
  * Config for the Threat Detection Review report (#5784 W02). `topIncidents`
  * caps the incident table so one noisy month cannot produce a 400-page PDF; the
  * artifact states the cap and the number withheld rather than truncating
@@ -161,7 +178,7 @@ export const identityAccessConfigSchema = legacyReportConfigSchema.extend({
 /** Does a stored selector value actually select something? An empty array or
  *  an object whose every value selects nothing (`filters: {}`,
  *  `filters: { siteIds: [] }`) does not; any other present value does. */
-function selectsSomething(value: unknown): boolean {
+export function selectsSomething(value: unknown): boolean {
   if (value === undefined || value === null) return false;
   if (Array.isArray(value)) return value.length > 0;
   if (typeof value === 'object') return Object.values(value).some(selectsSomething);
@@ -218,6 +235,18 @@ export const ticketSlaConfigSchema = legacyReportConfigSchema.extend({
 export type TicketSlaConfig = z.infer<typeof ticketSlaConfigSchema>;
 
 /**
+ * #11018 — Customer SLA performance. Org-only, so the selectors are refused as
+ * on the business types. No `.default()`: the generator applies
+ * `last_full_month` and `includeSubjects: false`.
+ */
+export const ticketSlaPerformanceConfigSchema = legacyReportConfigSchema.extend({
+  ...BUSINESS_SELECTOR_REFUSALS,
+  period: periodSchema.optional(),
+  includeSubjects: z.boolean().optional(),
+});
+export type TicketSlaPerformanceConfig = z.infer<typeof ticketSlaPerformanceConfigSchema>;
+
+/**
  * #3198 W02 R2 — Technician time & billability (spec §3.3 R2).
  *
  * - `groupBy` (default `technician`, applied in the generator) narrows the
@@ -264,3 +293,105 @@ export const arAgingConfigSchema = legacyReportConfigSchema.extend({
   includePaidInPeriod: z.boolean().optional(),
 });
 export type ArAgingConfig = z.infer<typeof arAgingConfigSchema>;
+
+/**
+ * #7608 W10 — AI usage by client.
+ *
+ * - `period` is the standard business-report period (owner timezone, `[start,
+ *   end)`); absent = the last full calendar month, applied by
+ *   `resolveReportPeriod`.
+ * - `groupBy` has NO `.default()`: the default depends on the owner scope
+ *   (`organization` at partner scope, `model` at org scope) and is applied in
+ *   the generator, exactly like ticket SLA's.
+ * - No org/site/device selector keys (ruling T3e): the org set comes from the
+ *   live org list at partner scope, never from config.
+ */
+export const aiUsageByClientConfigSchema = legacyReportConfigSchema.extend({
+  ...BUSINESS_SELECTOR_REFUSALS,
+  period: periodSchema.optional(),
+  groupBy: z.enum(['organization', 'model']).optional(),
+});
+export type AiUsageByClientConfig = z.infer<typeof aiUsageByClientConfigSchema>;
+
+/**
+ * #9828 W1 (Gate B 8). `mrr_renewals` is measured at run time: contracts keep
+ * no status history, so neither an `asOf` date nor a `period` can be honoured.
+ * Both are refused (400 naming the key) rather than stored and silently
+ * ignored. Same body as `refusedBusinessSelector`, with the run-time message.
+ */
+function refusedAsOfRunTime(key: string) {
+  return z.unknown().superRefine((value, ctx) => {
+    if (selectsSomething(value)) {
+      ctx.addIssue({
+        code: 'custom',
+        message: `${key} is not supported for mrr_renewals; it is measured at run time because contracts keep no status history`,
+      });
+    }
+  }).optional();
+}
+
+/**
+ * #9828 W1 — MRR & renewals.
+ *
+ * - `groupBy` (default `organization`) and `renewalHorizonDays` (default 90)
+ *   are applied in the generator: no `.default()` anywhere
+ *   (parseStoredReportConfig filters defaults top-level only).
+ * - No org/site/device selector keys (ruling T3e).
+ */
+export const mrrRenewalsConfigSchema = legacyReportConfigSchema.extend({
+  ...BUSINESS_SELECTOR_REFUSALS,
+  asOf: refusedAsOfRunTime('asOf'),
+  period: refusedAsOfRunTime('period'),
+  groupBy: z.enum(['organization', 'contract']).optional(),
+  renewalHorizonDays: z.union([z.literal(30), z.literal(60), z.literal(90), z.literal(180)]).optional(),
+});
+export type MrrRenewalsConfig = z.infer<typeof mrrRenewalsConfigSchema>;
+
+/**
+ * #9828 W2 — quote win rate.
+ *
+ * - `period` is the standard business-report period (owner timezone, `[start,
+ *   end)`), applied to each lineage's FIRST send date; absent = the last full
+ *   calendar month, applied by `resolveReportPeriod`.
+ * - `groupBy` has NO `.default()`: the default depends on the owner scope
+ *   (`organization` at partner scope, `author` at org scope) and is applied
+ *   in the generator, exactly like ticket SLA's and AI usage's.
+ * - No org/site/device selector keys (ruling T3e).
+ */
+export const quoteWinRateConfigSchema = legacyReportConfigSchema.extend({
+  ...BUSINESS_SELECTOR_REFUSALS,
+  period: periodSchema.optional(),
+  groupBy: z.enum(['organization', 'author', 'currency']).optional(),
+});
+export type QuoteWinRateConfig = z.infer<typeof quoteWinRateConfigSchema>;
+
+/**
+ * #9828 W3 — Client profitability.
+ *
+ * - `period` (absent = last full month) and `groupBy` (default `organization`
+ *   at partner scope, `source` at org scope) are applied in the generator: no
+ *   `.default()` anywhere (parseStoredReportConfig filters defaults top-level
+ *   only).
+ * - `laborCostPerHour` (OD2-B, Gate B 11): the report's own uniform internal
+ *   labor rate — a report-definition option like `weeklyCapacityHours`, not a
+ *   partner setting (settings.md Rule 2). Absent = hours only, no estimate. A
+ *   positive decimal string with at most 2 dp (whole units for a zero-decimal
+ *   currency), in a supported currency; never inferred from report data.
+ * - No org/site/device selector keys (ruling T3e).
+ */
+export const clientProfitabilityConfigSchema = legacyReportConfigSchema.extend({
+  ...BUSINESS_SELECTOR_REFUSALS,
+  period: periodSchema.optional(),
+  groupBy: z.enum(['organization', 'source']).optional(),
+  laborCostPerHour: z.strictObject({
+    amount: z.string()
+      .regex(/^\d{1,7}(\.\d{1,2})?$/, 'laborCostPerHour.amount must be a decimal with at most 2 decimal places')
+      .refine((v) => Number(v) > 0, 'laborCostPerHour.amount must be greater than zero'),
+    currencyCode: z.enum(CURRENCY_CODES),
+  }).superRefine((rate, ctx) => {
+    if (isZeroDecimal(rate.currencyCode) && !/^\d+(\.0{1,2})?$/.test(rate.amount)) {
+      ctx.addIssue({ code: 'custom', path: ['amount'], message: `laborCostPerHour.amount must be a whole number for ${rate.currencyCode}` });
+    }
+  }).optional(),
+});
+export type ClientProfitabilityConfig = z.infer<typeof clientProfitabilityConfigSchema>;

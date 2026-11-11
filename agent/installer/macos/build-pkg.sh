@@ -34,25 +34,32 @@ echo "  Output:   $OUTPUT"
 echo ""
 
 # ----- Build payload root -----
-# Mirror the on-disk layout the installer will create
+# The root-daemon binaries (agent, watchdog) and breeze-backup are STAGED in
+# a root-only directory; postinstall copies them to /usr/local/bin or
+# /Library/Breeze/bin per install-location.sh (#7211). Staging them straight
+# into /usr/local/bin would write root binaries into a directory a non-root
+# identity controls on exactly the hosts that need the trusted directory.
+# The desktop helper is not relocated and still installs to /usr/local/bin.
 PAYLOAD="$WORK_DIR/payload"
+STAGING="$PAYLOAD/Library/Breeze/pkg-staging"
 mkdir -p "$PAYLOAD/usr/local/bin"
+mkdir -p "$STAGING"
 mkdir -p "$PAYLOAD/Library/LaunchDaemons"
 mkdir -p "$PAYLOAD/Library/LaunchAgents"
 
-cp "$AGENT_BIN" "$PAYLOAD/usr/local/bin/breeze-agent"
-chmod 755 "$PAYLOAD/usr/local/bin/breeze-agent"
+cp "$AGENT_BIN" "$STAGING/breeze-agent"
+chmod 755 "$STAGING/breeze-agent"
 
 cp "$DESKTOP_HELPER_BIN" "$PAYLOAD/usr/local/bin/breeze-desktop-helper"
 chmod 755 "$PAYLOAD/usr/local/bin/breeze-desktop-helper"
 
-# Install backup binary
-cp "$BACKUP_BIN" "$PAYLOAD/usr/local/bin/breeze-backup"
-chmod 755 "$PAYLOAD/usr/local/bin/breeze-backup"
+# Backup binary (installed next to the agent; the agent resolves it there)
+cp "$BACKUP_BIN" "$STAGING/breeze-backup"
+chmod 755 "$STAGING/breeze-backup"
 
-# Install watchdog binary
-cp "$WATCHDOG_BIN" "$PAYLOAD/usr/local/bin/breeze-watchdog"
-chmod 755 "$PAYLOAD/usr/local/bin/breeze-watchdog"
+# Watchdog binary
+cp "$WATCHDOG_BIN" "$STAGING/breeze-watchdog"
+chmod 755 "$STAGING/breeze-watchdog"
 
 cp "$SCRIPT_DIR/../../service/launchd/com.breeze.agent.plist" \
    "$PAYLOAD/Library/LaunchDaemons/com.breeze.agent.plist"
@@ -72,7 +79,17 @@ SCRIPTS="$WORK_DIR/scripts"
 mkdir -p "$SCRIPTS"
 cp "$SCRIPT_DIR/preinstall" "$SCRIPTS/preinstall"
 cp "$SCRIPT_DIR/postinstall" "$SCRIPTS/postinstall"
+# Sourced by postinstall from its own directory.
+cp "$SCRIPT_DIR/install-location.sh" "$SCRIPTS/install-location.sh"
+# Also sourced by postinstall: the breeze-group create/repair rule, shared with
+# the daemon, which go:embeds the same file (#7829).
+cp "$SCRIPT_DIR/../../internal/sessionbroker/ensure_ipc_group.sh" "$SCRIPTS/ensure_ipc_group.sh"
+# The network-isolation recovery daemon's template (#10099). It travels with
+# the scripts, not in the payload: launchd would load a payload LaunchDaemon at
+# every boot. postinstall renders it only when a recovery binary was staged.
+cp "$SCRIPT_DIR/../../service/launchd/com.breeze.isolation.plist" "$SCRIPTS/com.breeze.isolation.plist"
 chmod 755 "$SCRIPTS/preinstall" "$SCRIPTS/postinstall"
+chmod 644 "$SCRIPTS/install-location.sh" "$SCRIPTS/ensure_ipc_group.sh" "$SCRIPTS/com.breeze.isolation.plist"
 
 # ----- Build component package -----
 mkdir -p "$(dirname "$OUTPUT")"

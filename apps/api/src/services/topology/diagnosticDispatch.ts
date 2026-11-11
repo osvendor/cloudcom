@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { and, asc, eq, isNull, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, isNull, sql } from 'drizzle-orm';
 import {
   topologyDiagnosticCommandSchema,
   type TopologyDiagnosticCommand,
@@ -13,19 +13,28 @@ import {
   topologyCollectionSources,
   topologyDiagnosticRuns,
   topologyNodeBindings,
+  topologyProbeTargets,
   topologySiteState,
 } from '../../db/schema';
 import {
   registerCommandRevalidation,
   type CommandRevalidationRow,
   type ClaimCancelReason,
+  type RevalidationHoldReason,
 } from '../commandClaimEligibility';
-// TYPE-ONLY on purpose: `commandQueue.ts` statically imports `routes/agentWs.ts`
-// and this module sits in `commandDispatch.ts`'s import closure. The runtime
-// insert comes from the `commandQueueInsert.ts` leaf instead.
+// TYPE-ONLY on purpose: `commandQueue.ts` imports `commandDispatch.ts`, which
+// side-effect-imports this module, so a runtime edge back to `commandQueue.ts`
+// would be an import cycle. The runtime insert comes from the
+// `commandQueueInsert.ts` leaf instead.
 import type { CommandPayload } from '../commandQueue';
 import { insertQueuedCommandInTransaction } from '../commandQueueInsert';
 import { CommandTypes } from '../commandTypes';
+import { getPermissionAuthorityVersion } from '../permissions';
+import {
+  revalidateTopologyRequesterAuthority,
+  runRequiresRequesterRevalidation,
+  topologyRequesterAuthoritySchema,
+} from './diagnosticTraceAuthority';
 import {
   TOPOLOGY_DIAGNOSTIC_INTENT_EVENT,
   type TopologyDiagnosticIntent,
@@ -40,12 +49,42 @@ import {
  */
 export type TopologyCommandAuthorityDecision =
   | { allow: true; payload: TopologyDiagnosticCommand }
-  | { allow: false; reason: ClaimCancelReason };
+  | { allow: false; reason: ClaimCancelReason; hold?: never }
+  /** Neither delivered nor cancelled: the requester's version was not prepared (#11358). */
+  | { allow: false; hold: RevalidationHoldReason; reason?: never };
 
 type Reader = Pick<typeof db, 'select'>;
 
+/** Requester user id → permission-authority version (`null`: unavailable), resolved before the claim locked rows. */
+export type TopologyRequesterPermissionVersions = ReadonlyMap<string, string | null>;
+
+/**
+ * Where the requester's permission version comes from (#11358). A claim passes
+ * the map its prepare half resolved, because it holds `device_commands` row
+ * locks and must not wait on Redis. `'live'` reads Redis, and only a caller
+ * outside a claim may pass it. Required, so an in-lock caller cannot fall back
+ * to a live read by leaving it out.
+ */
+export type TopologyRequesterPermissionSource = TopologyRequesterPermissionVersions | 'live';
+
 function deny(reason: ClaimCancelReason): TopologyCommandAuthorityDecision {
   return { allow: false, reason };
+}
+
+/**
+ * A `permissionVersion` lookup that answers only from `versions` and never
+ * reads Redis. A requester missing from the map resolves to `null` (so the
+ * revalidation denies at that step) and is recorded in `missed`; the caller
+ * turns that denial into a hold.
+ */
+function preparedPermissionVersionLookup(versions: TopologyRequesterPermissionVersions) {
+  const missed = new Set<string>();
+  const lookup = async (userId: string): Promise<string | null> => {
+    if (versions.has(userId)) return versions.get(userId) ?? null;
+    missed.add(userId);
+    return null;
+  };
+  return { lookup, missed };
 }
 
 /**
@@ -54,11 +93,20 @@ function deny(reason: ClaimCancelReason): TopologyCommandAuthorityDecision {
  *
  * Fails closed: an unknown run, a malformed payload, a moved device, a rotated
  * producer epoch or a changed site configuration all deny delivery.
+ *
+ * `permissionVersions` (#11358): the delivery claim runs this while it holds
+ * `device_commands` row locks. It therefore passes the map from
+ * {@link resolveTopologyRequesterPermissionVersions}, which runs before the
+ * lock, and Redis is never read here. A requester missing from the map answers
+ * `{ hold: 'revalidation_unprepared' }`, and the claim leaves the row pending
+ * for the next claim. A requester is missing when the preparation did not
+ * cover the row: the row arrived after the read, fell past the prepare row
+ * limit, or the type's preparer failed.
  */
 export async function validateTopologyCommandAuthority(
   command: CommandRevalidationRow,
   rawPayload: unknown,
-  options: { now?: Date; reader?: Reader } = {},
+  options: { now?: Date; reader?: Reader; permissionVersions: TopologyRequesterPermissionSource },
 ): Promise<TopologyCommandAuthorityDecision> {
   const now = options.now ?? new Date();
   const reader = options.reader ?? db;
@@ -141,8 +189,11 @@ export async function validateTopologyCommandAuthority(
     return deny('scope_changed');
   }
 
+  // M3-D7: fence on what THIS plan executes, not on any settings revision —
+  // an unrelated settings write must not strand every in-flight diagnostic.
+  // The plan's `settingsRevision` stays as provenance.
   const [state] = await reader
-    .select({ settingsRevision: topologySiteState.settingsRevision })
+    .select({ effectiveSettings: topologySiteState.effectiveSettings })
     .from(topologySiteState)
     .where(
       and(
@@ -151,21 +202,133 @@ export async function validateTopologyCommandAuthority(
       ),
     )
     .limit(1);
-  if (!state || state.settingsRevision.toString() !== payload.plan.settingsRevision) {
+  if (!state) return deny('scope_changed');
+  if (!(await planConfigurationCurrent(reader, run, payload.plan, state.effectiveSettings))) {
     return deny('scope_changed');
+  }
+
+  // M3-D13: the REQUESTER's live authority, not only the origin's — for a
+  // routed trace and for a scheduled policy occurrence (whose requester is the
+  // arming actor, and whose policy must still be armed at the same revision).
+  // Partner trust is already evaluated by the generic claim.
+  if (runRequiresRequesterRevalidation(run)) {
+    // The check order is unchanged: a malformed or changed requester still
+    // denies before any version is needed.
+    const prepared = options.permissionVersions === 'live' ? null : preparedPermissionVersionLookup(options.permissionVersions);
+    const denial = await revalidateTopologyRequesterAuthority({
+      reader,
+      run,
+      ...(prepared && { permissionVersion: prepared.lookup }),
+    });
+    if (prepared && prepared.missed.size > 0) return { allow: false, hold: 'revalidation_unprepared' };
+    if (denial) return deny(denial === 'authority_unavailable' ? 'authority_unavailable' : 'scope_changed');
   }
 
   return { allow: true, payload };
 }
 
+/**
+ * Delivery's lock-free half (#11358). Returns the current permission version
+ * of every requester whose frozen authority one of these diagnostics checks at
+ * delivery. It is read BEFORE the claim locks any `device_commands` row; it is
+ * registered as the revalidation's prepare half. The in-lock half then compares
+ * against this map and never waits on Redis.
+ *
+ * This is the read the in-lock check used to make, moved earlier. Redis is not
+ * transactional with Postgres, so no read fences a version bump that lands
+ * after it. The unfenced window now starts at this pre-lock read rather than
+ * at the in-lock check. Result publication re-checks the version live.
+ *
+ * A `null` value (Redis unavailable) is kept, and the in-lock half denies on
+ * it (`authority_unavailable`), as it did when it read live. Runs are read by
+ * id only. The in-lock half re-reads each run with its full fence, and a
+ * version resolved here for a run it then refuses goes unused.
+ */
+export async function resolveTopologyRequesterPermissionVersions(
+  reader: Reader,
+  payloads: ReadonlyArray<unknown>,
+): Promise<TopologyRequesterPermissionVersions> {
+  const runIds = new Set<string>();
+  for (const payload of payloads) {
+    const parsed = topologyDiagnosticCommandSchema.safeParse(payload);
+    if (parsed.success) runIds.add(parsed.data.runId);
+  }
+  if (runIds.size === 0) return new Map();
+  const runs = await reader
+    .select({
+      recipeId: topologyDiagnosticRuns.recipeId,
+      policyId: topologyDiagnosticRuns.policyId,
+      requesterAuthority: topologyDiagnosticRuns.requesterAuthority,
+    })
+    .from(topologyDiagnosticRuns)
+    .where(inArray(topologyDiagnosticRuns.id, [...runIds]));
+  const userIds = new Set<string>();
+  for (const run of runs) {
+    if (!runRequiresRequesterRevalidation(run)) continue;
+    // An authority that does not parse is denied in-lock before any version is needed.
+    const frozen = topologyRequesterAuthoritySchema.safeParse(run.requesterAuthority);
+    if (frozen.success) userIds.add(frozen.data.userId);
+  }
+  return new Map(await Promise.all(
+    [...userIds].map(async (userId) => [userId, await getPermissionAuthorityVersion(userId)] as const),
+  ));
+}
+
+/**
+ * Every configured target the plan pins must still be the same live,
+ * enabled revision, and outbound probing must not have been withdrawn from
+ * the compiled configuration. Observed gateway/resolver destinations carry
+ * their own origin/evidence fences above.
+ */
+export async function planConfigurationCurrent(
+  reader: Reader,
+  run: { orgId: string; siteId: string },
+  plan: TopologyDiagnosticPlan,
+  effectiveSettings: unknown,
+): Promise<boolean> {
+  const pinned = plan.destinations.flatMap((destination) =>
+    destination.target.kind === 'configured_target'
+      ? [{ id: destination.target.targetId, revision: destination.target.targetRevision }]
+      : []);
+  if (!pinned.length) return true;
+  const configuration = (effectiveSettings as { configuration?: { outboundEnabled?: unknown } } | null)?.configuration;
+  if (configuration !== undefined && configuration.outboundEnabled !== true) return false;
+  const rows = await reader
+    .select({ id: topologyProbeTargets.id, revision: topologyProbeTargets.revision, enabled: topologyProbeTargets.enabled, deletedAt: topologyProbeTargets.deletedAt })
+    .from(topologyProbeTargets)
+    .where(and(
+      eq(topologyProbeTargets.orgId, run.orgId),
+      eq(topologyProbeTargets.siteId, run.siteId),
+      inArray(topologyProbeTargets.id, pinned.map((target) => target.id)),
+    ));
+  const live = new Map(rows.map((row) => [row.id, row]));
+  return pinned.every((target) => {
+    const row = live.get(target.id);
+    return !!row && row.enabled && row.deletedAt === null && row.revision.toString() === target.revision;
+  });
+}
+
+const NO_VERSIONS: TopologyRequesterPermissionVersions = new Map();
+
+/**
+ * Two halves (#11358). The prepare half resolves the requesters' permission
+ * versions from Redis before the claim locks any `device_commands` row. The
+ * in-lock half compares against them. If a diagnostic needs a requester version
+ * that was not prepared (no preparation at all, or that requester missing), it
+ * is held for the next claim. A diagnostic that needs no requester version
+ * never waits on the preparation.
+ */
 registerCommandRevalidation(
   CommandTypes.NETWORK_DIAGNOSTIC,
-  async (tx, row) => {
+  async (tx, row, versions: TopologyRequesterPermissionVersions | undefined) => {
     const decision = await validateTopologyCommandAuthority(row, row.payload, {
       reader: tx,
+      permissionVersions: versions ?? NO_VERSIONS,
     });
-    return decision.allow ? null : decision.reason;
+    if (decision.allow) return null;
+    return decision.hold !== undefined ? { hold: decision.hold } : decision.reason;
   },
+  (reader, rows) => resolveTopologyRequesterPermissionVersions(reader, rows.map((row) => row.payload)),
 );
 
 // ---------------------------------------------------------------------------
@@ -321,6 +484,16 @@ export async function dispatchTopologyDiagnosticRun(
         await settleRun(run, 'expired', 'dispatch_timeout', now);
         await setIntentState(runId, 'settled');
         return null;
+      }
+      // M3-D13: enqueue is a live-authority boundary. A revoked requester (or
+      // a disarmed policy) never gets a command minted on its behalf.
+      if (runRequiresRequesterRevalidation(run)) {
+        const denial = await revalidateTopologyRequesterAuthority({ reader: db, run, checkTrust: true, requirePartnerFlags: true });
+        if (denial) {
+          await settleRun(run, 'cancelled', `authority_${denial}`.slice(0, 64), now);
+          await setIntentState(runId, 'settled');
+          return null;
+        }
       }
 
       const commandId = randomUUID();

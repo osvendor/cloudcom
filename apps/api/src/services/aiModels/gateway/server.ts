@@ -1,0 +1,348 @@
+/**
+ * The loopback model gateway: one in-process HTTP listener on 127.0.0.1:<ephemeral>
+ * through which every request for a gateway-kind connection (W06 openai_compatible,
+ * W07 cloud kinds) leaves the API. Modelled on services/llm/llmEgressProxy.ts.
+ *
+ * Trust boundary: callers (the Agent SDK child, in-process clients) present a
+ * per-dispatch grant token in the URL path (`/g/<token>/…`). The grant binds one
+ * connection, partner, org and the exact wire model(s) the resolver priced; the
+ * decrypted credential lives only in the grant record and is injected by
+ * forward.ts. An unknown, expired or revoked token gets one fixed 401 body —
+ * no oracle for whether a token ever existed — and no upstream call.
+ */
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { captureException } from '../../sentry';
+import { scrubSecrets } from './scrub';
+import { noteGatewayFailure } from './failureNotes';
+import { assertBoundModel, getGatewayAdapter, type GatewayAdapter } from './adapter';
+import { auditGatewayEgress } from './forward';
+import { createGrantStore, type GrantStore } from './grants';
+import {
+  GATEWAY_CONNECT_TIMEOUT_MS,
+  GATEWAY_IDLE_TIMEOUT_MS,
+  GATEWAY_MAX_CONCURRENT_PER_GRANT,
+  GATEWAY_MAX_REQUEST_BYTES,
+  GATEWAY_TOTAL_TIMEOUT_MS,
+} from './limits';
+import {
+  GatewayError,
+  gatewayErrorBody,
+  type GatewayGrant,
+  type GatewayGrantInput,
+  type GatewayGrantRecord,
+  type GatewayResponse,
+} from './types';
+
+export interface ModelGateway {
+  grant(input: GatewayGrantInput): GatewayGrant;
+  revoke(token: string): void;
+  /** Revokes every grant in this process bound to the connection (aborting in-flight requests); returns how many. */
+  revokeConnection(connectionId: string): number;
+  port(): number;
+  /** The address the listener is actually bound to (always 127.0.0.1). */
+  listenAddress(): string;
+  close(): Promise<void>;
+}
+
+/** Per-listener timing overrides; production uses the limits.ts defaults. */
+export interface GatewayServerOptions {
+  totalTimeoutMs?: number;
+  idleTimeoutMs?: number;
+}
+
+/** `/g/<token-segment>[/<path>][?query]` — the token segment is anything up to the next slash; the store validates it. */
+const ROUTE = /^\/g\/([^/?#]*)(\/[^?#]*)?(?:\?.*)?$/;
+/** Dot segments, encoded dots/slashes/backslashes, and raw backslashes are never legitimate in an adapter path. */
+const UNSAFE_PATH = /%2e|%2f|%5c|\\/i;
+
+const INVALID_GRANT = gatewayErrorBody('authentication_error', 'Invalid or expired gateway grant.');
+const MALFORMED_PATH = gatewayErrorBody('invalid_request_error', 'Malformed gateway path.');
+
+function send(res: ServerResponse, status: number, body: string): void {
+  if (res.headersSent) { res.destroy(); return; }
+  res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+  res.end(body);
+}
+
+async function readBody(req: IncomingMessage, limit: number, signal: AbortSignal): Promise<Buffer> {
+  const declared = Number(req.headers['content-length'] ?? '0');
+  if (Number.isFinite(declared) && declared > limit) {
+    throw new GatewayError(413, 'request_too_large', 'request_too_large', 'Request body too large.');
+  }
+  const parts: Buffer[] = [];
+  let total = 0;
+  // An abort destroys the request stream so a stalled sender
+  // cannot hold a grant slot until the next chunk arrives.
+  const onAbort = (): void => { req.destroy(); };
+  signal.addEventListener('abort', onAbort, { once: true });
+  try {
+    for await (const chunk of req) {
+      if (signal.aborted) throw new GatewayError(499, 'api_error', 'client_aborted', 'Request aborted.');
+      total += (chunk as Buffer).length;
+      if (total > limit) throw new GatewayError(413, 'request_too_large', 'request_too_large', 'Request body too large.');
+      parts.push(chunk as Buffer);
+    }
+  } finally {
+    signal.removeEventListener('abort', onAbort);
+  }
+  if (signal.aborted) throw new GatewayError(499, 'api_error', 'client_aborted', 'Request aborted.');
+  return Buffer.concat(parts);
+}
+
+/** What a stream had delivered when the idle timer cut it. */
+export interface IdleCutStats {
+  elapsedMs: number;
+  bytesStreamed: number;
+  /** Whose silence tripped the cut: the adapter's stream, or a client that stopped reading (drain wait). */
+  waitingOn: 'upstream' | 'client';
+}
+
+async function writeResponse(
+  res: ServerResponse,
+  out: GatewayResponse,
+  signal: AbortSignal,
+  idleTimeoutMs: number,
+  onIdleCut: (stats: IdleCutStats) => void,
+): Promise<void> {
+  res.writeHead(out.status, { ...out.headers, 'cache-control': 'no-store' });
+  if (Buffer.isBuffer(out.body)) { res.end(out.body); return; }
+  const startedAt = Date.now();
+  let bytesStreamed = 0;
+  let idle: NodeJS.Timeout | null = null;
+  let complete = false;
+  let waitingOn: IdleCutStats['waitingOn'] = 'upstream';
+  const arm = (): void => {
+    if (idle) clearTimeout(idle);
+    idle = setTimeout(() => {
+      // Never silent (#10591): a stream cut here was otherwise invisible server-side.
+      try {
+        onIdleCut({ elapsedMs: Date.now() - startedAt, bytesStreamed, waitingOn });
+      } catch (error) {
+        console.error('[modelGateway] idle-cut report failed:', error instanceof Error ? error.message : String(error));
+      }
+      res.destroy(new Error('gateway idle timeout'));
+    }, idleTimeoutMs);
+  };
+  arm();
+  try {
+    for await (const chunk of out.body) {
+      if (signal.aborted || res.destroyed) break;
+      bytesStreamed += chunk.length;
+      if (!res.write(chunk)) {
+        // Wait for drain, but also wake on abort / close / error.
+        waitingOn = 'client';
+        await new Promise<void>((resolve) => {
+          const done = (): void => {
+            res.off('drain', done); res.off('close', done); res.off('error', done);
+            signal.removeEventListener('abort', done);
+            resolve();
+          };
+          res.once('drain', done); res.once('close', done); res.once('error', done);
+          signal.addEventListener('abort', done, { once: true });
+        });
+        waitingOn = 'upstream';
+        if (signal.aborted || res.destroyed) break;
+      }
+      arm();
+    }
+    complete = !signal.aborted && !res.destroyed;
+  } finally {
+    if (idle) clearTimeout(idle);
+    // A stream cut short (timeout, revocation, disconnect) must not end cleanly:
+    // a clean end would let the caller read a truncated answer as a complete one.
+    if (complete) res.end(); else res.destroy();
+  }
+}
+
+function headersOf(req: IncomingMessage): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(req.headers)) if (typeof v === 'string') out[k.toLowerCase()] = v;
+  return out;
+}
+
+/**
+ * Defence in depth for the bound-model rule: an Anthropic-dialect request whose JSON
+ * body names a top-level `model` must name a bound one, whatever the adapter does.
+ * Bodies that are not a JSON object are left to the adapter (which rejects them).
+ */
+function assertAnthropicBodyModel(adapter: GatewayAdapter, body: Buffer, grant: GatewayGrantRecord): string | null {
+  if (adapter.dialect !== 'anthropic' || body.length === 0) return null;
+  let parsed: unknown;
+  try { parsed = JSON.parse(body.toString('utf8')); } catch { return null; }
+  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && 'model' in parsed) {
+    return assertBoundModel(grant, (parsed as { model?: unknown }).model);
+  }
+  return null;
+}
+
+/** Client-safe note for a stream the idle timer cut (no host, URL or credential). */
+export function idleCutMessage(idleTimeoutMs: number): string {
+  return `The model endpoint sent nothing for ${Math.round(idleTimeoutMs / 1000)} seconds, so the response was cut off.`;
+}
+
+/** GatewayError codes that describe the upstream endpoint's answer or reachability. */
+const UPSTREAM_FAILURE_CODES: ReadonlySet<string> = new Set([
+  'upstream_malformed', 'upstream_not_streamed', 'upstream_redirect', 'upstream_too_large',
+  'upstream_timeout', 'upstream_unreachable', 'egress_blocked',
+]);
+/** Of those, the ones whose raising site already writes a detailed log line. */
+const UPSTREAM_CODES_LOGGED_AT_SOURCE: ReadonlySet<string> = new Set(['upstream_not_streamed', 'upstream_timeout', 'upstream_unreachable']);
+
+const TIMED_OUT = gatewayErrorBody('api_error', 'The model endpoint did not answer in time.');
+
+export async function startModelGateway(
+  store: GrantStore = createGrantStore(),
+  options: GatewayServerOptions = {},
+): Promise<ModelGateway> {
+  const totalTimeoutMs = options.totalTimeoutMs ?? GATEWAY_TOTAL_TIMEOUT_MS;
+  const idleTimeoutMs = options.idleTimeoutMs ?? GATEWAY_IDLE_TIMEOUT_MS;
+  let listenPort = 0;
+  let listenHost = '';
+  const sweeper = setInterval(() => store.sweep(), 60_000);
+  sweeper.unref();
+
+  const server: Server = createServer((req, res) => {
+    void (async () => {
+      const m = ROUTE.exec(req.url ?? '');
+      if (!m) { send(res, 400, MALFORMED_PATH); return; }
+      const token = m[1]!;
+      const path = m[2] ?? '/';
+      if (UNSAFE_PATH.test(path) || path.split('/').some((seg) => seg === '..' || seg === '.')) {
+        send(res, 400, MALFORMED_PATH);
+        return;
+      }
+      const grant: GatewayGrantRecord | null = store.lookup(token);
+      if (!grant) { send(res, 401, INVALID_GRANT); return; }
+      if (grant.inFlight.size >= GATEWAY_MAX_CONCURRENT_PER_GRANT) {
+        send(res, 429, gatewayErrorBody('rate_limit_error', 'Too many concurrent requests on this connection.'));
+        return;
+      }
+      const ac = new AbortController();
+      grant.inFlight.add(ac);
+      // The server's own deadline is told apart from a client disconnect: the
+      // first is answered (504), the second cannot be delivered anyway.
+      let timedOut = false;
+      const total = setTimeout(() => { timedOut = true; ac.abort(); }, totalTimeoutMs);
+      res.on('close', () => ac.abort());
+      let model: string | null = null;
+      try {
+        const body = await readBody(req, GATEWAY_MAX_REQUEST_BYTES, ac.signal);
+        const adapter = getGatewayAdapter(grant.config.kind);
+        model = assertAnthropicBodyModel(adapter, body, grant);
+        const out = await adapter.handle(
+          { method: req.method ?? 'GET', path, headers: headersOf(req), body, signal: ac.signal },
+          grant,
+        );
+        await writeResponse(res, out, ac.signal, idleTimeoutMs, ({ elapsedMs, bytesStreamed, waitingOn }) => {
+          // A client that stopped reading is not the endpoint's fault; only the endpoint's silence is noted for the turn.
+          if (waitingOn === 'upstream') noteGatewayFailure(grant.aiSessionId, idleCutMessage(idleTimeoutMs));
+          console.warn(`[modelGateway] stream idle timeout: no progress for ${idleTimeoutMs} ms; response cut `
+            + `(grant ${grant.id}, connection ${grant.config.connectionId}, model ${model === null ? 'unknown' : JSON.stringify(model)}, `
+            + `path ${path}, waiting_on ${waitingOn}, idle_ms ${idleTimeoutMs}, elapsed_ms ${elapsedMs}, bytes_streamed ${bytesStreamed}).`);
+        });
+      } catch (error) {
+        if (timedOut) {
+          send(res, 504, TIMED_OUT);
+        } else if (error instanceof GatewayError) {
+          if (error.code === 'gateway_model_mismatch') {
+            // The request never reached forwardUpstream; record the refusal against
+            // the upstream it was bound for.
+            auditGatewayEgress(grant, null, null, true);
+          }
+          if (UPSTREAM_FAILURE_CODES.has(error.code)) {
+            // The endpoint answered (or could not be reached) in a way the
+            // adapter refused. Name it for the turn; log it unless the raising
+            // site already logged it with more detail (#10591).
+            noteGatewayFailure(grant.aiSessionId, scrubSecrets(error.message, [grant.credential.secret]));
+            if (!UPSTREAM_CODES_LOGGED_AT_SOURCE.has(error.code)) {
+              console.warn(`[modelGateway] upstream failure ${error.code} (grant ${grant.id}, connection ${grant.config.connectionId}, `
+                + `model ${model === null ? 'unknown' : JSON.stringify(model)}, path ${path}, status ${error.status}): `
+                + scrubSecrets(error.message, [grant.credential.secret]));
+            }
+          }
+          if (error.status === 413) res.setHeader('connection', 'close');
+          send(res, error.status === 499 ? 400 : error.status, gatewayErrorBody(error.errorType,
+            scrubSecrets(error.message, [grant.credential.secret])));
+        } else {
+          const scrubbed = scrubSecrets(error instanceof Error ? error.message : String(error), [grant.credential.secret]);
+          console.error(`[modelGateway] unhandled adapter error (grant ${grant.id}, connection ${grant.config.connectionId}):`, scrubbed);
+          // A gateway bug, not an endpoint answer: report it. Only the scrubbed
+          // message travels (never the original error, whose cause chain or
+          // properties could carry the credential).
+          const reported = new Error(`model gateway adapter error: ${scrubbed}`);
+          reported.name = error instanceof Error ? error.name : 'Error';
+          // Keep the throw site for triage; the stack's first line repeats the message, so scrub it too.
+          if (error instanceof Error && error.stack) reported.stack = scrubSecrets(error.stack, [grant.credential.secret], 8_000);
+          captureException(reported, undefined, undefined, { fingerprint: ['ai_model_gateway', 'unhandled_adapter_error'] });
+          send(res, 502, gatewayErrorBody('api_error', 'The model endpoint request failed.'));
+        }
+      } finally {
+        clearTimeout(total);
+        if (timedOut) {
+          console.warn(`[modelGateway] request exceeded the total timeout (grant ${grant.id}, connection ${grant.config.connectionId}).`);
+        }
+        grant.inFlight.delete(ac);
+      }
+    })();
+  });
+  server.headersTimeout = GATEWAY_CONNECT_TIMEOUT_MS;
+  server.requestTimeout = 0; // long streams; the per-request total timer governs
+
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      server.off('error', reject);
+      const addr = server.address();
+      listenPort = typeof addr === 'object' && addr ? addr.port : 0;
+      listenHost = typeof addr === 'object' && addr ? addr.address : '';
+      resolve();
+    });
+  });
+  server.on('error', (error) => {
+    console.error('[modelGateway] listener error:', error instanceof Error ? error.message : String(error));
+  });
+
+  const api: ModelGateway = {
+    grant(input) {
+      const { token } = store.issue(input);
+      return {
+        token,
+        baseUrl: `http://127.0.0.1:${listenPort}/g/${token}`,
+        revoke: () => store.revoke(token),
+      };
+    },
+    revoke: (token) => store.revoke(token),
+    revokeConnection: (connectionId) => store.revokeConnection(connectionId),
+    port: () => listenPort,
+    listenAddress: () => listenHost,
+    async close() {
+      clearInterval(sweeper);
+      store.revokeAll();
+      server.closeAllConnections?.();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      if (singletonInstance === api) { singletonInstance = null; singletonPromise = null; }
+    },
+  };
+  return api;
+}
+
+let singletonPromise: Promise<ModelGateway> | null = null;
+let singletonInstance: ModelGateway | null = null;
+
+/** Lazy per-process singleton (one listener; grants separate callers). Starts on first use. */
+export function getModelGateway(): Promise<ModelGateway> {
+  if (!singletonPromise) {
+    singletonPromise = startModelGateway().then((gw) => { singletonInstance = gw; return gw; }, (error) => {
+      singletonPromise = null;
+      throw error;
+    });
+  }
+  return singletonPromise;
+}
+
+export async function closeModelGateway(): Promise<void> {
+  const pending = singletonPromise;
+  if (!pending) return;
+  const gw = singletonInstance ?? (await pending.catch(() => null));
+  if (gw) await gw.close();
+}

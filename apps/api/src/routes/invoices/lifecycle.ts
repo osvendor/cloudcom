@@ -18,6 +18,7 @@ import { enqueueInvoicePdfRender } from '../../jobs/invoiceWorker';
 import { and, eq } from 'drizzle-orm';
 import { sendInvoiceEmail, resendInvoiceEmail, type SendInvoiceEmailOptions } from '../../services/invoicePdf'; // added in Phase 5
 import { writeRouteAudit } from '../../services/auditEvents';
+import { assertInvoiceBillingEnabled, assertInvoiceBillingEnabledById } from '../../services/invoiceBillingGate';
 import { invoiceActorFrom, handleServiceError } from './invoices';
 
 export const invoiceLifecycleRoutes = new Hono();
@@ -70,6 +71,8 @@ invoiceLifecycleRoutes.post('/:id/send', scopes, sendPerm, zValidator('param', i
   if (!parsed.ok) return c.json({ error: parsed.error }, 400);
   const id = c.req.valid('param').id;
   try {
+    // Billing master switch FIRST: applyDeviceAppendixOverride below writes.
+    await assertInvoiceBillingEnabledById(id);
     // BEFORE sendInvoiceEmail (which issues, which enqueues the async render).
     if (parsed.data.includeDeviceAppendix !== undefined) {
       await applyDeviceAppendixOverride(id, parsed.data.includeDeviceAppendix);
@@ -88,6 +91,7 @@ invoiceLifecycleRoutes.post('/:id/resend', scopes, sendPerm, zValidator('param',
   const parsed = await parseComposerBody(c, sendComposerSchema);
   if (!parsed.ok) return c.json({ error: parsed.error }, 400);
   try {
+    await assertInvoiceBillingEnabledById(id);
     const result = await resendInvoiceEmail(id, invoiceActorFrom(c), composerOptions(parsed.data));
     writeRouteAudit(c, {
       orgId: result.invoice.orgId,
@@ -118,6 +122,7 @@ async function loadLinkableInvoice(id: string, actor: ReturnType<typeof invoiceA
   if (!inv) throw new InvoiceServiceError('Invoice not found', 404, 'INVOICE_NOT_FOUND');
   requireOrgAccess(actor, inv.orgId);
   requireSiteAccess(actor, inv.siteId);
+  await assertInvoiceBillingEnabled(inv.orgId);
   if (inv.status === 'draft') {
     throw new InvoiceServiceError('This invoice has not been issued yet — issue it to create a link', 409, 'INVALID_STATE');
   }
@@ -159,7 +164,7 @@ invoiceLifecycleRoutes.post('/:id/reset-link', scopes, sendPerm, zValidator('par
   const id = c.req.valid('param').id;
   try {
     const inv = await loadLinkableInvoice(id, invoiceActorFrom(c));
-    // SEC-150 FAIL-CLOSED. Reset exists precisely to kill an issued capability;
+    // FAIL-CLOSED. Reset exists precisely to kill an issued capability;
     // a reset that leaves a payable Stripe Checkout session IS the finding. The
     // intent is recorded and Stripe is called BEFORE the local reset, and the
     // reset is refused (503 STRIPE_REVOCATION_PENDING) until every open session

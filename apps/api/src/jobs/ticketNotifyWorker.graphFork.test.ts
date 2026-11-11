@@ -30,12 +30,13 @@ vi.mock('../config/validate', () => ({ getConfig: () => ({ TICKETS_INBOUND_DOMAI
 vi.mock('../db', () => ({
   withSystemDbAccessContext: withSystemDbAccessContextMock,
   db: {
-    select: vi.fn(() => ({ from: vi.fn(() => ({ where: vi.fn(() => ({ limit: vi.fn(() => selectMock()) })) })) })),
+    select: vi.fn(() => ({ from: vi.fn(() => ({ where: vi.fn(() => ({ limit: vi.fn(() => selectMock()), orderBy: vi.fn(() => selectMock()) })) })) })),
     insert: vi.fn(() => ({ values: vi.fn((v: unknown) => { insertValuesMock(v); return { returning: vi.fn(() => Promise.resolve([])) }; }) })),
     update: vi.fn(() => ({ set: vi.fn((v: unknown) => { updateSetMock(v); return { where: vi.fn(() => Promise.resolve([])) }; }) })),
   },
 }));
 vi.mock('../db/schema', () => ({
+  ticketComments: { id: 'id', ticketId: 'ticketId', content: 'content', isPublic: 'isPublic', deletedAt: 'deletedAt', createdAt: 'createdAt' },
   tickets: { id: 'id' },
   partners: { id: 'id', slug: 'slug', name: 'name', settings: 'settings' },
   organizations: { id: 'id', name: 'name' },
@@ -104,7 +105,7 @@ describe('ticketNotifyWorker M365 Graph fork', () => {
 
   it('routes a threaded public reply through sendThreadedReply, not EmailService', async () => {
     selectMock
-      .mockResolvedValueOnce([{ id: 't-1', orgId: 'o-1', partnerId: 'p-1', internalNumber: 'T-1', subject: 'Printer', submitterEmail: 'cust@x.com' }]) // getTicket
+      .mockResolvedValueOnce([{ id: 't-1', orgId: 'o-1', partnerId: 'p-1', internalNumber: 'T-1', ticketNumber: 'KQ-1', subject: 'Printer\r\nnew line', submitterEmail: 'cust@x.com' }]) // getTicket
       .mockResolvedValueOnce([{ slug: 'acme', settings: {} }]); // partner (replyTo)
     resolveMailboxMock.mockResolvedValue({ ...MAILBOX, originalMessageId: 'orig-1' });
 
@@ -114,23 +115,17 @@ describe('ticketNotifyWorker M365 Graph fork', () => {
     });
 
     expect(sendThreadedMock).toHaveBeenCalledTimes(1);
-    expect(sendThreadedMock).toHaveBeenCalledWith(MAILBOX, 'orig-1', expect.stringContaining('<!doctype html>'));
+    expect(sendThreadedMock).toHaveBeenCalledWith(MAILBOX, 'orig-1', expect.stringContaining('<!doctype html>'), 'cust@x.com', '[KQ-1] New reply: Printer new line');
     expect(sendNewMock).not.toHaveBeenCalled();
     expect(sendEmailMock).not.toHaveBeenCalled();
   });
 
-  it('does NOT append the comment body on the Graph path even when fullMessageReply is on', async () => {
-    // fullMessageReply is gated on `!graphMailbox`: a connected-M365 reply goes to a
-    // recipient set we have not validated, so the actual comment TEXT must never ride
-    // it. With a mailbox connected the comment is not even loaded - this proves the
-    // guard by making a distinctive comment body available (4th select) and asserting
-    // it never reaches the Graph send. Removing the `!graphMailbox` guard would append
-    // it and fail here.
+  it('includes full public history on Graph and binds delivery to the requester', async () => {
     selectMock
-      .mockResolvedValueOnce([{ id: 't-1', orgId: 'o-1', partnerId: 'p-1', internalNumber: 'T-1', subject: 'Printer', submitterEmail: 'cust@x.com' }]) // getTicket
-      .mockResolvedValueOnce([{ slug: 'acme', settings: { ticketing: { inbound: { fullMessageReply: true } } } }]) // partner: fullMessageReply ON
+      .mockResolvedValueOnce([{ id: 't-1', orgId: 'o-1', partnerId: 'p-1', internalNumber: 'T-1', ticketNumber: 'KQ-1', subject: 'Printer\r\nnew line', submitterEmail: 'cust@x.com' }]) // getTicket
+      .mockResolvedValueOnce([{ slug: 'acme', name: 'OS', settings: { ticketing: { inbound: { fullMessageReply: true } } } }]) // partner: fullMessageReply ON
       .mockResolvedValueOnce([{ name: 'Acme Org' }]) // compose: getOrgName
-      .mockResolvedValue([{ content: 'SECRET-GRAPH-COMMENT-BODY', isPublic: true, deletedAt: null }]); // comment (only read if the guard were removed)
+      .mockResolvedValue([{ ticketId: 't-1', content: 'PUBLIC-GRAPH-COMMENT-BODY', isPublic: true, deletedAt: null }]); // comment (only read if the guard were removed)
     resolveMailboxMock.mockResolvedValue({ ...MAILBOX, originalMessageId: 'orig-1' });
 
     await handleTicketEvent({
@@ -140,13 +135,16 @@ describe('ticketNotifyWorker M365 Graph fork', () => {
 
     expect(sendThreadedMock).toHaveBeenCalledTimes(1);
     const html = (sendThreadedMock.mock.calls[0]! as unknown as unknown[])[2] as string;
-    expect(html).not.toContain('SECRET-GRAPH-COMMENT-BODY');
+    expect(html).toContain('PUBLIC-GRAPH-COMMENT-BODY');
+    expect(html).not.toContain('Sign in');
+    expect(sendThreadedMock.mock.calls[0][4]).toBe('OS IT SUPPORT TICKET #T-1 — Printer new line');
+    expect(sendThreadedMock.mock.calls[0].slice(3)).toEqual(['cust@x.com', expect.stringContaining('IT SUPPORT TICKET #T-1')]);
     expect(sendEmailMock).not.toHaveBeenCalled();
   });
 
   it('uses sendNewMail when the mailbox is connected but there is no original message id', async () => {
     selectMock
-      .mockResolvedValueOnce([{ id: 't-1', orgId: 'o-1', partnerId: 'p-1', internalNumber: 'T-1', subject: 'Printer', submitterEmail: 'cust@x.com' }])
+      .mockResolvedValueOnce([{ id: 't-1', orgId: 'o-1', partnerId: 'p-1', internalNumber: 'T-1', ticketNumber: 'KQ-1', subject: 'Printer\r\nnew line', submitterEmail: 'cust@x.com' }])
       .mockResolvedValueOnce([{ slug: 'acme', settings: {} }]);
     resolveMailboxMock.mockResolvedValue({ ...MAILBOX, originalMessageId: null });
 
@@ -157,7 +155,7 @@ describe('ticketNotifyWorker M365 Graph fork', () => {
 
     expect(sendNewMock).toHaveBeenCalledTimes(1);
     expect(sendNewMock).toHaveBeenCalledWith(
-      MAILBOX, 'cust@x.com', expect.stringContaining('T-1'), expect.stringContaining('<!doctype html>'),
+      MAILBOX, 'cust@x.com', expect.stringContaining('KQ-1'), expect.stringContaining('<!doctype html>'),
     );
     expect(sendThreadedMock).not.toHaveBeenCalled();
     expect(sendEmailMock).not.toHaveBeenCalled();
@@ -165,7 +163,7 @@ describe('ticketNotifyWorker M365 Graph fork', () => {
 
   it('falls back to EmailService when no verified outbound mailbox resolves', async () => {
     selectMock
-      .mockResolvedValueOnce([{ id: 't-1', orgId: 'o-1', partnerId: 'p-1', internalNumber: 'T-1', subject: 'Printer', submitterEmail: 'cust@x.com' }])
+      .mockResolvedValueOnce([{ id: 't-1', orgId: 'o-1', partnerId: 'p-1', internalNumber: 'T-1', ticketNumber: 'KQ-1', subject: 'Printer\r\nnew line', submitterEmail: 'cust@x.com' }])
       .mockResolvedValueOnce([{ slug: 'acme', settings: {} }]);
     resolveMailboxMock.mockResolvedValue(null);
 
@@ -183,7 +181,7 @@ describe('ticketNotifyWorker M365 Graph fork', () => {
   it('NEVER routes assignee/tech notifications through Graph (ticket.assigned uses EmailService)', async () => {
     gfPush.isAuthorisedForTicket.mockResolvedValue(true);
     selectMock
-      .mockResolvedValueOnce([{ id: 't-1', orgId: 'o-1', partnerId: 'p-1', internalNumber: 'T-1', subject: 'Printer', submitterEmail: 'cust@x.com' }]) // getTicket
+      .mockResolvedValueOnce([{ id: 't-1', orgId: 'o-1', partnerId: 'p-1', internalNumber: 'T-1', ticketNumber: 'KQ-1', subject: 'Printer\r\nnew line', submitterEmail: 'cust@x.com' }]) // getTicket
       .mockResolvedValueOnce([{ name: 'Acme' }]); // org name (assignee now via loadUserCandidate)
     // Even if a mailbox WERE connected, the assignee path must never consult it.
     resolveMailboxMock.mockResolvedValue({ ...MAILBOX, originalMessageId: 'orig-1' });

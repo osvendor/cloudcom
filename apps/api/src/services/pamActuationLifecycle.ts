@@ -1,5 +1,6 @@
 import { sql } from 'drizzle-orm';
 import { db } from '../db';
+import { PAM_USER_REASON_UNVERIFIED, enqueuePamRequestNotify } from './pamRequestNotify';
 
 export type PamRequestSnapshot = {
   id: string;
@@ -16,7 +17,41 @@ export type PamActuationRef = {
   requestRevision: number;
   generation: number;
   desiredState: 'active' | 'cleanup';
+  // Set when createPamDecisionIntent refused to create an active actuation
+  // (see PAM_TARGET_HASH_UNVERIFIED_REASON below) instead of creating one.
+  // actuationId is '' and generation is 0 in that case — no pam_actuations
+  // row was created.
+  refusalReason?: string;
 };
+
+// Shown to whoever reads the elevation request's outcome (approver UI,
+// elevation history, agent ingest response) when a decision that would
+// dispatch an actuation is refused because the target executable's hash
+// could not be verified. Kept as a single exported string so every caller
+// and every test refers to the exact same wording.
+export const PAM_TARGET_HASH_UNVERIFIED_REASON =
+  'Target identity could not be verified on the device; re-request elevation.';
+
+/** `details.source` on the elevation_audit 'denied' row written for that refusal. */
+const PAM_TARGET_HASH_UNVERIFIED_SOURCE = 'target_hash_unverified';
+
+function hasVerifiableTargetHash(hash: string | null): boolean {
+  return typeof hash === 'string' && hash.trim().length > 0;
+}
+
+/**
+ * Thrown by {@link requestPamCleanup} when the elevation has no
+ * pam_actuations row at all — i.e. nothing was ever dispatched to the device,
+ * so there is nothing to clean up there. Typed so a batch caller (the expiry
+ * enforcer) can tell this apart from a genuine cleanup failure
+ * The message is unchanged for existing callers.
+ */
+export class PamActuationNotFoundError extends Error {
+  constructor(public readonly elevationRequestId: string) {
+    super('PAM actuation not found');
+    this.name = 'PamActuationNotFoundError';
+  }
+}
 
 type PamLifecycleTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
 
@@ -76,6 +111,15 @@ export async function createPamDecisionIntent(tx: PamLifecycleTx, input: {
     throw new Error('approved PAM actuation requires a future expiry');
   }
 
+  // Lock order (PAM ownership epochs spec §9): the device row FOR SHARE first,
+  // then the request, then the actuation insert (whose epoch guard re-reads the
+  // device FOR SHARE and refuses a non-current epoch or org). The actuation is
+  // anchored to the epoch read here, so a move that commits between this read
+  // and the insert fails the insert instead of re-homing the decision.
+  const device = rows<{ ownership_epoch: number }>(await tx.execute<{ ownership_epoch: number }>(sql`
+    SELECT ownership_epoch FROM devices WHERE id = ${input.request.deviceId} FOR SHARE
+  `))[0];
+  if (!device) throw new Error('PAM request device not found');
   const lockedRequest = rows<RequestRow>(await tx.execute<RequestRow>(sql`
     SELECT id, org_id, device_id, revision
     FROM elevation_requests
@@ -100,15 +144,62 @@ export async function createPamDecisionIntent(tx: PamLifecycleTx, input: {
   `))[0];
   if (existing) return toRef(existing);
 
+  // The agent's PinTarget pinning step fails closed on a missing/blank
+  // target hash (it has nothing to compare the file it's about to run
+  // against, so a swap between approval and actuation would go
+  // undetected). Refuse to even create an active actuation for a
+  // path-targeting decision with no hash, rather than let it reach the
+  // agent and fail invisibly after the request already shows
+  // approved/auto_approved. tech_jit_admin / ai_tool_action decisions carry
+  // no target path at all (PinTarget already fails those closed on the
+  // empty-path check) and are unaffected.
+  if (active && input.request.targetExecutablePath && !hasVerifiableTargetHash(input.request.targetExecutableHash)) {
+    await tx.execute(sql`
+      UPDATE elevation_requests
+      SET status = 'denied',
+          denial_reason = ${PAM_TARGET_HASH_UNVERIFIED_REASON},
+          updated_at = now()
+      WHERE id = ${input.request.id} AND revision = ${input.requestRevision}
+    `);
+    await tx.execute(sql`
+      INSERT INTO elevation_audit (org_id, elevation_request_id, event_type, actor, details, occurred_at)
+      VALUES (
+        ${input.request.orgId}, ${input.request.id}, 'denied', 'system',
+        jsonb_build_object('reason', ${PAM_TARGET_HASH_UNVERIFIED_REASON}::text, 'source', ${PAM_TARGET_HASH_UNVERIFIED_SOURCE}::text),
+        now()
+      )
+    `);
+    // #8928: a technician's approve (prior status pending) that is refused
+    // here leaves the end user waiting on IT, so tell them it was denied. The
+    // insert-time auto_approved refusal has nobody waiting and stays silent.
+    // The internal constant is never shown; best-effort, never rolls back.
+    if (input.decision === 'approved') {
+      await enqueuePamRequestNotify(
+        tx,
+        { id: input.request.id, deviceId: input.request.deviceId },
+        'denied',
+        PAM_USER_REASON_UNVERIFIED,
+      );
+    }
+    return {
+      actuationId: '',
+      elevationRequestId: input.request.id,
+      requestRevision: input.requestRevision,
+      generation: 0,
+      desiredState: 'cleanup',
+      refusalReason: PAM_TARGET_HASH_UNVERIFIED_REASON,
+    };
+  }
+
   const desiredState = active ? 'active' : 'cleanup';
   const observedState = active ? 'pending_dispatch' : 'cleanup_pending';
   const inserted = rows<ActuationRow>(await tx.execute<ActuationRow>(sql`
     INSERT INTO pam_actuations (
-      org_id, device_id, elevation_request_id, request_revision, generation,
+      org_id, device_id, device_epoch, elevation_request_id, request_revision, generation,
       desired_state, observed_state, target_executable_path,
       target_executable_hash, subject_username, expires_at, cleanup_requested_at
     ) VALUES (
-      ${input.request.orgId}, ${input.request.deviceId}, ${input.request.id},
+      ${input.request.orgId}, ${input.request.deviceId}, ${device.ownership_epoch}::integer, ${input.request.id},
       ${input.requestRevision}, 1, ${desiredState}, ${observedState},
       ${input.request.targetExecutablePath}, ${input.request.targetExecutableHash},
       ${input.request.subjectUsername}, ${input.expiresAt?.toISOString() ?? null}::timestamptz,
@@ -134,7 +225,7 @@ export async function requestPamCleanup(tx: PamLifecycleTx, input: {
     LIMIT 1
     FOR UPDATE
   `))[0];
-  if (!current) throw new Error('PAM actuation not found');
+  if (!current) throw new PamActuationNotFoundError(input.elevationRequestId);
   if (current.desired_state === 'cleanup') return toRef(current);
 
   const nextGeneration = current.generation + 1;

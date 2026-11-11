@@ -35,6 +35,7 @@ const line: InvoiceDetail['lines'][number] = {
 /** An issued, already-emailed invoice — the state Re-send exists for. */
 function detail(extra: Partial<InvoiceDetail['invoice']> = {}, top: Partial<InvoiceDetail> = {}): InvoiceDetail {
   return {
+    autopay: null,
     invoice: {
       id: 'inv-1', invoiceNumber: 'INV-0007', orgId: 'org-1', siteId: null, status: 'sent',
       currencyCode: 'USD', issueDate: '2026-06-01', dueDate: '2026-06-30',
@@ -104,6 +105,26 @@ describe('InvoiceActions — re-send', () => {
     state.permissions = [{ resource: 'invoices', action: 'read' }, { resource: 'invoices', action: 'export' }];
     render(<InvoiceActions detail={detail()} variant="rail" />);
     expect(screen.queryByTestId('invoice-resend')).not.toBeInTheDocument();
+  });
+
+  it('shows the saved invoice subject as the subject hint', async () => {
+    fetchMock.mockImplementation(async (input: string) => {
+      if (input.startsWith('/orgs/organizations/')) return json({ billingContact: { email: 'ap@acme.test' } });
+      if (input === '/orgs/partners/me') return json({
+        name: 'CloudWise',
+        emailSignature: null,
+        settings: { emailTemplates: { invoice_send: { subject: 'Please pay {{invoice_number}} from {{partner_name}}' } } },
+      });
+      return json({ data: {} });
+    });
+    render(<InvoiceActions detail={detail()} variant="header" />);
+    await openComposer();
+    await waitFor(() => {
+      expect(screen.getByTestId('invoice-send-subject')).toHaveAttribute(
+        'placeholder',
+        'Please pay INV-0007 from CloudWise',
+      );
+    });
   });
 
   it('prefills To from the org billing contact and previews the partner signature', async () => {

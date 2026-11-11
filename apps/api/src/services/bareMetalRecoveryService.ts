@@ -25,7 +25,9 @@ import {
   hashRecoveryNonce,
   RECOVERY_CODE_TTL_MS,
 } from './bareMetalRecoveryCodes';
+import { resolveSnapshotPlatform } from './bareMetalRebuildSchemas';
 import { generateRecoveryToken, hashRecoveryToken } from './recoveryBootstrap';
+import { refreshReadinessAfterRecovery } from './bareMetalReadinessRefresh';
 import { RECOVERY_REFUSAL_MESSAGES } from './recoveryCapabilities';
 
 export type BareMetalRecoveryRow = typeof bareMetalRecoveries.$inferSelect;
@@ -59,6 +61,29 @@ export class BareMetalRecoveryError extends Error {
     this.name = 'BareMetalRecoveryError';
   }
 }
+
+/**
+ * The caller's integrity decision refused the recovery
+ * (services/backupRestoreGate.ts); `body` is the complete response.
+ */
+export class RecoveryIntegrityRefusedError extends Error {
+  constructor(
+    public status: 403 | 409,
+    public body: Record<string, unknown>,
+  ) {
+    super(typeof body.error === 'string' ? body.error : 'recovery_integrity_refused');
+    this.name = 'RecoveryIntegrityRefusedError';
+  }
+}
+
+/**
+ * A caller's integrity decision for a recovery's snapshot (the device being
+ * recovered is the snapshot's own). `bindRecovery` records a confirmed
+ * authorization bound to the new recovery, in the same transaction.
+ */
+export type RecoveryIntegrityDecision =
+  | { ok: true; bindRecovery?: (recoveryId: string) => Promise<unknown> }
+  | { ok: false; status: 403 | 409; body: Record<string, unknown> };
 
 const SYSTEM_ACTOR_ID = '00000000-0000-0000-0000-000000000000';
 const RECOVERY_TOKEN_TTL_MS = 24 * 3600 * 1000;
@@ -217,6 +242,14 @@ export async function createBareMetalRecovery(input: {
   drGroupId?: string | null;
   target?: Record<string, unknown> | null;
   tx?: DrDb;
+  /**
+   * Integrity decision for the snapshot, made by the caller for its own actor
+   * (a route checks the request and its step-up; DR refuses a snapshot
+   * without a usable attestation). Called after every other check, before
+   * the recovery is created; a refusal throws RecoveryIntegrityRefusedError.
+   * Recovery authentication enforces the same rules again.
+   */
+  integrity?: (snapshot: { id: string; deviceId: string }) => Promise<RecoveryIntegrityDecision>;
 }): Promise<{ row: BareMetalRecoveryRow; code: string }> {
   const tx = input.tx ?? db;
 
@@ -228,6 +261,7 @@ export async function createBareMetalRecovery(input: {
       bareMetalReasons: backupSnapshots.bareMetalReasons,
       referencedFiles: backupJobs.referencedFiles,
       storageIdentity: backupSnapshots.storageIdentity,
+      layoutManifest: backupSnapshots.layoutManifest, // new — source of `platform`
     })
     .from(backupSnapshots)
     .leftJoin(backupJobs, eq(backupJobs.id, backupSnapshots.jobId))
@@ -261,6 +295,9 @@ export async function createBareMetalRecovery(input: {
     throw recoveryInProgressError(inProgress);
   }
 
+  const integrity = input.integrity ? await input.integrity({ id: snapshot.id, deviceId: snapshot.deviceId }) : { ok: true as const };
+  if (!integrity.ok) throw new RecoveryIntegrityRefusedError(integrity.status, integrity.body);
+
   const code = generateRecoveryCode();
   const row = await insertRecoveryRow(tx, {
       orgId: input.orgId,
@@ -275,12 +312,14 @@ export async function createBareMetalRecovery(input: {
       // it authenticates nothing on its own.
       nonceHash: hashRecoveryNonce(generateRecoveryNonce()),
       status: 'created',
+      platform: resolveSnapshotPlatform(snapshot.layoutManifest),
       ...(input.target ? { target: input.target } : {}),
       createdBy: input.createdBy,
       executingDeviceId: input.executingDeviceId ?? null,
       drExecutionId: input.drExecutionId ?? null,
       drGroupId: input.drGroupId ?? null,
   }, snapshot.deviceId, input.orgId);
+  if (integrity.bindRecovery) await integrity.bindRecovery(row.id);
 
   audit({
     orgId: input.orgId,
@@ -495,7 +534,7 @@ export async function applyRebuildCommandResult(input: {
     set.failureReason = error ?? (envelopeStatus === 'timeout' ? 'command timed out' : 'failed without reason');
   }
 
-  await db
+  const updated = await db
     .update(bareMetalRecoveries)
     .set(set)
     .where(
@@ -506,4 +545,7 @@ export async function applyRebuildCommandResult(input: {
       ),
     )
     .returning();
+  if (updated?.length && (set.status === 'completed' || set.status === 'failed')) {
+    refreshReadinessAfterRecovery(input.orgId, rec.deviceId);
+  }
 }

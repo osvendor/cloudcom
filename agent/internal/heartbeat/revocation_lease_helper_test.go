@@ -70,7 +70,7 @@ func TestHelperLeaseRenewIsForwardedToTheControlPlane(t *testing.T) {
 	h := &Heartbeat{
 		sessionBroker:       newTestBrokerWithSessions(t, session),
 		isHeadless:          true,
-		desktopMgr:          desktop.NewSessionManager(),
+		desktopMgr:          desktop.NewSessionManagerWithPreloader(nil),
 		leaseRenewRequester: func(sessionID string) { asked <- sessionID },
 	}
 	h.rememberDesktopOwner("desk-renew", session.SessionID)
@@ -105,7 +105,7 @@ func TestHelperLeaseRenewFromANonOwnerIsDropped(t *testing.T) {
 	h := &Heartbeat{
 		sessionBroker:       newTestBrokerWithSessions(t, owner, stranger),
 		isHeadless:          true,
-		desktopMgr:          desktop.NewSessionManager(),
+		desktopMgr:          desktop.NewSessionManagerWithPreloader(nil),
 		leaseRenewRequester: func(sessionID string) { asked <- sessionID },
 	}
 	h.rememberDesktopOwner("desk-owned", owner.SessionID)
@@ -133,7 +133,7 @@ func TestLeaseAnswerIsForwardedToTheOwningHelper(t *testing.T) {
 	h := &Heartbeat{
 		sessionBroker: newTestBrokerWithSessions(t, session),
 		isHeadless:    true,
-		desktopMgr:    desktop.NewSessionManager(),
+		desktopMgr:    desktop.NewSessionManagerWithPreloader(nil),
 	}
 	h.rememberDesktopOwner("desk-answer", session.SessionID)
 
@@ -164,7 +164,7 @@ func TestLeaseRevocationIsForwardedToTheOwningHelper(t *testing.T) {
 	h := &Heartbeat{
 		sessionBroker: newTestBrokerWithSessions(t, session),
 		isHeadless:    true,
-		desktopMgr:    desktop.NewSessionManager(),
+		desktopMgr:    desktop.NewSessionManagerWithPreloader(nil),
 	}
 	h.rememberDesktopOwner("desk-revoke", session.SessionID)
 
@@ -193,7 +193,7 @@ func TestRevocationAnswerDoesNotBlockTheReadPump(t *testing.T) {
 	h := &Heartbeat{
 		sessionBroker: newTestBrokerWithSessions(t, session),
 		isHeadless:    true,
-		desktopMgr:    desktop.NewSessionManager(),
+		desktopMgr:    desktop.NewSessionManagerWithPreloader(nil),
 	}
 	// An owner whose helper session is NOT in the broker: the stop path falls
 	// through to the direct manager, and nothing may be awaited inline.

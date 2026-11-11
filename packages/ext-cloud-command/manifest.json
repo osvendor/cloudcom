@@ -13,7 +13,8 @@
       "web.navigation.v1",
       "server.db.rls.v1",
       "server.secrets.v1",
-      "server.audit.v1"
+      "server.audit.v1",
+      "server.jobs.v1"
     ]
   },
   "server": {
@@ -26,6 +27,11 @@
         "id": "overview",
         "path": "/overview",
         "element": "cloudcommand-overview-page"
+      },
+      {
+        "id": "health",
+        "path": "/health",
+        "element": "cloudcommand-health-page"
       },
       {
         "id": "connect",
@@ -56,6 +62,16 @@
         "id": "threecx-call-log",
         "path": "/threecx-call-log",
         "element": "cloudcommand-threecx-call-log-page"
+      },
+      {
+        "id": "idrive",
+        "path": "/idrive",
+        "element": "cloudcommand-idrive-page"
+      },
+      {
+        "path": "/harmony",
+        "element": "cloudcommand-harmony-page",
+        "id": "harmony"
       }
     ],
     "navigation": [
@@ -70,6 +86,24 @@
         "label": "Connect",
         "path": "/connect",
         "order": 101
+      },
+      {
+        "id": "health",
+        "label": "Operations health",
+        "path": "/health",
+        "order": 102
+      },
+      {
+        "id": "idrive",
+        "label": "IDrive 360",
+        "path": "/idrive",
+        "order": 103
+      },
+      {
+        "path": "/harmony",
+        "id": "harmony",
+        "order": 104,
+        "label": "Harmony Endpoint"
       }
     ],
     "slots": []
@@ -78,7 +112,12 @@
   "schemaCompatibilityFloor": "0.1.0",
   "publicRoutes": [],
   "agentRoutes": false,
-  "jobs": [],
+  "jobs": [
+    {
+      "cron": "*/5 * * * *",
+      "name": "harmony-sync"
+    }
+  ],
   "aiTools": [],
   "tenancy": {
     "orgCascadeDeleteTables": [
@@ -87,20 +126,112 @@
       "cloudcommand_microsoft_admin_connections",
       "cloudcommand_microsoft_admin_consent",
       "cloudcommand_microsoft_directory_preferences",
+      "cloudcommand_microsoft_directory_layouts",
+      "cloudcommand_microsoft_directory_snapshots",
       "cloudcommand_google_oauth_connections",
-      "cloudcommand_google_oauth_attempts"
+      "cloudcommand_google_oauth_attempts",
+      "cloudcommand_idrive_connections",
+      "cloudcommand_idrive_operations",
+      "cloudcommand_harmony_endpoints",
+      "cloudcommand_harmony_clients",
+      "cloudcommand_harmony_scopes"
     ],
-    "deviceCascadeDeleteTables": [],
+    "orgMergePolicies": {
+      "cloudcommand_threecx_connections": {
+        "kind": "leave-for-erasure",
+        "note": "Credentials are bound to the source organization; reconnect explicitly on the surviving organization."
+      },
+      "cloudcommand_microsoft_connections": {
+        "kind": "leave-for-erasure",
+        "note": "Tenant authorization remains bound to the source organization; reconnect explicitly."
+      },
+      "cloudcommand_microsoft_admin_connections": {
+        "kind": "leave-for-erasure",
+        "note": "Enterprise application credentials and tenant authority must not move across organizations."
+      },
+      "cloudcommand_microsoft_admin_consent": {
+        "kind": "leave-for-erasure",
+        "note": "Pending consent is bound to its initiating organization and actor."
+      },
+      "cloudcommand_microsoft_directory_preferences": {
+        "kind": "leave-for-erasure",
+        "note": "Directory user identifiers belong to the source tenant connection."
+      },
+      "cloudcommand_microsoft_directory_layouts": {
+        "kind": "leave-for-erasure",
+        "note": "Saved views remain scoped to the source organization and technician."
+      },
+      "cloudcommand_microsoft_directory_snapshots": {
+        "kind": "leave-for-erasure",
+        "note": "Cached directory data is bound to the source tenant and credential version; regenerate after reconnecting."
+      },
+      "cloudcommand_google_oauth_connections": {
+        "kind": "leave-for-erasure",
+        "note": "Refresh tokens use organization-bound authenticated encryption and require fresh consent."
+      },
+      "cloudcommand_google_oauth_attempts": {
+        "kind": "leave-for-erasure",
+        "note": "PKCE and browser consent state are bound to the source organization."
+      },
+      "cloudcommand_idrive_connections": {
+        "kind": "leave-for-erasure",
+        "note": "IDrive authorization and operation previews are bound to the original organization; reconnect explicitly."
+      },
+      "cloudcommand_idrive_operations": {
+        "kind": "leave-for-erasure",
+        "note": "IDrive authorization and operation previews are bound to the original organization; reconnect explicitly."
+      },
+      "cloudcommand_harmony_endpoints": {
+        "note": "Harmony mappings and endpoint evidence remain with the source client; explicitly remap after a merge.",
+        "kind": "leave-for-erasure"
+      },
+      "cloudcommand_harmony_clients": {
+        "note": "Harmony mappings and endpoint evidence remain with the source client; explicitly remap after a merge.",
+        "kind": "leave-for-erasure"
+      },
+      "cloudcommand_harmony_scopes": {
+        "note": "Harmony mappings and endpoint evidence remain with the source client; explicitly remap after a merge.",
+        "kind": "leave-for-erasure"
+      }
+    },
+    "deviceCascadeDeleteTables": [
+      "cloudcommand_harmony_endpoints"
+    ],
     "deviceOrgDenormalizedTables": [],
     "nonTenantTables": [],
     "orgExportColumns": {
       "cloudcommand_google_oauth_connections": {
-        "include": ["id", "org_id", "customer_id", "customer_domain", "authorized_email", "granted_scopes", "status", "created_by", "verified_at", "created_at", "updated_at"],
-        "exclude": ["refresh_token"]
+        "include": [
+          "id",
+          "org_id",
+          "customer_id",
+          "customer_domain",
+          "authorized_email",
+          "granted_scopes",
+          "status",
+          "created_by",
+          "verified_at",
+          "created_at",
+          "updated_at"
+        ],
+        "exclude": [
+          "refresh_token"
+        ]
       },
       "cloudcommand_google_oauth_attempts": {
-        "include": ["org_id", "actor_id", "expected_domain", "status", "expires_at", "created_at"],
-        "exclude": ["state_hash", "browser_hash", "verifier_ciphertext"]
+        "include": [
+          "org_id",
+          "actor_id",
+          "expected_domain",
+          "status",
+          "expires_at",
+          "created_at"
+        ],
+        "exclude": [
+          "state_hash",
+          "browser_hash",
+          "verifier_ciphertext"
+        ]
       },
       "cloudcommand_threecx_connections": {
         "include": [
@@ -164,6 +295,32 @@
         ],
         "exclude": []
       },
+      "cloudcommand_microsoft_directory_layouts": {
+        "include": [
+          "org_id",
+          "actor_id",
+          "resource",
+          "layout",
+          "updated_at"
+        ],
+        "exclude": []
+      },
+      "cloudcommand_microsoft_directory_snapshots": {
+        "include": [
+          "org_id",
+          "tenant_id",
+          "connection_generation",
+          "directory_collected_at",
+          "usage_collected_at",
+          "last_attempt_at",
+          "directory_status",
+          "usage_status"
+        ],
+        "exclude": [
+          "directory_data",
+          "usage_data"
+        ]
+      },
       "cloudcommand_microsoft_admin_consent": {
         "exclude": [
           "state_hash",
@@ -181,7 +338,77 @@
           "expires_at",
           "created_at"
         ]
+      },
+      "cloudcommand_idrive_connections": {
+        "include": [
+          "id",
+          "org_id",
+          "company_id",
+          "group_id",
+          "company_name",
+          "group_name",
+          "enabled",
+          "stale_hours",
+          "version",
+          "last_verified_at",
+          "created_at",
+          "updated_at"
+        ],
+        "exclude": [
+          "secret_ciphertext"
+        ]
+      },
+      "cloudcommand_idrive_operations": {
+        "include": [
+          "id",
+          "org_id",
+          "actor_id",
+          "connection_version",
+          "kind",
+          "status",
+          "expires_at",
+          "created_at",
+          "completed_at"
+        ],
+        "exclude": [
+          "payload_ciphertext"
+        ]
+      },
+      "cloudcommand_harmony_scopes": {
+        "include": [
+          "id",
+          "org_id",
+          "partner_id",
+          "integration_id",
+          "kind",
+          "external_id"
+        ],
+        "exclude": []
+      },
+      "cloudcommand_harmony_clients": {
+        "include": [
+          "org_id",
+          "partner_id",
+          "integration_id",
+          "version",
+          "checked_at"
+        ],
+        "exclude": []
+      },
+      "cloudcommand_harmony_endpoints": {
+        "include": [
+          "org_id",
+          "partner_id",
+          "integration_id",
+          "external_id",
+          "device_id",
+          "evidence"
+        ],
+        "exclude": []
       }
-    }
+    },
+    "deviceOrgMoveDeleteTables": [
+      "cloudcommand_harmony_endpoints"
+    ]
   }
 }

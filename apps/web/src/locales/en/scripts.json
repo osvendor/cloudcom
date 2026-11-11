@@ -3,7 +3,8 @@
     "errors": {
       "fetch": "Failed to fetch automation",
       "generic": "An error occurred",
-      "save": "Failed to save automation"
+      "save": "Failed to save automation",
+      "invalidTarget": "The device target is invalid: {{detail}}"
     },
     "loading": "Loading automation...",
     "breadcrumb": {
@@ -25,7 +26,8 @@
     },
     "actions": {
       "create": "Create Automation",
-      "saveChanges": "Save Changes"
+      "saveChanges": "Save Changes",
+      "backToAutomations": "Back to Jobs"
     }
   },
   "automationForm": {
@@ -51,6 +53,11 @@
         "weekdaysNine": "Weekdays 9 AM",
         "weeklySunday": "Weekly Sunday"
       }
+    },
+    "alertWorkflow": {
+      "severity": "Severities",
+      "kind": "Monitor kinds",
+      "hint": "Leave a group empty to match any value. Existing advanced filters are preserved."
     },
     "validation": {
       "valueRequired": "Value is required",
@@ -145,6 +152,7 @@
     },
     "fields": {
       "name": "Automation name",
+      "actionType": "Action type",
       "cronExpression": "Cron Expression",
       "eventType": "Event Type",
       "webhookUrl": "Webhook URL",
@@ -203,7 +211,9 @@
     },
     "empty": {
       "noActions": "No actions defined. Click \"Add Action\" to create one."
-    }
+    },
+    "partnerGroupsNote": "Partner-wide automations cannot target specific device groups or devices, because each belongs to a single organization. Use All Devices or an Advanced Filter.",
+    "partnerTargetBlocked": "This partner-wide automation targets specific device groups or devices, which is not supported. Change the target to All Devices or an Advanced Filter before saving."
   },
   "automationList": {
     "elevated": "Elevated",
@@ -218,7 +228,9 @@
     "searchPlaceholder": "Search automations...",
     "filters": {
       "allTriggers": "All Triggers",
-      "allStatus": "All Status"
+      "allStatus": "All Status",
+      "triggerLabel": "Trigger",
+      "statusLabel": "Status"
     },
     "trigger": {
       "schedule": "Schedule",
@@ -329,6 +341,14 @@
       "untitled": "Script",
       "awaiting": "Waiting for the agent to report…",
       "truncated": "Output truncated — see the device's script history for the full text."
+    },
+    "commandOutput": {
+      "show_one": "Show command output",
+      "show_other": "Show command output ({{count}})",
+      "hide_one": "Hide command output",
+      "hide_other": "Hide command output ({{count}})",
+      "label": "Command (action {{index}})",
+      "truncated": "Output truncated — the full text is not kept in this view."
     }
   },
   "automationsPage": {
@@ -361,7 +381,7 @@
       "scheduled": "Scheduled",
       "on-demand": "On demand",
       "webhooks": "Webhooks",
-      "event-rules": "Event rules"
+      "event-rules": "Alert workflows"
     }
   },
   "complianceDashboard": {
@@ -403,12 +423,17 @@
     "empty": {
       "noPolicies": "No policies configured",
       "allCompliant": "All devices are compliant!",
+      "notEvaluated": "No devices have been evaluated yet.",
+      "noViolationsPending_one": "No violations found; {{count}} device is still pending evaluation.",
+      "noViolationsPending_other": "No violations found; {{count}} devices are still pending evaluation.",
       "noMatchingDevices": "No matching devices found."
     },
     "policyComplianceRatio": "{{compliant}} / {{total}} compliant",
     "searchDevices": "Search devices...",
-    "violationCount": "{{count}} violation",
-    "moreViolations": "+{{count}} more violations",
+    "violationCount_one": "{{count}} violation",
+    "violationCount_other": "{{count}} violations",
+    "moreViolations_one": "+{{count}} more violation",
+    "moreViolations_other": "+{{count}} more violations",
     "lastChecked": "Last checked: {{date}}",
     "pagination": {
       "showing": "Showing {{start}} to {{end}} of {{total}}",
@@ -421,6 +446,7 @@
       "generic": "An error occurred"
     },
     "loading": "Loading compliance data...",
+    "backToPolicies": "Back to Policies",
     "policyTitle": "Compliance: {{policy}}",
     "policyFallback": "Policy",
     "title": "Compliance Dashboard",
@@ -478,7 +504,8 @@
     },
     "actions": {
       "create": "Create Policy",
-      "saveChanges": "Save Changes"
+      "saveChanges": "Save Changes",
+      "backToPolicies": "Back to Policies"
     }
   },
   "policyForm": {
@@ -537,10 +564,12 @@
     },
     "actions": {
       "savePolicy": "Save policy",
-      "addRule": "Add Rule"
+      "addRule": "Add Rule",
+      "removeRule": "Remove Rule"
     },
     "fields": {
       "name": "Policy name",
+      "ruleType": "Rule type",
       "targetType": "Target Type",
       "softwareName": "Software Name",
       "versionCheck": "Version Check",
@@ -612,7 +641,9 @@
     "searchPlaceholder": "Search policies...",
     "filters": {
       "allEnforcement": "All Enforcement",
-      "allStatus": "All Status"
+      "allStatus": "All Status",
+      "enforcementLabel": "Enforcement",
+      "statusLabel": "Status"
     },
     "enforcement": {
       "monitor": {
@@ -659,8 +690,8 @@
       "rejected": "Rejected",
       "none": "None",
       "reasons": {
-        "unknown_field": "No matching field definition",
-        "not_script_writable": "Field is not script-writable",
+        "unknown_field": "No custom field with this key — check the spelling against the field key in Settings → Custom Fields",
+        "not_script_writable": "Field is not script-writable — turn on \"Allow scripts to write this field\" in Settings → Custom Fields",
         "not_applicable_to_device": "Field does not apply to this device type",
         "device_not_found": "Device not found",
         "invalid_type": "Value has the wrong type",
@@ -689,6 +720,8 @@
       "timeout": "Script execution timed out",
       "pending": "Script is waiting to be executed",
       "queued": "Script is queued for delivery to the device",
+      "queuedAwaitingPickup": "No active agent session has picked this up yet. The script is delivered when the device's agent next checks in.",
+      "deviceOffline": "The device is offline. The script is delivered when it reconnects.",
       "cancelling": "Stop requested — waiting for the device to confirm.",
       "cancelled": "Script was stopped on the device"
     },
@@ -707,6 +740,7 @@
       "timeout": "Timeout",
       "queued": "Queued",
       "queuedOffline": "Queued — device offline",
+      "queuedAwaitingPickup": "Queued — waiting for the device to pick it up",
       "cancelling": "Stopping…",
       "cancelled": "Cancelled",
       "completedCancelTooLate": "Completed — your stop request arrived too late",
@@ -726,7 +760,9 @@
       "lastHour": "Last Hour",
       "lastDay": "Last 24 Hours",
       "lastWeek": "Last 7 Days",
-      "lastMonth": "Last 30 Days"
+      "lastMonth": "Last 30 Days",
+      "statusLabel": "Status",
+      "dateLabel": "Date range"
     },
     "status": {
       "pending": "Pending",
@@ -736,6 +772,7 @@
       "timeout": "Timeout",
       "queued": "Queued",
       "queuedOffline": "Queued — device offline",
+      "queuedAwaitingPickup": "Queued — awaiting pickup",
       "cancelling": "Stopping…",
       "cancelled": "Cancelled",
       "completedCancelTooLate": "Completed — your stop request arrived too late",
@@ -770,7 +807,7 @@
   "scriptAiInput": {
     "placeholder": {
       "ready": "Describe the script you need...",
-      "opening": "Opening AI assistant..."
+      "opening": "Opening Breeze AI..."
     },
     "actions": {
       "stopGenerating": "Stop generating",
@@ -786,15 +823,15 @@
     "approval": {
       "title": "Approval Required",
       "approve": "Approve",
-      "reject": "Reject"
+      "reject": "Deny"
     },
     "empty": {
-      "title": "Script AI Assistant",
-      "description": "Describe what you need and I'll write the script for you."
+      "title": "Breeze AI",
+      "description": "Ask Breeze AI to write or review this script."
     }
   },
   "scriptAiPanel": {
-    "title": "AI Script Assistant",
+    "title": "Breeze AI",
     "actions": {
       "redoTitle": "Re-apply AI change",
       "redo": "Redo",
@@ -936,13 +973,23 @@
       "allAdmitted": "All selected devices were admitted and queued.",
       "partiallyAdmitted": "Some devices were admitted and queued. Review the remaining targets.",
       "rejected": "No devices were admitted. Review the reasons below.",
-      "queued": "Queued"
+      "queued": "Queued",
+      "reasons": {
+        "not_found_or_inaccessible": "Device not found or not accessible",
+        "site_access_denied": "You don't have access to this device's site",
+        "script_org_mismatch": "This script belongs to a different organization than the device",
+        "os_incompatible": "Script is not compatible with this device's operating system",
+        "device_decommissioned": "Device has been decommissioned",
+        "maintenance_suppressed": "Skipped: device is in a maintenance window"
+      }
     },
     "confirm": {
       "title": "Confirm Execution",
-      "description": "Run “{{name}}” on {{count}} device(s) as {{runAs}}. Scripts are queued and begin executing immediately."
+      "description": "Run “{{name}}” on {{count}} device(s) as {{runAs}}. Scripts are queued and begin executing immediately.",
+      "descriptionOffline": "Run “{{name}}” on {{count}} device(s) as {{runAs}}. Scripts are queued now: online devices start right away, and {{offline}} offline device(s) run when they come back online."
     },
     "selectedCount": "{{count}} device(s) selected",
+    "executeBlocked": "Execute is unavailable: a selected device cannot run this script here (it may belong to a different organization than the one shown, or no longer be accessible).",
     "languages": {
       "powershell": "PowerShell",
       "bash": "Bash",
@@ -953,6 +1000,44 @@
       "windows": "Windows",
       "macos": "macOS",
       "linux": "Linux"
+    },
+    "targetMode": {
+      "label": "Run on",
+      "devices": "Devices",
+      "groups": "Device groups"
+    },
+    "groups": {
+      "title": "Select device groups",
+      "searchPlaceholder": "Search groups",
+      "selectedCount": "{{count}} group(s) selected",
+      "dynamic": "Dynamic",
+      "deviceCount": "{{count}} device(s)",
+      "refusedReason": "Unavailable as a run target: this group's rules match on fields a device reports about itself ({{fields}}).",
+      "loading": "Loading device groups...",
+      "loadFailed": "Could not load device groups.",
+      "retry": "Retry",
+      "empty": "No device groups found.",
+      "tooManyGroups": "A run can target at most {{max}} groups.",
+      "countingMembers": "Counting members...",
+      "countFailed": "Could not count the members of the selected groups. The server checks the limit when you run.",
+      "summaryUnique": "{{count}} unique device(s) in the selected groups",
+      "summaryCompatible": "{{count}} can run this script (matching operating system)",
+      "summaryOffline": "{{count}} of those are offline and run when the device is online",
+      "membershipNote": "Dynamic group membership is as of the last evaluation and is read again when the run starts.",
+      "overCap": "These groups contain {{count}} unique devices, above the limit of {{max}} per run. Deselect a group or split the run.",
+      "submitting": "Submitting to {{count}} group(s)...",
+      "warningsTitle": "Notes from the server",
+      "confirmDescription": "Run “{{name}}” on {{groups}} device group(s) as {{runAs}}. Scripts are queued and begin executing immediately.",
+      "confirmDescriptionOffline": "Run “{{name}}” on {{groups}} device group(s) as {{runAs}}. Scripts are queued now: online devices start right away, and {{offline}} offline device(s) run when they come back online.",
+      "confirmMembers": "{{count}} unique device(s) are in these groups right now; membership is read again when you confirm.",
+      "confirmMembersUnknown": "The number of devices is not known yet; membership is read when you confirm.",
+      "errors": {
+        "selectGroup": "Please select at least one device group",
+        "tooManyTargets": "These groups resolve to {{count}} devices, above the limit of {{max}} per run. Deselect a group or split the run.",
+        "perGroup": "Devices per group: {{groups}}.",
+        "groupNotFound": "{{count}} selected group(s) no longer exist or are not accessible. Reload the list and try again.",
+        "noTargets": "The selected groups contain no devices this run can target; nothing was run."
+      }
     }
   },
   "secretParameters": {
@@ -968,6 +1053,7 @@
     "loading": "Loading executions...",
     "actions": {
       "backToScripts": "Back to Scripts",
+      "backToScript": "Back to Script",
       "runScript": "Run Script"
     },
     "breadcrumb": {
@@ -1050,8 +1136,8 @@
       "exitCodeSeverity": "Exit Code Severity"
     },
     "ai": {
-      "toggleTitle": "Toggle AI Script Assistant (⌘⇧I)",
-      "button": "AI Assistant"
+      "toggleTitle": "Toggle Breeze AI (⌘⇧I)",
+      "button": "Breeze AI"
     },
     "parameters": {
       "emptyPrefix": "No parameters yet. Parameters let users supply values at runtime — reference them in your script as",
@@ -1064,9 +1150,9 @@
       "elevatedHint": "Uses sudo on macOS/Linux, runas on Windows."
     },
     "exitCodeSeverity": {
-      "emptyPrefix": "Map specific exit codes to alert severities. When the script returns one of these codes, an alert is raised at the configured severity. Choose",
+      "emptyPrefix": "Map specific exit codes to alert severities. When an unattended run (scheduled, automation, policy or alert-triggered) returns one of these codes, an alert is raised at the configured severity; manual runs never raise one. A later run that exits cleanly resolves it. Choose",
       "suppressAlert": "Suppress alert",
-      "emptySuffix": "to mark a code as informational (no incident raised). Exit codes you don't list here use the default outcome handling.",
+      "emptySuffix": "to mark a code as informational (no alert). A non-zero code you don't list uses the nearest lower listed severity, or medium.",
       "suppressHint": "Suppress alert — exit code is treated as informational, no incident raised."
     },
     "keyboardSave": "{{shortcut}} to save",
@@ -1405,6 +1491,7 @@
   },
   "testRunner": {
     "title": "Test run",
+    "deviceSelectLabel": "Test device",
     "devicePlaceholder": "Select a test device…",
     "noDevices": "No compatible devices",
     "devicesLoadFailed": "Couldn't load devices",
@@ -1465,6 +1552,22 @@
     "riskLow": "Low",
     "riskMedium": "Medium",
     "riskHigh": "High",
-    "riskCritical": "Critical"
+    "riskCritical": "Critical",
+    "reviewInApprovals": "Review in Approvals",
+    "status": {
+      "proposed": "Awaiting review",
+      "scan_rejected": "Rejected by the security scan",
+      "review_failed": "AI review failed",
+      "reviewed": "Reviewed",
+      "approved": "Approved",
+      "rejected": "Rejected",
+      "changes_requested": "Changes requested",
+      "expired": "Expired",
+      "superseded": "Superseded",
+      "executed": "Executed",
+      "verified": "Verified",
+      "verification_failed": "Verification failed",
+      "promoted": "Saved to library"
+    }
   }
 }

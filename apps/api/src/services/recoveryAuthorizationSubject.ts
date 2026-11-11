@@ -563,6 +563,12 @@ function stablePrincipalFor(auth: AuthContext): {
     case 'client_user':
       return { kind: auth.principal.kind, id: auth.user.id };
     case 'api_key':
+      // No rehydration path exists for a partner service principal (its key
+      // is not an api_keys row); refuse at capture rather than queue a job
+      // that can never be re-authorized.
+      if (auth.principal.partnerServicePrincipalId) {
+        throw new RecoveryAuthorizationDeniedError('principal_kind_not_supported');
+      }
       if (!auth.principal.apiKeyId) throw new RecoveryAuthorizationDeniedError('principal_id_missing');
       return { kind: 'api_key', id: auth.principal.apiKeyId };
     case 'oauth_grant':
@@ -576,6 +582,9 @@ function stablePrincipalFor(auth: AuthContext): {
       return { kind: 'system', id: auth.principal.reason };
     case 'unknown':
       throw new RecoveryAuthorizationDeniedError('unknown_principal');
+    // Tool catalog W04 (#5219): no rehydration path exists for a flow run (the
+    // persisted vocabulary has no flow kind, and a run id is not an agent run).
+    case 'flow':
     case 'agent':
     case 'helper':
       throw new RecoveryAuthorizationDeniedError('principal_kind_not_supported');

@@ -15,12 +15,14 @@ const captureMessageMock = vi.fn();
 const setLevelMock = vi.fn();
 const setExtrasMock = vi.fn();
 const setContextMock = vi.fn();
+const setFingerprintMock = vi.fn();
 const withScopeMock = vi.fn((cb: (scope: unknown) => void) =>
   cb({
     setTag: setTagMock,
     setContext: setContextMock,
     setLevel: setLevelMock,
     setExtras: setExtrasMock,
+    setFingerprint: setFingerprintMock,
   }),
 );
 
@@ -48,6 +50,7 @@ describe('sentry service', () => {
     setLevelMock.mockClear();
     setExtrasMock.mockClear();
     setContextMock.mockClear();
+    setFingerprintMock.mockClear();
     process.env = { ...ORIGINAL_ENV };
   });
 
@@ -163,6 +166,25 @@ describe('sentry service', () => {
     expect(setTagMock).toHaveBeenCalledWith('backup_dispatch_issue', 'redelivery-refused');
   });
 
+  // AI chargeback (#7608): a failed or expired monthly close is only
+  // recoverable if the operator can find the org and the month.
+  it('captureException and captureMessage keep the AI chargeback org_id + ai_charge_period_start tags', async () => {
+    process.env.SENTRY_DSN = 'https://abc@o1.ingest.us.sentry.io/2';
+    const { initSentry, captureException, captureMessage } = await import('./sentry');
+    initSentry();
+
+    captureException(new Error('close failed'), undefined, { org_id: 'org-1', ai_charge_period_start: '2026-11-01' });
+    expect(setTagMock).toHaveBeenCalledWith('org_id', 'org-1');
+    expect(setTagMock).toHaveBeenCalledWith('ai_charge_period_start', '2026-11-01');
+
+    setTagMock.mockClear();
+    captureMessage('AI chargeback: usage expired', {
+      eventCode: 'ai_chargeback_usage_expired', tags: { org_id: 'org-1', ai_charge_period_start: '2026-11-01' },
+    });
+    expect(setTagMock).toHaveBeenCalledWith('ai_charge_period_start', '2026-11-01');
+    expect(setTagMock).toHaveBeenCalledWith('event_code', 'ai_chargeback_usage_expired');
+  });
+
   // #3022: a CONNECT_TIMEOUT already arrives tagged `pg_code:CONNECT_TIMEOUT`,
   // but that bucket mixes two unrelated failures — a handshake that really
   // failed, and a main thread too busy to run the socket callbacks. These tags
@@ -187,6 +209,20 @@ describe('sentry service', () => {
     expect(setTagMock).toHaveBeenCalledWith('connect_timeout_cause', 'unknown');
     expect(setTagMock).toHaveBeenCalledWith('event_loop_lag_bucket', 'unknown');
     setConnectTimeoutClassifier(null);
+  });
+
+  // #7600 W02: a bursty call site (the ledger shadow listener) groups its
+  // events under one fixed, bounded fingerprint instead of per-message.
+  it('captureException applies an explicit fingerprint, and sets none by default', async () => {
+    process.env.SENTRY_DSN = 'https://abc@o1.ingest.us.sentry.io/2';
+    const { initSentry, captureException } = await import('./sentry');
+    initSentry();
+
+    captureException(new Error('shadow failed'), undefined, undefined, { fingerprint: ['ai_invocation_shadow', '42501'] });
+    expect(setFingerprintMock).toHaveBeenCalledWith(['ai_invocation_shadow', '42501']);
+    setFingerprintMock.mockClear();
+    captureException(new Error('other'));
+    expect(setFingerprintMock).not.toHaveBeenCalled();
   });
 
   it('captureException leaves non-timeout errors untagged by the #3022 classifier', async () => {
@@ -481,10 +517,14 @@ describe('scrubEvent', () => {
         release_sync_failure_reason: 'ssrf-blocked',
         release_sync_context: 'stale-volume-fallback',
         backup_dispatch_issue: 'redelivery-refused',
+        command_dispatch_refusal: 'trust_denied',
         worker: 'patchScheduler',
         worker_failure_reason: 'desktop_stop_pending',
+        command_result_phase: 'cis_result',
         patch_reconcile_stage: 'enqueue_failed',
         patch_reconcile_repeat: '2-4',
+        patch_scheduler_stage: 'closest_wins_resolve_failed',
+        update_ring_stage: 'device_count_failed',
         jobId: 'bull-job-918273',
         path: '/public/quotes/raw-capability',
         arbitrary: 'raw-capability',
@@ -566,6 +606,10 @@ describe('scrubEvent', () => {
       // contentless and an operator cannot tell a deliberate at-most-once drop
       // from an ordinary backup-worker crash.
       backup_dispatch_issue: 'redelivery-refused',
+      // #8022/BREEZE-45: the maintenance-reboot sweep's refused-dispatch
+      // warning. Dropped here, every refusal arrives as the same contentless
+      // event and the reason a device is never rebooted is unrecoverable.
+      command_dispatch_refusal: 'trust_denied',
       // #1379/BREEZE-9: attachWorkerObservability sets this on every worker,
       // and the allowlist introduced two days later (a50769487) has discarded
       // it ever since, which is why ~12k held-context events carry an empty
@@ -574,8 +618,13 @@ describe('scrubEvent', () => {
       // #3912's tags. Inert until that PR lands, but asserted now so a future
       // edit to ALLOWED_TAG_NAMES cannot quietly un-allowlist them.
       worker_failure_reason: 'desktop_stop_pending',
+      command_result_phase: 'cis_result',
       patch_reconcile_stage: 'enqueue_failed',
       patch_reconcile_repeat: '2-4',
+      // #9632: closest-wins scheduling failures and the ring-count failure.
+      // Dropped here, they arrive contentless and indistinguishable.
+      patch_scheduler_stage: 'closest_wins_resolve_failed',
+      update_ring_stage: 'device_count_failed',
       // NB: `jobId` was in the input bag and is deliberately absent here — a
       // BullMQ per-job counter is unbounded by construction, so allowlisting it
       // would inflate Sentry's tag index without making anything triageable.
@@ -603,6 +652,27 @@ describe('scrubEvent', () => {
     expect(() => scrubEvent({} as any)).not.toThrow();
     expect(() => scrubEvent({ request: {} } as any)).not.toThrow();
     expect(() => scrubEvent({ request: { headers: {} } } as any)).not.toThrow();
+  });
+
+  // W08 (#8147): the scrubber validates a caller-supplied route_template by
+  // building a request-less context. A non-template value must be dropped —
+  // never thrown out of beforeSend (an error reporter must not crash).
+  it.each(['*', '/quotes?token=raw', 'not-a-route', '/quotes/%3Atoken'])(
+    'drops an unsafe route_template tag %j without throwing',
+    async (routeTemplate) => {
+      const { scrubEvent } = await import('./sentry');
+      let out: Record<string, any> | undefined;
+      expect(() => {
+        out = scrubEvent({ tags: { route_template: routeTemplate, pg_code: '42501' } });
+      }).not.toThrow();
+      expect(out?.tags).toEqual({ pg_code: '42501' });
+    },
+  );
+
+  it('keeps the fixed tunnel-host route_template tag (#8158)', async () => {
+    const { scrubEvent } = await import('./sentry');
+    const out = scrubEvent({ tags: { route_template: 'tunnel-host', pg_code: '42501' } }) as Record<string, any>;
+    expect(out?.tags).toEqual({ route_template: 'tunnel-host', pg_code: '42501' });
   });
 });
 
@@ -776,15 +846,29 @@ describe('accounting captureException tags stay allowlisted (#4828)', () => {
     // 8 -> 10: the two SyncToken-re-read fixes later in this branch each added a
     // tag-bearing capture without bumping the pin, which is exactly the count
     // mismatch this number exists to force.
-    ['accounting/accountingInvoicePush.ts', 10],
+    // 10 -> 12: Xero W04 refinement 22 void-recovery persist added its own
+    // zero-row and catch captureException calls (same tag shape as the
+    // existing SyncToken persist).
+    ['../routes/pax8Orders.ts', 1],
+    ['pax8OrderObservability.ts', 1],
+    ['pax8OrderSubmitRepository.ts', 1],
+    ['aiToolsPax8Orders.ts', 1],
+    ['accounting/accountingInvoicePush.ts', 12],
     ['accounting/accountingMappingService.ts', 5],
     // Phase D2. Paths are resolved against THIS file's directory (services/),
     // so the two worker files reach out of it.
-    ['accounting/accountingPaymentPush.ts', 12], // +2 noteRecordFailed (give-up alarm, own catch), +1 the org-scope outbox skip
+    // 12 -> 14: Xero W05 — the create-side `remote_ambiguous` refusal capture and
+    // `markPaymentRefusedIfStillOwed`'s own best-effort catch.
+    ['accounting/accountingPaymentPush.ts', 14], // +2 noteRecordFailed (give-up alarm, own catch), +1 the org-scope outbox skip
     // #6082: the sync-mapping terminal-failure path (`AccountingMappingError`)
     // added a third tag-bearing capture (`accounting_entity_id`).
     ['../jobs/accountingSyncWorker.ts', 3],
-    ['../jobs/accountingReconcileWorker.ts', 5],
+    // Xero W02: sweep pass 3 (reap stale pending_tenant rows) added a sixth
+    // tag-bearing capture (`accounting_reconcile_phase: 'sweep.reapPendingTenants'`).
+    // Xero W05a: sweep pass 1's owed-delete check (webhook budget deferral
+    // exemption) is isolated with its own tag-bearing capture
+    // (`accounting_reconcile_phase: 'sweep.owedDelete'`) — seventh.
+    ['../jobs/accountingReconcileWorker.ts', 7],
     // #5126: the same #4828/Phase D2 defect in the pull-back path — every
     // captureException in accountingPaymentPull.ts tagged camelCase keys
     // (action, resourceId, remotePaymentId, invoiceId) with no allowlisted
@@ -813,4 +897,11 @@ describe('accounting captureException tags stay allowlisted (#4828)', () => {
       expect(allowedTagNames.has(key), `tag "${key}" in ${relativePath} is not in sentry.ts ALLOWED_TAG_NAMES — it will be silently dropped`).toBe(true);
     }
   });
+});
+
+// Sourced-alert diagnostics must survive the outbound scrubber.
+it('retains local alert owner identity in Sentry tags', async () => {
+  const { scrubEvent } = await import('./sentry');
+  const tags = { ownerKind: 'backup_workload', ownerRef: '11111111-1111-4111-8111-111111111111' };
+  expect(scrubEvent({ tags: { ...tags } }).tags).toEqual(tags);
 });

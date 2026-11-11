@@ -163,6 +163,7 @@ async function seedTimedOutRun(
       result: opts.commandResult ?? {
         status: 'timeout',
         error: 'Command timed out after 60000ms',
+        timedOutBy: 'server',
       },
     })
     .returning({ id: deviceCommands.id });
@@ -178,6 +179,9 @@ async function sendWsResult(
   body: Record<string, unknown>,
 ): Promise<void> {
   const handlers = createAgentWsHandlers(fx.agentId, {
+    agentId: fx.agentId,
+    siteId: fx.siteId,
+    installIncarnation: 1,
     deviceId: fx.deviceId,
     orgId: fx.orgId,
     partnerId: fx.partnerId,
@@ -206,6 +210,7 @@ async function sendHttpResult(
   const app = new Hono();
   app.use('*', async (c, next) => {
     c.set('agent', {
+      installIncarnation: 1,
       deviceId: fx.deviceId,
       agentId: fx.agentId,
       orgId: fx.orgId,
@@ -655,7 +660,7 @@ describe('#3607 late command result recovery', () => {
       // green for the wrong reason. Resetting isolates the guard being tested.
       await getTestDb()
         .update(deviceCommands)
-        .set({ status: 'failed', result: { status: 'timeout', error: 'reopened for replay' } })
+        .set({ status: 'failed', result: { status: 'timeout', error: 'reopened for replay', timedOutBy: 'server' } })
         .where(eq(deviceCommands.id, commandId));
 
       await sendWsResult(fx, commandId, {

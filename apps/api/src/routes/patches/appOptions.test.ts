@@ -65,10 +65,20 @@ vi.mock('../../db/schema', () => ({
   },
 }));
 
+// Mirrors prod gate semantics: 403 unless the caller holds exactly the
+// granted permission.
+let grantedPermission: string | null = 'devices:read';
+
 vi.mock('../../middleware/auth', () => ({
   requireScope: vi.fn(() => async (c: any, next: any) => {
     c.set('auth', currentAuth);
     await next();
+  }),
+  requirePermission: vi.fn((resource: string, action: string) => async (c: any, next: any) => {
+    if (`${resource}:${action}` !== grantedPermission) {
+      return c.json({ error: 'Forbidden' }, 403);
+    }
+    return next();
   }),
 }));
 
@@ -98,6 +108,17 @@ describe('GET /app-options', () => {
     selectMock.mockReset();
     selectDistinctMock.mockReset();
     currentAuth = systemAuth();
+    grantedPermission = 'devices:read';
+  });
+
+  it('rejects a caller without devices:read', async () => {
+    grantedPermission = null;
+
+    const res = await appOptionsRoutes.request('/app-options');
+
+    expect(res.status).toBe(403);
+    expect(selectMock).not.toHaveBeenCalled();
+    expect(selectDistinctMock).not.toHaveBeenCalled();
   });
 
   it('merges catalog and observed entries, with catalog metadata winning on dedup', async () => {
@@ -139,6 +160,45 @@ describe('GET /app-options', () => {
       displayName: 'Firefox',
       inCatalog: true,
     }));
+  });
+
+  it('offers observed Linux packages by bare name, one option across apt and yum (#9370)', async () => {
+    selectMock.mockReturnValue(selectRows([]));
+    selectDistinctMock.mockReturnValue(selectDistinctRows([
+      { source: 'linux', packageId: 'apt:docker-ce', vendor: null, displayName: 'docker-ce' },
+      { source: 'linux', packageId: 'yum:docker-ce', vendor: null, displayName: 'docker-ce' },
+      { source: 'third_party', packageId: 'docker-ce', vendor: null, displayName: 'Docker CE (winget)' },
+    ]));
+
+    const res = await appOptionsRoutes.request('/app-options');
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    const linux = body.data.filter((option: any) => option.source === 'linux');
+    expect(linux).toEqual([
+      { source: 'linux', packageId: 'docker-ce', vendor: null, displayName: 'docker-ce', inCatalog: false },
+    ]);
+    // Same name from a third-party source stays its own option.
+    expect(body.data.filter((option: any) => option.source === 'third_party')).toHaveLength(1);
+    expect(observedWhereMock()).toHaveBeenCalledWith(expect.objectContaining({
+      conditions: expect.arrayContaining([
+        expect.objectContaining({ op: 'inArray', right: expect.arrayContaining(['third_party', 'custom', 'linux']) }),
+      ]),
+    }));
+  });
+
+  it('lists applications before Linux packages so OS packages cannot crowd them off the first page', async () => {
+    selectMock.mockReturnValue(selectRows([]));
+    selectDistinctMock.mockReturnValue(selectDistinctRows([
+      { source: 'linux', packageId: 'apt:adduser', vendor: null, displayName: 'adduser' },
+      { source: 'third_party', packageId: 'Zoom.Zoom', vendor: 'Zoom', displayName: 'Zoom' },
+    ]));
+
+    const res = await appOptionsRoutes.request('/app-options?limit=1');
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data.map((option: any) => option.packageId)).toEqual(['Zoom.Zoom']);
   });
 
   it('filters by search across name, vendor, and packageId', async () => {

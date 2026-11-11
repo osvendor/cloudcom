@@ -77,6 +77,14 @@ function nextRows(table: string): unknown[] {
   throw new Error(`No queued rows for table ${table}`);
 }
 
+// AI Suggested Fixes W3 — loadRunContext's proven-fix lookup. Mocked so it never
+// consumes this file's queued db rows; returns null (no memory) by default.
+const loadProvenFixesForRun = vi.hoisted(() => vi.fn(async (): Promise<unknown> => null));
+vi.mock('../fixMemory/runMemory', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../fixMemory/runMemory')>()),
+  loadProvenFixesForRun,
+}));
+
 vi.mock('../../db', () => {
   const makeSelect = () => ({
     from: vi.fn((table: unknown) => {
@@ -177,6 +185,13 @@ const createBreezeMcpServer = vi.hoisted(() =>
 vi.mock('../aiAgentSdkTools', () => ({
   createBreezeMcpServer,
   BREEZE_MCP_TOOL_NAMES: ['mcp__breeze__query_devices'],
+  // runLoop.ts's full-profile exposure (WQ3, #6755) derives from
+  // Object.keys(TOOL_TIERS); this suite never exercises a full-profile run,
+  // but the module-level computation still runs, so this must exist.
+  TOOL_TIERS: { query_devices: 1 },
+  // A full-profile run intersects its exposure with the declared set (#7427);
+  // mirrors TOOL_TIERS above.
+  listChatSurfaceToolNames: () => ['query_devices'],
   POST_TOOL_USE_TIMEOUT_MS: 10_000,
 }));
 
@@ -225,22 +240,29 @@ vi.mock('../../jobs/agentNotifyRetryWorker', () => ({ enqueueAgentNotifyRetry })
 const scheduleFixWatch = vi.hoisted(() => vi.fn<(...args: unknown[]) => Promise<void>>(async () => undefined));
 vi.mock('../../jobs/fixWatchWorker', () => ({ scheduleFixWatch }));
 
-const resolveLlmConfigForOrg = vi.hoisted(() =>
-  vi.fn<(orgId: string) => Promise<{ source: string; apiKey?: string; model: string }>>());
-vi.mock('../llm/llmConfigResolver', () => ({ resolveLlmConfigForOrg }));
+// AI model registry W03 (Task 12): the run loop resolves `ai_agents` through
+// the registry and settles through the single billing path.
+const resolveModel = vi.hoisted(() => vi.fn());
+vi.mock('../aiModels/resolveModel', () => ({ resolveModel }));
+const settleInvocation = vi.hoisted(() =>
+  vi.fn<(input: Record<string, unknown>) => Promise<{ costCents: number; invocationIds: string[]; deferred: boolean }>>(
+    async () => ({ costCents: 0, invocationIds: [], deferred: false })));
+vi.mock('../aiModels/settleInvocation', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../aiModels/settleInvocation')>()),
+  settleInvocation,
+}));
 
 const buildClaudeSdkChildEnv = vi.hoisted(() =>
   vi.fn<(resolved: { source: string }) => Record<string, string>>(() => ({ CI: 'true' })));
 vi.mock('../streamingSessionManager', () => ({ buildClaudeSdkChildEnv }));
 
-const recordSessionlessSdkUsage = vi.hoisted(() => vi.fn<(...args: unknown[]) => Promise<void>>(async () => undefined));
-const calculateCostCents = vi.hoisted(() => vi.fn<(...args: unknown[]) => number>(() => 0));
-vi.mock('../aiCostTracker', () => ({ recordSessionlessSdkUsage, calculateCostCents }));
+vi.mock('../aiCostTracker', () => ({}));
 const reserveAiBudget = vi.hoisted(() => vi.fn());
 const markAiBudgetReservationIndeterminate = vi.hoisted(() => vi.fn());
 vi.mock('../aiBudgetReservations', () => ({ reserveAiBudget, markAiBudgetReservationIndeterminate }));
 
-import { createAgentRunPostToolUse, createAgentRunPreToolUse, executeAgentRun } from './runLoop';
+import { createAgentRunCallPairing, createAgentRunPostToolUse, createAgentRunPreToolUse, executeAgentRun } from './runLoop';
+import { makeResolvedModel } from '../aiModels/__fixtures__/resolvedModel';
 import type { AgentRunOutcome } from './runLoop';
 import { SWEEP_TOOL_ALLOWLIST } from './sweepProfile';
 
@@ -251,7 +273,6 @@ function policy(overrides: Partial<AiAgentPolicy> = {}): AiAgentPolicy {
   return {
     enabled: true,
     mode: 'shadow',
-    model: 'claude-test-model',
     toolAllowlist: [],
     protectedResources: { services: [], paths: [], registryKeys: [], deviceTags: [] },
     limits: { ...AI_AGENT_LIMIT_DEFAULTS },
@@ -296,6 +317,7 @@ function seedRows(options: {
   scheduleId?: string | null;
   triggerRef?: Record<string, unknown>;
   deviceId?: string | null;
+  triggerKind?: 'alert' | 'schedule' | 'manual';
 } = {}) {
   const effective = options.effective ?? policy();
   const deviceId = options.deviceId === undefined ? null : options.deviceId;
@@ -310,7 +332,7 @@ function seedRows(options: {
     anomalyIncidentId: null,
     status: 'queued',
     modeAtStart: 'shadow',
-    triggerKind: options.profile === 'sweep' ? 'schedule' : 'alert',
+    triggerKind: options.triggerKind ?? (options.profile === 'sweep' ? 'schedule' : 'alert'),
     policySnapshot: snapshot(effective),
     profile: options.profile ?? 'sweep',
     correlationGroupId: null,
@@ -430,7 +452,7 @@ beforeEach(() => {
   completeToolExecution.mockResolvedValue(undefined);
   reconcileHungExecutions.mockResolvedValue(0);
   closeAgentRunSession.mockResolvedValue(undefined);
-  resolveLlmConfigForOrg.mockResolvedValue({ source: 'platform', apiKey: 'sk-test', model: 'claude-fallback' });
+  resolveModel.mockResolvedValue(makeResolvedModel('platform', { surface: 'ai_agents' }));
   resolveRecipientUserIds.mockResolvedValue([]);
   enqueueAgentNotifyRetry.mockResolvedValue(undefined);
   createActionIntent.mockResolvedValue({ id: 'intent-1', status: 'pending_approval' });
@@ -479,10 +501,8 @@ describe('sweep profile outcome-tool gating (P2-2)', () => {
       },
       outcome,
       intentIds: [],
-      allowedPending: new Map<string, number>(),
       sessionId: null,
-      executionIdPending: new Map<string, Array<string | null>>(),
-      actPinPending: new Map<string, Array<unknown>>(),
+      pairing: createAgentRunCallPairing(),
       actReservation: { count: 0 },
       deadlineMs: Date.now() + 60_000,
     };
@@ -548,9 +568,7 @@ describe('sweep profile outcome-tool gating (P2-2)', () => {
     const outcome = emptyOutcome();
     const post = createAgentRunPostToolUse({
       outcome,
-      allowedPending: new Map<string, number>(),
-      executionIdPending: new Map<string, Array<string | null>>(),
-      actPinPending: new Map<string, Array<unknown>>(),
+      pairing: createAgentRunCallPairing(),
       run: { id: RUN_ID, orgId: ORG_ID, agentId: AGENT_ID, deviceId: null, profile: 'sweep' },
       agentUserId: USER_A,
     } as never);
@@ -566,9 +584,7 @@ describe('sweep profile outcome-tool gating (P2-2)', () => {
     const outcome = emptyOutcome();
     const post = createAgentRunPostToolUse({
       outcome,
-      allowedPending: new Map<string, number>(),
-      executionIdPending: new Map<string, Array<string | null>>(),
-      actPinPending: new Map<string, Array<unknown>>(),
+      pairing: createAgentRunCallPairing(),
       run: { id: RUN_ID, orgId: ORG_ID, agentId: AGENT_ID, deviceId: null, profile: 'full' },
       agentUserId: USER_A,
     } as never);
@@ -580,6 +596,12 @@ describe('sweep profile outcome-tool gating (P2-2)', () => {
 });
 
 describe('sweep profile exposure and context in the run loop (P2-2)', () => {
+  it('sweep run has no provenFixes lookup (Review Focus 5)', async () => {
+    seedRows({ effective: policy({ toolAllowlist: ['manage_services'] }), profile: 'sweep' });
+    await executeAgentRun(RUN_ID);
+    expect(loadProvenFixesForRun).not.toHaveBeenCalled();
+  });
+
   it('exposes the sweep floor + sweep outcome tool with the sweep limits', async () => {
     // Deliberately mismatched agent allowlist — the floor is served regardless.
     seedRows({ effective: policy({ toolAllowlist: ['manage_services'] }), profile: 'sweep' });
@@ -622,7 +644,7 @@ describe('sweep profile exposure and context in the run loop (P2-2)', () => {
     loadSweepEvidence.mockResolvedValue({ kinds: {}, truncated: false });
     transitionRunStatus.mockResolvedValue(true);
     createAgentRunSession.mockResolvedValue('session-2');
-    resolveLlmConfigForOrg.mockResolvedValue({ source: 'platform', apiKey: 'sk-test', model: 'claude-fallback' });
+    resolveModel.mockResolvedValue(makeResolvedModel('platform', { surface: 'ai_agents' }));
     resolveRecipientUserIds.mockResolvedValue([]);
     getCachedAiKillStateSnapshot.mockReturnValue({ killed: false, epoch: 0 });
     createBreezeMcpServer.mockImplementation((getAuth, pre, post) => {
@@ -814,7 +836,9 @@ describe('notify / fix-watch split at finish (P2-2)', () => {
   });
 
   it('a full run still does BOTH (unchanged by the split)', async () => {
-    seedRows({ profile: 'full', deviceId: DEVICE_ID });
+    // #6908: manual trigger — an alert-triggered full run that ends no_action with
+    // nothing proposed is now deliberately silent (runFinishedNotify.test.ts).
+    seedRows({ profile: 'full', deviceId: DEVICE_ID, triggerKind: 'manual' });
     scriptQuery({ assistantText: 'All good.' });
 
     await executeAgentRun(RUN_ID);

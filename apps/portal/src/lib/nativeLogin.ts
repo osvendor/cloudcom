@@ -8,6 +8,12 @@ const canonical32 = (value: unknown): value is string => typeof value === 'strin
   && /^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/.test(value);
 
 export function parseNativeLoginRequest(query: URLSearchParams): NativeLoginRequest | null {
+  query = new URLSearchParams(query);
+  // Ignore only the known browser Access marker; actual identity is checked
+  // by portal authentication and the one-time PKCE exchange.
+  if (query.getAll('cf-access-login').length === 1 && query.get('cf-access-login') === 'success') {
+    query.delete('cf-access-login');
+  }
   if ([...query.keys()].length !== fields.length || fields.some(key => query.getAll(key).length !== 1)) return null;
   if (query.get('clientId') !== 'cloudcom-rustdesk-v1' || query.get('codeChallengeMethod') !== 'S256') return null;
   const redirectUri = query.get('redirectUri')!;

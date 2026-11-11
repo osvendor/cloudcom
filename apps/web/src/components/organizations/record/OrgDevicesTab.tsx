@@ -1,12 +1,24 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { i18n } from '@/lib/i18n';
 import DeviceList, { type Device, type DeviceStatus } from '@/components/devices/DeviceList';
+import { ORG_TAB_COLUMN_PRESET, readColumnVisibility } from '@/components/devices/columnVisibility';
+import { navigateTo } from '@/lib/navigation';
+import { fetchAllPages } from '@/lib/fetchAllPages';
+import { applyOrgSwitch } from '@/lib/orgSwitch';
+import { usePermissions } from '@/lib/permissions';
+import { useOrgStore } from '@/stores/orgStore';
+import { toDeviceListRow, type ApiDeviceRow } from '@/components/devices/deviceRowTransform';
 import type { OrgFetch } from './orgRecordFetch';
 
 export interface OrgDevicesTabProps {
   orgId: string;
+  orgName: string;
   orgFetch: OrgFetch;
 }
+
+/** The tab's single bounded page (see the component note). Exported for the test. */
+export const ORG_DEVICES_LIMIT = 200;
 
 type SiteOption = { id: string; name: string };
 
@@ -35,52 +47,106 @@ const STATUS_OPTIONS: DeviceStatus[] = [
  * cursor walk: a customer record's own device count is realistically well
  * under that, and the filter bar here is intentionally the cut-down
  * search/status/site set rather than the fleet page's full chip-based filter
- * builder. This is an unenforced assumption, not a hard cap — an org past
- * 200 devices silently loses rows past the limit with no truncation notice.
- * Revisit with real pagination (or `fetchAllDevices`'s cursor walk) if that
- * ever stops being realistic.
+ * builder. An org past the cap is told so (#9023): the cursor response's
+ * `nextCursor` says rows were left behind, and the notice hands off to the
+ * fleet page in this org's workspace, which walks every page.
  */
-export default function OrgDevicesTab({ orgId, orgFetch }: OrgDevicesTabProps) {
+export default function OrgDevicesTab({ orgId, orgName, orgFetch }: OrgDevicesTabProps) {
   const { t } = useTranslation('organizations');
+  const { can } = usePermissions();
+  // Same gate as the fleet page's "Install agent": the enrol flow mints an
+  // enrolment key, which the API gates on organizations:write (#7217).
+  const canAddDevice = can('organizations', 'write');
   const [devices, setDevices] = useState<LoadState<Device>>(null);
+  const [warrantyRequested, setWarrantyRequested] = useState(() => readColumnVisibility(ORG_TAB_COLUMN_PRESET).has('warranty'));
+  const [truncated, setTruncated] = useState(false);
   const [sites, setSites] = useState<SiteOption[]>([]);
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState('');
   const [siteFilter, setSiteFilter] = useState('');
 
-  useEffect(() => {
-    let cancelled = false;
-    setDevices(null);
-    void (async () => {
-      try {
-        const res = await orgFetch('/devices?limit=200');
-        if (!res.ok) throw new Error(`devices load failed: ${res.status}`);
-        const body = await res.json();
-        const rows: Device[] | null = Array.isArray(body?.data) ? body.data : Array.isArray(body) ? body : null;
-        // A 200 whose body isn't a parseable array tells us nothing about the
-        // real device count — treating it as `[]` would render "No devices
-        // found" (active guidance to adjust filters) for what is actually an
-        // API failure. Fail the same way a non-2xx response does.
-        if (rows === null) throw new Error('devices load: malformed response body');
-        if (!cancelled) setDevices(rows);
-      } catch (err) {
-        console.warn('[OrgDevicesTab] devices load failed', err);
-        if (!cancelled) setDevices('failed');
+  // Read through a ref so toggling the column never re-runs the mount load
+  // (which would blank the rows behind a spinner). `rowsHaveWarrantyRef`
+  // records whether the rows on screen carry warranty, so only an off→on
+  // toggle over warranty-less rows triggers a (background) reload.
+  const warrantyRequestedRef = useRef(warrantyRequested);
+  warrantyRequestedRef.current = warrantyRequested;
+  const rowsHaveWarrantyRef = useRef(false);
+  // Bumped by every load and by unmount / org change, so a stale response can
+  // never overwrite a newer one (the old per-effect `cancelled` flag).
+  const loadGenerationRef = useRef(0);
+
+  const loadDevices = useCallback(async ({ background }: { background: boolean }) => {
+    const generation = ++loadGenerationRef.current;
+    const isCurrent = () => generation === loadGenerationRef.current;
+    const includeWarranty = warrantyRequestedRef.current;
+    if (!background) {
+      setDevices(null);
+      setTruncated(false);
+    }
+    try {
+      const res = await orgFetch(`/devices?limit=${ORG_DEVICES_LIMIT}${includeWarranty ? '&includeWarranty=true' : ''}`);
+      if (!res.ok) throw new Error(`devices load failed: ${res.status}`);
+      const body = await res.json();
+      const rows: ApiDeviceRow[] | null = Array.isArray(body?.data) ? body.data : Array.isArray(body) ? body : null;
+      // A 200 whose body isn't a parseable array tells us nothing about the
+      // real device count — treating it as `[]` would render "No devices
+      // found" (active guidance to adjust filters) for what is actually an
+      // API failure. Fail the same way a non-2xx response does.
+      if (rows === null) throw new Error('devices load: malformed response body');
+      if (!isCurrent()) return;
+      setDevices(rows.map(toDeviceListRow));
+      rowsHaveWarrantyRef.current = includeWarranty;
+      // Cursor mode (no `page`) returns `nextCursor` when rows remain; a
+      // `total` (legacy/offset shape) says the same thing another way.
+      const pagination = body?.pagination;
+      const total = typeof pagination?.total === 'number' ? pagination.total : null;
+      setTruncated(Boolean(pagination?.nextCursor) || (total !== null && total > rows.length));
+    } catch (err) {
+      if (background) {
+        // Keep the rows already on screen; the warranty column just stays empty.
+        console.warn('[OrgDevicesTab] background devices load failed', err);
+        return;
       }
-    })();
-    return () => {
-      cancelled = true;
-    };
+      console.warn('[OrgDevicesTab] devices load failed', err);
+      if (isCurrent()) setDevices('failed');
+    }
   }, [orgFetch, orgId]);
+
+  useEffect(() => {
+    rowsHaveWarrantyRef.current = false;
+    void loadDevices({ background: false });
+    return () => {
+      loadGenerationRef.current += 1;
+    };
+  }, [orgFetch, orgId]); // loadDevices has the same deps
+
+  // Column turned on over rows loaded without warranty → reload in the
+  // background. Off, or on again over warranty-bearing rows, is a no-op.
+  // Waiting for loaded rows covers a toggle during the first load (that load
+  // read the old flag); a failed load is left to the user's retry.
+  const rowsLoaded = Array.isArray(devices);
+  useEffect(() => {
+    if (!warrantyRequested || !rowsLoaded || rowsHaveWarrantyRef.current) return;
+    void loadDevices({ background: true });
+  }, [warrantyRequested, rowsLoaded, loadDevices]);
 
   useEffect(() => {
     let cancelled = false;
     void (async () => {
       try {
-        const res = await orgFetch(`/orgs/sites?organizationId=${orgId}&limit=100`);
-        if (!res.ok) throw new Error(`sites load failed: ${res.status}`);
-        const body = await res.json();
-        const rows: SiteOption[] | null = Array.isArray(body?.data) ? body.data : Array.isArray(body) ? body : null;
+        // Every page, not the first 100 (#9791): a device at a site past the
+        // page limit rendered "Unknown Site". `fetchAllPages` is the walk
+        // behind `fetchAllSites`; it is driven here through `orgFetch` so the
+        // org pin holds (fetchAllSites would use the ambient fetch).
+        const rows = await fetchAllPages<SiteOption>(
+          async (page, limit) => {
+            const res = await orgFetch(`/orgs/sites?organizationId=${orgId}&page=${page}&limit=${limit}`);
+            if (!res.ok) throw new Error(`sites load failed: ${res.status}`);
+            return res.json();
+          },
+          { aliasKeys: ['sites'], strictShape: true },
+        );
         if (rows === null) throw new Error('sites load: malformed response body');
         if (!cancelled) setSites(rows.map((s) => ({ id: s.id, name: s.name })));
       } catch (err) {
@@ -97,13 +163,35 @@ export default function OrgDevicesTab({ orgId, orgFetch }: OrgDevicesTabProps) {
   const filteredDevices = useMemo(() => {
     if (devices === null || devices === 'failed') return [];
     const q = search.trim().toLowerCase();
-    return devices.filter((d) => {
-      if (statusFilter && d.status !== statusFilter) return false;
-      if (siteFilter && d.siteId !== siteFilter) return false;
-      if (q && !d.hostname?.toLowerCase().includes(q)) return false;
-      return true;
-    });
-  }, [devices, search, statusFilter, siteFilter]);
+    // Same label /devices shows for a device whose site is not in the lookup.
+    const siteNameById = new Map(sites.map((s) => [s.id, s.name]));
+    return devices
+      .filter((d) => {
+        if (statusFilter && d.status !== statusFilter) return false;
+        if (siteFilter && d.siteId !== siteFilter) return false;
+        if (q && !d.hostname?.toLowerCase().includes(q)) return false;
+        return true;
+      })
+      .map((d) => ({ ...d, siteName: siteNameById.get(d.siteId) ?? i18n.t('devices:devicesPage.unknownSite') }));
+  }, [devices, sites, search, statusFilter, siteFilter]);
+
+  const filtersActive = search.trim() !== '' || statusFilter !== '' || siteFilter !== '';
+  const clearFilters = () => {
+    setSearch('');
+    setStatusFilter('');
+    setSiteFilter('');
+  };
+  // Leaving the record is the point of both hand-offs below; the fleet page
+  // (and its enrol modal) work in the ambient org, so switch to this one —
+  // or, when the workspace already is this org, just go (no "Switched to"
+  // toast for a switch that did not happen).
+  const switchTo = (destination: string) => {
+    if (useOrgStore.getState().currentOrgId === orgId) {
+      void navigateTo(destination);
+      return;
+    }
+    void applyOrgSwitch(orgId, t('orgRecord.actions.workHereToast', { orgName }), destination);
+  };
 
   if (devices === null) {
     return (
@@ -121,6 +209,31 @@ export default function OrgDevicesTab({ orgId, orgFetch }: OrgDevicesTabProps) {
     );
   }
 
+  // Nothing enrolled at all: no filter bar, no table header, and no "try
+  // adjusting your filters" advice for filters nobody set (#9023).
+  if (devices.length === 0) {
+    return (
+      <div data-testid="org-devices-tab" className="space-y-4">
+        <div
+          data-testid="org-devices-empty"
+          className="flex flex-col items-start gap-3 rounded-lg border bg-card p-6 text-sm"
+        >
+          <p className="text-muted-foreground">{t('orgRecord.devices.noneEnrolled', { orgName })}</p>
+          {canAddDevice && (
+            <button
+              type="button"
+              data-testid="org-devices-add"
+              onClick={() => switchTo('/devices#add-device')}
+              className="inline-flex h-9 items-center rounded-md bg-primary px-3 text-sm font-medium text-primary-foreground hover:bg-primary/90"
+            >
+              {t('orgRecord.devices.addDevice')}
+            </button>
+          )}
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div data-testid="org-devices-tab" className="space-y-4">
       <div className="flex flex-wrap items-center gap-3">
@@ -130,10 +243,12 @@ export default function OrgDevicesTab({ orgId, orgFetch }: OrgDevicesTabProps) {
           value={search}
           onChange={(e) => setSearch(e.target.value)}
           placeholder={t('orgRecord.devices.searchPlaceholder')}
+          aria-label={t('orgRecord.devices.searchLabel')}
           className="h-9 w-56 rounded-md border bg-background px-3 text-sm"
         />
         <select
           data-testid="org-devices-status-filter"
+          aria-label={t('orgRecord.devices.statusFilterLabel')}
           value={statusFilter}
           onChange={(e) => setStatusFilter(e.target.value)}
           className="h-9 rounded-md border bg-background px-2 text-sm"
@@ -148,6 +263,7 @@ export default function OrgDevicesTab({ orgId, orgFetch }: OrgDevicesTabProps) {
         {sites.length > 0 && (
           <select
             data-testid="org-devices-site-filter"
+            aria-label={t('orgRecord.devices.siteFilterLabel')}
             value={siteFilter}
             onChange={(e) => setSiteFilter(e.target.value)}
             className="h-9 rounded-md border bg-background px-2 text-sm"
@@ -161,7 +277,45 @@ export default function OrgDevicesTab({ orgId, orgFetch }: OrgDevicesTabProps) {
           </select>
         )}
       </div>
-      <DeviceList devices={filteredDevices} sites={sites} forceSingleOrg />
+      {truncated && (
+        <p data-testid="org-devices-cap-notice" className="text-sm text-muted-foreground">
+          {t('orgRecord.devices.capNotice', { limit: ORG_DEVICES_LIMIT })}
+          {' · '}
+          <button
+            type="button"
+            data-testid="org-devices-open-in-devices"
+            onClick={() => switchTo('/devices')}
+            className="font-medium text-primary hover:underline"
+          >
+            {t('orgRecord.devices.openInDevices')}
+          </button>
+        </p>
+      )}
+      {filtersActive && filteredDevices.length === 0 ? (
+        <div
+          data-testid="org-devices-no-matches"
+          className="flex flex-col items-start gap-3 rounded-lg border bg-card p-6 text-sm"
+        >
+          <p className="text-muted-foreground">{t('orgRecord.devices.noMatches')}</p>
+          <button
+            type="button"
+            data-testid="org-devices-clear-filters"
+            onClick={clearFilters}
+            className="inline-flex h-9 items-center rounded-md border px-3 text-sm font-medium hover:bg-accent"
+          >
+            {t('orgRecord.devices.clearFilters')}
+          </button>
+        </div>
+      ) : (
+        <DeviceList
+          onWarrantyRequiredChange={setWarrantyRequested}
+          devices={filteredDevices}
+          sites={sites}
+          forceSingleOrg
+          columnPreset={ORG_TAB_COLUMN_PRESET}
+          onSelect={(d) => void navigateTo(`/devices/${d.id}`)}
+        />
+      )}
     </div>
   );
 }

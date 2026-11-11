@@ -12,11 +12,13 @@
         "low": "Low",
         "medium": "Medium"
       },
+      "customRangeIncomplete": "Choose a start and end date, start first and at most 366 days apart, to apply a custom range.",
       "dashboardOptions": {
         "capacity": "Capacity Planning",
         "operations": "Operations Overview",
         "sla": "SLA Compliance"
       },
+      "dateRangeSelectLabel": "Date range",
       "dateRanges": {
         "customRange": "Custom range",
         "last24Hours": "Last 24 hours",
@@ -31,7 +33,8 @@
       "subtitle": "Insights across your fleet and services",
       "title": "Analytics",
       "trend": {
-        "operationalHealth": "Operational health"
+        "operationalHealth": "Operational health",
+        "weekOf": "Week of {{date}}"
       },
       "widgets": {
         "alertTable": {
@@ -40,7 +43,7 @@
           "title": "Alert Statistics"
         },
         "capacity": {
-          "title": "Capacity Forecast"
+          "title": "Disk Capacity Forecast"
         },
         "complianceGauge": {
           "policiesEvaluated": "{{count}} policies evaluated",
@@ -61,7 +64,7 @@
           "title": "Remote Sessions"
         },
         "uptime": {
-          "label": "Fleet uptime",
+          "label": "Online now",
           "title": "Uptime"
         }
       }
@@ -103,6 +106,7 @@
     },
     "gaugeWidget": {
       "criticalValue": "Critical {{value}}",
+      "noData": "No compliance checks to evaluate",
       "warnValue": "Warn {{value}}"
     },
     "queryBuilder": {
@@ -113,7 +117,8 @@
         "p95": "P95",
         "sum": "Sum"
       },
-      "description": "Configure metrics and aggregation for your dashboard",
+      "coverageNote": "Queries cover the first {{count}} online devices only. Offline devices and the rest of a larger fleet are not included.",
+      "description": "Choose a metric and aggregation to query across your online devices",
       "errors": {
         "failedToExecuteQuery": "Failed to execute query",
         "noDevicesSelected": "No devices selected for query"
@@ -127,28 +132,13 @@
         "timeRange": "Time range"
       },
       "metricNames": {
-        "activeDevices": "Active Devices",
-        "automationRuns": "Automation Runs",
         "cpuUtilization": "CPU Utilization",
         "diskUsage": "Disk Usage",
-        "incidentCount": "Incident Count",
-        "loginVolume": "Login Volume",
         "memoryUtilization": "Memory Utilization",
-        "mfaAdoption": "MFA Adoption",
-        "networkThroughput": "Network Throughput",
-        "patchCompliance": "Patch Compliance",
-        "remoteSessions": "Remote Sessions",
-        "responseTime": "Response Time",
-        "slaCompliance": "SLA Compliance",
-        "threatAlerts": "Threat Alerts",
-        "uptime": "Uptime",
-        "vulnerabilityScore": "Vulnerability Score"
+        "networkThroughput": "Network Throughput"
       },
       "metricTypes": {
-        "availability": "Availability",
-        "performance": "Performance",
-        "security": "Security",
-        "usage": "Usage"
+        "performance": "Performance"
       },
       "runQuery": "Run Query",
       "running": "Running...",
@@ -164,7 +154,16 @@
     "slaComplianceCard": {
       "defaultPeriodLabel": "Last 30 days",
       "downtime": "Downtime {{value}}",
+      "exclusions": {
+        "maintenanceApplied": "Maintenance windows excluded",
+        "maintenanceSkipped": "Maintenance windows not excluded: too many devices to check",
+        "maintenanceUnavailable": "Maintenance windows not excluded: status unavailable",
+        "none": "No exclusions",
+        "title": "Exclusions",
+        "weekends": "Weekends excluded"
+      },
       "incidents": "{{count}} incidents",
+      "noDevices": "No devices measured yet",
       "status": {
         "atRisk": "At risk",
         "breach": "Breach",
@@ -172,6 +171,34 @@
       },
       "targetUptime": "Target {{target}}% uptime",
       "title": "SLA Compliance"
+    },
+    "slaEmptyState": {
+      "create": "Create SLA definition",
+      "created": "SLA definition created",
+      "description": "An SLA definition sets the uptime target this tab measures your devices against. Create one to start tracking compliance.",
+      "errors": {
+        "create": "Failed to create SLA definition"
+      },
+      "form": {
+        "cancel": "Cancel",
+        "excludeMaintenance": "Exclude devices in a maintenance window",
+        "excludeWeekends": "Exclude weekends",
+        "measurementWindow": "Measurement window",
+        "name": "Name",
+        "organization": "Organization",
+        "scopeNote": "Measures every device in the organization.",
+        "selectOrganization": "Select an organization",
+        "submit": "Create",
+        "uptimeTarget": "Uptime target (%)",
+        "uptimeTargetInvalid": "Enter a value from 0 to 100.",
+        "windows": {
+          "daily": "Daily",
+          "monthly": "Monthly",
+          "weekly": "Weekly"
+        }
+      },
+      "noPermission": "Ask an administrator with organization management access to create an SLA definition.",
+      "title": "No SLA definition yet"
     },
     "tableWidget": {
       "filterPlaceholder": "Filter",
@@ -224,6 +251,16 @@
       "serverReplaceAgeYears": "Plan server replacement after (years)",
       "serverReplaceAgeYearsHelp": "Servers follow their own timeline and are listed in a separate section of the report."
     },
+    "backupStatusOptions": {
+      "cancel": "Cancel",
+      "createReport": "Create report",
+      "includeDevicesWithoutBackup": "Include devices without any backup",
+      "includeDevicesWithoutBackupHelp": "Off, the report only lists devices with some backup evidence, like the provider's own summary email.",
+      "sources": "Backup sources",
+      "sourcesHelp": "Choose which backup sources to include in the report.",
+      "sourceBreeze": "Breeze backup",
+      "sourceProvider": "Connected backup providers"
+    },
     "vulnerabilityManagementOptions": {
       "cancel": "Cancel",
       "createReport": "Create report",
@@ -252,6 +289,12 @@
     },
     "reportEditPage": {
       "backToReports": "Back to Reports",
+      "backupPreview": {
+        "title": "Preview",
+        "description": "Builds the current backup snapshot with the options above. It runs only when you ask.",
+        "run": "Generate preview",
+        "error": "Could not generate the preview."
+      },
       "description": "Update the configuration for \"{{name}}\".",
       "errors": {
         "fetchReport": "Failed to fetch report",
@@ -300,6 +343,13 @@
         "replaceNow": "Replace now",
         "unknownAge": "Purchase date unknown"
       },
+      "backupStatus": {
+        "healthy": "Healthy",
+        "warning": "Warning",
+        "critical": "Critical",
+        "unknown": "Unknown",
+        "truncated": "The device list reached its row limit and is incomplete."
+      },
       "vulnerabilityManagement": {
         "critical": "Open critical",
         "expiringExceptions": "Exceptions expiring next period",
@@ -322,7 +372,16 @@
         "security_compliance_posture": "Security & Compliance Posture",
         "software_inventory": "Software Inventory",
         "threat_detection_review": "Threat Detection Review",
-        "endpoint_management_review": "Endpoint Management Review"
+        "endpoint_management_review": "Endpoint Management Review",
+        "ticket_sla_attainment": "Ticket SLA attainment",
+        "technician_time_billability": "Technician time & billability",
+        "ar_aging": "AR aging",
+        "ai_usage_by_client": "AI usage by client",
+        "mrr_renewals": "MRR & renewals",
+        "quote_win_rate": "Quote win rate",
+        "client_profitability": "Client profitability",
+        "ticket_sla_performance": "SLA performance",
+        "backup_status": "Backup Status"
       },
       "threatDetection": {
         "agents": "Endpoints with a detection agent",
@@ -351,6 +410,29 @@
         "noncompliant": "Not compliant",
         "notMeasured": "N/A",
         "staleEnrolments": "Stale enrolments"
+      },
+      "slaPerformance": {
+        "priority": "Priority",
+        "ticketsOpened": "Tickets opened",
+        "firstResponse": "First response",
+        "resolution": "Resolution",
+        "target": "Target",
+        "measured": "Measured",
+        "withinSla": "% within SLA",
+        "median": "Median",
+        "mean": "Mean",
+        "varies": "varies",
+        "breaches": "Breaches",
+        "breachCount_one": "{{count}} breach",
+        "breachCount_other": "{{count}} breaches",
+        "unavailable": "This run’s SLA summary could not be read, so it cannot be shown here. Generate the report again.",
+        "notes": "What this measures",
+        "priorities": {
+          "urgent": "Urgent",
+          "high": "High",
+          "normal": "Normal",
+          "low": "Low"
+        }
       },
       "identityAccess": {
         "notMeasured": "N/A",
@@ -390,7 +472,7 @@
         "fetchReports": "Failed to fetch reports",
         "generateReport": "Failed to generate report",
         "generic": "An error occurred",
-        "noCompletedRun": "No completed narrative to open yet"
+        "noCompletedRun": "No completed run to open yet"
       },
       "formats": {
         "csv": "CSV",
@@ -399,6 +481,7 @@
       },
       "loading": "Loading reports...",
       "never": "Never",
+      "notGeneratedYet": "Not generated yet",
       "success": {
         "generated": "Report \"{{name}}\" generated."
       },
@@ -419,14 +502,24 @@
         "security_compliance_posture": "Security & Compliance Posture",
         "software_inventory": "Software Inventory",
         "threat_detection_review": "Threat Detection Review",
-        "endpoint_management_review": "Endpoint Management Review"
+        "endpoint_management_review": "Endpoint Management Review",
+        "ticket_sla_attainment": "Ticket SLA attainment",
+        "technician_time_billability": "Technician time & billability",
+        "ar_aging": "AR aging",
+        "ai_usage_by_client": "AI usage by client",
+        "mrr_renewals": "MRR & renewals",
+        "quote_win_rate": "Quote win rate",
+        "client_profitability": "Client profitability",
+        "ticket_sla_performance": "SLA performance",
+        "backup_status": "Backup Status"
       },
       "runsTable": {
         "actions": "Actions",
         "completed": "Completed",
         "report": "Report",
         "started": "Started",
-        "status": "Status"
+        "status": "Status",
+        "organization": "Organization"
       },
       "schedules": {
         "daily": "Daily",
@@ -446,7 +539,8 @@
         "lastGenerated": "Last Generated",
         "name": "Name",
         "schedule": "Schedule",
-        "type": "Type"
+        "type": "Type",
+        "covers": "Covers"
       },
       "tabs": {
         "recentRuns": "Recent Runs",
@@ -455,7 +549,21 @@
       "templates": "Templates",
       "title": "Reports",
       "tryAgain": "Try again",
-      "unknownReport": "Unknown Report"
+      "unknownReport": "Unknown Report",
+      "partnerWideIncomplete": "Some reports that cover all organizations could not be loaded, so this list may be incomplete. Switch to All organizations to see every report.",
+      "covers": {
+        "combined": "All organizations · Combined",
+        "unknownOrg": "Unknown organization",
+        "seriesAll": "All orgs · {{count}} · One per organization",
+        "seriesSelected_one": "{{count}} org · One per organization",
+        "seriesSelected_other": "{{count}} orgs · One per organization"
+      },
+      "delivery": {
+        "noRecipients": "No recipients",
+        "noRecipientsHint": "The last scheduled run had nobody to email. Add recipients to deliver this report.",
+        "partial": "Partly delivered",
+        "failed": "Email not sent"
+      }
     },
     "reportBuilder": {
       "actions": {
@@ -729,6 +837,7 @@
           "os": "OS",
           "owner": "Owner",
           "patch_level": "Patch level",
+          "product_number": "Product Number",
           "serial": "Serial",
           "site": "Site",
           "status": "Status"
@@ -780,6 +889,11 @@
         "and": "AND",
         "or": "OR"
       },
+      "filterLabels": {
+        "logic": "Filter logic",
+        "field": "Filter field",
+        "operator": "Filter operator"
+      },
       "noFieldsSelected": "No fields selected yet.",
       "noFilters": "No filters yet. Add your first condition.",
       "noGrouping": "No grouping",
@@ -800,7 +914,11 @@
         "updateFailed": "Could not update the report recipients",
         "convertFailed": "Could not convert this email address",
         "mfaRequired": "Converting a recipient requires multi-factor authentication. Enable MFA in your profile and try again.",
-        "loadFailed": "Could not load the report recipients"
+        "loadFailed": "Could not load the report recipients",
+        "businessEmailOnly": "Business reports are delivered only to the email addresses below. Organization contacts can't be added.",
+        "partnerOwnedEmailOnly": "This report covers all organizations, so it is delivered only to the email addresses below. Organization contacts can't be added.",
+        "oneTimeNotEmailed": "One-time reports aren't emailed. Choose a recurring schedule to send this report to contacts.",
+        "emailAddresses": "Email addresses"
       },
       "previewTable": {
         "selectFields": "Select fields to populate the preview table."
@@ -834,6 +952,9 @@
         "everyDay": "Every day"
       },
       "scheduleOptions": {
+        "one_time": {
+          "label": "One-time"
+        },
         "daily": {
           "label": "Daily"
         },
@@ -878,6 +999,7 @@
           "title": "Report type"
         }
       },
+      "removeField": "Remove {{field}}",
       "selectedFields": "Selected fields",
       "success": {
         "created": "Report \"{{name}}\" saved.",
@@ -934,7 +1056,16 @@
         "security_compliance_posture": "Security & Compliance Posture",
         "software_inventory": "Software Inventory",
         "threat_detection_review": "Threat Detection Review",
-        "endpoint_management_review": "Endpoint Management Review"
+        "endpoint_management_review": "Endpoint Management Review",
+        "ticket_sla_attainment": "Ticket SLA attainment",
+        "technician_time_billability": "Technician time & billability",
+        "ar_aging": "AR aging",
+        "ai_usage_by_client": "AI usage by client",
+        "mrr_renewals": "MRR & renewals",
+        "quote_win_rate": "Quote win rate",
+        "client_profitability": "Client profitability",
+        "ticket_sla_performance": "SLA performance",
+        "backup_status": "Backup Status"
       },
       "schedules": {
         "daily": "Daily",
@@ -945,6 +1076,8 @@
       "spec": {
         "cadence": "Cadence",
         "defaultRange": "Default range",
+        "lastFullMonth": "Last full month",
+        "asOfRunDate": "As of run date",
         "format": "Format"
       },
       "success": {
@@ -988,11 +1121,59 @@
         "endpoint_management_review": {
           "description": "Microsoft Intune evidence: enrolment coverage, compliance breakdown with a 30-day trend, stale enrolments and licence seats, with the freshness of each sync stated.",
           "name": "Intune Endpoint Management Review"
+        },
+        "ticket_sla_attainment": {
+          "name": "Ticket SLA attainment",
+          "description": "Response and resolution attainment for the period, recomputed from the ticket timestamps rather than read off the breach stamps — so a ticket answered late but eventually answered still counts as a miss. Grouped by organization, priority, technician or category."
+        },
+        "technician_time_billability": {
+          "name": "Technician time & billability",
+          "description": "Logged time against an assumed weekly capacity, the billable / included / non-billable split, and how much of the billable time has actually been approved and billed. Technicians with no time in the period are listed at zero rather than dropped."
+        },
+        "ar_aging": {
+          "name": "AR aging",
+          "description": "Unpaid invoice balances bucketed current / 1–30 / 31–60 / 61–90 / 90+ days past due, one set of totals per currency with no conversion. Invoices with no due date get their own bucket, never \"current\"."
+        },
+        "ai_usage_by_client": {
+          "name": "AI usage by client",
+          "description": "Platform AI usage per client for the period: requests, tokens, Breeze cost, the amount to charge from the client's billing profile, and what has already been invoiced. Included usage and unpriced models are shown separately, never blended in."
+        },
+        "mrr_renewals": {
+          "name": "MRR & renewals",
+          "description": "Monthly and annual recurring revenue from active contracts, measured on the day the report runs, with the contracts renewing inside the chosen horizon and what has actually been billed as recurring. One set of totals per currency, never converted."
+        },
+        "quote_win_rate": {
+          "name": "Quote win rate",
+          "description": "The share of sent quotes that were won, counted per opportunity so a revised and re-sent quote counts once. The headline rate covers decided opportunities only, with the still-open count beside it. Values are pre-tax, one set per currency, never converted."
+        },
+        "ticket_sla_performance": {
+          "name": "SLA performance",
+          "description": "Customer-ready response and resolution times against SLA, by priority, with breaches."
+        },
+        "client_profitability": {
+          "name": "Client profitability",
+          "description": "Billed revenue per client for the period by source (recurring, labor, product, AI, other), with the hours logged against it and an optional labor-cost estimate from one blended hourly rate. Figures using that rate are labelled as estimates. One set of totals per currency, never converted."
+        },
+        "backup_status": {
+          "name": "Backup Status Report",
+          "description": "Every device's backup status across Breeze and connected backup providers, in one snapshot: coverage buckets, last successful backup, and a 28-day history per device."
         }
       },
       "title": "Report Templates",
       "useTemplate": "Use template",
-      "useTemplateTitle": "Use {{name}}"
+      "useTemplateTitle": "Use {{name}}",
+      "groups": {
+        "business": "Business",
+        "general": "General",
+        "businessDescription": "Numbers about your own MSP business rather than your clients’ devices — for staff only."
+      },
+      "delivery": {
+        "contactsLoading": "Loading organization contacts…",
+        "contactsFailed": "Could not load this organization's contacts. You can still add email addresses.",
+        "noContacts": "This organization has no contacts with an email address.",
+        "removeEmail": "Remove {{email}}",
+        "recipientsFailed": "The report \"{{name}}\" was created, but its recipients could not all be added. Add them from the report."
+      }
     },
     "threatDetectionOptions": {
       "cancel": "Cancel",
@@ -1024,6 +1205,388 @@
       "adminDetail": "Include administrator sign-in detail",
       "adminDetailHelp": "Lists each interactive sign-in by an account holding an admin role, including the address it came from. This is the section an auditor reads first.",
       "coverageNote": "The report covers interactive sign-ins only and prints the window it actually covers. Microsoft keeps sign-in logs for about 30 days and requires an Entra ID P1 or P2 licence to release them, so the first report after enabling collection is partial and says so."
+    },
+    "reportPeriod": {
+      "label": "Reporting period",
+      "kinds": {
+        "last_full_month": "Last full month",
+        "last_30_days": "Last 30 days",
+        "last_quarter": "Last full quarter",
+        "custom": "Custom dates"
+      },
+      "start": "Start date",
+      "end": "End date (inclusive)",
+      "help": "Preset periods are worked out each time the report runs, so a monthly schedule always covers the month that just ended.",
+      "errors": {
+        "missing": "Choose both a start date and an end date.",
+        "invalid": "Both dates must be real calendar dates.",
+        "order": "The start date must not be after the end date."
+      }
+    },
+    "ticketSlaOptions": {
+      "approximationNote": "Attainment is recomputed from ticket timestamps rather than read from breach flags, so a ticket answered late still counts as a miss. Paused time is stored as a lifetime total, so pauses after the first response slightly flatter response attainment.",
+      "groupBy": "Group by",
+      "groupByAutomatic": "Automatic: by organization for all organizations, by priority for one organization",
+      "groupByValues": {
+        "organization": "Organization",
+        "priority": "Priority",
+        "technician": "Technician (current assignee)",
+        "category": "Category"
+      },
+      "technicianNote": "Tickets are grouped by their current assignee. Reassignment history is not tracked, so this is not necessarily the technician who responded.",
+      "includeNoSla": "List tickets without an SLA target",
+      "includeNoSlaHelp": "Tickets with no SLA target are always counted separately and never affect attainment. This only controls whether they appear in the detail rows.",
+      "cancel": "Cancel",
+      "createReport": "Create report"
+    },
+    "technicianTimeOptions": {
+      "groupBy": "Group by",
+      "groupByValues": {
+        "technician": "Technician",
+        "organization": "Organization",
+        "work_type": "Work type"
+      },
+      "orgAxisNote": "Time entries not linked to an organization appear in their own \"No organization\" row. A report owned by a single organization only sees time logged against its tickets.",
+      "capacityHours": "Weekly capacity per technician (hours)",
+      "capacityHoursHelp": "Utilization assumes uniform capacity for every technician, prorated over working days. PTO and part-time schedules are not modelled.",
+      "cancel": "Cancel",
+      "createReport": "Create report"
+    },
+    "arAgingOptions": {
+      "asOf": "Age balances as of",
+      "asOfHelp": "Leave empty to age against the day the report runs. A date moves only the aging reference date: balances are current, so it does not reconstruct past balances or undo payments recorded after that date.",
+      "asOfInvalid": "Enter a real calendar date, or leave the field empty.",
+      "groupBy": "Group by",
+      "groupByValues": {
+        "organization": "Organization",
+        "currency": "Currency"
+      },
+      "currencyNote": "Each currency gets its own totals. Amounts are not converted between currencies.",
+      "includePaidInPeriod": "List invoices paid month to date",
+      "includePaidInPeriodHelp": "Adds a note listing invoices fully paid from the first of the as-of month through the as-of date. It never changes the aging buckets.",
+      "cancel": "Cancel",
+      "createReport": "Create report"
+    },
+    "aiUsageByClientOptions": {
+      "groupBy": "Group by",
+      "groupByAutomatic": "Automatic: by organization for all organizations, by model for one organization",
+      "groupByValues": {
+        "organization": "Organization",
+        "model": "Model"
+      },
+      "periodNote": "Charges bill by UTC calendar month. A period set in another timezone can differ from the invoice for usage near month boundaries.",
+      "unpricedNote": "Usage on a model with no rate on the client's billing profile is counted as unpriced. It is never treated as free.",
+      "cancel": "Cancel",
+      "createReport": "Create report"
+    },
+    "mrrRenewalsOptions": {
+      "runTimeNote": "This report is always measured on the day the report runs. It has no period or as-of date to set.",
+      "groupBy": "Group by",
+      "groupByValues": {
+        "organization": "Organization",
+        "contract": "Contract"
+      },
+      "renewalHorizon": "Renewal horizon",
+      "renewalHorizonOption": "Next {{days}} days",
+      "renewalHorizonHelp": "Contracts whose term ends within this window are listed as renewals.",
+      "cancel": "Cancel",
+      "createReport": "Create report"
+    },
+    "quoteWinRateOptions": {
+      "groupBy": "Group by",
+      "groupByAutomatic": "Automatic: by organization for all organizations, by author for one organization",
+      "groupByValues": {
+        "organization": "Organization",
+        "author": "Author",
+        "currency": "Currency"
+      },
+      "periodNote": "The period applies to the date each quote was first sent. A quote that is revised and re-sent counts once, as one opportunity.",
+      "cancel": "Cancel",
+      "createReport": "Create report"
+    },
+    "ticketSlaPerformanceOptions": {
+      "includeSubjects": "Include ticket subjects",
+      "includeSubjectsHelp": "Delivered reports are visible to every portal user of this organization. Leave off unless every user may see every ticket subject.",
+      "cancel": "Cancel",
+      "createReport": "Create report"
+    },
+    "clientProfitabilityOptions": {
+      "groupBy": "Group by",
+      "groupByDefault": "Default for the report's scope",
+      "groupByValues": {
+        "organization": "Organization",
+        "source": "Source"
+      },
+      "groupByHelp": "The default groups by organization for an all-organizations report and by source for a single organization.",
+      "laborEnabled": "Estimate labor cost",
+      "laborAmount": "Labor cost per hour",
+      "laborCurrency": "Currency",
+      "laborHelp": "One blended rate for every technician. Figures using it are labelled as estimates.",
+      "cancel": "Cancel",
+      "createReport": "Create report"
+    },
+    "ownerScope": {
+      "legend": "Report covers",
+      "allOrganizations": "All organizations",
+      "allOrganizationsHint": "Covers every active and trial organization, resolved at each run. Excluded organizations are listed in the report's notes. Requires access to all organizations.",
+      "singleOrganization": "One organization",
+      "singleOrganizationHint": "The organization selected in the organization switcher.",
+      "singleOrganizationDisabledHint": "Pick an organization in the organization switcher to create an organization-scoped report.",
+      "needsOrganizationHint": "Pick an organization in the organization switcher to create this report. Reports for all organizations require access to all organizations."
+    },
+    "orgPicker": {
+      "label": "Organization",
+      "placeholder": "Choose an organization",
+      "hint": "You are viewing all organizations. Choose the organization this report is for.",
+      "required": "Choose an organization before saving this report.",
+      "chooseFirst": "Choose an organization above before using a template.",
+      "previewNeedsOrg": "Choose an organization to see a live preview."
+    },
+    "series": {
+      "covers": {
+        "legend": "Covers",
+        "org": "One organization",
+        "orgHint": "A report for one customer, sent to that organization's contacts.",
+        "series": "One report per organization",
+        "seriesHint": "One definition, with a separate copy for every organization it covers, each sent to that organization's contacts.",
+        "combined": "All organizations combined",
+        "combinedHint": "One combined report across all your organizations, for your own team."
+      },
+      "schedule": {
+        "label": "How often each organization's copy is sent",
+        "placeholder": "Choose a schedule",
+        "hint": "A report sent to many organizations runs on a schedule, so it can't be one-time. Choose how often each organization's copy is sent.",
+        "required": "Choose how often the report is sent."
+      },
+      "targeting": {
+        "legend": "Which organizations",
+        "all": "All organizations",
+        "allHint": "Includes every current and future organization. Untick any you want to skip.",
+        "selected": "Chosen organizations",
+        "selectedHint": "Includes exactly the organizations you tick.",
+        "search": "Search organizations",
+        "summary": "Covers {{covered}} of {{total}} organizations",
+        "noneSelected": "Choose at least one organization.",
+        "empty": "No organizations match."
+      },
+      "recipients": {
+        "legend": "Who receives each organization's copy",
+        "primaryContact": "The organization's primary contact",
+        "roles": "Contacts with these roles",
+        "noRuleWarning": "No rule is selected, so an organization receives its copy only when you add contacts on that organization's copy.",
+        "internalCc": "Internal copies",
+        "internalCcHint": "Every organization's copy is also sent to these addresses on your team.",
+        "ccPlaceholder": "name@example.com",
+        "ccAdd": "Add",
+        "ccInvalid": "Enter a valid email address.",
+        "ccRemove": "Remove {{email}}",
+        "previewLoading": "Checking recipients…",
+        "previewContacts_one": "Resolves to {{count}} contact",
+        "previewContacts_other": "Resolves to {{count}} contacts",
+        "previewOrgs_one": "across {{count}} organization",
+        "previewOrgs_other": "across {{count}} organizations",
+        "previewMissing_one": "{{count}} organization has no customer recipient: {{names}}",
+        "previewMissing_other": "{{count}} organizations have no customer recipient: {{names}}",
+        "previewMore": "and {{count}} more",
+        "previewFailed": "Couldn't check recipients. They are still worked out for each organization when its report runs.",
+        "previewNoTargets": "Choose organizations to see who receives the report."
+      },
+      "builder": {
+        "filtersDisabled": "Site, device and group filters aren't available here: each organization's copy covers the whole organization.",
+        "created": "Created multi-org report “{{name}}”",
+        "saved": "Saved multi-org report “{{name}}”",
+        "saveFailed": "Couldn't save the multi-org report.",
+        "targetsFailed": "The settings were saved, but the organizations covered were not updated. Try saving again."
+      },
+      "list": {
+        "filtersLabel": "Show",
+        "filters": {
+          "all": "All",
+          "multi": "Multi-org",
+          "single": "Single-org",
+          "combined": "Combined"
+        },
+        "noMatches": "No reports match this filter.",
+        "loadFailed": "Couldn't load multi-org reports. Other reports are shown.",
+        "multiOrgBadge": "Multi-org",
+        "multiOrgBadgeTitle": "Part of the multi-org report “{{name}}”",
+        "expand": "Show organizations",
+        "collapse": "Hide organizations",
+        "summary": "{{date}} · {{delivered}}/{{total}} delivered",
+        "summaryNoRecipient_one": "{{count}} no recipient",
+        "summaryNoRecipient_other": "{{count}} no recipients",
+        "summaryBlocked_one": "{{count}} blocked",
+        "summaryBlocked_other": "{{count}} blocked",
+        "summaryNever": "Not run yet",
+        "runsSeriesColumn": "Multi-org report",
+        "actions": {
+          "edit": "Edit multi-org report",
+          "transferOwner": "Transfer owner",
+          "delete": "Delete multi-org report",
+          "pause": "Pause",
+          "resume": "Resume"
+        },
+        "pausedBadge": "Paused",
+        "pausedTitle": "Paused: no organization's copy runs until you resume it.",
+        "paused": "Paused “{{name}}”",
+        "resumed": "Resumed “{{name}}”",
+        "pauseFailed": "Couldn't pause or resume the multi-org report.",
+        "deleteTitle": "Delete multi-org report?",
+        "deleteMessage": "“{{name}}” stops running. Each organization's copy is archived with its run history.",
+        "deleteConfirm": "Delete",
+        "deleted": "Deleted multi-org report “{{name}}”",
+        "deleteFailed": "Couldn't delete the multi-org report."
+      },
+      "drilldown": {
+        "columns": {
+          "org": "Organization",
+          "state": "State",
+          "lastRun": "Last run",
+          "delivery": "Delivery",
+          "recipients": "Recipients",
+          "actions": "Actions"
+        },
+        "states": {
+          "active": "Active",
+          "excluded": "Excluded",
+          "ineligible": "Not eligible",
+          "blocked_no_authority": "Blocked: owner has no access",
+          "blocked_no_recipients": "No customer recipient",
+          "detached": "Detached"
+        },
+        "delivery": {
+          "sent": "Sent",
+          "not_scheduled": "Not emailed"
+        },
+        "neverRun": "Not run yet",
+        "actions": {
+          "runNow": "Run now",
+          "editRecipients": "Edit recipients",
+          "exclude": "Exclude",
+          "include": "Include",
+          "detach": "Detach"
+        },
+        "lastOrgHint": "A multi-org report with chosen organizations needs at least one. Delete it instead.",
+        "noAuthorityHint": "The owner can't reach this organization, so its copy doesn't run. Transfer the owner to fix it.",
+        "excludeTitle": "Exclude {{org}}?",
+        "excludeMessage": "{{org}} stops receiving this report. Its copy is archived with its run history, and including it again restores the same copy.",
+        "excludeConfirm": "Exclude",
+        "detachTitle": "Detach {{org}}?",
+        "detachMessage": "{{org}}'s copy becomes a standalone report you can edit freely. It keeps its run history and stops following this multi-org report. While that standalone copy exists, {{org}} stays out of the multi-org report even if you include it again.",
+        "detachConfirm": "Detach",
+        "excluded": "Excluded {{org}}",
+        "included": "Included {{org}}",
+        "detached": "Detached {{org}}",
+        "generated": "Report generated for {{org}}",
+        "updateFailed": "Couldn't update the multi-org report.",
+        "detachFailed": "Couldn't detach the report.",
+        "generateFailed": "Couldn't generate the report.",
+        "detachedHint": "Its standalone copy is managed separately. Delete that report to bring this organization back into the multi-org report."
+      },
+      "transferOwner": {
+        "title": "Transfer owner",
+        "description": "Each organization's copy runs with the owner's access. Choose a partner user with access to every organization.",
+        "label": "New owner",
+        "placeholder": "Choose a user",
+        "current": "{{name}} (current owner)",
+        "confirm": "Transfer",
+        "loadFailed": "Couldn't load users.",
+        "forbidden": "You need permission to view users to transfer the owner.",
+        "noCandidates": "No other user has access to every organization.",
+        "transferred": "Owner transferred to {{name}}",
+        "failed": "Couldn't transfer the owner."
+      },
+      "child": {
+        "partOf": "Part of the multi-org report “{{name}}”",
+        "partOfUnnamed": "Part of a multi-org report",
+        "lockedExplanation": "Shared settings are edited on the multi-org report. Only this organization's recipients can be changed here.",
+        "managedByMsp": "Managed by your MSP",
+        "managedExplanation": "Your MSP manages this report. You can change who in your organization receives it.",
+        "editSeries": "Edit multi-org report",
+        "detach": "Detach",
+        "archived": "This copy is archived: the organization is no longer covered by the multi-org report.",
+        "summary": {
+          "type": "Type",
+          "schedule": "Schedule",
+          "format": "Format"
+        },
+        "recipients": {
+          "title": "Recipients for this organization",
+          "description": "Choose who receives this organization's copy, on top of the multi-org report's rule.",
+          "default": "Follow rule",
+          "add": "Always send",
+          "remove": "Never send",
+          "byRule": "Included by rule",
+          "loadFailed": "Couldn't load recipients.",
+          "updated": "Recipients updated",
+          "updateFailed": "Couldn't update recipients.",
+          "empty": "This organization has no contacts with an email address."
+        }
+      },
+      "editPage": {
+        "title": "Edit multi-org report",
+        "description": "Changes apply to every organization's copy of “{{name}}”.",
+        "breadcrumb": "Reports",
+        "back": "Back to Reports",
+        "loading": "Loading multi-org report…",
+        "notFound": "This multi-org report no longer exists.",
+        "loadFailed": "Couldn't load the multi-org report."
+      },
+      "errors": {
+        "seriesTypeUnsupported": "This report type can't be sent as one report per organization.",
+        "seriesConfigOrgSpecific": "Remove the site, device and group filters: a multi-org report covers whole organizations.",
+        "seriesManaged": "This report belongs to a multi-org report. Edit the multi-org report, or detach this copy first.",
+        "seriesOwnerIneligible": "That user can't own a multi-org report.",
+        "seriesOwnerIneligiblePermission": "That user can't own a multi-org report: their role doesn't grant the Reports export permission (reports:export).",
+        "seriesOwnerIneligibleOrgAccess": "That user can't own a multi-org report: they need access to every organization.",
+        "seriesOwnerIneligibleInactive": "That user's account isn't active, so they can't own a multi-org report.",
+        "seriesOwnerIneligibleMembership": "That user is no longer a member of your partner, so they can't own a multi-org report.",
+        "seriesOwnerIneligibleNotPartner": "That user doesn't belong to your partner, so they can't own a multi-org report.",
+        "seriesOwnerIneligibleTenantInactive": "Your partner account isn't active, so a multi-org report can't get a new owner.",
+        "seriesNotFound": "This multi-org report no longer exists.",
+        "seriesWriteDenied": "Only partner users with access to every organization can change multi-org reports.",
+        "seriesTargetOrgInaccessible": "One of the chosen organizations isn't available to you.",
+        "seriesTargetOrgHidden": "Quick Support and the unassigned-devices holding organization can't be covered by a multi-org report.",
+        "reportNotSeriesChild": "This report is no longer part of a multi-org report.",
+        "recipientModeRequiresSeries": "\"Never send\" only applies to a copy of a multi-org report.",
+        "recipientsNeedExportAndMfa": "Sending reports to recipients needs the export permission and multi-factor sign-in.",
+        "seriesAuthorityUnverifiable": "Couldn't confirm the owner's access right now. Try again in a moment."
+      }
+    },
+    "seriesCombine": {
+      "banner": "Some organizations have near-identical reports that could be combined into one multi-org report. Groups found: {{groups}}",
+      "review": "Review",
+      "title": "Combine into one multi-org report",
+      "groupLabel": "Group",
+      "groupSummary": "{{type}} · {{schedule}} · organizations: {{orgs}}",
+      "nameLabel": "Multi-org report name",
+      "targetLegend": "Organizations covered",
+      "targetSelected": "Only these organizations (nothing new is sent)",
+      "targetAll": "All organizations, including ones added later",
+      "targetAllWarning": "Organizations without a copy today start receiving this report, with only the internal CC until you add customer recipients.",
+      "adopt": "Kept and converted",
+      "archive": "Duplicate, will be archived",
+      "deliverableLinked": "Used as service deliverable evidence",
+      "lastRun": "Last run {{date}}",
+      "neverRun": "Never run",
+      "contacts": "Customer recipients: {{list}}",
+      "noContacts": "No customer recipients",
+      "ccShared": "Internal CC on every copy: {{list}}",
+      "ccNone": "No internal CC",
+      "ccConflictHeading": "These CC addresses are only on some of these reports. Choose what happens to each:",
+      "ccInclude": "CC every copy",
+      "ccDrop": "Stop CC-ing",
+      "ccUnresolved": "Choose what happens to every CC address before combining.",
+      "ruleNote": "Every customer keeps exactly the recipients they have today. You can add a recipient rule later on the multi-org report.",
+      "confirm": "Combine",
+      "success": "Combined into “{{name}}”",
+      "failed": "Could not combine these reports.",
+      "groupChanged": "These reports changed since you opened this dialog. The list has been refreshed.",
+      "stalled": "Not sending today (its owner lost access). Combining resumes it.",
+      "ccHeldBy": "Currently CC'd on: {{list}}",
+      "ownerIneligible": "You can't own a report for these organizations: {{list}}",
+      "ccTooMany": "Too many internal CC addresses (max {{max}}).",
+      "otherOrgs": "other organizations"
     }
   }
 }

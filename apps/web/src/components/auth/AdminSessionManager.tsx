@@ -6,7 +6,10 @@ import {
   restoreAccessTokenFromCookieDetailed,
   useAuthStore
 } from '../../stores/auth';
+import { getPartnersMe } from '../../lib/api/partnersMe';
 import { useOrgStore } from '../../stores/orgStore';
+import { getJwtClaims } from '../../lib/authScope';
+import { SESSION_TIMEOUT_MAX_MINUTES } from '../../lib/sessionTimeout';
 import IdleWarningDialog from './IdleWarningDialog';
 
 const DEFAULT_IDLE_TIMEOUT_MINUTES = 60;
@@ -48,6 +51,9 @@ const DELIBERATE_ACTIVITY_EVENTS: ReadonlyArray<keyof WindowEventMap> = [
 
 export default function AdminSessionManager() {
   const isAuthenticated = useAuthStore((state) => state.isAuthenticated);
+  // Boolean, not the token: refreshes rotate the token and must not re-run the
+  // session-timeout effect (it resets the budget to the default).
+  const hasAccessToken = useAuthStore((state) => Boolean(state.tokens?.accessToken));
   const currentOrgId = useOrgStore((state) => state.currentOrgId);
   const [idleTimeoutMs, setIdleTimeoutMs] = useState(DEFAULT_IDLE_TIMEOUT_MS);
   // Last budget we actually READ from the server, for any scope. Used only as a
@@ -205,7 +211,7 @@ export default function AdminSessionManager() {
     const settleTimeout = (configuredMinutes: number | null) => {
       if (cancelled) return;
       if (configuredMinutes !== null && Number.isFinite(configuredMinutes) && configuredMinutes > 0) {
-        const ms = Math.max(1, configuredMinutes) * 60 * 1000;
+        const ms = Math.min(SESSION_TIMEOUT_MAX_MINUTES, Math.max(1, configuredMinutes)) * 60 * 1000;
         lastKnownBudgetMsRef.current = ms;
         setIdleTimeoutMs(ms);
         return;
@@ -220,14 +226,24 @@ export default function AdminSessionManager() {
 
     const loadSessionTimeout = async () => {
       try {
-        if (currentOrgId) {
+        // #7498: /orgs/partners/me is partner-only. An org-scoped user with no
+        // org selected yet (orgs still loading) must use its own org's effective
+        // settings rather than take a 403 on every page.
+        const claims = getJwtClaims();
+        const settingsOrgId =
+          currentOrgId ?? (claims.scope === 'organization' ? claims.orgId : null);
+        // Cold load: no token yet, so the scope is unknown. Don't guess partner
+        // (that 403s for org users); keep the default budget armed and let the
+        // effect re-run when the token lands (accessToken is a dep).
+        if (!settingsOrgId && claims.scope === null && !hasAccessToken) return;
+        if (settingsOrgId) {
           // Org selected: use that org's effective settings so a partner-level
           // `security.sessionTimeout` default is honored by the idle-logout
           // runtime, matching what the settings UI shows as effective/locked.
           // Reading the raw org record missed partner defaults the org hadn't
           // overridden locally (#2147).
           const response = await fetchWithAuth(
-            `/orgs/organizations/${currentOrgId}/effective-settings`
+            `/orgs/organizations/${settingsOrgId}/effective-settings`
           );
           if (!response.ok) {
             // Surface the failure: this is the path that enforces a possibly
@@ -251,16 +267,17 @@ export default function AdminSessionManager() {
         // partner-level security policy. Without this the timer silently reset to
         // the 60-minute frontend default whenever no org was selected, logging a
         // partner admin out early despite a longer configured timeout (#2347).
-        const response = await fetchWithAuth('/orgs/partners/me');
-        if (!response.ok) {
+        // Shared with the other islands reading partners/me at load (#9172).
+        const read = await getPartnersMe();
+        if (!read.ok) {
           console.warn(
             '[AdminSessionManager] Failed to load partner session timeout:',
-            response.status
+            read.status
           );
           settleTimeout(null);
           return;
         }
-        const data = await response.json();
+        const data = read.data as { settings?: { security?: { sessionTimeout?: unknown } } } | null;
         settleTimeout(Number(data?.settings?.security?.sessionTimeout));
       } catch (err) {
         // Fall back to the frontend default — NOT to the previous scope's
@@ -275,7 +292,7 @@ export default function AdminSessionManager() {
     return () => {
       cancelled = true;
     };
-  }, [isAuthenticated, currentOrgId]);
+  }, [isAuthenticated, currentOrgId, hasAccessToken]);
 
   useEffect(() => {
     if (!isAuthenticated) return;

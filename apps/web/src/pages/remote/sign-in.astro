@@ -1,0 +1,9 @@
+---
+import AuthShellBranded from '../../layouts/AuthShellBranded.astro';
+import UnifiedNativeSignInPage from '../../components/remote/UnifiedNativeSignInPage';
+Astro.response.headers.set('Cache-Control', 'no-store');
+Astro.response.headers.set('Referrer-Policy', 'no-referrer');
+---
+<AuthShellBranded title="Sign in to Remote Access">
+  <UnifiedNativeSignInPage client:only="react" />
+</AuthShellBranded>

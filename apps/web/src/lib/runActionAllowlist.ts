@@ -12,21 +12,20 @@ export const RUN_ACTION_ALLOWLIST: ReadonlyArray<{ file: string; reason: string 
 export const RUN_ACTION_MIGRATION_BACKLOG: ReadonlyArray<string> = [
   'apps/web/src/components/devices/AddDeviceModal.tsx',
   'apps/web/src/components/devices/ChangeSiteModal.tsx',
-  'apps/web/src/components/devices/CreateGroupModal.tsx',
   'apps/web/src/components/devices/DeviceBootPerformanceTab.tsx',
   'apps/web/src/components/devices/DeviceGroupsPage.tsx',
   // DeviceList.tsx removed: its only fetchWithAuth call (POST /filters/preview,
   // a read) moved to hooks/useAdvancedFilterIds.ts — no mutating calls remain.
   // DevicePatchStatusTab.tsx migrated to runAction (patch scan/install) — now in TARGET_GLOBS.
   'apps/web/src/components/devices/DeviceSecurityTab.tsx',
-  'apps/web/src/components/devices/DeviceSettingsModal.tsx',
   // DeviceWarrantyCard.tsx migrated to runAction (#1723) — now in TARGET_GLOBS.
   'apps/web/src/components/alerts/AlertCorrelationView.tsx',
   // AlertRulesPage.tsx removed (#3988): the page it backed has been a 301 to
   // /configuration-policies since d8a6bc833 (2026-02-22), so the component was
   // unreachable from any route.
-  'apps/web/src/components/alerts/AlertTemplateEditor.tsx',
-  'apps/web/src/components/alerts/AlertTemplateList.tsx',
+  // AlertTemplateEditor.tsx / AlertTemplateList.tsx removed (alerting
+  // consolidation W05c2, #6367): /settings/alert-templates* now 301s to
+  // /alerts/monitors.
   // AlertsPage.tsx migrated to runAction (#1300) — now in TARGET_GLOBS.
   // CorrelatedAlertGroups.tsx migrated to runAction — now in TARGET_GLOBS.
   // Backup feature tab: config create/update/test surface outcomes via the

@@ -5,6 +5,17 @@ vi.mock('./customFields/scriptWriteBack', () => ({
   applyScriptCustomFieldWrites: (...args: unknown[]) => applyMock(...args),
 }));
 
+// This suite only exercises the custom-field write-back step; the terminal
+// automation-action reconciliation it now falls through into (#3530: no
+// longer swallowed) is covered by commandResultHandlers.automation.test.ts.
+// Mocked here the same way those sibling suites mock it, so a real call
+// doesn't reach into automationActionResults.ts and its own `../db` needs
+// (getCurrentDbAccessContext, withSystemDbAccessContext) that this file's
+// minimal db mock doesn't provide.
+vi.mock('./automationActionResults', () => ({
+  applyAutomationActionTerminal: vi.fn().mockResolvedValue(true),
+}));
+
 // Minimal Drizzle capture: we only assert what reaches scriptExecutions.set().
 const setCalls: Array<Record<string, unknown>> = [];
 vi.mock('../db', () => ({
@@ -19,7 +30,16 @@ vi.mock('../db', () => ({
   },
   runOutsideDbContext: (fn: () => unknown) => fn(),
   withSystemDbAccessContext: (fn: () => unknown) => fn(),
+  withDbTransaction: async (fn: () => Promise<unknown>) => {
+    savepointDepth.value += 1;
+    try {
+      return await fn();
+    } finally {
+      savepointDepth.value -= 1;
+    }
+  },
 }));
+const savepointDepth = vi.hoisted(() => ({ value: 0 }));
 
 import { commandResultHandlers } from './commandResultHandlers';
 
@@ -69,11 +89,52 @@ describe('handleScriptResult custom-field write-back', () => {
     expect(setCalls[0]?.customFieldResult).toBeNull();
   });
 
+  // #3530: the handler now shares a transaction with the command's terminal
+  // CAS, so the write-back must sit in its OWN savepoint — a caught Postgres
+  // error on a bare statement would leave that transaction aborted and park
+  // the whole result, stdout included.
+  it('runs the write-back inside its own savepoint', async () => {
+    let depthDuringWriteBack = -1;
+    applyMock.mockImplementation(async () => {
+      depthDuringWriteBack = savepointDepth.value;
+      return null;
+    });
+    await call('plain output');
+    expect(depthDuringWriteBack).toBe(1);
+    expect(setCalls[0]?.stdout).toBe('plain output');
+  });
+
   it('still persists stdout when the write-back throws', async () => {
     applyMock.mockRejectedValue(new Error('boom'));
     await call('::breeze:custom-fields:: {"a":1}');
     expect(setCalls[0]?.stdout).toContain('::breeze:custom-fields::');
     expect(setCalls[0]?.customFieldResult).toBeNull();
+  });
+
+  // #6537 — when every stdout line was a marker, the agent strips them all and
+  // sends no stdout at all; the transport then synthesizes `stdout` from
+  // JSON.stringify(result). That envelope is not output the script printed and
+  // must not be persisted as if it were — it read to the reporter as proof the
+  // write had landed.
+  it('does not persist the transport-synthesized envelope JSON as stdout', async () => {
+    applyMock.mockResolvedValue({ applied: [], rejected: [{ key: 'a', reason: 'not_script_writable' }] });
+    const envelope = { customFieldWrites: { schemaVersion: 1, fields: { a: 1 } } };
+    await commandResultHandlers.script!({
+      agentId: 'agent-1',
+      command: { id: 'cmd-5', payload: { executionId: EXEC_ID }, type: 'script' } as never,
+      commandId: 'cmd-5',
+      result: { status: 'completed', exitCode: 0, result: envelope } as never,
+      resolvedDeviceId: DEVICE_ID,
+      stdout: JSON.stringify(envelope),
+    });
+    expect(applyMock).toHaveBeenCalledWith(
+      expect.objectContaining({ stdout: undefined, resultEnvelope: envelope }),
+    );
+    expect(setCalls[0]?.stdout).toBeNull();
+    expect(setCalls[0]?.customFieldResult).toEqual({
+      applied: [],
+      rejected: [{ key: 'a', reason: 'not_script_writable' }],
+    });
   });
 
   it('runs the write-back for a non-zero exit code', async () => {

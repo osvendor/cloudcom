@@ -87,6 +87,7 @@ vi.mock('../middleware/auth', () => ({
     return next();
   }),
   requireScope: vi.fn(() => async (_c: any, next: any) => next()),
+  requireMfa: vi.fn(() => async (_c: any, next: any) => next()),
   requirePermission: vi.fn(() => async (c: any, next: any) => {
     const allowedSiteIds = c.req.header('x-restrict-site')
       ? [c.req.header('x-restrict-site') as string]
@@ -177,7 +178,13 @@ describe('CIS hardening — site-scope enforcement', () => {
         // summary query
         .mockReturnValueOnce({
           from: vi.fn().mockReturnValue({
-            where: vi.fn().mockResolvedValue([{ total: 0, averageScore: 100, failingDevices: 0 }]),
+            where: vi.fn().mockResolvedValue([{ total: 0, failingDevices: 0 }]),
+          }),
+        } as never)
+        // latest per-device scores (shared averageCisScore helper)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockResolvedValue([]),
           }),
         } as never)
         // rows query
@@ -226,7 +233,13 @@ describe('CIS hardening — site-scope enforcement', () => {
         } as never)
         .mockReturnValueOnce({
           from: vi.fn().mockReturnValue({
-            where: vi.fn().mockResolvedValue([{ total: 0, averageScore: 100, failingDevices: 0 }]),
+            where: vi.fn().mockResolvedValue([{ total: 0, failingDevices: 0 }]),
+          }),
+        } as never)
+        // latest per-device scores (shared averageCisScore helper)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockResolvedValue([{ score: 79 }, { score: 80 }, { score: 79 }]),
           }),
         } as never)
         .mockReturnValueOnce({
@@ -248,6 +261,8 @@ describe('CIS hardening — site-scope enforcement', () => {
 
       expect(res.status).toBe(200);
       expect(conditionText(rankedWhere)).not.toContain('devices.siteId');
+      // #9606: summary average comes from the shared helper over the latest per-device scores.
+      expect((await res.json()).summary.averageScore).toBe(79);
     });
   });
 

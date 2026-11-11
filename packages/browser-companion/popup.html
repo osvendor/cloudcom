@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>OS Companion</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <main class="app">
+    <section class="connection" aria-label="Connection">
+      <span id="connectionDot" class="dot" aria-label="Disconnected"></span>
+      <div class="connection-status" id="connectionStatus">Not connected</div>
+      <button id="connect" class="button primary" type="button">Log in to Breeze</button>
+    </section>
+    <div class="scope-row"><div class="scope-field">
+    <label class="field-label" for="client">Client</label>
+    <select id="client" class="select" disabled><option>Connect to load clients</option></select>
+    </div><div class="scope-field">
+    <label class="field-label" for="deviceSelect">Device · user</label>
+    <select id="deviceSelect" class="select"><option value="">Choose a device</option></select>
+    </div></div>
+    <label class="search device-search"><span class="search-icon" aria-hidden="true">⌕</span><input aria-label="Search device selector" id="deviceSearch" type="search" placeholder="Find computer, device, or user" autocomplete="off"></label>
+    <div id="message" class="message" role="status" aria-live="polite"></div>
+    <nav class="tabs" aria-label="Companion sections"><button class="tab active" data-tab="work" type="button">Work</button><button class="tab" data-tab="logins" type="button">Logins</button><button class="tab" data-tab="devices" type="button">Devices</button><button class="tab" data-tab="notes" type="button">Notes</button></nav>
+    <section id="loginsPanel" class="panel hidden"><select id="loginScope" class="select" aria-label="Login search scope"><option value="all">All client logins</option><option value="site">This website</option></select><p class="meta">Copy a value to paste anywhere. For website fill, select the field first, then choose This website.</p><label class="search"><span class="search-icon" aria-hidden="true">⌕</span><input aria-label="Search logins" id="loginSearch" type="search" placeholder="Search logins" autocomplete="off"></label><div id="loginList" class="list"><div class="empty">Connect and choose a client to view logins.</div></div></section>
+    <section id="workPanel" class="panel" aria-label="Work"></section>
+    <section id="devicesPanel" class="panel hidden" aria-label="Devices"><div id="devicesPrompt" class="empty">Choose a device above to open device tools.</div></section>
+    <section id="notesPanel" class="panel hidden" aria-label="Notes"></section>
+    <section id="toolPanel" class="hidden" aria-label="Device tools">
+      <div id="selectedDevice" class="selected-device"></div>
+      <div class="launch-row" id="launchRow"></div><nav class="inline-tools" id="inlineTools"></nav>
+      <iframe id="toolFrame" title="Selected device tools"></iframe>
+    </section>
+    <footer><button id="lock" class="link-button" type="button">Lock companion</button><span>Staff only</span></footer>
+  </main>
+  <script type="module" src="popup.js"></script>
+</body>
+</html>
+

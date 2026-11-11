@@ -36,6 +36,8 @@
     },
     "errors": {
       "agentUpgradeRequired": "Remote-Desktop erfordert auf diesem Gerät ein Agent-Update (Unterstützung für Sitzungs-Widerrufsleases und Start-Fence). Der Agent aktualisiert sich automatisch – das ist in der Regel innerhalb einer Minute erledigt. Terminal und Dateiübertragung sind nicht betroffen.",
+      "deviceNotFoundOrAccessDenied": "Gerät nicht gefunden oder Zugriff verweigert",
+      "siteAccessDenied": "Zugriff auf diesen Standort verweigert",
       "connectionFailed": "Verbindung fehlgeschlagen",
       "createDesktopCode": "Desktop-Verbindungscode konnte nicht erstellt werden",
       "createDesktopSession": "Die Desktop-Sitzung konnte nicht erstellt werden",
@@ -47,7 +49,8 @@
       "securityCheckToast": "Remote-Start nicht verfügbar: Sicherheitsprüfung fehlgeschlagen. Bitte wenden Sie sich an Ihren Administrator.",
       "securityPolicy": "Remote-Start durch Sicherheitsrichtlinie blockiert",
       "server": "Remote-Start fehlgeschlagen: Serverfehler. Bitte wenden Sie sich an Ihren Administrator.",
-      "vncTunnelFailed": "VNC-Tunnel konnte nicht geöffnet werden"
+      "vncTunnelFailed": "VNC-Tunnel konnte nicht geöffnet werden",
+      "providerUnavailable": "Dieses Fernwartungstool ist für dieses Gerät nicht mehr verfügbar. Aktualisieren Sie die Seite und versuchen Sie es erneut."
     },
     "fallback": {
       "linuxFirstRun": "Machen Sie die heruntergeladene Datei unter Linux ausführbar (chmod +x) und starten Sie sie einmal. Damit wird der Viewer registriert und Sitzungen öffnen sich danach automatisch.",
@@ -64,6 +67,14 @@
     },
     "launching": "Start...",
     "launchingViewer": "Viewer wird gestartet...",
+    "loginWindow": {
+      "connectVnc": "Mit VNC Relay verbinden",
+      "description": "macOS blockiert im Anmeldefenster entfernte Tastatur- und Mauseingaben, daher wurde Remote Desktop nicht gestartet.",
+      "enableVncRelay": "Aktivieren Sie VNC Relay in der Konfigurationsrichtlinie des Geräts, um sich am Anmeldebildschirm anzumelden, oder verbinden Sie sich erneut, nachdem sich ein Benutzer angemeldet hat.",
+      "title": "Dieser Mac befindet sich im Anmeldefenster",
+      "unavailableTitle": "Remote Desktop nicht verfügbar",
+      "useVncRelay": "Verwenden Sie VNC Relay, um sich am Anmeldebildschirm anzumelden."
+    },
     "openInBrowser": "Im Browser öffnen",
     "policyDisabled": "Remote-Desktop ist durch Richtlinie deaktiviert",
     "policyDisabledNamed": "Der Remotedesktop ist durch die Richtlinie „{{name}}“ deaktiviert.",
@@ -82,6 +93,10 @@
         "default": "Die Sitzung wurde durch eine Sicherheitsrichtlinie beendet. Versuchen Sie es erneut."
       }
     },
+    "startFailed": {
+      "description": "Der Agent konnte die Sitzung nicht starten. Versuchen Sie es erneut oder prüfen Sie die Diagnoseprotokolle des Geräts.",
+      "title": "Remote Desktop konnte nicht gestartet werden"
+    },
     "unavailable": {
       "default": "Desktop ist auf diesem Gerät nicht verfügbar",
       "headless": "Dieses Gerät verfügt über keine Anzeige – der Remote-Desktop ist nicht verfügbar",
@@ -90,11 +105,19 @@
       "missingEntitlement": "Der Desktop im Anmeldefenster ist blockiert, bis die erforderliche Apple-Berechtigung genehmigt wurde",
       "missingPermission": "Es fehlen noch die für den unbeaufsichtigten Desktop-Zugriff erforderlichen macOS-Berechtigungen",
       "noDisplaySession": "Keine aktive grafische Sitzung — melden Sie sich zuerst per RDP oder an der Konsole an",
-      "unsupportedOs": "Der Anmeldefenster-Desktop erfordert macOS 14 (Sonoma) oder höher. Aktivieren Sie VNC Relay in der Konfigurationsrichtlinie des Geräts, um eine Verbindung auf dem Anmeldebildschirm herzustellen.",
+      "unsupportedOs": "macOS blockiert im Anmeldefenster entfernte Tastatur- und Mauseingaben, daher kann Remote Desktop diesen Mac dort nicht steuern. Aktivieren Sie VNC Relay in der Konfigurationsrichtlinie des Geräts, um eine Verbindung auf dem Anmeldebildschirm herzustellen.",
       "virtualDisplay": "Für diesen Mac ist keine erfassbare Anzeige verfügbar. Aktivieren Sie VNC Relay, um eine Verbindung über macOS Screen Sharing herzustellen.",
       "waylandUnsupported": "Dies ist ein Wayland-Desktop — Remote-Desktop erfordert einen neueren Agenten",
       "x11AuthFailed": "Authentifizierung am Anzeigeserver (X-Authority) nicht möglich",
       "x11ConnectFailed": "Verbindung zum Anzeigeserver auf diesem Gerät nicht möglich"
+    },
+    "opensNewWindow": "(öffnet ein neues Fenster)",
+    "split": {
+      "builtInViewer": "Integrierter Viewer",
+      "connectWith": "Mit {{name}} verbinden",
+      "connectWithBuiltIn": "Mit dem integrierten Viewer verbinden",
+      "menuLabel": "Verbindungsart wählen",
+      "opensInBrowser": "Öffnet sich in einem neuen Browser-Tab"
     }
   },
   "connectVncButton": {
@@ -194,6 +217,7 @@
       "copy": "Kopieren",
       "delete": "Löschen",
       "download": "Herunterladen",
+      "mkdir": "Neuer Ordner",
       "move": "Verschieben",
       "purge": "Endgültig löschen",
       "restore": "Wiederherstellen",
@@ -235,6 +259,7 @@
     "emptyDirectory": "Leeres Verzeichnis",
     "errors": {
       "copy": "Kopieren fehlgeschlagen",
+      "createFolder": "Ordner konnte nicht erstellt werden",
       "delete": "Fehler beim Löschen",
       "download": "Download fehlgeschlagen",
       "downloadTooLarge": "Zu groß für den Download ({{size}}). Der Dateibrowser überträgt Dateien bis {{max}}.",
@@ -249,6 +274,15 @@
     "home": "Zuhause",
     "modified": "Geändert",
     "moveTo": "Verschieben nach",
+    "newFolder": {
+      "action": "Neuer Ordner",
+      "title": "Neuer Ordner",
+      "nameLabel": "Ordnername",
+      "location": "Wird erstellt in {{path}}",
+      "created": "Ordner {{name}} erstellt",
+      "invalidName": "Ordnernamen dürfen keine Pfadtrennzeichen oder vom Dateisystem dieses Geräts nicht erlaubte Zeichen enthalten.",
+      "nameExists": "Hier gibt es bereits eine Datei oder einen Ordner mit diesem Namen."
+    },
     "selectedCount": "Ausgewählte Anzahl",
     "size": "Größe",
     "title": "Dateimanager",
@@ -280,7 +314,7 @@
       "threads": "Threads"
     },
     "errors": {
-      "handlerNotConfigured": "Fehler beim Handler nicht konfiguriert",
+      "handlerNotConfigured": "Der Handler zum Beenden von Prozessen ist nicht konfiguriert",
       "killFailed": "Prozess konnte nicht beendet werden"
     },
     "killConfirm": "Prozessbeendigung bestätigen",
@@ -303,15 +337,24 @@
     "title": "Prozessmanager",
     "totalCpu": "Insgesamt CPU",
     "pid": "PID",
-    "cpu": "CPU"
+    "cpu": "CPU",
+    "monitorThis": "Überwachen"
   },
   "proxyTunnelPage": {
     "errors": {
+      "closeFailed": "Tunnel konnte nicht geschlossen werden",
+      "invalidProxyUrl": "Der Server hat eine ungültige Proxy-Adresse zurückgegeben.",
       "invalidTicket": "Dieser Link ist ungültig oder abgelaufen.",
-      "obtainTicket": "Ticket konnte nicht abgerufen werden",
-      "prepareConnection": "Die Verbindung konnte nicht vorbereitet werden",
+      "obtainTicket": "Tunnel-Ticket konnte nicht abgerufen werden",
+      "popupBlocked": "Ihr Browser hat den neuen Tab blockiert. Erlauben Sie Pop-ups für diese Website und versuchen Sie es erneut.",
+      "prepareConnection": "Proxy-Verbindung konnte nicht vorbereitet werden",
       "tlsUntrusted": "Dieses Gerät hat ein nicht vertrauenswürdiges oder selbstsigniertes Zertifikat vorgelegt.",
       "tunnelFailed": "Tunnel konnte nicht geöffnet werden"
+    },
+    "cookieBlocked": {
+      "title": "Dieser Browser hat die eingebettete Proxy-Sitzung blockiert.",
+      "body": "Öffnen Sie das Gerät in einem neuen Tab, um fortzufahren.",
+      "storageBody": "Er blockiert den Website-Speicher in eingebetteten Seiten, den die Geräteseite benötigt. Ein neuer Tab funktioniert."
     },
     "openInNewTab": "In neuem Tab öffnen",
     "preparingConnection": "Proxy-Verbindung wird vorbereitet…",
@@ -351,25 +394,25 @@
     "enterStrings": "Geben Sie Zeichenfolgen ein",
     "enterValueName": "Geben Sie den Wertnamen ein",
     "errors": {
-      "createKey": "Schlüssel konnte nicht erstellt werden",
+      "createKey": "Registrierungsschlüssel konnte nicht erstellt werden",
       "createKeyDetail": "Registrierungsschlüssel konnte nicht erstellt werden: {{message}}",
-      "deleteKey": "Schlüssel konnte nicht gelöscht werden",
+      "deleteKey": "Registrierungsschlüssel konnte nicht gelöscht werden",
       "deleteKeyDetail": "Registrierungsschlüssel konnte nicht gelöscht werden: {{message}}",
-      "deleteValue": "Wert konnte nicht gelöscht werden",
+      "deleteValue": "Registrierungswert konnte nicht gelöscht werden",
       "deleteValueDetail": "Registrierungswert konnte nicht gelöscht werden: {{message}}",
-      "invalidFormat": "Ungültiges Format fehlgeschlagen",
-      "invalidNumber": "Fehler bei ungültiger Nummer",
-      "keyNameBackslash": "Der Backslash des Schlüsselnamens konnte nicht eingegeben werden",
-      "keyNameRequired": "Schlüsselname erforderlich konnte nicht eingegeben werden",
-      "keyProvider": "Fehler beim Schlüsselanbieter",
-      "loadKeys": "Schlüssel konnten nicht geladen werden",
+      "invalidFormat": "Ungültiges Wertformat",
+      "invalidNumber": "Ungültiger Zahlenwert",
+      "keyNameBackslash": "Der Schlüsselname darf keinen Backslash enthalten",
+      "keyNameRequired": "Schlüsselname ist erforderlich",
+      "keyProvider": "Der Registrierungsschlüssel-Provider ist nicht konfiguriert",
+      "loadKeys": "Registrierungsschlüssel konnten nicht geladen werden",
       "loadKeysDetail": "Registrierungsschlüssel konnten nicht geladen werden: {{message}}",
-      "loadValues": "Werte konnten nicht geladen werden",
+      "loadValues": "Registrierungswerte konnten nicht geladen werden",
       "loadValuesDetail": "Registrierungswerte konnten nicht geladen werden: {{message}}",
-      "saveValue": "Wert konnte nicht gespeichert werden",
+      "saveValue": "Registrierungswert konnte nicht gespeichert werden",
       "saveValueDetail": "Registrierungswert konnte nicht gespeichert werden: {{message}}",
-      "valueNameRequired": "Der erforderliche Name konnte nicht eingegeben werden",
-      "valueProvider": "Fehler beim Wert des Anbieters"
+      "valueNameRequired": "Wertname ist erforderlich",
+      "valueProvider": "Der Registrierungswert-Provider ist nicht konfiguriert"
     },
     "hexadecimal": "Hexadezimal",
     "key": "Schlüssel",
@@ -440,14 +483,14 @@
     "disconnect": "Trennen",
     "errorMessage": "Fehler: {{message}}",
     "errors": {
-      "closedUnexpectedly": "Das unerwartete Schließen ist fehlgeschlagen",
-      "connection": "Verbindung fehlgeschlagen",
+      "closedUnexpectedly": "Verbindung wurde unerwartet geschlossen",
+      "connection": "Verbindungsfehler",
       "createSession": "Sitzung konnte nicht erstellt werden",
-      "createTicket": "Ticket konnte nicht erstellt werden",
-      "failed": "Fehlgeschlagen, fehlgeschlagen",
+      "createTicket": "Verbindungsticket konnte nicht erstellt werden",
+      "failed": "Verbindung fehlgeschlagen",
       "initialize": "Initialisierung fehlgeschlagen",
-      "invalidTicket": "Fehler beim ungültigen Ticket",
-      "webSocket": "Web-Socket fehlgeschlagen"
+      "invalidTicket": "Ungültige Antwort für Verbindungsticket",
+      "webSocket": "WebSocket-Verbindungsfehler"
     },
     "exitFullscreen": "Beenden Sie den Vollbildmodus",
     "fullscreen": "Vollbild",
@@ -483,23 +526,23 @@
       "deleteRegistryValue": "Der Registrierungswert konnte nicht gelöscht werden",
       "disableTask": "Die Aufgabe konnte nicht deaktiviert werden",
       "enableTask": "Aufgabe konnte nicht aktiviert werden",
-      "eventDetails": "Ereignisdetails konnten nicht aufgerufen werden",
+      "eventDetails": "Ereignisdetails konnten nicht abgerufen werden",
       "fetchEventLogs": "Ereignisprotokolle konnten nicht abgerufen werden",
       "fetchProcesses": "Prozesse konnten nicht abgerufen werden",
       "fetchServices": "Dienste konnten nicht abgerufen werden",
       "fetchTasks": "Aufgaben konnten nicht abgerufen werden",
       "killProcess": "Prozess konnte nicht beendet werden",
-      "processDetails": "Details konnten nicht verarbeitet werden",
+      "processDetails": "Prozessdetails konnten nicht abgerufen werden",
       "queryEvents": "Ereignisse konnten nicht abgefragt werden",
-      "registryKeys": "Registrierungsschlüssel fehlgeschlagen",
-      "registryValues": "Registrierungswerte fehlgeschlagen",
+      "registryKeys": "Registrierungsschlüssel konnten nicht geladen werden",
+      "registryValues": "Registrierungswerte konnten nicht geladen werden",
       "restartService": "Der Dienst konnte nicht neu gestartet werden",
       "runTask": "Aufgabe konnte nicht ausgeführt werden",
       "setRegistryValue": "Der Registrierungswert konnte nicht festgelegt werden",
       "startService": "Der Dienst konnte nicht gestartet werden",
       "stopService": "Der Dienst konnte nicht beendet werden",
-      "taskDetails": "Aufgabendetails konnten nicht aufgerufen werden",
-      "taskHistory": "Fehler beim Aufgabenverlauf"
+      "taskDetails": "Aufgabendetails konnten nicht geladen werden",
+      "taskHistory": "Aufgabenverlauf konnte nicht geladen werden"
     },
     "policyDisabled": "Eine Konfigurationsrichtlinie hat Remote-Systemtools deaktiviert.",
     "policyDisabledNamed": "Die Konfigurationsrichtlinie „{{name}}“ hat Remote-Systemtools deaktiviert.",
@@ -602,7 +645,7 @@
     "displayName": "Anzeigename",
     "executablePath": "Ausführbarer Pfad",
     "loading": "Laden",
-    "noDescription": "Keine Beschreibung",
+    "noDescription": "Keine Beschreibung verfügbar",
     "noServicesAvailable": "Keine Dienste verfügbar",
     "noServicesFound": "Keine Dienste gefunden",
     "ok": "Okay",
@@ -620,9 +663,10 @@
     },
     "stopService": "Stoppen Sie den Dienst",
     "summary": "{{shown}} von {{total}} Leistungen auf {{device}}",
-    "title": "Titel",
+    "title": "Dienste",
     "windowsOnlyDescription": "Der Dienstemanager ist nur für Windows-Geräte verfügbar. {{device}} läuft {{os}}.",
-    "windowsOnlyTitle": "Nur Windows-Titel"
+    "windowsOnlyTitle": "Nur Windows",
+    "monitorThis": "Überwachen"
   },
   "sessionHistory": {
     "columns": {
@@ -637,7 +681,10 @@
       "lastSevenDays": "Letzte sieben Tage",
       "lastThirtyDays": "Letzte dreißig Tage",
       "today": "Heute",
-      "yesterday": "Gestern"
+      "yesterday": "Gestern",
+      "typeFilterLabel": "Sitzungstyp",
+      "userFilterLabel": "Benutzer",
+      "dateFilterLabel": "Zeitraum"
     },
     "noSessions": "Keine Sitzungen",
     "page": "Seite {{current}} von {{total}}",
@@ -655,6 +702,7 @@
       "disconnected": "Nicht verbunden",
       "failed": "Fehlgeschlagen",
       "pending": "Ausstehend",
+      "endedByUser": "Vom Benutzer beendet",
       "teardownPending": "Wird beendet (Gerät bestätigt noch)"
     },
     "subtitle": "Überwachungsprotokoll für den Fernzugriff",
@@ -671,7 +719,7 @@
   "sessionHistoryPage": {
     "detailsTitle": "Details Titel",
     "errors": {
-      "exportFetch": "Der Abruf konnte nicht exportiert werden"
+      "exportFetch": "Sitzungen für den Export konnten nicht abgerufen werden"
     },
     "fields": {
       "dataTransferred": "Daten übertragen",
@@ -691,6 +739,7 @@
       "timeline": "Zeitleiste"
     },
     "subtitle": "Fernzugriffssitzungen anzeigen und überwachen",
+    "endedByUser": "Vom Benutzer beendet",
     "teardownPending": "Bestätigung des Geräts ausstehend",
     "title": "Sitzungsverlauf",
     "viewDevice": "Gerät anzeigen",
@@ -736,12 +785,12 @@
     },
     "disconnect": "Trennen",
     "errors": {
-      "authenticationDetail": "Authentifizierungsdetails fehlgeschlagen",
-      "authenticationFailed": "Die Authentifizierung ist fehlgeschlagen",
-      "connectionLost": "Fehler beim Verbindungsverlust",
-      "loadViewer": "Viewer konnte nicht geladen werden",
-      "securityFailure": "Aufgrund eines Sicherheitsfehlers fehlgeschlagen",
-      "securityType": "Fehler beim Sicherheitstyp"
+      "authenticationDetail": "Authentifizierung fehlgeschlagen: {{reason}}. Bitte überprüfen Sie Ihr VNC-Passwort.",
+      "authenticationFailed": "Authentifizierung fehlgeschlagen",
+      "connectionLost": "Verbindung unerwartet unterbrochen",
+      "loadViewer": "VNC-Viewer konnte nicht geladen werden",
+      "securityFailure": "Sicherheitsfehler: {{reason}}",
+      "securityType": "Sicherheitstyp wird nicht unterstützt: {{reason}}"
     },
     "exitFullscreen": "Beenden Sie den Vollbildmodus",
     "fullscreen": "Vollbild",
@@ -762,8 +811,8 @@
     "disconnect": "Trennen",
     "errors": {
       "connect": "Verbindung konnte nicht hergestellt werden",
-      "invalidTicket": "Fehler beim ungültigen Ticket",
-      "obtainTicket": "Ticket konnte nicht abgerufen werden"
+      "invalidTicket": "Ungültige Antwort für Tunnel-Ticket",
+      "obtainTicket": "VNC-Tunnel-Ticket konnte nicht abgerufen werden"
     },
     "sessionTitle": "Sitzungstitel"
   },
@@ -829,5 +878,23 @@
       "unlabeled": "Sitzung ohne Bezeichnung",
       "openSession": "Sitzungsdetails öffnen"
     }
+  },
+  "activeSessionsBanner": {
+    "title_one": "Eine andere Person hat eine Sitzung auf diesem Gerät",
+    "title_other": "{{count}} andere Personen haben Sitzungen auf diesem Gerät",
+    "session": "{{name}} – {{type}}, seit {{duration}}",
+    "unknownUser": "Unbekannter Benutzer",
+    "sessionConnecting": "{{name}} – {{type}}, verbindet…",
+    "duration": {
+      "minutes_one": "{{count}} Minute",
+      "minutes_other": "{{count}} Minuten",
+      "hoursMinutes": "{{hours}} Std. {{minutes}} Min.",
+      "lessThanMinute": "weniger als einer Minute",
+      "hours_one": "{{count}} Stunde",
+      "hours_other": "{{count}} Stunden"
+    },
+    "announcement_one": "{{names}} hat eine Sitzung auf diesem Gerät",
+    "announcement_other": "{{names}} haben Sitzungen auf diesem Gerät",
+    "announcementNone": "Niemand sonst hat eine Sitzung auf diesem Gerät"
   }
 }

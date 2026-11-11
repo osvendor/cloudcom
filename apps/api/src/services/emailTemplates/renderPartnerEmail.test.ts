@@ -11,7 +11,7 @@ function commentArgs(overrides: Partial<RenderPartnerEmailArgs> = {}): RenderPar
     id: 'ticket_comment_notification',
     vars: {},
     ctaUrl: PORTAL_HREF,
-    internalNumber: 'T-2026-0001',
+    ticketNumber: 'T-2026-0001',
     ticketSubject: 'Printer is down',
     ...overrides,
   };
@@ -102,7 +102,7 @@ describe('renderPartnerEmail', () => {
       id: 'ticket_autoresponse',
       custom: null,
       vars: { requester_name: 'Ada' },
-      internalNumber: 'T-2026-0001',
+      ticketNumber: 'T-2026-0001',
       ticketSubject: 'Printer is down',
       inboundAutoresponseFallback: { subject: null, body: 'Hello {{requester_name}}' },
     });
@@ -126,7 +126,7 @@ describe('renderPartnerEmail', () => {
       id: 'ticket_resolved',
       vars: { resolution_note: 'Replaced the roller' },
       ctaUrl: PORTAL_HREF,
-      internalNumber: 'T-2026-0001',
+      ticketNumber: 'T-2026-0001',
       ticketSubject: 'Printer is down',
     });
     expect(out.subject).toBe('[T-2026-0001] Resolved: Printer is down');
@@ -218,7 +218,7 @@ describe('renderPartnerEmail', () => {
       id: 'ticket_resolved',
       vars: { resolution_note: '' },
       ctaUrl: PORTAL_HREF,
-      internalNumber: 'T-2026-0001',
+      ticketNumber: 'T-2026-0001',
       ticketSubject: 'Printer is down',
     });
     expect(out.html).toContain('Your ticket has been resolved.');
@@ -251,5 +251,50 @@ describe('renderPartnerEmail', () => {
     expect(hello).toBeLessThan(note);
     expect(note).toBeLessThan(href);
     expect(href).toBeLessThan(sig);
+  });
+});
+
+describe('renderPartnerEmail text body and variants', () => {
+  it('returns the body as plain text, without the preheader, with the button as "label: url"', () => {
+    const out = renderPartnerEmail({ id: 'autopay_request', vars: { partner_name: 'Example MSP', client_name: 'Acme', ach_mode_text: 'You can use a US bank account or a card.' },
+      ctaUrl: 'https://portal.example.test/autopay/tok', bodyAfterCta: '<p>LOCKED BLOCK</p>' });
+    expect(out.bodyText).toContain('Hi Acme,');
+    expect(out.bodyText).toContain('Set up automatic payments: https://portal.example.test/autopay/tok');
+    expect(out.bodyText).not.toContain('LOCKED BLOCK');
+    expect(out.bodyText).not.toContain(out.preheader);
+    expect(out.heading).toBe('Pay future invoices automatically');
+    expect(out.html).toContain('LOCKED BLOCK');
+  });
+  it('a variant picks its own default subject, heading and body', () => {
+    const vars = { partner_name: 'Example MSP', client_name: 'Acme', invoice_number: 'INV-7' };
+    const base = renderPartnerEmail({ id: 'payment_failed', vars });
+    const confirm = renderPartnerEmail({ id: 'payment_failed', variant: 'confirm', vars });
+    expect(confirm.subject).toBe('Confirm your payment for invoice INV-7');
+    expect(confirm.heading).toBe('Your bank needs you to confirm this payment');
+    expect(base.subject).not.toBe(confirm.subject);
+  });
+  it("a partner's saved override still wins over every variant", () => {
+    const custom = { subject: 'Custom {{invoice_number}}', heading: null, buttonLabel: null, html: null };
+    expect(renderPartnerEmail({ id: 'payment_failed', variant: 'confirm', custom, vars: { invoice_number: 'INV-7' } }).subject).toBe('Custom INV-7');
+  });
+});
+
+// R11: names and labels are inserted literally. A string replacement would expand `$&`,
+// `$'`, `$1`… in an MSP's name or button label into pieces of the template.
+describe('replacement patterns in partner text are literal', () => {
+  it('a button label with $& and $\' renders as written, in HTML and text', () => {
+    const out = renderPartnerEmail(commentArgs({
+      custom: { subject: null, heading: null, buttonLabel: "Pay $& now $'", html: '<p>Hello {{cta_button}} there</p>' },
+    }));
+    expect(out.html).toContain("Pay $&amp; now $&#39;</a>");
+    expect(out.bodyText).toContain("Pay $& now $': https://manage.example/portal/tickets/abc");
+    expect(out.html).not.toMatch(/__CTA|cta-sentinel/i);
+  });
+  it('content spliced before the button keeps its $& literally', () => {
+    const out = renderPartnerEmail(commentArgs({
+      custom: { subject: null, heading: null, buttonLabel: null, html: '<p>Hello {{cta_button}}</p>' },
+      bodyBeforeCta: '<p>Fee: $& and $1</p>',
+    }));
+    expect(out.html).toContain('<p>Fee: $& and $1</p>');
   });
 });

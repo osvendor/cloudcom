@@ -2,10 +2,10 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { eq } from 'drizzle-orm';
 
 import { topologyGloballyDisabled } from '../../config/env';
-import { db } from '../../db';
+import { db, withSystemDbAccessContext } from '../../db';
 import { readWithPartnerAxisVisibility } from '../../db/partnerAxisRead';
+import { orgTopologyFlagsCache } from '../agentOrgSettingsCache';
 import { organizations, partners } from '../../db/schema';
-import type { TopologyRequestContext } from './access';
 
 export const TOPOLOGY_FLAG_KEYS = [
   'materialization',
@@ -23,6 +23,7 @@ export type TopologyFlags = Record<TopologyFlagName, boolean>;
 export type TopologyCapabilityReason =
   | 'materialization_disabled'
   | 'topology_preparing'
+  | 'topology_import_failed'
   | 'ui_disabled'
   | 'collection_unavailable'
   | 'physical_disabled'
@@ -32,7 +33,8 @@ export type TopologyCapabilityReason =
   | 'diagnostics_disabled'
   | 'diagnostics_unavailable'
   | 'ai_disabled'
-  | 'ai_unavailable';
+  | 'ai_unavailable'
+  | 'ai_not_configured';
 
 export interface TopologyCapabilityState {
   available: boolean;
@@ -44,7 +46,6 @@ export interface TopologyAgentCapabilities {
   physical?: boolean;
   interfaceHealth?: boolean;
   diagnostics?: boolean;
-  ai?: boolean;
 }
 
 export interface TopologyCapabilities {
@@ -57,7 +58,9 @@ export interface TopologyCapabilities {
   ai: TopologyCapabilityState;
 }
 
-export type TopologyRequestContextLike = Pick<TopologyRequestContext, 'scope'>;
+// Flags are a function of the org (and its partner) only, so the site half of
+// a TopologyScope is never read.
+export type TopologyRequestContextLike = { scope: { orgId: string; siteId?: string } };
 
 const DEFAULT_TOPOLOGY_FLAGS: TopologyFlags = {
   materialization: false,
@@ -186,6 +189,41 @@ export async function loadTopologyFlags(
   });
 }
 
+/**
+ * Topology flags for an AGENT request path (heartbeat, unifi-collectors,
+ * unifi-telemetry), #8053. Resolved in its own short system context — the
+ * #6671 / 2026-09-22 rule: never inside a lock-holding transaction, because the
+ * partner read here escapes to a second pooled connection — and served from a
+ * per-org process cache for `AGENT_ORG_SETTINGS_CACHE_TTL_MS`. The flags are a
+ * function of the org row and its partner row only, so the org id is the whole
+ * key. Must be called OUTSIDE any DB context; inside one the cache is bypassed.
+ * A thrown lookup is never cached.
+ */
+export async function loadAgentTopologyFlags(orgId: string): Promise<TopologyFlags> {
+  return orgTopologyFlagsCache.getOrLoad(orgId, () =>
+    withSystemDbAccessContext(() => loadTopologyFlags({ scope: { orgId } })),
+  );
+}
+
+/**
+ * D9/D15.4: the deployed physical-view capability. It gates EXPOSURE only
+ * (graphs, counts, neighborhoods, detail/evidence/health, cursors); canonical
+ * publication, support and aging keep running while it is off, so re-enabling
+ * needs no reprojection. Independent of whether any collector is present —
+ * collectability is reported through graph coverage instead.
+ */
+export function topologyPhysicalExposed(flags: Pick<TopologyFlags, 'materialization' | 'physical'>): boolean {
+  return flags.materialization && flags.physical;
+}
+
+/**
+ * M3 Task 6: interface measurement (port health and history) is exposed only
+ * with the physical capability (interfaces are physical evidence) AND the
+ * `interfaceHealth` flag. Like `physical`, it gates EXPOSURE only.
+ */
+export function topologyInterfaceHealthExposed(flags: Pick<TopologyFlags, 'materialization' | 'physical' | 'interfaceHealth'>): boolean {
+  return topologyPhysicalExposed(flags) && flags.interfaceHealth === true;
+}
 function capability(
   available: boolean,
   reason: TopologyCapabilityReason,
@@ -205,17 +243,31 @@ function dependentCapability(
   return capability(supported, unavailableReason);
 }
 
+/**
+ * `aiReady` (M4-D4, #6000) is the server/provider/org AI policy answer
+ * (`topologyAiAvailable` minus the flags, see `aiToolGate.ts`) — AI readiness
+ * is never an agent capability bit. `aiNotConfigured` names the not-ready
+ * case where the server has no model provider at all (`ai_not_configured`,
+ * the same precedence as `topologyAiRefusalCode`).
+ */
 export function getTopologyCapabilities(
   flags: TopologyFlags,
-  siteGraphReady: boolean,
+  /** `'import_failed'` (#7557): not ready, and the automatic first-snapshot
+   * import recorded a site-specific failure — say so instead of "preparing". */
+  siteGraphReady: boolean | 'import_failed',
   agentCapabilities: TopologyAgentCapabilities,
+  aiReady = false,
+  aiNotConfigured = false,
 ): TopologyCapabilities {
-  const effectiveUi = flags.ui && flags.materialization && siteGraphReady;
+  const ready = siteGraphReady === true;
+  const effectiveUi = flags.ui && flags.materialization && ready;
   const uiReason: TopologyCapabilityReason = !flags.materialization
     ? 'materialization_disabled'
-    : !siteGraphReady
-      ? 'topology_preparing'
-      : 'ui_disabled';
+    : siteGraphReady === 'import_failed'
+      ? 'topology_import_failed'
+      : !ready
+        ? 'topology_preparing'
+        : 'ui_disabled';
 
   return {
     materialization: capability(flags.materialization, 'materialization_disabled'),
@@ -247,9 +299,9 @@ export function getTopologyCapabilities(
     ai: dependentCapability(
       flags.materialization,
       flags.ai,
-      agentCapabilities.ai === true,
+      aiReady,
       'ai_disabled',
-      'ai_unavailable',
+      !aiReady && aiNotConfigured ? 'ai_not_configured' : 'ai_unavailable',
     ),
   };
 }

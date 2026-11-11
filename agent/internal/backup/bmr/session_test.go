@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -485,9 +486,15 @@ func TestExchangeRecoveryCode_SendsClientCapabilities(t *testing.T) {
 	}))
 	defer server.Close()
 
-	_, _, err := ExchangeRecoveryCode(context.Background(), server.URL, "ABC-DEF-GHJ")
+	_, _, err := ExchangeRecoveryCode(context.Background(), server.URL, "ABC-DEF-GHJ", "0.117.0")
 	if err != nil {
 		t.Fatalf("ExchangeRecoveryCode: %v", err)
+	}
+
+	// #5629: the helper's version rides on the exchange so the server can
+	// refuse too-old media before claiming the one-time code.
+	if got, _ := gotBody["helperVersion"].(string); got != "0.117.0" {
+		t.Errorf("request helperVersion = %q, want %q (body %v)", got, "0.117.0", gotBody)
 	}
 
 	caps, ok := gotBody["capabilities"].([]any)
@@ -496,6 +503,61 @@ func TestExchangeRecoveryCode_SendsClientCapabilities(t *testing.T) {
 	}
 	if !containsAny(caps, CapabilitySnapshotFileMembershipV1) {
 		t.Fatalf("capabilities = %v, want to contain %q", caps, CapabilitySnapshotFileMembershipV1)
+	}
+}
+
+// TestExchangeRecoveryCode_OmitsEmptyHelperVersion: an unset version must
+// not be sent as "" — the server's schema requires min(1) when present.
+func TestExchangeRecoveryCode_OmitsEmptyHelperVersion(t *testing.T) {
+	var gotBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		writeTestBootstrapEnvelope(t, w, "gen-1", true)
+	}))
+	defer server.Close()
+
+	if _, _, err := ExchangeRecoveryCode(context.Background(), server.URL, "ABC-DEF-GHJ", ""); err != nil {
+		t.Fatalf("ExchangeRecoveryCode: %v", err)
+	}
+	if _, present := gotBody["helperVersion"]; present {
+		t.Errorf("request body carried helperVersion for an empty version: %v", gotBody)
+	}
+}
+
+// TestExchangeRecoveryCode_SendsMediaPlatform: the helper reports the OS it
+// runs on so the server can refuse a code for the other platform's media
+// BEFORE claiming it (W07a). Only linux/windows are sent; anything else is
+// omitted (the server's enum would 400 it).
+func TestExchangeRecoveryCode_SendsMediaPlatform(t *testing.T) {
+	var gotBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		writeTestBootstrapEnvelope(t, w, "gen-1", true)
+	}))
+	defer server.Close()
+
+	if _, _, err := ExchangeRecoveryCode(context.Background(), server.URL, "ABC-DEF-GHJ", "0.117.0"); err != nil {
+		t.Fatalf("ExchangeRecoveryCode: %v", err)
+	}
+	got, present := gotBody["mediaPlatform"]
+	if runtime.GOOS == "linux" || runtime.GOOS == "windows" {
+		if got != runtime.GOOS {
+			t.Errorf("mediaPlatform = %v, want %q (body %v)", got, runtime.GOOS, gotBody)
+		}
+	} else if present {
+		t.Errorf("mediaPlatform present on %s: %v", runtime.GOOS, gotBody)
+	}
+}
+
+func TestMediaPlatformFor(t *testing.T) {
+	for goos, want := range map[string]string{"linux": "linux", "windows": "windows", "darwin": "", "freebsd": "", "": ""} {
+		if got := mediaPlatformFor(goos); got != want {
+			t.Errorf("mediaPlatformFor(%q) = %q, want %q", goos, got, want)
+		}
 	}
 }
 
@@ -610,7 +672,7 @@ func TestExchangeRecoveryCode_NonJSON409DegradesToUnknownNegotiationError(t *tes
 	}))
 	defer server.Close()
 
-	_, _, err := ExchangeRecoveryCode(context.Background(), server.URL, "some-code")
+	_, _, err := ExchangeRecoveryCode(context.Background(), server.URL, "some-code", "")
 	if err == nil {
 		t.Fatal("expected an error")
 	}

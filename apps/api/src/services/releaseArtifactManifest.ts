@@ -5,7 +5,11 @@ import {
   verify as verifySignature,
   type KeyObject,
 } from "node:crypto";
-import { assertDistributableReleaseAsset, isUnsignedSelfHostAsset } from './releaseAssetTrust';
+import {
+  EDITION_SELF_HOST,
+  assertDistributableReleaseAsset,
+  isUnsignedSelfHostAsset,
+} from './releaseAssetTrust';
 import { safeFetchFollowingRedirects } from './urlSafety';
 
 // Warn once per asset name per process. This fires on the normal, intended path
@@ -95,6 +99,52 @@ export class ReleaseAssetNotDistributableError extends Error {
   }
 }
 
+// The manifest is genuine but was published before the release pipeline began
+// recording a field this server now requires to serve the asset (#7830). Not a
+// forgery and not a mislabel: the operator's fix is to raise the pinned
+// release (BINARY_VERSION) to `minimumRelease` or later, and the message says
+// so. Subclasses ReleaseAssetNotDistributableError so every existing
+// `instanceof` category check keeps classifying it as a policy refusal.
+export class ReleaseManifestTooOldError extends ReleaseAssetNotDistributableError {
+  readonly release: string;
+  readonly minimumRelease: string;
+
+  constructor(args: { message: string; release: string; minimumRelease: string }) {
+    super(args.message);
+    this.name = "ReleaseManifestTooOldError";
+    this.release = args.release;
+    this.minimumRelease = args.minimumRelease;
+  }
+}
+
+// The first official releases whose manifest generator (release.yml) writes
+// each field. Verified against the published manifests: v0.104.0 has neither,
+// v0.105.0 has `edition`, v0.112.0 is the first with signingIdentity/TeamId.
+export const FIRST_RELEASE_WITH_EDITION = "v0.105.0";
+export const FIRST_RELEASE_WITH_MACOS_PUBLISHER = "v0.112.0";
+
+function parseReleaseTag(tag: string): [number, number, number] | null {
+  const match = /^v(\d+)\.(\d+)\.(\d+)(?:-[0-9A-Za-z.-]+)?$/.exec(tag);
+  if (!match) return null;
+  return [Number(match[1]), Number(match[2]), Number(match[3])];
+}
+
+/**
+ * True only when `release` is a parseable release tag strictly older than
+ * `threshold` (a prerelease of the threshold version itself does not count —
+ * it may already carry the field). An unparseable tag is never "older": the
+ * legacy allowances below must not extend to tags they cannot order.
+ */
+export function releasePredates(release: string, threshold: string): boolean {
+  const actual = parseReleaseTag(release);
+  const limit = parseReleaseTag(threshold);
+  if (!actual || !limit) return false;
+  for (let i = 0; i < 3; i++) {
+    if (actual[i]! !== limit[i]!) return actual[i]! < limit[i]!;
+  }
+  return false;
+}
+
 const ED25519_SPKI_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
 /**
  * Ceiling for the manifest and its signature. Exported because binarySync.ts
@@ -118,7 +168,9 @@ type ReleaseArtifactManifestAsset = {
   intendedUse?: unknown;
   // Release edition ("self-host" | "hosted"). Optional — absent on manifests
   // predating this field, which is tolerated everywhere it's read (treated
-  // as "no edition claim", never as "self-host" by default).
+  // as "no edition claim", never as "self-host" by default). The one place
+  // an absence may SATISFY an expected "self-host" is a release older than
+  // FIRST_RELEASE_WITH_EDITION — see assertEditionAbsenceIsLegacySelfHost.
   edition?: unknown;
   signingIdentity?: unknown;
   signingTeamId?: unknown;
@@ -131,8 +183,36 @@ type ReleaseArtifactManifest = {
   // BYO signing (Deliverable 1): the release's peeled source commit SHA,
   // recorded so downstream signing workflows can pin their checkout.
   sourceCommit?: unknown;
+  // Server-only hotfix releases (additive, top-level; absent ⇒ "full"). A
+  // server-only release rebuilds only the server images and carries a previous
+  // full release's agent binaries forward: binariesRelease names that release,
+  // binariesSourceCommit its source commit, carriedImages the carried image
+  // digests. Read only through verifyReleaseArtifactManifestIdentity, after the
+  // signature has verified.
+  releaseKind?: unknown;
+  binariesRelease?: unknown;
+  binariesSourceCommit?: unknown;
+  carriedImages?: unknown;
   assets?: unknown;
 };
+
+export type ReleaseKind = "full" | "server-only";
+
+export type VerifiedManifestIdentity = {
+  release: string;
+  repository: string;
+  /** The manifest's source commit; null on manifests predating the field. */
+  sourceCommit: string | null;
+  /** "full" when the manifest carries no releaseKind. */
+  releaseKind: ReleaseKind;
+  /** Server-only only: the full release whose agent binaries this release carries. */
+  binariesRelease?: string;
+  /** Server-only only: that full release's source commit (40-hex). */
+  binariesSourceCommit?: string;
+};
+
+const STABLE_RELEASE_TAG = /^v\d+\.\d+\.\d+$/;
+const FULL_COMMIT_SHA = /^[0-9a-f]{40}$/;
 
 type SelectedReleaseArtifactManifestAsset = ReleaseArtifactManifestAsset & {
   sha256: string;
@@ -156,11 +236,29 @@ function readMacosPublisher(
   entry: ReleaseArtifactManifestAsset,
   assetName: string,
   required: boolean,
+  release: string,
 ): { signingIdentity: string | null; signingTeamId: string | null } {
   const identity = entry.signingIdentity;
   const teamId = entry.signingTeamId;
-  if (identity === undefined && teamId === undefined && !required) {
-    return { signingIdentity: null, signingTeamId: null };
+  if (identity === undefined && teamId === undefined) {
+    if (!required) return { signingIdentity: null, signingTeamId: null };
+    // A genuine manifest from before the pipeline recorded the publisher
+    // (#7830). The pin is a security control — install.sh checks the pkg's
+    // signature against exactly this identity before a privileged install —
+    // so there is nothing to fall back to; tell the operator which release
+    // carries it instead of reporting the manifest as invalid.
+    if (releasePredates(release, FIRST_RELEASE_WITH_MACOS_PUBLISHER)) {
+      throw new ReleaseManifestTooOldError({
+        message:
+          `The signed release manifest for ${release} predates the macOS publisher identity for ${assetName} ` +
+          `(first recorded in ${FIRST_RELEASE_WITH_MACOS_PUBLISHER}), so the package cannot be served. ` +
+          `Set BINARY_VERSION to ${FIRST_RELEASE_WITH_MACOS_PUBLISHER} or later.`,
+        release,
+        minimumRelease: FIRST_RELEASE_WITH_MACOS_PUBLISHER,
+      });
+    }
+    // Otherwise (a release that should carry the identity, or a tag that
+    // cannot be ordered): fall through to the generic invalid-identity refusal.
   }
   if (
     typeof identity !== "string" ||
@@ -427,7 +525,12 @@ export async function verifyReleaseArtifactBuffer(args: {
 
   const actualSha256 = sha256Hex(args.assetBuffer);
   assertSha256Equal(actualSha256, entry.sha256, args.assetName);
-  const publisher = readMacosPublisher(entry, args.assetName, args.requireMacosPublisher === true);
+  const publisher = readMacosPublisher(
+    entry,
+    args.assetName,
+    args.requireMacosPublisher === true,
+    manifest.release as string,
+  );
 
   return {
     assetName: args.assetName,
@@ -457,6 +560,53 @@ function readIntendedUse(entry: { intendedUse?: unknown }, assetName: string): s
     );
   }
   return entry.intendedUse;
+}
+
+/**
+ * Called only when the entry's edition differs from the caller's expectation.
+ * Returns (accepts) in exactly one case: the entry has NO edition, the caller
+ * expects "self-host", the manifest's release predates the edition field, AND
+ * the caller pinned exactly that release (#7830). The pin requirement keeps
+ * the old incidental downgrade guard for everyone else: an unpinned ("latest")
+ * or local-volume fetch never pins a release, so a replayed — genuinely signed
+ * — pre-v0.105.0 manifest is still refused there rather than silently rolling
+ * the fleet back to an old build. Every official release before v0.105.0 was
+ * the public self-host
+ * build — the hosted edition did not exist until the field did — so for those
+ * manifests the absence carries no information and refusing it made every
+ * installer unreachable for a self-hoster pinning BINARY_VERSION below
+ * v0.105.0. The verified result still reports `edition: null`: nothing
+ * downstream (e.g. assertDistributableReleaseAsset's unsigned-MSI relaxation)
+ * may read a claim into a manifest that made none. A missing edition is never
+ * read as "hosted", and on a release that should carry the field it is refused.
+ */
+function assertEditionAbsenceIsLegacySelfHost(args: {
+  assetName: string;
+  release: string;
+  edition: unknown;
+  expectedEdition: string;
+  pinnedRelease: string | null;
+}): void {
+  const mismatch = `Release artifact manifest edition mismatch for ${args.assetName}: expected ${args.expectedEdition}, got ${String(args.edition)}`;
+  if (args.edition !== undefined) {
+    throw new ReleaseAssetNotDistributableError(mismatch);
+  }
+  if (args.expectedEdition === EDITION_SELF_HOST) {
+    if (releasePredates(args.release, FIRST_RELEASE_WITH_EDITION)) {
+      if (args.pinnedRelease === args.release) return;
+      throw new ReleaseAssetNotDistributableError(
+        `${mismatch} — the signed manifest for ${args.release} predates the edition field (first recorded in ${FIRST_RELEASE_WITH_EDITION}). ` +
+          `A release that old is served only when BINARY_VERSION pins it explicitly; otherwise use ${FIRST_RELEASE_WITH_EDITION} or later.`,
+      );
+    }
+    throw new ReleaseAssetNotDistributableError(
+      `${mismatch} — the signed manifest for ${args.release} records no edition, but every official release since ${FIRST_RELEASE_WITH_EDITION} does, ` +
+        `so its absence here is refused rather than assumed`,
+    );
+  }
+  throw new ReleaseAssetNotDistributableError(
+    `${mismatch} — the signed manifest for ${args.release} records no edition, and a missing edition is never treated as ${args.expectedEdition}`,
+  );
 }
 
 function selectManifestAsset(args: {
@@ -547,9 +697,15 @@ function selectManifestAsset(args: {
     );
   }
   if (args.expectedEdition && entry.edition !== args.expectedEdition) {
-    throw new ReleaseAssetNotDistributableError(
-      `Release artifact manifest edition mismatch for ${args.assetName}: expected ${args.expectedEdition}, got ${String(entry.edition)}`,
-    );
+    assertEditionAbsenceIsLegacySelfHost({
+      assetName: args.assetName,
+      release: manifest.release as string,
+      edition: entry.edition,
+      expectedEdition: args.expectedEdition,
+      // Asserted equal to manifest.release above, so this is "the operator
+      // explicitly pinned exactly this signed release".
+      pinnedRelease: args.expectedRelease ?? null,
+    });
   }
 
   return {
@@ -579,7 +735,12 @@ export async function verifyReleaseArtifactManifestAsset(args: {
     expectedPlatformTrust: args.expectedPlatformTrust,
     expectedEdition: args.expectedEdition,
   });
-  const publisher = readMacosPublisher(entry, args.assetName, args.requireMacosPublisher === true);
+  const publisher = readMacosPublisher(
+    entry,
+    args.assetName,
+    args.requireMacosPublisher === true,
+    manifest.release as string,
+  );
   return {
     assetName: args.assetName,
     sha256: entry.sha256,
@@ -614,7 +775,78 @@ export function verifyReleaseArtifactManifestIntegrity(
   };
 }
 
-async function fetchSmallBuffer(url: string, label: string): Promise<Buffer> {
+/**
+ * Verifies a release manifest's signature and identity, then reports what kind
+ * of release it describes. The order is the contract: nothing in the manifest —
+ * least of all releaseKind/binariesRelease, which a caller may FOLLOW to another
+ * release — is read before the signature verifies and the manifest is bound to
+ * the expected repository (case-insensitive, as GitHub routes) and release tag.
+ *
+ * Full manifests (releaseKind absent or "full") are accepted exactly as the
+ * per-asset verifier accepts them; sourceCommit is reported but not required,
+ * since manifests predating the field are still valid full releases.
+ */
+export function verifyReleaseArtifactManifestIdentity(args: {
+  manifestBytes: Buffer;
+  signatureBytes: Buffer;
+  expectedRepository: string;
+  expectedRelease: string;
+}): VerifiedManifestIdentity {
+  verifyManifestSignature(args.manifestBytes, args.signatureBytes);
+  const manifest = parseManifest(args.manifestBytes);
+  const repository = manifest.repository as string;
+  if (repository.toLowerCase() !== args.expectedRepository.toLowerCase()) {
+    throw new ReleaseManifestAssetLookupError(
+      `Release artifact manifest repository mismatch: expected ${args.expectedRepository}, got ${repository}`,
+    );
+  }
+  assertStringEqual(manifest.release, args.expectedRelease, "release");
+  const release = manifest.release as string;
+  const sourceCommit =
+    typeof manifest.sourceCommit === "string" ? manifest.sourceCommit : null;
+
+  const kind = manifest.releaseKind ?? "full";
+  if (kind === "full") {
+    return { release, repository, sourceCommit, releaseKind: "full" };
+  }
+  if (kind !== "server-only") {
+    throw new ReleaseManifestAssetLookupError(
+      `Release artifact manifest for ${release} has an unknown releaseKind ${JSON.stringify(kind)}`,
+    );
+  }
+  const { binariesRelease, binariesSourceCommit } = manifest;
+  if (
+    typeof binariesRelease !== "string" ||
+    !STABLE_RELEASE_TAG.test(binariesRelease) ||
+    binariesRelease === release
+  ) {
+    throw new ReleaseManifestAssetLookupError(
+      `Server-only release manifest for ${release} has an invalid binariesRelease ${JSON.stringify(binariesRelease)}`,
+    );
+  }
+  if (
+    typeof binariesSourceCommit !== "string" ||
+    !FULL_COMMIT_SHA.test(binariesSourceCommit)
+  ) {
+    throw new ReleaseManifestAssetLookupError(
+      `Server-only release manifest for ${release} has an invalid binariesSourceCommit ${JSON.stringify(binariesSourceCommit)}`,
+    );
+  }
+  return {
+    release,
+    repository,
+    sourceCommit,
+    releaseKind: "server-only",
+    binariesRelease,
+    binariesSourceCommit,
+  };
+}
+
+async function fetchSmallBuffer(
+  url: string,
+  label: string,
+  signal?: AbortSignal,
+): Promise<Buffer> {
   // A naive `redirect: "follow"` on verification inputs was an SSRF bypass
   // (#3649): a trusted URL could redirect into private space. The guarded
   // helper re-validates and pins every hop before it is dialed. `maxBytes`
@@ -622,6 +854,7 @@ async function fetchSmallBuffer(url: string, label: string): Promise<Buffer> {
   // overrun rather than the body being buffered and measured afterwards.
   const resp = await safeFetchFollowingRedirects(url, {
     maxBytes: MAX_MANIFEST_BYTES,
+    ...(signal ? { signal } : {}),
   });
   if (!resp.ok) {
     throw new Error(`Failed to fetch ${label}: ${resp.status}`);
@@ -694,6 +927,8 @@ export async function fetchVerifiedGithubReleaseArtifact(args: {
   expectedEdition?: string;
   requireMacosPublisher?: boolean;
   maxAssetBytes: number;
+  /** Aborts the manifest, signature and asset fetches (e.g. AbortSignal.timeout). */
+  signal?: AbortSignal;
 }): Promise<{ buffer: Buffer; verified: VerifiedReleaseArtifact }> {
   if (!isReleaseArtifactManifestVerificationConfigured()) {
     throw new Error(
@@ -702,10 +937,11 @@ export async function fetchVerifiedGithubReleaseArtifact(args: {
   }
 
   const [manifestBytes, signatureBytes] = await Promise.all([
-    fetchSmallBuffer(args.manifestUrl, "release artifact manifest"),
+    fetchSmallBuffer(args.manifestUrl, "release artifact manifest", args.signal),
     fetchSmallBuffer(
       args.signatureUrl,
       "release artifact manifest Ed25519 signature",
+      args.signal,
     ),
   ]);
   const selected = await verifyReleaseArtifactManifestAsset({
@@ -726,6 +962,7 @@ export async function fetchVerifiedGithubReleaseArtifact(args: {
 
   const response = await safeFetchFollowingRedirects(args.assetUrl, {
     maxBytes: selected.size,
+    ...(args.signal ? { signal: args.signal } : {}),
   });
   if (!response.ok) {
     throw new Error(`Failed to fetch release artifact ${args.assetName}: ${response.status}`);
@@ -743,6 +980,43 @@ export async function fetchVerifiedGithubReleaseArtifact(args: {
     requireMacosPublisher: args.requireMacosPublisher,
   });
   return { buffer, verified };
+}
+
+/**
+ * Fetches and signature-verifies ONLY the manifest pair (a few KB) and returns
+ * the verified entry for one asset, without downloading the asset itself.
+ * Lets a cache refresher compare the signed sha256 against what it already
+ * holds and skip the (up to 128 MiB) body download when nothing changed.
+ */
+export async function peekVerifiedGithubReleaseArtifact(args: {
+  assetName: string;
+  manifestUrl: string;
+  signatureUrl: string;
+  expectedRepository?: string;
+  expectedRelease?: string | null;
+  expectedPlatformTrust?: string;
+  expectedEdition?: string;
+  requireMacosPublisher?: boolean;
+}): Promise<VerifiedReleaseArtifact> {
+  if (!isReleaseArtifactManifestVerificationConfigured()) {
+    throw new Error(
+      "Release artifact manifest public key is required for privileged installer downloads",
+    );
+  }
+  const [manifestBytes, signatureBytes] = await Promise.all([
+    fetchSmallBuffer(args.manifestUrl, "release artifact manifest"),
+    fetchSmallBuffer(args.signatureUrl, "release artifact manifest Ed25519 signature"),
+  ]);
+  return verifyReleaseArtifactManifestAsset({
+    assetName: args.assetName,
+    manifestBytes,
+    signatureBytes,
+    expectedRepository: args.expectedRepository,
+    expectedRelease: args.expectedRelease,
+    expectedPlatformTrust: args.expectedPlatformTrust,
+    expectedEdition: args.expectedEdition,
+    requireMacosPublisher: args.requireMacosPublisher,
+  });
 }
 
 export async function verifyGithubReleaseArtifactBuffer(args: {

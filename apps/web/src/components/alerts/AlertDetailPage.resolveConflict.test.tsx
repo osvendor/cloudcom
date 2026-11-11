@@ -53,7 +53,7 @@ const resolvedAlert = { ...openAlert, status: 'resolved', resolvedAt: '2026-08-2
 function mockRaceLostThenRefetch() {
   let alertReads = 0;
   fetchWithAuth.mockImplementation((url: string, init?: { method?: string }) => {
-    if (url.endsWith('/tickets')) {
+    if (url.endsWith('/tickets') || url.endsWith('/external-tickets')) {
       return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ data: [] }) });
     }
     if (init?.method === 'POST' && url.endsWith('/resolve')) {
@@ -78,7 +78,7 @@ function mockRaceLostThenRefetch() {
  */
 function mockPlainServerError() {
   fetchWithAuth.mockImplementation((url: string, init?: { method?: string }) => {
-    if (url.endsWith('/tickets')) {
+    if (url.endsWith('/tickets') || url.endsWith('/external-tickets')) {
       return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ data: [] }) });
     }
     if (init?.method === 'POST' && url.endsWith('/resolve')) {
@@ -95,7 +95,7 @@ function mockPlainServerError() {
 const countAlertReads = () =>
   fetchWithAuth.mock.calls.filter(
     ([url, init]) => typeof url === 'string' && url.includes(ALERT_ID)
-      && !url.endsWith('/tickets') && (init as { method?: string } | undefined)?.method !== 'POST'
+      && !url.endsWith('/tickets') && !url.endsWith('/external-tickets') && (init as { method?: string } | undefined)?.method !== 'POST'
   ).length;
 
 beforeEach(() => {
@@ -152,5 +152,33 @@ describe('AlertDetailPage — losing the resolve race', () => {
 
     // ...and there is nothing fresher to fetch: exactly the mount-time read.
     expect(countAlertReads()).toBe(1);
+  });
+});
+
+// #7215: write actions are now gated on the caller's permissions. These suites
+// exercise the actions themselves, so grant everything; the role-aware
+// behaviour is covered in the *.permissions.test.tsx suites.
+vi.mock('../../lib/permissions', () => ({
+  usePermissions: () => ({ permissions: [], can: () => true }),
+  hasPermission: () => true,
+}));
+
+describe('AlertDetailPage — resolve request body (#9622)', () => {
+  it('POSTs a JSON body so the API validator does not 400 on an empty body', async () => {
+    mockRaceLostThenRefetch();
+    render(<AlertDetailPage alertId={ALERT_ID} />);
+
+    await userEvent.click(await screen.findByRole('button', { name: /resolve/i }));
+
+    await waitFor(() => {
+      const call = fetchWithAuth.mock.calls.find(
+        ([url, init]) => typeof url === 'string' && url.endsWith('/resolve')
+          && (init as { method?: string } | undefined)?.method === 'POST'
+      );
+      expect(call).toBeDefined();
+      const body = (call![1] as { body?: unknown }).body;
+      expect(typeof body).toBe('string');
+      expect(JSON.parse(body as string)).toEqual({ note: '' });
+    });
   });
 });

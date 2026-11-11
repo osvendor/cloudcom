@@ -23,11 +23,15 @@ import { aiQueueCommandForExecution } from './aiDispatch';
 import { resolveBackupConfigForDevice } from './featureConfigResolver';
 import { deviceSiteDenied, deviceIdSiteDenied, resolveSiteAllowedDeviceIds, runFrozenDeviceIds } from './aiToolsSiteScope';
 import { loadSnapshotWithSiteAccess } from './aiToolsBackupShared';
+import { authorizeAiRestore } from './aiToolsRestoreAuthorization';
 import {
   resolveBackupWriteCommandDestination,
   resolveBackupProviderConfig,
   resolveBackupDestinationError,
 } from './backupProviderConfig';
+import { backupReadCredentialPayload, backupWriteCredentialPayload } from './backupCommandCredentials';
+import { normalizeStorageIdentity } from '../jobs/backupRetention';
+import { restoreIntegrityRefusalForActor } from './backupRestoreActorGate';
 
 function getOrgId(auth: AuthContext): string | null {
   return auth.orgId ?? auth.accessibleOrgIds?.[0] ?? null;
@@ -338,6 +342,10 @@ export function registerMssqlTools(aiTools: Map<string, AiTool>): void {
           status: 'pending',
           type: 'manual',
           backupType: 'database',
+          // Stamped at creation, as the backup worker does at dispatch: the snapshot
+          // persisted from this job copies it, and restores of that snapshot are
+          // only served through a storage session when it is present.
+          storageIdentity: normalizeStorageIdentity(destination.provider, destination.providerConfig),
           createdAt: new Date(),
           updatedAt: new Date(),
         })
@@ -351,9 +359,8 @@ export function registerMssqlTools(aiTools: Map<string, AiTool>): void {
         {
           backupJobId: backupJob?.id,
           configId: resolvedConfig.configId,
-          provider: destination.provider,
-          providerConfig: destination.providerConfig,
-          storageEncryption: destination.storageEncryption,
+          // A reference only: resolved when the command is delivered.
+          ...backupWriteCredentialPayload(resolvedConfig.configId, device.orgId, destination),
           instance,
           database,
           backupType,
@@ -447,6 +454,13 @@ export function registerMssqlTools(aiTools: Map<string, AiTool>): void {
       const snapshotResult = await loadSnapshotWithSiteAccess(auth, snapshotId);
       if ('error' in snapshotResult) return JSON.stringify({ error: snapshotResult.error });
       const snapshot = snapshotResult.snapshot;
+      // The target must be in the snapshot's org (a multi-org caller can reach
+      // both), and a target at another site than the backup source needs
+      // backup:cross_site_restore — the same check as POST /backup/mssql/restore.
+      const restoreAuthorization = await authorizeAiRestore(auth, { snapshot, targetDeviceId: deviceId });
+      if (!restoreAuthorization.ok) {
+        return JSON.stringify({ error: restoreAuthorization.error, ...(restoreAuthorization.code ? { code: restoreAuthorization.code } : {}) });
+      }
 
       const metadata =
         snapshot.metadata && typeof snapshot.metadata === 'object' && !Array.isArray(snapshot.metadata)
@@ -478,6 +492,15 @@ export function registerMssqlTools(aiTools: Map<string, AiTool>): void {
         return JSON.stringify({ error: message });
       }
 
+      // Integrity: an AI agent can only restore an attested snapshot.
+      const integrityRefusal = await restoreIntegrityRefusalForActor({
+        snapshotDbId: snapshot.id,
+        targetDeviceId: deviceId,
+        commandType: CommandTypes.MSSQL_RESTORE,
+        actor: 'ai_agent',
+      });
+      if (integrityRefusal) return JSON.stringify({ error: integrityRefusal.message, code: integrityRefusal.code });
+
       const { command, error } = await aiQueueCommandForExecution(
         auth,
         'restore_mssql_database',
@@ -497,8 +520,7 @@ export function registerMssqlTools(aiTools: Map<string, AiTool>): void {
           backupFileName,
           targetDatabase,
           noRecovery: Boolean(input.noRecovery),
-          provider: backupProviderConfig.provider,
-          providerConfig: backupProviderConfig.providerConfig,
+          ...backupReadCredentialPayload(snapshot.configId!, snapshot.orgId, backupProviderConfig.provider),
         },
         { userId: auth.user?.id }
       );
@@ -522,7 +544,8 @@ export function registerMssqlTools(aiTools: Map<string, AiTool>): void {
   // ============================================
 
   registerTool({
-    tier: 2,
+    // W03 (#6757): tier 3 supervised — queues MSSQL_VERIFY on the device.
+    tier: 3,
     domain: 'backup',
     searchHint: 'Microsoft SQL Server backup snapshot verification',
     definition: {
@@ -612,8 +635,7 @@ export function registerMssqlTools(aiTools: Map<string, AiTool>): void {
             ),
           snapshotId: snapshot.providerSnapshotId,
           backupFileName,
-          provider: backupProviderConfig.provider,
-          providerConfig: backupProviderConfig.providerConfig,
+          ...backupReadCredentialPayload(snapshot.configId!, snapshot.orgId, backupProviderConfig.provider),
         },
         { userId: auth.user?.id }
       );

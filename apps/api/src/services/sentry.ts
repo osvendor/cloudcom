@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import * as Sentry from '@sentry/node';
 import type { Context } from 'hono';
 import { API_VERSION } from '../version';
@@ -6,6 +7,7 @@ import { pgErrorCode } from '../utils/pgErrors';
 // edge. See setConnectTimeoutClassifier below for why that matters.
 import type { ConnectTimeoutDiagnosis } from './postgresConnectTimeout';
 import {
+  TUNNEL_HOST_ROUTE_LABEL,
   UNMATCHED_ROUTE_LABEL,
   safeMatchedRouteLabel,
 } from './safeRequestLabel';
@@ -58,9 +60,25 @@ const ALLOWED_TAG_NAMES = new Set([
   'user_id',
   'scope',
   'org_id',
+  // Sourced alert ownership: a bounded kind and the local workload row UUID.
+  'ownerKind',
+  'ownerRef',
   'partner_id',
+  'psa_connection_id',
+  'psa_provider',
   'stripe_reconcile_stage',
-  // SEC-150: which phase of Checkout-session revocation produced the alert —
+  // Restore-point ledger ingest (#4757): a closed set of literals written at
+  // fixed call sites ('tenant_mismatch', 'write_failed', 'call_site'); never an id.
+  'restore_point_ingest',
+  // Autopay failures: local row UUIDs and bounded enum/phase labels only.
+  'billing_notice_id',
+  'billing_notice_kind',
+  'autopay_method_id',
+  'autopay_phase',
+  'attempt_id',
+  'schedule_id',
+  'return_identity',
+  // Which phase of Checkout-session revocation produced the alert —
   // 'request' (intent/sibling request), 'expire' (the sweep's provider call),
   // 'blocked' (terminal-unrepaired) or 'charged_repair' (the session was paid
   // after we asked for it to die). A closed four-value set of string literals
@@ -112,6 +130,13 @@ const ALLOWED_TAG_NAMES = new Set([
   // (DB_POOL_HEALTH_VERDICTS plus the `check-failed` self-report); carries no
   // tenant, device, or host identifier.
   'db_pool_health_verdict',
+  // #6452: the Redis memory watchdog's used_memory/maxmemory ratio, rounded to
+  // a whole percent. `scrubEvent` deletes `message`, `logentry` and `extra`
+  // from every event, so without this the alert would say only "Redis memory
+  // is high" with no number attached — the thing an operator actually needs to
+  // decide how urgent raising REDIS_MAXMEMORY is. Bounded 0-100 (int), carries
+  // no tenant, device, or host identifier.
+  'redis_memory_ratio',
   // #3517: the global body-limit gate's 413s carry the carve-out RULE that
   // matched and its configured byte ceiling. `body_limit_rule` is the closed
   // `BodyLimitRule` union (middleware/bodyLimit.ts) and `body_limit_max_size` is
@@ -200,6 +225,10 @@ const ALLOWED_TAG_NAMES = new Set([
   // per-job counter — unbounded by construction, exactly the high-cardinality
   // tag the captureMessage doc comment warns against.
   'worker',
+  // oauth/log.ts: a closed set of ERROR_IDS constants. Its doc says Sentry
+  // groups OAuth warnings by this tag; until it was listed here every one of
+  // them collapsed into a single "Error: [redacted]" issue (BREEZE-4D).
+  'errorId',
   // Set by fix/sentry-worker-job-failures (#3912), which deliberately does not
   // touch this file. Inert until that lands — an allowlist entry only ever
   // preserves a tag something else sets, so listing it early cannot leak
@@ -218,6 +247,14 @@ const ALLOWED_TAG_NAMES = new Set([
   // into unbounded tag cardinality. Neither carries a tenant, device or job id.
   'patch_reconcile_stage',
   'patch_reconcile_repeat',
+  // #9632: closest-wins patch scheduling. `patch_scheduler_stage` is a closed
+  // 2-value set (closest_wins_resolve_failed | closest_wins_winner_unschedulable)
+  // and `update_ring_stage` a closed 1-value set (device_count_failed), all
+  // string literals at fixed call sites in jobs/patchSchedulerWorker.ts and
+  // routes/updateRingsHelpers.ts. No policy, ring, tenant or device id: those
+  // stay in the console line next to each capture.
+  'patch_scheduler_stage',
+  'update_ring_stage',
   // #4137: `dispatch-backup` is a one-shot (`attempts: 1`) because Phase 3 of
   // processDispatchBackup commits per-target child `backup_jobs` rows, so a
   // retry duplicates them. Two consequences of that trade are things an
@@ -230,6 +267,13 @@ const ALLOWED_TAG_NAMES = new Set([
   // provably-unsent rows failed, so they wait on the stale reaper instead).
   // Carries no tenant, device or job identifier.
   'backup_dispatch_issue',
+  // #8022: why a device command dispatch was refused, as the closed
+  // `CommandDispatchRefusal` union (services/commandQueue.ts) — the dispatch
+  // seam's refusal codes plus 'cancelled' — or the literal 'unclassified'.
+  // The refusal's `error` text interpolates ids and never reaches Sentry, so
+  // without this tag a refusal report carries no reason at all.
+  // Carries no tenant, device or command identifier.
+  'command_dispatch_refusal',
   // These were being passed to captureMessage and silently dropped — the same
   // defect as `worker`, found by auditing every tag key against this list
   // rather than trusting that a passed tag arrives.
@@ -254,6 +298,11 @@ const ALLOWED_TAG_NAMES = new Set([
   // ingestion path reported the result. Not redundant with `event_code`: the
   // same drop can arrive from either path and they fail for different reasons.
   'backup_result_source',
+  // #3530: which command-result handler swallowed a failure after its command
+  // row was already terminal. Closed set of literals from
+  // services/commandResultHandlers.ts ('sensitive_data_result', 'cis_result',
+  // 'discovery_mark_failed'); command/agent IDs stay out by design.
+  'command_result_phase',
   // BREEZE-A/#3218: the derived `${file}.${fn}` attribution for a held DB
   // context. Structurally bounded — parseOpenerFrame builds it from a matched
   // stack frame's source basename and stripped function name, and deliberately
@@ -300,7 +349,7 @@ const ALLOWED_TAG_NAMES = new Set([
   // thousand. Cardinality is bounded in practice by the throttle: at most one
   // event per outage.
   'llm_egress_dropped',
-  // SEC-142/143: WHICH reservation TTL the expiry sweep fired on. A closed
+  // WHICH AI budget reservation TTL the expiry sweep fired on. A closed
   // two-literal union produced by the sweep's own arithmetic (`active_ttl` /
   // `indeterminate_ttl`) — no org, reservation or amount can reach it; those go
   // only to the console lines, which are not scrubbed. Allowlisted because
@@ -391,7 +440,8 @@ const ALLOWED_TAG_NAMES = new Set([
   // AccountingPaymentPushErrorCode union (never the error's message, which
   // interpolates provider text), `accounting_trigger` is the reconcile job's
   // trigger union (webhook | sweep | manual), `accounting_reconcile_phase` is
-  // two literals in the sweep, and `accounting_audit_action` is the
+  // three literals in the sweep (its two passes plus sweep.reapPendingTenants),
+  // and `accounting_audit_action` is the
   // `accounting.payment.*` audit actions — the push path's (pushed | deleted |
   // delete_unresolved | orphan_retained) plus the pull path's (pulled |
   // reversed | adopted | diverged | removed_remotely, #5126).
@@ -429,7 +479,9 @@ const ALLOWED_TAG_NAMES = new Set([
   // unexpected Graph failure (graph_response_invalid, graph_request_timeout,
   // graph_transport_failed, graph_license_required, graph_not_found,
   // graph_response_too_large, the refusal codes) degraded silently to
-  // `last_status='error'` with no alert. `m365_sync_domain` is the closed
+  // `last_status='error'` with no alert. (#9394 later took graph_request_timeout
+  // out of that set: it is retried on the BullMQ ladder and, if it outlasts it,
+  // recorded on the row as `error` without a per-run Sentry event.) `m365_sync_domain` is the closed
   // `M365SyncDomain` union and `m365_sync_failure_code` is the closed
   // `M365SyncCallFailureCode` union — both string-literal unions from
   // services/m365Sync/types.ts / m365ControlPlane/readActionService.ts, never
@@ -437,7 +489,69 @@ const ALLOWED_TAG_NAMES = new Set([
   // tenant; neither new tag carries a vault ref, credential, or tenant secret.
   'm365_sync_domain',
   'm365_sync_failure_code',
+  // W03 AI model registry (#7601, PR #7700 review S1/S2/S4): a billing-path
+  // failure (unrecorded settlement, failed agent-run settlement, an
+  // unreserved credit debit that did not land) is only recoverable if the
+  // operator can find the row. `scrubEvent` deletes message/extra, so the ids
+  // must ride as tags. Record-scoped opaque UUIDs, the same precedent as
+  // `invoice_id` / `accounting_mapping_id` above — never free text:
+  // `ai_reservation_id` = ai_budget_reservations.id, `ai_invocation_id` = the
+  // first ai_invocations.id of the call (the debit's idempotency key suffix),
+  // `ai_agent_run_id` = ai_agent_runs.id.
+  'ai_reservation_id',
+  'ai_invocation_id',
+  'ai_agent_run_id',
+  // #9451 / #7717: the keyed credit debit outbox. `ai_credit_debit_id` =
+  // ai_credit_debits.id (opaque UUID, what /admin/ai-billing re-drives by);
+  // `ai_credit_debit_source` is the enum 'compute' | 'invocation'. The two
+  // counts are the sweep's operator-backlog alert: small integers.
+  // (three counts: failed debits, dead settlements, stale undelivered debits)
+  'ai_credit_debit_id',
+  'ai_credit_debit_source',
+  'ai_failed_credit_debits',
+  'ai_dead_pending_settlements',
+  'ai_stale_undelivered_credit_debits',
+  // AI chargeback W10 (#7608): the UTC billing month ('YYYY-MM-01') of a
+  // monthly close that failed or found expired usage — with `org_id`, the key
+  // an operator needs to find the ai_usage_charge_runs slot. A date, one value
+  // per month, written only by jobs/aiChargebackWorker.ts. Named specifically
+  // rather than `period_start` for the same reason as the mobile pair above:
+  // the allowlist is keyed by NAME.
+  'ai_charge_period_start',
+  // Tool Catalog W04 (#5219): the flow runner. Every flow capture carries the
+  // run it is about, because `scrubEvent` deletes message/extra and a flow
+  // failure with no ids cannot be found again. `flow_id` = flows.id and
+  // `flow_run_id` = flow_runs.id are local row UUIDs (the `schedule_id` /
+  // `attempt_id` precedent); `flow_site` is a hardcoded string literal at each
+  // call site (e.g. 'reconciler.enqueue', 'runEvents.publish'), the
+  // `cas_label` precedent. None carries free text, a device or host id.
+  'flow_id',
+  'flow_run_id',
+  'flow_site',
 ]);
+// Isolation diagnostics carry only local UUIDs and closed server labels. Keep the generic
+// names unavailable to unrelated callers, and never admit report paths or agent prose.
+const ISOLATION_DIAGNOSTIC_PHASES = new Set([
+  'isolation_heartbeat_block', 'isolation_report_dropped', 'isolation_allowlist_fallback',
+  'isolation_result_ignored', 'isolation_verify_tamper', 'isolation_secret_unavailable',
+  'isolation_outcome_publish',
+]);
+const ISOLATION_DIAGNOSTIC_REASONS = new Set([
+  'stdout_missing', 'stdout_oversize', 'stdout_not_json', 'identity_schema',
+  'identity_mismatch', 'episode_mismatch', 'transport_timeout',
+]);
+const ISOLATION_UUID_TAGS = new Set(['deviceId', 'isolationId', 'incidentId', 'incidentActionId', 'commandId', 'agentId']);
+const LOCAL_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function isIsolationDiagnosticTag(key: string, value: unknown, tags: Record<string, unknown> | undefined): boolean {
+  if (!(typeof tags?.phase === 'string' && ISOLATION_DIAGNOSTIC_PHASES.has(tags.phase))
+    && !(typeof tags?.isolationId === 'string' && LOCAL_UUID.test(tags.isolationId))) return false;
+  if (typeof value !== 'string') return false;
+  if (ISOLATION_UUID_TAGS.has(key)) return LOCAL_UUID.test(value);
+  if (key === 'phase') return ISOLATION_DIAGNOSTIC_PHASES.has(value);
+  if (key === 'reason') return ISOLATION_DIAGNOSTIC_REASONS.has(value);
+  if (key === 'source') return value === 'configuration' || value === 'builder';
+  return false;
+}
 const UNSAFE_TAG_CHARACTERS = /[/?#\r\n]/;
 const SAFE_STRUCTURAL_NAME = /^[A-Za-z_$<][A-Za-z0-9_.$<>:[\] ]{0,127}$/;
 
@@ -448,7 +562,7 @@ function isBoundedTagValue(value: unknown): value is string | number | boolean {
 }
 
 function isSafeRouteTemplateTag(value: unknown): value is string {
-  if (value === UNMATCHED_ROUTE_LABEL) return true;
+  if (value === UNMATCHED_ROUTE_LABEL || value === TUNNEL_HOST_ROUTE_LABEL) return true;
   if (typeof value !== 'string') return false;
   const c = { req: { routePath: value } } as unknown as Context;
   return safeMatchedRouteLabel(c) === value;
@@ -459,7 +573,7 @@ function pickAllowedTags(
 ): Record<string, string | number | boolean> {
   const picked: Record<string, string | number | boolean> = {};
   for (const [key, value] of Object.entries(tags ?? {})) {
-    if (!ALLOWED_TAG_NAMES.has(key)) continue;
+    if (!ALLOWED_TAG_NAMES.has(key) && !isIsolationDiagnosticTag(key, value, tags)) continue;
     if (key === 'route_template') {
       if (isSafeRouteTemplateTag(value)) picked[key] = value;
       continue;
@@ -535,7 +649,7 @@ function setCallerTags(
 ): void {
   for (const [key, value] of Object.entries(tags ?? {})) {
     if (
-      ALLOWED_TAG_NAMES.has(key) &&
+      (ALLOWED_TAG_NAMES.has(key) || isIsolationDiagnosticTag(key, value, tags)) &&
       key !== 'route_template' &&
       isBoundedTagValue(value)
     ) {
@@ -637,6 +751,83 @@ export function sentryBreezeRoleTag(): 'all' | 'api' | 'worker' {
   return 'all';
 }
 
+/**
+ * Group key for the outbound event throttle. Built from the SCRUBBED event:
+ * exception values are all '[redacted]', so the throw site (type plus the
+ * full stack, transaction and route) and the bounded discriminator tags are what tell two
+ * failures apart. Exported for test.
+ */
+export function eventThrottleSignature(event: Record<string, any>): string {
+  const fingerprint = Array.isArray(event.fingerprint) ? event.fingerprint.filter((p: unknown) => p !== '{{ default }}') : [];
+  if (fingerprint.length) return `fp:${fingerprint.join('|')}`;
+  const tags = event.tags ?? {};
+  const parts: string[] = [
+    String(event.level ?? 'error'), String(tags.event_code ?? ''), String(tags.worker ?? ''), String(tags.errorId ?? ''),
+    String(event.transaction ?? ''), String(tags.route_template ?? ''),
+  ];
+  for (const value of Array.isArray(event.exception?.values) ? event.exception.values : []) {
+    // ALL frames, not just the innermost: a PostgresError / DrizzleQueryError has the
+    // same innermost frames for every DB failure in the process, so the callers are
+    // what separate unrelated errors. Still stable for a true storm (same stack).
+    const frames: Record<string, unknown>[] = Array.isArray(value?.stacktrace?.frames) ? value.stacktrace.frames : [];
+    parts.push(
+      String(value?.type ?? ''),
+      normalizeThrottleMessage(value?.value),
+      ...frames.map(f => `${f.function ?? '?'}:${f.lineno ?? ''}:${f.colno ?? ''}`),
+    );
+  }
+  // Hash so the key stays small however long the stack or transaction name is.
+  return createHash('sha1').update(parts.join('\u0000')).digest('hex');
+}
+
+/** Collapse ids so a storm with varying values still shares one key. */
+function normalizeThrottleMessage(raw: unknown): string {
+  if (typeof raw !== 'string') return '';
+  return raw
+    .replace(/"[^"]*"|'[^']*'/g, '?')
+    .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, '?')
+    .replace(/\d+/g, '?');
+}
+
+/**
+ * Process-wide safety net under every error event, after scrubbing. Call sites
+ * are expected to bound themselves (see sentryThrottle.ts), but one that does
+ * not — a worker capturing a permanent failure on a 2 s tick — burned the
+ * monthly error quota in days (BREEZE-4B/4C, ~85k events in 60 h, with the SDK
+ * backing off another ~90k/day client side). The SDK's Dedupe integration only
+ * drops an event identical to the one immediately before it, so two loops that
+ * interleave defeat it.
+ *
+ * Token bucket per signature: `burst` events immediately, then one per
+ * `refillMs`. Per-process, like throttledReporter; the server log keeps the
+ * unthrottled signal. Exported for test.
+ */
+export function createEventThrottle(options: { burst: number; refillMs: number; maxKeys?: number }) {
+  const maxKeys = options.maxKeys ?? 1000;
+  const buckets = new Map<string, { tokens: number; updatedAt: number }>();
+  return <T extends Record<string, any>>(event: T): T | null => {
+    const key = eventThrottleSignature(event);
+    const now = Date.now();
+    let bucket = buckets.get(key);
+    if (bucket) {
+      const refill = Math.floor((now - bucket.updatedAt) / options.refillMs);
+      if (refill > 0) bucket = { tokens: Math.min(options.burst, bucket.tokens + refill), updatedAt: bucket.updatedAt + refill * options.refillMs };
+      buckets.delete(key);
+    } else {
+      bucket = { tokens: options.burst, updatedAt: now };
+      if (buckets.size >= maxKeys) buckets.delete(buckets.keys().next().value!);
+    }
+    // Re-insert so Map order tracks recency for eviction.
+    buckets.set(key, bucket);
+    if (bucket.tokens <= 0) return null;
+    bucket.tokens -= 1;
+    return event;
+  };
+}
+
+const EVENT_THROTTLE_BURST = 10;
+const EVENT_THROTTLE_REFILL_MS = 5 * 60_000;
+
 function parseSampleRate(raw: string | undefined): number {
   if (!raw) return 0;
   const parsed = Number(raw);
@@ -655,6 +846,7 @@ export function initSentry(): void {
   }
 
   const tracesSampleRate = parseSampleRate(process.env.SENTRY_TRACES_SAMPLE_RATE);
+  const throttleEvent = createEventThrottle({ burst: EVENT_THROTTLE_BURST, refillMs: EVENT_THROTTLE_REFILL_MS });
 
   Sentry.init({
     dsn,
@@ -666,7 +858,7 @@ export function initSentry(): void {
     release: API_VERSION,
     tracesSampleRate,
     profilesSampleRate: parseSampleRate(process.env.SENTRY_PROFILES_SAMPLE_RATE),
-    beforeSend: (event) => scrubEvent(event),
+    beforeSend: (event) => throttleEvent(scrubEvent(event)),
     beforeSendTransaction: (event) => scrubTransactionEvent(event)
   });
 
@@ -693,6 +885,11 @@ export function captureException(
   err: unknown,
   c?: Context,
   tags?: Record<string, string>,
+  /**
+   * `fingerprint`: group a bursty call site's events under fixed, BOUNDED
+   * values (literals and a SQLSTATE, never an id or a message) — #7600 W02.
+   */
+  options?: { fingerprint?: readonly string[] },
 ): void {
   // Classify BEFORE the init guard. The classifier is no longer only a tag
   // source: it also feeds the rolling CONNECT_TIMEOUT rate that the #3214
@@ -719,6 +916,7 @@ export function captureException(
 
   Sentry.withScope((scope) => {
     setCallerTags(scope, tags);
+    if (options?.fingerprint) scope.setFingerprint([...options.fingerprint]);
     if (c) {
       scope.setTag('method', c.req.method);
       scope.setTag('route_template', safeMatchedRouteLabel(c));

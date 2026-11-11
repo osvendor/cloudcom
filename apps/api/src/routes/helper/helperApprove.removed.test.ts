@@ -3,6 +3,12 @@ import { Hono } from 'hono';
 
 // Mirror the db/schema/middleware mock shape used by the sibling index.test.ts
 // harness so helperAuth resolves an authenticated device for our request.
+// The route statically imports the SDK tool server (A-W04 Helper onlyTools).
+vi.mock('../../services/aiAgentSdkTools', () => ({ createBreezeMcpServer: vi.fn() }));
+// W03 Task 7: the route imports the registry's session-turn resolver (whose
+// loader reads schema tables this suite does not mock); never reached here.
+vi.mock('../../services/aiModels/sessionModel', () => ({ resolveSessionTurn: vi.fn() }));
+
 vi.mock('../../db', () => ({
   db: {
     select: vi.fn(),
@@ -70,6 +76,10 @@ vi.mock('../../services/helperPermissions', () => ({
   resolveHelperPermissionLevelForDevice: vi.fn(),
 }));
 
+vi.mock('../../services/helperSettings', () => ({
+  buildHelperConfigUpdate: vi.fn(async () => ({ enabled: true })),
+}));
+
 vi.mock('../../services/helperAiAgent', () => ({
   buildHelperSystemPrompt: vi.fn(() => 'helper system prompt'),
 }));
@@ -83,7 +93,8 @@ vi.mock('../../services/streamingSessionManager', () => ({
   },
 }));
 
-vi.mock('../../services/aiInputSanitizer', () => ({
+vi.mock('../../services/aiInputSanitizer', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../services/aiInputSanitizer')>()),
   sanitizeUserMessage: vi.fn(() => ({ sanitized: 'hello', flags: [] })),
 }));
 

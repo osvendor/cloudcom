@@ -51,7 +51,7 @@ curl -X POST https://breeze.yourdomain.com/api/v1/api-keys \
     "orgId": "ORG_UUID",
     "name": "CI/CD Pipeline Key",
     "scopes": ["devices:read", "scripts:execute"],
-    "expiresAt": "2026-12-31T23:59:59Z",
+    "expiresAt": "2099-12-31T23:59:59Z",
     "rateLimit": 5000
   }'
 ```
@@ -63,8 +63,9 @@ curl -X POST https://breeze.yourdomain.com/api/v1/api-keys \
 | `orgId` | `string (uuid)` | Yes | -- | Organization the key belongs to. |
 | `name` | `string` | Yes | -- | Human-readable label (1-255 characters). |
 | `scopes` | `string[]` | No | `[]` | Permissions granted to this key. |
-| `expiresAt` | `string (datetime)` | No | `null` (never) | ISO 8601 expiration timestamp. |
+| `expiresAt` | `string (datetime)` | No | `null` (never) | ISO 8601 timestamp with a time and `Z` (e.g. `2099-12-31T23:59:59Z`); a bare date is rejected. Must be in the future. |
 | `rateLimit` | `integer` | No | `1000` | Maximum requests per hour (1-100,000). |
+| `mcpDomains` | `string[] \| null` | No | `null` (all tools) | Limit the key to MCP tool areas. See [MCP tool areas](#mcp-tool-areas-mcpdomains). |
 
 <Aside>
   MFA verification is required to create, update, rotate, or revoke API keys. The requesting session must have completed MFA.
@@ -84,6 +85,31 @@ Scopes restrict which API operations a key can perform. When a route is protecte
 ```
 
 Scopes can be updated after creation via the `PATCH` endpoint without rotating the key material.
+
+### MCP tool areas (`mcpDomains`)
+
+A key with an `ai:*` scope can be limited to specific tool areas on the [MCP server](/features/mcp-server/#limit-a-connection-to-tool-areas). `mcpDomains` is an array of area names, or `null` for all tools (the default, which also includes areas added later).
+
+Valid values: `devices`, `scripts`, `patching`, `monitoring`, `network`, `security`, `backup`, `tickets`, `billing`, `accounts`, `integrations`, `admin`, `ai`. Core tools are always included and are not listed. An empty array, `core` and unknown names are rejected with a 400. Duplicates are removed, and a list naming every area is stored as `null`.
+
+```bash
+curl -X POST https://breeze.yourdomain.com/api/v1/api-keys \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "orgId": "ORG_UUID",
+    "name": "Ticket assistant",
+    "scopes": ["ai:read", "ai:write"],
+    "mcpDomains": ["tickets", "devices"]
+  }'
+```
+
+- The limit applies only to the MCP server. REST API behavior of the key is unchanged.
+- It narrows access only. Scopes, roles, approvals and MFA still apply.
+- The create, `GET /api-keys` and `GET /api-keys/:id` responses include `mcpDomains`.
+- To change it, send `PATCH /api-keys/:id` with `{ "mcpDomains": ["tickets"] }`, or `{ "mcpDomains": null }` to allow all tools. Widening needs the same delegation rights as granting the key's scopes.
+- Rotating a key keeps its `mcpDomains`.
+- Partner service principal keys are always unrestricted in this release.
 
 ### Authentication Flow
 
@@ -151,6 +177,8 @@ curl -X POST https://breeze.yourdomain.com/api/v1/api-keys/KEY_UUID/rotate \
 
 The response contains the new full key in the `key` field. All other attributes (name, scopes, rate limit, expiration) are preserved.
 
+Only the key's **creator** can rotate it: the key keeps acting with its creator's permissions, so another admin gets `403` with `code: "API_KEY_CREATOR_REQUIRED"` and should revoke the key instead. A key that belongs to an organization service principal is rotated from the service principal (`POST /service-principals/:id/rotate`). Rotating binds the key to the creator's current sign-in, the same way creating one does, so a key that stopped working after its creator's password or MFA change works again once the creator rotates it.
+
 ### Revocation
 
 Revoking an API key performs a **soft delete** -- the record remains in the database with `status: "revoked"` but the key can no longer authenticate. Revoked keys cannot be rotated or updated.
@@ -167,6 +195,18 @@ curl -X DELETE https://breeze.yourdomain.com/api/v1/api-keys/KEY_UUID \
 | `active` | Key can authenticate requests. |
 | `expired` | The `expiresAt` timestamp has passed. Set automatically on the next authentication attempt. |
 | `revoked` | Manually disabled via the `DELETE` endpoint. Permanent. |
+
+### When a key stops working because of its creator
+
+A key minted by a person is checked against that person's account on every request (v0.121.0+):
+
+- **The key stops working** when its creator's sign-in credential is replaced or voided: a password change or reset, accepting an invite (which sets a new password), an administrator changing the account's status, or a change to the creator's MFA factors. Mint a new key afterwards. Re-enabling a disabled account does not bring back keys minted before it was disabled.
+- **The key keeps working** when its creator signs out, or after a role change, an email change or an organization merge.
+- **A role downgrade or a removed membership takes effect immediately.** The key is limited to what its creator can still do, on every request.
+
+<Aside type="note">
+  On v0.120.0, signing out also stopped the creator's keys. Keys that stopped working that way are not revived by upgrading; mint a replacement.
+</Aside>
 
 ---
 
@@ -231,12 +271,48 @@ Every mutation is recorded in the audit log (`service_principal.create`, `servic
 | `scripts:read` | Export scripts |
 | `backup-configuration:read` | Export backup configuration |
 | `custom-fields:read` | Export custom field definitions and values |
+| `alerts:read` | Read the alerts feed across accessible organizations (opt-in, never a default scope) |
+| `device-status:read` | Read live device status, last-seen time and agent version across accessible organizations (opt-in, never a default scope, not implied by `devices:read`) |
+| `tickets:read` | Read the tickets feed, single tickets and ticket comments across accessible organizations, including every internal note (opt-in, never a default scope) |
 | `organizations:write` | Create organizations (bounded by the partner's organization cap) |
 | `sites:write` | Create sites in the principal's accessible organizations |
 | `enrollment-keys:write` | Create enrollment keys (raw key returned once) |
 | `contracts:write` | Create a contract, update header fields, add/patch/remove lines, and GET one contract. Does not grant activate/pause/cancel, documents, or the human JWT `/api/v1/contracts` surface. Line removal is contents, not tenancy deletion. |
+| `tickets:write` | Create, update, change status, assign and comment on tickets in accessible organizations. Does not grant delete, restore, moving a ticket between organizations, bulk actions, attachments, time entries, AI drafts or the ticket mailbox; the principal acts as itself, never as a person |
+| `alerts:write` | Acknowledge and resolve alerts as the principal in accessible organizations (opt-in, never a default or preset). Does not imply `alerts:read` or grant suppress, dismiss, delete, bulk actions, or rules |
 
 The `:write` scopes exist for unattended provisioning and integrations -- migration scripts, scheduled syncs, and partner-built tools. They are **opt-in at principal creation and never part of the default scope set**: a default-scoped principal stays read-only. Grant them only to credentials that genuinely need them, and prefer a dedicated principal so rotation and revocation stay surgical. Tenancy writes are create-only -- deleting organizations, sites, or enrollment keys remains a human, MFA-gated action.
+
+#### Who can manage a partner service principal
+
+Managing partner service principals needs a partner-wide admin (all-organization access) with `organizations:write` and a completed MFA challenge. Beyond that:
+
+- **Only the principal's owner** (the admin who created it) can issue or rotate its keys, re-enable it, add a scope, or remove or extend its expiry or source-CIDR restriction. Anyone else gets `403` with `code: "SERVICE_PRINCIPAL_OWNER_REQUIRED"`.
+- **Any partner-wide admin** can revoke a key, disable the principal, remove scopes, shorten its expiry, remove some of its source CIDRs, and rename it.
+- **Every scope is a delegation.** Whoever grants a scope, by creating the principal, adding the scope, or issuing, rotating or re-enabling a key that carries it, must hold the permission the dashboard requires for the same data: for example `tickets:read` needs `tickets.read`, `contracts:write` needs `contracts.write`, `alerts:write` needs `alerts.write`, `backup-configuration:read` needs `backup.read`, and `inventory:read`, `custom-fields:read` and `device-status:read` need `devices.read`.
+- **Keys end with the owner's sign-in credential**, the same way a person's own API keys do: the owner's password change or reset, an administrator changing the owner's account status, a change to the owner's MFA factors, or removing the owner from the partner stops every key issued before it, on both the Partner API and MCP. Signing out does not. The owner issues a new key afterwards.
+
+If the owner leaves, create a new principal under another admin, move the integration to its key, and disable the old principal.
+
+<Aside type="caution" title="Upgrading to v0.122.1">
+  - **`tickets:*` grants take effect immediately.** Earlier versions let admins grant `tickets:read` and `tickets:write` before the ticket routes existed. After the upgrade, any principal holding them can read every ticket and comment (including internal notes) and create, update and comment on tickets, including customer-visible replies that email the requester. Review which principals hold `tickets:*` before upgrading.
+  - **Scopes granted before the upgrade are not re-checked** against the granting admin's permissions. Review principals whose scopes were granted by an admin who does not hold the matching permission.
+  - **Keys another admin issued on someone else's principal are refused over MCP** until the owner rotates them; the Partner API keeps accepting them. Have each principal's owner rotate such keys before upgrading. Existing keys are bound to their owner's current sign-in state on upgrade and keep working.
+  - **Plan for owner off-boarding:** an integration whose principal belongs to a departing admin stops when that admin is disabled or removed, so create the replacement principal first.
+</Aside>
+
+#### MCP scopes (partner-wide MCP access)
+
+A partner service principal can also authenticate the [MCP server](/features/mcp-server/#partner-service-principal-keys-partner-wide-automation) with the same `brz_sp_` key in `X-API-Key`. These scopes grant nothing on the Partner API:
+
+| Scope | Grants over MCP |
+|--------|--------|
+| `ai:read` | Required for any MCP access; Tier 1 (read) tools |
+| `ai:write` | Tier 2 tools |
+| `ai:execute` | Tier 3 tools (still approval-only unless the principal is listed in `MCP_UNATTENDED_TIER3_PRINCIPALS` as `partner_sp:<id>`) |
+| `ai:execute_admin` | Tier 3 tools in production when `MCP_REQUIRE_EXECUTE_ADMIN` is on |
+
+They are opt-in and never default, and `ai:write`, `ai:execute` and `ai:execute_admin` each require `ai:read`. Granting one requires the acting admin to hold the permissions an organization API key's creator needs for the same scope. Over MCP the principal reaches every organization of its partner; its per-tool permissions are its owner's (the admin who created it) live partner role, the owner must keep all-organization access, and only keys the owner issued are accepted.
 
 ---
 
@@ -377,6 +453,7 @@ Create a new API key. Returns the full key exactly once.
   "scopes": ["devices:read"],
   "expiresAt": "2026-12-31T23:59:59.000Z",
   "rateLimit": 1000,
+  "mcpDomains": null,
   "createdBy": "uuid",
   "createdAt": "2026-02-18T...",
   "status": "active",
@@ -396,7 +473,7 @@ Retrieve metadata for a single API key. The `keyHash` is not included.
 
 #### `PATCH /api-keys/:id`
 
-Update an active API key's name, scopes, or rate limit. Cannot update revoked or expired keys.
+Update an active API key's name, scopes, rate limit, or MCP tool areas. Cannot update revoked or expired keys.
 
 **Required permission:** `organizations:write` + MFA
 
@@ -407,6 +484,7 @@ Update an active API key's name, scopes, or rate limit. Cannot update revoked or
 | `name` | `string` | New display name (1-255 characters). |
 | `scopes` | `string[]` | Replace the scopes array. |
 | `rateLimit` | `integer` | New rate limit (1-100,000 requests/hour). |
+| `mcpDomains` | `string[] \| null` | Limit the key to MCP tool areas, or `null` for all tools. Widening needs the same delegation rights as granting the key's scopes. |
 
 ---
 

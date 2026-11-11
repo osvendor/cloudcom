@@ -1,7 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
 import { db } from '../../db';
-import { agentSecurityRoutes } from './security';
+import { agentSecurityRoutes, managementPostureChanges } from './security';
+import { writeAuditEvent } from '../../services/auditEvents';
+import { raiseRemoteToolAppearedAlerts } from '../../services/remoteToolAlerts/alerts';
+import { upsertSecurityStatusForDevice } from './helpers';
+import { runAfterDbContextCommit } from '../../db';
 
 const AGENT_ID = 'agent-001';
 const DEVICE_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
@@ -9,6 +13,8 @@ const ORG_ID = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
 
 vi.mock('drizzle-orm', () => ({
   eq: (left: unknown, right: unknown) => ({ op: 'eq', left, right }),
+  // updateOwnDeviceRow (#8318 §6.4) ANDs the id + agent_id identity predicate.
+  and: (...args: unknown[]) => ({ op: 'and', args }),
 }));
 
 vi.mock('../../db', () => ({
@@ -16,10 +22,26 @@ vi.mock('../../db', () => ({
     select: vi.fn(),
     update: vi.fn(),
   },
+  // Records the deferred work; a test runs it to stand in for the commit.
+  runAfterDbContextCommit: vi.fn(),
+}));
+
+vi.mock('../../services/remoteToolAlerts/alerts', () => ({
+  raiseRemoteToolAppearedAlerts: vi.fn(async () => ({ raised: [], held: [], failed: [], suppressedByMaintenance: false })),
 }));
 
 vi.mock('../../db/schema', () => ({
-  devices: { id: 'devices.id', agentId: 'devices.agentId', orgId: 'devices.orgId' },
+  devices: {
+    id: 'devices.id',
+    agentId: 'devices.agentId',
+    orgId: 'devices.orgId',
+    managementPosture: 'devices.managementPosture',
+  },
+  securityStatus: {
+    deviceId: 'security_status.deviceId',
+    provider: 'security_status.provider',
+    threatCount: 'security_status.threatCount',
+  },
 }));
 
 vi.mock('../../services/auditEvents', () => ({
@@ -27,8 +49,11 @@ vi.mock('../../services/auditEvents', () => ({
 }));
 
 vi.mock('./helpers', () => ({
-  upsertSecurityStatusForDevice: vi.fn(async () => undefined),
+  upsertSecurityStatusForDevice: vi.fn(async () => ({ provider: 'windows_defender', threatCount: 0 })),
 }));
+
+const recordAgentIngestSubmission = vi.hoisted(() => vi.fn());
+vi.mock('../metrics', () => ({ recordAgentIngestSubmission }));
 
 function mountWithRole(role: 'agent' | 'watchdog' | undefined): Hono {
   const app = new Hono();
@@ -49,15 +74,31 @@ function mountWithRole(role: 'agent' | 'watchdog' | undefined): Hono {
   return app;
 }
 
-function mockDeviceLookup() {
-  vi.mocked(db.select).mockReturnValue({
+function selectResolving(rows: unknown[]) {
+  return {
     from: vi.fn().mockReturnValue({
       where: vi.fn().mockReturnValue({
-        limit: vi.fn().mockResolvedValue([{ id: DEVICE_ID, orgId: ORG_ID }]),
+        limit: vi.fn().mockResolvedValue(rows),
       }),
     }),
-  } as never);
-  const set = vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue(undefined) });
+  } as never;
+}
+
+/**
+ * Queue the handler's reads in order: the device row, then (security status
+ * only) the previously stored status row.
+ */
+function mockDeviceLookup(
+  device: Record<string, unknown> = {},
+  previousStatus: Array<Record<string, unknown>> = [],
+) {
+  vi.mocked(db.select)
+    .mockReturnValueOnce(selectResolving([{ id: DEVICE_ID, orgId: ORG_ID, managementPosture: null, ...device }]))
+    .mockReturnValueOnce(selectResolving(previousStatus));
+  // updateOwnDeviceRow (#8318 §6.4) always asks for the matched rows back.
+  const set = vi.fn().mockReturnValue({
+    where: vi.fn().mockReturnValue({ returning: vi.fn().mockResolvedValue([{ id: DEVICE_ID }]) }),
+  });
   vi.mocked(db.update).mockReturnValue({ set } as never);
   return set;
 }
@@ -65,6 +106,9 @@ function mockDeviceLookup() {
 describe('agent security routes — requireAgentRole gate (F3)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // clearAllMocks keeps queued mockReturnValueOnce values; the status route
+    // reads less on some paths, so drop any leftover queued select.
+    vi.mocked(db.select).mockReset();
   });
 
   describe('PUT /agents/:id/security/status', () => {
@@ -152,5 +196,350 @@ describe('agent security routes — requireAgentRole gate (F3)', () => {
       const written = set.mock.calls[0]?.[0] as { managementPosture: typeof unsupportedPosture };
       expect(written.managementPosture.identity).toEqual(unsupportedPosture.identity);
     });
+  });
+
+  // #4340 — per-submit `agent.security_status.submit` / `.management_posture.
+  // submit` audits were ~15% of audit_logs. The canonical rows are overwritten
+  // in place, so the audit is kept — but only for a REAL change.
+  describe('change-only auditing (#4340)', () => {
+    const put = (path: string, body: unknown) => mountWithRole('agent').request(`/agents/${AGENT_ID}/${path}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+    describe('security status', () => {
+      it('does NOT audit a re-report with the same provider and threat count', async () => {
+        mockDeviceLookup({}, [{ provider: 'windows_defender', threatCount: 0 }]);
+        const res = await put('security/status', { provider: 'defender', threatCount: 0 });
+
+        expect(res.status).toBe(200);
+        expect(writeAuditEvent).not.toHaveBeenCalled();
+        expect(recordAgentIngestSubmission).toHaveBeenCalledWith('security_status', 'success');
+      });
+
+      it('audits a threat-count change with before/after', async () => {
+        mockDeviceLookup({}, [{ provider: 'windows_defender', threatCount: 0 }]);
+        vi.mocked(upsertSecurityStatusForDevice).mockResolvedValueOnce({ provider: 'windows_defender', threatCount: 3 });
+        const res = await put('security/status', { provider: 'defender', threatCount: 3 });
+
+        expect(res.status).toBe(200);
+        expect(writeAuditEvent).toHaveBeenCalledTimes(1);
+        expect(vi.mocked(writeAuditEvent).mock.calls[0]![1]).toMatchObject({
+          orgId: ORG_ID,
+          actorType: 'agent',
+          actorId: AGENT_ID,
+          action: 'agent.security_status.submit',
+          resourceType: 'device',
+          resourceId: DEVICE_ID,
+          details: {
+            provider: 'windows_defender',
+            threatCount: 3,
+            changes: [{ field: 'threatCount', before: 0, after: 3 }],
+          },
+        });
+      });
+
+      it('audits a provider change with before/after', async () => {
+        mockDeviceLookup({}, [{ provider: 'windows_defender', threatCount: 0 }]);
+        vi.mocked(upsertSecurityStatusForDevice).mockResolvedValueOnce({ provider: 'crowdstrike', threatCount: 0 });
+        const res = await put('security/status', { provider: 'crowdstrike', threatCount: 0 });
+
+        expect(res.status).toBe(200);
+        const details = (vi.mocked(writeAuditEvent).mock.calls[0]![1] as unknown as { details: { changes: unknown[] } }).details;
+        expect(details.changes).toEqual([{ field: 'provider', before: 'windows_defender', after: 'crowdstrike' }]);
+      });
+
+      it('counts a failed previous-row read as a failed ingest and rethrows', async () => {
+        vi.mocked(db.select)
+          .mockReturnValueOnce(selectResolving([{ id: DEVICE_ID, orgId: ORG_ID, managementPosture: null }]))
+          .mockReturnValueOnce({
+            from: vi.fn().mockReturnValue({
+              where: vi.fn().mockReturnValue({ limit: vi.fn().mockRejectedValue(new Error('db down')) }),
+            }),
+          } as never);
+        const res = await put('security/status', { provider: 'defender', threatCount: 0 });
+
+        expect(res.status).toBe(500);
+        expect(upsertSecurityStatusForDevice).not.toHaveBeenCalled();
+        expect(writeAuditEvent).not.toHaveBeenCalled();
+        expect(recordAgentIngestSubmission).toHaveBeenCalledTimes(1);
+        expect(recordAgentIngestSubmission).toHaveBeenCalledWith('security_status', 'failed');
+      });
+
+      it('audits the first-ever report for a device (no stored row yet)', async () => {
+        mockDeviceLookup({}, []);
+        const res = await put('security/status', { provider: 'defender', threatCount: 0 });
+
+        expect(res.status).toBe(200);
+        const details = (vi.mocked(writeAuditEvent).mock.calls[0]![1] as unknown as { details: { changes: unknown[] } }).details;
+        expect(details.changes).toEqual([
+          { field: 'provider', before: null, after: 'windows_defender' },
+          { field: 'threatCount', before: null, after: 0 },
+        ]);
+      });
+    });
+
+    describe('management posture', () => {
+      const posture = {
+        collectedAt: '2026-06-20T00:00:00.000Z',
+        scanDurationMs: 120,
+        categories: {
+          mdm: [{ name: 'Intune', status: 'active' }],
+          rmm: [{ name: 'Breeze', status: 'active' }, { name: 'ScreenConnect', status: 'installed' }],
+        },
+        identity: {
+          joinType: 'azure_ad',
+          azureAdJoined: true,
+          domainJoined: false,
+          workplaceJoined: false,
+          tenantId: 'tenant-1',
+          source: 'dsregcmd',
+        },
+        errors: ['wmi timeout'],
+      };
+
+      it('does NOT audit a re-scan that differs only in collectedAt, duration, errors and entry order', async () => {
+        mockDeviceLookup({ managementPosture: posture });
+        const res = await put('management/posture', {
+          ...posture,
+          collectedAt: '2026-06-20T00:15:00.000Z',
+          scanDurationMs: 95,
+          errors: [],
+          categories: { rmm: [...posture.categories.rmm].reverse(), mdm: posture.categories.mdm },
+        });
+
+        expect(res.status).toBe(200);
+        expect(writeAuditEvent).not.toHaveBeenCalled();
+        expect(recordAgentIngestSubmission).toHaveBeenCalledWith('management_posture', 'success');
+      });
+
+      it('audits a detection change, naming the changed category', async () => {
+        mockDeviceLookup({ managementPosture: posture });
+        const res = await put('management/posture', {
+          ...posture,
+          categories: { ...posture.categories, rmm: [{ name: 'Breeze', status: 'active' }] },
+        });
+
+        expect(res.status).toBe(200);
+        expect(writeAuditEvent).toHaveBeenCalledTimes(1);
+        expect(vi.mocked(writeAuditEvent).mock.calls[0]![1]).toMatchObject({
+          action: 'agent.management_posture.submit',
+          resourceType: 'device',
+          resourceId: DEVICE_ID,
+          details: { changed: ['categories.rmm'] },
+        });
+      });
+
+      it('audits an identity change', async () => {
+        mockDeviceLookup({ managementPosture: posture });
+        const res = await put('management/posture', {
+          ...posture,
+          identity: { ...posture.identity, joinType: 'none', azureAdJoined: false },
+        });
+
+        expect(res.status).toBe(200);
+        const details = (vi.mocked(writeAuditEvent).mock.calls[0]![1] as unknown as { details: { changed: string[] } }).details;
+        expect(details.changed).toEqual(['identity']);
+      });
+
+      // #11306 — a remote access / RMM tool the previous scan did not have
+      // alerts the partner, after the posture write commits.
+      describe('new remote tool alerts', () => {
+        it('raises an alert for a remote access tool that appeared since the previous scan, after the commit', async () => {
+          mockDeviceLookup({ managementPosture: posture });
+          const res = await put('management/posture', {
+            ...posture,
+            collectedAt: '2026-06-20T00:15:00.000Z',
+            categories: { ...posture.categories, remoteAccess: [{ name: 'UltraViewer', status: 'installed' }] },
+          });
+
+          expect(res.status).toBe(200);
+          expect(runAfterDbContextCommit).toHaveBeenCalledTimes(1);
+          expect(runAfterDbContextCommit).toHaveBeenCalledWith('management-posture.remote-tool-alerts', expect.any(Function));
+          // Deferred, not raised inside the request transaction.
+          expect(raiseRemoteToolAppearedAlerts).not.toHaveBeenCalled();
+
+          const afterCommit = vi.mocked(runAfterDbContextCommit).mock.calls[0]![1] as () => unknown;
+          await afterCommit();
+          expect(raiseRemoteToolAppearedAlerts).toHaveBeenCalledTimes(1);
+          expect(raiseRemoteToolAppearedAlerts).toHaveBeenCalledWith({
+            deviceId: DEVICE_ID,
+            orgId: ORG_ID,
+            detectedAt: '2026-06-20T00:15:00.000Z',
+            tools: [{ name: 'UltraViewer', category: 'remoteAccess', status: 'installed' }],
+          });
+        });
+
+        it('raises nothing on the first-ever posture: it is the baseline', async () => {
+          mockDeviceLookup({ managementPosture: null });
+          const res = await put('management/posture', {
+            ...posture,
+            categories: { ...posture.categories, remoteAccess: [{ name: 'Splashtop', status: 'active' }] },
+          });
+
+          expect(res.status).toBe(200);
+          expect(raiseRemoteToolAppearedAlerts).not.toHaveBeenCalled();
+          expect(runAfterDbContextCommit).not.toHaveBeenCalled();
+        });
+
+        it('raises nothing for a re-scan with the same tools, or one that only lost a tool', async () => {
+          mockDeviceLookup({ managementPosture: posture });
+          await put('management/posture', { ...posture, collectedAt: '2026-06-20T00:15:00.000Z' });
+          mockDeviceLookup({ managementPosture: posture });
+          await put('management/posture', { ...posture, categories: { mdm: posture.categories.mdm } });
+
+          expect(runAfterDbContextCommit).not.toHaveBeenCalled();
+        });
+
+        it('raises nothing when the write persisted nothing', async () => {
+          mockDeviceLookup({ managementPosture: posture });
+          vi.mocked(db.update).mockReturnValueOnce({
+            set: vi.fn().mockReturnValue({
+              where: vi.fn().mockReturnValue({ returning: vi.fn().mockResolvedValue([]) }),
+            }),
+          } as never);
+          vi.mocked(db.select).mockReset();
+          vi.mocked(db.select)
+            .mockReturnValueOnce(selectResolving([{ id: DEVICE_ID, orgId: ORG_ID, managementPosture: posture }]))
+            .mockReturnValueOnce(selectResolving([]));
+          const res = await put('management/posture', {
+            ...posture,
+            categories: { ...posture.categories, remoteAccess: [{ name: 'UltraViewer', status: 'installed' }] },
+          });
+
+          expect(res.status).toBe(404);
+          expect(runAfterDbContextCommit).not.toHaveBeenCalled();
+        });
+
+        it('raises nothing when the posture write fails', async () => {
+          const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+          mockDeviceLookup({ managementPosture: posture });
+          vi.mocked(db.update).mockReturnValueOnce({
+            set: vi.fn().mockReturnValue({ where: vi.fn().mockRejectedValue(new Error('db down')) }),
+          } as never);
+          const res = await put('management/posture', {
+            ...posture,
+            categories: { ...posture.categories, remoteAccess: [{ name: 'UltraViewer', status: 'installed' }] },
+          });
+
+          expect(res.status).toBe(500);
+          expect(runAfterDbContextCommit).not.toHaveBeenCalled();
+          consoleError.mockRestore();
+        });
+      });
+
+      it('audits the first-ever posture for a device', async () => {
+        mockDeviceLookup({ managementPosture: null });
+        const res = await put('management/posture', posture);
+
+        expect(res.status).toBe(200);
+        const details = (vi.mocked(writeAuditEvent).mock.calls[0]![1] as unknown as { details: { changed: string[] } }).details;
+        expect(details.changed).toEqual(['identity', 'categories.mdm', 'categories.rmm']);
+      });
+
+      // Review of wave 1b-1 (must-fix 3): a 0-row write persisted nothing, so
+      // it records no success and audits no change.
+      function zeroRowWrite(rowAfter: Array<Record<string, unknown>>) {
+        mockDeviceLookup({ managementPosture: null });
+        vi.mocked(db.update).mockReturnValueOnce({
+          set: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({ returning: vi.fn().mockResolvedValue([]) }),
+          }),
+        } as never);
+        // ownDeviceRowChangedHands re-reads the row by id once.
+        vi.mocked(db.select).mockReset();
+        vi.mocked(db.select)
+          .mockReturnValueOnce(selectResolving([{ id: DEVICE_ID, orgId: ORG_ID, managementPosture: null }]))
+          .mockReturnValueOnce(selectResolving(rowAfter));
+      }
+
+      it('answers a write the row refused because it changed hands with the stale-credential 401: no success, no audit', async () => {
+        zeroRowWrite([{ agentId: 'agent-after-reattach' }]);
+        const res = await put('management/posture', posture);
+
+        expect(res.status).toBe(401);
+        expect(await res.text()).toBe('Invalid agent credentials');
+        expect(writeAuditEvent).not.toHaveBeenCalled();
+        expect(recordAgentIngestSubmission).not.toHaveBeenCalled();
+      });
+
+      it('answers a write whose row vanished after the read with 404: no success, no audit', async () => {
+        zeroRowWrite([]);
+        const res = await put('management/posture', posture);
+
+        expect(res.status).toBe(404);
+        expect(await res.json()).toEqual({ error: 'Device not found' });
+        expect(writeAuditEvent).not.toHaveBeenCalled();
+        expect(recordAgentIngestSubmission).not.toHaveBeenCalled();
+      });
+
+      it('counts a failed posture write as a failed ingest', async () => {
+        const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+        mockDeviceLookup({ managementPosture: null });
+        vi.mocked(db.update).mockReturnValueOnce({
+          set: vi.fn().mockReturnValue({ where: vi.fn().mockRejectedValue(new Error('db down')) }),
+        } as never);
+        const res = await put('management/posture', posture);
+
+        expect(res.status).toBe(500);
+        expect(writeAuditEvent).not.toHaveBeenCalled();
+        expect(recordAgentIngestSubmission).toHaveBeenCalledWith('management_posture', 'failed');
+        consoleError.mockRestore();
+      });
+    });
+  });
+});
+
+describe('managementPostureChanges (#4340)', () => {
+  const identity = { joinType: 'none', azureAdJoined: false, domainJoined: false, workplaceJoined: false, source: 'agent' };
+  const base = {
+    collectedAt: '2026-06-20T00:00:00.000Z',
+    scanDurationMs: 10,
+    identity,
+    categories: {
+      policy: [{ name: 'macOS Configuration Profiles', status: 'active', details: { profileCount: 2, profiles: ['a', 'b'] } }],
+      rmm: [{ name: 'Breeze', status: 'active' }],
+    },
+  };
+
+  it('flags a detection whose only change is in its details', () => {
+    const after = {
+      ...base,
+      categories: {
+        ...base.categories,
+        policy: [{ name: 'macOS Configuration Profiles', status: 'active', details: { profileCount: 3, profiles: ['a', 'b', 'c'] } }],
+      },
+    };
+    expect(managementPostureChanges(base, after)).toEqual(['categories.policy']);
+  });
+
+  it('ignores reordered values inside details', () => {
+    const after = {
+      ...base,
+      categories: {
+        ...base.categories,
+        policy: [{ name: 'macOS Configuration Profiles', status: 'active', details: { profiles: ['b', 'a'], profileCount: 2 } }],
+      },
+    };
+    expect(managementPostureChanges(base, after)).toEqual([]);
+  });
+
+  it('flags a category that disappears, whether omitted or sent empty', () => {
+    const omitted = { ...base, categories: { policy: base.categories.policy } };
+    const emptied = { ...base, categories: { ...base.categories, rmm: [] } };
+    expect(managementPostureChanges(base, omitted)).toEqual(['categories.rmm']);
+    expect(managementPostureChanges(base, emptied)).toEqual(['categories.rmm']);
+    // ...and omitted vs empty are the same state ("nothing detected").
+    expect(managementPostureChanges(omitted, emptied)).toEqual([]);
+  });
+
+  it('distinguishes a duplicated detection from a single one', () => {
+    const dup = { ...base, categories: { ...base.categories, rmm: [base.categories.rmm[0], base.categories.rmm[0]] } };
+    expect(managementPostureChanges(base, dup)).toEqual(['categories.rmm']);
+  });
+
+  it('treats a missing stored posture as every present part changing', () => {
+    expect(managementPostureChanges(null, base)).toEqual(['identity', 'categories.policy', 'categories.rmm']);
   });
 });

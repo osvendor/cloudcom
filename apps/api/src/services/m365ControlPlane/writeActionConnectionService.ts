@@ -22,6 +22,10 @@ const actionsConnectionService = createConnectionService({
     signingKid: config.executorSigningKid,
   }),
   retest: (client, request) => client.retestCustomerGraphActions(request),
+  // #8661: a Retest after a manifest bump that finds the new roles not yet
+  // granted must leave the row `manifest-stale` (upgrade-eligible) instead of
+  // promoting it into `grant_missing`, which dead-ended the connection.
+  retestPromotesManifestOnlyWhenSatisfied: true,
   // recordEvent/recordMetric intentionally omitted, mirroring the read instance:
   // consent telemetry is emitted at the route layer, not inside the service.
   // The actions metric siblings are consumed by the actions route (Task 10).
@@ -33,13 +37,17 @@ export type InitiateCustomerGraphActionsConsentInput = InitiateConsentInput;
 export type InitiatedCustomerGraphActionsConsent = InitiatedConsent<'customer-graph-actions'>;
 
 export const initiateCustomerGraphActionsConsent = actionsConnectionService.initiateConsent;
+export const initiateCustomerGraphActionsUpgradeConsent = actionsConnectionService.initiateUpgradeConsent;
 export const listCustomerGraphActionsConnections = actionsConnectionService.listConnections;
-export const markAdminConsentReturned = actionsConnectionService.markAdminConsentReturned;
-export const transitionAdminConsentToIdentity = actionsConnectionService.transitionAdminConsentToIdentity;
+export const listStaleManifestCustomerGraphActionsConnections = actionsConnectionService.listStaleManifestConnections;
+export const transitionIdentityToConsent = actionsConnectionService.transitionIdentityToConsent;
+export const readPendingCustomerGraphActionsTenantConfirmation = actionsConnectionService.readPendingTenantConfirmation;
+export const continueCustomerGraphActionsConsent = actionsConnectionService.continueToConsent;
+export const cancelCustomerGraphActionsTenantConfirmation = actionsConnectionService.cancelTenantConfirmation;
 export const markConsentAttemptFailed = actionsConnectionService.markConsentAttemptFailed;
-export const applyIdentityVerificationResult = actionsConnectionService.applyIdentityVerificationResult;
-export const transitionUpgradeConsentToIdentityForActions = actionsConnectionService.transitionUpgradeConsentToIdentity;
-export const applyUpgradeVerificationResultForActions = actionsConnectionService.applyUpgradeVerificationResult;
+export const beginConsentFinalization = actionsConnectionService.beginConsentFinalization;
+export const applyConsentFinalizationResult = actionsConnectionService.applyConsentFinalizationResult;
+export const applyUpgradeFinalizationResultForActions = actionsConnectionService.applyUpgradeFinalizationResult;
 export const loadRetestSnapshot = actionsConnectionService.loadRetestSnapshot;
 export const applyRetestResult = actionsConnectionService.applyRetestResult;
 export const retestCustomerGraphActionsConnection = actionsConnectionService.retestConnection;

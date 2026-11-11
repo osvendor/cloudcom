@@ -76,10 +76,21 @@ export const oauthRefreshTokens = pgTable('oauth_refresh_tokens', {
   revokedAt: timestamp('revoked_at', { withTimezone: true }),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
   lastUsedAt: timestamp('last_used_at', { withTimezone: true }),
+  // #10301 rotation grace window (oauth/refreshRotationGrace.ts). Written only
+  // by consume() in the same UPDATE that consumes the token during a rotation:
+  // rotated_at is rotation provenance (revoked_at alone is also set by
+  // destroy()); successor_sealed is the successor token sealed under a key that
+  // needs this row's RAW token, cleared by the client's next rotation once older
+  // than REFRESH_ROTATION_GRACE_MAX_MS (30 s, not the configured window).
+  rotatedAt: timestamp('rotated_at', { withTimezone: true }),
+  successorSealed: text('successor_sealed'),
 }, (table) => ({
   userIdx: index('oauth_refresh_tokens_user_idx').on(table.userId),
   partnerIdx: index('oauth_refresh_tokens_partner_idx').on(table.partnerId),
   clientIdx: index('oauth_refresh_tokens_client_idx').on(table.clientId),
+  sealedClientIdx: index('oauth_refresh_tokens_sealed_client_idx')
+    .on(table.clientId, table.rotatedAt)
+    .where(sql`${table.successorSealed} IS NOT NULL`),
 }));
 
 // oauth_sessions: oidc-provider Session payloads (was in-memory, now persisted
@@ -134,6 +145,10 @@ export const oauthGrants = pgTable('oauth_grants', {
   revokedAt: timestamp('revoked_at', { withTimezone: true }),
   revokedByUserId: uuid('revoked_by_user_id').references(() => users.id, { onDelete: 'set null' }),
   revokedReason: text('revoked_reason'),
+  // B-W02 (#6156): MCP tool domains for this grant, chosen at consent. NULL =
+  // unrestricted. A real column, not `payload`: oidc-provider owns the payload
+  // and drops unknown keys. Read per request by assertLiveOAuthUser.
+  mcpDomains: text('mcp_domains').array().$type<string[] | null>(),
 }, (table) => ({
   accountIdx: index('oauth_grants_account_idx').on(table.accountId),
   clientIdx: index('oauth_grants_client_idx').on(table.clientId),
@@ -144,6 +159,12 @@ export const oauthGrants = pgTable('oauth_grants', {
   accountClientActiveIdx: index('oauth_grants_account_client_active_idx')
     .on(table.accountId, table.clientId)
     .where(sql`${table.revokedAt} IS NULL`),
+  // Connection health OAuth source (spec 2026-10-15 §1.3, §3): grants revoked
+  // automatically for refresh-token reuse. Created in
+  // 2026-12-29-100100-connection-health-incidents.
+  autoRevokedIdx: index('oauth_grants_auto_revoked_idx')
+    .on(table.revokedAt)
+    .where(sql`${table.revokedReason} = 'refresh-token-reuse' AND ${table.revokedByUserId} IS NULL`),
 }));
 
 // oauth_client_blocks: org-wide block of an OAuth client (e.g. "no Cursor

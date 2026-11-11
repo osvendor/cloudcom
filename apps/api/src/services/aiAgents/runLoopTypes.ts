@@ -1,4 +1,7 @@
-import type { AnalysisOutcome, RemediationTriggerKind } from '@breeze/shared';
+import type { AnalysisOutcome, AssessmentOutcome, RemediationTriggerKind, ResearchOutcome } from '@breeze/shared';
+import type { ResearchRunContext } from './researchContext';
+import type { AssessmentRunContext } from '../wisp/assessmentTypes';
+import type { RunProvenFixes } from '../fixMemory/runMemory';
 /**
  * The run loop's internal shape contracts, split out of `runLoop.ts` (issue
  * #4451) so the loop itself and its per-profile finalizers (`runFinalizers.ts`)
@@ -41,6 +44,19 @@ import type { TicketRunContext } from './ticketContext';
 import type { WorkspaceService } from '../workspace/workspaceService';
 import type { AiAgentRunStagedInputs } from '../../db/schema/aiAgents';
 
+// Wisp W05b — the assessment run's shapes live in `wisp/assessmentTypes.ts`
+// (type-only, shared with `wisp/assessment.ts` and `wisp/readiness.ts`);
+// re-exported so run-loop code names them from here like every other
+// per-profile context.
+export type {
+  AssessmentDigest,
+  AssessmentReason,
+  AssessmentRunContext,
+  OrgReadiness,
+  ReadinessCheck,
+  WispAssessmentTriggerRef,
+} from '../wisp/assessmentTypes';
+
 export interface OutcomeProposedAction {
   tool: string;
   action?: string;
@@ -79,9 +95,9 @@ export interface OutcomeExecutedAction {
    * `'(inline)'` when the ledger write itself failed — a ledger failure must
    * never block the tool call, so the call still executes and is recorded
    * with the placeholder id (see `executionLedger.ts` and the pre/post hooks
-   * below). Correlation between the pre and post hook is per-tool FIFO order
-   * (same assumption `allowedPending` already made) — genuine per-invocation
-   * ids need SDK hook support the loop doesn't have yet.
+   * below). The pre and post hook pair each call by the SDK's tool_use id
+   * (`AgentRunCallPairing` in runLoop.ts, #8163), falling back to per-tool
+   * FIFO order only for a call the SDK sent without one.
    */
   executionId: string;
   result: 'ok' | 'failed';
@@ -312,6 +328,27 @@ export interface AgentRunOutcome {
    * and `maxActionsPerRun` is 0.
    */
   analysis?: AnalysisOutcome;
+  /** AI Suggested Fixes W2 — the validated research submission (accepted items + recorded rejections). */
+  research?: ResearchOutcome;
+  /**
+   * Wisp W05b — every assessment outcome-tool call of an `assessment`-profile
+   * run, captured by the post-tool-use hook. Unlike the single-shot `submit_*`
+   * outcomes above, each tool may be called many times, so each call APPENDS
+   * to its list. Model-supplied ids inside are untrusted:
+   * `finalizeAssessment` (assessmentFinalizer.ts) re-reads every concern
+   * under the grant ceiling, pins it to the run's org and applies the calls.
+   * `specialistRequests` are kept untouched for W07's audit. Absent for every
+   * other profile and for an assessment that stayed quiet.
+   */
+  assessment?: AssessmentOutcome;
+  /**
+   * Wisp W05b — why `finalizeAssessment` did not apply part of `assessment`
+   * (`raise_cap`, `concern_not_in_org`, `nudge_backoff`, `nudge_snoozed`,
+   * `nudge_digest_only`, `nudge_dismissed`, `propose_tier1_refused`, …), one
+   * entry per skipped call — the same idiom as `ticketTriageSkipped`. Absent
+   * when nothing was skipped.
+   */
+  assessmentSkipped?: string[];
   /** Sandbox compute charged to this run, in cents (spec §5.6). */
   computeCents?: number;
   /**
@@ -359,6 +396,14 @@ export interface RunRow {
   taskStepKey: string | null;
   taskAttemptOrdinal: number | null;
   /**
+   * Wisp W02 — the delegation grant + revision admission pinned (both or
+   * none, `ai_agent_runs_grant_link_chk`). When set, the pre-tool hook checks
+   * EVERY tool call against the live ceiling. Optional so fixtures that
+   * predate W02 stay valid rows.
+   */
+  grantId?: string | null;
+  grantRevisionId?: string | null;
+  /**
    * Execution plane W04 — the admission-frozen inputs of an `analysis` run
    * (`ai_agent_runs.staged_inputs`), `null` for every other profile. jsonb:
    * read DEFENSIVELY.
@@ -370,6 +415,31 @@ export interface RunRow {
    * workspace finalizer settles at when provider usage is unavailable.
    */
   computeReservedCents: number | null;
+  /**
+   * AI model registry W03 — the funding of the offering admission resolved
+   * (`ai_agent_runs.funding_source`) and that offering's id (finding 6: the
+   * loop re-resolves exactly it). Both null on a run admitted before W03;
+   * optional so a fixture that predates them stays a valid row.
+   */
+  fundingSource?: 'platform' | 'partner_key' | null;
+  admittedOfferingId?: string | null;
+  /**
+   * AI model registry W09 (#7607) — the failover hop the run last recorded
+   * (`ai_agent_runs.served_*`, all four set together or all null). A re-driven
+   * run resumes on this hop's offering and reservation key. `servedFundingSource`
+   * is the TOKEN funding only; compute stays on `fundingSource` (D7).
+   */
+  servedOfferingId?: string | null;
+  servedFundingSource?: 'platform' | 'partner_key' | null;
+  servedFailoverHop?: number | null;
+  servedFailoverCause?: string | null;
+  /**
+   * #7787 — the offering the run was routed to before its failover. When
+   * `servedOfferingId` equals `admittedOfferingId` the served_* columns are
+   * ADMISSION's provenance (the primary was cooling or ineligible at
+   * admission), not a hop: the run stays on hop 0's key (`startHopFor`).
+   */
+  servedFailoverFromOfferingId?: string | null;
 }
 
 export interface AgentRow {
@@ -385,6 +455,12 @@ export interface RunContext {
   run: RunRow;
   agent: AgentRow;
   orgPartnerId: string;
+  /**
+   * The run org's display name, read with `orgPartnerId` (#10387: the
+   * assessment prompt names its org). Optional so fixtures that predate it
+   * stay valid; absent reads as "no name".
+   */
+  orgName?: string | null;
   device: { id: string; siteId: string; hostname: string; osType: string } | null;
   alert: { title: string; severity: string; message: string | null } | null;
   /** Bounded, sanitized ticket context (Task 4) — `null` for every non-ticket
@@ -460,6 +536,24 @@ export interface RunContext {
     siteId: string | null;
     evidence: DesignEvidence;
   } | null;
+  /** AI Suggested Fixes W2 — set only for a `remediation_research` run. Optional like `patch`. */
+  research?: ResearchRunContext | null;
+  /**
+   * Wisp W05b — the grant-scoped context of an `assessment`-profile run
+   * (`loadAssessmentContext`, wisp/assessment.ts): thread summary, the org's
+   * live concerns with this grant's recipient state, the changes digest, the
+   * requesting watch, readiness and nudge feedback. `null` for every other
+   * profile AND for an assessment whose grant is no longer active — the run
+   * loop then skips the run with `grant_inactive` before any model call.
+   */
+  assessment: AssessmentRunContext | null;
+  /**
+   * AI Suggested Fixes W3 — proven fixes for this run's alert or correlation
+   * group. Set only for `verdict`/`full` runs whose org-pinned alert or group
+   * read resolved; null otherwise, and whenever memory is off, empty or
+   * unavailable. Optional (absent ≡ null) like `research`.
+   */
+  provenFixes?: RunProvenFixes | null;
   /**
    * AI patch agent W01 (#5747) — the schedule occurrence (or manual trigger)
    * and the bounded, org-pinned patch evidence a `patch`-profile run plans

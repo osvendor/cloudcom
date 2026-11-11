@@ -4,11 +4,29 @@ vi.mock('node:fs/promises', () => ({
   stat: vi.fn(async () => ({ size: 2 })),
 }));
 
-vi.mock('node:fs', () => ({
-  createReadStream: vi.fn(() => ({ on: vi.fn(), destroy: vi.fn() })),
-}));
+vi.mock('node:fs', async () => {
+  // The `.gz` branch pipes the raw read stream into a real zlib gunzip via
+  // `node:stream`'s `pipeline`, which needs a genuine stream interface
+  // (`.once`, `.pipe`, readable-state introspection, etc.) — a hand-rolled
+  // `{ on, destroy }` stub isn't enough. The default bytes must also be a
+  // VALID (if empty) gzip stream: many tests exercising other branches
+  // (capability/authorization refusals, etc.) happen to use `.gz`-suffixed
+  // remote paths and never override this mock, so a real gunzip is always
+  // attached and will actually try to decode whatever this returns — raw
+  // empty bytes fail zlib parsing asynchronously with an unhandled stream
+  // error those tests never listen for.
+  const { Readable } = await import('node:stream');
+  const { gzipSync } = await import('node:zlib');
+  return {
+    createReadStream: vi.fn(() => Readable.from(gzipSync(Buffer.alloc(0)))),
+  };
+});
 
 const resolveSnapshotProviderConfigMock = vi.fn();
+const loadOriginKeyRootsMock = vi.hoisted(() => vi.fn());
+vi.mock('./backupOriginKeyRoots', () => ({
+  loadOriginKeyRoots: (...args: unknown[]) => loadOriginKeyRootsMock(...args),
+}));
 // FIFO queue of rows returned by successive `db.select().from().where().limit()`
 // calls, in call order. `getAuthenticatedRecoveryDownloadTarget` always issues
 // the lineage select first; for an external-reference download,
@@ -16,13 +34,23 @@ const resolveSnapshotProviderConfigMock = vi.fn();
 // snapshot's file_index_status, the backup_snapshot_files membership row, and
 // the backup_snapshot_origins row.
 const lineageRows = vi.hoisted(() => [] as Array<Array<Record<string, unknown>>>);
+const innerJoins = vi.hoisted(() => [] as unknown[][]);
+const wheres = vi.hoisted(() => [] as unknown[]);
 
 vi.mock('../db', () => ({
   db: {
     select: vi.fn(() => {
       const chain: Record<string, any> = {};
       chain.from = vi.fn(() => chain);
-      chain.where = vi.fn(() => chain);
+      chain.where = vi.fn((cond: unknown) => {
+        wheres.push(cond);
+        return chain;
+      });
+      chain.leftJoin = vi.fn(() => chain);
+      chain.innerJoin = vi.fn((...args: unknown[]) => {
+        innerJoins.push(args);
+        return chain;
+      });
       chain.limit = vi.fn(async () => lineageRows.shift() ?? []);
       return chain;
     }),
@@ -57,14 +85,51 @@ vi.mock('@aws-sdk/s3-request-presigner', () => ({
 }));
 
 import { stat as statMock } from 'node:fs/promises';
+import { createReadStream as createReadStreamMock } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { Readable } from 'node:stream';
+import { gzipSync } from 'node:zlib';
 import { getAuthenticatedRecoveryDownloadTarget } from './recoveryDownloadService';
+import { normalizeStorageIdentity } from './backupStorageIdentity';
+
+// The identity normalizeStorageIdentity() derives for providerConfig
+// { path: '/var/backups' } — i.e. the pinned identity a snapshot written to
+// that local root carries.
+const LOCAL_IDENTITY = 'local::/var/backups';
 
 describe('getAuthenticatedRecoveryDownloadTarget', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     lineageRows.length = 0;
-    lineageRows.push([{ orgId: 'org-1', deviceId: 'device-1' }]);
+    lineageRows.push([{ orgId: 'org-1', deviceId: 'device-1', keyLayout: 'legacy_flat' }]);
   });
+
+  it.each([['device_scoped'], [undefined]])(
+    'refuses a snapshot whose key layout (%s) this server cannot read, before loading provider credentials',
+    async (keyLayout) => {
+      lineageRows[0] = [{ orgId: 'org-1', deviceId: 'device-1', keyLayout }];
+
+      const result = await getAuthenticatedRecoveryDownloadTarget(
+        {
+          id: 'token-layout',
+          orgId: 'org-1',
+          deviceId: 'device-1',
+          snapshotId: 'snapshot-db-layout',
+          status: 'authenticated',
+          authenticatedAt: new Date('2099-04-01T00:00:00.000Z'),
+          expiresAt: new Date('2099-04-02T00:00:00.000Z'),
+          negotiatedCapabilities: null,
+        },
+        'snapshots/snap-ext-001/manifest.json'
+      );
+
+      expect(result).toEqual({
+        unavailable: true,
+        reason: 'This backup was written in a storage format this server version cannot read.',
+      });
+      expect(resolveSnapshotProviderConfigMock).not.toHaveBeenCalled();
+    },
+  );
 
   it('rejects a token whose pinned snapshot lineage changed before loading provider credentials', async () => {
     lineageRows[0] = [{ orgId: 'org-2', deviceId: 'device-2' }];
@@ -277,6 +342,73 @@ describe('getAuthenticatedRecoveryDownloadTarget', () => {
     });
   });
 
+  // #6398: the agent's S3 provider has never applied the destination's
+  // `prefix` — every snapshot object lands at `snapshots/<id>/...` verbatim.
+  // Presigning `<prefix>/snapshots/...` 404'd every token-mode recovery on a
+  // prefixed destination. The configured prefix must NOT be applied to
+  // snapshot keys; only a per-snapshot recorded `storagePrefix` may relocate
+  // them.
+  describe('destination prefix (#6398)', () => {
+    const tokenRow = {
+      id: 'token-prefix',
+      orgId: 'org-1',
+      deviceId: 'device-1',
+      snapshotId: 'snapshot-db-prefix',
+      status: 'authenticated',
+      authenticatedAt: new Date('2099-04-01T00:00:00.000Z'),
+      expiresAt: new Date('2099-04-02T00:00:00.000Z'),
+    };
+    const prefixedConfig = {
+      bucket: 'backups',
+      region: 'us-east-1',
+      accessKey: 'key',
+      secretKey: 'secret',
+      prefix: 'w05',
+    };
+    const presignedKey = () => {
+      expect(getSignedUrlMock).toHaveBeenCalledTimes(1);
+      const [, command] = (getSignedUrlMock.mock.calls[0] as unknown) as [unknown, { input: { Key: string } }];
+      return command.input.Key;
+    };
+
+    it('does not apply the configured destination prefix to a snapshot recorded without a storagePrefix', async () => {
+      resolveSnapshotProviderConfigMock.mockResolvedValue({
+        snapshot: { snapshotId: 'snap-ext-001', metadata: {} },
+        providerType: 's3',
+        providerConfig: prefixedConfig,
+      });
+
+      const result = await getAuthenticatedRecoveryDownloadTarget(tokenRow as any, 'snapshots/snap-ext-001/layout.json');
+
+      expect(result.unavailable).toBe(false);
+      expect(presignedKey()).toBe('snapshots/snap-ext-001/layout.json');
+    });
+
+    it('does not apply the configured prefix to a snapshot whose recorded storagePrefix is the bare agent layout', async () => {
+      resolveSnapshotProviderConfigMock.mockResolvedValue({
+        snapshot: { snapshotId: 'snap-ext-001', metadata: { storagePrefix: 'snapshots/snap-ext-001' } },
+        providerType: 's3',
+        providerConfig: prefixedConfig,
+      });
+
+      await getAuthenticatedRecoveryDownloadTarget(tokenRow as any, 'snapshots/snap-ext-001/manifest.json');
+
+      expect(presignedKey()).toBe('snapshots/snap-ext-001/manifest.json');
+    });
+
+    it('still honors a per-snapshot recorded storagePrefix that carries a base prefix', async () => {
+      resolveSnapshotProviderConfigMock.mockResolvedValue({
+        snapshot: { snapshotId: 'snap-ext-001', metadata: { storagePrefix: 's3://backups/legacy/snapshots/snap-ext-001' } },
+        providerType: 's3',
+        providerConfig: prefixedConfig,
+      });
+
+      await getAuthenticatedRecoveryDownloadTarget(tokenRow as any, 'snapshots/snap-ext-001/manifest.json');
+
+      expect(presignedKey()).toBe('legacy/snapshots/snap-ext-001/manifest.json');
+    });
+  });
+
   describe('external-reference downloads (W09, #6464)', () => {
     const baseTokenRow = {
       id: 'token-ext',
@@ -289,7 +421,7 @@ describe('getAuthenticatedRecoveryDownloadTarget', () => {
       negotiatedCapabilities: ['snapshot-file-membership-v1'],
     };
 
-    function mockCurrentSnapshotLocal(storageIdentity = 'store-1') {
+    function mockCurrentSnapshotLocal(storageIdentity = LOCAL_IDENTITY) {
       resolveSnapshotProviderConfigMock.mockResolvedValue({
         snapshot: {
           snapshotId: 'current',
@@ -302,15 +434,15 @@ describe('getAuthenticatedRecoveryDownloadTarget', () => {
     }
 
     it("R6: an external key that IS a member of the snapshot index, with a verified origin, is authorized — physical key uses the ORIGIN prefix, not the token snapshot's", async () => {
-      mockCurrentSnapshotLocal('store-1');
+      mockCurrentSnapshotLocal(LOCAL_IDENTITY);
       lineageRows.push([{ fileIndexStatus: 'complete' }]); // token snapshot file index
       lineageRows.push([{ id: 'file-row-1' }]); // membership
       lineageRows.push([
         {
           originOrgId: 'org-1',
           originDeviceId: 'device-1',
-          originStorageIdentity: 'store-1',
-          originStoragePrefix: 'archive-2025',
+          originStorageIdentity: LOCAL_IDENTITY,
+          originStoragePrefix: 'archive-2025/snapshots/older',
         },
       ]); // origin
 
@@ -320,6 +452,101 @@ describe('getAuthenticatedRecoveryDownloadTarget', () => {
       const [filePathArg] = (statMock as any).mock.calls[0];
       expect(filePathArg).toContain('archive-2025/snapshots/older/files/a.gz');
       expect(filePathArg).not.toContain('/current/');
+    });
+
+    it("R6 + #6489: an authorized external .gz reference is gunzipped from the ORIGIN-prefixed physical path, not left compressed", async () => {
+      // Regression guard for a plausible break the R6 test above can't catch
+      // on its own: R6 only asserts which path `stat()` was called with, but
+      // never reads the returned stream — so a bug that opened the correct
+      // origin-prefixed file yet fed the WRONG bytes into gunzip (or skipped
+      // gunzip entirely for external references) would pass R6 and still
+      // ship broken.
+      mockCurrentSnapshotLocal(LOCAL_IDENTITY);
+      lineageRows.push([{ fileIndexStatus: 'complete' }]); // token snapshot file index
+      lineageRows.push([{ id: 'file-row-1' }]); // membership
+      lineageRows.push([
+        {
+          originOrgId: 'org-1',
+          originDeviceId: 'device-1',
+          originStorageIdentity: LOCAL_IDENTITY,
+          originStoragePrefix: 'archive-2025/snapshots/older',
+        },
+      ]); // origin
+
+      const original = Buffer.from('origin-prefixed external reference payload for #6489');
+      (createReadStreamMock as any).mockImplementationOnce((requestedPath: string) => {
+        expect(requestedPath).toContain('archive-2025/snapshots/older/files/a.gz');
+        return Readable.from(gzipSync(original));
+      });
+
+      const result = await getAuthenticatedRecoveryDownloadTarget(baseTokenRow as any, 'snapshots/older/files/a.gz');
+
+      expect(result.unavailable).toBe(false);
+      if (result.unavailable) throw new Error('unreachable');
+      expect(result.contentLength).toBeNull();
+
+      const chunks: Buffer[] = [];
+      for await (const chunk of result.stream as unknown as AsyncIterable<Buffer>) {
+        chunks.push(chunk);
+      }
+      expect(Buffer.concat(chunks).equals(original)).toBe(true);
+    });
+
+    describe('origin storage prefix is the origin\'s full recorded root (#8665)', () => {
+      function mockCurrentSnapshotS3() {
+        resolveSnapshotProviderConfigMock.mockResolvedValue({
+          snapshot: { snapshotId: 'current', metadata: { storagePrefix: 'snapshots/current' }, storageIdentity: null },
+          providerType: 's3',
+          providerConfig: { bucket: 'backups', region: 'us-east-1', accessKey: 'key', secretKey: 'secret' },
+        });
+      }
+      function pushAuthorizedOrigin(originStoragePrefix: string | null) {
+        lineageRows.push([{ fileIndexStatus: 'complete' }]);
+        lineageRows.push([{ id: 'file-row-1' }]);
+        lineageRows.push([{ originOrgId: 'org-1', originDeviceId: 'device-1', originStorageIdentity: '', originStoragePrefix }]);
+      }
+      const presignedKey = () => {
+        expect(getSignedUrlMock).toHaveBeenCalledTimes(1);
+        const [, command] = (getSignedUrlMock.mock.calls[0] as unknown) as [unknown, { input: { Key: string } }];
+        return command.input.Key;
+      };
+
+      it.each([
+        ['the bare agent layout (Hyper-V, MSSQL, reconcile)', 'snapshots/older', 'snapshots/older/files/a.gz'],
+        ['a root under a base prefix', 'archive-2025/snapshots/older', 'archive-2025/snapshots/older/files/a.gz'],
+        ['an s3:// URI root', 's3://backups/archive-2025/snapshots/older/', 'archive-2025/snapshots/older/files/a.gz'],
+        ['a value that does not name the origin\'s root', 'archive-2025', 'snapshots/older/files/a.gz'],
+        ['another snapshot\'s root that merely starts with the origin id', 'base/snapshots/older-v2', 'snapshots/older/files/a.gz'],
+        ['a root with trailing segments after the origin id', 'base/snapshots/older/extra', 'snapshots/older/files/a.gz'],
+        ['no recorded prefix (falls back to the token snapshot\'s bare root)', null, 'snapshots/older/files/a.gz'],
+      ])('S3: presigns the external key once under %s', async (_label, originStoragePrefix, expected) => {
+        mockCurrentSnapshotS3();
+        pushAuthorizedOrigin(originStoragePrefix);
+
+        const result = await getAuthenticatedRecoveryDownloadTarget(baseTokenRow as any, 'snapshots/older/files/a.gz');
+
+        expect(result.unavailable).toBe(false);
+        expect(presignedKey()).toBe(expected);
+      });
+
+      it.each([
+        ['the bare agent layout', 'snapshots/older', '/var/backups/snapshots/older/files/a.gz'],
+        ['a root under a base prefix', 'archive-2025/snapshots/older', '/var/backups/archive-2025/snapshots/older/files/a.gz'],
+        ['a value that does not name the origin\'s root', 'archive-2025', '/var/backups/snapshots/older/files/a.gz'],
+        ['no recorded prefix', null, '/var/backups/snapshots/older/files/a.gz'],
+      ])('local: reads the external key once under %s', async (_label, originStoragePrefix, expected) => {
+        mockCurrentSnapshotLocal(LOCAL_IDENTITY);
+        lineageRows.push([{ fileIndexStatus: 'complete' }]);
+        lineageRows.push([{ id: 'file-row-1' }]);
+        lineageRows.push([{ originOrgId: 'org-1', originDeviceId: 'device-1', originStorageIdentity: LOCAL_IDENTITY, originStoragePrefix }]);
+
+        const result = await getAuthenticatedRecoveryDownloadTarget(baseTokenRow as any, 'snapshots/older/files/a.gz');
+
+        expect(result.unavailable).toBe(false);
+        expect(statMock).toHaveBeenCalledTimes(1);
+        const [filePathArg] = (statMock as any).mock.calls[0];
+        expect(filePathArg).toBe(expected);
+      });
     });
 
     it('R7 (a): a sibling file of a referenced origin snapshot that is NOT itself in the index is refused', async () => {
@@ -400,6 +627,63 @@ describe('getAuthenticatedRecoveryDownloadTarget', () => {
       });
     });
 
+    it('an external key is refused when the index was not built from the manifest bytes the attestation names', async () => {
+      mockCurrentSnapshotLocal();
+      lineageRows.push([{ fileIndexStatus: 'complete', fileIndexManifestSha256: 'a'.repeat(64), attestation: { status: 'verified', manifestSha256: 'b'.repeat(64) } }]);
+      lineageRows.push([{ id: 'file-row-1' }]);
+      lineageRows.push([{ originOrgId: 'org-1', originDeviceId: 'device-1', originStorageIdentity: LOCAL_IDENTITY, originStoragePrefix: null }]);
+
+      const result = await getAuthenticatedRecoveryDownloadTarget(baseTokenRow as any, 'snapshots/older/files/a.gz');
+
+      expect(result).toMatchObject({ unavailable: true });
+    });
+
+    it('an external key is refused when the attestation did not match', async () => {
+      mockCurrentSnapshotLocal();
+      lineageRows.push([{ fileIndexStatus: 'complete', fileIndexManifestSha256: 'a'.repeat(64), attestation: { status: 'mismatch', manifestSha256: 'a'.repeat(64) } }]);
+      lineageRows.push([{ id: 'file-row-1' }]);
+      lineageRows.push([{ originOrgId: 'org-1', originDeviceId: 'device-1', originStorageIdentity: LOCAL_IDENTITY, originStoragePrefix: null }]);
+
+      const result = await getAuthenticatedRecoveryDownloadTarget(baseTokenRow as any, 'snapshots/older/files/a.gz');
+
+      expect(result).toMatchObject({ unavailable: true });
+    });
+
+    it('an external key bound to a matching attestation is authorized, and membership is read against the approved index', async () => {
+      mockCurrentSnapshotLocal(LOCAL_IDENTITY);
+      innerJoins.length = 0;
+      lineageRows.push([{ fileIndexStatus: 'complete', fileIndexManifestSha256: 'a'.repeat(64), attestation: { status: 'pending', manifestSha256: 'a'.repeat(64) } }]);
+      lineageRows.push([{ id: 'file-row-1' }]);
+      lineageRows.push([{ originOrgId: 'org-1', originDeviceId: 'device-1', originStorageIdentity: LOCAL_IDENTITY, originStoragePrefix: null }]);
+
+      const result = await getAuthenticatedRecoveryDownloadTarget(baseTokenRow as any, 'snapshots/older/files/a.gz');
+
+      expect(result.unavailable).toBe(false);
+      expect(innerJoins).toHaveLength(1);
+    });
+
+    it('reads membership only against the index state it approved, in the same statement', async () => {
+      mockCurrentSnapshotLocal(LOCAL_IDENTITY);
+      wheres.length = 0;
+      const digest = 'c'.repeat(64);
+      lineageRows.push([{ fileIndexStatus: 'complete', fileIndexManifestSha256: digest, attestation: { status: 'verified', manifestSha256: digest } }]);
+      lineageRows.push([{ id: 'file-row-1' }]);
+      lineageRows.push([{ originOrgId: 'org-1', originDeviceId: 'device-1', originStorageIdentity: LOCAL_IDENTITY, originStoragePrefix: null }]);
+
+      await getAuthenticatedRecoveryDownloadTarget(baseTokenRow as any, 'snapshots/older/files/a.gz');
+
+      // wheres: lineage, token snapshot, membership, origin.
+      const { PgDialect } = await import('drizzle-orm/pg-core');
+      const query = new PgDialect().sqlToQuery(wheres[2] as any);
+      const text = query.sql.toLowerCase().replace(/\s+/g, ' ');
+      expect(text).toContain('"backup_snapshot_files"."backup_path" = $');
+      expect(text).toContain('"backup_snapshots"."file_index_status" = $');
+      expect(text).toContain('"backup_snapshots"."file_index_manifest_sha256" is not distinct from $');
+      expect(text).toContain("<> 'attestation_failed'");
+      expect(text).toContain('"backup_snapshot_attestations"."manifest_sha256" = "backup_snapshots"."file_index_manifest_sha256"');
+      expect(query.params).toEqual(expect.arrayContaining(['snapshot-db-current', 'snapshots/older/files/a.gz', 'complete', digest]));
+    });
+
     it("an external key is refused when the snapshot's file_index_status is not complete (e.g. agent)", async () => {
       mockCurrentSnapshotLocal();
       lineageRows.push([{ fileIndexStatus: 'agent' }]);
@@ -408,5 +692,337 @@ describe('getAuthenticatedRecoveryDownloadTarget', () => {
 
       expect(result).toMatchObject({ unavailable: true });
     });
+  });
+
+  describe('pinned storage identity (#6490)', () => {
+    const DRIFT_REASON =
+      'The backup destination for this device has changed since this snapshot was written. Restore the previous destination settings or choose a snapshot written to the current destination.';
+    const tokenRow = {
+      id: 'token-drift',
+      orgId: 'org-1',
+      deviceId: 'device-1',
+      snapshotId: 'snapshot-db-drift',
+      status: 'authenticated' as const,
+      authenticatedAt: new Date('2099-04-01T00:00:00.000Z'),
+      expiresAt: new Date('2099-04-02T00:00:00.000Z'),
+      negotiatedCapabilities: null,
+    };
+
+    it('refuses an own-prefix LOCAL download when the live root no longer matches the pinned identity, before touching the filesystem', async () => {
+      resolveSnapshotProviderConfigMock.mockResolvedValue({
+        snapshot: { snapshotId: 'current', metadata: {}, storageIdentity: 'local::/srv/old-backups' },
+        providerType: 'local',
+        providerConfig: { path: '/var/backups' },
+      });
+
+      const result = await getAuthenticatedRecoveryDownloadTarget(tokenRow as any, 'snapshots/current/manifest.json');
+
+      expect(result).toEqual({ unavailable: true, reason: DRIFT_REASON });
+      expect(statMock).not.toHaveBeenCalled();
+      expect(createReadStreamMock).not.toHaveBeenCalled();
+    });
+
+    it('refuses an own-prefix S3 download when the live bucket no longer matches the pinned identity, without presigning', async () => {
+      resolveSnapshotProviderConfigMock.mockResolvedValue({
+        snapshot: { snapshotId: 'current', metadata: {}, storageIdentity: 's3::minio.example.com::old-bucket' },
+        providerType: 's3',
+        providerConfig: { bucket: 'new-bucket', region: 'us-east-1', endpoint: 'https://minio.example.com' },
+      });
+
+      const result = await getAuthenticatedRecoveryDownloadTarget(tokenRow as any, 'snapshots/current/files/a.gz');
+
+      expect(result).toEqual({ unavailable: true, reason: DRIFT_REASON });
+      expect(getSignedUrlMock).not.toHaveBeenCalled();
+      expect(s3ClientCtorMock).not.toHaveBeenCalled();
+    });
+
+    it('refuses when the provider TYPE changed (pinned s3, live local)', async () => {
+      resolveSnapshotProviderConfigMock.mockResolvedValue({
+        snapshot: { snapshotId: 'current', metadata: {}, storageIdentity: 's3::minio.example.com::old-bucket' },
+        providerType: 'local',
+        providerConfig: { path: '/var/backups' },
+      });
+
+      const result = await getAuthenticatedRecoveryDownloadTarget(tokenRow as any, 'snapshots/current/manifest.json');
+
+      expect(result).toEqual({ unavailable: true, reason: DRIFT_REASON });
+      expect(statMock).not.toHaveBeenCalled();
+    });
+
+    it('allows an own-prefix S3 download whose live config normalizes to the pinned identity (credential/prefix edits are not drift)', async () => {
+      resolveSnapshotProviderConfigMock.mockResolvedValue({
+        snapshot: { snapshotId: 'current', metadata: {}, storageIdentity: 's3::minio.example.com::same-bucket' },
+        providerType: 's3',
+        providerConfig: {
+          bucket: 'same-bucket',
+          region: 'us-east-1',
+          endpoint: 'https://MINIO.example.com/',
+          prefix: 'rotated-prefix',
+          accessKeyId: 'rotated-key',
+          secretAccessKey: 'rotated-secret',
+        },
+      });
+
+      const result = await getAuthenticatedRecoveryDownloadTarget(tokenRow as any, 'snapshots/current/files/a.gz');
+
+      expect(result).toMatchObject({ unavailable: false, type: 'redirect' });
+      expect(getSignedUrlMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('allows an own-prefix LOCAL download whose live root matches the pinned identity', async () => {
+      resolveSnapshotProviderConfigMock.mockResolvedValue({
+        snapshot: { snapshotId: 'current', metadata: {}, storageIdentity: LOCAL_IDENTITY },
+        providerType: 'local',
+        providerConfig: { path: '/var/backups' },
+      });
+
+      const result = await getAuthenticatedRecoveryDownloadTarget(tokenRow as any, 'snapshots/current/manifest.json');
+
+      expect(result.unavailable).toBe(false);
+    });
+
+    it('still allows a legacy snapshot with NO pinned identity (nothing to compare against)', async () => {
+      resolveSnapshotProviderConfigMock.mockResolvedValue({
+        snapshot: { snapshotId: 'current', metadata: {}, storageIdentity: null },
+        providerType: 'local',
+        providerConfig: { path: '/var/backups' },
+      });
+
+      const result = await getAuthenticatedRecoveryDownloadTarget(tokenRow as any, 'snapshots/current/manifest.json');
+
+      expect(result.unavailable).toBe(false);
+    });
+
+    it('treats an EMPTY-string pinned identity as drift (fail closed), not as a legacy snapshot', async () => {
+      resolveSnapshotProviderConfigMock.mockResolvedValue({
+        snapshot: { snapshotId: 'current', metadata: {}, storageIdentity: '' },
+        providerType: 'local',
+        providerConfig: { path: '/var/backups' },
+      });
+
+      const result = await getAuthenticatedRecoveryDownloadTarget(tokenRow as any, 'snapshots/current/manifest.json');
+
+      expect(result).toEqual({ unavailable: true, reason: DRIFT_REASON });
+      expect(statMock).not.toHaveBeenCalled();
+    });
+
+    it('refuses an otherwise-authorized EXTERNAL key when the live config drifted from the pinned identity', async () => {
+      resolveSnapshotProviderConfigMock.mockResolvedValue({
+        snapshot: { snapshotId: 'current', metadata: {}, storageIdentity: 'local::/srv/old-backups' },
+        providerType: 'local',
+        providerConfig: { path: '/var/backups' },
+      });
+      // Origin verified against the PINNED identity — this is the case the
+      // origin check alone cannot catch, since it never looks at the live config.
+      lineageRows.push([{ fileIndexStatus: 'complete' }]);
+      lineageRows.push([{ id: 'file-row-1' }]);
+      lineageRows.push([{ originOrgId: 'org-1', originDeviceId: 'device-1', originStorageIdentity: 'local::/srv/old-backups', originStoragePrefix: null }]);
+
+      const result = await getAuthenticatedRecoveryDownloadTarget(
+        { ...tokenRow, negotiatedCapabilities: ['snapshot-file-membership-v1'] } as any,
+        'snapshots/older/files/a.gz'
+      );
+
+      expect(result).toEqual({ unavailable: true, reason: DRIFT_REASON });
+      expect(statMock).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('local provider .gz byte contract (#6489)', () => {
+    // agent/internal/backup/providers/local.go gzip-compresses on Upload and
+    // gunzips on Download, keyed purely off the `.gz` key suffix — S3 keys
+    // hold raw bytes even when they end in `.gz` (Part 0 of the W09 plan:
+    // "never add or strip .gz"). Token-mode recovery reads local-provider
+    // storage directly, so the SERVER must mirror that gunzip for local
+    // objects, or a bare-metal recovery counts compressed bytes as
+    // "restored". Decision recorded on the issue: server gunzips.
+    const gzTokenRow = {
+      id: 'token-gz',
+      orgId: 'org-1',
+      deviceId: 'device-1',
+      snapshotId: 'snapshot-db-gz',
+      status: 'authenticated' as const,
+      authenticatedAt: new Date('2099-04-01T00:00:00.000Z'),
+      expiresAt: new Date('2099-04-02T00:00:00.000Z'),
+    };
+
+    beforeEach(() => {
+      resolveSnapshotProviderConfigMock.mockResolvedValue({
+        snapshot: { snapshotId: 'snap-ext-001', metadata: {} },
+        providerType: 'local',
+        providerConfig: { path: '/var/backups' },
+      });
+    });
+
+    async function readAll(stream: NodeJS.ReadableStream): Promise<Buffer> {
+      const chunks: Buffer[] = [];
+      for await (const chunk of stream as AsyncIterable<Buffer | string>) {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      }
+      return Buffer.concat(chunks);
+    }
+
+    it('round-trips a gzipped local object through the token-mode download path, matching the original bytes and the SHA-256 the manifest would record', async () => {
+      const original = Buffer.from('bare-metal recovery payload — round trip fixture for #6489\n'.repeat(50));
+      const expectedSha256 = createHash('sha256').update(original).digest('hex');
+      (createReadStreamMock as any).mockImplementationOnce(() => Readable.from(gzipSync(original)));
+
+      const result = await getAuthenticatedRecoveryDownloadTarget(
+        gzTokenRow as any,
+        'snapshots/snap-ext-001/files/payload.dat.gz'
+      );
+
+      expect(result.unavailable).toBe(false);
+      if (result.unavailable) throw new Error('unreachable');
+      expect(result.type).toBe('stream');
+      // The decompressed length isn't knowable without decompressing, so a
+      // fixed Content-Length must NOT be claimed for a local .gz object.
+      expect(result.contentLength).toBeNull();
+
+      const decompressed = await readAll(result.stream as unknown as NodeJS.ReadableStream);
+      expect(decompressed.equals(original)).toBe(true);
+      expect(createHash('sha256').update(decompressed).digest('hex')).toBe(expectedSha256);
+    });
+
+    it('streams a local object whose key does NOT end in .gz verbatim, unchanged', async () => {
+      const raw = Buffer.from('already-uncompressed manifest bytes, unrelated to gzip');
+      (createReadStreamMock as any).mockImplementationOnce(() => Readable.from(raw));
+      (statMock as any).mockResolvedValueOnce({ size: raw.length });
+
+      const result = await getAuthenticatedRecoveryDownloadTarget(
+        gzTokenRow as any,
+        'snapshots/snap-ext-001/files/payload.dat'
+      );
+
+      expect(result.unavailable).toBe(false);
+      if (result.unavailable) throw new Error('unreachable');
+      expect(result.contentLength).toBe(raw.length);
+
+      const streamed = await readAll(result.stream as unknown as NodeJS.ReadableStream);
+      expect(streamed.equals(raw)).toBe(true);
+    });
+
+    it('surfaces a corrupt gzip object as an explicit stream error, not truncated success', async () => {
+      const corrupt = Buffer.from('this is not a valid gzip stream at all');
+      (createReadStreamMock as any).mockImplementationOnce(() => Readable.from(corrupt));
+
+      const result = await getAuthenticatedRecoveryDownloadTarget(
+        gzTokenRow as any,
+        'snapshots/snap-ext-001/files/broken.dat.gz'
+      );
+
+      expect(result.unavailable).toBe(false);
+      if (result.unavailable) throw new Error('unreachable');
+      await expect(readAll(result.stream as unknown as NodeJS.ReadableStream)).rejects.toThrow();
+    });
+  });
+});
+
+// #7081: a snapshot's objects are read under its recorded key root. A
+// prefixed_flat snapshot ignores helper-reported metadata.storagePrefix and
+// origin_storage_prefix entirely; external refs resolve through the origin's
+// recorded root, which must equal the snapshot's own (I4).
+describe('snapshot key root (#7081)', () => {
+  const PREFIX = 'msp/acme';
+  const s3Config = { bucket: 'backups', region: 'us-east-1', accessKey: 'key', secretKey: 'secret', prefix: 'ignored-config-prefix' };
+  const IDENTITY = normalizeStorageIdentity('s3', s3Config);
+  const tokenRow = {
+    id: 'token-root',
+    orgId: 'org-1',
+    deviceId: 'device-1',
+    snapshotId: 'snapshot-db-root',
+    status: 'authenticated' as const,
+    authenticatedAt: new Date('2099-04-01T00:00:00.000Z'),
+    expiresAt: new Date('2099-04-02T00:00:00.000Z'),
+    negotiatedCapabilities: ['snapshot-file-membership-v1'],
+  };
+  const presignedKey = () => {
+    expect(getSignedUrlMock).toHaveBeenCalledTimes(1);
+    const [, command] = (getSignedUrlMock.mock.calls[0] as unknown) as [unknown, { input: { Key: string } }];
+    return command.input.Key;
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    loadOriginKeyRootsMock.mockReset();
+    lineageRows.length = 0;
+    lineageRows.push([{ orgId: 'org-1', deviceId: 'device-1', keyLayout: 'prefixed_flat', keyPrefix: PREFIX }]);
+    resolveSnapshotProviderConfigMock.mockResolvedValue({
+      snapshot: {
+        snapshotId: 'snap-own',
+        storageIdentity: IDENTITY,
+        // Helper-reported; never consulted for a prefixed_flat snapshot.
+        metadata: { storagePrefix: 'evil/snapshots/snap-own' },
+      },
+      providerType: 's3',
+      providerConfig: s3Config,
+    });
+  });
+
+  it('presigns the snapshot\'s own keys under its recorded root, ignoring metadata.storagePrefix', async () => {
+    const result = await getAuthenticatedRecoveryDownloadTarget(tokenRow as any, 'snapshots/snap-own/files/x');
+    expect(result.unavailable).toBe(false);
+    expect(presignedKey()).toBe(`${PREFIX}/snapshots/snap-own/files/x`);
+    expect(loadOriginKeyRootsMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['without a prefix', { keyLayout: 'prefixed_flat', keyPrefix: null }],
+    ['with a prefix that is not in normalized form', { keyLayout: 'prefixed_flat', keyPrefix: '/msp/acme/' }],
+    ['with a legacy layout carrying a prefix', { keyLayout: 'legacy_flat', keyPrefix: PREFIX }],
+  ])('refuses a snapshot whose recorded root is unreadable (%s), before loading provider credentials', async (_name, pair) => {
+    lineageRows[0] = [{ orgId: 'org-1', deviceId: 'device-1', ...pair }];
+    const result = await getAuthenticatedRecoveryDownloadTarget(tokenRow as any, 'snapshots/snap-own/files/x');
+    expect(result).toEqual({
+      unavailable: true,
+      reason: 'This backup was written in a storage format this server version cannot read.',
+    });
+    expect(resolveSnapshotProviderConfigMock).not.toHaveBeenCalled();
+  });
+
+  function authorizeExternal() {
+    lineageRows.push([{ fileIndexStatus: 'complete' }]); // token snapshot file index
+    lineageRows.push([{ id: 'file-row-1' }]); // membership
+    lineageRows.push([{
+      originOrgId: 'org-1',
+      originDeviceId: 'device-1',
+      originStorageIdentity: IDENTITY,
+      // Never used for a prefixed_flat snapshot.
+      originStoragePrefix: 'evil',
+    }]);
+  }
+
+  it('serves an external ref under the origin\'s recorded root when it equals the own root', async () => {
+    authorizeExternal();
+    loadOriginKeyRootsMock.mockResolvedValue(new Map([['snap-origin', { layout: 'prefixed_flat', prefix: PREFIX }]]));
+    const result = await getAuthenticatedRecoveryDownloadTarget(tokenRow as any, 'snapshots/snap-origin/files/a');
+    expect(result.unavailable).toBe(false);
+    expect(presignedKey()).toBe(`${PREFIX}/snapshots/snap-origin/files/a`);
+    expect(loadOriginKeyRootsMock).toHaveBeenCalledWith({ orgId: 'org-1', storageIdentity: IDENTITY, originSnapshotIds: ['snap-origin'] });
+  });
+
+  it.each([
+    ['under another root', new Map([['snap-origin', { layout: 'legacy_flat', prefix: null }]])],
+    ['with no recorded root left', new Map()],
+  ])('refuses an external ref whose origin is %s', async (_name, roots) => {
+    authorizeExternal();
+    loadOriginKeyRootsMock.mockResolvedValue(roots);
+    const result = await getAuthenticatedRecoveryDownloadTarget(tokenRow as any, 'snapshots/snap-origin/files/a');
+    expect(result).toEqual({
+      unavailable: true,
+      reason: 'Requested path references an object this recovery is not authorized to read.',
+    });
+    expect(getSignedUrlMock).not.toHaveBeenCalled();
+  });
+
+  it('refuses a prefixed snapshot on a non-S3 destination', async () => {
+    resolveSnapshotProviderConfigMock.mockResolvedValue({
+      snapshot: { snapshotId: 'snap-own', storageIdentity: 'local::/var/backups', metadata: {} },
+      providerType: 'local',
+      providerConfig: { path: '/var/backups' },
+    });
+    const result = await getAuthenticatedRecoveryDownloadTarget(tokenRow as any, 'snapshots/snap-own/files/x');
+    expect(result).toMatchObject({ unavailable: true });
+    expect(statMock).not.toHaveBeenCalled();
   });
 });

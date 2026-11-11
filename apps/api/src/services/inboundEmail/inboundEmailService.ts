@@ -1,26 +1,43 @@
-import { and, eq } from 'drizzle-orm';
+import { and, eq, inArray, isNull, ne, sql } from 'drizzle-orm';
 import { db, runOutsideDbContext, withSystemDbAccessContext } from '../../db';
+import { isPgUniqueViolation } from '../../utils/pgErrors';
 import {
   ticketEmailInbound,
   tickets,
   portalUsers,
   organizations,
+  partnerUsers,
   partners,
   ticketMailboxConnections,
+  users,
 } from '../../db/schema';
 import { changeTicketStatus, createTicket, type TicketActor } from '../ticketService';
 import { resolvePartnerByRecipient } from './resolvePartner';
 import { resolveOrgBySenderDomain, resolveEmailRequester, loadPartnerInboundPolicy } from './resolveOrg';
+import { extractForwardedSender, domainOf } from './forwardParse';
+import { UNASSIGNED_POOL_ORG_TYPE } from '../unassignedPool/orgType';
 import { maybeSendAutoresponse } from './autoresponder';
+import { applyDefaultInboundAssignee } from './defaultAssignee';
 import { insertEmailAuthoredComment } from './emailComments';
 import { hasStoredAttachments, persistInboundAttachments, withInboundAttachmentNote } from './inboundAttachments';
 import { captureException, captureMessage } from '../sentry';
 import { getConfig } from '../../config/validate';
 import type { NormalizedInboundEmail, InboundParseStatus } from './types';
-import type { M365MailboxGenerationContext } from '../inboundEmailQueue';
-import { TICKET_TOKEN_RE, findTicketInPartner, findClosedTicketInPartner, type SenderResolver } from './threadMatcher';
+import {
+  POLLED_MAILBOX_PROVIDERS,
+  type MailboxGenerationContext,
+  type PolledMailboxProvider,
+} from '../inboundEmailQueue';
+
+/** Type guard: is this normalized-email provider a PULLED mailbox provider
+ * (so it must carry a generation and acquire the lifecycle lock)? */
+function isPolledProvider(p: string): p is PolledMailboxProvider {
+  return (POLLED_MAILBOX_PROVIDERS as readonly string[]).includes(p);
+}
+import { stripTicketTokens, findTicketInPartner, findClosedTicketInPartner, type SenderResolver } from './threadMatcher';
 import { claimMessageLink, findLinkByMessageId, normalizeMessageId } from '../ticketEmailLinks';
 import { ownOutboundReason, ticketCreationLoopReason } from './loopPrevention';
+import { TicketMergedError } from '../ticketMerge/errors';
 
 // Synthetic actor for the inbound pipeline. Its userId is only ever written to
 // audit_logs.actor_id (NOT NULL, but no FK to users — same pattern as
@@ -30,13 +47,12 @@ import { ownOutboundReason, ticketCreationLoopReason } from './loopPrevention';
 // to users(id) — ticket_comments.user_id, tickets.closed_by — so the resolved-ticket
 // reopen can go through the service's status-change path (#6689).
 const SYSTEM_ACTOR: TicketActor = {
-  userId: '00000000-0000-0000-0000-000000000000',
+  kind: 'system',
+  source: 'inbound_email',
   name: 'Inbound Email',
-  principalKind: 'system'
 };
 
 // Per-partner ticket display number, e.g. T-2026-0001.
-const TOKEN_RE = TICKET_TOKEN_RE;
 
 async function logInbound(
   n: NormalizedInboundEmail,
@@ -79,11 +95,16 @@ async function logInbound(
 // a BRAND-NEW transaction on a FRESH pooled connection — fully independent of the
 // poisoned outer tx, which is still aborted on its own connection. This insert
 // therefore commits even though the outer tx will roll back its partial writes.
+// Returns true when the terminal `failed` row is durably recorded (a fresh insert,
+// or a 23505 meaning a concurrent retry already recorded it), false when it could
+// NOT be recorded. The caller uses this to decide whether the message may be
+// acknowledged (recorded) or must be retried by BullMQ (not recorded — never
+// silently drop an unrecorded message).
 async function logInboundFailedDurable(
   n: NormalizedInboundEmail,
   partnerId: string | null,
   error: unknown
-): Promise<void> {
+): Promise<boolean> {
   const message = error instanceof Error ? error.message : String(error);
   try {
     await runOutsideDbContext(() =>
@@ -105,16 +126,22 @@ async function logInboundFailedDurable(
         })
       )
     );
+    return true;
   } catch (logErr) {
-    // A 23505 here means a concurrent retry already logged the failed row (the
-    // (partner_id, provider_message_id) unique index) — or any other write error.
-    // A failure to LOG must never crash the worker; record it and swallow.
+    // A 23505 means a concurrent retry already durably logged this failed row (the
+    // (partner_id, provider_message_id) unique index) — the terminal record EXISTS,
+    // so it counts as recorded. Any OTHER error means we could NOT record it: report
+    // that so the caller lets BullMQ retry rather than acknowledge an unrecorded loss.
+    // isPgUniqueViolation walks the DrizzleQueryError `.cause` chain — the production
+    // postgres-js error is WRAPPED, so its 23505 lives at `.cause.code`, not `.code`.
+    if (isPgUniqueViolation(logErr)) return true;
     captureException(logErr instanceof Error ? logErr : new Error(String(logErr)));
+    return false;
   }
 }
 
 async function lockActiveMailboxGeneration(
-  generation: M365MailboxGenerationContext,
+  generation: MailboxGenerationContext,
 ): Promise<boolean> {
   const rows = await db
     .select({ id: ticketMailboxConnections.id })
@@ -122,9 +149,25 @@ async function lockActiveMailboxGeneration(
     .where(and(
       eq(ticketMailboxConnections.id, generation.connectionId),
       eq(ticketMailboxConnections.partnerId, generation.partnerId),
-      eq(ticketMailboxConnections.tenantId, generation.tenantId),
+      // The job's provider must match the LIVE connection's provider — a job can
+      // never lock against a connection of a different provider.
+      eq(ticketMailboxConnections.provider, generation.provider),
+      // tenant_id is Microsoft-only. IS NOT DISTINCT FROM so a Gmail generation
+      // (tenantId null) matches the live null, while a Microsoft generation still
+      // requires the exact tenant.
+      sql`${ticketMailboxConnections.tenantId} IS NOT DISTINCT FROM ${generation.tenantId}`,
       eq(ticketMailboxConnections.consentAttemptId, generation.consentAttemptId),
-      eq(ticketMailboxConnections.status, 'connected'),
+      // The consentAttemptId (generation) match above is the "same live binding"
+      // proof: a DISABLE rotates it, so a retired/rotated connection already fails
+      // this lock. A transient poll failure (reauth_required/error) does NOT rotate
+      // it — the binding is unchanged. Requiring status='connected' here would then
+      // SILENTLY DROP a message that was enqueued while connected but consumed after
+      // a poll failure (the consumer returns without a durable record, the poll
+      // cursor has already advanced past it, and a same-account reconnect preserves
+      // the cursor — so the message is never re-listed and is lost). Accept the two
+      // transient statuses so already-received mail is ingested; a pending_consent
+      // or disabled row is still excluded.
+      inArray(ticketMailboxConnections.status, ['connected', 'reauth_required', 'error']),
     ))
     .for('update')
     .limit(1);
@@ -144,29 +187,46 @@ export interface ProcessInboundEmailDependencies {
 
 export async function processInboundEmail(
   n: NormalizedInboundEmail,
-  mailboxGeneration?: M365MailboxGenerationContext,
+  mailboxGeneration?: MailboxGenerationContext,
   dependencies: ProcessInboundEmailDependencies = {},
 ): Promise<void> {
   // partnerId is tracked outside the try so the durable-failed log records whatever
   // tenant was resolved before the failure (may be null if resolution itself failed).
   let partnerId: string | null = null;
+  // Backward-compat: a mailbox generation enqueued BEFORE the `provider` field
+  // existed is definitionally m365 (Gmail post-dates that field). Default it so a
+  // legacy in-flight BullMQ job is not silently dropped at the provider-equality
+  // gate during a rolling upgrade (its Graph delta cursor may already have
+  // advanced, so the message would be lost, not redelivered).
+  const generation: MailboxGenerationContext | undefined = mailboxGeneration
+    ? { ...mailboxGeneration, provider: ((mailboxGeneration as { provider?: PolledMailboxProvider }).provider ?? 'm365') as PolledMailboxProvider }
+    : undefined;
   try {
     // A legacy raw BullMQ job cannot prove which mailbox lifecycle generation
-    // produced it. Keep generic providers backward-compatible, but fail closed
-    // for M365 rather than letting a pre-deploy job bypass the connection lock.
-    if (n.provider === 'm365' && !mailboxGeneration) return;
+    // produced it. Keep webhook providers backward-compatible, but fail closed
+    // for any PULLED-mailbox provider (m365, gmail) rather than letting a
+    // pre-deploy job bypass the connection lock.
+    if (isPolledProvider(n.provider) && !generation) return;
 
     // (1) Tenant identity is established ONLY from the recipient. Sender data is untrusted.
     // Resolution runs INSIDE the try so a failure here still routes to the durable
     // failed-log instead of escaping (and being silently retried / lost).
-    if (mailboxGeneration) {
+    if (generation) {
       // The queue payload's resolvedPartnerId is not authority. Lock and compare
       // every server-issued mailbox-generation field against the live row in the
       // same transaction that performs ticket/comment writes. A disable that won
       // first rotates the generation; a lock acquired here first makes disable wait.
-      if (n.provider !== 'm365' || !await lockActiveMailboxGeneration(mailboxGeneration)) return;
+      // Exact provider equality: the message's provider must be a polled provider
+      // AND match the generation's provider (the lock then verifies that against
+      // the live connection). This stops a job of one provider being validated
+      // against another provider's connection.
+      if (
+        !isPolledProvider(n.provider)
+        || n.provider !== generation.provider
+        || !await lockActiveMailboxGeneration(generation)
+      ) return;
       await dependencies.afterMailboxGenerationLock?.();
-      partnerId = mailboxGeneration.partnerId;
+      partnerId = generation.partnerId;
     } else {
       partnerId = n.resolvedPartnerId ?? await resolvePartnerByRecipient(n.to);
     }
@@ -342,8 +402,13 @@ export async function processInboundEmail(
     // known-portal-user match must NOT be trusted to append a PUBLIC comment, reopen a
     // ticket, or create a ticket as a trusted sender unless the sender's domain is
     // authenticated. We rely on the verdicts the provider already computed at its MX
-    // boundary (aligned SPF+DKIM, or DMARC pass). When NOT verified, route the message to
-    // the EXISTING quarantine/review path instead of auto-acting — mail is never dropped.
+    // boundary (aligned SPF+DKIM, or DMARC pass). On a Microsoft 365 mailbox three more
+    // sources count (senderAuth.source, normalizeGraphMessage): Exchange's intra-tenant
+    // stamp ('exchange-internal', #8299), Exchange's own DMARC stamp on external mail
+    // ('exchange-online') and a trusted ARC sealer's verdict ('trusted-arc-sealer',
+    // #10862). When NOT verified, route the
+    // message to the EXISTING quarantine/review path instead of auto-acting — mail is
+    // never dropped.
     if (!n.senderAuth?.verified) {
       // A `senderAuthDiagnostic` means we're acting NOT because of a genuine DMARC fail but
       // because no usable provider verdict could be read — the silent mass-quarantine (or, when
@@ -361,8 +426,9 @@ export async function processInboundEmail(
           }
         );
       }
-      const reason = gap
-        ? `unverified sender (SPF/DKIM/DMARC): ${gap}`
+      const reasonDetail = gap ?? n.senderAuthConsulted;
+      const reason = reasonDetail
+        ? `unverified sender (SPF/DKIM/DMARC): ${reasonDetail}`
         : 'unverified sender (SPF/DKIM/DMARC)';
       // Default: route to the review queue. If the partner opted into dropping
       // unverified mail, silently ignore it instead (audit row only, no review
@@ -438,9 +504,51 @@ export async function processInboundEmail(
       await dependencies.afterTicketMatchLock?.(closedOriginal.id);
       // No requester and NO acknowledgement: a reply to a closed ticket spawns a
       // linked ticket, it is not a fresh submission (spec §5).
-      const t = await createFromEmail(n, partnerId, closedOriginal.orgId, closedOriginal.emailThreadKey, closedOriginal.internalNumber, null, false);
+      const t = await createFromEmail(n, partnerId, closedOriginal.orgId, closedOriginal.emailThreadKey, closedOriginal.internalNumber, null, false, policy.defaultAssigneeUserId, closedOriginal.id);
       await logCreated(n, partnerId, t);
       return;
+    }
+
+    // (4.5) STAFF-FORWARD INTAKE (before the portal-user step, so a staff member
+    // who also has a portal login still routes by the original sender). When one
+    // of the partner's own staff forwards a client's email into the support
+    // mailbox, route by the ORIGINAL sender's domain (the client the mail is
+    // really about), not the forwarder's (a staff address would otherwise file
+    // under the MSP's own org).
+    //
+    // Gates, all required:
+    //  - the partner turned it on (settings.ticketing.inbound.staffForwardRouting,
+    //    default off);
+    //  - the message came from a connected Gmail mailbox (provider 'gmail'). The
+    //    native Mailgun address and Microsoft 365 mailboxes never route this way:
+    //    neither gives a body known to be the sender's own text/plain part;
+    //  - the outer message already passed the sender-auth gate above, so an
+    //    external sender cannot reach this branch with a forged forwarded block;
+    //  - the outer sender is partner-level staff of THIS partner (see
+    //    loadPartnerStaffAccess) who could open the org the ticket would be filed
+    //    under (staffCanReachOrg). A customer-org user, staff limited to other
+    //    orgs, or a suspended or deleted target org routes normally.
+    // The extracted address is used for its DOMAIN ONLY, to pick an org bucket,
+    // never for authentication, and the client is never emailed (no
+    // autoresponse, no contact onboarded). Falls through to ordinary routing when
+    // there is no forward block, the original domain is unmapped, or it is the
+    // forwarder's own domain (then the message is handled exactly as it would be
+    // with this setting off). Only a provider-supplied, unstripped text/plain
+    // body is scanned (forwardScanText): mail without one routes normally.
+    const forwardedFrom = policy.staffForwardRouting && n.provider === 'gmail'
+      ? extractForwardedSender(n.forwardScanText)
+      : null;
+    const fwdDomain = domainOf(forwardedFrom);
+    if (forwardedFrom && fwdDomain && fwdDomain !== senderDomain(n.from)) {
+      const staffAccess = await loadPartnerStaffAccess(n.from, partnerId);
+      if (staffAccess) {
+        const fwdOrg = await resolveOrgBySenderDomain(forwardedFrom, partnerId);
+        if (fwdOrg && await staffCanReachOrg(staffAccess, fwdOrg.orgId, partnerId)) {
+          const t = await createFromEmail(n, partnerId, fwdOrg.orgId, null, null, null, false, policy.defaultAssigneeUserId);
+          await logCreated(n, partnerId, t, `staff-forward: filed by original sender domain ${fwdDomain}`);
+          return;
+        }
+      }
     }
 
     // (5) Known portal-user sender -> their home org. Most specific; wins over
@@ -450,7 +558,7 @@ export async function processInboundEmail(
     if (sender) {
       // A portal LOGIN. createTicket derives the person from its contact_id —
       // the inbound path must not resolve a second candidate by address.
-      const t = await createFromEmail(n, partnerId, sender.orgId, null, null, { kind: 'portal', portalUserId: sender.id }, true);
+      const t = await createFromEmail(n, partnerId, sender.orgId, null, null, { kind: 'portal', portalUserId: sender.id }, true, policy.defaultAssigneeUserId);
       // A login with no contact_id yields a ticket attributed to nobody. Not an
       // error (the ticket is right, the login's data is incomplete) — a note,
       // so the gap is visible instead of only showing up as a customer who
@@ -466,8 +574,11 @@ export async function processInboundEmail(
 
     // (6) Sender domain mapped to a customer org (Phase 5) -> ALWAYS create the
     // ticket; optionally onboard a password-less contact so future replies
-    // thread + attribute. This sits behind the senderAuth.verified (DMARC) gate
-    // above, so a forged From: @customer.com can't file into the customer's org.
+    // thread + attribute. This sits behind the senderAuth.verified gate above, so a
+    // forged From: @customer.com from outside can't file into the customer's org.
+    // The one exception is mail verified as intra-tenant on a Microsoft 365 mailbox
+    // (source 'exchange-internal', #8299): that proves the mail came from inside the
+    // mailbox's own tenant, not that the From domain is genuine.
     const domainMatch = await senderResolver.domainOrg();
     if (domainMatch) {
       // `autoCreateContact` is the partner's "onboard people from this domain"
@@ -485,7 +596,7 @@ export async function processInboundEmail(
           requesterNote = unlinkedRequesterNote(resolved.reason, n.from);
         }
       }
-      const t = await createFromEmail(n, partnerId, domainMatch.orgId, null, null, requester, autoresponse);
+      const t = await createFromEmail(n, partnerId, domainMatch.orgId, null, null, requester, autoresponse, policy.defaultAssigneeUserId);
       await logCreated(n, partnerId, t, requesterNote);
       return;
     }
@@ -508,7 +619,7 @@ export async function processInboundEmail(
     if (policy.unknownSenderMode === 'triage' && policy.defaultTriageOrgId) {
       // Unknown sender: no requester and no acknowledgement (we would be
       // replying to an address the partner never vetted).
-      const t = await createFromEmail(n, partnerId, policy.defaultTriageOrgId, null, null, null, false);
+      const t = await createFromEmail(n, partnerId, policy.defaultTriageOrgId, null, null, null, false, policy.defaultAssigneeUserId);
       await logCreated(n, partnerId, t);
       return;
     }
@@ -516,8 +627,13 @@ export async function processInboundEmail(
     // (8) 'quarantine' (default) -> review queue for manual handling.
     await logInbound(n, partnerId, 'quarantined', null);
   } catch (err) {
-    // (9) Any guard/error -> failed, logged under the RESOLVED partner (or null if
-    // resolution failed). Never a cross-tenant write.
+    // #8972: the matched ticket was merged between the (unlocked) match and the
+    // comment's ticket lock. Not a failure of this message: rethrow so the outer
+    // transaction rolls back and BullMQ retries — the re-run matches through
+    // merged_into_ticket_id and lands the reply on the survivor.
+    if (err instanceof TicketMergedError) throw err;
+    // (9) Any guard/error after partner resolution -> failed, logged under the
+    // RESOLVED partner. Never a cross-tenant write.
     //
     // The outer work transaction is now poisoned (25P02): we CANNOT log on it. Record
     // the terminal `failed` row in a FRESH transaction (logInboundFailedDurable) so it
@@ -525,7 +641,43 @@ export async function processInboundEmail(
     // writes and BullMQ does NOT retry — the durable `failed` row is the terminal record
     // surfaced by the review queue.
     captureException(err instanceof Error ? err : new Error(String(err)));
-    await logInboundFailedDurable(n, partnerId, err);
+    // A failure BEFORE the partner was resolved (e.g. a transient error inside
+    // recipient resolution) has no review queue to land in: every queue is
+    // partner-scoped, so a partner_id NULL `failed` row is invisible to operators.
+    // Acknowledging it would lose the message, so rethrow and let BullMQ retry; an
+    // exhausted job stays visible in the queue's failed set.
+    if (partnerId === null) throw err;
+    const recorded = await logInboundFailedDurable(n, partnerId, err);
+    // Force the outer work transaction to ROLL BACK its partial writes. Returning
+    // normally here only rolls back when the caught error was a DATABASE error
+    // (which poisons the tx with 25P02); an ordinary application/JS exception thrown
+    // AFTER a ticket/comment/link was already written does NOT poison the tx, so a
+    // plain return would COMMIT that half-done work beside the separate `failed` row.
+    // Throwing guarantees rollback regardless of the error kind.
+    if (!recorded) {
+      // The terminal `failed` row could NOT be recorded (e.g. the database is down).
+      // Rethrow the ORIGINAL error, not the swallow-me sentinel, so the worker lets
+      // BullMQ RETRY the whole message — acknowledging it now would drop it with no
+      // record anywhere.
+      throw err;
+    }
+    // Recorded durably (or a concurrent retry already did): the `failed` row is the
+    // terminal record surfaced in the review queue, so the worker swallows this
+    // sentinel and BullMQ does NOT retry.
+    throw new InboundEmailProcessingRecorded(err);
+  }
+}
+
+/**
+ * Thrown by processInboundEmail AFTER a terminal `failed` row has been durably
+ * recorded (on its own connection). It exists solely to roll back the outer work
+ * transaction's partial writes. handleInboundEmail swallows it — the durable
+ * `failed` row is the terminal record, so BullMQ must NOT retry the job.
+ */
+export class InboundEmailProcessingRecorded extends Error {
+  constructor(public readonly reason: unknown) {
+    super('inbound email processing failed and was recorded as a durable failed row');
+    this.name = 'InboundEmailProcessingRecorded';
   }
 }
 
@@ -560,12 +712,13 @@ function createSenderResolver(from: string, partnerId: string): SenderResolver {
 async function logCreated(
   n: NormalizedInboundEmail,
   partnerId: string,
-  result: { id: string; lostClaimTo: string | null },
+  result: { id: string; lostClaimTo: string | null; assigneeNote?: string | null },
   note?: string
 ): Promise<void> {
   const notes = [
     result.lostClaimTo ? `lost message-id claim to ticket ${result.lostClaimTo}` : null,
     note ?? null,
+    result.assigneeNote ?? null,
   ].filter((v): v is string => v !== null);
   await logInbound(n, partnerId, 'created', result.id, notes.length ? notes.join('; ') : undefined);
 }
@@ -621,6 +774,51 @@ function inboundDomainOrNull(): string | null {
   }
 }
 
+interface PartnerStaffAccess {
+  orgAccess: 'all' | 'selected' | 'none';
+  orgIds: string[] | null;
+}
+
+// The outer sender as partner-level staff of `partnerId`, or null. Staff means an
+// ACTIVE user of this partner with no home org (users.org_id IS NULL: partner
+// staff, not a customer-org user and not the MSP's own internal-org staff) and a
+// partner_users membership in this partner. The membership's org access is
+// returned so the caller can require it to cover the target org.
+async function loadPartnerStaffAccess(address: string, partnerId: string): Promise<PartnerStaffAccess | null> {
+  const rows = await db.select({ orgAccess: partnerUsers.orgAccess, orgIds: partnerUsers.orgIds })
+    .from(users)
+    .innerJoin(partnerUsers, and(eq(partnerUsers.userId, users.id), eq(partnerUsers.partnerId, partnerId)))
+    .where(and(
+      eq(sql`lower(${users.email})`, address.trim().toLowerCase()),
+      eq(users.partnerId, partnerId),
+      isNull(users.orgId),
+      eq(users.status, 'active'),
+    ))
+    .limit(1);
+  return rows[0] ?? null;
+}
+
+// Whether the staff member could open `orgId`, by the rules the auth middleware
+// uses to build a partner member's accessible orgs (middleware/auth.ts): the
+// membership covers it ('all', or 'selected' listing it) AND the org belongs to
+// this partner, is active or trial, is not deleted, and is not the
+// unassigned-device holding org.
+async function staffCanReachOrg(access: PartnerStaffAccess, orgId: string, partnerId: string): Promise<boolean> {
+  const covered = access.orgAccess === 'all'
+    || (access.orgAccess === 'selected' && (access.orgIds?.includes(orgId) ?? false));
+  if (!covered) return false;
+  const rows = await db.select({ id: organizations.id }).from(organizations)
+    .where(and(
+      eq(organizations.id, orgId),
+      eq(organizations.partnerId, partnerId),
+      inArray(organizations.status, ['active', 'trial']),
+      ne(organizations.type, UNASSIGNED_POOL_ORG_TYPE),
+      isNull(organizations.deletedAt),
+    ))
+    .limit(1);
+  return rows.length > 0;
+}
+
 // Lower-cased domain part of an email address (everything after the last '@'),
 // or '' when the address is malformed. Used by the ingest-time self-loop drop.
 function senderDomain(addr: string): string {
@@ -651,7 +849,11 @@ async function createFromEmail(
   carryThreadKey: string | null,
   priorNumber: string | null,
   requester: EmailTicketRequester,
-  autoresponse: boolean
+  autoresponse: boolean,
+  defaultAssigneeUserId: string | null,
+  // #8883 W5 (Gate B14): the closed ticket this one continues; passed only on
+  // the closed-continuation path, so createTicket skips routing for it.
+  continuationOfTicketId: string | null = null
 ) {
   // GUARD (spec §6 layer 2): the resolved org MUST belong to the resolved partner before create.
   const orgOk = await db
@@ -666,13 +868,14 @@ async function createFromEmail(
   const ticket = await createTicket(
     {
       orgId,
-      subject: n.subject.replace(TOKEN_RE, '').trim() || '(no subject)',
+      subject: stripTicketTokens(n.subject) || '(no subject)',
       description,
       source: 'email',
       submitterEmail: n.from,
       submitterName: n.fromName,
       submittedBy: requester?.kind === 'portal' ? requester.portalUserId : undefined,
-      requesterContactId: requester?.kind === 'contact' ? requester.contactId : undefined
+      requesterContactId: requester?.kind === 'contact' ? requester.contactId : undefined,
+      ...(continuationOfTicketId ? { continuationOfTicketId } : {})
     },
     SYSTEM_ACTOR
   );
@@ -749,6 +952,18 @@ async function createFromEmail(
     await persistInboundAttachments(n, { ticketId: ticket.id, orgId, commentId });
   }
 
+  // Partner default assignee (settings.ticketing.inbound.defaultAssigneeUserId).
+  // Applies to every ticket this pipeline creates, and only when nothing else
+  // assigned it. Same transaction as the ticket: the assignment and its
+  // `ticket.assigned` outbox row commit or roll back with it, and the
+  // notification job is queued only from the committed row (#8040). A user who
+  // cannot own this ticket (disabled, removed, no access to this org) leaves it
+  // unassigned and is named in the inbound log; it never fails the message.
+  const defaultAssignee = await applyDefaultInboundAssignee(ticket, defaultAssigneeUserId, SYSTEM_ACTOR);
+  const assigneeNote = defaultAssignee.kind === 'skipped'
+    ? `default assignee not applied (${defaultAssignee.code}); ticket left unassigned`
+    : null;
+
   // One-time autoresponse — ONLY for an accepted known sender on a FRESH ticket.
   //
   // This used to be gated on `submittedBy && !priorNumber`, reading the presence
@@ -784,7 +999,7 @@ async function createFromEmail(
       subject: persisted[0]?.subject ?? '',
     });
   }
-  return { id: ticket.id, lostClaimTo };
+  return { id: ticket.id, lostClaimTo, assigneeNote };
 }
 
 /**

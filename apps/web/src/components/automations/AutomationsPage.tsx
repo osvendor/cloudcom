@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { TFunction } from 'i18next';
 import { Plus } from 'lucide-react';
@@ -6,17 +6,26 @@ import AutomationList, { type Automation } from './AutomationList';
 import AutomationRunHistory, {
   type AutomationRun as RunHistoryRun,
   type DeviceRunResult,
+  type DeviceCommandResult,
   type DeviceScriptResult,
 } from './AutomationRunHistory';
-import { fetchWithAuth, useAuthStore } from '../../stores/auth';
+import { fetchWithAuth, handleSessionExpired, useAuthStore } from '../../stores/auth';
+import { runAction, handleActionError, ActionError } from '@/lib/runAction';
 import { navigateTo } from '@/lib/navigation';
 import { usePermissions } from '@/lib/permissions';
-import { useHashTab } from '@/lib/useHashState';
-import type { TriggerFilter } from './AutomationList';
+import { useHashState, useHashTab } from '@/lib/useHashState';
+import type { MoveToFlowsColumn, TriggerFilter } from './AutomationList';
+import type { FlowConversionDto, FlowConversionState } from '@breeze/shared';
+import { useFlowsGate } from '../../stores/featuresStore';
+import { useOrgStore } from '../../stores/orgStore';
+import { ConversionPanel, parseConvertHash, CONVERT_HASH_PREFIX } from './conversion/ConversionPanel';
+import { JobsMigrationBanner } from './conversion/JobsMigrationBanner';
+import { conversionErrorMessage, listConversions } from './conversion/conversionApi';
 // Initializes the shared i18next singleton. Islands hydrate independently, so
 // an island that hydrates before whichever other island happens to pull i18n in
 // would otherwise render raw keys (and mismatch the SSR markup).
 import '../../lib/i18n';
+import { useStableT } from '@/lib/i18n/useStableT';
 
 type ModalMode = 'closed' | 'delete' | 'history' | 'run';
 
@@ -51,6 +60,18 @@ function asString(value: unknown): string | undefined {
 }
 
 type ScriptsT = TFunction<'scripts'>;
+
+const CONVERSION_STATES: readonly string[] = ['shadow', 'switched', 'reverted'];
+
+/** The additive `conversion` field on automation reads (#5221 Decision 9). */
+function toConversionSummary(raw: unknown): Automation['conversion'] {
+  if (!isPlainRecord(raw)) return null;
+  const id = asString(raw.id);
+  const flowId = asString(raw.flowId);
+  const state = asString(raw.state);
+  if (!id || !flowId || !state || !CONVERSION_STATES.includes(state)) return null;
+  return { id, flowId, state: state as FlowConversionState };
+}
 
 function toListAutomation(raw: unknown, t: ScriptsT): Automation {
   const item = isPlainRecord(raw) ? raw : {};
@@ -95,6 +116,7 @@ function toListAutomation(raw: unknown, t: ScriptsT): Automation {
       }))
       : [],
     enabled: Boolean(item.enabled),
+    conversion: toConversionSummary(item.conversion),
     lastRunAt: asString(item.lastRunAt),
     lastRunStatus: undefined,
     recentRuns: undefined,
@@ -146,6 +168,9 @@ function toRunHistoryRun(raw: unknown, automation: Automation): RunHistoryRun {
 }
 
 const RUN_HISTORY_POLL_MS = 4000;
+/** The conversions list route caps `limit` at 100; 20 pages covers 2,000 live conversions per state. */
+const CONVERSION_PAGE_SIZE = 100;
+const CONVERSION_PAGES_MAX = 20;
 
 const DEVICE_RESULT_STATUSES = ['pending', 'running', 'success', 'failed', 'skipped'] as const;
 
@@ -183,6 +208,32 @@ function toDeviceScriptResults(raw: unknown): DeviceScriptResult[] | undefined {
   return parsed.length > 0 ? parsed : undefined;
 }
 
+/** Parse the per-device execute_command results a run produced (#3188). */
+export function toDeviceCommandResults(raw: unknown): DeviceCommandResult[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const parsed = raw
+    .map((entry): DeviceCommandResult | null => {
+      if (!isPlainRecord(entry)) return null;
+      if (typeof entry.actionIndex !== 'number') return null;
+      return {
+        actionIndex: entry.actionIndex,
+        status: asString(entry.status) ?? 'pending',
+        output: asString(entry.output),
+        outputTruncated: entry.outputTruncated === true,
+        error: asString(entry.error),
+        errorTruncated: entry.errorTruncated === true,
+        message: asString(entry.message),
+      };
+    })
+    .filter((entry): entry is DeviceCommandResult => entry !== null);
+  if (raw.length > 0 && parsed.length === 0) {
+    console.warn(
+      `[AutomationsPage] discarded all ${raw.length} command result(s) for a device — unexpected payload shape`,
+    );
+  }
+  return parsed.length > 0 ? parsed : undefined;
+}
+
 function toDeviceRunResult(raw: unknown): DeviceRunResult | null {
   if (!isPlainRecord(raw)) return null;
   const deviceId = asString(raw.deviceId);
@@ -202,12 +253,14 @@ function toDeviceRunResult(raw: unknown): DeviceRunResult | null {
     output: asString(raw.output),
     error: asString(raw.error),
     scriptResults: toDeviceScriptResults(raw.scriptResults),
+    commandResults: toDeviceCommandResults(raw.commandResults),
   };
 }
 
 export default function AutomationsPage() {
   const { t } = useTranslation('scripts');
-  const { permissions } = usePermissions();
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
+  const { permissions, can } = usePermissions();
   // #3262 — mirrors canManagePartnerWidePolicies(auth) server-side. UX only;
   // the cancel route re-checks this on every request.
   const canManagePartnerWide = useAuthStore((s) => s.user?.canManagePartnerWide);
@@ -223,14 +276,30 @@ export default function AutomationsPage() {
     window.location.hash = next;
     setTab(next);
   };
+  // #5221 W06: "Move to Flows". The panel follows `#convert-<automationId>`.
+  const canWrite = can('automations', 'write');
+  const currentOrgId = useOrgStore((s) => s.currentOrgId);
+  const { enabled: flowsOn } = useFlowsGate();
+  const [convertId, setConvertId] = useHashState<string | null>(null, parseConvertHash);
+  const [liveConversions, setLiveConversions] = useState<FlowConversionDto[]>([]);
+  const openConversion = (automation: Automation) => {
+    window.location.hash = `${CONVERT_HASH_PREFIX}${automation.id}`;
+    setConvertId(automation.id);
+  };
+  const closeConversion = () => {
+    window.location.hash = tab;
+    setConvertId(null);
+  };
 
-  const fetchAutomations = useCallback(async () => {
+  // `background` reloads (after a conversion) keep the page mounted: the
+  // full-page spinner would unmount the banner and the open panel's state.
+  const fetchAutomations = useCallback(async (background = false) => {
     try {
-      setLoading(true);
+      if (!background) setLoading(true);
       setError(undefined);
       const response = await fetchWithAuth('/automations');
       if (!response.ok) {
-        throw new Error(t('automationsPage.errors.fetch'));
+        throw new Error(stableT('automationsPage.errors.fetch'));
       }
       const data = await response.json();
       const rows = data.data ?? data.automations ?? [];
@@ -240,15 +309,15 @@ export default function AutomationsPage() {
       // ones, which render read-only inline instead of being hidden — #3824.)
       setAutomations(
         Array.isArray(rows)
-          ? rows.map((row: unknown) => toListAutomation(row, t)).filter((automation) => !automation.managedByMonitorId)
+          ? rows.map((row: unknown) => toListAutomation(row, stableT)).filter((automation) => !automation.managedByMonitorId)
           : []
       );
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('automationsPage.errors.generic'));
+      setError(err instanceof Error ? err.message : stableT('automationsPage.errors.generic'));
     } finally {
       setLoading(false);
     }
-  }, [t]);
+  }, [stableT]);
 
   const fetchRunHistory = useCallback(async (automation: Automation) => {
     try {
@@ -282,9 +351,39 @@ export default function AutomationsPage() {
     }
   }, []);
 
+  // Fidelity for the column: the live (shadow / switched) conversions. A 404
+  // means Flows are off here; the column is then not shown at all.
+  const conversionsSeq = useRef(0);
+  const fetchConversions = useCallback(async () => {
+    const mine = ++conversionsSeq.current;
+    const all = async (state: 'shadow' | 'switched') => {
+      const out: FlowConversionDto[] = [];
+      for (let page = 0; page < CONVERSION_PAGES_MAX; page += 1) {
+        const r = await listConversions({ state, limit: CONVERSION_PAGE_SIZE, offset: page * CONVERSION_PAGE_SIZE });
+        out.push(...r.conversions);
+        if (r.conversions.length < CONVERSION_PAGE_SIZE || out.length >= r.total) break;
+      }
+      return out;
+    };
+    try {
+      const [shadow, switched] = await Promise.all([all('shadow'), all('switched')]);
+      if (mine === conversionsSeq.current) setLiveConversions([...shadow, ...switched]);
+    } catch (err) {
+      // Keep the badges already shown: the column works without them and the
+      // panel loads its own preview. A 404 means Flows are off here.
+      if (!(err instanceof ActionError) || err.status !== 404) {
+        console.warn('[AutomationsPage] could not load conversions', err);
+      }
+    }
+  }, []);
+
   useEffect(() => {
     fetchAutomations();
   }, [fetchAutomations]);
+
+  useEffect(() => {
+    if (flowsOn) void fetchConversions();
+  }, [flowsOn, fetchConversions]);
 
   // Live progress: while the history modal is open and any run is still in
   // progress, re-poll the run list so counts/statuses update (#2023). Stops
@@ -308,41 +407,47 @@ export default function AutomationsPage() {
     setModalMode('delete');
   };
 
+  // Run / toggle / delete go through runAction so every failure is toasted
+  // (#3531). The page-level `error` banner renders behind the delete modal's
+  // fixed z-50 scrim, so a failed delete used to be invisible.
   const handleRun = async (automation: Automation) => {
     setSubmitting(true);
     try {
-      const response = await fetchWithAuth(`/automations/${automation.id}/trigger`, {
-        method: 'POST'
+      await runAction({
+        request: () =>
+          fetchWithAuth(`/automations/${automation.id}/trigger`, {
+            method: 'POST'
+          }),
+        errorFallback: t('automationsPage.errors.run'),
+        onUnauthorized: handleSessionExpired,
+        friendly: conversionErrorMessage,
       });
-
-      if (!response.ok) {
-        throw new Error(t('automationsPage.errors.run'));
-      }
-
       await fetchAutomations();
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('automationsPage.errors.generic'));
+      handleActionError(err, t('automationsPage.errors.run'));
     } finally {
       setSubmitting(false);
     }
   };
 
   const handleToggle = async (automation: Automation, enabled: boolean) => {
+    const fallback = enabled ? t('automationsPage.errors.enable') : t('automationsPage.errors.disable');
     try {
-      const response = await fetchWithAuth(`/automations/${automation.id}`, {
-        method: 'PUT',
-        body: JSON.stringify({ enabled })
+      await runAction({
+        request: () =>
+          fetchWithAuth(`/automations/${automation.id}`, {
+            method: 'PUT',
+            body: JSON.stringify({ enabled })
+          }),
+        errorFallback: fallback,
+        onUnauthorized: handleSessionExpired,
+        friendly: conversionErrorMessage,
       });
-
-      if (!response.ok) {
-        throw new Error(enabled ? t('automationsPage.errors.enable') : t('automationsPage.errors.disable'));
-      }
-
       setAutomations(prev =>
         prev.map(a => (a.id === automation.id ? { ...a, enabled } : a))
       );
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('automationsPage.errors.generic'));
+      handleActionError(err, fallback);
     }
   };
 
@@ -363,22 +468,35 @@ export default function AutomationsPage() {
 
     setSubmitting(true);
     try {
-      const response = await fetchWithAuth(`/automations/${selectedAutomation.id}`, {
-        method: 'DELETE'
+      await runAction({
+        request: () =>
+          fetchWithAuth(`/automations/${selectedAutomation.id}`, {
+            method: 'DELETE'
+          }),
+        errorFallback: t('automationsPage.errors.delete'),
+        onUnauthorized: handleSessionExpired,
+        friendly: conversionErrorMessage,
       });
-
-      if (!response.ok) {
-        throw new Error(t('automationsPage.errors.delete'));
-      }
-
       await fetchAutomations();
       handleCloseModal();
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('automationsPage.errors.generic'));
+      // runAction already toasted; keep the confirmation modal open so the
+      // operator can retry or cancel, and do not refetch as if it succeeded.
+      handleActionError(err, t('automationsPage.errors.delete'));
     } finally {
       setSubmitting(false);
     }
   };
+
+  const moveToFlows: MoveToFlowsColumn | undefined = flowsOn
+    ? {
+        fidelityByAutomation: new Map(
+          liveConversions.map((c) => [c.automationId, { fidelity: c.fidelity, findings: c.findings }]),
+        ),
+        onOpen: openConversion,
+      }
+    : undefined;
+  const panelAutomation = flowsOn && convertId ? automations.find((a) => a.id === convertId) ?? null : null;
 
   if (loading) {
     return (
@@ -397,7 +515,7 @@ export default function AutomationsPage() {
         <p className="text-sm text-destructive">{error}</p>
         <button
           type="button"
-          onClick={fetchAutomations}
+          onClick={() => void fetchAutomations()}
           className="mt-4 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:opacity-90"
         >
           {t('common:actions.retry')}
@@ -413,23 +531,45 @@ export default function AutomationsPage() {
           <h1 className="text-xl font-semibold tracking-tight">{t('automationsPage.title')}</h1>
           <p className="text-muted-foreground">{t('automationsPage.description')}</p>
         </div>
+        {/* R1 (#5221 Decision 8): with Flows on, "New job" opens Flows (POST /automations is 410). */}
         <a
-          href="/jobs/new"
+          href={flowsOn ? '/flows' : '/jobs/new'}
+          data-testid="automations-new"
           className="inline-flex h-10 items-center justify-center gap-2 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground transition hover:opacity-90"
         >
           <Plus className="h-4 w-4" />
-          {t('automationsPage.actions.new')}
+          {flowsOn ? t('flows:jobs.migration.newJobOpensFlows') : t('automationsPage.actions.new')}
         </a>
       </div>
 
-      <nav className="flex gap-1 border-b" aria-label={t('automationsPage.tabs.ariaLabel')}>
+      {flowsOn && (
+        <JobsMigrationBanner
+          canWrite={canWrite}
+          orgId={currentOrgId}
+          onConverted={() => {
+            void fetchAutomations(true);
+            void fetchConversions();
+          }}
+        />
+      )}
+
+      {/* #7148: this row overflowed by 33px at 390px, clipping "Event rules"
+          mid-word. It stayed a plain button row (not OverflowTabs) because an
+          existing test contract (AutomationsPage.tabs.test.tsx) — and the
+          AutomationList trigger-select reverse-mapping it drives — depends on
+          `role="button"` + `aria-current="page"` semantics that OverflowTabs'
+          ARIA tabs pattern (`role="tab"` + `aria-selected`) doesn't provide.
+          overflow-x-auto + shrink-0 + whitespace-nowrap fixes the clipping
+          without changing that contract. */}
+      <nav className="flex gap-1 overflow-x-auto border-b" aria-label={t('automationsPage.tabs.ariaLabel')}>
         {JOB_TABS.map((key) => (
           <button
             key={key}
             type="button"
             onClick={() => switchTab(key)}
             aria-current={tab === key ? 'page' : undefined}
-            className={`-mb-px border-b-2 px-3 py-2 text-sm ${tab === key ? 'border-primary font-medium text-foreground' : 'border-transparent text-muted-foreground hover:text-foreground'}`}
+            data-testid={`automations-tab-${key}`}
+            className={`-mb-px shrink-0 whitespace-nowrap border-b-2 px-3 py-2 text-sm ${tab === key ? 'border-primary font-medium text-foreground' : 'border-transparent text-muted-foreground hover:text-foreground'}`}
           >
             {t(/* i18n-dynamic */ `automationsPage.tabs.${key}`)}
           </button>
@@ -451,7 +591,22 @@ export default function AutomationsPage() {
         onViewHistory={handleViewHistory}
         triggerFilter={triggerFilterForTab(tab)}
         onTriggerFilterChange={(value) => switchTab(FILTER_TO_TAB[value])}
+        moveToFlows={moveToFlows}
       />
+
+      {panelAutomation && (
+        <ConversionPanel
+          key={panelAutomation.id}
+          job={panelAutomation}
+          conversionId={panelAutomation.conversion?.id ?? null}
+          canWrite={canWrite}
+          onClose={closeConversion}
+          onChanged={() => {
+            void fetchAutomations(true);
+            void fetchConversions();
+          }}
+        />
+      )}
 
       {/* Delete Confirmation Modal */}
       {modalMode === 'delete' && selectedAutomation && (

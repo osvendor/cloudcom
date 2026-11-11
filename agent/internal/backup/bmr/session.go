@@ -3,6 +3,7 @@ package bmr
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -10,15 +11,29 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"runtime"
 	"strings"
 	"time"
 
+	"github.com/breeze-rmm/agent/internal/backup/integrity"
 	"github.com/breeze-rmm/agent/internal/backup/providers"
 	"github.com/breeze-rmm/agent/internal/httputil"
 )
 
+// newHTTPClient backs every core BMR trust-boundary request (authenticate,
+// exchange, progress, completion) — see certpin.go. VerifyPeerCertificate
+// runs alongside (never instead of) Go's normal certificate-chain
+// validation, so with no pin configured this is exactly the client that
+// existed before certificate pinning did.
 var newHTTPClient = func() *http.Client {
-	return &http.Client{Timeout: 30 * time.Second}
+	return &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				VerifyPeerCertificate: verifyPinnedServerCert,
+			},
+		},
+	}
 }
 
 var runRecovery = RunRecoveryContext
@@ -90,6 +105,20 @@ func RunRecoveryWithTokenContext(ctx context.Context, cfg RecoveryConfig) (*Reco
 		effectiveCfg.ExpectSystemState = SnapshotExpectsSystemState(bootstrap.Snapshot)
 		effectiveCfg.FileIndex = bootstrap.Snapshot.FileIndex
 	}
+	// The integrity expectation is resolved before anything is downloaded:
+	// a block this helper cannot understand, two blocks that disagree, or a
+	// block for another snapshot fails the recovery here.
+	bootstrapIntegrity, err := BootstrapIntegrity(bootstrap)
+	if err == nil {
+		effectiveCfg.Integrity, err = ResolveIntegrity(cfg.Integrity, bootstrapIntegrity)
+	}
+	if err == nil {
+		err = effectiveCfg.Integrity.CheckSnapshot(effectiveCfg.SnapshotID)
+	}
+	if err != nil {
+		result.Error = fmt.Sprintf("snapshot integrity expectation refused: %s", err.Error())
+		return completeAndReturn(err)
+	}
 
 	runResult, runErr := runRecovery(ctx, effectiveCfg, provider)
 	if runResult != nil {
@@ -146,10 +175,33 @@ var ErrCodeInvalid = fmt.Errorf("bmr: recovery code invalid or already used")
 type exchangeCodeRequest struct {
 	Code         string   `json:"code"`
 	Capabilities []string `json:"capabilities,omitempty"`
+	// HelperVersion lets the server refuse too-old recovery media with a
+	// 409 helper_version_too_old BEFORE it claims the one-time code
+	// (#5629). Omitted when empty; older servers ignore it.
+	HelperVersion string `json:"helperVersion,omitempty"`
+	// IntegrityProtocolVersion is the snapshot integrity protocol this
+	// helper implements (integrity.ProtocolVersion), so the server can tell
+	// a helper that checks snapshot attestations on restore from one that
+	// does not. Older servers ignore it.
+	IntegrityProtocolVersion int `json:"integrityProtocolVersion"`
+	// MediaPlatform is the OS this recovery media boots ("linux" or
+	// "windows"), so the server can refuse a code issued for the other
+	// platform with 409 media_platform_mismatch BEFORE claiming it. Omitted
+	// for any other OS; older servers ignore it.
+	MediaPlatform string `json:"mediaPlatform,omitempty"`
 }
 
-func ExchangeRecoveryCode(ctx context.Context, serverURL, code string) (string, *BootstrapResponse, error) {
-	payload, err := json.Marshal(exchangeCodeRequest{Code: code, Capabilities: ClientCapabilities()})
+// mediaPlatformFor maps a GOOS value to the server's mediaPlatform enum, or
+// "" (omitted) for an OS the server does not accept.
+func mediaPlatformFor(goos string) string {
+	if goos == "linux" || goos == "windows" {
+		return goos
+	}
+	return ""
+}
+
+func ExchangeRecoveryCode(ctx context.Context, serverURL, code, helperVersion string) (string, *BootstrapResponse, error) {
+	payload, err := json.Marshal(exchangeCodeRequest{Code: code, Capabilities: ClientCapabilities(), HelperVersion: helperVersion, IntegrityProtocolVersion: integrity.ProtocolVersion, MediaPlatform: mediaPlatformFor(runtime.GOOS)})
 	if err != nil {
 		return "", nil, fmt.Errorf("bmr: marshal exchange request: %w", err)
 	}
@@ -162,7 +214,14 @@ func ExchangeRecoveryCode(ctx context.Context, serverURL, code string) (string, 
 
 	resp, err := newHTTPClient().Do(req)
 	if err != nil {
-		return "", nil, fmt.Errorf("bmr: exchange request failed: %w", err)
+		// A cancelled/expired caller context is the caller's own doing, not
+		// a reachability problem with the server — keep it a plain error.
+		if ctx.Err() != nil {
+			return "", nil, fmt.Errorf("bmr: exchange request failed: %w", err)
+		}
+		// No HTTP response at all (DNS, connect, TLS, timeout): the code
+		// never reached a server, so it must not read as a rejected code.
+		return "", nil, &ServerUnreachableError{Host: req.URL.Host, Err: err}
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -171,20 +230,39 @@ func ExchangeRecoveryCode(ctx context.Context, serverURL, code string) (string, 
 		return "", nil, fmt.Errorf("bmr: read exchange response: %w", err)
 	}
 
-	if resp.StatusCode == http.StatusNotFound {
-		return "", nil, ErrCodeInvalid
+	// Every non-success Breeze answer on this route is a JSON object with a
+	// string `error` (code_invalid, a negotiation code, a rate-limit
+	// message). Anything else came from some other web server — the usual
+	// cause is a wrong server URL — and says nothing about the code (#7649).
+	notBreeze := func() error {
+		return &UnexpectedServerResponseError{Host: req.URL.Host, StatusCode: resp.StatusCode, ContentType: resp.Header.Get("Content-Type")}
 	}
 	if resp.StatusCode == http.StatusConflict {
+		// Always a terminal negotiation refusal, JSON or not (a non-JSON 409
+		// degrades to Code "unknown" — see parseRecoveryNegotiationError).
 		return "", nil, parseRecoveryNegotiationError(resp.StatusCode, data)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		var errorBody map[string]any
-		if err := json.Unmarshal(data, &errorBody); err == nil {
-			if message, ok := errorBody["error"].(string); ok && message != "" {
-				return "", nil, fmt.Errorf("bmr: exchange failed: %s", message)
-			}
+		errorCode, isBreezeError := breezeErrorCode(data)
+		if !isBreezeError {
+			return "", nil, notBreeze()
 		}
-		return "", nil, fmt.Errorf("bmr: exchange failed with status %d", resp.StatusCode)
+		// 404 {"error":"code_invalid"} is an unknown/used/expired/
+		// wrong-status code. A Breeze 400 is the typed input itself being
+		// refused: {"error":"code_invalid"} when it does not normalize to a
+		// code, or zValidator's object-shaped error for an over-long one
+		// (routes/backup/bmrRecoveries.ts, bmrExchangeSchema).
+		if (resp.StatusCode == http.StatusBadRequest && (errorCode == "code_invalid" || isRequestValidationError(data))) ||
+			(resp.StatusCode == http.StatusNotFound && errorCode == "code_invalid") {
+			return "", nil, ErrCodeInvalid
+		}
+		if resp.StatusCode == http.StatusNotFound {
+			return "", nil, notBreeze()
+		}
+		if errorCode == "" {
+			return "", nil, fmt.Errorf("bmr: exchange failed with status %d", resp.StatusCode)
+		}
+		return "", nil, fmt.Errorf("bmr: exchange failed: %s", errorCode)
 	}
 
 	var body struct {
@@ -192,7 +270,7 @@ func ExchangeRecoveryCode(ctx context.Context, serverURL, code string) (string, 
 		Bootstrap json.RawMessage `json:"bootstrap"`
 	}
 	if err := json.Unmarshal(data, &body); err != nil {
-		return "", nil, fmt.Errorf("bmr: decode exchange response: %w", err)
+		return "", nil, notBreeze()
 	}
 	if body.Token == "" || len(body.Bootstrap) == 0 {
 		return "", nil, fmt.Errorf("bmr: exchange response missing token or bootstrap")
@@ -258,10 +336,12 @@ func (e *authenticateStatusError) Error() string {
 type authenticateRequest struct {
 	Token        string   `json:"token"`
 	Capabilities []string `json:"capabilities,omitempty"`
+	// IntegrityProtocolVersion: see exchangeCodeRequest.
+	IntegrityProtocolVersion int `json:"integrityProtocolVersion"`
 }
 
 func authenticateRecoverySessionContext(ctx context.Context, serverURL, token string) (*BootstrapResponse, error) {
-	payload, err := json.Marshal(authenticateRequest{Token: token, Capabilities: ClientCapabilities()})
+	payload, err := json.Marshal(authenticateRequest{Token: token, Capabilities: ClientCapabilities(), IntegrityProtocolVersion: integrity.ProtocolVersion})
 	if err != nil {
 		return nil, fmt.Errorf("bmr: marshal authenticate request: %w", err)
 	}

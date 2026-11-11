@@ -42,6 +42,7 @@
   },
   "denyPrompt": "Pourquoi refusez-vous cette demande ? Le motif est facultatif.",
   "denyReasonPlaceholder": "Facultatif — communiqué au demandeur",
+  "denyReasonShownToUserHint": "L’utilisateur final voit ceci dans sa notification (500 premiers caractères).",
   "confirmDeny": "Confirmer le refus",
   "cancel": "Annuler",
   "deny": "Refuser",
@@ -67,6 +68,7 @@
     "noApproverDevice": "Enregistrez un appareil d’approbation dans votre profil, puis réessayez.",
     "notSoleApprover": "Une autre personne habilitée doit décider de cette demande.",
     "siteCeiling": "Cette approbation accorde une autorité à l'échelle de l'organisation. Votre accès est limité à des sites spécifiques, donc une autre personne habilitée doit décider de cette demande.",
+    "approverScopeRequired": "Cette approbation concerne toutes les organisations du partenaire : elle nécessite donc un approbateur au niveau du partenaire ayant accès à toutes les organisations.",
     "verificationFailed": "La vérification a été annulée ou a échoué. Réessayez.",
     "alreadyDecided": "Cette demande a déjà été traitée.",
     "expired": "Cette demande a expiré avant qu’une décision ne soit prise.",
@@ -98,6 +100,7 @@
     "loading": "Chargement des approbations récentes…",
     "error": "Impossible de charger les approbations récentes.",
     "retry": "Réessayer",
+    "decisionReasonLabel": "Motif de l’approbateur",
     "empty": "Rien ne s’est terminé récemment.",
     "status": {
       "failed": "Échec",
@@ -106,10 +109,73 @@
       "cancelled": "Annulée",
       "completed": "Terminée",
       "denied": "Refusée",
+      "refused": "Approuvée, puis bloquée",
       "approved": "Approuvée",
       "reported": "Signalée",
       "unknown": "Inconnu"
     }
   },
-  "proposedByAgentExecuteNotice": "Approuver ceci l'exécute maintenant — ce n'est pas un essai, même en mode ombre."
+  "proposedByAgentExecuteNotice": "Approuver ceci l'exécute maintenant — ce n'est pas un essai, même en mode ombre.",
+  "assuranceDefaultNotice": {
+    "upcomingTitle": "Les appareils d’approbateur seront requis à partir du {{date}}",
+    "upcomingBody": "Aucun choix de sécurité des approbations n’a été enregistré pour votre compte partenaire ; la valeur par défaut de la plateforme s’applique donc : à partir du {{date}}, approuver une demande à risque élevé ou critique nécessite un appareil d’approbateur enregistré au lieu d’un simple clic. Enregistrez un appareil d’ici là pour ne pas retarder les approbations.",
+    "activeTitle": "Les approbations à risque élevé nécessitent un appareil d’approbateur",
+    "activeBody": "Depuis le {{date}}, la valeur par défaut de la plateforme exige un appareil d’approbateur enregistré pour approuver les demandes à risque élevé et critique, car aucun choix de sécurité des approbations n’a été enregistré pour votre compte partenaire. C’est pourquoi ces approbations demandent votre appareil.",
+    "settingsLink": "Vérifier la sécurité des approbations",
+    "registerLink": "Enregistrer un appareil d’approbateur"
+  },
+  "diagnosticAccess": {
+    "title": "Accès de diagnostic en lecture seule",
+    "organization": "Organisation",
+    "device": "Appareil",
+    "access": "Accès",
+    "readOnlyOps": "Lecture seule : {{operations}}. Aucune écriture, suppression, aucun renommage, script ou modification du registre.",
+    "duration": "Durée",
+    "durationValue": "{{minutes}} minutes après l'approbation",
+    "purpose": "Objectif",
+    "requestedBy": "Demandé par",
+    "principalUser": "Breeze AI",
+    "principalApiKey": "Clé d'API MCP",
+    "principalOauth": "Connexion OAuth MCP",
+    "paths": "Chemins",
+    "recursive": "Toute l'arborescence",
+    "thisFolderOnly": "Ce dossier et les fichiers qu'il contient directement",
+    "sensitiveHeading": "Magasins sensibles demandés explicitement",
+    "noSensitive": "Les emplacements connus des mots de passe et cookies du navigateur, des magasins d'identifiants, des clés privées et des jetons enregistrés sont retenus, même dans ces chemins. Il s'agit d'une liste fixe ; tout le reste dans ces chemins est lisible.",
+    "opList": "lister",
+    "opRead": "lire",
+    "classes": {
+      "browser_secrets": "Mots de passe, cookies du navigateur et leurs clés",
+      "credential_store": "Magasins d'identifiants du système d'exploitation",
+      "private_keys": "Clés privées (SSH, GnuPG, TLS)",
+      "session_tokens": "Jetons de session et identifiants cloud enregistrés"
+    }
+  },
+  "operatorPlan": {
+    "title": "Plan de la tâche IA",
+    "summary_one": "{{count}} effet, révision {{revision}} du plan",
+    "summary_other": "{{count}} effets, révision {{revision}} du plan",
+    "groupBreeze": "Appareils Breeze",
+    "groupM365": "Microsoft 365",
+    "groupGoogle": "Google Workspace",
+    "effectOrdinal": "Étape {{ordinal}}",
+    "targetLine": "{{targetLabel}} ({{principalLabel}})",
+    "orderNote": "Les effets s’exécutent dans cet ordre. La connexion est désactivée en dernier, de sorte qu’un arrêt anticipé ne laisse jamais de messages sans acheminement.",
+    "empty": "Ce plan ne contient aucun effet.",
+    "invalid": "Ce plan n’a pas pu être affiché en entier. Ne l’approuvez pas."
+  },
+  "intentStatus": {
+    "title": "État de l’approbation",
+    "waitingForApprovers": "En attente des approbateurs",
+    "notFound": "Cette approbation est introuvable.",
+    "status": {
+      "pending_approval": "Approbation en attente",
+      "in_progress": "En cours",
+      "completed": "Terminée",
+      "failed": "Échec",
+      "rejected": "Refusé",
+      "expired": "Expirée",
+      "cancelled": "Annulée"
+    }
+  }
 }

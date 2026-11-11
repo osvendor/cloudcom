@@ -7,6 +7,7 @@ import { snapshotsRoutes } from './snapshots';
 import { reconcileRoutes } from './reconcile';
 import { restoreRoutes } from './restore';
 import { dashboardRoutes } from './dashboard';
+import { backupHealthRoutes } from './health';
 import { backupVerificationRoutes } from './verification';
 import { vssRoutes } from './vss';
 import { encryptionRoutes } from './encryption';
@@ -18,6 +19,7 @@ import { hypervRoutes } from './hyperv';
 import { slaRoutes } from './sla';
 import { vaultRoutes } from './vault';
 import { backupProviderRoutes } from './providers';
+import { storageCredentialRoutes } from './storageCredentials';
 
 export const backupRoutes = new Hono();
 
@@ -32,12 +34,19 @@ backupRoutes.use('*', authMiddleware);
 backupRoutes.use('*', requireScope('organization', 'partner', 'system'));
 
 backupRoutes.route('/', configsRoutes);
+// /backup/storage-credentials/* — carries its own prefix, like configsRoutes.
+backupRoutes.route('/', storageCredentialRoutes);
 backupRoutes.route('/', profilesRoutes);
 backupRoutes.route('/', jobsRoutes);
 backupRoutes.route('/', snapshotsRoutes);
 backupRoutes.route('/', reconcileRoutes);
 backupRoutes.route('/', restoreRoutes);
 backupRoutes.route('/', dashboardRoutes);
+// GET /backup/health/devices. Mounted AFTER dashboardRoutes and BEFORE
+// backupVerificationRoutes is irrelevant for correctness — '/health/devices'
+// and '/health' are distinct static paths — but keeping the two health
+// surfaces adjacent makes the split obvious to the next reader.
+backupRoutes.route('/', backupHealthRoutes);
 backupRoutes.route('/', backupVerificationRoutes);
 backupRoutes.route('/', bmrRoutes);
 backupRoutes.route('/', bmrRecoveryRoutes);

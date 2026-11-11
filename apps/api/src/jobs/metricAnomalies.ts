@@ -11,6 +11,8 @@ import {
 } from '../services/metricAnomalies';
 import { getBullMQConnection } from '../services/redis';
 import { attachWorkerObservability } from './workerObservability';
+import { registerEpisodeCloseAlertHandler } from '../services/metricAnomalyEpisodeAlerts';
+import { notParkedDeviceCondition } from '../services/unassignedPool/selectorPredicate';
 
 const METRIC_ANOMALIES_QUEUE = 'metric-anomalies';
 const SCAN_CRON_PATTERN = '*/10 * * * *';
@@ -135,7 +137,7 @@ async function findAnomalyOrgRows(): Promise<Array<{ orgId: string }>> {
   const deviceOrgs = await db
     .select({ orgId: devices.orgId })
     .from(devices)
-    .where(sql`${devices.status} <> 'decommissioned' AND ${devices.isEphemeral} = false`)
+    .where(sql`${devices.status} <> 'decommissioned' AND ${devices.isEphemeral} = false AND ${notParkedDeviceCondition()}`)
     .groupBy(devices.orgId);
   const openEpisodeOrgs = await db
     .select({ orgId: metricAnomalyEpisodes.orgId })
@@ -272,6 +274,9 @@ async function scheduleMetricAnomaliesScan(): Promise<void> {
 }
 
 export async function initializeMetricAnomaliesWorker(): Promise<void> {
+  // W02: the resolve stage runs in this worker; wire its close hook before
+  // the first job can run.
+  registerEpisodeCloseAlertHandler();
   metricAnomaliesWorker = createMetricAnomaliesWorker();
   attachWorkerObservability(metricAnomaliesWorker, 'metricAnomaliesWorker');
   metricAnomaliesWorker.on('error', (error) => {

@@ -10,8 +10,9 @@
 // shared ValueInput renders `between` as a date-range picker only, so exposing
 // it on a number field would render the wrong widget. Every operator listed
 // here is both backend-valid and renderable by ValueInput/OperatorSelector.
+import i18next from 'i18next';
 import type { FilterFieldDefinition, FilterOperator } from '@breeze/shared';
-import { DEVICE_FUNCTION_KEYS } from '@breeze/shared';
+import { DEVICE_FUNCTION_KEYS, WORKLOAD_RUNTIMES } from '@breeze/shared';
 
 const S: FilterOperator[] = ['equals', 'notEquals', 'contains', 'notContains', 'startsWith', 'endsWith', 'matches', 'in', 'notIn', 'isNull', 'isNotNull'];
 const N: FilterOperator[] = ['equals', 'notEquals', 'greaterThan', 'greaterThanOrEquals', 'lessThan', 'lessThanOrEquals', 'isNull', 'isNotNull'];
@@ -27,6 +28,7 @@ export const FILTER_FIELDS: FilterFieldDefinition[] = [
   { key: 'status', label: 'Status', category: 'core', type: 'enum', operators: E,
     enumValues: ['online', 'offline', 'maintenance', 'decommissioned', 'quarantined', 'updating', 'pending'] },
   { key: 'agentVersion', label: 'Agent Version', category: 'core', type: 'string', operators: S },
+  { key: 'helperVersion', label: 'Helper Version', category: 'core', type: 'string', operators: S },
   { key: 'enrolledAt', label: 'Enrolled At', category: 'core', type: 'datetime', operators: DT },
   { key: 'lastSeenAt', label: 'Last Seen At', category: 'core', type: 'datetime', operators: DT },
   { key: 'tags', label: 'Tags', category: 'core', type: 'array', operators: A },
@@ -37,15 +39,25 @@ export const FILTER_FIELDS: FilterFieldDefinition[] = [
     enumValues: [...DEVICE_FUNCTION_KEYS] },
   { key: 'lastUser', label: 'Last User', category: 'core', type: 'string', operators: S },
   { key: 'isHeadless', label: 'Headless', category: 'core', type: 'boolean', operators: B },
+  // Workload host inventory (#8193): devices.hosts_workloads / workload_runtimes.
+  { key: 'hostsWorkloads', label: 'Hosts Workloads', category: 'core', type: 'boolean', operators: B },
+  { key: 'workloadRuntimes', label: 'Workload Runtimes', category: 'core', type: 'array', operators: A,
+    enumValues: [...WORKLOAD_RUNTIMES] },
   { key: 'uptimeSeconds', label: 'Uptime (seconds)', category: 'core', type: 'number', operators: N },
   { key: 'watchdogStatus', label: 'Watchdog Status', category: 'core', type: 'enum', operators: E, enumValues: ['connected', 'failover', 'offline'] },
   { key: 'quarantinedAt', label: 'Quarantined At', category: 'core', type: 'datetime', operators: DT },
   // Device-state predicates — backend models these as booleans (EXISTS against
   // device_patches / alerts / patch_job_results); operators equals/notEquals so
   // the negative case ("is not") is expressible.
+  { key: 'networkIsolation.active', category: 'core', type: 'boolean', operators: B,
+    get label() { return i18next.t('devices:networkIsolation.filterLabel', { defaultValue: 'Isolated' }); } },
   { key: 'patches.pending', label: 'Needs Patches', category: 'core', type: 'boolean', operators: B },
   { key: 'alerts.critical', label: 'Critical Alert Active', category: 'core', type: 'boolean', operators: B },
   { key: 'system.rebootRequired', label: 'Reboot Required', category: 'core', type: 'boolean', operators: B },
+  // Log-shipping health (#8611): online device whose log shipping has been
+  // failing for >= 30 min. Refused as an execution-target field (see
+  // lib/executionRefusedFields.ts).
+  { key: 'logShippingFailing', label: 'Log Shipping Failing', category: 'core', type: 'boolean', operators: B },
 
   // OS
   { key: 'osType', label: 'OS Type', category: 'os', type: 'enum', operators: E, enumValues: ['windows', 'macos', 'linux'] },
@@ -62,6 +74,12 @@ export const FILTER_FIELDS: FilterFieldDefinition[] = [
   { key: 'hardware.ramTotalMb', label: 'RAM (MB)', category: 'hardware', type: 'number', operators: N },
   { key: 'hardware.diskTotalGb', label: 'Disk Size (GB)', category: 'hardware', type: 'number', operators: N },
   { key: 'hardware.gpuModel', label: 'GPU Model', category: 'hardware', type: 'string', operators: S },
+  // Storage/RAID health rollup (#6854) — device_hardware_health, not device_hardware.
+  { key: 'hardware.health', label: 'Hardware Health', category: 'hardware', type: 'enum', operators: E,
+    enumValues: ['ok', 'warning', 'critical', 'unknown'] },
+  // Stored device_warranty.status (#9863); a device with no warranty record is 'unknown'.
+  { key: 'warranty.status', label: 'Warranty Status', category: 'hardware', type: 'enum', operators: E,
+    enumValues: ['active', 'expiring', 'expired', 'unknown', 'subscription_active'] },
 
   // Network
   { key: 'network.ipAddress', label: 'IP Address', category: 'network', type: 'string', operators: S },
@@ -79,10 +97,13 @@ export const FILTER_FIELDS: FilterFieldDefinition[] = [
   { key: 'software.installed', label: 'Has Software Installed', category: 'software', type: 'string', operators: ['contains', 'notContains', 'equals', 'in', 'hasAny', 'hasAll'] },
   { key: 'software.notInstalled', label: 'Missing Software', category: 'software', type: 'string', operators: ['contains', 'equals', 'in', 'hasAny'] },
 
+  { key: 'software.version', label: 'Software Version', category: 'software', type: 'string', operators: ['below', 'atLeast', 'equals'] },
+  { key: 'software.vendor', label: 'Software Vendor', category: 'software', type: 'string', operators: ['contains', 'equals'] },
+
   // Hierarchy
   { key: 'orgId', label: 'Organization', category: 'hierarchy', type: 'string', operators: ['equals', 'in'] },
   { key: 'siteId', label: 'Site', category: 'hierarchy', type: 'string', operators: ['equals', 'in'] },
-  { key: 'groupId', label: 'Device Group', category: 'hierarchy', type: 'string', operators: ['equals', 'in'] },
+  { key: 'groupId', label: 'Device Group', category: 'hierarchy', type: 'string', operators: ['equals', 'notEquals', 'in', 'notIn'], description: 'Group membership. Excluding a dynamic group uses its last evaluated membership.' },
 
   // Computed
   { key: 'daysSinceLastSeen', label: 'Days Since Last Seen', category: 'computed', type: 'number', operators: N, computed: true },

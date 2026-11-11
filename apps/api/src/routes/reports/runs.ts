@@ -1,8 +1,9 @@
 import { Hono } from 'hono';
+import { reportRunOwnerColumns } from '../../services/reportRunOwner';
 import { zValidator } from '../../lib/validation';
 import { and, eq, or, sql, desc, inArray, type SQL } from 'drizzle-orm';
-import { db } from '../../db';
-import { reports, reportRuns } from '../../db/schema';
+import { db, withDbTransaction } from '../../db';
+import { organizations, reports, reportRuns, reportSeries } from '../../db/schema';
 import { authMiddleware, requirePermission, requireScope } from '../../middleware/auth';
 import { writeRouteAudit } from '../../services/auditEvents';
 import { auditSensitiveRead } from '../../services/sensitiveReadAudit';
@@ -26,13 +27,24 @@ import {
   REPORT_TYPE_PERMISSION_DENIED,
 } from '../../services/reportTypePermissions';
 import type { UserPermissions } from '../../services/permissions';
-import { rowsToCsv, rowsToTsv } from '@breeze/shared';
+import {
+  isTicketSlaPerformanceSummary,
+  reportRunRowsToCsv,
+  rowsToXlsx,
+  sheetsToXlsx,
+  ticketSlaPerformanceSheets,
+  XLSX_MIME_TYPE,
+  XlsxLimitError,
+  type XlsxSheet,
+} from '@breeze/shared';
 import {
   getPagination, getReportWithOrgCheck, getReportRunWithOrgCheck, isPortalSelfServiceLocked,
   isSystemManagedReportDefinition, PARTNER_OWNED_REPORT, partnerOwnedReportVisibility,
   partnerWideListTarget,
   systemPartnerWideListArm,
   PORTAL_SELF_SERVICE_REPORT,
+  REPORT_TENANT_INACTIVE,
+  resolveOrgReportAuthority,
 } from './helpers';
 import { downloadQuerySchema, listRunsSchema } from './schemas';
 // Execution plane W05 (spec §6.3) — attach an analysis artifact by reference.
@@ -90,7 +102,10 @@ runsRoutes.post(
 
     // Ruling P8b: a type whose read permissions the caller lacks is hidden by
     // the loader, so generate-by-id on it answers 404 (not the 403 below).
-    const report = await getReportWithOrgCheck(reportId, auth, permissions);
+    // #6699 decision B: loaded as 'read_history' so an out-of-service owner
+    // gets the explicit tenant_inactive 403 below; the live 'read' resolution
+    // below is what refuses it.
+    const report = await getReportWithOrgCheck(reportId, auth, permissions, 'read_history');
     if (!report) {
       return c.json({ error: 'Report not found' }, 404);
     }
@@ -140,6 +155,9 @@ runsRoutes.post(
     const liveResult = owner.partnerId !== undefined
       ? await resolveRequestPartnerReportAuthority(auth, owner.partnerId, 'read')
       : await resolveRequestReportAuthority(auth, owner.orgId, 'read');
+    if (!liveResult.ok && liveResult.reason === 'tenant_inactive') {
+      return c.json(REPORT_TENANT_INACTIVE, 403);
+    }
     if (!liveResult.ok || liveResult.authority.scope.kind === 'legacy_unscoped') {
       return c.json({ error: 'Access to report scope denied' }, 403);
     }
@@ -186,16 +204,25 @@ runsRoutes.post(
       throw error;
     }
 
-    // Create a new report run
+    // Create a new report run. Multi-org series W01 (spec §3.2): this route
+    // never emails, so a manual run of a SCHEDULED definition is recorded as
+    // 'not_scheduled' — distinct from the schedule's own deliveries, which the
+    // list's latest-delivery warning reads. A one-time definition has no
+    // schedule to contrast with and stays NULL.
+    const deliveryStatus = report.schedule && report.schedule !== 'one_time'
+      ? ('not_scheduled' as const)
+      : null;
     const [run] = await db
       .insert(reportRuns)
       .values({
         reportId: report.id,
+        ...reportRunOwnerColumns(report),
         status: 'pending',
         startedAt: new Date(),
         requestedByKind: 'user',
         requestedByUserId: auth.user.id,
         requestedByPortalUserId: null,
+        deliveryStatus,
         ...persistedSiteScopeValues(executionAuthority),
       })
       .returning();
@@ -227,29 +254,34 @@ runsRoutes.post(
       // context (runInReportScope, ruling P6). A mismatch between the owner
       // axis and the authority throws ReportScopeMismatchError — recorded on
       // the run below like any other failure.
-      const scope = await reportScopeFromAuthority(owner, executionAuthority);
-      const result = await generateReport(
-        report.type,
-        scope,
-        config,
-        executionAuthority,
-      );
-      const previous = await previousBaselineFor(
-        report.id,
-        executionAuthority.fingerprint,
-      );
-      if (previous) result.previous = previous;
-      const rowCount = result.rowCount ?? (Array.isArray(result.rows) ? result.rows.length : 0);
-      await db
-        .update(reportRuns)
-        .set({
-          status: 'completed',
-          completedAt: new Date(),
-          outputUrl: `/api/reports/runs/${run.id}/download`,
-          result,
-          rowCount
-        })
-        .where(eq(reportRuns.id, run.id));
+      // One savepoint around generation and the completed update: if report SQL
+      // fails, it rolls back so the mark-failed update in the catch can still run
+      // in a live transaction (#11203).
+      await withDbTransaction(async () => {
+        const scope = await reportScopeFromAuthority(owner, executionAuthority);
+        const result = await generateReport(
+          report.type,
+          scope,
+          config,
+          executionAuthority,
+        );
+        const previous = await previousBaselineFor(
+          report.id,
+          executionAuthority.fingerprint,
+        );
+        if (previous) result.previous = previous;
+        const rowCount = result.rowCount ?? (Array.isArray(result.rows) ? result.rows.length : 0);
+        await db
+          .update(reportRuns)
+          .set({
+            status: 'completed',
+            completedAt: new Date(),
+            outputUrl: `/api/reports/runs/${run.id}/download`,
+            result,
+            rowCount
+          })
+          .where(eq(reportRuns.id, run.id));
+      });
       return c.json({ message: 'Report generated', runId: run.id, status: 'completed' });
     } catch (err) {
       await db
@@ -313,7 +345,12 @@ runsRoutes.get(
       if (!auth.orgId) {
         return c.json({ error: 'Organization context required' }, 403);
       }
-      const result = await resolveRequestReportAuthority(auth, auth.orgId, 'read');
+      // #6771: an org token may only name its own org.
+      if (query.orgId && query.orgId !== auth.orgId) {
+        return c.json({ error: 'Access to this organization denied' }, 403);
+      }
+      // #6699 decision B: listing runs is read-only history.
+      const result = await resolveRequestReportAuthority(auth, auth.orgId, 'read_history');
       if (!result.ok || result.authority.scope.kind === 'legacy_unscoped') {
         return c.json({ data: [], pagination: { page, limit, total: 0 } });
       }
@@ -325,12 +362,23 @@ runsRoutes.get(
         reportRuns,
         result.authority.scope,
       );
+    } else if (auth.scope === 'partner' && query.orgId) {
+      // #6771: a single-org run listing — the ONLY way a partner lists an
+      // out-of-service org's runs (served from the verified report-history
+      // reach by resolveOrgReportAuthority; the unfiltered listing below stays
+      // active-only). Org-owned runs only, like GET /reports?orgId=.
+      const result = await resolveOrgReportAuthority(auth, query.orgId, 'read_history');
+      if (!result.ok || result.authority.scope.kind === 'legacy_unscoped') {
+        return c.json({ error: 'Access to this organization denied' }, 403);
+      }
+      conditions.push(eq(reports.orgId, query.orgId));
+      runScopePredicate = reportRunScopeSqlPredicate(reportRuns, result.authority.scope);
     } else if (auth.scope === 'partner') {
       const orgIds = auth.accessibleOrgIds ?? [];
       const authorityMap = await resolveRequestReportAuthorityMap(
         auth,
         orgIds,
-        'read',
+        'read_history',
       );
       const scopes: LiveSiteScopeV1[] = [];
       for (const result of authorityMap.values()) {
@@ -357,6 +405,10 @@ runsRoutes.get(
         // exactly the pre-W01 three-argument call.
         ...(partnerWide ? [partnerWide] : []),
       );
+    } else if (query.orgId) {
+      // System scope, single org (#6771 parity with GET /reports?orgId=).
+      conditions.push(eq(reports.orgId, query.orgId));
+      runScopePredicate = unrestrictedReportRunScopeSqlPredicate(reportRuns);
     } else {
       // System scope. #3198 W02 (addendum B7, ruling P9): partner-owned runs
       // with a well-formed partner_wide envelope list too (the run carries its
@@ -388,7 +440,9 @@ runsRoutes.get(
       .where(whereCondition);
     const total = Number(countResult[0]?.count ?? 0);
 
-    // Get runs with report info
+    // Get runs with report info. Multi-org series W01 (spec §3.6): the owning
+    // org (LEFT join — a partner-owned definition has none) and the run's
+    // delivery summary.
     const runsList = await db
       .select({
         id: reportRuns.id,
@@ -401,10 +455,18 @@ runsRoutes.get(
         rowCount: reportRuns.rowCount,
         createdAt: reportRuns.createdAt,
         reportName: reports.name,
-        reportType: reports.type
+        reportType: reports.type,
+        orgId: reports.orgId,
+        orgName: organizations.name,
+        seriesId: reports.seriesId,
+        seriesName: reportSeries.name,
+        deliveryStatus: reportRuns.deliveryStatus,
+        recipientCount: reportRuns.recipientCount
       })
       .from(reportRuns)
       .innerJoin(reports, eq(reportRuns.reportId, reports.id))
+      .leftJoin(organizations, eq(organizations.id, reports.orgId))
+      .leftJoin(reportSeries, eq(reportSeries.id, reports.seriesId))
       .where(whereCondition)
       .orderBy(desc(reportRuns.createdAt), desc(reportRuns.id))
       .limit(limit)
@@ -505,9 +567,35 @@ runsRoutes.get(
     }
 
     if (format === 'excel') {
-      const body = rowsToTsv(rows);
-      c.header('Content-Type', 'application/vnd.ms-excel');
-      c.header('Content-Disposition', `attachment; filename="${baseName}.xls"`);
+      // #9956: a real .xlsx workbook (was TSV text saved as .xls, which Excel
+      // opened only after a format-mismatch warning).
+      // #11277: the SLA performance workbook carries the breaches and notes
+      // sheets too; a priorities-only sheet would read as complete while every
+      // breach is missing, so refuse rather than fall back to it.
+      let sheets: XlsxSheet[] | null = null;
+      if (row.reportType === 'ticket_sla_performance') {
+        const summary = result?.summary;
+        if (!isTicketSlaPerformanceSummary(summary)) {
+          // A completed run whose stored summary fails the shape guard is a
+          // data anomaly (shape drift or a corrupt row); leave a trace of it.
+          console.warn('[reports] SLA performance run has an unreadable summary; Excel download refused', {
+            runId,
+            reportId: row.reportId,
+          });
+          return c.json({ error: 'This SLA performance run has no readable summary, so its breaches cannot be exported' }, 409);
+        }
+        sheets = ticketSlaPerformanceSheets(rows, summary);
+      }
+      let body: Uint8Array<ArrayBuffer>;
+      try {
+        body = sheets ? sheetsToXlsx(sheets) : rowsToXlsx(rows);
+      } catch (err) {
+        // Only the worksheet row/column limits are expected; anything else is a bug.
+        if (!(err instanceof XlsxLimitError)) throw err;
+        return c.json({ error: 'Report is too large for an Excel worksheet; download it as CSV instead' }, 409);
+      }
+      c.header('Content-Type', XLSX_MIME_TYPE);
+      c.header('Content-Disposition', `attachment; filename="${baseName}.xlsx"`);
       auditSensitiveRead(c, {
         action: 'report.run.download',
         orgId: row.orgId,
@@ -516,12 +604,12 @@ runsRoutes.get(
         resourceId: runId,
         format,
         rowCount: rows.length,
-        byteCount: Buffer.byteLength(body, 'utf8'),
+        byteCount: body.byteLength,
       });
       return c.body(body);
     }
 
-    const body = rowsToCsv(rows);
+    const body = reportRunRowsToCsv(row.reportType, rows);
     c.header('Content-Type', 'text/csv;charset=utf-8;');
     c.header('Content-Disposition', `attachment; filename="${baseName}.csv"`);
     auditSensitiveRead(c, {
@@ -550,7 +638,8 @@ runsRoutes.get(
     const access = await getReportRunWithOrgCheck(
       runId,
       auth,
-      'read',
+      // #6699 decision B: run detail/result metadata is read-only history.
+      'read_history',
       c.get('permissions') as UserPermissions | undefined,
     );
     if (!access) {
@@ -658,9 +747,18 @@ runsRoutes.post(
     // reports suite's module graph and breaks the ones whose partial
     // `vi.mock('../../db/schema')` factories do not declare it. Same reason
     // routes/tickets/attachments.ts and ticketAttachmentStorage defer it.
-    const { resolveArtifact } = await import('../../services/artifacts/artifactService');
-    const artifact = await resolveArtifact(handle, { orgId });
-    if (!artifact) {
+    //
+    // OBJECT-LEVEL check (not a coarse permission) — same as the ticket
+    // attachment sibling route: `findArtifactForAuth` is the canonical
+    // `GET /ai/artifacts/:id` route's own authorization helper, proving the
+    // CALLER may read this specific artifact under their own org-axis scoping
+    // without requiring `ai_agents:read` as a standing grant. That alone is
+    // not sufficient — the artifact must ALSO belong to the RUN's own org,
+    // never just an org the caller happens to be able to reach, or a sibling
+    // org's file could land on this report.
+    const { findArtifactForAuth } = await import('../../services/artifacts/artifactService');
+    const artifact = await findArtifactForAuth(handle, auth);
+    if (!artifact || artifact.orgId !== orgId) {
       return c.json(
         { error: 'No such artifact is available to this organization', code: 'ARTIFACT_NOT_FOUND' },
         404,

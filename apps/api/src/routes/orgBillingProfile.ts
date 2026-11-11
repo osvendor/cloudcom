@@ -1,11 +1,8 @@
 import type { Context, Hono } from 'hono';
-import { and, eq, isNull } from 'drizzle-orm';
 import { z } from 'zod';
-import { db, runOutsideDbContext, withSystemDbAccessContext } from '../db';
-import { organizations } from '../db/schema';
-import { requirePermission, requireScope, type AuthContext } from '../middleware/auth';
+import { requireMfa, requirePermission, requireScope, type AuthContext } from '../middleware/auth';
 import { PERMISSIONS } from '../services/permissions';
-import { partnerMemberMayReachOrg } from '../services/partnerOrgSelection';
+import { resolveBillingConfigurableOrg } from '../services/billingOrgAccess';
 import { writeRouteAudit } from '../services/auditEvents';
 import {
   getOrgAssignment, assignProfileToOrg, clearOrgAssignment, BillingProfileServiceError,
@@ -19,21 +16,10 @@ async function resolveAccessibleOrg(c: Context): Promise<{ id: string; partnerId
   if (!auth.partnerId) return c.json({ error: 'Partner context required' }, 403);
   const parsed = orgIdSchema.safeParse(c.req.param('id'));
   if (!parsed.success) return c.json({ error: 'Invalid organization ID' }, 400);
-  const id = parsed.data;
-  // Suspended orgs are absent from canAccessOrg; use the canonical raw member
-  // selection for that case, then independently prove partner ownership.
-  if (!auth.canAccessOrg(id) && !await partnerMemberMayReachOrg(auth, id)) {
-    return c.json({ error: 'Organization not found' }, 404);
-  }
-  const load = () => db.select({ id: organizations.id, partnerId: organizations.partnerId })
-    .from(organizations)
-    .where(and(eq(organizations.id, id), eq(organizations.partnerId, auth.partnerId!), isNull(organizations.deletedAt)))
-    .limit(1);
-  const [org] = auth.canAccessOrg(id)
-    ? await load()
-    : await runOutsideDbContext(() => withSystemDbAccessContext(load));
-  if (!org || org.partnerId !== auth.partnerId) return c.json({ error: 'Organization not found' }, 404);
-  return { id: org.id, partnerId: auth.partnerId };
+  // Shared with manage_billing_profiles (services/billingOrgAccess.ts, W14 #6784).
+  const org = await resolveBillingConfigurableOrg(auth, parsed.data);
+  if (!org) return c.json({ error: 'Organization not found' }, 404);
+  return org;
 }
 
 function fail(c: Context, err: unknown) {
@@ -57,7 +43,7 @@ export function registerOrgBillingProfileRoutes(orgRoutes: Hono) {
     } catch (err) { return fail(c, err); }
   });
 
-  orgRoutes.put('/organizations/:id/billing-profile', partnerOnly, write, async (c) => {
+  orgRoutes.put('/organizations/:id/billing-profile', partnerOnly, write, requireMfa(), async (c) => {
     const org = await resolveAccessibleOrg(c);
     if (org instanceof Response) return org;
     const parsed = assignmentSchema.safeParse(await c.req.json().catch(() => null));
@@ -73,7 +59,7 @@ export function registerOrgBillingProfileRoutes(orgRoutes: Hono) {
     } catch (err) { return fail(c, err); }
   });
 
-  orgRoutes.delete('/organizations/:id/billing-profile', partnerOnly, write, async (c) => {
+  orgRoutes.delete('/organizations/:id/billing-profile', partnerOnly, write, requireMfa(), async (c) => {
     const org = await resolveAccessibleOrg(c);
     if (org instanceof Response) return org;
     try {

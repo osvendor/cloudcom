@@ -1,7 +1,8 @@
 import { Hono } from 'hono';
+import { pgErrorCode } from '@breeze/shared/pgErrors';
 import { createHmac, randomBytes, timingSafeEqual } from 'crypto';
 import { eq, and, gt } from 'drizzle-orm';
-import { db, withSystemDbAccessContext } from '../../db';
+import { db, withSystemDbAccessContext, withDbTransaction } from '../../db';
 import { c2cConnections, c2cConsentSessions } from '../../db/schema';
 import { requireMfa, requirePermission } from '../../middleware/auth';
 import { writeAuditEvent } from '../../services/auditEvents';
@@ -20,6 +21,8 @@ import { resolveScopedOrgId } from './helpers';
 import { getCookieValue } from '../auth/helpers';
 import { PERMISSIONS } from '../../services/permissions';
 
+import { isHoldingOrg } from '../../services/unassignedPool/protectedOrg';
+import { PROTECTED_ORG_ERROR } from '../../services/unassignedPool/orgType';
 const M365_CONSENT_COOKIE_NAME = 'breeze_c2c_m365_consent';
 const M365_CONSENT_COOKIE_PATH = '/api/v1/c2c/m365/callback';
 const M365_CONSENT_COOKIE_MAX_AGE_SECONDS = 10 * 60;
@@ -100,6 +103,8 @@ m365AuthRoutes.get('/m365/consent-url', requireC2cWrite, requireMfa(), async (c)
   const auth = c.get('auth');
   const orgId = resolveScopedOrgId(auth, c.req.query('orgId'));
   if (!orgId) return c.json({ error: 'orgId is required for this scope' }, 400);
+  // canAccessOrg is true for system scope: the holding org is never a target.
+  if (await isHoldingOrg(orgId)) return c.json(PROTECTED_ORG_ERROR, 409);
 
   const config = getPlatformConfig();
   if (!config) {
@@ -234,109 +239,114 @@ m365CallbackRoute.get('/c2c/m365/callback', async (c) => {
   }
 
   try {
+    // Savepoint: the catch below answers with a redirect from inside the
+    // context, so a failed insert must stop here or the commit turns it into a
+    // 500 (#11225). Nothing is stored either way.
+    return await withDbTransaction(async () => {
     const config = getPlatformConfig();
     if (!config) {
-      console.error('[c2c/m365/callback] Platform app env vars missing during callback', { orgId: session.orgId });
-      clearCookie();
-      return c.redirect(`${frontendBase}/c2c?c2c_error=${encodeURIComponent('Platform app no longer configured')}`);
-    }
+      console.error('[c2c/m365/callback] Platform app env vars missing during callback'  , { orgId: session.orgId });
+        clearCookie();
+        return c.redirect(`${frontendBase}/c2c?c2c_error=${encodeURIComponent('Platform app no longer configured')}`);
+      }
 
-    // Acquire access token via client_credentials grant
-    const tokenResult = await acquireClientCredentialsToken({
-      tenantId,
-      clientId: config.clientId,
-      clientSecret: config.clientSecret,
-    });
+      // Acquire access token via client_credentials grant
+      const tokenResult = await acquireClientCredentialsToken({
+        tenantId,
+        clientId: config.clientId,
+        clientSecret: config.clientSecret,
+      });
 
-    // Validate token works by calling Graph API
-    const graphTest = await testGraphAccess(tokenResult.accessToken);
-    const displayName =
-      session.displayName ||
-      (graphTest.ok && graphTest.orgDisplayName
-        ? `Microsoft 365 - ${graphTest.orgDisplayName}`
-        : 'Microsoft 365');
+      // Validate token works by calling Graph API
+      const graphTest = await testGraphAccess(tokenResult.accessToken);
+      const displayName =
+        session.displayName ||
+        (graphTest.ok && graphTest.orgDisplayName
+          ? `Microsoft 365 - ${graphTest.orgDisplayName}`
+          : 'Microsoft 365');
 
-    const now = new Date();
-    const tokenExpiresAt = new Date(Date.now() + tokenResult.expiresIn * 1000);
-    const storedScopeMetadata = buildStoredScopeMetadata(session.scopes);
+      const now = new Date();
+      const tokenExpiresAt = new Date(Date.now() + tokenResult.expiresIn * 1000);
+      const storedScopeMetadata = buildStoredScopeMetadata(session.scopes);
 
-    const [existing] = await db
-      .select()
-      .from(c2cConnections)
-      .where(and(
-        eq(c2cConnections.orgId, session.orgId),
-        eq(c2cConnections.provider, 'microsoft_365'),
-        eq(c2cConnections.authMethod, 'platform_app'),
-        eq(c2cConnections.tenantId, tenantId),
-      ))
-      .limit(1);
+      const [existing] = await db
+        .select()
+        .from(c2cConnections)
+        .where(and(
+          eq(c2cConnections.orgId, session.orgId),
+          eq(c2cConnections.provider, 'microsoft_365'),
+          eq(c2cConnections.authMethod, 'platform_app'),
+          eq(c2cConnections.tenantId, tenantId),
+        ))
+        .limit(1);
 
-    if (existing && existing.status !== 'revoked') {
-      await db
-        .update(c2cConnections)
-        .set({
+      if (existing && existing.status !== 'revoked') {
+        await db
+          .update(c2cConnections)
+          .set({
+            displayName,
+            accessToken: encryptSecret(tokenResult.accessToken),
+            tokenExpiresAt,
+            scopes: storedScopeMetadata,
+            status: 'active',
+            updatedAt: now,
+          })
+          .where(eq(c2cConnections.id, existing.id));
+
+        clearCookie();
+        return c.redirect(
+          `${frontendBase}/c2c?c2c_connected=true&connectionId=${existing.id}`
+        );
+      }
+
+      // Create the connection
+      const [connection] = await db
+        .insert(c2cConnections)
+        .values({
+          orgId: session.orgId,
+          provider: 'microsoft_365',
+          authMethod: 'platform_app',
           displayName,
+          tenantId,
+          clientId: null,
+          clientSecret: null,
           accessToken: encryptSecret(tokenResult.accessToken),
           tokenExpiresAt,
           scopes: storedScopeMetadata,
           status: 'active',
+          createdAt: now,
           updatedAt: now,
         })
-        .where(eq(c2cConnections.id, existing.id));
+        .returning();
+
+      if (!connection) {
+        console.error('[c2c/m365/callback] Connection insert returned no row', { orgId: session.orgId, tenantId });
+        clearCookie();
+        return c.redirect(`${frontendBase}/c2c?c2c_error=${encodeURIComponent('Failed to create connection')}`);
+      }
+
+      // Audit log the connection creation
+      writeAuditEvent(c, {
+        orgId: session.orgId,
+        actorType: 'system',
+        actorId: session.orgId,
+        action: 'c2c.connection.create',
+        resourceType: 'c2c_connection',
+        resourceId: connection.id,
+        resourceName: connection.displayName,
+        details: {
+          provider: 'microsoft_365',
+          authMethod: 'platform_app',
+          tenantId,
+          userId: session.userId ?? null,
+        },
+      });
 
       clearCookie();
       return c.redirect(
-        `${frontendBase}/c2c?c2c_connected=true&connectionId=${existing.id}`
+        `${frontendBase}/c2c?c2c_connected=true&connectionId=${connection.id}`
       );
-    }
-
-    // Create the connection
-    const [connection] = await db
-      .insert(c2cConnections)
-      .values({
-        orgId: session.orgId,
-        provider: 'microsoft_365',
-        authMethod: 'platform_app',
-        displayName,
-        tenantId,
-        clientId: null,
-        clientSecret: null,
-        accessToken: encryptSecret(tokenResult.accessToken),
-        tokenExpiresAt,
-        scopes: storedScopeMetadata,
-        status: 'active',
-        createdAt: now,
-        updatedAt: now,
-      })
-      .returning();
-
-    if (!connection) {
-      console.error('[c2c/m365/callback] Connection insert returned no row', { orgId: session.orgId, tenantId });
-      clearCookie();
-      return c.redirect(`${frontendBase}/c2c?c2c_error=${encodeURIComponent('Failed to create connection')}`);
-    }
-
-    // Audit log the connection creation
-    writeAuditEvent(c, {
-      orgId: session.orgId,
-      actorType: 'system',
-      actorId: session.orgId,
-      action: 'c2c.connection.create',
-      resourceType: 'c2c_connection',
-      resourceId: connection.id,
-      resourceName: connection.displayName,
-      details: {
-        provider: 'microsoft_365',
-        authMethod: 'platform_app',
-        tenantId,
-        userId: session.userId ?? null,
-      },
     });
-
-    clearCookie();
-    return c.redirect(
-      `${frontendBase}/c2c?c2c_connected=true&connectionId=${connection.id}`
-    );
   } catch (err) {
     console.error('[c2c/m365/callback] Consent callback failed', {
       orgId: session.orgId,
@@ -345,7 +355,10 @@ m365CallbackRoute.get('/c2c/m365/callback', async (c) => {
     });
     captureException(err);
 
-    const msg = err instanceof Error ? safeErrorMsg(err.message) : 'Unknown error during consent callback';
+    // A database failure carries the query and its values: never in a browser URL.
+    const msg = pgErrorCode(err)
+      ? 'Could not save the connection'
+      : err instanceof Error ? safeErrorMsg(err.message) : 'Unknown error during consent callback';
     clearCookie();
     return c.redirect(`${frontendBase}/c2c?c2c_error=${encodeURIComponent(msg)}`);
   }

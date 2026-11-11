@@ -72,8 +72,10 @@ type fakeDeps struct {
 
 	rebuildCalls  []rebuild.Options
 	progressCalls []bmr.ProgressUpdate
-	progressErr   error
-	powerCalls    []string
+	// progressTokens[i] is the recovery token progressCalls[i] was posted with.
+	progressTokens []string
+	progressErr    error
+	powerCalls     []string
 }
 
 func (f *fakeDeps) build(version string) Deps {
@@ -96,6 +98,7 @@ func (f *fakeDeps) build(version string) Deps {
 		WidenScope: f.widenFn,
 		Progress: func(ctx context.Context, server, token string, u bmr.ProgressUpdate) error {
 			f.progressCalls = append(f.progressCalls, u)
+			f.progressTokens = append(f.progressTokens, token)
 			return f.progressErr
 		},
 		Power: func(action string) error {
@@ -290,6 +293,173 @@ func TestConsole_RefusedPlanPostsRefusedAndOffersRetry(t *testing.T) {
 	}
 }
 
+func diskHasWindowsDeps(t *testing.T) *fakeDeps {
+	return &fakeDeps{
+		exchangeFn: happyExchange(t),
+		collectFn:  func(ctx context.Context) (*layout.Manifest, error) { return singleDiskLayout(), nil },
+		rebuildFn: func(ctx context.Context, opts rebuild.Options) (*rebuild.Result, error) {
+			if opts.DryRun && !opts.ForceDisk {
+				return &rebuild.Result{
+					Status:      "refused",
+					Refusal:     "target disk 0 contains a Windows installation; pass --force-disk to overwrite it",
+					RefusalCode: rebuild.RefusalCodeDiskHasWindows,
+				}, &rebuild.RefusalError{
+					Reason: "target disk 0 contains a Windows installation; pass --force-disk to overwrite it",
+					Code:   rebuild.RefusalCodeDiskHasWindows,
+				}
+			}
+			if opts.DryRun {
+				return samplePlan(), nil
+			}
+			return &rebuild.Result{Status: "completed"}, nil
+		},
+	}
+}
+
+func TestConsole_DiskHasWindowsOffersOverwrite(t *testing.T) {
+	// Order: dry run refused -> OVERWRITE -> dry run (ForceDisk) -> serial confirm -> real run.
+	io := &fakeIO{Answers: []string{"https://breeze.example", "abc-def-ghj", "OVERWRITE", "6002248"}}
+	deps := diskHasWindowsDeps(t)
+	c := &Console{IO: io, Deps: deps.build("0.111.1"), Cmdline: "breeze.media=1"}
+	if err := c.Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	calls := deps.rebuildCalls
+	if len(calls) != 3 || calls[0].ForceDisk || !calls[1].ForceDisk || !calls[1].DryRun || !calls[2].ForceDisk || calls[2].DryRun {
+		t.Fatalf("calls = %+v", calls)
+	}
+	if !strings.Contains(io.transcript.String(), "already contains a Windows installation") {
+		t.Fatal(io.transcript.String())
+	}
+	// refused is terminal server-side: it must NOT be posted before the operator decides.
+	if got := strings.Join(statusesOf(deps.progressCalls), ","); got != "planned,restoring,validated,rebooted" {
+		t.Fatalf("progress statuses = %s", got)
+	}
+}
+
+func TestConsole_DiskHasWindowsWrongSerialStillBlocksAfterOverwrite(t *testing.T) {
+	// OVERWRITE is in addition to the serial confirmation, never instead of it.
+	io := &fakeIO{Answers: []string{"https://breeze.example", "abc-def-ghj", "OVERWRITE", "wrong", "wrong", "6002248"}}
+	deps := diskHasWindowsDeps(t)
+	c := &Console{IO: io, Deps: deps.build("0.111.1"), Cmdline: "breeze.media=1"}
+	if err := c.Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if n := len(deps.rebuildCalls); n != 3 {
+		t.Fatalf("rebuild calls = %d, want 3", n)
+	}
+	if got := strings.Count(io.transcript.String(), "That does not match. Try again."); got != 2 {
+		t.Fatalf("serial-mismatch message printed %d times, want 2:\n%s", got, io.transcript.String())
+	}
+}
+
+// After a decline the `refused` post is terminal server-side; OVERWRITE must
+// never be offered again for this recovery, or the disk would be erased while
+// the server record stays refused. Typing it at the failure menu is an invalid
+// choice; retry needs a new code (console_retry_new_code_test.go, #7927).
+func TestConsole_DiskHasWindowsNoOverwriteAfterRefusedPosted(t *testing.T) {
+	io := &fakeIO{Answers: []string{"https://breeze.example", "abc-def-ghj", "", "OVERWRITE", "p"}}
+	deps := diskHasWindowsDeps(t)
+	c := &Console{IO: io, Deps: deps.build("0.111.1"), Cmdline: "breeze.media=1"}
+	if err := c.Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	for _, o := range deps.rebuildCalls {
+		if o.ForceDisk || !o.DryRun {
+			t.Fatalf("no forced/real run after a posted refusal: %+v", deps.rebuildCalls)
+		}
+	}
+	if n := strings.Count(io.transcript.String(), "Type OVERWRITE"); n != 1 {
+		t.Fatalf("OVERWRITE offered %d times, want 1:\n%s", n, io.transcript.String())
+	}
+	if got := strings.Join(statusesOf(deps.progressCalls), ","); got != "refused" {
+		t.Fatalf("progress statuses = %s, want a single refused", got)
+	}
+}
+
+func TestConsole_DiskHasWindowsDeclineMessageIsConsoleAppropriate(t *testing.T) {
+	io := &fakeIO{Answers: []string{"https://breeze.example", "abc-def-ghj", "", "p"}}
+	deps := diskHasWindowsDeps(t)
+	c := &Console{IO: io, Deps: deps.build("0.111.1"), Cmdline: "breeze.media=1"}
+	if err := c.Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	out := io.transcript.String()
+	if strings.Contains(out, "--force-disk") {
+		t.Fatalf("console must not mention the CLI flag:\n%s", out)
+	}
+	if !strings.Contains(out, "new recovery code") {
+		t.Fatalf("missing new-code guidance:\n%s", out)
+	}
+}
+
+func TestConsole_DiskHasWindowsCIModeNeverOverwrites(t *testing.T) {
+	io := &fakeIO{FailReadLine: true}
+	deps := diskHasWindowsDeps(t)
+	cmdline := "breeze.media=1 breeze.ci=1 breeze.server=https://breeze.example breeze.code=abc-def-ghj breeze.target=/dev/sda breeze.confirm=6002248 breeze.after=poweroff"
+	c := &Console{IO: io, Deps: deps.build("0.111.1"), Cmdline: cmdline}
+	if err := c.Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if io.readLineCalls != 0 {
+		t.Fatalf("ReadLine called %d times in CI mode", io.readLineCalls)
+	}
+	for _, o := range deps.rebuildCalls {
+		if o.ForceDisk {
+			t.Fatalf("CI must never force: %+v", deps.rebuildCalls)
+		}
+	}
+	if got := strings.Join(statusesOf(deps.progressCalls), ","); got != "refused" {
+		t.Fatalf("progress statuses = %s, want refused", got)
+	}
+}
+
+func TestConsole_DiskHasWindowsDeclineFallsThroughAndPostsRefused(t *testing.T) {
+	io := &fakeIO{Answers: []string{"https://breeze.example", "abc-def-ghj", "overwrite", "p"}}
+	deps := diskHasWindowsDeps(t)
+	c := &Console{IO: io, Deps: deps.build("0.111.1"), Cmdline: "breeze.media=1"}
+	if err := c.Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	for _, o := range deps.rebuildCalls {
+		if o.ForceDisk {
+			t.Fatalf("lowercase overwrite must not force: %+v", deps.rebuildCalls)
+		}
+	}
+	if got := strings.Join(statusesOf(deps.progressCalls), ","); got != "refused" {
+		t.Fatalf("progress statuses = %s, want refused", got)
+	}
+	if strings.Join(deps.powerCalls, ",") != "poweroff" {
+		t.Fatalf("power = %v", deps.powerCalls)
+	}
+}
+
+func TestConsole_OtherRefusalNoOverwrite(t *testing.T) {
+	io := &fakeIO{Answers: []string{"https://breeze.example", "abc-def-ghj", "OVERWRITE", "p"}}
+	deps := &fakeDeps{
+		exchangeFn: happyExchange(t),
+		collectFn:  func(ctx context.Context) (*layout.Manifest, error) { return singleDiskLayout(), nil },
+		rebuildFn: func(ctx context.Context, opts rebuild.Options) (*rebuild.Result, error) {
+			return &rebuild.Result{Status: "refused", Refusal: "disk /dev/sda is currently in use"}, &rebuild.RefusalError{Reason: "disk /dev/sda is currently in use"}
+		},
+	}
+	c := &Console{IO: io, Deps: deps.build("0.111.1"), Cmdline: "breeze.media=1"}
+	if err := c.Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	for _, o := range deps.rebuildCalls {
+		if o.ForceDisk {
+			t.Fatalf("other refusals must never force: %+v", deps.rebuildCalls)
+		}
+	}
+	if !strings.Contains(io.transcript.String(), "Please choose r, s, or p.") {
+		t.Fatalf("OVERWRITE should be an invalid choice:\n%s", io.transcript.String())
+	}
+	if strings.Join(deps.powerCalls, ",") != "poweroff" {
+		t.Fatalf("power = %v", deps.powerCalls)
+	}
+}
+
 func TestConsole_OldMediaRefused(t *testing.T) {
 	io := &fakeIO{Answers: []string{"https://breeze.example", "abc-def-ghj"}}
 	deps := &fakeDeps{
@@ -312,6 +482,88 @@ func TestConsole_OldMediaRefused(t *testing.T) {
 	}
 	if len(deps.rebuildCalls) != 0 {
 		t.Errorf("rebuild calls = %d, want 0", len(deps.rebuildCalls))
+	}
+	// #5629: by the time this gate trips the server has already claimed the
+	// one-time code and moved the recovery to media_booted, so the console
+	// must post a terminal `failed` or the recovery is wedged forever (and
+	// blocks POST /bmr/recoveries for the device with recovery_in_progress).
+	if got := statusesOf(deps.progressCalls); strings.Join(got, ",") != "failed" {
+		t.Fatalf("progress statuses = %v, want [failed]", got)
+	}
+	reason := deps.progressCalls[0].Reason
+	if !strings.HasPrefix(reason, "media_too_old") || !strings.Contains(reason, "0.111.1") || !strings.Contains(reason, "0.120.0") {
+		t.Errorf("progress reason = %q, want media_too_old with both versions", reason)
+	}
+}
+
+// TestConsole_ServerRefusesOldMediaBeforeClaim pins the #5629 happy path of
+// the fix: a server that knows the floor refuses the exchange with a 409
+// helper_version_too_old BEFORE the code is claimed. The console must print
+// the server's message, stop without re-prompting for another code (the
+// code is still good — re-prompting would only confuse the operator), and
+// post no progress (it holds no token).
+func TestConsole_ServerRefusesOldMediaBeforeClaim(t *testing.T) {
+	io := &fakeIO{Answers: []string{"https://breeze.example", "abc-def-ghj", "abc-def-ghj"}}
+	var exchangeCalls int
+	deps := &fakeDeps{
+		exchangeFn: func(ctx context.Context, server, code string) (string, *bmr.BootstrapResponse, error) {
+			exchangeCalls++
+			return "", nil, &bmr.RecoveryNegotiationError{
+				Code:    "helper_version_too_old",
+				Message: "This recovery media (v0.111.1) is older than the server requires (v0.120.0); download the current ISO. The recovery code was not used.",
+			}
+		},
+	}
+	c := &Console{IO: io, Deps: deps.build("0.111.1"), Cmdline: "breeze.media=1"}
+
+	err := c.Run(context.Background())
+	if err == nil {
+		t.Fatal("Run() error = nil, want the server's version refusal")
+	}
+	var negErr *bmr.RecoveryNegotiationError
+	if !errors.As(err, &negErr) || negErr.Code != "helper_version_too_old" {
+		t.Errorf("Run() error = %v, want wrapping RecoveryNegotiationError{helper_version_too_old}", err)
+	}
+	if exchangeCalls != 1 {
+		t.Errorf("exchange calls = %d, want 1 (no re-prompt on a terminal refusal)", exchangeCalls)
+	}
+	if !strings.Contains(io.transcript.String(), "The recovery code was not used") {
+		t.Errorf("transcript missing the server's message; got:\n%s", io.transcript.String())
+	}
+	if len(deps.progressCalls) != 0 {
+		t.Errorf("progress calls = %v, want none (no token was minted)", statusesOf(deps.progressCalls))
+	}
+}
+
+// TestConsole_MediaPlatformMismatchIsTerminal: a 409 media_platform_mismatch
+// (W07a) goes through the same terminal refusal path as helper_version_too_old.
+func TestConsole_MediaPlatformMismatchIsTerminal(t *testing.T) {
+	io := &fakeIO{Answers: []string{"https://breeze.example", "abc-def-ghj", "abc-def-ghj"}}
+	var exchangeCalls int
+	deps := &fakeDeps{
+		exchangeFn: func(ctx context.Context, server, code string) (string, *bmr.BootstrapResponse, error) {
+			exchangeCalls++
+			return "", nil, &bmr.RecoveryNegotiationError{
+				Code:    "media_platform_mismatch",
+				Message: "This recovery is for a Windows backup; boot the Breeze Windows recovery media instead. The recovery code was not used.",
+			}
+		},
+	}
+	c := &Console{IO: io, Deps: deps.build("0.120.0"), Cmdline: "breeze.media=1"}
+
+	err := c.Run(context.Background())
+	var negErr *bmr.RecoveryNegotiationError
+	if !errors.As(err, &negErr) || negErr.Code != "media_platform_mismatch" {
+		t.Fatalf("Run() error = %v, want wrapping RecoveryNegotiationError{media_platform_mismatch}", err)
+	}
+	if exchangeCalls != 1 {
+		t.Errorf("exchange calls = %d, want 1 (no re-prompt on a terminal refusal)", exchangeCalls)
+	}
+	if !strings.Contains(io.transcript.String(), "The recovery code was not used") {
+		t.Errorf("transcript missing the server's message; got:\n%s", io.transcript.String())
+	}
+	if len(deps.progressCalls) != 0 {
+		t.Errorf("progress calls = %v, want none", statusesOf(deps.progressCalls))
 	}
 }
 
@@ -487,6 +739,13 @@ func TestConsole_LockAcquisitionFailureAbortsBeforeAnyIO(t *testing.T) {
 // stubs it again with stubHoldAfterPower.
 func TestMain(m *testing.M) {
 	holdAfterPower = func() {}
+	// `go test` builds this package's own test binary, which stands in
+	// for the CI/test-only recovery-media build in unattendedCmdlineAllowed's
+	// own doc comment — every test in this package that exercises
+	// breeze.ci=1 depends on it being honored. Tests that specifically
+	// need to simulate a *production* build (the flag unset) save/restore
+	// it themselves — see TestConsole_CiCmdlineIgnoredWithoutBuildTimeFlag.
+	unattendedCmdlineEnabled = "1"
 	os.Exit(m.Run())
 }
 
@@ -939,5 +1198,112 @@ func TestConsole_WidenScopeRunsBeforeDryRun(t *testing.T) {
 	}
 	if strings.Count(strings.Join(order, ","), "widen") != 1 {
 		t.Fatalf("widen called %d times, want 1", strings.Count(strings.Join(order, ","), "widen"))
+	}
+}
+
+// TestPromptServer_InsecureCmdlineIgnoredOutsideCI: breeze.insecure=1 on the
+// kernel cmdline does not relax the https:// requirement of the interactive
+// (non-CI) prompt. The insecure token only applies to CI's unattended path,
+// where ci=true short-circuits promptServer entirely before this check is
+// reached.
+func TestPromptServer_InsecureCmdlineIgnoredOutsideCI(t *testing.T) {
+	io := &fakeIO{Answers: []string{"http://other-origin.example", "https://real.example"}}
+	c := &Console{IO: io}
+	answers := Answers{Insecure: true}
+
+	server, err := c.promptServer(false, answers)
+	if err != nil {
+		t.Fatalf("promptServer: %v", err)
+	}
+	if server != "https://real.example" {
+		t.Fatalf("expected the http:// answer to be refused and https:// accepted, got %q", server)
+	}
+	if !strings.Contains(io.transcript.String(), "https://") {
+		t.Fatalf("expected the operator to see the https:// requirement message, transcript: %s", io.transcript.String())
+	}
+}
+
+// TestConsole_CiCmdlineIgnoredWithoutBuildTimeFlag: breeze.ci=1 comes from
+// the same unauthenticated kernel cmdline as breeze.server=/breeze.insecure=1,
+// so it must not be able to skip the interactive prompts on its own.
+// Console.Run only honors a cmdline breeze.ci=1 when
+// unattendedCmdlineAllowed() reports the build was linked with the
+// CI/test-only ldflag — this test
+// simulates a production build (flag unset) and proves the console still
+// falls through to the interactive, https-required prompt instead of
+// trusting the cmdline's answers directly. fakeIO.FailReadLine proves a
+// prompt was actually attempted (CI mode never touches IO at all).
+func TestConsole_CiCmdlineIgnoredWithoutBuildTimeFlag(t *testing.T) {
+	prev := unattendedCmdlineEnabled
+	unattendedCmdlineEnabled = ""
+	t.Cleanup(func() { unattendedCmdlineEnabled = prev })
+
+	cmdline := "breeze.media=1 breeze.ci=1 breeze.server=http://other-origin.example breeze.insecure=1 " +
+		"breeze.code=abc-def-ghj breeze.target=/dev/sda breeze.confirm=6002248 breeze.after=poweroff"
+	c := &Console{IO: &fakeIO{FailReadLine: true}, Deps: (&fakeDeps{}).build("0.111.1"), Cmdline: cmdline}
+
+	err := c.Run(context.Background())
+	if err == nil {
+		t.Fatal("Run() succeeded with no operator confirmation; want an error from the interactive prompt a non-test build must fall back to")
+	}
+	if strings.Contains(err.Error(), "other-origin.example") {
+		t.Fatalf("Run() error = %v; the unauthenticated cmdline server URL must never reach Exchange without operator confirmation", err)
+	}
+}
+
+// TestConsole_CiCmdlineHonoredWithBuildTimeFlag is the paired green case:
+// the exact same cmdline runs fully unattended once the build actually
+// opted into it (as every CI/test build does via TestMain below).
+func TestConsole_CiCmdlineHonoredWithBuildTimeFlag(t *testing.T) {
+	prev := unattendedCmdlineEnabled
+	unattendedCmdlineEnabled = "1"
+	t.Cleanup(func() { unattendedCmdlineEnabled = prev })
+
+	io := &fakeIO{FailReadLine: true}
+	deps := &fakeDeps{
+		exchangeFn: happyExchange(t),
+		collectFn:  func(ctx context.Context) (*layout.Manifest, error) { return singleDiskLayout(), nil },
+		rebuildFn: func(ctx context.Context, opts rebuild.Options) (*rebuild.Result, error) {
+			if opts.DryRun {
+				return samplePlan(), nil
+			}
+			return &rebuild.Result{Status: "completed"}, nil
+		},
+	}
+	cmdline := "breeze.media=1 breeze.ci=1 breeze.server=https://breeze.example breeze.code=abc-def-ghj " +
+		"breeze.target=/dev/sda breeze.confirm=6002248 breeze.after=poweroff"
+	c := &Console{IO: io, Deps: deps.build("0.111.1"), Cmdline: cmdline}
+
+	if err := c.Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if io.readLineCalls != 0 {
+		t.Fatalf("expected zero prompts in CI mode, got %d", io.readLineCalls)
+	}
+}
+
+// TestPromptServer_CiRequiresHTTPSUnlessExplicitlyInsecure closes the
+// second half of the same requirement: even on a build where
+// breeze.ci=1 IS honored, the ci branch itself must not accept a
+// plaintext server unless the cmdline also carries the explicit
+// breeze.insecure=1 opt-out (the same token the interactive path already
+// requires — see TestPromptServer_InsecureCmdlineIgnoredOutsideCI).
+// Before the fix, the ci branch performed no scheme check at all.
+func TestPromptServer_CiRequiresHTTPSUnlessExplicitlyInsecure(t *testing.T) {
+	c := &Console{IO: &fakeIO{FailReadLine: true}}
+	_, err := c.promptServer(true, Answers{Server: "http://other-origin.example"})
+	if err == nil {
+		t.Fatal("expected a ci-mode plaintext server with no breeze.insecure=1 to be refused")
+	}
+}
+
+func TestPromptServer_CiHonorsExplicitInsecure(t *testing.T) {
+	c := &Console{IO: &fakeIO{FailReadLine: true}}
+	server, err := c.promptServer(true, Answers{Server: "http://other-origin.example", Insecure: true})
+	if err != nil {
+		t.Fatalf("promptServer: %v", err)
+	}
+	if server != "http://other-origin.example" {
+		t.Fatalf("server = %q, want the explicitly-insecure cmdline value", server)
 	}
 }

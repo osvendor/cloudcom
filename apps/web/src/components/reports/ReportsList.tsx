@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import {
   FileText,
   Calendar,
@@ -12,11 +12,31 @@ import {
   XCircle,
   Loader2,
   LayoutTemplate,
-  Mail
+  Mail,
+  Layers
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { runAction, ActionError } from '@/lib/runAction';
-import { fetchWithAuth } from '../../stores/auth';
+import { fetchWithAuth, useAuthStore } from '../../stores/auth';
+import { useOrgStore } from '../../stores/orgStore';
+import { PageHeader } from '../shared/PageHeader';
+import { useJwtClaims } from '@/lib/authScope';
+import { CoversCell } from './CoversCell';
+import { DeliveryStatusChip, type ReportDeliveryStatus } from './DeliveryStatusChip';
+import { useHashState } from '@/lib/useHashState';
+import { fetchSeriesList } from './series/seriesApi';
+import { ReportsFilterChips } from './series/ReportsFilterChips';
+import { SeriesListRow } from './series/SeriesListRow';
+import CombineBanner from './series/CombineBanner';
+import {
+  buildListEntries,
+  DEFAULT_REPORTS_LIST_VIEW,
+  filterListEntries,
+  formatReportsListHash,
+  parseReportsListHash,
+  type ReportsListView,
+} from './series/listModel';
+import type { SeriesDetail } from './series/types';
 import { exportReport, downloadBlob, getBrowserTimezone, type PostureSummary } from './reportExport';
 import { formatDateTime } from '@/lib/dateTimeFormat';
 import {
@@ -29,9 +49,20 @@ import {
   type FleetDesignReportSummary,
   type EndpointManagementSummary,
   type VulnerabilityManagementSummary,
+  type IdentityAccessSummary,
+  type TicketSlaPerformanceSummary,
+  type TicketSlaSummary,
+  type TechnicianTimeSummary,
+  type AiUsageByClientSummary,
+  type ArAgingSummary,
+  type MrrRenewalsSummary,
+  type QuoteWinRateSummary,
+  type ClientProfitabilitySummary,
   type ReportType as SharedReportType
 } from '@breeze/shared';
 import { useTranslation } from 'react-i18next';
+import { useStableT } from '@/lib/i18n/useStableT';
+import { replaceUrl } from '../../lib/replaceUrl';
 
 // Derived from the canonical tuple in `@breeze/shared`
 // (`packages/shared/src/reportTypes.ts`) rather than hand-listed. The
@@ -67,6 +98,19 @@ export type Report = {
   schedule: ReportSchedule;
   format: ReportFormat;
   config: Record<string, unknown>;
+  /** Owner. A partner-owned report (#3198: covers all of the partner's
+   *  organizations) has `orgId: null` and `partnerId` set; an org-owned one has
+   *  `orgId` set. Ownership is immutable after create. */
+  orgId: string | null;
+  partnerId: string | null;
+    /** W02: set on a series child (an org-owned row a multi-org report manages). */
+    seriesId?: string | null;
+    seriesName?: string | null;
+    archivedAt?: string | null;
+    /** Multi-org series W01: the owning org's name (GET /reports joins it); null for a partner-owned report. */
+  orgName?: string | null;
+  /** Multi-org series W01: the latest SCHEDULED run's delivery outcome (manual runs excluded). */
+  lastDeliveryStatus?: ReportDeliveryStatus | null;
   portalSelfService: boolean;
   lastGeneratedAt: string | null;
   createdAt: string;
@@ -84,6 +128,14 @@ export type ReportRun = {
   createdAt: string;
   reportName?: string;
   reportType?: ReportType;
+  seriesId?: string | null;
+  seriesName?: string | null;
+  /** Multi-org series W01 (GET /reports/runs): the owning org; null for a partner-owned report's run. */
+  orgId?: string | null;
+  orgName?: string | null;
+  deliveryStatus?: ReportDeliveryStatus | null;
+  /** Customer recipients the run resolved (non-series: contacts + typed addresses). Not rendered in W01. */
+  recipientCount?: number | null;
 };
 
 type ReportsListProps = {
@@ -105,6 +157,14 @@ function scheduleConfigOf(config: Record<string, unknown> | undefined): Schedule
   return raw && typeof raw === 'object' ? (raw as ScheduleConfig) : {};
 }
 
+// GET /reports caps `limit` at 100 (apps/api/src/utils/pagination.ts). The
+// page cap bounds the partner-owned merge at 2,000 partner-owned reports;
+// past it the page says the list is incomplete.
+const PARTNER_WIDE_PAGE_LIMIT = 100;
+const PARTNER_WIDE_PAGE_CAP = 20;
+
+type PartnerWideFetch = { rows: Report[]; complete: boolean };
+
 function recipientCountOf(config: Record<string, unknown> | undefined): number {
   const raw = config?.emailRecipients;
   return Array.isArray(raw) ? raw.filter((r) => typeof r === 'string' && r.trim() !== '').length : 0;
@@ -112,6 +172,7 @@ function recipientCountOf(config: Record<string, unknown> | undefined): number {
 
 export default function ReportsList({ onEdit, onGenerate, onDelete, timezone }: ReportsListProps) {
   const { t } = useTranslation('reports');
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   const effectiveTimezone = timezone || getBrowserTimezone();
   const [reports, setReports] = useState<Report[]>([]);
   const [recentRuns, setRecentRuns] = useState<ReportRun[]>([]);
@@ -120,27 +181,149 @@ export default function ReportsList({ onEdit, onGenerate, onDelete, timezone }: 
   const [generatingIds, setGeneratingIds] = useState<Set<string>>(new Set());
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'reports' | 'runs'>('reports');
+  const { currentOrgId } = useOrgStore();
+  const jwtClaims = useJwtClaims();
+  // Absent = a session persisted before the field existed; treated as capable
+  // like every other partner-wide surface (the server gates regardless).
+  const canManagePartnerWide = useAuthStore((s) => s.user?.canManagePartnerWide) !== false;
+  // `GET /reports` carries the ambient `?orgId=` of the focused org (kept on
+  // purpose: dropping it would list every org's reports under one org), and
+  // the API lists partner-owned reports only without it. A partner-owned
+  // report covers the focused org too, so for a partner-scope user with an org
+  // focused the partner-owned reports are fetched as well
+  // (`?ownerScope=partner`, a server-side filter) and merged in. This is also
+  // the only way a single-org partner (who never gets an All organizations
+  // option) sees them. Only users who may administer partner-wide state can
+  // see partner-owned rows at all (the server answers an empty list to anyone
+  // else), so nobody else fetches. Fails closed while the token is unresolved.
+  const mergePartnerWide =
+    jwtClaims.status === 'resolved' &&
+    jwtClaims.claims.scope === 'partner' &&
+    canManagePartnerWide &&
+    !!currentOrgId;
+  // Multi-org series (W03). Same fail-closed gate as mergePartnerWide: only a
+  // partner-scope user who may administer partner-wide state sees series. On
+  // the All-organizations view the list groups children under their series; with
+  // one org focused, children are ordinary rows with a Multi-org badge.
+  const seriesGate =
+    jwtClaims.status === 'resolved' && jwtClaims.claims.scope === 'partner' && canManagePartnerWide;
+  // Series W04: Combine spans every org of the partner, so it is offered only
+  // under All organizations, and only to users who may administer
+  // partner-wide state (the server gates regardless).
+  const showCombineBanner =
+    jwtClaims.status === 'resolved' &&
+    jwtClaims.claims.scope === 'partner' &&
+    canManagePartnerWide &&
+    !currentOrgId;
+  // A session that passes the client gate but may not read series (403) falls
+  // back to the ungrouped list, so no per-org copy disappears (W03 final review).
+  const [seriesForbidden, setSeriesForbidden] = useState(false);
+  const grouped = seriesGate && !currentOrgId && !seriesForbidden;
+  const [seriesDetails, setSeriesDetails] = useState<SeriesDetail[]>([]);
+  const [seriesLoadFailed, setSeriesLoadFailed] = useState(false);
+  const [view, setView] = useHashState<ReportsListView>(DEFAULT_REPORTS_LIST_VIEW, parseReportsListHash);
+  const updateView = useCallback((next: ReportsListView) => {
+    setView(next);
+    const hash = formatReportsListHash(next);
+    if (hash) window.location.hash = hash;
+    else replaceUrl(`${window.location.pathname}${window.location.search}`);
+  }, [setView]);
+  const [partnerWideIncomplete, setPartnerWideIncomplete] = useState(false);
 
+  const fetchPartnerWideReports = useCallback(async (): Promise<PartnerWideFetch> => {
+    // Paginated (updatedAt desc), so page through it. Rows can shift between
+    // pages while paging, so dedupe by id. A page without `pagination.total`
+    // keeps paging while pages come back full.
+    const byId = new Map<string, Report>();
+    try {
+      for (let page = 1; page <= PARTNER_WIDE_PAGE_CAP; page++) {
+        const response = await fetchWithAuth(
+          `/reports?ownerScope=partner&limit=${PARTNER_WIDE_PAGE_LIMIT}&page=${page}`,
+          { skipOrgIdInjection: true },
+        );
+        if (!response.ok) {
+          console.warn('Failed to fetch partner-wide reports:', response.status);
+          return { rows: [...byId.values()], complete: false };
+        }
+        const data = await response.json();
+        const pageRows: Report[] = Array.isArray(data?.data) ? data.data : [];
+        // The server filters to partner-owned rows; re-check so an org-owned
+        // row can never be merged into another org's view.
+        for (const row of pageRows) {
+          if (row.partnerId && !row.orgId && !byId.has(row.id)) byId.set(row.id, row);
+        }
+        const total = typeof data?.pagination?.total === 'number' ? data.pagination.total : undefined;
+        if (pageRows.length < PARTNER_WIDE_PAGE_LIMIT) return { rows: [...byId.values()], complete: true };
+        if (total !== undefined && page * PARTNER_WIDE_PAGE_LIMIT >= total) {
+          return { rows: [...byId.values()], complete: true };
+        }
+      }
+      console.warn('Partner-wide reports listing hit the page cap; later rows are not shown:', {
+        pages: PARTNER_WIDE_PAGE_CAP,
+        fetched: byId.size,
+      });
+      return { rows: [...byId.values()], complete: false };
+    } catch (err) {
+      // The org's own list still renders; partner-wide rows are an addition.
+      console.warn('Failed to fetch partner-wide reports:', err);
+      return { rows: [...byId.values()], complete: false };
+    }
+  }, []);
+
+  // Each list fetch takes a sequence number; only the newest may write state,
+  // so an older (e.g. pre-merge) response landing late cannot clobber it.
+  const fetchSeq = useRef(0);
   const fetchReports = useCallback(async () => {
+    const seq = ++fetchSeq.current;
+    const isCurrent = () => seq === fetchSeq.current;
     try {
       setLoading(true);
       setError(undefined);
-      const response = await fetchWithAuth('/reports');
+      const [response, partnerWide, seriesResult] = await Promise.all([
+        // Grouped: children are represented by their series row, so they must
+        // not consume the (50-row) first page.
+        fetchWithAuth(grouped ? '/reports?series=exclude' : '/reports'),
+        mergePartnerWide
+          ? fetchPartnerWideReports()
+          : Promise.resolve<PartnerWideFetch>({ rows: [], complete: true }),
+        grouped
+          ? fetchSeriesList().then(
+              (rows) => ({ rows: rows ?? [], failed: false, forbidden: rows === null }),
+              (err: unknown) => {
+                // The rest of the list still renders; the banner says what is missing.
+                console.warn('Failed to fetch multi-org reports:', err);
+                return { rows: [] as SeriesDetail[], failed: true, forbidden: false };
+              },
+            )
+          : Promise.resolve({ rows: [] as SeriesDetail[], failed: false, forbidden: false }),
+      ]);
       if (!response.ok) {
-        throw new Error(t('reports.reportsList.errors.fetchReports'));
+        throw new Error(stableT('reports.reportsList.errors.fetchReports'));
       }
       const data = await response.json();
-      setReports(data.data ?? []);
+      if (!isCurrent()) return;
+      const own: Report[] = data.data ?? [];
+      const seen = new Set(own.map((r) => r.id));
+      setReports([...own, ...partnerWide.rows.filter((r) => !seen.has(r.id))]);
+      setPartnerWideIncomplete(!partnerWide.complete);
+      setSeriesDetails(seriesResult.rows);
+      setSeriesLoadFailed(seriesResult.failed);
+      // Refetches ungrouped: `grouped` flips, so fetchReports (and its effect) re-run.
+      if (seriesResult.forbidden) setSeriesForbidden(true);
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('reports.reportsList.errors.generic'));
+      if (!isCurrent()) return;
+      setError(err instanceof Error ? err.message : stableT('reports.reportsList.errors.generic'));
     } finally {
-      setLoading(false);
+      if (isCurrent()) setLoading(false);
     }
-  }, [t]);
+  }, [stableT, mergePartnerWide, fetchPartnerWideReports, grouped]);
 
   const fetchRecentRuns = useCallback(async () => {
     try {
-      const response = await fetchWithAuth('/reports/runs?limit=20');
+      // Cross-org on purpose: GET /reports/runs honors ?orgId= since #6771, and
+      // ambient injection would narrow this panel to the switcher's org (and
+      // drop partner-owned runs). Kept as the all-accessible-orgs listing.
+      const response = await fetchWithAuth('/reports/runs?limit=20', { skipOrgIdInjection: true });
       if (!response.ok) {
         console.error('Failed to fetch recent runs:', response.status);
         return;
@@ -154,8 +337,13 @@ export default function ReportsList({ onEdit, onGenerate, onDelete, timezone }: 
 
   useEffect(() => {
     fetchReports();
+  }, [fetchReports]);
+
+  // Separate effect: the runs list does not depend on the partner-wide merge
+  // flag, so resolving the token must not refetch it.
+  useEffect(() => {
     fetchRecentRuns();
-  }, [fetchReports, fetchRecentRuns]);
+  }, [fetchRecentRuns]);
 
   const handleGenerate = async (report: Report) => {
     setGeneratingIds(prev => new Set([...prev, report.id]));
@@ -278,6 +466,23 @@ export default function ReportsList({ onEdit, onGenerate, onDelete, timezone }: 
             // designed vulnerability summary as an unrelated type and the
             // compiler stops guarding buildReportPdf's arm for it.
             | VulnerabilityManagementSummary
+            // #5784 W06 — same reasoning, for the identity access review cover.
+            | IdentityAccessSummary
+            // #3198 W03 — the three business report types (ticket SLA
+            // attainment, technician time & billability, AR aging).
+            | TicketSlaSummary
+            | TechnicianTimeSummary
+            | ArAgingSummary
+            // #7608 W10 — AI usage by client.
+            | AiUsageByClientSummary
+            // #9828 — MRR & renewals.
+            | MrrRenewalsSummary
+            // #9828 — quote win rate.
+            | QuoteWinRateSummary
+            // #9828 — Client profitability.
+            | ClientProfitabilitySummary
+            // #11018 — SLA performance.
+            | TicketSlaPerformanceSummary
             | undefined,
           // Drives the scorecard trend chip ("79, up from 74 last month")
           // when the stored run snapshot captured a prior baseline.
@@ -310,7 +515,10 @@ export default function ReportsList({ onEdit, onGenerate, onDelete, timezone }: 
     setOpeningReportId(report.id);
     try {
       const res = await fetchWithAuth(
-        `/reports/runs?reportId=${encodeURIComponent(report.id)}&status=completed&limit=1`
+        `/reports/runs?reportId=${encodeURIComponent(report.id)}&status=completed&limit=1`,
+        // The reportId pins the report; an ambient ?orgId= (#6771) must not
+        // narrow the lookup away from it.
+        { skipOrgIdInjection: true },
       );
       if (!res.ok) {
         throw new Error(t('reports.reportsList.errors.downloadFailed'));
@@ -334,145 +542,13 @@ export default function ReportsList({ onEdit, onGenerate, onDelete, timezone }: 
     return formatDateTime(dateStr, { timeZone: effectiveTimezone });
   };
 
-  if (loading) {
-    return (
-      <div className="flex items-center justify-center py-12">
-        <div className="text-center">
-          <div className="h-8 w-8 animate-spin rounded-full border-4 border-primary border-t-transparent mx-auto" />
-          <p className="mt-4 text-sm text-muted-foreground">{t('reports.reportsList.loading')}</p>
-        </div>
-      </div>
-    );
-  }
+  const entries = buildListEntries(reports, seriesDetails, grouped);
+  const visibleEntries = filterListEntries(entries, view.filter);
+  // A hash naming a series that isn't listed (deleted, other partner) expands nothing.
+  const expandedSeriesId = seriesDetails.some((d) => d.series.id === view.seriesId) ? view.seriesId : null;
 
-  if (error && reports.length === 0) {
-    return (
-      <div className="rounded-lg border border-destructive/40 bg-destructive/10 p-6 text-center">
-        <p className="text-sm text-destructive">{error}</p>
-        <button
-          type="button"
-          onClick={fetchReports}
-          className="mt-4 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:opacity-90"
-        >
-          {t('reports.reportsList.tryAgain')}
-        </button>
-      </div>
-    );
-  }
-
-  return (
-    <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-xl font-semibold tracking-tight">{t('reports.reportsList.title')}</h1>
-          <p className="text-muted-foreground">{t('reports.reportsList.description')}</p>
-        </div>
-        <div className="flex items-center gap-2">
-          <a
-            href="/reports/templates"
-            className="inline-flex h-10 items-center justify-center gap-2 rounded-md border bg-background px-4 text-sm font-medium hover:bg-muted"
-          >
-            <LayoutTemplate className="h-4 w-4" />
-            {t('reports.reportsList.templates')}
-          </a>
-          <a
-            href="/reports/builder"
-            className="inline-flex h-10 items-center justify-center gap-2 rounded-md border bg-background px-4 text-sm font-medium hover:bg-muted"
-          >
-            <FileText className="h-4 w-4" />
-            {t('reports.reportsList.adhocReport')}
-          </a>
-          <a
-            href="/reports/new"
-            className="inline-flex h-10 items-center justify-center gap-2 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground hover:opacity-90"
-          >
-            <Plus className="h-4 w-4" />
-            {t('reports.reportsList.newReport')}
-          </a>
-        </div>
-      </div>
-
-      {error && (
-        <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
-          {error}
-        </div>
-      )}
-
-      {/* Tabs */}
-      <div className="border-b">
-        <div className="flex gap-4">
-          <button
-            type="button"
-            onClick={() => setActiveTab('reports')}
-            className={cn(
-              'pb-3 text-sm font-medium transition-colors',
-              activeTab === 'reports'
-                ? 'border-b-2 border-primary text-foreground'
-                : 'text-muted-foreground hover:text-foreground'
-            )}
-          >
-            {t('reports.reportsList.tabs.savedReports')}
-          </button>
-          <button
-            type="button"
-            onClick={() => setActiveTab('runs')}
-            className={cn(
-              'pb-3 text-sm font-medium transition-colors',
-              activeTab === 'runs'
-                ? 'border-b-2 border-primary text-foreground'
-                : 'text-muted-foreground hover:text-foreground'
-            )}
-          >
-            {t('reports.reportsList.tabs.recentRuns')}
-          </button>
-        </div>
-      </div>
-
-      {activeTab === 'reports' && (
-        <>
-          {reports.length === 0 ? (
-            <div className="rounded-lg border border-dashed p-12 text-center">
-              <FileText className="h-12 w-12 text-muted-foreground mx-auto mb-4" />
-              <h3 className="text-lg font-medium">{t('reports.reportsList.emptyReportsTitle')}</h3>
-              <p className="text-sm text-muted-foreground mt-1">
-                {t('reports.reportsList.emptyReportsDescription')}
-              </p>
-              <a
-                href="/reports/new"
-                className="inline-flex h-10 items-center justify-center gap-2 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground hover:opacity-90 mt-4"
-              >
-                <Plus className="h-4 w-4" />
-                {t('reports.reportsList.createReport')}
-              </a>
-            </div>
-          ) : (
-            <div className="rounded-lg border bg-card shadow-xs overflow-hidden">
-              <table className="w-full">
-                <thead className="bg-muted/40">
-                  <tr className="text-left text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                    <th className="px-4 py-3">
-                      {t('reports.reportsList.table.name')}
-                    </th>
-                    <th className="px-4 py-3">
-                      {t('reports.reportsList.table.type')}
-                    </th>
-                    <th className="px-4 py-3">
-                      {t('reports.reportsList.table.schedule')}
-                    </th>
-                    <th className="px-4 py-3">
-                      {t('reports.reportsList.table.format')}
-                    </th>
-                    <th className="px-4 py-3">
-                      {t('reports.reportsList.table.lastGenerated')}
-                    </th>
-                    <th className="px-4 py-3 text-right">
-                      {t('reports.reportsList.table.actions')}
-                    </th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y">
-                  {reports.map(report => (
-                    <tr key={report.id} className="hover:bg-muted/30">
+  const renderReportRow = (report: Report) => (
+                    <tr key={report.id} data-testid={`report-row-${report.id}`} className="hover:bg-muted/30">
                       <td className="px-4 py-3">
                         <div className="flex items-center gap-2">
                           <FileText className="h-4 w-4 text-muted-foreground" />
@@ -485,7 +561,35 @@ export default function ReportsList({ onEdit, onGenerate, onDelete, timezone }: 
                               {t('reports.reportsList.visibleInPortal')}
                             </span>
                           )}
-                        </div>
+                            {report.seriesId && (
+                              seriesGate ? (
+                                <a
+                                  href={`/reports/series/${report.seriesId}`}
+                                  title={t('reports.series.list.multiOrgBadgeTitle', { name: report.seriesName ?? '' })}
+                                  className="shrink-0"
+                                >
+                                  <span data-testid={`report-series-badge-${report.id}`} className="inline-flex items-center gap-1 rounded-full bg-primary/10 px-2 py-0.5 text-xs font-medium text-primary">
+                                    <Layers className="h-3 w-3" />
+                                    {t('reports.series.list.multiOrgBadge')}
+                                  </span>
+                                </a>
+                              ) : (
+                                <span data-testid={`report-series-badge-${report.id}`} className="inline-flex shrink-0 items-center gap-1 rounded-full bg-muted px-2 py-0.5 text-xs font-medium">
+                                  <Layers className="h-3 w-3" />
+                                  {t('reports.series.list.multiOrgBadge')}
+                                </span>
+                              )
+                            )}
+                          </div>
+                      </td>
+                      <td className="px-4 py-3">
+                        {/* Multi-org series W01 (spec §3.7): replaces the lone
+                            partner-owned ScopeBadge — every row says what it covers. */}
+                        <CoversCell
+                          testId={`report-covers-${report.id}`}
+                          orgId={report.orgId}
+                          orgName={report.orgName}
+                        />
                       </td>
                       <td className="px-4 py-3 text-sm">
                         {getReportTypeLabel(report.type)}
@@ -532,6 +636,15 @@ export default function ReportsList({ onEdit, onGenerate, onDelete, timezone }: 
                             )}
                           </p>
                         )}
+                        {report.lastDeliveryStatus === 'no_recipients' && (
+                          <div className="mt-1">
+                            <DeliveryStatusChip
+                              testId={`report-no-recipients-${report.id}`}
+                              status="no_recipients"
+                              title={t('reports.reportsList.delivery.noRecipientsHint')}
+                            />
+                          </div>
+                        )}
                       </td>
                       <td className="px-4 py-3 text-sm">
                         {getFormatLabel(report.format)}
@@ -547,7 +660,16 @@ export default function ReportsList({ onEdit, onGenerate, onDelete, timezone }: 
                                (#4562) while the customer portal exposes
                                reports — so the row offers reading the newest
                                run only. Read-only, not invisible: the MSP can
-                               still open what the customer sees. */
+                               still open what the customer sees. A row that
+                               was never generated has nothing to open. */
+                            !report.lastGeneratedAt ? (
+                              <span
+                                data-testid={`report-open-latest-empty-${report.id}`}
+                                className="px-3 text-xs text-muted-foreground"
+                              >
+                                {t('reports.reportsList.notGeneratedYet')}
+                              </span>
+                            ) : (
                             <button
                               type="button"
                               data-testid={`report-open-latest-${report.id}`}
@@ -562,6 +684,7 @@ export default function ReportsList({ onEdit, onGenerate, onDelete, timezone }: 
                               )}
                               {t('reports.reportsList.aiNarrative.openLatest')}
                             </button>
+                            )
                           ) : (
                             <>
                               <button
@@ -587,6 +710,7 @@ export default function ReportsList({ onEdit, onGenerate, onDelete, timezone }: 
                               >
                                 <Pencil className="h-4 w-4" />
                               </button>
+                              {!report.seriesId && (
                               <button
                                 type="button"
                                 data-testid={`report-delete-${report.id}`}
@@ -601,14 +725,198 @@ export default function ReportsList({ onEdit, onGenerate, onDelete, timezone }: 
                                   <Trash2 className="h-4 w-4" />
                                 )}
                               </button>
+                              )}
                             </>
                           )}
                         </div>
                       </td>
                     </tr>
-                  ))}
-                </tbody>
+  );
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center py-12">
+        <div className="text-center">
+          <div className="h-8 w-8 animate-spin rounded-full border-4 border-primary border-t-transparent mx-auto" />
+          <p className="mt-4 text-sm text-muted-foreground">{t('reports.reportsList.loading')}</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (error && reports.length === 0) {
+    return (
+      <div className="rounded-lg border border-destructive/40 bg-destructive/10 p-6 text-center">
+        <p className="text-sm text-destructive">{error}</p>
+        <button
+          type="button"
+          onClick={fetchReports}
+          className="mt-4 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:opacity-90"
+        >
+          {t('reports.reportsList.tryAgain')}
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      <PageHeader
+        title={t('reports.reportsList.title')}
+        description={t('reports.reportsList.description')}
+        actions={
+          <>
+            <a
+              href="/reports/templates"
+              className="inline-flex h-10 items-center justify-center gap-2 rounded-md border bg-background px-4 text-sm font-medium hover:bg-muted"
+            >
+              <LayoutTemplate className="h-4 w-4" />
+              {t('reports.reportsList.templates')}
+            </a>
+            <a
+              href="/reports/builder"
+              className="inline-flex h-10 items-center justify-center gap-2 rounded-md border bg-background px-4 text-sm font-medium hover:bg-muted"
+            >
+              <FileText className="h-4 w-4" />
+              {t('reports.reportsList.adhocReport')}
+            </a>
+            <a
+              href="/reports/new"
+              className="inline-flex h-10 items-center justify-center gap-2 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground hover:opacity-90"
+            >
+              <Plus className="h-4 w-4" />
+              {t('reports.reportsList.newReport')}
+            </a>
+          </>
+        }
+      />
+
+      {error && (
+        <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          {error}
+        </div>
+      )}
+
+      {/* Tabs */}
+      <div className="border-b">
+        <div className="flex gap-4">
+          <button
+            type="button"
+            data-testid="reports-tab-saved"
+            onClick={() => setActiveTab('reports')}
+            className={cn(
+              'pb-3 text-sm font-medium transition-colors',
+              activeTab === 'reports'
+                ? 'border-b-2 border-primary text-foreground'
+                : 'text-muted-foreground hover:text-foreground'
+            )}
+          >
+            {t('reports.reportsList.tabs.savedReports')}
+          </button>
+          <button
+            type="button"
+            data-testid="reports-tab-runs"
+            onClick={() => setActiveTab('runs')}
+            className={cn(
+              'pb-3 text-sm font-medium transition-colors',
+              activeTab === 'runs'
+                ? 'border-b-2 border-primary text-foreground'
+                : 'text-muted-foreground hover:text-foreground'
+            )}
+          >
+            {t('reports.reportsList.tabs.recentRuns')}
+          </button>
+        </div>
+      </div>
+
+      {activeTab === 'reports' && (
+        <>
+          {partnerWideIncomplete && (
+            <p
+              data-testid="reports-partner-wide-incomplete"
+              role="status"
+              className="rounded-md border border-warning/40 bg-warning/10 px-4 py-2 text-sm"
+            >
+              {t('reports.reportsList.partnerWideIncomplete')}
+            </p>
+          )}
+          {showCombineBanner && <CombineBanner timezone={effectiveTimezone} onCombined={fetchReports} />}
+            {seriesLoadFailed && (
+              <p data-testid="reports-series-load-failed" role="status" className="rounded-md border border-warning/40 bg-warning/10 px-4 py-2 text-sm">
+                {t('reports.series.list.loadFailed')}
+              </p>
+            )}
+            {entries.length > 0 && (
+              <ReportsFilterChips value={view.filter} onChange={(filter) => updateView({ ...view, filter })} />
+            )}
+            {entries.length === 0 ? (
+            <div className="rounded-lg border border-dashed p-12 text-center">
+              <FileText className="h-12 w-12 text-muted-foreground mx-auto mb-4" />
+              <h3 className="text-lg font-medium">{t('reports.reportsList.emptyReportsTitle')}</h3>
+              <p className="text-sm text-muted-foreground mt-1">
+                {t('reports.reportsList.emptyReportsDescription')}
+              </p>
+              <a
+                href="/reports/new"
+                className="inline-flex h-10 items-center justify-center gap-2 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground hover:opacity-90 mt-4"
+              >
+                <Plus className="h-4 w-4" />
+                {t('reports.reportsList.createReport')}
+              </a>
+            </div>
+          ) : (
+            <div className="rounded-lg border bg-card shadow-xs overflow-hidden">
+              <table className="w-full">
+                <thead className="bg-muted/40">
+                  <tr className="text-left text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                    <th className="px-4 py-3">
+                      {t('reports.reportsList.table.name')}
+                    </th>
+                    <th className="px-4 py-3">
+                      {t('reports.reportsList.table.covers')}
+                    </th>
+                    <th className="px-4 py-3">
+                      {t('reports.reportsList.table.type')}
+                    </th>
+                    <th className="px-4 py-3">
+                      {t('reports.reportsList.table.schedule')}
+                    </th>
+                    <th className="px-4 py-3">
+                      {t('reports.reportsList.table.format')}
+                    </th>
+                    <th className="px-4 py-3">
+                      {t('reports.reportsList.table.lastGenerated')}
+                    </th>
+                    <th className="px-4 py-3 text-right">
+                      {t('reports.reportsList.table.actions')}
+                    </th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y">
+                  {visibleEntries.map((entry) =>
+                    entry.kind === 'series' ? (
+                      <SeriesListRow
+                        key={`series-${entry.detail.series.id}`}
+                        detail={entry.detail}
+                        expanded={expandedSeriesId === entry.detail.series.id}
+                        onToggle={() =>
+                          updateView({ ...view, seriesId: expandedSeriesId === entry.detail.series.id ? null : entry.detail.series.id })
+                        }
+                        onChanged={fetchReports}
+                        timezone={effectiveTimezone}
+                      />
+                    ) : (
+                      renderReportRow(entry.report)
+                    ),
+                  )}
+                  </tbody>
               </table>
+              {visibleEntries.length === 0 && (
+                <p data-testid="reports-filter-no-matches" className="p-6 text-center text-sm text-muted-foreground">
+                  {t('reports.series.list.noMatches')}
+                </p>
+              )}
+  
             </div>
           )}
         </>
@@ -633,6 +941,10 @@ export default function ReportsList({ onEdit, onGenerate, onDelete, timezone }: 
                       {t('reports.reportsList.runsTable.report')}
                     </th>
                     <th className="px-4 py-3">
+                      {t('reports.reportsList.runsTable.organization')}
+                    </th>
+                    <th className="px-4 py-3">{t('reports.series.list.runsSeriesColumn')}</th>
+                    <th className="px-4 py-3">
                       {t('reports.reportsList.runsTable.status')}
                     </th>
                     <th className="px-4 py-3">
@@ -648,7 +960,7 @@ export default function ReportsList({ onEdit, onGenerate, onDelete, timezone }: 
                 </thead>
                 <tbody className="divide-y">
                   {recentRuns.map(run => (
-                    <tr key={run.id} className="hover:bg-muted/30">
+                    <tr key={run.id} data-testid={`report-run-row-${run.id}`} className="hover:bg-muted/30">
                       <td className="px-4 py-3">
                         <div>
                           <span className="font-medium">{run.reportName || t('reports.reportsList.unknownReport')}</span>
@@ -660,9 +972,21 @@ export default function ReportsList({ onEdit, onGenerate, onDelete, timezone }: 
                         </div>
                       </td>
                       <td className="px-4 py-3">
+                        <CoversCell
+                          testId={`report-run-covers-${run.id}`}
+                          orgId={run.orgId}
+                          orgName={run.orgName}
+                        />
+                      </td>
+                      <td data-testid={`report-run-series-${run.id}`} className="px-4 py-3 text-sm text-muted-foreground">
+                        {run.seriesName ?? ''}
+                      </td>
+                        <td className="px-4 py-3">
                         <div className="flex items-center gap-2">
                           {getStatusIcon(run.status)}
                           <span
+                            data-testid={`report-run-status-${run.id}`}
+                            data-status={run.status}
                             className={cn(
                               'text-sm capitalize',
                               run.status === 'completed' && 'text-success',
@@ -676,6 +1000,11 @@ export default function ReportsList({ onEdit, onGenerate, onDelete, timezone }: 
                         {run.errorMessage && (
                           <p className="text-xs text-destructive mt-1">{run.errorMessage}</p>
                         )}
+                        <DeliveryStatusChip
+                          testId={`report-run-delivery-${run.id}`}
+                          status={run.deliveryStatus}
+                          className="mt-1"
+                        />
                       </td>
                       <td className="px-4 py-3 text-sm text-muted-foreground">
                         {formatDate(run.startedAt)}
@@ -688,6 +1017,7 @@ export default function ReportsList({ onEdit, onGenerate, onDelete, timezone }: 
                           {run.status === 'completed' && (
                             <button
                               type="button"
+                              data-testid={`report-run-download-${run.id}`}
                               onClick={() => handleDownload(run)}
                               disabled={downloadingRunId === run.id}
                               className="flex h-8 items-center gap-1 rounded-md border px-3 text-sm hover:bg-muted disabled:opacity-50"

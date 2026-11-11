@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -219,10 +220,11 @@ func TestTokenRotationPromotesImmediatelyAgainstLegacyServer(t *testing.T) {
 	}
 }
 
-// The Helper runs as the logged-in user, cannot read the root-only secrets.yaml,
-// and reads helper_auth_token from agent.yaml. A promotion that only rewrote
-// secrets.yaml would leave it on the superseded token.
-func TestTokenRotationUpdatesHelperTokenInAgentYAML(t *testing.T) {
+// A rotation must reach the Helper without ever putting the helper token in
+// agent.yaml, which every local user can read. The rotated token lands in
+// secrets.yaml (and, on Unix, the group-scoped helper_token.yaml); Windows
+// pushes it to the console-session Assist over IPC (sendHelperTokenUpdate).
+func TestTokenRotationKeepsHelperTokenOutOfAgentYAML(t *testing.T) {
 	srv := newRotationServer(t)
 	h, cfgPath := newRotationTestHeartbeat(t, srv.URL)
 
@@ -232,12 +234,31 @@ func TestTokenRotationUpdatesHelperTokenInAgentYAML(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read agent.yaml: %v", err)
 	}
-	if !strings.Contains(string(agentYAML), "brz_staged_helper") {
-		t.Errorf("agent.yaml does not carry the rotated helper token — the Breeze Helper "+
-			"reads it from here and would 401 after the grace window:\n%s", agentYAML)
+	for _, forbidden := range []string{"helper_auth_token", "brz_staged_helper", "brz_current_helper"} {
+		if strings.Contains(string(agentYAML), forbidden) {
+			t.Errorf("agent.yaml carries %q after rotation:\n%s", forbidden, agentYAML)
+		}
 	}
-	if strings.Contains(string(agentYAML), "brz_current_helper") {
-		t.Errorf("agent.yaml still carries the superseded helper token:\n%s", agentYAML)
+
+	persisted, err := config.ReadPersistedCredentials()
+	if err != nil {
+		t.Fatalf("ReadPersistedCredentials: %v", err)
+	}
+	if persisted.HelperAuthToken != "brz_staged_helper" {
+		t.Errorf("secrets.yaml helper token = %q, want brz_staged_helper", persisted.HelperAuthToken)
+	}
+	if got := h.currentHelperToken(); got != "brz_staged_helper" {
+		t.Errorf("token retained for IPC pushes = %q, want brz_staged_helper", got)
+	}
+
+	if runtime.GOOS != "windows" {
+		helperYAML, err := os.ReadFile(filepath.Join(filepath.Dir(cfgPath), "helper_token.yaml"))
+		if err != nil {
+			t.Fatalf("read helper_token.yaml: %v", err)
+		}
+		if !strings.Contains(string(helperYAML), "brz_staged_helper") {
+			t.Errorf("helper_token.yaml does not carry the rotated helper token:\n%s", helperYAML)
+		}
 	}
 }
 
@@ -434,6 +455,9 @@ func TestConfirmRotationDiscardsOnlyTerminalConflicts(t *testing.T) {
 		rawBody string
 		// true => the staged credentials must be gone from disk afterwards.
 		wantDiscarded bool
+		// Defaults to 1. A staged-token 401 adds a second call: the probe of
+		// the CURRENT credential (#2773).
+		wantConfirmCalls int
 	}{
 		{
 			name:          "expired staged set is terminal",
@@ -448,12 +472,16 @@ func TestConfirmRotationDiscardsOnlyTerminalConflicts(t *testing.T) {
 			wantDiscarded: true,
 		},
 		{
-			name:   "staged token rejected outright is terminal",
-			status: http.StatusUnauthorized,
-			body:   map[string]any{"error": "unauthorized"},
-			// A 401 means the server would not accept the staged token at all, so
-			// it can never be promoted.
-			wantDiscarded: true,
+			// #2773 — this stub 401s EVERY token, current included, so nothing
+			// proves the current credential is live (a suspended device or an
+			// inactive tenant looks exactly like this). The staged copy may be
+			// the server's current credential; keep it. The discard-after-proof
+			// cases are in TestConfirmRotationStagedTokenRejected.
+			name:             "staged token rejected while the current token is also rejected is retryable",
+			status:           http.StatusUnauthorized,
+			body:             map[string]any{"error": "unauthorized"},
+			wantDiscarded:    false,
+			wantConfirmCalls: 2,
 		},
 		{
 			name:   "compare-and-swap conflict is retryable",
@@ -520,8 +548,12 @@ func TestConfirmRotationDiscardsOnlyTerminalConflicts(t *testing.T) {
 
 			h.reconcilePendingRotation()
 
-			if confirmCalls != 1 {
-				t.Fatalf("confirm calls = %d, want 1", confirmCalls)
+			wantCalls := tc.wantConfirmCalls
+			if wantCalls == 0 {
+				wantCalls = 1
+			}
+			if confirmCalls != wantCalls {
+				t.Fatalf("confirm calls = %d, want %d", confirmCalls, wantCalls)
 			}
 
 			persisted, err := config.ReadPersistedCredentials()

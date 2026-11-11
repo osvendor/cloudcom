@@ -26,6 +26,7 @@ vi.mock('../components/shared/Toast', () => ({
 }));
 
 import {
+  __resetStepUpGrantCacheForTests,
   CeremonyError,
   decideIntentApproval,
   decideIntentApprovalBatch,
@@ -230,6 +231,82 @@ describe('decideIntentApproval — supervised scope skips the ceremony (#5600)',
   });
 });
 
+describe('decideIntentApproval — fresh approver factor (topology M4-D3)', () => {
+  beforeEach(() => __resetStepUpGrantCacheForTests());
+
+  /** Seed the module grant cache through the real path: an enforced supervised approve that minted one. */
+  async function seedGrant() {
+    runAction.mockImplementation((opts: Parameters<typeof actualRunAction>[0]) => actualRunAction(opts));
+    getApprovalAssertion.mockResolvedValue(PROOF);
+    fetchWithAuth
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: 'step_up_required', requiredLevel: 3 }), { status: 403 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ stepUpGrantId: 'grant-1' }), { status: 200 }));
+    await decideIntentApproval('ap-0', 'approve', undefined, 'supervised');
+    vi.clearAllMocks();
+  }
+
+  it('supervised approve with freshFactor runs the ceremony FIRST and never spends a cached grant', async () => {
+    await seedGrant();
+    runAction.mockImplementation((opts: Parameters<typeof actualRunAction>[0]) => actualRunAction(opts));
+    getApprovalAssertion.mockResolvedValue(PROOF);
+    fetchWithAuth.mockResolvedValueOnce(new Response(JSON.stringify({ stepUpGrantId: 'grant-2' }), { status: 200 }));
+
+    const outcome = await decideIntentApproval('ap-1', 'approve', undefined, 'supervised', { freshFactor: true });
+    expect(outcome).toBe('decided');
+    expect(getApprovalAssertion).toHaveBeenCalledWith('/mobile/approvals', 'ap-1');
+    expect(fetchWithAuth).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchWithAuth.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('/mobile/approvals/ap-1/approve');
+    expect(JSON.parse(init.body as string)).toEqual({ proof: PROOF });
+  });
+
+  it('a fresh-factor decide never caches a grant for the next card', async () => {
+    runAction.mockImplementation((opts: Parameters<typeof actualRunAction>[0]) => actualRunAction(opts));
+    getApprovalAssertion.mockResolvedValue(PROOF);
+    fetchWithAuth.mockResolvedValueOnce(new Response(JSON.stringify({ stepUpGrantId: 'grant-9' }), { status: 200 }));
+    await decideIntentApproval('ap-1', 'approve', undefined, 'supervised', { freshFactor: true });
+
+    vi.clearAllMocks();
+    runAction.mockImplementation((opts: Parameters<typeof actualRunAction>[0]) => actualRunAction(opts));
+    fetchWithAuth.mockResolvedValueOnce(new Response('{}', { status: 200 }));
+    await decideIntentApproval('ap-2', 'approve', undefined, 'supervised');
+    const [, init] = fetchWithAuth.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).not.toHaveProperty('stepUpGrantId');
+  });
+
+  it("maps 403 step_up_required reason 'fresh_mfa_required' to fresh_factor_required, not the register-a-device CTA", async () => {
+    runAction.mockImplementation((opts: Parameters<typeof actualRunAction>[0]) => actualRunAction(opts));
+    getApprovalAssertion.mockResolvedValue(PROOF);
+    fetchWithAuth.mockResolvedValue(new Response(JSON.stringify({ error: 'step_up_required', requiredLevel: 3, reason: 'fresh_mfa_required' }), { status: 403 }));
+    const outcome = await decideIntentApproval('ap-1', 'approve', undefined, 'supervised', { freshFactor: true });
+    expect(outcome).toBe('fresh_factor_required');
+    expect(fetchWithAuth).toHaveBeenCalledTimes(1);
+  });
+
+  it("a supervised approve WITHOUT the flag still recovers from 'fresh_mfa_required' with exactly one ceremony", async () => {
+    runAction.mockImplementation((opts: Parameters<typeof actualRunAction>[0]) => actualRunAction(opts));
+    getApprovalAssertion.mockResolvedValue(PROOF);
+    fetchWithAuth
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: 'step_up_required', requiredLevel: 3, reason: 'fresh_mfa_required' }), { status: 403 }))
+      .mockResolvedValueOnce(new Response('{}', { status: 200 }));
+    expect(await decideIntentApproval('ap-1', 'approve', undefined, 'supervised')).toBe('decided');
+    expect(getApprovalAssertion).toHaveBeenCalledTimes(1);
+    expect(JSON.parse((fetchWithAuth.mock.calls[1] as [string, RequestInit])[1].body as string)).toEqual({ proof: PROOF });
+  });
+
+  it("without the flag, a refusal still maps to needs_device (callers such as the approvals inbox never see the new outcome)", async () => {
+    runAction.mockImplementation((opts: Parameters<typeof actualRunAction>[0]) => actualRunAction(opts));
+    getApprovalAssertion.mockResolvedValue(PROOF);
+    fetchWithAuth.mockResolvedValue(new Response(JSON.stringify({ error: 'step_up_required', requiredLevel: 3, reason: 'fresh_mfa_required' }), { status: 403 }));
+    expect(await decideIntentApproval('ap-1', 'approve', undefined, 'four_eyes')).toBe('needs_device');
+  });
+
+  it('deny with freshFactor needs no ceremony', async () => {
+    await decideIntentApproval('ap-1', 'deny', undefined, 'supervised', { freshFactor: true });
+    expect(getApprovalAssertion).not.toHaveBeenCalled();
+  });
+});
+
 describe('decideIntentApproval server rejections', () => {
   beforeEach(() => {
     runAction.mockImplementation((opts: Parameters<typeof actualRunAction>[0]) => actualRunAction(opts));
@@ -290,6 +367,115 @@ describe('decideIntentApproval server rejections', () => {
     expect(toasted.message).not.toBe('site_ceiling');
     expect(toasted.message).not.toMatch(/failed to submit the decision/i);
     expect(toasted.message).toMatch(/organization-wide/i);
+  });
+
+  it('maps a 403 approver_scope_required to translated copy, not the raw token or decideFailed', async () => {
+    fetchWithAuth.mockResolvedValue(
+      new Response(JSON.stringify({ error: 'approver_scope_required' }), { status: 403 }),
+    );
+    const rejection = await decideIntentApproval('ap-1', 'approve').catch((e: unknown) => e);
+    expect(rejection).toBeInstanceOf(ActionError);
+    const toasted = showToast.mock.calls[0][0] as { message: string };
+    expect(toasted.message).not.toMatch(/failed to submit the decision/i);
+    expect(toasted.message).toMatch(/partner-level approver/i);
+  });
+});
+
+/**
+ * An approve can come back HTTP 200 and still not have taken effect: the
+ * server refused the linked elevation (its target could not be verified) and
+ * denied it. The response says so with `enforcementStatus: 'refused'`.
+ */
+describe('decideIntentApproval — an approve the server refused', () => {
+  const REFUSAL = 'Target identity could not be verified on the device; re-request elevation.';
+
+  beforeEach(() => {
+    runAction.mockImplementation((opts: Parameters<typeof actualRunAction>[0]) => actualRunAction(opts));
+    getApprovalAssertion.mockResolvedValue(PROOF);
+  });
+
+  it('returns refused and shows the reason as an error, never an "approved" toast', async () => {
+    fetchWithAuth.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          approval: { id: 'ap-1', status: 'approved' },
+          enforcementStatus: 'refused',
+          reason: REFUSAL,
+        }),
+        { status: 200 },
+      ),
+    );
+
+    const outcome = await decideIntentApproval('ap-1', 'approve');
+
+    expect(outcome).toBe('refused');
+    expect(showToast).toHaveBeenCalledTimes(1);
+    const toasted = showToast.mock.calls[0][0] as { type: string; message: string; detail?: string };
+    expect(toasted.type).toBe('error');
+    expect(toasted.message).toMatch(/your approval was blocked/i);
+    expect(toasted.message).not.toMatch(/^action approved$/i);
+    expect(toasted.detail).toBe(REFUSAL);
+  });
+
+  it('still reports the refusal as an error when the server gave no reason', async () => {
+    fetchWithAuth.mockResolvedValue(
+      new Response(
+        JSON.stringify({ approval: { id: 'ap-1', status: 'approved' }, enforcementStatus: 'refused' }),
+        { status: 200 },
+      ),
+    );
+
+    const outcome = await decideIntentApproval('ap-1', 'approve');
+
+    expect(outcome).toBe('refused');
+    expect(showToast).toHaveBeenCalledTimes(1);
+    const toasted = showToast.mock.calls[0][0] as { type: string; message: string; detail?: string };
+    expect(toasted.type).toBe('error');
+    expect(toasted.message).toMatch(/your approval was blocked/i);
+    expect(toasted.detail).toBeUndefined();
+  });
+
+  it('an approve that took effect is still reported as approved', async () => {
+    fetchWithAuth.mockResolvedValue(
+      new Response(
+        JSON.stringify({ approval: { id: 'ap-1', status: 'approved' }, enforcementStatus: 'pending_dispatch' }),
+        { status: 200 },
+      ),
+    );
+
+    const outcome = await decideIntentApproval('ap-1', 'approve');
+
+    expect(outcome).toBe('decided');
+    expect(showToast).toHaveBeenCalledTimes(1);
+    expect(showToast).toHaveBeenCalledWith({ type: 'success', message: 'Action approved' });
+  });
+
+  it('silentSuccess: an approve that took effect shows no success toast (caller owns the message, #9658)', async () => {
+    fetchWithAuth.mockResolvedValue(
+      new Response(
+        JSON.stringify({ approval: { id: 'ap-1', status: 'approved' }, enforcementStatus: 'pending_dispatch' }),
+        { status: 200 },
+      ),
+    );
+
+    const outcome = await decideIntentApproval('ap-1', 'approve', undefined, 'four_eyes', { silentSuccess: true });
+
+    expect(outcome).toBe('decided');
+    expect(showToast).not.toHaveBeenCalled();
+  });
+
+  it('silentSuccess does not silence a refused approve', async () => {
+    fetchWithAuth.mockResolvedValue(
+      new Response(
+        JSON.stringify({ approval: { id: 'ap-1', status: 'approved' }, enforcementStatus: 'refused', reason: 'nope' }),
+        { status: 200 },
+      ),
+    );
+
+    const outcome = await decideIntentApproval('ap-1', 'approve', undefined, 'four_eyes', { silentSuccess: true });
+
+    expect(outcome).toBe('refused');
+    expect(showToast).toHaveBeenCalledWith(expect.objectContaining({ type: 'error' }));
   });
 });
 

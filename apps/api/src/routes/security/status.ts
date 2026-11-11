@@ -8,6 +8,7 @@ import { requirePermission, requireScope } from '../../middleware/auth';
 import { canAccessSite, getUserPermissions, type UserPermissions } from '../../services/permissions';
 import { listStatusQuerySchema, deviceIdParamSchema } from './schemas';
 import { getPagination, paginate, listStatusRows, toStatusResponse } from './helpers';
+import { attachHarmonySecurity } from '../../extensions/harmonySecurity';
 
 export const statusRoutes = new Hono();
 
@@ -54,6 +55,7 @@ statusRoutes.get(
     }
 
     const response = paginate(results, page, limit);
+    response.data = await attachHarmonySecurity(response.data);
     return c.json(response);
   }
 );
@@ -96,6 +98,7 @@ statusRoutes.get(
       }
     }
 
-    return c.json({ data: status });
+    const [withCloudEvidence] = await attachHarmonySecurity([status]);
+    return c.json({ data: withCloudEvidence });
   }
 );

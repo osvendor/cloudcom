@@ -2,15 +2,16 @@ import './setup';
 import { randomUUID } from 'node:crypto';
 import { expect, it } from 'vitest';
 import { eq } from 'drizzle-orm';
-import { db, withDbAccessContext, type DbAccessContext } from '../../db';
-import { configurationPolicies, configPolicyAssignments, configPolicyFeatureLinks, devices } from '../../db/schema';
-import { resolveDeviceIdsForPolicy } from '../../services/monitors/conversion/legacyBaseline';
-import { previewPolicyConversion } from '../../services/monitors/conversion';
+import { db, withDbAccessContext, withSystemDbAccessContext, type DbAccessContext } from '../../db';
+import { alertRules, alertTemplates, configurationPolicies, configPolicyAssignments, configPolicyFeatureLinks, configPolicyAlertRules, monitorDefinitions, monitorConversions, devices } from '../../db/schema';
+import { adminAuthForPartner } from '../../routes/admin/monitorConversion';
 import { createSystemAuthContext } from '../../services/featureConfigResolver';
-import { createOrganization, createPartner, createSite } from './db-utils';
+import { previewPolicyConversion, convertPolicy } from '../../services/monitors/conversion';
+import { resolveDeviceIdsForPolicy } from '../../services/monitors/conversion/legacyBaseline';
+import { createOrganization, createPartner, createSite, createUser } from './db-utils';
 
-// Task 18 supplies the shared conversionFixture; this scope-only fixture keeps
-// the inherited-consumer regression executable before that task lands.
+// Scope-only fixture for the inherited-consumer regression. The ledger's live
+// RLS proofs live in monitorConversionsPartnerRls.integration.test.ts.
 async function inheritedScopeFixture() {
   const partner = await createPartner();
   const org = await createOrganization({ partnerId: partner.id });
@@ -71,4 +72,163 @@ it('previews from a caller that holds no ambient DB context (self-managed route)
   // rather than quietly taking a second pooled connection.
   await expect(withDbAccessContext(f.context, () => previewPolicyConversion(f.policyId, auth, { mode: 'inline' })))
     .rejects.toThrow(/SELF_MANAGED_DB_CONTEXT_ROUTES/);
+});
+
+// W05c2 reuses the existing scope fixture; the planned C1 actor case was absent.
+it('writes nullable system actors for an administrator-triggered conversion', async () => {
+  const f = await inheritedScopeFixture();
+  const user = await createUser({ partnerId: f.partnerId, orgId: f.orgId });
+  const auth = { ...createSystemAuthContext(), user: {
+    id: user.id, email: user.email, name: user.name, isPlatformAdmin: true,
+  } };
+  const systemAuth = adminAuthForPartner(auth, f.partnerId);
+  expect(systemAuth.scope).toBe('system');
+  expect(systemAuth.user.id).toBe(user.id);
+  const sourceId = await withDbAccessContext(f.context, async () => {
+    const [link] = await db.select().from(configPolicyFeatureLinks)
+      .where(eq(configPolicyFeatureLinks.configPolicyId, f.policyId));
+    const [source] = await db.insert(configPolicyAlertRules).values({
+      featureLinkId: link!.id, name: 'High CPU', severity: 'high',
+      conditions: [{ type: 'metric', metric: 'cpu', operator: 'gt', value: 80 }],
+    }).returning();
+    return source!.id;
+  });
+  const preview = await previewPolicyConversion(f.policyId, systemAuth, { mode: 'inline' });
+  if ('status' in preview) throw new Error(`Unexpected preview status: ${preview.status}`);
+  expect(preview.blockedBy).toBeUndefined();
+  expect(preview.equivalence.deltas).toEqual([]);
+  const result = await convertPolicy(f.policyId, preview.previewHash, systemAuth);
+  expect(result.conversionIds).toHaveLength(1);
+  await withDbAccessContext(f.context, async () => {
+    const [source] = await db.select().from(configPolicyAlertRules).where(eq(configPolicyAlertRules.id, sourceId));
+    expect(source!.retiredAt).not.toBeNull();
+    expect(source!.convertedToMonitorId).not.toBeNull();
+    const [monitor] = await db.select().from(monitorDefinitions)
+      .where(eq(monitorDefinitions.id, source!.convertedToMonitorId!));
+    const [ledger] = await db.select().from(monitorConversions)
+      .where(eq(monitorConversions.id, result.conversionIds[0]!));
+    expect(monitor!.createdBy).toBeNull();
+    expect(ledger!.convertedBy).toBeNull();
+  });
+});
+
+/**
+ * #6644 review finding 1: the platform-admin sweep routes are SELF-MANAGED, and
+ * the partner converter opens its own serializable transaction. A handler that
+ * wraps the converter in any ambient context (withSystemDbAccessContext) trips
+ * assertIsolationNotNested on every call. Drive the mounted routes, not the
+ * converter, so the handler's own wrapping is what gets exercised.
+ */
+it('runs the platform-admin partner preview and convert routes end to end', async () => {
+  const { Hono } = await import('hono');
+  const { adminMonitorConversionRoutes } = await import('../../routes/admin/monitorConversion');
+  const f = await inheritedScopeFixture();
+  const user = await createUser({ partnerId: f.partnerId, orgId: f.orgId });
+  const sourceId = await withDbAccessContext(f.context, async () => {
+    const [link] = await db.select().from(configPolicyFeatureLinks)
+      .where(eq(configPolicyFeatureLinks.configPolicyId, f.policyId));
+    const [source] = await db.insert(configPolicyAlertRules).values({
+      featureLinkId: link!.id, name: 'High CPU', severity: 'high',
+      conditions: [{ type: 'metric', metric: 'cpu', operator: 'gt', value: 80 }],
+    }).returning();
+    return source!.id;
+  });
+  const adminAuth = { ...createSystemAuthContext(), token: { mfa: true }, user: {
+    id: user.id, email: user.email, name: user.name, isPlatformAdmin: true,
+  } };
+  const app = new Hono();
+  app.use('*', async (c, next) => { c.set('auth' as never, adminAuth as never); await next(); });
+  app.route('/admin/monitor-conversion', adminMonitorConversionRoutes);
+
+  const previewRes = await app.request(`/admin/monitor-conversion/partners/${f.partnerId}/preview`, { method: 'POST' });
+  expect(previewRes.status).toBe(200);
+  const { data: preview } = await previewRes.json() as { data: { previewHash: string } };
+  expect(preview.previewHash).toEqual(expect.any(String));
+
+  const convertRes = await app.request(`/admin/monitor-conversion/partners/${f.partnerId}/convert`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ previewHash: preview.previewHash }),
+  });
+  expect(convertRes.status).toBe(200);
+  await withDbAccessContext(f.context, async () => {
+    const [source] = await db.select().from(configPolicyAlertRules).where(eq(configPolicyAlertRules.id, sourceId));
+    expect(source!.retiredAt).not.toBeNull();
+  });
+});
+
+/**
+ * #6644 review finding 2: the platform-admin backlog must count only what the
+ * converter will take — rows on ACTIVE policies (convert.ts, and
+ * countPendingConversions in loadSources.ts). A row on an inactive policy is
+ * never converted, so counting it strands the partner above zero forever.
+ */
+it('counts only active-policy rows in the partner backlog', async () => {
+  const { listPartnerConversionBacklog } = await import('../../services/monitors/conversion/partnerBacklog');
+  const f = await inheritedScopeFixture();
+  await withDbAccessContext(f.context, async () => {
+    const [link] = await db.select().from(configPolicyFeatureLinks)
+      .where(eq(configPolicyFeatureLinks.configPolicyId, f.policyId));
+    await db.insert(configPolicyAlertRules).values({
+      featureLinkId: link!.id, name: 'Active CPU', severity: 'high',
+      conditions: [{ type: 'metric', metric: 'cpu', operator: 'gt', value: 80 }],
+    });
+    const [inactive] = await db.insert(configurationPolicies).values({
+      orgId: f.orgId, partnerId: null, name: 'Inactive legacy', status: 'inactive', createdBy: null,
+    }).returning();
+    const [inactiveLink] = await db.insert(configPolicyFeatureLinks)
+      .values({ configPolicyId: inactive!.id, featureType: 'alert_rule' }).returning();
+    await db.insert(configPolicyAlertRules).values({
+      featureLinkId: inactiveLink!.id, name: 'Inactive CPU', severity: 'high',
+      conditions: [{ type: 'metric', metric: 'cpu', operator: 'gt', value: 90 }],
+    });
+  });
+  const row = (await listPartnerConversionBacklog()).find((r) => r.partnerId === f.partnerId);
+  expect(row).toMatchObject({ pendingRows: 1, pendingPolicies: 1 });
+
+  // The tenant banner's count and its pending-policy list share one predicate
+  // (#6644 review finding 5): the inactive policy is in neither.
+  const { countPendingConversions } = await import('../../services/monitors/conversion');
+  const pending = await withDbAccessContext(f.context, () =>
+    countPendingConversions({ orgId: f.orgId, partnerId: f.partnerId, includePartnerWide: false }));
+  expect(pending).toMatchObject({ policies: 1, rows: 1, pendingPolicies: [{ id: f.policyId, name: 'Legacy parent' }] });
+});
+
+/**
+ * #7206: built-in system anchor rules ("Reboot pending too long", "Patch job
+ * failure": per-org alert_rules on an ownerless is_built_in template, created
+ * by patchAlerts.ts) are raised directly by the patch workers. Conversion
+ * refuses them (unconvertible:built_in) and the retirement sweep skips them,
+ * so they must not count as standalone rules awaiting conversion. Runs the
+ * shared NOT EXISTS predicate (systemManagedRules.ts) against real Postgres
+ * under the caller's RLS context, the same predicate GET /alerts/rules uses
+ * for ?needsConversion=true.
+ */
+it('does not count built-in system anchor rules as standalone rules awaiting conversion', async () => {
+  const { ensureRebootPendingRule, ensurePatchJobFailureRule } = await import('../../services/patchAlerts');
+  const f = await inheritedScopeFixture();
+  await withSystemDbAccessContext(async () => {
+    await ensureRebootPendingRule(f.orgId);
+    await ensurePatchJobFailureRule(f.orgId);
+  });
+  await withDbAccessContext(f.context, async () => {
+    const [template] = await db.insert(alertTemplates).values({
+      orgId: f.orgId, partnerId: null, name: 'Org CPU', severity: 'high',
+      conditions: { type: 'threshold', metric: 'cpuPercent', operator: 'gt', value: 90 },
+      titleTemplate: 'CPU', messageTemplate: 'CPU high',
+    }).returning();
+    await db.insert(alertRules).values({
+      orgId: f.orgId, templateId: template!.id, name: 'Org CPU rule', targetType: 'org', targetId: f.orgId,
+    });
+  });
+
+  const { countPendingConversions } = await import('../../services/monitors/conversion');
+  const pending = await withDbAccessContext(f.context, () =>
+    countPendingConversions({ orgId: f.orgId, partnerId: f.partnerId, includePartnerWide: false }));
+  expect(pending.standaloneRules).toBe(1);
+
+  // Control: the anchor rules exist and are visible to the org caller, so the
+  // count above is the predicate's doing, not an RLS blind spot.
+  const visible = await withDbAccessContext(f.context, () =>
+    db.select({ id: alertRules.id }).from(alertRules).where(eq(alertRules.orgId, f.orgId)));
+  expect(visible).toHaveLength(3);
 });

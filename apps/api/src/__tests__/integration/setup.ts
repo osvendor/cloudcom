@@ -25,9 +25,10 @@ import { beforeAll, afterAll, beforeEach } from 'vitest';
 import { drizzle, type PostgresJsDatabase } from 'drizzle-orm/postgres-js';
 import postgres, { type Sql } from 'postgres';
 import Redis, { type RedisOptions } from 'ioredis';
-import * as schema from '../../db/schema';
 import { assertTestDatabaseUrlSafe } from '../../testUtils/integrationDatabaseSafety';
 import { REDIS_CLIENT_BASE_OPTIONS } from '../../services/redis';
+import { __resetAgentAuthNegativeCacheForTests } from '../../middleware/agentAuthNegativeCache';
+import { __resetHotPathCachesForTests } from '../../services/hotPathCacheRegistry';
 
 // Load test environment variables
 const DATABASE_URL = process.env.DATABASE_URL || 'postgresql://breeze_test:breeze_test@localhost:5433/breeze_test';
@@ -37,6 +38,12 @@ const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6380';
 // Ensure JWT_SECRET is set for auth tests
 process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-jwt-secret-must-be-at-least-32-characters-long';
 process.env.NODE_ENV = 'test';
+// Pin the approver-assurance platform default date far in the future so no
+// suite's outcome depends on the wall clock crossing it. Suites that exercise
+// the platform default set APPROVER_ASSURANCE_DEFAULT_ENFORCE_FROM themselves.
+if (!process.env.APPROVER_ASSURANCE_DEFAULT_ENFORCE_FROM) {
+  process.env.APPROVER_ASSURANCE_DEFAULT_ENFORCE_FROM = '2999-01-01T00:00:00Z';
+}
 
 // Shared safety guard: cleanupDatabase() runs TRUNCATE CASCADE on core tenant
 // tables. It requires a parseable breeze_test(_*) database on a local allowlisted
@@ -44,7 +51,10 @@ process.env.NODE_ENV = 'test';
 // postgres pool is opened or destructive SQL is run. The dedicated request-role
 // runner uses this same helper so its role DDL cannot drift outside this boundary.
 
-export type TestDatabase = PostgresJsDatabase<typeof schema>;
+// Schema-less, matching the production `db` (#8052): no relational
+// `db.query.*` builders, so a TestDatabase is interchangeable with the
+// production type. Use the core builder (`select().from(...)`) in tests.
+export type TestDatabase = PostgresJsDatabase;
 
 let testClient: Sql;
 let testDb: TestDatabase;
@@ -121,7 +131,7 @@ export async function setupIntegrationTests() {
     onnotice: () => {}
   });
 
-  testDb = drizzle(testClient, { schema });
+  testDb = drizzle(testClient);
 
   // Raw `breeze_app` client (no proxy guard) for RLS negative-control writes.
   // Connects as the same unprivileged role as production code-under-test, so
@@ -134,7 +144,7 @@ export async function setupIntegrationTests() {
     connect_timeout: 10,
     onnotice: () => {}
   });
-  appDb = drizzle(appClient, { schema });
+  appDb = drizzle(appClient);
 
   // Create Redis connection
   testRedis = new Redis(REDIS_URL, {
@@ -220,6 +230,17 @@ const CLEANUP_TABLES = [
   // rows survive between tests. supported_currencies is NOT here on purpose —
   // it is seeded reference data every suite depends on.
   'exchange_rates',
+  // Global, id-only backup snapshot tombstones (no tenant FK, so no cascade
+  // reaches them). Without this a snapshot id deleted by one test stays
+  // unavailable to every later test that reuses the same literal id.
+  'backup_snapshot_id_tombstones',
+  // Org-erasure backup fences: platform evidence with no org FK (it must
+  // survive the erasure), so no cascade reaches them. Storage GC honours a
+  // fence by snapshot id alone, so a fence left by one test would protect a
+  // same-id prefix in every later test.
+  'backup_erasure_targets',
+  'backup_erasure_manifests',
+  'backup_erasure_fence_refs',
   'device_commands',
   'device_group_memberships',
   'device_groups',
@@ -388,4 +409,12 @@ afterAll(async () => {
 
 beforeEach(async () => {
   await cleanupDatabase();
+  // #8050 — the agent-auth negative cache is in-process state that outlives
+  // the truncate above: a rejection cached against one test's (agentId, token)
+  // must not answer the next test, which may seed that same pair as valid.
+  __resetAgentAuthNegativeCacheForTests();
+  // #8053 — same for the agent hot-path caches (per-org settings, topology
+  // flags, manifest trust material, collector absence): a value cached for one
+  // test's org or device must not answer the next test.
+  __resetHotPathCachesForTests();
 });

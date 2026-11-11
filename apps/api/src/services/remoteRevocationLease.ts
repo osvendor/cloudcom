@@ -31,6 +31,7 @@ import {
   devices,
   organizations,
   organizationUsers,
+  partners,
   partnerUsers,
   remoteSessions,
   userPasskeys,
@@ -39,7 +40,7 @@ import {
 import { getRedis } from './redis';
 import { teardownDisconnectedSessions } from './remoteSessionTeardown';
 import { commitDesktopTerminalIntent, type TerminalSessionRow } from './remoteDesktopTerminalIntent';
-import { resolveDesktopSessionPolicy } from './remoteAccessPolicy';
+import { checkRemoteAccess, resolveDesktopSessionPolicy } from './remoteAccessPolicy';
 import { getEffectiveMfaPolicy } from './mfaPolicy';
 import { remoteDesktopFenceRequired } from '../config/env';
 
@@ -102,7 +103,10 @@ export type RevocationReason =
   | 'membership_removed'
   | 'site_scope_lost'
   | 'mfa_required'
-  | 'hard_deadline';
+  | 'hard_deadline'
+  | 'org_suspended'
+  | 'partner_suspended'
+  | 'policy_denied';
 
 /** The lease block shipped to the agent inside the `start_desktop` payload. */
 export interface RevocationLeaseGrant {
@@ -121,7 +125,7 @@ export type RenewRevocationLeaseResult =
       renewEverySec: number;
       graceSec: number;
       /**
-       * SEC-038: the session's current `desktop_start_generation`, as a
+       * The session's current `desktop_start_generation`, as a
        * canonical decimal string (it is a bigint — it must never pass through
        * a JS number). The agent's durable start fence resyncs from this, so a
        * renewal answer doubles as the fence's authority on what the server
@@ -158,7 +162,7 @@ export interface RevocationRecheckRow {
     startedAt: Date | null;
     createdAt: Date;
     permissionsEpochSnapshot: number | null;
-    /** SEC-038 monotonic start/terminal generation, bumped by both intents. */
+    /** monotonic start/terminal generation, bumped by both intents. */
     desktopStartGeneration: bigint;
     /** The generation at which the session was declared terminal. */
     terminalGeneration: bigint | null;
@@ -171,7 +175,7 @@ export interface RevocationRecheckRow {
     agentId: string | null;
     /** Agent-declared revocation-lease protocol version; 0 = not capable. */
     revocationLeaseProtocolVersion: number;
-    /** SEC-038 agent-declared desktop start/terminal fence version; 0 = unfenced. */
+    /** agent-declared desktop start/terminal fence version; 0 = unfenced. */
     desktopFenceProtocolVersion: number;
   };
   user: {
@@ -191,8 +195,20 @@ export interface RevocationRecheckRow {
    * Whether the session's org is still a live org under the caller's partner.
    * Mirrors the partner-axis check in `resolveLiveEventAuthorization`: an
    * archived / soft-deleted / cross-partner org is not reachable any more.
+   * Applies to every caller, org-scoped or partner-scoped — org lifecycle is
+   * not conditional on which axis authorized the session.
    */
   sessionOrgUsable: boolean;
+  /**
+   * The session's owning organization's partner, read live. Matches
+   * `resolveRemoteWsLiveAuthority`'s owning-partner check: a suspended,
+   * churned or soft-deleted partner cannot retain remote-session authority
+   * through an otherwise-active organization.
+   */
+  partner: {
+    status: string;
+    deletedAt: Date | null;
+  };
 }
 
 /** Live statuses a lease may be renewed for. */
@@ -217,7 +233,11 @@ export function clampHardDeadline(startMs: number, maxSessionDurationHours: numb
   return startMs + Math.min(requested, REVOCATION_LEASE_HARD_CAP_MS);
 }
 
-/** When a session's clock starts: the answer time if it has one, else creation. */
+/**
+ * When a session's clock starts: its original start (the first answer, or the
+ * first WebSocket-fallback start) if it has one, else creation. A reconnect
+ * does not move it (#11113).
+ */
 export function sessionStartMs(session: { startedAt: Date | null; createdAt: Date }): number {
   return (session.startedAt ?? session.createdAt).getTime();
 }
@@ -245,6 +265,7 @@ export function evaluateRevocationRecheck(
   nowMs: number,
   hardDeadlineMs: number,
   mfaRequired = false,
+  policyAllowed = true,
 ): RecheckVerdict {
   if (!row) return { ok: false, reason: 'session_ended' };
 
@@ -270,6 +291,16 @@ export function evaluateRevocationRecheck(
   if (device.orgId !== session.orgId) {
     return { ok: false, reason: 'membership_removed' };
   }
+  // Org and partner lifecycle apply to EVERY caller, org-scoped or
+  // partner-scoped alike — an admin suspending/deleting the org or
+  // downgrading the owning partner must reach an already-running P2P
+  // session, the same way it already reaches a fresh session start.
+  if (!row.sessionOrgUsable) {
+    return { ok: false, reason: 'org_suspended' };
+  }
+  if (row.partner.status !== 'active' || row.partner.deletedAt !== null) {
+    return { ok: false, reason: 'partner_suspended' };
+  }
 
   if (user.orgId !== null) {
     // Org-scoped user: the session's org must be their own org, and the
@@ -294,9 +325,7 @@ export function evaluateRevocationRecheck(
     ) {
       return { ok: false, reason: 'membership_removed' };
     }
-    if (!row.sessionOrgUsable) {
-      return { ok: false, reason: 'membership_removed' };
-    }
+    // sessionOrgUsable is already checked above for every caller.
   }
 
   // MFA per CURRENT policy. The force_mfa flip itself already advances
@@ -305,6 +334,14 @@ export function evaluateRevocationRecheck(
   // usable factor (e.g. every passkey deleted or disabled).
   if (mfaRequired && !user.mfaProtected) {
     return { ok: false, reason: 'mfa_required' };
+  }
+
+  // Live remote-access policy for the session's capability (webrtcDesktop /
+  // remoteTools), same enforcement point a fresh session start already goes
+  // through — an admin disabling the capability mid-session must end it, not
+  // just block new starts.
+  if (!policyAllowed) {
+    return { ok: false, reason: 'policy_denied' };
   }
 
   if (nowMs >= hardDeadlineMs) {
@@ -367,10 +404,13 @@ export async function loadRevocationRecheckRow(
               AND ${organizations.status} IN ('active', 'trial')
               AND ${organizations.deletedAt} IS NULL
           )`,
+          partnerStatus: partners.status,
+          partnerDeletedAt: partners.deletedAt,
         })
         .from(remoteSessions)
         .innerJoin(devices, eq(remoteSessions.deviceId, devices.id))
         .innerJoin(users, eq(remoteSessions.userId, users.id))
+        .innerJoin(partners, eq(partners.id, users.partnerId))
         .leftJoin(
           organizationUsers,
           and(
@@ -405,7 +445,7 @@ export async function loadRevocationRecheckRow(
             found.permissionsEpochSnapshot === undefined
               ? null
               : Number(found.permissionsEpochSnapshot),
-          // Generations stay bigint end to end — see the SEC-038 constraint:
+          // Generations stay bigint end to end — see the constraint:
           // they are produced, transported and compared as canonical decimal
           // strings and never as a JS number.
           desktopStartGeneration: BigInt(found.desktopStartGeneration ?? 0n),
@@ -446,6 +486,10 @@ export async function loadRevocationRecheckRow(
             }
           : null,
         sessionOrgUsable: found.sessionOrgUsable === true,
+        partner: {
+          status: found.partnerStatus,
+          deletedAt: found.partnerDeletedAt ?? null,
+        },
       } satisfies RevocationRecheckRow;
     }),
   );
@@ -488,7 +532,7 @@ export async function markSessionRevoked(
   sessionId: string,
   reason: RevocationReason,
 ): Promise<TerminalSessionRow | null> {
-  // Through the terminal-intent contract (SEC-038 W03): the revocation bumps
+  // Through the terminal-intent contract: the revocation bumps
   // the same generation every start bumps, and the row it returns carries the
   // terminal generation the follow-up stop must name.
   const result = await runOutsideDbContext(() =>
@@ -695,8 +739,8 @@ export async function renewRevocationLease(
   // The MFA policy is consulted ONLY for a factorless user whose session would
   // otherwise renew: a user holding a factor pays no extra queries, and a
   // session that is ending anyway never triggers the enrolment-grace grant.
+  let mfaRequired = false;
   if (verdict.ok && row && !row.user.mfaProtected) {
-    let mfaRequired: boolean;
     try {
       mfaRequired = await resolveLeaseMfaRequired(row);
     } catch (err) {
@@ -708,6 +752,16 @@ export async function renewRevocationLease(
     }
     verdict = evaluateRevocationRecheck(row, now, hardDeadline, mfaRequired);
   }
+  // Same reasoning: only re-check remote-access policy for a session that is
+  // still otherwise renewable. `checkRemoteAccess` itself fails closed on a
+  // resolution error (denies rather than throwing), matching a fresh session
+  // start's admission gate — a mid-session policy disable/lease-renew race
+  // must never be more permissive than starting a brand-new session.
+  if (verdict.ok && row) {
+    const capability = row.session.type === 'desktop' ? 'webrtcDesktop' as const : 'remoteTools' as const;
+    const policy = await checkRemoteAccess(row.device.id, capability, { bypassCache: true });
+    verdict = evaluateRevocationRecheck(row, now, hardDeadline, mfaRequired, policy.allowed);
+  }
   if (verdict.ok) {
     return {
       status: 'renewed',
@@ -715,7 +769,7 @@ export async function renewRevocationLease(
       hardDeadline,
       renewEverySec: REVOCATION_LEASE_RENEW_EVERY_MS / 1000,
       graceSec: REVOCATION_LEASE_GRACE_MS / 1000,
-      // SEC-038 fence resync: this same row snapshot, not a second query.
+      // Fence resync: this same row snapshot, not a second query.
       ...(row
         ? {
             startGeneration: row.session.desktopStartGeneration.toString(),
@@ -759,10 +813,11 @@ export async function renewRevocationLease(
 // ---------------------------------------------------------------------------
 
 /**
- * SEC-038: the only desktop start/terminal fence protocol version this server
+ * The only desktop start/terminal fence protocol version this server
  * speaks. An agent reporting exactly this value keeps the durable per-session
- * generation fence (W04/W05); anything else is unfenced. Enforced only while
- * REMOTE_DESKTOP_FENCE_REQUIRED is on (default off — owner decision 1).
+ * generation fence (W04/W05); anything else is unfenced. Enforced while
+ * REMOTE_DESKTOP_FENCE_REQUIRED is on, which is the default; agents from
+ * v0.114.0 on declare it.
  */
 export const DESKTOP_FENCE_PROTOCOL_VERSION = 1;
 
@@ -812,9 +867,14 @@ export async function prepareRevocationLeaseForStart(
   if (row.device.revocationLeaseProtocolVersion !== REVOCATION_LEASE_PROTOCOL_VERSION) {
     return { ok: false, reason: 'agent_upgrade_required' };
   }
-  // SEC-038 W06: behind the flag, an agent without the durable start fence is
-  // refused with the same code — the generation in the start payload is only
-  // meaningful when the endpoint honours it.
+  // Start fence gate (on by default): an agent without the durable start fence
+  // is refused with the same code — the generation in the start payload is
+  // only meaningful when the endpoint honours it. Agents that declare the
+  // fence honour it on start_desktop; builds from this release on also honour
+  // it on the WebSocket fallback (desktop_stream_start). Older fence-capable
+  // builds ignore it there, so on that path the server-side handshake in
+  // routes/desktopWs.ts (no frames or input before the agent accepts, relay
+  // closed as soon as a stop is sent) is what orders a late start.
   if (!isDesktopFenceCapable(row.device.desktopFenceProtocolVersion)) {
     return { ok: false, reason: 'agent_upgrade_required' };
   }
@@ -844,10 +904,10 @@ export async function prepareRevocationLeaseForStart(
 }
 
 /**
- * SEC-038 W06 fence admission. Gate off (the default) admits every agent so
- * the release that introduces the gate is a fleet no-op; gate on admits only
- * an agent declaring exactly DESKTOP_FENCE_PROTOCOL_VERSION. Read at call time
- * so the flag can be flipped without a restart-sensitive module constant.
+ * Start fence admission. Gate on (the default) admits only an agent declaring
+ * exactly DESKTOP_FENCE_PROTOCOL_VERSION; REMOTE_DESKTOP_FENCE_REQUIRED=false
+ * (explicit opt-out) admits every agent. Read at call time so the flag can be
+ * flipped without a restart-sensitive module constant.
  */
 export function isDesktopFenceCapable(desktopFenceProtocolVersion: number): boolean {
   if (!remoteDesktopFenceRequired()) return true;
@@ -858,7 +918,7 @@ export function isDesktopFenceCapable(desktopFenceProtocolVersion: number): bool
  * Cheap standalone capability probe for callers that only need to fail fast
  * (session creation) and have no session row yet. Covers both desktop-start
  * capability gates: the unconditional revocation lease (#5481) and the
- * flag-gated start fence (SEC-038 W06).
+ * flag-gated start fence.
  */
 export async function isDesktopStartCapable(deviceId: string): Promise<boolean> {
   const [row] = await runOutsideDbContext(() =>

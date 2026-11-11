@@ -441,6 +441,39 @@ describe('GET /cf-access-login', () => {
     expect(res.headers.get('Location')).toContain('/login?');
     expect(res.headers.get('Location')).toContain('reason=disabled');
   });
+  it('does not discover staff from a caller email or portal cookie without verified Access', async () => {
+    envState.enabled = true; dbState.userRow = activeUser;
+    const response = await callGet('/cf-access-login?remoteIdentity=1&email=admin@example.test', {
+      Cookie: 'breeze_portal_session=customer',
+    });
+    expect(await response.json()).toEqual({ kind: 'none' });
+    expect(response.headers.get('Cache-Control')).toBe('no-store');
+    expect(servicesState.mintCalls).toHaveLength(0);
+  });
+  it.each(['active', 'disabled'])('discovers %s staff only after Access verification, without issuing a session', async status => {
+    envState.enabled = true;
+    verifyState.next = { kind: 'claims', claims: { email: 'user@example.com', sub: 'cf-user' } };
+    dbState.userRow = { ...activeUser, status };
+    const response = await callGet('/cf-access-login?remoteIdentity=1', { 'Cf-Access-Jwt-Assertion': 'tok' });
+    expect(await response.json()).toEqual({ kind: 'staff' });
+    expect(servicesState.mintCalls).toHaveLength(0);
+    expect(cookieState.set).toBeNull();
+    expect(dbState.lastLoginUpdated).toBe(false);
+  });
+  it('an unknown verified Access identity remains a customer and issues no staff session', async () => {
+    envState.enabled = true;
+    verifyState.next = { kind: 'claims', claims: { email: 'customer@example.com', sub: 'cf-customer' } };
+    const response = await callGet('/cf-access-login?remoteIdentity=1', { 'Cf-Access-Jwt-Assertion': 'tok' });
+    expect(await response.json()).toEqual({ kind: 'customer' });
+    expect(servicesState.mintCalls).toHaveLength(0);
+  });
+  it('rejects invalid Access assertions during remote identity discovery', async () => {
+    envState.enabled = true; verifyState.next = { kind: 'invalid', code: 'ERR_JWT_EXPIRED' };
+    const response = await callGet('/cf-access-login?remoteIdentity=1', { 'Cf-Access-Jwt-Assertion': 'tok' });
+    expect(response.status).toBe(302);
+    expect(response.headers.get('Location')).toContain('invalid-jwt');
+    expect(servicesState.mintCalls).toHaveLength(0);
+  });
 
   it('redirects to /login with error=no-jwt when header missing', async () => {
     envState.enabled = true;
@@ -673,6 +706,58 @@ describe('GET /cf-access-login', () => {
     expect(res.status).toBe(302);
     expect(res.headers.get('Location')).toContain('/login?');
     expect(res.headers.get('Location')).toContain('reason=binding');
+  });
+
+  it.each([
+    ['rotation', 'begin', 'invalid', 'AuthBindingRotationRequiredError', false],
+    ['unavailable', 'begin', 'logout_pending', 'AuthBindingUnavailableError', false],
+    ['unavailable', 'begin', 'private-reason-token', 'AuthBindingUnavailableError', false],
+    ['conflict', 'begin', undefined, 'AuthIssuanceConflictError', false],
+    ['capability', 'finish', undefined, 'AuthIssuanceCapabilityError', true],
+  ] as const)('logs only safe binding metadata for %s at %s (%s)', async (kind, phase, reason, errorClass, hadCapability) => {
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      envState.enabled = true;
+      transitionState.bindingValue = 'private-cookie-value';
+      verifyState.next = {
+        kind: 'claims',
+        claims: { email: activeUser.email, sub: 'private-cf-sub', aud: envState.audience,
+          iss: `https://${envState.teamDomain}`, exp: 999, iat: 1 },
+      };
+      dbState.userRow = { ...activeUser, authEpoch: 3, mfaEpoch: 2 };
+      const error = kind === 'rotation'
+        ? new transitionState.AuthBindingRotationRequiredError({ kind: 'browser', value: 'private-replacement' })
+        : kind === 'unavailable'
+          ? new transitionState.AuthBindingUnavailableError()
+          : kind === 'conflict'
+            ? new transitionState.AuthIssuanceConflictError()
+            : new transitionState.AuthIssuanceCapabilityError();
+      Object.assign(error, {
+        name: 'private-exception-name', message: 'private-exception-message',
+        reason, token: 'private-token', identity: activeUser,
+      });
+      if (phase === 'begin') transitionState.beginError = error;
+      else transitionState.finishError = error;
+
+      const res = await callGet('/cf-access-login', { 'Cf-Access-Jwt-Assertion': 'private-jwt' });
+      expect(res.status).toBe(302);
+      expect(res.headers.get('Location')).toBe('/login?error=cf-access&reason=binding');
+      expect(warning).toHaveBeenCalledExactlyOnceWith('[cf-access-redirect] binding issuance rejected', {
+        errorClass,
+        reason: reason === 'invalid' || reason === 'logout_pending' ? reason : 'unspecified',
+        phase,
+        elapsedMs: expect.any(Number),
+        hadBinding: true,
+        hadCapability,
+      });
+      const serialized = JSON.stringify(warning.mock.calls);
+      expect(serialized).not.toContain('private-');
+      expect(serialized).not.toContain(activeUser.email);
+      expect(serialized).not.toContain(activeUser.id);
+      expect(warning.mock.calls[0]?.[1].elapsedMs).toBeGreaterThanOrEqual(0);
+    } finally {
+      warning.mockRestore();
+    }
   });
 
   it('mints a session and redirects to / with cf-access-login=success on success', async () => {

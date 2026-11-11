@@ -118,9 +118,32 @@ describe('buildTenantExportPlan', () => {
     );
   });
 
+  it('classifies the retirement lease token in excludedSensitive', () => {
+    const sensitive = tablePolicy('org_id', {
+      included: [], reviewedIncluded: [], excludedSensitive: ['lease_token'], excludedOpen: [],
+    }).columns.lease_token;
+    expect(CORE_TENANT_EXPORT_POLICY.hardware_alert_retirement_outbox?.columns.lease_token)
+      .toBe(sensitive);
+  });
+
+  it('builds the retirement export plan without its lease token or envelope', async () => {
+    const table = 'hardware_alert_retirement_outbox';
+    mockState.columns = [
+      column(table, 'id', 'uuid', 1),
+      column(table, 'org_id', 'uuid', 2),
+      column(table, 'envelope', 'jsonb', 3),
+      column(table, 'lease_token', 'uuid', 4),
+      column(table, 'lease_until', 'timestamp with time zone', 5, 'timestamptz'),
+      column(table, 'created_at', 'timestamp with time zone', 6, 'timestamptz'),
+    ];
+    await expect(buildTenantExportPlan([table], CORE_TENANT_EXPORT_POLICY)).resolves.toEqual([
+      { table, organizationKey: 'org_id', includedColumns: ['id', 'org_id', 'lease_until', 'created_at'] },
+    ]);
+  });
+
   const enrollmentEpochs = [
     ['enrollment_keys', 'credential_generation', ['key', 'key_secret_hash', 'short_code']],
-    ['installer_bootstrap_tokens', 'parent_credential_generation', ['token']],
+    ['installer_bootstrap_tokens', 'parent_credential_generation', ['token', 'token_hash']],
   ] as const;
 
   it.each(enrollmentEpochs)(
@@ -318,6 +341,23 @@ describe('buildTenantExportPlan', () => {
 });
 
 describe('CORE_TENANT_EXPORT_POLICY migration-era columns', () => {
+  it('exports software_policies.managed_by_link_id (#6960): a plain row identifier, no secret', () => {
+    expect(CORE_TENANT_EXPORT_POLICY.software_policies!.columns.managed_by_link_id).toMatchObject({
+      decision: 'include',
+    });
+  });
+
+  it('classifies every security_agent_device_status column as included (#6960 W03): typed columns, no open container', () => {
+    const policy = CORE_TENANT_EXPORT_POLICY.security_agent_device_status;
+    expect(policy).toBeDefined();
+    for (const column of [
+      'id', 'org_id', 'device_id', 'vendor_endpoint_id', 'vendor', 'state', 'reason_code', 'detail',
+      'policy_id', 'last_evaluated_at', 'state_changed_at', 'created_at',
+    ]) {
+      expect(policy!.columns[column], column).toMatchObject({ decision: 'include' });
+    }
+  });
+
   it('exports deployment dependency fingerprints as reviewed integrity provenance', () => {
     expect(
       CORE_TENANT_EXPORT_POLICY.software_deployments!.columns.dependency_fingerprint,
@@ -362,10 +402,18 @@ describe('CORE_TENANT_EXPORT_POLICY migration-era columns', () => {
       report_id: 'include',
       org_id: 'include',
       contact_id: 'include',
+      mode: 'include',
       created_at: 'include',
     });
 
-    expect(CORE_TENANT_EXPORT_POLICY).not.toHaveProperty('report_runs');
+    // #4247: report_runs gained org_id, so every column is classified; the
+    // stored result payload is an open container and never exported.
+    const runs = CORE_TENANT_EXPORT_POLICY.report_runs!;
+    expect(runs.organizationKey).toBe('org_id');
+    expect(runs.columns.result).toMatchObject({ decision: 'exclude' });
+    expect(runs.columns.org_id!.decision).toBe('include');
+    expect(runs.columns.partner_id!.decision).toBe('include');
+    expect(runs.columns.output_url!.decision).toBe('include');
   });
 
   // #2787 wave 04 — `devices` is in CORE_ORG_CASCADE_DELETE_ORDER, so EVERY
@@ -514,5 +562,97 @@ describe('AI origin columns are classified (#5022 W01)', () => {
       expect(cols[name], `action_intents.${name} unclassified`).toBeDefined();
       expect(cols[name]!.decision).toBe('include');
     }
+  });
+});
+
+describe('retiring columns (#7606)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockState.columns = [];
+  });
+
+  const registry = (): TenantExportPolicyRegistry => ({
+    ai_script_policies: tablePolicy('org_id', {
+      included: ['id', 'org_id'], reviewedIncluded: [], excludedSensitive: [], excludedOpen: [], retiring: ['reviewer_model'],
+    }),
+  });
+  const live = (...names: string[]) => names.map((name, i) => column('ai_script_policies', name, 'text', i + 1));
+
+  it('a retiring column may be absent from the live schema (after the drop)', async () => {
+    mockState.columns = live('id', 'org_id');
+    const [plan] = await buildTenantExportPlan(['ai_script_policies'], registry());
+    expect(plan!.includedColumns).toEqual(['id', 'org_id']);
+  });
+
+  it('a retiring column that is still present is never exported (before the drop)', async () => {
+    mockState.columns = live('id', 'org_id', 'reviewer_model');
+    const [plan] = await buildTenantExportPlan(['ai_script_policies'], registry());
+    expect(plan!.includedColumns).toEqual(['id', 'org_id']);
+  });
+
+  it('a retiring jsonb column needs no separate open-container review', async () => {
+    mockState.columns = [...live('id', 'org_id'), column('ai_script_policies', 'reviewer_model', 'jsonb', 3)];
+    await expect(buildTenantExportPlan(['ai_script_policies'], registry())).resolves.toHaveLength(1);
+  });
+
+  it('an ordinary policy column missing from the live schema still throws', async () => {
+    mockState.columns = live('id');
+    await expect(buildTenantExportPlan(['ai_script_policies'], registry())).rejects.toThrow(/org_id/);
+  });
+
+  it('a mayBeAbsent decision that would INCLUDE the column is refused (retiring is exclude-only)', async () => {
+    mockState.columns = live('id', 'org_id');
+    const bad: TenantExportPolicyRegistry = {
+      ai_script_policies: policy('org_id', {
+        id: { decision: 'include', rationale: 'Row id.' },
+        org_id: { decision: 'include', rationale: 'Tenant id.' },
+        reviewer_model: { decision: 'include', rationale: 'Bad.', mayBeAbsent: true },
+      }),
+    };
+    await expect(buildTenantExportPlan(['ai_script_policies'], bad)).rejects.toThrow(/reviewer_model/);
+  });
+
+  it('the policy checker (tenant-export-policy integration contract) accepts a retiring column both before and after the drop', () => {
+    const tables = ['ai_script_policies'];
+    const cols = (...names: string[]) => names.map((columnName) => ({ tableName: 'ai_script_policies', columnName }));
+    expect(findTenantExportPolicyIssues(tables, cols('id', 'org_id', 'reviewer_model'), registry())).toEqual([]);
+    expect(findTenantExportPolicyIssues(tables, cols('id', 'org_id'), registry())).toEqual([]);
+    expect(findTenantExportPolicyIssues(tables, cols('id'), registry())).toEqual(['ai_script_policies.org_id: classification has no live column']);
+  });
+
+  it('W08b dropped the retired columns, so the core registry no longer classifies them (#7606)', () => {
+    for (const [table, col] of [
+      ['ai_script_policies', 'reviewer_model'],
+      ['client_ai_org_policies', 'allowed_models'],
+      ['ai_agents', 'model'],
+      ['ai_budgets', 'allowed_models'],
+    ] as const) {
+      expect(CORE_TENANT_EXPORT_POLICY[table]!.columns[col], `${table}.${col}`).toBeUndefined();
+    }
+  });
+
+  it('the W08b archive exports its metadata and excludes the jsonb value as an open container (#7606)', () => {
+    const archive = CORE_TENANT_EXPORT_POLICY.ai_model_registry_legacy_archive!;
+    expect(archive.organizationKey).toBe('org_id');
+    expect(archive.columns.value).toMatchObject({ decision: 'exclude', openContainerReviewed: true });
+    expect(archive.columns.value!.mayBeAbsent).toBeUndefined();
+    for (const col of ['id', 'partner_id', 'org_id', 'source_table', 'source_id', 'source_column', 'had_cutover', 'archived_at']) {
+      expect(archive.columns[col], col).toMatchObject({ decision: 'include' });
+    }
+  });
+});
+
+describe('software install-script columns are classified (#6958 PR C)', () => {
+  it('includes software_catalog.builtin_package_key (a varchar package key, not an open container)', () => {
+    const cols = CORE_TENANT_EXPORT_POLICY['software_catalog']!.columns;
+    expect(cols['builtin_package_key'], 'software_catalog.builtin_package_key unclassified').toBeDefined();
+    expect(cols['builtin_package_key']!.decision).toBe('include');
+  });
+
+  it('software_versions stays parent-keyed with no export entry of its own', () => {
+    // software_versions has no org_id; it follows software_catalog
+    // (orgMergeRegistry `follows-parent`), so install_scripts_enabled needs no
+    // classification. If an entry is ever added, classify that column too.
+    expect(CORE_TENANT_EXPORT_POLICY['software_versions']).toBeUndefined();
   });
 });

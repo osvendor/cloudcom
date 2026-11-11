@@ -31,6 +31,8 @@
     "confidenceValue": "{{confidence}}% confianza"
   },
   "alertDetailPage": {
+    "externalTickets": "Tickets externos",
+    "externalTicketsFailedToLoad": "No se pudieron cargar los tickets externos.",
     "loadingAlert": "Cargando alerta...",
     "backToAlerts": "Volver a alertas",
     "goBack": "Volver",
@@ -66,8 +68,8 @@
     "alertAcknowledged": "Alerta reconocida",
     "failedToResolveAlert": "No se pudo resolver la alerta",
     "alertResolved": "Alerta resuelta",
-    "alertsBreadcrumb": "Ruta de navegación de alertas",
-    "alertFallback": "Reserva de alerta",
+    "alertsBreadcrumb": "Alertas",
+    "alertFallback": "Alerta",
     "unknownMetric": "Métrica desconocida",
     "severity": {
       "critical": "Crítico",
@@ -82,6 +84,21 @@
       "resolved": "Resuelto",
       "suppressed": "suprimido",
       "dismissed": "Descartado"
+    },
+    "createPsaTicket": "Crear ticket PSA",
+    "psaTicketRequested": "Ticket PSA solicitado",
+    "failedToCreatePsaTicket": "No se pudo solicitar el ticket PSA",
+    "lifecycleLine": {
+      "text": "{{rearm}} · enfriamiento {{minutes}} min ({{source}})",
+      "rearmNewEvidence": "Se rearma con evidencia nueva",
+      "rearmAfterDelay": "Se rearma después de {{minutes}} min",
+      "sources": {
+        "monitor": "este monitor",
+        "org": "valor predeterminado de la organización",
+        "partner": "valor predeterminado del partner",
+        "builtin": "valor predeterminado integrado",
+        "legacy": "regla de alerta"
+      }
     }
   },
   "alertDetails": {
@@ -112,6 +129,7 @@
     "close": "Cerrar",
     "createALinkedTicketPreFilledFrom": "Cree un ticket vinculado precargado a partir de esta alerta",
     "createTicket": "Crear ticket",
+    "viewTicket": "Ver ticket {{ticket}}",
     "silenceThisAlertStopsNotificationsWithoutResolving": "Silenciar esta alerta: detiene las notificaciones sin resolverlas",
     "suppress": "Suprimir",
     "dismissPermanentlyHidesThisAlertForGood": "Descartar permanentemente: oculta esta alerta definitivamente (el vencimiento de la garantía no volverá a alertar para la misma fecha de finalización; otras condiciones aún pueden abrir una nueva alerta si se repiten)",
@@ -124,7 +142,7 @@
     "unknownMetric": "Métrica desconocida",
     "statusChange": "{{from}} → {{to}}",
     "resolveAlert": "Resolver alerta",
-    "ticketCreationFailedRetry": "Reintento fallido al crear el ticket",
+    "ticketCreationFailedRetry": "No se pudo crear el ticket. Inténtelo de nuevo",
     "ticketCreated": "Ticket {{ticket}} creado",
     "severity": {
       "critical": "Crítico",
@@ -221,7 +239,11 @@
       "resolved": "Resuelto",
       "suppressed": "suprimido",
       "dismissed": "Descartado"
-    }
+    },
+    "filterStatusLabel": "Filtro de estado",
+    "filterSeverityLabel": "Filtro de gravedad",
+    "filterDeviceLabel": "Filtro de dispositivo",
+    "filterDateRangeLabel": "Filtro de rango de fechas"
   },
   "alertRuleEditPage": {
     "loadingAlertRule": "Cargando regla de alerta...",
@@ -430,98 +452,6 @@
     "evaluatedAgainst": "Evaluado contra {{hostname}}",
     "fireSuppressionNote": "Una ventana de mantenimiento activa, el período de enfriamiento, una alerta que ya está abierta o la supresión por fluctuaciones (flapping) pueden seguir impidiendo que se cree una alerta cuando se ejecute la regla."
   },
-  "alertTemplateEditor": {
-    "loadingAlertTemplate": "Cargando plantilla de alerta...",
-    "tryAgain": "Intentar otra vez",
-    "templateMetadata": "Metadatos de plantilla",
-    "name": "Nombre",
-    "availableTo": "Disponible para",
-    "allMyOrganizations": "Todas mis organizaciones",
-    "partnerWide": "(en todo el socio)",
-    "aSpecificOrganization": "Una organización específica",
-    "organization": "Organización",
-    "selectAnOrganization": "Seleccione una organización",
-    "severity": "Gravedad",
-    "category": "Categoría",
-    "description": "Descripción",
-    "conditionBuilder": "Generador de condiciones",
-    "combineMetricThresholdsWithEventPatternsTo": "Combine umbrales de métricas con patrones de eventos para activar alertas.",
-    "addMetric": "Agregar métrica",
-    "addEvent": "Agregar evento",
-    "trigger": "Desencadenador",
-    "remove": "Eliminar",
-    "type": "Tipo",
-    "metricThreshold": "Umbral métrico",
-    "eventPattern": "Patrón de evento",
-    "metric": "Métrico",
-    "operator": "Operador",
-    "thresholdValue": "Valor umbral",
-    "durationMin": "Duración (min)",
-    "frequencyCount": "Recuento de frecuencia",
-    "eventSource": "Fuente del evento",
-    "pattern": "Patrón",
-    "thresholdConfiguration": "Configuración de umbral",
-    "defaultsUsedWhenAddingNewMetricTriggers": "Valores predeterminados utilizados al agregar nuevos activadores de métricas. Ajuste por disparador según sea necesario.",
-    "defaultValue": "Valor predeterminado",
-    "defaultDurationMin": "Duración predeterminada (min)",
-    "defaultFrequencyCount": "Recuento de frecuencia predeterminado",
-    "escalationRules": "Reglas de escalada",
-    "routeAlertsBasedOnTimeAndSeverity": "Enrute alertas según el tiempo y la gravedad.",
-    "addEscalation": "Agregar escalada",
-    "step": "Paso",
-    "afterMin": "Después (min)",
-    "route": "Ruta",
-    "suppressionRules": "Reglas de supresión",
-    "avoidNoiseDuringMaintenanceAndDuplicates": "Evite ruidos durante el mantenimiento y duplicados.",
-    "addWindow": "Agregar ventana",
-    "suppressDuplicateAlerts": "Suprimir alertas duplicadas",
-    "cooldownMinutes": "Minutos de enfriamiento",
-    "noMaintenanceWindowsConfiguredAddOneTo": "No hay ventanas de mantenimiento configuradas. Agregue uno para silenciar las alertas durante el trabajo planificado.",
-    "timezone": "Zona horaria",
-    "starts": "Comienza",
-    "ends": "Termina",
-    "notificationRouting": "Enrutamiento de notificaciones",
-    "autoRemediation": "Corrección automática",
-    "linkAnAutomationPlaybookToRunWhen": "Vincule un manual de automatización para que se ejecute cuando se active esta alerta.",
-    "enableAutoRemediation": "Habilitar la corrección automática",
-    "automation": "Automatización",
-    "selectAutomation": "Seleccionar automatización",
-    "noAutomationsAvailableCreateOneInAutomations": "No hay automatizaciones disponibles. Cree uno en Automatizaciones para habilitar la corrección.",
-    "targetScope": "Alcance objetivo",
-    "applyThisTemplateToOrganizationsSitesOr": "Aplique esta plantilla a organizaciones, sitios o grupos.",
-    "scopeType": "Tipo de alcance",
-    "organizations": "Organizaciones",
-    "sites": "Sitios",
-    "groups": "Grupos",
-    "no": "No",
-    "optionsAvailableThisTemplateWillApplyBroadly": "opciones disponibles. Esta plantilla se aplicará ampliamente."
-  },
-  "alertTemplateList": {
-    "tryAgain": "Intentar otra vez",
-    "alertTemplates": "Plantillas de alerta",
-    "of": "de",
-    "templates": "plantillas",
-    "addTemplate": "Agregar plantilla",
-    "allSeverity": "toda severidad",
-    "critical": "Crítico",
-    "high": "Alto",
-    "medium": "Medio",
-    "low": "Bajo",
-    "info": "Información",
-    "allScopes": "Todos los alcances",
-    "partnerWide": "En todo el socio",
-    "organization": "Organización",
-    "builtIn": "Incorporado",
-    "name": "Nombre",
-    "scope": "Alcance",
-    "severity": "Gravedad",
-    "category": "Categoría",
-    "actions": "Acciones",
-    "noTemplatesMatchYourFilters": "Ninguna plantilla coincide con sus filtros.",
-    "deleteConfirm": "¿Eliminar plantilla \"{{name}}\"? Esto no se puede deshacer.",
-    "deleteFailed": "No se pudo eliminar la plantilla.",
-    "deleted": "Plantilla eliminada"
-  },
   "alertVerdict": {
     "label": {
       "actionable": "Requiere acción",
@@ -545,8 +475,6 @@
     "loadingAlerts": "Cargando alertas...",
     "tryAgain": "Intentar otra vez",
     "alerts": "Alertas",
-    "monitorAlertsAcrossYourDevicesRulesAre": "Supervise las alertas en sus dispositivos. Las reglas se gestionan en",
-    "configurationPolicies": "Políticas de configuración",
     "alert": "alerta",
     "dismissedAlertsAreHiddenForGoodWarranty": "Las alertas descartadas se ocultan para siempre. El vencimiento de la garantía no volverá a alertar para la misma fecha de finalización; otras alertas aún pueden activarse nuevamente si su condición se repite.",
     "cancel": "Cancelar",
@@ -567,6 +495,7 @@
     "alertResolved": "Alerta resuelta",
     "alertSuppressed": "\"{{title}}\" suprimido",
     "failedToSuppressAlert": "No se pudo suprimir la alerta",
+    "failedToRestoreAlert": "No se pudo restaurar la alerta. Sigue silenciada.",
     "failedBulkAction": "No se pudo realizar la acción «{{action}}» en las alertas",
     "skippedCount": "{{count}} omitido",
     "failedCount": "{{count}} falló",
@@ -591,7 +520,8 @@
     },
     "bulkConfirmQuestion": "{{action}} {{count}} alerta?",
     "bulkConfirmQuestion_one": "{{action}} {{count}} alerta?",
-    "bulkConfirmQuestion_other": "{{action}} {{count}} alertas?"
+    "bulkConfirmQuestion_other": "{{action}} {{count}} alertas?",
+    "subtitle": "Supervise las alertas en sus dispositivos. Los umbrales se definen en <monitors>Monitores</monitors>; impleméntelos en los clientes con <policies>Políticas de configuración</policies>."
   },
   "alertsSummary": {
     "activeAlerts": "Alertas activas",
@@ -619,7 +549,6 @@
       "alerts": "Alertas",
       "correlations": "Correlaciones",
       "monitors": "Monitores",
-      "rules": "Reglas",
       "delivery": "Entrega"
     }
   },
@@ -632,7 +561,8 @@
     "sections": {
       "channels": "Canales",
       "routing": "Enrutamiento",
-      "escalation": "Políticas de escalamiento"
+      "escalation": "Políticas de escalamiento",
+      "inheritedChannels": "Compartidos por su socio"
     },
     "routing": {
       "everythingElse": "Todo lo demás",
@@ -739,6 +669,7 @@
       "info": "Información"
     },
     "status": {
+      "open": "Abierto",
       "active": "Activo",
       "acknowledged": "Reconocido",
       "resolved": "Resuelto",
@@ -961,7 +892,8 @@
       "webhook": "Webhook",
       "sms": "SMS",
       "pushover": "Pushover"
-    }
+    },
+    "typeLabel": "Tipo"
   },
   "notificationChannelsPage": {
     "loadingNotificationChannels": "Cargando canales de notificación...",
@@ -1051,5 +983,10 @@
       "body": "Las plantillas existentes siguen siendo editables aquí y se convertirán en la próxima versión.",
       "link": "Abrir Monitores"
     }
+  },
+  "subject": {
+    "label": "Elemento afectado",
+    "backupWorkload": "Carga de respaldo",
+    "topologySite": "Sitio de topología"
   }
 }

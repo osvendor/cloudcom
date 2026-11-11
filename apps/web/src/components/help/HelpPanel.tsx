@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { BookOpen, ExternalLink, Loader2, X } from 'lucide-react';
 import { useHelpStore } from '@/stores/helpStore';
 import { isDocsEmbeddableOrigin } from '@/lib/docsEmbed';
+import { RIGHT_DOCK_BACKDROP_CLASS, RIGHT_DOCK_PANEL_CLASS } from '../layout/rightDockPanel';
 // Initializes the shared i18next singleton. Islands hydrate independently, so
 // an island that hydrates before whichever other island happens to pull i18n in
 // would otherwise render raw keys (and mismatch the SSR markup).
@@ -73,12 +74,20 @@ export default function HelpPanel() {
         // off-canvas shell truly non-interactive so it can't intercept clicks
         // meant for page content on wide layouts, and its (off-viewport) Close
         // control drops out of the focus/hit-test order (#1419).
+        //
+        // shadow-2xl is applied only while open (#7150): once collapsed, the
+        // shell's left edge sits exactly on the viewport's right edge, and an
+        // always-on shadow's blur spilled back into view as a grey band on
+        // every page.
+        //
+        // It docks below the app header so the bell, theme and account menu
+        // stay usable while it is open (#10107).
         inert={!isOpen}
-        className={`fixed right-0 top-0 z-40 flex h-full w-[400px] flex-col border-l bg-card shadow-2xl transition-transform duration-300 ${
-          isOpen ? 'translate-x-0' : 'translate-x-full pointer-events-none'
+        className={`${RIGHT_DOCK_PANEL_CLASS} ${
+          isOpen ? 'translate-x-0 shadow-2xl' : 'translate-x-full pointer-events-none'
         }`}
       >
-        <div className="flex items-center justify-between border-b bg-card px-4 py-3">
+        <div className="flex items-center justify-between border-b px-4 py-3">
           <div className="flex items-center gap-2">
             <BookOpen className="h-4 w-4 text-primary" />
             <span className="text-sm font-semibold text-foreground">{localizedLabel}</span>
@@ -152,7 +161,8 @@ export default function HelpPanel() {
 
       {isOpen && (
         <div
-          className="fixed inset-0 z-30 bg-black/30 lg:hidden"
+          data-testid="help-panel-backdrop"
+          className={RIGHT_DOCK_BACKDROP_CLASS}
           onClick={close}
         />
       )}

@@ -1,0 +1,14 @@
+---
+import Layout from '../../../layouts/Layout.astro';
+import AuthOverlay from '../../../components/auth/AuthOverlay';
+import DesktopEntry from '../../../components/cloudcom/browserDesktop/DesktopEntry';
+
+const { deviceId } = Astro.params;
+if (!deviceId || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(deviceId)) {
+  return Astro.redirect('/remote');
+}
+---
+<Layout title="Browser remote desktop">
+  <AuthOverlay client:load />
+  <DesktopEntry deviceId={deviceId} client:only="react" />
+</Layout>

@@ -1,3 +1,4 @@
+import { RESTORE_HELPER_UPDATE_REQUIRED_MESSAGE } from './backupRestoreGate';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const {
@@ -11,6 +12,7 @@ const {
   decryptMock,
   captureExceptionMock,
   inFlightMock,
+  dispatchMock,
 } = vi.hoisted(() => ({
   queueCommandMock: vi.fn(),
   claimMock: vi.fn(),
@@ -22,12 +24,24 @@ const {
   decryptMock: vi.fn(),
   captureExceptionMock: vi.fn(),
   inFlightMock: vi.fn(),
+  dispatchMock: vi.fn(),
+}));
+
+// Devices parked in a holding org, by id. The helper's query is proven against
+// Postgres in parkedCommandDelivery.integration.test.ts.
+const parkedDeviceIds = vi.hoisted(() => new Set<string>());
+vi.mock('./unassignedPool/deliveryEligibility', async () => ({
+  ...(await vi.importActual<typeof import('./unassignedPool/deliveryEligibility')>(
+    './unassignedPool/deliveryEligibility',
+  )),
+  isParkedDevice: vi.fn(async (_reader: unknown, deviceId: string) => parkedDeviceIds.has(deviceId)),
 }));
 
 vi.mock('../db', () => ({
   db: { select: (...a: unknown[]) => selectMock(...(a as [])) },
   runOutsideDbContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
   withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+  withSystemDbAccessContextIsolated: vi.fn(async (fn: () => Promise<unknown>) => fn()),
   getCurrentDbAccessContext: vi.fn(),
 }));
 vi.mock('../db/schema', () => ({ devices: { id: 'devices.id' } }));
@@ -46,7 +60,17 @@ vi.mock('./sensitiveCommandPayload', () => ({
   decryptCommandForDelivery: (...a: unknown[]) => decryptMock(...(a as [])),
   toAgentCommandFrame: (c: unknown) => c,
 }));
-vi.mock('../routes/agentWs', () => ({ sendCommandToAgent: (...a: unknown[]) => sendMock(...(a as [])) }));
+// #4142: the push goes through the relay facade. `dispatchMock` defaults (in
+// beforeEach) to a bridge over `sendMock`'s boolean, so the transport tests
+// below read as "the push succeeded / failed"; the outcome tests override it.
+// dispatchDisposition mirrors the real mapping (pinned in agentCommandRelay.test.ts);
+// importing the real module here would load the relay's whole dependency graph.
+vi.mock('./agentCommandRelay', () => ({
+  dispatchCommandToAgent: (...a: unknown[]) => dispatchMock(...(a as [])),
+  dispatchDisposition: (o: { status: string }) => (
+    o.status === 'sent' ? 'delivered' : o.status === 'indeterminate' ? 'uncertain' : 'not_delivered'
+  ),
+}));
 vi.mock('./sentry', () => ({
   captureException: (...a: unknown[]) => captureExceptionMock(...(a as [])),
 }));
@@ -83,10 +107,14 @@ function selectReturning(row: unknown) {
 describe('dispatchDeviceCommand (#5128 W1)', () => {
   beforeEach(() => {
     vi.resetAllMocks();
+    parkedDeviceIds.clear();
     vi.mocked(withSystemDbAccessContext).mockImplementation(async (fn) => fn());
     assertAllowedMock.mockResolvedValue(undefined);
     refreshMock.mockImplementation(async (_t: string, p: unknown) => p);
     inFlightMock.mockResolvedValue(0);
+    dispatchMock.mockImplementation(async (agentId: string, frame: unknown) => (
+      sendMock(agentId, frame) ? { status: 'sent', via: 'local' } : { status: 'offline' }
+    ));
     decryptMock.mockImplementation((c: unknown) => c);
     queueCommandMock.mockImplementation(async (_d, type, _p, _u, opts) => ({
       id: 'cmd-1',
@@ -114,7 +142,7 @@ describe('dispatchDeviceCommand (#5128 W1)', () => {
     });
     claimMock.mockImplementation(async () => {
       expect(depth).toBe(0);
-      return { id: 'cmd-1', executedAt: new Date() };
+      return { status: 'claimed', id: 'cmd-1', executedAt: new Date() };
     });
     sendMock.mockImplementation(() => { expect(depth).toBe(0); return true; });
     const result = await dispatchDeviceCommandWithSystemPrecheck({
@@ -184,7 +212,7 @@ describe('dispatchDeviceCommand (#5128 W1)', () => {
   it('online device → claim + push, delivery=delivered, and the row still carries a deadline', async () => {
     selectReturning(deviceRow('online'));
     const executedAt = new Date();
-    claimMock.mockResolvedValue({ id: 'cmd-1', executedAt });
+    claimMock.mockResolvedValue({ status: 'claimed', id: 'cmd-1', executedAt });
     sendMock.mockReturnValue(true);
     const res = await dispatchDeviceCommand({ deviceId: DEVICE, type: 'refresh_inventory' });
     expect(res.ok && res.delivery).toBe('delivered');
@@ -193,14 +221,162 @@ describe('dispatchDeviceCommand (#5128 W1)', () => {
     expect(releaseMock).not.toHaveBeenCalled();
   });
 
+  it('pushes to the agent id read in the claim, not the device row read before it (#8318 §6.4)', async () => {
+    selectReturning(deviceRow('online', 'agent-1')); // read before the claim
+    // A reattach / re-enroll committed between that read and the claim.
+    claimMock.mockResolvedValue({ status: 'claimed', id: 'cmd-1', executedAt: new Date(), agentId: 'agent-after-reattach' });
+    sendMock.mockReturnValue(true);
+    const res = await dispatchDeviceCommand({ deviceId: DEVICE, type: 'refresh_inventory' });
+    expect(res.ok && res.delivery).toBe('delivered');
+    expect(sendMock).toHaveBeenCalledTimes(1);
+    expect(sendMock.mock.calls[0]![0]).toBe('agent-after-reattach');
+  });
+
+  it('a push the claim cancels is reported as cancelled with its reason, not queued_live', async () => {
+    selectReturning(deviceRow('online'));
+    claimMock.mockResolvedValue({ status: 'cancelled', id: 'cmd-1', reason: 'device_moved_org' });
+    const res = await dispatchDeviceCommand({ deviceId: DEVICE, type: 'refresh_inventory' });
+    expect(res).toMatchObject({ ok: true, delivery: 'cancelled', cancelReason: 'device_moved_org' });
+    expect(res.ok && res.command.status).toBe('cancelled');
+    expect(sendMock).not.toHaveBeenCalled();
+    expect(releaseMock).not.toHaveBeenCalled();
+  });
+
+  it('a push the claim holds stays queued_live for the heartbeat', async () => {
+    selectReturning(deviceRow('online'));
+    claimMock.mockResolvedValue({ status: 'held', id: 'cmd-1', reason: 'claim_lock_conflict' });
+    const res = await dispatchDeviceCommand({ deviceId: DEVICE, type: 'refresh_inventory' });
+    expect(res.ok && res.delivery).toBe('queued_live');
+    expect(sendMock).not.toHaveBeenCalled();
+  });
+
+  describe('deferDelivery (#7187)', () => {
+    it('persists the row but neither claims nor pushes until deliver() runs', async () => {
+      selectReturning(deviceRow('online'));
+      const executedAt = new Date();
+      claimMock.mockResolvedValue({ status: 'claimed', id: 'cmd-1', executedAt });
+      sendMock.mockReturnValue(true);
+
+      const res = await dispatchDeviceCommand({ deviceId: DEVICE, type: 'refresh_inventory', deferDelivery: true });
+
+      expect(queueCommandMock).toHaveBeenCalledTimes(1);
+      expect(claimMock).not.toHaveBeenCalled();
+      expect(sendMock).not.toHaveBeenCalled();
+      expect(res.ok && res.delivery).toBe('queued_live');
+      const deliver = res.ok ? res.deliver : undefined;
+      expect(typeof deliver).toBe('function');
+
+      const delivered = await deliver!();
+
+      expect(claimMock).toHaveBeenCalledWith('cmd-1');
+      expect(sendMock).toHaveBeenCalledTimes(1);
+      expect(delivered.ok && delivered.delivery).toBe('delivered');
+    });
+
+    it('an offline device gets no continuation — there is nothing to push', async () => {
+      selectReturning(deviceRow('offline'));
+      const res = await dispatchDeviceCommand({ deviceId: DEVICE, type: 'refresh_inventory', deferDelivery: true });
+      expect(res.ok && res.delivery).toBe('queued_offline');
+      expect(res.ok && res.deliver).toBeUndefined();
+    });
+
+    it('a device with no agent socket gets no continuation', async () => {
+      selectReturning(deviceRow('online', null));
+      const res = await dispatchDeviceCommand({ deviceId: DEVICE, type: 'refresh_inventory', deferDelivery: true });
+      expect(res.ok && res.delivery).toBe('queued_live');
+      expect(res.ok && res.deliver).toBeUndefined();
+    });
+
+    it('a deliver() whose transport throws resolves queued_live instead of rejecting (the row is committed)', async () => {
+      selectReturning(deviceRow('online'));
+      claimMock.mockRejectedValue(new Error('pool exhausted'));
+
+      const res = await dispatchDeviceCommand({ deviceId: DEVICE, type: 'refresh_inventory', deferDelivery: true });
+      const delivered = await (res.ok ? res.deliver! : async () => { throw new Error('no deliver'); })();
+
+      expect(delivered.ok && delivered.delivery).toBe('queued_live');
+      expect(delivered.ok && delivered.command.id).toBe('cmd-1');
+      expect(captureExceptionMock).toHaveBeenCalled();
+    });
+
+    it('a deliver() whose relay is unconfirmed resolves indeterminate and keeps the claim (#4142)', async () => {
+      selectReturning(deviceRow('online'));
+      claimMock.mockResolvedValue({ status: 'claimed', id: 'cmd-1', executedAt: new Date(), agentId: 'agent-1' });
+      dispatchMock.mockResolvedValue({ status: 'indeterminate' });
+
+      const res = await dispatchDeviceCommand({ deviceId: DEVICE, type: 'refresh_inventory', deferDelivery: true });
+      const delivered = await (res.ok ? res.deliver! : async () => { throw new Error('no deliver'); })();
+
+      expect(delivered.ok && delivered.delivery).toBe('indeterminate');
+      expect(releaseMock).not.toHaveBeenCalled();
+    });
+
+    it('without deferDelivery the immediate push is unchanged and carries no continuation', async () => {
+      selectReturning(deviceRow('online'));
+      claimMock.mockResolvedValue({ status: 'claimed', id: 'cmd-1', executedAt: new Date() });
+      sendMock.mockReturnValue(true);
+      const res = await dispatchDeviceCommand({ deviceId: DEVICE, type: 'refresh_inventory' });
+      expect(res.ok && res.delivery).toBe('delivered');
+      expect(res.ok && res.deliver).toBeUndefined();
+    });
+  });
+
   it('online device, push fails → claim released, delivery=queued_live', async () => {
     selectReturning(deviceRow('online'));
     const executedAt = new Date();
-    claimMock.mockResolvedValue({ id: 'cmd-1', executedAt });
+    claimMock.mockResolvedValue({ status: 'claimed', id: 'cmd-1', executedAt });
     sendMock.mockReturnValue(false);
     const res = await dispatchDeviceCommand({ deviceId: DEVICE, type: 'refresh_inventory' });
     expect(res.ok && res.delivery).toBe('queued_live');
     expect(releaseMock).toHaveBeenCalledWith('cmd-1', executedAt);
+  });
+
+  describe('facade outcomes (#4142 W1.T2)', () => {
+    const executedAt = new Date('2026-11-08T12:00:00Z');
+    beforeEach(() => {
+      selectReturning(deviceRow('online'));
+      claimMock.mockResolvedValue({ status: 'claimed', id: 'cmd-1', executedAt, agentId: 'agent-1' });
+    });
+
+    it('sent → delivery delivered, claim kept', async () => {
+      dispatchMock.mockResolvedValue({ status: 'sent', via: 'relay' });
+      const res = await dispatchDeviceCommand({ deviceId: DEVICE, type: 'refresh_inventory' });
+      expect(res.ok && res.delivery).toBe('delivered');
+      expect(releaseMock).not.toHaveBeenCalled();
+    });
+
+    it('indeterminate → delivery indeterminate, command.status sent, releaseClaimedCommandDelivery not called', async () => {
+      dispatchMock.mockResolvedValue({ status: 'indeterminate' });
+      const res = await dispatchDeviceCommand({ deviceId: DEVICE, type: 'refresh_inventory' });
+      expect(res.ok && res.delivery).toBe('indeterminate');
+      expect(res.ok && res.command.status).toBe('sent');
+      expect(res.ok && res.command.executedAt).toBe(executedAt);
+      expect(releaseMock).not.toHaveBeenCalled();
+    });
+
+    it('offline → release called, delivery queued_live', async () => {
+      dispatchMock.mockResolvedValue({ status: 'offline' });
+      const res = await dispatchDeviceCommand({ deviceId: DEVICE, type: 'refresh_inventory' });
+      expect(res.ok && res.delivery).toBe('queued_live');
+      expect(releaseMock).toHaveBeenCalledWith('cmd-1', executedAt);
+    });
+
+    it('infrastructure_error (e.g. relay refused inside a held DB context) → release called, delivery queued_live', async () => {
+      dispatchMock.mockResolvedValue({ status: 'infrastructure_error', message: 'relay refused inside a held DB context' });
+      const res = await dispatchDeviceCommand({ deviceId: DEVICE, type: 'refresh_inventory' });
+      expect(res.ok && res.delivery).toBe('queued_live');
+      expect(releaseMock).toHaveBeenCalledWith('cmd-1', executedAt);
+    });
+
+    // A throw must never strand the claim AND must never release it: the frame
+    // may have reached the agent, so a release could deliver it twice.
+    it('a rejected dispatch → claim kept, no throw to the caller, delivery indeterminate', async () => {
+      dispatchMock.mockRejectedValue(new Error('facade contract violated'));
+      const res = await dispatchDeviceCommand({ deviceId: DEVICE, type: 'refresh_inventory' });
+      expect(res.ok && res.delivery).toBe('indeterminate');
+      expect(releaseMock).not.toHaveBeenCalled();
+      expect(captureExceptionMock).toHaveBeenCalledTimes(1);
+    });
   });
 
   it('online device with no agent socket → queued_live, never pushed', async () => {
@@ -219,7 +395,8 @@ describe('dispatchDeviceCommand (#5128 W1)', () => {
 
   it('runs the delivery refresher before decrypt on the enqueue-time push', async () => {
     selectReturning(deviceRow('online'));
-    claimMock.mockResolvedValue({ id: 'cmd-1', executedAt: new Date() });
+    const executedAt = new Date();
+    claimMock.mockResolvedValue({ status: 'claimed', id: 'cmd-1', executedAt });
     sendMock.mockReturnValue(true);
     refreshMock.mockResolvedValue({ s3Key: 'k', downloadUrl: 'https://fresh.example' });
     await dispatchDeviceCommand({
@@ -227,14 +404,20 @@ describe('dispatchDeviceCommand (#5128 W1)', () => {
       type: 'software_install',
       payload: { s3Key: 'k', downloadUrl: 'https://stale.example' },
     });
-    expect(refreshMock).toHaveBeenCalledWith('software_install', { s3Key: 'k', downloadUrl: 'https://stale.example' });
+    // The refresher is told which command and claim it is preparing, so a
+    // refusal can expire exactly this claim and nothing else.
+    expect(refreshMock).toHaveBeenCalledWith(
+      'software_install',
+      { s3Key: 'k', downloadUrl: 'https://stale.example' },
+      { commandId: 'cmd-1', deviceId: DEVICE, type: 'software_install', claimedAt: executedAt },
+    );
     expect(decryptMock.mock.calls[0]![0]).toMatchObject({ payload: { downloadUrl: 'https://fresh.example' } });
   });
 
   it('a refresher failure releases the claim instead of pushing a stale payload', async () => {
     selectReturning(deviceRow('online'));
     const executedAt = new Date();
-    claimMock.mockResolvedValue({ id: 'cmd-1', executedAt });
+    claimMock.mockResolvedValue({ status: 'claimed', id: 'cmd-1', executedAt });
     refreshMock.mockResolvedValue(null);
     const res = await dispatchDeviceCommand({ deviceId: DEVICE, type: 'software_install', payload: { s3Key: 'k' } });
     expect(sendMock).not.toHaveBeenCalled();
@@ -285,6 +468,119 @@ describe('dispatchDeviceCommand (#5128 W1)', () => {
     expect(queueCommandMock).not.toHaveBeenCalled();
   });
 
+  it('refuses a storage-destination read to a device whose backup helper predates storage sessions, writing no row', async () => {
+    selectReturning({ ...deviceRow('online'), backupReadProtocolVersion: 0 });
+    const res = await dispatchDeviceCommand({
+      deviceId: DEVICE,
+      type: 'backup_restore',
+      payload: { snapshotId: 'snap-1', provider: 's3', providerConfigRef: { configId: 'c', orgId: ORG } },
+    });
+    expect(res).toMatchObject({ ok: false, code: 'backup_helper_update_required' });
+    expect(res.ok ? '' : res.error).toMatch(/^Update the Breeze agent on this device/);
+    expect(queueCommandMock).not.toHaveBeenCalled();
+    expect(claimMock).not.toHaveBeenCalled();
+  });
+
+  it('queues a storage-destination read to a device whose backup helper supports storage sessions', async () => {
+    selectReturning({ ...deviceRow('online'), backupReadProtocolVersion: 1, backupIntegrityProtocolVersion: 2 });
+    claimMock.mockResolvedValue({ status: 'claimed', id: 'cmd-1', executedAt: new Date() });
+    sendMock.mockReturnValue(true);
+    const res = await dispatchDeviceCommand({
+      deviceId: DEVICE,
+      type: 'backup_restore',
+      payload: { snapshotId: 'snap-1', provider: 's3', providerConfigRef: { configId: 'c', orgId: ORG } },
+    });
+    expect(res.ok).toBe(true);
+    expect(queueCommandMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses a backup to S3 storage to a device whose backup helper predates brokered writes, writing no row', async () => {
+    selectReturning({ ...deviceRow('online'), backupReadProtocolVersion: 1, backupWriteProtocolVersion: 0 });
+    const res = await dispatchDeviceCommand({
+      deviceId: DEVICE,
+      type: 'hyperv_backup',
+      payload: { jobId: 'job-1', provider: 's3', providerConfigRef: { configId: 'c', orgId: ORG } },
+    });
+    expect(res).toMatchObject({ ok: false, code: 'backup_helper_update_required' });
+    expect(res.ok ? '' : res.error).toMatch(/^Update the Breeze agent on this device, then try again\. Backups now require/);
+    expect(queueCommandMock).not.toHaveBeenCalled();
+    expect(claimMock).not.toHaveBeenCalled();
+  });
+
+  it('queues a backup to S3 storage for a device that has not reported its helper yet', async () => {
+    selectReturning({ ...deviceRow('online'), backupReadProtocolVersion: null, backupWriteProtocolVersion: null });
+    claimMock.mockResolvedValue({ status: 'claimed', id: 'cmd-1', executedAt: new Date() });
+    sendMock.mockReturnValue(true);
+    const res = await dispatchDeviceCommand({
+      deviceId: DEVICE,
+      type: 'mssql_backup',
+      payload: { jobId: 'job-1', provider: 's3', providerConfigRef: { configId: 'c', orgId: ORG } },
+    });
+    expect(res.ok).toBe(true);
+    expect(queueCommandMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('queues a backup to S3 storage to a helper that reports brokered writes', async () => {
+    selectReturning({ ...deviceRow('online'), backupReadProtocolVersion: 1, backupWriteProtocolVersion: 1 });
+    claimMock.mockResolvedValue({ status: 'claimed', id: 'cmd-1', executedAt: new Date() });
+    sendMock.mockReturnValue(true);
+    const res = await dispatchDeviceCommand({
+      deviceId: DEVICE,
+      type: 'mssql_backup',
+      payload: { jobId: 'job-1', provider: 's3', providerConfigRef: { configId: 'c', orgId: ORG } },
+    });
+    expect(res.ok).toBe(true);
+  });
+
+  it('queues a local-destination restore to any helper that checks attestations, whatever its storage protocol', async () => {
+    selectReturning({ ...deviceRow('online'), backupReadProtocolVersion: 0, backupIntegrityProtocolVersion: 2 });
+    claimMock.mockResolvedValue({ status: 'claimed', id: 'cmd-1', executedAt: new Date() });
+    sendMock.mockReturnValue(true);
+    const res = await dispatchDeviceCommand({
+      deviceId: DEVICE,
+      type: 'backup_restore',
+      payload: { snapshotId: 'snap-1', provider: 'local', providerConfigRef: { configId: 'c', orgId: ORG } },
+    });
+    expect(res.ok).toBe(true);
+  });
+
+  it.each([
+    ['backup_restore', 1, { snapshotId: 'snap-1', provider: 's3', providerConfigRef: { configId: 'c', orgId: ORG } }],
+    ['backup_restore', 0, { snapshotId: 'snap-1', provider: 'local', providerConfigRef: { configId: 'c', orgId: ORG } }],
+    ['vm_instant_boot', 1, { snapshotId: 'snap-1', vmName: 'vm1' }],
+    ['bare_metal_rebuild', 1, { recoveryId: 'r1' }],
+  ] as const)('refuses %s to a helper below integrity protocol 2 (reports %s), writing no row', async (type, protocol, payload) => {
+    selectReturning({ ...deviceRow('online'), backupReadProtocolVersion: 1, backupIntegrityProtocolVersion: protocol });
+    const res = await dispatchDeviceCommand({ deviceId: DEVICE, type, payload });
+    expect(res).toMatchObject({ ok: false, code: 'backup_helper_update_required', error: RESTORE_HELPER_UPDATE_REQUIRED_MESSAGE });
+    expect(queueCommandMock).not.toHaveBeenCalled();
+    expect(claimMock).not.toHaveBeenCalled();
+  });
+
+  it('queues a privileged restore for a device that has not reported its helper yet (delivery waits for the report)', async () => {
+    selectReturning({ ...deviceRow('online'), backupReadProtocolVersion: null, backupIntegrityProtocolVersion: null });
+    claimMock.mockResolvedValue({ status: 'claimed', id: 'cmd-1', executedAt: new Date() });
+    sendMock.mockReturnValue(true);
+    const res = await dispatchDeviceCommand({
+      deviceId: DEVICE,
+      type: 'backup_restore',
+      payload: { snapshotId: 'snap-1', provider: 's3', providerConfigRef: { configId: 'c', orgId: ORG } },
+    });
+    expect(res.ok).toBe(true);
+  });
+
+  it('never refuses read-only validation on integrity grounds', async () => {
+    selectReturning({ ...deviceRow('online'), backupReadProtocolVersion: 1, backupIntegrityProtocolVersion: 1 });
+    claimMock.mockResolvedValue({ status: 'claimed', id: 'cmd-1', executedAt: new Date() });
+    sendMock.mockReturnValue(true);
+    const res = await dispatchDeviceCommand({
+      deviceId: DEVICE,
+      type: 'backup_verify',
+      payload: { snapshotId: 'snap-1', provider: 's3', providerConfigRef: { configId: 'c', orgId: ORG } },
+    });
+    expect(res.ok).toBe(true);
+  });
+
   it('a non-trust error from the trust check propagates rather than being swallowed', async () => {
     selectReturning(deviceRow('online'));
     assertAllowedMock.mockRejectedValue(new Error('db down'));
@@ -307,7 +603,7 @@ describe('dispatchDeviceCommand (#5128 W1)', () => {
     // reboots — from the legacy 30-minute execution clock to 5 minutes. NULL
     // restores the legacy clock exactly.
     selectReturning(deviceRow('online'));
-    claimMock.mockResolvedValue(null);
+    claimMock.mockResolvedValue({ status: 'not_claimable', id: 'cmd-1' });
     const res = await dispatchDeviceCommand({ deviceId: DEVICE, type: 'list_processes' });
     expect(res.ok).toBe(true);
     if (!res.ok) return;
@@ -350,7 +646,7 @@ describe('dispatchDeviceCommand (#5128 W1)', () => {
   it('a power-state command IS pushed when nothing is in flight', async () => {
     // #5128 review round 2 (J): a blanket skip regressed the callers that have
     // always pushed a reboot immediately — maintenanceRebootWorker (Linux
-    // maintenance windows) and the fleet-findings dispatch map — delaying a
+    // maintenance windows, before #9181) and the fleet-findings dispatch map — delaying a
     // scheduled reboot by a whole heartbeat interval. The barrier's real
     // condition is "nothing else in flight", so apply that instead.
     for (const type of ['reboot', 'shutdown', 'reboot_safe_mode']) {
@@ -360,7 +656,7 @@ describe('dispatchDeviceCommand (#5128 W1)', () => {
       refreshMock.mockImplementation(async (_t: string, p: unknown) => p);
       decryptMock.mockImplementation((c: unknown) => c);
       queueCommandMock.mockResolvedValue({ id: 'cmd-1', type, status: 'pending' });
-      claimMock.mockResolvedValue({ id: 'cmd-1', executedAt: new Date() });
+      claimMock.mockResolvedValue({ status: 'claimed', id: 'cmd-1', executedAt: new Date() });
       sendMock.mockReturnValue(true);
       const res = await dispatchDeviceCommand({ deviceId: DEVICE, type });
       expect(res.ok && res.delivery).toBe('delivered');
@@ -371,7 +667,7 @@ describe('dispatchDeviceCommand (#5128 W1)', () => {
 
   it('a non-power-state command never pays for the in-flight probe', async () => {
     selectReturning(deviceRow('online'));
-    claimMock.mockResolvedValue({ id: 'cmd-1', executedAt: new Date() });
+    claimMock.mockResolvedValue({ status: 'claimed', id: 'cmd-1', executedAt: new Date() });
     sendMock.mockReturnValue(true);
     await dispatchDeviceCommand({ deviceId: DEVICE, type: 'refresh_inventory' });
     expect(inFlightMock).not.toHaveBeenCalled();
@@ -412,7 +708,7 @@ describe('dispatchDeviceCommand (#5128 W1)', () => {
 
   it('a non-power-state command to an online device is still pushed immediately', async () => {
     selectReturning(deviceRow('online'));
-    claimMock.mockResolvedValue({ id: 'cmd-1', executedAt: new Date() });
+    claimMock.mockResolvedValue({ status: 'claimed', id: 'cmd-1', executedAt: new Date() });
     sendMock.mockReturnValue(true);
     const res = await dispatchDeviceCommand({ deviceId: DEVICE, type: 'refresh_inventory' });
     expect(res.ok && res.delivery).toBe('delivered');
@@ -431,7 +727,7 @@ describe('dispatchDeviceCommand (#5128 W1)', () => {
     // recoverable, and worth reporting.
     selectReturning(deviceRow('online'));
     const executedAt = new Date();
-    claimMock.mockResolvedValue({ id: 'cmd-1', executedAt });
+    claimMock.mockResolvedValue({ status: 'claimed', id: 'cmd-1', executedAt });
     sendMock.mockReturnValue(false);
     releaseMock.mockRejectedValue(new Error('pool exhausted'));
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
@@ -445,5 +741,26 @@ describe('dispatchDeviceCommand (#5128 W1)', () => {
     } finally {
       errorSpy.mockRestore();
     }
+  });
+  it('refuses a parked device before trust or persistence', async () => {
+    parkedDeviceIds.add(DEVICE);
+    selectReturning(deviceRow('online'));
+
+    const result = await dispatchDeviceCommand({ deviceId: DEVICE, type: 'refresh_inventory' });
+
+    expect(result).toMatchObject({ ok: false, code: 'device_pending_assignment' });
+    expect(queueCommandMock).not.toHaveBeenCalled();
+    expect(assertAllowedMock).not.toHaveBeenCalled();
+    expect(sendMock).not.toHaveBeenCalled();
+  });
+
+  it('still queues lifecycle removal for a parked device', async () => {
+    parkedDeviceIds.add(DEVICE);
+    selectReturning(deviceRow('offline'));
+
+    const result = await dispatchDeviceCommand({ deviceId: DEVICE, type: 'self_uninstall' });
+
+    expect(result).toMatchObject({ ok: true });
+    expect(queueCommandMock).toHaveBeenCalledWith(DEVICE, 'self_uninstall', expect.anything(), undefined, expect.anything());
   });
 });

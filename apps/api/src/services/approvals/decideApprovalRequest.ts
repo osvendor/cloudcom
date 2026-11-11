@@ -1,9 +1,10 @@
 import { and, eq, exists, gt, inArray, ne, sql } from 'drizzle-orm';
 
 import { db, runOutsideDbContext, withSystemDbAccessContext } from '../../db';
-import { isInteractiveUserSession, type AuthContext } from '../../middleware/auth';
+import { hasSatisfiedMfa, isInteractiveUserSession, type AuthContext } from '../../middleware/auth';
 import { approvalRequests } from '../../db/schema/approvals';
 import { elevationRequests, elevationAudit } from '../../db/schema/elevations';
+import { normalizePamDenialReason } from '../pamDenialReason';
 import { aiToolExecutions, aiSessions } from '../../db/schema/ai';
 import {
   actionIntents,
@@ -34,6 +35,12 @@ import {
   isAgentIntentDecideAuthorized,
   isOrgWideGovernanceIntent,
 } from '../actionIntents/intentApprovers';
+import {
+  APPROVER_SCOPE_REQUIRED,
+  APPROVER_SCOPE_REQUIRED_MESSAGE,
+  mayHavePartnerWideEffect,
+} from '../actionIntents/partnerWideEffect';
+import { isSoleOperatorSelfApprovalForbidden } from '../actionIntents/selfApprovalPolicy';
 import { buildAuthContextForIntent } from '../actionIntents/actorContext';
 import {
   effectiveTargetDeviceId,
@@ -41,16 +48,37 @@ import {
 } from '../actionIntents/intentTargetScope';
 import { aiAgentRuns } from '../../db/schema/aiAgents';
 import { devices } from '../../db/schema/devices';
+import { organizations } from '../../db/schema/orgs';
+import { diagnosticAccessGrants } from '../../db/schema/diagnosticAccess';
+import {
+  auditDiagnosticDecision,
+  auditDiagnosticSelfApproval,
+  decideDiagnosticGrantInTx,
+  isEligibleApprover as isEligibleDiagnosticApprover,
+  resolveEligibleApprovers as resolveDiagnosticApprovers,
+  type GrantRow as DiagnosticGrantRow,
+} from '../diagnosticAccess/grants';
 import { checkToolPermission } from '../aiGuardrails';
 import { loadPartnerPolicy, isEnforcing } from '../authenticatorPolicy';
-import { getUserPermissions, hasPermission, userCanDecideApprovals, canAccessOrg } from '../permissions';
+import { getUserPermissions, hasPermission, userCanDecideApprovals, canAccessOrg, canAccessSite } from '../permissions';
 import { canMutateOrgWideGovernance } from '../siteCeilingAccess';
 import { createPamDecisionIntent } from '../pamActuationLifecycle';
+import { enqueuePamRequestNotify } from '../pamRequestNotify';
+import { resolvePamTechnicianName } from '../pamTechnicianName';
 import { publishIntentTerminalOutbox } from '../aiOperator/taskOutbox';
+import { loadFlowIntentPeople } from '../flows/intentRun';
 import { PERMISSION_GRANTS, requiredAssurance, type RiskTier, type ApprovalProof } from '@breeze/shared';
 import { scriptProposals } from '../../db/schema/scriptProposals';
 import { loadProposalRow } from '../scriptProposals/queries';
 import { resolveStrictAcknowledgement } from './strictAcknowledgement';
+import {
+  FRESH_APPROVER_FACTOR_MIN_LEVEL,
+  isFreshApproverFactor,
+  requiresFreshApproverFactor,
+} from '../actionIntents/freshApproverFactor';
+
+/** Thrown inside the decide transaction to roll it back when a diagnostic grant is no longer pending. */
+class DiagnosticGrantNotPendingError extends Error {}
 
 /**
  * The approvals DECIDE core (P2-2 #4189), lifted verbatim out of
@@ -282,6 +310,9 @@ export function serialize(
     expiresAt: r.expiresAt.toISOString(),
     decidedAt: r.decidedAt?.toISOString() ?? null,
     decisionReason: r.decisionReason ?? null,
+    // Set on a `denied` row whose approver approved but the server refused
+    // it (see approvalRequests.refusalReason).
+    refusalReason: r.refusalReason ?? null,
     executionId: r.executionId ?? null,
     intentId: r.intentId ?? null,
     approvalScope,
@@ -436,7 +467,7 @@ async function redeemGrantForDecide(input: {
   if (isApprove && decision.decidedAssuranceLevel < decision.requiredLevel) {
     // An ENFORCING partner whose floor now outranks what the grant proves:
     // refuse, so the operator runs a ceremony that can actually clear it.
-    if (isEnforcing(policy, new Date())) return null;
+    if (isEnforcing(policy, new Date(), input.riskTier)) return null;
     decision.graceDowngrade = true;
   }
   return decision;
@@ -550,20 +581,21 @@ export async function decideApprovalRequest(
   // no-op passthrough (db/index.ts), so `runOutsideDbContext` is required to
   // actually elevate.
   if (existing.elevationRequestId && !existing.intentId) {
-    const elevationOrgId = await runOutsideDbContext(() =>
+    const elevationTarget = await runOutsideDbContext(() =>
       withSystemDbAccessContext(async () => {
         const [row] = await db
-          .select({ orgId: elevationRequests.orgId })
+          .select({ orgId: elevationRequests.orgId, flowType: elevationRequests.flowType, deviceId: elevationRequests.deviceId })
           .from(elevationRequests)
           .where(eq(elevationRequests.id, existing.elevationRequestId as string));
-        return row?.orgId ?? null;
+        return row ?? null;
       }),
     );
-    if (!elevationOrgId) {
+    if (!elevationTarget) {
       // Should be unreachable (ON DELETE SET NULL leaves elevationRequestId
       // null rather than dangling), but fail closed rather than proceed blind.
       return { httpStatus: 404, body: { error: 'elevation_not_found' } };
     }
+    const elevationOrgId = elevationTarget.orgId;
 
     const deciderPerms = await runOutsideDbContext(() =>
       withSystemDbAccessContext(() =>
@@ -586,6 +618,91 @@ export async function decideApprovalRequest(
       !hasPermission(deciderPerms, 'pam', 'approve')
     ) {
       return { httpStatus: 403, body: { error: 'pam_approve_required' } };
+    }
+    if (status === 'approved' && elevationTarget.flowType === 'uac_intercept') {
+      if (!hasSatisfiedMfa(input.auth)) {
+        return { httpStatus: 403, body: { error: 'MFA required', code: 'MFA_REQUIRED' } };
+      }
+      if (!hasPermission(deciderPerms, 'devices', 'execute')) {
+        return { httpStatus: 403, body: { error: 'devices_execute_required' } };
+      }
+      const device = await runOutsideDbContext(() => withSystemDbAccessContext(async () => {
+        const [row] = await db.select({ orgId: devices.orgId, siteId: devices.siteId })
+          .from(devices).where(eq(devices.id, elevationTarget.deviceId));
+        return row;
+      }));
+      if (!device || device.orgId !== elevationOrgId) {
+        return { httpStatus: 404, body: { error: 'device_not_found' } };
+      }
+      if (!canAccessSite(deciderPerms, device.siteId ?? '')) {
+        return { httpStatus: 403, body: { error: 'site_access_denied' } };
+      }
+    }
+  }
+
+  // Diagnostic read grants (services/diagnosticAccess): the row was fanned out
+  // to every eligible approver at REQUEST time; eligibility is re-proved LIVE
+  // here for both approve and deny (same rule as the PAM branch above): active
+  // account with devices:execute + approvals:decide for the device's org, and
+  // access to the device's site. A Site-A administrator cannot decide a
+  // Site-B grant, even if the device moved after the request.
+  let diagnosticSelfApprove = false;
+  let diagnosticTarget: { orgId: string; deviceId: string } | null = null;
+  if (existing.diagnosticAccessGrantId && !existing.intentId) {
+    const target = await runOutsideDbContext(() =>
+      withSystemDbAccessContext(async () => {
+        const [row] = await db
+          .select({
+            orgId: diagnosticAccessGrants.orgId,
+            deviceId: diagnosticAccessGrants.deviceId,
+            status: diagnosticAccessGrants.status,
+            deviceOrgId: devices.orgId,
+            siteId: devices.siteId,
+            partnerId: organizations.partnerId,
+            requestedByUserId: diagnosticAccessGrants.requestedByUserId,
+          })
+          .from(diagnosticAccessGrants)
+          .innerJoin(devices, eq(devices.id, diagnosticAccessGrants.deviceId))
+          .innerJoin(organizations, eq(organizations.id, diagnosticAccessGrants.orgId))
+          .where(eq(diagnosticAccessGrants.id, existing.diagnosticAccessGrantId as string));
+        return row ?? null;
+      }),
+    );
+    if (!target) return { httpStatus: 404, body: { error: 'diagnostic_access_grant_not_found' } };
+    diagnosticTarget = { orgId: target.orgId, deviceId: target.deviceId };
+    if (target.deviceOrgId !== target.orgId) {
+      return { httpStatus: 409, body: { error: 'diagnostic_access_device_moved', finalStatus: 'expired' } };
+    }
+    if (target.status !== 'pending_approval') {
+      return { httpStatus: 409, body: { error: `Already ${target.status}`, finalStatus: 'expired' } };
+    }
+    const eligible = await isEligibleDiagnosticApprover(
+      userId,
+      { orgId: target.orgId, siteId: target.siteId },
+      target.partnerId ?? null,
+    );
+    if (!eligible) {
+      return { httpStatus: 403, body: { error: 'diagnostic_access_approver_required' } };
+    }
+    // Self-approval: allowed only for a genuine sole operator, re-derived
+    // live with the same filter the fan-out used. A deny is always allowed.
+    // The requester must be IN the live population and alone in it; an empty
+    // or disagreeing resolution refuses rather than admits.
+    if (status === 'approved' && target.requestedByUserId === userId) {
+      const eligibleNow = await resolveDiagnosticApprovers(
+        { orgId: target.orgId, siteId: target.siteId },
+        target.partnerId ?? null,
+      );
+      diagnosticSelfApprove = true;
+      if (!eligibleNow.includes(userId) || eligibleNow.some((id) => id !== userId)) {
+        return {
+          httpStatus: 403,
+          body: {
+            error: 'self_approval_forbidden',
+            message: 'This request needs an approver other than the person who requested it.',
+          },
+        };
+      }
     }
   }
 
@@ -678,7 +795,16 @@ export async function decideApprovalRequest(
     // a lost permission or a tampered row — fail closed either way. (The
     // requester-less cancel contract for `approvals:decide` holders is the
     // cancel endpoint, Task 8 — not this handler.)
-    if (linkedIntent.approvalScope === 'supervised' && linkedIntent.requestingAgentRunId != null) {
+    //
+    // Tool catalog W04 (#5219), Decision 6: a supervised FLOW intent
+    // (`requestingFlowRunId` set, requester NULL) is the same requester-less
+    // shape and takes the same pool branch — the requester rule would answer
+    // `not_requester` to everyone. The delegator is a legitimate member of a
+    // supervised pool (spec §6.5).
+    if (
+      linkedIntent.approvalScope === 'supervised'
+      && (linkedIntent.requestingAgentRunId != null || linkedIntent.requestingFlowRunId != null)
+    ) {
       if (!(await isAgentIntentDecideAuthorized(userId, linkedIntent))) {
         recordActionIntentEvent({
           orgId: linkedIntent.orgId,
@@ -850,6 +976,72 @@ export async function decideApprovalRequest(
           };
         }
 
+        // Approver scope on a partner-wide intent, the decide-time twin of the fan-out:
+        // a queued row is a durable capability, so an org-only admin holding one is
+        // refused here. Approve-only, like every check in this block. A registered
+        // action loads the reads; every other intent pays one Map lookup.
+        let requirePartnerAxis = false;
+        if (mayHavePartnerWideEffect(linkedIntent.actionName, linkedIntent.arguments)) {
+          const { intentRequiresPartnerAxisApprover, isPartnerAxisApprover } = await import('../actionIntents/partnerAxisApprover');
+          requirePartnerAxis = await intentRequiresPartnerAxisApprover(linkedIntent);
+          if (requirePartnerAxis && !(await isPartnerAxisApprover(userId, linkedIntent.orgId, input.auth))) {
+            recordActionIntentEvent({
+              orgId: linkedIntent.orgId,
+              intentId: linkedIntent.id,
+              actionName: linkedIntent.actionName,
+              argumentDigest: linkedIntent.argumentDigest,
+              source: linkedIntent.source,
+              outcome: 'approver_unauthorized',
+              actorId: userId,
+              details: { approvalId: existing.id, errorCode: APPROVER_SCOPE_REQUIRED },
+            });
+            return {
+              httpStatus: 403,
+              body: { error: APPROVER_SCOPE_REQUIRED, message: APPROVER_SCOPE_REQUIRED_MESSAGE },
+            };
+          }
+        }
+
+        // Tool catalog W04 (#5219), Decision 6 — four-eyes on a FLOW intent.
+        // The intent has no requester (requested_by_user_id is NULL), so the
+        // requester exclusion below excludes nobody. The humans who must never
+        // be the second pair of eyes are the publication's DELEGATOR (they
+        // enabled the automation) and a manual run's TRIGGERER (its real
+        // requester) — read from the run and its pinned publication here,
+        // never from the request. Fan-out already left them out; this is the
+        // decide-time twin (a fanned-out row is a durable capability).
+        // Approve-only, like every check in this block: a deny only cancels.
+        if (linkedIntent.requestingFlowRunId) {
+          const people = await loadFlowIntentPeople(linkedIntent.requestingFlowRunId);
+          const excluded = people
+            ? [people.delegatorUserId, people.triggeredByUserId].filter((id): id is string => !!id)
+            : null;
+          if (!excluded || excluded.includes(userId)) {
+            recordActionIntentEvent({
+              orgId: linkedIntent.orgId,
+              intentId: linkedIntent.id,
+              actionName: linkedIntent.actionName,
+              argumentDigest: linkedIntent.argumentDigest,
+              source: linkedIntent.source,
+              outcome: 'approver_unauthorized',
+              actorId: userId,
+              details: {
+                approvalId: existing.id,
+                errorCode: excluded ? 'flow_delegator_self_approval' : 'flow_run_unreadable',
+              },
+            });
+            return excluded
+              ? {
+                  httpStatus: 403,
+                  body: {
+                    error: 'self_approval_forbidden',
+                    message: 'This step needs an approver other than the person who enabled or started this flow.',
+                  },
+                }
+              : { httpStatus: 403, body: { error: 'forbidden' } };
+          }
+        }
+
         // Sole-operator RE-DERIVATION (#2685). Four-eyes for a Tier-3 intent is
         // otherwise decided exactly once, at fan-out
         // (services/actionIntents/intentService.ts), by branch mutual exclusion:
@@ -884,6 +1076,28 @@ export async function decideApprovalRequest(
         // WebAuthn challenge. Gated to `approved` only — a deny stays available
         // in every case, since denying only cancels the action.
         if (linkedIntent.requestedByUserId === userId) {
+          // A PAM elevation intent can never be
+          // self-approved, even by a genuine sole operator. The fan-out never
+          // creates the requester-owned row for these; this refuses anyway.
+          if (isSoleOperatorSelfApprovalForbidden(linkedIntent.actionName)) {
+            recordActionIntentEvent({
+              orgId: linkedIntent.orgId,
+              intentId: linkedIntent.id,
+              actionName: linkedIntent.actionName,
+              argumentDigest: linkedIntent.argumentDigest,
+              source: linkedIntent.source,
+              outcome: 'approver_unauthorized',
+              actorId: userId,
+              details: { approvalId: existing.id, errorCode: 'self_approval_forbidden' },
+            });
+            return {
+              httpStatus: 403,
+              body: {
+                error: 'self_approval_forbidden',
+                message: 'This action needs an approver other than the person who requested it.',
+              },
+            };
+          }
           // Review finding #3: the SAME filters the fan-out applied
           // (intentService.ts) — not just the org-wide-governance ceiling, but
           // ALSO the STRICT-proposal `alsoRequire: scripts:write` narrowing
@@ -913,6 +1127,7 @@ export async function decideApprovalRequest(
             resolveIntentApprovers(linkedIntent!.orgId, {
               requireOrgWideGovernance: orgWideGovernance,
               alsoRequire,
+              ...(requirePartnerAxis ? { requirePartnerAxis } : {}),
             }),
           );
           const othersEligible = eligibleNow.filter((candidate) => candidate !== userId);
@@ -1029,10 +1244,16 @@ export async function decideApprovalRequest(
   // single-use WebAuthn challenge / mobile nonce cannot be consumed again per
   // row. Nothing else about this handler changes; see `preverifiedAssurance`
   // on `DecideApprovalInput` for the full list of gates that still run.
-  const isPartnerEnforcingForSupervised =
-    !input.preverifiedAssurance && isSupervisedSelfDecide && status === 'approved'
-      ? isEnforcing(await loadPartnerPolicy(input.auth.partnerId ?? null), new Date())
-      : false;
+  const checksSupervisedPolicy =
+    !input.preverifiedAssurance && isSupervisedSelfDecide && status === 'approved';
+  // Kept (not just the boolean) so the plain-click shortcut below can apply
+  // the partner's raise-only floor when it records a grace downgrade.
+  const supervisedPartnerPolicy = checksSupervisedPolicy
+    ? await loadPartnerPolicy(input.auth.partnerId ?? null)
+    : null;
+  const isPartnerEnforcingForSupervised = checksSupervisedPolicy
+    ? isEnforcing(supervisedPartnerPolicy, new Date(), existing.riskTier as RiskTier)
+    : false;
   // #5601: a presented grant suppresses the shortcut for the same reason a
   // presented proof does — a credential the caller offered must be ADJUDICATED
   // (accepted, or refused with 403), never silently dropped on the floor while
@@ -1049,6 +1270,20 @@ export async function decideApprovalRequest(
     assurance = input.preverifiedAssurance;
   } else if (skipAssuranceLadder) {
     assurance = resolveApprovalAssurance(existing.riskTier as RiskTier);
+    if (status === 'approved') {
+      // The shortcut only runs when the partner is NOT enforcing, so an
+      // approve below the (partner-raised) floor is exactly the ladder's
+      // "under-assured but allowed" case. Flag it the same way so the
+      // downgrade is recorded explicitly rather than only being derivable
+      // from level < floor. The recorded level/factor are untouched.
+      assurance.requiredLevel = requiredAssurance(
+        existing.riskTier as RiskTier,
+        supervisedPartnerPolicy?.floorOverrides ?? null,
+      );
+      if (assurance.decidedAssuranceLevel < assurance.requiredLevel) {
+        assurance.graceDowngrade = true;
+      }
+    }
   } else if (presentedGrantId !== undefined && proof === undefined && status === 'approved') {
     // #5601 REDEEM PATH. Replaces the ceremony, never the authorization: every
     // other gate in this handler (human principal, row pending/expiry, live
@@ -1161,6 +1396,76 @@ export async function decideApprovalRequest(
     }
   }
 
+  // A sole operator approving their OWN diagnostic grant needs a fresh
+  // second factor: a hardware-backed assertion (>= L3) made for THIS
+  // decision, never a session tap or a reused step-up grant, whatever the
+  // partner policy or batch path. Deny is never gated.
+  if (
+    diagnosticSelfApprove
+    && !isFreshApproverFactor({
+      decidedVia: assurance.decidedVia,
+      decidedAssuranceLevel: assurance.decidedAssuranceLevel,
+      stepUpGrantReuse: assurance.stepUpGrantReuse === true,
+    })
+  ) {
+    return { httpStatus: 403, body: { error: 'step_up_required', requiredLevel: FRESH_APPROVER_FACTOR_MIN_LEVEL } };
+  }
+
+  // Topology M4-D3 (#6000): a tool listed in FRESH_APPROVER_FACTOR_TOOLS is
+  // approved only with a hardware-backed factor assertion (>= L3) made for
+  // THIS decision — not a supervised session tap, not a reused step-up grant.
+  // The release path re-reads exactly this recorded factor instead of trusting
+  // any session `mfa` claim (a durable release's rebuilt auth synthesizes one).
+  // Approve-only: a deny is never blocked. Checked BEFORE the CAS so an
+  // under-assured approve never flips the row; the client runs the ceremony on
+  // `step_up_required` and retries.
+  if (
+    linkedIntent
+    && status === 'approved'
+    && requiresFreshApproverFactor(linkedIntent.actionName)
+    && !isFreshApproverFactor({
+      decidedVia: assurance.decidedVia,
+      decidedAssuranceLevel: assurance.decidedAssuranceLevel,
+      stepUpGrantReuse: assurance.stepUpGrantReuse === true,
+    })
+  ) {
+    recordActionIntentEvent({
+      orgId: linkedIntent.orgId,
+      intentId: linkedIntent.id,
+      actionName: linkedIntent.actionName,
+      argumentDigest: linkedIntent.argumentDigest,
+      source: linkedIntent.source,
+      outcome: 'approver_unauthorized',
+      actorId: userId,
+      details: { approvalId: existing.id, errorCode: 'fresh_mfa_required' },
+    });
+    return {
+      httpStatus: 403,
+      body: { error: 'step_up_required', requiredLevel: FRESH_APPROVER_FACTOR_MIN_LEVEL, reason: 'fresh_mfa_required' },
+    };
+  }
+
+  // Every diagnostic self-approval leaves a durable audit record, written
+  // BEFORE the grant can become active: if it cannot be written the decision
+  // is refused (retryable) rather than activating an unrecorded self-approval.
+  if (diagnosticSelfApprove && diagnosticTarget) {
+    try {
+      await auditDiagnosticSelfApproval({
+        grantId: existing.diagnosticAccessGrantId as string,
+        orgId: diagnosticTarget.orgId,
+        deviceId: diagnosticTarget.deviceId,
+        deciderUserId: userId,
+        approvalRequestId: id,
+        decidedAssuranceLevel: assurance.decidedAssuranceLevel ?? null,
+        decidedVia: assurance.decidedVia ?? null,
+        authenticatorDeviceId: assurance.authenticatorDeviceId ?? null,
+      });
+    } catch (err) {
+      console.error('[approvals] diagnostic self-approval audit failed; refusing the decision:', err);
+      return { httpStatus: 503, body: { error: 'audit_unavailable', retryable: true } };
+    }
+  }
+
   // Task 6: the ENTIRE decision write — approval-row CAS, the ai_tool_executions
   // mirror, and the action-intents fan-in (intent CAS + release_by stamp +
   // sibling expiry + intent_approved outbox insert) — commits as ONE
@@ -1186,10 +1491,13 @@ export async function decideApprovalRequest(
         lostRace: false;
         updated: typeof approvalRequests.$inferSelect;
         wonIntent: boolean;
-        enforcementStatus: 'pending_dispatch' | 'cleanup_pending' | null;
+        enforcementStatus: 'pending_dispatch' | 'cleanup_pending' | 'refused' | null;
+        /** Set with enforcementStatus 'refused': why the approve did not take effect. */
+        refusalReason: string | null;
       };
 
   let writeResult: DecideWriteResult;
+  let decidedDiagnosticGrant: DiagnosticGrantRow | null = null;
   try {
     writeResult = await runOutsideDbContext(() =>
       withSystemDbAccessContext(() =>
@@ -1213,6 +1521,43 @@ export async function decideApprovalRequest(
               .from(actionIntents)
               .where(eq(actionIntents.id, existing.intentId))
               .for('update');
+          }
+
+          // #7526: the same rule for a PAM elevation — lock the elevation
+          // before any approval_requests row. This transaction used to take
+          // its own approval row first and the elevation second, then the
+          // sibling rows, so two approvers deciding the same elevation at
+          // once each held their own row while waiting for the elevation, and
+          // the winner then waited for the loser's row in the sibling expiry
+          // below: Postgres aborted one with 40P01 (a 500). Elevation first,
+          // then approval rows, is the order every path that touches both
+          // uses (the web console's respond route decides the elevation and
+          // expires the approval rows only after it commits). `no key update`
+          // is the strength the elevation UPDATE below takes anyway, so the
+          // fan-out's approval_requests inserts (an FK key-share lock on the
+          // elevation) are not held up by it.
+          if (existing.elevationRequestId) {
+            const [elevation] = await tx
+              .select({ status: elevationRequests.status })
+              .from(elevationRequests)
+              .where(eq(elevationRequests.id, existing.elevationRequestId))
+              .for('no key update');
+            if (elevation?.status !== 'pending') {
+              // The elevation was already decided or closed elsewhere (the
+              // web console, another approver, the stale-request expirer).
+              // This row can no longer decide anything: store it as expired,
+              // as the sibling expiry would have, never as this approver's
+              // approve or deny, and report the lost race.
+              await tx
+                .update(approvalRequests)
+                .set({ status: 'expired', decidedAt: new Date() })
+                .where(and(
+                  eq(approvalRequests.id, id),
+                  eq(approvalRequests.userId, userId),
+                  eq(approvalRequests.status, 'pending'),
+                ));
+              return { lostRace: true };
+            }
           }
 
           if (proposalIdForDecision && acknowledgedPatterns.length > 0) {
@@ -1258,9 +1603,10 @@ export async function decideApprovalRequest(
             // was written), and the caller gets a plain 409 below.
             return { lostRace: true };
           }
-          const updated = casRows[0]!;
+          let updated = casRows[0]!;
 
-          let enforcementStatus: 'pending_dispatch' | 'cleanup_pending' | null = null;
+          let enforcementStatus: 'pending_dispatch' | 'cleanup_pending' | 'refused' | null = null;
+          let refusalReason: string | null = null;
           if (updated.elevationRequestId) {
             const now = new Date();
             const expiresAt = status === 'approved'
@@ -1283,7 +1629,7 @@ export async function decideApprovalRequest(
                   : {
                       status: 'denied',
                       deniedByUserId: userId,
-                      denialReason: reason ?? null,
+                      denialReason: normalizePamDenialReason(reason),
                       updatedAt: now,
                       decidedAssuranceLevel: assurance.decidedAssuranceLevel,
                       decidedVia: assurance.decidedVia,
@@ -1302,49 +1648,113 @@ export async function decideApprovalRequest(
                 targetExecutablePath: elevationRequests.targetExecutablePath,
                 targetExecutableHash: elevationRequests.targetExecutableHash,
                 subjectUsername: elevationRequests.subjectUsername,
+                flowType: elevationRequests.flowType,
               });
 
-            if (elevationRows.length > 0) {
-              const elevation = elevationRows[0]!;
-              await tx.insert(elevationAudit).values({
+            const elevation = elevationRows[0];
+            if (!elevation) {
+              // Unreachable: this transaction locked the elevation above and
+              // saw it pending. Roll back rather than commit an approval row
+              // that says this approver decided an elevation they did not.
+              throw new Error(
+                `elevation ${updated.elevationRequestId} was pending under this transaction's lock but its decision matched no row`,
+              );
+            }
+            await tx.insert(elevationAudit).values({
+              orgId: elevation.orgId,
+              elevationRequestId: elevation.id,
+              eventType: status === 'approved' ? 'approved' : 'denied',
+              actor: 'technician',
+              actorUserId: userId,
+              details: {
+                source: 'mobile_approval',
+                approval_request_id: updated.id,
+                ...(status === 'denied' && reason ? { reason } : {}),
+                // Inline literal, not a helper spread: the elevation_audit
+                // writer inventory (pamAuditExport) reads these keys statically.
+                ...(assurance.graceDowngrade
+                  ? { assurance_downgraded_grace: true, required_assurance_level: assurance.requiredLevel }
+                  : {}),
+              },
+              occurredAt: now,
+            });
+            const actuation = await createPamDecisionIntent(tx, {
+              request: {
+                id: elevation.id,
                 orgId: elevation.orgId,
-                elevationRequestId: elevation.id,
-                eventType: status === 'approved' ? 'approved' : 'denied',
-                actor: 'technician',
-                actorUserId: userId,
-                details: {
-                  source: 'mobile_approval',
-                  approval_request_id: updated.id,
-                  ...(status === 'denied' && reason ? { reason } : {}),
-                },
-                occurredAt: now,
-              });
-              const actuation = await createPamDecisionIntent(tx, {
-                request: {
-                  id: elevation.id,
-                  orgId: elevation.orgId,
-                  deviceId: elevation.deviceId,
-                  targetExecutablePath: elevation.targetExecutablePath ?? '',
-                  targetExecutableHash: elevation.targetExecutableHash,
-                  subjectUsername: elevation.subjectUsername,
-                },
-                requestRevision: elevation.revision,
-                decision: status,
-                expiresAt,
-              });
-              enforcementStatus = actuation.desiredState === 'active'
+                deviceId: elevation.deviceId,
+                targetExecutablePath: elevation.targetExecutablePath ?? '',
+                targetExecutableHash: elevation.targetExecutableHash,
+                subjectUsername: elevation.subjectUsername,
+              },
+              requestRevision: elevation.revision,
+              decision: status,
+              expiresAt,
+            });
+            // #8928: tell the end user who handed this request to IT that it
+            // was denied. Savepointed and best-effort: it never rolls back the
+            // deny. The raw reason, not the stored placeholder.
+            if (status === 'denied' && elevation.flowType === 'uac_intercept') {
+              await enqueuePamRequestNotify(tx, { id: elevation.id, deviceId: elevation.deviceId }, 'denied', reason,
+                () => resolvePamTechnicianName(elevation.deviceId, { userId }));
+            }
+            enforcementStatus = actuation.refusalReason
+              ? 'refused'
+              : actuation.desiredState === 'active'
                 ? 'pending_dispatch'
                 : 'cleanup_pending';
+            refusalReason = actuation.refusalReason ?? null;
 
-              await tx
+            // The approve was refused and the elevation is now denied, so
+            // this row must not read as approved to anyone who reads it (the
+            // mobile app and the inbox's Recent panel read `status`). Same
+            // transaction, and the CAS above already holds this row's lock.
+            // decided_* keep recording the approver's approve;
+            // refusal_reason is what marks it as refused rather than denied
+            // by the approver.
+            if (refusalReason && status === 'approved') {
+              const [refused] = await tx
                 .update(approvalRequests)
-                .set({ status: 'expired', decidedAt: now })
-                .where(and(
-                  eq(approvalRequests.elevationRequestId, elevation.id),
-                  eq(approvalRequests.status, 'pending'),
-                  ne(approvalRequests.id, updated.id),
-                ));
+                .set({ status: 'denied', refusalReason })
+                .where(and(eq(approvalRequests.id, updated.id), eq(approvalRequests.status, 'approved')))
+                .returning();
+              if (!refused) {
+                // Unreachable: this transaction wrote 'approved' to the row
+                // and holds its lock. Roll back rather than commit an
+                // approval row that reads as approved.
+                throw new Error(`refused approve could not be stored on approval ${updated.id}`);
+              }
+              updated = refused;
             }
+
+            await tx
+              .update(approvalRequests)
+              .set({ status: 'expired', decidedAt: now })
+              .where(and(
+                eq(approvalRequests.elevationRequestId, elevation.id),
+                eq(approvalRequests.status, 'pending'),
+                ne(approvalRequests.id, updated.id),
+              ));
+          }
+
+          // Diagnostic read grant: activate (or deny) it in THIS transaction,
+          // first-wins against the other approvers and the request TTL. If the
+          // grant is no longer pending (revoked, lapsed, decided elsewhere) the
+          // whole decision rolls back rather than record an approval that
+          // activated nothing.
+          if (updated.diagnosticAccessGrantId) {
+            const decided = await decideDiagnosticGrantInTx(tx as unknown as typeof db, {
+              grantId: updated.diagnosticAccessGrantId,
+              approvalRequestId: updated.id,
+              deciderUserId: userId,
+              status,
+              reason: reason ?? null,
+              decidedAssuranceLevel: assurance.decidedAssuranceLevel ?? null,
+              decidedVia: assurance.decidedVia ?? null,
+              now: new Date(),
+            });
+            if (!decided) throw new DiagnosticGrantNotPendingError();
+            decidedDiagnosticGrant = decided;
           }
 
           // If this approval row was created by the AI agent SDK (Breeze AI /
@@ -1475,27 +1885,43 @@ export async function decideApprovalRequest(
                 // which is safe because task linkage is immutable.
                 await publishIntentTerminalOutbox(
                   tx,
-                  { id: intentId, orgId: linkedIntent.orgId, taskId: linkedIntent.taskId },
+                  {
+                    id: intentId,
+                    orgId: linkedIntent.orgId,
+                    taskId: linkedIntent.taskId,
+                    requestingFlowRunId: linkedIntent.requestingFlowRunId,
+                  },
                   'intent_rejected',
                 );
               }
             }
           }
 
-          return { lostRace: false, updated, wonIntent, enforcementStatus };
+          return { lostRace: false, updated, wonIntent, enforcementStatus, refusalReason };
         }),
       ),
     );
   } catch (err) {
+    if (err instanceof DiagnosticGrantNotPendingError) {
+      return { httpStatus: 409, body: { error: 'diagnostic_access_no_longer_pending', finalStatus: 'expired' } };
+    }
     console.error('[approvals] decide transaction failed (rolled back):', err);
     return { httpStatus: 500, body: { error: 'decide_failed', retryable: true } };
+  }
+
+  if (decidedDiagnosticGrant) {
+    try {
+      await auditDiagnosticDecision(decidedDiagnosticGrant, userId, id, { selfApproved: diagnosticSelfApprove });
+    } catch (auditErr) {
+      console.error('[approvals] diagnostic access decision audit failed:', auditErr);
+    }
   }
 
   if (writeResult.lostRace) {
     return { httpStatus: 409, body: { error: 'Already decided', finalStatus: 'expired' } };
   }
 
-  const { updated, wonIntent, enforcementStatus } = writeResult;
+  const { updated, wonIntent, enforcementStatus, refusalReason } = writeResult;
 
   // Action intents (spec §4 / §3.4): post-commit audit/metrics projection for
   // the intent fan-in that already committed (or rolled back) as part of the
@@ -1532,6 +1958,11 @@ export async function decideApprovalRequest(
         decidedAssuranceLevel: assurance.decidedAssuranceLevel,
         decidedVia: assurance.decidedVia,
         ...(supervisedSelfApproval ? { approvalMethod: 'supervised_self' as const } : {}),
+        // Approved below the required floor because the partner is not
+        // enforcing approver assurance (off, or inside its grace window).
+        ...(assurance.graceDowngrade
+          ? { assuranceDowngradedGrace: true, requiredAssuranceLevel: assurance.requiredLevel }
+          : {}),
         // #5601: a redeemed row keeps the honest level/factor above (they
         // describe a real ceremony), so THIS is the only thing that says a
         // second ceremony did not happen. Emitted only on reuse, so a fresh
@@ -1602,6 +2033,9 @@ export async function decideApprovalRequest(
         decidedTargetRef?.orgId ?? null,
       ),
       ...(enforcementStatus ? { enforcementStatus } : {}),
+      // The approve was refused (the linked elevation is now denied): the
+      // approver's client shows this instead of reporting an approval.
+      ...(refusalReason ? { reason: refusalReason } : {}),
       // #5601: present only when a genuine ceremony just minted one. The
       // client caches it and presents it on the next approve in this window
       // instead of prompting for another passkey scan.

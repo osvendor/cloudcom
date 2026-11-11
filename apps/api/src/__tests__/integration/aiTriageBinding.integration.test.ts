@@ -55,6 +55,11 @@ import {
 import { resolveAutomationTargetDeviceIds } from '../../services/automationRuntime';
 import { handleAgentRunTerminalForAutomation } from '../../services/automationTerminalEvidence';
 import { createOrganization, createPartner, createSite, createUser } from './db-utils';
+import { usePlatformAiKeyPlaceholder } from './helpers/platformAiKey';
+
+// W03 (#7601): agent admission resolves the agent's model first; the
+// platform default is only usable with a platform key configured.
+usePlatformAiKeyPlaceholder();
 
 type ExecuteRunJobData = Extract<AutomationQueueJobData, { type: 'execute-run' }>;
 
@@ -531,7 +536,7 @@ describe('managed AI-triage event binding against real Postgres', () => {
       message: 'There is no device to triage',
     });
 
-    expect(result).toEqual({ skipped: 'managed_automation_event_has_no_device' });
+    expect(result).toEqual({ skipped: 'alert_has_no_device' });
     expect(await allAutomationRuns()).toEqual([]);
     expect(await allAgentRuns()).toEqual([]);
   });

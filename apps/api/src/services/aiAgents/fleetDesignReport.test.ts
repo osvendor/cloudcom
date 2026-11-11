@@ -238,7 +238,8 @@ function outcome(overrides: Partial<FleetDesignOutcome> = {}): FleetDesignOutcom
           rationale: 'SMB is the function.', itemRef: 'monitoring:file_server:watch:0',
         }],
         alertRules: [{
-          name: 'Disk over 85%', severity: 'high', conditions: [], cooldownMinutes: 60,
+          name: 'Disk over 85%', severity: 'high', cooldownMinutes: 60,
+          kind: 'disk', condition: { operator: 'gt', value: 85, durationMinutes: 15 }, responses: [], deliveryMode: 'inherit', deliveryChannelIds: [],
           rationale: 'Data growth is the failure mode.', action: 'none', paging: 'business_hours',
           itemRef: 'monitoring:file_server:rule:0',
         }],
@@ -379,6 +380,9 @@ describe('persistFleetDesignReport', () => {
     const values = state.insertValues[1]!;
     expect(values).toMatchObject({
       reportId: REPORT_ID,
+      // #4247: the artifact run carries its parent definition's owner.
+      orgId: ORG_ID,
+      partnerId: null,
       status: 'completed',
       rowCount: 0,
       executionScopePrincipalKind: 'system',

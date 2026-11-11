@@ -1,10 +1,11 @@
 import {
-  pgTable, uuid, varchar, integer, boolean, timestamp, numeric, jsonb, char,
-  uniqueIndex, index
+  pgTable, uuid, varchar, integer, boolean, timestamp, jsonb,
+  uniqueIndex, index, foreignKey
 } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
 import { partners, organizations } from './orgs';
 import { ticketStatusEnum, ticketPriorityEnum } from './portal';
+import { businessCalendars } from './businessCalendars';
 
 export const ticketStatuses = pgTable('ticket_statuses', {
   id: uuid('id').primaryKey().defaultRandom(),
@@ -40,10 +41,21 @@ export const orgTicketSettings = pgTable('org_ticket_settings', {
   orgId: uuid('org_id').notNull().unique().references(() => organizations.id, { onDelete: 'cascade' }),
   // { "<priority>": { "responseMinutes": n|null, "resolutionMinutes": n|null } } — shape owned by the shared Zod validator
   slaOverrides: jsonb('sla_overrides').notNull().default(sql`'{}'::jsonb`),
-  defaultHourlyRate: numeric('default_hourly_rate', { precision: 10, scale: 2 }),
-  // W04: legacy snapshot retained for export only; the inert default allows SLA-only inserts.
-  rateCurrency: char('rate_currency', { length: 3 }).notNull().default('USD'),
-  defaultBillable: boolean('default_billable'),
+  // SLA-only since #4628 W04b: the three labour-pricing columns were dropped by
+  // 2026-10-29-100300-drop-legacy-labour-pricing-columns.sql (billing profiles
+  // price labour now; skipped legacy values live in legacy_labour_pricing_archive).
+  // #8973 W4 (2027-01-03-160000): the org's business-calendar override; NULL =
+  // inherit the partner default (resolveBusinessCalendar). An org-owned calendar
+  // of this org or a partner-wide one of its partner — enforced by the
+  // org_ticket_settings_business_calendar_guard_trg trigger and the service.
+  businessCalendarId: uuid('business_calendar_id'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull()
-});
+}, (t) => [
+  index('org_ticket_settings_business_calendar_idx').on(t.businessCalendarId).where(sql`business_calendar_id IS NOT NULL`),
+  foreignKey({
+    name: 'org_ticket_settings_business_calendar_id_fk',
+    columns: [t.businessCalendarId],
+    foreignColumns: [businessCalendars.id],
+  }).onDelete('set null'),
+]);

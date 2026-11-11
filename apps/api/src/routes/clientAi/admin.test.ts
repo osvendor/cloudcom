@@ -1,18 +1,24 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Hono } from 'hono';
+import { PgDialect } from 'drizzle-orm/pg-core';
 
 const {
   dbSelectMock,
   dbInsertMock,
   dbDeleteMock,
+  dbExecuteMock,
   writeRouteAuditMock,
   getOrgPolicyMock,
+  txEvents,
 } = vi.hoisted(() => ({
   dbSelectMock: vi.fn(),
   dbInsertMock: vi.fn(),
   dbDeleteMock: vi.fn(),
+  dbExecuteMock: vi.fn(),
   writeRouteAuditMock: vi.fn(),
   getOrgPolicyMock: vi.fn(),
+  /** Savepoint boundaries, recorded beside the statements a test cares about. */
+  txEvents: [] as string[],
 }));
 
 // Accessible org for the partner-scoped test auth context. Literal because
@@ -42,8 +48,17 @@ vi.mock('../../config/env', () => ({
 vi.mock('../../db', () => ({
   getCurrentDbAccessContext: vi.fn(() => undefined),
   runOutsideDbContext: vi.fn((fn: () => unknown) => fn()),
+  withDbTransaction: async (fn: () => Promise<unknown>) => {
+    txEvents.push('tx:open');
+    try {
+      return await fn();
+    } finally {
+      txEvents.push('tx:close');
+    }
+  },
+  assertInTransaction: vi.fn(),
   withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
-  db: { select: dbSelectMock, insert: dbInsertMock, delete: dbDeleteMock },
+  db: { select: dbSelectMock, insert: dbInsertMock, delete: dbDeleteMock, execute: dbExecuteMock },
 }));
 
 vi.mock('../../services/auditEvents', () => ({ writeRouteAudit: writeRouteAuditMock }));
@@ -82,6 +97,8 @@ const AUTHED = { Authorization: 'Bearer token', 'Content-Type': 'application/jso
 
 beforeEach(() => {
   vi.clearAllMocks();
+  txEvents.length = 0;
+  dbExecuteMock.mockImplementation(async () => []);
   dbSelectMock.mockImplementation(() => selectChain([MAPPING_ROW]));
   dbInsertMock.mockImplementation(() => ({
     values: vi.fn(() => ({
@@ -165,6 +182,36 @@ describe('client-ai admin — tenant mapping', () => {
     );
   });
 
+  // Org merge race (portal registration W4, plan D8 / OD7): the PUT can create
+  // the org's mapping, which no FOR UPDATE can lock in advance, so it takes the
+  // per-org portal Entra lock a merge holds, in the upsert's own savepoint.
+  it('PUT takes the per-org portal Entra lock inside the upsert savepoint, before the upsert', async () => {
+    dbExecuteMock.mockImplementation(async () => {
+      txEvents.push('lock');
+      return [];
+    });
+    dbInsertMock.mockImplementation(() => {
+      txEvents.push('upsert');
+      return {
+        values: vi.fn(() => ({
+          onConflictDoUpdate: vi.fn(() => ({ returning: vi.fn(() => Promise.resolve([MAPPING_ROW])) })),
+        })),
+      };
+    });
+
+    const res = await buildApp().request(`/client-ai/admin/orgs/${ORG_ID}/tenant-mapping`, {
+      method: 'PUT',
+      headers: AUTHED,
+      body: JSON.stringify({ entraTenantId: TID }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(txEvents).toEqual(['tx:open', 'lock', 'upsert', 'tx:close']);
+    const lock = new PgDialect().sqlToQuery(dbExecuteMock.mock.calls[0]![0] as never);
+    expect(lock.sql).toBe(`SELECT pg_advisory_xact_lock(hashtext('portal-entra-org:' || $1::uuid::text))`);
+    expect(lock.params).toEqual([ORG_ID]);
+  });
+
   it('PUT maps a DrizzleQueryError-wrapped tenant-uniqueness violation to 409 tenant_already_mapped', async () => {
     // DrizzleQueryError shape: generic outer error, real PostgresError (with
     // code + constraint_name) on .cause — mirrors what postgres.js + Drizzle
@@ -240,7 +287,6 @@ describe('client-ai admin — policy', () => {
       userAccess: 'all',
       selectedUserIds: [],
       allowedProviders: ['anthropic'],
-      allowedModels: [],
       writeMode: 'readwrite',
       dlpConfig: {},
       dailyBudgetCents: null,
@@ -285,6 +331,22 @@ describe('client-ai admin — policy', () => {
         }),
       })
     );
+  });
+
+  it('PUT /client-ai/admin/orgs/:orgId/policy with allowedModels → 400 naming office_chat; nothing is written', async () => {
+    for (const allowedModels of [['x'], [], null]) {
+      const res = await buildApp().request(`/client-ai/admin/orgs/${ORG_ID}/policy`, {
+        method: 'PUT',
+        headers: AUTHED,
+        body: JSON.stringify({ enabled: true, allowedModels }),
+      });
+      expect(res.status).toBe(400);
+      const text = JSON.stringify(await res.json());
+      expect(text).toContain('allowedModels');
+      expect(text).toContain('office_chat');
+    }
+    expect(dbInsertMock).not.toHaveBeenCalled();
+    expect(writeRouteAuditMock).not.toHaveBeenCalled();
   });
 
   it('PUT persists writeApproval and audits it as a changed key', async () => {

@@ -178,8 +178,8 @@ export const scriptTags = pgTable('script_tags', {
 }));
 
 export const scriptToTags = pgTable('script_to_tags', {
-  scriptId: uuid('script_id').notNull().references(() => scripts.id),
-  tagId: uuid('tag_id').notNull().references(() => scriptTags.id)
+  scriptId: uuid('script_id').notNull().references(() => scripts.id, { onDelete: 'cascade' }),
+  tagId: uuid('tag_id').notNull().references(() => scriptTags.id, { onDelete: 'cascade' })
 }, (table) => ({
   pk: primaryKey({ columns: [table.scriptId, table.tagId] }),
   tagIdIdx: index('script_to_tags_tag_id_idx').on(table.tagId)
@@ -323,6 +323,8 @@ export const scriptExecutions = pgTable('script_executions', {
   aiAgentRunId: uuid('ai_agent_run_id'),
   createdAt: timestamp('created_at').defaultNow().notNull()
 }, (table) => ({
+  monitorDeviceStatusIdx: index('cloudcom_script_executions_monitor_device_status_idx')
+    .on(table.monitorId, table.deviceId, table.status, table.createdAt.desc()),
   proposalIdx: index('script_executions_proposal_idx')
     .on(table.proposalId)
     .where(sql`proposal_id IS NOT NULL`),

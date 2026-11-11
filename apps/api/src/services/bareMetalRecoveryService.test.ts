@@ -38,6 +38,11 @@ vi.mock('../db', () => {
     withDbAccessContext: vi.fn((_context: unknown, fn: () => any) => fn()),
   };
 });
+const refreshReadinessMock = vi.hoisted(() => vi.fn());
+vi.mock('./bareMetalReadinessRefresh', () => ({
+  refreshReadinessAfterRecovery: refreshReadinessMock,
+}));
+
 vi.mock('./auditService', () => ({
   createAuditLogAsync: (entry: Record<string, unknown>) => createAuditLogAsyncMock(entry),
 }));
@@ -278,6 +283,52 @@ describe('createBareMetalRecovery', () => {
     });
     expect(JSON.stringify(entry)).not.toContain(normalizeRecoveryCode(out.code));
   });
+
+  // R36: platform is copied from the selected snapshot's layoutManifest.platform
+  describe('createBareMetalRecovery — platform', () => {
+    it('sets platform from a Windows layout manifest', async () => {
+      selectMock
+        .mockReturnValueOnce(chainMock([{ ...restorableSnapshot, layoutManifest: { schemaVersion: 1, platform: 'windows', bootMode: 'uefi', disks: [] } }]))
+        .mockReturnValueOnce(chainMock([])); // in-flight check
+      insertMock.mockReturnValueOnce(chainMock([recoveryRow({ platform: 'windows' })]));
+
+      const out = await createBareMetalRecovery({
+        orgId: ORG_ID, snapshotId: SNAPSHOT_ID, identity: 'original', createdBy: USER_ID, source: 'vm_restore',
+      });
+
+      expect(out.row.platform).toBe('windows');
+      const inserted = insertMock.mock.results[0]!.value.values.mock.calls[0][0];
+      expect(inserted.platform).toBe('windows');
+    });
+
+    it('sets platform to null when the layout manifest has no platform field', async () => {
+      selectMock
+        .mockReturnValueOnce(chainMock([{ ...restorableSnapshot, layoutManifest: { schemaVersion: 1, disks: [] } }]))
+        .mockReturnValueOnce(chainMock([]));
+      insertMock.mockReturnValueOnce(chainMock([recoveryRow({ platform: null })]));
+
+      const out = await createBareMetalRecovery({
+        orgId: ORG_ID, snapshotId: SNAPSHOT_ID, identity: 'original', createdBy: USER_ID, source: 'vm_restore',
+      });
+
+      expect(out.row.platform).toBeNull();
+      const inserted = insertMock.mock.results[0]!.value.values.mock.calls[0][0];
+      expect(inserted.platform).toBeNull();
+    });
+
+    it('sets platform to null when the snapshot has no layout manifest at all', async () => {
+      selectMock
+        .mockReturnValueOnce(chainMock([{ ...restorableSnapshot, layoutManifest: null }]))
+        .mockReturnValueOnce(chainMock([]));
+      insertMock.mockReturnValueOnce(chainMock([recoveryRow({ platform: null })]));
+
+      const out = await createBareMetalRecovery({
+        orgId: ORG_ID, snapshotId: SNAPSHOT_ID, identity: 'original', createdBy: USER_ID, source: 'vm_restore',
+      });
+
+      expect(out.row.platform).toBeNull();
+    });
+  });
 });
 
 describe('mintRecoveryTokenForRecovery', () => {
@@ -373,6 +424,21 @@ describe('applyRebuildCommandResult', () => {
     expect(set).toMatchObject({ status: 'completed' });
     expect(set.validatedAt).toBeInstanceOf(Date);
     expect(set.completedAt).toBeInstanceOf(Date);
+    expect(refreshReadinessMock).toHaveBeenCalledTimes(1);
+    expect(refreshReadinessMock).toHaveBeenCalledWith(ORG_ID, expect.any(String));
+  });
+
+  it('does not refresh readiness for a refusal or when the guarded update lost the race (W08)', async () => {
+    refreshReadinessMock.mockClear();
+    selectMock.mockReturnValueOnce(chainMock([recoveryRow({ identity: 'new', status: 'media_booted' })]));
+    updateMock.mockReturnValueOnce(chainMock([recoveryRow({ status: 'refused' })]));
+    await applyRebuildCommandResult({ recoveryId: RECOVERY_ID, orgId: ORG_ID, result: { status: 'failed', result: { status: 'refused', refusal: 'no' } } });
+
+    selectMock.mockReturnValueOnce(chainMock([recoveryRow({ status: 'restoring' })]));
+    updateMock.mockReturnValueOnce(chainMock([]));
+    await applyRebuildCommandResult({ recoveryId: RECOVERY_ID, orgId: ORG_ID, result: { status: 'failed', error: 'x' } });
+
+    expect(refreshReadinessMock).not.toHaveBeenCalled();
   });
 
   it('records a refusal as refused with the refusal text as failureReason', async () => {

@@ -121,6 +121,9 @@ vi.mock('../services/reportGenerationService', async (importOriginal) => {
 });
 
 vi.mock('drizzle-orm', () => ({
+  // Multi-org series W01 — GET /reports spreads the table's columns into its
+  // projection; the mocked table object IS its column map here.
+  getTableColumns: (table: Record<string, unknown>) => ({ ...table }),
   and: (...conditions: any[]) => ({ op: 'and', conditions }),
   or: (...conditions: any[]) => ({ op: 'or', conditions }),
   eq: (column: unknown, value: unknown) => ({ op: 'eq', column, value }),
@@ -132,10 +135,13 @@ vi.mock('drizzle-orm', () => ({
   desc: (column: unknown) => ({ op: 'desc', column }),
   // #4622 W03 — the device_inventory manual branch excludes retired assets.
   isNull: (column: unknown) => ({ op: 'isNull', column }),
+  isNotNull: (column: unknown) => ({ op: 'isNotNull', column }),
   sql: (strings: TemplateStringsArray, ...values: unknown[]) => ({ op: 'sql', strings, values })
 }));
 
 vi.mock('../db', () => ({
+  withDbTransaction: (fn: () => Promise<unknown>) => fn(),
+  withDbTransactionIfHeld: (fn: () => Promise<unknown>) => fn(),
   db: {
     select: vi.fn(() => ({
       from: vi.fn(() => ({
@@ -180,8 +186,12 @@ vi.mock('../db/schema', () => ({
     executionScopeFingerprint: 'reports.executionScopeFingerprint',
     executionScopeCapturedAt: 'reports.executionScopeCapturedAt',
     executionScopePrincipalKind: 'reports.executionScopePrincipalKind',
-    portalSelfService: 'reports.portalSelfService'
+    portalSelfService: 'reports.portalSelfService',
+    seriesId: 'reports.seriesId',
+    archivedAt: 'reports.archivedAt'
   },
+  // Multi-org report series W02 — the list joins it for seriesName.
+  reportSeries: { id: 'reportSeries.id', name: 'reportSeries.name' },
   portalBranding: {
     orgId: 'portalBranding.orgId',
     enableReports: 'portalBranding.enableReports'
@@ -203,7 +213,9 @@ vi.mock('../db/schema', () => ({
     executionScopeUserId: 'reportRuns.executionScopeUserId',
     executionScopeFingerprint: 'reportRuns.executionScopeFingerprint',
     executionScopeCapturedAt: 'reportRuns.executionScopeCapturedAt',
-    executionScopePrincipalKind: 'reportRuns.executionScopePrincipalKind'
+    executionScopePrincipalKind: 'reportRuns.executionScopePrincipalKind',
+    deliveryStatus: 'reportRuns.deliveryStatus',
+    recipientCount: 'reportRuns.recipientCount'
   },
   devices: {
     id: 'devices.id',
@@ -259,6 +271,7 @@ vi.mock('../db/schema', () => ({
   alerts: {
     orgId: 'alerts.orgId',
     deviceId: 'alerts.deviceId',
+    topologySiteId: 'alerts.topologySiteId',
     ruleId: 'alerts.ruleId',
     title: 'alerts.title',
     severity: 'alerts.severity',
@@ -271,7 +284,7 @@ vi.mock('../db/schema', () => ({
     id: 'alertRules.id',
     name: 'alertRules.name'
   },
-  organizations: {},
+  organizations: { id: 'organizations.id', name: 'organizations.name' },
   sites: {
     id: 'sites.id',
     name: 'sites.name'
@@ -286,6 +299,7 @@ vi.mock('../middleware/auth', () => ({
   }),
   requireScope: vi.fn(() => async (_c: any, next: any) => next()),
   requireMfa: vi.fn(() => async (_c: any, next: any) => next()),
+  hasSatisfiedMfa: vi.fn(() => true),
   requirePermission: vi.fn((resource: string, action: string) => async (c: any, next: any) => {
     permissionState.last = { resource, action };
     if (permissionState.deny) {
@@ -478,6 +492,8 @@ function mockMetricsQueries(
 type SummaryAlert = {
   orgId: string;
   siteId: string | null;
+  /** A site-owned topology policy alert's OWNING site (M3-D6). */
+  topologySiteId?: string | null;
   severity: string;
   status: string;
   day: string;
@@ -505,6 +521,9 @@ function alertMatches(alert: SummaryAlert, condition: any): boolean {
     if (condition.column === 'devices.siteId') {
       return alert.siteId === condition.value;
     }
+    if (isOwningSite(condition.column)) {
+      return owningSite(alert) === condition.value;
+    }
     return true;
   }
   if (condition.op === 'inArray') {
@@ -514,18 +533,31 @@ function alertMatches(alert: SummaryAlert, condition: any): boolean {
     if (condition.column === 'devices.siteId') {
       return alert.siteId !== null && (condition.values as string[]).includes(alert.siteId);
     }
+    if (isOwningSite(condition.column)) {
+      const site = owningSite(alert);
+      return site !== null && (condition.values as string[]).includes(site);
+    }
     return true;
   }
   return true;
 }
 
-/** The device-scope branch the alerts-summary handler conjoins into every aggregate. */
+/** The mocked `coalesce(alerts.topology_site_id, devices.site_id)` owning-site expression. */
+function isOwningSite(column: any): boolean {
+  return column?.op === 'sql' && column.values?.[0] === 'alerts.topologySiteId' && column.values?.[1] === 'devices.siteId';
+}
+function owningSite(alert: SummaryAlert): string | null {
+  return alert.topologySiteId ?? alert.siteId;
+}
+const OWNING_SITE = expect.objectContaining({ op: 'sql', values: ['alerts.topologySiteId', 'devices.siteId'] });
+
+/** The site-scope branch the alerts-summary handler conjoins into every aggregate. */
 function findDeviceScopeNode(condition: any): any {
   const children = condition?.op === 'and' ? condition.conditions : [condition];
   return children.find(
     (child: any) =>
       child?.op === 'or' ||
-      ((child?.op === 'inArray' || child?.op === 'eq') && child.column === 'devices.siteId')
+      ((child?.op === 'inArray' || child?.op === 'eq') && (child.column === 'devices.siteId' || isOwningSite(child.column)))
   );
 }
 
@@ -572,6 +604,7 @@ function mockAlertsSummaryQueries(rows: SummaryAlert[]) {
           joins[index]!.push(condition);
           return node;
         };
+        node.leftJoin = node.innerJoin;
         node.where = (condition: any) => {
           captured.push(condition);
           const promise: any = Promise.resolve(
@@ -760,9 +793,48 @@ describe('POST /reports/:id/generate persists a snapshot', () => {
         requestedByKind: 'user',
         requestedByUserId: 'user-123',
         requestedByPortalUserId: null,
+        // #4247: the run carries its parent definition's owner axis.
+        orgId: ORG_ID,
+        partnerId: null,
       }),
     );
   });
+
+  it.each([
+    ['weekly', 'not_scheduled'],
+    ['one_time', null],
+  ] as const)(
+    'stamps a manual run of a %s definition with deliveryStatus %s (multi-org series W01)',
+    async (schedule, expected) => {
+      const app = new Hono();
+      app.route('/reports', reportRoutes);
+      vi.mocked(db.update).mockReturnValue({
+        set: () => ({ where: () => Promise.resolve() })
+      } as any);
+      vi.mocked(db.select).mockImplementation(() =>
+        selectChain([{
+          id: 'rep-1',
+          orgId: ORG_ID,
+          type: 'device_inventory',
+          name: 'Inv',
+          config: {},
+          format: 'csv',
+          schedule
+        }])
+      );
+      const insertValuesMock = vi.fn(() => ({
+        returning: () => Promise.resolve([{ id: 'run-1', status: 'pending' }]),
+      }));
+      vi.mocked(db.insert).mockReturnValue({ values: insertValuesMock } as any);
+
+      const res = await app.request('/reports/rep-1/generate', { method: 'POST' });
+
+      expect(res.status).toBe(200);
+      expect(insertValuesMock).toHaveBeenCalledWith(
+        expect.objectContaining({ deliveryStatus: expected }),
+      );
+    },
+  );
 });
 
 describe('generateReport dispatch — security_compliance_posture', () => {
@@ -846,6 +918,21 @@ describe('report definition scope enforcement', () => {
     total: number,
     capturedConditions: unknown[]
   ) {
+    const pageWhere = () => vi.fn((condition) => {
+      capturedConditions.push(condition);
+      return {
+        orderBy: vi.fn().mockReturnValue({
+          limit: vi.fn().mockReturnValue({
+            offset: vi.fn().mockResolvedValue(rows)
+          })
+        })
+      };
+    });
+    // GET /reports joins organizations (W01); GET /reports/templates does not.
+    // W02 adds a second (report_series) join, so the join chains.
+    const pageChain: { leftJoin?: unknown; where: unknown } = { where: pageWhere() };
+    const leftJoin = vi.fn(() => pageChain);
+    pageChain.leftJoin = leftJoin;
     vi.mocked(db.select)
       .mockReturnValueOnce({
         from: vi.fn().mockReturnValue({
@@ -856,19 +943,9 @@ describe('report definition scope enforcement', () => {
         })
       } as any)
       .mockReturnValueOnce({
-        from: vi.fn().mockReturnValue({
-          where: vi.fn((condition) => {
-            capturedConditions.push(condition);
-            return {
-              orderBy: vi.fn().mockReturnValue({
-                limit: vi.fn().mockReturnValue({
-                  offset: vi.fn().mockResolvedValue(rows)
-                })
-              })
-            };
-          })
-        })
+        from: vi.fn().mockReturnValue({ leftJoin, where: pageWhere() })
       } as any);
+    return { leftJoin };
   }
 
   function mockPredicateFilteredDefinitionPage(
@@ -883,6 +960,22 @@ describe('report definition scope enforcement', () => {
         ? sourceRows.filter((row) => visibleIdSet.has(row.id))
         : sourceRows;
 
+    const pageWhere: ReturnType<typeof vi.fn> = vi.fn((condition: unknown) => {
+      capturedConditions.push(condition);
+      return {
+        orderBy: vi.fn().mockReturnValue({
+          limit: vi.fn((limit: number) => ({
+            offset: vi.fn((offset: number) =>
+              Promise.resolve(rowsFor(condition).slice(offset, offset + limit))
+            )
+          }))
+        })
+      };
+    });
+
+    const joined: { leftJoin?: unknown; where: unknown } = { where: pageWhere };
+    joined.leftJoin = vi.fn(() => joined);
+
     vi.mocked(db.select)
       .mockReturnValueOnce({
         from: vi.fn().mockReturnValue({
@@ -894,18 +987,9 @@ describe('report definition scope enforcement', () => {
       } as any)
       .mockReturnValueOnce({
         from: vi.fn().mockReturnValue({
-          where: vi.fn((condition) => {
-            capturedConditions.push(condition);
-            return {
-              orderBy: vi.fn().mockReturnValue({
-                limit: vi.fn((limit: number) => ({
-                  offset: vi.fn((offset: number) =>
-                    Promise.resolve(rowsFor(condition).slice(offset, offset + limit))
-                  )
-                }))
-              })
-            };
-          })
+          // GET /reports joins organizations (W01); GET /reports/templates does not.
+          leftJoin: vi.fn(() => joined),
+          where: pageWhere
         })
       } as any);
   }
@@ -1016,7 +1100,7 @@ describe('report definition scope enforcement', () => {
       expect(resolveRequestReportAuthority).toHaveBeenCalledWith(
         authState.auth,
         ORG_ID,
-        'read'
+        'read_history'
       );
       expect(reportDefinitionScopeSqlPredicate).toHaveBeenCalledTimes(1);
       expect(captured).toHaveLength(2);
@@ -1106,13 +1190,48 @@ describe('report definition scope enforcement', () => {
     expect(resolveRequestReportAuthorityMap).toHaveBeenCalledWith(
       authState.auth,
       [ORG_ID, orgB],
-      'read'
+      'read_history'
     );
     expect(reportDefinitionMultiOrgScopeSqlPredicate).toHaveBeenCalledTimes(1);
     expect(captured.every((condition) =>
       conditionContainsIdentity(condition, siteScopeState.compositePredicate)
     )).toBe(true);
     expect(reportDefinitionScopeSqlPredicate).not.toHaveBeenCalled();
+  });
+
+  it('joins the owning org name and the latest scheduled delivery onto every listed definition (multi-org series W01)', async () => {
+    const captured: unknown[] = [];
+    const { leftJoin } = mockDefinitionPage(
+      [{ id: REPORT_ID, orgId: ORG_ID, orgName: 'Acme Dental', lastDeliveryStatus: 'no_recipients' }],
+      1,
+      captured
+    );
+
+    const response = await app().request('/reports');
+
+    expect(response.status).toBe(200);
+    expect((await response.json()).data[0]).toMatchObject({
+      orgName: 'Acme Dental',
+      lastDeliveryStatus: 'no_recipients'
+    });
+    const projection = vi.mocked(db.select).mock.calls[1]![0] as unknown as Record<string, unknown>;
+    // Every reports column is still returned (getTableColumns), plus the two new fields.
+    expect(projection).toMatchObject({
+      id: 'reports.id',
+      orgId: 'reports.orgId',
+      name: 'reports.name',
+      orgName: 'organizations.name'
+    });
+    expect(projection.lastDeliveryStatus).toMatchObject({ op: 'sql' });
+    expect(leftJoin).toHaveBeenCalledWith(
+      { id: 'organizations.id', name: 'organizations.name' },
+      { op: 'eq', column: 'organizations.id', value: 'reports.orgId' }
+    );
+    expect(projection.seriesName).toBe('reportSeries.name');
+    expect(leftJoin).toHaveBeenCalledWith(
+      { id: 'reportSeries.id', name: 'reportSeries.name' },
+      { op: 'eq', column: 'reportSeries.id', value: 'reports.seriesId' }
+    );
   });
 
   it.each(['', '/templates'])(
@@ -1330,13 +1449,16 @@ describe('report definition scope enforcement', () => {
       'executionScopeFingerprint',
       'executionScopeCapturedAt',
       'executionScopePrincipalKind',
-      'portalSelfService'
+      'portalSelfService',
+      // Multi-org report series W02: the write routes refuse a series child.
+      'seriesId',
+      'archivedAt'
     ]);
     expect(metadataProjection).not.toHaveProperty('config');
     expect(resolveRequestReportAuthority).toHaveBeenCalledWith(
       authState.auth,
       ORG_ID,
-      'read'
+      'read_history'
     );
   });
 
@@ -1380,7 +1502,7 @@ describe('report definition scope enforcement', () => {
   });
 
   it.each([
-    { method: 'GET', suffix: '', body: undefined, action: 'read' },
+    { method: 'GET', suffix: '', body: undefined, action: 'read_history' },
     { method: 'PUT', suffix: '', body: { name: 'Nope' }, action: 'write' },
     { method: 'DELETE', suffix: '', body: undefined, action: 'delete' },
     { method: 'POST', suffix: '/reauthorize', body: undefined, action: 'write' }
@@ -2335,11 +2457,25 @@ describe('reports routes', () => {
       for (const node of scopeNodes) {
         expect(node).toEqual({
           op: 'inArray',
-          column: 'devices.siteId',
+          column: OWNING_SITE,
           values: [SITE_ALLOWED]
         });
         expect(node).toBe(scopeNodes[0]);
       }
+    });
+
+    it('scopes a site-owned topology alert by its TOPOLOGY site, not its origin device site (M3-D6)', async () => {
+      siteScopeState.result = restrictedAuthority(ORG_ID, [SITE_ALLOWED]);
+      mockAlertsSummaryQueries([
+        ...orgAlerts,
+        { orgId: ORG_ID, siteId: SITE_ALLOWED, topologySiteId: SITE_DENIED, severity: 'critical', status: 'open', day: '2026-07-04', ruleId: 'rule-t', ruleName: 'Topology' },
+        { orgId: ORG_ID, siteId: SITE_ALLOWED, topologySiteId: SITE_DENIED, severity: 'critical', status: 'open', day: '2026-07-05', ruleId: 'rule-t', ruleName: 'Topology' },
+        { orgId: ORG_ID, siteId: SITE_DENIED, topologySiteId: SITE_ALLOWED, severity: 'info', status: 'open', day: '2026-07-04', ruleId: 'rule-t', ruleName: 'Topology' },
+      ]);
+
+      const body = await (await app.request('/reports/data/alerts-summary')).json();
+      expect(body.total).toBe(3);
+      expect(body.data.bySeverity).toEqual({ critical: 1, warning: 1, info: 1 });
     });
 
     it('returns 403 for a denied siteId before any query', async () => {
@@ -2404,7 +2540,7 @@ describe('reports routes', () => {
       for (const condition of captured) {
         expect(findDeviceScopeNode(condition)).toEqual({
           op: 'inArray',
-          column: 'devices.siteId',
+          column: OWNING_SITE,
           values: [SITE_B1]
         });
       }
@@ -2446,12 +2582,12 @@ describe('reports routes', () => {
       expect(scopeNodes[0]).toEqual({
         op: 'or',
         conditions: [
-          { op: 'eq', column: 'devices.orgId', value: ORG_ID },
+          { op: 'eq', column: 'alerts.orgId', value: ORG_ID },
           {
             op: 'and',
             conditions: [
-              { op: 'eq', column: 'devices.orgId', value: ORG_B },
-              { op: 'inArray', column: 'devices.siteId', values: [SITE_B1] }
+              { op: 'eq', column: 'alerts.orgId', value: ORG_B },
+              { op: 'inArray', column: OWNING_SITE, values: [SITE_B1] }
             ]
           }
         ]
@@ -2836,7 +2972,7 @@ describe('report run immutable scope enforcement', () => {
     expect(resolveRequestReportAuthority).toHaveBeenCalledWith(
       expect.anything(),
       ORG_A,
-      'read',
+      'read_history',
     );
     expect(db.insert).not.toHaveBeenCalled();
     expect(generateReport).not.toHaveBeenCalled();
@@ -3001,6 +3137,47 @@ describe('report run immutable scope enforcement', () => {
     );
   });
 
+  it('projects the owning org and the delivery summary onto every listed run (multi-org series W01)', async () => {
+    const app = new Hono();
+    app.route('/reports', reportRoutes);
+    siteScopeState.result = authority('unrestricted') as any;
+    const captured: unknown[] = [];
+    const page = capturedSelectChain(
+      [{
+        id: RUN_ID,
+        reportId: REPORT_ID,
+        orgId: ORG_A,
+        orgName: 'Acme Dental',
+        deliveryStatus: 'no_recipients',
+        recipientCount: 0,
+      }],
+      captured,
+    );
+    vi.mocked(db.select)
+      .mockReturnValueOnce(capturedSelectChain([{ count: 1 }], captured))
+      .mockReturnValueOnce(page);
+
+    const res = await app.request('/reports/runs?limit=2');
+
+    expect(res.status).toBe(200);
+    expect((await res.json()).data[0]).toMatchObject({
+      orgId: ORG_A,
+      orgName: 'Acme Dental',
+      deliveryStatus: 'no_recipients',
+      recipientCount: 0,
+    });
+    expect(vi.mocked(db.select).mock.calls[1]![0]).toMatchObject({
+      orgId: 'reports.orgId',
+      orgName: 'organizations.name',
+      deliveryStatus: 'reportRuns.deliveryStatus',
+      recipientCount: 'reportRuns.recipientCount',
+    });
+    expect(page.leftJoin).toHaveBeenCalledWith(
+      { id: 'organizations.id', name: 'organizations.name' },
+      { op: 'eq', column: 'organizations.id', value: 'reports.orgId' },
+    );
+  });
+
   it('filters recentRuns in SQL before limiting and never materializes hidden result payloads', async () => {
     const app = new Hono();
     app.route('/reports', reportRoutes);
@@ -3071,7 +3248,7 @@ describe('report run immutable scope enforcement', () => {
   it.each([
     {
       route: (id: string) => `/reports/runs/${id}`,
-      action: 'read',
+      action: 'read_history',
     },
     {
       route: (id: string) => `/reports/runs/${id}/download?format=json`,
@@ -3205,7 +3382,7 @@ describe('report run immutable scope enforcement', () => {
       expect(resolveRequestReportAuthority).toHaveBeenCalledWith(
         expect.anything(),
         ORG_B,
-        'read',
+        'read_history',
       );
       expect(resolveRequestReportAuthorityMap).not.toHaveBeenCalled();
     },

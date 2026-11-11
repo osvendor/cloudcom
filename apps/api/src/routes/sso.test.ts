@@ -1,4 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+// The holding-org refusal reads the org; the db mocks below do not model it.
+vi.mock('../services/unassignedPool/protectedOrg', () => ({ isHoldingOrg: vi.fn(async () => false) }));
 import { createHmac, createHash } from 'crypto';
 import { Hono } from 'hono';
 import { ssoRoutes } from './sso';
@@ -106,7 +109,7 @@ vi.mock('../services/ssoBrowserTransition', () => ({
   withLockedSsoProviderAuthority: ssoTransitionMocks.withLockedSsoProviderAuthority,
 }));
 
-vi.mock('../services/sso', () => ({
+vi.mock('../services/sso', async () => ({
   generateState: vi.fn().mockReturnValue('state'),
   generateNonce: vi.fn().mockReturnValue('nonce'),
   generatePKCEChallenge: vi.fn().mockReturnValue({
@@ -128,8 +131,9 @@ vi.mock('../services/sso', () => ({
     if (ev === false || ev === 'false') return 'false';
     return 'absent';
   },
-  // Real logic (not a stub) so the IdP-MFA tests exercise the amr check.
-  idpAssertedMfa: (claims: { amr?: unknown }) => Array.isArray(claims?.amr) && claims.amr.includes('mfa'),
+  // The REAL implementation (not a hand-copied mirror) so the IdP-MFA tests
+  // exercise the actual amr check and cannot drift from it (#6137).
+  idpAssertedMfa: (await vi.importActual<typeof import('../services/sso')>('../services/sso')).idpAssertedMfa,
   mapUserAttributes: vi.fn(),
   discoverOIDCConfig: vi.fn(),
   // SR2-14: getOIDCConfig (defined in the route file, NOT mocked) now calls this
@@ -150,12 +154,9 @@ vi.mock('../services/sso', () => ({
       throw new Error(`OIDC endpoint rejected (internal): ${label}`);
     }
   },
-  PROVIDER_PRESETS: {
-    okta: {
-      scopes: 'openid profile email',
-      attributeMapping: { email: 'email', name: 'name' }
-    }
-  }
+  // The REAL preset table so the preset tests resolve the shipped keys (#9601:
+  // the web sent 'azure' while the table is keyed 'azure-ad').
+  PROVIDER_PRESETS: (await vi.importActual<typeof import('../services/sso')>('../services/sso')).PROVIDER_PRESETS
 }));
 
 vi.mock('../services', () => ({
@@ -514,7 +515,7 @@ import {
 import { createPendingDomain, verifyDomain, isSsoProvisioningBlocked, isDomainVerifiedForOrg } from '../services/ssoDomainVerification';
 import { PARTNER_WIDE_WRITE_DENIED_MESSAGE } from '../services/partnerWideAccess';
 import { getUserPermissions } from '../services/permissions';
-import { writeRouteAudit } from '../services/auditEvents';
+import { derivePartnerAttribution, writeRouteAudit } from '../services/auditEvents';
 import { auditLogin } from './auth/helpers';
 
 const PROVIDER_UUID = '00000000-0000-4000-8000-000000000001';
@@ -841,7 +842,7 @@ describe('sso routes', () => {
       orgId: ORG_UUID,
       name: 'Okta',
       type: 'oidc',
-      scopes: 'openid profile email',
+      scopes: 'openid profile email groups',
       authorizationUrl: 'https://issuer.example.com/auth',
       tokenUrl: 'https://issuer.example.com/token',
       userInfoUrl: 'https://issuer.example.com/userinfo',
@@ -849,6 +850,69 @@ describe('sso routes', () => {
       createdBy: USER_UUID,
       status: 'inactive'
     }));
+  });
+
+  // #9601: the preset key the create route reads must be the one the API
+  // publishes from GET /sso/presets. The web form used to send 'azure', which
+  // matched nothing, so the provider was created with no attribute mapping.
+  describe('preset keys (#9601)', () => {
+    const postPreset = (preset: string) => app.request('/sso/providers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'Entra', type: 'oidc', preset })
+    });
+
+    it('applies the azure-ad preset scopes and given/family name mapping', async () => {
+      const valuesMock = vi.fn().mockReturnValue({
+        returning: vi.fn().mockResolvedValue([{ id: PROVIDER_UUID, name: 'Entra' }])
+      });
+      vi.mocked(db.insert).mockReturnValue({ values: valuesMock } as any);
+
+      const res = await postPreset('azure-ad');
+
+      expect(res.status).toBe(201);
+      expect(valuesMock).toHaveBeenCalledWith(expect.objectContaining({
+        scopes: 'openid profile email',
+        attributeMapping: expect.objectContaining({ firstName: 'given_name', lastName: 'family_name' })
+      }));
+    });
+
+    it("maps the legacy 'azure' value (stale web bundles) to the azure-ad preset", async () => {
+      const valuesMock = vi.fn().mockReturnValue({
+        returning: vi.fn().mockResolvedValue([{ id: PROVIDER_UUID, name: 'Entra' }])
+      });
+      vi.mocked(db.insert).mockReturnValue({ values: valuesMock } as any);
+
+      const res = await postPreset('azure');
+
+      expect(res.status).toBe(201);
+      expect(valuesMock).toHaveBeenCalledWith(expect.objectContaining({
+        attributeMapping: expect.objectContaining({ firstName: 'given_name', lastName: 'family_name' })
+      }));
+    });
+
+    it('rejects an unknown preset with 400 instead of silently ignoring it', async () => {
+      const res = await postPreset('not-a-preset');
+
+      expect(res.status).toBe(400);
+      // The caller is told which ids are valid, not a bare "Invalid input".
+      const body = await res.json();
+      expect(body.error).toContain('preset');
+      expect(body.error).toContain('"azure-ad"|"okta"|"google"|"auth0"');
+      expect(db.insert).not.toHaveBeenCalled();
+    });
+
+    it('treats an empty preset (Custom configuration) as no preset', async () => {
+      const valuesMock = vi.fn().mockReturnValue({
+        returning: vi.fn().mockResolvedValue([{ id: PROVIDER_UUID, name: 'Entra' }])
+      });
+      vi.mocked(db.insert).mockReturnValue({ values: valuesMock } as any);
+
+      const res = await postPreset('');
+
+      expect(res.status).toBe(201);
+      expect(valuesMock).toHaveBeenCalledWith(expect.objectContaining({ attributeMapping: undefined }));
+    });
   });
 
   it('creates a SAML provider without discovery', async () => {
@@ -2158,6 +2222,25 @@ describe('sso routes', () => {
       expect(verifyIdTokenSignature).toHaveBeenCalled();
     });
 
+    // #8862: only re-auth gets clock tolerance. Login verification stays strict.
+    it('verifies a login-mode id_token strictly (no clock tolerance)', async () => {
+      wireHappyPathDb();
+      vi.mocked(verifyIdTokenSignature).mockRejectedValue(
+        new Error('ID token signature verification failed: "exp" claim timestamp check failed')
+      );
+
+      const res = await app.request('/sso/callback?code=oidc-code&state=state', {
+        method: 'GET',
+        headers: { cookie: ssoStateCookieHeader('state') }
+      });
+
+      expect(res.headers.get('location') ?? '').toContain('/login?error=sso_error');
+      expect(verifyIdTokenSignature).toHaveBeenCalledTimes(1);
+      const options = vi.mocked(verifyIdTokenSignature).mock.calls[0]![3];
+      expect(options).toEqual({ mode: 'login' });
+      expect(options).not.toHaveProperty('clockToleranceSeconds');
+    });
+
     // security review #2 (C-2): a token response with no id_token must be
     // rejected — the callback no longer accepts an unsigned/absent id_token.
     it('rejects a callback whose token response has no id_token', async () => {
@@ -2454,6 +2537,36 @@ describe('sso routes', () => {
       const res = await doCallback();
       expect(res.status).toBe(302);
       expect(createTokenPair).toHaveBeenCalledWith(expect.objectContaining({ mfa: true, mfaSrc: 'idp' }), expect.any(Object));
+    });
+
+    // #6137: a phishing-resistant passkey login (`amr: ["phr"]`, e.g. Pocket ID)
+    // satisfies trusted upstream MFA the same way `mfa` does.
+    it('mints mfa:true when the provider trusts IdP MFA and amr attests phr (#6137)', async () => {
+      wireLinkedLogin({ trustsIdpMfa: true, amr: ['phr'] });
+      const res = await doCallback();
+      expect(res.status).toBe(302);
+      expect(createTokenPair).toHaveBeenCalledWith(expect.objectContaining({ mfa: true, mfaSrc: 'idp' }), expect.any(Object));
+    });
+
+    it('mints mfa:false for amr phr when the provider does NOT trust IdP MFA (#6137)', async () => {
+      wireLinkedLogin({ trustsIdpMfa: false, amr: ['phr'] });
+      const res = await doCallback();
+      expect(res.status).toBe(302);
+      expect(createTokenPair).toHaveBeenCalledWith(expect.objectContaining({ mfa: false }), expect.any(Object));
+    });
+
+    it('mints mfa:false for a trusted provider asserting only a single-factor hardware key (#6137)', async () => {
+      wireLinkedLogin({ trustsIdpMfa: true, amr: ['hwk'] });
+      const res = await doCallback();
+      expect(res.status).toBe(302);
+      expect(createTokenPair).toHaveBeenCalledWith(expect.objectContaining({ mfa: false }), expect.any(Object));
+    });
+
+    it('mints mfa:false for an UNENROLLED user under a required policy, even with a trusted amr:phr assertion (#6137)', async () => {
+      wireLinkedLogin({ trustsIdpMfa: true, amr: ['phr'], policyRequiresMfa: true, userMfaEnabled: false });
+      const res = await doCallback();
+      expect(res.status).toBe(302);
+      expect(createTokenPair).toHaveBeenCalledWith(expect.objectContaining({ mfa: false }), expect.any(Object));
     });
 
     it('denies an org-axis SSO identity outside its owning partner allowlist before minting', async () => {
@@ -3021,6 +3134,114 @@ describe('sso routes', () => {
       }));
     });
 
+    // #7252: a partner admin in the All-organizations view (no org in the body
+    // or auth context, several accessible orgs) got a bare "Organization ID
+    // required" on an org-owned create — nothing said what to do next.
+    it('400s an org-owned create with no resolvable org with an actionable message and code', async () => {
+      setAuthContext({
+        scope: 'partner',
+        orgId: null,
+        partnerId: PARTNER_UUID,
+        accessibleOrgIds: [ORG_UUID, '00000000-0000-4000-8000-000000000011'],
+        partnerOrgAccess: 'all'
+      });
+
+      const res = await app.request('/sso/providers', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'Authentik', type: 'oidc' })
+      });
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.code).toBe('sso_provider_org_required');
+      expect(body.error).not.toBe('Organization ID required');
+      expect(body.error).toMatch(/select an organization/i);
+      expect(body.error).toMatch(/ownerScope/);
+      expect(db.insert).not.toHaveBeenCalled();
+    });
+
+    // The web form never sends a body orgId; fetchWithAuth appends ?orgId=.
+    describe('selected ?orgId fallback', () => {
+      const OTHER_ORG = '00000000-0000-4000-8000-000000000011';
+      const partnerCtx = (canAccessOrg: (id: string) => boolean) => setAuthContext({
+        scope: 'partner',
+        orgId: null,
+        partnerId: PARTNER_UUID,
+        accessibleOrgIds: [ORG_UUID, OTHER_ORG],
+        partnerOrgAccess: 'selected',
+        canAccessOrg
+      });
+      const post = (qs: string) => app.request(`/sso/providers${qs}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'Authentik', type: 'oidc' })
+      });
+
+      it('creates for the accessible query orgId when the body has none', async () => {
+        partnerCtx((id) => id === ORG_UUID);
+        const valuesMock = vi.fn().mockReturnValue({
+          returning: vi.fn().mockResolvedValue([{ id: PROVIDER_UUID, name: 'Authentik', orgId: ORG_UUID }])
+        });
+        vi.mocked(db.insert).mockReturnValue({ values: valuesMock } as any);
+
+        const res = await post(`?orgId=${ORG_UUID}`);
+
+        expect(res.status).toBe(201);
+        expect(valuesMock).toHaveBeenCalledWith(expect.objectContaining({ orgId: ORG_UUID }));
+      });
+
+      it('403s an inaccessible query orgId', async () => {
+        partnerCtx((id) => id === ORG_UUID);
+        const res = await post(`?orgId=${OTHER_ORG}`);
+        expect(res.status).toBe(403);
+        expect(db.insert).not.toHaveBeenCalled();
+      });
+
+      it('still 400s with neither body nor query orgId', async () => {
+        partnerCtx(() => true);
+        const res = await post('');
+        expect(res.status).toBe(400);
+        expect((await res.json()).code).toBe('sso_provider_org_required');
+      });
+    });
+
+    it('does not suggest ownerScope=partner to an org-scoped caller (it cannot use it)', async () => {
+      setAuthContext({ scope: 'organization', orgId: null, partnerId: null, accessibleOrgIds: [] });
+
+      const res = await app.request('/sso/providers', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'Authentik', type: 'oidc' })
+      });
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toBe('Organization ID required');
+      expect(body.code).toBeUndefined();
+      expect(db.insert).not.toHaveBeenCalled();
+    });
+
+    it('still 403s an org-owned create for an org the partner user cannot access (no loosening)', async () => {
+      setAuthContext({
+        scope: 'partner',
+        orgId: null,
+        partnerId: PARTNER_UUID,
+        accessibleOrgIds: [ORG_UUID],
+        partnerOrgAccess: 'selected',
+        canAccessOrg: (orgId) => orgId === ORG_UUID
+      });
+
+      const res = await app.request('/sso/providers', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'Authentik', type: 'oidc', orgId: '00000000-0000-4000-8000-000000000011' })
+      });
+
+      expect(res.status).toBe(403);
+      expect(db.insert).not.toHaveBeenCalled();
+    });
+
     it('403s ownerScope=partner when partnerOrgAccess is not all', async () => {
       setAuthContext({
         scope: 'partner',
@@ -3551,7 +3772,7 @@ describe('sso routes', () => {
       );
       expect(auditLogin).toHaveBeenCalledWith(
         expect.anything(),
-        expect.objectContaining({ scope: 'partner', method: 'sso-partner', orgId: null, userId: USER_UUID })
+        expect.objectContaining({ scope: 'partner', method: 'sso-partner', orgId: null, partnerId: PARTNER_UUID, userId: USER_UUID })
       );
     });
 
@@ -4079,6 +4300,82 @@ describe('sso routes', () => {
       expect(exchangeCodeForTokens).toHaveBeenCalled();
       expect(db.insert).not.toHaveBeenCalled();
       expect(createTokenPair).not.toHaveBeenCalled();
+    });
+
+    // #8862: a signed-in user linking an IdP stays on the profile page when the
+    // id_token fails verification, and link verification stays strict.
+    it('callback link mode keeps an id_token verification failure on the profile page', async () => {
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      primeLinkCallback({ linkUserId: USER_UUID });
+      vi.mocked(verifyIdTokenSignature).mockRejectedValueOnce(
+        new Error('ID token signature verification failed: "exp" claim timestamp check failed')
+      );
+
+      const res = await doCallback();
+
+      expect(res.status).toBe(302);
+      expect(res.headers.get('location')).toBe('/settings/profile?ssoLinkError=idp_verify_failed');
+      expect(vi.mocked(verifyIdTokenSignature).mock.calls[0]![3]).toEqual({ mode: 'link' });
+      expect(getUserInfo).not.toHaveBeenCalled();
+      expect(db.insert).not.toHaveBeenCalled();
+      expect(createTokenPair).not.toHaveBeenCalled();
+      expect(writeRouteAudit).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: 'sso.identity.link_rejected',
+          result: 'denied',
+          details: expect.objectContaining({ reason: 'idp_verify_failed', userId: USER_UUID }),
+        })
+      );
+    });
+
+    // #9377: /callback is unauthenticated, so a partner-level provider's link
+    // rows reach the partner audit trail only via an explicit top-level
+    // partnerId. Feed the (mocked) writeRouteAudit argument to the real
+    // derivation with a no-auth context to get the partner_id the row persists.
+    const persistedLinkPartnerIds = (action: string): Array<string | null> =>
+      vi.mocked(writeRouteAudit).mock.calls
+        .map(([, event]) => event)
+        .filter((event) => event.action === action)
+        .map((event) => derivePartnerAttribution({ req: { header: () => undefined } } as any, event));
+
+    it('attributes sso.identity.linked to the partner for a partner-level provider (#9377)', async () => {
+      primeLinkCallback({ linkUserId: USER_UUID, provider: PARTNER_PROVIDER });
+      vi.mocked(db.select).mockReturnValueOnce(sel([])); // (provider, sub) not in use
+      vi.mocked(db.insert).mockReturnValueOnce({
+        values: vi.fn(() => ({ returning: vi.fn().mockResolvedValue([]) }))
+      } as any);
+
+      const res = await doCallback();
+
+      expect(res.headers.get('location')).toBe('/settings/profile?ssoLinked=1');
+      expect(persistedLinkPartnerIds('sso.identity.linked')).toEqual([PARTNER_UUID]);
+    });
+
+    it('attributes sso.identity.link_rejected (idp_verify_failed) to the partner for a partner-level provider (#9377)', async () => {
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      primeLinkCallback({ linkUserId: USER_UUID, provider: PARTNER_PROVIDER });
+      vi.mocked(verifyIdTokenSignature).mockRejectedValueOnce(
+        Object.assign(new Error('Invalid nonce'), { failureKind: 'nonce' })
+      );
+
+      const res = await doCallback();
+
+      expect(res.headers.get('location')).toBe('/settings/profile?ssoLinkError=idp_verify_failed');
+      expect(persistedLinkPartnerIds('sso.identity.link_rejected')).toEqual([PARTNER_UUID]);
+    });
+
+    it('attributes sso.identity.link_rejected (binding failure) to the partner for a partner-level provider (#9377)', async () => {
+      primeLinkCallback({
+        linkUserId: USER_UUID,
+        provider: PARTNER_PROVIDER,
+        linkingUser: { ...ACTIVE_LINKING_USER, status: 'suspended' },
+      });
+
+      const res = await doCallback();
+
+      expect(res.headers.get('location')).toBe('/settings/profile?ssoLinkError=session_invalid');
+      expect(persistedLinkPartnerIds('sso.identity.link_rejected')).toEqual([PARTNER_UUID]);
     });
 
     it('callback link mode rejects an email mismatch (no insert)', async () => {
@@ -5008,6 +5305,29 @@ describe('sso routes', () => {
         // Self sorts first so the guaranteed-self-lockout case survives truncation.
         expect(data.unlinked[0]).toMatchObject({ id: USER_UUID, isSelf: true });
         expect(data.unlinked[1]).toMatchObject({ email: 'alice@example.com', isSelf: false, hasPasskey: true });
+      });
+
+      // #7252: the create-flow preflight derives the axis exactly like
+      // POST /providers, so it refuses an unresolvable org the same way.
+      it('create flow with no resolvable org: 400 with the actionable provider-create message and code', async () => {
+        setAuthContext({
+          scope: 'partner',
+          orgId: null,
+          partnerId: PARTNER_UUID,
+          accessibleOrgIds: [ORG_UUID, '00000000-0000-4000-8000-000000000011'],
+          partnerOrgAccess: 'all'
+        });
+
+        const res = await app.request('/sso/providers/enforcement-preflight', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({})
+        });
+
+        expect(res.status).toBe(400);
+        const body = await res.json();
+        expect(body.code).toBe('sso_provider_org_required');
+        expect(body.error).toMatch(/select an organization/i);
       });
 
       it('edit flow (providerId): linked members are excluded and the effective login provider is reported', async () => {

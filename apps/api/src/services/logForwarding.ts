@@ -7,19 +7,19 @@ import { decryptForColumn } from './secretCrypto';
 import { captureException } from './sentry';
 import { safeFetch, SsrfBlockedError } from './urlSafety';
 
-interface LogForwardingConfig {
-  enabled: boolean;
-  // Field names are retained from the original Elasticsearch-only design to
-  // avoid a settings-JSONB migration. The transport below speaks the plain
-  // Elasticsearch/OpenSearch `_bulk` wire protocol over HTTP, so any
-  // compatible sink works (Elasticsearch, OpenSearch, the Wazuh indexer,
-  // AWS OpenSearch Service, etc.).
-  elasticsearchUrl: string;
-  elasticsearchApiKey?: string;
-  elasticsearchUsername?: string;
-  elasticsearchPassword?: string;
-  indexPrefix: string;
-}
+// The destination type and its pure resolver live in a dependency-free module
+// so settings code (effectiveSettings, the partner inheritance bindings) can ask
+// the same resolver without pulling in the DB and transport (#9762).
+import {
+  resolveForwardingDestination,
+  type LogForwardingConfig,
+} from './logForwardingDestination';
+
+export {
+  resolveForwardingDestination,
+  type ForwardingDestinationSource,
+  type LogForwardingConfig,
+} from './logForwardingDestination';
 
 interface EventLogDocument {
   deviceId: string;
@@ -57,26 +57,23 @@ export async function getOrgForwardingConfig(orgId: string): Promise<LogForwardi
 
   const settings = (org.settings as Record<string, unknown>) ?? {};
   const partnerSettings = (partner?.settings as Record<string, unknown>) ?? {};
-  const partnerForwarding = partnerSettings.eventLogs as Partial<LogForwardingConfig> | undefined;
-  // Only an enabled partner destination with an endpoint overrides the org.
-  // Otherwise, the org configures its own destination.
-  // Keep destinations atomic: never send org credentials to a partner URL.
-  const usePartner = partnerForwarding?.enabled === true && !!partnerForwarding?.elasticsearchUrl;
-  const forwarding = usePartner
-    ? partnerForwarding
-    : settings.logForwarding as LogForwardingConfig | undefined;
-  const table = usePartner ? 'partners' : 'organizations';
-
-  if (!forwarding?.enabled || !forwarding.elasticsearchUrl) return null;
+  const { source, config } = resolveForwardingDestination(partnerSettings.eventLogs, settings.logForwarding);
+  if (!config) return null;
+  const table = source === 'partner' ? 'partners' : 'organizations';
   return {
-    ...forwarding,
-    enabled: true,
-    elasticsearchUrl: forwarding.elasticsearchUrl,
-    indexPrefix: forwarding.indexPrefix || 'breeze-logs',
+    ...config,
     // AAD must match the settings column that owns the selected credentials.
-    elasticsearchApiKey: decryptForColumn(table, 'settings', forwarding.elasticsearchApiKey) ?? undefined,
-    elasticsearchPassword: decryptForColumn(table, 'settings', forwarding.elasticsearchPassword) ?? undefined,
+    elasticsearchApiKey: decryptForColumn(table, 'settings', config.elasticsearchApiKey) ?? undefined,
+    elasticsearchPassword: decryptForColumn(table, 'settings', config.elasticsearchPassword) ?? undefined,
   };
+}
+
+// ES/OpenSearch index names must be lowercase and may not contain
+// \, /, *, ?, ", <, >, |, space, comma or #, and may not start with -, _ or +.
+// Org ids are UUIDs (already lowercase hex + hyphens), so this is a defensive
+// normalization rather than a required one.
+function indexSafeOrgSegment(orgId: string): string {
+  return orgId.toLowerCase().replace(/[^a-z0-9-]/g, '').replace(/^[-_+]+/, '') || 'unknown';
 }
 
 function buildAuthHeader(config: LogForwardingConfig): string | undefined {
@@ -141,7 +138,12 @@ export async function bulkIndexToEndpoint(
   if (events.length === 0) return { indexed: 0, errors: 0 };
 
   const today = new Date().toISOString().slice(0, 10).replace(/-/g, '.');
-  const indexName = `${config.indexPrefix}-${today}`;
+  // A shared (partner-wide) destination gets its own index per org so that
+  // one org's mapping (field types, dynamic keys under `details`) cannot
+  // collide with or poison another org's documents in the same index.
+  const indexName = config.sharedAcrossOrgs && orgId
+    ? `${config.indexPrefix}-org-${indexSafeOrgSegment(orgId)}-${today}`
+    : `${config.indexPrefix}-${today}`;
   const url = `${config.elasticsearchUrl.replace(/\/+$/, '')}/_bulk`;
   const orgSuffix = orgId ? ` org=${orgId}` : '';
 

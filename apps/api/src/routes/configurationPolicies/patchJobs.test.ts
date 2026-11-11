@@ -10,21 +10,41 @@ const {
   summarizePatchInventoryMock,
   enqueuePatchJobMock,
   captureExceptionMock,
-} = vi.hoisted(() => ({
-  getConfigPolicyMock: vi.fn(),
-  checkDeviceMaintenanceWindowMock: vi.fn(),
-  resolvePatchConfigDetailsForDeviceMock: vi.fn(),
-  loadPolicyLocalPatchConfigMock: vi.fn(),
-  listPatchInventoryMock: vi.fn(),
-  summarizePatchInventoryMock: vi.fn((rows: any[]) => ({
-    total: rows.length,
-    ok: rows.filter((row) => row.effectiveStatus === 'ok').length,
-    needsRepair: rows.filter((row) => row.effectiveStatus === 'needs_repair').length,
-    invalidReference: rows.filter((row) => row.effectiveStatus === 'invalid_reference').length,
-  })),
-  enqueuePatchJobMock: vi.fn(async (_jobId?: string, _delayMs?: number) => undefined),
-  captureExceptionMock: vi.fn(),
-}));
+  dbContextState,
+  withAuthDbAccessContextMock,
+} = vi.hoisted(() => {
+  // #6849 — tracks whether we are currently inside the short
+  // withAuthDbAccessContext block the route opens for its DB work, so tests
+  // can assert enqueuePatchJob is only ever called AFTER that block has
+  // returned (i.e. after the write committed), not from inside it.
+  const state = { depth: 0, enqueueDepths: [] as number[] };
+  return {
+    getConfigPolicyMock: vi.fn(),
+    checkDeviceMaintenanceWindowMock: vi.fn(),
+    resolvePatchConfigDetailsForDeviceMock: vi.fn(),
+    loadPolicyLocalPatchConfigMock: vi.fn(),
+    listPatchInventoryMock: vi.fn(),
+    summarizePatchInventoryMock: vi.fn((rows: any[]) => ({
+      total: rows.length,
+      ok: rows.filter((row) => row.effectiveStatus === 'ok').length,
+      needsRepair: rows.filter((row) => row.effectiveStatus === 'needs_repair').length,
+      invalidReference: rows.filter((row) => row.effectiveStatus === 'invalid_reference').length,
+    })),
+    enqueuePatchJobMock: vi.fn(async (_jobId?: string, _delayMs?: number) => {
+      state.enqueueDepths.push(state.depth);
+    }),
+    captureExceptionMock: vi.fn(),
+    dbContextState: state,
+    withAuthDbAccessContextMock: vi.fn(async (_auth: unknown, fn: () => Promise<unknown>) => {
+      state.depth += 1;
+      try {
+        return await fn();
+      } finally {
+        state.depth -= 1;
+      }
+    }),
+  };
+});
 
 vi.mock('../../services/configurationPolicy', () => ({
   getConfigPolicy: getConfigPolicyMock,
@@ -58,6 +78,7 @@ vi.mock('../../middleware/auth', () => ({
   requireScope: vi.fn(() => (c: any, next: any) => next()),
   requirePermission: vi.fn(() => (c: any, next: any) => next()),
   requireMfa: vi.fn(() => (c: any, next: any) => next()),
+  withAuthDbAccessContext: withAuthDbAccessContextMock,
 }));
 
 vi.mock('../../db', () => ({
@@ -117,8 +138,6 @@ function makePolicyLocal(overrides: Record<string, unknown> = {}): any {
     featurePolicyId: null,
     settings: {
       sources: ['os'],
-      autoApprove: false,
-      autoApproveSeverities: [],
       scheduleFrequency: 'daily',
       scheduleTime: '02:00',
       scheduleDayOfWeek: 'sun',
@@ -139,14 +158,14 @@ function makePolicyLocal(overrides: Record<string, unknown> = {}): any {
   };
 }
 
+const RING_ID_FOR_SNAPSHOT = '99999999-9999-4999-8999-999999999999';
+
 function makeResolvedPatchConfig(overrides: Record<string, unknown> = {}): any {
   return {
     settings: {
       id: 'ps-1',
       featureLinkId: 'fl-1',
       sources: ['os'],
-      autoApprove: false,
-      autoApproveSeverities: [],
       scheduleFrequency: 'daily',
       scheduleTime: '02:00',
       scheduleDayOfWeek: 'sun',
@@ -199,6 +218,8 @@ describe('configurationPolicies patchJob routes', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    dbContextState.depth = 0;
+    dbContextState.enqueueDepths = [];
     app = new Hono();
     app.use('*', async (c, next) => {
       c.set('auth', makeAuth());
@@ -284,6 +305,17 @@ describe('configurationPolicies patchJob routes', () => {
           scheduleDayOfMonth: 1,
           rebootPolicy: 'if_required',
         },
+        ring: {
+          classification: 'valid_ring',
+          valid: true,
+          ringId: RING_ID_FOR_SNAPSHOT,
+          ringName: 'Pilot',
+          categoryRules: [],
+          categories: [],
+          excludeCategories: [],
+          autoApprove: {},
+          appRules: [{ source: 'third_party', packageId: 'Zoom.Zoom', action: 'pin', pinnedVersion: '6.0' }],
+        },
       }));
       vi.mocked(db.select)
         .mockReturnValueOnce({
@@ -311,12 +343,28 @@ describe('configurationPolicies patchJob routes', () => {
       expect(json.success).toBe(true);
       expect(json.totalDevices).toBe(1);
       expect(insertValuesMock.mock.calls[0]?.[0]?.patches).toMatchObject({
+        ringId: RING_ID_FOR_SNAPSHOT,
         sources: ['third_party'],
-        policyAutoApprove: { enabled: true, severities: ['critical'], deferralDays: 5 },
-        apps: [{ source: 'third_party', packageId: 'Mozilla.Firefox', action: 'block' }],
+        ringAppRules: [{ source: 'third_party', packageId: 'Zoom.Zoom', action: 'pin', pinnedVersion: '6.0' }],
       });
+      // #8188: the settings above still carry stale policy-level approval
+      // keys; neither the legacy `apps` mirror nor `policyAutoApprove` is
+      // snapshotted any more, and the policy's inline Firefox block is gone.
+      const snapshotPatches = insertValuesMock.mock.calls[0]?.[0]?.patches as Record<string, unknown>;
+      expect(snapshotPatches).not.toHaveProperty('apps');
+      expect(snapshotPatches).not.toHaveProperty('policyAutoApprove');
+      expect(JSON.stringify(snapshotPatches)).not.toContain('Mozilla.Firefox');
       expect(writeRouteAudit).toHaveBeenCalled();
       expect(json.enqueueFailures).toEqual([]);
+
+      // #6849 — the DB write ran inside withAuthDbAccessContext, and
+      // enqueuePatchJob must only ever be called after that block returned
+      // (depth back to 0), i.e. after the write committed — never from
+      // inside it, which is what let the worker read the job before the
+      // request's insert was durable.
+      expect(withAuthDbAccessContextMock).toHaveBeenCalledTimes(1);
+      expect(enqueuePatchJobMock).toHaveBeenCalledTimes(1);
+      expect(dbContextState.enqueueDepths).toEqual([0]);
     });
 
     it('surfaces the failure instead of reporting success when enqueue fails (#3945)', async () => {
@@ -324,10 +372,6 @@ describe('configurationPolicies patchJob routes', () => {
       loadPolicyLocalPatchConfigMock.mockResolvedValue(makePolicyLocal({
         settings: {
           sources: ['third_party'],
-          autoApprove: true,
-          autoApproveSeverities: ['critical'],
-          autoApproveDeferralDays: 5,
-          apps: [{ source: 'third_party', packageId: 'Mozilla.Firefox', action: 'block' }],
           scheduleFrequency: 'daily',
           scheduleTime: '02:00',
           scheduleDayOfWeek: 'sun',
@@ -351,7 +395,16 @@ describe('configurationPolicies patchJob routes', () => {
         values: insertValuesMock,
       } as any);
 
-      enqueuePatchJobMock.mockRejectedValueOnce(new Error('queue wedged'));
+      // mockImplementationOnce (not mockRejectedValueOnce) so the #6849
+      // depth-capture in the hoisted default implementation still runs before
+      // this call rejects — otherwise this test couldn't assert the enqueue
+      // was attempted post-commit (depth 0) on the exact path where a future
+      // regression is most likely to re-nest it (right next to the
+      // try/catch this test exercises).
+      enqueuePatchJobMock.mockImplementationOnce(async () => {
+        dbContextState.enqueueDepths.push(dbContextState.depth);
+        throw new Error('queue wedged');
+      });
 
       const res = await app.request(`/${POLICY_ID}/patch-job`, {
         method: 'POST',
@@ -369,6 +422,9 @@ describe('configurationPolicies patchJob routes', () => {
         { jobId: 'job-1', orgId: ORG_ID, error: 'queue wedged' },
       ]);
       expect(captureExceptionMock).toHaveBeenCalled();
+      // #6849 — the failing enqueue attempt itself still ran after the write
+      // committed (depth 0), not from inside withAuthDbAccessContext.
+      expect(dbContextState.enqueueDepths).toEqual([0]);
     });
 
     it('returns 404 when no accessible devices found', async () => {
@@ -588,6 +644,12 @@ describe('configurationPolicies patchJob routes', () => {
       expect(json.totalDevices).toBe(2);
       // One patch_jobs row per device org (job insert grouped by org).
       expect(insertValuesMock).toHaveBeenCalledTimes(2);
+      // #6849 — both per-org enqueue calls ran after the single
+      // withAuthDbAccessContext block (that inserted both rows) had
+      // returned, not from inside the per-org insert loop.
+      expect(withAuthDbAccessContextMock).toHaveBeenCalledTimes(1);
+      expect(enqueuePatchJobMock).toHaveBeenCalledTimes(2);
+      expect(dbContextState.enqueueDepths).toEqual([0, 0]);
     });
 
     it('reports only the failing org while still creating jobs for every org in a partner-wide request (#3945)', async () => {
@@ -833,15 +895,10 @@ describe('configurationPolicies patchJob routes', () => {
 
   describe('GET /:id/resolve-patch-config/:deviceId', () => {
     it('returns resolved patch config for a device', async () => {
-      const appRules = [{ source: 'third_party', packageId: 'Mozilla.Firefox', action: 'block' }];
       getConfigPolicyMock.mockResolvedValue({ id: POLICY_ID, name: 'P1', status: 'active' });
       loadPolicyLocalPatchConfigMock.mockResolvedValue(makePolicyLocal({
         settings: {
           sources: ['os'],
-          autoApprove: true,
-          autoApproveSeverities: ['critical'],
-          autoApproveDeferralDays: 5,
-          apps: appRules,
           scheduleFrequency: 'daily',
           scheduleTime: '02:00',
           scheduleDayOfWeek: 'sun',
@@ -863,13 +920,17 @@ describe('configurationPolicies patchJob routes', () => {
       expect(json.effective.approvalRing).toBeDefined();
       // New keys sourced from the requested policy (it is also the winning one)
       expect(json.isWinning).toBe(true);
-      expect(json.effective.settings.autoApproveDeferralDays).toBe(5);
-      expect(json.effective.settings.apps).toEqual(appRules);
+      // #8188: the retired policy-level approval keys are not previewed.
+      for (const key of ['autoApprove', 'autoApproveSeverities', 'autoApproveDeferralDays']) {
+        expect(json.effective.settings).not.toHaveProperty(key);
+      }
+      // #8186: effective app rules come from the ring; this policy has none.
+      expect(json.effective.settings.apps).toEqual([]);
     });
 
     it('loads the winning policy config when it differs from the requested policy', async () => {
       const winningPolicyId = '88888888-8888-8888-8888-888888888888';
-      const winningApps = [{ source: 'custom', packageId: 'corp-tool', action: 'pin', pinnedVersion: '1.2.3' }];
+      const winningRingRules = [{ source: 'third_party', packageId: 'Mozilla.Firefox', action: 'block' }];
       getConfigPolicyMock.mockResolvedValue({ id: POLICY_ID, name: 'P1', status: 'active' });
       loadPolicyLocalPatchConfigMock.mockImplementation(async (configPolicyId: string) => {
         if (configPolicyId === POLICY_ID) {
@@ -881,10 +942,6 @@ describe('configurationPolicies patchJob routes', () => {
           featureLinkId: 'fl-2',
           settings: {
             sources: ['os', 'third_party'],
-            autoApprove: true,
-            autoApproveSeverities: ['critical', 'important'],
-            autoApproveDeferralDays: 9,
-            apps: winningApps,
             scheduleFrequency: 'weekly',
             scheduleTime: '03:30',
             scheduleDayOfWeek: 'tue',
@@ -900,6 +957,7 @@ describe('configurationPolicies patchJob routes', () => {
             categories: [],
             excludeCategories: [],
             autoApprove: {},
+            appRules: winningRingRules,
           },
         });
       });
@@ -917,8 +975,9 @@ describe('configurationPolicies patchJob routes', () => {
       expect(json.isWinning).toBe(false);
       expect(json.effective.configPolicyId).toBe(winningPolicyId);
       // New keys must come from the *winning* policy's local config
-      expect(json.effective.settings.autoApproveDeferralDays).toBe(9);
-      expect(json.effective.settings.apps).toEqual(winningApps);
+      expect(json.effective.settings).not.toHaveProperty('autoApproveDeferralDays');
+      // #8186: the winning policy's RING rules.
+      expect(json.effective.settings.apps).toEqual(winningRingRules);
       expect(json.effective.approvalRing.ringId).toBe('ring-w');
       expect(json.effective.approvalRing.ringName).toBe('Winning Ring');
       // Requested policy's own config is still returned unchanged

@@ -1,3 +1,4 @@
+import { findPartnerOwnedGroupIds, partnerGroupTargetRefusal } from '../services/deviceGroupOwnership';
 import { randomUUID } from 'node:crypto';
 import { Hono, type Context } from 'hono';
 import { z } from 'zod';
@@ -31,12 +32,13 @@ import {
   type AgentCeilingDto,
 } from '@breeze/shared';
 import { zValidator } from '../lib/validation';
+import { selectRunIntentsForCaller } from '../services/aiAgents/runIntentsForCaller';
 import { db, runOutsideDbContext, withSystemDbAccessContext } from '../db';
 import {
   actionIntents, aiAgentGraduation, aiAgentRuns, aiAgents, aiToolExecutions, devices, organizations,
-  reportRuns, reports, ticketDrafts, type AiAgentRow,
+  reportRuns, reports, ticketDrafts, users, wispGrants, type AiAgentRow,
 } from '../db/schema';
-import { authMiddleware, requireMfa, requirePermission, requireScope, type AuthContext } from '../middleware/auth';
+import { authMiddleware, requireMfa, requirePermission, requireScope, withAuthDbAccessContext, type AuthContext } from '../middleware/auth';
 import { policyDecideEnabled } from '../config/env';
 import { runSiteScopeCondition } from '../services/aiAgentRunSiteScope';
 import {
@@ -44,7 +46,10 @@ import {
   PARTNER_WIDE_WRITE_DENIED_MESSAGE,
   PartnerWideWriteDeniedError,
 } from '../services/partnerWideAccess';
-import { AgentAccessDeniedError, assertAgentWriteAllowed } from '../services/aiAgents/access';
+import { AgentAccessDeniedError, AgentSiteCeilingDeniedError, assertAgentWriteAllowed } from '../services/aiAgents/access';
+import { AgentModelNotAllowedError } from '../services/aiAgents/agentModelErrors';
+import { ResearchAgentEditError } from '../services/aiAgents/researchAgentEdit';
+import { TroubleshootAgentEditError } from '../services/aiAgents/troubleshootAgentEdit';
 import { canMutateOrgWideGovernance, SITE_CEILING_WRITE_DENIED_MESSAGE } from '../services/siteCeilingAccess';
 import { getCircuitState, resetCircuit } from '../services/aiAgents/agentCircuit';
 import { readAiKillState } from '../services/aiKillState';
@@ -141,9 +146,10 @@ export { runSiteScopeCondition };
 
 /**
  * A path id that is not a uuid must never reach a query. Postgres raises
- * 22P02 on the cast, and because the request runs inside one
- * withDbAccessContext transaction that error poisons it — the COMMIT then
- * 500s on what is really a 404.
+ * 22P02 on the cast, and because the request normally runs inside one
+ * withDbAccessContext transaction (self-managed routes such as POST /:id/runs
+ * hold none) that error poisons it — the COMMIT then 500s on what is really a
+ * 404.
  */
 function uuidParam(c: Context, name: string): string | null {
   const parsed = UUID.safeParse(c.req.param(name));
@@ -157,6 +163,25 @@ function uuidParam(c: Context, name: string): string | null {
  * that governs agent authority. Naming AiAgentDto (from @breeze/shared, which
  * the web client also imports) is what keeps the two ends from drifting.
  */
+/**
+ * W5 PR C (#5220, Decision 9): an allowlisted `flow__<slug>` with no enabled
+ * manual flow for the agent's owner is saved (the flow may be enabled later;
+ * every agent call is gated live) but the response says so. Best-effort: a
+ * failed read never fails the save.
+ */
+async function flowToolSaveWarnings(row: AiAgentRow): Promise<{ warnings?: Array<{ code: 'flow_tool_unknown'; tools: string[] }> }> {
+  const allowlist = Array.isArray(row.toolAllowlist) ? row.toolAllowlist : [];
+  if (!allowlist.some((t) => typeof t === 'string' && t.startsWith('flow__'))) return {};
+  try {
+    const { unknownFlowToolNames } = await import('../services/flows/agentFlowTools');
+    const unknown = await unknownFlowToolNames({ orgId: row.orgId ?? null, partnerId: row.partnerId ?? null }, allowlist);
+    return unknown.length > 0 ? { warnings: [{ code: 'flow_tool_unknown', tools: unknown }] } : {};
+  } catch (err) {
+    console.error('[aiAgents] flow tool save warning could not be computed', err);
+    return {};
+  }
+}
+
 function mapRow(row: AiAgentRow): AiAgentDto {
   return {
     id: row.id,
@@ -164,7 +189,8 @@ function mapRow(row: AiAgentRow): AiAgentDto {
     name: row.name,
     enabled: row.enabled,
     mode: row.mode,
-    model: row.model,
+    // AI model registry W05: the offering the policy is bound to (null = follows the assignment).
+    offeringId: row.offeringId ?? null,
     orgId: row.orgId,
     partnerId: row.partnerId,
     ownerScope: row.partnerId ? 'partner' : 'organization',
@@ -224,6 +250,9 @@ function isAgentKindConflict(err: unknown): boolean {
 }
 
 export function mapError(c: Context, err: unknown) {
+  if (err instanceof ResearchAgentEditError || err instanceof TroubleshootAgentEditError) {
+    return c.json({ error: err.message, code: err.code, fields: err.fields }, 400);
+  }
   if (err instanceof UnsupportedAgentModeError) {
     // err.code, not a repeated literal — the class types it as a literal, so
     // this cannot drift from the value the client branches on.
@@ -260,6 +289,13 @@ export function mapError(c: Context, err: unknown) {
   }
   if (err instanceof AgentKindConflictError) {
     return c.json({ error: err.message, code: err.code }, 409);
+  }
+  // AI model registry W03 (Step 7A): the policy model could not be bound to a
+  // registry offering — 400 invalid_model / not_permitted / model_unavailable,
+  // 403 permission_required (W05: the WRITER lacks the offering's permission),
+  // or 503 registry_unavailable while the partner's one-time cutover is pending.
+  if (err instanceof AgentModelNotAllowedError) {
+    return c.json({ error: err.message, code: err.code }, err.status);
   }
   // Membership-validation failure on recipients (services/aiAgents/recipients.ts):
   // actionable client error — the body names exactly which ids were refused.
@@ -301,6 +337,9 @@ export function mapError(c: Context, err: unknown) {
   // Letting it propagate rolls the transaction back and puts it in front of the
   // global onError handler, which logs it and reports it to Sentry.
   if (err instanceof AgentInvariantError) throw err;
+  if (err instanceof AgentSiteCeilingDeniedError) {
+    return c.json({ error: err.message }, 403);
+  }
   if (err instanceof AgentAccessDeniedError) {
     return c.json({ error: err.message }, 404);
   }
@@ -542,9 +581,11 @@ aiAgentsRoutes.get('/tool-catalog', scopes, requireAiRead, async (c) => {
 /**
  * Task 4 (#5049): the partner-wide baseline's tool ceiling for one `kind`,
  * projected for the create/edit form so an org-scoped caller can see what a
- * new org row would be capped to WITHOUT being able to read the partner row
- * itself (`effectivePolicy.ts:341-350` — an org token carries a partnerId but
- * never passes `breeze_has_partner_access`). A partner-scope caller gets the
+ * new org row would be capped to. The org token reads its own partner's
+ * baseline in its own DB context through the SELECT-only
+ * `ai_agents_partner_wide_select` branch (#5199); only the two allowlists and
+ * the authorized script ids leave `loadPartnerBaselineCeiling`, never the rest
+ * of the partner row. A partner-scope caller gets the
  * same projection when editing/creating an ORG-owned row for its own
  * partner — a partner token CAN read its own partner rows directly, so this
  * exposes nothing new; `loadPartnerBaselineCeiling` just saves it a second
@@ -656,10 +697,8 @@ export const AI_AGENT_GRADUATION_BY_ORG_BATCH = 25;
  * can explain why Promote is disabled.
  *
  * With `orgId`: the effective agent is resolved SERVER-SIDE via
- * `resolveEffectiveAgentSystem` — an org token carries a `partnerId` but
- * never passes `breeze_has_partner_access`, so it cannot read the partner
- * baseline row itself (`effectivePolicy.ts:341-350`) — never an id supplied
- * on the query string. `ownerScope` reports `'organization'` only when THIS
+ * `resolveEffectiveAgentSystem` after the `canAccessOrg` gate — never an id
+ * supplied on the query string. `ownerScope` reports `'organization'` only when THIS
  * org has its own active `ai_agents` row for `kind` (an override); every
  * other org rides the partner baseline and reports `'partner'`.
  *
@@ -1012,8 +1051,7 @@ aiAgentsRoutes.post(
     let candidates = rows;
     if (kind !== undefined) {
       // Server-side resolution, never a caller-supplied agent id — the same
-      // rule GET /graduation states: an org token carries a partnerId but
-      // cannot read the partner baseline row itself.
+      // rule GET /graduation states.
       const resolved = await resolveEffectiveAgentSystem(orgId, kind);
       if (!resolved) {
         return c.json({ error: 'No active agent policy for this organization/kind' }, 404);
@@ -1392,6 +1430,15 @@ aiAgentsRoutes.get('/runs/:runId', scopes, requireAiRead, async (c) => {
       agentName: aiAgents.name,
       agentKind: aiAgents.kind,
       deviceHostname: devices.hostname,
+      // W07 "Wisp for <user>" provenance. Joined under the REQUEST db context:
+      // if RLS hides the grant row, grantorUserId is null and the DTO's `wisp`
+      // is null (we cannot name a grantor we cannot see). The partner SELECT
+      // branch on wisp_grants admits the partner's own users.
+      grantId: aiAgentRuns.grantId,
+      requestedByRunId: aiAgentRuns.requestedByRunId,
+      depth: aiAgentRuns.depth,
+      grantorUserId: wispGrants.grantorUserId,
+      grantorName: users.name,
     })
     .from(aiAgentRuns)
     // LEFT, not INNER — same residual RLS-visibility gap as `GET /runs` above.
@@ -1402,6 +1449,8 @@ aiAgentsRoutes.get('/runs/:runId', scopes, requireAiRead, async (c) => {
     // 404ing (see buildRunTrace's `agent: RunTraceAgentInput | null` param).
     .leftJoin(aiAgents, eq(aiAgentRuns.agentId, aiAgents.id))
     .leftJoin(devices, eq(aiAgentRuns.deviceId, devices.id))
+    .leftJoin(wispGrants, eq(aiAgentRuns.grantId, wispGrants.id))
+    .leftJoin(users, eq(wispGrants.grantorUserId, users.id))
     .where(and(
       eq(aiAgentRuns.id, runId),
       auth.orgCondition(aiAgentRuns.orgId),
@@ -1445,20 +1494,15 @@ aiAgentsRoutes.get('/runs/:runId', scopes, requireAiRead, async (c) => {
   // it. TWO org predicates: the run's OWN org pins the read, and the caller's
   // condition stays as defence-in-depth beside RLS — same posture as the
   // batched hostname read below.
-  const intentRows = await db
-    .select({
-      id: actionIntents.id,
-      status: actionIntents.status,
-      actionName: actionIntents.actionName,
-      approvalScope: actionIntents.approvalScope,
-      decidedVia: actionIntents.decidedVia,
-    })
-    .from(actionIntents)
-    .where(and(
-      eq(actionIntents.requestingAgentRunId, run.id),
-      eq(actionIntents.orgId, run.orgId),
-      auth.orgCondition(actionIntents.orgId),
-    ));
+  //
+  // W2 #11085: plus the caller's own pending approval row per intent
+  // (selectRunIntentsForCaller's header).
+  const intentRows = await selectRunIntentsForCaller({
+    runId: run.id,
+    runOrgId: run.orgId,
+    userId: auth.user.id,
+    orgCondition: auth.orgCondition(actionIntents.orgId),
+  });
 
   // Phase 2 wave P2-2 (scheduled sweeps), Task A7 — a sweep run is
   // device-less but its findings each name one device, so the detail needs
@@ -1500,8 +1544,8 @@ aiAgentsRoutes.get('/runs/:runId', scopes, requireAiRead, async (c) => {
   // carries the full rendered markdown, which the run-detail DTO deliberately
   // does not ship. Skipped entirely for every run that links no artifact.
   //
-  // The join to `reports` is what carries the tenancy: `report_runs` has no
-  // `org_id` of its own, so the org pin lives on its parent definition. Both
+  // The join to `reports` pins the org on the parent definition (report_runs
+  // also carries the same owner since #4247, enforced by composite FKs). Both
   // predicates are load-bearing for the same reason the hostname read's two
   // are — `eq(reports.orgId, run.orgId)` pins the artifact to the RUN's org
   // (a partner-scoped caller's accessible set spans siblings), and
@@ -2054,19 +2098,34 @@ aiAgentsRoutes.post(
     const id = uuidParam(c, 'id');
     if (!id) return c.json({ error: 'Agent not found' }, 404);
 
-    const agent = await getAgent(auth, id);
-    if (!agent) return c.json({ error: 'Agent not found' }, 404);
-
     const { deviceId } = c.req.valid('json');
-    const access = await verifyDeviceAccess(deviceId, auth);
-    if ('error' in access) return c.json({ error: access.error }, 404);
+
+    // #7943 — self-managed DB context (SELF_MANAGED_DB_CONTEXT_ROUTES): no
+    // request transaction is held. `createAndEnqueueAgentRun` opens its own
+    // system transaction(s) and enqueues after they commit; under the ambient
+    // request transaction every manual run pinned a second pooled connection
+    // for the whole admission (#2417 / #6671). So the phases are sequential,
+    // never nested: both authorization reads run in ONE short caller-scoped
+    // context (dbAccessContextFromAuth: the same tenant scope the request
+    // transaction carried — a foreign agent or device is simply not found;
+    // only the user id is withheld for ai_agent / service-principal callers),
+    // it commits, and only then does admission run with nothing held.
+    const authz = await withAuthDbAccessContext(auth, async () => {
+      const agent = await getAgent(auth, id);
+      if (!agent) return { error: 'Agent not found' } as const;
+      const access = await verifyDeviceAccess(deviceId, auth);
+      if ('error' in access) return { error: access.error } as const;
+      return { agent, device: access.device } as const;
+    });
+    if ('error' in authz) return c.json({ error: authz.error }, 404);
+    const { agent, device } = authz;
 
     // Every outcome below is audited: `createAndEnqueueAgentRun` writes no audit
     // row of its own, so this closure is the only record of which human asked
     // for autonomous work on this device — including when the answer was "no".
     const auditTrigger = (result: 'success' | 'failure', details: Record<string, unknown>) => {
       writeRouteAudit(c, {
-        orgId: access.device.orgId,
+        orgId: device.orgId,
         action: 'ai_agent.run.manual_trigger',
         resourceType: 'ai_agent',
         resourceId: agent.id,
@@ -2094,7 +2153,7 @@ aiAgentsRoutes.post(
     // Runs belong to the device's organization, never the agent's: a visible
     // partner-wide agent has no orgId of its own.
     const result = await createAndEnqueueAgentRun({
-      orgId: access.device.orgId,
+      orgId: device.orgId,
       kind: agent.kind,
       triggerKind: 'manual',
       deviceId,
@@ -2136,6 +2195,8 @@ aiAgentsRoutes.post(
   async (c) => {
     const auth = c.get('auth');
     const body = c.req.valid('json');
+    const partnerGroupIds = await findPartnerOwnedGroupIds(body.triggers?.deviceGroupIds ?? []);
+    if (partnerGroupIds.length > 0) return c.json(partnerGroupTargetRefusal(partnerGroupIds), 400);
     let owner: { orgId: string | null; partnerId: string | null };
 
     if (body.ownerScope === 'partner') {
@@ -2156,7 +2217,7 @@ aiAgentsRoutes.post(
 
     try {
       const row = await createAgent(auth, owner, body);
-      return c.json({ data: mapRow(row) }, 201);
+      return c.json({ data: mapRow(row), ...(await flowToolSaveWarnings(row)) }, 201);
     } catch (err) {
       return mapError(c, err);
     }
@@ -2175,8 +2236,10 @@ aiAgentsRoutes.patch(
     const id = uuidParam(c, 'id');
     if (!id) return c.json({ error: 'Agent not found' }, 404);
     try {
+      const partnerGroupIds = await findPartnerOwnedGroupIds(body.triggers?.deviceGroupIds ?? []);
+      if (partnerGroupIds.length > 0) return c.json(partnerGroupTargetRefusal(partnerGroupIds), 400);
       const row = await updateAgent(auth, id, body);
-      return c.json({ data: mapRow(row) });
+      return c.json({ data: mapRow(row), ...(await flowToolSaveWarnings(row)) });
     } catch (err) {
       return mapError(c, err);
     }

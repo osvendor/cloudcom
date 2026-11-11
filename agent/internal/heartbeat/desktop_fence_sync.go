@@ -12,7 +12,7 @@ import (
 	"github.com/breeze-rmm/agent/internal/websocket"
 )
 
-// SEC-038 W05 — the agent half of the fence resync.
+// The agent half of the fence resync.
 //
 // The durable fence (desktop_fence.go) refuses a generation-carrying start for
 // any session it has not confirmed with the control plane IN THIS PROCESS.
@@ -129,6 +129,11 @@ func (h *Heartbeat) applyDesktopFenceAnswer(msg websocket.RevocationLeaseMessage
 			Terminal: msg.TerminationPhase != "" && msg.TerminationPhase != "none",
 			Nonce:    msg.SyncNonce,
 		})
+	}
+	// A session the control plane says is over must not keep a consent
+	// prompt up for a start that can no longer run.
+	if !msg.Unavailable && h.desktopStartFence.isTerminal(msg.SessionID) {
+		withdrawConsentPrompt(msg.SessionID)
 	}
 }
 
@@ -273,6 +278,14 @@ func (h *Heartbeat) desktopSessionTerminalAfterStart(sessionID string) bool {
 	}
 	log.Warn("a terminal decision landed while this desktop start was in flight; tearing it down",
 		"sessionId", sessionID)
+	h.teardownStartedDesktop(sessionID)
+	return true
+}
+
+// teardownStartedDesktop stops a desktop session whose start completed but
+// must not stand (a terminal decision landed mid-start, or its consent no
+// longer holds), and releases its target and leases.
+func (h *Heartbeat) teardownStartedDesktop(sessionID string) {
 	if h.sessionBroker != nil {
 		if session := h.desktopOwnerSession(sessionID); session != nil {
 			req := ipc.DesktopStopRequest{SessionID: sessionID}
@@ -292,10 +305,11 @@ func (h *Heartbeat) desktopSessionTerminalAfterStart(sessionID string) bool {
 			}
 		}
 	}
-	h.desktopMgr.StopSession(sessionID)
+	if h.desktopMgr != nil {
+		h.desktopMgr.StopSession(sessionID)
+	}
 	h.releaseDesktopLeases(sessionID)
 	h.takeDesktopTarget(sessionID)
-	return true
 }
 
 // desktopStartTombstonedError is what the refused start reports.

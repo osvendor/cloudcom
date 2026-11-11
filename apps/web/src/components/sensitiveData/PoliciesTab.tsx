@@ -2,12 +2,18 @@ import '@/lib/i18n';
 import { useState, useEffect, useCallback } from 'react';
 import { Layers, Plus, Pencil, Trash2, Globe } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { fetchWithAuth } from '../../stores/auth';
+import { fetchWithAuth, handleSessionExpired } from '../../stores/auth';
+import { runAction, handleActionError, ActionError } from '@/lib/runAction';
 import { useOrgStore } from '../../stores/orgStore';
 import { useDefaultOwnerScope } from '@/hooks/useDefaultOwnerScope';
+import { nextCronOccurrenceAt } from '@breeze/shared';
 import { DETECTION_CLASSES, DATA_TYPE_COLORS } from './constants';
+import { useSensitiveDataLabels } from './useSensitiveDataLabels';
+import SensitiveDataAccessDenied from './SensitiveDataAccessDenied';
+import { formatDateTime } from '@/lib/dateTimeFormat';
 import { ConfirmDialog } from '../shared/ConfirmDialog';
 import { showToast } from '../shared/Toast';
+import { useStableT } from '@/lib/i18n/useStableT';
 
 type Policy = {
   id: string;
@@ -30,7 +36,22 @@ type FormState = {
   scheduleType: string;
   intervalMinutes: number;
   cron: string;
+  // `schedule.enabled` as stored. The form has no control for it, so an edit
+  // sends it back unchanged — the API defaults a missing value to `true`, which
+  // would silently re-enable a paused schedule (#9683). undefined = never set.
+  scheduleEnabled?: boolean;
+  // Stored but not editable here; the API replaces `schedule` wholesale on PUT,
+  // so they must be sent back or an edit silently resets them.
+  scheduleTimezone?: string;
+  scheduleDeviceIds?: string[];
 };
+
+/** Next cron firing as a browser-local string, or null when it cannot be computed. */
+function nextCronRunLabel(cron: string, timezone?: string): string | null {
+  if (!cron.trim()) return null;
+  const iso = nextCronOccurrenceAt(cron, timezone || 'UTC');
+  return iso ? formatDateTime(iso) : null;
+}
 
 const defaultForm: FormState = {
   name: '',
@@ -43,9 +64,12 @@ const defaultForm: FormState = {
 
 export default function PoliciesTab() {
   const { t } = useTranslation('security');
+  const { dataTypeLabel } = useSensitiveDataLabels();
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   const [policies, setPolicies] = useState<Policy[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
+  const [forbidden, setForbidden] = useState(false);
 
   // Edit/Create state
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -66,10 +90,16 @@ export default function PoliciesTab() {
     try {
       setLoading(true);
       setError(undefined);
+      setForbidden(false);
       const res = await fetchWithAuth('/sensitive-data/policies');
+      if (res.status === 403) {
+        setPolicies([]);
+        setForbidden(true);
+        return;
+      }
       if (!res.ok) {
         throw new Error(
-          t('sensitiveDataPoliciesTab.errors.fetchPolicies', {
+          stableT('sensitiveDataPoliciesTab.errors.fetchPolicies', {
             defaultValue: 'Failed to fetch policies',
           }),
         );
@@ -77,15 +107,16 @@ export default function PoliciesTab() {
       const json = await res.json();
       setPolicies(json.data ?? []);
     } catch (err) {
+      setPolicies([]);
       setError(
         err instanceof Error
           ? err.message
-          : t('sensitiveDataPoliciesTab.errors.generic', { defaultValue: 'An error occurred' }),
+          : stableT('sensitiveDataPoliciesTab.errors.generic', { defaultValue: 'An error occurred' }),
       );
     } finally {
       setLoading(false);
     }
-  }, [t]);
+  }, [stableT]);
 
   useEffect(() => {
     fetchPolicies();
@@ -109,6 +140,11 @@ export default function PoliciesTab() {
       scheduleType: typeof schedule?.type === 'string' ? schedule.type : 'manual',
       intervalMinutes: typeof schedule?.intervalMinutes === 'number' ? schedule.intervalMinutes : 60,
       cron: typeof schedule?.cron === 'string' ? schedule.cron : '',
+      scheduleEnabled: typeof schedule?.enabled === 'boolean' ? schedule.enabled : undefined,
+      scheduleTimezone: typeof schedule?.timezone === 'string' && schedule.timezone ? schedule.timezone : undefined,
+      scheduleDeviceIds: Array.isArray(schedule?.deviceIds)
+        ? (schedule.deviceIds as unknown[]).filter((v): v is string => typeof v === 'string')
+        : undefined,
     });
     setShowForm(true);
   };
@@ -123,14 +159,29 @@ export default function PoliciesTab() {
     });
   };
 
+  // Every mutation goes through runAction so a failure is always toasted
+  // (#3531); the delete ConfirmDialog stays open on failure and the page
+  // `error` banner would otherwise render behind it.
+  const reportFailure = (err: unknown, fallback: string) => {
+    handleActionError(err, fallback);
+    if (err instanceof ActionError && err.status === 401) return;
+    setError(err instanceof Error ? err.message : fallback);
+  };
+
   const handleSave = async () => {
     if (!form.name.trim()) return;
     setSaving(true);
     setError(undefined);
+    const saveFallback = t('sensitiveDataPoliciesTab.errors.savePolicy', {
+      defaultValue: 'Failed to save policy',
+    });
     try {
       const schedule: Record<string, unknown> = { type: form.scheduleType };
       if (form.scheduleType === 'interval') schedule.intervalMinutes = form.intervalMinutes;
       if (form.scheduleType === 'cron') schedule.cron = form.cron;
+      if (editingId && form.scheduleEnabled !== undefined) schedule.enabled = form.scheduleEnabled;
+      if (editingId && form.scheduleTimezone) schedule.timezone = form.scheduleTimezone;
+      if (editingId && form.scheduleDeviceIds?.length) schedule.deviceIds = form.scheduleDeviceIds;
 
       const body = {
         name: form.name,
@@ -144,16 +195,11 @@ export default function PoliciesTab() {
       const url = editingId ? `/sensitive-data/policies/${editingId}` : '/sensitive-data/policies';
       const method = editingId ? 'PUT' : 'POST';
 
-      const res = await fetchWithAuth(url, { method, body: JSON.stringify(body) });
-      if (!res.ok) {
-        const json = await res.json().catch(() => ({}));
-        throw new Error(
-          json.error ||
-            t('sensitiveDataPoliciesTab.errors.savePolicy', {
-              defaultValue: 'Failed to save policy',
-            }),
-        );
-      }
+      await runAction({
+        request: () => fetchWithAuth(url, { method, body: JSON.stringify(body) }),
+        errorFallback: saveFallback,
+        onUnauthorized: handleSessionExpired,
+      });
 
       setShowForm(false);
       await fetchPolicies();
@@ -164,11 +210,7 @@ export default function PoliciesTab() {
         type: 'success',
       });
     } catch (err) {
-      setError(
-        err instanceof Error
-          ? err.message
-          : t('sensitiveDataPoliciesTab.errors.saveFailed', { defaultValue: 'Save failed' }),
-      );
+      reportFailure(err, saveFallback);
     } finally {
       setSaving(false);
     }
@@ -181,15 +223,15 @@ export default function PoliciesTab() {
   const handleConfirmDelete = async () => {
     if (!deleteTarget) return;
     setDeleting(true);
+    const fallback = t('sensitiveDataPoliciesTab.errors.deletePolicy', {
+      defaultValue: 'Failed to delete policy',
+    });
     try {
-      const res = await fetchWithAuth(`/sensitive-data/policies/${deleteTarget.id}`, { method: 'DELETE' });
-      if (!res.ok) {
-        throw new Error(
-          t('sensitiveDataPoliciesTab.errors.deletePolicy', {
-            defaultValue: 'Failed to delete policy',
-          }),
-        );
-      }
+      await runAction({
+        request: () => fetchWithAuth(`/sensitive-data/policies/${deleteTarget.id}`, { method: 'DELETE' }),
+        errorFallback: fallback,
+        onUnauthorized: handleSessionExpired,
+      });
       const deletedName = deleteTarget.name;
       setDeleteTarget(null);
       await fetchPolicies();
@@ -201,38 +243,36 @@ export default function PoliciesTab() {
         type: 'success',
       });
     } catch (err) {
-      setError(
-        err instanceof Error
-          ? err.message
-          : t('sensitiveDataPoliciesTab.errors.deleteFailed', { defaultValue: 'Delete failed' }),
-      );
+      reportFailure(err, fallback);
     } finally {
       setDeleting(false);
     }
   };
 
   const handleToggleActive = async (policy: Policy) => {
+    const fallback = t('sensitiveDataPoliciesTab.errors.updatePolicy', {
+      defaultValue: 'Failed to update policy',
+    });
     try {
-      const res = await fetchWithAuth(`/sensitive-data/policies/${policy.id}`, {
-        method: 'PUT',
-        body: JSON.stringify({ isActive: !policy.isActive }),
-      });
-      if (!res.ok) {
-        throw new Error(
-          t('sensitiveDataPoliciesTab.errors.updatePolicy', {
-            defaultValue: 'Failed to update policy',
+      await runAction({
+        request: () =>
+          fetchWithAuth(`/sensitive-data/policies/${policy.id}`, {
+            method: 'PUT',
+            body: JSON.stringify({ isActive: !policy.isActive }),
           }),
-        );
-      }
+        errorFallback: fallback,
+        onUnauthorized: handleSessionExpired,
+      });
       await fetchPolicies();
     } catch (err) {
-      setError(
-        err instanceof Error
-          ? err.message
-          : t('sensitiveDataPoliciesTab.errors.updateFailed', { defaultValue: 'Update failed' }),
-      );
+      reportFailure(err, fallback);
     }
   };
+
+  if (forbidden) return <SensitiveDataAccessDenied />;
+
+  const formCronNextRun = form.scheduleType === 'cron' ? nextCronRunLabel(form.cron, form.scheduleTimezone) : null;
+  const cronZone = form.scheduleTimezone || 'UTC';
 
   return (
     <>
@@ -339,7 +379,7 @@ export default function PoliciesTab() {
                         : 'hover:bg-muted'
                     }`}
                   >
-                    {cls.label}
+                    {dataTypeLabel(cls.value)}
                   </button>
                 ))}
               </div>
@@ -379,9 +419,14 @@ export default function PoliciesTab() {
               {form.scheduleType === 'cron' && (
                 <div>
                   <label className="text-sm font-medium">
-                    {t('sensitiveDataPoliciesTab.form.cronExpression', {
-                      defaultValue: 'Cron Expression',
-                    })}
+                    {cronZone === 'UTC'
+                      ? t('sensitiveDataPoliciesTab.form.cronExpressionUtc', {
+                          defaultValue: 'Cron Expression (UTC)',
+                        })
+                      : t('sensitiveDataPoliciesTab.form.cronExpressionZone', {
+                          defaultValue: 'Cron Expression ({{zone}})',
+                          zone: cronZone,
+                        })}
                   </label>
                   <input
                     value={form.cron}
@@ -391,6 +436,14 @@ export default function PoliciesTab() {
                     })}
                     className="mt-1 h-10 w-full rounded-md border bg-background px-3 text-sm"
                   />
+                  {formCronNextRun && (
+                    <p className="mt-1 text-xs text-muted-foreground" data-testid="sensitive-policy-cron-next-run">
+                      {t('sensitiveDataPoliciesTab.form.cronNextRun', {
+                        defaultValue: 'Next run (your local time): {{time}}',
+                        time: formCronNextRun,
+                      })}
+                    </p>
+                  )}
                 </div>
               )}
             </div>
@@ -453,8 +506,12 @@ export default function PoliciesTab() {
                     minutes: schedule.intervalMinutes,
                   })
                 : schedule?.type === 'cron'
-                  ? String(schedule.cron ?? 'cron')
+                  ? `${String(schedule.cron ?? 'cron')} (${
+                      typeof schedule.timezone === 'string' && schedule.timezone ? schedule.timezone : 'UTC'
+                    })`
                   : t('sensitiveDataPoliciesTab.schedule.manual', { defaultValue: 'Manual' });
+              const schedulePaused = schedule?.enabled === false
+                && (schedule.type === 'interval' || schedule.type === 'cron');
 
               return (
                 <tr key={policy.id} className="text-sm hover:bg-muted/20">
@@ -483,15 +540,36 @@ export default function PoliciesTab() {
                           key={cls}
                           className={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium ${DATA_TYPE_COLORS[cls] ?? ''}`}
                         >
-                          {cls}
+                          {dataTypeLabel(cls)}
                         </span>
                       ))}
                     </div>
                   </td>
-                  <td className="px-4 py-3 text-xs text-muted-foreground">{scheduleLabel}</td>
+                  <td className="px-4 py-3 text-xs text-muted-foreground">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span>{scheduleLabel}</span>
+                      {schedulePaused && (
+                        <span
+                          className="inline-flex items-center rounded-full border border-yellow-500/40 bg-yellow-500/15 px-2 py-0.5 text-xs font-medium text-yellow-700"
+                          title={t('sensitiveDataPoliciesTab.schedule.pausedTitle', {
+                            defaultValue: 'Scheduling is turned off for this policy, so it will not run automatically',
+                          })}
+                          data-testid="sensitive-policy-schedule-paused"
+                        >
+                          {t('sensitiveDataPoliciesTab.schedule.paused', { defaultValue: 'Paused' })}
+                        </span>
+                      )}
+                    </div>
+                  </td>
                   <td className="px-4 py-3">
                     <button
                       type="button"
+                      role="switch"
+                      aria-checked={policy.isActive}
+                      aria-label={t('sensitiveDataLabels.a11y.togglePolicyActive', {
+                        defaultValue: 'Active: {{name}}',
+                        name: policy.name,
+                      })}
                       onClick={() => handleToggleActive(policy)}
                       className={`relative inline-flex h-6 w-11 items-center rounded-full border transition ${policy.isActive ? 'bg-emerald-500/80' : 'bg-muted'}`}
                     >
@@ -503,6 +581,8 @@ export default function PoliciesTab() {
                       <button
                         type="button"
                         onClick={() => openEdit(policy)}
+                        aria-label={t('sensitiveDataLabels.a11y.editPolicy', { defaultValue: 'Edit policy {{name}}', name: policy.name })}
+                        title={t('sensitiveDataLabels.a11y.editPolicy', { defaultValue: 'Edit policy {{name}}', name: policy.name })}
                         className="inline-flex h-8 w-8 items-center justify-center rounded-md border hover:bg-muted"
                       >
                         <Pencil className="h-4 w-4" />
@@ -510,6 +590,8 @@ export default function PoliciesTab() {
                       <button
                         type="button"
                         onClick={() => handleDelete(policy)}
+                        aria-label={t('sensitiveDataLabels.a11y.deletePolicy', { defaultValue: 'Delete policy {{name}}', name: policy.name })}
+                        title={t('sensitiveDataLabels.a11y.deletePolicy', { defaultValue: 'Delete policy {{name}}', name: policy.name })}
                         className="inline-flex h-8 w-8 items-center justify-center rounded-md border text-destructive hover:bg-destructive/10"
                       >
                         <Trash2 className="h-4 w-4" />

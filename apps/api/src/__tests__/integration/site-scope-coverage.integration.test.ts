@@ -60,6 +60,26 @@ import {
 // tracked for a follow-up sweep; see the audit narrative referenced by the
 // SP2 launch-readiness plan.
 const SITE_SCOPE_EXEMPT_HANDLERS: ReadonlySet<string> = new Set<string>([
+  // Security scan start (#6263 W05 PR A): the handler delegates to
+  // services/securityScanStart.ts `startDeviceScan`, which is shared with the AI
+  // `security_scan scan` action and applies the gate itself (device org check +
+  // `canAccessSite(userPerms, device.siteId)` → 403). The static scan cannot see
+  // through the service call; the gate is unit-tested in securityScanStart.test.ts.
+  'routes/security/scans.ts:POST /scan/:deviceId',
+  // Customer-portal hardware health (#7731): the caller is a portal user bound to
+  // ONE customer org (orgId comes from portalAuth, never the request) and portal
+  // users have no site scope. The read model filters devices by that orgId, so a
+  // site gate would be dead code; same reasoning as routes/portal/assets.ts.
+  'routes/portal/hardwareHealth.ts:GET /hardware-health/devices/:deviceId',
+  // Customer-portal hardware inventory (#7732): same reasoning as hardware health
+  // above. The caller is a portal user bound to ONE customer org (orgId from
+  // portalAuth, never the request), portal users have no site scope, and the read
+  // model filters devices by that orgId.
+  'routes/portal/hardwareInventory.ts:GET /hardware-inventory/devices/:deviceId',
+  'routes/portal/performance.ts:GET /performance/devices/:deviceId',
+  // Portal session binds one org; portal users have no technician site scope.
+  'routes/portal/software.ts:GET /software/devices/:deviceId',
+  'routes/portal/patches.ts:GET /patches/devices/:deviceId',
   // -- routes/snmp -----------------------------------------------------------
   // Deprecated SNMP metric/threshold endpoints — every handler is a 4-line
   // stub that returns the deprecation payload (HTTP 410) and never reaches a
@@ -147,6 +167,14 @@ const SITE_SCOPE_INPUT_EXEMPT: ReadonlySet<string> = new Set<string>([
   // (requirePartnerApiScope) — no user permissions context; results are
   // clamped to the principal's partner-accessible orgs by the export query.
   'routes/partnerApi/devices.ts:GET /devices',
+  // Partner alerts feed (alerts:read): same machine service-principal auth, no
+  // user permissions/allowedSiteIds context; rows clamped to the principal's
+  // accessible orgs, device/rule/monitor/episode ids ownership-checked.
+  'routes/partnerApi/alerts.ts:GET /alerts',
+  // Partner device-status feed (device-status:read, #7577): same machine
+  // service-principal auth, no user permissions/allowedSiteIds context; rows
+  // clamped to the principal's accessible orgs, siteId is only a filter.
+  'routes/partnerApi/deviceStatus.ts:GET /device-status',
   // Helper-token path (helperAuth on all helperRoutes): no user permissions
   // context, and the session lookup is pinned to the token's own device row
   // (eq(aiSessions.deviceId, device.id)) before any write. (W7 #2637.)
@@ -166,9 +194,7 @@ const SITE_SCOPE_INPUT_EXEMPT: ReadonlySet<string> = new Set<string>([
   'routes/agents/connections.ts:PUT /:id/connections',
   'routes/agents/elevationRequests.ts:POST /:id/elevation-requests',
   'routes/agents/enrollment.ts:POST /enroll',
-  'routes/agents/inventory.ts:PUT /:id/disks',
   'routes/agents/inventory.ts:PUT /:id/hardware',
-  'routes/agents/inventory.ts:PUT /:id/network',
   'routes/agents/inventory.ts:PUT /:id/warranty-info',
   // Agent-token mTLS renewal confirm (Wave 5 Task 4/6). The atomic
   // activate+demote writes device_mtls_certificates and devices.mtls_cert_*
@@ -182,6 +208,17 @@ const SITE_SCOPE_INPUT_EXEMPT: ReadonlySet<string> = new Set<string>([
   // `eq(…, device.id)` for the agent authenticated by agentBearerAuthMiddleware.
   // Surfaced by #4019 — the writes sit well past the old 4000-byte window.
   'routes/agents/mtls.ts:POST /renew-cert',
+  // Agent-token route (requireAgentRole + agentAuthMiddleware on '/:id/*'); the
+  // device is the authenticated agent's own (c.get('agent').deviceId, :id is never
+  // read), so no user input selects devices.
+  'routes/agents/messageEvents.ts:POST /:id/message-events',
+  // Agent-token security-status ingest (requireAgentRole + agentAuthMiddleware
+  // on agentRoutes '/:id/*'). #4340's change-only audit added a pre-read of
+  // `securityStatus` keyed on `device.id`, where `device` is resolved from the
+  // authenticated agent's own `:id` (token hash bound to that agentId). No
+  // user session, no caller-supplied device selector, so allowedSiteIds never
+  // applies.
+  'routes/agents/security.ts:PUT /:id/security/status',
   'routes/agents/sessions.ts:PUT /:id/sessions',
   'routes/agents/state.ts:PUT /:id/config-state',
   'routes/agents/state.ts:PUT /:id/registry-state',
@@ -192,6 +229,11 @@ const SITE_SCOPE_INPUT_EXEMPT: ReadonlySet<string> = new Set<string>([
   // helperAuth device-token path; query pinned to the caller's own device via
   // eq(aiSessions.deviceId, device.id) (#2637 client-declared tool results).
   'routes/helper/index.ts:POST /chat/sessions/:id/tool-results',
+  // helperAuth device-token path: the optional sessionId ownership check is
+  // pinned to the token's own device (eq(aiSessions.deviceId, device.id)) and
+  // the screenshot is stored against device.id from the token, never a
+  // caller-supplied device selector.
+  'routes/helper/index.ts:POST /screenshots',
   'routes/tunnels.ts:GET /desktop-access',
   'routes/tunnels.ts:POST /downgrade-to-vnc',
   'routes/tunnels.ts:POST /upgrade-to-webrtc',
@@ -238,12 +280,18 @@ const SITE_SCOPE_INPUT_EXEMPT: ReadonlySet<string> = new Set<string>([
   // apply site scope directly (RMM-QA-221), as do the earlier metrics fixes.
   'routes/huntress.ts:GET /status',
   'routes/updateRings.ts:GET /:id/compliance',
-  // Org-scoped compliance list, identical posture to its sibling routes
-  // (/firewall, /trends) which resolve rows through the same org-scoped
-  // listStatusRows helper. Flagged only because the recovery-key escrow
-  // enrichment references deviceRecoveryKeys.deviceId inline — and that
-  // lookup is constrained (inArray) to the device ids listStatusRows already
-  // resolved, so it discloses no device beyond the caller's accessible orgs.
+  // Same posture (#11039): requireScope('partner', 'system') at partner.ts:154
+  // refuses organization scope, the only scope that carries allowedSiteIds
+  // (auth.ts:859), and the rollups read only orgs that scope may already see.
+  // partner.test.ts pins the 403 for a site-restricted organization-scope caller.
+  'routes/partner.ts:GET /dashboard',
+  // Compliance list, identical posture to its sibling routes (/firewall,
+  // /password-policy) which resolve rows through the same listStatusRows
+  // helper — org-scoped and narrowed in SQL to the caller's allowed sites.
+  // Flagged only because the recovery-key escrow enrichment references
+  // deviceRecoveryKeys.deviceId inline — and that lookup is constrained
+  // (inArray) to the device ids listStatusRows already resolved, so it
+  // discloses no device beyond the caller's accessible orgs and sites.
   'routes/security/compliance.ts:GET /encryption',
   // ---- Newly VISIBLE to the widened detector (#4019); posture unchanged.
   // Public bare-metal-recovery bootstrap (mounted on `bmrPublicRoutes`, BEFORE
@@ -254,14 +302,6 @@ const SITE_SCOPE_INPUT_EXEMPT: ReadonlySet<string> = new Set<string>([
   // supplies no device selector. Its device access sits past the old byte
   // window.
   'routes/backup/bmr.ts:POST /bmr/recover/authenticate',
-  // Org record-page overview: partner/system scope only, gated on ORGS_READ +
-  // auth.canAccessOrg(id), and the `devices` read is a pure aggregate
-  // (count(*) FILTER …) over `eq(devices.orgId, id)` — no per-device rows are
-  // returned, so no cross-site device is disclosed. Same posture as the
-  // org-wide aggregates above; site-scoping the totals themselves remains the
-  // same separate product call. Its `devices` block sits past the old window
-  // (the handler is a long chain of per-permission aggregate blocks).
-  'routes/orgSummary.ts:GET /organizations/:id/summary',
 ]);
 
 // SITE_SCOPE_INPUT_EXEMPT entries that ARE reached via the user `authMiddleware`
@@ -297,16 +337,16 @@ const SITE_SCOPE_INPUT_EXEMPT_USER_SESSION_OK: ReadonlySet<string> = new Set<str
   // Partner/system-only aggregates use user auth but cannot be reached by
   // organization site-restricted roles; see SITE_SCOPE_INPUT_EXEMPT above.
   'routes/huntress.ts:GET /status',
-  // Newly visible to the widened detector (#4019). Neither references a
-  // non-user auth guard token in its file (orgSummary uses plain authMiddleware;
-  // bmr's public router has no auth middleware at all), so both are recorded
-  // here as deliberate exceptions; reasons in SITE_SCOPE_INPUT_EXEMPT above.
+  'routes/partner.ts:GET /dashboard',
+  // Newly visible to the widened detector (#4019). bmr's public router has no
+  // auth middleware at all, so it is recorded here as a deliberate exception;
+  // reasons in SITE_SCOPE_INPUT_EXEMPT above. (orgSummary left this list when
+  // W18 PR A rewrote the handler — #6789.)
   'routes/backup/bmr.ts:POST /bmr/recover/authenticate',
-  'routes/orgSummary.ts:GET /organizations/:id/summary',
   'routes/updateRings.ts:GET /:id/compliance',
-  // Org-scoped compliance list (see note in SITE_SCOPE_INPUT_EXEMPT). Reached
-  // via user auth (requireScope) but exempt because the escrow enrichment is
-  // constrained to the org-scoped device set listStatusRows already resolved.
+  // Compliance list (see note in SITE_SCOPE_INPUT_EXEMPT). Reached via user
+  // auth (requireScope) but exempt because the escrow enrichment is constrained
+  // to the org- and site-scoped device set listStatusRows already resolved.
   'routes/security/compliance.ts:GET /encryption',
 ]);
 

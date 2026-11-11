@@ -5,8 +5,9 @@ package heartbeat
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
+
+	"github.com/breeze-rmm/agent/internal/procspawn"
 )
 
 // installAndRestartWatchdog downloads the verified watchdog binary, swaps it in
@@ -20,11 +21,15 @@ func (h *Heartbeat) installAndRestartWatchdog(targetVersion string) error {
 	}
 	defer func() { _ = os.Remove(tempPath) }()
 
-	if err := replaceWatchdogBinaryUnix(tempPath, watchdogBinaryPathUnix); err != nil {
+	dest, err := watchdogBinaryPath()
+	if err != nil {
+		return fmt.Errorf("resolve watchdog binary path: %w", err)
+	}
+	if err := replaceWatchdogBinaryUnix(tempPath, dest); err != nil {
 		return err
 	}
 
-	if out, err := exec.Command("systemctl", "restart", "breeze-watchdog").CombinedOutput(); err != nil {
+	if out, err := procspawn.Command("systemctl", "restart", "breeze-watchdog").CombinedOutput(); err != nil {
 		return fmt.Errorf("systemctl restart breeze-watchdog: %s: %w", strings.TrimSpace(string(out)), err)
 	}
 	return nil

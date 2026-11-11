@@ -12,6 +12,13 @@ vi.mock('../../stores/auth', () => ({
   fetchWithAuth: vi.fn(),
 }));
 
+// The live session list (GET /devices/:id/sessions/live) needs devices:execute
+// or remote:access; the default grants cover it.
+const perms = vi.hoisted(() => ({ granted: new Set<string>(['scripts:execute', 'devices:read', 'devices:execute']) }));
+vi.mock('../../lib/permissions', () => ({
+  usePermissions: () => ({ permissions: [], can: (r: string, a: string) => perms.granted.has(`${r}:${a}`) }),
+}));
+
 const fetchWithAuthMock = vi.mocked(fetchWithAuth);
 
 const makeJsonResponse = (payload: unknown, ok = true, status = ok ? 200 : 500): Response =>
@@ -387,6 +394,30 @@ describe('ScriptPickerModal sourced parameters (#3409 PR3)', () => {
 describe('ScriptPickerModal session targeting', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    perms.granted = new Set(['scripts:execute', 'devices:read', 'devices:execute']);
+  });
+
+  it('does not ask the device for its live sessions without devices:execute or remote:access', async () => {
+    routeFetchMock();
+    const liveCalls = () => fetchWithAuthMock.mock.calls.filter(([url]) => String(url).endsWith('/sessions/live'));
+    const renderUserRun = () => {
+      const view = render(
+        <ScriptPickerModal isOpen onClose={vi.fn()} onSelect={vi.fn()} deviceHostname="rds-01"
+          deviceOs="windows" deviceId="dev-1" helperLifecycleMode="on-demand" />
+      );
+      fireEvent.change(screen.getByTestId('script-run-as'), { target: { value: 'user' } });
+      return view;
+    };
+
+    perms.granted = new Set(['scripts:execute', 'devices:read']);
+    const first = renderUserRun();
+    await waitFor(() => expect(screen.getByTestId('script-session-target')).toBeDefined());
+    expect(liveCalls()).toHaveLength(0);
+    first.unmount();
+
+    perms.granted = new Set(['scripts:execute', 'devices:read', 'remote:access']);
+    renderUserRun();
+    await waitFor(() => expect(liveCalls()).toHaveLength(1));
   });
 
   it('shows the session dropdown only for runAs=user on an on-demand device', async () => {
@@ -573,5 +604,38 @@ describe('ScriptPickerModal accessible labels', () => {
     await waitFor(() => expect(screen.getByTestId('script-session-target')).toBeDefined());
 
     expect(screen.getByLabelText('Target session')).toBe(screen.getByTestId('script-session-target'));
+  });
+});
+
+// #9935 — importing a catalog (system) script makes an org copy with the same
+// name; the picker lists both, so each row has to say where it comes from.
+describe('ScriptPickerModal source badge (#9935)', () => {
+  const DUPLICATE_NAME_SCRIPTS = [
+    { id: 'sys-1', name: 'Flush DNS Cache', language: 'powershell', category: 'Network', osTypes: ['windows'], isSystem: true, orgId: null, partnerId: null },
+    { id: 'org-1', name: 'Flush DNS Cache', language: 'powershell', category: 'Network', osTypes: ['windows'], isSystem: false, orgId: 'org-a', partnerId: null },
+    { id: 'ptn-1', name: 'Flush DNS Cache', language: 'powershell', category: 'Network', osTypes: ['windows'], isSystem: false, orgId: null, partnerId: 'partner-a' },
+  ];
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    fetchWithAuthMock.mockResolvedValue(makeJsonResponse(DUPLICATE_NAME_SCRIPTS));
+  });
+
+  it('labels the catalog script and its imported copies with distinct source badges', async () => {
+    render(<ScriptPickerModal isOpen onClose={vi.fn()} onSelect={vi.fn()} />);
+
+    const system = await screen.findByTestId('script-source-badge-sys-1');
+    expect(system.textContent).toBe('System');
+    expect(screen.getByTestId('script-source-badge-org-1').textContent).toBe('Organization');
+    expect(screen.getByTestId('script-source-badge-ptn-1').textContent).toBe('Partner-wide');
+    // The badge sits inside the row it describes.
+    expect(screen.getByTestId('script-picker-row-sys-1').contains(system)).toBe(true);
+  });
+
+  it('shows no badge when the row carries no ownership fields', async () => {
+    fetchWithAuthMock.mockResolvedValue(makeJsonResponse(SCRIPTS_DATA));
+    render(<ScriptPickerModal isOpen onClose={vi.fn()} onSelect={vi.fn()} />);
+    await screen.findByTestId('script-picker-row-p1');
+    expect(screen.queryByTestId('script-source-badge-p1')).toBeNull();
   });
 });

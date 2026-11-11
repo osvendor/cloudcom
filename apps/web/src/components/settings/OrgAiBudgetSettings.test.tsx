@@ -106,6 +106,7 @@ describe('OrgAiBudgetSettings — partner locks', () => {
         'aiBudgets.enabled', 'aiBudgets.monthlyBudgetCents', 'aiBudgets.dailyBudgetCents',
         'aiBudgets.maxTurnsPerSession', 'aiBudgets.messagesPerMinutePerUser',
         'aiBudgets.messagesPerHourPerOrg', 'aiBudgets.approvalMode', 'aiBudgets.alertThresholdPercents',
+        'aiBudgets.toolRateLimitMultiplier',
       ],
     );
     const { findByTestId } = renderTab();
@@ -278,5 +279,167 @@ describe('OrgAiBudgetSettings — save failures are surfaced', () => {
     // The form is still editable and still holds what the user typed — a
     // failed save must not look like a successful one.
     expect((getByTestId('org-ai-budget-monthly') as HTMLInputElement).value).toBe('25');
+  });
+});
+
+describe('OrgAiBudgetSettings — per-tool rate-limit multiplier (#6476)', () => {
+  it('renders empty with a "Default (1)" placeholder when inherited', async () => {
+    mockEffective({ ...DEFAULT_BUDGET, toolRateLimitMultiplier: 1 });
+    const { findByTestId } = renderTab();
+
+    const input = (await findByTestId('org-ai-budget-tool-rate-limit-multiplier')) as HTMLInputElement;
+    expect(input.value).toBe('');
+    expect(input.placeholder).toBe('Default (1)');
+    expect(input.min).toBe('1');
+    expect(input.max).toBe('10');
+  });
+
+  it('sends the multiplier when the user sets it', async () => {
+    mockEffective({ ...DEFAULT_BUDGET, toolRateLimitMultiplier: 1 });
+    const { findByTestId, getByTestId } = renderTab();
+
+    const input = (await findByTestId('org-ai-budget-tool-rate-limit-multiplier')) as HTMLInputElement;
+    fireEvent.change(input, { target: { value: '3' } });
+    fireEvent.click(getByTestId('org-ai-budget-save'));
+
+    await waitFor(() => expect(budgetPut().body).toEqual({ toolRateLimitMultiplier: 3 }));
+  });
+
+  it('is disabled and never sent when the partner locks it', async () => {
+    mockEffective({ ...DEFAULT_BUDGET, toolRateLimitMultiplier: 2 }, ['aiBudgets.toolRateLimitMultiplier']);
+    const { findByTestId, getByTestId } = renderTab();
+
+    const input = (await findByTestId('org-ai-budget-tool-rate-limit-multiplier')) as HTMLInputElement;
+    expect(input.disabled).toBe(true);
+    expect(input.value).toBe('2');
+    expect(getByTestId('org-ai-budget-locked-toolRateLimitMultiplier').textContent).toContain('Managed by partner');
+  });
+
+  it('highlights the field and shows its readable message on an out-of-range 400 (sweep E2)', async () => {
+    fetchWithAuth.mockImplementation((url: string, init?: RequestInit) => {
+      if (url === '/orgs/organizations/org-1/effective-settings' && !init) {
+        return Promise.resolve(jsonRes({ effective: { aiBudgets: { ...DEFAULT_BUDGET, toolRateLimitMultiplier: 1 } }, locked: [] }));
+      }
+      return Promise.resolve(jsonRes({
+        error: 'toolRateLimitMultiplier: Too big: expected number to be <=10',
+        details: {
+          formErrors: [],
+          fieldErrors: { toolRateLimitMultiplier: ['Too big: expected number to be <=10'] },
+        },
+      }, 400));
+    });
+    const { findByTestId, getByTestId } = renderTab();
+
+    const input = (await findByTestId('org-ai-budget-tool-rate-limit-multiplier')) as HTMLInputElement;
+    fireEvent.change(input, { target: { value: '15' } });
+    fireEvent.click(getByTestId('org-ai-budget-save'));
+
+    // The field itself is marked invalid and carries its own readable text —
+    // not the raw `toolRateLimitMultiplier: …` key.
+    await waitFor(() => expect(input.getAttribute('aria-invalid')).toBe('true'));
+    expect(input.className).toContain('border-destructive');
+    expect(getByTestId('org-ai-budget-error-toolRateLimitMultiplier').textContent).toBe(
+      'Too big: expected number to be <=10',
+    );
+
+    // sweep F8: the toast must not lead with the raw field-path key either.
+    await waitFor(() =>
+      expect(showToast).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'error', message: 'Too big: expected number to be <=10' }),
+      ),
+    );
+    expect(
+      (vi.mocked(showToast).mock.calls as Array<[{ message: string }]>).some(([arg]) =>
+        arg.message.startsWith('toolRateLimitMultiplier:'),
+      ),
+    ).toBe(false);
+
+    // Editing the field again clears the highlight.
+    fireEvent.change(input, { target: { value: '5' } });
+    expect(input.getAttribute('aria-invalid')).toBeNull();
+  });
+});
+
+describe('OrgAiBudgetSettings — approval mode has its own card, not the budget card', () => {
+  it('the budget card has no approval-mode control', async () => {
+    mockEffective({ ...DEFAULT_BUDGET });
+    const { findByTestId, queryByTestId } = renderTab();
+
+    await findByTestId('org-ai-budget-monthly');
+    expect(queryByTestId('org-ai-budget-approval-mode')).toBeNull();
+    expect(queryByTestId('org-ai-approval-mode')).toBeNull();
+  });
+
+  it('the approvals section renders only the approval mode and saves only it', async () => {
+    mockEffective({ ...DEFAULT_BUDGET });
+    const { container, ...q } = render(<OrgAiBudgetSettings orgId="org-1" section="approvals" />);
+    const scoped = within(container);
+
+    const select = (await scoped.findByTestId('org-ai-approval-mode')) as HTMLSelectElement;
+    expect(scoped.queryByTestId('org-ai-budget-monthly')).toBeNull();
+    expect(scoped.queryByTestId('org-ai-budget-enabled')).toBeNull();
+    void q;
+
+    fireEvent.change(select, { target: { value: 'auto_approve' } });
+    fireEvent.click(scoped.getByTestId('org-ai-approval-mode-save'));
+
+    await waitFor(() => expect(budgetPut().body).toEqual({ approvalMode: 'auto_approve' }));
+  });
+
+  it('a partner-locked approval mode links to the partner AI approvals tab', async () => {
+    mockEffective({ ...DEFAULT_BUDGET, approvalMode: 'action_plan' }, ['aiBudgets.approvalMode']);
+    const { container } = render(<OrgAiBudgetSettings orgId="org-1" section="approvals" />);
+    const scoped = within(container);
+
+    const select = (await scoped.findByTestId('org-ai-approval-mode')) as HTMLSelectElement;
+    expect(select.disabled).toBe(true);
+    const note = scoped.getByTestId('org-ai-budget-locked-approvalMode');
+    expect(within(note).getByRole('link').getAttribute('href')).toBe('/settings/partner#ai-approvals');
+    expect(within(note).getByRole('link').textContent).toBe('AI Approvals');
+    expect((scoped.getByTestId('org-ai-approval-mode-save') as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  // PUT /ai/budget has no null for approvalMode, so "Default" cannot clear an
+  // org-set mode; offering it would toast "saved" and snap back.
+  it('an org-set approval mode does not offer the Default option it cannot save', async () => {
+    mockEffective({ ...DEFAULT_BUDGET, approvalMode: 'auto_approve' });
+    const { container } = render(<OrgAiBudgetSettings orgId="org-1" section="approvals" />);
+    const scoped = within(container);
+
+    const select = (await scoped.findByTestId('org-ai-approval-mode')) as HTMLSelectElement;
+    expect(select.value).toBe('auto_approve');
+    const defaultOption = Array.from(select.options).find((o) => o.value === '');
+    expect(defaultOption?.disabled).toBe(true);
+  });
+
+  it('an inherited approval mode shows Default selected and enabled', async () => {
+    mockEffective({ ...DEFAULT_BUDGET });
+    const { container } = render(<OrgAiBudgetSettings orgId="org-1" section="approvals" />);
+    const scoped = within(container);
+
+    const select = (await scoped.findByTestId('org-ai-approval-mode')) as HTMLSelectElement;
+    expect(select.value).toBe('');
+    expect(Array.from(select.options).find((o) => o.value === '')?.disabled).toBe(false);
+  });
+
+  it('shows the readable per-field message when the server rejects the approval mode', async () => {
+    fetchWithAuth.mockImplementation((url: string, init?: RequestInit) => {
+      if (url === '/orgs/organizations/org-1/effective-settings' && !init) {
+        return Promise.resolve(jsonRes({ effective: { aiBudgets: { ...DEFAULT_BUDGET } }, locked: [] }));
+      }
+      return Promise.resolve(jsonRes({
+        error: 'approvalMode: Invalid option',
+        details: { formErrors: [], fieldErrors: { approvalMode: ['Invalid option'] } },
+      }, 400));
+    });
+    const { container } = render(<OrgAiBudgetSettings orgId="org-1" section="approvals" />);
+    const scoped = within(container);
+
+    const select = (await scoped.findByTestId('org-ai-approval-mode')) as HTMLSelectElement;
+    fireEvent.change(select, { target: { value: 'hybrid_plan' } });
+    fireEvent.click(scoped.getByTestId('org-ai-approval-mode-save'));
+
+    await waitFor(() => expect(select.getAttribute('aria-invalid')).toBe('true'));
+    expect(scoped.getByTestId('org-ai-budget-error-approvalMode').textContent).toBe('Invalid option');
   });
 });

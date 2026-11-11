@@ -9,11 +9,16 @@
 import type { MiddlewareHandler } from 'hono';
 import { createHash } from 'crypto';
 import { eq, or } from 'drizzle-orm';
-import { db, withSystemDbAccessContext, withDbAccessContext } from '../db';
+import { db, withSystemDbAccessContext, withDbAccessContext, type DbAccessContext } from '../db';
+import { isSelfManagedDbContextRoute } from './selfManagedDbContextRoutes';
 import { devices, organizations } from '../db/schema';
 import type { AuthContext } from './auth';
 import { matchAgentTokenHash } from './agentAuth';
 import { evaluateDeviceCredentialLifecycle } from './deviceCredentialLifecycle';
+import { PARKED_DEVICE_REFUSAL } from './agentAuthParked';
+import { isUnassignedPoolOrgType } from '../services/unassignedPool/orgType';
+import { buildHelperConfigUpdate } from '../services/helperSettings';
+import { recordAgentCredentialUse } from '../services/agentCredentialUse';
 
 export interface HelperDevice {
   id: string;
@@ -29,8 +34,22 @@ export interface HelperDevice {
 declare module 'hono' {
   interface ContextVariableMap {
     helperDevice: HelperDevice;
+    /** Effective Helper enabled setting for the device, resolved by helperAuth. */
+    helperEnabled: boolean;
   }
 }
+
+/**
+ * Answer for every helper route (core and extension /helper/*) when the
+ * device's effective Helper setting is off. No route is exempt: no Helper
+ * client polls a status route, and the agent stops and uninstalls the Helper
+ * from the same setting on its next heartbeat. The code lets a client tell
+ * this refusal apart from a credential failure.
+ */
+export const HELPER_DISABLED_REFUSAL = {
+  error: 'Breeze Helper is disabled for this device by policy',
+  code: 'helper_disabled',
+} as const;
 
 /**
  * Authenticate helper requests using the helper-scoped bearer token.
@@ -69,6 +88,8 @@ export const helperAuth: MiddlewareHandler = async (c, next) => {
         status: devices.status,
         agentTokenSuspendedAt: devices.agentTokenSuspendedAt,
         partnerId: organizations.partnerId,
+        // Pre-assignment: a device parked in a holding org is refused below.
+        organizationType: organizations.type,
       })
       .from(devices)
       .innerJoin(organizations, eq(organizations.id, devices.orgId))
@@ -121,6 +142,37 @@ export const helperAuth: MiddlewareHandler = async (c, next) => {
     }
   }
 
+  // Pre-assignment: a device parked in its partner's
+  // holding org keeps credential rotation and lifecycle removal on the agent
+  // REST surface and nothing else. A Helper session is interactive AI, tool and
+  // remote surface, so the helper token issued at enrollment is refused until
+  // the device is assigned. Same body as the agent REST refusal.
+  if (isUnassignedPoolOrgType(device.organizationType)) {
+    return c.json(PARKED_DEVICE_REFUSAL, 403);
+  }
+
+  // Effective Helper enabled setting — the same resolver (and 120s cache) the
+  // agent heartbeat uses to install/uninstall the Helper, so the two agree.
+  // Resolved under a system context anchored to the authenticated device's own
+  // org, exactly as the heartbeat does.
+  let helperEnabled: boolean;
+  try {
+    const settings = await withSystemDbAccessContext(() => buildHelperConfigUpdate(device.id, device.orgId));
+    helperEnabled = settings.enabled === true;
+  } catch (err) {
+    console.error('[helperAuth] failed to resolve effective helper settings:', err instanceof Error ? err.message : err);
+    c.header('Retry-After', '30');
+    return c.json({ error: 'Helper settings could not be loaded. Try again.' }, 503);
+  }
+  if (!helperEnabled) {
+    return c.json(HELPER_DISABLED_REFUSAL, 403);
+  }
+  c.set('helperEnabled', helperEnabled);
+
+  // #8318 §6.5: the helper credential counts as the install being alive, so
+  // the reattach confirm's liveness read sees helper-only activity too.
+  recordAgentCredentialUse(device.id);
+
   c.set('helperDevice', {
     id: device.id,
     agentId: device.agentId,
@@ -168,25 +220,41 @@ export const helperAuth: MiddlewareHandler = async (c, next) => {
 
   c.set('auth', syntheticAuth);
 
-  await withDbAccessContext(
-    {
-      scope: 'organization',
-      orgId: device.orgId,
-      accessibleOrgIds: [device.orgId],
-      // Helper tokens have NO partner-AXIS access. This array gates
-      // `breeze_has_partner_access`, which admits WRITES to partner-owned rows;
-      // it stays empty, exactly as the agent sibling keeps it (agentAuth.ts) and
-      // as the AuthContext design note requires (`helperDevicePartnerId` in
-      // middleware/auth.ts: Helper tokens must never activate partner-wide RLS
-      // branches). `currentPartnerId` below is a strictly separate, read-only
-      // axis — do not merge the two. The partner-LLM BYOK read that needs the
-      // partner runs under its own system context.
-      accessiblePartnerIds: [],
-      // Own partner — read-visibility of partner-wide catalog rows.
-      currentPartnerId: device.partnerId ?? null,
-    },
-    async () => {
-      await next();
-    },
-  );
+  // #3127 — the chat message-send route owns its DB context (it waits on a
+  // blocked turn between two short ones; see selfManagedDbContextRoutes.ts), so
+  // it must not inherit a request transaction held across that wait.
+  if (isSelfManagedDbContextRoute(c.req.method, c.req.path)) {
+    await next();
+    return;
+  }
+
+  await withDbAccessContext(helperDbAccessContext(device), async () => {
+    await next();
+  });
 };
+
+/**
+ * The org-scoped DB access context every helper request runs under. Exported so
+ * a self-managed helper route re-enters exactly this context for each of its
+ * short DB phases instead of re-deriving it by hand.
+ */
+export function helperDbAccessContext(
+  device: { orgId: string; partnerId: string | null | undefined },
+): DbAccessContext {
+  return {
+    scope: 'organization',
+    orgId: device.orgId,
+    accessibleOrgIds: [device.orgId],
+    // Helper tokens have NO partner-AXIS access. This array gates
+    // `breeze_has_partner_access`, which admits WRITES to partner-owned rows;
+    // it stays empty, exactly as the agent sibling keeps it (agentAuth.ts) and
+    // as the AuthContext design note requires (`helperDevicePartnerId` in
+    // middleware/auth.ts: Helper tokens must never activate partner-wide RLS
+    // branches). `currentPartnerId` below is a strictly separate, read-only
+    // axis — do not merge the two. The partner-LLM BYOK read that needs the
+    // partner runs under its own system context.
+    accessiblePartnerIds: [],
+    // Own partner — read-visibility of partner-wide catalog rows.
+    currentPartnerId: device.partnerId ?? null,
+  };
+}

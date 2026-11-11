@@ -1,6 +1,11 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Hono } from 'hono';
 
+// services/aiAgent.ts (reached transitively) resolves session models through
+// the registry (W03 #7601); stub its DB adapters under this partial schema mock.
+vi.mock('../services/aiModels/sessionModel', () => ({ chooseSessionModel: vi.fn() }));
+vi.mock('../services/aiModels/candidateLoader', () => ({ readOrgPartnerId: vi.fn() }));
+
 vi.mock('../services/stepUpActorAssurance', () => ({ lockActorAssurance: vi.fn(async () => true) }));
 import { deviceRoutes } from '../routes/devices';
 import { createAuthenticatedClient, createTestDevice, createTestUser } from './helpers';
@@ -130,6 +135,11 @@ vi.mock('../db', () => ({
 }));
 
 vi.mock('../db/schema', () => ({
+  deviceReliability: { deviceId: 'deviceId', details: 'details', reliabilityScore: 'reliabilityScore', trendDirection: 'trendDirection' },
+  deviceReliabilityBaselines: { id: 'id', deviceId: 'deviceId', baselineAt: 'baselineAt', createdAt: 'createdAt', clearedAt: 'clearedAt', reason: 'reason', source: 'source' },
+  // services/patchSeverityOverlay.ts builds module-level SQL fragments from these at import time.
+  patches: { severity: 'patches.severity', category: 'patches.category' },
+  devicePatches: { reportedSeverity: 'device_patches.reported_severity', reportedCategory: 'device_patches.reported_category' },
   // routes/devices/events.ts builds module-level SQL fragments from auditLogs at import time (#4835).
   auditLogs: { actorType: 'actorType', details: 'details', timestamp: 'timestamp', action: 'action' },
   users: { id: 'id', email: 'email', name: 'name', status: 'status', mfaEnabled: 'mfaEnabled' },

@@ -7,6 +7,14 @@ use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_updater::UpdaterExt;
 use url::Url;
 
+mod dev_build;
+#[cfg(any(target_os = "linux", test))]
+mod linux_webkit_env;
+mod screenshot;
+mod session_menu;
+mod update_diagnostics;
+use update_diagnostics::{classify_update_error, UpdateFailStage, UpdateStep, UPDATER_LOG_FILE};
+
 const MAX_DEEP_LINK_BYTES: usize = 4096;
 const MAX_SESSION_WINDOWS: usize = 16;
 const MAX_ID_PARAM_BYTES: usize = 128;
@@ -48,6 +56,14 @@ fn register_url_scheme() -> Result<(), String> {
 /// terminate sequence is already fragile enough to need the `RunEvent::Exit`
 /// workaround at the bottom of `run()`; re-entering it is not worth finding out.
 static EXIT_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set once the operator confirms Cmd+Q with sessions open (#8241).
+static QUIT_CONFIRMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set by the session window when it has shown the quit confirmation. If it
+/// never does (no listener, webview not ready), Cmd+Q falls back to quitting.
+static QUIT_PROMPT_SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+const QUIT_PROMPT_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
 
 // ── Linux `breeze://` registration ───────────────────────────────────────
 // The helpers below are compiled on Linux, and under `cfg(test)` everywhere so
@@ -300,6 +316,66 @@ fn run_best_effort(program: &str, args: &[&std::ffi::OsStr]) {
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn register_url_scheme() -> Result<(), String> {
     Ok(())
+}
+
+/// Register `breeze://` unless this is a development build (#8956).
+///
+/// macOS and Linux re-register on every launch, so the last-launched install
+/// wins the scheme. A local dev build carries the `999.*` version marker and,
+/// once launched, would keep every console deep link for itself. Windows has no
+/// launch-time registration (the MSI writes it), so there is nothing to skip.
+fn register_url_scheme_for(version: &str, major: u64) -> Result<(), String> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    dev_build::scheme_registration_allowed(
+        version,
+        major,
+        &own_install_path(),
+        std::env::var(dev_build::DEV_REGISTER_ENV).ok().as_deref(),
+    )?;
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let _ = (version, major);
+    register_url_scheme()
+}
+
+/// Human-readable location of the running install, for messages only: the
+/// `.app` bundle on macOS, the `.AppImage` file on Linux, else the executable.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn own_install_path() -> String {
+    #[cfg(target_os = "linux")]
+    if let Some(appimage) = std::env::var("APPIMAGE")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    {
+        return appimage;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return "an unknown location".to_string();
+    };
+    #[cfg(target_os = "macos")]
+    if let Some(bundle) = exe
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+        .filter(|p| p.extension().is_some_and(|ext| ext == "app"))
+    {
+        return bundle.display().to_string();
+    }
+    exe.display().to_string()
+}
+
+/// Time since the running executable was written — for a local build, roughly
+/// when it was built (a copy that resets mtime, or re-signing, restarts it).
+/// `Err` says why the age is unknown: unreadable metadata, or a timestamp in the
+/// future. [`dev_build::classify_build`] treats an unknown age as stale.
+#[cfg_attr(debug_assertions, allow(dead_code))] // only `auto_update` (release builds) uses it
+fn running_build_age() -> Result<std::time::Duration, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("cannot resolve own path: {e}"))?;
+    let modified = std::fs::metadata(&exe)
+        .and_then(|m| m.modified())
+        .map_err(|e| format!("cannot read modification time of {}: {e}", exe.display()))?;
+    std::time::SystemTime::now()
+        .duration_since(modified)
+        .map_err(|_| format!("modification time of {} is in the future", exe.display()))
 }
 
 /// Per-window pending deep link URLs. Key = window label, value = deep link URL.
@@ -595,6 +671,10 @@ fn apply_pending_update(
         return Err("no pending update to apply".to_string());
     };
     let version = update.version.clone();
+    log_update(
+        &app,
+        &format!("Applying update {version} (user chose Restart & update)"),
+    );
 
     // On Windows install() launches the installer and terminates the process,
     // so emit a labelled "Installing" first — the exit is then a known step,
@@ -603,8 +683,8 @@ fn apply_pending_update(
     emit_update_status(&app, UpdateStatus::Installing { version: version.clone() });
 
     if let Err(e) = update.install(bytes) {
-        eprintln!("Update install failed: {}", e);
-        emit_update_status(&app, UpdateStatus::Failed { version });
+        let stage = classify_update_error(UpdateStep::Install, &e);
+        report_update_failure(&app, &version, stage, e.to_string());
         return Err(e.to_string());
     }
 
@@ -626,7 +706,10 @@ fn apply_pending_update(
 /// is best-effort: a failure is logged but not surfaced, since the next launch
 /// re-checks regardless.
 #[tauri::command]
-fn dismiss_pending_update(pending: tauri::State<'_, PendingUpdate>) -> Result<(), String> {
+fn dismiss_pending_update(
+    app: tauri::AppHandle,
+    pending: tauri::State<'_, PendingUpdate>,
+) -> Result<(), String> {
     let taken = {
         let mut slot = lock_or_recover(&pending.0, "pending_update");
         slot.take()
@@ -634,10 +717,25 @@ fn dismiss_pending_update(pending: tauri::State<'_, PendingUpdate>) -> Result<()
     let Some((update, bytes)) = taken else {
         return Ok(());
     };
+    log_update(
+        &app,
+        &format!(
+            "Update {} postponed (user chose Remind me later)",
+            update.version
+        ),
+    );
 
     #[cfg(not(target_os = "windows"))]
     if let Err(e) = update.install(bytes) {
-        eprintln!("Deferred update disk-swap failed: {}", e);
+        let stage = classify_update_error(UpdateStep::Install, &e);
+        log_update(
+            &app,
+            &format!(
+                "Deferred update {} disk-swap failed at the {} stage: {e}",
+                update.version,
+                stage.as_str()
+            ),
+        );
     }
     #[cfg(target_os = "windows")]
     drop((update, bytes));
@@ -715,8 +813,11 @@ fn route_deep_link(app: &tauri::AppHandle, url: String) {
 }
 
 /// Emit a deep-link-received event to a window with retry delays.
-/// Spawns a background thread that emits at 500ms and 1500ms to cover
-/// slow webview startup. Stops early if the target window is destroyed.
+/// Spawns a background thread that emits at +500ms and +2000ms (cumulative)
+/// to cover slow webview startup. Stops early if the target window is
+/// destroyed, or once the window has applied the link — the frontend calls
+/// `clear_pending_deep_link` when it does, so a missing (or different)
+/// pending entry means there is nothing left to deliver (#8947).
 fn emit_with_retry(app: &tauri::AppHandle, label: &str, url: String) {
     let handle = app.clone();
     let label = label.to_string();
@@ -728,11 +829,27 @@ fn emit_with_retry(app: &tauri::AppHandle, label: &str, url: String) {
                 eprintln!("Window {} gone — stopping deep link emission", label);
                 return;
             }
+            if !deep_link_still_pending(&handle, &label, &url) {
+                return;
+            }
             if let Err(err) = handle.emit_to(&label, "deep-link-received", url.clone()) {
                 eprintln!("Failed to emit deep-link-received to {}: {}", label, err);
             }
         }
     });
+}
+
+/// True while `url` is still the pending deep link for `label`, i.e. the
+/// window has not yet applied it.
+fn deep_link_still_pending(app: &tauri::AppHandle, label: &str, url: &str) -> bool {
+    match app.try_state::<DeepLinkState>() {
+        Some(state) => {
+            let links = lock_or_recover(&state.0, "deep_link_state");
+            links.get(label).map(String::as_str) == Some(url)
+        }
+        // No state to consult: keep the previous behaviour and deliver.
+        None => true,
+    }
 }
 
 /// Create a new WebviewWindow for an independent remote desktop session.
@@ -837,6 +954,85 @@ fn request_exit(app: &tauri::AppHandle, code: i32) {
     }
 }
 
+/// Cmd+Q (macOS menu, #8241). With remote sessions open, ask in the focused
+/// session window first (it renders the confirmation and calls `confirm_quit`);
+/// otherwise quit straight away.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn request_quit(app: &tauri::AppHandle) {
+    let sessions = active_session_window_count(app);
+    let confirmed = QUIT_CONFIRMED.load(std::sync::atomic::Ordering::SeqCst);
+    if !session_menu::should_confirm_quit(sessions, confirmed) {
+        request_exit(app, 0);
+        return;
+    }
+    let counter = app.state::<WindowCounter>();
+    let n = *lock_or_recover(&counter.0, "window_counter");
+    let windows: Vec<_> = (1..=n)
+        .rev()
+        .filter_map(|i| app.get_webview_window(&format!("session-{}", i)))
+        .collect();
+    let target = windows
+        .iter()
+        .find(|w| w.is_focused().unwrap_or(false))
+        .or_else(|| windows.first());
+    match target {
+        Some(window) => {
+            let _ = window.show();
+            let _ = window.set_focus();
+            QUIT_PROMPT_SHOWN.store(false, std::sync::atomic::Ordering::SeqCst);
+            if let Err(err) = app.emit_to(window.label(), "quit-requested", sessions) {
+                // Nobody can answer the prompt; do what Cmd+Q always did.
+                eprintln!("Failed to ask for quit confirmation: {err}");
+                request_exit(app, 0);
+                return;
+            }
+            // An emit reaches no one if the window is not listening; never let
+            // Cmd+Q silently do nothing.
+            let handle = app.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(QUIT_PROMPT_ACK_TIMEOUT);
+                if !QUIT_PROMPT_SHOWN.load(std::sync::atomic::Ordering::SeqCst) {
+                    eprintln!("Quit confirmation was not shown; quitting");
+                    let h = handle.clone();
+                    let _ = handle.run_on_main_thread(move || request_exit(&h, 0));
+                }
+            });
+        }
+        None => request_exit(app, 0),
+    }
+}
+
+#[tauri::command]
+fn quit_prompt_shown() {
+    QUIT_PROMPT_SHOWN.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[tauri::command]
+fn confirm_quit(app: tauri::AppHandle) {
+    QUIT_CONFIRMED.store(true, std::sync::atomic::Ordering::SeqCst);
+    request_exit(&app, 0);
+}
+
+/// Saves a session screenshot (PNG bytes as the raw invoke body) into the
+/// user's Pictures folder, falling back to Downloads. The folder and file name
+/// are chosen here, never by the page. Returns the saved path for display.
+#[tauri::command]
+fn save_screenshot(app: tauri::AppHandle, request: tauri::ipc::Request<'_>) -> Result<String, String> {
+    let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
+        return Err("expected raw PNG bytes".into());
+    };
+    let dir = app
+        .path()
+        .picture_dir()
+        .or_else(|_| app.path().download_dir())
+        .map_err(|e| format!("no folder to save into: {e}"))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    screenshot::write_screenshot(&dir, bytes, now).map(|p| p.display().to_string())
+}
+
 /// Whether the app should quit now that `label` was destroyed.
 ///
 /// Session windows are the app's reason to exist; `main` is only on screen
@@ -867,7 +1063,15 @@ enum UpdateStatus {
     Installing { version: String },
     Restarting { version: String },
     Deferred { version: String },
-    Failed { version: String },
+    /// `stage` and `error` say where and why it failed (#7681); `logPath` is
+    /// the updater log holding the full sequence, `null` when it is unavailable.
+    Failed {
+        version: String,
+        stage: UpdateFailStage,
+        error: String,
+        #[serde(rename = "logPath")]
+        log_path: Option<String>,
+    },
     /// Downloaded and waiting for the user to choose Restart & update or
     /// Remind me later. Only emitted when no remote session is active.
     Ready { version: String },
@@ -879,6 +1083,61 @@ fn emit_update_status(app: &tauri::AppHandle, status: UpdateStatus) {
     if let Err(e) = app.emit("update-status", status) {
         eprintln!("Failed to emit update-status: {}", e);
     }
+}
+
+/// `<app log dir>/updater.log`, or `None` when the platform has no log dir.
+fn updater_log_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    app.path()
+        .app_log_dir()
+        .ok()
+        .map(|dir| dir.join(UPDATER_LOG_FILE))
+}
+
+/// Record an updater event on stderr and in the updater log, returning the
+/// log path when the line reached it. The release Windows build has no
+/// console, so the log file is the only durable trace (#7681). Best-effort: a
+/// log write failure never affects the update.
+fn log_update(app: &tauri::AppHandle, message: &str) -> Option<std::path::PathBuf> {
+    eprintln!("{message}");
+    let path = updater_log_path(app)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    match update_diagnostics::append_log_line(&path, now, message) {
+        Ok(()) => Some(path),
+        Err(e) => {
+            eprintln!("Failed to write {}: {e}", path.display());
+            None
+        }
+    }
+}
+
+/// Log a failed update with its stage and cause, and tell the UI the same, so
+/// the banner says why instead of only "failed".
+fn report_update_failure(
+    app: &tauri::AppHandle,
+    version: &str,
+    stage: UpdateFailStage,
+    error: String,
+) {
+    // Only point the user at the log if this failure actually reached it.
+    let logged = log_update(
+        app,
+        &format!(
+            "Update {version} failed at the {} stage: {error}",
+            stage.as_str()
+        ),
+    );
+    emit_update_status(
+        app,
+        UpdateStatus::Failed {
+            version: version.to_string(),
+            stage,
+            error,
+            log_path: logged.map(|p| p.display().to_string()),
+        },
+    );
 }
 
 /// Whole-percent download progress, used to throttle UI events to one event
@@ -909,24 +1168,75 @@ async fn auto_update(app: tauri::AppHandle) {
     // the WebRTC handshake complete on typical connections.
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
-    let updater = match app.updater() {
+    // Check-time failures (no network, bad endpoint) go to the log only: no
+    // banner is showing yet, and a launch with no reachable update server is
+    // not something to interrupt the user about.
+    let current = app.package_info().version.to_string();
+    // A dev-marker build past its grace period accepts any real release, so a
+    // forgotten local build stops outranking every published version (#8956).
+    // Release builds get exactly the plugin's default "remote is newer" rule.
+    let build_age = running_build_age();
+    let build_kind =
+        dev_build::classify_build(app.package_info().version.major, build_age.clone().ok());
+    if build_kind == dev_build::BuildKind::DevStale {
+        let age = match &build_age {
+            Ok(age) => format!("built {} days ago", age.as_secs() / 86_400),
+            Err(why) => format!("age unknown: {why}"),
+        };
+        log_update(
+            &app,
+            &format!(
+                "Running development build {current} ({age}; grace {} days): any published release will replace it",
+                dev_build::DEV_BUILD_UPDATE_GRACE.as_secs() / 86_400
+            ),
+        );
+    }
+    // Setting a comparator replaces the plugin's default rule entirely,
+    // including `plugins.updater.allowDowngrades` (unset for the viewer). Add
+    // any downgrade policy to `release_supersedes`, not to the config.
+    let updater = match app
+        .updater_builder()
+        .version_comparator(move |current, release| {
+            dev_build::release_supersedes(
+                build_kind,
+                release.version.major,
+                release.version > current,
+            )
+        })
+        .build()
+    {
         Ok(u) => u,
         Err(e) => {
-            eprintln!("Failed to create updater: {}", e);
+            log_update(
+                &app,
+                &format!("Failed to create updater (running {current}): {e}"),
+            );
             return;
         }
     };
 
     let update = match updater.check().await {
         Ok(Some(update)) => update,
-        Ok(None) => return, // already up to date
+        Ok(None) => {
+            log_update(&app, &format!("Update check: {current} is up to date"));
+            return;
+        }
         Err(e) => {
-            eprintln!("Update check failed: {}", e);
+            log_update(
+                &app,
+                &format!("Update check failed (running {current}): {e}"),
+            );
             return;
         }
     };
 
-    eprintln!("Update {} available, downloading...", update.version);
+    log_update(
+        &app,
+        &format!(
+            "Update {} available (running {current}), downloading {}",
+            update.version, update.download_url
+        ),
+    );
 
     let version = update.version.clone();
     emit_update_status(&app, UpdateStatus::Available { version: version.clone() });
@@ -965,15 +1275,23 @@ async fn auto_update(app: tauri::AppHandle) {
     {
         Ok(bytes) => bytes,
         Err(e) => {
-            eprintln!("Update download failed: {}", e);
             // Surface the failure so a banner already showing "Downloading…"
             // doesn't stay pinned forever, reintroducing the silent-crash look.
-            emit_update_status(&app, UpdateStatus::Failed { version: version.clone() });
+            let stage = classify_update_error(UpdateStep::Download, &e);
+            report_update_failure(&app, &version, stage, e.to_string());
             return;
         }
     };
 
-    eprintln!("Update {} downloaded", update.version);
+    // `download()` only returns Ok once the signature verified.
+    log_update(
+        &app,
+        &format!(
+            "Update {} downloaded and signature verified ({} bytes)",
+            update.version,
+            bytes.len()
+        ),
+    );
 
     // Decide what to do with the download based on whether a remote session is
     // live. Restarting/installing mid-session would kill it, so an active
@@ -993,14 +1311,21 @@ async fn auto_update(app: tauri::AppHandle) {
         #[cfg(not(target_os = "windows"))]
         {
             if let Err(e) = update.install(bytes) {
-                eprintln!("Deferred update disk-swap failed: {}", e);
+                // Nothing was staged, so "applies when this session ends"
+                // would be false — report the failure instead.
+                let stage = classify_update_error(UpdateStep::Install, &e);
+                report_update_failure(&app, &version, stage, e.to_string());
+                return;
             }
         }
         #[cfg(target_os = "windows")]
         {
             drop((update, bytes));
         }
-        eprintln!("Active remote session — deferring update to next launch");
+        log_update(
+            &app,
+            &format!("Update {version}: active remote session, deferring to next launch"),
+        );
         emit_update_status(&app, UpdateStatus::Deferred { version });
         return;
     }
@@ -1009,25 +1334,41 @@ async fn auto_update(app: tauri::AppHandle) {
     // Ready prompt (apply_pending_update / dismiss_pending_update).
     if let Some(pending) = app.try_state::<PendingUpdate>() {
         *lock_or_recover(&pending.0, "pending_update") = Some((update, bytes));
-        eprintln!("Update {} ready — awaiting user choice", version);
+        log_update(
+            &app,
+            &format!("Update {version} ready, awaiting user choice"),
+        );
         emit_update_status(&app, UpdateStatus::Ready { version });
     } else {
-        eprintln!("PendingUpdate state missing; cannot present update prompt");
         // Defensive: clear the banner so a (theoretically impossible) missing
         // state doesn't leave it pinned on "Downloading…" — the silent-look
         // this feature exists to remove.
-        emit_update_status(&app, UpdateStatus::Failed { version });
+        report_update_failure(
+            &app,
+            &version,
+            UpdateFailStage::Install,
+            "internal error: pending-update state missing; cannot present the update prompt"
+                .to_string(),
+        );
     }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Linux: WebKitGTK picks its renderer when the first webview is set up,
+    // so this must run before the builder below — and first, while the
+    // process is still single-threaded (#8764).
+    #[cfg(target_os = "linux")]
+    linux_webkit_env::apply();
+
     let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        // Per-device viewer preferences (#8241), kept on this machine only.
+        .plugin(tauri_plugin_store::Builder::default().build())
         .invoke_handler(tauri::generate_handler![
             get_pending_deep_link,
             clear_pending_deep_link,
@@ -1038,7 +1379,22 @@ pub fn run() {
             apply_pending_update,
             dismiss_pending_update,
             get_scheme_registration_error,
+            save_screenshot,
+            quit_prompt_shown,
+            confirm_quit,
         ]);
+
+    // macOS: an app menu without the Cmd+W/H/M key equivalents, so those
+    // reach the remote; Cmd+Q confirms while sessions are open (K9, #8241).
+    #[cfg(target_os = "macos")]
+    {
+        builder = builder
+            .menu(|app| session_menu::build(app))
+            .on_menu_event(|app, event| match event.id().as_ref() {
+                session_menu::MENU_QUIT => request_quit(app),
+                id => session_menu::handle_window_item(app, id),
+            });
+    }
 
     // Single instance plugin (desktop only) — ensures deep links open in existing
     // process. A second remote session is launched by the OS handing the running
@@ -1082,7 +1438,8 @@ pub fn run() {
         .setup(|app| {
             // Kept so the idle card can say registration failed instead of
             // claiming the viewer is ready when `breeze://` will not resolve.
-            let scheme_registration = register_url_scheme();
+            let version = &app.package_info().version;
+            let scheme_registration = register_url_scheme_for(&version.to_string(), version.major);
             if let Err(ref err) = scheme_registration {
                 eprintln!("breeze:// registration failed: {err}");
             }
@@ -1499,8 +1856,34 @@ mod tests {
                 json!({ "phase": "deferred", "version": "1.2.3" }),
             ),
             (
-                UpdateStatus::Failed { version: v.clone() },
-                json!({ "phase": "failed", "version": "1.2.3" }),
+                UpdateStatus::Failed {
+                    version: v.clone(),
+                    stage: UpdateFailStage::Extract,
+                    error: "unsupported Zip archive: Compression method not supported".into(),
+                    log_path: Some("C:\\logs\\updater.log".into()),
+                },
+                json!({
+                    "phase": "failed",
+                    "version": "1.2.3",
+                    "stage": "extract",
+                    "error": "unsupported Zip archive: Compression method not supported",
+                    "logPath": "C:\\logs\\updater.log",
+                }),
+            ),
+            (
+                UpdateStatus::Failed {
+                    version: v.clone(),
+                    stage: UpdateFailStage::Download,
+                    error: "timed out".into(),
+                    log_path: None,
+                },
+                json!({
+                    "phase": "failed",
+                    "version": "1.2.3",
+                    "stage": "download",
+                    "error": "timed out",
+                    "logPath": null,
+                }),
             ),
             (
                 UpdateStatus::Ready { version: v.clone() },

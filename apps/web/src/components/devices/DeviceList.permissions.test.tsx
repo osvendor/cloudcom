@@ -1,0 +1,117 @@
+import { fireEvent, render, screen } from '@testing-library/react';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+import DeviceList, { type Device } from './DeviceList';
+
+// #7215: the row-menu Wake posts to POST /devices/:id/commands (devices.execute).
+const granted = vi.hoisted(() => new Set<string>());
+const flags = vi.hoisted(() => ({ ENABLE_ENDPOINT_MESSAGING: true }));
+vi.mock('../../lib/featureFlags', async (orig) => ({
+  ...(await orig<typeof import('../../lib/featureFlags')>()),
+  get ENABLE_ENDPOINT_MESSAGING() { return flags.ENABLE_ENDPOINT_MESSAGING; },
+}));
+vi.mock('../../lib/permissions', () => ({
+  usePermissions: () => ({ permissions: [], can: (r: string, a: string) => granted.has(`${r}:${a}`) }),
+  hasPermission: (_p: unknown, r: string, a: string) => granted.has(`${r}:${a}`),
+}));
+vi.mock('../../stores/auth', () => ({ fetchWithAuth: vi.fn(), registerOrgIdProvider: vi.fn() }));
+vi.mock('@/stores/orgStore', () => ({
+  useOrgStore: (selector: (s: { currentOrgId: string | null; allOrgs: boolean }) => unknown) =>
+    selector({ currentOrgId: null, allOrgs: true }),
+}));
+vi.mock('../remote/ConnectDesktopButton', () => ({ default: () => null }));
+vi.mock('@/lib/formatTime', () => ({ formatLastSeen: () => 'just now' }));
+
+const offline: Device = {
+  id: '11111111-1111-1111-1111-111111111111',
+  deviceClass: 'agent',
+  hostname: 'sleepy-box',
+  os: 'linux',
+  osVersion: '22.04',
+  status: 'offline',
+  cpuPercent: 1,
+  ramPercent: 1,
+  lastSeen: new Date().toISOString(),
+  orgId: 'org-1',
+  orgName: 'Acme',
+  siteId: 'site-1',
+  siteName: 'HQ',
+  agentVersion: '0.70.0',
+  tags: [],
+};
+
+describe('DeviceList — Wake is gated on devices:execute (#7215)', () => {
+  beforeEach(() => granted.clear());
+
+  it('hides Wake from the row menu without the permission (other items still render)', () => {
+    render(<DeviceList devices={[offline]} pageSize={50} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Device actions' }));
+    expect(screen.getByRole('button', { name: /run script/i })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /^wake$/i })).toBeNull();
+  });
+
+  it('shows Wake in the row menu with the permission', () => {
+    granted.add('devices:execute');
+    render(<DeviceList devices={[offline]} pageSize={50} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Device actions' }));
+    expect(screen.getByRole('button', { name: /^wake$/i })).toBeTruthy();
+  });
+});
+
+describe('DeviceList — Remote terminal is gated on remote:access', () => {
+  beforeEach(() => granted.clear());
+  const online: Device = { ...offline, status: 'online' };
+
+  it('hides Remote terminal from the row menu without remote:access', () => {
+    granted.add('devices:read');
+    render(<DeviceList devices={[online]} pageSize={50} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Device actions' }));
+    expect(screen.getByRole('button', { name: /run script/i })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /remote terminal/i })).toBeNull();
+  });
+
+  it('shows Remote terminal in the row menu with remote:access', () => {
+    granted.add('remote:access');
+    render(<DeviceList devices={[online]} pageSize={50} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Device actions' }));
+    expect(screen.getByRole('button', { name: /remote terminal/i })).toBeTruthy();
+  });
+});
+
+describe('DeviceList — bulk Send message is gated on endpoint_messages:send', () => {
+  beforeEach(() => granted.clear());
+  const online: Device = { ...offline, status: 'online' };
+
+  const openBulk = () => {
+    fireEvent.click(screen.getByLabelText('Select all devices on this page'));
+    fireEvent.click(screen.getByRole('button', { name: /bulk actions/i }));
+  };
+
+  it('hides the bulk Send message item without the permission (other items still render)', () => {
+    render(<DeviceList devices={[online]} pageSize={50} />);
+    openBulk();
+    expect(screen.getByTestId('bulk-actions-menu')).toBeTruthy();
+    expect(screen.queryByTestId('bulk-send-message')).toBeNull();
+  });
+
+  it('shows the bulk Send message item with the permission', () => {
+    granted.add('endpoint_messages:send');
+    render(<DeviceList devices={[online]} pageSize={50} />);
+    openBulk();
+    expect(screen.getByTestId('bulk-send-message')).toBeTruthy();
+  });
+
+  // #8968: hidden until the build enables endpoint messaging.
+  it('hides the bulk Send message item when the build-time endpoint messaging flag is off', () => {
+    flags.ENABLE_ENDPOINT_MESSAGING = false;
+    try {
+      granted.add('endpoint_messages:send');
+      render(<DeviceList devices={[online]} pageSize={50} />);
+      openBulk();
+      expect(screen.getByTestId('bulk-actions-menu')).toBeTruthy();
+      expect(screen.queryByTestId('bulk-send-message')).toBeNull();
+    } finally {
+      flags.ENABLE_ENDPOINT_MESSAGING = true;
+    }
+  });
+});

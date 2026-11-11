@@ -1,5 +1,6 @@
 {
   "titles": {
+    "adminMonitorConversion": "Legacy Alert Conversion",
     "notFound": "Page not found",
     "serverError": "Something went wrong",
     "acceptInvite": "Accept Invite",
@@ -14,22 +15,26 @@
     "adminConnectedApps": "Connected apps (admin)",
     "adminLlmProviderCatalog": "LLM Provider Catalog",
     "adminQuarantined": "Quarantined Devices",
+    "adminSystem": "System",
     "adminThirdPartyCatalog": "Third-Party Catalog",
     "adminTrustAct": "Partner trust action",
     "adminTrustQueue": "Partner Trust Queue",
     "adminSendingDomains": "Partner Sending Domains",
     "adminUsersDetailDevices": "User devices",
     "aiAgentsImpact": "AI Impact",
+    "aiAgentsFixMemory": "Fix memory",
+    "flows": "Flows",
+    "flowDetail": "Flow",
+    "flowRun": "Flow run",
     "aiAgentsRunsDetail": "Run Detail",
     "aiAgentsRuns": "Agent Runs",
-    "aiForOffice": "AI for Office",
+    "aiForOffice": "Breeze AI for Office",
     "aiRisk": "AI Risk Engine",
     "alertsDelivery": "Alerts – Delivery",
     "alertsCorrelations": "Alert Correlations",
     "alertsDetail": "Alert Details",
     "alertsMonitors": "Alerts – Monitors",
     "alertsMonitorDetail": "Alerts – Monitor",
-    "alertsRules": "Alerts – Legacy rules",
     "alerts": "Alerts",
     "analytics": "Analytics",
     "approvals": "Approvals",
@@ -59,6 +64,7 @@
     "contractsNew": "New contract",
     "devicesCompare": "Device Comparison",
     "devicesGroups": "Device Groups",
+    "devicesUnassigned": "Unassigned Devices",
     "devicesDetail": "Device Details",
     "devices": "Devices & Assets",
     "devicesNetworkDetail": "Network Device Details",
@@ -67,18 +73,19 @@
     "dnsSecurity": "DNS Security",
     "dr": "Disaster Recovery",
     "extensionsNamePath": "Extension",
-    "fleet": "Fleet Orchestration",
+    "fleet": "Findings",
     "forgotPassword": "Forgot Password",
     "incidentsDetail": "Incident Detail",
-    "incidents": "Incidents",
+    "incidents": "Security Incidents",
     "dashboard": "Dashboard",
     "integrations": "Integrations",
     "integrationsPsa": "PSA Integrations",
     "integrationsWebhooks": "Webhooks",
     "login": "Sign In",
     "logs": "Logs",
-    "monitoring": "Monitoring",
+    "monitoring": "Network",
     "oauthConsent": "Authorize access",
+    "oauthError": "App connection failed",
     "onedrive": "OneDrive",
     "organizations": "Organizations",
     "organizationsDetail": "Organization",
@@ -91,6 +98,7 @@
     "policies": "Policies",
     "policiesNew": "New Policy",
     "quick": "Quick Support",
+    "verify": "Review a support request",
     "registerPartner": "Register Your Company",
     "remoteFilesDevice": "Remote File Manager",
     "remoteFiles": "Start File Transfer",
@@ -106,6 +114,7 @@
     "reportsDetailEdit": "Edit Report",
     "reports": "Reports",
     "reportsNew": "Create Report",
+    "reportsSeriesEdit": "Edit Multi-org Report",
     "reportsTemplates": "Report Templates",
     "resetPassword": "Reset Password",
     "scriptsDetail": "Edit Script",
@@ -130,12 +139,11 @@
     "settingsAiUsage": "AI Usage",
     "settingsAiScriptAuthoring": "Script authoring",
     "settingsToolSources": "Tool Sources",
-    "settingsAlertTemplatesDetail": "Alert Template",
-    "settingsAlertTemplates": "Alert Templates",
     "settingsApiKeys": "API Keys",
     "settingsBilling": "Billing Settings",
     "settingsCatalog": "Product Catalog",
     "settingsConnectedApps": "Connected apps",
+    "settingsDeliverableTemplates": "Deliverable Templates",
     "settingsCustomFields": "Custom Fields",
     "settingsEnrollmentKeys": "Enrollment Keys",
     "settingsFilters": "Saved Filters",
@@ -149,6 +157,7 @@
     "settingsProfile": "Profile Settings",
     "settingsRoles": "Roles",
     "settingsSitesDetail": "Site Settings",
+    "settingsSites": "Sites",
     "settingsSso": "Single Sign-On",
     "settingsUsers": "Users",
     "settingsVariables": "Variables",
@@ -162,14 +171,28 @@
     "ticketsNew": "Create Ticket",
     "timesheet": "Timesheet",
     "vulnerabilities": "Vulnerabilities",
-    "workspace": "AI Assistant",
     "aiAgentsFleetDesign": "Fleet Design",
     "agreementTemplates": "Agreement templates",
     "agreementTemplateDetail": "Agreement template",
     "agreementTemplateNew": "New agreement template",
     "signedAgreements": "Signed agreements",
     "settingsTicketing": "Ticketing Settings",
-    "securityScans": "IOC Scans"
+    "securityScans": "IOC Scans",
+    "devicesTime": "Time synchronization",
+    "adminAiModels": "AI Models",
+    "adminWisp": "Wisp",
+    "billingAutopay": "Automatic payments",
+    "endpointMessages": "Endpoint Messages",
+    "securityDetectionRules": "Detection Rules",
+    "settingsPlan": "Plan & features",
+    "settingsWispMemory": "Wisp memory",
+    "wispThread": "Wisp thread",
+    "wisp": "Wisp",
+    "wispChat": "Breeze AI",
+    "aiTasks": "AI Tasks",
+    "aiTask": "AI task",
+    "settingsAi": "AI settings",
+    "settingsFlowLimits": "Flow limits"
   },
   "layout": {
     "metaDescription": "Breeze RMM - Remote Monitoring and Management",
@@ -178,12 +201,43 @@
   "authShell": {
     "tagline": "The modern RMM platform built for speed, clarity, and scale."
   },
+  "authFooter": {
+    "reportAbuse": "Report abuse",
+    "security": "Security"
+  },
   "errorPage": {
     "notFoundBody": "The page you’re looking for doesn’t exist or may have been moved.",
     "serverErrorBody": "An unexpected error occurred on our end. Our team has been notified — please try again in a moment.",
     "referenceIdLabel": "Reference ID:",
     "dashboardLink": "Go to dashboard",
     "signInLink": "Sign in"
+  },
+  "oauthErrorPage": {
+    "invalidClient": {
+      "heading": "This app can't connect",
+      "body": "Breeze doesn't recognize the app that sent you here, or the app isn't allowed to connect to this Breeze server. Check that the app is set up with this server's address, then try again."
+    },
+    "invalidRedirectUri": {
+      "heading": "This app's return address isn't registered",
+      "body": "The app asked Breeze to send you back to an address it never registered, so Breeze stopped here to protect your account. The app's developer or your administrator needs to fix the app's redirect URL."
+    },
+    "sessionExpired": {
+      "heading": "This sign-in has expired",
+      "body": "The connection took too long, or it was started in a different browser. Go back to the app and connect again."
+    },
+    "invalidRequest": {
+      "heading": "The app sent a request Breeze can't accept",
+      "body": "The app's connection request was incomplete or asked for something this server doesn't support. Go back to the app and try again. If it keeps happening, contact the app's developer."
+    },
+    "serverError": {
+      "heading": "Breeze couldn't finish connecting",
+      "body": "Something went wrong on our end. Wait a few minutes, then go back to the app and try again."
+    },
+    "generic": {
+      "heading": "This connection couldn't be completed",
+      "body": "Go back to the app and start the connection again. If it keeps happening, contact your Breeze administrator."
+    },
+    "nextStep": "No access was granted. You can close this page."
   },
   "settingsIndex": {
     "heading": "Settings",
@@ -219,7 +273,7 @@
       },
       "connectedApps": {
         "title": "Connected Apps",
-        "description": "Review and revoke AI assistants and MCP clients authorized to access your tenant."
+        "description": "Review and revoke AI clients authorized to access your tenant."
       },
       "officeAddinBindings": {
         "title": "Outlook Add-in Bindings",
@@ -236,8 +290,45 @@
       "ticketChecklistTemplates": {
         "title": "Ticket checklist templates",
         "description": "Reusable step lists your technicians can apply to any ticket."
+      },
+      "profile": {
+        "title": "My profile"
+      },
+      "apiKeys": {
+        "title": "API keys"
+      },
+      "partnerServicePrincipals": {
+        "title": "Service principals"
+      },
+      "alertTemplates": {
+        "title": "Alert templates"
+      },
+      "plan": {
+        "title": "Plan & features",
+        "description": "Your plan, which features it includes, and where each one comes from."
+      },
+      "wispMemory": {
+        "title": "Wisp memory",
+        "description": "Review, confirm, and retract what Wisp remembers."
+      },
+      "flowLimits": {
+        "title": "Flow limits",
+        "description": "Monthly run limits and the AI token limit for flows."
       }
-    }
+    },
+    "groups": {
+      "account": "Account & Access",
+      "billing": "Billing & Service Desk",
+      "devices": "Devices & Enrollment",
+      "data": "Automation & Data",
+      "ai": "AI",
+      "integrations": "Integrations"
+    },
+    "search": {
+      "label": "Search settings",
+      "placeholder": "Search settings…"
+    },
+    "noResults": "No settings match your search."
   },
   "settingsBillingPage": {
     "heading": "Billing settings",
@@ -245,7 +336,7 @@
   },
   "settingsConnectedAppsPage": {
     "heading": "Connected apps",
-    "description": "AI assistants and other MCP clients that have been authorized to access your tenant via OAuth. Revoke access at any time — the app's token will be rejected within 10 minutes."
+    "description": "AI clients that have been authorized to access your tenant via OAuth. Revoke access at any time — the app's token will be rejected within 10 minutes."
   },
   "settingsOrganizationBillingPage": {
     "backLink": "← Organization settings",

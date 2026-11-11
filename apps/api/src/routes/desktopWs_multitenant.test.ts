@@ -4,6 +4,18 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 // Mocks — must be declared before any import that triggers the modules
 // -------------------------------------------------------------------
 
+// Existing route cases exercise the non-isolated ICE plan.
+vi.mock('./remote/desktopRelayPolicy', async () => {
+  const { getIceServers } = await import('./remote/helpers');
+  return {
+    resolveDesktopIcePlan: async (_deviceId: string, scope: import('./remote/helpers').TurnCredentialScope) => ({
+      ok: true,
+      relayOnly: false,
+      iceServers: getIceServers(scope),
+    }),
+  };
+});
+
 vi.mock('../db', () => ({
   runOutsideDbContext: vi.fn((fn: () => unknown) => fn()),
   withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn()),
@@ -68,8 +80,10 @@ vi.mock('../services/rate-limit', () => ({
 }));
 
 vi.mock('./remote/helpers', () => ({
+  createDesktopStartCommandId: vi.fn((id: string) => `desk-start-${id}-${crypto.randomUUID()}`),
   logSessionAudit: vi.fn(async () => undefined),
   getIceServers: vi.fn(() => []),
+  buildRemoteSessionPromptPayload: vi.fn(async () => undefined),
 }));
 
 vi.mock('../services/clientIp', () => ({

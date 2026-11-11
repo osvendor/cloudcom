@@ -22,20 +22,22 @@ function toolEntries(tier: number): string[] {
 }
 
 describe('tierConfig lists system_cleanup', () => {
-  it('shows list and status as auto-executing and run as approval-gated', () => {
-    expect(toolEntries(1)).toContain('system_cleanup (list)');
+  it('shows status as a Tier 1 read, list as a Tier 2 live read and run as approval-gated', () => {
+    // list asks the device for its cleaner catalog (a live command); status
+    // reads the stored run.
+    expect(toolEntries(2)).toContain('system_cleanup (list)');
+    expect(toolEntries(1)).not.toContain('system_cleanup (list)');
     expect(toolEntries(1)).toContain('system_cleanup (status)');
     expect(toolEntries(3)).toContain('system_cleanup (run)');
+    expect(toolEntries(3)).toContain('system_cleanup (cancel)');
   });
 
-  it('advertises the real per-tool rate limit and permission', () => {
+  it('advertises the per-tool rate limit row and permission', () => {
+    // The limit itself is served by GET /ai/tool-rate-limits (#6476); this row
+    // only carries the display metadata.
     const row = RATE_LIMIT_CONFIGS.find((c) => c.toolName === 'system_cleanup');
     expect(row).toEqual({
       toolName: 'system_cleanup',
-      // Per TOOL, and `status` polling shares the counter with `run` — the
-      // number mirrors TOOL_RATE_LIMITS.system_cleanup in aiGuardrails.ts.
-      limit: 30,
-      windowSeconds: 3600,
       tier: 3,
       permission: 'devices.execute',
       category: 'Files, Disk & Registry',
@@ -43,12 +45,12 @@ describe('tierConfig lists system_cleanup', () => {
   });
 
   it('maps RBAC per action', () => {
-    expect(RBAC_MAPPINGS.system_cleanup).toEqual({ list: 'devices.read', run: 'devices.execute', status: 'devices.read' });
+    expect(RBAC_MAPPINGS.system_cleanup).toEqual({ list: 'devices.execute', run: 'devices.execute', cancel: 'devices.execute', status: 'devices.read' });
   });
 });
 
 describe('system_cleanup catalog labels exist in all 8 locales', () => {
-  it.each(LOCALES)('%s carries the tool label and all three action labels', (locale) => {
+  it.each(LOCALES)('%s carries the tool label and all four action labels', (locale) => {
     const catalog = JSON.parse(readFileSync(join(localesDir, locale, 'settings.json'), 'utf8'));
     const tools = catalog.aiAgentsPage.catalog.tools;
     const actions = catalog.aiAgentsPage.catalog.actions;
@@ -58,6 +60,7 @@ describe('system_cleanup catalog labels exist in all 8 locales', () => {
     expect(typeof actions.system_cleanup?.list).toBe('string');
     expect(typeof actions.system_cleanup?.run).toBe('string');
     expect(typeof actions.system_cleanup?.status).toBe('string');
+    expect(typeof actions.system_cleanup?.cancel).toBe('string');
 
     if (locale !== 'en') {
       // translationCoverage.test.ts caps exact-English duplicates per namespace
@@ -68,6 +71,7 @@ describe('system_cleanup catalog labels exist in all 8 locales', () => {
       expect(actions.system_cleanup.list).not.toBe(en.aiAgentsPage.catalog.actions.system_cleanup.list);
       expect(actions.system_cleanup.run).not.toBe(en.aiAgentsPage.catalog.actions.system_cleanup.run);
       expect(actions.system_cleanup.status).not.toBe(en.aiAgentsPage.catalog.actions.system_cleanup.status);
+      expect(actions.system_cleanup.cancel).not.toBe(en.aiAgentsPage.catalog.actions.system_cleanup.cancel);
     }
   });
 });

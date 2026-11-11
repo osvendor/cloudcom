@@ -36,12 +36,14 @@ import {
   alertVerdictOutcomeSchema,
   fleetDesignOutcomeFromSubmission,
   fleetDesignSubmissionSchema,
+  fleetDesignRuleFields,
   narrativeOutcomeFromSubmission,
   narrativeSubmissionSchema,
   patchPlanOutcomeFromSubmission,
   patchPlanSubmissionSchema,
   analysisOutcomeSchema,
   ANALYSIS_FINDING_SEVERITIES,
+  RESEARCH_SUBMISSION_SHAPE,
   sweepFindingsOutcomeSchema,
   ticketTriageProposalSchema,
   type AiAgentRunProfile,
@@ -53,9 +55,22 @@ import {
   type NarrativeOutcome,
   type PatchPlanOutcome,
   type PatchPlanOutcomeRefs,
+  type ResearchOutcome,
   type SweepFindingsOutcome,
   type TicketTriageProposal,
   type SubmitTaskStepPayload,
+  nudgeSchema,
+  proposeActionSchema,
+  raiseConcernSchema,
+  requestSpecialistSchema,
+  updateConcernSchema,
+  updateConcernToolShape,
+  validateRequestSpecialist,
+  type NudgeInput,
+  type ProposeActionInput,
+  type RaiseConcernInput,
+  type RequestSpecialistInput,
+  type UpdateConcernInput,
 } from '@breeze/shared';
 import {
   SUBMIT_TASK_STEP_DESCRIPTION,
@@ -63,6 +78,7 @@ import {
   SUBMIT_TASK_STEP_TOOL_NAME,
   validateSubmitTaskStep,
 } from './tools/submitTaskStep';
+import { validateResearchSubmission, type ResearchToolRefs } from './researchSubmission';
 
 export const OUTCOME_TOOL_NAMES = [
   'submit_alert_verdict', 'submit_sweep_findings', 'submit_narrative', 'submit_ticket_proposal',
@@ -80,6 +96,20 @@ export const OUTCOME_TOOL_NAMES = [
   // `outcomeToolsForProfile('full')` is deliberately `[]`. It is selected by
   // `outcomeToolsForRun` on the run's task linkage instead.
   'submit_task_step',
+  // AI Suggested Fixes W2 — see outcomeToolsForProfile's 'remediation_research' arm.
+  'submit_suggestions',
+  // Wisp W05b — the `assessment` profile's FIVE outcome tools (the first
+  // profile with more than one). Unlike every `submit_*` tool above, each may
+  // be called many times per run: capture APPENDS to `outcome.assessment.<list>`
+  // and `finalizeAssessment` (assessmentFinalizer.ts) applies them after the
+  // run. `record_concern`, not `raise_concern`: that name is the CHAT tool in
+  // TOOL_TIERS (W05a Task 11b), and `createBreezeMcpServer` refuses an extra
+  // tool whose name is a TOOL_TIERS key.
+  'record_concern',
+  'update_concern',
+  'nudge',
+  'propose_action',
+  'request_specialist',
 ] as const;
 export type OutcomeToolName = (typeof OUTCOME_TOOL_NAMES)[number];
 // `ReturnType<typeof tool>` does not resolve usefully here: `tool` is generic
@@ -90,6 +120,10 @@ export type OutcomeToolName = (typeof OUTCOME_TOOL_NAMES)[number];
 // sidesteps this the same way: `Array<SdkMcpToolDefinition<any>>`.
 export type SdkTool = SdkMcpToolDefinition<any>;
 
+/** Wisp W05b — what one assessment outcome-tool call validates to. */
+export type AssessmentToolInput =
+  | RaiseConcernInput | UpdateConcernInput | NudgeInput | ProposeActionInput | RequestSpecialistInput;
+
 export const OUTCOME_MCP_TOOL_NAMES: Record<OutcomeToolName, string> = {
   submit_task_step: 'mcp__breeze__submit_task_step',
   submit_alert_verdict: 'mcp__breeze__submit_alert_verdict',
@@ -99,6 +133,12 @@ export const OUTCOME_MCP_TOOL_NAMES: Record<OutcomeToolName, string> = {
   submit_fleet_design: 'mcp__breeze__submit_fleet_design',
   submit_patch_plan: 'mcp__breeze__submit_patch_plan',
   submit_analysis: 'mcp__breeze__submit_analysis',
+  submit_suggestions: 'mcp__breeze__submit_suggestions',
+  record_concern: 'mcp__breeze__record_concern',
+  update_concern: 'mcp__breeze__update_concern',
+  nudge: 'mcp__breeze__nudge',
+  propose_action: 'mcp__breeze__propose_action',
+  request_specialist: 'mcp__breeze__request_specialist',
 };
 
 /**
@@ -111,6 +151,10 @@ export interface PatchPlanToolRefs {
   refs: PatchPlanOutcomeRefs;
   evidenceTruncated: boolean;
   generatedAt: string;
+}
+
+function isResearchToolRefs(value: unknown): value is ResearchToolRefs {
+  return !!value && typeof value === 'object' && 'scriptIdsAnyOs' in value;
 }
 
 function isPatchPlanToolRefs(value: unknown): value is PatchPlanToolRefs {
@@ -191,6 +235,19 @@ export function outcomeToolsForProfile(profile: AiAgentRunProfile): OutcomeToolN
     // outcome is still the only thing anything downstream reads.
     case 'analysis':
       return ['submit_analysis'];
+    // AI Suggested Fixes W2 — a research run's ONE output channel.
+    case 'remediation_research':
+      return ['submit_suggestions'];
+    // Wisp W05b — five tools, in the order the assessment prompt lists the
+    // outcomes. The drill-down floor (`assessmentProfile.ts`'s
+    // `ASSESSMENT_TOOL_ALLOWLIST`) is not an outcome tool and is never
+    // returned here.
+    case 'assessment':
+      return ['record_concern', 'update_concern', 'nudge', 'propose_action', 'request_specialist'];
+    // Wisp delegation W1 (#11084) — no outcome tool: the run's output is its
+    // summary plus the approval intents its proposals mint.
+    case 'device_troubleshooting':
+      return [];
     default: {
       const exhaustive: never = profile;
       throw new Error(`[outcomeToolsForProfile] Unknown run profile: ${String(exhaustive)}`);
@@ -252,6 +309,15 @@ export function validateOutcomeToolInput(
 export function validateOutcomeToolInput(
   toolName: 'submit_patch_plan', input: unknown, refs: PatchPlanToolRefs,
 ): PatchPlanOutcome;
+/**
+ * AI Suggested Fixes W2 — `submit_suggestions`' validated outcome is the
+ * SERVER-BUILT `ResearchOutcome` (accepted items + recorded rejections). Like
+ * the patch/design overloads it REQUIRES run refs: the OS-filtered catalog
+ * sets computed once per run by researchContext.ts.
+ */
+export function validateOutcomeToolInput(
+  toolName: 'submit_suggestions', input: unknown, refs: ResearchToolRefs,
+): ResearchOutcome;
 // The union overload the run loop's hooks call through: `toolName` there is
 // the `OutcomeToolName` the SDK handed them, not a literal, so none of the
 // narrow overloads above would apply. Callers that need the concrete type
@@ -268,17 +334,42 @@ export function validateOutcomeToolInput(
  * pinned to 0).
  */
 export function validateOutcomeToolInput(toolName: 'submit_analysis', input: unknown): AnalysisOutcome;
+/**
+ * Wisp W05b — the five assessment tools' validated outcome IS the raw tool
+ * input, parsed by the shared W05a schemas (`validators/wispConcerns.ts`).
+ * Every id in it is model-supplied and therefore untrusted: `finalizeAssessment`
+ * re-reads each concern under the grant ceiling and pins it to the run's org
+ * before it writes anything.
+ */
+export function validateOutcomeToolInput(toolName: 'record_concern', input: unknown): RaiseConcernInput;
+export function validateOutcomeToolInput(toolName: 'update_concern', input: unknown): UpdateConcernInput;
+export function validateOutcomeToolInput(toolName: 'nudge', input: unknown): NudgeInput;
+export function validateOutcomeToolInput(toolName: 'propose_action', input: unknown): ProposeActionInput;
+export function validateOutcomeToolInput(toolName: 'request_specialist', input: unknown): RequestSpecialistInput;
 export function validateOutcomeToolInput(
-  toolName: OutcomeToolName, input: unknown, refs?: FleetDesignOutcomeRefs | PatchPlanToolRefs,
+  toolName: OutcomeToolName, input: unknown, refs?: FleetDesignOutcomeRefs | PatchPlanToolRefs | ResearchToolRefs,
 ): AlertVerdictOutcome | SweepFindingsOutcome | NarrativeOutcome | TicketTriageProposal | SubmitTaskStepPayload
-  | FleetDesignOutcome | PatchPlanOutcome | AnalysisOutcome;
+  | FleetDesignOutcome | PatchPlanOutcome | AnalysisOutcome | ResearchOutcome | AssessmentToolInput;
 export function validateOutcomeToolInput(
-  toolName: OutcomeToolName, input: unknown, refs?: FleetDesignOutcomeRefs | PatchPlanToolRefs,
+  toolName: OutcomeToolName, input: unknown, refs?: FleetDesignOutcomeRefs | PatchPlanToolRefs | ResearchToolRefs,
 ): AlertVerdictOutcome | SweepFindingsOutcome | NarrativeOutcome | TicketTriageProposal | SubmitTaskStepPayload
-  | FleetDesignOutcome | PatchPlanOutcome | AnalysisOutcome {
+  | FleetDesignOutcome | PatchPlanOutcome | AnalysisOutcome | ResearchOutcome | AssessmentToolInput {
   switch (toolName) {
+    case 'record_concern':
+      return raiseConcernSchema.parse(input);
+    case 'update_concern':
+      return updateConcernSchema.parse(input);
+    case 'nudge':
+      return nudgeSchema.parse(input);
+    case 'propose_action':
+      return proposeActionSchema.parse(input);
+    case 'request_specialist':
+      return validateRequestSpecialist(input);
     case 'submit_analysis':
       return analysisOutcomeSchema.parse(input);
+    case 'submit_suggestions':
+      if (!isResearchToolRefs(refs)) throw new Error('[validateOutcomeToolInput] submit_suggestions needs research refs');
+      return validateResearchSubmission(input, refs);
     case 'submit_task_step':
       return validateSubmitTaskStep(input);
     case 'submit_alert_verdict':
@@ -293,7 +384,7 @@ export function validateOutcomeToolInput(
     case 'submit_ticket_proposal':
       return ticketTriageProposalSchema.parse(input);
     case 'submit_fleet_design': {
-      if (!refs || isPatchPlanToolRefs(refs)) throw new Error('[validateOutcomeToolInput] submit_fleet_design needs design refs');
+      if (!refs || isPatchPlanToolRefs(refs) || isResearchToolRefs(refs)) throw new Error('[validateOutcomeToolInput] submit_fleet_design needs design refs');
       // `.parse` first (the message names the offending path — the model
       // reads it back as the tool error), then the referential pass, which
       // throws `FleetDesignReferenceError` with the same path discipline.
@@ -561,24 +652,34 @@ const FLEET_DESIGN_WATCH_SHAPE = z.object({
   rationale: z.string().describe('Why THIS fleet needs this watch. REQUIRED — never leave blank.'),
 });
 
+// W05c2 (#6371): a rule proposal IS a monitor definition. The field map comes
+// from @breeze/shared so the model-facing shape cannot drift from the validator
+// that parses the submission (which also runs the kind/condition cross-checks).
 const FLEET_DESIGN_RULE_SHAPE = z.object({
-  name: z.string().max(200).describe('A short, human-readable rule name.'),
-  severity: z.enum(['critical', 'high', 'medium', 'low', 'info']).describe('How urgent a firing of this rule is.'),
-  conditions: z.array(z.record(z.string(), z.unknown())).describe(
-    'One or more alert-rule conditions, in the shape the alert rule system already uses.',
+  ...fleetDesignRuleFields,
+  name: fleetDesignRuleFields.name.describe('A short, human-readable monitor name.'),
+  kind: fleetDesignRuleFields.kind.describe(
+    'The monitor kind (cpu, memory, disk, offline, event_log, service, process, ...). kind and condition must match.',
   ),
-  cooldownMinutes: z.number().int().min(1).max(1440).describe('Minutes to wait before re-alerting on the same condition.'),
-  rationale: z.string().describe('Why THIS fleet needs this rule. REQUIRED — never leave blank.'),
-  action: z.union([
-    z.literal('none').describe('Alert only, no automated response.'),
-    z.object({
-      kind: z.enum(['playbook', 'script']),
-      ref: z.string().max(200).describe('The playbook or script name/id this rule runs.'),
-    }),
-  ]).describe('An automated response to run when this rule fires, or "none".'),
-  paging: z.enum(['none', 'business_hours', 'always']).describe('When a technician should be paged for this rule.'),
-  sourceTemplateId: z.string().uuid().optional().describe('The alert template id this rule was adapted from, if any.'),
-});
+  condition: fleetDesignRuleFields.condition.describe(
+    'The monitor condition in the monitor-definition shape for this kind, e.g. disk: { operator: "gt", value: 85, durationMinutes: 15 }.',
+  ),
+  severity: fleetDesignRuleFields.severity.describe('How urgent a firing of this monitor is.'),
+  cooldownMinutes: fleetDesignRuleFields.cooldownMinutes.describe('Minutes to wait before re-alerting on the same condition.'),
+  responses: fleetDesignRuleFields.responses.describe(
+    'Device-bound responses that execute when the monitor fires. Usually []. Allowed: { type: "execute_command", kind: "restart_service" } on service monitors, send_notification, create_alert. Scripts and commands are refused; recommend them via action instead.',
+  ),
+  deliveryMode: fleetDesignRuleFields.deliveryMode.describe(
+    'Notification delivery: "inherit" (routing decides; the default), "channels" (needs deliveryChannelIds) or "none" (inbox only).',
+  ),
+  rationale: fleetDesignRuleFields.rationale.describe('Why THIS fleet needs this monitor. REQUIRED — never leave blank.'),
+  action: fleetDesignRuleFields.action.describe(
+    'A recommended playbook or script for a technician, or "none". Recommendation only — it is not executed.',
+  ),
+  paging: fleetDesignRuleFields.paging.describe('Recommended paging for this monitor. Recommendation only.'),
+}).describe(
+  'A monitor definition. kind and condition must match. Only responses execute; action and paging are recommendation notes. Delivery inherits routing unless explicitly overridden.',
+);
 
 const SUBMIT_FLEET_DESIGN_SHAPE = {
   found: z.object({
@@ -596,7 +697,7 @@ const SUBMIT_FLEET_DESIGN_SHAPE = {
   monitoring: z.array(z.object({
     functionKey: FLEET_DESIGN_FUNCTION_KEY_SHAPE,
     watches: z.array(FLEET_DESIGN_WATCH_SHAPE).describe('Service/process watches for this function.'),
-    alertRules: z.array(FLEET_DESIGN_RULE_SHAPE).describe('Alert rules for this function.'),
+    alertRules: z.array(FLEET_DESIGN_RULE_SHAPE).describe('Monitor-definition proposals for this function; the collection name is retained for stable approval references.'),
   })).describe('What to watch, and why — one entry per function key named in `functions`.'),
   retired: z.array(z.object({
     kind: z.enum(['watch', 'rule']).describe('Whether the retired item was a watch or an alert rule.'),
@@ -745,9 +846,19 @@ const SUBMIT_PATCH_PLAN_SHAPE = {
   })).max(PATCH_PLAN_MAX_ITEMS).describe('The plan items, most important first. An empty array is valid.'),
 };
 
+/** Wisp assessment — the run's own org, the only id an `org` concern subject may name (#10387). */
+export interface AssessmentToolRefs {
+  orgId: string;
+}
+
 export function buildOutcomeSdkTools(
   names: readonly OutcomeToolName[],
-  refs?: { design?: FleetDesignOutcomeRefs; patch?: PatchPlanToolRefs },
+  refs?: {
+    design?: FleetDesignOutcomeRefs;
+    patch?: PatchPlanToolRefs;
+    research?: ResearchToolRefs;
+    assessment?: AssessmentToolRefs;
+  },
 ): SdkTool[] {
   return names.map((name) => {
     switch (name) {
@@ -858,6 +969,103 @@ export function buildOutcomeSdkTools(
           },
         ) as SdkTool;
       }
+      case 'submit_suggestions': {
+        const research = refs?.research;
+        if (!research) throw new Error('[buildOutcomeSdkTools] submit_suggestions requires research refs');
+        return tool(
+          'submit_suggestions',
+          'Record your fix suggestions for this problem on this device. Only visible, OS-compatible catalog items, '
+          + 'the allowlisted built-in actions, short manual steps, or a draft_request hand-off. Nothing here runs. '
+          + 'Call exactly once, as your last action.',
+          RESEARCH_SUBMISSION_SHAPE,
+          async (input) => {
+            const outcome = validateOutcomeToolInput('submit_suggestions', input, research); // throws → model retries
+            return { content: [{ type: 'text', text: JSON.stringify({ status: 'recorded', accepted: outcome.items.length, rejected: outcome.rejected }) }] };
+          },
+        ) as SdkTool;
+      }
+      // Wisp W05b — the assessment tools. Raw shapes come straight from the
+      // shared W05a schemas; the AUTHORITY is still the full schema's `.parse()`
+      // in `validateOutcomeToolInput`, which carries what a raw shape cannot
+      // (`update_concern`'s refine and its outcome-implies-resolved transform,
+      // #11427). The handlers validate only; the run loop captures the parsed
+      // value, so the finalizer always sees the transformed call. Validate-only, static ack, no DB — `finalizeAssessment`
+      // applies the captured calls after the run.
+      case 'record_concern': {
+        // #10387: an `org` subject can only be the run's org; `finalizeAssessment`
+        // drops any other (`raise_subject_not_in_org`). Refuse it HERE as an
+        // error result naming the right id, so the model can correct the call
+        // instead of being told `recorded` for a concern that will never exist.
+        // The run loop's post hook never captures an error result, and the
+        // finalizer's check stays the authority. Same wiring-time refusal as
+        // submit_fleet_design: no run org, no tool.
+        const assessment = refs?.assessment;
+        if (!assessment) throw new Error("[buildOutcomeSdkTools] record_concern requires the run's org id");
+        return tool(
+          'record_concern',
+          'Record something Wisp should keep tracking for this org. One subject per call. A concern about the '
+          + 'organization as a whole uses subject kind "org" with the organization id from the task.',
+          raiseConcernSchema.shape,
+          async (input) => {
+            const raise = validateOutcomeToolInput('record_concern', input); // throws → model retries
+            if (raise.subject.kind === 'org' && raise.subject.id !== assessment.orgId) {
+              const error = `Not recorded: an org subject must be this assessment's organization id ${assessment.orgId}. `
+                + `Call record_concern again with subject { kind: 'org', id: '${assessment.orgId}' }.`;
+              return { content: [{ type: 'text', text: JSON.stringify({ error }) }], isError: true };
+            }
+            return { content: [{ type: 'text', text: JSON.stringify({ status: 'recorded' }) }] };
+          },
+        ) as SdkTool;
+      }
+      case 'update_concern':
+        return tool(
+          'update_concern',
+          'Change severity/summary/evidence of an open concern, or close it. To close a concern send '
+          + "status: 'resolved' with an outcome (one sentence on how it ended); a summary edit alone keeps it open.",
+          updateConcernToolShape,
+          async (input) => {
+            validateOutcomeToolInput('update_concern', input); // throws → model retries
+            return { content: [{ type: 'text', text: JSON.stringify({ status: 'recorded' }) }] };
+          },
+        ) as SdkTool;
+      case 'nudge':
+        return tool(
+          'nudge',
+          'Tell the person Wisp works for about one concern with one suggested next step. Respect the eligibility '
+          + 'shown in the concerns list.',
+          nudgeSchema.shape,
+          async (input) => {
+            validateOutcomeToolInput('nudge', input); // throws → model retries
+            return { content: [{ type: 'text', text: JSON.stringify({ status: 'recorded' }) }] };
+          },
+        ) as SdkTool;
+      case 'propose_action':
+        return tool(
+          'propose_action',
+          'Propose a Tier-2/3 tool call for approval. Never executes directly.',
+          proposeActionSchema.shape,
+          async (input) => {
+            validateOutcomeToolInput('propose_action', input); // throws → model retries
+            return { content: [{ type: 'text', text: JSON.stringify({ status: 'recorded' }) }] };
+          },
+        ) as SdkTool;
+      case 'request_specialist':
+        // Wisp W07 (spec §7.5): validate-only, like its siblings. The post-hook
+        // captures the call into `outcome.assessment.specialistRequests`; the
+        // deterministic coordinator admits it AFTER the model's turn
+        // (`wisp/specialistDispatch.ts`). No model-callable tool launches a run.
+        return tool(
+          'request_specialist',
+          'Ask Wisp for a specialist (sweep, analysis, operator_recipe, patch_plan, remediation_research, '
+          + 'bulk_ticket_reply, device_troubleshooting) on this org. The request is recorded now and handled by Wisp\'s coordinator after '
+          + 'the assessment ends — nothing launches during this run. Kinds that ask first become an approval card '
+          + 'for the person Wisp works for. At most 3 requests per assessment; extra requests are refused.',
+          requestSpecialistSchema.shape,
+          async (input) => {
+            validateOutcomeToolInput('request_specialist', input); // throws → model retries
+            return { content: [{ type: 'text', text: JSON.stringify({ status: 'recorded' }) }] };
+          },
+        ) as SdkTool;
       case 'submit_analysis':
         return tool(
           'submit_analysis',

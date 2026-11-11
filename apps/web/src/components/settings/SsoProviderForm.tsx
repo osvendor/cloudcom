@@ -1,10 +1,12 @@
 import { i18n } from '@/lib/i18n';
 import type { TFunction } from 'i18next';
 import { useTranslation } from 'react-i18next';
-import { useMemo, useEffect, useState } from 'react';
+import { useMemo, useEffect, useRef, useState, type ChangeEvent } from 'react';
 import { useForm, useWatch } from 'react-hook-form';
 import { z } from 'zod';
 import { zodResolver } from '@hookform/resolvers/zod';
+import { SSO_OIDC_PRESET_IDS, type SsoOidcPresetId } from '@breeze/shared';
+import { ConfirmDialog } from '../shared/ConfirmDialog';
 
 const createSsoProviderSchema = (t: TFunction) => z.object({
   name: z.string().min(1, t('ssoProviderForm.providerNameIsRequired')),
@@ -30,8 +32,8 @@ const createSsoProviderSchema = (t: TFunction) => z.object({
   defaultRoleId: z.string().optional(),
   allowedDomains: z.string().optional(),
   enforceSSO: z.boolean(),
-  // #4018: whether Breeze accepts the IdP's own MFA assertion (`amr: mfa` in
-  // the id_token) as satisfying MFA-gated routes. Off by default — the API
+  // #4018: whether Breeze accepts the IdP's own MFA assertion (`amr: mfa` or
+  // `amr: phr` in the id_token) as satisfying MFA-gated routes. Off by default — the API
   // schemas (createProviderSchema/updateProviderSchema) already mark it
   // optional and default it to false; this mirrors that on the client.
   trustsIdpMfa: z.boolean()
@@ -83,15 +85,73 @@ type SsoProviderFormProps = {
   hasClientSecret?: boolean;
   /** Show the ownership-scope selector (create-only, partner-scope users). */
   showOwnerScope?: boolean;
+  /**
+   * #7252: the viewer is in the All-organizations (fleet) view, so there is no
+   * org for an org-owned provider to belong to — the API 400s that create.
+   * Only meaningful alongside `showOwnerScope`.
+   */
+  noOrgSelected?: boolean;
+  /**
+   * Whether the viewer may create partner-wide state (`canManagePartnerWide`
+   * from /users/me — false for `org_access = 'selected'` partner users; absent
+   * is treated as capable, the server enforces regardless). Only meaningful
+   * alongside `showOwnerScope`.
+   */
+  canManagePartnerWide?: boolean;
 };
 
-const presetOptions = [
+// Option values are the API's preset ids (#9601). The Record is keyed by the
+// shared SsoOidcPresetId union — the same type the API's PROVIDER_PRESETS table
+// uses — so adding, renaming or misspelling a preset fails typecheck here
+// instead of silently autofilling nothing. (Azure was once 'azure' here vs
+// 'azure-ad' in the API.)
+const PRESET_LABEL_KEYS: Record<SsoOidcPresetId, string> = {
+  'azure-ad': 'ssoProviderForm.azureADEntraID',
+  okta: 'ssoProviderForm.okta',
+  google: 'ssoProviderForm.googleWorkspace',
+  auth0: 'ssoProviderForm.auth0'
+};
+
+const presetOptions: { value: SsoOidcPresetId | ''; labelKey: string }[] = [
   { value: '', labelKey: 'ssoProviderForm.customConfiguration' },
-  { value: 'azure', labelKey: 'ssoProviderForm.azureADEntraID' },
-  { value: 'okta', labelKey: 'ssoProviderForm.okta' },
-  { value: 'google', labelKey: 'ssoProviderForm.googleWorkspace' },
-  { value: 'auth0', labelKey: 'ssoProviderForm.auth0' }
+  ...SSO_OIDC_PRESET_IDS.map(id => ({ value: id, labelKey: PRESET_LABEL_KEYS[id] }))
 ];
+
+// The fields a preset owns. Every attribute-mapping key is spelled out so that
+// applying a preset REPLACES the whole mapping: a key the new preset omits is
+// written as '' instead of being left at the previous preset's value (#9948 —
+// Okta's `groups=groups` survived a switch to Azure AD, which sets no groups
+// claim, and the groups claim feeds group-based role mapping).
+type PresetFields = {
+  scopes: string;
+  attributeMapping: { email: string; name: string; firstName: string; lastName: string; groups: string };
+};
+
+function toPresetFields(values: {
+  scopes?: string;
+  attributeMapping?: Partial<SsoProviderFormValues['attributeMapping']>;
+}): PresetFields {
+  const mapping = values.attributeMapping ?? {};
+  return {
+    scopes: values.scopes ?? '',
+    attributeMapping: {
+      email: mapping.email ?? '',
+      name: mapping.name ?? '',
+      firstName: mapping.firstName ?? '',
+      lastName: mapping.lastName ?? '',
+      groups: mapping.groups ?? ''
+    }
+  };
+}
+
+function samePresetFields(a: PresetFields, b: PresetFields): boolean {
+  return a.scopes === b.scopes
+    && a.attributeMapping.email === b.attributeMapping.email
+    && a.attributeMapping.name === b.attributeMapping.name
+    && a.attributeMapping.firstName === b.attributeMapping.firstName
+    && a.attributeMapping.lastName === b.attributeMapping.lastName
+    && a.attributeMapping.groups === b.attributeMapping.groups;
+}
 
 export default function SsoProviderForm({
   onSubmit,
@@ -105,16 +165,30 @@ export default function SsoProviderForm({
   testingConnection,
   isEditing,
   hasClientSecret,
-  showOwnerScope = false
+  showOwnerScope = false,
+  noOrgSelected = false,
+  canManagePartnerWide = true
 }: SsoProviderFormProps) {
   const { t } = useTranslation('settings');
   const [showSecret, setShowSecret] = useState(false);
+
+  // #7252: never offer (or default to) an owner the API is guaranteed to
+  // refuse. An org-owned create needs a selected org; a partner-wide create
+  // needs full partner org access. Both only apply to the create-time
+  // selector — edits never send ownerScope.
+  const ownerSelectorActive = showOwnerScope && !isEditing;
+  const orgOwnerDisabled = ownerSelectorActive && noOrgSelected;
+  const partnerOwnerDisabled = ownerSelectorActive && !canManagePartnerWide;
+  const noOwnerAvailable = orgOwnerDisabled && partnerOwnerDisabled;
+  const initialOwnerScope: 'organization' | 'partner' =
+    orgOwnerDisabled && !partnerOwnerDisabled ? 'partner' : 'organization';
 
   const {
     register,
     handleSubmit,
     formState: { errors, isSubmitting },
     setValue,
+    getValues,
     control,
   } = useForm<SsoProviderFormValues>({
     resolver: zodResolver(createSsoProviderSchema(t)),
@@ -138,12 +212,11 @@ export default function SsoProviderForm({
       allowedDomains: '',
       enforceSSO: false,
       trustsIdpMfa: false,
-      ownerScope: 'organization',
+      ownerScope: initialOwnerScope,
       ...defaultValues
     }
   });
 
-  const selectedPreset = useWatch({ control, name: 'preset' });
   const enforceSSO = useWatch({ control, name: 'enforceSSO' });
   const ownerScope = useWatch({ control, name: 'ownerScope' });
 
@@ -164,22 +237,89 @@ export default function SsoProviderForm({
     return scoped.filter(r => !r.isSystem);
   }, [roles, ownerScope]);
 
-  // Apply preset configuration when preset changes
+  // `initialOwnerScope` only seeds the form at mount. If availability changes
+  // while it is open (e.g. the org selection is cleared), a disabled radio
+  // stays checked and would still submit, so move the selection to the option
+  // that is still available.
   useEffect(() => {
-    if (selectedPreset && presets.length > 0) {
-      const preset = presets.find(p => p.id === selectedPreset);
-      if (preset) {
-        setValue('scopes', preset.scopes);
-        setValue('attributeMapping', preset.attributeMapping);
-      }
+    if (ownerScope === 'organization' && orgOwnerDisabled && !partnerOwnerDisabled) {
+      setValue('ownerScope', 'partner');
+    } else if (ownerScope === 'partner' && partnerOwnerDisabled && !orgOwnerDisabled) {
+      setValue('ownerScope', 'organization');
     }
-  }, [selectedPreset, presets, setValue]);
+  }, [ownerScope, orgOwnerDisabled, partnerOwnerDisabled, setValue]);
+
+  // Preset application (#9948). Picking a preset replaces every preset-owned
+  // field (scopes + the whole attribute mapping). It does so silently only when
+  // nothing the admin owns would be lost: the fields still hold what the last
+  // preset (or the form's own create defaults) put there, or already equal the
+  // new preset's values. Otherwise — the admin typed over them, or this is an
+  // edit of a saved provider whose stored mapping is the admin's — it asks
+  // first. Cancel keeps both the edits and the previous preset selection.
+  //
+  // Applied from the select's change handler rather than an effect on the
+  // watched value so a re-render (e.g. `presets` arriving) can never re-apply a
+  // preset over edits made after it was picked.
+  //
+  // `presetBaselineRef`: the preset-owned values as the last preset left them;
+  // null when the starting values are the admin's (edit, or caller-supplied).
+  const [initialPresetBaseline] = useState<PresetFields | null>(() =>
+    isEditing || defaultValues?.scopes !== undefined || defaultValues?.attributeMapping !== undefined
+      ? null
+      : toPresetFields(getValues())
+  );
+  const presetBaselineRef = useRef<PresetFields | null>(initialPresetBaseline);
+  const appliedPresetRef = useRef<string>(getValues('preset') ?? '');
+  const [pendingPreset, setPendingPreset] = useState<{ id: string; label: string; fields: PresetFields } | null>(null);
+
+  const applyPreset = (id: string, fields: PresetFields) => {
+    setValue('preset', id);
+    setValue('scopes', fields.scopes);
+    setValue('attributeMapping', fields.attributeMapping);
+    presetBaselineRef.current = fields;
+    appliedPresetRef.current = id;
+  };
+
+  const presetField = register('preset');
+  const handlePresetChange = (event: ChangeEvent<HTMLSelectElement>) => {
+    const id = event.target.value;
+    const preset = id ? presets.find(p => p.id === id) : undefined;
+    if (!preset) {
+      // Custom configuration: keep the current values for the admin to edit.
+      // (Preset options not in the loaded list are disabled, see the select.)
+      appliedPresetRef.current = id;
+      void presetField.onChange(event);
+      return;
+    }
+    const next = toPresetFields(preset);
+    const current = toPresetFields(getValues());
+    const baseline = presetBaselineRef.current;
+    if (samePresetFields(current, next) || (baseline !== null && samePresetFields(current, baseline))) {
+      applyPreset(id, next);
+      return;
+    }
+    const labelKey = (PRESET_LABEL_KEYS as Record<string, string | undefined>)[id];
+    setPendingPreset({ id, label: labelKey ? t(/* i18n-dynamic */ labelKey) : preset.name, fields: next });
+  };
+
+  const confirmPendingPreset = () => {
+    if (pendingPreset) applyPreset(pendingPreset.id, pendingPreset.fields);
+    setPendingPreset(null);
+  };
+
+  const cancelPendingPreset = () => {
+    // The uncontrolled select already shows the declined choice; put it back.
+    setValue('preset', appliedPresetRef.current);
+    setPendingPreset(null);
+  };
 
   const isLoading = useMemo(() => loading ?? isSubmitting, [loading, isSubmitting]);
 
   return (
     <form
       onSubmit={handleSubmit(async values => {
+        // Enter in a field submits even while the Save button is disabled.
+        if (noOwnerAvailable) return;
         await onSubmit?.(values);
       })}
       className="space-y-6 rounded-lg border bg-card p-6 shadow-xs"
@@ -188,24 +328,38 @@ export default function SsoProviderForm({
       {showOwnerScope && !isEditing && (
         <fieldset className="space-y-2 rounded-md border p-4" data-testid="sso-provider-owner">
           <legend className="px-1 text-xs font-medium uppercase text-muted-foreground">{t('ssoProviderForm.appliesTo')}</legend>
-          <label className="flex items-center gap-2 text-sm">
+          <label className={`flex items-center gap-2 text-sm${orgOwnerDisabled ? ' text-muted-foreground' : ''}`}>
             <input
               type="radio"
               value="organization"
+              disabled={orgOwnerDisabled}
               {...register('ownerScope')}
               data-testid="sso-provider-owner-org"
             />
             {t('ssoProviderForm.thisOrganization')}</label>
-          <label className="flex items-center gap-2 text-sm">
+          {orgOwnerDisabled && !noOwnerAvailable && (
+            <p className="pl-6 text-xs text-muted-foreground" data-testid="sso-provider-owner-org-hint">
+              {t('ssoProviderForm.selectAnOrganizationToCreateAnOrgProvider')}</p>
+          )}
+          <label className={`flex items-center gap-2 text-sm${partnerOwnerDisabled ? ' text-muted-foreground' : ''}`}>
             <input
               type="radio"
               value="partner"
+              disabled={partnerOwnerDisabled}
               {...register('ownerScope')}
               data-testid="sso-provider-owner-partner"
             />
             {t('ssoProviderForm.partnerTechnicianLogin')}{' '}
             <span className="text-muted-foreground">{t('ssoProviderForm.yourOwnTeamSignsInWithThis')}</span>
           </label>
+          {partnerOwnerDisabled && !noOwnerAvailable && (
+            <p className="pl-6 text-xs text-muted-foreground" data-testid="sso-provider-owner-partner-hint">
+              {t('ssoProviderForm.partnerProviderRequiresFullPartnerAccess')}</p>
+          )}
+          {noOwnerAvailable && (
+            <p role="alert" className="text-sm text-destructive" data-testid="sso-provider-owner-blocked">
+              {t('ssoProviderForm.selectAnOrganizationBeforeCreatingAProvider')}</p>
+          )}
         </fieldset>
       )}
 
@@ -232,10 +386,17 @@ export default function SsoProviderForm({
             <select
               id="provider-preset"
               className="h-10 w-full rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
-              {...register('preset')}
+              {...presetField}
+              onChange={handlePresetChange}
             >
               {presetOptions.map(option => (
-                <option key={option.value} value={option.value}>
+                <option
+                  key={option.value}
+                  value={option.value}
+                  // A preset applies only from the loaded list; until it loads
+                  // (or if /sso/presets failed) picking one could fill nothing.
+                  disabled={option.value !== '' && !presets.some(p => p.id === option.value)}
+                >
                   {t(/* i18n-dynamic */ option.labelKey)}
                 </option>
               ))}
@@ -548,13 +709,26 @@ export default function SsoProviderForm({
           <button
             type="submit"
             data-testid="provider-save"
-            disabled={isLoading}
+            disabled={isLoading || noOwnerAvailable}
             className="flex h-11 w-full items-center justify-center rounded-md bg-primary text-sm font-medium text-primary-foreground transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60 sm:w-auto sm:px-6"
           >
             {isLoading ? t('ssoProviderForm.saving') : submitLabel}
           </button>
         </div>
       </div>
+
+      {/* #9948: replacing an edited or stored mapping is never silent. Warning,
+          not destructive: nothing is saved until the admin clicks Save. */}
+      <ConfirmDialog
+        open={pendingPreset !== null}
+        onClose={cancelPendingPreset}
+        onConfirm={confirmPendingPreset}
+        variant="warning"
+        title={t('ssoProviderForm.replacePresetFields.title', { preset: pendingPreset?.label ?? '' })}
+        message={t('ssoProviderForm.replacePresetFields.message', { preset: pendingPreset?.label ?? '' })}
+        confirmLabel={t('ssoProviderForm.replacePresetFields.confirm')}
+        confirmTestId="sso-preset-replace-confirm"
+      />
     </form>
   );
 }

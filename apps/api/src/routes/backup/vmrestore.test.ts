@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Hono } from 'hono';
 import { vmRestoreRoutes } from './vmrestore';
+import { rebuildVhdxOutputPathSchema } from './schemas';
 
 const ORG_ID = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
 const SNAPSHOT_ID = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
@@ -20,6 +21,18 @@ const cancelBareMetalRecoveryMock = vi.fn();
 const queueBareMetalRebuildMock = vi.fn();
 const authorizeResilienceResourcesMock = vi.fn();
 const runOutsideDbContextMock = vi.fn((fn: () => unknown) => fn());
+
+// The integrity check itself is covered in restoreIntegrityGate.test.ts; here
+// only how the route uses its answer.
+const integrityGate = vi.hoisted(() => ({ gate: vi.fn(), check: vi.fn(), record: vi.fn() }));
+vi.mock('../../services/authEpochs', () => ({ getUserEpochs: async () => ({ authEpoch: 1, mfaEpoch: 2 }) }));
+vi.mock('./restoreIntegrityGate', () => ({
+  gateRestoreCommand: (...args: unknown[]) => integrityGate.gate(...args),
+  checkRestoreIntegrityRequest: (...args: unknown[]) => integrityGate.check(...args),
+  recordRequestAuthorization: (...args: unknown[]) => integrityGate.record(...args),
+  userCanStepUp: async () => false,
+  restoreIntegrityResponse: (c: any, check: any) => c.json(check.body, check.status),
+}));
 
 function chainMock(resolvedValue: unknown = []) {
   const chain: Record<string, any> = {};
@@ -110,6 +123,7 @@ vi.mock('../../services/commandQueue', () => ({
   CommandTypes: {
     VM_RESTORE_FROM_BACKUP: 'VM_RESTORE_FROM_BACKUP',
     VM_INSTANT_BOOT: 'VM_INSTANT_BOOT',
+    BARE_METAL_REBUILD: 'bare_metal_rebuild',
   },
 }));
 
@@ -145,6 +159,9 @@ describe('vm restore routes', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     authorizeResilienceResourcesMock.mockResolvedValue({ resources: [] });
+    integrityGate.gate.mockResolvedValue({ ok: true });
+    integrityGate.check.mockResolvedValue({ ok: true, authorizationReason: null });
+    integrityGate.record.mockResolvedValue('authorization-1');
     authState = {
       principal: { kind: 'user_session' },
       user: { id: 'user-123', email: 'test@example.com', name: 'Test User' },
@@ -159,7 +176,50 @@ describe('vm restore routes', () => {
     });
     app = new Hono();
     app.use('*', authMiddleware);
-    app.route('/', vmRestoreRoutes);
+    app.route('/backup', vmRestoreRoutes);
+  });
+
+  describe('restore integrity', () => {
+    const rows = () => {
+      selectMock
+        .mockReturnValueOnce(chainMock([{ id: SNAPSHOT_ID, orgId: ORG_ID, deviceId: 'source-device', snapshotId: 'snap-ext-001' }]))
+        .mockReturnValueOnce(chainMock([{ id: DEVICE_ID, status: 'online' }]));
+    };
+
+    it.each([
+      ['/backup/restore/as-vm', 'VM_RESTORE_FROM_BACKUP', { hypervisor: 'hyperv', vmName: 'Recovered VM' }],
+      ['/backup/restore/instant-boot', 'VM_INSTANT_BOOT', { vmName: 'Instant VM' }],
+    ])('%s answers a step-up request without creating a job or a command', async (path, commandType, extra) => {
+      rows();
+      integrityGate.gate.mockResolvedValueOnce({ ok: false, status: 403, body: { code: 'STEP_UP_REQUIRED', error: 'confirm' } });
+      const res = await app.request(path, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ snapshotId: SNAPSHOT_ID, targetDeviceId: DEVICE_ID, ...extra }),
+      });
+      expect(res.status).toBe(403);
+      expect(insertMock).not.toHaveBeenCalled();
+      expect(queueCommandForExecutionMock).not.toHaveBeenCalled();
+      expect(integrityGate.gate).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        snapshotDbId: SNAPSHOT_ID, targetDeviceId: DEVICE_ID, commandType, executingDeviceId: DEVICE_ID,
+      }));
+    });
+
+    it('queues a confirmed instant boot with the command id its authorization is bound to', async () => {
+      rows();
+      integrityGate.gate.mockResolvedValueOnce({ ok: true, commandId: 'reserved-command' });
+      const createdAt = new Date('2026-10-01T00:00:00.000Z');
+      insertMock.mockReturnValueOnce(chainMock([{ id: RESTORE_JOB_ID, status: 'pending', snapshotId: SNAPSHOT_ID, deviceId: DEVICE_ID, createdAt }]));
+      updateMock.mockReturnValue(chainMock([{ id: RESTORE_JOB_ID, status: 'pending', commandId: 'reserved-command', createdAt }]));
+      queueCommandForExecutionMock.mockResolvedValue({ command: { id: 'reserved-command', status: 'pending' } });
+      const res = await app.request('/backup/restore/instant-boot', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ snapshotId: SNAPSHOT_ID, targetDeviceId: DEVICE_ID, vmName: 'Instant VM' }),
+      });
+      expect(res.status).toBe(201);
+      expect(queueCommandForExecutionMock.mock.lastCall?.[3]).toEqual({ userId: 'user-123', commandId: 'reserved-command' });
+    });
   });
 
   it('denies cross-site VM restore before loading snapshot metadata or creating a job', async () => {
@@ -430,17 +490,17 @@ describe('vm restore routes — rebuild engine', () => {
     imageSizeGb: 120,
   };
 
-  function mockHappyPath() {
+  function mockHappyPath(platform: 'linux' | 'windows' = 'linux') {
     selectMock
       .mockReturnValueOnce(chainMock([{
         id: SNAPSHOT_ID,
         orgId: ORG_ID,
         snapshotId: 'snap-ext-001',
         deviceId: DEVICE_ID,
-        layoutManifest: { disks: [] },
+        layoutManifest: { platform, disks: [] },
         bareMetalRestorable: true,
       }]))
-      .mockReturnValueOnce(chainMock([{ id: HOST_ID, status: 'online', osType: 'linux' }]));
+      .mockReturnValueOnce(chainMock([{ id: HOST_ID, status: 'online', osType: platform }]));
     insertMock.mockReturnValueOnce(
       chainMock([{
         id: RESTORE_JOB_ID,
@@ -471,13 +531,69 @@ describe('vm restore routes — rebuild engine', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     authorizeResilienceResourcesMock.mockResolvedValue({ resources: [] });
+    integrityGate.check.mockResolvedValue({ ok: true, authorizationReason: null });
+    integrityGate.record.mockResolvedValue('authorization-1');
     vi.mocked(authMiddleware).mockImplementation((c: any, next: any) => {
       c.set('auth', authState);
       return next();
     });
     app = new Hono();
     app.use('*', authMiddleware);
-    app.route('/', vmRestoreRoutes);
+    app.route('/backup', vmRestoreRoutes);
+  });
+
+  describe('restore integrity', () => {
+    it('checks the rebuild of the snapshot\'s own device and answers a step-up request without creating anything', async () => {
+      mockHappyPath();
+      integrityGate.check.mockResolvedValueOnce({
+        ok: false, status: 403, body: { code: 'STEP_UP_REQUIRED', error: 'confirm', stepUp: { operation: 'backup_unattested_restore' } },
+      });
+      const res = await app.request('/backup/restore/as-vm', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ ...rebuildBody, stepUpGrant: '66666666-6666-4666-8666-666666666666' }),
+      });
+      expect(res.status).toBe(403);
+      expect(await res.json()).toEqual({ code: 'STEP_UP_REQUIRED', error: 'confirm', stepUp: { operation: 'backup_unattested_restore' } });
+      expect(integrityGate.check).toHaveBeenCalledWith(expect.anything(), {
+        orgId: ORG_ID,
+        snapshotDbId: SNAPSHOT_ID,
+        targetDeviceId: DEVICE_ID,
+        commandType: 'bare_metal_rebuild',
+        stepUpGrant: '66666666-6666-4666-8666-666666666666',
+        confirmUnattestedRestore: undefined,
+        // Read in the request context: the engine's org-scoped transaction
+        // cannot see a partner-level technician's user row. With a grant to
+        // consume, the factor state is not read up front.
+        userEpochs: { authEpoch: 1, mfaEpoch: 2 },
+        // The rebuild host runs the command.
+        executingDeviceId: HOST_ID,
+      });
+      expect(createBareMetalRecoveryMock).not.toHaveBeenCalled();
+      expect(queueBareMetalRebuildMock).not.toHaveBeenCalled();
+    });
+
+    it('records a confirmed rebuild\'s authorization bound to the recovery, in the same transaction', async () => {
+      mockHappyPath();
+      integrityGate.check.mockResolvedValueOnce({ ok: true, authorizationReason: 'unattested_legacy', confirmationMethod: 'mfa' });
+      const res = await app.request('/backup/restore/as-vm', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify(rebuildBody),
+      });
+      expect(res.status).toBe(202);
+      expect(integrityGate.record).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ snapshotDbId: SNAPSHOT_ID, targetDeviceId: DEVICE_ID, commandType: 'bare_metal_rebuild' }),
+        'unattested_legacy',
+        { recoveryId: RECOVERY_ID },
+        { inCurrentTransaction: true, confirmationMethod: 'mfa' },
+      );
+      // Without a grant, the factor state is read in the request context, not
+      // the engine's org-scoped transaction; the epochs are not needed.
+      expect(integrityGate.check).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ userMfaProtected: false }));
+      expect(integrityGate.check.mock.calls[0]?.[1]).not.toHaveProperty('userEpochs');
+    });
   });
 
   it('rejects an identity field on the rebuild variant (server forces identity: new)', async () => {
@@ -639,27 +755,123 @@ describe('vm restore routes — rebuild engine', () => {
     );
   });
 
-  it('refuses a rebuild host that is not a Linux device', async () => {
-    selectMock
-      .mockReturnValueOnce(chainMock([{
-        id: SNAPSHOT_ID,
-        orgId: ORG_ID,
-        snapshotId: 'snap-ext-001',
-        deviceId: DEVICE_ID,
-        layoutManifest: { disks: [] },
-        bareMetalRestorable: true,
-      }]))
-      .mockReturnValueOnce(chainMock([{ id: HOST_ID, status: 'online', osType: 'windows' }]));
+  function snapshotWithPlatform(platform: 'linux' | 'windows' | undefined) {
+    return chainMock([{
+      id: SNAPSHOT_ID,
+      orgId: ORG_ID,
+      snapshotId: 'snap-ext-001',
+      deviceId: DEVICE_ID,
+      layoutManifest: platform ? { platform, disks: [] } : { disks: [] },
+      bareMetalRestorable: true,
+    }]);
+  }
 
-    const res = await app.request('/backup/restore/as-vm', {
+  async function postRebuild(body: Record<string, unknown>) {
+    return app.request('/backup/restore/as-vm', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
-      body: JSON.stringify(rebuildBody),
+      body: JSON.stringify(body),
     });
+  }
+
+  // W06d (Task 20): the host rule is a platform MATCH, not Linux-only.
+  it('refuses a Windows rebuild host for a Linux snapshot with 409 rebuild_host_unsupported', async () => {
+    selectMock
+      .mockReturnValueOnce(snapshotWithPlatform('linux'))
+      .mockReturnValueOnce(chainMock([{ id: HOST_ID, status: 'online', osType: 'windows' }]));
+
+    const res = await postRebuild(rebuildBody);
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({
+      error: 'rebuild_host_unsupported',
+      details: { osType: 'windows', snapshotPlatform: 'linux' },
+    });
+    expect(createBareMetalRecoveryMock).not.toHaveBeenCalled();
+  });
+
+  it('refuses a Linux rebuild host for a Windows snapshot with 409 rebuild_host_unsupported', async () => {
+    selectMock
+      .mockReturnValueOnce(snapshotWithPlatform('windows'))
+      .mockReturnValueOnce(chainMock([{ id: HOST_ID, status: 'online', osType: 'linux' }]));
+
+    const res = await postRebuild(rebuildBody);
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({
+      error: 'rebuild_host_unsupported',
+      details: { osType: 'linux', snapshotPlatform: 'windows' },
+    });
+    expect(createBareMetalRecoveryMock).not.toHaveBeenCalled();
+  });
+
+  it('refuses a macOS rebuild host', async () => {
+    selectMock
+      .mockReturnValueOnce(snapshotWithPlatform('linux'))
+      .mockReturnValueOnce(chainMock([{ id: HOST_ID, status: 'online', osType: 'macos' }]));
+
+    const res = await postRebuild(rebuildBody);
 
     expect(res.status).toBe(409);
     expect(await res.json()).toMatchObject({ error: 'rebuild_host_unsupported' });
+  });
+
+  it('refuses a snapshot whose layout has no platform as snapshot_not_bare_metal_restorable', async () => {
+    // Refused before the host lookup, so only the snapshot read is queued.
+    selectMock.mockReturnValueOnce(snapshotWithPlatform(undefined));
+
+    const res = await postRebuild(rebuildBody);
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ error: 'snapshot_not_bare_metal_restorable' });
     expect(createBareMetalRecoveryMock).not.toHaveBeenCalled();
+  });
+
+  it('400s a request that includes hyperv for a Linux rebuild host', async () => {
+    mockHappyPath();
+
+    const res = await postRebuild({ ...rebuildBody, hyperv: { vmName: 'x' } });
+
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body).toMatchObject({ error: 'hyperv_requires_windows_host' });
+    expect(body.message).toMatch(/^hyperv is only valid for Windows rebuild hosts/);
+    expect(createBareMetalRecoveryMock).not.toHaveBeenCalled();
+    expect(queueBareMetalRebuildMock).not.toHaveBeenCalled();
+  });
+
+  it('accepts a Windows snapshot on a Windows host with a drive-letter path and forwards hyperv to the command', async () => {
+    mockHappyPath('windows');
+    const outputPath = 'C:\\ProgramData\\Breeze\\rebuild\\out\\dev-1.vhdx';
+    const hyperv = { vmName: 'w06-proof', switchName: 'lab-switch' };
+
+    const res = await postRebuild({ ...rebuildBody, outputPath, hyperv });
+
+    expect(res.status).toBe(202);
+    expect(queueBareMetalRebuildMock).toHaveBeenCalledWith(expect.objectContaining({
+      hostDeviceId: HOST_ID,
+      payload: expect.objectContaining({
+        target: expect.objectContaining({ kind: 'vhdx', path: outputPath }),
+        identity: 'new',
+        hyperv,
+      }),
+    }));
+    expect(vi.mocked(writeRouteAudit)).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ details: expect.objectContaining({ outputPath, hyperv }) }),
+    );
+  });
+
+  // R32
+  it.each([
+    ['/srv/rebuild/x.vhdx', true],
+    ['C:\\images\\x.vhdx', true],
+    ['c:\\images\\X.VHDX', true],
+    ['\\\\server\\share\\x.vhdx', false],
+    ['x.vhdx', false],
+    ['C:\\images\\x.img', false],
+  ])('rebuildVhdxOutputPathSchema(%j) accepted === %s', (path, accepted) => {
+    expect(rebuildVhdxOutputPathSchema.safeParse(path).success).toBe(accepted);
   });
 
   it('fails the restore job and cancels the recovery when the rebuild command cannot be queued', async () => {

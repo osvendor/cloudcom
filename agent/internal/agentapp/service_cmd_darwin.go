@@ -5,7 +5,6 @@ package agentapp
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"os/user"
 	"path/filepath"
 	"runtime"
@@ -15,12 +14,14 @@ import (
 	"github.com/breeze-rmm/agent/internal/config"
 	"github.com/breeze-rmm/agent/internal/launchdplist"
 	"github.com/breeze-rmm/agent/internal/macosuninstall"
+	"github.com/breeze-rmm/agent/internal/procspawn"
+	"github.com/breeze-rmm/agent/internal/securefs"
 	"github.com/breeze-rmm/agent/internal/sessionbroker"
 	"github.com/spf13/cobra"
 )
 
 const (
-	darwinBinaryPath                 = "/usr/local/bin/breeze-agent"
+	darwinBinaryPath                 = securefs.TrustedExecutableDir + "/breeze-agent"
 	darwinDesktopHelperBinaryPath    = "/usr/local/bin/breeze-desktop-helper"
 	darwinPlistDst                   = "/Library/LaunchDaemons/com.breeze.agent.plist"
 	darwinDesktopUserPlistDst        = "/Library/LaunchAgents/com.breeze.desktop-helper-user.plist"
@@ -28,7 +29,7 @@ const (
 	darwinLogDir                     = "/Library/Logs/Breeze"
 	darwinConfigDir                  = "/Library/Application Support/Breeze"
 	darwinLabel                      = "com.breeze.agent"
-	darwinWatchdogBinaryPath         = "/usr/local/bin/breeze-watchdog"
+	darwinWatchdogBinaryPath         = securefs.TrustedExecutableDir + "/breeze-watchdog"
 	darwinWatchdogPlistDst           = "/Library/LaunchDaemons/com.breeze.watchdog.plist"
 	darwinWatchdogLabel              = "com.breeze.watchdog"
 )
@@ -43,7 +44,7 @@ const darwinPlist = `<?xml version="1.0" encoding="UTF-8"?>
 
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/breeze-agent</string>
+        <string>/Library/Breeze/bin/breeze-agent</string>
         <string>run</string>
     </array>
 
@@ -97,7 +98,9 @@ func init() {
 	serviceCmd.AddCommand(serviceStopCmd)
 	serviceCmd.AddCommand(serviceStatusCmd)
 	serviceInstallCmd.Flags().BoolVar(&withUserHelper, "with-user-helper", false, "Also install the per-user desktop helper LaunchAgent")
-	serviceInstallCmd.Flags().BoolVar(&noWatchdog, "no-watchdog", false, "Skip automatic watchdog installation")
+	serviceInstallCmd.Flags().BoolVar(&noWatchdog, "no-watchdog", false, "Skip automatic watchdog installation and remember the choice (the running agent will not install it either)")
+	serviceInstallCmd.Flags().BoolVar(&watchdogOptIn, "watchdog", false, watchdogOptInUsage)
+	serviceInstallCmd.Flags().BoolVar(&strictWatchdog, "strict-watchdog", false, strictWatchdogUsage)
 	// A failed start returns an error from RunE; usage text would bury it.
 	serviceInstallCmd.SilenceUsage = true
 }
@@ -122,6 +125,23 @@ var serviceInstallCmd = &cobra.Command{
 			return fmt.Errorf("failed to set permissions on %s: %w", darwinConfigDir, err)
 		}
 
+		// Persist --no-watchdog / --watchdog (or honour a standing opt-out)
+		// before any install side effect: a failed marker write aborts here.
+		skipWatchdog, err := applyWatchdogFlags(defaultWatchdogFlagDeps(nil), noWatchdog, watchdogOptIn)
+		if err != nil {
+			return err
+		}
+		// The binary directory must be root-owned and not group/other
+		// writable — this is exactly what verifyOwnExecutableTrustedIfPrivileged
+		// checks at every privileged startup. EnsureTrustedDirChain walks
+		// every component under /Library with a symlink-refusing check
+		// instead of blindly creating/chowning through whatever is already
+		// there — /Library itself is admin-group-writable, so a pre-planted
+		// symlink or a foreign-owned directory must be refused, not followed.
+		if err := securefs.EnsureTrustedDirChain(securefs.TrustedExecutableDirRoot, securefs.TrustedExecutableDir, 0, 0, 0755); err != nil {
+			return fmt.Errorf("failed to secure %s: %w", securefs.TrustedExecutableDir, err)
+		}
+
 		// Stop existing service before replacing binary (safe for upgrades).
 		//
 		// Whether it was RUNNING is sampled BEFORE the unload, because this
@@ -132,14 +152,14 @@ var serviceInstallCmd = &cobra.Command{
 		wasRunning := false
 		if _, err := os.Stat(darwinPlistDst); err == nil {
 			wasRunning = isSystemServiceRunning()
-			if stopErr := exec.Command("launchctl", "unload", darwinPlistDst).Run(); stopErr != nil {
+			if stopErr := procspawn.Command("launchctl", "unload", darwinPlistDst).Run(); stopErr != nil {
 				fmt.Fprintf(os.Stderr, "Warning: failed to stop existing service: %v\n", stopErr)
 			} else {
 				fmt.Println("Stopped existing Breeze Agent service.")
 			}
 		}
 
-		// Copy current binary to /usr/local/bin/
+		// Copy current binary to the trusted binary directory.
 		exePath, err := os.Executable()
 		if err != nil {
 			return fmt.Errorf("failed to determine executable path: %w", err)
@@ -270,7 +290,8 @@ var serviceInstallCmd = &cobra.Command{
 			fmt.Printf("  3. Status:  sudo breeze-agent service status\n")
 			fmt.Printf("  4. Logs:    tail -f %s/agent.log\n", darwinLogDir)
 		}
-		if !noWatchdog {
+		var watchdogExit error
+		if !skipWatchdog {
 			// Describe the service state we actually left behind. This line
 			// used to assert "installed and running" unconditionally, which
 			// before #5252 was never true on this platform and is still not
@@ -295,15 +316,18 @@ var serviceInstallCmd = &cobra.Command{
 						"  1. Re-run `sudo breeze-agent service install` (will retry the download).\n"+
 						"  2. Download %s manually, place it next to breeze-agent,\n"+
 						"     then run `sudo breeze-watchdog service install`.\n"+
-						"  3. To skip the watchdog entirely, use `--no-watchdog`.\n",
+						"  3. To skip the watchdog entirely, use `--no-watchdog`.\n"+
+						watchdogSelfHealHint,
 					err, agentStateLine, watchdogManualDownloadURL(version, runtime.GOOS, runtime.GOARCH, serverURL))
 			}
+			watchdogExit = reportWatchdogBootstrap(err, strictWatchdog, os.Stdout)
 		}
 
 		// Reported last so the watchdog still gets bootstrapped, but reported:
 		// a silent exit 0 on a host whose agent is down is exactly how #5252
-		// went unnoticed until the device showed Offline.
-		return startErr
+		// went unnoticed until the device showed Offline. The agent's start
+		// failure wins over the watchdog outcome (--strict-watchdog → 78).
+		return installExitError(startErr, watchdogExit)
 	},
 }
 
@@ -315,7 +339,7 @@ var serviceUninstallCmd = &cobra.Command{
 			return fmt.Errorf("must run as root (sudo breeze-agent service uninstall)")
 		}
 		if err := uninstallDarwinService(func(name string, args ...string) ([]byte, error) {
-			return exec.Command(name, args...).CombinedOutput()
+			return procspawn.Command(name, args...).CombinedOutput()
 		}); err != nil {
 			return err
 		}
@@ -349,15 +373,15 @@ var serviceStartCmd = &cobra.Command{
 		// Use bootstrap (modern) with fallback to load (legacy)
 		if isLaunchdLoaded(darwinLabel) {
 			// Already loaded, just kick it
-			out, err := exec.Command("launchctl", "kickstart", "system/"+darwinLabel).CombinedOutput()
+			out, err := procspawn.Command("launchctl", "kickstart", "system/"+darwinLabel).CombinedOutput()
 			if err != nil {
 				return fmt.Errorf("failed to start service: %s", strings.TrimSpace(string(out)))
 			}
 		} else {
-			out, err := exec.Command("launchctl", "bootstrap", "system", darwinPlistDst).CombinedOutput()
+			out, err := procspawn.Command("launchctl", "bootstrap", "system", darwinPlistDst).CombinedOutput()
 			if err != nil {
 				// Fallback to legacy load
-				out2, err2 := exec.Command("launchctl", "load", darwinPlistDst).CombinedOutput()
+				out2, err2 := procspawn.Command("launchctl", "load", darwinPlistDst).CombinedOutput()
 				if err2 != nil {
 					return fmt.Errorf("failed to load service: %s / %s",
 						strings.TrimSpace(string(out)), strings.TrimSpace(string(out2)))
@@ -389,10 +413,10 @@ var serviceStopCmd = &cobra.Command{
 			return nil
 		}
 
-		out, err := exec.Command("launchctl", "bootout", "system/"+darwinLabel).CombinedOutput()
+		out, err := procspawn.Command("launchctl", "bootout", "system/"+darwinLabel).CombinedOutput()
 		if err != nil {
 			// Fallback to legacy unload
-			out2, err2 := exec.Command("launchctl", "unload", darwinPlistDst).CombinedOutput()
+			out2, err2 := procspawn.Command("launchctl", "unload", darwinPlistDst).CombinedOutput()
 			if err2 != nil {
 				return fmt.Errorf("failed to stop service: %s / %s",
 					strings.TrimSpace(string(out)), strings.TrimSpace(string(out2)))
@@ -419,7 +443,7 @@ var serviceStatusCmd = &cobra.Command{
 		}
 
 		// Get detailed info from launchctl print
-		out, err := exec.Command("launchctl", "print", "system/"+darwinLabel).CombinedOutput()
+		out, err := procspawn.Command("launchctl", "print", "system/"+darwinLabel).CombinedOutput()
 		if err != nil {
 			// Fallback: can't get details but the job is loaded
 			fmt.Println("Service: loaded (unable to retrieve details)")
@@ -481,7 +505,7 @@ func healLaunchdPlists() {
 
 // isLaunchdLoaded checks if the given label is loaded in launchd.
 func isLaunchdLoaded(label string) bool {
-	err := exec.Command("launchctl", "print", "system/"+label).Run()
+	err := procspawn.Command("launchctl", "print", "system/"+label).Run()
 	return err == nil
 }
 
@@ -498,8 +522,8 @@ func ensureDesktopHelpersLoaded() {
 		if uid := consoleUserUID(); uid != "" {
 			domain := "gui/" + uid
 			label := domain + "/com.breeze.desktop-helper-user"
-			if exec.Command("launchctl", "print", label).Run() != nil {
-				out, err := exec.Command("launchctl", "bootstrap", domain, darwinDesktopUserPlistDst).CombinedOutput()
+			if procspawn.Command("launchctl", "print", label).Run() != nil {
+				out, err := procspawn.Command("launchctl", "bootstrap", domain, darwinDesktopUserPlistDst).CombinedOutput()
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "Note: could not bootstrap desktop helper for console user %s: %s\n",
 						uid, strings.TrimSpace(string(out)))
@@ -512,8 +536,8 @@ func ensureDesktopHelpersLoaded() {
 
 	if fileExists(darwinDesktopLoginWindowPlistDst) {
 		lwLabel := "loginwindow/com.breeze.desktop-helper-loginwindow"
-		if exec.Command("launchctl", "print", lwLabel).Run() != nil {
-			out, err := exec.Command("launchctl", "bootstrap", "loginwindow", darwinDesktopLoginWindowPlistDst).CombinedOutput()
+		if procspawn.Command("launchctl", "print", lwLabel).Run() != nil {
+			out, err := procspawn.Command("launchctl", "bootstrap", "loginwindow", darwinDesktopLoginWindowPlistDst).CombinedOutput()
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Note: could not bootstrap login-window desktop helper: %s\n",
 					strings.TrimSpace(string(out)))
@@ -528,7 +552,7 @@ func ensureDesktopHelpersLoaded() {
 // or empty string if no one is logged in (e.g., the login window is showing,
 // where /dev/console is owned by root).
 func consoleUserUID() string {
-	out, err := exec.Command("stat", "-f", "%u", "/dev/console").Output()
+	out, err := procspawn.Command("stat", "-f", "%u", "/dev/console").Output()
 	if err != nil {
 		return ""
 	}
@@ -553,7 +577,7 @@ func bootstrapDesktopHelperPlists() {
 	// into that user's GUI session so it can access the display immediately.
 	if uid := os.Getenv("SUDO_UID"); uid != "" {
 		domain := "gui/" + uid
-		out, err := exec.Command("launchctl", "bootstrap", domain, darwinDesktopUserPlistDst).CombinedOutput()
+		out, err := procspawn.Command("launchctl", "bootstrap", domain, darwinDesktopUserPlistDst).CombinedOutput()
 		if err != nil {
 			// Not fatal — kickstart will retry on next heartbeat.
 			fmt.Fprintf(os.Stderr, "Note: could not bootstrap desktop helper for user %s (will retry on heartbeat): %s\n",
@@ -568,10 +592,10 @@ func bootstrapDesktopHelperPlists() {
 	// Bootstrap the login-window helper (covers login screen remote access).
 	// Use kickstart first (stable interface), fall back to bootstrap.
 	const loginWindowLabel = "loginwindow/com.breeze.desktop-helper-loginwindow"
-	if err := exec.Command("launchctl", "kickstart", "-k", loginWindowLabel).Run(); err == nil {
+	if err := procspawn.Command("launchctl", "kickstart", "-k", loginWindowLabel).Run(); err == nil {
 		fmt.Println("Login-window desktop helper kickstarted.")
 	} else {
-		out, err2 := exec.Command("launchctl", "bootstrap", "loginwindow", darwinDesktopLoginWindowPlistDst).CombinedOutput()
+		out, err2 := procspawn.Command("launchctl", "bootstrap", "loginwindow", darwinDesktopLoginWindowPlistDst).CombinedOutput()
 		if err2 != nil {
 			fmt.Fprintf(os.Stderr, "Note: could not start login-window desktop helper: %s\n",
 				strings.TrimSpace(string(out)))
@@ -614,7 +638,7 @@ func ensureDarwinBreezeGroupConsoleMembers() {
 // darwinConsoleUsernames lists the usernames with a GUI (loginwindow) session,
 // excluding root and system/service accounts.
 func darwinConsoleUsernames() []string {
-	out, err := exec.Command("ps", "-axo", "uid=,comm=").Output()
+	out, err := procspawn.Command("ps", "-axo", "uid=,comm=").Output()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: could not enumerate GUI sessions for %s group membership: %v\n",
 			sessionbroker.IPCGroupName, err)

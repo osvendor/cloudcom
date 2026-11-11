@@ -6,7 +6,6 @@
  *  - manual approvals (partner-wide or ring-scoped)
  *  - ring category rules (exact OS category match; terminal on match)
  *  - ring-level auto-approve (enabled + severities + deferral window) — #1317
- *  - ring-less policy-level auto-approve (severity list + deferral window)
  *  - policy source filtering ('os' vs 'third_party', ...)
  *  - per-app block/pin rules
  *
@@ -22,6 +21,7 @@
  */
 
 import type { PatchIneligibleReason } from '@breeze/shared';
+import { canonicalAppRuleKey, policyAppRuleSchema, type RingFeatureUpdates } from '@breeze/shared/validators';
 import { captureException } from './sentry';
 
 // ============================================
@@ -40,18 +40,6 @@ export interface CategoryRule {
   deferralDaysOverride?: number | null;
 }
 
-/**
- * Policy-level auto-approve (ring-less path). Empty severities while enabled =
- * approve none (fail-closed). The ring auto-approve path is now fail-closed the
- * same way (see evaluatePatchApproval Priority 3), so the two paths share the
- * "enabled but no severities means approve nothing" invariant.
- */
-export interface PolicyAutoApproveConfig {
-  enabled: boolean;
-  severities: string[];
-  deferralDays: number;
-}
-
 export type PolicyAppRule =
   | { source: string; packageId: string; action: 'block' }
   | { source: string; packageId: string; action: 'pin'; pinnedVersion: string };
@@ -59,16 +47,18 @@ export type PolicyAppRule =
 export type AppRuleVerdict = 'allowed' | 'blocked' | 'held';
 
 /**
- * Evaluator input. Carries both ring-level config and policy-level config:
- * sources, app rules, and ring-less auto-approve.
+ * Evaluator input. Carries the ring-level config plus the policy's patch
+ * sources. Auto-approval and per-app rules are ring-owned (#8188).
  */
 export interface ApprovalEvaluationConfig {
   ringId: string | null;
   /**
    * The partner that owns the ring referenced by ringId. Used to guard against
    * a config policy that links a ring from another partner (featurePolicyId is
-   * an unconstrained uuid). If ringPartnerId !== device-org's partner, the ring
-   * is ignored (treated as ringId = null).
+   * an unconstrained uuid). If ringPartnerId !== device-org's partner, the
+   * reference is invalid and fails closed: every candidate is denied with
+   * 'ring_reference_invalid' (#8186). Never fall back to "no ring", or a manual
+   * approval could install an app the ring blocks.
    */
   ringPartnerId?: string | null;
   categoryRules: CategoryRule[];
@@ -86,13 +76,34 @@ export interface ApprovalEvaluationConfig {
   excludeCategories?: string[];
   /** Policy-level source selections ('os', 'third_party', ...). Absent/empty = no filtering (legacy). */
   sources?: string[];
-  /** Policy-level auto-approve, consulted only when ringId is null. Absent means disabled. */
-  policyAutoApprove?: PolicyAutoApproveConfig;
   /**
-   * Policy-level per-app block/pin rules. Applied to every job approval path;
+   * Legacy per-app block/pin rules, read only from frozen job snapshots: jobs
+   * created before the #8186 cutover carry the policy's rules here, and
+   * W02/W03 snapshots mirrored the ring rules here for older executors. New
+   * snapshots stop writing it (#8188), but the executor keeps parsing it so
+   * an in-flight job keeps its rules. Applied to every job approval path;
    * manual per-device installs do not pass through this evaluator.
    */
   apps?: PolicyAppRule[];
+  /**
+   * Update Ring per-app block/pin rules (`patch_policies.app_rules`, #8184).
+   * Evaluated alongside `apps` with the stricter verdict winning
+   * (`evaluateAppRuleSets`); same position in the pipeline and the same
+   * "overrides a manual approval" semantics.
+   */
+  ringAppRules?: PolicyAppRule[];
+  /**
+   * The ring's Windows feature-release policy (`patch_policies.feature_updates`):
+   * block | allow | pin. Absent = block (the pre-control behaviour, and what a
+   * legacy job snapshot means). See patchEligibility's feature-update gate.
+   */
+  featureUpdates?: RingFeatureUpdates;
+  /**
+   * The policy links a ring reference that does not resolve (#8186). The
+   * evaluator then denies every outstanding candidate with
+   * 'ring_reference_invalid', manual approvals included.
+   */
+  ringReferenceInvalid?: boolean;
 }
 
 /** @deprecated Use ApprovalEvaluationConfig — kept for existing importers. */
@@ -101,6 +112,8 @@ export type RingConfig = ApprovalEvaluationConfig;
 // 'ring_auto_approve' is the #1317 ring-owned auto-approval reason (enabled +
 // severities + deferral). The historical 'legacy_auto_approve' name is kept as
 // an alias so already-stored job rows / callers reading this string still work.
+// 'policy_auto_approve' is never produced (policy-level auto-approve is retired,
+// #8188) and is kept only so historical rows carrying it still type-check.
 export type ApprovalReason =
   | 'manual'
   | 'category_rule'
@@ -279,15 +292,96 @@ export function comparePatchVersions(
   return 0;
 }
 
+/** dpkg's character weight: '~' below everything (end of string included), letters below other symbols. */
+function linuxVersionCharOrder(c: string | undefined): number {
+  if (c === undefined || (c >= '0' && c <= '9')) return 0;
+  if (/[A-Za-z]/.test(c)) return c.charCodeAt(0);
+  if (c === '~') return -1;
+  return c.charCodeAt(0) + 256;
+}
+
+function isAsciiDigit(c: string | undefined): boolean {
+  return c !== undefined && c >= '0' && c <= '9';
+}
+
+/** dpkg `verrevcmp`: alternating non-digit runs (by weight) and digit runs (numerically). */
+function compareLinuxVersionPart(a: string, b: string): number {
+  let i = 0;
+  let j = 0;
+  while (i < a.length || j < b.length) {
+    while ((i < a.length && !isAsciiDigit(a[i])) || (j < b.length && !isAsciiDigit(b[j]))) {
+      const ac = linuxVersionCharOrder(a[i]);
+      const bc = linuxVersionCharOrder(b[j]);
+      if (ac !== bc) return ac - bc;
+      i++;
+      j++;
+    }
+    while (a[i] === '0') i++;
+    while (b[j] === '0') j++;
+    let firstDiff = 0;
+    while (isAsciiDigit(a[i]) && isAsciiDigit(b[j])) {
+      if (firstDiff === 0) firstDiff = a.charCodeAt(i) - b.charCodeAt(j);
+      i++;
+      j++;
+    }
+    if (isAsciiDigit(a[i])) return 1;
+    if (isAsciiDigit(b[j])) return -1;
+    if (firstDiff !== 0) return firstDiff;
+  }
+  return 0;
+}
+
+function splitLinuxVersion(v: string): { epoch: number; upstream: string; revision: string } | null {
+  const colon = v.indexOf(':');
+  let epoch = 0;
+  let rest = v;
+  if (colon >= 0) {
+    const epochText = v.slice(0, colon);
+    if (!/^\d+$/.test(epochText)) return null;
+    epoch = parseInt(epochText, 10);
+    rest = v.slice(colon + 1);
+  }
+  const dash = rest.lastIndexOf('-');
+  return dash >= 0
+    ? { epoch, upstream: rest.slice(0, dash), revision: rest.slice(dash + 1) }
+    : { epoch, upstream: rest, revision: '' };
+}
+
+/**
+ * Version ordering for Linux package pins (#9370), following dpkg:
+ * `[epoch:]upstream[-revision]` — epoch first, then upstream, then revision;
+ * digit runs compare numerically and '~' sorts before everything (so
+ * `1.0~rc1` < `1.0`). RPM `version-release` strings from dnf order the same
+ * way for the usual forms. The tolerant comparator above is wrong here: it
+ * reads `5:10` < `5:9` by codepoint, which would let a pinned package
+ * upgrade past its pin.
+ *
+ * Returns null when either side is blank or the epoch is not numeric;
+ * callers treat null as "cannot prove within pin" (hold).
+ */
+export function compareLinuxPackageVersions(
+  a: string | null | undefined,
+  b: string | null | undefined
+): -1 | 0 | 1 | null {
+  const av = splitLinuxVersion((a ?? '').trim());
+  const bv = splitLinuxVersion((b ?? '').trim());
+  if (!av || !bv || !av.upstream || !bv.upstream) return null;
+  const cmp = av.epoch !== bv.epoch
+    ? av.epoch - bv.epoch
+    : compareLinuxVersionPart(av.upstream, bv.upstream) || compareLinuxVersionPart(av.revision, bv.revision);
+  return cmp === 0 ? 0 : cmp < 0 ? -1 : 1;
+}
+
 /**
  * Canonical lookup key for app rules. The UI presents 'third_party' and
  * 'custom' patch sources as one bucket (manual UI entries hardcode
- * 'third_party'), so both collapse to a canonical 'third_party' key; other
- * sources keep their own key.
+ * 'third_party'), so both collapse to a canonical 'third_party' key; Linux
+ * keys drop the `apt:`/`yum:` provider prefix (#9370); other sources keep
+ * their own key. Delegates to the shared implementation so the
+ * ring app-rule validator's uniqueness check uses the same identity.
  */
 export function appRuleKey(source: string, packageId: string): string {
-  const bucket = isThirdPartyPatchSource(source) ? 'third_party' : source;
-  return `${bucket}|${packageId.toLowerCase()}`;
+  return canonicalAppRuleKey(source, packageId);
 }
 
 /**
@@ -318,9 +412,77 @@ export function evaluateAppRule(
   if (!rule) return 'allowed';
   if (rule.action === 'block') return 'blocked';
 
-  const cmp = comparePatchVersions(patch.version, rule.pinnedVersion);
+  const cmp = patch.source === 'linux'
+    ? compareLinuxPackageVersions(patch.version, rule.pinnedVersion)
+    : comparePatchVersions(patch.version, rule.pinnedVersion);
   if (cmp === null) return 'held';
   return cmp > 0 ? 'held' : 'allowed';
+}
+
+const APP_RULE_VERDICT_RANK: Record<AppRuleVerdict, number> = { allowed: 0, held: 1, blocked: 2 };
+
+/**
+ * Worst verdict across several rule sets (`blocked` > `held` > `allowed`).
+ * Used while app rules are read from both the Update Ring and the policy link
+ * (#8184): a candidate is denied if either set denies it.
+ */
+export function evaluateAppRuleSets(
+  patch: { source: string; packageId: string | null; version: string | null },
+  maps: AppRuleMap[]
+): AppRuleVerdict {
+  let worst: AppRuleVerdict = 'allowed';
+  for (const m of maps) {
+    const v = evaluateAppRule(patch, m);
+    if (APP_RULE_VERDICT_RANK[v] > APP_RULE_VERDICT_RANK[worst]) worst = v;
+  }
+  return worst;
+}
+
+/**
+ * Normalise a stored app-rule list (a job snapshot key, or a ring's
+ * `app_rules` column) into evaluator rules. Returns null when `raw` is not an
+ * array — the caller decides how to report that.
+ *
+ * Valid entries lose their display-only fields. A malformed entry whose
+ * identity is usable (non-empty `source` + `packageId`) is coerced to `block`:
+ * dropping a restriction would silently widen install scope, so the admin's
+ * intent to restrict that app wins. An entry with no usable identity is
+ * dropped, loudly. `context` prefixes every log line.
+ */
+export function coerceAppRuleList(raw: unknown, context: string): PolicyAppRule[] | null {
+  if (!Array.isArray(raw)) return null;
+  const rules: PolicyAppRule[] = [];
+  for (const entry of raw) {
+    const parsed = policyAppRuleSchema.safeParse(entry);
+    if (parsed.success) {
+      const { source, packageId, action, pinnedVersion } = parsed.data;
+      if (action === 'pin' && pinnedVersion) {
+        rules.push({ source, packageId, action: 'pin', pinnedVersion });
+      } else {
+        // action === 'block' (pin without pinnedVersion is rejected by the schema).
+        rules.push({ source, packageId, action: 'block' });
+      }
+      continue;
+    }
+
+    const e = entry as { source?: unknown; packageId?: unknown } | null;
+    if (
+      e !== null &&
+      typeof e === 'object' &&
+      typeof e.source === 'string' &&
+      e.source.length > 0 &&
+      typeof e.packageId === 'string' &&
+      e.packageId.length > 0
+    ) {
+      console.warn(`${context} coercing malformed app rule to block (fail-closed):`, JSON.stringify(entry));
+      rules.push({ source: e.source, packageId: e.packageId, action: 'block' });
+    } else {
+      const message = `${context} dropping malformed app rule with unusable identity`;
+      console.warn(`${message}:`, JSON.stringify(entry));
+      captureException(new Error(message));
+    }
+  }
+  return rules;
 }
 
 // ============================================
@@ -337,8 +499,9 @@ export interface PatchCandidate {
   version: string | null;
   /**
    * device_patches.createdAt — when this device first reported the patch as
-   * pending. Deferral fallback anchor for third-party patches, which carry no
-   * vendor releaseDate (#2218).
+   * pending. Deferral fallback anchor for third-party (#2218) and Linux
+   * (#7800) patches, which carry no vendor releaseDate — see
+   * usesFirstSeenDeferralFallback.
    */
   firstSeenAt?: Date | string | null;
 }
@@ -350,7 +513,13 @@ export interface PatchCandidate {
  */
 export type PatchApprovalDecision =
   | { approved: ApprovalReason }
-  | { denied: Exclude<PatchIneligibleReason, 'not_outstanding' | 'superseded' | 'blocked_by_source' | 'blocked_by_category' | 'blocked_by_app_rule' | 'device_not_in_org'> };
+  /**
+   * `holdUntil` is when the deferral window ends (#7625 — the device Patches
+   * tab shows it); null when the patch cannot prove its age, in which case it
+   * is held until it can.
+   */
+  | { denied: 'held_by_deferral'; holdUntil: Date | null }
+  | { denied: Exclude<PatchIneligibleReason, 'not_outstanding' | 'superseded' | 'blocked_by_source' | 'blocked_by_category' | 'blocked_by_app_rule' | 'blocked_by_feature_update_policy' | 'device_not_in_org' | 'held_by_deferral' | 'ring_reference_invalid' | 'unsupported_user_scope'> };
 
 export function evaluatePatchApproval(
   patch: PatchCandidate,
@@ -370,10 +539,17 @@ export function decidePatchApproval(
   manualApprovalSet: Set<string>,
   categoryRuleMap: Map<string, CategoryRule>,
   ringAutoApprove: RingAutoApproveConfig,
-  now: Date
+  now: Date,
+  declinedSet: Set<string> = new Set()
 ): PatchApprovalDecision {
   const MANUAL: PatchApprovalDecision = { denied: 'awaiting_manual_approval' };
-  const DEFERRED: PatchApprovalDecision = { denied: 'held_by_deferral' };
+
+  // Priority 0: an explicit decline is terminal (#9369) — no category rule or
+  // ring auto-approve may re-approve it. The caller resolves decline vs. a
+  // later re-approval into the two sets, so a patch is in at most one.
+  if (declinedSet.has(patch.patchId)) {
+    return { denied: 'explicitly_declined' };
+  }
 
   // Priority 1: Manual approval
   if (manualApprovalSet.has(patch.patchId)) {
@@ -428,8 +604,9 @@ export function decidePatchApproval(
       }
     }
     const deferralDays = rule.deferralDaysOverride ?? ringConfig.deferralDays;
-    if (isHeldByDeferral(patch, deferralDays, now, 'category')) {
-      return DEFERRED;
+    const hold = deferralHold(patch, deferralDays, now, 'category');
+    if (hold.held) {
+      return { denied: 'held_by_deferral', holdUntil: hold.until };
     }
     return { approved: 'category_rule' };
   }
@@ -457,9 +634,9 @@ export function decidePatchApproval(
       if (!ringAutoApprove.thirdPartyApps) {
         return MANUAL;
       }
-      const hold = ringAutoApprove.thirdPartyDeferralDays ?? ringAutoApprove.deferralDays;
-      if (isHeldByDeferral(patch, hold, now, 'ring')) {
-        return DEFERRED;
+      const tpHold = deferralHold(patch, ringAutoApprove.thirdPartyDeferralDays ?? ringAutoApprove.deferralDays, now, 'ring');
+      if (tpHold.held) {
+        return { denied: 'held_by_deferral', holdUntil: tpHold.until };
       }
       return { approved: 'ring_auto_approve' };
     }
@@ -477,8 +654,9 @@ export function decidePatchApproval(
     } else if (!ringAutoApprove.severities.includes(patch.severity as string)) {
       return MANUAL;
     }
-    if (isHeldByDeferral(patch, ringAutoApprove.deferralDays, now, 'ring')) {
-      return DEFERRED;
+    const osHold = deferralHold(patch, ringAutoApprove.deferralDays, now, 'ring');
+    if (osHold.held) {
+      return { denied: 'held_by_deferral', holdUntil: osHold.until };
     }
     return { approved: 'ring_auto_approve' };
   }
@@ -492,7 +670,43 @@ export function isHeldByDeferral(
   now: Date,
   source: 'policy' | 'category' | 'ring'
 ): boolean {
-  if (deferralDays <= 0) return false;
+  return deferralHold(patch, deferralDays, now, source).held;
+}
+
+/**
+ * Whether a patch with no releaseDate may anchor its deferral window on
+ * first-seen (device_patches.createdAt) instead of failing closed.
+ *
+ *  - third-party / custom (#2218): winget and Homebrew carry no vendor date.
+ *  - linux (#7800): the agent reads `apt list --upgradable` / `dnf|yum
+ *    check-update`, which report a package name and version and never a date,
+ *    so EVERY Linux patch lacks one. Failing closed there held every Linux
+ *    patch forever under any deferral above 0 — the window could never start.
+ *  - microsoft / apple: deliberately NOT included; they keep the fail-closed
+ *    hold from #2222 (manual approval releases them). Windows Update normally
+ *    supplies LastDeploymentChangeTime (it can be empty), so a Windows patch
+ *    without a date is unusual and holding it is the safer failure. Note that the macOS `softwareupdate
+ *    -l` collector carries no date either, so on macOS this hold is routine,
+ *    not anomalous; #7800 scoped the change to Linux only — extending it to
+ *    'apple' is a separate decision.
+ */
+export function usesFirstSeenDeferralFallback(source: string | null | undefined): boolean {
+  return isThirdPartyPatchSource(source) || source === 'linux';
+}
+
+/**
+ * The deferral rule, once. `until` is when the window ends — null when the
+ * patch is held because it cannot prove its age (fail closed, logged).
+ * `isHeldByDeferral` is the boolean view of this; never re-derive the window
+ * anywhere else.
+ */
+export function deferralHold(
+  patch: PatchCandidate,
+  deferralDays: number,
+  now: Date,
+  source: 'policy' | 'category' | 'ring'
+): { held: false } | { held: true; until: Date | null } {
+  if (deferralDays <= 0) return { held: false };
 
   // CAREFUL: new Date('garbage') is a truthy Invalid Date — validity is
   // decided by the Number.isNaN check below, never by `!ageAnchor` alone. A
@@ -501,13 +715,16 @@ export function isHeldByDeferral(
   let anchorLabel = 'releaseDate';
   let ageAnchor: Date | null = patch.releaseDate ? new Date(patch.releaseDate) : null;
 
-  if (!ageAnchor && isThirdPartyPatchSource(patch.source) && patch.firstSeenAt) {
-    // Third-party fallback (#2218): winget/homebrew entries carry no vendor
-    // releaseDate, so a configured deferral window used to hold them forever.
-    // Anchor the window on when this device first reported the patch
-    // (device_patches.createdAt) instead — a conservative proxy (never earlier
-    // than the vendor release), so the patch is held at least as long as the
-    // window intends. OS patches keep the fail-closed posture below.
+  const firstSeenFallback = usesFirstSeenDeferralFallback(patch.source);
+  if (!ageAnchor && firstSeenFallback && patch.firstSeenAt) {
+    // First-seen fallback for sources whose feed never carries a release date:
+    // winget/homebrew (#2218) and Linux apt/dnf/yum (#7800). Without it a configured deferral
+    // window held these patches forever. Anchor the window on when this device
+    // first reported the patch (device_patches.createdAt) instead — a
+    // conservative proxy (never earlier than the vendor release), so the patch
+    // is held at least as long as the window intends. Windows and macOS OS
+    // patches keep the fail-closed posture below — see
+    // usesFirstSeenDeferralFallback for why.
     anchorLabel = 'first-seen (device_patches.createdAt)';
     ageAnchor = new Date(patch.firstSeenAt);
   }
@@ -518,20 +735,20 @@ export function isHeldByDeferral(
     // consistent with pin rules. The reason names which anchor failed so a
     // broken first-seen fallback (e.g. the column dropped from the select, a
     // malformed timestamp) is distinguishable in logs from the routine
-    // "third-party patch has no releaseDate at all" case.
+    // "this source has no releaseDate at all" case.
     const reason = ageAnchor
       ? `its ${anchorLabel} value is unparseable`
-      : isThirdPartyPatchSource(patch.source)
+      : firstSeenFallback
         ? 'it has no releaseDate and no first-seen fallback timestamp'
         : 'it has no releaseDate';
     console.warn(
       `[PatchApproval] patch ${patch.patchId} held: ${source} deferral of ${deferralDays} day(s) configured but ${reason}, so it cannot prove its age`
     );
-    return true;
+    return { held: true, until: null };
   }
 
   const deferralEnd = new Date(ageAnchor.getTime() + deferralDays * 24 * 60 * 60 * 1000);
-  return deferralEnd > now;
+  return deferralEnd > now ? { held: true, until: deferralEnd } : { held: false };
 }
 
 export interface RingAutoApproveConfig {

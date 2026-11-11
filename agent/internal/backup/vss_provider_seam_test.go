@@ -36,9 +36,16 @@ type fakeVSSProvider struct {
 	createCalls      int
 	releaseCalls     int
 	requestedVolumes []string
+
+	// onCreate, when set, runs at the start of CreateShadowCopy so a test can
+	// order the snapshot against other steps of the run.
+	onCreate func()
 }
 
 func (f *fakeVSSProvider) CreateShadowCopy(_ context.Context, volumes []string) (*vss.VSSSession, error) {
+	if f.onCreate != nil {
+		f.onCreate()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.createCalls++
@@ -497,8 +504,11 @@ func TestRunBackupContext_JournalHardExclude_MatchesVSSShadowPath(t *testing.T) 
 		t.Fatalf("expected only real.txt (under its shadow path) in the snapshot, got %+v", job.Snapshot.Files)
 	}
 	for _, call := range provider.uploadCalls {
-		if strings.Contains(call.localPath, "backup-journal") {
-			t.Errorf("must never upload a file from the checkpoint-journal directory even under its VSS shadow-copy path, got upload of %q", call.localPath)
+		// Keyed on the object key: an upload whose SOURCE is a journal file
+		// lands under files/.../backup-journal/. (The local path may be a
+		// staged copy under the staging dir, which is the journal dir here.)
+		if strings.Contains(call.remotePath, "backup-journal") {
+			t.Errorf("must never upload a file from the checkpoint-journal directory even under its VSS shadow-copy path, got upload of %q", call.remotePath)
 		}
 	}
 }
@@ -543,8 +553,11 @@ func TestRunBackupContext_JournalHardExclude_WinsOverMatchingUserExclude(t *test
 		t.Fatalf("expected only real.txt in the snapshot — the journal dir must get no entry, forced or not, got %+v", job.Snapshot.Files)
 	}
 	for _, call := range provider.uploadCalls {
-		if strings.Contains(call.localPath, "backup-journal") {
-			t.Errorf("must never upload a file from the checkpoint-journal directory, got upload of %q", call.localPath)
+		// Keyed on the object key: an upload whose SOURCE is a journal file
+		// lands under files/.../backup-journal/. (The local path may be a
+		// staged copy under the staging dir, which is the journal dir here.)
+		if strings.Contains(call.remotePath, "backup-journal") {
+			t.Errorf("must never upload a file from the checkpoint-journal directory, got upload of %q", call.remotePath)
 		}
 	}
 }

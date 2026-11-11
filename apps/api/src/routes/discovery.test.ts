@@ -6,9 +6,17 @@ import { authMiddleware } from '../middleware/auth';
 import { isRedisAvailable } from '../services/redis';
 import { decryptSecret, isEncryptedSecret } from '../services/secretCrypto';
 import { writeRouteAudit } from '../services/auditEvents';
-import { enqueueDiscoveryScan } from '../jobs/discoveryWorker';
+import { enqueueDiscoveryScanAfterCommit, getDiscoveryQueue } from '../jobs/discoveryWorker';
 import { createDiscoveryJobIfIdle } from '../services/discoveryJobCreation';
 import { networkTopology, topologyLayout, discoveredAssets, sites } from '../db/schema';
+import { moveDiscoveredAssetsToSite } from '../services/discoveredAssetSiteMove';
+import { withHostTimeZone } from '../testUtils/hostTimeZone';
+import {
+  findLinkPlacementConflict,
+  PlacementConcurrentUpdateError,
+  PlacementLinkConflictError,
+  reconcilePlacementOnLinkOrThrow,
+} from '../services/assetPlacement';
 
 // W01 (spec §4.4): the route now derives `reachability` through the batched
 // loader. The derivation is pinned by services/assetReachability.test.ts; this
@@ -21,6 +29,15 @@ vi.mock('../services/assetReachabilityLoader', () => ({
 }));
 
 vi.mock('../services', () => ({}));
+
+// The site-move service is pinned by services/discoveredAssetSiteMove.test.ts;
+// this suite owns the route gate (org + site allowlist) and the wiring.
+vi.mock('../services/discoveredAssetSiteMove', () => ({
+  moveDiscoveredAssetsToSite: vi.fn(),
+  DiscoveredAssetSiteMoveError: class DiscoveredAssetSiteMoveError extends Error {
+    constructor(public code: string, message: string) { super(message); }
+  },
+}));
 
 // The service's authorization, real transaction/replay and cross-site node
 // checks are exercised in topology-compatible-writes.integration.test.ts.
@@ -43,8 +60,19 @@ vi.mock('../services/redis', () => ({
 }));
 
 vi.mock('../jobs/discoveryWorker', () => ({
-  enqueueDiscoveryScan: vi.fn(async () => {}),
+  enqueueDiscoveryScanAfterCommit: vi.fn(),
   getDiscoveryQueue: vi.fn(() => null),
+}));
+
+// Placement reconciliation on link is covered by services/assetPlacement.test.ts;
+// here it is a no-op so the link route's own contract stays under test.
+vi.mock('../services/assetPlacement', () => ({
+  findLinkPlacementConflict: vi.fn(async () => null),
+  reconcilePlacementOnLinkOrThrow: vi.fn(async () => 'noop'),
+  PlacementLinkConflictError: class PlacementLinkConflictError extends Error {
+    constructor(public conflict: unknown = null) { super('placement_link_conflict'); }
+  },
+  PlacementConcurrentUpdateError: class PlacementConcurrentUpdateError extends Error {},
 }));
 
 vi.mock('../services/discoveryJobCreation', () => ({
@@ -94,6 +122,9 @@ vi.mock('../db', () => ({
       where: vi.fn(() => Promise.resolve())
     })),
     transaction: vi.fn(async (fn: any) => fn({
+      // The link write runs inside the savepoint transaction; route its UPDATE
+      // through the same db.update mock the pre-savepoint tests configure.
+      update: (...args: any[]) => (db as any).update(...args),
       select: vi.fn(() => ({ from: vi.fn(() => ({ where: vi.fn(() => Promise.resolve([])) })) })),
       delete: vi.fn(() => ({ where: vi.fn(() => Promise.resolve()) })),
       insert: vi.fn(() => ({
@@ -115,12 +146,14 @@ vi.mock('../db/schema', () => ({
     id: 'discoveryJobs.id',
     orgId: 'discoveryJobs.orgId',
     siteId: 'discoveryJobs.siteId',
+    profileId: 'discoveryJobs.profileId',
   },
   discoveredAssets: {
     id: 'discoveredAssets.id',
     orgId: 'discoveredAssets.orgId',
     siteId: 'discoveredAssets.siteId',
     linkedDeviceId: 'discoveredAssets.linkedDeviceId',
+    lastJobId: 'discoveredAssets.lastJobId',
   },
   networkTopology: { orgId: 'orgId' },
   topologyLayout: {
@@ -140,7 +173,12 @@ vi.mock('../db/schema', () => ({
     id: 'sites.id',
     orgId: 'sites.orgId',
   },
-  networkMonitors: {},
+  networkMonitors: {
+    id: 'networkMonitors.id',
+    orgId: 'networkMonitors.orgId',
+    assetId: 'networkMonitors.assetId',
+    managedByMonitorId: 'networkMonitors.managedByMonitorId',
+  },
   snmpDevices: {},
   snmpAlertThresholds: {},
   snmpMetrics: {},
@@ -640,6 +678,33 @@ describe('discovery routes', () => {
       });
     });
 
+    it('projects a normalized osFingerprint in the asset list response', async () => {
+      const now = new Date();
+      const mk = (id: string, osFingerprint: unknown) => ({
+        asset: {
+          id, orgId: '00000000-0000-0000-0000-000000000000', assetType: 'workstation',
+          approvalStatus: 'pending', isOnline: true, hostname: id, label: null,
+          ipAddress: '10.0.2.9', macAddress: null, manufacturer: null, model: null,
+          openPorts: [], snmpData: null, responseTimeMs: 2, linkedDeviceId: null,
+          osFingerprint, discoveryMethods: ['ping'], notes: null, tags: [],
+          firstSeenAt: now, lastSeenAt: now, createdAt: now, updatedAt: now,
+        },
+        snmpMonitoringEnabled: false, networkMonitoringEnabled: false,
+        linkedDeviceHostname: null, linkedDeviceDisplayName: null,
+        profileId: null, profileName: null, profileSubnets: null,
+      });
+      (db.select as any).mockReturnValueOnce({
+        from: () => ({ leftJoin: () => ({ leftJoin: () => ({ leftJoin: () => ({
+          where: () => ({ orderBy: () => Promise.resolve([mk('a-obj', { os: 'Windows 11' }), mk('a-null', null)]) }),
+        }) }) }) }),
+      });
+      const res = await app.request('/discovery/assets', { headers: { Authorization: 'Bearer token' } });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data[0].osFingerprint).toBe('Windows 11');
+      expect(body.data[1].osFingerprint).toBeNull();
+    });
+
     // Regression guard: the list serializer must forward typeSource and
     // detectedAssetType so the frontend can show the override badge without
     // fetching individual asset detail pages.
@@ -925,6 +990,27 @@ describe('discovery routes', () => {
       expect(body.data.siteTimezone).toBe('America/Chicago');
     });
 
+    it.each([
+      [{ os: 'Windows' }, 'Windows'],
+      ['Cisco IOS', 'Cisco IOS'],
+      [{ os: 42 }, null],
+      [null, null],
+      ['', null],
+      [{ os: '' }, null],
+    ])('returns osFingerprint %j as %j (#9645)', async (stored, expected) => {
+      const row = buildRow();
+      row.asset.osFingerprint = stored as any;
+      mockSingleAsset([row]);
+
+      const res = await app.request(`/discovery/assets/${ASSET_ID}`, {
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data.osFingerprint).toBe(expected);
+    });
+
     it('returns a null site timezone when the asset has no site', async () => {
       const row = buildRow();
       row.asset.siteId = null as unknown as string;
@@ -1135,6 +1221,12 @@ describe('discovery routes', () => {
       const body = await res.json();
       expect(body.id).toBe('job-001');
       expect(body.status).toBe('scheduled');
+      // Dispatch is deferred until the request transaction commits (#7187 hazard).
+      expect(enqueueDiscoveryScanAfterCommit).toHaveBeenCalledWith(expect.objectContaining({
+        jobId: 'job-001',
+        profileId,
+        agentId: null,
+      }));
     });
 
     it('rejects requested agents from a different site', async () => {
@@ -1275,6 +1367,19 @@ describe('discovery routes', () => {
   });
 
   describe('GET /discovery/profiles', () => {
+    // #9644: the last-run aggregate is a second, separately-qualified query
+    // (a correlated subquery inside the single-table profile select lost its
+    // table qualifiers and always evaluated to NULL).
+    const mockLastRuns = (rows: Array<{ profileId: string; lastRunAt: unknown }>) => {
+      (db.select as any).mockReturnValueOnce({
+        from: () => ({
+          where: () => ({
+            groupBy: () => Promise.resolve(rows),
+          }),
+        }),
+      });
+    };
+
     // Regression: the Changes tab differentiates "Alerting disabled" from "no
     // changes yet" using each profile's alertSettings, so the list response must
     // project alertSettings (#1729).
@@ -1303,7 +1408,6 @@ describe('discovery routes', () => {
           createdAt: now,
           updatedAt: now,
         },
-        lastRunAt: null,
       };
 
       (db.select as any).mockReturnValueOnce({
@@ -1313,6 +1417,7 @@ describe('discovery routes', () => {
           }),
         }),
       });
+      mockLastRuns([]);
 
       const res = await app.request('/discovery/profiles', {
         method: 'GET',
@@ -1324,6 +1429,51 @@ describe('discovery routes', () => {
       expect(body.data).toHaveLength(1);
       expect(body.data[0].alertSettings).toEqual(row.profile.alertSettings);
     });
+
+    it.each(['America/Denver', 'Asia/Tokyo'] as const)(
+      'reads offsetless lastRunAt text as UTC on a %s host',
+      async (zone) => {
+        await withHostTimeZone(zone, async () => {
+          const now = new Date();
+          const row = {
+            profile: {
+              id: 'profile-003',
+              orgId: '00000000-0000-0000-0000-000000000000',
+              siteId: '00000000-0000-0000-0000-000000000001',
+              name: 'Nightly Scan',
+              description: null,
+              enabled: true,
+              subnets: ['10.0.2.0/24'],
+              methods: ['ping'],
+              schedule: { type: 'manual' },
+              deepScan: false,
+              resolveHostnames: true,
+              alertSettings: null,
+              createdAt: now,
+              updatedAt: now,
+            },
+          };
+
+          (db.select as any).mockReturnValueOnce({
+            from: () => ({
+              where: () => ({
+                orderBy: () => Promise.resolve([row]),
+              }),
+            }),
+          });
+          mockLastRuns([{ profileId: 'profile-003', lastRunAt: '2026-08-25 18:34:15.123' }]);
+
+          const res = await app.request('/discovery/profiles', {
+            method: 'GET',
+            headers: { Authorization: 'Bearer token' }
+          });
+
+          expect(res.status).toBe(200);
+          const body = await res.json();
+          expect(body.data[0].lastRunAt).toBe('2026-08-25T18:34:15.123Z');
+        });
+      }
+    );
 
     it('returns alertSettings as null when a profile has none', async () => {
       const now = new Date();
@@ -1344,7 +1494,6 @@ describe('discovery routes', () => {
           createdAt: now,
           updatedAt: now,
         },
-        lastRunAt: null,
       };
 
       (db.select as any).mockReturnValueOnce({
@@ -1354,6 +1503,7 @@ describe('discovery routes', () => {
           }),
         }),
       });
+      mockLastRuns([]);
 
       const res = await app.request('/discovery/profiles', {
         method: 'GET',
@@ -1363,6 +1513,50 @@ describe('discovery routes', () => {
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.data[0].alertSettings).toBeNull();
+    });
+
+    it('skips the last-run lookup when no profile is visible (#9644)', async () => {
+      (db.select as any).mockClear();
+      (db.select as any).mockReturnValueOnce({
+        from: () => ({ where: () => ({ orderBy: () => Promise.resolve([]) }) }),
+      });
+
+      const res = await app.request('/discovery/profiles', {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(200);
+      expect(db.select).toHaveBeenCalledTimes(1);
+    });
+
+    it('returns each profile\'s own newest completed-job time, null when none (#9644)', async () => {
+      const now = new Date();
+      const mk = (id: string) => ({
+        profile: {
+          id, orgId: '00000000-0000-0000-0000-000000000000',
+          siteId: '00000000-0000-0000-0000-000000000001',
+          name: id, description: null, enabled: true, subnets: ['10.0.2.0/24'],
+          methods: ['ping'], schedule: { type: 'manual' }, deepScan: false,
+          resolveHostnames: true, alertSettings: null, createdAt: now, updatedAt: now,
+        },
+      });
+      (db.select as any).mockReturnValueOnce({
+        from: () => ({ where: () => ({ orderBy: () => Promise.resolve([mk('profile-a'), mk('profile-b')]) }) }),
+      });
+      mockLastRuns([{ profileId: 'profile-a', lastRunAt: new Date('2026-10-01T12:00:00.000Z') }]);
+
+      const res = await app.request('/discovery/profiles', {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data.map((p: any) => [p.id, p.lastRunAt])).toEqual([
+        ['profile-a', '2026-10-01T12:00:00.000Z'],
+        ['profile-b', null],
+      ]);
     });
   });
 
@@ -1393,6 +1587,47 @@ describe('discovery routes', () => {
       expect(body.subnets).toEqual(['10.0.2.0/24']);
       expect(body.schedule.type).toBe('interval');
       expect(body.schedule.intervalMinutes).toBe(30);
+    });
+
+    it.each(['0.0.0.0/0', '10.0.0.0/15'])('rejects subnet %s that the agent would skip (> 65,536 hosts)', async (subnet) => {
+      const res = await app.request('/discovery/profiles', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({
+          name: 'Too big',
+          siteId: '00000000-0000-0000-0000-000000000001',
+          subnets: ['192.168.1.0/24', subnet],
+          methods: ['ping'],
+          schedule: { type: 'interval', intervalMinutes: 30 },
+        })
+      });
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toContain('65,536');
+      expect(body.error).toContain(subnet);
+      expect(db.insert).not.toHaveBeenCalled();
+    });
+
+    it('accepts a /16 (exactly 65,536 hosts) and an oversized subnet when deepScan is on', async () => {
+      for (const body of [
+        { subnets: ['10.1.0.0/16'] },
+        { subnets: ['10.0.0.0/8'], deepScan: true },
+      ]) {
+        vi.mocked(db.select).mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue([{ id: '00000000-0000-0000-0000-000000000001' }]),
+            }),
+          }),
+        } as any);
+        const res = await app.request('/discovery/profiles', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+          body: JSON.stringify({ name: 'Big ok', siteId: '00000000-0000-0000-0000-000000000001', methods: ['ping'], schedule: { type: 'interval', intervalMinutes: 30 }, ...body })
+        });
+        expect(res.status).toBe(201);
+      }
     });
 
     it('encrypts and masks SNMP profile secrets', async () => {
@@ -1541,6 +1776,51 @@ describe('discovery routes', () => {
       expect(body.error).not.toBe('orgId is required when partner has multiple organizations');
       expect(res.status).toBe(200);
       expect(body.status).toBe('cancelled');
+    });
+
+    // The worker enqueues the dispatch job under `discovery-dispatch-${jobId}`
+    // (discoveryWorker.ts enqueueDiscoveryScan), never the bare row id. A
+    // cancel that removes the bare id is always a no-op: the queued dispatch
+    // still fires, and the worker's unconditional status write flips
+    // 'cancelled' back to 'running'.
+    it('removes the queued dispatch job under its prefixed BullMQ id, not the bare job id', async () => {
+      usePartnerAuth();
+
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([{ id: JOB_ID, orgId: ORG_A, status: 'scheduled' }])
+          })
+        })
+      } as any);
+
+      vi.mocked(db.update).mockReturnValueOnce({
+        set: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            returning: vi.fn().mockResolvedValue([{
+              id: JOB_ID,
+              orgId: ORG_A,
+              status: 'cancelled',
+              createdAt: new Date('2026-05-18T00:00:00.000Z'),
+              scheduledAt: null,
+              startedAt: null,
+              completedAt: new Date('2026-05-18T00:01:00.000Z')
+            }])
+          })
+        })
+      } as any);
+
+      const removeSpy = vi.fn(async () => {});
+      vi.mocked(getDiscoveryQueue).mockReturnValueOnce({ remove: removeSpy } as any);
+
+      const res = await app.request(`/discovery/jobs/${JOB_ID}/cancel?orgId=${ORG_A}`, {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(200);
+      expect(removeSpy).toHaveBeenCalledWith(`discovery-dispatch-${JOB_ID}`);
+      expect(removeSpy).not.toHaveBeenCalledWith(JOB_ID);
     });
 
     it('denies cancelling against an org the partner cannot access', async () => {
@@ -1735,7 +2015,6 @@ describe('discovery routes', () => {
           createdAt: now,
           updatedAt: now,
         },
-        lastRunAt: null,
       });
       vi.mocked(db.select).mockReturnValueOnce({
         from: vi.fn().mockReturnValue({
@@ -1747,6 +2026,8 @@ describe('discovery routes', () => {
             ]),
           }),
         }),
+      } as any).mockReturnValueOnce({
+        from: () => ({ where: () => ({ groupBy: () => Promise.resolve([]) }) }),
       } as any);
 
       const res = await app.request('/discovery/profiles', {
@@ -1780,7 +2061,7 @@ describe('discovery routes', () => {
 
       expect(res.status).toBe(403);
       expect(createDiscoveryJobIfIdle).not.toHaveBeenCalled();
-      expect(enqueueDiscoveryScan).not.toHaveBeenCalled();
+      expect(enqueueDiscoveryScanAfterCommit).not.toHaveBeenCalled();
     });
 
     it('rejects a mixed-site bulk approve atomically before any update', async () => {
@@ -2012,6 +2293,93 @@ describe('discovery routes', () => {
         expect(res.status).toBe(200);
         expect(capturedSetPayload).toMatchObject({
           autoLinkSuppressedAt: null
+        });
+      });
+
+      describe('placement authority on link (#8359)', () => {
+        const linkReq = () => app.request(`/discovery/assets/${ASSET_IN}/link`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+          body: JSON.stringify({ deviceId: DEVICE_ID })
+        });
+        function arrangeLinkWrite() {
+          setSiteRestrictedAuth([SITE_IN]);
+          mockAssetThenDevice(
+            { id: ASSET_IN, orgId: ORG, siteId: SITE_IN },
+            { id: DEVICE_ID, orgId: ORG, siteId: SITE_IN }
+          );
+          vi.mocked(db.update).mockReturnValueOnce({
+            set: vi.fn().mockReturnValue({
+              where: vi.fn().mockReturnValue({
+                returning: vi.fn().mockResolvedValue([{ id: ASSET_IN, orgId: ORG, linkedDeviceId: DEVICE_ID }])
+              })
+            })
+          } as any);
+        }
+
+        it('409 PLACEMENT_CONFLICT from the pre-check, before any write', async () => {
+          setSiteRestrictedAuth([SITE_IN]);
+          mockAssetThenDevice(
+            { id: ASSET_IN, orgId: ORG, siteId: SITE_IN },
+            { id: DEVICE_ID, orgId: ORG, siteId: SITE_IN }
+          );
+          const conflict = { device: { room: 'A' }, discovered: { room: 'B' } };
+          vi.mocked(findLinkPlacementConflict).mockResolvedValueOnce(conflict as any);
+
+          const res = await linkReq();
+          expect(res.status).toBe(409);
+          expect(await res.json()).toMatchObject({ code: 'PLACEMENT_CONFLICT', conflict });
+          expect(db.transaction).not.toHaveBeenCalled();
+          expect(db.update).not.toHaveBeenCalled();
+          expect(writeRouteAudit).not.toHaveBeenCalled();
+        });
+
+        it('409 and no link audit when a conflict appears after the pre-check (rollback path)', async () => {
+          arrangeLinkWrite();
+          const conflict = { device: { room: 'A' }, discovered: { room: 'B' } };
+          vi.mocked(reconcilePlacementOnLinkOrThrow).mockRejectedValueOnce(new PlacementLinkConflictError(conflict as any));
+
+          const res = await linkReq();
+          expect(res.status).toBe(409);
+          expect(await res.json()).toMatchObject({ code: 'PLACEMENT_CONFLICT', conflict });
+          expect(writeRouteAudit).not.toHaveBeenCalled();
+        });
+
+        it('409 PLACEMENT_CONCURRENT_UPDATE (not 500) when a concurrent placement write wins the unique index', async () => {
+          arrangeLinkWrite();
+          vi.mocked(reconcilePlacementOnLinkOrThrow).mockRejectedValueOnce(new PlacementConcurrentUpdateError());
+
+          const res = await linkReq();
+          expect(res.status).toBe(409);
+          expect(await res.json()).toMatchObject({ code: 'PLACEMENT_CONCURRENT_UPDATE' });
+          expect(writeRouteAudit).not.toHaveBeenCalled();
+        });
+
+        it('unlink never reconciles or clones placement back onto the asset', async () => {
+          setSiteRestrictedAuth([SITE_IN]);
+          vi.mocked(db.select).mockReturnValueOnce({
+            from: vi.fn().mockReturnValue({
+              where: vi.fn().mockReturnValue({
+                limit: vi.fn().mockResolvedValue([{
+                  id: ASSET_IN, orgId: ORG, siteId: SITE_IN, linkedDeviceId: DEVICE_ID, linkSource: 'manual'
+                }]),
+              }),
+            }),
+          } as any);
+          vi.mocked(db.update).mockReturnValueOnce({
+            set: vi.fn().mockReturnValue({
+              where: vi.fn().mockReturnValue({
+                returning: vi.fn().mockResolvedValue([{ id: ASSET_IN, orgId: ORG, linkedDeviceId: null }])
+              })
+            })
+          } as any);
+
+          const res = await app.request(`/discovery/assets/${ASSET_IN}/link`, {
+            method: 'DELETE',
+            headers: { Authorization: 'Bearer token' }
+          });
+          expect(res.status).toBe(200);
+          expect(reconcilePlacementOnLinkOrThrow).not.toHaveBeenCalled();
         });
       });
 
@@ -2252,6 +2620,38 @@ describe('discovery routes', () => {
         expect(res.status).toBe(403);
         const body = await res.json();
         expect(body.error).toBe('Access to this site denied');
+        expect(db.select).toHaveBeenCalledTimes(1);
+        expect(db.transaction).not.toHaveBeenCalled();
+      });
+
+      it.each([
+        { kind: 'managed', monitorId: '00000000-0000-0000-0000-000000000101' },
+        { kind: 'unmanaged', monitorId: null },
+        { kind: 'retired', monitorId: null, retiredAt: new Date() },
+      ])('preserves history for a $kind network check bound to the asset', async ({ monitorId, ...check }) => {
+        vi.mocked(db.select).mockReset();
+        setSiteRestrictedAuth([SITE_IN]);
+        mockAssetOnly({ id: ASSET_IN, orgId: ORG, hostname: 'h', ipAddress: '10.0.0.1', siteId: SITE_IN });
+        const checkId = '00000000-0000-0000-0000-000000000102';
+        vi.mocked(db.select).mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockResolvedValue([{ ...check, monitorId, checkId }]),
+          }),
+        } as any);
+
+        const res = await app.request(`/discovery/assets/${ASSET_IN}`, {
+          method: 'DELETE',
+          headers: { Authorization: 'Bearer token' }
+        });
+
+        expect(res.status).toBe(409);
+        expect(await res.json()).toEqual({
+          error: 'asset_has_retained_network_checks',
+          monitorIds: monitorId ? [monitorId] : [],
+          checkIds: [checkId],
+        });
+        expect(db.transaction).not.toHaveBeenCalled();
+        expect(db.delete).not.toHaveBeenCalled();
       });
 
       it('allows deleting an asset whose site is in the allowlist', async () => {
@@ -2551,6 +2951,826 @@ describe('discovery routes', () => {
       const body = await res.json();
       expect(body.data.typeSource).toBe('manual');
       expect(body.data.detectedAssetType).toBe('workstation');
+    });
+  });
+  describe('PATCH /assets/:id siteId (site move)', () => {
+    const ORG = '00000000-0000-0000-0000-000000000000';
+    const ASSET_ID = '00000000-0000-0000-0000-000000000010';
+    const SITE_FROM = '00000000-0000-0000-0000-0000000000a1';
+    const SITE_TO = '00000000-0000-0000-0000-0000000000a2';
+
+    function setSiteRestrictedAuth(allowedSiteIds: string[] | undefined) {
+      vi.mocked(authMiddleware).mockImplementation((c: any, next: any) => {
+        c.set('auth', {
+          user: { id: 'user-123', email: 'test@example.com', name: 'Test User' },
+          scope: 'organization',
+          orgId: ORG,
+          partnerId: null,
+          canAccessOrg: (orgId: string) => orgId === ORG,
+          accessibleOrgIds: null,
+        });
+        c.set('permissions', allowedSiteIds ? { allowedSiteIds } : {});
+        return next();
+      });
+    }
+
+    // mockImplementation survives vi.clearAllMocks(); start each case unrestricted.
+    beforeEach(() => setSiteRestrictedAuth(undefined));
+
+    /** Asset lookup (loadAuthorizedAsset) followed by the target-site lookup. */
+    function mockAssetThenSite(asset: any, site: any) {
+      vi.mocked(db.select)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({ limit: vi.fn().mockResolvedValue(asset ? [asset] : []) }),
+          }),
+        } as any)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({ limit: vi.fn().mockResolvedValue(site ? [site] : []) }),
+          }),
+        } as any);
+    }
+
+    const patch = (body: unknown) => app.request(`/discovery/assets/${ASSET_ID}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify(body),
+    });
+
+    it('rejects a target site that belongs to another org without writing', async () => {
+      mockAssetThenSite({ id: ASSET_ID, orgId: ORG, siteId: SITE_FROM }, null);
+
+      const res = await patch({ siteId: SITE_TO });
+
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({ error: 'Target site not found or belongs to a different organization' });
+      expect(db.update).not.toHaveBeenCalled();
+      expect(db.transaction).not.toHaveBeenCalled();
+      expect(moveDiscoveredAssetsToSite).not.toHaveBeenCalled();
+    });
+
+    it('denies a site-restricted caller moving an asset into a site outside their allowlist', async () => {
+      setSiteRestrictedAuth([SITE_FROM]);
+      mockAssetThenSite({ id: ASSET_ID, orgId: ORG, siteId: SITE_FROM }, { id: SITE_TO });
+
+      const res = await patch({ siteId: SITE_TO });
+
+      expect(res.status).toBe(403);
+      expect(await res.json()).toEqual({ error: 'Access to this site denied' });
+      expect(db.transaction).not.toHaveBeenCalled();
+      expect(moveDiscoveredAssetsToSite).not.toHaveBeenCalled();
+    });
+
+    it('runs the move through the service inside one transaction and reports the summary', async () => {
+      mockAssetThenSite({ id: ASSET_ID, orgId: ORG, siteId: SITE_FROM }, { id: SITE_TO });
+      vi.mocked(moveDiscoveredAssetsToSite).mockResolvedValueOnce([{
+        assetId: ASSET_ID,
+        moved: true,
+        previousSiteId: SITE_FROM,
+        unlinkedDeviceId: '00000000-0000-0000-0000-0000000000d9',
+        monitorsReattached: 2,
+        topologyPoliciesDisabled: 1,
+      }]);
+
+      let capturedSetPayload: any;
+      const tx = {
+        update: vi.fn(() => ({
+          set: vi.fn((payload: any) => {
+            capturedSetPayload = payload;
+            return {
+              where: vi.fn().mockReturnValue({
+                returning: vi.fn().mockResolvedValue([{
+                  id: ASSET_ID, orgId: ORG, siteId: SITE_TO, label: 'Core switch', hostname: null,
+                  ipAddress: '10.0.0.1', linkedDeviceId: null, linkSource: null,
+                }]),
+              }),
+            };
+          }),
+        })),
+      };
+      vi.mocked(db.transaction).mockImplementationOnce(async (fn: any) => fn(tx));
+
+      const res = await patch({ siteId: SITE_TO, label: 'Core switch' });
+
+      expect(res.status).toBe(200);
+      expect(moveDiscoveredAssetsToSite).toHaveBeenCalledTimes(1);
+      expect(moveDiscoveredAssetsToSite).toHaveBeenCalledWith({
+        tx, orgId: ORG, assetIds: [ASSET_ID], targetSiteId: SITE_TO,
+      });
+      // The remaining field edits ride the same transaction, after the move.
+      expect(capturedSetPayload).toMatchObject({ label: 'Core switch' });
+      expect(capturedSetPayload).not.toHaveProperty('siteId');
+      expect(db.update).not.toHaveBeenCalled();
+
+      const body = await res.json();
+      expect(body.siteId).toBe(SITE_TO);
+      expect(body.siteMove).toEqual({ unlinkedDevice: true, monitorsReattached: 2, topologyPoliciesDisabled: 1 });
+      expect(writeRouteAudit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: 'discovery.asset.update',
+        details: expect.objectContaining({
+          changedFields: expect.arrayContaining(['siteId', 'label']),
+          siteMove: expect.objectContaining({ fromSiteId: SITE_FROM, toSiteId: SITE_TO }),
+        }),
+      }));
+    });
+
+    it('treats siteId equal to the current site as a no-op and still requires another change', async () => {
+      mockAssetThenSite({ id: ASSET_ID, orgId: ORG, siteId: SITE_FROM }, null);
+
+      const res = await patch({ siteId: SITE_FROM });
+
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({ error: 'No updates provided' });
+      expect(db.transaction).not.toHaveBeenCalled();
+      expect(moveDiscoveredAssetsToSite).not.toHaveBeenCalled();
+    });
+
+    it('404s when the asset does not exist in the caller org', async () => {
+      mockAssetThenSite(null, null);
+
+      const res = await patch({ siteId: SITE_TO });
+
+      expect(res.status).toBe(404);
+      expect(db.transaction).not.toHaveBeenCalled();
+    });
+  });
+  describe('PATCH /profiles/:id siteId (profile site move)', () => {
+    const ORG = '00000000-0000-0000-0000-000000000000';
+    const PROFILE_ID = '00000000-0000-0000-0000-000000000020';
+    const SITE_FROM = '00000000-0000-0000-0000-0000000000a1';
+    const SITE_TO = '00000000-0000-0000-0000-0000000000a2';
+    const ASSET_A = '00000000-0000-0000-0000-0000000000e1';
+    const ASSET_B = '00000000-0000-0000-0000-0000000000e2';
+    const existingProfile = {
+      id: PROFILE_ID, orgId: ORG, siteId: SITE_FROM, snmpCommunities: [], snmpCredentials: null,
+    };
+
+    function setSiteRestrictedAuth(allowedSiteIds: string[] | undefined) {
+      vi.mocked(authMiddleware).mockImplementation((c: any, next: any) => {
+        c.set('auth', {
+          user: { id: 'user-123', email: 'test@example.com', name: 'Test User' },
+          scope: 'organization',
+          orgId: ORG,
+          partnerId: null,
+          canAccessOrg: (orgId: string) => orgId === ORG,
+          accessibleOrgIds: null,
+        });
+        c.set('permissions', allowedSiteIds ? { allowedSiteIds } : {});
+        return next();
+      });
+    }
+
+    beforeEach(() => {
+      setSiteRestrictedAuth(undefined);
+      // vi.clearAllMocks() keeps queued mockReturnValueOnce values; an earlier
+      // block that queued more lookups than its route consumed would otherwise
+      // feed this block's first select. mockReset restores the vi.fn default.
+      vi.mocked(db.select).mockReset();
+      vi.mocked(db.update).mockReset();
+      vi.mocked(db.transaction).mockReset();
+    });
+
+    const limitSelect = (rows: unknown[]) => ({
+      from: vi.fn().mockReturnValue({
+        where: vi.fn().mockReturnValue({ limit: vi.fn().mockResolvedValue(rows) }),
+      }),
+    } as any);
+
+    /** Profile lookup followed by the target-site lookup. */
+    function mockProfileThenSite(profile: any, site: any) {
+      vi.mocked(db.select)
+        .mockReturnValueOnce(limitSelect(profile ? [profile] : []))
+        .mockReturnValueOnce(limitSelect(site ? [site] : []));
+    }
+
+    /** A movable-asset selection: select({id}).from(assets).innerJoin(jobs).where(...). */
+    const candidateSelect = (rows: Array<{ id: string }>) => ({
+      from: vi.fn().mockReturnValue({
+        innerJoin: vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue(rows) }),
+      }),
+    });
+
+    function mockProfileUpdate(updatedRow: any) {
+      const setSpy = vi.fn().mockReturnValue({
+        where: vi.fn().mockReturnValue({ returning: vi.fn().mockResolvedValue([updatedRow]) }),
+      });
+      vi.mocked(db.update).mockReturnValueOnce({ set: setSpy } as any);
+      return setSpy;
+    }
+
+    const patch = (body: unknown) => app.request(`/discovery/profiles/${PROFILE_ID}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify(body),
+    });
+
+    it('rejects widening subnets past the agent limit without DeepScan, but allows it with DeepScan on the profile', async () => {
+      vi.mocked(db.select).mockReturnValueOnce(limitSelect([{ ...existingProfile, subnets: ['10.0.0.0/24'], deepScan: false }]));
+      const res = await patch({ subnets: ['10.0.0.0/8'] });
+      expect(res.status).toBe(400);
+      expect(JSON.stringify(await res.json())).toContain('65,536');
+      expect(db.update).not.toHaveBeenCalled();
+
+      vi.mocked(db.select).mockReturnValueOnce(limitSelect([{ ...existingProfile, subnets: ['10.0.0.0/24'], deepScan: true }]));
+      mockProfileUpdate({ ...existingProfile, subnets: ['10.0.0.0/8'], deepScan: true });
+      const ok = await patch({ subnets: ['10.0.0.0/8'] });
+      expect(ok.status).toBe(200);
+    });
+
+    it('rejects a target site that belongs to another org without writing', async () => {
+      mockProfileThenSite(existingProfile, null);
+
+      const res = await patch({ siteId: SITE_TO });
+
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({ error: 'Target site not found or belongs to a different organization' });
+      expect(db.update).not.toHaveBeenCalled();
+      expect(db.transaction).not.toHaveBeenCalled();
+      expect(moveDiscoveredAssetsToSite).not.toHaveBeenCalled();
+    });
+
+    it('denies a site-restricted caller moving the profile into a site outside their allowlist', async () => {
+      setSiteRestrictedAuth([SITE_FROM]);
+      mockProfileThenSite(existingProfile, { id: SITE_TO });
+
+      const res = await patch({ siteId: SITE_TO });
+
+      expect(res.status).toBe(403);
+      expect(await res.json()).toEqual({ error: 'Access to this site denied' });
+      expect(db.update).not.toHaveBeenCalled();
+      expect(db.transaction).not.toHaveBeenCalled();
+      expect(moveDiscoveredAssetsToSite).not.toHaveBeenCalled();
+    });
+
+    it('changes the site without moving assets when moveDiscoveredAssets is not set', async () => {
+      mockProfileThenSite(existingProfile, { id: SITE_TO });
+      const setSpy = mockProfileUpdate({ ...existingProfile, siteId: SITE_TO, name: 'HQ' });
+
+      const res = await patch({ siteId: SITE_TO, name: 'HQ' });
+
+      expect(res.status).toBe(200);
+      expect(setSpy).toHaveBeenCalledWith(expect.objectContaining({ siteId: SITE_TO, name: 'HQ' }));
+      expect(moveDiscoveredAssetsToSite).not.toHaveBeenCalled();
+      const body = await res.json();
+      expect(body.siteId).toBe(SITE_TO);
+      expect(body.assetMove).toBeUndefined();
+      expect(writeRouteAudit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: 'discovery.profile.update',
+        details: expect.objectContaining({
+          siteMove: expect.objectContaining({ fromSiteId: SITE_FROM, toSiteId: SITE_TO, assetMove: null }),
+        }),
+      }));
+    });
+
+    it('moves exactly the candidate assets through the service inside one transaction and reports the summary', async () => {
+      mockProfileThenSite(existingProfile, { id: SITE_TO });
+      vi.mocked(moveDiscoveredAssetsToSite).mockResolvedValueOnce([
+        { assetId: ASSET_A, moved: true, previousSiteId: SITE_FROM, unlinkedDeviceId: '00000000-0000-0000-0000-0000000000d9', monitorsReattached: 2, topologyPoliciesDisabled: 1 },
+        { assetId: ASSET_B, moved: true, previousSiteId: SITE_FROM, unlinkedDeviceId: null, monitorsReattached: 0, topologyPoliciesDisabled: 1 },
+      ]);
+
+      let capturedSetPayload: any;
+      const tx = {
+        select: vi.fn().mockReturnValueOnce(candidateSelect([{ id: ASSET_A }, { id: ASSET_B }])),
+        update: vi.fn(() => ({
+          set: vi.fn((payload: any) => {
+            capturedSetPayload = payload;
+            return {
+              where: vi.fn().mockReturnValue({
+                returning: vi.fn().mockResolvedValue([{ ...existingProfile, siteId: SITE_TO, name: 'Nightly' }]),
+              }),
+            };
+          }),
+        })),
+      };
+      vi.mocked(db.transaction).mockImplementationOnce(async (fn: any) => fn(tx));
+
+      const res = await patch({ siteId: SITE_TO, moveDiscoveredAssets: true });
+
+      expect(res.status).toBe(200);
+      expect(moveDiscoveredAssetsToSite).toHaveBeenCalledTimes(1);
+      expect(moveDiscoveredAssetsToSite).toHaveBeenCalledWith({
+        tx, orgId: ORG, assetIds: [ASSET_A, ASSET_B], targetSiteId: SITE_TO,
+      });
+      expect(capturedSetPayload).toMatchObject({ siteId: SITE_TO });
+      expect(db.update).not.toHaveBeenCalled();
+
+      const body = await res.json();
+      expect(body.siteId).toBe(SITE_TO);
+      expect(body.assetMove).toEqual({
+        candidates: 2, moved: 2, unlinkedDevices: 1, monitorsReattached: 2, topologyPoliciesDisabled: 2,
+      });
+      expect(writeRouteAudit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: 'discovery.profile.update',
+        details: expect.objectContaining({
+          changedFields: expect.arrayContaining(['siteId', 'moveDiscoveredAssets']),
+          siteMove: expect.objectContaining({
+            fromSiteId: SITE_FROM, toSiteId: SITE_TO, assetMove: expect.objectContaining({ moved: 2 }),
+          }),
+        }),
+      }));
+    });
+
+    it('treats siteId equal to the current site as a no-op for the site while other fields still apply', async () => {
+      vi.mocked(db.select).mockReturnValueOnce(limitSelect([existingProfile]));
+      const setSpy = mockProfileUpdate({ ...existingProfile, name: 'Renamed' });
+
+      const res = await patch({ siteId: SITE_FROM, name: 'Renamed', moveDiscoveredAssets: true });
+
+      expect(res.status).toBe(200);
+      // Only one select ran (the profile lookup): no target-site gate for the same site.
+      expect(db.select).toHaveBeenCalledTimes(1);
+      expect(setSpy).toHaveBeenCalledWith(expect.objectContaining({ name: 'Renamed' }));
+      expect(setSpy).not.toHaveBeenCalledWith(expect.objectContaining({ siteId: expect.anything() }));
+      expect(db.transaction).not.toHaveBeenCalled();
+      expect(moveDiscoveredAssetsToSite).not.toHaveBeenCalled();
+      expect((await res.json()).assetMove).toBeUndefined();
+    });
+
+    it('GET /profiles/:id/movable-assets returns the candidate count and the current site', async () => {
+      vi.mocked(db.select)
+        .mockReturnValueOnce(limitSelect([{ ...existingProfile, name: 'HQ' }]))
+        .mockReturnValueOnce(candidateSelect([{ id: ASSET_A }, { id: ASSET_B }]) as any);
+
+      const res = await app.request(`/discovery/profiles/${PROFILE_ID}/movable-assets`, {
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ count: 2, siteId: SITE_FROM });
+      expect(db.transaction).not.toHaveBeenCalled();
+    });
+
+    it('GET /profiles/:id/movable-assets 404s for a profile outside the caller org', async () => {
+      vi.mocked(db.select).mockReturnValueOnce(limitSelect([]));
+
+      const res = await app.request(`/discovery/profiles/${PROFILE_ID}/movable-assets`, {
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(404);
+    });
+  });
+
+  describe('PATCH /profiles/:id SNMP credential origin binding', () => {
+    const ORG = '00000000-0000-0000-0000-000000000000';
+    const PROFILE_ID = '00000000-0000-0000-0000-000000000030';
+    const SITE = '00000000-0000-0000-0000-0000000000b1';
+
+    function setAuth() {
+      vi.mocked(authMiddleware).mockImplementation((c: any, next: any) => {
+        c.set('auth', {
+          user: { id: 'user-123', email: 'test@example.com', name: 'Test User' },
+          scope: 'organization',
+          orgId: ORG,
+          partnerId: null,
+          canAccessOrg: (orgId: string) => orgId === ORG,
+          accessibleOrgIds: null,
+        });
+        c.set('permissions', {});
+        return next();
+      });
+    }
+
+    beforeEach(() => {
+      setAuth();
+      vi.mocked(db.select).mockReset();
+      vi.mocked(db.update).mockReset();
+      vi.mocked(db.transaction).mockReset();
+    });
+
+    const limitSelect = (rows: unknown[]) => ({
+      from: vi.fn().mockReturnValue({
+        where: vi.fn().mockReturnValue({ limit: vi.fn().mockResolvedValue(rows) }),
+      }),
+    } as any);
+
+    function mockProfileLookup(profile: any) {
+      vi.mocked(db.select).mockReturnValueOnce(limitSelect(profile ? [profile] : []));
+    }
+
+    function mockProfileUpdate(updatedRow: any) {
+      const setSpy = vi.fn().mockReturnValue({
+        where: vi.fn().mockReturnValue({ returning: vi.fn().mockResolvedValue([updatedRow]) }),
+      });
+      vi.mocked(db.update).mockReturnValueOnce({ set: setSpy } as any);
+      return setSpy;
+    }
+
+    const patch = (body: unknown) => app.request(`/discovery/profiles/${PROFILE_ID}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify(body),
+    });
+
+    const existingProfileWithSecrets = {
+      id: PROFILE_ID,
+      orgId: ORG,
+      siteId: SITE,
+      subnets: ['10.0.1.0/24', '10.0.2.0/24'],
+      snmpCommunities: ['enc:v1:mock-community'],
+      snmpCredentials: { version: 'v3', username: 'poller', authPassphrase: 'enc:v1:mock-auth' },
+    };
+
+    it('refuses an added subnet that leaves stored SNMP communities untouched', async () => {
+      mockProfileLookup(existingProfileWithSecrets);
+
+      const res = await patch({ subnets: ['10.0.1.0/24', '10.0.2.0/24', '10.0.3.0/24'] });
+
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({
+        error: 'Adding or changing subnets requires re-entering the SNMP credentials, or clearing them',
+      });
+      expect(db.update).not.toHaveBeenCalled();
+    });
+
+    it('refuses a widened subnet set that echoes masked SNMP credentials back', async () => {
+      mockProfileLookup(existingProfileWithSecrets);
+
+      const res = await patch({
+        subnets: ['10.0.1.0/24', '10.0.2.0/24', '10.0.3.0/24'],
+        snmpCommunities: ['********'],
+        snmpCredentials: { version: 'v3', username: 'poller', authPassphrase: '********' },
+      });
+
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({
+        error: 'Adding or changing subnets requires re-entering the SNMP credentials, or clearing them',
+      });
+      expect(db.update).not.toHaveBeenCalled();
+    });
+
+    it('refuses a changed (not just added) subnet under the same widening rule', async () => {
+      mockProfileLookup(existingProfileWithSecrets);
+
+      // Drops 10.0.2.0/24 but ALSO introduces 10.0.5.0/24 — a net change, not
+      // a pure narrowing, so it must still require fresh secrets.
+      const res = await patch({ subnets: ['10.0.1.0/24', '10.0.5.0/24'] });
+
+      expect(res.status).toBe(400);
+      expect(db.update).not.toHaveBeenCalled();
+    });
+
+    it('allows a widened subnet set when fresh SNMP secrets are supplied', async () => {
+      mockProfileLookup(existingProfileWithSecrets);
+      const setSpy = mockProfileUpdate({ ...existingProfileWithSecrets, subnets: ['10.0.1.0/24', '10.0.2.0/24', '10.0.3.0/24'] });
+
+      const res = await patch({
+        subnets: ['10.0.1.0/24', '10.0.2.0/24', '10.0.3.0/24'],
+        snmpCommunities: ['fresh-community'],
+        snmpCredentials: { version: 'v3', username: 'poller', authPassphrase: 'fresh-secret' },
+      });
+
+      expect(res.status).toBe(200);
+      expect(setSpy).toHaveBeenCalled();
+    });
+
+    it('allows a widened subnet set when the stored secrets are explicitly cleared', async () => {
+      mockProfileLookup(existingProfileWithSecrets);
+      const setSpy = mockProfileUpdate({ ...existingProfileWithSecrets, subnets: ['10.0.1.0/24', '10.0.2.0/24', '10.0.3.0/24'] });
+
+      const res = await patch({
+        subnets: ['10.0.1.0/24', '10.0.2.0/24', '10.0.3.0/24'],
+        snmpCommunities: [],
+        snmpCredentials: null,
+      });
+
+      expect(res.status).toBe(200);
+      expect(setSpy).toHaveBeenCalled();
+    });
+
+    it('allows narrowing subnets (removal only) without touching stored secrets', async () => {
+      mockProfileLookup(existingProfileWithSecrets);
+      const setSpy = mockProfileUpdate({ ...existingProfileWithSecrets, subnets: ['10.0.1.0/24'] });
+
+      const res = await patch({ subnets: ['10.0.1.0/24'] });
+
+      expect(res.status).toBe(200);
+      expect(setSpy).toHaveBeenCalled();
+    });
+
+    it('allows a profile update that never touches subnets, even with stored secrets present', async () => {
+      mockProfileLookup(existingProfileWithSecrets);
+      const setSpy = mockProfileUpdate({ ...existingProfileWithSecrets, name: 'Renamed' });
+
+      const res = await patch({ name: 'Renamed' });
+
+      expect(res.status).toBe(200);
+      expect(setSpy).toHaveBeenCalled();
+    });
+
+    const existingProfileWithSecretsAndExclusions = {
+      ...existingProfileWithSecrets,
+      excludeIps: ['10.0.1.5', '10.0.1.6'],
+    };
+
+    it('refuses removing an excluded IP that un-walls a host inside an already-approved subnet', async () => {
+      mockProfileLookup(existingProfileWithSecretsAndExclusions);
+
+      const res = await patch({ excludeIps: ['10.0.1.6'] });
+
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({
+        error: 'Adding or changing subnets requires re-entering the SNMP credentials, or clearing them',
+      });
+      expect(db.update).not.toHaveBeenCalled();
+    });
+
+    it('refuses clearing excludeIps entirely while stored SNMP secrets are left untouched', async () => {
+      mockProfileLookup(existingProfileWithSecretsAndExclusions);
+
+      const res = await patch({ excludeIps: [] });
+
+      expect(res.status).toBe(400);
+      expect(db.update).not.toHaveBeenCalled();
+    });
+
+    it('allows removing an excluded IP when fresh SNMP secrets are supplied', async () => {
+      mockProfileLookup(existingProfileWithSecretsAndExclusions);
+      const setSpy = mockProfileUpdate({ ...existingProfileWithSecretsAndExclusions, excludeIps: ['10.0.1.6'] });
+
+      const res = await patch({
+        excludeIps: ['10.0.1.6'],
+        snmpCommunities: ['fresh-community'],
+        snmpCredentials: { version: 'v3', username: 'poller', authPassphrase: 'fresh-secret' },
+      });
+
+      expect(res.status).toBe(200);
+      expect(setSpy).toHaveBeenCalled();
+    });
+
+    it('allows widening excludeIps (adding more exclusions) without touching stored secrets', async () => {
+      mockProfileLookup(existingProfileWithSecretsAndExclusions);
+      const setSpy = mockProfileUpdate({ ...existingProfileWithSecretsAndExclusions, excludeIps: ['10.0.1.5', '10.0.1.6', '10.0.1.7'] });
+
+      const res = await patch({ excludeIps: ['10.0.1.5', '10.0.1.6', '10.0.1.7'] });
+
+      expect(res.status).toBe(200);
+      expect(setSpy).toHaveBeenCalled();
+    });
+
+    it('refuses a bare siteId move while stored SNMP secrets are left untouched', async () => {
+      const OTHER_SITE = '00000000-0000-0000-0000-0000000000c2';
+      vi.mocked(db.select).mockReturnValueOnce(limitSelect([existingProfileWithSecrets]));
+
+      const res = await patch({ siteId: OTHER_SITE });
+
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({
+        error: 'Adding or changing subnets requires re-entering the SNMP credentials, or clearing them',
+      });
+      expect(db.update).not.toHaveBeenCalled();
+    });
+
+    it('allows a siteId move when fresh SNMP secrets are supplied', async () => {
+      const OTHER_SITE = '00000000-0000-0000-0000-0000000000c2';
+      vi.mocked(db.select)
+        .mockReturnValueOnce(limitSelect([existingProfileWithSecrets]))
+        .mockReturnValueOnce(limitSelect([{ id: OTHER_SITE }]));
+      const setSpy = mockProfileUpdate({ ...existingProfileWithSecrets, siteId: OTHER_SITE });
+
+      const res = await patch({
+        siteId: OTHER_SITE,
+        snmpCommunities: ['fresh-community'],
+        snmpCredentials: { version: 'v3', username: 'poller', authPassphrase: 'fresh-secret' },
+      });
+
+      expect(res.status).toBe(200);
+      expect(setSpy).toHaveBeenCalled();
+    });
+
+    it('allows a siteId move when stored secrets are explicitly cleared', async () => {
+      const OTHER_SITE = '00000000-0000-0000-0000-0000000000c2';
+      vi.mocked(db.select)
+        .mockReturnValueOnce(limitSelect([existingProfileWithSecrets]))
+        .mockReturnValueOnce(limitSelect([{ id: OTHER_SITE }]));
+      const setSpy = mockProfileUpdate({ ...existingProfileWithSecrets, siteId: OTHER_SITE });
+
+      const res = await patch({ siteId: OTHER_SITE, snmpCommunities: [], snmpCredentials: null });
+
+      expect(res.status).toBe(200);
+      expect(setSpy).toHaveBeenCalled();
+    });
+
+    it('allows a siteId move without stored secrets untouched when no secrets are stored', async () => {
+      const OTHER_SITE = '00000000-0000-0000-0000-0000000000c2';
+      const noSecretsProfile = { ...existingProfileWithSecrets, snmpCommunities: [], snmpCredentials: null };
+      vi.mocked(db.select)
+        .mockReturnValueOnce(limitSelect([noSecretsProfile]))
+        .mockReturnValueOnce(limitSelect([{ id: OTHER_SITE }]));
+      const setSpy = mockProfileUpdate({ ...noSecretsProfile, siteId: OTHER_SITE });
+
+      const res = await patch({ siteId: OTHER_SITE });
+
+      expect(res.status).toBe(200);
+      expect(setSpy).toHaveBeenCalled();
+    });
+  });
+
+  describe('pinned scan agent (#7969)', () => {
+    const ORG = '00000000-0000-0000-0000-000000000000';
+    const OTHER_ORG = '00000000-0000-0000-0000-0000000000ff';
+    const PROFILE_ID = '00000000-0000-0000-0000-000000000020';
+    const SITE = '00000000-0000-0000-0000-0000000000a1';
+    const SITE_TO = '00000000-0000-0000-0000-0000000000a2';
+    const DEVICE = '00000000-0000-0000-0000-0000000000d1';
+    const pinnable = { id: DEVICE, orgId: ORG, siteId: SITE, agentId: 'agent-1', isEphemeral: false };
+    const existingProfile = {
+      id: PROFILE_ID, orgId: ORG, siteId: SITE, subnets: ['10.0.0.0/24'], excludeIps: [],
+      snmpCommunities: [], snmpCredentials: null, deepScan: false, pinnedDeviceId: null,
+    };
+
+    const limitSelect = (rows: unknown[]) => ({
+      from: vi.fn().mockReturnValue({
+        where: vi.fn().mockReturnValue({ limit: vi.fn().mockResolvedValue(rows) }),
+      }),
+    } as any);
+
+    beforeEach(() => {
+      vi.mocked(db.select).mockReset();
+      vi.mocked(db.update).mockReset();
+      vi.mocked(db.insert).mockClear();
+    });
+
+    const post = (extra: Record<string, unknown>) => app.request('/discovery/profiles', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({
+        name: 'Pinned', siteId: SITE, subnets: ['10.0.0.0/24'], methods: ['ping'],
+        schedule: { type: 'interval', intervalMinutes: 30 }, ...extra,
+      }),
+    });
+
+    const patch = (body: unknown) => app.request(`/discovery/profiles/${PROFILE_ID}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify(body),
+    });
+
+    function mockProfileUpdate(updatedRow: any) {
+      const setSpy = vi.fn().mockReturnValue({
+        where: vi.fn().mockReturnValue({ returning: vi.fn().mockResolvedValue([updatedRow]) }),
+      });
+      vi.mocked(db.update).mockReturnValueOnce({ set: setSpy } as any);
+      return setSpy;
+    }
+
+    it('creates a profile pinned to a device in its own org and site', async () => {
+      vi.mocked(db.select)
+        .mockReturnValueOnce(limitSelect([{ id: SITE }]))
+        .mockReturnValueOnce(limitSelect([pinnable]));
+      const values = vi.fn(() => ({ returning: vi.fn(() => Promise.resolve([{ id: PROFILE_ID, orgId: ORG, pinnedDeviceId: DEVICE }])) }));
+      vi.mocked(db.insert).mockReturnValueOnce({ values } as any);
+
+      const res = await post({ pinnedDeviceId: DEVICE });
+
+      expect(res.status).toBe(201);
+      expect(values).toHaveBeenCalledWith(expect.objectContaining({ pinnedDeviceId: DEVICE }));
+    });
+
+    it('cross-org forge: rejects pinning a device from another organization without writing', async () => {
+      vi.mocked(db.select)
+        .mockReturnValueOnce(limitSelect([{ id: SITE }]))
+        .mockReturnValueOnce(limitSelect([{ ...pinnable, orgId: OTHER_ORG }]));
+
+      const res = await post({ pinnedDeviceId: DEVICE });
+
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/organization/i);
+      expect(db.insert).not.toHaveBeenCalled();
+    });
+
+    it('rejects a device that is not visible (RLS-hidden / unknown), in another site, ephemeral, or agentless', async () => {
+      for (const row of [null, { ...pinnable, siteId: SITE_TO }, { ...pinnable, isEphemeral: true }, { ...pinnable, agentId: null }]) {
+        vi.mocked(db.select)
+          .mockReturnValueOnce(limitSelect([{ id: SITE }]))
+          .mockReturnValueOnce(limitSelect(row ? [row] : []));
+        const res = await post({ pinnedDeviceId: DEVICE });
+        expect(res.status).toBe(400);
+      }
+      expect(db.insert).not.toHaveBeenCalled();
+    });
+
+    it('rejects a malformed pinnedDeviceId at the schema', async () => {
+      const res = await post({ pinnedDeviceId: 'agent-1' });
+      expect(res.status).toBe(400);
+      expect(db.insert).not.toHaveBeenCalled();
+    });
+
+    it('PATCH pins, and null clears the pin without a device lookup', async () => {
+      vi.mocked(db.select)
+        .mockReturnValueOnce(limitSelect([existingProfile]))
+        .mockReturnValueOnce(limitSelect([pinnable]));
+      const pinSpy = mockProfileUpdate({ ...existingProfile, pinnedDeviceId: DEVICE });
+      const pinned = await patch({ pinnedDeviceId: DEVICE });
+      expect(pinned.status).toBe(200);
+      expect(pinSpy).toHaveBeenCalledWith(expect.objectContaining({ pinnedDeviceId: DEVICE }));
+
+      vi.mocked(db.select).mockReturnValueOnce(limitSelect([{ ...existingProfile, pinnedDeviceId: DEVICE }]));
+      const clearSpy = mockProfileUpdate({ ...existingProfile, pinnedDeviceId: null });
+      const cleared = await patch({ pinnedDeviceId: null });
+      expect(cleared.status).toBe(200);
+      expect(clearSpy).toHaveBeenCalledWith(expect.objectContaining({ pinnedDeviceId: null }));
+      expect(db.select).toHaveBeenCalledTimes(3);
+    });
+
+    it('PATCH cross-org forge: rejects pinning another org\'s device without writing', async () => {
+      vi.mocked(db.select)
+        .mockReturnValueOnce(limitSelect([existingProfile]))
+        .mockReturnValueOnce(limitSelect([{ ...pinnable, orgId: OTHER_ORG }]));
+
+      const res = await patch({ pinnedDeviceId: DEVICE });
+
+      expect(res.status).toBe(400);
+      expect(db.update).not.toHaveBeenCalled();
+    });
+
+    it('PATCH site move re-validates a stored pin against the NEW site instead of carrying it silently', async () => {
+      vi.mocked(db.select)
+        .mockReturnValueOnce(limitSelect([{ ...existingProfile, pinnedDeviceId: DEVICE }]))
+        .mockReturnValueOnce(limitSelect([{ id: SITE_TO }]))
+        .mockReturnValueOnce(limitSelect([pinnable]));
+
+      const res = await patch({ siteId: SITE_TO });
+
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/site/i);
+      expect(db.update).not.toHaveBeenCalled();
+    });
+
+    it('PATCH: an unrelated edit that re-sends an unchanged (now stale) pin saves without re-validating it', async () => {
+      // The form always re-sends the current pin. A pin whose device has since
+      // moved site must not lock renames/schedule edits; the scan fails at run time.
+      vi.mocked(db.select).mockReturnValueOnce(limitSelect([{ ...existingProfile, pinnedDeviceId: DEVICE }]));
+      const setSpy = mockProfileUpdate({ ...existingProfile, name: 'Renamed', pinnedDeviceId: DEVICE });
+
+      const res = await patch({ name: 'Renamed', pinnedDeviceId: DEVICE });
+
+      expect(res.status).toBe(200);
+      expect(db.select).toHaveBeenCalledTimes(1); // no device lookup
+      expect(setSpy).toHaveBeenCalledWith(expect.objectContaining({ name: 'Renamed' }));
+    });
+
+    it('PATCH site move carries a stored pin that is valid in the new site', async () => {
+      vi.mocked(db.select)
+        .mockReturnValueOnce(limitSelect([{ ...existingProfile, pinnedDeviceId: DEVICE }]))
+        .mockReturnValueOnce(limitSelect([{ id: SITE_TO }]))
+        .mockReturnValueOnce(limitSelect([{ ...pinnable, siteId: SITE_TO }]));
+      mockProfileUpdate({ ...existingProfile, siteId: SITE_TO, pinnedDeviceId: DEVICE });
+
+      const res = await patch({ siteId: SITE_TO });
+
+      expect(res.status).toBe(200);
+      expect(db.select).toHaveBeenCalledTimes(3);
+    });
+
+    it('PATCH site move with pinnedDeviceId null clears the pin without a device lookup', async () => {
+      vi.mocked(db.select)
+        .mockReturnValueOnce(limitSelect([{ ...existingProfile, pinnedDeviceId: DEVICE }]))
+        .mockReturnValueOnce(limitSelect([{ id: SITE_TO }]));
+      const setSpy = mockProfileUpdate({ ...existingProfile, siteId: SITE_TO, pinnedDeviceId: null });
+
+      const res = await patch({ siteId: SITE_TO, pinnedDeviceId: null });
+
+      expect(res.status).toBe(200);
+      expect(db.select).toHaveBeenCalledTimes(2);
+      expect(setSpy).toHaveBeenCalledWith(expect.objectContaining({ siteId: SITE_TO, pinnedDeviceId: null }));
+    });
+
+    it('GET /profiles projects pinnedDeviceId (a dropped field would make the form save null and silently unpin)', async () => {
+      const now = new Date();
+      const base = {
+        orgId: ORG, siteId: SITE, name: 'p', description: null, enabled: true, subnets: [], methods: [],
+        schedule: null, deepScan: false, resolveHostnames: false, alertSettings: null, createdAt: now, updatedAt: now,
+      };
+      (db.select as any).mockReturnValueOnce({
+        from: () => ({ where: () => ({ orderBy: () => Promise.resolve([
+          { profile: { ...base, id: 'p-pinned', pinnedDeviceId: DEVICE } },
+          { profile: { ...base, id: 'p-auto', pinnedDeviceId: null } },
+        ]) }) }),
+      }).mockReturnValueOnce({
+        from: () => ({ where: () => ({ groupBy: () => Promise.resolve([]) }) }),
+      });
+
+      const res = await app.request('/discovery/profiles', { method: 'GET', headers: { Authorization: 'Bearer token' } });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data.map((p: any) => [p.id, p.pinnedDeviceId])).toEqual([['p-pinned', DEVICE], ['p-auto', null]]);
+    });
+
+    it('PATCH site move with an explicit pin in the new site validates the NEW pin against the new site', async () => {
+      vi.mocked(db.select)
+        .mockReturnValueOnce(limitSelect([{ ...existingProfile, pinnedDeviceId: DEVICE }]))
+        .mockReturnValueOnce(limitSelect([{ id: SITE_TO }]))
+        .mockReturnValueOnce(limitSelect([{ ...pinnable, siteId: SITE_TO }]));
+      const setSpy = mockProfileUpdate({ ...existingProfile, siteId: SITE_TO, pinnedDeviceId: DEVICE });
+
+      const res = await patch({ siteId: SITE_TO, pinnedDeviceId: DEVICE });
+
+      expect(res.status).toBe(200);
+      expect(setSpy).toHaveBeenCalledWith(expect.objectContaining({ siteId: SITE_TO, pinnedDeviceId: DEVICE }));
     });
   });
 });

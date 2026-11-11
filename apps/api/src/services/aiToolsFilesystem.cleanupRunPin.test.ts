@@ -19,6 +19,9 @@ const dbMockState = vi.hoisted(() => ({
 }));
 
 vi.mock('../db', () => ({
+  // These handlers run as under the per-call transaction: `inToolDbPhase`
+  // (#7918) joins it rather than opening a context of its own.
+  hasDbAccessContext: vi.fn(() => true),
   runOutsideDbContext: vi.fn((fn) => fn()),
   withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn()),
   db: {
@@ -53,6 +56,13 @@ vi.mock('../db', () => ({
   },
 }));
 
+// The remote-tools policy check has its own suites
+// (aiDispatch.test.ts, aiRemoteToolsPolicy.contract.test.ts); allow it here.
+vi.mock('./aiRemoteToolsPolicy', () => ({
+  REMOTE_TOOLS_DISABLED_BY_POLICY: 'REMOTE_TOOLS_DISABLED_BY_POLICY',
+  checkAiRemoteToolsPolicy: vi.fn(async () => ({ allowed: true })),
+  assertAiRemoteToolsAllowed: vi.fn(async () => undefined),
+}));
 vi.mock('./commandQueue', () => ({
   executeCommand: vi.fn(),
   executeCommandWithSystemPrecheck: vi.fn(async () => ({ status: 'completed', stdout: '{}' })),

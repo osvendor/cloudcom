@@ -45,16 +45,58 @@ vi.mock('../db', () => ({
 import {
   asNullableRecord,
   asRecord,
+  bootstrapServesKeyLayout,
   buildRecoveryDownloadDescriptor,
   computeRecoveryDownloadExpiry,
+  buildAuthenticatedBootstrapPayload,
   expireUnusedRecoveryTokens,
   generateRecoveryToken,
   getStringValue,
   hashRecoveryToken,
+  isHelperVersionAtLeast,
   RECOVERY_DOWNLOAD_SESSION_TTL_MS,
   resolveServerUrl,
   toIsoString,
 } from './recoveryBootstrap';
+
+// ── bootstrapServesKeyLayout (#7081 R19) ─────────────────────────────────────
+describe('bootstrapServesKeyLayout', () => {
+  const withDownload = { bootstrap: { download: { type: 'breeze_proxy' } } };
+  const withoutDownload = { bootstrap: { download: null } };
+
+  it('serves a legacy snapshot with or without a token-mode download', () => {
+    expect(bootstrapServesKeyLayout('legacy_flat', withDownload)).toBe(true);
+    expect(bootstrapServesKeyLayout('legacy_flat', withoutDownload)).toBe(true);
+  });
+
+  it.each(['prefixed_flat', 'device_scoped', undefined, null])('requires the token-mode download for layout %s', (layout) => {
+    expect(bootstrapServesKeyLayout(layout, withDownload)).toBe(true);
+    expect(bootstrapServesKeyLayout(layout, withoutDownload)).toBe(false);
+  });
+});
+
+// ── isHelperVersionAtLeast (#5629) ───────────────────────────────────────────
+// Must agree case-for-case with the recovery console's own versionAtLeast
+// (agent/internal/recoveryconsole/console.go, TestVersionAtLeast): if the
+// server's pre-claim gate passed a helper the console then refuses, the
+// one-time code would be burned again.
+
+describe('isHelperVersionAtLeast', () => {
+  it.each([
+    ['0.111.1', '0.100.0', true],
+    ['0.111.1', '0.120.0', false],
+    ['0.100.0', '0.100.0', true],
+    ['1.0.0', '0.999.0', true],
+    ['', '0.1.0', false],
+    ['v0.111.1', '0.111.1', true],
+    ['0.111', '0.111.0', true],
+    ['dev', '0.5.0', false],
+    ['0.111.1-rc1', '0.111.1', false],
+    ['99999999999999999999.0.0', '0.5.0', false],
+  ])('isHelperVersionAtLeast(%j, %j) = %s', (have, want, expected) => {
+    expect(isHelperVersionAtLeast(have, want)).toBe(expected);
+  });
+});
 
 // ── hashRecoveryToken ────────────────────────────────────────────────────────
 
@@ -409,6 +451,41 @@ describe('buildRecoveryDownloadDescriptor', () => {
 });
 
 // ── expireUnusedRecoveryTokens (D9) ─────────────────────────────────────────
+
+describe('buildAuthenticatedBootstrapPayload integrity expectation', () => {
+  const base = {
+    tokenId: 't',
+    deviceId: 'd',
+    snapshotId: 's',
+    restoreType: 'bare_metal',
+    targetConfig: null,
+    authenticatedAt: new Date('2026-09-30T00:00:00Z'),
+    device: null,
+    snapshot: { id: 's', snapshotId: 'snap-1' },
+    providerType: 's3',
+    config: null,
+  };
+  const block = {
+    v: 1,
+    mode: 'attested',
+    trust: 'server_verified',
+    snapshotId: 'snap-1',
+    objects: [{ role: 'manifest', key: 'snapshots/snap-1/manifest.json', sha256: 'a'.repeat(64), size: 3 }],
+  };
+
+  it('carries the block on the envelope and on the nested bootstrap', () => {
+    const payload = buildAuthenticatedBootstrapPayload({ ...base, integrity: block });
+    expect(payload.integrity).toEqual(block);
+    expect(payload.bootstrap.integrity).toEqual(block);
+  });
+
+  it('omits it entirely when there is none (the shape older recovery clients know)', () => {
+    const payload = buildAuthenticatedBootstrapPayload({ ...base, integrity: null });
+    expect(payload).not.toHaveProperty('integrity');
+    expect(payload.bootstrap).not.toHaveProperty('integrity');
+    expect(buildAuthenticatedBootstrapPayload(base)).not.toHaveProperty('integrity');
+  });
+});
 
 describe('expireUnusedRecoveryTokens', () => {
   const dialect = new PgDialect();

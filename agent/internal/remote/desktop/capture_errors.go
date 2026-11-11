@@ -29,6 +29,14 @@ const (
 	// problem was an Apple Silicon Mac with no framebuffer after its Screen
 	// Sharing session ended.
 	captureErrNoDisplayAttached = 11
+	// captureErrSCStreamFailed: an SCStream could not be created, attached to
+	// its output, or started (#5928). The shim reports the SCStreamError code
+	// alongside it.
+	captureErrSCStreamFailed = 12
+	// captureErrFrameUnavailable: the stream's latest frame could not be read
+	// (no frame in the slot, unexpected pixel format, or the pixel buffer
+	// could not be locked).
+	captureErrFrameUnavailable = 13
 )
 
 // translateCaptureError converts a C shim error code into a Go error.
@@ -36,15 +44,22 @@ const (
 // Rule for every message here: report what was OBSERVED, and enumerate the
 // causes that produce it. Do not name a single cause. A message that guesses
 // sends every reader down that path, including the ones it is wrong for.
+// errZeroDisplays marks the zero-displays failure (code 11) so the display
+// state annotation (display_power.go) can tell it from every other capture
+// error. It wraps ErrDisplayNotFound, which existing callers match on.
+var errZeroDisplays = fmt.Errorf("%w: the system reported zero displays to capture", ErrDisplayNotFound)
+
 func translateCaptureError(code int) error {
 	switch code {
 	case captureErrDisplayList:
 		return fmt.Errorf("failed to get display list")
 	case captureErrNoDisplayAttached:
-		return fmt.Errorf("%w: the system reported zero displays — nothing is attached to capture "+
-			"(on a headless Mac this is normal once a Screen Sharing session ends; "+
-			"attach a display or a dummy plug). This is NOT a permissions failure",
-			ErrDisplayNotFound)
+		// Enumerates both causes instead of assuming headless (#10874): a
+		// display that is attached but asleep drops out of the active list
+		// too. A session open (display_power.go) reads the online display
+		// list and prefixes the case it actually found.
+		return fmt.Errorf("%w (nothing attached, or the attached display is asleep). "+
+			"This is NOT a permissions failure", errZeroDisplays)
 	case captureErrContentUnavailable:
 		return fmt.Errorf("%w: the shareable-content request failed. Causes: Screen Recording "+
 			"not granted to this process; the requested display index no longer exists; "+
@@ -71,6 +86,13 @@ func translateCaptureError(code int) error {
 		return fmt.Errorf("failed to create CGDisplayStream")
 	case captureErrStreamStart:
 		return fmt.Errorf("failed to start CGDisplayStream")
+	case captureErrSCStreamFailed:
+		return fmt.Errorf("ScreenCaptureKit stream could not be created or started. Causes: Screen " +
+			"Recording not granted to this process; the display went away; the window server " +
+			"rejected the stream")
+	case captureErrFrameUnavailable:
+		return fmt.Errorf("ScreenCaptureKit frame could not be read (no frame yet, unexpected pixel " +
+			"format, or the pixel buffer could not be locked)")
 	default:
 		return fmt.Errorf("unknown error: %d", code)
 	}

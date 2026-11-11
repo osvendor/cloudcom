@@ -1,43 +1,75 @@
+const portalSentry=vi.hoisted(()=>vi.fn());
+vi.mock('../../services/sentry',()=>({captureException:portalSentry}));
+// The detail route preloads the partner's autopay rollout flag (#9585); keep that read
+// off this file's queue-driven db mock. The real-DB behaviour is in
+// portalInvoiceDbContext.integration.test.ts.
+vi.mock('../../services/autopay/autopayGate', async (original) => ({
+  ...await original<typeof import('../../services/autopay/autopayGate')>(),
+  isAutopayEnabledForPartner: vi.fn(async () => true),
+}));
+const bankRoutes=vi.hoisted(()=>({setup:vi.fn(),collect:vi.fn(),offer:vi.fn(async()=>null)}));
+vi.mock('../../services/autopay/bankPayment',async original=>({
+ ...await original<typeof import('../../services/autopay/bankPayment')>(),
+ startInvoiceBankSetup:bankRoutes.setup,collectAfterBankSetup:bankRoutes.collect,getBankAutopayOffer:bankRoutes.offer,
+}));
+import { prepareCardPayAndSave } from '../../services/autopay/payAndSave';
+const confirmation = vi.hoisted(() => ({ release: vi.fn() }));
+vi.mock('../../services/autopay/confirmPayment', () => ({ releaseInvoiceConfirmation: confirmation.release }));
+const reservation = vi.hoisted(() => ({ assert: vi.fn(), held: vi.fn(async () => false), lock: vi.fn(), inFlight: vi.fn(), invoice: null as Record<string, unknown> | null }));
+vi.mock('../../services/autopay/reservation', () => ({ assertNoActiveCollection: reservation.assert, holdsClientMoney: reservation.held, lockInvoiceForCollection: reservation.lock, readInFlightCollection: reservation.inFlight }));
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Hono } from 'hono';
 import { db } from '../../db';
 
 // Service-layer mocks — the route is a thin org-scoped consumer.
-const { getCustomerInvoiceMock, markViewedMock } = vi.hoisted(() => ({
-  getCustomerInvoiceMock: vi.fn(),
+const { getPortalInvoiceRowMock, markViewedMock } = vi.hoisted(() => ({
+  getPortalInvoiceRowMock: vi.fn(),
   markViewedMock: vi.fn(),
 }));
-// toCustomerInvoiceLine is deliberately kept REAL (importActual) — it is the
-// serialization boundary this suite's leak-guard test exists to police. A
-// hand-written stub here would only ever assert itself: it silently drifted
-// from the real field list when `name` was added (#3319), leaving the keyset
-// test documenting a keyset the route never actually returns.
+// The assembler (services/customerDocument) and toCustomerInvoiceLine are kept
+// REAL (importActual) — they are the serialization boundary this suite's
+// leak-guard test exists to police. A hand-written stub here would only ever
+// assert itself: it silently drifted from the real field list when `name` was
+// added (#3319), leaving the keyset test documenting a keyset the route never
+// actually returns. Only the row read and the view stamp are stubbed.
 vi.mock('../../services/invoiceService', async (importActual) => {
   const actual = await importActual<typeof import('../../services/invoiceService')>();
   return {
-    getCustomerInvoice: getCustomerInvoiceMock,
+    ...actual,
+    getPortalInvoiceRowOr404: getPortalInvoiceRowMock,
     markViewed: markViewedMock,
-    toCustomerInvoiceLine: actual.toCustomerInvoiceLine,
   };
 });
 
-const { getInvoicePdfMock, renderInvoicePdfMock } = vi.hoisted(() => ({
+const { getInvoicePdfMock, renderInvoicePdfMock, renderPartnerContextMock } = vi.hoisted(() => ({
   getInvoicePdfMock: vi.fn(),
   renderInvoicePdfMock: vi.fn(),
+  renderPartnerContextMock: vi.fn(),
 }));
 vi.mock('../../services/invoicePdf', () => ({
   getInvoicePdf: getInvoicePdfMock,
   renderInvoicePdf: renderInvoicePdfMock,
+  loadInvoiceRenderPartnerContext: renderPartnerContextMock,
+  // The db is mocked, so the ticket-label expressions are never compiled here.
+  invoiceLineTicketNumberSql: vi.fn(() => 'ticket_label_sql'),
+  invoiceLineTicketSubjectSql: vi.fn(() => 'ticket_subject_sql'),
+  invoiceLineTicketCategorySql: vi.fn(() => 'ticket_category_sql'),
 }));
 
 // DB mock for the list query: select().from().where() resolves to either the
 // count row or the data rows depending on call order. insert().values() is a
 // thenable so the pay route's mapping INSERT awaits cleanly.
-const { dbResults, insertValuesMock } = vi.hoisted(() => ({
+const { dbResults, insertValuesMock, mappings, ctx } = vi.hoisted(() => ({
   dbResults: [] as unknown[][],
   insertValuesMock: vi.fn(),
+  mappings: new Map<string,Record<string,unknown>>(),
+  // depth: open system contexts. orgTx: open organization-scoped transactions
+  // (the handler's own, or the portal middleware mirror's). nestedUnderOrgTx:
+  // every system-context open / context escape made while an org tx was open
+  // (#9585 item 3). orgContexts: every org context opened, to pin its scope.
+  ctx: { depth: 0, orgTx: 0, nestedUnderOrgTx: [] as string[], orgContexts: [] as unknown[] },
 }));
-// SEC-150: the fail-closed Checkout-session revocation phases run BEFORE this
+// The fail-closed Checkout-session revocation phases run BEFORE this
 // suite's transaction and issue their own queries. This file drives a
 // hand-rolled Drizzle mock whose result queue would be consumed by them, so the
 // revocation is stubbed out here and proved for real — against Postgres, with a
@@ -56,13 +88,18 @@ vi.mock('../../services/stripeSessionRevocation', () => ({
 vi.mock('../../db', () => {
   const makeChain = () => {
     const chain: Record<string, unknown> = {};
-    for (const m of ['select', 'from', 'where', 'orderBy', 'limit', 'offset', 'for']) chain[m] = vi.fn(() => chain);
+    for (const m of ['select', 'from', 'leftJoin', 'where', 'orderBy', 'limit', 'offset', 'for']) chain[m] = vi.fn(() => chain);
     (chain as { then: unknown }).then = (resolve: (v: unknown) => unknown) => {
       const rows = dbResults.shift() ?? [];
+      const first = rows[0];
+      if (first && typeof first === 'object' && 'currencyCode' in first && 'balance' in first) reservation.invoice = first as Record<string, unknown>;
       return Promise.resolve(rows).then(resolve);
     };
     (chain as { insert: unknown }).insert = vi.fn(() => ({
-      values: (v: unknown) => { insertValuesMock(v); return Promise.resolve(undefined); },
+      values: (v: any) => { insertValuesMock(v);let ignore=false;
+        const result:any={onConflictDoNothing:()=>{ignore=true;return result;},returning:()=>result,
+          then:(resolve:any,reject:any)=>{const prior=mappings.get(v.stripeObjectId);if(prior&&!ignore)return Promise.reject(new Error('invoice_stripe_payments_object_uq')).then(resolve,reject);
+            if(!prior)mappings.set(v.stripeObjectId,v);return Promise.resolve(prior?[]:[{invoiceId:v.invoiceId}]).then(resolve,reject);}};return result; },
     }));
     return chain;
   };
@@ -71,15 +108,32 @@ vi.mock('../../db', () => {
   // system-context connection read is covered by the integration test.
   return {
     db: makeChain(),
-    runOutsideDbContext: <T>(fn: () => T): T => fn(),
-    withSystemDbAccessContext: <T>(fn: () => Promise<T>): Promise<T> => fn(),
+    runOutsideDbContext: <T>(fn: () => T): T => {
+      if (ctx.orgTx > 0) ctx.nestedUnderOrgTx.push('runOutsideDbContext');
+      return fn();
+    },
+    // Tracks nesting so a test can prove the settle runs with NO context held (#7065).
+    withSystemDbAccessContext: async <T>(fn: () => Promise<T>): Promise<T> => {
+      if (ctx.orgTx > 0) ctx.nestedUnderOrgTx.push('withSystemDbAccessContext');
+      ctx.depth++;
+      try { return await fn(); } finally { ctx.depth--; }
+    },
+    withDbAccessContext: async <T>(context: { scope: string }, fn: () => Promise<T>): Promise<T> => {
+      if (context.scope !== 'organization') throw new Error(`unexpected ${context.scope} context in a portal route`);
+      ctx.orgContexts.push(context);
+      ctx.orgTx++;
+      try { return await fn(); } finally { ctx.orgTx--; }
+    },
+    // readWithPartnerAxisVisibility (getInvoiceAutopayOffer) consults this.
+    getCurrentDbAccessContext: () => undefined,
   };
 });
 
 // Stripe client + connect service mocks for the pay route.
 // Partner Stripe-key mocks for the pay route (API-key model — no Connect). The
 // pay route builds the partner's own client and charges directly on their account.
-const { sessionsCreateMock, getPartnerStripeClientMock } = vi.hoisted(() => ({
+const { sessionsCreateMock, getPartnerStripeClientMock, onlinePayMock } = vi.hoisted(() => ({
+  onlinePayMock: vi.fn(),
   sessionsCreateMock: vi.fn(),
   getPartnerStripeClientMock: vi.fn(),
 }));
@@ -88,12 +142,20 @@ vi.mock('../../services/partnerStripe', async (importOriginal) => {
   return {
     PartnerStripeError: actual.PartnerStripeError,
     getPartnerStripeClient: getPartnerStripeClientMock,
+    isPartnerOnlinePaymentAvailable: onlinePayMock,
   };
 });
 
 // Verify-on-return settle primitive (system-scoped in the route).
-const { settleCheckoutSessionMock } = vi.hoisted(() => ({ settleCheckoutSessionMock: vi.fn() }));
-vi.mock('../../services/stripeSettle', () => ({ settleCheckoutSession: settleCheckoutSessionMock }));
+const { settleCheckoutSessionMock, HeldCtxError } = vi.hoisted(() => ({
+  settleCheckoutSessionMock: vi.fn(),
+  HeldCtxError: class HeldDbContextForStripeError extends Error {},
+}));
+vi.mock('../../services/stripeSettle', () => ({
+  settleCheckoutSession: settleCheckoutSessionMock,
+  assertNoHeldDbContextForStripe: vi.fn(),
+  HeldDbContextForStripeError: HeldCtxError,
+}));
 
 // Real InvoiceServiceError / PartnerStripeError so `instanceof` branches in the route fire.
 import { InvoiceServiceError } from '../../services/invoiceTypes';
@@ -108,6 +170,21 @@ const partnerClient = (stripeAccountId = 'acct_9') => ({
 
 const ORG_ID = '22222222-2222-2222-2222-222222222222';
 const INV_ID = '11111111-1111-1111-1111-111111111111';
+// Anchors the Checkout expiry bucket (#10736): every invoice row the producer reads carries it.
+const INV_CREATED_AT = new Date('2026-10-01T10:17:42.000Z');
+
+// A raw invoices ROW, as getPortalInvoiceRowOr404 returns it.
+function invoiceRow(overrides: Record<string, unknown> = {}) {
+  return {
+    id: INV_ID, orgId: ORG_ID, createdAt: INV_CREATED_AT, partnerId: 'p1', siteId: null, status: 'sent', invoiceNumber: 'INV-1',
+    currencyCode: 'USD', issueDate: '2026-09-01', dueDate: '2026-09-30',
+    subtotal: '100.00', taxRate: '0.0000', taxTotal: '0.00', total: '100.00', amountPaid: '0.00', balance: '100.00',
+    depositDue: null, billToName: 'Acme', notes: null, sellerSnapshot: null, termsAndConditions: null,
+    lineGrouping: null, lineShowDate: null, lineShowNote: null, lineShowWorkedTime: null,
+    documentLocale: 'en', documentTheme: null, documentPageSize: null,
+    ...overrides,
+  };
+}
 
 // Wrap the route with a portalAuth-injecting middleware (mirrors portalAuthMiddleware).
 function app(orgId = ORG_ID, authMethod: 'bearer' | 'cookie' = 'bearer') {
@@ -140,7 +217,32 @@ function boundParams(node: unknown, out: unknown[] = [], seen = new Set<unknown>
 import { checkoutSessionExpiry } from '../../services/invoiceCheckout';
 
 describe('portal invoices routes', () => {
-  beforeEach(() => { vi.clearAllMocks(); dbResults.length = 0; insertValuesMock.mockReset(); });
+  it.each([
+    ['stale disclosure', 409, 'The terms changed. Review them and try again.', 'INVALID_STATE'],
+    ['unavailable enrollment', 409, 'Request automatic payments first', 'INVALID_STATE'],
+    ['disabled rollout', 404, 'Automatic payments unavailable', 'autopay_not_enabled'],
+  ] as const)('pay preserves the customer response for %s', async (_case, status, message, code) => {
+    dbResults.push([{ id: INV_ID, orgId: ORG_ID, createdAt: INV_CREATED_AT, partnerId: 'p1', status: 'sent',
+      balance: '100.00', currencyCode: 'USD', invoiceNumber: 'INV-1' }]);
+    vi.mocked(prepareCardPayAndSave).mockRejectedValueOnce(new InvoiceServiceError(message, status, 'INVALID_STATE'));
+    const res = await app().request(`/invoices/${INV_ID}/pay`, { method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ saveForAutopay: true, consentAccepted: true, disclosureHash: 'a'.repeat(64) }) });
+    expect(res.status).toBe(status);
+    expect(await res.json()).toEqual({ error: code === 'autopay_not_enabled' ? 'Automatic payments are not enabled' : message, code });
+    expect(sessionsCreateMock).not.toHaveBeenCalled();
+    expect(getPartnerStripeClientMock).not.toHaveBeenCalled();
+    expect(insertValuesMock).not.toHaveBeenCalled();
+  });
+
+it('portal invoice pay rejects missing authorization before Stripe', async () => {
+  const res = await app().request(`/invoices/${INV_ID}/pay`, { method: 'POST',
+    headers: { 'content-type': 'application/json' }, body: JSON.stringify({ saveForAutopay: true }) });
+  expect(res.status).toBe(400); expect(sessionsCreateMock).not.toHaveBeenCalled();
+});
+
+  beforeEach(() => {
+    reservation.invoice = null; reservation.assert.mockResolvedValue(undefined); reservation.lock.mockImplementation(async () => ({ invoice: reservation.invoice, reservedAmount: '0.00' })); vi.clearAllMocks(); reservation.inFlight.mockResolvedValue({ inProgress: false, amount: '0.00' }); dbResults.length = 0; insertValuesMock.mockReset(); mappings.clear(); onlinePayMock.mockResolvedValue(true); });
 
   it.each(['pay', 'settle'])('rejects cookie-authenticated POST /invoices/:id/%s without CSRF before side effects', async (action) => {
     const res = await app(ORG_ID, 'cookie').request(`/invoices/${INV_ID}/${action}`, {
@@ -155,6 +257,23 @@ describe('portal invoices routes', () => {
     expect(sessionsCreateMock).not.toHaveBeenCalled();
     expect(settleCheckoutSessionMock).not.toHaveBeenCalled();
   });
+
+it('portal pay returns 409 while captured money for the invoice is unapplied, before contacting Stripe', async () => {
+  dbResults.push([{ id: INV_ID, orgId: ORG_ID, createdAt: INV_CREATED_AT, partnerId: 'p1', status: 'sent', currencyCode: 'USD', balance: '100.00' }]);
+  reservation.held.mockResolvedValueOnce(true);
+  const response = await app().request(`/invoices/${INV_ID}/pay`, { method: 'POST' });
+  expect(response.status).toBe(409);
+  expect(await response.json()).toMatchObject({ code: 'COLLECTION_IN_PROGRESS' });
+  expect(sessionsCreateMock).not.toHaveBeenCalled();
+});
+it('portal pay returns 409 for a reservation before contacting Stripe', async () => {
+  dbResults.push([{ id: INV_ID, orgId: ORG_ID, createdAt: INV_CREATED_AT, partnerId: 'p1', status: 'sent', currencyCode: 'USD', balance: '100.00' }]);
+  reservation.assert.mockRejectedValueOnce(new InvoiceServiceError('A payment is already processing', 409, 'COLLECTION_IN_PROGRESS'));
+  const response = await app().request(`/invoices/${INV_ID}/pay`, { method: 'POST' });
+  expect(response.status).toBe(409);
+  expect(await response.json()).toMatchObject({ code: 'COLLECTION_IN_PROGRESS' });
+  expect(sessionsCreateMock).not.toHaveBeenCalled();
+});
 
   it('rejects a form-urlencoded settle body for bearer auth', async () => {
     const res = await app().request(`/invoices/${INV_ID}/settle`, {
@@ -192,37 +311,136 @@ describe('portal invoices routes', () => {
   });
 
   it('GET /invoices/:id returns the customer view + stamps viewed', async () => {
-    getCustomerInvoiceMock.mockResolvedValue({ invoice: { id: INV_ID, status: 'sent', invoiceNumber: 'INV-1' }, lines: [{ id: 'l1' }] });
+    getPortalInvoiceRowMock.mockResolvedValue(invoiceRow());
+    // Queue order (#9585): [partner], [branding] (preloaded before the org tx), then [line rows].
+    dbResults.push([], [], [{ id: 'l1', name: 'Seat', quantity: '1.00' }]);
     const res = await app().request(`/invoices/${INV_ID}`, { method: 'GET' });
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.invoice.id).toBe(INV_ID);
     expect(body.lines).toHaveLength(1);
-    expect(getCustomerInvoiceMock).toHaveBeenCalledWith(INV_ID, ORG_ID);
+    expect(getPortalInvoiceRowMock).toHaveBeenCalledWith(INV_ID, ORG_ID);
     expect(markViewedMock).toHaveBeenCalledWith(INV_ID, ORG_ID);
   });
 
+  it.each([[true], [false]])('GET /invoices/:id reports onlinePaymentAvailable=%s from the shared resolver (#7509)', async (available) => {
+    onlinePayMock.mockResolvedValue(available);
+    getPortalInvoiceRowMock.mockResolvedValue(invoiceRow());
+    const body = await (await app().request(`/invoices/${INV_ID}`, { method: 'GET' })).json();
+    expect(body.onlinePaymentAvailable).toBe(available);
+    expect(onlinePayMock).toHaveBeenCalledWith('p1');
+  });
+
+  it('GET /invoices/:id reports an in-flight autopay collection from the server-side reservation (#7824)', async () => {
+    reservation.inFlight.mockResolvedValue({ inProgress: true, amount: '50.00' });
+    getPortalInvoiceRowMock.mockResolvedValue(invoiceRow());
+    const body = await (await app().request(`/invoices/${INV_ID}`, { method: 'GET' })).json();
+    expect(body.collectionInProgress).toEqual({ amount: '50.00', actionRequired: false });
+    expect(reservation.inFlight).toHaveBeenCalledWith(expect.anything(), INV_ID);
+  });
+
+  it('GET /invoices/:id tells the customer when the autopay payment is waiting on their bank', async () => {
+    reservation.inFlight.mockResolvedValue({ inProgress: true, amount: '50.00', actionRequired: true });
+    getPortalInvoiceRowMock.mockResolvedValue(invoiceRow());
+    const body = await (await app().request(`/invoices/${INV_ID}`, { method: 'GET' })).json();
+    expect(body.collectionInProgress).toEqual({ amount: '50.00', actionRequired: true });
+  });
+
+  it('POST /invoices/:id/autopay-confirmation releases the off-session payment for the portal user\'s own org', async () => {
+    confirmation.release.mockResolvedValue({ outcome: 'released' });
+    const res = await app().request(`/invoices/${INV_ID}/autopay-confirmation`, { method: 'POST',
+      headers: { 'content-type': 'application/json' }, body: '{}' });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ outcome: 'released' });
+    expect(confirmation.release).toHaveBeenCalledWith({ invoiceId: INV_ID, orgId: ORG_ID });
+  });
+
+  it('POST /invoices/:id/autopay-confirmation 404s another org\'s invoice', async () => {
+    confirmation.release.mockRejectedValue(new InvoiceServiceError('Invoice not found', 404, 'INVOICE_NOT_FOUND'));
+    const res = await app('99999999-9999-4999-8999-999999999999').request(`/invoices/${INV_ID}/autopay-confirmation`, { method: 'POST',
+      headers: { 'content-type': 'application/json' }, body: '{}' });
+    expect(res.status).toBe(404);
+    expect(confirmation.release).toHaveBeenCalledWith({ invoiceId: INV_ID, orgId: '99999999-9999-4999-8999-999999999999' });
+  });
+
+  // #8254: releaseInvoiceConfirmation refuses a draft with the same 404 as a
+  // missing or other-org invoice (confirmPayment.test.ts). The route must then
+  // answer with the body every other portal invoice route gives a draft, so the
+  // response never says whether an unissued invoice exists.
+  it('POST /invoices/:id/autopay-confirmation answers not-found with the same body GET gives a draft', async () => {
+    confirmation.release.mockRejectedValue(new InvoiceServiceError('Invoice not found', 404, 'INVOICE_NOT_FOUND'));
+    const release = await app().request(`/invoices/${INV_ID}/autopay-confirmation`, { method: 'POST',
+      headers: { 'content-type': 'application/json' }, body: '{}' });
+    getPortalInvoiceRowMock.mockResolvedValue(invoiceRow({ status: 'draft' }));
+    const draftRead = await app().request(`/invoices/${INV_ID}`, { method: 'GET' });
+    expect(release.status).toBe(404);
+    expect(draftRead.status).toBe(404);
+    const body = await release.json();
+    expect(body).toEqual({ error: 'Invoice not found', code: 'NOT_FOUND' });
+    expect(body).toEqual(await draftRead.json());
+  });
+
+  it('POST /invoices/:id/autopay-confirmation passes a 409 through with its message and code', async () => {
+    confirmation.release.mockRejectedValue(new InvoiceServiceError('Payment is still processing', 409, 'INVALID_STATE', { reason: 'processing' }));
+    const res = await app().request(`/invoices/${INV_ID}/autopay-confirmation`, { method: 'POST',
+      headers: { 'content-type': 'application/json' }, body: '{}' });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ error: 'Payment is still processing', code: 'INVALID_STATE' });
+  });
+
+  it('POST /invoices/:id/autopay-confirmation requires a JSON body and cookie CSRF before Stripe', async () => {
+    expect((await app().request(`/invoices/${INV_ID}/autopay-confirmation`, { method: 'POST' })).status).toBe(415);
+    expect((await app(ORG_ID, 'cookie').request(`/invoices/${INV_ID}/autopay-confirmation`, { method: 'POST',
+      headers: { 'content-type': 'application/json' }, body: '{}' })).status).toBe(403);
+    expect(confirmation.release).not.toHaveBeenCalled();
+  });
+
+  it('GET /invoices/:id reports collectionInProgress=null when nothing is in flight (#7824)', async () => {
+    getPortalInvoiceRowMock.mockResolvedValue(invoiceRow());
+    const body = await (await app().request(`/invoices/${INV_ID}`, { method: 'GET' })).json();
+    expect(body.collectionInProgress).toBeNull();
+  });
+
+  it('GET /invoices/:id still renders (fail-safe null) when the in-flight read throws (#7824)', async () => {
+    reservation.inFlight.mockRejectedValue(new Error('db down'));
+    getPortalInvoiceRowMock.mockResolvedValue(invoiceRow());
+    const res = await app().request(`/invoices/${INV_ID}`, { method: 'GET' });
+    expect(res.status).toBe(200);
+    expect((await res.json()).collectionInProgress).toBeNull();
+  });
+
+  it('GET /invoices/:id fails closed (200, unavailable) when the availability lookup throws (#7509)', async () => {
+    onlinePayMock.mockRejectedValue(new Error('db down'));
+    getPortalInvoiceRowMock.mockResolvedValue(invoiceRow());
+    const res = await app().request(`/invoices/${INV_ID}`, { method: 'GET' });
+    expect(res.status).toBe(200);
+    expect((await res.json()).onlinePaymentAvailable).toBe(false);
+  });
+
   it('GET /invoices/:id serializes the exact safe line keyset even if the service row has internal fields', async () => {
-    getCustomerInvoiceMock.mockResolvedValue({
-      invoice: { id: INV_ID, status: 'sent', invoiceNumber: 'INV-1' },
-      lines: [{
-        id: 'internal-line-id', sourceType: 'time_entry', sourceId: 'source-1',
-        costBasis: '10.00', revenueAllocation: { labor: '25.00' }, isUnapprovedTime: true,
-        name: 'Support retainer',
-        description: 'Support', quantity: '1.00', unitPrice: '25.00', taxable: true, lineTotal: '25.00',
-        // #6467: worked-vs-billed disclosure — structured data, deliberately
-        // IN the safe keyset (ordinary numeric fact, like quantity), unlike
-        // sourceType/sourceId/costBasis/revenueAllocation/isUnapprovedTime above.
-        workedMinutes: 30,
-      }],
-    });
+    getPortalInvoiceRowMock.mockResolvedValue(invoiceRow({ lineShowDate: true }));
+    // Queue order (#9585): [partner], [branding] (preloaded before the org tx), then [line rows].
+    dbResults.push([], [], [{
+      id: 'line-id-1', parentLineId: 'parent-1', ticketId: 'tk-internal-uuid', ticketSubject: 'Internal subject',
+      sourceType: 'time_entry', sourceId: 'source-1',
+      costBasis: '10.00', revenueAllocation: { labor: '25.00' }, isUnapprovedTime: true,
+      name: 'Support retainer',
+      description: 'Support', quantity: '1.00', unitPrice: '25.00', taxable: true, lineTotal: '25.00',
+      // #6467: worked-vs-billed disclosure — structured data, deliberately
+      // IN the safe keyset (ordinary numeric fact, like quantity), unlike
+      // sourceType/sourceId/costBasis/revenueAllocation/isUnapprovedTime above.
+      workedMinutes: 30,
+      // #8604: the date toggle is frozen ON on the invoice row.
+      workDate: '2026-09-16',
+    }]);
 
     const res = await app().request(`/invoices/${INV_ID}`, { method: 'GET' });
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(Object.keys(body.lines[0]).sort()).toEqual([
-      'description', 'lineTotal', 'name', 'quantity', 'taxable', 'ticketCategory', 'ticketNumber', 'unitPrice', 'workedMinutes',
+      'description', 'id', 'lineTotal', 'name', 'quantity', 'taxable', 'ticketCategory', 'ticketNumber', 'unitPrice', 'workDate', 'workedMinutes',
     ]);
+    expect(body.lines[0].id).toBe('line-id-1');
     expect(body.lines[0]).not.toHaveProperty('sourceType');
     expect(body.lines[0]).not.toHaveProperty('sourceId');
     // The customer-facing title survives the route boundary (#3319) — this is
@@ -231,21 +449,26 @@ describe('portal invoices routes', () => {
     expect(body.lines[0].description).toBe('Support');
     // #6467: workedMinutes itself survives the route boundary too.
     expect(body.lines[0].workedMinutes).toBe(30);
+    // #8604: the route must not re-apply default toggles (which would drop the date).
+    expect(body.lines[0].workDate).toBe('2026-09-16');
   });
 
-  it('GET /invoices/:id resolves branding from the OUT-OF-HEADER partnerId', async () => {
-    // The shipped bug read `result.invoice.partnerId` (stripped by the
-    // serialization boundary) and sent undefined into the partners query.
-    getCustomerInvoiceMock.mockResolvedValue({
-      invoice: { id: INV_ID, status: 'sent', invoiceNumber: 'INV-1' }, lines: [], partnerId: 'partner-7',
-    });
-    dbResults.push([{ name: 'Lantern IT' }]);                                          // partners (system ctx)
+  it('GET /invoices/:id resolves branding from the invoice row partnerId (header carries none)', async () => {
+    // The shipped bug sent an undefined partnerId into the partners query.
+    // The partnerId now comes straight from the authorized invoice row.
+    getPortalInvoiceRowMock.mockResolvedValue(invoiceRow({ partnerId: 'partner-7' }));
+    dbResults.push([{ name: 'Lantern IT', billingEmail: 'bill@lantern.test', documentTheme: null, documentPageSize: null, settings: null }]); // partners (system ctx)
     dbResults.push([{ logoUrl: 'https://cdn/logo.png', primaryColor: '#123456' }]);    // portal_branding
+    dbResults.push([]);                                                                 // lines
     const res = await app().request(`/invoices/${INV_ID}`, { method: 'GET' });
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body.branding).toEqual({ partnerName: 'Lantern IT', logoUrl: 'https://cdn/logo.png', primaryColor: '#123456' });
-    // Walk the bound params of the partners where(): undefined must never reach postgres.js.
+    expect(body.branding).toMatchObject({
+      partnerName: 'Lantern IT', contactEmail: 'bill@lantern.test', logoUrl: 'https://cdn/logo.png', primaryColor: '#123456',
+    });
+    expect(body.invoice).not.toHaveProperty('partnerId');
+    // Walk the bound params of the partners where() (the 1st: it is preloaded before the lines, #9585):
+    // undefined must never reach postgres.js.
     const whereArg = (db as unknown as { where: { mock: { calls: unknown[][] } } }).where.mock.calls[0]![0];
     const params = boundParams(whereArg);
     expect(params).toContain('partner-7');
@@ -253,31 +476,41 @@ describe('portal invoices routes', () => {
   });
 
   it('GET /invoices/:id still renders with null branding when the lookups return nothing', async () => {
-    getCustomerInvoiceMock.mockResolvedValue({
-      invoice: { id: INV_ID, status: 'sent', invoiceNumber: 'INV-1' }, lines: [], partnerId: 'partner-7',
-    });
-    dbResults.push([]); dbResults.push([]);
+    getPortalInvoiceRowMock.mockResolvedValue(invoiceRow({ partnerId: 'partner-7' }));
+    dbResults.push([]); dbResults.push([]); dbResults.push([]);
     const res = await app().request(`/invoices/${INV_ID}`, { method: 'GET' });
     expect(res.status).toBe(200);
-    expect((await res.json()).branding).toEqual({ partnerName: null, logoUrl: null, primaryColor: null });
+    expect((await res.json()).branding).toEqual({ partnerName: null, contactEmail: null, logoUrl: null, primaryColor: null, theme: 'classic', pageSize: 'a4' });
   });
 
   it('GET /invoices/:id maps a cross-tenant 404 from the service', async () => {
-    getCustomerInvoiceMock.mockRejectedValue(new InvoiceServiceError('Invoice not found', 404, 'INVOICE_NOT_FOUND'));
+    getPortalInvoiceRowMock.mockRejectedValue(new InvoiceServiceError('Invoice not found', 404, 'INVOICE_NOT_FOUND'));
     const res = await app().request(`/invoices/${INV_ID}`, { method: 'GET' });
     expect(res.status).toBe(404);
     expect(markViewedMock).not.toHaveBeenCalled();
   });
 
   it('GET /invoices/:id never exposes a draft (404)', async () => {
-    getCustomerInvoiceMock.mockResolvedValue({ invoice: { id: INV_ID, status: 'draft' }, lines: [] });
+    getPortalInvoiceRowMock.mockResolvedValue(invoiceRow({ status: 'draft' }));
     const res = await app().request(`/invoices/${INV_ID}`, { method: 'GET' });
     expect(res.status).toBe(404);
     expect(markViewedMock).not.toHaveBeenCalled();
   });
 
+  // A draft and a missing / other-org invoice must be indistinguishable, or the
+  // body tells a portal user that an unissued invoice exists (#8123 follow-up).
+  it.each(['', '/pdf'])('GET /invoices/:id%s answers a draft and a missing invoice with the same 404 body', async (suffix) => {
+    getPortalInvoiceRowMock.mockRejectedValue(new InvoiceServiceError('Invoice not found', 404, 'INVOICE_NOT_FOUND'));
+    const missing = await app().request(`/invoices/${INV_ID}${suffix}`, { method: 'GET' });
+    getPortalInvoiceRowMock.mockResolvedValue(invoiceRow({ status: 'draft' }));
+    const draft = await app().request(`/invoices/${INV_ID}${suffix}`, { method: 'GET' });
+    expect(missing.status).toBe(404);
+    expect(draft.status).toBe(404);
+    expect(await missing.json()).toEqual(await draft.json());
+  });
+
   it('GET /invoices/:id/pdf streams the stored PDF', async () => {
-    getCustomerInvoiceMock.mockResolvedValue({ invoice: { id: INV_ID, status: 'sent', invoiceNumber: 'INV-1' }, lines: [] });
+    getPortalInvoiceRowMock.mockResolvedValue(invoiceRow());
     getInvoicePdfMock.mockResolvedValue(Buffer.from('%PDF-portal'));
     const res = await app().request(`/invoices/${INV_ID}/pdf`, { method: 'GET' });
     expect(res.status).toBe(200);
@@ -287,17 +520,20 @@ describe('portal invoices routes', () => {
   });
 
   it('GET /invoices/:id/pdf renders on demand if no artifact exists', async () => {
-    getCustomerInvoiceMock.mockResolvedValue({ invoice: { id: INV_ID, status: 'sent', invoiceNumber: 'INV-1' }, lines: [] });
+    getPortalInvoiceRowMock.mockResolvedValue(invoiceRow());
     getInvoicePdfMock.mockResolvedValueOnce(null).mockResolvedValueOnce(Buffer.from('%PDF-rendered'));
+    const partnerContext = { partnerId: 'p1', partner: { id: 'p1' }, onlinePaymentAvailable: false };
+    renderPartnerContextMock.mockResolvedValueOnce(partnerContext);
     const res = await app().request(`/invoices/${INV_ID}/pdf`, { method: 'GET' });
     expect(res.status).toBe(200);
-    expect(renderInvoicePdfMock).toHaveBeenCalledWith(INV_ID);
+    expect(renderPartnerContextMock).toHaveBeenCalledWith('p1');
+    expect(renderInvoicePdfMock).toHaveBeenCalledWith(INV_ID, { partnerContext });
   });
 
   it('POST /invoices/:id/pay charges directly on the partner key (no Connect) + carries session_id', async () => {
     // invoice SELECT → a payable sent invoice with a 100.00 balance
     dbResults.push([{
-      id: INV_ID, orgId: ORG_ID, partnerId: 'p1', status: 'sent',
+      id: INV_ID, orgId: ORG_ID, createdAt: INV_CREATED_AT, partnerId: 'p1', status: 'sent',
       balance: '100.00', currencyCode: 'USD', invoiceNumber: 'INV-1',
     }]);
     getPartnerStripeClientMock.mockResolvedValue(partnerClient('acct_9'));
@@ -315,7 +551,7 @@ describe('portal invoices routes', () => {
         // never arrives 'unpaid' from an async method.
         payment_method_types: ['card'],
         // metadata key matches the design spec (section 6 step 3).
-        expires_at: checkoutSessionExpiry().expiresAt,
+        expires_at: checkoutSessionExpiry(INV_CREATED_AT).expiresAt,
         metadata: expect.objectContaining({ invoice_balance_cents: '10000' }),
         // The return URL must carry {CHECKOUT_SESSION_ID} for verify-on-return settle.
         success_url: expect.stringContaining('session_id={CHECKOUT_SESSION_ID}'),
@@ -323,7 +559,7 @@ describe('portal invoices routes', () => {
       // No Connect stripeAccount option — the client is already the partner's. Only an
       // idempotency key keyed on (invoice, balance, phase) so a double-click reuses
       // the session.
-      { idempotencyKey: `inv_${INV_ID}_10000_bal_e${checkoutSessionExpiry().quantum}` },
+      { idempotencyKey: `inv_${INV_ID}_10000_bal_e${checkoutSessionExpiry(INV_CREATED_AT).quantum}_pd` },
     );
     // the Stripe object → payment mapping row is recorded
     expect(insertValuesMock).toHaveBeenCalledWith(expect.objectContaining({
@@ -335,7 +571,7 @@ describe('portal invoices routes', () => {
     // A JPY invoice with a 1000-yen balance: JPY is zero-decimal, so unit_amount
     // must be 1000 (not 100000). The mapping amount stays the major-unit string.
     dbResults.push([{
-      id: INV_ID, orgId: ORG_ID, partnerId: 'p1', status: 'sent',
+      id: INV_ID, orgId: ORG_ID, createdAt: INV_CREATED_AT, partnerId: 'p1', status: 'sent',
       balance: '1000.00', currencyCode: 'JPY', invoiceNumber: 'INV-JPY',
     }]);
     getPartnerStripeClientMock.mockResolvedValue(partnerClient('acct_9'));
@@ -349,19 +585,40 @@ describe('portal invoices routes', () => {
         line_items: [expect.objectContaining({
           price_data: expect.objectContaining({ unit_amount: 1000, currency: 'jpy' }),
         })],
-        expires_at: checkoutSessionExpiry().expiresAt,
+        expires_at: checkoutSessionExpiry(INV_CREATED_AT).expiresAt,
         metadata: expect.objectContaining({ invoice_balance_cents: '1000' }),
       }),
-      { idempotencyKey: `inv_${INV_ID}_1000_bal_e${checkoutSessionExpiry().quantum}` },
+      { idempotencyKey: `inv_${INV_ID}_1000_bal_e${checkoutSessionExpiry(INV_CREATED_AT).quantum}_pd` },
     );
     expect(insertValuesMock).toHaveBeenCalledWith(expect.objectContaining({
       stripeObjectId: 'cs_jpy', amount: '1000.00', currency: 'JPY',
     }));
   });
 
+  // #3803 item 8: a legacy zero-decimal balance with a fraction has no correct
+  // Checkout charge. Half-up turned JPY 1000.50 into a 1001 charge (0.50 more
+  // than owed) and 1000.40 into a 1000 charge (stranding 0.40 no Checkout can
+  // collect). Refused before any Stripe work; the provider settles it manually.
+  it.each([['1000.50'], ['1000.40']])('POST /invoices/:id/pay refuses a JPY balance of %s that the currency cannot express', async (balance) => {
+    dbResults.push([{
+      id: INV_ID, orgId: ORG_ID, createdAt: INV_CREATED_AT, partnerId: 'p1', status: 'sent',
+      balance, depositDue: null, amountPaid: '0.00', currencyCode: 'JPY', invoiceNumber: 'INV-JPY-LEGACY',
+    }]);
+    // The success path is fully wired, so only the representability guard can refuse.
+    getPartnerStripeClientMock.mockResolvedValue(partnerClient('acct_9'));
+    sessionsCreateMock.mockResolvedValue({ id: 'cs_jpy_legacy', url: 'https://checkout.stripe.com/c/cs_jpy_legacy', payment_intent: 'pi_jpy_legacy' });
+    dbResults.push([{ id: 'connection' }]);
+
+    const res = await app().request(`/invoices/${INV_ID}/pay`, { method: 'POST' });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ code: 'BALANCE_NOT_REPRESENTABLE' });
+    expect(sessionsCreateMock).not.toHaveBeenCalled();
+    expect(insertValuesMock).not.toHaveBeenCalled();
+  });
+
   it('POST /invoices/:id/pay charges the deposit-remaining amount while the deposit is unmet', async () => {
     dbResults.push([{
-      id: INV_ID, orgId: ORG_ID, partnerId: 'p1', status: 'sent',
+      id: INV_ID, orgId: ORG_ID, createdAt: INV_CREATED_AT, partnerId: 'p1', status: 'sent',
       balance: '10000.00', depositDue: '3000.00', amountPaid: '0.00',
       currencyCode: 'USD', invoiceNumber: 'INV-DEP',
     }]);
@@ -379,17 +636,17 @@ describe('portal invoices routes', () => {
             product_data: { name: 'Deposit — Invoice INV-DEP' },
           }),
         })],
-        expires_at: checkoutSessionExpiry().expiresAt,
+        expires_at: checkoutSessionExpiry(INV_CREATED_AT).expiresAt,
         metadata: expect.objectContaining({ invoice_balance_cents: '300000' }),
       }),
-      { idempotencyKey: `inv_${INV_ID}_300000_dep_e${checkoutSessionExpiry().quantum}` },
+      { idempotencyKey: `inv_${INV_ID}_300000_dep_e${checkoutSessionExpiry(INV_CREATED_AT).quantum}_pd` },
     );
     expect(insertValuesMock).toHaveBeenCalledWith(expect.objectContaining({ amount: '3000.00' }));
   });
 
   it('POST /invoices/:id/pay charges the remaining balance (plain name) once the deposit is satisfied', async () => {
     dbResults.push([{
-      id: INV_ID, orgId: ORG_ID, partnerId: 'p1', status: 'partially_paid',
+      id: INV_ID, orgId: ORG_ID, createdAt: INV_CREATED_AT, partnerId: 'p1', status: 'partially_paid',
       balance: '7000.00', depositDue: '3000.00', amountPaid: '3000.00',
       currencyCode: 'USD', invoiceNumber: 'INV-DEP',
     }]);
@@ -407,10 +664,10 @@ describe('portal invoices routes', () => {
             product_data: { name: 'Invoice INV-DEP' },
           }),
         })],
-        expires_at: checkoutSessionExpiry().expiresAt,
+        expires_at: checkoutSessionExpiry(INV_CREATED_AT).expiresAt,
         metadata: expect.objectContaining({ invoice_balance_cents: '700000' }),
       }),
-      { idempotencyKey: `inv_${INV_ID}_700000_bal_e${checkoutSessionExpiry().quantum}` },
+      { idempotencyKey: `inv_${INV_ID}_700000_bal_e${checkoutSessionExpiry(INV_CREATED_AT).quantum}_pd` },
     );
     expect(insertValuesMock).toHaveBeenCalledWith(expect.objectContaining({ amount: '7000.00' }));
   });
@@ -420,7 +677,7 @@ describe('portal invoices routes', () => {
     // where depositDue equals the eventual balance charge, so chargeMinor is
     // identical across the two sessions — only the dep/bal suffix disambiguates.
     dbResults.push([{
-      id: INV_ID, orgId: ORG_ID, partnerId: 'p1', status: 'sent',
+      id: INV_ID, orgId: ORG_ID, createdAt: INV_CREATED_AT, partnerId: 'p1', status: 'sent',
       balance: '10000.00', depositDue: '5000.00', amountPaid: '0.00',
       currencyCode: 'USD', invoiceNumber: 'INV-EQ',
     }]);
@@ -429,11 +686,11 @@ describe('portal invoices routes', () => {
     dbResults.push([{ id: 'connection' }]);
     await app().request(`/invoices/${INV_ID}/pay`, { method: 'POST' });
     const depositKey = (sessionsCreateMock.mock.calls[0]?.[1] as { idempotencyKey: string }).idempotencyKey;
-    expect(depositKey).toBe(`inv_${INV_ID}_500000_dep_e${checkoutSessionExpiry().quantum}`);
+    expect(depositKey).toBe(`inv_${INV_ID}_500000_dep_e${checkoutSessionExpiry(INV_CREATED_AT).quantum}_pd`);
 
     vi.clearAllMocks();
     dbResults.push([{
-      id: INV_ID, orgId: ORG_ID, partnerId: 'p1', status: 'partially_paid',
+      id: INV_ID, orgId: ORG_ID, createdAt: INV_CREATED_AT, partnerId: 'p1', status: 'partially_paid',
       balance: '5000.00', depositDue: '5000.00', amountPaid: '5000.00',
       currencyCode: 'USD', invoiceNumber: 'INV-EQ',
     }]);
@@ -442,7 +699,7 @@ describe('portal invoices routes', () => {
     dbResults.push([{ id: 'connection' }]);
     await app().request(`/invoices/${INV_ID}/pay`, { method: 'POST' });
     const balanceKey = (sessionsCreateMock.mock.calls[0]?.[1] as { idempotencyKey: string }).idempotencyKey;
-    expect(balanceKey).toBe(`inv_${INV_ID}_500000_bal_e${checkoutSessionExpiry().quantum}`);
+    expect(balanceKey).toBe(`inv_${INV_ID}_500000_bal_e${checkoutSessionExpiry(INV_CREATED_AT).quantum}_pd`);
 
     expect(depositKey).not.toBe(balanceKey);
   });
@@ -452,7 +709,7 @@ describe('portal invoices routes', () => {
     // rejected BEFORE any Stripe work (the guard now fires on chargeMinor, the
     // computeChargeNow output, not the raw balance).
     dbResults.push([{
-      id: INV_ID, orgId: ORG_ID, partnerId: 'p1', status: 'sent',
+      id: INV_ID, orgId: ORG_ID, createdAt: INV_CREATED_AT, partnerId: 'p1', status: 'sent',
       balance: '0.00', depositDue: null, amountPaid: '0.00',
       currencyCode: 'USD', invoiceNumber: 'INV-ZERO',
     }]);
@@ -467,7 +724,7 @@ describe('portal invoices routes', () => {
 
   it('POST /invoices/:id/pay returns 409 when the partner has no Stripe key configured', async () => {
     dbResults.push([{
-      id: INV_ID, orgId: ORG_ID, partnerId: 'p1', status: 'sent',
+      id: INV_ID, orgId: ORG_ID, createdAt: INV_CREATED_AT, partnerId: 'p1', status: 'sent',
       balance: '100.00', currencyCode: 'USD', invoiceNumber: 'INV-2',
     }]);
     getPartnerStripeClientMock.mockRejectedValue(new PartnerStripeError('not connected', 'NO_STRIPE_KEY'));
@@ -481,7 +738,7 @@ describe('portal invoices routes', () => {
     // A corrupt/undecryptable key is an internal fault — surfacing it as 409
     // "not available" would lie about why payment failed (mirrors createInvoicePayLink).
     dbResults.push([{
-      id: INV_ID, orgId: ORG_ID, partnerId: 'p1', status: 'sent',
+      id: INV_ID, orgId: ORG_ID, createdAt: INV_CREATED_AT, partnerId: 'p1', status: 'sent',
       balance: '100.00', currencyCode: 'USD', invoiceNumber: 'INV-3',
     }]);
     getPartnerStripeClientMock.mockRejectedValue(new PartnerStripeError('unreadable', 'STRIPE_KEY_UNREADABLE'));
@@ -493,7 +750,7 @@ describe('portal invoices routes', () => {
 
   it('POST /invoices/:id/pay maps a Stripe currency rejection to a customer-safe 409 STRIPE_CURRENCY_UNSUPPORTED', async () => {
     dbResults.push([{
-      id: INV_ID, orgId: ORG_ID, partnerId: 'p1', status: 'sent',
+      id: INV_ID, orgId: ORG_ID, createdAt: INV_CREATED_AT, partnerId: 'p1', status: 'sent',
       balance: '100.00', currencyCode: 'CHF', invoiceNumber: 'INV-CHF',
     }]);
     getPartnerStripeClientMock.mockResolvedValue({ ...partnerClient(), defaultCurrency: 'USD' });
@@ -515,7 +772,7 @@ describe('portal invoices routes', () => {
 
   it('POST /invoices/:id/pay never surfaces the partner currency-mismatch warning to the customer', async () => {
     dbResults.push([{
-      id: INV_ID, orgId: ORG_ID, partnerId: 'p1', status: 'sent',
+      id: INV_ID, orgId: ORG_ID, createdAt: INV_CREATED_AT, partnerId: 'p1', status: 'sent',
       balance: '100.00', currencyCode: 'EUR', invoiceNumber: 'INV-EUR',
     }]);
     getPartnerStripeClientMock.mockResolvedValue({ ...partnerClient(), defaultCurrency: 'USD' });
@@ -529,7 +786,7 @@ describe('portal invoices routes', () => {
 
   it('does not return a Checkout URL when the connected account changes during session creation', async () => {
     dbResults.push([{
-      id: INV_ID, orgId: ORG_ID, partnerId: 'p1', status: 'sent',
+      id: INV_ID, orgId: ORG_ID, createdAt: INV_CREATED_AT, partnerId: 'p1', status: 'sent',
       balance: '100.00', currencyCode: 'USD', invoiceNumber: 'INV-RACE',
     }]);
     dbResults.push([]); // final FOR SHARE revalidation sees replacement/disconnect
@@ -564,6 +821,19 @@ describe('portal invoices routes', () => {
     expect(settleCheckoutSessionMock).toHaveBeenCalledWith('p1', 'cs_123');
   });
 
+  it('POST /invoices/:id/settle settles with NO DB context held (#7065)', async () => {
+    dbResults.push([{ id: INV_ID, partnerId: 'p1' }]);   // invoice SELECT
+    dbResults.push([{ id: 'map_1' }]);                    // mapping SELECT
+    let depthAtSettle = -1;
+    settleCheckoutSessionMock.mockImplementation(async () => {
+      depthAtSettle = ctx.depth;
+      return { settled: true, invoiceId: INV_ID };
+    });
+    const res = await settle('cs_123');
+    expect(res.status).toBe(200);
+    expect(depthAtSettle).toBe(0);
+  });
+
   it('POST /invoices/:id/settle returns settled:false (no settle call) for a session not tied to this invoice', async () => {
     dbResults.push([{ id: INV_ID, partnerId: 'p1' }]);   // invoice SELECT
     dbResults.push([]);                                   // mapping SELECT → none (foreign/unknown session)
@@ -590,5 +860,248 @@ describe('portal invoices routes', () => {
     const res = await settle('cs_123');
     expect(res.status).toBe(200);
     expect(await res.json()).toMatchObject({ settled: false });
+  });
+
+  it('POST /invoices/:id/settle does NOT swallow the held-DB-context assertion (#7065)', async () => {
+    dbResults.push([{ id: INV_ID, partnerId: 'p1' }]);   // invoice SELECT
+    dbResults.push([{ id: 'map_1' }]);                    // mapping SELECT
+    settleCheckoutSessionMock.mockRejectedValue(new HeldCtxError('held'));
+
+    const res = await settle('cs_123');
+    expect(res.status).toBe(500);
+  });
+});
+
+const portalAutopay = vi.hoisted(() => ({ status: vi.fn(async () => ({ enrolled: false, status: null })), offer: vi.fn(async () => null) }));
+vi.mock('../../services/autopay/customerInvoiceStatus', () => ({ getCustomerInvoiceAutopay: portalAutopay.status }));
+describe('GET /invoices/:id carries how this invoice will be paid (D-4)', () => {
+  it('an enrolled client gets the status and no offer to set up again', async () => {
+    const scheduled = { state: 'scheduled', chargeDate: '2026-11-04', amount: '50.00', fee: '0.00', currency: 'USD',
+      methodLabel: 'Bank account ending in 6789', methodType: 'us_bank_account', reason: null, paidAt: null, canPayNow: true };
+    portalAutopay.offer.mockResolvedValueOnce({ eligible: true } as never);
+    portalAutopay.status.mockResolvedValueOnce({ enrolled: true, status: scheduled } as never);
+    getPortalInvoiceRowMock.mockResolvedValue(invoiceRow());
+    const body = await (await app().request(`/invoices/${INV_ID}`, { method: 'GET' })).json();
+    expect(body.autopayStatus).toEqual(scheduled);
+    expect(body.autopayEnrolled).toBe(true);
+    expect(body.autopay).toBeNull();
+    expect(portalAutopay.status).toHaveBeenCalledWith(expect.anything(), { invoiceId: INV_ID, orgId: ORG_ID }, { partnerAutopayEnabled: expect.any(Function) });
+  });
+  // R9: unknown enrollment fails closed: no setup or bank offer, and the failure is reported.
+  it('a failed status read offers nothing that saves a method and reports it', async () => {
+    portalAutopay.offer.mockResolvedValueOnce({ eligible: true } as never);
+    bankRoutes.offer.mockResolvedValueOnce({ available: true } as never);
+    portalAutopay.status.mockRejectedValueOnce(new Error('db down'));
+    getPortalInvoiceRowMock.mockResolvedValue(invoiceRow());
+    const res = await app().request(`/invoices/${INV_ID}`, { method: 'GET' });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.autopayStatus).toBeNull();
+    expect(body.autopay).toBeNull();
+    expect(body.bankAutopay).toBeNull();
+    expect(portalSentry).toHaveBeenCalledWith(expect.objectContaining({ message: 'db down' }), undefined, expect.objectContaining({ autopay_phase: 'invoice_status' }));
+  });
+});
+vi.mock('../../services/autopay/payAndSave', async importOriginal => {
+  const actual = await importOriginal<typeof import('../../services/autopay/payAndSave')>();
+  return { ...actual, getInvoiceAutopayOffer: portalAutopay.offer,
+    bindCardPayAndSave:vi.fn(async()=>{}),
+    prepareCardPayAndSave: vi.fn(async (_invoiceId: string, _orgId: string, input: { saveForAutopay?: boolean }) => {
+      if (input.saveForAutopay) throw new Error('Unexpected accepted save in ordinary-payment fixture');
+      return null;
+    }) };
+});
+
+it('reuses a portal Checkout mapping on repeated create',async()=>{
+ mappings.clear();dbResults.length=0;
+ getPartnerStripeClientMock.mockResolvedValue(partnerClient('acct_9'));sessionsCreateMock.mockResolvedValue({id:'cs_reuse',url:'https://checkout.stripe.com/c/cs_reuse'});
+ for(let i=0;i<2;i++){
+  dbResults.push([{id:INV_ID,orgId:ORG_ID,createdAt:INV_CREATED_AT,partnerId:'p1',status:'sent',balance:'100.00',currencyCode:'USD'}],[{id:'connection'}],[]);if(i)dbResults.push([{invoiceId:INV_ID,stripeAccountId:'acct_9'}]);
+  const response=await app().request(`/invoices/${INV_ID}/pay`,{method:'POST'});
+  expect(response.status).toBe(200);expect(await response.json()).toMatchObject({url:'https://checkout.stripe.com/c/cs_reuse'});
+ }
+ expect(mappings.size).toBe(1);
+ // Ordinary portal payments save nothing; Link stays available there.
+ for(const [params] of sessionsCreateMock.mock.calls)expect(params).not.toHaveProperty('wallet_options');
+});
+it('portal pay-and-save forwards consent and binds card-only off-session Checkout',async()=>{
+ mappings.clear();dbResults.length=0;
+ const capture={id:'33333333-3333-4333-8333-333333333333',stripeCustomerId:'cus_saved'};
+ vi.mocked(prepareCardPayAndSave).mockResolvedValueOnce(capture as any);
+ dbResults.push([{id:INV_ID,orgId:ORG_ID,createdAt:INV_CREATED_AT,partnerId:'p1',status:'sent',balance:'100.00',currencyCode:'USD'}],[{id:'connection'}],[]);
+ getPartnerStripeClientMock.mockResolvedValue(partnerClient('acct_9'));sessionsCreateMock.mockResolvedValue({id:'cs_saved',url:'https://checkout.stripe.com/c/cs_saved',payment_intent:'pi_saved'});
+ const response=await app().request(`/invoices/${INV_ID}/pay`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({saveForAutopay:true,consentAccepted:true,disclosureHash:'a'.repeat(64)})});
+ expect(response.status).toBe(200);
+ expect(prepareCardPayAndSave).toHaveBeenCalledWith(INV_ID,ORG_ID,expect.objectContaining({saveForAutopay:true,consentAccepted:true,disclosureHash:'a'.repeat(64)}),expect.any(String));
+ expect(sessionsCreateMock).toHaveBeenCalledWith(expect.objectContaining({payment_method_types:['card'],customer:'cus_saved',payment_intent_data:{setup_future_usage:'off_session',metadata:{autopay_setup_attempt_id:capture.id},description:expect.stringMatching(/^Invoice/)},
+  wallet_options:{link:{display:'never'}}}),expect.anything());
+ const {bindCardPayAndSave}=await import('../../services/autopay/payAndSave');
+ expect(bindCardPayAndSave).toHaveBeenCalledWith(capture,expect.objectContaining({id:'cs_saved'}));
+});
+
+it('bank pay validates strict consent and preserves the setup envelope',async()=>{
+ dbResults.length=0;dbResults.push([{id:INV_ID,orgId:ORG_ID,createdAt:INV_CREATED_AT,partnerId:'p1',status:'sent',balance:'100.00',currencyCode:'USD'}]);
+ bankRoutes.setup.mockResolvedValue({url:'https://checkout.stripe.com/setup'});
+ const body={methodType:'us_bank_account',phase:'setup',consentAccepted:true,principal:'100.00',fee:'0.00',currency:'USD',disclosureHash:'a'.repeat(64)};
+ const response=await app().request(`/invoices/${INV_ID}/pay`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
+ expect(response.status).toBe(200);expect(await response.json()).toEqual({url:'https://checkout.stripe.com/setup'});
+ expect(bankRoutes.setup).toHaveBeenCalledWith(expect.objectContaining({invoiceId:INV_ID,orgId:ORG_ID,returnTo:'portal'}));
+ const invalid=await app().request(`/invoices/${INV_ID}/pay`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({...body,consentAccepted:false})});
+ expect(invalid.status).toBe(400);
+});
+it('bank collect requires invoice admission and never treats the session ID as authority',async()=>{
+ bankRoutes.collect.mockClear();
+ dbResults.length=0;
+ const response=await app().request(`/invoices/${INV_ID}/pay`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({
+  methodType:'us_bank_account',phase:'collect',consentAccepted:true,principal:'100.00',fee:'0.00',currency:'USD',disclosureHash:'a'.repeat(64),setupSessionId:'cs_test',
+ })});
+ expect(response.status).toBe(404);expect(bankRoutes.collect).not.toHaveBeenCalled();
+});
+
+it.each(['refused','deferred','failed','canceled'])('bank %s is a conflict rather than a successful payment',async outcome=>{
+ dbResults.length=0;dbResults.push([{id:INV_ID,orgId:ORG_ID,createdAt:INV_CREATED_AT,partnerId:'p1',status:'sent',balance:'100.00',currencyCode:'USD'}]);
+ bankRoutes.collect.mockResolvedValue({attemptId:null,outcome,reason:'unavailable'});
+ const response=await app().request(`/invoices/${INV_ID}/pay`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({
+ methodType:'us_bank_account',phase:'collect',consentAccepted:true,principal:'100.00',fee:'0.00',currency:'USD',disclosureHash:'a'.repeat(64),setupSessionId:'cs_test'
+ })});
+ expect(response.status).toBe(409);
+});
+
+// FP-20: portal Checkout PaymentIntents carry a description too.
+it('portal Checkout PaymentIntents carry "Invoice … · MSP"', async () => {
+  mappings.clear(); dbResults.length = 0;
+  getPartnerStripeClientMock.mockResolvedValue(partnerClient('acct_9'));
+  sessionsCreateMock.mockResolvedValue({ id: 'cs_desc', url: 'https://checkout.stripe.com/c/cs_desc' });
+  dbResults.push([{ id: INV_ID, orgId: ORG_ID, createdAt: INV_CREATED_AT, partnerId: 'p1', status: 'sent', balance: '100.00', currencyCode: 'USD', invoiceNumber: 'INV-7', partnerName: 'Example MSP' }], [{ id: 'connection' }], []);
+  expect((await app().request(`/invoices/${INV_ID}/pay`, { method: 'POST' })).status).toBe(200);
+  expect(sessionsCreateMock.mock.calls.at(-1)![0]).toMatchObject({ payment_intent_data: { description: 'Invoice INV-7 · Example MSP' } });
+});
+
+// #9585 item 3: the portal invoice detail and PDF routes manage their own DB
+// context. This app mirrors routes/portal/auth.ts's decision (the real
+// isSelfManagedDbContextRoute predicate, else an org-scoped withDbAccessContext
+// around the whole handler), so while the routes did not opt out, every
+// partner-axis read below ran with the middleware's org transaction open.
+import { isSelfManagedDbContextRoute } from '../../middleware/selfManagedDbContextRoutes';
+import { withDbAccessContext } from '../../db';
+
+const PORTAL_ORG_CTX = {
+  scope: 'organization', orgId: ORG_ID, accessibleOrgIds: [ORG_ID], accessiblePartnerIds: [], userId: null, currentPartnerId: null,
+};
+
+function productionApp(orgId = ORG_ID) {
+  const a = new Hono();
+  a.use('/api/v1/portal/*', async (c, next) => {
+    c.set('portalAuth', {
+      user: { id: 'pu1', orgId, email: 'c@example.test', name: 'Cust', contactId: null, receiveNotifications: true, status: 'active' },
+      token: 't', authMethod: 'bearer', partnerId: 'p1', timezone: 'UTC',
+    });
+    if (isSelfManagedDbContextRoute(c.req.method, c.req.path)) return next();
+    return withDbAccessContext({ ...PORTAL_ORG_CTX, orgId, accessibleOrgIds: [orgId] } as never, () => next());
+  });
+  a.route('/api/v1/portal', portalInvoiceRoutes);
+  return a;
+}
+
+describe('portal invoice detail and PDF own their DB context (#9585)', () => {
+  // The org-transaction depth each call ran at: 0 = no transaction open.
+  const at: Record<string, number[]> = {};
+  const track = (name: string) => { (at[name] ??= []).push(ctx.orgTx); };
+  const partnerAxisReaders = () => [onlinePayMock, portalAutopay.offer, bankRoutes.offer, renderPartnerContextMock, renderInvoicePdfMock, markViewedMock];
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // Earlier suites leave unconsumed *Once values queued on these; reset them outright.
+    for (const m of [onlinePayMock, portalAutopay.offer, portalAutopay.status, bankRoutes.offer, renderPartnerContextMock, renderInvoicePdfMock]) m.mockReset();
+    ctx.orgTx = 0; ctx.nestedUnderOrgTx = []; ctx.orgContexts = [];
+    dbResults.length = 0;
+    for (const k of Object.keys(at)) delete at[k];
+    getPortalInvoiceRowMock.mockReset();
+    getPortalInvoiceRowMock.mockImplementation(async () => { track('row'); return invoiceRow(); });
+    markViewedMock.mockImplementation(async () => { track('markViewed'); });
+    reservation.inFlight.mockImplementation(async () => { track('inFlight'); return { inProgress: false, amount: '0.00' }; });
+    portalAutopay.status.mockImplementation(async () => { track('autopayStatus'); return { enrolled: false, status: null }; });
+    // The partner-axis readers: each opens its own system context.
+    onlinePayMock.mockImplementation(async () => { track('onlinePay'); return true; });
+    portalAutopay.offer.mockImplementation(async () => { track('cardOffer'); return { eligible: true } as never; });
+    bankRoutes.offer.mockImplementation(async () => { track('bankOffer'); return { available: true } as never; });
+    renderPartnerContextMock.mockImplementation(async () => { track('renderPartnerContext'); return { partnerId: 'p1', partner: { id: 'p1' }, onlinePaymentAvailable: true }; });
+    renderInvoicePdfMock.mockImplementation(async () => { track('render'); return {}; });
+    getInvoicePdfMock.mockReset();
+  });
+
+  it('GET /invoices/:id runs every system-context read outside the org transaction, and every org read inside it', async () => {
+    const res = await productionApp().request(`/api/v1/portal/invoices/${INV_ID}`, { method: 'GET' });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+
+    // No system context opened, and no context escaped, while an org tx was open.
+    expect(ctx.nestedUnderOrgTx).toEqual([]);
+    for (const read of ['onlinePay', 'cardOffer', 'bankOffer']) expect(at[read], read).toEqual([0]);
+    // The org-scoped reads still run under the portal org scope, never on the bare pool.
+    for (const read of ['row', 'markViewed', 'inFlight', 'autopayStatus']) {
+      expect(at[read]?.length, read).toBeGreaterThan(0);
+      expect(at[read]!.every((d) => d === 1), read).toBe(true);
+    }
+    // Exactly the scope the portal middleware sets: this org, no partner access.
+    expect(ctx.orgContexts.length).toBeGreaterThan(0);
+    for (const opened of ctx.orgContexts) expect(opened).toEqual(PORTAL_ORG_CTX);
+    // The preloaded answers still reach the response.
+    expect(body).toMatchObject({ onlinePaymentAvailable: true, autopay: { eligible: true }, bankAutopay: { available: true } });
+    expect(onlinePayMock).toHaveBeenCalledWith('p1');
+  });
+
+  it('GET /invoices/:id keeps the autopay offers gated on enrollment (enrolled: no card offer; unknown: neither)', async () => {
+    portalAutopay.status.mockImplementationOnce(async () => ({ enrolled: true, status: null }));
+    const enrolled = await (await productionApp().request(`/api/v1/portal/invoices/${INV_ID}`, { method: 'GET' })).json();
+    expect(enrolled.autopay).toBeNull();
+    expect(enrolled.bankAutopay).toEqual({ available: true });
+
+    portalAutopay.offer.mockClear(); bankRoutes.offer.mockClear();
+    portalAutopay.status.mockImplementationOnce(async () => { throw new Error('db down'); });
+    const unknown = await (await productionApp().request(`/api/v1/portal/invoices/${INV_ID}`, { method: 'GET' })).json();
+    expect(unknown).toMatchObject({ autopay: null, bankAutopay: null });
+    expect(portalAutopay.offer).not.toHaveBeenCalled();
+    expect(bankRoutes.offer).not.toHaveBeenCalled();
+  });
+
+  it('GET /invoices/:id/pdf preloads the partner bundle outside the org transaction and renders inside it', async () => {
+    getInvoicePdfMock.mockResolvedValueOnce(null).mockResolvedValueOnce(Buffer.from('%PDF-rendered'));
+    const res = await productionApp().request(`/api/v1/portal/invoices/${INV_ID}/pdf`, { method: 'GET' });
+    expect(res.status).toBe(200);
+    expect(ctx.nestedUnderOrgTx).toEqual([]);
+    expect(at.renderPartnerContext).toEqual([0]);
+    expect(at.row).toEqual([1]);
+    expect(at.render).toEqual([1]);
+    expect(renderPartnerContextMock).toHaveBeenCalledWith('p1');
+    expect(renderInvoicePdfMock).toHaveBeenCalledWith(INV_ID, { partnerContext: { partnerId: 'p1', partner: { id: 'p1' }, onlinePaymentAvailable: true } });
+    for (const opened of ctx.orgContexts) expect(opened).toEqual(PORTAL_ORG_CTX);
+  });
+
+  it('GET /invoices/:id/pdf streams a stored PDF without any partner-axis read', async () => {
+    getInvoicePdfMock.mockResolvedValue(Buffer.from('%PDF-stored'));
+    const res = await productionApp().request(`/api/v1/portal/invoices/${INV_ID}/pdf`, { method: 'GET' });
+    expect(res.status).toBe(200);
+    expect(renderPartnerContextMock).not.toHaveBeenCalled();
+    expect(renderInvoicePdfMock).not.toHaveBeenCalled();
+  });
+
+  it.each(['', '/pdf'])('GET /invoices/:id%s refuses another org\'s invoice under the caller\'s org scope, before any partner-axis read', async (suffix) => {
+    const OTHER_ORG = '99999999-9999-4999-8999-999999999999';
+    getPortalInvoiceRowMock.mockImplementation(async () => { track('row'); throw new InvoiceServiceError('Invoice not found', 404, 'INVOICE_NOT_FOUND'); });
+    const res = await productionApp(OTHER_ORG).request(`/api/v1/portal/invoices/${INV_ID}${suffix}`, { method: 'GET' });
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ error: 'Invoice not found', code: 'NOT_FOUND' });
+    expect(getPortalInvoiceRowMock).toHaveBeenCalledWith(INV_ID, OTHER_ORG);
+    expect(at.row).toEqual([1]);
+    for (const opened of ctx.orgContexts) expect(opened).toEqual({ ...PORTAL_ORG_CTX, orgId: OTHER_ORG, accessibleOrgIds: [OTHER_ORG] });
+    for (const reader of partnerAxisReaders()) expect(reader).not.toHaveBeenCalled();
+  });
+
+  it.each(['', '/pdf'])('GET /invoices/:id%s refuses a draft before any partner-axis read', async (suffix) => {
+    getPortalInvoiceRowMock.mockImplementation(async () => invoiceRow({ status: 'draft' }));
+    const res = await productionApp().request(`/api/v1/portal/invoices/${INV_ID}${suffix}`, { method: 'GET' });
+    expect(res.status).toBe(404);
+    for (const reader of partnerAxisReaders()) expect(reader).not.toHaveBeenCalled();
   });
 });

@@ -1,7 +1,8 @@
 import { Hono } from 'hono';
 import { zValidator } from '../../lib/validation';
 import { and, desc, eq, inArray } from 'drizzle-orm';
-import { createSupportSessionSchema, formatSupportCode } from '@breeze/shared';
+import { createSupportSessionSchema, formatSupportCode, ERROR_CODES } from '@breeze/shared';
+import { jsonError } from '../../lib/jsonError';
 import { db } from '../../db';
 import { devices, remoteSessions, supportSessions } from '../../db/schema';
 import { getOrCreateQuickSupportOrg } from '../../services/quickSupportOrg';
@@ -15,6 +16,7 @@ import { getTrustedClientIp } from '../../services/clientIp';
 import { endSupportSession } from '../../services/quickSupportEnd';
 import { logSessionAudit } from './helpers';
 import { createRemoteSession, RemoteSessionDeniedError } from '../../services/remoteSessionCreate';
+import { isDesktopFenceCapable } from '../../services/remoteRevocationLease';
 import { trustDenyBody } from '../../services/partnerTrust';
 
 export const supportSessionRoutes = new Hono();
@@ -37,13 +39,24 @@ function toView(
   session: SupportSessionRow,
   deviceOnline: boolean,
   hasLiveRemoteSession: boolean,
+  desktopReady = false,
 ) {
   const { codeHash: _codeHash, ...rest } = session;
   return {
     ...rest,
     status: session.status === 'ready' && hasLiveRemoteSession ? 'active' : session.status,
     deviceOnline,
+    desktopReady,
   };
+}
+
+type DesktopDevice = Pick<typeof devices.$inferSelect, 'status' | 'revocationLeaseProtocolVersion' | 'desktopFenceProtocolVersion'>;
+
+// A socket can come online before the first heartbeat declares security support.
+function isDesktopReady(device: DesktopDevice | undefined): boolean {
+  return device?.status === 'online'
+    && device.revocationLeaseProtocolVersion === 1
+    && isDesktopFenceCapable(device.desktopFenceProtocolVersion ?? 0);
 }
 
 /** Only 'claimed'/'ready' sessions can have a live device worth probing. */
@@ -61,12 +74,12 @@ supportSessionRoutes.post(
     // carries a partnerId but never passes breeze_has_partner_access, so it
     // must not be able to mint sessions it could not then read back.
     if (auth.scope !== 'partner' && auth.scope !== 'system') {
-      return c.json({ error: 'Quick Support requires partner scope' }, 403);
+      return jsonError(c, 403, ERROR_CODES.ACCESS_DENIED, 'Quick Support requires partner scope');
     }
     if (!auth.partnerId) {
       // System tokens may carry no partner context — there is no org to
       // provision into, and provisioning would otherwise throw.
-      return c.json({ error: 'Quick Support requires a partner context' }, 403);
+      return jsonError(c, 403, ERROR_CODES.ACCESS_DENIED, 'Quick Support requires a partner context');
     }
 
     const data = c.req.valid('json');
@@ -78,7 +91,7 @@ supportSessionRoutes.post(
       && auth.accessibleOrgIds !== null
       && !auth.accessibleOrgIds.includes(data.attributedOrgId)
     ) {
-      return c.json({ error: 'Attributed organization not accessible' }, 403);
+      return jsonError(c, 403, ERROR_CODES.ACCESS_DENIED, 'Attributed organization not accessible');
     }
 
     const { orgId } = await getOrCreateQuickSupportOrg(auth.partnerId);
@@ -127,7 +140,16 @@ supportSessionRoutes.post(
       getTrustedClientIp(c, 'unknown'),
     );
 
-    const webBase = process.env.PUBLIC_WEB_URL ?? '';
+    // The link is pasted into email/chat, so it must be absolute (#10508).
+    // Stock compose sets only PUBLIC_APP_URL; PUBLIC_WEB_URL stays an explicit
+    // override. No localhost default: with nothing configured the relative path
+    // is returned and the web client resolves it against its own origin.
+    const webBase = (
+      process.env.PUBLIC_WEB_URL?.trim()
+      || process.env.DASHBOARD_URL?.trim()
+      || process.env.PUBLIC_APP_URL?.trim()
+      || ''
+    ).replace(/\/+$/, '');
 
     return c.json({
       id: session.id,
@@ -159,15 +181,17 @@ supportSessionRoutes.get('/support-sessions', async (c) => {
   const deviceIds = [...new Set(sessions.filter(isProbeable).map((s) => s.deviceId!))];
 
   const onlineDeviceIds = new Set<string>();
+  const desktopReadyIds = new Set<string>();
   const liveSessionDeviceIds = new Set<string>();
 
   if (deviceIds.length > 0) {
     const deviceRows = await db
-      .select({ id: devices.id, status: devices.status })
+      .select({ id: devices.id, status: devices.status, revocationLeaseProtocolVersion: devices.revocationLeaseProtocolVersion, desktopFenceProtocolVersion: devices.desktopFenceProtocolVersion })
       .from(devices)
-      .where(inArray(devices.id, deviceIds)) as Array<{ id: string; status: string }>;
+      .where(inArray(devices.id, deviceIds)) as Array<DesktopDevice & { id: string }>;
     for (const row of deviceRows) {
       if (row.status === 'online') onlineDeviceIds.add(row.id);
+      if (isDesktopReady(row)) desktopReadyIds.add(row.id);
     }
 
     const liveRows = await db
@@ -185,6 +209,7 @@ supportSessionRoutes.get('/support-sessions', async (c) => {
       s,
       !!s.deviceId && onlineDeviceIds.has(s.deviceId),
       !!s.deviceId && liveSessionDeviceIds.has(s.deviceId),
+      !!s.deviceId && desktopReadyIds.has(s.deviceId),
     )),
   });
 });
@@ -208,9 +233,9 @@ supportSessionRoutes.post('/support-sessions/:id/end', async (c) => {
     .where(eq(supportSessions.id, id))
     .limit(1) as SupportSessionRow[];
 
-  if (!session) return c.json({ error: 'Support session not found' }, 404);
+  if (!session) return jsonError(c, 404, ERROR_CODES.NOT_FOUND, 'Support session not found');
   if (session.status === 'ended' || session.status === 'expired') {
-    return c.json({ error: 'Support session already ended' }, 409);
+    return jsonError(c, 409, ERROR_CODES.CONFLICT, 'Support session already ended');
   }
 
   const result = await endSupportSession(id, 'tech');
@@ -241,15 +266,15 @@ supportSessionRoutes.get('/support-sessions/:id', async (c) => {
     .where(eq(supportSessions.id, c.req.param('id')))
     .limit(1) as SupportSessionRow[];
 
-  if (!session) return c.json({ error: 'Support session not found' }, 404);
+  if (!session) return jsonError(c, 404, ERROR_CODES.NOT_FOUND, 'Support session not found');
 
   if (!isProbeable(session)) return c.json(toView(session, false, false));
 
   const [device] = await db
-    .select({ status: devices.status })
+    .select({ status: devices.status, revocationLeaseProtocolVersion: devices.revocationLeaseProtocolVersion, desktopFenceProtocolVersion: devices.desktopFenceProtocolVersion })
     .from(devices)
     .where(eq(devices.id, session.deviceId!))
-    .limit(1) as Array<{ status: string }>;
+    .limit(1) as DesktopDevice[];
 
   const live = await db
     .select({ id: remoteSessions.id })
@@ -260,5 +285,5 @@ supportSessionRoutes.get('/support-sessions/:id', async (c) => {
     ))
     .limit(1) as Array<{ id: string }>;
 
-  return c.json(toView(session, device?.status === 'online', live.length > 0));
+  return c.json(toView(session, device?.status === 'online', live.length > 0, isDesktopReady(device)));
 });

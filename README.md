@@ -43,15 +43,15 @@ Breeze is a full IT platform for MSPs and internal IT: monitoring, patching, rem
 
 Every RMM on the market hands you a dashboard and leaves the labor to you. Breeze hands you a team: **an AI operator that uses the platform for you.** It investigates alerts, remediates issues, resolves tickets, documents what it did, and only interrupts you when it needs a human decision.
 
-Breeze is free, open source (AGPL-3.0), and designed to be self-hosted or [cloud-hosted at breezermm.com](https://breezermm.com) (US and EU regions).
+Breeze has a free, open-source core (AGPL-3.0), designed to be self-hosted or [cloud-hosted at breezermm.com](https://breezermm.com) (US and EU regions). Extensions under [`ee/`](ee/), including Workspace, use a [separate commercial license](ee/LICENSE).
 
 ### Why Breeze?
 
 - **AI-native, not AI-added.** Every page has an AI operator that can see what you see and take action using built-in tools. Not a chatbot, an agent.
 - **RMM + PSA in one system.** Resolved is nice. Invoiced is better. The ticket, the time entry, the quote, and the invoice live where the work happens. No separate PSA, no sync job.
-- **Never metered.** Self-host with unlimited devices, forever. Every module ships in every plan; nothing sits behind a paywall.
+- **Free Community core.** Self-host the AGPL-3.0 core with unlimited devices and technicians. You fund infrastructure and any AI usage; commercial `ee/` extensions have separate terms.
 - **Lightweight agent.** Single Go binary. Cross-platform. Minimal resource footprint. Your clients won't notice it's there.
-- **Actually open source.** AGPL-3.0. Read every line. Fork it. Contribute. No bait-and-switch.
+- **Inspectable source.** Read, fork, and contribute to the AGPL-3.0 core. Source-visible commercial extensions are identified under `ee/`.
 - **Multi-tenant from day one.** Built for MSPs managing multiple clients, not retrofitted from a single-tenant architecture.
 - **Modern stack.** Not a legacy codebase with 15 years of technical debt. Clean, fast, extensible.
 
@@ -77,7 +77,7 @@ Breeze has privileged access to every device it manages. We take that seriously.
 
 For the full security whitepaper, including SOC 2 alignment mapping, see **[Security Practices](docs/security/SECURITY_PRACTICES.md)**.
 
-To report a vulnerability: **[security@lanternops.io](mailto:security@lanternops.io)**. See [SECURITY.md](SECURITY.md) for our disclosure policy.
+To report a vulnerability: **[security@breezermm.com](mailto:security@breezermm.com)**. See [SECURITY.md](SECURITY.md) for our disclosure policy.
 
 ---
 
@@ -156,7 +156,7 @@ chmod +x guided-setup.sh
 ./guided-setup.sh
 ```
 
-The guided setup checks required commands, Docker Compose, CPU, RAM, and free disk space before generating configuration. It asks which Breeze release to install, downloads that release's `docker-compose.yml` and `.env.example`, preserves the comments from `.env.example` in your generated `.env`, prompts for the required settings, and can generate secure passwords and application secrets with `openssl rand`.
+The guided setup checks required commands, Docker Compose, CPU, RAM, and free disk space before generating configuration. It asks which Breeze release to install (0.112.0 or later; older releases, whose images release signatures do not cover, need `--allow-unverified-release`), downloads that release's `docker-compose.yml` and `.env.example`, preserves the comments from `.env.example` in your generated `.env`, prompts for the required settings, and can generate secure passwords and application secrets with `openssl rand`.
 
 During setup you can choose the packaged Caddy reverse proxy, Nginx Proxy Manager, or another external reverse proxy path. You can also choose Docker named volumes or local `./data` subdirectories for persistent container data.
 
@@ -188,7 +188,11 @@ chmod +x guided-setup.sh
 #
 # The setup verifies the selected release's Ed25519-signed image inventory and
 # writes exact repository@sha256 refs. Do not replace those refs with tags or
-# copy digests from the package page. Rerun setup to resolve an upgrade.
+# copy digests from the package page. Releases before 0.112.0 have no signed
+# inventory and are refused unless you pass --allow-unverified-release. To
+# upgrade, download the current guided-setup.sh and run
+# `./guided-setup.sh --upgrade [VERSION]`: `docker compose pull` alone re-fetches
+# the same pinned digests.
 
 # Optional — for remote desktop (WebRTC TURN relay):
 #   TURN_HOST            public IP of your TURN server
@@ -360,7 +364,7 @@ For detailed architecture documentation, see [docs/guides/architecture.md](docs/
 - [x] Health checks & alerting
 - [x] Configuration policies (hierarchical with feature links)
 - [x] Advanced filtering
-- [x] AI chat with tool-equipped agent (BYOK)
+- [x] AI chat with tool-equipped agent (your own provider key)
 - [x] Risk-classified action engine
 - [x] Multi-tenant hierarchy
 - [x] macOS, Windows, and Linux agents
@@ -457,9 +461,18 @@ Thank you to everyone who has contributed to Breeze.
 <!-- contributors:start -->
 <a href="https://github.com/ToddHebebrand"><img src="https://avatars.githubusercontent.com/u/8375744?v=4&amp;s=128" width="64" height="64" alt="ToddHebebrand" title="ToddHebebrand (@ToddHebebrand)" /></a>
 <a href="https://github.com/bdunncompany"><img src="https://avatars.githubusercontent.com/u/17571793?v=4&amp;s=128" width="64" height="64" alt="bdunncompany" title="bdunncompany (@bdunncompany)" /></a>
+<a href="https://github.com/fabicarvano"><img src="https://avatars.githubusercontent.com/u/205927015?v=4&amp;s=128" width="64" height="64" alt="fabicarvano" title="fabicarvano (@fabicarvano)" /></a>
 <a href="https://github.com/ramphex"><img src="https://avatars.githubusercontent.com/u/43665314?v=4&amp;s=128" width="64" height="64" alt="ramphex" title="ramphex (@ramphex)" /></a>
+<a href="https://github.com/advenimus"><img src="https://avatars.githubusercontent.com/u/102630001?v=4&amp;s=128" width="64" height="64" alt="advenimus" title="advenimus (@advenimus)" /></a>
+<a href="https://github.com/hcaldicott"><img src="https://avatars.githubusercontent.com/u/1539430?v=4&amp;s=128" width="64" height="64" alt="hcaldicott" title="hcaldicott (@hcaldicott)" /></a>
+<a href="https://github.com/mvthul"><img src="https://avatars.githubusercontent.com/u/53946558?v=4&amp;s=128" width="64" height="64" alt="mvthul" title="mvthul (@mvthul)" /></a>
 <a href="https://github.com/Emilien-Etadam"><img src="https://avatars.githubusercontent.com/u/56485277?v=4&amp;s=128" width="64" height="64" alt="Emilien-Etadam" title="Emilien-Etadam (@Emilien-Etadam)" /></a>
+<a href="https://github.com/lennonflima"><img src="https://avatars.githubusercontent.com/u/62125964?v=4&amp;s=128" width="64" height="64" alt="lennonflima" title="lennonflima (@lennonflima)" /></a>
+<a href="https://github.com/aayush-ashok"><img src="https://avatars.githubusercontent.com/u/54711854?v=4&amp;s=128" width="64" height="64" alt="aayush-ashok" title="aayush-ashok (@aayush-ashok)" /></a>
 <a href="https://github.com/CookieSource"><img src="https://avatars.githubusercontent.com/u/36531905?v=4&amp;s=128" width="64" height="64" alt="CookieSource" title="CookieSource (@CookieSource)" /></a>
+<a href="https://github.com/obsidiangroup"><img src="https://avatars.githubusercontent.com/u/54423468?v=4&amp;s=128" width="64" height="64" alt="obsidiangroup" title="obsidiangroup (@obsidiangroup)" /></a>
+<a href="https://github.com/LewisLosa"><img src="https://avatars.githubusercontent.com/u/95869100?v=4&amp;s=128" width="64" height="64" alt="LewisLosa" title="LewisLosa (@LewisLosa)" /></a>
+<a href="https://github.com/JayDawgZA"><img src="https://avatars.githubusercontent.com/u/278054780?v=4&amp;s=128" width="64" height="64" alt="JayDawgZA" title="JayDawgZA (@JayDawgZA)" /></a>
 <!-- contributors:end -->
 
 ### Community
@@ -473,10 +486,10 @@ Thank you to everyone who has contributed to Breeze.
 ## FAQ
 
 **Is this really free?**
-Yes. Breeze is AGPL-3.0 licensed. Self-host it, use it in production, manage as many endpoints as you want. Free forever.
+Yes. Breeze Community is the AGPL-3.0 core, free to self-host in production with unlimited devices and technicians. You run and fund the infrastructure and any AI usage. Extensions under `ee/`, including Workspace, have separate commercial terms and require a commercial agreement for production use.
 
 **What's the catch?**
-No catch. The business model sits on top of the free platform: [Breeze Cloud](https://breezermm.com/pricing/) (managed hosting, US and EU regions), support plans for self-hosters, and [Managed AI Ops](https://breezermm.com/brain/), where a supervised team of AI agents works your queue and we tune it with you. Breeze is great on its own. The paid tiers add hosting and workers.
+You operate the free Community core yourself, with community support. Paid options include [Breeze Cloud and supported self-hosting](https://breezermm.com/pricing/), separately licensed commercial extensions under `ee/`, and [Managed AI Ops](https://breezermm.com/brain/), where a supervised team of AI agents works your queue and we tune it with you. Confirm the deployment, extension and service scope before purchasing.
 
 **What is Managed AI Ops?**
 AI agents working your alerts, patches, and tickets inside your own Breeze instance, with persistent memory, playbooks, and compliance evidence building up over time. The part no one else offers: we read the AI's conversations, verify its resolutions, and tune the agents as your fleet changes. Your risk engine holds the approvals throughout. Available on self-hosted or cloud Breeze. [Book a call](https://breezermm.com/contact/).
@@ -491,7 +504,7 @@ No. Tickets, time tracking, quotes, invoicing, a priced service catalog, and a c
 Absolutely. The multi-tenant hierarchy works for internal IT too. Use Organizations as departments or offices.
 
 **What AI models are supported?**
-For the in-product AI operator, Breeze uses the Claude Agent SDK (Anthropic). BYOK mode takes an Anthropic API key, and self-hosted deployments can point at any Anthropic-compatible endpoint (such as a LiteLLM gateway). We chose Claude for its tool-use capabilities and reasoning quality. Separately, Breeze runs a built-in MCP server with OAuth 2.1 + PKCE, so you can connect Claude.ai, ChatGPT, Cursor, or any other MCP-compatible AI agent, using whichever model that platform runs. We're open to community contributions for additional in-product model providers.
+For the in-product AI operator, Breeze uses the Claude Agent SDK (Anthropic). You can bring your own Anthropic API key, and self-hosted deployments can point at any Anthropic-compatible endpoint (such as a LiteLLM gateway). We chose Claude for its tool-use capabilities and reasoning quality. Separately, Breeze runs a built-in MCP server with OAuth 2.1 + PKCE, so you can connect Claude.ai, ChatGPT, Cursor, or any other MCP-compatible AI agent, using whichever model that platform runs. We're open to community contributions for additional in-product model providers.
 
 **Is there an agent auto-update?**
 Yes. The Breeze agent has a built-in updater that pulls signed release artifacts and self-installs across macOS, Windows, and Linux. The Watchdog service supervises the agent process and restarts it on failure. Production deployments verify Ed25519-signed release manifests via `RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS`.

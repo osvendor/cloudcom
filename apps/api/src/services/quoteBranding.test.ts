@@ -12,7 +12,7 @@ vi.mock('../db', () => {
   return { db: { select: () => chain } };
 });
 
-import { resolveQuoteBranding, type QuoteBrandingSource } from './quoteBranding';
+import { resolveQuoteBranding, resolveInvoiceBranding, type QuoteBrandingSource } from './quoteBranding';
 
 function queue(partner: unknown | null, brand: unknown | null): void {
   dbRows.next = [partner ? [partner] : [], brand ? [brand] : []];
@@ -34,14 +34,31 @@ function source(overrides: Partial<QuoteBrandingSource> = {}): QuoteBrandingSour
 beforeEach(() => { dbRows.next = []; dbRows.i = 0; });
 
 describe('resolveQuoteBranding', () => {
+  // #9673: the org secondary colour (quote PDF headings) overrides the partner's.
+  it("the org's secondary colour overrides the partner's", async () => {
+    queue({ ...basePartner, settings: { branding: { secondaryColor: '#0b1b2d' } } }, { ...baseBrand, secondaryColor: '#654321' });
+    expect((await resolveQuoteBranding(source())).secondaryColor).toBe('#654321');
+  });
+
+  it("the partner's secondary colour applies when the org has none", async () => {
+    queue({ ...basePartner, settings: { branding: { secondaryColor: '#0b1b2d' } } }, { ...baseBrand, secondaryColor: null });
+    expect((await resolveQuoteBranding(source())).secondaryColor).toBe('#0b1b2d');
+  });
+
   it('footer precedence: quote.terms wins over partner + portal footer', async () => {
     queue(basePartner, baseBrand);
     const b = await resolveQuoteBranding(source({ terms: 'quote terms' }));
     expect(b.footer).toBe('quote terms');
   });
 
-  it('footer precedence: partner invoiceFooter beats portal footer when terms null', async () => {
+  it('footer precedence (#7510): the org footer overrides the partner invoiceFooter when terms null', async () => {
     queue(basePartner, baseBrand);
+    const b = await resolveQuoteBranding(source({ terms: null }));
+    expect(b.footer).toBe('portal footer');
+  });
+
+  it('footer precedence: partner invoiceFooter used when terms + org footer absent', async () => {
+    queue(basePartner, { ...baseBrand, footerText: null });
     const b = await resolveQuoteBranding(source({ terms: null }));
     expect(b.footer).toBe('partner footer');
   });
@@ -50,6 +67,37 @@ describe('resolveQuoteBranding', () => {
     queue({ ...basePartner, invoiceFooter: null }, baseBrand);
     const b = await resolveQuoteBranding(source());
     expect(b.footer).toBe('portal footer');
+  });
+
+  it("#7216: a quote sent with no footer (terms frozen as '') prints none after a footer is added later", async () => {
+    // Both inherited levels now carry a footer that did not exist at send.
+    queue(basePartner, baseBrand);
+    const b = await resolveQuoteBranding(source({ terms: '' }));
+    expect(b.footer).toBe('');
+  });
+
+  it('#7216: an unfrozen quote (terms NULL — draft or pre-#7216 sent row) still resolves the footer live', async () => {
+    queue({ ...basePartner, invoiceFooter: null }, baseBrand);
+    expect((await resolveQuoteBranding(source({ terms: null }))).footer).toBe('portal footer');
+  });
+
+  it('inheritedFooter reports the partner footer + source even when quote.terms overrides (#6648)', async () => {
+    queue(basePartner, { ...baseBrand, footerText: null });
+    const b = await resolveQuoteBranding(source({ terms: 'quote terms' }));
+    expect(b.footer).toBe('quote terms');
+    expect(b.inheritedFooter).toEqual({ text: 'partner footer', source: 'partner' });
+  });
+
+  it('inheritedFooter reports the org footer over the partner default (#7510)', async () => {
+    queue(basePartner, baseBrand);
+    expect((await resolveQuoteBranding(source({ terms: 'quote terms' }))).inheritedFooter).toEqual({ text: 'portal footer', source: 'brand' });
+  });
+
+  it('inheritedFooter falls to the portal footer, then null (#6648)', async () => {
+    queue({ ...basePartner, invoiceFooter: null }, baseBrand);
+    expect((await resolveQuoteBranding(source())).inheritedFooter).toEqual({ text: 'portal footer', source: 'brand' });
+    queue({ ...basePartner, invoiceFooter: null }, { ...baseBrand, footerText: null });
+    expect((await resolveQuoteBranding(source())).inheritedFooter).toBeNull();
   });
 
   it('currency: quote → partner → USD fallback', async () => {
@@ -111,6 +159,17 @@ describe('resolveQuoteBranding', () => {
   it('frozen sellerSnapshot wins; buildSellerSnapshot is not synthesized', async () => {
     queue(basePartner, baseBrand);
     const frozen = { name: 'Frozen Co', address: null, phone: null, email: null, website: null };
+    const b = await resolveQuoteBranding(source({ sellerSnapshot: frozen }));
+    expect(b.seller).toEqual(frozen);
+  });
+
+  it('#6228 regression: a frozen seller snapshot is untouched even when the live partner has DIFFERENT company-details fallback data', async () => {
+    // The partner's company details (settings.contact) now differ from what's
+    // frozen on the quote — if resolveQuoteBranding ever started re-running
+    // buildSellerSnapshot for an already-sent quote, this would silently change
+    // an issued document's seller phone/website out from under it.
+    queue({ ...basePartner, settings: { contact: { phone: '555-LIVE', website: 'https://live.example' } } }, baseBrand);
+    const frozen = { name: 'Frozen Co', address: null, phone: '555-FROZEN', email: null, website: 'https://frozen.example' };
     const b = await resolveQuoteBranding(source({ sellerSnapshot: frozen }));
     expect(b.seller).toEqual(frozen);
   });
@@ -180,5 +239,36 @@ describe('resolveQuoteBranding', () => {
       expect(b.theme).toBe('classic');
       expect(b.pageSize).toBe('a4');
     });
+  });
+});
+
+describe('resolveQuoteBranding: partner Branding settings feed the document (Q-2026-0027)', () => {
+  const PNG = 'data:image/png;base64,iVBORw0KGgo=';
+  const brandedPartner = { ...basePartner, settings: { branding: { logoUrl: PNG, primaryColor: '#00bfa6', secondaryColor: '#0b1b2d' } } };
+
+  it("uses the partner's logo and colours when the customer org has no portal branding", async () => {
+    queue(brandedPartner, null);
+    const b = await resolveQuoteBranding(source());
+    expect(b.logoUrl).toBe(PNG);
+    expect(b.primaryColor).toBe('#00bfa6');
+    expect(b.secondaryColor).toBe('#0b1b2d');
+  });
+
+  it('keeps a per-org portal_branding value ahead of the partner default', async () => {
+    queue(brandedPartner, baseBrand);
+    const b = await resolveQuoteBranding(source());
+    expect(b.logoUrl).toBe('logo.png');
+    expect(b.primaryColor).toBe('#1c8a9e');
+  });
+
+  it("invoices use the partner's logo and colours too, and an org value still wins (#9676)", async () => {
+    queue(brandedPartner, null);
+    const b = await resolveInvoiceBranding({ ...source(), documentTheme: null, documentPageSize: null } as never);
+    expect(b.logoUrl).toBe(PNG);
+    expect(b.primaryColor).toBe('#00bfa6');
+    queue(brandedPartner, baseBrand);
+    const o = await resolveInvoiceBranding({ ...source(), documentTheme: null, documentPageSize: null } as never);
+    expect(o.logoUrl).toBe('logo.png');
+    expect(o.primaryColor).toBe('#1c8a9e');
   });
 });

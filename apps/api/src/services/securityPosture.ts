@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gte, ilike, inArray, lte, sql, type SQL } from 'drizzle-orm';
+import { and, asc, desc, eq, gte, ilike, inArray, lte, sql, type AnyColumn, type SQL } from 'drizzle-orm';
 
 import { db } from '../db';
 import {
@@ -11,7 +11,10 @@ import {
   securityStatus,
   securityThreats
 } from '../db/schema';
+import { EFFECTIVE_PATCH_SEVERITY_SQL } from './patchSeverityOverlay';
+import { normalizeSiteAllowlist } from './siteAllowlist';
 
+import { notParkedDeviceCondition } from './unassignedPool/selectorPredicate';
 const SECURITY_FACTOR_WEIGHTS = {
   patch_compliance: 25,
   encryption: 15,
@@ -88,6 +91,12 @@ export interface SecurityPostureFilter {
    * by the query: filtering afterwards produced short pages (#6096).
    */
   deviceIds?: readonly string[];
+  /**
+   * Site allowlist (`auth.allowedSiteIds`). Undefined = unrestricted; `[]` (or
+   * a malformed value) = nothing in scope. Matches the device's CURRENT site.
+   * Applied in SQL so `limit` and the counts cover visible devices only.
+   */
+  siteIds?: readonly string[];
   minScore?: number;
   maxScore?: number;
   riskLevel?: SecurityRiskLevel;
@@ -212,9 +221,11 @@ export function scoreEncryption(input: DeviceInput): FactorResult {
   };
 }
 
-function scoreAvHealth(input: DeviceInput): FactorResult {
-  const rtp = Boolean(input.security.realTimeProtection);
-  let score = rtp ? 85 : 20;
+export function scoreAvHealth(input: DeviceInput): FactorResult {
+  // A null reading means the agent's AV collector failed (#8043): score it as a
+  // neutral data gap like firewall/encryption do, not as protection off (#8252).
+  const rtp = input.security.realTimeProtection;
+  let score = rtp === true ? 85 : rtp === null ? 50 : 20;
   let confidence = input.security.realTimeProtection === null ? 0.3 : 0.9;
   const evidence: Record<string, unknown> = {
     realTimeProtection: input.security.realTimeProtection ?? null,
@@ -288,7 +299,7 @@ function scoreOpenPorts(input: DeviceInput): FactorResult {
   };
 }
 
-function scorePasswordPolicy(input: DeviceInput): FactorResult {
+export function scorePasswordPolicy(input: DeviceInput): FactorResult {
   const raw = input.security.passwordPolicySummary;
   if (!raw || typeof raw !== 'object') {
     return {
@@ -308,7 +319,8 @@ function scorePasswordPolicy(input: DeviceInput): FactorResult {
   const checks = [
     minLength !== null ? minLength >= 12 : null,
     complexityEnabled !== null ? complexityEnabled : null,
-    maxAgeDays !== null ? maxAgeDays <= 90 : null,
+    // 0 means passwords never expire (the Windows agent reports it that way).
+    maxAgeDays !== null ? maxAgeDays > 0 && maxAgeDays <= 90 : null,
     lockoutThreshold !== null ? lockoutThreshold > 0 && lockoutThreshold <= 5 : null
   ];
   const knownChecks = checks.filter((value): value is boolean => value !== null);
@@ -567,7 +579,7 @@ async function loadDeviceInputsForOrg(orgId: string): Promise<DeviceInput[]> {
     // posture coverage denominator.
     .where(and(
       eq(devices.orgId, orgId),
-      eq(devices.isEphemeral, false),
+      eq(devices.isEphemeral, false), notParkedDeviceCondition(),
       sql`${devices.status} <> 'decommissioned'`,
     ));
 
@@ -579,14 +591,20 @@ async function loadDeviceInputsForOrg(orgId: string): Promise<DeviceInput[]> {
     db
       .select({
         deviceId: devicePatches.deviceId,
-        severity: patches.severity,
+        // Effective per-device severity (patchSeverityOverlay.ts): falls back
+        // to this device's own reported severity when the shared, un-tenanted
+        // `patches.severity` is 'unknown' (the permanent state for
+        // microsoft/apple/linux/custom sources). Computed per device_patches
+        // row, inside a query already pinned to this org's deviceIds, before
+        // the groupBy below folds rows together — never mixed across orgs.
+        severity: EFFECTIVE_PATCH_SEVERITY_SQL,
         status: devicePatches.status,
         count: sql<number>`count(*)`
       })
       .from(devicePatches)
       .innerJoin(patches, eq(devicePatches.patchId, patches.id))
       .where(inArray(devicePatches.deviceId, deviceIds))
-      .groupBy(devicePatches.deviceId, patches.severity, devicePatches.status),
+      .groupBy(devicePatches.deviceId, EFFECTIVE_PATCH_SEVERITY_SQL, devicePatches.status),
     db
       .select({
         deviceId: securityThreats.deviceId,
@@ -935,6 +953,8 @@ export async function listLatestSecurityPosture(filter: SecurityPostureFilter): 
   // already compiles to `false`, but short-circuiting keeps it explicit and
   // saves the round trip.
   if (filter.deviceIds && filter.deviceIds.length === 0) return [];
+  const siteIds = normalizeSiteAllowlist(filter.siteIds);
+  if (siteIds && siteIds.length === 0) return [];
 
   const maxLimit = Math.min(Math.max(Number(filter.limit ?? 500), 1), 2000);
   const scopeConditions: SQL[] = [];
@@ -983,6 +1003,9 @@ export async function listLatestSecurityPosture(filter: SecurityPostureFilter): 
   }
   if (filter.search) {
     latestConditions.push(ilike(devices.hostname, `%${filter.search}%`));
+  }
+  if (siteIds) {
+    latestConditions.push(inArray(devices.siteId, [...siteIds]));
   }
 
   const rows = await db
@@ -1047,6 +1070,129 @@ export async function listLatestSecurityPosture(filter: SecurityPostureFilter): 
   return hydratePostureRows(latestRows, deviceRows);
 }
 
+export interface SecurityPostureCounts {
+  total: number;
+  averageScore: number;
+  lowRiskDevices: number;
+  mediumRiskDevices: number;
+  highRiskDevices: number;
+  criticalRiskDevices: number;
+}
+
+const EMPTY_SECURITY_POSTURE_COUNTS: SecurityPostureCounts = {
+  total: 0, averageScore: 0, lowRiskDevices: 0, mediumRiskDevices: 0, highRiskDevices: 0, criticalRiskDevices: 0
+};
+
+/**
+ * A-W05 fix 1: `listLatestSecurityPosture` returns a bounded, worst-first
+ * page. Reducing a fleet summary over just that page (the old behavior)
+ * silently reports the N worst devices as the whole fleet's posture once
+ * N < the true device count. This runs the SAME scope/filter conditions
+ * with no limit/offset as a SQL aggregate, so the counts are exact over the
+ * entire filtered set regardless of page size.
+ */
+export async function getSecurityPostureCounts(filter: SecurityPostureFilter): Promise<SecurityPostureCounts> {
+  if (filter.deviceIds && filter.deviceIds.length === 0) return EMPTY_SECURITY_POSTURE_COUNTS;
+  const siteIds = normalizeSiteAllowlist(filter.siteIds);
+  if (siteIds && siteIds.length === 0) return EMPTY_SECURITY_POSTURE_COUNTS;
+
+  const scopeConditions: SQL[] = [];
+  if (filter.orgId) {
+    scopeConditions.push(eq(securityPostureSnapshots.orgId, filter.orgId));
+  } else if (filter.orgIds && filter.orgIds.length > 0) {
+    scopeConditions.push(inArray(securityPostureSnapshots.orgId, filter.orgIds));
+  }
+  if (filter.deviceIds) {
+    scopeConditions.push(inArray(securityPostureSnapshots.deviceId, [...filter.deviceIds]));
+  }
+
+  const rankedSnapshots = db
+    .select({
+      deviceId: securityPostureSnapshots.deviceId,
+      overallScore: securityPostureSnapshots.overallScore,
+      riskLevel: securityPostureSnapshots.riskLevel,
+      rn: sql<number>`row_number() over (partition by ${securityPostureSnapshots.deviceId} order by ${securityPostureSnapshots.capturedAt} desc)`.as('rn')
+    })
+    .from(securityPostureSnapshots)
+    .where(scopeConditions.length > 0 ? and(...scopeConditions) : undefined)
+    .as('ranked_security_posture_counts');
+
+  const latestConditions: SQL[] = [eq(rankedSnapshots.rn, 1)];
+  if (typeof filter.minScore === 'number') {
+    latestConditions.push(gte(rankedSnapshots.overallScore, filter.minScore));
+  }
+  if (typeof filter.maxScore === 'number') {
+    latestConditions.push(lte(rankedSnapshots.overallScore, filter.maxScore));
+  }
+  if (filter.riskLevel) {
+    latestConditions.push(eq(rankedSnapshots.riskLevel, filter.riskLevel));
+  }
+  if (filter.search) {
+    latestConditions.push(ilike(devices.hostname, `%${filter.search}%`));
+  }
+  if (siteIds) {
+    latestConditions.push(inArray(devices.siteId, [...siteIds]));
+  }
+
+  const [row] = await db
+    .select({
+      total: sql<number>`count(*)`,
+      avgScore: sql<number>`avg(${rankedSnapshots.overallScore})`,
+      low: sql<number>`count(*) filter (where ${rankedSnapshots.riskLevel} = 'low')`,
+      medium: sql<number>`count(*) filter (where ${rankedSnapshots.riskLevel} = 'medium')`,
+      high: sql<number>`count(*) filter (where ${rankedSnapshots.riskLevel} = 'high')`,
+      critical: sql<number>`count(*) filter (where ${rankedSnapshots.riskLevel} = 'critical')`,
+    })
+    .from(rankedSnapshots)
+    .innerJoin(devices, eq(devices.id, rankedSnapshots.deviceId))
+    .where(and(...latestConditions));
+
+  if (!row || Number(row.total) === 0) return EMPTY_SECURITY_POSTURE_COUNTS;
+
+  return {
+    total: Number(row.total),
+    averageScore: Math.round(Number(row.avgScore ?? 0)),
+    lowRiskDevices: Number(row.low),
+    mediumRiskDevices: Number(row.medium),
+    highRiskDevices: Number(row.high),
+    criticalRiskDevices: Number(row.critical),
+  };
+}
+
+/**
+ * Latest persisted overall posture score per device for a set of orgs — one
+ * batched query, no limit, scores only (no factor hydration). Same
+ * latest-snapshot-per-device ranking as `listLatestSecurityPosture`; used by
+ * the partner dashboard rollup (#11039). Callers pass already-authorized
+ * orgIds plus the exact device ids they display, so hidden (ephemeral, parked,
+ * decommissioned) devices never skew the score and the window only ranks
+ * snapshots of those devices.
+ */
+export async function listLatestPostureScoresByOrgs(
+  orgIds: readonly string[],
+  deviceIds: readonly string[]
+): Promise<Array<{ orgId: string; deviceId: string; overallScore: number }>> {
+  if (orgIds.length === 0 || deviceIds.length === 0) return [];
+  const ranked = db
+    .select({
+      orgId: securityPostureSnapshots.orgId,
+      deviceId: securityPostureSnapshots.deviceId,
+      overallScore: securityPostureSnapshots.overallScore,
+      rn: sql<number>`row_number() over (partition by ${securityPostureSnapshots.deviceId} order by ${securityPostureSnapshots.capturedAt} desc)`.as('rn')
+    })
+    .from(securityPostureSnapshots)
+    .where(and(
+      inArray(securityPostureSnapshots.orgId, [...orgIds]),
+      inArray(securityPostureSnapshots.deviceId, [...deviceIds])
+    ))
+    .as('ranked_partner_posture_scores');
+  const rows = await db
+    .select({ orgId: ranked.orgId, deviceId: ranked.deviceId, overallScore: ranked.overallScore })
+    .from(ranked)
+    .where(eq(ranked.rn, 1));
+  return rows.map((r) => ({ orgId: r.orgId, deviceId: r.deviceId, overallScore: Number(r.overallScore) }));
+}
+
 export async function getLatestSecurityPostureForDevice(deviceId: string): Promise<SecurityPostureItem | null> {
   const [row] = await db
     .select({
@@ -1090,12 +1236,112 @@ export async function getLatestSecurityPostureForDevice(deviceId: string): Promi
   return hydratePostureRows([row], [device])[0] ?? null;
 }
 
+type TrendScoreRow = {
+  /** Organization the snapshot (or rebuilt run) belongs to. */
+  orgId: string;
+  capturedAt: Date;
+  /** Weight across orgs within a day (#9643): the snapshot's device count. */
+  devicesAudited: number;
+  overallScore: number;
+  patchComplianceScore: number;
+  encryptionScore: number;
+  avHealthScore: number;
+  firewallScore: number;
+  openPortsScore: number;
+  passwordPolicyScore: number;
+  osCurrencyScore: number;
+  adminExposureScore: number;
+};
+
+/**
+ * One trend point per UTC day. Posture runs hourly, so an org writes many
+ * snapshots a day; each day keeps only each org's LAST snapshot of that day,
+ * and those are then device-weighted across orgs (#9643). Averaging the
+ * hourly snapshots made the latest point ("Current score") drift from the
+ * overview score, which reflects the latest posture (#9926).
+ */
+function groupTrendPoints(rows: TrendScoreRow[]): Array<Record<string, string | number>> {
+  const latestByDayAndOrg = new Map<string, Map<string, TrendScoreRow>>();
+  for (const row of rows) {
+    const day = row.capturedAt.toISOString().slice(0, 10);
+    let byOrg = latestByDayAndOrg.get(day);
+    if (!byOrg) {
+      byOrg = new Map();
+      latestByDayAndOrg.set(day, byOrg);
+    }
+    const existing = byOrg.get(row.orgId);
+    if (!existing || row.capturedAt.getTime() > existing.capturedAt.getTime()) {
+      byOrg.set(row.orgId, row);
+    }
+  }
+
+  return Array.from(latestByDayAndOrg.entries())
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([timestamp, byOrg]) => computeTrendPoint(timestamp, Array.from(byOrg.values())));
+}
+
+/**
+ * Organization snapshots carry no device or site lineage, so a site-restricted
+ * trend is rebuilt from the per-device snapshots of devices currently in an
+ * allowed site. Each posture run writes every device snapshot and the org
+ * snapshot with one `captured_at`, so grouping by (org, captured_at) yields the
+ * org snapshot that run would have written for the visible devices; those then
+ * go through the same latest-per-org daily grouping as stored org snapshots.
+ */
+async function listSiteScopedTrendRuns(
+  params: { orgId?: string; orgIds?: string[] },
+  since: Date,
+  siteIds: readonly string[],
+): Promise<TrendScoreRow[]> {
+  const conditions: SQL[] = [
+    gte(securityPostureSnapshots.capturedAt, since),
+    inArray(devices.siteId, [...siteIds]),
+  ];
+  if (params.orgId) {
+    conditions.push(eq(securityPostureSnapshots.orgId, params.orgId));
+  } else if (params.orgIds && params.orgIds.length > 0) {
+    conditions.push(inArray(securityPostureSnapshots.orgId, params.orgIds));
+  }
+
+  const avgScore = (column: AnyColumn) =>
+    sql<number>`round(avg(${column}))::int`;
+
+  return db
+    .select({
+      orgId: securityPostureSnapshots.orgId,
+      capturedAt: securityPostureSnapshots.capturedAt,
+      devicesAudited: sql<number>`count(*)::int`,
+      overallScore: avgScore(securityPostureSnapshots.overallScore),
+      patchComplianceScore: avgScore(securityPostureSnapshots.patchComplianceScore),
+      encryptionScore: avgScore(securityPostureSnapshots.encryptionScore),
+      avHealthScore: avgScore(securityPostureSnapshots.avHealthScore),
+      firewallScore: avgScore(securityPostureSnapshots.firewallScore),
+      openPortsScore: avgScore(securityPostureSnapshots.openPortsScore),
+      passwordPolicyScore: avgScore(securityPostureSnapshots.passwordPolicyScore),
+      osCurrencyScore: avgScore(securityPostureSnapshots.osCurrencyScore),
+      adminExposureScore: avgScore(securityPostureSnapshots.adminExposureScore)
+    })
+    .from(securityPostureSnapshots)
+    .innerJoin(devices, eq(devices.id, securityPostureSnapshots.deviceId))
+    .where(and(...conditions))
+    .groupBy(securityPostureSnapshots.orgId, securityPostureSnapshots.capturedAt)
+    .orderBy(desc(securityPostureSnapshots.capturedAt));
+}
+
 export async function getSecurityPostureTrend(params: {
   orgId?: string;
   orgIds?: string[];
+  /** Site allowlist: undefined = unrestricted; `[]` (or malformed) = no points. */
+  siteIds?: readonly string[];
   days: number;
 }): Promise<Array<Record<string, string | number>>> {
   const since = new Date(Date.now() - params.days * 24 * 60 * 60 * 1000);
+  const siteIds = normalizeSiteAllowlist(params.siteIds);
+  if (siteIds) {
+    if (siteIds.length === 0) return [];
+    return groupTrendPoints(await listSiteScopedTrendRuns(params, since, siteIds));
+  }
+
   const conditions = [gte(securityPostureOrgSnapshots.capturedAt, since)];
   if (params.orgId) {
     conditions.push(eq(securityPostureOrgSnapshots.orgId, params.orgId));
@@ -1105,7 +1351,9 @@ export async function getSecurityPostureTrend(params: {
 
   const rows = await db
     .select({
+      orgId: securityPostureOrgSnapshots.orgId,
       capturedAt: securityPostureOrgSnapshots.capturedAt,
+      devicesAudited: securityPostureOrgSnapshots.devicesAudited,
       overallScore: securityPostureOrgSnapshots.overallScore,
       patchComplianceScore: securityPostureOrgSnapshots.patchComplianceScore,
       encryptionScore: securityPostureOrgSnapshots.encryptionScore,
@@ -1120,25 +1368,18 @@ export async function getSecurityPostureTrend(params: {
     .where(and(...conditions))
     .orderBy(desc(securityPostureOrgSnapshots.capturedAt));
 
-  type TrendRow = typeof rows[number];
-  const grouped = new Map<string, Array<typeof rows[number]>>();
-  for (const row of rows) {
-    const day = row.capturedAt.toISOString().slice(0, 10);
-    const current = grouped.get(day) ?? [];
-    current.push(row);
-    grouped.set(day, current);
-  }
-
-  const points = Array.from(grouped.entries())
-    .sort((a, b) => a[0].localeCompare(b[0]))
-    .map(([timestamp, entries]) => computeTrendPoint(timestamp, entries as TrendRow[]));
-
-  return points;
+  return groupTrendPoints(rows);
 }
 
 export function computeTrendPoint(
   timestamp: string,
   entries: Array<{
+    /**
+     * Device count behind the snapshot. Entries are weighted by it so the
+     * book-wide trend equals the device-weighted overview score (#9643).
+     * Omitted/zero-total falls back to an equal average.
+     */
+    devicesAudited?: number;
     overallScore: number;
     patchComplianceScore: number;
     encryptionScore: number;
@@ -1166,9 +1407,13 @@ export function computeTrendPoint(
     };
   }
 
+  const weightOf = (entry: (typeof entries)[number]) => Math.max(0, Number(entry.devicesAudited ?? 1));
+  const totalWeight = entries.reduce((sum, entry) => sum + weightOf(entry), 0);
   const avg = (
-    key: keyof (typeof entries)[number]
-  ) => clampScore(entries.reduce((sum, entry) => sum + Number(entry[key] ?? 0), 0) / entries.length);
+    key: Exclude<keyof (typeof entries)[number], 'devicesAudited'>
+  ) => totalWeight > 0
+    ? clampScore(entries.reduce((sum, entry) => sum + Number(entry[key] ?? 0) * weightOf(entry), 0) / totalWeight)
+    : clampScore(entries.reduce((sum, entry) => sum + Number(entry[key] ?? 0), 0) / entries.length);
 
   const overall = avg('overallScore');
   const antivirus = avg('avHealthScore');

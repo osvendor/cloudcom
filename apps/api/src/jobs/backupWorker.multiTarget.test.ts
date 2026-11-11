@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { DispatchOutcome } from '../services/agentCommandRelay';
 
 vi.mock('../services/auditService', () => ({ createAuditLogAsync: vi.fn() }));
@@ -24,7 +24,15 @@ const mockDb = {
   insert: vi.fn(),
   update: vi.fn(),
   selectDistinct: vi.fn(),
+  transaction: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn(mockDb)),
 };
+
+// A device parked in a holding org is covered in backupWorker.test.ts; here
+// every device is an ordinary customer device.
+vi.mock('../services/unassignedPool/deliveryEligibility', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../services/unassignedPool/deliveryEligibility')>()),
+  isParkedDevice: vi.fn(async () => false),
+}));
 
 vi.mock('../db', () => ({
   db: mockDb,
@@ -69,6 +77,33 @@ const agentRelayMock = {
     async (_agentId: string, _command: { id: string }): Promise<DispatchOutcome> => ({ status: 'sent', via: 'local' }),
   ),
 };
+// Brokered write delivery is covered by backupStorageWriteDelivery.test.ts and
+// the write-session integration suites; here the helper never reports it
+// unless a test says otherwise.
+const writeDeliveryMock = vi.hoisted(() => ({
+  broker: vi.fn(async (input: { provider: string; payload: Record<string, unknown> }) => (input.provider === 'local'
+    ? { mode: 'local', reason: 'no_credential', payload: input.payload }
+    : { mode: 'refused', reason: 'insecure_endpoint', message: 'Backups to S3 storage require the storage endpoint to use HTTPS.' })),
+}));
+vi.mock('../services/backupStorageWriteDelivery', () => ({
+  brokerWorkerBackupPayload: writeDeliveryMock.broker,
+  backupWriteRefusalMessage: (reason: string) => (reason === 'mint_failed'
+    ? 'The backup was not started: a secure storage session could not be issued for it. Run the backup again.'
+    : reason),
+}));
+
+const insertQueuedCommandMock = vi.fn(async (_tx: unknown, input: { id: string }) => ({ id: input.id }));
+vi.mock('../services/commandQueueInsert', () => ({
+  insertQueuedCommandInTransaction: insertQueuedCommandMock,
+}));
+/** The (deviceId, payload) of every backup_stop the worker persisted. */
+function queuedStops() {
+  return insertQueuedCommandMock.mock.calls
+    .map(([, input]) => input as unknown as { deviceId: string; type: string; payload: Record<string, unknown> })
+    .filter((input) => input.type === 'backup_stop')
+    .map((input) => ({ deviceId: input.deviceId, payload: input.payload }));
+}
+
 vi.mock('../services/agentCommandRelay', () => ({
   isAgentConnectedAnywhere: agentRelayMock.isAgentConnectedAnywhere,
   dispatchCommandToAgent: agentRelayMock.dispatchCommandToAgent,
@@ -85,7 +120,17 @@ const DATA = {
   orgId: 'org-1',
   deviceId: 'device-1',
 };
-const CONFIG_ROW = { id: 'config-1', provider: 'local', providerConfig: {}, encryption: false };
+const LOCAL_CONFIG_ROW = { id: 'config-1', orgId: 'org-1', provider: 'local', providerConfig: {}, encryption: false };
+const S3_CONFIG_ROW = {
+  id: 'config-1',
+  orgId: 'org-1',
+  provider: 's3',
+  providerConfig: { bucket: 'bucket-a', region: 'us-east-1', endpoint: 'https://storage.example', accessKey: 'AK', secretKey: 'synthetic-secret-value' },
+  encryption: false,
+};
+let CONFIG_ROW: Record<string, unknown> = LOCAL_CONFIG_ROW;
+/** Write protocol the device's helper reported (0 = an older helper). */
+let writeProtocol: number | null = 0;
 
 /** Discovered Hyper-V VMs for this run — one dispatch target each. */
 let vmRows: Array<{ vmName: string }> = [];
@@ -135,12 +180,17 @@ function selectResult(rows: unknown[]) {
 }
 
 let currentDeviceOrgId = 'org-1';
+/** The config's approval generation as re-read immediately before a send. */
+let currentConfigGeneration = 1;
 
 function wireDb() {
   mockDb.select.mockImplementation(((cols?: Record<string, unknown>) => {
     const keys = cols ? Object.keys(cols) : [];
     if (keys.length === 1 && keys[0] === 'orgId') return selectResult([{ orgId: currentDeviceOrgId }]);
     if (keys.length === 0) return selectResult([CONFIG_ROW]); // config load
+    if (keys.length === 1 && keys[0] === 'approvalGeneration') {
+      return selectResult([{ approvalGeneration: currentConfigGeneration }]);
+    }
     if (keys.length === 1 && keys[0] === 'status') {
       if (statusCallsSinceFirstInsert !== null) statusCallsSinceFirstInsert += 1;
       const cancelled =
@@ -149,7 +199,8 @@ function wireDb() {
         statusCallsSinceFirstInsert >= cancelAfterInsertOnCheck;
       return selectResult([{ status: cancelled ? 'cancelled' : 'pending' }]);
     }
-    if (keys.length === 1 && keys[0] === 'agentId') return selectResult([{ agentId: 'agent-1' }]);
+    // device -> agent lookup + the helper protocols it reported (an older helper)
+    if (keys[0] === 'agentId') return selectResult([{ agentId: 'agent-1', backupWriteProtocolVersion: writeProtocol, backupIntegrityProtocolVersion: 0 }]);
     if (keys.includes('featureLinkId')) {
       return selectResult([{ featureLinkId: 'link-1', backupMode: 'hyperv', modeTargets: {} }]);
     }
@@ -193,6 +244,9 @@ describe('processDispatchBackup — multi-target dispatch (#4137)', () => {
     cancelAfterInsertOnCheck = null;
     vmRows = [{ vmName: 'vm-a' }, { vmName: 'vm-b' }];
     currentDeviceOrgId = 'org-1';
+    currentConfigGeneration = 1;
+    CONFIG_ROW = LOCAL_CONFIG_ROW;
+    writeProtocol = 0;
     wireDb();
     agentRelayMock.isAgentConnectedAnywhere.mockResolvedValue(true);
     agentRelayMock.dispatchCommandToAgent.mockResolvedValue({ status: 'sent', via: 'local' });
@@ -207,14 +261,53 @@ describe('processDispatchBackup — multi-target dispatch (#4137)', () => {
     }
   });
 
-  it('rechecks ownership between target sends', async () => {
+  it('fails the job and stops the sent work when the device moves while a target is being sent', async () => {
     agentRelayMock.dispatchCommandToAgent.mockImplementationOnce(async () => {
       currentDeviceOrgId = 'org-2';
       return { status: 'sent', via: 'local' };
     });
-    expect(await __testOnly.processDispatchBackup(DATA as never)).toEqual({ dispatched: true });
+    expect(await __testOnly.processDispatchBackup(DATA as never)).toEqual({ dispatched: false });
     expect(agentRelayMock.dispatchCommandToAgent).toHaveBeenCalledTimes(1);
-    expect(updatesFor('child-1').some((u) => u.payload.status === 'failed' && u.payload.errorLog === 'device_org_changed')).toBe(true);
+    // The target that did go out is stopped on the helper, by its job id.
+    expect(queuedStops()).toEqual([{ deviceId: 'device-1', payload: { reason: 'cancelled', jobId: 'job-1' } }]);
+    for (const id of ['job-1', 'child-1']) {
+      expect(updatesFor(id).some((u) => u.payload.status === 'failed' && u.payload.errorLog === 'device_org_changed')).toBe(true);
+    }
+    expect(updatesFor('job-1').some((u) => u.payload.status === 'running')).toBe(false);
+  });
+
+  it('fails a single-target job whose device moves during the send', async () => {
+    vmRows = [{ vmName: 'vm-a' }];
+    agentRelayMock.dispatchCommandToAgent.mockImplementationOnce(async () => {
+      currentDeviceOrgId = 'org-2';
+      return { status: 'sent', via: 'local' };
+    });
+    expect(await __testOnly.processDispatchBackup(DATA as never)).toEqual({ dispatched: false });
+    expect(queuedStops()).toEqual([{ deviceId: 'device-1', payload: { reason: 'cancelled', jobId: 'job-1' } }]);
+    expect(updatesFor('job-1').some((u) => u.payload.status === 'failed' && u.payload.errorLog === 'device_org_changed')).toBe(true);
+    expect(updatesFor('job-1').some((u) => u.payload.status === 'running')).toBe(false);
+  });
+
+  it('does not stop anything when the device stays put', async () => {
+    expect(await __testOnly.processDispatchBackup(DATA as never)).toEqual({ dispatched: true });
+    expect(queuedStops()).toEqual([]);
+  });
+
+  it('re-checks the config generation immediately before each send', async () => {
+    CONFIG_ROW = { ...LOCAL_CONFIG_ROW, approvalGeneration: 1 };
+    currentConfigGeneration = 2; // edited after the dispatch was prepared
+    const result = await __testOnly.processDispatchBackup({ ...DATA, configGeneration: 1 } as never);
+    expect(result).toEqual({ dispatched: false });
+    expect(agentRelayMock.dispatchCommandToAgent).not.toHaveBeenCalled();
+    expect(updatesFor('job-1').some((u) => u.payload.status === 'failed' && u.payload.errorLog === 'backup_config_changed')).toBe(true);
+  });
+
+  it('sends when the config generation is unchanged', async () => {
+    CONFIG_ROW = { ...LOCAL_CONFIG_ROW, approvalGeneration: 1 };
+    currentConfigGeneration = 1;
+    const result = await __testOnly.processDispatchBackup({ ...DATA, configGeneration: 1 } as never);
+    expect(result).toEqual({ dispatched: true });
+    expect(agentRelayMock.dispatchCommandToAgent).toHaveBeenCalledTimes(2);
   });
 
   it('creates ONE child backup_jobs row for the second target and dispatches both', async () => {
@@ -391,5 +484,69 @@ describe('processDispatchBackup — multi-target dispatch (#4137)', () => {
     expect(updatesFor('child-2')).toContainEqual(
       expect.objectContaining({ payload: expect.objectContaining({ status: 'failed' }) }),
     );
+  });
+
+  describe('write dispatch telemetry', () => {
+    const writeDispatch = vi.fn();
+    beforeEach(async () => {
+      writeDispatch.mockReset();
+      const { setBackupMetricsRecorder } = await import('../services/backupMetrics');
+      setBackupMetricsRecorder({ onWriteDispatch: writeDispatch });
+    });
+    afterEach(async () => {
+      const { setBackupMetricsRecorder } = await import('../services/backupMetrics');
+      setBackupMetricsRecorder(null);
+    });
+
+    it('counts each sent target to a local destination as a local write', async () => {
+      expect(await __testOnly.processDispatchBackup(DATA as never)).toEqual({ dispatched: true });
+      expect(writeDispatch.mock.calls).toEqual([
+        ['hyperv_backup', 'local', 'no_credential', 1],
+        ['hyperv_backup', 'local', 'no_credential', 1],
+      ]);
+    });
+
+    it('never sends an S3 target the storage destination: an older helper is refused before anything is built', async () => {
+      CONFIG_ROW = S3_CONFIG_ROW;
+      vmRows = [{ vmName: 'vm-a' }];
+      expect(await __testOnly.processDispatchBackup(DATA as never)).toEqual({ dispatched: false });
+      expect(agentRelayMock.dispatchCommandToAgent).not.toHaveBeenCalled();
+      expect(writeDeliveryMock.broker).not.toHaveBeenCalled();
+      expect(writeDispatch).not.toHaveBeenCalled();
+    });
+
+    it('counts a target for which no write session could be issued as refused, and sends nothing', async () => {
+      CONFIG_ROW = S3_CONFIG_ROW;
+      writeProtocol = 1;
+      vmRows = [{ vmName: 'vm-a' }];
+      expect(await __testOnly.processDispatchBackup(DATA as never)).toEqual({ dispatched: false });
+      expect(agentRelayMock.dispatchCommandToAgent).not.toHaveBeenCalled();
+      expect(writeDispatch.mock.calls).toEqual([['hyperv_backup', 'refused', 'insecure_endpoint', 1]]);
+    });
+
+    it('sends a brokered target with its write session and no storage destination, counted as brokered', async () => {
+      CONFIG_ROW = S3_CONFIG_ROW;
+      writeProtocol = 1;
+      vmRows = [{ vmName: 'vm-a' }];
+      writeDeliveryMock.broker.mockImplementationOnce(async (input) => {
+        const { providerConfig: _p, ...rest } = input.payload;
+        return { mode: 'brokered', reason: 'ok', payload: { ...rest, storageSession: { scope: 'snapshot_write' } } };
+      });
+      expect(await __testOnly.processDispatchBackup(DATA as never)).toEqual({ dispatched: true });
+      const sent = agentRelayMock.dispatchCommandToAgent.mock.calls[0]![1] as unknown as { payload: Record<string, unknown> };
+      expect(sent.payload.providerConfig).toBeUndefined();
+      expect(sent.payload.storageSession).toEqual({ scope: 'snapshot_write' });
+      expect(writeDispatch.mock.calls).toEqual([['hyperv_backup', 'brokered', 'ok', 1]]);
+    });
+
+    it('does not count a target that was not sent', async () => {
+      agentRelayMock.dispatchCommandToAgent
+        .mockResolvedValueOnce({ status: 'sent', via: 'local' })
+        .mockResolvedValueOnce({ status: 'offline' });
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      await __testOnly.processDispatchBackup(DATA as never);
+      warn.mockRestore();
+      expect(writeDispatch).toHaveBeenCalledTimes(1);
+    });
   });
 });

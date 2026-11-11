@@ -3,7 +3,7 @@ import type { MonitorKindSpec } from './types';
 
 type C = {
   category: 'security' | 'hardware' | 'application' | 'system';
-  level: 'warning' | 'error' | 'critical';
+  level: 'info' | 'warning' | 'error' | 'critical';
   sourcePattern?: string;
   messagePattern?: string;
   countThreshold: number;
@@ -18,6 +18,7 @@ export const eventLogKind: MonitorKindSpec<C> = {
   overridableKeys: ['countThreshold', 'windowMinutes', 'level'],
   defaultSeverity: 'medium',
   agentDelivered: false,
+  recoverySupported: true,
   titleTemplate: '{{ruleName}} on {{deviceName}}',
   messageTemplate: '{{count}} matching {{category}} events on {{deviceName}} within {{windowMinutes}} minutes',
   toAlertCondition: (c) => ({

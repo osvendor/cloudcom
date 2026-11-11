@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { reportSuspiciousMcpOrigin } from '../services/mcpIntentCreation';
 import { z } from 'zod';
 import { zValidator } from '../lib/validation';
 import { and, eq, gt, desc, inArray, isNull, ne, or } from 'drizzle-orm';
@@ -11,6 +12,7 @@ import {
 import { db, runOutsideDbContext, withSystemDbAccessContext } from '../db';
 import { authMiddleware, isInteractiveUserSession } from '../middleware/auth';
 import { approvalRequests } from '../db/schema/approvals';
+import { diagnosticAccessGrants } from '../db/schema/diagnosticAccess';
 import { aiToolExecutions, aiSessions } from '../db/schema/ai';
 import { delegantM365Connections } from '../db/schema/delegant';
 import { organizations } from '../db/schema/orgs';
@@ -138,6 +140,11 @@ type LiveAuthzIntent = Pick<
   | 'orgId'
   | 'requestedByUserId'
   | 'requestingAgentRunId'
+  // Tool catalog W04 (#5219): a FLOW-originated intent is the other
+  // requester-less shape. `isAgentIntentDecideAuthorized` dispatches on
+  // `requestingFlowRunId` and reads `toolSourceToolId` for a tenant-tool step.
+  | 'requestingFlowRunId'
+  | 'toolSourceToolId'
   | 'actionName'
   | 'arguments'
   // P2-2 (#4189): `isAgentIntentDecideAuthorized` resolves the intent's
@@ -281,7 +288,13 @@ async function isIntentRowVisibleToUser(
   // per user here; four_eyes agent rows keep the unchanged org
   // approvals:decide rule. (`!= null` on purpose: never routes a legacy row
   // whose projection lacks the column into the agent branch.)
-  if (intent.requestingAgentRunId != null) {
+  //
+  // Tool catalog W04 (#5219): a FLOW-originated intent (`requestingFlowRunId`
+  // set) is the same requester-less shape and takes the same branch —
+  // supervised → the action-and-target pool (the decide core's own branch,
+  // decideApprovalRequest.ts), four_eyes → org approvals:decide. Left on the
+  // human rule it matched `requestedByUserId (NULL) === userId` for nobody.
+  if (intent.requestingAgentRunId != null || intent.requestingFlowRunId != null) {
     if (intent.approvalScope !== 'supervised') return orgDecideAuthorizer(intent.orgId);
     return agentDecideAuthorizer(intent);
   }
@@ -508,7 +521,11 @@ function toIntentOutcome(
       errorCode: null,
       reason:
         approval.status === 'denied'
-          ? approval.decisionReason?.trim() || 'the approval was denied, so it did not run'
+          // A refused approve (the approver approved, the server refused it)
+          // reports why it was refused, not a denial by the approver.
+          ? approval.refusalReason?.trim()
+            || approval.decisionReason?.trim()
+            || 'the approval was denied, so it did not run'
           : approval.status === 'expired'
             ? 'the approval expired, so it did not run'
             : approval.status === 'reported'
@@ -1225,6 +1242,7 @@ approvalRoutes.post('/:id/report-suspicious', async (c) => {
                   actionName: actionIntents.actionName,
                   argumentDigest: actionIntents.argumentDigest,
                   source: actionIntents.source,
+                  requestingFlowRunId: actionIntents.requestingFlowRunId,
                 });
               if (cas.length === 0) {
                 return {
@@ -1252,7 +1270,12 @@ approvalRoutes.post('/:id/report-suspicious', async (c) => {
               // because task linkage is immutable.
               await publishIntentTerminalOutbox(
                 tx,
-                { id: intentId, orgId: cas[0]!.orgId, taskId: locked?.taskId ?? null },
+                {
+                  id: intentId,
+                  orgId: cas[0]!.orgId,
+                  taskId: locked?.taskId ?? null,
+                  requestingFlowRunId: cas[0]!.requestingFlowRunId,
+                },
                 'intent_rejected',
               );
 
@@ -1293,10 +1316,56 @@ approvalRoutes.post('/:id/report-suspicious', async (c) => {
       }
     } else {
       // Non-intent-linked rows (executionId-linked legacy AI mobile-push
-      // flow, or plain dev-seed/PAM rows with neither): unchanged from
-      // before this fix round — a single flip statement, plus a best-effort
-      // ai_tool_executions mirror. There is no intent/sibling fan-in for
-      // these rows, so there is nothing else to make atomic with the flip.
+      // flow, or plain dev-seed/PAM rows with neither): a single flip
+      // statement, plus a best-effort ai_tool_executions mirror. There is no
+      // intent/sibling fan-in for these rows, so there is nothing else to
+      // make atomic with the flip.
+      //
+      // The flip is a CAS on status = 'pending', like the intent branch
+      // above: a decide that committed after the pre-fetch (including an
+      // approve stored as denied because the server refused it) keeps its
+      // outcome. The report itself still revokes and audits below.
+      //
+      // A reported diagnostic access request is denied outright (and its
+      // sibling approval rows retired), the same strong DENY an intent gets.
+      if (existing.diagnosticAccessGrantId) {
+        const grantId = existing.diagnosticAccessGrantId;
+        try {
+          await runOutsideDbContext(() =>
+            withSystemDbAccessContext(async () => {
+              const now = new Date();
+              const denied = await db
+                .update(diagnosticAccessGrants)
+                .set({ status: 'denied', deniedByUserId: userId, deniedAt: now, denialReason: 'Reported as suspicious', updatedAt: now })
+                .where(and(eq(diagnosticAccessGrants.id, grantId), eq(diagnosticAccessGrants.status, 'pending_approval')))
+                .returning({ id: diagnosticAccessGrants.id });
+              if (denied.length === 0) {
+                // Lost the race to an approval: the report still ends the
+                // access, by revoking what was just activated.
+                await db
+                  .update(diagnosticAccessGrants)
+                  .set({ status: 'revoked', revokedAt: now, revokedByUserId: userId, revokeReason: 'Reported as suspicious', updatedAt: now })
+                  .where(and(eq(diagnosticAccessGrants.id, grantId), eq(diagnosticAccessGrants.status, 'active')));
+              }
+              await db
+                .update(approvalRequests)
+                .set({ status: 'expired', decidedAt: now })
+                .where(and(
+                  eq(approvalRequests.diagnosticAccessGrantId, grantId),
+                  eq(approvalRequests.status, 'pending'),
+                  ne(approvalRequests.id, existing.id),
+                ));
+            }),
+          );
+        } catch (err) {
+          // Deny FIRST and fail the report if it cannot be recorded: flipping
+          // this row alone would leave the grant pending and a sibling
+          // approver's card still able to activate it.
+          console.error('[approvals] report-suspicious: failed to deny diagnostic access request:', err);
+          captureException(err);
+          return c.json({ error: 'report_suspicious_failed', retryable: true }, 500);
+        }
+      }
       await db
         .update(approvalRequests)
         .set({
@@ -1304,7 +1373,11 @@ approvalRoutes.post('/:id/report-suspicious', async (c) => {
           decidedAt: new Date(),
           decisionReason: 'Reported as suspicious by user',
         })
-        .where(and(eq(approvalRequests.id, id), eq(approvalRequests.userId, userId)));
+        .where(and(
+          eq(approvalRequests.id, id),
+          eq(approvalRequests.userId, userId),
+          eq(approvalRequests.status, 'pending'),
+        ));
 
       // Mirror to ai_tool_executions so the SDK waiter unblocks with denial.
       //
@@ -1385,6 +1458,18 @@ approvalRoutes.post('/:id/report-suspicious', async (c) => {
     }
   }
 
+  // B-W04 (#6158, D-B35): an MCP-origin intent never sets requesting_client_id;
+  // its target is the ORIGIN credential, revoked only when this reporter owns
+  // it (otherwise the owner and approvers are notified). Null for every other
+  // intent, so today's behaviour is unchanged.
+  const mcpOriginReport = existing.intentId
+    ? await reportSuspiciousMcpOrigin(existing.intentId, userId).catch((err) => {
+      console.error('[approvals] report-suspicious: MCP origin handling failed:', err);
+      captureException(err);
+      return { credentialRevoked: false, revocationError: 'revocation_failed' as const };
+    })
+    : null;
+
   // Audit row — security.suspicious_report, tenanted to the reported approval.
   //
   // Deliberately NOT a raw `db.insert(auditLogs)` inside the request
@@ -1458,6 +1543,7 @@ approvalRoutes.post('/:id/report-suspicious', async (c) => {
         // the integer count — losing real forensic detail about how much access
         // the report actually tore down. It is a count, never a credential.
         refreshRevocationCount: refreshTokensRevoked,
+        ...(mcpOriginReport ? { mcpOriginCredentialRevoked: mcpOriginReport.credentialRevoked } : {}),
       },
       result: 'success',
     });
@@ -1471,17 +1557,30 @@ approvalRoutes.post('/:id/report-suspicious', async (c) => {
   // durable release worker is going to run it). Revocation + audit above have
   // still happened; only the "did my report land?" answer differs.
   if (intentRaceLost) {
-    return c.json({ error: 'already_decided', finalStatus: intentRaceLost.finalStatus }, 409);
+    return c.json({
+      error: 'already_decided',
+      finalStatus: intentRaceLost.finalStatus,
+      ...(mcpOriginReport ? { credentialRevoked: mcpOriginReport.credentialRevoked } : {}),
+    }, 409);
+  }
+
+  // B-W04 (#6158, D-B35): say what happened to the MCP credential.
+  if (mcpOriginReport) {
+    return c.json({ reported: true, ...mcpOriginReport }, 200);
   }
 
   return c.body(null, 204);
 });
 
 
-// The two M365 mutation tools (tier 3) that create an approval card. Read-only
+// The ten M365 mutation tools (tier 3) that create an approval card. Read-only
 // M365 tools are tier 1 and never reach this surface. Only these get a customer
 // tenant lookup so a technician sees the blast radius at a glance.
-const M365_MUTATION_TOOLS = new Set(['m365_reset_password', 'm365_disable_user']);
+const M365_MUTATION_TOOLS = new Set([
+  'm365_reset_password', 'm365_disable_user',
+  'm365_revoke_sessions', 'm365_remove_license', 'm365_assign_license', 'm365_remove_from_group',
+  'm365_add_to_group', 'm365_retire_intune_device', 'm365_create_user', 'm365_set_auto_reply',
+]);
 
 /**
  * Resolve the customer tenant display name for a set of approval rows whose

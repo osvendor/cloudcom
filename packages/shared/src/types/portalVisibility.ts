@@ -1,3 +1,4 @@
+import type { BackupHealth, ExternalBackupStatus } from './backupHealth';
 import type { ServiceTileDto } from './portalService';
 
 export type TileStatus =
@@ -97,7 +98,8 @@ export interface DashboardDto {
   securityScore: SecurityScoreTileDto;
   devicesProtected: DevicesProtectedTileDto;
   patchesApplied: PatchesAppliedTileDto;
-  backup: BackupTileDto;
+  /** Absent when the org turned portal Backups off (#9351). */
+  backup?: BackupTileDto;
   support: SupportTileDto;
   actionItems: ActionItemsTileDto;
   awaitingYou: AwaitingYouTileDto;
@@ -105,6 +107,11 @@ export interface DashboardDto {
    *  is on, so a portal that never enabled it keeps its previous payload. */
   service?: ServiceTileDto;
 }
+
+/** A dashboard tile: every DashboardDto key except the page-level asOf/timezone.
+ *  The staff Customer view keys its tile labels by this, so a new tile fails
+ *  typecheck until it has a label (#9952). */
+export type DashboardTileKey = Exclude<keyof DashboardDto, 'asOf' | 'timezone'>;
 
 export interface SecurityTrendPoint {
   capturedAt: string;
@@ -115,6 +122,10 @@ export interface ThreatSourceCounts {
   native: number;
   sentinelOne: number;
   huntress: number;
+  /** EDR provider framework W02 (#8166): managed endpoint protection, vendor-neutral.
+   *  Present only when the org's enableEdrVisibility flag is on; omitted otherwise
+   *  so a portal that never enabled it keeps its previous payload byte-for-byte. */
+  edr?: number;
 }
 
 export interface ThreatWeekDto {
@@ -178,6 +189,22 @@ export interface BackupDeviceRow {
   readinessScore: number | null;
   estimatedRtoMinutes: number | null;
   estimatedRpoMinutes: number | null;
+  /** Which product `status`/`health` come from. 'breeze' = first-party backup
+   *  (or no backup at all); a third party may ALSO back the device up — see
+   *  `providerLabel`. 'external' = only a third party backs this row up: a
+   *  managed device (`id` = device id) or a third-party row with no managed
+   *  device (`id` = `provider:<row id>`). Verification, restore-test, breach
+   *  and readiness fields are first-party facts either way. (#6012) */
+  source: 'breeze' | 'external';
+  /** The third-party product label to SHOW, already resolved server-side per
+   *  the connection's portal-name toggle (spec D5): the generic "Managed cloud
+   *  backup" unless the MSP chose to name the vendor. Null when no third-party
+   *  backup covers this row. */
+  providerLabel: string | null;
+  status: ExternalBackupStatus;
+  health: BackupHealth;
+  /** Newest successful backup across every source backing this row up. */
+  lastSuccessAt: string | null;
 }
 
 export interface BackupOverviewDto {
@@ -197,6 +224,29 @@ export interface BackupOverviewDto {
   lastTestRestoreStatus: string | null;
   readinessScoredDevices: number | null;
   readinessTotalDevices: number | null;
+  /** Rows of the device ledger by derived health — one per Breeze device
+   *  (first-party and third-party merged) plus one per unlinked third-party
+   *  row. Always zero-filled. (#6012) */
+  byHealth: Record<BackupHealth, number>;
+  /** Distinct third-party backup labels shown for this org (D5-resolved),
+   *  sorted. Empty when no third-party backup reports for the org. (#6012) */
+  externalProviders: string[];
+  /** Third-party SaaS backup (Microsoft 365 / Google Workspace), one entry per
+   *  workload. Never counted in the device totals above. Absent from producers
+   *  that predate it, so readers treat a missing array as empty. (#10600) */
+  saasWorkloads?: BackupSaasWorkloadDto[];
+}
+
+export interface BackupSaasWorkloadDto {
+  /** D5-resolved: null unless the MSP chose to name the vendor in the portal. */
+  providerLabel: string | null;
+  /** Data-source key, e.g. `m365_mail`, `gws_drive`. */
+  workload: string;
+  accountType: 'm365' | 'gws';
+  health: BackupHealth;
+  status: ExternalBackupStatus;
+  lastSuccessAt: string | null;
+  itemCount: number | null;
 }
 
 export interface BackupDevicesDto {
@@ -213,6 +263,12 @@ export interface SupportUsageTicketDto {
   toBeBilledMinutes: number;
   coveredByContractMinutes: number;
   pendingReviewMinutes: number;
+  /** Block hours W04: present only when the org's Support hours flag is on. */
+  coveredByBlockMinutes?: number;
+  /** Block hours W04: minutes past the block's entitlement. Flag-on only. */
+  overBlockMinutes?: number;
+  /** #4617: held until the customer approves it (billed quantity). Optional until the portal renders it (W04). */
+  awaitingApprovalMinutes?: number;
 }
 
 export interface SupportUsageDto {
@@ -225,8 +281,41 @@ export interface SupportUsageDto {
     toBeBilled: CountHoursDto;
     coveredByContract: CountHoursDto;
     pendingReview: CountHoursDto;
+    /** Block hours W04: present only when the org's Support hours flag is on. */
+    coveredByBlock?: CountHoursDto;
+    /** Block hours W04: hours past the block's entitlement. Flag-on only. */
+    overBlock?: CountHoursDto;
+    /** #4617: time held for the customer's approval — neither billed nor to be billed yet. */
+    awaitingApproval?: CountHoursDto;
   };
   tickets: SupportUsageTicketDto[];
+}
+
+/**
+ * Customer-safe projection of the org's live block-hours balance (block hours
+ * W04). Built by an explicit whitelist (services/portal/hourBlock.ts), never by
+ * spreading the MSP-side HourBlockEstimate: that carries unapproved hours,
+ * foreign-currency hours, late-entry hours, the line id and the alert
+ * threshold, none of which a customer should see.
+ */
+export interface PortalHourBlockDto {
+  periodStart: string;            // YYYY-MM-DD, half-open [periodStart, periodEnd)
+  periodEnd: string;
+  includedHours: number;          // the line's included hours
+  carriedInHours: number;         // rollover carried in (0 under 'none')
+  usedHours: number;              // drawn so far this period (unapproved time included)
+  remainingHours: number;         // max(0, included + carriedIn - used)
+  overageHours: number;           // max(0, used - (included + carriedIn))
+  overageRate: string;            // the contracted per-hour rate, decimal string
+  currencyCode: string;           // the contract's currency
+  billingTiming: 'advance' | 'arrears';
+}
+
+export interface PortalHourBlockResponse {
+  hourBlock: PortalHourBlockDto | null;
+  /** YYYY-MM-DD. Set (with hourBlock null) when the org's block exists but its
+   *  open period has not started yet (a block added mid-period starts next period). */
+  startsOn: string | null;
 }
 
 export interface SlaDto {
@@ -266,12 +355,18 @@ export interface PortalRunDto {
     // #5784 W06 — managed evidence, same rule. `portalRunListPredicate` has no
     // type filter, so an unwidened union here is a type lie the compiler cannot
     // see: the value comes from the database.
-    | 'identity_access_review';
+    | 'identity_access_review'
+    // #11018 W2 — managed evidence, listed once delivered, never generated here.
+    | 'ticket_sla_performance';
   name: string;
   status: 'pending' | 'running' | 'completed' | 'failed';
   startedAt: string | null;
   completedAt: string | null;
   rowCount: number | null;
+  /** True when the stored result carries tabular `rows`, i.e. the CSV artifact
+   *  can be rendered. Executive summaries have none; the CSV route 422s for
+   *  them, so the client offers CSV only when this is true. */
+  csvAvailable: boolean;
   createdAt: string;
 }
 
@@ -318,4 +413,89 @@ export type NetworkOverviewDto =
       offlineAssets: null;
       snmpDevicesPolling: null;
       monitorsDown: null;
+    };
+
+/** Mirrors alert_severity (apps/api/src/db/schema/alerts.ts); ranked critical > high > medium > low > info. */
+export type NetworkAssetAlertSeverity = 'critical' | 'high' | 'medium' | 'low' | 'info';
+
+/**
+ * Customer-safe physical placement (CPEV-W1). Exact allowlist: no ids,
+ * timestamps, authority/link state or reconciliation outcome. `siteName` is the
+ * placement authority's live site, never stored on the placement.
+ */
+export interface PhysicalPlacementDto {
+  siteName: string;
+  room: string | null;
+  rack: string | null;
+  rackUnit: number | null;
+  heightU: number | null;
+}
+
+export interface NetworkAssetRowDto {
+  id: string;
+  hostname: string | null;
+  /** Technician-set display name; often more useful than hostname, which is frequently null. */
+  label: string | null;
+  ipAddress: string | null;
+  macAddress: string | null;
+  assetType: string;
+  /** null = unverified; never conflated with offline. */
+  onlineState: 'online' | 'offline' | null;
+  lastSeenAt: string | null;
+  firstSeenAt: string;
+  manufacturer: string | null;
+  model: string | null;
+  siteName: string;
+  /**
+   * Alert/ticket enrichment (#5861 PR 3). Present -- zero-filled when the
+   * asset has no active alerts -- whenever the org's enable_network_alerts
+   * flag is on; omitted entirely (never null-filled) when the flag is off,
+   * mirroring the optional `service?` pattern on DashboardDto.
+   */
+  activeAlertCount?: number;
+  /** Highest severity among this asset's active network-monitor alerts; null when activeAlertCount is 0. */
+  highestAlertSeverity?: NetworkAssetAlertSeverity | null;
+  /** Distinct non-terminal tickets linked (via ticket_alert_links) to this asset's active alerts. */
+  openTicketCount?: number;
+  /**
+   * Present only when the org's enable_physical_placement flag is on AND the
+   * asset's placement authority holds a placement; omitted otherwise (never
+   * null-filled, no placeholder strings).
+   */
+  physicalPlacement?: PhysicalPlacementDto;
+}
+
+/** A site that has at least one portal-visible network asset (#7025). */
+export interface NetworkSiteDto {
+  id: string;
+  name: string;
+}
+
+/**
+ * Sites to offer in the per-asset table's Site filter (#7025). Only sites with
+ * portal-visible (non-dismissed) assets are listed, so every option can match
+ * rows. `not_enabled` carries an empty list, mirroring NetworkAssetsDto.
+ */
+export interface NetworkSitesDto {
+  dataStatus: 'ok' | 'not_enabled';
+  data: NetworkSiteDto[];
+}
+
+/**
+ * Customer-safe Network Visibility per-asset list (#5861, PR 2).
+ *
+ * `no_data` and `not_enabled` carry an empty list, never a partial or
+ * synthetic one, mirroring the `not_enabled`/`no_data`/`ok` contract from
+ * NetworkOverviewDto.
+ */
+export type NetworkAssetsDto =
+  | {
+      dataStatus: 'ok';
+      data: NetworkAssetRowDto[];
+      pagination: PaginationDto;
+    }
+  | {
+      dataStatus: 'no_data' | 'not_enabled';
+      data: [];
+      pagination: PaginationDto;
     };

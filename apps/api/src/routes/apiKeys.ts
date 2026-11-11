@@ -1,9 +1,10 @@
 import { Hono } from 'hono';
 import { zValidator } from '../lib/validation';
 import { z } from 'zod';
+import { mcpDomainsInputSchema, normalizeMcpDomainsInput } from '@breeze/shared';
 import { and, eq, sql, desc, inArray } from 'drizzle-orm';
 import { db } from '../db';
-import { apiKeys } from '../db/schema';
+import { apiKeys, users } from '../db/schema';
 import { authMiddleware, requireMfa, requirePermission, requireScope, type AuthContext } from '../middleware/auth';
 import { createHash, randomBytes } from 'crypto';
 import { createAuditLogAsync } from '../services/auditService';
@@ -13,6 +14,7 @@ import {
   requiredPermissionsForApiKeyScopes,
   validateApiKeyScopeDelegation,
 } from '../services/apiKeyScopes';
+import { revokeApiKey } from '../services/apiKeyRevocation';
 import { authorizeHumanApiKeyCreator } from '../services/apiKeyAuthorization';
 import { getActiveOrgTenant } from '../services/tenantStatus';
 import {
@@ -244,6 +246,17 @@ function validateRequestedScopes(c: any, scopes: string[]) {
   return { scopes: result.scopes };
 }
 
+/**
+ * True when `next` grants a key access to a tool domain `prev` did not.
+ * `null` is unrestricted, so null-from-restricted widens; a restricted `next`
+ * widens when it names any domain absent from a restricted `prev`.
+ */
+function isMcpDomainsWidening(prev: string[] | null, next: string[] | null): boolean {
+  if (prev === null) return false;
+  if (next === null) return true;
+  return next.some((d) => !prev.includes(d));
+}
+
 // ============================================
 // Validation Schemas
 // ============================================
@@ -259,14 +272,22 @@ const createApiKeySchema = z.object({
   orgId: z.string().guid(),
   name: z.string().min(1).max(255),
   scopes: z.array(z.string()).default([]),
-  expiresAt: z.string().datetime().nullable().optional(),
-  rateLimit: z.number().int().min(1).max(100000).nullable().optional().transform(v => v ?? 1000)
+  // A real ISO timestamp (a bare YYYY-MM-DD is rejected; the web form
+  // normalises its date picker to end-of-day local time, #9654) that is still
+  // in the future — minting an already-expired credential is always a mistake.
+  expiresAt: z.string().datetime()
+    .refine((v) => new Date(v).getTime() > Date.now(), { message: 'expiresAt must be in the future' })
+    .nullable()
+    .optional(),
+  rateLimit: z.number().int().min(1).max(100000).nullable().optional().transform(v => v ?? 1000),
+  mcpDomains: mcpDomainsInputSchema.optional()
 });
 
 const updateApiKeySchema = z.object({
   name: z.string().min(1).max(255).optional(),
   scopes: z.array(z.string()).optional(),
-  rateLimit: z.number().int().min(1).max(100000).optional()
+  rateLimit: z.number().int().min(1).max(100000).optional(),
+  mcpDomains: mcpDomainsInputSchema.optional()
 });
 
 // ============================================
@@ -351,7 +372,8 @@ apiKeyRoutes.get(
         createdAt: apiKeys.createdAt,
         updatedAt: apiKeys.updatedAt,
         status: apiKeys.status,
-        source: apiKeys.source
+        source: apiKeys.source,
+        mcpDomains: apiKeys.mcpDomains
       })
       .from(apiKeys)
       .where(whereCondition)
@@ -405,6 +427,46 @@ apiKeyRoutes.post(
     // Generate the API key
     const { fullKey, keyPrefix, keyHash } = generateApiKey();
 
+    // This route only ever mints human-delegated keys (principalType
+    // defaults to 'human'; service-principal keys are minted through
+    // routes/partnerServicePrincipals.ts and never carry a creator epoch).
+    // Snapshot the creator's credential-state epochs so a password
+    // change/reset (credential_epoch) or an MFA factor change (mfa_epoch)
+    // after this moment invalidates the key — enforced in
+    // apiKeyAuthMiddleware. The key binds to credential_epoch, NOT auth_epoch:
+    // auth_epoch also advances on ordinary logout, which must not kill a
+    // user's API keys (#7489).
+    //
+    // authMiddleware already validated the token's aep/mep against the live
+    // row; credential_epoch is not a token claim, so read it here, guarded on
+    // those same session epochs. A credential change always advances
+    // auth_epoch too, so the guard can never hand back a credential epoch
+    // newer than this session: a change that commits before this read fails
+    // the guard, and one that commits after it leaves the key stamped with
+    // the old value, which apiKeyAuthMiddleware then rejects.
+    const creatorAuthEpoch = auth.token?.aep;
+    const creatorMfaEpoch = auth.token?.mep;
+    if (typeof creatorAuthEpoch !== 'number' || typeof creatorMfaEpoch !== 'number') {
+      // Unreachable through authMiddleware, which rejects any access token
+      // without numeric aep/mep. Reaching it means an auth path skipped that
+      // gate — refuse rather than mint a key no epoch check would ever bind.
+      console.warn('[api-keys] refused mint: request token carries no epoch claims', { userId: auth.user.id });
+      return c.json({ error: 'Session is no longer valid. Sign in again.' }, 401);
+    }
+    const [liveCreator] = await db
+      .select({ credentialEpoch: users.credentialEpoch })
+      .from(users)
+      .where(and(
+        eq(users.id, auth.user.id),
+        eq(users.status, 'active'),
+        eq(users.authEpoch, creatorAuthEpoch),
+        eq(users.mfaEpoch, creatorMfaEpoch),
+      ))
+      .limit(1);
+    if (!liveCreator) {
+      return c.json({ error: 'Session is no longer valid. Sign in again.' }, 401);
+    }
+
     // Create the API key record
     const [apiKey] = await db
       .insert(apiKeys)
@@ -416,8 +478,12 @@ apiKeyRoutes.post(
         scopes: scopeValidation.scopes,
         expiresAt: data.expiresAt ? new Date(data.expiresAt) : null,
         rateLimit: data.rateLimit,
+        mcpDomains: normalizeMcpDomainsInput(data.mcpDomains ?? null),
         createdBy: auth.user.id,
-        status: 'active'
+        status: 'active',
+        creatorAuthEpoch,
+        creatorMfaEpoch,
+        creatorCredentialEpoch: liveCreator.credentialEpoch,
       })
       .returning();
 
@@ -433,7 +499,8 @@ apiKeyRoutes.post(
       details: {
         scopes: apiKey.scopes,
         rateLimit: apiKey.rateLimit,
-        expiresAt: apiKey.expiresAt
+        expiresAt: apiKey.expiresAt,
+        mcpDomains: apiKey.mcpDomains ?? null
       }
     });
 
@@ -447,6 +514,7 @@ apiKeyRoutes.post(
       scopes: apiKey.scopes,
       expiresAt: apiKey.expiresAt,
       rateLimit: apiKey.rateLimit,
+      mcpDomains: apiKey.mcpDomains ?? null,
       createdBy: apiKey.createdBy,
       createdAt: apiKey.createdAt,
       status: apiKey.status,
@@ -481,7 +549,8 @@ apiKeyRoutes.get(
         createdAt: apiKeys.createdAt,
         updatedAt: apiKeys.updatedAt,
         status: apiKeys.status,
-        source: apiKeys.source
+        source: apiKeys.source,
+        mcpDomains: apiKeys.mcpDomains
       })
       .from(apiKeys)
       .where(eq(apiKeys.id, keyId))
@@ -558,6 +627,21 @@ apiKeyRoutes.patch(
       updates.scopes = scopeValidation.scopes;
     }
     if (data.rateLimit !== undefined) updates.rateLimit = data.rateLimit;
+    const previousMcpDomains = existingKey.mcpDomains ?? null;
+    let nextMcpDomains: string[] | null = previousMcpDomains;
+    if (data.mcpDomains !== undefined) {
+      nextMcpDomains = normalizeMcpDomainsInput(data.mcpDomains);
+      // Widening the domain set expands what the key can reach, so the updater
+      // must be able to delegate the key's STORED scopes (narrowing needs no
+      // extra check). Same denial the create path returns.
+      if (isMcpDomainsWidening(previousMcpDomains, nextMcpDomains)) {
+        const widenValidation = validateRequestedScopes(c, existingKey.scopes ?? []);
+        if ('response' in widenValidation) {
+          return widenValidation.response;
+        }
+      }
+      updates.mcpDomains = nextMcpDomains;
+    }
 
     const [updated] = await db
       .update(apiKeys)
@@ -576,7 +660,8 @@ apiKeyRoutes.patch(
         createdBy: apiKeys.createdBy,
         createdAt: apiKeys.createdAt,
         updatedAt: apiKeys.updatedAt,
-        status: apiKeys.status
+        status: apiKeys.status,
+        mcpDomains: apiKeys.mcpDomains
       });
 
     if (updated) {
@@ -588,7 +673,11 @@ apiKeyRoutes.patch(
         details: {
           changedFields: Object.keys(data),
           scopes: updated.scopes,
-          rateLimit: updated.rateLimit
+          rateLimit: updated.rateLimit,
+          // Only when the caller touched the field; mirrors changedFields.
+          ...(data.mcpDomains !== undefined
+            ? { mcpDomains: { previous: previousMcpDomains, next: nextMcpDomains } }
+            : {})
         }
       });
     }
@@ -636,33 +725,12 @@ apiKeyRoutes.delete(
     if (ceilingDenial) return ceilingDenial.response;
 
     // Soft delete by setting status to revoked
-    const [revoked] = await db
-      .update(apiKeys)
-      .set({
-        status: 'revoked',
-        updatedAt: new Date()
-      })
-      .where(eq(apiKeys.id, keyId))
-      .returning({
-        id: apiKeys.id,
-        name: apiKeys.name,
-        keyPrefix: apiKeys.keyPrefix,
-        status: apiKeys.status,
-        updatedAt: apiKeys.updatedAt
-      });
-
-    if (revoked) {
-      writeApiKeyAudit(c, auth, {
-        orgId: existingKey.orgId,
-        action: 'api_key.revoke',
-        keyId: existingKey.id,
-        keyName: revoked.name,
-        details: {
-          keyPrefix: revoked.keyPrefix,
-          previousStatus: existingKey.status
-        }
-      });
-    }
+    const { apiKey: revoked } = await revokeApiKey(keyId, auth.user.id, 'api_key.delete', {
+      existing: { orgId: existingKey.orgId, status: existingKey.status },
+      actorEmail: auth.user.email,
+      ipAddress: getTrustedClientIpOrUndefined(c),
+      userAgent: c.req.header('user-agent'),
+    });
 
     return c.json({
       success: true,
@@ -705,10 +773,54 @@ apiKeyRoutes.post(
       return c.json({ error: `Cannot rotate ${existingKey.status} API key` }, 400);
     }
 
+    // Rotation re-mints the secret but keeps `created_by`, the identity whose
+    // live permissions the key acts with (apiKeyAuth for human keys; over MCP,
+    // buildAuthFromApiKey resolves per-tool permissions from `created_by` for
+    // service-principal keys too). So only that creator may rotate it; anyone
+    // else with access to the org can still revoke it. A service principal's
+    // key is rotated from the service principal itself
+    // (/service-principals/:id/rotate), which issues the new key under the
+    // rotating admin.
+    if (existingKey.createdBy !== auth.user.id) {
+      return c.json({
+        error: 'Only the API key\'s creator can rotate it. Revoke it and create a new key instead.',
+        code: 'API_KEY_CREATOR_REQUIRED',
+      }, 403);
+    }
+
     // §1.4 delegation ceiling: org access is not key access. Runs BEFORE any
     // secret is generated or written.
     const ceilingDenial = await enforceApiKeyDelegationCeiling(c, auth, existingKey);
     if (ceilingDenial) return ceilingDenial.response;
+
+    // A rotated human key is a fresh mint from this session, so re-bind it to
+    // the creator's current session and credential state exactly as POST /
+    // does (same guarded read and the same reasons). Service-principal keys
+    // never carry creator epochs.
+    const isServicePrincipalKey = existingKey.principalType === 'service' && !!existingKey.principalId;
+    let creatorEpochs: { creatorAuthEpoch: number; creatorMfaEpoch: number; creatorCredentialEpoch: number } | null = null;
+    if (!isServicePrincipalKey) {
+      const creatorAuthEpoch = auth.token?.aep;
+      const creatorMfaEpoch = auth.token?.mep;
+      if (typeof creatorAuthEpoch !== 'number' || typeof creatorMfaEpoch !== 'number') {
+        console.warn('[api-keys] refused rotation: request token carries no epoch claims', { userId: auth.user.id });
+        return c.json({ error: 'Session is no longer valid. Sign in again.' }, 401);
+      }
+      const [liveCreator] = await db
+        .select({ credentialEpoch: users.credentialEpoch })
+        .from(users)
+        .where(and(
+          eq(users.id, auth.user.id),
+          eq(users.status, 'active'),
+          eq(users.authEpoch, creatorAuthEpoch),
+          eq(users.mfaEpoch, creatorMfaEpoch),
+        ))
+        .limit(1);
+      if (!liveCreator) {
+        return c.json({ error: 'Session is no longer valid. Sign in again.' }, 401);
+      }
+      creatorEpochs = { creatorAuthEpoch, creatorMfaEpoch, creatorCredentialEpoch: liveCreator.credentialEpoch };
+    }
 
     // Generate new key
     const { fullKey, keyPrefix, keyHash } = generateApiKey();
@@ -719,6 +831,7 @@ apiKeyRoutes.post(
       .set({
         keyHash,
         keyPrefix,
+        ...(creatorEpochs ?? {}),
         updatedAt: new Date(),
         // Reset usage stats on rotation (optional - could preserve them)
         usageCount: 0,
@@ -736,7 +849,8 @@ apiKeyRoutes.post(
         createdBy: apiKeys.createdBy,
         createdAt: apiKeys.createdAt,
         updatedAt: apiKeys.updatedAt,
-        status: apiKeys.status
+        status: apiKeys.status,
+        mcpDomains: apiKeys.mcpDomains
       });
 
     if (rotated) {
@@ -748,7 +862,8 @@ apiKeyRoutes.post(
         details: {
           keyPrefix: rotated.keyPrefix,
           previousKeyPrefix: existingKey.keyPrefix,
-          resetUsageCount: true
+          resetUsageCount: true,
+          mcpDomains: rotated.mcpDomains ?? null
         }
       });
     }

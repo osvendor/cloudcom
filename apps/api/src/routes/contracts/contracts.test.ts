@@ -16,6 +16,7 @@ vi.mock('../../services/contractService', () => ({
     ...(audit.changedFields !== undefined ? { changedFields: audit.changedFields } : {}),
     ...(audit.oldUnitPrice !== undefined ? { oldUnitPrice: audit.oldUnitPrice } : {}),
     ...(audit.newUnitPrice !== undefined ? { newUnitPrice: audit.newUnitPrice } : {}),
+    ...(audit.retired !== undefined ? { retired: audit.retired } : {}),
   })),
   activateContract: vi.fn(),
   pauseContract: vi.fn(),
@@ -91,7 +92,7 @@ describe('contract crud routes', () => {
   beforeEach(() => vi.clearAllMocks());
 
   it('POST / creates a draft contract', async () => {
-    (svc.createContract as any).mockResolvedValue({ id: CONTRACT_ID, status: 'draft' });
+    (svc.createContract as any).mockResolvedValue({ id: CONTRACT_ID, orgId: ORG_ID, name: 'Monthly Managed Services', status: 'draft' });
     const res = await app().request('/', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -108,6 +109,9 @@ describe('contract crud routes', () => {
     expect(body.data.id).toBe(CONTRACT_ID);
     expect(body.data.status).toBe('draft');
     expect(svc.createContract).toHaveBeenCalledOnce();
+    expect(writeRouteAudit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      orgId: ORG_ID, action: 'contract.create', resourceType: 'contract', resourceId: CONTRACT_ID,
+    }));
   });
 
   it('POST / rejects an invalid body (missing required fields → 400, no service call)', async () => {
@@ -135,7 +139,9 @@ describe('contract crud routes', () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.data.id).toBe(CONTRACT_ID);
-    expect(svc.getContract).toHaveBeenCalledWith(CONTRACT_ID, expect.anything());
+    // #9303: the contract page reads the org's other contracts for its
+    // double-billing notice; only this route opts in.
+    expect(svc.getContract).toHaveBeenCalledWith(CONTRACT_ID, expect.anything(), { includeRelated: true });
   });
 
   it('PATCH /:id updates a contract', async () => {
@@ -162,12 +168,15 @@ describe('contract crud routes', () => {
   });
 
   it('DELETE /:id deletes a draft contract', async () => {
-    (svc.deleteDraftContract as any).mockResolvedValue(undefined);
+    (svc.deleteDraftContract as any).mockResolvedValue({ id: CONTRACT_ID, orgId: ORG_ID, name: 'Monthly Managed Services' });
     const res = await app().request(`/${CONTRACT_ID}`, { method: 'DELETE' });
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.data.ok).toBe(true);
     expect(svc.deleteDraftContract).toHaveBeenCalledWith(CONTRACT_ID, expect.anything());
+    expect(writeRouteAudit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      orgId: ORG_ID, action: 'contract.delete', resourceType: 'contract', resourceId: CONTRACT_ID,
+    }));
   });
 
   it('maps a ContractServiceError to its status (CONTRACT_NOT_FOUND → 404)', async () => {
@@ -244,6 +253,57 @@ describe('contract line routes', () => {
       expect((await post(bad)).status).toBe(400);
     }
     expect(svc.addContractLineToContract).toHaveBeenCalledTimes(1);
+  });
+
+  it('POST /:id/lines accepts a valid block and 400s on each violation, with no service call (#4547 W03)', async () => {
+    (svc.addContractLineToContract as any).mockResolvedValue({ id: LINE_ID, orgId: ORG_ID, lineType: 'hour_block', unitPrice: '1000.00', contractName: 'Acme' });
+    const post = (body: unknown) => app().request(`/${CONTRACT_ID}/lines`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+    });
+    const ok = {
+      lineType: 'hour_block', description: 'Support block', unitPrice: '1000.00', taxable: false,
+      includedQuantity: '10', overageMode: 'bill', overageUnitPrice: '150.00', rolloverPolicy: 'none',
+    };
+    expect((await post(ok)).status).toBe(200);
+    expect(svc.addContractLineToContract).toHaveBeenCalledTimes(1);
+    for (const bad of [
+      { ...ok, overageMode: 'flag', overageUnitPrice: undefined },
+      { ...ok, rolloverPolicy: undefined },
+      { ...ok, rolloverPolicy: 'none', rolloverCapHours: '4' },
+      { ...ok, hourBlockAlertPct: 101 },
+      { ...ok, siteId: ORG_ID },
+    ]) expect((await post(bad)).status).toBe(400);
+    expect(svc.addContractLineToContract).toHaveBeenCalledTimes(1);
+  });
+
+  it('POST maps a duplicate live block to 409 HOUR_BLOCK_EXISTS', async () => {
+    (svc.addContractLineToContract as any).mockRejectedValue(new ContractServiceError('exists', 409, 'HOUR_BLOCK_EXISTS'));
+    const res = await app().request(`/${CONTRACT_ID}/lines`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ lineType: 'hour_block', description: 'b', unitPrice: '1.00', taxable: false, includedQuantity: '1', overageMode: 'bill', overageUnitPrice: '1.00', rolloverPolicy: 'none' }),
+    });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ code: 'HOUR_BLOCK_EXISTS' });
+  });
+
+  it('PATCH rejects the server-stamped columns (strict) and maps HOUR_BLOCK_FIELD_LOCKED to 400', async () => {
+    const patch = (body: unknown) => app().request(`/${CONTRACT_ID}/lines/${LINE_ID}`, {
+      method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+    });
+    for (const key of ['hourBlockFirstPeriodStart', 'hourBlockRetiredAt']) {
+      const res = await patch({ [key]: '2020-01-01' });
+      expect(res.status).toBe(400);
+      expect(await res.json()).toMatchObject({ code: 'HOUR_BLOCK_FIELD_LOCKED', details: { fields: [key] } });
+    }
+    expect(svc.updateContractLine).not.toHaveBeenCalled();
+    // an unrelated unknown key is still the ordinary validation 400 (no code)
+    const other = await patch({ lineType: 'flat' });
+    expect(other.status).toBe(400);
+    expect(await other.json()).not.toHaveProperty('code');
+    (svc.updateContractLine as any).mockRejectedValueOnce(new ContractServiceError('locked', 400, 'HOUR_BLOCK_FIELD_LOCKED'));
+    const locked = await patch({ overageMode: 'flag' });
+    expect(locked.status).toBe(400);
+    expect(await locked.json()).toMatchObject({ code: 'HOUR_BLOCK_FIELD_LOCKED' });
   });
 
   it('POST /:id/lines rejects a per_device_role line without deviceRoles (400, no service call)', async () => {
@@ -361,10 +421,22 @@ describe('contract line routes', () => {
     });
     const res = await app().request(`/${CONTRACT_ID}/lines/${LINE_ID}`, { method: 'DELETE' });
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ data: { ok: true } });
+    expect(await res.json()).toEqual({ data: { ok: true, retired: false } });
     expect(svc.removeContractLine).toHaveBeenCalledWith(CONTRACT_ID, LINE_ID, expect.anything());
     expect((writeRouteAudit as any).mock.calls[0][1]).toMatchObject({
       action: 'contract.line.removed', details: { contractLineId: LINE_ID, lineType: 'per_seat' },
+    });
+  });
+
+  it('DELETE reports { ok: true, retired: true } for a retired block and audits it (#4547 W03)', async () => {
+    (svc.removeContractLine as any).mockResolvedValue({
+      orgId: ORG_ID, contractId: CONTRACT_ID, contractName: 'Acme MSA', contractLineId: LINE_ID, lineType: 'hour_block', retired: true,
+    });
+    const res = await app().request(`/${CONTRACT_ID}/lines/${LINE_ID}`, { method: 'DELETE' });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ data: { ok: true, retired: true } });
+    expect((writeRouteAudit as any).mock.calls[0][1]).toMatchObject({
+      action: 'contract.line.removed', details: { lineType: 'hour_block', retired: true },
     });
   });
 
@@ -648,4 +720,11 @@ describe('POST /:id/currency — permission evidence + error details (#3778)', (
     expect(res.status).toBe(400);
     expect(svc.changeContractCurrency).not.toHaveBeenCalled();
   });
+});
+
+it('PATCH accepts boolean autopay exclusion and rejects nonboolean',async()=>{
+ vi.mocked(svc.updateContract).mockResolvedValue({id:CONTRACT_ID} as never);
+ const res=await app().request(`/${CONTRACT_ID}`,{method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify({autopayExcluded:true})});
+ expect(res.status).toBe(200);expect(svc.updateContract).toHaveBeenLastCalledWith(CONTRACT_ID,expect.objectContaining({autopayExcluded:true}),expect.anything());
+ expect((await app().request(`/${CONTRACT_ID}`,{method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify({autopayExcluded:'true'})})).status).toBe(400);
 });

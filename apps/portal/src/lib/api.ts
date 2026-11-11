@@ -7,7 +7,9 @@ import { navigateTo } from './navigation';
 // Invoice-domain enum SSOT lives in @breeze/shared (billing-enums.ts). Imported
 // into local scope for the InvoiceSummary/InvoiceDetail types below and re-exported
 // (type-only, erased at build) so '@/lib/api' consumers are unaffected.
-import type { BackupDevicesDto, BackupOverviewDto, DashboardDto, DocumentPageSize, DocumentThemeId, EnrichedPortalDevice, InvoiceStatus, NetworkOverviewDto, PublicQuoteCoverPage, PublicQuoteHeader, QuotePresentation, SecurityDevicesDto, SecurityOverviewDto, SlaDto, SupportUsageDto, TicketFormField } from '@breeze/shared';
+import type { BackupDevicesDto, BackupOverviewDto, DashboardDto, DeviceStatus, DocumentPageSize, DocumentThemeId, EnrichedPortalDevice, InvoiceStatus, NetworkAssetsDto, NetworkOverviewDto, NetworkSitesDto, PortalHourBlockResponse, PublicQuoteCoverPage, PublicQuoteHeader, QuotePresentation, SecurityDevicesDto, SecurityOverviewDto, SlaDto, SupportUsageDto, TicketFormField, TicketType } from '@breeze/shared';
+import { lineWorkedVsBilled } from '@breeze/shared';
+import type { TrustPagePublicPayloadAny } from '@breeze/shared';
 import type { HardwareLifecycleSummary, PortalRunDto, PortalRunsDto } from '@breeze/shared';
 import type { PortalDocumentsDto, PortalOccurrencesDto, PortalServiceOverviewDto } from '@breeze/shared';
 
@@ -136,12 +138,14 @@ export function buildPortalApiUrl(path: string): string {
 export function buildServerForwardHeaders(request: Request): Headers {
   const headers = new Headers();
   const cookie = request.headers.get('cookie');
-  const host = request.headers.get('host');
   const forwardedHost = request.headers.get('x-forwarded-host');
   const forwardedProto = request.headers.get('x-forwarded-proto');
 
   if (cookie) headers.set('cookie', cookie);
-  if (host) headers.set('host', host);
+  // No Host (#9700): undici drops a caller-set Host, so the API always sees the
+  // INTERNAL_API_URL host, which its FORCE_HTTPS internal-service exemption
+  // keys on. The forwarded headers below are ignored by the API unless the
+  // caller is a trusted proxy (it is not).
   if (forwardedHost) headers.set('x-forwarded-host', forwardedHost);
   if (forwardedProto) headers.set('x-forwarded-proto', forwardedProto);
 
@@ -170,6 +174,9 @@ export interface ApiResponse<T> {
    *  branding so a replaced proposal can show a branded notice instead of a bare
    *  failure. */
   errorData?: unknown;
+  /** The `details` object of an error body: a refusal's structured reason when the
+   *  `code` alone is shared by several refusals (e.g. COLLECTION_IN_PROGRESS). */
+  errorDetails?: Record<string, unknown>;
   statusCode?: number;
   headers?: Headers;
 }
@@ -242,6 +249,7 @@ export async function apiRequest<T>(
         error: body?.error || 'That didn\'t go through. Nothing was lost — try again in a moment.',
         code: typeof body?.code === 'string' ? body.code : undefined,
         errorData: body?.data,
+        errorDetails: body?.details && typeof body.details === 'object' && !Array.isArray(body.details) ? body.details : undefined,
         statusCode: response.status,
         headers: response.headers
       };
@@ -297,6 +305,16 @@ export async function apiPatch<T>(
   }, config);
 }
 
+/** Mirrors networkAssetsQuerySchema (apps/api/src/routes/portal/schemas.ts). */
+export type NetworkAssetStatusFilter = 'online' | 'offline' | 'unverified';
+export interface NetworkAssetsParams {
+  page?: number;
+  limit?: number;
+  siteId?: string;
+  assetType?: string;
+  status?: NetworkAssetStatusFilter;
+}
+
 export interface Pagination {
   page: number;
   limit: number;
@@ -339,6 +357,11 @@ export interface TicketSummary {
   subject: string;
   status: TicketStatus;
   priority: TicketPriority;
+  /**
+   * Read-only classification (#8596), shown as a quiet label. Optional: an
+   * older API omits it, and the portal can never set it.
+   */
+  ticketType?: TicketType;
   createdAt: string;
   updatedAt: string;
   sla: SlaDto;
@@ -374,6 +397,11 @@ export interface TicketComment {
    * on an 'email' comment is the only signal that the CUSTOMER wrote it.
    */
   senderPortalUserId?: string | null;
+  /**
+   * Set on a comment imported from another helpdesk (#8313): who wrote it
+   * there. 'requester' is the customer's own reply, which has no portal login.
+   */
+  originalAuthorKind?: 'staff' | 'requester' | null;
   content: string;
   createdAt: string;
   /** Absent on a reply the customer just posted locally. */
@@ -396,6 +424,22 @@ export interface TicketDetails extends TicketSummary {
   comments: TicketComment[];
 }
 
+/**
+ * A request of the viewer's that staff merged into another ticket (#8972, spec
+ * §6.1). `mergedInto` is set only while the viewer may read that ticket;
+ * `survivorDeleted` means it was deleted since, and nothing else of it is sent.
+ */
+export interface PortalMergedTicket {
+  merged: true;
+  // ticketNumber is always present from a current API; optional so a payload
+  // from an older API (which sent internalNumber instead) still type-checks.
+  mergedInto: { id: string; ticketNumber?: string } | null;
+  mergedAt: string | null;
+  survivorDeleted: boolean;
+}
+
+export type PortalTicketDetailResult = TicketDetails | PortalMergedTicket;
+
 // Slim portal-visible intake form (Phase 2). Mirrors the `GET /portal/tickets/forms`
 // payload — no titleTemplate (the server composes the subject) and no showInPortal
 // (the route already filtered to portal-visible forms).
@@ -412,12 +456,12 @@ export interface PortalTicketForm {
 // payload. On the form path the subject/description are composed server-side, so
 // no `subject` key is sent (an optional free-text `description` may still ride along).
 export type CreateTicketInput =
-  | { subject: string; description: string; priority: TicketPriority }
+  | { subject: string; description: string; priority?: TicketPriority }
   | {
       formId: string;
       formResponses: Record<string, unknown>;
       description?: string;
-      priority: TicketPriority;
+      priority?: TicketPriority;
     };
 
 export interface Asset {
@@ -425,13 +469,24 @@ export interface Asset {
   hostname: string;
   displayName: string | null;
   osType: string | null;
-  status: 'online' | 'offline' | 'warning';
+  /** `devices.status` — the `device_status` enum; there is no 'warning'. */
+  status: DeviceStatus;
   lastSeenAt: string | null;
 }
 
 // Re-export the shared InvoiceStatus (imported at the top of this file) so portal
 // components keep importing it from '@/lib/api' unchanged.
 export type { InvoiceStatus, PublicQuoteHeader };
+
+/** Branding on a customer document payload (mirrors `CustomerDocumentBrandingDto`). */
+export interface CustomerDocumentBranding {
+  partnerName: string | null;
+  contactEmail?: string | null;
+  logoUrl: string | null;
+  primaryColor: string | null;
+  theme: DocumentThemeId;
+  pageSize: DocumentPageSize;
+}
 
 export interface InvoiceSummary {
   id: string;
@@ -471,6 +526,8 @@ export interface SellerSnapshot {
 }
 
 export interface InvoiceLine {
+  /** The invoice_lines id: an opaque row key (the document's `document-line-*-<id>` test ids). */
+  id: string;
   ticketNumber: string | null;
   ticketCategory?: string | null;
   /** Line title; NULL on legacy lines where `description` holds the title (#3319). */
@@ -485,6 +542,9 @@ export interface InvoiceLine {
    *  non-time-entry lines and legacy rows predating the column; optional
    *  because older test fixtures and API responses predate the field. */
   workedMinutes?: number | null;
+  /** #8604: the partner-local day (YYYY-MM-DD) the line was worked. Non-null only
+   *  when the invoice prints dates and the line is a dated time-entry line. */
+  workDate?: string | null;
 }
 
 /** #6467 — one line naming the worked time whenever it differs from the
@@ -495,14 +555,31 @@ export interface InvoiceLine {
  *  on this page — the note is plain English; that gap is pre-existing and
  *  portal-wide, not specific to this note. */
 export function lineWorkedVsBilledNote(l: { quantity: string; workedMinutes?: number | null }): string | null {
-  if (l.workedMinutes == null) return null;
-  const worked = (l.workedMinutes / 60).toFixed(2);
-  const billed = Number(l.quantity).toFixed(2);
-  if (worked === billed) return null;
-  return `${worked} h worked · ${billed} h billed`;
+  const wb = lineWorkedVsBilled(l);
+  return wb ? `${wb.worked} h worked · ${wb.billed} h billed` : null;
 }
 
+import type {InvoiceAutopayOffer as InvoiceAutopayDisclosure} from '@breeze/shared';
+export type {InvoiceAutopayOffer as InvoiceAutopayDisclosure} from '@breeze/shared';
+export interface SaveForAutopayInput { saveForAutopay: boolean; consentAccepted?: true; disclosureHash?: string }
+
+export function invoiceAutopayInput(saveForAutopay: boolean, disclosure?: InvoiceAutopayDisclosure | null): SaveForAutopayInput {
+  return saveForAutopay && disclosure?.eligible
+    ? { saveForAutopay: true, consentAccepted: true, disclosureHash: disclosure.disclosureHash }
+    : { saveForAutopay: false };
+}
+
+import type { AutopayConfirmationRelease, BankAutopayOffer, BankPayInput, InvoicePayResult } from '@breeze/shared';
+export type { AutopayConfirmationRelease, BankAutopayOffer, BankPayInput, InvoicePayResult } from '@breeze/shared';
+
+import type { CustomerInvoiceAutopayStatus } from '@breeze/shared';
 export interface InvoiceDetail {
+  bankAutopay?: BankAutopayOffer | null;
+  autopay?: InvoiceAutopayDisclosure | null;
+  /** D-4: how this invoice will be paid automatically, if it will be. */
+  autopayStatus?: CustomerInvoiceAutopayStatus | null;
+  /** Automatic payments are on with a usable method: the page offers no setup. */
+  autopayEnrolled?: boolean;
   // The detail header is a separate serialization boundary on the API and
   // does not carry the list's derived `title`.
   invoice: Omit<InvoiceSummary, 'title'> & {
@@ -513,12 +590,29 @@ export interface InvoiceDetail {
     notes: string | null;
     sellerSnapshot?: SellerSnapshot | null;
     termsAndConditions?: string | null;
+    /** #8604: resolved line grouping; 'day' only when dates are on. */
+    lineGrouping?: 'entry' | 'day';
+    /** The status pill the customer sees (never 'draft'); #9414. */
+    displayStatus: Exclude<InvoiceStatus, 'draft'> | null;
+    billToAddress?: SellerSnapshot['address'];
+    billToTaxId?: string | null;
+    /** The short document terms line (invoices.terms). */
+    terms?: string | null;
   };
   lines: InvoiceLine[];
-  /** Partner branding for the document shell, matching QuoteDetail. Optional:
-   *  older API responses and fixtures predate it, in which case the view falls
-   *  back to GET /portal/branding. */
-  branding?: QuoteBranding;
+  /** `invoice.documentLocale ?? partner locale ?? 'en'` — the language the document prints in. */
+  documentLocale: string;
+  /** Partner branding for the document (theme and page size are the invoice's frozen
+   *  presentation, D14). Optional only for API responses that predate it, in which
+   *  case the view falls back to GET /portal/branding. */
+  branding?: CustomerDocumentBranding;
+  /** #7509: whether the partner can take online payment. `false` hides the Pay
+   *  CTA; absent (older API / fixtures) is treated as available — the pay route
+   *  still 409s as the backstop. */
+  onlinePaymentAvailable?: boolean;
+  /** #7824: server-side autopay collection in flight (same reservation the pay
+   *  route's 409 uses). Non-null disables the Pay button; null/absent = none. */
+  collectionInProgress?: { amount: string; actionRequired?: boolean } | null;
 }
 
 export type QuoteStatus =
@@ -679,9 +773,93 @@ export interface QuoteDetail {
   lines: QuoteLine[];
   /** Optional for API responses that predate the branding field. */
   branding?: QuoteBranding;
+  /** The document's resolved language (spec §3.7); absent on API responses that predate it. */
+  documentLocale?: string;
   /** Resolved document theme/pageSize (Task 12). Optional: fixtures/older
-   *  payloads omit it, which must read as 'classic' (documentShell's fallback). */
+   *  payloads omit it, which must read as 'classic'. */
   presentation?: QuotePresentation;
+}
+
+export interface PublicAgreementDetail {
+  request: {
+    id: string;
+    status: 'sent' | 'viewed' | 'signed' | 'declined';
+    coverMessage: string | null;
+    expiresAt: string;            // ISO instant
+    effectiveDate: string | null; // YYYY-MM-DD
+    signedAt: string | null;      // ISO
+    declinedAt: string | null;    // ISO
+  };
+  template: { name: string; versionNumber: number; sourceType: 'authored' | 'uploaded' };
+  /** Server-sanitized agreement HTML (authored templates). */
+  html: string | null;
+  /** API-relative path '/agreements/public/<token>/file' (uploaded templates). */
+  fileUrl: string | null;
+  /** API-relative path '/agreements/public/<token>/signed-copy' when THIS link
+   *  signed the agreement and its certified copy exists (#10695); null otherwise.
+   *  Absent on portal payloads, which download by signedAgreementId instead. */
+  signedCopyUrl?: string | null;
+  parties: { partnerName: string; orgName: string | null };
+  branding: {
+    partnerName: string;
+    logoUrl: string | null;
+    seller: { name: string | null; lines: string[]; phone: string | null; email: string | null; website: string | null } | null;
+  };
+}
+
+/** Browser-facing URL of an uploaded agreement's file (same-origin, token-scoped). */
+export function publicAgreementFilePath(token: string): PublicApiPath {
+  return publicApiPath(`/agreements/public/${encodeURIComponent(token)}/file`);
+}
+
+/** Browser-facing URL of an uploaded agreement's file for the signed-in portal user. */
+export function portalAgreementFilePath(id: string): PublicApiPath {
+  return publicApiPath(`/portal/agreements/${encodeURIComponent(id)}/file`);
+}
+
+/** Download URL of a signed agreement: the certified PDF (default) or the stored original. */
+export function signedAgreementFilePath(documentId: string, copy: 'certified' | 'original' = 'certified'): PublicApiPath {
+  return publicApiPath(`/portal/signed-agreements/${encodeURIComponent(documentId)}/file?copy=${copy}`);
+}
+
+/** An agreement request still awaiting signature (GET /portal/agreements). */
+export interface PortalAgreementSummary {
+  id: string;
+  name: string;
+  templateName: string | null;
+  status: 'sent' | 'viewed';
+  sentAt: string | null;
+  expiresAt: string;
+  /** The signed-in user's email is on the recipient list. */
+  canSign: boolean;
+}
+
+export type PortalAgreementDetail = PublicAgreementDetail & {
+  canSign: boolean;
+  signedAgreementId: string | null;
+  /** The org's zone (org → partner → UTC): format the request's instants in it (#10291). */
+  timezone: string;
+};
+
+/** GET /portal/agreements and /portal/signed-agreements: rows plus the org zone their instants format in (#10291). */
+export interface PortalAgreementListResponse<T> {
+  data: T[];
+  timezone: string;
+}
+
+export interface PortalSignedAgreement {
+  id: string;
+  name: string;
+  templateName: string | null;
+  versionNumber: number | null;
+  sourceKind: 'quote' | 'request';
+  quoteNumber: string | null;
+  mime: string;
+  byteSize: number;
+  signerName: string | null;
+  signedAt: string | null;
+  acceptanceOrigin: 'customer' | 'on_behalf' | null;
+  createdAt: string;
 }
 
 export interface PublicQuoteDetail {
@@ -689,15 +867,50 @@ export interface PublicQuoteDetail {
   blocks: QuoteBlock[];
   lines: QuoteLine[];
   branding: QuoteBranding;
+  /** The document's resolved language (spec §3.7); absent on API responses that predate it. */
+  documentLocale?: string;
   /** Resolved document theme/pageSize (Task 12). Optional: fixtures/older
-   *  payloads omit it, which must read as 'classic' (documentShell's fallback). */
+   *  payloads omit it, which must read as 'classic'. */
   presentation?: QuotePresentation;
+  /** #8231: signing goes straight on to card checkout (the partner takes online
+   *  payment; automatic-payment clients included). The page still
+   *  gates on an amount being due; the server makes the final call on accept. */
+  payOnAccept?: boolean;
+}
+
+/** #3740: what paying an accepted quote's invoice charges now (deposit-first). */
+export interface PublicQuotePayment {
+  amount: string;
+  currencyCode: string;
+  isDeposit: boolean;
+  invoiceNumber: string | null;
+}
+
+/** GET /quotes/public/:token/payment — the accepted quote's payment step.
+ *  `payment` is null when nothing can be paid online. */
+export interface PublicQuoteAccepted {
+  partnerName: string | null;
+  payment: PublicQuotePayment | null;
+}
+
+export interface PublicQuoteAcceptResult {
+  status: string;
+  invoiceNumber: string | null;
+  invoiceUrl: string | null;
+  checkoutUrl?: string | null;
+  payDeferred?: boolean;
+  /** Present when payDeferred: the payment step to show in place of the invoice page. */
+  payment?: PublicQuotePayment | null;
 }
 
 /** The public (token-gated) invoice payload — /invoices/public/:token. A VOID
  *  invoice deliberately carries only identity fields (no amounts), so most
  *  money fields are optional here. */
 export interface PublicInvoiceDetail {
+  bankAutopay?: BankAutopayOffer | null;
+  autopay?: InvoiceAutopayDisclosure | null;
+  autopayStatus?: CustomerInvoiceAutopayStatus | null;
+  autopayEnrolled?: boolean;
   invoice: {
     id: string;
     invoiceNumber: string | null;
@@ -719,10 +932,22 @@ export interface PublicInvoiceDetail {
     sellerSnapshot?: SellerSnapshot | null;
     termsAndConditions?: string | null;
     paidAt?: string | null;
+    /** #8604: resolved line grouping; 'day' only when dates are on. */
+    lineGrouping?: 'entry' | 'day';
+    /** Absent on the void payload (identity fields only). */
+    displayStatus?: Exclude<InvoiceStatus, 'draft'> | null;
+    billToAddress?: SellerSnapshot['address'];
+    billToTaxId?: string | null;
+    terms?: string | null;
   };
   lines: InvoiceLine[];
+  /** Absent on the void payload. */
+  documentLocale?: string;
   chargeNow: { amount: string; isDeposit: boolean } | null;
   payable: boolean;
+  /** #7824: an autopay collection is in flight (server reservation).
+   *  actionRequired: it is waiting on the customer's bank (off-session 3DS). */
+  collectionInProgress?: { amount: string; actionRequired?: boolean } | null;
   branding: {
     partnerName: string;
     contactEmail: string | null;
@@ -790,7 +1015,25 @@ export interface BrandingConfig {
   enableService?: boolean;
   enableDocuments?: boolean;
   enableLifecycle?: boolean;
+  enableHardwareHealth?: boolean;
+  enableHardwareInventory?: boolean;
+  enablePerformanceMetrics?: boolean;
+  enableSoftwareInventory?: boolean;
   enableNetworkVisibility?: boolean;
+  /** EDR framework W02 (#8166): MSP turned managed endpoint protection on for this org. */
+  enableEdrVisibility?: boolean;
+  /** Block hours W04 (#8179): MSP turned the Support hours card on for this org. */
+  enableHourBlock?: boolean;
+  /** Visibility W05 (#7735): MSP turned sensitive per-host patch detail on for this org. */
+  enablePatchDetail?: boolean;
+  /** Visibility W06 (#7736): MSP turned sensitive per-host CVE detail on for this org. */
+  enableVulnerabilityDetail?: boolean;
+  /** Environment visibility W1 (#8775): MSP turned sensitive physical placement (rack and room) on for this org. */
+  enablePhysicalPlacement?: boolean;
+  /** Trust Center W3d: per-USER capability, not an org flag — true only when the org
+   *  turned trust-page editing on AND this portal user is an org-scoped admin
+   *  contact. The API re-checks it on every trust-page request. */
+  canEditTrustPage?: boolean;
   /** Curated chrome accent key (packages/shared/src/types/portalChromeAccent.ts).
    *  null/unset/unrecognized means the default ('spruce') — nothing to apply. */
   chromeAccent?: string | null;
@@ -821,6 +1064,115 @@ function mapPaginatedData<T>(
   };
 }
 
+export interface PortalSoftwareItem {
+  name: string;
+  version: string | null;
+  vendor: string | null;
+  installDate: string | null;
+  lastSeen: string | null;
+}
+export interface PortalSoftwarePage<T = PortalSoftwareItem> {
+  asOf: string;
+  dataStatus: 'ok' | 'no_data';
+  data: T[];
+  pagination: { page: number; limit: number; total: number };
+}
+
+export type PortalPatchStatus = 'pending' | 'installed' | 'failed';
+export interface PortalPatchSummaryItem {
+  title: string;
+  severity: string;
+  version: string | null;
+  kbArticleUrl: string | null;
+  pendingDevices: number;
+  failedDevices: number;
+  installedDevices: number;
+  lastCheckedAt: string | null;
+}
+export interface PortalDevicePatchItem {
+  title: string;
+  severity: string;
+  version: string | null;
+  kbArticleUrl: string | null;
+  status: PortalPatchStatus;
+  installedAt: string | null;
+  installedVersion: string | null;
+  availableVersion: string | null;
+  lastCheckedAt: string | null;
+}
+
+export type PortalVulnerabilityStatus = 'open' | 'patched' | 'mitigated' | 'accepted';
+export interface PortalVulnerabilitySummaryItem {
+  cveId: string;
+  description: string;
+  severity: string;
+  cvssScore: number | null;
+  publishedAt: string | null;
+  patchAvailable: boolean;
+  affectedDevices: number;
+}
+export interface PortalVulnerabilityFindingItem {
+  cveId: string;
+  description: string;
+  severity: string;
+  cvssScore: number | null;
+  publishedAt: string | null;
+  patchAvailable: boolean;
+  status: PortalVulnerabilityStatus;
+  detectedAt: string;
+  resolvedAt: string | null;
+  deviceId: string;
+  deviceName: string;
+}
+
+// Customer work approval (#8200): staff ask the customer to approve extra or
+// after-hours work on a ticket. Dates arrive as ISO strings.
+export type PortalApprovalStatus = 'pending' | 'approved' | 'denied' | 'expired' | 'cancelled';
+
+export interface PortalApproval {
+  id: string;
+  ticketId: string;
+  ticketNumber: string;
+  ticketSubject: string;
+  trigger: 'budget' | 'after_hours';
+  status: PortalApprovalStatus;
+  revision: number;
+  requestedAt: string;
+  expiresAt: string;
+  decidedAt: string | null;
+  decisionOrigin: 'customer' | 'on_behalf' | null;
+  /** Staff message to the customer. */
+  message: string | null;
+  ask: {
+    minutes: number | null;
+    amount: string | null;
+    currencyCode: string | null;
+    coverageStartsAt: string | null;
+    coverageEndsAt: string | null;
+  };
+  snapshot: {
+    budgetMinutes: number | null;
+    consumedMinutes: number | null;
+    budgetAmount: string | null;
+    consumedAmount: string | null;
+  };
+  role: 'approver' | 'notify';
+  canDecide: boolean;
+}
+
+export interface PortalApprovalDecisionBody {
+  /** The revision the customer was looking at; the API refuses a stale one. */
+  revision: number;
+  signerName: string;
+  note?: string;
+}
+
+export interface PortalApprovalDecisionResult {
+  status: 'approved' | 'denied';
+  releasedEntryCount: number;
+  stillHeldEntryCount: number;
+}
+
 export const portalApi = {
   getRemoteDevices: (config: ApiRequestConfig = {}): Promise<ApiResponse<{ devices: RemoteDevice[] }>> =>
     apiGet<{ devices: RemoteDevice[] }>('/portal/remote/browser/devices', config),
@@ -831,9 +1183,21 @@ export const portalApi = {
     config: ApiRequestConfig = {},
   ): Promise<ApiResponse<RemoteSession>> =>
     apiPost<RemoteSession>('/portal/remote/sessions', { deviceId, transport }, config),
-  getRemoteSession: (id: string, config: ApiRequestConfig = {}) => apiGet<{ session: { id: string; status: string; hostname: string; webrtcAnswer: string | null; terminationPhase: string }; iceServers: RTCIceServer[] }>(`/portal/remote/sessions/${encodeURIComponent(id)}`, config),
+  getRemoteSession: (id: string, config: ApiRequestConfig = {}, includeIce = false) => apiGet<{ session: { id: string; status: string; hostname: string; webrtcAnswer: string | null; terminationPhase: string }; iceServers: RTCIceServer[] }>(`/portal/remote/sessions/${encodeURIComponent(id)}${includeIce ? '?includeIce=1' : ''}`, config),
   submitRemoteOffer: (id: string, offer: string, config: ApiRequestConfig = {}) => apiPost<{ success: true }>(`/portal/remote/sessions/${encodeURIComponent(id)}/offer`, { offer }, config),
   endRemoteSession: (id: string, config: ApiRequestConfig = {}) => apiPost<{ success: true; terminationPhase: string }>(`/portal/remote/sessions/${encodeURIComponent(id)}/end`, {}, config),
+  getVulnerabilitySummary: (params: ListParams & { status?: PortalVulnerabilityStatus } = {}, config: ApiRequestConfig = {}): Promise<ApiResponse<PortalSoftwarePage<PortalVulnerabilitySummaryItem>>> =>
+    apiGet<PortalSoftwarePage<PortalVulnerabilitySummaryItem>>('/portal/vulnerabilities/summary' + buildQueryString({ page: params.page ?? 1, limit: params.limit ?? 50, status: params.status ?? 'open' }), config),
+  getVulnerabilityFindings: (params: ListParams & { status?: PortalVulnerabilityStatus; deviceId?: string } = {}, config: ApiRequestConfig = {}): Promise<ApiResponse<PortalSoftwarePage<PortalVulnerabilityFindingItem>>> =>
+    apiGet<PortalSoftwarePage<PortalVulnerabilityFindingItem>>('/portal/vulnerabilities/findings' + buildQueryString({ page: params.page ?? 1, limit: params.limit ?? 50, status: params.status ?? 'open', deviceId: params.deviceId }), config),
+  getPatchSummary: (params: ListParams = {}, config: ApiRequestConfig = {}): Promise<ApiResponse<PortalSoftwarePage<PortalPatchSummaryItem>>> =>
+    apiGet<PortalSoftwarePage<PortalPatchSummaryItem>>('/portal/patches/summary' + buildQueryString({ page: params.page ?? 1, limit: params.limit ?? 50 }), config),
+  getDevicePatches: (deviceId: string, params: ListParams = {}, config: ApiRequestConfig = {}): Promise<ApiResponse<PortalSoftwarePage<PortalDevicePatchItem>>> =>
+    apiGet<PortalSoftwarePage<PortalDevicePatchItem>>('/portal/patches/devices/' + encodeURIComponent(deviceId) + buildQueryString({ page: params.page ?? 1, limit: params.limit ?? 50 }), config),
+  getSoftwareSummary: (params: ListParams = {}, config: ApiRequestConfig = {}): Promise<ApiResponse<PortalSoftwarePage>> =>
+    apiGet<PortalSoftwarePage>('/portal/software/summary' + buildQueryString({ page: params.page ?? 1, limit: params.limit ?? 50 }), config),
+  getDeviceSoftware: (deviceId: string, params: ListParams = {}, config: ApiRequestConfig = {}): Promise<ApiResponse<PortalSoftwarePage>> =>
+    apiGet<PortalSoftwarePage>('/portal/software/devices/' + encodeURIComponent(deviceId) + buildQueryString({ page: params.page ?? 1, limit: params.limit ?? 50 }), config),
 
   getDevices: async (
     params: ListParams = {},
@@ -845,6 +1209,38 @@ export const portalApi = {
         data: EnrichedPortalDevice[];
         pagination: Pagination;
       }>(`/portal/devices${query}`, config)
+    );
+  },
+
+  getApprovals: async (
+    config: ApiRequestConfig = {},
+    options: { pendingOnly?: boolean } = {}
+  ): Promise<ApiResponse<{ data: PortalApproval[] }>> => {
+    const query = buildQueryString({ status: options.pendingOnly ? 'pending' : undefined });
+    return apiGet<{ data: PortalApproval[] }>(`/portal/approvals${query}`, config);
+  },
+
+  approveApproval: async (
+    id: string,
+    body: PortalApprovalDecisionBody,
+    config: ApiRequestConfig = {}
+  ): Promise<ApiResponse<{ data: PortalApprovalDecisionResult }>> => {
+    return apiPost<{ data: PortalApprovalDecisionResult }>(
+      `/portal/approvals/${encodeURIComponent(id)}/approve`,
+      body,
+      config
+    );
+  },
+
+  denyApproval: async (
+    id: string,
+    body: PortalApprovalDecisionBody,
+    config: ApiRequestConfig = {}
+  ): Promise<ApiResponse<{ data: PortalApprovalDecisionResult }>> => {
+    return apiPost<{ data: PortalApprovalDecisionResult }>(
+      `/portal/approvals/${encodeURIComponent(id)}/deny`,
+      body,
+      config
     );
   },
 
@@ -863,8 +1259,13 @@ export const portalApi = {
   getTicket: async (
     id: string,
     config: ApiRequestConfig = {}
-  ): Promise<ApiResponse<TicketDetails>> => {
-    const response = await apiGet<{ ticket: TicketDetails }>(`/portal/tickets/${id}`, config);
+  ): Promise<ApiResponse<PortalTicketDetailResult>> => {
+    // A merged tombstone answers top-level `{ merged: true, mergedInto, mergedAt,
+    // survivorDeleted? }` with no `ticket` key (#8972).
+    type Body =
+      | { ticket: TicketDetails; merged?: undefined }
+      | { merged: true; mergedInto?: PortalMergedTicket['mergedInto']; mergedAt?: string | null; survivorDeleted?: boolean };
+    const response = await apiGet<Body>(`/portal/tickets/${id}`, config);
     if (!response.data) {
       return {
         error: response.error,
@@ -874,8 +1275,22 @@ export const portalApi = {
       };
     }
 
+    const body = response.data;
+    if (body.merged === true) {
+      return {
+        data: {
+          merged: true,
+          mergedInto: body.mergedInto ?? null,
+          mergedAt: body.mergedAt ?? null,
+          survivorDeleted: body.survivorDeleted === true,
+        },
+        statusCode: response.statusCode,
+        headers: response.headers
+      };
+    }
+
     return {
-      data: response.data.ticket,
+      data: body.ticket,
       statusCode: response.statusCode,
       headers: response.headers
     };
@@ -986,12 +1401,13 @@ export const portalApi = {
     return apiGet<InvoiceDetail>(`/portal/invoices/${id}`, config);
   },
 
-  payInvoice: async (
-    id: string,
-    config: ApiRequestConfig = {}
-  ): Promise<ApiResponse<{ url: string }>> => {
-    return apiPost<{ url: string }>(`/portal/invoices/${id}/pay`, undefined, config);
-  },
+  payInvoice: async (id: string, config: ApiRequestConfig = {}, autopay?: SaveForAutopayInput | BankPayInput): Promise<ApiResponse<InvoicePayResult>> =>
+    apiPost<InvoicePayResult>(`/portal/invoices/${id}/pay`, autopay, config),
+
+  // Cancel an autopay payment that is waiting on bank authentication so the
+  // customer can pay on-session (same effect as the emailed confirm link).
+  releaseAutopayConfirmation: async (id: string): Promise<ApiResponse<AutopayConfirmationRelease>> =>
+    apiPost<AutopayConfirmationRelease>(`/portal/invoices/${encodeURIComponent(id)}/autopay-confirmation`, {}),
 
   // Verify-on-return: settle the Checkout session server-side after the customer
   // lands back on the invoice (success_url carries the session id). Idempotent — the
@@ -1165,13 +1581,28 @@ export const portalApi = {
     token: string,
     signerName: string,
     signerEmail?: string
-  ): Promise<ApiResponse<{ data: { status: string; invoiceNumber: string | null; invoiceUrl: string | null; payDeferred?: boolean } }>> => {
-    return apiPost<{ data: { status: string; invoiceNumber: string | null; invoiceUrl: string | null; payDeferred?: boolean } }>(
+  ): Promise<ApiResponse<{ data: PublicQuoteAcceptResult }>> => {
+    return apiPost<{ data: PublicQuoteAcceptResult }>(
       `/quotes/public/${encodeURIComponent(token)}/accept`,
       { signerName, signerEmail },
       { redirectOnUnauthorized: false }
     );
   },
+
+  // #3740: an accepted quote's link still reaches its invoice's payment (and
+  // only that), including after accepting spent the link.
+  getPublicQuotePayment: async (
+    token: string,
+    config: ApiRequestConfig = {}
+  ): Promise<ApiResponse<{ data: PublicQuoteAccepted }>> => {
+    return apiGet<{ data: PublicQuoteAccepted }>(
+      `/quotes/public/${encodeURIComponent(token)}/payment`,
+      { ...config, redirectOnUnauthorized: false }
+    );
+  },
+
+  payPublicQuote: async (token: string): Promise<ApiResponse<{ data: { url: string } }>> =>
+    apiPost<{ data: { url: string } }>(`/quotes/public/${encodeURIComponent(token)}/pay`, {}, { redirectOnUnauthorized: false }),
 
   declinePublicQuote: async (
     token: string,
@@ -1179,6 +1610,84 @@ export const portalApi = {
   ): Promise<ApiResponse<{ data: { status: string } }>> => {
     return apiPost<{ data: { status: string } }>(
       `/quotes/public/${encodeURIComponent(token)}/decline`,
+      { reason },
+      { redirectOnUnauthorized: false }
+    );
+  },
+
+  getAgreements: async (
+    config: ApiRequestConfig = {}
+  ): Promise<ApiResponse<PortalAgreementListResponse<PortalAgreementSummary>>> => {
+    return apiGet<PortalAgreementListResponse<PortalAgreementSummary>>('/portal/agreements', config);
+  },
+
+  getAgreement: async (
+    id: string,
+    config: ApiRequestConfig = {}
+  ): Promise<ApiResponse<{ data: PortalAgreementDetail }>> => {
+    return apiGet<{ data: PortalAgreementDetail }>(`/portal/agreements/${encodeURIComponent(id)}`, config);
+  },
+
+  acceptAgreement: async (
+    id: string,
+    signerName: string,
+    config: ApiRequestConfig = {}
+  ): Promise<ApiResponse<{ data: { status: 'signed'; signedAt: string; signedAgreementId: string } }>> => {
+    return apiPost<{ data: { status: 'signed'; signedAt: string; signedAgreementId: string } }>(
+      `/portal/agreements/${encodeURIComponent(id)}/accept`,
+      { signerName },
+      config
+    );
+  },
+
+  declineAgreement: async (
+    id: string,
+    reason?: string,
+    config: ApiRequestConfig = {}
+  ): Promise<ApiResponse<{ data: { status: 'declined' } }>> => {
+    return apiPost<{ data: { status: 'declined' } }>(
+      `/portal/agreements/${encodeURIComponent(id)}/decline`,
+      { reason },
+      config
+    );
+  },
+
+  getSignedAgreements: async (
+    config: ApiRequestConfig = {}
+  ): Promise<ApiResponse<PortalAgreementListResponse<PortalSignedAgreement>>> => {
+    return apiGet<PortalAgreementListResponse<PortalSignedAgreement>>('/portal/signed-agreements', config);
+  },
+
+  // Public, token-gated agreement signing (no portal account). Hits
+  // /agreements/public/* (NOT /portal/*): a 401 must never bounce to login.
+  getPublicAgreement: async (
+    token: string,
+    config: ApiRequestConfig = {}
+  ): Promise<ApiResponse<{ data: PublicAgreementDetail }>> => {
+    return apiGet<{ data: PublicAgreementDetail }>(
+      `/agreements/public/${encodeURIComponent(token)}`,
+      config
+    );
+  },
+
+  acceptPublicAgreement: async (
+    token: string,
+    signerName: string,
+    signerEmail: string
+  ): Promise<ApiResponse<{ data: { status: 'signed'; signedAt: string } }>> => {
+    return apiPost<{ data: { status: 'signed'; signedAt: string } }>(
+      `/agreements/public/${encodeURIComponent(token)}/accept`,
+      { signerName, signerEmail },
+      { redirectOnUnauthorized: false }
+    );
+  },
+
+  declinePublicAgreement: async (
+    token: string,
+    reason?: string
+  ): Promise<ApiResponse<{ data: { status: 'declined' } }>> => {
+    return apiPost<{ data: { status: 'declined' } }>(
+      `/agreements/public/${encodeURIComponent(token)}/decline`,
       { reason },
       { redirectOnUnauthorized: false }
     );
@@ -1197,15 +1706,19 @@ export const portalApi = {
     );
   },
 
-  payPublicInvoice: async (
-    token: string
-  ): Promise<ApiResponse<{ data: { url: string } }>> => {
-    return apiPost<{ data: { url: string } }>(
-      `/invoices/public/${encodeURIComponent(token)}/pay`,
-      {},
-      { redirectOnUnauthorized: false }
-    );
-  },
+  // Public trust pages (spec trust-center §8): anonymous, no auth redirect.
+  getTrustCard: async (partnerSlug: string, orgSlug: string | null, config: ApiRequestConfig = {}) =>
+    apiGet<{ data: TrustCard }>(`/trust/card/${encodeURIComponent(partnerSlug)}${orgSlug ? `/${encodeURIComponent(orgSlug)}` : ''}`, { redirectOnUnauthorized: false, ...config }),
+  getTrustPage: async (partnerSlug: string, orgSlug: string | null, config: ApiRequestConfig = {}) =>
+    apiGet<{ data: TrustPageResponse }>(`/trust/public/${encodeURIComponent(partnerSlug)}${orgSlug ? `/${encodeURIComponent(orgSlug)}` : ''}`, { redirectOnUnauthorized: false, ...config }),
+  getTrustPreview: async (token: string, config: ApiRequestConfig = {}) =>
+    apiGet<{ data: TrustPageResponse }>(`/trust/public/preview/${encodeURIComponent(token)}`, { redirectOnUnauthorized: false, ...config }),
+
+  payPublicInvoice: async (token: string, autopay?: SaveForAutopayInput | BankPayInput): Promise<ApiResponse<{ data: InvoicePayResult }>> =>
+    apiPost<{ data: InvoicePayResult }>(`/invoices/public/${encodeURIComponent(token)}/pay`, autopay ?? {}, { redirectOnUnauthorized: false }),
+
+  releasePublicAutopayConfirmation: async (token: string): Promise<ApiResponse<{ data: AutopayConfirmationRelease }>> =>
+    apiPost<{ data: AutopayConfirmationRelease }>(`/invoices/public/${encodeURIComponent(token)}/autopay-confirmation`, {}, { redirectOnUnauthorized: false }),
 
   // Checkout verify-on-return WITHOUT the invoice token: exchanges the Stripe
   // session id for settlement + the canonical public page url (the return urls
@@ -1272,6 +1785,28 @@ export const portalApi = {
   ): Promise<ApiResponse<NetworkOverviewDto>> =>
     apiGet<NetworkOverviewDto>('/portal/network/overview', config),
 
+  // #7025 — sites that own portal-visible assets, for the Site filter.
+  getNetworkSites: (
+    config: ApiRequestConfig = {}
+  ): Promise<ApiResponse<NetworkSitesDto>> =>
+    apiGet<NetworkSitesDto>('/portal/network/sites', config),
+
+  // #6641 — per-asset list.
+  getNetworkAssets: (
+    params: NetworkAssetsParams = {},
+    config: ApiRequestConfig = {}
+  ): Promise<ApiResponse<NetworkAssetsDto>> =>
+    apiGet<NetworkAssetsDto>(
+      `/portal/network/assets${buildQueryString({
+        page: params.page ?? 1,
+        limit: params.limit ?? 50,
+        siteId: params.siteId,
+        assetType: params.assetType,
+        status: params.status,
+      })}`,
+      config
+    ),
+
   // ---------------------------------------------------------------------------
   // W08 — support usage
   // ---------------------------------------------------------------------------
@@ -1283,6 +1818,13 @@ export const portalApi = {
       `/portal/tickets/usage${buildQueryString({ month })}`,
       config
     ),
+
+  // Block hours W04 (#8179): read-only prepaid-hours balance. Only called
+  // when branding.enableHourBlock is true (see pages/tickets/index.astro).
+  getHourBlock: (
+    config: ApiRequestConfig = {}
+  ): Promise<ApiResponse<PortalHourBlockResponse>> =>
+    apiGet<PortalHourBlockResponse>('/portal/support-usage/hour-block', config),
 
   // W10 — customer reports
   getReportRuns: async (
@@ -1371,3 +1913,11 @@ export const portalApi = {
   documentContentUrl: (documentId: string): PublicApiPath =>
     publicApiPath(`/portal/documents/${documentId}/content`),
 };
+
+export interface TrustCard { title: string; orgName: string; logoUrl: string | null; primaryColor: string | null; managedByName: string | null; summaryLine: string; publishedAt: string; lastEvaluatedAt: string | null; stale: boolean; searchIndexable: boolean; locale: string; controlsShown: number; catalogTotal: number; controlsMet: number }
+export interface TrustPageResponse { payload: TrustPagePublicPayloadAny; lastEvaluatedAt: string | null; stale: boolean; preview?: boolean }
+
+export const trustBadgePath = (p: string, o: string): PublicApiPath => publicApiPath(`/trust/public/${encodeURIComponent(p)}/${encodeURIComponent(o)}/badge.svg`);
+/** `o` null = the partner-home page, which has its own document route (/trust/public/:partnerSlug/documents/:id). */
+export const trustDocumentPath = (p: string, o: string | null, id: string): PublicApiPath =>
+  publicApiPath(`/trust/public/${encodeURIComponent(p)}${o ? `/${encodeURIComponent(o)}` : ''}/documents/${encodeURIComponent(id)}`);

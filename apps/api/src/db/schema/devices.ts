@@ -1,8 +1,9 @@
 import { pgTable, uuid, varchar, text, timestamp, boolean, jsonb, pgEnum, integer, real, bigint, date, primaryKey, index, unique, uniqueIndex, foreignKey } from 'drizzle-orm/pg-core';
-import { ipClassEnum, organizations, sites } from './orgs';
+import { sql } from 'drizzle-orm';
+import { ipClassEnum, organizations, partners, sites } from './orgs';
 import { users } from './users';
 import { aiInitiatorKindEnum } from './aiInitiator';
-import type { BatteryStatus, DesktopAccessState, InterfaceBandwidth, TCCPermissions, VpnPresence } from '@breeze/shared';
+import type { IsolationMechanism, BatteryStatus, DesktopAccessState, InterfaceBandwidth, TCCPermissions, VpnPresence } from '@breeze/shared';
 
 export const osTypeEnum = pgEnum('os_type', ['windows', 'macos', 'linux']);
 export const deviceStatusEnum = pgEnum('device_status', ['online', 'offline', 'maintenance', 'decommissioned', 'quarantined', 'updating', 'pending']);
@@ -78,6 +79,14 @@ export const devices = pgTable('devices', {
   // parallels), or null when physical or undetermined.
   isVirtual: boolean('is_virtual').notNull().default(false),
   virtualizationPlatform: varchar('virtualization_platform', { length: 30 }),
+  // Workload HOST axis (#3834): does this device host workloads (containers /
+  // VMs), of which runtime. Distinct from isVirtual above (the GUEST axis).
+  // Written by services/workloads/ingest.ts from runtime DETECTION, never
+  // derived from device_workloads rows — an empty Docker host is still a
+  // container host. workloadRuntimes is the sorted runtimes whose detection is
+  // 'present'; a runtime reported 'unknown' keeps its previous membership.
+  hostsWorkloads: boolean('hosts_workloads').notNull().default(false),
+  workloadRuntimes: varchar('workload_runtimes', { length: 30 }).array().notNull().default([]),
   osVersion: varchar('os_version', { length: 100 }).notNull(),
   // Hardware Lifecycle report: when the device was bought. Source is 'manual'
   // (operator-entered, never overwritten by sync) or 'vendor' (derived from the
@@ -110,6 +119,14 @@ export const devices = pgTable('devices', {
   maintenanceReason: varchar('maintenance_reason', { length: 500 }),
   maintenanceStartedBy: uuid('maintenance_started_by').references(() => users.id, { onDelete: 'set null' }),
   lastSeenAt: timestamp('last_seen_at'),
+  // #7067 — latest agent-logs ingest time for this device. Written by the
+  // logs ingest route (agents/logs.ts), throttled to a conditional UPDATE so
+  // a batch that moved the value < 5 min doesn't cost a write on the hot
+  // ingest path. NULL = never shipped a log (or predates this column).
+  // Not a health signal on its own: agents ship warn+ by default, so a
+  // healthy agent can be log-quiet for hours. Shipping health comes from the
+  // agent's heartbeat instead (#7067).
+  lastLogAt: timestamp('last_log_at', { withTimezone: true }),
   enrolledAt: timestamp('enrolled_at').defaultNow().notNull(),
   // Bare-metal recovery W04a: stamped by the heartbeat check-in that completes
   // a recovery. recoveredFromSnapshotId is a soft reference to
@@ -190,10 +207,20 @@ export const devices = pgTable('devices', {
   watchdogStatus: watchdogStatusEnum('watchdog_status'),
   watchdogLastSeen: timestamp('watchdog_last_seen'),
   watchdogVersion: varchar('watchdog_version', { length: 50 }),
+  // The watchdog's OWN reported build edition (#4297), written together with
+  // watchdogVersion on every watchdog beat. NULL when the build at
+  // watchdogVersion has not reported one (never beaten, a pre-reporting build,
+  // or the main agent has since reported a different installed watchdog
+  // version). Read via effectiveWatchdogEdition (services/agentEditionCompat),
+  // which falls back to agentEdition when this is NULL.
+  watchdogEdition: varchar('watchdog_edition', { length: 20 }),
   // Installed breeze-backup version, reported by the agent's heartbeat.
   // Nullable: old agents and devices without the backup binary installed
   // never report one.
   backupVersion: varchar('backup_version', { length: 50 }),
+  // Installed Breeze Assist (user helper) version from the heartbeat (#6751).
+  // Nullable: old agents and devices without the helper never report one.
+  helperVersion: varchar('helper_version', { length: 50 }),
   // #2288 — the control-plane URL the agent last heartbeated to. Reported by
   // the agent; shows fleet position during a server URL migration.
   agentServerUrl: varchar('agent_server_url', { length: 512 }),
@@ -213,6 +240,11 @@ export const devices = pgTable('devices', {
   // build correctly reports back down to 0. Task 5 gates managed-software
   // dispatch on this value.
   outboundNetworkPolicyVersion: integer('outbound_network_policy_version').notNull().default(0),
+  // Non-sticky capability truth: written every heartbeat; omission after a downgrade clears it.
+  networkIsolationVersion: integer('network_isolation_version').notNull().default(0),
+  networkIsolationMechanism: text('network_isolation_mechanism').$type<IsolationMechanism>(),
+  networkIsolationUnsupportedReason: text('network_isolation_unsupported_reason'),
+  networkIsolationReady: boolean('network_isolation_ready').notNull().default(false),
   // #3409 PR4 — agent capability for encrypted secret-env delivery. 0 for every
   // agent build predating PR4b and for any heartbeat omitting the field; only
   // the recognized integer version 1 is written as anything else. Non-sticky
@@ -227,6 +259,40 @@ export const devices = pgTable('devices', {
   peripheralPolicyProtocolVersion: integer('peripheral_policy_protocol_version').notNull().default(0),
   rollbackProtocolVersion: integer('rollback_protocol_version').notNull().default(0),
   pamLifetimeProtocolVersion: integer('pam_lifetime_protocol_version').notNull().default(0),
+  // Independent of PAM availability: unavailable agents can still retry verification.
+  pamReconciliationResetProtocolVersion: integer('pam_reconciliation_reset_protocol_version').notNull().default(0),
+  // #8928: 1 = the agent shows PAM outcome notices and may claim pam_request_notify.
+  pamUserNotifyProtocolVersion: integer('pam_user_notify_protocol_version').notNull().default(0),
+  // PAM ownership epochs (#8203): current ownership epoch. Trigger-managed —
+  // advanced by exactly +1 on every org_id change; a caller-written change is
+  // refused with 42501. Never set it from app code.
+  ownershipEpoch: integer('ownership_epoch').notNull().default(1),
+  // PAM ownership epochs W4 (#8206): the ownership epoch whose identity the
+  // agent has loaded, as last reported on a heartbeat (signed identity
+  // assertion v2). Written only by the heartbeat route, monotonically and never
+  // above ownershipEpoch. PAM dispatch requires it to equal ownershipEpoch;
+  // NULL counts as acknowledged only at ownershipEpoch = 1.
+  agentIdentityEpochAck: integer('agent_identity_epoch_ack'),
+  // Reinstall reattach W1a (#8318, spec 2026-10-12-reinstall-reattach-design
+  // §4.1): which agent install owns this row. 1 = the original install (every
+  // device that was never reattached); advanced by exactly one when a reattach
+  // confirm hands the row to a new install, never otherwise
+  // (devices_install_incarnation_guard). device_commands rows are stamped with
+  // it at insert, and claim/result acceptance refuse an earlier incarnation's
+  // rows. incarnation_started_at is NULL exactly while the incarnation is 1
+  // (devices_install_incarnation_chk); last_reattached_at backs the
+  // "Reinstalled on" badge. Written only by services/deviceInstallBoundary.
+  installIncarnation: integer('install_incarnation').notNull().default(1),
+  incarnationStartedAt: timestamp('incarnation_started_at', { withTimezone: true }),
+  lastReattachedAt: timestamp('last_reattached_at', { withTimezone: true }),
+  // Reinstall reattach W1b (#8318 §4.1, §6.2): the agent's declared rebind
+  // capability. 1 = the agent follows the bounded rebind (verifies the signed
+  // `rebind` directive, stages agent-generated credentials, confirms with the
+  // confirm-only token); only such a device can be the SOURCE of a reattach,
+  // and only it is sent the directive. Written by enroll and NON-STICKY on
+  // every main and parked heartbeat. Not reset at the install boundary: the
+  // new install reports its own at enroll.
+  rebindProtocolVersion: integer('rebind_protocol_version').notNull().default(0),
   // Revocation-lease capability. 1 = this agent build renews a per-session
   // revocation lease over the command WebSocket and stops the desktop stream
   // when the lease is revoked or expires past its grace window. 0 (default,
@@ -236,13 +302,51 @@ export const devices = pgTable('devices', {
   // Non-sticky, same contract as the versions above: rewritten every beat so a
   // downgrade clears the claim.
   revocationLeaseProtocolVersion: integer('revocation_lease_protocol_version').notNull().default(0),
-  // SEC-038 W06 desktop start/terminal fence capability. 1 = this agent build
+  // Desktop start/terminal fence capability. 1 = this agent build
   // keeps the durable per-session generation fence (W04/W05) and refuses stale
   // or post-terminal starts. 0 (default, and every agent that omits the field)
   // means unfenced; behind REMOTE_DESKTOP_FENCE_REQUIRED the three
   // desktop-start dispatch sites refuse with 503 agent_upgrade_required, same
   // shape as the revocation-lease gate above. Non-sticky: rewritten every beat.
   desktopFenceProtocolVersion: integer('desktop_fence_protocol_version').notNull().default(0),
+  // Consent/notification prompt capability. 1 = this agent build parses the
+  // `prompt` block on a desktop-stream-start command and gates on it
+  // (consent dialog / on-screen notice) before capturing. 0 (default, and
+  // every agent that omits the field) means the agent silently ignores an
+  // unfamiliar `prompt` key and streams unconditionally — so any dispatch
+  // site that resolves a policy requiring consent or notification must
+  // refuse to start rather than send a prompt block a capability-0 agent
+  // will not honor. Non-sticky, same contract as the versions above.
+  consentPromptProtocolVersion: integer('consent_prompt_protocol_version').notNull().default(0),
+  // #3834 — agent capability for workload inventory. 0 for every build
+  // predating the collector and for any heartbeat omitting the field; only the
+  // recognized integer version 1 is written as anything else. Non-sticky
+  // (written every beat), so a downgrade reports back down. The device
+  // Workloads view uses it to say "agent too old" instead of "no data".
+  workloadInventoryProtocolVersion: integer('workload_inventory_protocol_version').notNull().default(0),
+  // Brokered storage-read protocol of the INSTALLED backup helper, reported by
+  // the main agent as a top-level heartbeat field. 1 = the helper can restore
+  // through a short-lived storage session instead of reusable storage
+  // credentials; 0 (every agent that omits the field) = no.
+  // Non-sticky: rewritten every beat so a helper downgrade clears the claim.
+  //
+  // NULL = NOT REPORTED YET: a newly enrolled (or re-enrolled) install whose
+  // first heartbeat has not arrived. Unknown is not "old helper": backup and
+  // restore dispatch waits for the report rather than choosing the path an
+  // old helper would get (services/backupHelperProtocols.ts). The heartbeat
+  // always writes a number, so NULL never returns once a report is recorded
+  // except through re-enrollment, which resets all three to NULL.
+  backupReadProtocolVersion: integer('backup_read_protocol_version'),
+  // Snapshot integrity protocol of the INSTALLED backup helper (same report,
+  // same non-sticky contract, same NULL = not reported yet). 1 = the helper
+  // produces snapshot attestations; 2 = it also checks them at every restore.
+  // 0 = neither.
+  backupIntegrityProtocolVersion: integer('backup_integrity_protocol_version'),
+  // Storage write protocol of the INSTALLED backup helper (same report, same
+  // non-sticky contract, same NULL = not reported yet). 1 = the helper writes
+  // through brokered storage sessions; 0 = it writes with the configured
+  // storage destination.
+  backupWriteProtocolVersion: integer('backup_write_protocol_version'),
   rollbackComponentVersions: jsonb('rollback_component_versions').$type<Record<string, string> | null>(),
   // Agent-reported build edition + migration-needed flag (heartbeat telemetry).
   // Non-sensitive; drives the self-hosted migration banner. Written unconditionally
@@ -254,6 +358,45 @@ export const devices = pgTable('devices', {
   // never cleared on a dispatched-but-failed dance so a broken device is
   // handled by an operator, not an uninstall/reinstall retry loop.
   editionMigrationDispatchedAt: timestamp('edition_migration_dispatched_at', { withTimezone: true }),
+  // #6449 — why the server is withholding update offers from this device.
+  // NULL = offers flowing. 'edition_unconfirmed' = the artifact-edition gate
+  // (agentAcceptsServedEdition, #4072) refused. Written by the heartbeat ONLY
+  // on a state change; `since` is when the current episode began.
+  updateOfferWithheldReason: varchar('update_offer_withheld_reason', { length: 50 }),
+  updateOfferWithheldSince: timestamp('update_offer_withheld_since', { withTimezone: true }),
+  // #4073 — the agent self-update currently being attempted. Stamped by the
+  // WS `update_status` message the agent sends before EVERY attempt, cleared
+  // by the heartbeat once the reported version reaches the target. An open
+  // record that is old and still retrying is a stuck update
+  // (isAgentUpdateStuck in @breeze/shared) — detectable without logs.
+  updateAttemptTargetVersion: varchar('update_attempt_target_version', { length: 50 }),
+  updateAttemptStartedAt: timestamp('update_attempt_started_at', { withTimezone: true }),
+  updateAttemptLastAt: timestamp('update_attempt_last_at', { withTimezone: true }),
+  updateAttemptCount: integer('update_attempt_count'),
+  // #6925 — agent-reported Breeze Assist install problem. NULL = none reported
+  // (healthy, Assist off, or an agent too old to report). 'awaiting_server_offer'
+  // = enabled but not installed and the server sent no helper version;
+  // 'install_abandoned' = the agent gave up installing the offered version
+  // (#6927). Written by the heartbeat ONLY on a state change; `since` is when
+  // the current episode began.
+  helperInstallIssue: varchar('helper_install_issue', { length: 50 }),
+  helperInstallIssueSince: timestamp('helper_install_issue_since', { withTimezone: true }),
+  // #8620 — agent-reported watchdog install health (#8618 / #7583). NULL =
+  // not reported. State and error class are closed vocabularies (see
+  // services/watchdogInstallHealth); written by the heartbeat ONLY on a
+  // transition. `since` is the server-clock time of the last state change.
+  watchdogInstallState: varchar('watchdog_install_state', { length: 20 }),
+  watchdogInstallErrorClass: varchar('watchdog_install_error_class', { length: 20 }),
+  watchdogInstallSince: timestamp('watchdog_install_since', { withTimezone: true }),
+  // #8608 — agent-reported log-shipping health (#8406). Classified per beat by
+  // services/logShippingHealth and written ONLY on a state change. NULL state =
+  // unknown (old agent / field absent), never healthy and never failing.
+  // 'failing' episodes are timed on the server receive clock via
+  // logShippingFailureStartedAt; the "sustained" verdict is derived at read time.
+  // lastError is a closed vocabulary (never raw error text), shown only while failing.
+  logShippingState: varchar('log_shipping_state', { length: 16 }),
+  logShippingFailureStartedAt: timestamp('log_shipping_failure_started_at', { withTimezone: true }),
+  logShippingLastError: varchar('log_shipping_last_error', { length: 200 }),
   // Enrollment idempotency (#2764): uninstall intent stamped by the agent's
   // graceful-uninstall notify path (Task 5/6); reaper decommissions once past
   // grace with no re-enrollment heartbeat. possibleReplacementOfDeviceId links
@@ -268,12 +411,19 @@ export const devices = pgTable('devices', {
   // silently extend itself. NULL on a decommissioned row means "removal time
   // unknown" and the purge job treats that as NEVER PURGE (fail closed).
   decommissionedAt: timestamp('decommissioned_at', { withTimezone: true }),
+  // Topology site location W3 (#7887, spec S§11): "Keep at <site>" — a technician confirmed this
+  // assignment, so no wrong-site suggestion is computed. Cleared by the
+  // breeze_devices_site_assignment_confirmation_reset trigger on any site/org change; no expiry.
+  siteAssignmentConfirmedAt: timestamp('site_assignment_confirmed_at', { withTimezone: true }),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
   partnerExportUpdatedAt: timestamp('partner_export_updated_at', { precision: 3 }).defaultNow().notNull()
 }, (table) => ({
   idOrgSiteUnique: uniqueIndex('devices_id_org_id_site_id_uniq').on(table.id, table.orgId, table.siteId),
   idOrgUnique: uniqueIndex('devices_id_org_id_uniq').on(table.id, table.orgId),
+  logShippingFailingIdx: index('devices_log_shipping_failing_idx')
+    .on(table.logShippingFailureStartedAt)
+    .where(sql`log_shipping_failure_started_at IS NOT NULL`),
 }));
 
 // Linked device profiles for multi-boot systems (#2138). One row per physical
@@ -313,12 +463,21 @@ export const deviceHardware = pgTable('device_hardware', {
   diskTotalGb: integer('disk_total_gb'),
   gpuModel: varchar('gpu_model', { length: 255 }),
   serialNumber: varchar('serial_number', { length: 100 }),
+  // #9593: SMBIOS system SKU (HP's product number). NULL until an agent reports one.
+  productSku: varchar('product_sku', { length: 100 }),
   manufacturer: varchar('manufacturer', { length: 255 }),
   model: varchar('model', { length: 255 }),
   motherboardManufacturer: varchar('motherboard_manufacturer', { length: 255 }),
   motherboardProduct: varchar('motherboard_product', { length: 255 }),
   motherboardVersion: varchar('motherboard_version', { length: 255 }),
   biosVersion: varchar('bios_version', { length: 100 }),
+  // Memory summary (#5351). All NULL until an agent reports a valid `memory`
+  // block; `memoryObservedAt` is when one was last applied (updatedAt also
+  // advances when memory collection failed). See device_memory_modules.
+  memorySlotsTotal: integer('memory_slots_total'),
+  memoryMaxCapacityMb: integer('memory_max_capacity_mb'),
+  memorySoldered: boolean('memory_soldered'),
+  memoryObservedAt: timestamp('memory_observed_at'),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
   partnerExportUpdatedAt: timestamp('partner_export_updated_at', { precision: 3 }).defaultNow().notNull()
 });
@@ -367,10 +526,11 @@ export const deviceNetwork = pgTable('device_network', {
   publicIp: varchar('public_ip', { length: 45 }),
   updatedAt: timestamp('updated_at').defaultNow().notNull()
 }, (table) => ({
-  // Every reader of this table filters by device_id (device-detail /network,
+  // Device-detail readers filter by device_id (device-detail /network,
   // cascade delete, the Devices-list LAN IP lookup). See migration
   // 2026-08-07-device-network-device-id-index.sql.
   deviceIdIdx: index('device_network_device_id_idx').on(table.deviceId),
+  orgMacIdx: index('device_network_org_mac_idx').on(table.orgId, sql`lower(${table.macAddress})`),
 }));
 
 export const deviceIpHistory = pgTable('device_ip_history', {
@@ -397,6 +557,7 @@ export const deviceIpHistory = pgTable('device_ip_history', {
 }, (table) => ({
   deviceIdIdx: index('device_ip_history_device_id_idx').on(table.deviceId),
   orgIdIdx: index('device_ip_history_org_id_idx').on(table.orgId),
+  orgMacIdx: index('device_ip_history_org_mac_idx').on(table.orgId, sql`lower(${table.macAddress})`),
   ipAddressIdx: index('device_ip_history_ip_address_idx').on(table.ipAddress),
   firstSeenIdx: index('device_ip_history_first_seen_idx').on(table.firstSeen),
   lastSeenIdx: index('device_ip_history_last_seen_idx').on(table.lastSeen),
@@ -418,6 +579,41 @@ export const deviceDisks = pgTable('device_disks', {
   health: varchar('health', { length: 50 }).default('healthy'),
   updatedAt: timestamp('updated_at').defaultNow().notNull()
 });
+
+// Per-slot memory inventory (#5351). One row per physical slot, populated or
+// empty (populated = false). Synced by slotKey from the agent's hardware
+// report (services/inventoryChildSync.ts syncDeviceMemoryModules), so row ids
+// survive unchanged reports. Migration:
+// 2026-11-01-110000-device-memory-modules.sql, which also declares the
+// composite FK DEFERRABLE INITIALLY IMMEDIATE (drizzle's foreignKey() builder
+// has no deferrable option) and installs the partner-export material triggers.
+export const deviceMemoryModules = pgTable('device_memory_modules', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  deviceId: uuid('device_id').notNull().references(() => devices.id),
+  orgId: uuid('org_id').notNull().references(() => organizations.id),
+  slotKey: varchar('slot_key', { length: 160 }).notNull(),
+  slotIndex: integer('slot_index').notNull(),
+  locator: varchar('locator', { length: 128 }).notNull(),
+  bankLabel: varchar('bank_label', { length: 128 }),
+  populated: boolean('populated').notNull(),
+  capacityMb: integer('capacity_mb'),
+  memoryType: varchar('memory_type', { length: 32 }),
+  formFactor: varchar('form_factor', { length: 32 }),
+  speedMts: integer('speed_mts'),
+  configuredSpeedMts: integer('configured_speed_mts'),
+  manufacturer: varchar('manufacturer', { length: 128 }),
+  partNumber: varchar('part_number', { length: 128 }),
+  serialNumber: varchar('serial_number', { length: 128 }),
+  updatedAt: timestamp('updated_at').defaultNow().notNull()
+}, (table) => ({
+  deviceSlotKeyUnique: uniqueIndex('device_memory_modules_device_slot_key_uniq').on(table.deviceId, table.slotKey),
+  orgIdIdx: index('device_memory_modules_org_id_idx').on(table.orgId),
+  deviceOrgFk: foreignKey({
+    columns: [table.deviceId, table.orgId],
+    foreignColumns: [devices.id, devices.orgId],
+    name: 'device_memory_modules_device_org_fk',
+  }).onUpdate('cascade').onDelete('cascade'),
+}));
 
 export const deviceMetrics = pgTable('device_metrics', {
   deviceId: uuid('device_id').notNull().references(() => devices.id),
@@ -467,7 +663,7 @@ export const deviceProcessSamples = pgTable('device_process_samples', {
 
 export const deviceSoftware = pgTable('device_software', {
   id: uuid('id').primaryKey().defaultRandom(),
-  deviceId: uuid('device_id').notNull().references(() => devices.id),
+  deviceId: uuid('device_id').notNull().references(() => devices.id, { onDelete: 'cascade' }),
   name: varchar('name', { length: 500 }).notNull(),
   version: varchar('version', { length: 100 }),
   publisher: varchar('publisher', { length: 255 }),
@@ -504,13 +700,21 @@ export const deviceConfigState = pgTable('device_config_state', {
 
 export const deviceGroups = pgTable('device_groups', {
   id: uuid('id').primaryKey().defaultRandom(),
-  orgId: uuid('org_id').notNull().references(() => organizations.id),
+  // org_id XOR partner_id (#10521). NULL org_id = a partner-owned group whose
+  // members live in every org of the partner; memberships keep the DEVICE's org.
+  // Use services/deviceGroupOwnership.ts helpers, never `group.orgId` alone.
+  orgId: uuid('org_id').references(() => organizations.id),
+  partnerId: uuid('partner_id').references(() => partners.id),
   siteId: uuid('site_id').references(() => sites.id),
   name: varchar('name', { length: 255 }).notNull(),
   type: deviceGroupTypeEnum('type').notNull().default('static'),
   rules: jsonb('rules'),
   filterConditions: jsonb('filter_conditions'),
   filterFieldsUsed: text('filter_fields_used').array().default([]),
+  filterRevision: integer('filter_revision').notNull().default(1),
+  evaluatedRevision: integer('evaluated_revision').notNull().default(0),
+  evaluatedAt: timestamp('evaluated_at'),
+  evaluationFailedOrgs: integer('evaluation_failed_orgs').notNull().default(0),
   parentId: uuid('parent_id'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull()
@@ -518,6 +722,7 @@ export const deviceGroups = pgTable('device_groups', {
   // Composite-FK target for contract_lines(device_group_id, org_id) (#3205 W02).
   // Created in SQL migration 2026-10-06-100100; declared here for db:check-drift.
   idOrgUnique: uniqueIndex('device_groups_id_org_id_uniq').on(table.id, table.orgId),
+  partnerIdIdx: index('device_groups_partner_id_idx').on(table.partnerId).where(sql`partner_id IS NOT NULL`),
 }));
 
 export const deviceGroupMemberships = pgTable('device_group_memberships', {
@@ -529,21 +734,13 @@ export const deviceGroupMemberships = pgTable('device_group_memberships', {
   addedBy: membershipSourceEnum('added_by').notNull().default('manual')
 }, (table) => ({
   pk: primaryKey({ columns: [table.deviceId, table.groupId] }),
-  // #3182 — the row's org_id alone is what RLS gates on, so without these the
-  // group_id and device_id are free to name a DIFFERENT org's group/device.
-  // Together they pin the triangle: group.org_id = membership.org_id =
-  // device.org_id. Created in SQL migration
-  // 2026-10-09-000200-device-group-memberships-composite-tenant-fks.sql, which
-  // also declares them DEFERRABLE INITIALLY IMMEDIATE (drizzle-orm's
-  // foreignKey() builder has no deferrable option, so that detail lives in the
-  // migration only) and adds the detach — to breeze_cascade_device_org_id(),
-  // an AFTER trigger — that drops these rows on a cross-org device move.
-  // Declared here for db:check-drift.
-  groupOrgFk: foreignKey({
-    columns: [table.groupId, table.orgId],
-    foreignColumns: [deviceGroups.id, deviceGroups.orgId],
-    name: 'device_group_memberships_group_org_fk',
-  }),
+  // #3182 / #10521 W1: membership.org_id remains the device's organization.
+  // The device composite FK is DEFERRABLE INITIALLY DEFERRED in
+  // 2026-10-09-000200 (Drizzle has no deferrable option). The deferred owner
+  // trigger in 2027-01-12-200100-device-group-membership-owner-integrity.sql
+  // replaces the group composite FK: an org group must match membership.org_id;
+  // a partner group must match that organization's partner. Both checks wait
+  // until COMMIT so the device-move detach and merge repoints can finish.
   deviceOrgFk: foreignKey({
     columns: [table.deviceId, table.orgId],
     foreignColumns: [devices.id, devices.orgId],
@@ -593,6 +790,14 @@ export const deviceCommands = pgTable('device_commands', {
   // clock). NULL = legacy rule (execution timeout measured from created_at).
   // See services/commandOfflinePolicy.ts and jobs/staleCommandReaper.ts.
   deliverBy: timestamp('deliver_by', { withTimezone: true }),
+  // #3578 -- the last in-flight stage the agent reported for this command over
+  // the `command_progress` WS frame (services/commandProgress.ts), and when it
+  // reported it. NULL on every row from an agent that predates the frame, and
+  // until the first report. Advisory only: nothing gates on it -- terminal
+  // state is still owned by `status`. See
+  // 2026-11-08-113300-device-commands-progress-stage.sql.
+  progressStage: varchar('progress_stage', { length: 32 }),
+  progressAt: timestamp('progress_at', { withTimezone: true }),
   // #5128 -- the device's org at enqueue. PROVENANCE, not tenancy: compared at
   // claim time to cancel rows whose device has since moved org. Deliberately
   // NOT named org_id so the RLS/cascade auto-discovery keeps device_commands
@@ -605,8 +810,17 @@ export const deviceCommands = pgTable('device_commands', {
   // table as system-scoped (both key on the literal column name).
   aiInitiatorKind: aiInitiatorKindEnum('ai_initiator_kind'),
   aiSessionId: uuid('ai_session_id'),
-  aiAgentRunId: uuid('ai_agent_run_id')
-});
+  aiAgentRunId: uuid('ai_agent_run_id'),
+  // Reinstall reattach W1a (#8318 §4.2): the devices.install_incarnation this
+  // row was enqueued for. Stamped by the device_commands_stamp_incarnation
+  // trigger on EVERY insert (a value written here is overwritten) and
+  // immutable after. NULL only on rows from before the trigger, and a NULL
+  // counts as incarnation 1. See services/commandIncarnation.ts.
+  deviceIncarnation: integer('device_incarnation')
+}, (table) => ({
+  executionLookupIdx: index('cloudcom_device_commands_execution_idx')
+    .on(table.type, sql`(${table.payload}->>'executionId')`),
+}));
 
 export const connectionProtocolEnum = pgEnum('connection_protocol', ['tcp', 'tcp6', 'udp', 'udp6']);
 

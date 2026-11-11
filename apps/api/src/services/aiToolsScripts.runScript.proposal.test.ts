@@ -10,6 +10,11 @@ const { flagMock, runnableMock, dispatchMock, accessMock, waitMock, transitionMo
 }));
 
 vi.mock('../config/env', () => ({ aiScriptAuthoringEnabled: flagMock }));
+// AI data policy (#8854): the gate's own resolver, faked per test.
+const policyMock = vi.hoisted(() => vi.fn(async (_devices: Array<{ orgId: string }>) => ({
+  deviceFileReadLevel: 'no_user_profiles' as string, source: { deviceFileReadLevel: 'partner' as string },
+})));
+vi.mock('./aiDevicePathPolicy', () => ({ resolveDevicePolicyForGate: policyMock }));
 vi.mock('./scriptProposals', async () => ({
   // The derivation itself is real (approvalMethod.test.ts pins it per value);
   // this suite proves the handler feeds it the context's decision record.
@@ -21,12 +26,24 @@ vi.mock('./scriptProposals', async () => ({
 vi.mock('./scriptDispatch', () => ({ dispatchScriptToDevice: dispatchMock }));
 vi.mock('./commandQueue', () => ({ waitForCommandResult: waitMock, executeCommand: vi.fn() }));
 const TX = { tx: true };
+// #7103 — open system contexts; a send must observe 0.
+const txState = vi.hoisted(() => ({ open: 0 }));
 vi.mock('../db', () => ({
+  // These handlers run as under the per-call transaction: `inToolDbPhase`
+  // (#7918) joins it rather than opening a context of its own.
+  hasDbAccessContext: vi.fn(() => true),
   db: {
     select: () => ({ from: () => ({ where: () => ({ limit: accessMock }) }) }),
     transaction: (fn: (tx: unknown) => unknown) => fn(TX),
   },
-  withSystemDbAccessContext: <T,>(fn: () => Promise<T>) => fn(),
+  withSystemDbAccessContext: async <T,>(fn: () => Promise<T>) => {
+    txState.open += 1;
+    try {
+      return await fn();
+    } finally {
+      txState.open -= 1;
+    }
+  },
   runOutsideDbContext: <T,>(fn: () => T) => fn(),
 }));
 
@@ -73,6 +90,33 @@ describe('run_script proposal branch', () => {
   it('passes the releasing intent id from the execution context to the runnability check', async () => {
     await __testOnly.runScriptHandler({ proposalId: 'p1', deviceIds: ['d1'] }, auth, { actionIntentId: 'i1' } as never);
     expect(runnableMock).toHaveBeenLastCalledWith(auth, expect.objectContaining({ proposalId: 'p1', releasingIntentId: 'i1' }));
+  });
+
+  // #7103 — the proposal run created its rows in a system context and sent
+  // inside it, before the commit.
+  it('creates the rows inside the system context and sends only after it closed', async () => {
+    runnableMock.mockResolvedValueOnce({
+      ok: true,
+      proposal: { id: 'p1', language: 'powershell', runAs: 'system', timeoutSeconds: 300, contentDigest: 'a'.repeat(64), riskTier: 'low' },
+    } as never);
+    const events: Array<{ kind: string; open: number }> = [];
+    dispatchMock.mockImplementationOnce((async (input: { deferDelivery?: boolean }) => {
+      events.push({ kind: 'create', open: txState.open });
+      const base = { ok: true, commandId: 'c1', executionId: 'e1', runAs: 'system' };
+      const deliver = async () => {
+        events.push({ kind: 'send', open: txState.open });
+        return { ...base, delivered: true, deliveryOutcome: 'sent' };
+      };
+      return input.deferDelivery ? { ...base, delivered: false, deliveryOutcome: 'deferred', deliver } : deliver();
+    }) as never);
+
+    const out = JSON.parse(await __testOnly.runScriptHandler({ proposalId: 'p1', deviceIds: ['d1'] }, auth));
+
+    expect(events).toEqual([
+      { kind: 'create', open: 1 },
+      { kind: 'send', open: 0 },
+    ]);
+    expect(out.results.d1.executionId).toBe('e1');
   });
 
   // W03 (#5612): `executed` is the precondition for verification (§4.9) and,
@@ -140,6 +184,50 @@ describe('run_script proposal branch', () => {
         actionIntentId: 'i1', releaseDecision: { approvalScope: 'four_eyes', decidedVia: 'webauthn_platform' },
       });
       expect(methodOf()).toBe('four_eyes');
+    });
+  });
+
+  describe('AI data policy: profile paths in proposal content (#8854)', () => {
+    const PROFILE_PROPOSAL = {
+      id: 'p1', language: 'powershell', runAs: 'system', timeoutSeconds: 300, contentDigest: 'a'.repeat(64), riskTier: 'low',
+      content: 'Get-Content C:\\Users\\bob\\Documents\\a.txt',
+    };
+
+    beforeEach(() => { policyMock.mockClear(); });
+
+    it('refuses under no_user_profiles, resolved from the target DEVICE rows, before any dispatch', async () => {
+      runnableMock.mockResolvedValueOnce({ ok: true, proposal: PROFILE_PROPOSAL } as never);
+      const out = JSON.parse(await __testOnly.runScriptHandler({ proposalId: 'p1', deviceIds: ['d1'] }, auth));
+      expect(out.condition).toBe('policy_denied');
+      expect(out.policy).toEqual({ level: 'no_user_profiles', source: 'partner' });
+      expect(out.error).toContain('C:\\Users\\bob\\Documents\\a.txt');
+      expect(out.proposalId).toBe('p1');
+      expect(policyMock).toHaveBeenCalledWith([expect.objectContaining({ id: 'd1', orgId: 'org-1' })]);
+      expect(dispatchMock).not.toHaveBeenCalled();
+      expect(transitionMock).not.toHaveBeenCalled();
+    });
+
+    it('refuses when the partner cannot be established (unresolved = off)', async () => {
+      runnableMock.mockResolvedValueOnce({ ok: true, proposal: PROFILE_PROPOSAL } as never);
+      policyMock.mockResolvedValueOnce({ deviceFileReadLevel: 'off', source: { deviceFileReadLevel: 'unresolved' } });
+      const out = JSON.parse(await __testOnly.runScriptHandler({ proposalId: 'p1', deviceIds: ['d1'] }, auth));
+      expect(out.policy).toEqual({ level: 'off', source: 'unresolved' });
+      expect(dispatchMock).not.toHaveBeenCalled();
+    });
+
+    it('dispatches under any_with_approval', async () => {
+      runnableMock.mockResolvedValueOnce({ ok: true, proposal: PROFILE_PROPOSAL } as never);
+      policyMock.mockResolvedValueOnce({ deviceFileReadLevel: 'any_with_approval', source: { deviceFileReadLevel: 'partner' } });
+      const out = JSON.parse(await __testOnly.runScriptHandler({ proposalId: 'p1', deviceIds: ['d1'] }, auth));
+      expect(dispatchMock).toHaveBeenCalledTimes(1);
+      expect(out.results.d1.executionId).toBe('e1');
+    });
+
+    it('takes no policy read for content without a profile path', async () => {
+      runnableMock.mockResolvedValueOnce({ ok: true, proposal: { ...PROFILE_PROPOSAL, content: 'Get-Content C:\\ProgramData\\Vendor\\app.log' } } as never);
+      await __testOnly.runScriptHandler({ proposalId: 'p1', deviceIds: ['d1'] }, auth);
+      expect(policyMock).not.toHaveBeenCalled();
+      expect(dispatchMock).toHaveBeenCalledTimes(1);
     });
   });
 });

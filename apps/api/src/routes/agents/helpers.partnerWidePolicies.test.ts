@@ -39,12 +39,13 @@
  * context, with and without `currentPartnerId`).
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { DevicePolicySet } from '../../services/devicePolicySet';
 
 // ---------------------------------------------------------------------------
 // Hoisted mocks
 // ---------------------------------------------------------------------------
 
-const { dbMock, redisMock, getRedisImpl, ownershipMock, systemEscapeMock } = vi.hoisted(() => {
+const { dbMock, redisMock, getRedisImpl, ownershipMock, systemEscapeMock, eqMock } = vi.hoisted(() => {
   let selectCallQueue: unknown[][] = [];
   let selectCallIdx = 0;
 
@@ -79,6 +80,7 @@ const { dbMock, redisMock, getRedisImpl, ownershipMock, systemEscapeMock } = vi.
   };
 
   return {
+    eqMock: vi.fn(),
     dbMock,
     redisMock,
     getRedisImpl: vi.fn(() => redisMock as any),
@@ -96,6 +98,13 @@ const { dbMock, redisMock, getRedisImpl, ownershipMock, systemEscapeMock } = vi.
     }),
   };
 });
+
+vi.mock('drizzle-orm', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('drizzle-orm')>();
+  eqMock.mockImplementation(actual.eq);
+  return { ...actual, eq: eqMock };
+});
+import { configPolicyEffectiveFeatureLinks, configPolicyFeatureLinks, configPolicyMonitoringWatches } from '../../db/schema';
 
 vi.mock('../../db', () => ({
   runOutsideDbContext: systemEscapeMock,
@@ -122,7 +131,8 @@ vi.mock('../../db/schema', () => ({
     configPolicyId: 'cpa.configPolicyId',
     priority: 'cpa.priority',
   },
-  configurationPolicies: { id: 'cp.id', status: 'cp.status', orgId: 'cp.orgId', partnerId: 'cp.partnerId' },
+  configurationPolicies: { id: 'cp.id', parentPolicyId: 'cp.parentPolicyId', status: 'cp.status', orgId: 'cp.orgId', partnerId: 'cp.partnerId' },
+  configPolicyFeatureLinks: { id: 'cpfl.id', configPolicyId: 'cpfl.configPolicyId', featureType: 'cpfl.featureType' },
   configPolicyEffectiveFeatureLinks: {
     id: 'cpefl.id',
     configPolicyId: 'cpefl.configPolicyId',
@@ -139,6 +149,7 @@ vi.mock('../../db/schema', () => ({
     minimumLevel: 'cpels.minimumLevel',
     collectionIntervalMinutes: 'cpels.collectionIntervalMinutes',
     rateLimitPerHour: 'cpels.rateLimitPerHour',
+    applicationProviders: 'cpels.applicationProviders',
   },
   configPolicyMonitoringSettings: {
     id: 'cpms.id',
@@ -204,7 +215,13 @@ vi.mock('../../services/featureConfigResolver', async (importOriginal) => {
     buildRoleOsFilterConditions: vi.fn(() => []),
   };
 });
-vi.mock('../../services/onedriveGraph', () => ({ resolveUserGroupMembershipCached: vi.fn() }));
+vi.mock('../../services/onedriveGraph', () => ({
+  resolveUserGroupMembershipCached: vi.fn(),
+  peekUserGroupMembershipCached: vi.fn(() => null),
+}));
+const loadConnectionMock = vi.hoisted(() => vi.fn(async () => null as unknown));
+// Fully mocked (no importOriginal): the real module pulls in secretCrypto / c2cM365.
+vi.mock('../../services/m365DirectGraph', () => ({ loadLegacyDirectConnection: loadConnectionMock }));
 vi.mock('../../services/filesystemAnalysis', () => ({
   getFilesystemScanState: vi.fn(),
   mergeFilesystemAnalysisPayload: vi.fn(),
@@ -229,7 +246,11 @@ import {
   buildPamConfigUpdate,
   buildHelperConfigUpdate,
   buildOnedriveHelperConfigUpdate,
+  finishOnedriveHelperConfig,
+  loadOnedriveHelperConfigPlan,
+  type OnedriveConfigPlan,
 } from './helpers';
+import { peekUserGroupMembershipCached, resolveUserGroupMembershipCached } from '../../services/onedriveGraph';
 import { ORG_SCOPED_ONLY_FEATURE_TYPES } from '@breeze/shared';
 
 const DEVICE_ID = '00000000-0000-4000-8000-000000000001';
@@ -240,20 +261,6 @@ const PARTNER_ID = '00000000-0000-4000-8000-000000000004';
 const deviceRow = [{ orgId: ORG_ID, siteId: SITE_ID, deviceRole: 'workstation', osType: 'windows' }];
 const orgWithPartner = [{ partnerId: PARTNER_ID }];
 const orgWithoutPartner = [{ partnerId: null }];
-
-/** A watch row shaped like config_policy_monitoring_watches. */
-const watchRow = {
-  watchType: 'service' as const,
-  name: 'Spooler',
-  alertOnStop: true,
-  alertAfterConsecutiveFailures: 2,
-  autoRestart: false,
-  maxRestartAttempts: 3,
-  restartCooldownSeconds: 60,
-  cpuThresholdPercent: null,
-  memoryThresholdMb: null,
-  thresholdDurationSeconds: null,
-};
 
 const eventLogPolicyRow = (level: string) => ({
   level,
@@ -274,7 +281,7 @@ beforeEach(() => {
 
 /**
  * Every agent-facing resolver must (a) hand the device org's partner to the
- * ownership predicate and (b) take the partner-wide RLS escape. Table-driven so
+ * ownership predicate and (b) stay in the caller's DB context. Table-driven so
  * a newly added resolver that forgets either half is a one-line addition here.
  */
 describe.each([
@@ -290,8 +297,9 @@ describe.each([
       deviceRow,
       org,
       [],
-      [{ level: 'partner', assignmentPriority: 1, settingsId: 'set-1', checkIntervalSeconds: 90 }],
-      [watchRow],
+      [{ policyId: 'policy-1', parentPolicyId: null, level: 'partner', assignmentPriority: 1 }],
+      [{ policyId: 'policy-1', checkIntervalSeconds: 90 }],
+      deviceRow, org, [], [], // monitor resolution: device found, no monitors
     ],
   },
   {
@@ -410,6 +418,54 @@ describe('partner-owned policies actually reach the agent payload', () => {
     expect(settings.max_events_per_cycle).toBe(10);
   });
 
+  it('event_log: sends only the winning policy providers, never their union', async () => {
+    dbMock._resetQueue([deviceRow, orgWithPartner, [], [
+      { ...eventLogPolicyRow('partner'), applicationProviders: ['Partner Provider'] },
+      { ...eventLogPolicyRow('organization'), applicationProviders: ['Dell UPS Local Node Manager'] },
+    ]]);
+    expect((await buildEventLogConfigUpdate(DEVICE_ID)).application_providers).toEqual(['Dell UPS Local Node Manager']);
+  });
+
+  it('event_log: the preloaded policy-set path also sends only the winner list', async () => {
+    const policySet: DevicePolicySet = {
+      deviceId: DEVICE_ID,
+      hierarchy: {
+        deviceId: DEVICE_ID, orgId: ORG_ID, siteId: SITE_ID, deviceRole: 'workstation', osType: 'windows',
+        org: { partnerId: PARTNER_ID, type: 'customer' }, site: null, groupIds: [],
+      },
+      candidates: (['partner', 'organization'] as const).map((level) => ({
+        assignmentId: level, level, targetId: level === 'partner' ? PARTNER_ID : ORG_ID,
+        priority: 1, roleFilter: null, osFilter: null, assignmentCreatedAt: new Date(0),
+        policyId: level, policyName: level,
+        policyOrgId: level === 'partner' ? null : ORG_ID,
+        policyPartnerId: level === 'partner' ? PARTNER_ID : null,
+        parentPolicyId: null,
+        links: { event_log: {
+          id: level, featureType: 'event_log', featurePolicyId: null, inlineSettings: null,
+          eventLog: {
+            ...eventLogPolicyRow(level), id: level, minimumLevel: 'warning',
+            applicationProviders: [level === 'partner' ? 'Partner Provider' : 'MSSQL$SQLEXPRESS'],
+          },
+          hardwareMonitoring: null, patch: null, timeSync: null, onedrive: null,
+        } },
+      })),
+    };
+    expect((await buildEventLogConfigUpdate(DEVICE_ID, { policySet })).application_providers).toEqual(['MSSQL$SQLEXPRESS']);
+    expect(dbMock.select).not.toHaveBeenCalled();
+  });
+
+  it('event_log: sends an empty provider list when no policy applies', async () => {
+    dbMock._resetQueue([deviceRow, orgWithPartner, [], []]);
+    expect((await buildEventLogConfigUpdate(DEVICE_ID)).application_providers).toEqual([]);
+  });
+
+  it('event_log: sends an empty list for cached settings from the previous release', async () => {
+    getRedisImpl.mockReturnValue(redisMock);
+    redisMock.get.mockResolvedValueOnce(JSON.stringify({ orgId: ORG_ID, settings: eventLogPolicyRow('partner') }));
+    expect((await buildEventLogConfigUpdate(DEVICE_ID, { orgId: ORG_ID })).application_providers).toEqual([]);
+    expect(dbMock.select).not.toHaveBeenCalled();
+  });
+
   it('event_log: an assignment with a non-matching osFilter loses to a matching one', async () => {
     // Org-level assignment has osFilter = ['linux'] (mismatch for windows device).
     // Partner-level assignment has osFilter = ['windows'] (matches).
@@ -462,15 +518,15 @@ describe('partner-owned policies actually reach the agent payload', () => {
     expect(result.uacInterceptionEnabled).toBe(true);
   });
 
-  it('monitoring: a partner-level policy delivers its watches', async () => {
+  it('reads the monitors interval without querying historical watches', async () => {
     dbMock._resetQueue([
       deviceRow,
       orgWithPartner,
       [],
-      [{ level: 'partner', assignmentPriority: 1, settingsId: 'set-1', checkIntervalSeconds: 90 }],
-      [watchRow],
+      [{ policyId: 'policy-1', parentPolicyId: null, level: 'partner', assignmentPriority: 1 }],
+      [{ policyId: 'policy-1', checkIntervalSeconds: 90 }],
       // resolveMonitorDerivedWatches runs its OWN resolveMonitorsForDevice
-      // pass after the policy-tab lookup above (#5677's discriminated
+      // pass after the interval lookup above (#5677's discriminated
       // result correctly tells device-not-found apart from device-found-
       // zero-monitors, so this scenario's device/org/group/assignment reads
       // must be queued too, or the resolver reads past the end of the queue
@@ -483,21 +539,21 @@ describe('partner-owned policies actually reach the agent payload', () => {
 
     const result = await buildMonitoringConfigUpdate(DEVICE_ID);
 
-    expect(result?.check_interval_seconds).toBe(90);
-    expect(result?.watches).toHaveLength(1);
-    expect(result?.watches[0]?.name).toBe('Spooler');
+    const tables = dbMock.select.mock.results.map(r => r.value.from.mock.calls[0]?.[0]);
+    expect(tables).not.toContain(configPolicyMonitoringWatches);
+    expect(tables).toContain(configPolicyFeatureLinks);
+    expect(eqMock).toHaveBeenCalledWith(configPolicyFeatureLinks.featureType, 'monitors');
+    expect(eqMock).not.toHaveBeenCalledWith(configPolicyEffectiveFeatureLinks.featureType, 'monitoring');
+    expect(result).toEqual({ check_interval_seconds: 90, watches: [] });
   });
 
-  it('monitoring: the watches read shares the policy join\'s escape, not a second one', async () => {
-    // The watches table's RLS walks settings_id → feature link →
-    // configuration_policies, so reading it outside the escape would find the
-    // partner-owned policy and then resolve zero watches (returning null).
+  it('monitoring: the interval read stays in the caller context', async () => {
     dbMock._resetQueue([
       deviceRow,
       orgWithPartner,
       [],
-      [{ level: 'partner', assignmentPriority: 1, settingsId: 'set-1', checkIntervalSeconds: 90 }],
-      [watchRow],
+      [{ policyId: 'policy-1', parentPolicyId: null, level: 'partner', assignmentPriority: 1 }],
+      [{ policyId: 'policy-1', checkIntervalSeconds: 90 }],
       // resolveMonitorDerivedWatches's own resolveMonitorsForDevice pass —
       // device found, zero monitor assignments (see #5677 comment above).
       // This test only asserts systemEscapeMock, but leaving the queue
@@ -527,8 +583,8 @@ describe('monitoring: a matched policy with zero enabled watches (#2949)', () =>
       deviceRow,
       orgWithPartner,
       [],
-      [{ level: 'organization', assignmentPriority: 1, settingsId: 'set-1', checkIntervalSeconds: 90 }],
-      [], // no enabled watches for the winning settings row
+      [{ policyId: 'policy-1', parentPolicyId: null, level: 'organization', assignmentPriority: 1 }],
+      [{ policyId: 'policy-1', checkIntervalSeconds: 90 }],
       // resolveMonitorDerivedWatches's own resolveMonitorsForDevice pass —
       // device found, zero monitor assignments (see #5677 comment above).
       deviceRow,
@@ -544,14 +600,14 @@ describe('monitoring: a matched policy with zero enabled watches (#2949)', () =>
     expect(result?.watches).toEqual([]);
   });
 
-  it('still returns null when no policy row matches at all', async () => {
+  it('sends an explicit empty config (not null) when no policy row matches at all — the deleted/unassigned policy clear (#2949)', async () => {
     dbMock._resetQueue([
       deviceRow,
       orgWithPartner,
       [],
       [], // no assignment/policy rows matched
       // resolveMonitorDerivedWatches's own resolveMonitorsForDevice pass —
-      // device found, zero monitor assignments — so the null result below
+      // device found, zero monitor assignments — so the empty result below
       // is genuinely "no policy and no monitors", not a device_missing
       // false positive from an exhausted queue.
       deviceRow,
@@ -562,7 +618,7 @@ describe('monitoring: a matched policy with zero enabled watches (#2949)', () =>
 
     const result = await buildMonitoringConfigUpdate(DEVICE_ID);
 
-    expect(result).toBeNull();
+    expect(result).toEqual({ check_interval_seconds: 60, watches: [] });
   });
 
   it('caches the empty-watches result via redis.set, same as any other match', async () => {
@@ -575,8 +631,8 @@ describe('monitoring: a matched policy with zero enabled watches (#2949)', () =>
       deviceRow,
       orgWithPartner,
       [],
-      [{ level: 'organization', assignmentPriority: 1, settingsId: 'set-1', checkIntervalSeconds: 90 }],
-      [], // no enabled watches for the winning settings row
+      [{ policyId: 'policy-1', parentPolicyId: null, level: 'organization', assignmentPriority: 1 }],
+      [{ policyId: 'policy-1', checkIntervalSeconds: 90 }],
       // resolveMonitorDerivedWatches's own resolveMonitorsForDevice pass —
       // device found, zero monitor assignments (see #5677 comment above).
       deviceRow,
@@ -585,14 +641,86 @@ describe('monitoring: a matched policy with zero enabled watches (#2949)', () =>
       [],
     ]);
 
-    const result = await buildMonitoringConfigUpdate(DEVICE_ID);
+    const result = await buildMonitoringConfigUpdate(DEVICE_ID, { orgId: ORG_ID });
 
     expect(result?.watches).toEqual([]);
     expect(redisMock.set).toHaveBeenCalledWith(
-      `monitoring:settings:device:${DEVICE_ID}`,
-      JSON.stringify({ check_interval_seconds: 90, watches: [] }),
+      `monitoring:settings:v2:device:${DEVICE_ID}`,
+      JSON.stringify({ orgId: ORG_ID, settings: { check_interval_seconds: 90, watches: [] } }),
       'EX',
       120,
     );
+  });
+});
+
+describe('OneDrive: DB phase captures, Graph phase never reads the DB (#8142)', () => {
+  const graphLib = {
+    id: 'lib-row-1', settingsId: 'set-1', orgId: ORG_ID, libraryId: 'lib-1', displayName: 'Docs', siteUrl: null,
+    siteId: null, webId: null, listId: null, targetingMode: 'graph_group', groupId: 'G-1', groupName: null,
+    hiveScope: 'hkcu', sortOrder: 0, enabled: true,
+  };
+  const base = {
+    silentAccountConfig: true, filesOnDemand: true, kfmSilentOptIn: false, kfmFolders: [],
+    kfmBlockOptOut: false, tenantAssociationId: null, restartOnChange: false,
+  };
+  const connection = { orgId: ORG_ID, clientId: 'c-1' };
+
+  beforeEach(() => {
+    vi.mocked(resolveUserGroupMembershipCached).mockReset();
+    vi.mocked(peekUserGroupMembershipCached).mockReset().mockReturnValue(null);
+    loadConnectionMock.mockReset().mockResolvedValue(null);
+  });
+
+  it('DB phase: captures hits, and loads the connection only because one UPN missed', async () => {
+    dbMock._resetQueue([
+      deviceRow, orgWithPartner, [],
+      [{ level: 'organization', assignmentPriority: 1, settingsId: 'set-1', ...base }],
+      [graphLib],
+      [{ signedInUpns: ['a@contoso.com', 'b@contoso.com'] }],
+    ]);
+    const hit = { kind: 'ok' as const, data: { groupIds: ['g-1'] } };
+    vi.mocked(peekUserGroupMembershipCached).mockImplementation((_org, upn) => (upn === 'a@contoso.com' ? hit : null));
+    loadConnectionMock.mockResolvedValueOnce(connection);
+
+    const plan = await loadOnedriveHelperConfigPlan(DEVICE_ID);
+
+    expect(plan?.upnLookups).toEqual([{ upn: 'a@contoso.com', cached: hit }, { upn: 'b@contoso.com', cached: null }]);
+    expect(plan?.connection).toEqual(connection);
+    expect(loadConnectionMock).toHaveBeenCalledWith(ORG_ID);
+    expect(resolveUserGroupMembershipCached).not.toHaveBeenCalled();
+  });
+
+  it('DB phase: every UPN a hit -> no connection read', async () => {
+    dbMock._resetQueue([
+      deviceRow, orgWithPartner, [],
+      [{ level: 'organization', assignmentPriority: 1, settingsId: 'set-1', ...base }],
+      [graphLib],
+      [{ signedInUpns: ['a@contoso.com'] }],
+    ]);
+    vi.mocked(peekUserGroupMembershipCached).mockReturnValue({ kind: 'ok', data: { groupIds: ['g-1'] } });
+    const plan = await loadOnedriveHelperConfigPlan(DEVICE_ID);
+    expect(plan?.connection).toBeNull();
+    expect(loadConnectionMock).not.toHaveBeenCalled();
+  });
+
+  it('Graph phase: a captured hit is used even if the cache has since expired; a miss uses the preloaded connection; zero DB', async () => {
+    const plan: OnedriveConfigPlan = {
+      deviceId: DEVICE_ID, orgId: ORG_ID, base, libs: [graphLib as never],
+      upnLookups: [
+        { upn: 'a@contoso.com', cached: { kind: 'ok', data: { groupIds: ['g-1'] } } },
+        { upn: 'b@contoso.com', cached: null },
+      ],
+      connection: connection as never,
+    };
+    vi.mocked(resolveUserGroupMembershipCached).mockResolvedValueOnce({ kind: 'ok', data: { groupIds: ['{G-1}'] } });
+    dbMock.select.mockClear();
+
+    const out = await finishOnedriveHelperConfig(plan);
+
+    expect(out.libraries[0]!.allowedUpns).toEqual(['a@contoso.com', 'b@contoso.com']);
+    expect(resolveUserGroupMembershipCached).toHaveBeenCalledTimes(1);
+    expect(resolveUserGroupMembershipCached).toHaveBeenCalledWith(ORG_ID, 'b@contoso.com', { connection });
+    expect(dbMock.select).not.toHaveBeenCalled();
+    expect(loadConnectionMock).not.toHaveBeenCalled();
   });
 });

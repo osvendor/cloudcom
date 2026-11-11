@@ -53,12 +53,15 @@ const h = vi.hoisted(() => {
     // false = not local, so the teardown falls back to signalling the agent.
     closeTerminalSession: vi.fn().mockReturnValue(false),
     closeTunnelSession: vi.fn().mockReturnValue(false),
+    // Depth of runOutsideDbContext calls in progress (#4142: the relay refuses
+    // to run inside a held DB context, so every stop must be sent outside it).
+    outside: { depth: 0 },
   };
 });
 
 // Capture drizzle operator calls as inspectable tagged objects so a test can
 // assert WHICH status predicate the UPDATE targets (active-only vs ne-disconnected).
-// `sql` is a fake tagged-template stand-in: `terminalIntentSet` (SEC-038 W03)
+// `sql` is a fake tagged-template stand-in: `terminalIntentSet`
 // calls it to build the generation-bump / termination-phase SQL fragments that
 // ride along in every terminal `.set()` — without it, `terminalIntentSet`
 // throws "No sql export" and every disconnect silently degrades to
@@ -74,7 +77,10 @@ vi.mock('drizzle-orm', () => ({
 vi.mock('../db', () => ({
   db: h.chain,
   withSystemDbAccessContext: (fn: () => unknown) => fn(),
-  runOutsideDbContext: (fn: () => unknown) => fn(),
+  runOutsideDbContext: async (fn: () => unknown) => {
+    h.outside.depth += 1;
+    try { return await fn(); } finally { h.outside.depth -= 1; }
+  },
 }));
 
 vi.mock('../db/schema', () => ({
@@ -85,7 +91,7 @@ vi.mock('../db/schema', () => ({
     userId: 'remote_sessions.user_id',
     status: 'remote_sessions.status',
     endedAt: 'remote_sessions.ended_at',
-    // SEC-038 W03 terminal-intent contract columns — `terminalIntentSet` reads
+    // Terminal-intent contract columns — `terminalIntentSet` reads
     // these to build the `sql` fragments in every terminal `.set()`.
     desktopStartGeneration: 'remote_sessions.desktop_start_generation',
     terminalGeneration: 'remote_sessions.terminal_generation',
@@ -137,7 +143,7 @@ import {
  * Seed the UPDATE ... RETURNING result (disconnected rows) and the device
  * SELECT ... WHERE result (agent resolution).
  *
- * `toTerminalSessionRow` (SEC-038 W03) throws if a returned row has no
+ * `toTerminalSessionRow` throws if a returned row has no
  * `terminalGeneration`, so every row gets a default bigint generation and
  * `pending` phase unless the caller overrides them.
  */
@@ -205,6 +211,33 @@ describe('terminateUserRemoteSessions', () => {
     expect(statusPredicate.vals).not.toContain('disconnected');
   });
 
+  // #4142: teardown runs inline in request handlers; the relay refuses to run
+  // inside a held DB context, so a cross-instance stop sent from inside it
+  // would never reach the agent.
+  it('sends stop_desktop and terminal_stop outside any held DB context', async () => {
+    const depthAtSend: number[] = [];
+    h.dispatchCommandToAgent.mockImplementation(async () => {
+      depthAtSend.push(h.outside.depth);
+      return { status: 'sent', via: 'relay' };
+    });
+    h.closeTerminalSession.mockReturnValue(false);
+    seed(
+      [
+        { id: 's1', type: 'desktop', deviceId: 'd1' },
+        { id: 's2', type: 'terminal', deviceId: 'd2' },
+      ],
+      [
+        { id: 'd1', agentId: 'agent-1' },
+        { id: 'd2', agentId: 'agent-2' },
+      ],
+    );
+
+    await terminateUserRemoteSessions('u1');
+
+    expect(depthAtSend).toHaveLength(2);
+    expect(depthAtSend.every((d) => d > 0)).toBe(true);
+  });
+
   it('disconnects two desktop sessions: revokes each viewer token and signals stop_desktop per session, returns 2', async () => {
     seed(
       [
@@ -221,7 +254,7 @@ describe('terminateUserRemoteSessions', () => {
 
     expect(result).toBe(2);
     expect(h.chain.update).toHaveBeenCalledTimes(2);
-    // SEC-038 W03: every terminal `.set()` now also carries the generation-bump
+    // Every terminal `.set()` now also carries the generation-bump
     // and termination-phase fragments from `terminalIntentSet` alongside the
     // writer's own columns.
     expect(h.chain.set).toHaveBeenCalledWith(
@@ -238,7 +271,7 @@ describe('terminateUserRemoteSessions', () => {
     expect(h.revokeViewerSession).toHaveBeenCalledWith('s2');
     expect(h.dispatchCommandToAgent).toHaveBeenCalledTimes(2);
     // The stop command id/payload now bind the terminal generation the row
-    // committed at (SEC-038 W03) — `1` here is the seeded default generation.
+    // committed at — `1` here is the seeded default generation.
     expect(h.dispatchCommandToAgent).toHaveBeenCalledWith('agent-1', {
       id: 'desk-stop-s1-1',
       type: 'stop_desktop',

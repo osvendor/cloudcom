@@ -1,7 +1,7 @@
-import '@/lib/i18n';
+import { i18n } from '@/lib/i18n';
 import { useCallback, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Loader2, Lock, Save, Wallet } from 'lucide-react';
+import { Loader2, Lock, Save, ShieldCheck, Wallet } from 'lucide-react';
 import { fetchWithAuth, useAuthStore } from '../../stores/auth';
 import { useDefaultOwnerScope } from '@/hooks/useDefaultOwnerScope';
 import { runAction, ActionError } from '@/lib/runAction';
@@ -10,6 +10,8 @@ import { showToast } from '../shared/Toast';
 import {
   AI_BUDGET_DEFAULTS,
   AI_BUDGET_FIELDS,
+  TOOL_RATE_LIMIT_MULTIPLIER_MAX,
+  TOOL_RATE_LIMIT_MULTIPLIER_MIN,
   aiBudgetSource,
   isAiBudgetFieldLocked,
   withAiBudgetDefaults,
@@ -17,13 +19,55 @@ import {
   type EffectiveAiBudget,
 } from '@/lib/aiBudget';
 import AiBudgetThresholdsInput from './AiBudgetThresholdsInput';
+import { useStableT } from '@/lib/i18n/useStableT';
 
-/** Where the partner-wide copies of these fields are edited. */
-const PARTNER_AI_BUDGETS_HREF = '/settings/partner#ai-budgets';
+/** Where the partner-wide copies of these fields are edited, per section. */
+const PARTNER_HREF = {
+  budget: '/settings/partner#ai-budgets',
+  approvals: '/settings/partner#ai-approvals',
+} as const;
+
+/**
+ * Approval mode is stored with the budget fields (`ai_budgets`, PUT
+ * /ai/budget, one resolver) but is not a budget and applies whether or not
+ * any cap is set, so it renders as its own card next to the approval timeout.
+ */
+const SECTION_FIELDS: Record<Section, readonly AiBudgetField[]> = {
+  budget: AI_BUDGET_FIELDS.filter((f) => f !== 'approvalMode'),
+  approvals: ['approvalMode'],
+};
+
+type Section = 'budget' | 'approvals';
+
+/**
+ * Pulls the per-field zod messages out of a PUT /ai/budget 400 body (the
+ * shared zValidator `{error, details: {formErrors, fieldErrors}}` shape) so
+ * the offending input can be highlighted and given its own readable text
+ * instead of leaving the user to parse `toolRateLimitMultiplier: Too big…`
+ * out of a toast (sweep E2).
+ */
+function extractFieldErrors(body: unknown): Partial<Record<AiBudgetField, string>> | null {
+  if (!body || typeof body !== 'object') return null;
+  const details = (body as Record<string, unknown>).details;
+  if (!details || typeof details !== 'object' || Array.isArray(details)) return null;
+  const fieldErrors = (details as Record<string, unknown>).fieldErrors;
+  if (!fieldErrors || typeof fieldErrors !== 'object' || Array.isArray(fieldErrors)) return null;
+
+  const out: Partial<Record<AiBudgetField, string>> = {};
+  for (const [field, messages] of Object.entries(fieldErrors as Record<string, unknown>)) {
+    if (!AI_BUDGET_FIELDS.includes(field as AiBudgetField)) continue;
+    if (Array.isArray(messages) && typeof messages[0] === 'string' && messages[0].length > 0) {
+      out[field as AiBudgetField] = messages[0];
+    }
+  }
+  return Object.keys(out).length > 0 ? out : null;
+}
 
 type Props = {
   /** The organization being edited. `null` while the page has no org context. */
   orgId: string | null;
+  /** Which card to render. Both share the same load, lock model and save path. */
+  section?: Section;
 };
 
 /** Draft text per field. `''` always means "leave as inherited". */
@@ -38,6 +82,7 @@ const EMPTY_DRAFT: Draft = {
   messagesPerHourPerOrg: '',
   approvalMode: '',
   alertThresholdPercents: '',
+  toolRateLimitMultiplier: '',
 };
 
 const APPROVAL_MODE_LABEL_KEYS = {
@@ -57,12 +102,17 @@ const APPROVAL_MODE_HELP_KEYS = {
 const centsToDollars = (cents: number | null): string => (cents == null ? '' : (cents / 100).toFixed(2));
 
 /**
- * Org-side editor for the eight AI budget fields (#6004).
+ * Org-side editor for the AI budget fields (#6004; #6476 added the per-tool
+ * rate-limit multiplier).
  *
  * Moved here from `AiUsagePage` so it sits beside every other partner-enforced
  * org setting (Security, Event Logs, Notifications) and so the usage page can
  * never render a form it has no org to save (the "Organization context
  * required" 400).
+ *
+ * `section="approvals"` renders the approval-mode field as its own card (it is
+ * stored with the budget fields but is not a budget); each card loads, locks
+ * and saves only its own section's fields.
  *
  * Two contracts this file exists to hold:
  *
@@ -77,8 +127,10 @@ const centsToDollars = (cents: number | null): string => (cents == null ? '' : (
  *    partner-enforced field; the control is disabled and excluded from the
  *    payload, and the amber note points at where the value actually lives.
  */
-export default function OrgAiBudgetSettings({ orgId }: Props) {
+export default function OrgAiBudgetSettings({ orgId, section = 'budget' }: Props) {
+  const sectionFields = SECTION_FIELDS[section];
   const { t } = useTranslation('settings');
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   const { isPartnerScope } = useDefaultOwnerScope();
   const canManagePartnerWide = useAuthStore((s) => s.user?.canManagePartnerWide) !== false;
   const showPartnerLink = isPartnerScope && canManagePartnerWide;
@@ -97,6 +149,7 @@ export default function OrgAiBudgetSettings({ orgId }: Props) {
   const [loadFailed, setLoadFailed] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [fieldErrors, setFieldErrors] = useState<Partial<Record<AiBudgetField, string>> | null>(null);
 
   const load = useCallback(async () => {
     if (!orgId) {
@@ -106,7 +159,7 @@ export default function OrgAiBudgetSettings({ orgId }: Props) {
     setLoading(true);
     try {
       const res = await fetchWithAuth(`/orgs/organizations/${orgId}/effective-settings`);
-      if (!res.ok) throw new Error(t('aiUsagePage.failedToLoadData'));
+      if (!res.ok) throw new Error(stableT('aiUsagePage.failedToLoadData'));
       const data = await res.json();
       const lockedList: string[] = data.locked ?? [];
       const merged = withAiBudgetDefaults(data.effective?.aiBudgets ?? data.aiBudgets);
@@ -136,16 +189,16 @@ export default function OrgAiBudgetSettings({ orgId }: Props) {
       setError(null);
     } catch (err) {
       setLoadFailed(true);
-      setError(err instanceof Error ? err.message : t('aiUsagePage.failedToLoadData'));
+      setError(err instanceof Error ? err.message : stableT('aiUsagePage.failedToLoadData'));
     } finally {
       setLoading(false);
     }
-  }, [orgId, t]);
+  }, [orgId, stableT]);
 
   useEffect(() => { void load(); }, [load]);
 
   const isLocked = (field: AiBudgetField) => isAiBudgetFieldLocked(locked, field);
-  const allFieldsLocked = AI_BUDGET_FIELDS.every(isLocked);
+  const allFieldsLocked = sectionFields.every(isLocked);
 
   const markTouched = (field: AiBudgetField) =>
     setTouched((prev) => (prev.includes(field) ? prev : [...prev, field]));
@@ -153,6 +206,14 @@ export default function OrgAiBudgetSettings({ orgId }: Props) {
   const setField = (field: AiBudgetField, value: string) => {
     markTouched(field);
     setDraft((prev) => ({ ...prev, [field]: value }));
+    // Editing a field that failed validation clears its highlight — the user
+    // is actively addressing it, and a stale red border past that point is
+    // just noise.
+    setFieldErrors((prev) => {
+      if (!prev || !(field in prev)) return prev;
+      const { [field]: _removed, ...rest } = prev;
+      return Object.keys(rest).length > 0 ? rest : null;
+    });
   };
 
   /**
@@ -193,9 +254,10 @@ export default function OrgAiBudgetSettings({ orgId }: Props) {
     if (!orgId) return;
     setSaving(true);
     setError(null);
+    setFieldErrors(null);
     try {
       const payload: Record<string, unknown> = {};
-      for (const field of AI_BUDGET_FIELDS) {
+      for (const field of sectionFields) {
         if (isLocked(field) || !touched.includes(field)) continue;
         const value = serialize(field);
         if (value !== undefined) payload[field] = value;
@@ -211,6 +273,16 @@ export default function OrgAiBudgetSettings({ orgId }: Props) {
         errorFallback: t('aiUsagePage.failedToSaveBudget'),
         successMessage: t('aiUsagePage.savedSuccessfully'),
         onUnauthorized: () => void navigateTo('/login', { replace: true }),
+        // Reuses the same fieldErrors extraction as the inline highlight below
+        // so the toast reads the field's own message, not the raw
+        // `toolRateLimitMultiplier: …` key extractApiError falls back to
+        // (sweep F8). Only substitutes when exactly one field failed — a
+        // multi-field 400 still gets the joined message.
+        friendly: (_code, _message, body) => {
+          const fe = extractFieldErrors(body);
+          const values = fe ? Object.values(fe) : [];
+          return values.length === 1 ? values[0] : undefined;
+        },
       });
       await load();
     } catch (err) {
@@ -218,7 +290,17 @@ export default function OrgAiBudgetSettings({ orgId }: Props) {
       if (!(err instanceof ActionError)) {
         showToast({ type: 'error', message: t('aiUsagePage.failedToSaveBudget') });
       }
-      setError(err instanceof Error ? err.message : t('aiUsagePage.failedToSaveBudget'));
+      const fe = err instanceof ActionError ? extractFieldErrors(err.body) : null;
+      if (fe) {
+        // The toast already showed the specific "field: message" text; the
+        // inline banner here would just repeat it in raw form, so replace it
+        // with the same "check the fields" headline the toast's detail line
+        // uses — the highlighted inputs below carry the actual reason.
+        setFieldErrors(fe);
+        setError(i18n.exists('errors:VALIDATION_FAILED') ? i18n.t('errors:VALIDATION_FAILED') : null);
+      } else {
+        setError(err instanceof Error ? err.message : t('aiUsagePage.failedToSaveBudget'));
+      }
     } finally {
       setSaving(false);
     }
@@ -239,15 +321,29 @@ export default function OrgAiBudgetSettings({ orgId }: Props) {
       >
         <Lock className="h-3 w-3" /> {t('aiUsagePage.managedByPartner')}
         {showPartnerLink && (
-          <a href={PARTNER_AI_BUDGETS_HREF} className="font-medium text-primary hover:underline not-italic">
-            {t('aiUsagePage.viewPartnerWideBudgets')}
+          <a href={PARTNER_HREF[section]} className="font-medium text-primary hover:underline not-italic">
+            {section === 'approvals'
+              ? t('partnerSettingsPage.tabs.aiApprovals.label')
+              : t('aiUsagePage.viewPartnerWideBudgets')}
           </a>
         )}
       </span>
     ) : null;
 
   const inputClass = (field: AiBudgetField) =>
-    `mt-1 w-full rounded-md border bg-background px-3 py-2 text-sm ${isLocked(field) ? 'opacity-60 cursor-not-allowed' : ''}`;
+    `mt-1 w-full rounded-md border bg-background px-3 py-2 text-sm ${isLocked(field) ? 'opacity-60 cursor-not-allowed' : ''} ${
+      fieldErrors?.[field] ? 'border-destructive focus-visible:ring-destructive' : ''
+    }`;
+
+  const fieldErrorNote = (field: AiBudgetField) =>
+    fieldErrors?.[field] ? (
+      <p
+        data-testid={`org-ai-budget-error-${field}`}
+        className="mt-1 text-xs text-destructive"
+      >
+        {fieldErrors[field]}
+      </p>
+    ) : null;
 
   if (!orgId) {
     return (
@@ -280,6 +376,68 @@ export default function OrgAiBudgetSettings({ orgId }: Props) {
     /* i18n-dynamic */ APPROVAL_MODE_LABEL_KEYS[AI_BUDGET_DEFAULTS.approvalMode],
   );
   const selectedApprovalMode = (draft.approvalMode || AI_BUDGET_DEFAULTS.approvalMode) as keyof typeof APPROVAL_MODE_HELP_KEYS;
+
+  if (section === 'approvals') {
+    // PUT /ai/budget has no null for approvalMode, so once the org has its own
+    // mode "Default" cannot be saved (serialize drops it): offering it would
+    // toast "saved" and snap back on reload.
+    const approvalModeIsOrgSet = aiBudgetSource('approvalMode', effective, locked) === 'organization';
+    return (
+      <section className="rounded-lg border bg-card p-6 shadow-xs" data-testid="org-ai-approval-mode-settings">
+        <div className="flex items-center gap-2">
+          <ShieldCheck className="h-5 w-5" />
+          <h2 className="text-lg font-semibold">{t('orgAiApprovalMode.title')}</h2>
+        </div>
+        <p className="mt-1 mb-4 text-sm text-muted-foreground">{t('orgAiApprovalMode.description')}</p>
+
+        {error && (
+          <div className="mb-4 rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">
+            {error}
+          </div>
+        )}
+
+        <div className="max-w-md">
+          <label className="block">
+            <span className="text-sm text-muted-foreground">{t('aiUsagePage.approvalMode')}</span>
+            <select
+              data-testid="org-ai-approval-mode"
+              value={draft.approvalMode}
+              onChange={(e) => setField('approvalMode', e.target.value)}
+              disabled={isLocked('approvalMode')}
+              aria-invalid={fieldErrors?.approvalMode ? true : undefined}
+              className={inputClass('approvalMode')}
+            >
+              <option value="" disabled={approvalModeIsOrgSet}>
+                {t('aiUsagePage.defaultValue', { value: approvalModeDefaultLabel })}
+              </option>
+              <option value="per_step">{t('aiUsagePage.perStepDefault')}</option>
+              <option value="action_plan">{t('aiUsagePage.actionPlan')}</option>
+              <option value="auto_approve">{t('aiUsagePage.autoApprove')}</option>
+              <option value="hybrid_plan">{t('aiUsagePage.hybridPlanAbort')}</option>
+            </select>
+            <p className="mt-1 text-xs text-muted-foreground">
+              {t(/* i18n-dynamic */ APPROVAL_MODE_HELP_KEYS[selectedApprovalMode])}
+            </p>
+            {fieldErrorNote('approvalMode')}
+            {lockedNote('approvalMode')}
+          </label>
+        </div>
+
+        <div className="mt-4">
+          <button
+            type="button"
+            data-testid="org-ai-approval-mode-save"
+            onClick={handleSave}
+            disabled={saving || allFieldsLocked}
+            className="inline-flex items-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+          >
+            {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+            {t('orgAiApprovalMode.save')}
+          </button>
+        </div>
+      </section>
+    );
+  }
 
   return (
     <section className="rounded-lg border bg-card p-6 shadow-xs" data-testid="org-ai-budget-settings">
@@ -314,27 +472,6 @@ export default function OrgAiBudgetSettings({ orgId }: Props) {
             <option value="false">{t('aiUsagePage.disabled')}</option>
           </select>
           {lockedNote('enabled')}
-        </label>
-
-        <label className="block">
-          <span className="text-sm text-muted-foreground">{t('aiUsagePage.approvalMode')}</span>
-          <select
-            data-testid="org-ai-budget-approval-mode"
-            value={draft.approvalMode}
-            onChange={(e) => setField('approvalMode', e.target.value)}
-            disabled={isLocked('approvalMode')}
-            className={inputClass('approvalMode')}
-          >
-            <option value="">{t('aiUsagePage.defaultValue', { value: approvalModeDefaultLabel })}</option>
-            <option value="per_step">{t('aiUsagePage.perStepDefault')}</option>
-            <option value="action_plan">{t('aiUsagePage.actionPlan')}</option>
-            <option value="auto_approve">{t('aiUsagePage.autoApprove')}</option>
-            <option value="hybrid_plan">{t('aiUsagePage.hybridPlanAbort')}</option>
-          </select>
-          <p className="mt-1 text-xs text-muted-foreground">
-            {t(/* i18n-dynamic */ APPROVAL_MODE_HELP_KEYS[selectedApprovalMode])}
-          </p>
-          {lockedNote('approvalMode')}
         </label>
 
         <label className="block">
@@ -426,6 +563,26 @@ export default function OrgAiBudgetSettings({ orgId }: Props) {
             className={inputClass('messagesPerHourPerOrg')}
           />
           {lockedNote('messagesPerHourPerOrg')}
+        </label>
+
+        <label className="block">
+          <span className="text-sm text-muted-foreground">{t('aiUsagePage.toolRateLimitMultiplier')}</span>
+          <input
+            data-testid="org-ai-budget-tool-rate-limit-multiplier"
+            type="number"
+            step={1}
+            min={TOOL_RATE_LIMIT_MULTIPLIER_MIN}
+            max={TOOL_RATE_LIMIT_MULTIPLIER_MAX}
+            value={draft.toolRateLimitMultiplier}
+            onChange={(e) => setField('toolRateLimitMultiplier', e.target.value)}
+            placeholder={placeholderFor('toolRateLimitMultiplier')}
+            disabled={isLocked('toolRateLimitMultiplier')}
+            className={inputClass('toolRateLimitMultiplier')}
+            aria-invalid={fieldErrors?.toolRateLimitMultiplier ? true : undefined}
+          />
+          {lockedNote('toolRateLimitMultiplier')}
+          {fieldErrorNote('toolRateLimitMultiplier')}
+          <span className="mt-1 block text-xs text-muted-foreground">{t('aiUsagePage.toolRateLimitMultiplierHelp')}</span>
         </label>
       </div>
 

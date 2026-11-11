@@ -31,6 +31,7 @@ const mocks = vi.hoisted(() => ({
   sourceCidrs: [] as string[],
   rateLimiter: vi.fn(),
   update: vi.fn(),
+  delete: vi.fn(),
   transaction: vi.fn(),
 }));
 
@@ -39,6 +40,7 @@ vi.mock('../../db', () => ({
     select: mocks.select,
     insert: mocks.insert,
     update: mocks.update,
+    delete: mocks.delete,
     execute: mocks.execute,
     transaction: mocks.transaction,
   },
@@ -127,6 +129,10 @@ function primeDb() {
       };
     }),
   }));
+  mocks.update.mockImplementation(() => ({
+    set: vi.fn(() => ({ where: vi.fn(async () => []) })),
+  }));
+  mocks.delete.mockImplementation(() => ({ where: vi.fn(async () => []) }));
   mocks.execute.mockResolvedValue([]);
 }
 
@@ -287,11 +293,19 @@ describe('POST /organizations', () => {
     expect(res.status).toBe(201);
     const body = await res.json() as any;
     expect(body.schemaVersion).toBe('1');
-    expect(body.data).toMatchObject({ id: ORG_ID, orgId: ORG_ID, name: 'Acme', slug: 'acme', type: 'customer' });
+    expect(body.data).toMatchObject({ id: ORG_ID, orgId: ORG_ID, name: 'Acme', slug: 'acme', type: 'customer', externalLinks: [] });
     expect(body.data.revision).toMatch(/^[a-f0-9]{64}$/);
     expect(mocks.systemContextOpens).toBe(1);
     expect(ensureDefaultProfile).toHaveBeenCalledWith(PARTNER_ID, 'CAD', expect.anything());
     expect(insertedValues[0]).toMatchObject({ partnerId: PARTNER_ID, currencyCode: 'CAD', name: 'Acme', slug: 'acme' });
+  });
+
+  it('refuses a reserved brand name (#10325)', async () => {
+    primeSuccess();
+    const res = await post('/organizations', 'organizations:write', { name: 'Microsoft Support', slug: 'ms' });
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toMatch(/reserved/i);
+    expect(mocks.insert).not.toHaveBeenCalled();
   });
 
   it('ignores a body-supplied partnerId — the principal partner wins', async () => {
@@ -395,12 +409,10 @@ describe('POST /organizations', () => {
 
 describe('POST /sites', () => {
   function primeSuccess() {
-    // Two inserts now, in order: the site row, then the contacts mirror's
-    // insert (`applyToContactRow` reads back `created!.id` from `.returning()`
-    // to record caller-verification destination provenance, #6354) — priming
-    // only the site row leaves that second insert's `.returning()` empty and
-    // `created` undefined.
-    insertResults = [[siteRow], [{ id: 'contact-1' }]];
+    // Four inserts now, in order: site, contacts mirror, canonical
+    // contact_roles assignment, then caller-verification destination provenance.
+    // Only the first two RETURNING payloads are consumed by this path.
+    insertResults = [[siteRow], [{ id: 'contact-1', siteId: SITE_ID, roles: ['site'] }], [], []];
     // Two reads now, in order: the contacts mirror's existing-primary lookup
     // (none — the site was just created), then the partner-export stamp
     // re-read. Priming only the stamp would feed its row to the mirror, which

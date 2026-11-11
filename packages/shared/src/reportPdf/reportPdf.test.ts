@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildPostureBackupMetric, buildReportPdf } from './reportPdf';
+import { buildPostureBackupMetric, buildReportPdf, buildPostureCoverageMetrics } from './reportPdf';
 import type { PostureSummary } from '../types/postureReport';
 import type { ExecutiveSummary } from '../types/executiveSummaryReport';
 import type { FleetDesignReportSummary, FleetDesignSubmission } from '../types/fleetDesign';
@@ -84,6 +84,60 @@ describe('buildPostureBackupMetric', () => {
   );
 });
 
+describe('buildPostureBackupMetric with a product inventory (#6012)', () => {
+  const products = [
+    { product: 'Backup (s3)', category: 'backup' as const, active: true },
+    { product: 'Managed cloud backup', category: 'backup' as const, active: true },
+    { product: 'Defender', category: 'antivirus' as const, active: true },
+  ];
+
+  it('names every backup product instead of a bare Yes', () => {
+    expect(buildPostureBackupMetric({ backupRequired: true, backupConfigured: true }, products)).toEqual({
+      label: 'Backup',
+      value: 'Backup (s3), Managed cloud backup',
+      status: 'good',
+    });
+  });
+
+  it('reads warn when only some backup products are working, bad when none are', () => {
+    expect(buildPostureBackupMetric(
+      { backupRequired: true, backupConfigured: true },
+      [products[0]!, { ...products[1]!, active: false }],
+    ).status).toBe('warn');
+    expect(buildPostureBackupMetric(
+      { backupRequired: true, backupConfigured: false },
+      [{ ...products[1]!, active: false }],
+    ).status).toBe('bad');
+  });
+
+  it('reads warn, not good, when a product backs up only some of the devices it covers', () => {
+    expect(buildPostureBackupMetric(
+      { backupRequired: true, backupConfigured: true },
+      [{ product: 'Managed cloud backup', category: 'backup', active: true, deviceCoverage: 200, activeDeviceCoverage: 1 }],
+    ).status).toBe('warn');
+    expect(buildPostureBackupMetric(
+      { backupRequired: true, backupConfigured: true },
+      [{ product: 'Managed cloud backup', category: 'backup', active: true, deviceCoverage: 3, activeDeviceCoverage: 3 }],
+    ).status).toBe('good');
+  });
+
+  it('stays neutral when backup is not required', () => {
+    expect(buildPostureBackupMetric({ backupRequired: false, backupConfigured: true }, products)).toEqual({
+      label: 'Backup', value: 'Backup (s3), Managed cloud backup', status: 'neutral',
+    });
+  });
+
+  it('falls back to the legacy metric when no backup product is listed', () => {
+    expect(buildPostureBackupMetric({ backupConfigured: true }, [products[2]!])).toEqual({
+      label: 'Backup', value: 'Yes', status: 'good',
+    });
+  });
+
+  it('falls back to the legacy metric when org-wide backup evidence was withheld (site-restricted report)', () => {
+    expect(buildPostureBackupMetric({}, [products[1]!])).toEqual({ label: 'Backup', value: 'No', status: 'na' });
+  });
+});
+
 describe('buildReportPdf in Node (no DOM)', () => {
   it('renders the posture cover + device table', () => {
     const doc = buildReportPdf(postureRows, { ...opts, reportType: 'security_compliance_posture', summary: postureSummary });
@@ -132,6 +186,83 @@ describe('buildReportPdf in Node (no DOM)', () => {
     });
     const text = pdfCommandText(doc);
     expect(text).toContain('200 devices, 1 with real-time protection on');
+  });
+
+  // Ruling 7: a coverage % over ASSESSED devices must disclose the devices
+  // it leaves out, or "EDR 100%" reads as whole-fleet coverage.
+  it('appends " · N not assessed" to each control value whose unknown count is positive', () => {
+    const summary: PostureSummary = {
+      ...postureSummary,
+      deviceCount: 10,
+      controls: {
+        edrCoveragePct: 100, edrUnknownCount: 5,
+        anyAvCoveragePct: 80, anyAvUnknownCount: 4,
+        unprotectedCount: 1,
+        encryptionPct: 50, encryptionUnknownCount: 3,
+        firewallPct: 90, firewallUnknownCount: 2,
+        patchCurrentPct: 70, patchUnknownCount: 6,
+        passwordComplexityPct: 60, passwordUnknownCount: 7,
+        localAdminExposurePct: 10, localAdminUnknownCount: 8,
+      },
+    };
+    const text = pdfCommandText(buildReportPdf(postureRows, { ...opts, reportType: 'security_compliance_posture', summary }));
+    for (const v of ['100% \u00b7 5 not assessed', '80% \u00b7 4 not assessed', '50% \u00b7 3 not assessed', '90% \u00b7 2 not assessed',
+      '70% \u00b7 6 not assessed', '60% \u00b7 7 not assessed', '10% \u00b7 8 not assessed']) {
+      expect(text).toContain(v);
+    }
+  });
+
+  // Ruling 23: a % over assessed devices must not read green when more than
+  // 20% of the fleet was not assessed (mirrors the trust page coverage floor).
+  describe('coverage-share status (Ruling 23)', () => {
+    const base = (over: Partial<PostureSummary['controls']>, deviceCount = 100): PostureSummary => ({
+      ...postureSummary, deviceCount, controls: { ...postureSummary.controls, ...over },
+    });
+    const statusOf = (s: PostureSummary, label: string) => buildPostureCoverageMetrics(s).find((m) => m.label === label)?.status;
+
+    it('100 devices, 20 assessed, 19 with EDR → na, not good', () => {
+      expect(statusOf(base({ edrCoveragePct: 95, edrUnknownCount: 80 }), 'Managed EDR coverage')).toBe('na');
+    });
+    it('exactly 20% unknown keeps the percentage status; 21% is na', () => {
+      expect(statusOf(base({ encryptionPct: 95, encryptionUnknownCount: 20 }), 'Disk encryption')).toBe('good');
+      expect(statusOf(base({ encryptionPct: 95, encryptionUnknownCount: 21 }), 'Disk encryption')).toBe('na');
+    });
+    it.each([
+      ['Managed EDR coverage', { edrCoveragePct: 100, edrUnknownCount: 50 }],
+      ['AV + real-time protection', { anyAvCoveragePct: 100, anyAvUnknownCount: 50 }],
+      ['Disk encryption', { encryptionPct: 100, encryptionUnknownCount: 50 }],
+      ['Patch current (no critical pending)', { patchCurrentPct: 100, patchUnknownCount: 50 }],
+      ['Host firewall', { firewallPct: 100, firewallUnknownCount: 50 }],
+      ['Password complexity', { passwordComplexityPct: 100, passwordUnknownCount: 50 }],
+      ['Local-admin exposure', { localAdminExposurePct: 0, localAdminUnknownCount: 50 }],
+    ] as const)('%s goes na above the 20%% unknown share', (label, over) => {
+      expect(statusOf(base(over), label)).toBe('na');
+      const zeroUnknown = Object.fromEntries(Object.entries(over).map(([k, v]) => [k, k.endsWith('UnknownCount') ? 0 : v]));
+      expect(statusOf(base(zeroUnknown), label)).toBe('good');
+    });
+  });
+
+  it('adds no suffix when an unknown count is zero or absent', () => {
+    const summary: PostureSummary = {
+      ...postureSummary,
+      controls: { ...postureSummary.controls, edrUnknownCount: 0, encryptionUnknownCount: 0 },
+    };
+    const text = pdfCommandText(buildReportPdf(postureRows, { ...opts, reportType: 'security_compliance_posture', summary }));
+    expect(text).not.toContain('not assessed');
+    expect(text).toContain('50%');
+  });
+
+  it('words a backup product\'s active subset as successful backups, not real-time protection (#6012)', () => {
+    const summary: PostureSummary = {
+      ...postureSummary,
+      securityProducts: [
+        { product: 'Managed cloud backup', category: 'backup', active: true, deviceCoverage: 10, activeDeviceCoverage: 6 },
+      ],
+    };
+    const doc = buildReportPdf(postureRows, { ...opts, reportType: 'security_compliance_posture', summary });
+    const text = pdfCommandText(doc);
+    expect(text).toContain('10 devices, 6 with a successful backup in the period');
+    expect(text).not.toContain('with real-time protection on');
   });
 
   it('omits the RTP subset note when every installed device is active', () => {

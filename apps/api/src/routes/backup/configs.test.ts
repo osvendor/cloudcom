@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+// The holding-org refusal reads the org; the db mocks below do not model it.
+vi.mock('../../services/unassignedPool/protectedOrg', () => ({ isHoldingOrg: vi.fn(async () => false) }));
 import { Hono } from 'hono';
 import { configsRoutes } from './configs';
 import { __setLookupForTests } from '../../services/urlSafety';
@@ -8,7 +11,7 @@ const ORG_ID = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
 
 function chainMock(resolvedValue: unknown = []) {
   const chain: Record<string, any> = {};
-  for (const method of ['from', 'where', 'limit', 'returning', 'set', 'values']) {
+  for (const method of ['from', 'where', 'limit', 'for', 'returning', 'set', 'values']) {
     chain[method] = vi.fn(() => Object.assign(Promise.resolve(resolvedValue), chain));
   }
   return Object.assign(Promise.resolve(resolvedValue), chain);
@@ -20,12 +23,21 @@ const updateMock = vi.fn(() => chainMock([]));
 const checkBackupProviderCapabilitiesMock = vi.fn();
 const s3SendMock = vi.fn();
 const s3ClientCtorMock = vi.fn();
+const deleteMock = vi.fn(() => chainMock([]));
+const recordCredentialChangeMock = vi.fn(async () => undefined);
+// Tracks whether a statement runs inside withDbTransaction.
+const txn = { depth: 0, log: [] as string[] };
+
+vi.mock('../../services/backupStorageCredentialHistory', () => ({
+  recordCredentialChange: (...args: unknown[]) => recordCredentialChangeMock(...(args as [])),
+}));
 
 vi.mock('../../db', () => ({
   db: {
     select: (...args: unknown[]) => selectMock(...(args as [])),
     insert: (...args: unknown[]) => insertMock(...(args as [])),
     update: (...args: unknown[]) => updateMock(...(args as [])),
+    delete: (...args: unknown[]) => deleteMock(...(args as [])),
     // Default-destination demote + promote run in one transaction so a failed
     // write can't leave the org with no default. The tx routes through the same
     // insert/update mocks, so assertions below see every statement.
@@ -37,6 +49,14 @@ vi.mock('../../db', () => ({
       }),
   },
   runOutsideDbContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+  withDbTransaction: vi.fn(async (fn: () => Promise<unknown>) => {
+    txn.depth += 1;
+    try {
+      return await fn();
+    } finally {
+      txn.depth -= 1;
+    }
+  }),
   withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn()),
   withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
   // `assertSafeUrl` (urlSafety) now carries the #1105 held-context tripwire, and
@@ -144,6 +164,12 @@ describe('backup config routes', () => {
     selectMock.mockImplementation(() => chainMock([]));
     insertMock.mockImplementation(() => chainMock([]));
     updateMock.mockImplementation(() => chainMock([]));
+    deleteMock.mockReset();
+    deleteMock.mockImplementation(() => chainMock([]));
+    recordCredentialChangeMock.mockReset();
+    recordCredentialChangeMock.mockImplementation(async () => { txn.log.push(`record:${txn.depth}`); });
+    txn.depth = 0;
+    txn.log = [];
     app = new Hono();
     app.use('*', authMiddleware);
     app.route('/backup', configsRoutes);
@@ -443,6 +469,188 @@ describe('backup config routes', () => {
     });
   });
 
+  it('refuses a destination setting already in the stored encrypted format', async () => {
+    const { encryptSecret } = await import('../../services/secretCrypto');
+    const foreign = encryptSecret('sealed-elsewhere', { aad: 'psa_connections.credentials' });
+    const res = await app.request('/backup/configs', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({
+        name: 'S3 backups',
+        provider: 's3',
+        details: { bucket: 'backups', region: 'us-east-1', accessKey: 'key', secretKey: foreign },
+      }),
+    });
+
+    expect(res.status).toBe(400);
+    expect(insertMock).not.toHaveBeenCalled();
+  });
+
+  it('refuses an update that puts an encrypted-format value into the destination', async () => {
+    const { encryptSecret } = await import('../../services/secretCrypto');
+    const foreign = encryptSecret('sealed-elsewhere');
+    const res = await app.request(`/backup/configs/${CONFIG_ID}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({ details: { secretKey: foreign } }),
+    });
+
+    expect(res.status).toBe(400);
+    expect(updateMock).not.toHaveBeenCalled();
+  });
+
+  it('masks a destination read back through the sealed column exactly as before', async () => {
+    const { backupConfigs: realBackupConfigs } = await vi.importActual<typeof import('../../db/schema')>('../../db/schema');
+    const plain = {
+      bucket: 'backups',
+      region: 'us-east-1',
+      accessKey: 'AKIA-PLAINTEXT',
+      secretKey: 'secret-plaintext',
+      credentials: { token: 'nested-token-plaintext' },
+    };
+    const stored = realBackupConfigs.providerConfig.mapToDriverValue(plain);
+    expect(String(stored)).not.toContain('secret-plaintext');
+    const readBack = realBackupConfigs.providerConfig.mapFromDriverValue(stored as never);
+
+    selectMock.mockReturnValueOnce(chainMock([makeConfig({ providerConfig: plain })]));
+    const before = await (await app.request(`/backup/configs/${CONFIG_ID}`, { headers: { Authorization: 'Bearer token' } })).json();
+    selectMock.mockReturnValueOnce(chainMock([makeConfig({ providerConfig: readBack })]));
+    const after = await (await app.request(`/backup/configs/${CONFIG_ID}`, { headers: { Authorization: 'Bearer token' } })).json();
+
+    expect(after).toEqual(before);
+    expect(after.details.secretKey).toEqual({ redacted: true, hasSecret: true, masked: '********' });
+    expect(JSON.stringify(after)).not.toContain('plaintext');
+  });
+
+  describe('storage key history', () => {
+    it('records the key of a new S3 destination', async () => {
+      insertMock.mockReturnValueOnce(chainMock([makeConfig()]));
+      const res = await app.request('/backup/configs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({
+          name: 'Primary S3',
+          provider: 's3',
+          details: { bucket: 'backups', region: 'us-east-1', accessKey: 'key', secretKey: 'secret' },
+        }),
+      });
+      expect(res.status).toBe(201);
+      expect(recordCredentialChangeMock).toHaveBeenCalledWith({
+        orgId: ORG_ID,
+        configId: CONFIG_ID,
+        previous: null,
+        next: { provider: 's3', providerConfig: makeConfig().providerConfig },
+      });
+    });
+
+    it('records a changed destination with its settings before and after', async () => {
+      const before = makeConfig();
+      const after = makeConfig({ providerConfig: { bucket: 'backups', region: 'us-east-1', accessKey: 'key2', secretKey: 'secret2' } });
+      selectMock.mockReturnValueOnce(chainMock([before]));
+      updateMock.mockReturnValueOnce(chainMock([after]));
+      const res = await app.request(`/backup/configs/${CONFIG_ID}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ details: { bucket: 'backups', region: 'us-east-1', accessKey: 'key2', secretKey: 'secret2' } }),
+      });
+      expect(res.status).toBe(200);
+      expect(recordCredentialChangeMock).toHaveBeenCalledWith({
+        orgId: ORG_ID,
+        configId: CONFIG_ID,
+        previous: { provider: 's3', providerConfig: before.providerConfig },
+        next: { provider: 's3', providerConfig: after.providerConfig },
+      });
+    });
+
+    it('locks the destination while reading it, and writes the change and its key record in one transaction', async () => {
+      const before = makeConfig();
+      const after = makeConfig({ providerConfig: { bucket: 'backups', region: 'us-east-1', accessKey: 'key2', secretKey: 'secret2' } });
+      const selectChain = chainMock([before]);
+      selectMock.mockReturnValueOnce(selectChain);
+      updateMock.mockImplementationOnce(() => { txn.log.push(`update:${txn.depth}`); return chainMock([after]); });
+      const res = await app.request(`/backup/configs/${CONFIG_ID}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ details: { bucket: 'backups', region: 'us-east-1', accessKey: 'key2', secretKey: 'secret2' } }),
+      });
+      expect(res.status).toBe(200);
+      expect(selectChain.for).toHaveBeenCalledWith('update');
+      expect(txn.log).toEqual(['update:1', 'record:1']);
+    });
+
+    it('fails the change when its key record cannot be written (the transaction rolls both back)', async () => {
+      selectMock.mockReturnValueOnce(chainMock([makeConfig()]));
+      updateMock.mockReturnValueOnce(chainMock([makeConfig()]));
+      recordCredentialChangeMock.mockImplementationOnce(async () => { throw new Error('sealing failed'); });
+      const res = await app.request(`/backup/configs/${CONFIG_ID}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ details: { bucket: 'backups', region: 'us-east-1', accessKey: 'key2', secretKey: 'secret2' } }),
+      });
+      expect(res.status).toBe(500);
+    });
+
+    it('creates a destination and records its key in one transaction', async () => {
+      insertMock.mockImplementationOnce(() => { txn.log.push(`insert:${txn.depth}`); return chainMock([makeConfig()]); });
+      await app.request('/backup/configs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ name: 'Primary S3', provider: 's3', details: { bucket: 'backups', region: 'us-east-1', accessKey: 'key', secretKey: 'secret' } }),
+      });
+      expect(txn.log).toEqual(['insert:1', 'record:1']);
+    });
+
+    it('records and deletes a destination in one transaction', async () => {
+      selectMock.mockReturnValueOnce(chainMock([makeConfig()]));
+      deleteMock.mockImplementationOnce(() => { txn.log.push(`delete:${txn.depth}`); return chainMock([makeConfig()]); });
+      await app.request(`/backup/configs/${CONFIG_ID}`, { method: 'DELETE', headers: { Authorization: 'Bearer token' } });
+      expect(txn.log).toEqual(['record:1', 'delete:1']);
+    });
+
+    it('records nothing for a change that does not touch the destination settings', async () => {
+      selectMock.mockReturnValueOnce(chainMock([makeConfig()]));
+      updateMock.mockReturnValueOnce(chainMock([makeConfig({ name: 'Renamed' })]));
+      const res = await app.request(`/backup/configs/${CONFIG_ID}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ name: 'Renamed' }),
+      });
+      expect(res.status).toBe(200);
+      expect(recordCredentialChangeMock).not.toHaveBeenCalled();
+    });
+
+    it('records a deleted destination before deleting it, so its key stays listed', async () => {
+      const existing = makeConfig();
+      const order: string[] = [];
+      selectMock.mockReturnValueOnce(chainMock([existing]));
+      recordCredentialChangeMock.mockImplementationOnce(async () => { order.push('record'); });
+      deleteMock.mockImplementationOnce(() => { order.push('delete'); return chainMock([existing]); });
+      const res = await app.request(`/backup/configs/${CONFIG_ID}`, {
+        method: 'DELETE',
+        headers: { Authorization: 'Bearer token' },
+      });
+      expect(res.status).toBe(200);
+      expect(recordCredentialChangeMock).toHaveBeenCalledWith({
+        orgId: ORG_ID,
+        configId: CONFIG_ID,
+        previous: { provider: 's3', providerConfig: existing.providerConfig },
+        next: null,
+      });
+      expect(order).toEqual(['record', 'delete']);
+    });
+
+    it('answers 404 for a destination that does not exist, recording nothing', async () => {
+      selectMock.mockReturnValueOnce(chainMock([]));
+      const res = await app.request(`/backup/configs/${CONFIG_ID}`, {
+        method: 'DELETE',
+        headers: { Authorization: 'Bearer token' },
+      });
+      expect(res.status).toBe(404);
+      expect(recordCredentialChangeMock).not.toHaveBeenCalled();
+      expect(deleteMock).not.toHaveBeenCalled();
+    });
+  });
+
   it('returns explicit unsupported object lock state for local configs', async () => {
     selectMock.mockReturnValueOnce(chainMock([makeConfig({
       provider: 'local',
@@ -597,6 +805,131 @@ describe('backup config routes', () => {
     const body = await res.json();
     expect(JSON.stringify(body)).not.toContain('existing-secret-key');
     expect(JSON.stringify(body)).not.toContain('existing-nested-token');
+  });
+
+  // Same origin-binding contract as credentialOriginBinding.ts: a
+  // masked/omitted S3 credential must not be carried forward to a new storage
+  // endpoint.
+  it('refuses to carry masked S3 credentials forward across a storage-endpoint change', async () => {
+    selectMock.mockReturnValueOnce(chainMock([makeConfig({
+      providerConfig: {
+        bucket: 'backups',
+        region: 'us-east-1',
+        endpoint: 'https://storage.trusted-vendor.example',
+        accessKey: 'existing-access-key',
+        secretKey: 'existing-secret-key',
+      },
+    })]));
+
+    const res = await app.request(`/backup/configs/${CONFIG_ID}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({
+        details: {
+          bucket: 'backups',
+          region: 'us-east-1',
+          endpoint: 'https://storage.other-origin.example',
+          accessKey: { redacted: true, hasSecret: true, masked: '********' },
+          secretKey: { redacted: true, hasSecret: true, masked: '********' },
+        },
+      }),
+    });
+
+    expect(res.status).toBe(400);
+    expect(updateMock).not.toHaveBeenCalled();
+    const body = await res.json();
+    expect(JSON.stringify(body)).not.toContain('existing-secret-key');
+  });
+
+  it('allows a storage-endpoint change when the full credential set is re-entered', async () => {
+    selectMock.mockReturnValueOnce(chainMock([makeConfig({
+      providerConfig: {
+        bucket: 'backups',
+        region: 'us-east-1',
+        endpoint: 'https://storage.trusted-vendor.example',
+        accessKey: 'existing-access-key',
+        secretKey: 'existing-secret-key',
+      },
+    })]));
+    updateMock.mockReturnValueOnce(chainMock([makeConfig({
+      providerConfig: {
+        bucket: 'backups',
+        region: 'us-east-1',
+        endpoint: 'https://storage.new-vendor.example',
+        accessKey: 'freshly-typed-access-key',
+        secretKey: 'freshly-typed-secret-key',
+      },
+      updatedAt: new Date('2026-03-31T02:00:00.000Z'),
+    })]));
+
+    const res = await app.request(`/backup/configs/${CONFIG_ID}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({
+        details: {
+          bucket: 'backups',
+          region: 'us-east-1',
+          endpoint: 'https://storage.new-vendor.example',
+          accessKey: 'freshly-typed-access-key',
+          secretKey: 'freshly-typed-secret-key',
+        },
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    const updateSet = updateMock.mock.results[0]?.value?.set;
+    expect(updateSet).toHaveBeenCalledWith(expect.objectContaining({
+      providerConfig: expect.objectContaining({
+        endpoint: expect.stringContaining('storage.new-vendor.example'),
+        accessKey: 'freshly-typed-access-key',
+        secretKey: 'freshly-typed-secret-key',
+      }),
+    }));
+  });
+
+  it('allows an endpoint change that keeps the same origin without re-entering credentials', async () => {
+    selectMock.mockReturnValueOnce(chainMock([makeConfig({
+      providerConfig: {
+        bucket: 'backups',
+        region: 'us-east-1',
+        endpoint: 'https://storage.trusted-vendor.example/old-path',
+        accessKey: 'existing-access-key',
+        secretKey: 'existing-secret-key',
+      },
+    })]));
+    updateMock.mockReturnValueOnce(chainMock([makeConfig({
+      providerConfig: {
+        bucket: 'backups',
+        region: 'us-east-1',
+        endpoint: 'https://storage.trusted-vendor.example',
+        accessKey: 'existing-access-key',
+        secretKey: 'existing-secret-key',
+      },
+      updatedAt: new Date('2026-03-31T02:00:00.000Z'),
+    })]));
+
+    const res = await app.request(`/backup/configs/${CONFIG_ID}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({
+        details: {
+          bucket: 'backups',
+          region: 'us-east-1',
+          endpoint: 'https://storage.trusted-vendor.example',
+          accessKey: { redacted: true, hasSecret: true, masked: '********' },
+          secretKey: { redacted: true, hasSecret: true, masked: '********' },
+        },
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    const updateSet = updateMock.mock.results[0]?.value?.set;
+    expect(updateSet).toHaveBeenCalledWith(expect.objectContaining({
+      providerConfig: expect.objectContaining({
+        accessKey: 'existing-access-key',
+        secretKey: 'existing-secret-key',
+      }),
+    }));
   });
 
   it('bumps approval_generation on every PATCH (site-ceiling gate contract §3)', async () => {
@@ -797,6 +1130,146 @@ describe('backup config routes', () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.status).toBe('success');
+  });
+
+  describe('destination key prefix (#7081)', () => {
+    const s3Details = { bucket: 'backups', region: 'us-east-1', accessKey: 'key', secretKey: 'secret' };
+
+    it('rejects S3 config creation with an invalid prefix', async () => {
+      const res = await app.request('/backup/configs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ name: 'Prefixed', provider: 's3', details: { ...s3Details, prefix: 'a b' } }),
+      });
+
+      expect(res.status).toBe(400);
+      expect(JSON.stringify(await res.json())).toContain('Invalid key prefix');
+      expect(insertMock).not.toHaveBeenCalled();
+    });
+
+    it('stores the normalized prefix on create', async () => {
+      insertMock.mockReturnValueOnce(chainMock([makeConfig()]));
+
+      const res = await app.request('/backup/configs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ name: 'Prefixed', provider: 's3', details: { ...s3Details, prefix: '/acme/' } }),
+      });
+
+      expect(res.status).toBe(201);
+      const persisted = insertMock.mock.results[0]?.value?.values.mock.calls[0]?.[0]?.providerConfig;
+      expect(persisted.prefix).toBe('acme');
+    });
+
+    it('drops an empty prefix on create', async () => {
+      insertMock.mockReturnValueOnce(chainMock([makeConfig()]));
+
+      const res = await app.request('/backup/configs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ name: 'Prefixed', provider: 's3', details: { ...s3Details, prefix: ' / ' } }),
+      });
+
+      expect(res.status).toBe(201);
+      const persisted = insertMock.mock.results[0]?.value?.values.mock.calls[0]?.[0]?.providerConfig;
+      expect('prefix' in persisted).toBe(false);
+    });
+
+    it('rejects S3 config updates with an invalid prefix', async () => {
+      selectMock.mockReturnValueOnce(chainMock([makeConfig()]));
+
+      const res = await app.request(`/backup/configs/${CONFIG_ID}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ details: { ...s3Details, prefix: 'a b' } }),
+      });
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toContain('Invalid key prefix');
+      expect(updateMock).not.toHaveBeenCalled();
+    });
+
+    it('test-connection probes under the normalized stored prefix', async () => {
+      selectMock.mockReturnValueOnce(chainMock([makeConfig({ providerConfig: { ...s3Details, prefix: '/acme/' } })]));
+      updateMock.mockReturnValueOnce(chainMock([makeConfig()]));
+      s3SendMock.mockResolvedValue({});
+      checkBackupProviderCapabilitiesMock.mockResolvedValue({ objectLock: { supported: true, error: null } });
+
+      const res = await app.request(`/backup/configs/${CONFIG_ID}/test`, {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(200);
+      expect((await res.json()).status).toBe('success');
+      const putKey = (s3SendMock.mock.calls[0]?.[0] as { input: { Key: string } }).input.Key;
+      expect(putKey).toMatch(/^acme\/\.breeze-probe-/);
+    });
+
+    // W03: backups to a destination whose stored prefix is invalid are refused
+    // at mint, so the connection test must fail too rather than report green.
+    it('test-connection fails on a stored prefix that is invalid, without touching storage', async () => {
+      selectMock.mockReturnValueOnce(chainMock([makeConfig({ providerConfig: { ...s3Details, prefix: 'Acme Corp//' } })]));
+      updateMock.mockReturnValueOnce(chainMock([makeConfig()]));
+      s3SendMock.mockResolvedValue({});
+      checkBackupProviderCapabilitiesMock.mockResolvedValue({ objectLock: { supported: true, error: null } });
+
+      const res = await app.request(`/backup/configs/${CONFIG_ID}/test`, {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.status).toBe('failed');
+      expect(body.error).toMatch(/^Invalid key prefix: .+ Backups to this destination are refused until the prefix is corrected\.$/);
+      expect(s3SendMock).not.toHaveBeenCalled();
+    });
+
+    it('accepts an update that leaves an invalid stored prefix unchanged, keeping it as stored', async () => {
+      selectMock.mockReturnValueOnce(chainMock([makeConfig({ providerConfig: { ...s3Details, prefix: 'Acme Corp' } })]));
+      updateMock.mockReturnValueOnce(chainMock([makeConfig()]));
+
+      const res = await app.request(`/backup/configs/${CONFIG_ID}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ details: { ...s3Details, region: 'us-west-2', prefix: 'Acme Corp' } }),
+      });
+
+      expect(res.status).toBe(200);
+      const persisted = updateMock.mock.results[0]?.value?.set.mock.calls[0]?.[0]?.providerConfig;
+      expect(persisted).toMatchObject({ region: 'us-west-2', prefix: 'Acme Corp' });
+    });
+
+    it('refuses an update that changes an invalid stored prefix to another invalid one', async () => {
+      selectMock.mockReturnValueOnce(chainMock([makeConfig({ providerConfig: { ...s3Details, prefix: 'Acme Corp' } })]));
+
+      const res = await app.request(`/backup/configs/${CONFIG_ID}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ details: { ...s3Details, prefix: 'Acme Corp 2' } }),
+      });
+
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toContain('Invalid key prefix');
+      expect(updateMock).not.toHaveBeenCalled();
+    });
+
+    it('stores the normalized prefix on update', async () => {
+      selectMock.mockReturnValueOnce(chainMock([makeConfig()]));
+      updateMock.mockReturnValueOnce(chainMock([makeConfig()]));
+
+      const res = await app.request(`/backup/configs/${CONFIG_ID}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ details: { ...s3Details, prefix: '/acme/' } }),
+      });
+
+      expect(res.status).toBe(200);
+      const persisted = updateMock.mock.results[0]?.value?.set.mock.calls[0]?.[0]?.providerConfig;
+      expect(persisted.prefix).toBe('acme');
+    });
   });
 
   it('rejects S3 config updates that drop the region without a derivable endpoint', async () => {

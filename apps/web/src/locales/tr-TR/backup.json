@@ -19,6 +19,7 @@
     "running": "Koşuyor",
     "failed": "Başarısız",
     "completed": "Tamamlandı",
+    "completedWithErrors": "Hatalarla tamamlandı",
     "partial": "Kısmi",
     "queued": "Sıraya alındı",
     "cancelled": "İptal edildi",
@@ -40,6 +41,7 @@
     "stalledTooltip": "{{minutes}} dakika boyunca veri alınmadı",
     "filesProgress": "{{done}} / {{total}} dosyalar",
     "speedValue": "{{value}}/s",
+    "etaValue": "yaklaşık {{value}} kaldı",
     "created": "Oluşturuldu",
     "updated": "Güncellendi",
     "files": "Dosyalar",
@@ -47,12 +49,13 @@
     "policyId": "Politika Kimliği",
     "featureLinkId": "Özellik Bağlantı Kimliği",
     "errorLog": "Hata Günlüğü",
-    "savings": "{{protected}} korumalı — {{uploaded}} yüklendi",
     "errorCount_one": "{{count}} hatası",
     "errorCount_other": "{{count}} hatalar",
     "failedCount_one": "{{count}} başarısız oldu",
     "failedCount_other": "{{count}} başarısız oldu",
-    "failedFilesTooltip": "Bu yedekleme sırasında başarısız olan dosyalar"
+    "failedFilesTooltip": "Bu yedekleme sırasında başarısız olan dosyalar",
+    "filesNotBackedUp_one": "{{count}} dosya yedeklenmedi",
+    "filesNotBackedUp_other": "{{count}} dosya yedeklenmedi"
   },
   "backupOverviewContent": {
     "noProviderTimelineAvailableYet": "Henüz sağlayıcı zaman çizelgesi mevcut değil.",
@@ -115,12 +118,14 @@
     "filesOk": "Dosyalar TAMAM",
     "filesFailed": "Dosyalar Başarısız Oldu",
     "lowReadinessDevices": "Düşük Hazırlıklı Cihazlar",
-    "devicesScoringBelowThe85PointReadinessThreshold": "85 puanlık hazırlık eşiğinin altında puan alan cihazlar.",
+    "lowReadinessDevicesDescription": "{{threshold}} puanlık hazırlık eşiğinin altında puan alan cihazlar.",
     "allDevicesMeetTheReadinessThreshold": "Tüm cihazlar hazırlık eşiğini karşılıyor.",
     "score": "Puan",
     "estRto": "Tah. RTO",
     "estRpo": "Tah. RPO",
-    "riskFactors": "Risk Faktörleri"
+    "riskFactors": "Risk Faktörleri",
+    "reason": "Neden",
+    "noDevicesScoredYet": "Henüz hiçbir cihazın hazırlık puanı yok."
   },
   "backupVerificationTab": {
     "loadingVerificationData": "Doğrulama verileri yükleniyor...",
@@ -174,7 +179,9 @@
     "oneOrMoreVssWritersAreNotStable": "Bir veya daha fazla VSS yazıcısı kararlı değil. Bir sonraki çalıştırmadan önce en son yazıcı durumlarını gözden geçirin.",
     "vssUnprotectedVolumes": "VSS gölge kopyasından değil, canlı ciltten okuyun: {{volumes}}. Bu birimlerdeki kullanımdaki dosyalar atlanmış veya tutarsız bir durumda yakalanmış olabilir.",
     "lastBackupFailed": "Son yedekleme başarısız oldu",
+    "lastBackupFailedWithCategory": "Son yedekleme başarısız oldu: {{category}}",
     "lastBackupCompletedWithWarnings": "Son yedekleme uyarılarla tamamlandı",
+    "lastBackupCompletedWithErrors": "Son yedekleme hatalarla tamamlandı",
     "writer": "Yazar",
     "state": "Eyalet",
     "noVssWriterDetailsWereReportedForThe": "En son yedekleme için VSS yazıcı ayrıntıları bildirilmedi.",
@@ -213,10 +220,30 @@
     "created2": "Oluşturuldu",
     "expires2": "Süresi doluyor",
     "protection2": "Koruma",
+    "integrity": "Bütünlük",
     "hold": "Basılı tutun",
     "standard": "Standart",
     "restorePointCount_one": "{{count}} geri yükleme noktası",
-    "restorePointCount_other": "{{count}} geri yükleme noktaları"
+    "restorePointCount_other": "{{count}} geri yükleme noktaları",
+    "activePhase": {
+      "waiting_for_device": "Cihaza gönderildi, başlaması bekleniyor",
+      "queued_on_device": "Bu cihazdaki başka bir yedeklemenin bitmesi bekleniyor",
+      "resuming": "Yarıda kalan bir yedekleme sürdürülüyor",
+      "scanning": "Dosyalar taranıyor",
+      "backing_up": "Yedekleniyor"
+    },
+    "activeJobs": {
+      "title": "Yedekleme devam ediyor",
+      "processedOfTotal": "{{done}} / {{total}} işlendi",
+      "processed": "{{done}} işlendi",
+      "lastHeard": "Cihazdan son sinyal: {{relative}}",
+      "mode": {
+        "file": "Dosya yedeklemesi",
+        "system_image": "Sistem görüntüsü yedeklemesi",
+        "mssql": "SQL Server yedeklemesi",
+        "hyperv": "Hyper-V yedeklemesi"
+      }
+    }
   },
   "deviceVaultStatus": {
     "loadingVaultStatus": "Kasa durumu yükleniyor...",
@@ -481,6 +508,22 @@
     "selectASnapshot": "Bir anlık görüntü seçin",
     "chooseTheRecoveryPointYouWantToRestore": "Geri yükleme yapmak istediğiniz kurtarma noktasını seçin.",
     "noSnapshotsAvailable": "Anlık görüntü yok.",
+    "device": "Cihaz",
+    "selectADevice": "Bir cihaz seçin",
+    "chooseTheDeviceToRestore": "Yedeğini geri yüklemek istediğiniz cihazı seçin.",
+    "deviceOption_one": "{{device}} ({{count}} anlık görüntü)",
+    "deviceOption_other": "{{device}} ({{count}} anlık görüntü)",
+    "unknownDevice": "Bilinmeyen cihaz",
+    "reviewDevice": "Cihaz: {{device}}",
+    "snapshotNeedsSecondFactor": "İkinci faktör gerekir",
+    "secondFactorNote": "Bu geri yükleme noktası doğrulanmamış. Geri yüklemeyi başlatmak, ikinci faktörünüzle onay vermenizi isteyecek.",
+    "secondFactorNoteNotEnrolled": "Bu geri yükleme noktası doğrulanmamış ve kurulu bir ikinci faktörünüz yok. Geri yüklemeyi başlatmak için bir tane gerekir.",
+    "secondFactorSetUp": "İki faktörlü kimlik doğrulamayı kur",
+    "commandDetails": "Komut ayrıntıları",
+    "copyCommandId": "Komut kimliğini kopyala",
+    "commandIdCopied": "Komut kimliği kopyalandı",
+    "commandIdCopyFailed": "Komut kimliği kopyalanamadı",
+    "carriedSnapshotUnavailable": "Sihirbazı açtığınız anlık görüntü artık mevcut değil. Bir cihaz ve onun anlık görüntülerinden birini seçin.",
     "selectRestoreType": "Geri yükleme türünü seçin",
     "fullRestoresEverythingSelectiveRestoresSpecificFiles": "Tam her şeyi geri yükler, seçici belirli dosyaları geri yükler.",
     "fullRestore": "Tam geri yükleme",
@@ -491,9 +534,9 @@
     "chooseFilesToRestoreForSelectiveRecoveries": "Seçmeli kurtarmalar için geri yüklenecek dosyaları seçin.",
     "fullRestoreSelectedSkipThisStepToContinue": "Tam geri yükleme seçildi. Devam etmek için bu adımı atlayın.",
     "destination": "Hedef",
-    "restoreToTheOriginalLocationOrProvideAn": "Orijinal konuma geri yükleyin veya alternatif bir yol sağlayın.",
-    "originalLocation": "Orijinal konum",
-    "restoreFilesInPlace": "Dosyaları yerine geri yükleyin.",
+    "restoreToAStagingFolderOrProvideAn": "Cihazdaki bir hazırlık klasörüne veya seçtiğiniz bir yola geri yükleyin.",
+    "stagingFolder": "Cihazdaki hazırlık klasörü",
+    "stagingFolderHint": "Dosyalar cihazın geçici dizinine (breeze-restore) yazılır; orijinaller asla üzerine yazılmaz.",
     "alternatePath": "Alternatif yol",
     "alternatePathPlaceholder": "örn. D:\\Restored veya /var/restore",
     "alternatePathRequired": "Devam etmek için bir hedef yol girin.",
@@ -517,14 +560,38 @@
     "command": "Komut:",
     "targetPath": "Hedef yolu:",
     "completed": "Tamamlandı:",
-    "resultPayload": "Sonuç yükü",
     "noRestoreHistoryYetStartARestoreTo": "Henüz geri yükleme geçmişi yok. Canlı sonuç ayrıntılarını buraya yüklemek için bir geri yükleme başlatın.",
     "recentRestoreHistory": "Son geri yükleme geçmişi",
     "mostRecentRestoreJobsForThisOrganization": "Bu kuruluş için en yeni geri yükleme işleri.",
     "noRestoreHistoryYet": "Henüz geri yükleme geçmişi yok.",
-    "restore": "geri yükleme ·",
     "files2": "Dosyalar:",
-    "size": "Boyut:"
+    "size": "Boyut:",
+    "filesSelected_one": "{{formatted}} dosya seçildi",
+    "filesSelected_other": "{{formatted}} dosya seçildi",
+    "folderFileCount_one": "{{formatted}} dosya",
+    "folderFileCount_other": "{{formatted}} dosya",
+    "allFilesFromSnapshot": "Anlık görüntüdeki tüm dosyalar",
+    "selectionFiles_one": "{{formatted}} dosya",
+    "selectionFiles_other": "{{formatted}} dosya",
+    "selectionFolders_one": "{{formatted}} klasör",
+    "selectionFolders_other": "{{formatted}} klasör",
+    "largeFolderSelectionTitle": "Büyük seçim",
+    "selectFolder": "{{name}} klasörünü seç",
+    "confirmLargeFolderSelection": "Bu seçim yaklaşık {{formatted}} dosyayı kapsıyor ve geri yükleme biraz sürebilir. Devam edilsin mi?",
+    "kindVm": "VM olarak geri yükle",
+    "kindInstantBoot": "Anında önyükleme",
+    "kindSelective": "Seçmeli geri yükleme",
+    "kindFull": "Tam geri yükleme",
+    "kindRebuild": "VHDX olarak yeniden oluşturma",
+    "restoreQueuedOnDevice": "{{device}} üzerinde geri yükleme kuyruğa alındı.",
+    "restoreStartedOnDevice": "{{device}} üzerinde geri yükleme başlatıldı.",
+    "restoreQueued": "Geri yükleme kuyruğa alındı.",
+    "restoreStarted": "Geri yükleme başlatıldı.",
+    "viewProgress": "İlerlemeyi görüntüle",
+    "cancelRestore": "Geri yüklemeyi iptal et",
+    "cancellingRestore": "İptal ediliyor...",
+    "restoreCancelled": "Geri yükleme iptal edildi.",
+    "cancelRestoreFailed": "Geri yükleme iptal edilemedi."
   },
   "sLAConfigDialog": {
     "name": "Ad",
@@ -583,6 +650,7 @@
     "snapshotDetails": "Anlık Görüntü Ayrıntıları",
     "size": "Boyut:",
     "files": "Dosyalar:",
+    "location": "Konum:",
     "holdReason": "Bekletme nedeni:",
     "holdSource": "Kaynağı beklet:",
     "enforcement": "Yaptırım:",
@@ -603,12 +671,30 @@
     "providerEnforcedImmutabilityCannotBeReleasedFromBreeze": "Sağlayıcı tarafından zorlanan değişmezlik, Breeze'den yayınlanamaz.",
     "fileTree": "Dosya Ağacı",
     "noFileTreeAvailable": "Dosya ağacı mevcut değil.",
+    "fileIndexBuilding": "Bu anlık görüntünün dosya listesi hazırlanıyor. Büyük yedeklerde bu birkaç dakika sürebilir.",
+    "fileIndexUnavailable": "Bu anlık görüntünün dosya listesi şu anda kullanılamıyor. Yine de anlık görüntünün tamamını geri yükleyebilirsiniz.",
+    "fileIndexIntegrityFailed": "Bu anlık görüntü bütünlük denetiminden geçemedi, bu nedenle dosyaları listelenemiyor.",
+    "fileIndexDeviceLocal": "Bu anlık görüntü cihazda depolanıyor ve Breeze dosya listesini henüz oradan okuyamıyor.",
+    "fileIndexRetry": "Tekrar dene",
+    "searchPlaceholder": "Bu anlık görüntüdeki dosyalarda ara",
+    "searchEmpty": "Eşleşen dosya yok",
+    "searchTimeout": "Arama çok uzun sürdü. Tekrar deneyin.",
+    "browseTimeout": "Bu klasörün listelenmesi çok uzun sürdü. Tekrar deneyin.",
+    "searchLoadMore": "Daha fazla yükle",
+    "searchRestoreFile": "Bu dosyayı geri yükle",
+    "searchMinLength": "En az 2 karakter girin",
+    "searchLoading": "Aranıyor…",
     "path": "Yol:",
     "useTheRestoreWorkflowToRecoverOrExport": "Bu anlık görüntüdeki dosyaları kurtarmak veya dışa aktarmak için geri yükleme iş akışını kullanın.",
     "select": "Seç",
+    "folderFileCount_one": "{{count}} dosya",
+    "folderFileCount_other": "{{count}} dosya",
+    "selectFolder": "{{name}} klasörünü seç",
+    "confirmLargeFolderSelection": "Bu seçim yaklaşık {{count}} dosyayı kapsıyor ve geri yükleme biraz sürebilir. Devam edilsin mi?",
     "name": "Ad",
     "size2": "Boyut",
-    "modified": "Değiştirildi"
+    "modified": "Değiştirildi",
+    "noSnapshotsYetFilesAppearHere": "Henüz anlık görüntü yok. Dosyalar, ilk yedekleme tamamlandıktan sonra burada görünür."
   },
   "vMRestoreConfirmStep": {
     "reviewConfirm": "İncele ve onayla",
@@ -622,8 +708,9 @@
     "mode": "Modu",
     "rebuildHost": "Yeniden oluşturma ana bilgisayarı",
     "outputPath": "Çıktı yolu",
-    "rebuildEngine": "Yeniden oluşturma motoru (Linux)",
-    "manualAttachNote": "VHDX'i bir Hyper-V sanal makinesine elle bağlayın; Linux konuklar için otomatik sanal makine oluşturma Windows motoruyla gelecek.",
+    "rebuildEngine": "Yeniden oluşturma motoru",
+    "manualAttachNote": "VHDX'i bir Hyper-V sanal makinesine elle bağlayın. Breeze sanal makineyi yalnızca bir Windows anlık görüntüsü, sanal makine adı girilmiş bir Windows ana bilgisayarında yeniden oluşturulduğunda sizin için oluşturur.",
+    "hypervVmNote": "Breeze, görüntü doğrulanır doğrulanmaz yeniden oluşturma ana bilgisayarında \"{{vmName}}\" Hyper-V sanal makinesini oluşturur.",
     "newIdentityNote": "Yeniden oluşturulan görüntü her zaman yeni bir makine kimliği alır ve asla özgün cihazın kimliğini devralmaz."
   },
   "vMRestoreSpecsStep": {
@@ -641,8 +728,7 @@
     "chooseTheSnapshotToRestoreAsAVirtual": "Sanal makine olarak geri yüklenecek anlık görüntüyü seçin.",
     "noSnapshotsAvailable": "Anlık görüntü yok.",
     "cpu": "CPU",
-    "mb": "MB",
-    "gb": "TR",
+    "gb": "GB",
     "selectTargetHost": "Hedef ana makineyi seçin",
     "chooseAWindowsDeviceWithHyperVTo": "Sanal makineyi barındırmak için Hyper-V'ye sahip bir Windows cihazı seçin.",
     "noWindowsDevicesAvailable": "Kullanılabilir Windows cihaz yok.",
@@ -663,15 +749,31 @@
     "back": "Geri",
     "continue": "Devam et",
     "starting": "Başlıyor...",
-    "rebuildEngineLinux": "Yeniden oluşturma motoru (Linux)",
-    "rebuildEngineDescription": "Bu Linux tam makine anlık görüntüsünü, Breeze yardımcısını çalıştıran bir Linux cihazında Hyper-V VHDX disk görüntüsüne dönüştürür. Görüntü her zaman yeni bir makine kimliği alır.",
-    "selectRebuildHost": "Linux yeniden oluşturma ana bilgisayarını seçin",
+    "rebuildEngineLinux": "Yeniden oluşturma motoru",
+    "rebuildEngineDescription": "Bu tam makine anlık görüntüsünü, Breeze yardımcısını çalıştıran aynı platformdaki bir cihazda Hyper-V VHDX disk görüntüsüne dönüştürür. Görüntü her zaman yeni bir makine kimliği alır.",
+    "selectRebuildHost": "Yeniden oluşturma ana bilgisayarını seçin",
     "chooseALinuxDeviceWithQemuUtils": "qemu-utils yüklü, çevrimiçi ve görüntü için yeterli boş alana sahip bir Linux cihazı seçin.",
+    "chooseAWindowsRebuildHost": "Breeze yardımcısını çalıştıran, çevrimiçi ve görüntü için yeterli boş alana sahip bir Windows cihazı seçin. Hyper-V yalnızca sanal makineyi oluşturmak için gerekir.",
     "outputPath": "Çıktı yolu",
     "outputPathHint": "Yeniden oluşturma ana bilgisayarında .vhdx ile biten mutlak yol.",
-    "outputPathInvalid": ".vhdx ile biten mutlak bir yol girin.",
+    "outputPathInvalid": "Yeniden oluşturma ana bilgisayarının işletim sistemine uygun, .vhdx ile biten mutlak bir yol girin (Windows'ta C:\\ gibi bir sürücü yolu, Linux'ta / ile başlayan bir yol).",
+    "hypervOptional": "Hyper-V sanal makinesi (isteğe bağlı)",
+    "hypervSpecsHint": "Yeniden oluşturma ana bilgisayarının sanal makineyi VM Özellikleri adımındaki CPU ve bellekle oluşturması için bir sanal makine adı girin.",
+    "hypervVmName": "Sanal makine adı",
+    "hypervVmNamePlaceholder": "örn. srv-01-restored",
+    "hypervSwitch": "Sanal anahtar",
+    "hypervSwitchPlaceholder": "Ağ bağdaştırıcısı olmaması için boş bırakın",
+    "hypervNoNicHint": "Anahtar seçilmedi — siz birini bağlayana kadar sanal makinenin ağ bağdaştırıcısı olmayacak.",
     "startRebuild": "Yeniden oluşturmayı başlat",
-    "rebuildStarted": "Yeniden oluşturma başlatıldı. VHDX, işlem tamamlandığında yeniden oluşturma ana bilgisayarında görünecek."
+    "rebuildStarted": "Yeniden oluşturma başlatıldı. VHDX, işlem tamamlandığında yeniden oluşturma ana bilgisayarında görünecek.",
+    "rebuildErrorNotRestorable": "Bu anlık görüntü yeniden oluşturulamaz: bare-metal geri yüklenebilir olarak işaretlenmemiş. Bare-metal geri yüklenebilir olarak işaretlenmiş bir tam makine anlık görüntüsü seçin veya tam geri yüklemeyi kullanın.",
+    "rebuildErrorNotRestorableReasons": "Bu anlık görüntü yeniden oluşturulamaz: {{reasons}}.",
+    "rebuildErrorHostUnsupported": "Yeniden oluşturma ana bilgisayarı, anlık görüntüyle aynı işletim sistemini çalıştırmalıdır. Başka bir ana bilgisayar seçin.",
+    "rebuildErrorRecoveryInProgress": "Bu cihaz için zaten devam eden bir bare-metal kurtarma var. Bitmesini bekleyin veya iptal edin, ardından yeniden deneyin.",
+    "rebuildErrorSnapshotNotFound": "Bu anlık görüntü artık mevcut değil. Sayfayı yenileyin ve başka bir anlık görüntü seçin.",
+    "rebuildErrorHostNotFound": "Seçilen yeniden oluşturma ana bilgisayarı artık mevcut değil. Başka bir ana bilgisayar seçin.",
+    "enterAVmNameToContinue": "Devam etmek için bir VM adı girin.",
+    "enterAVmNameOnTheVmNameStep": "Geri yüklemeyi başlatmak için “VM Adı” adımında bir VM adı girin."
   },
   "vaultConfigDialog": {
     "device": "Cihaz",
@@ -681,7 +783,9 @@
     "vaultType": "Kasa Tipi",
     "retentionCount": "Elde Tutma Sayısı",
     "numberOfSnapshotsToKeepInTheVault": "Kasada saklanacak anlık görüntü sayısı (1-100).",
-    "cancel": "İptal"
+    "cancel": "İptal",
+    "failedToSave": "Kasa kaydedilemedi. Lütfen tekrar deneyin.",
+    "deviceConfigNotSent": "Kasa kaydedildi, ancak yapılandırması cihaza gönderilemedi: {{error}}"
   },
   "vaultDashboard": {
     "loadingVaults": "Kasalar yükleniyor...",
@@ -703,7 +807,12 @@
     "actions": "Eylemler",
     "sync": "Senkronizasyon",
     "edit": "Düzenle",
-    "deactivate": "Devre dışı bırak"
+    "deactivate": "Devre dışı bırak",
+    "inactive": "Pasif",
+    "syncStarted": "Kasa eşitlemesi başlatıldı",
+    "failedToSync": "Kasa eşitlemesi başlatılamadı. Lütfen tekrar deneyin.",
+    "failedToDeactivate": "Kasa devre dışı bırakılamadı. Lütfen tekrar deneyin.",
+    "deviceConfigNotSent": "Kasa kaydedildi, ancak yapılandırması cihaza gönderilemedi: {{error}}"
   },
   "dRDashboard": {
     "loadingDisasterRecovery": "Olağanüstü durum kurtarma yükleniyor...",
@@ -817,7 +926,7 @@
     "uniqueDeviceCount_other": "{{count}} benzersiz cihazlar",
     "chooseAStepTypeForEachGroup": "Her kurtarma grubu için bir adım türü seçin.",
     "rebuildWaitTimeoutOutOfRange": "Bare-metal yeniden oluşturma bekleme süresi {{min}} ile {{max}} dakika arasında bir tam sayı olmalıdır.",
-    "rebuildOutputDirMustBeAbsolute": "Bare-metal yeniden oluşturma çıktı dizini \"/\" ile başlayan mutlak bir yol olmalı ve en fazla {{max}} karakter içermelidir.",
+    "rebuildOutputDirMustBeAbsolute": "Bare-metal yeniden oluşturma çıktı dizini mutlak bir yol olmalı (\"/\" ile ya da C:\\ gibi bir Windows sürücüsüyle başlamalı) ve en fazla {{max}} karakter içermelidir.",
     "partialSaveFailure": "Bu planın bir bölümü hatadan önce kaydedildi; bu nedenle plan ile liste artık farklı olabilir. Sorunu giderip yeniden kaydedin. Sunucunun yanıtı: {{message}}"
   },
   "dRPlanGroupCard": {
@@ -845,9 +954,13 @@
       "bareMetalRebuild": "Bare-metal yeniden oluşturma (yeniden oluşturma motoru)"
     },
     "rebuildHost": "Yeniden oluşturma ana bilgisayarı",
-    "rebuildHostHint": "Provaları çalıştıran, qemu-utils yüklü Linux cihazı. Yük devretmede ise her cihaz kurtarma ortamını başlatır.",
+    "rebuildHostHint": "Prova edilen cihazlarla aynı işletim sistemini çalıştırmalıdır; Breeze uyumsuz bir eşleşmeyi başlatma sırasında reddeder. Yük devretmede bunun yerine her cihaz kurtarma ortamından önyüklenir.",
+    "rebuildHostOs": "Ana bilgisayar işletim sistemi",
+    "rebuildHostOsLinux": "Linux ana bilgisayarları",
+    "rebuildHostOsWindows": "Windows ana bilgisayarları",
     "outputDir": "Çıktı dizini",
-    "outputDirHint": "Yeniden oluşturma ana bilgisayarında cihaz başına bir VHDX görüntüsü alan dizin.",
+    "outputDirHint": "Yeniden oluşturma ana bilgisayarında cihaz başına bir VHDX görüntüsü alan dizin. Ana bilgisayarın varsayılanı için boş bırakın.",
+    "outputDirOsMismatch": "Bu dizin ana bilgisayarın işletim sistemine uymuyor: Windows ana bilgisayarları C:\\ gibi bir sürücü yolu, Linux ana bilgisayarları / ile başlayan bir yol gerektirir.",
     "waitTimeout": "Bekleme süresi (dk)",
     "waitTimeoutHint": "Adım başarısız sayılmadan önce her cihazın kaydolması için beklenecek dakika."
   },
@@ -950,6 +1063,8 @@
     "codeExpires": "Şu saatte sona erer: {{time}}",
     "overdueNotice": "Henüz bir onay yok — kurtarma konsoluna bakın.",
     "fileIndexPreparing": "Anlık görüntüler arası referanslar için dosya dizini hazırlanıyor…",
+    "snapshotsLoadFailed": "Anlık görüntüler yüklenemedi. Tekrar denemek için sayfayı yenileyin.",
+    "noSnapshots": "Henüz bare-metal ile geri yüklenebilir anlık görüntü yok. Bare-metal geri yüklenebilir olarak işaretlenmiş tam makine yedeği gerekir.",
     "statusFailed": "Kurtarma başarısız oldu",
     "statusRefused": "Kurtarma reddedildi",
     "status": {
@@ -959,7 +1074,224 @@
       "restoring": "Geri yükleniyor",
       "validated": "Doğrulandı",
       "rebooted": "Yeniden başlatıldı",
-      "checked_in": "Giriş yapıldı"
+      "checked_in": "Giriş yapıldı",
+      "completed": "Tamamlandı"
     }
+  },
+  "backupHealth": {
+    "title": "Yedekleme durumu",
+    "subtitle": "Breeze'in yönettiği her cihaz ve yedekleme sağlayıcınızın bildirdiği her şey.",
+    "staleBanner": "Bazı sağlayıcı verileri güncel değil. En son görülen durum gösteriliyor.",
+    "unmappedNotice": "{{value}} cihaz, henüz bir Breeze kuruluşuyla eşlenmemiş sağlayıcı müşterilerine ait.",
+    "statusTitle": "Durum",
+    "recencyTitle": "Son başarılı yedekleme",
+    "coverage": "{{total}} uç noktadan {{covered}} tanesinin güncel yedeği var",
+    "definition": "“Yakın zamanlı”, son 48 saatte başarılı bir yedekleme anlamına gelir. Bir cihazın durumu son çalıştırmasını yansıtır; bu nedenle yakın zamanlı bir yedeği olsa bile o çalıştırma başarısız olduysa Kritik görünebilir.",
+    "providerOnly": "Yalnızca sağlayıcıda olan {{value}} uç nokta",
+    "m365Accounts": "{{value}} Microsoft 365 hesabı",
+    "status": {
+      "no_backups": "Yedek yok",
+      "completed": "Tamamlandı",
+      "completed_with_errors": "Hatalarla tamamlandı",
+      "in_progress": "İşleniyor",
+      "unsuccessful": "Başarısız",
+      "other": "Diğer",
+      "failed": "Başarısız",
+      "interrupted": "Kesildi",
+      "over_quota": "Kota aşıldı",
+      "no_selection": "Seçim yok",
+      "not_started": "Başlamadı",
+      "unknown": "Bilinmiyor",
+      "paused": "Duraklatıldı"
+    },
+    "recency": {
+      "never": "Hiç",
+      "under_24h": "24 saatten az",
+      "under_48h": "48 saatten az",
+      "over_48h": "48 saatten fazla"
+    },
+    "health": {
+      "healthy": "Sağlıklı",
+      "warning": "İlgi gerekiyor",
+      "critical": "Kritik",
+      "unknown": "Bilinmiyor"
+    },
+    "osType": {
+      "workstation": "İş istasyonu",
+      "server": "Sunucu",
+      "unknown": "Bilinmiyor"
+    },
+    "sourceAll": "Tüm kaynaklar",
+    "healthAll": "Tüm durumlar",
+    "sourceBreeze": "Breeze",
+    "searchPlaceholder": "Cihaz veya kuruluş ara",
+    "includeWithoutBackup": "Hiç yedeği olmayan cihazları da göster",
+    "table": {
+      "device": "Cihaz",
+      "computerName": "Bilgisayar adı",
+      "source": "Kaynak",
+      "dataSources": "Veri kaynakları",
+      "selected": "Seçilen",
+      "used": "Kullanılan",
+      "history": "Son 28 gün",
+      "errors": "Hatalar",
+      "verifiedBootable": "Önyükleme doğrulandı",
+      "agent": "Aracı"
+    },
+    "verifiedBootable": {
+      "passed": "Başarılı",
+      "failed": "Başarısız",
+      "never_run": "Hiç çalıştırılmadı",
+      "not_applicable": "Yok"
+    },
+    "dataSource": {
+      "files": "Dosyalar ve klasörler",
+      "system_state": "Sistem durumu",
+      "mssql": "SQL Server",
+      "hyperv": "Hyper-V",
+      "vmware": "VMware",
+      "bare_metal": "Bare metal",
+      "image": "Disk görüntüsü",
+      "m365_mail": "Microsoft 365 e-postası",
+      "m365_sharepoint": "SharePoint",
+      "m365_exchange": "Exchange",
+      "m365_onedrive": "OneDrive",
+      "m365_teams": "Teams",
+      "gws_mail": "Google Workspace e-postası",
+      "gws_drive": "Google Drive",
+      "gws_shared_drive": "Google ortak drive’ları",
+      "other": "Diğer"
+    },
+    "noObservation": "Gözlem yok",
+    "openDevice": "Cihazı aç",
+    "empty": "Bu filtrelere uyan cihaz yok.",
+    "loadMore": "Daha fazla yükle",
+    "error": "Yedekleme durumu yüklenemedi",
+    "external": {
+      "title": "Dış yedekleme",
+      "customer": "Sağlayıcı müşterisi",
+      "lastSuccess": "Son başarılı yedekleme",
+      "lastSession": "Son oturum",
+      "bootCheck": "Son önyükleme denetimi",
+      "unlink": "Bağlantıyı kaldır",
+      "unlinkConfirm": "Bu sağlayıcı cihazının Breeze cihazıyla bağlantısı kaldırılsın mı? Yedekleme ürününde kalır ve yeniden bağlanabilir.",
+      "unlinkedToast": "Sağlayıcı cihazının bağlantısı kaldırıldı",
+      "errorUnlink": "Sağlayıcı cihazının bağlantısı kaldırılamadı",
+      "error": "Dış yedekleme durumu yüklenemedi",
+      "alsoCheck": "Üçüncü taraf yedekleme bağlantılarını Entegrasyonlar bölümünde de kontrol edin."
+    },
+    "saasAccountsSubtitle": "Microsoft 365 / Google Workspace",
+    "saas": "SaaS",
+    "saasAccounts": "{{value}} SaaS hesabı",
+    "workloadBackup": "{{workload}} yedeklemesi",
+    "sourceProvider": "Yedekleme sağlayıcıları"
+  },
+  "restoreResultNotices": {
+    "systemStateRequiresRebuildTitle": "Sistem durumu bir bare-metal yeniden oluşturma ile uygulanır",
+    "systemStateRequiresRebuildBody": "Bu Windows kurtarması yalnızca dosyaları geri yükledi. Anlık görüntünün sistem durumunu uygulamak için bu anlık görüntünün bare-metal yeniden oluşturmasını çalıştırın (VM olarak geri yükle, yeniden oluşturma motoru).",
+    "unattestedSnapshot": "Onaylanmamış anlık görüntü: dosyalar bir anlık görüntü onayına göre denetlenmedi.",
+    "resultCode": "Sonuç kodu: {{code}}",
+    "restrictedDescriptors_one": "{{count}} öğe kısıtlayıcı bir erişim listesiyle geri yüklendi",
+    "restrictedDescriptors_other": "{{count}} öğe kısıtlayıcı bir erişim listesiyle geri yüklendi",
+    "restrictedDescriptorsBody": "Kayıtlı izinleri bu makinenin tanımadığı hesapları içeriyordu veya okunamadı; bu nedenle yalnızca SYSTEM ve Administrators erişebilir (sahip: Administrators). İzinleri gözden geçirip gerektiği şekilde yeniden atayın.",
+    "restrictedDescriptorsShowPaths_one": "{{count}} yolu göster",
+    "restrictedDescriptorsShowPaths_other": "{{count}} yolu göster",
+    "restrictedDescriptorsUnlisted_one": "{{count}} öğe daha listelenmedi.",
+    "restrictedDescriptorsUnlisted_other": "{{count}} öğe daha listelenmedi."
+  },
+  "unattestedRestoreStepUp": {
+    "heading": "Bu geri yüklemeyi onaylayın",
+    "introUnattested": "Bu yedeğin bütünlük onayı yok; bu nedenle içeriği geri yüklenmeden önce doğrulanmış bir kayıtla karşılaştırılamaz.",
+    "introProducerOnly": "Bu yedek, bütünlüğünü yalnızca özgün cihazın denetleyebileceği bir yerde saklandı. Başka bir cihaza geri yüklemek için onayınız gerekir.",
+    "twoFactor": "Devam etmek için iki faktörlü kimlik doğrulamayla onaylayın.",
+    "confirmOnly": "Devam etmek için onaylayın. Geri yükleme denetim günlüğüne kaydedilir.",
+    "code": "Kimlik doğrulama kodu",
+    "passkey": "Geçiş anahtarınızı kullanmanız istenecek.",
+    "enrollIntro": "Bu geri yüklemeyi onaylamak için ikinci bir faktör gerekir ve hesabınızda henüz yok. Profilinizde bir kimlik doğrulayıcı uygulaması veya geçiş anahtarı ayarlayın, ardından yeniden deneyin.",
+    "enrollIntroSmsOnly": "Bu geri yüklemeyi onaylamak için bir kimlik doğrulayıcı uygulaması veya geçiş anahtarı gerekir. Hesabınızda yalnızca kısa mesaj kodları var; profilinizde bunlardan birini ekleyin.",
+    "enrollLink": "İki faktörlü kimlik doğrulamayı ayarlayın",
+    "enrollStillRequired": "Hesabınızda hâlâ ikinci bir faktör yok. Bir tane ayarlayın, ardından yeniden deneyin.",
+    "enrollStillRequiredSmsOnly": "Hesabınızda hâlâ bir kimlik doğrulayıcı uygulaması veya geçiş anahtarı yok.",
+    "confirm": "Onayla ve geri yükle",
+    "cancel": "İptal",
+    "failed": "Doğrulama kabul edilmedi. Yeniden deneyin.",
+    "unavailable": "Doğrulama başlatılamadı. Yeniden deneyin."
+  },
+  "snapshotIntegrityBadge": {
+    "verified": "Doğrulandı",
+    "checking": "Denetleniyor",
+    "unverified": "Doğrulanmadı",
+    "failed": "Bütünlük denetimi başarısız"
+  },
+  "reparseSkipNotice": {
+    "summary_one": "{{count}} yeniden ayrıştırma noktası atlandı: bağlantılar (junction) ve bağlama noktaları izlenmez ve geri yüklenmez. Bu beklenen bir durumdur, hata değildir.",
+    "summary_other": "{{count}} yeniden ayrıştırma noktası atlandı: bağlantılar (junction) ve bağlama noktaları izlenmez ve geri yüklenmez. Bu beklenen bir durumdur, hata değildir.",
+    "showDetails": "Atlanan yolları göster"
+  },
+  "failureCategory": {
+    "device_offline": {
+      "label": "Cihaz çevrimdışı",
+      "hint": "Cihaz yedekleme sırasında Breeze ile bağlantısını kaybetti. Yedekleme penceresi boyunca cihazı açık ve çevrimiçi tutun."
+    },
+    "timeout": {
+      "label": "Takıldı veya zaman aşımına uğradı",
+      "hint": "Yedekleme ilerlemeyi durdurdu veya süre sınırını aştı. Çok büyük yedeklemeler birden fazla pencere gerektirebilir. Cihazın yükünü ve yedekleme seçiminin boyutunu kontrol edin."
+    },
+    "storage": {
+      "label": "Depolama sorunu",
+      "hint": "Breeze yedekleme hedefine yazamadı veya yükleme yetkisinin süresi doldu. Depolama yapılandırmasını test edin; kimlik bilgilerini ve boş alanı kontrol edin."
+    },
+    "agent": {
+      "label": "Aracı sorunu",
+      "hint": "Cihazdaki yedekleme bileşeni beklenmedik şekilde durdu. Aracıyı güncelleyin ve yedeklemeyi yeniden çalıştırın. Sorun devam ederse cihazın aracı günlüklerini kontrol edin."
+    },
+    "configuration": {
+      "label": "Yapılandırma sorunu",
+      "hint": "Yedeklenecek geçerli bir şey yoktu veya iş başlarken yedekleme yapılandırması değişti. Cihazın yedekleme profilini gözden geçirin."
+    },
+    "source_access": {
+      "label": "Dosyalar okunamadı",
+      "hint": "Bazı dosyalar kilitliydi, kullanımdaydı veya aracı tarafından okunamıyordu. Aşağıda listelenen dosyaları ve VSS durumunu kontrol edin."
+    },
+    "cancelled": {
+      "label": "İptal edildi",
+      "hint": "Bitmeden önce bir kullanıcı veya Breeze tarafından durduruldu."
+    },
+    "unknown": {
+      "label": "Diğer hata",
+      "hint": "Breeze bu hatayı henüz tanımıyor. Tam ileti aşağıda gösteriliyor."
+    },
+    "troubleshootingLink": "Sorun giderme kılavuzu"
+  },
+  "fullRunReason": {
+    "no_prior_snapshot": "Bu cihaz ve hedef için ilk yedekleme",
+    "base_expired": "Önceki yedeklemenin saklama süresi dolmuştu",
+    "storage_identity_changed": "Yedekleme hedefi değişti",
+    "backup_type_mismatch": "Önceki yedekleme farklı türdeydi",
+    "base_job_not_completed": "Önceki hiçbir yedekleme başarıyla tamamlanmadı",
+    "base_retired": "Önceki yedekleme, saklama kuralı nedeniyle kaldırıldı",
+    "base_retired_race": "Önceki yedekleme, saklama kuralı nedeniyle kaldırıldı",
+    "base_deleted_race": "Önceki yedekleme, saklama kuralı nedeniyle kaldırıldı",
+    "no_verified_base": "Önceki hiçbir yedekleme bütünlük doğrulamasını geçmedi",
+    "key_root_changed": "Hedef klasör (önek) değişti",
+    "base_key_root_unreadable": "Önceki yedeklemenin depolama konumu okunamadı",
+    "invalid_destination_prefix": "Hedef öneki geçersiz",
+    "nothing_reused": "Önceki bir yedekleme vardı, ancak değişmeyen hiçbir dosya yeniden kullanılamadı",
+    "unrecorded": "Neden kaydedilmedi (bu yedekleme, Breeze bunu izlemeye başlamadan önce çalıştı)"
+  },
+  "jobDataSummary": {
+    "uploadedAndReused": "{{uploaded}} yüklendi · {{reused}} yeniden kullanıldı",
+    "processedBeforeStopped": "Durmadan önce {{processed}} işlendi",
+    "full": "Tam",
+    "heading": "Bu çalıştırmanın depoladıkları",
+    "protected": "Korunan",
+    "uploadedThisRun": "Bu çalıştırmada yüklenen",
+    "reusedFromEarlier": "Önceki yedeklemelerden yeniden kullanılan",
+    "backupType": "Yedekleme türü",
+    "incremental": "Artımlı",
+    "fullWithReason": "Tam: {{reason}}",
+    "explainer": "Yalnızca yeni veya değişen dosyalar yüklenir. Değişmeyen dosyalar, bu cihazın aynı hedefe yaptığı önceki yedeklemelerden yeniden kullanılır.",
+    "learnMore": "Artımlı yedeklemeler nasıl çalışır",
+    "resumedAt": "Bu çalıştırma, kesintiye uğrayan bir yedeklemeyi {{time}} tarihinde sürdürdü."
   }
 }

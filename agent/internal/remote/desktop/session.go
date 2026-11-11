@@ -2,6 +2,7 @@ package desktop
 
 import (
 	"fmt"
+	"github.com/breeze-rmm/agent/internal/ipc"
 	"image"
 	"log/slog"
 	"runtime/debug"
@@ -45,6 +46,27 @@ type Session struct {
 	clipboardSync *clipboard.ClipboardSync
 	cursorDC      *webrtc.DataChannel
 	controlDC     *webrtc.DataChannel
+
+	// softwareSwapRetryAt (unix nanos) suppresses swapToSoftwareEncoder until
+	// then, after it found no usable software encoder (#11392).
+	softwareSwapRetryAt atomic.Int64
+
+	// displayWake keeps the display on for the session (#10874). Set in
+	// StartSession before the capture loop starts; released in doCleanup.
+	displayWake *displayWakeHold
+
+	// viewerChannels maps each viewer data-channel label to the channel now
+	// serving it. A replaced channel's messages are ignored and its late close
+	// does not reset the stream its successor carries. Guarded by mu.
+	viewerChannels map[string]any
+	// inputRAttached is set once the viewer opens a reliable input-r: it
+	// speaks W2b, so it is sent input_epoch announcements. Viewers that never
+	// open it are never sent a control message they predate.
+	inputRAttached atomic.Bool
+	// geometryMu serialises input geometry transitions (monitor switch,
+	// desktop switch): epoch bump, capturer swap, offset commit, announcement.
+	// Lock order: geometryMu, then mu. The input worker never takes it.
+	geometryMu    sync.Mutex
 	audioTrack    *webrtc.TrackLocalStaticSample
 	audioCapturer AudioCapturer
 	audioEnabled  atomic.Bool
@@ -116,6 +138,13 @@ type Session struct {
 	// transient stall doesn't pin a CPU core software-encoding 5K for the whole
 	// session. Driven from the ticker capture loop. See session_encoder_restore.go.
 	hwRestore hardwareRestorePolicy
+	// hwWarmupCh is non-nil while a hardware restore candidate is warming up
+	// off the live path (#10880). The warm-up goroutine hands its result back
+	// on it; only the capture loop receives, via maybeRestoreHardwareEncoder.
+	hwWarmupCh chan hardwareWarmupResult
+	// hwWarmupCancel is closed by abandonHardwareWarmup to tell the warm-up
+	// goroutine its result will not be collected. Set with hwWarmupCh.
+	hwWarmupCancel chan struct{}
 
 	// cursorOffsetX/Y store the active monitor's virtual desktop origin so
 	// cursorStreamLoop can convert absolute GetCursorInfo coords to
@@ -127,6 +156,13 @@ type Session struct {
 
 	// sasHandler is set from SessionManager.OnSASRequest during creation.
 	sasHandler func() error
+
+	// onClipboardSummary is SessionManager.OnClipboardSummary at creation.
+	onClipboardSummary func(sessionID string, summary ipc.ClipboardSummary)
+
+	// trickle carries local ICE candidates gathered after the answer to the
+	// viewer (#9182). nil for sessions not built by StartSession.
+	trickle *iceTrickle
 
 	// displayIndex is the monitor index this session was started on.
 	displayIndex int
@@ -151,6 +187,13 @@ type Session struct {
 	// WriteSample (never bumped by the idle heartbeat). Drives sampleDuration so
 	// the RTP media clock reflects true inter-frame wall time across idle gaps.
 	lastSampleNanos atomic.Int64
+	// lastCaptureUnixNano is when the capturer last delivered a frame to the
+	// CPU encode path, and lastEncodeOutputUnixNano when the encoder last
+	// returned encoded data. Together with lastVideoWriteUnixNano they let the
+	// ticker no-video watchdog tell a dead capturer from a stalled encoder or
+	// sink, so an encoder stall no longer rebuilds the capture stream (#10880).
+	lastCaptureUnixNano      atomic.Int64
+	lastEncodeOutputUnixNano atomic.Int64
 
 	// lastInputUnixNano is the wall-clock nanos of the most recent INPUT event
 	// (mouse/keyboard) from the viewer. It drives the idle-session watchdog
@@ -193,6 +236,10 @@ type SessionManager struct {
 	// while a watchdog is running would be a data race.
 	clock *watchdogClock
 
+	// notifyEnding, when set, replaces the watchdog's session_ending send
+	// (#10421). Test-only, with the same set-before-start rule as clock.
+	notifyEnding func(session *Session, body map[string]any)
+
 	// RequestRevocationLeaseRenew, if set, asks the control plane to renew the
 	// revocation lease for a session. Set by the layer that owns the agent's
 	// command WebSocket (the heartbeat), because this package has no transport
@@ -212,24 +259,75 @@ type SessionManager struct {
 	// so the reason is fully committed under s.mu before this ever reads it.
 	OnSessionStopped func(sessionID, reason string)
 
+	// OnClipboardSummary receives a session's clipboard transfer counters
+	// once, at teardown, when there was any clipboard activity. Copied onto
+	// each session at creation, like OnSASRequest.
+	OnClipboardSummary func(sessionID string, summary ipc.ClipboardSummary)
+
+	// ClipboardProvider, if set, supplies each new session's clipboard; nil
+	// (or a nil result) means the local system clipboard. The Windows system
+	// helper sets it so that what SYSTEM cannot read, such as an image the
+	// user copied, is read through the user helper (#8393). Set before
+	// sessions start, like OnSASRequest.
+	ClipboardProvider func(sessionID string) clipboard.Provider
+
 	// OnSessionStarted is the symmetric hook: called when a WebRTC peer
 	// connection reaches Connected, i.e. the viewer is actually watching.
 	// Quick Support uses it to tell the end user "Technician connected."
 	// Invoked on its own goroutine, like OnSessionStopped.
 	OnSessionStarted func(sessionID string)
 
+	// OnLocalICECandidate receives each local ICE candidate gathered after a
+	// session's answer was taken, and the end-of-gathering marker, once the
+	// transport owner calls BeginICETrickle (#9182). startGeneration is the
+	// value given to BeginICETrickle. Called serially per session from pion's
+	// candidate callback, so it must not block for long.
+	OnLocalICECandidate func(sessionID, startGeneration string, c LocalICECandidate)
+
 	// lastDesktopState caches the most recently broadcast desktop state so
 	// late-connecting viewers can receive an initial state when their control
 	// channel opens. Protected by mu.
 	lastDesktopState    string
 	lastDesktopUsername string
+
+	// activityObserver, if set, is called after every direct stop
+	// (StopSession, StopAllSessions) so a caller that mirrors whether any
+	// capture is running can look again at once. It must not block. Set it
+	// with SetActivityObserver.
+	activityObserver atomic.Pointer[func()]
+}
+
+// SetActivityObserver registers fn to be called after every StopSession and
+// StopAllSessions, on the stopping goroutine and with no manager lock held.
+// fn must not block. A nil fn clears it.
+func (m *SessionManager) SetActivityObserver(fn func()) {
+	if fn == nil {
+		m.activityObserver.Store(nil)
+		return
+	}
+	m.activityObserver.Store(&fn)
+}
+
+func (m *SessionManager) notifyActivity() {
+	if fn := m.activityObserver.Load(); fn != nil {
+		(*fn)()
+	}
 }
 
 // NewSessionManager creates a new session manager.
 // Eagerly loads OpenH264 in the background so the DLL is ready before
 // the first desktop session (avoids download timeout during IPC).
 func NewSessionManager() *SessionManager {
-	go PreloadOpenH264()
+	return NewSessionManagerWithPreloader(PreloadOpenH264)
+}
+
+// NewSessionManagerWithPreloader separates session state from the external codec startup.
+// Session unit tests supply nil: ICE and lease tests must not download or load
+// a native library asynchronously. Production always supplies PreloadOpenH264.
+func NewSessionManagerWithPreloader(preload func()) *SessionManager {
+	if preload != nil {
+		go preload()
+	}
 	return &SessionManager{
 		sessions: make(map[string]*Session),
 		config:   DefaultConfig(),
@@ -269,6 +367,15 @@ func (m *SessionManager) HasActiveSessions() bool {
 		}
 	}
 	return false
+}
+
+// HasSession reports whether sessionID is still registered with this manager
+// (#10316: the agent's banner sweep asks before hiding a session's banner).
+func (m *SessionManager) HasSession(sessionID string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	_, ok := m.sessions[sessionID]
+	return ok
 }
 
 // SetAtLoginWindow updates the login-window input mode on all active sessions.
@@ -380,21 +487,9 @@ func (m *SessionManager) CaptureScreenshot(displayIndex int) (*image.RGBA, int, 
 		return nil, 0, 0, ErrNoActiveSession
 	}
 
-	// Retry a few times — the repaint needs a moment to produce a DXGI frame.
-	var img *image.RGBA
-	var err error
-	for attempt := 0; attempt < 8; attempt++ {
-		img, err = cap.Capture()
-		if err != nil {
-			return nil, 0, 0, fmt.Errorf("capture from active session: %w", err)
-		}
-		if img != nil {
-			break
-		}
-		time.Sleep(30 * time.Millisecond)
-	}
-	if img == nil {
-		return nil, 0, 0, fmt.Errorf("capture from active session: no frame after retries")
+	img, err := captureFrameForScreenshot(cap)
+	if err != nil {
+		return nil, 0, 0, fmt.Errorf("capture from active session: %w", err)
 	}
 
 	w, h, err := cap.GetScreenBounds()
@@ -404,6 +499,35 @@ func (m *SessionManager) CaptureScreenshot(displayIndex int) (*image.RGBA, int, 
 	}
 
 	return img, w, h, nil
+}
+
+// captureFrameForScreenshot grabs one frame from a capturer the streaming loop
+// is also reading. A LatestFrameProvider (the macOS SCStream capturer, #5928)
+// hands back its current frame directly; Capture() there reports an unchanged
+// screen as no frame once the loop has taken it. Other capturers are retried a
+// few times, since the repaint needs a moment to produce a DXGI frame.
+func captureFrameForScreenshot(cap ScreenCapturer) (*image.RGBA, error) {
+	if lp, ok := cap.(LatestFrameProvider); ok {
+		img, err := lp.CaptureLatest()
+		if err != nil {
+			return nil, err
+		}
+		if img == nil {
+			return nil, fmt.Errorf("no frame available")
+		}
+		return img, nil
+	}
+	for attempt := 0; attempt < 8; attempt++ {
+		img, err := cap.Capture()
+		if err != nil {
+			return nil, err
+		}
+		if img != nil {
+			return img, nil
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+	return nil, fmt.Errorf("no frame after retries")
 }
 
 // StopSession stops and removes a session
@@ -418,6 +542,7 @@ func (m *SessionManager) StopSession(sessionID string) {
 	if session != nil {
 		session.Stop()
 	}
+	m.notifyActivity()
 }
 
 // StopAllSessions tears down all active desktop sessions.
@@ -433,6 +558,7 @@ func (m *SessionManager) StopAllSessions() {
 	for _, s := range sessions {
 		s.Stop()
 	}
+	m.notifyActivity()
 }
 
 // maxStopReasonBytes bounds the text StopWithReason records. Every source we
@@ -542,6 +668,12 @@ func (s *Session) LastStopReason() string {
 
 func (s *Session) doCleanup() {
 	s.cleanupOnce.Do(func() {
+		// Before anything else is torn down: nothing this session pressed may
+		// stay pressed on the customer's machine.
+		s.closeInput()
+		if s.trickle != nil {
+			s.trickle.stop()
+		}
 		if s.audioCapturer != nil {
 			s.audioCapturer.Stop()
 		}
@@ -562,6 +694,9 @@ func (s *Session) doCleanup() {
 		if s.capturer != nil {
 			s.capturer.Close()
 		}
+		// After the capturer: the display may sleep again only once nothing
+		// captures it (#10874).
+		s.displayWake.release()
 		if s.peerConn != nil {
 			s.peerConn.Close()
 		}
@@ -579,6 +714,10 @@ func (s *Session) doCleanup() {
 				slog.Warn("Failed to release local-input block", "session", s.id, "error", err.Error())
 			}
 		}
+
+		// Last: in helper mode this is an IPC write that can block, and
+		// nothing above may wait on it.
+		s.reportClipboardSummary()
 	})
 }
 

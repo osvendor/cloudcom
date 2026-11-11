@@ -14,7 +14,7 @@
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { Hono } from 'hono';
-import { beforeEach, afterEach, expect, it, vi } from 'vitest';
+import { beforeEach, afterEach, afterAll, expect, it, vi } from 'vitest';
 import { and, eq, sql } from 'drizzle-orm';
 import { getTestDb } from './setup';
 import { createPartner, createOrganization, createUser, setupTestEnvironment, createSite } from './db-utils';
@@ -30,6 +30,7 @@ import { organizationUsers, devices, deviceCommands, m365Connections } from '../
 import {
   callerVerifications as v, callerVerificationSubjectBindings as b, callerVerificationDestinations as d, callerVerificationPolicies as p,
 } from '../../db/schema/callerVerification';
+import { refreshTokenFamilies } from '../../db/schema/refreshTokenFamilies';
 import { executeOrgMerge } from '../../services/orgMerge';
 import { createAccessToken } from '../../services/jwt';
 import { clearPermissionCache } from '../../services/permissions';
@@ -38,6 +39,9 @@ import { moveOrgRoutes } from '../../routes/devices/moveOrg';
 import { requireCallerVerification } from '../../services/callerVerification/gate';
 import { handleRejection } from '../../services/callerVerification/rejection';
 import { createAdministrative, applyDecision } from '../../services/callerVerification/service';
+import { withAdministrativeProof } from '../../services/callerVerification/administrativeContext';
+import { callerVerificationAdministrativeDigest, mintStepUpGrant, validateStepUpGrant } from '../../services/mfaStepUpGrant';
+import { closeRedis } from '../../services/redis';
 import { observeLogin } from '../../services/callerVerification/subjects';
 import { destinationHash } from '../../services/callerVerification/destinations';
 import { observeSessionPrincipal } from '../../services/callerVerification/loginObservation';
@@ -102,6 +106,7 @@ beforeEach(async () => {
 afterEach(() => {
   delete process.env.CALLER_VERIFICATION_ENABLED;
   delete process.env.ORG_MERGE_FENCE_DRAIN_MS;
+  vi.unstubAllEnvs();
 });
 
 // ---------------------------------------------------------------------------
@@ -391,21 +396,48 @@ it.each(['organization', 'partner'] as const)('%s policy GET/PUT return defaults
   await check(await f.request('GET', path), scope === 'partner' ? 0 : 1, next);
 });
 
+afterAll(async () => { await closeRedis(); });
+
 it('admin factory keeps cap before proof consumption, incremented attempt and technician audit', async () => {
   const f = await liveFixture();
   const own = f.families[0]!;
-  await sys(() => db.update(p).set({ maxAttemptsPerHour: 2 }).where(eq(p.partnerId, f.env.partner.id)));
-  const consume = vi.fn(async () => ({ sid: randomUUID(), authEpoch: 1, mfaEpoch: 1 }));
-  configureCallerVerificationPorts({ consumeStepUp: consume });
-  const input = { orgId: own.orgId, targetContactId: own.contact.id, reason: 'Confirmed employee offboarding with the authorized HR manager.', stepUpGrantId: randomUUID() };
-  const result = await sys(() => createAdministrative(f.actor, input));
+  const proof = { userId: f.env.user.id, sid: randomUUID(), authEpoch: f.env.user.authEpoch, mfaEpoch: f.env.user.mfaEpoch };
+  await sys(async () => {
+    await db.update(p).set({ maxAttemptsPerHour: 2 }).where(eq(p.partnerId, f.env.partner.id));
+    await db.insert(refreshTokenFamilies).values({ familyId: proof.sid, userId: proof.userId, absoluteExpiresAt: new Date(Date.now() + 3600_000) });
+  });
+  const reason = 'Confirmed employee offboarding with the authorized HR manager.';
+  const bind = {
+    ...proof, operation: 'caller_verification_administrative_disable' as const,
+    resourceDigest: callerVerificationAdministrativeDigest({ orgId: own.orgId, entraTenantId: own.binding.entraTenantId!, entraOid: own.binding.entraOid!, reason }),
+  };
+  const stepUpGrantId = await mintStepUpGrant(bind);
+  expect(stepUpGrantId).not.toBeNull();
+  const input = { orgId: own.orgId, targetContactId: own.contact.id, reason, stepUpGrantId: stepUpGrantId! };
+  // A durable session and grant alone cannot substitute for interactive context.
+  await expect(sys(() => createAdministrative(f.actor, input))).rejects.toMatchObject({ code: 'interactive_stepup_required' });
+  expect(await validateStepUpGrant(stepUpGrantId!, bind)).toBe(true);
+  const result = await sys(() => withAdministrativeProof(proof, () => createAdministrative(f.actor, input)));
   expectHttpVerification(result as unknown as Record<string, unknown>);
-  expect((await sys(() => db.select().from(v).where(eq(v.id, result.id))))[0]!.attemptNo).toBe(2);
+  expect(result).toMatchObject({ method: 'administrative_stepup', status: 'verified', actionScope: 'disable_user', tier: 3 });
+  const [stored] = await sys(() => db.select().from(v).where(eq(v.id, result.id)));
+  expect(stored).toMatchObject({
+    attemptNo: 2, requesterBindingId: null, targetBindingId: own.binding.id,
+    stepupSessionId: proof.sid, stepupAuthEpoch: proof.authEpoch, stepupMfaEpoch: proof.mfaEpoch,
+  });
+  expect(stored!.stepupVerifiedAt).toBeInstanceOf(Date);
+  expect(await validateStepUpGrant(stepUpGrantId!, bind)).toBe(false);
   const audit = await sys(() => db.select().from(auditLogs).where(and(eq(auditLogs.resourceId, result.id), eq(auditLogs.action, 'caller_verification.administrative_created'))));
   expect(audit).toHaveLength(1);
-  expect(audit[0]).toMatchObject({ actorType: 'user', actorId: f.env.user.id });
-  await expect(sys(() => createAdministrative(f.actor, { ...input, stepUpGrantId: randomUUID() }))).rejects.toMatchObject({ code: 'attempt_cap' });
-  expect(consume).toHaveBeenCalledTimes(1);
+  expect(audit[0]).toMatchObject({ actorType: 'user', actorId: f.env.user.id, details: expect.objectContaining({ reason }) });
+  const cappedGrantId = await mintStepUpGrant(bind);
+  expect(cappedGrantId).not.toBeNull();
+  await expect(sys(() => withAdministrativeProof(proof, () => createAdministrative(f.actor, { ...input, stepUpGrantId: cappedGrantId! })))).rejects.toMatchObject({ code: 'attempt_cap' });
+  // The cap runs before the Redis GETDEL: the refused request keeps its grant.
+  expect(await validateStepUpGrant(cappedGrantId!, bind)).toBe(true);
+  const rows = await sys(() => db.select().from(v).where(and(eq(v.orgId, own.orgId), eq(v.contactId, own.contact.id), eq(v.method, 'administrative_stepup'))));
+  expect(rows).toHaveLength(1);
+  expect(rows[0]!.id).toBe(result.id);
 });
 
 async function liveDevice(f: LiveFamily) {
@@ -414,6 +446,8 @@ async function liveDevice(f: LiveFamily) {
 }
 
 it('real device move revokes old workstation authorization but preserves consumed history', async () => {
+  // The workstation tier is dark by default; this test exercises it.
+  vi.stubEnv('CALLER_VERIFICATION_WORKSTATION_ENABLED', 'true');
   const f = await liveFixture('partner', false);
   const own = f.families[0]!;
   const foreign = f.families[2]!;
@@ -472,7 +506,9 @@ it.each(['organization', 'system'] as const)('observation failure rolls back dec
 it('independent login resolves only a unique existing binding in its own org', async () => {
   const upn = 'observed@example.com';
   const principal = { sid: 'S-1-5-21-987', username: 'alex', upn };
-  await sys(() => db.update(b).set({ upnSnapshot: upn }).where(sql`${b.id} IN (${ba}::uuid, ${bb}::uuid)`));
+  // ba starts with no os principal on file so this is a legitimate first observation.
+  await sys(() => db.update(b).set({ upnSnapshot: upn, osPrincipal: null }).where(eq(b.id, ba)));
+  await sys(() => db.update(b).set({ upnSnapshot: upn }).where(eq(b.id, bb)));
   await withDbAccessContext(org(A), () => observeSessionPrincipal(A, 'host', 'alex', principal));
   expect((await sys(() => db.select().from(b).where(eq(b.id, ba))))[0]!.osPrincipal).toBe(principal.sid);
   expect((await sys(() => db.select().from(b).where(eq(b.id, bb))))[0]!.osPrincipal).toBe('sid:collision');
@@ -485,6 +521,29 @@ it('independent login resolves only a unique existing binding in its own org', a
   await withDbAccessContext(org(A), () => observeSessionPrincipal(A, 'host', 'alex', principal));
   expect((await sys(() => db.select().from(b).where(eq(b.id, ba))))[0]!.osPrincipal).toBeNull();
   expect((await sys(() => db.select().from(b).where(eq(b.id, ba2))))[0]!.osPrincipal).toBeNull();
+});
+
+it('independent login never overwrites an already-observed os principal and quarantines a conflicting claim instead of revoking established bindings', async () => {
+  const upn = 'observed2@example.com';
+  const principal = { sid: 'S-1-5-21-501', username: 'alex', upn };
+  // ba already carries a directory_sync os principal distinct from what this login reports.
+  await sys(() => db.update(b).set({ upnSnapshot: upn, osPrincipal: 'sid:established', source: 'directory_sync' }).where(eq(b.id, ba)));
+  await withDbAccessContext(org(A), () => observeSessionPrincipal(A, 'host', 'alex', principal));
+  // A self-reported session must never rewrite identity evidence already on file for this contact.
+  expect((await sys(() => db.select().from(b).where(eq(b.id, ba))))[0]!).toMatchObject({ osPrincipal: 'sid:established', source: 'directory_sync' });
+
+  // Now target a distinct, still-unset binding (ba2, same org, a DIFFERENT contact from ba)
+  // whose reported principal collides with ba's established os principal.
+  const upn2 = 'observed3@example.com';
+  const principal2 = { sid: 'S-1-5-21-502', username: 'sam', upn: upn2 };
+  await sys(() => db.update(b).set({ upnSnapshot: upn2, osPrincipal: null }).where(eq(b.id, ba2)));
+  await sys(() => db.update(b).set({ osPrincipal: principal2.sid, source: 'directory_sync' }).where(eq(b.id, ba)));
+  await withDbAccessContext(org(A), () => observeSessionPrincipal(A, 'host', 'sam', principal2));
+  // The established binding (ba, a different contact) must survive unrevoked, and its grants intact.
+  expect((await sys(() => db.select().from(b).where(eq(b.id, ba))))[0]!).toMatchObject({ revokedAt: null, osPrincipal: principal2.sid });
+  // The new claim (ba2) must not be silently accepted either — it stays unset, quarantined for review.
+  expect((await sys(() => db.select().from(b).where(eq(b.id, ba2))))[0]!).toMatchObject({ osPrincipal: null, revokedAt: null });
+  expect(await sys(() => db.select().from(auditLogs).where(and(eq(auditLogs.resourceId, ba2), eq(auditLogs.action, 'caller_verification.binding_observation_quarantined'))))).toHaveLength(1);
 });
 
 it('directory search returns W04 data envelope and enforces real route authorization', async () => {

@@ -174,6 +174,8 @@ func TestStageRollbackArtifacts_FailureLeavesLiveSetUntouched(t *testing.T) {
 	}
 }
 
+// Exercise the synchronous journal primitives on temporary files. The Windows
+// production wrapper schedules a detached service restart and must not run here.
 func TestRollbackSwapJournalRecoversEveryInterruptedBoundary(t *testing.T) {
 	for failAfter := 0; failAfter < 2; failAfter++ {
 		t.Run(string(rune('1'+failAfter)), func(t *testing.T) {
@@ -202,7 +204,7 @@ func TestRollbackSwapJournalRecoversEveryInterruptedBoundary(t *testing.T) {
 			if _, err := os.Stat(set.JournalPath); err != nil {
 				t.Fatalf("recoverable journal missing: %v", err)
 			}
-			if err := RecoverRollbackSwap(set.JournalPath); err != nil {
+			if err := recoverRollbackSwapInline(set.JournalPath); err != nil {
 				t.Fatalf("recover: %v", err)
 			}
 			for _, name := range []string{"agent", "backup"} {
@@ -268,13 +270,13 @@ func TestRollbackSwapRetainsOldSetUntilHealthCommit(t *testing.T) {
 	}
 	t.Run("unhealthy recovers old", func(t *testing.T) {
 		set := newSet(t)
-		if err := SwapRollbackArtifactsRetainingJournal(set); err != nil {
+		if err := swapRollbackArtifactsMode(set, nil, false); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := os.Stat(set.JournalPath); err != nil {
 			t.Fatal("recoverable journal was not retained")
 		}
-		if err := RecoverRollbackSwap(set.JournalPath); err != nil {
+		if err := recoverRollbackSwapInline(set.JournalPath); err != nil {
 			t.Fatal(err)
 		}
 		for _, artifact := range set.Artifacts {
@@ -286,7 +288,7 @@ func TestRollbackSwapRetainsOldSetUntilHealthCommit(t *testing.T) {
 	})
 	t.Run("healthy commits target", func(t *testing.T) {
 		set := newSet(t)
-		if err := SwapRollbackArtifactsRetainingJournal(set); err != nil {
+		if err := swapRollbackArtifactsMode(set, nil, false); err != nil {
 			t.Fatal(err)
 		}
 		if err := CommitRollbackSwap(set.JournalPath); err != nil {

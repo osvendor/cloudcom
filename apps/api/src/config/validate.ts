@@ -1,8 +1,14 @@
 import { isIP } from 'net';
+import { parseCimdAllowedHosts } from '../oauth/cimdHosts';
+import { MAX_BOOTSTRAP_TOKEN_TTL_MINUTES, OEM_LANES } from '@breeze/shared';
+import { parseUnattendedPrincipals } from '../services/mcpUnattendedPrincipals';
+import { TICKET_IMPORT_LIMIT_ENV_VARS } from '../services/ticketImport/importLimits';
 import { z } from 'zod';
 import { validateM365CustomerGraphReadRuntimeConfigAtBoot } from '../services/m365ControlPlane/runtimeConfig';
 import { validateM365CustomerGraphActionsRuntimeConfigAtBoot } from '../services/m365ControlPlane/writeActionRuntimeConfig';
 import { validateM365CommunicationsRuntimeConfigAtBoot } from '../services/m365ControlPlane/commsRuntimeConfig';
+import { getPortalEntraConfig } from './portalEntra';
+import { warnOnTrustedProxyCidrMismatch } from './proxyTrustBootCheck';
 import {
   OFFICIAL_RELEASE_REPOSITORY,
   RELEASE_SOURCE_REPOSITORY_SHAPE,
@@ -10,13 +16,23 @@ import {
 } from '../services/releaseSource';
 import { EVENT_SUBSCRIBER_IDS, isSubscriberId } from '../services/eventSubscriberIds';
 import { parsePlayIntegrityServiceAccount } from '../services/attestation/playIntegrity';
+import { parseTunnelOriginConfig } from './tunnelOrigin';
+import { isPrivateServiceRange, normalizeInternalApiHost } from '../services/requestTransport';
 import {
   canonicalCfAccessTeamDomain,
   decodePartnerApiCursorSigningKey,
   isRecognizedSelfHostSignal,
   parseEventPermissionEpochMode,
+  parseApproverAssuranceDefaultEnforceFrom,
   parseOAuthAuthEpochEnforceAfter,
 } from './env';
+
+/**
+ * W06 (#7604): minimum MCP_LLM_API_KEY length. Mirrors MIN_GATEWAY_KEY_LENGTH
+ * (services/aiModels/connections.ts — not imported: it pulls in the DB layer);
+ * envOpenAiBootstrap.test.ts asserts the two stay equal.
+ */
+export const MCP_LLM_MIN_API_KEY_LENGTH = 8;
 
 // ---------------------------------------------------------------------------
 // Insecure default detection
@@ -349,6 +365,42 @@ function validateLiveAuthorizationRolloutConfig(
   }
 }
 
+/**
+ * #9700: INTERNAL_SERVICE_CIDRS grants the FORCE_HTTPS exemption to socket
+ * peers in range, so it must name a private network. A public or all-addresses
+ * range would hand the exemption to internet clients. Enforced in every
+ * environment: a bad value is a security bug wherever it runs.
+ */
+function validateInternalServiceExemption(
+  cidrsRaw: string | undefined,
+  hostsRaw: string | undefined,
+  ctx: z.RefinementCtx,
+): void {
+  const cidrs = (cidrsRaw ?? '').split(',').map((entry) => entry.trim()).filter(Boolean);
+  for (const entry of cidrs) {
+    if (!isPrivateServiceRange(entry)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['INTERNAL_SERVICE_CIDRS'],
+        message:
+          `INTERNAL_SERVICE_CIDRS entry ${entry} must be a valid IP or CIDR lying wholly inside a private network `
+          + '(e.g. the compose bridge subnet, BREEZE_DOCKER_SUBNET). Public, over-wide and all-address ranges are refused.',
+      });
+    }
+  }
+
+  const hosts = (hostsRaw ?? '').split(',').map((entry) => entry.trim()).filter(Boolean);
+  for (const entry of hosts) {
+    if (!normalizeInternalApiHost(entry)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['INTERNAL_API_HOSTS'],
+        message: `INTERNAL_API_HOSTS entry ${entry} must be a bare host[:port], e.g. api:3001.`,
+      });
+    }
+  }
+}
+
 function validateTrustedProxyCidrsForProduction(value: string | undefined, ctx: z.RefinementCtx): void {
   const entries = (value ?? '')
     .split(',')
@@ -555,6 +607,19 @@ const envObjectSchema = z
     // FORCE_HTTPS is off, so this must not retroactively boot-refuse existing
     // deployments that don't force HTTPS.
     PUBLIC_API_URL: z.string().optional(),
+    // Network Proxy host mode (spec 2026-10-06 §2). Unset = path mode only.
+    // Validated in the superRefine below (shape + registrable-domain separation).
+    TUNNEL_ORIGIN_TEMPLATE: z.string().optional(),
+    TUNNEL_FRAME_ANCESTOR: z.string().optional(),
+    // Read by the tunnel-origin validator to derive the frame ancestor and to
+    // compare registrable domains; used unvalidated elsewhere.
+    PUBLIC_APP_URL: z.string().optional(),
+    DASHBOARD_URL: z.string().optional(),
+    PUBLIC_PORTAL_URL: z.string().optional(),
+    PUBLIC_WEB_URL: z.string().optional(),
+    PUBLIC_URL: z.string().optional(),
+    API_URL: z.string().optional(),
+    WEBAUTHN_ORIGIN: z.string().optional(),
     TRUST_PROXY_HEADERS: z.string().optional(),
     // Whether CF-Connecting-IP is trusted for client-IP resolution
     // (services/clientIp.ts). Boolean-ish; unset/empty means off. Format is
@@ -564,8 +629,70 @@ const envObjectSchema = z
     // trust is on and this is off (SR2-16).
     TRUST_CF_CONNECTING_IP: z.string().optional(),
     TRUSTED_PROXY_CIDRS: z.string().optional(),
+    // #9700: socket-peer range of in-cluster callers (portal/web SSR) whose
+    // plain-HTTP hop to INTERNAL_API_HOSTS is exempt from FORCE_HTTPS. Empty
+    // disables the exemption. Validated in the superRefine below.
+    INTERNAL_SERVICE_CIDRS: z.string().optional(),
+    INTERNAL_API_HOSTS: z.string().optional(),
     AGENT_ENROLLMENT_SECRET: z.string().optional(),
     ENROLLMENT_KEY_PEPPER: z.string().optional(),
+    // Read at issuance through positiveIntEnv (services/installerBootstrapToken.ts),
+    // which falls back on anything that is not a positive integer and clamps
+    // to 30 days. Declared so collectWarnings() may report an over-maximum
+    // value once at boot; deliberately not boot-refused.
+    INSTALLER_BOOTSTRAP_TOKEN_TTL_MINUTES: z
+      .string()
+      .optional()
+      .describe('Lifetime (minutes) of a newly issued installer bootstrap token when none is chosen. Default 10080 (7 days); values above 43200 (30 days) are clamped.'),
+    // Ticket import byte bucket (#8313 W1): read per charge through
+    // positiveIntEnv (services/migrationWindowLimits.ts), which falls back to
+    // the default on anything but a plain positive integer. Declared so
+    // collectWarnings() reports such a value once at boot; not boot-refused,
+    // like the other knobs of its family.
+    TICKET_IMPORT_MAX_BYTES_PER_HOUR: z
+      .string()
+      .optional()
+      .describe('Attachment bytes one migration window may download and store per hour. A plain positive integer; default 2147483648 (2 GiB), never below 10485760 (one file).'),
+    // Ticket import worker knobs (#8313 W4, services/ticketImport/importLimits.ts):
+    // read per use through positiveIntEnv, which falls back to the default on
+    // anything but a plain positive integer and clamps into range. Declared so
+    // collectWarnings() reports an ignored value once at boot; not boot-refused.
+    TICKET_IMPORT_WORKER_CONCURRENCY: z
+      .string()
+      .optional()
+      .describe('Import slices one API process runs at once. Default 3, at most 32.'),
+    TICKET_IMPORT_GLOBAL_CONCURRENCY: z
+      .string()
+      .optional()
+      .describe('Import slices holding the lease across every process. Default 2; always kept below TICKET_IMPORT_WORKER_CONCURRENCY.'),
+    TICKET_IMPORT_LEASE_MS: z
+      .string()
+      .optional()
+      .describe('Lifetime of an import slice lease in ms, renewed every third of it. Default 60000, between 5000 and 600000.'),
+    TICKET_IMPORT_SLICE_MS: z
+      .string()
+      .optional()
+      .describe('Work one import slice does before it hands over, in ms. Default 300000, between 5000 and 3600000.'),
+    TICKET_IMPORT_SOURCE_CONCURRENCY: z
+      .string()
+      .optional()
+      .describe('Requests in flight to one import source at once. Default 2, at most 16.'),
+    TICKET_IMPORT_SOURCE_TIMEOUT_MS: z
+      .string()
+      .optional()
+      .describe('Timeout of one request to an import source, in ms. Default 30000, between 1000 and 300000.'),
+    TICKET_IMPORT_MAX_CLOCK_SKEW_MS: z
+      .string()
+      .optional()
+      .describe('How far in the future a source time may be and still be clamped to now, in ms. Default 300000.'),
+    TICKET_IMPORT_MAX_ISSUES_PER_RUN: z
+      .string()
+      .optional()
+      .describe('Report rows one import run keeps; counters stay exact beyond it. Default 50000.'),
+    TICKET_IMPORT_MAX_TICKET_BYTES: z
+      .string()
+      .optional()
+      .describe('Converted content of one imported ticket in bytes. Default 268435456 (256 MiB), between 1 MiB and 2 GiB.'),
     MFA_RECOVERY_CODE_PEPPER: z.string().optional(),
     BREEZE_BOOTSTRAP_ADMIN_EMAIL: z.string().optional(),
     BREEZE_BOOTSTRAP_ADMIN_PASSWORD: z.string().optional(),
@@ -615,6 +742,39 @@ const envObjectSchema = z
     IS_HOSTED: z.string().optional(),
     AGENT_BACKUP_SERVER_URL: z.string().optional(),
 
+    // Platform date from which partners without an explicit approval-security
+    // enforcement choice require an approver device for high/critical
+    // approvals. Read at runtime by approverAssuranceDefaultEnforceFrom() in
+    // env.ts (blank = built-in date). Validated here so a typo fails boot
+    // rather than silently keeping the built-in date.
+    APPROVER_ASSURANCE_DEFAULT_ENFORCE_FROM: z
+      .string()
+      .optional()
+      .refine(
+        (v) => !v?.trim() || parseApproverAssuranceDefaultEnforceFrom(v) !== null,
+        'APPROVER_ASSURANCE_DEFAULT_ENFORCE_FROM must be an ISO date (YYYY-MM-DD) or timestamp',
+      ),
+
+    // Per-source-IP limit on POST /api/v1/agents/enroll (#7472). Read at
+    // runtime by getEnrollmentRateLimit() (blank = 10 per 60s). Validated here
+    // so a typo fails boot instead of silently keeping the default.
+    AGENT_ENROLL_RATE_LIMIT: z
+      .string()
+      .optional()
+      .refine(
+        (v) => !v?.trim() || /^[1-9]\d{0,8}$/.test(v.trim()),
+        'AGENT_ENROLL_RATE_LIMIT must be a positive integer below 1,000,000,000',
+      ),
+    AGENT_ENROLL_RATE_WINDOW_SECONDS: z
+      .string()
+      .optional()
+      .refine(
+        (v) => !v?.trim() || (/^[1-9]\d{0,8}$/.test(v.trim()) && Number(v.trim()) <= 230),
+        // The window is the /enroll 429 Retry-After; W09 agents cap Retry-After
+        // at 300 s after x1.3 jitter (230 = AGENT_RETRY_AFTER_MAX_SECONDS, #9457).
+        'AGENT_ENROLL_RATE_WINDOW_SECONDS must be a positive integer of at most 230',
+      ),
+
     // Controlled agent-fleet rollout (decouple registration from promotion).
     // When false, binarySync registers new binaries WITHOUT touching
     // agent_versions.isLatest — the fleet upgrade target only changes via
@@ -630,6 +790,35 @@ const envObjectSchema = z
     // AGENT_AUTO_PROMOTE above — a typo must fail boot, not silently read as
     // "off" for an operator who believed they enabled auto-remediation.
     AGENT_EDITION_AUTO_MIGRATE_ENABLED: z.string().optional(),
+
+    // Stateless MCP 2026-07-28 era kill switch (B-W03 #6157). Default false;
+    // read per request by mcpStatelessEnabled() (services/mcpProtocol.ts).
+    // Validated here for boolean format only, same class as
+    // AGENT_AUTO_PROMOTE above.
+    MCP_STATELESS_ENABLED: z.string().optional(),
+
+    // Tier-3 over MCP via action intents (B-W04 #6158). Kill switch is boolean
+    // (services/mcpIntentConfig.ts mcpTier3IntentsEnabled()); the knobs are read per call through
+    // positiveIntEnv in config/env.ts. Validated here for format only.
+    MCP_TIER3_INTENTS_ENABLED: z.string().optional(),
+    MCP_INTENT_MAX_LIVE_PER_PRINCIPAL: z.string().optional(),
+    MCP_INTENT_CREATES_PER_HOUR: z.string().optional(),
+    MCP_INTENT_CREATES_PER_USER_PER_HOUR: z.string().optional(),
+    MCP_APPROVAL_WAIT_MS: z.string().optional(),
+    MCP_APPROVAL_WAITS_PER_PRINCIPAL: z.string().optional(),
+
+    // MCP Apps pilot (B-W05 #6159). Boolean kill switch, read per call by
+    // services/mcpAppsConfig.ts mcpAppsEnabled(). Validated here for format only.
+    MCP_APPS_ENABLED: z.string().optional(),
+
+    // MCP Tasks extension (B-W06 #6160). Boolean flag read per call by
+    // services/mcpIntentConfig.ts mcpTasksEnabled() (effective only with
+    // MCP_STATELESS_ENABLED); the three knobs are read per call there too.
+    // Validated here for format only.
+    MCP_TASKS_ENABLED: z.string().optional(),
+    MCP_TASK_PENDING_POLL_INTERVAL_MS: z.string().optional(),
+    MCP_TASK_POLL_INTERVAL_MS: z.string().optional(),
+    MCP_TASK_TTL_GRACE_MS: z.string().optional(),
 
     // Signup-abuse detection kill switch / opt-in (services/abuseSignals).
     // Defaults to IS_HOSTED; read at runtime by abuseSignalsEnabled() in
@@ -653,10 +842,36 @@ const envObjectSchema = z
     // AGENT_AUTO_PROMOTE above.
     BREEZE_AI_AGENTS_POLICY_DECIDE_ENABLED: z.string().optional(),
 
+    // Recipe Library W06. Gates the identity_offboarding recipe, read at
+    // runtime by aiOperatorIdentityOffboardingEnabled() in env.ts. Validated
+    // here for boolean format only. Default off; nothing enables it.
+    AI_OPERATOR_RECIPE_IDENTITY_OFFBOARDING_ENABLED: z.string().optional(),
+    // R2: gates identity_onboarding, read by aiOperatorIdentityOnboardingEnabled().
+    AI_OPERATOR_RECIPE_IDENTITY_ONBOARDING_ENABLED: z.string().optional(),
+
     // Task A7 (tool-catalog W1). Platform kill switch for tool sources, read
     // at runtime by toolSourcesEnabled() in env.ts. Validated here for
     // boolean format only, same class as AGENT_AUTO_PROMOTE above.
     TOOL_SOURCES_ENABLED: z.string().optional(),
+
+    // Tool Catalog W3 (#5218). Platform kill switch for Flows, read at runtime
+    // by flowsEnabled() in env.ts. Boolean-format validation only.
+    FLOWS_ENABLED: z.string().optional(),
+    // Tool catalog W04 (#5219): approval window of a parked Tier-3 flow step,
+    // in hours (flowApprovalTtlHours() in env.ts). Integer 1..168 when set.
+    FLOW_APPROVAL_TTL_HOURS: z.string().optional(),
+    // Task A8: running flow runs per flow owner (flowMaxRunningPerOwner(),
+    // integer 1..500) and the run-body retention window in days
+    // (flowRunRetentionDays(), integer 7..3650).
+    FLOW_MAX_RUNNING_PER_OWNER: z.string().optional(),
+    FLOW_RUN_RETENTION_DAYS: z.string().optional(),
+    // W05 (#5220): per-flow inbound webhook rate (flowWebhookRatePerMinute(),
+    // 1..6000), non-accepted delivery retention days
+    // (flowWebhookDeliveryRetentionDays(), 1..365) and the for-each parallel
+    // ceiling (flowForEachMaxParallel(), 1..10).
+    FLOW_WEBHOOK_RATE_PER_MINUTE: z.string().optional(),
+    FLOW_WEBHOOK_DELIVERY_RETENTION_DAYS: z.string().optional(),
+    FLOW_FOREACH_MAX_PARALLEL: z.string().optional(),
 
     // Task A7. Sub-flag allowing a tool source to target private/loopback
     // egress — an SSRF vector on the hosted platform, so it's refused there
@@ -668,6 +883,17 @@ const envObjectSchema = z
     // at runtime by aiWorkspaceEnabled() in env.ts. Validated here for boolean
     // format only — the production coupling rule is in the superRefine below.
     BREEZE_AI_WORKSPACE_ENABLED: z.string().optional(),
+    BREEZE_AI_ARTIFACT_CAPTURE_ENABLED: z.string().optional(),
+    // Wisp (Wisp design §10). Hosted-only sub-flag of BREEZE_AI_AGENTS_ENABLED,
+    // read at runtime by wispEnabled() in env.ts. Boolean format + the
+    // production IS_HOSTED coupling are checked in the superRefines below.
+    BREEZE_WISP_ENABLED: z.string().optional(),
+    // Vendor updates (#11065): all dark by default. Read at runtime by
+    // services/oemUpdates/flags.ts; checked in the superRefine below.
+    BREEZE_OEM_UPDATES_ENABLED: z.string().optional(),
+    BREEZE_OEM_UPDATES_PARTNER_ALLOWLIST: z.string().optional(),
+    BREEZE_OEM_UPDATES_DISABLED_LANES: z.string().optional(),
+    BREEZE_OEM_UPDATES_LAB_DEVICE_IDS: z.string().optional(),
     // 'vercel' | 'fake'. Resolved at runtime by resolveSandboxBackendName()
     // (services/workspace/sandboxBackend.ts), which refuses an unset value in
     // production; the superRefine below additionally refuses 'fake' there.
@@ -708,6 +934,12 @@ const envObjectSchema = z
     // guessing which way it resolved.
     BREEZE_AUTHENTICATOR_ATTESTATION_ENFORCED: z.string().optional(),
 
+    // Remote desktop start fence (default true). A recognized false value is
+    // the explicit opt-out for fleets still on agents older than v0.114.0;
+    // validated in the superRefine below so a typo refuses boot instead of
+    // leaving an operator unsure which way it resolved.
+    REMOTE_DESKTOP_FENCE_REQUIRED: z.string().optional(),
+
     // #1374 W04 — Google Cloud service account (JSON, or base64 of that JSON)
     // with the Play Integrity API enabled, used to decode Android
     // `decodeIntegrityToken` verdicts. OPTIONAL by design: Play Integrity only
@@ -738,7 +970,7 @@ const envObjectSchema = z
     // with 3.5d once the split is actually exercised in prod topology).
     BREEZE_ROLE: z.string().optional(),
 
-    // M365 Tier-3 write-action AI tools (m365_disable_user, m365_reset_password)
+    // M365 Tier-3 write-action AI tools (the ten M365_HEADLESS_ACTIONS tools, e.g. m365_disable_user)
     // and the action-intents release worker's headless dispatch. Dark by
     // default. Read at runtime by writeActionRuntimeConfig.ts; declared here so
     // the format is guarded (a typo reads as OFF at the runtime flag parser,
@@ -776,6 +1008,10 @@ const envObjectSchema = z
     OAUTH_DCR_ENABLED: z.string().optional(),
     OAUTH_DCR_REQUIRE_IAT: z.string().optional(),
     OAUTH_DCR_ALLOW_ANONYMOUS: z.string().optional(),
+    // CIMD (B-W03 #6157): boolean flag + optional host allowlist, both checked
+    // in the superRefine below.
+    OAUTH_CIMD_ENABLED: z.string().optional(),
+    OAUTH_CIMD_ALLOWED_HOSTS: z.string().optional(),
 
     // Wave 3 live-authorization rollout controls. Shape is validated in EVERY
     // environment (a garbage value is a bug anywhere); presence is required in
@@ -792,6 +1028,10 @@ const envObjectSchema = z
     // matching superRefine block below for the exact pairing. None of these
     // are required at boot in development/test.
     //
+    // MCP unattended Tier 3 opt-in (routes/mcpServer.ts). Comma-separated
+    // `api_key:<id>` / `oauth_client_user:<client_id>/<user id>` entries;
+    // collectWarnings() logs the configured principals and malformed entries.
+    MCP_UNATTENDED_TIER3_PRINCIPALS: z.string().optional(),
     // OAuth (MCP) — required when MCP_OAUTH_ENABLED=true:
     MCP_OAUTH_ENABLED: z.string().optional(),
     OAUTH_JWKS_PRIVATE_JWK: z.string().optional(),
@@ -823,6 +1063,24 @@ const envObjectSchema = z
     // signatures, and a region without the Intuit webhook configured relies
     // on the 15-minute reconcile sweep instead.
     QBO_WEBHOOK_VERIFIER_TOKEN: z.string().optional(),
+
+    // Xero accounting integration (W02). All optional at boot: the connect flow
+    // validates the OAuth trio lazily (provider.configError()), the webhook key
+    // is only read by POST /webhooks/xero (W05), and the daily limit defaults to
+    // the Starter tier's 1000.
+    XERO_CLIENT_ID: z.string().optional(),
+    XERO_CLIENT_SECRET: z.string().optional(),
+    XERO_REDIRECT_URI: z.string().optional(),
+    XERO_WEBHOOK_KEY: z.string().optional(),
+    XERO_DAILY_CALL_LIMIT: z.string().optional(),
+
+    // Customer portal "Sign in with Microsoft" (portal registration W4). The
+    // portal's own Entra app; off unless BOTH the id and the secret are set.
+    // Parsed at call time by config/portalEntra.ts; validated at boot below so
+    // a malformed callback base fails here, not on a portal request.
+    PORTAL_ENTRA_CLIENT_ID: z.string().optional(),
+    PORTAL_ENTRA_CLIENT_SECRET: z.string().optional(),
+    PORTAL_ENTRA_CALLBACK_BASE_URL: z.string().optional(),
 
     // S3 / object storage — required when S3_BUCKET is set.
     S3_BUCKET: z.string().optional(),
@@ -912,7 +1170,10 @@ const envObjectSchema = z
     REDIS_PORT: z.string().optional(),
     REDIS_PASSWORD_FILE: z.string().optional(),
     NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
-    PARTNER_HOOKS_URL: z.string().url().optional(),
+    PARTNER_HOOKS_URL: z.preprocess(
+      (v) => (typeof v === 'string' && v.trim() === '' ? undefined : v),
+      z.string().url().optional(),
+    ),
     PARTNER_HOOKS_SECRET: z.string().min(16).optional(),
     // Empty string means "unset" — same reason as APNS_ENVIRONMENT above: both
     // compose files map this as `${IP_ALLOWLIST_ENFORCEMENT_MODE:-}`, so the key
@@ -946,8 +1207,19 @@ const envObjectSchema = z
     // staying on the safe default — see docs/operations/agent-network-and-manifest-rollout.md.
     AGENT_REQUIRE_MANIFEST_SIGNING_KEY_ID: z.enum(['true', 'false']).default('false'),
 
+    // #8616 heartbeat retain-state kill switch (routes/agents/
+    // heartbeatSettingsDecision.ts). Default on: a beat that advertises
+    // securityCapabilities.retainStateProtocolVersion 1 gets `retainState`
+    // for features with no decision this beat. 'false' answers every agent
+    // with the legacy payload, as an older API would. Strict enum so a typo
+    // boot-refuses instead of silently staying on.
+    HEARTBEAT_RETAIN_STATE_ENABLED: z.enum(['true', 'false']).default('true'),
+    AGENT_ECH_ENABLED: z.enum(['true', 'false']).default('true'),
+    NETWORK_ISOLATION_ENABLED: z.enum(['true', 'false']).default('false'),
+    NETWORK_ISOLATION_ENABLED_PARTNER_IDS: z.string().refine(value => !value.trim() || value.split(',').every(id => z.string().uuid().safeParse(id.trim()).success), 'Expected comma-separated partner UUIDs').optional(),
+
     // Phase 2 of per-partner LLM BYOK (#3922), Task 3.1 — gates catalog-mode
-    // routing (partner_llm_configs.catalog_entry_id). Off by default so a
+    // routing (partner_ai_connections.catalog_entry_id). Off by default so a
     // rolling deploy or rollback never exposes catalog selection ahead of
     // the resolver/route wiring that consumes it (Tasks 3.2+). When false,
     // selection-write routes 404 and existing catalog configs resolve as
@@ -957,9 +1229,11 @@ const envObjectSchema = z
     LLM_PROVIDER_CATALOG_ENABLED: z.enum(['true', 'false']).default('false'),
 
     // Caller verification (anti-vishing, #6354 W01). Exact-string contract:
-    // only 'true' enables; '' === unset. No generic boolean superRefine —
+    // unset or 'true' enables (W05 default); '' and 'false' disable. No generic boolean superRefine —
     // '1'/'yes'/'on' are refused at boot rather than silently accepted.
     CALLER_VERIFICATION_ENABLED: z.enum(['true', 'false', '']).optional(),
+    // Workstation tier (#6354 W05): dark by default; same exact-string contract.
+    CALLER_VERIFICATION_WORKSTATION_ENABLED: z.enum(['true', 'false', '']).optional(),
 
     // Security remediation Wave 6, Task 9 (approved plan deviation D1) — the
     // managed-software destination gate (services/managedSoftwareDispatchPolicy.ts).
@@ -999,8 +1273,15 @@ const envObjectSchema = z
 
     // -- Alternative LLM backend (openai-compatible, e.g. vLLM) ---------------
     // Off by default. Chat-only PoC; tool-calling is not supported on this path.
-    MCP_LLM_PROVIDER: z.enum(['anthropic', 'openai-compatible']).default('anthropic'),
-    MCP_LLM_BASE_URL: z.string().url().optional(),
+    // '' = unset (compose maps these as `${VAR:-}`, #7640).
+    MCP_LLM_PROVIDER: z.preprocess(
+      (v) => (typeof v === 'string' && v.trim() === '' ? undefined : v),
+      z.enum(['anthropic', 'openai-compatible']).default('anthropic'),
+    ),
+    MCP_LLM_BASE_URL: z.preprocess(
+      (v) => (typeof v === 'string' && v.trim() === '' ? undefined : v),
+      z.string().url().optional(),
+    ),
     MCP_LLM_API_KEY: z.string().optional(),
     MCP_LLM_MODEL: z.string().optional(),
     MCP_LLM_PRICE_INPUT_PER_M_USD: z.string().optional().transform((v) => (v ? parseFloat(v) : 0)).pipe(z.number().min(0)),
@@ -1052,6 +1333,7 @@ const envSchema = envObjectSchema
           message: 'BINARY_WINDOWS_PROMOTE_ENABLED must be true/false and requires a Windows release source when enabled.' });
       }
     }
+    validateInternalServiceExemption(data.INTERNAL_SERVICE_CIDRS, data.INTERNAL_API_HOSTS, ctx);
 
     if (
       isProduction
@@ -1273,9 +1555,35 @@ const envSchema = envObjectSchema
       }
     }
 
-    // MCP_LLM_PROVIDER openai-compatible: vLLM endpoint + auth + model id required at boot
-    // (enforced in all environments, not just production)
+    // Network Proxy tunnel origin (spec 2026-10-06 §2): refuse boot on a
+    // malformed template or one sharing a registrable domain with any app origin,
+    // in every NODE_ENV — a same-site tunnel origin is a tenant-isolation bug.
+    const tunnelOrigin = parseTunnelOriginConfig(data);
+    if (!tunnelOrigin.ok) {
+      for (const issue of tunnelOrigin.issues) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: [issue.path], message: `${issue.path} ${issue.message}` });
+      }
+    }
+
+    // MCP_LLM_PROVIDER openai-compatible: endpoint + model id required at boot
+    // (enforced in all environments, not just production). W06 (#7604, D6):
+    // boot turns these into one env-managed OpenAI-compatible connection PER
+    // PARTNER (services/aiModels/envOpenAiBootstrap.ts), so the path is
+    // self-host only — refused unless self-host is affirmatively declared
+    // (same fail-closed rule as ANTHROPIC_BASE_URL above). The key is optional
+    // (keyless local model servers); when set it must meet the gateway
+    // scrubber's minimum (MIN_GATEWAY_KEY_LENGTH). Messages never echo it.
     if (data.MCP_LLM_PROVIDER === 'openai-compatible') {
+      if (!isRecognizedSelfHostSignal(data.IS_HOSTED)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['MCP_LLM_PROVIDER'],
+          message:
+            'MCP_LLM_PROVIDER=openai-compatible is for self-hosted Breeze (set IS_HOSTED explicitly to false). '
+            + 'On hosted — or with IS_HOSTED unset/invalid — it is refused: it would create a connection for every '
+            + 'partner. Add an OpenAI-compatible connection under Partner Settings → AI Providers & Models instead.',
+        });
+      }
       if (!data.MCP_LLM_BASE_URL) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
@@ -1290,11 +1598,12 @@ const envSchema = envObjectSchema
           message: 'MCP_LLM_MODEL is required when MCP_LLM_PROVIDER is openai-compatible.',
         });
       }
-      if (!data.MCP_LLM_API_KEY?.trim()) {
+      const mcpLlmKey = data.MCP_LLM_API_KEY?.trim();
+      if (mcpLlmKey && mcpLlmKey.length < MCP_LLM_MIN_API_KEY_LENGTH) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           path: ['MCP_LLM_API_KEY'],
-          message: 'MCP_LLM_API_KEY is required when MCP_LLM_PROVIDER is openai-compatible.',
+          message: `MCP_LLM_API_KEY must be at least ${MCP_LLM_MIN_API_KEY_LENGTH} characters when set (leave it empty for a keyless endpoint).`,
         });
       }
     }
@@ -1483,6 +1792,31 @@ const envSchema = envObjectSchema
                 `${key} must be set when BREEZE_AI_WORKSPACE_ENABLED=true — the Vercel SDK's ambient-credential fallback is deliberately not used, so a missing value fails every analysis run instead of booting cleanly.`,
             });
           }
+        }
+      }
+      // Wisp is hosted-only (Wisp design §10): wispEnabled() already reads
+      // false off-hosted, so a self-hosted deploy setting the flag is a
+      // misconfiguration that would silently do nothing — refuse it at boot.
+      const wispFlag = (data.BREEZE_WISP_ENABLED ?? '').trim().toLowerCase();
+      if (wispFlag === 'true' || wispFlag === '1' || wispFlag === 'yes' || wispFlag === 'on') {
+        if ((data.IS_HOSTED ?? '').trim().toLowerCase() !== 'true') {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ['IS_HOSTED'],
+            message: 'BREEZE_WISP_ENABLED=true requires IS_HOSTED=true — Wisp is hosted-only (Wisp design §10).',
+          });
+        }
+        // A Wisp grant borrows a human's authority on a fresh step-up proof
+        // (Wisp design §4.2). With ENABLE_2FA off no step-up can be minted and
+        // the grant path degrades to "session only", so refuse it in production.
+        // Same falsy rule as envFlag('ENABLE_2FA', true).
+        const enable2fa = (data.ENABLE_2FA ?? '').trim().toLowerCase();
+        if (enable2fa !== '' && !['1', 'true', 'yes', 'on'].includes(enable2fa)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ['ENABLE_2FA'],
+            message: 'BREEZE_WISP_ENABLED=true requires ENABLE_2FA to stay on — Wisp grants are created and refreshed on a step-up proof (Wisp design §4.2).',
+          });
         }
       }
 
@@ -1968,6 +2302,90 @@ const envSchema = envObjectSchema
       });
     }
 
+    // OAUTH_CIMD_ENABLED / OAUTH_CIMD_ALLOWED_HOSTS (B-W03 #6157). A typo in
+    // the allowlist would otherwise fail closed at runtime with no boot error.
+    const cimdEnabledRaw = (data.OAUTH_CIMD_ENABLED ?? '').trim().toLowerCase();
+    if (cimdEnabledRaw && !boolValues.has(cimdEnabledRaw)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['OAUTH_CIMD_ENABLED'],
+        message: 'OAUTH_CIMD_ENABLED must be a boolean (true/false, 1/0, yes/no, on/off) when set. Defaults to false.',
+      });
+    }
+    const cimdHosts = parseCimdAllowedHosts(data.OAUTH_CIMD_ALLOWED_HOSTS);
+    if (!cimdHosts.ok) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['OAUTH_CIMD_ALLOWED_HOSTS'],
+        message: `OAUTH_CIMD_ALLOWED_HOSTS must be a comma-separated list of hostnames or .suffix entries (no scheme, path, port or wildcard): ${cimdHosts.reason}.`,
+      });
+    }
+
+    // MCP_STATELESS_ENABLED (B-W03 #6157). Same treatment as AGENT_AUTO_PROMOTE.
+    const mcpStatelessRaw = (data.MCP_STATELESS_ENABLED ?? '').trim().toLowerCase();
+    if (mcpStatelessRaw && !boolValues.has(mcpStatelessRaw)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['MCP_STATELESS_ENABLED'],
+        message:
+          'MCP_STATELESS_ENABLED must be a boolean (true/false, 1/0, yes/no, on/off) when set. ' +
+          'Defaults to false (the MCP server answers only the initialize-based protocol versions).',
+      });
+    }
+
+    // MCP_TIER3_INTENTS_ENABLED (B-W04 #6158): boolean typo guard.
+    const mcpIntentsRaw = (data.MCP_TIER3_INTENTS_ENABLED ?? '').trim().toLowerCase();
+    if (mcpIntentsRaw && !boolValues.has(mcpIntentsRaw)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['MCP_TIER3_INTENTS_ENABLED'],
+        message:
+          'MCP_TIER3_INTENTS_ENABLED must be a boolean (true/false, 1/0, yes/no, on/off) when set. ' +
+          'Defaults to false (Tier-3 over MCP keeps the MCP_APPROVAL_REQUIRED refusal).',
+      });
+    }
+    // MCP_APPS_ENABLED (B-W05 #6159): boolean typo guard.
+    const mcpAppsRaw = (data.MCP_APPS_ENABLED ?? '').trim().toLowerCase();
+    if (mcpAppsRaw && !boolValues.has(mcpAppsRaw)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['MCP_APPS_ENABLED'],
+        message:
+          'MCP_APPS_ENABLED must be a boolean (true/false, 1/0, yes/no, on/off) when set. ' +
+          'Defaults to false (no MCP Apps view is advertised or served).',
+      });
+    }
+    // MCP_TASKS_ENABLED (B-W06 #6160): boolean typo guard.
+    const mcpTasksRaw = (data.MCP_TASKS_ENABLED ?? '').trim().toLowerCase();
+    if (mcpTasksRaw && !boolValues.has(mcpTasksRaw)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['MCP_TASKS_ENABLED'],
+        message:
+          'MCP_TASKS_ENABLED must be a boolean (true/false, 1/0, yes/no, on/off) when set. ' +
+          'Defaults to false (Tier-3 calls keep the pending_approval result; no Tasks extension is advertised).',
+      });
+    }
+    for (const knob of [
+      'MCP_INTENT_MAX_LIVE_PER_PRINCIPAL',
+      'MCP_INTENT_CREATES_PER_HOUR',
+      'MCP_INTENT_CREATES_PER_USER_PER_HOUR',
+      'MCP_APPROVAL_WAIT_MS',
+      'MCP_APPROVAL_WAITS_PER_PRINCIPAL',
+      'MCP_TASK_PENDING_POLL_INTERVAL_MS',
+      'MCP_TASK_POLL_INTERVAL_MS',
+      'MCP_TASK_TTL_GRACE_MS',
+    ] as const) {
+      const raw = (data[knob] ?? '').trim();
+      if (raw && (!/^\d+$/.test(raw) || Number(raw) < 1)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [knob],
+          message: `${knob} must be a positive integer when set.`,
+        });
+      }
+    }
+
     // ABUSE_SIGNALS_ENABLED (signup-abuse detection). Same treatment and same
     // reasoning as AGENT_AUTO_PROMOTE above: independent of NODE_ENV, because
     // the value silently governs whether the subsystem runs at all. A typo
@@ -2006,6 +2424,21 @@ const envSchema = envObjectSchema
           'BREEZE_AUTHENTICATOR_ATTESTATION_ENFORCED must be a boolean (true/false, 1/0, yes/no, on/off) when set. ' +
           'Defaults to true (an L4/critical-tier approval requires a trusted platform_bound_basis). ' +
           'Set false ONLY as a break-glass revert — it re-opens the critical-tier bypass for every legacy mobile approver key.',
+      });
+    }
+
+    // REMOTE_DESKTOP_FENCE_REQUIRED (remote desktop start fence). Same
+    // treatment as BREEZE_AUTHENTICATOR_ATTESTATION_ENFORCED: the runtime
+    // reader keeps the fence required for an unrecognized value.
+    const fenceRequiredRaw = (data.REMOTE_DESKTOP_FENCE_REQUIRED ?? '').trim().toLowerCase();
+    if (fenceRequiredRaw && !boolValues.has(fenceRequiredRaw)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['REMOTE_DESKTOP_FENCE_REQUIRED'],
+        message:
+          'REMOTE_DESKTOP_FENCE_REQUIRED must be a boolean (true/false, 1/0, yes/no, on/off) when set. ' +
+          'Defaults to true (remote desktop requires an agent with the start fence, v0.114.0 or later). ' +
+          'Set false only while agents older than v0.114.0 are still updating.',
       });
     }
 
@@ -2079,6 +2512,18 @@ const envSchema = envObjectSchema
       });
     }
 
+    // FLOWS_ENABLED (Tool Catalog W3, #5218). Same treatment as
+    // TOOL_SOURCES_ENABLED: a typo must fail boot rather than read as off.
+    const flowsRaw = (data.FLOWS_ENABLED ?? '').trim().toLowerCase();
+    if (flowsRaw && !boolValues.has(flowsRaw)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['FLOWS_ENABLED'],
+        message:
+          'FLOWS_ENABLED must be a boolean (true/false, 1/0, yes/no, on/off) when set. Defaults to true (set false to keep Flows off).',
+      });
+    }
+
     // TOOL_SOURCES_ALLOW_PRIVATE_EGRESS (Task A7). Same boolean-format check,
     // plus a hosted refusal: a tool source that can reach a private/
     // loopback/link-local address from the shared hosted egress path is an
@@ -2120,6 +2565,54 @@ const envSchema = envObjectSchema
         message: 'BREEZE_AI_WORKSPACE_ENABLED must be a boolean (true/false, 1/0, yes/no, on/off) when set. Defaults to false (the workspace lane and artifact capture are dark).',
       });
     }
+    // Vendor updates (#11065). The lab override opens closed firmware gates, so it
+    // stays out of production. An unknown lane in the kill switch would stop nothing
+    // and look like it had, so a typo refuses the boot.
+    const oemFlag = (data.BREEZE_OEM_UPDATES_ENABLED ?? '').trim().toLowerCase();
+    if (oemFlag && !boolValues.has(oemFlag)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['BREEZE_OEM_UPDATES_ENABLED'],
+        message: 'BREEZE_OEM_UPDATES_ENABLED must be a boolean (true/false, 1/0, yes/no, on/off) when set. Defaults to false.',
+      });
+    }
+    if (isProduction && (data.BREEZE_OEM_UPDATES_LAB_DEVICE_IDS ?? '').trim()) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['BREEZE_OEM_UPDATES_LAB_DEVICE_IDS'],
+        message: 'BREEZE_OEM_UPDATES_LAB_DEVICE_IDS must not be set in production: it opens closed vendor update gates and is for lab devices only.',
+      });
+    }
+    // An empty allowlist means every partner, so a value that parses to nothing
+    // would open the feature to everyone while looking like a restriction.
+    const oemAllowlistRaw = (data.BREEZE_OEM_UPDATES_PARTNER_ALLOWLIST ?? '').trim();
+    if (oemAllowlistRaw && !oemAllowlistRaw.split(',').some((id) => id.trim())) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['BREEZE_OEM_UPDATES_PARTNER_ALLOWLIST'],
+        message: 'BREEZE_OEM_UPDATES_PARTNER_ALLOWLIST names no partner. Leave it unset to allow every partner.',
+      });
+    }
+    const unknownOemLanes = (data.BREEZE_OEM_UPDATES_DISABLED_LANES ?? '')
+      .split(',')
+      .map((lane) => lane.trim().toLowerCase())
+      .filter((lane) => lane && !(OEM_LANES as readonly string[]).includes(lane));
+    if (unknownOemLanes.length > 0) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['BREEZE_OEM_UPDATES_DISABLED_LANES'],
+        message: `BREEZE_OEM_UPDATES_DISABLED_LANES names unknown lanes: ${unknownOemLanes.join(', ')}. Known lanes: ${OEM_LANES.join(', ')}.`,
+      });
+    }
+
+    const wispRaw = (data.BREEZE_WISP_ENABLED ?? '').trim().toLowerCase();
+    if (wispRaw && !boolValues.has(wispRaw)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['BREEZE_WISP_ENABLED'],
+        message: 'BREEZE_WISP_ENABLED must be a boolean (true/false, 1/0, yes/no, on/off) when set. Defaults to false (Wisp is dark).',
+      });
+    }
     const blobBackendRaw = (data.ARTIFACT_BLOB_BACKEND ?? '').trim().toLowerCase();
     if (blobBackendRaw && blobBackendRaw !== 's3') {
       ctx.addIssue({
@@ -2145,6 +2638,32 @@ const envSchema = envObjectSchema
           code: z.ZodIssueCode.custom,
           path: [`ARTIFACT_S3_BUCKET_${region}`],
           message: `BREEZE_AI_WORKSPACE_ENABLED=true on a hosted deployment requires an artifact blob store for region ${region.toLowerCase()}: set ARTIFACT_S3_BUCKET_${region} (or S3_BUCKET) plus ARTIFACT_S3_ACCESS_KEY/ARTIFACT_S3_SECRET_KEY (or S3_ACCESS_KEY/S3_SECRET_KEY).`,
+        });
+      }
+    }
+
+    // BREEZE_AI_ARTIFACT_CAPTURE_ENABLED (#6732): large-tool-result capture
+    // independent of the workspace lane. Typo must fail at boot (reads as off
+    // otherwise), and `true` needs a reachable blob store on ANY deployment —
+    // otherwise every oversized tool result becomes artifact_store_unavailable.
+    const captureRaw = (data.BREEZE_AI_ARTIFACT_CAPTURE_ENABLED ?? '').trim().toLowerCase();
+    if (captureRaw && !boolValues.has(captureRaw)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['BREEZE_AI_ARTIFACT_CAPTURE_ENABLED'],
+        message: 'BREEZE_AI_ARTIFACT_CAPTURE_ENABLED must be a boolean (true/false, 1/0, yes/no, on/off) when set. Defaults to false (large tool results are truncated, not stored).',
+      });
+    }
+    if (['true', '1', 'yes', 'on'].includes(captureRaw) && !(workspaceOn && hostedOn)) {
+      const capRegion = regionRaw === 'eu' ? 'EU' : 'US';
+      const capBucket = (data[`ARTIFACT_S3_BUCKET_${capRegion}` as 'ARTIFACT_S3_BUCKET_EU' | 'ARTIFACT_S3_BUCKET_US'] ?? '').trim() || (data.S3_BUCKET ?? '').trim();
+      const capAccess = (data.ARTIFACT_S3_ACCESS_KEY ?? '').trim() || (data.S3_ACCESS_KEY ?? '').trim();
+      const capSecret = (data.ARTIFACT_S3_SECRET_KEY ?? '').trim() || (data.S3_SECRET_KEY ?? '').trim();
+      if (!capBucket || !capAccess || !capSecret) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['BREEZE_AI_ARTIFACT_CAPTURE_ENABLED'],
+          message: `BREEZE_AI_ARTIFACT_CAPTURE_ENABLED=true requires an artifact blob store: set ARTIFACT_S3_BUCKET_${capRegion} (or S3_BUCKET) plus ARTIFACT_S3_ACCESS_KEY/ARTIFACT_S3_SECRET_KEY (or S3_ACCESS_KEY/S3_SECRET_KEY).`,
         });
       }
     }
@@ -2217,6 +2736,30 @@ const envSchema = envObjectSchema
           'M365_TENANT_SYNC_ENABLED must be a boolean (true/false, 1/0, yes/no, on/off) when set. Defaults to false (the M365 tenant sync ticker and worker are dark).',
       });
     }
+    const flowTtlRaw = (data.FLOW_APPROVAL_TTL_HOURS ?? '').trim();
+    if (flowTtlRaw && (!/^\d+$/.test(flowTtlRaw) || Number(flowTtlRaw) < 1 || Number(flowTtlRaw) > 168)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['FLOW_APPROVAL_TTL_HOURS'],
+        message: 'FLOW_APPROVAL_TTL_HOURS must be an integer between 1 and 168 (hours a parked flow step waits for approval; default 24).',
+      });
+    }
+    for (const [knob, min, max, what] of [
+      ['FLOW_MAX_RUNNING_PER_OWNER', 1, 500, 'running flow runs per flow owner; default 20'],
+      ['FLOW_RUN_RETENTION_DAYS', 7, 3650, 'days before a finished flow run\'s bodies are pruned; default 90'],
+      ['FLOW_WEBHOOK_RATE_PER_MINUTE', 1, 6000, 'inbound webhook deliveries accepted per flow per minute; default 120'],
+      ['FLOW_WEBHOOK_DELIVERY_RETENTION_DAYS', 1, 365, 'days a non-accepted flow webhook delivery row is kept; default 30'],
+      ['FLOW_FOREACH_MAX_PARALLEL', 1, 10, 'most for-each items one flow step runs at once; default 5'],
+    ] as const) {
+      const raw = (data[knob] ?? '').trim();
+      if (raw && (!/^\d+$/.test(raw) || Number(raw) < min || Number(raw) > max)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [knob],
+          message: `${knob} must be an integer between ${min} and ${max} (${what}).`,
+        });
+      }
+    }
     for (const knob of ['M365_SYNC_CONCURRENCY', 'M365_SYNC_MAX_BACKLOG', 'M365_SYNC_TICK_BATCH'] as const) {
       const raw = (data[knob] ?? '').trim();
       if (raw && !/^\d+$/.test(raw)) {
@@ -2226,6 +2769,15 @@ const envSchema = envObjectSchema
           message: `${knob} must be a positive integer when set.`,
         });
       }
+    }
+
+    const xeroDailyRaw = (data.XERO_DAILY_CALL_LIMIT ?? '').trim();
+    if (xeroDailyRaw && (!/^\d+$/.test(xeroDailyRaw) || Number(xeroDailyRaw) < 1)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['XERO_DAILY_CALL_LIMIT'],
+        message: 'XERO_DAILY_CALL_LIMIT must be a positive integer when set (your Xero tier\'s per-organisation daily call limit; Starter is 1000).',
+      });
     }
 
     // BREEZE_ROLE ↔ APP_ENCRYPTION_KEY_ID pairing (wave 3.5b, #4084). Once a
@@ -2442,6 +2994,38 @@ function collectWarnings(env: Record<string, string | undefined>): ConfigWarning
   const nodeEnv = env.NODE_ENV ?? 'development';
   const isProduction = nodeEnv === 'production';
 
+  // MCP_UNATTENDED_TIER3_PRINCIPALS lifts interactive approval for the named
+  // principals, so a deploy that sets it must say so at boot, and an entry
+  // that can never match (a typo) must not look like a working allowlist.
+  const { principals: unattendedPrincipals, malformed } = parseUnattendedPrincipals(env.MCP_UNATTENDED_TIER3_PRINCIPALS);
+  {
+    const wellFormed = [...unattendedPrincipals];
+    if (wellFormed.length > 0) {
+      warnings.push({
+        key: 'MCP_UNATTENDED_TIER3_PRINCIPALS',
+        message: `MCP interactive approval is LIFTED for Tier 3 tools for ${wellFormed.length} principal(s): ${wellFormed.join(', ')}. Tier 4, tenant and bootstrap tools stay approval-only.`,
+      });
+    }
+    if (malformed.length > 0) {
+      warnings.push({
+        key: 'MCP_UNATTENDED_TIER3_PRINCIPALS',
+        message: `ignoring ${malformed.length} malformed entr${malformed.length === 1 ? 'y' : 'ies'} that can never match: ${malformed.join(', ')}. Each entry must be api_key:<api key id>, oauth_client_user:<client_id>/<user id> or partner_sp:<partner service principal id>.`,
+      });
+    }
+  }
+
+  // B-W06 (#6160, D-B55): Tasks exist only in the stateless era, so the flag
+  // without MCP_STATELESS_ENABLED is a silent no-op — say so at boot.
+  {
+    const truthy = (v: string | undefined) => ['1', 'true', 'yes', 'on'].includes((v ?? '').trim().toLowerCase());
+    if (truthy(env.MCP_TASKS_ENABLED) && !truthy(env.MCP_STATELESS_ENABLED)) {
+      warnings.push({
+        key: 'MCP_TASKS_ENABLED',
+        message: 'is on but MCP_STATELESS_ENABLED is off, so the MCP Tasks extension stays inactive (no task handles, nothing advertised). Turn MCP_STATELESS_ENABLED on with it.',
+      });
+    }
+  }
+
   // Production: FORCE_HTTPS should be true
   if (isProduction) {
     const forceHttps = (env.FORCE_HTTPS ?? '').trim().toLowerCase();
@@ -2456,7 +3040,7 @@ function collectWarnings(env: Record<string, string | undefined>): ConfigWarning
     // schema superRefine. No warning needed here; the validator throws if
     // it's missing or weak.)
 
-    // Integration compatibility settings ↔ APP_ENCRYPTION_KEY_ID (SEC-065).
+    // Integration compatibility settings ↔ APP_ENCRYPTION_KEY_ID.
     //
     // /integrations/{communication,monitoring,ticketing,psa} seal every
     // credential-shaped provider field with AAD-bound enc:v3 ciphertext and
@@ -2572,6 +3156,58 @@ function collectWarnings(env: Record<string, string | undefined>): ConfigWarning
     });
   }
 
+  // INSTALLER_BOOTSTRAP_TOKEN_TTL_MINUTES is clamped to the 30-day installer
+  // maximum when read (services/installerBootstrapToken.ts, via
+  // positiveIntEnv). Say so once at boot, so an operator who set a longer
+  // value learns it is not in effect. Same integer parse as positiveIntEnv:
+  // values it ignores (empty, non-integer) fall back to the default silently.
+  const bootstrapTtlRaw = (env.INSTALLER_BOOTSTRAP_TOKEN_TTL_MINUTES ?? '').trim();
+  if (/^\d+$/.test(bootstrapTtlRaw)) {
+    const bootstrapTtl = Number.parseInt(bootstrapTtlRaw, 10);
+    if (bootstrapTtl > MAX_BOOTSTRAP_TOKEN_TTL_MINUTES) {
+      warnings.push({
+        key: 'INSTALLER_BOOTSTRAP_TOKEN_TTL_MINUTES',
+        message:
+          `${bootstrapTtl} exceeds the maximum of ${MAX_BOOTSTRAP_TOKEN_TTL_MINUTES} minutes (30 days); ` +
+          `installer bootstrap tokens are issued with a ${MAX_BOOTSTRAP_TOKEN_TTL_MINUTES}-minute lifetime.`,
+      });
+    }
+  }
+
+  // TICKET_IMPORT_MAX_BYTES_PER_HOUR (services/migrationWindowLimits.ts) is a
+  // plain positive integer number of bytes. positiveIntEnv falls back to the
+  // 2 GiB default on anything else (`2e9`, `2GiB`, `2_147_483_648`, `12abc`,
+  // `0`); say so once at boot, so the operator learns their value is ignored.
+  const importBytesRaw = (env.TICKET_IMPORT_MAX_BYTES_PER_HOUR ?? '').trim();
+  if (importBytesRaw !== '' && !(/^\d+$/.test(importBytesRaw) && Number.parseInt(importBytesRaw, 10) > 0)) {
+    warnings.push({
+      key: 'TICKET_IMPORT_MAX_BYTES_PER_HOUR',
+      message:
+        `"${importBytesRaw}" is not a plain positive integer number of bytes; ` +
+        'the default of 2147483648 (2 GiB) per window per hour applies.',
+    });
+  }
+
+  // The ticket import worker's knobs (services/ticketImport/importLimits.ts)
+  // are plain positive integers; anything else falls back to its default.
+  // The global lease cap is kept below the worker concurrency, so a slot is
+  // always free to defer a refused slice: say so when the values given say
+  // otherwise.
+  for (const key of TICKET_IMPORT_LIMIT_ENV_VARS) {
+    const raw = (env[key] ?? '').trim();
+    if (raw !== '' && !(/^\d+$/.test(raw) && Number.parseInt(raw, 10) > 0)) {
+      warnings.push({ key, message: `"${raw}" is not a plain positive integer; the default applies.` });
+    }
+  }
+  const importWorkers = Number.parseInt((env.TICKET_IMPORT_WORKER_CONCURRENCY ?? '').trim() || '3', 10);
+  const importGlobal = Number.parseInt((env.TICKET_IMPORT_GLOBAL_CONCURRENCY ?? '').trim() || '2', 10);
+  if (Number.isFinite(importWorkers) && Number.isFinite(importGlobal) && importWorkers > 1 && importGlobal >= importWorkers) {
+    warnings.push({
+      key: 'TICKET_IMPORT_GLOBAL_CONCURRENCY',
+      message: `${importGlobal} is not below TICKET_IMPORT_WORKER_CONCURRENCY (${importWorkers}); ${importWorkers - 1} applies.`,
+    });
+  }
+
   // Warn about optional secrets that look insecure
   const optionalSecrets = [
     'AGENT_ENROLLMENT_SECRET',
@@ -2666,11 +3302,21 @@ export function validateConfig(): AppConfig {
   // executor's, wrapped under a KEK the API's identity cannot get (§3.2).
   validateM365CommunicationsRuntimeConfigAtBoot(env);
 
+  // Portal Entra app (W4): read at call time on the portal sign-in paths, so
+  // a malformed PORTAL_ENTRA_CALLBACK_BASE_URL / client id would otherwise
+  // first throw on a customer's request. Throws only when the app is
+  // configured (both id and secret set).
+  getPortalEntraConfig(env);
+
   // (The APP_ENCRYPTION_KEY_ID ↔ M365_GRAPH_ACTIONS_TOOLS_ENABLED pairing rule
   // used to live here as a post-parse throw reading `env` directly. It now runs
   // in the schema superRefine on declared keys — see #3374.)
 
   _config = result.data;
+
+  // #2987: advisory only — warn when TRUSTED_PROXY_CIDRS overlaps none of the
+  // subnets this process is attached to (stale pinned proxy address). Never throws.
+  warnOnTrustedProxyCidrMismatch(env);
 
   // #1412: surface an off-default AI route at boot so there is an audit trail
   // (and a self-hoster sees confirmation their backend is active). Reaching
@@ -2686,8 +3332,8 @@ export function validateConfig(): AppConfig {
     }
     console.warn(
       `[config] AI Agent routed to a custom Anthropic-compatible backend (ANTHROPIC_BASE_URL host=${host}). `
-      + 'Cost tracking is best-effort: an unrecognized model id is priced at conservative '
-      + 'DEFAULT_PRICING (Opus-tier), not actual backend cost.',
+      + 'An unrecognized model id is billed at a conservative Opus-tier rate until it is '
+      + 'priced on /admin/ai-models, not at actual backend cost.',
     );
   }
 

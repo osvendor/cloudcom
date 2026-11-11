@@ -10,6 +10,18 @@ const { authorizeLiveRemoteSessionAccessMock } = vi.hoisted(() => ({
 // Shapes mirror desktopWs_lifecycle.test.ts so module resolution matches.
 // -------------------------------------------------------------------
 
+// Existing route cases exercise the non-isolated ICE plan.
+vi.mock('./remote/desktopRelayPolicy', async () => {
+  const { getIceServers } = await import('./remote/helpers');
+  return {
+    resolveDesktopIcePlan: async (_deviceId: string, scope: import('./remote/helpers').TurnCredentialScope) => ({
+      ok: true,
+      relayOnly: false,
+      iceServers: getIceServers(scope),
+    }),
+  };
+});
+
 vi.mock('../db', () => ({
   runOutsideDbContext: vi.fn((fn: () => unknown) => fn()),
   withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn()),
@@ -35,6 +47,8 @@ vi.mock('../db/schema', () => ({
     desktopStartGeneration: 'remoteSessions.desktopStartGeneration',
     terminalGeneration: 'remoteSessions.terminalGeneration',
     terminationPhase: 'remoteSessions.terminationPhase',
+    type: 'remoteSessions.type',
+    iceCandidates: 'remoteSessions.iceCandidates',
   },
   devices: { id: 'devices.id' },
   users: { id: 'users.id', status: 'users.status' },
@@ -68,8 +82,15 @@ vi.mock('../services/viewerTokenRevocation', () => ({
   revokeViewerSession: vi.fn(async () => undefined),
 }));
 
+// #10542: the reconnect hold. Defaults: marking succeeds, nothing is held.
+vi.mock('../services/desktopReconnectGrace', () => ({
+  markDesktopViewerReconnectIntent: vi.fn(async () => true),
+  enforceExpiredDesktopReconnectHold: vi.fn(async () => 'none'),
+}));
+
 vi.mock('./agentWs', () => ({
   sendCommandToAgent: vi.fn(() => true),
+  sendDesktopIceCandidateToAgent: vi.fn(() => true),
   isAgentConnected: vi.fn(() => true),
 }));
 
@@ -154,9 +175,13 @@ vi.mock('../services/remoteWsAuthorization', () => ({
 import { db } from '../db';
 import { verifyViewerAccessToken } from '../services/jwt';
 import { isViewerJtiRevoked, isViewerSessionRevoked } from '../services/viewerTokenRevocation';
-import { sendCommandToAgent } from './agentWs';
+import { sendCommandToAgent, sendDesktopIceCandidateToAgent } from './agentWs';
 import { checkRemoteAccess, resolveDesktopSessionPolicy } from '../services/remoteAccessPolicy';
 import { createDesktopWsRoutes } from './desktopWs';
+import { RemoteSessionPromptPolicyError } from './remote/consentGate';
+import { getRedis } from '../services/redis';
+import { desktopStartInFlightRedisKey } from '../services/desktopStartInFlight';
+import { enforceExpiredDesktopReconnectHold, markDesktopViewerReconnectIntent } from '../services/desktopReconnectGrace';
 
 // -------------------------------------------------------------------
 // Helpers
@@ -202,11 +227,12 @@ function mockViewerSelect(row: unknown) {
     authorizeLiveRemoteSessionAccessMock.mockImplementation(async (_subject, accessMode = 'live') => {
       const session = live.session as typeof ACTIVE_SESSION & { errorMessage?: string | null };
       const readingFailure = accessMode === 'failure-diagnostics' &&
-        (session.status === 'failed' || (session.status === 'disconnected' && !!session.errorMessage));
+        (session.status === 'failed'
+          || ((session.status === 'disconnected' || session.status === 'denied') && !!session.errorMessage));
       const reason = live.user.status !== 'active' ? 'user_inactive'
         : live.session.userId !== USER_ID ? 'session_not_owned'
           : live.session.type !== 'desktop' ? 'session_missing'
-            : ['disconnected', 'failed'].includes(live.session.status) && !readingFailure ? 'session_inactive' : null;
+            : ['disconnected', 'failed', 'denied'].includes(live.session.status) && !readingFailure ? 'session_inactive' : null;
       if (reason) return { ok: false, status: reason === 'session_missing' ? 404 : 403, reason };
       const policy = await checkRemoteAccess(live.device.id, 'webrtcDesktop');
       return policy.allowed ? { ok: true, ...live } : { ok: false, status: 403, reason: 'policy_denied' };
@@ -238,7 +264,7 @@ function mockUpdateReturning(updatedRow: unknown) {
 /**
  * Rigs the two real db.select calls commitDesktopStreamStartIntent's twin,
  * commitDesktopStartIntent, and assertDesktopStartIntentCurrent make
- * (remoteDesktopStartIntent.ts — SEC-038 W02, not mocked in this file): the
+ * (remoteDesktopStartIntent.ts, not mocked in this file): the
  * row-locked read, then the pre-send re-read. Layered as mockReturnValueOnce
  * on top of mockViewerSelect's persistent (and, for this route, unused —
  * authorizeLiveRemoteSessionAccess is mocked directly) db.select rig, so it
@@ -247,8 +273,10 @@ function mockUpdateReturning(updatedRow: unknown) {
 function rigDesktopStartIntentSelects(options: {
   lockedStatus?: string;
   committedGeneration?: bigint;
+  /** Extra columns on the row-locked read (#8947: the current start's command id / answer). */
+  lockedRow?: Record<string, unknown>;
 } = {}) {
-  const { lockedStatus = 'pending', committedGeneration = 1n } = options;
+  const { lockedStatus = 'pending', committedGeneration = 1n, lockedRow = {} } = options;
 
   // A prior test may have left an unconsumed mockReturnValueOnce queued on
   // db.select (e.g. a denial test that never reached commitDesktopStartIntent
@@ -265,7 +293,7 @@ function rigDesktopStartIntentSelects(options: {
       where: vi.fn().mockReturnValue({
         limit: vi.fn().mockReturnValue({
           for: vi.fn().mockResolvedValue([
-            { status: lockedStatus, terminationPhase: 'none', generation: 0n },
+            { status: lockedStatus, terminationPhase: 'none', generation: 0n, ...lockedRow },
           ]),
         }),
       }),
@@ -503,6 +531,100 @@ describe('validateViewerSessionAccess (via /:id/viewer/offer)', () => {
     expect((command as { payload: Record<string, unknown> }).payload.prompt).toEqual(prompt);
   });
 
+  // #6819: the viewer-token offer binds the consent-unavailable fallback to
+  // the start generation exactly like the JWT offer route.
+  it.each([
+    { mode: 'consent', behavior: 'proceed', bound: 'proceed' },
+    { mode: 'consent', behavior: 'block', bound: 'block' },
+    { mode: 'notify', behavior: 'proceed', bound: null },
+  ] as const)('binds consentUnavailableBehavior=$bound for a $mode/$behavior prompt', async ({ mode, behavior, bound }) => {
+    primeHappyPath();
+    mockViewerSelect({ session: ACTIVE_SESSION, device: { ...DEVICE, consentPromptProtocolVersion: 1 }, user: USER });
+    const { buildRemoteSessionPromptPayload } = await import('./remote/helpers');
+    vi.mocked(buildRemoteSessionPromptPayload).mockResolvedValueOnce({
+      mode,
+      technicianName: null,
+      technicianEmail: null,
+      orgName: null,
+      consentUnavailableBehavior: behavior,
+      consentTimeoutMs: 30000,
+      notifyOnEnd: true,
+      showIndicator: true,
+    } as never);
+
+    const res = await offerRequest();
+    expect(res.status).toBe(200);
+
+    const set = (vi.mocked(db.update).mock.results[0]!.value as { set: ReturnType<typeof vi.fn> }).set;
+    expect(set).toHaveBeenCalledWith(expect.objectContaining({
+      desktopPromptMode: mode,
+      desktopConsentUnavailableBehavior: bound,
+    }));
+  });
+
+  it('dispatches a consent-mode start to an agent on consent prompt protocol 2', async () => {
+    primeHappyPath();
+    mockViewerSelect({ session: ACTIVE_SESSION, device: { ...DEVICE, consentPromptProtocolVersion: 2 }, user: USER });
+    const { buildRemoteSessionPromptPayload } = await import('./remote/helpers');
+    vi.mocked(buildRemoteSessionPromptPayload).mockResolvedValueOnce({
+      mode: 'consent',
+      technicianName: null,
+      technicianEmail: null,
+      orgName: null,
+      consentUnavailableBehavior: 'block',
+      consentTimeoutMs: 30000,
+      notifyOnEnd: true,
+      showIndicator: true,
+    } as never);
+
+    const res = await offerRequest();
+
+    expect(res.status).toBe(200);
+  });
+
+  it.each([0, 3, undefined])('refuses a consent-mode start before dispatch when the agent reports consent prompt protocol %s', async (version) => {
+    primeHappyPath();
+    mockViewerSelect({ session: ACTIVE_SESSION, device: { ...DEVICE, consentPromptProtocolVersion: version }, user: USER });
+    const { buildRemoteSessionPromptPayload } = await import('./remote/helpers');
+    const { prepareRevocationLeaseForStart } = await import('../services/remoteRevocationLease');
+    vi.mocked(buildRemoteSessionPromptPayload).mockResolvedValueOnce({
+      mode: 'consent',
+      technicianName: null,
+      technicianEmail: null,
+      orgName: null,
+      consentUnavailableBehavior: 'block',
+      consentTimeoutMs: 30000,
+      notifyOnEnd: true,
+      showIndicator: true,
+    } as never);
+
+    const res = await offerRequest();
+
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.code).toBe('CONSENT_UPGRADE_REQUIRED');
+    expect(body.error).toMatch(/update the agent/i);
+    // Refused before the lease, the start intent and any dispatch.
+    expect(prepareRevocationLeaseForStart).not.toHaveBeenCalled();
+    expect(db.update).not.toHaveBeenCalled();
+    expect(sendCommandToAgent).not.toHaveBeenCalled();
+  });
+
+  it('refuses the start when the prompt policy cannot be resolved', async () => {
+    primeHappyPath();
+    const { buildRemoteSessionPromptPayload } = await import('./remote/helpers');
+    vi.mocked(buildRemoteSessionPromptPayload).mockRejectedValueOnce(
+      new RemoteSessionPromptPolicyError(DEVICE_ID, 'statement timeout'),
+    );
+
+    const res = await offerRequest();
+
+    expect(res.status).toBe(503);
+    expect((await res.json()).code).toBe('REMOTE_PROMPT_POLICY_UNAVAILABLE');
+    expect(db.update).not.toHaveBeenCalled();
+    expect(sendCommandToAgent).not.toHaveBeenCalled();
+  });
+
   it('on valid + active + allowed: submits offer and sends start_desktop with the policy payload', async () => {
     primeHappyPath();
 
@@ -557,7 +679,7 @@ describe('GET /:id/viewer/session failure diagnostics', () => {
   // below): a 'disconnected' session WITH a recorded errorMessage is now the
   // mid-session counterpart to 'failed' and must return the diagnosis too —
   // only a 'disconnected' session with NO recorded reason still rejects.
-  it.each(['pending', 'connecting', 'active', 'denied'])('still rejects a revoked %s session', async (status) => {
+  it.each(['pending', 'connecting', 'active'])('still rejects a revoked %s session', async (status) => {
     mockViewerSelect({ session: { ...failedSession, status }, device: DEVICE, user: USER });
     const res = await request();
     expect(res.status).toBe(401);
@@ -579,7 +701,7 @@ describe('GET /:id/viewer/session failure diagnostics', () => {
     expect(sendCommandToAgent).not.toHaveBeenCalled();
   });
 
-  // SEC-038 W06 (#5537): a server-side End whose stop_desktop has not yet been
+  // #5537 — a server-side End whose stop_desktop has not yet been
   // acknowledged by the agent leaves the row terminal with
   // terminationPhase='pending'. The viewer's answer poll must see the phase
   // and must never be handed a stale answer it could connect with.
@@ -610,6 +732,54 @@ describe('GET /:id/viewer/session failure diagnostics', () => {
     expect(await res.json()).toMatchObject({ status: 'active', webrtcAnswer: 'v=0 stale-answer' });
     expect(db.update).not.toHaveBeenCalled();
     expect(sendCommandToAgent).not.toHaveBeenCalled();
+  });
+
+  // #6818: a consent refusal commits status 'denied' with the reason in
+  // errorMessage and revokes the viewer token. The answer poll must be able to
+  // read that reason once, so the technician sees "declined" / "did not
+  // respond" instead of a generic "session ended".
+  it('returns the consent reason for a revoked denied session', async () => {
+    const reason = 'The user on the remote device declined the connection.';
+    mockViewerSelect({
+      session: { ...failedSession, status: 'denied', terminationPhase: 'confirmed', errorMessage: reason, desktopPromptMode: 'consent' },
+      device: DEVICE,
+      user: USER,
+    });
+    const res = await request();
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ status: 'denied', errorMessage: reason, webrtcAnswer: null });
+    expect(db.update).not.toHaveBeenCalled();
+    expect(sendCommandToAgent).not.toHaveBeenCalled();
+  });
+
+  it('still rejects a revoked denied session with no recorded reason', async () => {
+    mockViewerSelect({
+      session: { ...failedSession, status: 'denied', errorMessage: null },
+      device: DEVICE,
+      user: USER,
+    });
+    const res = await request();
+    expect(res.status).toBe(401);
+    expect(await res.json()).toEqual({ error: 'Session closed' });
+  });
+
+  // #6818: the agent holds its answer until the end user answers the consent
+  // dialog, so the viewer needs the start's prompt mode and answer budget.
+  it.each([
+    ['consent', 87_000],
+    ['notify', 45_000],
+    ['off', 15_000],
+    [null, 15_000],
+  ])('reports promptMode=%s with an answer budget of %i ms', async (promptMode, answerTimeoutMs) => {
+    vi.mocked(isViewerSessionRevoked).mockResolvedValue(false);
+    mockViewerSelect({
+      session: { ...failedSession, status: 'connecting', errorMessage: null, webrtcAnswer: null, desktopPromptMode: promptMode },
+      device: DEVICE,
+      user: USER,
+    });
+    const res = await request();
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ status: 'connecting', promptMode: promptMode ?? 'off', answerTimeoutMs });
   });
 
   it('still rejects a revoked disconnected session with no recorded reason', async () => {
@@ -714,5 +884,318 @@ describe('GET /:id/viewer/session failure diagnostics', () => {
   it('rejects non-desktop sessions', async () => {
     mockViewerSelect({ session: { ...failedSession, type: 'terminal' }, device: DEVICE, user: USER });
     expect((await request()).status).toBe(404);
+  });
+});
+
+// #10542: a peer drop the viewer's reconnect caused is held for a short grace.
+// These routes are the viewer half of that: the ICE-server fetch marks the
+// reconnect, and a held session whose deadline passed is ended before any
+// viewer-token route serves it again.
+describe('viewer reconnect hold (#10542)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(enforceExpiredDesktopReconnectHold).mockResolvedValue('none');
+    vi.mocked(markDesktopViewerReconnectIntent).mockResolvedValue(true);
+  });
+
+  const iceServersRequest = () => buildApp().request(`/${SESSION_ID}/viewer/ice-servers`, {
+    headers: { Authorization: 'Bearer valid.viewer.token' },
+  });
+
+  it('marks a reconnect in flight when the viewer fetches ICE servers for an active session', async () => {
+    primeHappyPath();
+    mockViewerSelect({ session: { ...ACTIVE_SESSION, desktopStartGeneration: 7n }, device: DEVICE, user: USER });
+    const res = await iceServersRequest();
+    expect(res.status).toBe(200);
+    // The mark names the start the session is on, so a late drop for an
+    // older peer is never held against a newer start.
+    expect(markDesktopViewerReconnectIntent).toHaveBeenCalledWith(SESSION_ID, 7n);
+  });
+
+  it('does not mark the first connect (session not yet active)', async () => {
+    primeHappyPath();
+    mockViewerSelect({ session: { ...ACTIVE_SESSION, status: 'pending' }, device: DEVICE, user: USER });
+    const res = await iceServersRequest();
+    expect(res.status).toBe(200);
+    expect(markDesktopViewerReconnectIntent).not.toHaveBeenCalled();
+  });
+
+  it('still serves ICE servers when the mark cannot be written', async () => {
+    primeHappyPath();
+    vi.mocked(markDesktopViewerReconnectIntent).mockResolvedValue(false);
+    expect((await iceServersRequest()).status).toBe(200);
+  });
+
+  it('accepts the reconnect offer while the hold is running', async () => {
+    primeHappyPath();
+    rigDesktopStartIntentSelects({ lockedStatus: 'active' });
+    const res = await offerRequest();
+    expect(res.status).toBe(200);
+    expect(enforceExpiredDesktopReconnectHold).toHaveBeenCalledWith(
+      expect.objectContaining({ id: SESSION_ID, deviceId: DEVICE_ID }),
+    );
+    expect(sendCommandToAgent).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses with 401 'Session closed' once the hold's deadline passed (and it ended the session)", async () => {
+    primeHappyPath();
+    vi.mocked(enforceExpiredDesktopReconnectHold).mockResolvedValue('ended');
+    const res = await offerRequest();
+    expect(res.status).toBe(401);
+    expect(await res.json()).toEqual({ error: 'Session closed' });
+    expect(sendCommandToAgent).not.toHaveBeenCalled();
+  });
+
+  it('refuses with 503 when the hold record cannot be checked', async () => {
+    primeHappyPath();
+    vi.mocked(enforceExpiredDesktopReconnectHold).mockResolvedValue('unavailable');
+    const res = await offerRequest();
+    expect(res.status).toBe(503);
+    expect(sendCommandToAgent).not.toHaveBeenCalled();
+  });
+
+  it.each([['ws-ticket', 'POST'], ['ice-servers', 'GET']])('enforces an expired hold on %s too', async (route, method) => {
+    primeHappyPath();
+    vi.mocked(enforceExpiredDesktopReconnectHold).mockResolvedValue('ended');
+    const res = await buildApp().request(`/${SESSION_ID}/viewer/${route}`, {
+      method, headers: { Authorization: 'Bearer valid.viewer.token' },
+    });
+    expect(res.status).toBe(401);
+    expect(markDesktopViewerReconnectIntent).not.toHaveBeenCalled();
+  });
+
+  it('does not run the hold check on the failure-diagnostics read', async () => {
+    primeHappyPath();
+    const res = await buildApp().request(`/${SESSION_ID}/viewer/session`, {
+      headers: { Authorization: 'Bearer valid.viewer.token' },
+    });
+    expect(res.status).toBe(200);
+    expect(enforceExpiredDesktopReconnectHold).not.toHaveBeenCalled();
+  });
+});
+
+// #8947: one viewer window posted two offers ~250 ms apart; both were accepted
+// and dispatched, and the first peer was orphaned. The real start-intent and
+// in-flight-marker code runs here against an in-memory Redis.
+describe('POST /:id/viewer/offer — concurrent second offer (#8947)', () => {
+  const IN_FLIGHT_COMMAND = `desk-start-${SESSION_ID}-99999999-9999-4999-8999-999999999999`;
+  let store: Map<string, string>;
+
+  function useMemoryRedis() {
+    store = new Map();
+    vi.mocked(getRedis).mockReturnValue({
+      status: 'ready',
+      get: vi.fn(async (key: string) => store.get(key) ?? null),
+      set: vi.fn(async (key: string, value: string) => { store.set(key, value); return 'OK'; }),
+      eval: vi.fn(async (_script: string, _n: number, key: string, value: string) => {
+        if (store.get(key) !== value) return 0;
+        store.delete(key);
+        return 1;
+      }),
+    } as never);
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    primeHappyPath();
+    useMemoryRedis();
+  });
+
+  it('refuses a second offer while the first start is unanswered: 409 START_IN_FLIGHT, nothing dispatched', async () => {
+    store.set(desktopStartInFlightRedisKey(SESSION_ID), IN_FLIGHT_COMMAND);
+    rigDesktopStartIntentSelects({
+      lockedStatus: 'connecting',
+      lockedRow: { startCommandId: IN_FLIGHT_COMMAND, hasAnswer: false },
+    });
+
+    const res = await offerRequest();
+
+    expect(res.status).toBe(409);
+    expect((await res.json()).code).toBe('START_IN_FLIGHT');
+    expect(db.update).not.toHaveBeenCalled();
+    expect(sendCommandToAgent).not.toHaveBeenCalled();
+    // The in-flight start keeps its marker.
+    expect(store.get(desktopStartInFlightRedisKey(SESSION_ID))).toBe(IN_FLIGHT_COMMAND);
+  });
+
+  it('accepts a reconnect offer once the answer is stored', async () => {
+    store.set(desktopStartInFlightRedisKey(SESSION_ID), IN_FLIGHT_COMMAND);
+    rigDesktopStartIntentSelects({
+      lockedStatus: 'connecting',
+      lockedRow: { startCommandId: IN_FLIGHT_COMMAND, hasAnswer: true },
+    });
+
+    const res = await offerRequest();
+
+    expect(res.status).toBe(200);
+    expect(sendCommandToAgent).toHaveBeenCalledTimes(1);
+  });
+
+  it('accepts a reconnect offer on an active session whose peer dropped', async () => {
+    store.set(desktopStartInFlightRedisKey(SESSION_ID), IN_FLIGHT_COMMAND);
+    rigDesktopStartIntentSelects({
+      lockedStatus: 'active',
+      lockedRow: { startCommandId: IN_FLIGHT_COMMAND, hasAnswer: true },
+    });
+
+    const res = await offerRequest();
+
+    expect(res.status).toBe(200);
+    expect(sendCommandToAgent).toHaveBeenCalledTimes(1);
+  });
+
+  it('marks the dispatched start in flight under its own command id', async () => {
+    const res = await offerRequest();
+
+    expect(res.status).toBe(200);
+    const [, command] = vi.mocked(sendCommandToAgent).mock.calls[0]!;
+    expect(store.get(desktopStartInFlightRedisKey(SESSION_ID))).toBe((command as { id: string }).id);
+  });
+
+  it('releases the marker when the start was superseded before dispatch', async () => {
+    // The pre-send re-read sees a newer generation than the one committed.
+    rigDesktopStartIntentSelects({ lockedStatus: 'pending', committedGeneration: 2n });
+
+    const res = await offerRequest();
+
+    expect(res.status).toBe(409);
+    expect((await res.json()).code).toBe('SESSION_SUPERSEDED');
+    expect(sendCommandToAgent).not.toHaveBeenCalled();
+    expect(store.has(desktopStartInFlightRedisKey(SESSION_ID))).toBe(false);
+  });
+
+  it('releases the marker when the request throws after the commit', async () => {
+    const { logSessionAudit } = await import('./remote/helpers');
+    vi.mocked(logSessionAudit).mockRejectedValueOnce(new Error('audit write exploded'));
+
+    const res = await offerRequest();
+
+    expect(res.status).toBe(500);
+    expect(sendCommandToAgent).not.toHaveBeenCalled();
+    expect(store.has(desktopStartInFlightRedisKey(SESSION_ID))).toBe(false);
+  });
+
+  it('releases the marker when the agent is unreachable, so the retry is not refused', async () => {
+    vi.mocked(sendCommandToAgent).mockReturnValueOnce(false);
+
+    const res = await offerRequest();
+
+    expect(res.status).toBe(502);
+    expect(store.has(desktopStartInFlightRedisKey(SESSION_ID))).toBe(false);
+  });
+});
+
+
+
+// #9182: trickle ICE. The viewer posts candidates it gathered after its offer
+// (relayed to the agent), and reads the agent's late candidates back from the
+// session poll.
+describe('trickle ICE viewer routes (#9182)', () => {
+  const RELAY = 'candidate:9 1 udp 16777215 198.51.100.7 3478 typ relay raddr 203.0.113.5 rport 50000';
+  const LIVE = { ...ACTIVE_SESSION, desktopStartGeneration: 3n, webrtcAnswer: 'v=0 answer', iceCandidates: [] as unknown[] };
+
+  const postIce = (body: unknown, token: string | null = 'valid.viewer.token') => buildApp().request(`/${SESSION_ID}/viewer/ice`, {
+    method: 'POST',
+    headers: {
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify(body),
+  });
+  const getSession = () => buildApp().request(`/${SESSION_ID}/viewer/session`, {
+    headers: { Authorization: 'Bearer valid.viewer.token' },
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    primeHappyPath();
+    mockViewerSelect({ session: LIVE, device: DEVICE, user: USER });
+    vi.mocked(sendDesktopIceCandidateToAgent).mockReturnValue(true);
+  });
+
+  it('stores a late viewer candidate and relays it to the agent for the current start', async () => {
+    mockUpdateReturning({ iceCandidates: [{}] });
+
+    const res = await postIce({ candidate: { candidate: RELAY, sdpMid: '0', sdpMLineIndex: 0, usernameFragment: 'abcd' } });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ accepted: true, forwarded: true });
+    expect(db.update).toHaveBeenCalledTimes(1);
+    expect(sendDesktopIceCandidateToAgent).toHaveBeenCalledWith(AGENT_ID, {
+      type: 'desktop_ice_candidate',
+      sessionId: SESSION_ID,
+      startGeneration: '3',
+      candidate: { candidate: RELAY, sdpMid: '0', sdpMLineIndex: 0, usernameFragment: 'abcd' },
+    });
+    expect(sendCommandToAgent).not.toHaveBeenCalled();
+  });
+
+  it('rejects an empty candidate (the browser end-of-candidates signal)', async () => {
+    const res = await postIce({ candidate: { candidate: '' } });
+    expect(res.status).toBe(400);
+    expect(db.update).not.toHaveBeenCalled();
+    expect(sendDesktopIceCandidateToAgent).not.toHaveBeenCalled();
+  });
+
+  it('rejects a request without a viewer token', async () => {
+    const res = await postIce({ candidate: { candidate: RELAY } }, null);
+    expect(res.status).toBe(401);
+    expect(sendDesktopIceCandidateToAgent).not.toHaveBeenCalled();
+  });
+
+  it('refuses a session that has no start in flight', async () => {
+    mockViewerSelect({ session: { ...LIVE, status: 'pending' }, device: DEVICE, user: USER });
+    const res = await postIce({ candidate: { candidate: RELAY } });
+    expect(res.status).toBe(409);
+    expect(db.update).not.toHaveBeenCalled();
+    expect(sendDesktopIceCandidateToAgent).not.toHaveBeenCalled();
+  });
+
+  it('does not relay a candidate the guarded write refused', async () => {
+    mockUpdateReturning(undefined);
+    const res = await postIce({ candidate: { candidate: RELAY } });
+    expect(res.status).toBe(409);
+    expect(sendDesktopIceCandidateToAgent).not.toHaveBeenCalled();
+  });
+
+  it('returns the agent\'s late candidates for the current start with the answer', async () => {
+    mockViewerSelect({
+      session: {
+        ...LIVE,
+        iceCandidates: [
+          { source: 'agent', generation: '2', seq: 0, candidate: { candidate: 'stale' } },
+          { source: 'viewer', generation: '3', candidate: { candidate: 'viewer-own' } },
+          { source: 'agent', generation: '3', seq: 1, complete: true },
+          { source: 'agent', generation: '3', seq: 0, candidate: { candidate: RELAY, sdpMid: '0', sdpMLineIndex: 0 } },
+        ],
+      },
+      device: DEVICE,
+      user: USER,
+    });
+
+    const res = await getSession();
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.webrtcAnswer).toBe('v=0 answer');
+    expect(body.agentIceCandidates).toEqual([
+      { seq: 0, candidate: { candidate: RELAY, sdpMid: '0', sdpMLineIndex: 0 } },
+      { seq: 1, complete: true },
+    ]);
+  });
+
+  it('withholds the agent\'s candidates whenever the answer is withheld', async () => {
+    mockViewerSelect({
+      session: {
+        ...LIVE,
+        terminationPhase: 'pending',
+        iceCandidates: [{ source: 'agent', generation: '3', seq: 0, candidate: { candidate: RELAY } }],
+      },
+      device: DEVICE,
+      user: USER,
+    });
+
+    const body = await (await getSession()).json();
+    expect(body.webrtcAnswer).toBeNull();
+    expect(body.agentIceCandidates).toEqual([]);
   });
 });

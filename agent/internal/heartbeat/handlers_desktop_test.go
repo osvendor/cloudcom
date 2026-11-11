@@ -162,7 +162,7 @@ func TestHandleDesktopStreamStopHeadlessStillExecutesBoundStop(t *testing.T) {
 func TestHandleStopDesktopStateBasedRoutesDirectSession(t *testing.T) {
 	const sessionID = "11111111-1111-1111-1111-111111111111"
 
-	mgr := desktop.NewSessionManager()
+	mgr := desktop.NewSessionManagerWithPreloader(nil)
 	// Inject a direct session into the manager. It is never registered in
 	// desktopOwners, mimicking a Linux WebRTC session that boots headless.
 	setUnexportedField(t, mgr, "sessions", map[string]*desktop.Session{sessionID: {}})

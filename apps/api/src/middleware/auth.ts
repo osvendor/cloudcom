@@ -3,20 +3,33 @@ import { HTTPException } from 'hono/http-exception';
 import { verifyToken, TokenPayload } from '../services/jwt';
 import { getBoundMobileDeviceBlock, mobileDeviceBlockedResponse } from './mobileDeviceBlocked';
 import { getUserPermissions, hasPermission, canAccessOrg, canAccessSite, UserPermissions } from '../services/permissions';
+import { normalizeSiteAllowlist } from '../services/siteAllowlist';
 import { isTokenIssuedBeforePasswordChange, isUserTokenRevoked } from '../services/tokenRevocation';
+import { runPreContextChecks } from './preContextChecks';
+import { chargeUserRateBudget } from './rateLimitBudget';
 import { db, runOutsideDbContext, withDbAccessContext, withSystemDbAccessContext, type DbAccessContext, type DbAccessScope } from '../db';
 import { users, partnerUsers, organizations } from '../db/schema';
-import { and, eq, inArray, isNull, or, SQL } from 'drizzle-orm';
+import { UNASSIGNED_POOL_ORG_TYPE } from '../services/unassignedPool/orgType';
+import { orderAccessibleOrgIds } from './accessibleOrgOrder';
+import { and, eq, inArray, isNull, ne, or, SQL } from 'drizzle-orm';
 import type { PgColumn } from 'drizzle-orm/pg-core';
 import type { AiOriginRef } from '@breeze/shared';
 import type { PartnerTrustState } from '../db/schema/orgs';
 import { ENABLE_2FA } from '../routes/auth/schemas';
 import { assertActiveTenantContext, TenantInactiveError } from '../services/tenantStatus';
 import { writeAuditEvent } from '../services/auditEvents';
-import { withSentryRequestScope } from '../services/sentry';
+import { captureException, withSentryRequestScope } from '../services/sentry';
 import { getEffectiveMfaPolicy } from '../services/mfaPolicy';
 import { ipAllowlistGuard } from './ipAllowlistGuard';
+import { markPermissionGate } from './permissionGate';
+import { isAutomationPrincipal, isFlowPrincipal } from './principalKind';
 import { isSelfManagedDbContextRoute } from './selfManagedDbContextRoutes';
+import { isReportHistoryReadRoute } from './reportHistoryRoutes';
+import {
+  computeReportHistoryReach,
+  EMPTY_REPORT_HISTORY_REACH,
+  type ReportHistoryReach,
+} from '../services/reportHistoryAccess';
 
 /**
  * The transports/actors that can produce an AuthContext.
@@ -46,13 +59,26 @@ import { isSelfManagedDbContextRoute } from './selfManagedDbContextRoutes';
 export type PrincipalKind =
   | { kind: 'user_session' }
   | { kind: 'client_user' }
-  | { kind: 'api_key'; apiKeyId?: string }
+  // `partnerServicePrincipalId` is set only for a partner service principal
+  // (`brz_sp_` key) on the MCP endpoint. It is still an API-key-class machine
+  // caller everywhere (no interactive session, no approval surface), but
+  // `apiKeyId` is then a partner_service_principal_keys id, NOT an api_keys
+  // id: consumers that resolve `apiKeyId` against api_keys must check
+  // isPartnerServicePrincipal() first. `auth.user` is the principal's owner,
+  // borrowed for per-tool RBAC only; it never reaches breeze.user_id.
+  | { kind: 'api_key'; apiKeyId?: string; partnerServicePrincipalId?: string }
   | { kind: 'oauth_grant'; grantId?: string }
   | { kind: 'agent'; deviceId?: string }
   | { kind: 'helper'; deviceId?: string }
   // An AI operator agent acting as itself (spec 2026-08-22 §3). Built only by
   // services/aiAgents/agentAuthContext.ts. NEVER satisfies any user-RBAC gate.
   | { kind: 'ai_agent'; agentId: string; runId: string }
+  // A published flow's run acting as itself (tool catalog W04, #5219, Open
+  // Decision 7). Built only by services/flows/flowAuthContext.ts. NEVER
+  // satisfies any user-RBAC gate. It has NO agent id: a site that needs one
+  // stays agent-only and refuses a flow (automationPrincipal.contract.test.ts)
+  // — never substitute `runId` for an agent id.
+  | { kind: 'flow'; flowId: string; runId: string }
   | { kind: 'system'; reason: string }
   | { kind: 'unknown' };
 
@@ -64,6 +90,13 @@ export type PrincipalKind =
  * present, including `oauth_grant` (which acts *for* a user but not *as* an
  * interactive session).
  */
+export { isAiAgentPrincipal, isAutomationPrincipal, isFlowPrincipal } from './principalKind';
+
+/** True for a partner service principal (`brz_sp_` key) caller. */
+export function isPartnerServicePrincipal(auth: Pick<AuthContext, 'principal'>): boolean {
+  return auth.principal?.kind === 'api_key' && Boolean(auth.principal.partnerServicePrincipalId);
+}
+
 export function isInteractiveUserSession(auth: Pick<AuthContext, 'principal'>): boolean {
   return auth.principal.kind === 'user_session';
 }
@@ -88,8 +121,9 @@ export function requireInteractiveSession(): MiddlewareHandler {
   };
 }
 
-export function isAiAgentPrincipal(auth: Pick<AuthContext, 'principal'>): boolean {
-  return auth.principal?.kind === 'ai_agent';
+/** The 403 message an HTTP gate returns to an automation principal. */
+function automationHttpDenial(auth: Pick<AuthContext, 'principal'>): string {
+  return isFlowPrincipal(auth) ? 'Flows cannot call HTTP routes' : 'AI agents cannot call HTTP routes';
 }
 
 export interface AuthContext {
@@ -119,6 +153,33 @@ export interface AuthContext {
    */
   aiOrigin?: AiOriginRef;
 
+  /**
+   * AI chat TOOL auth only (#6675): the org an org-scoped AI write defaults to
+   * when the tool input names none. Set to the session org for a chat whose
+   * org was anchored by the device page it was opened from (recorded
+   * server-side in `ai_sessions.context_snapshot`, `aiSessionOrgAnchor.ts`).
+   *
+   * A default, never a grant: `resolveWritableToolOrgId` re-checks
+   * `canAccessOrg` on every call and an explicit `orgId` always wins. It does
+   * not narrow reads — the caller's reach is unchanged.
+   */
+  aiWriteDefaultOrgId?: string;
+
+  /**
+   * Wisp (w00 A2, A23): the delegation grant this call runs under. Defined and
+   * read by W03 (the memory tools refuse without it, `services/wisp/memoryTools.ts`);
+   * populated by W04 (`narrowAuthToCeiling`, a chat turn under a grant) and by
+   * W05/W02 (an agent run carrying a grant id). Absent everywhere else, so
+   * no other caller can reach grant-scoped memory.
+   *
+   * - `grantId` / `grantRevisionId` pin the ceiling (`resolveGrantCeiling`).
+   * - `sessionId` is the `ai_sessions.id` of the calling turn (W04 stamps
+   *   `session.breezeSessionId`; W05 stamps `run.sessionId ?? null`). Optional
+   *   so populators without a session compile unchanged; `remember` records it
+   *   as the block's `sourceSessionId` and the model can never supply it.
+   */
+  wispGrant?: { grantId: string; grantRevisionId: string; sessionId?: string | null };
+
   user: {
     id: string;
     email: string;
@@ -134,6 +195,10 @@ export interface AuthContext {
    * Pre-computed list of org IDs this user can access.
    * - string[] = user can access these specific orgs (org or partner scope)
    * - null = user can access ALL orgs (system scope)
+   *
+   * For partner scope the order is deterministic (`orderAccessibleOrgIds`,
+   * #9529) because `[0]` is still a fallback default in places. Prefer an
+   * explicit org over reading `[0]`.
    */
   accessibleOrgIds: string[] | null;
 
@@ -150,6 +215,21 @@ export interface AuthContext {
    * keys) — those fail closed at the gate.
    */
   partnerOrgAccess?: 'all' | 'selected' | 'none' | null;
+
+  /**
+   * #6771. The report-history capability: the caller's OWN out-of-service
+   * orgs (suspended / churned / offboarding / archived) whose report
+   * definitions and run metadata it may READ, with its live scope in each.
+   * Deliberately NOT part of `accessibleOrgIds` / `canAccessOrg` /
+   * `orgCondition` — those stay active/trial-only for every route.
+   *
+   * Set ONLY by `authMiddleware`, ONLY for partner-scope requests to the
+   * report-history GET routes (`isReportHistoryReadRoute`); undefined
+   * everywhere else. Consume it only through `services/reportHistoryAccess.ts`
+   * and the history branches of `routes/reports/helpers.ts`, for the
+   * 'read_history' action.
+   */
+  reportHistory?: ReportHistoryReach;
 
   /**
    * Helper to get the org filter condition for any table.
@@ -232,10 +312,12 @@ declare module 'hono' {
 export function siteAccessCheck(
   allowedSiteIds?: string[]
 ): (siteId: string | null | undefined) => boolean {
+  // A malformed (non-array, e.g. null) allowlist denies every site (#6790).
+  const allowed = normalizeSiteAllowlist(allowedSiteIds);
   return (siteId) => {
-    if (!allowedSiteIds) return true;
+    if (allowed === undefined) return true;
     if (!siteId) return false;
-    return allowedSiteIds.includes(siteId);
+    return allowed.includes(siteId);
   };
 }
 
@@ -246,10 +328,20 @@ export function siteAccessCheck(
  *
  * Path is the API path *after* the `/api/v1` mount, e.g. `/auth/mfa/setup`.
  */
-export function isMfaEnrollmentExemptPath(path: string): boolean {
+export function isMfaEnrollmentExemptPath(path: string, method?: string): boolean {
   // Strip the /api/v1 prefix if present so the check works whether Hono
   // gives us the absolute path or a sub-app path.
   const rel = path.startsWith('/api/v1') ? path.slice('/api/v1'.length) : path;
+
+  // READ of the caller's own partner status (#6627). The account-inactive
+  // screen's only call; partnerGuard already skips it so a pending/suspended
+  // partner can learn its status. Without this a pending hosted partner whose
+  // role forces MFA got 428 here, the inactive screen had nothing to render,
+  // and the user bounced /account/inactive → / → 403 PARTNER_INACTIVE →
+  // /account/inactive forever. It returns only id/name/slug/status and the
+  // operator-set status CTA — no tenant data. Exact path and GET/HEAD only:
+  // any write, sub-path or sibling /partner route stays behind the gate.
+  if (rel === '/partner/me' && (method === 'GET' || method === 'HEAD')) return true;
 
   if (rel === '/auth/logout') return true;
   // The CF-Access-fronted twin of /auth/logout: it durably revokes refresh
@@ -413,33 +505,39 @@ export async function computeAccessibleOrgIds(
           : eq(organizations.type, 'quick_support');
 
         const partnerOrgs = await db
-          .select({ id: organizations.id })
+          .select({ id: organizations.id, slug: organizations.slug, type: organizations.type })
           .from(organizations)
           .where(
             and(
               eq(organizations.partnerId, partnerId),
               orgFilter,
               inArray(organizations.status, ['active', 'trial']),
+              // Holding org is never human-reachable.
+              ne(organizations.type, UNASSIGNED_POOL_ORG_TYPE),
               isNull(organizations.deletedAt)
             )
           );
 
-        return { orgIds: partnerOrgs.map(o => o.id), partnerOrgAccess: 'selected' };
+        return { orgIds: orderAccessibleOrgIds(partnerOrgs), partnerOrgAccess: 'selected' };
       }
 
       // orgAccess=all: partner users can access all orgs under their partner.
+      // Both branches go through orderAccessibleOrgIds: `accessibleOrgIds[0]`
+      // is a fallback default for AI sessions and tool helpers (#9529).
       const partnerOrgs = await db
-        .select({ id: organizations.id })
+        .select({ id: organizations.id, slug: organizations.slug, type: organizations.type })
         .from(organizations)
         .where(
           and(
             eq(organizations.partnerId, partnerId),
             inArray(organizations.status, ['active', 'trial']),
+            // Holding org is never human-reachable.
+            ne(organizations.type, UNASSIGNED_POOL_ORG_TYPE),
             isNull(organizations.deletedAt)
           )
         );
 
-      return { orgIds: partnerOrgs.map(o => o.id), partnerOrgAccess: 'all' };
+      return { orgIds: orderAccessibleOrgIds(partnerOrgs), partnerOrgAccess: 'all' };
     });
   }
 
@@ -480,6 +578,8 @@ export function buildDbAccessContext(args: {
   accessibleOrgIds: string[] | null;
   partnerId: string | null;
   userId: string | null;
+  /** #6771 — see `DbAccessContext.reportHistoryOrgIds`. Omitted = none. */
+  reportHistoryOrgIds?: readonly string[];
 }): DbAccessContext {
   return {
     scope: args.scope,
@@ -488,6 +588,9 @@ export function buildDbAccessContext(args: {
     accessiblePartnerIds: computeAccessiblePartnerIds(args.scope, args.partnerId),
     userId: args.userId,
     currentPartnerId: args.partnerId ?? null,
+    ...(args.scope === 'partner' && args.reportHistoryOrgIds && args.reportHistoryOrgIds.length > 0
+      ? { reportHistoryOrgIds: args.reportHistoryOrgIds }
+      : {}),
   };
 }
 
@@ -509,9 +612,18 @@ export function dbAccessContextFromAuth(auth: AuthContext): DbAccessContext {
     // #2822 routed the AI-tool handlers through this builder, an unguarded
     // dereference here would turn a missing `user` into a TypeError inside
     // every tool call rather than a benign null user id.
-    // AI agents carry a synthetic user record for audit attribution only. It
-    // must never reach breeze.user_id or satisfy Shape-6 user-scoped RLS.
-    userId: auth.principal?.kind === 'ai_agent' ? null : auth.user?.id ?? null,
+    // AI agents and flows carry a synthetic user record for audit attribution
+    // only. It must never reach breeze.user_id or satisfy Shape-6 user-scoped
+    // RLS.
+    // A partner service principal's `user` is its owner, borrowed for per-tool
+    // RBAC only; the machine must never read or write the owner's private
+    // (user-scoped) rows, so it gets no user id either.
+    userId: isAutomationPrincipal(auth) || isPartnerServicePrincipal(auth)
+      ? null
+      : auth.user?.id ?? null,
+    // #6771: re-entering the request's context re-enters its report-history
+    // grant too (only ever set on the report-history GET routes).
+    reportHistoryOrgIds: auth.reportHistory?.orgIds,
   });
 }
 
@@ -565,6 +677,11 @@ export async function authMiddleware(c: Context, next: Next): Promise<void | Res
   if (await isUserTokenRevoked(payload.sub, payload.iat)) {
     throw new HTTPException(401, { message: 'Invalid or expired token' });
   }
+
+  // #10962: after the revocation check, so a revoked token can't burn its
+  // former owner's budget; before this middleware's Postgres reads, so a runaway
+  // client is refused without the per-request auth queries.
+  await chargeUserRateBudget(c, payload.sub);
 
   // Fetch user to ensure they still exist and are active. Pre-auth lookup —
   // must run under system scope because the request's real scope isn't
@@ -678,7 +795,7 @@ export async function authMiddleware(c: Context, next: Next): Promise<void | Res
   // getEffectiveOrgSettings query, and hot polled exempt routes
   // (/users/me, /auth/mfa/*) must not pay that DB cost on every request
   // (the US DB has a ~25-connection ceiling).
-  if (ENABLE_2FA && !user.mfaEnabled && !isMfaEnrollmentExemptPath(c.req.path)) {
+  if (ENABLE_2FA && !user.mfaEnabled && !isMfaEnrollmentExemptPath(c.req.path, c.req.method)) {
     const policy = await getEffectiveMfaPolicy({
       scope: payload.scope,
       userId: user.id,
@@ -754,6 +871,33 @@ export async function authMiddleware(c: Context, next: Next): Promise<void | Res
   }
   const canAccessSite = siteAccessCheck(allowedSiteIds);
 
+  // #6771 — the report-history capability, computed ONLY for a partner-scope
+  // request to one of the report-history GET routes. Like
+  // computeAccessibleOrgIds it reads under its own short system transaction
+  // here, BEFORE the request transaction opens, so the history routes never
+  // need a system escape later. It never touches `accessibleOrgIds`.
+  // A failure degrades to "no history" (fail closed) rather than failing a
+  // request that may only be listing active orgs — but it is never silent.
+  let reportHistory: ReportHistoryReach | undefined;
+  if (
+    payload.scope === 'partner'
+    && payload.partnerId
+    && partnerOrgAccess !== null
+    && isReportHistoryReadRoute(c.req.method, c.req.path)
+  ) {
+    try {
+      reportHistory = await computeReportHistoryReach({ partnerId: payload.partnerId, userId: user.id });
+    } catch (err) {
+      console.error('[authMiddleware] report-history reach lookup failed; serving no history', {
+        userId: user.id,
+        partnerId: payload.partnerId,
+        err,
+      });
+      captureException(err);
+      reportHistory = EMPTY_REPORT_HISTORY_REACH;
+    }
+  }
+
   c.set('auth', {
     // The interactive session JWT path — the one place a real human at a
     // browser produces an AuthContext.
@@ -773,7 +917,8 @@ export async function authMiddleware(c: Context, next: Next): Promise<void | Res
     orgCondition,
     canAccessOrg,
     allowedSiteIds,
-    canAccessSite
+    canAccessSite,
+    ...(reportHistory ? { reportHistory } : {}),
   });
 
   // The return value matters: ipAllowlistGuard returns its deny/error
@@ -791,7 +936,17 @@ export async function authMiddleware(c: Context, next: Next): Promise<void | Res
   // class). They run with NO ambient context and manage their own short DB
   // access contexts; auth is still set above so requireScope/requirePermission
   // and the handler's actor still work.
-  const runScopedHandler = () => {
+  const runScopedHandler = async () => {
+    // #8334 / #1105: per-user Redis limiters registered on the matched routes
+    // run HERE, before a pooled connection is taken, not inside the request
+    // transaction. A denial is finalized on the context directly:
+    // ipAllowlistGuard awaits this function but discards its return value, so
+    // returning the Response would drop it ("Context is not finalized").
+    const preContextDenied = await runPreContextChecks(c);
+    if (preContextDenied) {
+      c.res = preContextDenied;
+      return;
+    }
     if (isSelfManagedDbContextRoute(c.req.method, c.req.path)) {
       return next();
     }
@@ -806,7 +961,8 @@ export async function authMiddleware(c: Context, next: Next): Promise<void | Res
         orgId: payload.orgId,
         accessibleOrgIds,
         partnerId: payload.partnerId,
-        userId: user.id
+        userId: user.id,
+        reportHistoryOrgIds: reportHistory?.orgIds,
       }),
       next
     );
@@ -839,8 +995,8 @@ export function requireScope(...scopes: Array<'system' | 'partner' | 'organizati
       throw new HTTPException(401, { message: 'Not authenticated' });
     }
 
-    if (auth.principal?.kind === 'ai_agent') {
-      throw new HTTPException(403, { message: 'AI agents cannot call HTTP routes' });
+    if (isAutomationPrincipal(auth)) {
+      throw new HTTPException(403, { message: automationHttpDenial(auth) });
     }
 
     if (!scopes.includes(auth.scope)) {
@@ -854,8 +1010,8 @@ export function requireScope(...scopes: Array<'system' | 'partner' | 'organizati
 export function requirePartner(c: Context, next: Next) {
   const auth = c.get('auth');
 
-  if (auth?.principal?.kind === 'ai_agent') {
-    throw new HTTPException(403, { message: 'AI agents cannot call HTTP routes' });
+  if (auth && isAutomationPrincipal(auth)) {
+    throw new HTTPException(403, { message: automationHttpDenial(auth) });
   }
 
   if (!auth?.partnerId) {
@@ -868,10 +1024,10 @@ export function requirePartner(c: Context, next: Next) {
 export function requireOrg(c: Context, next: Next) {
   const auth = c.get('auth');
 
-  // An agent context always carries orgId (the run's org), so the bare presence
-  // check below ADMITTED it. This gate is the one that failed open by accident.
-  if (auth?.principal?.kind === 'ai_agent') {
-    throw new HTTPException(403, { message: 'AI agents cannot call HTTP routes' });
+  // An agent (or flow) context always carries orgId (the run's org), so the
+  // bare presence check below ADMITTED it. This gate is the one that failed open by accident.
+  if (auth && isAutomationPrincipal(auth)) {
+    throw new HTTPException(403, { message: automationHttpDenial(auth) });
   }
 
   if (!auth?.orgId) {
@@ -883,15 +1039,15 @@ export function requireOrg(c: Context, next: Next) {
 
 // Permission-based middleware
 export function requirePermission(resource: string, action: string) {
-  return async (c: Context, next: Next) => {
+  return markPermissionGate(async (c: Context, next: Next) => {
     const auth = c.get('auth');
 
     if (!auth) {
       throw new HTTPException(401, { message: 'Not authenticated' });
     }
 
-    if (auth.principal?.kind === 'ai_agent') {
-      throw new HTTPException(403, { message: 'AI agents cannot call HTTP routes' });
+    if (isAutomationPrincipal(auth)) {
+      throw new HTTPException(403, { message: automationHttpDenial(auth) });
     }
 
     // #5733 — pass the token scope. The system-scope token LOGIN mints carries
@@ -919,7 +1075,7 @@ export function requirePermission(resource: string, action: string) {
     c.set('permissions', userPerms);
 
     await next();
-  };
+  }, `${resource}:${action}`);
 }
 
 /**
@@ -952,8 +1108,8 @@ export function requireMfa() {
       throw new HTTPException(401, { message: 'Not authenticated' });
     }
 
-    if (auth.principal?.kind === 'ai_agent') {
-      throw new HTTPException(403, { message: 'AI agents cannot call HTTP routes' });
+    if (isAutomationPrincipal(auth)) {
+      throw new HTTPException(403, { message: automationHttpDenial(auth) });
     }
 
     if (!hasSatisfiedMfa(auth)) {
@@ -993,8 +1149,8 @@ export function requireOrgAccess(orgIdParam: string = 'orgId') {
     // Denies today only because getUserPermissions misses on the synthetic
     // agent id — a fail-closed by coincidence, plus a needless DB round-trip.
     // Make it a written denial.
-    if (auth.principal?.kind === 'ai_agent') {
-      throw new HTTPException(403, { message: 'AI agents cannot call HTTP routes' });
+    if (isAutomationPrincipal(auth)) {
+      throw new HTTPException(403, { message: automationHttpDenial(auth) });
     }
 
     if (!orgId) {
@@ -1033,8 +1189,8 @@ export function requireSiteAccess(siteIdParam: string = 'siteId') {
     // Denies today only because getUserPermissions misses on the synthetic
     // agent id — a fail-closed by coincidence, plus a needless DB round-trip.
     // Make it a written denial.
-    if (auth.principal?.kind === 'ai_agent') {
-      throw new HTTPException(403, { message: 'AI agents cannot call HTTP routes' });
+    if (isAutomationPrincipal(auth)) {
+      throw new HTTPException(403, { message: automationHttpDenial(auth) });
     }
 
     if (!siteId) {

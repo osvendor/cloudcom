@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
 import { useFormContext, type FieldValues } from 'react-hook-form';
 import { useTranslation } from 'react-i18next';
-import type { MonitorKind } from '@breeze/shared';
+import { APPLICATION_INFO_EVENT_PROVIDERS, eventLogCollectionGap, type MonitorKind } from '@breeze/shared';
 import { fetchAllScripts } from '@/lib/scriptsFetch';
 import { MONITOR_KIND_FIELDS, NETWORK_CHECK_TARGET_DEFAULTS, type KindField } from './monitorKindFields';
+import { CompositeConditionFields } from './MonitorAuthoringFields';
 
 /**
  * Which translated-option namespace a select field's values live under.
@@ -21,8 +22,13 @@ export const SELECT_OPTION_NAMESPACE: Record<string, string> = {
   match: 'compositeMatch',
   presence: 'presences',
   checkType: 'checkTypes',
+  'network_check:method': 'httpMethods',
+  'network_check:recordType': 'dnsRecordTypes',
   'antivirus:check': 'antivirusChecks',
   'backup_continuity:check': 'backupChecks',
+  'hardware_health:componentTypes': 'monitors.fields.hardware_health.componentTypeOptions',
+  'hardware_health:minHealth': 'monitors.fields.hardware_health.minHealthOptions',
+  'time_sync:findings': 'monitors.fields.time_sync.findingOptions',
 };
 
 interface FetchedScript {
@@ -34,6 +40,11 @@ export interface MonitorConditionFieldsProps {
   kind: MonitorKind;
   /** react-hook-form path prefix for the condition object, e.g. 'condition'. */
   name: string;
+  /**
+   * `data-testid` per field key, and for `collection-warning`. For a second copy
+   * of a kind's fields on the same page, whose ids would otherwise collide.
+   */
+  testIdFor?: (key: string) => string;
 }
 
 /**
@@ -41,18 +52,46 @@ export interface MonitorConditionFieldsProps {
  * one field-map-driven renderer instead of hand-coding 13 kind-specific forms.
  * Reads/writes through `useFormContext()`; the parent must wrap in `<FormProvider>`.
  */
-export default function MonitorConditionFields({ kind, name }: MonitorConditionFieldsProps) {
+export default function MonitorConditionFields(props: MonitorConditionFieldsProps) {
+  return props.kind === 'composite' ? (
+    <CompositeConditionFields name={props.name} />
+  ) : (
+    <ScalarConditionFields {...props} />
+  );
+}
+
+/** Everything MonitorConditionFields did before composite existed (#5289). */
+function ScalarConditionFields({ kind, name, testIdFor }: MonitorConditionFieldsProps) {
   const { t } = useTranslation('monitoring');
+  const fieldTestId = testIdFor ?? ((key: string) => `condition-field-${key}`);
   const { register, watch, setValue, formState: { errors } } = useFormContext<FieldValues>();
   const fields = MONITOR_KIND_FIELDS[kind];
 
-  const conditionErrors = (errors[name] as Record<string, { message?: string } | undefined> | undefined) ?? {};
+  // `name` is a dotted react-hook-form path (`condition`, or
+  // `condition.children.0.condition` for a composite child) — `formState.errors`
+  // is a NESTED object keyed by path segment, not a flat dotted string, so a
+  // plain `errors[name]` lookup only ever resolves for a single-segment name.
+  // Walk the path instead.
+  const conditionErrors =
+    (name.split('.').reduce<unknown>((node, part) => (node as Record<string, unknown> | undefined)?.[part], errors) as
+      | Record<string, { message?: string } | undefined>
+      | undefined) ?? {};
+  // Composite children share the SAME kind (e.g. two `cpu` children), which
+  // would otherwise render duplicate `id`/`htmlFor` pairs across sibling
+  // instances of this component — scope every element id by the full form
+  // path instead of the bare field key.
+  const fieldId = (key: string) => `${name.replaceAll('.', '-')}-${key}`;
 
   // One subscription for the whole condition object rather than one `watch()`
   // call per `showWhen` field — the field list (and therefore how many
   // fields would need watching) varies by `kind`, and calling a hook a
   // variable number of times per render breaks the rules of hooks.
   const conditionValues = (watch(name) as Record<string, unknown> | undefined) ?? {};
+  // #8174 — Information/Warning Application events reach the server only from
+  // the agent's provider allowlist; flag a rule that targets anything else
+  // before it is saved (the API returns the same check as `warnings`).
+  // The editor knows built-ins only; the save response also checks providers in scoped policies.
+  const collectionGap = kind === 'event_log' ? eventLogCollectionGap(conditionValues) : null;
   const isVisible = (field: KindField): boolean =>
     !field.showWhen || String(conditionValues[field.showWhen.key] ?? '') === field.showWhen.equals;
 
@@ -106,17 +145,54 @@ export default function MonitorConditionFields({ kind, name }: MonitorConditionF
         const label = t(/* i18n-dynamic */ field.labelKey) + (field.unit ? ` (${field.unit})` : '');
         const fieldError = conditionErrors[field.key]?.message;
 
+        if (field.kind === 'multiselect') {
+          const ns = SELECT_OPTION_NAMESPACE[`${kind}:${field.key}`] ?? SELECT_OPTION_NAMESPACE[field.key];
+          return (
+            <fieldset
+              key={field.key}
+              data-testid={`condition-field-${field.key}`}
+              className="space-y-2 sm:col-span-2"
+              aria-describedby={fieldError ? `condition-error-${field.key}` : undefined}
+            >
+              <legend className="text-xs font-medium text-muted-foreground">{label}</legend>
+              <div className="grid gap-2 sm:grid-cols-2">
+                {(field.options ?? []).map((option) => {
+                  const id = `condition-field-${field.key}-${option}`;
+                  return (
+                    <label key={option} htmlFor={id} className="flex items-center gap-2 text-sm">
+                      <input
+                        id={id}
+                        data-testid={id}
+                        type="checkbox"
+                        value={option}
+                        className="h-4 w-4 rounded border"
+                        {...register(path)}
+                      />
+                      {t(/* i18n-dynamic */ `${ns}.${option}`, { defaultValue: option })}
+                    </label>
+                  );
+                })}
+              </div>
+              {fieldError && (
+                <p id={`condition-error-${field.key}`} className="text-xs text-destructive">
+                  {fieldError}
+                </p>
+              )}
+            </fieldset>
+          );
+        }
+
         if (field.kind === 'boolean') {
           return (
             <div key={field.key} className="flex items-center gap-2 pt-5">
               <input
-                id={`condition-field-${field.key}`}
-                data-testid={`condition-field-${field.key}`}
+                id={fieldId(field.key)}
+                data-testid={fieldTestId(field.key)}
                 type="checkbox"
                 className="h-4 w-4 rounded border"
                 {...register(path)}
               />
-              <label className="text-xs font-medium text-muted-foreground" htmlFor={`condition-field-${field.key}`}>
+              <label className="text-xs font-medium text-muted-foreground" htmlFor={fieldId(field.key)}>
                 {label}
               </label>
             </div>
@@ -126,12 +202,12 @@ export default function MonitorConditionFields({ kind, name }: MonitorConditionF
         if (field.kind === 'script') {
           return (
             <div key={field.key} className="space-y-1">
-              <label className="text-xs font-medium text-muted-foreground" htmlFor={`condition-field-${field.key}`}>
+              <label className="text-xs font-medium text-muted-foreground" htmlFor={fieldId(field.key)}>
                 {label}
               </label>
               <select
-                id={`condition-field-${field.key}`}
-                data-testid={`condition-field-${field.key}`}
+                id={fieldId(field.key)}
+                data-testid={fieldTestId(field.key)}
                 className="h-9 w-full rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
                 {...register(path)}
                 // Explicit `value` (in addition to `register`'s own binding)
@@ -162,12 +238,12 @@ export default function MonitorConditionFields({ kind, name }: MonitorConditionF
         if (field.kind === 'operator') {
           return (
             <div key={field.key} className="space-y-1">
-              <label className="text-xs font-medium text-muted-foreground" htmlFor={`condition-field-${field.key}`}>
+              <label className="text-xs font-medium text-muted-foreground" htmlFor={fieldId(field.key)}>
                 {label}
               </label>
               <select
-                id={`condition-field-${field.key}`}
-                data-testid={`condition-field-${field.key}`}
+                id={fieldId(field.key)}
+                data-testid={fieldTestId(field.key)}
                 className="h-9 w-full rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
                 {...register(path)}
               >
@@ -184,12 +260,12 @@ export default function MonitorConditionFields({ kind, name }: MonitorConditionF
         if (field.kind === 'select') {
           return (
             <div key={field.key} className="space-y-1">
-              <label className="text-xs font-medium text-muted-foreground" htmlFor={`condition-field-${field.key}`}>
+              <label className="text-xs font-medium text-muted-foreground" htmlFor={fieldId(field.key)}>
                 {label}
               </label>
               <select
-                id={`condition-field-${field.key}`}
-                data-testid={`condition-field-${field.key}`}
+                id={fieldId(field.key)}
+                data-testid={fieldTestId(field.key)}
                 className="h-9 w-full rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
                 {...register(path)}
               >
@@ -209,12 +285,12 @@ export default function MonitorConditionFields({ kind, name }: MonitorConditionF
 
         return (
           <div key={field.key} className="space-y-1">
-            <label className="text-xs font-medium text-muted-foreground" htmlFor={`condition-field-${field.key}`}>
+            <label className="text-xs font-medium text-muted-foreground" htmlFor={fieldId(field.key)}>
               {label}
             </label>
             <input
-              id={`condition-field-${field.key}`}
-              data-testid={`condition-field-${field.key}`}
+              id={fieldId(field.key)}
+              data-testid={fieldTestId(field.key)}
               type={field.kind === 'number' ? 'number' : 'text'}
               min={field.min}
               max={field.max}
@@ -244,6 +320,22 @@ export default function MonitorConditionFields({ kind, name }: MonitorConditionF
           </div>
         );
       })}
+      {collectionGap && (
+        <p
+          className="text-xs text-amber-700 dark:text-amber-400 sm:col-span-2"
+          data-testid={testIdFor ? testIdFor('collection-warning') : 'event-log-collection-warning'}
+          role="note"
+        >
+          {collectionGap.reason === 'no_source'
+            ? t('fields.eventLogCollectionNoSource', { providers: collectionProviders })
+            : t('fields.eventLogCollectionSourceNotCollected', {
+                source: collectionGap.source,
+                providers: collectionProviders,
+              })}
+        </p>
+      )}
     </div>
   );
 }
+
+const collectionProviders = APPLICATION_INFO_EVENT_PROVIDERS.join(', ');

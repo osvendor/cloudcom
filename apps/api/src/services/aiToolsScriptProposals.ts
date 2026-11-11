@@ -15,10 +15,19 @@ import { aiScriptAuthoringEnabled } from '../config/env';
 import type { AiTool } from './aiTools';
 import { verifyDeviceAccess } from './aiTools';
 import type { AuthContext } from '../middleware/auth';
+import { dbAccessContextFromAuth } from '../middleware/auth';
+import { isFlowPrincipal } from '../middleware/principalKind';
 import {
-  createScriptProposal, enqueueScriptReview, getScriptProposalForPrincipal,
-  waitForReviewCompletion,
+  getCurrentDbAccessContext, hasDbAccessContext, runOutsideDbContext, withDbAccessContext,
+} from '../db';
+import { captureException } from './sentry';
+import { splitByOrg, type SplitByOrg } from './aiToolSplitByOrg';
+import {
+  createScriptProposal, enqueueScriptReview, getScriptProposalForPrincipal, selectLatestModelReview,
+  selectProposalExecutions, waitForReviewCompletion,
 } from './scriptProposals';
+import { projectFindings } from './scriptProposals/reviewFindings';
+import type { ScriptProposalReviewRow } from '../db/schema/scriptProposals';
 
 /** Spec §4.2: the inline wait before propose_script returns `pending`. */
 const INLINE_REVIEW_WAIT_MS = 45_000;
@@ -38,22 +47,69 @@ const INLINE_REVIEW_WAIT_MS = 45_000;
 async function resolveProposalOrgId(
   deviceIds: string[],
   auth: AuthContext,
-): Promise<{ orgId: string } | { error: string }> {
-  const orgIds = new Set<string>();
+): Promise<{ orgId: string } | { error: string } | SplitByOrg> {
+  // Insertion-ordered: the first device's org is listed first.
+  const byOrg = new Map<string, string[]>();
   for (const deviceId of deviceIds) {
     const access = await verifyDeviceAccess(deviceId, auth);
     if ('error' in access) return { error: access.error };
-    orgIds.add(access.device.orgId);
+    const group = byOrg.get(access.device.orgId);
+    if (group) group.push(deviceId); else byOrg.set(access.device.orgId, [deviceId]);
   }
-  if (orgIds.size > 1) {
-    return { error: 'invalid_input: all target devices must belong to one organization' };
+  if (byOrg.size > 1) {
+    return splitByOrg(byOrg, {
+      tool: 'propose_script',
+      hint: 'A proposal belongs to one organization. Call propose_script once per group.',
+    });
   }
   // Fall back to the caller's own org only if a device somehow resolved
   // without one — the page-context org, exactly as routes/ai.ts resolves it.
-  const [orgId] = [...orgIds];
+  const [orgId] = [...byOrg.keys()];
   const resolved = orgId ?? auth.orgId;
   if (!resolved) return { error: 'invalid_input: could not resolve the organization for these devices' };
   return { orgId: resolved };
+}
+
+/**
+ * Run `fn` in a transaction of its OWN that has committed by the time this
+ * resolves (#7128), under the CALLER's access context — never system scope,
+ * never the bare pool.
+ *
+ * The context is read BEFORE `runOutsideDbContext`, which clears both
+ * context stores: read inside, it would always be empty. With a context held
+ * (the MCP route's request transaction) the fresh transaction reuses it
+ * verbatim, so the write sees exactly the RLS the request does; with none
+ * (the SDK wrapper opens none for a self-managed tool) it is built from
+ * `auth` by the same canonical builder that wrapper uses.
+ *
+ * Same commit-before-hand-off shape as `aiToolsFilesystem.ts`'s scan
+ * registration. With a caller transaction held this briefly takes a second
+ * pooled connection; it never waits on anything while it does.
+ */
+function inOwnCommittedContext<T>(auth: AuthContext, fn: () => Promise<T>): Promise<T> {
+  const context = getCurrentDbAccessContext() ?? dbAccessContextFromAuth(auth);
+  return runOutsideDbContext(() => withDbAccessContext(context, fn));
+}
+
+/**
+ * The reviewer's outcome as the model reads it (#10399). `verdict` is the
+ * reviewer's recommendation in one word (`approve` | `changes` | `reject`,
+ * null when the review did not complete), so the model reports what the
+ * reviewer actually said instead of inferring "it passed" from
+ * `status: 'completed'`. Advisory: a human still approves every run.
+ */
+function reviewForModel(review: ScriptProposalReviewRow) {
+  const stored = (review.verdict ?? {}) as { findings?: unknown };
+  return {
+    status: review.status,
+    verdict: review.recommendedAction ?? null,
+    summary: review.summary ?? null,
+    riskTier: review.riskTier ?? null,
+    goalMatch: review.goalMatch ?? null,
+    reversible: review.reversible ?? null,
+    verificationAdequate: review.verificationAdequate ?? null,
+    findings: projectFindings(stored.findings),
+  };
 }
 
 function disabled(): string {
@@ -71,6 +127,10 @@ export function registerScriptProposalTools(aiTools: Map<string, AiTool>): void 
     // before the handler runs, so an author cannot propose against a device
     // they cannot see.
     deviceArgs: ['deviceIds'],
+    // The handler hands the proposal to the review worker and then waits for
+    // its verdict, so it must commit first and must not hold a transaction
+    // across the wait (#7128). See `AiTool.selfManagedDbContext`.
+    selfManagedDbContext: true,
     definition: {
       name: 'propose_script',
       description:
@@ -94,6 +154,9 @@ export function registerScriptProposalTools(aiTools: Map<string, AiTool>): void 
     },
     handler: async (input, auth) => {
       if (!aiScriptAuthoringEnabled()) return disabled();
+      // Tool catalog W04 (#5219): a proposal's author is an agent run or a chat
+      // session; a flow is neither, and its run id is not an agent run id.
+      if (isFlowPrincipal(auth)) return JSON.stringify({ error: 'flow_principal_unsupported', action: 'propose_script' });
       const parsed = proposeScriptInputSchema.safeParse(input);
       if (!parsed.success) {
         return JSON.stringify({ error: `invalid_input: ${parsed.error.issues.map((i) => i.message).join('; ')}` });
@@ -108,11 +171,25 @@ export function registerScriptProposalTools(aiTools: Map<string, AiTool>): void 
         ? { kind: 'agent_run' as const, agentRunId: auth.principal.runId }
         : { kind: 'chat_session' as const, sessionId: null };
 
-      const resolvedOrg = await resolveProposalOrgId(parsed.data.deviceIds, auth);
-      if ('error' in resolvedOrg) return JSON.stringify({ error: resolvedOrg.error });
+      // Read BEFORE anything below escapes it. True only when the CALLER holds
+      // a transaction this handler cannot release — the MCP route's auth
+      // middleware wraps the whole request in one. The SDK wrapper (chat and
+      // agent runs) opens none for this tool.
+      const callerHoldsTransaction = hasDbAccessContext();
 
-      const { proposal, scan } = await createScriptProposal(
-        auth, parsed.data, author, resolvedOrg.orgId);
+      // Resolve the org and insert in ONE transaction that has COMMITTED before
+      // the review is enqueued (#7128). The worker loads the proposal under its
+      // own system context about 2 ms after the enqueue; an uncommitted row is
+      // invisible to it.
+      const created = await inOwnCommittedContext(auth, async () => {
+        const resolvedOrg = await resolveProposalOrgId(parsed.data.deviceIds, auth);
+        if ('error' in resolvedOrg) return resolvedOrg;
+        return createScriptProposal(auth, parsed.data, author, resolvedOrg.orgId);
+      });
+      if ('error' in created) {
+        return JSON.stringify(created.error === 'split_by_org' ? created : { error: created.error });
+      }
+      const { proposal, scan } = created;
       const staticScan = {
         basicHits: scan.basicHits, strictHits: scan.strictHits, touchClasses: scan.touchClasses,
       };
@@ -126,23 +203,49 @@ export function registerScriptProposalTools(aiTools: Map<string, AiTool>): void 
         });
       }
 
-      await enqueueScriptReview({ proposalId: proposal.id, orgId: proposal.orgId, attempt: 1 });
-      const review = await waitForReviewCompletion(proposal.id, INLINE_REVIEW_WAIT_MS);
+      try {
+        await enqueueScriptReview({ proposalId: proposal.id, orgId: proposal.orgId, attempt: 1 });
+      } catch (err) {
+        // The proposal has already committed, so it cannot be rolled back with
+        // the tool call any more. It is inert (nothing runs without a reviewed
+        // proposal and a human approval) and expires on its own TTL. Say so
+        // plainly rather than surfacing a raw queue error, so the model does
+        // not report a proposal that will never be reviewed as `pending`.
+        console.error('[propose_script] failed to enqueue the script review', {
+          proposalId: proposal.id, orgId: proposal.orgId, error: err,
+        });
+        captureException(err instanceof Error ? err : new Error(String(err)), undefined, {
+          service: 'propose_script', orgId: proposal.orgId,
+        });
+        return JSON.stringify({
+          error: 'review_unavailable: the proposal was saved but its independent review could not be queued, so it cannot be run. Try propose_script again shortly.',
+          proposalId: proposal.id, status: proposal.status, staticScan,
+        });
+      }
+
+      // Under a caller-held transaction, polling would pin that transaction's
+      // pooled connection idle-in-transaction for the whole wait (#1105): answer
+      // `pending` now; the review still runs and get_script_proposal reads it.
+      const review = callerHoldsTransaction
+        ? null
+        : await waitForReviewCompletion(proposal.id, INLINE_REVIEW_WAIT_MS);
 
       return JSON.stringify({
         proposalId: proposal.id,
         status: review?.status === 'completed' ? 'reviewed' : proposal.status,
         staticScan,
         review: review
-          ? {
-            status: review.status, riskTier: review.riskTier, summary: review.summary,
-            goalMatch: review.goalMatch, reversible: review.reversible,
-            verificationAdequate: review.verificationAdequate,
-            recommendedAction: review.recommendedAction,
-          }
-          // The reviewer worker lands in W02, so this is the normal answer in
-          // W01b. It means "not yet", never "failed".
-          : { status: 'pending' },
+          ? reviewForModel(review)
+          // The review is queued but had not finished inside the inline wait
+          // (or the wait was skipped under a caller-held transaction). It means
+          // "not yet", never "failed". `nextStep` spells out the poll-and-retry
+          // loop explicitly (#7129) so the model does not treat `run_script`'s
+          // resulting `proposal_review_pending` deny as a dead end.
+          : {
+            status: 'pending',
+            nextStep: 'Review is still in progress. Poll get_script_proposal with this proposalId until '
+              + 'its status is no longer pending, then call run_script.',
+          },
       });
     },
   });
@@ -154,7 +257,7 @@ export function registerScriptProposalTools(aiTools: Map<string, AiTool>): void 
     definition: {
       name: 'get_script_proposal',
       description:
-        'Read a script proposal: its status, the static scan, the independent review verdict and findings, the human decision, any executions, and the verification result.',
+        'Read a script proposal: its status, the static scan, the independent review verdict and findings, the human decision, its runs (executionId per device, for get_script_execution), the verification result, and approvalsPath, the page where the user can review it or save it to the library.',
       input_schema: {
         type: 'object' as const,
         properties: { proposalId: { type: 'string', description: 'Proposal UUID' } },
@@ -165,6 +268,41 @@ export function registerScriptProposalTools(aiTools: Map<string, AiTool>): void 
       if (!aiScriptAuthoringEnabled()) return disabled();
       const proposal = await getScriptProposalForPrincipal(auth, String(input.proposalId));
       if (!proposal) return JSON.stringify({ error: 'not_found: no such proposal in this organization' });
+      // #10399: the newest model review, read in the same caller context as
+      // the runs below. Without it the model saw only `status: 'reviewed'`
+      // and told the user the review "passed" a proposal whose reviewer had
+      // asked for changes. No row: still queued (`proposed`), never requested
+      // (a BASIC scan hit stops before review), failed before writing one
+      // (`review_failed`), or otherwise missing — never a verdict to infer.
+      const latestReview = await selectLatestModelReview(proposal.id);
+      const review = latestReview
+        ? reviewForModel(latestReview)
+        : {
+          status: proposal.status === 'proposed' ? 'pending'
+            : proposal.status === 'scan_rejected' ? 'not_requested'
+              : proposal.status === 'review_failed' ? 'failed'
+                : 'unavailable',
+          verdict: null,
+        };
+      // #7918: a run that outlived its run_script call still completed on the
+      // device. Its execution id is the only way the model can read that
+      // output (get_script_execution), so every run is echoed — narrowed to
+      // the devices this caller may see, like `targetDeviceIds` below and the
+      // web detail read (scriptProposals/detail.ts). Read in the caller's own
+      // per-call context (RLS-scoped), never an escape to system scope, which
+      // would hold a second pooled connection under the first.
+      const visible = proposal.scopedDeviceIds === null ? null : new Set(proposal.scopedDeviceIds);
+      const executions = (await selectProposalExecutions(proposal.id))
+        .filter((e) => visible === null || visible.has(e.deviceId))
+        .map((e) => ({
+          executionId: e.id,
+          deviceId: e.deviceId,
+          hostname: e.hostname ?? null,
+          status: e.status,
+          exitCode: e.exitCode ?? null,
+          startedAt: e.startedAt?.toISOString() ?? null,
+          completedAt: e.completedAt?.toISOString() ?? null,
+        }));
       return JSON.stringify({
         proposalId: proposal.id,
         status: proposal.status,
@@ -179,12 +317,20 @@ export function registerScriptProposalTools(aiTools: Map<string, AiTool>): void 
           basicHits: proposal.basicHits, strictHits: proposal.strictHits,
           touchClasses: proposal.touchClasses, scannerVersion: proposal.scannerVersion,
         },
+        review,
         decision: {
           decidedBy: proposal.decidedBy, decidedAt: proposal.decidedAt, note: proposal.decisionNote,
         },
         intentId: proposal.intentId,
         verification: { verifiedAt: proposal.verifiedAt, result: proposal.verificationResult },
         expiresAt: proposal.expiresAt,
+        executions,
+        ...(executions.length > 0
+          ? { nextStep: 'Read a run\'s output and exit code with get_script_execution { executionId }. Do not run_script this proposal again: a proposal runs once.' }
+          : {}),
+        // The human-facing page for this proposal (review, run results, and
+        // "Save to library" once verified). Give it to the user as a link.
+        approvalsPath: `/approvals#proposal-${proposal.id}`,
       });
     },
   });

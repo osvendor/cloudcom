@@ -123,9 +123,16 @@ export type TerminalClassification = 'increment' | 'reset' | 'neutral';
  * Typed `ReadonlySet<AiAgentRunProfile>` so a misspelled member is a compile
  * error. Membership is still a DECISION, not a derivation — see the "fifth
  * profile" note on `classifyTerminal`.
+ *
+ * `device_troubleshooting` (#11084) is deliberately absent: the run works live
+ * on a device, so a clean finish is real evidence that this agent is healthy
+ * and resets its streak. It executes nothing itself (forced shadow), so its
+ * verdict stays `no_action` and finding a problem never increments.
  */
 const STREAK_NEUTRAL_PROFILES: ReadonlySet<AiAgentRunProfile> = new Set([
   'verdict', 'sweep', 'narrative', 'triage', 'design',
+  // W2: a research run returns suggestions a human must accept; it executes nothing.
+  'remediation_research',
   // AI patch agent (W01): a patch run returns a plan — advice a human must
   // accept — built from a system-assembled evidence bundle, and executes
   // nothing. Its clean completion says nothing about whether the org's
@@ -141,6 +148,11 @@ const STREAK_NEUTRAL_PROFILES: ReadonlySet<AiAgentRunProfile> = new Set([
   // increment the streak. Added BY HAND, same as `patch` above — the
   // per-profile row in agentCircuit.test.ts is the guard.
   'analysis',
+  // Wisp W05: an assessment that reports `needs_attention` is doing its job
+  // (raising concerns), not failing, and it executes nothing itself
+  // (`maxActionsPerRun: 0`; every write is an outcome tool → intent). Added
+  // BY HAND; assessmentProfile.test.ts's classifyTerminal case is the guard.
+  'assessment',
 ]);
 
 /**
@@ -220,6 +232,9 @@ export function classifyTerminal(
   runVerdict: AgentRunVerdict | null,
   profile: AiAgentRunProfile = 'full',
 ): TerminalClassification {
+  // AI model registry W03: an admin's model choice / a provider refusal is not
+  // an agent fault, so a `blocked` run never moves the streak either way.
+  if (to === 'blocked') return 'neutral';
   if (to === 'completed') {
     if (STREAK_NEUTRAL_PROFILES.has(profile)) return 'neutral';
     return runVerdict === 'needs_attention' ? 'increment' : 'reset';
@@ -534,7 +549,7 @@ export async function recordRunTerminal(
               `${justOpened.agentName} hit ${justOpened.consecutiveFailures} consecutive failed/needs-attention `
               + `runs (threshold ${justOpened.threshold}) and has been paused for this organization. `
               + 'A human must reset it before it runs again.',
-            link: `/ai-agents/${run.agentId}`,
+            link: `/ai-agents/runs#agent=${run.agentId}`,
             priority: 'high',
             metadata: {
               agentId: run.agentId,

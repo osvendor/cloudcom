@@ -7,11 +7,42 @@ const dbMocks = vi.hoisted(() => ({
   updateMock: vi.fn(),
   writeRouteAuditMock: vi.fn(),
   generateMock: vi.fn(),
+  requestResearchMock: vi.fn(),
+  sourceDeviceMock: vi.fn(),
+  researchStatusMock: vi.fn(),
+  lookupMock: vi.fn(),
   emitFeedbackMock: vi.fn(),
   executeScriptOnDevicesMock: vi.fn(),
+  dispatchBuiltinMock: vi.fn(),
+  recordBuiltinMock: vi.fn(),
+  recordOutcomeMock: vi.fn(async () => ({ state: 'pending', stateReason: null, humanVote: null })),
+  recordVoteMock: vi.fn(),
+  createDoneMock: vi.fn(),
+  loadActiveInstructionsMock: vi.fn(),
+  loadSummariesMock: vi.fn(async () => new Map()),
+  // #7109 — models withAuthDbAccessContext as a context that COMMITS when its
+  // callback returns; `depth` says whether a DB call ran inside one.
+  // `ids` is the stack of open context identities (outermost first): `depth`
+  // alone cannot tell the SAME context from a sibling one (#7280).
+  dbContextState: { depth: 0, events: [] as string[], ids: [] as number[], committed: [] as number[], nextId: 0 },
 }));
 
-let currentPermissions: { allowedSiteIds?: string[] } | undefined;
+const withAuthDbAccessContextMock = vi.hoisted(() => vi.fn(async (_auth: unknown, fn: () => Promise<unknown>) => {
+  dbMocks.dbContextState.depth += 1;
+  const id = ++dbMocks.dbContextState.nextId;
+  dbMocks.dbContextState.ids.push(id);
+  try {
+    return await fn();
+  } finally {
+    dbMocks.dbContextState.depth -= 1;
+    dbMocks.dbContextState.ids.pop();
+    dbMocks.dbContextState.events.push('commit');
+    dbMocks.dbContextState.committed.push(id);
+  }
+}));
+
+let authOverride: Record<string, unknown> | undefined;
+let currentPermissions: { allowedSiteIds?: string[]; permissions?: Array<{ resource: string; action: string }> } | undefined;
 
 vi.mock('../db', () => ({
   db: {
@@ -19,6 +50,7 @@ vi.mock('../db', () => ({
     insert: dbMocks.insertMock,
     update: dbMocks.updateMock,
   },
+  withDbTransaction: async (fn: () => Promise<unknown>) => fn(),
 }));
 
 vi.mock('../db/schema', () => ({
@@ -70,22 +102,44 @@ vi.mock('../middleware/auth', () => ({
       accessibleOrgIds: ['11111111-1111-4111-8111-111111111111'],
       orgCondition: () => undefined,
       canAccessOrg: (orgId: string) => orgId === '11111111-1111-4111-8111-111111111111',
+      ...authOverride,
     });
-    c.set('permissions', currentPermissions ?? {});
+    c.set('permissions', currentPermissions ?? { permissions: [] });
     return next();
   }),
   requirePermission: vi.fn(() => async (_c: any, next: any) => next()),
   requireScope: vi.fn(() => async (_c: any, next: any) => next()),
   requireMfa: vi.fn(() => async (_c: any, next: any) => next()),
+  withAuthDbAccessContext: withAuthDbAccessContextMock,
 }));
 
 vi.mock('../services/auditEvents', () => ({
   writeRouteAudit: dbMocks.writeRouteAuditMock,
 }));
 
+const { RemediationSourceDeviceErrorMock } = vi.hoisted(() => ({
+  RemediationSourceDeviceErrorMock: class RemediationSourceDeviceError extends Error {},
+}));
 vi.mock('../services/remediationSuggestions', () => ({
   generateRemediationSuggestions: dbMocks.generateMock,
+  RemediationSourceDeviceError: RemediationSourceDeviceErrorMock,
 }));
+
+vi.mock('../services/fixMemory/research', () => ({
+  requestResearch: dbMocks.requestResearchMock,
+  researchStatusForSource: dbMocks.researchStatusMock,
+  researchSourceDeviceId: dbMocks.sourceDeviceMock,
+}));
+vi.mock('../services/fixMemory/instructions', () => ({ loadActiveInstructions: dbMocks.loadActiveInstructionsMock }));
+vi.mock('../services/fixMemory/lookup', () => ({ lookupFixes: dbMocks.lookupMock }));
+vi.mock('../services/fixMemory/signatureLoader', () => ({
+  signatureForSource: vi.fn(async () => ({ signature: { broad: false } })),
+  sourceRefFor: vi.fn(() => ({ kind: 'alert', alertId: 'a-1' })),
+}));
+vi.mock('../services/fixMemory/catalog', () => ({ resolveOrgPartnerId: vi.fn(async () => 'p-1') }));
+
+const captureExceptionMock = vi.hoisted(() => vi.fn());
+vi.mock('../services/sentry', () => ({ captureException: captureExceptionMock }));
 
 vi.mock('../services/mlFeedbackEmitters', () => ({
   emitRemediationSuggestionFeedback: dbMocks.emitFeedbackMock,
@@ -93,6 +147,18 @@ vi.mock('../services/mlFeedbackEmitters', () => ({
 
 vi.mock('../services/scriptExecution', () => ({
   executeScriptOnDevices: dbMocks.executeScriptOnDevicesMock,
+}));
+
+vi.mock('../services/fixMemory/builtinActions', () => ({
+  dispatchBuiltinAction: dbMocks.dispatchBuiltinMock,
+  clampBuiltinRisk: (_a: string, r: string) => r,
+}));
+vi.mock('../services/fixMemory/outcomeRecorder', () => ({
+  recordBuiltinOutcome: dbMocks.recordBuiltinMock,
+  recordExecutionOutcome: dbMocks.recordOutcomeMock,
+  recordOutcomeVote: dbMocks.recordVoteMock,
+  createManualStepsOutcome: dbMocks.createDoneMock,
+  loadOutcomeSummaries: dbMocks.loadSummariesMock,
 }));
 
 import { remediationSuggestionRoutes, resolvePatchedRiskTier } from './remediationSuggestions';
@@ -171,6 +237,26 @@ function mockSelectOnce(result: unknown) {
   dbMocks.selectMock.mockReturnValueOnce(createSelectChain(result));
 }
 
+const scriptUpdateCalls: Array<Record<string, unknown>> = [];
+// #7276: the script path's atomic claim (and, on a refused dispatch, its release).
+function mockScriptClaim(claimed = true) {
+  dbMocks.updateMock.mockImplementationOnce(() => ({
+    set: vi.fn((set: Record<string, unknown>) => {
+      scriptUpdateCalls.push(set);
+      return { where: vi.fn().mockReturnValue({ returning: vi.fn().mockResolvedValue(claimed ? [{ id: baseSuggestion.id }] : []) }) };
+    }),
+  }));
+}
+// Release is awaited without .returning().
+function mockScriptRelease() {
+  dbMocks.updateMock.mockImplementationOnce(() => ({
+    set: vi.fn((set: Record<string, unknown>) => {
+      scriptUpdateCalls.push(set);
+      return { where: vi.fn().mockResolvedValue(undefined) };
+    }),
+  }));
+}
+
 function mockSuggestionLoad(suggestion: Record<string, unknown>) {
   dbMocks.selectMock.mockReturnValueOnce({
     from: vi.fn().mockReturnValue({
@@ -218,12 +304,39 @@ function mockInsertValuesOnly() {
   return { values };
 }
 
+function admittedForRace() {
+  return {
+    ok: true,
+    admission: {
+      requestId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      status: 'queued',
+      targets: [{
+        requestedDeviceId: baseSuggestion.deviceId,
+        admission: 'admitted',
+        executionId: '66666666-6666-4666-8666-666666666666',
+        commandId: '77777777-7777-4777-8777-777777777777',
+      }],
+    },
+    script: { id: baseSuggestion.scriptId, name: 'Disk Cleanup' },
+    ignoredParameters: [],
+    triggerType: 'manual',
+    runAs: 'system',
+    auditOrgId: baseSuggestion.orgId,
+  };
+}
+
 describe('remediation suggestion routes', () => {
   let app: Hono;
 
   beforeEach(() => {
     vi.clearAllMocks();
     currentPermissions = undefined;
+    scriptUpdateCalls.length = 0;
+    dbMocks.dbContextState.depth = 0;
+    dbMocks.dbContextState.events = [];
+    dbMocks.dbContextState.ids = [];
+    dbMocks.dbContextState.committed = [];
+    dbMocks.dbContextState.nextId = 0;
     app = new Hono();
     app.route('/remediation-suggestions', remediationSuggestionRoutes);
   });
@@ -248,12 +361,32 @@ describe('remediation suggestion routes', () => {
       sourceType: 'anomaly',
       sourceId: baseSuggestion.sourceId,
       actorUserId: 'user-1',
-    }));
+    }), { runInDbContext: expect.any(Function) });
     const body = await res.json();
     expect(body.data[0].title).toBe('Disk Cleanup');
     expect(dbMocks.writeRouteAuditMock).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       action: 'ml.remediation_suggestions.generate',
     }));
+  });
+
+  it('Generate returns each suggestion hydrated with its fix outcome, like the list (I4)', async () => {
+    dbMocks.generateMock.mockResolvedValueOnce({
+      orgId: baseSuggestion.orgId, sourceType: 'anomaly', sourceId: baseSuggestion.sourceId, skipped: false,
+      suggestions: [baseSuggestion],
+    });
+    const outcome = { state: 'holding', stateReason: 'condition_cleared', humanVote: null };
+    dbMocks.loadSummariesMock.mockResolvedValueOnce(new Map([[baseSuggestion.id, outcome]]) as never);
+
+    const res = await app.request('/remediation-suggestions/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({ sourceType: 'anomaly', sourceId: baseSuggestion.sourceId, limit: 3 }),
+    });
+
+    expect(res.status).toBe(201);
+    expect(dbMocks.loadSummariesMock).toHaveBeenCalledWith([baseSuggestion.id]);
+    const body = await res.json();
+    expect(body.data[0].outcome).toEqual(outcome);
   });
 
   it('updates suggestion status and emits feedback', async () => {
@@ -283,6 +416,30 @@ describe('remediation suggestion routes', () => {
     }));
     const body = await res.json();
     expect(body.data.status).toBe('accepted');
+  });
+
+  it('carries builtinAction in the feedback metadata when a built-in suggestion is accepted', async () => {
+    const builtin = { ...baseSuggestion, targetType: 'builtin_action', builtinAction: 'restart_service', scriptId: null };
+    mockSuggestionLoad(builtin);
+    dbMocks.updateMock.mockReturnValueOnce({
+      set: vi.fn().mockReturnValue({
+        where: vi.fn().mockReturnValue({
+          returning: vi.fn().mockResolvedValue([{ ...builtin, status: 'accepted', acceptedBy: 'user-1', acceptedAt: new Date('2026-06-18T12:05:00.000Z') }]),
+        }),
+      }),
+    });
+
+    const res = await app.request(`/remediation-suggestions/${baseSuggestion.id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({ status: 'accepted' }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(dbMocks.emitFeedbackMock).toHaveBeenCalledWith(expect.objectContaining({
+      eventType: 'suggestion.accepted',
+      metadata: expect.objectContaining({ targetType: 'builtin_action', builtinAction: 'restart_service' }),
+    }));
   });
 
   it('creates and links a pending elevation request for accepted high-risk script suggestions', async () => {
@@ -555,10 +712,291 @@ describe('remediation suggestion routes', () => {
     expect(dbMocks.emitFeedbackMock).not.toHaveBeenCalled();
   });
 
+  describe('built-in execute (W2 Task 15)', () => {
+    const builtinRow = {
+      ...baseSuggestion, targetType: 'builtin_action', builtinAction: 'restart_service', scriptId: null,
+      status: 'accepted', riskTier: 'medium', parameters: { serviceName: 'Spooler' },
+    };
+    const run = () => app.request(`/remediation-suggestions/${builtinRow.id}/execute`, { method: 'POST', headers: { Authorization: 'Bearer token' } });
+    const withDevicesExecute = () => { currentPermissions = { permissions: [{ resource: 'devices', action: 'execute' }] }; };
+    const deviceRow = { id: builtinRow.deviceId, orgId: builtinRow.orgId, siteId: '99999999-9999-4999-8999-999999999999', osType: 'windows', agentVersion: '1.0.0', status: 'online' };
+    const phase3Row = { ...builtinRow, status: 'executed', executedBy: 'user-1', executedAt: new Date('2026-06-18T12:10:00.000Z') };
+    // A5: the gate's conditional claim (accepted/edited -> executed) and phase 3's idempotent update.
+    const updateCalls: Array<{ depth: number; ctx: number | null; set: Record<string, unknown> }> = [];
+    const currentCtx = () => dbMocks.dbContextState.ids.at(-1) ?? null;
+    const mockUpdateReturning = (rows: unknown[]) => {
+      dbMocks.updateMock.mockImplementationOnce(() => ({
+        set: vi.fn((set: Record<string, unknown>) => {
+          updateCalls.push({ depth: dbMocks.dbContextState.depth, ctx: currentCtx(), set });
+          return { where: vi.fn().mockReturnValue({ returning: vi.fn().mockResolvedValue(rows) }) };
+        }),
+      }));
+    };
+    const mockClaim = (claimed = true) => mockUpdateReturning(claimed ? [phase3Row] : []);
+    const mockPhase3 = (depths?: Record<string, number>) => {
+      dbMocks.updateMock.mockImplementationOnce(() => {
+        if (depths) depths.update = dbMocks.dbContextState.depth;
+        return { set: vi.fn((set: Record<string, unknown>) => {
+          updateCalls.push({ depth: dbMocks.dbContextState.depth, ctx: currentCtx(), set });
+          return { where: vi.fn().mockReturnValue({ returning: vi.fn().mockResolvedValue([phase3Row]) }) };
+        }) };
+      });
+    };
+    beforeEach(() => { updateCalls.length = 0; });
+
+    it('needs devices:execute on top of scripts:execute', async () => {
+      mockSuggestionLoad(builtinRow);
+      currentPermissions = { permissions: [{ resource: 'scripts', action: 'execute' }] };
+      const res = await run();
+      expect(res.status).toBe(403);
+      expect(dbMocks.dispatchBuiltinMock).not.toHaveBeenCalled();
+    });
+
+    it('claims the row in the gate context, dispatches outside any db context, then records the attempt inside one', async () => {
+      withDevicesExecute();
+      const depths: Record<string, number> = {};
+      mockSuggestionLoad(builtinRow);
+      mockDeviceLoad(deviceRow);
+      mockClaim();
+      dbMocks.dispatchBuiltinMock.mockImplementationOnce(async () => {
+        depths.dispatch = dbMocks.dbContextState.depth;
+        return { ok: true, commandId: 'cmd-1', cleanupRunId: null };
+      });
+      mockPhase3(depths);
+      dbMocks.recordBuiltinMock.mockImplementationOnce(async () => {
+        depths.record = dbMocks.dbContextState.depth;
+        return { state: 'pending', stateReason: null, humanVote: null };
+      });
+      const res = await run();
+      expect(res.status).toBe(201);
+      const body = await res.json();
+      expect(body.data).toMatchObject({ status: 'executed', builtinAction: 'restart_service', outcome: { state: 'pending' } });
+      expect(body.execution).toEqual({ commandId: 'cmd-1', cleanupRunId: null });
+      expect(dbMocks.dispatchBuiltinMock).toHaveBeenCalledWith({
+        action: 'restart_service', parameters: { serviceName: 'Spooler' }, device: expect.objectContaining({ id: builtinRow.deviceId, osType: 'windows' }), userId: 'user-1',
+      });
+      expect(dbMocks.recordBuiltinMock).toHaveBeenCalledWith({
+        suggestion: expect.objectContaining({ id: builtinRow.id }), deviceId: builtinRow.deviceId, commandId: 'cmd-1', cleanupRunId: null,
+      });
+      expect(dbMocks.emitFeedbackMock).toHaveBeenCalledWith(expect.objectContaining({ dedupeKey: 'executed:command:cmd-1' }));
+      // The claim commits in the gate context BEFORE dispatch; nothing is held across dispatch; link + record share phase 3's.
+      expect(updateCalls[0]).toMatchObject({ depth: 1, set: expect.objectContaining({ status: 'executed', executedBy: 'user-1' }) });
+      expect(dbMocks.dbContextState.events[0]).toBe('commit');
+      expect(depths.dispatch).toBe(0);
+      expect(depths.update).toBeGreaterThan(0);
+      expect(depths.record).toBeGreaterThan(0);
+    });
+
+    it('#7280: the claim and phase 3 are separate committed contexts; dispatch runs outside any; link + record share phase 3\'s', async () => {
+      withDevicesExecute();
+      const seen: Record<string, number | null> = {};
+      mockSuggestionLoad(builtinRow);
+      mockDeviceLoad(deviceRow);
+      mockClaim();
+      dbMocks.dispatchBuiltinMock.mockImplementationOnce(async () => {
+        seen.dispatch = currentCtx();
+        seen.committedBeforeDispatch = dbMocks.dbContextState.committed.at(0) ?? null;
+        return { ok: true, commandId: 'cmd-1', cleanupRunId: null };
+      });
+      mockPhase3();
+      dbMocks.recordBuiltinMock.mockImplementationOnce(async () => {
+        seen.record = currentCtx();
+        return { state: 'pending', stateReason: null, humanVote: null };
+      });
+      const res = await run();
+      expect(res.status).toBe(201);
+      const [claim, link] = updateCalls;
+      expect(claim!.ctx).not.toBeNull();
+      expect(link!.ctx).not.toBeNull();
+      expect(seen.dispatch).toBeNull(); // outside every context
+      expect(seen.record).not.toBeNull();
+      // Phase 3 is a NEW context, not a continuation of the gate's: the gate committed first.
+      expect(link!.ctx).not.toBe(claim!.ctx);
+      expect(seen.record).toBe(link!.ctx);
+      expect(seen.record).not.toBe(claim!.ctx);
+      // The CLAIM's own context committed before dispatch ran.
+      expect(seen.committedBeforeDispatch).toBe(claim!.ctx);
+    });
+
+    it('A5: a claim that matches no row (a concurrent /execute won) is a 409 and nothing is dispatched', async () => {
+      withDevicesExecute();
+      mockSuggestionLoad(builtinRow);
+      mockDeviceLoad(deviceRow);
+      mockClaim(false);
+      const res = await run();
+      expect(res.status).toBe(409);
+      expect(await res.json()).toMatchObject({ code: 'already_dispatching' });
+      expect(dbMocks.dispatchBuiltinMock).not.toHaveBeenCalled();
+    });
+
+    it('surfaces a dispatch refusal with its status and code, releases the claim, and records nothing', async () => {
+      withDevicesExecute();
+      mockSuggestionLoad(builtinRow);
+      mockDeviceLoad(deviceRow);
+      mockClaim();
+      dbMocks.dispatchBuiltinMock.mockResolvedValueOnce({ ok: false, status: 409, error: 'process_ambiguous' });
+      mockUpdateReturning([builtinRow]);
+      const res = await run();
+      expect(res.status).toBe(409);
+      expect(await res.json()).toEqual({ error: 'process_ambiguous' });
+      expect(updateCalls).toHaveLength(2);
+      expect(updateCalls[1]).toMatchObject({ depth: 1, set: expect.objectContaining({ status: 'accepted', executedBy: null, executedAt: null }) });
+      expect(dbMocks.recordBuiltinMock).not.toHaveBeenCalled();
+      expect(dbMocks.emitFeedbackMock).not.toHaveBeenCalled();
+    });
+
+    it('A5: dispatch ok but phase 3 throws -> 202 dispatched/not recorded with the commandId, captured, claim kept', async () => {
+      withDevicesExecute();
+      mockSuggestionLoad(builtinRow);
+      mockDeviceLoad(deviceRow);
+      mockClaim();
+      dbMocks.dispatchBuiltinMock.mockResolvedValueOnce({ ok: true, commandId: 'cmd-7', cleanupRunId: null });
+      mockPhase3();
+      dbMocks.emitFeedbackMock.mockRejectedValueOnce(new Error('feedback down'));
+      const err = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+      const res = await run();
+      expect(res.status).toBe(202);
+      expect(await res.json()).toMatchObject({ dispatched: true, recorded: false, commandId: 'cmd-7' });
+      expect(captureExceptionMock).toHaveBeenCalledWith(expect.any(Error), undefined, expect.objectContaining({ suggestionId: builtinRow.id, commandId: 'cmd-7' }));
+      // No release: only the claim + the failed phase-3 update ran.
+      expect(updateCalls.map((c) => c.set.status)).toEqual(['executed', undefined]);
+      err.mockRestore();
+    });
+
+    it('a high-risk built-in (reboot) still requires an approved elevation', async () => {
+      withDevicesExecute();
+      mockSuggestionLoad({ ...builtinRow, builtinAction: 'reboot', parameters: {}, riskTier: 'high', elevationRequestId: null });
+      const res = await run();
+      expect(res.status).toBe(403);
+      expect(dbMocks.dispatchBuiltinMock).not.toHaveBeenCalled();
+    });
+
+    it('B3: a PATCH that edits a built-in to an out-of-allowlist shape cannot be executed: 400, no claim, no dispatch', async () => {
+      withDevicesExecute();
+      // What a PATCH can leave behind (parameters is a free-form record there).
+      mockSuggestionLoad({ ...builtinRow, parameters: { serviceName: 42, extra: 'x' } });
+      const res = await run();
+      expect(res.status).toBe(400);
+      expect(await res.json()).toMatchObject({ code: 'invalid_builtin_parameters' });
+      expect(dbMocks.dispatchBuiltinMock).not.toHaveBeenCalled();
+      expect(dbMocks.updateMock).not.toHaveBeenCalled();
+    });
+
+    it('B8: PATCH cannot move an executed (claimed) built-in back: 409 already_executed, nothing written', async () => {
+      mockSuggestionLoad({ ...builtinRow, status: 'executed' });
+      const res = await app.request(`/remediation-suggestions/${builtinRow.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ status: 'accepted' }),
+      });
+      expect(res.status).toBe(409);
+      expect(await res.json()).toMatchObject({ code: 'already_executed' });
+      expect(dbMocks.updateMock).not.toHaveBeenCalled();
+    });
+
+    it('B8: a PATCH losing the race to an /execute claim (no row matched) is a 409, not a 500', async () => {
+      mockSuggestionLoad(builtinRow);
+      mockUpdateReturning([]);
+      const res = await app.request(`/remediation-suggestions/${builtinRow.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ status: 'edited' }),
+      });
+      expect(res.status).toBe(409);
+      expect(dbMocks.emitFeedbackMock).not.toHaveBeenCalled();
+    });
+
+    it('B8: other target types can still move out of executed', async () => {
+      const script = { ...baseSuggestion, status: 'executed' };
+      mockSuggestionLoad(script);
+      dbMocks.updateMock.mockReturnValueOnce({ set: vi.fn().mockReturnValue({ where: vi.fn().mockReturnValue({ returning: vi.fn().mockResolvedValue([{ ...script, status: 'accepted' }]) }) }) });
+      const res = await app.request(`/remediation-suggestions/${script.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ status: 'accepted' }),
+      });
+      expect(res.status).toBe(200);
+    });
+
+    it('B3: PATCH cannot lower a built-in below its stored (floor-clamped) tier', async () => {
+      const reboot = { ...builtinRow, builtinAction: 'reboot', parameters: {}, riskTier: 'high' };
+      mockSuggestionLoad(reboot);
+      const setMock = vi.fn().mockReturnValue({ where: vi.fn().mockReturnValue({ returning: vi.fn().mockResolvedValue([{ ...reboot, status: 'edited' }]) }) });
+      dbMocks.updateMock.mockReturnValueOnce({ set: setMock });
+      const res = await app.request(`/remediation-suggestions/${reboot.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ status: 'edited', riskTier: 'low' }),
+      });
+      expect(res.status).toBe(200);
+      expect(setMock).toHaveBeenCalledWith(expect.objectContaining({ riskTier: 'high' }));
+    });
+
+    it('B3: a high-risk built-in (reboot) with an approved same-device elevation dispatches and returns 201', async () => {
+      withDevicesExecute();
+      const elevationRequestId = '88888888-8888-4888-8888-888888888888';
+      const reboot = { ...builtinRow, builtinAction: 'reboot', parameters: {}, riskTier: 'high', elevationRequestId };
+      mockSuggestionLoad(reboot);
+      mockElevationLoad({ id: elevationRequestId, orgId: reboot.orgId, deviceId: reboot.deviceId, status: 'approved', expiresAt: new Date('2099-01-01T00:00:00.000Z') });
+      mockDeviceLoad(deviceRow);
+      mockUpdateReturning([{ ...phase3Row, builtinAction: 'reboot', riskTier: 'high', elevationRequestId }]);
+      dbMocks.dispatchBuiltinMock.mockResolvedValueOnce({ ok: true, commandId: 'cmd-r', cleanupRunId: null });
+      mockPhase3();
+      dbMocks.recordBuiltinMock.mockResolvedValueOnce({ state: 'pending', stateReason: null, humanVote: null });
+      const res = await run();
+      expect(res.status).toBe(201);
+      expect(dbMocks.dispatchBuiltinMock).toHaveBeenCalledWith(expect.objectContaining({ action: 'reboot' }));
+    });
+
+    it('a device the caller cannot reach is a 404 and nothing is dispatched', async () => {
+      withDevicesExecute();
+      mockSuggestionLoad(builtinRow);
+      mockSelectOnce([]);
+      const res = await run();
+      expect(res.status).toBe(404);
+      expect(dbMocks.dispatchBuiltinMock).not.toHaveBeenCalled();
+    });
+
+    it('A5: an already-executed (or claimed) built-in is a 409 before dispatch, so a retry never re-sends', async () => {
+      withDevicesExecute();
+      mockSuggestionLoad({ ...builtinRow, status: 'executed' });
+      const res = await run();
+      expect(res.status).toBe(409);
+      expect(await res.json()).toMatchObject({ code: 'already_executed' });
+      expect(dbMocks.dispatchBuiltinMock).not.toHaveBeenCalled();
+      expect(dbMocks.updateMock).not.toHaveBeenCalled();
+    });
+
+    it('refuses a built-in elevation request without devices:execute', async () => {
+      currentPermissions = { permissions: [{ resource: 'scripts', action: 'execute' }] };
+      mockSuggestionLoad({ ...builtinRow, builtinAction: 'reboot', riskTier: 'high', elevationRequestId: null, parameters: {} });
+      const res = await app.request(`/remediation-suggestions/${builtinRow.id}/elevation-request`, { method: 'POST', headers: { Authorization: 'Bearer token' } });
+      expect(res.status).toBe(403);
+      expect(dbMocks.insertMock).not.toHaveBeenCalled();
+    });
+
+    it('accepts a built-in row for an elevation request', async () => {
+      withDevicesExecute();
+      mockSuggestionLoad({ ...builtinRow, builtinAction: 'reboot', riskTier: 'high', elevationRequestId: null, parameters: {} });
+      mockDeviceLoad();
+      const { values: insertValues } = mockInsertReturning({ id: 'el-1', status: 'pending', expiresAt: null });
+      mockInsertValuesOnly();
+      dbMocks.updateMock.mockReturnValueOnce({ set: vi.fn().mockReturnValue({ where: vi.fn().mockReturnValue({ returning: vi.fn().mockResolvedValue([{ ...builtinRow, riskTier: 'high', elevationRequestId: 'el-1', updatedAt: new Date(), createdAt: new Date() }]) }) }) });
+      const res = await app.request(`/remediation-suggestions/${builtinRow.id}/elevation-request`, { method: 'POST', headers: { Authorization: 'Bearer token' } });
+      expect(res.status).toBe(201);
+      expect(insertValues).toHaveBeenCalledWith(expect.objectContaining({
+        reason: expect.stringContaining('requires approval before it runs'),
+        metadata: expect.objectContaining({ builtinAction: 'reboot' }),
+      }));
+    });
+  });
+
   it('executes accepted script suggestions through the server-side script rail', async () => {
     const accepted = { ...baseSuggestion, status: 'accepted' };
     const scriptExecutionId = '66666666-6666-4666-8666-666666666666';
+    const depths: Record<string, number> = {};
     mockSuggestionLoad(accepted);
+    mockScriptClaim();
     dbMocks.executeScriptOnDevicesMock.mockResolvedValueOnce({
       ok: true,
       admission: {
@@ -577,18 +1015,25 @@ describe('remediation suggestion routes', () => {
       runAs: 'system',
       auditOrgId: baseSuggestion.orgId,
     });
-    dbMocks.updateMock.mockReturnValueOnce({
-      set: vi.fn().mockReturnValue({
-        where: vi.fn().mockReturnValue({
-          returning: vi.fn().mockResolvedValue([{
-            ...accepted,
-            status: 'executed',
-            scriptExecutionId,
-            executedBy: 'user-1',
-            executedAt: new Date('2026-06-18T12:10:00.000Z'),
-          }]),
+    dbMocks.updateMock.mockImplementationOnce(() => {
+      depths.update = dbMocks.dbContextState.depth;
+      return {
+        set: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            returning: vi.fn().mockResolvedValue([{
+              ...accepted,
+              status: 'executed',
+              scriptExecutionId,
+              executedBy: 'user-1',
+              executedAt: new Date('2026-06-18T12:10:00.000Z'),
+            }]),
+          }),
         }),
-      }),
+      };
+    });
+    dbMocks.recordOutcomeMock.mockImplementationOnce(async () => {
+      depths.recordOutcome = dbMocks.dbContextState.depth;
+      return { state: 'pending', stateReason: null, humanVote: null };
     });
 
     const res = await app.request(`/remediation-suggestions/${baseSuggestion.id}/execute`, {
@@ -616,11 +1061,263 @@ describe('remediation suggestion routes', () => {
     expect(body.data.status).toBe('executed');
     expect(body.data.scriptExecutionId).toBe(scriptExecutionId);
     expect(body.execution.targets[0].executionId).toBe(scriptExecutionId);
+    expect(dbMocks.recordOutcomeMock).toHaveBeenCalledWith({
+      suggestion: expect.objectContaining({ id: baseSuggestion.id, orgId: baseSuggestion.orgId }),
+      deviceId: baseSuggestion.deviceId,
+      scriptExecutionId,
+    });
+    // The panel swaps its row for this response, so the outcome must be on it.
+    expect(body.data.outcome).toEqual({ state: 'pending', stateReason: null, humanVote: null });
+    // Must ride the SAME context/transaction that produced the link (phase 3),
+    // not a separate context opened after it closed — that's the atomicity
+    // this fix restores (see Task 18 review, IMPORTANT 1).
+    expect(depths.recordOutcome).toBeGreaterThan(0);
+    expect(depths.recordOutcome).toBe(depths.update);
+  });
+
+  // #7109 — the route is registered in selfManagedDbContextRoutes.ts, so no
+  // request transaction wraps it. The execution rows must commit before the
+  // command is sent, and the suggestion's own reads and writes run in short
+  // contexts of their own — never one held across the service (#6671).
+  describe('commit-before-send (#7109)', () => {
+    const scriptExecutionId = '66666666-6666-4666-8666-666666666666';
+    const admitted = () => ({
+      ok: true,
+      admission: {
+        requestId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+        status: 'queued',
+        targets: [{
+          requestedDeviceId: baseSuggestion.deviceId,
+          admission: 'admitted',
+          executionId: scriptExecutionId,
+          commandId: '77777777-7777-4777-8777-777777777777',
+        }],
+      },
+      script: { id: baseSuggestion.scriptId, name: 'Disk Cleanup' },
+      ignoredParameters: [],
+      triggerType: 'manual',
+      runAs: 'system',
+      auditOrgId: baseSuggestion.orgId,
+    });
+    const depths: Record<string, number> = {};
+    const mockExecutedUpdate = (accepted: Record<string, unknown>) => {
+      dbMocks.updateMock.mockImplementationOnce(() => {
+        depths.update = dbMocks.dbContextState.depth;
+        return {
+          set: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              returning: vi.fn().mockResolvedValue([{ ...accepted, status: 'executed', scriptExecutionId }]),
+            }),
+          }),
+        };
+      });
+    };
+
+    beforeEach(() => {
+      for (const key of Object.keys(depths)) delete depths[key];
+    });
+
+    it('sends only after the context that created the execution rows committed', async () => {
+      const accepted = { ...baseSuggestion, status: 'accepted' };
+      mockSuggestionLoad(accepted);
+      mockScriptClaim();
+      // Stands in for executeScriptOnDevices' contract (#7103, pinned in
+      // scriptExecution.commitBeforeSend.test.ts): rows are created through
+      // the runner when one is given, else inline; the send follows.
+      dbMocks.executeScriptOnDevicesMock.mockImplementationOnce(async (input: { runInDbContext?: <T>(fn: () => Promise<T>) => Promise<T> }) => {
+        const createRows = async () => {
+          dbMocks.dbContextState.events.push(dbMocks.dbContextState.depth > 0 ? 'rows:in-context' : 'rows:contextless');
+        };
+        if (input.runInDbContext) await input.runInDbContext(createRows);
+        else await createRows();
+        dbMocks.dbContextState.events.push('send');
+        return admitted();
+      });
+      mockExecutedUpdate(accepted);
+
+      const res = await app.request(`/remediation-suggestions/${baseSuggestion.id}/execute`, {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(201);
+      const { events } = dbMocks.dbContextState;
+      const rows = events.indexOf('rows:in-context');
+      const send = events.indexOf('send');
+      expect(rows).toBeGreaterThanOrEqual(0);
+      expect(send).toBeGreaterThan(rows);
+      expect(events.slice(rows + 1, send)).toContain('commit');
+    });
+
+    it('passes a runner that opens the caller\'s own DB access context', async () => {
+      const accepted = { ...baseSuggestion, status: 'accepted' };
+      mockSuggestionLoad(accepted);
+      mockScriptClaim();
+      dbMocks.executeScriptOnDevicesMock.mockResolvedValueOnce(admitted());
+      mockExecutedUpdate(accepted);
+
+      await app.request(`/remediation-suggestions/${baseSuggestion.id}/execute`, {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      const input = dbMocks.executeScriptOnDevicesMock.mock.calls[0]![0];
+      expect(typeof input.runInDbContext).toBe('function');
+      withAuthDbAccessContextMock.mockClear();
+      const inner = vi.fn(async () => 'ran');
+      await expect(input.runInDbContext(inner)).resolves.toBe('ran');
+      expect(withAuthDbAccessContextMock).toHaveBeenCalledWith(input.auth, inner);
+    });
+
+    it('loads and updates the suggestion in contexts, never holding one across the service', async () => {
+      const accepted = { ...baseSuggestion, status: 'accepted' };
+      mockScriptClaim();
+      dbMocks.selectMock.mockImplementationOnce(() => {
+        depths.load = dbMocks.dbContextState.depth;
+        return {
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({ limit: vi.fn().mockResolvedValue([accepted]) }),
+          }),
+        };
+      });
+      dbMocks.executeScriptOnDevicesMock.mockImplementationOnce(async () => {
+        depths.service = dbMocks.dbContextState.depth;
+        return admitted();
+      });
+      mockExecutedUpdate(accepted);
+      dbMocks.emitFeedbackMock.mockImplementationOnce(async () => {
+        depths.feedback = dbMocks.dbContextState.depth;
+      });
+
+      const res = await app.request(`/remediation-suggestions/${baseSuggestion.id}/execute`, {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(201);
+      expect(depths).toEqual({ load: 1, service: 0, update: 1, feedback: 1 });
+    });
+
+    // The execution is already committed and sent when the link fails, so the
+    // route must say so with a 500 and write neither feedback nor a success
+    // audit for a link that never happened.
+    it('returns 500 without feedback or audit when the link update matches no row', async () => {
+      const accepted = { ...baseSuggestion, status: 'accepted' };
+      mockSuggestionLoad(accepted);
+      mockScriptClaim();
+      dbMocks.executeScriptOnDevicesMock.mockResolvedValueOnce(admitted());
+      dbMocks.updateMock.mockReturnValueOnce({
+        set: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({ returning: vi.fn().mockResolvedValue([]) }),
+        }),
+      });
+
+      const res = await app.request(`/remediation-suggestions/${baseSuggestion.id}/execute`, {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(500);
+      expect(await res.json()).toEqual({ error: 'Failed to update suggestion' });
+      expect(dbMocks.executeScriptOnDevicesMock).toHaveBeenCalledTimes(1);
+      expect(dbMocks.emitFeedbackMock).not.toHaveBeenCalled();
+      expect(dbMocks.writeRouteAuditMock).not.toHaveBeenCalled();
+    });
+  });
+
+  it('#7276: a lost claim race is a 409 and the script is never dispatched', async () => {
+    mockSuggestionLoad({ ...baseSuggestion, status: 'accepted' });
+    mockScriptClaim(false);
+
+    const res = await app.request(`/remediation-suggestions/${baseSuggestion.id}/execute`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer token' },
+    });
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ code: 'already_dispatching' });
+    expect(dbMocks.executeScriptOnDevicesMock).not.toHaveBeenCalled();
+    expect(dbMocks.emitFeedbackMock).not.toHaveBeenCalled();
+    expect(dbMocks.updateMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('#7276: a service refusal (ok:false) releases the claim and passes the status through', async () => {
+    mockSuggestionLoad({ ...baseSuggestion, status: 'accepted' });
+    mockScriptClaim();
+    mockScriptRelease();
+    dbMocks.executeScriptOnDevicesMock.mockResolvedValueOnce({ ok: false, error: 'forbidden', status: 403 });
+
+    const res = await app.request(`/remediation-suggestions/${baseSuggestion.id}/execute`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer token' },
+    });
+
+    expect(res.status).toBe(403);
+    expect(scriptUpdateCalls).toHaveLength(2);
+    expect(scriptUpdateCalls[1]).toMatchObject({ executedBy: null, executedAt: null });
+  });
+
+  it('#7276: an admitted target with no executionId KEEPS the claim (command may have left)', async () => {
+    mockSuggestionLoad({ ...baseSuggestion, status: 'accepted' });
+    mockScriptClaim();
+    const r = admittedForRace();
+    (r.admission.targets[0] as { executionId: string | null }).executionId = null;
+    dbMocks.executeScriptOnDevicesMock.mockResolvedValueOnce(r);
+
+    const res = await app.request(`/remediation-suggestions/${baseSuggestion.id}/execute`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer token' },
+    });
+
+    expect(res.status).toBe(500);
+    expect(scriptUpdateCalls).toHaveLength(1);
+    expect(captureExceptionMock).toHaveBeenCalled();
+  });
+
+  it('#7276: a dispatch that throws KEEPS the claim (no release), so a retry cannot re-send', async () => {
+    mockSuggestionLoad({ ...baseSuggestion, status: 'accepted' });
+    mockScriptClaim();
+    dbMocks.executeScriptOnDevicesMock.mockRejectedValueOnce(new Error('boom'));
+
+    const res = await app.request(`/remediation-suggestions/${baseSuggestion.id}/execute`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer token' },
+    });
+
+    expect(res.status).toBe(500);
+    expect(scriptUpdateCalls).toHaveLength(1);
+    expect(dbMocks.updateMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('#7276: two concurrent /execute calls dispatch exactly once', async () => {
+    const accepted = { ...baseSuggestion, status: 'accepted' };
+    mockSuggestionLoad(accepted);
+    mockSuggestionLoad(accepted);
+    mockScriptClaim(true);  // winner
+    mockScriptClaim(false); // loser (row lock, WHERE re-evaluated)
+    dbMocks.executeScriptOnDevicesMock.mockResolvedValue(admittedForRace());
+    dbMocks.updateMock.mockImplementationOnce(() => ({
+      set: vi.fn().mockReturnValue({
+        where: vi.fn().mockReturnValue({
+          returning: vi.fn().mockResolvedValue([{ ...accepted, status: 'executed', scriptExecutionId: '66666666-6666-4666-8666-666666666666' }]),
+        }),
+      }),
+    }));
+    const call = () => app.request(`/remediation-suggestions/${baseSuggestion.id}/execute`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer token' },
+    });
+    const [a, b] = await Promise.all([call(), call()]);
+
+    expect([a.status, b.status].sort()).toEqual([201, 409]);
+    expect(dbMocks.executeScriptOnDevicesMock).toHaveBeenCalledTimes(1);
   });
 
   it('returns 422 for rejected admission without mutating or auditing the suggestion', async () => {
     const accepted = { ...baseSuggestion, status: 'accepted' };
     mockSuggestionLoad(accepted);
+    mockScriptClaim();
+    mockScriptRelease();
     dbMocks.executeScriptOnDevicesMock.mockResolvedValueOnce({
       ok: true,
       admission: {
@@ -646,9 +1343,13 @@ describe('remediation suggestion routes', () => {
 
     expect(res.status).toBe(422);
     expect(await res.json()).toEqual({ admission: 'denied', reasonCode: 'site_access_denied' });
-    expect(dbMocks.updateMock).not.toHaveBeenCalled();
+    // Claim then release (nothing was dispatched); never a link/executed write.
+    expect(scriptUpdateCalls).toHaveLength(2);
+    expect(scriptUpdateCalls[1]).toMatchObject({ executedBy: null, executedAt: null });
+    expect(scriptUpdateCalls.some((c) => 'scriptExecutionId' in c || c.status === 'executed')).toBe(false);
     expect(dbMocks.emitFeedbackMock).not.toHaveBeenCalled();
     expect(dbMocks.writeRouteAuditMock).not.toHaveBeenCalled();
+    expect(dbMocks.recordOutcomeMock).not.toHaveBeenCalled();
   });
 
   it('blocks high-risk server-side execution without an approved elevation request', async () => {
@@ -702,6 +1403,7 @@ describe('remediation suggestion routes', () => {
     const scriptExecutionId = '66666666-6666-4666-8666-666666666666';
 
     mockSuggestionLoad(accepted);
+    mockScriptClaim();
     mockElevationLoad({
       id: elevationRequestId,
       orgId: baseSuggestion.orgId,
@@ -910,5 +1612,420 @@ describe('remediation suggestion routes', () => {
     expect(body.status.accepted).toBe(1);
     expect(body.rates.acceptRate).toBe(1);
     expect(body.feedback.accepted).toBe(1);
+  });
+
+  const json = (body: unknown) => ({ method: 'POST', headers: { Authorization: 'Bearer token', 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+
+  it('records a 👎 on an executed suggestion and audits it', async () => {
+    mockSuggestionLoad({ ...baseSuggestion, status: 'executed', scriptExecutionId: '66666666-6666-4666-8666-666666666666' });
+    dbMocks.recordVoteMock.mockResolvedValueOnce({ state: 'verified', stateReason: 'held_with_fresh_telemetry', humanVote: 'down' });
+    const res = await app.request(`/remediation-suggestions/${baseSuggestion.id}/vote`, json({ vote: 'down' }));
+    expect(res.status).toBe(200);
+    expect(dbMocks.recordVoteMock).toHaveBeenCalledWith({ suggestionId: baseSuggestion.id, orgId: baseSuggestion.orgId, vote: 'down', userId: 'user-1' });
+    expect((await res.json()).data.outcome.humanVote).toBe('down');
+    expect(dbMocks.writeRouteAuditMock).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ action: 'ml.remediation_suggestion.vote' }));
+  });
+
+  it('409 when no attempt was recorded for the suggestion', async () => {
+    mockSuggestionLoad({ ...baseSuggestion, status: 'accepted' });
+    dbMocks.recordVoteMock.mockResolvedValueOnce(null);
+    const res = await app.request(`/remediation-suggestions/${baseSuggestion.id}/vote`, json({ vote: 'up' }));
+    expect(res.status).toBe(409);
+  });
+
+  it('400 on an invalid vote and 404 on an invisible suggestion', async () => {
+    expect((await app.request(`/remediation-suggestions/${baseSuggestion.id}/vote`, json({ vote: 'meh' }))).status).toBe(400);
+    mockSelectOnce([]);
+    expect((await app.request(`/remediation-suggestions/${baseSuggestion.id}/vote`, json({ vote: 'up' }))).status).toBe(404);
+    expect(dbMocks.recordVoteMock).not.toHaveBeenCalled();
+  });
+
+  it('403 for a site-restricted user outside the device site', async () => {
+    currentPermissions = { allowedSiteIds: ['88888888-8888-4888-8888-888888888888'] };
+    mockSuggestionLoad({ ...baseSuggestion, status: 'executed' });
+    mockDeviceLoad();
+    const res = await app.request(`/remediation-suggestions/${baseSuggestion.id}/vote`, json({ vote: 'up' }));
+    expect(res.status).toBe(403);
+    expect(dbMocks.recordVoteMock).not.toHaveBeenCalled();
+  });
+
+  it('Done records manual steps once and rejects non-manual targets', async () => {
+    const manual = { ...baseSuggestion, targetType: 'manual_steps', scriptId: null, status: 'accepted' };
+    mockSuggestionLoad(manual);
+    dbMocks.createDoneMock.mockResolvedValueOnce({ state: 'awaiting_recovery', stateReason: 'manual_steps_done', humanVote: null });
+    expect((await app.request(`/remediation-suggestions/${baseSuggestion.id}/done`, json({}))).status).toBe(201);
+
+    mockSuggestionLoad(manual);
+    dbMocks.createDoneMock.mockResolvedValueOnce(null);
+    expect((await app.request(`/remediation-suggestions/${baseSuggestion.id}/done`, json({}))).status).toBe(409);
+
+    mockSuggestionLoad({ ...baseSuggestion, status: 'accepted' });
+    expect((await app.request(`/remediation-suggestions/${baseSuggestion.id}/done`, json({}))).status).toBe(400);
+  });
+
+  const RID = '66666666-6666-4666-8666-666666666666';
+  const manualAccepted = () => mockSuggestionLoad({ ...baseSuggestion, targetType: 'manual_steps', scriptId: null, status: 'accepted' });
+
+  it('Done with an invisible or retired reviewed row is a 404, not a silent unreviewed Done', async () => {
+    manualAccepted();
+    dbMocks.loadActiveInstructionsMock.mockResolvedValueOnce(null);
+    const res = await app.request(`/remediation-suggestions/${baseSuggestion.id}/done`, json({ instructionsId: RID }));
+    expect(res.status).toBe(404);
+    expect(dbMocks.createDoneMock).not.toHaveBeenCalled();
+  });
+
+  it('Done with reviewed steps passes the id through', async () => {
+    manualAccepted();
+    dbMocks.loadActiveInstructionsMock.mockResolvedValueOnce({ id: RID, osType: null });
+    const returning = vi.fn().mockResolvedValue([{ id: baseSuggestion.id }]);
+    const where = vi.fn().mockReturnValue({ returning });
+    const set = vi.fn().mockReturnValue({ where });
+    dbMocks.updateMock.mockReturnValueOnce({ set });
+    dbMocks.createDoneMock.mockResolvedValueOnce({ state: 'awaiting_recovery', stateReason: 'manual_steps_done', humanVote: null });
+    const res = await app.request(`/remediation-suggestions/${baseSuggestion.id}/done`, json({ instructionsId: RID }));
+    expect(res.status).toBe(201);
+    expect(dbMocks.createDoneMock).toHaveBeenCalledWith(expect.objectContaining({ instructionsId: RID }));
+    expect(set).toHaveBeenCalledWith(expect.objectContaining({ instructionsId: RID }));
+  });
+
+  it('F5: a 23505 on the instructions link is a 409 (no uncaught 500) and never a half-written Done', async () => {
+    manualAccepted();
+    dbMocks.loadActiveInstructionsMock.mockResolvedValueOnce({ id: RID, osType: null });
+    dbMocks.createDoneMock.mockResolvedValueOnce({ state: 'awaiting_recovery', stateReason: 'manual_steps_done', humanVote: null });
+    const returning = vi.fn().mockRejectedValue(Object.assign(new Error('duplicate key value violates unique constraint "source_instructions_uq"'), { code: '23505' }));
+    dbMocks.updateMock.mockReturnValueOnce({ set: vi.fn().mockReturnValue({ where: vi.fn().mockReturnValue({ returning }) }) });
+    const res = await app.request(`/remediation-suggestions/${baseSuggestion.id}/done`, json({ instructionsId: RID }));
+    expect(res.status).toBe(409);
+    expect(dbMocks.writeRouteAuditMock).not.toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ action: 'ml.remediation_suggestion.done' }));
+  });
+
+  it('A4: a link UPDATE that matches no row (another reviewed row already linked) is a 409 and the outcome rolls back', async () => {
+    manualAccepted();
+    dbMocks.loadActiveInstructionsMock.mockResolvedValueOnce({ id: RID, osType: null });
+    dbMocks.createDoneMock.mockResolvedValueOnce({ state: 'awaiting_recovery', stateReason: 'manual_steps_done', humanVote: null });
+    const returning = vi.fn().mockResolvedValue([]);
+    dbMocks.updateMock.mockReturnValueOnce({ set: vi.fn().mockReturnValue({ where: vi.fn().mockReturnValue({ returning }) }) });
+    const res = await app.request(`/remediation-suggestions/${baseSuggestion.id}/done`, json({ instructionsId: RID }));
+    expect(res.status).toBe(409);
+    expect(dbMocks.writeRouteAuditMock).not.toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ action: 'ml.remediation_suggestion.done' }));
+  });
+
+  it('A4: Done rides the ambient request transaction (a savepoint), never a second caller context', async () => {
+    manualAccepted();
+    dbMocks.createDoneMock.mockResolvedValueOnce({ state: 'awaiting_recovery', stateReason: 'manual_steps_done', humanVote: null });
+    const res = await app.request(`/remediation-suggestions/${baseSuggestion.id}/done`, json({}));
+    expect(res.status).toBe(201);
+    expect(withAuthDbAccessContextMock).not.toHaveBeenCalled();
+  });
+
+  it('Done with no body is an unreviewed Done (no instructions lookup)', async () => {
+    manualAccepted();
+    dbMocks.createDoneMock.mockResolvedValueOnce({ state: 'awaiting_recovery', stateReason: 'manual_steps_done', humanVote: null });
+    const res = await app.request(`/remediation-suggestions/${baseSuggestion.id}/done`, { method: 'POST', headers: { Authorization: 'Bearer token' } });
+    expect(res.status).toBe(201);
+    expect(dbMocks.loadActiveInstructionsMock).not.toHaveBeenCalled();
+    expect(dbMocks.createDoneMock).toHaveBeenCalledWith(expect.objectContaining({ instructionsId: null }));
+  });
+
+  it('Done rejects a non-uuid instructionsId at validation', async () => {
+    expect((await app.request(`/remediation-suggestions/${baseSuggestion.id}/done`, json({ instructionsId: 'nope' }))).status).toBe(400);
+  });
+
+  it('lists suggestions with origin and their outcome', async () => {
+    mockSelectOnce([{ ...baseSuggestion, origin: 'memory' }]);
+    dbMocks.loadSummariesMock.mockResolvedValueOnce(new Map([[baseSuggestion.id, { state: 'holding', stateReason: 'condition_cleared', humanVote: null }]]));
+    const res = await app.request('/remediation-suggestions?sourceType=alert&sourceId=a-1', { headers: { Authorization: 'Bearer token' } });
+    const body = await res.json();
+    expect(body.data[0]).toMatchObject({ origin: 'memory', outcome: { state: 'holding' } });
+  });
+});
+
+describe('research / memory / draft-brief routes', () => {
+  let app: Hono;
+  const ORG = '11111111-1111-4111-8111-111111111111';
+  const ALERT = '66666666-6666-4666-8666-666666666666';
+  const auth = { headers: { Authorization: 'Bearer token' } };
+  const post = (body: unknown) => ({ method: 'POST', headers: { Authorization: 'Bearer token', 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    // resetAllMocks wipes the context model; these routes now run their phases through it.
+    dbMocks.dbContextState.depth = 0;
+    dbMocks.dbContextState.events = [];
+    withAuthDbAccessContextMock.mockImplementation(async (_auth: unknown, fn: () => Promise<unknown>) => {
+      dbMocks.dbContextState.depth += 1;
+      try { return await fn(); } finally { dbMocks.dbContextState.depth -= 1; dbMocks.dbContextState.events.push('commit'); }
+    });
+    dbMocks.loadSummariesMock.mockResolvedValue(new Map());
+    currentPermissions = undefined;
+    authOverride = undefined;
+    app = new Hono();
+    app.route('/remediation-suggestions', remediationSuggestionRoutes);
+  });
+
+  it('POST /research starts deep research and 202s', async () => {
+    dbMocks.requestResearchMock.mockResolvedValueOnce({ status: 'started', runId: 'run-9', depth: 'deep' });
+    const res = await app.request('/remediation-suggestions/research', post({ sourceType: 'alert', sourceId: ALERT, depth: 'deep' }));
+    expect(res.status).toBe(202);
+    expect((await res.json()).data).toEqual({ status: 'started', runId: 'run-9', depth: 'deep' });
+    expect(dbMocks.requestResearchMock).toHaveBeenCalledWith(expect.objectContaining({ orgId: ORG, sourceType: 'alert', sourceId: ALERT, depth: 'deep', trigger: 'manual', actorUserId: 'user-1' }));
+  });
+
+  it('POST /research answers 200 when research is already running', async () => {
+    dbMocks.requestResearchMock.mockResolvedValueOnce({ status: 'already_running', runId: 'run-9', depth: 'quick' });
+    const res = await app.request('/remediation-suggestions/research', post({ sourceType: 'alert', sourceId: ALERT, depth: 'quick' }));
+    expect(res.status).toBe(200);
+  });
+
+  it.each([
+    ['credits_exhausted', 402], ['daily_budget', 402], ['monthly_budget', 402],
+    ['plan_gate', 403], ['ai_disabled', 403], ['flag_off', 403], ['permission', 403],
+    ['source_not_found', 404],
+    ['max_concurrent_research_runs', 409], ['auto_cap', 409], ['model_unavailable', 409], ['research_unavailable', 503], ['research_baseline_not_system_provisioned', 409],
+  ])('POST /research maps denial %s to %i with the code verbatim in the body', async (code, status) => {
+    dbMocks.requestResearchMock.mockResolvedValueOnce({ status: 'denied', code, message: 'm' });
+    const res = await app.request('/remediation-suggestions/research', post({ sourceType: 'alert', sourceId: ALERT, depth: 'quick' }));
+    expect(res.status).toBe(status);
+    expect(await res.json()).toEqual({ error: 'm', code });
+  });
+
+  it('POST /research refuses an org the caller cannot access before starting anything', async () => {
+    const res = await app.request('/remediation-suggestions/research', post({ sourceType: 'alert', sourceId: ALERT, depth: 'quick', orgId: '99999999-9999-4999-8999-999999999999' }));
+    expect(res.status).toBe(403);
+    expect(dbMocks.requestResearchMock).not.toHaveBeenCalled();
+  });
+
+  // A partner-scope caller has no org of its own; ?orgId= is the only way to pick one.
+  const partnerAuth = () => {
+    authOverride = {
+      scope: 'partner', orgId: null, partnerId: 'p-1',
+      accessibleOrgIds: ['11111111-1111-4111-8111-111111111111'],
+      canAccessOrg: (orgId: string) => orgId === '11111111-1111-4111-8111-111111111111',
+    };
+  };
+
+  it('POST /research resolves the org from ?orgId= when the body has none (#7940)', async () => {
+    partnerAuth();
+    dbMocks.requestResearchMock.mockResolvedValueOnce({ status: 'started', runId: 'run-1', depth: 'quick' });
+    const res = await app.request(`/remediation-suggestions/research?orgId=${ORG}`, post({ sourceType: 'alert', sourceId: ALERT, depth: 'quick' }));
+    expect(res.status).toBe(202);
+    expect(dbMocks.requestResearchMock).toHaveBeenCalledWith(expect.objectContaining({ orgId: ORG }));
+  });
+
+  it('POST /research prefers the body org over ?orgId=', async () => {
+    partnerAuth();
+    dbMocks.requestResearchMock.mockResolvedValueOnce({ status: 'started', runId: 'run-1', depth: 'quick' });
+    const res = await app.request('/remediation-suggestions/research?orgId=99999999-9999-4999-8999-999999999999', post({ sourceType: 'alert', sourceId: ALERT, depth: 'quick', orgId: ORG }));
+    expect(res.status).toBe(202);
+    expect(dbMocks.requestResearchMock).toHaveBeenCalledWith(expect.objectContaining({ orgId: ORG }));
+  });
+
+  it('POST /research: an inaccessible body org is not masked by an accessible ?orgId=', async () => {
+    partnerAuth();
+    const res = await app.request(`/remediation-suggestions/research?orgId=${ORG}`, post({ sourceType: 'alert', sourceId: ALERT, depth: 'quick', orgId: '99999999-9999-4999-8999-999999999999' }));
+    expect(res.status).toBe(403);
+    expect(dbMocks.requestResearchMock).not.toHaveBeenCalled();
+  });
+
+  it('POST /research 400s for a partner caller with neither body nor query org', async () => {
+    partnerAuth();
+    const res = await app.request('/remediation-suggestions/research', post({ sourceType: 'alert', sourceId: ALERT, depth: 'quick' }));
+    expect(res.status).toBe(400);
+    expect(dbMocks.requestResearchMock).not.toHaveBeenCalled();
+  });
+
+  it('POST /research refuses an inaccessible ?orgId= with 403 and starts nothing (#7940)', async () => {
+    partnerAuth(); // org outside the partner
+    const res = await app.request('/remediation-suggestions/research?orgId=99999999-9999-4999-8999-999999999999', post({ sourceType: 'alert', sourceId: ALERT, depth: 'quick' }));
+    expect(res.status).toBe(403);
+    expect(dbMocks.requestResearchMock).not.toHaveBeenCalled();
+  });
+
+  it('POST /research: an org-scope caller cannot switch org via ?orgId= (#7940)', async () => {
+    const res = await app.request('/remediation-suggestions/research?orgId=99999999-9999-4999-8999-999999999999', post({ sourceType: 'alert', sourceId: ALERT, depth: 'quick' }));
+    expect(res.status).toBe(403);
+    expect(dbMocks.requestResearchMock).not.toHaveBeenCalled();
+  });
+
+  it('POST /research 400s on a malformed ?orgId=', async () => {
+    const res = await app.request('/remediation-suggestions/research?orgId=not-a-uuid', post({ sourceType: 'alert', sourceId: ALERT, depth: 'quick' }));
+    expect(res.status).toBe(400);
+    expect(dbMocks.requestResearchMock).not.toHaveBeenCalled();
+  });
+
+  it('GET /research returns the latest run state for the source', async () => {
+    dbMocks.researchStatusMock.mockResolvedValueOnce({ runId: 'run-9', depth: 'quick', status: 'running', errorCode: null, noSafeFix: false, finishedAt: null });
+    const res = await app.request(`/remediation-suggestions/research?sourceType=alert&sourceId=${ALERT}`, auth);
+    expect(res.status).toBe(200);
+    expect((await res.json()).data).toMatchObject({ status: 'running' });
+    expect(dbMocks.researchStatusMock).toHaveBeenCalledWith({ orgId: ORG, sourceType: 'alert', sourceId: ALERT });
+  });
+
+  it('GET /memory returns proven and similar fixes without touching research', async () => {
+    dbMocks.lookupMock.mockResolvedValueOnce({ signature: {}, proven: [{ id: 'f1' }], similar: [{ id: 'f2' }] });
+    const res = await app.request(`/remediation-suggestions/memory?sourceType=alert&sourceId=${ALERT}`, auth);
+    expect(res.status).toBe(200);
+    expect((await res.json()).data).toEqual({ proven: [{ id: 'f1' }], similar: [{ id: 'f2' }] });
+    expect(dbMocks.lookupMock).toHaveBeenCalledWith(expect.objectContaining({ orgId: ORG, partnerId: 'p-1', limit: 5 }));
+    expect(dbMocks.requestResearchMock).not.toHaveBeenCalled();
+    expect(dbMocks.researchStatusMock).not.toHaveBeenCalled();
+  });
+
+  it('GET /draft-brief only serves script_draft rows', async () => {
+    mockSuggestionLoad({ ...baseSuggestion, targetType: 'script_draft', parameters: { brief: 'Clear queue', language: 'powershell' } });
+    const ok = await app.request(`/remediation-suggestions/${baseSuggestion.id}/draft-brief`, auth);
+    expect(ok.status).toBe(200);
+    expect((await ok.json()).data).toEqual({ brief: 'Clear queue', language: 'powershell', title: baseSuggestion.title });
+    mockSuggestionLoad(baseSuggestion);
+    expect((await app.request(`/remediation-suggestions/${baseSuggestion.id}/draft-brief`, auth)).status).toBe(400);
+  });
+
+  it('GET /draft-brief 404s a site-limited user whose site does not cover the suggestion device', async () => {
+    currentPermissions = { allowedSiteIds: ['site-allowed'] };
+    mockSuggestionLoad({ ...baseSuggestion, targetType: 'script_draft', parameters: { brief: 'secret brief', language: 'powershell' } });
+    dbMocks.selectMock.mockReturnValueOnce({ from: () => ({ where: () => ({ limit: async () => [{ siteId: 'site-other' }] }) }) });
+    const res = await app.request(`/remediation-suggestions/${baseSuggestion.id}/draft-brief`, auth);
+    expect(res.status).toBe(404);
+    expect(JSON.stringify(await res.json())).not.toContain('secret brief');
+  });
+
+  it('GET /draft-brief 404s a non-uuid id without querying', async () => {
+    expect((await app.request('/remediation-suggestions/not-a-uuid/draft-brief', auth)).status).toBe(404);
+    expect(dbMocks.selectMock).not.toHaveBeenCalled();
+  });
+
+  describe('site-limited user (source device outside allowed sites)', () => {
+    beforeEach(() => {
+      currentPermissions = { permissions: [{ resource: 'ai_sessions', action: 'use' }], allowedSiteIds: ['site-allowed'] };
+      dbMocks.sourceDeviceMock.mockResolvedValue({ deviceId: 'dev-1' });
+      dbMocks.selectMock.mockReturnValueOnce({ from: () => ({ where: () => ({ limit: async () => [{ siteId: 'site-other' }] }) }) });
+    });
+
+    it('POST /research 404s and starts nothing', async () => {
+      const res = await app.request('/remediation-suggestions/research', post({ sourceType: 'alert', sourceId: ALERT, depth: 'quick' }));
+      expect(res.status).toBe(404);
+      expect(dbMocks.requestResearchMock).not.toHaveBeenCalled();
+    });
+
+    it('GET /research reveals no run state', async () => {
+      const res = await app.request(`/remediation-suggestions/research?sourceType=alert&sourceId=${ALERT}`, auth);
+      expect((await res.json()).data).toBeNull();
+      expect(dbMocks.researchStatusMock).not.toHaveBeenCalled();
+    });
+
+    it('GET /memory returns nothing', async () => {
+      const res = await app.request(`/remediation-suggestions/memory?sourceType=alert&sourceId=${ALERT}`, auth);
+      expect((await res.json()).data).toEqual({ proven: [], similar: [] });
+      expect(dbMocks.lookupMock).not.toHaveBeenCalled();
+    });
+
+    it('Generate 404s without generating or researching', async () => {
+      const res = await app.request('/remediation-suggestions/generate', post({ sourceType: 'alert', sourceId: ALERT }));
+      expect(res.status).toBe(404);
+      expect(dbMocks.generateMock).not.toHaveBeenCalled();
+    });
+
+    it('Generate for an RCA 404s when the supplied deviceId sits outside the allowed sites', async () => {
+      const res = await app.request('/remediation-suggestions/generate', post({
+        sourceType: 'rca', sourceId: ALERT, orgId: ORG, deviceId: '77777777-7777-4777-8777-777777777777',
+      }));
+      expect(res.status).toBe(404);
+      expect(dbMocks.generateMock).not.toHaveBeenCalled();
+    });
+
+    it('Generate for an RCA with an in-site deviceId proceeds', async () => {
+      dbMocks.selectMock.mockReset();
+      dbMocks.selectMock.mockReturnValueOnce({ from: () => ({ where: () => ({ limit: async () => [{ siteId: 'site-allowed' }] }) }) });
+      dbMocks.generateMock.mockResolvedValueOnce({ orgId: ORG, sourceType: 'rca', sourceId: ALERT, skipped: false, suggestions: [], research: null });
+      const res = await app.request('/remediation-suggestions/generate', post({
+        sourceType: 'rca', sourceId: ALERT, orgId: ORG, deviceId: '77777777-7777-4777-8777-777777777777',
+      }));
+      expect(res.status).toBe(201);
+      expect(dbMocks.generateMock).toHaveBeenCalledWith(
+        expect.objectContaining({ sourceType: 'rca', deviceId: '77777777-7777-4777-8777-777777777777' }),
+        expect.anything(),
+      );
+    });
+
+    it('F4: fails CLOSED (404, nothing started) when the source or its device cannot be resolved', async () => {
+      for (const unresolved of [null, { deviceId: null }]) {
+        dbMocks.requestResearchMock.mockClear();
+        dbMocks.sourceDeviceMock.mockResolvedValue(unresolved);
+        const res = await app.request('/remediation-suggestions/research', post({ sourceType: 'alert', sourceId: ALERT, depth: 'quick' }));
+        expect(res.status).toBe(404);
+        expect(dbMocks.requestResearchMock).not.toHaveBeenCalled();
+      }
+    });
+
+    it('an in-site source still proceeds', async () => {
+      dbMocks.selectMock.mockReset();
+      dbMocks.selectMock.mockReturnValueOnce({ from: () => ({ where: () => ({ limit: async () => [{ siteId: 'site-allowed' }] }) }) });
+      dbMocks.requestResearchMock.mockResolvedValueOnce({ status: 'started', runId: 'r', depth: 'quick' });
+      const res = await app.request('/remediation-suggestions/research', post({ sourceType: 'alert', sourceId: ALERT, depth: 'quick' }));
+      expect(res.status).toBe(202);
+    });
+  });
+
+  it('GET /draft-brief 404s an unknown suggestion', async () => {
+    dbMocks.selectMock.mockReturnValueOnce({ from: () => ({ where: () => ({ limit: async () => [] }) }) });
+    expect((await app.request(`/remediation-suggestions/${baseSuggestion.id}/draft-brief`, auth)).status).toBe(404);
+  });
+
+  it('Generate answers 400 when the RCA deviceId does not belong to the source', async () => {
+    dbMocks.generateMock.mockRejectedValueOnce(new RemediationSourceDeviceErrorMock('not part of this source'));
+    const res = await app.request('/remediation-suggestions/generate', post({
+      sourceType: 'rca', sourceId: ALERT, orgId: ORG, deviceId: '77777777-7777-4777-8777-777777777777',
+    }));
+    expect(res.status).toBe(400);
+    expect(dbMocks.writeRouteAuditMock).not.toHaveBeenCalled();
+  });
+
+  describe('A2: research-starting POSTs are self-managed (no context held across requestResearch)', () => {
+    it('POST /research gates in a short context, then calls requestResearch with none held and an RLS runReads', async () => {
+      currentPermissions = { permissions: [{ resource: 'ai_sessions', action: 'use' }], allowedSiteIds: ['site-allowed'] };
+      const depths: Record<string, number> = {};
+      dbMocks.sourceDeviceMock.mockImplementationOnce(async () => { depths.gate = dbMocks.dbContextState.depth; return { deviceId: 'dev-1' }; });
+      dbMocks.selectMock.mockReturnValueOnce({ from: () => ({ where: () => ({ limit: async () => [{ siteId: 'site-allowed' }] }) }) });
+      dbMocks.requestResearchMock.mockImplementationOnce(async (input: { runReads: (fn: () => Promise<number>) => Promise<number> }) => {
+        depths.research = dbMocks.dbContextState.depth;
+        depths.reads = await input.runReads(async () => dbMocks.dbContextState.depth);
+        return { status: 'started', runId: 'r', depth: 'quick' };
+      });
+      const res = await app.request('/remediation-suggestions/research', post({ sourceType: 'alert', sourceId: ALERT, depth: 'quick' }));
+      expect(res.status).toBe(202);
+      expect(depths).toEqual({ gate: 1, research: 0, reads: 1 });
+    });
+
+    it('Generate runs the service with no context held and hands it the caller-scoped runner', async () => {
+      const depths: Record<string, number> = {};
+      dbMocks.generateMock.mockImplementationOnce(async (_input: unknown, opts: { runInDbContext: (fn: () => Promise<number>) => Promise<number> }) => {
+        depths.service = dbMocks.dbContextState.depth;
+        depths.runner = await opts.runInDbContext(async () => dbMocks.dbContextState.depth);
+        return { orgId: ORG, sourceType: 'anomaly', sourceId: baseSuggestion.sourceId, skipped: false, suggestions: [baseSuggestion], research: null };
+      });
+      dbMocks.loadSummariesMock.mockImplementationOnce(async () => { depths.outcomes = dbMocks.dbContextState.depth; return new Map(); });
+      const res = await app.request('/remediation-suggestions/generate', post({ sourceType: 'anomaly', sourceId: baseSuggestion.sourceId }));
+      expect(res.status).toBe(201);
+      expect(depths).toEqual({ service: 0, runner: 1, outcomes: 1 });
+    });
+  });
+
+  describe('Generate research gating', () => {
+    const gen = () => app.request('/remediation-suggestions/generate', post({ sourceType: 'anomaly', sourceId: baseSuggestion.sourceId }));
+    const result = { orgId: ORG, sourceType: 'anomaly', sourceId: baseSuggestion.sourceId, skipped: false, suggestions: [], research: { status: 'started', runId: 'r', depth: 'quick' } };
+
+    it('passes allowResearch=true only with ai_sessions:use and returns the research outcome', async () => {
+      currentPermissions = { permissions: [{ resource: 'ai_sessions', action: 'use' }] };
+      dbMocks.generateMock.mockResolvedValueOnce(result);
+      const res = await gen();
+      expect(dbMocks.generateMock).toHaveBeenCalledWith(expect.objectContaining({ allowResearch: true }), expect.anything());
+      expect((await res.json()).research).toEqual(result.research);
+    });
+
+    it('passes allowResearch=false without that permission', async () => {
+      dbMocks.generateMock.mockResolvedValueOnce(result);
+      await gen();
+      expect(dbMocks.generateMock).toHaveBeenCalledWith(expect.objectContaining({ allowResearch: false }), expect.anything());
+    });
   });
 });

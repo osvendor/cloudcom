@@ -7,20 +7,37 @@ import { createThreeCxReadService, normalizePbxOrigin, ThreeCxReadError } from '
 import { createProvider, ProviderError, type GuardedFetch } from './transport';
 import type { NativeMicrosoftServices } from './native-microsoft';
 export type { NativeMicrosoftServices, MicrosoftRequest, MicrosoftResource } from './native-microsoft';
+export { projectMicrosoftResource } from './native-microsoft';
 import { mountMicrosoftRoutes } from './microsoft';
 import { mountDirectoryPreferenceRoutes } from './directory-preferences';
+import { mountDirectorySnapshotRoutes } from './directory-snapshots';
 import { mountGoogleRoutes } from './google';
+import { mountIDriveRoutes } from './idrive';
+import { IDriveError } from './idrive-provider';
+import { mountHarmonyRoutes } from './harmony';
+import { HarmonyError } from './harmony-contract';
+import type { NativeHarmonyServices } from './native-harmony';
+export * from './native-harmony';
+export * from './harmony-contract';
+export { createHarmonyProvider } from './harmony-provider';
+export type IDriveDbRunner = <T>(auth: Variables['auth'], work: () => Promise<T>) => Promise<T>;
 import type { NativeGoogleServices } from './native-google';
 export type { NativeGoogleServices, GoogleRequest, GoogleDirectoryKind, GoogleDirectoryResult, GoogleMembersResult, GoogleStorageResult, GoogleActivitySource, GoogleActivityResult, GoogleSuspendInput, GoogleSuspendResult, GoogleProfileInput, GoogleProfileResult, GoogleTraceItem, GoogleTraceResult } from './native-google';
 import { mountThreeCxDetails, ThreeCxDetailError } from './threecx-details';
 import { mountThreeCxDashboard } from './threecx-dashboard';
 import { mountThreeCxCallLog } from './threecx-call-log';
+import { healthRoutes, type HealthReader } from './health';
+export type { HealthReader, HealthAuth, HealthCard, OperationsHealth, AlertWorkload, AlertWorkloadGroup, AlertScriptMonitorWorkload } from './health';
 import type { AdministrationRuntime } from './admin-runtime';
 import { createAdministrationServices } from './admin-services';
 export type { AdministrationRuntime } from './admin-runtime';
 export { createAdministrationTokenProvider } from './admin-token-provider';
 export { createUnixSocketExchangeWorkerPort } from './exchange-socket-client';
 export type { ExchangeDescriptorRegistry } from './exchange-services';
+export { createAdminGraphProvider } from './admin-graph-provider';
+export { createExchangeMailboxInventoryClient, createExchangeMailboxStatisticsClient, createExchangePreservationInspectClient } from './exchange-contract';
+export { claimDirectorySnapshot, publishDirectorySnapshotSource, releaseDirectorySnapshot } from './directory-snapshot-store';
+export type { SnapshotBinding, SnapshotSource } from './directory-snapshot-store';
 
 const table = 'cloudcommand_threecx_connections';
 export type ThreeCxConnection = { id: string; org_id: string; origin: string; client_id: string; secret_ciphertext: string;
@@ -48,12 +65,17 @@ function summary(row: Row, canManage: boolean) {
 }
 
 /** Only the statically compiled host can provide this public-egress transport. */
-export function createCloudCommandExtension(fetch: GuardedFetch, microsoft?: NativeMicrosoftServices, administration?: AdministrationRuntime, google?: NativeGoogleServices): BreezeExtensionV1 {
-  return { register(registrar, context) { registrar.mountRoute(createRoutes(context, fetch, microsoft, administration, google) as unknown as Hono); } };
+export function createCloudCommandExtension(fetch: GuardedFetch, microsoft?: NativeMicrosoftServices, administration?: AdministrationRuntime, google?: NativeGoogleServices, health?: HealthReader, idriveDb?: IDriveDbRunner, harmony?: NativeHarmonyServices): BreezeExtensionV1 {
+  return { register(registrar, context) {
+    registrar.mountRoute(createRoutes(context, fetch, microsoft, administration, google, health, idriveDb, harmony) as unknown as Hono);
+    if (harmony) registrar.registerJob({ name:'harmony-sync', cron:'*/5 * * * *', handler:() => harmony.refreshDue() });
+  } };
 }
 
-export function createRoutes(context: ExtensionRuntimeContext, fetch: GuardedFetch, microsoft?: NativeMicrosoftServices, administration?: AdministrationRuntime, google?: NativeGoogleServices) {
+export function createRoutes(context: ExtensionRuntimeContext, fetch: GuardedFetch, microsoft?: NativeMicrosoftServices, administration?: AdministrationRuntime, google?: NativeGoogleServices, health?: HealthReader, idriveDb?: IDriveDbRunner, harmony?: NativeHarmonyServices) {
   const app = new Hono<{ Variables: Variables }>();
+  // Global, operator-only aggregate route has its own gate, before the client-scoped routes.
+  app.route('/', healthRoutes(health));
   const provider = createProvider(fetch);
   async function connection(orgId: string) {
     return rows<Row>(await context.db.execute(sql`SELECT * FROM cloudcommand_threecx_connections WHERE org_id = ${orgId}::uuid`))[0];
@@ -73,15 +95,18 @@ export function createRoutes(context: ExtensionRuntimeContext, fetch: GuardedFet
     const canManage = permissions.hasPermission('organizations', 'write') && permissions.mfaSatisfied;
     // Administration's typed dispatcher distinguishes reads from writes and re-authorizes
     // every operation. All configuration mutations retain the outer write/MFA gate.
-    if (c.req.method !== 'GET' && !canManage && !c.req.path.endsWith('/microsoft/administration')) throw new RouteError('configuration_access_denied', 403);
-    const organization = rows<{ partner_id: string }>(await context.db.execute(sql`SELECT partner_id FROM organizations WHERE id = ${org.data}::uuid AND deleted_at IS NULL AND status IN ('active', 'trial')`))[0];
+    const personalLayoutWrite = c.req.method === 'PUT' && /\/microsoft\/directory\/layout\/(?:all|users|shared-mailboxes|groups|licenses|sites)$/.test(c.req.path);
+    const directoryRefresh = c.req.method === 'POST' && c.req.path.endsWith('/microsoft/directory/refresh');
+    if (c.req.method !== 'GET' && !canManage && !personalLayoutWrite && !directoryRefresh && !c.req.path.endsWith('/microsoft/administration')) throw new RouteError('configuration_access_denied', 403);
+    const lookupOrganization = () => context.db.execute(sql`SELECT partner_id FROM organizations WHERE id = ${org.data}::uuid AND deleted_at IS NULL AND status IN ('active', 'trial')`);
+    const organization = rows<{ partner_id: string }>(await ((c.req.path.includes('/idrive/') || c.req.path.includes('/harmony/')) && idriveDb ? idriveDb(auth, lookupOrganization) : lookupOrganization()))[0];
     if (!organization || (auth.partnerId && auth.partnerId !== organization.partner_id)) throw new RouteError('not_available', 404);
     c.set('scope', { organizationId: org.data, partnerId: organization.partner_id, actorId: auth.user.id });
     c.set('canManage', canManage);
     await next();
   });
   app.onError((error, c) => {
-    if (error instanceof RouteError || error instanceof ThreeCxDetailError) return c.json({ error: error.code.replaceAll('_', ' '), code: error.code }, error.status);
+    if (error instanceof RouteError || error instanceof ThreeCxDetailError || error instanceof IDriveError || error instanceof HarmonyError) return c.json({ error: error.code.replaceAll('_', ' '), code: error.code }, error.status);
     if (error instanceof ProviderError || error instanceof ThreeCxReadError) return c.json({ error: 'The PBX request could not be completed.', code: error.code }, 502);
     // Never log upstream bodies, URLs, request payloads, token or DB query values.
     context.log('error', 'Cloud Command request failed');
@@ -152,8 +177,12 @@ export function createRoutes(context: ExtensionRuntimeContext, fetch: GuardedFet
   mountThreeCxDetails(app, { connection, credentials: row => ({ origin: row.origin, clientId: row.client_id, secret: secret(row) }), provider, context });
   mountThreeCxDashboard(app, { connection, credentials: row => ({ origin: row.origin, clientId: row.client_id, secret: secret(row) }), provider, context });
   mountThreeCxCallLog(app, { connection, credentials: row => ({ origin: row.origin, clientId: row.client_id, secret: secret(row) }), provider, context });
-  mountMicrosoftRoutes(app, administration ? createAdministrationServices(context, fetch, administration) : microsoft);
+  const microsoftServices = administration ? createAdministrationServices(context, fetch, administration) : microsoft;
+  mountMicrosoftRoutes(app, microsoftServices);
   mountGoogleRoutes(app, google);
+  mountIDriveRoutes(app, context, fetch, idriveDb);
+  mountHarmonyRoutes(app, harmony);
   mountDirectoryPreferenceRoutes(app, context);
+  mountDirectorySnapshotRoutes(app, context, microsoftServices);
   return app;
 }

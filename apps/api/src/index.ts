@@ -1,29 +1,45 @@
+import {companionWorkRoutes} from './routes/companionWork';
+import {startCompanionWorkReconciler,stopCompanionWorkReconciler} from './services/companionWork';
+import { companionScriptRoutes } from './routes/companionScripts';
+import { startCompanionScriptReconciler,stopCompanionScriptReconciler } from './services/companionScripts';
 import { nativeTargetRoutes } from './routes/nativeTarget';
+import { staffNativeRoutes } from './routes/staffNative';
+import { createBrowserCompanionTransport } from './routes/browserCompanion';
 import { config as loadDotenv } from 'dotenv';
 loadDotenv({ quiet: true });
 // Canonicalize NODE_ENV before any module reads it (some routes/services gate
 // on `NODE_ENV === 'production'` at import time). Must stay directly after
 // dotenv so .env is loaded first. See #917 (L-6).
 import './config/normalizeNodeEnv';
+// An empty CLAUDE_CONFIG_DIR (compose `${VAR:-}`) must read as unset for the Agent SDK. #9133.
+import './config/normalizeClaudeConfigDir';
 import { serve } from '@hono/node-server';
 import { createNodeWebSocket } from '@hono/node-ws';
+import { installPerRouteMaxPayload } from './services/wsMaxPayload';
 import { Hono } from 'hono';
-import type { Context } from 'hono';
+import type { MiddlewareHandler } from 'hono';
 import { cors } from 'hono/cors';
 import { HTTPException } from 'hono/http-exception';
 import { prettyJSON } from 'hono/pretty-json';
 import { secureHeaders } from 'hono/secure-headers';
 
 import { securityMiddleware } from './middleware/security';
+import { exceptPathPrefix } from './middleware/pathExemption';
 import { requestPathLogger } from './middleware/requestPathLogger';
+import { agentAdmission } from './middleware/agentAdmission';
+import { agentRequestConcurrency } from './middleware/agentRequestConcurrency';
+import { startAdmissionControl, stopAdmissionControl } from './services/admission/admissionRuntime';
 import { createGlobalBodyLimitMiddleware } from './middleware/bodyLimitGate';
-import { globalRateLimit } from './middleware/globalRateLimit';
+import { globalRateLimit, registerGlobalRateLimitSkipPrefix } from './middleware/globalRateLimit';
+import { exceptTunnelSurface, isTunnelSurface, tunnelHostClassifier, tunnelHostDispatch } from './middleware/tunnelHostDispatch';
+import { tunnelHostRoutes } from './routes/tunnelHost';
 import { authRoutes } from './routes/auth';
 import { accountDeletionAdminRoutes } from './routes/auth/accountDeletion';
 import { configRoutes } from './routes/config';
 import { externalServicesRoutes } from './routes/externalServices';
 import { agentRoutes } from './routes/agents';
 import { deviceRoutes } from './routes/devices';
+import { timeStatusRoutes } from './routes/timeStatus';
 import { pamRoutes } from './routes/pam';
 import { scriptRoutes } from './routes/scripts';
 import { scriptLibraryRoutes } from './routes/scriptLibrary';
@@ -33,26 +49,42 @@ import { alertRoutes } from './routes/alerts';
 import { alertTemplateRoutes } from './routes/alertTemplates';
 import { ticketsRoutes } from './routes/tickets';
 import { callerVerificationRoutes } from './routes/callerVerification';
+import { endpointMessageRoutes } from './routes/endpointMessages';
 import { mailboxRoutes } from './routes/tickets/mailboxConnect';
 import { catalogRoutes } from './routes/catalog';
 import { emailWebhookRoutes } from './routes/tickets/emailWebhook';
 import { invoiceRoutes } from './routes/invoices';
 import { quoteRoutes } from './routes/quotes';
 import { quotesPublicRoutes } from './routes/quotesPublic';
+import { agreementsPublicRoutes } from './routes/agreementsPublic';
+import { routeReferrerPolicyWins } from './middleware/routeReferrerPolicy';
 import { invoicesPublicRoutes } from './routes/invoicesPublic';
 import { stripeConnectRoutes } from './routes/stripeConnect';
 import { stripeWebhookRoutes } from './routes/webhooks/stripe';
 import { quickbooksWebhookRoutes } from './routes/webhooks/quickbooks';
+import { xeroWebhookRoutes } from './routes/webhooks/xero';
 import { resendWebhookRoutes } from './routes/webhooks/emailProvider';
+import { edrWebhookRoutes } from './routes/webhooks/edr';
+import { flowWebhookRoutes } from './routes/flowWebhooks';
 import { invoiceAssemblyRoutes } from './routes/invoices/assembly';
 import { invoiceSettingsRoutes } from './routes/invoices/settings';
+import { billingPaymentSettingsRoutes } from './routes/billingPaymentSettings';
+import { ticketApprovalSettingsRoutes } from './routes/tickets/approvalSettings';
+import { ticketApprovalRoutes } from './routes/tickets/approvals';
+import { autopayRoutes } from './routes/autopay';
+import { mountAutopayChargingRoutes } from './routes/autopay/mount';
+import { publicAutopayRoutes } from './routes/autopay/public';
+import { portalPaymentMethodRoutes } from './routes/portal/paymentMethods';
 import { contractRoutes } from './routes/contracts';
 import { timeEntriesRoutes } from './routes/timeEntries';
 import { billingProfilesRoutes } from './routes/billingProfiles';
 import { ticketCategoriesRoutes } from './routes/ticketCategories';
 import { ticketConfigRoutes } from './routes/ticketConfig';
+import { businessCalendarRoutes } from './routes/businessCalendars';
+import { ticketRoutingRuleRoutes } from './routes/tickets/routingRules';
 import { ticketResponseTemplateRoutes } from './routes/tickets/ticketResponseTemplates';
 import { ticketFormRoutes } from './routes/tickets/forms';
+import { serviceCatalogRoutes } from './routes/tickets/serviceCatalog';
 import { tenantVariableRoutes } from './routes/tenantVariables';
 import { orgRoutes } from './routes/orgs';
 import { orgMergeRoutes } from './routes/orgMerge';
@@ -63,6 +95,17 @@ import { serviceDeliverableRoutes } from './routes/serviceDeliverables';
 import { deliverableTemplateRoutes } from './routes/deliverableTemplates';
 import { ticketChecklistTemplateRoutes } from './routes/ticketChecklistTemplates';
 import { orgDocumentRoutes } from './routes/orgDocuments';
+import { trustPageRoutes } from './routes/trustPage';
+import { trustPagePublicRoutes } from './routes/trustPagePublic';
+import { trustPageAttestationRoutes } from './routes/trustPageAttestation';
+import { byTrustCrossOriginPath } from './middleware/trustCrossOrigin';
+import { bySameOriginFramePath, isSameOriginFramePath } from './middleware/sameOriginFrame';
+// Trust Center W2 (#8770) — W02a stub routers, filled by W02b/d/f/g.
+import { trustPageDeclarationRoutes } from './routes/trustPageDeclarations';
+import { trustPageContentRoutes } from './routes/trustPageContent';
+import { trustPageAccessRoutes } from './routes/trustPageAccess';
+import { trustAccessPublicRoutes } from './routes/trustAccessPublic';
+import { trustPageTemplateRoutes } from './routes/trustPageTemplate';
 import { orgKeyDateRoutes } from './routes/orgKeyDates';
 import { oauthRoutes } from './routes/oauth';
 import { wellKnownRoutes } from './routes/oauthWellKnown';
@@ -73,6 +116,9 @@ import { roleRoutes } from './routes/roles';
 import { permissionsCatalogRoutes } from './routes/permissionsCatalog';
 import { auditLogRoutes } from './routes/auditLogs';
 import { backupRoutes } from './routes/backup';
+import { edrRoutes } from './routes/edr';
+import { connectionHealthRoutes } from './routes/connectionHealth';
+import { emailUnsubscribeRoutes } from './routes/emailUnsubscribe';
 import { reportRoutes } from './routes/reports';
 import { incidentRoutes } from './routes/incidents';
 import { searchRoutes } from './routes/search';
@@ -81,12 +127,16 @@ import { remoteRoutes } from './routes/remote';
 import { apiKeyRoutes } from './routes/apiKeys';
 import { servicePrincipalRoutes } from './routes/servicePrincipals';
 import { partnerServicePrincipalRoutes } from './routes/partnerServicePrincipals';
+import { migrationWindowRoutes } from './routes/migrationWindows';
+import { ticketImportRoutes } from './routes/ticketImports';
 import { partnerApiRoutes } from './routes/partnerApi';
 import { enrollmentKeyRoutes, publicEnrollmentRoutes, publicShortLinkRoutes } from './routes/enrollmentKeys';
 import { installerRoutes } from './routes/installer';
 import { supportPublicRoutes } from './routes/supportPublic';
+import { callerVerifyPublicRoutes } from './routes/callerVerifyPublic';
 import { ssoRoutes } from './routes/sso';
 import { partnerLoginBrandingRoutes } from './routes/partnerLoginBranding';
+import { preAssignmentRoutes } from './routes/preAssignment';
 import { docsRoutes } from './routes/docs';
 import { accessReviewRoutes } from './routes/accessReviews';
 import { webhookRoutes } from './routes/webhooks';
@@ -94,6 +144,7 @@ import { policyRoutes } from './routes/policyManagement';
 import { configPolicyRoutes } from './routes/configurationPolicies';
 import { psaRoutes } from './routes/psa';
 import { patchRoutes } from './routes/patches/index';
+import { oemUpdatesFleetRoutes } from './routes/oemUpdates/fleet';
 import { thirdPartyCatalogRoutes } from './routes/thirdPartyCatalog';
 import { patchPolicyRoutes } from './routes/patchPolicies';
 import { updateRingRoutes } from './routes/updateRings';
@@ -107,8 +158,11 @@ import { analyticsRoutes } from './routes/analytics';
 import { fleetFindingsRoutes } from './routes/fleetFindings';
 import { discoveryRoutes } from './routes/discovery';
 import { discoveryAssetProbeRoutes } from './routes/discoveryAssetProbe';
+import { discoveryAssetPlacementRoutes } from './routes/discoveryAssetPlacement';
+import { discoveryAssetCircuitsRoutes } from './routes/discoveryAssetCircuits';
 import { monitoringAssetMetricsRoutes } from './routes/monitoringAssetMetrics';
 import { topologyRoutes } from './routes/topology';
+import { circuitRoutes } from './routes/circuits';
 import { networkBaselineRoutes } from './routes/networkBaselines';
 import { networkChangeRoutes } from './routes/networkChanges';
 import { portalRoutes } from './routes/portal';
@@ -125,6 +179,7 @@ import { monitorRoutes } from './routes/monitors';
 import { monitoringRoutes } from './routes/monitoring';
 import { auditBaselineRoutes } from './routes/auditBaselines';
 import { softwareRoutes } from './routes/software';
+import { softwareBuiltinPackagesRoutes } from './routes/softwareBuiltinPackages';
 import { softwarePoliciesRoutes } from './routes/softwarePolicies';
 import { vulnerabilityRoutes, vulnerabilitySyncRoutes } from './routes/vulnerabilities';
 import { systemRoutes } from './routes/system';
@@ -155,13 +210,17 @@ import { aiRoutes } from './routes/ai';
 import { aiScriptProposalRoutes } from './routes/ai/scriptProposals';
 import { aiScriptPolicyRoutes } from './routes/ai/scriptPolicy';
 import { partnerAiScriptPolicyRoutes } from './routes/partnerAiScriptPolicy';
-import { aiProviderRoutes } from './routes/aiProvider';
+import { aiDataPolicyRoutes } from './routes/ai/dataPolicy';
+import { partnerAiDataPolicyRoutes } from './routes/partnerAiDataPolicy';
+import { aiModelsRoutes } from './routes/aiModels';
 import { aiAgentsRoutes } from './routes/aiAgents';
 import { aiArtifactRoutes } from './routes/aiArtifacts';
 import { aiAgentSchedulesRoutes } from './routes/aiAgentSchedules';
 import { fleetDesignRoutes } from './routes/fleetDesign';
 import { patchPlanRoutes } from './routes/patchPlan';
 import { aiOperatorTasksRoutes } from './routes/aiOperatorTasks';
+import { wispRoutes } from './routes/wisp';
+import { wispMemoryRoutes } from './routes/wisp/memory';
 import { scriptAiRoutes } from './routes/scriptAi';
 import { mcpServerRoutes, initMcpBootstrapForStartup } from './routes/mcpServer';
 import { mountInviteLandingRoutes } from './modules/mcpInvites';
@@ -169,9 +228,21 @@ import { devPushRoutes } from './routes/devPush';
 import { helperRoutes } from './routes/helper';
 import { playbookRoutes } from './routes/playbooks';
 import { remediationSuggestionRoutes } from './routes/remediationSuggestions';
+import { fixMemoryRoutes } from './routes/fixMemory';
 import { seedBuiltInPlaybooks } from './services/builtInPlaybooks';
 import { ensureSystemLibraryScripts } from './services/systemScriptLibrary';
+import { runLegacyAlertingRetirement, LEGACY_ALERTING_RETRY_DELAYS_MS } from './services/monitors/conversion/retirementSweep';
 import { ensureBuiltInMonitorsForAllPartners } from './services/monitors/builtInMonitors';
+import { refreshPinnedBuiltinPackages } from './services/builtinDeploymentPackages';
+import { sealUnsealedSettingsSecrets } from './services/settingsSecretBackfill';
+import { reportableCutoverError } from './services/aiModels/registryCutover';
+import { runEnvOpenAiBootstrapAtBoot } from './services/aiModels/envOpenAiBootstrap';
+import { registerGatewayConnectionCheck } from './services/aiModels/gatewayConnectionState';
+import { sealUnsealedBackupProviderConfigs } from './services/backupProviderConfigBackfill';
+import { hashLegacyInstallerBootstrapTokens } from './services/installerBootstrapTokenHashBackfill';
+import { safeErrorMessage } from './services/aiModels/safeDbError';
+import { baselineCredentialHistory } from './services/backupStorageCredentialHistory';
+import { runStartupTaskWithRetry } from './services/startupTaskRetry';
 import { seedDefaultAuditBaselines } from './services/auditBaselineService';
 import { changesRoutes } from './routes/changes';
 import { dnsSecurityRoutes } from './routes/dnsSecurity';
@@ -198,6 +269,7 @@ import { extensionsAdminRoutes } from './routes/extensionsAdmin';
 import { extensionsWebRoutes } from './routes/extensionsWeb';
 import { internalSyntheticRoutes } from './routes/internal/synthetic';
 import { toolSourcesRoutes } from './routes/toolSources';
+import { flowsRoutes } from './routes/flows';
 import { bootstrapPlatformAdmins } from './services/platformAdminBootstrap';
 import { reportStalePamRuleTiers } from './services/pamRuleTierDriftCheck';
 import {
@@ -226,9 +298,11 @@ import {
   stopDbPoolHealthMonitor,
 } from './db/dbPoolHealthMonitor';
 import { getWedgedBackendMinAgeMs } from './db/wedgedBackends';
+import { startRedisMemoryMonitor, stopRedisMemoryMonitor } from './services/redisMemoryMonitor';
 import { isBenignRejection, isRecoverablePostgresConnectionTeardown } from './services/rejectionSuppressions';
-import { partnerGuard } from './middleware/partnerGuard';
-import { API_VERSION } from './version';
+import { partnerGuardWithExemptions } from './middleware/partnerGuard';
+import { buildHealthPayload } from './services/versionInfo';
+import { warnOnVersionMismatch } from './services/versionMismatch';
 import {
   setWorkerReadinessTransitionHandler,
   workerReadinessRegistry,
@@ -246,29 +320,41 @@ import {
 // role, so this file's own import closure no longer has to pull in the
 // entire worker-module graph. The handful of imports below are the
 // "phase 2 specials" that stay directly in index.ts (not registry entries):
-// the webhook-delivery singleton (`shutdownRuntime`'s preamble calls
-// `getWebhookWorker().stop()` before any other shutdown phase runs), and the
-// event-dispatch/relay consumers, which have their own role gating distinct
-// from the registry's placement filter.
-import { getWebhookWorker } from './workers/webhookDelivery';
-import { startRegisteredWorkers, buildWorkerShutdownTasks } from './services/workerRegistry';
+// the event-dispatch/relay consumers, which have their own role gating
+// distinct from the registry's placement filter. The registry closes the
+// webhook-delivery BullMQ worker during its shutdown phase.
+import {
+  startRegisteredWorkers,
+  startRedisIndependentWorkers,
+  buildWorkerShutdownTasks,
+} from './services/workerRegistry';
 import { registerAiAgentEnqueuer } from './jobs/aiAgentEnqueuer';
 import { backfillC2cConnectionSecrets } from './services/c2cSecrets';
 import { backfillDefaultPatchSchedules } from './jobs/patchScheduleBackfill';
+import { reconcileDecommissionedDynamicMemberships } from './jobs/decommissionedGroupMembershipReconcile';
 import { registerAllEventSubscribers } from './services/eventSubscribers';
+import { registerTopologyPhysicalAuthorities } from './services/topology/physicalAuthorities';
 import { initializeDeviceEventHandlers } from './events/deviceEvents';
+import { warmBreezeToolSurface } from './services/aiAgentSdkTools';
 import { buildWebhookFanoutDeps } from './services/webhookFanoutDeps';
 import { closeRedis, getRedis, isRedisAvailable } from './services/redis';
+import { getClusterCacheBus } from './services/clusterCacheBus';
 import { shutdownEventDispatcher } from './services/eventDispatcher';
 import { shutdownChatRunBridge } from './services/workspace/chatRunBridge';
 import { initializeEventDispatchWorker, shutdownEventDispatchWorker } from './jobs/eventDispatchWorker';
 import { shutdownEventDispatchQueue } from './services/eventDispatchQueue';
 import {
+  claimAgentCommandRelayShard,
   initializeAgentCommandRelayWorker,
+  releaseAgentCommandRelayClaim,
   shutdownAgentCommandRelayWorker,
 } from './jobs/agentCommandRelayWorker';
+import { shutdownAgentCommandRelayQueue } from './services/agentCommandRelay';
 import { AI_AGENTS_ENABLED, abuseSignalsEnabled, breezeRole, eventDispatchMode } from './config/env';
+import { wispEnabled } from './config/env';
+import { installWispGrantHooks } from './services/wisp/grantLifecycle';
 import { logAiAgentsSubsystemState } from './services/aiAgents/subsystemState';
+import { startPlatformModelSnapshotRefresher, warnOnUnsupportedPlatformInferenceGeo } from './services/aiModels/platformModels';
 import { partnerTrustMode } from './config/partnerTrustMode';
 import { isPartnerLaneConfigured } from './services/emailDomains/config';
 import { auditChainVerifyEnabled } from './config/auditChainVerify';
@@ -277,8 +363,10 @@ import { writeAuditEvent } from './services/auditEvents';
 import { drainAuditRetryQueue, runWithAuditRequestTracking } from './services/auditService';
 import { runShutdownPhases } from './services/shutdownPhases';
 import { drainLlmEgressQueue } from './services/llm/llmEgressRecorder';
-import { createCorsOriginResolver } from './services/corsOrigins';
+import { closeModelGateway } from './services/aiModels/gateway/server';
+import { CORS_MIDDLEWARE_OPTIONS } from './services/corsPolicy';
 import { validateConfig } from './config/validate';
+import { startTurnPreflight } from './services/system/connections/turnPreflight';
 import { initializeDatabaseForStartup } from './db/databaseStartup';
 import { clearPermissionCache } from './services/permissions';
 import { loadBuiltinExtensions } from './extensions/builtinExtensions';
@@ -291,15 +379,23 @@ import {
   extensionRootsSnapshot,
 } from './extensions/faultAttribution';
 import { syncBinaries } from './services/binarySync';
+import { syncBuiltinYaraPack } from './services/yaraBuiltinPack';
+import { startRegularMsiCacheWarmer } from './services/installerBuilder';
 import * as dbModule from './db';
-import { deviceGroups, devices, securityThreats, webhookDeliveries } from './db/schema';
-import { eq, ne, sql } from 'drizzle-orm';
+import { webhookDeliveries } from './db/schema';
+import { resolveFallbackOrgId } from './services/auditFallbackOrg';
+import { ne, sql } from 'drizzle-orm';
 import { envInt } from './utils/envInt';
+import { registerAllEffectProbes } from './services/aiOperator/effectProbes/bootstrap';
 import {
   createReadinessEvaluator,
   type WorkerInitPhase
 } from './services/readiness';
 import { createReadinessHandler } from './routes/readiness';
+import { startCapacityGuard, stopCapacityGuard } from './services/capacityGuard';
+import { agentRolloutLimits } from './services/agentRolloutAdmission';
+import { dbSaturationResponse } from './middleware/dbSaturationResponse';
+import { httpExceptionResponse } from './middleware/httpExceptionResponse';
 import { resolveReadinessTiming } from './config/readinessConfig';
 
 const { db } = dbModule;
@@ -322,7 +418,7 @@ const REQUIRE_REDIS_ON_STARTUP = envFlag(
   (process.env.NODE_ENV ?? 'development') === 'production'
 );
 
-const app = new Hono();
+export const app = new Hono();
 
 /**
  * Boot-time connectivity results. These drive the startup fail-fast gate and
@@ -397,11 +493,12 @@ const readiness = createReadinessEvaluator({
 setWorkerReadinessTransitionHandler(() => readiness.invalidate());
 
 // Create WebSocket helpers (must be done before routes are registered)
-const { injectWebSocket, upgradeWebSocket } = createNodeWebSocket({ app });
-const resolveCorsOrigin = createCorsOriginResolver({
-  configuredOriginsRaw: process.env.CORS_ALLOWED_ORIGINS,
-  nodeEnv: process.env.NODE_ENV
-});
+const { injectWebSocket, upgradeWebSocket, wss } = createNodeWebSocket({ app });
+// One WebSocketServer instance serves every upgrade route below (terminal,
+// desktop signaling, tunnel relay, event stream, agent ingest) with no
+// per-route hook for `maxPayload`, so the `ws` library default of 100 MiB
+// would otherwise apply everywhere. Size it per route instead.
+installPerRouteMaxPayload(wss);
 
 // Global middleware
 // FIRST, deliberately: `http_requests_total` / `http_request_duration_seconds`
@@ -412,19 +509,72 @@ const resolveCorsOrigin = createCorsOriginResolver({
 // but was never mounted, so neither series appeared in a production scrape.
 app.use('*', metricsMiddleware);
 app.use('*', requestPathLogger());
+// W08 (#8147): agent admission control. Directly after the request logger so a
+// refusal is still counted (metricsMiddleware) and logged with its reason, and
+// before everything that costs: secure headers, the body-limit gate, the Redis
+// round trip in globalRateLimit, the partner guard, agent auth's DB transaction
+// and any body read. O(1), no I/O, never inside a DB context. A pass-through
+// until the admission controller starts, and in BREEZE_ADMISSION_MODE=off.
+app.use('*', agentAdmission());
+app.use('*', agentRequestConcurrency());
+// Network Proxy host mode (spec 2026-10-06 §3): classify by Host + the Caddy
+// tunnel-site assertion. Runs after metrics/logging (they cover tunnel traffic)
+// and before every app header/CORS middleware (those skip tunnel surfaces).
+app.use('*', tunnelHostClassifier());
+
+// The tunnel-http proxy route (routes/tunnelHttp.ts) sets its own response
+// headers on every request — a restrictive sandboxed CSP that intentionally
+// allows same-origin framing so the app's own iframe can embed the proxied
+// device UI, plus its own cross-site request admission — and does so
+// specifically BECAUSE some of the app-wide headers below (CSP
+// `frame-ancestors 'none'`, X-Frame-Options: DENY, credentialed CORS) are
+// wrong for that one route: applied on top, they silently won the merge over
+// the route's own response and broke iframe embedding entirely (the route's
+// sandbox CSP never reached the browser). Skip only the conflicting header
+// output for that path prefix; every other route keeps it unchanged. Tunnel
+// hosts (host mode) are exempted the same way via `exceptTunnelSurface` /
+// `skipHeadersWhen`.
+//
+// `securityMiddleware()` also enforces FORCE_HTTPS redirect and
+// canonical-Host rejection, which have nothing to do with the CSP conflict
+// above and must keep running for this prefix too — so it is exempted via
+// its own `skipHeadersPathPrefix` option (headers only), not via
+// `exceptTunnelHttp`, which would drop that transport enforcement as well.
+const TUNNEL_HTTP_PATH_PREFIX = '/api/v1/tunnel-http/';
+const exceptTunnelHttp = (mw: MiddlewareHandler) => exceptPathPrefix(TUNNEL_HTTP_PATH_PREFIX, exceptTunnelSurface(mw));
+
+const SECURE_HEADERS_OPTIONS = {
+  // Override defaults to match Breeze security policy:
+  // - HSTS: 1 year (secureHeaders default is 180 days / 15552000s)
+  strictTransportSecurity: 'max-age=31536000; includeSubDomains; preload',
+  // - X-Frame-Options: DENY (default is SAMEORIGIN)
+  xFrameOptions: 'DENY',
+  // - Referrer-Policy: strict-origin-when-cross-origin (default is no-referrer)
+  referrerPolicy: 'strict-origin-when-cross-origin',
+} as const;
+
+// Trust Center W3b: the public badge and the attestation/JWKS paths get the same headers except
+// `Cross-Origin-Resource-Policy: cross-origin` (middleware/trustCrossOrigin.ts), so other origins can load them.
+// It must be chosen here, not in the handlers: secureHeaders writes its headers after next() and would
+// overwrite a handler's CORP.
+// #10192/#10290: the PDF routes the portal iframes (middleware/sameOriginFrame.ts) get
+// X-Frame-Options: SAMEORIGIN here and CSP `frame-ancestors 'self'` from securityMiddleware below — chosen by
+// path for the same reason. Every other route keeps DENY / 'none'.
 app.use(
   '*',
-  secureHeaders({
-    // Override defaults to match Breeze security policy:
-    // - HSTS: 1 year (secureHeaders default is 180 days / 15552000s)
-    strictTransportSecurity: 'max-age=31536000; includeSubDomains; preload',
-    // - X-Frame-Options: DENY (default is SAMEORIGIN)
-    xFrameOptions: 'DENY',
-    // - Referrer-Policy: strict-origin-when-cross-origin (default is no-referrer)
-    referrerPolicy: 'strict-origin-when-cross-origin',
-  })
+  exceptTunnelHttp(
+    routeReferrerPolicyWins(
+      bySameOriginFramePath(
+        byTrustCrossOriginPath(
+          secureHeaders({ ...SECURE_HEADERS_OPTIONS }),
+          secureHeaders({ ...SECURE_HEADERS_OPTIONS, crossOriginResourcePolicy: 'cross-origin' }),
+        ),
+        secureHeaders({ ...SECURE_HEADERS_OPTIONS, xFrameOptions: 'SAMEORIGIN' }),
+      )
+    )
+  )
 );
-app.use('*', securityMiddleware());
+app.use('*', securityMiddleware({ skipHeadersPathPrefix: TUNNEL_HTTP_PATH_PREFIX, skipHeadersWhen: isTunnelSurface, sameOriginFrameWhen: isSameOriginFramePath }));
 app.use(
   '*',
   createGlobalBodyLimitMiddleware({
@@ -433,17 +583,19 @@ app.use(
   })
 );
 app.use('*', globalRateLimit());
+// Tunnel hosts end here: the body limit (fixed policy on tunnel surfaces, not
+// path-keyed), rate limit (tunnel bucket, no path skips), metrics and logging ran; no app route, auth, prettyJSON or CORS is reachable on a tunnel host.
+app.use('*', tunnelHostDispatch(tunnelHostRoutes));
 app.use('*', prettyJSON());
+// The registered companion origins have a separate, narrowly scoped CORS
+// boundary. Browser authorization remains on the authenticated extension page.
+app.route('/api/v1/browser-companion', createBrowserCompanionTransport(async (request,env) => app.fetch(request,env)));
 app.use(
   '*',
-  cors({
-    origin: (origin) => resolveCorsOrigin(origin),
-    credentials: true,
-    allowHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'X-API-Key', 'X-Breeze-CSRF'],
-    allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    exposeHeaders: ['Content-Length', 'X-Request-Id'],
-    maxAge: 86400
-  })
+  exceptTunnelHttp(
+    // Origin resolver + header lists live in services/corsPolicy.ts (B-W03 #6157).
+    cors(CORS_MIDDLEWARE_OPTIONS)
+  )
 );
 
 const startedAt = Date.now();
@@ -454,12 +606,9 @@ const startedAt = Date.now();
 // instead — see routes/agents/download.ts #1470 — so this payload is no longer
 // coupled to the installer.)
 app.get('/health', (c) => {
-  const uptimeSeconds = Math.floor((Date.now() - startedAt) / 1000);
-  return c.json({
-    status: 'ok',
-    version: API_VERSION,
-    uptime: uptimeSeconds
-  });
+  // binariesVersion differs from version only on a server-only release image
+  // (see services/binarySource.ts getPairedBinariesVersion).
+  return c.json(buildHealthPayload(startedAt));
 });
 
 // Kubernetes liveness probe — minimal 200 OK
@@ -571,10 +720,6 @@ function sanitizeActionSegment(segment: string): string {
   return segment;
 }
 
-function isLikelyUuid(value: string): boolean {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
-}
-
 function buildFallbackAction(method: string, apiPath: string): string {
   const cleaned = apiPath.replace(/^\/api\/v1\//, '/');
   const segments = cleaned
@@ -606,158 +751,12 @@ function fallbackAuditEligible(path: string): boolean {
   return path.startsWith('/api/v1/');
 }
 
-async function resolveFallbackOrgId(c: Context, path: string): Promise<string | null> {
-  const auth = c.get('auth') as { orgId?: string | null; accessibleOrgIds?: string[] } | undefined;
-  if (auth?.orgId) {
-    return auth.orgId;
-  }
-
-  if (auth?.accessibleOrgIds && auth.accessibleOrgIds.length === 1) {
-    return auth.accessibleOrgIds[0] ?? null;
-  }
-
-  if (path.startsWith('/api/v1/agents/')) {
-    const segments = path.split('/').filter(Boolean);
-    const agentId = segments[3];
-    if (!agentId || agentId === 'enroll') {
-      return null;
-    }
-
-    try {
-      const [device] = await db
-        .select({ orgId: devices.orgId })
-        .from(devices)
-        .where(eq(devices.agentId, agentId))
-        .limit(1);
-      return device?.orgId ?? null;
-    } catch (err) {
-      console.error('[audit] Failed to resolve orgId from path:', err);
-      return null;
-    }
-  }
-
-  if (path.startsWith('/api/v1/devices/')) {
-    const segments = path.split('/').filter(Boolean);
-    const entity = segments[3];
-    if (!entity) {
-      return null;
-    }
-
-    if (entity === 'groups') {
-      const groupId = segments[4];
-      if (!groupId || !isLikelyUuid(groupId)) {
-        return null;
-      }
-
-      try {
-        const [group] = await db
-          .select({ orgId: deviceGroups.orgId })
-          .from(deviceGroups)
-          .where(eq(deviceGroups.id, groupId))
-          .limit(1);
-        return group?.orgId ?? null;
-      } catch (err) {
-        console.error('[audit] Failed to resolve orgId from device group:', err);
-        return null;
-      }
-    }
-
-    if (!isLikelyUuid(entity)) {
-      return null;
-    }
-
-    try {
-      const [device] = await db
-        .select({ orgId: devices.orgId })
-        .from(devices)
-        .where(eq(devices.id, entity))
-        .limit(1);
-      return device?.orgId ?? null;
-    } catch (err) {
-      console.error('[audit] Failed to resolve orgId from path:', err);
-      return null;
-    }
-  }
-
-  if (path.startsWith('/api/v1/security/scan/')) {
-    const segments = path.split('/').filter(Boolean);
-    const deviceId = segments[4];
-    if (!deviceId || !isLikelyUuid(deviceId)) {
-      return null;
-    }
-
-    try {
-      const [device] = await db
-        .select({ orgId: devices.orgId })
-        .from(devices)
-        .where(eq(devices.id, deviceId))
-        .limit(1);
-      return device?.orgId ?? null;
-    } catch (err) {
-      console.error('[audit] Failed to resolve orgId from path:', err);
-      return null;
-    }
-  }
-
-  if (path.startsWith('/api/v1/security/threats/')) {
-    const segments = path.split('/').filter(Boolean);
-    const threatId = segments[4];
-    if (!threatId || !isLikelyUuid(threatId)) {
-      return null;
-    }
-
-    try {
-      const [threat] = await db
-        .select({ orgId: devices.orgId })
-        .from(securityThreats)
-        .innerJoin(devices, eq(securityThreats.deviceId, devices.id))
-        .where(eq(securityThreats.id, threatId))
-        .limit(1);
-      return threat?.orgId ?? null;
-    } catch (err) {
-      console.error('[audit] Failed to resolve orgId from path:', err);
-      return null;
-    }
-  }
-
-  if (path.startsWith('/api/v1/system-tools/devices/')) {
-    const segments = path.split('/').filter(Boolean);
-    const deviceId = segments[4];
-    if (!deviceId || !isLikelyUuid(deviceId)) {
-      return null;
-    }
-
-    try {
-      const [device] = await db
-        .select({ orgId: devices.orgId })
-        .from(devices)
-        .where(eq(devices.id, deviceId))
-        .limit(1);
-      return device?.orgId ?? null;
-    } catch (err) {
-      console.error('[audit] Failed to resolve orgId from path:', err);
-      return null;
-    }
-  }
-
-  return null;
-}
-
 // Generic partner status guard — blocks non-active partners.
 // IMPORTANT: every branch MUST `return` the next()/partnerGuard() promise so
 // any Response (403 PARTNER_INACTIVE, 403 PARTNER_NOT_FOUND, 503 PARTNER_LOOKUP_UNAVAILABLE)
 // propagates back through Hono's compose chain. Discarding the return causes
 // Hono to throw "Context is not finalized" and the request collapses to 500.
-api.use('*', async (c, next) => {
-  const path = c.req.path;
-  if (path.startsWith('/api/v1/auth')) return next();
-  if (path === '/api/v1/config' || path === '/api/v1/config/') return next();
-  if (path.startsWith('/api/v1/users/me')) return next();
-  if (path === '/api/v1/partner/me' || path.startsWith('/api/v1/partner/me/')) return next();
-  if (path.startsWith('/api/v1/agents/')) return next();
-  if (path.startsWith('/api/v1/internal/synthetic/')) return next();   // synthetic test router — self-gated (token + canary latch)
-  return partnerGuard(c, next);
-});
+api.use('*', partnerGuardWithExemptions);
 
 api.use('*', async (c, next) => {
   const auditWritten = await runWithAuditRequestTracking(next);
@@ -777,12 +776,25 @@ api.use('*', async (c, next) => {
     return;
   }
 
+  const auth = c.get('auth') as {
+    user?: { id?: string; email?: string };
+    orgId?: string | null;
+    scope?: string;
+    partnerId?: string | null;
+  } | undefined;
+
+  // A write that names no org the caller can reach — partner-level config
+  // (catalog, price books, templates, integrations) or a body-targeted route —
+  // is still recorded when a signed-in user made it: as a partner-level row
+  // (org_id NULL) rather than under a guessed org. Partner-scope callers are
+  // attributed to their own partner. Unattributable requests (no user) are
+  // still skipped.
   const orgId = await resolveFallbackOrgId(c, path);
-  if (!orgId) {
+  if (!orgId && !auth?.user?.id) {
     return;
   }
+  const partnerId = !orgId && auth?.scope === 'partner' && auth.partnerId ? auth.partnerId : undefined;
 
-  const auth = c.get('auth') as { user?: { id?: string; email?: string }; orgId?: string | null } | undefined;
   const status = c.res.status;
 
   let result: 'success' | 'denied' | 'failure';
@@ -804,25 +816,47 @@ api.use('*', async (c, next) => {
   }
 
   writeAuditEvent(c, {
-    orgId,
+    orgId: orgId ?? null,
     actorType,
     actorId: auth?.user?.id ?? undefined,
     actorEmail: auth?.user?.email,
     action: buildFallbackAction(method, path),
     resourceType: getResourceTypeFromPath(path),
-    details: { path, method, statusCode: status, fallback: true },
+    details: { path, method, statusCode: status, fallback: true, ...(partnerId ? { partnerId } : {}) },
     result
   });
 });
 
 api.route('/auth', authRoutes);
 api.route('/config', configRoutes);
+// Public trust pages (Trust Center W1, no auth). Mounted before every root-mounted
+// router so no `.use('*')` auth middleware can run ahead of these unauthenticated
+// GETs. /trust/card/* is skip-listed from the global limiter (portal SSR shares one
+// IP) and is DB-free on a serving-set miss; /trust/public/* has its own isolated
+// 'trustpublic' bucket. Unrelated to /partner/trust (partnerTrustRoutes).
+registerGlobalRateLimitSkipPrefix('/api/v1/trust/card/');
+// Signed attestation + JWKS (Trust Center W3b): public like the W1 block above and mounted ahead of it for the same
+// reason; its own 'trustattest' bucket; CORP cross-origin comes from byTrustCrossOriginPath above.
+api.route('/trust/attestation', trustPageAttestationRoutes);
+// Gated-document access flow (Trust Center W2, no auth): before /trust so its paths are never read as slugs.
+api.route('/trust/access', trustAccessPublicRoutes);
+api.route('/trust', trustPagePublicRoutes);
+// Public, token-gated agreement signing (#9075 W2b, no auth). Mounted with the
+// other public surfaces, before every root-mounted router and before the
+// auth-gated /contracts router, so no `.use('*')` auth middleware can run ahead
+// of it (mirrors /quotes/public). The signed request token is the only
+// authorisation; its own isolated 'agreementpublic' rate bucket.
+api.route('/agreements/public', agreementsPublicRoutes);
 api.route('/', externalServicesRoutes);
 api.route('/agents', agentRoutes);
 api.route('/native-target', nativeTargetRoutes);
+api.route('/staff-native', staffNativeRoutes);
 api.route('/devices', deviceRoutes);
+api.route('/time-status', timeStatusRoutes);
 api.route('/pam', pamRoutes);
 api.route('/scripts', scriptRoutes);
+api.route('/companion-scripts', companionScriptRoutes);
+api.route('/companion-work', companionWorkRoutes);
 api.route('/script-library', scriptLibraryRoutes);
 api.route('/automations/webhooks', automationWebhookRoutes);
 api.route('/automations', automationRoutes);
@@ -839,16 +873,25 @@ api.route('/alert-templates', alertTemplateRoutes);
 // authMiddleware) gate (the Microsoft admin-consent redirect carries no Bearer
 // token). The callback authenticates via signed state + binding cookie instead.
 api.route('/tickets/mailbox', mailboxRoutes);
+// Customer work approval staff routes (#4617 W03): absolute paths spanning
+// /tickets/:id/approval-*, /ticket-approval-requests/:id/* and
+// /time-entries/:id/write-off-held, each with its own authMiddleware. Mounted
+// BEFORE the /tickets and /time-entries hubs so these paths are matched here
+// first and never fall through those hubs' .use('*') chains.
+api.route('/', ticketApprovalRoutes);
 api.route('/tickets', ticketsRoutes);
 // Caller verification (#6354 W01): mounted at the root because its paths
 // span /orgs/:orgId/…, /partner/… and /orgs/:orgId/tickets/:ticketId/…; the
 // router gates itself (404 while CALLER_VERIFICATION_ENABLED !== 'true').
 api.route('/', callerVerificationRoutes);
+// Endpoint messaging (#8741 W1): technician -> end-user message fan-out.
+api.route('/endpoint-messages', endpointMessageRoutes);
 api.route('/catalog', catalogRoutes);
 // Public, token-gated invoice view-and-pay (no auth) — MUST precede the
 // auth-gated /invoices router so the unauthenticated /invoices/public/* sub-path
 // isn't swallowed by invoiceRoutes' auth middleware (mirrors /quotes/public).
 api.route('/invoices/public', invoicesPublicRoutes);
+mountAutopayChargingRoutes(api);
 api.route('/invoices', invoiceRoutes);
 // Public, token-gated quote acceptance (no auth) — MUST precede the auth-gated
 // /quotes router so the unauthenticated /quotes/public/* sub-path isn't swallowed
@@ -867,13 +910,24 @@ api.route('/', invoiceAssemblyRoutes);
 // /api/v1/partner/billing-settings and /api/v1/orgs/:orgId/billing-settings.
 // invoiceSettingsRoutes applies authMiddleware itself.
 api.route('/', invoiceSettingsRoutes);
+api.route('/', billingPaymentSettingsRoutes);
+// Customer work approval policy (#4617): /api/v1/ticketing/approval-settings and
+// /api/v1/orgs/:orgId/ticketing/approval-settings. Each route leads with authMiddleware.
+api.route('/', ticketApprovalSettingsRoutes);
 api.route('/time-entries', timeEntriesRoutes);
 api.route('/ticket-categories', ticketCategoriesRoutes);
 api.route('/billing-profiles', billingProfilesRoutes);
 api.route('/ticket-config', ticketConfigRoutes);
+api.route('/business-calendars', businessCalendarRoutes);
+api.route('/ticket-routing-rules', ticketRoutingRuleRoutes);
 api.route('/', ticketResponseTemplateRoutes);
 api.route('/', ticketFormRoutes);
+api.route('/', serviceCatalogRoutes);
 api.route('/', tenantVariableRoutes);
+// Self-contained autopay auth must run before the broad org/portal routers.
+api.route('/autopay/public', publicAutopayRoutes);
+api.route('/portal', portalPaymentMethodRoutes);
+api.route('/', autopayRoutes);
 api.route('/orgs', orgRoutes);
 api.route('/orgs', orgMergeRoutes);
 api.route('/orgs', orgArchiveRoutes);
@@ -883,12 +937,21 @@ api.route('/orgs', serviceDeliverableRoutes); // /orgs/:orgId/deliverables/* (#5
 api.route('/deliverable-templates', deliverableTemplateRoutes); // (#5573 W05)
 api.route('/ticket-checklist-templates', ticketChecklistTemplateRoutes); // (#5783 W02)
 api.route('/orgs', orgDocumentRoutes); // /orgs/:orgId/documents/* (#5573 W03)
+api.route('/orgs', trustPageRoutes); // /orgs/:orgId/trust-page/* (Trust Center W1)
+api.route('/orgs', trustPageDeclarationRoutes); // /orgs/:orgId/trust-page/declarations/* (Trust Center W2, W02b)
+api.route('/orgs', trustPageContentRoutes); // /orgs/:orgId/trust-page/{faq,subprocessors}/* (Trust Center W2, W02f)
+api.route('/orgs', trustPageAccessRoutes); // /orgs/:orgId/trust-page/access/* (Trust Center W2, W02d)
+api.route('/trust-page-template', trustPageTemplateRoutes); // partner-wide template (Trust Center W2, W02g)
 api.route('/orgs', orgKeyDateRoutes);         // /orgs/:orgId/key-dates/* (#5573 W01)
 api.route('/users', userRoutes);
 api.route('/roles', roleRoutes);
 api.route('/permissions', permissionsCatalogRoutes);
 api.route('/audit-logs', auditLogRoutes);
 api.route('/backup', backupRoutes);
+api.route('/edr', edrRoutes); // EDR provider framework (#8164 W01b)
+api.route('/connection-health', connectionHealthRoutes);
+// Unauthenticated RFC 8058 one-click unsubscribe (signed token; per-IP rate limited in the router).
+api.route('/email', emailUnsubscribeRoutes);
 api.route('/reports', reportRoutes);
 api.route('/incidents', incidentRoutes);
 api.route('/search', searchRoutes);
@@ -905,6 +968,10 @@ api.route('/remote', remoteRoutes);
 api.route('/api-keys', apiKeyRoutes);
 api.route('/service-principals', servicePrincipalRoutes);
 api.route('/partner-service-principals', partnerServicePrincipalRoutes);
+// Ticket migration windows (#8313): partner-wide admin grants of import mode.
+api.route('/migration-windows', migrationWindowRoutes);
+// Ticket import framework (#8313 W4): sources, mappings and import runs.
+api.route('/ticket-imports', ticketImportRoutes);
 api.route('/partner-api', partnerApiRoutes);
 api.route('/enrollment-keys', publicEnrollmentRoutes); // Public download (no auth) — must precede auth-protected routes
 api.route('/enrollment-keys', enrollmentKeyRoutes);
@@ -913,11 +980,19 @@ api.route('/installer', installerRoutes);
 // Guarded by ~44 bits of code entropy, a 15-minute TTL, per-IP rate limits
 // and a single atomic pending->claimed transition.
 api.route('/support', supportPublicRoutes);
+// Public caller-verification card (#6354 W03) — the 32-byte SMS/email link
+// token is the only credential (no bearer). 404 while CALLER_VERIFICATION_ENABLED
+// is off, before any Redis/DB work; per-IP, per-token and miss budgets; one
+// hash lookup in a short system context. See routes/callerVerifyPublic.ts.
+api.route('/verify', callerVerifyPublicRoutes);
 api.route('/sso', ssoRoutes);
 // Mounted directly at /partners (not nested under /orgs' /partners/me or the
 // legacy singular /partner router) — final URL /api/v1/partners/me/login-branding
 // per Task 11's consumed contract (#2183).
 api.route('/partners', partnerLoginBrandingRoutes);
+// Parked-device holding area: full partner admins list and assign devices
+// waiting in their partner's holding org.
+api.route('/pre-assignment', preAssignmentRoutes);
 api.route('/docs', docsRoutes);
 api.route('/access-reviews', accessReviewRoutes);
 api.route('/webhooks', webhookRoutes);
@@ -929,11 +1004,19 @@ api.route('/webhooks/tickets', emailWebhookRoutes);
 // via c.req.text(), so no body-consuming middleware sits in front of it.
 api.route('/webhooks', stripeWebhookRoutes);
 // Intuit QuickBooks webhook — no session auth, HMAC-gated with the app-level
-// verifier token. partnerGuard passes through (no Authorization header); the
-// route reads the raw body itself via c.req.text(), so no body-consuming
+// verifier token. partnerGuard skips this exact path (isPartnerGuardExemptPath),
+// so even a request carrying a bearer token does no partner read before the
+// HMAC check (#7296); the route reads the raw body itself via c.req.text(), so no body-consuming
 // middleware may sit in front of it. NOT in SELF_MANAGED_DB_CONTEXT_ROUTES:
 // there is no ambient auth transaction to opt out of on an unauthenticated route.
 api.route('/webhooks', quickbooksWebhookRoutes);
+// Xero webhook (W05) — no session auth, HMAC-gated with XERO_WEBHOOK_KEY.
+// partnerGuard skips this exact path (isPartnerGuardExemptPath), so even a
+// request carrying a bearer token does no partner read before the HMAC check.
+// The route reads the raw body itself via c.req.text(), so no body-consuming
+// middleware may sit in front of it. NOT in SELF_MANAGED_DB_CONTEXT_ROUTES:
+// there is no ambient auth transaction to opt out of on an unauthenticated route.
+api.route('/webhooks', xeroWebhookRoutes);
 // Resend delivery webhook for partner sending domains (W06) — no session auth,
 // Svix-signature-verified, and inert with a 404 when EMAIL_DOMAINS_WEBHOOK_SECRET
 // is unset. partnerGuard passes through (no Authorization header); the route
@@ -941,10 +1024,26 @@ api.route('/webhooks', quickbooksWebhookRoutes);
 // sit in front of it. NOT in SELF_MANAGED_DB_CONTEXT_ROUTES: there is no ambient
 // auth transaction to opt out of on an unauthenticated route.
 api.route('/webhooks', resendWebhookRoutes);
+// EDR vendor push hints (W03 PR-B, #8167) — no session auth; the per-connection
+// secret the vendor echoes in Authorization is verified in the handler.
+// partnerGuard skips the exact /webhooks/edr/<uuid> path so that secret is never
+// parsed as a JWT; the global body gate caps it at 256 KB and it has its own
+// isolated per-IP bucket. NOT under /edr (whose authMiddleware covers `*`) and
+// NOT in SELF_MANAGED_DB_CONTEXT_ROUTES: no ambient auth transaction exists here.
+api.route('/webhooks', edrWebhookRoutes);
+// Flow webhook ingress (Tool Catalog W05, #5220) — public, no session auth: the
+// Breeze HMAC signature / X-Breeze-Webhook-Token is verified in
+// services/flows/webhook/ingest.ts (uniform 401). partnerGuard skips the exact
+// /webhooks/flows/<uuid> path; the global body gate caps it at 262,144 B and it
+// has its own isolated per-IP bucket. Mounted at its own prefix, not under the
+// authenticated /flows router. NOT in SELF_MANAGED_DB_CONTEXT_ROUTES: no ambient
+// auth transaction exists on an unauthenticated route.
+api.route('/webhooks/flows', flowWebhookRoutes);
 api.route('/policies', policyRoutes);
 api.route('/configuration-policies', configPolicyRoutes);
 api.route('/psa', psaRoutes);
 api.route('/patches', patchRoutes);
+api.route('/oem-updates', oemUpdatesFleetRoutes);
 api.route('/third-party-catalog', thirdPartyCatalogRoutes);
 api.route('/patch-policies', patchPolicyRoutes);
 api.route('/update-rings', updateRingRoutes);
@@ -990,6 +1089,10 @@ api.route('/discovery', discoveryRoutes);
 // probe lives in its own module so routes/discovery.ts does not grow past 2,247
 // lines; no path overlaps, so mount order is immaterial.
 api.route('/discovery', discoveryAssetProbeRoutes);
+// GET/PUT/DELETE /discovery/assets/:id/placement — physical placement, #8134.
+// Another sub-router at the same prefix; no path overlap, so order is immaterial.
+api.route('/discovery', discoveryAssetPlacementRoutes);
+api.route('/discovery', discoveryAssetCircuitsRoutes);
 api.route('/network/baselines', networkBaselineRoutes);
 api.route('/network/changes', networkChangeRoutes);
 api.route('/portal', portalRoutes);
@@ -1008,6 +1111,8 @@ api.route('/monitoring', monitoringRoutes);
 // lines). `/assets/:id` cannot shadow `/assets/:id/metrics`.
 api.route('/monitoring', monitoringAssetMetricsRoutes);
 api.route('/audit-baselines', auditBaselineRoutes);
+// #6958 D2: deeper mount first so `/software` never shadows it.
+api.route('/software/builtin-packages', softwareBuiltinPackagesRoutes);
 api.route('/software', softwareRoutes);
 api.route('/software-policies', softwarePoliciesRoutes);
 // Deeper mount first: isolates the platform-admin sync router from the main
@@ -1023,6 +1128,7 @@ api.route('/integrations', integrationRoutes);
 api.route('/partner/trust', partnerTrustRoutes);
 // W04 (#5612): the partner CEILING for the unattended script lane.
 api.route('/partner/ai/script-policy', partnerAiScriptPolicyRoutes);
+api.route('/partner/ai/data-policy', partnerAiDataPolicyRoutes);
 // W03 (partner sending domains). MUST stay above the catch-all `/partner`
 // mount below, the same ordering `/partner/trust` relies on — Hono matches in
 // registration order, so a later specific mount is never reached.
@@ -1044,7 +1150,8 @@ api.route('/metrics', metricsRoutes);
 api.route('/agent-ws', createAgentWsRoutes(upgradeWebSocket));
 api.route('/agent-versions', agentVersionRoutes);
 api.route('/viewers', viewerRoutes);
-api.route('/ai/provider', aiProviderRoutes);
+// AI model registry (W04 #7602) — before the broad '/ai' mounts (Hono matches in order).
+api.route('/ai/models', aiModelsRoutes);
 // BEFORE /ai/agents: aiAgentsRoutes owns /:id, which would otherwise capture
 // '/schedules' as an agent id (#4189).
 api.route('/ai/agents/schedules', aiAgentSchedulesRoutes);
@@ -1059,6 +1166,15 @@ api.route('/ai/patch-plan', patchPlanRoutes);
 // Read-only Operator task surface (W07 of #5205, P3-1e) — a separate route
 // module from the already-large aiAgentsRoutes per spec §12.
 api.route('/ai/operator', aiOperatorTasksRoutes);
+// Wisp W03 (#9909): memory page routes. MUST stay above '/wisp': wispRoutes'
+// use('*') gates (partner scope only) match /wisp/memory/* too, and Hono runs
+// matching handlers in registration order. Registered first, a matched memory
+// handler answers before those gates are reached (pinned in
+// routes/wisp/memory.test.ts). Its own gates: auth → wispEnabled() → ai_sessions:use.
+api.route('/wisp/memory', wispMemoryRoutes);
+// Wisp W02 (#9908): delegation grants. Every route 404s while
+// BREEZE_WISP_ENABLED is off (checked per request inside wispRoutes).
+api.route('/wisp', wispRoutes);
 // W03 (#5612): more specific than '/ai', so it must be registered first — same
 // reason '/ai/agents/schedules' sits above '/ai/agents'. Hono matches in
 // registration order.
@@ -1067,6 +1183,7 @@ api.route('/ai/script-proposals', aiScriptProposalRoutes);
 // registered ahead of '/ai' so the literal paths never fall into a sibling
 // param route.
 api.route('/ai', aiScriptPolicyRoutes);
+api.route('/ai', aiDataPolicyRoutes);
 // BEFORE /ai: aiRoutes owns broad paths. There is no /ai/agents mount here —
 // the per-run artifact LIST lives inside aiAgentsRoutes itself (see
 // routes/aiAgents.ts, above its /runs/:runId), so no second router shares
@@ -1079,6 +1196,7 @@ api.route('/dev', devPushRoutes);
 api.route('/helper', helperRoutes);
 api.route('/playbooks', playbookRoutes);
 api.route('/remediation-suggestions', remediationSuggestionRoutes);
+api.route('/fix-memory', fixMemoryRoutes);
 api.route('/changes', changesRoutes);
 api.route('/dns-security', dnsSecurityRoutes);
 api.route('/s1', sentinelOneRoutes);
@@ -1115,7 +1233,11 @@ api.route('/extensions', extensionsWebRoutes);
 // Tool Catalog W1 (#5215 / #5216) — BYO MCP tool sources. 404s whole-router
 // when TOOL_SOURCES_ENABLED is off (routes/toolSources.ts's first `use('*')`).
 api.route('/tool-sources', toolSourcesRoutes);
+// Tool Catalog W03 (#5218) — read-only flows. 404s whole-router when
+// FLOWS_ENABLED is off (routes/flows.ts's first `use('*')`).
+api.route('/flows', flowsRoutes);
 api.route('/topology', topologyRoutes);
+api.route('/circuits', circuitRoutes);
 
 // One system-scoped state store, shared by the per-request enabled gate and the
 // built-in extension loader. The gate checks installed_extensions.enabled on
@@ -1139,20 +1261,15 @@ app.notFound((c) => {
 app.onError((err, c) => {
   // Handle HTTPException properly (e.g., 401, 403, etc.)
   if (err instanceof HTTPException) {
-    // A typed HTTPException may carry a machine-readable `code` (e.g.
-    // `lease_unavailable`) that callers switch on. This handler builds the body
-    // itself instead of delegating to `err.getResponse()`, so the code has to
-    // be copied across explicitly or it is silently dropped.
-    const typedCode = (err as { code?: unknown }).code;
-    return c.json(
-      {
-        error: err.message || 'Request failed',
-        message: err.message,
-        ...(typeof typedCode === 'string' && typedCode ? { code: typedCode } : {})
-      },
-      err.status
-    );
+    return httpExceptionResponse(err, c);
   }
+
+  // W08 (#8147): a pool-acquire timeout (#8229/#8243) or an RLS prologue
+  // timeout means the caller's work never ran — answer 503 + Retry-After so
+  // agents make one attempt per cycle instead of four, and keep saturation out
+  // of Sentry (see middleware/dbSaturationResponse.ts).
+  const saturated = dbSaturationResponse(err, c);
+  if (saturated) return saturated;
 
   // #3022 — say out loud what a CONNECT_TIMEOUT actually means before the raw
   // error is logged. The driver's own message is `write CONNECT_TIMEOUT
@@ -1218,6 +1335,19 @@ async function initializeWorkers(): Promise<void> {
     console.warn('[WARN] Redis not available - background workers disabled');
     workerInitPhase = 'skipped-no-redis';
     readiness.invalidate();
+    // #7105: the few entries that need only Postgres (the stale command
+    // reaper) keep running on their Redis-less fallback. Readiness is
+    // unchanged — this process still consumes no queues.
+    await startRedisIndependentWorkers(breezeRole(), {
+      onResult: (name, ok, error) => {
+        if (ok) return;
+        console.error(`[CRITICAL] Failed to start ${name} without Redis:`, error);
+        captureException(error instanceof Error ? error : new Error(String(error)));
+      },
+    });
+    // #4134: no relay consumer starts, so give up the shard claimed before
+    // serving; producers then answer `offline` instead of enqueuing unread.
+    await releaseAgentCommandRelayClaim();
     return;
   }
 
@@ -1366,17 +1496,21 @@ async function shutdownRuntime(signal: NodeJS.Signals): Promise<void> {
   shutdownInProgress = true;
   console.log(`[shutdown] Received ${signal}, shutting down gracefully...`);
 
-  getWebhookWorker().stop();
+  stopCompanionScriptReconciler();
+  stopCompanionWorkReconciler();
   // The sampler is already unref'd, so this is tidiness rather than a
   // requirement — it just stops starvation warnings from being emitted about a
   // process that is deliberately winding down and no longer serving traffic.
   stopEventLoopMonitor();
+  stopCapacityGuard();
+  stopAdmissionControl();
   // #3214. Also already unref'd, so this is tidiness — but it additionally stops
   // the watchdog opening a fresh probe connection while the pool is draining,
   // which would report `database-unreachable` about a process that is simply
   // shutting down.
   stopDbPoolHealthMonitor();
   stopWedgedBackendMonitor();
+  stopRedisMemoryMonitor();
   if (auditRetryInterval) {
     clearInterval(auditRetryInterval);
     auditRetryInterval = null;
@@ -1465,11 +1599,18 @@ async function shutdownRuntime(signal: NodeJS.Signals): Promise<void> {
         // subscribers. A leaked one keeps the process alive past SIGTERM, which
         // is how a rolling deploy turns into a stuck pod.
         shutdownChatRunBridge,
+        // W06: the loopback model gateway — revokes every grant (aborting in-flight
+        // upstream calls) once the workers that hold them have settled.
+        closeModelGateway,
         shutdownEventDispatchWorker,
         shutdownEventDispatchQueue,
         shutdownAgentCommandRelayWorker,
+        // #4134: per-instance producer handles (shared connection; hygiene).
+        shutdownAgentCommandRelayQueue,
       ],
     },
+    // 3b. W05: the cluster cache subscriber owns its own duplicate connection.
+    { name: 'cluster-cache-bus', tasks: [() => getClusterCacheBus().stop()] },
     // 4. Event bus releases its borrowed connection reference (no quit — Task 2).
     { name: 'eventbus', tasks: [async () => getEventBus().close()] },
     // 5. The ONLY owner of the Redis quits.
@@ -1581,6 +1722,8 @@ async function bootstrap(): Promise<void> {
   }
 
   console.log(`Breeze API starting on port ${port}...`);
+  // #7024: BREEZE_VERSION edited without new image digests — say so at boot.
+  warnOnVersionMismatch();
 
   // Initialize error reporting first so failures during the rest of startup
   // (migrations, seeds, self-tests) and the global onError/unhandledRejection
@@ -1644,6 +1787,8 @@ async function bootstrap(): Promise<void> {
   // Validate configuration before anything else — fail fast on missing/insecure secrets.
   // The validated config is stored as a singleton; retrieve later via getConfig().
   const config = validateConfig();
+  agentRolloutLimits();
+  startCapacityGuard({ checkDependencies: async () => (await readiness.get()).ready });
 
   // #3214 — pool-health watchdog.
   //
@@ -1703,6 +1848,9 @@ async function bootstrap(): Promise<void> {
   // userId bumps the shared Redis version key, so every replica invalidates at
   // once rather than each aging out independently.
   await clearPermissionCache();
+  // Wisp W02: re-evaluate a user's delegation grants whenever their permission
+  // authority changes (pause on lost access, lift its own pauses on recovery).
+  if (wispEnabled()) installWispGrantHooks();
   console.log(`[config] Validated: NODE_ENV=${config.NODE_ENV}, port=${config.API_PORT}`);
   if ((process.env.AGENT_BACKUP_SERVER_URL ?? '').trim()) {
     console.log(`[config] AGENT_BACKUP_SERVER_URL active: ${process.env.AGENT_BACKUP_SERVER_URL!.trim()}`);
@@ -1734,7 +1882,26 @@ async function bootstrap(): Promise<void> {
     console.error('[startup] Platform admin bootstrap failed (non-fatal):', err);
   }
 
+  registerAllEffectProbes(); // Recipe Library E4: provider effect probes, registered once
+
   await runStartupChecks();
+  if (process.env.CLOUDCOM_CREDENTIALS_ENABLED === 'true') { startCompanionScriptReconciler(); startCompanionWorkReconciler(); }
+
+  // #6452 — Redis memory watchdog. Started after runStartupChecks so the
+  // client has had its first connect attempt; the watchdog itself tolerates
+  // Redis being down (a failed tick just counts against
+  // breeze_redis_memory_check_failures) and keeps retrying on its own
+  // interval, same as the other watchdogs below.
+  const redisMemoryIntervalMs = startRedisMemoryMonitor();
+  if (redisMemoryIntervalMs === null) {
+    console.warn(
+      '[redis-memory] Watchdog DISABLED via REDIS_MEMORY_MONITOR_DISABLED — a full '
+      + 'noeviction Redis instance will surface only as a failed login or a stuck '
+      + 'queue (#6452).',
+    );
+  } else {
+    console.log(`[redis-memory] Watchdog started (interval ${redisMemoryIntervalMs}ms)`);
+  }
 
   // #3128: advisory scan for PAM rules pinned to a risk tier no tool resolves
   // to any more. Tool tiers are static code, so a deploy is the only moment a
@@ -1807,6 +1974,21 @@ async function bootstrap(): Promise<void> {
     console.error('[startup] Failed to backfill default patch schedules:', err);
   }
 
+  // #9933: devices removed before dynamic groups started excluding
+  // decommissioned devices kept their non-pinned dynamic rows. Enqueue the
+  // normal device.created re-evaluation for each; once the jobs run the query
+  // finds nothing, so this is a no-op on later boots. Not awaited: it only
+  // enqueues, and boot should not wait on Redis round-trips per device.
+  void reconcileDecommissionedDynamicMemberships()
+    .then((result) => {
+      if (result.scanned > 0) {
+        console.log(`[startup] Queued dynamic-group re-evaluation for ${result.enqueued} removed device(s) (${result.failed} failed)`);
+      }
+    })
+    .catch((err) => {
+      console.error('[startup] Failed to reconcile removed devices out of dynamic groups:', err);
+    });
+
   // Register local agent binaries in DB and optionally sync to S3 (BINARY_SOURCE=local only)
   //
   // #6098: deliberately NOT wrapped in runWithSystemDbAccess. syncBinaries()
@@ -1827,6 +2009,38 @@ async function bootstrap(): Promise<void> {
     }
     console.error('[startup] Binary sync failed (non-fatal in github mode):', err);
   }
+
+  // #6263 W03b: upsert the built-in YARA pack from this release's signed
+  // manifest. Deliberately NOT awaited: it fetches the release asset and runs
+  // the breeze-yarac pre-check (up to minutes), and a pack problem must never
+  // block or crash boot. It never rejects (every failure logs and returns
+  // 'skipped', leaving the published built-in set as it was) and opens its
+  // own system DB context outside any ambient one. Every replica runs it; an
+  // advisory lock plus the strictly-newer version check make that a no-op
+  // after the first.
+  void syncBuiltinYaraPack()
+    .then((outcome) => console.log(`[startup] Built-in YARA pack: ${outcome}`))
+    .catch((err) => console.error('[startup] Built-in YARA pack sync failed unexpectedly:', err));
+
+  // Keeps the regular-MSI download cache (installerBuilder.ts) warm from a
+  // background timer instead of the request path: the installer routes that
+  // consume it all run inside an ambient DB transaction opened by auth
+  // middleware before their handlers run, so there is no place inside those
+  // handlers to fetch before "entering" that transaction. Deliberately not
+  // awaited — its own first fetch runs in the background and must not add
+  // GitHub network latency to boot; a request that lands before the first
+  // warm completes still gets its own bounded fetch via fetchRegularMsi's
+  // existing cache-miss fallback.
+  startRegularMsiCacheWarmer();
+  // AI model registry W01 (#7599): keep the in-process ai_platform_models
+  // snapshot warm for the synchronous hot paths (Agent SDK thinking options,
+  // token-price fallback). Not awaited; until the first load lands, those
+  // paths use the W00 bootstrap rules.
+  startPlatformModelSnapshotRefresher();
+  // AI model registry W03 (#7601): the platform key serves only us/global
+  // (W01 D3). Non-fatal: an unsupported AI_PLATFORM_INFERENCE_GEO takes
+  // platform models offline (residency_unavailable), so say so at boot.
+  warnOnUnsupportedPlatformInferenceGeo();
 
   // Boot-time self-test for every deployment that signs its own update
   // manifests: round-trip a synthetic manifest through sign + validate. If this
@@ -1856,9 +2070,38 @@ async function bootstrap(): Promise<void> {
     }
   }
 
+  // M2 D1: physical topology producer authorities (discovery target, UniFi
+  // controller site). Default-deny when absent, so install before serving.
+  registerTopologyPhysicalAuthorities();
+
+  // Model gateway: before every upstream dial, refuse a grant whose connection
+  // was disconnected or re-keyed/re-pointed (on any replica) since it was
+  // issued. Installed before serving, so no request can dial without it.
+  registerGatewayConnectionCheck();
+
+  // W05 (#8144): subscribe to cluster cache invalidations before serving, so a
+  // write on another instance reaches this one's hot-path caches. Bounded at
+  // 1 s and never throws; without Redis the caches stay TTL-only.
+  const clusterCacheOutcome = startupChecks.redisOk ? await getClusterCacheBus().start() : 'unavailable';
+  if (clusterCacheOutcome === 'subscribed') console.log('[clusterCache] subscriber subscribed');
+  else console.warn(`[clusterCache] subscriber ${clusterCacheOutcome}: hot-path caches on this instance are TTL-only until it subscribes`);
+
+  // #4134: take this instance's relay shard before any agent socket can name
+  // it in a presence lease (producers answer `offline` for a shard without an
+  // owner). The consumer itself starts in initializeWorkers(). Never throws.
+  if (breezeRole() !== 'worker' && startupChecks.redisOk) await claimAgentCommandRelayShard();
+
+  // W08: start sampling only after migrations and boot work, so their stalls
+  // never enter the controller's history. Admission never affects /ready.
+  startAdmissionControl();
   server = serve({
     fetch: app.fetch,
     port
+  });
+
+  // #9372: one non-blocking TURN preflight (never rejects, never delays boot).
+  startTurnPreflight(process.env).catch(() => {
+    console.warn('[turn-preflight] preflight failed unexpectedly');
   });
 
   injectWebSocket(server);
@@ -1871,7 +2114,11 @@ async function bootstrap(): Promise<void> {
   // partners × ~40 queries each must never delay /health. One-time per partner
   // (partners.settings marker), each partner its own transaction; opt out with
   // BREEZE_BUILTIN_MONITORS_AUTOSEED=false.
-  void ensureBuiltInMonitorsForAllPartners()
+  void runStartupTaskWithRetry('built-in monitors provisioning', () => ensureBuiltInMonitorsForAllPartners(), {
+    hasFailures: (r) => r.failed > 0,
+    onFailure: ({ attempt, error, result }) =>
+      console.error(`[startup] Built-in monitors provisioning attempt ${attempt + 1} failed:`, error ?? `${result?.failed} partner(s) failed`),
+  })
     .then((result) => {
       if (result.provisioned > 0 || result.failed > 0) {
         console.log(
@@ -1881,6 +2128,159 @@ async function bootstrap(): Promise<void> {
     })
     .catch((err) => {
       console.error('[startup] Failed to provision built-in monitors:', err);
+    });
+
+  // #6958: move every partner's provisioned DNS built-in rows forward to the
+  // code-pinned version. Forward-only (an older replica booting never reverts
+  // a newer pin), one row-locked transaction per catalog row, per-row failures
+  // counted rather than thrown. Detached after serve() like the task above.
+  void runStartupTaskWithRetry('pinned built-in package refresh', () => refreshPinnedBuiltinPackages(), {
+    hasFailures: (r) => r.failed > 0,
+    onFailure: ({ attempt, error, result }) =>
+      console.error(`[startup] pinned built-in package refresh attempt ${attempt + 1} failed:`, error ?? `${result?.failed} row(s) failed`),
+  })
+    .then((result) => {
+      // Counts are from the last attempt. Rows still failing after the retries
+      // are already in Sentry per key; surface the exhaustion as an error too.
+      const line = `[startup] pinned built-in package refresh: refreshed ${result.refreshed}, failed ${result.failed}`;
+      if (result.failed > 0) console.error(`${line} (retries exhausted)`);
+      else console.log(line);
+    })
+    .catch((err) => {
+      console.error('[startup] pinned built-in package refresh failed:', err);
+    });
+
+  // Notification-channel secrets in partner/org/site settings are sealed on
+  // write; this seals values stored before that. Detached after serve() like
+  // the built-ins above: readers open both forms, so nothing waits on it.
+  // Idempotent — once every value is sealed it finds nothing to do.
+  void runStartupTaskWithRetry('settings secret sealing', () => sealUnsealedSettingsSecrets(), {
+    hasFailures: (r) => Object.values(r).some((s) => s.failed > 0),
+    onFailure: ({ attempt, error }) =>
+      console.error(`[startup] Sealing stored settings secrets attempt ${attempt + 1} failed:`, error ?? 'row failures'),
+  })
+    .then((result) => {
+      const touched = Object.entries(result).filter(([, stats]) => stats.scanned > 0);
+      if (touched.length > 0) {
+        console.log(
+          `[startup] Settings secrets sealed: ${touched
+            .map(([table, s]) => `${table} ${s.sealed}/${s.scanned} row(s) (${s.contended} changed concurrently, ${s.failed} failed)`)
+            .join('; ')}`,
+        );
+      }
+    })
+    .catch((err) => {
+      console.error('[startup] Sealing stored settings secrets failed:', err);
+      captureException(err, undefined, { area: 'settings_secret_backfill' });
+    });
+
+  // Backup destination credentials (backup_configs.provider_config) are sealed
+  // on write by the column type; this seals rows stored before that. Detached
+  // and idempotent like the settings sweep above — readers open both forms.
+  void sealUnsealedBackupProviderConfigs()
+    .then((stats) => {
+      if (stats.scanned > 0) {
+        console.log(
+          `[startup] Backup destination credentials sealed: ${stats.sealed}/${stats.scanned} config(s) `
+            + `(${stats.contended} changed concurrently, ${stats.failed} failed)`,
+        );
+      }
+      if (stats.failed > 0 || stats.contended > 0) {
+        captureException(
+          new Error(`backup destination credential sealing left ${stats.failed} failed and ${stats.contended} contended config(s)`),
+          undefined,
+          { area: 'backup_provider_config_backfill' },
+        );
+      }
+    })
+    .catch((err) => {
+      console.error('[startup] Sealing stored backup destination credentials failed:', err);
+      captureException(err, undefined, { area: 'backup_provider_config_backfill' });
+    });
+
+  // Installer bootstrap tokens are stored as a keyed hash on issue; this hashes
+  // the plaintext rows issued before that. Detached and idempotent like the
+  // sweeps above — redemption matches both forms. A missing
+  // ENROLLMENT_KEY_PEPPER rejects the whole sweep here (logged + reported),
+  // never the boot.
+  void hashLegacyInstallerBootstrapTokens()
+    .then((stats) => {
+      if (stats.scanned > 0) {
+        console.log(
+          `[startup] Installer bootstrap tokens hashed: ${stats.hashed}/${stats.scanned} token(s) `
+            + `(${stats.contended} changed concurrently, ${stats.failed} failed)`,
+        );
+      }
+      if (stats.failed > 0 || stats.contended > 0) {
+        captureException(
+          new Error(`installer bootstrap token hashing left ${stats.failed} failed and ${stats.contended} contended token(s)`),
+          undefined,
+          { area: 'installer_bootstrap_token_hash_backfill' },
+        );
+      }
+    })
+    .catch((err) => {
+      console.error('[startup] Hashing stored installer bootstrap tokens failed:', err);
+      captureException(err, undefined, { area: 'installer_bootstrap_token_hash_backfill' });
+    });
+
+  // W06 (#7604, D6): MCP_LLM_PROVIDER=openai-compatible → one env-managed
+  // OpenAI-compatible connection + priced offering per partner (and the chat
+  // default re-pointed once); unset → those connections are released. Each
+  // partner's registry gate (ensurePartnerCutover, W08 bootstrap) runs FIRST
+  // inside the bootstrap, so the gate can never undo it. Detached and retried on a
+  // bounded schedule; idempotent across restarts and replicas (per-partner
+  // registry lock). One Sentry event if it still ends incomplete; then, every
+  // 10 minutes, partners created since boot get their connection. Never logs
+  // the key.
+  void runEnvOpenAiBootstrapAtBoot()
+    .catch((err) => {
+      console.error('[startup] MCP_LLM_* env bootstrap failed:', safeErrorMessage(err));
+      captureException(reportableCutoverError(err), undefined, { area: 'ai_env_openai_bootstrap' });
+    });
+
+  // Storage keys that S3 backup destinations used before backups were written
+  // only through storage sessions are recorded once, so each stays listed
+  // until there is evidence it was disabled. Detached after serve() like the
+  // backfills above; idempotent (a destination whose current key is recorded is
+  // skipped) and never logs a key.
+  void runStartupTaskWithRetry('backup storage key history', () => baselineCredentialHistory(), {
+    hasFailures: (r) => r.failed > 0,
+    onFailure: ({ attempt, error }) =>
+      console.error(
+        `[startup] Recording backup storage key history attempt ${attempt + 1} failed:`,
+        error instanceof Error ? error.name : error ? 'unknown' : 'destination failures',
+      ),
+  })
+    .then((result) => {
+      if (result.recorded > 0 || result.failed > 0) {
+        console.log(
+          `[startup] Backup storage key history: ${result.recorded} recorded, ${result.failed} failed `
+          + `(${result.scanned} S3 destination(s) scanned)`,
+        );
+      }
+    })
+    .catch((err) => {
+      console.error('[startup] Recording backup storage key history failed:', err instanceof Error ? err.name : 'unknown');
+      captureException(err, undefined, { area: 'backup_storage_key_history' });
+    });
+
+  // W05d — convert whatever legacy alerting the W05c release left unconverted,
+  // retire what cannot convert (listed in the Monitors banner), then count what
+  // is still unretired. Detached after serve() for the same reason as the
+  // built-ins above; chained so the count runs AFTER the sweep and cannot fire
+  // spuriously on the first boot after upgrade. Never refuses boot.
+  void runLegacyAlertingRetirement({ retryDelaysMs: LEGACY_ALERTING_RETRY_DELAYS_MS })
+    .then((r) => {
+      console.log(
+        `[startup] Legacy alerting retirement: ${r.partners} partner(s) swept, ${r.converted} converted, ` +
+        `${r.retired} retired, ${r.failed} failed; unretired rules=${r.remaining.configPolicyAlertRules} ` +
+        `watches=${r.remaining.configPolicyMonitoringWatches}`,
+      );
+    })
+    .catch((err) => {
+      console.error('[startup] Legacy alerting retirement failed:', err);
+      captureException(err, undefined, { area: 'legacy_alerting_sweep' });
     });
 
   // Explicit registration (wave 3.5d-b, #4086): the lazy worker registry only
@@ -1904,6 +2304,21 @@ async function bootstrap(): Promise<void> {
 
   await initializeWorkers();
 
+  // #11004: build the static AI tool surface (~340 Zod tool declarations, their
+  // registry metadata and one throwaway SDK MCP server) now, so the first AI
+  // chat message after a restart does not pay for it on the request path. CPU
+  // only, no I/O.
+  try {
+    const warmed = warmBreezeToolSurface();
+    console.log(`[startup] AI tool surface warmed: ${warmed.tools} chat tools in ${warmed.ms}ms`);
+  } catch (error) {
+    // The template is not cached on failure, so every AI session retries the
+    // same build — and a deterministic failure (e.g. a tool with no registry
+    // description) fails each one until it is fixed.
+    console.error('[startup] AI tool surface warm-up failed; AI chat sessions will retry the build and fail the same way until this is fixed:', error);
+    captureException(error instanceof Error ? error : new Error(String(error)));
+  }
+
   // Periodically retry failed audit writes. The in-process queue is bounded
   // (10k entries) and per-entry attempts are capped (3) with exponential
   // backoff, so a long DB outage degrades to Sentry-capture rather than
@@ -1920,7 +2335,9 @@ async function bootstrap(): Promise<void> {
   installSignalHandlers();
 }
 
-void bootstrap().catch((error) => {
-  console.error('[CRITICAL] API startup failed:', error);
-  process.exit(1);
-});
+if (!process.env.VITEST) {
+  void bootstrap().catch((error) => {
+    console.error('[CRITICAL] API startup failed:', error);
+    process.exit(1);
+  });
+}

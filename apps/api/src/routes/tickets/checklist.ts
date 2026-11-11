@@ -8,8 +8,13 @@ import {
   checklistItemPatchSchema,
   checklistReorderSchema,
   applyChecklistTemplateSchema,
+  saveChecklistAsTemplateSchema,
+  ERROR_CODES,
 } from '@breeze/shared';
-import { applyChecklistTemplateToTicket } from '../../services/ticketChecklistTemplateService';
+import {
+  applyChecklistTemplateToTicket,
+  createChecklistTemplateFromTicket,
+} from '../../services/ticketChecklistTemplateService';
 import { HumanWorkStepWaitingError } from '../../services/aiOperator/humanWorkService';
 import {
   templateActorFrom,
@@ -25,6 +30,7 @@ import {
   ChecklistServiceError,
 } from '../../services/ticketChecklistService';
 import { getScopedTicketOr404 } from './tickets';
+import { ticketMergedResponse } from '../../services/ticketMerge/errors';
 
 const idParam = z.object({ id: z.string().guid() });
 const itemIdParam = z.object({ itemId: z.string().guid() });
@@ -41,6 +47,9 @@ const readPerm = requirePermission(PERMISSIONS.TICKETS_READ.resource, PERMISSION
 const writePerm = requirePermission(PERMISSIONS.TICKETS_WRITE.resource, PERMISSIONS.TICKETS_WRITE.action);
 
 function handleServiceError(c: { json: (b: unknown, s: number) => Response }, err: unknown): Response {
+  // #8972 W1: a write reached a merged tombstone → 409 with the survivor id.
+  const merged = ticketMergedResponse(c, err);
+  if (merged) return merged;
   if (err instanceof ChecklistServiceError) {
     return c.json(
       { error: err.message, code: err.code, ...(err.details ? { details: err.details } : {}) },
@@ -94,7 +103,7 @@ ticketChecklistRoutes.patch(
       // Re-check scope through the item's OWN ticket — the item id alone
       // carries no tenancy. A foreign or soft-deleted ticket is a bare 404.
       if (!(await getScopedTicketOr404(auth, item.ticketId))) {
-        return c.json({ error: 'Checklist item not found' }, 404);
+        return c.json({ error: 'Checklist item not found', code: ERROR_CODES.NOT_FOUND }, 404);
       }
       return c.json({ data: await patchChecklistItem(item.id, patch, actorFrom(c)) });
     } catch (err) {
@@ -113,7 +122,7 @@ ticketChecklistRoutes.delete(
     try {
       const item = await getChecklistItemOr404(c.req.valid('param').itemId);
       if (!(await getScopedTicketOr404(auth, item.ticketId))) {
-        return c.json({ error: 'Checklist item not found' }, 404);
+        return c.json({ error: 'Checklist item not found', code: ERROR_CODES.NOT_FOUND }, 404);
       }
       await deleteChecklistItem(item.id);
       return c.json({ data: { deleted: true } });
@@ -130,7 +139,7 @@ ticketChecklistRoutes.get(
   zValidator('param', idParam),
   async (c) => {
     const ticket = await getScopedTicketOr404(c.get('auth'), c.req.valid('param').id);
-    if (!ticket) return c.json({ error: 'Ticket not found' }, 404);
+    if (!ticket) return c.json({ error: 'Ticket not found', code: ERROR_CODES.NOT_FOUND }, 404);
     return c.json({ data: await listChecklist(ticket.id) });
   },
 );
@@ -143,7 +152,7 @@ ticketChecklistRoutes.post(
   zValidator('json', checklistItemCreateSchema),
   async (c) => {
     const ticket = await getScopedTicketOr404(c.get('auth'), c.req.valid('param').id);
-    if (!ticket) return c.json({ error: 'Ticket not found' }, 404);
+    if (!ticket) return c.json({ error: 'Ticket not found', code: ERROR_CODES.NOT_FOUND }, 404);
     try {
       const item = await addChecklistItem(
         { id: ticket.id, orgId: ticket.orgId },
@@ -168,7 +177,7 @@ ticketChecklistRoutes.post(
   async (c) => {
     const auth = c.get('auth');
     const ticket = await getScopedTicketOr404(auth, c.req.valid('param').id);
-    if (!ticket) return c.json({ error: 'Ticket not found' }, 404);
+    if (!ticket) return c.json({ error: 'Ticket not found', code: ERROR_CODES.NOT_FOUND }, 404);
     try {
       // Deliberately NOT gated on isInteractiveUserSession: applying a template
       // creates UNTICKED steps and asserts nothing about work performed. Only
@@ -188,6 +197,32 @@ ticketChecklistRoutes.post(
   },
 );
 
+// Save the ticket's CURRENT steps as a new template (#9180). Needs tickets:write
+// (this router's writePerm); a partner-wide template additionally needs
+// canManagePartnerWidePolicies, enforced in the service (403). The steps are
+// read server-side from the ticket, never taken from the body.
+ticketChecklistRoutes.post(
+  '/:id/checklist/save-as-template',
+  scopes,
+  writePerm,
+  zValidator('param', idParam),
+  zValidator('json', saveChecklistAsTemplateSchema),
+  async (c) => {
+    const ticket = await getScopedTicketOr404(c.get('auth'), c.req.valid('param').id);
+    if (!ticket) return c.json({ error: 'Ticket not found', code: ERROR_CODES.NOT_FOUND }, 404);
+    try {
+      const result = await createChecklistTemplateFromTicket(
+        { id: ticket.id, orgId: ticket.orgId },
+        c.req.valid('json'),
+        templateActorFrom(c),
+      );
+      return c.json({ data: result }, 201);
+    } catch (err) {
+      return handleChecklistTemplateError(c, err);
+    }
+  },
+);
+
 ticketChecklistRoutes.post(
   '/:id/checklist/reorder',
   scopes,
@@ -196,7 +231,7 @@ ticketChecklistRoutes.post(
   zValidator('json', checklistReorderSchema),
   async (c) => {
     const ticket = await getScopedTicketOr404(c.get('auth'), c.req.valid('param').id);
-    if (!ticket) return c.json({ error: 'Ticket not found' }, 404);
+    if (!ticket) return c.json({ error: 'Ticket not found', code: ERROR_CODES.NOT_FOUND }, 404);
     try {
       return c.json({ data: await reorderChecklist(ticket.id, c.req.valid('json').itemIds) });
     } catch (err) {

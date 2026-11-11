@@ -1,22 +1,23 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+// The holding-org refusal reads the org; the db mocks below do not model it.
+vi.mock('../services/unassignedPool/protectedOrg', () => ({ isHoldingOrg: vi.fn(async () => false) }));
 import { writeRouteAudit } from '../services/auditEvents';
 import { Hono } from 'hono';
 
-const { queueDeliveryMock, validateWebhookUrlSafetyWithDnsMock } = vi.hoisted(() => ({
-  queueDeliveryMock: vi.fn(),
+const { enqueueWebhookAttemptMock, validateWebhookUrlSafetyWithDnsMock } = vi.hoisted(() => ({
+  enqueueWebhookAttemptMock: vi.fn(),
   validateWebhookUrlSafetyWithDnsMock: vi.fn()
 }));
 
 const { permissionGate, mfaGate } = vi.hoisted(() => ({
-  permissionGate: { deny: false },
+  // `granted` null: every permission passes unless listed in `denied`.
+  // `granted` a set: only the listed resource:action pairs pass.
+  permissionGate: { deny: false, denied: new Set<string>(), granted: null as Set<string> | null },
   mfaGate: { deny: false }
 }));
 
-vi.mock('../workers/webhookDelivery', () => ({
-  getWebhookWorker: vi.fn(() => ({
-    queueDelivery: queueDeliveryMock
-  }))
-}));
+vi.mock('../jobs/webhookDeliveryQueue', () => ({ enqueueWebhookAttempt: enqueueWebhookAttemptMock }));
 
 vi.mock('../services/auditEvents', () => ({
   writeRouteAudit: vi.fn()
@@ -41,6 +42,7 @@ vi.mock('../services/notificationSenders/webhookSender', () => ({
 }));
 
 vi.mock('../db', () => ({
+  runAfterDbContextCommit: vi.fn((_label, work) => work()),
   runOutsideDbContext: vi.fn((fn) => fn()),
   withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn()),
   withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
@@ -84,8 +86,13 @@ vi.mock('../middleware/auth', () => ({
     return next();
   }),
   requireScope: vi.fn(() => async (_c: any, next: any) => next()),
-  requirePermission: vi.fn(() => async (c: any, next: any) => {
-    if (permissionGate.deny) {
+  requirePermission: vi.fn((resource: string, action: string) => async (c: any, next: any) => {
+    const key = `${resource}:${action}`;
+    if (
+      permissionGate.deny
+      || permissionGate.denied.has(key)
+      || (permissionGate.granted !== null && !permissionGate.granted.has(key))
+    ) {
       return c.json({ error: 'Forbidden' }, 403);
     }
     return next();
@@ -98,9 +105,10 @@ vi.mock('../middleware/auth', () => ({
   })
 }));
 
-import { db } from '../db';
+import { db, runAfterDbContextCommit } from '../db';
 import { authMiddleware } from '../middleware/auth';
 import { webhookRoutes } from './webhooks';
+import { isHoldingOrg } from '../services/unassignedPool/protectedOrg';
 
 function mockSelectLimit(result: unknown) {
   return {
@@ -156,7 +164,10 @@ describe('webhook routes', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    enqueueWebhookAttemptMock.mockResolvedValue(DELIVERY_ID_1);
     permissionGate.deny = false;
+    permissionGate.denied.clear();
+    permissionGate.granted = null;
     mfaGate.deny = false;
     validateWebhookUrlSafetyWithDnsMock.mockResolvedValue([]);
 
@@ -176,6 +187,156 @@ describe('webhook routes', () => {
     app.route('/webhooks', webhookRoutes);
   });
 
+  describe('payload versions and replay identity', () => {
+    const orgId = '11111111-1111-1111-1111-111111111111';
+    const row = (extra: Record<string, unknown> = {}) => ({
+      id: WEBHOOK_ID_1, orgId, name: 'Alert webhook', url: 'https://hooks.example.com/alerts',
+      secret: 'secret-123', events: ['alert.triggered'], headers: [], status: 'active',
+      approvalGeneration: 1, payloadVersion: 2, createdAt: new Date(), updatedAt: new Date(), ...extra,
+    });
+    const request = (body: Record<string, unknown>, method = 'POST', path = '/webhooks') =>
+      app.request(path, { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const createBody = { name: 'Alert webhook', url: 'https://hooks.example.com/alerts', secret: 'secret-123', events: ['alert.triggered'] };
+    const insert = () => {
+      const values = vi.fn((data: Record<string, unknown>) => ({ returning: vi.fn(async () => [row(data)]) }));
+      vi.mocked(db.insert).mockReturnValueOnce({ values } as any);
+      return values;
+    };
+    beforeEach(() => { vi.mocked(db.select).mockReset(); vi.mocked(db.insert).mockReset(); vi.mocked(db.update).mockReset(); });
+
+    // #10565: alert.escalated has a publisher now, so it is an ordinary event.
+    it('accepts alert.escalated on POST', async () => {
+      const values = insert();
+      const res = await request({ ...createBody, events: ['alert.escalated'] });
+      expect(res.status).toBe(201);
+      expect(values.mock.calls[0]![0]).toHaveProperty('events', ['alert.escalated']);
+    });
+    it('accepts alert.escalated on PATCH', async () => {
+      vi.mocked(db.select).mockReturnValueOnce(mockSelectLimit([row()]) as any);
+      const set = vi.fn((data: Record<string, unknown>) => ({ where: vi.fn(() => ({ returning: vi.fn(async () => [row(data)]) })) }));
+      vi.mocked(db.update).mockReturnValueOnce({ set } as any);
+      const res = await request({ events: ['alert.escalated'] }, 'PATCH', `/webhooks/${WEBHOOK_ID_1}`);
+      expect(res.status).toBe(200);
+      expect(set.mock.calls[0]![0]).toHaveProperty('events', ['alert.escalated']);
+    });
+    it('allows pausing a stored subscription without changing its events', async () => {
+      const stored = row({ events: ['alert.escalated'] });
+      vi.mocked(db.select).mockReturnValueOnce(mockSelectLimit([stored]) as any);
+      const set = vi.fn((data: Record<string, unknown>) => ({ where: vi.fn(() => ({ returning: vi.fn(async () => [{ ...stored, ...data }]) })) }));
+      vi.mocked(db.update).mockReturnValueOnce({ set } as any);
+      const res = await request({ status: 'paused' }, 'PATCH', `/webhooks/${WEBHOOK_ID_1}`);
+      expect(res.status).toBe(200);
+      expect(set.mock.calls[0]![0]).toHaveProperty('status', 'disabled');
+      expect(set.mock.calls[0]![0]).not.toHaveProperty('events');
+      expect(await res.json()).toMatchObject({ status: 'paused', events: ['alert.escalated'] });
+    });
+    it('stores an explicit v1 choice on creation', async () => {
+      const values = insert();
+      expect((await request({ ...createBody, payloadVersion: 1 })).status).toBe(201);
+      expect(values.mock.calls[0]![0]).toHaveProperty('payloadVersion', 1);
+    });
+    it('leaves an omitted payload version to the database default', async () => {
+      const values = insert();
+      expect((await request(createBody)).status).toBe(201);
+      expect(values.mock.calls[0]![0]).not.toHaveProperty('payloadVersion');
+    });
+    it.each(['POST', 'PATCH'])('rejects unsupported payload versions on %s', async (method) => {
+      if (method === 'POST') insert();
+      else {
+        vi.mocked(db.select).mockReturnValueOnce(mockSelectLimit([row()]) as any);
+        vi.mocked(db.update).mockReturnValueOnce({ set: vi.fn(() => ({ where: vi.fn(() => ({ returning: vi.fn(async () => [row()]) })) })) } as any);
+      }
+      const res = await request({ ...createBody, payloadVersion: 3 }, method,
+        method === 'POST' ? '/webhooks' : `/webhooks/${WEBHOOK_ID_1}`);
+      expect(res.status).toBe(400);
+      expect(db.insert).not.toHaveBeenCalled();
+      expect(db.update).not.toHaveBeenCalled();
+    });
+    it('updates and returns the version', async () => {
+      vi.mocked(db.select).mockReturnValueOnce(mockSelectLimit([row({ payloadVersion: 1 })]) as any);
+      const set = vi.fn((data: Record<string, unknown>) => ({ where: vi.fn(() => ({ returning: vi.fn(async () => [row(data)]) })) }));
+      vi.mocked(db.update).mockReturnValueOnce({ set } as any);
+      const res = await request({ payloadVersion: 2 }, 'PATCH', `/webhooks/${WEBHOOK_ID_1}`);
+      expect(res.status).toBe(200);
+      expect(set.mock.calls[0]![0]).toHaveProperty('payloadVersion', 2);
+      expect(await res.json()).toHaveProperty('payloadVersion', 2);
+    });
+    it('returns the version on GET', async () => {
+      vi.mocked(db.select).mockReturnValueOnce(mockSelectLimit([row({ payloadVersion: 1 })]) as any)
+        .mockReturnValueOnce({ from: vi.fn(() => ({ where: vi.fn(() => ({ groupBy: vi.fn(async () => []) })) })) } as any)
+        .mockReturnValueOnce(mockSelectOrderLimit([]) as any);
+      const res = await app.request(`/webhooks/${WEBHOOK_ID_1}`);
+      expect(res.status).toBe(200);
+      expect(await res.json()).toHaveProperty('payloadVersion', 1);
+    });
+    it.each([1, 2])('pins v%s sample delivery version and timestamp without enriching the payload', async (version) => {
+      vi.mocked(db.select).mockReturnValueOnce(mockSelectLimit([row({ payloadVersion: version })]) as any);
+      const values = insert();
+      const payload = { sample: true };
+      const res = await request({ payload }, 'POST', `/webhooks/${WEBHOOK_ID_1}/test`);
+      expect(res.status).toBe(202);
+      const recorded = values.mock.calls[0]![0];
+      expect(recorded).toMatchObject({ payloadVersion: version, webhookGeneration: 1, eventTimestamp: expect.any(Date), payload });
+      expect(enqueueWebhookAttemptMock).toHaveBeenCalledWith({ deliveryId: WEBHOOK_ID_1, webhookId: WEBHOOK_ID_1, generation: 1, attemptsMade: 0 }, expect.any(Date));
+      expect(runAfterDbContextCommit).toHaveBeenCalledWith(expect.any(String), expect.any(Function));
+    });
+    it.each(['test', 'retry'])('keeps the %s delivery pending when post-commit enqueue fails', async (kind) => {
+      vi.mocked(db.select).mockReturnValueOnce(mockSelectLimit([row()]) as any);
+      if (kind === 'retry') vi.mocked(db.select).mockReturnValueOnce(mockSelectLimit([{
+        id: DELIVERY_ID_1, webhookId: WEBHOOK_ID_1, status: 'failed', eventType: 'alert.triggered', eventId: 'source', payloadVersion: 1, payload: {},
+      }]) as any);
+      const values = insert();
+      enqueueWebhookAttemptMock.mockRejectedValueOnce(new Error('Redis down'));
+      const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const res = await request({}, 'POST', `/webhooks/${WEBHOOK_ID_1}/${kind === 'test' ? 'test' : `retry/${DELIVERY_ID_1}`}`);
+      expect(res.status).toBe(202);
+      expect(values.mock.calls[0]![0]).toMatchObject({ status: 'pending', attempts: 0 });
+      expect(db.update).not.toHaveBeenCalled();
+      expect(log).toHaveBeenCalledWith(expect.stringContaining('WEBHOOK_DELIVERY_ENQUEUE_FAILED'));
+      log.mockRestore();
+    });
+    it('includes scheduled deliveries in stats and accepts the scheduled history filter', async () => {
+      vi.mocked(db.select).mockReturnValueOnce(mockSelectLimit([row()]) as any)
+        .mockReturnValueOnce({ from: vi.fn(() => ({ where: vi.fn(() => ({ groupBy: vi.fn(async () => [{ status: 'scheduled', count: 2 }]) })) })) } as any)
+        .mockReturnValueOnce(mockSelectOrderLimit([]) as any);
+      const detail = await app.request(`/webhooks/${WEBHOOK_ID_1}`);
+      expect(await detail.json()).toHaveProperty('deliveryStats.scheduled', 2);
+      vi.mocked(db.select).mockReturnValueOnce(mockSelectLimit([row()]) as any)
+        .mockReturnValueOnce(mockSelectWhere([{ count: 0 }]) as any)
+        .mockReturnValueOnce(mockSelectList([]) as any);
+      expect((await app.request(`/webhooks/${WEBHOOK_ID_1}/deliveries?status=scheduled`)).status).toBe(200);
+    });
+    it.each([
+      { root: null, version: 1 }, { root: 'original-root-event', version: 1 },
+      { root: null, version: 2 }, { root: 'original-root-event', version: 2 },
+    ])('replays source version $version and preserves root $root', async ({ root, version }) => {
+      const source = { id: DELIVERY_ID_1, webhookId: WEBHOOK_ID_1, eventId: 'source-event', eventType: 'alert.triggered',
+        payload: { alertId: 'alert-id' }, status: 'failed', payloadVersion: version, replayRootEventId: root };
+      vi.mocked(db.select).mockReturnValueOnce(mockSelectLimit([row({ payloadVersion: version === 1 ? 2 : 1 })]) as any)
+        .mockReturnValueOnce(mockSelectLimit([source]) as any);
+      const values = insert();
+      const res = await request({}, 'POST', `/webhooks/${WEBHOOK_ID_1}/retry/${DELIVERY_ID_1}`);
+      expect(res.status).toBe(202);
+      const recorded = values.mock.calls[0]![0];
+      expect(recorded).toMatchObject({ payloadVersion: version, webhookGeneration: 1, payload: source.payload,
+        replayRootEventId: root ?? source.eventId, eventTimestamp: expect.any(Date) });
+      expect(recorded.eventId).not.toBe(source.eventId);
+      expect(enqueueWebhookAttemptMock).toHaveBeenCalledWith({ deliveryId: WEBHOOK_ID_1, webhookId: WEBHOOK_ID_1, generation: 1, attemptsMade: 0 }, expect.any(Date));
+    });
+  });
+
+  it('refuses to create a webhook on a holding org', async () => {
+    vi.mocked(isHoldingOrg).mockResolvedValueOnce(true);
+    const res = await app.request('/webhooks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'Device Alerts', url: 'https://example.com/webhooks/device', secret: 'secret-123', events: ['device.online'] }),
+    });
+    expect(res.status).toBe(409);
+    expect((await res.json()).code).toBe('ORG_PROTECTED');
+    expect(db.insert).not.toHaveBeenCalled();
+  });
+
   it('creates a webhook with secret metadata', async () => {
     vi.mocked(db.insert).mockReturnValueOnce({
       values: vi.fn(() => ({
@@ -185,13 +346,15 @@ describe('webhook routes', () => {
           name: 'Device Alerts',
           url: 'https://example.com/webhooks/device',
           secret: 'secret-123',
-          events: ['device.created'],
+          events: ['device.online'],
           headers: [{ key: 'X-Test', value: '1' }],
           status: 'active',
           createdBy: 'user-123',
           createdAt: new Date('2026-02-07T13:00:00.000Z'),
           updatedAt: new Date('2026-02-07T13:00:00.000Z'),
-          lastDeliveryAt: null
+          lastDeliveryAt: new Date('2026-02-08T10:00:00.000Z'),
+          successCount: 7,
+          failureCount: 2
         }]))
       }))
     } as any);
@@ -203,7 +366,7 @@ describe('webhook routes', () => {
         name: 'Device Alerts',
         url: 'https://example.com/webhooks/device',
         secret: 'secret-123',
-        events: ['device.created'],
+        events: ['device.online'],
         headers: [{ key: 'X-Test', value: '1' }]
       })
     });
@@ -213,6 +376,10 @@ describe('webhook routes', () => {
     expect(body.id).toBe(WEBHOOK_ID_1);
     expect(body.hasSecret).toBe(true);
     expect(body.secret).toBeUndefined();
+    // #9656: delivery stats are returned so the list can render them.
+    expect(body.lastDeliveryAt).toBe('2026-02-08T10:00:00.000Z');
+    expect(body.successCount).toBe(7);
+    expect(body.failureCount).toBe(2);
   });
 
   it('encrypts and redacts custom webhook headers', async () => {
@@ -224,7 +391,7 @@ describe('webhook routes', () => {
           name: 'Device Alerts',
           url: 'https://example.com/webhooks/device',
           secret: values.secret,
-          events: ['device.created'],
+          events: ['device.online'],
           headers: values.headers,
           status: 'active',
           createdBy: 'user-123',
@@ -242,7 +409,7 @@ describe('webhook routes', () => {
         name: 'Device Alerts',
         url: 'https://example.com/webhooks/device',
         secret: 'secret-123',
-        events: ['device.created'],
+        events: ['device.online'],
         headers: [{ key: 'Authorization', value: 'Bearer token-123' }]
       })
     });
@@ -272,7 +439,7 @@ describe('webhook routes', () => {
           // Echo back what the handler actually persisted (encrypted form).
           url: values.url,
           secret: values.secret,
-          events: ['device.created'],
+          events: ['device.online'],
           headers: [],
           status: 'active',
           createdBy: 'user-123',
@@ -290,7 +457,7 @@ describe('webhook routes', () => {
         name: 'Cred Hook',
         url: credentialUrl,
         secret: 'secret-123',
-        events: ['device.created']
+        events: ['device.online']
       })
     });
 
@@ -320,7 +487,7 @@ describe('webhook routes', () => {
         name: 'Device Alerts',
         url: encryptedUrl,
         secret: null,
-        events: ['device.created'],
+        events: ['device.online'],
         headers: [],
         status: 'active',
         createdBy: 'user-123',
@@ -348,7 +515,7 @@ describe('webhook routes', () => {
       }))
     } as any);
 
-    queueDeliveryMock.mockResolvedValueOnce(DELIVERY_ID_1);
+    enqueueWebhookAttemptMock.mockResolvedValueOnce(DELIVERY_ID_1);
 
     const res = await app.request(`/webhooks/${WEBHOOK_ID_1}/test`, {
       method: 'POST',
@@ -360,9 +527,9 @@ describe('webhook routes', () => {
     // The decrypted url/secret never leave this route on the enqueue path —
     // only the webhook's identity and generation snapshot. The worker
     // reloads and decrypts the row itself, at send time.
-    const call = (queueDeliveryMock.mock.calls as any[])[0];
-    expect(call[0]).toBe(WEBHOOK_ID_1);
-    expect(call[1]).toBe(1);
+    const call = (enqueueWebhookAttemptMock.mock.calls as any[])[0];
+    expect(call[0]).toEqual({ deliveryId: DELIVERY_ID_1, webhookId: WEBHOOK_ID_1, generation: 1, attemptsMade: 0 });
+    expect(call[1]).toBeInstanceOf(Date);
     expect(JSON.stringify(call)).not.toContain('user:pass');
   });
 
@@ -378,7 +545,7 @@ describe('webhook routes', () => {
         name: 'Device Alerts',
         url: encryptedUrl,
         secret: null,
-        events: ['device.created'],
+        events: ['device.online'],
         headers: [],
         status: 'active',
         createdBy: 'user-123',
@@ -396,7 +563,7 @@ describe('webhook routes', () => {
           name: 'Renamed',
           url: encryptedUrl,
           secret: null,
-          events: ['device.created'],
+          events: ['device.online'],
           headers: [],
           status: 'active',
           createdBy: 'user-123',
@@ -436,7 +603,7 @@ describe('webhook routes', () => {
         name: 'Device Alerts',
         url: 'https://example.com/webhook',
         secret: 'secret-123',
-        events: ['device.created'],
+        events: ['device.online'],
         headers: [],
         status: 'active',
         createdBy: 'user-123',
@@ -455,7 +622,7 @@ describe('webhook routes', () => {
           name: 'Renamed Again',
           url: 'https://example.com/webhook',
           secret: 'secret-123',
-          events: ['device.created'],
+          events: ['device.online'],
           headers: [],
           status: 'active',
           createdBy: 'user-123',
@@ -489,7 +656,7 @@ describe('webhook routes', () => {
         name: 'Unsafe Hook',
         url: 'http://127.0.0.1/webhook',
         secret: 'secret-123',
-        events: ['device.created']
+        events: ['device.online']
       })
     });
 
@@ -506,7 +673,7 @@ describe('webhook routes', () => {
         name: 'Bad Headers',
         url: 'https://example.com/webhook',
         secret: 'secret-123',
-        events: ['device.created'],
+        events: ['device.online'],
         headers: [
           { key: 'Host', value: '169.254.169.254' },
           { key: 'X-Breeze-Event-Type', value: 'forged' },
@@ -534,13 +701,15 @@ describe('webhook routes', () => {
           name: 'First',
           url: 'https://example.com/1',
           secret: 'secret-a',
-          events: ['device.created'],
+          events: ['device.online'],
           headers: [{ key: 'Authorization', value: 'enc:v1:test' }],
           status: 'active',
           createdBy: 'user-123',
           createdAt: new Date(),
           updatedAt: new Date(),
-          lastDeliveryAt: null
+          lastDeliveryAt: new Date('2026-02-08T10:00:00.000Z'),
+          successCount: 5,
+          failureCount: 1
         },
         {
           id: WEBHOOK_ID_2,
@@ -554,7 +723,9 @@ describe('webhook routes', () => {
           createdBy: 'user-123',
           createdAt: new Date(),
           updatedAt: new Date(),
-          lastDeliveryAt: null
+          lastDeliveryAt: null,
+          successCount: null,
+          failureCount: null
         }
       ]) as any);
 
@@ -574,6 +745,9 @@ describe('webhook routes', () => {
       masked: '********'
     });
     expect(body.data[1].status).toBe('paused');
+    // #9656: delivery stats on the list; null counts serialize as 0.
+    expect(body.data[0]).toMatchObject({ lastDeliveryAt: '2026-02-08T10:00:00.000Z', successCount: 5, failureCount: 1 });
+    expect(body.data[1]).toMatchObject({ lastDeliveryAt: null, successCount: 0, failureCount: 0 });
   });
 
   it('queues a test webhook delivery and persists pending delivery row', async () => {
@@ -584,7 +758,7 @@ describe('webhook routes', () => {
         name: 'Device Alerts',
         url: 'https://example.com/webhook',
         secret: 'secret-123',
-        events: ['device.created'],
+        events: ['device.online'],
         headers: [{ key: 'X-Test', value: '1' }],
         status: 'active',
         createdBy: 'user-123',
@@ -616,7 +790,7 @@ describe('webhook routes', () => {
       }))
     } as any);
 
-    queueDeliveryMock.mockResolvedValueOnce(DELIVERY_ID_1);
+    enqueueWebhookAttemptMock.mockResolvedValueOnce(DELIVERY_ID_1);
 
     const res = await app.request(`/webhooks/${WEBHOOK_ID_1}/test`, {
       method: 'POST',
@@ -628,7 +802,7 @@ describe('webhook routes', () => {
     const body = await res.json();
     expect(body.message).toBe('Test delivery queued');
     expect(body.delivery.status).toBe('pending');
-    expect(queueDeliveryMock).toHaveBeenCalledTimes(1);
+    expect(enqueueWebhookAttemptMock).toHaveBeenCalledTimes(1);
   });
 
   // Site-ceiling gate contract §3/finding 6: a paused webhook's test job
@@ -643,7 +817,7 @@ describe('webhook routes', () => {
         name: 'Device Alerts',
         url: 'https://example.com/webhook',
         secret: 'secret-123',
-        events: ['device.created'],
+        events: ['device.online'],
         headers: [],
         status: 'disabled',
         createdBy: 'user-123',
@@ -661,7 +835,7 @@ describe('webhook routes', () => {
     });
 
     expect(res.status).toBe(409);
-    expect(queueDeliveryMock).not.toHaveBeenCalled();
+    expect(enqueueWebhookAttemptMock).not.toHaveBeenCalled();
   });
 
   it('rejects retry when delivery is not failed', async () => {
@@ -673,7 +847,7 @@ describe('webhook routes', () => {
           name: 'Device Alerts',
           url: 'https://example.com/webhook',
           secret: 'secret-123',
-          events: ['device.created'],
+          events: ['device.online'],
           headers: [],
           status: 'active',
           createdBy: 'user-123',
@@ -687,7 +861,7 @@ describe('webhook routes', () => {
         {
           id: DELIVERY_ID_1,
           webhookId: WEBHOOK_ID_1,
-          eventType: 'device.created',
+          eventType: 'device.online',
           eventId: 'evt-1',
           payload: {},
           status: 'delivered',
@@ -718,7 +892,7 @@ describe('webhook routes', () => {
         name: 'Device Alerts',
         url: 'https://example.com/webhook',
         secret: 'secret-123',
-        events: ['device.created'],
+        events: ['device.online'],
         headers: [],
         status: 'error',
         createdBy: 'user-123',
@@ -735,7 +909,7 @@ describe('webhook routes', () => {
     });
 
     expect(res.status).toBe(409);
-    expect(queueDeliveryMock).not.toHaveBeenCalled();
+    expect(enqueueWebhookAttemptMock).not.toHaveBeenCalled();
   });
 
   it('rejects webhook mutations when permission check fails', async () => {
@@ -748,7 +922,7 @@ describe('webhook routes', () => {
         name: 'Device Alerts',
         url: 'https://example.com/webhooks/device',
         secret: 'secret-123',
-        events: ['device.created']
+        events: ['device.online']
       })
     });
 
@@ -765,7 +939,7 @@ describe('webhook routes', () => {
         name: 'Device Alerts',
         url: 'https://example.com/webhooks/device',
         secret: 'secret-123',
-        events: ['device.created']
+        events: ['device.online']
       })
     });
 
@@ -789,7 +963,7 @@ describe('webhook routes', () => {
     name: 'Foreign Hook',
     url: 'https://attacker:secret@foreign.example.com/hook?token=leak-me',
     secret: 'foreign-secret-should-not-leak',
-    events: ['device.created'],
+    events: ['device.online'],
     headers: [],
     status: 'active',
     createdBy: 'foreign-user',
@@ -864,7 +1038,7 @@ describe('webhook routes', () => {
       name: 'Credentialed Hook',
       url: encryptedUrl,
       secret: null,
-      events: ['device.created'],
+      events: ['device.online'],
       headers: encryptWebhookHeaders([{ key: 'Authorization', value: 'Bearer stored' }]),
       status: 'active',
       createdBy: 'user-123',
@@ -894,7 +1068,7 @@ describe('webhook routes', () => {
       name: 'Credentialed Hook',
       url: encryptSecret('https://hooks.example.com/deliver') as string,
       secret: null,
-      events: ['device.created'],
+      events: ['device.online'],
       headers: encryptWebhookHeaders([{ key: 'Authorization', value: 'Bearer stored' }]),
       status: 'active',
       createdBy: 'user-123',
@@ -926,7 +1100,7 @@ describe('webhook routes', () => {
       name: 'Credentialed Hook',
       url: encryptSecret('https://hooks.example.com/deliver') as string,
       secret: null,
-      events: ['device.created'],
+      events: ['device.online'],
       headers: [],
       status: 'active',
       createdBy: 'user-123',
@@ -949,7 +1123,400 @@ describe('webhook routes', () => {
 
     expect(res.status).toBe(409);
     expect(writeRouteAudit).not.toHaveBeenCalled();
-    expect(queueDeliveryMock).not.toHaveBeenCalled();
+    expect(enqueueWebhookAttemptMock).not.toHaveBeenCalled();
   });
 
+
+  // #6767. The webhooks.headers jsonb column also holds a legacy record shape
+  // ({ "X-Api-Key": "enc:v1:..." }) that delivery still honours. The edit form
+  // reads headers from GET, so dropping them there made the next save submit
+  // `headers: []` and wipe the stored credentials.
+  describe('legacy record-shaped headers (#6767)', () => {
+    async function legacyRow() {
+      const { encryptSecret } = await import('../services/secretCrypto');
+      return {
+        id: WEBHOOK_ID_1,
+        orgId: '11111111-1111-1111-1111-111111111111',
+        name: 'Legacy Hook',
+        url: 'https://example.com/legacy',
+        secret: null,
+        events: ['device.online'],
+        headers: { 'X-Api-Key': encryptSecret('legacy-key-123') as string },
+        status: 'active',
+        createdBy: 'user-123',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        lastDeliveryAt: null,
+      };
+    }
+
+    it('returns legacy headers to the edit form as redacted entries instead of dropping them', async () => {
+      const row = await legacyRow();
+      vi.mocked(db.select)
+        .mockReturnValueOnce(mockSelectWhere([{ count: 1 }]) as any)
+        .mockReturnValueOnce(mockSelectList([row]) as any);
+
+      const res = await app.request('/webhooks', { method: 'GET', headers: { Authorization: 'Bearer token' } });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data[0].headers).toEqual([
+        { key: 'X-Api-Key', value: { redacted: true, hasSecret: true, masked: '********' } },
+      ]);
+      expect(JSON.stringify(body)).not.toContain('legacy-key-123');
+    });
+
+    it('keeps the stored legacy header value when the edit form re-submits it masked', async () => {
+      const row = await legacyRow();
+      vi.mocked(db.select).mockReturnValueOnce(mockSelectLimit([row]) as any);
+      const setSpy = vi.fn((values: Record<string, unknown>) => ({
+        where: vi.fn(() => ({ returning: vi.fn(async () => [{ ...row, ...values }]) })),
+      }));
+      vi.mocked(db.update).mockReturnValueOnce({ set: setSpy } as any);
+
+      const res = await app.request(`/webhooks/${WEBHOOK_ID_1}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ name: 'Renamed', headers: [{ key: 'X-Api-Key', value: '********' }] }),
+      });
+
+      expect(res.status).toBe(200);
+      const setPayload = (setSpy.mock.calls as any[])[0][0];
+      expect(setPayload.headers).toEqual([{ key: 'X-Api-Key', value: row.headers['X-Api-Key'] }]);
+    });
+  });
+
+  // #6767. The Webhooks tab toggle and the form's enabled switch speak `status`.
+  it('pauses and resumes a webhook through PATCH status', async () => {
+    const stored = {
+      id: WEBHOOK_ID_1,
+      orgId: '11111111-1111-1111-1111-111111111111',
+      name: 'Device Alerts',
+      url: 'https://example.com/webhook',
+      secret: null,
+      events: ['device.online'],
+      headers: [],
+      status: 'active',
+      createdBy: 'user-123',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      lastDeliveryAt: null,
+    };
+    vi.mocked(db.select).mockReturnValueOnce(mockSelectLimit([stored]) as any);
+    const setSpy = vi.fn((values: Record<string, unknown>) => ({
+      where: vi.fn(() => ({ returning: vi.fn(async () => [{ ...stored, ...values }]) })),
+    }));
+    vi.mocked(db.update).mockReturnValueOnce({ set: setSpy } as any);
+
+    const res = await app.request(`/webhooks/${WEBHOOK_ID_1}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({ status: 'paused' }),
+    });
+
+    expect(res.status).toBe(200);
+    expect((setSpy.mock.calls as any[])[0][0].status).toBe('disabled');
+    expect((await res.json()).status).toBe('paused');
+  });
+
+  it('creates a webhook paused when the create form asks for it', async () => {
+    const valuesSpy = vi.fn((values: Record<string, unknown>) => ({
+      returning: vi.fn(async () => [{
+        id: WEBHOOK_ID_1,
+        createdBy: 'user-123',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        lastDeliveryAt: null,
+        ...values,
+      }]),
+    }));
+    vi.mocked(db.insert).mockReturnValueOnce({ values: valuesSpy } as any);
+
+    const res = await app.request('/webhooks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Paused hook',
+        url: 'https://example.com/webhooks/paused',
+        secret: 'secret-123',
+        events: ['device.online'],
+        status: 'paused',
+      }),
+    });
+
+    expect(res.status).toBe(201);
+    expect((valuesSpy.mock.calls as any[])[0][0].status).toBe('disabled');
+    expect((await res.json()).status).toBe('paused');
+  });
+  describe('read routes require webhooks:read', () => {
+    const readRoutes = [
+      ['GET /webhooks', '/webhooks'],
+      ['GET /webhooks/:id', `/webhooks/${WEBHOOK_ID_1}`],
+      ['GET /webhooks/:id/deliveries', `/webhooks/${WEBHOOK_ID_1}/deliveries`]
+    ] as const;
+
+    it.each(readRoutes)('%s returns 403 without webhooks:read and never reads the db', async (_name, path) => {
+      permissionGate.denied.add('webhooks:read');
+
+      const res = await app.request(path, { method: 'GET', headers: { Authorization: 'Bearer token' } });
+
+      expect(res.status).toBe(403);
+      expect(db.select).not.toHaveBeenCalled();
+    });
+
+    it.each(readRoutes)('%s returns 403 with only organizations:read and never reads the db', async (_name, path) => {
+      permissionGate.granted = new Set(['organizations:read']);
+
+      const res = await app.request(path, { method: 'GET', headers: { Authorization: 'Bearer token' } });
+
+      expect(res.status).toBe(403);
+      expect(db.select).not.toHaveBeenCalled();
+    });
+
+    const storedWebhook = {
+      id: WEBHOOK_ID_1,
+      orgId: '11111111-1111-1111-1111-111111111111',
+      name: 'Hook',
+      url: 'https://example.com/hook',
+      secret: null,
+      events: ['device.online'],
+      headers: [],
+      status: 'active'
+    };
+
+    it('GET /webhooks returns 200 with only webhooks:read', async () => {
+      permissionGate.granted = new Set(['webhooks:read']);
+      vi.mocked(db.select)
+        .mockReturnValueOnce(mockSelectWhere([{ count: 1 }]) as any)
+        .mockReturnValueOnce(mockSelectList([storedWebhook]) as any);
+
+      const res = await app.request('/webhooks', { method: 'GET', headers: { Authorization: 'Bearer token' } });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data).toHaveLength(1);
+      expect(body.data[0].id).toBe(WEBHOOK_ID_1);
+    });
+
+    it('GET /webhooks/:id returns 200 with only webhooks:read', async () => {
+      permissionGate.granted = new Set(['webhooks:read']);
+      vi.mocked(db.select)
+        .mockReturnValueOnce(mockSelectLimit([storedWebhook]) as any)
+        .mockReturnValueOnce({
+          from: vi.fn(() => ({
+            where: vi.fn(() => ({ groupBy: vi.fn(() => Promise.resolve([{ status: 'delivered', count: 2 }])) }))
+          }))
+        } as any)
+        .mockReturnValueOnce(mockSelectOrderLimit([]) as any);
+
+      const res = await app.request(`/webhooks/${WEBHOOK_ID_1}`, { method: 'GET', headers: { Authorization: 'Bearer token' } });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.id).toBe(WEBHOOK_ID_1);
+      expect(body.deliveryStats.delivered).toBe(2);
+    });
+
+    it('GET /webhooks/:id/deliveries returns 200 with only webhooks:read', async () => {
+      permissionGate.granted = new Set(['webhooks:read']);
+      vi.mocked(db.select)
+        .mockReturnValueOnce(mockSelectLimit([storedWebhook]) as any)
+        .mockReturnValueOnce(mockSelectWhere([{ count: 0 }]) as any)
+        .mockReturnValueOnce(mockSelectList([]) as any);
+
+      const res = await app.request(`/webhooks/${WEBHOOK_ID_1}/deliveries`, { method: 'GET', headers: { Authorization: 'Bearer token' } });
+
+      expect(res.status).toBe(200);
+      expect((await res.json()).data).toEqual([]);
+    });
+
+    it('webhook writes still require organizations:write, not webhooks:read', async () => {
+      permissionGate.granted = new Set(['webhooks:read']);
+
+      const res = await app.request('/webhooks', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'Hook', url: 'https://example.com/hook', events: ['device.online'] })
+      });
+
+      expect(res.status).toBe(403);
+      expect(db.insert).not.toHaveBeenCalled();
+    });
+  });
+
+  it('GET /:id/deliveries returns only the fields the delivery history renders', async () => {
+    vi.mocked(db.select)
+      .mockReturnValueOnce(mockSelectLimit([{
+        id: WEBHOOK_ID_1,
+        orgId: '11111111-1111-1111-1111-111111111111',
+        name: 'Hook',
+        url: 'https://example.com/hook',
+        secret: null,
+        events: ['device.online'],
+        headers: [],
+        status: 'active'
+      }]) as any)
+      .mockReturnValueOnce(mockSelectWhere([{ count: 1 }]) as any)
+      .mockReturnValueOnce(mockSelectList([{
+        id: DELIVERY_ID_1,
+        webhookId: WEBHOOK_ID_1,
+        eventType: 'device.online',
+        eventId: 'evt-1',
+        payload: { hostname: 'payload-marker' },
+        status: 'failed',
+        attempts: 2,
+        nextRetryAt: null,
+        responseStatus: 500,
+        responseBody: 'response-body-marker',
+        responseTimeMs: 120,
+        errorMessage: 'boom',
+        createdAt: new Date('2026-01-01T00:00:00Z'),
+        deliveredAt: null
+      }]) as any);
+
+    const res = await app.request(`/webhooks/${WEBHOOK_ID_1}/deliveries`, {
+      method: 'GET',
+      headers: { Authorization: 'Bearer token' }
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.pagination.total).toBe(1);
+    expect(body.data).toHaveLength(1);
+    const row = body.data[0];
+    expect(row).toMatchObject({
+      id: DELIVERY_ID_1,
+      webhookId: WEBHOOK_ID_1,
+      status: 'failed',
+      event: 'device.online',
+      responseStatus: 500,
+      attempt: 2,
+      createdAt: '2026-01-01T00:00:00.000Z'
+    });
+    expect(row).not.toHaveProperty('payload');
+    expect(row).not.toHaveProperty('responseBody');
+    const text = JSON.stringify(body);
+    expect(text).not.toContain('payload-marker');
+    expect(text).not.toContain('response-body-marker');
+  });
+  // #9651: the form offered `alert.created`, which nothing publishes, so the
+  // subscription saved fine and never fired. The API now rewrites the legacy
+  // name to `alert.triggered` and rejects names that are never published.
+  describe('event names (#9651)', () => {
+    function mockInsertEcho() {
+      const values = vi.fn((row: any) => ({
+        returning: vi.fn(() => Promise.resolve([{
+          id: WEBHOOK_ID_1,
+          orgId: '11111111-1111-1111-1111-111111111111',
+          name: row.name,
+          url: row.url,
+          secret: row.secret,
+          events: row.events,
+          headers: [],
+          status: 'active',
+          createdBy: 'user-123',
+          createdAt: new Date('2026-02-07T13:00:00.000Z'),
+          updatedAt: new Date('2026-02-07T13:00:00.000Z'),
+          lastDeliveryAt: null,
+          approvalGeneration: 1
+        }]))
+      }));
+      vi.mocked(db.insert).mockReturnValueOnce({ values } as any);
+      return values;
+    }
+
+    function createWith(events: unknown) {
+      return app.request('/webhooks', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'Alerts', url: 'https://example.com/hook', secret: 'secret-123', events })
+      });
+    }
+
+    it('stores a legacy alert.created subscription as alert.triggered', async () => {
+      const values = mockInsertEcho();
+      const res = await createWith(['alert.created', 'device.offline']);
+      expect(res.status).toBe(201);
+      expect((values.mock.calls as any[])[0][0].events).toEqual(['alert.triggered', 'device.offline']);
+      expect((await res.json()).events).toEqual(['alert.triggered', 'device.offline']);
+    });
+
+    it('does not store alert.triggered twice when both names are sent', async () => {
+      const values = mockInsertEcho();
+      const res = await createWith(['alert.triggered', 'alert.created']);
+      expect(res.status).toBe(201);
+      expect((values.mock.calls as any[])[0][0].events).toEqual(['alert.triggered']);
+    });
+
+    it('accepts the * wildcard', async () => {
+      const values = mockInsertEcho();
+      const res = await createWith(['*']);
+      expect(res.status).toBe(201);
+      expect((values.mock.calls as any[])[0][0].events).toEqual(['*']);
+    });
+
+    it('rejects an event name that is never published', async () => {
+      const res = await createWith(['device.online', 'device.exploded']);
+      expect(res.status).toBe(400);
+      expect(JSON.stringify(await res.json())).toContain('device.exploded');
+      expect(db.insert).not.toHaveBeenCalled();
+    });
+
+    it('rewrites alert.created on PATCH too', async () => {
+      vi.mocked(db.select).mockReturnValueOnce(mockSelectLimit([{
+        id: WEBHOOK_ID_1,
+        orgId: '11111111-1111-1111-1111-111111111111',
+        name: 'Alerts',
+        url: 'https://example.com/hook',
+        secret: 'secret-123',
+        events: ['device.online'],
+        headers: [],
+        status: 'active',
+        createdBy: 'user-123',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        lastDeliveryAt: null,
+        approvalGeneration: 1
+      }]) as any);
+      const set = vi.fn((patch: any) => ({
+        where: vi.fn(() => ({
+          returning: vi.fn(() => Promise.resolve([{
+            id: WEBHOOK_ID_1,
+            orgId: '11111111-1111-1111-1111-111111111111',
+            name: 'Alerts',
+            url: 'https://example.com/hook',
+            secret: 'secret-123',
+            events: patch.events,
+            headers: [],
+            status: 'active',
+            createdBy: 'user-123',
+            createdAt: new Date(),
+            updatedAt: new Date(),
+            lastDeliveryAt: null,
+            approvalGeneration: 2
+          }]))
+        }))
+      }));
+      vi.mocked(db.update).mockReturnValueOnce({ set } as any);
+
+      const res = await app.request(`/webhooks/${WEBHOOK_ID_1}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ events: ['alert.created'] })
+      });
+
+      expect(res.status).toBe(200);
+      expect((set.mock.calls as any[])[0][0].events).toEqual(['alert.triggered']);
+    });
+
+    it('rejects an unpublished event name on PATCH without writing', async () => {
+      const res = await app.request(`/webhooks/${WEBHOOK_ID_1}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ events: ['ticket.exploded'] })
+      });
+      expect(res.status).toBe(400);
+      expect(db.update).not.toHaveBeenCalled();
+    });
+  });
 });

@@ -1,4 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+// routes/ai.ts reaches the model registry (ticket-draft) -> candidateLoader,
+// which this file's partial schema mock does not cover. Not under test here.
+vi.mock('../services/aiModels/sessionModel', () => ({
+  resolveSessionTurn: vi.fn(),
+}));
 import { Hono } from 'hono';
 
 // #6396: own-session chat routes are gated on the dedicated ai_sessions:use
@@ -59,8 +65,8 @@ vi.mock('../services/aiAgent', () => ({
 vi.mock('../services/aiCostTracker', () => ({
   getSessionHistory: vi.fn().mockResolvedValue([]),
   getUsageSummary: vi.fn(),
+  getAggregateUsageSummary: vi.fn(),
   updateBudget: vi.fn(),
-  recordUsage: vi.fn(),
 }));
 
 vi.mock('../services/streamingSessionManager', () => ({
@@ -83,7 +89,7 @@ vi.mock('../services/effectiveSettings', () => ({ assertNotLocked: vi.fn() }));
 
 import { aiRoutes } from './ai';
 import { createSession, listSessions, getSession } from '../services/aiAgent';
-import { updateBudget } from '../services/aiCostTracker';
+import { updateBudget, getUsageSummary, getAggregateUsageSummary } from '../services/aiCostTracker';
 
 const ORG_ID = 'org-111';
 
@@ -215,5 +221,50 @@ describe('own-session chat routes are gated on ai_sessions:use (#6396)', () => {
     // Past the permission gate the handler may still 400/404/500 on the
     // minimal mocks; the gate itself is what this asserts.
     expect((await call(method, path, body)).status).not.toBe(403);
+  });
+});
+
+// #9667: partner/system callers with no org selected ("All organizations") got
+// hard-coded zeros. They must get usage aggregated over THEIR accessible orgs.
+describe('GET /ai/usage with no org selected (#9667)', () => {
+  let app: Hono;
+  const AGG = {
+    daily: { inputTokens: 1, outputTokens: 2, totalCostCents: 300, messageCount: 4 },
+    monthly: { inputTokens: 10, outputTokens: 20, totalCostCents: 9000, messageCount: 40 },
+    budget: null,
+    billedTo: 'platform',
+    credits: null,
+    alerts: { fired: [] },
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(getAggregateUsageSummary).mockResolvedValue(AGG as never);
+    app = new Hono();
+    app.route('/ai', aiRoutes);
+  });
+
+  const get = () => app.request('/ai/usage', { headers: { Authorization: 'Bearer t' } });
+  const partnerAuth = (accessibleOrgIds: string[] | null, scope = 'partner') => ({
+    ...authWith([AI_SESSIONS_USE]),
+    scope,
+    orgId: null,
+    partnerId: 'partner-1',
+    accessibleOrgIds,
+  });
+
+  it('aggregates over only the partner caller\'s accessible orgs', async () => {
+    currentAuth = partnerAuth(['org-a', 'org-b']);
+    const res = await get();
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ daily: { totalCostCents: 300 }, monthly: { totalCostCents: 9000 }, budget: null });
+    expect(getAggregateUsageSummary).toHaveBeenCalledWith(['org-a', 'org-b']);
+    expect(getUsageSummary).not.toHaveBeenCalled();
+  });
+
+  it('passes null (unrestricted) for system scope', async () => {
+    currentAuth = partnerAuth(null, 'system');
+    await get();
+    expect(getAggregateUsageSummary).toHaveBeenCalledWith(null);
   });
 });

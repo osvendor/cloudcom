@@ -1,24 +1,20 @@
 package main
 
 import (
-	"encoding/json"
-	"fmt"
 	"io"
 	"os"
 	"os/signal"
-	"os/user"
 	"path/filepath"
 	"runtime"
 	"syscall"
-	"time"
 
 	"github.com/breeze-rmm/agent/internal/authstate"
 	"github.com/breeze-rmm/agent/internal/config"
+	"github.com/breeze-rmm/agent/internal/ech"
 	"github.com/breeze-rmm/agent/internal/ipc"
 	"github.com/breeze-rmm/agent/internal/logging"
 	"github.com/breeze-rmm/agent/internal/remote/desktop"
 	"github.com/breeze-rmm/agent/internal/secmem"
-	"github.com/breeze-rmm/agent/internal/sessionbroker"
 	"github.com/breeze-rmm/agent/internal/userhelper"
 	"github.com/spf13/cobra"
 )
@@ -26,6 +22,7 @@ import (
 var version = "0.5.0"
 var contextFlag string
 var probePrompt bool
+var probeSCK bool
 
 var log = logging.L("desktop-helper")
 
@@ -39,15 +36,33 @@ var rootCmd = &cobra.Command{
 var probeCmd = &cobra.Command{
 	Use:   "probe",
 	Short: "Probe the local macOS desktop capture path for the selected context",
+	Long: `Probe the local macOS desktop capture path for the selected context.
+
+The probe captures once, through CoreGraphics, and does not call
+ScreenCaptureKit unless --sck is given: on macOS 15+ a ScreenCaptureKit call
+can raise the system's screen-recording consent dialog (#8058).
+
+macOS charges the probe's capture to the process that launched it (Terminal,
+or breeze-agent from a Breeze script or remote terminal), not to the launchd
+desktop helper, so its permission results do not reflect the helper's grants.
+The authoritative source is the agent log line "TCC permissions received".`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return runProbe()
+		// Logs to stderr so stdout stays the JSON report.
+		logging.Init("text", "info", os.Stderr)
+		return runProbeTo(cmd.OutOrStdout(), cmd.ErrOrStderr(), probeOptions{
+			allowPrompt: probePrompt,
+			capture:     true,
+			allowSCK:    probeSCK,
+		}, runtime.GOOS)
 	},
 }
 
 func init() {
 	rootCmd.PersistentFlags().StringVar(&contextFlag, "context", ipc.DesktopContextUserSession, "Desktop context: 'user_session' or 'login_window'")
 	probeCmd.Flags().BoolVar(&probePrompt, "prompt", false, "Allow the probe to trigger macOS permission prompts")
+	probeCmd.Flags().BoolVar(&probeSCK, "sck", false, "Also try ScreenCaptureKit, once (macOS 14+). May raise the macOS screen-recording consent dialog")
 	rootCmd.AddCommand(probeCmd)
+	rootCmd.AddCommand(newCaptureBackendCmd())
 }
 
 func main() {
@@ -60,7 +75,9 @@ func runDesktopHelper() {
 	// On macOS this resolves to ~/Library/Logs/Breeze, not the root-owned
 	// 0700 shared agent log directory the user-session LaunchAgent cannot
 	// write (#5877). Other platforms keep the shared directory.
-	logDir, homeErr := config.HelperLogDir()
+	// The role argument only matters on Windows; this standalone binary is
+	// the macOS desktop helper, where the euid decides.
+	logDir, homeErr := config.HelperLogDir(false)
 	mkdirErr := os.MkdirAll(logDir, 0700)
 	logPath := filepath.Join(logDir, "desktop-helper.log")
 	var output io.Writer = os.Stdout
@@ -69,6 +86,13 @@ func runDesktopHelper() {
 		output = f
 	}
 	logging.Init("text", "info", output)
+
+	// On macOS the console-user helper keeps its ECH/DNS caches and the
+	// wallpaper recovery record in ~/Library/Application Support/Breeze: the
+	// agent data dir is 0700 root and unreadable here (#10870). Create it
+	// before the ECH dialer and the shipper first persist a cache; a failure
+	// is reported once the shipper is up.
+	stateDir, stateErr := ensureHelperStateDir(runtime.GOOS, os.Geteuid(), config.ProcessDataDir)
 
 	// Use LoadHelperConfig, NOT Load: on macOS the desktop-helper runs as the
 	// logged-in user (Aqua LaunchAgent), and Load() unconditionally reads
@@ -79,6 +103,8 @@ func runDesktopHelper() {
 		log.Warn("helper config load failed; helper log shipping disabled", "error", err)
 		cfg = config.Default()
 	}
+	// The log shipper below dials through the shared ECH dialer.
+	ech.Configure(cfg.ECH, cfg.ECHServerEnabled)
 
 	socketPath := ipc.DefaultSocketPath()
 	if cfg.IPCSocketPath != "" {
@@ -93,7 +119,8 @@ func runDesktopHelper() {
 	// This gate is now reachable in user context too: LoadHelperConfig reads
 	// agent.yaml (world-readable) and skips root-only secrets.yaml, so the macOS
 	// user-session desktop-helper populates AgentID/ServerURL/HelperAuthToken
-	// and ships its diagnostics (#2483), as does the Windows SYSTEM helper.
+	// and ships its diagnostics (#2483). On Windows no user-readable file
+	// carries the helper token (see config/helpertoken_windows.go).
 	if cfg.AgentID != "" && cfg.ServerURL != "" && cfg.HelperAuthToken != "" {
 		helperToken := secmem.NewSecureString(cfg.HelperAuthToken)
 		cfg.HelperAuthToken = ""
@@ -106,6 +133,10 @@ func runDesktopHelper() {
 			AgentVersion: version + "-desktop-helper",
 			MinLevel:     cfg.LogShippingLevel,
 			AuthMonitor:  authMon,
+			HTTPClient:   newShipperHTTPClient(),
+			// The WebRTC/ICE diagnostics live in this process, so it must
+			// follow the agent's set_log_level override too (#7416).
+			LevelOverridePath: config.LogLevelOverridePath(),
 		})
 		defer logging.StopShipper()
 	} else {
@@ -126,33 +157,18 @@ func runDesktopHelper() {
 	// written.
 	logging.EmitLogFileOutcome(log, logPath, openErr, mkdirErr, homeErr)
 
-	startupProbe := collectProbeOutput(false, true)
-	attrs := []any{
-		"context", startupProbe.Context,
-		"processUser", startupProbe.ProcessUser,
-		"captureGranted", startupProbe.CaptureGranted,
-		"pid", os.Getpid(),
-		"version", version,
+	if stateErr != nil {
+		log.Warn("helper state dir unavailable; ECH/DNS caches and the wallpaper recovery record will not persist", "dir", stateDir, "error", stateErr.Error())
 	}
-	if startupProbe.CaptureError != "" {
-		attrs = append(attrs, "captureError", startupProbe.CaptureError)
-	}
-	if startupProbe.TCC != nil {
-		remoteDesktop := "unknown"
-		if startupProbe.TCC.RemoteDesktop != nil {
-			remoteDesktop = fmt.Sprintf("%t", *startupProbe.TCC.RemoteDesktop)
-		}
-		attrs = append(attrs,
-			"screenRecording", startupProbe.TCC.ScreenRecording,
-			"accessibility", startupProbe.TCC.Accessibility,
-			"fullDiskAccess", startupProbe.TCC.FullDiskAccess,
-			"remoteDesktop", remoteDesktop,
-		)
-	}
-	if len(startupProbe.Sessions) > 0 {
-		attrs = append(attrs, "sessions", startupProbe.Sessions)
-	}
-	log.Info("desktop helper startup probe", attrs...)
+	// Put back a wallpaper a crash mid-session left black. Runs after the
+	// shipper is up so the recovery is visible in Agent Logs.
+	recoverWallpaperAtStart(runtime.GOOS, os.Geteuid(), contextFlag, func() { _ = desktop.GetWallpaperManager() })
+
+	// A permission check like any other: it never captures (#8390) and never
+	// calls ScreenCaptureKit (#8058). It used to take a real frame on every
+	// helper start, which on macOS 15 raised the monthly acknowledgement alert.
+	startupProbe := collectProbeOutput(startupProbeOptions())
+	log.Info("desktop helper startup probe", startupProbeLogAttrs(startupProbe)...)
 
 	// Shutdown is signalled by closing `done`, NOT by calling Stop on a
 	// captured client. The supervisor builds a fresh client per reconnect
@@ -173,9 +189,8 @@ func runDesktopHelper() {
 	// session. Until that happened the device reported
 	// desktopAccess.reason = "helper_not_connected" while showing as online.
 	//
-	// Keeping the process alive also means the startup capture probe above
-	// runs once per login session rather than once per IPC blip, which stops
-	// reconnects from re-firing the macOS Screen Recording prompt.
+	// Keeping the process alive also means the startup probe above runs once
+	// per login session rather than once per IPC blip.
 	sup := &userhelper.Supervisor{
 		Name:   "desktop helper",
 		Policy: desktopHelperReconnectPolicy(),
@@ -197,61 +212,4 @@ func desktopHelperRole() ipc.HelperRole {
 		return ipc.HelperRoleUser
 	}
 	return ipc.HelperRoleSystem
-}
-
-type probeOutput struct {
-	Timestamp      time.Time                       `json:"timestamp"`
-	Context        string                          `json:"context"`
-	ProcessUser    string                          `json:"processUser,omitempty"`
-	Sessions       []sessionbroker.DetectedSession `json:"sessions,omitempty"`
-	TCC            *ipc.TCCStatus                  `json:"tcc,omitempty"`
-	CaptureGranted bool                            `json:"captureGranted"`
-	CaptureError   string                          `json:"captureError,omitempty"`
-}
-
-func runProbe() error {
-	logging.Init("text", "info", os.Stdout)
-
-	out := collectProbeOutput(probePrompt, true)
-
-	enc := json.NewEncoder(os.Stdout)
-	enc.SetIndent("", "  ")
-	return enc.Encode(out)
-}
-
-func collectProbeOutput(allowPrompt bool, allowCaptureProbe bool) probeOutput {
-	out := probeOutput{
-		Timestamp: time.Now().UTC(),
-		Context:   contextFlag,
-	}
-
-	if cu, err := user.Current(); err == nil {
-		out.ProcessUser = cu.Username
-	}
-
-	if detector := sessionbroker.NewSessionDetector(); detector != nil {
-		sessions, err := detector.ListSessions()
-		if err != nil {
-			out.CaptureError = fmt.Sprintf("session detection failed: %v", err)
-		} else {
-			out.Sessions = sessions
-		}
-	}
-
-	out.TCC = userhelper.ProbeTCCPermissions(contextFlag, allowPrompt, allowCaptureProbe)
-
-	if allowCaptureProbe {
-		granted, err := desktop.ProbeCaptureAccess(desktop.CaptureConfig{
-			DesktopContext: contextFlag,
-		})
-		out.CaptureGranted = granted
-		if err != nil {
-			if out.CaptureError != "" {
-				out.CaptureError += "; "
-			}
-			out.CaptureError += err.Error()
-		}
-	}
-
-	return out
 }

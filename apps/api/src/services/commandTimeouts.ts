@@ -1,4 +1,6 @@
+import { RESTORE_POINT_PAYLOAD_KEY, SECURITY_SCAN_TIMEOUT_MINUTES_RANGE } from '@breeze/shared';
 import { CommandTypes } from './commandTypes';
+import { WORKSTATION_TIMEOUT_MAX_MS } from './callerVerification/workstationProtocol';
 
 // ── Timeout tiers (milliseconds) ──────────────────────────────────
 const FIVE_MINUTES = 5 * 60 * 1000;
@@ -13,6 +15,37 @@ const DEFAULT_TIMEOUT_MS = THIRTY_MINUTES;
 // nothing younger than the buffer can be due (#3190).
 export const SCRIPT_GRACE_BUFFER_MS = 5 * 60 * 1000;
 const DEFAULT_SCRIPT_TIMEOUT_S = 300;
+
+/**
+ * Extra time a SCRIPT command gets when its payload carries an ENABLED
+ * restore-point block (#9162). The agent takes the System Restore checkpoint
+ * before the script starts, on its own context bounded by
+ * `systemrestore.CommandBudget` (agent/internal/systemrestore/checkpoint.go,
+ * 5 min) — deliberately NOT out of the script's `timeoutSeconds`. Without this
+ * the server deadline (`timeoutSeconds` + grace) could pass while the agent is
+ * still inside a long checkpoint and the reaper would terminalise a command the
+ * agent is about to answer.
+ *
+ * Keep it equal to the agent constant. It is a best-effort bound, not a
+ * guarantee: the two native SRSetRestorePointW calls cannot be cancelled by
+ * that context (see the TIMEOUT CAVEAT on systemrestore.Create), so a wedged
+ * System Restore service can still outlast it.
+ */
+export const RESTORE_POINT_CHECKPOINT_BUDGET_MS = 5 * 60 * 1000;
+
+/**
+ * True when a command payload carries a restore-point block the agent will act
+ * on. Only `enabled: true` triggers a checkpoint; a missing, disabled or
+ * malformed block does not, so it gets no extra budget.
+ */
+function hasEnabledRestorePointBlock(payload?: Record<string, unknown> | null): boolean {
+  const block = payload?.[RESTORE_POINT_PAYLOAD_KEY];
+  return (
+    typeof block === 'object' &&
+    block !== null &&
+    (block as Record<string, unknown>).enabled === true
+  );
+}
 
 // ── Commands that should never be reaped (interactive sessions) ───
 export const EXCLUDED_COMMAND_TYPES = new Set<string>([
@@ -50,6 +83,8 @@ const SHORT_TIMEOUT_TYPES = new Set<string>([
   CommandTypes.REGISTRY_KEY_DELETE,
   CommandTypes.FILE_LIST,
   CommandTypes.FILE_READ,
+  CommandTypes.DIAG_FILE_LIST,
+  CommandTypes.DIAG_FILE_READ,
   CommandTypes.FILE_WRITE,
   CommandTypes.FILE_DELETE,
   CommandTypes.FILE_MKDIR,
@@ -72,15 +107,18 @@ const SHORT_TIMEOUT_TYPES = new Set<string>([
 ]);
 
 const MEDIUM_TIMEOUT_TYPES = new Set<string>([
-  CommandTypes.SECURITY_SCAN,
   CommandTypes.PATCH_SCAN,
   CommandTypes.SOFTWARE_UNINSTALL,
   CommandTypes.FILESYSTEM_ANALYSIS,
   CommandTypes.SYSTEM_CLEANUP_LIST,
   CommandTypes.REBOOT_SAFE_MODE,
+  // #8729: same execution budget as the safe-mode reboot. Its DELIVERY window
+  // is the 15-minute live_only class (commandOfflinePolicy.ts), not this.
+  CommandTypes.FORCE_REBOOT,
   CommandTypes.SELF_UNINSTALL,
   CommandTypes.COLLECT_EVIDENCE,
   CommandTypes.EXECUTE_CONTAINMENT,
+  CommandTypes.RELEASE_CONTAINMENT,
   CommandTypes.ROLLBACK_PATCHES,
   CommandTypes.COLLECT_RELIABILITY_METRICS,
   CommandTypes.APPLY_CIS_REMEDIATION,
@@ -89,6 +127,11 @@ const MEDIUM_TIMEOUT_TYPES = new Set<string>([
   CommandTypes.SECURITY_THREAT_REMOVE,
   CommandTypes.SECURITY_THREAT_RESTORE,
   CommandTypes.BACKUP_RESTORE,
+  // Vendor updates (#11065): the vendor CLI exports then imports its settings,
+  // which takes minutes. The 30-minute tier fits (the 2-hour LONG tier is for
+  // the run, which downloads a tool and flashes firmware); listed explicitly so
+  // the budget is a decision rather than the unknown-type fallback.
+  CommandTypes.OEM_UPDATE_RELEASE,
 ]);
 
 /**
@@ -111,7 +154,7 @@ export const NETWORK_DIAGNOSTIC_TIMEOUT_MS = 150 * 1000;
  *
  * Why a ceiling and not a stall clock. `backup_jobs` can use a 15-minute stall
  * window because the agent streams `backup_progress` continuously into
- * `last_progress_at`. Nothing equivalent exists here: `device_commands` has no
+ * `last_keepalive_at`. Nothing equivalent exists here: `device_commands` has no
  * progress column, four of these six types report nothing at all mid-flight,
  * and the BMR pair's only mid-flight signal is a PHASE transition posted to
  * `/bmr/recover/progress` — the whole 3-hour restore sits inside a single
@@ -126,10 +169,12 @@ export const NETWORK_DIAGNOSTIC_TIMEOUT_MS = 150 * 1000;
  * trade — a disconnect mid-restore is not evidence of failure here, and the
  * previous setting produced a false "failed" on every real recovery.
  *
- * NOT in scope of this constant: `/mssql/restore` and `/hyperv/restore` also
- * wait synchronously on `executeCommand(..., { timeoutMs: 600000 })`, which
- * terminalises those two REST flows after 10 minutes regardless of what the
- * reaper does. Making them asynchronous is separate work.
+ * #6437: `/mssql/restore` and `/hyperv/restore` used to wait synchronously on
+ * `executeCommand(..., { timeoutMs: 600000 })`, which terminalised those two
+ * REST flows after 10 minutes regardless of this ceiling. Both now dispatch
+ * async via `queueCommandForExecution` (the D20 queued-ack pattern from
+ * #5447/PR #5461), so this reaper ceiling is what actually owns their
+ * deadline too.
  */
 export const WHOLE_MACHINE_RESTORE_TIMEOUT_MS = TWENTY_FOUR_HOURS;
 
@@ -142,7 +187,40 @@ const RESTORE_TIMEOUT_TYPES = new Set<string>([
   CommandTypes.HYPERV_RESTORE,
 ]);
 
+/**
+ * #7105 — the last-resort ceiling for a `backup_jobs` row, and the command
+ * timeout for `backup_run`.
+ *
+ * The stale backup reaper (`reapStaleBackupJobs`) owns a file backup's
+ * lifetime: liveness, offline grace, and a no-transfer window that can itself
+ * run to 24 h for a large remainder. This is its absolute cap for a job that
+ * never reported anything, and it is exported so that reaper reads it from
+ * here — one number, not two that can drift.
+ *
+ * `backup_run` gets the same value as its command timeout rather than the
+ * 2-hour LONG tier its mssql/hyperv siblings use: a device_commands row for a
+ * file backup must never time out before the job it drives could, or the
+ * timeout (now propagated to the job, see `propagateTimedOutDeviceCommand`)
+ * would fail a healthy multi-hour upload — the #6415 shape. Today no path
+ * writes a device_commands row for `backup_run` (`jobs/backupWorker.ts` sends
+ * it straight over the socket, keyed by the backup_jobs id); before this it
+ * fell through to the 30-minute default with an "Unknown command type"
+ * warning, which is the trap this closes.
+ */
+export const BACKUP_JOB_ABSOLUTE_TIMEOUT_MS = TWENTY_FOUR_HOURS;
+
+/**
+ * #6354 W02 — a `caller_verify` prompt is never on screen longer than
+ * `WORKSTATION_TIMEOUT_MAX_MS` (the helper's own countdown ceiling), and the
+ * verification it serves expires on the same clock. The grace only covers the
+ * result's trip back; a longer budget would hold a dead row for the 30-minute
+ * default (and warn as an unknown type on every command).
+ */
+export const CALLER_VERIFY_TIMEOUT_MS = WORKSTATION_TIMEOUT_MAX_MS + 30_000;
+
 const LONG_TIMEOUT_TYPES = new Set<string>([
+  // Vendor updates (#11065): a vendor tool download plus a firmware flash.
+  CommandTypes.OEM_UPDATE_RUN,
   CommandTypes.AGENT_ROLLBACK_V1,
   // #3525: deliberately NOT SHORT_TIMEOUT_TYPES. The generic reaper clocks
   // `pending` rows from createdAt (jobs/staleCommandReaper.ts), so a 5-minute
@@ -172,29 +250,73 @@ const LONG_TIMEOUT_TYPES = new Set<string>([
 ]);
 
 /**
+ * #10057 — what the server waits for a delivered `security_scan` on top of the
+ * agent's own scan deadline. The agent fetches and compiles the YARA rule sets
+ * BEFORE its scan clock starts (`ruleSetLoadTimeout`, 5 min, in
+ * agent/internal/heartbeat/handlers_security.go), then may trigger Defender
+ * (30 s) and send the result; the other 5 minutes cover that tail.
+ */
+export const SECURITY_SCAN_COMMAND_GRACE_MS = 10 * 60 * 1000;
+
+/**
+ * #10057 — a `security_scan`'s server timeout, derived from the budget the
+ * command carries. It used to be a flat 30 minutes, while a policy can give
+ * the agent up to 720 (`scanTimeoutMinutes`), so the reaper failed long scans
+ * the agent was still running. The payload's `timeoutMinutes` is the agent's
+ * deadline (services/securityScanPayload.ts writes the policy value, or the
+ * 720-minute ceiling when no policy governs the device). A payload with no
+ * budget — a command queued before that change — falls back to the same
+ * ceiling, the bound the sweep pump finalizes on.
+ */
+function securityScanTimeoutMs(payload?: Record<string, unknown> | null): number {
+  const [min, max] = SECURITY_SCAN_TIMEOUT_MINUTES_RANGE;
+  const raw = payload?.timeoutMinutes;
+  const minutes =
+    typeof raw === 'number' && Number.isFinite(raw) && raw > 0
+      ? Math.min(max, Math.max(min, Math.ceil(raw)))
+      : max;
+  return minutes * 60 * 1000 + SECURITY_SCAN_COMMAND_GRACE_MS;
+}
+
+/**
  * Returns the server-side timeout for a command type in milliseconds.
  * For 'script' commands, reads payload.timeoutSeconds and adds a grace buffer
- * so the agent-side timeout fires first.
+ * so the agent-side timeout fires first, plus the restore-point checkpoint
+ * budget when the payload carries an enabled `restorePoint` block (#9162).
  */
 export function getCommandTimeoutMs(
   commandType: string,
   payload?: Record<string, unknown> | null,
 ): number {
+  if (
+    commandType === CommandTypes.TIME_RESYNC ||
+    commandType === CommandTypes.TIME_SET_TIMEZONE ||
+    commandType === CommandTypes.TIME_APPLY_POLICY
+  )
+    return 60_000;
   if (commandType === CommandTypes.SCRIPT) {
     const timeoutSeconds =
       typeof payload?.timeoutSeconds === 'number'
         ? payload.timeoutSeconds
         : DEFAULT_SCRIPT_TIMEOUT_S;
-    return timeoutSeconds * 1000 + SCRIPT_GRACE_BUFFER_MS;
+    const checkpointBudgetMs = hasEnabledRestorePointBlock(payload)
+      ? RESTORE_POINT_CHECKPOINT_BUDGET_MS
+      : 0;
+    return timeoutSeconds * 1000 + SCRIPT_GRACE_BUFFER_MS + checkpointBudgetMs;
   }
   if (
     commandType === CommandTypes.NETWORK_DIAGNOSTIC ||
     commandType === CommandTypes.NETWORK_DIAGNOSTIC_CANCEL
   )
     return NETWORK_DIAGNOSTIC_TIMEOUT_MS;
+  if (commandType === CommandTypes.SECURITY_SCAN) return securityScanTimeoutMs(payload);
   if (SHORT_TIMEOUT_TYPES.has(commandType)) return FIVE_MINUTES;
   if (MEDIUM_TIMEOUT_TYPES.has(commandType)) return THIRTY_MINUTES;
   if (RESTORE_TIMEOUT_TYPES.has(commandType)) return WHOLE_MACHINE_RESTORE_TIMEOUT_MS;
+  if (commandType === CommandTypes.BACKUP_RUN) return BACKUP_JOB_ABSOLUTE_TIMEOUT_MS;
+  if (commandType === CommandTypes.CALLER_VERIFY) return CALLER_VERIFY_TIMEOUT_MS;
+  // #8928: showing a toast is quick; an unanswered notice is noise, not work.
+  if (commandType === CommandTypes.PAM_REQUEST_NOTIFY) return 2 * 60 * 1000;
   // Disk Cleanup v2: a native run's real budget is per-selection and lives on
   // the row; this is the ceiling that keeps the reaper from terminalising a
   // command whose run is still inside it.

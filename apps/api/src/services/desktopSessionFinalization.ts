@@ -13,6 +13,7 @@ import {
 import { ensureDesktopStreamStopped } from './desktopSessionStop';
 import { commitDesktopTerminalIntent } from './remoteDesktopTerminalIntent';
 import { revokeViewerSession } from './viewerTokenRevocation';
+import { markRequestAuditWritten } from './auditRequestTracking';
 
 const connectionIdentitySchema = z.object({
   connectionId: z.string().uuid(),
@@ -179,7 +180,7 @@ export async function finalizeDesktopSessionOnce(
   const frameBytes = clampNonnegativeInteger(input.frameBytes);
 
   return withSystemDbAccessContext(async () => {
-    // Through the terminal-intent contract (SEC-038 W03). The phase is
+    // Through the terminal-intent contract. The phase is
     // 'confirmed' straight away: `ensureDesktopStreamStopped` above only
     // returns once the agent's stop proof is in hand, so there is nothing left
     // for the endpoint to acknowledge.
@@ -217,6 +218,7 @@ export async function finalizeDesktopSessionOnce(
       },
       result: 'success',
     });
+    markRequestAuditWritten();
     return 'finalized';
   });
 }
@@ -348,6 +350,7 @@ export async function reconcileDesktopFinalizationFence(input: {
       result: 'success',
     }),
   );
+  markRequestAuditWritten();
   const released = await releaseDesktopFinalizationIntent(
     input.sessionId,
     input.expectedFinalizationId,

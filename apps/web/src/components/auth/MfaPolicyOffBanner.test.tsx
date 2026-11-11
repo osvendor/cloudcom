@@ -9,7 +9,14 @@ vi.mock('react-i18next', () => ({
   useTranslation: () => ({ t: (key: string) => key, i18n: { language: 'en' } }),
 }));
 
-type BannerUser = { id: string; canManagePartnerWide?: boolean } | null;
+type BannerUser = {
+  id: string;
+  canManagePartnerWide?: boolean;
+  permissions?: Array<{ resource: string; action: string }>;
+} | null;
+
+// PATCH /orgs/partners/me requires organizations:write (#10295).
+const ORGS_WRITE = [{ resource: 'organizations', action: 'write' }];
 type Scope = 'system' | 'partner' | 'organization' | null;
 
 const state = vi.hoisted(() => ({
@@ -34,6 +41,8 @@ vi.mock('@/lib/authScope', () => ({
   useJwtClaims: () => state.claims,
 }));
 
+import { invalidatePartnersMe } from '@/lib/api/partnersMe';
+
 const fetchWithAuthMock = vi.mocked(fetchWithAuth);
 const DISMISS_KEY = 'breeze.mfaPolicyOffBannerDismissedOn';
 const TEST_ID = 'mfa-policy-off-banner';
@@ -55,7 +64,10 @@ function todayKey(): string {
 }
 
 beforeEach(() => {
-  state.user = { id: 'user-1', canManagePartnerWide: true };
+  // partners/me reads are shared while in flight (#9172); a test that leaves one
+  // pending must not hand it to the next test.
+  invalidatePartnersMe();
+  state.user = { id: 'user-1', canManagePartnerWide: true, permissions: ORGS_WRITE };
   state.claims = { status: 'resolved', claims: { scope: 'partner', orgId: null, partnerId: 'p1' } };
   fetchWithAuthMock.mockReset();
   window.localStorage.clear();
@@ -109,11 +121,57 @@ describe('MfaPolicyOffBanner', () => {
   });
 
   it('renders nothing (and never fetches) for a partner user who cannot manage partner-wide policies', async () => {
-    state.user = { id: 'user-1', canManagePartnerWide: false };
+    state.user = { id: 'user-1', canManagePartnerWide: false, permissions: ORGS_WRITE };
     render(<MfaPolicyOffBanner />);
     await act(async () => {});
     expect(fetchWithAuthMock).not.toHaveBeenCalled();
     expect(screen.queryByTestId(TEST_ID)).not.toBeInTheDocument();
+  });
+
+  // #10295: a Partner Viewer has full partner access (canManagePartnerWide) but
+  // only organizations:read, so the "Require MFA" CTA leads to a form it cannot save.
+  it('renders nothing (and never fetches) for a partner user without organizations:write', async () => {
+    state.user = {
+      id: 'user-1',
+      canManagePartnerWide: true,
+      permissions: [{ resource: 'organizations', action: 'read' }],
+    };
+    render(<MfaPolicyOffBanner />);
+    await act(async () => {});
+    expect(fetchWithAuthMock).not.toHaveBeenCalled();
+    expect(screen.queryByTestId(TEST_ID)).not.toBeInTheDocument();
+  });
+
+  it('renders nothing (and never fetches) while the permission list has not loaded', async () => {
+    state.user = { id: 'user-1', canManagePartnerWide: true };
+    render(<MfaPolicyOffBanner />);
+    await act(async () => {});
+    expect(fetchWithAuthMock).not.toHaveBeenCalled();
+    expect(screen.queryByTestId(TEST_ID)).not.toBeInTheDocument();
+  });
+
+  it('appears once permissions land, and hides again when organizations:write is revoked', async () => {
+    state.user = { id: 'user-1', canManagePartnerWide: true };
+    fetchWithAuthMock.mockResolvedValue(partnerResponse(undefined));
+    const { rerender } = render(<MfaPolicyOffBanner />);
+    await act(async () => {});
+    expect(fetchWithAuthMock).not.toHaveBeenCalled();
+
+    state.user = { id: 'user-1', canManagePartnerWide: true, permissions: ORGS_WRITE };
+    rerender(<MfaPolicyOffBanner />);
+    expect(await screen.findByTestId(TEST_ID)).toBeInTheDocument();
+    expect(fetchWithAuthMock).toHaveBeenCalledTimes(1);
+
+    state.user = { id: 'user-1', canManagePartnerWide: true, permissions: [{ resource: 'organizations', action: 'read' }] };
+    rerender(<MfaPolicyOffBanner />);
+    await waitFor(() => expect(screen.queryByTestId(TEST_ID)).not.toBeInTheDocument());
+  });
+
+  it('renders for a wildcard (*:*) admin grant', async () => {
+    state.user = { id: 'user-1', canManagePartnerWide: true, permissions: [{ resource: '*', action: '*' }] };
+    fetchWithAuthMock.mockResolvedValueOnce(partnerResponse(undefined));
+    render(<MfaPolicyOffBanner />);
+    expect(await screen.findByTestId(TEST_ID)).toBeInTheDocument();
   });
 
   it('renders nothing when there is no authenticated user', async () => {
@@ -217,5 +275,88 @@ describe('MfaPolicyOffBanner', () => {
 
     await waitFor(() => expect(screen.queryByTestId(TEST_ID)).not.toBeInTheDocument());
     expect(fetchWithAuthMock).toHaveBeenCalledTimes(2);
+  });
+
+  // #9031: the banner sits above the h1 on every page; a live region re-announces
+  // on every load, and a stacked CTA made it 80-140px tall.
+  it('is not a live region (no role=status/alert)', async () => {
+    fetchWithAuthMock.mockResolvedValueOnce(partnerResponse(false));
+    render(<MfaPolicyOffBanner />);
+    const banner = await screen.findByTestId(TEST_ID);
+    expect(banner).not.toHaveAttribute('role', 'status');
+    expect(banner).not.toHaveAttribute('role', 'alert');
+    expect(banner.getAttribute('aria-live')).toBeNull();
+    expect(banner.tagName).toBe('ASIDE');
+    expect(banner).toHaveAttribute('aria-label', 'mfaPolicyOffBanner.label');
+  });
+
+  it('renders the CTA inline with the message on one row', async () => {
+    fetchWithAuthMock.mockResolvedValueOnce(partnerResponse(false));
+    render(<MfaPolicyOffBanner />);
+    const banner = await screen.findByTestId(TEST_ID);
+    const message = screen.getByText('mfaPolicyOffBanner.message');
+    const cta = screen.getByRole('link', { name: 'mfaPolicyOffBanner.cta' });
+    // Message and CTA are siblings in one wrapping row, not a stacked block.
+    expect(cta.parentElement).toBe(message.parentElement);
+    expect(message.parentElement?.className).toMatch(/\bflex-wrap\b/);
+  });
+
+  describe('route ownership on /settings/partner (#9171)', () => {
+    const setPath = (path: string) => window.history.pushState({}, '', path);
+    afterEach(() => setPath('/'));
+
+    it('layout instance renders nothing on /settings/partner (the page owns it)', async () => {
+      setPath('/settings/partner');
+      fetchWithAuthMock.mockResolvedValue(partnerResponse(undefined));
+      render(<MfaPolicyOffBanner />);
+      await waitFor(() => expect(fetchWithAuthMock).toHaveBeenCalled());
+      await act(async () => {});
+      expect(screen.queryByTestId(TEST_ID)).not.toBeInTheDocument();
+    });
+
+    it('layout instance hides on soft navigation in and reappears on the way out', async () => {
+      setPath('/devices');
+      fetchWithAuthMock.mockResolvedValue(partnerResponse(undefined));
+      render(<MfaPolicyOffBanner />);
+      expect(await screen.findByTestId(TEST_ID)).toBeInTheDocument();
+      act(() => {
+        setPath('/settings/partner');
+        document.dispatchEvent(new Event('astro:page-load'));
+      });
+      expect(screen.queryByTestId(TEST_ID)).not.toBeInTheDocument();
+      act(() => {
+        setPath('/devices');
+        document.dispatchEvent(new Event('astro:page-load'));
+      });
+      expect(await screen.findByTestId(TEST_ID)).toBeInTheDocument();
+    });
+
+    it('layout instance picks up a dismissal made on the page copy after soft navigation away', async () => {
+      setPath('/devices');
+      fetchWithAuthMock.mockResolvedValue(partnerResponse(undefined));
+      render(<MfaPolicyOffBanner />);
+      expect(await screen.findByTestId(TEST_ID)).toBeInTheDocument();
+      act(() => {
+        setPath('/settings/partner');
+        document.dispatchEvent(new Event('astro:page-load'));
+      });
+      // Page copy dismissed (it writes the shared per-day key).
+      window.localStorage.setItem(DISMISS_KEY, todayKey());
+      act(() => {
+        setPath('/devices');
+        document.dispatchEvent(new Event('astro:page-load'));
+      });
+      expect(screen.queryByTestId(TEST_ID)).not.toBeInTheDocument();
+    });
+
+    it('page placement renders on /settings/partner without the layout margin and shares the dismissal', async () => {
+      setPath('/settings/partner');
+      fetchWithAuthMock.mockResolvedValue(partnerResponse(undefined));
+      render(<MfaPolicyOffBanner placement="page" />);
+      const banner = await screen.findByTestId(TEST_ID);
+      expect(banner).not.toHaveClass('mb-4');
+      fireEvent.click(screen.getByRole('button', { name: 'mfaPolicyOffBanner.dismiss' }));
+      expect(window.localStorage.getItem(DISMISS_KEY)).toBe(todayKey());
+    });
   });
 });

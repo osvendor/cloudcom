@@ -13,11 +13,21 @@ import {
   monitorKindSchema,
   monitorSeveritySchema,
   monitorDeliveryModeSchema,
+  monitorConditionSchemas,
+  monitorResponsesSchema,
+  alertCooldownMinutesSchema,
+  rearmModeSchema,
+  rearmDelayMinutesSchema,
+  isKindShapedRecoveryCondition,
+  isLegacyRecoveryCondition,
+  isValidRearmPair,
+  REARM_PAIR_MESSAGE,
   MONITOR_KINDS,
   type MonitorKind,
   type MonitorDeliveryMode,
+  type RearmMode,
 } from '@breeze/shared';
-import { fetchWithAuth } from '../../stores/auth';
+import { fetchWithAuth, useAuthStore } from '../../stores/auth';
 import { useOrgStore } from '../../stores/orgStore';
 import { navigateTo } from '@/lib/navigation';
 import { extractApiError } from '@/lib/apiError';
@@ -33,9 +43,12 @@ import ActionsEditor, {
   type SoftwareCatalogItem,
 } from '../automations/ActionsEditor';
 import MonitorConditionFields from './MonitorConditionFields';
+import NetworkCheckAssetBinding, { bindNetworkAsset, type NetworkAsset } from './NetworkCheckAssetBinding';
+import { RestartResponseFields } from './MonitorAuthoringFields';
 import DeployMonitorDialog from './DeployMonitorDialog';
 import MonitorDevicesTable from './MonitorDevicesTable';
 import MonitorActivityTab from './MonitorActivityTab';
+import MonitorLifecycleFields from './MonitorLifecycleFields';
 import { defaultConditionFor } from './monitorKindFields';
 import { ConfirmDialog } from '../shared/ConfirmDialog';
 import Breadcrumbs from '../layout/Breadcrumbs';
@@ -43,6 +56,8 @@ import Breadcrumbs from '../layout/Breadcrumbs';
 // an island that hydrates before whichever other island happens to pull i18n in
 // would otherwise render raw keys (and mismatch the SSR markup).
 import { i18n } from '../../lib/i18n';
+import { useStableT } from '@/lib/i18n/useStableT';
+import { usePageItemName } from '../layout/usePageItemName';
 
 const UNAUTHORIZED = () => void navigateTo('/login', { replace: true });
 
@@ -69,8 +84,20 @@ export interface MonitorFormValues {
   enabled: boolean;
   condition: Record<string, unknown>;
   severity: 'critical' | 'high' | 'medium' | 'low' | 'info';
-  cooldownMinutes: number;
-  autoResolve: boolean;
+  // Lifecycle overrides: null = inherit the org/partner default.
+  cooldownMinutes: number | null;
+  autoResolve: boolean | null;
+  rearmMode: RearmMode | null;
+  rearmDelayMinutes: number | null;
+  // The recovery condition in this kind's shape, used only while `clearsWhenEnabled`.
+  // A flag rather than setting `clearsWhen` to null: once it has a stored value,
+  // react-hook-form 7.90 throws in getDirtyFields on `setValue(path, null, { shouldDirty })`.
+  clearsWhenEnabled: boolean;
+  clearsWhen: Record<string, unknown> | null;
+  // A stored recovery condition this form can't edit (a raw API blob). Form-only:
+  // it is never sent, so leaving the key out of the PATCH keeps it as stored.
+  // `unknown` because it is opaque here: its shape must never be able to block Save.
+  rawRecoveryCondition: unknown;
   responses: Array<Record<string, unknown>>;
   deliveryMode: MonitorDeliveryMode;
   deliveryChannelIds: string[];
@@ -82,6 +109,9 @@ export interface MonitorFormValues {
   recurrenceActions: Array<Record<string, unknown>>;
   pauseResponsesOnEscalation: boolean;
   aiAgentId?: string | null;
+  // Form-only: '' = the connection's default board. Sent on the wire as a number | null,
+  // and only when the board select is shown (see onSubmit).
+  psaBoardId?: string;
   ownerScope?: 'organization' | 'partner';
 }
 
@@ -95,28 +125,72 @@ export interface MonitorFormValues {
 // reject every submission that sets a recurrence threshold. The server still
 // runs the full shared schema on the built payload and is the source of truth
 // for the business rules (delivery channels required, ai_triage needs an
-// agent, recurrence threshold/window set together); this schema only catches
-// shape errors early.
-const monitorFormSchema = z.object({
-  name: z.string().min(1),
-  description: z.string().optional(),
-  kind: monitorKindSchema,
-  enabled: z.boolean(),
-  condition: z.record(z.string(), z.unknown()),
-  severity: monitorSeveritySchema,
-  cooldownMinutes: z.number().int().min(0).max(1440),
-  autoResolve: z.boolean(),
-  responses: z.array(z.record(z.string(), z.unknown())),
-  deliveryMode: monitorDeliveryModeSchema,
-  deliveryChannelIds: z.array(z.string()),
-  escalationPolicyId: z.string().nullable().optional(),
-  recurrenceThreshold: z.number().int().min(2).max(100).nullable().optional(),
-  recurrenceWindowDays: z.number().int().min(1).max(365).nullable().optional(),
-  recurrenceActions: z.array(z.record(z.string(), z.unknown())),
-  pauseResponsesOnEscalation: z.boolean(),
-  aiAgentId: z.string().nullable().optional(),
-  ownerScope: z.enum(['organization', 'partner']).optional(),
-});
+// agent, recurrence threshold/window set together); this schema catches shape
+// errors early, plus the per-kind rules in the superRefine below.
+// Marks the specific "restart service needs a name" zod issue so the error
+// rendering (below) can show it instead of the generic invalidResponses copy.
+const RESTART_SERVICE_NAME_ISSUE = 'restartServiceRequiresName';
+
+const monitorFormSchema = z
+  .object({
+    name: z.string().min(1),
+    description: z.string().optional(),
+    kind: monitorKindSchema,
+    enabled: z.boolean(),
+    condition: z.record(z.string(), z.unknown()),
+    severity: monitorSeveritySchema,
+    cooldownMinutes: alertCooldownMinutesSchema.nullable(),
+    autoResolve: z.boolean().nullable(),
+    rearmMode: rearmModeSchema.nullable(),
+    rearmDelayMinutes: rearmDelayMinutesSchema.nullable(),
+    clearsWhenEnabled: z.boolean(),
+    clearsWhen: z.record(z.string(), z.unknown()).nullable(),
+    rawRecoveryCondition: z.unknown(),
+    responses: z.array(z.record(z.string(), z.unknown())),
+    deliveryMode: monitorDeliveryModeSchema,
+    deliveryChannelIds: z.array(z.string()),
+    escalationPolicyId: z.string().nullable().optional(),
+    recurrenceThreshold: z.number().int().min(2).max(100).nullable().optional(),
+    recurrenceWindowDays: z.number().int().min(1).max(365).nullable().optional(),
+    recurrenceActions: z.array(z.record(z.string(), z.unknown())),
+    pauseResponsesOnEscalation: z.boolean(),
+    aiAgentId: z.string().nullable().optional(),
+    psaBoardId: z.string().optional(),
+    ownerScope: z.enum(['organization', 'partner']).optional(),
+  })
+  // Shape-only above; these two rules pull in the REAL shared per-kind
+  // condition schema and the shared responses schema (composite children,
+  // restart-service bounds) so a bad composite child or an out-of-range
+  // restart limit surfaces on the field, not only after the server 400s.
+  .superRefine((value, ctx) => {
+    const condition = monitorConditionSchemas[value.kind].safeParse(value.condition);
+    if (!condition.success) ctx.addIssue({ code: 'custom', path: ['condition'], message: 'Invalid condition' });
+    const responses = monitorResponsesSchema.safeParse(value.responses);
+    if (!responses.success) ctx.addIssue({ code: 'custom', path: ['responses'], message: 'Invalid responses' });
+    if (!isValidRearmPair(value)) ctx.addIssue({ code: 'custom', path: ['rearmDelayMinutes'], message: REARM_PAIR_MESSAGE });
+    if (value.clearsWhenEnabled && !isKindShapedRecoveryCondition(value.kind, value.clearsWhen)) {
+      ctx.addIssue({ code: 'custom', path: ['clearsWhen'], message: 'Invalid recovery condition' });
+    }
+    // D1: a `restart_service` response carries no service name of its own — it
+    // compiles to `auto_restart: true` on the delivered watch, which only ever
+    // targets the service named on the monitor's own `service`-kind condition
+    // (see automationActions.ts). Without this check the editor happily saves a
+    // restart response on a monitor with no service name at all (any non-service
+    // kind, or a service monitor whose name is still blank mid-edit), and at
+    // runtime automationRuntime.executeCommandAction reports it "succeeded" while
+    // doing nothing (~L1615). Block Save instead of shipping an inert action.
+    const hasRestartServiceResponse = value.responses.some(
+      (response) => (response as { kind?: unknown }).kind === 'restart_service',
+    );
+    const conditionServiceName = (value.condition as { serviceName?: unknown })?.serviceName;
+    const hasServiceName =
+      typeof conditionServiceName === 'string' && conditionServiceName.trim().length > 0;
+    if (hasRestartServiceResponse && !hasServiceName) {
+      // Sentinel picked up by the error rendering below (sweep F2) so the
+      // specific reason reaches the user instead of the generic fallback.
+      ctx.addIssue({ code: 'custom', path: ['responses'], message: RESTART_SERVICE_NAME_ISSUE });
+    }
+  });
 
 const DEFAULT_VALUES: MonitorFormValues = {
   name: '',
@@ -125,8 +199,13 @@ const DEFAULT_VALUES: MonitorFormValues = {
   enabled: true,
   condition: defaultConditionFor('cpu'),
   severity: 'high',
-  cooldownMinutes: 5,
-  autoResolve: false,
+  cooldownMinutes: null,
+  autoResolve: null,
+  rearmMode: null,
+  rearmDelayMinutes: null,
+  clearsWhenEnabled: false,
+  clearsWhen: null,
+  rawRecoveryCondition: null,
   responses: [],
   deliveryMode: 'inherit',
   deliveryChannelIds: [],
@@ -161,7 +240,7 @@ export function tabFromHash(hash: string): EditorTab | undefined {
 }
 export function editorHashForTab(hash: string, tab: EditorTab): string {
   const params = editorHashParams(hash);
-  if (!params.has('policy')) return `#${tab}`;
+  if (!['policy', 'kind', 'assetId', 'checkType', 'target', 'serviceName', 'processName'].some(key => params.has(key))) return `#${tab}`;
   params.set('tab', tab);
   return `#${params.toString()}`;
 }
@@ -187,6 +266,7 @@ export async function attachAfterCreate(
 
 export default function MonitorEditor({ monitorId }: MonitorEditorProps) {
   const { t } = useTranslation(['monitoring', 'common']);
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   const isNew = !monitorId;
   const jwt = useJwtClaims();
   const currentPartnerId = jwt.status === 'resolved' ? jwt.claims.partnerId : null;
@@ -219,9 +299,13 @@ export default function MonitorEditor({ monitorId }: MonitorEditorProps) {
   const [aiAgents, setAiAgents] = useState<AiAgent[]>([]);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [builtinKey, setBuiltinKey] = useState<string | null>(null);
+  const [loadedName, setLoadedName] = useState<string | undefined>();
   // Null for a partner-wide monitor — DeployMonitorDialog falls back to the
   // currently selected org from the org store in that case.
   const [monitorOrgId, setMonitorOrgId] = useState<string | null>(null);
+  const [prefillOrgId, setPrefillOrgId] = useState<string | null>(null);
+  const [assetPrefillError, setAssetPrefillError] = useState(false);
+  const [assetPrefillAttempt, setAssetPrefillAttempt] = useState(0);
   const [monitorPartnerId, setMonitorPartnerId] = useState<string | null>(null);
 
   const [hashTab, setHashTab] = useHashState<EditorTab>('settings', tabFromHash);
@@ -242,8 +326,9 @@ export default function MonitorEditor({ monitorId }: MonitorEditorProps) {
     control,
     watch,
     setValue,
+    getValues,
     reset,
-    formState: { errors, isSubmitting },
+    formState: { errors, isSubmitting, isDirty },
   } = methods;
 
   const watchKind = watch('kind');
@@ -253,9 +338,68 @@ export default function MonitorEditor({ monitorId }: MonitorEditorProps) {
   const watchDeliveryMode = watch('deliveryMode');
   const watchOwnerScope = watch('ownerScope');
   const watchEscalationPolicyId = watch('escalationPolicyId');
+  const watchPsaBoardId = watch('psaBoardId');
+  // Alert -> PSA ticket board override. Changing it needs partner-wide config
+  // rights (the API 403s a change otherwise), so the select only exists for
+  // those callers AND when the partner has an external PSA bound. Any lookup
+  // failure leaves `psaBoards` null and the select hidden.
+  const canManagePartnerWide = useAuthStore(s => s.user?.canManagePartnerWide ?? true);
+  const [psaBoards, setPsaBoards] = useState<Array<{ id: number; name: string }> | null>(null);
+  const [psaLookupSettled, setPsaLookupSettled] = useState(false);
+  const [psaBoardsUnavailable, setPsaBoardsUnavailable] = useState(false);
+  const [loadedPsaBoardId, setLoadedPsaBoardId] = useState<number | null>(null);
+  const showPsaBoardSelect = psaBoards !== null;
+  useEffect(() => {
+    if (!isPartnerScope || !canManagePartnerWide) {
+      setPsaBoards(null);
+      setPsaBoardsUnavailable(false);
+      return;
+    }
+    let cancelled = false;
+    let bound = false;
+    let failedStatus: number | string | null = null;
+    setPsaBoardsUnavailable(false);
+    (async () => {
+      try {
+        const meRes = await fetchWithAuth('/orgs/partners/me');
+        if (!meRes?.ok) return;
+        const meBody = await meRes.json().catch(() => null);
+        const partner = (meBody?.data ?? meBody) as
+          { serviceManagementMode?: unknown; serviceManagementPsaConnectionId?: unknown } | null;
+        const connectionId = partner?.serviceManagementPsaConnectionId;
+        if (partner?.serviceManagementMode !== 'external' || typeof connectionId !== 'string' || !connectionId) return;
+        // From here the partner IS bound: a failure means "unavailable", not "absent".
+        bound = true;
+        const optRes = await fetchWithAuth(`/psa/connections/${connectionId}/alert-ticketing/options`);
+        if (!optRes?.ok) {
+          failedStatus = optRes?.status ?? 'no response';
+          return;
+        }
+        const optBody = await optRes.json().catch(() => null);
+        const boards = optBody?.data?.boards?.options;
+        if (!cancelled && Array.isArray(boards)) {
+          setPsaBoards(boards.filter((b: { id?: unknown; name?: unknown }) => typeof b?.id === 'number' && typeof b?.name === 'string'));
+        } else {
+          failedStatus = 'malformed response';
+        }
+      } catch {
+        // Optional control: hide the select; surface a hint only when bound.
+        failedStatus = 'request failed';
+      } finally {
+        if (!cancelled && bound && failedStatus !== null) {
+          console.warn('Could not load PSA boards for the monitor board override (status: %s)', String(failedStatus));
+          setPsaBoardsUnavailable(true);
+        }
+        if (!cancelled) setPsaLookupSettled(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [isPartnerScope, canManagePartnerWide]);
   const isLoading = saving || isSubmitting;
   const isPartnerOwned = isNew ? watchOwnerScope === 'partner' : monitorPartnerId !== null;
-  const ownerOrgId = isNew ? currentOrgId : monitorOrgId;
+  const ownerOrgId = isNew ? prefillOrgId ?? currentOrgId : monitorOrgId;
   const deliveryChoiceOrgId = ownerOrgId ?? currentOrgId;
   const deliveryChoiceSuffix = deliveryChoiceOrgId ? `&orgId=${encodeURIComponent(deliveryChoiceOrgId)}` : '';
   const channelRail = useDeliveryResource<NotificationChannel>(`/alerts/delivery/rails?rail=channels${deliveryChoiceSuffix}`);
@@ -339,13 +483,16 @@ export default function MonitorEditor({ monitorId }: MonitorEditorProps) {
       setLoading(true);
       setError(undefined);
       const response = await fetchWithAuth(`/monitor-definitions/${monitorId}`);
-      if (!response.ok) throw new Error(t('monitoring:editor.errors.load'));
+      if (!response.ok) throw new Error(stableT('monitoring:editor.errors.load'));
       const data = await response.json();
       const monitor = data?.data ?? data;
       setAttachments(Array.isArray(monitor.attachments) ? monitor.attachments : []);
       setBuiltinKey(typeof monitor.builtinKey === 'string' ? monitor.builtinKey : null);
       setMonitorOrgId(typeof monitor.orgId === 'string' ? monitor.orgId : null);
       setMonitorPartnerId(typeof monitor.partnerId === 'string' ? monitor.partnerId : null);
+      setLoadedName(typeof monitor.name === 'string' ? monitor.name : undefined);
+      const storedRecovery = monitor.autoResolveConditions ?? null;
+      const recoveryIsKindShaped = isKindShapedRecoveryCondition(monitor.kind, storedRecovery);
       reset({
         name: monitor.name ?? '',
         description: monitor.description ?? '',
@@ -353,8 +500,15 @@ export default function MonitorEditor({ monitorId }: MonitorEditorProps) {
         enabled: monitor.enabled ?? true,
         condition: monitor.condition ?? defaultConditionFor(monitor.kind),
         severity: monitor.severity ?? 'high',
-        cooldownMinutes: monitor.cooldownMinutes ?? 5,
-        autoResolve: monitor.autoResolve ?? false,
+        cooldownMinutes: monitor.cooldownMinutes ?? null,
+        autoResolve: monitor.autoResolve ?? null,
+        rearmMode: monitor.rearmMode ?? null,
+        // The delay only exists with after_delay. A stray one would fail the pair rule on a
+        // field that isn't rendered, and Save would do nothing with no visible reason.
+        rearmDelayMinutes: monitor.rearmMode === 'after_delay' ? (monitor.rearmDelayMinutes ?? null) : null,
+        clearsWhenEnabled: recoveryIsKindShaped,
+        clearsWhen: recoveryIsKindShaped ? storedRecovery : null,
+        rawRecoveryCondition: recoveryIsKindShaped ? null : storedRecovery,
         responses: monitor.responses ?? [],
         deliveryMode: monitor.deliveryMode ?? 'inherit',
         deliveryChannelIds: monitor.deliveryChannelIds ?? [],
@@ -365,13 +519,15 @@ export default function MonitorEditor({ monitorId }: MonitorEditorProps) {
         recurrenceActions: monitor.recurrenceActions ?? [],
         pauseResponsesOnEscalation: monitor.pauseResponsesOnEscalation ?? true,
         aiAgentId: monitor.aiAgentId ?? null,
+        psaBoardId: typeof monitor.psaBoardId === 'number' ? String(monitor.psaBoardId) : '',
       });
+      setLoadedPsaBoardId(typeof monitor.psaBoardId === 'number' ? monitor.psaBoardId : null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('monitoring:editor.errors.load'));
+      setError(err instanceof Error ? err.message : stableT('monitoring:editor.errors.load'));
     } finally {
       setLoading(false);
     }
-  }, [isNew, monitorId, reset, t]);
+  }, [isNew, monitorId, reset, stableT]);
 
   useEffect(() => {
     void fetchKinds();
@@ -384,7 +540,77 @@ export default function MonitorEditor({ monitorId }: MonitorEditorProps) {
   const handleKindChange = (kind: MonitorKind) => {
     setValue('kind', kind, { shouldDirty: true });
     setValue('condition', defaultConditionFor(kind), { shouldDirty: true });
+    // An authored recovery condition belongs to the old kind and would fail validation on the new one.
+    setValue('clearsWhenEnabled', false, { shouldDirty: true });
   };
+
+  useEffect(() => {
+    if (!isNew) return;
+    const params = editorHashParams(window.location.hash);
+    const kind = params.get('kind');
+    if (!kind || !(MONITOR_KINDS as readonly string[]).includes(kind)) return;
+    setValue('kind', kind as MonitorKind);
+    const condition = defaultConditionFor(kind as MonitorKind);
+    const checkType = params.get('checkType');
+    if (kind === 'network_check') {
+      if (['icmp_ping', 'tcp_port', 'http_check', 'dns_check'].includes(checkType ?? '')) condition.checkType = checkType;
+      if (params.get('target')) condition.target = params.get('target');
+    }
+    // "Monitor this" handoff from Remote Tools (#10927): prefill the watched name.
+    const watchedName = kind === 'service' ? params.get('serviceName')
+      : kind === 'process' ? params.get('processName') : null;
+    if (watchedName) {
+      condition[kind === 'service' ? 'serviceName' : 'processName'] = watchedName;
+      if (!getValues('name')) {
+        setValue('name', `${kind === 'service' ? stableT('monitoring:kinds.service') : stableT('monitoring:kinds.process')} ${watchedName}`, { shouldDirty: true });
+      }
+    }
+    setValue('condition', condition);
+  }, [isNew, setValue, getValues, stableT]);
+
+  useEffect(() => {
+    if (!isNew) return;
+    const params = editorHashParams(window.location.hash);
+    const assetId = params.get('assetId');
+    if (params.get('kind') !== 'network_check' || !assetId
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(assetId)) return;
+    let cancelled = false;
+    setAssetPrefillError(false);
+    setValue('ownerScope', 'organization');
+    const initialCondition = getValues('condition');
+    const initialBinding = [initialCondition.checkType, initialCondition.target, initialCondition.assetId];
+    void (async () => {
+      try {
+        const res = await fetchWithAuth(`/discovery/assets/${encodeURIComponent(assetId)}`, { skipOrgIdInjection: true });
+        if (!res.ok) throw new Error('asset_read_failed');
+        const body = await res.json();
+        const asset = body.data as NetworkAsset & { orgId: string };
+        if (!asset || asset.id !== assetId || !asset.orgId) throw new Error('asset_response_invalid');
+        if (cancelled || getValues('kind') !== 'network_check' || getValues('ownerScope') !== 'organization'
+          || ['checkType', 'target', 'assetId'].some((key, index) => getValues('condition')[key] !== initialBinding[index])) return;
+        setPrefillOrgId(asset.orgId);
+        // A new asset handoff without a target should use the asset, not the
+        // condition's sample target. The guard above preserves any user edits.
+        const bound = bindNetworkAsset({ ...getValues('condition'), target: params.get('target') ?? '' }, asset);
+        setValue('condition', bound, { shouldDirty: true });
+        if (!getValues('name')) {
+          const label = asset.label ?? asset.hostname ?? asset.ipAddress ?? asset.id;
+          setValue('name', bound.checkType === 'icmp_ping'
+            ? stableT('monitoring:editor.networkCheckAsset.pingName', { label })
+            : `${stableT('monitoring:kinds.network_check')} ${label}`, { shouldDirty: true });
+        }
+      } catch {
+        if (!cancelled) setAssetPrefillError(true);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [isNew, assetPrefillAttempt, getValues, setValue, stableT]);
+
+  useEffect(() => {
+    if (!isPartnerOwned || watchKind !== 'network_check') return;
+    const condition = getValues('condition');
+    if (condition.assetId) setValue('condition', bindNetworkAsset(condition, null), { shouldDirty: true });
+  }, [isPartnerOwned, watchKind, getValues, setValue]);
 
   const switchTab = (tab: EditorTab) => {
     window.location.hash = editorHashForTab(window.location.hash, tab);
@@ -409,6 +635,8 @@ export default function MonitorEditor({ monitorId }: MonitorEditorProps) {
         severity: values.severity,
         cooldownMinutes: values.cooldownMinutes,
         autoResolve: values.autoResolve,
+        rearmMode: values.rearmMode,
+        rearmDelayMinutes: values.rearmMode === 'after_delay' ? values.rearmDelayMinutes : null,
         responses: values.responses,
         deliveryMode: values.deliveryMode,
         deliveryChannelIds: values.deliveryMode === 'channels' ? values.deliveryChannelIds : [],
@@ -420,9 +648,27 @@ export default function MonitorEditor({ monitorId }: MonitorEditorProps) {
         pauseResponsesOnEscalation: values.pauseResponsesOnEscalation,
         aiAgentId: values.aiAgentId || null,
       };
+      // Omitted on PATCH = keep the stored raw condition. Replace turns authoring on, which wins.
+      // On a kind change, the API re-checks a stored value, and one the engine could never
+      // evaluate has no value worth keeping: the section is hidden on most kinds, so a refusal
+      // would leave the user with no way to fix it.
+      const kindChanged = values.kind !== methods.formState.defaultValues?.kind;
+      if (values.clearsWhenEnabled) {
+        payload.autoResolveConditions = values.clearsWhen;
+      } else if (values.rawRecoveryCondition === null || (kindChanged && !isLegacyRecoveryCondition(values.rawRecoveryCondition))) {
+        payload.autoResolveConditions = null;
+      }
+      // Omit the key entirely unless the select was shown: a caller who cannot manage
+      // partner-wide config must never send (or null out) the board override.
+      if (showPsaBoardSelect) {
+        const boardNumber = values.psaBoardId ? Number(values.psaBoardId) : NaN;
+        payload.psaBoardId = Number.isInteger(boardNumber) && boardNumber > 0 ? boardNumber : null;
+      }
       if (isNew && isPartnerScope && values.ownerScope) {
         payload.ownerScope = values.ownerScope;
       }
+
+      if (isNew && !isPartnerOwned && prefillOrgId) payload.orgId = prefillOrgId;
 
       const url = isNew ? '/monitor-definitions' : `/monitor-definitions/${monitorId}`;
       const method = isNew ? 'POST' : 'PATCH';
@@ -542,6 +788,8 @@ export default function MonitorEditor({ monitorId }: MonitorEditorProps) {
     }
   };
 
+  usePageItemName(loadedName);
+
   if (loading) {
     return (
       <div className="flex items-center justify-center py-12">
@@ -561,7 +809,11 @@ export default function MonitorEditor({ monitorId }: MonitorEditorProps) {
         />
         <div className="flex items-center justify-between gap-4">
           <div className="flex items-center gap-4">
-            <a href="/alerts/monitors" className="flex h-10 w-10 items-center justify-center rounded-md border hover:bg-muted">
+            <a
+              href="/alerts/monitors"
+              className="flex h-10 w-10 items-center justify-center rounded-md border hover:bg-muted"
+              aria-label={t('monitoring:editor.actions.backToMonitors')}
+            >
               <ArrowLeft className="h-5 w-5" />
             </a>
             <h1 className="text-xl font-semibold tracking-tight">
@@ -638,7 +890,7 @@ export default function MonitorEditor({ monitorId }: MonitorEditorProps) {
               <button
                 type="button"
                 data-testid="monitor-editor-test-run"
-                disabled={!testDeviceId || testSubmitting}
+                disabled={!testDeviceId || testSubmitting || isDirty}
                 onClick={() => void handleRunTest()}
                 className="h-9 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
               >
@@ -652,6 +904,12 @@ export default function MonitorEditor({ monitorId }: MonitorEditorProps) {
                 {t('common:actions.close')}
               </button>
             </div>
+            {isDirty && (
+              // The test route evaluates the SAVED definition, not the form (#9625).
+              <p data-testid="monitor-editor-test-dirty-hint" className="mt-2 text-xs text-muted-foreground">
+                {t('monitoring:editor.testDialog.saveToTest')}
+              </p>
+            )}
             {testResult && (
               <p
                 data-testid="monitor-editor-test-result"
@@ -738,47 +996,48 @@ export default function MonitorEditor({ monitorId }: MonitorEditorProps) {
               </select>
             </div>
             <MonitorConditionFields kind={watchKind} name="condition" />
+            {watchKind === 'network_check' && <>
+              <NetworkCheckAssetBinding
+                orgId={isPartnerOwned ? null : ownerOrgId}
+                assetId={(watch('condition').assetId as string | undefined) ?? null}
+                onSelect={asset => setValue('condition', bindNetworkAsset(getValues('condition'), asset), { shouldDirty: true })}
+              />
+              {assetPrefillError && <p role="alert" className="text-sm text-destructive">
+                {t('monitoring:editor.networkCheckAsset.failed')}{' '}
+                <button type="button" className="underline" onClick={() => setAssetPrefillAttempt(value => value + 1)}>{t('common:actions.retry')}</button>
+              </p>}
+            </>}
+            {errors.condition && (
+              <p role="alert" data-testid="monitor-editor-condition-error" className="text-sm text-destructive">
+                {t('monitoring:editor.errors.invalidCondition')}
+              </p>
+            )}
           </section>
 
           <section className="space-y-3">
-            <h2 className="text-sm font-semibold">{t('monitoring:editor.sections.noise')}</h2>
-            <div className="grid gap-3 sm:grid-cols-2">
-              <div className="space-y-2">
-                <label className="text-xs font-medium text-muted-foreground" htmlFor="monitor-editor-severity">
-                  {t('monitoring:editor.fields.severity')}
-                </label>
-                <select
-                  id="monitor-editor-severity"
-                  data-testid="monitor-editor-severity"
-                  className="h-9 w-full rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
-                  {...register('severity')}
-                >
-                  {['critical', 'high', 'medium', 'low', 'info'].map((sev) => (
-                    <option key={sev} value={sev}>
-                      {t(/* i18n-dynamic */ `monitoring:severities.${sev}`)}
-                    </option>
-                  ))}
-                </select>
-              </div>
-              <div className="space-y-2">
-                <label className="text-xs font-medium text-muted-foreground" htmlFor="monitor-editor-cooldown">
-                  {t('monitoring:editor.fields.cooldownMinutes')}
-                </label>
-                <input
-                  id="monitor-editor-cooldown"
-                  data-testid="monitor-editor-cooldown"
-                  type="number"
-                  min={0}
-                  max={1440}
-                  className="h-9 w-full rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
-                  {...register('cooldownMinutes', { valueAsNumber: true })}
-                />
-              </div>
+            <h2 className="text-sm font-semibold">{t('monitoring:editor.sections.lifecycle')}</h2>
+            <div className="space-y-2 sm:w-1/2 sm:pr-1.5">
+              <label className="text-xs font-medium text-muted-foreground" htmlFor="monitor-editor-severity">
+                {t('monitoring:editor.fields.severity')}
+              </label>
+              <select
+                id="monitor-editor-severity"
+                data-testid="monitor-editor-severity"
+                className="h-9 w-full rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
+                {...register('severity')}
+              >
+                {['critical', 'high', 'medium', 'low', 'info'].map((sev) => (
+                  <option key={sev} value={sev}>
+                    {t(/* i18n-dynamic */ `monitoring:severities.${sev}`)}
+                  </option>
+                ))}
+              </select>
             </div>
-            <label className="flex items-center gap-2 text-sm">
-              <input type="checkbox" data-testid="monitor-editor-auto-resolve" {...register('autoResolve')} />
-              {t('monitoring:editor.fields.autoResolve')}
-            </label>
+            <MonitorLifecycleFields
+              orgId={isPartnerOwned ? null : ownerOrgId}
+              ready={!loading}
+              showPartnerWideHint={hydrated && isPartnerOwned}
+            />
           </section>
 
           <section className="space-y-3">
@@ -810,6 +1069,14 @@ export default function MonitorEditor({ monitorId }: MonitorEditorProps) {
               notificationChannels={notificationChannels}
               softwareCatalog={softwareCatalog}
             />
+            <RestartResponseFields />
+            {errors.responses && (
+              <p role="alert" data-testid="monitor-editor-responses-error" className="text-sm text-destructive">
+                {(errors.responses.root?.message ?? errors.responses.message) === RESTART_SERVICE_NAME_ISSUE
+                  ? t('monitoring:editor.errors.restartServiceRequiresName')
+                  : t('monitoring:editor.errors.invalidResponses')}
+              </p>
+            )}
           </section>
 
           <section className="space-y-3">
@@ -880,6 +1147,33 @@ export default function MonitorEditor({ monitorId }: MonitorEditorProps) {
                   {compatibleEscalationPolicies.map(policy => <option key={policy.id} value={policy.id}>{policy.name}</option>)}
                 </select>
               </div>
+            )}
+            {showPsaBoardSelect && (
+              <div className="space-y-2">
+                <label htmlFor="monitor-editor-psa-board" className="text-xs font-medium text-muted-foreground">
+                  {t('monitoring:editor.fields.psaBoard')}
+                </label>
+                <select id="monitor-editor-psa-board" data-testid="monitor-editor-psa-board"
+                  className="h-9 w-full rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring" {...register('psaBoardId')}
+                  value={watchPsaBoardId ?? ''}>
+                  <option value="">{t('monitoring:editor.psaBoardDefault')}</option>
+                  {watchPsaBoardId && !psaBoards?.some(b => String(b.id) === watchPsaBoardId) && (
+                    <option value={watchPsaBoardId}>{`#${watchPsaBoardId}`}</option>
+                  )}
+                  {psaBoards?.map(b => <option key={b.id} value={String(b.id)}>{b.name}</option>)}
+                </select>
+                <p className="text-xs text-muted-foreground">{t('monitoring:editor.psaBoardHelp')}</p>
+              </div>
+            )}
+            {!showPsaBoardSelect && psaBoardsUnavailable && (
+              <p className="text-xs text-muted-foreground" data-testid="monitor-editor-psa-board-unavailable">
+                {t('monitoring:editor.psaBoardUnavailable')}
+              </p>
+            )}
+            {!showPsaBoardSelect && loadedPsaBoardId !== null && (!isPartnerScope || !canManagePartnerWide || psaLookupSettled) && (
+              <p className="text-xs text-muted-foreground" data-testid="monitor-editor-psa-board-readonly">
+                {t('monitoring:editor.psaBoardReadOnly', { id: loadedPsaBoardId })}
+              </p>
             )}
             <a href="/alerts/delivery" data-testid="monitor-editor-delivery-home" className="text-sm text-primary underline">
               {t('monitoring:editor.deliveryPreview.manage')}

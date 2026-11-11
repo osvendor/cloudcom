@@ -5,9 +5,10 @@
  * reboot commands via the existing command queue infrastructure.
  */
 
-import { queueCommandForExecution } from './commandQueue';
+import { queueCommandForExecution, queueCommandForExecutionWithSystemPrecheck } from './commandQueue';
 import { checkDeviceMaintenanceWindow, resolvePatchConfigForDevice } from './featureConfigResolver';
 import { captureException } from './sentry';
+import { rebootPromptTextSchemas } from '@breeze/shared/validators';
 
 // ============================================
 // Reboot delay resolution (issue #3197)
@@ -196,10 +197,79 @@ export function computeRebootDeadline(
   return new Date(derived);
 }
 
+// ============================================
+// Custom restart-prompt text (issue #8030)
+// ============================================
+
+/**
+ * Operator-supplied replacement text for the end-user restart prompt. Every
+ * field is optional and independent: an absent field means the agent keeps its
+ * built-in English copy for that part of the prompt. Rides the schedule_reboot
+ * payload for the same reason the deferral budget does — it is fixed for the
+ * life of one scheduled reboot.
+ */
+export interface RebootPromptText {
+  title?: string;
+  body?: string;
+  button?: string;
+}
+
+const PROMPT_TEXT_FIELDS = [
+  ['title', 'rebootPromptTitle'],
+  ['body', 'rebootPromptBody'],
+  ['button', 'rebootPromptButton'],
+] as const;
+
+/**
+ * Derives the prompt text from an already-resolved patch settings row,
+ * re-validating each stored value with the same schema every write path uses.
+ * A value that fails (a hand-edited row, a pre-validator write) is dropped —
+ * that field falls back to the built-in text — and reported, because shipping
+ * unvalidated text to an end user's screen is the outcome to avoid, and a
+ * silently English prompt is not a reason to fail the reboot.
+ */
+export function rebootPromptTextFrom(
+  settings: ResolvedPatchSettings,
+  deviceId: string
+): RebootPromptText {
+  if (!settings) return {};
+  const text: RebootPromptText = {};
+  for (const [field, column] of PROMPT_TEXT_FIELDS) {
+    const stored = (settings as Record<string, unknown>)[column];
+    const parsed = rebootPromptTextSchemas[field].safeParse(stored);
+    if (!parsed.success) {
+      console.warn(
+        `[PatchReboot] device ${deviceId} has an invalid stored ${column}; using the built-in text`
+      );
+      captureException(
+        new Error(`Invalid config_policy_patch_settings.${column} for device ${deviceId}; dropped`)
+      );
+      continue;
+    }
+    if (parsed.data !== null) text[field] = parsed.data;
+  }
+  return text;
+}
+
+/**
+ * The prompt keys for the schedule_reboot payload. Only SET fields are emitted:
+ * an absent key is what tells the agent to keep its built-in text, and it is
+ * also what an agent predating #8030 sees — so an unset policy produces a
+ * payload byte-identical to before.
+ */
+export function rebootPromptPayload(text: RebootPromptText): Record<string, string> {
+  const payload: Record<string, string> = {};
+  if (text.title) payload.promptTitle = text.title;
+  if (text.body) payload.promptBody = text.body;
+  if (text.button) payload.promptButton = text.button;
+  return payload;
+}
+
 /** Everything one policy walk answers for a single reboot dispatch. */
 export interface ResolvedRebootPlan {
   delayMinutes: number;
   deferral: RebootDeferralSettings;
+  promptText: RebootPromptText;
 }
 
 /**
@@ -227,6 +297,7 @@ export async function resolveRebootPlan(
     return {
       delayMinutes: rebootDelayMinutesFrom(settings, deviceId),
       deferral: rebootDeferralSettingsFrom(settings),
+      promptText: rebootPromptTextFrom(settings, deviceId),
     };
   } catch (err) {
     console.warn(
@@ -234,7 +305,7 @@ export async function resolveRebootPlan(
       err
     );
     captureException(err instanceof Error ? err : new Error(String(err)));
-    return { delayMinutes: DEFAULT_REBOOT_DELAY_MINUTES, deferral: DEFERRAL_OFF };
+    return { delayMinutes: DEFAULT_REBOOT_DELAY_MINUTES, deferral: DEFERRAL_OFF, promptText: {} };
   }
 }
 
@@ -350,6 +421,12 @@ export async function executeReboot(
      */
     deferral?: RebootDeferralSettings;
     /**
+     * Explicit restart-prompt text (#8030). Omit to resolve it from the device's
+     * effective patch policy. The policy walk is skipped only when delay,
+     * deferral AND prompt text are all supplied.
+     */
+    promptText?: RebootPromptText;
+    /**
      * Close of the maintenance window this reboot was issued inside, if any.
      * Caps the deadline so a user cannot postpone past the end of the window.
      */
@@ -360,36 +437,87 @@ export async function executeReboot(
      * without it a mismatched device id would receive a reboot.
      */
     expectedOrgId?: string;
-  } = {}
+    /**
+     * #11065 W06, additive. `'hold'` makes `windowEndsAt` the deadline and tells
+     * the agent to drop, never force, a restart that cannot begin by then (the
+     * overnight vendor-update reboot, services/oemUpdates/rebootPlanner.ts).
+     * Omitted means today's behaviour: no key on the payload at all. Only send it
+     * to an agent that honours it (`agentSupportsOemRebootHold`): an older one
+     * ignores the key and forces the restart late.
+     */
+    deadlineAction?: 'hold';
+    /** Echoed back on the heartbeat as `rebootStatus.source`. Defaults to `patch_job`. */
+    source?: 'patch_job' | 'oem_updates';
+  } & (
+    | { commitBeforeDelivery?: false }
+    | {
+        /**
+         * Commit the row on its own short transaction, then push it. For a caller with
+         * no DB context held, where a push from inside a transaction could reach an
+         * agent before the row is visible (#7103). Needs `expectedOrgId`, because the
+         * device lookup runs in system scope.
+         */
+        commitBeforeDelivery: true;
+        expectedOrgId: string;
+      }
+  ) = {}
 ): Promise<RebootResult> {
+  // The type requires it. A tenancy boundary is still worth checking at runtime.
+  if (options.commitBeforeDelivery && !options.expectedOrgId) {
+    return { success: false, error: 'commitBeforeDelivery requires expectedOrgId' };
+  }
+  // A hold restart without the window close, or one that would begin after it,
+  // would only be warned about and then dropped: refuse it before any lookup.
+  const hold = options.deadlineAction === 'hold';
+  if (hold && !options.windowEndsAt) {
+    return { success: false, error: 'A held reboot needs the maintenance window close' };
+  }
+
   const explicitDelay =
     options.delayMinutes !== undefined ? clampRebootDelayMinutes(options.delayMinutes) : undefined;
-  // One policy walk answers both questions; skipped entirely only when the
-  // caller has already supplied both.
+  // One policy walk answers every question; skipped entirely only when the
+  // caller has already supplied all of them.
   const plan =
-    explicitDelay !== undefined && options.deferral !== undefined
+    explicitDelay !== undefined && options.deferral !== undefined && options.promptText !== undefined
       ? null
       : await resolveRebootPlan(deviceId);
   const delayMinutes = explicitDelay ?? plan!.delayMinutes;
   const deferral = options.deferral ?? plan!.deferral;
-  const deadline = computeRebootDeadline(new Date(), delayMinutes, deferral, options.windowEndsAt);
+  const promptText = options.promptText ?? plan!.promptText;
+  const now = new Date();
+  let deadline = computeRebootDeadline(now, delayMinutes, deferral, options.windowEndsAt);
+  if (hold) {
+    // The close itself, not the deferral-derived stop: with deferral off that
+    // would be the scheduled time, and any lateness inside the window (a flash
+    // hold, a timer) would drop a restart that still had hours to run.
+    deadline = options.windowEndsAt!;
+    if (now.getTime() + delayMinutes * 60_000 > deadline.getTime()) {
+      return { success: false, error: 'The held reboot would begin after the maintenance window closes' };
+    }
+  }
 
-  const result = await queueCommandForExecution(
-    deviceId,
-    'schedule_reboot',
-    {
-      delayMinutes,
-      reason,
-      source: 'patch_job',
-      // #3207. Additive keys: an agent that predates them reads only the three
-      // above, and `allowDeferral` absent must never mean "enabled".
-      deadline: deadline.toISOString(),
-      allowDeferral: deferral.allowDeferral,
-      maxDeferrals: deferral.maxDeferrals,
-      deferralMinutes: deferral.deferralMinutes,
-    },
-    { expectedOrgId: options.expectedOrgId }
-  );
+  const payload = {
+    delayMinutes,
+    reason,
+    source: options.source ?? 'patch_job',
+    // #3207. Additive keys: an agent that predates them reads only the three
+    // above, and `allowDeferral` absent must never mean "enabled".
+    deadline: deadline.toISOString(),
+    allowDeferral: deferral.allowDeferral,
+    maxDeferrals: deferral.maxDeferrals,
+    deferralMinutes: deferral.deferralMinutes,
+    // #8030. Additive and only present when set; see rebootPromptPayload.
+    ...rebootPromptPayload(promptText),
+    // #11065 W06. Additive and only present for a hold.
+    ...(hold ? { deadlineAction: 'hold' as const } : {}),
+  };
+  const result = options.commitBeforeDelivery
+    ? await queueCommandForExecutionWithSystemPrecheck(deviceId, 'schedule_reboot', payload, {
+        expectedOrgId: options.expectedOrgId,
+      })
+    : await queueCommandForExecution(deviceId, 'schedule_reboot', payload, {
+        expectedOrgId: options.expectedOrgId,
+      });
 
   if (result.error) {
     return { success: false, error: result.error };

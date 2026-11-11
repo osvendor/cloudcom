@@ -106,6 +106,8 @@ async function insertKey(input: {
         keyPrefix: `brz_sp_${randomUUID().slice(0, 8)}`,
         rotatedFromId: input.rotatedFromId,
         createdBy: input.userId,
+        ownerCredentialEpoch: 1,
+        ownerMfaEpoch: 1,
       })
       .returning(),
   );
@@ -206,7 +208,7 @@ describe('partner-service-principal database contract', () => {
   runDb.each([
     { label: 'empty', scopes: [] },
     { label: 'duplicate', scopes: ['devices:read', 'devices:read'] },
-    { label: 'unknown', scopes: ['devices:read', 'alerts:read'] },
+    { label: 'unknown', scopes: ['devices:read', 'billing:read'] },
   ])('rejects $label principal scopes in PostgreSQL', async ({ scopes }) => {
     const { partnerA, userA } = await seedTwoPartners();
     const cause = await captureCause(() =>
@@ -221,6 +223,18 @@ describe('partner-service-principal database contract', () => {
 
     expect(cause?.code).toBe('23514');
     expect(cause?.constraint_name).toBe('partner_service_principals_scopes_check');
+  });
+
+  runDb('accepts the opt-in device-status:read scope in PostgreSQL (#7577)', async () => {
+    const { partnerA, userA } = await seedTwoPartners();
+    const [principal] = await (getTestDb() as any).insert(partnerServicePrincipals).values({
+      partnerId: partnerA.id,
+      name: `device-status-${randomUUID()}`,
+      scopes: ['devices:read', 'device-status:read'],
+      createdBy: userA.id,
+      updatedBy: userA.id,
+    }).returning();
+    expect(principal?.scopes).toEqual(['devices:read', 'device-status:read']);
   });
 
   runDb('rejects unknown principal and key status values', async () => {
@@ -252,6 +266,8 @@ describe('partner-service-principal database contract', () => {
         keyPrefix: 'brz_sp_invalid',
         status: 'disabled',
         createdBy: userA.id,
+        ownerCredentialEpoch: 1,
+        ownerMfaEpoch: 1,
       }),
     );
     expect(keyStatusCause?.code).toBe('23514');
@@ -286,6 +302,8 @@ describe('partner-service-principal database contract', () => {
           keyHash: `hash-${randomUUID()}`,
           keyPrefix: 'brz_sp_wrongprincipal',
           createdBy: userA.id,
+          ownerCredentialEpoch: 1,
+          ownerMfaEpoch: 1,
         }),
       ),
     );
@@ -304,6 +322,8 @@ describe('partner-service-principal database contract', () => {
           keyPrefix: 'brz_sp_wrongrotation',
           rotatedFromId: keyB.id,
           createdBy: userA.id,
+          ownerCredentialEpoch: 1,
+          ownerMfaEpoch: 1,
         }),
       ),
     );
@@ -380,6 +400,8 @@ describe('partner-service-principal partner-axis RLS (breeze_app)', () => {
               keyHash: `hash-${randomUUID()}`,
               keyPrefix: 'brz_sp_forged',
               createdBy: userA.id,
+              ownerCredentialEpoch: 1,
+              ownerMfaEpoch: 1,
             }),
       ),
     );

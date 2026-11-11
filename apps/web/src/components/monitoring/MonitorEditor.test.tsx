@@ -7,7 +7,11 @@ import { fetchWithAuth } from '../../stores/auth';
 import { navigateTo } from '@/lib/navigation';
 import { showToast } from '../shared/Toast';
 
-vi.mock('../../stores/auth', () => ({ fetchWithAuth: vi.fn() }));
+const authUser: { canManagePartnerWide?: boolean } = {};
+vi.mock('../../stores/auth', () => ({
+  fetchWithAuth: vi.fn(),
+  useAuthStore: (selector: (s: unknown) => unknown) => selector({ user: authUser }),
+}));
 vi.mock('../../stores/orgStore', () => ({
   useOrgStore: (selector: (s: { currentOrgId: string | null }) => unknown) => selector({ currentOrgId: 'org-1' }),
 }));
@@ -68,6 +72,18 @@ const MONITOR_M1_FIXTURE = {
   partnerId: null,
   attachments: [],
 };
+
+describe('MonitorEditor back link (#7158 a11y)', () => {
+  it('gives the icon-only back-to-monitors link an accessible name', async () => {
+    fetchMock.mockImplementation(async (input: string) => defaultFetchImpl(input));
+    render(<MonitorEditor />);
+
+    expect(await screen.findByRole('link', { name: 'Back to Monitors' })).toHaveAttribute(
+      'href',
+      '/alerts/monitors',
+    );
+  });
+});
 
 describe('MonitorEditor owner scope hydration (#6391)', () => {
   it('omits the owner-scope block from the server markup so hydration matches', () => {
@@ -222,6 +238,51 @@ describe('MonitorEditor (#5289)', () => {
     await waitFor(() => expect(toastMock).toHaveBeenCalledWith({ type: 'error', message: expected }));
     expect(screen.getByTestId('monitor-editor-error')).toHaveTextContent(expected);
     expect(screen.getByTestId('monitor-editor-error')).not.toHaveTextContent('INVALID_MONITOR:');
+  });
+
+  it('blocks the save on a condition the shared schema rejects and says why (#6371 W05c2 Task 12)', async () => {
+    fetchMock.mockImplementation(async (input: string) => defaultFetchImpl(input));
+    render(<MonitorEditor />);
+    await waitFor(() => expect(screen.getByTestId('monitor-editor')).toBeInTheDocument());
+
+    fireEvent.change(screen.getByTestId('monitor-editor-kind'), { target: { value: 'disk' } });
+    fireEvent.change(screen.getByTestId('monitor-editor-name'), { target: { value: 'Disk full' } });
+    // percentThresholdCondition caps value at 100.
+    fireEvent.change(screen.getByTestId('condition-field-value'), { target: { value: '150' } });
+    // submit() rather than a click: the input's native max=100 would block a
+    // click-submit before react-hook-form's resolver ever runs.
+    fireEvent.submit(screen.getByTestId('monitor-editor-save').closest('form')!);
+
+    expect(await screen.findByTestId('monitor-editor-condition-error')).toHaveTextContent(
+      'Some condition values are missing or out of range',
+    );
+    expect(
+      fetchMock.mock.calls.some(([, init]) => ['POST', 'PATCH'].includes(String((init as RequestInit)?.method))),
+    ).toBe(false);
+  });
+
+  it('blocks the save on a Restart service response with no service name (D1)', async () => {
+    fetchMock.mockImplementation(async (input: string) => defaultFetchImpl(input));
+    render(<MonitorEditor />);
+    await waitFor(() => expect(screen.getByTestId('monitor-editor')).toBeInTheDocument());
+
+    fireEvent.change(screen.getByTestId('monitor-editor-kind'), { target: { value: 'disk' } });
+    fireEvent.change(screen.getByTestId('monitor-editor-name'), { target: { value: 'Disk full' } });
+
+    fireEvent.click(screen.getAllByRole('button', { name: /add action/i })[0]);
+    const actionTypeSelect = screen.getByRole('option', { name: 'Execute Command' }).closest('select')!;
+    fireEvent.change(actionTypeSelect, { target: { value: 'execute_command' } });
+    fireEvent.click(screen.getByTestId('restart-0-toggle'));
+
+    fireEvent.submit(screen.getByTestId('monitor-editor-save').closest('form')!);
+
+    // sweep F2: the specific reason, not the generic "missing or out of range" fallback.
+    expect(await screen.findByTestId('monitor-editor-responses-error')).toHaveTextContent(
+      'Restart service requires a service name',
+    );
+    expect(
+      fetchMock.mock.calls.some(([, init]) => ['POST', 'PATCH'].includes(String((init as RequestInit)?.method))),
+    ).toBe(false);
   });
 
   it('create mode: switching kind to disk renders its fields with defaults and submits the right condition + ownerScope', async () => {
@@ -512,6 +573,26 @@ describe('MonitorEditor (#5289)', () => {
     await waitFor(() => expect(screen.getByTestId('monitor-editor-test-result')).toHaveTextContent('HOST-1'));
   });
 
+  it('edit mode: disables Test while the form has unsaved edits and says why (#9625)', async () => {
+    fetchMock.mockImplementation(async (input: string, init?: RequestInit) => {
+      if (input === '/monitor-definitions/m1' && !init) return json({ data: { ...MONITOR_M1_FIXTURE } });
+      if (input === '/monitor-definitions/m1/devices') return json({ data: [] });
+      if (input === '/devices') return json({ devices: [{ id: 'dev-1', hostname: 'HOST-1' }] });
+      return defaultFetchImpl(input);
+    });
+    render(<MonitorEditor monitorId="m1" />);
+    await waitFor(() => expect(screen.getByTestId('monitor-editor-name')).toHaveValue('Disk full'));
+    fireEvent.click(screen.getByTestId('monitor-editor-test-open'));
+    await waitFor(() => expect(screen.getByTestId('monitor-editor-test-device')).toBeInTheDocument());
+    fireEvent.change(screen.getByTestId('monitor-editor-test-device'), { target: { value: 'dev-1' } });
+    expect(screen.getByTestId('monitor-editor-test-run')).toBeEnabled();
+    expect(screen.queryByTestId('monitor-editor-test-dirty-hint')).toBeNull();
+
+    fireEvent.change(screen.getByTestId('monitor-editor-name'), { target: { value: 'Disk very full' } });
+    await waitFor(() => expect(screen.getByTestId('monitor-editor-test-run')).toBeDisabled());
+    expect(screen.getByTestId('monitor-editor-test-dirty-hint')).toHaveTextContent('Save to test your changes');
+  });
+
   it('edit mode: PATCHes the monitor on save and refetches (not POST, not the create-mode navigate)', async () => {
     fetchMock.mockImplementation(async (input: string, init?: RequestInit) => {
       if (input === '/monitor-definitions/m1' && !init) return json({ data: MONITOR_M1_FIXTURE });
@@ -762,4 +843,131 @@ describe('MonitorEditor (#5289)', () => {
     expect(fetchMock.mock.calls.filter(([url]) => url === '/monitor-definitions/m1')).toHaveLength(1);
   });
 
+});
+
+
+describe('network check authoring', () => {
+  const asset = { id: '11111111-1111-4111-8111-111111111111', orgId: '22222222-2222-4222-8222-222222222222', label: 'Core switch', ipAddress: '192.0.2.2', hostname: 'core-sw' };
+  beforeEach(() => {
+    vi.clearAllMocks();
+    window.history.replaceState(null, '', '/alerts/monitors/new');
+    fetchMock.mockImplementation(async (input, init) => {
+      if (input === `/discovery/assets/${asset.id}`) return json({ data: asset });
+      if (input.startsWith('/discovery/assets?')) return json({ data: [asset] });
+      if (input === '/monitor-definitions' && init?.method === 'POST') return json({ data: { id: 'new-1' } });
+      return defaultFetchImpl(input);
+    });
+  });
+
+  it.each([
+    { suffix: '', checkType: 'icmp_ping', target: '192.0.2.2' },
+    { suffix: '&checkType=http_check&target=https%3A%2F%2Fexample.com%2Fhealth', checkType: 'http_check', target: 'https://example.com/health' },
+  ])('prefills the asset owner and preserves the $checkType handoff on save', async ({ suffix, checkType, target }) => {
+    window.history.replaceState(null, '', `/alerts/monitors/new#kind=network_check&assetId=${asset.id}${suffix}`);
+    render(<MonitorEditor />);
+    await screen.findByRole('option', { name: 'Core switch' });
+    expect(screen.getByTestId('condition-field-target')).toHaveValue(target);
+    expect(screen.getByTestId('condition-field-checkType')).toHaveValue(checkType);
+    await waitFor(() => expect(screen.getByTestId('monitor-editor-name')).not.toHaveValue(''));
+    fireEvent.click(screen.getByTestId('monitor-editor-save'));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/monitor-definitions', expect.objectContaining({ method: 'POST' })));
+    const call = fetchMock.mock.calls.find(([url, init]) => url === '/monitor-definitions' && init?.method === 'POST')!;
+    expect(JSON.parse(String(call[1]?.body))).toMatchObject({ orgId: asset.orgId, ownerScope: 'organization', condition: { assetId: asset.id, checkType, target } });
+  });
+
+  it.each(['bogus', 'network_check&assetId=invalid'])('ignores invalid hash preselection: %s', async hash => {
+    window.history.replaceState(null, '', `/alerts/monitors/new#kind=${hash}`);
+    render(<MonitorEditor />);
+    expect(await screen.findByTestId('monitor-editor-kind')).toHaveValue(hash === 'bogus' ? 'cpu' : 'network_check');
+    expect(fetchMock.mock.calls.some(([url]) => url.startsWith('/discovery/assets/'))).toBe(false);
+  });
+
+  it('resolves an asset outside the selected org and saves under its actual owner', async () => {
+    // The partner has org-1 selected, while the handoff asset belongs to another org.
+    const previous = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (input, init) => {
+      if (input === `/discovery/assets/${asset.id}` && !init?.skipOrgIdInjection) {
+        return json({ error: 'Asset not found' }, false, 404);
+      }
+      return previous(input, init);
+    });
+    window.history.replaceState(null, '', `/alerts/monitors/new#kind=network_check&assetId=${asset.id}`);
+    render(<MonitorEditor />);
+    await waitFor(() => expect(screen.getByTestId('condition-field-target')).toHaveValue(asset.ipAddress));
+    expect(fetchMock).toHaveBeenCalledWith(`/discovery/assets/${asset.id}`, expect.objectContaining({ skipOrgIdInjection: true }));
+    fireEvent.click(screen.getByTestId('monitor-editor-save'));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/monitor-definitions', expect.objectContaining({ method: 'POST' })));
+    const call = fetchMock.mock.calls.find(([url, init]) => url === '/monitor-definitions' && init?.method === 'POST')!;
+    expect(JSON.parse(String(call[1]?.body))).toMatchObject({
+      ownerScope: 'organization', orgId: asset.orgId, condition: { assetId: asset.id },
+    });
+  });
+
+  it('retries a failed asset prefill without an unhandled rejection', async () => {
+    window.history.replaceState(null, '', `/alerts/monitors/new#kind=network_check&assetId=${asset.id}`);
+    const previous = fetchMock.getMockImplementation()!;
+    let failed = false;
+    fetchMock.mockImplementation(async (input, init) => {
+      if (input === `/discovery/assets/${asset.id}` && !failed) { failed = true; throw new Error('offline'); }
+      return previous(input, init);
+    });
+    render(<MonitorEditor />);
+    expect(await screen.findByRole('alert')).toHaveTextContent('Could not load assets');
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    await waitFor(() => expect(screen.getByTestId('monitor-editor-name')).toHaveValue('Ping Core switch'));
+    expect(screen.getByTestId('network-check-asset-picker')).toHaveValue(asset.id);
+  });
+
+  it.each(['target', 'owner', 'kind'])('ignores late asset prefill after the user changes %s', async field => {
+    window.history.replaceState(null, '', `/alerts/monitors/new#kind=network_check&assetId=${asset.id}`);
+    const previous = fetchMock.getMockImplementation()!;
+    let finish!: (response: Response) => void;
+    fetchMock.mockImplementation(async (input, init) => input === `/discovery/assets/${asset.id}`
+      ? new Promise<Response>(resolve => { finish = resolve; }) : previous(input, init));
+    render(<MonitorEditor />);
+    await screen.findByTestId('condition-field-target');
+    if (field === 'target') fireEvent.change(screen.getByTestId('condition-field-target'), { target: { value: 'custom.example.com' } });
+    if (field === 'owner') fireEvent.click(screen.getByTestId('monitor-editor-owner-partner'));
+    if (field === 'kind') fireEvent.change(screen.getByTestId('monitor-editor-kind'), { target: { value: 'cpu' } });
+    await act(async () => finish(json({ data: asset })));
+    expect(screen.getByTestId('monitor-editor-name')).toHaveValue('');
+    if (field === 'target') expect(screen.getByTestId('condition-field-target')).toHaveValue('custom.example.com');
+    if (field === 'owner') expect(screen.getByTestId('network-check-asset-picker')).toHaveValue('');
+    if (field === 'kind') expect(screen.getByTestId('monitor-editor-kind')).toHaveValue('cpu');
+  });
+
+  it('clears binding when switching to partner ownership', async () => {
+    window.history.replaceState(null, '', `/alerts/monitors/new#kind=network_check&assetId=${asset.id}`);
+    render(<MonitorEditor />);
+    await screen.findByRole('option', { name: 'Core switch' });
+    fireEvent.click(screen.getByTestId('monitor-editor-owner-partner'));
+    expect(screen.getByTestId('network-check-asset-picker')).toBeDisabled();
+    fireEvent.click(screen.getByTestId('monitor-editor-save'));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/monitor-definitions', expect.objectContaining({ method: 'POST' })));
+    const call = fetchMock.mock.calls.find(([url, init]) => url === '/monitor-definitions' && init?.method === 'POST')!;
+    const body = JSON.parse(String(call[1]?.body));
+    expect(body.condition.assetId).toBeUndefined();
+    expect(body.orgId).toBeUndefined();
+  });
+
+  it.each([
+    { checkType: 'icmp_ping', packetSize: 1400 },
+    { checkType: 'http_check', headers: { 'X-Probe': 'breeze' } },
+  ])('PATCH preserves API-only options through binding and unbinding: $checkType', async option => {
+    const fixture = { ...MONITOR_M1_FIXTURE, name: 'Network test', kind: 'network_check', condition: {
+      ...option, target: option.checkType === 'http_check' ? 'https://example.com:8443/health' : 'example.com', pollingIntervalSeconds: 60, timeoutSeconds: 5, consecutiveFailures: 2, degradedIsFailure: false,
+    } };
+    const previous = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (input, init) => input === '/monitor-definitions/m1' ? json({ data: fixture }) : previous(input, init));
+    render(<MonitorEditor monitorId="m1" />);
+    await screen.findByDisplayValue('Network test');
+    await screen.findByRole('option', { name: 'Core switch' });
+    fireEvent.change(screen.getByTestId('network-check-asset-picker'), { target: { value: asset.id } });
+    fireEvent.change(screen.getByTestId('network-check-asset-picker'), { target: { value: '' } });
+    expect(screen.getByTestId('condition-field-target')).toHaveValue(fixture.condition.target);
+    fireEvent.click(screen.getByTestId('monitor-editor-save'));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/monitor-definitions/m1', expect.objectContaining({ method: 'PATCH' })));
+    const call = fetchMock.mock.calls.find(([url, init]) => url === '/monitor-definitions/m1' && init?.method === 'PATCH')!;
+    expect(JSON.parse(String(call[1]?.body)).condition).toMatchObject({ ...option, target: fixture.condition.target });
+  });
 });

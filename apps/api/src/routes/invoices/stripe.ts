@@ -24,7 +24,10 @@ const idParam = z.object({ id: z.string().guid() });
 // invoice balance (to share with the customer). Gated on the partner's Stripe
 // Connect being active; 409 STRIPE_NOT_CONNECTED otherwise.
 invoiceStripeRoutes.post('/:id/pay-link', scopes, sendPerm, zValidator('param', idParam), async (c) => {
-  try { return c.json({ data: await createInvoicePayLink(c.req.valid('param').id, invoiceActorFrom(c)) }); }
+  try {
+    const id = c.req.valid('param').id;
+    return c.json({ data: await createInvoicePayLink(id, invoiceActorFrom(c)) });
+  }
   catch (err) { return handleServiceError(c, err); }
 });
 
@@ -38,7 +41,7 @@ const abandonSchema = z.object({
 });
 
 /**
- * POST /invoices/:id/stripe-sessions/abandon — SEC-150 operator override.
+ * POST /invoices/:id/stripe-sessions/abandon — operator override.
  *
  * An MSP whose Stripe account is gone forever (closed, credential destroyed,
  * key permanently revoked) can otherwise never void the invoice: the fail-closed

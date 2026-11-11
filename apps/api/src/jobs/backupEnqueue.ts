@@ -12,6 +12,7 @@ import { backupConfigs } from '../db/schema';
 import { createInstrumentedQueue } from '../services/bullmqQueue';
 import {
   backupQueueJobDataSchema,
+  type BackupQueueJobData,
   type QueueActorMeta,
   withQueueMeta,
 } from './queueSchemas';
@@ -60,6 +61,13 @@ const PRIVILEGED_JOB_OPTIONS = {
 const DISPATCH_JOB_OPTIONS = {
   attempts: 1,
 };
+
+/**
+ * How many times a dispatch is queued again while the device has not reported
+ * its backup helper (backupWorker holdForHelperReport) — and so how many
+ * re-queue ids a cancellation looks for.
+ */
+export const BACKUP_CAPABILITY_WAIT_MAX_ATTEMPTS = 40;
 
 let backupQueue: Queue | null = null;
 
@@ -137,7 +145,43 @@ export interface ProcessResultsResult {
     formatVersion?: number;
     backupIdentity?: string;
   };
+  // Snapshot attestation envelope, forwarded verbatim (validated where it is
+  // recorded, services/backupAttestation.ts).
+  attestation?: unknown;
   error?: string;
+}
+
+/**
+ * The OPTIONAL free-text fields of the result. The strict queue schema declares
+ * each as a non-empty string, but the ingress schema (routes/backup/
+ * resultSchemas.ts) accepts any string, so a helper that reports one blank gets
+ * past ingress and is then refused here, failing a run that succeeded (#7466:
+ * the Hyper-V export sends `warning: ""` on every clean run).
+ *
+ * Blank means "not reported": {@link withBlankOptionalStringsAbsent} drops these
+ * keys when they are empty or whitespace-only, just before the strict parse. The
+ * queue schema stays strict for everything else. The required `status` is
+ * server-derived and deliberately NOT listed: a blank one is a server bug and
+ * must still be refused. backupEnqueue.test.ts derives the optional
+ * non-empty-string keys from the queue schema and fails if one is missing here.
+ */
+const BLANK_AS_ABSENT_RESULT_KEYS = [
+  'agentStatus',
+  'jobId',
+  'snapshotId',
+  'warning',
+  'error',
+] as const satisfies ReadonlyArray<keyof ProcessResultsResult>;
+
+function withBlankOptionalStringsAbsent(result: ProcessResultsResult): ProcessResultsResult {
+  const normalized: ProcessResultsResult = { ...result };
+  for (const key of BLANK_AS_ABSENT_RESULT_KEYS) {
+    const value = normalized[key];
+    if (typeof value === 'string' && value.trim() === '') {
+      delete normalized[key];
+    }
+  }
+  return normalized;
 }
 
 const SYSTEM_DISPATCH_META: QueueActorMeta = {
@@ -160,6 +204,7 @@ export async function enqueueBackupDispatch(
   orgId: string,
   deviceId: string,
   meta: QueueActorMeta = SYSTEM_DISPATCH_META,
+  options: { catchUpUntil?: string } = {},
 ): Promise<string> {
   const queue = getBackupQueue();
   // Site-ceiling gate contract §3: snapshot the config's CURRENT
@@ -180,6 +225,7 @@ export async function enqueueBackupDispatch(
     orgId,
     deviceId,
     configGeneration: configRow?.approvalGeneration,
+    ...(options.catchUpUntil ? { catchUpUntil: options.catchUpUntil } : {}),
   }, meta));
   const job = await queue.add(
     'dispatch-backup',
@@ -194,12 +240,114 @@ export async function enqueueBackupDispatch(
   return job.id!;
 }
 
+type DispatchBackupQueueData = Extract<BackupQueueJobData, { type: 'dispatch-backup' }>;
+
+/** BullMQ id of the `attempt`-th re-queue of a dispatch waiting for the helper report. */
+function capabilityWaitQueueJobId(jobId: string, attempt: number): string {
+  return `backup-dispatch-${jobId}-capability-wait-${attempt}`;
+}
+
+/**
+ * Queue the same dispatch again, `delayMs` from now, because the device has
+ * not reported its backup helper yet (backupWorker holdForHelperReport).
+ *
+ * The payload is the original one — including the config generation it was
+ * first queued with, so an edit made while waiting still fails the job closed
+ * — plus the wait bookkeeping. Each re-queue gets its own BullMQ id: the id of
+ * the job being processed still exists (and completed ids are retained), so
+ * reusing one would be silently dropped. Same one-shot options as every
+ * dispatch; the worker's redelivery guard applies to each re-queue as well.
+ */
+export async function enqueueBackupDispatchCapabilityWait(
+  data: DispatchBackupQueueData,
+  wait: { attempt: number; since: string },
+  delayMs: number,
+): Promise<string> {
+  const queue = getBackupQueue();
+  const payload = backupQueueJobDataSchema.parse({
+    ...data,
+    capabilityWaitAttempt: wait.attempt,
+    capabilityWaitSince: wait.since,
+  });
+  const job = await queue.add(
+    'dispatch-backup',
+    payload,
+    {
+      jobId: capabilityWaitQueueJobId(data.jobId, wait.attempt),
+      delay: delayMs,
+      ...DISPATCH_JOB_OPTIONS,
+      removeOnComplete: { count: 50 },
+      removeOnFail: { count: 100 },
+    }
+  );
+  return job.id!;
+}
+
+/**
+ * How long after an agent connects its catch-up dispatch runs. Lets a flapping
+ * agent settle, the presence lease land and the first heartbeat report the
+ * backup helper.
+ */
+const BACKUP_CATCH_UP_DISPATCH_DELAY_MS = 15_000;
+
+/** BullMQ id of the dispatch an agent connect queues for a waiting job (#11013). */
+function catchUpQueueJobId(jobId: string): string {
+  return `backup-dispatch-${jobId}-catch-up`;
+}
+
+/**
+ * Queue the dispatch of a job that waited for its device (#11013).
+ *
+ * One stable id per job is the debounce: a connect while this dispatch is still
+ * queued or running is a BullMQ no-op. The id has to free as soon as the
+ * dispatch finishes, because a flapping agent can leave the job waiting again
+ * and a retained finished job would silently swallow the next connect. So,
+ * unlike every other dispatch, it is not kept after it finishes. The row claim
+ * in prepareBackupDispatchTargets is what guarantees a single send.
+ */
+export async function enqueueBackupCatchUpDispatch(row: {
+  jobId: string;
+  configId: string;
+  orgId: string;
+  deviceId: string;
+  catchUpUntil: Date;
+  /** The generation stamped on the row when the job started waiting. */
+  configGeneration?: number;
+}): Promise<string> {
+  const queue = getBackupQueue();
+  // NOT re-read from backup_configs: a fresh read would bless an edit made
+  // while the job waited, which site-ceiling gate contract §3 must fail closed.
+  const payload = backupQueueJobDataSchema.parse(withQueueMeta({
+    type: 'dispatch-backup' as const,
+    jobId: row.jobId,
+    configId: row.configId,
+    orgId: row.orgId,
+    deviceId: row.deviceId,
+    configGeneration: row.configGeneration,
+    catchUpUntil: row.catchUpUntil.toISOString(),
+    catchUpDispatch: true as const,
+  }, SYSTEM_DISPATCH_META));
+  const job = await queue.add(
+    'dispatch-backup',
+    payload,
+    {
+      jobId: catchUpQueueJobId(row.jobId),
+      delay: BACKUP_CATCH_UP_DISPATCH_DELAY_MS,
+      ...DISPATCH_JOB_OPTIONS,
+      removeOnComplete: true,
+      removeOnFail: true,
+    }
+  );
+  return job.id!;
+}
+
 export async function enqueueBackupResults(
   jobId: string,
   orgId: string,
   deviceId: string,
   result: ProcessResultsResult,
   meta: QueueActorMeta = AGENT_RESULT_META,
+  options: { dispatchExpectationVerified?: true } = {},
 ): Promise<string> {
   const queue = getBackupQueue();
   const payload = backupQueueJobDataSchema.parse(withQueueMeta({
@@ -207,7 +355,8 @@ export async function enqueueBackupResults(
     jobId,
     orgId,
     deviceId,
-    result,
+    result: withBlankOptionalStringsAbsent(result),
+    ...(options.dispatchExpectationVerified ? { dispatchExpectationVerified: true as const } : {}),
   }, meta));
   const job = await queue.add(
     'process-results',
@@ -222,18 +371,28 @@ export async function enqueueBackupResults(
   return job.id!;
 }
 
+/**
+ * Remove a backup's dispatch that has not started yet. A dispatch waiting for
+ * the device's helper report lives under a re-queue id instead of the
+ * original (enqueueBackupDispatchCapabilityWait), and a job that waited for its
+ * device under a catch-up id, so each of those is looked up too; at most one of
+ * them is ever still queued.
+ */
 export async function removeQueuedBackupDispatch(jobId: string): Promise<boolean> {
   const queue = getBackupQueue();
-  const queuedJob = await queue.getJob(`backup-dispatch-${jobId}`);
-  if (!queuedJob) {
-    return false;
+  const ids = [`backup-dispatch-${jobId}`, catchUpQueueJobId(jobId)];
+  for (let attempt = 1; attempt <= BACKUP_CAPABILITY_WAIT_MAX_ATTEMPTS; attempt++) {
+    ids.push(capabilityWaitQueueJobId(jobId, attempt));
   }
+  const candidates = await Promise.all(ids.map((id) => queue.getJob(id)));
 
-  const state = await queuedJob.getState();
-  if (state !== 'waiting' && state !== 'delayed' && state !== ('paused' as string)) {
-    return false;
+  let removed = false;
+  for (const queuedJob of candidates) {
+    if (!queuedJob) continue;
+    const state = await queuedJob.getState();
+    if (state !== 'waiting' && state !== 'delayed' && state !== ('paused' as string)) continue;
+    await queuedJob.remove();
+    removed = true;
   }
-
-  await queuedJob.remove();
-  return true;
+  return removed;
 }

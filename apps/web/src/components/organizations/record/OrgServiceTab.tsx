@@ -9,12 +9,14 @@ import { listDeliverables, unwrapData, type Deliverable } from '@/lib/api/servic
 import { formatDate } from '@/components/billing/shared/format';
 import { ActionError } from '@/lib/runAction';
 import { useLatest, type OrgFetch } from './orgRecordFetch';
+import { useStableT } from '@/lib/i18n/useStableT';
 
 const UPCOMING_WINDOW_DAYS = 90;
 
 interface ContractOption {
   id: string;
   name: string;
+  startDate?: string | null;
 }
 
 /** A failed load keeps the server's message so the tab can say WHY. */
@@ -70,6 +72,7 @@ export function upcomingWithin(rows: Deliverable[], today: string, days: number)
  */
 export default function OrgServiceTab({ orgId, orgFetch }: { orgId: string; orgFetch: OrgFetch }) {
   const { t } = useTranslation('deliverables');
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   const [rows, setRows] = useState<Deliverable[] | LoadFailure | null>(null);
   const [contracts, setContracts] = useState<ContractsState>('loading');
   const [adding, setAdding] = useState(false);
@@ -82,12 +85,12 @@ export default function OrgServiceTab({ orgId, orgFetch }: { orgId: string; orgF
     const result = await latest.run(
       listDeliverables(orgFetch, orgId).catch((err: unknown): LoadFailure => {
         console.error('[OrgServiceTab] failed to load deliverables', err);
-        return failureFrom(err, t('errors.loadFailed'));
+        return failureFrom(err, stableT('errors.loadFailed'));
       }),
     );
     if (result === undefined) return;
     setRows(result);
-  }, [latest, orgFetch, orgId, t]);
+  }, [latest, orgFetch, orgId, stableT]);
 
   useEffect(() => {
     void load();
@@ -102,8 +105,8 @@ export default function OrgServiceTab({ orgId, orgFetch }: { orgId: string; orgF
     setContracts('loading');
     (async () => {
       try {
-        const list = await unwrapData<Array<{ id: string; name: string }>>(await orgFetch(CONTRACTS_PATH));
-        if (!cancelled) setContracts((Array.isArray(list) ? list : []).map((c) => ({ id: c.id, name: c.name })));
+        const list = await unwrapData<Array<{ id: string; name: string; startDate?: string | null }>>(await orgFetch(CONTRACTS_PATH));
+        if (!cancelled) setContracts((Array.isArray(list) ? list : []).map((c) => ({ id: c.id, name: c.name, startDate: c.startDate ?? null })));
       } catch (err) {
         console.error('[OrgServiceTab] failed to load contracts', err);
         if (!cancelled) setContracts('failed');
@@ -212,6 +215,7 @@ export default function OrgServiceTab({ orgId, orgFetch }: { orgId: string; orgF
         fetcher={orgFetch}
         orgId={orgId}
         groupByContract
+        selectable
         onSelect={setSelected}
         refreshKey={refreshKey}
       />

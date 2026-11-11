@@ -23,7 +23,12 @@ var allCommandTypes = []string{
 	tools.CmdRegistryKeys, tools.CmdRegistryValues, tools.CmdRegistryGet,
 	tools.CmdRegistrySet, tools.CmdRegistryDelete,
 	tools.CmdRegistryKeyCreate, tools.CmdRegistryKeyDelete,
-	tools.CmdReboot, tools.CmdShutdown, tools.CmdLock, tools.CmdRebootSafeMode, tools.CmdWakeOnLan,
+	tools.CmdReboot, tools.CmdShutdown, tools.CmdLock, tools.CmdRebootSafeMode, tools.CmdForceReboot, tools.CmdWakeOnLan,
+
+	// handlers_oem.go init()
+	tools.CmdOemUpdateRun,
+	tools.CmdOemUpdateRelease,
+
 	tools.CmdRefreshInventory,
 	tools.CmdCollectSoftware, tools.CmdSoftwareUninstall, tools.CmdSoftwareInstall, tools.CmdSoftwareUpdate,
 
@@ -35,6 +40,7 @@ var allCommandTypes = []string{
 	tools.CmdFileList, tools.CmdFileRead, tools.CmdFileWrite,
 	tools.CmdFileDelete, tools.CmdFileMkdir, tools.CmdFileRename,
 	tools.CmdFileCopy, tools.CmdFileListDrives,
+	tools.CmdDiagFileList, tools.CmdDiagFileRead,
 	tools.CmdFileTrashList, tools.CmdFileTrashRestore, tools.CmdFileTrashPurge,
 	tools.CmdFilesystemAnalysis,
 	tools.CmdSystemCleanupList, tools.CmdSystemCleanupRun,
@@ -56,7 +62,7 @@ var allCommandTypes = []string{
 	tools.CmdScheduleReboot, tools.CmdCancelReboot, tools.CmdGetRebootStatus,
 
 	// handlers_network.go init()
-	tools.CmdNetworkDiscovery, tools.CmdSnmpPoll,
+	tools.CmdNetworkDiscovery, tools.CmdSnmpPoll, tools.CmdTopologyInterfacePoll,
 	tools.CmdNetworkDiagnostic, tools.CmdNetworkDiagnosticCancel,
 	tools.CmdNetworkPing, tools.CmdNetworkTcpCheck,
 	tools.CmdNetworkHttpCheck, tools.CmdNetworkDnsCheck,
@@ -84,15 +90,21 @@ var allCommandTypes = []string{
 	tools.CmdHypervDiscover, tools.CmdHypervBackup, tools.CmdHypervRestore,
 	tools.CmdHypervCheckpoint, tools.CmdHypervVMState,
 
+	// handlers_vault_forward.go init()
+	tools.CmdVaultSync, tools.CmdVaultStatus, tools.CmdVaultConfigure,
+
 	// handlers_systemstate_forward.go init()
 	tools.CmdSystemStateCollect, tools.CmdHardwareProfile,
 
 	// handlers_bmr_forward.go init()
-	tools.CmdVMRestoreEstimate, tools.CmdVMRestoreFromBackup, tools.CmdBMRRecover,
-	tools.CmdBareMetalRebuild,
+	tools.CmdVMRestoreEstimate, tools.CmdVMRestoreFromBackup, tools.CmdVMInstantBoot,
+	tools.CmdBMRRecover, tools.CmdBareMetalRebuild,
 
 	// handlers_user.go init()
-	CmdNotifyUser, CmdTrayUpdate,
+	CmdNotifyUser, CmdTrayUpdate, CmdRetractMessage,
+	CmdChatOpen, CmdChatMessage, CmdChatClose,
+	// caller_verify.go (#6354 W02)
+	cmdCallerVerify,
 
 	// handlers.go — log shipping
 	tools.CmdSetLogLevel,
@@ -117,6 +129,9 @@ var allCommandTypes = []string{
 	// handlers_cis.go init()
 	tools.CmdCisBenchmark, tools.CmdApplyCisRemediation,
 
+	// handlers_timesync.go init()
+	tools.CmdTimeResync, tools.CmdTimeSetTimezone, tools.CmdTimeApplyPolicy,
+
 	// handlers_peripheral.go init()
 	tools.CmdPeripheralPolicySync,
 	// handlers_peripheral_v2.go init()
@@ -129,7 +144,7 @@ var allCommandTypes = []string{
 	tools.CmdSupportEnd,
 
 	// handlers_incident_response.go init()
-	tools.CmdCollectEvidence, tools.CmdExecuteContainment,
+	tools.CmdCollectEvidence, tools.CmdExecuteContainment, tools.CmdReleaseContainment,
 
 	// handlers_tunnel.go init()
 	tools.CmdTunnelOpen, tools.CmdTunnelData, tools.CmdTunnelClose,
@@ -138,6 +153,10 @@ var allCommandTypes = []string{
 	// handlers_actuate.go init() — PAM Track 5
 	tools.CmdActuateElevation,
 	tools.CmdPamApplyV2, tools.CmdPamCleanupV2,
+	tools.CmdPamReconcileV2,
+
+	// handlers_pam_notify.go init() — #8928 outcome notices
+	tools.CmdPamRequestNotify,
 
 	// handlers_encryption.go init()
 	tools.CmdEncryptionCollectKeys, tools.CmdEncryptionRotateKey,
@@ -205,9 +224,9 @@ func TestHandleRefreshInventoryDispatchesSendInventory(t *testing.T) {
 func TestHandleDesktopStreamStartPassesDisplayIndex(t *testing.T) {
 	var gotDisplayIndex int
 	h := &Heartbeat{
-		wsDesktopStart: func(sessionID string, displayIndex int, config desktop.StreamConfig, sendFrame desktop.SendFrameFunc) (int, int, error) {
+		wsDesktopStart: func(sessionID string, displayIndex int, config desktop.StreamConfig, lease *desktop.RevocationLease, sendFrame desktop.SendFrameFunc) (int, int, *desktop.WsStreamSession, error) {
 			gotDisplayIndex = displayIndex
-			return 1920, 1080, nil
+			return 1920, 1080, nil, nil
 		},
 	}
 
@@ -215,8 +234,9 @@ func TestHandleDesktopStreamStartPassesDisplayIndex(t *testing.T) {
 		ID:   "desktop-stream-1",
 		Type: tools.CmdDesktopStreamStart,
 		Payload: map[string]any{
-			"sessionId":    "ws-1",
-			"displayIndex": float64(2),
+			"sessionId":       "ws-1",
+			"displayIndex":    float64(2),
+			"revocationLease": testRevocationLeasePayload(),
 		},
 	})
 
@@ -225,6 +245,189 @@ func TestHandleDesktopStreamStartPassesDisplayIndex(t *testing.T) {
 	}
 	if gotDisplayIndex != 2 {
 		t.Fatalf("displayIndex = %d, want 2", gotDisplayIndex)
+	}
+}
+
+// This WS-fallback transport previously started capturing unconditionally —
+// no consent/notify gate at all, unlike handleStartDesktop's WebRTC path,
+// which asks the end user (or applies consentUnavailableBehavior) before
+// ever starting the capture. These pin the same gate on this path, using the
+// no-session-broker branch (h.sessionBroker == nil -> no helper can show the
+// prompt; with nobody signed in consentUnavailableBehavior decides, with
+// someone signed in the start is always refused) since that needs no
+// session-broker/helper fixture to exercise the outcomes deterministically.
+
+func TestHandleDesktopStreamStartDeniesWhenConsentRequiredAndUnavailableBehaviorBlocks(t *testing.T) {
+	withConsentSeams(t, occupancyUnoccupied, true)
+	started := false
+	h := &Heartbeat{
+		wsDesktopStart: func(sessionID string, displayIndex int, config desktop.StreamConfig, lease *desktop.RevocationLease, sendFrame desktop.SendFrameFunc) (int, int, *desktop.WsStreamSession, error) {
+			started = true
+			return 1920, 1080, nil, nil
+		},
+	}
+
+	result := handleDesktopStreamStart(h, Command{
+		ID:   "desktop-stream-consent-block",
+		Type: tools.CmdDesktopStreamStart,
+		Payload: map[string]any{
+			"sessionId":       "ws-consent-block",
+			"revocationLease": testRevocationLeasePayload(),
+			"prompt": map[string]any{
+				"mode":                       "consent",
+				"consentUnavailableBehavior": "block",
+			},
+		},
+	})
+
+	if started {
+		t.Fatalf("capture must not start before a consent decision is reached")
+	}
+	if result.Status != "completed" {
+		t.Fatalf("expected a completed (not failed) result carrying the denial marker, got %s (%s)", result.Status, result.Error)
+	}
+	var data map[string]any
+	if err := json.Unmarshal([]byte(result.Stdout), &data); err != nil {
+		t.Fatalf("result.Stdout not valid JSON: %v (stdout=%q)", err, result.Stdout)
+	}
+	if data["event"] != "consent_denied" {
+		t.Fatalf("event = %v, want consent_denied", data["event"])
+	}
+	if data["reason"] != "no_user_session" {
+		t.Fatalf("reason = %v, want no_user_session (no helper, nobody signed in)", data["reason"])
+	}
+}
+
+// With someone signed in and no helper able to show them the prompt, the
+// stream never starts — whatever the policy says.
+func TestHandleDesktopStreamStartRefusesSignedInUserWhoCannotBeAsked(t *testing.T) {
+	withConsentSeams(t, occupancyOccupied, true)
+	started := false
+	h := &Heartbeat{
+		wsDesktopStart: func(sessionID string, displayIndex int, config desktop.StreamConfig, lease *desktop.RevocationLease, sendFrame desktop.SendFrameFunc) (int, int, *desktop.WsStreamSession, error) {
+			started = true
+			return 1920, 1080, nil, nil
+		},
+	}
+
+	result := handleDesktopStreamStart(h, Command{
+		ID:   "desktop-stream-consent-occupied",
+		Type: tools.CmdDesktopStreamStart,
+		Payload: map[string]any{
+			"sessionId":       "ws-consent-occupied",
+			"revocationLease": testRevocationLeasePayload(),
+			"prompt": map[string]any{
+				"mode":                       "consent",
+				"consentUnavailableBehavior": "proceed",
+			},
+		},
+	})
+
+	if started {
+		t.Fatalf("capture must not start when a signed-in user cannot be asked")
+	}
+	var data map[string]any
+	if err := json.Unmarshal([]byte(result.Stdout), &data); err != nil {
+		t.Fatalf("result.Stdout not valid JSON: %v (stdout=%q)", err, result.Stdout)
+	}
+	if data["event"] != "consent_denied" || data["reason"] != "helper_unreachable" {
+		t.Fatalf("result = %v, want consent_denied/helper_unreachable", data)
+	}
+}
+
+func TestHandleDesktopStreamStartProceedsWhenConsentUnavailableBehaviorAllows(t *testing.T) {
+	withConsentSeams(t, occupancyUnoccupied, true)
+	started := false
+	h := &Heartbeat{
+		wsDesktopStart: func(sessionID string, displayIndex int, config desktop.StreamConfig, lease *desktop.RevocationLease, sendFrame desktop.SendFrameFunc) (int, int, *desktop.WsStreamSession, error) {
+			started = true
+			return 1920, 1080, nil, nil
+		},
+	}
+
+	result := handleDesktopStreamStart(h, Command{
+		ID:   "desktop-stream-consent-proceed",
+		Type: tools.CmdDesktopStreamStart,
+		Payload: map[string]any{
+			"sessionId":       "ws-consent-proceed",
+			"revocationLease": testRevocationLeasePayload(),
+			"prompt": map[string]any{
+				"mode":                       "consent",
+				"consentUnavailableBehavior": "proceed",
+			},
+		},
+	})
+
+	if !started {
+		t.Fatalf("expected capture to start when consentUnavailableBehavior is proceed")
+	}
+	if result.Status != "completed" {
+		t.Fatalf("expected completed, got %s (%s)", result.Status, result.Error)
+	}
+	var data map[string]any
+	if err := json.Unmarshal([]byte(result.Stdout), &data); err != nil {
+		t.Fatalf("result.Stdout not valid JSON: %v (stdout=%q)", err, result.Stdout)
+	}
+	// consentReason must be reported as "no_user_session", never "user" —
+	// the API audits "user" specifically as the end user granting the session.
+	if data["consentReason"] != "no_user_session" || data["consentOccupancy"] != "unoccupied" {
+		t.Fatalf("consentReason = %v / occupancy %v, want no_user_session / unoccupied", data["consentReason"], data["consentOccupancy"])
+	}
+}
+
+func TestHandleDesktopStreamStartStartsImmediatelyWhenNoPromptBlockSent(t *testing.T) {
+	// An older/unconfigured API sends no prompt block at all — must behave
+	// exactly as before this change (regression control).
+	started := false
+	h := &Heartbeat{
+		wsDesktopStart: func(sessionID string, displayIndex int, config desktop.StreamConfig, lease *desktop.RevocationLease, sendFrame desktop.SendFrameFunc) (int, int, *desktop.WsStreamSession, error) {
+			started = true
+			return 1920, 1080, nil, nil
+		},
+	}
+
+	result := handleDesktopStreamStart(h, Command{
+		ID:      "desktop-stream-no-prompt",
+		Type:    tools.CmdDesktopStreamStart,
+		Payload: map[string]any{"sessionId": "ws-no-prompt", "revocationLease": testRevocationLeasePayload()},
+	})
+
+	if !started {
+		t.Fatalf("expected capture to start when no prompt block is present")
+	}
+	if result.Status != "completed" {
+		t.Fatalf("expected completed, got %s (%s)", result.Status, result.Error)
+	}
+}
+
+func TestHandleDesktopStreamStartStartsImmediatelyForNotifyMode(t *testing.T) {
+	// "notify" is informational-only (matches handleStartDesktop): it must
+	// not block the start.
+	started := false
+	h := &Heartbeat{
+		wsDesktopStart: func(sessionID string, displayIndex int, config desktop.StreamConfig, lease *desktop.RevocationLease, sendFrame desktop.SendFrameFunc) (int, int, *desktop.WsStreamSession, error) {
+			started = true
+			return 1920, 1080, nil, nil
+		},
+	}
+
+	result := handleDesktopStreamStart(h, Command{
+		ID:   "desktop-stream-notify",
+		Type: tools.CmdDesktopStreamStart,
+		Payload: map[string]any{
+			"sessionId":       "ws-notify",
+			"revocationLease": testRevocationLeasePayload(),
+			"prompt": map[string]any{
+				"mode": "notify",
+			},
+		},
+	})
+
+	if !started {
+		t.Fatalf("expected capture to start immediately for notify mode")
+	}
+	if result.Status != "completed" {
+		t.Fatalf("expected completed, got %s (%s)", result.Status, result.Error)
 	}
 }
 

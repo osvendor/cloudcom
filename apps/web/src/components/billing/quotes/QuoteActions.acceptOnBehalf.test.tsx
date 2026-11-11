@@ -111,6 +111,30 @@ describe('Accept on behalf', () => {
     expect(screen.queryByTestId('quote-accept-on-behalf')).toBeNull();
   });
 
+  // #9963: an item-less quote converted into a $0 draft invoice. The server
+  // refuses it (422 QUOTE_EMPTY); the button says why instead of opening a
+  // dialog whose submit can only fail.
+  it.each([
+    ['draft', 'Add at least one item before accepting.'],
+    ['sent', 'This quote has no items. Use Revise quote to issue a version with items.'],
+  ] as const)('disables the button on an item-less %s quote and says why', (status, why) => {
+    const internalOnly = sent({ status });
+    internalOnly.lines = internalOnly.lines.map((l) => ({ ...l, customerVisible: false }));
+    render(<QuoteActions detail={internalOnly} variant="header" onChanged={vi.fn()} />);
+    const button = screen.getByTestId('quote-accept-on-behalf');
+    expect(button.hasAttribute('disabled')).toBe(true);
+    expect(button.getAttribute('title')).toBe(why);
+    fireEvent.click(button);
+    expect(screen.queryByTestId('accept-on-behalf-reference')).toBeNull();
+  });
+
+  it('keeps the button enabled when the quote has a customer-visible item', () => {
+    render(<QuoteActions detail={sent()} variant="header" onChanged={vi.fn()} />);
+    const button = screen.getByTestId('quote-accept-on-behalf');
+    expect(button.hasAttribute('disabled')).toBe(false);
+    expect(button.getAttribute('title')).toBeNull();
+  });
+
   // "This quote was never sent. The customer's first sight of it will be the
   // invoice." — the one consequence a tech cannot undo by voiding the invoice.
   it('warns about a never-sent draft, and only on a draft', () => {
@@ -203,6 +227,39 @@ describe('Accept on behalf', () => {
     render(<QuoteActions detail={sent({}, { autoEmailInvoiceOnAccept: false })} variant="header" onChanged={vi.fn()} />);
     fireEvent.click(screen.getByTestId('quote-accept-on-behalf'));
     expect(screen.queryByTestId('accept-on-behalf-consequence-email')).toBeNull();
+  });
+
+  // The API exposes no signal for the org billing-contact fallback, so the
+  // copy is conditional on the quote's recorded recipients: name them when we
+  // know them, and be honest when there are none.
+  it('names the recorded recipients in the email line when auto-email is on', () => {
+    render(<QuoteActions detail={sent({}, { autoEmailInvoiceOnAccept: true, recipients: ['ap@customer.example', 'cfo@customer.example'] })} variant="header" onChanged={vi.fn()} />);
+    fireEvent.click(screen.getByTestId('quote-accept-on-behalf'));
+    const line = screen.getByTestId('accept-on-behalf-consequence-email').textContent ?? '';
+    expect(line).toContain('ap@customer.example');
+    expect(line).toContain('cfo@customer.example');
+  });
+
+  it('does not promise an email when auto-email is on but the quote has no recorded recipients', () => {
+    render(<QuoteActions detail={sent({}, { autoEmailInvoiceOnAccept: true, recipients: [] })} variant="header" onChanged={vi.fn()} />);
+    fireEvent.click(screen.getByTestId('quote-accept-on-behalf'));
+    expect(screen.queryByTestId('accept-on-behalf-consequence-email')).toBeNull();
+    expect(screen.getByTestId('accept-on-behalf-consequence-email-none').textContent).toMatch(/no recipient/i);
+  });
+
+  it('the success toast says the invoice may not have been emailed when there were no recipients', async () => {
+    render(<QuoteActions detail={sent({}, { autoEmailInvoiceOnAccept: true, recipients: [] })} variant="header" onChanged={vi.fn()} />);
+    fireEvent.click(screen.getByTestId('quote-accept-on-behalf'));
+    fireEvent.change(screen.getByTestId('accept-on-behalf-reference'), { target: { value: 'PO 4471' } });
+    fireEvent.click(screen.getByTestId('accept-on-behalf-submit'));
+    await waitFor(() => expect(runAction).toHaveBeenCalled());
+    const opts = runAction.mock.calls.at(-1)?.[0] as unknown as {
+      parseSuccess: (d: unknown) => unknown;
+      successMessage: (d: unknown) => string;
+    };
+    const msg = opts.successMessage(opts.parseSuccess({ data: { invoiceId: 'inv-1', invoiceNumber: 'INV-2026-0007' } }));
+    expect(msg).toContain('INV-2026-0007');
+    expect(msg).toMatch(/may not have been emailed/i);
   });
 
   // Unknown (field omitted — an older payload/fixture) must read the same as

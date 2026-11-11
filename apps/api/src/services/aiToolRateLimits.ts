@@ -1,0 +1,413 @@
+/**
+ * Per-tool AI/MCP rate-limit multiplier (#6476).
+ *
+ * `TOOL_RATE_LIMITS` (services/aiGuardrails.ts) is the brake on a runaway
+ * model: `run_script` 5 per 5 min, `network_discovery` 2 per 10 min, and so
+ * on. A weaker self-hosted model retries and re-plans more than Claude does, so
+ * it hits those buckets first. The only knob exposed is one scalar,
+ * `toolRateLimitMultiplier` (integer 1–10, default 1), stored with the AI
+ * budget settings (`ai_budgets.tool_rate_limit_multiplier` + partner
+ * `settings.aiBudgets.toolRateLimitMultiplier`) and merged by the existing
+ * partner-wins rule in services/effectiveSettings.ts.
+ *
+ * Invariant: the multiplier can only RAISE a limit. Anything that is not an
+ * integer in [1, 10] is treated as 1, so a bad stored value tightens back to
+ * the shipped limits rather than loosening or removing them.
+ *
+ * The Redis counter stays keyed per user per tool (`ai:tool:<user>:<tool>`)
+ * across orgs; the org of the CURRENT call picks the multiplier. A user who
+ * works in two orgs with different multipliers shares one counter, and each
+ * call is judged against its own org's ceiling.
+ */
+import { eq } from 'drizzle-orm';
+import { z } from 'zod';
+import { db, withSystemDbAccessContext } from '../db';
+import { readWithPartnerAxisVisibility } from '../db/partnerAxisRead';
+import { partners } from '../db/schema/orgs';
+import { getEffectiveAiBudget } from './effectiveSettings';
+
+export const TOOL_RATE_LIMIT_MULTIPLIER_MIN = 1;
+export const TOOL_RATE_LIMIT_MULTIPLIER_MAX = 10;
+export const TOOL_RATE_LIMIT_MULTIPLIER_DEFAULT = 1;
+
+/**
+ * Write-side validation for both homes (org PUT /ai/budget, partner PATCH
+ * settings.aiBudgets). Out-of-range is REJECTED (400), never clamped, so a
+ * caller is told their value did not take.
+ */
+export const toolRateLimitMultiplierSchema = z
+  .number()
+  .int()
+  .min(TOOL_RATE_LIMIT_MULTIPLIER_MIN)
+  .max(TOOL_RATE_LIMIT_MULTIPLIER_MAX);
+
+// Per-tool rate limits: { limit, windowSeconds }
+export const TOOL_RATE_LIMITS: Record<string, { limit: number; windowSeconds: number }> = {
+  execute_command: { limit: 10, windowSeconds: 300 },
+  // Per TOOL (list/get share the counter). 5 per hour is the shipped ceiling;
+  // the route's own per-actor limiter (endpointMessaging/rateLimits) stays authoritative.
+  send_endpoint_message: { limit: 5, windowSeconds: 3600 },
+  run_script: { limit: 5, windowSeconds: 300 },
+  // Deliberately looser than run_script: a stop is the safe direction, and a
+  // rate limit that blocks a tech's assistant from halting a runaway script is
+  // worse than the burst it prevents.
+  cancel_script_execution: { limit: 20, windowSeconds: 300 },
+  security_scan: { limit: 3, windowSeconds: 600 },
+  // #6268: per tool, reads included. Sweep creation is ALSO limited 10/h per
+  // user inside createSweep, shared by UI, API, AI and MCP.
+  ioc_hunt: { limit: 30, windowSeconds: 600 },
+  network_discovery: { limit: 2, windowSeconds: 600 },
+  file_operations: { limit: 20, windowSeconds: 300 },
+  manage_services: { limit: 10, windowSeconds: 300 },
+  s1_isolate_device: { limit: 5, windowSeconds: 600 },
+  s1_threat_action: { limit: 5, windowSeconds: 600 },
+  analyze_disk_usage: { limit: 10, windowSeconds: 300 },
+  disk_cleanup: { limit: 3, windowSeconds: 600 },
+  // Per TOOL, not per action (checkToolRateLimit keys on the tool name), and
+  // `run` returns immediately while the model polls `status` on this same
+  // counter — spec §9.1's "2 per hour" would exhaust after the first poll and
+  // lock the model out of the run it just started. 30/h leaves room for a
+  // catalog, a run and a poll every few minutes. The safety on `run` is the
+  // Tier 3 supervised approval; the single-run-per-device claim in
+  // startSystemCleanupRun refuses a second run while one is in flight.
+  system_cleanup: { limit: 30, windowSeconds: 3600 },
+  manage_startup_items: { limit: 5, windowSeconds: 600 },
+  manage_scheduled_tasks: { limit: 10, windowSeconds: 300 },
+  take_screenshot: { limit: 10, windowSeconds: 300 },
+  analyze_screen: { limit: 10, windowSeconds: 300 },
+  computer_control: { limit: 20, windowSeconds: 300 },
+  // Fleet tools — per-tool rate limits
+  manage_deployments: { limit: 10, windowSeconds: 600 },
+  manage_patches: { limit: 15, windowSeconds: 300 },
+  manage_groups: { limit: 20, windowSeconds: 300 },
+  manage_maintenance_windows: { limit: 15, windowSeconds: 300 },
+  manage_automations: { limit: 10, windowSeconds: 600 },
+  manage_alert_rules: { limit: 15, windowSeconds: 300 },
+  manage_service_monitors: { limit: 15, windowSeconds: 300 },
+  generate_report: { limit: 10, windowSeconds: 300 },
+  // Brain device context tools
+  set_device_context: { limit: 20, windowSeconds: 300 },
+  // Wisp W03: every remember is a row a human must later review.
+  remember: { limit: 20, windowSeconds: 300 },
+  // Wisp W05a: every raise_concern is a row Wisp will nudge a person about;
+  // every create_watch is a recurring assessment that spends grant budget.
+  raise_concern: { limit: 20, windowSeconds: 300 },
+  create_watch: { limit: 10, windowSeconds: 3600 },
+  // Wisp W08: every link_entity is a durable row on the thread every later
+  // session is seeded with (cap 50 per thread).
+  link_entity: { limit: 20, windowSeconds: 300 },
+  // Wisp check-ins (#10991 W03): every schedule_check_in is a delayed job and
+  // a notification to the grantor (cap 5 scheduled per thread).
+  schedule_check_in: { limit: 10, windowSeconds: 600 },
+  cancel_check_in: { limit: 20, windowSeconds: 300 },
+  // Wisp W07: every launch_specialist admits a run or an Operator task (or a
+  // client-facing bulk reply) that spends grant budget.
+  launch_specialist: { limit: 10, windowSeconds: 3600 },
+  // A resolve writes a concern_outcome memory block and closes a SHARED fact
+  // other techs see; a snooze silences nudges. Bound both against a
+  // prompt-injected loop walking every concern under the ceiling.
+  snooze_concern: { limit: 20, windowSeconds: 300 },
+  resolve_concern: { limit: 20, windowSeconds: 300 },
+  // Diagnostic access: each request pages every eligible approver, and each
+  // read is a live endpoint command — bound both.
+  request_diagnostic_access: { limit: 5, windowSeconds: 300 },
+  diagnostic_list_directory: { limit: 120, windowSeconds: 300 },
+  diagnostic_read_file: { limit: 120, windowSeconds: 300 },
+  resolve_device_context: { limit: 20, windowSeconds: 300 },
+  // Event log tools
+  search_logs: { limit: 30, windowSeconds: 300 },
+  get_log_trends: { limit: 20, windowSeconds: 300 },
+  detect_log_correlations: { limit: 10, windowSeconds: 300 },
+  // One export is a full table scan's worth of work — far below search_logs'
+  // 30/5min on purpose.
+  export_dataset: { limit: 5, windowSeconds: 300 },
+  // Agent log tools
+  set_agent_log_level: { limit: 5, windowSeconds: 600 },
+  capture_agent_pprof: { limit: 3, windowSeconds: 600 },
+  // Configuration policy tools
+  get_configuration_policy: { limit: 30, windowSeconds: 300 },
+  manage_configuration_policy: { limit: 20, windowSeconds: 300 },
+  configuration_policy_compliance: { limit: 30, windowSeconds: 300 },
+  apply_configuration_policy: { limit: 10, windowSeconds: 300 },
+  remove_configuration_policy_assignment: { limit: 10, windowSeconds: 300 },
+  // Playbook tools
+  execute_playbook: { limit: 5, windowSeconds: 600 },
+  manage_processes: { limit: 15, windowSeconds: 300 },
+  // Tags and registry tools
+  manage_tags: { limit: 20, windowSeconds: 300 },
+  registry_operations: { limit: 15, windowSeconds: 300 },
+  // Backup tools
+  trigger_backup: { limit: 5, windowSeconds: 600 },
+  restore_snapshot: { limit: 3, windowSeconds: 600 },
+  restore_as_vm: { limit: 3, windowSeconds: 900 },
+  instant_boot_vm: { limit: 3, windowSeconds: 900 },
+  trigger_mssql_backup: { limit: 5, windowSeconds: 600 },
+  restore_mssql_database: { limit: 3, windowSeconds: 900 },
+  verify_mssql_backup: { limit: 5, windowSeconds: 600 },
+  manage_hyperv_vm: { limit: 10, windowSeconds: 300 },
+  trigger_hyperv_backup: { limit: 5, windowSeconds: 900 },
+  restore_hyperv_vm: { limit: 3, windowSeconds: 900 },
+  manage_hyperv_checkpoints: { limit: 5, windowSeconds: 600 },
+  trigger_vault_sync: { limit: 10, windowSeconds: 600 },
+  configure_vault: { limit: 10, windowSeconds: 300 },
+  trigger_c2c_sync: { limit: 10, windowSeconds: 300 },
+  restore_c2c_items: { limit: 5, windowSeconds: 600 },
+  configure_backup_sla: { limit: 10, windowSeconds: 300 },
+  execute_dr_plan: { limit: 3, windowSeconds: 900 },
+  manage_dr_plan: { limit: 10, windowSeconds: 300 },
+  // Monitoring tools
+  query_monitors: { limit: 30, windowSeconds: 300 },
+  manage_monitors: { limit: 10, windowSeconds: 300 },
+  get_service_monitoring_status: { limit: 30, windowSeconds: 300 },
+  // Integration & webhook tools
+  test_webhook: { limit: 5, windowSeconds: 300 },
+  // AI agent governance — a grant is a rare, deliberate act.
+  manage_ai_agents: { limit: 5, windowSeconds: 3600 },
+  // Agent version & remote session tools
+  trigger_agent_upgrade: { limit: 5, windowSeconds: 600 },
+  trigger_agent_restart: { limit: 5, windowSeconds: 600 },
+  create_remote_session: { limit: 10, windowSeconds: 300 },
+  // Notification channel & saved filter tools
+  manage_delivery: { limit: 10, windowSeconds: 300 },
+  manage_notification_channels: { limit: 10, windowSeconds: 300 },
+  manage_saved_filters: { limit: 15, windowSeconds: 300 },
+  // CIS hardening tools
+  get_cis_compliance: { limit: 30, windowSeconds: 300 },
+  get_cis_device_report: { limit: 30, windowSeconds: 300 },
+  apply_cis_remediation: { limit: 10, windowSeconds: 600 },
+  // Huntress integration tools
+  sync_huntress_data: { limit: 10, windowSeconds: 300 },
+  // EDR provider framework (#8167 W03). edr_endpoint_action mirrors
+  // dispatchEdrAction's own per-actor budget (10 / 10 min); sync_edr_data is
+  // coalesced on the job id anyway, so a tight cap only stops a chatty loop.
+  edr_endpoint_action: { limit: 10, windowSeconds: 600 },
+  sync_edr_data: { limit: 3, windowSeconds: 600 },
+  // User risk tools
+  assign_security_training: { limit: 10, windowSeconds: 300 },
+  // Registration-debt payoff: rate limits for newly-permissioned tools.
+  execute_containment: { limit: 5, windowSeconds: 600 },       // mirrors s1_isolate_device
+  release_containment: { limit: 5, windowSeconds: 600 },       // W13 (#10101): same budget as isolating
+  collect_evidence: { limit: 10, windowSeconds: 300 },          // mirrors take_screenshot-class dispatch
+  remediate_software_violation: { limit: 10, windowSeconds: 600 }, // mirrors apply_cis_remediation
+  // Full-control W04 (#6758, quorum QW11): spec wiring checklist item 3 — the
+  // remaining device-touching W04 tools. Per tool, so reads share the budget
+  // (manage_browser_policy list) and the bound is set to leave room for them.
+  manage_browser_policy: { limit: 20, windowSeconds: 300 },     // apply queues one command per device
+  manage_peripheral_policy: { limit: 10, windowSeconds: 300 },  // every write queues a device sync
+  remediate_sensitive_data: { limit: 10, windowSeconds: 600 },  // mirrors apply_cis_remediation; encrypt/quarantine/secure_delete on devices
+  configure_network_baseline: { limit: 10, windowSeconds: 300 }, // arms recurring on-site discovery scans
+  // Full-control W06 (#6776): PSA configuration + ticket-ops. Per tool, so reads share the
+  // budget; the bounds leave room for a model that lists, edits and re-lists. None touches a
+  // device or a vendor — these cap a runaway loop of config writes and queue/attachment reads.
+  manage_ticket_config: { limit: 40, windowSeconds: 300 },
+  manage_ticket_checklist_templates: { limit: 40, windowSeconds: 300 },
+  manage_ticket_inbox: { limit: 30, windowSeconds: 300 },
+  manage_ticket_attachments: { limit: 30, windowSeconds: 60 },  // the route's own limiter: 30/60 s
+  manage_ticket_forms: { limit: 40, windowSeconds: 300 },
+  manage_ticket_response_templates: { limit: 40, windowSeconds: 300 },
+  manage_time_suggestions: { limit: 40, windowSeconds: 300 },
+  // Full-control W07 (#6777): alert correlation + signal triage. Per tool, so reads share the budget.
+  // explain builds an evidence timeline from alerts and event logs (a few queries per call), so it
+  // is the one read worth a tighter shared cap; the writes cap a runaway ack/resolve/label loop.
+  get_alert_correlations: { limit: 60, windowSeconds: 300 },
+  manage_alert_correlations: { limit: 30, windowSeconds: 300 },
+  manage_device_anomalies: { limit: 40, windowSeconds: 300 },
+  reliability_feedback: { limit: 30, windowSeconds: 300 },
+  // Full-control W08 (#6778): network topology. Graph reads page through bounded projections; the diagnostic
+  // start is also capped by the service's own per-user / site / org budget (429 + Retry-After).
+  get_topology_graph: { limit: 60, windowSeconds: 300 },
+  run_topology_diagnostic: { limit: 20, windowSeconds: 300 },
+  manage_topology_manual: { limit: 30, windowSeconds: 300 },
+  manage_topology_monitoring: { limit: 40, windowSeconds: 300 },
+  manage_topology_templates: { limit: 30, windowSeconds: 300 },
+  apply_topology_template: { limit: 20, windowSeconds: 300 },
+  // Full-control W09 (#6779): the probe dispatches to an agent and the sync queues a vendor pull; hosts calls the vendor cloud.
+  manage_snmp_templates: { limit: 30, windowSeconds: 300 },
+  get_snmp_metrics: { limit: 60, windowSeconds: 300 },
+  probe_network_asset: { limit: 20, windowSeconds: 300 },
+  manage_known_guests: { limit: 30, windowSeconds: 300 },
+  get_unifi_status: { limit: 30, windowSeconds: 300 },
+  trigger_unifi_sync: { limit: 6, windowSeconds: 300 },
+  // Full-control W10 (#6780): read-only replays of stored rows; the detail reads assemble several queries.
+  get_device_ai_activity: { limit: 60, windowSeconds: 300 },
+  list_operator_tasks: { limit: 60, windowSeconds: 300 },
+  get_operator_task: { limit: 40, windowSeconds: 300 },
+  list_ai_agent_schedules: { limit: 40, windowSeconds: 300 },
+  list_fleet_designs: { limit: 40, windowSeconds: 300 },
+  get_fleet_design: { limit: 30, windowSeconds: 300 },
+  // Full-control W11 (#6781, W11-D11): security policy tools. The status views assemble several queries; the
+  // recovery-key tool reaches a device (rotate / collect queue a command), compliance deactivate is permanent.
+  get_security_compliance: { limit: 40, windowSeconds: 300 },
+  manage_security_recommendations: { limit: 30, windowSeconds: 300 },
+  manage_access_reviews: { limit: 30, windowSeconds: 300 },
+  manage_audit_baselines: { limit: 30, windowSeconds: 300 },
+  manage_compliance_policies: { limit: 10, windowSeconds: 300 },
+  manage_security_policies: { limit: 20, windowSeconds: 300 },
+  manage_recovery_keys: { limit: 10, windowSeconds: 300 },
+  manage_pam_rules: { limit: 30, windowSeconds: 300 },
+  // Full-control W12 (#6782, W12-D6): device-reaching tools 10/300 s, like manage_recovery_keys.
+  manage_software_catalog: { limit: 30, windowSeconds: 300 },
+  search_packages: { limit: 30, windowSeconds: 300 },
+  manage_software_deployments: { limit: 10, windowSeconds: 300 },
+  get_device_software: { limit: 40, windowSeconds: 300 },
+  manage_device_software: { limit: 10, windowSeconds: 300 },
+  manage_software_inventory: { limit: 30, windowSeconds: 300 },
+  bootstrap_homebrew: { limit: 10, windowSeconds: 300 },
+  manage_fleet_findings: { limit: 30, windowSeconds: 300 },
+  manage_custom_fields: { limit: 20, windowSeconds: 300 },
+  // Full-control W13 (#6783, W13-D9): device reads 40/300 s, record writes 20/300 s, the vendor lookup 10/300 s.
+  get_device_events: { limit: 40, windowSeconds: 300 },
+  get_device_health: { limit: 40, windowSeconds: 300 },
+  get_process_samples: { limit: 40, windowSeconds: 300 },
+  get_management_posture: { limit: 20, windowSeconds: 300 },
+  manage_device_function: { limit: 20, windowSeconds: 300 },
+  manage_device_links: { limit: 20, windowSeconds: 300 },
+  manage_manual_assets: { limit: 20, windowSeconds: 300 },
+  manage_device_warranty: { limit: 10, windowSeconds: 300 },
+  // W13 PR B (#6783, W13-D9): the live event-log read uses the manage_processes limit.
+  browse_device_event_log: { limit: 15, windowSeconds: 300 },
+  manage_tenant_variables: { limit: 20, windowSeconds: 300 },
+  manage_support_sessions: { limit: 10, windowSeconds: 300 },
+  // W17 (#6788): the VSS read waits on the machine, so it uses the live event-log limit.
+  manage_backup_verification: { limit: 30, windowSeconds: 300 },
+  get_vss_status: { limit: 15, windowSeconds: 300 },
+  manage_c2c_configs: { limit: 20, windowSeconds: 300 },
+  list_bmr_recoveries: { limit: 40, windowSeconds: 300 },
+  get_backup_health: { limit: 30, windowSeconds: 300 },
+  // W14 (#6784, W14-D9): billing writes use the W13 write limit.
+  manage_billing_profiles: { limit: 20, windowSeconds: 300 },
+  manage_billing_settings: { limit: 20, windowSeconds: 300 },
+  manage_contract_templates: { limit: 20, windowSeconds: 300 },
+  manage_contract_documents: { limit: 20, windowSeconds: 300 },
+  // W14 PR B (#6784): tight limits on the tools that bill (generate_invoice) and push to the books.
+  manage_contracts: { limit: 30, windowSeconds: 300 },
+  manage_accounting_sync: { limit: 10, windowSeconds: 300 },
+  // W15 PR A (#6785, W15-D11): per tool, so reads and writes share one counter.
+  get_pax8_status: { limit: 30, windowSeconds: 300 },
+  search_pax8_products: { limit: 30, windowSeconds: 300 },
+  manage_pax8_orders: { limit: 30, windowSeconds: 300 },
+  manage_pax8_subscriptions: { limit: 10, windowSeconds: 300 },
+  // Full-control W18 PR A (#6789): readiness fans out over up to 50 orgs per call, so it gets half the budget.
+  get_org_summary: { limit: 30, windowSeconds: 300 },
+  get_account_readiness: { limit: 15, windowSeconds: 300 },
+  get_audit_retention: { limit: 30, windowSeconds: 300 },
+  list_portal_users: { limit: 30, windowSeconds: 300 },
+  list_users: { limit: 30, windowSeconds: 300 },
+  get_user: { limit: 30, windowSeconds: 300 },
+  list_roles: { limit: 30, windowSeconds: 300 },
+  // Full-control W18 PR B (#6789): writers that reach customers (the portal) or send report data out (recipients).
+  manage_org_portal_settings: { limit: 15, windowSeconds: 300 },
+  manage_report_recipients: { limit: 20, windowSeconds: 300 },
+  // Full-control W16 PR A (#6786): each call admits a credit-debiting run or an operator task.
+  run_patch_plan: { limit: 5, windowSeconds: 300 },
+  create_operator_task: { limit: 10, windowSeconds: 300 },
+  // Full-control W16 PR B (#6786): a schedule starts recurring credit-debiting runs; a Fleet Design runs or applies.
+  manage_ai_agent_schedules: { limit: 15, windowSeconds: 300 },
+  manage_fleet_designs: { limit: 10, windowSeconds: 300 },
+};
+
+/**
+ * Clamp-free validation: an integer in [1, 10] passes through; anything else
+ * (0, negatives, 11+, fractions, strings, null) becomes 1. Missing
+ * (undefined/null) is the normal "not configured" case and is silent; any
+ * other invalid value is logged, because it means a stored setting bypassed
+ * the write-side validation.
+ */
+export function normalizeToolRateLimitMultiplier(value: unknown, source = 'unknown'): number {
+  if (value === undefined || value === null) return TOOL_RATE_LIMIT_MULTIPLIER_DEFAULT;
+  if (
+    typeof value === 'number'
+    && Number.isInteger(value)
+    && value >= TOOL_RATE_LIMIT_MULTIPLIER_MIN
+    && value <= TOOL_RATE_LIMIT_MULTIPLIER_MAX
+  ) {
+    return value;
+  }
+  console.warn(
+    `[aiToolRateLimits] Ignoring invalid toolRateLimitMultiplier ${JSON.stringify(value)} from ${source}; `
+    + `using ${TOOL_RATE_LIMIT_MULTIPLIER_DEFAULT} (valid range ${TOOL_RATE_LIMIT_MULTIPLIER_MIN}-${TOOL_RATE_LIMIT_MULTIPLIER_MAX}).`,
+  );
+  return TOOL_RATE_LIMIT_MULTIPLIER_DEFAULT;
+}
+
+/**
+ * The limit actually enforced for a shipped `baseLimit`: ceil(base × m).
+ * Re-normalizes `multiplier` so no caller can pass a value that lowers the
+ * limit, and floors at `baseLimit` as a second guard.
+ */
+export function scaleToolRateLimit(baseLimit: number, multiplier: number): number {
+  const m = normalizeToolRateLimitMultiplier(multiplier, 'scaleToolRateLimit');
+  return Math.max(baseLimit, Math.ceil(baseLimit * m));
+}
+
+export interface ToolRateLimitScope {
+  /** The org the current call runs in (chat session org / MCP API key org). */
+  orgId: string | null;
+  /**
+   * Fallback when there is no org — a partner-scope MCP caller (OAuth bearer,
+   * or an API key with no org). Uses the partner's own `aiBudgets` value.
+   */
+  partnerId?: string | null;
+}
+
+async function readPartnerMultiplier(partnerId: string): Promise<unknown> {
+  const row = await readWithPartnerAxisVisibility(() =>
+    db
+      .select({ settings: partners.settings })
+      .from(partners)
+      .where(eq(partners.id, partnerId))
+      .then((rows) => rows[0]),
+  );
+  const settings = row?.settings;
+  if (!settings || typeof settings !== 'object' || Array.isArray(settings)) return undefined;
+  const budgets = (settings as Record<string, unknown>).aiBudgets;
+  if (!budgets || typeof budgets !== 'object' || Array.isArray(budgets)) return undefined;
+  return (budgets as Record<string, unknown>).toolRateLimitMultiplier;
+}
+
+/**
+ * Effective multiplier for the current call. Never throws: a failed lookup
+ * falls back to 1 (the shipped limits), which keeps every limit enforced —
+ * failing closed here would instead block every rate-limited tool on a DB blip,
+ * a regression against the pre-#6476 behaviour that read no settings at all.
+ */
+export async function resolveToolRateLimitMultiplier(scope: ToolRateLimitScope): Promise<number> {
+  try {
+    if (scope.orgId) {
+      // Self-context like checkAiRateLimit: the chat tool callback runs outside
+      // the request's DB context; inside a request this reuses the ambient one.
+      const budget = await withSystemDbAccessContext(() => getEffectiveAiBudget(scope.orgId!));
+      return normalizeToolRateLimitMultiplier(budget.toolRateLimitMultiplier, `org ${scope.orgId}`);
+    }
+    if (scope.partnerId) {
+      const raw = await readPartnerMultiplier(scope.partnerId);
+      return normalizeToolRateLimitMultiplier(raw, `partner ${scope.partnerId}`);
+    }
+  } catch (err) {
+    console.warn(
+      `[aiToolRateLimits] Could not load toolRateLimitMultiplier (org ${scope.orgId ?? '-'}, partner ${scope.partnerId ?? '-'}); `
+      + 'enforcing the shipped limits.',
+      err,
+    );
+  }
+  return TOOL_RATE_LIMIT_MULTIPLIER_DEFAULT;
+}
+
+export interface EffectiveToolRateLimit {
+  toolName: string;
+  /** The shipped TOOL_RATE_LIMITS value. */
+  baseLimit: number;
+  /** What checkToolRateLimit enforces under `multiplier`. */
+  limit: number;
+  windowSeconds: number;
+}
+
+/** Every TOOL_RATE_LIMITS entry with the limit enforced under `multiplier`. */
+export function listEffectiveToolRateLimits(multiplier: number): EffectiveToolRateLimit[] {
+  return Object.entries(TOOL_RATE_LIMITS).map(([toolName, cfg]) => ({
+    toolName,
+    baseLimit: cfg.limit,
+    limit: scaleToolRateLimit(cfg.limit, multiplier),
+    windowSeconds: cfg.windowSeconds,
+  }));
+}

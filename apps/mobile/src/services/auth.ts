@@ -4,8 +4,12 @@ import type { User } from './api';
 import { APPROVAL_CACHE_KEY, clearApprovalCacheOrThrow } from './approvalCache';
 import { APP_LOCK_STATE_KEY } from './appLockState';
 import { CSRF_TOKEN_KEY, clearCsrfToken } from './csrfToken';
+import { ARRIVAL_MEMORY_KEY, clearArrivalMemory } from './arrivalMemory';
 import { LOCAL_TIMER_KEY, clearLocalTimer } from './localTimer';
+import { AI_MODEL_PREF_KEY, clearAiModelPref } from './aiModelPrefs';
+import { LOCATION_SITES_CACHE_KEY, clearLocationSitesOrThrow } from './locationSitesCache';
 import { QUEUE_KEY, clearQueueForSignOut } from './timeEntryQueue';
+import { clearWorkTypeCache } from './workTypes';
 import {
   AUTH_TOKEN_KEY,
   AUTH_USER_KEY,
@@ -127,6 +131,9 @@ export class SecureWipeError extends Error {
 export async function clearAuthData(
   options: Readonly<{ deliberate?: boolean }> = {}
 ): Promise<void> {
+  // In-memory, synchronous, cannot fail: work types are partner-owned labels,
+  // so the next account on this device must not be offered this one's list.
+  clearWorkTypeCache();
   const deletions: Array<{ key: string; run: () => Promise<unknown> }> = [
     { key: AUTH_TOKEN_KEY, run: () => SecureStore.deleteItemAsync(AUTH_TOKEN_KEY) },
     { key: AUTH_USER_KEY, run: () => SecureStore.deleteItemAsync(AUTH_USER_KEY) },
@@ -149,6 +156,14 @@ export async function clearAuthData(
     // that work under the new identity. Safe to clear on ANY session end — it
     // holds no unsent work, only an in-progress span the technician can restart.
     { key: LOCAL_TIMER_KEY, run: () => clearLocalTimer() },
+    // The last-picked AI chat model is a partner-scoped offering id; the next
+    // account on this device starts from its own menu default.
+    { key: AI_MODEL_PREF_KEY, run: () => clearAiModelPref() },
+    // #8211: partner-owned site names and coordinates, plus which sites this
+    // technician dismissed. Both are account-scoped, so the next account on
+    // this device must not read them.
+    { key: LOCATION_SITES_CACHE_KEY, run: () => clearLocationSitesOrThrow() },
+    { key: ARRIVAL_MEMORY_KEY, run: () => clearArrivalMemory() },
     // Unsent time-entry writes ARE unsent work, so they are parked-and-cleared
     // only on a deliberate sign-out (see the doc comment above). The park has
     // to land first: `clearQueueForSignOut` rejects rather than delete rows it

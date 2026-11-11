@@ -11,6 +11,7 @@ vi.mock('./aiTools', () => ({
       manage_maintenance_windows: 1,
       manage_automations: 1,
       manage_alert_rules: 1,
+      manage_monitors: 1,
       generate_report: 1,
       // Configuration policy tools
       manage_configuration_policy: 1,
@@ -29,20 +30,35 @@ vi.mock('./aiTools', () => ({
       query_devices: 1,
       query_change_log: 1,
       // file_operations base tier 1; guardrails escalate read/write/delete/mkdir/rename to
-      // Tier 3 (SR5-01) and downgrade list to Tier 2 (recon only)
+      // Tier 3 (privileged-read rule) and downgrade list to Tier 2 (recon only)
       file_operations: 1,
+      // Mirror the real registry entries (aiToolsScripts.ts registerTool
+      // tier: 1); their list actions resolve to Tier 2 via TIER2_ACTIONS.
+      manage_processes: 1,
+      manage_scheduled_tasks: 1,
+      // Real registry entries are tier 1 (aiToolsFilesystem.ts /
+      // aiToolsPerformance.ts); their live variants resolve to Tier 2.
+      system_cleanup: 1,
+      analyze_disk_usage: 1,
+      analyze_boot_performance: 1,
       execute_command: 3,
       // Ticketing tools
       manage_tickets: 1,
       manage_alerts: 1,
       // Billing/ticketing write tools
       manage_invoices: 2,
-      manage_catalog: 2,
+      manage_billing_catalog: 2,
       manage_contracts: 2,
       manage_quotes: 2,
       // P2-5 (#4192): mirrors the real registry entry
       // (`aiAgentSdkTools.ts` TOOL_TIERS.manage_ai_agents = 3).
       manage_ai_agents: 3,
+      // Mirrors the real registry entries
+      // (aiToolsGoogle.ts googleToolTiers — all Tier 3).
+      google_set_forwarding: 3,
+      google_disable_forwarding: 3,
+      google_add_mail_delegate: 3,
+      google_share_calendar: 3,
     };
     return tiers[toolName];
   }),
@@ -74,6 +90,34 @@ import {
 } from './aiGuardrails';
 import { getUserPermissions, hasPermission } from './permissions';
 
+describe('manage_monitors — retired mutations', () => {
+  it.each(['create', 'update', 'delete'])('%s returns its refusal without approval', (action) => {
+    expect(checkGuardrails('manage_monitors', { action })).toMatchObject({
+      tier: 1,
+      allowed: true,
+      requiresApproval: false,
+    });
+  });
+
+  it.each(['get', 'create', 'update', 'delete'])('%s requires only devices.read', async (action) => {
+    const auth = {
+      user: { id: 'user-1' },
+      token: { roleId: 'operator', scope: 'organization' },
+      orgId: 'org-1',
+      partnerId: null,
+    } as any;
+    vi.mocked(getUserPermissions).mockResolvedValue({ roleId: 'operator' } as any);
+    vi.mocked(hasPermission).mockImplementation((_permissions, resource, permissionAction) =>
+      resource === 'devices' && permissionAction === 'read',
+    );
+
+    expect(requiredPermissionsForTool('manage_monitors', { action })).toEqual([
+      { resource: 'devices', action: 'read' },
+    ]);
+    expect(await checkToolPermission('manage_monitors', { action }, auth)).toBeNull();
+  });
+});
+
 // ─── Tier escalation for fleet tools ────────────────────────────────────
 
 describe('checkGuardrails — fleet tool tier escalation', () => {
@@ -86,6 +130,7 @@ describe('checkGuardrails — fleet tool tier escalation', () => {
       ['manage_deployments', 'device_status'],
       ['manage_patches', 'list'],
       ['manage_patches', 'compliance'],
+      ['manage_patches', 'device_history'],
       ['manage_groups', 'list'],
       ['manage_groups', 'get'],
       ['manage_groups', 'preview'],
@@ -101,17 +146,11 @@ describe('checkGuardrails — fleet tool tier escalation', () => {
       ['manage_alert_rules', 'test_rule'],
       ['manage_alert_rules', 'list_channels'],
       ['manage_alert_rules', 'alert_summary'],
-      // Disabled mutation actions — tools return policy redirect before guardrails apply,
-      // but checkGuardrails resolves them at base tier since they're not in TIER2/TIER3 maps.
-      ['manage_maintenance_windows', 'create'],
-      ['manage_maintenance_windows', 'update'],
-      ['manage_maintenance_windows', 'delete'],
+      // Retired manage_alert_rules mutations are no longer actions; an unknown
+      // action resolves at the base tier.
       ['manage_alert_rules', 'create_rule'],
       ['manage_alert_rules', 'update_rule'],
       ['manage_alert_rules', 'delete_rule'],
-      ['manage_automations', 'create'],
-      ['manage_automations', 'update'],
-      ['manage_automations', 'delete'],
       ['generate_report', 'list'],
       ['generate_report', 'data'],
       ['generate_report', 'history'],
@@ -137,8 +176,6 @@ describe('checkGuardrails — fleet tool tier escalation', () => {
       ['manage_patches', 'decline'],
       ['manage_patches', 'defer'],
       ['manage_patches', 'bulk_approve'],
-      ['manage_groups', 'add_devices'],
-      ['manage_groups', 'remove_devices'],
       ['manage_automations', 'enable'],
       ['manage_automations', 'disable'],
       ['generate_report', 'create'],
@@ -149,12 +186,64 @@ describe('checkGuardrails — fleet tool tier escalation', () => {
       ['manage_tickets', 'log_time_entry'],
       ['manage_tickets', 'start_timer'],
       ['manage_tickets', 'stop_timer'],
+      ['manage_tickets', 'update_time_entry'],
       ['file_operations', 'list'],
     ];
 
     it.each(t2Cases)('%s:%s → Tier 2, no approval', (tool, action) => {
       const result = checkGuardrails(tool, { action });
       expect(result.tier).toBe(2);
+      expect(result.allowed).toBe(true);
+      expect(result.requiresApproval).toBe(false);
+    });
+  });
+
+  // --- Live device inspection: Tier 2 read-only ---
+  // Each of these runs a live command on the device (devices:execute). They
+  // sit at Tier 2 read-only so they auto-execute without a prompt but keep an
+  // audit row, and an MCP key needs ai:write to reach them.
+  describe('Tier 2 read-only — live device inspection', () => {
+    const liveCases: [string, string][] = [
+      ['manage_processes', 'list'],
+      ['manage_scheduled_tasks', 'list'],
+      ['file_operations', 'list'],
+      ['system_cleanup', 'list'],
+    ];
+
+    it.each(liveCases)('%s:%s → Tier 2, read-only, no approval', (tool, action) => {
+      const result = checkGuardrails(tool, { action });
+      expect(result.tier).toBe(2);
+      expect(result.allowed).toBe(true);
+      expect(result.requiresApproval).toBe(false);
+      expect(result.readOnly).toBe(true);
+    });
+
+    // Tools that read stored data by default and only reach the device when a
+    // boolean input asks for fresh data. Only the live request is Tier 2.
+    const liveFlagCases: [string, Record<string, unknown>][] = [
+      ['analyze_disk_usage', { deviceId: 'd', refresh: true }],
+      ['analyze_boot_performance', { deviceId: 'd', triggerCollection: true }],
+    ];
+
+    it.each(liveFlagCases)('%s with %j → Tier 2, read-only, no approval', (tool, input) => {
+      const result = checkGuardrails(tool, input);
+      expect(result.tier).toBe(2);
+      expect(result.allowed).toBe(true);
+      expect(result.requiresApproval).toBe(false);
+      expect(result.readOnly).toBe(true);
+    });
+
+    const storedReadCases: [string, Record<string, unknown>][] = [
+      ['analyze_disk_usage', { deviceId: 'd' }],
+      ['analyze_disk_usage', { deviceId: 'd', refresh: false }],
+      ['analyze_boot_performance', { deviceId: 'd' }],
+      ['analyze_boot_performance', { deviceId: 'd', triggerCollection: false }],
+      ['system_cleanup', { deviceId: 'd', action: 'status' }],
+    ];
+
+    it.each(storedReadCases)('%s with %j reads stored data → Tier 1', (tool, input) => {
+      const result = checkGuardrails(tool, input);
+      expect(result.tier).toBe(1);
       expect(result.allowed).toBe(true);
       expect(result.requiresApproval).toBe(false);
     });
@@ -175,7 +264,19 @@ describe('checkGuardrails — fleet tool tier escalation', () => {
       ['manage_groups', 'create'],
       ['manage_groups', 'update'],
       ['manage_groups', 'delete'],
+      // #10149 (QW9): membership writes feed agent run scope and group-targeted
+      // policies, and schedule peripheral reconciliation — supervised.
+      ['manage_groups', 'add_devices'],
+      ['manage_groups', 'remove_devices'],
       ['manage_automations', 'run'],
+      // W01-D3 (#6755): handler-disabled today, escalated so re-enabling the
+      // handler cannot silently reopen an unallowlisted agent write.
+      ['manage_maintenance_windows', 'create'],
+      ['manage_maintenance_windows', 'update'],
+      ['manage_maintenance_windows', 'delete'],
+      ['manage_automations', 'create'],
+      ['manage_automations', 'update'],
+      ['manage_automations', 'delete'],
     ];
 
     it.each(t3Cases)('%s:%s → Tier 3, approval required', (tool, action) => {
@@ -219,7 +320,7 @@ describe('checkGuardrails — fleet tool tier escalation', () => {
       'start_service',
       'stop_service',
       'restart_service',
-      // file_read is a read but stays Tier 3 deliberately (SR5-01: arbitrary
+      // file_read is a read but stays Tier 3 deliberately (privileged-read rule: arbitrary
       // file contents off a root/LocalSystem agent are exfiltratable).
       'file_read',
       // list_services and event_logs_query are reads but stay Tier 3: both
@@ -760,8 +861,8 @@ describe('checkGuardrails — manage_tickets tier escalation', () => {
     }
   });
 
-  it('log_time_entry/start_timer/stop_timer resolve to Tier 2 (auto-execute + audit)', () => {
-    for (const action of ['log_time_entry', 'start_timer', 'stop_timer']) {
+  it('log_time_entry/start_timer/stop_timer/update_time_entry resolve to Tier 2 (auto-execute + audit)', () => {
+    for (const action of ['log_time_entry', 'start_timer', 'stop_timer', 'update_time_entry']) {
       const result = checkGuardrails('manage_tickets', { action });
       expect(result.tier).toBe(2);
       expect(result.allowed).toBe(true);
@@ -779,6 +880,15 @@ describe('checkGuardrails — manage_tickets tier escalation', () => {
     const result = checkGuardrails('manage_tickets', { action: 'move_org' });
     expect(result.tier).toBe(3);
     expect(result.requiresApproval).toBe(true);
+  });
+
+  it('merge_preview is Tier 1 (read) and merge is Tier 3 with approval (#8972)', () => {
+    const preview = checkGuardrails('manage_tickets', { action: 'merge_preview' });
+    expect(preview.tier).toBe(1);
+    expect(preview.requiresApproval).toBe(false);
+    const merge = checkGuardrails('manage_tickets', { action: 'merge' });
+    expect(merge.tier).toBe(3);
+    expect(merge.requiresApproval).toBe(true);
   });
 
   // P2-4 (#4191): new ticket-triage actions, same family as update_fields.
@@ -821,7 +931,7 @@ describe('buildApprovalDescription — manage_tickets copy (P2-4, #4191)', () =>
       ticketId: TICKET_ID,
       content: 'the secret triage note body',
     });
-    expect(result.description).toBe(`Post private AI triage note on ticket #${TICKET_ID.slice(0, 8)}...`);
+    expect(result.description).toBe(`Post internal note on ticket #${TICKET_ID.slice(0, 8)}...`);
     expect(result.description).not.toContain('secret triage note body');
   });
 
@@ -850,7 +960,7 @@ describe('buildApprovalDescription — manage_tickets copy (P2-4, #4191)', () =>
 
   it('other manage_tickets actions keep the pre-existing generic description shape (no regression)', () => {
     const result = checkGuardrails('manage_tickets', { action: 'assign', ticketId: TICKET_ID });
-    expect(result.description).toBe('manage_tickets: assign');
+    expect(result.description).toBe('Manage tickets: assign');
   });
 });
 
@@ -902,7 +1012,78 @@ describe('buildApprovalDescription — manage_ai_agents copy (P2-5, #4192)', () 
 
   it('other manage_ai_agents actions keep the generic description shape (no regression)', () => {
     const result = checkGuardrails('manage_ai_agents', { action: 'rotate_something' });
-    expect(result.description).toBe('manage_ai_agents: rotate_something');
+    expect(result.description).toBe('Manage ai agents: rotate something');
+  });
+});
+
+// The approval headline for these four
+// Google Workspace tools used to fall through to the generic `${toolName}`
+// default — no destination address anywhere in the always-visible headline,
+// on web or mobile. These assert the destination is now in the headline, and
+// that a destination on a different domain from the mailbox being acted on
+// is flagged distinctly. Domain comparison uses the tool's own `userEmail`/
+// `ownerEmail` argument as the workspace-domain stand-in (this layer has no
+// connection/customerDomain lookup, and checkGuardrails is synchronous, so a
+// verified-domain lookup would need a broader async refactor) — the label
+// below is worded as a heuristic accordingly. See D-41a for the owner
+// decision on actually locking these tools to verified domains.
+describe('buildApprovalDescription — Google external-destination copy', () => {
+  it('google_set_forwarding: same-domain destination has no domain-mismatch flag', () => {
+    const result = checkGuardrails('google_set_forwarding', {
+      userEmail: 'alice@acme.example',
+      forwardTo: 'bob@acme.example',
+      reason: 'coverage',
+    });
+    expect(result.description).toBe('Forward mail from alice@acme.example to bob@acme.example');
+  });
+
+  it('google_set_forwarding: cross-domain destination is flagged in the headline', () => {
+    const result = checkGuardrails('google_set_forwarding', {
+      userEmail: 'alice@acme.example',
+      forwardTo: 'ext-recipient@foreign.example',
+      reason: 'coverage',
+    });
+    expect(result.description).toContain('ext-recipient@foreign.example');
+    expect(result.description).toContain('different domain from source mailbox');
+  });
+
+  it('google_add_mail_delegate: names the delegate and flags a cross-domain one', () => {
+    const result = checkGuardrails('google_add_mail_delegate', {
+      userEmail: 'alice@acme.example',
+      delegateEmail: 'ext-recipient@foreign.example',
+      reason: 'coverage',
+    });
+    expect(result.description).toContain('ext-recipient@foreign.example');
+    expect(result.description).toContain('different domain from source mailbox');
+  });
+
+  it('google_share_calendar: names the share target and flags a cross-domain one', () => {
+    const result = checkGuardrails('google_share_calendar', {
+      ownerEmail: 'alice@acme.example',
+      shareWithEmail: 'ext-recipient@foreign.example',
+      reason: 'coverage',
+    });
+    expect(result.description).toContain('ext-recipient@foreign.example');
+    expect(result.description).toContain('different domain from source mailbox');
+  });
+
+  it('google_disable_forwarding: with removeAddress, names and flags the removed address', () => {
+    const result = checkGuardrails('google_disable_forwarding', {
+      userEmail: 'alice@acme.example',
+      forwardTo: 'ext-recipient@foreign.example',
+      removeAddress: true,
+      reason: 'coverage',
+    });
+    expect(result.description).toContain('ext-recipient@foreign.example');
+    expect(result.description).toContain('different domain from source mailbox');
+  });
+
+  it('google_disable_forwarding: without removeAddress never mentions a destination', () => {
+    const result = checkGuardrails('google_disable_forwarding', {
+      userEmail: 'alice@acme.example',
+      reason: 'coverage',
+    });
+    expect(result.description).not.toContain('different domain from source mailbox');
   });
 });
 
@@ -1081,13 +1262,13 @@ describe('checkToolPermission — action-multiplexed tools require action arg', 
   });
 });
 
-// ─── SR5-01: filesystem read/write are privileged (execute + Tier 3) ────
+// ─── Privileged-read rule: filesystem read/write are privileged (execute + Tier 3) ────
 
-// SR5-01 (agent runs as root / LocalSystem) plus this branch's partial
+// The privileged-read rule (agent runs as root / LocalSystem) plus this branch's partial
 // relaxation, asserted once: `list` is recon-only and was deliberately
 // downgraded to Tier 2, everything that touches file CONTENT — `read`
 // included — stays Tier 3.
-describe('file_operations tier boundary (SR5-01 + partial relaxation)', () => {
+describe('file_operations tier boundary (privileged-read rule + partial relaxation)', () => {
   it('list is Tier 2 (auto-execute + audit) — recon only, deliberate downgrade', () => {
     const result = checkGuardrails('file_operations', { action: 'list', deviceId: 'd1', path: '/tmp' });
     expect(result.tier).toBe(2);
@@ -1106,7 +1287,7 @@ describe('file_operations tier boundary (SR5-01 + partial relaxation)', () => {
   );
 });
 
-describe('checkToolPermission — file_operations requires devices.execute (SR5-01)', () => {
+describe('checkToolPermission — file_operations requires devices.execute (privileged-read rule)', () => {
   const auth = {
     user: { id: 'user-1' },
     token: { roleId: 'viewer', scope: 'organization' },

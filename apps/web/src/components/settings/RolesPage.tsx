@@ -1,16 +1,15 @@
 import '@/lib/i18n';
 import { useTranslation } from 'react-i18next';
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import RoleManager, {
   type Role,
-  type Permission,
   type EffectivePermission,
+  type RoleFormData,
   RoleFormModal,
   DeleteRoleModal,
   RoleUsersModal
 } from './RoleManager';
 import { fetchWithAuth } from '../../stores/auth';
-import { getOrgScope } from '@/hooks/useOrgScope';
 import { navigateTo } from '@/lib/navigation';
 import { runAction, ActionError } from '../../lib/runAction';
 import { showToast } from '../shared/Toast';
@@ -122,6 +121,38 @@ export default function RolesPage() {
     }
   }, []);
 
+  // Picking a parent inside Create/Clone/Edit shows that parent's effective
+  // permissions as inherited (#9603). They are inherited by definition from the
+  // child's side, so every row is marked inherited.
+  const parentRequestSeq = useRef(0);
+  const handleParentChange = useCallback(async (parentRoleId: string | null) => {
+    // Only the latest pick may write state: a slower response for an earlier
+    // parent (or one landing after the dialog closed) must be dropped.
+    const seq = ++parentRequestSeq.current;
+    if (!parentRoleId) {
+      setInheritedPermissions([]);
+      return;
+    }
+    try {
+      const response = await fetchWithAuth(`/roles/${parentRoleId}/effective-permissions`);
+      if (seq !== parentRequestSeq.current) return;
+      if (!response.ok) {
+        console.error(`[RolesPage] could not load parent permissions (${response.status})`);
+        setInheritedPermissions([]);
+        return;
+      }
+      const data = await response.json();
+      if (seq !== parentRequestSeq.current) return;
+      setInheritedPermissions(
+        (data.permissions ?? []).map((p: EffectivePermission) => ({ ...p, inherited: true }))
+      );
+    } catch (err) {
+      if (seq !== parentRequestSeq.current) return;
+      console.error('[RolesPage] could not load parent permissions', err);
+      setInheritedPermissions([]);
+    }
+  }, []);
+
   // Compute available parent roles (system roles + custom roles, excluding descendants of selected role)
   const getAvailableParentRoles = useCallback(() => {
     // All roles can be potential parents except the selected role itself
@@ -182,33 +213,24 @@ export default function RolesPage() {
   };
 
   const handleCloseModal = () => {
+    parentRequestSeq.current++;
     setModalMode('closed');
     setSelectedRole(null);
     setRoleUsers([]);
     setInheritedPermissions([]);
   };
 
-  const handleCreateSubmit = async (data: {
-    name: string;
-    description: string;
-    permissions: Permission[];
-    parentRoleId: string | null;
-  }) => {
+  const handleCreateSubmit = async (data: RoleFormData) => {
     setSubmitting(true);
     try {
-      // When focused on a specific org (partner admin drilled into one org, or
-      // an org-scope user), create the role scoped to that org so it shows up in
-      // that org's SSO default-role picker (#3524). In fleet view (scope 'all')
-      // send nothing — the API defaults a partner caller to a partner-scoped
-      // role, preserving the prior behavior.
-      const scope = getOrgScope();
-      const body = scope.scope === 'org'
-        ? { ...data, orgId: scope.orgId }
-        : data;
+      // The owner axis comes from the dialog's explicit scope choice (#8370):
+      // `data` carries ownerScope (+ orgId for an org role) for a partner-scope
+      // creator, and neither for an org-scope creator, whose token org owns it.
+      // It is no longer read from the header org.
       await runAction({
         request: () => fetchWithAuth('/roles', {
           method: 'POST',
-          body: JSON.stringify(body)
+          body: JSON.stringify(data)
         }),
         errorFallback: t('rolesPage.failedToCreateRole'),
         successMessage: t('rolesPage.roleCreated', { name: data.name }),
@@ -228,12 +250,7 @@ export default function RolesPage() {
     }
   };
 
-  const handleEditSubmit = async (data: {
-    name: string;
-    description: string;
-    permissions: Permission[];
-    parentRoleId: string | null;
-  }) => {
+  const handleEditSubmit = async (data: RoleFormData) => {
     if (!selectedRole) return;
 
     setSubmitting(true);
@@ -261,12 +278,7 @@ export default function RolesPage() {
     }
   };
 
-  const handleCloneSubmit = async (data: {
-    name: string;
-    description: string;
-    permissions: Permission[];
-    parentRoleId: string | null;
-  }) => {
+  const handleCloneSubmit = async (data: RoleFormData) => {
     if (!selectedRole) return;
 
     setSubmitting(true);
@@ -275,7 +287,7 @@ export default function RolesPage() {
       const clonedRole = await runAction<Role>({
         request: () => fetchWithAuth(`/roles/${selectedRole.id}/clone`, {
           method: 'POST',
-          body: JSON.stringify({ name: data.name })
+          body: JSON.stringify({ name: data.name, description: data.description })
         }),
         errorFallback: t('rolesPage.failedToCloneRole'),
         onUnauthorized: () => void navigateTo('/login', { replace: true })
@@ -292,6 +304,9 @@ export default function RolesPage() {
         [...originalPermSet].some((p) => !newPermSet.has(p));
 
       const parentRoleChanged = data.parentRoleId !== selectedRole.parentRoleId;
+      // The server copies force_mfa from the source role, so only a changed
+      // toggle needs the follow-up PATCH (#5317).
+      const forceMfaChanged = data.forceMfa !== (selectedRole.forceMfa === true);
 
       // Step 2 (#822 issue #1): if the user edited permissions / description /
       // parent, PATCH the new role with the changes. PREVIOUSLY this PATCH's
@@ -300,14 +315,19 @@ export default function RolesPage() {
       // their edited permissions but silently got the original ones. Now the
       // PATCH goes through runAction so any failure surfaces as a clear toast
       // and the modal does NOT close on partial-success.
-      if (permissionsChanged || data.description !== selectedRole.description || parentRoleChanged) {
+      if (
+        permissionsChanged ||
+        parentRoleChanged ||
+        forceMfaChanged
+      ) {
         await runAction({
           request: () => fetchWithAuth(`/roles/${clonedRole.id}`, {
             method: 'PATCH',
             body: JSON.stringify({
               description: data.description,
               permissions: data.permissions,
-              parentRoleId: data.parentRoleId
+              parentRoleId: data.parentRoleId,
+              forceMfa: data.forceMfa
             })
           }),
           errorFallback: t('rolesPage.roleClonedButApplyingTheEditedPermissionsFailedEditTheNe'),
@@ -417,7 +437,8 @@ export default function RolesPage() {
         mode="create"
         role={null}
         availableParentRoles={getAvailableParentRoles()}
-        inheritedPermissions={[]}
+        inheritedPermissions={inheritedPermissions}
+        onParentChange={handleParentChange}
         onSubmit={handleCreateSubmit}
         onCancel={handleCloseModal}
         loading={submitting}
@@ -430,6 +451,7 @@ export default function RolesPage() {
         role={selectedRole}
         availableParentRoles={getAvailableParentRoles()}
         inheritedPermissions={inheritedPermissions}
+        onParentChange={handleParentChange}
         onSubmit={handleEditSubmit}
         onCancel={handleCloseModal}
         loading={submitting}
@@ -442,6 +464,7 @@ export default function RolesPage() {
         role={selectedRole}
         availableParentRoles={getAvailableParentRoles()}
         inheritedPermissions={inheritedPermissions}
+        onParentChange={handleParentChange}
         onSubmit={handleCloneSubmit}
         onCancel={handleCloseModal}
         loading={submitting}

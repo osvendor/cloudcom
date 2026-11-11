@@ -174,14 +174,14 @@ vi.mock('../../services/permissions', async (importOriginal) => {
   };
 });
 
-vi.mock('../../db', () => ({ db: dbMock }));
+vi.mock('../../db', () => ({ db: dbMock, withDbTransaction: (fn: () => Promise<unknown>) => fn(), }));
 vi.mock('../../db/schema', () => ({
   alertCorrelationGroups: {}, alertCorrelationMembers: {},
   alertRules: {}, alertTemplates: {}, alerts: tables.alerts, notificationChannels: {},
   alertNotifications: {}, devices: tables.devices, tickets: tables.tickets, ticketAlertLinks: {},
 }));
 vi.mock('../../services/alertCooldown', () => ({
-  setCooldown: vi.fn(), markConfigPolicyRuleCooldown: vi.fn(),
+  setCooldown: vi.fn(),
 }));
 vi.mock('../../services/auditEvents', () => ({ writeRouteAudit: vi.fn() }));
 vi.mock('../../services/eventBus', () => ({ publishEvent: vi.fn() }));
@@ -274,6 +274,11 @@ describe('alert state-change authz (Finding #6)', () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ until: '2030-01-01T00:00:00.000Z' }),
     });
+    expect(res.status).toBe(403);
+  });
+
+  it('403 on POST /alerts/:id/unsuppress without ALERTS_WRITE', async () => {
+    const res = await makeApp().request(`/alerts/${ALERT_ID}/unsuppress`, { method: 'POST' });
     expect(res.status).toBe(403);
   });
 
@@ -585,7 +590,7 @@ describe('POST /alerts/bulk site-axis scope (T3)', () => {
     expect(state.alerts.find((a) => a.id === ALERT_B)?.status).toBe('active');
   });
 
-  it('still acknowledges org-wide (deviceless) alerts for a SITE_A-restricted user', async () => {
+  it('refuses to acknowledge org-wide (deviceless) alerts for a SITE_A-restricted user', async () => {
     authRef.current = { ...authRef.current, allowedSiteIds: [SITE_A] } as typeof authRef.current;
 
     const res = await makeApp().request('/alerts/bulk', {
@@ -594,9 +599,24 @@ describe('POST /alerts/bulk site-axis scope (T3)', () => {
       body: JSON.stringify({ alertIds: [ALERT_ORGWIDE, ALERT_B], action: 'acknowledge' }),
     });
 
-    expect(res.status).toBe(200);
-    expect(state.alerts.find((a) => a.id === ALERT_ORGWIDE)?.status).toBe('acknowledged');
+    expect(res.status).toBe(404);
+    expect(state.alerts.find((a) => a.id === ALERT_ORGWIDE)?.status).toBe('active');
     expect(state.alerts.find((a) => a.id === ALERT_B)?.status).toBe('active');
+  });
+
+  it("bulk resolve stamps resolution_reason 'manual'; acknowledge does not (#7281)", async () => {
+    const post = (alertId: string, action: string) =>
+      makeApp().request('/alerts/bulk', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ alertIds: [alertId], action }),
+      });
+
+    expect((await post(ALERT_A, 'resolve')).status).toBe(200);
+    expect((await post(ALERT_B, 'acknowledge')).status).toBe(200);
+
+    expect(state.alerts.find((a) => a.id === ALERT_A)).toMatchObject({ status: 'resolved', resolutionReason: 'manual' });
+    expect(state.alerts.find((a) => a.id === ALERT_B)).not.toHaveProperty('resolutionReason');
   });
 
   it('acknowledges alerts across all sites for an unrestricted user (no regression)', async () => {

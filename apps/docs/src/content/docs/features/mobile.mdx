@@ -103,7 +103,7 @@ From the alert detail screen, technicians can:
 - **Acknowledge** an active alert with a single tap (`POST /alerts/:id/acknowledge`).
 - **Resolve** an alert with an optional resolution note (`POST /alerts/:id/resolve`).
 
-Both actions publish events (`alert.acknowledged`, `alert.resolved`) through the event bus and write audit log entries. Resolving an alert also sets the appropriate cooldown period based on the alert rule or configuration policy settings.
+Both actions publish events (`alert.acknowledged`, `alert.resolved`) through the event bus and write audit log entries. Resolving a monitor alert applies its configured cooldown period. Historical alerts from retired policy rules can still be resolved; they no longer set a policy-rule cooldown.
 
 ### Tickets
 
@@ -120,6 +120,40 @@ Tapping a ticket opens the detail view, which shows the full activity stream -- 
 Time tracking keeps working without a signal: a timer started offline is held on the phone and submitted with its real start and end times once you reconnect, rather than being stamped with the time the phone came back.
 
 The app can also suggest time entries from remote sessions you have just finished -- a partner setting that is off by default, and the one place that feature appears. See [Suggested time entries](/features/ticketing/#suggested-time-entries).
+
+### Arrival suggestions
+
+When you open the app at a client site, Breeze can suggest starting a timer: *"Looks like you're at Acme Corp -- Main Office."* One tap starts an ordinary time entry for that organization and site. Nothing is started or stopped without your tap.
+
+**Two opt-ins are required.** Neither one alone does anything:
+
+1. **Your partner turns it on** under **Settings > Ticketing > Time Tracking** (off by default), and can set a default arrival radius.
+2. **You turn it on** on your phone. The first time, the Time tab shows a short explanation and a **Turn on** button; only that tap raises the system location prompt. **Not now** hides the card for 30 days, and you can change your mind later in the app's **Settings > Location suggestions** row.
+
+**What is and is not sent.** The app compares your position with the saved site locations *on the phone* and discards it. Your position is never sent to Breeze, and is never part of analytics or logs. The one exception is deliberate: when you tap **Save my current location as \<site\>** (below), that single reading becomes the site's saved location.
+
+**When it prompts.** Only while the app is open -- when you return to it, open Home or Tickets, or pull to refresh on Tickets. It checks at most every 5 minutes (a pull to refresh checks right away). It stays quiet when:
+
+- a timer is already running,
+- the phone's location is not precise enough to tell sites apart (worse than about 500 m),
+- you dismissed that site in the last 4 hours, or stopped a timer there in the last 30 minutes.
+
+If more than one site is in range, you pick from a list sorted by distance -- Breeze never picks for you. With open tickets assigned to you at that organization you can start against one, or choose **Site visit -- no ticket**. A timer started offline still records the organization and site when it syncs.
+
+**Still at the site?** For a timer that an arrival suggestion started, the app can later ask *"Still at Acme Corp? Timer has been running 2h 28m."* after two readings, at least 5 minutes apart, show you well away from the site. **Stop** stops the timer as of your tap; **Keep running** leaves it alone. This also only happens while the app is open.
+
+**Saving a site's location from the phone.** If your role has the **Set site location** permission, a **Save my current location as \<site\>** button appears on a ticket (and when editing a timesheet entry) for organizations that have sites without a saved location. Stand at the site first: the reading must be accurate to within 100 m or the app asks you to try again somewhere with a clearer view of the sky.
+
+| Phone state | What the app does |
+|---|---|
+| Never asked | Time tab explainer; **Turn on** raises the system prompt |
+| Allowed while using the app (precise) | Suggestions work |
+| Allow once / only this time | Works until the app is closed; turn it on again from **Settings > Location suggestions** |
+| Approximate location only | No suggestions; the settings row says *Precise location is off -- suggestions need it* |
+| Denied | The app never asks again; the settings row opens the phone's Settings |
+| Location services off | No suggestions; the settings row opens the phone's Settings |
+
+The app asks for foreground ("While Using") access only. Background location is not requested.
 
 ### Remote Actions
 
@@ -146,11 +180,19 @@ The offline target can't execute its own wake, so the API selects an online peer
 | `RELAY_OVERRIDE_INVALID` | Caller-supplied relay isn't online or isn't at the target's site/subnet. |
 | `WS_SEND_FAILED` | Relay dropped its WebSocket between selection and dispatch — retry. |
 
-The agent's WoL handler sends three rounds of magic packets to UDP ports 7 and 9 spaced 500 ms apart, one per known MAC. Success measurement is left to the UI — wait for the target's next heartbeat to confirm the wake worked (typical resume time: 30 s to 5 min).
+A target that is already online returns `TARGET_ONLINE` and nothing is sent (v0.127.0+).
+
+The agent's WoL handler sends three rounds of magic packets to UDP ports 7 and 9 spaced 500 ms apart, one per known MAC. Typical resume time is 30 s to 5 min. From v0.127.0, Breeze records each sent wake and resolves it within about 12 minutes as `came_online`, `timed_out`, `send_failed` or `unknown`; see [Wake-on-LAN](/features/remote-access/#wake-on-lan).
 
 <Aside type="caution">
   The `shutdown` and `lock` actions visible in the mobile UI are dispatched through the core commands endpoint (`POST /devices/:id/commands`) rather than the mobile actions endpoint, as the mobile actions schema does not currently accept those command types.
 </Aside>
+
+---
+
+## Wisp on mobile
+
+If [Wisp](/features/wisp/) is on for your account, its **nudges** arrive as push notifications, so a concern that needs a person reaches you away from your desk. Tapping one opens the **Wisp thread** screen, which shows the brief sections, the full activity timeline and the linked items (read-only; each one opens its item). When Wisp has asked first, the approval card uses **Hold to approve**: press and hold to confirm, so a stray tap cannot approve anything. See [Approval Mode](#approval-mode) for how mobile approvals work.
 
 ---
 
@@ -272,6 +314,8 @@ A request moves through one of the following **statuses**:
 4. On approval, the blocked action resumes immediately. On denial or expiry, the action fails and the reason is recorded.
 
 </Steps>
+
+**Several pending approvals at once** (v0.117.0+): when more than one request is waiting, the approval screen shows its position in the queue (for example **2 of 5**) with **Prev** and **Next** buttons, plus a **Later** action that sets the current request aside so the next one comes up first. A deferred request is not dismissed; it stays pending, you can return to it with Prev/Next, and it expires on its normal schedule if nobody decides it. With a single pending request the screen is unchanged.
 
 When the request was initiated by the user's *own* mobile app for that same user (a self-approval), the app requires a deliberate 5-second hold-to-confirm instead of a single tap, to prevent an attacker with a momentarily unlocked phone from rubber-stamping a self-issued request.
 

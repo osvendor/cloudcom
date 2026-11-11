@@ -23,12 +23,21 @@ vi.mock('../db/schema', () => ({
 }));
 
 vi.mock('./aiAgentSystemPrompt', () => ({ AI_SYSTEM_PROMPT_BASE: 'base', AI_SYSTEM_PROMPT_TAIL: 'tail' }));
-vi.mock('./aiToolIndex', () => ({ composeStaticSystemPrompt: () => 'base\nindex\ntail' }));
+vi.mock('./aiToolIndex', () => ({ composeStaticSystemPrompt: () => 'base\nindex\ntail', renderPageContextToolBlocks: () => '', resolveToolIndexMode: () => 'lazy' }));
 vi.mock('./aiAgentSdkTools', () => ({ listChatSurfaceToolNames: () => [] }));
 
 const getActiveDeviceContextMock = vi.fn();
 vi.mock('./brainDeviceContext', () => ({
   getActiveDeviceContext: (...args: unknown[]) => getActiveDeviceContextMock(...args),
+}));
+
+// W03 Task 9 (#7601): createSession picks its model through the registry.
+vi.mock('./aiModels/candidateLoader', () => ({ readOrgPartnerId: vi.fn(async () => 'partner-1') }));
+vi.mock('./aiModels/sessionModel', () => ({
+  chooseSessionModel: vi.fn(async () => ({
+    offeringId: 'off-1', offeringPartnerId: 'partner-1', options: null,
+    model: 'claude-sonnet-4-6', billingSource: 'platform',
+  })),
 }));
 
 import { buildSystemPrompt } from './aiAgent';

@@ -27,12 +27,44 @@ describe('tenant-bound authentication methods provider', () => {
     expect(listed).toEqual({ items: [
       { id: PHONE, type: 'phone', detail: 'mobile ending 4567', removable: true },
       { id: AUTHENTICATOR, type: 'microsoftAuthenticator', detail: 'Ada phone', removable: true },
-      { type: 'fido2', removable: false },
+      { id: 'fido-opaque', type: 'fido2', removable: true },
     ] });
     expect(h.fetch.mock.calls[1]).toEqual([`${ORIGIN}/users/${USER}/authentication/methods`, expect.objectContaining({ method: 'GET' })]);
     expect(JSON.stringify(listed)).not.toMatch(/secret|deviceTag|publicKey/);
   });
 
+  it.each([
+    ['email', 'emailMethods', '3ddfcfc8-9383-446f-83cc-3ab9be4be18f'],
+    ['fido2', 'fido2Methods', '_jpuR-TGZtk6aQCLF3BQjA2'],
+    ['softwareOath', 'softwareOathMethods', 'b172893e-893e-b172-3e89-72b13e8972b1'],
+    ['temporaryAccessPass', 'temporaryAccessPassMethods', '05267842-25b2-4b21-8abd-8e4982796f7f'],
+    ['windowsHelloForBusiness', 'windowsHelloForBusinessMethods', '_jpuR-TGZtk6aQCLF3BQjA2'],
+    ['platformCredential', 'platformCredentialMethods', 'R18B3t8Ogh9XIOGmPt81d6p_KXJs1YTxfGgGqeVFJSM1'],
+  ] as const)('removes %s only after finding the exact typed method', async (kind, collection, methodId) => {
+    const h = harness(); const guard = vi.fn(async () => {});
+    h.fetch.mockResolvedValueOnce(response({ value: [{ id: methodId, '@odata.type': `#microsoft.graph.${kind}AuthenticationMethod`, displayName: 'QA method', secret: 'never', temporaryAccessPass: 'never' }] }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    await expect(h.provider.remove(USER, { kind, methodId }, guard)).resolves.toEqual({ accepted: true });
+    expect(guard).toHaveBeenCalledTimes(2);
+    expect(h.fetch.mock.calls[2]).toEqual([`${ORIGIN}/users/${USER}/authentication/${collection}/${methodId}`, expect.objectContaining({ method: 'DELETE' })]);
+    expect(h.fetch.mock.calls[2][1]).not.toHaveProperty('body');
+  });
+  it.each(['../methods', 'id/child', 'id%2fchild', 'id?query=yes', 'id#fragment', 'id with spaces', 'a'.repeat(513)])('rejects unsafe opaque IDs before acquiring credentials: %s', async methodId => {
+    const h = harness();
+    await expect(h.provider.remove(USER, { kind: 'fido2', methodId })).rejects.toMatchObject({ code: 'invalid_input' });
+    expect(h.acquireToken).not.toHaveBeenCalled();
+  });
+  it('keeps password, unknown and malformed methods read-only and never returns credential secrets', async () => {
+    const h = harness(); h.fetch.mockResolvedValueOnce(response({ value: [
+      { id: PHONE, '@odata.type': '#microsoft.graph.passwordAuthenticationMethod', password: 'never' },
+      { id: 'key/unsafe', '@odata.type': '#microsoft.graph.fido2AuthenticationMethod' },
+      { id: PHONE, '@odata.type': '#microsoft.graph.futureAuthenticationMethod', secret: 'never' },
+      { id: PHONE, '@odata.type': '#microsoft.graph.temporaryAccessPassAuthenticationMethod', temporaryAccessPass: 'never' },
+    ] }));
+    const result = await h.provider.list(USER);
+    expect(result.items.slice(0, 3).every(method => !method.removable)).toBe(true);
+    expect(JSON.stringify(result)).not.toContain('never');
+  });
   it.each([['no role', []], ['wrong role', ['User.Read.All']]])('fails closed for %s before Graph calls', async (_label, roles) => {
     const h = harness(roles);
     await expect(h.provider.list(USER)).rejects.toMatchObject({ code: 'provider_access_denied' });
@@ -79,5 +111,59 @@ describe('tenant-bound authentication methods provider', () => {
     h.fetch.mockResolvedValueOnce(response(methods)).mockResolvedValueOnce(response({}, 503));
     await expect(h.provider.remove(USER, { kind: 'phone', methodId: PHONE })).rejects.toMatchObject({ code: 'unknown_write_outcome' });
     expect(h.fetch).toHaveBeenCalledTimes(3);
+  });
+
+  it('creates a recovery email through the fixed Graph path and verifies the resulting address', async () => {
+    const h = harness();
+    h.fetch.mockResolvedValueOnce(response(methods))
+      .mockResolvedValueOnce(response({ id: '3ddfcfc8-9383-446f-83cc-3ab9be4be18f' }, 201))
+      .mockResolvedValueOnce(response({ value: [...methods.value, { '@odata.type': '#microsoft.graph.emailAuthenticationMethod', emailAddress: 'qa@example.net' }] }));
+    await expect(h.provider.setRecoveryEmail(USER, 'qa@example.net')).resolves.toEqual({ accepted: true, verified: true });
+    expect(h.fetch.mock.calls[2]).toEqual([`${ORIGIN}/users/${USER}/authentication/emailMethods`,
+      expect.objectContaining({ method: 'POST', body: JSON.stringify({ emailAddress: 'qa@example.net' }) })]);
+  });
+
+  it('updates the existing recovery email by its fixed ID and leaves uncertain readback unverified', async () => {
+    const h = harness();
+    h.fetch.mockResolvedValueOnce(response({ value: [{ '@odata.type': '#microsoft.graph.emailAuthenticationMethod', emailAddress: 'old@example.net' }] }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(response({ value: [{ '@odata.type': '#microsoft.graph.emailAuthenticationMethod', emailAddress: 'old@example.net' }] }));
+    await expect(h.provider.setRecoveryEmail(USER, 'new@example.net')).resolves.toEqual({ accepted: true, verified: false });
+    expect(h.fetch.mock.calls[2]).toEqual([`${ORIGIN}/users/${USER}/authentication/emailMethods/3ddfcfc8-9383-446f-83cc-3ab9be4be18f`,
+      expect.objectContaining({ method: 'PATCH', body: JSON.stringify({ emailAddress: 'new@example.net' }) })]);
+  });
+
+  it('rejects invalid recovery email before acquiring a token', async () => {
+    const h = harness();
+    await expect(h.provider.setRecoveryEmail(USER, 'not-an-email')).rejects.toMatchObject({ code: 'invalid_input' });
+    expect(h.fetch).not.toHaveBeenCalled();
+  });
+
+  it('creates a mobile phone through the fixed Graph collection and verifies its exact readback', async () => {
+    const h = harness();
+    h.fetch.mockResolvedValueOnce(response({ value: [] }))
+      .mockResolvedValueOnce(response({ id: PHONE }, 201))
+      .mockResolvedValueOnce(response({ id: PHONE, phoneType: 'mobile', phoneNumber: '+1 5555551234' }));
+    await expect(h.provider.setMobilePhone(USER, '+1 5555551234')).resolves.toEqual({ accepted: true, verified: true });
+    expect(h.fetch.mock.calls[2]).toEqual([`${ORIGIN}/users/${USER}/authentication/phoneMethods`,
+      expect.objectContaining({ method: 'POST', body: JSON.stringify({ phoneNumber: '+1 5555551234', phoneType: 'mobile' }) })]);
+    expect(h.fetch.mock.calls[3]).toEqual([`${ORIGIN}/users/${USER}/authentication/phoneMethods/${PHONE}`,
+      expect.objectContaining({ method: 'GET' })]);
+  });
+
+  it('updates an existing mobile phone without exposing the number in its result', async () => {
+    const h = harness();
+    h.fetch.mockResolvedValueOnce(response(methods))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(response({ id: PHONE, phoneType: 'mobile', phoneNumber: '+1 5555550000' }));
+    await expect(h.provider.setMobilePhone(USER, '+1 5555551234')).resolves.toEqual({ accepted: true, verified: false });
+    expect(h.fetch.mock.calls[2]).toEqual([`${ORIGIN}/users/${USER}/authentication/phoneMethods/${PHONE}`,
+      expect.objectContaining({ method: 'PATCH', body: JSON.stringify({ phoneNumber: '+1 5555551234', phoneType: 'mobile' }) })]);
+  });
+
+  it('rejects an invalid mobile phone before token acquisition', async () => {
+    const h = harness();
+    await expect(h.provider.setMobilePhone(USER, '555-1234')).rejects.toMatchObject({ code: 'invalid_input' });
+    expect(h.fetch).not.toHaveBeenCalled();
   });
 });

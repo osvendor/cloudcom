@@ -37,6 +37,17 @@ const { ctxState, dbState, partnerTrustMocks, agentWsMocks, commandDispatchMocks
   sentryMocks: { captureMessage: vi.fn() },
 }));
 
+// Holding-org delivery eligibility is its own read, proven against Postgres
+// in parkedCommandDelivery.integration.test.ts; kept out of this suite's
+// context-depth event trace.
+vi.mock('./unassignedPool/deliveryEligibility', async () => ({
+  ...(await vi.importActual<typeof import('./unassignedPool/deliveryEligibility')>(
+    './unassignedPool/deliveryEligibility',
+  )),
+  isParkedDevice: vi.fn(async () => false),
+  assertCommandDeliverable: vi.fn(async () => undefined),
+}));
+
 vi.mock('../db', () => ({
   db: {
     select: vi.fn(() => ({
@@ -110,6 +121,22 @@ vi.mock('../routes/agentWs', () => ({
   isAgentConnected: (...args: unknown[]) => agentWsMocks.isAgentConnected(...(args as [])),
 }));
 
+// #4142: commandQueue pushes through the relay facade. This bridge keeps the
+// agentWs mock above as the transport, so `wsSend@depth<n>` still records the
+// depth at which the push happens.
+vi.mock('./agentCommandRelay', async () => {
+  const ws = await import('../routes/agentWs');
+  return {
+    dispatchCommandToAgent: async (agentId: string, frame: unknown) => (
+      ws.sendCommandToAgent(agentId, frame as never) ? { status: 'sent', via: 'local' } : { status: 'offline' }
+    ),
+    agentReachability: async (agentId: string) => (ws.isAgentConnected(agentId) ? 'connected' : 'absent'),
+    dispatchDisposition: (o: { status: string }) => (
+      o.status === 'sent' ? 'delivered' : o.status === 'indeterminate' ? 'uncertain' : 'not_delivered'
+    ),
+  };
+});
+
 vi.mock('./commandDispatch', () => ({
   claimPendingCommandForDelivery: (...args: unknown[]) => {
     ctxState.events.push(`claim@depth${ctxState.depth}`);
@@ -136,7 +163,7 @@ vi.mock('./backupMetrics', () => ({
   recordRestoreTimeout: vi.fn(),
 }));
 
-import { executeCommand, executeCommandWithSystemPrecheck } from './commandQueue';
+import { executeCommand, executeCommandWithCallerPrecheck, executeCommandWithSystemPrecheck } from './commandQueue';
 import { TrustDeniedError } from './partnerTrust.commands';
 
 const ONLINE_DEVICE = {
@@ -163,7 +190,7 @@ beforeEach(() => {
   dbState.commandRows = [{ id: 'cmd-1', status: 'completed', type: 'list_services', result: { status: 'completed', stdout: '{}' } }];
   agentWsMocks.sendCommandToAgent.mockReturnValue(true);
   agentWsMocks.isAgentConnected.mockReturnValue(true);
-  commandDispatchMocks.claimPendingCommandForDelivery.mockResolvedValue({ executedAt: new Date() });
+  commandDispatchMocks.claimPendingCommandForDelivery.mockResolvedValue({ status: 'claimed', id: 'cmd-1', executedAt: new Date() });
 });
 
 describe('executeCommandWithSystemPrecheck (#4150/#1105)', () => {
@@ -319,6 +346,52 @@ describe('executeCommandWithSystemPrecheck (#4150/#1105)', () => {
   });
 });
 
+describe('executeCommandWithCallerPrecheck (#7918)', () => {
+  const CALLER_CTX = { scope: 'organization', orgId: 'org-1', accessibleOrgIds: ['org-1'] } as never;
+
+  it('prechecks in a SHORT context of the CALLER’s scope, then dispatches and waits holding nothing', async () => {
+    const { withDbAccessContext } = await import('../db');
+
+    const result = await executeCommandWithCallerPrecheck('device-1', 'list_services', {}, CALLER_CTX, { timeoutMs: 5_000 });
+
+    expect(result.status).toBe('completed');
+    // The precheck ran under the caller's tenant context, never system scope.
+    expect(withDbAccessContext).toHaveBeenCalledWith(CALLER_CTX, expect.any(Function));
+    expect(ctxState.events).toEqual([
+      'ctx:enter',
+      'select:devices@depth1',
+      'trustCheck@depth1',
+      'ctx:exit',
+      'ctx:enter',
+      'insert:device_commands@depth1',
+      'ctx:exit',
+      'claim@depth0',
+      'wsSend@depth0',
+      'select:device_commands@depth0',
+    ]);
+    expect(ctxState.depth).toBe(0);
+  });
+
+  it('reads a device outside the caller’s tenant as not found and dispatches nothing', async () => {
+    dbState.deviceRows = []; // what RLS returns for another tenant's device
+
+    const result = await executeCommandWithCallerPrecheck('device-1', 'list_services', {}, CALLER_CTX, { timeoutMs: 5_000 });
+
+    expect(result).toEqual({ status: 'failed', error: 'Device not found' });
+    expect(ctxState.events).toEqual(['ctx:enter', 'select:devices@depth1', 'ctx:exit']);
+  });
+
+  it('joins an ambient context instead of nesting one (plain executeCommand behaviour)', async () => {
+    ctxState.ambient = { scope: 'organization' };
+    const { withDbAccessContext } = await import('../db');
+
+    await executeCommandWithCallerPrecheck('device-1', 'list_services', {}, CALLER_CTX, { timeoutMs: 5_000 });
+
+    expect(withDbAccessContext).not.toHaveBeenCalled();
+    expect(ctxState.events.slice(0, 2)).toEqual(['select:devices@depth0', 'trustCheck@depth0']);
+  });
+});
+
 describe('executeCommand (unchanged by #4150)', () => {
   it('still runs its precheck in the CALLER’s context and opens none of its own', async () => {
     const result = await executeCommand('device-1', 'list_services', {}, { timeoutMs: 5_000 });
@@ -470,4 +543,69 @@ it('executeCommand preserves a caller-supplied command ID through committed inse
   expect(dbState.insertedCommand?.id).toBe(commandId);
   expect(result.commandId).toBe(commandId);
   expect(result.status).toBe('completed');
+});
+
+/**
+ * A backup write command's destination is resolved at delivery, on a
+ * connection of the delivery path's own — and a helper that reports brokered
+ * writes is only given a write session when that connection can see the
+ * command's backup job. Dispatching from inside a held context means the job
+ * the caller just inserted is still uncommitted, so delivery cannot see it and
+ * falls back to delivering the storage destination itself. The dispatch entry
+ * points therefore refuse a backup write from inside a context, before any row
+ * or socket send exists.
+ */
+describe('backup write dispatch requires the caller to have committed', () => {
+  const WRITE_PAYLOAD = { jobId: '22222222-2222-4222-8222-222222222222', provider: 'local' };
+
+  it.each(['mssql_backup', 'hyperv_backup'])(
+    'executeCommand refuses %s from inside a held context',
+    async (type) => {
+      ctxState.ambient = { scope: 'organization' };
+      ctxState.depth = 1;
+
+      await expect(executeCommand('device-1', type, WRITE_PAYLOAD, { timeoutMs: 5_000 }))
+        .rejects.toThrow(/after the transaction that created its backup job has committed/);
+      expect(dbState.insertedCommand).toBeNull();
+      expect(agentWsMocks.sendCommandToAgent).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(['mssql_backup', 'hyperv_backup'])(
+    'executeCommandWithSystemPrecheck refuses %s from inside a held context',
+    async (type) => {
+      ctxState.ambient = { scope: 'organization' };
+      ctxState.depth = 1;
+
+      await expect(executeCommandWithSystemPrecheck('device-1', type, WRITE_PAYLOAD, {
+        timeoutMs: 5_000,
+        expectedOrgId: 'org-1',
+      })).rejects.toThrow(/after the transaction that created its backup job has committed/);
+      expect(dbState.insertedCommand).toBeNull();
+      expect(agentWsMocks.sendCommandToAgent).not.toHaveBeenCalled();
+    },
+  );
+
+  it('dispatches a backup write from depth 0', async () => {
+    // Positive control: the refusal above must not be a refusal of every
+    // backup write.
+    dbState.commandRows = [{ id: 'cmd-1', status: 'completed', type: 'mssql_backup', result: { status: 'completed', stdout: '{}' } }];
+
+    const result = await executeCommandWithSystemPrecheck('device-1', 'mssql_backup', WRITE_PAYLOAD, {
+      timeoutMs: 5_000,
+      expectedOrgId: 'org-1',
+    });
+
+    expect(result.status).toBe('completed');
+    expect(dbState.insertedCommand).toMatchObject({ type: 'mssql_backup' });
+  });
+
+  it('leaves other command types dispatched from a held context alone', async () => {
+    ctxState.ambient = { scope: 'organization' };
+    ctxState.depth = 1;
+
+    const result = await executeCommand('device-1', 'list_services', {}, { timeoutMs: 5_000 });
+
+    expect(result.status).toBe('completed');
+  });
 });

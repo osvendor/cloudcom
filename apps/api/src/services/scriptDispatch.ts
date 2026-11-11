@@ -3,7 +3,13 @@ import { randomUUID } from 'node:crypto';
 import { and, eq, sql } from 'drizzle-orm';
 import { canonicalizeScriptParameters, hasVariableTokens } from '@breeze/shared';
 
-import { db, runOutsideDbContext, withSystemDbAccessContext } from '../db';
+import { db, runOutsideDbContext, withSystemDbAccessContext, withDbTransactionIfHeld } from '../db';
+import {
+  buildRestorePointRequest,
+  discardRestorePointRequest,
+  restorePointPayloadField,
+} from './restorePointRequest';
+import type { RestorePointRequestBlock } from '@breeze/shared';
 import { devices, organizations, scriptExecutions, scripts, sites, users } from '../db/schema';
 import type { ScriptProposalRow } from '../db/schema/scriptProposals';
 import type { ScriptApprovalMethod } from '@breeze/shared';
@@ -13,8 +19,9 @@ import {
   claimPendingCommandForDelivery,
   releaseClaimedCommandDelivery,
 } from './commandDispatch';
+import { cancelledCommandError } from './commandCancelMessage';
 import { CommandTypes, queueCommand } from './commandQueue';
-import { aiOriginColumns } from './aiOriginColumns';
+import { aiOriginAuditActor, aiOriginColumns } from './aiOriginColumns';
 import type { AiOriginRef } from '@breeze/shared';
 import { defaultOfflinePolicy, deliverByFor, type OfflinePolicy } from './commandOfflinePolicy';
 import {
@@ -22,8 +29,9 @@ import {
   toAgentCommandFrame,
   encryptSensitivePayloadFields,
 } from './sensitiveCommandPayload';
-import { sendCommandToAgent } from '../routes/agentWs';
+import { dispatchCommandToAgent, dispatchDisposition } from './agentCommandRelay';
 import { captureException } from './sentry';
+import { isParkedDevice, PARKED_DEVICE_COMMAND_REFUSAL_MESSAGE } from './unassignedPool/deliveryEligibility';
 import { createAuditLogAsync } from './auditService';
 import { checkScriptMaintenanceSuppression } from './scriptMaintenanceGate';
 import {
@@ -166,7 +174,32 @@ export type DispatchScriptInput = {
    * `device_commands.created_by`).
    */
   principalActorId?: string | null;
+  /**
+   * #3445 — create the execution + command rows but do NOT claim or send the
+   * command; return a `deliver()` continuation instead.
+   *
+   * For callers that dispatch inside a transaction that stays open after this
+   * function returns (the automation runtime holds the device row lock around
+   * it). The rows are INSERTed through the ambient transaction, and the agent
+   * result path reads `device_commands` on its own connection: a send before
+   * commit lets a fast agent answer while the rows are still invisible, the
+   * result is dropped as an orphan, and the execution is stranded until the
+   * stale reaper fails it at timeout + 5 min. Such a caller passes this flag
+   * and calls `deliver()` after its transaction commits.
+   */
+  deferDelivery?: boolean;
 };
+
+/** Why an attempted delivery did or did not reach the agent. */
+export type ScriptDeliveryOutcome =
+  | 'sent'
+  | 'claim_lost'
+  | 'decrypt_failed'
+  | 'send_failed'
+  // #4142: the relay could not confirm the frame reached the agent. The claim
+  // is kept; the result or the stale reaper settles the row. Not a failure.
+  | 'indeterminate'
+  | 'no_agent';
 
 export type DispatchScriptResult =
   | {
@@ -191,13 +224,22 @@ export type DispatchScriptResult =
       // 'agent_upgrade_required_recorded' refusal (see below), because every
       // caller branches on `ok` alone and would otherwise report a run that
       // had already been failed as successfully queued.
-      deliveryOutcome:
-        | 'sent'
-        | 'claim_lost'
-        | 'decrypt_failed'
-        | 'send_failed'
-        | 'no_agent';
+      //
+      // 'deferred' (#3445) is returned ONLY when the caller passed
+      // `deferDelivery: true`: nothing has been attempted yet, and the caller
+      // owns calling `deliver()` once its transaction has committed.
+      deliveryOutcome: ScriptDeliveryOutcome | 'deferred';
       executedAt: Date | null;
+      /**
+       * #3445 — present only for a `deferDelivery: true` dispatch. Claims the
+       * queued command, sends it over the agent's WebSocket, and marks the
+       * execution `running`, then resolves to the dispatch result with the real
+       * delivery fields. MUST be called with no ambient transaction (it opens
+       * its own short system contexts), after the transaction that created the
+       * rows has committed. It can resolve to an `ok: false` claim-time
+       * refusal, exactly as an immediate dispatch can.
+       */
+      deliver?: () => Promise<DispatchScriptResult>;
       // Bound parameter keys the caller supplied a value for (#3409 PR3
       // §2.2). The binding wins authoritatively and the supplied value is
       // dropped — reported rather than rejected, because a stored automation
@@ -217,6 +259,9 @@ export type DispatchScriptResult =
       ok: false;
       code:
         | 'device_decommissioned'
+        // The device is parked in a holding org, where only lifecycle removal
+        // is delivered. Refused before any row is written or secret sealed.
+        | 'device_pending_assignment'
         | 'device_offline'
         // #4919 — an active maintenance window with `suppressScripts`. The
         // operator's own schedule: every caller records this as a SKIP, keeps
@@ -285,7 +330,15 @@ export type DispatchScriptResult =
         //       stay OUT of DISPATCH_CODES_ALREADY_RECORDED, and its message
         //       must not blame an agent version that may be perfectly current.
         | 'agent_upgrade_required_recorded'
-        | 'secret_gate_unavailable';
+        | 'secret_gate_unavailable'
+        // The push's claim-time eligibility check (the same one the heartbeat
+        // claim runs: requester still active, device still in the org it was
+        // queued for, lifecycle, partner trust, …) refused the command and,
+        // in the same transaction, cancelled it AND its execution row (batch
+        // counters included). Row ownership matches
+        // 'agent_upgrade_required_recorded': a fan-out records it WITHOUT
+        // writing its own failure row. `error` carries the reason.
+        | 'delivery_cancelled_recorded';
       error: string;
     };
 
@@ -296,6 +349,13 @@ export async function dispatchScriptToDevice(input: DispatchScriptInput): Promis
   // live re-read needed.
   if (device.status === 'decommissioned') {
     return { ok: false, code: 'device_decommissioned', error: 'Device is decommissioned' };
+  }
+  // A device parked in a holding org receives lifecycle removal only — never a
+  // script. Live read (the org type is not on the caller's snapshot), ahead of
+  // the maintenance gate and every write, so no execution row is created and
+  // no secret is sealed for it.
+  if (await isParkedDevice(db, device.id)) {
+    return { ok: false, code: 'device_pending_assignment', error: PARKED_DEVICE_COMMAND_REFUSAL_MESSAGE };
   }
   // #4919 — before the liveness read and before any row is written. Ordered
   // ahead of the offline gate deliberately: "we would not have run this
@@ -631,10 +691,10 @@ export async function dispatchScriptToDevice(input: DispatchScriptInput): Promis
   const discardPendingExecution = async (reason: string) => {
     if (!executionId) return;
     try {
-      const deleted = await db
+      const deleted = await withDbTransactionIfHeld(() => db
         .delete(scriptExecutions)
         .where(and(eq(scriptExecutions.id, executionId), eq(scriptExecutions.status, 'pending')))
-        .returning({ id: scriptExecutions.id });
+        .returning({ id: scriptExecutions.id }));
       if (deleted.length === 0) {
         console.warn(
           '[scriptDispatch] execution row was not pending at discard time; leaving it alone',
@@ -653,6 +713,7 @@ export async function dispatchScriptToDevice(input: DispatchScriptInput): Promis
   let payload: Record<string, unknown>;
   let command: Awaited<ReturnType<typeof queueCommand>>;
   let stage: 'payload build' | 'queueCommand' = 'payload build';
+  let restorePoint: RestorePointRequestBlock | null = null;
   try {
     // Payload build lives inside this guarded region (not after it) so a seal
     // failure — #3409 PR4a made the 'script' entry real — also discards the
@@ -664,6 +725,22 @@ export async function dispatchScriptToDevice(input: DispatchScriptInput): Promis
     // Live since PR4c-2: `secretEnv` is set for `tenantSecret` parameters and
     // sealed here into `secretEnvEnvelope`; without one this is a passthrough.
     const reservedCommandId = randomUUID();
+    // #4609 W05: the System Restore checkpoint decision, resolved inside this
+    // guarded region so a resolution failure also discards the pending
+    // execution row. Stamped BEFORE encryption; the block carries no secret
+    // material and the encryptor passes it through untouched. Null (no
+    // policy, toggle off, non-Windows) adds no key at all.
+    restorePoint = await buildRestorePointRequest({
+      deviceId: device.id,
+      orgId: device.orgId,
+      osType: device.osType,
+      trigger: 'script',
+      label: source.kind === 'saved' ? `run script ${source.script.name}`
+        : source.kind === 'proposal' ? 'run reviewed script'
+          : 'run command',
+      deviceCommandId: reservedCommandId,
+      scriptExecutionId: executionId,
+    });
     payload = encryptSensitivePayloadFields('script', {
       scriptId: payloadScriptId,
       ...(executionId ? { executionId } : {}),
@@ -696,6 +773,7 @@ export async function dispatchScriptToDevice(input: DispatchScriptInput): Promis
       // agent already treats as fail-closed.
       ...(acknowledgedSecurityPatterns.length > 0 ? { acknowledgedSecurityPatterns } : {}),
       ...(input.targetSessionId != null ? { targetSessionId: input.targetSessionId } : {}),
+      ...restorePointPayloadField(restorePoint),
     }, { commandId: reservedCommandId, deviceId: device.id });
     stage = 'queueCommand';
     command = await queueCommand(device.id, 'script', payload, safeCreatedBy ?? undefined, {
@@ -723,120 +801,206 @@ export async function dispatchScriptToDevice(input: DispatchScriptInput): Promis
     });
   } catch (err) {
     await discardPendingExecution(`${stage} threw`);
+    await discardRestorePointRequest(restorePoint);
     throw err;
   }
   if (!command) {
     await discardPendingExecution('queueCommand returned no row');
+    await discardRestorePointRequest(restorePoint);
     return { ok: false, code: 'insert_failed', error: 'Failed to create command' };
   }
 
-  let delivered = false;
-  let executedAt: Date | null = null;
-  let deliveryOutcome:
-    | 'sent'
-    | 'claim_lost'
-    | 'decrypt_failed'
-    | 'send_failed'
-    | 'no_agent' = 'no_agent';
-  if (device.agentId) {
-    const claimed = await claimPendingCommandForDelivery(command.id);
-    if (claimed) {
-      // #3409 PR4c-2: the immediate-send path claims the command itself and
-      // hands it straight to the WS, bypassing
-      // `prepareClaimedCommandsForDelivery` — so the claim-time gate has to
-      // run HERE too, or a device whose agent lost the capability between the
-      // preflight above and this claim would receive the script with the
-      // credential unset. Only the secret-bearing path pays for it.
-      //
-      // A `[]` return means the gate already drove the command AND its
-      // execution row terminal: do not send, and do NOT release the claim
-      // back to pending (an incapable agent would just re-claim it).
-      //
-      // The gate's own try/catch covers only its writes — the capability
-      // SELECT (and its multi-device contract-violation throw) propagates
-      // out of here. Left bare that would escape AFTER
-      // `claimPendingCommandForDelivery` already flipped the row to 'sent',
-      // 500 the caller, and abort a large fan-out mid-run. So a throw fails
-      // CLOSED (never decrypt, never send) and returns a per-device refusal
-      // so the fan-out continues — but under its OWN code
-      // ('secret_gate_unavailable'), not the capability one: nothing was
-      // written on that path, and the agent may be perfectly current. The
-      // command row is deliberately LEFT 'sent' with its envelope intact for
-      // the stale-command reaper to strip — this path cannot know whether the
-      // gate's terminal write landed, and writing over it blind could clobber
-      // a row something else already moved.
-      // `false` = deliver; a code = refuse with it. Distinct values because
-      // the two refusals differ in whether rows were already written.
-      let gated: false | 'agent_upgrade_required_recorded' | 'secret_gate_unavailable' = false;
-      if (hasSecrets) {
-        try {
-          const survivors = await failClaimedSecretCommandsForUnsupportedAgent([
-            {
-              id: command.id,
-              type: 'script',
+  // Claim → claim-time secret gate → JIT decrypt → WS send → mark running.
+  // Runs inline for an ordinary dispatch, or later through `deliver()` for a
+  // `deferDelivery` one (#3445).
+  const commandId = command.id;
+  const deliverPayload = payload;
+  const deliverNow = async (): Promise<
+    | Extract<DispatchScriptResult, { ok: false }>
+    | { ok: true; delivered: boolean; deliveryOutcome: ScriptDeliveryOutcome; executedAt: Date | null }
+  > => {
+    let delivered = false;
+    let executedAt: Date | null = null;
+    let deliveryOutcome: ScriptDeliveryOutcome = 'no_agent';
+    if (device.agentId) {
+      const claimed = await claimPendingCommandForDelivery(commandId);
+      if (claimed.status === 'cancelled') {
+        return { ok: false, code: 'delivery_cancelled_recorded', error: cancelledCommandError(claimed.reason) };
+      }
+      if (claimed.status === 'claimed') {
+        // #3409 PR4c-2: the immediate-send path claims the command itself and
+        // hands it straight to the WS, bypassing
+        // `prepareClaimedCommandsForDelivery` — so the claim-time gate has to
+        // run HERE too, or a device whose agent lost the capability between the
+        // preflight above and this claim would receive the script with the
+        // credential unset. Only the secret-bearing path pays for it.
+        //
+        // A `[]` return means the gate already drove the command AND its
+        // execution row terminal: do not send, and do NOT release the claim
+        // back to pending (an incapable agent would just re-claim it).
+        //
+        // The gate's own try/catch covers only its writes — the capability
+        // SELECT (and its multi-device contract-violation throw) propagates
+        // out of here. Left bare that would escape AFTER
+        // `claimPendingCommandForDelivery` already flipped the row to 'sent',
+        // 500 the caller, and abort a large fan-out mid-run. So a throw fails
+        // CLOSED (never decrypt, never send) and returns a per-device refusal
+        // so the fan-out continues — but under its OWN code
+        // ('secret_gate_unavailable'), not the capability one: nothing was
+        // written on that path, and the agent may be perfectly current. The
+        // command row is deliberately LEFT 'sent' with its envelope intact for
+        // the stale-command reaper to strip — this path cannot know whether the
+        // gate's terminal write landed, and writing over it blind could clobber
+        // a row something else already moved.
+        // `false` = deliver; a code = refuse with it. Distinct values because
+        // the two refusals differ in whether rows were already written.
+        let gated: false | 'agent_upgrade_required_recorded' | 'secret_gate_unavailable' = false;
+        if (hasSecrets) {
+          try {
+            // Own system context: a no-op when a caller's context is already
+            // held (the immediate path), and the write's context when deliver()
+            // runs after the caller committed (#3445).
+            const survivors = await withSystemDbAccessContext(() => failClaimedSecretCommandsForUnsupportedAgent([
+              {
+                id: commandId,
+                type: 'script',
+                deviceId: device.id,
+                payload: deliverPayload,
+                executedAt: claimed.executedAt,
+              },
+            ]));
+            gated = survivors.length === 0 ? 'agent_upgrade_required_recorded' : false;
+          } catch (gateErr) {
+            // ids only — never the payload, sealed or otherwise.
+            console.error('[scriptDispatch] secret claim gate threw; refusing delivery', {
+              commandId,
               deviceId: device.id,
-              payload,
-              executedAt: claimed.executedAt,
-            },
-          ]);
-          gated = survivors.length === 0 ? 'agent_upgrade_required_recorded' : false;
-        } catch (gateErr) {
-          // ids only — never the payload, sealed or otherwise.
-          console.error('[scriptDispatch] secret claim gate threw; refusing delivery', {
-            commandId: command.id,
-            deviceId: device.id,
-            executionId,
-            error: gateErr instanceof Error ? gateErr.message : String(gateErr),
-          });
-          captureException(gateErr);
-          // NOT the capability refusal: this branch wrote nothing, and the
-          // agent may be perfectly current. A distinct code keeps it out of
-          // DISPATCH_CODES_ALREADY_RECORDED (so the device still gets its
-          // failure row) and off the "go upgrade your agent" remediation.
-          gated = 'secret_gate_unavailable';
+              executionId,
+              error: gateErr instanceof Error ? gateErr.message : String(gateErr),
+            });
+            captureException(gateErr);
+            // NOT the capability refusal: this branch wrote nothing, and the
+            // agent may be perfectly current. A distinct code keeps it out of
+            // DISPATCH_CODES_ALREADY_RECORDED (so the device still gets its
+            // failure row) and off the "go upgrade your agent" remediation.
+            gated = 'secret_gate_unavailable';
+          }
         }
-      }
-      if (gated) {
-        return gated === 'agent_upgrade_required_recorded'
-          ? { ok: false, code: gated, error: AGENT_UPGRADE_REQUIRED_MESSAGE }
-          : { ok: false, code: gated, error: SECRET_GATE_UNAVAILABLE_MESSAGE };
-      }
-      const deliverable = decryptCommandForDelivery({
-        id: command.id,
-        type: 'script',
-        deviceId: device.id,
-        payload,
-      });
-      const sent = deliverable
-        ? sendCommandToAgent(device.agentId, toAgentCommandFrame(deliverable))
-        : false;
-      if (sent) {
-        delivered = true;
-        deliveryOutcome = 'sent';
-        executedAt = claimed.executedAt;
-        if (executionId) {
-          // Guarded on pending: a fast agent can already have driven the row
-          // terminal (see handleScriptResult in services/commandResultHandlers.ts).
-          await db
-            .update(scriptExecutions)
-            .set({ status: 'running', startedAt: claimed.executedAt })
-            .where(and(eq(scriptExecutions.id, executionId), eq(scriptExecutions.status, 'pending')));
+        if (gated) {
+          return gated === 'agent_upgrade_required_recorded'
+            ? { ok: false, code: gated, error: AGENT_UPGRADE_REQUIRED_MESSAGE }
+            : { ok: false, code: gated, error: SECRET_GATE_UNAVAILABLE_MESSAGE };
+        }
+        const deliverable = decryptCommandForDelivery({
+          id: commandId,
+          type: 'script',
+          deviceId: device.id,
+          payload: deliverPayload,
+        });
+        // #4142: through the relay facade, which never rejects by contract and
+        // answers for an agent on another instance. delivered -> as before;
+        // uncertain -> the frame may be out, so KEEP the claim (never release,
+        // never retry) and let the agent's result or the reaper settle it;
+        // not_delivered -> hand the claim back, as the old `false` did.
+        let disposition: 'delivered' | 'uncertain' | 'not_delivered' = 'not_delivered';
+        if (deliverable) {
+          try {
+            // #8318 §6.4: to the agent_id read IN the claim, not `device.agentId`
+            // read before it (a reattach or re-enroll may have committed since).
+            disposition = dispatchDisposition(
+              await dispatchCommandToAgent(claimed.agentId, toAgentCommandFrame(deliverable)),
+            );
+          } catch (sendErr) {
+            // Contract violation (the facade never rejects). The frame may
+            // already be on the wire, so releasing the claim could let a second
+            // delivery race the first: KEEP the claim, report, and propagate.
+            // The row stays 'sent'; the agent's result or the stale reaper
+            // settles it.
+            console.error('[scriptDispatch] relay facade rejected; keeping the delivery claim', {
+              commandId,
+              deviceId: device.id,
+              error: sendErr instanceof Error ? sendErr.message : String(sendErr),
+            });
+            captureException(sendErr);
+            throw sendErr;
+          }
+        }
+        if (disposition === 'delivered') {
+          delivered = true;
+          deliveryOutcome = 'sent';
+          executedAt = claimed.executedAt;
+          if (executionId) {
+            // Guarded on pending: a fast agent can already have driven the row
+            // terminal (see handleScriptResult in services/commandResultHandlers.ts).
+            // Same context rule as the secret gate above.
+            //
+            // The command is already on the wire, so a failure here is
+            // bookkeeping, not a delivery failure: report it and still return
+            // `delivered`. The agent's result closes the row either way —
+            // handleScriptResult's CAS accepts `pending` too.
+            const runningAt = claimed.executedAt;
+            const runningExecutionId = executionId;
+            try {
+              await withSystemDbAccessContext(() => db
+                .update(scriptExecutions)
+                .set({ status: 'running', startedAt: runningAt })
+                .where(and(eq(scriptExecutions.id, runningExecutionId), eq(scriptExecutions.status, 'pending'))));
+            } catch (runningErr) {
+              console.error('[scriptDispatch] failed to mark a delivered execution running', {
+                commandId,
+                executionId: runningExecutionId,
+                error: runningErr instanceof Error ? runningErr.message : String(runningErr),
+              });
+              captureException(runningErr);
+            }
+          }
+        } else if (disposition === 'uncertain') {
+          // The relay could not tell us whether the frame reached the agent.
+          // Not delivered as far as we can report, not failed either: the claim
+          // stays (no release, no retry) and the execution is NOT stamped
+          // running. The agent's result (handleScriptResult accepts
+          // pending/queued/running) or the stale reaper settles it.
+          deliveryOutcome = 'indeterminate';
+        } else {
+          // We had a claimed command and a connected agent and still failed to
+          // reach it — operationally different from the normal "no agent
+          // connected, queued for later" case, so this is worth a log line.
+          deliveryOutcome = deliverable ? 'send_failed' : 'decrypt_failed';
+          console.warn('[scriptDispatch] failed to deliver claimed command to connected agent', {
+            commandId,
+            deviceId: device.id,
+            deliveryOutcome,
+          });
+          await releaseClaimedCommandDelivery(commandId, claimed.executedAt);
         }
       } else {
-        // We had a claimed command and a connected agent and still failed to
-        // reach it — operationally different from the normal "no agent
-        // connected, queued for later" case, so this is worth a log line.
-        deliveryOutcome = deliverable ? 'send_failed' : 'decrypt_failed';
-        console.warn('[scriptDispatch] failed to deliver claimed command to connected agent', {
-          commandId: command.id,
-          deviceId: device.id,
-          deliveryOutcome,
-        });
-        await releaseClaimedCommandDelivery(command.id, claimed.executedAt);
+        deliveryOutcome = 'claim_lost';
       }
-    } else {
-      deliveryOutcome = 'claim_lost';
     }
+    return { ok: true, delivered, deliveryOutcome, executedAt };
+  };
+
+  const settle = (
+    attempt: Awaited<ReturnType<typeof deliverNow>>,
+  ): DispatchScriptResult => (attempt.ok
+    ? {
+      ok: true,
+      commandId,
+      executionId,
+      delivered: attempt.delivered,
+      deliveryOutcome: attempt.deliveryOutcome,
+      executedAt: attempt.executedAt,
+      deliverBy,
+      ignoredParameters,
+      runAs,
+      targetSessionId: input.targetSessionId ?? null,
+    }
+    : attempt);
+
+  let immediate: DispatchScriptResult | null = null;
+  if (!input.deferDelivery) {
+    immediate = settle(await deliverNow());
+    if (!immediate.ok) return immediate;
   }
 
   // #5022 / W05: an AI-authored (proposal-backed) run writes its own audit
@@ -861,22 +1025,27 @@ export async function dispatchScriptToDevice(input: DispatchScriptInput): Promis
     // source.proposal.authorKind while actorId came from the invoker, so an
     // AI-AUTHORED script hand-run by a human wrote actor_type='ai_agent'
     // against a HUMAN user id.) Authorship is a separate fact and now lives in
-    // `details.authorKind`.
-    const principalIsAgent = input.aiOrigin?.kind === 'ai_agent';
-    const auditActorType = principalIsAgent ? ('ai_agent' as const) : ('user' as const);
-    const auditActorId = principalIsAgent
-      ? (input.principalActorId ?? SYSTEM_ACTOR_ID)
-      : (safeCreatedBy ?? safeTriggeredBy ?? SYSTEM_ACTOR_ID);
+    // `details.authorKind`. Tool catalog W04 (#5219), Decision 16: the shared
+    // mapping makes a flow origin system automation carrying its run.
+    const humanActorId = safeCreatedBy ?? safeTriggeredBy;
+    const actor = input.aiOrigin
+      ? aiOriginAuditActor(input.aiOrigin, { agentActorId: input.principalActorId, humanActorId })
+      : {
+        actorType: 'user' as const,
+        actorId: humanActorId ?? SYSTEM_ACTOR_ID,
+        initiatedBy: 'ai' as const,
+        originDetails: aiOriginColumns(undefined),
+      };
     void createAuditLogAsync({
       trigger: input.trigger,
       orgId: device.orgId,
-      actorType: auditActorType,
-      actorId: auditActorId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
       action: 'ai.script.executed',
       resourceType: 'device',
       resourceId: device.id,
       resourceName: device.hostname,
-      initiatedBy: 'ai',
+      initiatedBy: actor.initiatedBy,
       result: 'dispatched',
       details: {
         executionId,
@@ -890,7 +1059,7 @@ export async function dispatchScriptToDevice(input: DispatchScriptInput): Promis
         // arm indexes); `deviceId` is set as well so the feed's details arm can
         // also find it.
         deviceId: device.id,
-        ...aiOriginColumns(input.aiOrigin),
+        ...actor.originDetails,
         approvalMethod: input.provenance?.approvalMethod ?? null,
         reviewRiskTier: input.provenance?.reviewRiskTier ?? null,
         reviewSummary: input.provenance?.reviewSummary ?? null,
@@ -898,7 +1067,24 @@ export async function dispatchScriptToDevice(input: DispatchScriptInput): Promis
     });
   }
 
-  return { ok: true, commandId: command.id, executionId, delivered, deliveryOutcome, executedAt, deliverBy, ignoredParameters, runAs, targetSessionId: input.targetSessionId ?? null };
+  if (immediate) return immediate;
+  // Deferred (#3445): the rows exist but nothing has been attempted. The AI
+  // audit row above is written now rather than after delivery (#7103: the AI
+  // run_script paths defer too). Its `result: 'dispatched'` means "the command
+  // exists", which is true from here on whether or not the send succeeds.
+  return {
+    ok: true,
+    commandId,
+    executionId,
+    delivered: false,
+    deliveryOutcome: 'deferred',
+    executedAt: null,
+    deliverBy,
+    ignoredParameters,
+    runAs,
+    targetSessionId: input.targetSessionId ?? null,
+    deliver: async () => settle(await deliverNow()),
+  };
 }
 
 // #3826 Wave 4A Task 3: reserved sidecar key for the users-FK probe-and-degrade

@@ -5,7 +5,10 @@
  * Each tool wraps existing DB schema with org-scoped isolation.
  */
 
-import { db } from '../db';
+import { pgErrorCode } from '@breeze/shared/pgErrors';
+import { db, withDbTransactionIfHeld } from '../db';
+
+const PG_UNDEFINED_TABLE = '42P01';
 import {
   networkMonitors,
   networkMonitorResults,
@@ -23,6 +26,7 @@ import {
   runFrozenDeviceIds,
   SITE_SCOPE_EMPTY_NOTE,
 } from './aiToolsSiteScope';
+import { presentEndpointTarget, scrubUrlsInText, scrubUrlsInValue } from '../utils/endpointDisplay';
 
 type MonitoringHandler = (input: Record<string, unknown>, auth: AuthContext) => Promise<string>;
 
@@ -32,6 +36,26 @@ type MonitoringHandler = (input: Record<string, unknown>, auth: AuthContext) => 
 
 function getOrgId(auth: AuthContext): string | null {
   return auth.orgId ?? auth.accessibleOrgIds?.[0] ?? null;
+}
+
+// Monitor targets and agent error text can carry endpoint credentials (URL
+// userinfo, `?token=` queries, authorizing path segments). Tool results show
+// a URL as scheme + host plus a fingerprint, and every URL inside free text
+// as its origin. Applied on output too because rows stored before ingest-time
+// scrubbing still hold the full URL.
+function presentMonitorTarget<T extends { target?: unknown }>(row: T): T & { targetFingerprint?: string | null } {
+  if (typeof row.target !== 'string') return row;
+  const view = presentEndpointTarget(row.target);
+  return { ...row, target: view.target, targetFingerprint: view.fingerprint };
+}
+
+function presentMonitorRow<T extends { target?: unknown; config?: unknown; lastError?: unknown }>(row: T) {
+  const presented = presentMonitorTarget(row);
+  return {
+    ...presented,
+    ...('config' in row ? { config: scrubUrlsInValue(row.config) } : {}),
+    ...('lastError' in row ? { lastError: typeof row.lastError === 'string' ? scrubUrlsInText(row.lastError) : row.lastError } : {}),
+  };
 }
 
 function orgWhere(auth: AuthContext, orgIdCol: ReturnType<typeof sql.raw> | any): SQL | undefined {
@@ -100,7 +124,9 @@ export function registerMonitoringTools(aiTools: Map<string, AiTool>): void {
       if (typeof input.search === 'string' && input.search.trim()) {
         const term = input.search.trim().replace(/[\\%_]/g, '\\$&');
         conditions.push(
-          sql`(${networkMonitors.name} ILIKE ${'%' + term + '%'} OR ${networkMonitors.target} ILIKE ${'%' + term + '%'})`
+          // Target is matched on its host part only, so the search cannot be
+          // used to probe a stored URL's path, query or userinfo.
+          sql`(${networkMonitors.name} ILIKE ${'%' + term + '%'} OR substring(${networkMonitors.target} from '^(?:[A-Za-z][A-Za-z0-9+.-]*://)?(?:[^/?#]*@)?([^/?#]*)') ILIKE ${'%' + term + '%'})`
         );
       }
 
@@ -147,6 +173,7 @@ export function registerMonitoringTools(aiTools: Map<string, AiTool>): void {
         consecutiveFailures: networkMonitors.consecutiveFailures,
         pollingInterval: networkMonitors.pollingInterval,
         assetId: networkMonitors.assetId,
+        managedByMonitorId: networkMonitors.managedByMonitorId,
       };
 
       // Unrestricted callers take the exact pre-existing query (no join).
@@ -183,7 +210,7 @@ export function registerMonitoringTools(aiTools: Map<string, AiTool>): void {
         monitors: rows.map((row) => {
           const r = row.assetId ? reachabilityByAsset.get(row.assetId) : undefined;
           return {
-            ...row,
+            ...presentMonitorTarget(row),
             assetReachability: r ? { state: r.state, source: r.source, observedAt: r.observedAt } : null,
           };
         }),
@@ -193,37 +220,69 @@ export function registerMonitoringTools(aiTools: Map<string, AiTool>): void {
   });
 
   // ============================================
-  // 2. manage_monitors — CRUD + history
+  // 2. manage_monitors — Details + history
   // ============================================
 
   registerTool({
     tier: 1,
     domain: 'monitoring',
-    searchHint: 'network monitors: get check history, create, update, delete',
+    searchHint: 'network checks: get check history and monitor definition ownership',
     definition: {
       name: 'manage_monitors',
-      description: 'Get monitor details with recent check history, or create/update/delete monitors. Actions: get, create, update, delete.',
+      description: 'Actions: get, create, update, delete. Only get is supported, returning a network check and recent results; writes are retired. Author checks with manage_monitor_definitions (kind network_check). Retire unconverted checks through the conversion ledger to preserve history.',
       input_schema: {
         type: 'object' as const,
         properties: {
           action: { type: 'string', enum: ['get', 'create', 'update', 'delete'], description: 'The action to perform' },
           monitorId: { type: 'string', description: 'Monitor UUID (required for get/update/delete)' },
-          assetId: { type: 'string', description: 'Discovered-asset UUID to bind the monitor to (sets its site scope). Required for site-restricted users on create.' },
-          name: { type: 'string', description: 'Monitor name (for create/update)' },
-          monitorType: { type: 'string', description: 'Monitor type: icmp_ping, tcp_port, http_check, dns_check (for create)' },
-          target: { type: 'string', description: 'Target host/URL (for create/update)' },
-          pollingInterval: { type: 'number', description: 'Polling interval in seconds (for create/update)' },
-          timeout: { type: 'number', description: 'Timeout in seconds (for create/update)' },
-          config: { type: 'object', description: 'Monitor-specific configuration (for create/update)' },
-          isActive: { type: 'boolean', description: 'Enable or disable the monitor (for create/update)' },
-          limit: { type: 'number', description: 'Max recent check results to return (for get, default 50)' },
+          assetId: { type: 'string', description: 'Discovered-asset UUID (retired — use manage_monitor_definitions with condition.assetId)' },
+          name: { type: 'string', description: 'Monitor name (retired — use manage_monitor_definitions)' },
+          monitorType: { type: 'string', description: 'Monitor type: icmp_ping, tcp_port, http_check, dns_check (retired — use manage_monitor_definitions)' },
+          target: { type: 'string', description: 'Target host/URL (retired — use manage_monitor_definitions)' },
+          pollingInterval: { type: 'number', description: 'Polling interval in seconds (retired — use manage_monitor_definitions)' },
+          timeout: { type: 'number', description: 'Timeout in seconds (retired — use manage_monitor_definitions)' },
+          config: { type: 'object', description: 'Monitor-specific configuration (retired — use manage_monitor_definitions)' },
+          isActive: { type: 'boolean', description: 'Enable or disable the monitor (retired — use manage_monitor_definitions)' },
+          limit: { type: 'number', description: 'Max recent check results for get (default 50, max 100)' },
+          orgId: {
+            type: 'string',
+            description: 'Organization UUID (retired — use manage_monitor_definitions)',
+          },
         },
         required: ['action'],
       },
     },
     handler: safeHandler('manage_monitors', async (input, auth) => {
       const action = input.action as string;
-      const orgId = getOrgId(auth);
+
+      // Keep legacy actions in the schema so older prompts receive guidance.
+      if (action === 'delete') {
+        return JSON.stringify({
+          error: 'network_check_cleanup_retired',
+          message: 'Retire this check through the conversion ledger; history must be retained.',
+          hint: {
+            route: 'POST /monitor-definitions/conversion/retire',
+            sourceTable: 'network_monitors', sourceId: input.monitorId, reason: 'operator',
+          },
+        });
+      }
+      if (action === 'create' || action === 'update') {
+        return JSON.stringify({
+          error: 'network_check_authoring_retired',
+          message: 'Network checks are authored as monitor definitions. Call manage_monitor_definitions with kind "network_check"; bind it to a discovered asset with condition.assetId to pin the probe to the asset\'s site and alert on its device.',
+          useTool: 'manage_monitor_definitions',
+          example: {
+            action: 'create',
+            definition: {
+              kind: 'network_check', name: 'Gateway reachable', severity: 'high',
+              condition: {
+                checkType: 'icmp_ping', target: '10.0.0.1',
+                assetId: '<optional asset uuid>', consecutiveFailures: 2,
+              },
+            },
+          },
+        });
+      }
 
       /**
        * Site-axis check for a loaded monitor (app-layer; RLS does NOT enforce
@@ -304,119 +363,15 @@ export function registerMonitoringTools(aiTools: Map<string, AiTool>): void {
         }).from(networkMonitorAlertRules)
           .where(eq(networkMonitorAlertRules.monitorId, monitor.id));
 
-        return JSON.stringify({ monitor, recentResults: results, alertRules: rules });
-      }
-
-      if (action === 'create') {
-        if (!orgId) return JSON.stringify({ error: 'Organization context required' });
-        if (!input.name) return JSON.stringify({ error: 'name is required' });
-        if (!input.monitorType) return JSON.stringify({ error: 'monitorType is required' });
-        if (!input.target) return JSON.stringify({ error: 'target is required' });
-
-        const assetId = typeof input.assetId === 'string' && input.assetId ? input.assetId : null;
-
-        // Validate the asset binding belongs to the caller's org (fail closed
-        // on a cross-org assetId) before it can set the monitor's site scope.
-        if (assetId) {
-          const [asset] = await db
-            .select({ id: discoveredAssets.id })
-            .from(discoveredAssets)
-            .where(and(eq(discoveredAssets.id, assetId), eq(discoveredAssets.orgId, orgId)))
-            .limit(1);
-          if (!asset) return JSON.stringify({ error: 'Asset not found or access denied' });
-        }
-
-        // Site-axis gate on create (SR5-08): a site-restricted caller MUST bind
-        // the monitor to an asset in a site they can access. Fail closed if
-        // unbound — an assetless monitor has no site, and the worker would then
-        // pick an arbitrary org agent to probe an arbitrary target across sites.
-        // Unrestricted callers pass regardless (assertMonitorSiteAccess short-
-        // circuits when auth.canAccessSite is undefined).
-        if (!(await assertMonitorSiteAccess({ id: 'new', assetId, orgId }))) {
-          return JSON.stringify({
-            error:
-              'Site-restricted users must bind the monitor to an asset in an accessible site (provide assetId).',
-          });
-        }
-
-        const [monitor] = await db.insert(networkMonitors).values({
-          orgId,
-          assetId,
-          name: input.name as string,
-          monitorType: input.monitorType as 'icmp_ping' | 'tcp_port' | 'http_check' | 'dns_check',
-          target: input.target as string,
-          config: (input.config as Record<string, unknown>) ?? {},
-          pollingInterval: typeof input.pollingInterval === 'number' ? input.pollingInterval : 60,
-          timeout: typeof input.timeout === 'number' ? input.timeout : 5,
-          isActive: typeof input.isActive === 'boolean' ? input.isActive : true,
-        }).returning();
-
-        return JSON.stringify({ success: true, monitorId: monitor?.id, name: monitor?.name });
-      }
-
-      if (action === 'update') {
-        if (!input.monitorId) return JSON.stringify({ error: 'monitorId is required' });
-
-        const conditions: SQL[] = [eq(networkMonitors.id, input.monitorId as string)];
-        const oc = orgWhere(auth, networkMonitors.orgId);
-        if (oc) conditions.push(oc);
-
-        const [existing] = await db.select().from(networkMonitors).where(and(...conditions)).limit(1);
-        if (!existing) return JSON.stringify({ error: 'Monitor not found or access denied' });
-
-        // Site-axis gate — deny same as "not found" (no oracle).
-        if (!(await assertMonitorSiteAccess(existing))) {
-          return JSON.stringify({ error: 'Monitor not found or access denied' });
-        }
-
-        // #5291 W04 — a compiled `network_check` row is owned by the monitor
-        // compiler; a side edit here would survive only until the next compile.
-        if (existing.managedByMonitorId) {
-          return JSON.stringify({
-            error: 'network_monitor_managed_by_monitor',
-            monitorId: existing.managedByMonitorId,
-          });
-        }
-
-        const updates: Record<string, unknown> = { updatedAt: new Date() };
-        if (typeof input.name === 'string') updates.name = input.name;
-        if (typeof input.target === 'string') updates.target = input.target;
-        if (typeof input.pollingInterval === 'number') updates.pollingInterval = input.pollingInterval;
-        if (typeof input.timeout === 'number') updates.timeout = input.timeout;
-        if (input.config !== undefined) updates.config = input.config;
-        if (typeof input.isActive === 'boolean') updates.isActive = input.isActive;
-
-        await db.update(networkMonitors).set(updates).where(eq(networkMonitors.id, existing.id));
-        return JSON.stringify({ success: true, message: `Monitor "${existing.name}" updated` });
-      }
-
-      if (action === 'delete') {
-        if (!input.monitorId) return JSON.stringify({ error: 'monitorId is required' });
-
-        const conditions: SQL[] = [eq(networkMonitors.id, input.monitorId as string)];
-        const oc = orgWhere(auth, networkMonitors.orgId);
-        if (oc) conditions.push(oc);
-
-        const [existing] = await db.select().from(networkMonitors).where(and(...conditions)).limit(1);
-        if (!existing) return JSON.stringify({ error: 'Monitor not found or access denied' });
-
-        // Site-axis gate — deny same as "not found" (no oracle).
-        if (!(await assertMonitorSiteAccess(existing))) {
-          return JSON.stringify({ error: 'Monitor not found or access denied' });
-        }
-
-        // #5291 W04 — a compiled `network_check` row is owned by the monitor
-        // compiler; a side edit here would survive only until the next compile.
-        if (existing.managedByMonitorId) {
-          return JSON.stringify({
-            error: 'network_monitor_managed_by_monitor',
-            monitorId: existing.managedByMonitorId,
-          });
-        }
-
-        // Cascade delete handles results and alert rules via FK onDelete: 'cascade'
-        await db.delete(networkMonitors).where(eq(networkMonitors.id, existing.id));
-        return JSON.stringify({ success: true, message: `Monitor "${existing.name}" deleted` });
+        return JSON.stringify({
+          monitor: presentMonitorRow(monitor),
+          recentResults: results.map((r) => ({
+            ...r,
+            error: scrubUrlsInText(r.error),
+            details: scrubUrlsInValue(r.details),
+          })),
+          alertRules: rules,
+        });
       }
 
       return JSON.stringify({ error: `Unknown action: ${action}` });
@@ -609,18 +564,18 @@ export function registerMonitoringTools(aiTools: Map<string, AiTool>): void {
         if (changeLogDeviceCondition) changeLogConditions.push(changeLogDeviceCondition);
         let changeLogNames: { subject: string }[] = [];
         try {
-          changeLogNames = await db
+          changeLogNames = await withDbTransactionIfHeld(() => db
             .select({ subject: deviceChangeLog.subject })
             .from(deviceChangeLog)
             .where(and(...changeLogConditions))
             .groupBy(deviceChangeLog.subject)
-            .limit(1000);
+            .limit(1000));
         } catch (err) {
           // Tolerate missing-table environments (older self-hosted schemas) as
           // an empty source; any other DB error must surface as a tool error
           // (via safeHandler / the aiAgentSdkTools catch), not a silent empty.
-          const msg = err instanceof Error ? err.message : String(err);
-          if (!msg.includes('does not exist')) throw err;
+          // The SQLSTATE, not the message: Drizzle wraps the driver error (#11225).
+          if (pgErrorCode(err) !== PG_UNDEFINED_TABLE) throw err;
         }
 
         // Source 2: Distinct service/process names from check results
@@ -631,7 +586,7 @@ export function registerMonitoringTools(aiTools: Map<string, AiTool>): void {
         if (checkNameDeviceCondition) checkNameConditions.push(checkNameDeviceCondition);
         let checkNames: { name: string; watchType: string }[] = [];
         try {
-          checkNames = await db
+          checkNames = await withDbTransactionIfHeld(() => db
             .select({
               name: serviceProcessCheckResults.name,
               watchType: serviceProcessCheckResults.watchType,
@@ -639,12 +594,11 @@ export function registerMonitoringTools(aiTools: Map<string, AiTool>): void {
             .from(serviceProcessCheckResults)
             .where(and(...checkNameConditions))
             .groupBy(serviceProcessCheckResults.name, serviceProcessCheckResults.watchType)
-            .limit(500);
+            .limit(500));
         } catch (err) {
           // Same policy as the change-log source: only missing-table errors are
           // tolerated as an empty source; everything else surfaces as a tool error.
-          const msg = err instanceof Error ? err.message : String(err);
-          if (!msg.includes('does not exist')) throw err;
+          if (pgErrorCode(err) !== PG_UNDEFINED_TABLE) throw err;
         }
 
         const seen = new Set<string>();

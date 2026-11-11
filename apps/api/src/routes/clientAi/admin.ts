@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import { zValidator } from '../../lib/validation';
 import { eq } from 'drizzle-orm';
-import { db } from '../../db';
+import { db, withDbTransaction } from '../../db';
 import { readWithPartnerAxisVisibility } from '../../db/partnerAxisRead';
 import { clientAiOrgPolicies, clientAiTenantMappings } from '../../db/schema/clientAi';
 import { partners } from '../../db/schema/orgs';
@@ -12,12 +12,15 @@ import { CLIENT_AI_ENTRA_CLIENT_ID } from '../../config/env';
 import { resolveScopedOrgId } from '../c2c/helpers';
 import { getOrgPolicy } from '../../services/clientAiPolicy';
 import { isPgUniqueViolation } from '../../utils/pgErrors';
+import { lockPortalEntraOrgMappings } from '../../services/portalEntraTenantProof';
 import { putPolicySchema, putTenantMappingSchema } from './schemas';
 import { clientAiAdminOrgRoutes } from './adminOrgs';
 import { clientAiAdminSessionRoutes } from './adminSessions';
 import { clientAiAdminUsageRoutes } from './adminUsage';
 import { clientAiAdminTemplateRoutes } from './adminTemplates';
 
+import { isHoldingOrg } from '../../services/unassignedPool/protectedOrg';
+import { PROTECTED_ORG_ERROR } from '../../services/unassignedPool/orgType';
 /**
  * MSP-facing admin surface for Breeze AI for Office (spec §9, consumed by the
  * Plan-4 dashboard): tenant mapping + per-org policy. Mirrors routes/m365.ts:
@@ -111,26 +114,39 @@ clientAiAdminRoutes.put(
     const auth = c.get('auth');
     const orgId = resolveScopedOrgId(auth, c.req.param('orgId'));
     if (!orgId) return c.json({ error: 'Organization not found' }, 404);
+    // canAccessOrg is true for system scope: the holding org is never a target.
+    if (await isHoldingOrg(orgId)) return c.json(PROTECTED_ORG_ERROR, 409);
 
     const { entraTenantId } = c.req.valid('json');
     const now = new Date();
 
     let row: typeof clientAiTenantMappings.$inferSelect | undefined;
     try {
-      [row] = await db
-        .insert(clientAiTenantMappings)
-        .values({
-          orgId,
-          entraTenantId: entraTenantId.toLowerCase(),
-          createdBy: auth.user?.id ?? null,
-          createdAt: now,
-          updatedAt: now,
-        })
-        .onConflictDoUpdate({
-          target: clientAiTenantMappings.orgId,
-          set: { entraTenantId: entraTenantId.toLowerCase(), updatedAt: now },
-        })
-        .returning();
+      // Savepoint so the caught unique violation cannot poison the request
+      // transaction and turn the 409 into a 500 at commit (#11203).
+      [row] = await withDbTransaction(async () => {
+        // This upsert can CREATE the org's mapping. An org merge's FOR UPDATE
+        // cannot lock that row in advance, so take the per-org lock the merge
+        // holds for both its orgs (portal registration W4, plan D8 / OD7).
+        // Without it, a mapping created for an unmapped survivor mid-merge
+        // would make keep-survivor drop the loser's proven mapping. Released
+        // with the savepoint if the upsert fails, else held to request commit.
+        await lockPortalEntraOrgMappings([orgId]);
+        return db
+          .insert(clientAiTenantMappings)
+          .values({
+            orgId,
+            entraTenantId: entraTenantId.toLowerCase(),
+            createdBy: auth.user?.id ?? null,
+            createdAt: now,
+            updatedAt: now,
+          })
+          .onConflictDoUpdate({
+            target: clientAiTenantMappings.orgId,
+            set: { entraTenantId: entraTenantId.toLowerCase(), updatedAt: now },
+          })
+          .returning();
+      });
     } catch (err) {
       // client_ai_tenant_mappings_tenant_uniq: the tenant is already mapped to
       // a DIFFERENT org. Deliberately opaque — do not reveal which org.
@@ -213,7 +229,6 @@ clientAiAdminRoutes.put(
     if (body.userAccess !== undefined) set.userAccess = body.userAccess;
     if (body.selectedUserIds !== undefined) set.selectedUserIds = body.selectedUserIds;
     if (body.allowedProviders !== undefined) set.allowedProviders = body.allowedProviders;
-    if (body.allowedModels !== undefined) set.allowedModels = body.allowedModels;
     if (body.writeMode !== undefined) set.writeMode = body.writeMode;
     if (body.writeApproval !== undefined) set.writeApproval = body.writeApproval;
     if (body.dlpConfig !== undefined) set.dlpConfig = body.dlpConfig;

@@ -108,6 +108,15 @@ describe('RunsListPage', () => {
     expect(screen.getByTestId('runs-list-row-run-3')).toHaveTextContent('Anomaly');
   });
 
+  it('labels a blocked run (AI model registry W03) and treats it as terminal, not live', async () => {
+    mockEndpoints({ runs: [{ ...RUN_1, id: 'run-b', status: 'blocked' as const, runVerdict: null }] });
+    render(<RunsListPage />);
+
+    await waitFor(() => expect(screen.getByTestId('runs-list-row-run-b')).toBeInTheDocument());
+    expect(screen.getByTestId('runs-list-row-run-b')).toHaveTextContent('Blocked');
+    expect(screen.queryByTestId('run-live-indicator')).not.toBeInTheDocument();
+  });
+
   it('shows an error state when the list fails to load', async () => {
     mockEndpoints({ runsOk: false, runsStatus: 500 });
     render(<RunsListPage />);
@@ -1026,5 +1035,42 @@ describe('RunsListPage load-more error copy', () => {
 
     await waitFor(() => expect(screen.getByTestId('runs-list-load-more-error')).toBeInTheDocument());
     expect(screen.getByTestId('runs-list-load-more-error')).toHaveTextContent('Could not load more runs.');
+  });
+});
+
+describe('RunsListPage report header links (#10135)', () => {
+  it('shows only the fix memory link for a research agent', async () => {
+    mockEndpoints({ agents: [{ id: 'r1', name: 'Researcher', kind: 'research' }] });
+    render(<RunsListPage />);
+    expect(await screen.findByTestId('runs-link-fix-memory')).toHaveAttribute('href', '/ai-agents/fix-memory');
+    expect(screen.getByTestId('runs-link-fix-memory')).toHaveTextContent('Fix memory');
+    expect(screen.queryByTestId('runs-link-fleet-design')).toBeNull();
+  });
+
+  it('shows only the fleet design link for a designer agent', async () => {
+    mockEndpoints({ agents: [{ id: 'd1', name: 'Designer', kind: 'designer' }] });
+    render(<RunsListPage />);
+    expect(await screen.findByTestId('runs-link-fleet-design')).toHaveAttribute('href', '/ai-agents/fleet-design');
+    expect(screen.getByTestId('runs-link-fleet-design')).toHaveTextContent('Fleet design');
+    expect(screen.queryByTestId('runs-link-fix-memory')).toBeNull();
+  });
+
+  it('shows neither link without such agents, or when the agents fetch fails', async () => {
+    mockEndpoints();
+    const { unmount } = render(<RunsListPage />);
+    await waitFor(() => expect(screen.getByTestId('runs-list-row-run-1')).toBeInTheDocument());
+    expect(screen.queryByTestId('runs-link-fix-memory')).toBeNull();
+    expect(screen.queryByTestId('runs-link-fleet-design')).toBeNull();
+    unmount();
+
+    fetchMock.mockImplementation((url: string) => {
+      if (url.startsWith('/ai/agents/runs')) return Promise.resolve(json({ data: [RUN_1], nextCursor: null }));
+      if (url.startsWith('/ai/agents')) return Promise.resolve(json({}, false, 500));
+      return Promise.resolve(json({ data: [] }));
+    });
+    render(<RunsListPage />);
+    await waitFor(() => expect(screen.getByTestId('runs-list-row-run-1')).toBeInTheDocument());
+    expect(screen.queryByTestId('runs-link-fix-memory')).toBeNull();
+    expect(screen.queryByTestId('runs-link-fleet-design')).toBeNull();
   });
 });

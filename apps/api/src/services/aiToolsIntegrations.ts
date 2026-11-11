@@ -6,37 +6,55 @@
  * org-scoped isolation.
  */
 
-import { db } from '../db';
+import { randomUUID } from 'node:crypto';
+import { db, runAfterDbContextCommit } from '../db';
+import { pageEnvelope, pageParamSchema, readPageArgs } from './aiToolPagination';
 import {
   webhooks,
   webhookDeliveries,
   psaConnections,
   psaTicketMappings,
 } from '../db/schema/integrations';
-import { eq, and, desc, sql, SQL } from 'drizzle-orm';
+import { eq, and, or, isNull, isNotNull, desc, sql, SQL } from 'drizzle-orm';
 import type { AuthContext } from '../middleware/auth';
 import type { AiTool } from './aiTools';
 import { canMutateOrgWideGovernance, SITE_CEILING_WRITE_DENIED_MESSAGE } from './siteCeilingAccess';
 import { decryptForColumn } from './secretCrypto';
-import { redactUrlForLogs } from './notificationSenders/webhookSender';
-import { getWebhookWorker } from '../workers/webhookDelivery';
+import { describeEndpointUrl, type EndpointUrlView } from '../utils/endpointDisplay';
+import { enqueueWebhookAttempt } from '../jobs/webhookDeliveryQueue';
+import { canManagePartnerWidePolicies } from './partnerWideAccess';
+import { captureException } from './sentry';
 
-// webhooks.url is encrypted at rest and may embed credentials. Decrypt for
-// display then strip userinfo/query/hash so the AI tool never sees a token.
-// Plaintext legacy rows pass through decryptForColumn unchanged.
-function maskWebhookUrl(stored: string): string {
+// webhooks.url is encrypted at rest, and for chat-provider endpoints the PATH
+// is what authorizes a post, so AI tools show only the origin plus a short
+// fingerprint (see utils/endpointDisplay). Plaintext legacy rows pass through
+// decryptForColumn unchanged.
+function describeWebhookEndpoint(stored: string): EndpointUrlView {
   let decrypted: string;
   try {
     // Legacy plaintext rows pass through decryptForColumn unchanged (no throw).
     decrypted = decryptForColumn('webhooks', 'url', stored) ?? stored;
   } catch {
-    // An encrypted value we cannot decrypt (key/AAD mismatch, corruption). Do NOT
-    // fall back to the raw ciphertext: redactUrlForLogs treats `enc:...` as an
-    // opaque URL and would surface the ciphertext blob to the model. Emit a fixed
-    // placeholder instead.
-    return '[encrypted]';
+    // An encrypted value we cannot decrypt (key/AAD mismatch, corruption). Never
+    // fall back to the raw ciphertext; emit a fixed placeholder instead.
+    return { url: '[encrypted]', fingerprint: null };
   }
-  return redactUrlForLogs(decrypted);
+  return describeEndpointUrl(decrypted);
+}
+
+/** Partner plumbing stays private to full partner administrators (OD1). */
+function webhookOwnerCondition(auth: AuthContext): SQL | undefined {
+  if (auth.scope === 'system') return undefined;
+  const org = and(isNotNull(webhooks.orgId), auth.orgCondition(webhooks.orgId));
+  return auth.scope === 'partner' && auth.partnerId && canManagePartnerWidePolicies(auth)
+    ? or(org, and(isNull(webhooks.orgId), eq(webhooks.partnerId, auth.partnerId)))
+    : org;
+}
+
+function canReadWebhookOwner(auth: AuthContext, row: { partnerId: string | null }): boolean {
+  return !row.partnerId || auth.scope === 'system' || (
+    auth.scope === 'partner' && row.partnerId === auth.partnerId && canManagePartnerWidePolicies(auth)
+  );
 }
 
 type IntegrationHandler = (input: Record<string, unknown>, auth: AuthContext) => Promise<string>;
@@ -106,13 +124,15 @@ export function registerIntegrationTools(aiTools: Map<string, AiTool>): void {
       const limit = Math.min(Math.max((input.limit as number) ?? 25, 1), 50);
 
       const conditions: SQL[] = [];
-      const orgCond = auth.orgCondition(webhooks.orgId);
+      const orgCond = webhookOwnerCondition(auth);
       if (orgCond) conditions.push(orgCond);
       if (status) conditions.push(eq(webhooks.status, status as 'active' | 'disabled' | 'error'));
 
       const rows = await db
         .select({
           id: webhooks.id,
+          orgId: webhooks.orgId,
+          partnerId: webhooks.partnerId,
           name: webhooks.name,
           url: webhooks.url,
           status: webhooks.status,
@@ -128,7 +148,10 @@ export function registerIntegrationTools(aiTools: Map<string, AiTool>): void {
         .orderBy(desc(webhooks.createdAt))
         .limit(limit);
 
-      const maskedRows = rows.map((row) => ({ ...row, url: maskWebhookUrl(row.url) }));
+      const maskedRows = rows.filter(row => canReadWebhookOwner(auth, row)).map((row) => {
+        const endpoint = describeWebhookEndpoint(row.url);
+        return { ...row, url: endpoint.url, urlFingerprint: endpoint.fingerprint };
+      });
 
       if (!includeDeliveries) {
         return JSON.stringify({ webhooks: maskedRows, count: maskedRows.length });
@@ -158,7 +181,7 @@ export function registerIntegrationTools(aiTools: Map<string, AiTool>): void {
         }),
       );
 
-      return JSON.stringify({ webhooks: webhooksWithDeliveries, count: rows.length });
+      return JSON.stringify({ webhooks: webhooksWithDeliveries, count: maskedRows.length });
     }),
   });
 
@@ -181,12 +204,18 @@ export function registerIntegrationTools(aiTools: Map<string, AiTool>): void {
             type: 'string',
             description: 'Specific PSA connection UUID (optional — omit to list all)',
           },
+          ...pageParamSchema(25, 100),
         },
         required: [],
       },
     },
     handler: safeHandler('query_psa_status', async (input, auth) => {
       const connectionId = input.connectionId as string | undefined;
+      // A-W05 (5c, the survey-miss follow-up): PSA connections are naturally
+      // few per org/partner, but the tool had no `limit` at all.
+      const page = readPageArgs('query_psa_status', input, { defaultLimit: 25, maxLimit: 100 });
+      if (!page.ok) return JSON.stringify({ error: page.error, code: page.code });
+      const { limit, offset, fingerprint } = page;
 
       const conditions: SQL[] = [];
       // Dual-axis (epic #2135): psa_connections is org-owned OR partner-wide.
@@ -205,7 +234,9 @@ export function registerIntegrationTools(aiTools: Map<string, AiTool>): void {
       }
       if (connectionId) conditions.push(eq(psaConnections.id, connectionId));
 
-      const rows = await db
+      // A single-connection lookup needs no page bound at all (there is at
+      // most one row); the list form over-fetches by one for hasMore.
+      const baseQuery = db
         .select({
           id: psaConnections.id,
           provider: psaConnections.provider,
@@ -220,7 +251,8 @@ export function registerIntegrationTools(aiTools: Map<string, AiTool>): void {
         })
         .from(psaConnections)
         .where(conditions.length > 0 ? and(...conditions) : undefined)
-        .orderBy(desc(psaConnections.createdAt));
+        .orderBy(desc(psaConnections.createdAt), desc(psaConnections.id));
+      const rows = connectionId ? await baseQuery : await baseQuery.limit(limit + 1).offset(offset);
 
       // If a specific connection was requested, also count ticket mappings
       if (connectionId && rows.length > 0) {
@@ -235,7 +267,8 @@ export function registerIntegrationTools(aiTools: Map<string, AiTool>): void {
         });
       }
 
-      return JSON.stringify({ connections: rows, count: rows.length });
+      const envelope = pageEnvelope({ key: 'connections', items: rows, limit, offset, fingerprint });
+      return JSON.stringify({ ...envelope, count: envelope.showing });
     }),
   });
 
@@ -244,7 +277,14 @@ export function registerIntegrationTools(aiTools: Map<string, AiTool>): void {
   // ============================================
 
   registerTool({
-    tier: 2,
+    // Sends a real outbound POST (mutates), and its route
+    // (POST /webhooks/:id/test) carries requireMfa() on top of
+    // organizations:write. Per the MFA rule in aiGuardrails.ts ("MFA — what
+    // substitutes for the routes' requireMfa()"), a tool mirroring a mutating
+    // requireMfa() route is tier 3. Paired with TIER3_SUPERVISED_TOOLS in
+    // aiGuardrails.ts so TOOL_TIERS-equivalent resolution (getToolTier) and
+    // approval-scope resolution move together.
+    tier: 3,
     domain: 'integrations',
     searchHint: 'Breeze webhook connectivity: send a test delivery to an endpoint',
     definition: {
@@ -268,11 +308,9 @@ export function registerIntegrationTools(aiTools: Map<string, AiTool>): void {
       }
       const webhookId = input.webhookId as string;
 
-      // Verify webhook exists and belongs to org. Select the full row — the
-      // worker config mapper needs orgId/secret/headers/events/retryPolicy,
-      // not just id/name/url.
+      // Scope the lookup before creating a delivery so cross-org ids cannot send.
       const conditions: SQL[] = [eq(webhooks.id, webhookId)];
-      const orgCond = auth.orgCondition(webhooks.orgId);
+      const orgCond = webhookOwnerCondition(auth);
       if (orgCond) conditions.push(orgCond);
 
       const [webhook] = await db
@@ -281,22 +319,26 @@ export function registerIntegrationTools(aiTools: Map<string, AiTool>): void {
         .where(and(...conditions))
         .limit(1);
 
-      if (!webhook) {
+      if (!webhook || !canReadWebhookOwner(auth, webhook)) {
         return JSON.stringify({ error: 'Webhook not found or access denied' });
       }
 
       // Insert a test delivery record
       const eventType = 'test';
-      const eventId = `test-${Date.now()}`;
+      const eventId = `test-${webhook.partnerId ? randomUUID() : Date.now()}`;
       const now = new Date();
       const payload = { test: true, timestamp: now.toISOString() };
       const [delivery] = await db
         .insert(webhookDeliveries)
         .values({
           webhookId: webhook.id,
+          orgId: webhook.orgId,
           eventType,
           eventId,
           payload,
+          payloadVersion: webhook.payloadVersion,
+          webhookGeneration: webhook.approvalGeneration,
+          eventTimestamp: now,
           status: 'pending',
           attempts: 0,
         })
@@ -304,50 +346,29 @@ export function registerIntegrationTools(aiTools: Map<string, AiTool>): void {
 
       if (!delivery) return JSON.stringify({ error: 'Failed to create test delivery record' });
 
-      // Mirror routes/webhooks.ts POST /:id/test — an inserted 'pending' row
-      // with no worker dispatch never actually sends anything. Queue the
-      // delivery the same way the route does, and mark it 'failed' on a queue
-      // error instead of leaving a permanently-stuck 'pending' row.
-      const event = {
-        id: eventId,
-        type: eventType,
-        orgId: webhook.orgId,
-        source: 'webhook.test',
-        priority: 'normal',
-        payload,
-        metadata: {
-          timestamp: now.toISOString(),
-          userId: auth.user.id,
-        },
-      };
-
-      try {
-        await getWebhookWorker().queueDelivery(webhook.id, webhook.approvalGeneration, event as any, delivery.id);
-      } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : 'Unknown queue error';
-        await db
-          .update(webhookDeliveries)
-          .set({
-            status: 'failed',
-            attempts: 1,
-            errorMessage,
-            deliveredAt: new Date(),
-          })
-          .where(eq(webhookDeliveries.id, delivery.id));
-
-        return JSON.stringify({
-          error: 'Failed to queue webhook delivery',
+      // The worker must read the committed row; recovery can re-drive it if Redis is down.
+      runAfterDbContextCommit('ai.test_webhook', () => enqueueWebhookAttempt({
+        deliveryId: delivery.id,
+        webhookId: webhook.id,
+        generation: webhook.approvalGeneration,
+        attemptsMade: 0,
+      }, new Date()).catch((error) => {
+        captureException(error instanceof Error ? error : new Error(String(error)));
+        console.error(`[integrations:test_webhook] enqueue-failed ${JSON.stringify({
+          errorId: 'WEBHOOK_DELIVERY_ENQUEUE_FAILED',
           deliveryId: delivery.id,
           webhookId: webhook.id,
-        });
-      }
+        })}`);
+      }));
 
+      const endpoint = describeWebhookEndpoint(webhook.url);
       return JSON.stringify({
         success: true,
         message: `Test delivery queued for webhook "${webhook.name}"`,
         deliveryId: delivery.id,
         webhookId: webhook.id,
-        webhookUrl: maskWebhookUrl(webhook.url),
+        webhookUrl: endpoint.url,
+        webhookUrlFingerprint: endpoint.fingerprint,
         createdAt: delivery.createdAt,
       });
     }),

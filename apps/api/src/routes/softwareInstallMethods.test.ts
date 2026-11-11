@@ -23,6 +23,7 @@ function chainMock(terminalValue: any): any {
 
 vi.mock('../db', () => ({
   runOutsideDbContext: vi.fn((fn: any) => fn()),
+  withDbTransaction: (fn: () => Promise<unknown>) => fn(),
   withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn()),
   withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
   db: {
@@ -240,6 +241,21 @@ describe('softwareInstallMethodRoutes', () => {
 
     it('rejects methods on built-in items (integrationProvider set)', async () => {
       vi.mocked(db.select).mockReturnValueOnce(chainMock([ownedCatalogItem({ integrationProvider: 'ninite' })]) as any);
+
+      const res = await app.request(`/software/catalog/${CATALOG_ID}/install-methods`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ platform: 'windows', kind: 'winget', packageId: 'Vendor.App' }),
+      });
+
+      expect(res.status).toBe(400);
+      expect(db.insert).not.toHaveBeenCalled();
+    });
+
+    it('rejects methods on Breeze built-in packages (builtinPackageKey set, #6958)', async () => {
+      vi.mocked(db.select).mockReturnValueOnce(
+        chainMock([ownedCatalogItem({ builtinPackageKey: 'controld_windows' })]) as any,
+      );
 
       const res = await app.request(`/software/catalog/${CATALOG_ID}/install-methods`, {
         method: 'POST',

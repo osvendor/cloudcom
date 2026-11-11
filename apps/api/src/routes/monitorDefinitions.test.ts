@@ -14,6 +14,7 @@ import { MONITOR_KINDS } from '@breeze/shared';
  */
 
 const {
+  loadPolicyApplicationProvidersMock,
   hasPermMock,
   mfaOkMock,
   listMonitorDefinitionsMock,
@@ -25,6 +26,7 @@ const {
   selectMock,
   isMonitorAttachableToPolicyMock,
 } = vi.hoisted(() => ({
+  loadPolicyApplicationProvidersMock: vi.fn(async (): Promise<string[]> => []),
   hasPermMock: vi.fn<(resource: string, action: string) => boolean>(() => true),
   mfaOkMock: vi.fn(() => true),
   listMonitorDefinitionsMock: vi.fn(),
@@ -40,6 +42,8 @@ const {
   // that the route respects the pre-check's answer.
   isMonitorAttachableToPolicyMock: vi.fn(async () => true),
 }));
+
+vi.mock('../services/eventLogPolicyProviders', () => ({ loadPolicyApplicationProviders: loadPolicyApplicationProvidersMock }));
 
 vi.mock('../middleware/auth', () => ({
   authMiddleware: async (_c: unknown, next: () => Promise<void>) => next(),
@@ -160,6 +164,8 @@ function selectChain<T>(rows: T) {
 
 vi.mock('../db', () => ({
   db: { select: selectMock },
+  hasDbAccessContext: () => true,
+  withDbTransaction: async (fn: () => Promise<unknown>) => fn(),
 }));
 
 import { monitorDefinitionRoutes } from './monitorDefinitions';
@@ -172,6 +178,7 @@ import {
   updateFeatureLink as updateFeatureLinkMock,
 } from '../services/configurationPolicy';
 import { PARTNER_WIDE_WRITE_DENIED_MESSAGE } from '../services/partnerWideAccess';
+import { SITE_CEILING_WRITE_DENIED_MESSAGE } from '../services/siteCeilingAccess';
 import { resolveMonitorsForDevice as resolveMonitorsForDeviceMock } from '../services/monitors/monitorResolver';
 import { evaluateConditions as evaluateConditionsMock } from '../services/alertConditions';
 import { PgDialect } from 'drizzle-orm/pg-core';
@@ -253,6 +260,7 @@ function jsonRequest(app: Hono, method: string, path: string, body?: unknown) {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  loadPolicyApplicationProvidersMock.mockResolvedValue([]);
   hasPermMock.mockReturnValue(true);
   mfaOkMock.mockReturnValue(true);
   selectMock.mockReturnValue(selectChain([]));
@@ -273,6 +281,9 @@ describe('GET /monitor-definitions', () => {
     expect(body.data).toHaveLength(2);
     expect(body.data.find((r) => r.id === MONITOR_ID)).toMatchObject({ attachmentCount: 3 });
     expect(body.data.find((r) => r.id === 'other-id')).toMatchObject({ attachmentCount: 0 });
+    // The REST list is unpaged: no page argument reaches the service (#6735).
+    expect(listMonitorDefinitionsMock).toHaveBeenCalledTimes(1);
+    expect(listMonitorDefinitionsMock.mock.calls[0]).toHaveLength(2);
   });
 
   it('skips the count query and returns an empty list when there are no monitors', async () => {
@@ -287,14 +298,14 @@ describe('GET /monitor-definitions', () => {
 });
 
 describe('GET /monitor-definitions/kinds', () => {
-  it('returns one entry per monitor kind (19 after W05c1) with kind/overridableKeys/defaultSeverity/agentDelivered', async () => {
+  it('returns twenty-two monitor kinds with kind/overridableKeys/defaultSeverity/agentDelivered', async () => {
     const res = await jsonRequest(buildApp(), 'GET', '/kinds');
 
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
       data: Array<{ kind: string; overridableKeys: string[]; defaultSeverity: string; agentDelivered: boolean }>;
     };
-    expect(body.data).toHaveLength(19);
+    expect(body.data).toHaveLength(22);
     expect(body.data).toHaveLength(MONITOR_KINDS.length);
     expect(new Set(body.data.map((d) => d.kind))).toEqual(new Set(MONITOR_KINDS));
     for (const entry of body.data) {
@@ -302,6 +313,59 @@ describe('GET /monitor-definitions/kinds', () => {
       expect(typeof entry.defaultSeverity).toBe('string');
       expect(typeof entry.agentDelivered).toBe('boolean');
     }
+    expect(body.data.find(entry => entry.kind === 'hardware_health')).toMatchObject({
+      overridableKeys: ['minHealth', 'includePredictiveFailure', 'consecutiveSnapshots'],
+      defaultSeverity: 'high', agentDelivered: false,
+    });
+  });
+});
+
+describe('#10935: autoResolveConditions without logic never reaches the service', () => {
+  const noLogic = { conditions: [{ type: 'event_log', category: 'application', level: 'info', countThreshold: 1, windowMinutes: 60 }] };
+  const eventLog = { kind: 'event_log', condition: { category: 'application', level: 'warning', countThreshold: 1, windowMinutes: 60 } };
+
+  it('POST returns 400 at autoResolveConditions, not 201', async () => {
+    const res = await jsonRequest(buildApp(), 'POST', '', validCreateBody({ ...eventLog, autoResolveConditions: noLogic }));
+
+    expect(res.status).toBe(400);
+    expect(JSON.stringify(await res.json())).toContain('autoResolveConditions');
+    expect(createMonitorDefinitionMock).not.toHaveBeenCalled();
+  });
+
+  it('PATCH returns 400 at autoResolveConditions, with or without the kind', async () => {
+    for (const body of [{ autoResolveConditions: noLogic }, { kind: 'event_log', autoResolveConditions: noLogic }]) {
+      const res = await jsonRequest(buildApp(), 'PATCH', `/${MONITOR_ID}`, body);
+
+      expect(res.status).toBe(400);
+      expect(JSON.stringify(await res.json())).toContain('autoResolveConditions');
+    }
+    expect(updateMonitorDefinitionMock).not.toHaveBeenCalled();
+  });
+
+  it('POST accepts the event_log shape', async () => {
+    createMonitorDefinitionMock.mockResolvedValue(monitorRow());
+    const res = await jsonRequest(buildApp(), 'POST', '', validCreateBody({
+      ...eventLog,
+      autoResolveConditions: { category: 'application', level: 'info', messagePattern: 'Power Restored' },
+    }));
+
+    expect(res.status).toBe(201);
+    expect(createMonitorDefinitionMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns the warning for a recovery event that is not collected', async () => {
+    createMonitorDefinitionMock.mockResolvedValue(monitorRow({
+      ...eventLog,
+      autoResolveConditions: { category: 'application', level: 'info', sourcePattern: 'Nothing-Collects-This', countThreshold: 1, windowMinutes: 60 },
+    }));
+    const res = await jsonRequest(buildApp(), 'POST', '', validCreateBody({
+      ...eventLog,
+      autoResolveConditions: { category: 'application', level: 'info', sourcePattern: 'Nothing-Collects-This' },
+    }));
+
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as { warnings?: string[] };
+    expect(body.warnings).toEqual(expect.arrayContaining([expect.stringContaining('Recovery condition')]));
   });
 });
 
@@ -374,7 +438,92 @@ describe('POST /monitor-definitions', () => {
   });
 });
 
+describe('event_log collection warnings at save (#8174)', () => {
+  const infoCondition = (sourcePattern: string) => ({
+    category: 'application',
+    level: 'info',
+    sourcePattern,
+    countThreshold: 1,
+    windowMinutes: 60,
+  });
+
+  it.each(['POST', 'PATCH'])('%s uses scoped policy providers for advisory warnings', async (method) => {
+    const row = { ...monitorRow(), kind: 'event_log', condition: infoCondition('Dell UPS Local Node Manager') };
+    createMonitorDefinitionMock.mockResolvedValue(row);
+    updateMonitorDefinitionMock.mockResolvedValue(row);
+    const request = () => jsonRequest(buildApp(), method, method === 'POST' ? '' : `/${MONITOR_ID}`, method === 'POST' ? validCreateBody() : { name: 'Renamed' });
+    expect((await (await request()).json()).warnings).toHaveLength(1);
+    loadPolicyApplicationProvidersMock.mockResolvedValue(['Dell UPS Local Node Manager']);
+    expect((await (await request()).json()).warnings).toBeUndefined();
+    expect(loadPolicyApplicationProvidersMock).toHaveBeenLastCalledWith({ orgId: ORG_ID, partnerId: null });
+  });
+
+  it('does not query providers for other monitor kinds or composites without event logs', async () => {
+    for (const row of [monitorRow(), monitorRow({ kind: 'composite', condition: { children: [{ kind: 'cpu', condition: {} }] } })]) {
+      createMonitorDefinitionMock.mockResolvedValue(row);
+      await jsonRequest(buildApp(), 'POST', '', validCreateBody());
+    }
+    expect(loadPolicyApplicationProvidersMock).not.toHaveBeenCalled();
+  });
+
+  it('queries providers for an event-log composite child', async () => {
+    loadPolicyApplicationProvidersMock.mockResolvedValue(['Dell UPS Local Node Manager']);
+    createMonitorDefinitionMock.mockResolvedValue(monitorRow({ kind: 'composite', condition: { children: [
+      { kind: 'event_log', condition: infoCondition('Dell UPS') },
+    ] } }));
+    const response = await jsonRequest(buildApp(), 'POST', '', validCreateBody());
+    expect((await response.json()).warnings).toBeUndefined();
+    expect(loadPolicyApplicationProvidersMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('POST returns warnings for an info-level Application source outside the agent allowlist', async () => {
+    const created = { ...monitorRow(), kind: 'event_log', condition: infoCondition('Application Error') };
+    createMonitorDefinitionMock.mockResolvedValue(created);
+
+    const res = await jsonRequest(buildApp(), 'POST', '', validCreateBody());
+
+    expect(res.status).toBe(201);
+    const body = await res.json();
+    expect(body.data).toEqual(created);
+    expect(body.warnings).toHaveLength(1);
+    expect(body.warnings[0]).toContain('Application Error');
+    expect(body.warnings[0]).toContain('MsiInstaller');
+  });
+
+  it('POST omits warnings for an allowlisted provider', async () => {
+    const created = { ...monitorRow(), kind: 'event_log', condition: infoCondition('MsiInstaller') };
+    createMonitorDefinitionMock.mockResolvedValue(created);
+
+    const res = await jsonRequest(buildApp(), 'POST', '', validCreateBody());
+
+    expect(res.status).toBe(201);
+    expect(await res.json()).toEqual({ data: created });
+  });
+
+  it('PATCH returns warnings computed from the saved row (a partial patch carries no kind)', async () => {
+    const updated = { ...monitorRow(), kind: 'event_log', condition: infoCondition('VSS') };
+    updateMonitorDefinitionMock.mockResolvedValue(updated);
+
+    const res = await jsonRequest(buildApp(), 'PATCH', `/${MONITOR_ID}`, { name: 'Renamed' });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.warnings).toHaveLength(1);
+    expect(body.warnings[0]).toContain('VSS');
+  });
+});
+
 describe('PATCH /monitor-definitions/:id', () => {
+  it('passes only the sent keys to the service, so a description-only PATCH resets nothing', async () => {
+    updateMonitorDefinitionMock.mockResolvedValue({ id: MONITOR_ID, orgId: 'org-1', name: 'Monitor', kind: 'offline' });
+
+    const res = await jsonRequest(buildApp(), 'PATCH', `/${MONITOR_ID}`, { description: 'x' });
+
+    expect(res.status).toBe(200);
+    expect(updateMonitorDefinitionMock).toHaveBeenCalledTimes(1);
+    expect(updateMonitorDefinitionMock.mock.calls[0]?.[1]).toStrictEqual({ description: 'x' });
+  });
+
   it('maps a MonitorValidationError to 400 { error: INVALID_MONITOR, details }', async () => {
     updateMonitorDefinitionMock.mockRejectedValue(
       new MonitorValidationError('deliveryChannelIds required when deliveryMode is channels'),
@@ -504,6 +653,35 @@ describe('POST /monitor-definitions/:id/attachments', () => {
     expect(addFeatureLinkMock).not.toHaveBeenCalled();
     expect(updateFeatureLinkMock).not.toHaveBeenCalled();
   });
+  // A monitors link's `inheritance` lives in the link's inline settings, which
+  // this route rewrites on every attach. Writing `{ items }` alone silently
+  // turned a `replace` policy back into `cumulative`, re-admitting every
+  // inherited monitor the policy was set up to shadow.
+  it('keeps a replace link replace when attaching another monitor', async () => {
+    const OTHER_MONITOR_ID = '88888888-8888-4888-8888-888888888888';
+    getMonitorDefinitionMock.mockResolvedValue(monitorRow());
+    vi.mocked(getConfigPolicyMock).mockResolvedValue({ id: POLICY_ID, orgId: ORG_ID, partnerId: null } as never);
+    selectMock
+      .mockReturnValueOnce(selectChain([{ id: 'fl-1', inlineSettings: { items: [], inheritance: 'replace' } }]))
+      .mockReturnValueOnce(selectChain([{ monitorId: OTHER_MONITOR_ID, enabled: true, overrides: null, sortOrder: 0 }]));
+
+    const res = await jsonRequest(buildApp(), 'POST', `/${MONITOR_ID}/attachments`, {
+      configPolicyId: POLICY_ID,
+    });
+
+    expect(res.status).toBe(201);
+    expect(updateFeatureLinkMock).toHaveBeenCalledTimes(1);
+    const [, updates] = vi.mocked(updateFeatureLinkMock).mock.calls[0]!;
+    expect(updates).toEqual({
+      inlineSettings: {
+        inheritance: 'replace',
+        items: [
+          { monitorId: OTHER_MONITOR_ID, enabled: true, overrides: null, sortOrder: 0 },
+          { monitorId: MONITOR_ID, enabled: true, overrides: null, sortOrder: 1 },
+        ],
+      },
+    });
+  });
 });
 
 describe('DELETE /monitor-definitions/:id/attachments/:attachmentId', () => {
@@ -545,6 +723,71 @@ describe('DELETE /monitor-definitions/:id/attachments/:attachmentId', () => {
 
     expect(res.status).toBe(204);
     expect(removeFeatureLinkMock).toHaveBeenCalledTimes(1);
+  });
+  it('keeps a replace link replace when detaching one of several monitors', async () => {
+    const OTHER_MONITOR_ID = '88888888-8888-4888-8888-888888888888';
+    getMonitorDefinitionMock.mockResolvedValue(monitorRow());
+    mockAttachmentRow();
+    vi.mocked(getConfigPolicyMock).mockResolvedValue({ id: POLICY_ID, orgId: ORG_ID, partnerId: null } as never);
+    selectMock
+      .mockReturnValueOnce(selectChain([{ id: 'fl-1', inlineSettings: { items: [], inheritance: 'replace' } }]))
+      .mockReturnValueOnce(
+        selectChain([
+          { monitorId: MONITOR_ID, enabled: true, overrides: null, sortOrder: 0 },
+          { monitorId: OTHER_MONITOR_ID, enabled: true, overrides: null, sortOrder: 1 },
+        ]),
+      );
+
+    const res = await jsonRequest(buildApp(), 'DELETE', `/${MONITOR_ID}/attachments/${ATTACHMENT_ID}`);
+
+    expect(res.status).toBe(204);
+    expect(removeFeatureLinkMock).not.toHaveBeenCalled();
+    expect(updateFeatureLinkMock).toHaveBeenCalledWith(
+      'fl-1',
+      {
+        inlineSettings: {
+          inheritance: 'replace',
+          items: [{ monitorId: OTHER_MONITOR_ID, enabled: true, overrides: null, sortOrder: 1 }],
+        },
+      },
+      POLICY_ID,
+    );
+  });
+
+  // An empty `replace` link is how a policy says "none of my parents' monitors
+  // apply here". Deleting it on the last detach would quietly re-admit them.
+  it('keeps an emptied replace link instead of deleting it', async () => {
+    getMonitorDefinitionMock.mockResolvedValue(monitorRow());
+    mockAttachmentRow();
+    vi.mocked(getConfigPolicyMock).mockResolvedValue({ id: POLICY_ID, orgId: ORG_ID, partnerId: null } as never);
+    selectMock
+      .mockReturnValueOnce(selectChain([{ id: 'fl-1', inlineSettings: { items: [], inheritance: 'replace' } }]))
+      .mockReturnValueOnce(selectChain([{ monitorId: MONITOR_ID, enabled: true, overrides: null, sortOrder: 0 }]));
+
+    const res = await jsonRequest(buildApp(), 'DELETE', `/${MONITOR_ID}/attachments/${ATTACHMENT_ID}`);
+
+    expect(res.status).toBe(204);
+    expect(removeFeatureLinkMock).not.toHaveBeenCalled();
+    expect(updateFeatureLinkMock).toHaveBeenCalledWith(
+      'fl-1',
+      { inlineSettings: { inheritance: 'replace', items: [] } },
+      POLICY_ID,
+    );
+  });
+
+  it('still removes an emptied cumulative link', async () => {
+    getMonitorDefinitionMock.mockResolvedValue(monitorRow());
+    mockAttachmentRow();
+    vi.mocked(getConfigPolicyMock).mockResolvedValue({ id: POLICY_ID, orgId: ORG_ID, partnerId: null } as never);
+    selectMock
+      .mockReturnValueOnce(selectChain([{ id: 'fl-1', inlineSettings: { items: [] } }]))
+      .mockReturnValueOnce(selectChain([{ monitorId: MONITOR_ID, enabled: true, overrides: null, sortOrder: 0 }]));
+
+    const res = await jsonRequest(buildApp(), 'DELETE', `/${MONITOR_ID}/attachments/${ATTACHMENT_ID}`);
+
+    expect(res.status).toBe(204);
+    expect(removeFeatureLinkMock).toHaveBeenCalledWith('fl-1', POLICY_ID);
+    expect(updateFeatureLinkMock).not.toHaveBeenCalled();
   });
 });
 
@@ -728,6 +971,120 @@ describe('site scope on device-reading monitor routes', () => {
   });
 });
 
+/**
+ * Site-ceiling write gate (bind monitor-definition writes to a caller's
+ * site ceiling like every sibling org-wide governance object). A
+ * site-restricted org caller (`auth.allowedSiteIds` set, including `[]`)
+ * must be refused before any write, on every writer: create, update,
+ * delete, attach and detach — a monitor's compiled responses run as SYSTEM
+ * on every device the attaching policy reaches, with no site axis of its
+ * own to narrow that reach.
+ */
+describe('site-ceiling write gate on monitor-definition writers', () => {
+  const SITE_A = '88888888-8888-4888-8888-888888888888';
+  const ATTACHMENT_ID = '66666666-6666-4666-8666-666666666666';
+
+  it.each([
+    ['restricted to one site', [SITE_A]],
+    ['restricted to zero sites', []],
+  ])('POST /monitor-definitions denied 403, no create (%s)', async (_label, allowedSiteIds) => {
+    const res = await jsonRequest(
+      buildApp({ allowedSiteIds }),
+      'POST',
+      '',
+      validCreateBody(),
+    );
+
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: SITE_CEILING_WRITE_DENIED_MESSAGE });
+    expect(createMonitorDefinitionMock).not.toHaveBeenCalled();
+  });
+
+  it('PATCH /monitor-definitions/:id denied 403, no update', async () => {
+    getMonitorDefinitionMock.mockResolvedValue(monitorRow());
+
+    const res = await jsonRequest(
+      buildApp({ allowedSiteIds: [SITE_A] }),
+      'PATCH',
+      `/${MONITOR_ID}`,
+      { name: 'Renamed' },
+    );
+
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: SITE_CEILING_WRITE_DENIED_MESSAGE });
+    expect(updateMonitorDefinitionMock).not.toHaveBeenCalled();
+  });
+
+  it('DELETE /monitor-definitions/:id denied 403, no delete', async () => {
+    getMonitorDefinitionMock.mockResolvedValue(monitorRow());
+
+    const res = await jsonRequest(buildApp({ allowedSiteIds: [SITE_A] }), 'DELETE', `/${MONITOR_ID}`);
+
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: SITE_CEILING_WRITE_DENIED_MESSAGE });
+    expect(deleteMonitorDefinitionMock).not.toHaveBeenCalled();
+  });
+
+  it('POST /monitor-definitions/:id/attachments denied 403, no attach', async () => {
+    getMonitorDefinitionMock.mockResolvedValue(monitorRow());
+
+    const res = await jsonRequest(
+      buildApp({ allowedSiteIds: [SITE_A] }),
+      'POST',
+      `/${MONITOR_ID}/attachments`,
+      { configPolicyId: POLICY_ID },
+    );
+
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: SITE_CEILING_WRITE_DENIED_MESSAGE });
+    expect(addFeatureLinkMock).not.toHaveBeenCalled();
+    expect(updateFeatureLinkMock).not.toHaveBeenCalled();
+    expect(getConfigPolicyMock).not.toHaveBeenCalled();
+  });
+
+  it('POST /monitor-definitions/:id/attachments createPolicyFor branch denied 403 too', async () => {
+    getMonitorDefinitionMock.mockResolvedValue(monitorRow());
+
+    const res = await jsonRequest(
+      buildApp({ allowedSiteIds: [SITE_A] }),
+      'POST',
+      `/${MONITOR_ID}/attachments`,
+      { createPolicyFor: { level: 'site', targetId: SITE_A } },
+    );
+
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: SITE_CEILING_WRITE_DENIED_MESSAGE });
+    expect(createConfigPolicyMock).not.toHaveBeenCalled();
+    expect(assignPolicyMock).not.toHaveBeenCalled();
+  });
+
+  it('DELETE /monitor-definitions/:id/attachments/:attachmentId denied 403, no detach', async () => {
+    getMonitorDefinitionMock.mockResolvedValue(monitorRow());
+
+    const res = await jsonRequest(
+      buildApp({ allowedSiteIds: [SITE_A] }),
+      'DELETE',
+      `/${MONITOR_ID}/attachments/${ATTACHMENT_ID}`,
+    );
+
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: SITE_CEILING_WRITE_DENIED_MESSAGE });
+    expect(removeFeatureLinkMock).not.toHaveBeenCalled();
+    expect(updateFeatureLinkMock).not.toHaveBeenCalled();
+    expect(getConfigPolicyMock).not.toHaveBeenCalled();
+  });
+
+  it('an unrestricted org caller still succeeds (control)', async () => {
+    const created = monitorRow();
+    createMonitorDefinitionMock.mockResolvedValue(created);
+
+    const res = await jsonRequest(buildApp(), 'POST', '', validCreateBody());
+
+    expect(res.status).toBe(201);
+    expect(createMonitorDefinitionMock).toHaveBeenCalledTimes(1);
+  });
+});
+
 vi.mock('./monitorDefinitions.conversion', async () => {
   const { Hono } = await import('hono');
   return { monitorConversionRoutes: new Hono().get('/pending', (c) => c.json({ data: { policies: 0, rows: 0 } })) };
@@ -737,4 +1094,55 @@ it('mounts the literal conversion resource before monitor ids', async () => {
   expect(response.status).toBe(200);
   expect(await response.json()).toEqual({ data: { policies: 0, rows: 0 } });
   expect(getMonitorDefinitionMock).not.toHaveBeenCalled();
+});
+
+// #7206: a built-in system anchor rule ("Reboot pending too long", "Patch job
+// failure") is refused with a specific, readable outcome — never the old
+// misleading "Alert template not found" 404.
+describe('POST /monitor-definitions/convert-from-rule/:ruleId', () => {
+  it('maps system_managed to 409 RULE_SYSTEM_MANAGED with a readable message', async () => {
+    const { convertRuleToMonitor } = await import('../services/monitors/ruleConversionService');
+    vi.mocked(convertRuleToMonitor).mockResolvedValueOnce({ ok: false, failure: { kind: 'system_managed' } });
+
+    const res = await jsonRequest(buildApp(), 'POST', '/convert-from-rule/rule-1');
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({
+      error: 'System-managed rule — it keeps alerting on its own and needs no conversion',
+      code: 'RULE_SYSTEM_MANAGED',
+    });
+    expect(writeRouteAuditMock).not.toHaveBeenCalled();
+  });
+
+  it('maps governance_denied (site-restricted caller) to 403', async () => {
+    const { convertRuleToMonitor } = await import('../services/monitors/ruleConversionService');
+    vi.mocked(convertRuleToMonitor).mockResolvedValueOnce({ ok: false, failure: { kind: 'governance_denied' } });
+
+    const res = await jsonRequest(buildApp(), 'POST', '/convert-from-rule/rule-1');
+
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: expect.stringMatching(/Site-restricted/) });
+  });
+
+  it('maps a conversion refusal raised inside the group transaction to its status, not a 500', async () => {
+    const { convertRuleToMonitor } = await import('../services/monitors/ruleConversionService');
+    const { ConversionError } = await import('../services/monitors/conversion/errors');
+    vi.mocked(convertRuleToMonitor).mockRejectedValueOnce(new ConversionError('preview_stale', 'Template group changed'));
+
+    const res = await jsonRequest(buildApp(), 'POST', '/convert-from-rule/rule-1');
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ error: 'preview_stale' });
+    expect(writeRouteAuditMock).not.toHaveBeenCalled();
+  });
+
+  it('still maps template_not_found to 404', async () => {
+    const { convertRuleToMonitor } = await import('../services/monitors/ruleConversionService');
+    vi.mocked(convertRuleToMonitor).mockResolvedValueOnce({ ok: false, failure: { kind: 'template_not_found' } });
+
+    const res = await jsonRequest(buildApp(), 'POST', '/convert-from-rule/rule-1');
+
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ error: 'Alert template not found' });
+  });
 });

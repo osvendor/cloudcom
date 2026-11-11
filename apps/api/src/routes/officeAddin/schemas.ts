@@ -1,4 +1,42 @@
 import { z } from 'zod';
+import { ticketTypeSchema } from '@breeze/shared';
+
+/**
+ * A `z.coerce.date()` field that reports a plain "<field> is required" when
+ * the value is missing, instead of zod v4's self-contradictory "Expected
+ * date, received Date" (paper cut G2-4, #6497 — `new Date(undefined)` coerces
+ * to an Invalid Date rather than throwing, so bare `z.coerce.date()` never
+ * gets the chance to say the field is absent). Duplicated from
+ * `packages/shared/src/validators/timeEntries.ts` (small, single-file helper).
+ */
+function requiredDate(fieldName: string) {
+  return z.any().transform((val, ctx) => {
+    // `z.coerce.date()` runs `new Date(val)`, and `new Date(null)`,
+    // `new Date(false)`, and `new Date(0)` all evaluate to a "valid"
+    // 1970-01-01 epoch Date rather than throwing — so a `null`/boolean/`0`
+    // sentinel for "not set" would otherwise sail through coercion and
+    // silently create a ~56-year-long time entry instead of being rejected
+    // the same way an omitted field is. Reject every non-date-like input
+    // shape up front; only strings, finite numbers, and Date instances are
+    // allowed to reach coercion.
+    if (
+      val === undefined ||
+      val === null ||
+      typeof val === 'boolean' ||
+      val === 0 ||
+      !(typeof val === 'string' || (typeof val === 'number' && Number.isFinite(val)) || val instanceof Date)
+    ) {
+      ctx.addIssue({ code: 'custom', message: `${fieldName} is required` });
+      return z.NEVER;
+    }
+    const parsed = z.coerce.date().safeParse(val);
+    if (!parsed.success) {
+      ctx.addIssue({ code: 'custom', message: `${fieldName} must be a valid date` });
+      return z.NEVER;
+    }
+    return parsed.data;
+  });
+}
 
 /** Body of POST /office-addin/auth/exchange (spec §9). */
 export const exchangeSchema = z.object({
@@ -61,6 +99,7 @@ export const fromEmailSchema = z.object({
     z.object({ kind: z.literal('raw') }), // submitter_email/name only
   ]),
   followUpOf: z.object({ ticketId: z.string().uuid() }).nullish(), // closed-ticket continuation: carries thread key + prior number
+  ticketType: ticketTypeSchema.optional(), // #7900: omitted -> incident
 });
 
 /** Body of POST /office-addin/tickets/:id/link-email (spec §3.3, Task 17). */
@@ -87,6 +126,19 @@ export const draftSchema = z.object({
 export const addinStartTimerSchema = z.object({
   ticketId: z.string().uuid(),
   description: z.string().max(10_000).optional(),
+  /**
+   * #4628 W04. OMIT to let the server apply the ticket category's default
+   * work type at stamp time (§3.1) — what kept pre-W04 add-in builds priced
+   * correctly and still the right behaviour for "I didn't say". No `null`:
+   * the add-in offers a work type or the default, never "explicitly none".
+   */
+  workTypeId: z.string().uuid().optional(),
+  /**
+   * #8196 W05: the "log as non-billable" retry after a 409 APPROVAL_REQUIRED
+   * (the customer-approval gate refuses only billable timer STARTs). Omit for
+   * the server default.
+   */
+  isBillable: z.boolean().optional(),
 });
 
 /** Body of POST /office-addin/time/stop (Task 18). Same shape as the web `stopTimerSchema`. */
@@ -104,10 +156,17 @@ export const addinStopTimerSchema = z.object({
 export const addinLogTimeSchema = z
   .object({
     ticketId: z.string().uuid(),
-    startedAt: z.coerce.date(),
-    endedAt: z.coerce.date(),
+    startedAt: requiredDate('startedAt'),
+    endedAt: requiredDate('endedAt'),
     description: z.string().min(1).max(10_000),
     isBillable: z.boolean().optional(),
+    /**
+     * #4628 W04. OMIT to let the server apply the ticket category's default
+     * work type at stamp time (§3.1) — what kept pre-W04 add-in builds priced
+     * correctly and still the right behaviour for "I didn't say". No `null`:
+     * the add-in offers a work type or the default, never "explicitly none".
+     */
+    workTypeId: z.string().uuid().optional(),
   })
   .refine((v) => v.endedAt.getTime() > v.startedAt.getTime(), {
     message: 'endedAt must be after startedAt',

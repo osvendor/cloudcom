@@ -1,13 +1,15 @@
-import { BREEZE_AI_GUARDRAILS_CORE } from './aiAgentSystemPrompt';
+import { buildMcpGuardrailsCore } from './aiAgentSystemPrompt';
 
 // Approximate tool count stated in the instructions below. Kept as a rounded
 // literal (not derived from the aiTools registry at runtime) so this string
 // module stays decoupled from the heavy tool registry — mcpGuidancePromptTools
 // .test.ts asserts it stays within tolerance of the live count and fails loudly
 // if the two drift apart.
-export const MCP_TOOL_COUNT_APPROX = 220;
+export const MCP_TOOL_COUNT_APPROX = 372;
 
-export const MCP_SERVER_INSTRUCTIONS = `You are connected to Breeze RMM — a multi-tenant Remote Monitoring and Management platform for MSPs. This server exposes ~${MCP_TOOL_COUNT_APPROX} tools for managing devices, alerts, patches, backups, security, tickets, and configuration policies.
+/** Server instructions; approval wording follows the action-intents flag (D-B34). */
+export function buildMcpServerInstructions(intentsEnabled: boolean): string {
+  return `You are connected to Breeze RMM — a multi-tenant Remote Monitoring and Management platform for MSPs. This server exposes ~${MCP_TOOL_COUNT_APPROX} tools for managing devices, alerts, patches, backups, security, tickets, and configuration policies.
 
 ## Tenant hierarchy
 Partner (MSP) → Organization (customer) → Site (location) → Device Group → Device. You can only see and act within the organizations your API key/token grants access to.
@@ -17,10 +19,17 @@ Partner (MSP) → Organization (customer) → Site (location) → Device Group �
 2. Read before write: prefer query_* and get_* tools to understand state before any manage_* or execute_* call.
 3. One target at a time unless the user explicitly asks for a fleet-wide operation.
 
-${BREEZE_AI_GUARDRAILS_CORE}
+${buildMcpGuardrailsCore(intentsEnabled)}
+
+## Paged and large results
+List results carry hasMore and nextCursor. When hasMore is true and you need more, call the same tool again with cursor set to nextCursor and the same filters. A result with artifact.handle means the full output is stored: use read_artifact to page through it instead of re-running the query.
 
 ## Common workflows
 For frequent MSP tasks, use the guided prompts: breeze-fleet-triage, breeze-device-investigate, breeze-patch-remediate, breeze-incident-kickoff, breeze-turnkey-setup.`;
+}
+
+/** Flag-off value; existing importers keep this name. */
+export const MCP_SERVER_INSTRUCTIONS = buildMcpServerInstructions(false);
 
 export interface McpPromptDefinition {
   name: string;
@@ -50,10 +59,10 @@ Do NOT perform any mutation. Rank findings by severity and lead with the most ur
     name: 'breeze-device-investigate',
     description: 'Deep-dive one device and summarize likely root cause (read-only).',
     arguments: [{ name: 'device', description: 'Device name, hostname, or id', required: true }],
-    referencedTools: ['resolve_device_context', 'query_devices', 'get_device_details', 'analyze_metrics', 'search_agent_logs', 'get_device_vulnerabilities'],
+    referencedTools: ['resolve_device_context', 'query_devices', 'get_device_details', 'get_device_hardware_health', 'get_device_time_status', 'list_time_sync_issues', 'analyze_metrics', 'search_agent_logs', 'get_device_vulnerabilities'],
     render: (a) => `Investigate the device "${a.device ?? '(unspecified)'}" in Breeze RMM. Steps:
 1. Resolve it with resolve_device_context (or query_devices to search by name); ECHO the resolved device + organization back to the user.
-2. Pull get_device_details, analyze_metrics, and recent logs via search_agent_logs.
+2. Pull get_device_details, get_device_hardware_health, get_device_time_status, analyze_metrics, and recent logs via search_agent_logs. If the reliability score is in question, call get_device_hardware_health with includeReliability=true and cite its drivers/hardwareOffenders30d — never guess a cause the tool output doesn't support. For time findings, call list_time_sync_issues with the resolved deviceId; use its domain context only within the caller's scope.
 3. Check get_device_vulnerabilities.
 4. Summarize the likely root cause and recommended next actions.
 This is a read-only investigation — do not run commands or mutations without explicit user confirmation.`,
@@ -90,7 +99,7 @@ If the user wants customer-facing tracking, open or link a ticket with manage_ti
     name: 'breeze-turnkey-setup',
     description: 'Opinionated baseline configuration wizard — partner-wide by default.',
     arguments: [{ name: 'scope', description: 'partner (all orgs) or a specific org; defaults to partner-wide', required: false }],
-    referencedTools: ['manage_configuration_policy', 'manage_update_rings', 'manage_backup_configs', 'manage_backup_profiles', 'manage_software_policies', 'manage_peripheral_policies', 'manage_dns_policy', 'manage_policy_feature_link', 'apply_configuration_policy'],
+    referencedTools: ['manage_monitor_definitions', 'manage_configuration_policy', 'manage_update_rings', 'manage_backup_configs', 'manage_backup_profiles', 'manage_software_policies', 'manage_peripheral_policies', 'manage_dns_policy', 'manage_policy_feature_link', 'apply_configuration_policy'],
     render: (a) => `Set up a recommended baseline configuration in Breeze RMM${a.scope ? ` for ${a.scope}` : ''}. DEFAULT to partner-wide ownership (ownerScope=partner) so one policy applies to all of the MSP's organizations — ECHO the resolved organization/partner scope back to the user, CONFIRM the ownerScope=partner default, and PREVIEW each policy before applying it.
 
 Before authoring settings, call manage_policy_feature_link (action=describe, featureType) — no existing policy ID is needed. For a link-only feature, create the standalone policy first (manage_software_policies or manage_peripheral_policies), then link its returned UUID as featurePolicyId. Create patch rings with manage_update_rings before linking their IDs. For backup, create the selection profile with manage_backup_profiles and use its ID as featurePolicyId; create storage with manage_backup_configs and put its ID in inlineSettings.destinationConfigId. Backup cadence and retention use nested inlineSettings.schedule and inlineSettings.retention. A partner-owned configuration policy applies to no organizations until assigned.
@@ -101,7 +110,7 @@ Walk through these categories, creating each via a Configuration Policy (manage_
 3. DNS security (manage_dns_policy): enable filtering; block malware/phishing/C2/newly-registered-domain categories.
 4. Peripheral policy (manage_peripheral_policies): block unauthorized USB mass-storage by default; allow HID.
 5. Config/CIS baseline: apply CIS Level 1 baseline for the device OS via the policy's security/compliance feature (inlineSettings).
-6. Core alert rules via the policy's alert_rule feature (inlineSettings): device offline > 15 min; disk > 90%; sustained CPU > 95% for 10 min; failed backup; critical patch missing > 7 days; reliability-score drop.
+6. Core alert conditions as monitors (manage_monitor_definitions, attached via the policy's "monitors" feature link): device offline > 15 min; disk > 90%; sustained CPU > 95% for 10 min; failed backup; critical patch missing > 7 days; reliability-score drop.
 
 These are recommended defaults — let the user adjust values before applying. Never assign a policy without confirming the target scope.`,
   },

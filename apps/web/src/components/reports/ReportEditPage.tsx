@@ -1,10 +1,12 @@
 import { useState, useEffect, useCallback } from 'react';
 import { ArrowLeft, Loader2 } from 'lucide-react';
+import BackupStatusPreviewPanel from './BackupStatusPreviewPanel';
 import ReportBuilder, { type ReportBuilderFormValues } from './ReportBuilder';
 import type { Report, ReportType } from './ReportsList';
 import { fetchWithAuth } from '../../stores/auth';
 import { navigateTo } from '@/lib/navigation';
 import Breadcrumbs from '../layout/Breadcrumbs';
+import { SeriesChildView } from './series/SeriesChildLockBanner';
 import { PostureBackupRequiredField } from './PostureReportOptionsForm';
 import {
   DEFAULT_HARDWARE_LIFECYCLE_OPTIONS,
@@ -12,6 +14,12 @@ import {
   hardwareLifecycleOptionsFromConfig,
   type HardwareLifecycleOptions,
 } from './HardwareLifecycleOptionsForm';
+import {
+  DEFAULT_BACKUP_STATUS_OPTIONS,
+  BackupStatusOptionsFields,
+  backupStatusOptionsFromConfig,
+  type BackupStatusOptions,
+} from './BackupStatusOptionsForm';
 import {
   DEFAULT_THREAT_DETECTION_OPTIONS,
   ThreatDetectionOptionsFields,
@@ -36,11 +44,84 @@ import {
   identityAccessOptionsFromConfig,
   type IdentityAccessOptions,
 } from './IdentityAccessOptionsForm';
+import {
+  DEFAULT_TICKET_SLA_PERFORMANCE_OPTIONS,
+  isTicketSlaPerformanceOptionsValid,
+  ticketSlaPerformanceConfigFromOptions,
+  TicketSlaPerformanceOptionsFields,
+  ticketSlaPerformanceOptionsFromConfig,
+  type TicketSlaPerformanceOptions,
+} from './TicketSlaPerformanceOptionsForm';
+import {
+  DEFAULT_TICKET_SLA_OPTIONS,
+  TicketSlaOptionsFields,
+  isTicketSlaOptionsValid,
+  ticketSlaConfigFromOptions,
+  ticketSlaOptionsFromConfig,
+  type TicketSlaOptions,
+} from './TicketSlaOptionsForm';
+import {
+  DEFAULT_TECHNICIAN_TIME_OPTIONS,
+  TechnicianTimeOptionsFields,
+  isTechnicianTimeOptionsValid,
+  technicianTimeConfigFromOptions,
+  technicianTimeOptionsFromConfig,
+  type TechnicianTimeOptions,
+} from './TechnicianTimeOptionsForm';
+import {
+  DEFAULT_AR_AGING_OPTIONS,
+  ArAgingOptionsFields,
+  arAgingConfigFromOptions,
+  arAgingOptionsFromConfig,
+  isArAgingOptionsValid,
+  type ArAgingOptions,
+} from './ArAgingOptionsForm';
+import {
+  DEFAULT_AI_USAGE_BY_CLIENT_OPTIONS,
+  AiUsageByClientOptionsFields,
+  aiUsageByClientConfigFromOptions,
+  aiUsageByClientOptionsFromConfig,
+  isAiUsageByClientOptionsValid,
+  type AiUsageByClientOptions,
+} from './AiUsageByClientOptionsForm';
+import {
+  DEFAULT_MRR_RENEWALS_OPTIONS,
+  MrrRenewalsOptionsFields,
+  isMrrRenewalsOptionsValid,
+  mrrRenewalsConfigFromOptions,
+  mrrRenewalsOptionsFromConfig,
+  type MrrRenewalsOptions,
+} from './MrrRenewalsOptionsForm';
+import {
+  DEFAULT_QUOTE_WIN_RATE_OPTIONS,
+  QuoteWinRateOptionsFields,
+  isQuoteWinRateOptionsValid,
+  quoteWinRateConfigFromOptions,
+  quoteWinRateOptionsFromConfig,
+  type QuoteWinRateOptions,
+} from './QuoteWinRateOptionsForm';
+import {
+  DEFAULT_CLIENT_PROFITABILITY_OPTIONS,
+  ClientProfitabilityOptionsFields,
+  clientProfitabilityConfigFromOptions,
+  clientProfitabilityOptionsFromConfig,
+  isClientProfitabilityOptionsValid,
+  type ClientProfitabilityOptions,
+} from './ClientProfitabilityOptionsForm';
+import { isBusinessReportType } from './businessReportAccess';
+import {
+  BUSINESS_OPTION_CONFIG_KEYS,
+  BUSINESS_REFUSED_CONFIG_KEYS,
+  isSelectorlessOrgReportType,
+  omitConfigKeys,
+} from './businessReportConfig';
 import { useTranslation } from 'react-i18next';
 // Initializes the shared i18next singleton. Islands hydrate independently, so
 // an island that hydrates before whichever other island happens to pull i18n in
 // would otherwise render raw keys (and mismatch the SSR markup).
 import '../../lib/i18n';
+import { useStableT } from '@/lib/i18n/useStableT';
+import { usePageItemName } from '../layout/usePageItemName';
 
 type ReportEditPageProps = {
   reportId: string;
@@ -48,39 +129,69 @@ type ReportEditPageProps = {
 
 export default function ReportEditPage({ reportId }: ReportEditPageProps) {
   const { t } = useTranslation('reports');
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   const [report, setReport] = useState<Report | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
+  const [notFound, setNotFound] = useState(false);
   const [backupRequired, setBackupRequired] = useState(true);
   const [lifecycleOptions, setLifecycleOptions] = useState<HardwareLifecycleOptions>(DEFAULT_HARDWARE_LIFECYCLE_OPTIONS);
+  const [backupStatusOptions, setBackupStatusOptions] = useState<BackupStatusOptions>(DEFAULT_BACKUP_STATUS_OPTIONS);
   const [threatOptions, setThreatOptions] = useState<ThreatDetectionOptions>(DEFAULT_THREAT_DETECTION_OPTIONS);
   const [endpointManagementOptions, setEndpointManagementOptions] = useState<EndpointManagementOptions>(DEFAULT_ENDPOINT_MANAGEMENT_OPTIONS);
   const [vulnerabilityOptions, setVulnerabilityOptions] = useState<VulnerabilityManagementOptions>(DEFAULT_VULNERABILITY_MANAGEMENT_OPTIONS);
   const [identityOptions, setIdentityOptions] = useState<IdentityAccessOptions>(DEFAULT_IDENTITY_ACCESS_OPTIONS);
+  const [slaPerformanceOptions, setSlaPerformanceOptions] = useState<TicketSlaPerformanceOptions>(DEFAULT_TICKET_SLA_PERFORMANCE_OPTIONS);
+  const [ticketSlaOptions, setTicketSlaOptions] = useState<TicketSlaOptions>(DEFAULT_TICKET_SLA_OPTIONS);
+  const [technicianTimeOptions, setTechnicianTimeOptions] = useState<TechnicianTimeOptions>(DEFAULT_TECHNICIAN_TIME_OPTIONS);
+  const [arAgingOptions, setArAgingOptions] = useState<ArAgingOptions>(DEFAULT_AR_AGING_OPTIONS);
+  const [aiUsageOptions, setAiUsageOptions] = useState<AiUsageByClientOptions>(DEFAULT_AI_USAGE_BY_CLIENT_OPTIONS);
+  const [mrrRenewalsOptions, setMrrRenewalsOptions] = useState<MrrRenewalsOptions>(DEFAULT_MRR_RENEWALS_OPTIONS);
+  const [quoteWinRateOptions, setQuoteWinRateOptions] = useState<QuoteWinRateOptions>(DEFAULT_QUOTE_WIN_RATE_OPTIONS);
+  const [clientProfitabilityOptions, setClientProfitabilityOptions] = useState<ClientProfitabilityOptions>(DEFAULT_CLIENT_PROFITABILITY_OPTIONS);
 
   const fetchReport = useCallback(async () => {
     try {
       setLoading(true);
       setError(undefined);
+      setNotFound(false);
       const response = await fetchWithAuth(`/reports/${reportId}`);
+      // A 404 is not only "deleted": the API hides a report whose type the
+      // caller may not see (business types for an org-scope user, or a missing
+      // tickets/time_entries/invoices permission) behind the same 404, so it
+      // gets the not-found state rather than a generic fetch failure.
+      if (response.status === 404) {
+        setNotFound(true);
+        setReport(null);
+        return;
+      }
       if (!response.ok) {
-        throw new Error(t('reports.reportEditPage.errors.fetchReport'));
+        throw new Error(stableT('reports.reportEditPage.errors.fetchReport'));
       }
       const data = await response.json() as Report;
       setReport(data);
       const config = data.config as Record<string, unknown>;
       setBackupRequired(config.backupRequired !== false);
       setLifecycleOptions(hardwareLifecycleOptionsFromConfig(config));
+      setBackupStatusOptions(backupStatusOptionsFromConfig(config));
       setThreatOptions(threatDetectionOptionsFromConfig(config));
       setEndpointManagementOptions(endpointManagementOptionsFromConfig(config));
       setVulnerabilityOptions(vulnerabilityManagementOptionsFromConfig(config));
       setIdentityOptions(identityAccessOptionsFromConfig(config));
+      setSlaPerformanceOptions(ticketSlaPerformanceOptionsFromConfig(config));
+      setTicketSlaOptions(ticketSlaOptionsFromConfig(config));
+      setTechnicianTimeOptions(technicianTimeOptionsFromConfig(config));
+      setArAgingOptions(arAgingOptionsFromConfig(config));
+      setAiUsageOptions(aiUsageByClientOptionsFromConfig(config));
+      setMrrRenewalsOptions(mrrRenewalsOptionsFromConfig(config));
+      setQuoteWinRateOptions(quoteWinRateOptionsFromConfig(config));
+      setClientProfitabilityOptions(clientProfitabilityOptionsFromConfig(config));
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('reports.reportEditPage.errors.generic'));
+      setError(err instanceof Error ? err.message : stableT('reports.reportEditPage.errors.generic'));
     } finally {
       setLoading(false);
     }
-  }, [reportId, t]);
+  }, [reportId, stableT]);
 
   useEffect(() => {
     fetchReport();
@@ -94,6 +205,8 @@ export default function ReportEditPage({ reportId }: ReportEditPageProps) {
   const handleCancel = useCallback(() => {
     void navigateTo('/reports');
   }, []);
+
+  usePageItemName(report?.name);
 
   if (loading) {
     return (
@@ -113,6 +226,7 @@ export default function ReportEditPage({ reportId }: ReportEditPageProps) {
           <a
             href="/reports"
             className="flex h-10 w-10 items-center justify-center rounded-md border hover:bg-muted"
+            aria-label={t('reports.reportEditPage.backToReports')}
           >
             <ArrowLeft className="h-4 w-4" />
           </a>
@@ -120,8 +234,14 @@ export default function ReportEditPage({ reportId }: ReportEditPageProps) {
         </div>
 
         <div className="rounded-lg border border-destructive/40 bg-destructive/10 p-6 text-center">
-          <p className="text-sm text-destructive">{error || t('reports.reportEditPage.notFound')}</p>
+          <p
+            data-testid={notFound || !error ? 'report-edit-not-found' : 'report-edit-error'}
+            className="text-sm text-destructive"
+          >
+            {notFound || !error ? t('reports.reportEditPage.notFound') : error}
+          </p>
           <a
+            data-testid="report-edit-back"
             href="/reports"
             className="mt-4 inline-block rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:opacity-90"
           >
@@ -132,24 +252,174 @@ export default function ReportEditPage({ reportId }: ReportEditPageProps) {
     );
   }
 
+  // A multi-org series child (W02 `seriesId`): shared fields are locked; only
+  // the org's recipient overrides and (for the MSP) Detach are offered.
+  if (report.seriesId) {
+    return (
+      <div className="space-y-6">
+        <Breadcrumbs items={[
+          { label: t('reports.reportEditPage.reportsBreadcrumb'), href: '/reports' },
+          { label: report.name || t('reports.reportEditPage.title') }
+        ]} />
+        <div className="flex items-center gap-4">
+          <a
+            href="/reports"
+            className="flex h-10 w-10 items-center justify-center rounded-md border hover:bg-muted"
+            aria-label={t('reports.reportEditPage.backToReports')}
+          >
+            <ArrowLeft className="h-4 w-4" />
+          </a>
+          <div>
+            <h1 className="text-xl font-semibold tracking-tight">{t('reports.reportEditPage.title')}</h1>
+            <p className="text-muted-foreground">{report.name}</p>
+          </div>
+        </div>
+        <SeriesChildView report={report} onChanged={fetchReport} />
+      </div>
+    );
+  }
+
   // Convert report config to form values
   const config = report.config as Record<string, unknown>;
   const isPosture = report.type === 'security_compliance_posture';
   const isLifecycle = report.type === 'hardware_lifecycle';
+  const isBackupStatus = report.type === 'backup_status';
   const isThreatDetection = report.type === 'threat_detection_review';
   const isEndpointManagement = report.type === 'endpoint_management_review';
   const isVulnerability = report.type === 'vulnerability_management';
   const isIdentityAccess = report.type === 'identity_access_review';
+  const isSlaPerformance = report.type === 'ticket_sla_performance';
+  const isTicketSla = report.type === 'ticket_sla_attainment';
+  const isTechnicianTime = report.type === 'technician_time_billability';
+  const isArAging = report.type === 'ar_aging';
+  const isAiUsage = report.type === 'ai_usage_by_client';
+  const isMrrRenewals = report.type === 'mrr_renewals';
+  const isQuoteWinRate = report.type === 'quote_win_rate';
+  const isClientProfitability = report.type === 'client_profitability';
+  const isBusiness = isBusinessReportType(report.type);
+  // Partner-owned (covers all the partner's organizations): the PUT must not
+  // carry any orgId — the API answers 400 report_ownership_immutable.
+  const partnerOwned = report.orgId == null && report.partnerId != null;
+  // The stored run time / day / date (config.schedule, which the schedule
+  // worker reads). Without them the builder falls back to 09:00 / Monday / 1st
+  // and a save moves the report's delivery (seriesBuilderDefaults does the same).
+  const scheduleDetail =
+    config.schedule && typeof config.schedule === 'object' && !Array.isArray(config.schedule)
+      ? (config.schedule as Record<string, unknown>)
+      : {};
+  // The extra email addresses a template dialog (or the builder) stored. The
+  // builder owns this key and PUT replaces `config`, so not hydrating it here
+  // would empty the list on the first save.
+  const storedEmailRecipients = Array.isArray(config.emailRecipients)
+    ? config.emailRecipients.filter((email): email is string => typeof email === 'string')
+    : [];
+  // #9728: the custom builder's own state (data source, columns, record
+  // filters, grouping, chart, checked formats) lives on `config`; PUT replaces
+  // `config`, so a form that opens blank writes the blank back. Each key is
+  // restored only when it was stored with the right shape.
+  const isRecord = (v: unknown): v is Record<string, unknown> =>
+    typeof v === 'object' && v !== null && !Array.isArray(v);
+  const builderTypes = ['devices', 'alerts', 'patches', 'compliance', 'activity'];
+  const chartTypes = ['table', 'bar', 'line', 'pie'];
+  const formatValues = ['csv', 'pdf', 'excel'];
+  const storedBuilderState: Partial<ReportBuilderFormValues> = {
+    ...(typeof config.builderType === 'string' && builderTypes.includes(config.builderType)
+      ? { builderType: config.builderType as ReportBuilderFormValues['builderType'] }
+      : {}),
+    ...(isRecord(config.dataSource)
+      && Object.values(config.dataSource).every((v) => typeof v === 'string' || typeof v === 'boolean')
+      ? { dataSource: config.dataSource as ReportBuilderFormValues['dataSource'] }
+      : {}),
+    ...(Array.isArray(config.columns) && config.columns.every((c) => typeof c === 'string')
+      ? { columns: config.columns as string[] }
+      : {}),
+    ...(Array.isArray(config.filterConditions) && config.filterConditions.every(
+      (c) => isRecord(c)
+        && ['id', 'field', 'operator', 'value'].every((k) => typeof c[k] === 'string')
+        && (c.logic === 'and' || c.logic === 'or'),
+    )
+      ? { filterConditions: config.filterConditions as ReportBuilderFormValues['filterConditions'] }
+      : {}),
+    ...(typeof config.groupBy === 'string' ? { groupBy: config.groupBy } : {}),
+    ...(isRecord(config.aggregation) && typeof config.aggregation.type === 'string'
+      ? { aggregation: config.aggregation as ReportBuilderFormValues['aggregation'] }
+      : {}),
+    ...(typeof config.chartType === 'string' && chartTypes.includes(config.chartType)
+      ? { chartType: config.chartType as ReportBuilderFormValues['chartType'] }
+      : {}),
+    ...(Array.isArray(config.exportFormats)
+      && config.exportFormats.length > 0
+      && config.exportFormats.every((f) => typeof f === 'string' && formatValues.includes(f))
+      ? { exportFormats: config.exportFormats as ReportBuilderFormValues['exportFormats'] }
+      : {}),
+  };
   const defaultValues: Partial<ReportBuilderFormValues> = {
+    ...(isBusiness || isSelectorlessOrgReportType(report.type) ? {} : storedBuilderState),
     name: report.name,
     type: report.type as ReportType,
     schedule: report.schedule,
+    ...(typeof scheduleDetail.time === 'string' ? { scheduleTime: scheduleDetail.time } : {}),
+    ...(typeof scheduleDetail.day === 'string' ? { scheduleDay: scheduleDetail.day } : {}),
+    ...(typeof scheduleDetail.date === 'string' ? { scheduleDate: scheduleDetail.date } : {}),
     format: report.format,
-    dateRange: (config.dateRange as ReportBuilderFormValues['dateRange']) || {
-      preset: 'last_30_days'
-    },
-    filters: (config.filters as ReportBuilderFormValues['filters']) || {}
+    emailRecipients: storedEmailRecipients,
+    // Business types select by their own period and owner scope; the server
+    // REFUSES a dateRange/filters on them, so none is defaulted here. A
+    // selectorless org type refuses them the same way.
+    ...(isBusiness || isSelectorlessOrgReportType(report.type)
+      ? {}
+      : {
+          dateRange: (config.dateRange as ReportBuilderFormValues['dateRange']) || {
+            preset: 'last_30_days'
+          },
+          filters: (config.filters as ReportBuilderFormValues['filters']) || {}
+        })
   };
+
+  /**
+   * PUT /reports/:id replaces `config` wholesale, so anything the edit page
+   * does not reconstruct is dropped on save. Each curated type folds its own
+   * options over the stored config; every other type passes it through.
+   *
+   * A business type REPLACES its option keys rather than overlaying them: its
+   * form deliberately omits some (SLA "Automatic" group-by, AR unset as-of), and
+   * a plain spread would let the stored value survive. Legacy selectors the
+   * server refuses on business types are dropped too.
+   */
+  const businessConfig = (formConfig: Record<string, unknown>) => ({
+    ...omitConfigKeys(config, [...BUSINESS_OPTION_CONFIG_KEYS, ...BUSINESS_REFUSED_CONFIG_KEYS]),
+    ...formConfig,
+  });
+  const curatedConfig: Partial<Record<ReportType, () => Record<string, unknown>>> = {
+    security_compliance_posture: () => ({ ...config, backupRequired }),
+    hardware_lifecycle: () => ({ ...config, ...lifecycleOptions }),
+    backup_status: () => ({ ...config, ...backupStatusOptions }),
+    threat_detection_review: () => ({ ...config, ...threatOptions }),
+    endpoint_management_review: () => ({ ...config, ...endpointManagementOptions }),
+    vulnerability_management: () => ({ ...config, ...vulnerabilityOptions }),
+    identity_access_review: () => ({ ...config, ...identityOptions }),
+    ticket_sla_attainment: () => businessConfig(ticketSlaConfigFromOptions(ticketSlaOptions)),
+    technician_time_billability: () => businessConfig(technicianTimeConfigFromOptions(technicianTimeOptions)),
+    ar_aging: () => businessConfig(arAgingConfigFromOptions(arAgingOptions)),
+    ai_usage_by_client: () => businessConfig(aiUsageByClientConfigFromOptions(aiUsageOptions)),
+    mrr_renewals: () => businessConfig(mrrRenewalsConfigFromOptions(mrrRenewalsOptions)),
+    quote_win_rate: () => businessConfig(quoteWinRateConfigFromOptions(quoteWinRateOptions)),
+    client_profitability: () => businessConfig(clientProfitabilityConfigFromOptions(clientProfitabilityOptions)),
+    ticket_sla_performance: () => businessConfig(ticketSlaPerformanceConfigFromOptions(slaPerformanceOptions)),
+  };
+  const baseConfig = curatedConfig[report.type]?.() ?? config;
+  // The options panels render outside the builder, so their validity (custom
+  // period both dates, real days, start <= end; AR as-of a real day) must gate
+  // the builder's own submit — otherwise an invalid option PUTs and 400s.
+  const businessOptionsInvalid =
+    (isTicketSla && !isTicketSlaOptionsValid(ticketSlaOptions))
+    || (isTechnicianTime && !isTechnicianTimeOptionsValid(technicianTimeOptions))
+    || (isArAging && !isArAgingOptionsValid(arAgingOptions))
+    || (isAiUsage && !isAiUsageByClientOptionsValid(aiUsageOptions))
+    || (isMrrRenewals && !isMrrRenewalsOptionsValid(mrrRenewalsOptions))
+    || (isQuoteWinRate && !isQuoteWinRateOptionsValid(quoteWinRateOptions))
+    || (isClientProfitability && !isClientProfitabilityOptionsValid(clientProfitabilityOptions))
+    || (isSlaPerformance && !isTicketSlaPerformanceOptionsValid(slaPerformanceOptions));
 
   return (
     <div className="space-y-6">
@@ -161,6 +431,7 @@ export default function ReportEditPage({ reportId }: ReportEditPageProps) {
         <a
           href="/reports"
           className="flex h-10 w-10 items-center justify-center rounded-md border hover:bg-muted"
+          aria-label={t('reports.reportEditPage.backToReports')}
         >
           <ArrowLeft className="h-4 w-4" />
         </a>
@@ -186,6 +457,14 @@ export default function ReportEditPage({ reportId }: ReportEditPageProps) {
           <HardwareLifecycleOptionsFields value={lifecycleOptions} onChange={setLifecycleOptions} />
         </div>
       )}
+
+      {isBackupStatus && (
+        <div className="rounded-lg border bg-card p-6 shadow-xs">
+          <BackupStatusOptionsFields value={backupStatusOptions} onChange={setBackupStatusOptions} />
+        </div>
+      )}
+
+      {isBackupStatus && <BackupStatusPreviewPanel orgId={report.orgId ?? null} config={baseConfig} />}
 
       {isThreatDetection && (
         <div className="rounded-lg border bg-card p-6 shadow-xs">
@@ -214,25 +493,62 @@ export default function ReportEditPage({ reportId }: ReportEditPageProps) {
         </div>
       )}
 
+      {isSlaPerformance && (
+        <div className="rounded-lg border bg-card p-6 shadow-xs">
+          <TicketSlaPerformanceOptionsFields value={slaPerformanceOptions} onChange={setSlaPerformanceOptions} />
+        </div>
+      )}
+
+      {isTicketSla && (
+        <div className="rounded-lg border bg-card p-6 shadow-xs">
+          <TicketSlaOptionsFields value={ticketSlaOptions} onChange={setTicketSlaOptions} />
+        </div>
+      )}
+
+      {isTechnicianTime && (
+        <div className="rounded-lg border bg-card p-6 shadow-xs">
+          <TechnicianTimeOptionsFields value={technicianTimeOptions} onChange={setTechnicianTimeOptions} />
+        </div>
+      )}
+
+      {isArAging && (
+        <div className="rounded-lg border bg-card p-6 shadow-xs">
+          <ArAgingOptionsFields value={arAgingOptions} onChange={setArAgingOptions} />
+        </div>
+      )}
+
+      {isAiUsage && (
+        <div className="rounded-lg border bg-card p-6 shadow-xs">
+          <AiUsageByClientOptionsFields value={aiUsageOptions} onChange={setAiUsageOptions} />
+        </div>
+      )}
+
+      {isMrrRenewals && (
+        <div className="rounded-lg border bg-card p-6 shadow-xs">
+          <MrrRenewalsOptionsFields value={mrrRenewalsOptions} onChange={setMrrRenewalsOptions} />
+        </div>
+      )}
+
+      {isQuoteWinRate && (
+        <div className="rounded-lg border bg-card p-6 shadow-xs">
+          <QuoteWinRateOptionsFields value={quoteWinRateOptions} onChange={setQuoteWinRateOptions} />
+        </div>
+      )}
+
+      {isClientProfitability && (
+        <div className="rounded-lg border bg-card p-6 shadow-xs">
+          <ClientProfitabilityOptionsFields value={clientProfitabilityOptions} onChange={setClientProfitabilityOptions} />
+        </div>
+      )}
+
       <ReportBuilder
         mode="edit"
         reportId={reportId}
+        reportOrgId={report.orgId ?? null}
         defaultValues={defaultValues}
-        baseConfig={
-          isPosture
-            ? { ...config, backupRequired }
-            : isLifecycle
-              ? { ...config, ...lifecycleOptions }
-              : isThreatDetection
-                ? { ...config, ...threatOptions }
-                : isEndpointManagement
-                  ? { ...config, ...endpointManagementOptions }
-                  : isVulnerability
-                    ? { ...config, ...vulnerabilityOptions }
-                    : isIdentityAccess
-                      ? { ...config, ...identityOptions }
-                      : config
-        }
+        baseConfig={baseConfig}
+        partnerOwned={partnerOwned}
+        submitBlocked={businessOptionsInvalid}
         onSubmit={handleSubmit}
         onCancel={handleCancel}
       />

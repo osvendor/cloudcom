@@ -192,6 +192,91 @@ describe('portal report self-service tenancy', () => {
       ),
     ).rejects.toBeInstanceOf(PortalReportNotFoundError);
   });
+
+  // #6941 (defense in depth): the marker alone is not enough either. Neither
+  // writer of portal_self_service can set it on an msp_staff-audience type
+  // today, but if a row ever carried it (hand edit, future writer) an AR aging
+  // run must still be neither listed nor downloadable from the portal. The
+  // executive_summary run in the same org is the control: it proves the list
+  // is not vacuously empty.
+  runDb('hides an msp_staff-audience run even when its definition carries portal_self_service', async () => {
+    const fixture = await withSystemDbAccessContext(async () => {
+      const partner = await createPartner();
+      const org = await createOrganization({ partnerId: partner.id });
+
+      const scope = {
+        version: 1,
+        kind: 'unrestricted',
+        orgId: org.id,
+      } as const;
+      const authority: UserReportExecutionAuthority = {
+        principalKind: 'user',
+        principalUserId: crypto.randomUUID(),
+        scope,
+        capturedAt: new Date(),
+        fingerprint: siteScopeFingerprint(scope),
+      };
+
+      const seedRun = async (type: 'ar_aging' | 'executive_summary') => {
+        const [definition] = await db.insert(reports).values({
+          orgId: org.id,
+          name: `Flagged ${type}`,
+          type,
+          schedule: 'one_time',
+          format: 'csv',
+          config: {},
+          portalSelfService: true,
+          ...persistedSiteScopeValues(authority),
+        }).returning({ id: reports.id });
+
+        const [run] = await db.insert(reportRuns).values({
+          reportId: definition!.id,
+          status: 'completed',
+          startedAt: new Date(),
+          completedAt: new Date(),
+          result: { rows: [{ customer: 'Acme', balance: 100 }], summary: {} },
+          rowCount: 1,
+          requestedByKind: 'user',
+          requestedByUserId: null,
+          requestedByPortalUserId: null,
+          ...persistedSiteScopeValues(authority),
+        }).returning({ id: reportRuns.id });
+        return run!.id;
+      };
+
+      return {
+        org,
+        mspStaffRunId: await seedRun('ar_aging'),
+        customerRunId: await seedRun('executive_summary'),
+      };
+    });
+
+    const listed = await withDbAccessContext(orgContext(fixture.org.id), () =>
+      listPortalRuns(fixture.org.id, 'UTC', { page: 1, limit: 50 }),
+    );
+    const listedIds = listed.data.map((row) => row.id);
+    expect(listedIds).toContain(fixture.customerRunId);
+    expect(listedIds).not.toContain(fixture.mspStaffRunId);
+    expect(listed.data.map((row) => row.type)).not.toContain('ar_aging');
+
+    await expect(
+      withDbAccessContext(orgContext(fixture.org.id), () =>
+        renderRunCsv(fixture.customerRunId, fixture.org.id),
+      ),
+    ).resolves.toContain('Acme');
+
+    await expect(
+      withDbAccessContext(orgContext(fixture.org.id), () =>
+        renderRunCsv(fixture.mspStaffRunId, fixture.org.id),
+      ),
+    ).rejects.toBeInstanceOf(PortalReportNotFoundError);
+
+    await expect(
+      withDbAccessContext(orgContext(fixture.org.id), () =>
+        renderRunPdf(fixture.mspStaffRunId, fixture.org.id, 'UTC'),
+      ),
+    ).rejects.toBeInstanceOf(PortalReportNotFoundError);
+  });
 });
 
 // Spec section 4, decision A2: enable_lifecycle gates the hardware lifecycle
@@ -433,5 +518,85 @@ describe('hardware_lifecycle visibility follows enable_lifecycle', () => {
       .toEqual([]);
     expect((portalDefinition?.config as { sites?: string[] })?.sites)
       .not.toContain(otherSiteId);
+  });
+});
+
+// #9774: the portal offers a CSV link only when csvAvailable is true. The flag
+// is computed in SQL on the list path, so it must be proven against real
+// Postgres (the unit tests mock the DB) and must agree with renderRunCsv.
+describe('listPortalRuns csvAvailable', () => {
+  runDb('is true only for a result with a rows array, matching renderRunCsv', async () => {
+    const fixture = await withSystemDbAccessContext(async () => {
+      const partner = await createPartner();
+      const org = await createOrganization({ partnerId: partner.id });
+      const [portalUser] = await db.insert(portalUsers).values({
+        orgId: org.id,
+        email: `portal-${crypto.randomUUID()}@example.test`,
+        status: 'active',
+      }).returning({ id: portalUsers.id });
+      await db.insert(portalBranding).values({ orgId: org.id, enableReports: true });
+
+      const scope = { version: 1, kind: 'unrestricted', orgId: org.id } as const;
+      const authority: UserReportExecutionAuthority = {
+        principalKind: 'user',
+        principalUserId: crypto.randomUUID(),
+        scope,
+        capturedAt: new Date(),
+        fingerprint: siteScopeFingerprint(scope),
+      };
+      const [definition] = await db.insert(reports).values({
+        orgId: org.id,
+        name: 'Customer portal — Executive summary',
+        type: 'executive_summary',
+        schedule: 'one_time',
+        format: 'pdf',
+        config: { dateRange: { preset: 'last_30_days' } },
+        portalSelfService: true,
+        ...persistedSiteScopeValues(authority),
+      }).returning({ id: reports.id });
+
+      const base = {
+        reportId: definition!.id,
+        status: 'completed' as const,
+        startedAt: new Date(),
+        completedAt: new Date(),
+        requestedByKind: 'portal_user' as const,
+        requestedByUserId: null,
+        requestedByPortalUserId: portalUser!.id,
+        ...persistedSiteScopeValues(authority),
+      };
+      const insertRun = async (result: unknown) => {
+        const [run] = await db.insert(reportRuns).values({
+          ...base,
+          result: result as never,
+        }).returning({ id: reportRuns.id });
+        return run!.id;
+      };
+      return {
+        org,
+        withRows: await insertRun({ rows: [{ a: 1 }], summary: {} }),
+        noRows: await insertRun({ summary: { deviceCount: 12 } }),
+        nullResult: await insertRun(null),
+      };
+    });
+
+    const listed = await withDbAccessContext(orgContext(fixture.org.id), () =>
+      listPortalRuns(fixture.org.id, 'UTC', { page: 1, limit: 50 }),
+    );
+    const flag = (id: string) => listed.data.find((row) => row.id === id)?.csvAvailable;
+    expect(flag(fixture.withRows)).toBe(true);
+    expect(flag(fixture.noRows)).toBe(false);
+    expect(flag(fixture.nullResult)).toBe(false);
+
+    await expect(
+      withDbAccessContext(orgContext(fixture.org.id), () =>
+        renderRunCsv(fixture.withRows, fixture.org.id),
+      ),
+    ).resolves.toEqual(expect.any(String));
+    await expect(
+      withDbAccessContext(orgContext(fixture.org.id), () =>
+        renderRunCsv(fixture.noRows, fixture.org.id),
+      ),
+    ).rejects.toThrow();
   });
 });

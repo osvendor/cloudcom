@@ -6,7 +6,7 @@ import { randomUUID } from 'node:crypto';
  * - file_operations (list Tier 2, other actions Tier 3): Perform file operations
  *   on a device. Reads/writes run as root/LocalSystem on the endpoint, so read
  *   is privileged (requires devices.execute + approval), same as write/delete
- *   (SR5-01). list is recon-only and auto-executes with audit.
+ *   (privileged-read rule). list is recon-only and auto-executes with audit.
  * - analyze_disk_usage (Tier 1): Analyze filesystem usage for a device
  * - disk_cleanup (Tier 1 preview, Tier 3 execute): Preview or execute disk cleanup
  * - system_cleanup (Tier 1 list/status, Tier 3 run): OS-native maintenance
@@ -29,6 +29,9 @@ import { eq, and, SQL } from 'drizzle-orm';
 import type { AuthContext } from '../middleware/auth';
 import type { AiTool } from './aiTools';
 import { AGENT_MAX_FILE_WRITE_BYTES } from '../routes/systemTools/schemas';
+import { isAgentConfigPath } from '../routes/systemTools/sensitiveTargets';
+import { aiPathRefusal } from './aiPathRestriction';
+import { requestsLiveDeviceRead } from './aiLiveDeviceReads';
 import {
   buildCleanupPreview,
   getLatestFilesystemSnapshot,
@@ -36,25 +39,30 @@ import {
   parseFilesystemAnalysisStdout,
   setFilesystemScanGeneration,
   clearFilesystemScanGeneration,
+  findInFlightFilesystemScan,
   safeCleanupCategories,
   readPlanPreviewCandidates,
 } from './filesystemAnalysis';
 import { aiExecuteCommand, aiExecuteCommandWithSystemPrecheck, requireAiOrigin } from './aiDispatch';
+import { inToolDbPhase } from './aiToolDbContext';
 import {
   AGENT_UPDATE_REQUIRED_ERROR,
   MIN_AGENT_VERSION_SYSTEM_CLEANUP,
   awaitSystemCleanupResult,
   parseAgentJson,
   queueSystemCleanupList,
+  cancelSystemCleanupRun,
   resolveSystemCleanupRunStatus,
   startSystemCleanupRun,
   systemCleanupCatalogSchema,
 } from './systemCleanup';
 import { CommandTypes } from './commandTypes';
 import { createAuditLogAsync } from './auditService';
+import { aiOriginAuditActor } from './aiOriginColumns';
 import { captureException } from './sentry';
 import { writeAuditEvent, requestLikeFromSnapshot } from './auditEvents';
 import { CLEANUP_PREVIEW_TTL_HOURS } from '../routes/devices/filesystem';
+import { notParkedDeviceCondition } from './unassignedPool/selectorPredicate';
 
 type AiToolTier = 1 | 2 | 3 | 4;
 
@@ -100,7 +108,7 @@ async function verifyDeviceAccess(
   if (auth.allowedDeviceIds && !auth.allowedDeviceIds.includes(deviceId)) {
     return { error: 'Device not found or access denied' };
   }
-  const conditions: SQL[] = [eq(devices.id, deviceId)];
+  const conditions: SQL[] = [eq(devices.id, deviceId), notParkedDeviceCondition()];
   const orgCond = auth.orgCondition(devices.orgId);
   if (orgCond) conditions.push(orgCond);
   const [device] = await db.select().from(devices).where(and(...conditions)).limit(1);
@@ -116,13 +124,98 @@ async function verifyDeviceAccess(
   return { device };
 }
 
+type FileCommandResult = Awaited<ReturnType<typeof aiExecuteCommand>>;
+type DescribedDeleteResult = FileCommandResult & {
+  outcome?: 'moved_to_trash' | 'permanently_deleted' | 'unverified';
+  spaceReclaimed?: false;
+  bytesRemoved?: number;
+  message?: string;
+};
+
+function parseAgentStdoutObject(stdout: string | undefined): Record<string, unknown> | null {
+  if (!stdout) return null;
+  try {
+    const parsed: unknown = JSON.parse(stdout);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null;
+  } catch {
+    return null;
+  }
+}
+
+// Every message below stays under the tightest chat-compaction tier's
+// maxStringChars (300, aiToolOutput.ts) so the model never reads a cut one.
+const DELETE_TIMEOUT_MESSAGE = 'The delete timed out waiting for the agent. It may still have happened on the device. List the folder to check before retrying or reporting it.';
+const DELETE_UNVERIFIED_MESSAGE = 'The agent reply did not confirm what happened, so it is unknown whether the item was deleted or any space was freed. List the folder and run analyze_disk_usage refresh=true before reporting.';
+
+/**
+ * A timeout may still have acted on the device after the wait ended; say so
+ * instead of passing back a bare timeout the model reads as "nothing happened".
+ */
+function timedOutDelete(result: FileCommandResult): DescribedDeleteResult | null {
+  return result.status === 'timeout'
+    ? { ...result, outcome: 'unverified', message: DELETE_TIMEOUT_MESSAGE }
+    : null;
+}
+
+/**
+ * #9853: the agent answers a trash move with `{ deleted: true, trashId }`,
+ * which read as "space freed" to the model on a disk that stayed full. The
+ * agent body stays in `stdout` (fenced as device text, trashId included); the
+ * fields added here are API-authored and survive the chat compactor.
+ */
+function describeTrashDeleteResult(result: FileCommandResult): DescribedDeleteResult {
+  const timedOut = timedOutDelete(result);
+  if (timedOut) return timedOut;
+  if (result.status !== 'completed') return result;
+  const body = parseAgentStdoutObject(result.stdout);
+  if (body?.deleted !== true || typeof body.trashId !== 'string') {
+    return { ...result, outcome: 'unverified', message: DELETE_UNVERIFIED_MESSAGE };
+  }
+  return {
+    ...result,
+    outcome: 'moved_to_trash',
+    spaceReclaimed: false,
+    message: 'Moved to the agent trash (trashId in the agent result), not deleted. No disk space was reclaimed: the bytes stay in the trash, normally on the same volume, until it is purged after 30 days. To free space use disk_cleanup (preview, then execute) or delete with permanent: true.',
+  };
+}
+
+function describePermanentDeleteResult(result: FileCommandResult): DescribedDeleteResult {
+  const timedOut = timedOutDelete(result);
+  if (timedOut) return timedOut;
+  if (result.status !== 'completed') return result;
+  const body = parseAgentStdoutObject(result.stdout);
+  const bytesRemoved = body && typeof body.bytesFreed === 'number' && Number.isFinite(body.bytesFreed)
+    ? Math.max(0, body.bytesFreed)
+    : null;
+  if (body?.permanent !== true || bytesRemoved === null) {
+    // A gated agent always answers a permanent delete with both fields. If
+    // they are missing the API cannot tell a permanent delete from a trash
+    // move, so it must not claim either.
+    return { ...result, outcome: 'unverified', message: DELETE_UNVERIFIED_MESSAGE };
+  }
+  // No `spaceReclaimed: true`: the agent's `bytesFreed` is a link-following
+  // stat of the path, and an unlinked file that a process still holds open (a
+  // runaway log) keeps its blocks until that process closes it. The API cannot
+  // see either, so it reports what the agent removed and how to confirm.
+  return {
+    ...result,
+    outcome: 'permanently_deleted',
+    bytesRemoved,
+    message: `Permanently deleted; cannot be restored. The agent removed ${bytesRemoved} bytes, but space returns only if no process still has the file open (restart it) and the path was not a link. Confirm with analyze_disk_usage refresh=true before reporting space freed.`,
+  };
+}
+
+// #6745 (A-W05 follow-up): the largest preview page of realistic candidates
+// that fits the chat budget uncompacted (aiToolsFilesystem.diskCleanup.outputShape.test.ts).
+const DISK_CLEANUP_DEFAULT_CANDIDATES = 35;
+
 export function registerFilesystemTools(aiTools: Map<string, AiTool>): void {
   function registerTool(tool: AiTool): void {
     aiTools.set(tool.definition.name, tool);
   }
 
   // ============================================
-  // file_operations - list Tier 2, other actions Tier 3 (SR5-01)
+  // file_operations - list Tier 2, other actions Tier 3 (privileged-read rule)
   // ============================================
 
   registerTool({
@@ -132,7 +225,7 @@ export function registerFilesystemTools(aiTools: Map<string, AiTool>): void {
     deviceArgs: ['deviceId'],
     definition: {
       name: 'file_operations',
-      description: 'Perform file operations on a device. list auto-executes with audit; read, write, delete, mkdir and rename require approval because the agent reads/writes as root/LocalSystem.',
+      description: 'File operations on a device. list auto-executes; read/write/delete/mkdir/rename need approval (runs as root). delete moves the item to the agent trash on the same volume, which frees no disk space; to free space use disk_cleanup or permanent: true. The AI data policy may refuse profile folders.',
       input_schema: {
         type: 'object' as const,
         properties: {
@@ -140,7 +233,8 @@ export function registerFilesystemTools(aiTools: Map<string, AiTool>): void {
           action: { type: 'string', enum: ['list', 'read', 'write', 'delete', 'mkdir', 'rename'], description: 'File operation' },
           path: { type: 'string', description: 'File or directory path' },
           content: { type: 'string', description: 'File content (for write)' },
-          newPath: { type: 'string', description: 'New path (for rename)' }
+          newPath: { type: 'string', description: 'New path (for rename)' },
+          permanent: { type: 'boolean', description: 'delete only: delete now, not to the agent trash; cannot be restored. A file a process holds open frees space when it closes. Non-empty folders refused.' }
         },
         required: ['deviceId', 'action', 'path']
       }
@@ -163,6 +257,16 @@ export function registerFilesystemTools(aiTools: Map<string, AiTool>): void {
       const fileCommandType = actionMap[input.action as string];
       if (!fileCommandType) return JSON.stringify({ error: `Unknown action: ${input.action}` });
 
+      // Deny the agent's own config/secrets directory outright, regardless
+      // of the caller's permission — this tool does not go through
+      // routes/systemTools (it calls aiExecuteCommand directly), so it must carry its
+      // own copy of the same check the REST file routes apply.
+      const targetPath = input.path as string;
+      const targetNewPath = input.newPath as string | undefined;
+      if (isAgentConfigPath(targetPath) || (targetNewPath !== undefined && isAgentConfigPath(targetNewPath))) {
+        return JSON.stringify({ error: 'Access to this path is not permitted' });
+      }
+
       // The agent rejects file_write payloads over 4MB decoded, and its WS
       // read limit (16MB) is sized from that cap — an oversized frame kills
       // the agent's connection instead of being rejected (issue #2399).
@@ -177,18 +281,54 @@ export function registerFilesystemTools(aiTools: Map<string, AiTool>): void {
         }
       }
 
+      const permanent = input.permanent === true;
+      if (permanent && fileCommandType !== 'file_delete') {
+        return JSON.stringify({ error: 'permanent applies only to the delete action' });
+      }
+
+      if (permanent) {
+        // #9853: the same fail-closed agent-version gate disk_cleanup's execute
+        // lane uses. A gated agent answers a permanent delete with
+        // `{ permanent: true, bytesFreed }`, which is how the result below can
+        // say what was freed. An older or unparseable agent is refused: nothing
+        // is dispatched, so a permanent request never turns into a silent trash
+        // move that frees nothing.
+        if (!agentSupportsCleanupGuard(access.device.agentVersion)) {
+          return JSON.stringify({
+            error: 'agent_update_required',
+            minAgentVersion: MIN_AGENT_VERSION_CLEANUP_GUARD,
+            agentVersion: access.device.agentVersion || null,
+            message: `Nothing was deleted. This agent cannot permanently delete files; permanent delete needs agent ${MIN_AGENT_VERSION_CLEANUP_GUARD} or newer. Upgrade the agent. disk_cleanup has the same requirement. A delete without permanent only moves the item to the agent trash on the same volume and frees no disk space.`,
+          });
+        }
+        // File Manager lane, not the cleanup lane: no `cleanupGuard`, because
+        // the guard confines deletes to the cleanup rule table and refuses
+        // anything modified recently — an active runaway log, the case this
+        // exists for. No `recursive`, so a non-empty folder is refused by the
+        // agent rather than wiped; folders go through disk_cleanup.
+        const result = await aiExecuteCommand(auth, 'file_operations', deviceId, fileCommandType, {
+          path: input.path,
+          permanent: true,
+        }, { userId: auth.user.id, timeoutMs: 30000 });
+        return JSON.stringify(describePermanentDeleteResult(result));
+      }
+
       const result = await aiExecuteCommand(auth, 'file_operations', deviceId, fileCommandType, {
         path: input.path,
         content: input.content,
         newPath: input.newPath
       }, { userId: auth.user.id, timeoutMs: 30000 });
 
+      if (fileCommandType === 'file_delete') {
+        return JSON.stringify(describeTrashDeleteResult(result));
+      }
       return JSON.stringify(result);
     }
   });
 
   // ============================================
-  // analyze_disk_usage - Tier 1 (read-only)
+  // analyze_disk_usage - Tier 1 stored snapshot read; `refresh: true` scans
+  // the device live (Tier 2 read-only, devices:execute — aiLiveDeviceReads.ts)
   // ============================================
 
   registerTool({
@@ -196,14 +336,18 @@ export function registerFilesystemTools(aiTools: Map<string, AiTool>): void {
     domain: 'devices',
     searchHint: 'disk space, low disk, largest folders and files on one device',
     deviceArgs: ['deviceId'],
+    // A refresh waits up to timeoutSeconds + 75 s (90 s minimum, 975 s max)
+    // for the scan, so the handler opens its own short contexts instead of
+    // holding the per-call transaction across it (#7918).
+    selfManagedDbContext: true,
     definition: {
       name: 'analyze_disk_usage',
-      description: 'Analyze filesystem usage for a device and explain what is consuming disk space. Can optionally run a fresh scan.',
+      description: 'Analyze filesystem usage for a device and explain what is consuming disk space. Reads the latest stored scan; refresh=true runs a fresh scan on the device (needs execute permission).',
       input_schema: {
         type: 'object' as const,
         properties: {
           deviceId: { type: 'string', description: 'The device UUID' },
-          refresh: { type: 'boolean', description: 'If true, run a fresh filesystem analysis before returning results' },
+          refresh: { type: 'boolean', description: 'If true, run a fresh filesystem analysis on the device first (also needed when no stored scan exists)' },
           path: { type: 'string', description: 'Volume or directory to analyse (e.g. "C:\\\\", "D:\\\\", "/", "/data"). Defaults to the OS root.' },
           maxDepth: { type: 'number', description: 'Max traversal depth (1-64)' },
           topFiles: { type: 'number', description: 'Largest file rows to keep (1-500)' },
@@ -218,25 +362,49 @@ export function registerFilesystemTools(aiTools: Map<string, AiTool>): void {
     },
     handler: async (input, auth) => {
       const deviceId = input.deviceId as string;
-      const refresh = Boolean(input.refresh);
+      // The same predicate the guardrails classify on: only this input may
+      // reach the device (permission and tier both key on it).
+      const refresh = requestsLiveDeviceRead('analyze_disk_usage', input);
       const maxCandidates = Math.min(Math.max(1, Number(input.maxCandidates) || 50), 200);
 
-      const access = await verifyDeviceAccess(deviceId, auth, refresh);
+      const access = await inToolDbPhase(auth, () => verifyDeviceAccess(deviceId, auth, refresh));
       if ('error' in access) return JSON.stringify({ error: access.error });
       const osType = access.device.osType;
       const scanPath = normalizeScanPath(
         osType,
         typeof input.path === 'string' && input.path.length > 0 ? input.path : osRootScanPath(osType),
       );
+      // The schema checked the raw input; normalisation can respell it
+      // (`C:Users\x` becomes `C:\Users\x`), so check what is actually scanned.
+      const scanRootRefusal = aiPathRefusal(scanPath);
+      if (scanRootRefusal) return JSON.stringify({ error: scanRootRefusal });
       // Narrower than the route's check on purpose: the tool has no volume
       // list, so only the OS root auto-continues a checkpointed baseline. A
       // second volume's scan simply does not self-resume from the AI lane.
       const isRootScopedScan = scanPath === osRootScanPath(osType);
 
-      const snapshot = await getLatestFilesystemSnapshot(deviceId, scanPath);
+      const snapshot = await inToolDbPhase(auth, () => getLatestFilesystemSnapshot(deviceId, scanPath));
       let freshPayload: Record<string, unknown> | null = null;
 
-      if (refresh || !snapshot) {
+      // No stored scan is NOT a reason to scan: that would reach the device
+      // on a call classified (and permission-checked) as a stored read.
+      if (refresh) {
+        // #8509: one scan at a time per device. Report the scan already in
+        // flight (any volume — the agent runs one walker) rather than starting
+        // a second, and BEFORE registering a generation, which would make the
+        // running scan's result look superseded.
+        const inFlight = await inToolDbPhase(auth, () => findInFlightFilesystemScan(deviceId));
+        if (inFlight) {
+          return JSON.stringify({
+            inFlight: true,
+            commandId: inFlight.id,
+            status: inFlight.status,
+            createdAt: inFlight.createdAt,
+            scanPath: inFlight.scanPath ?? scanPath,
+            requestedScanPath: scanPath,
+            message: `A filesystem scan is already running on this device (command ${inFlight.id}, queued ${inFlight.createdAt.toISOString()}); a second one was not started. Call again without refresh once it finishes to read the stored result.`,
+          });
+        }
         const timeoutMs = Math.max(90_000, ((Number(input.timeoutSeconds) || 300) + 75) * 1000);
         const commandId = randomUUID();
         // Commit registration before the command can be delivered. Escaping the
@@ -296,7 +464,7 @@ export function registerFilesystemTools(aiTools: Map<string, AiTool>): void {
       }
 
       if (!snapshot && !freshPayload) {
-        return JSON.stringify({ message: 'No filesystem analysis available. Try refresh=true.' });
+        return JSON.stringify({ message: 'No filesystem analysis stored for this volume yet. Call again with refresh=true to scan the device.' });
       }
 
       // The shared command-result handler owns persistence. Render this command's
@@ -355,6 +523,11 @@ export function registerFilesystemTools(aiTools: Map<string, AiTool>): void {
     domain: 'devices',
     searchHint: 'disk cleanup: preview candidates, execute removal and report reclaimed space',
     deviceArgs: ['deviceId'],
+    // `execute` deletes path by path, up to a 240 s budget, waiting on the
+    // device for each (#7918). Its writes already run in their own committed
+    // contexts (inCleanupContext); only the access check needed one. `preview`
+    // only touches the DB and keeps the per-call transaction.
+    selfManagedDbContext: ['execute'],
     definition: {
       name: 'disk_cleanup',
       description: 'Preview or execute disk cleanup. Preview is read-only. Execute deletes approved safe candidates and reports reclaimed space. Actions: preview, execute.',
@@ -367,7 +540,8 @@ export function registerFilesystemTools(aiTools: Map<string, AiTool>): void {
           categories: { type: 'array', items: { type: 'string' }, description: 'Optional cleanup categories filter for preview' },
           cleanupRunId: { type: 'string', format: 'uuid', description: 'Preview run to execute; defaults to the run remembered from this tool’s own preview' },
           paths: { type: 'array', items: { type: 'string' }, description: 'Selected paths to delete (required for execute)' },
-          maxCandidates: { type: 'number', description: 'Max preview candidates returned in chat (1-200, default 100)' }
+          maxCandidates: { type: 'number', description: `Max preview candidates returned in chat, largest first (1-200, default ${DISK_CLEANUP_DEFAULT_CANDIDATES})` },
+          includeReasons: { type: 'boolean', description: 'Include each preview candidate\'s reason text (default false)' },
         },
         required: ['deviceId', 'action']
       }
@@ -380,7 +554,7 @@ export function registerFilesystemTools(aiTools: Map<string, AiTool>): void {
       const sessionKey = auth.aiOrigin?.kind === 'ai_assistant'
         ? `${auth.aiOrigin.sessionId}:${auth.user.id}:${deviceId}` : undefined;
 
-      const access = await verifyDeviceAccess(deviceId, auth, action === 'execute');
+      const access = await inToolDbPhase(auth, () => verifyDeviceAccess(deviceId, auth, action === 'execute'));
       if ('error' in access) return JSON.stringify({ error: access.error });
 
       const inCleanupContext = <T>(fn: () => Promise<T>) => runOutsideDbContext(() =>
@@ -422,8 +596,10 @@ export function registerFilesystemTools(aiTools: Map<string, AiTool>): void {
           : undefined;
         const preview = buildCleanupPreview(snapshot, requestedCategories);
 
-        const maxCandidates = Math.min(Math.max(1, Number(input.maxCandidates) || 100), 200);
+        const maxCandidates = Math.min(Math.max(1, Number(input.maxCandidates) || DISK_CLEANUP_DEFAULT_CANDIDATES), 200);
         const returnedCandidates = preview.candidates.slice(0, maxCandidates);
+        const truncatedCandidateCount = Math.max(0, preview.candidates.length - returnedCandidates.length);
+        const includeReasons = input.includeReasons === true;
         const [cleanupRun] = await inCleanupContext(async () => db
           .insert(deviceFilesystemCleanupRuns)
           .values({
@@ -451,10 +627,19 @@ export function registerFilesystemTools(aiTools: Map<string, AiTool>): void {
           estimatedBytes: preview.estimatedBytes,
           candidateCount: preview.candidateCount,
           returnedCandidateCount: returnedCandidates.length,
-          truncatedCandidateCount: Math.max(0, preview.candidates.length - returnedCandidates.length),
+          truncatedCandidateCount,
+          hasMore: truncatedCandidateCount > 0,
           maxCandidates,
           categories: preview.categories,
-          candidates: returnedCandidates
+          // #6745: every previewed candidate is safe by construction (the
+          // preview filters on it), so `safe` carried no information; `reason`
+          // repeats per category and is opt-in. Execute accepts any path in the
+          // pinned run, including ones not shown here.
+          candidates: returnedCandidates.map(({ safe: _safe, reason, ...candidate }) =>
+            (includeReasons && reason !== undefined ? { ...candidate, reason } : candidate)),
+          ...(truncatedCandidateCount > 0
+            ? { note: `Showing the ${returnedCandidates.length} largest of ${preview.candidateCount} candidates (estimatedBytes covers all of them). Pass a larger maxCandidates or filter by categories to see more.` }
+            : {}),
         });
       }
 
@@ -658,7 +843,8 @@ export function registerFilesystemTools(aiTools: Map<string, AiTool>): void {
   });
 
   // ============================================
-  // system_cleanup - Tier 1 list, Tier 3 run (spec §9.1)
+  // system_cleanup - Tier 2 list (asks the device live), Tier 1 status,
+  // Tier 3 run (spec §9.1) and cancel (#10161)
   // ============================================
   //
   // THIN on purpose. Every decision — the MIN_AGENT_VERSION gate, action-id
@@ -673,17 +859,21 @@ export function registerFilesystemTools(aiTools: Map<string, AiTool>): void {
     domain: 'devices',
     searchHint: 'OS-native disk cleanup: Windows Disk Cleanup/DISM, macOS snapshots/brew, Linux package cache/journal',
     deviceArgs: ['deviceId'],
+    // `list` waits up to 60 s for the device's catalog; queueing and polling
+    // already open their own contexts (systemCleanup.ts), so only the reads
+    // below needed one (#7918). `run` queues and returns; `status` reads.
+    selfManagedDbContext: ['list'],
     definition: {
       name: 'system_cleanup',
-      description: 'List, run or check OS-native cleaners (Windows Disk Cleanup/DISM, macOS snapshots/Homebrew, Linux cache/journal) beyond scanner reach. list is read-only; re-poll pending with commandId. run needs approval, returns cleanupRunId; poll status until executed/failed, do not re-run. status is read-only.',
+      description: 'List, run, check or cancel OS-native cleaners (Windows Disk Cleanup/DISM, macOS snapshots/Homebrew, Linux cache/journal) beyond scanner reach. list is read-only; re-poll pending with commandId. run returns cleanupRunId; poll status until executed/failed, do not re-run. run and cancel need approval.',
       input_schema: {
         type: 'object' as const,
         properties: {
           deviceId: { type: 'string', description: 'The device UUID' },
-          action: { type: 'string', enum: ['list', 'run', 'status'], description: 'list (read-only catalog), run (start selected actions; returns a cleanupRunId), or status (read-only progress/result of a run)' },
+          action: { type: 'string', enum: ['list', 'run', 'status', 'cancel'], description: 'list (read-only catalog), run (start selected actions; returns a cleanupRunId), status (read-only progress/result of a run), or cancel (end a running run)' },
           actionIds: { type: 'array', items: { type: 'string' }, description: 'Catalog action ids to run, from a prior list call (required for run)' },
           params: { type: 'object', description: 'Optional per-action parameters. journalVacuumBytes (67108864-4294967296) bounds journalctl --vacuum-size.' },
-          cleanupRunId: { type: 'string', description: 'The cleanupRunId returned by run (required for status)' },
+          cleanupRunId: { type: 'string', description: 'The cleanupRunId returned by run (required for status and cancel)' },
           commandId: { type: 'string', description: 'For list only: the commandId of a catalog request that answered "pending", to re-check it instead of starting a new one' },
         },
         required: ['deviceId', 'action'],
@@ -691,14 +881,15 @@ export function registerFilesystemTools(aiTools: Map<string, AiTool>): void {
     },
     handler: async (input, auth) => {
       const deviceId = input.deviceId as string;
-      const action = input.action as 'list' | 'run' | 'status';
+      const action = input.action as 'list' | 'run' | 'status' | 'cancel';
 
       // Throws (never returns) when the surface minted no origin — an
       // unattributed destructive device command is refused, not degraded.
       const aiOrigin = requireAiOrigin(auth, 'system_cleanup');
 
-      // `status` reads a run row; the device need not be online for that.
-      const access = await verifyDeviceAccess(deviceId, auth, action !== 'status');
+      // `status` reads a run row and `cancel` fails one (its pending command is
+      // exactly what an offline device has not claimed); neither needs it online.
+      const access = await inToolDbPhase(auth, () => verifyDeviceAccess(deviceId, auth, action !== 'status' && action !== 'cancel'));
       if ('error' in access) return JSON.stringify({ error: access.error });
 
       const device = {
@@ -736,8 +927,85 @@ export function registerFilesystemTools(aiTools: Map<string, AiTool>): void {
       // Same probe-degrade as disk_cleanup above: an `ai_agent` principal's
       // auth.user.id is the agent's id, not a users row, and requested_by is an
       // FK onto users.id.
-      const [userRow] = await db.select({ id: users.id }).from(users).where(eq(users.id, auth.user.id)).limit(1);
+      const [userRow] = await inToolDbPhase(auth, () =>
+        db.select({ id: users.id }).from(users).where(eq(users.id, auth.user.id)).limit(1));
       const requestedBy = userRow ? auth.user.id : null;
+      // Tool catalog W04 (#5219), Decision 16: a flow is system automation
+      // carrying its run — never 'ai_agent' (the fallback below for a
+      // non-users actor) and never its synthetic attribution id.
+      const flowActor = aiOrigin.kind === 'flow'
+        ? aiOriginAuditActor(aiOrigin, { agentActorId: null, humanActorId: null })
+        : null;
+      const auditActor = flowActor
+        ? { actorType: flowActor.actorType, actorId: flowActor.actorId, initiatedBy: flowActor.initiatedBy }
+        : {
+          actorType: requestedBy ? 'user' as const : 'ai_agent' as const,
+          actorId: auth.user.id,
+          actorEmail: auth.user.email,
+          initiatedBy: 'ai' as const,
+        };
+
+      if (action === 'cancel') {
+        const cleanupRunId = typeof input.cleanupRunId === 'string' ? input.cleanupRunId : '';
+        if (!cleanupRunId) return JSON.stringify({ error: 'cleanupRunId is required for the cancel action' });
+        // The SAME lookup + CAS the human cancel route uses
+        // (POST …/run/:cleanupRunId/cancel), scoped to the verified device.
+        const cancelled = await cancelSystemCleanupRun({ device: { id: device.id, orgId: device.orgId }, cleanupRunId });
+        if (!cancelled.ok) {
+          if (cancelled.status === 404) return JSON.stringify({ error: 'Cleanup run not found' });
+          // Same F-4 lesson as run_in_progress below: a bare error next to a
+          // status reads like success, so say plainly nothing was cancelled.
+          // A re-read that still says `running` means the cancel lost its
+          // CAS for some other reason; never call that "no longer running".
+          return JSON.stringify({
+            error: 'not_running',
+            refused: true,
+            cleanupRunId,
+            status: cancelled.runStatus,
+            note: cancelled.runStatus === 'running'
+              ? 'Nothing was cancelled: the cancel did not take effect and the run still reads running. Check status before trying again.'
+              : `Nothing was cancelled: this run is no longer running (status ${cancelled.runStatus}).`,
+          });
+        }
+        void createAuditLogAsync({
+          orgId: device.orgId,
+          ...auditActor,
+          action: 'device.filesystem.system_cleanup.cancel',
+          resourceType: 'device',
+          resourceId: device.id,
+          resourceName: access.device.hostname,
+          details: {
+            cleanupRunId,
+            commandId: cancelled.commandId,
+            commandCancelled: cancelled.commandCancelled,
+            surface: 'ai_tool',
+            ...(flowActor ? flowActor.originDetails : {}),
+          },
+          result: 'success',
+        }).catch((auditError: unknown) => {
+          console.error('[system_cleanup] cancel audit write failed (non-fatal)', { deviceId: device.id, error: auditError });
+        });
+        // Only a command the device had not claimed is actually stopped. A
+        // claimed one keeps running on the device, so do not say "cancelled"
+        // for it (#10161 review): the cleaner may still delete files.
+        if (cancelled.commandCancelled) {
+          return JSON.stringify({
+            cleanupRunId,
+            status: 'failed',
+            cancelled: true,
+            commandCancelled: true,
+            note: 'Cancelled before the device started it: no cleaner ran.',
+          });
+        }
+        return JSON.stringify({
+          cleanupRunId,
+          status: 'failed',
+          cancelled: false,
+          runMarkedFailed: true,
+          commandCancelled: false,
+          note: 'The device had already started this run, so it could not be stopped. The run is marked failed, but the cleaner may still finish and free space; its result is recorded on the run without changing this status.',
+        });
+      }
 
       if (action === 'list') {
         // A re-check of a catalog request that answered `pending` earlier:
@@ -810,14 +1078,11 @@ export function registerFilesystemTools(aiTools: Map<string, AiTool>): void {
       // status) for every path, AI or human.
       void createAuditLogAsync({
         orgId: device.orgId,
-        actorType: requestedBy ? 'user' : 'ai_agent',
-        actorId: auth.user.id,
-        actorEmail: auth.user.email,
+        ...auditActor,
         action: 'device.filesystem.system_cleanup.run',
         resourceType: 'device',
         resourceId: device.id,
         resourceName: access.device.hostname,
-        initiatedBy: 'ai',
         details: {
           cleanupRunId: started.cleanupRunId,
           commandId: started.commandId,
@@ -825,6 +1090,7 @@ export function registerFilesystemTools(aiTools: Map<string, AiTool>): void {
           surface: 'ai_tool',
           status: 'running',
           deadlineAt: started.deadlineAt,
+          ...(flowActor ? flowActor.originDetails : {}),
         },
         result: 'success',
       }).catch((auditError: unknown) => {

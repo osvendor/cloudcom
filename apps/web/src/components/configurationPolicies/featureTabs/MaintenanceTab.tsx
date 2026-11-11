@@ -158,6 +158,9 @@ function ToggleRow({
       </div>
       <button
         type="button"
+        role="switch"
+        aria-checked={checked}
+        aria-label={label}
         data-testid={testId}
         onClick={() => onChange(!checked)}
         className={`relative inline-flex h-6 w-11 items-center rounded-full border transition ${checked ? "bg-emerald-500/80" : "bg-muted"}`}
@@ -281,6 +284,24 @@ export default function MaintenanceTab({
               </option>
             ))}
           </select>
+          {/* #9565: the scheduler pins the day (featureConfigResolver.ts
+              maintenanceOccurrenceStart) — weekly = Sunday, monthly = the 1st.
+              There is no day picker yet, so say which day the window opens. */}
+          {(settings.recurrence === "weekly" ||
+            settings.recurrence === "monthly") && (
+            <p
+              data-testid="maintenance-recurrence-rule"
+              className="mt-1 text-xs text-muted-foreground"
+            >
+              {settings.recurrence === "weekly"
+                ? i18n.t(
+                    "policies:configurationPolicies.featureTabs.maintenanceTab.weeklyOpensEverySunday",
+                  )
+                : i18n.t(
+                    "policies:configurationPolicies.featureTabs.maintenanceTab.monthlyOpensOnTheFirst",
+                  )}
+            </p>
+          )}
         </div>
 
         {/* Window start — a full date/time for a one-off window, a time of day
@@ -462,9 +483,7 @@ export default function MaintenanceTab({
           )}
           checked={settings.rebootIfPending}
           onChange={(v) => update("rebootIfPending", v)}
-          testId={i18n.t(
-            "policies:configurationPolicies.featureTabs.maintenanceTab.maintenanceRebootIfPendingToggle",
-          )}
+          testId="maintenance-reboot-if-pending-toggle"
         />
       </div>
 

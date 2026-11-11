@@ -1,4 +1,4 @@
-import type { DeviceRole } from '@breeze/shared';
+import type { DeviceRole, RolloverPolicy } from '@breeze/shared';
 import { desc, sql } from 'drizzle-orm';
 import {
   pgTable, uuid, text, varchar, integer, boolean, numeric, jsonb, date, char,
@@ -14,7 +14,7 @@ export const contractBillingTimingEnum = pgEnum('contract_billing_timing', [
   'advance', 'arrears'
 ]);
 export const contractLineTypeEnum = pgEnum('contract_line_type', [
-  'flat', 'per_device', 'per_device_role', 'per_device_group', 'per_seat', 'manual'
+  'flat', 'per_device', 'per_device_role', 'per_device_group', 'per_seat', 'manual', 'hour_block'
 ]);
 // #3205 W04 (#4607): what happens to the units above included_quantity.
 export const contractOverageModeEnum = pgEnum('contract_overage_mode', ['bill', 'flag']);
@@ -35,6 +35,7 @@ export const contracts = pgTable('contracts', {
   nextBillingAt: date('next_billing_at'),
   autoIssue: boolean('auto_issue').notNull().default(false),
   autoRenew: boolean('auto_renew').notNull().default(false),
+  autopayExcluded: boolean('autopay_excluded').notNull().default(false),
   renewalTermMonths: integer('renewal_term_months'),
   renewalNoticeDays: integer('renewal_notice_days'),
   // Multi-currency (spec §5): stamped from the org (or copied from the source
@@ -46,9 +47,17 @@ export const contracts = pgTable('contracts', {
   terms: text('terms'),
   createdBy: uuid('created_by').references(() => users.id),
   createdAt: timestamp('created_at').defaultNow().notNull(),
-  updatedAt: timestamp('updated_at').defaultNow().notNull()
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+  // #10361: the quote whose accept created this contract; NULL for hand-built
+  // and adopted contracts, and again once that quote is deleted. Composite FK
+  // (source_quote_id, org_id) -> quotes(id, org_id) ON DELETE SET NULL
+  // (source_quote_id) DEFERRABLE is SQL-only (2027-01-17-150000) — quotes.ts
+  // imports this file, so a .references() here would be an import cycle.
+  sourceQuoteId: uuid('source_quote_id')
 }, (t) => [
   index('contracts_org_status_idx').on(t.orgId, t.status),
+  // Partial (WHERE source_quote_id IS NOT NULL), mirrored from SQL for drift.
+  index('contracts_source_quote_idx').on(t.sourceQuoteId).where(sql`${t.sourceQuoteId} IS NOT NULL`),
   index('contracts_partner_status_idx').on(t.partnerId, t.status),
   // Real partial index (status='active') created in SQL; drizzle-kit only needs the column for drift.
   index('contracts_next_billing_idx').on(t.nextBillingAt),
@@ -66,6 +75,7 @@ export const contractLines = pgTable('contract_lines', {
   // catalog_item_id + site_id FKs created in SQL (ON DELETE SET NULL) to dodge import cycles.
   catalogItemId: uuid('catalog_item_id'),
   unitPrice: numeric('unit_price', { precision: 12, scale: 2 }).notNull(),
+  // #9664: NOT NULL on a manual line — contract_lines_manual_quantity_chk (SQL-only).
   manualQuantity: numeric('manual_quantity', { precision: 12, scale: 2 }),
   siteId: uuid('site_id'),
   // #4693: the site's name at write time. Survives the FK's ON DELETE SET NULL
@@ -85,6 +95,17 @@ export const contractLines = pgTable('contract_lines', {
   includedQuantity: numeric('included_quantity', { precision: 12, scale: 2 }),
   overageMode: contractOverageModeEnum('overage_mode'),
   overageUnitPrice: numeric('overage_unit_price', { precision: 12, scale: 2 }),
+  // #4547 W01: hour_block columns. NULL on every other line type. The shape is
+  // pinned by contract_lines_hour_block_chk (SQL-only, like the allowance and
+  // device-role CHECKs above); contract_lines_allowance_chk was re-added to list
+  // 'hour_block' and exempt it from integrality. included_quantity /
+  // overage_mode / overage_unit_price above double as the block's hours and
+  // overage terms. hour_block_first_period_start is server-stamped at insert.
+  rolloverPolicy: text('rollover_policy').$type<RolloverPolicy>(),
+  rolloverCapHours: numeric('rollover_cap_hours', { precision: 12, scale: 2 }),
+  hourBlockAlertPct: integer('hour_block_alert_pct'),
+  hourBlockFirstPeriodStart: date('hour_block_first_period_start'),
+  hourBlockRetiredAt: timestamp('hour_block_retired_at', { withTimezone: true }),
   // #3205 W02: the device group a per_device_group line bills. Composite FK
   // (device_group_id, org_id) -> device_groups(id, org_id) ON DELETE SET NULL
   // (device_group_id), and contract_lines_device_group_chk, are SQL-only like
@@ -100,7 +121,11 @@ export const contractLines = pgTable('contract_lines', {
   index('contract_lines_org_idx').on(t.orgId),
   // Partial index (WHERE device_group_id IS NOT NULL); the SQL migration creates it, this mirrors it.
   index('contract_lines_device_group_id_idx').on(t.deviceGroupId).where(sql`${t.deviceGroupId} IS NOT NULL`),
-  uniqueIndex('contract_lines_id_org_uq').on(t.id, t.orgId)
+  uniqueIndex('contract_lines_id_org_uq').on(t.id, t.orgId),
+  // #4547: one LIVE block per org. The real partial unique index lives in SQL
+  // (2026-12-17-100100); this mirrors it so db:check-drift stays clean.
+  uniqueIndex('contract_lines_one_live_hour_block_per_org_uq').on(t.orgId)
+    .where(sql`${t.lineType} = 'hour_block' AND ${t.hourBlockRetiredAt} IS NULL`),
 ]);
 
 export const contractBillingPeriods = pgTable('contract_billing_periods', {
@@ -118,6 +143,77 @@ export const contractBillingPeriods = pgTable('contract_billing_periods', {
   // Composite-FK target for cbp_outcomes_period_org_fk (#3205 W07). Built
   // CONCURRENTLY by migration 2026-10-08-101100-billing-evidence-fk-targets.sql.
   uniqueIndex('contract_billing_periods_id_org_uq').on(t.id, t.orgId),
+]);
+
+/**
+ * Partner billing toggle (spec 2026-10-16-partner-billing-enabled-design.md §6.1, Q7): one row per
+ * billing period of an active contract skipped while the partner had Billing off. RLS Shape 1,
+ * org-owned operational history. Manual review only (resolved flag + note); a row never invoices,
+ * charges or triggers autopay.
+ *
+ * SQL-ONLY constraints (migration 2027-01-05-120100-contract-skipped-billing-periods.sql):
+ *   - (contract_id, org_id) -> contracts(id, org_id) ON DELETE CASCADE DEFERRABLE INITIALLY IMMEDIATE
+ * CHECKs: contract_skipped_billing_periods_period_chk (period_end > period_start, half-open),
+ * contract_skipped_billing_periods_reason_chk (reason IN ('billing_disabled'), no default),
+ * contract_skipped_billing_periods_note_chk (resolution_note <= 2000 chars).
+ */
+export const contractSkippedBillingPeriods = pgTable('contract_skipped_billing_periods', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  orgId: uuid('org_id').notNull().references(() => organizations.id),
+  contractId: uuid('contract_id').notNull(),
+  // Half-open [periodStart, periodEnd).
+  periodStart: date('period_start').notNull(),
+  periodEnd: date('period_end').notNull(),
+  reason: text('reason').$type<'billing_disabled'>().notNull(),
+  resolved: boolean('resolved').notNull().default(false),
+  resolutionNote: text('resolution_note'),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull()
+}, (t) => [
+  uniqueIndex('contract_skipped_billing_periods_contract_period_uq').on(t.contractId, t.periodStart),
+  index('contract_skipped_billing_periods_org_idx').on(t.orgId),
+]);
+
+/**
+ * #4547 W01: one row per CLOSED block-hours period (RLS Shape 1, org-owned — a
+ * balance, not a policy). UNIQUE (contract_line_id, period_start) is the close
+ * path's idempotency key. Written by W02; nothing writes it in W01.
+ *
+ * SQL-ONLY constraints (migration 2026-12-17-100200-contract-hour-periods.sql),
+ * all DEFERRABLE INITIALLY IMMEDIATE:
+ *   - (contract_id, org_id)        -> contracts(id, org_id)       ON DELETE CASCADE
+ *   - (contract_line_id, org_id)   -> contract_lines(id, org_id)  ON DELETE RESTRICT
+ *   - (overage_invoice_id, org_id) -> invoices(id, org_id)        ON DELETE SET NULL (overage_invoice_id)
+ * CHECKs: contract_hour_periods_period_chk (period_end > period_start),
+ * contract_hour_periods_hours_nonneg_chk (every hours column >= 0),
+ * contract_hour_periods_close_source_chk. There is deliberately NO CHECK tying
+ * overage_hours to overage_invoice_id: the invoice FK is SET NULL.
+ */
+export const contractHourPeriods = pgTable('contract_hour_periods', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  contractLineId: uuid('contract_line_id').notNull(),
+  contractId: uuid('contract_id').notNull(),
+  orgId: uuid('org_id').notNull().references(() => organizations.id),
+  // Half-open [periodStart, periodEnd).
+  periodStart: date('period_start').notNull(),
+  periodEnd: date('period_end').notNull(),
+  includedHours: numeric('included_hours', { precision: 12, scale: 2 }).notNull(),
+  carriedInHours: numeric('carried_in_hours', { precision: 12, scale: 2 }).notNull(),
+  consumedHours: numeric('consumed_hours', { precision: 12, scale: 2 }).notNull(),
+  overageHours: numeric('overage_hours', { precision: 12, scale: 2 }).notNull(),
+  carriedOutHours: numeric('carried_out_hours', { precision: 12, scale: 2 }).notNull(),
+  // Hours absorbed from entries stamped in another currency (Decision 8 flag).
+  foreignCurrencyHours: numeric('foreign_currency_hours', { precision: 12, scale: 2 }).notNull().default('0'),
+  entryCount: integer('entry_count').notNull(),
+  // Snapshots at close.
+  overageUnitPrice: numeric('overage_unit_price', { precision: 12, scale: 2 }).notNull(),
+  currencyCode: char('currency_code', { length: 3 }).notNull(),
+  overageInvoiceId: uuid('overage_invoice_id'),
+  closeSource: text('close_source').$type<'billing_run' | 'close_out'>().notNull(),
+  closedAt: timestamp('closed_at', { withTimezone: true }).defaultNow().notNull()
+}, (t) => [
+  uniqueIndex('contract_hour_periods_line_period_uq').on(t.contractLineId, t.periodStart),
+  index('contract_hour_periods_org_idx').on(t.orgId),
+  index('contract_hour_periods_contract_idx').on(t.contractId, desc(t.periodStart)),
 ]);
 
 /**

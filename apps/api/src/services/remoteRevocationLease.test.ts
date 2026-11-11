@@ -10,6 +10,7 @@ vi.mock('./remoteAccessPolicy', () => ({
     idleTimeoutMinutes: 5,
     maxSessionDurationHours: 8,
   })),
+  checkRemoteAccess: vi.fn(async () => ({ allowed: true })),
 }));
 vi.mock('./mfaPolicy', () => ({
   getEffectiveMfaPolicy: vi.fn(async () => ({ required: false })),
@@ -35,6 +36,7 @@ import {
 } from './remoteRevocationLease';
 import { teardownDisconnectedSessions } from './remoteSessionTeardown';
 import { getEffectiveMfaPolicy } from './mfaPolicy';
+import { checkRemoteAccess } from './remoteAccessPolicy';
 import { afterEach } from 'vitest';
 
 const NOW = Date.parse('2026-10-15T12:00:00.000Z');
@@ -73,6 +75,7 @@ function row(overrides: Partial<RevocationRecheckRow> = {}): RevocationRecheckRo
     orgMembership: { roleId: 'role-1', siteIds: null },
     partnerMembership: null,
     sessionOrgUsable: true,
+    partner: { status: 'active', deletedAt: null },
   };
   return { ...base, ...overrides } as RevocationRecheckRow;
 }
@@ -305,7 +308,7 @@ describe('evaluateRevocationRecheck', () => {
       r.sessionOrgUsable = false;
       expect(evaluateRevocationRecheck(r, NOW, NOW + 60_000)).toEqual({
         ok: false,
-        reason: 'membership_removed',
+        reason: 'org_suspended',
       });
     });
 
@@ -318,9 +321,70 @@ describe('evaluateRevocationRecheck', () => {
       });
     });
   });
+
+  // The lease is the only mid-session authority for a P2P desktop stream: an
+  // admin suspending/deleting the org, downgrading the owning partner, or
+  // disabling the remote-access capability must reach an already-running
+  // session, not just block a NEW one from starting.
+  describe('org and partner lifecycle (mid-session recheck)', () => {
+    it('revokes an org-scoped caller when the session org is no longer usable', () => {
+      const r = row({ sessionOrgUsable: false });
+      expect(evaluateRevocationRecheck(r, NOW, NOW + 60_000)).toEqual({
+        ok: false,
+        reason: 'org_suspended',
+      });
+    });
+
+    it('revokes when the owning partner is suspended', () => {
+      const r = row({ partner: { status: 'suspended', deletedAt: null } });
+      expect(evaluateRevocationRecheck(r, NOW, NOW + 60_000)).toEqual({
+        ok: false,
+        reason: 'partner_suspended',
+      });
+    });
+
+    it('revokes when the owning partner is soft-deleted, even if status still reads active', () => {
+      const r = row({ partner: { status: 'active', deletedAt: new Date(NOW - 1000) } });
+      expect(evaluateRevocationRecheck(r, NOW, NOW + 60_000)).toEqual({
+        ok: false,
+        reason: 'partner_suspended',
+      });
+    });
+
+    it('revokes a partner-scoped caller when the owning partner is suspended too', () => {
+      const r = row({
+        user: { status: 'active', permissionsEpoch: 7, orgId: null, partnerId: 'partner-1', mfaProtected: true },
+        orgMembership: null,
+        partnerMembership: { roleId: 'role-p', orgAccess: 'all', orgIds: null },
+        sessionOrgUsable: true,
+        partner: { status: 'churned', deletedAt: null },
+      });
+      expect(evaluateRevocationRecheck(r, NOW, NOW + 60_000)).toEqual({
+        ok: false,
+        reason: 'partner_suspended',
+      });
+    });
+  });
+
+  describe('remote-access policy recheck (webrtcDesktop / remoteTools disabled mid-session)', () => {
+    it('revokes when the live policy check denies the capability', () => {
+      expect(evaluateRevocationRecheck(row(), NOW, NOW + 60_000, false, false)).toEqual({
+        ok: false,
+        reason: 'policy_denied',
+      });
+    });
+
+    it('renews when the live policy check still allows the capability', () => {
+      expect(evaluateRevocationRecheck(row(), NOW, NOW + 60_000, false, true)).toEqual({ ok: true });
+    });
+
+    it('defaults to allowed when the caller omits the policy verdict (back-compat)', () => {
+      expect(evaluateRevocationRecheck(row(), NOW, NOW + 60_000)).toEqual({ ok: true });
+    });
+  });
 });
 
-describe('renewRevocationLease fence resync fields (SEC-038 W05)', () => {
+describe('renewRevocationLease fence resync fields', () => {
   const liveRedis = () => ({
     eval: vi.fn(async () =>
       JSON.stringify({
@@ -467,6 +531,48 @@ describe('renewRevocationLease', () => {
         status: 'disconnected', terminalGeneration: 7n, terminationPhase: 'pending',
       },
     ]);
+  });
+
+  describe('live remote-access policy recheck', () => {
+    beforeEach(() => {
+      vi.mocked(checkRemoteAccess).mockClear();
+      vi.mocked(checkRemoteAccess).mockResolvedValue({ allowed: true });
+    });
+
+    it('consults the live (bypass-cache) policy on every otherwise-renewable lease', async () => {
+      const redis = fakeRedis(leaseValue());
+      await renewRevocationLease('sess-1', {
+        loadRow: async () => row(),
+        redis: redis as never,
+        now: () => NOW,
+      });
+      expect(checkRemoteAccess).toHaveBeenCalledWith('dev-1', 'webrtcDesktop', { bypassCache: true });
+    });
+
+    it('revokes an already-running session the instant an admin disables the capability', async () => {
+      vi.mocked(checkRemoteAccess).mockResolvedValueOnce({ allowed: false, reason: 'disabled by policy' });
+      const redis = fakeRedis(leaseValue());
+      const markRow = vi.fn(async () => null);
+      const result = await renewRevocationLease('sess-1', {
+        loadRow: async () => row(),
+        redis: redis as never,
+        now: () => NOW,
+        markRevoked: markRow,
+      });
+      expect(result).toEqual({ status: 'revoked', reason: 'policy_denied' });
+      expect(markRow).toHaveBeenCalledWith('sess-1', 'policy_denied');
+    });
+
+    it('does not consult policy for a lease that is already revoked on another ground', async () => {
+      const redis = fakeRedis(leaseValue());
+      await renewRevocationLease('sess-1', {
+        loadRow: async () => row({ user: { ...row().user, status: 'suspended' } }),
+        redis: redis as never,
+        now: () => NOW,
+        markRevoked: async () => null,
+      });
+      expect(checkRemoteAccess).not.toHaveBeenCalled();
+    });
   });
 
   describe('MFA through the effective policy (#6107)', () => {
@@ -702,19 +808,33 @@ describe('prepareRevocationLeaseForStart', () => {
   });
 });
 
-// SEC-038 W06 (#5537): the desktop-fence capability gate mirrors the #5481
-// lease gate — same denial code, same upgrade message — but sits behind
-// REMOTE_DESKTOP_FENCE_REQUIRED, default OFF, so the release that introduces
-// it is a no-op for the fleet until the flag is flipped one release later.
-describe('prepareRevocationLeaseForStart — desktop fence capability gate (SEC-038 W06)', () => {
+// #5537 — the desktop-fence capability gate mirrors the #5481
+// lease gate — same denial code, same upgrade message. REMOTE_DESKTOP_FENCE_REQUIRED
+// is required by default; a recognized false value is the explicit opt-out.
+describe('prepareRevocationLeaseForStart — desktop fence capability gate', () => {
   const original = process.env.REMOTE_DESKTOP_FENCE_REQUIRED;
   afterEach(() => {
     if (original === undefined) delete process.env.REMOTE_DESKTOP_FENCE_REQUIRED;
     else process.env.REMOTE_DESKTOP_FENCE_REQUIRED = original;
   });
 
-  it('gate off: admits an unfenced agent (fleet no-op on the introducing release)', async () => {
+  it('default (unset): refuses an agent without the start fence with the agent_upgrade_required code', async () => {
     delete process.env.REMOTE_DESKTOP_FENCE_REQUIRED;
+    const r = row();
+    r.device.desktopFenceProtocolVersion = 0;
+    await expect(
+      prepareRevocationLeaseForStart('sess-1', { loadRow: async () => r, now: () => NOW }),
+    ).resolves.toEqual({ ok: false, reason: 'agent_upgrade_required' });
+  });
+
+  it('default (unset): admits a fenced agent', async () => {
+    delete process.env.REMOTE_DESKTOP_FENCE_REQUIRED;
+    const result = await prepareRevocationLeaseForStart('sess-1', { loadRow: async () => row(), now: () => NOW });
+    expect(result.ok).toBe(true);
+  });
+
+  it('explicit opt-out (false): admits an agent without the start fence', async () => {
+    process.env.REMOTE_DESKTOP_FENCE_REQUIRED = 'false';
     const r = row();
     r.device.desktopFenceProtocolVersion = 0;
     const result = await prepareRevocationLeaseForStart('sess-1', { loadRow: async () => r, now: () => NOW });

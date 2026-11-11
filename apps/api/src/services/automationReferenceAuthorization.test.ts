@@ -15,7 +15,10 @@ import {
 type ScriptRow = typeof scripts.$inferSelect;
 type CatalogRow = typeof softwareCatalog.$inferSelect;
 type VersionRow = typeof softwareVersions.$inferSelect;
-type ChannelRow = typeof notificationChannels.$inferSelect;
+// `config` lives in notification_channel_configs now, joined in by
+// selectNotificationChannelsWithConfig (#6379) — not a column on
+// notificationChannels itself any more.
+type ChannelRow = typeof notificationChannels.$inferSelect & { config: unknown };
 
 const PARTNER_A = '11111111-1111-4111-8111-111111111111';
 const PARTNER_B = '22222222-2222-4222-8222-222222222222';
@@ -84,6 +87,7 @@ const baseCatalog: CatalogRow = {
   orgId: ORG_A,
   partnerId: null,
   integrationProvider: null,
+  builtinPackageKey: null,
   name: 'Managed package',
   vendor: 'Vendor',
   description: 'Managed package',
@@ -92,6 +96,7 @@ const baseCatalog: CatalogRow = {
   websiteUrl: null,
   isManaged: true,
   createdAt: new Date('2026-08-24T00:00:00.000Z'),
+  deletedAt: null,
 };
 const orgCatalogA: CatalogRow = { ...baseCatalog };
 const orgCatalogB: CatalogRow = {
@@ -125,7 +130,9 @@ const baseVersion: VersionRow = {
   silentUninstallArgs: null,
   preInstallScript: null,
   postInstallScript: null,
+  installScriptsEnabled: false,
   detectionRules: null,
+  successExitCodes: [],
   isLatest: true,
 };
 
@@ -182,13 +189,26 @@ function fakeTransaction(fixtures: Fixtures) {
         };
       }
 
+      if (table === notificationChannels) {
+        // selectNotificationChannelsWithConfig (services/notificationChannelConfig.ts,
+        // #6379) chains .leftJoin().where().orderBy().$dynamic() — no .limit()
+        // here, so the awaited value comes straight off .$dynamic().
+        return {
+          leftJoin: vi.fn(() => ({
+            where: vi.fn(() => ({
+              orderBy: vi.fn(() => ({
+                $dynamic: vi.fn(async () => fixtures.channels ?? []),
+              })),
+            })),
+          })),
+        };
+      }
+
       const rows = table === scripts
         ? fixtures.scripts ?? []
         : table === softwareCatalog
           ? fixtures.catalogs ?? []
-          : table === notificationChannels
-            ? fixtures.channels ?? []
-            : [];
+          : [];
       return { where: vi.fn(async () => rows) };
     }),
   }));

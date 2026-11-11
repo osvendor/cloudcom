@@ -5,7 +5,8 @@ import AlertsPage from './AlertsPage';
 import { fetchWithAuth } from '../../stores/auth';
 
 vi.mock('../../stores/auth', () => ({
-  fetchWithAuth: vi.fn()
+  fetchWithAuth: vi.fn(),
+  useAuthStore: (select: (state: { user: { canManagePartnerWide: boolean } }) => unknown) => select({ user: { canManagePartnerWide: true } }),
 }));
 
 const showToast = vi.fn();
@@ -26,13 +27,33 @@ vi.mock('../filters/DeviceFilterBar', () => ({
 // re-runs the selector and picks up the new value); it resets to 'org-1' before
 // every test via the file-level beforeEach below.
 let mockCurrentOrgId: string | null = 'org-1';
+// Fields beyond orgScope/currentOrgId satisfy useOrgScope() (#4147/sweep A3
+// gate): `mockOrganizationsLoaded` starts true (scope pre-resolved) so
+// existing tests keep seeing exactly one /alerts fetch on mount; a dedicated
+// test below flips it to simulate the unresolved window.
+let mockOrganizationsLoaded = true;
 vi.mock('../../stores/orgStore', () => ({
-  useOrgStore: (selector: (s: { orgScope: string; currentOrgId: string | null }) => unknown) =>
-    selector({ orgScope: 'current', currentOrgId: mockCurrentOrgId })
+  useOrgStore: (selector: (s: {
+    orgScope: string;
+    currentOrgId: string | null;
+    allOrgs: boolean;
+    error: string | null;
+    organizationsLoaded: boolean;
+    organizations: unknown[];
+  }) => unknown) =>
+    selector({
+      orgScope: 'current',
+      currentOrgId: mockCurrentOrgId,
+      allOrgs: false,
+      error: null,
+      organizationsLoaded: mockOrganizationsLoaded,
+      organizations: [],
+    })
 }));
 
 beforeEach(() => {
   mockCurrentOrgId = 'org-1';
+  mockOrganizationsLoaded = true;
 });
 
 const fetchMock = vi.mocked(fetchWithAuth);
@@ -616,6 +637,56 @@ describe('AlertsPage — suppress duration picker', () => {
     expect(await screen.findByRole('button', { name: /Suppress: High CPU on SRV-01/i })).toBeInTheDocument();
   });
 
+  it('Undo on the suppress toast lifts the mute server-side (#8966)', async () => {
+    listOnlyMock(() => Promise.resolve(makeJsonResponse({ id: ALERT_ID, status: 'suppressed' })));
+    const base = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input) === `/alerts/${ALERT_ID}/unsuppress` && init?.method === 'POST') {
+        return Promise.resolve(makeJsonResponse({ id: ALERT_ID, status: 'active' }));
+      }
+      return base(input, init);
+    });
+
+    render(<AlertsPage />);
+    fireEvent.click(await screen.findByRole('button', { name: /Suppress: High CPU on SRV-01/i }));
+    fireEvent.click(await screen.findByTestId('suppress-confirm'));
+    await waitFor(() => expect(showToast).toHaveBeenCalledWith(expect.objectContaining({ type: 'undo' })));
+
+    const undoToast = showToast.mock.calls.map(([a]) => a).find((a) => a.type === 'undo');
+    undoToast.onUndo();
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        `/alerts/${ALERT_ID}/unsuppress`,
+        expect.objectContaining({ method: 'POST' }),
+      );
+    });
+    // The row is restored locally too.
+    expect(await screen.findByRole('button', { name: /Suppress: High CPU on SRV-01/i })).toBeInTheDocument();
+  });
+
+  it('surfaces the server error when the Undo is rejected', async () => {
+    listOnlyMock(() => Promise.resolve(makeJsonResponse({ id: ALERT_ID, status: 'suppressed' })));
+    const base = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input) === `/alerts/${ALERT_ID}/unsuppress` && init?.method === 'POST') {
+        return Promise.resolve(makeJsonResponse({ error: 'Alert is no longer suppressed' }, false, 409));
+      }
+      return base(input, init);
+    });
+
+    render(<AlertsPage />);
+    fireEvent.click(await screen.findByRole('button', { name: /Suppress: High CPU on SRV-01/i }));
+    fireEvent.click(await screen.findByTestId('suppress-confirm'));
+    await waitFor(() => expect(showToast).toHaveBeenCalledWith(expect.objectContaining({ type: 'undo' })));
+
+    showToast.mock.calls.map(([a]) => a).find((a) => a.type === 'undo').onUndo();
+
+    await waitFor(() => {
+      expect(showToast).toHaveBeenCalledWith(expect.objectContaining({ type: 'error' }));
+    });
+  });
+
   it('hides the Mute button on resolved alerts (the suppress endpoint rejects them)', async () => {
     const resolvedAlert = { ...activeAlert, status: 'resolved' };
     fetchMock.mockImplementation((input, init) => {
@@ -879,3 +950,64 @@ describe('AlertsPage complete device filter scope (RMM-QA-153)', () => {
     expect(previews).toBe(2);
   });
 });
+
+describe('AlertsPage — mount fetch is not duplicated (sweep A3)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  const listMock = () =>
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url.startsWith('/alerts') && method === 'GET') {
+        return Promise.resolve(makeJsonResponse({ data: [] }));
+      }
+      if (url.startsWith('/devices/options?') && method === 'GET') {
+        return Promise.resolve(makeJsonResponse({ data: [], page: { nextCursor: null, returned: 0, total: 0, hasMore: false, observedAt: '2026-08-24T00:00:00.000Z' } }));
+      }
+      return Promise.resolve(makeJsonResponse({ data: [] }));
+    });
+
+  it('fetches /alerts exactly once when the org scope is already resolved', async () => {
+    listMock();
+    render(<AlertsPage />);
+
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.filter(([url]) => String(url).startsWith('/alerts?')).length).toBeGreaterThan(0)
+    );
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).startsWith('/alerts?')).length).toBe(1);
+  });
+
+  it('waits out the org-scope-resolving window instead of firing an unscoped fetch that gets superseded', async () => {
+    listMock();
+    // Unresolved: no concrete org, not explicit fleet view, org list not yet
+    // loaded — the sub-second window before OrgSwitcher's fetch lands (#4147).
+    mockCurrentOrgId = null;
+    mockOrganizationsLoaded = false;
+    const { rerender } = render(<AlertsPage />);
+
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).startsWith('/alerts?')).length).toBe(0);
+
+    // Org scope resolves (mirrors OrgSwitcher's fetchOrganizations landing).
+    mockCurrentOrgId = 'org-1';
+    mockOrganizationsLoaded = true;
+    rerender(<AlertsPage />);
+
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.filter(([url]) => String(url).startsWith('/alerts?')).length).toBe(1)
+    );
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).startsWith('/alerts?')).length).toBe(1);
+  });
+});
+
+// #7215: write actions are now gated on the caller's permissions. These suites
+// exercise the actions themselves, so grant everything; the role-aware
+// behaviour is covered in the *.permissions.test.tsx suites.
+vi.mock('../../lib/permissions', () => ({
+  usePermissions: () => ({ permissions: [], can: () => true }),
+  hasPermission: () => true,
+}));

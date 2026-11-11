@@ -3,12 +3,15 @@ import '../styles/globals.css';
 import { ClientRouter } from 'astro:transitions';
 import AuthPanelBranding from '../components/auth/AuthPanelBranding';
 import { tServer } from '../lib/i18n/server';
+import { currentSecurityContacts, getAuthFooterLinks } from '../lib/securityContact';
 
 interface Props {
   title?: string;
   titleKey?: string;
   description?: string;
   tagline?: string;
+  /** Set by /login/<partner-slug> (#4017) so the panel shows that partner's branding. */
+  partnerSlug?: string;
 }
 
 const {
@@ -16,8 +19,11 @@ const {
   titleKey,
   description = tServer(Astro.locals.locale, 'layout.metaDescription'),
   tagline = tServer(Astro.locals.locale, 'authShell.tagline'),
+  partnerSlug,
 } = Astro.props;
 const pageTitle = titleKey ? tServer(Astro.locals.locale, titleKey) : title;
+// Operator abuse/security links (#8872): server-side env, empty unless configured.
+const footerLinks = getAuthFooterLinks(currentSecurityContacts(), Astro.url.host);
 ---
 
 <!DOCTYPE html>
@@ -40,13 +46,22 @@ const pageTitle = titleKey ? tServer(Astro.locals.locale, titleKey) : title;
     <div class="flex min-h-screen">
 
       <!-- Left branded panel (partner-aware island) -->
-      <AuthPanelBranding tagline={tagline} client:load />
+      <AuthPanelBranding tagline={tagline} partnerSlug={partnerSlug} client:load />
 
       <!-- Right form panel -->
-      <div class="flex flex-1 items-center justify-center px-6 py-12 sm:px-12">
+      <div class="flex flex-1 flex-col items-center justify-center px-6 py-12 sm:px-12">
         <div class="w-full max-w-md">
           <slot />
         </div>
+        {footerLinks.length > 0 && (
+          <footer class="mt-10 flex gap-4 text-xs text-muted-foreground">
+            {footerLinks.map((link) => (
+              <a href={link.href} class="underline-offset-4 hover:text-foreground hover:underline">
+                {tServer(Astro.locals.locale, /* i18n-dynamic */ link.key)}
+              </a>
+            ))}
+          </footer>
+        )}
       </div>
 
     </div>

@@ -32,7 +32,8 @@
  * Contract, deliberately narrow so the engine stays uniform:
  *   - every executor runs inside the engine's ONE Phase-B transaction
  *     (`db` here is the ambient transaction proxy — never opens its own);
- *   - every executor leaves ZERO rows behind under the loser org;
+ *   - authority-only and enrollment-only rows are explicitly retained by their
+ *     policy; moved history severs all authority references;
  *   - `dropped` counts rows actually DELETEd, `moved` counts rows repointed,
  *     and `notes` carries anything an operator must see in the merge
  *     summary's `warnings` (demotions, deactivations, neutralizations and
@@ -55,11 +56,13 @@
  * children are re-homed onto the surviving definition (after recipient
  * collisions are deduplicated).
  */
+import { autopayMergeExecutors } from './autopay/merge';
 import { sql, type SQL } from 'drizzle-orm';
 import * as dbModule from '../db';
 import { extractRowCount } from '../db/rowCount';
 import { buildRepoint, keyExpr } from './orgMergeExecutors';
 import { moveBindings, resolveBindingMerge } from './callerVerification/merge';
+import { expireUnactuatedElevationRequests } from './pamDeviceMoveGuard';
 
 export interface MergeTableOutcome {
   moved: number;
@@ -655,6 +658,90 @@ const fenceScriptProposals: CustomMergeExecutor = async (loser) => {
 const moveScriptProposals: CustomMergeExecutor = async () => ({ moved: 0, dropped: 0, notes: [] });
 
 // ---------------------------------------------------------------------------
+// diagnostic_access_grants — FENCE, then leave for erasure.
+//
+// A grant is one source-org administrator's approval of read-only file access
+// on one device for one requester. `devices` repoints in the move phase and
+// breeze_cascade_device_org_id() restamps every device_id+org_id table with it,
+// grants included — so a live grant left alone would arrive in the survivor org
+// still active and authorize reads there on an approval nobody in that org
+// gave. Resolve phase therefore expires pending requests (and their approval
+// fan-out rows) and revokes active grants before anything moves.
+// ---------------------------------------------------------------------------
+const fenceDiagnosticAccessGrants: CustomMergeExecutor = async (loser) => {
+  await run(sql`
+    UPDATE approval_requests
+       SET status = 'expired', decided_at = now()
+     WHERE status = 'pending'
+       AND diagnostic_access_grant_id IN (
+         SELECT id FROM diagnostic_access_grants
+          WHERE org_id = ${uuid(loser)} AND status = 'pending_approval')`);
+  const expired = await run(sql`
+    UPDATE diagnostic_access_grants
+       SET status = 'expired', updated_at = now()
+     WHERE org_id = ${uuid(loser)}
+       AND status = 'pending_approval'`);
+  const revoked = await run(sql`
+    UPDATE diagnostic_access_grants
+       SET status = 'revoked', revoked_at = now(),
+           revoke_reason = 'organization merged away', updated_at = now()
+     WHERE org_id = ${uuid(loser)}
+       AND status = 'active'`);
+  return {
+    moved: 0,
+    dropped: 0,
+    notes: expired + revoked > 0
+      ? [
+        `diagnostic_access_grants: revoked ${revoked} active grant(s) and expired ${expired} pending request(s) `
+        + 'from the merged-away org. Their approvals were given by that org\'s administrators and do not '
+        + 'carry over; request access again under the surviving organization if it is still needed.',
+      ]
+      : [],
+  };
+};
+
+/** diagnostic_access_grants, MOVE half — a no-op; the resolve half did the disposition. */
+const moveDiagnosticAccessGrants: CustomMergeExecutor = async () => ({ moved: 0, dropped: 0, notes: [] });
+
+// ---------------------------------------------------------------------------
+// elevation_requests — EXPIRE live un-actuated requests (OD4), then let the
+// devices repoint carry the un-actuated ones (PAM ownership epochs W6, #8208,
+// spec §8 merge row).
+//
+// Resolve: every pending/approved/auto_approved/actuating request of the loser
+// that no pam_actuations row references is expired with reason
+// ownership_changed — its approval was made under the loser's policy and must
+// not authorize anything in the survivor (same reasoning as
+// diagnostic_access_grants above).
+//
+// Move: nothing. When the walk repoints the loser's devices (cause org_merge,
+// armed by executeOrgMerge), devices_restamp_unactuated_elevation_requests
+// moves each device's un-actuated requests AND their elevation_audit rows into
+// the survivor, and breeze_pam_chain_epoch_guard re-anchors them to the
+// device's survivor epoch. Actuated requests (epoch-frozen evidence) and
+// requests whose device had already left the loser stay behind with the loser
+// shell, under an evidence hold (writeEvidenceHold). A plain repoint here
+// would 42501 on an actuated row and 23514 on a left-behind one.
+// ---------------------------------------------------------------------------
+const resolveElevationRequests: CustomMergeExecutor = async (loser) => {
+  const expired = await expireUnactuatedElevationRequests(dbModule.db, { orgId: loser });
+  return {
+    moved: 0,
+    dropped: 0,
+    notes: expired > 0
+      ? [
+        `elevation_requests: expired ${expired} pending or approved privileged-access request(s) of the merged-away `
+        + 'org that never reached the device (reason ownership_changed). Their approvals were made under that '
+        + 'org\'s policy and do not carry over; request elevation again under the surviving organization.',
+      ]
+      : [],
+  };
+};
+
+/** elevation_requests, MOVE half — a no-op; the devices restamp trigger moves the un-actuated rows. */
+const moveElevationRequests: CustomMergeExecutor = async () => ({ moved: 0, dropped: 0, notes: [] });
+
+// ---------------------------------------------------------------------------
 // plugin_installations — `plugin_installations_org_catalog_unique (org_id,
 // catalog_id)`. `plugin_logs.installation_id` is NOT NULL with a NO ACTION FK,
 // so the old dedupe DELETE aborted the merge for any plugin that had ever
@@ -896,7 +983,7 @@ const mergeContacts: CustomMergeExecutor = async (loser, survivor) => {
 // backup_configs — `backup_configs_org_default_uq ON backup_configs(org_id)
 // WHERE is_default`. Clear the loser's default flag when the survivor
 // already has one, then repoint. NEVER delete: the row carries org-owned
-// storage credentials (provider_config / encryption_key) and backup_chains,
+// storage credentials (provider_config) and backup_chains,
 // backup_snapshots and restore_jobs all reference it.
 // ---------------------------------------------------------------------------
 const mergeBackupConfigs: CustomMergeExecutor = async (loser, survivor) => {
@@ -914,6 +1001,26 @@ const mergeBackupConfigs: CustomMergeExecutor = async (loser, survivor) => {
     dropped: 0,
     notes: cleared > 0
       ? [`backup_configs: cleared the default flag on ${cleared} backup destination from the merged-away org (credentials kept) — the survivor's default destination was kept`]
+      : [],
+  };
+};
+
+// ---------------------------------------------------------------------------
+// trust_pages — UNIQUE(org_id) and a page is an org's PUBLIC identity (spec
+// trust-center §9 "Merge"). The loser's page is ALWAYS retired, even when the
+// survivor has none: repointing would publish org A's history under org B's
+// name. Children (snapshots, document links) are ON DELETE CASCADE. The
+// survivor's last_evaluated_at is cleared so the next hourly refresh rebuilds
+// its snapshot: its fleet just changed.
+// ---------------------------------------------------------------------------
+const mergeTrustPages: CustomMergeExecutor = async (loser, survivor) => {
+  const dropped = await run(sql`DELETE FROM trust_pages WHERE org_id = ${uuid(loser)}`);
+  await run(sql`UPDATE trust_pages SET last_evaluated_at = NULL, updated_at = now() WHERE org_id = ${uuid(survivor)}`);
+  return {
+    moved: 0,
+    dropped,
+    notes: dropped > 0
+      ? [`trust_pages: retired the merged-away org's public trust page (${dropped}); its snapshots and document links were removed with it. The surviving page will be rebuilt on the next hourly refresh.`]
       : [],
   };
 };
@@ -1369,8 +1476,11 @@ const mergeOrganizationUsers: CustomMergeExecutor = async (loser, survivor) => {
 // dropping them is not on the table. The survivor's definition for the same
 // schedule is the same weekly narrative under a different id, so the loser's
 // run history simply continues there. `ai_agent_runs.report_run_id` keeps
-// pointing at the same (untouched) report_runs rows, so run traces stay
-// linked.
+// pointing at the same report_runs rows, so run traces stay linked. (#4247
+// deliberately did NOT add a same-org composite FK from ai_agent_runs to
+// report_runs: ai_agent_runs is leave-for-erasure with a trigger-immutable
+// org_id, while the runs it references are repointed to the survivor here —
+// such an FK would fail every merge of an org with a narrative run.)
 //
 // The narrative key deliberately carries no keyWhere: `keyMatch` compares with a plain
 // `=`, which is NULL-blind, so ordinary reports (NULL
@@ -1378,6 +1488,28 @@ const mergeOrganizationUsers: CustomMergeExecutor = async (loser, survivor) => {
 // of the partial index it mirrors. The portal and fleet-design passes need an
 // explicit predicate on both aliases because their keys (`type`) are always
 // non-NULL.
+//
+// Two more references to the doomed definition must move with its runs (#7443),
+// or the merge either aborts or silently loses service-delivery history:
+//  - `service_deliverable_evidence.report_id`: a run cited as deliverable
+//    evidence carries its definition id too, enforced by
+//    sd_evidence_report_run_fk (report_run_id, report_id) -> report_runs(id,
+//    report_id). Re-homing the run and re-pointing the evidence are separate
+//    statements, so the pair is mismatched in between — legal only because
+//    that FK is DEFERRABLE (2026-12-03-120200) and the merge runs under
+//    SET CONSTRAINTS ALL DEFERRED. Left un-pointed, the evidence would be
+//    CASCADE-deleted with the definition via sd_evidence_report_org_fk.
+//  - `service_deliverables.auto_evidence_report_id`: the managed-evidence
+//    binding (a portal self-service definition). Its FK is ON DELETE SET NULL
+//    (referential actions fire immediately even when deferred), so a binding
+//    left on the doomed definition would silently stop the deliverable
+//    producing evidence.
+// The re-pointed rows' org_id still names the loser here (parents-first:
+// reports runs before the service_deliverable* repoints), so
+// sd_evidence_report_org_fk (report_id, org_id) and
+// service_deliverables_auto_report_org_fk (auto_evidence_report_id, org_id)
+// are mismatched too until those repoints land; both are DEFERRABLE and pass
+// at commit.
 // ---------------------------------------------------------------------------
 const REPORTS_KEY = ['source_ai_agent_schedule_id'] as const;
 // Mirrors reports_portal_self_service_org_type_uniq (org_id, type)
@@ -1389,6 +1521,22 @@ const PORTAL_REPORT_WHERE_BOTH = sql`s.portal_self_service = true AND t.portal_s
 const FLEET_DESIGN_REPORT_KEY = ['type'] as const;
 const FLEET_DESIGN_REPORT_WHERE_BOTH = sql`s.type = 'ai_fleet_design' AND t.type = 'ai_fleet_design'`;
 
+/**
+ * Every collision pass `mergeReports` runs. `mergeReports` iterates this list
+ * and `CUSTOM_WOULD_DROP_COUNTS.reports` ORs over it, so the preview cannot
+ * drift from what the executor deletes (#7615: Fleet Design was missing from
+ * the preview). A new dedupe pass belongs here and nowhere else.
+ */
+const REPORT_DEDUPE_PASSES: ReadonlyArray<{
+  name: 'narrative' | 'portal' | 'fleetDesign';
+  key: readonly string[];
+  whereBoth?: SQL;
+}> = [
+  { name: 'narrative', key: REPORTS_KEY },
+  { name: 'portal', key: PORTAL_REPORT_KEY, whereBoth: PORTAL_REPORT_WHERE_BOTH },
+  { name: 'fleetDesign', key: FLEET_DESIGN_REPORT_KEY, whereBoth: FLEET_DESIGN_REPORT_WHERE_BOTH },
+];
+
 async function rehomeReportChildrenThenDelete(
   loser: string,
   survivor: string,
@@ -1397,11 +1545,26 @@ async function rehomeReportChildrenThenDelete(
 ): Promise<{
   dropped: number;
   reportRunsRehomed: number;
+  evidenceRehomed: number;
+  autoEvidenceRebound: number;
   recipientsDeduplicated: number;
   recipientsRehomed: number;
 }> {
   const reportRunsRehomed = await run(sql`
     UPDATE report_runs AS c
+       SET report_id = s.id,
+           -- #4247: the run's owner follows its new parent (composite
+           -- report_runs_report_org_fk; deferred until commit anyway).
+           org_id = s.org_id
+      FROM reports t
+      JOIN reports s
+        ON s.org_id = ${uuid(survivor)}
+       AND ${keyMatch(key)}${whereBoth ? sql` AND ${whereBoth}` : sql``}
+     WHERE t.org_id = ${uuid(loser)}
+       AND c.report_id = t.id`);
+
+  const evidenceRehomed = await run(sql`
+    UPDATE service_deliverable_evidence AS c
        SET report_id = s.id
       FROM reports t
       JOIN reports s
@@ -1409,6 +1572,16 @@ async function rehomeReportChildrenThenDelete(
        AND ${keyMatch(key)}${whereBoth ? sql` AND ${whereBoth}` : sql``}
      WHERE t.org_id = ${uuid(loser)}
        AND c.report_id = t.id`);
+
+  const autoEvidenceRebound = await run(sql`
+    UPDATE service_deliverables AS c
+       SET auto_evidence_report_id = s.id
+      FROM reports t
+      JOIN reports s
+        ON s.org_id = ${uuid(survivor)}
+       AND ${keyMatch(key)}${whereBoth ? sql` AND ${whereBoth}` : sql``}
+     WHERE t.org_id = ${uuid(loser)}
+       AND c.auto_evidence_report_id = t.id`);
 
   const recipientsDeduplicated = await run(sql`
     DELETE FROM report_schedule_recipients AS c
@@ -1448,45 +1621,121 @@ async function rehomeReportChildrenThenDelete(
   return {
     dropped,
     reportRunsRehomed,
+    evidenceRehomed,
+    autoEvidenceRebound,
     recipientsDeduplicated,
     recipientsRehomed,
   };
 }
 
+function rehomedChildrenSummary(pass: Awaited<ReturnType<typeof rehomeReportChildrenThenDelete>>): string {
+  return `report_runs: ${pass.reportRunsRehomed}; service_deliverable_evidence: ${pass.evidenceRehomed} re-pointed;`
+    + ` service_deliverables auto-evidence: ${pass.autoEvidenceRebound} re-bound;`
+    + ` report_schedule_recipients: ${pass.recipientsDeduplicated} deduplicated, ${pass.recipientsRehomed} re-homed`;
+}
+
+// ---------------------------------------------------------------------------
+// Multi-org report series W02: reports_series_active_child_uniq (org_id,
+// series_id) WHERE series_id IS NOT NULL AND archived_at IS NULL collides when
+// both orgs hold an active child of the same series. The survivor keeps its
+// child. The loser's child is ARCHIVED in place — never deleted, and its runs
+// are never re-homed. W02 chose this because a run may be deliverable
+// evidence and sd_evidence_report_run_fk (report_run_id, report_id) ->
+// report_runs(id, report_id) was then NOT deferrable, so moving a run aborted
+// the merge with 23503. That FK is DEFERRABLE since 2026-12-03-120200 (#7443)
+// and the dedupe passes below now re-home evidence-linked runs, but this pass
+// keeps archive-in-place: this pass itself touches no run or evidence row.
+// The archived child then repoints into the survivor org with its history
+// intact (the generic repoint below). Its
+// recipient overrides are unioned onto the survivor's child; a 'remove' on
+// either side wins over an 'add'.
+// ---------------------------------------------------------------------------
+async function archiveCollidingSeriesChildren(
+  loser: string,
+  survivor: string,
+): Promise<{ archived: number; removesPromoted: number; recipientsDeduplicated: number; recipientsRehomed: number }> {
+  const twin = sql`s.org_id = ${uuid(survivor)}
+       AND s.series_id = t.series_id
+       AND s.archived_at IS NULL
+       AND t.archived_at IS NULL`;
+
+  const removesPromoted = await run(sql`
+    UPDATE report_schedule_recipients AS existing
+       SET mode = 'remove'
+      FROM report_schedule_recipients c
+      JOIN reports t ON t.id = c.report_id
+      JOIN reports s ON ${twin}
+     WHERE t.org_id = ${uuid(loser)}
+       AND t.series_id IS NOT NULL
+       AND c.mode = 'remove'
+       AND existing.report_id = s.id
+       AND existing.contact_id = c.contact_id
+       AND existing.mode = 'add'`);
+
+  const recipientsDeduplicated = await run(sql`
+    DELETE FROM report_schedule_recipients AS c
+     USING reports t
+      JOIN reports s ON ${twin}
+     WHERE t.org_id = ${uuid(loser)}
+       AND t.series_id IS NOT NULL
+       AND c.report_id = t.id
+       AND EXISTS (
+         SELECT 1 FROM report_schedule_recipients existing
+          WHERE existing.report_id = s.id
+            AND existing.contact_id = c.contact_id
+       )`);
+
+  const recipientsRehomed = await run(sql`
+    UPDATE report_schedule_recipients AS c
+       SET report_id = s.id
+      FROM reports t
+      JOIN reports s ON ${twin}
+     WHERE t.org_id = ${uuid(loser)}
+       AND t.series_id IS NOT NULL
+       AND c.report_id = t.id`);
+
+  const archived = await run(sql`
+    UPDATE reports t
+       SET archived_at = now(), updated_at = now()
+      FROM reports s
+     WHERE t.org_id = ${uuid(loser)}
+       AND t.series_id IS NOT NULL
+       AND ${twin}`);
+
+  return { archived, removesPromoted, recipientsDeduplicated, recipientsRehomed };
+}
+
 const mergeReports: CustomMergeExecutor = async (loser, survivor) => {
-  const narrative = await rehomeReportChildrenThenDelete(
-    loser,
-    survivor,
-    REPORTS_KEY,
-  );
-  const portal = await rehomeReportChildrenThenDelete(
-    loser,
-    survivor,
-    PORTAL_REPORT_KEY,
-    PORTAL_REPORT_WHERE_BOTH,
-  );
-  const fleetDesign = await rehomeReportChildrenThenDelete(
-    loser,
-    survivor,
-    FLEET_DESIGN_REPORT_KEY,
-    FLEET_DESIGN_REPORT_WHERE_BOTH,
-  );
+  const series = await archiveCollidingSeriesChildren(loser, survivor);
+  const passes = {} as Record<
+    (typeof REPORT_DEDUPE_PASSES)[number]['name'],
+    Awaited<ReturnType<typeof rehomeReportChildrenThenDelete>>
+  >;
+  for (const pass of REPORT_DEDUPE_PASSES) {
+    passes[pass.name] = await rehomeReportChildrenThenDelete(loser, survivor, pass.key, pass.whereBoth);
+  }
+  const { narrative, portal, fleetDesign } = passes;
   const moved = await run(buildRepoint('reports', loser, survivor));
   const notes: string[] = [];
   if (narrative.dropped > 0) {
     notes.push(
       `reports: dropped ${narrative.dropped} duplicate AI narrative report definition from the merged-away org (the survivor already had one for the same schedule; the merged-away definition's own name/config/execution-scope fields were discarded — re-check the surviving definition)`
-      + ` and re-homed its children onto the survivor's definition (report_runs: ${narrative.reportRunsRehomed}; report_schedule_recipients: ${narrative.recipientsDeduplicated} deduplicated, ${narrative.recipientsRehomed} re-homed)`,
+      + ` and re-homed its children onto the survivor's definition (${rehomedChildrenSummary(narrative)})`,
     );
   }
   if (portal.dropped > 0) {
     notes.push(
-      `reports: dropped ${portal.dropped} duplicate portal self-service report definition from the merged-away org and re-homed its children onto the survivor's canonical definition (report_runs: ${portal.reportRunsRehomed}; report_schedule_recipients: ${portal.recipientsDeduplicated} deduplicated, ${portal.recipientsRehomed} re-homed)`,
+      `reports: dropped ${portal.dropped} duplicate portal self-service report definition from the merged-away org and re-homed its children onto the survivor's canonical definition (${rehomedChildrenSummary(portal)})`,
     );
   }
   if (fleetDesign.dropped > 0) {
     notes.push(
-      `reports: dropped ${fleetDesign.dropped} duplicate Fleet Design report definition from the merged-away org and re-homed its children onto the survivor's definition (report_runs: ${fleetDesign.reportRunsRehomed}; report_schedule_recipients: ${fleetDesign.recipientsDeduplicated} deduplicated, ${fleetDesign.recipientsRehomed} re-homed)`,
+      `reports: dropped ${fleetDesign.dropped} duplicate Fleet Design report definition from the merged-away org and re-homed its children onto the survivor's definition (${rehomedChildrenSummary(fleetDesign)})`,
+    );
+  }
+  if (series.archived > 0) {
+    notes.push(
+      `reports: archived ${series.archived} multi-org report child definition(s) of the merged-away org whose series already had an active child in the survivor; their run history stays attached to the archived rows (report_schedule_recipients: ${series.recipientsRehomed} override(s) moved to the survivor's child, ${series.recipientsDeduplicated} duplicate(s) dropped, ${series.removesPromoted} add→remove promotion(s))`,
     );
   }
   return {
@@ -1540,10 +1789,19 @@ const mergeAutomationResourceBindings: CustomMergeExecutor = async (loser, survi
 // review, `last_error = 'name_not_addressable'` — rather than truncated into a
 // name that no longer splits back to a real source.
 // ---------------------------------------------------------------------------
+/**
+ * The in-grammar collision slug `mergeToolSources` gives a loser source. Shared
+ * with `resolveFlows`, which must predict the rename to rewrite flow step tool
+ * references before the move phase performs it.
+ */
+function toolSourceMergeSlugSql(slug: SQL, loser: string): SQL {
+  return sql`left(${slug}, 20) || 'm' || substr(replace(${uuid(loser)}::text, '-', ''), 1, 3)`;
+}
+
 const mergeToolSources: CustomMergeExecutor = async (loser, survivor) => {
   const renamed = await run(sql`
     UPDATE tool_sources AS t
-       SET slug = left(t.slug, 20) || 'm' || substr(replace(${uuid(loser)}::text, '-', ''), 1, 3),
+       SET slug = ${toolSourceMergeSlugSql(sql`t.slug`, loser)},
            updated_at = now()
      WHERE t.org_id = ${uuid(loser)}
        AND EXISTS (
@@ -1588,17 +1846,248 @@ const mergeToolSourceTools: CustomMergeExecutor = async (loser, survivor) => ({
   notes: [],
 });
 
+// ---------------------------------------------------------------------------
+// flows — Tool Catalog W03 (#5215 / #5218).
+//
+// `flows_org_slug_uq (org_id, slug) WHERE org_id IS NOT NULL` lets two orgs
+// each own a flow with the same slug, so a plain repoint aborts the merge on
+// 23505 and a dedupe-DELETE would silently destroy a draft. The RESOLVE half
+// renames a colliding loser flow `<slug>_m<n>` (length-aware, trailing `_`
+// stripped so no `__` forms, retried until free against the survivor's flows,
+// the survivor partner's partner-wide flows, and every other loser flow).
+//
+// It also rewrites step tool references (quorum risk 1): `mergeToolSources`
+// renames a loser source whose slug collides with a survivor source, so a
+// moved flow step `hudu__get_asset` would otherwise resolve to the
+// SURVIVOR's different `hudu` integration. Resolve completes for every table
+// before move starts for any, so the slugs read here are still the
+// pre-rename ones and `toolSourceMergeSlugSql` predicts the new ones — no
+// dependence on walk order. The MOVE half is a plain repoint; partner-wide
+// rows (org_id NULL) are never merge participants.
+//
+// W04 (#5219 A3): the resolve half also pauses an enabled flow whose tools it
+// rewrites (`org_merged`) and cancels the loser org's active runs
+// (`cancelLoserFlowRuns`). Publications (`flow_versions`) are a plain
+// REPOINT_TABLES entry and move with their flow in the move phase; the
+// DEFERRED owner guard compares each publication with its flow at commit.
+// ---------------------------------------------------------------------------
+const FLOW_SLUG_MAX = 48;
+
+/**
+ * Rows out of a driver result. Deliberately NOT lenient (same rule as
+ * db/rowCount.ts): degrading an unexpected shape to [] would make resolveFlows
+ * skip the tool-reference rewrite silently.
+ */
+function resultRows<T>(result: unknown): T[] {
+  if (Array.isArray(result)) return result as T[];
+  const rows = (result as { rows?: unknown } | null)?.rows;
+  if (Array.isArray(rows)) return rows as T[];
+  throw new Error('[orgMerge] unexpected driver result shape (no rows array)');
+}
+
+/** `<base>_m<n>` within 48 chars; the cut base loses trailing `_` so no `__` forms. */
+export function flowMergeSlugCandidate(slug: string, n: number): string {
+  const suffix = `_m${n}`;
+  const base = slug.slice(0, FLOW_SLUG_MAX - suffix.length).replace(/_+$/, '');
+  return `${base}${suffix}`;
+}
+
+/** Rewrites `<old>__<name>` step tools per the source rename map; null when unchanged. */
+export function rewriteFlowStepTools(
+  definition: unknown,
+  renames: ReadonlyMap<string, string>,
+): Record<string, unknown> | null {
+  if (renames.size === 0 || !definition || typeof definition !== 'object' || Array.isArray(definition)) return null;
+  const doc = definition as Record<string, unknown>;
+  if (!Array.isArray(doc.steps)) return null;
+  let changed = false;
+  const steps = doc.steps.map((step) => {
+    if (!step || typeof step !== 'object') return step;
+    const tool = (step as { tool?: unknown }).tool;
+    if (typeof tool !== 'string') return step;
+    const sep = tool.indexOf('__');
+    if (sep <= 0) return step;
+    const next = renames.get(tool.slice(0, sep));
+    if (!next) return step;
+    changed = true;
+    return { ...(step as Record<string, unknown>), tool: `${next}${tool.slice(sep)}` };
+  });
+  return changed ? { ...doc, steps } : null;
+}
+
+/**
+ * Cancels the loser org's active flow runs (Tool Catalog W04, #5219 A3).
+ *
+ * Runs are `leave-for-erasure` (`flow_runs.org_id` is trigger-immutable), so
+ * they stay on the loser shell; this only stops them. It covers every run
+ * executing in the loser org — runs of the loser's own flows AND of the
+ * partner's partner-wide flows — so it does not depend on the loser owning a
+ * flow.
+ *
+ * Same rule as `cancelFlowRun` / `disableFlow`: `cancel_requested_at` is set
+ * first, on every active run. Then a parked run (`queued`, `waiting`,
+ * `awaiting_approval`) that no slice holds a live lease on ends `cancelled`
+ * (`org_merged`) at once, clearing `wake_at` and the lease as the
+ * `flow_runs_waiting_chk` / `flow_runs_lease_pair_chk` CHECKs require, and its
+ * `awaiting_approval` step is closed with it. A `running` run, or a parked run
+ * a resuming slice currently leases, is never written `cancelled` here: the
+ * slice owns it and stops at its next `cancel_requested_at` check. The pending
+ * intents of a cancelled run stay with the loser (action_intents is
+ * leave-for-erasure) — a later approval hits the dispatch claim's
+ * `run_terminal`.
+ */
+async function cancelLoserFlowRuns(loser: string): Promise<string[]> {
+  const active = await run(sql`
+    UPDATE flow_runs
+       SET cancel_requested_at = COALESCE(cancel_requested_at, now()),
+           updated_at = now()
+     WHERE org_id = ${uuid(loser)}
+       AND status IN ('queued', 'running', 'waiting', 'awaiting_approval')`);
+  const [cancelledRow] = resultRows<{ n: number | string }>(
+    await dbModule.db.execute(sql`
+      WITH cancelled AS (
+        UPDATE flow_runs
+           SET status = 'cancelled',
+               error_code = 'org_merged',
+               error = 'The organization this run executed in was merged into another organization.',
+               cancel_requested_at = COALESCE(cancel_requested_at, now()),
+               finished_at = now(),
+               wake_at = NULL,
+               lease_token = NULL,
+               lease_expires_at = NULL,
+               updated_at = now()
+         WHERE org_id = ${uuid(loser)}
+           AND status IN ('queued', 'waiting', 'awaiting_approval')
+           AND (lease_expires_at IS NULL OR lease_expires_at <= now())
+        RETURNING id, org_id
+      ), closed_steps AS (
+        UPDATE flow_run_steps AS s
+           SET status = 'cancelled',
+               error_code = 'cancelled',
+               finished_at = now()
+          FROM cancelled AS c
+         WHERE s.run_id = c.id
+           AND s.org_id = c.org_id
+           AND s.status = 'awaiting_approval'
+        RETURNING s.id
+      )
+      SELECT (SELECT count(*) FROM cancelled)::int AS n`),
+  );
+  const cancelled = Number(cancelledRow?.n ?? 0);
+  const stillRunning = active - cancelled;
+  const notes: string[] = [];
+  if (cancelled > 0) {
+    notes.push(`flows: cancelled ${cancelled} parked run(s) in the merged-away org (error_code org_merged); their history and any pending approvals stay with that org`);
+  }
+  if (stillRunning > 0) {
+    notes.push(`flows: ${stillRunning} running run(s) in the merged-away org (including any parked run a worker slice currently holds) were asked to cancel and stop at their next checkpoint`);
+  }
+  return notes;
+}
+
+const resolveFlows: CustomMergeExecutor = async (loser, survivor) => {
+  const runNotes = await cancelLoserFlowRuns(loser);
+
+  const loserFlows = resultRows<{ id: string; slug: string; status: string; definition: unknown }>(
+    await dbModule.db.execute(sql`
+      SELECT id, slug, status, definition FROM flows
+       WHERE org_id = ${uuid(loser)}
+       ORDER BY created_at, id
+         FOR UPDATE`),
+  );
+  if (loserFlows.length === 0) return { moved: 0, dropped: 0, notes: runNotes };
+
+  const takenRows = resultRows<{ slug: string }>(
+    await dbModule.db.execute(sql`
+      SELECT f.slug FROM flows AS f
+       WHERE f.org_id = ${uuid(survivor)}
+          OR (f.org_id IS NULL AND f.partner_id = (SELECT o.partner_id FROM organizations AS o WHERE o.id = ${uuid(survivor)}))`),
+  );
+  const survivorSlugs = new Set(takenRows.map((r) => r.slug));
+  const taken = new Set<string>([...survivorSlugs, ...loserFlows.map((f) => f.slug)]);
+
+  const renameRows = resultRows<{ old_slug: string; new_slug: string }>(
+    await dbModule.db.execute(sql`
+      SELECT t.slug AS old_slug, ${toolSourceMergeSlugSql(sql`t.slug`, loser)} AS new_slug
+        FROM tool_sources AS t
+       WHERE t.org_id = ${uuid(loser)}
+         AND EXISTS (SELECT 1 FROM tool_sources AS s WHERE s.org_id = ${uuid(survivor)} AND s.slug = t.slug)`),
+  );
+  const sourceRenames = new Map(renameRows.map((r) => [r.old_slug, r.new_slug]));
+
+  let renamed = 0;
+  let rewritten = 0;
+  let paused = 0;
+  for (const flow of loserFlows) {
+    let slug = flow.slug;
+    if (survivorSlugs.has(flow.slug)) {
+      let n = 1;
+      let candidate = flowMergeSlugCandidate(flow.slug, n);
+      while (taken.has(candidate)) candidate = flowMergeSlugCandidate(flow.slug, ++n);
+      taken.add(candidate);
+      slug = candidate;
+      renamed += 1;
+    }
+    const nextDefinition = rewriteFlowStepTools(flow.definition, sourceRenames);
+    if (slug === flow.slug && !nextDefinition) continue;
+    if (nextDefinition) rewritten += 1;
+    // An ENABLED flow whose step tools were rewritten no longer matches its
+    // live publication (flow_versions still names the old qualified tool), so
+    // it pauses org_merged in this same statement and must be re-enabled —
+    // which publishes a new row. It keeps enabled_publication_seq
+    // (flows_enabled_publication_chk pairs paused with a publication). Only
+    // `enabled` pauses: a draft cannot be paused (no publication), and an
+    // already paused or disabled flow needs a re-enable anyway. The row is
+    // locked FOR UPDATE above, so the status read is current.
+    const pause = nextDefinition !== null && flow.status === 'enabled';
+    if (pause) paused += 1;
+    await run(sql`
+      UPDATE flows
+         SET slug = ${slug},
+             definition = ${nextDefinition ? sql`${JSON.stringify(nextDefinition)}::jsonb` : sql`definition`},
+             definition_version = definition_version + ${nextDefinition ? sql.raw('1') : sql.raw('0')},${pause ? sql.raw(`
+             status = 'paused',
+             paused_reason = 'org_merged',`) : sql.raw('')}
+             updated_at = GREATEST(now(), webhook_secret_rotated_at + interval '1 millisecond')
+       WHERE id = ${flow.id}::uuid`);
+    // updated_at is set strictly after the webhook secret's rotated_at: a
+    // definition rewrite must never look like "no edit since the mint" (#10270,
+    // flows/versions.ts webhookSecretSurvivesEnable). GREATEST ignores the NULL.
+  }
+
+  const notes: string[] = [...runNotes];
+  if (renamed > 0) {
+    notes.push(`flows: renamed ${renamed} flow(s) from the merged-away org whose slug already existed under the survivor (suffixed _m<n>; nothing deleted)`);
+  }
+  if (rewritten > 0) {
+    notes.push(`flows: rewrote step tool references in ${rewritten} flow(s) to follow renamed external tool sources`);
+  }
+  if (paused > 0) {
+    notes.push(`flows: paused ${paused} enabled flow(s) whose step tool references were rewritten (paused_reason org_merged); re-enable each to publish the rewritten definition`);
+  }
+  return { moved: 0, dropped: 0, notes };
+};
+
+const mergeFlows: CustomMergeExecutor = async (loser, survivor) => ({
+  moved: await run(buildRepoint('flows', loser, survivor)),
+  dropped: 0,
+  notes: [],
+});
+
 /**
  * The `move`-phase half of every `custom` table (which, for all but one of
  * them, is the whole executor).
  */
 export const CUSTOM_EXECUTORS: Readonly<Record<string, CustomMergeExecutor>> = {
+  ...autopayMergeExecutors,
   caller_verification_subject_bindings: moveBindings,
   automation_resource_bindings: mergeAutomationResourceBindings,
   tool_sources: mergeToolSources,
   tool_source_tools: mergeToolSourceTools,
+  flows: mergeFlows,
   contacts: mergeContacts,
   backup_configs: mergeBackupConfigs,
+  trust_pages: mergeTrustPages,
   audit_baselines: mergeAuditBaselines,
   service_deliverables: mergeServiceDeliverables,
   ticket_checklist_templates: mergeTicketChecklistTemplates,
@@ -1620,6 +2109,8 @@ export const CUSTOM_EXECUTORS: Readonly<Record<string, CustomMergeExecutor>> = {
   ai_run_artifacts: moveAiRunArtifacts,
   script_executions: moveScriptExecutionsDetachingAiOrigin,
   script_proposals: moveScriptProposals,
+  diagnostic_access_grants: moveDiagnosticAccessGrants,
+  elevation_requests: moveElevationRequests,
   m365_sync_state: moveM365SnapshotTable,
   m365_users: moveM365SnapshotTable,
   m365_intune_devices: moveM365SnapshotTable,
@@ -1642,6 +2133,9 @@ export const CUSTOM_EXECUTORS: Readonly<Record<string, CustomMergeExecutor>> = {
  * contract test asserts that.
  */
 export const CUSTOM_RESOLVE_EXECUTORS: Readonly<Record<string, CustomMergeExecutor>> = {
+  // Must run in resolve: predicts mergeToolSources' move-phase slug renames to
+  // rewrite flow step tool references (and renames colliding flow slugs).
+  flows: resolveFlows,
   // Must run in resolve: both colliding identities are revoked before the
   // move pass repoints, so the canonical partial unique indexes cannot 23505.
   caller_verification_subject_bindings: resolveBindingMerge,
@@ -1653,6 +2147,12 @@ export const CUSTOM_RESOLVE_EXECUTORS: Readonly<Record<string, CustomMergeExecut
   // Must run in resolve, not move: `devices` repoints in the move phase and a
   // live proposal targeting one of them would still be consumable.
   script_proposals: fenceScriptProposals,
+  // Must run in resolve: `devices` repoints in the move phase and its trigger
+  // restamps grants into the survivor org.
+  diagnostic_access_grants: fenceDiagnosticAccessGrants,
+  // Must run in resolve (OD4): the devices repoint in the move phase carries
+  // un-actuated requests into the survivor; a live approval must not arrive.
+  elevation_requests: resolveElevationRequests,
   // Must run in resolve: m365_sync_state's composite FK targets
   // m365_connections (repoint-dedupe) and m365_intune_devices's targets
   // devices (plain repoint) — both parents move in the `move` phase.
@@ -1695,6 +2195,10 @@ export const CUSTOM_WOULD_REVOKE_COUNTS: Readonly<Record<string, (loser: string)
     SELECT count(*)::int AS n FROM script_proposals
      WHERE org_id = ${uuid(loser)}
        AND status IN ${SCRIPT_PROPOSAL_LIVE_STATUSES}`,
+  diagnostic_access_grants: (loser) => sql`
+    SELECT count(*)::int AS n FROM diagnostic_access_grants
+     WHERE org_id = ${uuid(loser)}
+       AND status IN ('pending_approval', 'active')`,
 };
 
 /**
@@ -1710,6 +2214,9 @@ export const CUSTOM_WOULD_REVOKE_COUNTS: Readonly<Record<string, (loser: string)
  */
 export const CUSTOM_WOULD_DROP_COUNTS: Readonly<Record<string, (loser: string, survivor: string) => SQL>> = {
   ticket_drafts: (loser) => sql`SELECT count(*)::int AS n FROM ticket_drafts WHERE org_id = ${uuid(loser)}`,
+  // mergeTrustPages deletes the loser's page unconditionally (no collision
+  // key), so the mirror is plain loserRows, like ticket_drafts.
+  trust_pages: (loser) => sql`SELECT count(*)::int AS n FROM trust_pages WHERE org_id = ${uuid(loser)}`,
   // m365 tenant-sync snapshots: resolveM365SnapshotTable deletes EVERY
   // loser-org row unconditionally, so the mirror is plain loserRows.
   m365_sync_state: (loser) => sql`SELECT count(*)::int AS n FROM m365_sync_state WHERE org_id = ${uuid(loser)}`,
@@ -1729,12 +2236,9 @@ export const CUSTOM_WOULD_DROP_COUNTS: Readonly<Record<string, (loser: string, s
     SELECT count(*)::int AS n FROM reports t
      WHERE t.org_id = ${uuid(loser)}
        AND (
-         ${collidesWithSurvivor('reports', REPORTS_KEY, survivor)}
-         OR ${collidesWithSurvivor(
-           'reports',
-           PORTAL_REPORT_KEY,
-           survivor,
-           PORTAL_REPORT_WHERE_BOTH,
+         ${sql.join(
+           REPORT_DEDUPE_PASSES.map((p) => collidesWithSurvivor('reports', p.key, survivor, p.whereBoth)),
+           sql` OR `,
          )}
        )`,
   pax8_orders: (loser, survivor) => sql`

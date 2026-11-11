@@ -110,6 +110,16 @@ function browserShim(options: TunnelRewriteOptions): string {
 var options=${config};
 var rewrite=${rewriteTunnelUrl.toString()};
 function map(value){return typeof value==='string'||value instanceof URL?rewrite(String(value),options):value;}
+// This document runs in an opaque origin, so its requests to the tunnel are
+// cross-origin and send no cookies unless credentialed — the device's session
+// cookie would never come back. Default tunnel requests to credentialed.
+function inTunnel(value){
+  try{
+    var base=typeof document!=='undefined'&&document.baseURI||location.href;
+    var resolved=new URL(String(value),base);
+    return resolved.origin===new URL(location.href).origin&&resolved.pathname.indexOf(options.basePath)===0;
+  }catch(e){return false;}
+}
 if(typeof fetch==='function'){
   var originalFetch=fetch;
   globalThis.fetch=function(input,init){
@@ -123,7 +133,11 @@ if(typeof fetch==='function'){
         if(url===resolved.pathname+resolved.search+resolved.hash) url=input.url;
       }
       if(url!==input.url) input=new Request(url,input);
-    }else input=map(input);
+      if(inTunnel(input.url)&&input.credentials!=='include') input=new Request(input,{credentials:'include'});
+    }else{
+      input=map(input);
+      if(inTunnel(input)&&(!init||init.credentials===undefined)) init=Object.assign({},init,{credentials:'include'});
+    }
     return originalFetch.call(this,input,init);
   };
 }
@@ -131,7 +145,9 @@ if(typeof XMLHttpRequest!=='undefined'){
   var originalOpen=XMLHttpRequest.prototype.open;
   XMLHttpRequest.prototype.open=function(){
     var args=Array.prototype.slice.call(arguments);args[1]=map(args[1]);
-    return originalOpen.apply(this,args);
+    var result=originalOpen.apply(this,args);
+    if(inTunnel(args[1])) this.withCredentials=true;
+    return result;
   };
 }
 if(typeof Element!=='undefined'){
@@ -158,8 +174,17 @@ if(typeof Element!=='undefined'){
  * legacy device markup. Tokens consume quoted '>' characters and raw-text bodies.
  * WebSocket upgrades and Location setters are not supported by this HTTP bridge.
  */
-export function rewriteTunnelHtml(html: string, options: TunnelRewriteOptions): string {
-  const injection = `<base href="${options.basePath}">` + browserShim(options);
+export function rewriteTunnelHtml(
+  html: string,
+  options: TunnelRewriteOptions,
+  behavior: { injectBase?: boolean } = {},
+): string {
+  // Host mode (spec §5): the device owns the origin, so relative URLs already
+  // resolve correctly and an injected <base> would only add risk. Path mode
+  // keeps it. A device's own <base> is still stripped below in both modes
+  // (host-mode handling of device <base> is a W04 lab decision).
+  const injectBase = behavior.injectBase ?? true;
+  const injection = (injectBase ? `<base href="${options.basePath}">` : '') + browserShim(options);
   let injected = false;
   let sawScript = false;
   const rewritten = html.replace(

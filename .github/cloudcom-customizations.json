@@ -2,6 +2,28 @@
   "version": 1,
   "customizations": [
     {
+      "id": "managed-rustdesk-viewer-routing",
+      "requiredFiles": [
+        "scripts/cloudcom/rustdesk/build-viewer-msi.ps1",
+        "scripts/cloudcom/rustdesk/build-managed-client-local.ps1",
+        "scripts/cloudcom/rustdesk/ManagedViewerLauncher.cs",
+        "docs/cloudcom-managed-viewer-msi.md",
+        "scripts/cloudcom/rustdesk/launch-managed.ps1",
+        "scripts/cloudcom/rustdesk/launch-managed.test.ps1",
+        "docs/cloudcom-managed-viewer-launch.md"
+      ],
+      "hooks": [
+        {
+          "file": ".github/workflows/cloudcom-ci.yml",
+          "contains": "./scripts/cloudcom/rustdesk/launch-managed.test.ps1"
+        },
+        {
+          "file": "scripts/cloudcom/rustdesk/launch-managed.ps1",
+          "contains": "$start.EnvironmentVariables['RUSTDESK_APPNAME'] = $route"
+        }
+      ]
+    },
+    {
       "id": "rustdesk-desired-state",
       "requiredFiles": [
         "scripts/cloudcom/rustdesk/common.ps1",
@@ -36,7 +58,9 @@
         "apps/api/src/services/cloudcom/remoteAccessOptions.test.ts",
         "apps/web/src/components/cloudcom/RemoteAccessAlternatives.tsx",
         "apps/web/src/components/cloudcom/RemoteAccessAlternatives.test.tsx",
-        "docs/cloudcom-rustdesk.md"
+        "docs/cloudcom-rustdesk.md",
+        "apps/web/src/components/remote/ConnectDesktopButton.split.test.tsx",
+        "apps/web/src/components/remote/RemoteToolsPage.remoteTools.test.tsx"
       ],
       "hooks": [
         {
@@ -45,7 +69,15 @@
         },
         {
           "file": "apps/web/src/components/remote/RemoteToolsPage.tsx",
-          "contains": "<RemoteAccessAlternatives"
+          "contains": "remoteAccessProviders={remoteTools.providers}"
+        },
+        {
+          "file": "apps/web/src/components/remote/ConnectDesktopButton.tsx",
+          "contains": "await launchViaRemoteTool(choice.id)"
+        },
+        {
+          "file": "apps/web/src/components/remote/ConnectDesktopButton.tsx",
+          "contains": "/staff-native/launch/${deviceId}"
         }
       ]
     },
@@ -179,7 +211,7 @@
       "hooks": [
         {
           "file": "packages/ext-cloud-command/src/server/index.ts",
-          "contains": "mountMicrosoftRoutes(app, administration ? createAdministrationServices(context, fetch, administration) : microsoft)"
+          "contains": "mountMicrosoftRoutes(app, microsoftServices)"
         },
         {
           "file": "packages/ext-cloud-command/src/web/index.ts",
@@ -192,6 +224,10 @@
         {
           "file": "packages/ext-cloud-command/manifest.json",
           "contains": "cloudcommand-connect-page"
+        },
+        {
+          "file": "packages/ext-cloud-command/src/server/index.ts",
+          "contains": "mountDirectorySnapshotRoutes(app, context, microsoftServices)"
         }
       ]
     },
@@ -312,23 +348,86 @@
         "apps/web/src/components/integrations/GoogleWorkspaceIntegration.test.tsx"
       ],
       "hooks": [
-        { "file": "packages/ext-cloud-command/src/server/index.ts", "contains": "mountGoogleRoutes(app, google)" },
-        { "file": "packages/ext-cloud-command/src/web/index.ts", "contains": "import './google'" },
-        { "file": "packages/ext-cloud-command/manifest.json", "contains": "cloudcommand-google-page" },
-        { "file": "apps/api/src/extensions/builtinRegistry.ts", "contains": "nativeGoogleServices.directory" },
-        { "file": "apps/api/src/extensions/builtinRegistry.ts", "contains": "nativeGoogleServices.members" },
-        { "file": "apps/api/src/extensions/builtinRegistry.ts", "contains": "nativeGoogleServices.mailboxSettings" },
-        { "file": "apps/api/src/extensions/builtinRegistry.ts", "contains": "nativeGoogleServices.storage" },
-        { "file": "apps/api/src/extensions/builtinRegistry.ts", "contains": "nativeGoogleServices.activity" },
-        { "file": "apps/api/src/services/googleClient.ts", "contains": "admin.reports.usage.readonly" },
-        { "file": "apps/api/src/services/googleClient.ts", "contains": "admin.reports.audit.readonly" },
-        { "file": "apps/web/src/components/integrations/GoogleWorkspaceIntegration.tsx", "contains": "admin.reports.usage.readonly" },
-        { "file": "apps/web/src/components/integrations/GoogleWorkspaceIntegration.tsx", "contains": "admin.reports.audit.readonly" },
-        { "file": "apps/api/src/extensions/builtinRegistry.ts", "contains": "nativeGoogleServices.setSuspended" },
-        { "file": "apps/api/src/extensions/builtinRegistry.ts", "contains": "nativeGoogleServices.auditSuspension" },
-        { "file": "apps/api/src/extensions/builtinRegistry.ts", "contains": "nativeGoogleServices.updateProfile" },
-        { "file": "apps/api/src/extensions/builtinRegistry.ts", "contains": "nativeGoogleServices.auditProfile" },
-        { "file": ".github/workflows/cloudcom-ci.yml", "contains": "cloudCommandGoogle.test.ts" }
+        {
+          "file": "packages/ext-cloud-command/src/server/index.ts",
+          "contains": "mountGoogleRoutes(app, google)"
+        },
+        {
+          "file": "packages/ext-cloud-command/src/web/index.ts",
+          "contains": "import './google'"
+        },
+        {
+          "file": "packages/ext-cloud-command/manifest.json",
+          "contains": "cloudcommand-google-page"
+        },
+        {
+          "file": "apps/api/src/extensions/builtinRegistry.ts",
+          "contains": "nativeGoogleServices.directory"
+        },
+        {
+          "file": "apps/api/src/extensions/builtinRegistry.ts",
+          "contains": "nativeGoogleServices.members"
+        },
+        {
+          "file": "apps/api/src/extensions/builtinRegistry.ts",
+          "contains": "nativeGoogleServices.mailboxSettings"
+        },
+        {
+          "file": "apps/api/src/extensions/builtinRegistry.ts",
+          "contains": "nativeGoogleServices.storage"
+        },
+        {
+          "file": "apps/api/src/extensions/builtinRegistry.ts",
+          "contains": "nativeGoogleServices.activity"
+        },
+        {
+          "file": "packages/shared/src/constants/googleDwdScopes.ts",
+          "contains": "admin.reports.usage.readonly"
+        },
+        {
+          "file": "packages/shared/src/constants/googleDwdScopes.ts",
+          "contains": "admin.reports.audit.readonly"
+        },
+        {
+          "file": "packages/shared/src/constants/googleDwdScopes.ts",
+          "contains": "admin.reports.usage.readonly"
+        },
+        {
+          "file": "packages/shared/src/constants/googleDwdScopes.ts",
+          "contains": "admin.reports.audit.readonly"
+        },
+        {
+          "file": "apps/api/src/extensions/builtinRegistry.ts",
+          "contains": "nativeGoogleServices.setSuspended"
+        },
+        {
+          "file": "apps/api/src/extensions/builtinRegistry.ts",
+          "contains": "nativeGoogleServices.auditSuspension"
+        },
+        {
+          "file": "apps/api/src/extensions/builtinRegistry.ts",
+          "contains": "nativeGoogleServices.updateProfile"
+        },
+        {
+          "file": "apps/api/src/extensions/builtinRegistry.ts",
+          "contains": "nativeGoogleServices.auditProfile"
+        },
+        {
+          "file": ".github/workflows/cloudcom-ci.yml",
+          "contains": "cloudCommandGoogle.test.ts"
+        },
+        {
+          "file": "apps/api/src/services/googleClient.ts",
+          "contains": "REPORTS_SCOPES"
+        },
+        {
+          "file": "apps/api/src/services/googleClient.ts",
+          "contains": "AUDIT_REPORTS_SCOPES"
+        },
+        {
+          "file": "apps/web/src/components/integrations/GoogleWorkspaceIntegration.tsx",
+          "contains": "GOOGLE_DWD_SCOPES_CSV"
+        }
       ]
     },
     {
@@ -346,12 +445,30 @@
         "docs/cloudcom-upstream-maintenance.md"
       ],
       "hooks": [
-        { "file": "apps/api/src/routes/google.ts", "contains": "googleRoutes.route('/', cloudCommandGoogleOAuthRoutes)" },
-        { "file": "apps/api/src/extensions/cloudCommandGoogle.ts", "contains": "loadGoogleOAuth(auth, input.orgId)" },
-        { "file": "apps/web/src/components/integrations/GoogleWorkspaceIntegration.tsx", "contains": "Authorize Google Workspace" },
-        { "file": "packages/ext-cloud-command/manifest.json", "contains": "cloudcommand_google_oauth_connections" },
-        { "file": ".github/workflows/cloudcom-ci.yml", "contains": "src/routes/cloudCommandGoogleOAuth.test.ts" },
-        { "file": "scripts/cloudcom/test-threecx-rls.sh", "contains": "cloudCommandGoogleOAuth.integration.test.ts" }
+        {
+          "file": "apps/api/src/routes/google.ts",
+          "contains": "googleRoutes.route('/', cloudCommandGoogleOAuthRoutes)"
+        },
+        {
+          "file": "apps/api/src/extensions/cloudCommandGoogle.ts",
+          "contains": "loadGoogleOAuth(auth, input.orgId)"
+        },
+        {
+          "file": "apps/web/src/components/integrations/GoogleWorkspaceIntegration.tsx",
+          "contains": "Authorize Google Workspace"
+        },
+        {
+          "file": "packages/ext-cloud-command/manifest.json",
+          "contains": "cloudcommand_google_oauth_connections"
+        },
+        {
+          "file": ".github/workflows/cloudcom-ci.yml",
+          "contains": "src/routes/cloudCommandGoogleOAuth.test.ts"
+        },
+        {
+          "file": "scripts/cloudcom/test-threecx-rls.sh",
+          "contains": "cloudCommandGoogleOAuth.integration.test.ts"
+        }
       ]
     },
     {
@@ -390,6 +507,407 @@
         {
           "file": ".github/workflows/cloudcom-ci.yml",
           "contains": "pnpm --filter @breeze/api exec vitest run --config vitest.integration.config.ts src/__tests__/integration/unifiSyncLockOrder.integration.test.ts"
+        }
+      ]
+    },
+    {
+      "id": "staff-native-and-ticket-conversation",
+      "requiredFiles": [
+        "apps/api/migrations/2026-09-30-staff-native.sql",
+        "apps/api/src/services/staffNativeAdmission.ts",
+        "apps/api/src/services/staffNativeAuthority.ts",
+        "apps/api/src/services/staffNativeLogin.ts",
+        "apps/api/src/services/cloudcom/remoteAccessEnrollment.ts",
+        "apps/api/src/services/emailTemplates/ticketConversation.ts",
+        "apps/web/src/pages/remote/native.astro"
+      ],
+      "hooks": [
+        {
+          "file": "apps/api/src/index.ts",
+          "contains": "staffNativeRoutes"
+        },
+        {
+          "file": "apps/api/src/services/tenantCascade.ts",
+          "contains": "staff_native_sessions"
+        },
+        {
+          "file": "apps/api/src/services/orgMergeRegistry.ts",
+          "contains": "staff_native_sessions"
+        },
+        {
+          "file": "apps/api/src/services/tenantExportPolicyRegistry.ts",
+          "contains": "\"staff_native_sessions\""
+        },
+        {
+          "file": "apps/api/src/jobs/ticketNotifyWorker.ts",
+          "contains": "ticketConversation"
+        }
+      ]
+    },
+    {
+      "id": "credentials-vault-documents",
+      "requiredFiles": [
+        "packages/ext-credentials/manifest.json",
+        "packages/ext-credentials/migrations/0001_credentials.sql",
+        "packages/ext-credentials/migrations/0002_documents.sql",
+        "packages/ext-credentials/migrations/0003_companion_script_runs.sql",
+        "packages/ext-credentials/src/server/index.ts",
+        "packages/ext-credentials/src/server/index.test.ts",
+        "packages/ext-credentials/src/server/secrets.ts",
+        "packages/ext-credentials/src/server/secrets.test.ts",
+        "packages/ext-credentials/src/server/documents.ts",
+        "packages/ext-credentials/src/server/documents.test.ts",
+        "packages/ext-credentials/src/server/documentImages.ts",
+        "packages/ext-credentials/src/server/documentImages.test.ts",
+        "packages/ext-credentials/src/server/documentSecrets.ts",
+        "packages/ext-credentials/src/server/documentSecrets.test.ts",
+        "packages/ext-credentials/src/server/totp.ts",
+        "packages/ext-credentials/src/server/totp.test.ts",
+        "packages/ext-credentials/src/import/documentSections.ts",
+        "packages/ext-credentials/src/import/documentSections.test.ts",
+        "packages/ext-credentials/src/web/documents.ts",
+        "packages/ext-credentials/src/web/documents.test.ts",
+        "packages/ext-credentials/src/web/companionFill.test.ts"
+      ],
+      "hooks": [
+        {
+          "file": "apps/api/src/extensions/builtinRegistry.ts",
+          "contains": "module: createCredentialsExtension(async event => {"
+        },
+        {
+          "file": "apps/api/src/extensions/builtinRegistry.ts",
+          "contains": "await createAuditLog(event);"
+        },
+        {
+          "file": "apps/api/src/extensions/builtinRegistry.ts",
+          "contains": "enableEnvVar: 'CLOUDCOM_CREDENTIALS_ENABLED'"
+        },
+        {
+          "file": "apps/api/Dockerfile",
+          "contains": "pnpm --filter @cloudcom/ext-credentials build:web"
+        },
+        {
+          "file": "apps/api/src/services/encryptedColumnRegistry.ts",
+          "contains": "credentials_records"
+        },
+        {
+          "file": "apps/api/src/services/encryptedColumnRegistry.ts",
+          "contains": "credentials_documents"
+        }
+      ]
+    },
+    {
+      "id": "browser-companion-session-work-tools",
+      "requiredFiles": [
+        "packages/browser-companion/build.mjs",
+        "packages/browser-companion/config.js",
+        "packages/browser-companion/background.js",
+        "packages/browser-companion/workspace.js",
+        "packages/browser-companion/session.test.mjs",
+        "packages/browser-companion/background.test.mjs",
+        "packages/browser-companion/popup-work.test.mjs",
+        "packages/browser-companion/popup-notes.test.mjs",
+        "packages/browser-companion/popup-navigation.test.mjs",
+        "packages/browser-companion/workspace-network.test.mjs",
+        "packages/browser-companion/workspace-services.test.mjs",
+        "packages/browser-companion/workspace-processes.test.mjs",
+        "packages/browser-companion/workspace-scripts.test.mjs",
+        "packages/browser-companion/workspace-registry.test.mjs",
+        "packages/browser-companion/workspace-events.test.mjs",
+        "apps/api/src/routes/browserCompanion.ts",
+        "apps/api/src/routes/browserCompanion.test.ts",
+        "apps/api/src/routes/companionWork.ts",
+        "apps/api/src/routes/companionWork.test.ts",
+        "apps/api/src/routes/companionScripts.ts",
+        "apps/api/src/services/browserCompanionSession.ts",
+        "apps/api/src/services/browserCompanionSession.test.ts",
+        "apps/api/src/services/browserCompanionPolicy.ts",
+        "apps/api/src/services/browserCompanionPolicy.test.ts",
+        "apps/api/src/services/companionWork.ts",
+        "apps/api/src/services/companionWork.test.ts",
+        "apps/api/src/services/companionScripts.ts",
+        "apps/api/src/services/companionScripts.test.ts",
+        "packages/browser-companion/scripts/clear-print-spool.test.ps1"
+      ],
+      "hooks": [
+        {
+          "file": "apps/api/src/index.ts",
+          "contains": "app.route('/api/v1/browser-companion', createBrowserCompanionTransport"
+        },
+        {
+          "file": "apps/api/src/index.ts",
+          "contains": "api.route('/companion-scripts', companionScriptRoutes)"
+        },
+        {
+          "file": "apps/api/src/index.ts",
+          "contains": "api.route('/companion-work', companionWorkRoutes)"
+        },
+        {
+          "file": "apps/api/src/index.ts",
+          "contains": "startCompanionScriptReconciler(); startCompanionWorkReconciler();"
+        },
+        {
+          "file": "apps/api/src/extensions/builtinRegistry.ts",
+          "contains": "return authorizeBrowserCompanion(auth"
+        }
+      ]
+    },
+    {
+      "id": "idrive-group-mapping",
+      "requiredFiles": [
+        "packages/ext-cloud-command/migrations/2026-10-13-idrive360.sql",
+        "packages/ext-cloud-command/src/server/idrive.ts",
+        "packages/ext-cloud-command/src/server/idrive.test.ts",
+        "packages/ext-cloud-command/src/server/idrive-provider.ts",
+        "packages/ext-cloud-command/src/web/idrive.ts",
+        "packages/ext-cloud-command/src/web/idrive.test.ts"
+      ],
+      "hooks": [
+        {
+          "file": "packages/ext-cloud-command/src/server/index.ts",
+          "contains": "mountIDriveRoutes(app, context, fetch, idriveDb);"
+        },
+        {
+          "file": "apps/api/src/extensions/builtinRegistry.ts",
+          "contains": "return withAuthDbAccessContext(auth as"
+        },
+        {
+          "file": "packages/ext-cloud-command/manifest.json",
+          "contains": "cloudcommand_idrive_connections"
+        },
+        {
+          "file": "packages/ext-cloud-command/manifest.json",
+          "contains": "cloudcommand_idrive_operations"
+        }
+      ]
+    },
+    {
+      "id": "harmony-endpoint-evidence-ai",
+      "requiredFiles": [
+        "packages/ext-cloud-command/src/server/harmony.ts",
+        "packages/ext-cloud-command/src/server/harmony.test.ts",
+        "packages/ext-cloud-command/src/server/harmony-provider.ts",
+        "packages/ext-cloud-command/src/server/harmony-provider.test.ts",
+        "packages/ext-cloud-command/src/server/harmony-contract.ts",
+        "packages/ext-cloud-command/src/server/harmony-contract.test.ts",
+        "packages/ext-cloud-command/src/server/harmony-hunting-contract.ts",
+        "packages/ext-cloud-command/src/server/harmony-hunting-contract.test.ts",
+        "packages/ext-cloud-command/src/server/native-harmony.ts",
+        "packages/ext-cloud-command/src/web/harmony.ts",
+        "packages/ext-cloud-command/src/web/harmony.test.ts",
+        "packages/ext-cloud-command/migrations/2026-10-15-harmony.sql",
+        "apps/api/src/extensions/cloudCommandHarmony.ts",
+        "apps/api/src/extensions/cloudCommandHarmony.test.ts",
+        "apps/api/src/extensions/harmonySecurity.ts",
+        "apps/api/src/extensions/harmonySecurity.test.ts",
+        "apps/api/src/services/aiToolsHarmony.ts",
+        "apps/api/src/services/aiToolsHarmony.test.ts",
+        "apps/api/src/db/schema/harmony.ts",
+        "apps/api/migrations/2026-10-15-harmony-integrations.sql",
+        "apps/api/src/__tests__/integration/harmonyRls.integration.test.ts",
+        "apps/api/src/__tests__/integration/harmonyPublication.integration.test.ts"
+      ],
+      "hooks": [
+        {
+          "file": "packages/ext-cloud-command/src/server/index.ts",
+          "contains": "mountHarmonyRoutes(app, harmony);"
+        },
+        {
+          "file": "apps/api/src/extensions/builtinRegistry.ts",
+          "contains": "nativeHarmonyServices.refreshDue()"
+        },
+        {
+          "file": "apps/api/src/services/aiTools.ts",
+          "contains": "registerHarmonyTools(aiTools);"
+        },
+        {
+          "file": "packages/ext-cloud-command/src/web/index.ts",
+          "contains": "import './harmony';"
+        }
+      ]
+    },
+    {
+      "id": "shared-remote-directory-and-identity",
+      "requiredFiles": [
+        "apps/api/src/services/staffRemoteDirectory.ts",
+        "apps/api/src/services/staffRemoteDirectory.test.ts",
+        "apps/api/src/services/staffNativeDirectory.ts",
+        "apps/api/src/services/staffNativeDirectory.test.ts",
+        "apps/api/src/services/deviceIdentity.ts",
+        "apps/api/src/services/deviceIdentity.test.ts",
+        "apps/api/src/services/deviceIdentity.pg.test.ts",
+        "apps/web/src/components/remote/RemoteComputerDirectory.tsx",
+        "apps/web/src/components/remote/RemoteComputerDirectory.test.tsx",
+        "apps/web/src/components/remote/RemoteComputersPage.tsx",
+        "apps/web/src/components/remote/RemoteComputersPage.test.tsx",
+        "apps/web/src/components/remote/remoteAccount.ts",
+        "apps/web/src/components/remote/remoteAccount.test.ts",
+        "apps/web/src/pages/remote/computers.astro",
+        "scripts/cloudcom/rustdesk/ManagedViewerDefaults.cs",
+        "scripts/cloudcom/rustdesk/ManagedViewerDefaults.test.cs"
+      ],
+      "hooks": [
+        {
+          "file": "apps/api/src/routes/staffNative.ts",
+          "contains": "listStaffRemoteComputers"
+        },
+        {
+          "file": "apps/api/src/routes/staffNative.ts",
+          "contains": "renameStaffNativeDevice"
+        },
+        {
+          "file": "apps/api/src/routes/portal/remote.ts",
+          "contains": "currentDeviceUser, previousDeviceUsers"
+        },
+        {
+          "file": "scripts/cloudcom/rustdesk/ManagedViewerLauncher.cs",
+          "contains": "ManagedViewerDefaults.EnsureUdpDefault"
+        },
+        {
+          "file": "scripts/cloudcom/rustdesk/build-viewer-msi.ps1",
+          "contains": "(Join-Path $PSScriptRoot 'ManagedViewerDefaults.cs')"
+        }
+      ]
+    },
+    {
+      "id": "capacity-admission-and-db-planning",
+      "requiredFiles": [
+        "apps/api/src/services/capacityGuard.ts",
+        "apps/api/src/services/capacityGuard.test.ts",
+        "apps/api/src/services/capacityGuardPolicy.ts",
+        "apps/api/src/services/capacityGuardPolicy.test.ts",
+        "apps/api/src/services/capacityMetrics.ts",
+        "apps/api/src/services/capacityMetrics.test.ts",
+        "apps/api/src/services/agentUpdateCapacity.ts",
+        "apps/api/src/services/agentUpdateCapacity.test.ts",
+        "apps/api/src/services/agentRolloutAdmission.ts",
+        "apps/api/src/services/agentRolloutAdmission.test.ts",
+        "apps/api/src/services/capacityGuardWiring.test.ts",
+        "apps/api/src/services/agentRolloutAdmission.redis.test.ts",
+        "apps/api/src/middleware/agentRequestConcurrency.ts",
+        "apps/api/src/middleware/agentRequestConcurrency.test.ts",
+        "apps/api/src/db/preparedPolicyReads.ts",
+        "apps/api/src/db/preparedPolicyReads.test.ts",
+        "apps/api/src/db/preparedPolicyReads.integration.test.ts"
+      ],
+      "hooks": [
+        {
+          "file": "apps/api/src/index.ts",
+          "contains": "app.use('*', agentRequestConcurrency());"
+        },
+        {
+          "file": "apps/api/src/index.ts",
+          "contains": "startCapacityGuard({ checkDependencies:"
+        },
+        {
+          "file": "apps/api/src/db/index.ts",
+          "contains": "enablePreparedPolicyReads(client);"
+        }
+      ]
+    },
+    {
+      "id": "bounded-background-work",
+      "requiredFiles": [
+        "apps/api/src/jobs/monitorWorkAdmission.ts",
+        "apps/api/src/jobs/monitorWorkAdmission.test.ts",
+        "apps/api/src/jobs/vulnerabilityWorkAdmission.ts",
+        "apps/api/src/jobs/vulnerabilityWorkAdmission.test.ts",
+        "apps/api/src/jobs/metricRollupWorkAdmission.ts",
+        "apps/api/src/jobs/metricRollupWorkAdmission.test.ts",
+        "apps/api/src/services/vulnerabilityWorkCapacity.ts",
+        "apps/api/src/services/exploitFeeds.capacity.test.ts",
+        "apps/api/src/jobs/monitorScriptWorker.test.ts",
+        "apps/api/src/jobs/cloudCommandM365SnapshotWorker.test.ts",
+        "agent/internal/unifi/collector_backoff.go",
+        "agent/internal/unifi/collector_backoff_test.go"
+      ],
+      "hooks": [
+        {
+          "file": "apps/api/src/jobs/vulnerabilityJobs.ts",
+          "contains": "runVulnerabilityWork(job, token"
+        },
+        {
+          "file": "apps/api/src/services/exploitFeeds.ts",
+          "contains": "assertVulnerabilityWorkCapacity();"
+        },
+        {
+          "file": "apps/api/src/jobs/metricRollups.ts",
+          "contains": "runMetricRollupWork(job, token"
+        },
+        {
+          "file": "apps/api/src/jobs/metricRollups.ts",
+          "contains": "setGlobalConcurrency(readMetricRollupConcurrency())"
+        },
+        {
+          "file": "apps/api/src/jobs/monitorScriptWorker.ts",
+          "contains": "canRunScriptMonitorProbe(readCapacityGuard())"
+        },
+        {
+          "file": "apps/api/src/jobs/cloudCommandM365SnapshotWorker.ts",
+          "contains": "s.refresh_requested_at IS NOT NULL"
+        },
+        {
+          "file": "agent/internal/unifi/collector.go",
+          "contains": "retryUntil = lastFetch.Add(configFailureDelay(failedFetches, sched.active, 0, deps.random))"
+        },
+        {
+          "file": "agent/internal/unifi/collector.go",
+          "contains": "if at, ok := httputil.RetryAtFrom(err); ok {\n\t\t\t\t\tfetchRetryAt = at"
+        },
+        {
+          "file": "agent/internal/unifi/collector.go",
+          "contains": "if fetchRetryAt.After(retryUntil) {\n\t\t\t\t\tretryUntil = fetchRetryAt"
+        },
+        {
+          "file": "agent/internal/unifi/collector.go",
+          "contains": "if remaining := retryUntil.Sub(deps.clock()); remaining > next {\n\t\t\t\tnext = remaining"
+        },
+        {
+          "file": "agent/internal/unifi/collector.go",
+          "contains": "deps.clock().Before(retryUntil)"
+        },
+        {
+          "file": "agent/internal/unifi/collector.go",
+          "contains": "lastFetch.Sub(lastErrorLog) >= fetchErrorLogInterval"
+        }
+      ]
+    },
+    {
+      "id": "alert-evaluation-health-telemetry",
+      "requiredFiles": [
+        "apps/api/src/jobs/alertWorkTelemetry.ts",
+        "apps/api/src/jobs/alertWorkTelemetry.test.ts",
+        "apps/api/src/services/alertWorkTelemetry.ts",
+        "apps/api/src/services/alertWorkTelemetry.test.ts",
+        "apps/api/src/db/alertQueryTiming.ts",
+        "apps/api/src/db/alertQueryTiming.test.ts",
+        "apps/api/src/extensions/operationsHealth.ts",
+        "apps/api/src/extensions/operationsHealth.test.ts",
+        "packages/ext-cloud-command/src/server/health.ts",
+        "packages/ext-cloud-command/src/server/health.test.ts",
+        "packages/ext-cloud-command/src/web/health.ts",
+        "packages/ext-cloud-command/src/web/health.test.ts"
+      ],
+      "hooks": [
+        {
+          "file": "apps/api/src/db/index.ts",
+          "contains": "enableAlertQueryTiming(client);"
+        },
+        {
+          "file": "apps/api/src/jobs/alertWorker.ts",
+          "contains": "evaluateDeviceAlerts(data.deviceId, { hierarchy })"
+        },
+        {
+          "file": "apps/api/src/jobs/alertWorker.ts",
+          "contains": "keepLastIfActive: true"
+        },
+        {
+          "file": "packages/ext-cloud-command/src/server/index.ts",
+          "contains": "app.route('/', healthRoutes(health));"
+        },
+        {
+          "file": "apps/api/src/extensions/builtinRegistry.ts",
+          "contains": "readOperationsHealth(auth)"
         }
       ]
     }

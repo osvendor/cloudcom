@@ -8,6 +8,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const selectMock = vi.fn();
 const updateMock = vi.fn();
 
+// Topology M4-D2 visibility is covered by aiSessionAccess tests and topologyAiSessionHistory.integration.
+vi.mock('./topology/aiSessionAccess', () => ({ topologySessionAccessCondition: vi.fn(async () => undefined) }));
 vi.mock('../db', () => ({
   db: {
     select: (...a: unknown[]) => selectMock(...a),
@@ -49,12 +51,24 @@ vi.mock('drizzle-orm', () => ({
 }));
 
 vi.mock('./aiAgentSystemPrompt', () => ({ AI_SYSTEM_PROMPT_BASE: 'base', AI_SYSTEM_PROMPT_TAIL: 'tail' }));
-vi.mock('./aiToolIndex', () => ({ composeStaticSystemPrompt: () => 'base\nindex\ntail' }));
+vi.mock('./aiToolIndex', () => ({ composeStaticSystemPrompt: () => 'base\nindex\ntail', renderPageContextToolBlocks: () => '', resolveToolIndexMode: () => 'lazy' }));
 vi.mock('./aiAgentSdkTools', () => ({ listChatSurfaceToolNames: () => [] }));
 vi.mock('./brainDeviceContext', () => ({ getActiveDeviceContext: vi.fn() }));
-vi.mock('./aiInputSanitizer', () => ({ sanitizePageContext: (x: unknown) => x }));
+vi.mock('./aiInputSanitizer', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./aiInputSanitizer')>()),
+  sanitizePageContext: (x: unknown) => x,
+}));
 
-import { getSession, getSessionMessages, handleApproval, isIntentBackedExecution } from './aiAgent';
+// W03 Task 9 (#7601): createSession picks its model through the registry.
+vi.mock('./aiModels/candidateLoader', () => ({ readOrgPartnerId: vi.fn(async () => 'partner-1') }));
+vi.mock('./aiModels/sessionModel', () => ({
+  chooseSessionModel: vi.fn(async () => ({
+    offeringId: 'off-1', offeringPartnerId: 'partner-1', options: null,
+    model: 'claude-sonnet-4-6', billingSource: 'platform',
+  })),
+}));
+
+import { getSession, getSessionMessages, handleApproval, isIntentBackedExecution, getDecidedExecutionOutcome } from './aiAgent';
 
 type Cond = { op: string; col?: unknown; val?: unknown; conds?: Cond[] };
 
@@ -335,5 +349,43 @@ describe('isIntentBackedExecution', () => {
     stubSelectOnce([]);
 
     await expect(isIntentBackedExecution('exec-missing')).resolves.toBe(false);
+  });
+});
+
+describe('getDecidedExecutionOutcome (#9431)', () => {
+  it.each([
+    ['approved', 'approved'],
+    ['executing', 'approved'],
+    ['completed', 'approved'],
+    ['failed', 'approved'],
+    ['rejected', 'not_approved'],
+  ])('maps a %s execution of this session to %s', async (status, outcome) => {
+    stubSelectOnce([{ status, sessionId: 'session-1', intentId: null }]);
+
+    await expect(getDecidedExecutionOutcome('exec-1', 'session-1')).resolves.toBe(outcome);
+  });
+
+  it('returns null while the execution is still pending', async () => {
+    stubSelectOnce([{ status: 'pending', sessionId: 'session-1', intentId: null }]);
+
+    await expect(getDecidedExecutionOutcome('exec-1', 'session-1')).resolves.toBeNull();
+  });
+
+  it('returns null for an execution of another session (no cross-session disclosure)', async () => {
+    stubSelectOnce([{ status: 'approved', sessionId: 'session-other', intentId: null }]);
+
+    await expect(getDecidedExecutionOutcome('exec-1', 'session-1')).resolves.toBeNull();
+  });
+
+  it('returns null for an intent-backed execution (decided in Approvals, not here)', async () => {
+    stubSelectOnce([{ status: 'approved', sessionId: 'session-1', intentId: 'intent-1' }]);
+
+    await expect(getDecidedExecutionOutcome('exec-1', 'session-1')).resolves.toBeNull();
+  });
+
+  it('returns null when the execution does not exist', async () => {
+    stubSelectOnce([]);
+
+    await expect(getDecidedExecutionOutcome('exec-missing', 'session-1')).resolves.toBeNull();
   });
 });

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,7 +24,7 @@ import (
 
 const multipartUploadThreshold = 100 * 1024 * 1024 // 100 MB
 
-// S3Provider is a stub for S3-compatible backup storage.
+// S3Provider stores backups in S3-compatible object storage.
 type S3Provider struct {
 	Bucket          string
 	Region          string
@@ -33,8 +34,11 @@ type S3Provider struct {
 	sessionToken    string
 	sseAlgorithm    string
 	sseKMSKeyID     string
-	client          *s3.Client
-	clientMu        sync.Mutex
+	// keyPrefix ("" = none) is the snapshot key root this provider reads and
+	// writes under; see SetKeyPrefix.
+	keyPrefix string
+	client    *s3.Client
+	clientMu  sync.Mutex
 }
 
 // NewS3Provider creates a new S3Provider.
@@ -45,8 +49,60 @@ func NewS3Provider(bucket, region, accessKeyID, secretAccessKey, sessionToken st
 // BackupIdentity implements JournalIdentity. The endpoint is included
 // because a custom endpoint means an S3-compatible-but-different backend
 // (MinIO, Backblaze's S3 API, ...) even when bucket+region happen to match.
+//
+// A key prefix is part of the identity: a checkpoint journal or incremental
+// base written at the bucket root must never be reused under a prefix, where
+// its objects do not exist. Without one the identity is unchanged, byte for
+// byte the storageIdentity the API delivers for brokered writes
+// (helperStorageIdentity).
 func (s *S3Provider) BackupIdentity() string {
-	return fmt.Sprintf("s3|%s|%s|%s", s.endpoint, s.Region, s.Bucket)
+	id := fmt.Sprintf("s3|%s|%s|%s", s.endpoint, s.Region, s.Bucket)
+	if s.keyPrefix != "" {
+		id += "|prefix=" + s.keyPrefix
+	}
+	return id
+}
+
+// SetKeyPrefix makes the provider map every key it is given — the LOGICAL
+// keys manifests embed (snapshots/<id>/...) — to <prefix>/<key> in the
+// bucket, and strip the prefix again from listed keys, exactly as the API
+// maps a prefixed_flat snapshot (apps/api/src/services/backupKeyLayout.ts).
+// raw is normalized with NormalizeKeyPrefix; "" (or only slashes and
+// whitespace) means no prefix. An invalid prefix is refused and leaves the
+// provider unchanged — it never falls back to the bucket root.
+//
+// Only operator-supplied configurations use this (agent.yaml's
+// backup_s3_prefix, breeze-backup rebuild --key-prefix): the API never sends
+// an S3 destination to a helper; it brokers prefixed access itself. To read
+// a snapshot, pass the snapshot's recorded key_prefix, which differs from
+// the destination's current prefix once that has been changed.
+func (s *S3Provider) SetKeyPrefix(raw string) error {
+	prefix, err := NormalizeKeyPrefix(raw)
+	if err != nil {
+		return err
+	}
+	s.keyPrefix = prefix
+	return nil
+}
+
+// KeyPrefix is the normalized key prefix ("" = none).
+func (s *S3Provider) KeyPrefix() string { return s.keyPrefix }
+
+// physicalKey is the bucket key for a logical key.
+func (s *S3Provider) physicalKey(logical string) string {
+	if s.keyPrefix == "" {
+		return logical
+	}
+	return s.keyPrefix + "/" + logical
+}
+
+// logicalKey inverts physicalKey; false when physical is not under the
+// prefix root.
+func (s *S3Provider) logicalKey(physical string) (string, bool) {
+	if s.keyPrefix == "" {
+		return physical, true
+	}
+	return strings.CutPrefix(physical, s.keyPrefix+"/")
 }
 
 // SetServerSideEncryption requires S3 server-side encryption on future uploads.
@@ -74,39 +130,139 @@ func (s *S3Provider) Upload(localPath, remotePath string) error {
 
 // UploadContext sends a local file to S3 with cancellation support.
 func (s *S3Provider) UploadContext(ctx context.Context, localPath, remotePath string) error {
+	_, err := s.upload(ctx, localPath, remotePath, false)
+	return err
+}
+
+// UploadWithDigest implements DigestUploader: it uploads like UploadContext
+// and returns the digest of the bytes the stored object holds. A file up to
+// the multipart threshold goes up in one PutObject whose body hashes the
+// pass the SDK finally sent (see rewindableDigestSource); a larger file is
+// read once, sequentially, by the multipart uploader (see
+// sequentialDigestReader), trading the concurrent ReadAt path for a digest of
+// exactly what was stored.
+func (s *S3Provider) UploadWithDigest(ctx context.Context, localPath, remotePath string) (UploadDigest, error) {
+	return s.upload(ctx, localPath, remotePath, true)
+}
+
+// s3MultipartThreshold is multipartUploadThreshold, as a variable so tests
+// can reach the multipart path with a small file.
+var s3MultipartThreshold int64 = multipartUploadThreshold
+
+func setS3MultipartThresholdForTest(n int64) (restore func()) {
+	old := s3MultipartThreshold
+	s3MultipartThreshold = n
+	return func() { s3MultipartThreshold = old }
+}
+
+// s3SequentialMemoryBudget bounds the memory a sequential multipart upload
+// buffers, up to the part size where one part alone needs more.
+const s3SequentialMemoryBudget = 256 << 20
+
+// s3SequentialPartPlan sizes a sequential multipart upload of size bytes (a
+// file that may change while it is read — see UploadWithDigest). Without a
+// seekable body the uploader cannot size parts itself, and it buffers parts
+// in memory: (concurrency+1) pooled parts plus the first part, read
+// separately and grown by doubling (up to two parts). The part size leaves
+// headroom under the 10,000-part limit for a file that grows while it is
+// read; concurrency shrinks as parts grow, to at least 1. The resulting
+// bound (s3SequentialBufferedBytes) is s3SequentialMemoryBudget up to about
+// 500 GiB, and four parts above that (about 490 MB at 1 TiB, 2.4 GB at
+// 5 TiB). Database and VM exports, which cannot change during the backup,
+// never take this path.
+func s3SequentialPartPlan(size int64) (partSize int64, concurrency int) {
+	const maxParts = 9000
+	partSize = manager.MinUploadPartSize
+	if size > 0 {
+		if need := (size + maxParts - 1) / maxParts; need > partSize {
+			partSize = need
+		}
+	}
+	concurrency = int(s3SequentialMemoryBudget/partSize) - 3
+	if concurrency > manager.DefaultUploadConcurrency {
+		concurrency = manager.DefaultUploadConcurrency
+	}
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	return partSize, concurrency
+}
+
+// s3SequentialBufferedBytes is the most a sequential multipart upload of size
+// bytes holds in memory (see s3SequentialPartPlan).
+func s3SequentialBufferedBytes(size int64) int64 {
+	part, concurrency := s3SequentialPartPlan(size)
+	return int64(concurrency+3) * part
+}
+
+// immutableSourceKey marks an upload whose source cannot change while the
+// backup runs.
+type immutableSourceKey struct{}
+
+// WithImmutableSource returns a context telling UploadWithDigest that the
+// source file cannot change during the backup (a database backup file or VM
+// export the helper itself just wrote). A large file is then hashed in one
+// read and uploaded through the SDK's unbuffered ranged-read path; if its
+// size or modification time changed by the end of the upload, the upload
+// fails.
+func WithImmutableSource(ctx context.Context) context.Context {
+	return context.WithValue(ctx, immutableSourceKey{}, true)
+}
+
+// IsImmutableSource reports whether ctx carries WithImmutableSource.
+func IsImmutableSource(ctx context.Context) bool {
+	return immutableSource(ctx)
+}
+
+func immutableSource(ctx context.Context) bool {
+	v, _ := ctx.Value(immutableSourceKey{}).(bool)
+	return v
+}
+
+// largeDigestUploadHook reports which path a digested multipart upload took
+// ("immutable" or "sequential"). Test seam.
+var largeDigestUploadHook func(mode string)
+
+func setLargeDigestUploadHookForTest(fn func(mode string)) (restore func()) {
+	old := largeDigestUploadHook
+	largeDigestUploadHook = fn
+	return func() { largeDigestUploadHook = old }
+}
+
+func (s *S3Provider) upload(ctx context.Context, localPath, remotePath string, withDigest bool) (UploadDigest, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if s.Bucket == "" || s.Region == "" {
-		return errors.New("s3 bucket and region are required")
+		return UploadDigest{}, errors.New("s3 bucket and region are required")
 	}
 	if localPath == "" {
-		return errors.New("local source path is required")
+		return UploadDigest{}, errors.New("local source path is required")
 	}
 	if remotePath == "" {
-		return errors.New("remote path is required")
+		return UploadDigest{}, errors.New("remote path is required")
 	}
 
 	client, err := s.getClient()
 	if err != nil {
-		return err
+		return UploadDigest{}, err
 	}
 
 	file, err := os.Open(localPath)
 	if err != nil {
-		return fmt.Errorf("failed to open source file: %w", err)
+		return UploadDigest{}, fmt.Errorf("failed to open source file: %w", err)
 	}
 	defer file.Close()
 
 	info, err := file.Stat()
 	if err != nil {
-		return fmt.Errorf("failed to stat source file: %w", err)
+		return UploadDigest{}, fmt.Errorf("failed to stat source file: %w", err)
 	}
 
 	input := &s3.PutObjectInput{
 		Bucket: aws.String(s.Bucket),
-		Key:    aws.String(remotePath),
-		Body:   file,
+		Key:    aws.String(s.physicalKey(remotePath)),
+		Body:   uploadProgressSource(ctx, file),
 	}
 	switch s.sseAlgorithm {
 	case "AES256":
@@ -117,22 +273,106 @@ func (s *S3Provider) UploadContext(ctx context.Context, localPath, remotePath st
 			input.SSEKMSKeyId = aws.String(s.sseKMSKeyID)
 		}
 	}
-	if info.Size() > multipartUploadThreshold {
-		uploader := manager.NewUploader(client)
-		if _, err := uploader.Upload(ctx, input); err != nil {
-			return fmt.Errorf("failed to upload file to s3 with multipart upload: %w", err)
+
+	threshold := int64(multipartUploadThreshold)
+	if withDigest {
+		threshold = s3MultipartThreshold
+	}
+	if info.Size() > threshold {
+		if !withDigest {
+			// The feature/s3/manager uploader stays until the module moves to
+			// transfermanager as a whole (the same call this path always made).
+			uploader := manager.NewUploader(client)                //nolint:staticcheck // see above
+			if _, err := uploader.Upload(ctx, input); err != nil { //nolint:staticcheck // see above
+				return UploadDigest{}, fmt.Errorf("failed to upload file to s3 with multipart upload: %w", err)
+			}
+			return UploadDigest{}, nil
 		}
-		return nil
+		if immutableSource(ctx) {
+			if largeDigestUploadHook != nil {
+				largeDigestUploadHook("immutable")
+			}
+			return s.uploadImmutable(ctx, client, input, file, info, remotePath)
+		}
+		if largeDigestUploadHook != nil {
+			largeDigestUploadHook("sequential")
+		}
+		body := newSequentialDigestReader(uploadProgressSource(ctx, file))
+		input.Body = body
+		partSize, concurrency := s3SequentialPartPlan(info.Size())
+		uploader := manager.NewUploader(client, func(u *manager.Uploader) { //nolint:staticcheck // as above
+			u.PartSize = partSize
+			u.Concurrency = concurrency
+		})
+		if _, err := uploader.Upload(ctx, input); err != nil { //nolint:staticcheck // as above
+			return UploadDigest{}, fmt.Errorf("failed to upload file to s3 with multipart upload: %w", err)
+		}
+		return body.digest(), nil
 	}
 
-	if _, err := client.PutObject(ctx, input); err != nil {
-		return fmt.Errorf("failed to upload file to s3: %w", err)
+	var digestSource *rewindableDigestSource
+	if withDigest {
+		digestSource = newRewindableDigestSource(uploadProgressSource(ctx, file))
+		input.Body = digestSource
 	}
-	return nil
+	if _, err := client.PutObject(ctx, input); err != nil {
+		return UploadDigest{}, fmt.Errorf("failed to upload file to s3: %w", err)
+	}
+	if !withDigest {
+		return UploadDigest{}, nil
+	}
+	d, ok := digestSource.digest()
+	if !ok {
+		return UploadDigest{}, fmt.Errorf("%w: the upload of %s was not read as one complete pass", ErrDigestUnavailable, remotePath)
+	}
+	return d, nil
+}
+
+// uploadImmutable hashes file in one sequential read, uploads it through the
+// uploader's ranged-read path (parts are read concurrently straight from the
+// file, nothing buffered), and fails if the file's size or modification time
+// changed meanwhile — the digest would then not describe what was stored.
+func (s *S3Provider) uploadImmutable(ctx context.Context, client *s3.Client, input *s3.PutObjectInput, file *os.File, before os.FileInfo, remotePath string) (UploadDigest, error) {
+	sum := newCountingHash()
+	if _, err := io.Copy(sum, &contextReader{ctx: ctx, reader: file}); err != nil {
+		return UploadDigest{}, fmt.Errorf("failed to read source file: %w", err)
+	}
+	d := sum.digest()
+	if d.Size != before.Size() {
+		return UploadDigest{}, fmt.Errorf("source file for %s changed while it was read", remotePath)
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return UploadDigest{}, fmt.Errorf("failed to rewind source file: %w", err)
+	}
+	input.Body = uploadProgressSource(ctx, file)
+	uploader := manager.NewUploader(client)                //nolint:staticcheck // see UploadContext's multipart path
+	if _, err := uploader.Upload(ctx, input); err != nil { //nolint:staticcheck // as above
+		return UploadDigest{}, fmt.Errorf("failed to upload file to s3 with multipart upload: %w", err)
+	}
+	// Heuristic, not proof: the size+mtime check relies on the caller having
+	// written and closed the file itself (only the MSSQL .bak and Hyper-V
+	// export uploads mark their sources unchanging).
+	after, err := file.Stat()
+	if err != nil {
+		return UploadDigest{}, fmt.Errorf("failed to stat source file after upload: %w", err)
+	}
+	if after.Size() != before.Size() || !after.ModTime().Equal(before.ModTime()) {
+		return UploadDigest{}, fmt.Errorf("source file for %s changed during the upload", remotePath)
+	}
+	return d, nil
 }
 
 // Download retrieves a file from S3.
 func (s *S3Provider) Download(remotePath, localPath string) error {
+	return s.DownloadContext(context.Background(), remotePath, localPath)
+}
+
+// DownloadContext retrieves a file from S3. Cancelling ctx aborts the request
+// and any in-progress body read.
+func (s *S3Provider) DownloadContext(ctx context.Context, remotePath, localPath string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if s.Bucket == "" || s.Region == "" {
 		return errors.New("s3 bucket and region are required")
 	}
@@ -148,10 +388,9 @@ func (s *S3Provider) Download(remotePath, localPath string) error {
 		return err
 	}
 
-	ctx := context.Background()
 	resp, err := client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(s.Bucket),
-		Key:    aws.String(remotePath),
+		Key:    aws.String(s.physicalKey(remotePath)),
 	})
 	if err != nil {
 		var noSuchKey *s3types.NoSuchKey
@@ -170,7 +409,7 @@ func (s *S3Provider) Download(remotePath, localPath string) error {
 	if err != nil {
 		return fmt.Errorf("failed to create local destination file: %w", err)
 	}
-	_, copyErr := io.Copy(file, resp.Body)
+	_, copyErr := io.Copy(DownloadProgressWriter(ctx, file), resp.Body)
 	closeErr := file.Close()
 	if copyErr != nil {
 		return fmt.Errorf("failed to write s3 object to local file: %w", copyErr)
@@ -196,7 +435,7 @@ func (s *S3Provider) List(prefix string) ([]string, error) {
 	ctx := context.Background()
 	paginator := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
 		Bucket: aws.String(s.Bucket),
-		Prefix: aws.String(prefix),
+		Prefix: aws.String(s.physicalKey(prefix)),
 	})
 
 	keys := []string{}
@@ -206,9 +445,16 @@ func (s *S3Provider) List(prefix string) ([]string, error) {
 			return nil, fmt.Errorf("failed to list s3 objects: %w", err)
 		}
 		for _, object := range page.Contents {
-			if object.Key != nil {
-				keys = append(keys, *object.Key)
+			if object.Key == nil {
+				continue
 			}
+			key, ok := s.logicalKey(*object.Key)
+			if !ok {
+				// Fail closed: storage answered with a key outside the
+				// requested root, which no logical key maps to.
+				return nil, fmt.Errorf("s3 listing returned %q, outside key prefix %q", *object.Key, s.keyPrefix)
+			}
+			keys = append(keys, key)
 		}
 	}
 
@@ -231,7 +477,7 @@ func (s *S3Provider) Delete(remotePath string) error {
 
 	if _, err := client.DeleteObject(context.Background(), &s3.DeleteObjectInput{
 		Bucket: aws.String(s.Bucket),
-		Key:    aws.String(remotePath),
+		Key:    aws.String(s.physicalKey(remotePath)),
 	}); err != nil {
 		return fmt.Errorf("failed to delete s3 object: %w", err)
 	}
@@ -250,7 +496,8 @@ func (s *S3Provider) getClient() (*s3.Client, error) {
 	// has no dial/TLS/header deadline and a stalled network peer wedges the
 	// request forever. The mid-body stall (a peer that accepts the request
 	// but never finishes reading/writing the body) is NOT covered here — that
-	// case is handled by the per-file upload deadline in snapshot.go.
+	// case is handled by the caller's context: the per-file upload deadline in
+	// snapshot.go, and the per-file download deadline in verify.go (#6598).
 	httpClient := awshttp.NewBuildableClient().
 		WithDialerOptions(func(d *net.Dialer) { d.Timeout = 30 * time.Second }).
 		WithTransportOptions(func(tr *http.Transport) {

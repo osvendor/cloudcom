@@ -1,13 +1,19 @@
 import { createReadStream } from 'node:fs';
 import { stat } from 'node:fs/promises';
 import { resolve as resolvePath } from 'node:path';
+import { pipeline } from 'node:stream';
+import { createGunzip } from 'node:zlib';
 import { GetObjectCommand } from '@aws-sdk/client-s3';
 import { createGuardedS3Client } from './guardedS3Client';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
-import { coerceS3EndpointUrl } from '@breeze/shared';
-import { and, eq } from 'drizzle-orm';
+import { coerceS3EndpointUrl, deriveS3RegionFromEndpoint } from '@breeze/shared';
+import { and, eq, ne } from 'drizzle-orm';
 import { db } from '../db';
 import { backupSnapshotFiles, backupSnapshotOrigins, backupSnapshots, recoveryTokens } from '../db/schema';
+import { backupSnapshotAttestations } from '../db/schema/backupSnapshotAttestations';
+import { resolveSnapshotPhysicalKey, snapshotKeyRootOf } from './backupKeyLayout';
+import { loadOriginKeyRoots } from './backupOriginKeyRoots';
+import { boundIndexCondition, indexMatchesAttestation } from './backupRestoreIntegrity';
 import { classifyBackupObjectKey, hasMembershipCapability } from './backupObjectKey';
 import {
   asRecord,
@@ -15,6 +21,8 @@ import {
   getStringValue,
   resolveSnapshotProviderConfig,
 } from './recoveryBootstrap';
+import { RECOVERY_REFUSAL_MESSAGES } from './recoveryCapabilities';
+import { normalizeStorageIdentity } from '../jobs/backupRetention';
 
 type RecoveryDownloadRow = Pick<
   typeof recoveryTokens.$inferSelect,
@@ -51,18 +59,53 @@ export async function authorizeExternalReference(
   };
 
   const [tokenSnapshot] = await dbHandle
-    .select({ fileIndexStatus: backupSnapshots.fileIndexStatus })
+    .select({
+      fileIndexStatus: backupSnapshots.fileIndexStatus,
+      fileIndexManifestSha256: backupSnapshots.fileIndexManifestSha256,
+      integrityStatus: backupSnapshots.integrityStatus,
+      attestation: {
+        status: backupSnapshotAttestations.status,
+        manifestSha256: backupSnapshotAttestations.manifestSha256,
+      },
+    })
     .from(backupSnapshots)
+    .leftJoin(backupSnapshotAttestations, eq(backupSnapshotAttestations.snapshotDbId, backupSnapshots.id))
     .where(eq(backupSnapshots.id, args.snapshotDbId))
     .limit(1);
   if (!tokenSnapshot || tokenSnapshot.fileIndexStatus !== 'complete') {
     return refuse('file index not complete');
   }
+  // The index authorizes only when it was built from exactly the manifest
+  // bytes the snapshot's attestation names (services/backupRestoreIntegrity.ts).
+  const attestation = tokenSnapshot.attestation
+    && typeof tokenSnapshot.attestation.status === 'string'
+    && typeof tokenSnapshot.attestation.manifestSha256 === 'string'
+    ? { status: tokenSnapshot.attestation.status, manifestSha256: tokenSnapshot.attestation.manifestSha256 }
+    : null;
+  const boundDigest = tokenSnapshot.fileIndexManifestSha256 ?? null;
+  if (!indexMatchesAttestation(
+    { fileIndexStatus: tokenSnapshot.fileIndexStatus, fileIndexManifestSha256: boundDigest, integrityStatus: tokenSnapshot.integrityStatus ?? null },
+    attestation,
+  )) {
+    return refuse('file index does not match the snapshot attestation');
+  }
 
+  // Membership is read in one statement with the index state it was approved
+  // on: rows of an index being rebuilt, or rebuilt from other bytes since the
+  // check above, never count.
   const [membership] = await dbHandle
     .select({ id: backupSnapshotFiles.id })
     .from(backupSnapshotFiles)
-    .where(and(eq(backupSnapshotFiles.snapshotDbId, args.snapshotDbId), eq(backupSnapshotFiles.backupPath, args.key)))
+    .innerJoin(backupSnapshots, eq(backupSnapshots.id, backupSnapshotFiles.snapshotDbId))
+    .leftJoin(backupSnapshotAttestations, eq(backupSnapshotAttestations.snapshotDbId, backupSnapshots.id))
+    .where(and(
+      eq(backupSnapshotFiles.snapshotDbId, args.snapshotDbId),
+      eq(backupSnapshotFiles.backupPath, args.key),
+      // A content-less row (directory or symlink entry, #11235) names no
+      // object: its empty backup_path is never a key.
+      ne(backupSnapshotFiles.backupPath, ''),
+      boundIndexCondition(boundDigest),
+    ))
     .limit(1);
   if (!membership) {
     return refuse('key is not a member of the snapshot file index');
@@ -134,36 +177,86 @@ function buildS3Client(config: {
   });
 }
 
+/**
+ * Presigned GET for ONE exact object key of an S3 backup destination, built
+ * with the same tenant-configuration client as the recovery download path.
+ * The key is used verbatim: it is the PHYSICAL key, which the caller composes
+ * from the snapshot's recorded key root (#7081, backupKeyLayout.ts
+ * physicalKeyFor); this function never applies the destination's prefix. The
+ * caller is responsible for authorizing the key and for bounding
+ * `expiresInSeconds` (clamped here to 1..300).
+ */
+export async function presignSnapshotObjectGet(args: {
+  providerConfig: Record<string, unknown>;
+  key: string;
+  expiresInSeconds: number;
+}): Promise<string> {
+  const providerConfig = asRecord(args.providerConfig);
+  const bucket = getStringValue(providerConfig, 'bucket') || getStringValue(providerConfig, 'bucketName');
+  const region =
+    getStringValue(providerConfig, 'region')?.trim() ||
+    deriveS3RegionFromEndpoint(getStringValue(providerConfig, 'endpoint'));
+  if (!bucket || !region) {
+    throw new Error('Snapshot storage is misconfigured.');
+  }
+  const client = buildS3Client({
+    region,
+    endpoint: getStringValue(providerConfig, 'endpoint') ?? undefined,
+    accessKeyId: getStringValue(providerConfig, 'accessKey') || getStringValue(providerConfig, 'accessKeyId') || undefined,
+    secretAccessKey: getStringValue(providerConfig, 'secretKey') || getStringValue(providerConfig, 'secretAccessKey') || undefined,
+    sessionToken: getStringValue(providerConfig, 'sessionToken') ?? undefined,
+  });
+  const expiresIn = Math.max(1, Math.min(300, Math.floor(args.expiresInSeconds)));
+  return (getSignedUrl as any)(client, new GetObjectCommand({ Bucket: bucket, Key: args.key }), { expiresIn });
+}
+
+/**
+ * A recorded `storagePrefix` is a snapshot's FULL root. Today's writers
+ * (Hyper-V/MSSQL helpers in agent/cmd/breeze-backup/exec_hyperv.go, reconcile
+ * adoption in backupSnapshotReconcile.ts) record the bare `snapshots/<id>`;
+ * older rows may carry a base in front of it (`<base>/snapshots/<id>`, or an
+ * `s3://<bucket>/` URI). The logical key already carries `snapshots/<id>/`, so
+ * only that `<base>` relocates it. A value whose last segments are not
+ * `snapshots/<id>` does not name this snapshot's root and leaves the key
+ * verbatim, the same way for a snapshot's own keys and for an external
+ * reference to it, so one object never resolves to two physical keys.
+ */
+function keyUnderRecordedRoot(normalizedRemotePath: string, storagePrefix: string | null, snapshotId: string | null): string {
+  if (!storagePrefix || !snapshotId) return normalizedRemotePath;
+  const marker = `snapshots/${snapshotId}`;
+  const normalizedStoragePrefix = storagePrefix.replace(/^s3:\/\/[^/]+\//, '').replace(/^\/+|\/+$/g, '');
+  if (normalizedStoragePrefix === marker) return normalizedRemotePath;
+  if (!normalizedStoragePrefix.endsWith(`/${marker}`)) return normalizedRemotePath;
+  const basePrefix = normalizedStoragePrefix.slice(0, -marker.length).replace(/\/+$/g, '');
+  return basePrefix ? `${basePrefix}/${normalizedRemotePath}` : normalizedRemotePath;
+}
+
 function deriveRemoteStorageKey(
   normalizedRemotePath: string,
-  providerConfig: Record<string, unknown>,
   snapshotMetadata: Record<string, unknown>,
-  originStoragePrefixOverride?: string | null
+  origin?: { snapshotId: string; storagePrefix: string | null } | null
 ) {
   // W09 (#6464) Task 6: an external reference is served from the ORIGIN
   // snapshot's own verified storage prefix, never the token snapshot's —
   // origin.originStoragePrefix was captured and verified by
-  // hydrateSnapshotFileIndex (Task 4) at index-build time.
-  if (originStoragePrefixOverride) {
-    return `${originStoragePrefixOverride.replace(/^\/+|\/+$/g, '')}/${normalizedRemotePath}`;
+  // hydrateSnapshotFileIndex (Task 4) at index-build time. It is a verbatim
+  // copy of the origin's metadata.storagePrefix, so it is the origin's full
+  // root and is resolved against the origin's id (#8665: prepending it
+  // doubled the key to snapshots/<o>/snapshots/<o>/...).
+  if (origin?.storagePrefix) {
+    return keyUnderRecordedRoot(normalizedRemotePath, origin.storagePrefix, origin.snapshotId);
   }
-  const storagePrefix = getStringValue(snapshotMetadata, 'storagePrefix');
-  if (storagePrefix) {
-    const marker = snapshotMetadata.snapshotId && typeof snapshotMetadata.snapshotId === 'string'
-      ? `snapshots/${snapshotMetadata.snapshotId}`
-      : null;
-    if (marker) {
-      const normalizedStoragePrefix = storagePrefix.replace(/^s3:\/\/[^/]+\//, '').replace(/^\/+|\/+$/g, '');
-      const markerIndex = normalizedStoragePrefix.lastIndexOf(marker);
-      if (markerIndex >= 0) {
-        const basePrefix = normalizedStoragePrefix.slice(0, markerIndex).replace(/\/+$/g, '');
-        return basePrefix ? `${basePrefix}/${normalizedRemotePath}` : normalizedRemotePath;
-      }
-    }
-  }
-
-  const prefix = getStringValue(providerConfig, 'prefix');
-  return prefix ? `${prefix.replace(/^\/+|\/+$/g, '')}/${normalizedRemotePath}` : normalizedRemotePath;
+  // #6398: the destination's configured `prefix` is deliberately NOT applied.
+  // This path serves legacy_flat snapshots only, whose objects are at
+  // `snapshots/<id>/...` whatever the destination's prefix is now; presigning
+  // `<prefix>/snapshots/...` for them once 404'd every token-mode recovery
+  // (bmr-recover, bare-metal / Restore-as-VM rebuild, DR). A snapshot written
+  // under a destination prefix records `prefixed_flat` and its keys are mapped
+  // through that recorded root instead (#7081; see the caller). Only a
+  // per-snapshot recorded storagePrefix that names the snapshot's root
+  // relocates a legacy snapshot's keys (keyUnderRecordedRoot).
+  const snapshotId = typeof snapshotMetadata.snapshotId === 'string' ? snapshotMetadata.snapshotId : null;
+  return keyUnderRecordedRoot(normalizedRemotePath, getStringValue(snapshotMetadata, 'storagePrefix'), snapshotId);
 }
 
 export async function getAuthenticatedRecoveryDownloadTarget(
@@ -194,7 +287,12 @@ export async function getAuthenticatedRecoveryDownloadTarget(
   }
 
   const [lineage] = await db
-    .select({ orgId: backupSnapshots.orgId, deviceId: backupSnapshots.deviceId })
+    .select({
+      orgId: backupSnapshots.orgId,
+      deviceId: backupSnapshots.deviceId,
+      keyLayout: backupSnapshots.keyLayout,
+      keyPrefix: backupSnapshots.keyPrefix,
+    })
     .from(backupSnapshots)
     .where(and(
       eq(backupSnapshots.id, snapshotDbId),
@@ -204,10 +302,36 @@ export async function getAuthenticatedRecoveryDownloadTarget(
   if (!lineage || lineage.orgId !== tokenRow.orgId || lineage.deviceId !== tokenRow.deviceId) {
     return { unavailable: true, reason: 'Recovery snapshot lineage is unavailable.' } as const;
   }
+  // Object keys are derived from the snapshot's recorded key root (#7081);
+  // one this server does not understand is refused rather than guessed.
+  const keyRoot = snapshotKeyRootOf(lineage);
+  if (!keyRoot) {
+    return { unavailable: true, reason: 'This backup was written in a storage format this server version cannot read.' } as const;
+  }
 
   const resolved = await resolveSnapshotProviderConfig(snapshotDbId);
   if (!resolved?.snapshot || !resolved.providerType || !resolved.providerConfig) {
     return { unavailable: true, reason: 'Recovery snapshot storage is unavailable.' } as const;
+  }
+
+  // #6490: resolveSnapshotProviderConfig prefers the LIVE backup_configs row
+  // over snapshot-pinned metadata, so a destination changed after this
+  // snapshot was written would stream every key — own-prefix or external —
+  // from the wrong bucket/root. Authenticate/exchange already refuse that
+  // drift up front (negotiateRecoveryCapabilities); this re-checks on every
+  // object because the destination can change mid-session. A legacy
+  // snapshot with no pinned identity (NULL) has nothing to compare against;
+  // an empty string is not "no identity" and fails closed.
+  const pinnedStorageIdentity = resolved.snapshot.storageIdentity ?? null;
+  if (pinnedStorageIdentity !== null) {
+    const resolvedStorageIdentity = normalizeStorageIdentity(resolved.providerType, asRecord(resolved.providerConfig));
+    if (resolvedStorageIdentity !== pinnedStorageIdentity) {
+      console.warn(
+        `[getAuthenticatedRecoveryDownloadTarget] refused token ${tokenRow.id}: storage identity drift`,
+        { tokenId: tokenRow.id, snapshotDbId, pinnedStorageIdentity, resolvedStorageIdentity },
+      );
+      return { unavailable: true, reason: RECOVERY_REFUSAL_MESSAGES.storage_identity_drift } as const;
+    }
   }
 
   const ownSnapshotId = resolved.snapshot.snapshotId;
@@ -222,7 +346,7 @@ export async function getAuthenticatedRecoveryDownloadTarget(
     return { unavailable: true, reason: 'Requested path is outside the allowed snapshot scope.' } as const;
   }
 
-  let originStoragePrefix: string | null = null;
+  let origin: { snapshotId: string; storagePrefix: string | null } | null = null;
   if (scope.kind === 'external') {
     if (!hasMembershipCapability(tokenRow.negotiatedCapabilities)) {
       return {
@@ -237,7 +361,7 @@ export async function getAuthenticatedRecoveryDownloadTarget(
       originSnapshotId: scope.originSnapshotId,
       orgId: tokenRow.orgId,
       deviceId: tokenRow.deviceId,
-      pinnedStorageIdentity: resolved.snapshot.storageIdentity ?? '',
+      pinnedStorageIdentity: pinnedStorageIdentity ?? '',
     });
     if (!authorization.ok) {
       return {
@@ -245,7 +369,7 @@ export async function getAuthenticatedRecoveryDownloadTarget(
         reason: 'Requested path references an object this recovery is not authorized to read.',
       } as const;
     }
-    originStoragePrefix = authorization.originStoragePrefix;
+    origin = { snapshotId: scope.originSnapshotId, storagePrefix: authorization.originStoragePrefix };
   }
   const normalizedRemotePath = scope.key;
 
@@ -269,7 +393,41 @@ export async function getAuthenticatedRecoveryDownloadTarget(
       secretAccessKey: getStringValue(providerConfig, 'secretKey') || getStringValue(providerConfig, 'secretAccessKey') || undefined,
       sessionToken: getStringValue(providerConfig, 'sessionToken') ?? undefined,
     });
-    const key = deriveRemoteStorageKey(normalizedRemotePath, providerConfig, snapshotMetadata, originStoragePrefix);
+    let key: string | null;
+    if (keyRoot.layout === 'legacy_flat') {
+      // Snapshots written before key roots were recorded: the physical key
+      // comes from the recorded storagePrefix (own, or the origin's for an
+      // external reference, #8665).
+      key = deriveRemoteStorageKey(normalizedRemotePath, snapshotMetadata, origin);
+    } else {
+      // A recorded root is the only source of the physical key (I1):
+      // metadata.storagePrefix and origin_storage_prefix are never read. An
+      // external ref resolves through its origin's recorded root, which must
+      // be this snapshot's own (I4); anything else is refused.
+      const originRoots = scope.kind === 'external' && pinnedStorageIdentity !== null
+        ? await loadOriginKeyRoots({
+          orgId: tokenRow.orgId,
+          storageIdentity: pinnedStorageIdentity,
+          originSnapshotIds: [scope.originSnapshotId],
+        })
+        : new Map();
+      key = resolveSnapshotPhysicalKey({
+        ownRoot: keyRoot,
+        ownSnapshotId,
+        logicalKey: normalizedRemotePath,
+        originRoots,
+      });
+      if (key === null) {
+        console.warn(
+          `[getAuthenticatedRecoveryDownloadTarget] refused token ${tokenRow.id}: key outside the snapshot key root`,
+          { tokenId: tokenRow.id, snapshotDbId, key: normalizedRemotePath },
+        );
+        return {
+          unavailable: true,
+          reason: 'Requested path references an object this recovery is not authorized to read.',
+        } as const;
+      }
+    }
     const expiresInSeconds = Math.max(
       1,
       Math.min(300, Math.floor((downloadExpiry.getTime() - Date.now()) / 1000))
@@ -290,7 +448,8 @@ export async function getAuthenticatedRecoveryDownloadTarget(
     };
   }
 
-  if (resolved.providerType === 'local') {
+  // Local destinations always record the legacy root (#7081 I7).
+  if (resolved.providerType === 'local' && keyRoot.layout === 'legacy_flat') {
     const rootPath = getStringValue(providerConfig, 'path') || getStringValue(providerConfig, 'basePath');
     if (!rootPath) {
       return { unavailable: true, reason: 'Snapshot storage is misconfigured.' } as const;
@@ -298,15 +457,54 @@ export async function getAuthenticatedRecoveryDownloadTarget(
 
     const filePath = ensureContainedLocalPath(
       rootPath,
-      originStoragePrefix ? `${originStoragePrefix}/${normalizedRemotePath}` : normalizedRemotePath
+      origin ? keyUnderRecordedRoot(normalizedRemotePath, origin.storagePrefix, origin.snapshotId) : normalizedRemotePath
     );
     const fileInfo = await stat(filePath);
+    const fileName = normalizedRemotePath.split('/').pop() || 'recovery-object';
+    const contentType = normalizedRemotePath.endsWith('.json') ? 'application/json' : 'application/octet-stream';
+
+    // #6489: agent/internal/backup/providers/local.go gzip-compresses on
+    // Upload and gunzips again on Download, keyed purely off a `.gz` key
+    // suffix — S3 keys, by contrast, hold raw bytes even when the recorded
+    // key ends in `.gz` (W09 plan Part 0, "never add or strip .gz": the
+    // suffix is just part of the manifest-recorded key there). Token-mode
+    // recovery reads local-provider storage directly rather than through the
+    // agent, so without mirroring the agent's gunzip here a bare-metal
+    // recovery against a local backend would count compressed bytes as
+    // "restored" bytes. Decision recorded on the issue: the SERVER gunzips.
+    // The decompressed length isn't knowable without decompressing the
+    // object, so this branch deliberately omits a fixed Content-Length and
+    // streams instead (see the route handler in routes/backup/bmr.ts, which
+    // only sets the header when contentLength is non-null).
+    if (normalizedRemotePath.endsWith('.gz')) {
+      const rawStream = createReadStream(filePath);
+      const gunzip = createGunzip();
+      // `pipeline` (not a bare `.pipe()`) so a failure on EITHER side closes
+      // the other: a corrupt/truncated gzip payload destroys `gunzip` but
+      // `.pipe()` alone never destroys its *source* in response, which would
+      // otherwise leak the open file descriptor from `createReadStream`
+      // until GC finalization — the exact case the "corrupt gzip" test
+      // below exercises. The callback below only needs to swallow the
+      // already-consumer-visible error (surfaced via `gunzip`'s own 'error'
+      // event, forwarded by the route handler's ReadableStream), not
+      // re-report it.
+      pipeline(rawStream, gunzip, () => {});
+      return {
+        unavailable: false,
+        type: 'stream' as const,
+        fileName,
+        contentLength: null,
+        contentType,
+        stream: gunzip,
+      };
+    }
+
     return {
       unavailable: false,
       type: 'stream' as const,
-      fileName: normalizedRemotePath.split('/').pop() || 'recovery-object',
+      fileName,
       contentLength: fileInfo.size,
-      contentType: normalizedRemotePath.endsWith('.json') ? 'application/json' : 'application/octet-stream',
+      contentType,
       stream: createReadStream(filePath),
     };
   }

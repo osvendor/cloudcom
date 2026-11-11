@@ -1,25 +1,30 @@
 import { Hono } from 'hono';
 import { zValidator } from '../../lib/validation';
 import { z } from 'zod';
-import { and, asc, desc, eq, ilike, inArray, isNotNull, isNull, or, sql, type SQL } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, isNotNull, isNull, sql, type SQL } from 'drizzle-orm';
 import { db } from '../../db';
 import { tickets, ticketComments, ticketAlertLinks, devices, organizations, users, alerts, ticketStatuses } from '../../db/schema';
 import { requireScope, requirePermission } from '../../middleware/auth';
-import { deviceInSiteScope, ticketSiteScopeCondition } from './siteScope';
+import { alertInSiteScope, deviceInSiteScope, ticketSiteScopeCondition } from './siteScope';
 import { PERMISSIONS, hasPermission, type UserPermissions } from '../../services/permissions';
-import { escapeLike } from '../../utils/sql';
+import { ticketSearchCondition } from '../../services/ticketSearch';
+import { checklistCountsForTickets } from '../../services/ticketChecklistService';
+import { withBusinessMinutesRemaining } from '../../services/businessCalendars/remaining';
 import {
   createTicketSchema, updateTicketSchema, changeTicketStatusSchema,
   assignTicketSchema, addTicketCommentSchema, listTicketsQuerySchema,
-  editCommentSchema
+  editCommentSchema,
+  ERROR_CODES,
 } from '@breeze/shared';
 import {
+  type TicketActor,
   createTicket, changeTicketStatus, assignTicket, addTicketComment,
   linkAlertToTicket, unlinkAlertFromTicket, updateTicketFields,
   editTicketComment, deleteTicketComment, listRequestersForOrg,
   softDeleteTicket, restoreTicket,
   TicketServiceError
 } from '../../services/ticketService';
+import { ticketMergedResponse } from '../../services/ticketMerge/errors';
 import {
   evaluateTicketTriage,
   getTicketTriageSuggestion,
@@ -68,36 +73,44 @@ const CLOSED_STATUSES = ['resolved', 'closed'] as const;
 const PRIORITY_ORDER = sql`CASE ${tickets.priority}
   WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END`;
 
-// SQL twins of services/ticketSla.ts rules — change them together.
-// Active elapsed = now - created_at - paused; at-risk at 80% of the tighter target (D7).
-const SLA_BREACHED = sql`${tickets.slaBreachedAt} IS NOT NULL`;
-const SLA_AT_RISK = sql`(
-  ${tickets.slaBreachedAt} IS NULL
+// #8973 W3 (spec §4.3 reader 2): at-risk compares now() with the STORED 80%
+// point of each unfrozen arm (services/ticketSlaDeadlines.ts writes it).
+// SLA_BREACHED is unchanged. A stamped breach on either arm leaves at-risk.
+// #8972: merged tombstones never count as breached / at-risk (spec §3.6).
+const SLA_BREACHED = sql`(${tickets.slaBreachedAt} IS NOT NULL AND ${tickets.mergedIntoTicketId} IS NULL)`;
+export const SLA_AT_RISK = sql`(
+  ${tickets.mergedIntoTicketId} IS NULL
+  AND ${tickets.slaBreachedAt} IS NULL
   AND ${tickets.status} IN ('new', 'open')
   AND ${tickets.slaPausedAt} IS NULL
   AND (
-    (${tickets.firstResponseAt} IS NULL AND ${tickets.responseSlaMinutes} IS NOT NULL
-      AND now() >= ${tickets.createdAt}
-        + COALESCE(${tickets.slaPausedMinutes}, 0) * interval '1 minute'
-        + ${tickets.responseSlaMinutes} * interval '1 minute' * 0.8)
-    OR (${tickets.resolutionSlaMinutes} IS NOT NULL
-      AND now() >= ${tickets.createdAt}
-        + COALESCE(${tickets.slaPausedMinutes}, 0) * interval '1 minute'
-        + ${tickets.resolutionSlaMinutes} * interval '1 minute' * 0.8)
+    (${tickets.firstResponseAt} IS NULL AND ${tickets.responseWarnAt} IS NOT NULL
+      AND now() >= ${tickets.responseWarnAt})
+    OR (${tickets.resolutionWarnAt} IS NOT NULL
+      AND now() >= ${tickets.resolutionWarnAt})
   )
 )`;
 
-export function actorFrom(c: { get: (k: 'auth') => AuthContext }) {
+/** The human session behind a staff ticket route — always a `'user'` actor. */
+export function actorFrom(c: { get: (k: 'auth') => AuthContext }): Extract<TicketActor, { kind: 'user' }> {
   const auth = c.get('auth');
-  return { userId: auth.user.id, name: auth.user.name, email: auth.user.email };
+  return { kind: 'user', userId: auth.user.id, name: auth.user.name, email: auth.user.email };
 }
 
 export function handleServiceError(c: { json: (b: unknown, s: number) => Response }, err: unknown): Response {
+  // #8972 W1: a write reached a merged tombstone → 409 with the survivor id.
+  const merged = ticketMergedResponse(c, err);
+  if (merged) return merged;
   if (err instanceof TicketServiceError) {
     // `code` is optional on the error; include it when present so callers can
     // branch on a stable token instead of the message (W08 #3902 relies on
     // ATTACHMENT_NOT_CLAIMABLE reaching the client).
-    return c.json(err.code ? { error: err.message, code: err.code } : { error: err.message }, err.status);
+    return c.json({
+      error: err.message,
+      ...(err.code ? { code: err.code } : {}),
+      // e.g. EXTERNAL_ID_CONFLICT names the ticket already holding the id.
+      ...(err.details ? { details: err.details } : {}),
+    }, err.status);
   }
   throw err;
 }
@@ -198,14 +211,14 @@ ticketsRoutes.get(
     const auth = c.get('auth');
     const query = c.req.valid('query');
     if (auth.scope === 'organization' && !auth.orgId) {
-      return c.json({ error: 'Organization context required' }, 403);
+      return c.json({ error: 'Organization context required', code: ERROR_CODES.ACCESS_DENIED }, 403);
     }
     if (query.orgId && !auth.canAccessOrg(query.orgId)) {
-      return c.json({ error: 'Organization not found or access denied' }, 403);
+      return c.json({ error: 'Organization not found or access denied', code: ERROR_CODES.ACCESS_DENIED }, 403);
     }
     const scopeResult = buildScopeConditions(auth);
     if (scopeResult === SCOPE_MISSING) {
-      return c.json({ error: 'Partner context required' }, 403);
+      return c.json({ error: 'Partner context required', code: ERROR_CODES.ACCESS_DENIED }, 403);
     }
     const conditions: SQL[] = scopeResult;
     if (query.orgId) conditions.push(eq(tickets.orgId, query.orgId));
@@ -214,6 +227,7 @@ ticketsRoutes.get(
     const siteCondition = ticketSiteScopeCondition(auth);
     if (siteCondition) conditions.push(siteCondition);
     conditions.push(isNull(tickets.deletedAt)); // soft-deleted tickets never count toward queue tabs
+    conditions.push(isNull(tickets.mergedIntoTicketId)); // #8972: merged tombstones never count
     const whereCondition = conditions.length > 0 ? and(...conditions) : undefined;
 
     const rows = await db
@@ -256,14 +270,14 @@ ticketsRoutes.get(
     const auth = c.get('auth');
     const query = c.req.valid('query');
     if (auth.scope === 'organization' && !auth.orgId) {
-      return c.json({ error: 'Organization context required' }, 403);
+      return c.json({ error: 'Organization context required', code: ERROR_CODES.ACCESS_DENIED }, 403);
     }
     if (auth.scope === 'partner' && !auth.partnerId) {
-      return c.json({ error: 'Partner context required' }, 403);
+      return c.json({ error: 'Partner context required', code: ERROR_CODES.ACCESS_DENIED }, 403);
     }
 
     if (query.orgId && !auth.canAccessOrg(query.orgId)) {
-      return c.json({ error: 'Organization not found or access denied' }, 403);
+      return c.json({ error: 'Organization not found or access denied', code: ERROR_CODES.ACCESS_DENIED }, 403);
     }
 
     const orgIds = query.orgId
@@ -297,16 +311,16 @@ ticketsRoutes.get(
     // partner org-access narrowing (inArray(orgId, accessibleOrgIds), fail-closed
     // on an empty list) as the stats and detail paths — defense-in-depth parity.
     if (auth.scope === 'organization' && !auth.orgId) {
-      return c.json({ error: 'Organization context required' }, 403);
+      return c.json({ error: 'Organization context required', code: ERROR_CODES.ACCESS_DENIED }, 403);
     }
     const scopeResult = buildScopeConditions(auth);
     if (scopeResult === SCOPE_MISSING) {
-      return c.json({ error: 'Partner context required' }, 403);
+      return c.json({ error: 'Partner context required', code: ERROR_CODES.ACCESS_DENIED }, 403);
     }
     const conditions: SQL[] = scopeResult;
     if (q.orgId) {
       if (auth.scope !== 'system' && !auth.canAccessOrg(q.orgId)) {
-        return c.json({ error: 'Organization not found or access denied' }, 403);
+        return c.json({ error: 'Organization not found or access denied', code: ERROR_CODES.ACCESS_DENIED }, 403);
       }
       conditions.push(eq(tickets.orgId, q.orgId));
     }
@@ -315,7 +329,7 @@ ticketsRoutes.get(
       // caller asking for a device outside their sites gets a hard 403, not an
       // empty list, so the failure is visible.
       if (!(await deviceInSiteScope(auth, q.deviceId))) {
-        return c.json({ error: 'Device not found or access denied' }, 403);
+        return c.json({ error: 'Device not found or access denied', code: ERROR_CODES.ACCESS_DENIED }, 403);
       }
       conditions.push(eq(tickets.deviceId, q.deviceId));
     }
@@ -329,11 +343,13 @@ ticketsRoutes.get(
       const canManage = perms
         ? hasPermission(perms, PERMISSIONS.TICKETS_MANAGE.resource, PERMISSIONS.TICKETS_MANAGE.action)
         : false;
-      if (!canManage) return c.json({ error: 'Viewing deleted tickets requires ticket management permission' }, 403);
+      if (!canManage) return c.json({ error: 'Viewing deleted tickets requires ticket management permission', code: ERROR_CODES.ACCESS_DENIED }, 403);
       conditions.push(sql`${tickets.deletedAt} IS NOT NULL`);
     } else {
       conditions.push(isNull(tickets.deletedAt));
     }
+    // #8972: merged tombstones are hidden (list, search, closed filter) unless asked for.
+    if (!q.showMerged) conditions.push(isNull(tickets.mergedIntoTicketId));
     if (q.status) conditions.push(eq(tickets.status, q.status));
     else if (q.statusGroup === 'open') conditions.push(inArray(tickets.status, [...OPEN_STATUSES]));
     else if (q.statusGroup === 'closed') conditions.push(inArray(tickets.status, [...CLOSED_STATUSES]));
@@ -341,18 +357,19 @@ ticketsRoutes.get(
     else if (q.assignee === 'unassigned') conditions.push(isNull(tickets.assignedTo));
     else if (q.assignee) conditions.push(eq(tickets.assignedTo, q.assignee));
     if (q.categoryId) conditions.push(eq(tickets.categoryId, q.categoryId));
+    if (q.ticketType) conditions.push(inArray(tickets.ticketType, q.ticketType));
     if (q.priority) conditions.push(eq(tickets.priority, q.priority));
     if (q.slaState === 'breached') conditions.push(SLA_BREACHED);
     else if (q.slaState === 'at_risk') conditions.push(SLA_AT_RISK);
     else if (q.slaState === 'breaching') conditions.push(sql`(${SLA_BREACHED} OR ${SLA_AT_RISK})`);
     else if (q.slaState === 'ok') conditions.push(sql`(NOT ${SLA_BREACHED} AND NOT ${SLA_AT_RISK})`);
     if (q.search) {
-      // Escape ILIKE special chars (\, %, _) so they match literally, not as
-      // wildcards/escapes. Use the shared helper — the prior inline regex
-      // dropped backslash, so a trailing '\' could escape the closing '%'.
-      const term = `%${escapeLike(q.search)}%`;
-      const searchCond = or(ilike(tickets.subject, term), ilike(tickets.internalNumber, term));
-      if (searchCond) conditions.push(searchCond);
+      // Subject / Breeze number substrings (ILIKE-escaped by the helper), or
+      // the whole source number of an imported ticket (#8313).
+      const visibleOrgIds = auth.scope === 'organization'
+        ? [auth.orgId as string]
+        : auth.scope === 'partner' ? (auth.accessibleOrgIds ?? []) : null;
+      conditions.push(ticketSearchCondition(q.search, visibleOrgIds));
     }
     const whereCondition = conditions.length > 0 ? and(...conditions) : undefined;
 
@@ -362,7 +379,7 @@ ticketsRoutes.get(
       : q.sort === 'due' ? [asc(tickets.dueDate), asc(tickets.id)]
       : [desc(SLA_BREACHED), desc(SLA_AT_RISK), PRIORITY_ORDER, asc(tickets.createdAt), asc(tickets.id)]; // triage: breaches surface first
 
-    const data = await db
+    const rows = await db
       .select({
         id: tickets.id,
         internalNumber: tickets.internalNumber,
@@ -370,6 +387,7 @@ ticketsRoutes.get(
         status: tickets.status,
         priority: tickets.priority,
         source: tickets.source,
+        ticketType: tickets.ticketType,
         orgId: tickets.orgId,
         orgName: organizations.name,
         deviceId: tickets.deviceId,
@@ -385,9 +403,21 @@ ticketsRoutes.get(
         slaPausedAt: tickets.slaPausedAt,
         slaPausedMinutes: tickets.slaPausedMinutes,
         slaBreachReason: tickets.slaBreachReason,
+        // #8973 W3 stored deadlines (spec §4.3 readers 5–6).
+        responseDueAt: tickets.responseDueAt,
+        resolutionDueAt: tickets.resolutionDueAt,
+        responseWarnAt: tickets.responseWarnAt,
+        resolutionWarnAt: tickets.resolutionWarnAt,
+        // #8973 W4: the business-calendar snapshot (null = 24×7).
+        slaCalendarRevisionId: tickets.slaCalendarRevisionId,
         createdAt: tickets.createdAt,
         updatedAt: tickets.updatedAt,
         deletedAt: tickets.deletedAt,
+        // #8313: the window that imported the ticket; null when live.
+        migrationWindowId: tickets.migrationWindowId,
+        // #8972: the merged marker for the "Merged" chip (rows appear only under showMerged=true).
+        mergedIntoTicketId: tickets.mergedIntoTicketId,
+        mergedAt: tickets.mergedAt,
         statusName: ticketStatuses.name,
         statusColor: ticketStatuses.color
       })
@@ -400,6 +430,9 @@ ticketsRoutes.get(
       .orderBy(...orderBy)
       .limit(q.limit)
       .offset(offset);
+    // #8973 W4: business minutes remaining, server-side, only for rows on a
+    // calendar (one batch load per page); with none the client counts wall-clock.
+    const data = await withBusinessMinutesRemaining(db, rows);
 
     const countRows = await db
       .select({ count: sql<number>`count(*)` })
@@ -407,7 +440,15 @@ ticketsRoutes.get(
       .where(whereCondition);
     const total = Number(countRows[0]?.count ?? 0);
 
-    return c.json({ data, pagination: { page: q.page, limit: q.limit, total } });
+    // #9180 — checklist progress for the queue: one grouped count for the page,
+    // never a per-row fetch. Checklists are internal MSP procedure (spec #5783
+    // §2): an organization-scoped caller gets no `checklist` key at all.
+    if (auth.scope === 'organization' || data.length === 0) {
+      return c.json({ data, pagination: { page: q.page, limit: q.limit, total } });
+    }
+    const counts = await checklistCountsForTickets(data.map((t) => t.id));
+    const withChecklist = data.map((t) => ({ ...t, checklist: counts.get(t.id) ?? null }));
+    return c.json({ data: withChecklist, pagination: { page: q.page, limit: q.limit, total } });
   }
 );
 
@@ -423,14 +464,14 @@ ticketsRoutes.post(
 
     // Mirror the alerts/rules convention: verify the caller can reach the target org.
     if (!auth.canAccessOrg(body.orgId)) {
-      return c.json({ error: 'Access to this organization denied' }, 403);
+      return c.json({ error: 'Access to this organization denied', code: ERROR_CODES.ACCESS_DENIED }, 403);
     }
 
     // Site-axis guard: a site-restricted caller may only open device-bound
     // tickets for devices in their allowed sites (deviceless org-level tickets
     // are fine — they aren't site-bound).
     if (body.deviceId && !(await deviceInSiteScope(auth, body.deviceId))) {
-      return c.json({ error: 'Device not found or access denied' }, 403);
+      return c.json({ error: 'Device not found or access denied', code: ERROR_CODES.ACCESS_DENIED }, 403);
     }
 
     try {
@@ -454,7 +495,7 @@ ticketsRoutes.get(
     const auth = c.get('auth');
     const { orgId } = c.req.valid('query');
     if (!auth.canAccessOrg(orgId)) {
-      return c.json({ error: 'Access to this organization denied' }, 403);
+      return c.json({ error: 'Access to this organization denied', code: ERROR_CODES.ACCESS_DENIED }, 403);
     }
     const data = await listRequestersForOrg(orgId);
     return c.json({ data });
@@ -472,10 +513,10 @@ ticketsRoutes.get(
     const { id } = c.req.valid('param');
 
     if (auth.scope === 'organization' && !auth.orgId) {
-      return c.json({ error: 'Organization context required' }, 403);
+      return c.json({ error: 'Organization context required', code: ERROR_CODES.ACCESS_DENIED }, 403);
     }
     const ticket = await getScopedTicketOr404(auth, id);
-    if (!ticket) return c.json({ error: 'Ticket not found' }, 404);
+    if (!ticket) return c.json({ error: 'Ticket not found', code: ERROR_CODES.NOT_FOUND }, 404);
 
     // Decorate with display names for the workbench breadcrumb / assignee chip.
     // Mirrors the list endpoint's join column choices; left joins keep missing
@@ -522,6 +563,10 @@ ticketsRoutes.get(
 
     const comments = commentRows.map((row) => ({
       ...row,
+      // #8313: who wrote an imported comment in its source (display only).
+      originalAuthor: row.originalAuthorKind
+        ? { name: row.authorName ?? null, email: row.originalAuthorEmail ?? null, kind: row.originalAuthorKind }
+        : null,
       deleted: row.deletedAt != null,
       // Never ship the prior text of a deleted comment to the client.
       content: row.deletedAt != null ? '' : row.content,
@@ -542,7 +587,9 @@ ticketsRoutes.get(
       .leftJoin(alerts, eq(ticketAlertLinks.alertId, alerts.id))
       .where(eq(ticketAlertLinks.ticketId, id));
 
-    return c.json({ data: { ...ticket, orgName, deviceHostname, assigneeName, statusName, statusColor, comments, alertLinks } });
+    // #8973 W4: non-null only when the ticket carries a calendar revision.
+    const [withRemaining] = await withBusinessMinutesRemaining(db, [ticket]);
+    return c.json({ data: { ...ticket, slaBusinessMinutesRemaining: withRemaining!.slaBusinessMinutesRemaining, orgName, deviceHostname, assigneeName, statusName, statusColor, comments, alertLinks } });
   }
 );
 
@@ -556,10 +603,10 @@ ticketsRoutes.get(
     const { id } = c.req.valid('param');
 
     if (auth.scope === 'organization' && !auth.orgId) {
-      return c.json({ error: 'Organization context required' }, 403);
+      return c.json({ error: 'Organization context required', code: ERROR_CODES.ACCESS_DENIED }, 403);
     }
     const ticket = await getScopedTicketOr404(auth, id);
-    if (!ticket) return c.json({ error: 'Ticket not found' }, 404);
+    if (!ticket) return c.json({ error: 'Ticket not found', code: ERROR_CODES.NOT_FOUND }, 404);
 
     const result = await getTicketTriageSuggestion(ticket);
     return c.json(result);
@@ -578,23 +625,23 @@ ticketsRoutes.post(
     const body = c.req.valid('json');
 
     if (auth.scope === 'organization' && !auth.orgId) {
-      return c.json({ error: 'Organization context required' }, 403);
+      return c.json({ error: 'Organization context required', code: ERROR_CODES.ACCESS_DENIED }, 403);
     }
     const ticket = await getScopedTicketOr404(auth, id);
-    if (!ticket) return c.json({ error: 'Ticket not found' }, 404);
+    if (!ticket) return c.json({ error: 'Ticket not found', code: ERROR_CODES.NOT_FOUND }, 404);
 
     const suggestion = await getTicketTriageSuggestion(ticket);
     if (!suggestion.enabled) {
-      return c.json({ error: 'Ticket triage suggestions are disabled' }, 409);
+      return c.json({ error: 'Ticket triage suggestions are disabled', code: ERROR_CODES.TICKET_TRIAGE_DISABLED }, 409);
     }
     if (!suggestion.suggestion) {
-      return c.json({ error: 'No ticket triage suggestion is currently available' }, 409);
+      return c.json({ error: 'No ticket triage suggestion is currently available', code: ERROR_CODES.TICKET_TRIAGE_UNAVAILABLE }, 409);
     }
     if (body.priority !== undefined && body.priority !== suggestion.suggestion.priority) {
-      return c.json({ error: 'Priority no longer matches the current suggestion' }, 409);
+      return c.json({ error: 'Priority no longer matches the current suggestion', code: ERROR_CODES.TICKET_TRIAGE_PRIORITY_MISMATCH }, 409);
     }
     if (body.categoryId !== undefined && (suggestion.suggestion.categoryId === null || body.categoryId !== suggestion.suggestion.categoryId)) {
-      return c.json({ error: 'Category no longer matches the current suggestion' }, 409);
+      return c.json({ error: 'Category no longer matches the current suggestion', code: ERROR_CODES.TICKET_TRIAGE_CATEGORY_MISMATCH }, 409);
     }
 
     try {
@@ -629,17 +676,17 @@ ticketsRoutes.post(
     const body = c.req.valid('json');
 
     if (auth.scope === 'organization' && !auth.orgId) {
-      return c.json({ error: 'Organization context required' }, 403);
+      return c.json({ error: 'Organization context required', code: ERROR_CODES.ACCESS_DENIED }, 403);
     }
     const ticket = await getScopedTicketOr404(auth, id);
-    if (!ticket) return c.json({ error: 'Ticket not found' }, 404);
+    if (!ticket) return c.json({ error: 'Ticket not found', code: ERROR_CODES.NOT_FOUND }, 404);
 
     const suggestion = await getTicketTriageSuggestion(ticket);
     if (!suggestion.enabled) {
-      return c.json({ error: 'Ticket triage suggestions are disabled' }, 409);
+      return c.json({ error: 'Ticket triage suggestions are disabled', code: ERROR_CODES.TICKET_TRIAGE_DISABLED }, 409);
     }
     if (!suggestion.suggestion) {
-      return c.json({ error: 'No ticket triage suggestion is currently available' }, 409);
+      return c.json({ error: 'No ticket triage suggestion is currently available', code: ERROR_CODES.TICKET_TRIAGE_UNAVAILABLE }, 409);
     }
 
     await emitTicketTriageFeedback({
@@ -695,16 +742,23 @@ ticketsRoutes.patch(
     }
     if (Object.keys(body).length === 0) return c.json({ error: 'No fields to update' }, 400);
 
+    // #4617: the budget is the customer's spend ceiling under the approval
+    // gate — a partner-staff decision. Organization scope cannot read the
+    // time entries it is measured against (time_entries has no org-axis RLS).
+    if (auth.scope === 'organization' && (body.budgetMinutes !== undefined || body.budgetAmount !== undefined)) {
+      return c.json({ error: 'The ticket budget can only be set by partner staff', code: ERROR_CODES.ACCESS_DENIED }, 403);
+    }
+
     if (auth.scope === 'organization' && !auth.orgId) {
-      return c.json({ error: 'Organization context required' }, 403);
+      return c.json({ error: 'Organization context required', code: ERROR_CODES.ACCESS_DENIED }, 403);
     }
     const found = await getScopedTicketOr404(auth, id);
-    if (!found) return c.json({ error: 'Ticket not found' }, 404);
+    if (!found) return c.json({ error: 'Ticket not found', code: ERROR_CODES.NOT_FOUND }, 404);
 
     // Site-axis guard on the NEW device (the existing ticket's device was
     // already gated by getScopedTicketOr404 above).
     if (typeof body.deviceId === 'string' && !(await deviceInSiteScope(auth, body.deviceId))) {
-      return c.json({ error: 'Device not found or access denied' }, 403);
+      return c.json({ error: 'Device not found or access denied', code: ERROR_CODES.ACCESS_DENIED }, 403);
     }
 
     try {
@@ -729,10 +783,10 @@ ticketsRoutes.post(
     const body = c.req.valid('json');
 
     if (auth.scope === 'organization' && !auth.orgId) {
-      return c.json({ error: 'Organization context required' }, 403);
+      return c.json({ error: 'Organization context required', code: ERROR_CODES.ACCESS_DENIED }, 403);
     }
     const found = await getScopedTicketOr404(auth, id);
-    if (!found) return c.json({ error: 'Ticket not found' }, 404);
+    if (!found) return c.json({ error: 'Ticket not found', code: ERROR_CODES.NOT_FOUND }, 404);
 
     try {
       const ticket = await changeTicketStatus(id,
@@ -760,10 +814,10 @@ ticketsRoutes.post(
     const { assigneeId } = c.req.valid('json');
 
     if (auth.scope === 'organization' && !auth.orgId) {
-      return c.json({ error: 'Organization context required' }, 403);
+      return c.json({ error: 'Organization context required', code: ERROR_CODES.ACCESS_DENIED }, 403);
     }
     const found = await getScopedTicketOr404(auth, id);
-    if (!found) return c.json({ error: 'Ticket not found' }, 404);
+    if (!found) return c.json({ error: 'Ticket not found', code: ERROR_CODES.NOT_FOUND }, 404);
 
     try {
       const ticket = await assignTicket(id, assigneeId, actorFrom(c));
@@ -787,10 +841,10 @@ ticketsRoutes.delete(
     const auth = c.get('auth');
     const { id } = c.req.valid('param');
     if (auth.scope === 'organization' && !auth.orgId) {
-      return c.json({ error: 'Organization context required' }, 403);
+      return c.json({ error: 'Organization context required', code: ERROR_CODES.ACCESS_DENIED }, 403);
     }
     const found = await getScopedTicketOr404(auth, id);
-    if (!found) return c.json({ error: 'Ticket not found' }, 404);
+    if (!found) return c.json({ error: 'Ticket not found', code: ERROR_CODES.NOT_FOUND }, 404);
     try {
       const result = await softDeleteTicket(id, actorFrom(c));
       return c.json({ data: result });
@@ -811,10 +865,10 @@ ticketsRoutes.post(
     const auth = c.get('auth');
     const { id } = c.req.valid('param');
     if (auth.scope === 'organization' && !auth.orgId) {
-      return c.json({ error: 'Organization context required' }, 403);
+      return c.json({ error: 'Organization context required', code: ERROR_CODES.ACCESS_DENIED }, 403);
     }
     const found = await getScopedTicketOr404(auth, id, { includeDeleted: true });
-    if (!found) return c.json({ error: 'Ticket not found' }, 404);
+    if (!found) return c.json({ error: 'Ticket not found', code: ERROR_CODES.NOT_FOUND }, 404);
     try {
       const ticket = await restoreTicket(id, actorFrom(c));
       return c.json({ data: ticket });
@@ -837,10 +891,10 @@ ticketsRoutes.post(
     const body = c.req.valid('json');
 
     if (auth.scope === 'organization' && !auth.orgId) {
-      return c.json({ error: 'Organization context required' }, 403);
+      return c.json({ error: 'Organization context required', code: ERROR_CODES.ACCESS_DENIED }, 403);
     }
     const found = await getScopedTicketOr404(auth, id);
-    if (!found) return c.json({ error: 'Ticket not found' }, 404);
+    if (!found) return c.json({ error: 'Ticket not found', code: ERROR_CODES.NOT_FOUND }, 404);
 
     try {
       const result = await addTicketComment(id, body, actorFrom(c));
@@ -868,10 +922,10 @@ ticketsRoutes.patch(
     const { id, commentId } = c.req.valid('param');
     const body = c.req.valid('json');
     if (auth.scope === 'organization' && !auth.orgId) {
-      return c.json({ error: 'Organization context required' }, 403);
+      return c.json({ error: 'Organization context required', code: ERROR_CODES.ACCESS_DENIED }, 403);
     }
     const found = await getScopedTicketOr404(auth, id);
-    if (!found) return c.json({ error: 'Ticket not found' }, 404);
+    if (!found) return c.json({ error: 'Ticket not found', code: ERROR_CODES.NOT_FOUND }, 404);
     const perms = c.get('permissions') as UserPermissions | undefined;
     const canManageAny = perms ? hasPermission(perms, PERMISSIONS.TICKETS_MANAGE.resource, PERMISSIONS.TICKETS_MANAGE.action) : false;
     try {
@@ -893,10 +947,10 @@ ticketsRoutes.delete(
     const auth = c.get('auth');
     const { id, commentId } = c.req.valid('param');
     if (auth.scope === 'organization' && !auth.orgId) {
-      return c.json({ error: 'Organization context required' }, 403);
+      return c.json({ error: 'Organization context required', code: ERROR_CODES.ACCESS_DENIED }, 403);
     }
     const found = await getScopedTicketOr404(auth, id);
-    if (!found) return c.json({ error: 'Ticket not found' }, 404);
+    if (!found) return c.json({ error: 'Ticket not found', code: ERROR_CODES.NOT_FOUND }, 404);
     const perms = c.get('permissions') as UserPermissions | undefined;
     const canManageAny = perms ? hasPermission(perms, PERMISSIONS.TICKETS_MANAGE.resource, PERMISSIONS.TICKETS_MANAGE.action) : false;
     try {
@@ -921,25 +975,26 @@ ticketsRoutes.post(
     const { alertId } = c.req.valid('json');
 
     if (auth.scope === 'organization' && !auth.orgId) {
-      return c.json({ error: 'Organization context required' }, 403);
+      return c.json({ error: 'Organization context required', code: ERROR_CODES.ACCESS_DENIED }, 403);
     }
     const found = await getScopedTicketOr404(auth, id);
-    if (!found) return c.json({ error: 'Ticket not found' }, 404);
+    if (!found) return c.json({ error: 'Ticket not found', code: ERROR_CODES.NOT_FOUND }, 404);
 
     // Site-axis gate on the ALERT's device (the ticket's device was already
     // gated above): a site-restricted caller must not link alerts for devices
     // outside their allowed sites. The service's same-org check stays in
     // linkAlertToTicket — the route layer owns the site axis.
     const alertRows = await db
-      .select({ deviceId: alerts.deviceId })
+      .select({ deviceId: alerts.deviceId, topologySiteId: alerts.topologySiteId })
       .from(alerts)
       .where(eq(alerts.id, alertId))
       .limit(1);
     const alertRow = alertRows[0];
-    if (!alertRow) return c.json({ error: 'Alert not found' }, 404);
-    if (alertRow.deviceId && !(await deviceInSiteScope(auth, alertRow.deviceId))) {
+    if (!alertRow) return c.json({ error: 'Alert not found', code: ERROR_CODES.NOT_FOUND }, 404);
+    // A site-owned topology alert follows its topology site (M3-D6).
+    if (!(await alertInSiteScope(auth, alertRow))) {
       // Out-of-site alerts are invisible, not forbidden — same shape as the ticket gate.
-      return c.json({ error: 'Alert not found' }, 404);
+      return c.json({ error: 'Alert not found', code: ERROR_CODES.NOT_FOUND }, 404);
     }
 
     try {
@@ -962,22 +1017,23 @@ ticketsRoutes.delete(
     const { id, alertId } = c.req.valid('param');
 
     if (auth.scope === 'organization' && !auth.orgId) {
-      return c.json({ error: 'Organization context required' }, 403);
+      return c.json({ error: 'Organization context required', code: ERROR_CODES.ACCESS_DENIED }, 403);
     }
     const found = await getScopedTicketOr404(auth, id);
-    if (!found) return c.json({ error: 'Ticket not found' }, 404);
+    if (!found) return c.json({ error: 'Ticket not found', code: ERROR_CODES.NOT_FOUND }, 404);
 
     // Same site-axis gate as the link route: an out-of-site alert must be
     // invisible to a restricted caller even for unlink.
     const alertRows = await db
-      .select({ deviceId: alerts.deviceId })
+      .select({ deviceId: alerts.deviceId, topologySiteId: alerts.topologySiteId })
       .from(alerts)
       .where(eq(alerts.id, alertId))
       .limit(1);
     const alertRow = alertRows[0];
-    if (!alertRow) return c.json({ error: 'Alert not found' }, 404);
-    if (alertRow.deviceId && !(await deviceInSiteScope(auth, alertRow.deviceId))) {
-      return c.json({ error: 'Alert not found' }, 404);
+    if (!alertRow) return c.json({ error: 'Alert not found', code: ERROR_CODES.NOT_FOUND }, 404);
+    // A site-owned topology alert follows its topology site (M3-D6).
+    if (!(await alertInSiteScope(auth, alertRow))) {
+      return c.json({ error: 'Alert not found', code: ERROR_CODES.NOT_FOUND }, 404);
     }
 
     try {

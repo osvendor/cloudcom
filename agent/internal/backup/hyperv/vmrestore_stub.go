@@ -5,6 +5,7 @@ package hyperv
 import (
 	"context"
 
+	"github.com/breeze-rmm/agent/internal/backup/integrity"
 	"github.com/breeze-rmm/agent/internal/backup/providers"
 )
 
@@ -16,17 +17,9 @@ type VMRestoreFromBackupConfig struct {
 	CPUCount   int    `json:"cpuCount,omitempty"`
 	DiskSizeGB int64  `json:"diskSizeGb,omitempty"`
 	SwitchName string `json:"switchName,omitempty"`
-}
-
-// VMRestoreFromBackupResult holds the outcome of a VM restore from backup.
-type VMRestoreFromBackupResult struct {
-	VMName     string   `json:"vmName"`
-	NewVMID    string   `json:"newVmId"`
-	VHDXPath   string   `json:"vhdxPath"`
-	Status     string   `json:"status"`
-	DurationMs int64    `json:"durationMs"`
-	Warnings   []string `json:"warnings,omitempty"`
-	Error      string   `json:"error,omitempty"`
+	// Integrity is the command's integrity expectation (nil when the
+	// payload carried none). Not part of the JSON form.
+	Integrity *integrity.Expectation `json:"-"`
 }
 
 // RestoreAsVM is a stub for non-Windows platforms.

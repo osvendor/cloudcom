@@ -22,6 +22,9 @@ import { cn } from '@/lib/utils';
 import { fetchWithAuth } from '../../stores/auth';
 import { navigateTo } from '@/lib/navigation';
 import { formatDateTime } from '@/lib/dateTimeFormat';
+import { useStableT } from '@/lib/i18n/useStableT';
+import RestorePointInline from '../restorePoints/RestorePointInline';
+import type { RestorePointBadgeOutcome } from '../restorePoints/RestorePointBadge';
 
 type PatchResult = {
   id?: string;
@@ -40,6 +43,8 @@ type HistoryResult = {
   scannedCount?: number;
   pendingCount?: number;
   rebootRequired?: boolean;
+  // #4759 W08: the System Restore outcome the agent reported, stored verbatim on the command result.
+  restorePoint?: RestorePointBadgeOutcome;
   results?: PatchResult[];
   errorMessage?: string;
 };
@@ -202,6 +207,7 @@ function getPatchResultKb(patch: PatchResult): string | null {
 
 export default function PatchInstallHistory({ deviceId }: PatchInstallHistoryProps) {
   const { t } = useTranslation('patches');
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   const [history, setHistory] = useState<PatchHistoryEntry[]>([]);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -238,7 +244,7 @@ export default function PatchInstallHistory({ deviceId }: PatchInstallHistoryPro
             void navigateTo('/login', { replace: true });
             return;
           }
-          throw new Error(t('patchInstallHistory.errors.fetchHistory'));
+          throw new Error(stableT('patchInstallHistory.errors.fetchHistory'));
         }
         const json = await response.json();
         const data = json?.data ?? json;
@@ -248,12 +254,12 @@ export default function PatchInstallHistory({ deviceId }: PatchInstallHistoryPro
         setHistory(entries);
         setTotal(typeof data?.total === 'number' ? data.total : entries.length);
       } catch (err) {
-        if (!silent) setError(err instanceof Error ? err.message : t('patchInstallHistory.errors.fetchHistory'));
+        if (!silent) setError(err instanceof Error ? err.message : stableT('patchInstallHistory.errors.fetchHistory'));
       } finally {
         if (!silent) setLoading(false);
       }
     },
-    [deviceId, currentPage, typeFilter, statusFilter, t]
+    [deviceId, currentPage, typeFilter, statusFilter, stableT]
   );
 
   useEffect(() => {
@@ -577,6 +583,7 @@ function HistoryDetail({ entry, t }: { entry: PatchHistoryEntry; t: TFunction<'p
             <p className="text-sm font-medium text-yellow-800">{t('patchInstallHistory.detail.yes')}</p>
           </div>
         )}
+        <RestorePointInline outcome={result?.restorePoint} />
         <div className="rounded-md border bg-card p-3">
           <p className="text-xs font-medium text-muted-foreground">{t('patchInstallHistory.detail.started')}</p>
           <p className="text-sm font-medium">{formatAbsoluteDate(entry.createdAt, t)}</p>

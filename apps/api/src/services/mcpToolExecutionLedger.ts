@@ -12,6 +12,8 @@ export interface McpToolExecutionLedgerPrincipal {
   oauthGrantId?: string | null;
   partnerId?: string | null;
   actorUserId?: string | null;
+  /** Set for a partner service principal; `apiKeyId` is then its key id. */
+  partnerServicePrincipalId?: string | null;
 }
 
 export interface McpToolExecutionLedgerHandle {
@@ -40,7 +42,17 @@ export interface BeginMcpToolExecutionLedgerInput {
   tier: number;
   toolInput: Record<string, unknown>;
   principal: McpToolExecutionLedgerPrincipal;
+  /** Verified-owned legacy transport session; null in the stateless era. */
   transportSessionId?: string | null;
+  /**
+   * B-W03 (#6157, D-B19): the server-minted per-request UUID — the same value
+   * the request audit and tool audit carry as `resourceId`.
+   */
+  transportRequestId: string;
+  /** 'release' = the action-intent release worker (B-W04 #6158). */
+  era: 'legacy' | 'modern' | 'release';
+  /** B-W04 (#6158): the released action intent, stored on ai_tool_executions.intent_id. */
+  intentId?: string;
 }
 
 export interface CompleteMcpToolExecutionLedgerInput {
@@ -57,8 +69,11 @@ function isUuid(value: string | null | undefined): value is string {
 
 function sanitizePrincipal(principal: McpToolExecutionLedgerPrincipal): Record<string, unknown> {
   return {
-    type: 'api_key',
+    type: principal.partnerServicePrincipalId ? 'partner_service_principal' : 'api_key',
     apiKeyId: principal.apiKeyId.slice(0, 256),
+    ...(principal.partnerServicePrincipalId
+      ? { partnerServicePrincipalId: principal.partnerServicePrincipalId.slice(0, 256) }
+      : {}),
     oauthGrantId: principal.oauthGrantId ?? null,
     partnerId: principal.partnerId ?? null,
     actorUserId: principal.actorUserId ?? null,
@@ -89,6 +104,8 @@ export async function beginMcpToolExecutionLedger(
     target,
     transport: {
       sessionId: input.transportSessionId ?? null,
+      requestId: input.transportRequestId,
+      era: input.era,
     },
   };
 
@@ -112,6 +129,8 @@ export async function beginMcpToolExecutionLedger(
             source: 'mcp',
             principal,
             transportSessionId: input.transportSessionId ?? null,
+            transportRequestId: input.transportRequestId,
+            era: input.era,
           },
           systemPrompt: null,
         });
@@ -123,6 +142,7 @@ export async function beginMcpToolExecutionLedger(
             toolName: input.toolName,
             toolInput,
             status: 'executing',
+            ...(input.intentId ? { intentId: input.intentId } : {}),
           })
           .returning({ id: aiToolExecutions.id });
 

@@ -11,6 +11,7 @@ let userRow: { id: string; status: string; partnerId?: string | null } | undefin
 let joinRow:
   | {
       session: {
+        createdAt: Date;
         userId: string;
         status: string;
         deviceId: string;
@@ -29,6 +30,7 @@ let joinRow:
     }
   | undefined = {
   session: {
+    createdAt: new Date(),
     userId: 'user-1',
     status: 'active',
     deviceId: 'dev-1',
@@ -152,6 +154,13 @@ vi.mock('../services/remoteAccessPolicy', () => ({
   checkRemoteAccess: vi.fn(async () => ({ allowed: true })),
 }));
 
+// The live-authority check refuses VNC tunnels on consent-mode devices. Default
+// to "the device's prompt policy allows VNC" so the other scenarios stand alone.
+const { checkVncConsentGate } = vi.hoisted(() => ({
+  checkVncConsentGate: vi.fn(async (): Promise<any> => ({ ok: true })),
+}));
+vi.mock('./remote/vncConsentGate', () => ({ checkVncConsentGate }));
+
 vi.mock('../services/viewerTokenRevocation', () => ({
   revokeViewerSession: vi.fn(async () => undefined),
   isViewerSessionRevoked: vi.fn(async () => false),
@@ -159,6 +168,16 @@ vi.mock('../services/viewerTokenRevocation', () => ({
 
 vi.mock('../services/redis', () => ({
   getRedis: vi.fn(() => 'redis-client'),
+}));
+
+// resolveRemoteWsLiveAuthority (services/remoteWsAuthorization.ts), which
+// every function under test here goes through, now also consults the
+// blanket credential-revocation marker. Default it to "not revoked" so
+// these tests keep exercising their own scenarios (policy, offline device,
+// etc.) rather than tripping this unrelated check.
+vi.mock('../services/tokenRevocation', () => ({
+  isUserTokenRevoked: vi.fn(async () => false),
+  isTimestampRevoked: vi.fn(async () => false),
 }));
 
 vi.mock('../services/rate-limit', () => ({
@@ -254,9 +273,11 @@ async function captureTunnelHandlers(sharedLeases: ReturnType<typeof testSharedL
 
 beforeEach(() => {
   vi.clearAllMocks();
+  checkVncConsentGate.mockResolvedValue({ ok: true });
   setUserRow({ id: 'user-1', status: 'active', partnerId: null });
   setJoinRow({
     session: {
+      createdAt: new Date(),
       userId: 'user-1',
       status: 'active',
       deviceId: 'dev-1',
@@ -356,6 +377,27 @@ describe('exact tunnel relay ownership', () => {
     await handlers.onClose({}, ws as never);
   });
 
+  it('rejects a VNC relay at connect time on a device that requires consent', async () => {
+    vi.mocked(consumeWsTicket).mockResolvedValueOnce({
+      ok: true, sessionId: 'tunnel-1', sessionType: 'tunnel', userId: 'user-1', version: 2, mfaSatisfied: true, ticketJti: 'jti-1',
+    } as never);
+    checkVncConsentGate.mockResolvedValue({
+      ok: false,
+      status: 409,
+      body: { error: 'VNC can\'t ask for consent', code: 'CONSENT_REQUIRED_TRANSPORT_UNAVAILABLE' },
+    });
+    const handlers = await captureTunnelHandlers(testSharedLeases(Number.MAX_SAFE_INTEGER));
+    const ws = makeFakeWs();
+
+    await handlers.onOpen({}, ws as never);
+
+    expect(checkVncConsentGate).toHaveBeenCalledWith('dev-1');
+    expect(ws.close).toHaveBeenCalledWith(4001, expect.stringMatching(/consent/i));
+    expect(ws.send).not.toHaveBeenCalledWith(
+      JSON.stringify({ type: 'connected', tunnelId: 'tunnel-1' }),
+    );
+  });
+
   it('does not reactivate or notify connected after lease loss during a DB read', async () => {
     vi.useFakeTimers();
     let plainSelectCount = 0;
@@ -416,7 +458,7 @@ describe('revalidateTunnelSession', () => {
 
   it('revokes when the tunnel session no longer belongs to the user', async () => {
     setJoinRow({
-      session: { userId: 'someone-else', status: 'active', deviceId: 'dev-1' },
+      session: { userId: 'someone-else', status: 'active', deviceId: 'dev-1', createdAt: new Date() },
       device: { id: 'dev-1', status: 'online' },
     });
     const result = await revalidateTunnelSession('tunnel-1', liveConn);
@@ -426,7 +468,7 @@ describe('revalidateTunnelSession', () => {
 
   it('revokes when the session has been ended/disconnected elsewhere', async () => {
     setJoinRow({
-      session: { userId: 'user-1', status: 'disconnected', deviceId: 'dev-1' },
+      session: { userId: 'user-1', status: 'disconnected', deviceId: 'dev-1', createdAt: new Date() },
       device: { id: 'dev-1', status: 'online' },
     });
     const result = await revalidateTunnelSession('tunnel-1', liveConn);
@@ -435,7 +477,7 @@ describe('revalidateTunnelSession', () => {
 
   it('revokes when the device has gone offline/quarantined', async () => {
     setJoinRow({
-      session: { userId: 'user-1', status: 'active', deviceId: 'dev-1' },
+      session: { userId: 'user-1', status: 'active', deviceId: 'dev-1', createdAt: new Date() },
       device: { id: 'dev-1', status: 'offline' },
     });
     const result = await revalidateTunnelSession('tunnel-1', liveConn);
@@ -455,7 +497,7 @@ describe('revalidateTunnelSession', () => {
 
   it('checks the proxy capability for proxy tunnels', async () => {
     setJoinRow({
-      session: { userId: 'user-1', status: 'active', deviceId: 'dev-1', orgId: 'org-1', type: 'proxy' },
+      session: { userId: 'user-1', status: 'active', deviceId: 'dev-1', orgId: 'org-1', type: 'proxy', createdAt: new Date() },
       device: { id: 'dev-1', orgId: 'org-1', status: 'online', agentId: 'agent-1' },
     });
     vi.mocked(checkRemoteAccess).mockResolvedValue({ allowed: false, reason: 'Disabled by policy' });
@@ -519,6 +561,27 @@ describe('enforceTunnelRevocation', () => {
       expect.objectContaining({ type: 'tunnel_close', payload: { tunnelId: 'tunnel-1' } }),
     );
     expect(revokeViewerSession).toHaveBeenCalledWith('tunnel-1');
+  });
+
+  it('closes an open VNC relay 4003 once the device\'s prompt policy switches to consent', async () => {
+    const ws = makeFakeWs();
+    registerLiveConnection('tunnel-1', ws);
+    expect(await enforceTunnelRevocation('tunnel-1', ws as never)).toBe(false);
+
+    checkVncConsentGate.mockResolvedValue({
+      ok: false,
+      status: 409,
+      body: { error: 'consent', code: 'CONSENT_REQUIRED_TRANSPORT_UNAVAILABLE' },
+    });
+    const closed = await enforceTunnelRevocation('tunnel-1', ws as never);
+
+    expect(closed).toBe(true);
+    expect(checkVncConsentGate).toHaveBeenCalledWith('dev-1');
+    expect(ws.close).toHaveBeenCalledWith(4003, 'Access revoked');
+    expect(sendCommandToAgent).toHaveBeenCalledWith(
+      'agent-1',
+      expect.objectContaining({ type: 'tunnel_close', payload: { tunnelId: 'tunnel-1' } }),
+    );
   });
 
   it('still closes the exact socket when viewer revocation persistence fails', async () => {
@@ -593,7 +656,7 @@ describe('enforceTunnelRevocation', () => {
     // Redis flag clear, but revalidateTunnelSession returns not-ok.
     vi.mocked(isViewerSessionRevoked).mockResolvedValue(false);
     setJoinRow({
-      session: { userId: 'user-1', status: 'active', deviceId: 'dev-1' },
+      session: { userId: 'user-1', status: 'active', deviceId: 'dev-1', createdAt: new Date() },
       device: { id: 'dev-1', status: 'offline' },
     });
     const ws = makeFakeWs();

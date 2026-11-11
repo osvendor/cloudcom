@@ -2,10 +2,12 @@ import { Context, Next } from 'hono';
 import { HTTPException } from 'hono/http-exception';
 import { createHash, timingSafeEqual } from 'crypto';
 import { and, eq, isNull } from 'drizzle-orm';
-import { db, withDbAccessContext, withSystemDbAccessContext } from '../db';
+import { db, withDbAccessContext, withDbTransaction, withSystemDbAccessContext } from '../db';
 import { devices, organizations } from '../db/schema';
 import { getRedis, rateLimiter } from '../services';
-import { type AgentTokenSuspendReason } from '../services/agentTokenSuspension';
+import { isolationBlocksTokenSuspension, type AgentTokenSuspendReason } from '../services/agentTokenSuspension';
+import { assertNoUnresolvedIsolation, findUnresolvedIsolations, NetworkIsolationUnresolvedError, type UnresolvedIsolation } from '../services/networkIsolation/lifecycle';
+import { captureMessage } from '../services/sentry';
 import { enforceAgentCertificateBinding, readAgentCertificateAssertion } from '../services/agentCertificateBinding';
 import { createAuditLogAsync } from '../services/auditService';
 import { getTrustedClientIp, rateLimitIpKey } from '../services/clientIp';
@@ -15,18 +17,39 @@ import {
   checkDeviceTokenSuspension,
 } from './deviceCredentialLifecycle';
 import { isDeviceUninstallDraining } from '../services/deviceUninstallDrain';
+import { checkAgentStorageSessionRateLimit } from '../services/agentStorageSessionRateLimit';
+import { DRAIN_CLAIM_TYPE_ALLOWLIST } from '../services/drainClaimAllowlist';
+import { isUnassignedPoolOrgType } from '../services/unassignedPool/orgType';
+import { CORE_AGENT_ACTION_INDEX, isCoreAgentPath } from './agentCorePath';
+import { isParkedAllowedAgentPath, PARKED_DEVICE_REFUSAL } from './agentAuthParked';
+import { agentAuthNegativeCache, type AgentAuthTerminalRejection } from './agentAuthNegativeCache';
+import { staleAgentCredentialRejection, terminalAgentAuthRejection } from './agentAuthRejection';
+
+export { staleAgentCredentialRejection };
+import { bufferAgentRequestBody } from './agentRequestBody';
 import {
   AGENT_ORG_RATE_WINDOW_SECONDS,
   computeReservedIngestLimit,
   isReservedIngestPath,
   resolveOrgRateLimit,
 } from '../services/agentOrgRateLimit';
+import { ownDeviceRowChangedHands, updateOwnDeviceRow, type OwnDeviceRowIdentity } from '../services/agentOwnDeviceRow';
+import { recordAgentCredentialUse } from '../services/agentCredentialUse';
 
 export interface AgentAuthContext {
   deviceId: string;
   agentId: string;
   orgId: string;
   siteId: string;
+  /**
+   * #8318 §6.4 — `devices.install_incarnation` as read by the row this
+   * request authenticated against. Every command claim and result acceptance
+   * on this request takes a row only when its stamp equals this value AND the
+   * device's current incarnation, so a request the previous install
+   * authenticated just before a reattach confirm never claims or completes
+   * the new install's work.
+   */
+  installIncarnation: number;
   /**
    * #4673 W02 — the partner (MSP) that OWNS this device's organization,
    * resolved by the device auth select's join to `organizations`.
@@ -84,6 +107,17 @@ export interface AgentAuthContext {
    */
   deviceUninstallDraining?: boolean;
   /**
+   * True when the device's org is its partner's holding org (a "parked"
+   * device).
+   * The middleware has already restricted the route surface to the positive
+   * allowlist in ./agentAuthParked.ts, and narrowed `claimTypeAllowlist` to
+   * `self_uninstall`; the heartbeat returns its minimal parked beat.
+   *
+   * Optional at the type level only so hand-built agent contexts in tests keep
+   * typechecking; the real middleware always sets it.
+   */
+  isPreAssignment?: boolean;
+  /**
    * The ONE derived command-type allowlist for every `device_commands` claim
    * site on this request. `undefined` means unrestricted — which is also
    * `claimPendingCommandsForDevice`'s default for a missing `typeAllowlist`,
@@ -108,12 +142,12 @@ declare module 'hono' {
 
 // 120 requests per 60-second window per agent
 const AGENT_RATE_LIMIT = 120;
-const AGENT_RATE_WINDOW_SECONDS = 60;
+export const AGENT_RATE_WINDOW_SECONDS = 60;
 // Task 19: per-(agent, source-IP) bucket. A stolen token used from a second
 // IP can no longer eat the legit agent's 120/min budget — it has its own
 // smaller 30/min ceiling, and the legit agent keeps its own.
 const AGENT_PER_IP_RATE_LIMIT = 30;
-const AGENT_PER_IP_RATE_WINDOW_SECONDS = 60;
+export const AGENT_PER_IP_RATE_WINDOW_SECONDS = 60;
 // Dedup TTL for `agent.source.ip.changed` audits: log a given (device, IP)
 // pair at most once per day so noisy mobile/roaming agents don't drown ops
 // in events.
@@ -268,34 +302,95 @@ export function isAgentTokenRotationDue(tokenIssuedAt: Date | null | undefined, 
 }
 
 /**
+ * What `suspendAgentToken` did:
+ * - `suspended`: this call stamped the suspension;
+ * - `unchanged`: nothing to write — already suspended (the write is
+ *   idempotent), or the row is no longer visible;
+ * - `stale_caller`: the row now carries another `agent_id` than the socket
+ *   authenticated as (#8318 §6.4: a reattach confirm or an in-place re-enroll
+ *   after the socket opened). Nothing was suspended, and the row belongs to a
+ *   different install;
+ * - `isolation_unresolved`: a non-forced suspension would cut off recovery;
+ * - `failed`: the write threw (logged here).
+ */
+export type AgentTokenSuspendOutcome = 'suspended' | 'unchanged' | 'stale_caller' | 'isolation_unresolved' | 'failed';
+
+/**
  * Task 18: Persistently suspend an agent token. Called when the WS layer
  * detects a cross-tenant probe pattern (token spraying foreign session IDs).
- * Idempotent — only writes on the first call per device.
+ * Idempotent — only writes on the first call per device. Never rejects.
  *
  * Unsuspending requires manual operator action (clear the columns directly
  * or via a future admin endpoint); the agent will retry forever and produce
  * a loud reconnect-loop signal that surfaces the suspension to ops.
  */
-export async function suspendAgentToken(deviceId: string, reason: AgentTokenSuspendReason): Promise<void> {
+export async function suspendAgentToken(
+  agent: OwnDeviceRowIdentity,
+  reason: AgentTokenSuspendReason,
+): Promise<AgentTokenSuspendOutcome> {
+  const isolationBlocks = isolationBlocksTokenSuspension(reason);
+  let forcedIsolations: UnresolvedIsolation[] = [];
+  let outcome: AgentTokenSuspendOutcome;
   try {
-    await withSystemDbAccessContext(async () => {
-      await db
-        .update(devices)
-        .set({
+    outcome = await withSystemDbAccessContext(async (): Promise<AgentTokenSuspendOutcome> => {
+      if (isolationBlocks) {
+        await assertNoUnresolvedIsolation(db, { deviceId: agent.deviceId }, 'suspend_agent_token');
+      }
+      // #8318 §6.4: bound to the identity the socket authenticated as, so a
+      // probe from a superseded install cannot suspend the row's new owner.
+      const suspended = await updateOwnDeviceRow(
+        db,
+        agent,
+        {
           agentTokenSuspendedAt: new Date(),
           agentTokenSuspendedReason: reason.slice(0, 100),
-        })
-        .where(and(eq(devices.id, deviceId), isNull(devices.agentTokenSuspendedAt)));
+        },
+        { where: isNull(devices.agentTokenSuspendedAt) },
+      );
+      if (suspended.length > 0) {
+        // The identity-bound UPDATE holds the device lock until this context
+        // commits, serializing this lookup with isolation start.
+        if (!isolationBlocks) {
+          try {
+            // A failed warning query must roll back only its savepoint, never the
+            // security suspension already written in the outer transaction.
+            forcedIsolations = await withDbTransaction(() => findUnresolvedIsolations(db, { deviceId: agent.deviceId }));
+          } catch {
+            console.warn('[agentAuth] Forced suspension isolation warning lookup failed', { deviceId: agent.deviceId });
+          }
+        }
+        return 'suspended';
+      }
+      return (await ownDeviceRowChangedHands(db, agent)) ? 'stale_caller' : 'unchanged';
     });
   } catch (err) {
+    if (err instanceof NetworkIsolationUnresolvedError) {
+      console.warn('[agentAuth] Credential suspension refused: network isolation unresolved', {
+        deviceId: agent.deviceId, isolationIds: err.isolations.map(row => row.isolationId),
+      });
+      return 'isolation_unresolved';
+    }
     // Best-effort: the auth gate is the source of truth. A failed suspension
     // write just means the next probe will try again.
     console.error('[agentAuth] suspendAgentToken failed', {
-      deviceId,
+      deviceId: agent.deviceId,
       reason,
       err: err instanceof Error ? err.message : String(err),
     });
+    return 'failed';
   }
+  if (forcedIsolations.length > 0) {
+    console.warn('[agentAuth] Forced credential suspension: network isolation recovery is now bounded by expiry and the offline code', {
+      deviceId: agent.deviceId, isolationIds: forcedIsolations.map(row => row.isolationId),
+    });
+    for (const row of forcedIsolations) {
+      captureMessage('Forced credential suspension: network isolation recovery is now bounded by expiry and the offline code', {
+        eventCode: 'network_isolation_forced_token_suspension', level: 'warning',
+        tags: { deviceId: row.deviceId, isolationId: row.isolationId },
+      });
+    }
+  }
+  return outcome;
 }
 
 /**
@@ -335,6 +430,19 @@ export async function suspendAgentToken(deviceId: string, reason: AgentTokenSusp
  * that outer transaction, so the route opts out and the handler opens ONE
  * org-scoped context of its own around all of its DB work, after the limiter
  * has decided (see routes/agents/elevationRequests.ts).
+ *
+ * `pam/reconciliation-bindings` (#6260) is the SAME #1105 shape as
+ * elevation-requests, split out of #6258 because it is a TWO-segment action
+ * (`/api/v1/agents/<agentId>/pam/reconciliation-bindings`), which this single-
+ * segment set cannot express — see SELF_MANAGED_DB_CONTEXT_TWO_SEGMENT_ACTIONS
+ * below instead.
+ *
+ * `monitoring-results` is here because its per-result failure-counter loop
+ * (one Redis round trip pair per reported watch, plus an event publish) ran
+ * inside the request-long wrap, pinning a pooled connection idle-in-
+ * transaction for the whole loop. The handler now opens ONE short org-scoped
+ * context for the device read + insert and runs the Redis work after it has
+ * been released (see routes/agents/heartbeat.ts).
  */
 const SELF_MANAGED_DB_CONTEXT_ACTIONS = new Set([
   'heartbeat',
@@ -342,7 +450,51 @@ const SELF_MANAGED_DB_CONTEXT_ACTIONS = new Set([
   'commands',
   'eventlogs',
   'elevation-requests',
+  // M2 #5998 review: the UniFi topology companion ingest (POST) and the
+  // collector topology advertisement (GET) resolve topology flags — a
+  // partner-axis read on a second pooled connection — BEFORE their own short
+  // system transactions (routes/agents/unifiTelemetry.ts). Inside the
+  // request-long org wrap the ingest held topology_site_state row locks while
+  // reaching for that second connection: the #6671 wedge shape.
+  'unifi-telemetry',
+  'unifi-collectors',
+  'monitoring-results',
+  // #8318 wave 1b: phase 1 of the reattach rebind runs a per-agent rate
+  // limit (Redis), the provider call for the target's next certificate, and
+  // its own system transactions (routes/agents/rebind.ts); none of that may
+  // run inside a request-long org transaction (#1105).
+  'rebind',
 ]);
+
+/**
+ * The multi-segment counterpart to SELF_MANAGED_DB_CONTEXT_ACTIONS, for core
+ * agent actions shaped `/api/v1/agents/<agentId>/<segment0>/<segment1>` that
+ * self-manage their own DB context instead of relying on the request-long
+ * wrap. Each entry is the ordered pair of segments after `<agentId>`.
+ *
+ * `pam/reconciliation-bindings` (#6260) — `consumePamReconciliationRateLimit`'s
+ * per-device Redis round-trip (routes/agents/pamReconciliation.ts) ran inside
+ * the request-long wrap, the same #1105 shape as elevation-requests. The
+ * handler now opens its own org-scoped context after the limiter decides.
+ */
+const SELF_MANAGED_DB_CONTEXT_TWO_SEGMENT_ACTIONS: ReadonlyArray<readonly [string, string]> = [
+  ['pam', 'reconciliation-bindings'],
+  // #9517: the elevation-unable report runs its per-device rate limit (a Redis
+  // round-trip) before opening its own org-scoped context, and expires the
+  // request's mobile approval rows in system scope after that context exits —
+  // the same #1105 shape as reconciliation-bindings.
+  ['pam', 'elevation-unable'],
+  // M2 #5998 D14: parses a 4 MiB adjacency body and resolves topology flags
+  // (a partner-axis read) BEFORE its own short org-scoped admission
+  // transaction; a request-long wrap would hold a pooled connection across
+  // both and re-open the #6671 two-connection shape.
+  ['topology', 'adjacency'],
+  // #10190 W03: the prompt logo. On a cache miss the handler may fetch the
+  // MSP's https logo (routes/agents/promptIdentityLogo.ts), which must never
+  // run inside the request-long org transaction (#1105); its DB read is one
+  // short system context keyed by the authenticated device's org.
+  ['prompt-identity', 'logo'],
+];
 
 /**
  * Single-segment actions allowed during a TENANT (`offboarding`) drain:
@@ -431,67 +583,11 @@ const BOTH_DRAINS_ALLOWED_ACTIONS = new Set(
 );
 
 /**
- * The ONLY command type a drained agent — tenant-offboarding (#2774) or
- * device-remove (#3986) — may claim, ack, or have delivered.
- *
- * Exported so no handler has to restate the literal. `claimPendingCommandsForDevice`'s
- * `typeAllowlist` parameter is OPTIONAL and defaults to unrestricted, so every
- * restatement is a place a future edit can silently drop the narrowing and
- * hand a departing (or removed) machine the full command surface. There is
- * exactly one definition, surfaced on the agent context as `claimTypeAllowlist`.
+ * The ONLY command type a drained (or parked) agent may claim, ack, or have
+ * delivered. Defined in a dependency-free leaf so the command-insert
+ * chokepoint can share it; re-exported here for the existing importers.
  */
-export const DRAIN_CLAIM_TYPE_ALLOWLIST = ['self_uninstall'] as const;
-
-/**
- * The CORE agent mount, as absolute leading path segments.
- *
- * `index.ts` mounts `app.route('/api/v1', api)` and `api.route('/agents', agentRoutes)`,
- * so every core agent route is exactly `/api/v1/agents/<agentId>/...`.
- * `agentAuth.test.ts` pins this against those two mount lines in `index.ts`, so
- * a mount move is caught by a unit test rather than by drain mode silently
- * refusing the whole fleet.
- */
-const CORE_AGENT_MOUNT_SEGMENTS = ['api', 'v1', 'agents'] as const;
-
-/**
- * True when `pathSegments` is EXACTLY `/api/v1/agents/<agentId>/…` with
- * `expectedLength` segments in total.
- *
- * ABSOLUTE anchoring — indexed from the FRONT, with an exact length. The
- * previous implementation indexed from the END (`at(3) === 'agents'`), which
- * matched any path whose TAIL happened to look like `agents/<id>/<action>`.
- * That was a real hole with a false comment on it: this middleware also serves
- * the extension gateway, which mounts agent routes at `<prefix>/agent/<id>/*`
- * (singular) and at `/api/v1/<routeNamespace>/agent/<id>/*`, and extension
- * route paths are copied verbatim with no validation
- * (extensions/contributionRegistry.ts). A crafted request such as
- *
- *   /api/v1/ext/acme/agent/<id>/agents/<id>/rotate-token
- *
- * has a matching tail and would have joined the drain surface. Nothing shipped
- * registers such a route today, but the AGENT supplies the tail, so it needed
- * no extension-author complicity — and the old comment claiming "no extension
- * route can join the drain surface" is exactly what would have licensed
- * someone to write one.
- *
- * Fails CLOSED in both directions: an unrecognised shape is refused during a
- * drain, and if the core mount ever moves, drain mode blocks rather than
- * admits.
- */
-function isCoreAgentPath(
-  pathSegments: string[],
-  agentId: string,
-  expectedLength: number,
-): boolean {
-  if (pathSegments.length !== expectedLength) return false;
-  for (const [index, segment] of CORE_AGENT_MOUNT_SEGMENTS.entries()) {
-    if (pathSegments[index] !== segment) return false;
-  }
-  return pathSegments[CORE_AGENT_MOUNT_SEGMENTS.length] === agentId;
-}
-
-/** Index of the `<action>` segment in `/api/v1/agents/<agentId>/<action>`. */
-const CORE_AGENT_ACTION_INDEX = CORE_AGENT_MOUNT_SEGMENTS.length + 1;
+export { DRAIN_CLAIM_TYPE_ALLOWLIST };
 
 /**
  * #2774 / #3986 — the narrowed agent surface during a drain window.
@@ -570,6 +666,21 @@ export async function agentAuthMiddleware(c: Context, next: Next) {
 
   const tokenHash = createHash('sha256').update(token).digest('hex');
 
+  // #8050 — a credential that was TERMINALLY rejected within the last TTL is
+  // refused again here, before any DB/Redis work, with the identical response.
+  // Keyed on (agentId, tokenHash): a forged token only ever caches the
+  // forger's own key, so this can never lock a legitimate agent out. Only the
+  // rejections passed to `rejectTerminally` below are ever stored — rate
+  // limits, drain/parked refusals, quarantine, cert binding and errors are not.
+  const cachedRejection = agentAuthNegativeCache.lookup('rest', agentId, tokenHash);
+  if (cachedRejection) {
+    throw terminalAgentAuthRejection(cachedRejection);
+  }
+  const rejectTerminally = (kind: AgentAuthTerminalRejection): HTTPException => {
+    agentAuthNegativeCache.remember('rest', agentId, tokenHash, kind);
+    return terminalAgentAuthRejection(kind);
+  };
+
   // Authentication must work even when tenant RLS is deny-by-default.
   // Use system DB context for lookup, then scope all downstream queries to the device org.
   const device = await withSystemDbAccessContext(async () => {
@@ -592,6 +703,9 @@ export async function agentAuthMiddleware(c: Context, next: Next) {
         agentTokenSuspendedAt: devices.agentTokenSuspendedAt,
         hostname: devices.hostname,
         lastSeenIp: devices.lastSeenIp,
+        // #8318 §6.4: the incarnation this request authenticates under, read
+        // with the row it authenticates against.
+        installIncarnation: devices.installIncarnation,
         // #4673 W02 — the owning MSP, for `currentPartnerId`. An INNER join is
         // correct rather than a LEFT one: `devices.org_id` and
         // `organizations.partner_id` are both NOT NULL with an FK between them,
@@ -599,6 +713,9 @@ export async function agentAuthMiddleware(c: Context, next: Next) {
         // authenticate at all. A LEFT join would instead hand that device a
         // NULL partner and silently degrade it to the pre-W02 blind behaviour.
         partnerId: organizations.partnerId,
+        // Pre-assignment admission: a device in its partner's holding org is
+        // admitted to the parked allowlist only (see the gate below).
+        organizationType: organizations.type,
       })
       .from(devices)
       .innerJoin(organizations, eq(organizations.id, devices.orgId))
@@ -608,27 +725,21 @@ export async function agentAuthMiddleware(c: Context, next: Next) {
   });
 
   if (!device) {
-    throw new HTTPException(401, { message: 'Invalid agent credentials' });
+    throw rejectTerminally('device_not_found');
   }
 
   // Task 18: suspended tokens fail closed. We do NOT leak the suspension
   // reason in the response — a compromised agent should see the same 401
   // as a stale token.
   if (checkDeviceTokenSuspension(device)) {
-    throw new HTTPException(401, { message: 'Invalid agent credentials' });
+    throw rejectTerminally('token_suspended');
   }
 
   // A device row exists but neither token hash is populated — this is the
   // pre-hashed-token migration state. Surface a distinct error so the agent
   // can prompt for re-enrollment instead of silently retrying forever.
   if (!device.agentTokenHash && !device.watchdogTokenHash) {
-    throw new HTTPException(401, {
-      message: 'Re-enrollment required: device predates token-hash migration',
-      res: new Response(
-        JSON.stringify({ error: 'Re-enrollment required', code: 're_enrollment_required' }),
-        { status: 401, headers: { 'content-type': 'application/json' } },
-      ),
-    });
+    throw rejectTerminally('re_enrollment_required');
   }
 
   const match = matchRoleScopedAgentTokenHash({
@@ -644,7 +755,7 @@ export async function agentAuthMiddleware(c: Context, next: Next) {
     tokenHash,
   });
   if (!match) {
-    throw new HTTPException(401, { message: 'Invalid agent credentials' });
+    throw rejectTerminally('token_mismatch');
   }
 
   // #3986 Layer 1 — a removed device is STILL denied by default. The single
@@ -691,15 +802,45 @@ export async function agentAuthMiddleware(c: Context, next: Next) {
   // shapes below stay this ingress's own.
   const statusDenial = checkDeviceStatus(device, { allowDecommissioned: deviceUninstallDraining });
   if (statusDenial) {
-    throw new HTTPException(403, {
-      message:
-        statusDenial.reason === 'decommissioned'
-          ? 'Device has been decommissioned'
-          : 'Device is quarantined pending admin approval',
-    });
+    // #8050 — only `decommissioned` is terminal (and reaching it here already
+    // means NOT draining: a draining device is allowed through above).
+    // Quarantine is NOT cached: an admin approval must take effect at once.
+    if (statusDenial.reason === 'decommissioned') {
+      throw rejectTerminally('decommissioned');
+    }
+    throw new HTTPException(403, { message: 'Device is quarantined pending admin approval' });
   }
 
   const redis = getRedis();
+
+  const pathSegments = (c.req.path ?? '').split('/').filter(Boolean);
+  // Brokered storage sessions (`storage-sessions/<sessionId>/<op>` and the
+  // `…/object` compatibility read). ABSOLUTELY anchored like every other
+  // path-class decision here, so an extension route with the same tail does
+  // not qualify.
+  const isStorageSessionPath =
+    isCoreAgentPath(pathSegments, agentId, CORE_AGENT_ACTION_INDEX + 3)
+    && pathSegments[CORE_AGENT_ACTION_INDEX] === 'storage-sessions';
+
+  // Storage-session calls are metered by their own per-session, per-device and
+  // per-org windows (services/agentStorageSessionRateLimit.ts) INSTEAD of the general
+  // per-(agent, source-IP), per-agent and per-org buckets below. A brokered
+  // transfer makes one call per multipart part or small file; charged to the
+  // general buckets it exhausted them within a minute and the agent's own
+  // heartbeats were refused along with it, taking the device offline. Only the
+  // rate accounting differs: the credential checks above and the session
+  // token, device binding and budget checks in the handlers are unchanged.
+  if (isStorageSessionPath) {
+    const storageCheck = await checkAgentStorageSessionRateLimit(redis, {
+      orgId: device.orgId,
+      deviceId: device.id,
+      sessionId: pathSegments[CORE_AGENT_ACTION_INDEX + 1] ?? '',
+    });
+    if (!storageCheck.allowed) {
+      c.header('Retry-After', String(storageCheck.retryAfterSeconds));
+      return c.json({ error: 'storage_session_rate_limit_exceeded' }, 429);
+    }
+  }
 
   // Task 19: per-(agent, source-IP) rate limit. A stolen token used from a
   // second IP can't drain the legit agent's per-agent quota — each IP gets
@@ -711,16 +852,24 @@ export async function agentAuthMiddleware(c: Context, next: Next) {
     // so a stolen token can't mint a fresh per-IP bucket per request by walking
     // the low 64 bits of a subnet it already owns. `sourceIp` below stays raw —
     // the IP-change audit signal needs the real address.
-    const perIpKey = `agent_rate_ip:${device.id}:${rateLimitIpKey(sourceIp)}`;
-    const perIpCheck = await rateLimiter(
-      redis,
-      perIpKey,
-      AGENT_PER_IP_RATE_LIMIT,
-      AGENT_PER_IP_RATE_WINDOW_SECONDS,
-    );
-    if (!perIpCheck.allowed) {
-      c.header('Retry-After', String(Math.ceil((perIpCheck.resetAt.getTime() - Date.now()) / 1000)));
-      throw new HTTPException(429, { message: 'Agent per-source-IP rate limit exceeded' });
+    if (!isStorageSessionPath) {
+      const perIpKey = `agent_rate_ip:${device.id}:${rateLimitIpKey(sourceIp)}`;
+      // refundOnReject: a refused request is taken back out of the window, so
+      // an agent that retries while throttled does not keep itself throttled
+      // and the Retry-After below is when room actually returns. Admitted
+      // volume per (agent, IP) is still capped at the limit.
+      const perIpCheck = await rateLimiter(
+        redis,
+        perIpKey,
+        AGENT_PER_IP_RATE_LIMIT,
+        AGENT_PER_IP_RATE_WINDOW_SECONDS,
+        1,
+        { refundOnReject: true },
+      );
+      if (!perIpCheck.allowed) {
+        c.header('Retry-After', String(Math.ceil((perIpCheck.resetAt.getTime() - Date.now()) / 1000)));
+        throw new HTTPException(429, { message: 'Agent per-source-IP rate limit exceeded' });
+      }
     }
 
     // Task 19: detect source-IP changes. The legit agent typically lives at
@@ -774,94 +923,109 @@ export async function agentAuthMiddleware(c: Context, next: Next) {
     // a machine collecting its own uninstall. It is NOT a liveness signal —
     // `last_seen_at` is, and that one is guarded on terminal status in the
     // heartbeat handler, so the device still reads as Removed in the UI.
+    //
+    // #8318 §6.4: bound to the identity that authenticated (id + agent_id), so
+    // a request the previous install authenticated just before a reattach
+    // confirm matches 0 rows instead of stamping the new install's row.
     if (device.lastSeenIp !== sourceIp) {
       void withSystemDbAccessContext(async () => {
-        await db
-          .update(devices)
-          .set({ lastSeenIp: sourceIp })
-          .where(eq(devices.id, device.id));
+        await updateOwnDeviceRow(db, { deviceId: device.id, agentId: device.agentId }, { lastSeenIp: sourceIp });
       }).catch((err) => {
         console.error('[agentAuth] last_seen_ip update failed:', err);
       });
     }
   }
 
-  // Rate limiting per agent
-  const rateKey = `agent_rate:${agentId}`;
-  const rateCheck = await rateLimiter(redis, rateKey, AGENT_RATE_LIMIT, AGENT_RATE_WINDOW_SECONDS);
+  // General agent buckets (per agent, then per org). Storage-session calls
+  // were already metered above and never draw on these.
+  if (!isStorageSessionPath) {
+    // Rate limiting per agent
+    const rateKey = `agent_rate:${agentId}`;
+    // refundOnReject, as for the per-IP bucket above.
+    const rateCheck = await rateLimiter(
+      redis,
+      rateKey,
+      AGENT_RATE_LIMIT,
+      AGENT_RATE_WINDOW_SECONDS,
+      1,
+      { refundOnReject: true },
+    );
 
-  if (!rateCheck.allowed) {
-    c.header('Retry-After', String(Math.ceil((rateCheck.resetAt.getTime() - Date.now()) / 1000)));
-    throw new HTTPException(429, { message: 'Agent rate limit exceeded' });
-  }
+    if (!rateCheck.allowed) {
+      c.header('Retry-After', String(Math.ceil((rateCheck.resetAt.getTime() - Date.now()) / 1000)));
+      throw new HTTPException(429, { message: 'Agent rate limit exceeded' });
+    }
 
-  // Rate limiting per org (applied AFTER per-agent so we don't bill the org bucket
-  // for requests that already failed the per-agent check). Protects against a
-  // large fleet on one MSP saturating shared resources via the per-agent budget.
-  const orgRateKey = `agent_org_rate:${device.orgId}`;
-  const orgLimit = await resolveOrgRateLimit(redis, device.orgId);
-  const orgRateCheck = await rateLimiter(
-    redis,
-    orgRateKey,
-    orgLimit,
-    AGENT_ORG_RATE_WINDOW_SECONDS,
-  );
+    // Rate limiting per org (applied AFTER per-agent so we don't bill the org bucket
+    // for requests that already failed the per-agent check). Protects against a
+    // large fleet on one MSP saturating shared resources via the per-agent budget.
+    const orgRateKey = `agent_org_rate:${device.orgId}`;
+    const orgLimit = await resolveOrgRateLimit(redis, device.orgId);
+    const orgRateCheck = await rateLimiter(
+      redis,
+      orgRateKey,
+      orgLimit,
+      AGENT_ORG_RATE_WINDOW_SECONDS,
+    );
 
-  if (!orgRateCheck.allowed) {
-    // #2728 — reserved lane. The org bucket is shared with no per-device
-    // fairness, so a fleet of chatty heartbeats can drain it and starve the
-    // once-per-24h patch/inventory uploads that carry operator-facing posture.
-    // Those uploads are far too infrequent to be a load source themselves, so
-    // when the main bucket is exhausted we still admit them from a smaller
-    // reserved bucket. Only consulted on the overflow path, so the steady-state
-    // request path pays no extra Redis round-trip.
-    const reserved = isReservedIngestPath(c.req.path);
-    const reservedCheck = reserved
-      ? await rateLimiter(
-          redis,
-          `agent_org_rate_reserved:${device.orgId}`,
-          computeReservedIngestLimit(orgLimit),
-          AGENT_ORG_RATE_WINDOW_SECONDS,
-        )
-      : null;
+    if (!orgRateCheck.allowed) {
+      // #2728 — reserved lane. The org bucket is shared with no per-device
+      // fairness, so a fleet of chatty heartbeats can drain it and starve the
+      // once-per-24h patch/inventory uploads that carry operator-facing posture.
+      // Those uploads are far too infrequent to be a load source themselves, so
+      // when the main bucket is exhausted we still admit them from a smaller
+      // reserved bucket. Only consulted on the overflow path, so the steady-state
+      // request path pays no extra Redis round-trip.
+      const reserved = isReservedIngestPath(c.req.path);
+      const reservedCheck = reserved
+        ? await rateLimiter(
+            redis,
+            `agent_org_rate_reserved:${device.orgId}`,
+            computeReservedIngestLimit(orgLimit),
+            AGENT_ORG_RATE_WINDOW_SECONDS,
+          )
+        : null;
 
-    if (!reservedCheck?.allowed) {
-      // Per-device detail so a stale-posture report is diagnosable from logs
-      // without new tables: which device, which org, which endpoint, and
-      // whether the reserved lane was also spent (#2728).
-      console.warn('[agentAuth] org rate limit exceeded', {
+      if (!reservedCheck?.allowed) {
+        // Per-device detail so a stale-posture report is diagnosable from logs
+        // without new tables: which device, which org, which endpoint, and
+        // whether the reserved lane was also spent (#2728).
+        console.warn('[agentAuth] org rate limit exceeded', {
+          orgId: device.orgId,
+          deviceId: device.id,
+          path: c.req.path,
+          orgLimit,
+          reservedLane: reserved ? 'exhausted' : 'not-eligible',
+        });
+        // Advertise the full window. `orgRateCheck.resetAt` is when ONE slot
+        // frees (oldest entry + window), which under sustained saturation is
+        // ~now — advertising that would tell the whole fleet to come back in a
+        // second and turn backoff into a hot loop, amplifying the very overload
+        // that caused the rejection. De-synchronizing the herd is the agent's
+        // job, via additive jitter on this value (httputil.applyPositiveJitter),
+        // not the server's job via a varying header.
+        c.header('Retry-After', String(AGENT_ORG_RATE_WINDOW_SECONDS));
+        return c.json({ error: 'org_rate_limit_exceeded' }, 429);
+      }
+
+      console.warn('[agentAuth] org rate limit exceeded — admitted via reserved ingest lane', {
         orgId: device.orgId,
         deviceId: device.id,
         path: c.req.path,
         orgLimit,
-        reservedLane: reserved ? 'exhausted' : 'not-eligible',
       });
-      // Advertise the full window. `orgRateCheck.resetAt` is when ONE slot
-      // frees (oldest entry + window), which under sustained saturation is
-      // ~now — advertising that would tell the whole fleet to come back in a
-      // second and turn backoff into a hot loop, amplifying the very overload
-      // that caused the rejection. De-synchronizing the herd is the agent's
-      // job, via additive jitter on this value (httputil.applyPositiveJitter),
-      // not the server's job via a varying header.
-      c.header('Retry-After', String(AGENT_ORG_RATE_WINDOW_SECONDS));
-      return c.json({ error: 'org_rate_limit_exceeded' }, 429);
     }
-
-    console.warn('[agentAuth] org rate limit exceeded — admitted via reserved ingest lane', {
-      orgId: device.orgId,
-      deviceId: device.id,
-      path: c.req.path,
-      orgLimit,
-    });
   }
 
   // Tenant-status gate: a suspended/churned/soft-deleted org or partner must
   // not keep authenticating its agent fleet. The device-level checks above
   // (token suspension, decommission, quarantine) don't cover the org/partner
   // lifecycle; mirror the API-key path (apiKeyAuth → getActiveOrgTenant) and
-  // fail closed. Runs after the rate limiters so a flood from an inactive
-  // tenant can't drive uncached lookups, and returns the same opaque 401 as a
-  // stale token so the agent cannot distinguish suspension from a bad token.
+  // fail closed. Runs after the rate limiters, and returns the same opaque 401
+  // as a stale token so the agent cannot distinguish suspension from a bad
+  // token. A denial here is negative-cached (#8050), so a repeat from the same
+  // credential within the TTL is refused at the top of this middleware without
+  // reaching the device lookup, the limiters or this gate again.
   //
   // #2774 — an `offboarding` tenant resolves to 'draining': still
   // authenticated (that's the whole point — self_uninstall must be
@@ -871,11 +1035,13 @@ export async function agentAuthMiddleware(c: Context, next: Next) {
   // failure and back off its heartbeat).
   const tenantVerdict = await checkDeviceTenantState(device.orgId, { allowDraining: true });
   if (tenantVerdict.denied) {
-    throw new HTTPException(401, { message: 'Invalid agent credentials' });
+    // #8050 — cached: a suspended/churned/deleted tenant is durable state, and
+    // reinstatement takes effect within the cache TTL. (A draining tenant is
+    // NOT denied here — it resolves to the narrowed surface below, uncached.)
+    throw rejectTerminally('tenant_denied');
   }
   const tenantState = tenantVerdict.tenantState;
 
-  const pathSegments = (c.req.path ?? '').split('/').filter(Boolean);
   // #3986 Layer 2 — a DEVICE drain narrows the route surface exactly as a
   // TENANT drain does. This is the layer that does the real containment work:
   // Layer 1 only decided the credential still authenticates, and without this
@@ -916,6 +1082,17 @@ export async function agentAuthMiddleware(c: Context, next: Next) {
     );
   }
 
+  // Pre-assignment: a device parked in its partner's
+  // holding org is admitted to a positive allowlist only — credential rotation
+  // and lifecycle removal. Applied AFTER the drain gate so the two compose by
+  // intersection (a request must pass both); a route that does not exist yet
+  // is refused by default. Distinct error code so the agent (and an operator
+  // reading logs) can tell "waiting for assignment" from an auth failure.
+  const isPreAssignment = isUnassignedPoolOrgType(device.organizationType);
+  if (isPreAssignment && !isParkedAllowedAgentPath(pathSegments, agentId)) {
+    return c.json(PARKED_DEVICE_REFUSAL, 403);
+  }
+
   // Security remediation Wave 5, Task 6 — shared certificate/device binding
   // decision (services/agentCertificateBinding.ts). Runs AFTER bearer/token
   // auth and the tenant-status gate, BEFORE the request is granted access.
@@ -943,11 +1120,17 @@ export async function agentAuthMiddleware(c: Context, next: Next) {
   // agent holds a durable copy of the new token and promotes pending->current.
   c.set('agentPendingTokenPresented', match.pendingTokenPresented);
 
+  // #8318 §6.5: the liveness marker the reattach confirm reads. Every gate
+  // above passed, so this credential was genuinely used. Throttled and
+  // fire-and-forget inside; never throws into the request.
+  recordAgentCredentialUse(device.id);
+
   c.set('agent', {
     deviceId: device.id,
     agentId: device.agentId,
     orgId: device.orgId,
     siteId: device.siteId,
+    installIncarnation: device.installIncarnation,
     // #4673 W02 — surfaced here (not just baked into the wrap below) because
     // the three SELF_MANAGED_DB_CONTEXT_ACTIONS routes skip that wrap and
     // hand-build their own org context; they read this to populate
@@ -967,7 +1150,11 @@ export async function agentAuthMiddleware(c: Context, next: Next) {
     // command type, because `claimPendingCommandsForDevice`'s `typeAllowlist`
     // defaults to unrestricted. `undefined` here still means unrestricted, but
     // now there is exactly one place that decides it.
-    claimTypeAllowlist: drainNarrowed ? DRAIN_CLAIM_TYPE_ALLOWLIST : undefined,
+    //
+    // A parked device takes the same narrowing: lifecycle removal
+    // (`self_uninstall`) is the only command type it may claim or ack.
+    claimTypeAllowlist: drainNarrowed || isPreAssignment ? DRAIN_CLAIM_TYPE_ALLOWLIST : undefined,
+    isPreAssignment,
   });
 
   // #1105 — high-frequency, high-concurrency routes that self-manage their DB
@@ -988,13 +1175,43 @@ export async function agentAuthMiddleware(c: Context, next: Next) {
   // silent zero-row read rather than an error. Now only the three core routes
   // that genuinely self-manage their context opt out; everything else,
   // extension routes included, keeps the wrap.
+  //
+  // #6260 — the two-segment counterpart. Same ABSOLUTE anchoring: exact
+  // length AND both segments must match, so a crafted extension tail
+  // (`.../agents/<id>/pam/reconciliation-bindings`) does not opt out either.
+  const isSelfManagedTwoSegmentAction = SELF_MANAGED_DB_CONTEXT_TWO_SEGMENT_ACTIONS.some(
+    ([segment0, segment1]) =>
+      isCoreAgentPath(pathSegments, agentId, CORE_AGENT_ACTION_INDEX + 2)
+      && pathSegments[CORE_AGENT_ACTION_INDEX] === segment0
+      && pathSegments[CORE_AGENT_ACTION_INDEX + 1] === segment1,
+  );
+  // Brokered storage sessions (isStorageSessionPath, above): write operations
+  // call object storage over the network (multipart create/complete/abort,
+  // list, delete), which must never run inside a held transaction — the
+  // handlers open one short org-scoped context per database phase
+  // (routes/agents/storageSessions.ts).
   if (
-    isCoreAgentPath(pathSegments, agentId, CORE_AGENT_ACTION_INDEX + 1)
-    && SELF_MANAGED_DB_CONTEXT_ACTIONS.has(pathSegments[CORE_AGENT_ACTION_INDEX] ?? '')
+    (
+      isCoreAgentPath(pathSegments, agentId, CORE_AGENT_ACTION_INDEX + 1)
+      && SELF_MANAGED_DB_CONTEXT_ACTIONS.has(pathSegments[CORE_AGENT_ACTION_INDEX] ?? '')
+    )
+    || isSelfManagedTwoSegmentAction
+    || isStorageSessionPath
   ) {
     await next();
     return;
   }
+
+  // #8839 — receive the WHOLE request body before the request-long org
+  // transaction opens. Routes inside the wrap parse their body (`bodyLimit` →
+  // `zValidator` → handler) after `next()`, so reading it inside the wrap held
+  // a pooled connection idle-in-transaction for as long as a stalled upload
+  // took to arrive — one tenant's misbehaving proxy drained the whole pool for
+  // everyone (2026-10-15). The auth SELECT above stays first: it is short and
+  // rejects unauthenticated uploads before any body is read. Self-managed and
+  // storage-session routes (returned above) read their own bodies, unbuffered.
+  const bodyRefusal = await bufferAgentRequestBody(c, { agentId: device.agentId, orgId: device.orgId });
+  if (bodyRefusal) return bodyRefusal;
 
   await withDbAccessContext(
     {
@@ -1021,7 +1238,11 @@ export async function agentAuthMiddleware(c: Context, next: Next) {
       // policy is FOR SELECT, it grants no write targeting: a foreign partner's
       // rows stay invisible, and UPDATE/DELETE still see only the org-owned
       // rows they saw before.
-      currentPartnerId: device.partnerId
+      //
+      // A parked device receives no configuration at all, so it does not get
+      // this read axis either: its allowed wrapped routes (token rotation,
+      // uninstall-intent) touch only its own device row.
+      currentPartnerId: isPreAssignment ? null : device.partnerId
     },
     async () => {
       await next();

@@ -200,7 +200,19 @@
     },
     "title": "Network Discovery",
     "toasts": {
-      "scanQueued": "Discovery scan queued for \"{{name}}\""
+      "scanQueued": "Discovery scan queued for \"{{name}}\"",
+      "profileCreated": "Discovery profile \"{{name}}\" created",
+      "profileUpdated": "Discovery profile \"{{name}}\" updated",
+      "profileDeleted": "Discovery profile \"{{name}}\" deleted",
+      "profileMoved": "Profile moved to {{site}}.",
+      "assetsMoved_one": "{{count}} network device moved",
+      "assetsMoved_other": "{{count}} network devices moved",
+      "agentLinksRemoved_one": "{{count}} agent link removed",
+      "agentLinksRemoved_other": "{{count}} agent links removed",
+      "monitorsReattached_one": "{{count}} monitor re-attached",
+      "monitorsReattached_other": "{{count}} monitors re-attached",
+      "topologyPoliciesDisabled_one": "{{count}} topology policy disabled",
+      "topologyPoliciesDisabled_other": "{{count}} topology policies disabled"
     },
     "days": {
       "monday": "Monday",
@@ -258,11 +270,15 @@
       "time": "Time",
       "timeout": "Timeout (ms)",
       "timezone": "Timezone",
-      "username": "Username"
+      "username": "Username",
+      "scanAgent": "Scan agent"
     },
     "options": {
       "everyHours": "Every {{count}} hours",
-      "selectSite": "Select a site..."
+      "selectSite": "Select a site...",
+      "automaticAgent": "Automatic (prefer an agent on these subnets)",
+      "agentOffline": "{{name}} (offline)",
+      "pinnedAgentUnlisted": "Pinned agent (not in this site)"
     },
     "placeholders": {
       "profileName": "Headquarters scan",
@@ -285,7 +301,8 @@
       "invalidCidr": "\"{{value}}\": not a valid CIDR range or IP address",
       "octet": "\"{{value}}\": octet value exceeds 255",
       "prefix": "\"{{value}}\": prefix length must be 0–32",
-      "subnetRequired": "At least one subnet or IP address is required."
+      "subnetRequired": "At least one subnet or IP address is required.",
+      "subnetTooLarge": "\"{{value}}\": subnet is too large. The agent skips subnets over {{limit}} addresses (larger than a /16); split it into smaller ranges"
     },
     "actions": {
       "saveProfile": "Save Profile"
@@ -295,7 +312,19 @@
       "arp": "ARP Sweep",
       "snmp": "SNMP Probe",
       "portScan": "TCP Port Scan"
-    }
+    },
+    "siteMove": {
+      "notice": "This profile will scan from the new site from now on. Devices it already discovered stay in the current site unless you move them.",
+      "moveAssets_one": "Also move the {{count}} network device this profile discovered to the new site",
+      "moveAssets_other": "Also move the {{count}} network devices this profile discovered to the new site",
+      "moveAssetsUnknown": "Also move the network devices this profile discovered to the new site"
+    },
+    "scanAgentHelp": {
+      "automatic": "An online agent in this site with an address in one of the subnets is preferred.",
+      "pinned": "Scans run only from this agent. If it is offline, the scan fails instead of using another agent.",
+      "loadError": "Could not load this site's agents. Automatic selection is still available."
+    },
+    "subnetTopologyNote": "Subnets here also identify this site's networks on the topology map."
   },
   "discoveryProfileList": {
     "actions": {
@@ -314,6 +343,8 @@
       "subnets": "Subnets"
     },
     "configuredCount": "{{count}} profiles configured",
+    "configuredCount_one": "{{count}} profile configured",
+    "configuredCount_other": "{{count}} profiles configured",
     "empty": "No discovery profiles yet. Create your first profile to start scanning.",
     "lastRun": "Last run {{time}}",
     "loading": "Loading discovery profiles...",
@@ -409,7 +440,10 @@
       "interval": "Scan interval must be between 1 and 168 hours.",
       "selectSite": "Select a site before saving."
     },
-    "configuredCount": "{{count}} baselines configured"
+    "configuredCount": "{{count}} baselines configured",
+    "configuredCount_one": "{{count}} baseline configured",
+    "configuredCount_other": "{{count}} baselines configured",
+    "subnetTopologyNote": "Subnets here also identify this site's networks on the topology map."
   },
   "networkChangeDetailModal": {
     "acknowledgeTitle": "Acknowledge Event",

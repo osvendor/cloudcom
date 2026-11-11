@@ -47,19 +47,34 @@ beforeEach(() => {
   decideIntentApproval.mockReset();
 });
 
+describe('AiApprovalDialog — standing instruction conflict banner (W06)', () => {
+  it('renders the banner with the interpolated instruction text when present', () => {
+    render(<AiApprovalDialog {...baseProps} standingInstructionConflict={{ text: "don't reboot PC-01" }} />);
+
+    const banner = screen.getByTestId('approval-standing-instruction-banner');
+    expect(banner).toHaveTextContent("Conflicts with a remembered instruction: “don't reboot PC-01”");
+  });
+
+  it('renders no banner when there is no conflict', () => {
+    render(<AiApprovalDialog {...baseProps} />);
+
+    expect(screen.queryByTestId('approval-standing-instruction-banner')).toBeNull();
+  });
+});
+
 describe('AiApprovalDialog', () => {
-  it('renders Approve/Reject buttons for a non-intent-backed (legacy Tier-2) execution', () => {
+  it('renders Approve/Deny buttons for a non-intent-backed (legacy Tier-2) execution', () => {
     render(<AiApprovalDialog {...baseProps} />);
 
     expect(screen.getByRole('button', { name: /approve/i })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /reject/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /deny/i })).toBeInTheDocument();
   });
 
   it('renders a waiting-for-an-approver state instead of a self-approve button when intentBacked', () => {
     render(<AiApprovalDialog {...baseProps} intentBacked />);
 
     expect(screen.queryByRole('button', { name: /^approve$/i })).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /^reject$/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^deny$/i })).not.toBeInTheDocument();
     expect(screen.getByText(/waiting for an approver/i)).toBeInTheDocument();
     expect(
       screen.getByText(/needs approval in the approvals area or the breeze mobile app/i),
@@ -316,6 +331,31 @@ describe('intent-backed self-approve (sole operator)', () => {
     expect(onIntentDecided).not.toHaveBeenCalled();
   });
 
+  it('refused → terminal state with the refused copy, never "approved"', async () => {
+    // The server accepted the approve but refused to apply it and denied the
+    // request. decideIntentApproval has already toasted the reason; the card
+    // must settle terminally and must not read as approved.
+    decideIntentApproval.mockResolvedValue('refused');
+    const onIntentDecided = vi.fn();
+    render(
+      <AiApprovalDialog
+        {...selfProps}
+        intentBacked
+        selfApprovalRequestId="ap-1"
+        onIntentDecided={onIntentDecided}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /approve/i }));
+    await waitFor(() => expect(screen.getByRole('alert')).toBeInTheDocument());
+    expect(screen.getByRole('alert')).toHaveTextContent(/your approval was blocked/i);
+    // The decided-approve state renders "Action approved"; a refusal never does.
+    expect(screen.queryByText(/action approved/i)).toBeNull();
+    expect(screen.queryByRole('button', { name: /approve/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /deny/i })).toBeNull();
+    // Decided (denied), so the parent may clear it — same as a 409/410.
+    expect(onIntentDecided).toHaveBeenCalledOnce();
+  });
+
   it('deny → decideIntentApproval(deny) → onIntentDecided', async () => {
     decideIntentApproval.mockResolvedValue('decided');
     const onIntentDecided = vi.fn();
@@ -436,6 +476,85 @@ describe('intent-backed self-approve (sole operator)', () => {
     expect(screen.queryByRole('button', { name: /approve/i })).toBeNull();
     expect(screen.queryByRole('button', { name: /deny/i })).toBeNull();
     expect(screen.getByText(/waiting for an approver/i)).toBeInTheDocument();
+  });
+});
+
+// #9534: a supervised self-approve runs no WebAuthn ceremony (#5600), yet the
+// button read "Verify & Approve" with a fingerprint icon. It promises a
+// verification only when one is actually required: four_eyes (or an unknown
+// scope, which decides with the ceremony) and fresh-factor tools.
+describe('self-approve button copy matches whether a verification runs (#9534)', () => {
+  const props = (toolName = 'file_operations') => ({
+    toolName,
+    description: 'Read a file',
+    input: {} as Record<string, unknown>,
+    onApprove: vi.fn<() => void>(),
+    onReject: vi.fn<() => void>(),
+    intentBacked: true,
+    selfApprovalRequestId: 'ap-1',
+    onIntentDecided: vi.fn(),
+  });
+
+  it('supervised: plain "Approve", no fingerprint icon', () => {
+    render(<AiApprovalDialog {...props()} approvalScope="supervised" />);
+    const approve = screen.getByTestId('ai-approval-approve');
+    expect(approve).toHaveTextContent(/^Approve$/);
+    expect(approve.querySelector('[class*="lucide-fingerprint"]')).toBeNull();
+  });
+
+  it('supervised: the in-flight label does not claim to wait for a verification', async () => {
+    decideIntentApproval.mockReturnValue(new Promise(() => {}));
+    render(<AiApprovalDialog {...props()} approvalScope="supervised" />);
+    fireEvent.click(screen.getByTestId('ai-approval-approve'));
+    await waitFor(() => expect(screen.getByTestId('ai-approval-approve')).toBeDisabled());
+    expect(screen.getByTestId('ai-approval-approve')).toHaveTextContent(/approving/i);
+    expect(screen.queryByText(/waiting for verification/i)).toBeNull();
+  });
+
+  it.each([
+    ['four_eyes', 'file_operations'],
+    [undefined, 'file_operations'],
+    ['supervised', 'diagnose_connectivity'],
+  ] as const)('scope %s / %s: "Verify & Approve" with the fingerprint icon', (scope, tool) => {
+    render(<AiApprovalDialog {...props(tool)} approvalScope={scope} />);
+    const approve = screen.getByTestId('ai-approval-approve');
+    expect(approve).toHaveTextContent(/verify & approve/i);
+    expect(approve.querySelector('[class*="lucide-fingerprint"]')).not.toBeNull();
+  });
+});
+
+describe('fresh approver factor (topology diagnose_connectivity, M4-D3)', () => {
+  const props = () => ({
+    toolName: 'diagnose_connectivity',
+    description: 'Run gateway reachability from core-sw-1',
+    input: { site_id: 's' } as Record<string, unknown>,
+    onApprove: vi.fn<() => void>(),
+    onReject: vi.fn<() => void>(),
+  });
+
+  it('asks the decide helper for a fresh factor on approve', async () => {
+    decideIntentApproval.mockResolvedValue('decided');
+    const onIntentDecided = vi.fn();
+    render(<AiApprovalDialog {...props()} intentBacked selfApprovalRequestId="ap-1" approvalScope="supervised" onIntentDecided={onIntentDecided} testIdPrefix="topology-proposal" />);
+    fireEvent.click(screen.getByTestId('topology-proposal-approve'));
+    await waitFor(() => expect(onIntentDecided).toHaveBeenCalled());
+    expect(decideIntentApproval).toHaveBeenCalledWith('ap-1', 'approve', undefined, 'supervised', { freshFactor: true });
+  });
+
+  it('fresh_factor_required keeps Approve available for another passkey scan and says why', async () => {
+    decideIntentApproval.mockResolvedValue('fresh_factor_required');
+    render(<AiApprovalDialog {...props()} intentBacked selfApprovalRequestId="ap-1" approvalScope="supervised" onIntentDecided={vi.fn()} testIdPrefix="topology-proposal" />);
+    fireEvent.click(screen.getByTestId('topology-proposal-approve'));
+    await waitFor(() => expect(screen.getByTestId('topology-proposal-error')).toHaveTextContent(/fresh passkey/i));
+    expect(screen.getByTestId('topology-proposal-approve')).not.toBeDisabled();
+    expect(screen.getByTestId('topology-proposal-deny')).toBeInTheDocument();
+  });
+
+  it('deny sends no fresh-factor request', async () => {
+    decideIntentApproval.mockResolvedValue('decided');
+    render(<AiApprovalDialog {...props()} intentBacked selfApprovalRequestId="ap-1" approvalScope="supervised" onIntentDecided={vi.fn()} testIdPrefix="topology-proposal" />);
+    fireEvent.click(screen.getByTestId('topology-proposal-deny'));
+    await waitFor(() => expect(decideIntentApproval).toHaveBeenCalledWith('ap-1', 'deny', undefined, 'supervised'));
   });
 });
 
@@ -580,6 +699,81 @@ describe('self-approve expiry countdown', () => {
 });
 
 /**
+ * #6475 — org-configured interactive-approval window. `approvalWindowMs`
+ * replaces the hard-coded AUTO_DENY_MS as the countdown/progress-bar
+ * denominator when the server sends one; absent, the old 5-minute behaviour
+ * is unchanged (covered by the suite above, which never sets these props).
+ */
+describe('org-configured approval window (#6475)', () => {
+  const makeLegacyProps = () => ({
+    toolName: 'file_operations',
+    description: 'Read a file',
+    input: {} as Record<string, unknown>,
+    onApprove: vi.fn<() => void>(),
+    onReject: vi.fn<() => void>(),
+  });
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('shows a ~30-minute countdown for a 30-minute approvalWindowMs, and does not auto-deny at 5 minutes', () => {
+    const props = makeLegacyProps();
+    render(<AiApprovalDialog {...props} approvalWindowMs={30 * 60 * 1000} />);
+
+    expect(screen.getByRole('timer')).toHaveTextContent('30:00');
+
+    // Past the OLD 5-minute mark: must still be counting down, not denied.
+    act(() => {
+      vi.advanceTimersByTime(5 * 60 * 1000 + 2000);
+    });
+    expect(props.onReject).not.toHaveBeenCalled();
+    expect(screen.getByRole('timer')).toHaveTextContent('24:5');
+
+    // Past the real 30-minute deadline: now it auto-denies.
+    act(() => {
+      vi.advanceTimersByTime(25 * 60 * 1000);
+    });
+    expect(props.onReject).toHaveBeenCalled();
+  });
+
+  it('anchors to approvalExpiresAt (legacy non-intent path) instead of a fresh window', () => {
+    render(
+      <AiApprovalDialog
+        {...makeLegacyProps()}
+        approvalWindowMs={30 * 60 * 1000}
+        approvalExpiresAt={new Date(Date.now() + 10 * 60 * 1000).toISOString()}
+      />,
+    );
+
+    expect(screen.getByRole('timer')).toHaveTextContent('10:00');
+  });
+
+  it('keeps the old 5-minute countdown when approvalWindowMs/approvalExpiresAt are absent', () => {
+    render(<AiApprovalDialog {...makeLegacyProps()} />);
+
+    expect(screen.getByRole('timer')).toHaveTextContent('5:00');
+  });
+
+  it('sizes the progress bar denominator to the configured window, not AUTO_DENY_MS', () => {
+    render(<AiApprovalDialog {...makeLegacyProps()} approvalWindowMs={30 * 60 * 1000} />);
+
+    expect(screen.getByRole('progressbar')).toHaveAttribute('aria-valuenow', '100');
+
+    act(() => {
+      vi.advanceTimersByTime(15 * 60 * 1000);
+    });
+    // Halfway through a 30-minute window: ~50%, not ~0% (which is what
+    // dividing by the old 5-minute AUTO_DENY_MS would floor to).
+    expect(screen.getByRole('progressbar')).toHaveAttribute('aria-valuenow', '50');
+  });
+});
+
+/**
  * #4888 — the run-context row.
  *
  * Letting an assistant choose `runAs` is a privilege decision: it can launch a
@@ -615,7 +809,7 @@ describe('AiApprovalDialog — script run context (#4888)', () => {
 
     const row = screen.getByTestId('approval-run-context');
     expect(row).toHaveTextContent(/system/i);
-    expect(row).toHaveTextContent(/chosen by the assistant/i);
+    expect(row).toHaveTextContent(/chosen by Breeze AI/i);
   });
 
   it('calls out an assistant override of the script’s saved default', () => {
@@ -656,7 +850,7 @@ describe('AiApprovalDialog — script run context (#4888)', () => {
     const row = screen.getByTestId('approval-run-context');
     expect(row).toHaveTextContent(/logged-in user/i);
     expect(row).toHaveTextContent(/saved default/i);
-    expect(row).not.toHaveTextContent(/chosen by the assistant/i);
+    expect(row).not.toHaveTextContent(/chosen by Breeze AI/i);
   });
 
   it('names the pinned Windows session for a session-targeted user run', () => {

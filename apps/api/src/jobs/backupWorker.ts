@@ -7,7 +7,9 @@
  * - process-results: Updates job/snapshot rows from agent result payload
  */
 
+import { randomUUID } from 'node:crypto';
 import { Worker, Job } from 'bullmq';
+import type { BackupFullRunReason } from '@breeze/shared';
 import * as dbModule from '../db';
 import {
   backupJobs,
@@ -24,8 +26,9 @@ import {
   sqlInstances,
 } from '../db/schema';
 import { recoveryTokens } from '../db/schema/recoveryTokens';
-import { eq, ne, and, or, desc, gt, sql, isNull, lt, inArray } from 'drizzle-orm';
-import { resolveAllBackupAssignedDevices } from '../services/featureConfigResolver';
+import { backupSnapshotAttestations } from '../db/schema/backupSnapshotAttestations';
+import { eq, ne, and, or, desc, gt, gte, sql, isNotNull, isNull, lt, inArray } from 'drizzle-orm';
+import { resolveAllBackupAssignedDevices, resolveBackupConfigForDevice } from '../services/featureConfigResolver';
 import { getBullMQConnection } from '../services/redis';
 import { dispatchCommandToAgent, isAgentConnectedAnywhere } from '../services/agentCommandRelay';
 import type { AgentCommand } from '../routes/agentWs';
@@ -45,7 +48,15 @@ import { markBackupJobFailedIfInFlight } from '../services/backupResultPersisten
 import { createScheduledBackupJobIfAbsent, deviceHelperQueues } from '../services/backupJobCreation';
 import { recordDispatchedExpectation } from '../services/agentWorkExpectation';
 import { attachWorkerObservability } from './workerObservability';
+import { recordBackupWriteDispatch } from '../services/backupMetrics';
+import { backupWriteRefusalMessage, brokerWorkerBackupPayload } from '../services/backupStorageWriteDelivery';
+import { resolveMintKeyRoot } from '../services/backupStorageWriteSessions';
+import { LEGACY_FLAT_ROOT, sameKeyRoot, snapshotKeyRootOf, type SnapshotKeyRoot } from '../services/backupKeyLayout';
+import { BACKUP_HELPER_UNREPORTED_MESSAGE, backupHelperProtocolsUnreported } from '../services/backupHelperProtocols';
+import { backupWriteHelperRefusal } from '../services/backupWriteHelperGate';
 import { captureException } from '../services/sentry';
+import { insertQueuedCommandInTransaction } from '../services/commandQueueInsert';
+import { CommandTypes } from '../services/commandTypes';
 import { createAuditLogAsync } from '../services/auditService';
 import { assertQueueJobName, parseQueueJobData } from '../services/bullmqValidation';
 import {
@@ -55,6 +66,15 @@ import {
   withQueueMeta,
 } from './queueSchemas';
 import { jobSchedule } from './scheduleRegistry';
+import { isParkedDevice, PARKED_DEVICE_CANCEL_REASON } from '../services/unassignedPool/deliveryEligibility';
+import { notHoldingOrgCondition } from '../services/unassignedPool/selectorPredicate';
+import {
+  BACKUP_MISSED_ERROR,
+  computeBackupCatchUpUntil,
+  dispatchCatchUpsForConnectedDevices,
+  expireSupersededBackupCatchUps,
+  isBackupCatchUpEnabled,
+} from './backupCatchUp';
 
 // Re-export enqueue functions for backward compatibility
 export const getBackupQueue = backupEnqueue.getBackupQueue;
@@ -116,11 +136,19 @@ function createBackupWorker(): Worker<BackupQueueJobData> {
         assertQueueJobName(BACKUP_QUEUE, job, 'cleanup-expired-snapshots');
         return await processCleanupExpiredSnapshots();
       }
+      // check-schedules is ALSO handled outside the blanket context (#6597):
+      // every job it creates is handed to the dispatch worker, which reads the
+      // row on its own connection. Created inside one sweep-long transaction,
+      // those rows were invisible until the whole sweep committed — the
+      // dispatch resolved them as pathless file backups and they sat `pending`
+      // until the stale reaper failed them. processCheckSchedules commits each
+      // org's jobs in their own short context before enqueueing them.
+      if (data.type === 'check-schedules') {
+        assertQueueJobName(BACKUP_QUEUE, job, 'check-schedules');
+        return await processCheckSchedules();
+      }
       return runWithSystemDbAccess(async () => {
         switch (data.type) {
-          case 'check-schedules':
-            assertQueueJobName(BACKUP_QUEUE, job, 'check-schedules');
-            return await processCheckSchedules();
           case 'expire-recovery-tokens':
             assertQueueJobName(BACKUP_QUEUE, job, 'expire-recovery-tokens');
             return await processExpireRecoveryTokens();
@@ -152,6 +180,7 @@ type PolicySchedule = {
   timezone?: string;
   dayOfWeek?: number;
   dayOfMonth?: number;
+  runMissedBackupsOnConnect?: boolean;
 };
 
 const SCHEDULE_LOOKBACK_MINUTES = 5;
@@ -161,9 +190,11 @@ const BACKUP_REPEATABLE_META: QueueActorMeta = {
   source: 'worker:backup:repeatable',
 };
 
-async function processCheckSchedules(): Promise<{ enqueued: number }> {
-  const now = new Date();
-
+/**
+ * Enumerate every org that has an active backup configuration policy, either
+ * org-owned or inherited from a partner-wide one.
+ */
+async function loadScheduledBackupOrgIds(): Promise<Set<string>> {
   // 1. Find all org IDs with active backup config policies
   const orgRows = await db
     .selectDistinct({ orgId: configurationPolicies.orgId })
@@ -206,7 +237,9 @@ async function processCheckSchedules(): Promise<{ enqueued: number }> {
         .from(organizations)
         .where(and(
           inArray(organizations.partnerId, partnerIds),
-          ne(organizations.type, 'quick_support')
+          ne(organizations.type, 'quick_support'),
+          // Nor the holding org: parked devices are never backed up.
+          notHoldingOrgCondition()
         ))
     : [];
 
@@ -217,90 +250,147 @@ async function processCheckSchedules(): Promise<{ enqueued: number }> {
   for (const { orgId } of partnerOrgRows) {
     orgIds.add(orgId);
   }
+  return orgIds;
+}
 
+interface ScheduledBackupJobToDispatch {
+  jobId: string;
+  configId: string;
+  deviceId: string;
+  /** #11013: how long the job may wait for an offline device; absent = it may not. */
+  catchUpUntil?: string;
+}
+
+/**
+ * Create every scheduled backup job that is due for one org. Runs inside the
+ * caller's (short, per-org) DB context and only CREATES rows — enqueueing is
+ * the caller's job, strictly after this context has committed (#6597).
+ */
+async function createDueScheduledBackupJobs(
+  orgId: string,
+  now: Date,
+): Promise<ScheduledBackupJobToDispatch[]> {
+  const due: ScheduledBackupJobToDispatch[] = [];
+  const entries = await resolveAllBackupAssignedDevices(orgId);
+
+  for (const entry of entries) {
+    // Broken profile link (deleted/RLS-hidden/empty/malformed selections):
+    // skip loudly. Falling through would dispatch the legacy settings row,
+    // which on a profile link carries no paths — a backup that protects
+    // nothing while reporting success.
+    //
+    // The resolver flags this in selectionError, but re-derive it here too:
+    // this is the last checkpoint before a backup runs, so it must not
+    // depend on an upstream flag being set. A link that names a profile and
+    // has no specs NEVER falls back to legacy dispatch.
+    const profileId = entry.settings?.backupProfileId ?? null;
+    const brokenProfileLink =
+      entry.selectionError ??
+      (profileId && !entry.selectionSpecs
+        ? `Backup profile ${profileId} could not be resolved into any data source`
+        : null);
+    if (brokenProfileLink) {
+      console.error(
+        `[BackupWorker] Device ${entry.deviceId} (org ${orgId}, link ${entry.featureLinkId}): ${brokenProfileLink} — no backup scheduled`
+      );
+      continue;
+    }
+
+    // Destination chain already resolved (explicit → legacy → org
+    // default). Nothing resolved = loud skip, never silent: a partner
+    // policy hit an org with no default destination.
+    if (!entry.configId) {
+      console.error(
+        `[BackupWorker] Device ${entry.deviceId} (org ${orgId}, link ${entry.featureLinkId}) has no backup destination — set an org default destination or pin one on the policy`
+      );
+      continue;
+    }
+
+    const schedule = entry.settings?.schedule as PolicySchedule | null;
+    if (!schedule?.frequency || !schedule.time) continue;
+    const occurrenceKey = getDueOccurrenceKey(
+      schedule as never,
+      now,
+      entry.resolvedTimezone,
+      SCHEDULE_LOOKBACK_MINUTES,
+    );
+    if (!occurrenceKey) continue;
+
+    // Profile fan-out: one job per enabled selection. Legacy custom links
+    // (no profile) create a single job with NULL mode, exactly as before.
+    const specs = entry.selectionSpecs ?? [undefined];
+    const helperQueues = await deviceHelperQueues(entry.deviceId);
+    const catchUpUntil = isBackupCatchUpEnabled(schedule)
+      ? computeBackupCatchUpUntil(schedule, now, entry.resolvedTimezone)
+      : undefined;
+    let createdAny = false;
+    for (const spec of specs) {
+      const result = await createScheduledBackupJobIfAbsent({
+        orgId,
+        configId: entry.configId,
+        featureLinkId: entry.featureLinkId,
+        deviceId: entry.deviceId,
+        helperQueues,
+        occurrenceKey,
+        createdAt: now,
+        dedupeWindowMinutes: SCHEDULE_LOOKBACK_MINUTES,
+        ...(spec
+          ? { backupMode: spec.backupMode, modeTargets: spec.targets }
+          : {}),
+      });
+
+      if (result?.created) {
+        createdAny = true;
+        due.push({
+          jobId: result.job.id,
+          configId: result.job.configId,
+          deviceId: entry.deviceId,
+          ...(catchUpUntil ? { catchUpUntil } : {}),
+        });
+      }
+    }
+    if (createdAny && entry.featureLinkId) {
+      // Matches the dedupe window createScheduledBackupJobIfAbsent uses, floored
+      // to the minute like it, so a job of this same occurrence is never counted
+      // as an earlier one.
+      const occurrenceStart = new Date(now.getTime() - SCHEDULE_LOOKBACK_MINUTES * 60_000);
+      occurrenceStart.setSeconds(0, 0);
+      await expireSupersededBackupCatchUps({
+        deviceId: entry.deviceId,
+        featureLinkId: entry.featureLinkId,
+        occurrenceStart,
+      });
+    }
+  }
+  return due;
+}
+
+/**
+ * Scheduled-backup sweep. Called with NO ambient DB context (see the worker
+ * switch): each phase opens its own short system context.
+ *
+ * #6597 — the job rows for an org are created in one context that COMMITS
+ * before any of their dispatches is enqueued. The dispatch worker reads a job
+ * on its own connection within milliseconds of the enqueue; a row still
+ * inside an open transaction is invisible to it, and it then resolved the job
+ * as a pathless file backup, "failed" a row it could not see, and left the
+ * committed row `pending` until the stale reaper failed it with "Backup
+ * dispatch never completed".
+ */
+async function processCheckSchedules(): Promise<{ enqueued: number }> {
+  const now = new Date();
+
+  const orgIds = await runWithSystemDbAccess(() => loadScheduledBackupOrgIds());
   if (orgIds.size === 0) return { enqueued: 0 };
 
   let enqueued = 0;
 
-  // 2. For each org, resolve all backup-assigned devices via config policy hierarchy.
+  // 2. For each org, resolve all backup-assigned devices via config policy
+  // hierarchy and create the due jobs, then enqueue them once committed.
   for (const orgId of orgIds) {
+    let due: ScheduledBackupJobToDispatch[];
     try {
-      const entries = await resolveAllBackupAssignedDevices(orgId);
-
-      for (const entry of entries) {
-        // Broken profile link (deleted/RLS-hidden/empty/malformed selections):
-        // skip loudly. Falling through would dispatch the legacy settings row,
-        // which on a profile link carries no paths — a backup that protects
-        // nothing while reporting success.
-        //
-        // The resolver flags this in selectionError, but re-derive it here too:
-        // this is the last checkpoint before a backup runs, so it must not
-        // depend on an upstream flag being set. A link that names a profile and
-        // has no specs NEVER falls back to legacy dispatch.
-        const profileId = entry.settings?.backupProfileId ?? null;
-        const brokenProfileLink =
-          entry.selectionError ??
-          (profileId && !entry.selectionSpecs
-            ? `Backup profile ${profileId} could not be resolved into any data source`
-            : null);
-        if (brokenProfileLink) {
-          console.error(
-            `[BackupWorker] Device ${entry.deviceId} (org ${orgId}, link ${entry.featureLinkId}): ${brokenProfileLink} — no backup scheduled`
-          );
-          continue;
-        }
-
-        // Destination chain already resolved (explicit → legacy → org
-        // default). Nothing resolved = loud skip, never silent: a partner
-        // policy hit an org with no default destination.
-        if (!entry.configId) {
-          console.error(
-            `[BackupWorker] Device ${entry.deviceId} (org ${orgId}, link ${entry.featureLinkId}) has no backup destination — set an org default destination or pin one on the policy`
-          );
-          continue;
-        }
-
-        const schedule = entry.settings?.schedule as PolicySchedule | null;
-        if (!schedule?.frequency || !schedule.time) continue;
-        const occurrenceKey = getDueOccurrenceKey(
-          schedule as never,
-          now,
-          entry.resolvedTimezone,
-          SCHEDULE_LOOKBACK_MINUTES,
-        );
-        if (!occurrenceKey) continue;
-
-        // Profile fan-out: one job per enabled selection. Legacy custom links
-        // (no profile) create a single job with NULL mode, exactly as before.
-        const specs = entry.selectionSpecs ?? [undefined];
-        const helperQueues = await deviceHelperQueues(entry.deviceId);
-        for (const spec of specs) {
-          const result = await createScheduledBackupJobIfAbsent({
-            orgId,
-            configId: entry.configId,
-            featureLinkId: entry.featureLinkId,
-            deviceId: entry.deviceId,
-            helperQueues,
-            occurrenceKey,
-            createdAt: now,
-            dedupeWindowMinutes: SCHEDULE_LOOKBACK_MINUTES,
-            ...(spec
-              ? { backupMode: spec.backupMode, modeTargets: spec.targets }
-              : {}),
-          });
-
-          if (result?.created) {
-            // 6. Enqueue dispatch
-            await enqueueBackupDispatch(
-              result.job.id,
-              result.job.configId,
-              orgId,
-              entry.deviceId
-            );
-            enqueued++;
-          }
-        }
-      }
+      due = await runWithSystemDbAccess(() => createDueScheduledBackupJobs(orgId, now));
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       console.error(`[BackupWorker] Failed to process scheduled backups for org ${orgId}: ${errMsg}`);
@@ -309,12 +399,47 @@ async function processCheckSchedules(): Promise<{ enqueued: number }> {
       }
       continue;
     }
+
+    for (const job of due) {
+      try {
+        // enqueueBackupDispatch reads the config's approval generation, so it
+        // needs a context of its own — a fresh one, after the creation above
+        // has committed.
+        await runWithSystemDbAccess(() => (job.catchUpUntil
+          ? enqueueBackupDispatch(job.jobId, job.configId, orgId, job.deviceId, undefined, { catchUpUntil: job.catchUpUntil })
+          : enqueueBackupDispatch(job.jobId, job.configId, orgId, job.deviceId))
+        );
+        enqueued++;
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        console.error(
+          `[BackupWorker] Failed to enqueue scheduled backup dispatch for job ${job.jobId} (org ${orgId}, device ${job.deviceId}): ${errMsg}`
+        );
+        // The row has committed, so nothing will ever dispatch it: settle it
+        // now instead of leaving it `pending` for the stale reaper.
+        try {
+          await runWithSystemDbAccess(() =>
+            markJobFailed(job.jobId, `Failed to enqueue backup dispatch: ${errMsg}`)
+          );
+        } catch (markErr) {
+          console.error(`[BackupWorker] Failed to mark scheduled backup job ${job.jobId} failed:`, markErr);
+        }
+      }
+    }
   }
 
   if (enqueued > 0) {
     console.log(
       `[BackupWorker] Scheduled ${enqueued} backup job(s) from config policies`
     );
+  }
+
+  try {
+    await dispatchCatchUpsForConnectedDevices();
+  } catch (err) {
+    // Next tick retries; the schedules above already went out.
+    console.error('[BackupWorker] Failed to sweep deferred backup catch-ups:', err);
+    captureException(err, undefined, { backup_dispatch_issue: 'catch-up-sweep-failed' });
   }
 
   return { enqueued };
@@ -701,7 +826,13 @@ export async function resolveBackupTargets(
 
 type BackupDispatchPrecheck =
   | { status: 'done'; result: { dispatched: boolean } }
-  | { status: 'ok'; config: typeof backupConfigs.$inferSelect; agentId: string };
+  | {
+    status: 'ok';
+    config: typeof backupConfigs.$inferSelect;
+    agentId: string;
+    /** The device has not reported its backup helper protocols yet. */
+    helperProtocolsUnreported: boolean;
+  };
 
 /**
  * Phase 1: cancellation guard, config load and the agent lookup, inside ONE
@@ -716,6 +847,20 @@ async function loadBackupDispatchPrecheck(
     return { status: 'done', result: { dispatched: false } };
   }
 
+  // A later check of a dispatch that waited for the device's helper report
+  // (see holdForHelperReport) proceeds only while its job is still exactly as
+  // it left it: a job the reaper failed, or anything else settled meanwhile,
+  // is never dispatched late.
+  if (data.capabilityWaitAttempt !== undefined && !(await isBackupJobStillPending(data.jobId))) {
+    return { status: 'done', result: { dispatched: false } };
+  }
+
+  // A job that waited for its device runs only if it is still waiting and the
+  // reason it was scheduled still holds: the wait can outlast the policy.
+  if (data.catchUpDispatch && !(await catchUpStillApplies(data.jobId))) {
+    return { status: 'done', result: { dispatched: false } };
+  }
+
   // Load config for command payload
   const [config] = await db
     .select()
@@ -725,6 +870,15 @@ async function loadBackupDispatchPrecheck(
 
   if (!config) {
     await markJobFailed(data.jobId, 'Backup config not found');
+    return { status: 'done', result: { dispatched: false } };
+  }
+
+  // The config is loaded by id alone under system scope, so its org is checked
+  // here: a job only ever runs a config of its own org (backup_configs is
+  // org-owned, never partner-wide). Fail before any destination credential is
+  // read into a payload.
+  if (config.orgId !== data.orgId) {
+    await refuseBackupDispatch(data, 'backup_config_org_mismatch');
     return { status: 'done', result: { dispatched: false } };
   }
 
@@ -743,26 +897,192 @@ async function loadBackupDispatchPrecheck(
     return { status: 'done', result: { dispatched: false } };
   }
 
-  // Find the agent for this device
+  // A device parked in its partner's holding org is never backed up: fail the
+  // job before any destination credential is loaded into a payload.
+  if (await isParkedDevice(db, data.deviceId)) {
+    await markJobFailed(data.jobId, PARKED_DEVICE_CANCEL_REASON);
+    return { status: 'done', result: { dispatched: false } };
+  }
+
+  // Find the agent for this device, and whether it has reported its backup
+  // helper yet.
   const [device] = await db
-    .select({ agentId: devices.agentId })
+    .select({
+      agentId: devices.agentId,
+      backupWriteProtocolVersion: devices.backupWriteProtocolVersion,
+      backupIntegrityProtocolVersion: devices.backupIntegrityProtocolVersion,
+    })
     .from(devices)
     .where(eq(devices.id, data.deviceId))
     .limit(1);
 
   const agentId = device?.agentId;
   if (!agentId) {
-    await markJobFailed(data.jobId, 'Agent not connected');
+    await deferUntilAgentConnectsOrFail(data);
     return { status: 'done', result: { dispatched: false } };
   }
 
-  return { status: 'ok', config, agentId };
+  // A backup to S3 storage is written only through a write-scoped storage
+  // session. A device whose helper has REPORTED that it cannot use one is
+  // refused before anything is built; one that has not reported yet is held
+  // below until it does. Every target this worker builds (backup_run,
+  // mssql_backup, hyperv_backup) writes to this same destination.
+  const writeRefusal = backupWriteHelperRefusal(
+    'backup_run',
+    { provider: config.provider },
+    device!.backupWriteProtocolVersion,
+  );
+  if (writeRefusal) {
+    await markJobFailed(data.jobId, writeRefusal);
+    return { status: 'done', result: { dispatched: false } };
+  }
+
+  return { status: 'ok', config, agentId, helperProtocolsUnreported: backupHelperProtocolsUnreported(device!) };
+}
+
+/**
+ * The agent is not connected. A scheduled job with a catch-up window stays
+ * `pending` for the next connect; a job without one (manual, or the policy
+ * turned runMissedBackupsOnConnect off) fails as it always has, and one whose
+ * window has closed fails as missed. Returns whether the job is now waiting.
+ */
+async function deferUntilAgentConnectsOrFail(data: DispatchBackupJobData): Promise<boolean> {
+  if (!data.catchUpUntil) {
+    await markJobFailed(data.jobId, 'Agent not connected');
+    return false;
+  }
+  const catchUpUntil = new Date(data.catchUpUntil);
+  if (catchUpUntil.getTime() <= Date.now()) {
+    await markJobFailed(data.jobId, BACKUP_MISSED_ERROR);
+    return false;
+  }
+  const waiting = await db
+    .update(backupJobs)
+    .set({
+      catchUpUntil,
+      // Site-ceiling gate contract §3: the generation this job was queued
+      // against travels with it, so an edit made while it waits still fails it
+      // closed (`backup_config_changed`) instead of running the new config.
+      catchUpConfigGeneration: data.configGeneration ?? null,
+      updatedAt: new Date(),
+    })
+    .where(and(eq(backupJobs.id, data.jobId), eq(backupJobs.status, 'pending')))
+    .returning({ id: backupJobs.id });
+  return waiting.length > 0;
+}
+
+/**
+ * A catch-up dispatch re-checks its row: cancelled, reaped or superseded jobs
+ * have nothing to run, and a job whose policy link is gone or that turned the
+ * toggle off fails here rather than back up a device nobody asked it to.
+ */
+async function catchUpStillApplies(jobId: string): Promise<boolean> {
+  const [job] = await db
+    .select({
+      status: backupJobs.status,
+      catchUpUntil: backupJobs.catchUpUntil,
+      featureLinkId: backupJobs.featureLinkId,
+      configId: backupJobs.configId,
+      deviceId: backupJobs.deviceId,
+    })
+    .from(backupJobs)
+    .where(eq(backupJobs.id, jobId))
+    .limit(1);
+
+  if (!job || job.status !== 'pending' || !job.catchUpUntil) return false;
+  // The device's effective backup policy NOW: the policy may have been
+  // deactivated, unassigned, outranked by another one or pointed at another
+  // destination while the job waited. Only the same link and destination the
+  // scheduler chose may still run.
+  const current = job.featureLinkId ? await resolveBackupConfigForDevice(job.deviceId) : null;
+  if (!current?.settings || current.featureLinkId !== job.featureLinkId || current.configId !== job.configId) {
+    await markJobFailed(jobId, 'Catch-up cancelled: the backup policy no longer applies to this device.');
+    return false;
+  }
+  if (!isBackupCatchUpEnabled(current.settings.schedule)) {
+    await markJobFailed(jobId, 'Catch-up cancelled: running missed backups was turned off on the backup policy.');
+    return false;
+  }
+  return true;
+}
+
+/**
+ * How often, and for how long, a backup for a device that has not reported
+ * its backup helper yet is checked again. The agent sends its first heartbeat
+ * within one heartbeat interval (60 s by default) of starting, so ten minutes
+ * leaves room for several missed beats. Both bounds apply: the wall clock
+ * (delayed jobs can run late) and the number of checks.
+ */
+export const BACKUP_CAPABILITY_WAIT_POLL_MS = 15_000;
+export const BACKUP_CAPABILITY_WAIT_MAX_MS = 10 * 60 * 1000;
+// The attempt ceiling (backupEnqueue.BACKUP_CAPABILITY_WAIT_MAX_ATTEMPTS) lives
+// with the queue ids a cancellation has to look up.
+
+/**
+ * The device has not reported its backup helper yet (a new or re-enrolled
+ * install before its first heartbeat). Nothing is built or sent — how the
+ * destination travels and which incremental base is pinned both depend on
+ * that report — and the job stays `pending`. The same dispatch is queued
+ * again shortly; once the window is exhausted the job fails with a reason the
+ * operator can act on. Should the re-queue itself be lost, the stale reaper
+ * still fails the pending job (BACKUP_PENDING_TIMEOUT_MS).
+ */
+async function holdForHelperReport(
+  data: DispatchBackupJobData,
+  onExhausted: { message: string; log: string } = {
+    message: BACKUP_HELPER_UNREPORTED_MESSAGE,
+    log: 'did not report its backup helper in time',
+  },
+): Promise<{ dispatched: boolean }> {
+  const now = Date.now();
+  const since = data.capabilityWaitSince ?? new Date(now).toISOString();
+  const attempt = (data.capabilityWaitAttempt ?? 0) + 1;
+  const sinceMs = Date.parse(since);
+  const exhausted = attempt > backupEnqueue.BACKUP_CAPABILITY_WAIT_MAX_ATTEMPTS
+    || !Number.isFinite(sinceMs)
+    || now - sinceMs >= BACKUP_CAPABILITY_WAIT_MAX_MS;
+  if (exhausted) {
+    console.warn(`[BackupWorker] Device ${data.deviceId} ${onExhausted.log}; failing job ${data.jobId}`);
+    await runWithSystemDbAccess(() => markJobFailed(data.jobId, onExhausted.message));
+    return { dispatched: false };
+  }
+  try {
+    await backupEnqueue.enqueueBackupDispatchCapabilityWait(data, { attempt, since }, BACKUP_CAPABILITY_WAIT_POLL_MS);
+  } catch (err) {
+    // Rethrown so the worker's `failed` listener reports it; the job row is
+    // settled now rather than left for the pending reaper.
+    await runWithSystemDbAccess(() => markJobFailed(
+      data.jobId,
+      'The backup was not started: it could not be queued again while waiting for the device to report its backup features. Run the backup again.',
+    ));
+    throw err;
+  }
+  if (attempt === 1) {
+    console.log(`[BackupWorker] Job ${data.jobId} waits for device ${data.deviceId} to report its backup helper`);
+  }
+  return { dispatched: false };
+}
+
+/**
+ * Issuing a write session failed for a transient reason (database or Redis)
+ * while building the dispatch. Thrown out of Phase 3 so its whole system
+ * transaction — child job rows, dispatch pins, sessions already issued for
+ * earlier targets — rolls back; the dispatch is then tried again later, like
+ * a device that has not reported its helper yet.
+ */
+class TransientWriteSessionError extends Error {
+  constructor() {
+    super('A write session could not be issued for a backup target');
+    this.name = 'TransientWriteSessionError';
+  }
 }
 
 interface PreparedBackupTarget {
   commandJobId: string;
   command: AgentCommand;
   commandType: string;
+  /** How the storage destination travels with this target (write-dispatch telemetry). */
+  writeDelivery: { mode: 'brokered' | 'local'; reason: string };
 }
 
 type BackupDispatchPrepare =
@@ -771,6 +1091,8 @@ type BackupDispatchPrepare =
       status: 'ok';
       prepared: PreparedBackupTarget[];
       preFailedTargets: string[];
+      /** Why the parent's own target was not prepared, when it was not. */
+      parentFailureDetail: string | null;
       backupMode: string;
       targetCount: number;
     };
@@ -781,15 +1103,7 @@ type BackupDispatchPrepare =
  * condition is visible in the API log rather than only by counting objects in
  * the bucket.
  */
-export type FullBackupFallbackReason =
-  | 'no_prior_snapshot'
-  | 'base_expired'
-  | 'storage_identity_changed'
-  | 'backup_type_mismatch'
-  | 'base_job_not_completed'
-  | 'base_retired'
-  | 'base_deleted_race'
-  | 'base_retired_race';
+export type FullBackupFallbackReason = BackupFullRunReason;
 
 /**
  * The newest snapshot for this device+config ignoring EVERY eligibility
@@ -798,6 +1112,9 @@ export type FullBackupFallbackReason =
 export interface BaseCandidateProbe {
   expiresAt: Date | null;
   storageIdentity: string | null;
+  /** The snapshot's recorded key root (#7081), verbatim. */
+  keyLayout: string | null;
+  keyPrefix: string | null;
   backupType: string | null;
   jobStatus: string | null;
   retired: boolean;
@@ -808,19 +1125,34 @@ export interface BaseCandidateProbe {
  * query's WHERE clause, in the same order, so the reason it reports is the
  * first filter the newest snapshot actually fails.
  */
+/**
+ * Job statuses whose snapshot may serve as an incremental base. `partial`
+ * stays excluded, unchanged by #5396.
+ * `completed_with_errors` (#5396) is a run that missed a few files under the
+ * threshold — it was a valid base while it was still recorded as `completed`,
+ * and excluding it would turn every run after one locked file into a full
+ * backup.
+ */
+const INCREMENTAL_BASE_JOB_STATUSES = ['completed', 'completed_with_errors'] as const;
+
 export function classifyMissingBaseReason(
   probe: BaseCandidateProbe | null,
-  ctx: { storageIdentity: string; mode: 'file' | 'system_image'; now: Date },
+  ctx: { storageIdentity: string; mode: 'file' | 'system_image'; now: Date; keyRoot: SnapshotKeyRoot },
 ): FullBackupFallbackReason {
   if (!probe) return 'no_prior_snapshot';
   if (probe.storageIdentity !== ctx.storageIdentity) return 'storage_identity_changed';
+  const probeRoot = snapshotKeyRootOf({ keyLayout: probe.keyLayout, keyPrefix: probe.keyPrefix });
+  if (!probeRoot) return 'base_key_root_unreadable';
+  if (!sameKeyRoot(probeRoot, ctx.keyRoot)) return 'key_root_changed';
   const typeMatches =
     ctx.mode === 'system_image'
       ? probe.backupType === 'system_image'
       : probe.backupType === 'file' || probe.backupType === null;
   if (!typeMatches) return 'backup_type_mismatch';
   if (probe.expiresAt !== null && probe.expiresAt <= ctx.now) return 'base_expired';
-  if (probe.jobStatus !== 'completed') return 'base_job_not_completed';
+  if (!(INCREMENTAL_BASE_JOB_STATUSES as readonly (string | null)[]).includes(probe.jobStatus)) {
+    return 'base_job_not_completed';
+  }
   if (probe.retired) return 'base_retired';
   // Every mirrored filter passed, so the newest snapshot was not the blocker
   // (e.g. it belongs to a different device row than the one queried). Report
@@ -849,6 +1181,8 @@ async function readBaseCandidateProbe(
     .select({
       expiresAt: backupSnapshots.expiresAt,
       storageIdentity: backupSnapshots.storageIdentity,
+      keyLayout: backupSnapshots.keyLayout,
+      keyPrefix: backupSnapshots.keyPrefix,
       backupType: backupSnapshots.backupType,
       jobStatus: backupJobs.status,
       retirementId: backupSnapshotRetirements.id,
@@ -870,6 +1204,8 @@ async function readBaseCandidateProbe(
   return {
     expiresAt: row.expiresAt ?? null,
     storageIdentity: row.storageIdentity ?? null,
+    keyLayout: row.keyLayout ?? null,
+    keyPrefix: row.keyPrefix ?? null,
     backupType: row.backupType ?? null,
     jobStatus: row.jobStatus ?? null,
     retired: row.retirementId != null,
@@ -914,6 +1250,9 @@ function logFullBackupFallback(
  * write happens while a lock from the other table is held (cf. #3911's
  * key-share deadlock).
  */
+/** The attested base manifest a capable helper checks its downloaded base against. */
+export type BaseAttestation = { manifestKey: string; manifestSha256: string; manifestSize: number };
+
 async function stampDispatchPinAndIdentity(params: {
   deviceId: string;
   configId: string;
@@ -921,20 +1260,24 @@ async function stampDispatchPinAndIdentity(params: {
   mode: 'file' | 'system_image' | null;
   provider: string;
   providerConfig: Record<string, unknown>;
-}): Promise<{ baseSnapshotId: string; publishLeaseExpiresAt: Date | null }> {
+}): Promise<{ baseSnapshotId: string; publishLeaseExpiresAt: Date | null; baseAttestation: BaseAttestation | null }> {
   const storageIdentity = normalizeStorageIdentity(params.provider, params.providerConfig);
 
   if (params.mode === null) {
     // hyperv/mssql: identity only — no lease, no pin (spec: pins/leases are
     // file/system_image only; storage_identity stamping is not).
     await db.update(backupJobs).set({ storageIdentity }).where(eq(backupJobs.id, params.jobId));
-    return { baseSnapshotId: '', publishLeaseExpiresAt: null };
+    return { baseSnapshotId: '', publishLeaseExpiresAt: null, baseAttestation: null };
   }
   const mode = params.mode;
 
   const leaseMs = resolveBackupBaseLeaseMs();
   const dispatchedAt = new Date();
   const publishLeaseExpiresAt = new Date(dispatchedAt.getTime() + leaseMs);
+  // #7081 (I4): the key root this run's new snapshot id will be reserved
+  // under. A dedupe base must be recorded under the same root, so a chain
+  // never spans roots; after a prefix change the first run is a full backup.
+  const mintRoot = resolveMintKeyRoot(params.provider, params.providerConfig);
 
   // #6351 review fix: the fallback-reason diagnosis runs AFTER the
   // transaction commits, never inside it. A failure in a purely explanatory
@@ -942,7 +1285,13 @@ async function stampDispatchPinAndIdentity(params: {
   // full-copy dispatch into a failed backup (and in Postgres a statement
   // error aborts the surrounding transaction outright, so catching it inside
   // would not help).
-  let pendingFallback: FullBackupFallbackReason | 'diagnose' | null = null;
+  // 'diagnose' explains a missing base from the probe below. 'diagnose_attested'
+  // does the same for a helper that verifies its base: the transaction already
+  // stamped 'no_verified_base', which the probe replaces with the first mirrored
+  // filter a snapshot fails, or 'no_prior_snapshot' when there is none at all
+  // (#11027: otherwise every new device's first backup reads as a verification
+  // failure).
+  let pendingFallback: FullBackupFallbackReason | 'diagnose' | 'diagnose_attested' | null = null;
 
   const outcome = await db.transaction(async (tx) => {
     // Review fix (spec §3.1 selection criteria): "no retirement row" is part
@@ -952,54 +1301,138 @@ async function stampDispatchPinAndIdentity(params: {
     // wins instead of dispatch falling back to a full run unnecessarily. The
     // lock-time re-check below still exists to catch the narrow race where a
     // retirement lands AFTER this select but before the FOR SHARE lock.
-    const [candidate] = await tx
-      .select({ id: backupSnapshots.id, snapshotId: backupSnapshots.snapshotId })
-      .from(backupSnapshots)
-      .innerJoin(backupJobs, eq(backupSnapshots.jobId, backupJobs.id))
-      .leftJoin(
-        backupSnapshotRetirements,
-        and(
-          eq(backupSnapshotRetirements.storageIdentity, storageIdentity),
-          eq(backupSnapshotRetirements.snapshotId, backupSnapshots.snapshotId),
-        ),
-      )
-      .where(
-        and(
-          eq(backupSnapshots.deviceId, params.deviceId),
-          eq(backupSnapshots.configId, params.configId),
-          // Review fix: scope by THIS dispatch's storage identity too. Without
-          // this, a config edit (§3.6) can leave the newest snapshot carrying
-          // the OLD identity while this job is stamped with the NEW one —
-          // dispatch would then pin a base whose row retention's pin check
-          // (scoped by storageIdentity) can never see, so retention would
-          // retire and delete it out from under an in-flight run.
-          eq(backupSnapshots.storageIdentity, storageIdentity),
-          mode === 'system_image'
-            ? eq(backupSnapshots.backupType, 'system_image')
-            : or(eq(backupSnapshots.backupType, 'file'), isNull(backupSnapshots.backupType)),
-          // #6351: the candidate must merely be UNEXPIRED RIGHT NOW — not
-          // survive the whole publish lease. Requiring
-          // `expiresAt > publishLeaseExpiresAt` was unsatisfiable for the
-          // default configuration: an ordinary daily snapshot expires at
-          // `taken + keepDaily` (7 days) while the lease runs to `now + 7
-          // days`, so the newest snapshot always fell short by exactly the
-          // gap between the two runs and EVERY backup fell back to a full
-          // copy. Survival across the lease is what the PIN is for:
-          // backupRetention.ts's `deleteSnapshotRow` returns 'pinned' for any
-          // snapshot named by an in-flight job's base_snapshot_id or by a
-          // still-live publish lease, regardless of expires_at (proved by
-          // backupRetentionPins.integration.test.ts's "skips an expired
-          // snapshot pinned as a running job's base"). Once the child
-          // publishes, the parent's objects stay reachable through the
-          // child's own manifest in the mark-and-sweep root set, so letting
-          // the parent ROW expire on schedule is safe.
-          or(isNull(backupSnapshots.expiresAt), gt(backupSnapshots.expiresAt, dispatchedAt)),
-          eq(backupJobs.status, 'completed'),
-          isNull(backupSnapshotRetirements.id),
-        ),
-      )
-      .orderBy(desc(backupSnapshots.timestamp))
+    // A helper that verifies its incremental base (snapshot integrity
+    // protocol >= 1) is only ever handed a base whose attestation the server
+    // verified (or, on a device-local destination, the same device's own
+    // producer_only attestation), plus that base manifest's attested digest
+    // to check the downloaded bytes against. No such candidate means a full
+    // run. Older helpers keep the unrestricted selection.
+    const [deviceRow] = await tx
+      .select({
+        integrityVersion: devices.backupIntegrityProtocolVersion,
+        incarnationStartedAt: devices.incarnationStartedAt,
+      })
+      .from(devices)
+      .where(eq(devices.id, params.deviceId))
       .limit(1);
+    // Not reported yet (NULL) is not "older helper": the dispatch waits for
+    // the report, and should this read still see NULL (a re-enrollment in
+    // between), only an attested base is pinned — safe for either helper.
+    const requireAttestedBase = deviceRow !== undefined
+      && (deviceRow.integrityVersion === null || deviceRow.integrityVersion >= 1);
+    const baseStatusIsLocal = storageIdentity.startsWith('local::');
+
+    if (!mintRoot.ok) {
+      // No root to match: no base. Mint refuses the write itself.
+      await tx
+        .update(backupJobs)
+        .set({ storageIdentity, publishLeaseExpiresAt, baseSnapshotId: null, fullBackupReason: 'invalid_destination_prefix' })
+        .where(eq(backupJobs.id, params.jobId));
+      pendingFallback = 'invalid_destination_prefix';
+      return { baseSnapshotId: '', publishLeaseExpiresAt, baseAttestation: null };
+    }
+    const runRoot = mintRoot.root;
+
+    const eligible = and(
+      eq(backupSnapshots.deviceId, params.deviceId),
+      eq(backupSnapshots.configId, params.configId),
+      // Review fix: scope by THIS dispatch's storage identity too. Without
+      // this, a config edit (§3.6) can leave the newest snapshot carrying
+      // the OLD identity while this job is stamped with the NEW one —
+      // dispatch would then pin a base whose row retention's pin check
+      // (scoped by storageIdentity) can never see, so retention would
+      // retire and delete it out from under an in-flight run.
+      eq(backupSnapshots.storageIdentity, storageIdentity),
+      // #7081 (I4): recorded under this run's key root.
+      eq(backupSnapshots.keyLayout, runRoot.layout),
+      runRoot.prefix === null ? isNull(backupSnapshots.keyPrefix) : eq(backupSnapshots.keyPrefix, runRoot.prefix),
+      mode === 'system_image'
+        ? eq(backupSnapshots.backupType, 'system_image')
+        : or(eq(backupSnapshots.backupType, 'file'), isNull(backupSnapshots.backupType)),
+      // #6351: the candidate must merely be UNEXPIRED RIGHT NOW — not
+      // survive the whole publish lease. Requiring
+      // `expiresAt > publishLeaseExpiresAt` was unsatisfiable for the
+      // default configuration: an ordinary daily snapshot expires at
+      // `taken + keepDaily` (7 days) while the lease runs to `now + 7
+      // days`, so the newest snapshot always fell short by exactly the
+      // gap between the two runs and EVERY backup fell back to a full
+      // copy. Survival across the lease is what the PIN is for:
+      // backupRetention.ts's `deleteSnapshotRow` returns 'pinned' for any
+      // snapshot named by an in-flight job's base_snapshot_id or by a
+      // still-live publish lease, regardless of expires_at (proved by
+      // backupRetentionPins.integration.test.ts's "skips an expired
+      // snapshot pinned as a running job's base"). Once the child
+      // publishes, the parent's objects stay reachable through the
+      // child's own manifest in the mark-and-sweep root set, so letting
+      // the parent ROW expire on schedule is safe.
+      or(isNull(backupSnapshots.expiresAt), gt(backupSnapshots.expiresAt, dispatchedAt)),
+      inArray(backupJobs.status, INCREMENTAL_BASE_JOB_STATUSES),
+      isNull(backupSnapshotRetirements.id),
+      // #8318 §5.4: a snapshot taken before the device's current install
+      // incarnation began was produced by an earlier install, so the chain
+      // stops there and the first backup of the new install is a full one.
+      // NULL (never reattached) adds no filter.
+      deviceRow?.incarnationStartedAt
+        ? gte(backupSnapshots.timestamp, deviceRow.incarnationStartedAt)
+        : undefined,
+    );
+    const retirementJoin = and(
+      eq(backupSnapshotRetirements.storageIdentity, storageIdentity),
+      eq(backupSnapshotRetirements.snapshotId, backupSnapshots.snapshotId),
+    );
+
+    let candidate: { id: string; snapshotId: string; baseAttestation: BaseAttestation | null } | undefined;
+    if (requireAttestedBase) {
+      const [row] = await tx
+        .select({
+          id: backupSnapshots.id,
+          snapshotId: backupSnapshots.snapshotId,
+          manifestKey: backupSnapshotAttestations.manifestKey,
+          manifestSha256: backupSnapshotAttestations.manifestSha256,
+          manifestSize: backupSnapshotAttestations.manifestSize,
+        })
+        .from(backupSnapshots)
+        .innerJoin(backupJobs, eq(backupSnapshots.jobId, backupJobs.id))
+        .innerJoin(
+          backupSnapshotAttestations,
+          and(
+            eq(backupSnapshotAttestations.snapshotDbId, backupSnapshots.id),
+            // Server-verified, or — on a device-local destination the server
+            // cannot read — the same device's own producer_only statement
+            // (the device, config and identity filters below bind it to this
+            // device and destination).
+            baseStatusIsLocal
+              ? inArray(backupSnapshotAttestations.status, ['verified', 'producer_only'])
+              : eq(backupSnapshotAttestations.status, 'verified'),
+            // The attestation describes the run the snapshot row names.
+            eq(backupSnapshotAttestations.jobId, backupSnapshots.jobId),
+            eq(backupSnapshotAttestations.deviceId, params.deviceId),
+            eq(backupSnapshotAttestations.storageIdentity, storageIdentity),
+            eq(backupSnapshotAttestations.providerSnapshotId, backupSnapshots.snapshotId),
+          ),
+        )
+        .leftJoin(backupSnapshotRetirements, retirementJoin)
+        .where(eligible)
+        .orderBy(desc(backupSnapshots.timestamp))
+        .limit(1);
+      candidate = row
+        ? {
+            id: row.id,
+            snapshotId: row.snapshotId,
+            baseAttestation: { manifestKey: row.manifestKey, manifestSha256: row.manifestSha256, manifestSize: row.manifestSize },
+          }
+        : undefined;
+    } else {
+      const [row] = await tx
+        .select({ id: backupSnapshots.id, snapshotId: backupSnapshots.snapshotId })
+        .from(backupSnapshots)
+        .innerJoin(backupJobs, eq(backupSnapshots.jobId, backupJobs.id))
+        .leftJoin(backupSnapshotRetirements, retirementJoin)
+        .where(eligible)
+        .orderBy(desc(backupSnapshots.timestamp))
+        .limit(1);
+      candidate = row ? { ...row, baseAttestation: null } : undefined;
+    }
 
     // Lock order: JOB row first (this UPDATE stamps identity/lease/tentative
     // pin unconditionally — every dispatched backup_run job gets these).
@@ -1009,12 +1442,15 @@ async function stampDispatchPinAndIdentity(params: {
         storageIdentity,
         publishLeaseExpiresAt,
         baseSnapshotId: candidate?.snapshotId ?? null,
+        // #11027: NULL when a base was found. A diagnosed fallback fills this
+        // in after commit, and a redispatch must not keep an earlier reason.
+        fullBackupReason: !candidate && requireAttestedBase ? 'no_verified_base' : null,
       })
       .where(eq(backupJobs.id, params.jobId));
 
     if (!candidate) {
-      pendingFallback = 'diagnose';
-      return { baseSnapshotId: '', publishLeaseExpiresAt };
+      pendingFallback = requireAttestedBase ? 'diagnose_attested' : 'diagnose';
+      return { baseSnapshotId: '', publishLeaseExpiresAt, baseAttestation: null };
     }
 
     // SNAPSHOT row second, locked ALONE (see docstring for why the retirement
@@ -1027,9 +1463,9 @@ async function stampDispatchPinAndIdentity(params: {
 
     if (!locked) {
       // Row already gone — a concurrent retention delete won the race.
-      await tx.update(backupJobs).set({ baseSnapshotId: null }).where(eq(backupJobs.id, params.jobId));
+      await tx.update(backupJobs).set({ baseSnapshotId: null, fullBackupReason: 'base_deleted_race' }).where(eq(backupJobs.id, params.jobId));
       pendingFallback = 'base_deleted_race';
-      return { baseSnapshotId: '', publishLeaseExpiresAt };
+      return { baseSnapshotId: '', publishLeaseExpiresAt, baseAttestation: null };
     }
 
     const [retirement] = await tx
@@ -1044,12 +1480,12 @@ async function stampDispatchPinAndIdentity(params: {
       .limit(1);
 
     if (retirement) {
-      await tx.update(backupJobs).set({ baseSnapshotId: null }).where(eq(backupJobs.id, params.jobId));
+      await tx.update(backupJobs).set({ baseSnapshotId: null, fullBackupReason: 'base_retired_race' }).where(eq(backupJobs.id, params.jobId));
       pendingFallback = 'base_retired_race';
-      return { baseSnapshotId: '', publishLeaseExpiresAt };
+      return { baseSnapshotId: '', publishLeaseExpiresAt, baseAttestation: null };
     }
 
-    return { baseSnapshotId: candidate.snapshotId, publishLeaseExpiresAt };
+    return { baseSnapshotId: candidate.snapshotId, publishLeaseExpiresAt, baseAttestation: candidate.baseAttestation };
   });
 
   if (pendingFallback !== null) {
@@ -1059,20 +1495,40 @@ async function stampDispatchPinAndIdentity(params: {
       configId: params.configId,
       storageIdentity,
     };
-    if (pendingFallback !== 'diagnose') {
+    if (pendingFallback !== 'diagnose' && pendingFallback !== 'diagnose_attested') {
       logFullBackupFallback(pendingFallback, logParams);
     } else {
       try {
         const probe = await readBaseCandidateProbe(params.deviceId, params.configId);
-        logFullBackupFallback(
-          classifyMissingBaseReason(probe, { storageIdentity, mode, now: dispatchedAt }),
-          logParams,
-        );
+        const attested = pendingFallback === 'diagnose_attested';
+        const classified = classifyMissingBaseReason(probe, {
+          storageIdentity,
+          mode,
+          now: dispatchedAt,
+          keyRoot: mintRoot.ok ? mintRoot.root : LEGACY_FLAT_ROOT,
+        });
+        // A snapshot that passes every mirrored filter was refused for its
+        // attestation, which the probe does not see.
+        const reason = attested && probe !== null && classified === 'no_prior_snapshot'
+          ? 'no_verified_base'
+          : classified;
+        logFullBackupFallback(reason, logParams);
+        // #11027: stored for the job's detail view. Same rule as the probe: a
+        // failure here never fails a dispatch that already committed, and only
+        // the value this dispatch stamped is replaced.
+        await db
+          .update(backupJobs)
+          .set({ fullBackupReason: reason })
+          .where(and(
+            eq(backupJobs.id, params.jobId),
+            attested ? eq(backupJobs.fullBackupReason, 'no_verified_base') : isNull(backupJobs.fullBackupReason),
+          ));
       } catch (err) {
         // Diagnosis only — the dispatch itself already committed.
         console.warn(
-          `[BackupWorker] Job ${params.jobId} has no incremental base and will upload a FULL copy; ` +
-            `the reason probe failed: ${err instanceof Error ? err.message : String(err)}`,
+          `[BackupWorker] Job ${params.jobId} (device ${params.deviceId}, config ${params.configId}) has no ` +
+            `incremental base and will upload a FULL copy; diagnosing or recording the reason failed: ` +
+            `${err instanceof Error ? err.message : String(err)}`,
         );
       }
     }
@@ -1095,6 +1551,29 @@ async function prepareBackupDispatchTargets(
     return { status: 'done', result: { dispatched: false } };
   }
 
+  // #11013: claim a job that waited for its device. Clearing the window takes it
+  // out of the reconnect sweep, and stamping started_at restarts the reaper's
+  // pending clock, which would otherwise read the time since the schedule. In
+  // this transaction, so a rollback of the build below leaves the job waiting.
+  if (data.catchUpDispatch) {
+    const now = new Date();
+    const claimed = await db
+      .update(backupJobs)
+      .set({ catchUpUntil: null, startedAt: now, updatedAt: now })
+      .where(and(
+        eq(backupJobs.id, data.jobId),
+        eq(backupJobs.status, 'pending'),
+        isNotNull(backupJobs.catchUpUntil),
+        // Past the window the row is the reaper's to settle; a claim then could
+        // send a backup the reaper is failing at the same moment.
+        gt(backupJobs.catchUpUntil, now),
+      ))
+      .returning({ id: backupJobs.id });
+    if (claimed.length === 0) {
+      return { status: 'done', result: { dispatched: false } };
+    }
+  }
+
   // Resolve backup mode: fan-out jobs carry their own selection (profile
   // model); legacy jobs fall back to the feature link's settings row.
   const [job] = await db
@@ -1107,13 +1586,32 @@ async function prepareBackupDispatchTargets(
     .where(eq(backupJobs.id, data.jobId))
     .limit(1);
 
+  // #6597: the row is invisible — almost certainly because its dispatch was
+  // enqueued before the transaction that created it committed. Every creator
+  // now commits first, so this is a tripwire, not a path. Refuse loudly: the
+  // fallthrough below would resolve an unread job as a pathless FILE backup
+  // whatever its real mode, "fail" it with a 0-row UPDATE, and leave the row
+  // that commits a moment later `pending` for the stale reaper with a message
+  // that points nowhere near the cause.
+  if (!job) {
+    const message =
+      `[BackupWorker] Backup job ${data.jobId} (device ${data.deviceId}) is not visible to the dispatch worker — ` +
+      'refusing to dispatch it. Its dispatch was most likely enqueued before the transaction that created ' +
+      'the row committed (#6597); if the row does commit, the stale-job reaper will fail it.';
+    console.error(message);
+    captureException(new Error(message), undefined, {
+      backup_dispatch_issue: 'job-row-not-visible',
+    });
+    return { status: 'done', result: { dispatched: false } };
+  }
+
   let backupMode = 'file';
   let modeTargets: Record<string, unknown> = {};
 
-  if (job?.backupMode) {
+  if (job.backupMode) {
     backupMode = job.backupMode;
     modeTargets = (job.modeTargets as Record<string, unknown>) ?? {};
-  } else if (job?.featureLinkId) {
+  } else if (job.featureLinkId) {
     const [settings] = await db
       .select({
         backupMode: configPolicyBackupSettings.backupMode,
@@ -1192,6 +1690,7 @@ async function prepareBackupDispatchTargets(
 
   const prepared: PreparedBackupTarget[] = [];
   const preFailedTargets: string[] = [];
+  let parentFailureDetail: string | null = null;
   // #4137: every child row this loop has already committed. A cancellation
   // detected at ANY later point must settle all of them — before this, a
   // cancel landing at the top of iteration `i` cancelled nothing and left
@@ -1221,7 +1720,7 @@ async function prepareBackupDispatchTargets(
         .values({
           orgId: data.orgId,
           configId: data.configId,
-          featureLinkId: job?.featureLinkId ?? null,
+          featureLinkId: job.featureLinkId ?? null,
           deviceId: data.deviceId,
           status: 'running',
           type: 'scheduled',
@@ -1256,29 +1755,73 @@ async function prepareBackupDispatchTargets(
       providerConfig: destination.providerConfig,
     });
 
+    // The storage destination itself goes into a payload only when it is a
+    // local path. For S3 it is used here, in memory, for identity stamping
+    // and for issuing the write session — never sent.
+    const targetPayload: Record<string, unknown> = {
+      jobId: commandJobId,
+      configId: data.configId,
+      provider: destination.provider,
+      ...(destination.provider === 'local' ? { providerConfig: destination.providerConfig } : {}),
+      storageEncryption: destination.storageEncryption,
+      ...target.payload,
+      // Payload fields stay file/system_image-only (spec §3.1) even though
+      // storage_identity is now stamped for every target above. Spread
+      // LAST (review fix) so the server-owned dedupe-base pin/lease can
+      // never be silently shadowed by a same-named key in target.payload
+      // (resolveBackupTargets's file/system_image branches don't produce
+      // one today, but nothing enforces that going forward).
+      ...(target.commandType === 'backup_run'
+        ? {
+            baseSnapshotId: dispatchPin.baseSnapshotId,
+            publishLeaseExpiresAt: dispatchPin.publishLeaseExpiresAt!.toISOString(),
+            // Only for a verified base pinned for a capable helper, which
+            // checks the downloaded base manifest against it.
+            ...(dispatchPin.baseAttestation ? { baseAttestation: dispatchPin.baseAttestation } : {}),
+          }
+        : {}),
+    };
+    // A backup to S3 storage carries a write-scoped storage session
+    // (server-issued snapshot id, base manifest from the dispatch pin only);
+    // a target for which none can be issued is refused, never sent the
+    // destination instead.
+    const delivery = await brokerWorkerBackupPayload({
+      orgId: data.orgId,
+      jobId: commandJobId,
+      deviceId: data.deviceId,
+      configId: data.configId,
+      commandType: target.commandType,
+      provider: destination.provider,
+      providerConfig: destination.providerConfig,
+      payload: targetPayload,
+      baseSnapshotId: target.commandType === 'backup_run' ? dispatchPin.baseSnapshotId : null,
+    });
+    if (delivery.mode === 'retry') throw new TransientWriteSessionError();
+    if (delivery.mode === 'held' || delivery.mode === 'refused') {
+      // Nothing is sent for this target, and its row is failed rather than
+      // left in flight: either the device's helper report was withdrawn (a
+      // re-enrollment) after the Phase 1 check, or a write session could not
+      // be issued — the storage destination is never sent instead.
+      const detail = delivery.mode === 'held' ? BACKUP_HELPER_UNREPORTED_MESSAGE : delivery.message;
+      if (commandJobId === data.jobId) {
+        parentFailureDetail = detail;
+      } else {
+        await db
+          .update(backupJobs)
+          .set({ status: 'failed', completedAt: new Date(), updatedAt: new Date(), errorLog: detail })
+          .where(eq(backupJobs.id, commandJobId));
+      }
+      recordBackupWriteDispatch(target.commandType, 'refused', delivery.reason);
+      preFailedTargets.push(delivery.mode === 'held'
+        ? `${target.commandType} (device has not reported its backup helper)`
+        : `${target.commandType} (${delivery.reason})`);
+      continue;
+    }
+
     const command: AgentCommand = {
       id: commandJobId,
       type: target.commandType,
-      payload: {
-        jobId: commandJobId,
-        configId: data.configId,
-        provider: destination.provider,
-        providerConfig: destination.providerConfig,
-        storageEncryption: destination.storageEncryption,
-        ...target.payload,
-        // Payload fields stay file/system_image-only (spec §3.1) even though
-        // storage_identity is now stamped for every target above. Spread
-        // LAST (review fix) so the server-owned dedupe-base pin/lease can
-        // never be silently shadowed by a same-named key in target.payload
-        // (resolveBackupTargets's file/system_image branches don't produce
-        // one today, but nothing enforces that going forward).
-        ...(target.commandType === 'backup_run'
-          ? {
-              baseSnapshotId: dispatchPin.baseSnapshotId,
-              publishLeaseExpiresAt: dispatchPin.publishLeaseExpiresAt!.toISOString(),
-            }
-          : {}),
-      },
+      payload: delivery.payload,
     };
 
     // Record the server-side dispatch expectation BEFORE sending so the WS
@@ -1291,10 +1834,15 @@ async function prepareBackupDispatchTargets(
     // fail-closed on arrival (dropped), not trusted.
     await recordDispatchedExpectation('backup', data.deviceId, commandJobId);
 
-    prepared.push({ commandJobId, command, commandType: target.commandType });
+    prepared.push({
+      commandJobId,
+      command,
+      commandType: target.commandType,
+      writeDelivery: { mode: delivery.mode, reason: delivery.reason },
+    });
   }
 
-  return { status: 'ok', prepared, preFailedTargets, backupMode, targetCount: targets.length };
+  return { status: 'ok', prepared, preFailedTargets, parentFailureDetail, backupMode, targetCount: targets.length };
 }
 
 /**
@@ -1367,9 +1915,10 @@ async function settleUndeliveredDispatchTargets(
 }
 
 async function processDispatchBackup(
-  data: DispatchBackupJobData,
+  initialData: DispatchBackupJobData,
   opts: { redelivered?: boolean } = {},
 ): Promise<{ dispatched: boolean }> {
+  let data = initialData;
   // #4137 — refuse a re-delivery outright. Phase 3 below INSERTs a fresh
   // `backup_jobs` child row per extra target and commits it before the Phase-4
   // sends, so re-running it duplicates the child set (stranding the previous
@@ -1401,16 +1950,45 @@ async function processDispatchBackup(
 
   // Phase 2 — connectivity check with NO DB context open (#1105).
   if (!(await isAgentConnectedAnywhere(agentId))) {
-    await runWithSystemDbAccess(() => markJobFailed(data.jobId, 'Agent not connected'));
-    return { dispatched: false };
+    const waiting = await runWithSystemDbAccess(() => deferUntilAgentConnectsOrFail(data));
+    if (!waiting) return { dispatched: false };
+    // #11013: an agent that connected before the row was stamped had a sweep
+    // that found nothing to run, and no later connect is coming. Checking again
+    // AFTER the stamp means every connect is seen by this check or by the sweep.
+    if (!(await isAgentConnectedAnywhere(agentId))) return { dispatched: false };
+    data = { ...data, catchUpDispatch: true };
+  }
+
+  // Unknown is not "older helper": wait for the device's first report
+  // instead of building a payload for a helper it may not have. Redis I/O,
+  // so also with no DB context open. A job that waited for its device is
+  // retried by the check-schedules sweep instead: a queued wait alongside that
+  // sweep could dispatch it twice.
+  if (precheck.helperProtocolsUnreported) {
+    if (data.catchUpDispatch) {
+      console.log(`[BackupWorker] Job ${data.jobId} waits for device ${data.deviceId} to report its backup helper; the catch-up sweep tries again`);
+      return { dispatched: false };
+    }
+    return holdForHelperReport(data);
   }
 
   // Phase 3 — resolve targets, build every command payload and record its
   // dispatch expectation: another short system DB context, then it CLOSES
   // before any target is actually sent.
-  const prepare = await runWithSystemDbAccess(() => prepareBackupDispatchTargets(data, config));
+  let prepare: BackupDispatchPrepare;
+  try {
+    prepare = await runWithSystemDbAccess(() => prepareBackupDispatchTargets(data, config));
+  } catch (err) {
+    if (!(err instanceof TransientWriteSessionError)) throw err;
+    // Nothing was committed and nothing was sent: try the dispatch again.
+    if (data.catchUpDispatch) return { dispatched: false }; // the rollback left it waiting
+    return holdForHelperReport(data, {
+      message: backupWriteRefusalMessage('mint_failed'),
+      log: 'could not be issued a write session in time',
+    });
+  }
   if (prepare.status === 'done') return prepare.result;
-  const { prepared, preFailedTargets, backupMode, targetCount } = prepare;
+  const { prepared, preFailedTargets, backupMode, targetCount, parentFailureDetail: preparedParentFailure } = prepare;
 
   // Phase 4 — the actual WS/relay sends, NO DB context open. Each
   // dispatchCommandToAgent call may poll for a relay ack for up to
@@ -1427,46 +2005,39 @@ async function processDispatchBackup(
   const sendState = new Map<string, TargetSendState>(
     prepared.map((target) => [target.commandJobId, 'not-attempted' as TargetSendState])
   );
-  let parentFailureDetail: string | null = null;
-  let deviceOrgChanged = false;
+  let parentFailureDetail: string | null = preparedParentFailure;
+  let dispatchRefusal: string | null = null;
+  // Set when ownership changed AFTER at least one target was sent: the sent
+  // targets are stopped on the helper and every row settles as failed.
+  let sentWorkRevoked = false;
+
+  const failUnattemptedTargets = (refusal: string): void => {
+    for (const pending of prepared) {
+      if (sendState.get(pending.commandJobId) !== 'not-attempted') continue;
+      sendState.set(pending.commandJobId, 'failed');
+      failedTargets.push(`${pending.commandType} (${refusal})`);
+      if (pending.commandJobId === data.jobId) {
+        parentFailureDetail = refusal;
+      } else {
+        failedChildJobs.push({ commandJobId: pending.commandJobId, detail: refusal });
+      }
+    }
+  };
 
   try {
     for (const target of prepared) {
       // Re-read after payload preparation and between sends: enqueue-time
-      // ownership cannot authorize a backup on a device moved to another org.
-      // Keep the relay acknowledgement wait outside the short DB context.
-      const admitted = await runWithSystemDbAccess(async () => {
-        const [device] = await db.select({ orgId: devices.orgId }).from(devices)
-          .where(eq(devices.id, data.deviceId)).limit(1);
-        if (device?.orgId === data.orgId) return true;
-
-        console.warn('[BackupWorker] Refusing backup dispatch: device_org_changed', {
-          jobId: data.jobId, deviceId: data.deviceId, orgId: data.orgId,
-        });
-        createAuditLogAsync({
-          orgId: data.orgId,
-          actorType: 'system',
-          actorId: '00000000-0000-0000-0000-000000000000',
-          action: 'backup.dispatch.denied',
-          resourceType: 'backup_job',
-          resourceId: data.jobId,
-          result: 'failure',
-          details: { deviceId: data.deviceId, reason: 'device_org_changed' },
-        });
-        return false;
-      });
-      if (!admitted) {
-        deviceOrgChanged = true;
-        for (const pending of prepared) {
-          if (sendState.get(pending.commandJobId) !== 'not-attempted') continue;
-          sendState.set(pending.commandJobId, 'failed');
-          failedTargets.push(`${pending.commandType} (device_org_changed)`);
-          if (pending.commandJobId === data.jobId) {
-            parentFailureDetail = 'device_org_changed';
-          } else {
-            failedChildJobs.push({ commandJobId: pending.commandJobId, detail: 'device_org_changed' });
-          }
-        }
+      // ownership cannot authorize a backup on a device moved to another org,
+      // and a config edited since the job was enqueued no longer describes
+      // what this send would run. Keep the relay acknowledgement wait outside
+      // the short DB context. A device parked in a holding org is refused here
+      // as well.
+      const refusal = await runWithSystemDbAccess(
+        () => readBackupDispatchRefusal(data, { checkConfigGeneration: true }),
+      );
+      if (refusal !== null) {
+        dispatchRefusal = refusal;
+        failUnattemptedTargets(refusal);
         break;
       }
 
@@ -1477,6 +2048,29 @@ async function processDispatchBackup(
       if (outcome.status === 'sent') {
         sendState.set(target.commandJobId, 'sent');
         sentCount++;
+        // A target carries either a write session or a local path (not a
+        // credential); nothing else is ever prepared.
+        recordBackupWriteDispatch(
+          target.commandType,
+          target.writeDelivery.mode,
+          target.writeDelivery.mode === 'brokered' ? 'ok' : 'no_credential',
+        );
+
+        // The pre-send re-read cannot hold a lock across the send (the relay
+        // acknowledgement wait must not pin a pooled connection), so a move
+        // can land between that read and the send itself. Read ownership
+        // again now that the command is out: if the device left the job's
+        // organization meanwhile, the sent work is stopped on the helper and
+        // the job fails instead of running under the old organization.
+        const movedDuringSend = await runWithSystemDbAccess(
+          () => readBackupDispatchRefusal(data, { checkConfigGeneration: false }),
+        );
+        if (movedDuringSend !== null) {
+          dispatchRefusal = movedDuringSend;
+          sentWorkRevoked = true;
+          failUnattemptedTargets(movedDuringSend);
+          break;
+        }
         continue;
       }
 
@@ -1493,6 +2087,34 @@ async function processDispatchBackup(
         failedChildJobs.push({ commandJobId: target.commandJobId, detail });
       } else {
         parentFailureDetail = detail;
+      }
+    }
+
+    // Work that went out before the device left the job's organization is
+    // stopped on the helper, each target by its own job id. The stop is a
+    // durable device_commands row the device picks up on its next claim: this
+    // worker may run on an instance that holds no agent sockets, so it never
+    // goes through the socket-local queue (commandQueue.ts).
+    if (sentWorkRevoked) {
+      const revokeDetail = dispatchRefusal ?? 'device_org_changed';
+      for (const target of prepared) {
+        if (sendState.get(target.commandJobId) !== 'sent') continue;
+        try {
+          await runWithSystemDbAccess(() => db.transaction((tx) => insertQueuedCommandInTransaction(tx, {
+            id: randomUUID(),
+            deviceId: data.deviceId,
+            type: CommandTypes.BACKUP_STOP,
+            // jobId targets one workload on a queue-capable helper; older
+            // helpers ignore it and stop every backup on the device.
+            payload: { reason: 'cancelled', jobId: target.commandJobId },
+            createdBy: null,
+          })));
+        } catch (err) {
+          console.warn(`[BackupWorker] Failed to queue backup_stop for job ${target.commandJobId}:`, err);
+        }
+        if (target.commandJobId !== data.jobId) {
+          failedChildJobs.push({ commandJobId: target.commandJobId, detail: revokeDetail });
+        }
       }
     }
 
@@ -1513,14 +2135,14 @@ async function processDispatchBackup(
         return { dispatched: false };
       }
 
-      if (sentCount === 0) {
+      if (sentCount === 0 || sentWorkRevoked) {
         await markJobFailed(
           data.jobId,
-          deviceOrgChanged
-            ? 'device_org_changed'
-            : lastNonOfflineOutcomeStatus
+          dispatchRefusal
+            ?? preparedParentFailure
+            ?? (lastNonOfflineOutcomeStatus
               ? `Failed to send command to agent (dispatch outcome ${lastNonOfflineOutcomeStatus})`
-              : 'Failed to send command to agent',
+              : 'Failed to send command to agent'),
         );
         return { dispatched: false };
       }
@@ -1563,7 +2185,8 @@ async function processDispatchBackup(
           inArray(backupJobs.status, ['pending', 'running']),
           // Helper admission/start can race this post-send write. Its lifecycle
           // signal wins; never promote queued work or reset execution start.
-          isNull(backupJobs.lastProgressAt)
+          // Every helper lifecycle signal stamps last_keepalive_at (#2798).
+          isNull(backupJobs.lastKeepaliveAt)
         ));
 
       console.log(
@@ -1610,6 +2233,9 @@ async function processResults(
       ...result,
       error: data.result.error,
     },
+    // Carried from the WS handler that consumed the dispatch expectation; a
+    // queue item without it never records a snapshot attestation.
+    dispatchExpectationVerified: data.dispatchExpectationVerified === true,
   });
 
   console.log(
@@ -1623,6 +2249,58 @@ async function processResults(
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/**
+ * Why a prepared backup must not be (or must no longer be) dispatched: the
+ * device left the job's organization, was parked in a holding org, or — when
+ * asked — its config was edited since the job was enqueued. Null when it may
+ * proceed. A refusal is logged and audited here. The caller opens the short
+ * system DB context this runs in.
+ */
+async function readBackupDispatchRefusal(
+  data: DispatchBackupJobData,
+  options: { checkConfigGeneration: boolean },
+): Promise<string | null> {
+  const [device] = await db.select({ orgId: devices.orgId }).from(devices)
+    .where(eq(devices.id, data.deviceId)).limit(1);
+  let reason: string | null = device?.orgId !== data.orgId
+    ? 'device_org_changed'
+    : (await isParkedDevice(db, data.deviceId)) ? PARKED_DEVICE_CANCEL_REASON : null;
+
+  if (reason === null && options.checkConfigGeneration && data.configGeneration !== undefined) {
+    const [config] = await db.select({ approvalGeneration: backupConfigs.approvalGeneration })
+      .from(backupConfigs)
+      .where(eq(backupConfigs.id, data.configId))
+      .limit(1);
+    if (config?.approvalGeneration !== data.configGeneration) reason = 'backup_config_changed';
+  }
+  if (reason === null) return null;
+
+  logBackupDispatchRefusal(data, reason);
+  return reason;
+}
+
+/** Fail the job and record why its dispatch was refused. */
+async function refuseBackupDispatch(data: DispatchBackupJobData, reason: string): Promise<void> {
+  logBackupDispatchRefusal(data, reason);
+  await markJobFailed(data.jobId, reason);
+}
+
+function logBackupDispatchRefusal(data: DispatchBackupJobData, reason: string): void {
+  console.warn(`[BackupWorker] Refusing backup dispatch: ${reason}`, {
+    jobId: data.jobId, deviceId: data.deviceId, orgId: data.orgId,
+  });
+  createAuditLogAsync({
+    orgId: data.orgId,
+    actorType: 'system',
+    actorId: '00000000-0000-0000-0000-000000000000',
+    action: 'backup.dispatch.denied',
+    resourceType: 'backup_job',
+    resourceId: data.jobId,
+    result: 'failure',
+    details: { deviceId: data.deviceId, reason },
+  });
+}
 
 async function markJobFailed(jobId: string, error: string): Promise<void> {
   await db
@@ -1647,6 +2325,16 @@ async function markBackupJobCancelled(jobId: string, error: string): Promise<voi
       eq(backupJobs.id, jobId),
       inArray(backupJobs.status, ['pending', 'running'])
     ));
+}
+
+async function isBackupJobStillPending(jobId: string): Promise<boolean> {
+  const [row] = await db
+    .select({ status: backupJobs.status })
+    .from(backupJobs)
+    .where(eq(backupJobs.id, jobId))
+    .limit(1);
+
+  return row?.status === 'pending';
 }
 
 async function isBackupJobCancelled(jobId: string): Promise<boolean> {

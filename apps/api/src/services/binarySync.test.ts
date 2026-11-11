@@ -1134,6 +1134,248 @@ describe("binarySync", () => {
     });
   });
 
+  describe("local-binary helper installer registration (#6872)", () => {
+    function setLocalEnv() {
+      process.env.BINARY_SOURCE = "local";
+      process.env.AGENT_BINARY_DIR = "/fake/agent/bin";
+      process.env.HELPER_BINARY_DIR = "/fake/helper/bin";
+      process.env.BINARY_VERSION_FILE = "/fake/version";
+      delete process.env.BREEZE_VERSION;
+      fsMocks.stat.mockResolvedValue({ isFile: () => true, size: 4096 } as any);
+      mockReadFileVersionOnly("0.116.0");
+    }
+
+    // readdir is called once for the agent dir and once for the helper dir;
+    // route by path so the two directories can hold different files.
+    function mockDirs(agentFiles: string[], helperFiles: string[]) {
+      fsMocks.readdir.mockImplementation(async (dir: any) => {
+        if (String(dir).includes("/fake/helper/bin")) return helperFiles as any;
+        return agentFiles as any;
+      });
+    }
+
+    afterEach(() => {
+      delete process.env.HELPER_BINARY_DIR;
+    });
+
+    it("registers component=helper rows for every installer present, two for the shared macOS dmg", async () => {
+      setLocalEnv();
+      mockDirs(
+        ["breeze-agent-windows-amd64.exe"],
+        ["breeze-helper-windows.msi", "breeze-helper-macos.dmg", "breeze-helper-linux.AppImage"],
+      );
+
+      await syncBinaries();
+
+      const rows = dbMocks.insertValues.mock.calls
+        .map((call: any[]) => call[0] as Record<string, unknown>)
+        .filter((v) => v.component === "helper");
+      expect(rows.map((r) => `${r.platform}/${r.architecture}`).sort()).toEqual([
+        "linux/amd64",
+        "macos/amd64",
+        "macos/arm64",
+        "windows/amd64",
+      ]);
+      const win = rows.find((r) => r.platform === "windows")!;
+      expect(win).toMatchObject({
+        version: "0.116.0",
+        component: "helper",
+        isLatest: true,
+        downloadUrl: "http://localhost:3001/api/v1/agents/download/helper/windows/amd64",
+      });
+      expect(JSON.parse(win.releaseManifest as string)).toMatchObject({
+        version: "0.116.0",
+        component: "helper",
+        platform: "windows",
+        arch: "amd64",
+      });
+      const dmg = rows.filter((r) => r.platform === "macos");
+      expect(dmg[0]!.checksum).toBe(dmg[1]!.checksum);
+      expect(rows.find((r) => r.platform === "macos" && r.architecture === "arm64")!.downloadUrl)
+        .toBe("http://localhost:3001/api/v1/agents/download/helper/darwin/arm64"); // registerLocalBinaries maps macos → darwin in the route param
+    });
+
+    it("registers only the macOS rows when only the dmg is present", async () => {
+      setLocalEnv();
+      mockDirs(["breeze-agent-windows-amd64.exe"], ["breeze-helper-macos.dmg"]);
+
+      await syncBinaries();
+
+      const rows = dbMocks.insertValues.mock.calls
+        .map((call: any[]) => call[0] as Record<string, unknown>)
+        .filter((v) => v.component === "helper");
+      expect(rows.map((r) => `${r.platform}/${r.architecture}`).sort()).toEqual([
+        "macos/amd64",
+        "macos/arm64",
+      ]);
+    });
+
+    it("warns once and still registers the agent when the helper dir is missing or empty", async () => {
+      setLocalEnv();
+      fsMocks.readdir.mockImplementation(async (dir: any) => {
+        if (String(dir).includes("/fake/helper/bin")) throw new Error("ENOENT");
+        return ["breeze-agent-windows-amd64.exe"] as any;
+      });
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      await expect(syncBinaries()).resolves.toBeUndefined();
+
+      const rows = dbMocks.insertValues.mock.calls.map((c: any[]) => c[0] as Record<string, unknown>);
+      expect(rows.some((v) => v.component === "agent")).toBe(true);
+      expect(rows.some((v) => v.component === "helper")).toBe(false);
+      expect(
+        warnSpy.mock.calls.filter((args) => String(args[0] ?? "").includes("helper installer")).length,
+      ).toBe(1);
+      warnSpy.mockRestore();
+    });
+
+    it("warns exactly once when the helper dir exists but holds no installer (empty helper dir)", async () => {
+      setLocalEnv();
+      mockDirs(["breeze-agent-windows-amd64.exe"], []);
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      await expect(syncBinaries()).resolves.toBeUndefined();
+
+      const rows = dbMocks.insertValues.mock.calls.map((c: any[]) => c[0] as Record<string, unknown>);
+      expect(rows.some((v) => v.component === "agent")).toBe(true);
+      expect(rows.some((v) => v.component === "helper")).toBe(false);
+      expect(
+        warnSpy.mock.calls.filter((args) => String(args[0] ?? "").includes("helper installer")).length,
+      ).toBe(1);
+      warnSpy.mockRestore();
+    });
+
+    it("defaults HELPER_BINARY_DIR to the agent dir (AGENT_BINARY_DIR) when unset", async () => {
+      setLocalEnv();
+      delete process.env.HELPER_BINARY_DIR;
+      const seen: string[] = [];
+      fsMocks.readdir.mockImplementation(async (dir: any) => {
+        seen.push(String(dir));
+        return ["breeze-agent-windows-amd64.exe"] as any;
+      });
+
+      await syncBinaries();
+
+      // binaryStoreDir("helper") — the same resolution the Helper download
+      // uses (#7515). An unset HELPER_BINARY_DIR follows AGENT_BINARY_DIR, not
+      // a cwd-relative ./agent/bin that exists only in a dev checkout.
+      expect(seen.length).toBeGreaterThan(0);
+      expect(seen.every((d) => d === "/fake/agent/bin")).toBe(true);
+    });
+
+    it("isolates helper registration failures after the agent succeeds", async () => {
+      setLocalEnv();
+      mockDirs(["breeze-agent-windows-amd64.exe"], ["breeze-helper-windows.msi"]);
+      const defaultTxImpl = async (fn: (tx: any) => Promise<void>) => fn(dbMocks.tx);
+      dbMocks.transaction.mockImplementation(async (fn: (tx: any) => Promise<void>) => {
+        const insertWrap = vi.fn((row: Record<string, unknown>) => {
+          if (row.component === "helper") throw new Error("simulated helper upsert failure");
+          return (dbMocks.insertValues as any)(row);
+        });
+        return fn({ update: dbMocks.tx.update, insert: vi.fn(() => ({ values: insertWrap })) });
+      });
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        await expect(syncBinaries()).resolves.toBeUndefined();
+        const rows = dbMocks.insertValues.mock.calls.map((c: any[]) => c[0] as Record<string, unknown>);
+        expect(rows.some((v) => v.component === "agent")).toBe(true);
+        expect(rows.some((v) => v.component === "helper")).toBe(false);
+        expect(
+          errorSpy.mock.calls.some((args) =>
+            String(args[0] ?? "").includes("Failed to register local helper installers"),
+          ),
+        ).toBe(true);
+      } finally {
+        errorSpy.mockRestore();
+        dbMocks.transaction.mockImplementation(defaultTxImpl);
+      }
+    });
+
+    // Manifest-first tier (Task 2, #6872): official manifest coverage first,
+    // per-deployment re-signing for the remainder, and a manifest-refused
+    // asset excluded from both — same fail-closed shape as the agent/
+    // user-helper/watchdog loops above (D4, #3836). Extracted locally rather
+    // than reusing the `:1554`/`:1796` describes' helpers verbatim, since
+    // those hard-code "local agent bytes"/size 18 fixtures that don't match
+    // this describe's stat mock (size 4096); the staging approach (manifest
+    // JSON + signature bytes fed through fsMocks.readFile, keyed off path
+    // suffix) is the same.
+    function stageOfficialManifestCovering(
+      filenames: string[],
+      opts: { checksumMismatch?: boolean } = {},
+    ) {
+      const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+      const publicDer = publicKey.export({ format: "der", type: "spki" }) as Buffer;
+      const rawPublicKey = publicDer.subarray(publicDer.length - 32).toString("base64");
+      // Matches what computeStreamingChecksum(filePath) yields for every
+      // helper installer in this describe — node:fs's createReadStream is
+      // mocked (unconditionally, regardless of path) to "local agent bytes".
+      const localFileChecksum = createHash("sha256").update("local agent bytes").digest("hex");
+      const manifest = Buffer.from(
+        JSON.stringify({
+          schemaVersion: 1,
+          repository: "LanternOps/breeze",
+          release: "v1.2.3",
+          assets: filenames.map((name) => ({
+            name,
+            sha256: opts.checksumMismatch ? "b".repeat(64) : localFileChecksum,
+            size: 4096, // matches this describe's fsMocks.stat size
+            platformTrust: fixturePlatformTrust(name),
+            edition: "self-host",
+          })),
+        }),
+      );
+      const signature = Buffer.from(sign(null, manifest, privateKey).toString("base64"));
+      process.env.RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS = rawPublicKey;
+      fsMocks.readFile.mockImplementation((path: unknown) => {
+        if (typeof path === "string" && path.endsWith("release-artifact-manifest.json.ed25519")) {
+          return Promise.resolve(signature);
+        }
+        if (typeof path === "string" && path.endsWith("release-artifact-manifest.json")) {
+          return Promise.resolve(manifest);
+        }
+        return Promise.resolve("0.116.0");
+      });
+    }
+
+    afterEach(() => {
+      delete process.env.RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS;
+    });
+
+    it("registers manifest-covered helper installers against the official manifest and re-signs the rest", async () => {
+      setLocalEnv();
+      mockDirs(["breeze-agent-windows-amd64.exe"], ["breeze-helper-windows.msi", "breeze-helper-linux.AppImage"]);
+      // Stage an official manifest that covers ONLY breeze-helper-windows.msi
+      stageOfficialManifestCovering(["breeze-helper-windows.msi"]);
+
+      await syncBinaries();
+
+      const rows = dbMocks.insertValues.mock.calls
+        .map((c: any[]) => c[0] as Record<string, unknown>)
+        .filter((v) => v.component === "helper");
+      const win = rows.find((r) => r.platform === "windows")!;
+      const linux = rows.find((r) => r.platform === "linux")!;
+      expect(win.signingKeyId).toBe("release-artifact-manifest-ed25519");
+      expect(linux.signingKeyId).not.toBe("release-artifact-manifest-ed25519");
+    });
+
+    it("does not re-sign a helper installer the manifest refused (D4 #3836)", async () => {
+      setLocalEnv();
+      mockDirs(["breeze-agent-windows-amd64.exe"], ["breeze-helper-windows.msi"]);
+      // Stage a manifest that lists breeze-helper-windows.msi with a sha256 that
+      // does NOT match the file → registerFromOfficialManifest puts it in
+      // excludedFilenames.
+      stageOfficialManifestCovering(["breeze-helper-windows.msi"], { checksumMismatch: true });
+
+      await syncBinaries();
+
+      const rows = dbMocks.insertValues.mock.calls
+        .map((c: any[]) => c[0] as Record<string, unknown>)
+        .filter((v) => v.component === "helper");
+      expect(rows).toHaveLength(0);
+    });
+  });
+
   // #1802: the local-binary path historically registered ONLY the agent
   // component, so self-hosters on BINARY_SOURCE=local never got watchdog
   // auto-update. It now also scans + registers breeze-watchdog-* siblings.
@@ -1900,6 +2142,139 @@ describe("binarySync", () => {
       expect(dbMocks.insertValues).toHaveBeenCalledWith(
         expect.objectContaining({ signingKeyId: "deploy-test-aaaaaaaa" }),
       );
+    });
+
+    // #11297: backup used to be re-signed with the per-deployment key even
+    // when the staged official manifest covered it, so an agent that trusts
+    // only the official key refused the backup artifact — and because the
+    // agent requires a matching backup artifact before it upgrades, the whole
+    // agent upgrade stalled. Backup now takes the same two tiers as the
+    // agent/user-helper/watchdog/helper loops.
+    describe("backup component (#11297)", () => {
+      function backupRows() {
+        return dbMocks.insertValues.mock.calls
+          .map((c: any[]) => c[0] as Record<string, unknown>)
+          .filter((v) => v.component === "backup");
+      }
+
+      function scanAgentAndBackup() {
+        fsMocks.readdir.mockResolvedValue([
+          "breeze-agent-linux-amd64",
+          "breeze-backup-linux-amd64",
+        ] as any);
+      }
+
+      it("registers a manifest-covered backup binary against the official key, not the per-deployment re-sign", async () => {
+        setLocalScanEnv();
+        scanAgentAndBackup();
+        const checksum = localAssetChecksum();
+        const official = makeOfficialLocalManifest([
+          { name: "breeze-agent-linux-amd64", sha256: checksum, size: 18, edition: "self-host" },
+          { name: "breeze-backup-linux-amd64", sha256: checksum, size: 18, edition: "self-host" },
+        ]);
+        process.env.RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS = official.publicKey;
+        mockReadFileWithOfficialManifest("0.65.9", official.manifest, official.signature);
+
+        await syncBinaries();
+
+        const rows = backupRows();
+        expect(rows).toHaveLength(1);
+        expect(rows[0]).toMatchObject({
+          component: "backup",
+          platform: "linux",
+          architecture: "amd64",
+          signingKeyId: "release-artifact-manifest-ed25519",
+          releaseManifest: official.manifest.toString("utf8"),
+          checksum,
+        });
+        expect(rows[0]!.downloadUrl).toContain("/agents/download/backup/linux/amd64");
+        // Both assets were covered — the per-deployment key signed nothing.
+        expect(manifestSigningMocks.signManifest).not.toHaveBeenCalled();
+      });
+
+      it("falls back to per-deployment re-signing for a backup binary the manifest does not cover", async () => {
+        setLocalScanEnv();
+        scanAgentAndBackup();
+        const checksum = localAssetChecksum();
+        const official = makeOfficialLocalManifest([
+          { name: "breeze-agent-linux-amd64", sha256: checksum, size: 18, edition: "self-host" },
+        ]);
+        process.env.RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS = official.publicKey;
+        mockReadFileWithOfficialManifest("0.65.9", official.manifest, official.signature);
+
+        await syncBinaries();
+
+        const rows = backupRows();
+        expect(rows).toHaveLength(1);
+        expect(rows[0]).toMatchObject({ signingKeyId: "deploy-test-aaaaaaaa" });
+        expect(manifestSigningMocks.signManifest).toHaveBeenCalledTimes(1);
+      });
+
+      it("splits a mixed backup set: the covered arch registers officially, the uncovered arch is re-signed, each exactly once", async () => {
+        setLocalScanEnv();
+        fsMocks.readdir.mockResolvedValue([
+          "breeze-agent-linux-amd64",
+          "breeze-backup-linux-amd64",
+          "breeze-backup-linux-arm64",
+        ] as any);
+        const checksum = localAssetChecksum();
+        const official = makeOfficialLocalManifest([
+          { name: "breeze-agent-linux-amd64", sha256: checksum, size: 18, edition: "self-host" },
+          { name: "breeze-backup-linux-amd64", sha256: checksum, size: 18, edition: "self-host" },
+        ]);
+        process.env.RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS = official.publicKey;
+        mockReadFileWithOfficialManifest("0.65.9", official.manifest, official.signature);
+
+        await syncBinaries();
+
+        const rows = backupRows();
+        expect(rows).toHaveLength(2);
+        expect(rows.find((r) => r.architecture === "amd64")).toMatchObject({
+          signingKeyId: "release-artifact-manifest-ed25519",
+        });
+        expect(rows.find((r) => r.architecture === "arm64")).toMatchObject({
+          signingKeyId: "deploy-test-aaaaaaaa",
+        });
+        expect(manifestSigningMocks.signManifest).toHaveBeenCalledTimes(1);
+      });
+
+      it("excludes a backup binary the manifest refused from BOTH tiers (fail closed, D4 #3836)", async () => {
+        setLocalScanEnv();
+        scanAgentAndBackup();
+        const checksum = localAssetChecksum();
+        const official = makeOfficialLocalManifest([
+          { name: "breeze-agent-linux-amd64", sha256: checksum, size: 18, edition: "self-host" },
+          // Checksum disagrees with the local file → present but refused.
+          { name: "breeze-backup-linux-amd64", sha256: "b".repeat(64), size: 18, edition: "self-host" },
+        ]);
+        process.env.RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS = official.publicKey;
+        mockReadFileWithOfficialManifest("0.65.9", official.manifest, official.signature);
+        const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+        const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+        try {
+          await syncBinaries();
+
+          expect(backupRows()).toHaveLength(0);
+          // The operator is told backup auto-update is unavailable, not that
+          // the scanned binary "registered".
+          expect(
+            warnSpy.mock.calls.some((args) =>
+              String(args[0] ?? "").includes("Every local backup binary was refused"),
+            ),
+          ).toBe(true);
+          expect(manifestSigningMocks.signManifest).not.toHaveBeenCalled();
+          expect(
+            errorSpy.mock.calls.some((args) =>
+              String(args[0] ?? "").includes("Checksum mismatch") &&
+              String(args[0] ?? "").includes("breeze-backup-linux-amd64"),
+            ),
+          ).toBe(true);
+        } finally {
+          errorSpy.mockRestore();
+          warnSpy.mockRestore();
+        }
+      });
     });
   });
 
@@ -2819,6 +3194,7 @@ describe("boot sync is pinned to the server's own release (#3742)", () => {
     delete process.env.BINARY_GITHUB_REPOSITORY;
     delete process.env.GITHUB_REPO;
     delete process.env.BINARY_VERSION;
+    delete process.env.BREEZE_BINARIES_VERSION;
     delete process.env.BREEZE_VERSION;
     delete process.env.APP_VERSION;
     delete process.env.BINARY_EDITION;
@@ -2918,6 +3294,92 @@ describe("boot sync is pinned to the server's own release (#3742)", () => {
     expect(fetchSpy).not.toHaveBeenCalledWith(
       `${apiBase}/releases/latest`,
       expect.anything(),
+    );
+  });
+
+  it("local-mode BINARY_VERSION registers all four signed Windows components without changing the server version", async () => {
+    process.env.BINARY_SOURCE = "local";
+    process.env.AGENT_BINARY_DIR = "/fake/agent/bin";
+    process.env.BINARY_VERSION_FILE = "/fake/version";
+    process.env.BINARY_VERSION = " 0.121.6 ";
+    process.env.BREEZE_VERSION = "0.121.5";
+    process.env.AGENT_AUTO_PROMOTE = "true";
+    fsMocks.readdir.mockResolvedValue([
+      "breeze-agent-windows-amd64.exe",
+      "breeze-user-helper-windows-amd64.exe",
+      "breeze-watchdog-windows-amd64.exe",
+      "breeze-backup-windows-amd64.exe",
+    ] as any);
+    fsMocks.stat.mockResolvedValue({ isFile: () => true, size: 4096 } as any);
+    mockReadFileVersionOnly("0.121.6\n");
+    const fetchSpy = stubNotFoundFetch();
+    dbMocks.select.mockReturnValue({
+      from: vi.fn().mockReturnValue({
+        where: vi.fn().mockResolvedValue([
+          { component: "agent", platform: "windows", architecture: "amd64", isLatest: true },
+          { component: "backup", platform: "windows", architecture: "amd64", isLatest: true },
+        ]),
+      }),
+    });
+
+    await syncBinaries();
+
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(process.env.BREEZE_VERSION).toBe("0.121.5");
+    expect(drizzleSpies.eq.mock.calls.some(([, value]) => value === "0.121.6")).toBe(true);
+    expect(drizzleSpies.eq.mock.calls.some(([, value]) => value === "0.121.5")).toBe(false);
+    const rows = dbMocks.insertValues.mock.calls.map((call: any[]) => call[0]);
+    expect(rows.map((row) => row.component).sort()).toEqual([
+      "agent", "backup", "user-helper", "watchdog",
+    ]);
+    for (const row of rows) {
+      expect(row).toMatchObject({
+        version: "0.121.6", platform: "windows", architecture: "amd64",
+        edition: "self-host", isLatest: true,
+        manifestSignature: "test-signature-base64",
+        signingKeyId: "deploy-test-aaaaaaaa",
+      });
+      expect(JSON.parse(row.releaseManifest)).toMatchObject({
+        version: "0.121.6", component: row.component, checksum: row.checksum,
+      });
+    }
+  });
+
+  it("local-mode rejects a stale hosted volume even when it matches the server but not BINARY_VERSION", async () => {
+    process.env.BINARY_SOURCE = "local";
+    process.env.BINARY_EDITION = "hosted";
+    process.env.BINARY_VERSION_FILE = "/fake/version";
+    process.env.BINARY_VERSION = "0.121.6";
+    process.env.BREEZE_VERSION = "0.121.5";
+    mockReadFileVersionOnly("0.121.5");
+    const fetchSpy = stubNotFoundFetch();
+
+    await expect(syncBinaries()).rejects.toThrow(
+      /BINARY_EDITION=hosted refuses to fall back.*expected binary version=0\.121\.6/,
+    );
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(dbMocks.insertValues).not.toHaveBeenCalled();
+  });
+
+  it("the registration safety net follows BINARY_VERSION instead of the older API version", async () => {
+    process.env.BINARY_SOURCE = "local";
+    process.env.AGENT_BINARY_DIR = "/fake/agent/bin";
+    process.env.BINARY_VERSION_FILE = "/fake/version";
+    process.env.BINARY_VERSION = "0.121.6";
+    process.env.APP_VERSION = "0.121.5";
+    process.env.BREEZE_VERSION = "0.121.5";
+    fsMocks.readdir.mockResolvedValue(["breeze-agent-windows-amd64.exe"] as any);
+    fsMocks.stat.mockResolvedValue({ isFile: () => true, size: 4096 } as any);
+    mockReadFileVersionOnly("0.121.6");
+    dbMocks.select.mockReturnValue({
+      from: vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue([]) }),
+    });
+    const fetchSpy = stubNotFoundFetch();
+
+    await syncBinaries();
+
+    expect(fetchSpy).toHaveBeenCalledExactlyOnceWith(
+      `${apiBase}/releases/tags/v0.121.6`, expect.anything(),
     );
   });
 });

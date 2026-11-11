@@ -1,4 +1,5 @@
-import { vi } from 'vitest';
+import { beforeEach, vi } from 'vitest';
+import { __resetAgentAuthNegativeCacheForTests } from '../middleware/agentAuthNegativeCache';
 
 // Set up test environment variables before any imports
 // JWT_SECRET must be at least 32 characters
@@ -13,6 +14,12 @@ process.env.NODE_ENV = 'test';
 // by deleting this var in their beforeEach; the integration suite runs with
 // real enforcement against the test database.
 process.env.IP_ALLOWLIST_ENFORCEMENT_MODE = 'off';
+// Pin the approver-assurance platform default date far in the future so no
+// suite's outcome depends on the wall clock crossing it. Suites that exercise
+// the platform default set APPROVER_ASSURANCE_DEFAULT_ENFORCE_FROM themselves.
+if (!process.env.APPROVER_ASSURANCE_DEFAULT_ENFORCE_FROM) {
+  process.env.APPROVER_ASSURANCE_DEFAULT_ENFORCE_FROM = '2999-01-01T00:00:00Z';
+}
 
 // Mock Redis client for tests that need it
 vi.mock('../services/redis', () => {
@@ -49,6 +56,20 @@ vi.mock('../services/redis', () => {
   };
 });
 
+// Connection-health reconcile nudges are fire-and-forget BullMQ adds from hot
+// paths (oauth/grantStatus.ts, jobs/syncAttempt.ts). A no-op here keeps every
+// caller's unit test from opening a real BullMQ connection; nudge.test.ts
+// unmocks it, and call-site tests assert against this mock.
+vi.mock('../services/connectionHealth/nudge', () => ({
+  CONNECTION_HEALTH_QUEUE: 'connection-health-reconcile',
+  NUDGE_JOB_NAME: 'reconcile-kind',
+  NUDGE_DELAY_MS: 60_000,
+  nudgeJobId: (kind: string) => `reconcile-kind-${kind}`,
+  nudgeConnectionHealth: vi.fn(),
+  resetNudgeQueueForTests: vi.fn(),
+  closeNudgeQueue: vi.fn(async () => {}),
+}));
+
 /**
  * Test setup for authenticated API tests.
  *
@@ -77,3 +98,11 @@ vi.mock('../services/redis', () => {
  * const res = await client.get('/devices');
  * ```
  */
+
+// #8050 — the agent-auth negative cache is process-wide module state. Without
+// a reset, one test's cached terminal rejection (same agentId + token) would
+// answer the next test's request with a replayed 401/403 before any of its
+// mocks run. Suites that test the cache itself rely on this reset too.
+beforeEach(() => {
+  __resetAgentAuthNegativeCacheForTests();
+});

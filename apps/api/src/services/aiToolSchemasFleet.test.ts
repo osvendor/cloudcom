@@ -141,6 +141,33 @@ describe('manage_patches schema', () => {
   it('rejects allRings on actions other than decline', () => {
     expect(parse('manage_patches', { action: 'approve', patchId: TEST_UUID, allRings: true }).success).toBe(false);
   });
+
+  // #6665: device_history is the read path that closes the "no AI tool sees
+  // scheduled patch jobs" gap.
+  it('requires deviceId for device_history', () => {
+    expect(parse('manage_patches', { action: 'device_history' }).success).toBe(false);
+  });
+
+  it('accepts device_history with deviceId', () => {
+    expect(parse('manage_patches', { action: 'device_history', deviceId: TEST_UUID }).success).toBe(true);
+  });
+
+  it('accepts device_history with since/until/resultStatus/limit', () => {
+    expect(parse('manage_patches', {
+      action: 'device_history',
+      deviceId: TEST_UUID,
+      since: '2026-09-01T00:00:00Z',
+      until: '2026-09-22T00:00:00Z',
+      resultStatus: 'failed',
+      limit: 10,
+    }).success).toBe(true);
+  });
+
+  it('rejects an invalid resultStatus for device_history', () => {
+    expect(parse('manage_patches', {
+      action: 'device_history', deviceId: TEST_UUID, resultStatus: 'approved',
+    }).success).toBe(false);
+  });
 });
 
 // ─── manage_groups ──────────────────────────────────────────────────────
@@ -278,36 +305,22 @@ describe('manage_alert_rules schema', () => {
     expect(parse('manage_alert_rules', { action: 'list_rules' }).success).toBe(true);
   });
 
-  it('accepts list_templates', () => {
-    expect(parse('manage_alert_rules', { action: 'list_templates' }).success).toBe(true);
-    expect(parse('manage_alert_rules', { action: 'list_templates', category: 'performance', severity: 'high' }).success).toBe(true);
-  });
-
-  it('accepts list_channels and alert_summary', () => {
-    expect(parse('manage_alert_rules', { action: 'list_channels' }).success).toBe(true);
-    expect(parse('manage_alert_rules', { action: 'alert_summary' }).success).toBe(true);
-  });
-
-  it('requires ruleId for get_rule/update_rule/delete_rule/test_rule', () => {
-    for (const action of ['get_rule', 'update_rule', 'delete_rule', 'test_rule']) {
-      expect(parse('manage_alert_rules', { action }).success).toBe(false);
-    }
-  });
-
-  it('requires name, templateId, targetType, targetId for create_rule', () => {
-    expect(parse('manage_alert_rules', { action: 'create_rule', name: 'Test' }).success).toBe(false);
-  });
-
-  it('accepts valid create_rule', () => {
+  it.each(['list_templates', 'create_rule', 'update_rule', 'delete_rule'])('rejects retired action %s even with complete input', (action) => {
     expect(parse('manage_alert_rules', {
-      action: 'create_rule',
-      name: 'High CPU alert',
-      templateId: TEST_UUID,
-      targetType: 'group',
-      targetId: TEST_UUID2,
-      severity: 'high',
-    }).success).toBe(true);
+      action, ruleId: TEST_UUID, name: 'High CPU alert', templateId: TEST_UUID,
+      targetType: 'group', targetId: TEST_UUID2,
+    }).success).toBe(false);
   });
+
+  it.each(['list_channels', 'alert_summary'])('accepts %s', (action) => {
+    expect(parse('manage_alert_rules', { action }).success).toBe(true);
+  });
+
+  it.each(['get_rule', 'test_rule'])('requires ruleId for %s', (action) => {
+    expect(parse('manage_alert_rules', { action }).success).toBe(false);
+    expect(parse('manage_alert_rules', { action, ruleId: TEST_UUID }).success).toBe(true);
+  });
+
 });
 
 // ─── generate_report ────────────────────────────────────────────────────
@@ -365,16 +378,22 @@ describe('generate_report schema', () => {
     expect(parse('generate_report', { action: 'create', name: 'Test', reportType: 'compliance', format: 'docx' }).success).toBe(false);
   });
 
-  // #3198 W02 regression pin: the org-axis AI tool cannot create or run a
-  // business report by type (they are msp_staff, partner-capable and gated
-  // on extra read permissions the tool's ad-hoc path never checks).
-  it.each(['ticket_sla_attainment', 'technician_time_billability', 'ar_aging'])(
-    'rejects business type %s for create and generate',
+  // #9222 reverses the #3198 W02 pin: the business types are reachable by type
+  // because the handler now applies the route gates (msp_staff audience, per-type
+  // read permissions, site-restricted refusal) — see
+  // aiToolsFleet.reportAudience.test.ts. The schema only closes the enum.
+  it.each(['ticket_sla_attainment', 'technician_time_billability', 'ar_aging', 'ai_usage_by_client', 'mrr_renewals', 'quote_win_rate', 'client_profitability'])(
+    'accepts business type %s for create, generate and data',
     (reportType) => {
-      expect(parse('generate_report', { action: 'create', name: 'Biz', reportType }).success).toBe(false);
-      expect(parse('generate_report', { action: 'generate', reportType }).success).toBe(false);
+      expect(parse('generate_report', { action: 'create', name: 'Biz', reportType }).success).toBe(true);
+      expect(parse('generate_report', { action: 'generate', reportType }).success).toBe(true);
+      expect(parse('generate_report', { action: 'data', reportType }).success).toBe(true);
     },
   );
+
+  it('still rejects a business-looking type that does not exist (no #6830 types yet)', () => {
+    expect(parse('generate_report', { action: 'data', reportType: 'ar_ageing' }).success).toBe(false);
+  });
 });
 
 // ─── manage_patches: setup_auto_approval ────────────────────────────────
@@ -388,8 +407,6 @@ describe('manage_patches setup_auto_approval schema', () => {
     expect(parse('manage_patches', {
       action: 'setup_auto_approval',
       configPolicyId: TEST_UUID,
-      autoApprove: true,
-      autoApproveSeverities: ['critical', 'important'],
       scheduleFrequency: 'weekly',
       scheduleTime: '03:00',
       rebootPolicy: 'if_required',
@@ -411,9 +428,15 @@ describe('manage_patches setup_auto_approval schema', () => {
     expect(parse('manage_patches', { action: 'setup_auto_approval', scheduleTime: '23:59' }).success).toBe(true);
   });
 
-  it('rejects invalid autoApproveSeverities values', () => {
-    expect(parse('manage_patches', { action: 'setup_auto_approval', autoApproveSeverities: ['unknown'] }).success).toBe(false);
-    expect(parse('manage_patches', { action: 'setup_auto_approval', autoApproveSeverities: ['critical', 'catastrophic'] }).success).toBe(false);
+  it('no longer declares policy-level autoApprove / autoApproveSeverities (moved to Update Rings)', () => {
+    const r = parse('manage_patches', {
+      action: 'setup_auto_approval',
+      autoApprove: true,
+      autoApproveSeverities: ['critical'],
+    }) as { success: boolean; data?: Record<string, unknown> };
+    expect(r.success).toBe(true);
+    expect(r.data).not.toHaveProperty('autoApprove');
+    expect(r.data).not.toHaveProperty('autoApproveSeverities');
   });
 
   it('rejects invalid rebootPolicy', () => {

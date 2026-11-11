@@ -49,6 +49,10 @@ func (s *scmManager) Create(spec Spec, exePath string) (Service, error) {
 		ErrorControl: mgr.ErrorNormal,
 	}, spec.Args...)
 	if err != nil {
+		// Lost a race with a concurrent installer; Install updates in place.
+		if errors.Is(err, windows.ERROR_SERVICE_EXISTS) {
+			return nil, ErrAlreadyExists
+		}
 		return nil, err
 	}
 	return &scmService{s: handle}, nil
@@ -136,18 +140,33 @@ func binaryPathName(exePath string, args ...string) string {
 	return line
 }
 
+// SetRecoveryActions also applies the actions to non-crash failures (a
+// service that stops with an error exit code), not only to crashes; the MSI
+// does the same with `sc failureflag`.
 func (x *scmService) SetRecoveryActions() error {
-	return x.s.SetRecoveryActions([]mgr.RecoveryAction{
+	if err := x.s.SetRecoveryActions([]mgr.RecoveryAction{
 		{Type: mgr.ServiceRestart, Delay: 5 * time.Second},
 		{Type: mgr.ServiceRestart, Delay: 10 * time.Second},
 		{Type: mgr.ServiceRestart, Delay: 30 * time.Second},
-	}, recoveryResetPeriodSeconds)
+	}, recoveryResetPeriodSeconds); err != nil {
+		return err
+	}
+	return x.s.SetRecoveryActionsOnNonCrashFailures(true)
 }
 
 // RequestStart passes no arguments: the command line, including "run", lives in
 // the registration itself, and start-time arguments would not survive an SCM
 // restart of the service.
-func (x *scmService) RequestStart() error { return x.s.Start() }
+func (x *scmService) RequestStart() error { return startRequestError(x.s.Start()) }
+
+// startRequestError translates the SCM's "already running" answer into the
+// neutral ErrAlreadyRunning; every other error passes through unchanged.
+func startRequestError(err error) error {
+	if errors.Is(err, windows.ERROR_SERVICE_ALREADY_RUNNING) {
+		return ErrAlreadyRunning
+	}
+	return err
+}
 
 func (x *scmService) Close() error { return x.s.Close() }
 

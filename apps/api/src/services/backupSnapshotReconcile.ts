@@ -1,3 +1,4 @@
+import { Readable } from 'node:stream';
 import { and, eq, inArray, isNull } from 'drizzle-orm';
 import { z } from 'zod';
 import { db, runOutsideDbContext, withSystemDbAccessContext } from '../db';
@@ -5,15 +6,26 @@ import { backupConfigs, backupJobs, backupSnapshots, backupSnapshotRetirements }
 import { normalizeStorageIdentity } from '../jobs/backupRetention';
 import type { ParsedBackupCommandResult } from '../routes/backup/resultSchemas';
 import { applyBackupCommandResultToJob, LATE_RESULT_FENCE_REASON_PATTERN } from './backupResultPersistence';
+import { loadSnapshotIdClaims } from './backupSnapshotIdReservations';
 import { captureException, captureMessage } from './sentry';
+import { recordSnapshotFileIndex } from './backupMetrics';
 import {
   BACKUP_SNAPSHOT_MANIFEST_KEY,
   BACKUP_SNAPSHOT_ROOT_DIR,
   backupSnapshotManifestKey,
   backupSnapshotRootPrefix,
-  fetchBackupObjectText,
-  listBackupObjectsUnderPrefix,
+  MANIFEST_STREAM_MAX_BYTES,
 } from './backupSnapshotStorage';
+import { scanManifest } from './backupManifestScanner';
+import {
+  keyRootForNewSnapshot,
+  keyRootId,
+  LEGACY_FLAT_ROOT,
+  sameKeyRoot,
+  snapshotKeyRootOf,
+  type SnapshotKeyRoot,
+} from './backupKeyLayout';
+import { iterateRootedObjects, openRootedObjectStream } from './backupRootedStorage';
 
 /**
  * Orphaned-snapshot reconciliation (#3006).
@@ -32,8 +44,9 @@ import {
  * mark-and-sweep object GC).
  *
  * TENANCY. The destination is a customer-owned bucket that Breeze does not
- * partition by org — the agent writes `snapshots/<id>/...` verbatim with no
- * org or device prefix (see the KNOWN GAP note in backupSnapshotStorage.ts).
+ * partition by org — snapshots are written under `snapshots/<id>/...` (under
+ * the reservation's key prefix, when it has one) with no org or device
+ * segment.
  * Enumerating it is therefore a cross-tenant read risk whenever two orgs point
  * their `backup_configs` at the same physical bucket. Four defences, in
  * order of strength:
@@ -72,10 +85,15 @@ import {
  * loop), which is precisely that half-written state; the write itself is an
  * upsert keyed on (jobId, snapshotId), so re-running is idempotent.
  *
+ * `completed_with_errors` (#5396) is a `completed` run that counted file
+ * failures; it can be half-written the same way and is adoptable on the same
+ * terms (persistence keeps its status rather than laundering it to
+ * `completed`).
+ *
  * `cancelled` and `partial` are deliberately absent: a user cancel is a
  * decision to respect, and a `partial` job already recorded its own outcome.
  */
-const ADOPTABLE_JOB_STATUSES = ['pending', 'running', 'failed', 'completed'] as const;
+const ADOPTABLE_JOB_STATUSES = ['pending', 'running', 'failed', 'completed', 'completed_with_errors'] as const;
 
 /**
  * Job statuses eligible for the WEAKER time-window matcher.
@@ -166,6 +184,8 @@ export type ReconcileSkipReason =
   /** D18 §3.4: the manifest is older than half the orphan window — leave it
    *  for the sweep instead of racing it. */
   | 'orphan-too-old-for-adoption'
+  /** The id is reserved to a backup that is still writing (brokered write). */
+  | 'reserved-for-active-backup'
   /** D18 §3.1/§3.4: the manifest declares a baseSnapshotId with no live,
    *  unretired backup_snapshots row — its references may already dangle. */
   | 'base-missing'
@@ -173,7 +193,14 @@ export type ReconcileSkipReason =
    *  rejected by backupResultPersistence.ts's late-result fence
    *  (errorLog contains publish_lease_expired or base_retired) — re-adopting
    *  it here would resurrect exactly what that fence exists to prevent. */
-  | 'late-result-fenced';
+  | 'late-result-fenced'
+  /** #7081: the snapshot was found under a key root other than the one its
+   *  id is reserved under (or, under a prefixed root, has no reservation) —
+   *  adopting it would record a root its objects do not live under. */
+  | 'key-root-mismatch'
+  /** #7081 (I4): the manifest's declared base is recorded under another key
+   *  root, or one this server cannot read — chains never span roots. */
+  | 'base-key-root-mismatch';
 
 export type ReconcileCandidate = {
   snapshotId: string;
@@ -237,6 +264,18 @@ type SnapshotClaims = {
    * Any foreign claim refuses the snapshot outright.
    */
   foreignClaimed: Set<string>;
+  /**
+   * Snapshot ids whose reservation (backup_snapshot_id_reservations) is still
+   * being written or sealed by a live backup job. Their objects may still
+   * change, so they are never adopted; the job's own result publishes them.
+   */
+  liveReserved: Set<string>;
+  /**
+   * #7081: the key root recorded on each id's reservation, verbatim. Adoption
+   * copies it onto the restore point, so a snapshot is adopted only from the
+   * root its reservation names.
+   */
+  reservationRoots: Map<string, { keyLayout: string; keyPrefix: string | null }>;
 };
 
 type AdoptableJob = {
@@ -249,46 +288,57 @@ type AdoptableJob = {
 
 /**
  * The agent's snapshot manifest (agent/internal/backup/snapshot.go's
- * `Snapshot`, encoded verbatim). Deliberately permissive: an unmodelled or
- * malformed field must never fail the whole parse and strand the snapshot
- * again — the same lesson as the agent result schemas (F13). `modTime` is NOT
- * validated as a datetime here; it is sanitized per-file below, because a
- * single bad OS mtime among 100k files must not cost the restore point.
+ * `Snapshot`, encoded verbatim), read as a stream (#11233): the top-level
+ * fields below, the `id`, and one `files[]` entry at a time. Deliberately
+ * permissive: an unmodelled or malformed field must never fail the whole parse
+ * and strand the snapshot again — the same lesson as the agent result schemas
+ * (F13). `modTime` is NOT validated as a datetime here; it is sanitized
+ * per-file below, because a single bad OS mtime among 100k files must not cost
+ * the restore point.
  */
-const reconcileManifestSchema = z
+const RECONCILE_MANIFEST_FIELDS = ['timestamp', 'size', 'formatVersion', 'baseSnapshotId'] as const;
+
+const reconcileManifestFieldsSchema = z.object({
+  timestamp: z.string().optional(),
+  size: z.number().nonnegative().optional(),
+  formatVersion: z.number().optional(),
+  baseSnapshotId: z.string().optional(),
+});
+
+const reconcileManifestFileSchema = z
   .object({
-    id: z.string().min(1),
-    timestamp: z.string().optional(),
+    sourcePath: z.string().min(1),
+    // Stable pre-VSS path (D12): must survive re-adoption or the
+    // index falls back to the shadow-copy device path.
+    originalPath: z.string().min(1).optional(),
+    // Empty ONLY on a content-less entry — see the refine below and
+    // backupSnapshotFileIndex.ts's twin (D-W09-1, #6491): every
+    // dir/symlink entry a real agent writes carries backupPath "",
+    // so a blanket .min(1) made every real Linux manifest
+    // 'manifest-unreadable' and un-adoptable.
+    backupPath: z.string(),
+    kind: z.string().optional(),
     size: z.number().nonnegative().optional(),
-    formatVersion: z.number().optional(),
-    baseSnapshotId: z.string().optional(),
-    files: z
-      .array(
-        z
-          .object({
-            sourcePath: z.string().min(1),
-            // Stable pre-VSS path (D12): must survive re-adoption or the
-            // index falls back to the shadow-copy device path.
-            originalPath: z.string().min(1).optional(),
-            // Empty ONLY on a content-less entry — see the refine below and
-            // backupSnapshotFileIndex.ts's twin (D-W09-1, #6491): every
-            // dir/symlink entry a real agent writes carries backupPath "",
-            // so a blanket .min(1) made every real Linux manifest
-            // 'manifest-unreadable' and un-adoptable.
-            backupPath: z.string(),
-            kind: z.string().optional(),
-            size: z.number().nonnegative().optional(),
-            modTime: z.string().optional(),
-          })
-          .passthrough()
-          .refine((f) => f.backupPath.length > 0 || f.kind === 'symlink' || f.kind === 'dir', {
-            message: 'backupPath must be non-empty on a content entry (kind "" / omitted)',
-            path: ['backupPath'],
-          })
-      )
-      .optional(),
+    modTime: z.string().optional(),
   })
-  .passthrough();
+  .passthrough()
+  .refine((f) => f.backupPath.length > 0 || f.kind === 'symlink' || f.kind === 'dir', {
+    message: 'backupPath must be non-empty on a content entry (kind "" / omitted)',
+    path: ['backupPath'],
+  });
+
+/**
+ * The most file-list text an adoption carries inline, about what an agent's
+ * own result can deliver (the 5 MB command-result cap, MAX_COMMAND_RESULT_BYTES
+ * in routes/agents/schemas.ts). A larger list is left out of the adopted
+ * result, exactly as an agent leaves out one that does not fit (#11026): the
+ * snapshot is persisted with its counts and sizes, and its file index is built
+ * from the manifest. A million-entry manifest is therefore never held here as
+ * objects (#11233).
+ */
+export const RECONCILE_INLINE_INDEX_MAX_CHARS = 5_000_000;
+/** Charged per inline entry on top of its strings: its keys and punctuation in the agent's JSON. */
+const RECONCILE_INLINE_ENTRY_OVERHEAD_CHARS = 64;
 
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -349,25 +399,35 @@ function coarseStorageIdentity(provider: string, providerConfig: Record<string, 
  * an in-flight or abandoned upload, never an adoptable snapshot — the manifest
  * is written last, so its presence is the agent's own completion marker (the
  * same signal the GC mark phase keys on).
+ *
+ * #6843: folds a STREAMED destination listing directly into this map, one
+ * page at a time — never materializes the whole `snapshots/` root into an
+ * array. A customer bucket can hold millions of objects (only a tiny fraction
+ * of which are `manifest.json` keys), and the pre-#6843 shape
+ * (`listBackupObjectsUnderPrefix`, the array collector) held that full
+ * listing in memory on this operator-triggered path — the same class of
+ * allocation GC's sweep removed in #6834.
  */
-function extractManifestBearingSnapshots(
-  listing: { key: string; lastModified: Date | null }[]
-): Map<string, Date | null> {
+async function extractManifestBearingSnapshots(
+  pages: AsyncIterable<{ key: string; lastModified: Date | null }[]>
+): Promise<Map<string, Date | null>> {
   const rootPrefix = `${BACKUP_SNAPSHOT_ROOT_DIR}/`;
   const manifestSuffix = `/${BACKUP_SNAPSHOT_MANIFEST_KEY}`;
   const found = new Map<string, Date | null>();
 
-  for (const object of listing) {
-    if (!object.key.startsWith(rootPrefix) || !object.key.endsWith(manifestSuffix)) {
-      continue;
+  for await (const page of pages) {
+    for (const object of page) {
+      if (!object.key.startsWith(rootPrefix) || !object.key.endsWith(manifestSuffix)) {
+        continue;
+      }
+      const snapshotId = object.key.slice(rootPrefix.length, object.key.length - manifestSuffix.length);
+      // Only a DIRECT child of snapshots/ is a snapshot root; a nested
+      // `manifest.json` under files/ belongs to the customer's own data.
+      if (!snapshotId || snapshotId.includes('/')) {
+        continue;
+      }
+      found.set(snapshotId, object.lastModified);
     }
-    const snapshotId = object.key.slice(rootPrefix.length, object.key.length - manifestSuffix.length);
-    // Only a DIRECT child of snapshots/ is a snapshot root; a nested
-    // `manifest.json` under files/ belongs to the customer's own data.
-    if (!snapshotId || snapshotId.includes('/')) {
-      continue;
-    }
-    found.set(snapshotId, object.lastModified);
   }
   return found;
 }
@@ -398,6 +458,8 @@ async function loadClaimsAndSharing(params: {
       const restorable = new Map<string, string>();
       const jobs = new Map<string, ClaimingJob>();
       const foreignClaimed = new Set<string>();
+      const liveReserved = new Set<string>();
+      const reservationRoots = new Map<string, { keyLayout: string; keyPrefix: string | null }>();
 
       // Rank for the dedupe below: a claim on THIS destination beats one on a
       // sibling config (a customer who deleted and recreated a config against
@@ -424,6 +486,19 @@ async function loadClaimsAndSharing(params: {
         for (const row of snapshotRows) {
           restorable.set(row.snapshotId, row.orgId);
         }
+
+        // The id's owner, whatever destination or endpoint spelling it was
+        // reserved under. Another organization's reservation refuses the id;
+        // one still being written by a live job is left to that job.
+        const reservationClaims = await loadSnapshotIdClaims(batch, orgId);
+        for (const id of reservationClaims.foreign) foreignClaimed.add(id);
+        for (const id of reservationClaims.live) liveReserved.add(id);
+        for (const [id, root] of reservationClaims.roots) reservationRoots.set(id, root);
+        // A server-issued id is published only by the job its reservation
+        // currently names: that job wins the dedupe below whatever the rank
+        // of the others (after a takeover, earlier jobs still carry the id).
+        const holder = (snapshotId: string, jobId: string) =>
+          reservationClaims.currentJobs.get(snapshotId) === jobId;
 
         // NOT filtered by config or org: seeing ANOTHER tenant's claim is the
         // entire point (a filtered query would make their snapshot look
@@ -460,7 +535,9 @@ async function loadClaimsAndSharing(params: {
           // records it on both. Rank deterministically rather than letting
           // scan order decide which run owns the objects.
           const existing = jobs.get(row.snapshotId);
-          if (!existing || outranks(claim, existing)) {
+          const claimHolds = holder(row.snapshotId, claim.jobId);
+          const existingHolds = !!existing && holder(row.snapshotId, existing.jobId);
+          if (!existing || (claimHolds && !existingHolds) || (claimHolds === existingHolds && outranks(claim, existing))) {
             jobs.set(row.snapshotId, claim);
           }
         }
@@ -483,7 +560,7 @@ async function loadClaimsAndSharing(params: {
         );
       });
 
-      return { claims: { restorable, jobs, foreignClaimed }, sharedDestination };
+      return { claims: { restorable, jobs, foreignClaimed, liveReserved, reservationRoots }, sharedDestination };
     })
   );
 }
@@ -570,38 +647,21 @@ function jobCoversWriteTime(job: AdoptableJob, writtenAt: Date, now: Date): bool
  * file indexing, legal-hold/immutability application and GFS/expiry
  * computation — the last of which is what finally makes the snapshot visible
  * to retention.
+ *
+ * The manifest is scanned one entry at a time (#11233), so its size is bounded
+ * only by the stream cap: every entry is validated and counted, and the file
+ * list is carried inline only while it fits RECONCILE_INLINE_INDEX_MAX_CHARS.
+ * Throws on any read, scan or validation failure, the dropped connection a
+ * stream reports included.
  */
-export function manifestToCommandResult(params: {
+export async function manifestToCommandResult(params: {
   snapshotId: string;
-  manifestText: string;
+  /** The manifest as a stream of its bytes, or as its whole text. */
+  manifest: NodeJS.ReadableStream | string;
   matchedBy: 'job-snapshot-id' | 'time-window';
-}): ParsedBackupCommandResult {
-  const parsed = reconcileManifestSchema.parse(JSON.parse(params.manifestText));
-
-  if (parsed.id !== params.snapshotId) {
-    throw new Error(
-      `manifest declares snapshot ${parsed.id} but is stored under ${params.snapshotId}`
-    );
-  }
-
-  const files = (parsed.files ?? []).map((file) => {
-    // Drop an unparseable mtime rather than letting `new Date(...)` reach
-    // Postgres as an Invalid Date and abort the whole adoption.
-    const modTime =
-      file.modTime && Number.isFinite(Date.parse(file.modTime)) ? file.modTime : undefined;
-    return {
-      sourcePath: file.sourcePath,
-      originalPath: file.originalPath,
-      backupPath: file.backupPath,
-      size: file.size !== undefined ? Math.trunc(file.size) : undefined,
-      modTime,
-    };
-  });
-
-  const declaredSize = parsed.size !== undefined ? Math.trunc(parsed.size) : undefined;
-  const summedSize = files.reduce((total, file) => total + (file.size ?? 0), 0);
-  const size = declaredSize ?? summedSize;
-
+  /** The key root the manifest was found under (#7081); legacy when omitted. */
+  root?: SnapshotKeyRoot;
+}): Promise<ParsedBackupCommandResult> {
   // #5410: the manifest is enough to recover the dedup split the agent would
   // have reported. Same rule as the agent's isReferenceEntry
   // (agent/internal/backup/incremental.go): an entry whose object lives
@@ -610,7 +670,7 @@ export function manifestToCommandResult(params: {
   // entries (dir/symlink, backupPath "") are skipped exactly as the agent's
   // isReferenceEntry skips them — "" never starts with ownPrefix, so
   // without the guard every directory would count as a reference. Without
-  // the loop at all, every adopted incremental would finalize as "uploaded
+  // the count at all, every adopted incremental would finalize as "uploaded
   // the whole corpus".
   //
   // Reported the way the agent reports it (`omitempty`): a run with no
@@ -620,43 +680,136 @@ export function manifestToCommandResult(params: {
   // reference entry — the agent's referenceEntry always copies it — so the
   // schema's optional size cannot undercount a real manifest.
   const ownPrefix = `${BACKUP_SNAPSHOT_ROOT_DIR}/${params.snapshotId}/`;
+  type InlineFile = NonNullable<NonNullable<ParsedBackupCommandResult['snapshot']>['files']>[number];
+  let inline: InlineFile[] | null = [];
+  let inlineChars = 0;
+  let summedSize = 0;
   let referencedFiles = 0;
   let referencedBytes = 0;
-  for (const file of files) {
-    if (!file.backupPath) continue;
-    if (!file.backupPath.startsWith(ownPrefix)) {
-      referencedFiles += 1;
-      referencedBytes += file.size ?? 0;
-    }
+
+  const source = typeof params.manifest === 'string' ? Readable.from([params.manifest]) : params.manifest;
+  const scanned = await scanManifest(
+    source,
+    {
+      onEntry(raw, index) {
+        const checked = reconcileManifestFileSchema.safeParse(raw);
+        if (!checked.success) {
+          throw new Error(`manifest entry ${index} is invalid: ${checked.error.message}`);
+        }
+        const file = checked.data;
+        // Drop an unparseable mtime rather than letting `new Date(...)` reach
+        // Postgres as an Invalid Date and abort the whole adoption.
+        const modTime = file.modTime && Number.isFinite(Date.parse(file.modTime)) ? file.modTime : undefined;
+        const size = file.size !== undefined ? Math.trunc(file.size) : undefined;
+        summedSize += size ?? 0;
+        if (file.backupPath && !file.backupPath.startsWith(ownPrefix)) {
+          referencedFiles += 1;
+          referencedBytes += size ?? 0;
+        }
+        if (inline === null) return;
+        inlineChars += RECONCILE_INLINE_ENTRY_OVERHEAD_CHARS + file.sourcePath.length +
+          (file.originalPath?.length ?? 0) + file.backupPath.length + (modTime?.length ?? 0);
+        if (inlineChars > RECONCILE_INLINE_INDEX_MAX_CHARS) {
+          inline = null;
+          return;
+        }
+        inline.push({ sourcePath: file.sourcePath, originalPath: file.originalPath, backupPath: file.backupPath, size, modTime });
+      },
+    },
+    { fields: RECONCILE_MANIFEST_FIELDS },
+  );
+
+  if (!scanned.id) {
+    throw new Error('manifest has no snapshot id');
   }
+  if (scanned.id !== params.snapshotId) {
+    throw new Error(
+      `manifest declares snapshot ${scanned.id} but is stored under ${params.snapshotId}`
+    );
+  }
+  const checkedFields = reconcileManifestFieldsSchema.safeParse(scanned.fields ?? {});
+  if (!checkedFields.success) {
+    const issues = checkedFields.error.issues.map((issue) => `${issue.path.join('.')}: ${issue.message}`).join('; ');
+    throw new Error(`manifest fields are invalid: ${issues}`);
+  }
+  const fields = checkedFields.data;
+
+  const declaredSize = fields.size !== undefined ? Math.trunc(fields.size) : undefined;
+  const size = declaredSize ?? summedSize;
   const dedup = referencedFiles > 0 ? { referencedFiles, referencedBytes } : {};
+  // Left out, the list is still in the manifest: the index is built from
+  // there. Omitted rather than [] so persistence leaves any index rows alone.
+  const files: InlineFile[] | null = inline;
+  const inlineDroppedEntries = files === null ? scanned.entries : null;
 
   const timestamp =
-    parsed.timestamp && Number.isFinite(Date.parse(parsed.timestamp)) ? parsed.timestamp : undefined;
+    fields.timestamp && Number.isFinite(Date.parse(fields.timestamp)) ? fields.timestamp : undefined;
 
   return {
     snapshotId: params.snapshotId,
-    filesBackedUp: files.length,
+    filesBackedUp: scanned.entries,
     bytesBackedUp: size,
     ...dedup,
     snapshot: {
       id: params.snapshotId,
       timestamp,
       size,
-      files,
+      ...(files !== null ? { files } : {}),
       // D18 (#5429/§3.1): forwarded so applyBackupCommandResultToJob can
       // record lineage on an adopted (not directly-reported) snapshot too.
-      baseSnapshotId: parsed.baseSnapshotId,
-      formatVersion: parsed.formatVersion,
+      baseSnapshotId: fields.baseSnapshotId,
+      formatVersion: fields.formatVersion,
     },
     metadata: {
       // Consumed by backupResultPersistence to set backup_snapshots.location.
-      storagePrefix: `${BACKUP_SNAPSHOT_ROOT_DIR}/${params.snapshotId}`,
+      // A prefixed snapshot's location and keys come from its recorded root
+      // (the row's key_layout / key_prefix, copied from its reservation),
+      // never from this helper-style field, so it is not set for one (#7081).
+      ...((params.root ?? LEGACY_FLAT_ROOT).layout === 'legacy_flat'
+        ? { storagePrefix: `${BACKUP_SNAPSHOT_ROOT_DIR}/${params.snapshotId}` }
+        : {}),
+      // The same record an agent result that left its list out produces
+      // (backupResultPersistence, #11026); the inline_dropped metric is
+      // recorded once the adoption is written.
+      ...(inlineDroppedEntries !== null ? { fileIndexInlineDroppedEntries: inlineDroppedEntries } : {}),
       reconciledFromStorage: true,
       reconciledAt: new Date().toISOString(),
       reconcileMatchedBy: params.matchedBy,
     },
   };
+}
+
+/**
+ * The key roots reconcile lists for a destination (#7081): the root its
+ * current prefix names (when valid) and always the legacy root. Roots of
+ * earlier prefixes are not listed, so orphans there are not adopted. A stored
+ * prefix that fails validation lists the legacy root only — never a guessed
+ * location.
+ */
+function reconcileKeyRoots(provider: string, providerConfig: Record<string, unknown>, configId: string): SnapshotKeyRoot[] {
+  const current = keyRootForNewSnapshot(provider, providerConfig);
+  if (!current.ok) {
+    console.warn(
+      `[BackupReconcile] config ${configId} has an invalid key prefix; reconciling the legacy key root only`,
+    );
+    return [LEGACY_FLAT_ROOT];
+  }
+  return current.root.layout === 'legacy_flat' ? [LEGACY_FLAT_ROOT] : [current.root, LEGACY_FLAT_ROOT];
+}
+
+/**
+ * Whether a snapshot found under `foundUnder` may be adopted given its
+ * reservation's recorded root (#7081): equal roots only; an id with no
+ * reservation is adopted as legacy_flat (backupResultPersistence), so only
+ * from the legacy root.
+ */
+function foundUnderRecordedRoot(
+  foundUnder: SnapshotKeyRoot,
+  reservationRoot: { keyLayout: string; keyPrefix: string | null } | undefined,
+): boolean {
+  if (!reservationRoot) return foundUnder.layout === 'legacy_flat';
+  const recorded = snapshotKeyRootOf(reservationRoot);
+  return recorded !== null && sameKeyRoot(recorded, foundUnder);
 }
 
 /**
@@ -721,13 +874,20 @@ export async function reconcileOrphanedBackupSnapshots(params: {
     );
   }
 
-  let listing;
+  // #7081: the destination's key roots this org may own snapshots under —
+  // its current prefix's root, and the legacy root (every snapshot written
+  // before prefixes applied). Each root is listed on its own; an orphan is
+  // only adopted from the root its reservation records.
+  const roots = reconcileKeyRoots(config.provider, asRecord(config.providerConfig), params.configId);
+  const storageSnapshots: Array<{ snapshotId: string; writtenAt: Date | null; root: SnapshotKeyRoot }> = [];
   try {
-    listing = await listBackupObjectsUnderPrefix({
-      provider: config.provider,
-      providerConfig: config.providerConfig,
-      prefix: backupSnapshotRootPrefix(),
-    });
+    for (const root of roots) {
+      const found = await extractManifestBearingSnapshots(iterateRootedObjects(
+        { provider: config.provider, providerConfig: config.providerConfig, root },
+        backupSnapshotRootPrefix(),
+      ));
+      for (const [snapshotId, writtenAt] of found) storageSnapshots.push({ snapshotId, writtenAt, root });
+    }
   } catch (error) {
     // A bad credential, a deleted bucket, or a provider 5xx is an upstream
     // failure, not a malformed request — and it is invisible unless it is
@@ -741,8 +901,7 @@ export async function reconcileOrphanedBackupSnapshots(params: {
     throw new BackupReconcileError('destination_unreadable', message);
   }
 
-  const storageSnapshots = extractManifestBearingSnapshots(listing);
-  const snapshotIds = [...storageSnapshots.keys()];
+  const snapshotIds = [...new Set(storageSnapshots.map((s) => s.snapshotId))];
 
   const providerConfigRecord = asRecord(config.providerConfig);
   const storageIdentity = normalizeStorageIdentity(config.provider, providerConfigRecord);
@@ -776,10 +935,12 @@ export async function reconcileOrphanedBackupSnapshots(params: {
 
   // Process oldest-written first so the time-window matcher consumes jobs
   // deterministically and a rerun produces the same attribution.
-  const ordered = snapshotIds.slice().sort((a, b) => {
-    const aTime = storageSnapshots.get(a)?.getTime() ?? 0;
-    const bTime = storageSnapshots.get(b)?.getTime() ?? 0;
-    return aTime === bTime ? a.localeCompare(b) : aTime - bTime;
+  const ordered = storageSnapshots.slice().sort((a, b) => {
+    const aTime = a.writtenAt?.getTime() ?? 0;
+    const bTime = b.writtenAt?.getTime() ?? 0;
+    if (aTime !== bTime) return aTime - bTime;
+    const byId = a.snapshotId.localeCompare(b.snapshotId);
+    return byId !== 0 ? byId : keyRootId(a.root).localeCompare(keyRootId(b.root));
   });
 
   const now = new Date();
@@ -790,13 +951,13 @@ export async function reconcileOrphanedBackupSnapshots(params: {
     deviceId: string;
     matchedBy: 'job-snapshot-id' | 'time-window';
     writtenAt: Date | null;
+    root: SnapshotKeyRoot;
   }[] = [];
 
   let unattributedJobs: AdoptableJob[] | null = null;
   const consumedJobIds = new Set<string>();
 
-  for (const snapshotId of ordered) {
-    const writtenAt = storageSnapshots.get(snapshotId) ?? null;
+  for (const { snapshotId, writtenAt, root } of ordered) {
     const skip = (skipReason: ReconcileSkipReason) => {
       candidates.push({
         snapshotId,
@@ -818,6 +979,19 @@ export async function reconcileOrphanedBackupSnapshots(params: {
     }
     if (writtenAt && now.getTime() - writtenAt.getTime() > RECONCILE_ORPHAN_HALF_WINDOW_MS) {
       skip('orphan-too-old-for-adoption');
+      continue;
+    }
+
+    if (claims.liveReserved.has(snapshotId)) {
+      skip('reserved-for-active-backup');
+      continue;
+    }
+
+    // #7081: adoption records the id's reservation root, so the snapshot must
+    // have been found under exactly that root. An id with no reservation is
+    // adopted as legacy_flat, so only from the legacy root.
+    if (!foundUnderRecordedRoot(root, claims.reservationRoots.get(snapshotId))) {
+      skip('key-root-mismatch');
       continue;
     }
 
@@ -884,6 +1058,7 @@ export async function reconcileOrphanedBackupSnapshots(params: {
         deviceId: claimingJob.deviceId,
         matchedBy: 'job-snapshot-id',
         writtenAt,
+        root,
       });
       continue;
     }
@@ -934,6 +1109,7 @@ export async function reconcileOrphanedBackupSnapshots(params: {
       deviceId: job.deviceId,
       matchedBy: 'time-window',
       writtenAt,
+      root,
     });
   }
 
@@ -977,19 +1153,24 @@ export async function reconcileOrphanedBackupSnapshots(params: {
     // to look at a bucket that is perfectly fine.
     let result: ParsedBackupCommandResult;
     try {
-      const manifestText = await fetchBackupObjectText({
-        provider: config.provider,
-        providerConfig: config.providerConfig,
-        key: backupSnapshotManifestKey(entry.snapshotId),
-      });
-      result = manifestToCommandResult({
+      const manifest = await openRootedObjectStream(
+        { provider: config.provider, providerConfig: config.providerConfig, root: entry.root },
+        backupSnapshotManifestKey(entry.snapshotId),
+        MANIFEST_STREAM_MAX_BYTES,
+      );
+      result = await manifestToCommandResult({
         snapshotId: entry.snapshotId,
-        manifestText,
+        manifest,
         matchedBy: entry.matchedBy,
+        root: entry.root,
       });
     } catch (error) {
       candidate.skipReason = 'manifest-unreadable';
       candidate.error = error instanceof Error ? error.message : String(error);
+      console.warn(
+        `[BackupReconcile] manifest of snapshot ${entry.snapshotId} (config ${params.configId}, key root ` +
+        `${keyRootId(entry.root)}) could not be read (${error instanceof Error ? error.name : 'non-Error'}): ${candidate.error}`,
+      );
       candidates.push(candidate);
       continue;
     }
@@ -1004,7 +1185,7 @@ export async function reconcileOrphanedBackupSnapshots(params: {
       const declaredBase = result.snapshot.baseSnapshotId;
       const [liveBase] = await runInDbContext(() =>
         db
-          .select({ id: backupSnapshots.id })
+          .select({ id: backupSnapshots.id, keyLayout: backupSnapshots.keyLayout, keyPrefix: backupSnapshots.keyPrefix })
           .from(backupSnapshots)
           .leftJoin(
             backupSnapshotRetirements,
@@ -1025,6 +1206,20 @@ export async function reconcileOrphanedBackupSnapshots(params: {
       if (!liveBase) {
         candidate.skipReason = 'base-missing';
         candidate.error = `manifest declares base ${declaredBase}, which has no live, unretired row`;
+        candidates.push(candidate);
+        continue;
+      }
+      // #7081 (I4): a chain never spans key roots — the base must be
+      // recorded under the root this snapshot was found under.
+      const baseRoot = snapshotKeyRootOf(liveBase);
+      if (!baseRoot || !sameKeyRoot(baseRoot, entry.root)) {
+        candidate.skipReason = 'base-key-root-mismatch';
+        candidate.error = `manifest declares base ${declaredBase}, which is not recorded under the same storage key root`;
+        console.warn(
+          `[BackupReconcile] base_key_root_mismatch: snapshot ${entry.snapshotId} (config ${params.configId}, ` +
+          `key root ${keyRootId(entry.root)}) declares base ${declaredBase} under ` +
+          `${baseRoot ? keyRootId(baseRoot) : 'an unreadable key root'} — not adopted`,
+        );
         candidates.push(candidate);
         continue;
       }
@@ -1063,6 +1258,9 @@ export async function reconcileOrphanedBackupSnapshots(params: {
       } else {
         candidate.adopted = true;
         adopted += 1;
+        if (result.metadata?.fileIndexInlineDroppedEntries !== undefined) {
+          recordSnapshotFileIndex('inline_dropped', 'dropped');
+        }
       }
     } catch (error) {
       // applyBackupCommandResultToJob commits the job UPDATE before inserting

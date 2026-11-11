@@ -2,10 +2,15 @@ package recoveryconsole
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/breeze-rmm/agent/internal/backup/bmr"
@@ -90,6 +95,11 @@ type Console struct {
 	// call, so waitAndRetryPending can bound it to 20 minutes overall
 	// rather than per-attempt.
 	pendingWaitElapsed time.Duration
+	// codeRejections counts recovery codes the server definitively
+	// rejected (bmr.ErrCodeInvalid) across one connect call — including
+	// across a return to the server prompt — so maxCodeAttempts bounds
+	// rejected codes, not network failures (#7649).
+	codeRejections int
 	// sleep is the time seam waitAndRetryPending uses instead of calling
 	// time.After directly, so tests can make a "30 second" wait resolve
 	// instantly. nil (the zero value, used by every real build) falls
@@ -135,10 +145,16 @@ var holdAfterPower = func() {
 // operator-facing failure short of that is handled inline (printed, and the
 // [r]etry/[s]hell/[p]oweroff menu offered).
 func (c *Console) Run(ctx context.Context) error {
-	media, ci, answers := ParseKernelCmdline(c.Cmdline)
+	media, ciRequested, answers := ParseKernelCmdline(c.Cmdline)
 	if !media && !c.AllowHost {
 		return errors.New("refusing to run: this is not recovery media (no breeze.media=1 on the kernel cmdline); pass --allow-host for development")
 	}
+	// breeze.ci=1 comes from the same unauthenticated kernel cmdline as
+	// every other breeze.* token — see buildflags.go's doc comment. Only
+	// a build that was explicitly linked as CI/test recovery media ever
+	// honors it; every other build treats ciRequested as inert and falls
+	// through to the normal interactive, https-required flow below.
+	ci := ciRequested && unattendedCmdlineAllowed()
 
 	// powerAndHold calls c.power(action) and then permanently suppresses
 	// the deferred lock release below, regardless of whether Power itself
@@ -205,29 +221,103 @@ func (c *Console) Run(ctx context.Context) error {
 		defer func() { releaseLock() }()
 	}
 
-	server, err := c.promptServer(ci, answers)
+	server, token, bs, err := c.connect(ctx, ci, answers)
 	if err != nil {
 		return err
 	}
+	for {
+		err := c.runRecovery(ctx, ci, answers, server, token, bs, powerAndHold)
+		if !errors.Is(err, errNewCodeRequired) {
+			return err
+		}
+		server, token, bs, err = c.reconnect(ctx, ci, answers, server)
+		if err != nil {
+			return err
+		}
+	}
+}
 
+// errNewCodeRequired is returned by runRecovery when the operator chose
+// [r]etry after the console posted a terminal status (`refused` or `failed`)
+// for the recovery. Both are terminal server-side, which then rejects every
+// later progress post for it, so re-running the attempt would perform a
+// recovery the server can never record (#7927). Run answers it by
+// exchanging a new recovery code and starting a fresh attempt.
+var errNewCodeRequired = errors.New("the recovery was marked refused or failed; a new recovery code is required")
+
+// reconnect asks for a new recovery code against the server already in use
+// (falling back to the full server prompt if that server can no longer be
+// used) after a terminal status was posted for the previous recovery.
+func (c *Console) reconnect(ctx context.Context, ci bool, answers Answers, server string) (string, string, *bmr.BootstrapResponse, error) {
+	c.IO.Print("Start a new recovery for this device in Breeze and enter its new recovery code.\n")
+	c.codeRejections = 0
 	token, bs, err := c.promptCodeAndExchange(ctx, ci, answers, server)
+	if errors.Is(err, errReenterServer) {
+		return c.connect(ctx, ci, answers)
+	}
+	if err != nil {
+		return "", "", nil, err
+	}
+	return server, token, bs, nil
+}
+
+// offerTerminalFailureOptions is offerFailureOptions after a terminal status
+// was posted: [r]etry returns errNewCodeRequired instead of re-running the
+// attempt, and [p]oweroff powers the machine off and holds.
+func (c *Console) offerTerminalFailureOptions(ci bool, powerAndHold func(string) error) error {
+	if !ci {
+		c.IO.Print("Retry will ask for a new recovery code.\n")
+	}
+	action, err := c.offerFailureOptions(ci)
 	if err != nil {
 		return err
 	}
+	if action == "poweroff" {
+		return powerAndHold("poweroff")
+	}
+	return errNewCodeRequired
+}
 
+// runRecovery runs one recovery attempt for the exchanged token/bootstrap.
+// It returns errNewCodeRequired when the operator retries after a terminal
+// status was posted; every other return ends Run.
+func (c *Console) runRecovery(ctx context.Context, ci bool, answers Answers, server, token string, bs *bmr.BootstrapResponse, powerAndHold func(string) error) error {
+	// Servers that know the floor refuse too-old media inside the exchange,
+	// before the code is claimed (helper_version_too_old, #5629). This
+	// post-exchange check is the fallback for a server that does not gate
+	// there: the code is already spent and the recovery is media_booted, so
+	// post a terminal `failed` — without it the recovery never leaves
+	// media_booted and blocks every new recovery for the device.
 	if bs.MinHelperVersion != "" && !versionAtLeast(c.Deps.Version, bs.MinHelperVersion) {
+		gateErr := fmt.Errorf("recovery media v%s is older than the server requires (v%s)", c.Deps.Version, bs.MinHelperVersion)
+		c.postProgress(ctx, server, token, bmr.ProgressUpdate{Status: "failed", Reason: "media_too_old: " + gateErr.Error()})
 		c.IO.Print("This recovery media (v%s) is older than the server requires (v%s); download the current ISO.\n", c.Deps.Version, bs.MinHelperVersion)
-		return fmt.Errorf("recovery media v%s is older than the server requires (v%s)", c.Deps.Version, bs.MinHelperVersion)
-	}
-
-	disk, err := c.chooseDisk(ctx, ci, answers)
-	if err != nil {
-		return err
+		return gateErr
 	}
 
 	snapshotID := bs.SnapshotID
 	if snapshotID == "" && bs.Snapshot != nil {
 		snapshotID = bs.Snapshot.SnapshotID
+	}
+
+	// The bootstrap's snapshot integrity expectation: a block this media
+	// cannot read, or one for another snapshot, refuses the recovery here,
+	// before a disk is chosen or anything is written. The engine checks the
+	// snapshot's control objects and files against it.
+	expectation, err := bmr.BootstrapIntegrity(bs)
+	if err == nil {
+		err = expectation.CheckSnapshot(snapshotID)
+	}
+	if err != nil {
+		reason := "snapshot integrity expectation refused: " + err.Error()
+		c.postProgress(ctx, server, token, bmr.ProgressUpdate{Status: "refused", Reason: reason})
+		c.IO.Print("Recovery cannot proceed: %s\n", reason)
+		return err
+	}
+
+	disk, err := c.chooseDisk(ctx, ci, answers)
+	if err != nil {
+		return err
 	}
 
 	identity := rebuild.IdentityNew
@@ -249,14 +339,7 @@ func (c *Console) Run(ctx context.Context) error {
 			if errors.As(err, &scopeErr) {
 				c.postProgress(ctx, server, token, bmr.ProgressUpdate{Status: "refused", Reason: scopeErr.Error()})
 				c.IO.Print("Recovery cannot proceed: %s\n", scopeErr.Error())
-				action, err := c.offerFailureOptions(ci)
-				if err != nil {
-					return err
-				}
-				if action == "poweroff" {
-					return powerAndHold("poweroff")
-				}
-				return scopeErr
+				return c.offerTerminalFailureOptions(ci, powerAndHold)
 			}
 			return fmt.Errorf("verify download scope: %w", err)
 		}
@@ -273,27 +356,46 @@ func (c *Console) Run(ctx context.Context) error {
 		// manifest) must apply its OS state; the engine refuses at
 		// preflight when it is missing rather than completing files-only.
 		ExpectSystemState: bmr.SnapshotExpectsSystemState(bs.Snapshot),
+		Integrity:         expectation,
 	}
 
+	// Every branch below that posts a terminal status (`refused`/`failed`)
+	// leaves this attempt through offerTerminalFailureOptions, so the loop
+	// never comes back around for a recovery the server has closed — in
+	// particular OVERWRITE is never offered after `refused` was posted, or
+	// the disk would be erased while the server record stays refused.
 	for {
 		dry := baseOpts
 		dry.DryRun = true
 		plan, planErr := c.Deps.Rebuild(ctx, dry)
 		if planErr != nil || plan == nil || plan.Status == "refused" || plan.Status == "failed" {
 			reason := refusalReason(plan, planErr)
+			// A disk that already holds Windows is the common real
+			// bare-metal case (the machine's own broken disk). Offer an
+			// explicit typed OVERWRITE BEFORE posting `refused`: refused is
+			// terminal server-side, so posting it first would make the
+			// recovery unrecoverable even if the operator proceeds. It is
+			// posted below only when they decline. The serial/ERASE
+			// confirmation still follows the re-run; CI never auto-overwrites.
+			if plan != nil && plan.RefusalCode == rebuild.RefusalCodeDiskHasWindows && !baseOpts.ForceDisk && !ci {
+				c.IO.Print("Disk %s already contains a Windows installation. Everything on it will be erased.\n", disk.Path)
+				line, err := c.IO.ReadLine("Type OVERWRITE to erase it, or press Enter for other options: ")
+				if err != nil {
+					return err
+				}
+				if strings.TrimSpace(line) == "OVERWRITE" {
+					baseOpts.ForceDisk = true
+					continue
+				}
+			}
 			c.postProgress(ctx, server, token, bmr.ProgressUpdate{Status: statusForFailure(plan), Reason: reason})
-			c.IO.Print("Recovery cannot proceed: %s\n", reason)
-			action, err := c.offerFailureOptions(ci)
-			if err != nil {
-				return err
+			if plan != nil && plan.RefusalCode == rebuild.RefusalCodeDiskHasWindows {
+				c.IO.Print("Recovery cannot proceed: disk %s already contains a Windows installation. "+
+					"This recovery is now marked refused; to overwrite the disk, start a new recovery and enter its new recovery code.\n", disk.Path)
+			} else {
+				c.IO.Print("Recovery cannot proceed: %s\n", reason)
 			}
-			switch action {
-			case "retry":
-				continue
-			case "poweroff":
-				return powerAndHold("poweroff")
-			}
-			continue
+			return c.offerTerminalFailureOptions(ci, powerAndHold)
 		}
 
 		c.printPlan(disk, plan)
@@ -327,17 +429,7 @@ func (c *Console) Run(ctx context.Context) error {
 			reason := refusalReason(res, runErr)
 			c.postProgress(ctx, server, token, bmr.ProgressUpdate{Status: statusForFailure(res), Reason: reason})
 			c.IO.Print("Recovery failed: %s\n", reason)
-			action, err := c.offerFailureOptions(ci)
-			if err != nil {
-				return err
-			}
-			switch action {
-			case "retry":
-				continue
-			case "poweroff":
-				return powerAndHold("poweroff")
-			}
-			continue
+			return c.offerTerminalFailureOptions(ci, powerAndHold)
 		}
 
 		c.postProgress(ctx, server, token, bmr.ProgressUpdate{Status: "validated", Result: res, Warnings: res.Warnings})
@@ -426,16 +518,54 @@ func (c *Console) power(action string) error {
 
 func (c *Console) promptServer(ci bool, answers Answers) (string, error) {
 	if ci {
-		return answers.Server, nil
+		// Reaching this branch at all already requires
+		// unattendedCmdlineAllowed() (see Console.Run) — a production
+		// build never gets here regardless of the cmdline. Within a
+		// CI/test build, the plaintext exception still requires the
+		// operator's own explicit breeze.insecure=1 token, the same one
+		// the interactive path below requires — breeze.ci=1 alone is not
+		// itself a reason to skip the scheme check.
+		server := strings.TrimSpace(answers.Server)
+		if !strings.HasPrefix(server, "https://") && !answers.Insecure {
+			return "", fmt.Errorf("ci server URL must start with https:// (set breeze.insecure=1 on a CI/test build to allow plaintext)")
+		}
+		return server, nil
+	}
+	// breeze.insecure=1 is only ever honored on the ci=1 unattended path
+	// above (ParseKernelCmdline's own doc comment already says this token
+	// is "only meaningful when ci is true"). This interactive branch is
+	// reached only when ci is false, so it must never look at
+	// answers.Insecure — that field is populated straight from the
+	// unauthenticated kernel cmdline, and an operator sitting at this
+	// prompt gets no other confirmation that "insecure" was ever
+	// requested. https:// is required here unconditionally.
+	trustedDefault := c.DefaultServer
+	cmdlineDefault := strings.TrimSpace(answers.Server)
+	if trustedDefault != "" && cmdlineDefault != "" && trustedDefault != cmdlineDefault {
+		c.IO.Print(
+			"WARNING: the boot cmdline suggests a different server (%s) than the one baked into this recovery media (%s). "+
+				"Using the media's own server unless you type a different URL below.\n",
+			cmdlineDefault, trustedDefault,
+		)
 	}
 	for {
-		def := c.DefaultServer
-		if def == "" {
-			def = answers.Server
-		}
+		def := trustedDefault
 		prompt := "Breeze server URL: "
-		if def != "" {
+		switch {
+		case def != "":
+			// A build-time (or --server flag) default is a value this
+			// binary/media was configured with, not something read off an
+			// unauthenticated kernel cmdline — safe to pre-fill silently.
 			prompt = fmt.Sprintf("Breeze server URL [%s]: ", def)
+		case cmdlineDefault != "":
+			// No trusted default exists, so the only candidate is the
+			// unauthenticated breeze.server= boot cmdline value. Pre-fill
+			// it as a SUGGESTION only, and label it as such so the
+			// operator knows accepting it (pressing Enter) means trusting
+			// unauthenticated boot configuration, not a value this media
+			// was built or launched with.
+			def = cmdlineDefault
+			prompt = fmt.Sprintf("Breeze server URL [%s — from boot cmdline, unverified; confirm or type a different URL]: ", def)
 		}
 		line, err := c.IO.ReadLine(prompt)
 		if err != nil {
@@ -449,15 +579,46 @@ func (c *Console) promptServer(ci bool, answers Answers) (string, error) {
 			c.IO.Print("A server URL is required.\n")
 			continue
 		}
-		if !strings.HasPrefix(line, "https://") && !answers.Insecure {
-			c.IO.Print("Server URL must start with https:// (or boot with breeze.insecure=1).\n")
+		if !strings.HasPrefix(line, "https://") {
+			c.IO.Print("Server URL must start with https://.\n")
 			continue
 		}
 		return line, nil
 	}
 }
 
+// maxCodeAttempts bounds how many recovery codes the server may reject
+// (bmr.ErrCodeInvalid) before the console gives up. Failures that are not a
+// verdict on the code — the server could not be reached, the URL is not a
+// Breeze server, or the server errored — never count against it (#7649).
 const maxCodeAttempts = 3
+
+// errReenterServer is returned by promptCodeAndExchange when the exchange
+// failed because of the server URL (unreachable, or not a Breeze server)
+// rather than the code; the message has already been printed and connect
+// sends the operator back to the server prompt.
+var errReenterServer = errors.New("recovery server could not be used; re-enter the server URL")
+
+// connect prompts for the server URL and a recovery code and exchanges the
+// code, returning to the server prompt whenever the exchange fails because
+// of the server rather than the code.
+func (c *Console) connect(ctx context.Context, ci bool, answers Answers) (string, string, *bmr.BootstrapResponse, error) {
+	c.codeRejections = 0
+	for {
+		server, err := c.promptServer(ci, answers)
+		if err != nil {
+			return "", "", nil, err
+		}
+		token, bs, err := c.promptCodeAndExchange(ctx, ci, answers, server)
+		if errors.Is(err, errReenterServer) {
+			continue
+		}
+		if err != nil {
+			return "", "", nil, err
+		}
+		return server, token, bs, nil
+	}
+}
 
 func (c *Console) promptCodeAndExchange(ctx context.Context, ci bool, answers Answers, server string) (string, *bmr.BootstrapResponse, error) {
 	// pendingWaitElapsed's own doc comment says the 20-minute
@@ -476,29 +637,220 @@ func (c *Console) promptCodeAndExchange(ctx context.Context, ci bool, answers An
 		return token, bs, nil
 	}
 
-	for attempt := 1; attempt <= maxCodeAttempts; attempt++ {
+	serverErrors := 0
+	for {
 		code, err := c.IO.ReadLine("Recovery code: ")
 		if err != nil {
 			return "", nil, err
 		}
-		token, bs, exErr := c.exchangeWithNegotiation(ctx, strings.TrimSpace(code), server)
+		code = strings.TrimSpace(code)
+		if code == "" {
+			c.IO.Print("A recovery code is required.\n")
+			continue
+		}
+		token, bs, exErr := c.exchangeWithNegotiation(ctx, code, server)
 		if exErr == nil {
 			return token, bs, nil
 		}
-		var negErr *bmr.RecoveryNegotiationError
-		if errors.As(exErr, &negErr) {
+		switch classifyExchangeError(exErr) {
+		case failureRefused:
 			// A terminal negotiation refusal (message already printed by
 			// exchangeWithNegotiation) is not a wrong code — re-prompting
 			// for another code would never help, so stop here instead of
 			// spending one of the operator's three attempts on it.
 			return "", nil, fmt.Errorf("recovery refused: %w", exErr)
+		case failureServerUnreachable:
+			var su *bmr.ServerUnreachableError
+			errors.As(exErr, &su)
+			c.IO.Print("Could not reach %s: %s.\n", su.Host, unreachableReason(exErr))
+			if failedBeforeSending(exErr) {
+				c.IO.Print("The recovery code was not sent and this did not count as a failed attempt. Check the server URL and the network connection.\n")
+			} else {
+				c.IO.Print(codeMayBeUsedNotice)
+			}
+			return "", nil, errReenterServer
+		case failureNotBreezeServer:
+			var ue *bmr.UnexpectedServerResponseError
+			errors.As(exErr, &ue)
+			if ue.StatusCode >= 500 {
+				// A proxy error page: the URL may be right and the Breeze
+				// server behind it down, restarting, or slow (a 504 can
+				// arrive after the server already claimed the code).
+				c.IO.Print("%s returned a gateway/server error page (HTTP %d%s): the Breeze server may be down or restarting, or the URL may be wrong.\n", ue.Host, ue.StatusCode, contentTypeSuffix(ue.ContentType))
+				c.IO.Print(codeMayBeUsedNotice)
+			} else {
+				c.IO.Print("%s answered, but not as a Breeze recovery server (HTTP %d%s).\n", ue.Host, ue.StatusCode, contentTypeSuffix(ue.ContentType))
+				c.IO.Print("The recovery code was not used and this did not count as a failed attempt. Check the server URL.\n")
+			}
+			return "", nil, errReenterServer
+		case failureServerError:
+			// The server (or our own context) failed without judging the
+			// code — a rate limit, a 5xx, a cancelled request. Show what
+			// happened and ask again without spending an attempt, but
+			// never forever: after maxCodeAttempts in a row, go back to
+			// the server prompt in case the URL points at the wrong API.
+			if ctx.Err() != nil {
+				return "", nil, exErr
+			}
+			serverErrors++
+			c.IO.Print("The server could not check that code: %v\n", exErr)
+			if serverErrors >= maxCodeAttempts {
+				c.IO.Print("This did not count as a failed attempt. The server keeps failing; check the server URL, or try again later.\n")
+				return "", nil, errReenterServer
+			}
+			c.IO.Print("This did not count as a failed attempt. Try the code again.\n")
+			continue
 		}
+		c.codeRejections++
 		c.IO.Print("That code did not work: %v\n", exErr)
-		if attempt == maxCodeAttempts {
+		if c.codeRejections >= maxCodeAttempts {
 			return "", nil, fmt.Errorf("too many invalid recovery codes: %w", exErr)
 		}
 	}
-	return "", nil, errors.New("unreachable")
+}
+
+// exchangeFailure is what a failed code exchange means for the operator.
+type exchangeFailure int
+
+const (
+	// failureCodeRejected: the Breeze server rejected the code itself.
+	failureCodeRejected exchangeFailure = iota
+	// failureServerUnreachable: no HTTP response (DNS, connect, TLS, timeout).
+	failureServerUnreachable
+	// failureNotBreezeServer: a response, but not from a Breeze recovery endpoint.
+	failureNotBreezeServer
+	// failureRefused: a terminal capability/version negotiation refusal.
+	failureRefused
+	// failureServerError: any other failure that is not a verdict on the code.
+	failureServerError
+)
+
+func (f exchangeFailure) String() string {
+	switch f {
+	case failureCodeRejected:
+		return "code-rejected"
+	case failureServerUnreachable:
+		return "server-unreachable"
+	case failureNotBreezeServer:
+		return "not-breeze-server"
+	case failureRefused:
+		return "refused"
+	case failureServerError:
+		return "server-error"
+	}
+	return fmt.Sprintf("exchangeFailure(%d)", int(f))
+}
+
+// classifyExchangeError maps a Deps.Exchange error to what it means for the
+// operator. Only bmr.ErrCodeInvalid — the server's definitive code_invalid
+// answer — is a rejected code (#7649).
+func classifyExchangeError(err error) exchangeFailure {
+	var negErr *bmr.RecoveryNegotiationError
+	var su *bmr.ServerUnreachableError
+	var ue *bmr.UnexpectedServerResponseError
+	switch {
+	case errors.Is(err, bmr.ErrCodeInvalid):
+		return failureCodeRejected
+	case errors.As(err, &negErr):
+		return failureRefused
+	case errors.As(err, &su):
+		return failureServerUnreachable
+	case errors.As(err, &ue):
+		return failureNotBreezeServer
+	default:
+		return failureServerError
+	}
+}
+
+// unreachableReason turns a transport failure into the operator-facing
+// reason the server could not be reached.
+func unreachableReason(err error) string {
+	var dnsErr *net.DNSError
+	var unknownAuthority x509.UnknownAuthorityError
+	var hostnameErr x509.HostnameError
+	var invalidCert x509.CertificateInvalidError
+	var certVerify *tls.CertificateVerificationError
+	var recordHeader tls.RecordHeaderError
+	var netErr net.Error
+	switch {
+	case errors.Is(err, bmr.ErrServerCertPinMismatch):
+		return "the server's TLS certificate does not match the one pinned into this recovery media"
+	case errors.As(err, &dnsErr):
+		if dnsErr.IsNotFound {
+			return "server name not found (DNS lookup failed) — check the server URL"
+		}
+		return fmt.Sprintf("DNS lookup failed (%s)", dnsErr.Err)
+	case errors.As(err, &hostnameErr):
+		return fmt.Sprintf("TLS certificate error (%v) — the certificate is for a different name; check the server URL", innermost(err))
+	case errors.As(err, &invalidCert) && (invalidCert.Reason == x509.Expired):
+		// x509 reports both "expired" and "not yet valid" as Expired; on
+		// bare-metal media a wrong BIOS clock is the usual cause.
+		return fmt.Sprintf("TLS certificate error (%v) — check this machine's date and time (BIOS clock)", innermost(err))
+	case errors.As(err, &unknownAuthority):
+		return fmt.Sprintf("TLS certificate error (%v) — the certificate is not trusted by this recovery media; check the server URL, or for a TLS-intercepting proxy on this network", innermost(err))
+	case errors.As(err, &invalidCert), errors.As(err, &certVerify):
+		return fmt.Sprintf("TLS certificate error (%v)", innermost(err))
+	case errors.As(err, &recordHeader):
+		return "TLS handshake failed — the server did not answer as an https:// server"
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return "connection refused — check the server URL and port"
+	case errors.Is(err, syscall.EHOSTUNREACH), errors.Is(err, syscall.ENETUNREACH):
+		return "no route to the server — check the network connection"
+	case errors.As(err, &netErr) && netErr.Timeout():
+		return "connection timed out — check the network connection and server URL"
+	default:
+		return innermost(err).Error()
+	}
+}
+
+// codeMayBeUsedNotice is printed when the request may have reached the
+// server before failing, so the one-time code may already be claimed.
+const codeMayBeUsedNotice = "This did not count as a failed attempt, but the request may have reached the server: if the same code is then reported as invalid, create a new recovery code in Breeze.\n"
+
+// failedBeforeSending reports whether a transport failure provably happened
+// before the request (and so the recovery code) was sent: name resolution,
+// the TCP dial, or the TLS handshake. A timeout or reset after that point
+// may have reached a server that already claimed the one-time code.
+func failedBeforeSending(err error) bool {
+	var dnsErr *net.DNSError
+	var opErr *net.OpError
+	var unknownAuthority x509.UnknownAuthorityError
+	var hostnameErr x509.HostnameError
+	var invalidCert x509.CertificateInvalidError
+	var certVerify *tls.CertificateVerificationError
+	var recordHeader tls.RecordHeaderError
+	switch {
+	case errors.Is(err, bmr.ErrServerCertPinMismatch),
+		errors.As(err, &dnsErr),
+		errors.As(err, &opErr) && opErr.Op == "dial",
+		errors.As(err, &unknownAuthority), errors.As(err, &hostnameErr),
+		errors.As(err, &invalidCert), errors.As(err, &certVerify),
+		errors.As(err, &recordHeader):
+		return true
+	}
+	return false
+}
+
+// innermost unwraps err (through *bmr.ServerUnreachableError and *url.Error)
+// to the transport error itself, so the printed reason does not repeat the
+// request URL the operator just typed.
+func innermost(err error) error {
+	var su *bmr.ServerUnreachableError
+	if errors.As(err, &su) && su.Err != nil {
+		err = su.Err
+	}
+	var ue *url.Error
+	if errors.As(err, &ue) && ue.Err != nil {
+		err = ue.Err
+	}
+	return err
+}
+
+func contentTypeSuffix(ct string) string {
+	if ct == "" {
+		return ""
+	}
+	return ", " + ct
 }
 
 // exchangeWithNegotiation calls Deps.Exchange with code, transparently

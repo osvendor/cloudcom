@@ -9,6 +9,7 @@
 // a topology node actually asks ("what is this?") plus two hand-offs.
 
 import { ExternalLink, Globe, Settings } from 'lucide-react';
+import { normalizeOsFingerprint } from './osFingerprint';
 import { useTranslation } from 'react-i18next';
 
 import type { DiscoveredAsset, OpenPortEntry } from './DiscoveredAssetList';
@@ -140,7 +141,7 @@ export default function AssetDetailModal({ open, asset, loading = false, onClose
   }
 
   const openPorts = asset.openPorts ?? [];
-  const osFingerprint = asset.osFingerprint ?? '—';
+  const osFingerprint = normalizeOsFingerprint(asset.osFingerprint) ?? '—';
   const snmpData = asset.snmpData ?? {};
   const tags = asset.tags ?? [];
   const displayName = asset.label || asset.hostname || asset.ip;
@@ -280,8 +281,13 @@ export default function AssetDetailModal({ open, asset, loading = false, onClose
                   data-testid="asset-modal-same-device-link"
                   className="text-sm text-primary hover:underline"
                 >
-                  {t('assetDetailModal.sameDeviceAs', { name: asset.linkedDeviceName || t('common:states.unknown') })}
+                  {asset.linkSource === 'agent_report'
+                    ? t('devices:hardwareHealth.bmcHost', { name: asset.linkedDeviceName || t('common:states.unknown') })
+                    : t('assetDetailModal.sameDeviceAs', { name: asset.linkedDeviceName || t('common:states.unknown') })}
                 </a>
+                {asset.linkSource === 'agent_report' && <p className="text-xs text-muted-foreground" data-testid="asset-modal-link-provenance">
+                  {t('devices:hardwareHealth.bmcAgentReport')}
+                </p>}
               </div>
             )}
 

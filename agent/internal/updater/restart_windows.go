@@ -5,12 +5,13 @@ package updater
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
 
+	"github.com/breeze-rmm/agent/internal/procspawn"
+	"github.com/breeze-rmm/agent/internal/psscript"
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/mgr"
@@ -19,6 +20,19 @@ import (
 const serviceName = "BreezeAgent"
 
 var rollbackRecoveryRestartScheduled atomic.Bool
+
+// detachedHelperSysProcAttr is the process attributes for the powershell.exe
+// update and rollback helpers. CREATE_NEW_PROCESS_GROUP lets the helper outlive
+// the agent it is replacing. CREATE_NO_WINDOW + HideWindow keep the
+// console-subsystem powershell.exe from opening a console window when the agent
+// is not running as the session-0 service (#3624), the same treatment as
+// executor/limits_windows.go and userhelper/spawn_windows.go.
+func detachedHelperSysProcAttr() *syscall.SysProcAttr {
+	return &syscall.SysProcAttr{
+		HideWindow:    true,
+		CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP | windows.CREATE_NO_WINDOW,
+	}
+}
 
 func deferRollbackSwapToRestart() bool { return true }
 
@@ -209,11 +223,23 @@ func buildRestartScript(opts restartScriptOptions) string {
 		// Success path: start the service.
 		"  Start-Service -Name '"+serviceName+"'",
 		"} catch {",
+		// Nothing in this block may abort it before the closing Start-Service.
+		// Under the script-wide 'Stop' preference a failed Out-File (TEMP
+		// unwritable, disk full) would end the script and leave the service
+		// stopped; under 'Continue' it only drops the log (#9751).
+		"  $ErrorActionPreference = 'Continue'",
 		// Failure path: log structured diagnostics. ${env:TEMP} always exists
 		// on Windows (unlike C:\ProgramData\Breeze, which may not exist yet
 		// on a fresh install — see #609 / HardenProgramDataAcl sequencing).
-		"  $stamp = [int][double]::Parse((Get-Date -UFormat %s))",
-		"  $logPath = Join-Path $env:TEMP (\"breeze-update-failure-$stamp.log\")",
+		// Culture-invariant stamp. `[double]::Parse((Get-Date -UFormat %s))`
+		// throws on hosts whose number format rejects "." (PowerShell 5.1
+		// emits a fractional value), which aborted this catch block before
+		// the log and the Start-Service below (#9751).
+		"  $stamp = [DateTime]::UtcNow.Ticks",
+		// The heartbeat reads this file after a swap that did not take
+		// (heartbeat/update_outcome.go): keep the prefix and the
+		// "operation:" / "exception:" lines in step with that parser.
+		"  $logPath = Join-Path $env:TEMP (\""+UpdateHelperFailureLogPrefix+"$stamp.log\")",
 		"  $op = if ($_.InvocationInfo) { $_.InvocationInfo.Line } else { '<unknown>' }",
 		"  $msg = @(",
 		"    \"Breeze update-helper failure at $(Get-Date -Format o)\",",
@@ -272,16 +298,10 @@ func RestartWithHelper(agent BinaryPair, userHelper *BinaryPair, backup *BinaryP
 		Backup:     backup,
 	})
 
-	scriptFile, err := os.CreateTemp("", "breeze-update-*.ps1")
+	scriptPath, err := psscript.CreateTemp("breeze-update-*.ps1", script)
 	if err != nil {
-		return fmt.Errorf("failed to create update script: %w", err)
-	}
-	if _, err := scriptFile.WriteString(script); err != nil {
-		scriptFile.Close()
-		os.Remove(scriptFile.Name())
 		return fmt.Errorf("failed to write update script: %w", err)
 	}
-	scriptFile.Close()
 
 	userHelperTemp := ""
 	userHelperTarget := ""
@@ -296,7 +316,7 @@ func RestartWithHelper(agent BinaryPair, userHelper *BinaryPair, backup *BinaryP
 		backupTarget = backup.Target
 	}
 	log.Info("spawning update helper script",
-		"script", scriptFile.Name(),
+		"script", scriptPath,
 		"newBinary", agent.Temp,
 		"target", agent.Target,
 		"userHelperTemp", userHelperTemp,
@@ -305,16 +325,14 @@ func RestartWithHelper(agent BinaryPair, userHelper *BinaryPair, backup *BinaryP
 		"backupTarget", backupTarget,
 	)
 
-	cmd := exec.Command("powershell.exe",
+	cmd := procspawn.Command("powershell.exe",
 		"-NoProfile", "-ExecutionPolicy", "Bypass",
-		"-File", scriptFile.Name(),
+		"-File", scriptPath,
 	)
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP,
-	}
+	cmd.SysProcAttr = detachedHelperSysProcAttr()
 
 	if err := cmd.Start(); err != nil {
-		os.Remove(scriptFile.Name())
+		os.Remove(scriptPath)
 		return fmt.Errorf("failed to start update helper: %w", err)
 	}
 
@@ -334,23 +352,14 @@ func startWindowsRollbackHelper(journalPath string, operation windowsRollbackOpe
 	if err != nil {
 		return err
 	}
-	scriptFile, err := os.CreateTemp("", "breeze-rollback-restart-*.ps1")
+	scriptPath, err := psscript.CreateTemp("breeze-rollback-restart-*.ps1", script)
 	if err != nil {
 		return err
 	}
-	if _, err := scriptFile.WriteString(script); err != nil {
-		_ = scriptFile.Close()
-		_ = os.Remove(scriptFile.Name())
-		return err
-	}
-	if err := scriptFile.Close(); err != nil {
-		_ = os.Remove(scriptFile.Name())
-		return err
-	}
-	cmd := exec.Command("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptFile.Name())
-	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP}
+	cmd := procspawn.Command("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath)
+	cmd.SysProcAttr = detachedHelperSysProcAttr()
 	if err := cmd.Start(); err != nil {
-		_ = os.Remove(scriptFile.Name())
+		_ = os.Remove(scriptPath)
 		return err
 	}
 	return cmd.Process.Release()
@@ -372,25 +381,27 @@ func RestartAfterRollback(journalPath string) error {
 			return err
 		}
 	}
+	return startDetachedServiceRestart("breeze-rollback-restart-*.ps1")
+}
 
-	scriptFile, err := os.CreateTemp("", "breeze-rollback-restart-*.ps1")
+// RestartSelf restarts the agent service from inside the service process.
+// Restart() cannot be used for that on Windows: it stops the service it runs
+// in and dies before it can start it again. A detached helper outlives the
+// stop and starts the service once it has stopped.
+func RestartSelf() error {
+	return startDetachedServiceRestart("breeze-restart-*.ps1")
+}
+
+func startDetachedServiceRestart(tempPattern string) error {
+	script := "Start-Sleep -Seconds 2\r\nRestart-Service -Name '" + serviceName + "' -Force\r\nRemove-Item -Path $PSCommandPath -Force -ErrorAction SilentlyContinue"
+	scriptPath, err := psscript.CreateTemp(tempPattern, script)
 	if err != nil {
 		return err
 	}
-	script := "Start-Sleep -Seconds 2\r\nRestart-Service -Name '" + serviceName + "' -Force\r\nRemove-Item -Path $PSCommandPath -Force -ErrorAction SilentlyContinue"
-	if _, err := scriptFile.WriteString(script); err != nil {
-		_ = scriptFile.Close()
-		_ = os.Remove(scriptFile.Name())
-		return err
-	}
-	if err := scriptFile.Close(); err != nil {
-		_ = os.Remove(scriptFile.Name())
-		return err
-	}
-	cmd := exec.Command("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptFile.Name())
-	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP}
+	cmd := procspawn.Command("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath)
+	cmd.SysProcAttr = detachedHelperSysProcAttr()
 	if err := cmd.Start(); err != nil {
-		_ = os.Remove(scriptFile.Name())
+		_ = os.Remove(scriptPath)
 		return err
 	}
 	return cmd.Process.Release()

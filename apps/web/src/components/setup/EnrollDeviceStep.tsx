@@ -1,3 +1,4 @@
+import { setupCompletionDestination } from '../../lib/purchaseHandoff';
 import { useEffect, useState, useCallback } from 'react';
 import { Check, Copy, Loader2, Download, Link, ArrowLeft, Info } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
@@ -6,6 +7,7 @@ import { extractApiError } from '@/lib/apiError';
 import { fallbackInstallerFilename, filenameFromContentDisposition } from '@/lib/downloadFilename';
 import { buildInstallCommands } from '@/lib/installCommands';
 import { showToast } from '../shared/Toast';
+import { useStableT } from '@/lib/i18n/useStableT';
 
 type Platform = 'windows' | 'macos' | 'linux';
 
@@ -26,6 +28,7 @@ function detectPlatform(): Platform {
 
 export default function EnrollDeviceStep({ orgId, siteId, onBack, onFinish: _onFinish }: EnrollDeviceStepProps) {
   const { t } = useTranslation('auth');
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   const userPlatform = detectPlatform();
 
   // Tab state
@@ -52,6 +55,8 @@ export default function EnrollDeviceStep({ orgId, siteId, onBack, onFinish: _onF
   const [cliInitialized, setCliInitialized] = useState(false);
   const [onboardingToken, setOnboardingToken] = useState('');
   const [enrollmentSecret, setEnrollmentSecret] = useState('');
+  // Server URL agents enroll against, as the API reports it at runtime (#8120).
+  const [tokenServerUrl, setTokenServerUrl] = useState('');
   const [tokenLoading, setTokenLoading] = useState(false);
   const [tokenError, setTokenError] = useState<string>();
   const [tokenCopied, setTokenCopied] = useState(false);
@@ -65,28 +70,30 @@ export default function EnrollDeviceStep({ orgId, siteId, onBack, onFinish: _onF
     setTokenLoading(true);
     setOnboardingToken('');
     setEnrollmentSecret('');
+    setTokenServerUrl('');
     setTokenError(undefined);
 
     try {
       const res = await fetchWithAuth('/devices/onboarding-token', { method: 'POST' });
       if (!res.ok) {
         const data = await res.json().catch(() => null);
-        setTokenError(extractApiError(data, t('setup.enroll.errors.generateTokenFailed')));
+        setTokenError(extractApiError(data, stableT('setup.enroll.errors.generateTokenFailed')));
         return;
       }
       const data = await res.json();
       if (!data.token) {
-        setTokenError(t('setup.enroll.errors.emptyToken'));
+        setTokenError(stableT('setup.enroll.errors.emptyToken'));
         return;
       }
       setOnboardingToken(data.token);
       if (data.enrollmentSecret) setEnrollmentSecret(data.enrollmentSecret);
+      if (typeof data.serverUrl === 'string' && data.serverUrl) setTokenServerUrl(data.serverUrl);
     } catch {
-      setTokenError(t('setup.enroll.errors.tokenConnectionFailed'));
+      setTokenError(stableT('setup.enroll.errors.tokenConnectionFailed'));
     } finally {
       setTokenLoading(false);
     }
-  }, [cliInitialized, t]);
+  }, [cliInitialized, stableT]);
 
   // Auto-init CLI if that's the default tab
   useEffect(() => {
@@ -98,6 +105,24 @@ export default function EnrollDeviceStep({ orgId, siteId, onBack, onFinish: _onF
     if (tab === 'cli') void initializeCli();
   };
 
+  // One parent key per site and user, reused across Download / Generate Link
+  // clicks; the server mints one only when there is no good one (#7345).
+  async function getAddDeviceParent(): Promise<{ id: string; reused: boolean } | { error: string }> {
+    const keyRes = await fetchWithAuth('/enrollment-keys/add-device-parent', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ siteId, orgId }),
+    });
+    if (!keyRes.ok) {
+      const body = await keyRes.json().catch(() => ({}));
+      return {
+        error: body.error || t('setup.enroll.errors.createEnrollmentKeyFailed', { status: keyRes.status }),
+      };
+    }
+    const data = (await keyRes.json()) as { id: string; reused?: boolean };
+    return { id: data.id, reused: data.reused === true };
+  }
+
   // --- Installer download ---
   const handleDownload = async () => {
     if (downloading) return;
@@ -106,30 +131,18 @@ export default function EnrollDeviceStep({ orgId, siteId, onBack, onFinish: _onF
     setDownloadSuccess(false);
 
     try {
-      // Create enrollment key scoped to the setup site. maxUsage is
-      // deliberately left unset — it is an enforced enrollment budget, not a
-      // display label. See the note in AddDeviceModal.handleDownload (#2992);
-      // on Windows and the macOS app-bundle path the installer's real
+      // The setup site's parent key, shared with the Add Device modal (#7345):
+      // reused while still good, minted only when not. Its max_usage stays 1
+      // — an enforced enrollment budget, not a display label (#2992). On
+      // Windows and the macOS app-bundle path the installer's real
       // device-count cap lives on the bootstrap token (on the legacy macOS zip
-      // fallback it lives on a child key), and the Enrollment Keys list now
-      // reads the former.
-      const keyRes = await fetchWithAuth('/enrollment-keys', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          name: `Setup installer (${new Date().toISOString().slice(0, 10)})`,
-          siteId,
-          orgId,
-        }),
-      });
-
-      if (!keyRes.ok) {
-        const body = await keyRes.json().catch(() => ({}));
-        setDownloadError(body.error || t('setup.enroll.errors.createEnrollmentKeyFailed', { status: keyRes.status }));
+      // fallback it lives on a child key), and the Enrollment Keys list reads
+      // the former.
+      const parent = await getAddDeviceParent();
+      if ('error' in parent) {
+        setDownloadError(parent.error);
         return;
       }
-
-      const keyData = await keyRes.json();
 
       // Download installer
       const dlController = new AbortController();
@@ -137,7 +150,10 @@ export default function EnrollDeviceStep({ orgId, siteId, onBack, onFinish: _onF
       let dlRes: Response;
       try {
         dlRes = await fetchWithAuth(
-          `/enrollment-keys/${keyData.id}/installer/${selectedPlatform}?count=${deviceCount}`,
+          // discardKeyOnFailure (#7217): a failed build must not leave a
+          // freshly minted parent key live. Never for a reused parent — it
+          // already backs installers delivered earlier.
+          `/enrollment-keys/${parent.id}/installer/${selectedPlatform}?count=${deviceCount}${parent.reused ? '' : '&discardKeyOnFailure=1'}`,
           { signal: dlController.signal },
         );
       } finally {
@@ -182,25 +198,13 @@ export default function EnrollDeviceStep({ orgId, siteId, onBack, onFinish: _onF
     setGeneratedLink('');
 
     try {
-      const keyRes = await fetchWithAuth('/enrollment-keys', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          name: `Setup link (${new Date().toISOString().slice(0, 10)})`,
-          siteId,
-          orgId,
-        }),
-      });
-
-      if (!keyRes.ok) {
-        const body = await keyRes.json().catch(() => ({}));
-        setLinkError(body.error || t('setup.enroll.errors.createEnrollmentKeyFailed', { status: keyRes.status }));
+      const parent = await getAddDeviceParent();
+      if ('error' in parent) {
+        setLinkError(parent.error);
         return;
       }
 
-      const keyData = await keyRes.json();
-
-      const linkRes = await fetchWithAuth(`/enrollment-keys/${keyData.id}/installer-link`, {
+      const linkRes = await fetchWithAuth(`/enrollment-keys/${parent.id}/installer-link${parent.reused ? '' : '?discardKeyOnFailure=1'}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ platform: selectedPlatform, count: deviceCount }),
@@ -265,7 +269,7 @@ export default function EnrollDeviceStep({ orgId, siteId, onBack, onFinish: _onF
       localStorage.removeItem('breeze-setup-org');
       localStorage.removeItem('breeze-setup-site');
     } catch { /* ignore */ }
-    window.location.href = '/';
+    window.location.href = setupCompletionDestination(window.location.search);
   };
 
   return (
@@ -473,11 +477,18 @@ export default function EnrollDeviceStep({ orgId, siteId, onBack, onFinish: _onF
 
           {/* Commands */}
           {(() => {
-            const commands: Record<Platform, string> = buildInstallCommands({
-              apiUrl: import.meta.env.PUBLIC_API_URL || window.location.origin,
-              token: onboardingToken || '<TOKEN>',
-              enrollmentSecret: enrollmentSecret || undefined,
-            });
+            // #7628: never render a command without a real key. A "<TOKEN>"
+            // placeholder looked runnable, got copied, and failed enrollment
+            // with enrollment_key_not_found (exit 11).
+            const command =
+              onboardingToken && !tokenLoading && !tokenError
+                ? buildInstallCommands({
+                    // #8120: the server's runtime URL first (see AddDeviceModal).
+                    apiUrl: tokenServerUrl || import.meta.env.PUBLIC_API_URL || window.location.origin,
+                    token: onboardingToken,
+                    enrollmentSecret: enrollmentSecret || undefined,
+                  })[selectedOS]
+                : null;
 
             return (
               <div>
@@ -501,19 +512,32 @@ export default function EnrollDeviceStep({ orgId, siteId, onBack, onFinish: _onF
                   ))}
                 </div>
                 <div className="rounded-lg border bg-muted/30 p-4">
-                  <div className="flex items-start justify-between gap-2">
-                    <code className="text-xs font-mono text-muted-foreground break-all">
-                      {commands[selectedOS]}
-                    </code>
-                    <button
-                      type="button"
-                      onClick={() => handleCopyCommand(commands[selectedOS])}
-                      aria-label={t('setup.enroll.cli.copyCommand')}
-                      className="shrink-0 p-1 hover:bg-muted rounded"
+                  {command ? (
+                    <div className="flex items-start justify-between gap-2">
+                      <code
+                        className="text-xs font-mono text-muted-foreground break-all"
+                        data-testid="setup-cli-command"
+                      >
+                        {command}
+                      </code>
+                      <button
+                        type="button"
+                        data-testid="setup-cli-copy-command"
+                        onClick={() => handleCopyCommand(command)}
+                        aria-label={t('setup.enroll.cli.copyCommand')}
+                        className="shrink-0 p-1 hover:bg-muted rounded"
+                      >
+                        <Copy className="h-4 w-4" />
+                      </button>
+                    </div>
+                  ) : (
+                    <p
+                      className="text-sm text-muted-foreground"
+                      data-testid="setup-cli-command-needs-token"
                     >
-                      <Copy className="h-4 w-4" />
-                    </button>
-                  </div>
+                      {t('setup.enroll.cli.commandNeedsToken')}
+                    </p>
+                  )}
                 </div>
                 <p className="mt-2 text-xs text-muted-foreground">
                   {selectedOS === 'windows' ? t('setup.enroll.cli.runAsAdmin') : t('setup.enroll.cli.runInTerminal')}

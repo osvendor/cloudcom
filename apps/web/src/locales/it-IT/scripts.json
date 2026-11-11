@@ -3,7 +3,8 @@
     "errors": {
       "fetch": "Impossibile recuperare l'automazione",
       "generic": "Si è verificato un errore",
-      "save": "Impossibile salvare l'automazione"
+      "save": "Impossibile salvare l'automazione",
+      "invalidTarget": "La destinazione dei dispositivi non è valida: {{detail}}"
     },
     "loading": "Caricamento automazione...",
     "breadcrumb": {
@@ -25,7 +26,8 @@
     },
     "actions": {
       "create": "Crea automazione",
-      "saveChanges": "Salva modifiche"
+      "saveChanges": "Salva modifiche",
+      "backToAutomations": "Torna ai lavori"
     }
   },
   "automationForm": {
@@ -51,6 +53,11 @@
         "weekdaysNine": "Giorni feriali alle 9:00",
         "weeklySunday": "Ogni domenica"
       }
+    },
+    "alertWorkflow": {
+      "severity": "Gravità",
+      "kind": "Tipi di monitor",
+      "hint": "Lascia un gruppo vuoto per accettare qualsiasi valore. I filtri avanzati esistenti vengono conservati."
     },
     "validation": {
       "valueRequired": "Il valore è obbligatorio",
@@ -158,7 +165,8 @@
       "command": "Comando",
       "whenOffline": "Se il dispositivo è offline",
       "software": "Software",
-      "failureNotificationChannel": "Canale di notifica errore"
+      "failureNotificationChannel": "Canale di notifica errore",
+      "actionType": "Tipo di azione"
     },
     "options": {
       "whenOffline": {
@@ -203,7 +211,9 @@
     },
     "empty": {
       "noActions": "Nessuna azione definita. Fai clic su \"Aggiungi azione\" per crearne una."
-    }
+    },
+    "partnerGroupsNote": "Le automazioni a livello di partner non possono avere come destinazione gruppi di dispositivi o dispositivi specifici, perché ciascuno appartiene a una sola organizzazione. Usa Tutti i dispositivi o un filtro avanzato.",
+    "partnerTargetBlocked": "Questa automazione a livello di partner ha come destinazione gruppi di dispositivi o dispositivi specifici, il che non è supportato. Cambia la destinazione in Tutti i dispositivi o in un filtro avanzato prima di salvare."
   },
   "automationList": {
     "elevated": "Privilegi elevati",
@@ -218,7 +228,9 @@
     "searchPlaceholder": "Cerca automazioni...",
     "filters": {
       "allTriggers": "Tutti i trigger",
-      "allStatus": "Tutti gli stati"
+      "allStatus": "Tutti gli stati",
+      "triggerLabel": "Tipo di trigger",
+      "statusLabel": "Stato"
     },
     "trigger": {
       "schedule": "Pianificazione",
@@ -327,6 +339,14 @@
       "awaiting": "In attesa della risposta dell'agente…",
       "truncated": "Output troncato: consulta la cronologia degli script del dispositivo per il testo completo."
     },
+    "commandOutput": {
+      "show_one": "Mostra output del comando",
+      "show_other": "Mostra output del comando ({{count}})",
+      "hide_one": "Nascondi output del comando",
+      "hide_other": "Nascondi output del comando ({{count}})",
+      "label": "Comando (azione {{index}})",
+      "truncated": "Output troncato: il testo completo non è mostrato in questa vista."
+    },
     "errors": {
       "cancelRun": "Impossibile annullare l'esecuzione."
     }
@@ -361,7 +381,7 @@
       "scheduled": "Pianificate",
       "on-demand": "Su richiesta",
       "webhooks": "Webhook",
-      "event-rules": "Regole evento"
+      "event-rules": "Flussi degli avvisi"
     }
   },
   "complianceDashboard": {
@@ -403,12 +423,17 @@
     "empty": {
       "noPolicies": "Nessun criterio configurato",
       "allCompliant": "Tutti i dispositivi sono conformi!",
+      "notEvaluated": "Nessun dispositivo è ancora stato valutato.",
+      "noViolationsPending_one": "Nessuna violazione trovata; {{count}} dispositivo è ancora in attesa di valutazione.",
+      "noViolationsPending_other": "Nessuna violazione trovata; {{count}} dispositivi sono ancora in attesa di valutazione.",
       "noMatchingDevices": "Nessun dispositivo corrispondente trovato."
     },
     "policyComplianceRatio": "{{compliant}} / {{total}} conformi",
     "searchDevices": "Cerca dispositivi...",
-    "violationCount": "{{count}} violazione",
-    "moreViolations": "+{{count}} altre violazioni",
+    "violationCount_one": "{{count}} violazione",
+    "violationCount_other": "{{count}} violazioni",
+    "moreViolations_one": "+{{count}} altra violazione",
+    "moreViolations_other": "+{{count}} altre violazioni",
     "lastChecked": "Ultimo controllo: {{date}}",
     "pagination": {
       "showing": "Visualizzazione da {{start}} a {{end}} di {{total}}",
@@ -421,6 +446,7 @@
       "generic": "Si è verificato un errore"
     },
     "loading": "Caricamento dati di conformità...",
+    "backToPolicies": "Torna ai criteri",
     "policyTitle": "Conformità: {{policy}}",
     "policyFallback": "Criterio",
     "title": "Dashboard conformità",
@@ -478,7 +504,8 @@
     },
     "actions": {
       "create": "Crea criterio",
-      "saveChanges": "Salva modifiche"
+      "saveChanges": "Salva modifiche",
+      "backToPolicies": "Torna ai criteri"
     }
   },
   "policyForm": {
@@ -537,7 +564,8 @@
     },
     "actions": {
       "savePolicy": "Salva criterio",
-      "addRule": "Aggiungi regola"
+      "addRule": "Aggiungi regola",
+      "removeRule": "Rimuovi regola"
     },
     "fields": {
       "name": "Nome criterio",
@@ -555,7 +583,8 @@
       "configFilePath": "Percorso file di configurazione",
       "configKey": "Chiave di configurazione",
       "remediationScript": "Script di correzione",
-      "evaluateEvery": "Valuta ogni"
+      "evaluateEvery": "Valuta ogni",
+      "ruleType": "Tipo di regola"
     },
     "placeholders": {
       "name": "Criterio baseline di sicurezza",
@@ -612,7 +641,9 @@
     "searchPlaceholder": "Cerca criteri...",
     "filters": {
       "allEnforcement": "Tutti i livelli di applicazione",
-      "allStatus": "Tutti gli stati"
+      "allStatus": "Tutti gli stati",
+      "enforcementLabel": "Applicazione",
+      "statusLabel": "Stato"
     },
     "enforcement": {
       "monitor": {
@@ -689,6 +720,8 @@
       "timeout": "Esecuzione script scaduta",
       "pending": "Lo script è in attesa di essere eseguito",
       "queued": "Lo script è in coda per l'invio al dispositivo",
+      "queuedAwaitingPickup": "Nessuna sessione attiva dell'agente lo ha ancora preso in carico. Lo script verrà consegnato al prossimo contatto dell'agente del dispositivo.",
+      "deviceOffline": "Il dispositivo è offline. Lo script verrà consegnato quando si riconnetterà.",
       "cancelling": "Interruzione richiesta: in attesa di conferma dal dispositivo.",
       "cancelled": "È stato interrotto sul dispositivo"
     },
@@ -712,7 +745,8 @@
       "failedCancelTooLate": "Non riuscito — la richiesta di interruzione è arrivata troppo tardi",
       "timeoutCancelTooLate": "Timeout — la richiesta di interruzione è arrivata troppo tardi",
       "cancelFailed": "Interruzione non riuscita — il dispositivo non è riuscito a interrompere il processo",
-      "queuedOffline": "In coda — dispositivo offline"
+      "queuedOffline": "In coda — dispositivo offline",
+      "queuedAwaitingPickup": "In coda — in attesa che il dispositivo lo prenda in carico"
     }
   },
   "executionHistory": {
@@ -726,7 +760,9 @@
       "lastHour": "Ultima ora",
       "lastDay": "Ultime 24 ore",
       "lastWeek": "Ultimi 7 giorni",
-      "lastMonth": "Ultimi 30 giorni"
+      "lastMonth": "Ultimi 30 giorni",
+      "statusLabel": "Stato",
+      "dateLabel": "Intervallo di date"
     },
     "status": {
       "pending": "In sospeso",
@@ -741,7 +777,8 @@
       "failedCancelTooLate": "Non riuscito — la richiesta di interruzione è arrivata troppo tardi",
       "timeoutCancelTooLate": "Timeout — la richiesta di interruzione è arrivata troppo tardi",
       "cancelFailed": "Interruzione non riuscita — il dispositivo non è riuscito a interrompere il processo",
-      "queuedOffline": "In coda — dispositivo offline"
+      "queuedOffline": "In coda — dispositivo offline",
+      "queuedAwaitingPickup": "In coda — in attesa di presa in carico"
     },
     "summary": "{{shown}} di {{total}}",
     "headers": {
@@ -770,7 +807,7 @@
   "scriptAiInput": {
     "placeholder": {
       "ready": "Descrivi lo script di cui hai bisogno...",
-      "opening": "Apertura assistente IA..."
+      "opening": "Apertura di Breeze AI..."
     },
     "actions": {
       "stopGenerating": "Interrompi generazione",
@@ -789,12 +826,12 @@
       "reject": "Rifiuta"
     },
     "empty": {
-      "title": "Assistente IA per script",
-      "description": "Descrivi ciò di cui hai bisogno e scriverò lo script per te."
+      "title": "Breeze AI",
+      "description": "Chiedi a Breeze AI di scrivere o rivedere questo script."
     }
   },
   "scriptAiPanel": {
-    "title": "Assistente IA per script",
+    "title": "Breeze AI",
     "actions": {
       "redoTitle": "Riapplica modifica IA",
       "redo": "Ripeti",
@@ -933,13 +970,23 @@
       "allAdmitted": "Tutti i dispositivi selezionati sono stati ammessi e messi in coda.",
       "partiallyAdmitted": "Alcuni dispositivi sono stati ammessi e messi in coda. Esamina le destinazioni rimanenti.",
       "rejected": "Nessun dispositivo è stato ammesso. Esamina i motivi qui sotto.",
-      "queued": "In coda"
+      "queued": "In coda",
+      "reasons": {
+        "not_found_or_inaccessible": "Dispositivo non trovato o non accessibile",
+        "site_access_denied": "Non hai accesso al sito di questo dispositivo",
+        "script_org_mismatch": "Lo script appartiene a un'organizzazione diversa da quella del dispositivo",
+        "os_incompatible": "Lo script non è compatibile con il sistema operativo di questo dispositivo",
+        "device_decommissioned": "Il dispositivo è stato dismesso",
+        "maintenance_suppressed": "Saltato: il dispositivo è in una finestra di manutenzione"
+      }
     },
     "confirm": {
       "title": "Conferma esecuzione",
-      "description": "Esegui \"{{name}}\" su {{count}} dispositivo/i come {{runAs}}. Gli script vengono accodati e iniziano l'esecuzione immediatamente."
+      "description": "Esegui \"{{name}}\" su {{count}} dispositivo/i come {{runAs}}. Gli script vengono accodati e iniziano l'esecuzione immediatamente.",
+      "descriptionOffline": "Esegui “{{name}}” su {{count}} dispositivo/i come {{runAs}}. Gli script vengono accodati ora: i dispositivi online iniziano subito e {{offline}} dispositivo/i offline verranno eseguiti quando tornano online."
     },
     "selectedCount": "{{count}} dispositivo/i selezionato/i",
+    "executeBlocked": "L’esecuzione non è disponibile: un dispositivo selezionato non può eseguire questo script qui (potrebbe appartenere a un’organizzazione diversa da quella mostrata o non essere più accessibile).",
     "languages": {
       "powershell": "PowerShell",
       "bash": "Bash",
@@ -953,6 +1000,44 @@
     },
     "toasts": {
       "runsWhenOnline": "Viene eseguito quando il dispositivo è online"
+    },
+    "targetMode": {
+      "label": "Esegui su",
+      "devices": "Dispositivi",
+      "groups": "Gruppi di dispositivi"
+    },
+    "groups": {
+      "title": "Seleziona gruppi di dispositivi",
+      "searchPlaceholder": "Cerca gruppi",
+      "selectedCount": "{{count}} gruppo/i selezionato/i",
+      "dynamic": "Dinamico",
+      "deviceCount": "{{count}} dispositivo/i",
+      "refusedReason": "Non disponibile come destinazione di esecuzione: le regole di questo gruppo si basano su campi che il dispositivo stesso segnala ({{fields}}).",
+      "loading": "Caricamento dei gruppi di dispositivi...",
+      "loadFailed": "Impossibile caricare i gruppi di dispositivi.",
+      "retry": "Riprova",
+      "empty": "Nessun gruppo di dispositivi trovato.",
+      "tooManyGroups": "Un'esecuzione può avere al massimo {{max}} gruppi come destinazione.",
+      "countingMembers": "Conteggio dei membri...",
+      "countFailed": "Impossibile contare i membri dei gruppi selezionati. Il server verifica il limite durante l'esecuzione.",
+      "summaryUnique": "{{count}} dispositivo/i univoco/i nei gruppi selezionati",
+      "summaryCompatible": "{{count}} possono eseguire questo script (sistema operativo compatibile)",
+      "summaryOffline": "{{count}} di questi sono offline e verranno eseguiti quando il dispositivo sarà online",
+      "membershipNote": "L'appartenenza ai gruppi dinamici è quella dell'ultima valutazione e viene riletta all'avvio dell'esecuzione.",
+      "overCap": "Questi gruppi contengono {{count}} dispositivi univoci, oltre il limite di {{max}} per esecuzione. Deseleziona un gruppo o suddividi l'esecuzione.",
+      "submitting": "Invio a {{count}} gruppo/i...",
+      "warningsTitle": "Note del server",
+      "confirmDescription": "Esegui “{{name}}” su {{groups}} gruppo/i di dispositivi come {{runAs}}. Gli script vengono messi in coda e iniziano subito.",
+      "confirmDescriptionOffline": "Esegui “{{name}}” su {{groups}} gruppo/i di dispositivi come {{runAs}}. Gli script vengono accodati ora: i dispositivi online iniziano subito e {{offline}} dispositivo/i offline verranno eseguiti quando tornano online.",
+      "confirmMembers": "In questo momento {{count}} dispositivo/i univoco/i fanno parte di questi gruppi; l'appartenenza viene riletta alla conferma.",
+      "confirmMembersUnknown": "Il numero di dispositivi non è ancora noto; l'appartenenza viene letta alla conferma.",
+      "errors": {
+        "selectGroup": "Seleziona almeno un gruppo di dispositivi",
+        "tooManyTargets": "Questi gruppi corrispondono a {{count}} dispositivi, oltre il limite di {{max}} per esecuzione. Deseleziona un gruppo o suddividi l'esecuzione.",
+        "perGroup": "Dispositivi per gruppo: {{groups}}.",
+        "groupNotFound": "{{count}} gruppo/i selezionato/i non esiste/esistono più o non è/sono accessibile/i. Ricarica l'elenco e riprova.",
+        "noTargets": "I gruppi selezionati non contengono dispositivi che questa esecuzione possa raggiungere; non è stato eseguito nulla."
+      }
     }
   },
   "secretParameters": {
@@ -968,6 +1053,7 @@
     "loading": "Caricamento esecuzioni...",
     "actions": {
       "backToScripts": "Torna agli script",
+      "backToScript": "Torna allo script",
       "runScript": "Esegui script"
     },
     "breadcrumb": {
@@ -1050,8 +1136,8 @@
       "exitCodeSeverity": "Gravità codice di uscita"
     },
     "ai": {
-      "toggleTitle": "Attiva/disattiva assistente IA per script (⌘⇧I)",
-      "button": "Assistente IA"
+      "toggleTitle": "Attiva/disattiva Breeze AI (⌘⇧I)",
+      "button": "Breeze AI"
     },
     "parameters": {
       "emptyPrefix": "Non ci sono ancora parametri. I parametri consentono agli utenti di fornire valori in fase di esecuzione - referenziali nello script come",
@@ -1064,9 +1150,9 @@
       "elevatedHint": "Usa sudo su macOS/Linux, runas su Windows."
     },
     "exitCodeSeverity": {
-      "emptyPrefix": "Mappa codici di uscita specifici a gravità degli avvisi. Quando lo script restituisce uno di questi codici, viene generato un avviso con la gravità configurata. Scegli",
+      "emptyPrefix": "Mappa codici di uscita specifici a gravità degli avvisi. Quando un'esecuzione non presidiata (pianificata, automazione, criterio o attivata da un avviso) restituisce uno di questi codici, viene generato un avviso con la gravità configurata; le esecuzioni manuali non ne generano mai. Un'esecuzione successiva che termina correttamente lo risolve. Scegli",
       "suppressAlert": "Sopprimi avviso",
-      "emptySuffix": "per contrassegnare un codice come informativo (nessun incidente generato). I codici di uscita non elencati qui usano la gestione dell'esito predefinita.",
+      "emptySuffix": "per contrassegnare un codice come informativo (nessun avviso). Un codice diverso da zero non elencato usa la gravità del codice inferiore elencato più vicino, oppure media.",
       "suppressHint": "Sopprimi avviso - il codice di uscita viene trattato come informativo, nessun incidente generato."
     },
     "keyboardSave": "{{shortcut}} per salvare",
@@ -1437,7 +1523,8 @@
       "notStarted": "L'esecuzione non è stata avviata (il dispositivo potrebbe essere in manutenzione).",
       "pollDeadline": "Ancora nessun risultato — controlla la cronologia delle esecuzioni.",
       "pollFailed": "Impossibile leggere il risultato — l'esecuzione potrebbe essere stata eliminata o il tuo accesso è cambiato."
-    }
+    },
+    "deviceSelectLabel": "Dispositivo di test"
   },
   "provenance": {
     "origin": "Origine",
@@ -1465,6 +1552,22 @@
     "riskLow": "Basso",
     "riskMedium": "Medio",
     "riskHigh": "Alto",
-    "riskCritical": "Critico"
+    "riskCritical": "Critico",
+    "reviewInApprovals": "Rivedi in Approvazioni",
+    "status": {
+      "proposed": "In attesa di revisione",
+      "scan_rejected": "Rifiutato dalla scansione di sicurezza",
+      "review_failed": "Revisione AI non riuscita",
+      "reviewed": "Revisionato",
+      "approved": "Approvato",
+      "rejected": "Rifiutato",
+      "changes_requested": "Modifiche richieste",
+      "expired": "Scaduto",
+      "superseded": "Sostituito",
+      "executed": "Eseguito",
+      "verified": "Verificato",
+      "verification_failed": "Verifica non riuscita",
+      "promoted": "Salvato nella libreria"
+    }
   }
 }

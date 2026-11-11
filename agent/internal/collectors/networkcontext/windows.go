@@ -38,6 +38,8 @@ var ipHelper = windows.NewLazySystemDLL("iphlpapi.dll")
 var currentCompartment = ipHelper.NewProc("GetCurrentThreadCompartmentId")
 var bestRoute2 = ipHelper.NewProc("GetBestRoute2")
 var getNeighbors2 = ipHelper.NewProc("GetIpNetTable2")
+var ifEntry2Ex = ipHelper.NewProc("GetIfEntry2Ex")
+var ifEntry2 = ipHelper.NewProc("GetIfEntry2")
 
 func NewReader(_ string) Reader {
 	return &WindowsReader{Adapters: readWindowsAdapters, ForwardTable: readWindowsRoutes, Compartment: func() uint32 { value, _, _ := currentCompartment.Call(); return uint32(value) }}
@@ -104,10 +106,7 @@ func readWindowsAdapters(ctx context.Context) ([]Adapter, error) {
 			if a.OperStatus == 1 {
 				state = "up"
 			}
-			kind := map[uint32]string{6: "ethernet", 71: "wifi", 131: "tunnel", 243: "cellular", 244: "cellular"}[a.IfType]
-			if kind == "" {
-				kind = "other"
-			}
+			kind := windowsInterfaceKind(a.IfType, a.PhysicalAddressLength > 0, a.IfType == 6 && windowsHardwareInterface(a.Luid))
 			adapter.Row = InterfaceRow{RowKey: key, InterfaceKey: key, OSIndex: a.IfIndex, Name: name, Kind: kind, AdminState: "unknown", OperState: state, MTU: ptr(a.Mtu), Addresses: []AddressRow{}}
 			if a.PhysicalAddressLength == 6 {
 				adapter.Row.CurrentMAC = net.HardwareAddr(a.PhysicalAddress[:6]).String()
@@ -338,7 +337,12 @@ func winSockaddr(ip netip.Addr, index uint32) windows.RawSockaddrInet {
 		v := (*windows.RawSockaddrInet6)(unsafe.Pointer(&raw))
 		v.Family = windows.AF_INET6
 		v.Addr = ip.As16()
-		v.Scope_id = index
+		// Only a link-local address is zoned by its interface. GetBestRoute2
+		// rejects a scope id on a global/ULA destination with
+		// ERROR_INVALID_PARAMETER; the interface pin is the separate InterfaceIndex.
+		if ip.IsLinkLocalUnicast() {
+			v.Scope_id = index
+		}
 	}
 	return raw
 }
@@ -399,4 +403,33 @@ func (r *WindowsReader) LookupRoute(ctx context.Context, request RouteLookupRequ
 		}
 	}
 	return out, nil
+}
+
+// windowsHardwareInterface reports MIB_IF_ROW2's HardwareInterface flag (bit 0
+// of InterfaceAndOperStatusFlags): true for a NIC backed by hardware (including
+// a VM's synthetic NIC), false for TAP, vEthernet and other software miniports.
+// A failed lookup is "not proven hardware" (#7819).
+func windowsHardwareInterface(luid uint64) bool {
+	row := windows.MibIfRow2{InterfaceLuid: luid}
+	if getIfEntry2(ifEntry2Ex, ifEntry2, &row) != nil {
+		return false
+	}
+	return row.InterfaceAndOperStatusFlags&0x01 != 0
+}
+
+// getIfEntry2 fills row by LUID. iphlpapi.dll on Windows 10 1507 (build 10240,
+// 2015 LTSB) has no GetIfEntry2Ex export, and calling a missing export panics
+// the agent (#9233), so fall back to GetIfEntry2 (Vista+).
+func getIfEntry2(ex, legacy *windows.LazyProc, row *windows.MibIfRow2) error {
+	proc, args := ex, []uintptr{uintptr(windows.MibIfEntryNormalWithoutStatistics), uintptr(unsafe.Pointer(row))}
+	if ex.Find() != nil {
+		if err := legacy.Find(); err != nil {
+			return err
+		}
+		proc, args = legacy, args[1:]
+	}
+	if code, _, _ := proc.Call(args...); code != 0 {
+		return syscall.Errno(code)
+	}
+	return nil
 }

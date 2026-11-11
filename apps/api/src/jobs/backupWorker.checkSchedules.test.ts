@@ -3,9 +3,14 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 // ── Mocks ────────────────────────────────────────────────────────────────────
 // backupWorker uses `import * as dbModule from '../db'` then `const { db } = dbModule`,
 // so the mock must expose every export the module touches at load time.
-const { selectDistinctMock, selectMock } = vi.hoisted(() => ({
+const { selectDistinctMock, selectMock, updateSetMock, systemContexts } = vi.hoisted(() => ({
   selectDistinctMock: vi.fn(),
   selectMock: vi.fn(),
+  updateSetMock: vi.fn(),
+  // #6597: models withSystemDbAccessContext as a transaction that COMMITS when
+  // its callback resolves (a nested call joins the outer one, like the real
+  // helper). `stack` is the open top-level contexts, `committed` the finished.
+  systemContexts: { seq: 0, stack: [] as number[], committed: new Set<number>() },
 }));
 
 function makeChain(result: unknown) {
@@ -18,13 +23,36 @@ function makeChain(result: unknown) {
   return chain;
 }
 
+// A device parked in a holding org is covered in backupWorker.test.ts; here
+// every device is an ordinary customer device.
+vi.mock('../services/unassignedPool/deliveryEligibility', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../services/unassignedPool/deliveryEligibility')>()),
+  isParkedDevice: vi.fn(async () => false),
+}));
+
 vi.mock('../db', () => ({
   db: {
     selectDistinct: (...args: unknown[]) => selectDistinctMock(...(args as [])),
     select: (...args: unknown[]) => selectMock(...(args as [])),
+    update: () => ({
+      set: (values: unknown) => {
+        updateSetMock(values);
+        return { where: () => Promise.resolve([]) };
+      },
+    }),
   },
   runOutsideDbContext: <T>(fn: () => T): T => fn(),
-  withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+  withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => {
+    if (systemContexts.stack.length > 0) return fn();
+    const id = ++systemContexts.seq;
+    systemContexts.stack.push(id);
+    try {
+      return await fn();
+    } finally {
+      systemContexts.stack.pop();
+      systemContexts.committed.add(id);
+    }
+  }),
   SYSTEM_DB_ACCESS_CONTEXT: { scope: 'system', orgId: null, partnerId: null },
 }));
 
@@ -177,6 +205,147 @@ describe('processCheckSchedules — backup profile fan-out', () => {
     ]);
     expect(result).toEqual({ enqueued: 2 });
   });
+
+  // #6597 — the dispatch worker reads the job row on its own connection. A row
+  // created inside a still-open transaction is invisible to it: the worker then
+  // resolved the job as a pathless file backup, "failed" a row it could not
+  // see, and the committed row sat `pending` until the stale reaper failed it
+  // with "Backup dispatch never completed". The whole sweep used to run in ONE
+  // system transaction, so every scheduled job was enqueued before it existed.
+  it('commits each scheduled job row before enqueueing its dispatch (#6597)', async () => {
+    systemContexts.seq = 0;
+    systemContexts.stack.length = 0;
+    systemContexts.committed.clear();
+    const createdIn = new Map<string, number | undefined>();
+    const committedAtEnqueue = new Map<string, boolean>();
+    let n = 0;
+    createScheduledBackupJobIfAbsentMock.mockImplementation(async () => {
+      const id = `job-${++n}`;
+      createdIn.set(id, systemContexts.stack.at(-1));
+      return { created: true, job: { id, configId: CONFIG_ID } };
+    });
+    enqueueBackupDispatchMock.mockImplementation(async (jobId: string) => {
+      const ctx = createdIn.get(jobId);
+      committedAtEnqueue.set(jobId, ctx !== undefined && systemContexts.committed.has(ctx));
+    });
+    primeOrgLookup();
+    resolveAllBackupAssignedDevicesMock.mockResolvedValueOnce([
+      {
+        deviceId: DEVICE_ID,
+        featureLinkId: LINK_ID,
+        configId: CONFIG_ID,
+        settings: { schedule: SCHEDULE, backupProfileId: PROFILE_ID, backupMode: 'file' },
+        selectionSpecs: [
+          { backupMode: 'file', targets: { paths: ['C:\\data'], excludes: [] } },
+          { backupMode: 'system_image', targets: { includeSystemState: true } },
+        ],
+        resolvedTimezone: 'UTC',
+      },
+    ]);
+
+    // Called with NO ambient context, exactly as the worker now calls it: the
+    // sweep owns its contexts instead of running inside one blanket one.
+    const result = await __testOnly.processCheckSchedules();
+
+    expect(result).toEqual({ enqueued: 2 });
+    expect(createdIn.size).toBe(2);
+    for (const [jobId, ctx] of createdIn) {
+      expect(ctx, `${jobId} was created outside any DB context`).toBeDefined();
+      expect(committedAtEnqueue.get(jobId), `${jobId} was enqueued before its row committed`).toBe(true);
+    }
+  });
+
+  it('fails a committed scheduled job whose dispatch cannot be enqueued (#6597)', async () => {
+    enqueueBackupDispatchMock.mockRejectedValueOnce(new Error('Redis unavailable'));
+    primeOrgLookup();
+    resolveAllBackupAssignedDevicesMock.mockResolvedValueOnce([
+      {
+        deviceId: DEVICE_ID,
+        featureLinkId: LINK_ID,
+        configId: CONFIG_ID,
+        settings: { schedule: SCHEDULE, backupProfileId: null, backupMode: 'file' },
+        selectionSpecs: null,
+        resolvedTimezone: 'UTC',
+      },
+    ]);
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    const result = await __testOnly.processCheckSchedules();
+
+    expect(result).toEqual({ enqueued: 0 });
+    // The row committed before the enqueue was attempted, so it must be
+    // settled here — otherwise it waits an hour for the stale reaper.
+    expect(updateSetMock).toHaveBeenCalledWith(
+      expect.objectContaining({ status: 'failed', errorLog: expect.stringContaining('Redis unavailable') }),
+    );
+    errorSpy.mockRestore();
+  });
+
+  it('keeps sweeping later orgs when one org\'s job creation throws (#6597)', async () => {
+    const ORG_2 = '66666666-6666-4666-8666-666666666666';
+    selectDistinctMock.mockReturnValueOnce(makeChain([{ orgId: ORG_ID }, { orgId: ORG_2 }]));
+    selectDistinctMock.mockReturnValueOnce(makeChain([]));
+    const legacyEntry = {
+      deviceId: DEVICE_ID,
+      featureLinkId: LINK_ID,
+      configId: CONFIG_ID,
+      settings: { schedule: SCHEDULE, backupProfileId: null, backupMode: 'file' },
+      selectionSpecs: null,
+      resolvedTimezone: 'UTC',
+    };
+    resolveAllBackupAssignedDevicesMock
+      .mockRejectedValueOnce(new Error('current transaction is aborted'))
+      .mockResolvedValueOnce([legacyEntry]);
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    const result = await __testOnly.processCheckSchedules();
+
+    // Each org has its own context, so the first org's failure neither blocks
+    // nor rolls back the second.
+    expect(result).toEqual({ enqueued: 1 });
+    expect(createScheduledBackupJobIfAbsentMock).toHaveBeenCalledWith(expect.objectContaining({ orgId: ORG_2 }));
+    expect(errorSpy.mock.calls.map((c) => String(c[0])).join('\n')).toContain(ORG_ID);
+    errorSpy.mockRestore();
+  });
+
+  it('enqueues the remaining jobs when one enqueue fails, counting only the successes (#6597)', async () => {
+    let n = 0;
+    createScheduledBackupJobIfAbsentMock.mockImplementation(async () => ({
+      created: true,
+      job: { id: `job-${++n}`, configId: CONFIG_ID },
+    }));
+    enqueueBackupDispatchMock
+      .mockRejectedValueOnce(new Error('Redis unavailable'))
+      .mockResolvedValueOnce(undefined);
+    primeOrgLookup();
+    resolveAllBackupAssignedDevicesMock.mockResolvedValueOnce([
+      {
+        deviceId: DEVICE_ID,
+        featureLinkId: LINK_ID,
+        configId: CONFIG_ID,
+        settings: { schedule: SCHEDULE, backupProfileId: PROFILE_ID, backupMode: 'file' },
+        selectionSpecs: [
+          { backupMode: 'file', targets: { paths: ['C:\\data'], excludes: [] } },
+          { backupMode: 'system_image', targets: { includeSystemState: true } },
+        ],
+        resolvedTimezone: 'UTC',
+      },
+    ]);
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    const result = await __testOnly.processCheckSchedules();
+
+    expect(result).toEqual({ enqueued: 1 });
+    expect(enqueueBackupDispatchMock).toHaveBeenCalledTimes(2);
+    expect(enqueueBackupDispatchMock).toHaveBeenLastCalledWith(
+      'job-2', CONFIG_ID, ORG_ID, DEVICE_ID, undefined,
+      { catchUpUntil: new Date(Date.now() + 20 * 3_600_000).toISOString() },
+    );
+    // The one failed enqueue settles its own row. (The other update is the
+    // scheduler expiring catch-ups the new jobs superseded, #11013.)
+    expect(updateSetMock.mock.calls.filter(([values]) => String((values as { errorLog?: string }).errorLog).startsWith('Failed to enqueue'))).toHaveLength(1);
+    errorSpy.mockRestore();
+  });
 });
 
 // #5080 W02: the schedule scan enumerates through the EFFECTIVE view, so an org
@@ -212,5 +381,77 @@ describe('processCheckSchedules — reads effective feature links', () => {
     const { configPolicyEffectiveFeatureLinks, configPolicyFeatureLinks } = await import('../db/schema');
     expect(joined).toContain(configPolicyEffectiveFeatureLinks);
     expect(joined).not.toContain(configPolicyFeatureLinks);
+  });
+});
+
+describe('missed-schedule catch-up (#11013)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-13T01:00:30Z'));
+    createScheduledBackupJobIfAbsentMock.mockResolvedValue({
+      created: true,
+      job: { id: 'job-1', configId: CONFIG_ID },
+    });
+    enqueueBackupDispatchMock.mockResolvedValue(undefined);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const entry = (schedule: Record<string, unknown>) => ({
+    deviceId: DEVICE_ID,
+    featureLinkId: LINK_ID,
+    configId: CONFIG_ID,
+    settings: { schedule },
+    selectionSpecs: null,
+    resolvedTimezone: 'UTC',
+  });
+
+  it('gives a scheduled job a window of 20 h from the schedule', async () => {
+    primeOrgLookup();
+    resolveAllBackupAssignedDevicesMock.mockResolvedValueOnce([entry(SCHEDULE)]);
+
+    await __testOnly.processCheckSchedules();
+
+    expect(enqueueBackupDispatchMock).toHaveBeenCalledWith(
+      'job-1', CONFIG_ID, ORG_ID, DEVICE_ID, undefined,
+      { catchUpUntil: '2026-07-13T21:00:30.000Z' },
+    );
+  });
+
+  it('gives no window when the policy turned runMissedBackupsOnConnect off', async () => {
+    primeOrgLookup();
+    resolveAllBackupAssignedDevicesMock.mockResolvedValueOnce([
+      entry({ ...SCHEDULE, runMissedBackupsOnConnect: false }),
+    ]);
+
+    await __testOnly.processCheckSchedules();
+
+    expect(enqueueBackupDispatchMock).toHaveBeenCalledWith('job-1', CONFIG_ID, ORG_ID, DEVICE_ID);
+  });
+
+  it('expires still-pending catch-ups of the same link when the next job is created', async () => {
+    primeOrgLookup();
+    resolveAllBackupAssignedDevicesMock.mockResolvedValueOnce([entry(SCHEDULE)]);
+
+    await __testOnly.processCheckSchedules();
+
+    // The text is chosen in SQL (device seen since or not); the integration
+    // suite pins it.
+    expect(updateSetMock).toHaveBeenCalledWith(
+      expect.objectContaining({ status: 'failed', completedAt: expect.any(Date), errorLog: expect.anything() }),
+    );
+  });
+
+  it('expires nothing when the occurrence created no new job', async () => {
+    primeOrgLookup();
+    resolveAllBackupAssignedDevicesMock.mockResolvedValueOnce([entry(SCHEDULE)]);
+    createScheduledBackupJobIfAbsentMock.mockResolvedValue({ created: false, job: { id: 'job-1', configId: CONFIG_ID } });
+
+    await __testOnly.processCheckSchedules();
+
+    expect(updateSetMock).not.toHaveBeenCalledWith(expect.objectContaining({ status: 'failed' }));
   });
 });

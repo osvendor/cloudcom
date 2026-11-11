@@ -14,13 +14,34 @@ import {
   type LucideIcon
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
+import type { TFunction } from 'i18next';
+import {
+  compliancePercentWithImageTerm,
+  type ContainerImageComplianceTerms,
+  type DevicePatchApprovalEvaluation,
+  type DevicePatchEffectiveApproval,
+} from '@breeze/shared';
 import { fetchWithAuth } from '../../stores/auth';
 import type { OSType } from './DeviceList';
 import PatchInstallHistory from '../patches/PatchInstallHistory';
+import DeviceVendorUpdatesSection from './DeviceVendorUpdatesSection';
 import { widthPercentClass } from '@/lib/utils';
+import { isDateOnly, parseDateOnly } from '@/lib/dateOnly';
 import { formatDateTime as formatDateTimeCentral } from '@/lib/dateTimeFormat';
 import { runAction, ActionError } from '@/lib/runAction';
 import { ConfirmDialog } from '../shared/ConfirmDialog';
+import type { PatchInstallFailure } from '../patches/PatchList';
+import { readInstallFailure } from '../patches/patchHelpers';
+import {
+  INSTALL_POLL_INTERVAL_MS,
+  INSTALL_POLL_MAX_DURATION_MS,
+  decideInstallPoll,
+  isTerminalCommandStatus,
+  readAwaitingRestart,
+  snapshotInstallOutcomes,
+  type InstallPollDecision,
+  type InstallPollState,
+} from './patchInstallPolling';
 
 type PatchItem = {
   id?: string;
@@ -42,7 +63,15 @@ type PatchItem = {
   requiresReboot?: boolean;
   isDownloaded?: boolean;
   approvalStatus?: string;
+  // #7625: the ring-aware verdict the scheduled patch job would reach. Display
+  // only — the per-row Install action still keys off approvalStatus (manual).
+  effectiveApproval?: DevicePatchEffectiveApproval | null;
   scope?: 'machine' | 'user' | null;
+  // #4223 deployment axis: the latest install attempt on this device failed.
+  installFailure?: PatchInstallFailure | null;
+  // #7680: the latest install attempt succeeded but needs a restart to finish;
+  // the OS keeps offering the update until then, so it is still in `pending`.
+  awaitingRestart?: { installedAt: string } | null;
 };
 
 type PatchPayload = {
@@ -52,6 +81,7 @@ type PatchPayload = {
   lastPatchScanStatus?: string | null;
   lastPatchScanUserScopeScanned?: boolean | null;
   lastPatchScanUserScopeSkipReason?: string | null;
+  approvalEvaluation?: DevicePatchApprovalEvaluation | null;
   pending?: PatchItem[];
   pendingPatches?: PatchItem[];
   missing?: PatchItem[];
@@ -61,7 +91,16 @@ type PatchPayload = {
   installedPatches?: PatchItem[];
   applied?: PatchItem[];
   patches?: PatchItem[];
+  /** W06: distinct container images on the device, present only when it has any. */
+  containerImages?: ContainerImageComplianceTerms;
 };
+
+function readContainerImages(value: unknown): ContainerImageComplianceTerms | null {
+  if (!value || typeof value !== 'object') return null;
+  const { stale, current, unknown } = value as Record<string, unknown>;
+  const count = (n: unknown): n is number => typeof n === 'number' && Number.isFinite(n) && n >= 0;
+  return count(stale) && count(current) && count(unknown) ? { stale, current, unknown } : null;
+}
 
 type PatchScanResponse = {
   jobId?: string;
@@ -224,6 +263,34 @@ function getNativePatchSource(osType: OSType): 'microsoft' | 'apple' | 'linux' {
   return 'apple';
 }
 
+const PATCH_LIST_KEYS = ['pending', 'pendingPatches', 'missing', 'missingPatches', 'available', 'installed', 'installedPatches', 'applied', 'patches'] as const;
+
+// #7637: the install poll asks the API to skip the ring-aware evaluation
+// (`approvalView=0`), which comes back as null verdicts. Carry the last known
+// verdicts (by patch id) and ring context forward so the badges don't flash
+// the manual-only fallback mid-install. A patch first seen during the poll
+// has no prior verdict and shows the fallback until the next full load.
+function carryApprovalView(previous: PatchPayload | null, next: PatchPayload): PatchPayload {
+  if (!previous) return next;
+  const known = new Map<string, DevicePatchEffectiveApproval>();
+  for (const key of PATCH_LIST_KEYS) {
+    for (const patch of previous[key] ?? []) {
+      if (patch.id && patch.effectiveApproval) known.set(patch.id, patch.effectiveApproval);
+    }
+  }
+  const merged: PatchPayload = { ...next, approvalEvaluation: previous.approvalEvaluation ?? null };
+  for (const key of PATCH_LIST_KEYS) {
+    const list = next[key];
+    if (!list) continue;
+    merged[key] = list.map((patch) =>
+      patch.effectiveApproval == null && patch.id && known.has(patch.id)
+        ? { ...patch, effectiveApproval: known.get(patch.id) }
+        : patch
+    );
+  }
+  return merged;
+}
+
 function getNativePatchProviderLabel(osType: OSType): string {
   if (osType === 'windows') return 'Windows';
   if (osType === 'linux') return 'Linux';
@@ -243,7 +310,20 @@ function readPatchIds(patches: PatchItem[]): string[] {
 // The device-patches endpoint sends approvalStatus for current payloads. Any
 // explicit non-approved status blocks install controls; an absent value (older
 // payloads / tests) is treated as installable.
+//
+// #7214 (paper cut #24): a patch whose latest install attempt failed is no
+// longer meaningfully "awaiting approval" — PatchApprovalCell below already
+// suppresses the "Pending Approval" badge for exactly this case (#4223), so
+// the "Patch Controls" count must agree with what the row actually shows.
+//
+// #7625: when the ring-aware verdict is present, only a patch NOTHING will
+// approve is awaiting approval — a ring auto-approved, deferred or
+// policy-excluded patch is not waiting on anyone.
 function isAwaitingApproval(patch: PatchItem): boolean {
+  if (readInstallFailure(patch.installFailure)) return false;
+  // #7680: already installed, only the restart is outstanding.
+  if (readAwaitingRestart(patch.awaitingRestart)) return false;
+  if (patch.effectiveApproval) return patch.effectiveApproval.state === 'needs_approval';
   return !isPatchApprovedForInstall(patch);
 }
 
@@ -274,7 +354,90 @@ function isPatchApprovedForInstall(patch: PatchItem): boolean {
   return patch.approvalStatus == null || patch.approvalStatus === 'approved';
 }
 
-function getApprovalBadge(patch: PatchItem): { label: string; className: string } {
+const APPROVAL_BADGE_CLASS = {
+  approved: 'bg-success/15 text-success border-success/30',
+  pending: 'bg-warning/15 text-warning border-warning/30',
+  info: 'bg-blue-500/20 text-blue-700 border-blue-500/40',
+  muted: 'bg-muted text-muted-foreground border-border',
+} as const;
+
+type ApprovalBadge = { label: string; className: string; title?: string };
+
+// #7625: badge for the ring-aware verdict. Null when the API sent none (older
+// payloads, or the evaluation failed) so the caller falls back to the
+// manual-only approvalStatus badge.
+function getEffectiveApprovalBadge(
+  patch: PatchItem,
+  ringName: string | null,
+  t: TFunction,
+  timezone?: string
+): ApprovalBadge | null {
+  const effective = patch.effectiveApproval;
+  if (!effective) return null;
+  const ring = ringName || t('devicePatchStatusTab.approval.unnamedRing');
+  switch (effective.state) {
+    case 'approved':
+      return { label: t('devicePatchStatusTab.approval.approved'), className: APPROVAL_BADGE_CLASS.approved, title: t('devicePatchStatusTab.approval.approvedTitle') };
+    case 'auto_approved':
+      return {
+        label: t('devicePatchStatusTab.approval.autoApproved'),
+        className: APPROVAL_BADGE_CLASS.approved,
+        // Since #10249 the evaluator excludes per-user rows itself
+        // (`unsupported_user_scope`), so this only fires for an older API that
+        // still approves them — never promise that the run installs one.
+        title: isUserScopedPatch(patch)
+          ? t('devicePatchStatusTab.approval.autoApprovedUserScopeTitle', { ring })
+          : t('devicePatchStatusTab.approval.autoApprovedTitle', { ring }),
+      };
+    case 'deferred': {
+      if (!effective.holdUntil) {
+        return { label: t('devicePatchStatusTab.approval.deferred'), className: APPROVAL_BADGE_CLASS.info, title: t('devicePatchStatusTab.approval.deferredNoDateTitle', { ring }) };
+      }
+      const date = formatDate(effective.holdUntil, timezone);
+      return { label: t('devicePatchStatusTab.approval.deferredUntil', { date }), className: APPROVAL_BADGE_CLASS.info, title: t('devicePatchStatusTab.approval.deferredUntilTitle', { ring, date }) };
+    }
+    case 'excluded': {
+      // A vendor lane owns this class here (spec 4.6): no policy blocked it.
+      if (effective.reason === 'managed_by_vendor_updates') {
+        return {
+          label: t('devicePatchStatusTab.approval.managedByVendorUpdates'),
+          className: APPROVAL_BADGE_CLASS.muted,
+          title: t('devicePatchStatusTab.approval.managedByVendorUpdatesTitle'),
+        };
+      }
+      const title = effective.reason === 'blocked_by_source'
+        ? t('devicePatchStatusTab.approval.excludedSourceTitle')
+        : effective.reason === 'blocked_by_app_rule'
+          ? t('devicePatchStatusTab.approval.excludedAppRuleTitle')
+        : effective.reason === 'blocked_by_feature_update_policy'
+          ? t('devicePatchStatusTab.approval.excludedFeatureUpdateTitle', { ring })
+          : effective.reason === 'ring_reference_invalid'
+            ? t('devicePatchStatusTab.approval.excludedRingReferenceTitle')
+          : effective.reason === 'unsupported_user_scope'
+            ? t('devicePatchStatusTab.approval.excludedUserScopeTitle')
+            : effective.reason === 'explicitly_declined'
+              ? t('devicePatchStatusTab.approval.excludedDeclinedTitle')
+              : t('devicePatchStatusTab.approval.excludedCategoryTitle', { ring });
+      return { label: t('devicePatchStatusTab.approval.excluded'), className: APPROVAL_BADGE_CLASS.muted, title };
+    }
+    case 'needs_approval':
+    default:
+      return {
+        label: t('devicePatchStatusTab.approval.pending'),
+        className: APPROVAL_BADGE_CLASS.pending,
+        // The Install gate counts a manual approval for ANY ring (tracked
+        // follow-up), the evaluator only this device's ring — so the row's
+        // Install button can be enabled under this badge. Explain why.
+        title: patch.approvalStatus === 'approved'
+          ? t('devicePatchStatusTab.approval.otherRingApprovalTitle', { ring })
+          : effective.reason === 'no_ring_resolved'
+            ? t('devicePatchStatusTab.approval.needsApprovalNoRingTitle')
+            : t('devicePatchStatusTab.approval.needsApprovalRingTitle', { ring }),
+      };
+  }
+}
+
+function getApprovalBadge(patch: PatchItem): ApprovalBadge {
   switch ((patch.approvalStatus ?? 'approved').toLowerCase()) {
     case 'approved':
       return { label: 'Approved', className: 'bg-success/15 text-success border-success/30' };
@@ -286,6 +449,63 @@ function getApprovalBadge(patch: PatchItem): { label: string; className: string 
     default:
       return { label: 'Pending Approval', className: 'bg-warning/15 text-warning border-warning/30' };
   }
+}
+
+// #4223: approval and deployment are separate axes. When the latest install
+// attempt on this device failed (e.g. the agent's battery preflight), show the
+// failure and its reason; "Pending Approval" is provably stale at that point
+// (ring auto-approval is evaluated at dispatch and never persisted), so it is
+// suppressed while any real persisted approval state stays visible.
+function PatchApprovalCell({ patch, timezone, ringName }: { patch: PatchItem; timezone?: string; ringName: string | null }) {
+  const { t } = useTranslation('devices');
+  const approvalBadge = getEffectiveApprovalBadge(patch, ringName, t, timezone) ?? getApprovalBadge(patch);
+  const approvalEl = (
+    <span
+      data-testid={`device-patch-${patch.id}-approval`}
+      title={approvalBadge.title}
+      className={`inline-flex w-fit items-center whitespace-nowrap rounded-full border px-2.5 py-1 text-xs font-medium ${approvalBadge.className}`}
+    >
+      {approvalBadge.label}
+    </span>
+  );
+  const isPendingApproval = patch.effectiveApproval
+    ? patch.effectiveApproval.state === 'needs_approval'
+    : (patch.approvalStatus ?? 'approved').toLowerCase() === 'pending';
+  const failure = readInstallFailure(patch.installFailure);
+  const awaitingRestart = failure ? undefined : readAwaitingRestart(patch.awaitingRestart);
+  // #7680: installed, but the OS keeps offering it until the device restarts.
+  if (awaitingRestart) {
+    return (
+      <div className="flex max-w-xs flex-col gap-1">
+        <span
+          data-testid={`device-patch-${patch.id}-awaiting-restart`}
+          title={t('devicePatchStatusTab.awaitingRestart.installedAt', { when: formatDateTime(awaitingRestart.installedAt, timezone) })}
+          className="inline-flex w-fit items-center gap-1 whitespace-nowrap rounded-full border border-success/30 bg-success/15 px-2.5 py-1 text-xs font-medium text-success"
+        >
+          <RefreshCw className="h-3.5 w-3.5" />
+          {t('devicePatchStatusTab.awaitingRestart.badge')}
+        </span>
+        {!isPendingApproval && approvalEl}
+      </div>
+    );
+  }
+  if (!failure) return approvalEl;
+
+  const reason = failure.error?.trim() || t('devicePatchStatusTab.installFailure.noReason');
+  return (
+    <div className="flex max-w-xs flex-col gap-1">
+      <span
+        data-testid={`device-patch-${patch.id}-install-failed`}
+        title={t('devicePatchStatusTab.installFailure.failedAt', { when: formatDateTime(failure.failedAt, timezone) })}
+        className="inline-flex w-fit items-center gap-1 whitespace-nowrap rounded-full border border-destructive/30 bg-destructive/15 px-2.5 py-1 text-xs font-medium text-destructive"
+      >
+        <AlertTriangle className="h-3.5 w-3.5" />
+        {t('devicePatchStatusTab.installFailure.badge')}
+      </span>
+      <span className="break-words text-xs text-muted-foreground">{reason}</span>
+      {!isPendingApproval && approvalEl}
+    </div>
+  );
 }
 
 function getCategoryBadge(patch: PatchItem, osType: OSType) {
@@ -394,8 +614,12 @@ function isNativePatchForOs(patch: PatchItem, osType: OSType) {
 
 function formatDate(value?: string, timezone?: string, fallback = 'Not reported') {
   if (!value) return fallback;
-  const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? value : date.toLocaleDateString([], timezone ? { timeZone: timezone } : undefined);
+  // A bare YYYY-MM-DD is a calendar date: no zone conversion (would shift it a day).
+  const dateOnly = isDateOnly(value);
+  const date = parseDateOnly(value);
+  return Number.isNaN(date.getTime())
+    ? value
+    : date.toLocaleDateString([], timezone && !dateOnly ? { timeZone: timezone } : undefined);
 }
 
 function formatDateTime(value?: string | null, timezone?: string, fallback = 'Never') {
@@ -548,11 +772,11 @@ function getSourceBadge(patch: PatchItem): { label: string; className: string } 
   return null;
 }
 
-function getReleaseLabel(patch: PatchItem, timezone?: string): string | null {
+function getReleaseLabel(patch: PatchItem, t: TFunction, timezone?: string): string | null {
   const value = patch.releaseDate || patch.releasedAt;
   if (!value) return null;
   const formatted = formatDate(value, timezone, '');
-  return formatted ? `Released ${formatted}` : null;
+  return formatted ? t('devicePatchStatusTab.released', { date: formatted }) : null;
 }
 
 function getInstalledVersionFromDescription(description?: string): string | null {
@@ -631,15 +855,19 @@ function getHomebrewUrl(patch: PatchItem, osType: OSType): string | null {
   return `${baseUrl}${baseName}`;
 }
 
-// ---------------------------------------------------------------------------
-// Poll interval / duration constants for post-install auto-refresh
-// macOS softwareupdate installs can take 30+ minutes to download + install,
-// and the post-install rescan adds another 60s. The frontend polls for the
-// full duration since the backend uses fire-and-forget command queuing.
-// ---------------------------------------------------------------------------
-const INSTALL_POLL_INTERVAL_MS = 5_000;
-const INSTALL_POLL_MAX_DURATION_MS = 1_800_000;
+// Post-install poll timing and stop rules live in ./patchInstallPolling (#10250).
+// Consecutive failed patch-status reads (one per 5 s tick) before the poll
+// gives up and says so, instead of spinning to the 30-minute cap.
+const INSTALL_POLL_MAX_FETCH_FAILURES = 6;
 const RECENT_LINUX_INSTALL_DAYS = 7;
+
+function readPendingList(data: PatchPayload | null): PatchItem[] | null {
+  if (!data) return null;
+  for (const list of [data.pending, data.pendingPatches, data.available]) {
+    if (Array.isArray(list)) return list;
+  }
+  return null;
+}
 const RECENT_LINUX_INSTALL_HISTORY_LIMIT = 100;
 const RECENT_LINUX_INSTALL_WINDOW_MS = RECENT_LINUX_INSTALL_DAYS * 24 * 60 * 60 * 1000;
 
@@ -673,25 +901,36 @@ export default function DevicePatchStatusTab({ deviceId, timezone, osType }: Dev
   // Track polling state after install
   const [isPolling, setIsPolling] = useState(false);
   const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const pollStartRef = useRef<number>(0);
-  const priorPendingCountRef = useRef<number>(-1);
+  // Which patches the running poll is waiting on, and its settle window.
+  const pollStateRef = useRef<InstallPollState | null>(null);
+  // Bumped on every new poll so a tick still awaiting a response from an
+  // earlier poll cannot stop (or report on) the one that replaced it.
+  const pollGenerationRef = useRef(0);
+  const pollTickInFlightRef = useRef(false);
   const recentLinuxInstallsRequestRef = useRef(0);
 
   // Use provided timezone, fetched siteTimezone, or browser default
   const effectiveTimezone = timezone ?? siteTimezone ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
   const normalizedOsType: OSType = osType ?? 'macos';
 
-  const fetchPatchStatus = useCallback(async (silent = false) => {
+  // `skipApprovalView` is for the install poller only (#7637): the API skips
+  // the ring-aware evaluation, and the last known badges are carried forward.
+  const fetchPatchStatus = useCallback(async (silent = false, skipApprovalView = false) => {
     if (!silent) {
       setLoading(true);
     }
     setError(undefined);
     try {
-      const response = await fetchWithAuth(`/devices/${deviceId}/patches`);
+      const url = skipApprovalView ? `/devices/${deviceId}/patches?approvalView=0` : `/devices/${deviceId}/patches`;
+      const response = await fetchWithAuth(url);
       if (!response.ok) throw new Error('Failed to fetch patch status');
       const json = await response.json();
       const data = json?.data ?? json;
-      setPayload(data);
+      if (skipApprovalView) {
+        setPayload((previous) => carryApprovalView(previous, data));
+      } else {
+        setPayload(data);
+      }
       if (json?.timezone || json?.siteTimezone) {
         setSiteTimezone(json.timezone ?? json.siteTimezone);
       }
@@ -803,6 +1042,7 @@ export default function DevicePatchStatusTab({ deviceId, timezone, osType }: Dev
   // Clean up polling on unmount
   useEffect(() => {
     return () => {
+      pollGenerationRef.current += 1;
       if (pollTimerRef.current) {
         clearInterval(pollTimerRef.current);
         pollTimerRef.current = null;
@@ -815,7 +1055,7 @@ export default function DevicePatchStatusTab({ deviceId, timezone, osType }: Dev
   const nativeSource = useMemo(() => getNativePatchSource(normalizedOsType), [normalizedOsType]);
   const nativeProviderLabel = useMemo(() => getNativePatchProviderLabel(normalizedOsType), [normalizedOsType]);
 
-  const { pendingNative, pendingOther, installedNative, installedThirdParty, compliancePercent } = useMemo(() => {
+  const { pendingNative, pendingOther, installedNative, installedThirdParty, compliancePercent, containerImages } = useMemo(() => {
     const data = payload ?? {};
     const pendingList = data.pending ?? data.pendingPatches ?? data.available ?? [];
     const installedList = data.installed ?? data.installedPatches ?? data.applied ?? [];
@@ -839,8 +1079,12 @@ export default function DevicePatchStatusTab({ deviceId, timezone, osType }: Dev
       : effectiveInstalled.filter(patch => isNativePatchForOs(patch, normalizedOsType));
     const thirdPartyInstalled = effectiveInstalled.filter(patch => !isNativePatchForOs(patch, normalizedOsType));
 
+    // W06: the same shared arithmetic as the API — a stale image is one more
+    // pending item, a current image one more installed item; unknowns are only
+    // shown as coverage. No `containerImages` → exactly the old number.
+    const images = readContainerImages(data.containerImages);
     const total = inferredPending.length + effectiveInstalled.length;
-    const computedCompliance = total > 0 ? Math.round((effectiveInstalled.length / total) * 100) : 100;
+    const computedCompliance = compliancePercentWithImageTerm(effectiveInstalled.length, total, images);
     const compliance = normalizedOsType === 'linux'
       ? computedCompliance
       : data.compliancePercent ?? data.compliance ?? computedCompliance;
@@ -850,7 +1094,8 @@ export default function DevicePatchStatusTab({ deviceId, timezone, osType }: Dev
       pendingOther: otherPending,
       installedNative: nativeInstalled,
       installedThirdParty: thirdPartyInstalled,
-      compliancePercent: compliance
+      compliancePercent: compliance,
+      containerImages: images
     };
   }, [payload, normalizedOsType]);
 
@@ -869,59 +1114,156 @@ export default function DevicePatchStatusTab({ deviceId, timezone, osType }: Dev
   // null/undefined means the field isn't present (older agent, non-Windows device,
   // or no winget provider), which is not the same as "we tried and failed".
   const userScopeNotScanned = payload?.lastPatchScanUserScopeScanned === false;
+  // #7625: which update ring the per-patch approval states were evaluated against.
+  const approvalEvaluation = payload?.approvalEvaluation ?? null;
+  const approvalRingName = approvalEvaluation?.ring
+    ? approvalEvaluation.ring.name || t('devicePatchStatusTab.approval.unnamedRing')
+    : null;
+  const installTitleFor = (patch: PatchItem, patchName: string, isApproved: boolean): string => {
+    if (isUserScopedPatch(patch)) return t('devicePatchStatusTab.installPatchUserScopeTitle', { name: patchName });
+    if (isApproved) return t('devicePatchStatusTab.installPatchTitle', { name: patchName });
+    // The ring handles it on schedule; installing it NOW still needs a manual
+    // approval (the install endpoint's gate is manual-only).
+    const state = patch.effectiveApproval?.state;
+    if (state === 'auto_approved' || state === 'deferred') {
+      return t('devicePatchStatusTab.installPatchRingManagedTitle', {
+        name: patchName,
+        ring: approvalRingName ?? t('devicePatchStatusTab.approval.unnamedRing'),
+      });
+    }
+    return t('devicePatchStatusTab.installPatchNotApprovedTitle', { name: patchName });
+  };
 
   // -------------------------------------------------------------------------
-  // Post-install polling: poll every 5s for up to 90s watching pending count
+  // Post-install polling (#10250): poll every 5 s until every targeted patch
+  // has an outcome (left the pending list, or gained a new failure / restart
+  // marker), the install command is abandoned, or the settle window after the
+  // command finished runs out. Stop rules: ./patchInstallPolling.
   // -------------------------------------------------------------------------
-  const startInstallPolling = useCallback((initialPendingCount: number) => {
+  const startInstallPolling = useCallback((target: {
+    patchIds: string[];
+    commandId?: string;
+    pending: PatchItem[];
+  }) => {
     // Stop any existing poll
     if (pollTimerRef.current) {
       clearInterval(pollTimerRef.current);
     }
 
-    priorPendingCountRef.current = initialPendingCount;
-    pollStartRef.current = Date.now();
+    const generation = ++pollGenerationRef.current;
+    const isCurrent = () => generation === pollGenerationRef.current;
+    const commandId = target.commandId;
+    let commandStatus: string | null = null;
+    let commandStatusWarned = false;
+    let consecutiveFetchFailures = 0;
+
+    pollStateRef.current = {
+      startedAt: Date.now(),
+      patchIds: target.patchIds,
+      baseline: snapshotInstallOutcomes(target.pending, target.patchIds),
+      settleFrom: null,
+    };
     setIsPolling(true);
     setControlNotice({ kind: 'info', message: t('devicePatchStatusTab.notices.installingPolling') });
 
-    pollTimerRef.current = setInterval(async () => {
-      const elapsed = Date.now() - pollStartRef.current;
-      if (elapsed >= INSTALL_POLL_MAX_DURATION_MS) {
-        // Timeout -- stop polling
-        if (pollTimerRef.current) {
-          clearInterval(pollTimerRef.current);
-          pollTimerRef.current = null;
-        }
-        setIsPolling(false);
-        setInstallingPatchIds(new Set());
-        setControlNotice({ kind: 'info', message: t('devicePatchStatusTab.notices.installLongerThanExpected') });
-        await refreshPatchView(true);
-        return;
+    const stopPolling = () => {
+      if (pollTimerRef.current) {
+        clearInterval(pollTimerRef.current);
+        pollTimerRef.current = null;
       }
+      pollStateRef.current = null;
+      setIsPolling(false);
+      setInstallingPatchIds(new Set());
+    };
 
-      const freshData = await fetchPatchStatus(true);
-      if (!freshData) return;
-
-      const freshPending = freshData.pending ?? freshData.pendingPatches ?? freshData.available ?? [];
-      const currentPendingCount = freshPending.length;
-
-      if (currentPendingCount < priorPendingCountRef.current) {
-        // Pending count went down -- install completed (at least partially)
-        if (pollTimerRef.current) {
-          clearInterval(pollTimerRef.current);
-          pollTimerRef.current = null;
+    // The command status only tells the poll when to stop waiting; the patch
+    // list stays the source of truth. A failed read is not fatal: the poll
+    // still resolves on the patch list and stops at the outer cap.
+    const readCommandStatus = async (id: string): Promise<string | null> => {
+      try {
+        const response = await fetchWithAuth(`/devices/${deviceId}/commands/${id}`);
+        if (response.ok) {
+          const json = await response.json();
+          const status = json?.data?.status;
+          if (typeof status === 'string') return status;
         }
-        setIsPolling(false);
-        setInstallingPatchIds(new Set());
-        const installed = priorPendingCountRef.current - currentPendingCount;
-        await fetchRecentLinuxInstalls(false);
-        setControlNotice({
-          kind: 'success',
-          message: t('devicePatchStatusTab.notices.installedSuccessfully', { installed, pending: currentPendingCount })
-        });
+        if (!commandStatusWarned) {
+          commandStatusWarned = true;
+          console.warn(`[DevicePatchStatusTab] Could not read install command ${id} status (HTTP ${response.status}); waiting on the patch list only.`);
+        }
+      } catch (err) {
+        if (!commandStatusWarned) {
+          commandStatusWarned = true;
+          console.warn(`[DevicePatchStatusTab] Could not read install command ${id} status; waiting on the patch list only.`, err);
+        }
+      }
+      return null;
+    };
+
+    pollTimerRef.current = setInterval(async () => {
+      if (pollTickInFlightRef.current) return;
+      pollTickInFlightRef.current = true;
+      try {
+        // Skip the ring-aware evaluation on every tick (#7637): it costs a second
+        // pooled connection per request, and approval can't change mid-install.
+        const freshData = await fetchPatchStatus(true, true);
+        if (commandId && !isTerminalCommandStatus(commandStatus)) {
+          commandStatus = (await readCommandStatus(commandId)) ?? commandStatus;
+        }
+        const state = pollStateRef.current;
+        if (!isCurrent() || !state) return;
+
+        const now = Date.now();
+        // A response with no pending list at all is a failed read, not "every
+        // targeted patch left the list" — never report success off it.
+        const freshPending = readPendingList(freshData);
+        let decision: InstallPollDecision;
+        if (freshPending) {
+          consecutiveFetchFailures = 0;
+          decision = decideInstallPoll(state, { now, pending: freshPending, commandStatus });
+        } else if (now - state.startedAt >= INSTALL_POLL_MAX_DURATION_MS) {
+          decision = { kind: 'timed_out' };
+        } else if (++consecutiveFetchFailures >= INSTALL_POLL_MAX_FETCH_FAILURES) {
+          console.warn(`[DevicePatchStatusTab] Install poll stopped after ${consecutiveFetchFailures} failed patch-status reads.`);
+          stopPolling();
+          setControlNotice({ kind: 'error', message: t('devicePatchStatusTab.notices.installStatusUnavailable') });
+          return;
+        } else {
+          return; // transient fetch failure: try again next tick
+        }
+
+        if (decision.kind === 'continue') {
+          state.settleFrom = decision.settleFrom;
+          return;
+        }
+
+        stopPolling();
+        // One full load at the end so every row's badges are current.
+        await refreshPatchView(true);
+        if (!isCurrent()) return;
+
+        if (decision.kind === 'timed_out') {
+          setControlNotice({ kind: 'info', message: t('devicePatchStatusTab.notices.installLongerThanExpected') });
+        } else if (decision.kind === 'command_ended') {
+          setControlNotice({
+            kind: 'error',
+            message: t('devicePatchStatusTab.notices.installCommandEnded', { status: decision.status })
+          });
+        } else {
+          const { installed, failed, awaitingRestart, unresolved, pending } = decision.summary;
+          setControlNotice(failed + awaitingRestart + unresolved === 0
+            ? { kind: 'success', message: t('devicePatchStatusTab.notices.installedSuccessfully', { installed, pending }) }
+            : {
+                // A failed command with no per-patch marker is still a failure.
+                kind: failed > 0 || commandStatus === 'failed' ? 'error' : 'info',
+                message: t('devicePatchStatusTab.notices.installFinishedWithIssues', { installed, failed, awaitingRestart, unresolved })
+              });
+        }
+      } finally {
+        pollTickInFlightRef.current = false;
       }
     }, INSTALL_POLL_INTERVAL_MS);
-  }, [fetchPatchStatus, fetchRecentLinuxInstalls, refreshPatchView]);
+  }, [deviceId, fetchPatchStatus, refreshPatchView]);
 
   const queuePatchScan = useCallback(async (
     action: 'scan-native' | 'scan-third-party',
@@ -978,7 +1320,7 @@ export default function DevicePatchStatusTab({ deviceId, timezone, osType }: Dev
       return;
     }
 
-    const currentPendingCount = pendingNative.length + pendingOther.length;
+    const currentPending = [...pendingNative, ...pendingOther];
     setControlAction(action);
     setControlNotice(null);
     try {
@@ -1005,7 +1347,7 @@ export default function DevicePatchStatusTab({ deviceId, timezone, osType }: Dev
       });
 
       // Start polling for completion
-      startInstallPolling(currentPendingCount);
+      startInstallPolling({ patchIds, commandId: body.commandId, pending: currentPending });
     } catch (err) {
       // runAction already toasted; the 409 "pending approval" detail in the JSON
       // body can't ride the toast, so add it to the inline notice when present.
@@ -1017,7 +1359,7 @@ export default function DevicePatchStatusTab({ deviceId, timezone, osType }: Dev
     } finally {
       setControlAction(null);
     }
-  }, [deviceId, pendingNative.length, pendingOther.length, startInstallPolling]);
+  }, [deviceId, pendingNative, pendingOther, startInstallPolling]);
 
   // The batch-install buttons request confirmation first; the ConfirmDialog's
   // onConfirm runs the queuePatchInstall above. Destructive action ⇒ never fire
@@ -1038,7 +1380,7 @@ export default function DevicePatchStatusTab({ deviceId, timezone, osType }: Dev
   const queueSinglePatchInstall = useCallback(async (patchId: string, patchName: string) => {
     if (!patchId) return;
 
-    const currentPendingCount = pendingNative.length + pendingOther.length;
+    const currentPending = [...pendingNative, ...pendingOther];
     setInstallingPatchIds(prev => new Set(prev).add(patchId));
     setControlNotice(null);
     try {
@@ -1059,7 +1401,7 @@ export default function DevicePatchStatusTab({ deviceId, timezone, osType }: Dev
       });
 
       // Start polling for completion
-      startInstallPolling(currentPendingCount);
+      startInstallPolling({ patchIds: [patchId], commandId: body.commandId, pending: currentPending });
     } catch (err) {
       setInstallingPatchIds(prev => {
         const next = new Set(prev);
@@ -1072,7 +1414,7 @@ export default function DevicePatchStatusTab({ deviceId, timezone, osType }: Dev
         message: err instanceof ActionError ? err.message : err instanceof Error ? err.message : t('devicePatchStatusTab.notices.installPatchFailed', { name: patchName })
       });
     }
-  }, [deviceId, pendingNative.length, pendingOther.length, startInstallPolling]);
+  }, [deviceId, pendingNative, pendingOther, startInstallPolling]);
 
   if (loading) {
     return (
@@ -1100,7 +1442,9 @@ export default function DevicePatchStatusTab({ deviceId, timezone, osType }: Dev
     );
   }
 
-  const isBusy = controlAction !== null || isPolling;
+  // A row install counts from the click, not from when its POST returns, so a
+  // second install cannot start (and replace this one's poll) in that window.
+  const isBusy = controlAction !== null || isPolling || installingPatchIds.size > 0;
 
   return (
     <div className="space-y-6">
@@ -1133,6 +1477,18 @@ export default function DevicePatchStatusTab({ deviceId, timezone, osType }: Dev
                 >
                   {patchPolicyLink.policyName}
                 </a>
+              </p>
+            )}
+            {approvalEvaluation?.available === false && (
+              <p data-testid="device-patch-approval-unavailable" className="mt-1 text-xs text-muted-foreground">
+                {t('devicePatchStatusTab.approval.unavailable')}
+              </p>
+            )}
+            {approvalEvaluation?.available && (
+              <p data-testid="device-patch-approval-ring" className="mt-1 text-xs text-muted-foreground">
+                {approvalRingName
+                  ? t('devicePatchStatusTab.approval.ringLine', { ring: approvalRingName })
+                  : t('devicePatchStatusTab.approval.noRingLine')}
               </p>
             )}
           </div>
@@ -1247,6 +1603,20 @@ export default function DevicePatchStatusTab({ deviceId, timezone, osType }: Dev
             <span>{t('devicePatchStatusTab.compliance.pending', { count: pendingNative.length + pendingOther.length })}</span>
             <span>{t('devicePatchStatusTab.compliance.installed', { count: displayedInstalledNative.length + installedThirdParty.length })}</span>
           </div>
+          {containerImages && (containerImages.stale > 0 || containerImages.unknown > 0) && (
+            <div className="mt-1 flex flex-wrap items-center gap-x-4 text-xs text-muted-foreground">
+              {containerImages.stale > 0 && (
+                <span data-testid="patch-compliance-images-behind">
+                  {t('devicePatchStatusTab.compliance.imagesBehind', { count: containerImages.stale })}
+                </span>
+              )}
+              {containerImages.unknown > 0 && (
+                <span data-testid="patch-compliance-images-not-checked">
+                  {t('devicePatchStatusTab.compliance.imagesNotChecked', { count: containerImages.unknown })}
+                </span>
+              )}
+            </div>
+          )}
         </div>
       </div>
 
@@ -1289,20 +1659,15 @@ export default function DevicePatchStatusTab({ deviceId, timezone, osType }: Dev
                       const badge = getCategoryBadge(patch, normalizedOsType);
                       const severityBadge = getSeverityBadge(patch.severity);
                       const kbLabel = getKbLabel(patch);
-                      const releaseLabel = getReleaseLabel(patch, effectiveTimezone);
+                      const releaseLabel = getReleaseLabel(patch, t, effectiveTimezone);
                       const srcBadge = getSourceBadge(patch);
                       const patchId = patch.id;
                       const isInstalling = patchId ? installingPatchIds.has(patchId) : false;
                       const notDownloaded = patch.isDownloaded === false;
-                      const approvalBadge = getApprovalBadge(patch);
                       const isApproved = isPatchApprovedForInstall(patch);
                       const canInstall = isPatchInstallable(patch);
                       const patchName = normalizePatchName(patch);
-                      const installTitle = isUserScopedPatch(patch)
-                        ? t('devicePatchStatusTab.installPatchUserScopeTitle', { name: patchName })
-                        : isApproved
-                          ? t('devicePatchStatusTab.installPatchTitle', { name: patchName })
-                          : t('devicePatchStatusTab.installPatchNotApprovedTitle', { name: patchName });
+                      const installTitle = installTitleFor(patch, patchName, isApproved);
 
                       return (
                         <tr key={patch.id ?? `${patch.name ?? patch.title ?? 'pending-native'}-${index}`} className="text-sm">
@@ -1379,9 +1744,7 @@ export default function DevicePatchStatusTab({ deviceId, timezone, osType }: Dev
                             )}
                           </td>
                           <td className="px-4 py-3">
-                            <span className={`inline-flex items-center whitespace-nowrap rounded-full border px-2.5 py-1 text-xs font-medium ${approvalBadge.className}`}>
-                              {approvalBadge.label}
-                            </span>
+                            <PatchApprovalCell patch={patch} timezone={effectiveTimezone} ringName={approvalRingName} />
                           </td>
                           <td className="px-2 py-3">
                             {patchId && (
@@ -1451,20 +1814,15 @@ export default function DevicePatchStatusTab({ deviceId, timezone, osType }: Dev
                       const brewDetails = getHomebrewPendingDetails(patch, normalizedOsType);
                       const severityBadge = getSeverityBadge(patch.severity);
                       const kbLabel = getKbLabel(patch);
-                      const releaseLabel = getReleaseLabel(patch, effectiveTimezone);
+                      const releaseLabel = getReleaseLabel(patch, t, effectiveTimezone);
                       const srcBadge = getSourceBadge(patch);
                       const patchId = patch.id;
                       const isInstalling = patchId ? installingPatchIds.has(patchId) : false;
                       const notDownloaded = patch.isDownloaded === false;
-                      const approvalBadge = getApprovalBadge(patch);
                       const isApproved = isPatchApprovedForInstall(patch);
                       const canInstall = isPatchInstallable(patch);
                       const patchName = normalizePatchName(patch);
-                      const installTitle = isUserScopedPatch(patch)
-                        ? t('devicePatchStatusTab.installPatchUserScopeTitle', { name: patchName })
-                        : isApproved
-                          ? t('devicePatchStatusTab.installPatchTitle', { name: patchName })
-                          : t('devicePatchStatusTab.installPatchNotApprovedTitle', { name: patchName });
+                      const installTitle = installTitleFor(patch, patchName, isApproved);
 
                       return (
                         <tr key={patch.id ?? `${patch.name ?? patch.title ?? 'pending-other'}-${index}`} className="text-sm">
@@ -1555,9 +1913,7 @@ export default function DevicePatchStatusTab({ deviceId, timezone, osType }: Dev
                             )}
                           </td>
                           <td className="px-4 py-3">
-                            <span className={`inline-flex items-center whitespace-nowrap rounded-full border px-2.5 py-1 text-xs font-medium ${approvalBadge.className}`}>
-                              {approvalBadge.label}
-                            </span>
+                            <PatchApprovalCell patch={patch} timezone={effectiveTimezone} ringName={approvalRingName} />
                           </td>
                           <td className="px-2 py-3">
                             {patchId && (
@@ -1718,6 +2074,9 @@ export default function DevicePatchStatusTab({ deviceId, timezone, osType }: Dev
           </div>
         </div>
       )}
+
+      {/* #11065: the maker's own update tool. Windows only in v1. */}
+      {osType === 'windows' && <DeviceVendorUpdatesSection deviceId={deviceId} />}
 
       <PatchInstallHistory deviceId={deviceId} />
 

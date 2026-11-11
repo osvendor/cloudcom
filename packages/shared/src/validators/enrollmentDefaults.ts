@@ -3,6 +3,23 @@ import { z } from 'zod';
 export const MAX_ENROLLMENT_TTL_MINUTES = 525_600; // 365 days
 export const MAX_ENROLLMENT_DEVICE_COUNT = 1000;
 
+/**
+ * Lifetime of the credential embedded in a downloaded installer (the
+ * installer bootstrap token, or the child enrollment key in the legacy macOS
+ * zip), in minutes.
+ *
+ * Default 7 days; never more than 30 days, whatever the source: the
+ * INSTALLER_BOOTSTRAP_TOKEN_TTL_MINUTES env var, an admin's pick, or an
+ * installer link's remaining lifetime. A downloaded installer that is never
+ * run should not stay able to enroll a device for months. Installer links and
+ * enrollment keys are separate objects and keep MAX_ENROLLMENT_TTL_MINUTES.
+ *
+ * Shared so the Add Device modal's installer picker offers exactly what the
+ * installer routes accept (they 400 an explicit ttlMinutes above the maximum).
+ */
+export const DEFAULT_BOOTSTRAP_TOKEN_TTL_MINUTES = 10_080; // 7 days
+export const MAX_BOOTSTRAP_TOKEN_TTL_MINUTES = 43_200; // 30 days
+
 /** Selectable TTLs, in minutes. Mirrors the Add Device modal's option set. */
 export const ENROLLMENT_TTL_OPTIONS = [60, 1440, 10080, 43200, 129600, 525600] as const;
 
@@ -120,6 +137,10 @@ export interface ResolvedEnrollmentDefaults {
   ttlMinutes: number;
   deviceCount: number;
   maxTtlMinutes: number;
+  /** True only when a partner or org default expiry is explicitly configured (not the product fallback). */
+  ttlConfigured: boolean;
+  /** True only when a partner or org default device count is explicitly configured (not the product fallback). */
+  deviceCountConfigured: boolean;
 }
 
 type Defaults = Record<string, unknown>;
@@ -149,10 +170,11 @@ export function resolveEnrollmentDefaults(
   partnerDefaults: Defaults,
   orgDefaults: Defaults,
 ): ResolvedEnrollmentDefaults {
-  const pick = (field: string, fallback: number): number => {
+  const configured = (field: string): number | undefined => {
     const raw = field in orgDefaults ? orgDefaults[field] : partnerDefaults[field];
-    return typeof raw === 'number' ? raw : fallback;
+    return typeof raw === 'number' ? raw : undefined;
   };
+  const pick = (field: string, fallback: number): number => configured(field) ?? fallback;
   const rawCap = partnerDefaults.maxEnrollmentLinkTtlMinutes;
   const maxTtlMinutes = typeof rawCap === 'number' ? rawCap : MAX_ENROLLMENT_TTL_MINUTES;
   const ttlMinutes = pick('defaultEnrollmentTtlMinutes', PRODUCT_DEFAULT_ENROLLMENT_TTL_MINUTES);
@@ -160,5 +182,7 @@ export function resolveEnrollmentDefaults(
     ttlMinutes: Math.min(ttlMinutes, maxTtlMinutes),
     deviceCount: pick('defaultEnrollmentDeviceCount', PRODUCT_DEFAULT_ENROLLMENT_DEVICE_COUNT),
     maxTtlMinutes,
+    ttlConfigured: configured('defaultEnrollmentTtlMinutes') !== undefined,
+    deviceCountConfigured: configured('defaultEnrollmentDeviceCount') !== undefined,
   };
 }

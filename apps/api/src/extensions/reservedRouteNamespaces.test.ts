@@ -86,20 +86,27 @@ describe('RESERVED_ROUTE_NAMESPACES', () => {
     // still fails, instead of passing on an unchanged total.
     //
     // Resolved top-level segments (all reserved):
+    //   autopayRoutes                 → billing, orgs
+    //   billingPaymentSettingsRoutes  → orgs, partner
     //   callerVerificationRoutes      → orgs, partner
     //   externalServicesRoutes        → billing, support
     //   invoiceAssemblyRoutes         → orgs, tickets
     //   invoiceSettingsRoutes         → orgs, partner
     //   ticketResponseTemplateRoutes  → ticket-response-templates
     //   ticketFormRoutes              → ticket-forms
+    //   ticketApprovalRoutes          → tickets, ticket-approval-requests, time-entries
+    //   ticketApprovalSettingsRoutes  → orgs, ticketing
     //   lifecycleRoutes               → me
     //   lifecycleAdminRoutes          → admin
     //   m365CallbackRoute             → c2c
     //   tenantVariableRoutes          → tenant-variables
+    //   serviceCatalogRoutes          → service-catalog
     // If this list changes, open the new sub-router, resolve its top-level
     // segments by hand, and add them to RESERVED_ROUTE_NAMESPACES.
     const rootMounts = [...source.matchAll(ROOT_MOUNT_RE)].map((m) => m[1]!).sort();
     expect(rootMounts).toEqual([
+      'autopayRoutes',
+      'billingPaymentSettingsRoutes',
       'callerVerificationRoutes',
       'externalServicesRoutes',
       'invoiceAssemblyRoutes',
@@ -107,7 +114,10 @@ describe('RESERVED_ROUTE_NAMESPACES', () => {
       'lifecycleAdminRoutes',
       'lifecycleRoutes',
       'm365CallbackRoute',
+      'serviceCatalogRoutes',
       'tenantVariableRoutes',
+      'ticketApprovalRoutes',
+      'ticketApprovalSettingsRoutes',
       'ticketFormRoutes',
       'ticketResponseTemplateRoutes',
     ]);
@@ -117,8 +127,10 @@ describe('RESERVED_ROUTE_NAMESPACES', () => {
     'billing',
     'support',
     'tenant-variables',
+    'ticket-approval-requests',
     'ticket-forms',
     'ticket-response-templates',
+    'ticketing',
   ])('reserves and rejects root-mounted sub-router namespace %s', (namespace) => {
     expect(RESERVED_ROUTE_NAMESPACES.has(namespace)).toBe(true);
     expect(() => parseExtensionManifestV1({ ...validManifest, routeNamespace: namespace })).toThrow();
@@ -130,11 +142,12 @@ describe('RESERVED_ROUTE_NAMESPACES', () => {
   });
 
   it.each([
+    'autopay',
     'service-principals',
     'partner-service-principals',
     'partner-api',
   ])('rejects core auth surface %s as a routeNamespace', (namespace) => {
-    // Regression guard for #2634 — these three shipped unreserved, letting an
+    // Regression guard for #2634 and autopay — an unreserved core namespace lets an
     // installed+enabled extension shadow auth-sensitive core endpoints.
     expect(RESERVED_ROUTE_NAMESPACES.has(namespace)).toBe(true);
     expect(() => parseExtensionManifestV1({ ...validManifest, routeNamespace: namespace })).toThrow();

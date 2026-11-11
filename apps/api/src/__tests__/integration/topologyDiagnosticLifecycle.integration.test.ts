@@ -24,6 +24,8 @@ import {
   topologyNodeBindings,
 } from '../../db/schema';
 import type { AuthContext } from '../../middleware/auth';
+import { metricsRegistry } from '../../services/metricsRegistry';
+import { TOPOLOGY_METRIC_NAMES } from '../../services/topology/metrics';
 import type { UserPermissions } from '../../services/permissions';
 import type { TopologyRequestContext } from '../../services/topology/access';
 import type {
@@ -158,7 +160,7 @@ async function fixture(options: { permissions?: typeof GRANTS } = {}) {
       orgId,
       partnerId: env.partner.id,
       accessibleOrgIds: [orgId],
-      allowedSiteIds: null,
+      allowedSiteIds: undefined,
       // Diagnostics are execution: the planner requires a satisfied MFA claim.
       token: { mfa: true },
       canAccessOrg: (candidate: string) => candidate === orgId,
@@ -424,6 +426,7 @@ describe('topology diagnostic dispatch', () => {
       validateTopologyCommandAuthority(
         { id: command!.id, type: command!.type, deviceId: f.deviceId, payload: command!.payload },
         command!.payload,
+        { permissionVersions: 'live' },
       ),
     );
     expect(decision.allow).toBe(true);
@@ -499,6 +502,7 @@ describe('topology diagnostic cancellation', () => {
       validateTopologyCommandAuthority(
         { id: command!.id, type: command!.type, deviceId: f.deviceId, payload: command!.payload },
         command!.payload,
+        { permissionVersions: 'live' },
       ),
     );
     expect(decision).toEqual({ allow: false, reason: 'scope_changed' });
@@ -547,6 +551,30 @@ describe('topology diagnostic cancellation', () => {
       status: 404,
     });
     expect((await f.row(run.id))!.state).toBe('queued');
+  });
+});
+
+describe('topology diagnostic operational metrics', () => {
+  it('times dispatch by recipe and state and counts accepted, late and rejected results', async () => {
+    metricsRegistry.resetMetrics();
+    const f = await fixture();
+    const run = await f.create('metrics-run');
+    await expect(f.create('metrics-run', { graphRevision: '9' })).rejects.toMatchObject({ status: 409 });
+    await dispatchTopologyDiagnosticRun(f.scope, run.id, { deliver: async () => true });
+    const [command] = await f.commandsForRun(run.id);
+    const current = (await f.asUser(() => getTopologyDiagnosticRun(f.context, run.id)))!;
+    await acceptTopologyDiagnosticResult(f.producer(command!.id), resultFor(current));
+    await acceptTopologyDiagnosticResult(f.producer(command!.id), resultFor(current));
+    await expect(acceptTopologyDiagnosticResult(f.producer(crypto.randomUUID()), { ...resultFor(current), commandId: command!.id }))
+      .rejects.toMatchObject({ status: 403 });
+
+    const text = await metricsRegistry.metrics();
+    expect(text).toContain(`${TOPOLOGY_METRIC_NAMES.dispatchDuration}_count{recipe="gateway_basic",status="queued"} 1`);
+    expect(text).toContain(`${TOPOLOGY_METRIC_NAMES.dispatchDuration}_count{recipe="gateway_basic",status="rejected"} 1`);
+    expect(text).toContain(`${TOPOLOGY_METRIC_NAMES.diagnosticResults}{recipe="gateway_basic",status="accepted"} 1`);
+    expect(text).toContain(`${TOPOLOGY_METRIC_NAMES.diagnosticResults}{recipe="gateway_basic",status="late"} 1`);
+    expect(text).toContain(`${TOPOLOGY_METRIC_NAMES.diagnosticResults}{recipe="other",status="rejected"} 1`);
+    for (const id of [f.orgId, f.siteId, f.deviceId, run.id]) expect(text).not.toContain(id);
   });
 });
 

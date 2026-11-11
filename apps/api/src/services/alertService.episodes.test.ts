@@ -24,8 +24,11 @@ const {
   fireEscalationLatchMock,
   isCooldownActiveMock,
   isFlappingMock,
+  scheduleStagedAlertDispatchMock,
   callOrder,
+  episodeUpdates,
 } = vi.hoisted(() => {
+  const episodeUpdates: Array<{ table: unknown; set: unknown; where: unknown }> = [];
   const resultsQueue: unknown[][] = [];
   const callOrder: string[] = [];
   const insertedAlerts: Record<string, unknown>[] = [];
@@ -44,6 +47,7 @@ const {
   };
   return {
     resultsQueue,
+    episodeUpdates,
     callOrder,
     insertedAlerts,
     dbMock: {
@@ -57,6 +61,20 @@ const {
           };
         },
       })),
+      execute: vi.fn(async (statement: { values: unknown[] }) => {
+        if (statement.values.length === 1) return []; // subject advisory lock
+        callOrder.push('createAlert.insert');
+        const [ruleId, deviceId, orgId, severity, title, message, context, monitorId, episodeId, requiresHuman, subjectKey] = statement.values;
+        insertedAlerts.push({
+          ruleId, deviceId, orgId, severity, title, message,
+          context: JSON.parse(context as string), monitorId, episodeId, requiresHuman, subjectKey,
+        });
+        return [{ id: 'alert-1' }];
+      }),
+      update: vi.fn((table: unknown) => ({ set: (set: unknown) => ({ where: (where: unknown) => {
+        episodeUpdates.push({ table, set, where });
+        return Promise.resolve(undefined);
+      } }) })),
       delete: vi.fn(() => ({ where: () => Promise.resolve([]) })),
     },
     captureExceptionMock: vi.fn(),
@@ -68,9 +86,12 @@ const {
     fireEscalationLatchMock: vi.fn(),
     isCooldownActiveMock: vi.fn(),
     isFlappingMock: vi.fn(),
+    scheduleStagedAlertDispatchMock: vi.fn(),
   };
 });
 
+vi.mock('./alertLifecycle/resolve', async (importOriginal) =>
+  (await import('../testUtils/alertLifecycleMock')).legacyLifecycleModule(await importOriginal()));
 vi.mock('drizzle-orm', () => ({
   eq: (col: unknown, val: unknown) => ({ op: 'eq', col, val }),
   and: (...args: unknown[]) => ({ op: 'and', args }),
@@ -86,7 +107,14 @@ vi.mock('drizzle-orm', () => ({
   desc: (col: unknown) => ({ op: 'desc', col }),
 }));
 
-vi.mock('../db', () => ({ db: dbMock }));
+vi.mock('../db', () => ({
+  db: dbMock,
+  withDbTransaction: async (fn: () => Promise<unknown>) => fn(),
+  // #10859 — the evaluator scopes its own contexts; their boundaries are
+  // asserted in alertService.contextScoping.test.ts.
+  withSystemDbAccessContext: async (fn: () => Promise<unknown>) => fn(),
+}));
+vi.mock('./alertSubjects', () => ({ evaluateSubjectAlerts: vi.fn(async () => 'ok') }));
 
 vi.mock('../db/schema', () => ({
   alerts: { id: 'alerts.id', ruleId: 'alerts.ruleId', deviceId: 'alerts.deviceId', status: 'alerts.status' },
@@ -110,6 +138,8 @@ vi.mock('../db/schema', () => ({
   organizations: { id: 'organizations.id', partnerId: 'organizations.partnerId' },
   sites: {},
   configPolicyAlertRules: {},
+  monitorEpisodes: { id: 'episodes.id', alertId: 'episodes.alertId', responseOutcome: 'episodes.responseOutcome',
+    responseRunId: 'episodes.responseRunId', responseDispatch: 'episodes.responseDispatch', responsesAdmittedAt: 'episodes.responsesAdmittedAt' },
   monitorDefinitions: { id: 'monitor_definitions.id' },
   monitorDeviceState: {
     monitorId: 'monitor_device_state.monitorId',
@@ -133,22 +163,21 @@ vi.mock('./monitors/escalationLatch', () => ({
 }));
 
 vi.mock('./alertConditions', () => ({
+  evidenceLeafPaths: vi.fn(() => []),
   evaluateConditions: evaluateConditionsMock,
   evaluateAutoResolveConditions: vi.fn(),
   interpolateTemplate: vi.fn((template: string) => template),
+  withMetConditionDescriptions: vi.fn((context: Record<string, unknown>) => context),
 }));
 
 vi.mock('./alertCooldown', () => ({
   isCooldownActive: isCooldownActiveMock,
   setCooldown: vi.fn(() => Promise.resolve()),
-  isConfigPolicyRuleCooling: vi.fn(),
-  markConfigPolicyRuleCooldown: vi.fn(),
   recordStateTransition: vi.fn(() => Promise.resolve()),
   isFlapping: isFlappingMock,
 }));
 
 vi.mock('./featureConfigResolver', () => ({
-  resolveAlertRulesForDevice: vi.fn(),
   resolveMaintenanceConfigForDevice: vi.fn(),
   isInMaintenanceWindow: vi.fn(),
 }));
@@ -157,6 +186,13 @@ vi.mock('./eventBus', () => ({ publishEvent: vi.fn(() => Promise.resolve()) }));
 vi.mock('./sentry', () => ({ captureException: captureExceptionMock }));
 vi.mock('./deviceSiteResolver', () => ({ resolveDeviceSiteId: vi.fn(() => Promise.resolve('site-1')) }));
 vi.mock('../jobs/alertCorrelation', () => ({ enqueueAlertCorrelation: vi.fn(() => Promise.resolve('job-1')) }));
+// #10926 — create stages `alert.triggered` on the row and hands the id to the
+// outbox; the after-commit publish and its follow-ups are covered by
+// alertPublishAfterCommit.integration.test.ts.
+vi.mock('./subjectAlertOutbox', () => ({ scheduleStagedAlertDispatch: scheduleStagedAlertDispatchMock }));
+
+import { resolveMaintenanceConfigForDevice, isInMaintenanceWindow } from './featureConfigResolver';
+import { evaluateSubjectAlerts } from './alertSubjects';
 
 import { evaluateDeviceAlerts } from './alertService';
 
@@ -242,9 +278,11 @@ function pushSweepQueue(opts: {
 
 beforeEach(() => {
   resultsQueue.length = 0;
+  episodeUpdates.length = 0;
   callOrder.length = 0;
   insertedAlerts.length = 0;
   vi.clearAllMocks();
+  vi.mocked(resolveMaintenanceConfigForDevice).mockResolvedValue(null);
   resolveMonitorsForDeviceMock.mockResolvedValue({
     kind: 'resolved',
     monitors: [
@@ -266,7 +304,7 @@ beforeEach(() => {
     };
   });
   fireEscalationLatchMock.mockResolvedValue({ escalationAlertId: 'alert-esc', recurrenceActionsPending: 0 });
-  linkEpisodeAlertMock.mockResolvedValue(undefined);
+  linkEpisodeAlertMock.mockResolvedValue({ owner: true });
   detachMonitorFromDeviceMock.mockResolvedValue(undefined);
   evaluateConditionsMock.mockResolvedValue({
     triggered: true,
@@ -278,6 +316,20 @@ beforeEach(() => {
 });
 
 describe('evaluateDeviceAlerts — monitor episodes (#5290)', () => {
+  it('records a suppressed alert as no response only while its episode is wholly unclaimed', async () => {
+    pushSweepQueue({ triggered: true });
+    isCooldownActiveMock.mockResolvedValue(true);
+    await evaluateDeviceAlerts(DEVICE_ID);
+    const update = episodeUpdates.find(row => (row.set as any).responseOutcome === 'skipped_no_response');
+    expect(update).toBeDefined();
+    expect(update!.where).toEqual({ op: 'and', args: [
+      { op: 'eq', col: 'episodes.id', val: 'episode-1' },
+      ...['alertId', 'responseOutcome', 'responseRunId', 'responseDispatch', 'responsesAdmittedAt']
+        .map(field => ({ op: 'isNull', col: `episodes.${field}` })),
+    ] });
+    expect(insertedAlerts).toHaveLength(0);
+  });
+
   it('records a breach observation BEFORE the alert is inserted', async () => {
     pushSweepQueue({ triggered: true });
 
@@ -351,6 +403,17 @@ describe('evaluateDeviceAlerts — monitor episodes (#5290)', () => {
 
     expect(insertedAlerts[0]).toMatchObject({ episodeId: 'episode-1', monitorId: MONITOR_ID });
     expect(linkEpisodeAlertMock).toHaveBeenCalledWith('episode-1', 'alert-1');
+  });
+
+  it('keeps a staged legacy alert when episode linking fails', async () => {
+    pushSweepQueue({ triggered: true });
+    linkEpisodeAlertMock.mockRejectedValueOnce(new Error('episode bookkeeping unavailable'));
+
+    expect(await evaluateDeviceAlerts(DEVICE_ID)).toContain('alert-1');
+    expect(insertedAlerts).toHaveLength(1);
+    expect(linkEpisodeAlertMock).toHaveBeenCalledWith('episode-1', 'alert-1');
+    // The alert still goes to the outbox for announcement.
+    expect(scheduleStagedAlertDispatchMock).toHaveBeenCalledExactlyOnceWith('alert-1');
   });
 
   it('opens the episode even when createAlert returns null because of cooldown', async () => {
@@ -465,5 +528,82 @@ describe('evaluateDeviceAlerts — monitor episodes (#5290)', () => {
       undefined,
       expect.objectContaining({ issue: 'episode_record_failed' }),
     );
+  });
+});
+
+describe('monitor maintenance suppression', () => {
+  it.each(['hardware_health', 'time_sync'] as const)(
+    'preserves %s subject recovery under the subject lock without admitting breaches or episode side effects',
+    async (kind) => {
+      vi.mocked(resolveMaintenanceConfigForDevice).mockResolvedValue({
+        suppressAlerts: true,
+      } as never);
+      vi.mocked(isInMaintenanceWindow).mockReturnValue({
+        active: true,
+        suppressAlerts: true,
+      } as never);
+      const recovered = {
+        subjectKey: 'disk:healthy',
+        status: 'recovered',
+        description: 'Recovered disk',
+      };
+      const unknown = {
+        subjectKey: 'disk:missing',
+        status: 'unknown',
+        description: 'Missing data',
+      };
+      evaluateConditionsMock.mockResolvedValue({
+        triggered: true,
+        conditionsMet: [],
+        conditionsNotMet: [],
+        context: {},
+        subjects: [
+          recovered,
+          unknown,
+          { subjectKey: 'disk:failed', status: 'breaching' },
+        ],
+      });
+      pushSweepQueue({ triggered: false, monitorRow: { id: MONITOR_ID, kind } });
+
+      expect(await evaluateDeviceAlerts(DEVICE_ID)).toEqual([]);
+
+      expect(dbMock.execute).toHaveBeenCalledWith(
+        expect.objectContaining({
+          values: [`hardware-subject:rule-1:${DEVICE_ID}`],
+        }),
+      );
+      expect(evaluateSubjectAlerts).toHaveBeenCalledWith(
+        expect.objectContaining({
+          evidence: expect.objectContaining({
+            subjects: [recovered, unknown],
+            createdAlertIds: [],
+          }),
+        }),
+      );
+      expect(insertedAlerts).toHaveLength(0);
+      expect(recordMonitorEvaluationMock).not.toHaveBeenCalled();
+      expect(fireEscalationLatchMock).not.toHaveBeenCalled();
+      expect(detachMonitorFromDeviceMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    { active: true, suppressAlerts: true, creates: false },
+    { active: false, suppressAlerts: true, creates: true },
+    { active: true, suppressAlerts: false, creates: true },
+  ])('active=$active suppressAlerts=$suppressAlerts creates=$creates', async ({ active, suppressAlerts, creates }) => {
+    vi.mocked(resolveMaintenanceConfigForDevice).mockResolvedValue({ suppressAlerts } as never);
+    vi.mocked(isInMaintenanceWindow).mockReturnValue({ active, suppressAlerts } as never);
+    pushSweepQueue({ triggered: true });
+    const ids = await evaluateDeviceAlerts(DEVICE_ID);
+    expect(ids).toHaveLength(creates ? 1 : 0);
+    expect(insertedAlerts).toHaveLength(creates ? 1 : 0);
+    expect(resolveMaintenanceConfigForDevice).toHaveBeenCalledWith(DEVICE_ID);
+    if (!creates) {
+      expect(evaluateConditionsMock).not.toHaveBeenCalled();
+      expect(recordMonitorEvaluationMock).not.toHaveBeenCalled();
+      expect(fireEscalationLatchMock).not.toHaveBeenCalled();
+      expect(detachMonitorFromDeviceMock).not.toHaveBeenCalled();
+    }
   });
 });

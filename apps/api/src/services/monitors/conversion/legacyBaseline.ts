@@ -4,6 +4,8 @@ import { devices, organizations, deviceGroupMemberships, configurationPolicies,
   configPolicyAssignments, configPolicyEffectiveFeatureLinks, configPolicyAlertRules,
   configPolicyMonitoringSettings, configPolicyMonitoringWatches } from '../../../db/schema';
 import { policyOwnershipCondition } from '../../configPolicyOwnership';
+import { notHoldingOrgCondition } from '../../unassignedPool/selectorPredicate';
+import { isUnassignedPoolOrgType } from '../../unassignedPool/orgType';
 export type DbExecutor = typeof db | Parameters<Parameters<typeof db.transaction>[0]>[0];
 export interface LegacyBaseline {
   rules: Array<typeof configPolicyAlertRules.$inferSelect>;
@@ -14,7 +16,7 @@ const LEVEL: Record<string, number> = { device: 5, device_group: 4, site: 3, org
 export async function resolveLegacyBaseline(deviceId: string, executor: DbExecutor): Promise<LegacyBaseline> {
   const [device] = await executor.select().from(devices).where(eq(devices.id, deviceId)).limit(1);
   if (!device) return { rules: [], monitoring: null };
-  const [org] = await executor.select({ partnerId: organizations.partnerId }).from(organizations)
+  const [org] = await executor.select({ partnerId: organizations.partnerId, type: organizations.type }).from(organizations)
     .where(eq(organizations.id, device.orgId)).limit(1);
   const groups = await executor.select({ groupId: deviceGroupMemberships.groupId }).from(deviceGroupMemberships)
     .where(eq(deviceGroupMemberships.deviceId, deviceId));
@@ -23,7 +25,8 @@ export async function resolveLegacyBaseline(deviceId: string, executor: DbExecut
     and(eq(configPolicyAssignments.level, 'site'), eq(configPolicyAssignments.targetId, device.siteId)),
     and(eq(configPolicyAssignments.level, 'organization'), eq(configPolicyAssignments.targetId, device.orgId)),
   ];
-  if (org?.partnerId) targets.push(and(eq(configPolicyAssignments.level, 'partner'), eq(configPolicyAssignments.targetId, org.partnerId)));
+  // No partner-level assignment reaches a device parked in the holding org.
+  if (org?.partnerId && !isUnassignedPoolOrgType(org.type)) targets.push(and(eq(configPolicyAssignments.level, 'partner'), eq(configPolicyAssignments.targetId, org.partnerId)));
   if (groups.length) targets.push(and(eq(configPolicyAssignments.level, 'device_group'), inArray(configPolicyAssignments.targetId, groups.map((g) => g.groupId))));
   const filters = and(or(...targets),
     sql`(${configPolicyAssignments.roleFilter} IS NULL OR ${device.deviceRole} = ANY(${configPolicyAssignments.roleFilter}))`,
@@ -43,7 +46,7 @@ export async function resolveLegacyBaseline(deviceId: string, executor: DbExecut
     level: configPolicyAssignments.level, priority: configPolicyAssignments.priority })
     .from(configPolicyAssignments)
     .innerJoin(configurationPolicies, eq(configPolicyAssignments.configPolicyId, configurationPolicies.id))
-    .innerJoin(configPolicyEffectiveFeatureLinks, and(eq(configPolicyEffectiveFeatureLinks.configPolicyId, configurationPolicies.id), eq(configPolicyEffectiveFeatureLinks.featureType, 'monitoring')))
+    .innerJoin(configPolicyEffectiveFeatureLinks, and(eq(configPolicyEffectiveFeatureLinks.configPolicyId, configurationPolicies.id), inArray(configPolicyEffectiveFeatureLinks.featureType, ['monitoring', 'monitors'])))
     .innerJoin(configPolicyMonitoringSettings, eq(configPolicyMonitoringSettings.featureLinkId, configPolicyEffectiveFeatureLinks.id))
     .where(and(eq(configurationPolicies.status, 'active'), owner, filters));
   // Actual watch runtime has no creation-time tie-breaker; preserve that order.
@@ -68,6 +71,7 @@ export async function resolveDeviceIdsForPolicy(policyId: string, executor: DbEx
     .innerJoin(configurationPolicies, eq(configurationPolicies.id, configPolicyAssignments.configPolicyId))
     .leftJoin(configPolicyEffectiveFeatureLinks, eq(configPolicyEffectiveFeatureLinks.configPolicyId, configurationPolicies.id))
     .where(and(eq(configurationPolicies.status, 'active'),
+      notHoldingOrgCondition(),
       or(eq(configurationPolicies.orgId, devices.orgId), and(isNull(configurationPolicies.orgId), eq(configurationPolicies.partnerId, organizations.partnerId))),
       or(eq(configurationPolicies.id, policyId), eq(configPolicyEffectiveFeatureLinks.sourcePolicyId, policyId)),
       sql`(${configPolicyAssignments.roleFilter} IS NULL OR ${devices.deviceRole} = ANY(${configPolicyAssignments.roleFilter}))`,

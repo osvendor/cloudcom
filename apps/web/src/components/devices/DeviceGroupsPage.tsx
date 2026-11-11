@@ -10,11 +10,19 @@ import {
 import { Plus, Pencil, Trash2, Shield, Play, X, ListFilter } from "lucide-react";
 import { fetchWithAuth } from "@/stores/auth";
 import { fetchAllSites } from "@/lib/fetchAllSites";
+import { useDefaultOwnerScope } from "@/hooks/useDefaultOwnerScope";
+import { GroupOwnerScopeField } from "./GroupOwnerScopeField";
+import { AllOrgsBadge, PartnerGroupEvaluationStatus, PartnerGroupMembers, type PartnerGroupEvaluation } from "./PartnerGroupDetails";
+import { usePartnerGroupCapabilities, partnerGroupFilterFields, partnerGroupFilterHasRefusedField, groupApiErrorMessage, type GroupOwnerScope } from "./partnerGroups";
 import { useFleetOrgOwner } from "@/hooks/useFleetOrgOwner";
 import { asList } from "@/lib/asList";
+import { runAction, ActionError } from "@/lib/runAction";
+import { showToast } from "../shared/Toast";
+import type { ScriptAdmissionResult } from "@breeze/shared";
 import type { FilterConditionGroup } from "@breeze/shared";
 import { encodeFilterToHash } from "./filterUrl";
-import { FilterBuilder, DEFAULT_FILTER_FIELDS } from "../filters/FilterBuilder";
+import { FilterBuilder } from "../filters/FilterBuilder";
+import { useDeviceFilterFields } from "../filters/useDeviceFilterFields";
 import { FilterPreview } from "../filters/FilterPreview";
 import { useFilterPreview } from "../../hooks/useFilterPreview";
 import {
@@ -28,6 +36,7 @@ import {
 } from "./deviceGroupMatching";
 import { useTranslation } from "react-i18next";
 import "../../lib/i18n";
+import { useHashState } from "../../lib/useHashState";
 
 type OSType = "windows" | "macos" | "linux";
 
@@ -51,6 +60,9 @@ type GroupType = "static" | "dynamic";
 
 type DeviceGroup = {
   id: string;
+  orgId?: string | null;
+  ownerScope?: GroupOwnerScope;
+  evaluation?: PartnerGroupEvaluation | null;
   name: string;
   type: GroupType;
   deviceCount?: number;
@@ -60,7 +72,7 @@ type DeviceGroup = {
    * Legacy, read-only. The web app has not authored these since the
    * FilterBuilder landed — see `handleSubmitGroup`.
    */
-  rules?: DeviceGroupRule[];
+  rules?: DeviceGroupRule[] | null;
   filterConditions?: FilterConditionGroup | null;
   policy?: { id: string; name: string };
 };
@@ -88,6 +100,10 @@ type ModalMode =
   | "bulk-script"
   | "bulk-policy";
 
+// `/devices/groups#create` opens the create dialog on load. Linked from the
+// Devices page Add-filter picker (DevicesPage `createGroupHref`, #9865).
+const CREATE_HASH = "create";
+
 type GroupFormState = {
   name: string;
   type: GroupType;
@@ -99,6 +115,14 @@ type DragPayload = {
   deviceId: string;
   fromGroupId: string;
 };
+
+/**
+ * Mirrors the `deviceIds` cap in the API's `executeScriptSchema`
+ * (`apps/api/src/services/scriptRunRequest.ts`). Checked client-side so the
+ * user gets a sentence naming the device count instead of a raw validation
+ * error; the server still enforces it.
+ */
+const MAX_SCRIPT_TARGETS = 500;
 
 const osLabels: Record<OSType, string> = {
   windows: "Windows",
@@ -177,7 +201,25 @@ const parseDragPayload = (event: DragEvent): DragPayload | null => {
 
 export default function DeviceGroupsPage() {
   const { t } = useTranslation("devices");
+  // Static catalog + org/partner custom fields (#8843): the rule builder's
+  // field picker and the card's condition chips both draw from it.
+  const filterFields = useDeviceFilterFields();
+  const { canCreatePartnerGroup, canWritePartnerGroups } = usePartnerGroupCapabilities();
+  const { defaultOwnerScope } = useDefaultOwnerScope();
+  const [ownerScope, setOwnerScope] = useState<GroupOwnerScope>(defaultOwnerScope);
+  const [ownerFilter, setOwnerFilter] = useHashState<GroupOwnerScope | "all">("all", (hash) => {
+    const owner = new URLSearchParams(hash).get("owner");
+    return owner === "organization" || owner === "partner" ? owner : undefined;
+  });
+  const changeOwnerFilter = (owner: GroupOwnerScope | "all") => {
+    setOwnerFilter(owner);
+    const hash = new URLSearchParams(window.location.hash.slice(1));
+    if (owner === "all") hash.delete("owner");
+    else hash.set("owner", owner);
+    window.history.replaceState(window.history.state, "", `${window.location.pathname}${window.location.search}${hash.size ? `#${hash}` : ""}`);
+  };
   const [groups, setGroups] = useState<DeviceGroup[]>([]);
+  const visibleGroups = useMemo(() => groups.filter((group) => ownerFilter === "all" || (group.ownerScope ?? "organization") === ownerFilter), [groups, ownerFilter]);
   const [devices, setDevices] = useState<Device[]>([]);
   const [sites, setSites] = useState<Site[]>([]);
   const [policies, setPolicies] = useState<Policy[]>([]);
@@ -186,6 +228,7 @@ export default function DeviceGroupsPage() {
   const [error, setError] = useState<string>();
   const [modalMode, setModalMode] = useState<ModalMode>("closed");
   const [selectedGroup, setSelectedGroup] = useState<DeviceGroup | null>(null);
+  const isPartnerForm = modalMode === "edit" ? selectedGroup?.ownerScope === "partner" : ownerScope === "partner";
   const [submitting, setSubmitting] = useState(false);
   const [formError, setFormError] = useState<string>();
   // All-orgs view injects no `?orgId=`, so a create needs an explicit owner org
@@ -234,7 +277,18 @@ export default function DeviceGroupsPage() {
       (modalMode === "create" || modalMode === "edit")
       ? groupForm.filterConditions
       : null,
-    { enabled: true },
+    // Pin to the group's own org when editing (All-orgs view has no injected
+    // org, so a negated group filter would match every org's devices — #9262),
+    // or to the chosen owner org when creating.
+    {
+      enabled: true,
+      // Same population membership evaluation materializes (#9933).
+      excludeDecommissioned: true,
+      allOrgs: isPartnerForm,
+      orgId: isPartnerForm ? undefined :
+        (modalMode === "edit" ? selectedGroup?.orgId : undefined) ??
+        (modalMode === "create" ? fleet.bodyOrgId : undefined),
+    },
   );
 
   // The chooser is inert until the server's membership answer is in hand: an
@@ -299,7 +353,7 @@ export default function DeviceGroupsPage() {
       // every static group renders as empty and the drag-and-drop move is inert
       // (its source-membership guard can never pass).
       const response = await fetchWithAuth(
-        "/device-groups?includeMemberships=true",
+        "/device-groups?includeMemberships=true&ownerScope=all",
       );
       if (!response.ok) {
         throw new Error("Failed to fetch device groups");
@@ -376,16 +430,20 @@ export default function DeviceGroupsPage() {
   useEffect(() => {
     setSelectedGroupIds((prev) => {
       const next = new Set<string>();
-      groups.forEach((group) => {
+      visibleGroups.forEach((group) => {
         if (prev.has(group.id)) {
           next.add(group.id);
         }
       });
       return next;
     });
-  }, [groups]);
+  }, [visibleGroups]);
 
   const resetForm = (group?: DeviceGroup) => {
+    const nextOwner = group
+      ? group.ownerScope ?? "organization"
+      : canCreatePartnerGroup ? defaultOwnerScope : "organization";
+    setOwnerScope(nextOwner);
     if (group) {
       // The filter is the authored representation. Legacy `rules` are only a
       // seed for groups that predate the FilterBuilder and have no filter yet.
@@ -397,7 +455,7 @@ export default function DeviceGroupsPage() {
 
       setGroupForm({
         name: group.name ?? "",
-        type: group.type ?? "static",
+        type: nextOwner === "partner" ? "dynamic" : group.type ?? "static",
         deviceIds: group.deviceIds
           ? [...group.deviceIds]
           : (group.devices?.map((device) => device.id) ?? []),
@@ -406,7 +464,7 @@ export default function DeviceGroupsPage() {
     } else {
       setGroupForm({
         name: "",
-        type: "static",
+        type: nextOwner === "partner" ? "dynamic" : "static",
         deviceIds: [],
         filterConditions: EMPTY_FILTER,
       });
@@ -508,7 +566,24 @@ export default function DeviceGroupsPage() {
     setModalMode("delete");
   };
 
+  // `#create` deep link (#9865): the Devices page "Add filter → New group…"
+  // shortcut lands here so groups have one create path. Adopted post-mount so
+  // the first client render still matches the SSR markup (#2421).
+  useEffect(() => {
+    if (window.location.hash === `#${CREATE_HASH}`) handleOpenCreate();
+    // Mount-only: the hash is an entry point, not live state.
+  }, []);
+
   const handleCloseModal = () => {
+    // Drop the deep-link hash so a reload doesn't reopen the dialog. Replace,
+    // not assign, so Back doesn't step through a bare `#` entry.
+    if (window.location.hash === `#${CREATE_HASH}`) {
+      window.history.replaceState(
+        window.history.state,
+        "",
+        window.location.pathname + window.location.search,
+      );
+    }
     setModalMode("closed");
     setSelectedGroup(null);
     setFormError(undefined);
@@ -588,8 +663,12 @@ export default function DeviceGroupsPage() {
       return;
     }
     // A new group must land in one org; edits keep the group's existing owner.
-    if (modalMode === "create" && fleet.needsOrgSelection) {
+    if (modalMode === "create" && !isPartnerForm && fleet.needsOrgSelection) {
       setFormError(t("common:layout.orgRequired.title"));
+      return;
+    }
+    if (isPartnerForm && partnerGroupFilterHasRefusedField(groupForm.filterConditions)) {
+      setFormError(t("errors:PARTNER_GROUP_FILTER_UNSUPPORTED"));
       return;
     }
     if (groupForm.type === "dynamic") {
@@ -617,16 +696,17 @@ export default function DeviceGroupsPage() {
       // `filterConditions` (routes/groups.ts, services/groupMembership.ts);
       // `rules` is inert storage kept for pre-FilterBuilder rows.
       const isEdit = modalMode === "edit" && Boolean(selectedGroup);
-      const isDynamic = groupForm.type === "dynamic";
+      const isDynamic = isPartnerForm || groupForm.type === "dynamic";
 
       const payload: Record<string, unknown> = {
         name: trimmedName,
-        type: groupForm.type,
+        type: isPartnerForm ? "dynamic" : groupForm.type,
       };
 
       // A create carries the concrete owner org in the body (the focused org, or
       // the fleet picker's choice); edits never move a group between orgs.
-      if (!isEdit && fleet.bodyOrgId) {
+      if (!isEdit && isPartnerForm) payload.ownerScope = "partner";
+      if (!isEdit && !isPartnerForm && fleet.bodyOrgId) {
         payload.orgId = fleet.bodyOrgId;
       }
 
@@ -668,7 +748,7 @@ export default function DeviceGroupsPage() {
           error?: string;
         } | null;
         throw new Error(
-          body?.error ?? t("deviceGroupsPage.failedToSaveDeviceGroup"),
+          groupApiErrorMessage(body, t("deviceGroupsPage.failedToSaveDeviceGroup")),
         );
       }
 
@@ -725,14 +805,15 @@ export default function DeviceGroupsPage() {
         {
           method: "DELETE",
           body: JSON.stringify({
-            reassignGroupId: deleteReassignGroupId || null,
+            reassignGroupId: selectedGroup.ownerScope === "partner" ? null : deleteReassignGroupId || null,
           }),
         },
       );
 
       if (!response.ok) {
+        const errorBody = await response.json().catch(() => null);
         if (response.status === 409) {
-          const body = await response.json().catch(() => null) as
+          const body = errorBody as
             {
               contractCount?: number;
               contracts?: Array<{ name: string }>;
@@ -754,7 +835,7 @@ export default function DeviceGroupsPage() {
           }
           if (parts.length > 0) throw new Error(parts.join(" "));
         }
-        throw new Error(t("deviceGroupsPage.failedToDeleteGroup"));
+        throw new Error(groupApiErrorMessage(errorBody, t("deviceGroupsPage.failedToDeleteGroup")));
       }
 
       await fetchGroups();
@@ -770,28 +851,118 @@ export default function DeviceGroupsPage() {
     }
   };
 
+  /**
+   * Run one script across every device in the selected groups (#3429).
+   *
+   * There is deliberately no `/device-groups/bulk` endpoint: this composes the
+   * two canonical, access-checked routes instead of adding a second script
+   * execution entrypoint to keep in sync.
+   *
+   *  1. `GET /device-groups/:id/devices` per group — authorizes each group
+   *     against the caller's org access and site restrictions, and returns only
+   *     members the caller may see.
+   *  2. ONE `POST /scripts/:id/execute` with the de-duplicated device set — the
+   *     server re-authorizes every device (org, site, script-org match, OS) and
+   *     batches per device org, so a selection spanning orgs fans out under
+   *     each device's own org and a device in two groups runs once.
+   *
+   * If any group's membership cannot be read, nothing runs: executing on the
+   * readable subset would silently skip a group the user explicitly chose.
+   */
   const handleBulkScript = async () => {
     if (!bulkScriptId || selectedGroupIds.size === 0) return;
     setSubmitting(true);
+    setFormError(undefined);
+    const script = scripts.find((candidate) => candidate.id === bulkScriptId);
     try {
-      const response = await fetchWithAuth("/device-groups/bulk", {
-        method: "POST",
-        body: JSON.stringify({
-          action: "run-script",
-          scriptId: bulkScriptId,
-          groupIds: Array.from(selectedGroupIds),
+      const memberLists = await Promise.all(
+        Array.from(selectedGroupIds).map(async (groupId) => {
+          const res = await fetchWithAuth(`/device-groups/${groupId}/devices`);
+          const body = await res.json().catch(() => ({}));
+          // A 200 whose body is not the `{ data: [...] }` envelope is a
+          // failure, not an empty group: `asList` would fail closed to `[]`
+          // and the user would be told their groups have no devices.
+          if (!res.ok || !Array.isArray(body?.data)) {
+            const groupName = groups.find((group) => group.id === groupId)?.name ?? groupId;
+            const detail = typeof body?.error === "string" ? `: ${body.error}` : "";
+            throw new Error(
+              `${t("deviceGroupsPage.bulkScriptMembershipFailed", { group: groupName })}${detail}`,
+            );
+          }
+          return (body.data as Array<{ deviceId?: unknown }>)
+            .map((member) => member?.deviceId)
+            .filter((id): id is string => typeof id === "string");
         }),
-      });
+      );
 
-      if (!response.ok) {
-        throw new Error("Failed to run script on groups");
+      const deviceIds = Array.from(new Set(memberLists.flat()));
+      if (deviceIds.length === 0) {
+        setFormError(t("deviceGroupsPage.bulkScriptNoDevices"));
+        return;
+      }
+      if (deviceIds.length > MAX_SCRIPT_TARGETS) {
+        setFormError(
+          t("deviceGroupsPage.bulkScriptTooManyDevices", {
+            count: deviceIds.length,
+            max: MAX_SCRIPT_TARGETS,
+          }),
+        );
+        return;
       }
 
-      await fetchGroups();
+      const result = await runAction<ScriptAdmissionResult>({
+        request: () =>
+          fetchWithAuth(`/scripts/${bulkScriptId}/execute`, {
+            method: "POST",
+            body: JSON.stringify({ deviceIds }),
+          }),
+        errorFallback: t("deviceGroupsPage.failedToRunScriptOnGroups"),
+        friendly: (code) =>
+          code === "MFA_REQUIRED" ? t("devicesPage.toasts.mfaRequired") : undefined,
+      });
+
+      const targets = Array.isArray(result?.targets) ? result.targets : [];
+      const admitted = targets.filter((target) => target.admission === "admitted");
+      const refused = targets.filter((target) => target.admission !== "admitted");
+      const reasons = Array.from(
+        new Set(refused.map((target) => target.reasonCode ?? target.admission)),
+      ).join(", ");
+
+      if (admitted.length === 0) {
+        setFormError(
+          refused.length > 0
+            ? t("deviceGroupsPage.bulkScriptNoneQueued", { reasons })
+            : t("deviceGroupsPage.failedToRunScriptOnGroups"),
+        );
+        return;
+      }
+      if (refused.length > 0) {
+        showToast({
+          type: "warning",
+          message: t("deviceGroupsPage.bulkScriptPartiallyQueued", {
+            admitted: admitted.length,
+            total: targets.length,
+            refused: refused.length,
+            reasons,
+          }),
+        });
+      } else {
+        showToast({
+          type: "success",
+          message: t("deviceGroupsPage.bulkScriptQueued", {
+            script: script?.name ?? "",
+            count: admitted.length,
+          }),
+        });
+      }
+
       setSelectedGroupIds(new Set());
       handleCloseModal();
     } catch (err) {
-      setError(
+      // runAction already toasted any HTTP failure (and a 401 goes to the
+      // auth redirect); only membership/network errors still need showing.
+      if (err instanceof ActionError) return;
+      setFormError(
         err instanceof Error
           ? err.message
           : t("deviceGroupsPage.failedToRunScriptOnGroups"),
@@ -817,7 +988,7 @@ export default function DeviceGroupsPage() {
           });
           if (!res.ok) {
             const errData = await res.json().catch(() => ({}));
-            throw new Error(errData?.error || `Failed for group ${groupId}`);
+            throw new Error(groupApiErrorMessage(errData, t("deviceGroupsPage.failedToApplyPolicyToGroups")));
           }
           return groupId;
         }),
@@ -929,12 +1100,12 @@ export default function DeviceGroupsPage() {
       setSelectedGroupIds(new Set());
       return;
     }
-    setSelectedGroupIds(new Set(groups.map((group) => group.id)));
+    setSelectedGroupIds(new Set(visibleGroups.map((group) => group.id)));
   };
 
   const allSelected =
-    groups.length > 0 &&
-    groups.every((group) => selectedGroupIds.has(group.id));
+    visibleGroups.length > 0 &&
+    visibleGroups.every((group) => selectedGroupIds.has(group.id));
 
   if (loading) {
     return (
@@ -991,6 +1162,18 @@ export default function DeviceGroupsPage() {
         </div>
       )}
 
+      {(canCreatePartnerGroup || ownerFilter !== "all" || groups.some((group) => group.ownerScope === "partner")) && (
+        <div data-testid="group-owner-filter" className="flex flex-wrap gap-1" role="group" aria-label={t("partnerGroups.ownerScope")}>
+          {(["all", "organization", "partner"] as const).map((owner) => (
+            <button key={owner} type="button" data-testid={`group-owner-filter-${owner}`} aria-pressed={ownerFilter === owner}
+              onClick={() => changeOwnerFilter(owner)}
+              className={`rounded-md border px-3 py-2 text-sm ${ownerFilter === owner ? "bg-primary/10 text-primary border-primary" : "hover:bg-muted"}`}>
+              {owner === "all" ? t("deviceGroupsPage.ownerFilterAll") : owner === "organization" ? t("deviceGroupsPage.ownerFilterOrganization") : t("deviceGroupsPage.ownerFilterPartner")}
+            </button>
+          ))}
+        </div>
+      )}
+
       {selectedGroupIds.size > 0 && (
         <div className="flex flex-col gap-3 rounded-md border bg-muted/40 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
           <div className="text-sm font-medium">
@@ -1026,7 +1209,9 @@ export default function DeviceGroupsPage() {
         </div>
       )}
 
-      {groups.length === 0 ? (
+      {groups.length > 0 && visibleGroups.length === 0 ? (
+        <p className="rounded-lg border p-6 text-center text-sm text-muted-foreground">{t("deviceGroupsPage.noGroupsMatchFilter")}</p>
+      ) : groups.length === 0 ? (
         <div className="rounded-lg border bg-card p-6 text-center">
           <p className="text-sm text-muted-foreground">
             {t("deviceGroupsPage.noDeviceGroupsYetCreateOne")}{" "}
@@ -1041,7 +1226,7 @@ export default function DeviceGroupsPage() {
         </div>
       ) : (
         <div className="rounded-lg border bg-card p-6 shadow-xs space-y-4">
-          <div className="flex items-center gap-3 text-sm font-medium text-muted-foreground">
+          <label className="flex items-center gap-3 text-sm font-medium text-muted-foreground">
             <input
               type="checkbox"
               checked={allSelected}
@@ -1049,9 +1234,11 @@ export default function DeviceGroupsPage() {
               className="h-4 w-4 rounded border-muted text-primary focus:ring-primary"
             />
             {t("deviceGroupsPage.selectAllGroups")}{" "}
-          </div>
+          </label>
           <div className="space-y-4">
-            {groups.map((group) => {
+            {visibleGroups.map((group) => {
+              const isPartner = group.ownerScope === "partner";
+              const isRedacted = isPartner && group.filterConditions == null && group.evaluation == null;
               const deviceIds = getGroupDeviceIds(group);
               const groupDevices = deviceIds
                 .map((id) => deviceById.get(id))
@@ -1061,7 +1248,11 @@ export default function DeviceGroupsPage() {
               // are only shown for rows that have no filter — otherwise a
               // stale stub would misreport the group's membership.
               const membershipChips = group.filterConditions
-                ? describeFilterConditions(group.filterConditions)
+                ? describeFilterConditions(group.filterConditions, filterFields, {
+                    orgs: fleet.organizations,
+                    sites: siteOptions,
+                    groups,
+                  })
                 : (group.rules ?? []).map((rule) =>
                     buildRuleLabel(rule, siteNameById),
                   );
@@ -1071,12 +1262,16 @@ export default function DeviceGroupsPage() {
               return (
                 <div
                   key={group.id}
+                  data-testid={`device-group-${group.id}`}
                   className="rounded-lg border bg-background p-4"
                 >
                   <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
                     <div className="flex gap-3">
                       <input
                         type="checkbox"
+                        aria-label={t("deviceGroupsPage.selectGroup", {
+                          name: group.name,
+                        })}
                         checked={isSelected}
                         onChange={(event) =>
                           toggleGroupSelection(group.id, event.target.checked)
@@ -1093,19 +1288,21 @@ export default function DeviceGroupsPage() {
                               ? t("deviceGroupsPage.dynamic")
                               : t("deviceGroupsPage.static")}
                           </span>
+                          {isPartner && <AllOrgsBadge groupId={group.id} />}
                         </div>
                         <div className="mt-3 flex flex-wrap gap-2 text-xs text-muted-foreground">
                           <span className="rounded-full border bg-muted px-2 py-0.5">
                             {deviceCount} {t("deviceGroupsPage.device")}
                             {deviceCount === 1 ? "" : t("deviceGroupsPage.s")}
                           </span>
-                          <span className="rounded-full border bg-muted px-2 py-0.5">
+                          {!isRedacted && <span className="rounded-full border bg-muted px-2 py-0.5">
                             Group assignment: {group.policy?.name || "None"}
-                          </span>
+                          </span>}
                         </div>
+                        {isPartner && group.evaluation && <PartnerGroupEvaluationStatus groupId={group.id} evaluation={group.evaluation} />}
                       </div>
                     </div>
-                    <div className="flex items-center gap-2">
+                    <div className="flex flex-wrap items-center gap-2">
                       {/* One-click jump into the device list with this group
                           applied as a chip (the list resolves the id server-side). */}
                       <a
@@ -1119,6 +1316,7 @@ export default function DeviceGroupsPage() {
                         <ListFilter className="h-4 w-4" />
                         {t("deviceGroupsPage.viewDevices")}
                       </a>
+                      {(!isPartner || canWritePartnerGroups) && <>
                       <button
                         type="button"
                         onClick={() => handleOpenEdit(group)}
@@ -1135,10 +1333,13 @@ export default function DeviceGroupsPage() {
                         <Trash2 className="h-4 w-4" />
                         {t("deviceGroupsPage.delete")}{" "}
                       </button>
+                      </>}
                     </div>
                   </div>
 
-                  {group.type === "dynamic" ? (
+                  {isRedacted ? (
+                    <p data-testid={`group-managed-by-partner-${group.id}`} className="mt-4 text-sm text-muted-foreground">{t("deviceGroupsPage.managedByPartner")}</p>
+                  ) : group.type === "dynamic" ? (
                     <div className="mt-4 rounded-md border bg-muted/20 p-4">
                       <div className="flex items-center justify-between">
                         <p className="text-sm font-medium">
@@ -1229,6 +1430,7 @@ export default function DeviceGroupsPage() {
                       </div>
                     </div>
                   )}
+                  {isPartner && <PartnerGroupMembers groupId={group.id} />}
                 </div>
               );
             })}
@@ -1264,7 +1466,13 @@ export default function DeviceGroupsPage() {
             </div>
 
             <form className="mt-6 space-y-6" onSubmit={handleSubmitGroup}>
-              {modalMode === "create" && fleet.isFleetScope && (
+              {modalMode === "create" && canCreatePartnerGroup && (
+                <GroupOwnerScopeField value={ownerScope} onChange={(scope) => {
+                  setOwnerScope(scope);
+                  if (scope === "partner") setGroupForm((prev) => ({ ...prev, type: "dynamic" }));
+                }} disabled={submitting} />
+              )}
+              {modalMode === "create" && !isPartnerForm && fleet.isFleetScope && (
                 <div>
                   <label className="text-sm font-medium">
                     {t("common:labels.organization")}
@@ -1305,7 +1513,9 @@ export default function DeviceGroupsPage() {
                 </div>
               </div>
 
-              <div>
+              {isPartnerForm ? (
+                <p className="text-sm text-muted-foreground">{t("deviceGroupsPage.partnerDynamicType")}</p>
+              ) : <div>
                 <label className="text-sm font-medium">
                   {t("deviceGroupsPage.groupType")}
                 </label>
@@ -1347,7 +1557,7 @@ export default function DeviceGroupsPage() {
                     {t("deviceGroupsPage.dynamic")}{" "}
                   </button>
                 </div>
-              </div>
+              </div>}
 
               {groupForm.type === "dynamic" ? (
                 <div className="rounded-md border bg-muted/20 p-4 space-y-4">
@@ -1369,7 +1579,7 @@ export default function DeviceGroupsPage() {
                         filterConditions: conditions,
                       }))
                     }
-                    filterFields={DEFAULT_FILTER_FIELDS}
+                    filterFields={isPartnerForm ? partnerGroupFilterFields(filterFields) : filterFields}
                     showPreview={false}
                   />
                   <FilterPreview
@@ -1497,7 +1707,7 @@ export default function DeviceGroupsPage() {
                   disabled={
                     submitting ||
                     membershipUnavailable ||
-                    (modalMode === "create" && fleet.needsOrgSelection)
+                    (modalMode === "create" && !isPartnerForm && fleet.needsOrgSelection)
                   }
                   className="inline-flex h-10 items-center justify-center rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
                 >
@@ -1532,7 +1742,9 @@ export default function DeviceGroupsPage() {
                 : t("deviceGroupsPage.s")}{" "}
               {t("deviceGroupsPage.fromTheGroup")}{" "}
             </p>
-            <div className="mt-4">
+            {selectedGroup.ownerScope === "partner" ? (
+              <p className="mt-4 text-sm text-muted-foreground">{t("deviceGroupsPage.partnerDeleteWarning")}</p>
+            ) : <div className="mt-4">
               <label className="text-sm font-medium">
                 {t("deviceGroupsPage.reassignDevicesOptional")}
               </label>
@@ -1557,7 +1769,7 @@ export default function DeviceGroupsPage() {
                     </option>
                   ))}
               </select>
-            </div>
+            </div>}
             {formError && (
               <div role="alert" className="mt-4 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
                 {formError}
@@ -1614,6 +1826,11 @@ export default function DeviceGroupsPage() {
                 ))}
               </select>
             </div>
+            {formError && (
+              <div role="alert" className="mt-4 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+                {formError}
+              </div>
+            )}
             <div className="mt-6 flex justify-end gap-3">
               <button
                 type="button"

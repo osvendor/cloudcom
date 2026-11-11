@@ -12,7 +12,6 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const selectMock = vi.fn();
 const insertMock = vi.fn();
 const updateMock = vi.fn();
-const resolveLlmConfigForOrgMock = vi.fn();
 
 vi.mock('../db', () => ({
   db: {
@@ -44,15 +43,25 @@ vi.mock('../db/schema', () => ({
 }));
 
 vi.mock('./aiAgentSystemPrompt', () => ({ AI_SYSTEM_PROMPT_BASE: 'base', AI_SYSTEM_PROMPT_TAIL: 'tail' }));
-vi.mock('./aiToolIndex', () => ({ composeStaticSystemPrompt: () => 'base\nindex\ntail' }));
+vi.mock('./aiToolIndex', () => ({ composeStaticSystemPrompt: () => 'base\nindex\ntail', renderPageContextToolBlocks: () => '', resolveToolIndexMode: () => 'lazy' }));
 vi.mock('./aiAgentSdkTools', () => ({ listChatSurfaceToolNames: () => [] }));
 vi.mock('./brainDeviceContext', () => ({ getActiveDeviceContext: vi.fn().mockResolvedValue([]) }));
 vi.mock('./llm/llmConfigResolver', () => ({
   LlmUnavailableError: class LlmUnavailableError extends Error {},
-  resolveLlmConfigForOrg: (...args: unknown[]) => resolveLlmConfigForOrgMock(...args),
+}));
+
+// W03 Task 9 (#7601): createSession picks its model through the registry.
+vi.mock('./aiModels/candidateLoader', () => ({ readOrgPartnerId: vi.fn(async () => 'partner-1') }));
+vi.mock('./aiModels/sessionModel', () => ({
+  chooseSessionModel: vi.fn(async () => ({
+    offeringId: 'off-1', offeringPartnerId: 'partner-1', options: null,
+    model: 'claude-sonnet-4-6', billingSource: 'platform',
+  })),
 }));
 
 import { createSession } from './aiAgent';
+import { chooseSessionModel } from './aiModels/sessionModel';
+import { readOrgPartnerId } from './aiModels/candidateLoader';
 
 const ORG_A = 'aaaaaaaa-1111-4222-8333-444455556666';
 const ORG_B = 'bbbbbbbb-1111-4222-8333-444455556666';
@@ -103,11 +112,6 @@ function expectInsert() {
 describe('createSession page-context org anchoring (#5593)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    resolveLlmConfigForOrgMock.mockResolvedValue({
-      source: 'platform',
-      apiKey: 'platform-key',
-      model: 'claude-sonnet-4-6',
-    });
   });
 
   it('anchors a partner-scoped session to the page-context device org, not accessibleOrgIds[0]', async () => {
@@ -121,7 +125,8 @@ describe('createSession page-context org anchoring (#5593)', () => {
 
     expect(valuesSpy).toHaveBeenCalledWith(expect.objectContaining({ orgId: ORG_B }));
     expect(result.orgId).toBe(ORG_B);
-    expect(resolveLlmConfigForOrgMock).toHaveBeenCalledWith(ORG_B);
+    expect(vi.mocked(readOrgPartnerId)).toHaveBeenCalledWith(ORG_B);
+    expect(vi.mocked(chooseSessionModel)).toHaveBeenCalledWith(expect.objectContaining({ orgId: ORG_B, surface: 'chat' }));
   });
 
   it('falls back to accessibleOrgIds[0] when the page-context device is outside the caller org axis', async () => {
@@ -207,10 +212,109 @@ describe('createSession page-context org anchoring (#5593)', () => {
     const valuesSpy = expectInsert();
 
     await createSession(partnerAuth(), {
-      pageContext: { type: 'dashboard', orgName: 'Mountain Capital' },
+      pageContext: { type: 'dashboard', orgName: 'Summit Peak' },
     });
 
     expect(selectMock).not.toHaveBeenCalled();
+    expect(valuesSpy).toHaveBeenCalledWith(expect.objectContaining({ orgId: ORG_A }));
+  });
+});
+
+describe('createSession records the page-context org anchor server-side (#6675)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function snapshotOf(valuesSpy: ReturnType<typeof vi.fn>) {
+    return (valuesSpy.mock.calls[0]![0] as { contextSnapshot: Record<string, unknown> | null }).contextSnapshot;
+  }
+
+  it('marks the snapshot when the session org came from the page device', async () => {
+    selectMock.mockReturnValue(devSelect([{ orgId: ORG_B, siteId: null }]));
+    const valuesSpy = expectInsert();
+
+    await createSession(partnerAuth(), { pageContext: devicePageContext });
+
+    expect(snapshotOf(valuesSpy)).toEqual({ ...devicePageContext, orgAnchor: 'page_context' });
+  });
+
+  it('does not mark the snapshot when the page device is not reachable (no default)', async () => {
+    selectMock.mockReturnValue(devSelect([{ orgId: 'cccccccc-1111-4222-8333-444455556666', siteId: null }]));
+    const valuesSpy = expectInsert();
+
+    await createSession(partnerAuth(), { pageContext: devicePageContext });
+
+    expect(snapshotOf(valuesSpy)).toEqual(devicePageContext);
+  });
+
+  it('does not mark the snapshot when an explicit orgId chose the org', async () => {
+    selectMock.mockReturnValue(devSelect([{ orgId: ORG_B, siteId: null }]));
+    const valuesSpy = expectInsert();
+
+    await createSession(partnerAuth(), { orgId: ORG_B, pageContext: devicePageContext });
+
+    expect(snapshotOf(valuesSpy)).toEqual(devicePageContext);
+  });
+
+  it('never trusts an anchor sent by the client', async () => {
+    selectMock.mockReturnValue(devSelect([{ orgId: 'cccccccc-1111-4222-8333-444455556666', siteId: null }]));
+    const valuesSpy = expectInsert();
+
+    await createSession(partnerAuth(), {
+      pageContext: { ...devicePageContext, orgAnchor: 'page_context' } as never,
+    });
+
+    expect(snapshotOf(valuesSpy)).toEqual(devicePageContext);
+  });
+});
+
+// #9529: the sidebar opened from a page with no device/topology context now
+// sends the header's selected org as `orgId`. The server must bind the session
+// to it (not `accessibleOrgIds[0]`), re-check access, and NOT record it as a
+// #6675 write anchor: it is an explicit choice, like any other `orgId`.
+describe('createSession binds to the header-selected org (#9529)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function snapshotOf(valuesSpy: ReturnType<typeof vi.fn>) {
+    return (valuesSpy.mock.calls[0]![0] as { contextSnapshot: Record<string, unknown> | null }).contextSnapshot;
+  }
+
+  it('binds a partner session with no page context to the selected org, not accessibleOrgIds[0]', async () => {
+    const valuesSpy = expectInsert();
+
+    const result = await createSession(partnerAuth(), { orgId: ORG_B });
+
+    expect(result.orgId).toBe(ORG_B);
+    expect(valuesSpy).toHaveBeenCalledWith(expect.objectContaining({ orgId: ORG_B, contextSnapshot: null }));
+    expect(vi.mocked(readOrgPartnerId)).toHaveBeenCalledWith(ORG_B);
+    expect(vi.mocked(chooseSessionModel)).toHaveBeenCalledWith(expect.objectContaining({ orgId: ORG_B }));
+    expect(selectMock).not.toHaveBeenCalled();
+  });
+
+  it('binds a non-device page (dashboard) to the selected org without recording a page anchor', async () => {
+    const valuesSpy = expectInsert();
+    const dashboard = { type: 'dashboard' as const, orgName: 'Org B' };
+
+    await createSession(partnerAuth(), { orgId: ORG_B, pageContext: dashboard });
+
+    expect(valuesSpy).toHaveBeenCalledWith(expect.objectContaining({ orgId: ORG_B }));
+    expect(snapshotOf(valuesSpy)).toEqual(dashboard);
+  });
+
+  it('refuses a selected org the caller cannot reach instead of falling back to another org', async () => {
+    await expect(
+      createSession(partnerAuth(), { orgId: 'cccccccc-1111-4222-8333-444455556666' }),
+    ).rejects.toThrow('Access denied to this organization');
+    expect(insertMock).not.toHaveBeenCalled();
+  });
+
+  it('still falls back to accessibleOrgIds[0] when no org is selected (All organizations, mobile)', async () => {
+    const valuesSpy = expectInsert();
+
+    await createSession(partnerAuth(), {});
+
     expect(valuesSpy).toHaveBeenCalledWith(expect.objectContaining({ orgId: ORG_A }));
   });
 });

@@ -1,6 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { Hono } from 'hono';
 import { tunnelRoutes, vncExchangeRoutes, vncViewerRoutes } from './tunnels';
+import { __resetTunnelOriginConfigForTests } from '../config/tunnelOrigin';
+import { isTunnelOriginEnabledForOrg } from '../services/tunnelOriginOptIn';
 
 // --- UUID constants ---
 const DEVICE_ID = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
@@ -16,6 +18,16 @@ const { rateLimiterMock } = vi.hoisted(() => ({
     remaining: 19,
     resetAt: new Date(Date.now() + 60_000),
   })),
+}));
+
+const { cancelPendingMock } = vi.hoisted(() => ({ cancelPendingMock: vi.fn(() => 0) }));
+vi.mock('../services/tunnelOriginOptIn', () => ({
+  isTunnelOriginEnabledForOrg: vi.fn(async () => true),
+}));
+
+vi.mock('../services/agentCommandAwait', () => ({
+  sendCommandToAgentAwaitResult: vi.fn(),
+  cancelPendingAgentCommandsByPrefix: cancelPendingMock,
 }));
 
 const { authorizeContinuationMock } = vi.hoisted(() => ({
@@ -150,9 +162,23 @@ vi.mock('./agentWs', () => ({
 }));
 
 // --- Remote access policy ---
+const { resolveDesktopSessionPolicyMock } = vi.hoisted(() => ({
+  resolveDesktopSessionPolicyMock: vi.fn(async (_deviceId: string): Promise<any> => ({
+    clipboard: { hostToViewer: true, viewerToHost: true },
+    idleTimeoutMinutes: 30,
+    maxSessionDurationHours: 8,
+  })),
+}));
 vi.mock('../services/remoteAccessPolicy', () => ({
   checkRemoteAccess: vi.fn(async () => ({ allowed: true })),
+  resolveDesktopSessionPolicy: resolveDesktopSessionPolicyMock,
 }));
+
+// --- VNC consent gate (default: the device's prompt policy allows VNC) ---
+const { checkVncConsentGate } = vi.hoisted(() => ({
+  checkVncConsentGate: vi.fn(async (): Promise<unknown> => ({ ok: true })),
+}));
+vi.mock('./remote/vncConsentGate', () => ({ checkVncConsentGate }));
 
 // --- Remote session auth ---
 vi.mock('../services/remoteSessionAuth', () => ({
@@ -172,9 +198,10 @@ vi.mock('../services/jwt', () => ({
 }));
 
 // --- Redis (used by requireViewerToken session-revoke check) ---
+const { redisSetMock } = vi.hoisted(() => ({ redisSetMock: vi.fn(async () => 'OK') }));
 vi.mock('../services/redis', () => ({
   getRedis: vi.fn(() => ({
-    set: vi.fn(async () => 'OK'),
+    set: redisSetMock,
     get: vi.fn(async () => null),
   })),
 }));
@@ -213,8 +240,9 @@ vi.mock('../services/viewerTokenRevocation', () => ({
   revokeViewerSession: vi.fn(async () => undefined),
 }));
 
-import { db } from '../db';
+import { db, withSystemDbAccessContext } from '../db';
 import { sendCommandToAgent } from './agentWs';
+import { checkRemoteAccess } from '../services/remoteAccessPolicy';
 import { createWsTicket, createVncConnectCode, consumeVncConnectCode } from '../services/remoteSessionAuth';
 import {
   createViewerAccessToken,
@@ -392,6 +420,26 @@ describe('POST /tunnels (VNC)', () => {
     expect(body).toHaveProperty('id', SESSION_ID);
     expect(body).toHaveProperty('type', 'vnc');
     expect(body).toHaveProperty('status', 'pending');
+  });
+
+  it('refuses a device parked in a holding org with 403 before inserting or sending anything', async () => {
+    vi.mocked(checkRemoteAccess).mockResolvedValueOnce({
+      allowed: false,
+      code: 'DEVICE_PENDING_ASSIGNMENT',
+      reason: 'This device is waiting to be assigned to an organization; remote access is unavailable until then',
+    } as any);
+    const res = await app.request('/tunnels', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ deviceId: DEVICE_ID, type: 'vnc' }),
+    });
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual(expect.objectContaining({
+      error: expect.stringMatching(/waiting to be assigned/),
+      code: 'DEVICE_PENDING_ASSIGNMENT',
+    }));
+    expect(db.insert).not.toHaveBeenCalled();
+    expect(sendCommandToAgent).not.toHaveBeenCalled();
   });
 
   it('maps partner-trust denial to a 403 without inserting a tunnel session', async () => {
@@ -749,6 +797,26 @@ describe('POST /tunnels/proxy-connect', () => {
     expect(body).toHaveProperty('tunnel');
     expect(body.tunnel).toMatchObject({ type: 'proxy', targetHost: '10.0.5.20', targetPort: 8080 });
     expect(body).not.toHaveProperty('ticket');
+  });
+
+  it('refuses a device parked in a holding org with 403 before resolving the asset or creating anything', async () => {
+    vi.mocked(checkRemoteAccess).mockResolvedValueOnce({
+      allowed: false,
+      code: 'DEVICE_PENDING_ASSIGNMENT',
+      reason: 'This device is waiting to be assigned to an organization; remote access is unavailable until then',
+    } as any);
+    vi.mocked(db.select).mockReturnValueOnce(makeSelectChain([onlineDevice]) as any);
+    const res = await app.request('/tunnels/proxy-connect', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(requestBody),
+    });
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual(expect.objectContaining({ code: 'DEVICE_PENDING_ASSIGNMENT' }));
+    expect(checkRemoteAccess).toHaveBeenCalledWith(DEVICE_ID, 'proxy');
+    expect(db.select).toHaveBeenCalledTimes(1);
+    expect(db.insert).not.toHaveBeenCalled();
+    expect(sendCommandToAgent).not.toHaveBeenCalled();
   });
 
   it('maps partner-trust denial to a 403 without creating a tunnel session (allowlist rule still created)', async () => {
@@ -1211,6 +1279,109 @@ describe('GET /tunnels/:id — site-scope enforcement', () => {
     expect(res.status).toBe(200);
     expect((await res.json()).id).toBe(SESSION_ID);
     expect(db.select).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ─── DELETE /tunnels/:id — permission, MFA and site-scope gates ───────────────
+// Closing a tunnel tears down a live remote session, so it needs the same
+// remote-access grants as opening one, and site-restricted callers may only
+// close tunnels to devices in their allowed sites.
+describe('DELETE /tunnels/:id — permission gates', () => {
+  let app: Hono;
+  const SITE_A = 'a0a0a0a0-a0a0-4a0a-8a0a-a0a0a0a0a0a0';
+  const SITE_B = 'b0b0b0b0-b0b0-4b0b-8b0b-b0b0b0b0b0b0';
+  const activeSession = { ...sessionRecord, status: 'active', userId: 'other-tech-1' };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(db.select).mockReset();
+    vi.mocked(db.update).mockReset();
+    vi.mocked(db.insert).mockReset();
+    vi.mocked(db.insert).mockImplementation(vi.fn().mockReturnValue(makeAuditAwareInsertChain([])) as any);
+    vi.mocked(db.update).mockReturnValue({
+      set: vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue(undefined) }),
+    } as any);
+    app = new Hono();
+    app.route('/tunnels', tunnelRoutes);
+  });
+
+  function expectSessionUntouched() {
+    expect(db.select).not.toHaveBeenCalled();
+    expect(db.update).not.toHaveBeenCalled();
+    expect(sendCommandToAgent).not.toHaveBeenCalled();
+  }
+
+  it('returns 403 and leaves the session open when the caller lacks remote access', async () => {
+    const res = await app.request(`/tunnels/${SESSION_ID}`, {
+      method: 'DELETE',
+      headers: { 'x-test-scope': 'partner', 'x-test-accessible-orgs': ORG_ID, 'x-deny-permission': 'remote:access' },
+    });
+
+    expect(res.status).toBe(403);
+    expectSessionUntouched();
+  });
+
+  it('returns 403 and leaves the session open when the caller lacks devices:execute', async () => {
+    const res = await app.request(`/tunnels/${SESSION_ID}`, {
+      method: 'DELETE',
+      headers: { 'x-deny-permission': 'devices:execute' },
+    });
+
+    expect(res.status).toBe(403);
+    expectSessionUntouched();
+  });
+
+  it('returns 403 and leaves the session open when MFA is not satisfied', async () => {
+    const res = await app.request(`/tunnels/${SESSION_ID}`, {
+      method: 'DELETE',
+      headers: { 'x-test-mfa': 'false' },
+    });
+
+    expect(res.status).toBe(403);
+    expectSessionUntouched();
+  });
+
+  it('returns 403 and leaves the session open when a site-restricted caller targets an out-of-site device', async () => {
+    vi.mocked(db.select)
+      .mockReturnValueOnce(makeSelectChain([activeSession]) as any) // session lookup
+      .mockReturnValueOnce(makeSelectChain([{ siteId: SITE_B }]) as any); // device site
+
+    const res = await app.request(`/tunnels/${SESSION_ID}`, {
+      method: 'DELETE',
+      headers: { 'x-test-scope': 'partner', 'x-test-accessible-orgs': ORG_ID, 'x-restrict-site': SITE_A },
+    });
+
+    expect(res.status).toBe(403);
+    expect(db.update).not.toHaveBeenCalled();
+    expect(sendCommandToAgent).not.toHaveBeenCalled();
+  });
+
+  it('closes the session for a permitted caller', async () => {
+    vi.mocked(db.select)
+      .mockReturnValueOnce(makeSelectChain([{ ...sessionRecord, status: 'active' }]) as any) // session lookup
+      .mockReturnValueOnce(makeSelectChain([onlineDevice]) as any); // device lookup
+
+    const res = await app.request(`/tunnels/${SESSION_ID}`, { method: 'DELETE' });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ closed: true });
+    expect(db.update).toHaveBeenCalledTimes(1);
+    expect(sendCommandToAgent).toHaveBeenCalledWith('agent-abc', expect.objectContaining({ type: 'tunnel_close' }));
+  });
+
+  it('closes an in-site session for a site-restricted caller', async () => {
+    vi.mocked(db.select)
+      .mockReturnValueOnce(makeSelectChain([activeSession]) as any) // session lookup
+      .mockReturnValueOnce(makeSelectChain([{ siteId: SITE_A }]) as any) // device site
+      .mockReturnValueOnce(makeSelectChain([onlineDevice]) as any); // device lookup
+
+    const res = await app.request(`/tunnels/${SESSION_ID}`, {
+      method: 'DELETE',
+      headers: { 'x-test-scope': 'partner', 'x-test-accessible-orgs': ORG_ID, 'x-restrict-site': SITE_A },
+    });
+
+    expect(res.status).toBe(200);
+    expect(db.update).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -1814,6 +1985,46 @@ describe('POST /vnc-viewer/upgrade-to-webrtc', () => {
     expect(createWsTicket).not.toHaveBeenCalled();
   });
 
+  it('passes the parked-device code through and creates no desktop session', async () => {
+    vi.mocked(verifyViewerAccessToken).mockResolvedValueOnce({
+      sub: USER_ID,
+      email: 'test@example.com',
+      sessionId: SESSION_ID,
+      purpose: 'viewer',
+      jti: 'viewer-jti-parked',
+      iat: 1_000,
+      exp: 2_000,
+      mfaSatisfied: true,
+      assuranceAbsoluteExpiresAt: 2_000,
+    });
+    vi.mocked(db.select).mockReturnValueOnce(makeJoinedSelectChain([{
+      tunnelUserId: USER_ID,
+      tunnelOrgId: ORG_ID,
+      deviceId: DEVICE_ID,
+      tunnelType: 'vnc',
+      tunnelStatus: 'pending',
+      deviceStatus: 'online',
+      agentId: 'agent-abc',
+      userEmail: 'test@example.com',
+    }]) as any);
+    vi.mocked(checkRemoteAccess).mockResolvedValueOnce({
+      allowed: false,
+      code: 'DEVICE_PENDING_ASSIGNMENT',
+      reason: 'This device is waiting to be assigned to an organization; remote access is unavailable until then',
+    } as any);
+
+    const res = await app.request('/vnc-viewer/upgrade-to-webrtc', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer viewer-token' },
+    });
+
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual(expect.objectContaining({ code: 'DEVICE_PENDING_ASSIGNMENT' }));
+    expect(db.update).not.toHaveBeenCalled();
+    expect(db.insert).not.toHaveBeenCalled();
+    expect(sendCommandToAgent).not.toHaveBeenCalled();
+  });
+
   it('maps partner-trust denial to a 403 without creating a desktop session', async () => {
     partnerTrustMode.mockReturnValueOnce('enforce');
     evaluateCapability.mockResolvedValueOnce({
@@ -1843,8 +2054,8 @@ describe('POST /vnc-viewer/upgrade-to-webrtc', () => {
       agentId: 'agent-abc',
       userEmail: 'test@example.com',
     }]) as any);
-    // The straggler sweep now runs through the terminal-intent contract
-    // (SEC-038 W03): db.update(...).set(...).where(...).returning(...) —
+    // The straggler sweep now runs through the terminal-intent contract:
+    // db.update(...).set(...).where(...).returning(...) —
     // .returning() must resolve (no live stragglers here, so []) or the
     // update throws before createRemoteSession/evaluateCapability ever run,
     // silently stranding this test's queued mockResolvedValueOnce for a
@@ -1899,6 +2110,46 @@ describe('POST /vnc-viewer/downgrade-to-vnc assurance', () => {
     expect(response.status).toBe(403);
     expect(createViewerDescendantAccessToken).not.toHaveBeenCalled();
     expect(db.select).not.toHaveBeenCalled();
+    expect(db.insert).not.toHaveBeenCalled();
+    expect(sendCommandToAgent).not.toHaveBeenCalled();
+  });
+
+  it('passes the parked-device code through and opens no tunnel', async () => {
+    vi.clearAllMocks();
+    const app = new Hono();
+    app.route('/vnc-viewer', vncViewerRoutes);
+    vi.mocked(verifyViewerAccessToken).mockResolvedValueOnce({
+      sub: USER_ID,
+      email: 'test@example.com',
+      sessionId: SESSION_ID,
+      purpose: 'viewer',
+      jti: 'viewer-jti-parked-down',
+      iat: 1_000,
+      exp: 2_000,
+      mfaSatisfied: true,
+      assuranceAbsoluteExpiresAt: 2_000,
+    });
+    vi.mocked(db.select).mockReturnValueOnce(makeJoinedSelectChain([{
+      userId: USER_ID,
+      orgId: ORG_ID,
+      deviceId: DEVICE_ID,
+      deviceStatus: 'online',
+      agentId: 'agent-abc',
+      userEmail: 'test@example.com',
+    }]) as any);
+    vi.mocked(checkRemoteAccess).mockResolvedValueOnce({
+      allowed: false,
+      code: 'DEVICE_PENDING_ASSIGNMENT',
+      reason: 'This device is waiting to be assigned to an organization; remote access is unavailable until then',
+    } as any);
+
+    const res = await app.request('/vnc-viewer/downgrade-to-vnc', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer viewer-token' },
+    });
+
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual(expect.objectContaining({ code: 'DEVICE_PENDING_ASSIGNMENT' }));
     expect(db.insert).not.toHaveBeenCalled();
     expect(sendCommandToAgent).not.toHaveBeenCalled();
   });
@@ -2004,6 +2255,189 @@ describe('POST /vnc-viewer/downgrade-to-vnc assurance', () => {
     expect(await res.json()).toEqual(expect.objectContaining({ error: 'TRUST_RESTRICTED' }));
     expect(db.insert).not.toHaveBeenCalled();
     expect(sendCommandToAgent).not.toHaveBeenCalled();
+  });
+});
+
+// ─── VNC under a consent-mode prompt policy ─────────────────────────────────
+// VNC has no end-user consent prompt, so every route that opens a VNC tunnel
+// or hands out credentials to reach one is refused when the device's resolved
+// prompt mode is `consent` (and when that policy cannot be read).
+
+describe('VNC consent gate', () => {
+  const consentRefusal = {
+    ok: false,
+    status: 409,
+    body: {
+      error: 'This device requires the user\'s consent before remote access. VNC can\'t ask for consent — use the remote desktop viewer.',
+      code: 'CONSENT_REQUIRED_TRANSPORT_UNAVAILABLE',
+    },
+  };
+  const viewerPayload = {
+    sub: USER_ID,
+    email: 'test@example.com',
+    sessionId: SESSION_ID,
+    purpose: 'viewer',
+    jti: 'viewer-jti-consent',
+    iat: 1_000,
+    exp: 2_000,
+    mfaSatisfied: true,
+    assuranceAbsoluteExpiresAt: 2_000,
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    checkVncConsentGate.mockResolvedValue({ ok: true });
+    rateLimiterMock.mockResolvedValue({ allowed: true, remaining: 19, resetAt: new Date(Date.now() + 60_000) });
+  });
+
+  it('POST /tunnels refuses a VNC tunnel before any session row or tunnel_open', async () => {
+    const app = new Hono();
+    app.route('/tunnels', tunnelRoutes);
+    vi.mocked(db.select).mockReset();
+    vi.mocked(db.select)
+      .mockReturnValueOnce(makeSelectChain([onlineDevice]) as any)
+      .mockReturnValueOnce(makeSelectChain([]) as any);
+    vi.mocked(db.insert).mockReturnValue(makeInsertChain([sessionRecord]) as any);
+    checkVncConsentGate.mockResolvedValueOnce(consentRefusal);
+
+    const res = await app.request('/tunnels', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ deviceId: DEVICE_ID, type: 'vnc' }),
+    });
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual(consentRefusal.body);
+    expect(checkVncConsentGate).toHaveBeenCalledWith(DEVICE_ID);
+    expect(db.insert).not.toHaveBeenCalled();
+    expect(sendCommandToAgent).not.toHaveBeenCalled();
+  });
+
+  it('POST /tunnels passes a policy-resolution refusal through unchanged', async () => {
+    const app = new Hono();
+    app.route('/tunnels', tunnelRoutes);
+    vi.mocked(db.select).mockReset();
+    vi.mocked(db.select)
+      .mockReturnValueOnce(makeSelectChain([onlineDevice]) as any)
+      .mockReturnValueOnce(makeSelectChain([]) as any);
+    checkVncConsentGate.mockResolvedValueOnce({
+      ok: false,
+      status: 503,
+      body: { error: 'unavailable', code: 'REMOTE_PROMPT_POLICY_UNAVAILABLE' },
+    });
+
+    const res = await app.request('/tunnels', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ deviceId: DEVICE_ID, type: 'vnc' }),
+    });
+
+    expect(res.status).toBe(503);
+    expect((await res.json()).code).toBe('REMOTE_PROMPT_POLICY_UNAVAILABLE');
+    expect(db.insert).not.toHaveBeenCalled();
+    expect(sendCommandToAgent).not.toHaveBeenCalled();
+  });
+
+  it('POST /tunnels does not consult the consent gate for a proxy tunnel', async () => {
+    const app = new Hono();
+    app.route('/tunnels', tunnelRoutes);
+    vi.mocked(db.select).mockReset();
+    vi.mocked(db.select)
+      .mockReturnValueOnce(makeSelectChain([onlineDevice]) as any)
+      .mockReturnValue(makeSelectChain([]) as any);
+    checkVncConsentGate.mockResolvedValue(consentRefusal);
+
+    const res = await app.request('/tunnels', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ deviceId: DEVICE_ID, type: 'proxy', targetHost: '10.0.0.5', targetPort: 80 }),
+    });
+
+    expect(res.status).not.toBe(409);
+    expect(checkVncConsentGate).not.toHaveBeenCalled();
+  });
+
+  // ws-ticket, connect-code and vnc-exchange re-prove live authority through
+  // authorizeRemoteSessionContinuation, which carries the consent check for VNC
+  // tunnels (remoteWsAuthorization.ts). The route maps its denial reasons to
+  // the same technician-facing codes as POST /tunnels.
+  it.each([
+    { routeName: 'ws-ticket', minted: () => vi.mocked(createWsTicket) },
+    { routeName: 'connect-code', minted: () => vi.mocked(createVncConnectCode) },
+  ])('POST /tunnels/:id/$routeName answers a consent_required live denial with 409 CONSENT_REQUIRED_TRANSPORT_UNAVAILABLE', async ({ routeName, minted }) => {
+    const app = new Hono();
+    app.route('/tunnels', tunnelRoutes);
+    vi.mocked(db.select).mockReturnValueOnce(makeSelectChain([sessionRecord]) as any);
+    authorizeContinuationMock.mockResolvedValueOnce({ ok: false, status: 403, reason: 'consent_required' });
+
+    const res = await app.request(`/tunnels/${SESSION_ID}/${routeName}`, { method: 'POST' });
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual(consentRefusal.body);
+    expect(minted()).not.toHaveBeenCalled();
+    expect(checkVncConsentGate).not.toHaveBeenCalled();
+  });
+
+  it('POST /tunnels/:id/ws-ticket answers a prompt_policy_unavailable live denial with 503 REMOTE_PROMPT_POLICY_UNAVAILABLE', async () => {
+    const app = new Hono();
+    app.route('/tunnels', tunnelRoutes);
+    vi.mocked(db.select).mockReturnValueOnce(makeSelectChain([sessionRecord]) as any);
+    authorizeContinuationMock.mockResolvedValueOnce({ ok: false, status: 503, reason: 'prompt_policy_unavailable' });
+
+    const res = await app.request(`/tunnels/${SESSION_ID}/ws-ticket`, { method: 'POST' });
+
+    expect(res.status).toBe(503);
+    expect((await res.json()).code).toBe('REMOTE_PROMPT_POLICY_UNAVAILABLE');
+    expect(createWsTicket).not.toHaveBeenCalled();
+  });
+
+  it('POST /vnc-exchange/:code answers a consent_required live denial with 409 and mints nothing', async () => {
+    const app = new Hono();
+    app.route('/vnc-exchange', vncExchangeRoutes);
+    vi.mocked(consumeVncConnectCode).mockResolvedValueOnce({
+      tunnelId: SESSION_ID,
+      deviceId: DEVICE_ID,
+      orgId: ORG_ID,
+      userId: USER_ID,
+      email: 'test@example.com',
+      expiresAt: Date.now() + 60_000,
+    });
+    vi.mocked(db.select).mockReturnValueOnce(makeSelectChain([sessionRecord]) as any);
+    authorizeContinuationMock.mockResolvedValueOnce({ ok: false, status: 403, reason: 'consent_required' });
+
+    const res = await app.request('/vnc-exchange/valid-code', { method: 'POST' });
+
+    expect(res.status).toBe(409);
+    expect((await res.json()).code).toBe('CONSENT_REQUIRED_TRANSPORT_UNAVAILABLE');
+    expect(createWsTicket).not.toHaveBeenCalled();
+    expect(createViewerAccessToken).not.toHaveBeenCalled();
+  });
+
+  it('POST /vnc-viewer/downgrade-to-vnc refuses before creating a tunnel or sending tunnel_open', async () => {
+    const app = new Hono();
+    app.route('/vnc-viewer', vncViewerRoutes);
+    vi.mocked(verifyViewerAccessToken).mockResolvedValueOnce(viewerPayload as never);
+    vi.mocked(db.select).mockReturnValueOnce(makeJoinedSelectChain([{
+      userId: USER_ID,
+      orgId: ORG_ID,
+      deviceId: DEVICE_ID,
+      deviceStatus: 'online',
+      agentId: 'agent-abc',
+      userEmail: 'test@example.com',
+    }]) as any);
+    checkVncConsentGate.mockResolvedValueOnce(consentRefusal);
+
+    const res = await app.request('/vnc-viewer/downgrade-to-vnc', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer viewer-token' },
+    });
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual(consentRefusal.body);
+    expect(checkVncConsentGate).toHaveBeenCalledWith(DEVICE_ID);
+    expect(db.insert).not.toHaveBeenCalled();
+    expect(sendCommandToAgent).not.toHaveBeenCalled();
+    expect(createWsTicket).not.toHaveBeenCalled();
   });
 });
 
@@ -2581,6 +3015,24 @@ describe('Audit logging — mutating tunnel endpoints', () => {
     expect(audits[0].details).toEqual(expect.objectContaining({ sessionUserId: 'owner-9999' }));
   });
 
+  it('DELETE /tunnels/:id cancels the tunnel’s in-flight proxied requests', async () => {
+    vi.mocked(db.select)
+      .mockReturnValueOnce(makeSelectChain([sessionRecord]) as any)
+      .mockReturnValueOnce(makeSelectChain([onlineDevice]) as any);
+    vi.mocked(db.update).mockReturnValue({
+      set: vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue(undefined) }),
+    } as any);
+    vi.mocked(db.insert).mockImplementation(vi.fn().mockReturnValue(makeAuditAwareInsertChain([])) as any);
+
+    const res = await app.request(`/tunnels/${SESSION_ID}`, {
+      method: 'DELETE',
+      headers: { 'x-test-scope': 'partner', 'x-test-accessible-orgs': ORG_ID },
+    });
+
+    expect(res.status).toBe(200);
+    expect(cancelPendingMock).toHaveBeenCalledWith(`http-req-${SESSION_ID}-`, 'tunnel_closed');
+  });
+
   it('POST /allowlist writes a tunnel.allowlist.create audit row with the rule', async () => {
     const insertMock = vi.fn().mockReturnValue(
       makeAuditAwareInsertChain([{ id: RULE_ID, orgId: ORG_ID }])
@@ -2816,7 +3268,7 @@ describe('Audit logging — credential-minting tunnel endpoints', () => {
         }),
       }),
     } as any);
-    // db.update (terminate stragglers, through the SEC-038 W03 terminal-intent
+    // db.update (terminate stragglers, through the terminal-intent
     // contract) then db.insert (new desktop session). No live stragglers, so
     // .returning() resolves to [] — teardownDisconnectedSessions runs after
     // the system context above returns and is mocked separately below.
@@ -2926,6 +3378,64 @@ describe('POST /tunnels/:id/http-ticket', () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body).toHaveProperty('ticket');
+  });
+
+  describe('server-built url', () => {
+    const hostEnv = () => {
+      process.env.TUNNEL_ORIGIN_TEMPLATE = 'https://{id}.us.breezetunnel.test';
+      process.env.TUNNEL_FRAME_ANCESTOR = 'https://app.breeze-app.test';
+      __resetTunnelOriginConfigForTests();
+    };
+    const mint = async (query = '') => {
+      vi.mocked(db.select).mockReturnValueOnce(makeSelectChain([sessionRecord]) as any);
+      vi.mocked(db.insert).mockReturnValue(makeAuditAwareInsertChain([]) as any);
+      return app.request(`/tunnels/${SESSION_ID}/http-ticket${query}`, { method: 'POST' });
+    };
+
+    beforeEach(() => {
+      vi.mocked(isTunnelOriginEnabledForOrg).mockResolvedValue(true);
+    });
+    afterEach(() => {
+      delete process.env.TUNNEL_ORIGIN_TEMPLATE;
+      delete process.env.TUNNEL_FRAME_ANCESTOR;
+      __resetTunnelOriginConfigForTests();
+    });
+
+    it('returns a path-mode url when host mode is off', async () => {
+      const res = await mint();
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.ticket).toEqual({ ticket: 'ws-ticket-abc', expiresInSeconds: 60 });
+      expect(body.url).toBe(`/api/v1/tunnel-http/${SESSION_ID}/?__bzt=ws-ticket-abc`);
+      expect(body.mode).toBe('path');
+    });
+
+    it('returns the tunnel-origin enter url in host mode', async () => {
+      hostEnv();
+      const body = await (await mint()).json();
+      expect(body.url).toBe(`https://${SESSION_ID}.us.breezetunnel.test/__bz/enter?t=ws-ticket-abc`);
+      expect(body.mode).toBe('host');
+      expect(isTunnelOriginEnabledForOrg).toHaveBeenCalledWith(ORG_ID);
+    });
+
+    it('falls back to path mode when the partner has not opted in', async () => {
+      hostEnv();
+      vi.mocked(isTunnelOriginEnabledForOrg).mockResolvedValue(false);
+      const body = await (await mint()).json();
+      expect(body.mode).toBe('path');
+      expect(body.url).toBe(`/api/v1/tunnel-http/${SESSION_ID}/?__bzt=ws-ticket-abc`);
+    });
+
+    it('builds a new-tab url for ?mode=tab', async () => {
+      hostEnv();
+      const body = await (await mint('?mode=tab')).json();
+      expect(body.url).toBe(`https://${SESSION_ID}.us.breezetunnel.test/__bz/enter?t=ws-ticket-abc&mode=tab`);
+    });
+
+    it('rejects an unknown mode', async () => {
+      const res = await app.request(`/tunnels/${SESSION_ID}/http-ticket?mode=popup`, { method: 'POST' });
+      expect(res.status).toBe(400);
+    });
   });
 
   it('returns 404 when the tunnel is not found', async () => {
@@ -3117,5 +3627,300 @@ describe('POST /tunnels — proxy scheme/skipTlsVerify persistence', () => {
     const audits = auditCalls(insertMock);
     expect(audits).toHaveLength(1);
     expect(audits[0].details).toEqual(expect.objectContaining({ scheme: 'http', skipTlsVerify: false }));
+  });
+});
+
+describe('GET /tunnels/:id — proxy viewer presence (gates cookie-less path-token auth)', () => {
+  let app: Hono;
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(db.select).mockReset();
+    app = new Hono();
+    app.route('/tunnels', tunnelRoutes);
+  });
+
+  it('marks the viewer present when the owner polls a live proxy tunnel', async () => {
+    vi.mocked(db.select).mockReturnValueOnce(makeSelectChain([{
+      ...sessionRecord, type: 'proxy', status: 'active', lastActivityAt: new Date(),
+    }]) as any);
+    const res = await app.request(`/tunnels/${SESSION_ID}`, { method: 'GET' });
+    expect(res.status).toBe(200);
+    expect(redisSetMock).toHaveBeenCalledWith(`tunnel-http:viewer:${SESSION_ID}`, '1', 'EX', expect.any(Number));
+  });
+
+  it('does not mark presence for a poll by someone other than the owner', async () => {
+    vi.mocked(db.select).mockReturnValueOnce(makeSelectChain([{
+      ...sessionRecord, userId: 'another-user', type: 'proxy', status: 'active', lastActivityAt: new Date(),
+    }]) as any);
+    await app.request(`/tunnels/${SESSION_ID}`, { method: 'GET' });
+    expect(redisSetMock).not.toHaveBeenCalledWith(`tunnel-http:viewer:${SESSION_ID}`, expect.anything(), expect.anything(), expect.anything());
+  });
+
+  it('does not mark presence for a terminal or non-proxy tunnel', async () => {
+    for (const row of [{ type: 'proxy', status: 'disconnected' }, { type: 'vnc', status: 'active' }]) {
+      vi.mocked(db.select).mockReturnValueOnce(makeSelectChain([{ ...sessionRecord, ...row, lastActivityAt: new Date() }]) as any);
+      await app.request(`/tunnels/${SESSION_ID}`, { method: 'GET' });
+    }
+    expect(redisSetMock).not.toHaveBeenCalledWith(`tunnel-http:viewer:${SESSION_ID}`, expect.anything(), expect.anything(), expect.anything());
+  });
+});
+
+// ─── Session clipboard policy on VNC tunnel responses (#8269) ────────────────
+//
+// The agent cannot filter the raw RFB stream, so the viewer gates VNC clipboard
+// on the policy the API reports with the tunnel. The value must come from the
+// same resolver the WebRTC path ships to the agent, never from client input.
+
+describe('VNC tunnel responses carry the session clipboard policy (#8269)', () => {
+  let app: Hono;
+  // Tracks whether the resolver ran inside withSystemDbAccessContext: the
+  // viewer-token / code-redemption routes have no request DB context, and a
+  // contextless read sees zero rows under deny-default RLS (baseline policy).
+  let systemDepth = 0;
+  let resolvedInSystemContext: boolean[] = [];
+
+  const ALLOW = { hostToViewer: true, viewerToHost: true };
+  const DENY_PASTE = { hostToViewer: true, viewerToHost: false };
+  const DENY_BOTH = { hostToViewer: false, viewerToHost: false };
+  const policyWith = (clipboard: { hostToViewer: boolean; viewerToHost: boolean }) => ({
+    clipboard,
+    idleTimeoutMinutes: 30,
+    maxSessionDurationHours: 8,
+  });
+
+  const vncCodeRecord = {
+    tunnelId: SESSION_ID,
+    deviceId: DEVICE_ID,
+    orgId: ORG_ID,
+    userId: USER_ID,
+    email: 'test@example.com',
+    expiresAt: Date.now() + 60_000,
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(db.select).mockReset();
+    vi.mocked(db.insert).mockReset();
+    systemDepth = 0;
+    resolvedInSystemContext = [];
+    vi.mocked(withSystemDbAccessContext).mockImplementation(async (fn: () => any) => {
+      systemDepth++;
+      try {
+        return await fn();
+      } finally {
+        systemDepth--;
+      }
+    });
+    resolveDesktopSessionPolicyMock.mockImplementation(async () => {
+      resolvedInSystemContext.push(systemDepth > 0);
+      return policyWith(ALLOW);
+    });
+    rateLimiterMock.mockResolvedValue({
+      allowed: true,
+      remaining: 19,
+      resetAt: new Date(Date.now() + 60_000),
+    });
+    app = new Hono();
+    app.route('/tunnels', tunnelRoutes);
+    app.route('/vnc-exchange', vncExchangeRoutes);
+    app.route('/vnc-viewer', vncViewerRoutes);
+  });
+
+  function primeVncCreate() {
+    vi.mocked(db.select)
+      .mockReturnValueOnce(makeSelectChain([onlineDevice]) as any)  // device lookup
+      .mockReturnValueOnce(makeSelectChain([]) as any);              // source-IP allowlist
+    vi.mocked(db.insert).mockReturnValue(makeAuditAwareInsertChain([sessionRecord]) as any);
+  }
+
+  function primeExchange() {
+    vi.mocked(consumeVncConnectCode).mockResolvedValueOnce(vncCodeRecord);
+    vi.mocked(db.select).mockReturnValueOnce(makeSelectChain([sessionRecord]) as any);
+    vi.mocked(createViewerAccessToken).mockResolvedValueOnce('viewer-token-xyz');
+    vi.mocked(db.insert).mockReturnValue(makeAuditAwareInsertChain([]) as any);
+  }
+
+  function primeDowngrade() {
+    vi.mocked(verifyViewerAccessToken).mockResolvedValueOnce({
+      sub: USER_ID,
+      email: 'test@example.com',
+      sessionId: SESSION_ID,
+      purpose: 'viewer',
+      jti: 'viewer-jti-clip',
+      iat: 1_000,
+      exp: 2_000,
+      mfaSatisfied: true,
+      assuranceAbsoluteExpiresAt: 2_000,
+    });
+    vi.mocked(db.select).mockReturnValueOnce(makeJoinedSelectChain([{
+      userId: USER_ID,
+      orgId: ORG_ID,
+      deviceId: DEVICE_ID,
+      deviceStatus: 'online',
+      agentId: 'agent-abc',
+      userEmail: 'test@example.com',
+    }]) as any);
+    vi.mocked(db.insert).mockReturnValue(makeAuditAwareInsertChain([{ id: 'new-tunnel' }]) as any);
+  }
+
+  // --- POST /tunnels (tunnel create) ---
+
+  it('POST /tunnels (vnc) returns the resolved clipboard policy for the tunnel device', async () => {
+    primeVncCreate();
+    const res = await app.request('/tunnels', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ deviceId: DEVICE_ID, type: 'vnc' }),
+    });
+
+    expect(res.status).toBe(201);
+    const body = await res.json();
+    expect(body.clipboard).toEqual(ALLOW);
+    expect(body.id).toBe(SESSION_ID);
+    expect(resolveDesktopSessionPolicyMock).toHaveBeenCalledWith(DEVICE_ID);
+  });
+
+  it('POST /tunnels (vnc) reports a direction the policy blocks as false', async () => {
+    primeVncCreate();
+    resolveDesktopSessionPolicyMock.mockResolvedValueOnce(policyWith(DENY_PASTE));
+    const res = await app.request('/tunnels', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ deviceId: DEVICE_ID, type: 'vnc' }),
+    });
+
+    expect(res.status).toBe(201);
+    expect((await res.json()).clipboard).toEqual(DENY_PASTE);
+  });
+
+  it('POST /tunnels (vnc) ignores a clipboard value supplied by the client', async () => {
+    primeVncCreate();
+    resolveDesktopSessionPolicyMock.mockResolvedValueOnce(policyWith(DENY_BOTH));
+    const res = await app.request('/tunnels', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ deviceId: DEVICE_ID, type: 'vnc', clipboard: ALLOW }),
+    });
+
+    expect(res.status).toBe(201);
+    expect((await res.json()).clipboard).toEqual(DENY_BOTH);
+  });
+
+  it('POST /tunnels (proxy) carries no clipboard policy and does not resolve one', async () => {
+    vi.mocked(db.select)
+      .mockReturnValueOnce(makeSelectChain([onlineDevice]) as any)
+      .mockReturnValueOnce(makeSelectChain([]) as any)
+      .mockReturnValueOnce(makeSelectChain([{
+        id: 'r2r2r2r2-r2r2-4r2r-8r2r-r2r2r2r2r2r2',
+        orgId: ORG_ID,
+        direction: 'destination',
+        enabled: true,
+        pattern: '10.0.0.0/8:*',
+      }]) as any);
+    vi.mocked(db.insert).mockReturnValue(
+      makeAuditAwareInsertChain([{ ...sessionRecord, type: 'proxy', targetHost: '10.0.0.5', targetPort: 8080 }]) as any
+    );
+    const res = await app.request('/tunnels', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ deviceId: DEVICE_ID, type: 'proxy', targetHost: '10.0.0.5', targetPort: 8080 }),
+    });
+
+    expect(res.status).toBe(201);
+    expect(await res.json()).not.toHaveProperty('clipboard');
+    expect(resolveDesktopSessionPolicyMock).not.toHaveBeenCalled();
+  });
+
+  // --- POST /vnc-exchange/:code (VNC deep link) ---
+
+  it('POST /vnc-exchange/:code returns the clipboard policy, resolved in system DB context', async () => {
+    primeExchange();
+    const res = await app.request('/vnc-exchange/valid-code', { method: 'POST' });
+
+    expect(res.status).toBe(200);
+    expect((await res.json()).clipboard).toEqual(ALLOW);
+    expect(resolveDesktopSessionPolicyMock).toHaveBeenCalledWith(DEVICE_ID);
+    expect(resolvedInSystemContext).toEqual([true]);
+  });
+
+  it('POST /vnc-exchange/:code reports a policy that blocks both directions', async () => {
+    primeExchange();
+    resolveDesktopSessionPolicyMock.mockResolvedValueOnce(policyWith(DENY_BOTH));
+    const res = await app.request('/vnc-exchange/valid-code', { method: 'POST' });
+
+    expect(res.status).toBe(200);
+    expect((await res.json()).clipboard).toEqual(DENY_BOTH);
+  });
+
+  // --- POST /vnc-viewer/downgrade-to-vnc (WebRTC → VNC) ---
+
+  it('POST /vnc-viewer/downgrade-to-vnc returns the clipboard policy, resolved in system DB context', async () => {
+    primeDowngrade();
+    const res = await app.request('/vnc-viewer/downgrade-to-vnc', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer viewer-token' },
+    });
+
+    expect(res.status).toBe(200);
+    expect((await res.json()).clipboard).toEqual(ALLOW);
+    expect(resolveDesktopSessionPolicyMock).toHaveBeenCalledWith(DEVICE_ID);
+    expect(resolvedInSystemContext).toEqual([true]);
+  });
+
+  it('POST /vnc-viewer/downgrade-to-vnc reports a direction the policy blocks as false', async () => {
+    primeDowngrade();
+    resolveDesktopSessionPolicyMock.mockResolvedValueOnce(policyWith({ hostToViewer: false, viewerToHost: true }));
+    const res = await app.request('/vnc-viewer/downgrade-to-vnc', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer viewer-token' },
+    });
+
+    expect(res.status).toBe(200);
+    expect((await res.json()).clipboard).toEqual({ hostToViewer: false, viewerToHost: true });
+  });
+
+  // --- Resolution failure: error out before any side effect, never a response
+  //     without the policy (the viewer would treat that as off, but a later
+  //     fail-open catch must not slip past these). ---
+
+  it('POST /tunnels (vnc) resolves the policy before creating the tunnel', async () => {
+    primeVncCreate();
+    resolveDesktopSessionPolicyMock.mockRejectedValueOnce(new Error('pool exhausted'));
+    const res = await app.request('/tunnels', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ deviceId: DEVICE_ID, type: 'vnc' }),
+    });
+
+    expect(res.status).toBe(500);
+    expect(db.insert).not.toHaveBeenCalled();
+    expect(sendCommandToAgent).not.toHaveBeenCalled();
+  });
+
+  it('POST /vnc-exchange/:code resolves the policy from the tunnel row before minting credentials', async () => {
+    const OTHER_DEVICE_ID = 'abababab-abab-4bab-8bab-abababababab';
+    vi.mocked(consumeVncConnectCode).mockResolvedValueOnce({ ...vncCodeRecord, deviceId: OTHER_DEVICE_ID });
+    vi.mocked(db.select).mockReturnValueOnce(makeSelectChain([sessionRecord]) as any);
+    resolveDesktopSessionPolicyMock.mockRejectedValueOnce(new Error('pool exhausted'));
+    const res = await app.request('/vnc-exchange/valid-code', { method: 'POST' });
+
+    expect(res.status).toBe(500);
+    expect(resolveDesktopSessionPolicyMock).toHaveBeenCalledWith(DEVICE_ID);
+    expect(createWsTicket).not.toHaveBeenCalled();
+    expect(createViewerAccessToken).not.toHaveBeenCalled();
+  });
+
+  it('POST /vnc-viewer/downgrade-to-vnc resolves the policy before creating the tunnel', async () => {
+    primeDowngrade();
+    resolveDesktopSessionPolicyMock.mockRejectedValueOnce(new Error('pool exhausted'));
+    const res = await app.request('/vnc-viewer/downgrade-to-vnc', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer viewer-token' },
+    });
+
+    expect(res.status).toBe(500);
+    expect(db.insert).not.toHaveBeenCalled();
+    expect(sendCommandToAgent).not.toHaveBeenCalled();
+    expect(createWsTicket).not.toHaveBeenCalled();
   });
 });

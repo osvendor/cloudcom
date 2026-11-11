@@ -6,9 +6,20 @@ import { handleActionError } from '../../lib/runAction';
 import { runClientAction } from '../../lib/runClientAction';
 import { ResponsiveTable, DataCard } from '../shared/ResponsiveTable';
 import { Switch } from '../pam/ui';
-import { bulkTools, patchSourceTool, type ToolSourceToolDto, type ToolTier } from './api';
+import { ConfirmDialog } from '../shared/ConfirmDialog';
+import { bulkTools, patchSourceTool, type ToolSourceKind, type ToolSourceToolDto, type ToolTier } from './api';
 
 const TIERS: ToolTier[] = [1, 2, 3];
+
+/** The `{ method, path }` of an openapi tool's operation binding, or null.
+ *  Rows from before the openapi kind (or a malformed binding) have none. */
+function operationOf(tool: ToolSourceToolDto): { method: string; path: string } | null {
+  const op = (tool.annotations as { operation?: unknown } | null | undefined)?.operation;
+  if (!op || typeof op !== 'object') return null;
+  const { method, path } = op as { method?: unknown; path?: unknown };
+  if (typeof method !== 'string' || typeof path !== 'string') return null;
+  return { method: method.toUpperCase(), path };
+}
 
 /** A tool the assistant can never actually call: removed upstream, or carrying
  *  a name the resolver refuses (`name_not_addressable`, written by discovery).
@@ -26,17 +37,23 @@ function isUnusable(tool: ToolSourceToolDto): boolean {
  */
 export function DiscoveredToolsTable({
   sourceId,
+  kind = 'mcp',
   tools,
   onChanged,
   onTest,
 }: {
   sourceId: string;
+  /** Which columns to show; defaults to MCP (no method/path). */
+  kind?: ToolSourceKind;
   tools: ToolSourceToolDto[];
   onChanged: () => void;
   onTest: (tool: ToolSourceToolDto) => void;
 }) {
   const { t } = useTranslation('toolSources');
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [confirmingEnableReads, setConfirmingEnableReads] = useState(false);
+  const [bulkBusy, setBulkBusy] = useState(false);
+  const isOpenapi = kind === 'openapi';
 
   const patch = async (tool: ToolSourceToolDto, body: { tier?: ToolTier; enabled?: boolean }) => {
     setBusyId(tool.id);
@@ -55,6 +72,7 @@ export function DiscoveredToolsTable({
 
   const runBulk = async (mode: 'enable_reads' | 'disable_all') => {
     try {
+      setBulkBusy(true);
       const result = await runClientAction(() => bulkTools(fetchWithAuth, sourceId, mode), {
         errorFallback: t('toasts.toolUpdateFailed'),
         successMessage: (r) => t('toasts.bulkUpdated', { count: r.updated }),
@@ -62,8 +80,23 @@ export function DiscoveredToolsTable({
       if (result) onChanged();
     } catch (err) {
       handleActionError(err, t('toasts.toolUpdateFailed'));
+    } finally {
+      setBulkBusy(false);
     }
   };
+
+  // What `enable_reads` would actually change: tier-1, not-yet-enabled,
+  // usable tools that do NOT still need human review. Mirrors the server's
+  // own WHERE clause (bulkToolsAction in service.ts) so the confirmation
+  // enumerates exactly the rows the API call will touch — never more, never
+  // fewer. An unconditional bulk-enable click previously activated
+  // peer-self-declared tier-1 tools with no per-tool human review.
+  const enableReadsEligible = tools.filter(
+    (tool) => tool.tier === 1 && !tool.enabled && !tool.reviewNeeded && !isUnusable(tool),
+  );
+  const enableReadsSkippedForReview = tools.filter(
+    (tool) => tool.tier === 1 && !tool.enabled && tool.reviewNeeded && !isUnusable(tool),
+  ).length;
 
   const flags = (tool: ToolSourceToolDto, surface: 'row' | 'card' = 'row') => (
     <div className="flex flex-wrap gap-1">
@@ -118,7 +151,11 @@ export function DiscoveredToolsTable({
       checked={tool.enabled}
       testId={`tool-${surface}-${tool.id}-enabled`}
       ariaLabel={t('tools.enabled')}
-      disabled={isUnusable(tool) || busyId === tool.id}
+      // Turning a still-reviewNeeded tool ON from its own switch would send a
+      // bare { enabled: true }, which the API now refuses — the tier select
+      // is the review (clears reviewNeeded server-side). Turning one OFF is
+      // never gated. Mirrors the server contract in patchSourceTool.
+      disabled={isUnusable(tool) || busyId === tool.id || (tool.reviewNeeded && !tool.enabled)}
       onToggle={() => void patch(tool, { enabled: !tool.enabled })}
     />
   );
@@ -146,7 +183,7 @@ export function DiscoveredToolsTable({
   return (
     <div className="space-y-3">
       <div className="flex justify-end gap-2">
-        <button type="button" data-testid="tools-enable-reads" className="h-8 rounded-md border px-2 text-sm" onClick={() => void runBulk('enable_reads')}>
+        <button type="button" data-testid="tools-enable-reads" className="h-8 rounded-md border px-2 text-sm" onClick={() => setConfirmingEnableReads(true)}>
           {t('tools.enableReads')}
         </button>
         <button type="button" data-testid="tools-disable-all" className="h-8 rounded-md border px-2 text-sm" onClick={() => void runBulk('disable_all')}>
@@ -154,12 +191,48 @@ export function DiscoveredToolsTable({
         </button>
       </div>
 
+      <ConfirmDialog
+        open={confirmingEnableReads}
+        onClose={() => setConfirmingEnableReads(false)}
+        onConfirm={() => {
+          setConfirmingEnableReads(false);
+          void runBulk('enable_reads');
+        }}
+        title={t('tools.enableReadsConfirmTitle')}
+        message={
+          enableReadsEligible.length > 0
+            ? t('tools.enableReadsConfirmMessage', { count: enableReadsEligible.length })
+            : t('tools.enableReadsConfirmEmpty')
+        }
+        confirmLabel={t('tools.enableReads')}
+        variant="warning"
+        isLoading={bulkBusy}
+        confirmDisabled={enableReadsEligible.length === 0}
+        confirmTestId="tools-enable-reads-confirm"
+        dialogTestId="tools-enable-reads-dialog"
+      >
+        {enableReadsEligible.length > 0 && (
+          <ul className="max-h-48 list-disc space-y-1 overflow-y-auto pl-5 font-mono text-xs">
+            {enableReadsEligible.map((tool) => (
+              <li key={tool.id}>{tool.qualifiedName}</li>
+            ))}
+          </ul>
+        )}
+        {enableReadsSkippedForReview > 0 && (
+          <p className="mt-3 text-xs text-muted-foreground">
+            {t('tools.enableReadsConfirmSkipped', { count: enableReadsSkippedForReview })}
+          </p>
+        )}
+      </ConfirmDialog>
+
       <ResponsiveTable
         table={
           <table className="w-full text-sm">
             <thead className="text-left text-xs text-muted-foreground">
               <tr>
                 <th className="p-2">{t('tools.name')}</th>
+                {isOpenapi && <th className="p-2">{t('tools.method')}</th>}
+                {isOpenapi && <th className="p-2">{t('tools.path')}</th>}
                 <th className="p-2">{t('tools.description')}</th>
                 <th className="p-2">{t('tools.proposedTier')}</th>
                 <th className="p-2">{t('tools.tier')}</th>
@@ -169,9 +242,23 @@ export function DiscoveredToolsTable({
               </tr>
             </thead>
             <tbody>
-              {tools.map((tool) => (
+              {tools.map((tool) => {
+                const op = isOpenapi ? operationOf(tool) : null;
+                return (
                 <tr key={tool.id} data-testid={`tool-row-${tool.id}`} className="border-t">
                   <td className="p-2 font-mono text-xs">{tool.qualifiedName}</td>
+                  {isOpenapi && (
+                    <td className="p-2 text-xs font-medium" data-testid={`tool-row-${tool.id}-method`}>{op?.method ?? ''}</td>
+                  )}
+                  {isOpenapi && (
+                    <td
+                      className="max-w-[16rem] truncate p-2 font-mono text-xs"
+                      title={op?.path}
+                      data-testid={`tool-row-${tool.id}-path`}
+                    >
+                      {op?.path ?? ''}
+                    </td>
+                  )}
                   <td className="max-w-xs truncate p-2" title={tool.description}>{tool.description}</td>
                   <td className="p-2" data-testid={`tool-row-${tool.id}-proposed`}>{tool.proposedTier}</td>
                   <td className="p-2">{tierSelect(tool)}</td>
@@ -179,7 +266,8 @@ export function DiscoveredToolsTable({
                   <td className="p-2">{flags(tool)}</td>
                   <td className="p-2">{testButton(tool)}</td>
                 </tr>
-              ))}
+                );
+              })}
             </tbody>
           </table>
         }
@@ -189,6 +277,11 @@ export function DiscoveredToolsTable({
               <DataCard key={tool.id}>
                 <div className="space-y-2">
                   <p className="font-mono text-xs">{tool.qualifiedName}</p>
+                  {isOpenapi && operationOf(tool) && (
+                    <p className="break-all font-mono text-xs text-muted-foreground">
+                      {operationOf(tool)?.method} {operationOf(tool)?.path}
+                    </p>
+                  )}
                   <p className="text-sm text-muted-foreground">{tool.description}</p>
                   <div className="flex items-center gap-2">
                     {tierSelect(tool, 'card')}

@@ -11,13 +11,16 @@ COPY turbo.json tsconfig.json ./
 
 COPY apps/portal/package.json ./apps/portal/
 COPY packages/shared/package.json ./packages/shared/
+COPY packages/document-ui/package.json ./packages/document-ui/
 
 RUN pnpm install
 
 COPY apps/portal ./apps/portal
 COPY packages/shared ./packages/shared
+COPY packages/document-ui ./packages/document-ui
 
 WORKDIR /app/apps/portal
 EXPOSE 4322
 
-CMD ["sh", "-lc", "pnpm install --prefer-offline --no-frozen-lockfile && pnpm dev --host 0.0.0.0 --port 4322"]
+# Clear a stale .astro/dev.json (survives restarts; Astro on Alpine mistakes a reused PID for a live server, #11184).
+CMD ["sh", "-lc", "pnpm install --prefer-offline --no-frozen-lockfile && rm -f .astro/dev.json && pnpm dev --host 0.0.0.0 --port 4322"]

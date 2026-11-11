@@ -12,10 +12,12 @@ import {
   Users
 } from 'lucide-react';
 import { cn, formatNumber, formatRelativeTime } from '@/lib/utils';
+import { FilterSelect } from '../shared/FilterSelect';
 import { fetchWithAuth } from '../../stores/auth';
 import { formatNumber as formatLocaleNumber } from '@/lib/i18n/format';
 import { ApproximateMoneyLine } from '@/components/billing/shared/ApproximateMoneyLine';
 import { formatMoney, sumByCurrency } from '@/components/billing/shared/format';
+import { useStableT } from '@/lib/i18n/useStableT';
 
 type Device = {
   id?: string | number;
@@ -25,8 +27,8 @@ type Device = {
   health?: string;
   alerts?: number;
   alertCount?: number;
-  compliance?: number;
-  compliancePercent?: number;
+  compliance?: number | null;
+  compliancePercent?: number | null;
   lastSeen?: string | number | Date;
   customerId?: string;
   customerName?: string;
@@ -61,8 +63,8 @@ type Customer = {
     open?: number;
     count?: number;
   };
-  compliancePercent?: number;
-  compliance?: number;
+  compliancePercent?: number | null;
+  compliance?: number | null;
   /** @deprecated wave 7 (#3779) — the API keeps sending a hardcoded 0 for one
    *  release so an already-loaded bundle can't break mid-deploy. NEVER read it. */
   mrr?: number;
@@ -84,7 +86,7 @@ type CustomerOverview = {
   healthLabel: HealthLabel;
   deviceCount: number;
   alertCount: number;
-  compliance: number;
+  compliance: number | null;
   /** Per-currency, first-seen order — the shape `sumByCurrency` produces and
    *  `formatMoney` consumes. An empty list means "no MRR", rendered as a dash;
    *  it is NEVER rendered as zero in some assumed currency. */
@@ -99,7 +101,7 @@ type DeviceOverview = {
   name: string;
   status: DeviceStatus;
   alerts: number;
-  compliance: number;
+  compliance: number | null;
   lastSeen: string;
   customerName: string;
 };
@@ -151,6 +153,16 @@ function normalizePercent(value: unknown): number {
   if (numeric === null) return 0;
   if (numeric <= 1) return numeric * 100;
   return numeric;
+}
+
+/** Like `normalizePercent`, but "no data" stays null so the UI can render a dash
+ *  instead of a confident 0% (the API sends null when no posture snapshot exists). */
+function normalizeNullablePercent(value: unknown): number | null {
+  return parseNumber(value) === null ? null : normalizePercent(value);
+}
+
+function renderPercent(value: number | null): string {
+  return value === null ? '—' : `${formatLocaleNumber(value, { maximumFractionDigits: 0 })}%`;
 }
 
 function normalizeCustomerId(customer: Customer, fallback: string): string {
@@ -217,8 +229,8 @@ function resolveAlertCount(customer: Customer): number {
   );
 }
 
-function resolveCompliance(customer: Customer): number {
-  return normalizePercent(customer.compliancePercent ?? customer.compliance);
+function resolveCompliance(customer: Customer): number | null {
+  return normalizeNullablePercent(customer.compliancePercent ?? customer.compliance);
 }
 
 /** Read the per-currency MRR groups off either payload shape. The deprecated
@@ -294,7 +306,7 @@ function normalizeDeviceData(customers: CustomerOverview[], fallbackDeviceName: 
       const id = device.id ?? `${customer.id}-device-${index}`;
       const name = device.name?.trim() || fallbackDeviceName(index + 1);
       const alerts = parseNumber(device.alertCount ?? device.alerts) ?? 0;
-      const compliance = normalizePercent(device.compliancePercent ?? device.compliance);
+      const compliance = normalizeNullablePercent(device.compliancePercent ?? device.compliance);
 
       return {
         id: String(id),
@@ -311,6 +323,7 @@ function normalizeDeviceData(customers: CustomerOverview[], fallbackDeviceName: 
 
 export default function PartnerDashboard() {
   const { t } = useTranslation('common');
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
@@ -324,7 +337,7 @@ export default function PartnerDashboard() {
       setError(undefined);
       const response = await fetchWithAuth('/partner/dashboard');
       if (!response.ok) {
-        throw new Error(t('longTail.partner.PartnerDashboard.errors.fetchFailed'));
+        throw new Error(stableT('longTail.partner.PartnerDashboard.errors.fetchFailed'));
       }
       const payload = await response.json();
       const data = payload?.data ?? payload ?? {};
@@ -333,11 +346,11 @@ export default function PartnerDashboard() {
         : data.customers ?? data.organizations ?? data.items ?? data.results ?? [];
       setCustomers(Array.isArray(list) ? list : []);
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('longTail.partner.PartnerDashboard.errors.fetchFailed'));
+      setError(err instanceof Error ? err.message : stableT('longTail.partner.PartnerDashboard.errors.fetchFailed'));
     } finally {
       setLoading(false);
     }
-  }, [t]);
+  }, [stableT]);
 
   useEffect(() => {
     fetchCustomers();
@@ -486,25 +499,27 @@ export default function PartnerDashboard() {
                     className="h-10 w-full rounded-md border bg-background pl-9 pr-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
                   />
                 </div>
-                <select
+                <FilterSelect
+                  label={t('longTail.partner.PartnerDashboard.healthFilterLabel')}
                   value={healthFilter}
                   onChange={event => setHealthFilter(event.target.value as 'all' | HealthLabel)}
-                  className="h-10 rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
+                  className="h-10"
                 >
                   <option value="all">{t('longTail.partner.PartnerDashboard.allHealth')}</option>
                   <option value="healthy">{t('longTail.partner.PartnerDashboard.health.healthy')}</option>
                   <option value="warning">{t('longTail.partner.PartnerDashboard.health.warning')}</option>
                   <option value="critical">{t('longTail.partner.PartnerDashboard.health.critical')}</option>
-                </select>
-                <select
+                </FilterSelect>
+                <FilterSelect
+                  label={t('longTail.partner.PartnerDashboard.sortFilterLabel')}
                   value={sortKey}
                   onChange={event => setSortKey(event.target.value as SortKey)}
-                  className="h-10 rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
+                  className="h-10"
                 >
                   <option value="health">{t('longTail.partner.PartnerDashboard.sort.health')}</option>
                   <option value="devices">{t('longTail.partner.PartnerDashboard.sort.devices')}</option>
                   <option value="name">{t('longTail.partner.PartnerDashboard.sort.name')}</option>
-                </select>
+                </FilterSelect>
               </div>
             </div>
 
@@ -561,7 +576,7 @@ export default function PartnerDashboard() {
                           <span className="text-muted-foreground">{t('longTail.partner.PartnerDashboard.compliance')}</span>
                         </div>
                         <p className="mt-2 text-sm font-semibold">
-                          {formatLocaleNumber(customer.compliance, { maximumFractionDigits: 0 })}%
+                          {renderPercent(customer.compliance)}
                         </p>
                       </div>
                     </div>
@@ -748,7 +763,7 @@ export default function PartnerDashboard() {
                       {formatNumber(device.alerts)}
                     </td>
                     <td className="px-4 py-3 text-right text-foreground">
-                      {formatLocaleNumber(device.compliance, { maximumFractionDigits: 0 })}%
+                      {renderPercent(device.compliance)}
                     </td>
                     <td className="px-4 py-3 text-right text-muted-foreground">
                       {device.lastSeen}

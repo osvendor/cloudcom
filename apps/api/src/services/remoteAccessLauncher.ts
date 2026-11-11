@@ -11,7 +11,22 @@ export type RemoteAccessLaunchSkipReason =
   | 'provider_disabled'
   | 'missing_device_identifier'
   | 'empty_url_template'
-  | 'scheme_not_allowed';
+  | 'scheme_not_allowed'
+  // Only for an explicit choice (#10922): the requested id is not one of this
+  // tenant's enabled providers. Never produced by the availability check.
+  | 'provider_not_available';
+
+/**
+ * One tool a technician can pick from the Connect menu (#10922). This is the
+ * whole client-visible shape: never the template, password or custom-field
+ * key. `kind` says how the browser opens it: `web` in a new tab (an http(s)
+ * template), `protocol` through the OS handler (rustdesk:, anydesk:, …).
+ */
+export interface RemoteAccessProviderOption {
+  id: string;
+  label: string;
+  kind: 'web' | 'protocol';
+}
 
 export interface RemoteAccessLaunchResult {
   launchUrl: string | null;
@@ -40,15 +55,28 @@ function extractScheme(url: string): string | null {
   return url.slice(0, colon).toLowerCase();
 }
 
-// Selects which configured provider a launch would use: the technician's
-// preference if it names a provider this tenant has and is enabled,
-// otherwise the tenant default. Shared by both the availability check and
-// the issuance path so the two can never disagree about *which* provider
-// they're evaluating.
+// Selects which configured provider a launch would use: an explicit choice
+// made at click time, else the technician's preference if it names a provider
+// this tenant has and is enabled, otherwise the tenant default. Shared by both
+// the availability check and the issuance path so the two can never disagree
+// about *which* provider they're evaluating.
 function selectRemoteAccessProvider(
   remoteAccess: InheritableRemoteAccessSettings | undefined | null,
   preferredProviderId?: string | null,
+  explicitProviderId?: string | null,
 ): { provider: RemoteAccessProvider | null; skipReason: RemoteAccessLaunchSkipReason | null } {
+  // An explicit choice (#10922) selects exactly like a preference -- only a
+  // provider this tenant has AND has enabled -- but it does NOT fall through to
+  // the default. The technician picked one tool; quietly launching another
+  // would hand back a different tool's credential than the one they clicked.
+  if (explicitProviderId) {
+    const providers = Array.isArray(remoteAccess?.providers) ? remoteAccess.providers : [];
+    const chosen = providers.find((p) => p.id === explicitProviderId && p.enabled);
+    return chosen
+      ? { provider: chosen, skipReason: null }
+      : { provider: null, skipReason: 'provider_not_available' };
+  }
+
   if (!remoteAccess?.providers?.length) {
     return { provider: null, skipReason: 'no_provider_configured' };
   }
@@ -79,21 +107,34 @@ function selectRemoteAccessProvider(
 // single source of truth for the pre-decrypt checks so availability and
 // issuance can't drift apart on skip-reason vocabulary.
 function evaluateRemoteAccessLaunchAvailability(
-  device: { customFields?: Record<string, unknown> | null },
+  device: { customFields?: Record<string, unknown> | null; enrolledRustDeskId?: string | null },
   remoteAccess: InheritableRemoteAccessSettings | undefined | null,
   preferredProviderId?: string | null,
+  explicitProviderId?: string | null,
 ): { provider: RemoteAccessProvider | null; idValue: string | null; skipReason: RemoteAccessLaunchSkipReason | null } {
-  const { provider, skipReason } = selectRemoteAccessProvider(remoteAccess, preferredProviderId);
+  const { provider, skipReason } = selectRemoteAccessProvider(remoteAccess, preferredProviderId, explicitProviderId);
   if (!provider) {
     return { provider: null, idValue: null, skipReason };
   }
+  return evaluateProviderForDevice(device, provider);
+}
+
+// The per-provider half of the pre-decrypt checks: enabled, the device carries
+// the identifier this provider needs, and the template is non-empty. The
+// Connect menu's option list (#10922) runs it over every provider, so a tool
+// is offered exactly when issuance would accept it.
+function evaluateProviderForDevice(
+  device: { customFields?: Record<string, unknown> | null },
+  provider: RemoteAccessProvider,
+): { provider: RemoteAccessProvider; idValue: string | null; skipReason: RemoteAccessLaunchSkipReason | null } {
   if (!provider.enabled) {
     return { provider, idValue: null, skipReason: 'provider_disabled' };
   }
 
   // Number/Boolean custom fields are stored as JSON primitives (#6191);
   // coerce them so a populated numeric identifier isn't treated as missing.
-  const raw = device.customFields?.[provider.customFieldKey];
+  const raw = /^rustdesk:\/\//i.test(provider.urlTemplate) && device.enrolledRustDeskId
+    ? device.enrolledRustDeskId : device.customFields?.[provider.customFieldKey];
   const idValue =
     typeof raw === 'string'
       ? raw
@@ -117,7 +158,7 @@ function evaluateRemoteAccessLaunchAvailability(
 // "should the Connect Desktop button render" without touching credentials.
 // See issue #3402.
 export function checkRemoteAccessLaunchAvailability(
-  device: { customFields?: Record<string, unknown> | null },
+  device: { customFields?: Record<string, unknown> | null; enrolledRustDeskId?: string | null },
   remoteAccess: InheritableRemoteAccessSettings | undefined | null,
   preferredProviderId?: string | null,
 ): RemoteAccessLaunchAvailability {
@@ -127,6 +168,39 @@ export function checkRemoteAccessLaunchAvailability(
     providerId: result.provider?.id ?? null,
     skipReason: result.skipReason,
   };
+}
+
+/**
+ * Every provider a technician could pick for this device from the Connect
+ * menu (#10922): the tenant's enabled providers that pass the same pre-decrypt
+ * checks issuance runs. Like `checkRemoteAccessLaunchAvailability` it never
+ * decrypts the password or substitutes the template, and it projects each
+ * provider to id/label/kind field by field so a credential-bearing field added
+ * to `RemoteAccessProvider` later cannot leak through a spread.
+ *
+ * A legacy duplicated id (save-time validation rejects new ones, #3401) is
+ * listed once: issuance resolves an id by first match, so a second row with
+ * the same id could never launch as itself.
+ */
+export function listRemoteAccessProviderOptions(
+  device: { customFields?: Record<string, unknown> | null },
+  remoteAccess: InheritableRemoteAccessSettings | undefined | null,
+): RemoteAccessProviderOption[] {
+  const providers = Array.isArray(remoteAccess?.providers) ? remoteAccess.providers : [];
+  const seen = new Set<string>();
+  const options: RemoteAccessProviderOption[] = [];
+  for (const provider of providers) {
+    if (!provider || typeof provider.id !== 'string' || provider.id.length === 0) continue;
+    if (seen.has(provider.id)) continue;
+    seen.add(provider.id);
+    if (evaluateProviderForDevice(device, provider).skipReason !== null) continue;
+    options.push({
+      id: provider.id,
+      label: typeof provider.name === 'string' && provider.name.trim().length > 0 ? provider.name : provider.id,
+      kind: /^https?:/i.test(provider.urlTemplate) ? 'web' : 'protocol',
+    });
+  }
+  return options;
 }
 
 // Build the launch URL the Connect Desktop button should fire for a device,
@@ -145,7 +219,7 @@ export function checkRemoteAccessLaunchAvailability(
 //   urlTemplate 'https://acme.screenconnect.com/Host#Access///{id}/Join'
 //     → 'https://acme.screenconnect.com/Host#Access///294064193/Join'
 export function buildRemoteAccessLaunchUrl(
-  device: { customFields?: Record<string, unknown> | null },
+  device: { customFields?: Record<string, unknown> | null; enrolledRustDeskId?: string | null },
   remoteAccess: InheritableRemoteAccessSettings | undefined | null,
 ): string | null {
   return resolveRemoteAccessLaunch(device, remoteAccess).launchUrl;
@@ -157,7 +231,7 @@ export function buildRemoteAccessLaunchUrl(
 // security event: the partner template was tampered to resolve to a
 // disallowed scheme only after substitution).
 export function resolveRemoteAccessLaunch(
-  device: { customFields?: Record<string, unknown> | null },
+  device: { customFields?: Record<string, unknown> | null; enrolledRustDeskId?: string | null },
   remoteAccess: InheritableRemoteAccessSettings | undefined | null,
   // A technician's own preferred provider (users.preferences.remoteAccessProviderId).
   // Deliberately an ID and nothing else: it SELECTS from the tenant's configured
@@ -165,6 +239,11 @@ export function resolveRemoteAccessLaunch(
   // still come from the tenant record, so a user value cannot introduce a scheme
   // or a destination -- which is what keeps the javascript: guard below meaningful.
   preferredProviderId?: string | null,
+  // The tool the technician picked from the Connect menu (#10922). The same
+  // "selects, never supplies" rule as the preference, but stricter: an id that
+  // is not one of this tenant's enabled providers is refused
+  // ('provider_not_available') instead of falling back to the default.
+  explicitProviderId?: string | null,
 ): RemoteAccessLaunchResult {
   // Runs the same pre-decrypt checks `checkRemoteAccessLaunchAvailability`
   // uses (provider selection, enabled, identifier present, template
@@ -174,6 +253,7 @@ export function resolveRemoteAccessLaunch(
     device,
     remoteAccess,
     preferredProviderId,
+    explicitProviderId,
   );
   if (skipReason !== null || !provider || idValue === null) {
     return { launchUrl: null, providerId: provider?.id ?? null, scheme: null, skipReason };

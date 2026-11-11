@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { restoreAccessTokenFromCookieDetailed, useAuthStore } from '../../stores/auth';
 import { Loader2 } from 'lucide-react';
 import Sidebar from './Sidebar';
@@ -17,6 +17,11 @@ export default function DashboardWrapper({ children, currentPath }: DashboardWra
   const [isChecking, setIsChecking] = useState(true);
   const [isRecovering, setIsRecovering] = useState(false);
   const [recoverAttempted, setRecoverAttempted] = useState(false);
+  const mounted = useRef(false);
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
 
   useEffect(() => {
     // Give the store time to rehydrate from localStorage
@@ -40,7 +45,8 @@ export default function DashboardWrapper({ children, currentPath }: DashboardWra
         // the redirect-to-login below must stay dormant. AuthOverlay's throttle
         // mask owns that state.
         void restoreAccessTokenFromCookieDetailed().then((outcome) => {
-          if (cancelled) return;
+          // Recovery changes this effect's dependencies; only unmount cancels completion.
+          if (!mounted.current) return;
           setIsRecovering(false);
           // 'throttled' (#3696) is NOT a dead session: the server rate-limited
           // /auth/refresh and never judged the cookie. Keep rendering the

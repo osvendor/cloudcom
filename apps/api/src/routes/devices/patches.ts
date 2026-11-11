@@ -2,14 +2,29 @@ import { Hono } from 'hono';
 import { eq, desc, inArray, and, sql, gte } from 'drizzle-orm';
 import { z } from 'zod';
 import { zValidator } from '../../lib/validation';
-import { db, runOutsideDbContext, withSystemDbAccessContext } from '../../db';
-import { patches, devicePatches, patchApprovals, deviceCommands, users } from '../../db/schema';
+import { db, withDbTransaction } from '../../db';
+import { readOwnPartnerAxisRows } from '../../db/partnerAxisRead';
+import { patches, devicePatches, deviceCommands, users } from '../../db/schema';
+import { resolveLatestManualDecisions, selectManualDecisionRows } from '../../services/patchManualDecisions';
 import { authMiddleware, requireMfa, requireScope, requirePermission } from '../../middleware/auth';
 import { PERMISSIONS } from '../../services/permissions';
 import { getDeviceWithOrgAndSiteCheck, SITE_ACCESS_DENIED } from './helpers';
+import { deviceCommandsInCurrentOrg } from './commandOrgScope';
 import { queueCommandForExecution } from '../../services/commandQueue';
 import { writeRouteAudit } from '../../services/auditEvents';
 import { resolvePartnerIdForOrg } from '../patches/helpers';
+import { loadDevicePatchInstallState, type PatchInstallAttempt } from '../../services/patchInstallFailures';
+import { EFFECTIVE_PATCH_CATEGORY_SQL, EFFECTIVE_PATCH_SEVERITY_SQL } from '../../services/patchSeverityOverlay';
+import { loadDevicePatchApprovalView, type DevicePatchApprovalView } from '../../services/devicePatchApprovalView';
+import { captureException } from '../../services/sentry';
+import {
+  buildRestorePointRequest,
+  discardRestorePointRequest,
+  linkRestorePointCommand,
+  restorePointPayloadField,
+} from '../../services/restorePointRequest';
+import { compliancePercentWithImageTerm, type DevicePatchApprovalEvaluation } from '@breeze/shared';
+import { containerImageComplianceTerms } from '../../services/workloads/imageCompliance';
 
 export const patchesRoutes = new Hono();
 
@@ -32,6 +47,13 @@ const patchHistoryQuerySchema = z.object({
   completedAfter: z.string().datetime({ offset: true }).optional()
 });
 
+// #7637: `approvalView=0` skips the ring-aware approval evaluation. The web
+// Patches tab's install poller (every 5 s, up to 30 min) sets it, so the poll
+// does not open a second pooled connection per tick; see the GET route.
+const devicePatchStatusQuerySchema = z.object({
+  approvalView: z.enum(['0', '1']).optional()
+});
+
 const PATCH_COMMAND_TYPES = ['install_patches', 'patch_scan', 'rollback_patches', 'download_patches'] as const;
 const LINUX_SOFTWARE_UPDATE_COMMAND_TYPE = 'software_update';
 
@@ -49,6 +71,32 @@ function commandTypesForPatchHistory(type: string, osType?: string | null): stri
     commandTypes.push(LINUX_SOFTWARE_UPDATE_COMMAND_TYPE);
   }
   return commandTypes;
+}
+
+/**
+ * #7680: a Windows update that installed but needs a restart to finish stays
+ * `IsInstalled=0` to Windows Update until the device restarts, so every scan in
+ * between re-reports it as pending. When the latest install attempt said
+ * "installed, restart required" and the device has not restarted since, the
+ * row is installed-pending-restart, not an untouched pending patch.
+ *
+ * "Not restarted since" = the OS still reports a pending reboot (which
+ * self-clears on the first post-reboot heartbeat) AND the last known boot,
+ * when the agent reported uptime, is not after the install. After a restart a
+ * patch the scan still offers did not finish installing, and reads as plain
+ * pending again.
+ */
+function awaitingRestart(
+  attempt: PatchInstallAttempt | undefined,
+  device: { pendingReboot: boolean; lastSeenAt: Date | null; uptimeSeconds: number | null }
+): { installedAt: string } | null {
+  if (!attempt || attempt.outcome !== 'installed' || !attempt.rebootRequired) return null;
+  if (!device.pendingReboot) return null;
+  if (device.lastSeenAt && typeof device.uptimeSeconds === 'number') {
+    const bootedAt = device.lastSeenAt.getTime() - device.uptimeSeconds * 1000;
+    if (bootedAt > attempt.at.getTime()) return null;
+  }
+  return { installedAt: attempt.at.toISOString() };
 }
 
 function safeParsePatchResult(result: unknown): unknown {
@@ -172,15 +220,17 @@ function normalizePatchHistoryResult(
 }
 
 /**
- * Resolve which of the given patch IDs carry an explicit partner-wide manual-approval
- * record (`patchApprovals.status = 'approved'`) for the partner.
+ * Resolve which of the given patch IDs are manually approved for the partner:
+ * the latest `patch_approvals` decision (approved vs rejected) wins, and a
+ * ring-level decline newer than a blanket approval denies (#9485) — the shared
+ * resolution in `services/patchManualDecisions.ts`.
  *
- * This is intentionally only the partner-wide manual-approval gate. It does NOT consider
+ * This is intentionally only the manual-approval gate. It does NOT consider
  * the device's effective patch ring or category/auto-approve rules — for the full
- * ring + category-aware evaluation see `resolveApprovedPatchesForDevice` in
- * `services/patchApprovalEvaluator.ts`.
+ * ring + category-aware evaluation see `services/patchEligibility.ts` (the GET route
+ * below reports that verdict as `effectiveApproval` via `loadDevicePatchApprovalView`).
  *
- * Known limitation: because this gate is partner-wide and ring-agnostic, a patch that is
+ * Known limitation: because this gate is ring-agnostic, a patch that is
  * approved for ring A passes this gate for a device in ring B. Wiring the install
  * endpoint through the full evaluator (`resolveApprovedPatchesForDevice`) is a tracked
  * follow-up.
@@ -188,27 +238,14 @@ function normalizePatchHistoryResult(
 async function getApprovedPatchIdsForPartner(partnerId: string, patchIds: string[]): Promise<Set<string>> {
   if (patchIds.length === 0) return new Set();
 
-  // patch_approvals is partner-axis RLS. An org-scoped caller's DB context has
-  // accessiblePartnerIds=[] → the table returns 0 rows in request context.
-  // Escape to system context: the partnerId is SERVER-DERIVED from the device's
-  // org (already access-checked), so reading their approvals does not leak
-  // cross-partner data (#rls_silent_zero_row_read_sdk_poll).
-  const approvals = await runOutsideDbContext(() =>
-    withSystemDbAccessContext(() =>
-      db
-        .select({ patchId: patchApprovals.patchId })
-        .from(patchApprovals)
-        .where(
-          and(
-            eq(patchApprovals.partnerId, partnerId),
-            inArray(patchApprovals.patchId, patchIds),
-            eq(patchApprovals.status, 'approved')
-          )
-        )
-    )
+  // patch_approvals is partner-axis RLS; org-scoped callers read it through
+  // the own-partner SELECT branch, in the request's own connection (#7647).
+  // partnerId is SERVER-DERIVED from the device's org (already access-checked).
+  const rows = await readOwnPartnerAxisRows(partnerId, () =>
+    selectManualDecisionRows(partnerId, patchIds)
   );
 
-  return new Set(approvals.map((approval) => approval.patchId));
+  return resolveLatestManualDecisions(rows, 'any').approved;
 }
 
 // GET /devices/:id/patches/history - Get patch operation history for a device
@@ -234,6 +271,7 @@ patchesRoutes.get(
 
     const conditions = [
       eq(deviceCommands.deviceId, deviceId),
+      await deviceCommandsInCurrentOrg(device),
       inArray(deviceCommands.type, commandTypes)
     ];
     if (status !== 'all') {
@@ -291,9 +329,11 @@ patchesRoutes.get(
   '/:id/patches',
   requireScope('organization', 'partner', 'system'),
   requirePermission(PERMISSIONS.DEVICES_READ.resource, PERMISSIONS.DEVICES_READ.action),
+  zValidator('query', devicePatchStatusQuerySchema),
   async (c) => {
     const auth = c.get('auth');
     const deviceId = c.req.param('id')!;
+    const { approvalView: approvalViewParam } = c.req.valid('query');
 
     const device = await getDeviceWithOrgAndSiteCheck(c, deviceId, auth);
     if (device === SITE_ACCESS_DENIED) {
@@ -318,8 +358,12 @@ patchesRoutes.get(
         title: patches.title,
         externalId: patches.externalId,
         description: patches.description,
-        severity: patches.severity,
-        category: patches.category,
+        // Effective values: shared trusted classification when known, else
+        // this device's own reported severity/category — see
+        // services/patchSeverityOverlay.ts. Scoped by the deviceId WHERE
+        // below, so this can never surface another tenant's report.
+        severity: EFFECTIVE_PATCH_SEVERITY_SQL,
+        category: EFFECTIVE_PATCH_CATEGORY_SQL,
         source: patches.source,
         packageId: patches.packageId,
         releaseDate: patches.releaseDate,
@@ -341,6 +385,7 @@ patchesRoutes.get(
       .where(
         and(
           eq(deviceCommands.deviceId, deviceId),
+          await deviceCommandsInCurrentOrg(device),
           eq(deviceCommands.type, 'patch_scan'),
           inArray(deviceCommands.status, ['completed', 'failed', 'timeout'])
         )
@@ -383,6 +428,67 @@ patchesRoutes.get(
       ? await getApprovedPatchIdsForPartner(partnerId, patchIds)
       : new Set<string>();
 
+    // #7625: the ring-aware verdict — what the scheduled job would decide for
+    // each outstanding patch (manual / ring auto-approved / deferred until a
+    // date / needs approval / excluded by policy). Additive: `approvalStatus`
+    // keeps its manual-only meaning because the Install action below is still
+    // gated on it. The evaluator reads partner-axis tables (patch_policies,
+    // patch_approvals); #7647 gave both an own-partner SELECT branch, so it
+    // runs in THIS request's connection — no second pooled connection, which
+    // was the hold-and-wait shape behind the 09-22 pool deadlock.
+    // readOwnPartnerAxisRows only escapes for a context that cannot see the
+    // device-org's partner (none here unless the org is partner-less, which
+    // the evaluator short-circuits anyway). deviceId/orgId are server-derived
+    // from the access-checked device. A failure degrades to
+    // `available: false` (the tab falls back to approvalStatus) rather than
+    // failing the whole patch list. `approvalView=0` (install poller) still
+    // skips the evaluation; skipped → both fields null and the web tab keeps
+    // its last-known badges.
+    let approvalView: DevicePatchApprovalView | null = null;
+    let approvalEvaluation: DevicePatchApprovalEvaluation | null = null;
+    if (approvalViewParam !== '0' && devicePatchList.some((p) => p.status === 'pending')) {
+      try {
+        const evaluate = () => loadDevicePatchApprovalView(deviceId, device.orgId);
+        // Savepoint: the catch below survives a failed read, and the install
+        // state read after it runs on this same transaction (#11225).
+        approvalView = await withDbTransaction(() => (partnerId
+          ? readOwnPartnerAxisRows(partnerId, evaluate)
+          // Partner-less org: the evaluator reads no partner-axis rows (it
+          // stops at the org's missing partner), so the request context suffices.
+          : evaluate()));
+        approvalEvaluation = approvalView.evaluation;
+        // A pending row the evaluator did not classify (status changed between
+        // the two reads, or an org with no partner) keeps the manual-only
+        // badge. Say so in the log rather than leaving it unexplained.
+        const unclassified = devicePatchList.filter(
+          (p) => p.status === 'pending' && !approvalView!.byPatchId.has(p.patchId)
+        ).length;
+        if (unclassified > 0) {
+          console.warn(
+            `[devices/patches] device ${deviceId}: ${unclassified} pending patch(es) got no ring-aware approval state; showing manual approval status for them`
+          );
+        }
+      } catch (err) {
+        console.error(`[devices/patches] ring-aware approval evaluation failed for device ${deviceId}:`, err);
+        captureException(err, c, { operation: 'devicePatchApprovalView', deviceId, orgId: device.orgId });
+        approvalEvaluation = { available: false, ring: null };
+      }
+    }
+    const effectiveApprovalFor = (patchId: string) => approvalView?.byPatchId.get(patchId) ?? null;
+
+    // #4223: surface the latest failed install attempt (and its reason, e.g.
+    // the agent's battery preflight) on each outstanding patch, so the tab no
+    // longer reads "Pending approval" for a patch whose install actually failed.
+    // #7680: per-device installs (this route's own Install button) count as
+    // attempts too, and a patch whose latest install succeeded but needs a
+    // restart reads as awaiting restart rather than plain pending.
+    const { failures: installFailures, latestByPatch } = await loadDevicePatchInstallState(
+      deviceId,
+      devicePatchList.filter((p) => p.status === 'pending').map((p) => p.patchId)
+    );
+    const awaitingRestartFor = (patchId: string) =>
+      awaitingRestart(latestByPatch.get(patchId), device);
+
     // Separate actionable pending updates from stale missing records.
     const pending = devicePatchList
       .filter(p => p.status === 'pending')
@@ -400,7 +506,10 @@ patchesRoutes.get(
         source: p.source,
         requiresReboot: p.requiresReboot,
         scope: p.scope,
-        approvalStatus: approvedPatchIds.has(p.patchId) ? 'approved' : 'pending'
+        approvalStatus: approvedPatchIds.has(p.patchId) ? 'approved' : 'pending',
+        effectiveApproval: effectiveApprovalFor(p.patchId),
+        installFailure: installFailures.get(p.patchId) ?? null,
+        awaitingRestart: awaitingRestartFor(p.patchId)
       }));
 
     const missing = devicePatchList
@@ -454,10 +563,13 @@ patchesRoutes.get(
         failureCount: p.failureCount
       }));
 
+    // W06 (#8195): stale container images count as pending items, current
+    // ones as installed items; unknowns stay out of the ratio and are only
+    // reported. A device with no workload rows gets exactly the old number
+    // and no `containerImages` key.
+    const imageTerms = (await containerImageComplianceTerms({ deviceIds: [deviceId] })).get(deviceId) ?? null;
     const total = pending.length + installed.length;
-    const compliancePercent = total > 0
-      ? Math.round((installed.length / total) * 100)
-      : 100;
+    const compliancePercent = compliancePercentWithImageTerm(installed.length, total, imageTerms);
 
     return c.json({
       data: {
@@ -466,6 +578,7 @@ patchesRoutes.get(
         lastPatchScanStatus: lastPatchScan?.status ?? null,
         lastPatchScanUserScopeScanned,
         lastPatchScanUserScopeSkipReason,
+        approvalEvaluation,
         pending,
         missing,
         installed,
@@ -482,8 +595,10 @@ patchesRoutes.get(
           releaseDate: p.releaseDate,
           installedAt: p.installedAt,
           source: p.source,
-          approvalStatus: approvedPatchIds.has(p.patchId) ? 'approved' : 'pending'
-        }))
+          approvalStatus: approvedPatchIds.has(p.patchId) ? 'approved' : 'pending',
+          effectiveApproval: p.status === 'pending' ? effectiveApprovalFor(p.patchId) : null
+        })),
+        ...(imageTerms ? { containerImages: imageTerms } : {})
       }
     });
   }
@@ -515,7 +630,9 @@ patchesRoutes.post(
         source: patches.source,
         externalId: patches.externalId,
         packageId: patches.packageId,
-        title: patches.title
+        title: patches.title,
+        category: patches.category,
+        scope: devicePatches.scope
       })
       .from(devicePatches)
       .innerJoin(patches, eq(devicePatches.patchId, patches.id))
@@ -535,7 +652,8 @@ patchesRoutes.post(
     // KB-bearing. Omitting it is also safe for older agents: with no packageId
     // their existing fallback resolves the observed externalId through WUA,
     // which matches both a KB article and an exact UpdateID.
-    const patchRefs = observedPatchRefs.map((patch) =>
+    // `scope` gates the request below; it is not part of the command payload.
+    const patchRefs = observedPatchRefs.map(({ scope: _scope, ...patch }) =>
       patch.source === 'microsoft' ? { ...patch, packageId: null } : patch
     );
 
@@ -549,6 +667,21 @@ patchesRoutes.post(
         error: 'Some patches were not found',
         missingPatchIds
       }, 404);
+    }
+
+    // #10249: a per-user WinGet install (#2727) cannot be applied by the
+    // SYSTEM agent — it fails the command, or after an agent restart installs
+    // a second, machine-wide copy. The web UI already disables Install for
+    // these rows; refuse a direct request too, with the same 409 shape as an
+    // unapproved id so the whole batch is rejected rather than half-queued.
+    const userScopePatchIds = observedPatchRefs
+      .filter((patch) => patch.scope === 'user')
+      .map((patch) => patch.id);
+    if (userScopePatchIds.length > 0) {
+      return c.json({
+        error: 'Per-user (user scope) patches cannot be installed by the agent',
+        userScopePatchIds
+      }, 409);
     }
 
     // Derive the partner from the device's org. If null (no partner found), approved
@@ -566,12 +699,35 @@ patchesRoutes.post(
       }, 409);
     }
 
+    // #4609 W05: the System Restore checkpoint decision for this install,
+    // through the same chokepoint as scheduled patch jobs. Null (no policy,
+    // non-Windows) leaves the payload exactly as before; `category` travels
+    // only alongside a stamped block (the agent's definitions-only skip).
+    let restorePoint;
+    try {
+      restorePoint = await buildRestorePointRequest({
+        deviceId,
+        orgId: device.orgId,
+        osType: device.osType,
+        trigger: 'patch',
+        label: `install ${data.patchIds.length} update${data.patchIds.length === 1 ? '' : 's'}`,
+      });
+    } catch (err) {
+      console.error('[devices/patches] System Restore checkpoint policy resolution failed', {
+        deviceId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      captureException(err);
+      return c.json({ error: 'Failed to resolve the System Restore checkpoint policy' }, 503);
+    }
+
     const queued = await queueCommandForExecution(
       deviceId,
       'install_patches',
       {
         patchIds: data.patchIds,
-        patches: patchRefs
+        patches: restorePoint ? patchRefs : patchRefs.map(({ category: _category, ...ref }) => ref),
+        ...restorePointPayloadField(restorePoint)
       },
       {
         userId: auth.user.id,
@@ -580,10 +736,12 @@ patchesRoutes.post(
     );
 
     if (!queued.command) {
+      await discardRestorePointRequest(restorePoint);
       return c.json({ error: queued.error || 'Failed to queue install_patches command' }, 503);
     }
 
     const command = queued.command;
+    await linkRestorePointCommand(restorePoint, command.id);
 
     const patchNames = patchRefs.map(p => p.title).filter(Boolean);
 
@@ -631,7 +789,7 @@ patchesRoutes.post(
     }
 
     // Bind the rollback target to THIS device's own `installed` observation,
-    // mirroring how install binds to `pending` (#5561 / SEC-115). `patches` is
+    // mirroring how install binds to `pending` (#5561). `patches` is
     // a global catalog shared across tenants, so an id alone must never select
     // what gets removed from a device. `packageId` is deliberately not
     // forwarded: the agent resolves rollbacks against its own installed set.

@@ -1,9 +1,14 @@
+import { createInstance } from 'i18next';
+import { I18nextProvider } from 'react-i18next';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, within } from '@testing-library/react';
 import {
   EMAIL_TEMPLATE_IDS,
   emailTemplateLabel,
 } from '@breeze/shared';
+import ptBRSettings from '../../locales/pt-BR/settings.json';
+
+const AUTOPAY_ROW_IDS = new Set(['autopay_request', 'autopay_enrolled', 'autopay_stopped', 'autopay_paused', 'autopay_resumed', 'card_expiring']);
 
 const fetchWithAuth = vi.fn();
 vi.mock('../../stores/auth', () => ({ fetchWithAuth: (...a: unknown[]) => fetchWithAuth(...a) }));
@@ -43,6 +48,18 @@ beforeEach(() => {
 });
 
 describe('EmailTemplatesTab', () => {
+  it('mounts all enrollment templates under Billing & payments and opens their existing editor', async () => {
+    routeFetch();
+    render(<EmailTemplatesTab />);
+    const group = await screen.findByTestId('autopay-email-template-group');
+    expect(group.textContent).toContain('Billing & payments');
+    for (const id of ['autopay_request', 'autopay_enrolled', 'autopay_stopped','autopay_paused','autopay_resumed', 'card_expiring']) {
+      expect(within(group).getByTestId(`autopay-email-template-${id}`)).toBeTruthy();
+    }
+    fireEvent.click(within(group).getByTestId('autopay-email-template-autopay_request'));
+    expect(await screen.findByTestId('email-template-editor')).toBeTruthy();
+  });
+
   it('lists all catalog template ids with catalog labels', async () => {
     routeFetch();
     render(<EmailTemplatesTab />);
@@ -52,14 +69,51 @@ describe('EmailTemplatesTab', () => {
       'ticket_comment_notification',
       'ticket_autoresponse',
       'ticket_resolved',
+      'ticket_merged',
       'quote_send',
+      'agreement_request_send',
       'invoice_send',
+      'invoice_autopay',
       'portal_invite',
+      'staff_invite',
+      'autopay_request',
+      'autopay_enrolled',
+      'autopay_stopped','autopay_paused','autopay_resumed',
+      'card_expiring',
+      'payment_reminder', 'payment_overdue',
+      'payment_receipt', 'payment_failed',
+      'ticket_approval_requested_approver',
+      'ticket_approval_requested_notify',
+      'ticket_approval_decided',
     ]);
+    expect(screen.getByTestId('autopay-email-template-group').contains(screen.getByTestId('email-template-row-invoice_autopay'))).toBe(true);
+    const newIds = new Set(['autopay_request', 'autopay_enrolled', 'autopay_stopped','autopay_paused','autopay_resumed', 'card_expiring']);
     for (const id of EMAIL_TEMPLATE_IDS) {
-      const row = screen.getByTestId(`email-template-row-${id}`);
+      const row = screen.getByTestId(newIds.has(id) ? `autopay-email-template-${id}` : id === 'payment_reminder' || id === 'payment_overdue' ? `autopay-template-${id}` : `email-template-row-${id}`);
       expect(row.textContent).toContain(emailTemplateLabel(id));
       expect(screen.getByTestId(`email-template-status-${id}`).textContent).toContain('Using default');
+    }
+  });
+
+  it('lists the agreement request template under Billing & payments (#9075 W2b)', async () => {
+    routeFetch();
+    render(<EmailTemplatesTab />);
+    await screen.findByTestId('email-templates-list');
+    const billing = screen.getByTestId('autopay-email-template-group');
+    const row = screen.getByTestId('email-template-row-agreement_request_send');
+    expect(billing.contains(row)).toBe(true);
+    expect(row.textContent).toContain('Agreement request');
+    expect(screen.getByTestId('email-template-other-group').contains(row)).toBe(false);
+  });
+
+  it('lists the work approval templates in the support group', async () => {
+    routeFetch();
+    render(<EmailTemplatesTab />);
+
+    await screen.findByTestId('email-templates-list');
+    const supportGroup = screen.getByTestId('email-template-other-group');
+    for (const id of ['ticket_approval_requested_approver', 'ticket_approval_requested_notify', 'ticket_approval_decided'] as const) {
+      expect(supportGroup.contains(screen.getByTestId(`email-template-row-${id}`))).toBe(true);
     }
   });
 
@@ -101,4 +155,79 @@ describe('EmailTemplatesTab', () => {
     expect(await screen.findByTestId('email-template-editor')).toBeTruthy();
     expect(window.location.hash).toBe('#email-templates');
   });
+});
+
+it.each(['payment_reminder', 'payment_overdue'])('opens the %s editor from Billing & payments', async id => {
+  routeFetch(); render(<EmailTemplatesTab />);
+  const row = await screen.findByTestId(`autopay-template-${id}`);
+  expect(screen.getByTestId('autopay-email-template-group')).toContainElement(row);
+  fireEvent.click(row);
+  expect(await screen.findByTestId('email-template-editor')).toBeTruthy();
+});
+
+it('retains translated enrollment and group labels alongside reminder rows', async () => {
+  const translated = createInstance();
+  const labels = {
+    autopay_request: 'Demande de paiement automatique',
+    autopay_enrolled: 'Paiements automatiques confirmés',
+    autopay_stopped: 'Paiements automatiques arrêtés',
+    autopay_paused: 'Paiements automatiques suspendus',
+    autopay_resumed: 'Paiements automatiques repris',
+    card_expiring: 'Expiration de la carte enregistrée',
+  };
+  await translated.init({ lng: 'fr', fallbackLng: false, defaultNS: 'settings',
+    resources: { fr: { settings: { emailTemplates: {
+      billingPayments: 'Facturation et paiements', supportPortal: 'Assistance et portail', labels,
+    } } } }, interpolation: { escapeValue: false } });
+  routeFetch();
+  render(<I18nextProvider i18n={translated}><EmailTemplatesTab /></I18nextProvider>);
+  const group = await screen.findByTestId('autopay-email-template-group');
+  expect(group.textContent).toContain('Facturation et paiements');
+  expect(screen.getByTestId('email-template-other-group').textContent).toContain('Assistance et portail');
+  for (const [id, label] of Object.entries(labels)) {
+    expect(within(group).getByTestId(`autopay-email-template-${id}`).textContent).toContain(label);
+  }
+  for (const id of ['payment_reminder', 'payment_overdue']) {
+    expect(within(group).getByTestId(`autopay-template-${id}`)).toBeTruthy();
+  }
+});
+
+it('renders every built-in template name from the pt-BR catalog in the list and editor heading (#9953)', async () => {
+  const translated = createInstance();
+  await translated.init({ lng: 'pt-BR', fallbackLng: false, defaultNS: 'settings',
+    resources: { 'pt-BR': { settings: ptBRSettings } }, interpolation: { escapeValue: false } });
+  const ptLabels = (ptBRSettings as { emailTemplates: { labels: Record<string, string> } }).emailTemplates.labels;
+  const rowTestId = (id: string) => AUTOPAY_ROW_IDS.has(id) ? `autopay-email-template-${id}`
+    : id === 'payment_reminder' || id === 'payment_overdue' ? `autopay-template-${id}` : `email-template-row-${id}`;
+  routeFetch();
+  render(<I18nextProvider i18n={translated}><EmailTemplatesTab /></I18nextProvider>);
+  await screen.findByTestId('email-templates-list');
+  for (const id of EMAIL_TEMPLATE_IDS) {
+    const label = ptLabels[id];
+    expect(label, id).toBeTruthy();
+    expect(label, id).not.toBe(emailTemplateLabel(id));
+    const row = screen.getByTestId(rowTestId(id));
+    expect(row).toHaveTextContent(label);
+    fireEvent.click(row);
+    const editor = await screen.findByTestId('email-template-editor');
+    expect(within(editor).getByRole('heading', { name: label })).toBeInTheDocument();
+    fireEvent.click(within(editor).getByTestId('email-template-back'));
+    await screen.findByTestId('email-templates-list');
+  }
+});
+
+it.each([
+  ['payment_receipt', 'Reçu de paiement'],
+  ['payment_failed', 'Le paiement n’a pas pu être effectué'],
+])('translates the %s row and editor heading', async (id, label) => {
+  const translated = createInstance();
+  await translated.init({ lng: 'fr', fallbackLng: false, defaultNS: 'settings',
+    resources: { fr: { settings: { emailTemplates: { labels: { [id]: label } } } } },
+    interpolation: { escapeValue: false } });
+  routeFetch();
+  render(<I18nextProvider i18n={translated}><EmailTemplatesTab /></I18nextProvider>);
+  const row = await screen.findByTestId(`email-template-row-${id}`);
+  expect(row).toHaveTextContent(label);
+  fireEvent.click(row);
+  expect(within(await screen.findByTestId('email-template-editor')).getByRole('heading', { name: label })).toBeInTheDocument();
 });

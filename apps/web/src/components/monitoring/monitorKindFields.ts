@@ -1,4 +1,4 @@
-import type { MonitorKind } from '@breeze/shared';
+import { TIME_SYNC_FINDING_CODES, type MonitorKind } from '@breeze/shared';
 
 /**
  * The monitor editor's condition fields render from this map rather than
@@ -7,7 +7,7 @@ import type { MonitorKind } from '@breeze/shared';
  * asserts every key here is a key of the corresponding zod object's shape, and
  * `defaultConditionFor` must produce a value the schema accepts.
  */
-export type FieldKind = 'number' | 'text' | 'select' | 'operator' | 'script' | 'boolean';
+export type FieldKind = 'number' | 'text' | 'select' | 'operator' | 'script' | 'boolean' | 'multiselect';
 
 export interface KindField {
   key: string;
@@ -58,7 +58,7 @@ export const MONITOR_KIND_FIELDS: Record<MonitorKind, readonly KindField[]> = {
       kind: 'select',
       options: ['security', 'hardware', 'application', 'system'],
     },
-    { key: 'level', labelKey: 'monitoring:fields.level', kind: 'select', options: ['warning', 'error', 'critical'] },
+    { key: 'level', labelKey: 'monitoring:fields.level', kind: 'select', options: ['info', 'warning', 'error', 'critical'] },
     { key: 'sourcePattern', labelKey: 'monitoring:fields.sourcePattern', kind: 'text', optional: true },
     { key: 'messagePattern', labelKey: 'monitoring:fields.messagePattern', kind: 'text', optional: true },
     { key: 'countThreshold', labelKey: 'monitoring:fields.countThreshold', kind: 'number', min: 1 },
@@ -164,7 +164,7 @@ export const MONITOR_KIND_FIELDS: Record<MonitorKind, readonly KindField[]> = {
       key: 'check',
       labelKey: 'monitoring:fields.backupCheck',
       kind: 'select',
-      options: ['no_successful_backup', 'consecutive_failures'],
+      options: ['no_successful_backup', 'consecutive_failures', 'completed_with_errors'],
     },
     {
       key: 'maxAgeHours',
@@ -219,14 +219,25 @@ export const MONITOR_KIND_FIELDS: Record<MonitorKind, readonly KindField[]> = {
       optional: true,
       showWhen: { key: 'checkType', equals: 'http_check' },
     },
+    { key: 'count', labelKey: 'monitoring:fields.pingCount', kind: 'number', min: 1, max: 20, optional: true, showWhen: { key: 'checkType', equals: 'icmp_ping' } },
+    { key: 'expectBanner', labelKey: 'monitoring:fields.expectBanner', kind: 'text', optional: true, showWhen: { key: 'checkType', equals: 'tcp_port' } },
+    { key: 'method', labelKey: 'monitoring:fields.httpMethod', kind: 'select', options: ['GET', 'HEAD', 'POST', 'PUT', 'OPTIONS'], optional: true, showWhen: { key: 'checkType', equals: 'http_check' } },
+    { key: 'expectedBody', labelKey: 'monitoring:fields.expectedBody', kind: 'text', optional: true, showWhen: { key: 'checkType', equals: 'http_check' } },
+    { key: 'followRedirects', labelKey: 'monitoring:fields.followRedirects', kind: 'boolean', optional: true, showWhen: { key: 'checkType', equals: 'http_check' } },
+    { key: 'verifySsl', labelKey: 'monitoring:fields.verifySsl', kind: 'boolean', optional: true, showWhen: { key: 'checkType', equals: 'http_check' } },
+    { key: 'recordType', labelKey: 'monitoring:fields.recordType', kind: 'select', options: ['A', 'AAAA', 'MX', 'CNAME', 'TXT', 'NS'], optional: true, showWhen: { key: 'checkType', equals: 'dns_check' } },
+    { key: 'expectedValue', labelKey: 'monitoring:fields.expectedValue', kind: 'text', optional: true, showWhen: { key: 'checkType', equals: 'dns_check' } },
+    { key: 'nameserver', labelKey: 'monitoring:fields.nameserver', kind: 'text', optional: true, showWhen: { key: 'checkType', equals: 'dns_check' } },
+    { key: 'degradedIsFailure', labelKey: 'monitoring:fields.degradedIsFailure', kind: 'boolean' },
+    { key: 'maxResponseMs', labelKey: 'monitoring:fields.maxResponseMs', kind: 'number', min: 1, max: 600000, optional: true },
     {
       key: 'pollingIntervalSeconds',
       labelKey: 'monitoring:fields.pollingIntervalSeconds',
       kind: 'number',
-      min: 30,
-      max: 3600,
+      min: 10,
+      max: 86400,
     },
-    { key: 'timeoutSeconds', labelKey: 'monitoring:fields.timeoutSeconds', kind: 'number', min: 1, max: 120 },
+    { key: 'timeoutSeconds', labelKey: 'monitoring:fields.timeoutSeconds', kind: 'number', min: 1, max: 300 },
     {
       key: 'consecutiveFailures',
       labelKey: 'monitoring:fields.consecutiveFailures',
@@ -241,7 +252,56 @@ export const MONITOR_KIND_FIELDS: Record<MonitorKind, readonly KindField[]> = {
   composite: [
     { key: 'match', labelKey: 'monitoring:fields.match', kind: 'select', options: ['all', 'any'] },
   ],
-
+  hardware_health: [
+    {
+      key: 'componentTypes',
+      labelKey: 'monitoring:monitors.fields.hardware_health.componentTypes',
+      kind: 'multiselect',
+      options: ['controller', 'virtual_disk', 'physical_disk', 'cache_battery', 'enclosure', 'collector'],
+    },
+    {
+      key: 'minHealth',
+      labelKey: 'monitoring:monitors.fields.hardware_health.minHealth',
+      kind: 'select',
+      options: ['warning', 'critical'],
+    },
+    {
+      key: 'includePredictiveFailure',
+      labelKey: 'monitoring:monitors.fields.hardware_health.includePredictiveFailure',
+      kind: 'boolean',
+    },
+    {
+      key: 'consecutiveSnapshots',
+      labelKey: 'monitoring:monitors.fields.hardware_health.consecutiveSnapshots',
+      kind: 'number',
+      min: 1,
+      max: 10,
+    },
+  ],
+  time_sync: [
+    {
+      key: 'findings',
+      labelKey: 'monitoring:monitors.fields.time_sync.findings',
+      kind: 'multiselect',
+      options: TIME_SYNC_FINDING_CODES,
+    },
+    {
+      key: 'consecutiveSnapshots',
+      labelKey: 'monitoring:monitors.fields.time_sync.consecutiveSnapshots',
+      kind: 'number',
+      min: 1,
+      max: 10,
+    },
+  ],
+  container_image_currency: [
+    {
+      key: 'minDaysBehind',
+      labelKey: 'monitoring:monitors.fields.container_image_currency.minDaysBehind',
+      kind: 'number',
+      min: 0,
+      max: 365,
+    },
+  ],
 };
 
 /**
@@ -307,7 +367,7 @@ export function defaultConditionFor(kind: MonitorKind): Record<string, unknown> 
       // script is chosen.
       return { scriptId: '00000000-0000-0000-0000-000000000000', intervalMinutes: 60, timeoutSeconds: 300, breachOnNonZeroExit: true };
     case 'network_check':
-      return { checkType: 'icmp_ping', target: '8.8.8.8', pollingIntervalSeconds: 60, timeoutSeconds: 5, consecutiveFailures: 2 };
+      return { checkType: 'icmp_ping', target: '8.8.8.8', pollingIntervalSeconds: 60, timeoutSeconds: 5, consecutiveFailures: 2, degradedIsFailure: false };
     case 'composite':
       return {
         match: 'all',
@@ -316,6 +376,19 @@ export function defaultConditionFor(kind: MonitorKind): Record<string, unknown> 
           { kind: 'memory', condition: { operator: 'gt', value: 90, durationMinutes: 5 } },
         ],
       };
-
+    case 'hardware_health':
+      return {
+        componentTypes: ['virtual_disk', 'physical_disk'],
+        minHealth: 'critical',
+        includePredictiveFailure: true,
+        consecutiveSnapshots: 2,
+      };
+    case 'time_sync':
+      return {
+        findings: ['sync_stale', 'sync_disabled'],
+        consecutiveSnapshots: 2,
+      };
+    case 'container_image_currency':
+      return { minDaysBehind: 7 };
   }
 }

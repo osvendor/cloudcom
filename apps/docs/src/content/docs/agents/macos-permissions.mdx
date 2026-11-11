@@ -14,19 +14,39 @@ macOS gates access to the screen, input events, and protected files behind per-a
 
 | Permission | Binary | Used For | How to Grant |
 |---|---|---|---|
-| **Full Disk Access** | `/usr/local/bin/breeze-agent`, `/usr/local/bin/breeze-desktop-helper` | System data collection, backup features | MDM PPPC profile (zero-touch) or manual System Settings grant |
-| **Accessibility** | `/usr/local/bin/breeze-agent`, `/usr/local/bin/breeze-desktop-helper` | Remote input (mouse and keyboard) during remote desktop sessions | MDM PPPC profile (zero-touch) or manual System Settings grant |
+| **Full Disk Access** | `/usr/local/bin/breeze-agent` or `/Library/Breeze/bin/breeze-agent` (see [agent path](#agent-path-usrlocalbin-or-librarybreezebin)), `/usr/local/bin/breeze-desktop-helper` | System data collection, backup features | MDM PPPC profile (zero-touch) or manual System Settings grant |
+| **Accessibility** | `/usr/local/bin/breeze-agent` or `/Library/Breeze/bin/breeze-agent` (see [agent path](#agent-path-usrlocalbin-or-librarybreezebin)), `/usr/local/bin/breeze-desktop-helper` | Remote input (mouse and keyboard) during remote desktop sessions | MDM PPPC profile (zero-touch) or manual System Settings grant |
 | **Screen Recording** | `/usr/local/bin/breeze-desktop-helper` | Remote desktop screen capture | **User approval only.** MDM cannot pre-grant it -- a PPPC profile can only allow standard (non-admin) users to approve it themselves, via the `ScreenCapture` service's `AllowStandardUserToSetSystemService` authorization (macOS 11+) |
 
 <Aside type="note">
   Apple does not permit MDM to silently grant Screen Recording. The best available automation is the `AllowStandardUserToSetSystemService` key, which lets a logged-in standard user click **Allow** without needing admin credentials. The end user still has to approve the prompt once.
 </Aside>
 
+## Agent Path: /usr/local/bin or /Library/Breeze/bin
+
+macOS ties Full Disk Access for a bare (non-bundle) binary to its file path, not just its code-signing identity, so which path the agent runs from decides where you grant FDA.
+
+From agent 0.118.3:
+
+- The agent and watchdog **stay in `/usr/local/bin`** when `/usr/local/bin` and every directory above it are owned by root and not writable by group or other -- the stock macOS state. Nothing moves, and existing Full Disk Access and other privacy grants keep working.
+- The agent **moves to `/Library/Breeze/bin`** only when `/usr/local/bin` is unsafe for a root daemon: the binary or a directory above it is not owned by root, or is group- or world-writable. The known case is Homebrew on Intel Macs, which hands `/usr/local/bin` to an admin user. Only in this case do you need to re-grant Full Disk Access, for `/Library/Breeze/bin/breeze-agent`. The agent logs a warning when it moves.
+- Agents 0.118.0 through 0.118.2 moved **every** install, safe or not, which is why fleets on those versions saw Full Disk Access break widely. 0.118.3 does not move an install back to `/usr/local/bin` once it has moved -- a re-grant you already made for `/Library/Breeze/bin` keeps holding. Move any Mac still on 0.118.0-0.118.2 to 0.118.3 or later; do not promote those versions to Macs you cannot touch.
+- The `.pkg` installer (used for installs and for macOS agent updates) always installs to wherever the existing install lives, so it never moves an install back and forth on its own. `breeze-agent service install` (manual CLI install) and the dev install script install to `/Library/Breeze/bin` directly.
+- The desktop helper is never moved -- it always stays at `/usr/local/bin/breeze-desktop-helper`.
+
+For an MDM-managed fleet, the simplest zero-touch approach is a PPPC profile that lists both paths (see below) so it covers a Mac regardless of which one it runs from.
+
+See [After an agent relocation](#after-an-agent-relocation) for what changes on a Mac that does move, and how to confirm the grant landed.
+
 ## Zero-Touch Grants with a PPPC Profile
 
 If the Mac is enrolled in an MDM (Jamf, Mosyle, Kandji, Intune, etc.), deploy a PPPC configuration profile that grants Full Disk Access and Accessibility to both Breeze binaries. This is the recommended path for fleet deployments -- no on-device interaction is required for those two permissions.
 
 The profile identifies each binary by its installed path plus a code-signing requirement, so the grant only applies to a genuine, Developer ID-signed Breeze binary at that path.
+
+<Aside type="caution" title="Cover both agent paths">
+  From agent 0.118.3, most Macs keep running the agent from `/usr/local/bin/breeze-agent`; only Macs where that directory is unsafe for a root daemon (see [Agent Path](#agent-path-usrlocalbin-or-librarybreezebin)) move to `/Library/Breeze/bin/breeze-agent`. A path-based PPPC grant for one path does not cover the other, so list both `/usr/local/bin/breeze-agent` and `/Library/Breeze/bin/breeze-agent`, each with the same code requirement, as the sample profile below does. That way the profile grants the permission wherever a given Mac's agent runs, with no need to know in advance which path applies. The desktop helper is never moved -- it always stays at `/usr/local/bin/breeze-desktop-helper`.
+</Aside>
 
 <Aside type="caution">
   PPPC payloads are only honored when delivered through a user-approved or supervised MDM enrollment. Installing the same `.mobileconfig` by double-clicking it does not apply the privacy grants.
@@ -68,6 +88,16 @@ The following profile is ready to import into your MDM (most consoles accept a r
           </dict>
           <dict>
             <key>Identifier</key>
+            <string>/Library/Breeze/bin/breeze-agent</string>
+            <key>IdentifierType</key>
+            <string>path</string>
+            <key>CodeRequirement</key>
+            <string>(identifier "breeze-agent-darwin-arm64" or identifier "breeze-agent-darwin-amd64") and anchor apple generic and certificate leaf[subject.OU] = D8W6N2JYMA</string>
+            <key>Allowed</key>
+            <true/>
+          </dict>
+          <dict>
+            <key>Identifier</key>
             <string>/usr/local/bin/breeze-desktop-helper</string>
             <key>IdentifierType</key>
             <string>path</string>
@@ -82,6 +112,16 @@ The following profile is ready to import into your MDM (most consoles accept a r
           <dict>
             <key>Identifier</key>
             <string>/usr/local/bin/breeze-agent</string>
+            <key>IdentifierType</key>
+            <string>path</string>
+            <key>CodeRequirement</key>
+            <string>(identifier "breeze-agent-darwin-arm64" or identifier "breeze-agent-darwin-amd64") and anchor apple generic and certificate leaf[subject.OU] = D8W6N2JYMA</string>
+            <key>Allowed</key>
+            <true/>
+          </dict>
+          <dict>
+            <key>Identifier</key>
+            <string>/Library/Breeze/bin/breeze-agent</string>
             <key>IdentifierType</key>
             <string>path</string>
             <key>CodeRequirement</key>
@@ -134,10 +174,12 @@ The following profile is ready to import into your MDM (most consoles accept a r
 </plist>
 ```
 
-The code requirements match both the Apple Silicon (`-darwin-arm64`) and Intel (`-darwin-amd64`) builds, so a single profile covers a mixed fleet. You can verify the signing identity of an installed binary at any time:
+The code requirements match both the Apple Silicon (`-darwin-arm64`) and Intel (`-darwin-amd64`) builds, so a single profile covers a mixed fleet. The agent entry is listed twice, once per path, so the same profile grants the permission whether a given Mac's agent runs from `/usr/local/bin` or `/Library/Breeze/bin` (see [Agent Path](#agent-path-usrlocalbin-or-librarybreezebin)). You can verify the signing identity of an installed binary at any time, using whichever path the agent currently runs from:
 
 ```bash
 codesign -dvvv /usr/local/bin/breeze-agent 2>&1 | grep -E '^Identifier|TeamIdentifier'
+# or, on a Mac where the agent moved:
+codesign -dvvv /Library/Breeze/bin/breeze-agent 2>&1 | grep -E '^Identifier|TeamIdentifier'
 # Identifier=breeze-agent-darwin-arm64
 # TeamIdentifier=D8W6N2JYMA
 ```
@@ -156,11 +198,11 @@ Without an MDM, grant the permissions on the device under **System Settings > Pr
 
 <Steps>
 
-1. **Full Disk Access** -- open **Privacy & Security > Full Disk Access**, click **+**, press <kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>G</kbd> in the file picker, and add `/usr/local/bin/breeze-agent` and `/usr/local/bin/breeze-desktop-helper`.
+1. **Full Disk Access** -- open **Privacy & Security > Full Disk Access**, click **+**, press <kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>G</kbd> in the file picker, and add `/usr/local/bin/breeze-desktop-helper` plus the agent binary at whichever path it runs from -- `/usr/local/bin/breeze-agent` on most Macs, or `/Library/Breeze/bin/breeze-agent` if it has moved (see [Agent Path](#agent-path-usrlocalbin-or-librarybreezebin)). Run `ls /Library/Breeze/bin/breeze-agent` first if you are not sure which one applies.
 
 2. **Accessibility** -- open **Privacy & Security > Accessibility** and add the same two binaries.
 
-3. **Screen Recording** -- open **Privacy & Security > Screen & System Audio Recording** (labeled **Screen Recording** on macOS 12-14) and enable `breeze-desktop-helper`. If the helper has already attempted a capture, it appears in the list automatically; otherwise the first remote desktop connection triggers the standard macOS approval prompt.
+3. **Screen Recording** -- open **Privacy & Security > Screen & System Audio Recording** (labeled **Screen Recording** on macOS 12-14) and enable `breeze-desktop-helper`. The helper never captures the screen to check this permission, so it may not appear in the list until you add it with **+** (`/usr/local/bin/breeze-desktop-helper`). On macOS 12-15 the helper asks macOS for the grant once a day while it is missing, and a remote desktop connection is refused (with a `missing_permission` reason in the console) until it is granted; on macOS 26 the first connection is allowed and its own capture decides.
 
 </Steps>
 
@@ -170,22 +212,66 @@ Changes to Full Disk Access take effect after the agent service restarts:
 sudo launchctl kickstart -k system/com.breeze.agent
 ```
 
+After granting Screen Recording or Accessibility, restart the desktop helper as the logged-in user (run in that user's Terminal, without `sudo`) so it re-reads its permissions:
+
+```bash
+launchctl kickstart -k gui/$(id -u)/com.breeze.desktop-helper-user
+```
+
+Remote desktop needs **both** Screen Recording and Accessibility for the desktop helper -- with either one missing, the device reports remote desktop as unavailable.
+
+## After an agent relocation
+
+This applies only to a Mac where `/usr/local/bin` was unsafe for a root daemon and the agent moved to `/Library/Breeze/bin` (see [Agent Path](#agent-path-usrlocalbin-or-librarybreezebin)). Most Macs never hit this.
+
+- **Grant Full Disk Access at the new path.** Add `/Library/Breeze/bin/breeze-agent` in **System Settings > Privacy & Security > Full Disk Access**, or push the PPPC update, if you have not already covered both paths as shown above.
+- **How to tell a Mac needs this.** Until the grant lands, the device's Full Disk Access status still shows as missing, and the agent's self-health reports a `macos_fda_relocation` warning naming the old and new path (from `GET /devices/{id}/health`). The warning clears on its own once Full Disk Access is granted for the new path -- there is no separate UI panel for it.
+- **Leftover binaries are cleaned up automatically.** After moving, the agent removes the old `breeze-agent`, `breeze-watchdog` and `breeze-backup` copies left behind in `/usr/local/bin` on its next start.
+- **A PPPC profile covering both paths needs zero further action.** If your profile already lists both `/usr/local/bin/breeze-agent` and `/Library/Breeze/bin/breeze-agent` with the same code requirement (as in the sample profile above), the grant applies automatically regardless of which path the agent ends up on.
+
 ## Troubleshooting
 
 **A permission "disappears" after an agent update.**
-TCC grants are keyed to the binary's code-signing identity, not just its path. Official Breeze binaries are Developer ID signed with a stable identity, so grants survive updates. If a grant stops applying after an update, check that the binary is still properly signed:
+For a bare (non-bundle) binary like the agent, macOS keys a TCC grant to the binary's file path, not just its code-signing identity, so a grant made for one path does not carry over if the binary starts running from a different one -- see [After an agent relocation](#after-an-agent-relocation) if that is what happened. Within a stable path, official Breeze binaries are Developer ID signed with a stable identity, so grants survive ordinary updates. If a grant stops applying after an update at the same path, check that the binary is still properly signed:
 
 ```bash
 codesign -dvvv /usr/local/bin/breeze-agent
+# or /Library/Breeze/bin/breeze-agent, whichever path the agent runs from
 ```
 
 Expect `Authority=Developer ID Application: LanternOps LLC (D8W6N2JYMA)` and `TeamIdentifier=D8W6N2JYMA`. An ad-hoc or unsigned binary -- typical of a manual or development build -- gets a new identity on every build, so macOS treats each update as a brand-new app and drops the grant. Reinstall an official signed release, or re-grant after each build for development installs.
 
 **The PPPC profile is installed but permissions are not granted.**
-Confirm the profile arrived through MDM (`profiles list` should show it under a device channel). PPPC payloads are ignored when the profile is installed manually. Also verify the code requirement matches the installed binary: `codesign -d -r- /usr/local/bin/breeze-agent` prints the designated requirement to compare against.
+Confirm the profile arrived through MDM (`profiles list` should show it under a device channel). PPPC payloads are ignored when the profile is installed manually. Also verify the code requirement matches the installed binary, at whichever path it runs from: `codesign -d -r- /usr/local/bin/breeze-agent` (or the `/Library/Breeze/bin` path) prints the designated requirement to compare against.
+
+**System Settings shows Screen Recording or Accessibility on, but Breeze reports it missing.**
+macOS honours a grant only while the binary still matches the code requirement recorded with it. If `breeze-desktop-helper` on disk was replaced by a build with a different signature (an ad-hoc or unsigned copy, or a locally built helper), or the grant was written by the permission self-heal in agent 0.105.2 and earlier (which recorded no code requirement), System Settings keeps showing the toggle on while macOS refuses the helper, with no prompt. When the helper sees a denial it explains it: the `desktop helper startup probe` line in the device's agent logs carries `tccVerdict` plus the helper's signing identity, its designated requirement, and, for each denied permission, the TCC row and the requirement stored in it. The agent's `TCC permissions received` line carries the same verdict as `denialVerdict`.
+
+| Verdict | Meaning | Fix |
+|---|---|---|
+| `requirement_mismatch` | The grant was made to a differently signed build | Reinstall the official signed release; the existing grant applies again. If the verdict stays, reset and grant again as in the next row |
+| `legacy_row_no_csreq` | The grant has no code requirement (old self-heal) | `sudo tccutil reset ScreenCapture` and `sudo tccutil reset Accessibility`, then grant again |
+| `not_granted` | No grant for this path, or it is off | Grant it in System Settings |
+| `unexplained` | The grant matches this binary; the cause is elsewhere | Collect the log line and contact support |
+| `unobservable` | The helper could not read the TCC database (it needs Full Disk Access) | Grant Full Disk Access to the helper, or check its signing identity in the same log line |
 
 **Remote desktop connects but shows a black screen.**
 Screen Recording has not been approved for `breeze-desktop-helper`. This permission always requires a one-time user approval -- see the table above.
+
+**macOS keeps asking to let `breeze-desktop-helper` record the screen (macOS 15+).**
+On macOS 15 and later, ScreenCaptureKit can show its own "record this computer's screen and audio" approval, and for the bare helper binary macOS may not keep that approval. macOS 15 also shows a separate acknowledgement alert ("`breeze-desktop-helper` can record this computer's screen") for the first screen capture in each 30-day window, by any API. The desktop helper's permission checks (at startup, on every connect, and in its periodic TCC loop) never capture the screen and never use ScreenCaptureKit; only a remote desktop session captures, so that alert can appear only while a technician is connecting. A helper restart on its own shows nothing.
+
+Where macOS reports the Screen Recording grant unreliably (macOS 26 can say "not granted" while it is), the helper reads other non-capturing signals instead: whether other apps' window titles are visible to it, and whether an earlier remote desktop session captured successfully on this agent version and macOS build. The agent log's `TCC permissions received` line carries `screenRecordingState` (`granted`, `denied` or `unknown`); `unknown` still allows a session, whose own capture decides. If ScreenCaptureKit cannot capture in a session (the user declines its prompt, or it produces no frames) while Screen Recording is granted, the helper switches to CoreGraphics capture and records that, so later sessions and helper restarts don't ask again. The record lapses when the agent updates, macOS updates, or the Screen Recording grant changes. Run these as the logged-in user, without `sudo`:
+
+```bash
+breeze-desktop-helper capture-backend                    # show the recorded verdict
+breeze-desktop-helper capture-backend pin-coregraphics   # never use ScreenCaptureKit for this user
+breeze-desktop-helper capture-backend reset              # forget it; the next session tries ScreenCaptureKit
+```
+
+From a root shell, such as a Breeze remote terminal, use `launchctl asuser <uid> sudo -u '#<uid>' /usr/local/bin/breeze-desktop-helper capture-backend ...`.
+
+`breeze-desktop-helper probe` reports the non-capturing check as `captureAccess` and then takes one real capture (it is the only permission check that does); it doesn't call ScreenCaptureKit unless you pass `--sck`. macOS charges a probe's capture to whatever launched it: Terminal, or `breeze-agent` from a Breeze script or remote terminal. The launchd helper's grants are separate, so the probe can't show them. For the helper's real permission state, look for the `TCC permissions received` line in the device's agent logs.
 
 **Remote desktop is unavailable even though the device shows Online.**
 The desktop helper runs alongside the agent and can briefly lose its connection to it — after an agent update, or when the Mac sleeps and wakes. The helper now reconnects on its own when that happens, so this should clear within moments. Earlier agent versions left the helper stopped until it was relaunched or the user logged out and back in; if you are seeing that, update the agent.

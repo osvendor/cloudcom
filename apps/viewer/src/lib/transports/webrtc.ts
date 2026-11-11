@@ -35,6 +35,11 @@ export interface WebRTCDeps {
    * (issue #3410). Fires only for a permanent gap, never for a failed attempt.
    */
   onWebRTCUnsupported?: () => void;
+  /**
+   * The agent is holding its answer until the end user answers the consent
+   * dialog (#6818). Fires at most once per attempt, before the answer lands.
+   */
+  onAwaitingUserApproval?: () => void;
 }
 
 export interface WebRTCSessionWrapper extends TransportSession {
@@ -43,6 +48,27 @@ export interface WebRTCSessionWrapper extends TransportSession {
   videoElement: HTMLVideoElement;
   controlChannel: RTCDataChannel;
   inputChannel: RTCDataChannel;
+  /** Open `input-r` on this peer connection (reliable input protocol, #8239). */
+  openReliableInput(): RTCDataChannel | null;
+}
+
+/**
+ * Open the reliable input channel, `input-r`, on an established peer
+ * connection. Only after the agent advertised `reliableInput`: an older agent
+ * would ignore the label, so there is no point opening it there.
+ *
+ * Ordered and fully reliable: the agent closes an `input-r` that sets
+ * maxRetransmits or maxPacketLifeTime. A data channel added once SCTP is up
+ * needs no renegotiation.
+ */
+export function openReliableInputChannel(pc: RTCPeerConnection): RTCDataChannel | null {
+  if (pc.signalingState === 'closed') return null;
+  try {
+    return pc.createDataChannel('input-r', { ordered: true });
+  } catch (err) {
+    console.warn('Could not open the reliable input channel; staying on the standard one:', err);
+    return null;
+  }
 }
 
 export async function connectWebRTC(
@@ -52,7 +78,9 @@ export async function connectWebRTC(
   const videoEl = deps.videoElement;
 
   try {
-    const session = await createWebRTCSession(auth, videoEl, undefined, deps.targetSessionId);
+    const session = await createWebRTCSession(auth, videoEl, undefined, deps.targetSessionId, {
+      onAwaitingUserApproval: deps.onAwaitingUserApproval,
+    });
 
     // Reduce input lag under loss: caller manages mouse-move coalescing via the
     // returned inputChannel, but set the low-water threshold here so it can hook
@@ -188,6 +216,7 @@ export async function connectWebRTC(
       videoElement: videoEl,
       controlChannel: session.controlChannel,
       inputChannel: session.inputChannel,
+      openReliableInput: () => openReliableInputChannel(session.pc),
       close: () => session.close(),
     };
 

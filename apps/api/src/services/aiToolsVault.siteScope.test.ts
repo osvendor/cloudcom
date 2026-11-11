@@ -11,6 +11,11 @@ vi.mock('./commandQueue', () => ({
   CommandTypes: { VAULT_SYNC: 'vault_sync' },
 }));
 
+vi.mock('./vaultDeviceCommands', () => ({
+  buildVaultConfigurePayload: vi.fn(async () => ({ enabled: false })),
+  resolveLatestVaultSyncSnapshotId: vi.fn(async () => 'snap-latest'),
+}));
+
 vi.mock('./aiDispatch', () => ({
   aiQueueCommandForExecution: vi.fn(async () => ({ command: { id: 'c1', status: 'sent' } })),
 }));
@@ -98,6 +103,24 @@ describe('get_vault_status — site scoping (cross-site secret/device read)', ()
     const result = await handlerFor('get_vault_status')({ deviceId: 'd1' }, makeAuth(undefined));
     const parsed = JSON.parse(result);
     expect(parsed.deviceId).toBe('d1');
+  });
+});
+
+describe('query_vaults — site narrowing', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('fails closed (empty, no query) for a site-restricted caller whose org never resolves', async () => {
+    let anyQueryRan = false;
+    mockDb.select.mockImplementation(() => {
+      anyQueryRan = true;
+      return { from: () => ({ leftJoin: () => ({ where: () => ({ orderBy: () => ({ limit: () => Promise.resolve([{ id: 'v1' }]) }) }) }) }) };
+    });
+    const auth = { ...makeAuth(['site-A']), orgId: null, accessibleOrgIds: [] };
+    const result = await handlerFor('query_vaults')({}, auth);
+    const parsed = JSON.parse(result);
+    expect(parsed.vaults).toEqual([]);
+    expect(parsed.showing).toBe(0);
+    expect(anyQueryRan).toBe(false);
   });
 });
 

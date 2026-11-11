@@ -1,10 +1,14 @@
 import { parseExtensionPageContextV1, type ExtensionPageContextV1 } from '@breeze/extension-web-sdk';
 import './microsoft-connect';
+import './idrive';
+import './harmony';
 import type { CloudCommandHostApi, CloudCommandThreeCxMode } from './index';
 
 const ELEMENT = 'cloudcommand-connect-page';
-type Provider = 'threecx' | 'microsoft' | 'google';
+type Provider = 'threecx' | 'microsoft' | 'google' | 'idrive' | 'harmony';
 const providers: ReadonlyArray<{ id: Provider; name: string; href: string; detail: string; icon: string }> = [
+  { id: 'idrive', name: 'IDrive 360', href: '', detail: 'Connect client backup groups.', icon: '<svg viewBox="0 0 24 24"><path d="M4 5h16v14H4zM8 15h8"/></svg>' },
+  { id: 'harmony', name: 'Harmony Endpoint', href: '', detail: 'Connect endpoint protection and scoped inventory.', icon: '<svg viewBox="0 0 24 24"><path d="M12 3l8 3v5c0 5-3.4 8.4-8 10-4.6-1.6-8-5-8-10V6z"/><path d="M8 12l2.5 2.5L16 9"/></svg>' },
   { id: 'threecx', name: '3CX', href: '', detail: 'Connect a PBX and select the directory scope for this organization.', icon: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14v14H5z"/><path d="M8 9h8M8 12h5M8 15h8"/></svg>' },
   { id: 'microsoft', name: 'Microsoft 365', href: '', detail: 'Manage Microsoft 365 connections, consent, and access for your organization.', icon: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 3h8v8H3zM13 3h8v8h-8zM3 13h8v8H3zM13 13h8v8H3z"/></svg>' },
   { id: 'google', name: 'Google Workspace', href: '/integrations#google', detail: 'Manage Google Workspace connections and access for your organization.', icon: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="M12 4a12 12 0 0 0 0 16M4 12h16"/></svg>' },
@@ -14,7 +18,7 @@ const selectedFromHash = (): Provider => {
   const callback = new URLSearchParams(window.location.search);
   if (callback.has('state') && (callback.has('code') || callback.has('admin_consent') || callback.has('error'))) return 'microsoft';
   const value = window.location.hash.replace(/^#/, '');
-  return value === 'threecx' || value === 'microsoft' || value === 'google' ? value : 'threecx';
+  return value === 'threecx' || value === 'microsoft' || value === 'google' || value === 'idrive' || value === 'harmony' ? value : 'threecx';
 };
 
 export class CloudCommandConnectPage extends HTMLElement {
@@ -72,7 +76,7 @@ export class CloudCommandConnectPage extends HTMLElement {
       // host appends the child. Deferring a detached shell prevents a child
       // that never loads its connection state in DOM implementations.
       if (this.selected !== 'google' && this.isConnected && this.contextValue && this.api) {
-        const child = document.createElement(this.selected === 'threecx' ? 'cloudcommand-threecx-page' : 'cloudcommand-microsoft-connect') as ThreeCxElement;
+        const child = document.createElement(this.selected === 'threecx' ? 'cloudcommand-threecx-page' : this.selected === 'idrive' ? 'cloudcommand-idrive-page' : this.selected === 'harmony' ? 'cloudcommand-harmony-page' : 'cloudcommand-microsoft-connect') as ThreeCxElement;
         if (this.selected === 'threecx') child.displayMode = 'configuration';
         child.context = this.contextValue;
         child.hostApi = { request: (path, init) => this.api!.request(path, init) };

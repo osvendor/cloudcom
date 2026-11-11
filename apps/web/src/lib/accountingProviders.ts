@@ -1,0 +1,153 @@
+import { useEffect, useState } from 'react';
+import { fetchWithAuth } from '../stores/auth';
+import { ActionError } from './runAction';
+
+/**
+ * The accounting providers the web knows how to drive (Xero W01). Mirrors
+ * `ACCOUNTING_PROVIDER_IDS` in apps/api/src/services/accounting/types.ts — the
+ * API's `/accounting/:provider/*` routes accept exactly these ids.
+ */
+export const ACCOUNTING_PROVIDER_IDS = ['quickbooks', 'xero'] as const;
+export type AccountingProviderId = (typeof ACCOUNTING_PROVIDER_IDS)[number];
+export type AccountingCapability = 'connect' | 'mapping' | 'customerImport' | 'invoicePush' | 'paymentPull' | 'paymentPush';
+
+/** Brand names — never translated. */
+export const ACCOUNTING_PROVIDER_NAMES: Record<AccountingProviderId, string> = { quickbooks: 'QuickBooks', xero: 'Xero' };
+
+/**
+ * Full product names — never translated. Distinct from `ACCOUNTING_PROVIDER_NAMES`
+ * only for QuickBooks, whose product is branded "QuickBooks Online"; used
+ * ONLY where the English copy has always said the full product name (the
+ * connection panel's heading and its "Connect your ... company" description)
+ * so those two strings keep rendering "QuickBooks Online", not "QuickBooks"
+ * (Xero W01 fix round 1, R10).
+ */
+export const ACCOUNTING_PROVIDER_PRODUCT_NAMES: Record<AccountingProviderId, string> = { quickbooks: 'QuickBooks Online', xero: 'Xero' };
+
+export function isAccountingProviderId(v: string): v is AccountingProviderId {
+  return (ACCOUNTING_PROVIDER_IDS as readonly string[]).includes(v);
+}
+
+/** Per-provider UI treatment. Xero follows its app-certification rules
+ *  (branded connect, confirmed disconnect); QuickBooks keeps the pre-W02
+ *  unbranded, unconfirmed behaviour byte-for-byte. */
+export interface AccountingProviderUi { brandedConnect: boolean; confirmDisconnect: boolean }
+export const ACCOUNTING_PROVIDER_UI: Record<AccountingProviderId, AccountingProviderUi> = {
+  quickbooks: { brandedConnect: false, confirmDisconnect: false },
+  xero: { brandedConnect: true, confirmDisconnect: true },
+};
+
+/** Status responses from an API older than Xero W02 carry no `capabilities`
+ *  field: treat every control as available rather than hiding them all. */
+export const ALL_CAPABILITIES: Record<AccountingCapability, boolean> = {
+  connect: true, mapping: true, customerImport: true, invoicePush: true, paymentPull: true, paymentPush: true,
+};
+
+// QuickBooks copy stays byte-identical. `provider_conflict` and the
+// unknown/null fallback both resolve to the two EXISTING keys the panel used
+// pre-W02 (`providerConflict`, `providerConnectionFailedPleaseTryAgain`) —
+// never a new duplicate `connectErrors.generic` / `connectErrors.providerConflict`.
+const CONNECT_ERROR_KEYS: Record<string, string> = {
+  tenant_held: 'accountingConnection.connectErrors.tenantHeld',
+  provider_conflict: 'accountingConnection.providerConflict',
+  auth_event_missing: 'accountingConnection.connectErrors.authEventMissing',
+  no_organisation: 'accountingConnection.connectErrors.noOrganisation',
+  tenant_lookup_failed: 'accountingConnection.connectErrors.tenantLookupFailed',
+  consent_denied: 'accountingConnection.connectErrors.consentDenied',
+};
+const GENERIC_CONNECT_ERROR_KEY = 'accountingConnection.providerConnectionFailedPleaseTryAgain';
+
+/** Maps an OAuth-return `error=` code to a full (namespace-relative) i18n key.
+ *  Unknown codes (incl. `exchange_failed`, `persist_failed`) and `null` fall
+ *  back to the existing generic "connection failed" key. */
+export function connectErrorKey(code: string | null): string {
+  return (code && CONNECT_ERROR_KEYS[code]) || GENERIC_CONNECT_ERROR_KEY;
+}
+
+/** Whether a runAction failure is the MFA-required 403 the accounting
+ *  `/settings` PATCH routes answer with when the caller hasn't stepped up.
+ *  Shared between `AccountingConnectionPanel` (push mode, payment sync
+ *  toggles, settings refresh) and `AccountingSettingsStep` so both surface
+ *  the same persistent `mfaRequiredHint` copy instead of
+ *  runAction's generic toast. */
+export function isMfaError(err: unknown): boolean {
+  return (
+    err instanceof ActionError &&
+    err.status === 403 &&
+    /mfa required/i.test(err.message)
+  );
+}
+
+/** `/accounting/<provider><suffix>` — the provider-scoped API path. */
+export function accountingPath(provider: AccountingProviderId, suffix = ''): string {
+  return `/accounting/${provider}${suffix}`;
+}
+
+export interface AccountingProviderSummary {
+  id: AccountingProviderId;
+  displayName: string;
+  configured: boolean;
+  capabilities: Record<AccountingCapability, boolean>;
+}
+export interface AccountingActiveConnection {
+  provider: AccountingProviderId;
+  status: string;
+}
+export interface AccountingProvidersResponse {
+  data: AccountingProviderSummary[];
+  activeConnection: AccountingActiveConnection | null;
+}
+
+/**
+ * Whether a provider's card and connection panel render. A provider shows when
+ * the instance has it configured OR when it holds the partner's active
+ * connection: an operator can remove a provider's env config while partners
+ * are still connected, and the API keeps status + disconnect working in that
+ * state (ruling R8) — hiding the provider would strand the connection with no
+ * way to disconnect it. The single predicate for AccountingProviderCards and
+ * IntegrationsPage, so the card row and the panel gate can never disagree.
+ */
+export function isAccountingProviderVisible(
+  summary: Pick<AccountingProviderSummary, 'id' | 'configured'>,
+  activeConnection: AccountingActiveConnection | null | undefined,
+): boolean {
+  return summary.configured || activeConnection?.provider === summary.id;
+}
+
+/** GET /accounting/providers. `null` on 401/403, any other non-2xx, a network
+ *  failure, or a body that is not the expected shape. */
+export async function fetchAccountingProviders(): Promise<AccountingProvidersResponse | null> {
+  try {
+    const res = await fetchWithAuth('/accounting/providers');
+    if (!res.ok) return null;
+    const body = (await res.json()) as Partial<AccountingProvidersResponse> | null;
+    if (!body || !Array.isArray(body.data)) return null;
+    return { data: body.data, activeConnection: body.activeConnection ?? null };
+  } catch {
+    return null;
+  }
+}
+
+/** The provider an invoice push would go to: the active connection, iff it can
+ *  push invoices. `null` while loading, when disabled, with no connection, or
+ *  when the connected provider lacks `invoicePush` — callers hide the push
+ *  control on `null` (a push with nowhere to go used to enqueue jobs the
+ *  worker then dropped). */
+export function useActivePushProvider(enabled: boolean): AccountingProviderId | null {
+  const [provider, setProvider] = useState<AccountingProviderId | null>(null);
+  useEffect(() => {
+    if (!enabled) {
+      setProvider(null);
+      return;
+    }
+    let live = true;
+    void fetchAccountingProviders().then((r) => {
+      if (!live) return;
+      const active = r?.activeConnection ?? null;
+      const summary = r && active ? r.data.find((p) => p.id === active.provider) : undefined;
+      setProvider(summary?.capabilities?.invoicePush ? summary.id : null);
+    });
+    return () => { live = false; };
+  }, [enabled]);
+  return provider;
+}

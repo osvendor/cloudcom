@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   AlertTriangle,
   CheckCircle2,
@@ -13,18 +13,39 @@ import {
 import { cn } from '@/lib/utils';
 import { formatDateTime } from '@/lib/dateTimeFormat';
 import { fetchWithAuth } from '../../stores/auth';
+import SnapshotIntegrityBadge from './SnapshotIntegrityBadge';
 import { friendlyFetchError } from '../../lib/utils';
 import { useScrollToError } from '../../lib/scrollToError';
 import BackupVerificationTab from './BackupVerificationTab';
-import { formatNumber } from '@/lib/i18n/format';
+import ExternalBackupCard from './ExternalBackupCard';
+import { formatBytes } from './backupDashboardHelpers';
+import BackupJobDataSummary from './BackupJobDataSummary';
 import DeviceVaultStatus from './DeviceVaultStatus';
+import ReparseSkipNotice from './ReparseSkipNotice';
+import {
+  splitReparseSkipNotice,
+  stripInlineIndexDropNote,
+  type ActiveBackupJob,
+  type BackupFailureCategory,
+  type BackupJobDataAccounting,
+} from '@breeze/shared';
+import DeviceBackupActiveJobs from './DeviceBackupActiveJobs';
+import { runAction, handleActionError } from '../../lib/runAction';
+import { showToast } from '../shared/Toast';
+import { navigateTo } from '@/lib/navigation';
+import { loginPathWithNext } from '../../lib/authScope';
+import BackupFailureCategoryBadge, { BackupFailureCategoryHint } from './BackupFailureCategoryBadge';
+import { stripInternalTagPrefix, truncateErrorSummary } from './backupErrorText';
 import AlphaBadge from '../shared/AlphaBadge';
 import { useTranslation } from 'react-i18next';
 import '../../lib/i18n';
 
 // `partial` is terminal but degraded: a restorable snapshot exists while a large
 // share of the data did not make it. Warning severity — never green, never red.
-type BackupJobStatus = 'completed' | 'running' | 'failed' | 'pending' | 'cancelled' | 'partial';
+// `completed_with_errors` (#5396) is a milder, distinct degraded outcome: a
+// restorable snapshot with SOME (under-threshold) file failures. Also warning
+// severity, but must never collapse into `completed` or the "pending" fallback.
+type BackupJobStatus = 'completed' | 'running' | 'failed' | 'pending' | 'cancelled' | 'partial' | 'completed_with_errors';
 type VssWriterState = 'stable' | 'failed' | 'waiting' | string;
 
 type VssWriter = {
@@ -57,12 +78,17 @@ type BackupJob = {
   // be created, so paths were read live). Rendered accordingly below — labelled
   // by the job's own status rather than always as an error.
   errorLog?: string | null;
+  failureCategory?: BackupFailureCategory | null;
+  // Absent on an older API during a rolling deploy.
+  dataAccounting?: BackupJobDataAccounting | null;
 };
 
 type Snapshot = {
   id: string;
   deviceId: string;
   label: string | null;
+  /** From GET /backup/snapshots; absent on an older API. */
+  integrityStatus?: string | null;
   createdAt: string;
   sizeBytes?: number | null;
   fileCount?: number | null;
@@ -85,13 +111,20 @@ type BackupStatus = {
   lastSuccessAt?: string | null;
   nextScheduledAt?: string | null;
   timezone?: string | null;
+  /** In-flight jobs, running first (#11027). Absent on an older API. */
+  activeJobs?: ActiveBackupJob[];
 };
+
+// While a backup is in flight the tab re-fetches so its progress stays live.
+const ACTIVE_POLL_MS = 5000;
+const UNAUTHORIZED = () => void navigateTo(loginPathWithNext(), { replace: true });
 
 const jobStatusConfig: Record<BackupJobStatus, { icon: typeof CheckCircle2; className: string; label: string }> = {
   completed: { icon: CheckCircle2, className: 'text-success bg-success/10', label: 'Completed' },
   running: { icon: Clock, className: 'text-primary bg-primary/10', label: 'Running' },
   failed: { icon: XCircle, className: 'text-destructive bg-destructive/10', label: 'Failed' },
   partial: { icon: AlertTriangle, className: 'text-warning bg-warning/10', label: 'Partial' },
+  completed_with_errors: { icon: AlertTriangle, className: 'text-warning bg-warning/10', label: 'Completed with errors' },
   pending: { icon: Clock, className: 'text-muted-foreground bg-muted', label: 'Pending' },
   cancelled: { icon: XCircle, className: 'text-muted-foreground bg-muted', label: 'Cancelled' },
 };
@@ -103,14 +136,6 @@ const vssStateConfig: Record<string, { className: string; label: string }> = {
   unknown: { className: 'text-muted-foreground bg-muted', label: 'Unknown' },
 };
 
-function formatBytes(bytes: number | null | undefined): string {
-  if (bytes == null) return '-';
-  if (bytes === 0) return '0 B';
-  const k = 1024;
-  const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return `${formatNumber(bytes / Math.pow(k, i), { maximumFractionDigits: 1 })} ${sizes[i]}`;
-}
 
 function formatTime(iso: string | null | undefined, timezone?: string | null): string {
   return formatDateTime(iso, {
@@ -199,38 +224,48 @@ export default function DeviceBackupTab({ deviceId, deviceStatus, timezone }: De
   const [actionMessage, setActionMessage] = useState<string>();
   const [actionInfo, setActionInfo] = useState<string>();
   const [runningBackup, setRunningBackup] = useState(false);
+  // Reported by ExternalBackupCard so the empty state below can be accurate
+  // without a second fetch. `null` = not answered yet.
+  const [hasExternalBackup, setHasExternalBackup] = useState<boolean | null>(null);
 
+  // The tab re-fetches on a timer while a backup is in flight, so requests can
+  // overlap with a refresh or a stop. Only the newest request may write state.
+  const latestFetchRef = useRef(0);
   const fetchData = useCallback(async () => {
-    setError(undefined);
+    const fetchId = ++latestFetchRef.current;
     try {
       const [statusRes, jobsRes, snapshotsRes] = await Promise.all([
         fetchWithAuth(`/backup/status/${deviceId}`),
         fetchWithAuth(`/backup/jobs?deviceId=${deviceId}`),
         fetchWithAuth(`/backup/snapshots?deviceId=${deviceId}`),
       ]);
+      const [statusPayload, jobsPayload, snapshotsPayload] = await Promise.all([
+        statusRes.ok ? statusRes.json() : null,
+        jobsRes.ok ? jobsRes.json() : null,
+        snapshotsRes.ok ? snapshotsRes.json() : null,
+      ]);
+      if (fetchId !== latestFetchRef.current) return;
 
       if (statusRes.ok) {
-        const payload = await statusRes.json();
-        setStatus(payload?.data ?? payload ?? null);
+        setStatus(statusPayload?.data ?? statusPayload ?? null);
       }
 
       if (jobsRes.ok) {
-        const payload = await jobsRes.json();
-        setJobs(Array.isArray(payload?.data) ? payload.data : []);
+        setJobs(Array.isArray(jobsPayload?.data) ? jobsPayload.data : []);
       }
 
       if (snapshotsRes.ok) {
-        const payload = await snapshotsRes.json();
-        setSnapshots(Array.isArray(payload?.data) ? payload.data : []);
+        setSnapshots(Array.isArray(snapshotsPayload?.data) ? snapshotsPayload.data : []);
       }
 
+      // Set from the outcome instead of clearing up front: a banner cleared at
+      // the start of every 5 s poll would blink, and useScrollToError would
+      // pull the page back to it each time it reappeared.
       const firstFail = [statusRes, jobsRes, snapshotsRes].find((r) => !r.ok);
-      if (firstFail) {
-        setError(`Failed to load some data (${firstFail.status})`);
-      }
+      setError(firstFail ? `Failed to load some data (${firstFail.status})` : undefined);
     } catch (err) {
       console.error('[DeviceBackupTab] fetchData:', err);
-      setError(friendlyFetchError(err));
+      if (fetchId === latestFetchRef.current) setError(friendlyFetchError(err));
     } finally {
       setLoading(false);
     }
@@ -273,6 +308,52 @@ export default function DeviceBackupTab({ deviceId, deviceStatus, timezone }: De
 
   useEffect(() => {
     fetchData();
+  }, [fetchData]);
+
+  const activeJobs = status?.activeJobs ?? [];
+  const hasActiveJobs = activeJobs.length > 0;
+  useEffect(() => {
+    if (!hasActiveJobs) return;
+    // Skip a tick while the previous poll is unanswered, so a slow API cannot
+    // stack requests.
+    let inFlight = false;
+    const timer = setInterval(() => {
+      if (inFlight) return;
+      inFlight = true;
+      void fetchData().finally(() => {
+        inFlight = false;
+      });
+    }, ACTIVE_POLL_MS);
+    return () => clearInterval(timer);
+  }, [hasActiveJobs, fetchData]);
+
+  // Same cancel route and runAction handling as BackupJobList.handleCancel.
+  const [stoppingId, setStoppingId] = useState<string | null>(null);
+  const stoppingRef = useRef(false);
+  const handleStopJob = useCallback(async (jobId: string) => {
+    if (stoppingRef.current) return;
+    stoppingRef.current = true;
+    setStoppingId(jobId);
+    try {
+      // The cancel route answers HTTP 200 with a `warning` when the job was
+      // marked cancelled but the stop signal could not reach the agent — a
+      // partial success runAction treats as success, so surface it here.
+      const result = await runAction<{ warning?: string } | null>({
+        request: () => fetchWithAuth(`/backup/jobs/${jobId}/cancel`, { method: 'POST' }),
+        errorFallback: 'Failed to cancel job',
+        onUnauthorized: UNAUTHORIZED,
+      });
+      const warning = result && typeof result === 'object' ? result.warning : undefined;
+      if (typeof warning === 'string' && warning.length > 0) {
+        showToast({ message: warning, type: 'warning' });
+      }
+      await fetchData();
+    } catch (err) {
+      handleActionError(err, 'Failed to cancel job');
+    } finally {
+      stoppingRef.current = false;
+      setStoppingId(null);
+    }
   }, [fetchData]);
 
   useEffect(() => {
@@ -380,13 +461,18 @@ export default function DeviceBackupTab({ deviceId, deviceStatus, timezone }: De
   }
 
   // Empty state
-  if (!error && !status?.protected && !status?.lastJob && jobs.length === 0) {
+  if (!error && !status?.protected && !status?.lastJob && jobs.length === 0 && hasExternalBackup !== true) {
     return (
       <div className="flex flex-col items-center justify-center py-20 text-center">
         <Database className="h-12 w-12 text-muted-foreground/40" />
         <h3 className="mt-4 text-base font-semibold text-foreground">{t('deviceBackupTab.noBackupConfigured')}</h3>
         <p className="mt-1 text-sm text-muted-foreground">
           {t('deviceBackupTab.assignABackupPolicyToProtectThisDevice')} </p>
+        <p data-testid="device-backup-empty-external-hint" className="mt-1 text-sm text-muted-foreground">
+          {t('backupHealth.external.alsoCheck')} </p>
+        {/* Still mounted: it is what answers hasExternalBackup, and if it finds
+            a row this branch stops rendering on the next commit. */}
+        <ExternalBackupCard deviceId={deviceId} onPresenceChange={setHasExternalBackup} />
       </div>
     );
   }
@@ -404,8 +490,19 @@ export default function DeviceBackupTab({ deviceId, deviceStatus, timezone }: De
   // note, not an error — and it is the only channel a total VSS failure has,
   // since that outcome produces no vssMetadata at all. This tab used to ignore
   // errorLog entirely, so such a run displayed as a clean green backup.
-  const lastJobDiagnostic = lastJob?.errorLog?.trim() || null;
+  // #9543: deliberately skipped reparse points are informational — shown on
+  // their own muted line, so a run whose only note is the skip is not framed
+  // as "completed with warnings" and a failed run's banner keeps its reason.
+  // #11026: nor is a historic note that a file list did not fit in the result:
+  // the list was not lost.
+  const { diagnostic: lastJobDiagnostic, reparseSkipped: lastJobReparseSkipped } =
+    splitReparseSkipNotice(stripInlineIndexDropNote(lastJob?.errorLog).warning);
   const lastJobFailed = lastJobStatus === 'failed';
+  const lastFailureCategory = lastJobFailed ? (lastJob?.failureCategory ?? null) : null;
+  // #5396: distinct from the generic "completed with warnings" framing — this
+  // run has a concrete, agent-reported count of files that failed to read or
+  // upload (still under the `partial` threshold), which the banner should name.
+  const lastJobCompletedWithErrors = lastJobStatus === 'completed_with_errors';
   const selectedSnapshot = snapshots.find((snapshot) => snapshot.id === selectedSnapshotId) ?? snapshots[0] ?? null;
   // Prefer the API-reported device zone; fall back to the already-validated
   // zone passed by the parent (never an invalid IANA id). formatDateTime
@@ -420,6 +517,13 @@ export default function DeviceBackupTab({ deviceId, deviceStatus, timezone }: De
 
   return (
     <div className="space-y-6">
+      {/* Above the first-party sections: a technician opening this tab for a
+          Cove-protected machine must not scroll past "no backup" to find it. */}
+      <ExternalBackupCard
+        deviceId={deviceId}
+        onPresenceChange={setHasExternalBackup}
+        onUnlinked={() => void fetchData()}
+      />
       {(error || actionError) && (
         <div ref={errorBannerRef} className="space-y-6">
           {error && (
@@ -484,6 +588,9 @@ export default function DeviceBackupTab({ deviceId, deviceStatus, timezone }: De
             )}
           </div>
           <div className="flex items-center gap-2">
+            {runBackupDisabledReason ? (
+              <p className="text-xs text-muted-foreground">{runBackupDisabledReason}</p>
+            ) : null}
             <button
               type="button"
               onClick={() => void handleRunBackupNow()}
@@ -505,6 +612,12 @@ export default function DeviceBackupTab({ deviceId, deviceStatus, timezone }: De
           </div>
         </div>
       </div>
+
+      <DeviceBackupActiveJobs
+        jobs={activeJobs}
+        onStop={(jobId) => void handleStopJob(jobId)}
+        stoppingId={stoppingId}
+      />
 
       {/* Job History */}
       <div className="rounded-lg border bg-card p-5 shadow-xs">
@@ -534,6 +647,9 @@ export default function DeviceBackupTab({ deviceId, deviceStatus, timezone }: De
                   const cfg = jobStatusConfig[jStatus] ?? jobStatusConfig.pending;
                   const Icon = cfg.icon;
                   const errorCount = job.errorCount ?? 0;
+                  const jobDiagnostic = splitReparseSkipNotice(
+                    stripInlineIndexDropNote(job.errorLog ? stripInternalTagPrefix(job.errorLog) : null).warning
+                  ).diagnostic;
                   return (
                     <tr key={job.id} className="border-b last:border-0">
                       <td className="py-2 pr-4 capitalize text-foreground">
@@ -556,18 +672,40 @@ export default function DeviceBackupTab({ deviceId, deviceStatus, timezone }: De
                       <td className="py-2 pr-4 text-muted-foreground">
                         {formatDuration(job.startedAt, job.completedAt)}
                       </td>
-                      <td className="py-2 pr-4 text-muted-foreground">
-                        {formatBytes(job.totalSize)}
+                      <td data-testid="backup-job-size" className="py-2 pr-4 text-muted-foreground">
+                        {job.status === 'running' || job.status === 'pending' ? (
+                          // The total is the whole job's size; live progress is on the active card above.
+                          '-'
+                        ) : job.dataAccounting ? (
+                          <BackupJobDataSummary accounting={job.dataAccounting} variant="cell" />
+                        ) : (
+                          formatBytes(job.totalSize, '-')
+                        )}
                       </td>
                       <td className="py-2">
-                        {errorCount > 0 ? (
-                          <span className="inline-flex items-center gap-1 text-destructive">
-                            <AlertTriangle className="h-3.5 w-3.5" />
-                            {errorCount}
-                          </span>
-                        ) : (
-                          <span className="text-muted-foreground">0</span>
-                        )}
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <BackupFailureCategoryBadge category={job.failureCategory} />
+                          {errorCount > 0 ? (
+                            <span
+                              data-testid="backup-job-error-count"
+                              className="inline-flex items-center gap-1 text-destructive"
+                            >
+                              <AlertTriangle className="h-3.5 w-3.5" />
+                              {errorCount}
+                            </span>
+                          ) : (
+                            !job.failureCategory && !jobDiagnostic && <span className="text-muted-foreground">0</span>
+                          )}
+                          {jobDiagnostic && (
+                            <span
+                              data-testid="backup-job-error-summary"
+                              title={jobDiagnostic}
+                              className="text-xs text-muted-foreground"
+                            >
+                              {truncateErrorSummary(jobDiagnostic)}
+                            </span>
+                          )}
+                        </div>
                       </td>
                     </tr>
                   );
@@ -598,13 +736,21 @@ export default function DeviceBackupTab({ deviceId, deviceStatus, timezone }: De
           <div>
             <p className="font-medium">
               {lastJobFailed
-                ? t('deviceBackupTab.lastBackupFailed')
-                : t('deviceBackupTab.lastBackupCompletedWithWarnings')}
+                ? lastFailureCategory
+                  ? t('deviceBackupTab.lastBackupFailedWithCategory', {
+                      category: t(/* i18n-dynamic */ `failureCategory.${lastFailureCategory}.label`),
+                    })
+                  : t('deviceBackupTab.lastBackupFailed')
+                : lastJobCompletedWithErrors
+                  ? t('deviceBackupTab.lastBackupCompletedWithErrors')
+                  : t('deviceBackupTab.lastBackupCompletedWithWarnings')}
             </p>
-            <p className="mt-1 break-words opacity-90">{lastJobDiagnostic}</p>
+            <p className="mt-1 whitespace-pre-line break-words opacity-90">{lastJobDiagnostic}</p>
+            {lastFailureCategory && <BackupFailureCategoryHint category={lastFailureCategory} className="mt-2" />}
           </div>
         </div>
       )}
+      {lastJobReparseSkipped && <ReparseSkipNotice summary={lastJobReparseSkipped} />}
 
       {/* VSS Status */}
       {showVssStatus && (
@@ -740,7 +886,7 @@ export default function DeviceBackupTab({ deviceId, deviceStatus, timezone }: De
                     <div className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
                       {t('deviceBackupTab.snapshotDetails')} </div>
                     <div className="mt-2 space-y-1 text-foreground">
-                      <div>{t('deviceBackupTab.size2')} {formatBytes(selectedSnapshot.sizeBytes)}</div>
+                      <div>{t('deviceBackupTab.size2')} {formatBytes(selectedSnapshot.sizeBytes, '-')}</div>
                       <div>{t('deviceBackupTab.files')} {selectedSnapshot.fileCount ?? '-'}</div>
                       <div>{t('deviceBackupTab.protection')} {protectionSummary(selectedSnapshot)}</div>
                     </div>
@@ -887,6 +1033,7 @@ export default function DeviceBackupTab({ deviceId, deviceStatus, timezone }: De
                   <th className="pb-2 pr-4 font-medium">{t('deviceBackupTab.created2')}</th>
                   <th className="pb-2 pr-4 font-medium">{t('deviceBackupTab.expires2')}</th>
                   <th className="pb-2 pr-4 font-medium">{t('deviceBackupTab.size')}</th>
+                  <th className="pb-2 pr-4 font-medium">{t('deviceBackupTab.integrity')}</th>
                   <th className="pb-2 font-medium">{t('deviceBackupTab.protection2')}</th>
                 </tr>
               </thead>
@@ -906,7 +1053,10 @@ export default function DeviceBackupTab({ deviceId, deviceStatus, timezone }: De
                     </td>
                     <td className="py-2 pr-4 text-muted-foreground">{formatTime(snap.expiresAt, effectiveZone)}</td>
                     <td className="py-2 pr-4 text-muted-foreground">
-                      {formatBytes(snap.sizeBytes)}
+                      {formatBytes(snap.sizeBytes, '-')}
+                    </td>
+                    <td className="py-2 pr-4">
+                      <SnapshotIntegrityBadge status={snap.integrityStatus} />
                     </td>
                     <td className="py-2">
                       <div className="flex flex-wrap items-center gap-1.5">

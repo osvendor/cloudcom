@@ -164,7 +164,15 @@ function rawInputs(overrides: Partial<RawNarrativeInputs> = {}): RawNarrativeInp
       patchScoreThisWeek: 88.2, patchScorePriorWeek: 81.5, overallScoreThisWeek: 76,
       pendingPatches: 31, devicesPending: 6, installed7d: 54,
     },
-    backups: { ok: 18, failed: 2, partial: 0, devicesFailed: 1 },
+    backups: { ok: 18, withErrors: 0, failed: 2, partial: 0, devicesFailed: 1 },
+    backupProviders: {
+      devices: 0,
+      saasWorkloads: 0,
+      devicesByHealth: { healthy: 0, warning: 0, critical: 0, unknown: 0 },
+      criticalDevices: [],
+      unlinkedDevices: 0,
+      lastSyncAgeMinutes: null,
+    },
     fleet: {
       total: 12, online: 10, offline: 2, decommissioned: 0,
       enrolled7d: 1, stale: 1, avgUptime7dPct: 97.4,
@@ -190,6 +198,7 @@ describe('assembleNarrativeContext', () => {
     expect(ctx.tickets.byCategoryTruncated).toBe(false);
     expect(ctx.patching.available).toBe(true);
     expect(ctx.backups.available).toBe(true);
+    expect(ctx.backupProviders.available).toBe(true);
     expect(ctx.fleet.available).toBe(true);
   });
 
@@ -208,8 +217,17 @@ describe('assembleNarrativeContext', () => {
     expect(ctx.backups.successRatePct).toBe(90);
   });
 
+  // #5396: a run that missed files under the threshold is a restore point, so it
+  // counts toward the success rate, but the narrative must be able to say so.
+  it('counts completed_with_errors runs as terminal successes and reports them separately', () => {
+    const ctx = assembleNarrativeContext(rawInputs({ backups: { ok: 6, withErrors: 3, failed: 1, partial: 0, devicesFailed: 1 } }));
+    expect(ctx.backups.terminal).toBe(10);
+    expect(ctx.backups.withErrors).toBe(3);
+    expect(ctx.backups.successRatePct).toBe(90);
+  });
+
   it('reports a null success rate — not 0 — when no backup job reached a terminal state', () => {
-    const ctx = assembleNarrativeContext(rawInputs({ backups: { ok: 0, failed: 0, partial: 0, devicesFailed: 0 } }));
+    const ctx = assembleNarrativeContext(rawInputs({ backups: { ok: 0, withErrors: 0, failed: 0, partial: 0, devicesFailed: 0 } }));
     expect(ctx.backups.terminal).toBe(0);
     expect(ctx.backups.successRatePct).toBeNull();
   });
@@ -233,6 +251,42 @@ describe('assembleNarrativeContext', () => {
     expect(ctx.truncated).toBe(false);
   });
 
+  it('caps and sanitizes third-party critical device names, and trims them before anything else (#6012)', () => {
+    const criticalDevices = Array.from({ length: NARRATIVE_TOP_N + 1 }, (_, i) => ({ name: `CRIT-${i}\n- forged line` }));
+    const ctx = assembleNarrativeContext(rawInputs({
+      backupProviders: {
+        devices: 20, saasWorkloads: 0, devicesByHealth: { healthy: 9, warning: 0, critical: 11, unknown: 0 },
+        criticalDevices, unlinkedDevices: 2, lastSyncAgeMinutes: 12,
+      },
+    }));
+    expect(ctx.backupProviders.criticalDevices).toHaveLength(NARRATIVE_TOP_N);
+    expect(ctx.backupProviders.criticalDevicesTruncated).toBe(true);
+    expect(ctx.backupProviders.criticalDevices[0]!.name).not.toContain('\n');
+    expect(ctx.truncated).toBe(false);
+
+    const byCategory = [{ name: 'Hardware', opened: 4, closed: 3 }];
+    const tight = assembleNarrativeContext(rawInputs({
+      tickets: { ...rawInputs().tickets!, byCategory },
+      backupProviders: {
+        devices: 3, saasWorkloads: 0, devicesByHealth: { healthy: 0, warning: 0, critical: 3, unknown: 0 },
+        criticalDevices: [{ name: longName(1) }, { name: longName(2) }, { name: longName(3) }],
+        unlinkedDevices: 0, lastSyncAgeMinutes: 5,
+      },
+    }), { limitBytes: Buffer.byteLength(JSON.stringify(assembleNarrativeContext(rawInputs({ tickets: { ...rawInputs().tickets!, byCategory } }))), 'utf8') + 400 });
+    expect(tight.backupProviders.criticalDevices.length).toBeLessThan(3);
+    expect(tight.backupProviders.criticalDevicesTruncated).toBe(true);
+    expect(tight.tickets.byCategory).toEqual(byCategory);
+  });
+
+  it('marks the third-party block unavailable, zeroed, when its loader failed', () => {
+    const ctx = assembleNarrativeContext(rawInputs({ backupProviders: null }));
+    expect(ctx.backupProviders).toEqual({
+      available: false, devices: 0, saasWorkloads: 0, devicesByHealth: { healthy: 0, warning: 0, critical: 0, unknown: 0 },
+      criticalDevices: [], criticalDevicesTruncated: false, unlinkedDevices: 0, lastSyncAgeMinutes: null,
+    });
+    expect(ctx.unavailable).toContain('backupProviders');
+  });
+
   // The ceiling is measured over the ENTIRE serialized context (not per
   // array), and it drops the least load-bearing list first: a ticket-category
   // breakdown is nice to have, the noisiest alert rules are the story.
@@ -254,9 +308,10 @@ describe('assembleNarrativeContext', () => {
     expect(roomy.alerts.topRulesTruncated).toBe(false);
 
     // A ceiling tight enough that the rules must give way too — and only
-    // after the categories are exhausted.
-    const tight = assembleNarrativeContext(raw, { limitBytes: 2000 });
-    expect(Buffer.byteLength(JSON.stringify(tight), 'utf8')).toBeLessThanOrEqual(2000);
+    // after the categories are exhausted. (2300: the fixed envelope grew by
+    // the third-party backup block, #6012.)
+    const tight = assembleNarrativeContext(raw, { limitBytes: 2300 });
+    expect(Buffer.byteLength(JSON.stringify(tight), 'utf8')).toBeLessThanOrEqual(2300);
     expect(tight.tickets.byCategory).toHaveLength(0);
     expect(tight.alerts.topRules.length).toBeLessThan(NARRATIVE_TOP_N);
     expect(tight.alerts.topRulesTruncated).toBe(true);
@@ -265,7 +320,7 @@ describe('assembleNarrativeContext', () => {
 
   it('never emits a partial entry when trimming — every surviving entry is whole', () => {
     const topRules = Array.from({ length: NARRATIVE_TOP_N }, (_, i) => ({ name: longName(i), count: 20 - i, highOrCritical: 1 }));
-    const ctx = assembleNarrativeContext(rawInputs({ alerts: { ...rawInputs().alerts!, topRules } }), { limitBytes: 2200 });
+    const ctx = assembleNarrativeContext(rawInputs({ alerts: { ...rawInputs().alerts!, topRules } }), { limitBytes: 2500 });
     expect(ctx.alerts.topRules.length).toBeGreaterThan(0);
     for (const rule of ctx.alerts.topRules) {
       // Whole entries only: a name is never sliced to make the budget fit,
@@ -438,7 +493,7 @@ describe('loadNarrativeContext', () => {
     await loadNarrativeContext(ORG);
     const { sql } = stmt('FROM alerts a WHERE');
     expect(orgPins(sql)).toBe(1);
-    expect(sql).toContain('a.resolved_by IS NULL');
+    expect(sql).toContain('a.resolved_by IS NULL AND a.resolved_by_principal_id IS NULL');
     expect(sql).toContain("a.severity = 'critical'");
     // Suppression is a CURRENT-STATE count: there is no suppressed_at column
     // to window on (reported via `unavailable`).
@@ -607,6 +662,106 @@ describe('loadNarrativeContext', () => {
     expect(sql).toContain("bj.status = 'failed'");
   });
 
+  describe('third-party backup providers (#6012)', () => {
+    const NOW = new Date('2026-08-29T12:00:00.000Z');
+    const providerRow = (over: Record<string, unknown> = {}) => ({
+      status: 'completed', last_success_at: '2026-08-29T11:00:00.000Z', errors_count: 0,
+      name: 'FILE01', breeze_device_id: 'd-1', account_type: 'backup_manager',
+      connection_is_active: true, connection_last_sync_at: '2026-08-29T11:50:00.000Z', connection_sync_interval_minutes: 30,
+      ...over,
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('reads current device health (not the week window), pinned to the org, joined to its own connection', async () => {
+      await loadNarrativeContext(ORG);
+      const { sql, params } = stmt('FROM backup_provider_devices');
+      expect(sql).toContain('bpd.org_id = ');
+      expect(params.filter((v) => v === ORG)).toHaveLength(1);
+      expect(sql).toContain('LEFT JOIN backup_provider_connections bpc ON bpc.id = bpd.connection_id AND bpc.partner_id = bpd.partner_id');
+      expect(params.some((v) => v instanceof Date || (typeof v === 'string' && v.includes('T')))).toBe(false);
+    });
+
+    it('tallies devices by derived health — as device health — and names the critical ones', async () => {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(NOW);
+      rowsFor.push({ match: 'FROM backup_provider_devices', rows: [
+        providerRow({ name: 'FILE01' }),
+        providerRow({ name: 'BACKUP-SVR', status: 'failed', last_success_at: null, breeze_device_id: null }),
+        providerRow({ name: 'OLD-PC', status: 'no_backups', last_success_at: null, breeze_device_id: 'd-3' }),
+        providerRow({ name: 'mail@acme.test', account_type: 'm365', breeze_device_id: null }),
+        providerRow({ name: 'drive@acme.test', account_type: 'gws', status: 'failed', breeze_device_id: null }),
+      ] });
+      const ctx = await loadNarrativeContext(ORG);
+
+      expect(ctx.backupProviders.available).toBe(true);
+      expect(ctx.backupProviders.devices).toBe(3);
+      expect(ctx.backupProviders.saasWorkloads).toBe(2);
+      expect(ctx.backupProviders.devicesByHealth).toEqual({ healthy: 1, warning: 0, critical: 2, unknown: 0 });
+      expect(ctx.backupProviders.criticalDevices.map((d) => d.name)).toEqual(['BACKUP-SVR', 'OLD-PC']);
+      // Mailbox accounts are never linked to a device, so they are not "unlinked devices".
+      expect(ctx.backupProviders.unlinkedDevices).toBe(1);
+      expect(ctx.backupProviders.lastSyncAgeMinutes).toBe(10);
+    });
+
+    it('withholds a health verdict for a stale or inactive connection, and reports the oldest sync', async () => {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(NOW);
+      rowsFor.push({ match: 'FROM backup_provider_devices', rows: [
+        providerRow({ name: 'A', status: 'failed', connection_last_sync_at: '2026-08-29T10:30:00.000Z' }),
+        providerRow({ name: 'B', status: 'failed', connection_is_active: false }),
+      ] });
+      const ctx = await loadNarrativeContext(ORG);
+      expect(ctx.backupProviders.devicesByHealth).toEqual({ healthy: 0, warning: 0, critical: 0, unknown: 2 });
+      expect(ctx.backupProviders.criticalDevices).toEqual([]);
+      expect(ctx.backupProviders.lastSyncAgeMinutes).toBe(90);
+    });
+
+    it('withdraws a HEALTHY verdict too on a stale, missing or never-synced connection', async () => {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(NOW);
+      rowsFor.push({ match: 'FROM backup_provider_devices', rows: [
+        // Fresh success, but the connection has not synced for 90 min (interval 30).
+        providerRow({ name: 'STALE-OK', connection_last_sync_at: '2026-08-29T10:30:00.000Z' }),
+        // LEFT JOIN found no connection row at all.
+        providerRow({
+          name: 'NO-CONN', connection_is_active: null, connection_last_sync_at: null, connection_sync_interval_minutes: null,
+        }),
+      ] });
+      const ctx = await loadNarrativeContext(ORG);
+      expect(ctx.backupProviders.devicesByHealth).toEqual({ healthy: 0, warning: 0, critical: 0, unknown: 2 });
+      expect(ctx.backupProviders.lastSyncAgeMinutes).toBe(90);
+    });
+
+    it('caps the critical names at NARRATIVE_TOP_N and says so', async () => {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(NOW);
+      rowsFor.push({ match: 'FROM backup_provider_devices', rows: Array.from({ length: NARRATIVE_TOP_N + 5 }, (_, i) =>
+        providerRow({ name: `CRIT-${String(i).padStart(2, '0')}`, status: 'failed', last_success_at: null })) });
+      const ctx = await loadNarrativeContext(ORG);
+      expect(ctx.backupProviders.criticalDevices).toHaveLength(NARRATIVE_TOP_N);
+      expect(ctx.backupProviders.criticalDevicesTruncated).toBe(true);
+      expect(ctx.backupProviders.devicesByHealth.critical).toBe(NARRATIVE_TOP_N + 5);
+    });
+
+    it('reports an org with no third-party backup as measured and empty', async () => {
+      const ctx = await loadNarrativeContext(ORG);
+      expect(ctx.backupProviders).toEqual({
+        available: true, devices: 0, saasWorkloads: 0, devicesByHealth: { healthy: 0, warning: 0, critical: 0, unknown: 0 },
+        criticalDevices: [], criticalDevicesTruncated: false, unlinkedDevices: 0, lastSyncAgeMinutes: null,
+      });
+    });
+
+    it('reports a failed read rather than swallowing it', async () => {
+      failOn = ['FROM backup_provider_devices'];
+      const ctx = await loadNarrativeContext(ORG);
+      expect(ctx.backupProviders.available).toBe(false);
+      expect(reportedFailures()).toEqual([expect.objectContaining({ orgId: ORG, loader: 'backupProviders' })]);
+    });
+  });
+
   it('reads current fleet state plus mean 7-day uptime, pinning the reliability join too', async () => {
     rowsFor.push({ match: 'device_reliability', rows: [{
       total: 12, online: 10, offline: 2, decommissioned: 0, enrolled_7d: 1, stale: 1, avg_uptime_7d: 97.44,
@@ -661,15 +816,16 @@ describe('loadNarrativeContext', () => {
     expect(ctx.tickets.available).toBe(false);
     expect(ctx.patching.available).toBe(false);
     expect(ctx.backups.available).toBe(false);
+    expect(ctx.backupProviders.available).toBe(false);
     expect(ctx.fleet.available).toBe(false);
-    expect(ctx.unavailable).toEqual(expect.arrayContaining(['tickets', 'patching', 'backups', 'fleet']));
+    expect(ctx.unavailable).toEqual(expect.arrayContaining(['tickets', 'patching', 'backups', 'backupProviders', 'fleet']));
     expect(ctx.unavailable).not.toContain('alerts');
     expect(ctx.unavailable).not.toContain('sweeps');
 
     // Every one of them is reported, not swallowed — four blocks broken by
     // one root cause is exactly the signal an operator needs to see.
     expect(reportedFailures().map((entry) => entry.loader))
-      .toEqual(['tickets', 'patching', 'backups', 'fleet']);
+      .toEqual(['tickets', 'patching', 'backups', 'backupProviders', 'fleet']);
   });
 
   // The posture SERVICE is the only source of the two scores, and it fails
@@ -735,7 +891,7 @@ describe('loadNarrativeContext', () => {
     const ctx = await loadNarrativeContext(ORG);
     expect(ctx.unavailable).toEqual(expect.arrayContaining([
       'alerts.suppressedInWindow', 'fleet.onlineOfflineDelta',
-      'org', 'alerts', 'sweeps', 'fixes', 'tickets', 'patching', 'backups', 'fleet',
+      'org', 'alerts', 'sweeps', 'fixes', 'tickets', 'patching', 'backups', 'backupProviders', 'fleet',
     ]));
     expect(ctx.truncated).toBe(false);
     expect(Buffer.byteLength(JSON.stringify(ctx), 'utf8')).toBeLessThanOrEqual(NARRATIVE_CONTEXT_HARD_LIMIT_BYTES);

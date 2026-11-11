@@ -85,6 +85,7 @@ import { sanitizeSweepText } from './runnerPrompt';
 // `vi.mock('../../db')` factory can be observed. Same idiom as
 // `narrativeContext.ts` / `sweepEvidence.ts`.
 import * as dbModule from '../../db';
+import { dateFromSqlValue } from '../portal/sqlTimestamp';
 
 // ---------------------------------------------------------------------------
 // Bounds
@@ -166,7 +167,7 @@ export interface DesignEvidence {
   };
   posture: { category: string; product: string; managedCount: number; staleCount: number }[];
   health: {
-    reliabilityWorst: { deviceId: string; score: number; trend: string | null }[];
+    reliabilityWorst: { deviceId: string; score: number; trend: string | null; provisional: boolean }[];
     fleetFindings: { kind: string; title: string; deviceCount: number }[];
     vulnerability: { critical: number; high: number; devicesAffected: number } | null;
     patching: { patchScore: number | null; devicesPending: number; pendingPatches: number } | null;
@@ -244,7 +245,7 @@ function textOrNull(value: unknown): string | null {
 function isoOrNull(value: unknown): string | null {
   if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value.toISOString();
   if (typeof value === 'string' && value.trim() !== '') {
-    const parsed = new Date(value);
+    const parsed = dateFromSqlValue(value);
     return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
   }
   return null;
@@ -507,8 +508,9 @@ type DeviceRow = {
 
 /**
  * Devices: primary table `org_id`-pinned; `sites`/`device_group_memberships`/
- * `device_groups`/`device_reliability` are all ALSO org-pinned in their join
- * condition (shape 5's own tables carry `org_id` directly). `siteId`, when
+ * `device_reliability` are also org-pinned in their join conditions. Group names
+ * include org-owned groups and partner-owned groups of this org's partner;
+ * memberships remain pinned to the device org. `siteId`, when
  * given, narrows on `devices.site_id`. Ephemeral (Quick Support) and
  * decommissioned devices are excluded — a fleet design is not written about
  * a one-off support session or a device already retired.
@@ -522,7 +524,11 @@ async function loadDevices(orgId: string, siteId: string | null | undefined): Pr
            (
              SELECT array_agg(g.name ORDER BY g.name)
              FROM device_group_memberships m
-             JOIN device_groups g ON g.id = m.group_id AND g.org_id = ${orgId}
+             JOIN device_groups g ON g.id = m.group_id AND (
+               g.org_id = ${orgId} OR (g.org_id IS NULL AND g.partner_id = (
+                 SELECT o.partner_id FROM organizations o WHERE o.id = ${orgId}
+               ))
+             )
              WHERE m.device_id = d.id AND m.org_id = ${orgId}
            ) AS group_names,
            d.tags, d.custom_fields,
@@ -705,7 +711,7 @@ async function loadHealth(orgId: string, siteId: string | null | undefined): Pro
   const siteJoinFilter = siteId ? sql`AND d.site_id = ${siteId}` : sql``;
 
   const reliability = await listReliabilityDevices({ orgId, siteId: siteId ?? undefined, limit: DESIGN_EVIDENCE_BOUNDS.reliabilityWorst });
-  const reliabilityWorst = reliability.rows.map((r) => ({ deviceId: r.deviceId, score: r.reliabilityScore, trend: r.trendDirection }));
+  const reliabilityWorst = reliability.rows.map((r) => ({ deviceId: r.deviceId, score: r.reliabilityScore, trend: r.trendDirection, provisional: r.provisional }));
 
   const findingRows = await query<{ kind: string; title: string; device_count: number | string | null }>(sql`
     SELECT kind, MIN(title) AS title, SUM(device_count)::int AS device_count
@@ -800,12 +806,14 @@ async function loadConfiguration(orgId: string, partnerId: string | null): Promi
     JOIN config_policy_monitoring_settings ms ON ms.id = w.settings_id
     JOIN config_policy_feature_links fl ON fl.id = ms.feature_link_id AND fl.config_policy_id = ANY(${uuidArray(policyIds)})
     JOIN configuration_policies cp ON cp.id = fl.config_policy_id AND ${ownerPredicate}
+    WHERE w.retired_at IS NULL
   `);
   const rules = policyIds.length === 0 ? [] : await query<RuleRow>(sql`
     SELECT fl.config_policy_id AS policy_id, r.name, r.severity::text AS severity, r.cooldown_minutes
     FROM config_policy_alert_rules r
     JOIN config_policy_feature_links fl ON fl.id = r.feature_link_id AND fl.config_policy_id = ANY(${uuidArray(policyIds)})
     JOIN configuration_policies cp ON cp.id = fl.config_policy_id AND ${ownerPredicate}
+    WHERE r.retired_at IS NULL
   `);
   const watchesByPolicy = new Map<string, RawDesignEvidence['configuration']['policies'][number]['watches']>();
   for (const w of watches) {

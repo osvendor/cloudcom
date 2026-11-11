@@ -117,8 +117,13 @@ vi.mock('../middleware/mobileDeviceBlocked', () => ({
 }));
 
 // Mock auth middleware as a pass-through (tests inject auth context manually)
+const permissionGate = vi.hoisted(() => ({ deny: false }));
 vi.mock('../middleware/auth', () => ({
   authMiddleware: vi.fn(async (_c: any, next: any) => { await next(); }),
+  requirePermission: vi.fn((_resource: string, _action: string) => async (c: any, next: any) => {
+    if (permissionGate.deny) return c.json({ error: 'Permission denied' }, 403);
+    await next();
+  }),
   resolveOrgAccess: vi.fn(async (auth: any, requestedOrgId?: string) => {
     if (requestedOrgId) return { type: 'single', orgId: requestedOrgId };
     if (auth.scope === 'partner' && auth.partnerId) return { type: 'multiple', orgIds: [] };
@@ -157,6 +162,7 @@ beforeEach(() => {
   partnerOrganizationRows = [{ id: 'org-1' }, { id: 'org-2' }, { id: 'org-3' }];
   setThrowOnSelect(false);
   blockedMobileDevice = false;
+  permissionGate.deny = false;
 });
 
 // -------------------------------------------------------------------
@@ -734,6 +740,28 @@ describe('EVENT_PERMISSION_EPOCH_MODE validation', () => {
 // -------------------------------------------------------------------
 
 describe('createEventWsTicketRoute', () => {
+  it('gates ticket minting on devices:read', async () => {
+    const { requirePermission } = await import('../middleware/auth');
+    createEventWsTicketRoute();
+    expect(requirePermission).toHaveBeenCalledWith('devices', 'read');
+  });
+
+  it('returns 403 and mints no ticket when the caller lacks the read permission', async () => {
+    const { Hono } = await import('hono');
+    const app = new Hono();
+    setUserStatusRow({ orgId: 'org-xyz' });
+    permissionGate.deny = true;
+    app.use('*', async (c, next) => {
+      c.set('auth', { user: { id: 'user-abc', email: 'a@b.com', name: 'A' }, orgId: 'org-xyz' } as any);
+      await next();
+    });
+    app.route('/events', createEventWsTicketRoute());
+    const res = await app.request('/events/ws-ticket', { method: 'POST' });
+    expect(res.status).toBe(403);
+    const body = await res.json();
+    expect(body.ticket).toBeUndefined();
+  });
+
   it('returns a ticket when auth context is set', async () => {
     const { Hono } = await import('hono');
     const app = new Hono();
@@ -874,7 +902,7 @@ describe('createEventWsTicketRoute', () => {
     ['permission epoch changed after mint', 'permission_epoch_mismatch'],
   ] as const)('authorizes a system-scope ticket for %s', async (scenario, reason) => {
     const { db } = await import('../db');
-    const { and, eq, inArray, isNull } = await import('drizzle-orm');
+    const { and, eq, inArray, isNull, ne } = await import('drizzle-orm');
     const { organizations } = await import('../db/schema');
     const { getRedis } = await import('../services/redis');
     const setex = vi.fn().mockResolvedValue('OK');
@@ -893,6 +921,7 @@ describe('createEventWsTicketRoute', () => {
         and(
           eq(organizations.partnerId, selectedPartnerId),
           inArray(organizations.status, ['active', 'trial']),
+          ne(organizations.type, 'unassigned_pool'),
           isNull(organizations.deletedAt),
         ),
       );
@@ -922,6 +951,7 @@ describe('createEventWsTicketRoute', () => {
         expect(orgQuery.from.mock.results[0].value.where).toHaveBeenCalledWith(and(
           eq(organizations.partnerId, selectedPartnerId),
           inArray(organizations.status, ['active', 'trial']),
+          ne(organizations.type, 'unassigned_pool'),
           isNull(organizations.deletedAt),
         ));
       }

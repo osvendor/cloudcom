@@ -28,6 +28,25 @@ type BackupCapabilities struct {
 	Providers           []string `json:"providers"` // s3, local, azure, gcs, b2
 }
 
+// ProtocolInfoFlag is the breeze-backup flag that prints ProtocolInfo as one
+// JSON object and exits. The main agent runs the INSTALLED helper with it to
+// learn which storage protocols that binary implements; a helper that
+// predates the flag exits non-zero, which the agent reads as version 0.
+const ProtocolInfoFlag = "protocol-info"
+
+// ProtocolInfo is the --protocol-info output.
+type ProtocolInfo struct {
+	// BackupReadProtocolVersion is the brokered storage-read protocol the
+	// helper implements (0 = none).
+	BackupReadProtocolVersion int `json:"backupReadProtocolVersion"`
+	// BackupIntegrityProtocolVersion is the snapshot integrity protocol the
+	// helper implements (0 = none).
+	BackupIntegrityProtocolVersion int `json:"backupIntegrityProtocolVersion"`
+	// BackupWriteProtocolVersion is the brokered storage-write protocol the
+	// helper implements (0 = none).
+	BackupWriteProtocolVersion int `json:"backupWriteProtocolVersion"`
+}
+
 // BackupCommandRequest is sent from the agent to the backup helper.
 type BackupCommandRequest struct {
 	CommandID   string          `json:"commandId"`
@@ -83,8 +102,10 @@ type BackupCommandResult struct {
 //
 // Current/Total are bytes for backup_run; restore keeps its existing meaning
 // (see RestoreFromSnapshotContext's progress callback). FilesDone/FilesTotal
-// are populated for backup_run only — restore progress doesn't report a file
-// count, hence omitempty.
+// are populated for backup_run, backup_verify and backup_test_restore;
+// restore progress doesn't report a file count, hence omitempty. Verify and
+// test-restore progress (phase "verifying" / "test_restore") carry manifest
+// entries finished in both Current/Total and FilesDone/FilesTotal.
 type BackupProgress struct {
 	CommandID  string `json:"commandId"`
 	Phase      string `json:"phase"`
@@ -92,7 +113,16 @@ type BackupProgress struct {
 	Total      int64  `json:"total"`   // bytes total
 	FilesDone  int    `json:"filesDone,omitempty"`
 	FilesTotal int    `json:"filesTotal,omitempty"`
-	Message    string `json:"message,omitempty"`
+	// VerifiedFiles/VerifiedBytes (backup_run only) count files, and their
+	// source bytes, the run has finished checking before deciding whether to
+	// upload them: the resume pass over the checkpoint journal and the
+	// dedupe pre-pass's re-hash of a file whose modification time moved. They
+	// are separate from Current/FilesDone, whose meaning is unchanged; the
+	// API counts their movement as progress so a multi-hour check pass is
+	// not reaped as wedged (#11014). Cumulative for the run.
+	VerifiedFiles int    `json:"verifiedFiles,omitempty"`
+	VerifiedBytes int64  `json:"verifiedBytes,omitempty"`
+	Message       string `json:"message,omitempty"`
 	// SnapshotID is the backup_run snapshot currently being written. Empty
 	// until the snapshot is created (pre-scan keepalives) and always empty for
 	// restore progress. Sent so the server can persist backup_jobs.snapshot_id
@@ -101,6 +131,53 @@ type BackupProgress struct {
 	// stranding the uploaded objects with no restore point.
 	SnapshotID string `json:"snapshotId,omitempty"`
 }
+
+// VerifyCommandTimeout is how long the agent waits for the helper to answer a
+// backup_verify or backup_test_restore, matching the API's two-hour
+// LONG_TIMEOUT_TYPES tier for both commands.
+//
+// VerifyRunBudget is how long the helper lets one of those runs work before
+// it stops and reports the counts it has so far. It MUST stay below
+// VerifyCommandTimeout with room for in-flight downloads to unwind, the
+// test-restore directory (possibly hundreds of thousands of files) to be
+// removed and the result to cross IPC. Otherwise the agent's wait expires
+// first, the late result is discarded, and the server records "command timed
+// out" with 0 files ok and 0 failed however much was checked (#6598).
+// Pinned by types_test.go.
+const (
+	VerifyCommandTimeout = 2 * time.Hour
+	VerifyRunBudget      = VerifyCommandTimeout - 10*time.Minute
+)
+
+// BareMetalRebuildForwardTimeout is how long the agent waits for the helper
+// to answer a bare_metal_rebuild. It stays under the API's 24 h
+// WHOLE_MACHINE_RESTORE_TIMEOUT_MS reaper (commandTimeouts.ts) so the
+// helper's own result, not a reaper timeout, is what the server records.
+//
+// BareMetalRebuildRunBudget is the helper's absolute ceiling on one rebuild.
+// It is a backstop, not the usual way a rebuild stops: the helper also
+// stops a rebuild that makes no progress for its stall window
+// (cmd/breeze-backup/rebuild_budget.go). It MUST stay below the forward
+// timeout with room for the engine to unwind, the terminal progress post
+// and the result to cross IPC. A fixed 4 h budget here aborted every
+// restore of more than about 130k files (#6664).
+const (
+	BareMetalRebuildForwardTimeout = 23 * time.Hour
+	BareMetalRebuildRunBudget      = BareMetalRebuildForwardTimeout - 10*time.Minute
+)
+
+// Helper-side run budgets for the long-running VM restore commands. The
+// helper bounds each run with its budget (cmd/breeze-backup); the agent's
+// forwarder waits the budget plus HelperResultGrace, so the helper's own
+// terminal result, not a forwarder timeout, is what the server records. A
+// forwarder wait at or below the budget reports "failed" while the restore
+// keeps running in the helper. Pinned by heartbeat/handlers_bmr_test.go, which
+// also pins BareMetalRebuildForwardTimeout against BareMetalRebuildRunBudget.
+const (
+	VMRestoreFromBackupRunBudget = 2 * time.Hour
+	VMInstantBootRunBudget       = 30 * time.Minute
+	HelperResultGrace            = 5 * time.Minute
+)
 
 // BackupStopForwardTimeout is how long the agent waits for the helper's
 // backup_stop reply. BackupStopDrainTimeout is how long the helper may block

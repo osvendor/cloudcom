@@ -11,6 +11,7 @@ import {
   type SkippedItem,
   type SoftwareGroup,
   type SoftwareGroupDetail,
+  type SoftwareGroupDeviceFindings,
   type VulnSeverity,
   type VulnSkipReason,
   type VulnStatus,
@@ -33,10 +34,13 @@ export type {
   DeviceVulnStats,
   FleetVulnStats,
   GroupCve,
+  GroupDevice,
   GroupFinding,
+  GroupVersion,
   RemediateResult,
   SoftwareGroup,
   SoftwareGroupDetail,
+  SoftwareGroupDeviceFindings,
   VulnTicketResult,
 } from '@breeze/shared';
 
@@ -69,7 +73,14 @@ export interface FleetVulnerability {
   epssScore: number | null;
   riskScore: number | null;
   deviceCount: number;
+  /** Vendor fix published (global catalog flag) — NOT "Ready". */
   patchAvailable: boolean;
+  /**
+   * Devices where an open finding for this CVE is "Ready": a managed patch is
+   * pending AND approved for the partner (#9533 — same definition as the
+   * By-software column and the "Patch ready" tile).
+   */
+  patchReadyDeviceCount: number;
   statuses: VulnStatus[];
 }
 
@@ -224,6 +235,16 @@ export async function fetchSoftwareGroupDetail(groupKey: string): Promise<Softwa
   return res.json() as Promise<SoftwareGroupDetail>;
 }
 
+/** Drawer drill-down: one device's findings within a software group (#2262). */
+export async function fetchSoftwareGroupDeviceFindings(groupKey: string, deviceId: string): Promise<GroupFinding[]> {
+  const res = await fetchWithAuth(
+    `/vulnerabilities/software/${encodeURIComponent(groupKey)}/devices/${encodeURIComponent(deviceId)}`,
+  );
+  if (!res.ok) throw new Error('Failed to load device findings');
+  const body = (await res.json()) as SoftwareGroupDeviceFindings;
+  return body.findings;
+}
+
 export async function fetchVulnStats(): Promise<FleetVulnStats> {
   const res = await fetchWithAuth('/vulnerabilities/stats');
   if (!res.ok) throw new Error('Failed to load vulnerability stats');
@@ -242,11 +263,10 @@ export async function fetchCveDevices(cveId: string): Promise<CveDevicesPayload>
  * Mirrors the server's `deviceVulnerabilityIds` cap (`routes/vulnerabilities.ts`,
  * `.max(200)` on remediate / bulk accept-risk / bulk mitigate / tickets).
  *
- * The cap is a request-size bound, not a product limit: `remediateVulnerabilities`
- * loops per finding doing ~5 queries plus a command enqueue inside ONE synchronous
- * request. Raising it server-side would just move the timeout. So the client
- * batches instead — a 576-finding selection becomes three sequential requests
- * rather than one guaranteed `Too big: expected array to have <=200 items`.
+ * The cap is a request-size bound, not a product limit: a 576-finding selection
+ * becomes three sequential requests rather than one guaranteed `Too big: expected
+ * array to have <=200 items`. `remediateVulnerabilities` batches its reads per
+ * request and queues one install per (device, patch) (#7071).
  */
 const BULK_ID_LIMIT = 200;
 
@@ -286,15 +306,19 @@ interface ChunkedSpec<T> {
  *
  * 1. The merged total is a CONFIRMED LOWER BOUND, not the applied total. The
  *    failing batch can still have done work before it failed —
- *    `remediateVulnerabilities` queues each command before the awaited event
+ *    `remediateVulnerabilities` queues each install before the awaited event
  *    publication, so a throw there leaves commands queued that no response ever
  *    reported. A lost HTTP response is ambiguous the same way.
- * 2. Retrying the same selection is NOT safe for remediation. Every call creates
- *    a fresh `install_patches` command via `queueCommandForExecution` with no
- *    finding/action idempotency key, so re-sending ids that already succeeded
- *    queues a SECOND install on those devices. Accept/mitigate are state-writes
- *    and tolerate a retry; remediation does not. The copy therefore tells the
- *    operator to reload first rather than inviting a blind retry.
+ * 2. What a retry does. For remediation the server attaches a re-sent finding
+ *    to an install of the same (device, patch) that is still pending or sent,
+ *    under a per-(device, patch) lock so overlapping requests collapse too, and lists
+ *    it in `alreadyQueued` (#7071, #3750). A command that has already FAILED is
+ *    not reused — re-queueing it is the point of a retry. A completed install
+ *    stops producing a target once the agent's post-install patch rescan moves
+ *    that device_patches row off `pending` (every candidate query requires
+ *    `pending`); the finding itself stays open until the next correlation pass,
+ *    but a retry skips it as having no available patch rather than re-queueing.
+ *    Accept/mitigate are state-writes and tolerate a retry.
  */
 async function runChunked<T>(ids: string[], spec: ChunkedSpec<T>): Promise<T> {
   const batches = chunkIds(ids);
@@ -316,8 +340,23 @@ async function runChunked<T>(ids: string[], spec: ChunkedSpec<T>): Promise<T> {
 
 // ---- Mutations (all wrapped in runAction so every outcome surfaces a toast) ----
 
-const remediateSummary = (d: RemediateResult): string =>
-  bulkSummary(`remediation${d.scheduled === 1 ? '' : 's'} scheduled`, d.scheduled, d.skipped);
+const plural = (n: number, word: string): string => `${n} ${word}${n === 1 ? '' : 's'}`;
+
+/**
+ * Remediation outcome copy. Leads with INSTALLS (#9533): one install_patches
+ * command commonly covers several CVEs on a device, so "3 remediations
+ * scheduled" overstated a single install. A replayed/retried selection
+ * collapses onto installs still queued (#3750); say how many findings did, so
+ * the count is not read as new installs.
+ */
+export const remediateSummary = (d: RemediateResult): string => {
+  const head = d.scheduled === 0
+    ? 'Nothing scheduled'
+    : `Scheduled ${plural(d.installs, 'install')} covering ${plural(d.scheduled, 'finding')}`
+      + (d.alreadyQueued.length > 0 ? ` (${d.alreadyQueued.length} already queued)` : '');
+  if (d.skipped.length === 0) return head;
+  return `${head}; ${d.skipped.length} skipped — ${summarizeSkipReasons(d.skipped)}`;
+};
 
 export async function remediateVuln(deviceVulnerabilityIds: string[]): Promise<RemediateResult> {
   return runChunked<RemediateResult>(deviceVulnerabilityIds, {
@@ -332,16 +371,26 @@ export async function remediateVuln(deviceVulnerabilityIds: string[]): Promise<R
         errorFallback: 'Failed to schedule remediation',
         ...(toast ? { successMessage: remediateSummary } : {}),
         parseSuccess: (data) => {
-          const d = data as { scheduled?: number; skipped?: SkippedItem[] };
-          return { scheduled: d.scheduled ?? 0, skipped: d.skipped ?? [] };
+          const d = data as { scheduled?: number; installs?: number; alreadyQueued?: string[]; skipped?: SkippedItem[] };
+          const scheduled = d.scheduled ?? 0;
+          // A pre-#9533 API has no `installs`; one per finding is its old claim.
+          return { scheduled, installs: d.installs ?? scheduled, alreadyQueued: d.alreadyQueued ?? [], skipped: d.skipped ?? [] };
         },
       }),
-    empty: { scheduled: 0, skipped: [] },
-    merge: (a, b) => ({ scheduled: a.scheduled + b.scheduled, skipped: [...a.skipped, ...b.skipped] }),
+    empty: { scheduled: 0, installs: 0, alreadyQueued: [], skipped: [] },
+    merge: (a, b) => ({
+      scheduled: a.scheduled + b.scheduled,
+      // A (device, patch) whose findings straddle two batches is counted by
+      // both (the later batch reuses the install), so on the >200-finding path
+      // this can over-count installs slightly. Toast copy only.
+      installs: a.installs + b.installs,
+      alreadyQueued: [...a.alreadyQueued, ...b.alreadyQueued],
+      skipped: [...a.skipped, ...b.skipped],
+    }),
     summary: remediateSummary,
     partial: (d, done, total) =>
       `Stopped after ${done} of ${total} findings. At least ${d.scheduled} scheduled — some in the failed batch may also have `
-      + `been scheduled. Reload before retrying: re-sending findings that already succeeded queues duplicate installs.`,
+      + `been scheduled. Retrying the selection will not queue a second install for any that are already queued.`,
   });
 }
 

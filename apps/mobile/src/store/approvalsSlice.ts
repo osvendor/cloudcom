@@ -1,6 +1,7 @@
 import { createAsyncThunk, createSlice, type PayloadAction } from '@reduxjs/toolkit';
 import {
   type ApprovalRequest,
+  type ReauthFactor,
   approveRequest as apiApprove,
   denyRequest as apiDeny,
   fetchApproval as apiFetchOne,
@@ -13,6 +14,12 @@ import { gatherApprovalProof } from '../services/approverDevice';
 interface ApprovalsState {
   pending: ApprovalRequest[];
   focusId: string | null;
+  /**
+   * Approvals the user set aside with "Later" (#6212). They stay in `pending`
+   * (and the approvals list) but automatic refocus prefers any non-deferred
+   * row, so a deferred one only takes over again when nothing else is left.
+   */
+  deferredIds: string[];
   loading: boolean;
   error: string | null;
   decisionInFlight: Record<string, 'approve' | 'deny' | undefined>;
@@ -30,6 +37,7 @@ interface ApprovalsState {
 const initialState: ApprovalsState = {
   pending: [],
   focusId: null,
+  deferredIds: [],
   loading: false,
   error: null,
   decisionInFlight: {},
@@ -58,7 +66,20 @@ export const fetchOne = createAsyncThunk('approvals/fetchOne', async (id: string
  * `decisionInFlight`/error reducers (keyed by plain id) don't have to change
  * shape for every existing dispatch site and test fixture.
  */
-export type ApproveArg = string | { id: string; acknowledgedPatterns?: string[] };
+export type ApproveArg =
+  | string
+  | {
+      id: string;
+      acknowledgedPatterns?: string[];
+      /**
+       * #4052: critical-tier re-auth, as a one-shot GETTER rather than the
+       * value. RTK copies the thunk arg into every lifecycle action's
+       * `meta.arg`, so a plain password here would ride through the dispatch
+       * pipeline (middleware, devtools, crash breadcrumbs). A function
+       * serialises to nothing. Called once, right before the POST.
+       */
+      takeReauth?: () => ReauthFactor | undefined;
+    };
 
 function approveArgId(arg: ApproveArg): string {
   return typeof arg === 'string' ? arg : arg.id;
@@ -73,7 +94,9 @@ export const approve = createAsyncThunk('approvals/approve', async (arg: Approve
   // blocks — enforcement is Phase 4). A cancelled biometric prompt DOES throw,
   // aborting the approve rather than silently downgrading a deliberate cancel.
   const proof = await gatherApprovalProof(id);
-  const updated = await apiApprove(id, proof ? { proof } : undefined, acknowledgedPatterns);
+  const reauth = typeof arg === 'string' ? undefined : arg.takeReauth?.();
+  const stepUp = proof || reauth ? { ...(proof ? { proof } : {}), ...(reauth ? { reauth } : {}) } : undefined;
+  const updated = await apiApprove(id, stepUp, acknowledgedPatterns);
   await clearCachedApproval(id);
   return updated;
 });
@@ -112,8 +135,40 @@ export const reportSuspicious = createAsyncThunk(
 function dropAndRefocus(state: ApprovalsState, id: string): void {
   state.pending = state.pending.filter((a) => a.id !== id);
   if (state.focusId === id) {
-    state.focusId = state.pending.find((a) => a.status === 'pending')?.id ?? null;
+    state.focusId = pickRefocus(state);
   }
+  pruneDeferred(state);
+}
+
+/**
+ * Next focus when the current one is gone: a pending row the user has not
+ * deferred, else (a deferred one is all that is left) the first pending row —
+ * which is un-deferred so it is a normal takeover again (#6212).
+ */
+function pickRefocus(state: ApprovalsState): string | null {
+  const live = state.pending.filter((a) => a.status === 'pending');
+  const deferred = state.deferredIds ?? [];
+  const chosen = live.find((a) => !deferred.includes(a.id)) ?? live[0];
+  if (!chosen) return null;
+  state.deferredIds = deferred.filter((d) => d !== chosen.id);
+  return chosen.id;
+}
+
+/** Drop deferrals that no longer name a pending row. */
+function pruneDeferred(state: ApprovalsState): void {
+  state.deferredIds = (state.deferredIds ?? []).filter((d) =>
+    state.pending.some((a) => a.id === d && a.status === 'pending')
+  );
+}
+
+/** Focus the pending row `step` places from the current one, wrapping. */
+function stepFocus(state: ApprovalsState, step: 1 | -1): void {
+  const live = state.pending.filter((a) => a.status === 'pending');
+  if (live.length < 2) return;
+  const i = live.findIndex((a) => a.id === state.focusId);
+  const next = live[(i + step + live.length) % live.length];
+  state.focusId = next.id;
+  state.deferredIds = (state.deferredIds ?? []).filter((d) => d !== next.id);
 }
 
 /**
@@ -132,13 +187,38 @@ const slice = createSlice({
   reducers: {
     setFocus(state, action: PayloadAction<string | null>) {
       state.focusId = action.payload;
+      // An explicit focus (push tap, Next/Prev) always wins over a deferral.
+      state.deferredIds = (state.deferredIds ?? []).filter((d) => d !== action.payload);
+    },
+    focusNext(state) {
+      stepFocus(state, 1);
+    },
+    focusPrev(state) {
+      stepFocus(state, -1);
+    },
+    /**
+     * "Later": set the focused approval aside and move to the next one the
+     * user has not deferred. No-op when nothing else is available to show —
+     * a lone approval keeps its takeover.
+     */
+    deferFocused(state) {
+      const deferred = state.deferredIds ?? [];
+      const live = state.pending.filter((a) => a.status === 'pending');
+      const i = live.findIndex((a) => a.id === state.focusId);
+      if (i < 0) return;
+      const candidates = [...live.slice(i + 1), ...live.slice(0, i)];
+      const next = candidates.find((a) => !deferred.includes(a.id));
+      if (!next) return;
+      state.deferredIds = [...deferred, live[i].id];
+      state.focusId = next.id;
     },
     markExpired(state, action: PayloadAction<string>) {
       const i = state.pending.findIndex((a) => a.id === action.payload);
       if (i >= 0) state.pending[i].status = 'expired';
       if (state.focusId === action.payload) {
-        state.focusId = state.pending.find((a) => a.status === 'pending')?.id ?? null;
+        state.focusId = pickRefocus(state);
       }
+      pruneDeferred(state);
     },
     /**
      * Wall-clock sweep over the WHOLE queue.
@@ -160,9 +240,10 @@ const slice = createSlice({
           (a) => a.id === state.focusId && a.status === 'pending'
         );
         if (!focusStillPending) {
-          state.focusId = state.pending.find((a) => a.status === 'pending')?.id ?? null;
+          state.focusId = pickRefocus(state);
         }
       }
+      pruneDeferred(state);
     },
     upsert(state, action: PayloadAction<ApprovalRequest>) {
       const i = state.pending.findIndex((a) => a.id === action.payload.id);
@@ -199,8 +280,9 @@ const slice = createSlice({
         (x) => x.id === s.focusId && x.status === 'pending'
       );
       if (!focusStillPending) {
-        s.focusId = a.payload.find((x) => x.status === 'pending')?.id ?? null;
+        s.focusId = pickRefocus(s);
       }
+      pruneDeferred(s);
     });
     b.addCase(refreshPending.rejected, (s, a) => {
       s.loading = false;
@@ -279,5 +361,5 @@ const slice = createSlice({
   },
 });
 
-export const { setFocus, markExpired, pruneExpired, upsert, clearApprovalsError } = slice.actions;
+export const { setFocus, focusNext, focusPrev, deferFocused, markExpired, pruneExpired, upsert, clearApprovalsError } = slice.actions;
 export default slice.reducer;

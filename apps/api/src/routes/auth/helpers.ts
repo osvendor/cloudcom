@@ -50,6 +50,16 @@ import {
   ANONYMOUS_ACTOR_ID,
   ENABLE_2FA
 } from './schemas';
+import { hasActiveTotpFactor, type TotpFactorRow } from './mfaFactorPredicates';
+
+// #10650: the authenticator-app factor predicate lives in its own module; it
+// is re-exported here so route code keeps one import site for auth helpers.
+export {
+  activeTotpFactorSql,
+  canAddBackupTotp,
+  hasActiveTotpFactor,
+  type TotpFactorRow,
+} from './mfaFactorPredicates';
 
 const { db } = dbModule;
 
@@ -229,6 +239,23 @@ export const INVALID_CREDENTIALS_CODE = 'invalid_credentials';
  * discloses nothing they don't already know from having reached this point.
  */
 export const ENROLLMENT_GRANT_EXPIRED_CODE = 'enrollment_grant_expired';
+/**
+ * #4045: a passwordless account offered NO proof to a factor-management route
+ * (recovery-code rotation, passkey deletion, MFA disable). The body carries
+ * `reauthUrl`, the one action that resolves it. Disclosure is the same as
+ * `enrollment_proof_required`: the caller is authenticated AS this account and
+ * `/users/me` already reports `hasPassword`.
+ */
+export const SSO_REAUTH_REQUIRED_CODE = 'sso_reauth_required';
+/**
+ * #4045: the `sso_reauth_manage_factor` grant failed to validate or consume in
+ * {@link resolveFactorManagementStepUp} / {@link consumeFactorManagementReauthGrant}
+ * — expired, already spent, minted in another session, or invalidated by a
+ * factor/epoch change since. Same reasoning as
+ * {@link ENROLLMENT_GRANT_EXPIRED_CODE}: the caller has already committed to the
+ * SSO road, so naming the failure discloses nothing.
+ */
+export const SSO_REAUTH_GRANT_EXPIRED_CODE = 'sso_reauth_grant_expired';
 
 /** The status a rejected body-supplied proof answers with. */
 export type ProofRejectionStatus = 400 | 401;
@@ -395,9 +422,11 @@ export async function requireFreshMfaStepUp(
     .limit(1);
 
   // Only TOTP step-up is supported here; SMS/passkey L4 re-auth is out of scope.
-  // Allowlist on the method (not a denylist) so any non-TOTP/unset method is
-  // rejected even if a stale secret lingers — defense-in-depth for the auth path.
-  if (!user?.mfaEnabled || user.mfaMethod !== 'totp' || !user.mfaSecret) {
+  // The shared predicate is an allowlist on the method (not a denylist): a
+  // TOTP primary, a backup beside a passkey primary (#10650), or a legacy
+  // enabled row whose mfa_method was never written qualifies, and
+  // a stale secret beside an SMS primary or on an MFA-off row never does.
+  if (!user || !hasActiveTotpFactor(user) || !user.mfaSecret) {
     return rejectProof(c, 'Invalid credentials', INVALID_CREDENTIALS_CODE, rejectionStatus);
   }
 
@@ -490,7 +519,7 @@ export async function enforceExistingFactorStepUp(
   grantId: string | undefined,
   opts: {
     consume: boolean;
-    operation?: 'add_factor' | 'rotate_recovery_codes' | 'delete_passkey';
+    operation?: 'add_factor' | 'rotate_recovery_codes' | 'delete_passkey' | 'remove_totp';
     resourceDigest?: string;
   },
 ): Promise<Response | null> {
@@ -525,7 +554,9 @@ export async function enforceExistingFactorStepUp(
 // ============================================
 
 /**
- * The single decision point for "may this caller install a FIRST MFA factor?".
+ * The "user at the keyboard" leg of installing an MFA factor: the FIRST one,
+ * or (#7369) an additional one on a passwordless account. It is never the
+ * whole gate for an account that already holds a factor — see below.
  *
  * Two roads, never both:
  *   - password — the historical path, unchanged, and evaluated FIRST.
@@ -537,17 +568,24 @@ export async function enforceExistingFactorStepUp(
  * The SSO road is refused outright for an account that HAS a password: two
  * roads of differing strength to the same door is how a step-up gets bypassed.
  *
- * It is ALSO refused for a passwordless account that already holds any factor.
- * The grant's operation is `enroll_first_factor` and that is all it may ever
- * do: without this check a passwordless account with a TOTP secret or a
- * registered passkey could re-auth at its IdP and use the resulting grant to
- * install a SECOND factor, side-stepping {@link enforceExistingFactorStepUp}
- * (SR2-20), which exists precisely to require proving an EXISTING factor
- * before adding a new one. The predicate is {@link userIsMfaProtected} — the
- * same one SR2-20 uses — so the two gates can never drift apart. A protected
- * passwordless account is REFUSED this road outright; it does not fall
- * through to any other step-up here. Its route back in is the SR2-20 path,
- * proving the factor it already holds.
+ * Which grant the SSO road accepts follows the account's factor state, via
+ * {@link userIsMfaProtected} — the same predicate the callback uses to pick
+ * the purpose it mints, and the one SR2-20 uses — so the three can never
+ * drift apart:
+ *   - no factor yet: only `enroll_first_factor`. That grant installs a FIRST
+ *     factor and nothing else; an account that already holds one can never
+ *     spend it (bindsMatch compares the operation, and the factor write bumped
+ *     `mfa_epoch` anyway), so it cannot be used to side-step
+ *     {@link enforceExistingFactorStepUp} (SR2-20).
+ *   - already protected: only `sso_reauth_manage_factor` (#4045), and ONLY as
+ *     the stand-in for the PASSWORD leg — exactly the role the password plays
+ *     for a password account adding a second factor. The existing-factor leg
+ *     is not decided here: every caller also runs
+ *     {@link enforceExistingFactorStepUp}, which for a protected account
+ *     demands a fresh `add_factor` grant proving the factor it already holds.
+ *     Before #7369 this road refused a protected passwordless account outright,
+ *     and with no password to take the other road it could never add a second
+ *     factor at all — SR2-20 was never reached.
  *
  * Every rejection is the same opaque `Invalid credentials` response the
  * password path already returns — SAME status, same body, whichever road was
@@ -644,11 +682,16 @@ export async function resolveEnrollmentStepUp(
     return c.json({ error: 'enrollment_proof_required', reauthUrl: '/sso/reauth/start' }, rejectionStatus);
   }
 
-  // FIRST factor only — see the doc comment above. Checked BEFORE the grant is
-  // consumed so a refused enrollment never burns the caller's grant.
-  if (await userIsMfaProtected(auth.user.id)) {
-    return rejectProof(c, 'Invalid credentials', INVALID_CREDENTIALS_CODE, rejectionStatus);
-  }
+  // The grant's PURPOSE follows the account's factor state — see the doc
+  // comment above. Same predicate the mint site in `routes/sso.ts` uses to
+  // pick the purpose, so a grant can only ever match the road it was minted
+  // for: `enroll_first_factor` for a first factor, `sso_reauth_manage_factor`
+  // (the password leg ONLY) once the account holds one. The existing-factor
+  // leg for a protected account is NOT decided here; every enrollment route
+  // enforces it separately via enforceExistingFactorStepUp (SR2-20).
+  const operation = (await userIsMfaProtected(auth.user.id))
+    ? 'sso_reauth_manage_factor' as const
+    : 'enroll_first_factor' as const;
 
   const epochs = await getUserEpochs(auth.user.id);
   const sid = auth.token?.sid;
@@ -661,7 +704,7 @@ export async function resolveEnrollmentStepUp(
   // divergence here would silently reject every legitimate grant.
   const bind = {
     userId: auth.user.id,
-    operation: 'enroll_first_factor' as const,
+    operation,
     authEpoch: epochs.authEpoch,
     mfaEpoch: epochs.mfaEpoch,
     sid,
@@ -685,6 +728,181 @@ export async function resolveEnrollmentStepUp(
     );
   }
 
+  return null;
+}
+
+// ============================================
+// Factor-management step-up (#4045)
+// ============================================
+
+/**
+ * Which "user at the keyboard" proof a factor-management request presented.
+ * Only {@link resolveFactorManagementStepUp} produces one, so the terminal
+ * {@link consumeFactorManagementReauthGrant} can never be told "the password
+ * was proven" by anything other than a gate that actually verified it.
+ */
+export type FactorManagementProof =
+  | { road: 'password' }
+  | { road: 'sso'; grantId: string };
+
+const SSO_REAUTH_URL = '/sso/reauth/start';
+const SSO_REAUTH_GRANT_EXPIRED_MESSAGE =
+  'Your identity verification has expired. Please verify with your identity provider again.';
+
+function ssoReauthGrantExpired(c: Context, rejectionStatus: ProofRejectionStatus): Response {
+  return rejectProof(c, SSO_REAUTH_GRANT_EXPIRED_MESSAGE, SSO_REAUTH_GRANT_EXPIRED_CODE, rejectionStatus, {
+    reauthUrl: SSO_REAUTH_URL,
+  });
+}
+
+/**
+ * The `sso_reauth_manage_factor` bind tuple for this caller, reconstructed
+ * against the LIVE epochs. Must match the mint site in `routes/sso.ts` (reauth
+ * branch) MEMBER FOR MEMBER — bindsMatch fails closed on any difference.
+ */
+async function manageFactorGrantBind(auth: AuthContext) {
+  const epochs = await getUserEpochs(auth.user.id);
+  const sid = auth.token?.sid;
+  if (!epochs || !sid) return null;
+  return {
+    userId: auth.user.id,
+    operation: 'sso_reauth_manage_factor' as const,
+    authEpoch: epochs.authEpoch,
+    mfaEpoch: epochs.mfaEpoch,
+    sid,
+  };
+}
+
+/**
+ * The GATE of a factor-management request: recovery-code rotation
+ * (`POST /mfa/recovery-codes`), passkey deletion (`DELETE /passkeys/:id`) and
+ * MFA disable (`POST /mfa/disable`). Decides the "user at the keyboard" proof
+ * that sits ALONGSIDE each route's own existing-factor proof — it never
+ * replaces that proof.
+ *
+ * Two roads, never both, the same shape as {@link resolveEnrollmentStepUp}:
+ *   - password — evaluated FIRST and byte-for-byte the historical path
+ *     ({@link requireCurrentPasswordStepUp}, same key prefix, same limiter).
+ *   - SSO re-auth grant — ONLY for an account with `password_hash IS NULL`
+ *     that already holds a factor, and ONLY a grant minted for
+ *     `sso_reauth_manage_factor`. An `enroll_first_factor` grant never
+ *     satisfies this (bindsMatch compares the operation), and this grant never
+ *     satisfies enrollment. The SSO road is refused outright for an account
+ *     that has a password: two roads of differing strength to one door is how
+ *     a step-up gets bypassed.
+ *
+ * The SSO road is charged the SAME per-user limiter as the password road
+ * (`${keyPrefix}:${userId}`, 5 per 5 min). That budget is load-bearing:
+ * `/mfa/disable` verifies a TOTP/SMS code AFTER this gate, the code verifier
+ * has no guess budget of its own, and a validated (not yet consumed) grant
+ * survives a wrong code — without the charge the SSO road would be an
+ * unthrottled code oracle.
+ *
+ * Non-consuming: returns the proof for {@link consumeFactorManagementReauthGrant}
+ * to spend at the terminal write, so a mistyped code does not burn the grant.
+ *
+ * Rejections stay opaque (`invalid_credentials`) wherever they would otherwise
+ * reveal whether the account has a password or a factor, with two deliberate
+ * exceptions that only a passwordless caller can reach and that disclose
+ * nothing `/users/me` does not: `sso_reauth_required` (no proof offered) and
+ * `sso_reauth_grant_expired` (the grant it offered is dead). Both carry
+ * `reauthUrl` so the client can offer the one action that fixes them.
+ */
+export async function resolveFactorManagementStepUp(
+  c: Context,
+  auth: AuthContext,
+  input: { currentPassword?: string; ssoReauthGrantId?: string },
+  opts: { keyPrefix: string; rejectionStatus?: ProofRejectionStatus },
+): Promise<{ error: Response } | { proof: FactorManagementProof }> {
+  const rejectionStatus = opts.rejectionStatus ?? 401;
+
+  if (input.currentPassword) {
+    const passwordError = await requireCurrentPasswordStepUp(
+      c, auth.user.id, input.currentPassword, opts.keyPrefix, { rejectionStatus },
+    );
+    return passwordError ? { error: passwordError } : { proof: { road: 'password' } };
+  }
+
+  // Same system-context idiom as resolveEnrollmentStepUp: a contextless read
+  // under forced RLS matches zero rows rather than erroring.
+  const [user] = await runWithSystemDbAccess(() =>
+    db
+      .select({ passwordHash: users.passwordHash })
+      .from(users)
+      .where(eq(users.id, auth.user.id))
+      .limit(1)
+  );
+  if (!user || user.passwordHash != null) {
+    return { error: rejectProof(c, 'Invalid credentials', INVALID_CREDENTIALS_CODE, rejectionStatus) };
+  }
+
+  if (!input.ssoReauthGrantId) {
+    const message = 'This account has no password. Verify with your identity provider to confirm this change.';
+    return {
+      error: rejectProof(c, message, SSO_REAUTH_REQUIRED_CODE, rejectionStatus, { reauthUrl: SSO_REAUTH_URL }),
+    };
+  }
+
+  // Managing a factor presupposes holding one. Checked BEFORE the grant is
+  // touched; the grant is only ever minted for a protected account anyway.
+  if (!(await userIsMfaProtected(auth.user.id))) {
+    return { error: rejectProof(c, 'Invalid credentials', INVALID_CREDENTIALS_CODE, rejectionStatus) };
+  }
+
+  const redis = getRedis();
+  if (!redis) {
+    return { error: c.json({ error: STEP_UP_UNAVAILABLE_MESSAGE, message: STEP_UP_UNAVAILABLE_MESSAGE }, 503) };
+  }
+  const rateCheck = await rateLimiter(redis, `${opts.keyPrefix}:${auth.user.id}`, 5, 5 * 60);
+  if (!rateCheck.allowed) {
+    return {
+      error: c.json({
+        error: STEP_UP_THROTTLED_MESSAGE,
+        message: STEP_UP_THROTTLED_MESSAGE,
+        retryAfter: Math.ceil((rateCheck.resetAt.getTime() - Date.now()) / 1000),
+      }, 429),
+    };
+  }
+
+  const bind = await manageFactorGrantBind(auth);
+  if (!bind) {
+    return { error: c.json({ error: 'Service temporarily unavailable' }, 503) };
+  }
+  if (!(await validateStepUpGrant(input.ssoReauthGrantId, bind))) {
+    return { error: ssoReauthGrantExpired(c, rejectionStatus) };
+  }
+
+  return { proof: { road: 'sso', grantId: input.ssoReauthGrantId } };
+}
+
+/**
+ * The TERMINAL half of {@link resolveFactorManagementStepUp}: spend the SSO
+ * grant exactly once, immediately before the factor write, re-checking the
+ * binding against the LIVE epochs (a factor change since the gate kills it).
+ * The password road has nothing to spend — the gate that produced the proof
+ * already verified it in this same request.
+ *
+ * Returns a Response to short-circuit the caller, or null to proceed.
+ */
+export async function consumeFactorManagementReauthGrant(
+  c: Context,
+  auth: AuthContext,
+  proof: FactorManagementProof,
+  opts: { rejectionStatus?: ProofRejectionStatus },
+): Promise<Response | null> {
+  if (proof.road === 'password') return null;
+  const rejectionStatus = opts.rejectionStatus ?? 401;
+
+  if (!(await userIsMfaProtected(auth.user.id))) {
+    return rejectProof(c, 'Invalid credentials', INVALID_CREDENTIALS_CODE, rejectionStatus);
+  }
+  const bind = await manageFactorGrantBind(auth);
+  if (!bind) {
+    return c.json({ error: 'Service temporarily unavailable' }, 503);
+  }
+  if (!(await consumeStepUpGrant(proof.grantId, bind))) {
+    return ssoReauthGrantExpired(c, rejectionStatus);
+  }
   return null;
 }
 
@@ -1412,7 +1630,7 @@ export type PendingMfaMethodVerdict =
 export function evaluatePendingMfaMethod(
   pending: PendingMfaRecord,
   method: PendingMfaVerificationMethod,
-  liveUser: { mfaSecret: string | null; mfaMethod: string | null; phoneNumber: string | null },
+  liveUser: TotpFactorRow & { phoneNumber: string | null },
   liveAllowedMethods: PendingMfaRecord['allowedMethods'],
 ): PendingMfaMethodVerdict {
   if (method === 'recovery') {
@@ -1426,7 +1644,7 @@ export function evaluatePendingMfaMethod(
   }
 
   const enrolled = method === 'totp'
-    ? Boolean(liveUser.mfaSecret)
+    ? hasActiveTotpFactor(liveUser)
     : liveUser.mfaMethod === 'sms' && Boolean(liveUser.phoneNumber);
   if (!enrolled) {
     return { ok: false, reason: 'factor_not_enrolled', terminal: false };
@@ -1625,11 +1843,13 @@ export async function resolveUserAuditOrgId(userId: string): Promise<string | nu
         return null;
       }
 
-      const [orgAssoc] = await db
+      // Savepoint: the catch is inside the context, so without one the failure
+      // rethrows when the context's transaction ends (#11225).
+      const [orgAssoc] = await dbModule.withDbTransaction(() => db
         .select({ orgId: organizationUsers.orgId })
         .from(organizationUsers)
         .where(eq(organizationUsers.userId, userId))
-        .limit(1);
+        .limit(1));
 
       return orgAssoc?.orgId ?? null;
     } catch (err) {
@@ -1704,10 +1924,13 @@ export async function auditUserLoginFailure(
 
 export function auditLogin(
   c: RequestLike,
-  opts: { orgId: string | null; userId: string; email: string; name: string; mfa: boolean; scope: string; ip: string; method?: string }
+  opts: { orgId: string | null; partnerId?: string | null; userId: string; email: string; name: string; mfa: boolean; scope: string; ip: string; method?: string }
 ): void {
   createAuditLogAsync({
     orgId: opts.orgId ?? undefined,
+    // Partner-axis rows (orgId null) must carry partnerId or they are
+    // invisible in the partner audit view; persistAuditLog drops it when orgId is set.
+    partnerId: opts.partnerId ?? undefined,
     actorId: opts.userId,
     actorEmail: opts.email,
     action: 'user.login',

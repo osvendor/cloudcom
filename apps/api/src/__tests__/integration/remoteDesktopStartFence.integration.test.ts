@@ -1,5 +1,5 @@
 /**
- * SEC-038 W02 (#5533) — start-intent ordering, against real Postgres.
+ * #5533 — start-intent ordering, against real Postgres.
  *
  * The property under test is an INTERLEAVING, so none of it can be proved by a
  * mocked Drizzle suite: a mock cannot hold a `FOR UPDATE` row lock, cannot show
@@ -25,7 +25,7 @@
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
-import { eq, sql } from 'drizzle-orm';
+import { and, eq, inArray, sql } from 'drizzle-orm';
 
 import './setup';
 import { getTestDb } from './setup';
@@ -101,6 +101,14 @@ import {
   commitDesktopStreamStartIntent,
   formatDesktopGeneration,
 } from '../../services/remoteDesktopStartIntent';
+import { originalRemoteSessionStart, remoteSessionStaleCondition } from '../../services/remoteSessionStaleness';
+import { getRedis } from '../../services/redis';
+import {
+  desktopStartInFlightRedisKey,
+  markDesktopStartInFlight,
+  releaseDesktopStartInFlight,
+} from '../../services/desktopStartInFlight';
+import { viewerAnswerTimeoutMs } from '../../routes/remote/consentTiming';
 
 const OFFER = 'v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\n';
 const LEASE = { lease: { sessionId: 'x', token: 't', expiresAt: new Date().toISOString() } };
@@ -120,6 +128,7 @@ async function insertDevice(orgId: string, siteId: string): Promise<string> {
     agentVersion: '0.0.0-test',
     status: 'online',
     revocationLeaseProtocolVersion: 1,
+    desktopFenceProtocolVersion: 1,
     enrolledAt: new Date(),
   }).returning({ id: devices.id });
   if (!row) throw new Error('insertDevice: no row returned');
@@ -171,6 +180,18 @@ async function commitTerminalIntentDirectly(
     // the status still reads live, which is exactly the window W03's
     // pending→confirmed teardown opens.
     ...(options.keepStatus ? {} : { status: 'disconnected' as const, endedAt: new Date() }),
+  }).where(eq(remoteSessions.id, sessionId));
+}
+
+/**
+ * What the agent's answer does to the row (routes/agentWs.ts, "Stored WebRTC
+ * answer"): the start stops being in flight, so a later offer is a reconnect.
+ */
+async function storeAnswerDirectly(sessionId: string): Promise<void> {
+  await getTestDb().update(remoteSessions).set({
+    webrtcAnswer: 'v=0\r\nanswer\r\n',
+    status: 'active',
+    startedAt: originalRemoteSessionStart(),
   }).where(eq(remoteSessions.id, sessionId));
 }
 
@@ -240,11 +261,14 @@ function offer(app: Hono, sessionId: string, token: string) {
   });
 }
 
-describe('SEC-038 W02 — desktop start-intent generation fence', () => {
-  beforeEach(() => {
+describe('desktop start-intent generation fence', () => {
+  beforeEach(async () => {
     sendCommandToAgentMock.mockClear();
     prepareRevocationLeaseForStartMock.mockReset();
     prepareRevocationLeaseForStartMock.mockResolvedValue({ ok: true, ...LEASE });
+    // The #8947 in-flight marker fails open on a client that is not ready yet;
+    // connect the app's lazily-created client so these tests exercise it.
+    await getRedis()?.ping();
   });
 
   it('publishes a start with a generation that strictly increases on every re-offer', async () => {
@@ -257,6 +281,10 @@ describe('SEC-038 W02 — desktop start-intent generation fence', () => {
     expect(first.status).toBe(200);
     const afterFirst = await readFence(sessionId);
     expect(afterFirst.generation).toBe(1n);
+
+    // A re-offer supersedes once the first start was answered (a reconnect).
+    // While it is still unanswered a re-offer is refused — see the #8947 tests.
+    await storeAnswerDirectly(sessionId);
 
     const second = await offer(app, sessionId, token);
     expect(second.status).toBe(200);
@@ -358,14 +386,17 @@ describe('SEC-038 W02 — desktop start-intent generation fence', () => {
       sessionId,
       startCommandId: `desk-start-${sessionId}-11111111-1111-4111-8111-111111111111`,
       promptMode: 'off',
+      consentUnavailableBehavior: null,
       offer: OFFER,
     }));
     expect(first).toMatchObject({ ok: true, generation: 1n });
+    await storeAnswerDirectly(sessionId);
 
     const second = await withSystemDbAccessContext(() => commitDesktopStartIntent({
       sessionId,
       startCommandId: `desk-start-${sessionId}-22222222-2222-4222-8222-222222222222`,
       promptMode: 'off',
+      consentUnavailableBehavior: null,
       offer: 'v=0\r\nDIFFERENT\r\n',
     }));
     expect(second).toMatchObject({ ok: true, generation: 2n });
@@ -382,16 +413,54 @@ describe('SEC-038 W02 — desktop start-intent generation fence', () => {
 
   it('refuses the WS-fallback start intent on a terminal session and bumps otherwise', async () => {
     const { sessionId } = await seed('pending');
+    const streamStart = (commandSuffix: string) => ({
+      sessionId,
+      startCommandId: `desk-start-${sessionId}-${commandSuffix}`,
+      promptMode: 'off' as const,
+      consentUnavailableBehavior: null,
+    });
 
-    const live = await withSystemDbAccessContext(() => commitDesktopStreamStartIntent(sessionId));
+    const live = await withSystemDbAccessContext(() =>
+      commitDesktopStreamStartIntent(streamStart('11111111-1111-4111-8111-111111111111'))
+    );
     expect(live).toMatchObject({ ok: true, generation: 1n });
-    expect((await readFence(sessionId)).status).toBe('active');
+    // Connecting until the agent accepts this exact start; never active here.
+    expect((await readFence(sessionId)).status).toBe('connecting');
 
     await commitTerminalIntentDirectly(sessionId);
     const afterTerminal = await withSystemDbAccessContext(() =>
-      commitDesktopStreamStartIntent(sessionId)
+      commitDesktopStreamStartIntent(streamStart('22222222-2222-4222-8222-222222222222'))
     );
     expect(afterTerminal).toEqual({ ok: false, reason: 'terminal' });
+  });
+
+  // A WebSocket-fallback start waits in 'connecting' for the agent's answer —
+  // through a consent prompt of up to about a minute and a half. The stale
+  // cutoff for a connecting row runs from the start attempt, not from when
+  // the session row was created, so that wait is never expired as stale.
+  it('does not expire a WS-fallback start waiting on its answer as stale, however old the session row', async () => {
+    const { sessionId } = await seed('pending');
+    await getTestDb().execute(sql`
+      UPDATE remote_sessions SET created_at = now() - interval '10 minutes', last_start_attempt_at = now() - interval '10 minutes' WHERE id = ${sessionId}::uuid
+    `);
+    const { sessionId: plainOld } = await seed('connecting');
+    await getTestDb().execute(sql`
+      UPDATE remote_sessions SET created_at = now() - interval '10 minutes', last_start_attempt_at = now() - interval '10 minutes' WHERE id = ${plainOld}::uuid
+    `);
+
+    const started = await withSystemDbAccessContext(() => commitDesktopStreamStartIntent({
+      sessionId,
+      startCommandId: `desk-start-${sessionId}-33333333-3333-4333-8333-333333333333`,
+      promptMode: 'consent',
+      consentUnavailableBehavior: 'block',
+    }));
+    expect(started.ok).toBe(true);
+
+    const stale = await getTestDb()
+      .select({ id: remoteSessions.id })
+      .from(remoteSessions)
+      .where(and(inArray(remoteSessions.id, [sessionId, plainOld]), remoteSessionStaleCondition(new Date())));
+    expect(stale.map((r) => r.id)).toEqual([plainOld]);
   });
 
   it('refuses a start intent on a session that no longer exists', async () => {
@@ -443,6 +512,118 @@ describe('SEC-038 W02 — desktop start-intent generation fence', () => {
     expect((await res.json()).code).toBe('SESSION_TERMINAL');
     expect(sendCommandToAgentMock).not.toHaveBeenCalled();
     expect((await readFence(sessionId)).phase).toBe('pending');
+  });
+
+  // #8947: one viewer window posted two offers ~250 ms apart; both were
+  // accepted, two start_desktop commands went out, and the first peer was
+  // orphaned. A second offer while the first start is unanswered is refused.
+  describe('concurrent second offer (#8947)', () => {
+    function viewerApp() {
+      return createDesktopWsRoutes(
+        vi.fn((_factory: unknown) => (_c: unknown, _next: unknown) => {}) as never,
+      );
+    }
+
+    function viewerOffer(app: ReturnType<typeof viewerApp>, sessionId: string) {
+      return app.request(`/${sessionId}/viewer/offer`, {
+        method: 'POST',
+        headers: { Authorization: 'Bearer viewer.token', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ offer: OFFER }),
+      });
+    }
+
+    async function seedViewer() {
+      const seeded = await seed('pending');
+      verifyViewerAccessTokenMock.mockResolvedValue({
+        sub: seeded.env.user.id,
+        email: seeded.env.user.email,
+        sessionId: seeded.sessionId,
+        jti: `jti-${seeded.sessionId}`,
+      });
+      return seeded;
+    }
+
+    it('JWT route: refuses a second offer while the first start is unanswered, and dispatches one start', async () => {
+      const { token, sessionId } = await seed('pending');
+      const app = buildApp();
+
+      expect((await offer(app, sessionId, token)).status).toBe(200);
+      const second = await offer(app, sessionId, token);
+
+      expect(second.status).toBe(409);
+      expect((await second.json()).code).toBe('START_IN_FLIGHT');
+      expect(sendCommandToAgentMock).toHaveBeenCalledTimes(1);
+      // The first start keeps its generation and identity.
+      const fence = await readFence(sessionId);
+      expect(fence.generation).toBe(1n);
+      const [, command] = sendCommandToAgentMock.mock.calls[0]!;
+      expect(fence.commandId).toBe((command as { id: string }).id);
+    });
+
+    it('viewer route: of two concurrent offers exactly one starts', async () => {
+      const { sessionId } = await seedViewer();
+      const app = viewerApp();
+
+      const results = await Promise.all([viewerOffer(app, sessionId), viewerOffer(app, sessionId)]);
+
+      expect(results.map((r) => r.status).sort()).toEqual([200, 409]);
+      const refused = results.find((r) => r.status === 409)!;
+      expect((await refused.json()).code).toBe('START_IN_FLIGHT');
+      expect(sendCommandToAgentMock).toHaveBeenCalledTimes(1);
+      expect((await readFence(sessionId)).generation).toBe(1n);
+    });
+
+    it('accepts a reconnect offer once the first start was answered', async () => {
+      const { sessionId } = await seedViewer();
+      const app = viewerApp();
+
+      expect((await viewerOffer(app, sessionId)).status).toBe(200);
+      await storeAnswerDirectly(sessionId);
+      expect((await viewerOffer(app, sessionId)).status).toBe(200);
+
+      expect(sendCommandToAgentMock).toHaveBeenCalledTimes(2);
+      expect((await readFence(sessionId)).generation).toBe(2n);
+    });
+
+    it('accepts a retry once the in-flight marker expired (the first viewer gave up waiting)', async () => {
+      const { sessionId } = await seedViewer();
+      const app = viewerApp();
+
+      expect((await viewerOffer(app, sessionId)).status).toBe(200);
+      // The row is unchanged — still connecting, unanswered — only the
+      // viewer's answer budget has run out.
+      await getRedis()!.del(desktopStartInFlightRedisKey(sessionId));
+      expect((await viewerOffer(app, sessionId)).status).toBe(200);
+      expect((await readFence(sessionId)).generation).toBe(2n);
+    });
+
+    it('marker: real PX TTL, and release is compare-and-delete against real Redis', async () => {
+      const sessionId = '00000000-0000-4000-8000-0000000089a7';
+      const key = desktopStartInFlightRedisKey(sessionId);
+      const redis = getRedis()!;
+
+      await markDesktopStartInFlight(sessionId, 'start-A', viewerAnswerTimeoutMs('off'));
+      const ttl = await redis.pttl(key);
+      expect(ttl).toBeGreaterThan(0);
+      expect(ttl).toBeLessThanOrEqual(viewerAnswerTimeoutMs('off'));
+
+      // A release for another start never drops this one's marker.
+      await releaseDesktopStartInFlight(sessionId, 'start-B');
+      expect(await redis.get(key)).toBe('start-A');
+
+      await releaseDesktopStartInFlight(sessionId, 'start-A');
+      expect(await redis.exists(key)).toBe(0);
+    });
+
+    it('accepts a retry when the first start never reached the agent', async () => {
+      const { sessionId } = await seedViewer();
+      const app = viewerApp();
+      sendCommandToAgentMock.mockReturnValueOnce(false);
+
+      expect((await viewerOffer(app, sessionId)).status).toBe(502);
+      expect((await viewerOffer(app, sessionId)).status).toBe(200);
+      expect((await readFence(sessionId)).generation).toBe(2n);
+    });
   });
 
   it('formats generations as canonical decimal strings beyond 2^53', () => {

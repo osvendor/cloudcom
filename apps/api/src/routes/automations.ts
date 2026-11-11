@@ -1,12 +1,13 @@
-import { createHash, createHmac, randomUUID, timingSafeEqual } from 'crypto';
+import { createHash, randomUUID, timingSafeEqual } from 'crypto';
 import { Hono, type Context, type Next } from 'hono';
 import { zValidator } from '../lib/validation';
 import { z } from 'zod';
 import { scriptParametersSchema } from '@breeze/shared';
-import { and, desc, eq, inArray, isNull, or, sql, type SQL } from 'drizzle-orm';
-import { db } from '../db';
+import { and, desc, eq, inArray, isNotNull, isNull, or, sql, type SQL } from 'drizzle-orm';
+import { db, runOutsideDbContext, withDbAccessContext, withSystemDbAccessContext } from '../db';
 import {
   automations,
+  automationActionResults,
   automationRuns,
   automationRunDeviceResults,
   configurationPolicies,
@@ -14,9 +15,17 @@ import {
   scriptExecutions,
   scripts,
 } from '../db/schema';
-import { authMiddleware, requireMfa, requirePermission, requireScope, type AuthContext } from '../middleware/auth';
+import {
+  authMiddleware,
+  requireMfa,
+  requirePermission,
+  requireScope,
+  withAuthDbAccessContext,
+  type AuthContext,
+} from '../middleware/auth';
 import { writeAuditEvent, writeRouteAudit } from '../services/auditEvents';
 import { getTrustedClientIp } from '../services/clientIp';
+import { verifyBreezeHmacSignature, type BreezeHmacFailure } from '../services/webhookSignature';
 import { PERMISSIONS, type UserPermissions } from '../services/permissions';
 import { getRedis } from '../services/redis';
 import { decryptForColumn, encryptSecret } from '../services/secretCrypto';
@@ -30,7 +39,12 @@ import {
   replaceAutomationResourceBindings,
   resolveAutomationReferencesForOwner,
   withWebhookDefaults,
+  type AutomationTargetDiagnostics,
 } from '../services/automationRuntime';
+import {
+  validateAutomationTargetConditions,
+  type AutomationTargetValidationResult,
+} from '../services/automationTargetValidation';
 import { AutomationReferenceAuthorizationError } from '../services/automationReferenceAuthorization';
 import { enqueueAutomationRun } from '../jobs/automationWorker';
 import {
@@ -47,8 +61,14 @@ import {
   managedAutomationOwnerIsLive,
 } from '../services/aiAgents/managedAutomation';
 import { UUID_REGEX } from '../utils/uuid';
+import { captureException } from '../services/sentry';
+import { resolveAutomationWebhookOwnerContext } from '../services/automationWebhookContext';
 import { projectAutomationRunsToSites, scanProjectedAutomationRuns } from '../services/automationReadProjection';
 import { managedByMonitorResponse } from '../services/monitors/managedRowGuard';
+import { conversionSummariesFor, resetShadowIfChanged } from '../services/flows/conversion/ledger';
+import { OccurrenceClaimedError, claimOccurrence, currentConversionForAutomation } from '../services/flows/conversion/claims';
+import { legacyWebhookDeliveryIdHeader, webhookOccurrenceInstant, webhookOccurrenceKeys } from '../services/flows/conversion/webhookOccurrence';
+import { flowsEnabled } from '../config/env';
 
 export const automationRoutes = new Hono();
 export const automationWebhookRoutes = new Hono();
@@ -187,6 +207,14 @@ async function reserveAutomationWebhookReplayNonce(replayKey: string, now: numbe
   }
 }
 
+const AUTOMATION_SIGNATURE_FAILURES: Record<BreezeHmacFailure, { ok: false; error: string; status: 400 | 401 }> = {
+  missing_signature: { ok: false, error: 'Missing webhook signature', status: 401 },
+  missing_timestamp: { ok: false, error: 'Missing webhook timestamp', status: 401 },
+  invalid_timestamp: { ok: false, error: 'Invalid webhook timestamp', status: 400 },
+  stale_timestamp: { ok: false, error: 'Webhook signature timestamp is outside the replay window', status: 401 },
+  bad_signature: { ok: false, error: 'Invalid webhook signature', status: 401 },
+};
+
 async function verifyAutomationWebhookSignature(input: {
   automationId: string;
   secret: string;
@@ -194,38 +222,37 @@ async function verifyAutomationWebhookSignature(input: {
   signatureHeader?: string | null;
   timestampHeader?: string | null;
   eventIdHeader?: string | null;
-}): Promise<{ ok: true } | { ok: false; error: string; status: 400 | 401 | 409 | 503 }> {
-  const signature = input.signatureHeader?.trim();
-  if (!signature) return { ok: false, error: 'Missing webhook signature', status: 401 };
-
-  const timestamp = input.timestampHeader?.trim();
-  if (!timestamp) return { ok: false, error: 'Missing webhook timestamp', status: 401 };
-
-  const parsedTimestamp = Number(timestamp);
-  if (!Number.isFinite(parsedTimestamp) || parsedTimestamp <= 0) {
-    return { ok: false, error: 'Invalid webhook timestamp', status: 400 };
-  }
-
-  const timestampMs = parsedTimestamp > 1_000_000_000_000
-    ? parsedTimestamp
-    : parsedTimestamp * 1000;
+}): Promise<{ ok: true; signatureDigest: string } | { ok: false; error: string; status: 400 | 401 | 409 | 503 }> {
+  // The shared Breeze HMAC scheme (services/webhookSignature.ts, also used by
+  // flow webhooks — Tool Catalog W05 #5220). Messages and statuses unchanged.
   const now = Date.now();
-  if (Math.abs(now - timestampMs) > AUTOMATION_WEBHOOK_SIGNATURE_WINDOW_MS) {
-    return { ok: false, error: 'Webhook signature timestamp is outside the replay window', status: 401 };
+  const verified = verifyBreezeHmacSignature({
+    secret: input.secret,
+    timestamp: input.timestampHeader,
+    signature: input.signatureHeader,
+    payload: input.payload,
+    now,
+    windowMs: AUTOMATION_WEBHOOK_SIGNATURE_WINDOW_MS,
+  });
+  if (!verified.ok) return AUTOMATION_SIGNATURE_FAILURES[verified.reason];
+
+  // The replay key is always derived from the verified signature, never from a
+  // caller-supplied header alone — an unsigned event-id is not trustworthy as
+  // the sole dedup key, since a byte-identical resend can carry a fresh one.
+  const signatureNonceHash = verified.signatureDigest;
+  const signatureReplayKey = `${input.automationId}:${signatureNonceHash}`;
+  const signatureReservation = await reserveAutomationWebhookReplayNonce(signatureReplayKey, now);
+  if (!signatureReservation.ok) return signatureReservation;
+
+  const trimmedEventId = input.eventIdHeader?.trim();
+  if (trimmedEventId) {
+    const eventIdNonceHash = createHash('sha256').update(trimmedEventId).digest('hex');
+    const eventIdReplayKey = `${input.automationId}:${eventIdNonceHash}`;
+    const eventIdReservation = await reserveAutomationWebhookReplayNonce(eventIdReplayKey, now);
+    if (!eventIdReservation.ok) return eventIdReservation;
   }
 
-  const expected = `sha256=${createHmac('sha256', input.secret).update(`${timestamp}.${input.payload}`).digest('hex')}`;
-  const normalizedSignature = signature.startsWith('sha256=') ? signature : `sha256=${signature}`;
-  const expectedBuffer = Buffer.from(expected, 'utf8');
-  const providedBuffer = Buffer.from(normalizedSignature, 'utf8');
-  if (expectedBuffer.length !== providedBuffer.length || !timingSafeEqual(expectedBuffer, providedBuffer)) {
-    return { ok: false, error: 'Invalid webhook signature', status: 401 };
-  }
-
-  const replayNonce = input.eventIdHeader?.trim() || normalizedSignature;
-  const replayNonceHash = createHash('sha256').update(replayNonce).digest('hex');
-  const replayKey = `${input.automationId}:${replayNonceHash}`;
-  return reserveAutomationWebhookReplayNonce(replayKey, now);
+  return { ok: true, signatureDigest: verified.signatureDigest };
 }
 
 function getPagination(query: { page?: string; limit?: string }) {
@@ -259,26 +286,64 @@ const requireValidRunId = requireUuidParam('runId', 'Automation run not found');
  * an automation (the only gate for unattended schedule/event triggers) and when
  * one is manually triggered (the resolved set may have drifted).
  *
- * Returns a 403 JSON response if the caller is site-restricted and the
- * automation's target set escapes their allowlist, otherwise null (proceed).
- * Unrestricted callers always pass.
+ * Returns `{ denied: <403 JSON response> }` if the caller is site-restricted
+ * and the automation's target set escapes their allowlist, otherwise
+ * `{ denied: null, targetDeviceIds }` (proceed) — `targetDeviceIds` is the
+ * exact target set this check resolved the automation against. A caller that
+ * dispatches a run right after this check (manual trigger) should pass that
+ * same list through as `boundDeviceIds` rather than letting the dispatch
+ * re-resolve independently: group/filter membership (and execution-target
+ * field-provenance exclusions) can change between two separate resolutions
+ * of the same automation, so two calls are not guaranteed to agree (TOCTOU).
+ * Unrestricted callers always pass, with an empty `targetDeviceIds` (the
+ * dispatch path resolves its own target set in that case, same as before).
  */
+function automationTargetInvalid(
+  c: Context,
+  result: Extract<AutomationTargetValidationResult, { ok: false }>,
+): Response {
+  return c.json({
+    error: result.error,
+    code: result.code,
+    ...(result.groupIds ? { groupIds: result.groupIds } : {}),
+    ...(result.deviceIds ? { deviceIds: result.deviceIds } : {}),
+  }, 400);
+}
+
 async function enforceAutomationSiteScope(
   c: Context,
   automation: Parameters<typeof checkAutomationTargetsWithinSiteScope>[0],
-) {
+): Promise<{
+  denied: Response | null;
+  targetDeviceIds: string[] | null;
+  targetDiagnostics?: AutomationTargetDiagnostics;
+}> {
   const perms = c.get('permissions') as UserPermissions | undefined;
   const result = await checkAutomationTargetsWithinSiteScope(automation, perms);
   if (!result.ok) {
     if (result.unbounded) {
-      return c.json(
-        { error: 'Site-restricted users cannot create or run automations that target all devices in the organization' },
-        403,
-      );
+      return {
+        denied: c.json(
+          { error: 'Site-restricted users cannot create or run automations that target all devices in the organization' },
+          403,
+        ),
+        targetDeviceIds: null,
+      };
     }
-    return c.json({ error: 'Access to one or more target sites denied' }, 403);
+    return { denied: c.json({ error: 'Access to one or more target sites denied' }, 403), targetDeviceIds: null };
   }
-  return null;
+  // `restricted` distinguishes "unrestricted caller, no resolution attempted"
+  // (targetDeviceIds should stay `null` so a dispatch caller falls back to
+  // its own resolution, exactly as before the field-provenance/TOCTOU fix) from "site-restricted
+  // caller whose resolved target legitimately came back empty" (`[]`, which
+  // must be bound as-is, not treated as "resolve your own").
+  return {
+    denied: null,
+    targetDeviceIds: result.restricted ? result.targetDeviceIds : null,
+    // #8598 — travels with the bound set so a broken group target still fails
+    // the run visibly instead of running as an empty bound set.
+    ...(result.restricted && result.targetDiagnostics ? { targetDiagnostics: result.targetDiagnostics } : {}),
+  };
 }
 
 // Dual-ownership (#2133): an automation is org-owned (orgId set) or
@@ -297,6 +362,31 @@ function canAccessAutomation(
   }
   if (auth.scope === 'system') return true;
   return auth.scope === 'partner' && !!auth.partnerId && automation.partnerId === auth.partnerId;
+}
+
+/**
+ * Tool Catalog W06 (#5221, Decision 9): a switched Job is frozen. Its flow is
+ * the one engine for it now; PUT/PATCH/DELETE/trigger/run answer
+ * `409 automation_converted { flowId }`. DELETE is refused too: an in-flight
+ * legacy run re-reads its source row on resume. Only a switch sets
+ * `converted_to_flow_id` and a revert clears it, so a shadow or reverted row
+ * is never frozen (editing a shadow row resets the shadow instead).
+ */
+function convertedAutomationResponse(
+  c: Context,
+  automation: { convertedToFlowId: string | null },
+): Response | null {
+  if (!automation.convertedToFlowId) return null;
+  return c.json({ error: 'automation_converted', flowId: automation.convertedToFlowId }, 409);
+}
+
+/** Rolls back a write whose row changed (switched or deleted) since the route read it. */
+class AutomationChangedSinceRead extends Error {}
+
+/** A write matched no row: the Job was switched (409, frozen) or deleted (404) since it was read. */
+async function convertedSinceReadResponse(c: Context, automationId: string, auth: AuthContext): Promise<Response> {
+  const current = await getAutomationWithOrgCheck(automationId, auth);
+  return (current && convertedAutomationResponse(c, current)) || c.json({ error: 'Automation not found' }, 404);
 }
 
 async function getAutomationWithOrgCheck(automationId: string, auth: AuthContext) {
@@ -461,10 +551,10 @@ function takePreview(
 /**
  * Fetch the `script_executions` rows minted by a run's `run_script` actions,
  * grouped by device (#3162). These carry the script's REAL stdout/stderr/exit
- * code, which `automation_run_device_results.output` never has — that column
- * only holds the automation's own log lines. RLS on script_executions (org_id =
- * device's org) scopes rows to the caller's tenancy, same as
- * fetchRunDeviceResults.
+ * code. `automation_run_device_results.output` is only a truncated
+ * concatenation of every action's output/message, not a per-script record.
+ * RLS on script_executions (org_id = device's org) scopes rows to the
+ * caller's tenancy, same as fetchRunDeviceResults.
  *
  * `scriptName` is a LEFT JOIN and can legitimately be null: an org-scoped RLS
  * context cannot see a partner-wide script (`scripts.org_id IS NULL`), so the
@@ -520,18 +610,88 @@ async function fetchRunScriptExecutions(runId: string, auth: AuthContext, allowe
   return byDevice;
 }
 
+const RUN_COMMAND_OUTPUT_PREVIEW_CHARS = 16_384;
+const RUN_COMMAND_ERROR_PREVIEW_CHARS = 8_192;
+
+type RunCommandResult = {
+  actionIndex: number;
+  status: string;
+  output?: string;
+  outputTruncated?: boolean;
+  error?: string;
+  errorTruncated?: boolean;
+  message?: string;
+};
+
+/**
+ * Fetch the per-device results of a run's `execute_command` actions (#3188).
+ * An ad-hoc command has no `scripts` row, so it can never mint a
+ * `script_executions` row; its stdout instead lands on its own
+ * `automation_action_results` row, correlated by command id when the agent
+ * reports (redacted at ingest). This surfaces it the same way
+ * `fetchRunScriptExecutions` surfaces a `run_script` action's stdout. RLS on
+ * automation_action_results (org_id = device's org) scopes rows to the
+ * caller's tenancy; the explicit org condition and site filter mirror the
+ * script-execution query.
+ */
+async function fetchRunCommandResults(runId: string, auth: AuthContext, allowedSiteIds?: string[]) {
+  const conditions: SQL[] = [
+    eq(automationActionResults.runId, runId),
+    eq(automationActionResults.actionType, 'execute_command'),
+  ];
+  const orgCondition = auth.orgCondition?.(automationActionResults.orgId);
+  if (orgCondition) conditions.push(orgCondition);
+  if (allowedSiteIds !== undefined) conditions.push(inArray(devices.siteId, allowedSiteIds));
+
+  const rows = await db
+    .select({
+      deviceId: automationActionResults.deviceId,
+      actionIndex: automationActionResults.actionIndex,
+      status: automationActionResults.status,
+      // +1 so the TS side can tell "exactly at the limit" from "overflowed".
+      output: sql<string | null>`left(${automationActionResults.output}, ${RUN_COMMAND_OUTPUT_PREVIEW_CHARS + 1})`,
+      error: sql<string | null>`left(${automationActionResults.error}, ${RUN_COMMAND_ERROR_PREVIEW_CHARS + 1})`,
+      message: automationActionResults.message,
+    })
+    .from(automationActionResults)
+    .innerJoin(devices, eq(devices.id, automationActionResults.deviceId))
+    .where(and(...conditions))
+    .orderBy(automationActionResults.actionIndex);
+
+  const byDevice = new Map<string, RunCommandResult[]>();
+
+  for (const row of rows) {
+    const output = takePreview(row.output, RUN_COMMAND_OUTPUT_PREVIEW_CHARS);
+    const error = takePreview(row.error, RUN_COMMAND_ERROR_PREVIEW_CHARS);
+    const list = byDevice.get(row.deviceId) ?? [];
+    list.push({
+      actionIndex: row.actionIndex,
+      status: row.status,
+      ...(output.text !== undefined ? { output: output.text } : {}),
+      ...(output.truncated ? { outputTruncated: true } : {}),
+      ...(error.text !== undefined ? { error: error.text } : {}),
+      ...(error.truncated ? { errorTruncated: true } : {}),
+      ...(row.message ? { message: row.message } : {}),
+    });
+    byDevice.set(row.deviceId, list);
+  }
+
+  return byDevice;
+}
+
 /**
  * Fetch the consolidated per-device breakdown for one run (#2023), joined to
  * `devices` for a display name. Shaped to the web `DeviceRunResult` contract:
  * status + start/complete timestamps + duration (ms) + output/error, plus the
- * per-device script executions the run queued (#3162). RLS on
+ * per-device script executions the run queued (#3162) and its execute_command
+ * action results (#3188). RLS on
  * automation_run_device_results (org_id = device's org) already scopes rows to
  * the caller's tenancy, so no extra org filter is needed here.
  */
 async function fetchRunDeviceResults(runId: string, auth: AuthContext, allowedSiteIds?: string[]) {
   const conditions: SQL[] = [eq(automationRunDeviceResults.runId, runId)];
   if (allowedSiteIds !== undefined) conditions.push(inArray(devices.siteId, allowedSiteIds));
-  const [rows, scriptExecutionsByDevice] = await Promise.all([
+  const [rows, scriptExecutionsByDevice, commandResultsByDevice] = await Promise.all([
     db
       .select({
         deviceId: automationRunDeviceResults.deviceId,
@@ -548,6 +708,7 @@ async function fetchRunDeviceResults(runId: string, auth: AuthContext, allowedSi
       .where(and(...conditions))
       .orderBy(desc(automationRunDeviceResults.startedAt)),
     fetchRunScriptExecutions(runId, auth, allowedSiteIds),
+    fetchRunCommandResults(runId, auth, allowedSiteIds),
   ]);
 
   return rows.map((row) => {
@@ -555,6 +716,7 @@ async function fetchRunDeviceResults(runId: string, auth: AuthContext, allowedSi
       ? new Date(row.completedAt).getTime() - new Date(row.startedAt).getTime()
       : undefined;
     const scriptResults = scriptExecutionsByDevice.get(row.deviceId);
+    const commandResults = commandResultsByDevice.get(row.deviceId);
     return {
       deviceId: row.deviceId,
       deviceName: row.displayName ?? row.hostname ?? row.deviceId,
@@ -565,6 +727,7 @@ async function fetchRunDeviceResults(runId: string, auth: AuthContext, allowedSi
       output: row.output ?? undefined,
       error: row.error ?? undefined,
       scriptResults: scriptResults && scriptResults.length > 0 ? scriptResults : undefined,
+      commandResults: commandResults && commandResults.length > 0 ? commandResults : undefined,
     };
   });
 }
@@ -674,7 +837,11 @@ automationRoutes.get(
     const query = c.req.valid('query');
     const { page, limit, offset } = getPagination(query);
 
-    const conditions: SQL<unknown>[] = [isNull(automations.retiredAt)];
+    // Retired rows stay out of the list (W05c1), except a Job switched to a
+    // flow (#5221): it is listed read-only with its conversion so the Jobs page
+    // can link to the flow and offer Revert. `converted_to_flow_id` is set only
+    // by a switch and cleared by a revert (its CHECK pins the retired reason).
+    const conditions: SQL<unknown>[] = [or(isNull(automations.retiredAt), isNotNull(automations.convertedToFlowId))!];
 
     if (auth.scope === 'organization') {
       if (!auth.orgId) {
@@ -766,10 +933,15 @@ automationRoutes.get(
         .offset(offset);
     }
 
+    // W06 (#5221, Decision 9): additive `conversion: { id, state, flowId } | null`.
+    const conversions = await conversionSummariesFor(rows.map((automation) => automation.id));
     return c.json({
-      data: rows.map((automation) => permissions?.allowedSiteIds === undefined
-        ? shapeAutomationForResponse(automation)
-        : shapeRestrictedAutomationForResponse(automation)),
+      data: rows.map((automation) => ({
+        ...(permissions?.allowedSiteIds === undefined
+          ? shapeAutomationForResponse(automation)
+          : shapeRestrictedAutomationForResponse(automation)),
+        conversion: conversions.get(automation.id) ?? null,
+      })),
       pagination: { page, limit, total },
     });
   },
@@ -926,7 +1098,7 @@ automationRoutes.post(
 
     // Site scope on top: a site-restricted user must not stop a run spanning
     // sibling sites.
-    const siteScopeDenied = await enforceAutomationSiteScope(c, automation);
+    const { denied: siteScopeDenied } = await enforceAutomationSiteScope(c, automation);
     if (siteScopeDenied) {
       return siteScopeDenied;
     }
@@ -1006,6 +1178,9 @@ automationRoutes.get(
       if (!siteCheck.ok) return c.json({ error: 'Automation not found' }, 404);
     }
 
+    // W06 (#5221, Decision 9): additive `conversion: { id, state, flowId } | null`.
+    const conversion = (await conversionSummariesFor([automationId])).get(automationId) ?? null;
+
     if (permissions?.allowedSiteIds !== undefined) {
       const scan = await scanProjectedAutomationRuns({
         automationId,
@@ -1020,6 +1195,7 @@ automationRoutes.get(
       };
       return c.json({
         ...shapeAutomationForResponse(automation),
+        conversion,
         runCount: scan.total,
         lastRunAt: scan.rows[0]?.startedAt ?? null,
         recentRuns: scan.rows.map((run) => ({
@@ -1050,6 +1226,7 @@ automationRoutes.get(
 
     return c.json({
       ...shapeAutomationForResponse(automation),
+      conversion,
       recentRuns: recentRuns.map((run) => ({
         ...run,
         status: toRunStatus(run.status),
@@ -1143,12 +1320,25 @@ automationRoutes.get(
 // These mutation routes remain for legacy compatibility.
 // ============================================
 
+/**
+ * W06 R1 (#5221, plan Decision 8): new standalone Jobs are not created once
+ * Flows are enabled on this installation — "New job" opens Flows instead. With
+ * FLOWS_ENABLED=false Jobs stay writable (Flows are unavailable there). Answers
+ * before body validation, so a client learns where to go whatever it sent.
+ * Managed rows (triage seeding, monitor compile) never come through this route.
+ */
+async function refuseCreateWhenFlowsEnabled(c: Context, next: Next) {
+  if (flowsEnabled()) return c.json({ error: 'automations_moved_to_flows', flowsUrl: '/flows' }, 410);
+  await next();
+}
+
 // DEPRECATED: Automations are now managed via Configuration Policies. These routes remain for legacy compatibility.
 automationRoutes.post(
   '/',
   requireScope('organization', 'partner', 'system'),
   requireAutomationWrite,
   requireMfa(),
+  refuseCreateWhenFlowsEnabled,
   zValidator('json', createAutomationSchema),
   async (c) => {
     const auth = c.get('auth');
@@ -1215,6 +1405,13 @@ automationRoutes.post(
       return c.json({ error: AI_TRIAGE_SYSTEM_MANAGED_ERROR_CODE }, 400);
     }
 
+    // #8598 — the target shape and every group/device id it names, checked
+    // against the resolved owner before anything is written.
+    const targetCheck = await validateAutomationTargetConditions({ owner, conditions: data.conditions });
+    if (!targetCheck.ok) {
+      return automationTargetInvalid(c, targetCheck);
+    }
+
     try {
       const automationId = randomUUID();
       const trigger = withWebhookDefaults(
@@ -1231,7 +1428,7 @@ automationRoutes.post(
       // Site-scope gate: a site-restricted creator must not own an automation
       // whose resolvable target set escapes their allowlist. This is the only
       // gate for unattended schedule/event triggers (no caller context later).
-      const siteScopeDenied = await enforceAutomationSiteScope(c, {
+      const { denied: siteScopeDenied } = await enforceAutomationSiteScope(c, {
         orgId: owner.orgId,
         partnerId: owner.partnerId,
         conditions: data.conditions,
@@ -1315,6 +1512,8 @@ async function handleUpdateAutomation(c: Context) {
   if (!automation) {
     return c.json({ error: 'Automation not found' }, 404);
   }
+  const frozen = convertedAutomationResponse(c, automation);
+  if (frozen) return frozen;
 
   // #5289 — a row compiled from a monitor definition must be edited only by
   // the compiler; a side edit here would silently drift from the definition
@@ -1333,6 +1532,18 @@ async function handleUpdateAutomation(c: Context) {
   // partner — administrable only with the partner-wide capability (#2133).
   if (automation.orgId === null && !canManagePartnerWidePolicies(auth)) {
     return c.json({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE }, 403);
+  }
+
+  // #8598 — only when the update replaces the target; ownership never changes
+  // on update, so the stored owner is the one to check against.
+  if (data.conditions !== undefined) {
+    const targetCheck = await validateAutomationTargetConditions({
+      owner: { orgId: automation.orgId, partnerId: automation.partnerId },
+      conditions: data.conditions,
+    });
+    if (!targetCheck.ok) {
+      return automationTargetInvalid(c, targetCheck);
+    }
   }
 
   try {
@@ -1417,7 +1628,7 @@ async function handleUpdateAutomation(c: Context) {
     // Site-scope gate: re-validate the post-update target set against the
     // caller's allowlist. Covers conditions/trigger changes that would widen
     // the target set beyond a site-restricted editor's sites.
-    const siteScopeDenied = await enforceAutomationSiteScope(c, {
+    const { denied: siteScopeDenied } = await enforceAutomationSiteScope(c, {
       ...automation,
       conditions: data.conditions !== undefined ? data.conditions : automation.conditions,
       trigger: updates.trigger !== undefined ? updates.trigger : automation.trigger,
@@ -1434,18 +1645,22 @@ async function handleUpdateAutomation(c: Context) {
         effectiveActions,
         effectiveNotificationTargets,
       );
+      // `converted_to_flow_id IS NULL` is re-evaluated after any lock wait: a switch
+      // that committed after the frozen check above leaves nothing to update (#10685).
       const [row] = await tx
         .update(automations)
         .set(updates)
-        .where(eq(automations.id, automationId))
+        .where(and(eq(automations.id, automationId), isNull(automations.convertedToFlowId)))
         .returning();
       if (!row) return null;
       await replaceAutomationResourceBindings(tx, automationId, axes, resolved);
+      // W06 (#5221, Decision 3): a source edit restarts a shadow conversion's counters.
+      await resetShadowIfChanged(tx, { automationId, previous: automation });
       return row;
     });
 
     if (!updated) {
-      return c.json({ error: 'Automation not found' }, 404);
+      return convertedSinceReadResponse(c, automationId, auth);
     }
 
     writeRouteAudit(c, {
@@ -1506,6 +1721,8 @@ automationRoutes.delete(
     if (!automation) {
       return c.json({ error: 'Automation not found' }, 404);
     }
+    const frozen = convertedAutomationResponse(c, automation);
+    if (frozen) return frozen;
 
     // #5289 — see the guard in handleUpdateAutomation. Unlike the agent-managed
     // case below, there is no soft-disable escape hatch for a monitor-managed
@@ -1545,13 +1762,26 @@ automationRoutes.delete(
       }, 409);
     }
 
-    await db
-      .delete(automationRuns)
-      .where(eq(automationRuns.automationId, automationId));
-
-    await db
-      .delete(automations)
-      .where(eq(automations.id, automationId));
+    // One transaction, and the row delete re-checks `converted_to_flow_id IS NULL` after
+    // any lock wait: a switch that committed after the frozen check above leaves the
+    // Job (and its run history) in place (#10685).
+    const deleted = await db.transaction(async (tx) => {
+      await tx
+        .delete(automationRuns)
+        .where(eq(automationRuns.automationId, automationId));
+      const rows = await tx
+        .delete(automations)
+        .where(and(eq(automations.id, automationId), isNull(automations.convertedToFlowId)))
+        .returning({ id: automations.id });
+      if (rows.length === 0) throw new AutomationChangedSinceRead();
+      return true;
+    }).catch((error: unknown) => {
+      if (error instanceof AutomationChangedSinceRead) return false;
+      throw error;
+    });
+    if (!deleted) {
+      return convertedSinceReadResponse(c, automationId, auth);
+    }
 
     writeRouteAudit(c, {
       orgId: automation.orgId,
@@ -1569,7 +1799,81 @@ automationRoutes.delete(
 // Manual trigger routes (kept for standalone automations)
 // ============================================
 
+/**
+ * #7347 — `POST /:id/trigger` and `POST /:id/run` are registered in
+ * middleware/selfManagedDbContextRoutes.ts: they run with NO ambient request
+ * transaction. The run row is created and COMMITTED in one short
+ * withAuthDbAccessContext block, and only then is `execute-run` enqueued. The
+ * execute-run worker loads the run on its own connection, so under the request
+ * transaction a fast worker found no run and threw `Automation run not found`.
+ */
 async function triggerAutomationRun(
+  c: Context,
+  automationId: string,
+  triggeredBy: string,
+  details?: Record<string, unknown>,
+) {
+  const auth = c.get('auth');
+
+  const admitted = await withAuthDbAccessContext(auth, () =>
+    admitManualAutomationRun(c, automationId, triggeredBy, details),
+  );
+  if (admitted instanceof Response) return admitted;
+  const { automation, run, targetDeviceIds } = admitted;
+
+  try {
+    await enqueueAutomationRun(run.id, targetDeviceIds);
+  } catch (error) {
+    // The run has already committed `running`, and nothing reaps a run no job
+    // will ever execute: fail it here rather than leave it spinning forever.
+    console.error(`[automations] Failed to enqueue manually triggered run ${run.id}:`, error);
+    captureException(error, undefined, { runId: run.id, automationId: automation.id });
+    await withAuthDbAccessContext(auth, () =>
+      db
+        .update(automationRuns)
+        .set({ status: 'failed', completedAt: new Date() })
+        .where(and(eq(automationRuns.id, run.id), eq(automationRuns.status, 'running'))),
+    ).catch((cleanupError: unknown) => {
+      console.error(`[automations] Failed to mark unenqueued run ${run.id} failed:`, cleanupError);
+    });
+    writeRouteAudit(c, {
+      orgId: automation.orgId,
+      action: 'automation.trigger',
+      resourceType: 'automation',
+      resourceId: automation.id,
+      resourceName: automation.name,
+      details: { runId: run.id, devicesTargeted: targetDeviceIds.length, triggeredBy },
+      result: 'failure',
+    });
+    return c.json({ error: 'Failed to queue the automation run', runId: run.id }, 500);
+  }
+
+  writeRouteAudit(c, {
+    orgId: automation.orgId,
+    action: 'automation.trigger',
+    resourceType: 'automation',
+    resourceId: automation.id,
+    resourceName: automation.name,
+    details: {
+      runId: run.id,
+      devicesTargeted: targetDeviceIds.length,
+      triggeredBy,
+    },
+  });
+
+  return c.json({
+    message: 'Automation triggered',
+    run: {
+      id: run.id,
+      status: toRunStatus(run.status),
+      devicesTargeted: run.devicesTargeted,
+      startedAt: run.startedAt,
+    },
+  });
+}
+
+/** The admission half of triggerAutomationRun; runs inside its own committed context. */
+async function admitManualAutomationRun(
   c: Context,
   automationId: string,
   triggeredBy: string,
@@ -1581,6 +1885,8 @@ async function triggerAutomationRun(
   if (!automation) {
     return c.json({ error: 'Automation not found' }, 404);
   }
+  const frozen = convertedAutomationResponse(c, automation);
+  if (frozen) return frozen;
 
   // #5289 — see the guard in handleUpdateAutomation.
   if (automation.managedByMonitorId) {
@@ -1609,7 +1915,11 @@ async function triggerAutomationRun(
   // Site-scope gate: re-validate the *current* resolved target set. Protects
   // against a target set that drifted (new devices/sites) since creation, and
   // against an automation created before the user's sites were restricted.
-  const siteScopeDenied = await enforceAutomationSiteScope(c, automation);
+  const {
+    denied: siteScopeDenied,
+    targetDeviceIds: siteScopedTargetDeviceIds,
+    targetDiagnostics: siteScopedTargetDiagnostics,
+  } = await enforceAutomationSiteScope(c, automation);
   if (siteScopeDenied) {
     return siteScopeDenied;
   }
@@ -1618,32 +1928,20 @@ async function triggerAutomationRun(
     automation,
     triggeredBy,
     details,
+    // Reuse the target set the site-scope check above already resolved
+    // instead of letting createAutomationRunRecord re-resolve independently
+    // (TOCTOU — see enforceAutomationSiteScope's doc comment). `null` means
+    // the caller was unrestricted and no resolution happened above, so
+    // createAutomationRunRecord falls back to its own resolution as before;
+    // an empty array is a real (possibly zero-device) resolved result and is
+    // bound as-is.
+    ...(siteScopedTargetDeviceIds !== null ? { boundDeviceIds: siteScopedTargetDeviceIds } : {}),
+    ...(siteScopedTargetDeviceIds !== null && siteScopedTargetDiagnostics
+      ? { targetDiagnostics: siteScopedTargetDiagnostics }
+      : {}),
   });
 
-  await enqueueAutomationRun(run.id, targetDeviceIds);
-
-  writeRouteAudit(c, {
-    orgId: automation.orgId,
-    action: 'automation.trigger',
-    resourceType: 'automation',
-    resourceId: automation.id,
-    resourceName: automation.name,
-    details: {
-      runId: run.id,
-      devicesTargeted: targetDeviceIds.length,
-      triggeredBy,
-    },
-  });
-
-  return c.json({
-    message: 'Automation triggered',
-    run: {
-      id: run.id,
-      status: toRunStatus(run.status),
-      devicesTargeted: run.devicesTargeted,
-      startedAt: run.startedAt,
-    },
-  });
+  return { automation, run, targetDeviceIds };
 }
 
 automationRoutes.post(
@@ -1683,11 +1981,34 @@ automationWebhookRoutes.post('/:id', async (c) => {
     return c.json({ error: 'Automation not found' }, 404);
   }
 
-  const [automation] = await db
-    .select()
-    .from(automations)
-    .where(eq(automations.id, automationId))
-    .limit(1);
+  // #7363 — this route is unauthenticated (mounted without authMiddleware), so
+  // nothing has opened a DB context and a bare query runs as `breeze_app` with
+  // scope 'none': RLS hides every automation. System scope is used ONLY for
+  // two read-only lookups: this one (the automation row, before the secret
+  // check) and the owner's tenant context (after it). Every write runs as the
+  // automation's owner, never as system.
+  const lookup = () => runOutsideDbContext(() => withSystemDbAccessContext(async () => {
+    const [row] = await db
+      .select()
+      .from(automations)
+      .where(eq(automations.id, automationId))
+      .limit(1);
+    return row ?? null;
+  }, 'automations.webhook.lookup'));
+  let automation = await lookup();
+
+  // #5221 B6 — a Job switched to a flow keeps its URL: the delivery goes to the
+  // flow's ingest (its verification, replay protection and claims), before any
+  // legacy verification or Redis write. Only a row the switch retired can be
+  // switched (`converted_to_flow_id`, cleared again by a revert), so every
+  // other row skips this (and the module) entirely. Null ⇒ legacy continues.
+  if (automation?.convertedToFlowId) {
+    const { forwardLegacyWebhook } = await import('../services/flows/conversion/legacyWebhookForward');
+    const forwarded = await forwardLegacyWebhook(c, automationId);
+    if (forwarded) return forwarded;
+    // A revert committed since the lookup: legacy takes the delivery, with the row as it is now.
+    automation = await lookup();
+  }
 
   if (!automation || !automation.enabled) {
     return c.json({ error: 'Automation not found' }, 404);
@@ -1712,7 +2033,7 @@ automationWebhookRoutes.post('/:id', async (c) => {
   const rawBody = await c.req.text();
   const signatureHeader = c.req.header('x-breeze-signature');
   const timestampHeader = c.req.header('x-breeze-timestamp');
-  const eventIdHeader = c.req.header('x-breeze-event-id') ?? c.req.header('x-breeze-nonce');
+  const eventIdHeader = legacyWebhookDeliveryIdHeader((name) => c.req.header(name));
   const headerSecret = c.req.header('x-automation-secret')
     ?? c.req.header('x-webhook-secret');
 
@@ -1723,6 +2044,7 @@ automationWebhookRoutes.post('/:id', async (c) => {
     return c.json({ error: 'Query-string webhook secrets are no longer accepted; use HMAC signing (x-breeze-signature + x-breeze-timestamp)' }, 401);
   }
 
+  let signatureDigest: string | null = null;
   if (signatureHeader || timestampHeader) {
     const signatureCheck = await verifyAutomationWebhookSignature({
       automationId,
@@ -1735,6 +2057,7 @@ automationWebhookRoutes.post('/:id', async (c) => {
     if (!signatureCheck.ok) {
       return c.json({ error: signatureCheck.error }, signatureCheck.status);
     }
+    signatureDigest = signatureCheck.signatureDigest;
   } else {
     if (!headerSecret) {
       return c.json({ error: 'Missing signed webhook verification' }, 401);
@@ -1765,17 +2088,131 @@ automationWebhookRoutes.post('/:id', async (c) => {
     return c.json({ error: 'Invalid JSON payload' }, 400);
   }
 
-  const { run, targetDeviceIds } = await createAutomationRunRecord({
-    automation,
-    triggeredBy: 'webhook',
-    details: {
-      sourceIp: getTrustedClientIp(c, 'unknown'),
-      userAgent: c.req.header('user-agent') ?? 'unknown',
-      payload,
-    },
-  });
+  // Resolved only now, so an unverified caller neither learns the tenant's
+  // status nor makes the server read organizations/partners for it.
+  const ownerContext = await runOutsideDbContext(() => withSystemDbAccessContext(
+    () => resolveAutomationWebhookOwnerContext(automation),
+    'automations.webhook.owner',
+  ));
+  if (!ownerContext) {
+    // Verified sender, but the owning org/partner is not active. Leave a trace
+    // for the tenant: their integration silently stopping is otherwise invisible.
+    console.warn(`[automations] Webhook ${automationId} refused: owning tenant is not active`);
+    writeAuditEvent(c, {
+      orgId: automation.orgId,
+      action: 'automation.trigger.webhook',
+      resourceType: 'automation',
+      resourceId: automation.id,
+      resourceName: automation.name,
+      actorType: 'system',
+      details: { triggeredBy: 'webhook', reason: 'owner_inactive' },
+      result: 'denied',
+    });
+    return c.json({ error: 'Automation owner is not active' }, 403);
+  }
 
-  await enqueueAutomationRun(run.id, targetDeviceIds);
+  // Write phase, as the automation's owner — the context a user of that owner
+  // triggering the automation by hand would have. The automation is re-read
+  // under it so a row disabled, deleted, re-owned or re-keyed (trigger/secret
+  // changed) since the lookup is refused rather than run.
+  const admitted = await runOutsideDbContext(() => withDbAccessContext(ownerContext, async () => {
+    const [current] = await db
+      .select()
+      .from(automations)
+      .where(eq(automations.id, automationId))
+      .limit(1);
+    // A switch committed since the lookup: the delivery is the flow's (forwarded below).
+    if (current?.convertedToFlowId) return 'switched' as const;
+    if (
+      !current
+      || !current.enabled
+      || current.orgId !== automation.orgId
+      || current.partnerId !== automation.partnerId
+      || JSON.stringify(current.trigger) !== JSON.stringify(automation.trigger)
+    ) {
+      return null;
+    }
+    // #5221 B2 (Decision 6) — a row with a conversion in any state claims the
+    // delivery (both aliases) in the run's own transaction. The row is enabled
+    // here, so its generation is shadow or reverted and legacy is the
+    // preferred engine (a switched row is disabled and never gets this far).
+    // A row with no conversion keeps today's path: no lock, no hook.
+    const conversion = await currentConversionForAutomation(db, current.id);
+    const claimKeys = conversion ? webhookOccurrenceKeys(signatureDigest, eventIdHeader) : [];
+    try {
+      return await createAutomationRunRecord({
+        automation: current,
+        triggeredBy: 'webhook',
+        details: {
+          sourceIp: getTrustedClientIp(c, 'unknown'),
+          userAgent: c.req.header('user-agent') ?? 'unknown',
+          payload,
+        },
+        ...(conversion && claimKeys.length > 0
+          ? {
+              onCreated: async (tx, run) => {
+                const claim = await claimOccurrence(tx, {
+                  automationId: current.id,
+                  owner: { orgId: current.orgId, partnerId: current.partnerId },
+                  keys: claimKeys,
+                  engine: 'legacy',
+                  conversionId: conversion.id,
+                  legacyRunId: run.id,
+                  occurrenceAt: webhookOccurrenceInstant(timestampHeader),
+                });
+                if (!claim.ok) throw new OccurrenceClaimedError(claim.existing);
+              },
+            }
+          : {}),
+      });
+    } catch (err) {
+      if (err instanceof OccurrenceClaimedError) return 'claimed' as const;
+      throw err;
+    }
+  }));
+
+  if (admitted === 'switched') {
+    const { forwardLegacyWebhook } = await import('../services/flows/conversion/legacyWebhookForward');
+    return (await forwardLegacyWebhook(c, automationId)) ?? c.json({ error: 'Automation not found' }, 404);
+  }
+  if (!admitted) {
+    return c.json({ error: 'Automation not found' }, 404);
+  }
+  if (admitted === 'claimed') {
+    // The same answer a Redis replay hit gives: this delivery was already admitted.
+    return c.json({ error: 'Duplicate webhook delivery' }, 409);
+  }
+  const { run, targetDeviceIds } = admitted;
+
+  // Enqueued only after the run committed: the worker reads it on another connection.
+  try {
+    await enqueueAutomationRun(run.id, targetDeviceIds);
+  } catch (error) {
+    // Same as the manual trigger: nothing reaps a `running` run no job will
+    // ever execute, so fail it rather than leave it spinning forever.
+    console.error(`[automations] Failed to enqueue webhook-triggered run ${run.id}:`, error);
+    captureException(error, undefined, { runId: run.id, automationId: automation.id });
+    await runOutsideDbContext(() => withDbAccessContext(ownerContext, () =>
+      db
+        .update(automationRuns)
+        .set({ status: 'failed', completedAt: new Date() })
+        .where(and(eq(automationRuns.id, run.id), eq(automationRuns.status, 'running'))),
+    )).catch((cleanupError: unknown) => {
+      console.error(`[automations] Failed to mark unenqueued run ${run.id} failed:`, cleanupError);
+      captureException(cleanupError, undefined, { runId: run.id, automationId: automation.id, stage: 'enqueue-cleanup' });
+    });
+    writeAuditEvent(c, {
+      orgId: automation.orgId,
+      action: 'automation.trigger.webhook',
+      resourceType: 'automation',
+      resourceId: automation.id,
+      resourceName: automation.name,
+      actorType: 'system',
+      details: { runId: run.id, devicesTargeted: targetDeviceIds.length, triggeredBy: 'webhook' },
+      result: 'failure',
+    });
+    return c.json({ error: 'Failed to queue the automation run', runId: run.id }, 500);
+  }
 
   // Webhook callers are anonymous (no auth user / no JWT), so writeRouteAudit's
   // auth-derived actor doesn't apply. Use writeAuditEvent directly with a

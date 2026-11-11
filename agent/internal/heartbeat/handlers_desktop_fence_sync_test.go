@@ -10,13 +10,13 @@ import (
 	"github.com/breeze-rmm/agent/internal/websocket"
 )
 
-// SEC-038 W05, handler level: a start for a session the fence has no
+// Handler level: a start for a session the fence has no
 // in-process record of triggers one bounded resync with the control plane
 // before any admission decision is taken.
 
 func newSyncHeartbeat(t *testing.T) *Heartbeat {
 	t.Helper()
-	h := &Heartbeat{desktopMgr: desktop.NewSessionManager()}
+	h := &Heartbeat{desktopMgr: desktop.NewSessionManagerWithPreloader(nil)}
 	h.desktopFenceSyncTimeout = 2 * time.Second
 	return h
 }

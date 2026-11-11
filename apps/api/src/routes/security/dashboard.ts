@@ -6,6 +6,7 @@ import {
   listLatestSecurityPosture,
   getSecurityPostureTrend
 } from '../../services/securityPosture';
+import { siteAllowlistOf } from '../../services/aiToolsSiteScope';
 import { dashboardQuerySchema, providerCatalog, postureComponentModel } from './schemas';
 import {
   resolveScopedOrgIds,
@@ -35,17 +36,20 @@ dashboardRoutes.get(
     if (scope.error) {
       return c.json({ error: scope.error.message }, scope.error.status);
     }
+    const siteIds = siteAllowlistOf(auth);
 
     const [statusRows, threats, posture, recommendationsResult, trendPoints] = await Promise.all([
       listStatusRows(auth, query.orgId),
       listThreatRows(auth, undefined, query.orgId),
       listLatestSecurityPosture({
         orgIds: scope.orgIds,
+        siteIds,
         limit: 2000
       }),
       buildBe9Recommendations(auth, query.orgId),
       getSecurityPostureTrend({
         orgIds: scope.orgIds,
+        siteIds,
         days: 30
       })
     ]);
@@ -92,17 +96,36 @@ dashboardRoutes.get(
     const defaultAccounts = parsedAdmins.reduce((sum, admin) => sum + admin.issueCounts.defaultAccounts, 0);
     const weakAccounts = parsedAdmins.reduce((sum, admin) => sum + admin.issueCounts.weakPasswords, 0);
 
-    const encryptedStatuses = statuses.filter((status) => status.encryptionStatus !== 'unencrypted');
-    const bitlockerEnabled = encryptedStatuses.filter((status) => status.os === 'windows').length;
-    const filevaultEnabled = encryptedStatuses.filter((status) => status.os === 'macos').length;
+    // "Enabled" means fully encrypted (#9643); partially encrypted machines are
+    // reported separately instead of inflating the enabled count.
+    const countEncryption = (os: string, state: 'encrypted' | 'partial') =>
+      statuses.filter((status) => status.os === os && status.encryptionStatus === state).length;
+    const bitlockerEnabled = countEncryption('windows', 'encrypted');
+    const bitlockerPartial = countEncryption('windows', 'partial');
+    const filevaultEnabled = countEncryption('macos', 'encrypted');
+    const filevaultPartial = countEncryption('macos', 'partial');
 
     const chartTrend = trendPoints.map((point) => ({
       timestamp: String(point.timestamp),
       score: Number(point.overall ?? 0)
     }));
 
-    const avProtected = statuses.filter((status) => status.realTimeProtection).length;
-    const avUnprotected = statuses.length - avProtected;
+    // A null reading is unknown (#8252) and gets its own bucket: counting it as
+    // unprotected / disabled reports "protection off" for a failed collection.
+    const countTriState = (pick: (status: (typeof statuses)[number]) => boolean | null) => {
+      let on = 0;
+      let off = 0;
+      let unknown = 0;
+      for (const status of statuses) {
+        const value = pick(status);
+        if (value === true) on += 1;
+        else if (value === false) off += 1;
+        else unknown += 1;
+      }
+      return { on, off, unknown };
+    };
+    const av = countTriState((status) => status.realTimeProtection);
+    const fw = countTriState((status) => status.firewallEnabled);
 
     return c.json({
       data: {
@@ -120,18 +143,22 @@ dashboardRoutes.get(
         securityScore,
         overallScore: securityScore,
         antivirus: {
-          protected: avProtected,
-          unprotected: avUnprotected
+          protected: av.on,
+          unprotected: av.off,
+          unknown: av.unknown
         },
         firewall: {
-          enabled: statuses.filter((status) => status.firewallEnabled).length,
-          disabled: statuses.filter((status) => !status.firewallEnabled).length
+          enabled: fw.on,
+          disabled: fw.off,
+          unknown: fw.unknown
         },
-        firewallEnabled: statuses.filter((status) => status.firewallEnabled).length,
-        firewallDisabled: statuses.filter((status) => !status.firewallEnabled).length,
+        firewallEnabled: fw.on,
+        firewallDisabled: fw.off,
         encryption: {
           bitlockerEnabled,
+          bitlockerPartial,
           filevaultEnabled,
+          filevaultPartial,
           total: statuses.length
         },
         passwordPolicyCompliance,
@@ -169,15 +196,20 @@ dashboardRoutes.get(
   '/score-breakdown',
   requireScope('organization', 'partner', 'system'),
   requirePermission('devices', 'read'),
+  zValidator('query', dashboardQuerySchema),
   async (c) => {
     const auth = c.get('auth');
-    const scope = resolveScopedOrgIds(auth);
+    // ?orgId= is the header org switcher's selection (#9639); it can only
+    // narrow within the caller's accessible orgs (403 otherwise).
+    const { orgId } = c.req.valid('query');
+    const scope = resolveScopedOrgIds(auth, orgId);
     if (scope.error) {
       return c.json({ error: scope.error.message }, scope.error.status);
     }
 
     const posture = await listLatestSecurityPosture({
       orgIds: scope.orgIds,
+      siteIds: siteAllowlistOf(auth),
       limit: 2000
     });
     const total = posture.length;

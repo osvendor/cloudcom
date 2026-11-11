@@ -1,10 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
 
-const { selectMock, updateMock, enqueueBackupDispatchMock } = vi.hoisted(() => ({
+const { selectMock, updateMock, enqueueBackupDispatchMock, authDbContexts } = vi.hoisted(() => ({
   selectMock: vi.fn(),
   updateMock: vi.fn(),
   enqueueBackupDispatchMock: vi.fn(),
+  // #6597: models withAuthDbAccessContext as a fresh transaction that COMMITS
+  // when its callback resolves. `stack` is the currently-open contexts,
+  // `committed` the ids whose callback has finished.
+  authDbContexts: { seq: 0, stack: [] as number[], committed: new Set<number>() },
 }));
 
 const SITE_A = '11111111-1111-4111-8111-111111111111';
@@ -53,6 +57,11 @@ vi.mock('../../db/schema', () => ({
     id: 'backupConfigs.id',
     name: 'backupConfigs.name',
   },
+  backupStorageSessions: {
+    jobId: 'backup_storage_sessions.job_id',
+    scope: 'backup_storage_sessions.scope',
+    resumedAt: 'backup_storage_sessions.resumed_at',
+  },
   devices: {
     id: 'devices.id',
     orgId: 'devices.orgId',
@@ -78,6 +87,8 @@ vi.mock('drizzle-orm', () => ({
   gte: (column: unknown, value: unknown) => ({ op: 'gte', column, value }),
   lte: (column: unknown, value: unknown) => ({ op: 'lte', column, value }),
   inArray: (column: unknown, values: unknown[]) => ({ op: 'inArray', column, values }),
+  isNotNull: (column: unknown) => ({ op: 'isNotNull', column }),
+  max: (column: unknown) => ({ op: 'max', column }),
   sql: Object.assign(
     (strings: TemplateStringsArray, ...values: unknown[]) => ({ op: 'sql', strings, values }),
     { join: (values: unknown[]) => values }
@@ -89,6 +100,16 @@ vi.mock('../../middleware/auth', () => ({
   requireScope: vi.fn(() => (_c: any, next: any) => next()),
   requirePermission: vi.fn(() => (_c: any, next: any) => next()),
   requireMfa: vi.fn(() => (_c: any, next: any) => next()),
+  withAuthDbAccessContext: vi.fn(async (_auth: any, fn: any) => {
+    const id = ++authDbContexts.seq;
+    authDbContexts.stack.push(id);
+    try {
+      return await fn();
+    } finally {
+      authDbContexts.stack.pop();
+      authDbContexts.committed.add(id);
+    }
+  }),
 }));
 
 vi.mock('../../services/auditEvents', () => ({
@@ -108,6 +129,20 @@ vi.mock('../../services/featureConfigResolver', () => ({
 
 vi.mock('../../jobs/backupWorker', () => ({
   enqueueBackupDispatch: (...args: unknown[]) => enqueueBackupDispatchMock(...(args as [])),
+}));
+
+const { removeQueuedBackupDispatchMock, queueBackupStopCommandMock } = vi.hoisted(() => ({
+  removeQueuedBackupDispatchMock: vi.fn(),
+  queueBackupStopCommandMock: vi.fn(),
+}));
+
+vi.mock('../../jobs/backupEnqueue', () => ({
+  removeQueuedBackupDispatch: removeQueuedBackupDispatchMock,
+}));
+
+vi.mock('../../services/commandQueue', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../services/commandQueue')>()),
+  queueBackupStopCommand: queueBackupStopCommandMock,
 }));
 
 vi.mock('../../services/backupMetrics', () => ({
@@ -151,6 +186,59 @@ describe('backup jobs routes', () => {
       await next();
     });
     app.route('/', jobsRoutes);
+  });
+
+  describe('POST /jobs/:id/cancel of a job waiting for its device (#11013)', () => {
+    const JOB_ID = '33333333-3333-4333-8333-333333333333';
+    const pendingJob = (catchUpUntil: Date | null) => ({
+      id: JOB_ID,
+      orgId: 'org-a',
+      deviceId: 'device-1',
+      status: 'pending',
+      catchUpUntil,
+      createdAt: new Date('2026-11-04T05:00:00Z'),
+      updatedAt: new Date('2026-11-04T05:00:00Z'),
+    });
+    const wireCancel = (current: Record<string, unknown>, settled: Record<string, unknown> = {}) => {
+      selectMock.mockReturnValueOnce(makeSelectChain([current]));
+      updateMock.mockReturnValue({
+        set: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            returning: vi.fn().mockResolvedValue([{ ...current, status: 'cancelled', ...settled }]),
+          }),
+        }),
+      } as any);
+      removeQueuedBackupDispatchMock.mockResolvedValue(false);
+      queueBackupStopCommandMock.mockResolvedValue({});
+    };
+
+    it('queues no stop: nothing was sent, and a pre-queue helper would stop the whole device', async () => {
+      wireCancel(pendingJob(new Date(Date.now() + 3_600_000)));
+
+      const res = await app.request(`/jobs/${JOB_ID}/cancel`, { method: 'POST' });
+
+      expect(res.status).toBe(200);
+      expect(queueBackupStopCommandMock).not.toHaveBeenCalled();
+    });
+
+    it('queues the stop when a catch-up claimed the job between the read and the cancel', async () => {
+      // `current` still shows the window; the row the cancel settled does not.
+      wireCancel(pendingJob(new Date(Date.now() + 3_600_000)), { catchUpUntil: null });
+
+      const res = await app.request(`/jobs/${JOB_ID}/cancel`, { method: 'POST' });
+
+      expect(res.status).toBe(200);
+      expect(queueBackupStopCommandMock).toHaveBeenCalledWith('device-1', expect.objectContaining({ jobId: JOB_ID }));
+    });
+
+    it('still queues a stop for an ordinary pending job whose dispatch had already left the queue', async () => {
+      wireCancel(pendingJob(null));
+
+      const res = await app.request(`/jobs/${JOB_ID}/cancel`, { method: 'POST' });
+
+      expect(res.status).toBe(200);
+      expect(queueBackupStopCommandMock).toHaveBeenCalledWith('device-1', expect.objectContaining({ jobId: JOB_ID }));
+    });
   });
 
   it('denies an explicit out-of-scope device filter for site-restricted users', async () => {
@@ -225,6 +313,129 @@ describe('backup jobs routes', () => {
     }));
   });
 
+  it('GET /jobs returns failureCategory per row', async () => {
+    selectMock.mockReturnValueOnce(makeSelectChain([
+      {
+        job: makeJob({ id: 'job-failed', status: 'failed', errorLog: '[stale-backup-reaper] Device went offline during backup' }),
+        deviceName: 'Device',
+        deviceHostname: 'host',
+        configName: 'Primary Backup',
+      },
+      {
+        job: makeJob({ id: 'job-ok', status: 'completed', errorLog: null }),
+        deviceName: 'Device',
+        deviceHostname: 'host',
+        configName: 'Primary Backup',
+      },
+    ]));
+
+    const res = await app.request('/jobs');
+
+    expect(res.status).toBe(200);
+    const { data } = await res.json();
+    expect(data[0].failureCategory).toBe('device_offline');
+    // Explicit null, not a dropped key: "nothing failed" is an answer.
+    expect(data[1]).toHaveProperty('failureCategory', null);
+  });
+
+  it('GET /jobs/:id returns failureCategory', async () => {
+    selectMock.mockReturnValueOnce(makeSelectChain([
+      {
+        job: makeJob({ status: 'failed', errorLog: 'backup helper exited unexpectedly' }),
+        deviceName: 'Device',
+        deviceHostname: 'host',
+        siteId: null,
+        configName: 'Primary Backup',
+      },
+    ]));
+
+    const res = await app.request('/jobs/job-1');
+
+    expect(res.status).toBe(200);
+    expect((await res.json()).failureCategory).toBe('agent');
+  });
+
+  it('GET /jobs/:id returns dataAccounting and resumedAt', async () => {
+    selectMock
+      .mockReturnValueOnce(makeSelectChain([
+        {
+          job: makeJob({
+            status: 'completed',
+            backupMode: 'file',
+            backupType: 'file',
+            totalSize: 1000,
+            transferredSize: 100,
+            referencedSize: 900,
+            baseSnapshotId: 'snap-base',
+          }),
+          deviceName: 'Device',
+          deviceHostname: 'host',
+          siteId: null,
+          configName: 'Primary Backup',
+        },
+      ]))
+      .mockReturnValueOnce(makeSelectChain([
+        { jobId: 'job-1', resumedAt: new Date('2026-11-05T10:02:00.000Z') },
+      ]));
+
+    const res = await app.request('/jobs/job-1');
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.dataAccounting).toEqual({
+      protectedBytes: 1000,
+      uploadedBytes: 100,
+      reusedBytes: 900,
+      processedBytes: null,
+      runKind: 'incremental',
+      fullRunReason: null,
+    });
+    expect(body.resumedAt).toBe('2026-11-05T10:02:00.000Z');
+  });
+
+  it('GET /jobs/:id returns a null resumedAt for a run that never resumed', async () => {
+    selectMock.mockReturnValueOnce(makeSelectChain([
+      {
+        job: makeJob({ status: 'running' }),
+        deviceName: 'Device',
+        deviceHostname: 'host',
+        siteId: null,
+        configName: 'Primary Backup',
+      },
+    ]));
+
+    const res = await app.request('/jobs/job-1');
+
+    expect(res.status).toBe(200);
+    expect((await res.json()).resumedAt).toBeNull();
+  });
+
+  it('GET /jobs returns dataAccounting per row, a stored full-run reason included, and looks up no sessions', async () => {
+    selectMock.mockReturnValueOnce(makeSelectChain([
+      {
+        job: makeJob({
+          status: 'completed',
+          backupMode: 'file',
+          totalSize: 500,
+          baseSnapshotId: null,
+          fullBackupReason: 'no_prior_snapshot',
+        }),
+        deviceName: 'Device',
+        deviceHostname: 'host',
+        siteId: null,
+        configName: 'Primary Backup',
+      },
+    ]));
+
+    const res = await app.request('/jobs');
+
+    expect(res.status).toBe(200);
+    const [row] = (await res.json()).data;
+    expect(row.dataAccounting).toMatchObject({ runKind: 'full', fullRunReason: 'no_prior_snapshot', uploadedBytes: 500 });
+    expect(row).not.toHaveProperty('resumedAt');
+    expect(selectMock).toHaveBeenCalledTimes(1);
+  });
+
   it('exposes live-progress fields (transferredSize, totalFiles, lastProgressAt) in the job response', async () => {
     permissionsState = undefined;
     const jobsChain = makeSelectChain([
@@ -238,6 +449,7 @@ describe('backup jobs routes', () => {
           fileCount: 8,
           totalFiles: 20,
           lastProgressAt: new Date('2026-04-01T00:01:30Z'),
+          lastKeepaliveAt: new Date('2026-04-01T00:02:00Z'),
         }),
         deviceName: 'Running Device',
         deviceHostname: 'running-host',
@@ -257,6 +469,7 @@ describe('backup jobs routes', () => {
       fileCount: 8,
       totalFiles: 20,
       lastProgressAt: '2026-04-01T00:01:30.000Z',
+      lastKeepaliveAt: '2026-04-01T00:02:00.000Z',
     });
   });
 
@@ -279,6 +492,7 @@ describe('backup jobs routes', () => {
     expect(job.transferredSize).toBeNull();
     expect(job.totalFiles).toBeNull();
     expect(job.lastProgressAt).toBeNull();
+    expect(job.lastKeepaliveAt).toBeNull();
   });
 
   it('exposes referencedSize/referencedFiles for an incremental job that deduped files', async () => {
@@ -659,6 +873,94 @@ describe('backup jobs routes', () => {
     expect(body.data.created).toBe(1);
     expect(body.data.jobIds).toEqual(['job-multi-file']);
   });
+
+  // #6597 — the dispatch worker reads the job row on its own connection. A row
+  // still inside an uncommitted transaction is invisible to it, so the worker
+  // resolved the job as a pathless file backup, "failed" a row it could not
+  // see, and the committed row then sat `pending` until the stale reaper
+  // failed it with "Backup dispatch never completed". Every job must be
+  // created in a transaction that has COMMITTED before its dispatch is queued.
+  function trackCreateAndEnqueueContexts() {
+    authDbContexts.seq = 0;
+    authDbContexts.stack.length = 0;
+    authDbContexts.committed.clear();
+    const createdIn = new Map<string, number | undefined>();
+    const committedAtEnqueue = new Map<string, boolean>();
+    let n = 0;
+    vi.mocked(createManualBackupJobIfIdle).mockImplementation(async (input: any) => {
+      const id = `job-${input.deviceId}-${++n}`;
+      createdIn.set(id, authDbContexts.stack.at(-1));
+      return {
+        created: true,
+        job: {
+          id,
+          orgId: input.orgId,
+          configId: input.configId,
+          deviceId: input.deviceId,
+          status: 'pending',
+          type: 'manual',
+          createdAt: new Date('2026-04-01T00:00:00Z'),
+          updatedAt: new Date('2026-04-01T00:00:00Z'),
+        },
+      } as any;
+    });
+    const openContextsAtEnqueue = new Map<string, number>();
+    enqueueBackupDispatchMock.mockImplementation(async (jobId: string) => {
+      const ctx = createdIn.get(jobId);
+      committedAtEnqueue.set(jobId, ctx !== undefined && authDbContexts.committed.has(ctx));
+      openContextsAtEnqueue.set(jobId, authDbContexts.stack.length);
+    });
+    return { createdIn, committedAtEnqueue, openContextsAtEnqueue };
+  }
+
+  it('run-all commits every job row before enqueueing any dispatch (#6597)', async () => {
+    const { createdIn, committedAtEnqueue } = trackCreateAndEnqueueContexts();
+    vi.mocked(resolveAllBackupAssignedDevices).mockResolvedValueOnce([
+      { deviceId: 'device-1', configId: 'config-1', featureLinkId: 'feature-1' } as any,
+      { deviceId: 'device-2', configId: 'config-1', featureLinkId: 'feature-1' } as any,
+      { deviceId: 'device-3', configId: 'config-1', featureLinkId: 'feature-1' } as any,
+    ]);
+    selectMock.mockReturnValueOnce(
+      makeSelectChain([{ id: 'device-1' }, { id: 'device-2' }, { id: 'device-3' }])
+    );
+
+    const res = await app.request('/jobs/run-all', { method: 'POST' });
+
+    expect(res.status).toBe(201);
+    expect(enqueueBackupDispatchMock).toHaveBeenCalledTimes(3);
+    for (const [jobId, ctx] of createdIn) {
+      expect(ctx, `${jobId} was not created in its own committed transaction`).toBeDefined();
+      expect(committedAtEnqueue.get(jobId), `${jobId} was enqueued before its row committed`).toBe(true);
+    }
+  });
+
+  it('single-device run commits every job row before enqueueing its dispatch (#6597)', async () => {
+    const { createdIn, committedAtEnqueue, openContextsAtEnqueue } = trackCreateAndEnqueueContexts();
+    selectMock.mockReturnValueOnce(makeSelectChain([{ id: 'device-1', status: 'online' }]));
+    vi.mocked(resolveBackupConfigForDevice).mockResolvedValueOnce({
+      settings: null,
+      featureLinkId: 'feature-1',
+      configId: 'config-1',
+      selectionSpecs: [
+        { backupMode: 'file', targets: { paths: ['C:\\Data'], excludes: [] } },
+        { backupMode: 'system_image', targets: { volumes: ['C:'] } },
+      ],
+      selectionError: null,
+      inlineSettings: null,
+      resolvedTimezone: 'UTC',
+    } as any);
+
+    const res = await app.request('/jobs/run/device-1', { method: 'POST' });
+
+    expect(res.status).toBe(201);
+    expect(enqueueBackupDispatchMock).toHaveBeenCalledTimes(2);
+    for (const [jobId, ctx] of createdIn) {
+      expect(ctx, `${jobId} was not created in its own committed transaction`).toBeDefined();
+      expect(committedAtEnqueue.get(jobId), `${jobId} was enqueued before its row committed`).toBe(true);
+      // #7213: the Redis enqueue must not hold a pooled DB connection.
+      expect(openContextsAtEnqueue.get(jobId), `${jobId} was enqueued inside a held DB context`).toBe(0);
+    }
+  });
 });
 
 function makeJob(overrides: Record<string, unknown> = {}) {
@@ -679,6 +981,7 @@ function makeJob(overrides: Record<string, unknown> = {}) {
     fileCount: null,
     totalFiles: null,
     lastProgressAt: null,
+    lastKeepaliveAt: null,
     referencedSize: null,
     referencedFiles: null,
     errorCount: null,

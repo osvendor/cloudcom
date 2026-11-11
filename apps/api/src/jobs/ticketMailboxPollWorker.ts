@@ -6,11 +6,56 @@ import {
   listConnectedMailboxes,
   updateDeltaCursor,
   resetDeltaCursor,
+  recordTransientPollFailure,
+  recordPollAttempt,
+  releasePollAttempt,
   setConnectedMailboxStatus,
+  listConnectedGmailMailboxes,
+  isConnectedGmailMailboxCurrent,
+  getConnectedGmailMailboxOrgId,
+  seedGmailCursor,
+  updateHistoryCursor,
+  setGmailMailboxStatus,
+  type ConnectedGmailMailbox,
+  type GmailMailboxSnapshot,
 } from '../services/ticketMailbox/connectionService';
 import { getMailboxToken } from '../services/ticketMailbox/mailboxToken';
-import { listInboxDelta, markRead } from '../services/ticketMailbox/graphMailClient';
+import {
+  MAILBOX_PLATFORM_NOT_CONFIGURED_REASON,
+  MAILBOX_VERIFICATION_FAILED,
+  MailboxPlatformNotConfiguredError,
+} from '../services/ticketMailbox/mailboxErrors';
+import {
+  classifyGraphPollError,
+  GraphSweepBudgetError,
+  isDeltaCursorExpired,
+  listInboxDelta,
+  markRead,
+} from '../services/ticketMailbox/graphMailClient';
 import { normalizeGraphMessage } from '../services/ticketMailbox/normalizeGraphMessage';
+import { evaluateTrustedArc, type ArcEvaluation } from '../services/ticketMailbox/arcSeal';
+
+/** How long a message whose trusted sealer's key could not be fetched waits for a
+ * retry before it goes to quarantine like any other unverified mail. */
+const ARC_RETRY_WINDOW_MS = 60 * 60 * 1000;
+
+function isWithinArcRetryWindow(receivedDateTime: string | undefined): boolean {
+  const received = receivedDateTime ? Date.parse(receivedDateTime) : Number.NaN;
+  return Number.isFinite(received) && Date.now() - received < ARC_RETRY_WINDOW_MS;
+}
+import {
+  getStartHistoryId,
+  listInboxChanges,
+  forEachInboxPageSince,
+  getFullMessage,
+  classifyGmailError,
+  GmailHistoryExpiredError,
+} from '../services/ticketMailbox/googleMailboxClient';
+import { normalizeGmailMessage, isAddressedToMailbox } from '../services/ticketMailbox/normalizeGmailMessage';
+import { getInboundMailboxSession } from '../services/googleClient';
+import type { gmail_v1 } from '@googleapis/gmail';
+import { loadGoogleConnection, decryptConnectionKey } from '../services/googleHelpers';
+import { runOutsideDbContext, withSystemDbAccessContext } from '../db';
 import { enqueueInboundEmail } from '../services/inboundEmailQueue';
 import { attachWorkerObservability } from './workerObservability';
 
@@ -18,46 +63,209 @@ const QUEUE_NAME = 'ticket-mailbox-poll';
 const SWEEP_INTERVAL_MS = 90 * 1000;
 const SWEEP_JOB_ID = 'ticket-mailbox-poll-sweep';
 
+/**
+ * Total Graph time for one sweep's Microsoft 365 pass: two thirds of the sweep
+ * interval (#8308). Every mailbox's Graph calls share this one deadline, and no
+ * mailbox is started once too little of it is left. It bounds Graph time and
+ * when new mailboxes start, not the whole pass: the local work after a page
+ * (enqueue, generation rechecks, cursor write) stays outside it and is bounded
+ * by the per-sweep page cap, as before.
+ */
+export const GRAPH_POLL_PASS_BUDGET_MS = Math.floor((SWEEP_INTERVAL_MS * 2) / 3);
+
+/**
+ * A mailbox is only started with at least this much of the pass left. With less,
+ * it would mostly spend its share on the token request, so it is left for the
+ * next sweep instead, where it goes first (it was not stamped as attempted).
+ */
+export const GRAPH_POLL_MIN_MAILBOX_START_MS = Math.floor(GRAPH_POLL_PASS_BUDGET_MS / 4);
+
+/**
+ * A mailbox whose delta read the pass deadline ends before the first page counts
+ * a transient failure only when it was given at least this much of the pass
+ * (#8308). With less, it started late because earlier mailboxes used the pass,
+ * so the miss says nothing about this mailbox's health: it is logged as deferred
+ * and its attempt stamp is cleared, so the next sweep starts it first with the
+ * whole pass, and a failure then does count. Keeping the stamp instead would put
+ * it back in the same late slot every sweep, never polled and never counted.
+ */
+export const GRAPH_POLL_FAIR_SHARE_MS = Math.floor(GRAPH_POLL_PASS_BUDGET_MS / 2);
+
+/**
+ * A mailbox stamped this recently is skipped (#8308), so two overlapping sweeps
+ * do not both start the same mailbox within this window. It is a short claim,
+ * not a lease: no sweep releases it, and a mailbox whose Graph work runs longer
+ * than this can be started again by an overlapping sweep. That duplicate is
+ * safe, as it was before this change: cursor writes are compare-and-swap
+ * (#8400) and inbound processing dedups by provider message id. The window is
+ * the gap between the pass deadline and the next sweep, which is shorter than
+ * the time between two back-to-back sweeps reaching the same mailbox (the last
+ * mailbox a pass starts is stamped at least GRAPH_POLL_MIN_MAILBOX_START_MS
+ * before its deadline), so sequential sweeps never hit it.
+ */
+export const GRAPH_POLL_ATTEMPT_CLAIM_MS = SWEEP_INTERVAL_MS - GRAPH_POLL_PASS_BUDGET_MS;
+
 type SweepJobData = { type: 'sweep' };
 
+/**
+ * Clears the attempt stamp of a mailbox this sweep stamped but did not get to
+ * poll (#8308), so it goes first next sweep. If the clear itself fails, the
+ * mailbox keeps a fresh stamp and could land in the same late slot again, so
+ * count a transient failure instead: then it shows on the mailbox's health
+ * rather than going unpolled while reading healthy. Returns whether the stamp
+ * was cleared.
+ */
+async function releaseOrCount(c: Awaited<ReturnType<typeof listConnectedMailboxes>>[number]): Promise<boolean> {
+  try {
+    return await releasePollAttempt(c);
+  } catch (err) {
+    captureException(err instanceof Error ? err : new Error(String(err)));
+    await recordTransientPollFailure(c, new Date()).catch((countErr: unknown) => {
+      captureException(countErr instanceof Error ? countErr : new Error(String(countErr)));
+    });
+    return false;
+  }
+}
+
 /** Process one mailbox end-to-end. Graph I/O runs outside any DB context. */
-async function sweepOne(c: Awaited<ReturnType<typeof listConnectedMailboxes>>[number]): Promise<void> {
+async function sweepOne(
+  c: Awaited<ReturnType<typeof listConnectedMailboxes>>[number],
+  passDeadlineAt: number,
+): Promise<void> {
   if (!c.tenantId) return;
 
+  // Preserve the fork's original connection floor for pre-upgrade rows.
+  // Seeding "now" after an outage or expired cursor would silently lose mail
+  // from the polling gap. New connections use the explicit upstream floor.
+  const floor = c.eligibleAfter ?? c.createdAt;
+  if (!Number.isFinite(floor.getTime())) throw new Error('Invalid mailbox eligibility floor');
+  const baselineOpen = c.eligibleAfter !== null && c.baselineCompletedAt === null;
+  const floorMs = Math.floor(floor.getTime() / 1000) * 1000;
+
+  // The pass deadline bounds this mailbox's Graph calls in this sweep (#8308),
+  // shared by the delta read and the mark-read calls. It is never later than
+  // GRAPH_POLL_SWEEP_BUDGET_MS from now, because the pass budget is shorter.
+  // Enqueue and the generation rechecks are local Redis/DB work and are not
+  // bounded by it.
+  const deadlineAt = passDeadlineAt;
+  const startedAt = Date.now();
+  let token: string;
   let page: Awaited<ReturnType<typeof listInboxDelta>>;
   try {
-    const token = await getMailboxToken(c.tenantId);
-    page = await listInboxDelta(token, c.mailboxAddress, c.deltaLink);
+    token = await getMailboxToken(c.tenantId);
+    page = await listInboxDelta(token, c.mailboxAddress, c.deltaLink, { deadlineAt });
   } catch (err) {
     const status = (err as { status?: number }).status;
-    if (status === 410) {
-      await resetDeltaCursor(c);
-      console.warn('[mailboxPoll] delta token gone (410); cursor reset', { id: c.id });
+    // Only a stored cursor can expire. The same answer to a fresh delta request has
+    // nothing to clear, and treating it as expired would retry it every sweep with
+    // nothing recorded, so it is classified like any other refusal below.
+    if (c.deltaLink !== null && isDeltaCursorExpired(err)) {
+      const reset = await resetDeltaCursor(c, c.deltaLink);
+      console.warn('[mailboxPoll] delta token expired; cursor cleared for a re-walk', {
+        id: c.id,
+        status,
+        graphCode: (err as { graphCode?: string }).graphCode,
+        reset,
+      });
       return;
     }
 
-    const next = status === 401 || status === 403 ? 'reauth_required' : 'error';
+    const kind = classifyGraphPollError(err);
+    if (err instanceof GraphSweepBudgetError && deadlineAt - startedAt < GRAPH_POLL_FAIR_SHARE_MS) {
+      const released = await releaseOrCount(c);
+      console.warn('[mailboxPoll] pass deadline reached before the first page; deferred to the next sweep', {
+        id: c.id,
+        shareMs: deadlineAt - startedAt,
+        released,
+        limit: 'pass_deadline',
+      });
+      return;
+    }
+    if (kind === 'transient') {
+      // Leave the mailbox 'connected' so the next sweep retries. Marking it
+      // 'error' would drop it from polling until a manual reconnect (#8299).
+      // Count the failure on the connection so a mailbox failing for hours does
+      // not read as healthy (#8308); the error text itself stays in this log.
+      const failures = await recordTransientPollFailure(c, new Date());
+      console.warn('[mailboxPoll] transient Graph failure; will retry next sweep', {
+        id: c.id,
+        status,
+        consecutiveFailures: failures,
+        err: err instanceof Error ? err.message : err,
+        // Say so when the pass deadline ended it, not Graph (#8308).
+        ...(err instanceof GraphSweepBudgetError ? { limit: 'pass_deadline' } : {}),
+      });
+      return;
+    }
+
+    const next = kind === 'reauth' ? 'reauth_required' : 'error';
     // Raw, unsanitized text (do not prefix with MAILBOX_VERIFICATION_FAILED,
     // 'Mailbox verification failed' — connectionService.ts's listMailboxConnections
     // only exposes lastError to the client when it has that exact prefix, to
     // keep this poller's error text server-side-only; #6192).
+    // The one failure an admin can fix from the UI gets our own sanitized
+    // reason, which is the only lastError text the list route exposes.
     await setConnectedMailboxStatus(
       c,
       next,
-      err instanceof Error ? err.message : 'poll failed',
+      err instanceof MailboxPlatformNotConfiguredError
+        ? `${MAILBOX_VERIFICATION_FAILED}: ${MAILBOX_PLATFORM_NOT_CONFIGURED_REASON}`
+        : err instanceof Error ? err.message : 'poll failed',
     );
     return;
   }
 
   let lastMessageAt: Date | null = null;
+  let markReadSkipped = 0;
+  const arcCounts: Partial<Record<ArcEvaluation['status'], number>> = {};
+  let beforeFloor = 0;
   try {
-    const token = await getMailboxToken(c.tenantId);
+    // The token from the delta read is reused: getMailboxToken only returns a
+    // token with more than five minutes left, which outlasts the sweep budget,
+    // so a second token request (and an unrecorded token outage) is not needed.
     // Graph I/O may outlive a reconnect/disable. Revalidate the exact generation
     // immediately before producing any external side effects.
     if (!await isConnectedMailboxSnapshotCurrent(c)) return;
     for (const msg of page.messages) {
-      const normalized = normalizeGraphMessage(msg, c.partnerId, c.mailboxAddress);
+      if (floorMs !== null) {
+        // A removal carries only an id; there is nothing to import or to count.
+        if (msg['@removed']) continue;
+        // On every round, not only the first: delta reports old mail again when
+        // someone reads, flags or moves it. No enqueue and no mark-read, so mail
+        // already in the inbox stays exactly as it was (#10863). Mail newer than
+        // the floor falls through, including what arrived during the baseline walk.
+        const received = msg.receivedDateTime ? Date.parse(msg.receivedDateTime) : Number.NaN;
+        // Retain the cursor and retry ambiguous input rather than permanently
+        // consuming a message whose eligibility cannot be established.
+        if (!Number.isFinite(received)) {
+          throw new Error('Missing or invalid mailbox message received time');
+        }
+        if (received < floorMs) {
+          beforeFloor += 1;
+          continue;
+        }
+      }
+      const arc = await evaluateTrustedArc(msg.internetMessageHeaders, c.trustedArcSealers, msg.receivedDateTime);
+      // Only results that name a sealer: a malformed chain on spam is not a fault.
+      if (arc && (arc.status === 'verified' || 'sealer' in arc && arc.sealer)) {
+        arcCounts[arc.status] = (arcCounts[arc.status] ?? 0) + 1;
+      }
+      // The sealer's key could not be fetched. Quarantining would park genuine mail
+      // for a DNS blip, so stop here, before this message or the cursor moves, and
+      // retry next sweep (ingest dedups what this page already enqueued). Mail older
+      // than the retry window is let through to quarantine, so a sealer whose DNS
+      // stays down cannot hold the mailbox, and only a selector that has returned a
+      // key before is retried, so a sender cannot hold it with a made-up one (#10862).
+      if (arc?.status === 'dns-unavailable' && arc.retryable && isWithinArcRetryWindow(msg.receivedDateTime)) {
+        const failures = await recordTransientPollFailure(c, new Date());
+        console.warn('[mailboxPoll] trusted ARC sealer key lookup failed; will retry next sweep', {
+          id: c.id, sealer: arc.sealer, consecutiveFailures: failures,
+        });
+        return;
+      }
+      const normalized = normalizeGraphMessage(msg, c.partnerId, c.mailboxAddress, { arc });
       await enqueueInboundEmail(normalized, {
+        provider: 'm365',
         connectionId: c.id,
         partnerId: c.partnerId,
         tenantId: c.tenantId,
@@ -68,9 +276,22 @@ async function sweepOne(c: Awaited<ReturnType<typeof listConnectedMailboxes>>[nu
       // effect. A stale result also stops this page so no later message or cursor
       // can be produced from the obsolete snapshot.
       if (!await isConnectedMailboxSnapshotCurrent(c)) return;
-      await markRead(token, c.mailboxAddress, msg.id).catch((e) => {
-        console.warn('[mailboxPoll] mark-read failed', { id: msg.id, err: e instanceof Error ? e.message : e });
-      });
+      // Mark-read is best-effort (a failure is only logged), so once the sweep
+      // budget is spent it is skipped rather than holding the sweep (#8308). The
+      // message is still enqueued and the cursor still advances.
+      if (Date.now() >= deadlineAt) {
+        markReadSkipped += 1;
+      } else {
+        await markRead(token, c.mailboxAddress, msg.id, deadlineAt).catch((e) => {
+          // A call the pass deadline cut short is a skip, counted in the summary
+          // line with its limit, not a mark-read failure (#8308).
+          if (e instanceof GraphSweepBudgetError || Date.now() >= deadlineAt) {
+            markReadSkipped += 1;
+            return;
+          }
+          console.warn('[mailboxPoll] mark-read failed', { id: msg.id, err: e instanceof Error ? e.message : e });
+        });
+      }
       if (msg.receivedDateTime) lastMessageAt = new Date(msg.receivedDateTime);
     }
   } catch (err) {
@@ -81,23 +302,407 @@ async function sweepOne(c: Awaited<ReturnType<typeof listConnectedMailboxes>>[nu
     return;
   }
 
-  if (page.deltaLink) {
+  // A configured sealer none of whose seals verified this sweep is a configuration or
+  // DNS fault (a wrong d=, a rotated key), not spam: say so once per sweep.
+  if (!arcCounts.verified && ((arcCounts.invalid ?? 0) + (arcCounts['dns-unavailable'] ?? 0)) > 0) {
+    console.warn('[mailboxPoll] no seal from a trusted ARC sealer verified this sweep', {
+      id: c.id, sealers: c.trustedArcSealers, counts: arcCounts,
+    });
+  }
+
+  if (markReadSkipped > 0) {
+    console.warn('[mailboxPoll] sweep budget spent; left messages unread', { id: c.id, count: markReadSkipped, limit: 'pass_deadline' });
+  }
+  // A round that did not finish this sweep stores its resumeLink, so the next
+  // sweep continues it instead of starting over (#8400).
+  const cursor = page.deltaLink ?? page.resumeLink ?? null;
+  if (page.resumeLink) {
+    console.info('[mailboxPoll] delta round continues next sweep', {
+      id: c.id,
+      messages: page.messages.length,
+      limit: page.resumeReason === 'page_cap' ? 'page_cap' : 'pass_deadline',
+    });
+  }
+  if (cursor) {
     const polledAt = new Date();
-    await updateDeltaCursor(c, page.deltaLink, polledAt, lastMessageAt ?? polledAt);
+    // The stored resumeLink plus the open baseline is the "not finished" state: a
+    // later sweep resumes, and only a real deltaLink closes the baseline.
+    const completed = page.deltaLink !== null;
+    const written = baselineOpen
+      ? await updateDeltaCursor(c, c.deltaLink, cursor, polledAt, lastMessageAt ?? polledAt, { skipped: beforeFloor, completed })
+      : await updateDeltaCursor(c, c.deltaLink, cursor, polledAt, lastMessageAt ?? polledAt);
+    if (!written) {
+      // An overlapping sweep advanced the cursor first, or the generation changed;
+      // the next sweep re-reads it. Nothing from this round was counted.
+      console.info('[mailboxPoll] cursor write lost to another sweep or a lifecycle change', { id: c.id });
+    } else if (baselineOpen && completed) {
+      console.info('[mailboxPoll] connect baseline finished', { id: c.id, skipped: beforeFloor });
+    }
   }
 }
 
+/** Most Graph message ids one sweep logs for messages it could not date. */
+
 /** Exported for tests. Reads connections in system context, processes each independently. */
-export async function runMailboxSweep(): Promise<void> {
-  const connections = await listConnectedMailboxes();
-  for (const c of connections) {
+const errMsg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+
+/**
+ * Process one connected Gmail mailbox. Reads via the org's domain-wide-delegation
+ * service account (google_workspace_connections), impersonating the mailbox
+ * address; this sweep only READS (the granted scope is gmail.readonly — see
+ * googleMailboxClient). googleAccountSub holds the
+ * mailbox's immutable Google account sub (captured at connect) and namespaces the
+ * dedup key, so an email/alias change does not fracture dedup. Identity is
+ * re-verified on EVERY sweep (session.identity().sub vs the stored sub) before any
+ * read, so a mid-connected reassignment to a different account is caught here, and
+ * a same-Workspace org merge can be a plain repoint instead of a forced reauth.
+ */
+async function sweepOneGmail(c: ConnectedGmailMailbox): Promise<void> {
+  // orgId binds every later generation check to the credential org loaded below,
+  // so a mid-sweep org merge (repoint, generation kept) aborts the sweep.
+  const snapshot = { id: c.id, partnerId: c.partnerId, consentAttemptId: c.consentAttemptId, orgId: c.orgId };
+
+  let saKey: string;
+  try {
+    // google_workspace_connections has forced org RLS; the sweep runs with no
+    // ambient DB context, so load the credential inside an explicit system
+    // context (as the connectionService helpers do) or the row is invisible and
+    // a healthy mailbox would be wrongly marked reauth_required.
+    const conn = await runOutsideDbContext(() =>
+      withSystemDbAccessContext(() => loadGoogleConnection(c.orgId)),
+    );
+    if (!conn || conn.status !== 'active') {
+      // Guard the org-merge race: the credential was loaded by the org captured at
+      // enumeration (c.orgId). An org merge repoints this connection's org and
+      // drops the loser's Google credential (keep-survivor), so a merge committing
+      // between enumeration and now leaves c.orgId's credential legitimately gone
+      // while the row is healthy under the survivor. Re-read the row's CURRENT org;
+      // if it changed (or the row moved out of this generation), skip this sweep so
+      // the next one loads the survivor credential — do NOT falsely mark a healthy
+      // mailbox reauth_required. (setGmailMailboxStatus now also requires the
+      // snapshot org, so it could not clobber the repointed row either; the early
+      // return keeps this path explicit.)
+      const currentOrgId = await getConnectedGmailMailboxOrgId(snapshot);
+      if (currentOrgId !== c.orgId) return;
+      await setGmailMailboxStatus(snapshot, 'reauth_required', 'google workspace connection missing or inactive');
+      return;
+    }
+    saKey = decryptConnectionKey(conn);
+  } catch (err) {
+    // A missing/inactive credential is handled above (reauth_required). Reaching
+    // here means the credential READ or decrypt threw — most often a transient DB
+    // hiccup. Do NOT stamp a terminal 'error' (that status is excluded from the
+    // next sweep, so a blip would permanently stop this mailbox until manual
+    // intervention). Log and leave the mailbox 'connected' so the next sweep
+    // retries; a persistent fault keeps surfacing here rather than going silent.
+    captureException(err instanceof Error ? err : new Error(String(err)));
+    console.error('[mailboxPoll] gmail credential load failed; will retry next sweep', { id: c.id });
+    return;
+  }
+
+  // ONE session for this sweep: verify identity and do every read through it, so
+  // the account check and the mail it reads are bound to the same token.
+  const session = getInboundMailboxSession(saKey, c.mailboxAddress);
+
+  // Verify the mailbox STILL resolves to the same Google account before ingesting
+  // anything. An org merge repoints org_id (and thus which credential this sweep
+  // loads), and an address can be reassigned to a different account. Comparing the
+  // live sub to the stored one on every sweep is the safety gate that lets the merge
+  // be a plain repoint (no forced reauth, so in-flight mail is not dropped): a
+  // same-account merge keeps polling seamlessly, a different account is caught here.
+  let liveSub: string;
+  try {
+    liveSub = (await session.identity()).sub;
+  } catch (err) {
+    const kind = classifyGmailError(err);
+    if (kind === 'reauth') await setGmailMailboxStatus(snapshot, 'reauth_required', errMsg(err));
+    else if (kind === 'fatal') await setGmailMailboxStatus(snapshot, 'error', errMsg(err));
+    // rate_limit / transient: leave connected, retry next sweep.
+    return;
+  }
+  if (liveSub !== c.googleAccountSub) {
+    await setGmailMailboxStatus(snapshot, 'reauth_required', 'the Google account behind this mailbox changed; reconnect required');
+    return;
+  }
+
+  // No cursor yet: establish the eligibility floor (connect time) and the
+  // baseline history cursor, then process nothing this tick ("new mail from now").
+  if (!c.historyId) {
     try {
-      await sweepOne(c);
+      const startId = await getStartHistoryId(session.gmail);
+      await seedGmailCursor(snapshot, startId, new Date());
+    } catch (err) {
+      const kind = classifyGmailError(err);
+      if (kind === 'reauth') await setGmailMailboxStatus(snapshot, 'reauth_required', errMsg(err));
+      else if (kind === 'fatal') await setGmailMailboxStatus(snapshot, 'error', errMsg(err));
+      // rate_limit / transient: leave connected, retry next sweep.
+    }
+    return;
+  }
+
+  let changes: Awaited<ReturnType<typeof listInboxChanges>>;
+  try {
+    changes = await listInboxChanges(session.gmail, c.historyId);
+  } catch (err) {
+    if (err instanceof GmailHistoryExpiredError) {
+      // Cursor too old to serve. Do NOT resume at "now" (that silently skips the
+      // gap). Reconcile: enumerate INBOX since the eligibility floor and ingest
+      // (durable dedup drops anything already ticketed), then commit a fresh
+      // cursor. Mail that arrived AND left the inbox during the gap is not
+      // recoverable and is not backfilled (documented, best-effort).
+      await reconcileGmailAfterExpiry(c, snapshot, session.gmail);
+      return;
+    }
+    const kind = classifyGmailError(err);
+    if (kind === 'reauth') await setGmailMailboxStatus(snapshot, 'reauth_required', errMsg(err));
+    else if (kind === 'fatal') await setGmailMailboxStatus(snapshot, 'error', errMsg(err));
+    // rate_limit / transient: cursor NOT advanced, retried next tick.
+    return;
+  }
+
+  const lastMessageAt = await ingestGmailIds(c, snapshot, session.gmail, changes.messageIds);
+  if (lastMessageAt === ABORTED) return;
+
+  // Advance the cursor ONLY after the page's messages are durably enqueued, and
+  // only if it is still at the value this sweep started from (compare-and-swap) so
+  // an overlapping slow sweep cannot move it backward.
+  if (changes.newHistoryId) {
+    await updateHistoryCursor(snapshot, c.historyId, changes.newHistoryId, new Date(), lastMessageAt);
+  }
+}
+
+/** Sentinel: the generation changed mid-ingest, so stop without advancing. */
+const ABORTED = Symbol('aborted');
+
+/** Fetch, normalize, and enqueue a set of Gmail message ids under the connection's
+ * generation. Rechecks the generation before every enqueue. Returns the newest
+ * message timestamp seen, or ABORTED if the generation went stale.
+ *
+ * No-loss policy: the cursor advances only after the whole page is durably enqueued
+ * (see the callers). We do NOT silently skip a message that fails to fetch — that
+ * would advance the cursor past mail that was never recorded anywhere and lose it.
+ * getFullMessage returns null for a 404 (deleted between listing and fetch — a real
+ * race, correctly skipped); any other error propagates, aborting the page so the
+ * cursor stays put and the next sweep retries. normalizeGmailMessage is total (it
+ * never throws — malformed parts degrade to best-effort), so a weird message still
+ * ingests rather than wedging the mailbox. A persistent non-404 fetch error is a
+ * genuine Gmail anomaly on that message: it blocks that one mailbox (surfaced via
+ * the sweep's captureException) rather than dropping a customer email — matching the
+ * m365 path. A durable per-message dead-letter/replay ledger is the future
+ * enhancement that would let such a message be set aside without blocking.
+ *
+ * The eligibility floor (the connection's `eligibleAfter`, the connect instant)
+ * applies on BOTH paths: a message whose Gmail receipt time predates it is
+ * pre-connection mail and is never ticketed. On the incremental path that is a
+ * labelAdded(INBOX) change on an old message (e.g. an old thread moved back into
+ * the inbox); on the recovery path the query is one second wide (see
+ * listInboxMessageIdsSince). `minInternalDateMs` overrides the floor when given. */
+async function ingestGmailIds(
+  c: ConnectedGmailMailbox,
+  snapshot: GmailMailboxSnapshot,
+  gmail: gmail_v1.Gmail,
+  ids: string[],
+  minInternalDateMs?: number,
+): Promise<Date | null | typeof ABORTED> {
+  let lastMessageAt: Date | null = null;
+  const floorMs = minInternalDateMs ?? c.eligibleAfter?.getTime() ?? null;
+  if (!await isConnectedGmailMailboxCurrent(snapshot)) return ABORTED;
+  for (const id of ids) {
+    const msg = await getFullMessage(gmail, id);
+    if (!msg) continue; // deleted between listing and fetch — a normal race
+    // Pre-connection mail is never ticketed, whichever path surfaced it.
+    if (floorMs != null && msg.internalDate != null
+        && Number(msg.internalDate) < floorMs) continue;
+    // Ingestion scope (decision A): ticket ONLY mail delivered to the support
+    // mailbox per the MTA-stamped Delivered-To. history.list returns the whole INBOX
+    // with no recipient filter, and the mailbox may be an alias on a personal/shared
+    // account, so enqueueing everything would turn that account's unrelated mail into
+    // tickets. A non-recipient message is deliberately left in the inbox (not an
+    // error, not lost) and the cursor advances past it. Every skip is logged for
+    // observability. Gmail's Delivered-To carries the exact delivered address — the
+    // ALIAS for alias mail, the PRIMARY for direct mail (live-verified against
+    // support-primary@example.com, 2026-09-22) — so alias mail is captured, not skipped.
+    if (!isAddressedToMailbox(msg.payload?.headers ?? undefined, c.mailboxAddress)) {
+      // Observability only. Do NOT log the message's recipient/correspondent headers
+      // (Delivered-To / To / X-Original-To): when the support alias shares a mailbox
+      // with someone's personal mail, those are third-party addresses that must not be
+      // exported to centralized application logs. The connection id + Gmail message id
+      // are enough to investigate a wrongly-filtered message (fetch it out-of-band).
+      console.info('[mailboxPoll] gmail message skipped: not delivered to the support mailbox', {
+        id: c.id,
+        messageId: id,
+      });
+      continue;
+    }
+    const normalized = normalizeGmailMessage(msg, c.partnerId, c.mailboxAddress, c.googleAccountSub);
+    // Revalidate the generation immediately before the enqueue side effect.
+    if (!await isConnectedGmailMailboxCurrent(snapshot)) return ABORTED;
+    await enqueueInboundEmail(normalized, {
+      provider: 'gmail',
+      connectionId: c.id,
+      partnerId: c.partnerId,
+      tenantId: null,
+      consentAttemptId: c.consentAttemptId,
+    });
+    // Track the NEWEST timestamp, not the last one enumerated: Gmail's
+    // messages.list (recovery path) does not guarantee ascending internalDate
+    // order, so a plain assignment could move last_message_at backward.
+    if (msg.internalDate) {
+      const ts = new Date(Number(msg.internalDate));
+      if (!lastMessageAt || ts > lastMessageAt) lastMessageAt = ts;
+    }
+  }
+  return lastMessageAt;
+}
+
+/** Recovery after an expired history cursor: capture a fresh baseline FIRST, then
+ * enumerate INBOX since the eligibility floor and ingest, then commit the baseline.
+ * Capturing the baseline before enumeration means any mail arriving during
+ * enumeration is caught by the next incremental sweep (durable dedup absorbs the
+ * small overlap). */
+async function reconcileGmailAfterExpiry(
+  c: ConnectedGmailMailbox,
+  snapshot: GmailMailboxSnapshot,
+  gmail: gmail_v1.Gmail,
+): Promise<void> {
+  // Without a durable floor we cannot bound recovery: searching "from now" would
+  // permanently skip mail already in the inbox, and enumerating everything would
+  // import the whole historical inbox as tickets. A seeded connection always has
+  // a floor; if it is somehow absent, STOP without advancing (leave the cursor
+  // expired) so the next sweep retries rather than losing mail.
+  if (!c.eligibleAfter) {
+    console.warn('[mailboxPoll] gmail history expired but no eligibility floor; skipping recovery', { id: c.id });
+    return;
+  }
+  try {
+    const baseline = await getStartHistoryId(gmail);
+    const floorSec = Math.floor(c.eligibleAfter.getTime() / 1000);
+    const floorMs = c.eligibleAfter.getTime();
+    // STREAM the enumeration one page at a time so an expired mailbox with a very
+    // large post-floor backlog never accumulates the whole inbox in memory. Each
+    // page is ingested and released; the cursor is advanced ONCE after all pages
+    // (interruption leaves the expired cursor untouched, so the next sweep replays
+    // safely — dedup prevents duplicate tickets).
+    let lastMessageAt: Date | null = null;
+    let enumerated = 0;
+    let aborted = false;
+    await forEachInboxPageSince(gmail, floorSec, async (pageIds) => {
+      enumerated += pageIds.length;
+      // Pass the exact-millisecond floor: the query is widened by 1s so the floor
+      // second is never missed, so ingest must drop anything genuinely before the
+      // floor (pre-connection mail).
+      const r = await ingestGmailIds(c, snapshot, gmail, pageIds, floorMs);
+      if (r === ABORTED) { aborted = true; return false; }
+      if (r && (!lastMessageAt || r > lastMessageAt)) lastMessageAt = r;
+      return true;
+    });
+    if (aborted) return;
+    // CAS against the expired cursor we started from: if a concurrent sweep already
+    // recovered and advanced the cursor, this commit matches 0 rows rather than
+    // clobbering the newer baseline. c.historyId is non-null here (an expired
+    // cursor is what raised GmailHistoryExpiredError to reach this path).
+    await updateHistoryCursor(snapshot, c.historyId!, baseline, new Date(), lastMessageAt);
+    console.warn('[mailboxPoll] gmail history expired; reconciled', { id: c.id, enumerated });
+  } catch (err) {
+    const kind = classifyGmailError(err);
+    if (kind === 'reauth') await setGmailMailboxStatus(snapshot, 'reauth_required', errMsg(err));
+    else if (kind === 'fatal') await setGmailMailboxStatus(snapshot, 'error', errMsg(err));
+    // rate_limit / transient: cursor left expired; next sweep retries reconciliation.
+  }
+}
+
+export async function runMailboxSweep(): Promise<void> {
+  // Oldest attempt first (listConnectedMailboxes orders by last_poll_attempt_at),
+  // under one deadline for the whole Microsoft 365 pass (#8308).
+  const connections = await listConnectedMailboxes();
+  const passDeadlineAt = Date.now() + GRAPH_POLL_PASS_BUDGET_MS;
+  const leaveRest = (i: number) => {
+    console.warn('[mailboxPoll] pass deadline reached; mailboxes left for the next sweep', {
+      left: connections.length - i,
+      total: connections.length,
+      ids: connections.slice(i).map((m) => m.id),
+      limit: 'pass_deadline',
+    });
+  };
+  for (const [i, c] of connections.entries()) {
+    if (passDeadlineAt - Date.now() < GRAPH_POLL_MIN_MAILBOX_START_MS) {
+      // Not stamped, so these go ahead of every mailbox this pass reached.
+      leaveRest(i);
+      break;
+    }
+    try {
+      // Stamped before any token or Graph work, so a mailbox that hangs or fails
+      // still moves behind the ones not reached. A mailbox whose stamp fails is
+      // not polled this sweep: polling it without moving it would let it stay
+      // ahead of the mailboxes behind it on every sweep and starve them. One that
+      // stamps no row is claimed by an overlapping sweep, or changed generation
+      // since the listing; either way it must not spend this pass.
+      let stamped: boolean;
+      try {
+        stamped = await recordPollAttempt(c, GRAPH_POLL_ATTEMPT_CLAIM_MS);
+      } catch (err) {
+        // Skipped this sweep. Count a transient failure (best effort: it writes
+        // the same row) and report it, so a stamp that keeps failing shows on
+        // the mailbox's health instead of leaving it unpolled and reading healthy.
+        captureException(err instanceof Error ? err : new Error(String(err)));
+        await recordTransientPollFailure(c, new Date()).catch((countErr: unknown) => {
+          captureException(countErr instanceof Error ? countErr : new Error(String(countErr)));
+        });
+        console.error('[mailboxPoll] could not record the poll attempt; skipping this mailbox this sweep', {
+          id: c.id,
+          err: errMsg(err),
+        });
+        continue;
+      }
+      if (!stamped) continue;
+      // The stamp is a database write and can be slow; check again so a mailbox
+      // never starts its token and Graph work without its minimum share. This one
+      // was stamped but not started, so clear the stamp: it then goes first next
+      // sweep with the mailboxes this pass did not reach.
+      if (passDeadlineAt - Date.now() < GRAPH_POLL_MIN_MAILBOX_START_MS) {
+        await releaseOrCount(c);
+        leaveRest(i);
+        break;
+      }
+      await sweepOne(c, passDeadlineAt);
     } catch (err) {
       captureException(err instanceof Error ? err : new Error(String(err)));
       console.error('[mailboxPoll] sweepOne crashed', { id: c.id });
     }
   }
+
+  const gmailConnections = await listConnectedGmailMailboxes();
+  // Bounded concurrency: sweeps are independent per mailbox, so a single slow (or
+  // timing-out) Google request no longer serially starves every later mailbox — at
+  // most GMAIL_SWEEP_CONCURRENCY are in flight and one stuck lane blocks only itself.
+  // Kept small so concurrent per-sweep DB contexts stay well under the connection pool.
+  await runWithConcurrency(gmailConnections, GMAIL_SWEEP_CONCURRENCY, async (c) => {
+    try {
+      await sweepOneGmail(c);
+    } catch (err) {
+      captureException(err instanceof Error ? err : new Error(String(err)));
+      console.error('[mailboxPoll] sweepOneGmail crashed', { id: c.id });
+    }
+  });
+}
+
+const GMAIL_SWEEP_CONCURRENCY = 4;
+
+/** Run `fn` over `items` with at most `limit` in flight at once. Each task is
+ * self-contained (fn swallows its own errors), so one lane never blocks another. */
+async function runWithConcurrency<T>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T) => Promise<void>,
+): Promise<void> {
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const i = next++;
+      await fn(items[i]!);
+    }
+  });
+  await Promise.all(workers);
 }
 
 let queue: Queue<SweepJobData> | null = null;

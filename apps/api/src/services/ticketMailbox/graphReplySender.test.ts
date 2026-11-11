@@ -15,7 +15,7 @@ describe('sendThreadedReply', () => {
       .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({}) })
       .mockResolvedValueOnce({ ok: true, status: 202, text: async () => '' });
 
-    await sendThreadedReply(target, 'orig-1', '<p>reply</p>');
+    await sendThreadedReply(target, 'orig-1', '<p>reply</p>', 'customer@example.com', '[T-2026-3000] Reply');
 
     expect(fetchMock).toHaveBeenCalledTimes(3);
     const createReplyCall = fetchMock.mock.calls[0]!;
@@ -27,13 +27,14 @@ describe('sendThreadedReply', () => {
     expect(patchDraftCall[0]).toContain('/messages/draft-9');
     expect(patchDraftCall[1].method).toBe('PATCH');
     expect(JSON.parse(patchDraftCall[1].body).body).toEqual({ contentType: 'HTML', content: '<p>reply</p>' });
+    expect(JSON.parse(patchDraftCall[1].body)).toMatchObject({ subject: '[T-2026-3000] Reply', toRecipients: [{ emailAddress: { address: 'customer@example.com' } }], ccRecipients: [], bccRecipients: [] });
     expect(sendDraftCall[0]).toContain('/messages/draft-9/send');
     expect(sendDraftCall[1].method).toBe('POST');
   });
 
   it('throws if createReply fails', async () => {
     fetchMock.mockResolvedValueOnce({ ok: false, status: 403, text: async () => 'denied' });
-    await expect(sendThreadedReply(target, 'orig-1', '<p>x</p>')).rejects.toThrow(/403/);
+    await expect(sendThreadedReply(target, 'orig-1', '<p>x</p>', 'customer@example.com', 'Reply')).rejects.toThrow(/403/);
   });
 });
 

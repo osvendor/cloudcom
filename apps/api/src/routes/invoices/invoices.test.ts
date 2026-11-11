@@ -9,10 +9,14 @@ vi.mock('../../services/invoiceService', () => ({
   addCatalogLine: vi.fn(),
   addBundleLine: vi.fn(),
   updateLine: vi.fn(),
+  refreshDraftTimeLines: vi.fn(),
   removeLine: vi.fn(),
   deleteDraftInvoice: vi.fn(),
   updateInvoice: vi.fn(),
   updateIssuedDueDate: vi.fn(),
+  changeInvoiceCurrency: vi.fn(),
+  requireOrgAccess: vi.fn(),
+  requireSiteAccess: vi.fn(),
   issueInvoice: vi.fn(),
   voidInvoice: vi.fn(),
   recordPayment: vi.fn(),
@@ -20,6 +24,11 @@ vi.mock('../../services/invoiceService', () => ({
   voidPayment: vi.fn(),
   assembleDraftFromOrg: vi.fn(),
   assembleDraftFromTicket: vi.fn()
+}));
+
+vi.mock('../../services/invoiceBillingGate', () => ({
+  assertInvoiceBillingEnabled: vi.fn(),
+  assertInvoiceBillingEnabledById: vi.fn(),
 }));
 
 // Mock the Phase 5 PDF/email service — /:id/send + /:id/pdf delegate here.
@@ -33,7 +42,7 @@ vi.mock('../../services/invoicePdf', () => ({
 // GET /:id resolves document branding (partner/portal) for the in-app preview,
 // mirroring the quotes route. Stub it so route tests don't hit the real DB.
 vi.mock('../../services/quoteBranding', () => ({
-  resolveQuoteBranding: vi.fn()
+  resolveInvoiceBranding: vi.fn()
 }));
 
 // Payment routes write to the durable audit chain; stub it so route tests don't
@@ -86,6 +95,7 @@ import * as pdfSvc from '../../services/invoicePdf';
 import * as brandingSvc from '../../services/quoteBranding';
 import { writeRouteAudit } from '../../services/auditEvents';
 import { InvoiceServiceError } from '../../services/invoiceTypes';
+import { assertInvoiceBillingEnabled, assertInvoiceBillingEnabledById } from '../../services/invoiceBillingGate';
 
 function app() {
   // invoiceRoutes already applies authMiddleware internally
@@ -100,7 +110,7 @@ describe('invoice crud + lines routes', () => {
   beforeEach(() => vi.clearAllMocks());
 
   it('POST / creates a manual invoice', async () => {
-    (svc.createManualInvoice as any).mockResolvedValue({ id: INV_ID, status: 'draft' });
+    (svc.createManualInvoice as any).mockResolvedValue({ id: INV_ID, orgId: ORG_ID, status: 'draft' });
     const res = await app().request('/', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -110,6 +120,9 @@ describe('invoice crud + lines routes', () => {
     const body = await res.json();
     expect(body.data.id).toBe(INV_ID);
     expect(svc.createManualInvoice).toHaveBeenCalledOnce();
+    expect(writeRouteAudit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      orgId: ORG_ID, action: 'invoice.create', resourceType: 'invoice', resourceId: INV_ID,
+    }));
   });
 
   it('POST / rejects an invalid body (non-UUID orgId → 400, no service call)', async () => {
@@ -133,14 +146,14 @@ describe('invoice crud + lines routes', () => {
 
   it('GET /:id fetches one invoice and attaches resolved branding', async () => {
     (svc.getInvoice as any).mockResolvedValue({ invoice: { id: INV_ID }, lines: [], stripeConnected: false });
-    (brandingSvc.resolveQuoteBranding as any).mockResolvedValue({ partnerName: 'Lantern IT', logoUrl: null, primaryColor: null, footer: null, currencyCode: 'USD', seller: null });
+    (brandingSvc.resolveInvoiceBranding as any).mockResolvedValue({ partnerName: 'Lantern IT', logoUrl: null, primaryColor: null, footer: null, currencyCode: 'USD', seller: null });
     const res = await app().request(`/${INV_ID}`, { method: 'GET' });
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.data.invoice.id).toBe(INV_ID);
     expect(body.data.branding.partnerName).toBe('Lantern IT');
     expect(svc.getInvoice).toHaveBeenCalledWith(INV_ID, expect.anything());
-    expect(brandingSvc.resolveQuoteBranding).toHaveBeenCalledWith({ id: INV_ID, presentationSnapshot: null });
+    expect(brandingSvc.resolveInvoiceBranding).toHaveBeenCalledWith({ id: INV_ID }); // the invoice row itself — no forged presentationSnapshot (#6227)
   });
 
   it('POST /:id/lines adds a manual line', async () => {
@@ -193,13 +206,55 @@ describe('invoice crud + lines routes', () => {
     expect(svc.updateInvoice).not.toHaveBeenCalled();
   });
 
+  it('#8604: PATCH /:id passes the line itemization override through, null = inherit', async () => {
+    (svc.updateInvoice as any).mockResolvedValue({ id: INV_ID, status: 'draft' });
+    const res = await app().request(`/${INV_ID}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ lineGrouping: 'day', lineShowDate: true, lineShowNote: null, lineShowWorkedTime: false })
+    });
+    expect(res.status).toBe(200);
+    expect(svc.updateInvoice).toHaveBeenCalledWith(
+      INV_ID,
+      { lineGrouping: 'day', lineShowDate: true, lineShowNote: null, lineShowWorkedTime: false },
+      expect.anything()
+    );
+  });
+
+  it('#8604: PATCH /:id accepts null (clear to billing default) for every override field', async () => {
+    (svc.updateInvoice as any).mockResolvedValue({ id: INV_ID, status: 'draft' });
+    const all = { lineGrouping: null, lineShowDate: null, lineShowNote: null, lineShowWorkedTime: null };
+    const res = await app().request(`/${INV_ID}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(all)
+    });
+    expect(res.status).toBe(200);
+    expect(svc.updateInvoice).toHaveBeenCalledWith(INV_ID, all, expect.anything());
+  });
+
+  it('#8604: PATCH /:id rejects an unknown grouping or a non-boolean toggle (400, no service call)', async () => {
+    for (const body of [{ lineGrouping: 'week' }, { lineShowDate: 'yes' }]) {
+      const res = await app().request(`/${INV_ID}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      expect(res.status).toBe(400);
+    }
+    expect(svc.updateInvoice).not.toHaveBeenCalled();
+  });
+
   it('DELETE /:id deletes a draft invoice', async () => {
-    (svc.deleteDraftInvoice as any).mockResolvedValue(undefined);
+    (svc.deleteDraftInvoice as any).mockResolvedValue({ id: INV_ID, orgId: ORG_ID });
     const res = await app().request(`/${INV_ID}`, { method: 'DELETE' });
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.data.ok).toBe(true);
     expect(svc.deleteDraftInvoice).toHaveBeenCalledWith(INV_ID, expect.anything());
+    expect(writeRouteAudit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      orgId: ORG_ID, action: 'invoice.delete', resourceType: 'invoice', resourceId: INV_ID,
+    }));
   });
 
   it('maps an InvoiceServiceError to its status (NOTHING_TO_INVOICE → 409)', async () => {
@@ -214,6 +269,44 @@ describe('invoice crud + lines routes', () => {
     expect(res.status).toBe(409);
     const body = await res.json();
     expect(body.code).toBe('NOTHING_TO_INVOICE');
+  });
+});
+
+describe('POST /:id/refresh-time-lines (#8606)', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('refreshes the draft, returns the per-line outcome and audits the counts', async () => {
+    const result = {
+      invoiceId: INV_ID, orgId: ORG_ID,
+      summary: { refreshed: 1, unchanged: 0, skipped: 1, quantityDrifted: 0 },
+      lines: [
+        { lineId: 'l1', status: 'refreshed', changed: ['description'] },
+        { lineId: 'l2', status: 'skipped', reason: 'billed_elsewhere' },
+      ],
+    };
+    (svc.refreshDraftTimeLines as any).mockResolvedValue(result);
+    const res = await app().request(`/${INV_ID}/refresh-time-lines`, { method: 'POST' });
+    expect(res.status).toBe(200);
+    expect((await res.json()).data).toEqual(result);
+    expect(svc.refreshDraftTimeLines).toHaveBeenCalledWith(INV_ID, expect.objectContaining({ userId: 'u1', partnerId: 'p1' }));
+    expect(writeRouteAudit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      orgId: ORG_ID, action: 'invoice.time_lines.refreshed', resourceType: 'invoice', resourceId: INV_ID,
+      details: result.summary,
+    }));
+  });
+
+  it('maps a non-draft refusal to 409 NOT_A_DRAFT and writes no audit', async () => {
+    (svc.refreshDraftTimeLines as any).mockRejectedValue(new InvoiceServiceError('Invoice is not a draft', 409, 'NOT_A_DRAFT'));
+    const res = await app().request(`/${INV_ID}/refresh-time-lines`, { method: 'POST' });
+    expect(res.status).toBe(409);
+    expect((await res.json()).code).toBe('NOT_A_DRAFT');
+    expect(writeRouteAudit).not.toHaveBeenCalled();
+  });
+
+  it('rejects a non-UUID id with 400 and never calls the service', async () => {
+    const res = await app().request('/not-a-uuid/refresh-time-lines', { method: 'POST' });
+    expect(res.status).toBe(400);
+    expect(svc.refreshDraftTimeLines).not.toHaveBeenCalled();
   });
 });
 
@@ -693,5 +786,94 @@ describe('invoice assembly routes', () => {
     expect(res.status).toBe(409);
     const body = await res.json();
     expect(body.code).toBe('NOTHING_TO_INVOICE');
+  });
+});
+
+// Partner billing master switch (billing_enabled=false): gated operations answer
+// 404 { error: 'Not found', code: 'BILLING_DISABLED' }; reads and payments keep working.
+describe('billing master switch', () => {
+  const L = '44444444-4444-4444-4444-444444444444';
+  const off = () => new InvoiceServiceError('Not found', 404, 'BILLING_DISABLED');
+  const json = { 'content-type': 'application/json' };
+  const gatedServiceCalls: Array<[string, string, string, unknown, () => any]> = [
+    ['create', 'POST', '/', { orgId: ORG_ID }, () => svc.createManualInvoice],
+    ['edit', 'PATCH', `/${INV_ID}`, { notes: 'x' }, () => svc.updateInvoice],
+    ['delete', 'DELETE', `/${INV_ID}`, undefined, () => svc.deleteDraftInvoice],
+    ['add line', 'POST', `/${INV_ID}/lines`, { name: 'n', quantity: 1, unitPrice: 1, taxable: false }, () => svc.addManualLine],
+    ['add catalog line', 'POST', `/${INV_ID}/lines/catalog`, { catalogItemId: L, quantity: 1 }, () => svc.addCatalogLine],
+    ['add bundle line', 'POST', `/${INV_ID}/lines/bundle`, { bundleId: L, quantity: 1 }, () => svc.addBundleLine],
+    ['edit line', 'PATCH', `/${INV_ID}/lines/${L}`, { quantity: 2 }, () => svc.updateLine],
+    ['delete line', 'DELETE', `/${INV_ID}/lines/${L}`, undefined, () => svc.removeLine],
+    ['currency', 'POST', `/${INV_ID}/currency`, { currencyCode: 'EUR' }, () => svc.changeInvoiceCurrency],
+    ['due date', 'PATCH', `/${INV_ID}/due-date`, { dueDate: '2026-12-01' }, () => svc.updateIssuedDueDate],
+    ['refresh time lines', 'POST', `/${INV_ID}/refresh-time-lines`, undefined, () => svc.refreshDraftTimeLines],
+    ['issue', 'POST', `/${INV_ID}/issue`, undefined, () => svc.issueInvoice],
+    ['void', 'POST', `/${INV_ID}/void`, { reason: 'dup' }, () => svc.voidInvoice],
+  ];
+  beforeEach(() => vi.clearAllMocks());
+
+  it.each(gatedServiceCalls)('%s: service BILLING_DISABLED -> 404 body; resolves normally when on', async (_n, method, path, body, fn) => {
+    fn().mockRejectedValueOnce(off());
+    const init = { method, headers: json, body: body === undefined ? undefined : JSON.stringify(body) };
+    const res = await app().request(path, init);
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ error: 'Not found', code: 'BILLING_DISABLED' });
+    fn().mockResolvedValueOnce({ id: INV_ID, orgId: ORG_ID, invoice: {}, audit: {}, summary: {} });
+    expect((await app().request(path, init)).status).toBe(200);
+  });
+
+  it('assemble from org and from ticket -> 404 BILLING_DISABLED', async () => {
+    (svc.assembleDraftFromOrg as any).mockRejectedValueOnce(off());
+    const r1 = await invoiceAssemblyRoutes.request(`/orgs/${ORG_ID}/invoices/assemble`, {
+      method: 'POST', headers: json, body: JSON.stringify({ from: '2026-01-01', to: '2026-01-31' }),
+    });
+    expect(r1.status).toBe(404);
+    expect(await r1.json()).toEqual({ error: 'Not found', code: 'BILLING_DISABLED' });
+    (svc.assembleDraftFromTicket as any).mockRejectedValueOnce(off());
+    const r2 = await invoiceAssemblyRoutes.request(`/tickets/${TICKET_ID}/invoice`, { method: 'POST' });
+    expect(r2.status).toBe(404);
+    expect(await r2.json()).toEqual({ error: 'Not found', code: 'BILLING_DISABLED' });
+  });
+
+  it.each(['send', 'resend'])('POST /:id/%s -> 404 BEFORE the device-appendix write and before any email', async (op) => {
+    (assertInvoiceBillingEnabledById as any).mockRejectedValueOnce(off());
+    dbAppendixState.callOrder = [];
+    const res = await app().request(`/${INV_ID}/${op}`, {
+      method: 'POST', headers: json, body: JSON.stringify({ includeDeviceAppendix: true }),
+    });
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ error: 'Not found', code: 'BILLING_DISABLED' });
+    expect(dbAppendixState.callOrder).toEqual([]);
+    expect(pdfSvc.sendInvoiceEmail).not.toHaveBeenCalled();
+    expect(pdfSvc.resendInvoiceEmail).not.toHaveBeenCalled();
+  });
+
+  it.each(['GET', 'POST'])('public-link / reset-link (%s) -> 404 BILLING_DISABLED before any write', async (method) => {
+    const path = method === 'GET' ? `/${INV_ID}/public-link` : `/${INV_ID}/reset-link`;
+    // loadLinkableInvoice reads via the (chain-mocked) db; give it a row, then fail the gate.
+    const { db } = await import('../../db');
+    (db as any).limit.mockResolvedValueOnce([{ id: INV_ID, orgId: ORG_ID, siteId: null, status: 'sent' }]);
+    (assertInvoiceBillingEnabled as any).mockRejectedValueOnce(off());
+    dbAppendixState.callOrder = [];
+    const res = await app().request(path, { method });
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ error: 'Not found', code: 'BILLING_DISABLED' });
+    expect((db as any).delete).not.toHaveBeenCalled();
+    expect((db as any).update).not.toHaveBeenCalled();
+  });
+
+  it('kept operations work with billing off: GET /:id and record payment are never gated', async () => {
+    (assertInvoiceBillingEnabled as any).mockRejectedValue(off());
+    (assertInvoiceBillingEnabledById as any).mockRejectedValue(off());
+    (svc.getInvoice as any).mockResolvedValueOnce({ invoice: { id: INV_ID, orgId: ORG_ID }, lines: [] });
+    (brandingSvc.resolveInvoiceBranding as any).mockResolvedValueOnce({});
+    expect((await app().request(`/${INV_ID}`)).status).toBe(200);
+    (svc.recordPayment as any).mockResolvedValueOnce({ id: 'pay1' });
+    const pay = await app().request(`/${INV_ID}/payments`, {
+      method: 'POST', headers: json, body: JSON.stringify({ amount: 5, method: 'cash', paidAt: '2026-01-01T00:00:00Z' }),
+    });
+    expect(pay.status).not.toBe(404);
+    (assertInvoiceBillingEnabled as any).mockReset();
+    (assertInvoiceBillingEnabledById as any).mockReset();
   });
 });

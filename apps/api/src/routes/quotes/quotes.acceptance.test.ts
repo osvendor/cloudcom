@@ -5,6 +5,7 @@ vi.mock('../../services/quoteService', () => ({
   createQuote: vi.fn(),
   cloneQuote: vi.fn(),
   getQuote: vi.fn(),
+  refreshDraftQuoteTaxRate: vi.fn(async () => false),
   listQuotes: vi.fn(),
   updateQuote: vi.fn(),
   deleteDraftQuote: vi.fn(),
@@ -32,6 +33,7 @@ vi.mock('../../services/contractTemplateRender', () => ({
   renderContractBlocksForClient: vi.fn(async (blocks: unknown[]) => blocks),
   loadContractPdfInputs: vi.fn(async () => ({ contractRenderData: new Map(), uploads: [] })),
   loadContractBlockAuthoring: vi.fn(async () => new Map()),
+  resolveQuoteEditorAutoVariables: vi.fn(() => ({})),
   attachContractAuthoring: vi.fn((blocks: unknown[]) => blocks),
 }));
 

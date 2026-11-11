@@ -113,6 +113,7 @@ import type { AuthContext } from '../../middleware/auth';
 import { readAiKillState } from '../aiKillState';
 import { createActionIntent } from '../actionIntents/intentService';
 import { resolveEffectiveAgentSystem } from './effectivePolicy';
+import { isHumanAuthoritativeProvenance } from '../ticketProvenance';
 import { sanitizeSweepText } from './runnerPrompt';
 
 /**
@@ -177,7 +178,7 @@ function filterEligibleFields(
   function consider<T extends string>(key: (typeof TICKET_FIELD_KEYS)[number], field: TicketTriageFieldProposal<T> | undefined): void {
     if (!field) return;
     result.anyProposed = true;
-    if (fieldProvenance[key] === 'user') {
+    if (isHumanAuthoritativeProvenance(fieldProvenance[key])) {
       result.anyHumanSet = true;
       return;
     }
@@ -330,7 +331,10 @@ export async function persistTicketTriage(
   // file's header).
   candidates.push({
     slot: 'note',
-    toolInput: { action: 'comment', ticketId: run.ticketId, content: noteContent(proposal) },
+    // isPublic:false is truthful — the handler forces every agent comment
+    // private (aiToolsTicketing.ts addAiTriageNote) — and explicit, so the
+    // public-comment escalation (isInputAwareTier3, W02 #6756) never applies.
+    toolInput: { action: 'comment', ticketId: run.ticketId, content: noteContent(proposal), isPublic: false },
   });
 
   // 2. fields

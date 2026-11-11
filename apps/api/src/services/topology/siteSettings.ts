@@ -9,13 +9,18 @@ import { hasPermission } from '../permissions';
 import { hasSatisfiedMfa } from '../../middleware/auth';
 import { type TopologyRequestContext, topologyPermissionPairs } from './access';
 import { loadTopologyConfiguration } from './siteConfiguration';
-import { getTopologyCapabilities, loadTopologyFlags } from './flags';
-import { readLegacyImportCheckpoint } from './legacyImportState';
+import { getTopologyCapabilities, topologyInterfaceHealthExposed, topologyPhysicalExposed } from './flags';
+import { readLegacyImportBootstrapFailure, readLegacyImportCheckpoint } from './legacyImportState';
+import { loadTopologyAiFlagsAndReadiness } from './aiToolGate';
 export async function readTopologySiteSettings(
   ctx: TopologyRequestContext,
 ): Promise<TopologySiteSettings> {
   const snapshot = await loadTopologyConfiguration(ctx);
-  const flags = await loadTopologyFlags(ctx);
+  // M4-D4: AI readiness = server/provider/org AI policy. Review R1: flags and
+  // readiness are partner-axis reads the request's org-scoped context cannot
+  // see; they come from ONE combined read (at most one short partner-axis
+  // escape, #2822) rather than a flags escape plus a readiness escape.
+  const { flags, readiness: aiReadiness } = await loadTopologyAiFlagsAndReadiness(ctx);
   const [state] = await db
     .select({ effectiveSettings: topologySiteState.effectiveSettings })
     .from(topologySiteState)
@@ -26,9 +31,13 @@ export async function readTopologySiteSettings(
       ),
     )
     .limit(1);
-  const ready =
-    readLegacyImportCheckpoint(state?.effectiveSettings ?? {})?.status ===
-    'complete';
+  const effectiveSettings = state?.effectiveSettings ?? {};
+  const checkpoint = readLegacyImportCheckpoint(effectiveSettings);
+  // #7557: with no staged import, a recorded bootstrap failure is reported as
+  // such; a staged (retrying/draining) import is genuinely still preparing.
+  const ready: boolean | 'import_failed' = checkpoint?.status === 'complete'
+    ? true
+    : !checkpoint && readLegacyImportBootstrapFailure(effectiveSettings) ? 'import_failed' : false;
   const can = (capability: 'write' | 'execute' | 'configure') =>
     topologyPermissionPairs(capability).every(([resource, action]) =>
       hasPermission(ctx.permissions, resource, action),
@@ -40,15 +49,22 @@ export async function readTopologySiteSettings(
     capabilities: {
       ...getTopologyCapabilities(flags, ready, {
         collection: false,
-        physical: false,
-        interfaceHealth: false,
-        diagnostics: false,
-        ai: false,
-      }),
-      recurringMonitoring: {
-        available: false,
-        reason: 'recurring_monitoring_unavailable',
-      },
+        // D9: physical view = deployed capability (materialization && flag),
+        // independent of collector presence; coverage reports collectability.
+        physical: topologyPhysicalExposed(flags),
+        // M3 Task 11: port measurement is exposure-gated like physical; the
+        // history/link-health reads use the same predicate.
+        interfaceHealth: topologyInterfaceHealthExposed(flags),
+        // Per-origin eligibility is the collectors read's job; the site
+        // capability is the flag exposure (the run routes enforce the rest).
+        diagnostics: true,
+      }, aiReadiness.provider && aiReadiness.orgPolicy, aiReadiness.providerNotConfigured === true),
+      // M3 Task 7: recurring monitoring exists once diagnostics do; a policy
+      // still runs only after a human arms it (activation intent alone never).
+      recurringMonitoring:
+        flags.materialization && flags.diagnostics
+          ? { available: true, reason: null }
+          : { available: false, reason: 'recurring_monitoring_unavailable' },
     },
     permissions: {
       canEdit: can('write'),

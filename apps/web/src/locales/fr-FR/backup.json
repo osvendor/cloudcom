@@ -19,6 +19,7 @@
     "running": "En cours",
     "failed": "Échec",
     "completed": "Terminée",
+    "completedWithErrors": "Terminée avec des erreurs",
     "partial": "Partielle",
     "queued": "En file d’attente",
     "cancelled": "Annulé",
@@ -40,6 +41,7 @@
     "stalledTooltip": "Aucune donnée reçue depuis {{minutes}} min",
     "filesProgress": "{{done}} / {{total}} fichiers",
     "speedValue": "{{value}}/s",
+    "etaValue": "encore environ {{value}}",
     "created": "Création",
     "updated": "Mise à jour",
     "files": "Dossiers",
@@ -47,12 +49,13 @@
     "policyId": "Politique ID",
     "featureLinkId": "Lien de fonctionnalité ID",
     "errorLog": "Journal d’erreurs",
-    "savings": "{{protected}} protégés — {{uploaded}} téléversés",
     "errorCount_one": "{{count}} erreur",
     "errorCount_other": "{{count}} erreurs",
     "failedCount_one": "{{count}} en échec",
     "failedCount_other": "{{count}} en échec",
-    "failedFilesTooltip": "Fichiers en échec lors de cette sauvegarde"
+    "failedFilesTooltip": "Fichiers en échec lors de cette sauvegarde",
+    "filesNotBackedUp_one": "{{count}} fichier non sauvegardé",
+    "filesNotBackedUp_other": "{{count}} fichiers non sauvegardés"
   },
   "backupOverviewContent": {
     "noProviderTimelineAvailableYet": "Aucun délai de fournisseur n’est encore disponible.",
@@ -115,12 +118,14 @@
     "filesOk": "Dossiers OK",
     "filesFailed": "Échec des fichiers",
     "lowReadinessDevices": "Dispositifs de faible préparation",
-    "devicesScoringBelowThe85PointReadinessThreshold": "Les appareils obtiennent un score inférieur au seuil de préparation de 85 points.",
+    "lowReadinessDevicesDescription": "Appareils dont le score est inférieur au seuil de préparation de {{threshold}} points.",
     "allDevicesMeetTheReadinessThreshold": "Tous les appareils atteignent le seuil de préparation.",
     "score": "Partition",
     "estRto": "RTO estimé",
     "estRpo": "RPO estimé",
-    "riskFactors": "Facteurs de risque"
+    "riskFactors": "Facteurs de risque",
+    "reason": "Motif",
+    "noDevicesScoredYet": "Aucun appareil n’a encore de score de préparation."
   },
   "backupVerificationTab": {
     "loadingVerificationData": "Chargement des données de vérification...",
@@ -174,7 +179,9 @@
     "oneOrMoreVssWritersAreNotStable": "Un ou plusieurs rédacteurs VSS ne sont pas stables. Consultez les derniers écrits des auteurs avant la prochaine édition.",
     "vssUnprotectedVolumes": "Lu à partir du volume actif, et non d’une copie fantôme VSS : {{volumes}}. Les fichiers en cours d’utilisation sur ces volumes peuvent avoir été ignorés ou capturés dans un état incohérent.",
     "lastBackupFailed": "Échec de la dernière sauvegarde",
+    "lastBackupFailedWithCategory": "Échec de la dernière sauvegarde : {{category}}",
     "lastBackupCompletedWithWarnings": "Dernière sauvegarde terminée avec des avertissements",
+    "lastBackupCompletedWithErrors": "Dernière sauvegarde terminée avec des erreurs",
     "writer": "Écrivain",
     "state": "État",
     "noVssWriterDetailsWereReportedForThe": "Aucun détail de l’auteur VSS n’a été rapporté pour la dernière sauvegarde.",
@@ -213,10 +220,30 @@
     "created2": "Création",
     "expires2": "Expiration",
     "protection2": "Protection",
+    "integrity": "Intégrité",
     "hold": "Tiens",
     "standard": "Standard",
     "restorePointCount_one": "{{count}} point de restauration",
-    "restorePointCount_other": "{{count}} points de restauration"
+    "restorePointCount_other": "{{count}} points de restauration",
+    "activePhase": {
+      "waiting_for_device": "Envoyée à l'appareil, en attente de démarrage",
+      "queued_on_device": "En attente de la fin d'une autre sauvegarde sur cet appareil",
+      "resuming": "Reprise d’une sauvegarde interrompue",
+      "scanning": "Analyse des fichiers",
+      "backing_up": "Sauvegarde en cours"
+    },
+    "activeJobs": {
+      "title": "Sauvegarde en cours d’exécution",
+      "processedOfTotal": "{{done}} sur {{total}} traités",
+      "processed": "{{done}} traités",
+      "lastHeard": "Dernier signal de l'appareil : {{relative}}",
+      "mode": {
+        "file": "Sauvegarde de fichiers",
+        "system_image": "Sauvegarde d’image système",
+        "mssql": "Sauvegarde SQL Server",
+        "hyperv": "Sauvegarde Hyper-V"
+      }
+    }
   },
   "deviceVaultStatus": {
     "loadingVaultStatus": "Chargement de l’état du coffre...",
@@ -481,6 +508,22 @@
     "selectASnapshot": "Sélectionnez un instantané",
     "chooseTheRecoveryPointYouWantToRestore": "Choisissez le point de récupération à restaurer.",
     "noSnapshotsAvailable": "Aucune capture d’écran disponible.",
+    "device": "Appareil",
+    "selectADevice": "Sélectionnez un appareil",
+    "chooseTheDeviceToRestore": "Choisissez l’appareil dont vous voulez restaurer la sauvegarde.",
+    "deviceOption_one": "{{device}} ({{count}} instantané)",
+    "deviceOption_other": "{{device}} ({{count}} instantanés)",
+    "unknownDevice": "Appareil inconnu",
+    "reviewDevice": "Appareil : {{device}}",
+    "snapshotNeedsSecondFactor": "Second facteur requis",
+    "secondFactorNote": "Ce point de restauration n’est pas vérifié. Le démarrage de la restauration vous demandera de confirmer avec votre second facteur.",
+    "secondFactorNoteNotEnrolled": "Ce point de restauration n’est pas vérifié et vous n’avez aucun second facteur configuré. Le démarrage de la restauration en exigera un.",
+    "secondFactorSetUp": "Configurer l’authentification à deux facteurs",
+    "commandDetails": "Détails de la commande",
+    "copyCommandId": "Copier l’ID de la commande",
+    "commandIdCopied": "ID de la commande copié",
+    "commandIdCopyFailed": "Impossible de copier l’ID de la commande",
+    "carriedSnapshotUnavailable": "L’instantané avec lequel vous avez ouvert l’assistant n’est plus disponible. Choisissez un appareil et l’un de ses instantanés.",
     "selectRestoreType": "Sélectionner le type de restauration",
     "fullRestoresEverythingSelectiveRestoresSpecificFiles": "Restaure tout en complet, la sélective restaure des fichiers spécifiques.",
     "fullRestore": "Restauration complète",
@@ -491,9 +534,9 @@
     "chooseFilesToRestoreForSelectiveRecoveries": "Choisissez les fichiers à restaurer pour des récupérations sélectives.",
     "fullRestoreSelectedSkipThisStepToContinue": "Restauration complète sélectionnée. Saute cette étape pour continuer.",
     "destination": "Destination",
-    "restoreToTheOriginalLocationOrProvideAn": "Restaurez les fichiers à leur emplacement d’origine ou indiquez un autre chemin.",
-    "originalLocation": "Emplacement d’origine",
-    "restoreFilesInPlace": "Restaurez les fichiers à leur emplacement d’origine.",
+    "restoreToAStagingFolderOrProvideAn": "Restaurez dans un dossier de préparation sur l’appareil ou dans un chemin de votre choix.",
+    "stagingFolder": "Dossier de préparation sur l’appareil",
+    "stagingFolderHint": "Les fichiers sont placés dans le répertoire temporaire de l’appareil (breeze-restore) ; les originaux ne sont jamais écrasés.",
     "alternatePath": "Chemin alternatif",
     "alternatePathPlaceholder": "p. ex. D:\\Restored ou /var/restore",
     "alternatePathRequired": "Saisissez un chemin de destination pour continuer.",
@@ -517,14 +560,38 @@
     "command": "Commandement :",
     "targetPath": "Chemin de la cible :",
     "completed": "Terminé :",
-    "resultPayload": "Charge utile résultante",
     "noRestoreHistoryYetStartARestoreTo": "Aucun historique de restauration pour l’instant. Commencez une restauration pour charger les détails des résultats en direct ici.",
     "recentRestoreHistory": "Historique récent de la restauration",
     "mostRecentRestoreJobsForThisOrganization": "Les travaux de restauration les plus récents pour cette organisation.",
     "noRestoreHistoryYet": "Aucun historique de restauration pour l’instant.",
-    "restore": "restaurer ·",
     "files2": "Fichiers :",
-    "size": "Taille :"
+    "size": "Taille :",
+    "filesSelected_one": "{{formatted}} fichier sélectionné",
+    "filesSelected_other": "{{formatted}} fichiers sélectionnés",
+    "folderFileCount_one": "{{formatted}} fichier",
+    "folderFileCount_other": "{{formatted}} fichiers",
+    "allFilesFromSnapshot": "Tous les fichiers de l'instantané",
+    "selectionFiles_one": "{{formatted}} fichier",
+    "selectionFiles_other": "{{formatted}} fichiers",
+    "selectionFolders_one": "{{formatted}} dossier",
+    "selectionFolders_other": "{{formatted}} dossiers",
+    "largeFolderSelectionTitle": "Sélection volumineuse",
+    "selectFolder": "Sélectionner le dossier {{name}}",
+    "confirmLargeFolderSelection": "Cette sélection couvre environ {{formatted}} fichiers et la restauration peut prendre du temps. Continuer ?",
+    "kindVm": "Restaurer en tant que VM",
+    "kindInstantBoot": "Démarrage instantané",
+    "kindSelective": "Restauration sélective",
+    "kindFull": "Restauration complète",
+    "kindRebuild": "Reconstruction en VHDX",
+    "restoreQueuedOnDevice": "Restauration mise en file d’attente sur {{device}}.",
+    "restoreStartedOnDevice": "Restauration démarrée sur {{device}}.",
+    "restoreQueued": "Restauration mise en file d’attente.",
+    "restoreStarted": "Restauration démarrée.",
+    "viewProgress": "Voir la progression",
+    "cancelRestore": "Annuler la restauration",
+    "cancellingRestore": "Annulation...",
+    "restoreCancelled": "Restauration annulée.",
+    "cancelRestoreFailed": "Impossible d’annuler la restauration."
   },
   "sLAConfigDialog": {
     "name": "Nom",
@@ -583,6 +650,7 @@
     "snapshotDetails": "Détails du instantané",
     "size": "Taille :",
     "files": "Fichiers :",
+    "location": "Emplacement :",
     "holdReason": "Maintenez la raison :",
     "holdSource": "Source de maintien :",
     "enforcement": "Application de la stratégie :",
@@ -603,12 +671,30 @@
     "providerEnforcedImmutabilityCannotBeReleasedFromBreeze": "L’immutabilité imposée par le fournisseur ne peut pas être libérée de Breeze.",
     "fileTree": "Arbre de fichiers",
     "noFileTreeAvailable": "Aucun arbre de fichiers disponible.",
+    "fileIndexBuilding": "Préparation de la liste des fichiers de cet instantané. Cela peut prendre quelques minutes pour les sauvegardes volumineuses.",
+    "fileIndexUnavailable": "La liste des fichiers de cet instantané n’est pas disponible pour le moment. Vous pouvez tout de même restaurer l’instantané complet.",
+    "fileIndexIntegrityFailed": "Cet instantané a échoué à la vérification d’intégrité ; ses fichiers ne peuvent donc pas être affichés.",
+    "fileIndexDeviceLocal": "Cet instantané est stocké sur l’appareil et Breeze ne peut pas encore y lire sa liste de fichiers.",
+    "fileIndexRetry": "Réessayer",
+    "searchPlaceholder": "Rechercher des fichiers dans cet instantané",
+    "searchEmpty": "Aucun fichier ne correspond",
+    "searchTimeout": "La recherche a pris trop de temps. Réessayez.",
+    "browseTimeout": "L'affichage de ce dossier a pris trop de temps. Réessayez.",
+    "searchLoadMore": "Charger plus",
+    "searchRestoreFile": "Restaurer ce fichier",
+    "searchMinLength": "Saisissez au moins 2 caractères",
+    "searchLoading": "Recherche en cours…",
     "path": "Chemin :",
     "useTheRestoreWorkflowToRecoverOrExport": "Utilisez le flux de restauration pour récupérer ou exporter des fichiers à partir de cet instantané.",
     "select": "Sélectionner",
+    "folderFileCount_one": "{{count}} fichier",
+    "folderFileCount_other": "{{count}} fichiers",
+    "selectFolder": "Sélectionner le dossier {{name}}",
+    "confirmLargeFolderSelection": "Cette sélection couvre environ {{count}} fichiers et la restauration peut prendre du temps. Continuer ?",
     "name": "Nom",
     "size2": "Taille",
-    "modified": "Modifié"
+    "modified": "Modifié",
+    "noSnapshotsYetFilesAppearHere": "Aucun instantané pour le moment. Les fichiers apparaîtront ici une fois la première sauvegarde terminée."
   },
   "vMRestoreConfirmStep": {
     "reviewConfirm": "Vérifiez et confirmez",
@@ -622,8 +708,9 @@
     "mode": "Mode",
     "rebuildHost": "Hôte de reconstruction",
     "outputPath": "Chemin de sortie",
-    "rebuildEngine": "Moteur de reconstruction (Linux)",
-    "manualAttachNote": "Attachez le VHDX à une VM Hyper-V manuellement ; la création automatique de VM pour les invités Linux arrivera avec le moteur Windows.",
+    "rebuildEngine": "Moteur de reconstruction",
+    "manualAttachNote": "Attachez le VHDX à une VM Hyper-V manuellement. Breeze crée la VM pour vous uniquement lorsqu'un instantané Windows est reconstruit sur un hôte Windows avec un nom de VM renseigné.",
+    "hypervVmNote": "Breeze crée la VM Hyper-V « {{vmName}} » sur l'hôte de reconstruction dès que l'image est validée.",
     "newIdentityNote": "L'image reconstruite reçoit toujours une nouvelle identité de machine et ne reprend jamais l'identité de l'appareil d'origine."
   },
   "vMRestoreSpecsStep": {
@@ -641,7 +728,6 @@
     "chooseTheSnapshotToRestoreAsAVirtual": "Choisissez l’instantané à restaurer en tant que machine virtuelle.",
     "noSnapshotsAvailable": "Aucune capture d’écran disponible.",
     "cpu": "CPU",
-    "mb": "MB",
     "gb": "GB",
     "selectTargetHost": "Sélectionner l’hôte cible",
     "chooseAWindowsDeviceWithHyperVTo": "Choisissez un appareil Windows avec Hyper-V pour héberger la machine virtuelle.",
@@ -663,15 +749,31 @@
     "back": "Retour",
     "continue": "Continuer",
     "starting": "Commencer...",
-    "rebuildEngineLinux": "Moteur de reconstruction (Linux)",
-    "rebuildEngineDescription": "Reconstruit cet instantané de machine complète Linux en une image disque VHDX Hyper-V sur un appareil Linux exécutant l'assistant Breeze. L'image reçoit toujours une nouvelle identité de machine.",
-    "selectRebuildHost": "Sélectionner l'hôte de reconstruction Linux",
+    "rebuildEngineLinux": "Moteur de reconstruction",
+    "rebuildEngineDescription": "Reconstruit cet instantané de machine complète en une image disque VHDX Hyper-V sur un appareil de même plateforme exécutant l'assistant Breeze. L'image reçoit toujours une nouvelle identité de machine.",
+    "selectRebuildHost": "Sélectionner l'hôte de reconstruction",
     "chooseALinuxDeviceWithQemuUtils": "Choisissez un appareil Linux en ligne disposant de qemu-utils et d'un espace libre suffisant pour l'image.",
+    "chooseAWindowsRebuildHost": "Choisissez un appareil Windows en ligne exécutant l'assistant Breeze et disposant d'un espace libre suffisant pour l'image. Hyper-V n'est requis que pour créer la VM.",
     "outputPath": "Chemin de sortie",
     "outputPathHint": "Chemin absolu sur l'hôte de reconstruction se terminant par .vhdx.",
-    "outputPathInvalid": "Saisissez un chemin absolu se terminant par .vhdx.",
+    "outputPathInvalid": "Saisissez un chemin absolu adapté au système d'exploitation de l'hôte de reconstruction et se terminant par .vhdx (un chemin de lecteur comme C:\\ sous Windows, un chemin commençant par / sous Linux).",
+    "hypervOptional": "VM Hyper-V (facultatif)",
+    "hypervSpecsHint": "Saisissez un nom de VM pour que l'hôte de reconstruction crée la VM avec le processeur et la mémoire de l'étape Spécifications de la VM.",
+    "hypervVmName": "Nom de la VM",
+    "hypervVmNamePlaceholder": "ex. srv-01-restored",
+    "hypervSwitch": "Commutateur virtuel",
+    "hypervSwitchPlaceholder": "Laisser vide pour aucun adaptateur réseau",
+    "hypervNoNicHint": "Aucun commutateur sélectionné — la VM n'aura pas d'adaptateur réseau tant que vous n'en connectez pas un.",
     "startRebuild": "Lancer la reconstruction",
-    "rebuildStarted": "Reconstruction lancée. Le VHDX apparaîtra sur l'hôte de reconstruction une fois celle-ci terminée."
+    "rebuildStarted": "Reconstruction lancée. Le VHDX apparaîtra sur l'hôte de reconstruction une fois celle-ci terminée.",
+    "rebuildErrorNotRestorable": "Cet instantané ne peut pas être reconstruit : il n’est pas marqué comme restaurable en bare metal. Choisissez un instantané de machine complète marqué comme restaurable en bare metal, ou utilisez la restauration complète.",
+    "rebuildErrorNotRestorableReasons": "Cet instantané ne peut pas être reconstruit : {{reasons}}.",
+    "rebuildErrorHostUnsupported": "L’hôte de reconstruction doit exécuter le même système d’exploitation que l’instantané. Choisissez un autre hôte.",
+    "rebuildErrorRecoveryInProgress": "Une récupération bare metal est déjà en cours pour cet appareil. Attendez qu’elle se termine ou annulez-la, puis réessayez.",
+    "rebuildErrorSnapshotNotFound": "Cet instantané n’existe plus. Actualisez la page et choisissez un autre instantané.",
+    "rebuildErrorHostNotFound": "L’hôte de reconstruction sélectionné n’existe plus. Choisissez un autre hôte.",
+    "enterAVmNameToContinue": "Saisissez un nom de VM pour continuer.",
+    "enterAVmNameOnTheVmNameStep": "Saisissez un nom de VM à l’étape « Nom de la VM » pour lancer la restauration."
   },
   "vaultConfigDialog": {
     "device": "Dispositif",
@@ -681,7 +783,9 @@
     "vaultType": "Type de voûte",
     "retentionCount": "Nombre de rétentions",
     "numberOfSnapshotsToKeepInTheVault": "Nombre d’instantanés à conserver dans le coffre (1 à 100).",
-    "cancel": "Annuler"
+    "cancel": "Annuler",
+    "failedToSave": "Impossible d'enregistrer le coffre. Veuillez réessayer.",
+    "deviceConfigNotSent": "Coffre enregistré, mais sa configuration n'a pas pu être envoyée à l'appareil : {{error}}"
   },
   "vaultDashboard": {
     "loadingVaults": "Chargement des coffres...",
@@ -703,7 +807,12 @@
     "actions": "Actions",
     "sync": "Synchroniser",
     "edit": "Modifier",
-    "deactivate": "Désactiver"
+    "deactivate": "Désactiver",
+    "inactive": "Inactif",
+    "syncStarted": "Synchronisation du coffre démarrée",
+    "failedToSync": "Impossible de démarrer la synchronisation du coffre. Veuillez réessayer.",
+    "failedToDeactivate": "Impossible de désactiver le coffre. Veuillez réessayer.",
+    "deviceConfigNotSent": "Coffre enregistré, mais sa configuration n'a pas pu être envoyée à l'appareil : {{error}}"
   },
   "dRDashboard": {
     "loadingDisasterRecovery": "Chargement de la récupération après sinistre...",
@@ -817,7 +926,7 @@
     "uniqueDeviceCount_other": "{{count}} Appareils uniques",
     "chooseAStepTypeForEachGroup": "Choisissez un type d'étape pour chaque groupe de récupération.",
     "rebuildWaitTimeoutOutOfRange": "Le délai d'attente de la reconstruction bare-metal doit être un nombre entier compris entre {{min}} et {{max}} minutes.",
-    "rebuildOutputDirMustBeAbsolute": "Le répertoire de sortie de la reconstruction bare-metal doit être un chemin absolu commençant par « / » et comporter au plus {{max}} caractères.",
+    "rebuildOutputDirMustBeAbsolute": "Le répertoire de sortie de la reconstruction bare-metal doit être un chemin absolu (commençant par « / » ou par un lecteur Windows comme C:\\) et comporter au plus {{max}} caractères.",
     "partialSaveFailure": "Une partie de ce plan a été enregistrée avant l'erreur : le plan et la liste peuvent donc diverger. Corrigez le problème puis enregistrez de nouveau. Le serveur indique : {{message}}"
   },
   "dRPlanGroupCard": {
@@ -845,9 +954,13 @@
       "bareMetalRebuild": "Reconstruction bare-metal (moteur de reconstruction)"
     },
     "rebuildHost": "Hôte de reconstruction",
-    "rebuildHostHint": "Appareil Linux équipé de qemu-utils qui exécute les répétitions. En basculement, chaque appareil démarre plutôt sur le support de récupération.",
+    "rebuildHostHint": "Doit exécuter le même système d'exploitation que les appareils répétés ; Breeze refuse une paire incompatible au lancement. En basculement, chaque appareil démarre plutôt sur le support de récupération.",
+    "rebuildHostOs": "Système d'exploitation de l'hôte",
+    "rebuildHostOsLinux": "Hôtes Linux",
+    "rebuildHostOsWindows": "Hôtes Windows",
     "outputDir": "Répertoire de sortie",
-    "outputDirHint": "Répertoire sur l'hôte de reconstruction qui reçoit une image VHDX par appareil.",
+    "outputDirHint": "Répertoire sur l'hôte de reconstruction qui reçoit une image VHDX par appareil. Laissez vide pour utiliser la valeur par défaut de l'hôte.",
+    "outputDirOsMismatch": "Ce répertoire ne correspond pas au système d'exploitation de l'hôte : les hôtes Windows exigent un chemin de lecteur comme C:\\, les hôtes Linux un chemin commençant par /.",
     "waitTimeout": "Délai d'attente (min)",
     "waitTimeoutHint": "Minutes d'attente de l'enregistrement de chaque appareil avant l'échec de l'étape."
   },
@@ -950,6 +1063,8 @@
     "codeExpires": "Expire à {{time}}",
     "overdueNotice": "Aucune confirmation pour l'instant — consultez la console de récupération.",
     "fileIndexPreparing": "Préparation de l'index des fichiers pour les références inter-instantanés…",
+    "snapshotsLoadFailed": "Impossible de charger les instantanés. Rechargez la page pour réessayer.",
+    "noSnapshots": "Aucun instantané restaurable en bare-metal pour l'instant. Une sauvegarde complète de la machine marquée restaurable en bare-metal est requise.",
     "statusFailed": "Échec de la récupération",
     "statusRefused": "Récupération refusée",
     "status": {
@@ -959,7 +1074,224 @@
       "restoring": "Restauration en cours",
       "validated": "Validée",
       "rebooted": "Redémarrée",
-      "checked_in": "Confirmée"
+      "checked_in": "Confirmée",
+      "completed": "Terminé"
     }
+  },
+  "backupHealth": {
+    "title": "État des sauvegardes",
+    "subtitle": "Tous les appareils gérés par Breeze, ainsi que tout ce que remonte votre fournisseur de sauvegarde.",
+    "staleBanner": "Certaines données du fournisseur ne sont plus à jour. Voici le dernier état connu.",
+    "unmappedNotice": "{{value}} appareils appartiennent à des clients du fournisseur qui ne sont pas encore associés à une organisation Breeze.",
+    "statusTitle": "Statut",
+    "recencyTitle": "Dernière sauvegarde réussie",
+    "coverage": "{{covered}} des {{total}} postes ont une sauvegarde récente",
+    "definition": "« Récente » signifie une sauvegarde réussie au cours des 48 dernières heures. L’état d’un appareil reflète sa dernière exécution : il peut avoir une sauvegarde récente et afficher tout de même Critique si cette exécution a échoué.",
+    "providerOnly": "{{value}} postes connus du seul fournisseur",
+    "m365Accounts": "{{value}} comptes Microsoft 365",
+    "status": {
+      "no_backups": "Aucune sauvegarde",
+      "completed": "Terminée",
+      "completed_with_errors": "Terminée avec des erreurs",
+      "in_progress": "En cours",
+      "unsuccessful": "Sans succès",
+      "other": "Autre",
+      "failed": "Échec",
+      "interrupted": "Interrompue",
+      "over_quota": "Quota dépassé",
+      "no_selection": "Aucune sélection",
+      "not_started": "Non démarrée",
+      "unknown": "Inconnu",
+      "paused": "En pause"
+    },
+    "recency": {
+      "never": "Jamais",
+      "under_24h": "Moins de 24 heures",
+      "under_48h": "Moins de 48 heures",
+      "over_48h": "Plus de 48 heures"
+    },
+    "health": {
+      "healthy": "Correct",
+      "warning": "À surveiller",
+      "critical": "Critique",
+      "unknown": "Inconnu"
+    },
+    "osType": {
+      "workstation": "Poste de travail",
+      "server": "Serveur",
+      "unknown": "Inconnu"
+    },
+    "sourceAll": "Toutes les sources",
+    "healthAll": "Tous les états",
+    "sourceBreeze": "Breeze",
+    "searchPlaceholder": "Rechercher un appareil ou une organisation",
+    "includeWithoutBackup": "Inclure les appareils sans aucune sauvegarde",
+    "table": {
+      "device": "Appareil",
+      "computerName": "Nom de l'ordinateur",
+      "source": "Source",
+      "dataSources": "Sources de données",
+      "selected": "Sélectionné",
+      "used": "Utilisé",
+      "history": "28 derniers jours",
+      "errors": "Erreurs",
+      "verifiedBootable": "Démarrage vérifié",
+      "agent": "Agent"
+    },
+    "verifiedBootable": {
+      "passed": "Réussi",
+      "failed": "Échec",
+      "never_run": "Jamais exécuté",
+      "not_applicable": "s.o."
+    },
+    "dataSource": {
+      "files": "Fichiers et dossiers",
+      "system_state": "État du système",
+      "mssql": "SQL Server",
+      "hyperv": "Hyper-V",
+      "vmware": "VMware",
+      "bare_metal": "Bare metal",
+      "image": "Image disque",
+      "m365_mail": "Messagerie Microsoft 365",
+      "m365_sharepoint": "SharePoint",
+      "m365_exchange": "Exchange",
+      "m365_onedrive": "OneDrive",
+      "m365_teams": "Teams",
+      "gws_mail": "Messagerie Google Workspace",
+      "gws_drive": "Google Drive",
+      "gws_shared_drive": "Drive partagés Google",
+      "other": "Autre"
+    },
+    "noObservation": "Aucune observation",
+    "openDevice": "Ouvrir l'appareil",
+    "empty": "Aucun appareil ne correspond à ces filtres.",
+    "loadMore": "Charger plus",
+    "error": "Impossible de charger l'état des sauvegardes",
+    "external": {
+      "title": "Sauvegarde externe",
+      "customer": "Client du fournisseur",
+      "lastSuccess": "Dernière sauvegarde réussie",
+      "lastSession": "Dernière session",
+      "bootCheck": "Dernier test de démarrage",
+      "unlink": "Dissocier",
+      "unlinkConfirm": "Dissocier cet appareil du fournisseur de l'appareil Breeze ? Il reste dans le produit de sauvegarde et peut être réassocié.",
+      "unlinkedToast": "Appareil du fournisseur dissocié",
+      "errorUnlink": "Impossible de dissocier l'appareil du fournisseur",
+      "error": "Impossible de charger l'état de la sauvegarde externe",
+      "alsoCheck": "Vérifiez aussi les connexions de sauvegarde tierces dans Intégrations."
+    },
+    "saasAccountsSubtitle": "Microsoft 365 / Google Workspace",
+    "saas": "SaaS",
+    "saasAccounts": "{{value}} comptes SaaS",
+    "workloadBackup": "Sauvegarde de {{workload}}",
+    "sourceProvider": "Fournisseurs de sauvegarde"
+  },
+  "restoreResultNotices": {
+    "systemStateRequiresRebuildTitle": "L'état du système est appliqué par une reconstruction bare-metal",
+    "systemStateRequiresRebuildBody": "Cette récupération Windows n'a restauré que des fichiers. Pour appliquer l'état du système de l'instantané, lancez une reconstruction bare-metal de cet instantané (Restaurer en tant que VM, moteur de reconstruction).",
+    "unattestedSnapshot": "Instantané non attesté : les fichiers n'ont pas été vérifiés par rapport à une attestation d'instantané.",
+    "resultCode": "Code de résultat : {{code}}",
+    "restrictedDescriptors_one": "{{count}} élément restauré avec une liste d'accès restrictive",
+    "restrictedDescriptors_other": "{{count}} éléments restaurés avec une liste d'accès restrictive",
+    "restrictedDescriptorsBody": "Leurs autorisations enregistrées désignaient des comptes que cette machine ne reconnaît pas ou n'ont pas pu être lues ; seuls SYSTEM et les Administrateurs peuvent donc y accéder (propriétaire : Administrateurs). Vérifiez et réattribuez les autorisations si nécessaire.",
+    "restrictedDescriptorsShowPaths_one": "Afficher {{count}} chemin",
+    "restrictedDescriptorsShowPaths_other": "Afficher {{count}} chemins",
+    "restrictedDescriptorsUnlisted_one": "{{count}} autre élément n'est pas listé.",
+    "restrictedDescriptorsUnlisted_other": "{{count}} autres éléments ne sont pas listés."
+  },
+  "unattestedRestoreStepUp": {
+    "heading": "Confirmer cette restauration",
+    "introUnattested": "Cette sauvegarde n'a pas d'attestation d'intégrité : son contenu ne peut donc pas être vérifié par rapport à un enregistrement contrôlé avant sa restauration.",
+    "introProducerOnly": "Cette sauvegarde a été stockée à un emplacement où seul l'appareil d'origine peut vérifier son intégrité. La restaurer sur un autre appareil nécessite votre confirmation.",
+    "twoFactor": "Confirmez avec l'authentification à deux facteurs pour continuer.",
+    "confirmOnly": "Confirmez pour continuer. La restauration est consignée dans le journal d'audit.",
+    "code": "Code d'authentification",
+    "passkey": "Il vous sera demandé d'utiliser votre clé d'accès.",
+    "enrollIntro": "La confirmation de cette restauration nécessite un second facteur, et votre compte n'en a pas encore. Configurez une application d'authentification ou une clé d'accès dans votre profil, puis réessayez.",
+    "enrollIntroSmsOnly": "La confirmation de cette restauration nécessite une application d'authentification ou une clé d'accès. Votre compte n'a que des codes par SMS ; ajoutez-en une dans votre profil.",
+    "enrollLink": "Configurer l'authentification à deux facteurs",
+    "enrollStillRequired": "Votre compte n'a toujours pas de second facteur. Configurez-en un, puis réessayez.",
+    "enrollStillRequiredSmsOnly": "Votre compte n'a toujours pas d'application d'authentification ni de clé d'accès.",
+    "confirm": "Confirmer et restaurer",
+    "cancel": "Annuler",
+    "failed": "La vérification n'a pas été acceptée. Réessayez.",
+    "unavailable": "Impossible de démarrer la vérification. Réessayez."
+  },
+  "snapshotIntegrityBadge": {
+    "verified": "Vérifiée",
+    "checking": "Vérification en cours",
+    "unverified": "Non vérifiée",
+    "failed": "Échec du contrôle d'intégrité"
+  },
+  "reparseSkipNotice": {
+    "summary_one": "{{count}} point d'analyse ignoré : les jonctions et les points de montage ne sont ni suivis ni restaurés. C'est normal, ce n'est pas une erreur.",
+    "summary_other": "{{count}} points d'analyse ignorés : les jonctions et les points de montage ne sont ni suivis ni restaurés. C'est normal, ce n'est pas une erreur.",
+    "showDetails": "Afficher les chemins ignorés"
+  },
+  "failureCategory": {
+    "device_offline": {
+      "label": "Appareil hors ligne",
+      "hint": "L’appareil a perdu sa connexion à Breeze pendant la sauvegarde. Laissez-le allumé et en ligne pendant toute la fenêtre de sauvegarde."
+    },
+    "timeout": {
+      "label": "Bloquée ou délai dépassé",
+      "hint": "La sauvegarde a cessé de progresser ou a dépassé sa limite de temps. Les très grandes sauvegardes peuvent nécessiter plus d’une fenêtre. Vérifiez la charge de l’appareil et la taille de la sélection de sauvegarde."
+    },
+    "storage": {
+      "label": "Problème de stockage",
+      "hint": "Breeze n’a pas pu écrire dans la destination de sauvegarde, ou l’autorisation de téléversement a expiré. Testez la configuration du stockage et vérifiez ses identifiants et l’espace libre."
+    },
+    "agent": {
+      "label": "Problème d’agent",
+      "hint": "Le composant de sauvegarde de l’appareil s’est arrêté de façon inattendue. Mettez à jour l’agent et relancez la sauvegarde. Si le problème persiste, consultez les journaux de l’agent sur l’appareil."
+    },
+    "configuration": {
+      "label": "Problème de configuration",
+      "hint": "Il n’y avait rien de valide à sauvegarder, ou la configuration de sauvegarde a changé pendant le démarrage de la tâche. Vérifiez le profil de sauvegarde de l’appareil."
+    },
+    "source_access": {
+      "label": "Fichiers illisibles",
+      "hint": "Certains fichiers étaient verrouillés, en cours d’utilisation ou illisibles par l’agent. Vérifiez les fichiers listés ci-dessous et l’état de VSS."
+    },
+    "cancelled": {
+      "label": "Annulée",
+      "hint": "Arrêtée par un utilisateur, ou par Breeze, avant la fin."
+    },
+    "unknown": {
+      "label": "Autre erreur",
+      "hint": "Breeze ne reconnaît pas encore cette erreur. Le message complet est affiché ci-dessous."
+    },
+    "troubleshootingLink": "Guide de dépannage"
+  },
+  "fullRunReason": {
+    "no_prior_snapshot": "Première sauvegarde pour cet appareil et cette destination",
+    "base_expired": "La sauvegarde précédente avait expiré selon la rétention",
+    "storage_identity_changed": "La destination de sauvegarde a changé",
+    "backup_type_mismatch": "La sauvegarde précédente était d'un autre type",
+    "base_job_not_completed": "Aucune sauvegarde antérieure ne s'est terminée avec succès",
+    "base_retired": "La sauvegarde précédente a été supprimée par la rétention",
+    "base_retired_race": "La sauvegarde précédente a été supprimée par la rétention",
+    "base_deleted_race": "La sauvegarde précédente a été supprimée par la rétention",
+    "no_verified_base": "Aucune sauvegarde antérieure n'a réussi la vérification d'intégrité",
+    "key_root_changed": "Le dossier de destination (préfixe) a changé",
+    "base_key_root_unreadable": "L'emplacement de stockage de la sauvegarde précédente n'a pas pu être lu",
+    "invalid_destination_prefix": "Le préfixe de destination n'est pas valide",
+    "nothing_reused": "Une sauvegarde antérieure était disponible, mais aucun fichier inchangé n'a pu être réutilisé",
+    "unrecorded": "Raison non enregistrée (cette sauvegarde a eu lieu avant que Breeze ne la consigne)"
+  },
+  "jobDataSummary": {
+    "uploadedAndReused": "{{uploaded}} téléversés · {{reused}} réutilisés",
+    "processedBeforeStopped": "{{processed}} traités avant l'arrêt",
+    "full": "Complète",
+    "heading": "Ce que cette exécution a stocké",
+    "protected": "Protégés",
+    "uploadedThisRun": "Téléversés pendant cette exécution",
+    "reusedFromEarlier": "Réutilisés à partir de sauvegardes antérieures",
+    "backupType": "Type de sauvegarde",
+    "incremental": "Incrémentielle",
+    "fullWithReason": "Complète : {{reason}}",
+    "explainer": "Seuls les fichiers nouveaux ou modifiés sont téléversés. Les fichiers inchangés sont réutilisés à partir des sauvegardes antérieures de cet appareil vers la même destination.",
+    "learnMore": "Fonctionnement des sauvegardes incrémentielles",
+    "resumedAt": "Cette exécution a repris une sauvegarde interrompue le {{time}}."
   }
 }

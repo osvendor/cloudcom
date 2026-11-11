@@ -10,11 +10,13 @@ import {
 import {
   createManualInvoice, getInvoice, listInvoices, addManualLine, addCatalogLine, addBundleLine,
   updateLine, removeLine, deleteDraftInvoice, updateInvoice, updateIssuedDueDate,
-  changeInvoiceCurrency
+  changeInvoiceCurrency, refreshDraftTimeLines, getOwnedInvoiceOr404, requireInvoiceAccess
 } from '../../services/invoiceService';
+import { assembleCustomerInvoiceDocument } from '../../services/customerDocument';
 import { writeRouteAudit } from '../../services/auditEvents';
+import { auditBillingDocument } from '../../services/billingDocumentAudit';
 import { InvoiceServiceError, type InvoiceActor } from '../../services/invoiceTypes';
-import { resolveQuoteBranding } from '../../services/quoteBranding';
+import { resolveInvoiceBranding } from '../../services/quoteBranding';
 
 export const invoiceCrudRoutes = new Hono();
 const scopes = requireScope('partner', 'system');
@@ -55,8 +57,11 @@ invoiceCrudRoutes.get('/', scopes, readPerm, zValidator('query', listInvoicesQue
   catch (err) { return handleServiceError(c, err); }
 });
 invoiceCrudRoutes.post('/', scopes, writePerm, zValidator('json', createManualInvoiceSchema), async (c) => {
-  try { return c.json({ data: await createManualInvoice(c.req.valid('json'), invoiceActorFrom(c)) }); }
-  catch (err) { return handleServiceError(c, err); }
+  try {
+    const invoice = await createManualInvoice(c.req.valid('json'), invoiceActorFrom(c));
+    auditBillingDocument(c, 'invoice', 'create', invoice);
+    return c.json({ data: invoice });
+  } catch (err) { return handleServiceError(c, err); }
 });
 invoiceCrudRoutes.get('/:id', scopes, readPerm, zValidator('param', idParam), async (c) => {
   try {
@@ -64,13 +69,24 @@ invoiceCrudRoutes.get('/:id', scopes, readPerm, zValidator('param', idParam), as
     // Branding (partner name/logo, accent, seller, footer) lets the in-app Preview
     // render the customer-facing document without a second round-trip — the same
     // partner/portal source the invoice PDF resolves, so the two brand identically.
-    // Invoices are out of scope for the proposal presentation theme/pageSize work
-    // (Task 5) and must stay classic/a4 — pass presentationSnapshot: null so
-    // resolveQuoteBranding falls through to the partner's live columns/defaults
-    // exactly as it did before theme/pageSize existed (invoices never freeze a
-    // presentation snapshot; the field is simply ignored by every caller here).
-    const branding = await resolveQuoteBranding({ ...detail.invoice, presentationSnapshot: null });
+    // Theme / page size go through the ONE invoice presentation resolver
+    // (#6227): the invoice's issue-time snapshot, or the partner's live values
+    // for a draft — the same answer the public customer view gives.
+    const branding = await resolveInvoiceBranding(detail.invoice);
     return c.json({ data: { ...detail, branding } });
+  } catch (err) { return handleServiceError(c, err); }
+});
+// GET /:id/customer-view — the staff Preview's read of the CUSTOMER document
+// (#9402): exactly what the portal and the public link render, from the one
+// assembler. Same middleware and the same org + site ownership check as GET /:id,
+// so access is exactly "can read this invoice". Side-effect free: no markViewed,
+// no token minted or returned, no audit row (it reads what GET /:id already can).
+// Drafts are served (staff mode), previewing what issuing will freeze.
+invoiceCrudRoutes.get('/:id/customer-view', scopes, readPerm, zValidator('param', idParam), async (c) => {
+  try {
+    const inv = await getOwnedInvoiceOr404(c.req.valid('param').id);
+    requireInvoiceAccess(invoiceActorFrom(c), inv);
+    return c.json({ data: await assembleCustomerInvoiceDocument(inv, 'staff') });
   } catch (err) { return handleServiceError(c, err); }
 });
 invoiceCrudRoutes.patch('/:id', scopes, writePerm, zValidator('param', idParam), zValidator('json', updateInvoiceSchema), async (c) => {
@@ -78,7 +94,11 @@ invoiceCrudRoutes.patch('/:id', scopes, writePerm, zValidator('param', idParam),
   catch (err) { return handleServiceError(c, err); }
 });
 invoiceCrudRoutes.delete('/:id', scopes, writePerm, zValidator('param', idParam), async (c) => {
-  try { await deleteDraftInvoice(c.req.valid('param').id, invoiceActorFrom(c)); return c.json({ data: { ok: true } }); }
+  try {
+    const deleted = await deleteDraftInvoice(c.req.valid('param').id, invoiceActorFrom(c));
+    auditBillingDocument(c, 'invoice', 'delete', deleted);
+    return c.json({ data: { ok: true } });
+  }
   catch (err) { return handleServiceError(c, err); }
 });
 invoiceCrudRoutes.post('/:id/lines', scopes, writePerm, zValidator('param', idParam), zValidator('json', manualLineSchema), async (c) => {
@@ -116,6 +136,22 @@ invoiceCrudRoutes.patch('/:id/due-date', scopes, writePerm, zValidator('param', 
 invoiceCrudRoutes.patch('/:id/lines/:lineId', scopes, writePerm, zValidator('param', lineParam), zValidator('json', updateLineSchema), async (c) => {
   try { const p = c.req.valid('param'); return c.json({ data: await updateLine(p.id, p.lineId, c.req.valid('json'), invoiceActorFrom(c)) }); }
   catch (err) { return handleServiceError(c, err); }
+});
+// #8606: draft-only "Refresh from time entries". Re-reads each time-entry
+// line's source entry; never changes quantities, prices or totals. Returns the
+// per-line outcome (refreshed / unchanged / skipped + reason / quantityDrifted).
+invoiceCrudRoutes.post('/:id/refresh-time-lines', scopes, writePerm, zValidator('param', idParam), async (c) => {
+  try {
+    const result = await refreshDraftTimeLines(c.req.valid('param').id, invoiceActorFrom(c));
+    writeRouteAudit(c, {
+      orgId: result.orgId,
+      action: 'invoice.time_lines.refreshed',
+      resourceType: 'invoice',
+      resourceId: result.invoiceId,
+      details: { ...result.summary },
+    });
+    return c.json({ data: result });
+  } catch (err) { return handleServiceError(c, err); }
 });
 invoiceCrudRoutes.delete('/:id/lines/:lineId', scopes, writePerm, zValidator('param', lineParam), async (c) => {
   try { const p = c.req.valid('param'); return c.json({ data: await removeLine(p.id, p.lineId, invoiceActorFrom(c)) }); }

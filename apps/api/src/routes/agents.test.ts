@@ -1,9 +1,19 @@
 import { createHash } from 'crypto';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { Hono } from 'hono';
+import { ERROR_CODES } from '@breeze/shared';
 import { agentRoutes } from './agents';
 
-vi.mock('../services', () => ({}));
+// Public download routes (routes/agents/download.ts) take their per-IP
+// limiter's Redis client from ../services and fail closed (503) without one.
+// services/aiAgent.ts (reached transitively) resolves session models through
+// the registry (W03 #7601); stub its DB adapters under this partial schema mock.
+vi.mock('../services/aiModels/sessionModel', () => ({ chooseSessionModel: vi.fn() }));
+vi.mock('../services/aiModels/candidateLoader', () => ({ readOrgPartnerId: vi.fn() }));
+
+vi.mock('../services', () => ({
+  getRedis: vi.fn(() => ({})),
+}));
 vi.mock('../services/redis', () => ({
   getRedis: vi.fn(() => ({
     multi: vi.fn(),
@@ -69,6 +79,11 @@ const defaultSelectChain = () => ({
   }))
 });
 
+// The heartbeat's own-row read is `.limit(1).for('no key update')` (#8318 §6.4,
+// selectOwnDeviceRowForUpdate); every other read awaits `.limit()` directly.
+const lockableRows = (rows: unknown) => Object.assign(Promise.resolve(rows), { for: vi.fn(() => Promise.resolve(rows)) });
+const lockableLimit = (rows: unknown) => vi.fn(() => lockableRows(rows));
+
 const defaultInsertChain = () => ({
   values: vi.fn(() => ({
     onConflictDoNothing: vi.fn(() => ({
@@ -96,6 +111,17 @@ function mockResolvedEnrollmentPartner(partnerId = 'partner-123') {
   } as any);
 }
 
+// Holding-org delivery eligibility is its own read, covered by the
+// helpers.filesystemAnalysis suite and parkedCommandDelivery.integration.test.ts;
+// kept out of this suite's ordered select queue.
+vi.mock('../services/unassignedPool/deliveryEligibility', async () => ({
+  ...(await vi.importActual<typeof import('../services/unassignedPool/deliveryEligibility')>(
+    '../services/unassignedPool/deliveryEligibility',
+  )),
+  isParkedDevice: vi.fn(async () => false),
+  assertCommandDeliverable: vi.fn(async () => undefined),
+}));
+
 vi.mock('../db', () => ({
   db: {
     select: vi.fn(() => defaultSelectChain()),
@@ -109,10 +135,26 @@ vi.mock('../db', () => ({
   withDbAccessContext: vi.fn(async (_ctx: any, fn: any) => fn()),
   withSystemDbAccessContext: vi.fn(async (fn: any) => fn()),
   runOutsideDbContext: vi.fn((fn: any) => fn()),
+  // #8053 W1a-1: DeferredCacheFills consults these.
+  hasDbAccessContext: () => false,
+  getCurrentDbAccessContext: () => ({ scope: 'system' }),
+  runAfterDbContextExit: (_label: string, work: () => unknown) => { work(); },
+  // #3530: the command-result route's CAS + persistence savepoint.
+  withDbTransaction: vi.fn(async (fn: any) => fn()),
   SYSTEM_DB_ACCESS_CONTEXT: { scope: 'system', orgId: null, accessibleOrgIds: null }
 }));
 
+// #9521: the enrollment transaction takes the org's partner-export lock via
+// tx.execute; the transaction mock here hands over the bare db mock, which has
+// no execute. The lock's own behaviour is covered by enrollment.test.ts and
+// enrollmentDeadlock.integration.test.ts.
+vi.mock('../db/partnerExportLock', () => ({
+  lockPartnerExportOrg: vi.fn(async () => undefined),
+}));
+
 vi.mock('../db/schema', () => ({
+  deviceReliability: { deviceId: 'deviceId', details: 'details', reliabilityScore: 'reliabilityScore', trendDirection: 'trendDirection' },
+  deviceReliabilityBaselines: { id: 'id', deviceId: 'deviceId', baselineAt: 'baselineAt', createdAt: 'createdAt', clearedAt: 'clearedAt', reason: 'reason', source: 'source' },
   devices: {},
   deviceHardware: {},
   deviceNetwork: {},
@@ -213,6 +255,7 @@ vi.mock('../services/topology/flags', () => ({
 
 vi.mock('../services/sentry', () => ({
   captureException: vi.fn(),
+  captureMessage: vi.fn(),
 }));
 
 vi.mock('./backup/verificationService', () => ({
@@ -249,6 +292,7 @@ vi.mock('../middleware/auth', () => ({
 vi.mock('../middleware/agentAuth', () => ({
   agentAuthMiddleware: vi.fn((c: any, next: any) => {
     c.set('agent', {
+      installIncarnation: 1,
       deviceId: 'device-123',
       agentId: 'agent-123',
       orgId: 'org-123',
@@ -264,7 +308,7 @@ vi.mock('../services/commandDispatch', () => ({
   claimPendingCommandsForDevice: vi.fn().mockResolvedValue([]),
 }));
 
-import { db, runOutsideDbContext, withSystemDbAccessContext } from '../db';
+import { db, runOutsideDbContext, withDbTransaction, withSystemDbAccessContext } from '../db';
 import {
   devices as devicesTable,
   automationPolicies as automationPoliciesTable,
@@ -274,12 +318,14 @@ import { queueCommandForExecution } from '../services/commandQueue';
 import { processBackupVerificationResult } from './backup/verificationService';
 import { claimPendingCommandsForDevice } from '../services/commandDispatch';
 import { agentAuthMiddleware } from '../middleware/agentAuth';
+import { __resetHotPathCachesForTests } from '../services/hotPathCacheRegistry';
 
 describe('agent routes', () => {
   let app: Hono;
 
   beforeEach(() => {
     vi.clearAllMocks();
+    __resetHotPathCachesForTests(); // per-org heartbeat caches (#8053)
     // Reset db mock implementations to factory defaults (clearAllMocks doesn't reset mockReturnValue)
     vi.mocked(db.select).mockImplementation(() => defaultSelectChain() as any);
     vi.mocked(db.insert).mockImplementation(() => defaultInsertChain() as any);
@@ -778,7 +824,7 @@ describe('agent routes', () => {
       vi.mocked(db.select).mockReturnValueOnce({
         from: vi.fn().mockReturnValue({
           where: vi.fn().mockReturnValue({
-            limit: vi.fn().mockResolvedValue([{
+            limit: lockableLimit([{
               id: 'device-123',
               agentId: 'agent-123',
               orgId: 'org-123'
@@ -799,7 +845,7 @@ describe('agent routes', () => {
 
       expect(res.status).toBe(401);
       const body = await res.json() as { code?: string; expected?: string; declared?: string };
-      expect(body.code).toBe('re_enrollment_required');
+      expect(body.code).toBe(ERROR_CODES.RE_ENROLLMENT_REQUIRED);
       expect(body.expected).toBe('agent');
       expect(body.declared).toBe('watchdog');
       expect(claimPendingCommandsForDevice).not.toHaveBeenCalled();
@@ -810,7 +856,7 @@ describe('agent routes', () => {
         .mockReturnValueOnce({
           from: vi.fn().mockReturnValue({
             where: vi.fn().mockReturnValue({
-              limit: vi.fn().mockResolvedValue([{
+              limit: lockableLimit([{
                 id: 'device-123',
                 agentId: 'agent-123'
               }])
@@ -884,9 +930,9 @@ describe('agent routes', () => {
       // resolvers await it directly).
       const rowsChain = (rows: unknown[]) => ({
         where: vi.fn(() => Object.assign(Promise.resolve(rows), {
-          limit: vi.fn(() => Promise.resolve(rows)),
+          limit: vi.fn(() => lockableRows(rows)),
           orderBy: vi.fn(() => Object.assign(Promise.resolve(rows), {
-            limit: vi.fn(() => Promise.resolve(rows))
+            limit: vi.fn(() => lockableRows(rows))
           }))
         }))
       });
@@ -959,11 +1005,13 @@ describe('agent routes', () => {
       const body = await res.json();
       expect(body.configUpdate).toEqual({
         backup_server_url: '',
+        ech_enabled: true,
         event_log_settings: {
           max_events_per_cycle: 100,
           collect_categories: ['security', 'hardware', 'application', 'system'],
           minimum_level: 'info',
           collection_interval_minutes: 15,
+          application_providers: [],
         },
         policy_registry_state_probes: [
           { registry_path: 'HKLM\\SOFTWARE\\Policies\\Alpha', value_name: 'Flag' },
@@ -973,6 +1021,8 @@ describe('agent routes', () => {
           { file_path: '/etc/ssh/sshd_config', config_key: 'PermitRootLogin' }
         ],
         patch_source_settings: { exclusiveWindowsUpdate: false },
+        feature_update_settings: { mode: 'block' },
+        hardware_monitoring_settings: { enabled: true, poll_interval_minutes: 10, disk_health_interval_minutes: 60 },
         // #5511 W02: a resolved absent warranty policy delivers an explicit
         // false (the revoke-on-unassign contract), exactly like patch_source.
         warranty_settings: { hp_cmsl_enabled: false },
@@ -990,7 +1040,7 @@ describe('agent routes', () => {
       vi.mocked(db.select).mockReturnValue({
         from: vi.fn().mockReturnValue({
           where: vi.fn().mockReturnValue({
-            limit: vi.fn().mockResolvedValue([])
+            limit: lockableLimit([])
           })
         })
       } as any);
@@ -1019,7 +1069,7 @@ describe('agent routes', () => {
         .mockReturnValueOnce({
           from: vi.fn().mockReturnValue({
             where: vi.fn().mockReturnValue({
-              limit: vi.fn().mockResolvedValue([{
+              limit: lockableLimit([{
                 id: 'device-123',
                 agentId: 'agent-123',
                 orgId: 'org-123',
@@ -1032,7 +1082,7 @@ describe('agent routes', () => {
           from: vi.fn().mockReturnValue({
             where: vi.fn().mockReturnValue({
               orderBy: vi.fn().mockReturnValue({
-                limit: vi.fn().mockResolvedValue([])
+                limit: lockableLimit([])
               })
             })
           })
@@ -1041,7 +1091,7 @@ describe('agent routes', () => {
           from: vi.fn().mockReturnValue({
             where: vi.fn().mockReturnValue({
               orderBy: vi.fn().mockReturnValue({
-                limit: vi.fn().mockResolvedValue([])
+                limit: lockableLimit([])
               })
             })
           })
@@ -1086,15 +1136,19 @@ describe('agent routes', () => {
       expect(body.commands[0].type).toBe('filesystem_analysis');
       expect(body.configUpdate).toEqual({
         backup_server_url: '',
+        ech_enabled: true,
         event_log_settings: {
           max_events_per_cycle: 100,
           collect_categories: ['security', 'hardware', 'application', 'system'],
           minimum_level: 'info',
           collection_interval_minutes: 15,
+          application_providers: [],
         },
         policy_registry_state_probes: [],
         policy_config_state_probes: [],
         patch_source_settings: { exclusiveWindowsUpdate: false },
+        feature_update_settings: { mode: 'block' },
+        hardware_monitoring_settings: { enabled: true, poll_interval_minutes: 10, disk_health_interval_minutes: 60 },
         warranty_settings: { hp_cmsl_enabled: false },
         require_manifest_signing_key_id: false
       });
@@ -1146,6 +1200,7 @@ describe('agent routes', () => {
     it('rejects a watchdog credential through the primary-agent role gate', async () => {
       vi.mocked(agentAuthMiddleware).mockImplementationOnce((c: any, next: any) => {
         c.set('agent', {
+          installIncarnation: 1,
           deviceId: 'device-123',
           agentId: 'agent-123',
           orgId: 'org-123',
@@ -1443,15 +1498,17 @@ describe('agent routes', () => {
       });
 
       expect(res.status).toBe(200);
-      // runOutsideDbContext is called 3 times: command lookup, command update, and audit policy queueing
-      expect(vi.mocked(runOutsideDbContext)).toHaveBeenCalledTimes(3);
-      // withSystemDbAccessContext is called twice: once by the pre-existing
-      // path, and once wrapping the terminal device_commands compare-and-set.
-      // That second call is the #1375 fix (Sentry BREEZE-7) — this route is the
-      // REST twin of agentWs.processCommandResult and was writing
-      // device_commands with no access context. The count is load-bearing:
-      // dropping back to 1 means the write went contextless again.
-      expect(vi.mocked(withSystemDbAccessContext)).toHaveBeenCalledTimes(2);
+      // runOutsideDbContext is called twice: the command lookup and the
+      // audit-policy re-collect enqueue. #3530 moved the terminal
+      // device_commands compare-and-set off its own outside+system transaction
+      // and into the request-context savepoint it shares with the per-type
+      // persistence (withDbTransaction) — still an explicit context, so the
+      // #1375 invariant (no contextless device_commands write) holds.
+      expect(vi.mocked(runOutsideDbContext)).toHaveBeenCalledTimes(2);
+      expect(vi.mocked(withDbTransaction)).toHaveBeenCalledTimes(1);
+      // The follow-up enqueue still escapes the request transaction into its
+      // own system context so the new row commits before the agent can answer.
+      expect(vi.mocked(withSystemDbAccessContext)).toHaveBeenCalledTimes(1);
       expect(vi.mocked(queueCommandForExecution)).toHaveBeenCalledWith(
         'device-123',
         'collect_audit_policy',

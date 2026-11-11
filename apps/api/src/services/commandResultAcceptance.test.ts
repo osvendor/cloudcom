@@ -7,6 +7,8 @@ import {
   SERVER_TIMEOUT_RESULT_STATUS,
   BACKUP_QUEUE_ACK_RESULT_STATUS,
   TIMEOUT_REOPEN_EXCLUDED_COMMAND_TYPES,
+  RESULT_PROCESSING_FAILED_RESULT_STATUS,
+  RESULT_PROCESSING_FAILED_REOPEN_EXCLUDED_COMMAND_TYPES,
 } from './commandResultAcceptance';
 import { QUEUED_BACKUP_WORKLOAD_COMMAND_TYPES } from './commandTypes';
 
@@ -32,6 +34,7 @@ describe('commandAcceptsAgentResult (#3607)', () => {
       commandAcceptsAgentResult('failed', {
         status: SERVER_TIMEOUT_RESULT_STATUS,
         error: 'Command timed out after 60000ms',
+        timedOutBy: 'server',
       }),
     ).toBe(true);
 
@@ -43,6 +46,34 @@ describe('commandAcceptsAgentResult (#3607)', () => {
         timedOutBy: 'server',
       }),
     ).toBe(true);
+
+    // …and what routes/backup/verificationScheduled.ts writes — a different
+    // literal `timedOutBy` value than 'server', which is why the predicate
+    // checks the key's presence rather than one specific string.
+    expect(
+      commandAcceptsAgentResult('failed', {
+        status: SERVER_TIMEOUT_RESULT_STATUS,
+        error: 'Verification timed out after 30 minutes',
+        timedOutBy: 'verification-timeout-check',
+      }),
+    ).toBe(true);
+  });
+
+  // SEC follow-up: buildStoredCommandResult never copies `timedOutBy` from the
+  // agent's own payload — the marker is only ever set by a server-side
+  // writer. A stored row whose status collides with the server's own
+  // SERVER_TIMEOUT_RESULT_STATUS literal but carries no marker cannot have
+  // come from one of the three legitimate writers, so it must not be
+  // reopenable — otherwise an agent could report its OWN `status:'timeout'`
+  // (a value commandResultSchema allows) and keep that row reopenable
+  // indefinitely for a later result.
+  it('rejects a stored timeout status with no server timedOutBy marker', () => {
+    expect(
+      commandAcceptsAgentResult('failed', {
+        status: SERVER_TIMEOUT_RESULT_STATUS,
+        error: 'Agent reported a timeout',
+      }),
+    ).toBe(false);
   });
 
   it('rejects an agent-reported failure so a duplicate frame cannot rewrite it', () => {
@@ -130,15 +161,23 @@ describe('commandAcceptsAgentResultCondition (#3607)', () => {
     // the bound-parameter check is what proves every discriminator is bound,
     // not string-interpolated.
     const { sql: text, params } = new PgDialect().sqlToQuery(
-      commandAcceptsAgentResultCondition(),
+      commandAcceptsAgentResultCondition({ installIncarnation: 4 }),
     );
 
     expect(text).toContain('"status" in');
     expect(text).toContain(`"result"->>'status' =`);
+    expect(text).toContain(`"result"->>'timedOutBy' IS NOT NULL`);
     expect(text).toContain('"type" in');
     expect(text).toContain(' or ');
-    // Every literal rides as a placeholder, in predicate order.
+    // #8318 §6.4: both incarnation halves lead — the device's current one
+    // (the SECURITY DEFINER resolver) and the caller's, bound as a parameter.
+    expect(text).toContain('public.breeze_device_command_incarnation_is_current(');
+    expect(text).toContain('COALESCE("device_commands"."device_incarnation", 1) = ');
+    // The timedOutBy existence check carries no literal — no agent-supplied
+    // value is ever bound for it.
+    // Every OTHER literal rides as a placeholder, in predicate order.
     expect(params).toEqual([
+      4,
       ...ACCEPTED_COMMAND_RESULT_STATUSES,
       'failed',
       ...TIMEOUT_REOPEN_EXCLUDED_COMMAND_TYPES,
@@ -146,8 +185,54 @@ describe('commandAcceptsAgentResultCondition (#3607)', () => {
       'completed',
       ...QUEUED_BACKUP_WORKLOAD_COMMAND_TYPES,
       BACKUP_QUEUE_ACK_RESULT_STATUS,
+      'failed',
+      ...RESULT_PROCESSING_FAILED_REOPEN_EXCLUDED_COMMAND_TYPES,
+      RESULT_PROCESSING_FAILED_RESULT_STATUS,
     ]);
+    expect(text).toContain(`"result"->>'processingFailedAt' IS NOT NULL`);
     expect(text).not.toContain(SERVER_TIMEOUT_RESULT_STATUS);
     expect(text).not.toContain(BACKUP_QUEUE_ACK_RESULT_STATUS);
+    expect(text).not.toContain(RESULT_PROCESSING_FAILED_RESULT_STATUS);
+  });
+});
+
+// #3530 — a result whose per-type persistence failed is rolled back and the
+// row parked as `failed` + this marker, so the history never reads
+// "completed" for a result that was not recorded, and a resubmitted result is
+// accepted and reprocessed instead of short-circuited as a duplicate.
+describe('result-processing-failed marker (#3530)', () => {
+  const marked = {
+    status: RESULT_PROCESSING_FAILED_RESULT_STATUS,
+    agentStatus: 'completed',
+    processingFailedAt: '2026-09-28T00:00:00.000Z',
+  };
+
+  it('reopens a row parked by a server-side processing failure, for any command type', () => {
+    expect(commandAcceptsAgentResult('failed', marked)).toBe(true);
+    expect(commandAcceptsAgentResult('failed', marked, 'script')).toBe(true);
+    expect(commandAcceptsAgentResult('failed', marked, 'backup_verify')).toBe(true);
+  });
+
+  it('requires the server-only processingFailedAt stamp, like timedOutBy', () => {
+    expect(
+      commandAcceptsAgentResult('failed', { status: RESULT_PROCESSING_FAILED_RESULT_STATUS }),
+    ).toBe(false);
+  });
+
+  it('never reopens a type whose command row must not be rewritten after it goes terminal', () => {
+    // network_diagnostic: plan authority lapses (same reason as the timeout
+    // exclusion). PAM: late evidence enters only the frozen PAM result
+    // transaction, never a rewrite of the command row.
+    for (const type of RESULT_PROCESSING_FAILED_REOPEN_EXCLUDED_COMMAND_TYPES) {
+      expect(commandAcceptsAgentResult('failed', marked, type)).toBe(false);
+    }
+    expect(RESULT_PROCESSING_FAILED_REOPEN_EXCLUDED_COMMAND_TYPES).toEqual(
+      expect.arrayContaining(['network_diagnostic', 'pam_apply_v2', 'pam_cleanup_v2']),
+    );
+  });
+
+  it('only reopens a failed row — never a completed one carrying the marker', () => {
+    expect(commandAcceptsAgentResult('completed', marked)).toBe(false);
+    expect(commandAcceptsAgentResult('cancelled', marked)).toBe(false);
   });
 });

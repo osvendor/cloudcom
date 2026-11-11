@@ -19,7 +19,8 @@ const authenticatorMock = vi.hoisted(() => ({
   getBatchApprovalAssertion: vi.fn(),
 }));
 
-vi.mock('../../stores/auth', () => ({ fetchWithAuth: vi.fn() }));
+// registerOrgIdProvider: orgStore (read by the approver-device notice) registers itself on import.
+vi.mock('../../stores/auth', () => ({ fetchWithAuth: vi.fn(), registerOrgIdProvider: vi.fn() }));
 // Resolved relative to THIS file (components/approvals/), the same module
 // runAction.ts reaches via '../components/shared/Toast' — matches the
 // established pattern (AiAgentGraduationPanel.test.tsx) for intercepting
@@ -39,6 +40,16 @@ vi.mock('@/hooks/useEventStream', () => ({
     subscribe: vi.fn(),
     unsubscribe: vi.fn(),
   }),
+}));
+// #9939: the always-allow graduation prefetch is gated on the policy-decide
+// flag (/config) and `ai_agents:read`. Both open here so the existing
+// always-allow cases keep exercising the prefetch; the closed gate is pinned
+// in ApprovalsInbox.requests.test.tsx.
+vi.mock('../../stores/featuresStore', () => ({
+  useAiAgentsPolicyDecideGate: () => ({ enabled: true, loaded: true }),
+}));
+vi.mock('@/lib/permissions', () => ({
+  usePermissions: () => ({ permissions: [], can: () => true }),
 }));
 vi.mock('@/lib/intentApprovals', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/lib/intentApprovals')>();
@@ -144,6 +155,39 @@ afterEach(() => {
 });
 
 describe('ApprovalsInbox', () => {
+  it('shows the platform-default approver-device notice to a partner without an explicit choice', async () => {
+    fetchMock.mockImplementation((async (url: string) => {
+      if (String(url).includes('/authenticator/policy')) {
+        return response({
+          policy: { floorOverrides: {}, requireEnrollment: null, enforceFrom: null },
+          effective: {
+            source: 'platform_default',
+            mode: 'grace',
+            requireEnrollment: true,
+            enforceFrom: '2026-11-05T00:00:00.000Z',
+            enforcedTiers: ['high', 'critical'],
+            defaultNotice: 'upcoming',
+          },
+          platformDefault: { enforceFrom: '2026-11-05T00:00:00.000Z', enforcedTiers: ['high', 'critical'] },
+        });
+      }
+      return response({ approvals: [pendingApproval], nextCursor: null });
+    }) as unknown as typeof fetchWithAuth);
+    render(<ApprovalsInbox />);
+    const notice = await screen.findByTestId('approver-assurance-default-notice');
+    expect(notice).toHaveAttribute('data-state', 'upcoming');
+  });
+
+  it('shows no approver-device notice when the policy cannot be read', async () => {
+    fetchMock.mockImplementation((async (url: string) => {
+      if (String(url).includes('/authenticator/policy')) return response({ error: 'Forbidden' }, false, 403);
+      return response({ approvals: [pendingApproval], nextCursor: null });
+    }) as unknown as typeof fetchWithAuth);
+    render(<ApprovalsInbox />);
+    await screen.findByTestId('approval-row-approval-1');
+    expect(screen.queryByTestId('approver-assurance-default-notice')).toBeNull();
+  });
+
   it('renders pending approval details', async () => {
     render(<ApprovalsInbox />);
 
@@ -151,6 +195,27 @@ describe('ApprovalsInbox', () => {
     expect(row).toHaveTextContent('Restart accounting server');
     expect(row).toHaveTextContent('Helpdesk Copilot');
     expect(row).toHaveTextContent(/high/i);
+  });
+
+  it('shows the flow context labels the server sends on a flow-origin card', async () => {
+    fetchMock.mockResolvedValue(
+      response({
+        approvals: [
+          {
+            ...pendingApproval,
+            requestingClientLabel: 'Flow Disk cleanup',
+            actionLabel: 'Step cleanup: run_script',
+            actionToolName: 'run_script',
+          },
+        ],
+        nextCursor: null,
+      }),
+    );
+    render(<ApprovalsInbox />);
+
+    const row = await screen.findByTestId('approval-row-approval-1');
+    expect(row).toHaveTextContent('Step cleanup: run_script');
+    expect(row).toHaveTextContent('Flow Disk cleanup');
   });
 
   it('marks an agent-originated approval with the agent badge and attribution', async () => {
@@ -262,6 +327,11 @@ describe('ApprovalsInbox', () => {
       expect(intentApprovalsMock.decide).toHaveBeenCalledWith(
         'approval-1',
         'approve',
+        undefined,
+        'four_eyes',
+        // The inbox shows its own "Approved {action} for {org}" toast, so the
+        // helper's generic one must be suppressed (#9658: two toasts per click).
+        { silentSuccess: true },
       ),
     );
   });
@@ -434,6 +504,22 @@ describe('ApprovalsInbox', () => {
     expect(navigateToMock).not.toHaveBeenCalled();
   });
 
+  it('shows a non-retryable, specific inline message for a 403 approver_scope_required refusal', async () => {
+    intentApprovalsMock.decide.mockRejectedValue(
+      new ActionError('Forbidden', 403, undefined, { error: 'approver_scope_required' }),
+    );
+    render(<ApprovalsInbox />);
+    await screen.findByTestId('approval-row-approval-1');
+
+    fireEvent.click(screen.getByTestId('approval-approve-approval-1'));
+
+    const error = await screen.findByTestId('approval-error-approval-1');
+    expect(error).not.toHaveTextContent(/could not be submitted/i);
+    expect(error).not.toHaveTextContent('approver_scope_required');
+    expect(error).toHaveTextContent(/partner-level approver/i);
+    expect(navigateToMock).not.toHaveBeenCalled();
+  });
+
   it('polls for approvals every 30 seconds as a fallback for a dead WebSocket', async () => {
     vi.useFakeTimers();
     render(<ApprovalsInbox />);
@@ -443,8 +529,12 @@ describe('ApprovalsInbox', () => {
     // — see loadApprovals' `withCount`. The org display name now rides on
     // each row's own server-resolved `orgName` field, so there is no
     // separate org-names lookup to count here.
+    // The approver-device notice reads /authenticator/policy once on mount;
+    // it is not part of the approvals poll, so count approvals calls only.
+    const approvalsCalls = () =>
+      fetchMock.mock.calls.filter(([url]) => !String(url).includes('/authenticator/policy')).length;
     await act(async () => {});
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(approvalsCalls()).toBe(2);
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(30_000);
@@ -452,7 +542,7 @@ describe('ApprovalsInbox', () => {
     // The poll is silent and intentionally skips the count refresh (see
     // `withCount` in loadApprovals), so it adds exactly ONE more call — the
     // list itself.
-    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(approvalsCalls()).toBe(3);
   });
 
   it('refreshes silently: no loading spinner while re-fetching an already-loaded list', async () => {
@@ -508,7 +598,7 @@ describe('ApprovalsInbox — grouped agent cards and batch decisions', () => {
       'Approve all (2)',
     );
     expect(screen.getByTestId(`approval-group-decline-${GROUP_KEY}`)).toHaveTextContent(
-      'Decline all (2)',
+      'Deny all (2)',
     );
   });
 
@@ -1080,7 +1170,9 @@ describe('ApprovalsInbox — "Approve and always allow"', () => {
     fireEvent.click(await screen.findByTestId('approval-always-allow-confirm-ap-a'));
 
     await waitFor(() => expect(promoteCalls()).toHaveLength(1));
-    expect(intentApprovalsMock.decide).toHaveBeenCalledWith('ap-a', 'approve');
+    // The row's scope rides along: a supervised card must not be pushed onto
+    // the four-eyes passkey path by the always-allow flow.
+    expect(intentApprovalsMock.decide).toHaveBeenCalledWith('ap-a', 'approve', undefined, 'supervised');
 
     const decideOrder = intentApprovalsMock.decide.mock.invocationCallOrder[0];
     const promoteCallIndex = fetchMock.mock.calls.findIndex(([url]) =>
@@ -1159,6 +1251,27 @@ describe('ApprovalsInbox — "Approve and always allow"', () => {
     expect(promoteCalls()).toHaveLength(0);
     expect(showToastMock).not.toHaveBeenCalled();
     expect(screen.getByTestId('approval-row-ap-a')).toBeInTheDocument();
+  });
+
+  it('never promotes when decideIntentApproval returns refused — the approve did not take effect', async () => {
+    const removedOnApprove = new Set<string>();
+    routeGraduationAndBatch([agentCard('ap-a')], graduationDto([graduationRow('manage_patches:install')]), {
+      removedOnApprove,
+    });
+    intentApprovalsMock.decide.mockImplementation(async (id: string) => {
+      removedOnApprove.add(id);
+      return 'refused';
+    });
+    render(<ApprovalsInbox />);
+
+    fireEvent.click(await screen.findByTestId('approval-always-allow-ap-a'));
+    fireEvent.click(await screen.findByTestId('approval-always-allow-confirm-ap-a'));
+
+    // The request was decided (denied), so the card leaves the list …
+    await waitFor(() => expect(screen.queryByTestId('approval-row-ap-a')).not.toBeInTheDocument());
+    // … but nothing was approved, so there is nothing to always allow.
+    expect(promoteCalls()).toHaveLength(0);
+    expect(showToastMock).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'success' }));
   });
 
   it('hides the button and stays silent when the graduation fetch fails, without blocking Approve', async () => {
@@ -1393,6 +1506,25 @@ describe('ApprovalsInbox — organization identity, live expiry, paging, and cop
     );
   });
 
+  // The server can refuse an approve (the linked elevation's target could not
+  // be verified) and deny the request instead. decideIntentApproval has
+  // already shown that as an error with the reason; the inbox must not
+  // follow it with "Approved …".
+  it('never reports a refused approve as approved, and refreshes the list', async () => {
+    routeFull({ page1: [{ ...pendingApproval, orgName: 'Acme Dental' }] });
+    intentApprovalsMock.decide.mockResolvedValue('refused');
+    render(<ApprovalsInbox />);
+    await screen.findByTestId('approval-row-approval-1');
+    const listFetchesBefore = fetchMock.mock.calls.length;
+
+    fireEvent.click(screen.getByTestId('approval-approve-approval-1'));
+
+    await waitFor(() => expect(intentApprovalsMock.decide).toHaveBeenCalled());
+    // The decision is final (the request is denied), so the list reloads.
+    await waitFor(() => expect(fetchMock.mock.calls.length).toBeGreaterThan(listFetchesBefore));
+    expect(showToastMock).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'success' }));
+  });
+
   it('renders "Expires in under a minute" instead of a misleading unit below 60s', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-08-23T12:00:00.000Z'));
@@ -1577,7 +1709,7 @@ describe('ApprovalsInbox — batch scope naming (finding #2)', () => {
     fireEvent.click(screen.getByTestId(`approval-group-decline-${GROUP_KEY}`));
 
     expect(screen.getByTestId(`approval-group-deny-summary-${GROUP_KEY}`)).toHaveTextContent(
-      'This declines 2 requests for Acme Dental.',
+      'This denies 2 requests for Acme Dental.',
     );
   });
 });
@@ -1674,6 +1806,106 @@ describe('ApprovalsInbox — #intent-<id> deep link (sweep G2-4)', () => {
     expect(screen.queryByTestId('approval-intent-gone-notice')).not.toBeInTheDocument();
   });
 
+  const statusFetch = (approvals: unknown[], status: { code: number; payload: unknown }) => {
+    fetchMock.mockImplementation((async (url: string) => {
+      if (typeof url === 'string' && url.includes('/action-intents/')) {
+        return response(status.payload, status.code < 300, status.code);
+      }
+      return response({ approvals, nextCursor: null });
+    }) as unknown as typeof fetchWithAuth);
+  };
+  const statusCalls = () =>
+    fetchMock.mock.calls.filter(([url]) => String(url).includes('/action-intents/'));
+
+  it('shows a read-only status card from GET /status when the hashed intent is not in the loaded rows', async () => {
+    const intentId = '77777777-7777-4777-8777-777777777777';
+    statusFetch([pendingApproval], {
+      code: 200,
+      payload: {
+        id: intentId,
+        status: 'pending_approval',
+        actionLabel: 'manage_patches',
+        targetSummary: 'Install patches',
+        approvalScope: 'four_eyes',
+        requestingClientLabel: 'MCP · Claude Code',
+        expiresAt: '2026-10-23T00:00:00.000Z',
+        createdAt: '2026-10-22T00:00:00.000Z',
+      },
+    });
+    window.location.hash = `#intent-${intentId}`;
+
+    render(<ApprovalsInbox />);
+    const card = await screen.findByTestId('approval-intent-status-card');
+
+    expect(String(statusCalls()[0]?.[0])).toBe(`/action-intents/${intentId}/status`);
+    expect(card).toHaveTextContent('Pending approval');
+    expect(card).toHaveTextContent('manage_patches');
+    expect(card).toHaveTextContent('MCP · Claude Code');
+    expect(card).toHaveTextContent('Waiting for approvers');
+    expect(screen.queryByTestId('approval-intent-gone-notice')).not.toBeInTheDocument();
+  });
+
+  it('does not show the waiting line for a terminal status', async () => {
+    const intentId = '77777777-7777-4777-8777-777777777778';
+    statusFetch([pendingApproval], {
+      code: 200,
+      payload: {
+        id: intentId, status: 'completed', actionLabel: 'manage_patches', targetSummary: null,
+        approvalScope: 'supervised', requestingClientLabel: null,
+        expiresAt: '2026-10-23T00:00:00.000Z', createdAt: '2026-10-22T00:00:00.000Z',
+      },
+    });
+    window.location.hash = `#intent-${intentId}`;
+    render(<ApprovalsInbox />);
+    const card = await screen.findByTestId('approval-intent-status-card');
+    expect(card).toHaveTextContent('Completed');
+    expect(card).not.toHaveTextContent('Waiting for approvers');
+  });
+
+  it('keeps the gone notice on a 404 from GET /status, with no error toast', async () => {
+    const intentId = '88888888-8888-4888-8888-888888888888';
+    statusFetch([pendingApproval], { code: 404, payload: { error: 'not_found' } });
+    window.location.hash = `#intent-${intentId}`;
+
+    render(<ApprovalsInbox />);
+    expect(await screen.findByTestId('approval-intent-gone-notice')).toBeInTheDocument();
+    expect(screen.queryByTestId('approval-intent-status-card')).not.toBeInTheDocument();
+    expect(showToastMock).not.toHaveBeenCalled();
+  });
+
+  it('does not fetch the status when the hash matches a loaded row', async () => {
+    const intentId = '99999999-9999-4999-8999-999999999999';
+    statusFetch([{ ...pendingApproval, id: 'approval-1', intentId }], { code: 404, payload: {} });
+    window.location.hash = `#intent-${intentId}`;
+
+    render(<ApprovalsInbox />);
+    await screen.findByTestId('approval-row-approval-1');
+    expect(statusCalls()).toHaveLength(0);
+    expect(screen.queryByTestId('approval-intent-status-card')).not.toBeInTheDocument();
+  });
+
+  it('re-resolves when the hash changes after the list has loaded', async () => {
+    const first = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const second = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    statusFetch([{ ...pendingApproval, id: 'approval-1', intentId: first }], {
+      code: 200,
+      payload: {
+        id: second, status: 'failed', actionLabel: 'x', targetSummary: null, approvalScope: 'supervised',
+        requestingClientLabel: null, expiresAt: '2026-10-23T00:00:00.000Z', createdAt: '2026-10-22T00:00:00.000Z',
+      },
+    });
+    window.location.hash = `#intent-${first}`;
+    render(<ApprovalsInbox />);
+    await screen.findByTestId('approval-row-approval-1');
+    expect(statusCalls()).toHaveLength(0);
+
+    window.location.hash = `#intent-${second}`;
+    window.dispatchEvent(new HashChangeEvent('hashchange'));
+    const card = await screen.findByTestId('approval-intent-status-card');
+    expect(card).toHaveTextContent('Failed');
+    expect(String(statusCalls()[0]?.[0])).toBe(`/action-intents/${second}/status`);
+  });
+
   it('ignores a hash that does not name an intent', async () => {
     routeFetch([pendingApproval]);
     window.location.hash = '#something-else';
@@ -1716,5 +1948,84 @@ describe('ApprovalsInbox — expiry roll-up (sweep G2-10)', () => {
     await act(async () => {});
 
     expect(screen.getByTestId('approval-expiry-approval-1')).toHaveTextContent('Expires in 89 min');
+  });
+
+  // Mount assertion: a card only its own suite renders is not shipped. The
+  // plan must be on screen INLINE (no toggle) so an approver cannot sign a
+  // multi-effect identity plan without the list being visible.
+  const PLAN_ARGS = {
+    taskId: '00000000-0000-4000-8000-0000000000a1',
+    planRevision: 2,
+    effectSetDigest: 'a'.repeat(64),
+    effects: [
+      { ordinal: 0, provider: 'm365', toolName: 'm365_set_auto_reply', targetLabel: 'Dana Ruiz', principalLabel: 'dana@customer.example', rendering: 'Set an auto-reply' },
+      { ordinal: 1, provider: 'google', toolName: 'google_set_forwarding', targetLabel: 'Dana Ruiz', principalLabel: 'dana@customer.example', rendering: 'Forward Gmail' },
+      { ordinal: 2, provider: 'google', toolName: 'google_suspend_user', targetLabel: 'Dana Ruiz', principalLabel: 'dana@customer.example', rendering: 'Suspend account' },
+    ],
+  };
+
+  it('renders the operator plan card INSIDE the inbox for an operator_plan approval', async () => {
+    routeFetch([{ ...pendingApproval, actionToolName: 'operator_plan', actionArguments: PLAN_ARGS }]);
+    render(<ApprovalsInbox />);
+
+    expect(await screen.findByTestId(`approval-operator-plan-${pendingApproval.id}`)).toBeInTheDocument();
+    expect(screen.getAllByTestId(/^operator-plan-effect-/)).toHaveLength(3);
+  });
+
+  it('enables Approve for a valid operator_plan', async () => {
+    routeFetch([{ ...pendingApproval, actionToolName: 'operator_plan', actionArguments: PLAN_ARGS }]);
+    render(<ApprovalsInbox />);
+
+    expect(await screen.findByTestId(`approval-approve-${pendingApproval.id}`)).toBeEnabled();
+  });
+
+  it.each([
+    ['missing arguments', null],
+    ['malformed effects', { effects: 'nope' }],
+    ['a malformed entry', { effects: [{ ordinal: 0 }] }],
+    ['zero effects', { effects: [] }],
+  ])('disables Approve (deny stays enabled) for an unreadable operator_plan: %s', async (_name, args) => {
+    routeFetch([{ ...pendingApproval, actionToolName: 'operator_plan', actionArguments: args }]);
+    render(<ApprovalsInbox />);
+
+    expect(await screen.findByTestId(`approval-approve-${pendingApproval.id}`)).toBeDisabled();
+    expect(screen.getByTestId(`approval-deny-${pendingApproval.id}`)).toBeEnabled();
+  });
+
+  it('does NOT render the operator plan card for any other tool', async () => {
+    routeFetch([{ ...pendingApproval, actionToolName: 'run_script' }]);
+    render(<ApprovalsInbox />);
+
+    await screen.findByTestId(`approval-row-${pendingApproval.id}`);
+    expect(screen.queryByTestId(/^approval-operator-plan-/)).toBeNull();
+  });
+});
+
+describe('ApprovalsInbox deny reason disclosure (#8928)', () => {
+  it('tells the approver the reason is shown to the end user on a PAM (uac_intercept) card', async () => {
+    fetchMock.mockResolvedValue(
+      response({
+        approvals: [{ ...pendingApproval, actionToolName: 'uac_intercept', intentId: null }],
+        nextCursor: null,
+      }),
+    );
+    render(<ApprovalsInbox />);
+    await screen.findByTestId('approval-row-approval-1');
+
+    fireEvent.click(screen.getByTestId('approval-deny-approval-1'));
+    const hint = screen.getByTestId('approval-deny-reason-hint-approval-1');
+    expect(hint).toHaveTextContent(
+      'The end user sees this in their notification (first 500 characters).',
+    );
+    expect(screen.getByTestId('approval-deny-reason-approval-1').getAttribute('aria-describedby'))
+      .toContain(hint.id);
+  });
+
+  it('does not show the end-user hint on a non-PAM card', async () => {
+    render(<ApprovalsInbox />);
+    await screen.findByTestId('approval-row-approval-1');
+
+    fireEvent.click(screen.getByTestId('approval-deny-approval-1'));
+    expect(screen.queryByTestId('approval-deny-reason-hint-approval-1')).toBeNull();
   });
 });

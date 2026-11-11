@@ -11,6 +11,7 @@ const partnerWide: ConfigPolicy = {
   orgId: null,
   partnerId: '33333333-3333-3333-3333-333333333333',
   orgName: null,
+  hasPartnerWideAssignment: true,
 };
 
 const orgOwned: ConfigPolicy = {
@@ -21,6 +22,13 @@ const orgOwned: ConfigPolicy = {
   orgName: 'OliveTech',
 };
 
+describe('ConfigPolicyList status filter select accessible name (#7156)', () => {
+  it('gives the status filter select a real accessible name', () => {
+    render(<ConfigPolicyList policies={[]} />);
+    expect(screen.getByRole('combobox', { name: 'Status' })).toBeInTheDocument();
+  });
+});
+
 describe('ConfigPolicyList ownership badges', () => {
   it('shows the Partner-wide badge only on partner-wide policies', () => {
     render(<ConfigPolicyList policies={[partnerWide, orgOwned]} />);
@@ -28,6 +36,26 @@ describe('ConfigPolicyList ownership badges', () => {
     const badges = screen.getAllByTestId('partner-wide-badge');
     expect(badges).toHaveLength(1);
     expect(badges[0]).toHaveTextContent('Partner-wide');
+  });
+
+  // #9565: a partner-owned policy with no partner-level ("all organizations")
+  // assignment applies to no organization until it is assigned, so it must not
+  // claim to be partner-wide.
+  it('shows a neutral Partner badge, not Partner-wide, on an unassigned partner policy', () => {
+    render(<ConfigPolicyList policies={[{ ...partnerWide, hasPartnerWideAssignment: false }]} />);
+
+    expect(screen.queryByTestId('partner-wide-badge')).not.toBeInTheDocument();
+    const badge = screen.getByTestId('partner-policy-badge');
+    expect(badge).toHaveTextContent('Partner');
+    expect(badge).toHaveAttribute('title', expect.stringMatching(/only where it is assigned/i));
+  });
+
+  it('treats a missing assignment flag as not partner-wide (fail-closed)', () => {
+    const { hasPartnerWideAssignment: _omit, ...legacy } = partnerWide;
+    render(<ConfigPolicyList policies={[legacy]} />);
+
+    expect(screen.queryByTestId('partner-wide-badge')).not.toBeInTheDocument();
+    expect(screen.getByTestId('partner-policy-badge')).toBeInTheDocument();
   });
 
   it('shows an org badge with the owning org name on org-owned policies', () => {
@@ -65,7 +93,7 @@ describe('ConfigPolicyList Features column (#2950)', () => {
   const withLinks: ConfigPolicy = {
     ...orgOwned,
     featureLinks: [
-      { id: 'link-1', featureType: 'alert_rule' },
+      { id: 'link-1', featureType: 'monitors' },
       { id: 'link-2', featureType: 'onedrive_helper' },
     ],
   };
@@ -74,7 +102,7 @@ describe('ConfigPolicyList Features column (#2950)', () => {
     render(<ConfigPolicyList policies={[withLinks]} />);
 
     const badges = screen.getAllByTestId('config-policy-feature-badge');
-    expect(badges.map((b) => b.textContent)).toEqual(['Alerts', 'OneDrive Helper']);
+    expect(badges.map((b) => b.textContent)).toEqual(['Monitors', 'OneDrive Helper']);
     expect(screen.queryByTestId('config-policy-features-empty')).toBeNull();
   });
 

@@ -21,6 +21,9 @@ vi.mock('../../stores/auth', () => ({
   useAuthStore: vi.fn()
 }));
 
+let jwtClaims: { scope: string | null; orgId: string | null } = { scope: 'partner', orgId: null };
+vi.mock('../../lib/authScope', () => ({ getJwtClaims: () => jwtClaims }));
+
 vi.mock('../../stores/orgStore', () => ({
   useOrgStore: vi.fn()
 }));
@@ -46,6 +49,7 @@ describe('AdminSessionManager idle timeout source', () => {
   beforeEach(() => {
     vi.useFakeTimers();
     vi.clearAllMocks();
+    jwtClaims = { scope: 'partner', orgId: null };
     useAuthStoreMock.mockImplementation((selector: any) => selector({ isAuthenticated: true }));
     useOrgStoreMock.mockImplementation((selector: any) => selector({ currentOrgId: ORG_ID }));
   });
@@ -70,6 +74,32 @@ describe('AdminSessionManager idle timeout source', () => {
     );
     // It must NOT read the raw org record (that path misses partner defaults).
     expect(fetchWithAuthMock).not.toHaveBeenCalledWith(`/orgs/organizations/${ORG_ID}`);
+  });
+
+  it('org-scoped user with no org selected yet reads own org effective-settings, never partner-only /orgs/partners/me (#7498)', async () => {
+    jwtClaims = { scope: 'organization', orgId: 'org-own' };
+    useOrgStoreMock.mockImplementation((selector: any) => selector({ currentOrgId: null }));
+    fetchWithAuthMock.mockResolvedValue(
+      makeJsonResponse({ effective: { security: { sessionTimeout: 120 } }, locked: [] })
+    );
+
+    render(<AdminSessionManager />);
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(fetchWithAuthMock).toHaveBeenCalledWith('/orgs/organizations/org-own/effective-settings');
+    expect(fetchWithAuthMock).not.toHaveBeenCalledWith('/orgs/partners/me');
+  });
+
+  it('cold load with no token and unknown scope does not call partner-only /orgs/partners/me (#7498)', async () => {
+    jwtClaims = { scope: null, orgId: null };
+    useOrgStoreMock.mockImplementation((selector: any) => selector({ currentOrgId: null }));
+    render(<AdminSessionManager />);
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(fetchWithAuthMock).not.toHaveBeenCalledWith('/orgs/partners/me');
   });
 
   it('enforces a partner-level effective session timeout for idle logout', async () => {
@@ -188,6 +218,32 @@ describe('AdminSessionManager All Organizations mode (#2347)', () => {
       await Promise.resolve();
     });
     expect(apiLogoutMock).not.toHaveBeenCalled();
+  });
+
+  it('clamps a configured timeout above the 720-minute ceiling to 12 hours (#6111)', async () => {
+    fetchWithAuthMock.mockResolvedValue(
+      makeJsonResponse({ settings: { security: { sessionTimeout: 1440 } } })
+    );
+
+    render(<AdminSessionManager />);
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      vi.advanceTimersByTime(719 * 60_000);
+      await Promise.resolve();
+    });
+    expect(apiLogoutMock).not.toHaveBeenCalled();
+
+    await act(async () => {
+      vi.advanceTimersByTime(2 * 60_000);
+      await Promise.resolve();
+    });
+    expect(apiLogoutMock).toHaveBeenCalledTimes(1);
+    expect(handleSessionExpiredMock).toHaveBeenCalledWith('idle');
   });
 
   it('still logs out once the configured partner timeout elapses in All Organizations mode', async () => {

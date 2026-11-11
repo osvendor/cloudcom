@@ -4,12 +4,16 @@ import '@/lib/i18n';
 import { Plus, Pencil, Trash2, Search, Settings, ChevronDown, AlertCircle } from 'lucide-react';
 import { fetchWithAuth, useAuthStore } from '../../stores/auth';
 import { useOrgStore } from '../../stores/orgStore';
+import { FilterSelect } from '../shared/FilterSelect';
 import { getJwtClaims } from '../../lib/authScope';
 import { useDefaultOwnerScope, type OwnerScope } from '../../hooks/useDefaultOwnerScope';
 import type { CustomFieldDefinition, CustomFieldType, CustomFieldOptions } from '@breeze/shared';
 import { asList } from '@/lib/asList';
 import HelpTooltip from '../shared/HelpTooltip';
 import RmmCustomFieldImport from '../devices/RmmCustomFieldImport';
+import { useStableT } from '@/lib/i18n/useStableT';
+import { runAction, ActionError } from '@/lib/runAction';
+import { showToast } from '../shared/Toast';
 
 interface CustomField extends Omit<CustomFieldDefinition, 'createdAt' | 'updatedAt'> {
   createdAt: string | Date;
@@ -34,6 +38,7 @@ const DEVICE_TYPE_OPTIONS = [
 
 export default function CustomFieldsPage() {
   const { t } = useTranslation('settings');
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   const [fields, setFields] = useState<CustomField[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -56,7 +61,11 @@ export default function CustomFieldsPage() {
   const [formDefaultValue, setFormDefaultValue] = useState<unknown>(null);
   const [formDeviceTypes, setFormDeviceTypes] = useState<string[]>([]);
   const [formOptions, setFormOptions] = useState<CustomFieldOptions>({});
-  const [dropdownChoices, setDropdownChoices] = useState<Array<{ label: string; value: string }>>([]);
+  // `valueTouched`: Value was hand-edited (or loaded from a saved choice), so
+  // it stops following the Label (#9677).
+  const [dropdownChoices, setDropdownChoices] = useState<
+    Array<{ label: string; value: string; valueTouched?: boolean }>
+  >([]);
 
   // Partner-wide ownership (#2135 step 6). A partner-scope tech whose token
   // never resolved partner-wide capability (orgAccess='selected') got a 403
@@ -67,6 +76,10 @@ export default function CustomFieldsPage() {
   // matching the server (which still gates every write regardless).
   const { isPartnerScope, defaultOwnerScope } = useDefaultOwnerScope();
   const currentOrgId = useOrgStore((s) => s.currentOrgId);
+  const organizations = useOrgStore((s) => s.organizations);
+  // #7122: org names for the Organization column, so an org-owned field is
+  // attributable when several orgs' fields are listed together.
+  const orgNameById = new Map((organizations ?? []).map((o) => [o.id, o.name]));
   const canManagePartnerWide = useAuthStore((s) => s.user?.canManagePartnerWide) !== false;
   const showOwnerScope = isPartnerScope && canManagePartnerWide;
   const [formOwnerScope, setFormOwnerScope] = useState<OwnerScope>(defaultOwnerScope);
@@ -87,16 +100,16 @@ export default function CustomFieldsPage() {
 
       const response = await fetchWithAuth(`/custom-fields?${params.toString()}`);
       if (!response.ok) {
-        throw new Error(t('customFieldsPage.errors.fetch'));
+        throw new Error(stableT('customFieldsPage.errors.fetch'));
       }
       const data = await response.json();
       setFields(asList(data));
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('customFieldsPage.errors.fetch'));
+      setError(err instanceof Error ? err.message : stableT('customFieldsPage.errors.fetch'));
     } finally {
       setLoading(false);
     }
-  }, [typeFilter, searchQuery, t]);
+  }, [typeFilter, searchQuery, stableT]);
 
   useEffect(() => {
     fetchFields();
@@ -175,12 +188,16 @@ export default function CustomFieldsPage() {
   // (options.choices = dropdownChoices.filter(c => c.label && c.value) => []).
   const normalizeChoices = (
     raw: unknown
-  ): Array<{ label: string; value: string }> => {
+  ): Array<{ label: string; value: string; valueTouched: boolean }> => {
     if (!Array.isArray(raw)) return [];
     return raw.map((entry) =>
       typeof entry === 'string'
-        ? { label: entry, value: entry }
-        : { label: (entry as { label?: string })?.label ?? '', value: (entry as { value?: string })?.value ?? '' }
+        ? { label: entry, value: entry, valueTouched: true }
+        : {
+            label: (entry as { label?: string })?.label ?? '',
+            value: (entry as { value?: string })?.value ?? '',
+            valueTouched: true
+          }
     );
   };
 
@@ -216,10 +233,13 @@ export default function CustomFieldsPage() {
     updated[index] = {
       label: current?.label ?? '',
       value: current?.value ?? '',
+      valueTouched: current?.valueTouched ?? false,
       [field]: newValue
     };
-    // Auto-generate value from label if value is empty
-    if (field === 'label' && !updated[index].value) {
+    if (field === 'value') {
+      updated[index].valueTouched = true;
+    } else if (!updated[index].valueTouched) {
+      // Keep Value tracking the Label until the user edits Value by hand.
       updated[index].value = generateFieldKey(newValue);
     }
     setDropdownChoices(updated);
@@ -265,7 +285,9 @@ export default function CustomFieldsPage() {
     try {
       const options: CustomFieldOptions = {};
       if (formType === 'dropdown') {
-        options.choices = dropdownChoices.filter((c) => c.label && c.value);
+        options.choices = dropdownChoices
+          .filter((c) => c.label && c.value)
+          .map(({ label, value }) => ({ label, value }));
       }
       if (formType === 'number') {
         if (formOptions.min !== undefined) options.min = formOptions.min;
@@ -315,19 +337,21 @@ export default function CustomFieldsPage() {
         : '/custom-fields';
       const method = modalMode === 'edit' ? 'PATCH' : 'POST';
 
-      const response = await fetchWithAuth(url, {
-        method,
-        body: JSON.stringify(payload)
+      await runAction({
+        request: () => fetchWithAuth(url, { method, body: JSON.stringify(payload) }),
+        errorFallback: t('customFieldsPage.errors.save'),
+        successMessage: modalMode === 'edit'
+          ? t('customFieldsPage.toasts.updated')
+          : t('customFieldsPage.toasts.created'),
       });
-
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-        throw new Error(errorData.error || t('customFieldsPage.errors.save'));
-      }
 
       await fetchFields();
       handleCloseModal();
     } catch (err) {
+      if (err instanceof ActionError && err.status === 401) return;
+      if (!(err instanceof ActionError)) {
+        showToast({ type: 'error', message: err instanceof Error ? err.message : t('customFieldsPage.errors.save') });
+      }
       setFormError(err instanceof Error ? err.message : t('customFieldsPage.errors.save'));
     } finally {
       setSubmitting(false);
@@ -341,17 +365,19 @@ export default function CustomFieldsPage() {
     setFormError(null);
 
     try {
-      const response = await fetchWithAuth(`/custom-fields/${selectedField.id}`, {
-        method: 'DELETE'
+      await runAction({
+        request: () => fetchWithAuth(`/custom-fields/${selectedField.id}`, { method: 'DELETE' }),
+        errorFallback: t('customFieldsPage.errors.delete'),
+        successMessage: t('customFieldsPage.toasts.deleted'),
       });
-
-      if (!response.ok) {
-        throw new Error(t('customFieldsPage.errors.delete'));
-      }
 
       await fetchFields();
       handleCloseModal();
     } catch (err) {
+      if (err instanceof ActionError && err.status === 401) return;
+      if (!(err instanceof ActionError)) {
+        showToast({ type: 'error', message: err instanceof Error ? err.message : t('customFieldsPage.errors.delete') });
+      }
       setFormError(err instanceof Error ? err.message : t('customFieldsPage.errors.delete'));
     } finally {
       setSubmitting(false);
@@ -414,10 +440,11 @@ export default function CustomFieldsPage() {
             className="h-10 w-full rounded-md border bg-background pl-9 pr-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
           />
         </div>
-        <select
+        <FilterSelect
+          label={t('customFieldsPage.typeFilterLabel')}
           value={typeFilter}
           onChange={(e) => setTypeFilter(e.target.value as CustomFieldType | '')}
-          className="h-10 rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
+          className="h-10"
         >
           <option value="">{t('customFieldsPage.allTypes')}</option>
           {FIELD_TYPES.map((type) => (
@@ -425,7 +452,7 @@ export default function CustomFieldsPage() {
               {t(/* i18n-dynamic */ type.labelKey)}
             </option>
           ))}
-        </select>
+        </FilterSelect>
       </div>
 
       {filteredFields.length === 0 ? (
@@ -453,6 +480,7 @@ export default function CustomFieldsPage() {
             <thead className="bg-muted/40">
               <tr className="text-left text-xs font-semibold uppercase tracking-wide text-muted-foreground">
                 <th className="px-4 py-3">{t('common:labels.name')}</th>
+                {isPartnerScope && <th className="px-4 py-3">{t('common:labels.organization')}</th>}
                 <th className="px-4 py-3">{t('customFieldsPage.columns.key')}</th>
                 <th className="px-4 py-3">{t('common:labels.type')}</th>
                 <th className="px-4 py-3">{t('common:labels.required')}</th>
@@ -467,16 +495,15 @@ export default function CustomFieldsPage() {
                   <td className="px-4 py-3">
                     <div className="font-medium">
                       {field.name}
-                      {field.orgId === null && (
-                        <span
-                          data-testid="custom-field-all-orgs-badge"
-                          className="ml-2 rounded-full bg-primary/10 px-2 py-0.5 text-xs text-primary"
-                        >
-                          {t('customFieldsPage.allOrganizations')}
-                        </span>
-                      )}
                     </div>
                   </td>
+                  {isPartnerScope && (
+                    <td className="px-4 py-3" data-testid="custom-field-org">
+                      {field.orgId === null
+                        ? t('customFieldsPage.allOrganizations')
+                        : (orgNameById.get(field.orgId) ?? field.orgId)}
+                    </td>
+                  )}
                   <td className="px-4 py-3">
                     <code className="rounded bg-muted px-1.5 py-0.5 text-xs">
                       {field.fieldKey}

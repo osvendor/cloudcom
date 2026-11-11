@@ -68,7 +68,8 @@ export interface SsoCompletionParams {
   capability: AuthIssuanceCapability;
   provider: ProviderRow;
   user: UserRow;
-  /** Whether the verified id_token's `amr` attested MFA at assertion time. */
+  /** Whether the verified id_token's `amr` attested MFA (`mfa` or `phr`, see
+   *  `idpAssertedMfa`) at assertion time. */
   idpMfaAsserted: boolean;
   /**
    * True only when the ceremony verified a Breeze-held factor (TOTP / SMS /
@@ -150,9 +151,9 @@ export async function completeSsoLogin(
   // IdP-asserted MFA — axis-independent, so it is computed here (above the
   // membership branch) and shared by both the org and partner token payloads.
   // When the provider opts in via `trustsIdpMfa` AND the verified id_token's
-  // `amr` attested multi-factor, propagate mfa:true so the tenant can satisfy
+  // `amr` attested multi-factor (`mfa`) or phishing-resistant (`phr`) auth, propagate mfa:true so the tenant can satisfy
   // Breeze's MFA-gated routes via their IdP. Fail-safe: any provider that
-  // hasn't opted in, or an assertion without the `mfa` amr, yields mfa:false.
+  // hasn't opted in, or an assertion without an `mfa`/`phr` amr, yields mfa:false.
   // This claim never satisfies the L4 step-up (requireFreshMfaStepUp
   // re-verifies a Breeze-held TOTP).
   //
@@ -510,8 +511,13 @@ export async function finalizeSsoPendingLink(
     }
 
     const rejected = (reason: string, extra?: Record<string, unknown>): SsoLinkFinalizeResult => {
+      // The record snapshots the provider's axis (org_id XOR partner_id).
+      // This runs from the unauthenticated /link/confirm, so with no request
+      // auth or ambient scope these two fields are the row's only tenancy
+      // (#9377): orgId: null here put every early rejection in no trail.
       writeRouteAudit(c, {
-        orgId: null,
+        orgId: record.providerOrgId,
+        partnerId: record.providerPartnerId,
         action: 'sso.link.ceremony_rejected',
         resourceType: 'sso_provider',
         resourceId: record.providerId,
@@ -632,6 +638,7 @@ export async function finalizeSsoPendingLink(
           : 'browser_transition_unavailable';
       writeRouteAudit(c, {
       orgId: provider.orgId,
+      partnerId: provider.partnerId,
       action: 'sso.link.ceremony_rejected',
       resourceType: 'sso_provider',
       resourceId: provider.id,
@@ -661,6 +668,7 @@ export async function finalizeSsoPendingLink(
   if (provider.partnerId) {
     auditLogin(c, {
       orgId: null,
+      partnerId: provider.partnerId,
       userId: user.id,
       email: user.email,
       name: user.name,
@@ -673,6 +681,7 @@ export async function finalizeSsoPendingLink(
 
   writeRouteAudit(c, {
     orgId: provider.orgId,
+    partnerId: provider.partnerId,
     action: 'sso.identity.linked',
     resourceType: 'sso_provider',
     resourceId: provider.id,

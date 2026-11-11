@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	mathrand "math/rand"
@@ -90,14 +91,31 @@ type Config struct {
 	// this field existed, whenever the org's binding mode requires one). This
 	// is a known, accepted gap for already-enrolled fleets at rollout, not a
 	// bug in agents enrolled after this field landed.
-	DeviceID                     string `mapstructure:"device_id"`
-	HeartbeatIntervalSeconds     int    `mapstructure:"heartbeat_interval_seconds"`
-	MetricsIntervalSeconds       int    `mapstructure:"metrics_interval_seconds"`
-	ProcessSampleIntervalSeconds int    `mapstructure:"process_sample_interval_seconds"`
+	DeviceID string `mapstructure:"device_id"`
+	// WsFirstReconnectWindowSeconds bounds the random spread of the first
+	// WebSocket redial after a stable connection drops (W09, #8148). Default
+	// DefaultWsFirstReconnectWindowSeconds; 0..300 accepted. 0 (and anything
+	// <= 5) reproduces the 1-5 s spread shipped in #9145. An explicit 0 is
+	// meaningful, so the default is applied by Default() before the file is
+	// unmarshalled over it, never by "if zero" at the use site.
+	WsFirstReconnectWindowSeconds int `mapstructure:"ws_first_reconnect_window_seconds"`
+	// LoopRetryAfter makes the agent honour a server Retry-After at the loop
+	// level: httputil.Do returns it as RetryAt instead of sleeping into the
+	// caller's deadline, and the periodic heartbeat senders, the UniFi
+	// collector and the log shipper skip that route until then. Heartbeats
+	// and command results are never deferred. Default true; false restores
+	// per-request-only handling (W09, #8148).
+	LoopRetryAfter               bool `mapstructure:"loop_retry_after"`
+	HeartbeatIntervalSeconds     int  `mapstructure:"heartbeat_interval_seconds"`
+	MetricsIntervalSeconds       int  `mapstructure:"metrics_interval_seconds"`
+	ProcessSampleIntervalSeconds int  `mapstructure:"process_sample_interval_seconds"`
 	// PatchScanIntervalHours is the cadence of the (expensive) patch scan, in
 	// hours. Clamped to [1, 168] at the use site; defaults to DefaultPatchScanIntervalHours.
-	PatchScanIntervalHours   int      `mapstructure:"patch_scan_interval_hours"`
-	EnabledCollectors        []string `mapstructure:"enabled_collectors"`
+	PatchScanIntervalHours int      `mapstructure:"patch_scan_interval_hours"`
+	EnabledCollectors      []string `mapstructure:"enabled_collectors"`
+	Hardware               struct {
+		ToolDirs []string `mapstructure:"tool_dirs" yaml:"tool_dirs"`
+	} `mapstructure:"hardware" yaml:"hardware"`
 	BackupEnabled            bool     `mapstructure:"backup_enabled"`
 	BackupPaths              []string `mapstructure:"backup_paths"`
 	BackupRetention          int      `mapstructure:"backup_retention"`
@@ -105,6 +123,7 @@ type Config struct {
 	BackupLocalPath          string   `mapstructure:"backup_local_path"`
 	BackupS3Bucket           string   `mapstructure:"backup_s3_bucket"`
 	BackupS3Region           string   `mapstructure:"backup_s3_region"`
+	BackupS3Prefix           string   `mapstructure:"backup_s3_prefix"` // Key prefix: snapshots go under <prefix>/snapshots/ (empty = bucket root)
 	BackupS3AccessKey        string   `mapstructure:"backup_s3_access_key"`
 	BackupS3SecretKey        string   `mapstructure:"backup_s3_secret_key"`
 	BackupVSSEnabled         bool     `mapstructure:"backup_vss_enabled"`          // Windows: VSS shadow copy before backup
@@ -135,18 +154,21 @@ type Config struct {
 	// relay TURN, disconnect timeout, etc.) ship regardless.
 	DesktopDebug bool `mapstructure:"desktop_debug"`
 
-	// PAMEnabled gates privileged access management features, including the
-	// dormant local elevation account. Default false.
+	// PAMEnabled opts into dormant elevation-account provisioning at startup.
+	// Default false. After reconciliation, organization PAM policy is authoritative:
+	// an enabled policy provisions the account even when this flag is false.
+	// This flag is not a local opt-out from organization policy.
 	PAMEnabled bool `mapstructure:"pam_enabled"`
 
 	// PAMActuatorStrategy selects the Windows elevation actuator: "sendinput"
 	// (Path A — inject credentials into consent.exe) or "token_launch" (Path B —
 	// suppress consent.exe and launch the target elevated via CreateProcessAsUser
 	// as ~breeze_elev). Default "sendinput". Path B ships dark; flip per-device
-	// via agent.yaml. Ignored when PAMEnabled is false.
+	// via agent.yaml. Managed PAM v2 uses its own launch path.
 	PAMActuatorStrategy string `mapstructure:"pam_actuator_strategy"`
 
-	// Concurrency limits
+	// Concurrency limits. Both size the shared command pool and, separately,
+	// the backup verification lane (Heartbeat.verificationPool).
 	MaxConcurrentCommands int `mapstructure:"max_concurrent_commands"`
 	CommandQueueSize      int `mapstructure:"command_queue_size"`
 
@@ -206,6 +228,18 @@ type Config struct {
 	// a manifest can be verified by a key other than the one it names.
 	RequireManifestSigningKeyID bool `mapstructure:"require_manifest_signing_key_id" yaml:"require_manifest_signing_key_id"`
 
+	// ECH is the operator opt-out for Encrypted Client Hello on the control
+	// plane connection (#8869). Default true: the dialer dials plain until it
+	// sees the filter signature (plaintext HTTP answered on the TLS port)
+	// twice, then dials that host with ECH and falls back to plain inside the
+	// same dial. One-shot commands (enroll/bootstrap/support) retry with ECH
+	// on the first signature. Set false to never use ECH.
+	ECH bool `mapstructure:"ech" yaml:"ech"`
+
+	// ECHServerEnabled mirrors the server-side ECH kill switch pushed to the
+	// agent. Default true; the control plane can turn ECH off fleet-wide.
+	ECHServerEnabled bool `mapstructure:"ech_server_enabled" yaml:"ech_server_enabled"`
+
 	// HPWarrantyCollectionEnabled is the control-plane switch for device-side
 	// HP warranty collection via HP's CMSL (#5511). Pushed on the heartbeat as
 	// warranty_settings.hp_cmsl_enabled and persisted so the setting survives a
@@ -226,6 +260,14 @@ type Config struct {
 	// Persisted in the same SaveTo that adds the delegated key, so the two
 	// facts can never disagree. See manifestdelegation.go.
 	ManifestDelegationEpoch uint64 `mapstructure:"manifest_delegation_epoch" yaml:"manifest_delegation_epoch"`
+
+	// OwnershipEpoch is the device's PAM ownership epoch as last asserted by
+	// the server in a signed identity assertion v2 (#8202 W4), 0 when none was
+	// ever received. It moves with org_id/site_id: written only by
+	// PersistServerIdentity (never lowered) and enrollment, preserved from disk
+	// by every other save, and reported on each heartbeat so the server can
+	// record which epoch's identity this process has loaded.
+	OwnershipEpoch uint64 `mapstructure:"ownership_epoch" yaml:"ownership_epoch"`
 
 	// mTLS client certificate (Cloudflare API Shield)
 	MtlsCertPEM     string `mapstructure:"mtls_cert_pem"`
@@ -272,6 +314,17 @@ type Config struct {
 	// daemon, systemd service, etc.). Desktop commands route through IPC when set.
 	IsHeadless bool `mapstructure:"-"`
 
+	// IsInstalledAgent is a runtime flag set when this process is the host's
+	// installed Breeze agent: started by the OS service manager (Windows SCM,
+	// macOS LaunchDaemon, Linux systemd as root), running from the canonical
+	// agent.yaml under ConfigDir(), and not a Quick Support client. Only that
+	// process owns machine-wide artifacts shared with other Breeze processes on
+	// the host (the Breeze Assist package, its autostart entry and its
+	// per-session state). A foreground `run`, a second build pointed at another
+	// config file, or a Quick Support client must leave those alone.
+	// Runtime-only, never read from disk.
+	IsInstalledAgent bool `mapstructure:"-"`
+
 	// SupportMode marks this process as an ephemeral Quick Support client:
 	// enrolled into a throwaway temp workspace, serving one remote-desktop
 	// session, then self-destructing. It gates off everything a disposable
@@ -305,6 +358,10 @@ func IsEnrolled(cfg *Config) bool {
 
 // defaultLogFile returns the platform-specific default log file path.
 func defaultLogFile() string {
+	// A support session logs inside its private folder (#7629).
+	if root := registeredUserWorkspace(); root != "" {
+		return filepath.Join(root, "logs", "agent.log")
+	}
 	switch runtime.GOOS {
 	case "windows":
 		return filepath.Join(configDir(), "logs", "agent.log")
@@ -335,6 +392,14 @@ const DefaultPatchScanIntervalHours = 24
 // and that invariant is only enforceable if both sides read one constant.
 const DefaultHeartbeatIntervalSeconds = 60
 
+// DefaultWsFirstReconnectWindowSeconds is the default spread of the first
+// WebSocket redial after a stable connection drops; MaxWsFirstReconnectWindowSeconds
+// is the accepted ceiling (W09, #8148).
+const (
+	DefaultWsFirstReconnectWindowSeconds = 30
+	MaxWsFirstReconnectWindowSeconds     = 300
+)
+
 func Default() *Config {
 	return &Config{
 		HeartbeatIntervalSeconds:     DefaultHeartbeatIntervalSeconds,
@@ -356,8 +421,19 @@ func Default() *Config {
 		AuditMaxSizeMB:               50,
 		AuditMaxBackups:              3,
 
-		AutoUpdate:                 true,
-		PatchExcludeFeatureUpdates: true,
+		// W09 (#8148): defaults live here, before the file is unmarshalled over
+		// them, so an absent key keeps them and an explicit 0/false is honoured.
+		WsFirstReconnectWindowSeconds: DefaultWsFirstReconnectWindowSeconds,
+		LoopRetryAfter:                true,
+
+		ECH:              true,
+		ECHServerEnabled: true,
+
+		AutoUpdate: true,
+		// Windows feature releases are decided by the device's update ring
+		// (heartbeat feature_update_settings); this key is only an operator kill
+		// switch that excludes them regardless of the ring.
+		PatchExcludeFeatureUpdates: false,
 		PatchMinDiskSpaceGB:        2.0,
 		PatchRequireACPower:        true,
 		PatchRebootMaxPerDay:       3,
@@ -419,10 +495,35 @@ func Load(cfgFile string) (*Config, error) {
 // ApplyManifestKeyDelegation) can hold the lock across BOTH halves instead of
 // dropping it between the read and the write.
 func loadLocked(cfgFile string) (*Config, error) {
+	// Checked before viper is touched: a refused load must not rebind the
+	// process to a config outside its user workspace, since every later
+	// persist follows the bound file (#7629).
+	if err := checkConfigTarget(cfgFile); err != nil {
+		return nil, err
+	}
 	cfg := Default()
 
+	// The machine-wide agent.yaml is read only through the trust check (see
+	// machine_config_trust.go): the file and folder must be ones no other
+	// account can have written, and what viper parses is what was read from
+	// the checked handle.
+	trustedFile := ""
 	if cfgFile != "" {
 		viper.SetConfigFile(cfgFile)
+		if machineConfigFileNeedsTrust(cfgFile) {
+			trustedFile = cfgFile
+		}
+	} else if p := defaultConfigFilePath(); machineConfigFileNeedsTrust(p) {
+		if _, err := os.Lstat(p); err == nil {
+			viper.SetConfigFile(p)
+			trustedFile = p
+		} else {
+			// No machine config yet: look only in the working directory,
+			// never for some other agent.* in the machine folder.
+			viper.SetConfigName("agent")
+			viper.SetConfigType("yaml")
+			viper.AddConfigPath(".")
+		}
 	} else {
 		viper.SetConfigName("agent")
 		viper.SetConfigType("yaml")
@@ -433,7 +534,20 @@ func loadLocked(cfgFile string) (*Config, error) {
 	viper.AutomaticEnv()
 	viper.SetEnvPrefix("BREEZE")
 
-	if err := viper.ReadInConfig(); err != nil {
+	if trustedFile != "" {
+		data, err := readTrustedMachineConfigFileFn(trustedFile)
+		switch {
+		case errors.Is(err, os.ErrNotExist) && cfgFile == "":
+			// Removed since the Lstat above: a fresh host, as below.
+		case err != nil:
+			return nil, err
+		default:
+			viper.SetConfigType("yaml")
+			if err := viper.ReadConfig(bytes.NewReader(data)); err != nil {
+				return nil, fmt.Errorf("reading %s: %w", trustedFile, err)
+			}
+		}
+	} else if err := viper.ReadInConfig(); err != nil {
 		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
 			return nil, err
 		}
@@ -455,12 +569,11 @@ func loadLocked(cfgFile string) (*Config, error) {
 	// Old-format configs with inline secrets still work via the unmarshal
 	// above; the secrets file values take precedence when present.
 	secretsPath := secretsFilePathFor(viper.ConfigFileUsed())
-	if _, err := os.Stat(secretsPath); err == nil {
-		sv := viper.New()
-		sv.SetConfigFile(secretsPath)
-		if err := sv.ReadInConfig(); err != nil {
-			return nil, fmt.Errorf("reading secrets file: %w", err)
-		}
+	sv, err := readSecretsFile(secretsPath)
+	if err != nil {
+		return nil, err
+	}
+	if sv != nil {
 		// IMPORTANT: this read-back is a hardcoded list and CANNOT be driven by
 		// isSecretYAMLKey (there's no generic config-key -> struct-field mapping
 		// at this layer). When you add a new secret field, update BOTH
@@ -567,6 +680,9 @@ func SetAllAndPersist(kv map[string]any) error {
 	persistMu.Lock()
 	defer persistMu.Unlock()
 	path := viper.ConfigFileUsed()
+	if err := checkConfigTarget(path); err != nil {
+		return err
+	}
 
 	if path != "" {
 		if err := migrateInlineSecretsToSecretFile(path); err != nil {
@@ -589,7 +705,7 @@ func SetAllAndPersist(kv map[string]any) error {
 			viper.Set(key, value)
 		}
 	}
-	if err := viper.WriteConfig(); err != nil {
+	if err := writeAgentYAMLFromViperLocked(path); err != nil {
 		return err
 	}
 	if path != "" {
@@ -608,6 +724,9 @@ func SetAndPersist(key string, value any) error {
 	persistMu.Lock()
 	defer persistMu.Unlock()
 	path := viper.ConfigFileUsed()
+	if err := checkConfigTarget(path); err != nil {
+		return err
+	}
 
 	// SECURITY: move any legacy inline secrets out of the on-disk agent.yaml into
 	// root-only secrets.yaml BEFORE re-serializing viper, and clear them from
@@ -635,7 +754,7 @@ func SetAndPersist(key string, value any) error {
 	} else {
 		viper.Set(key, value)
 	}
-	if err := viper.WriteConfig(); err != nil {
+	if err := writeAgentYAMLFromViperLocked(path); err != nil {
 		return err
 	}
 	if path != "" {
@@ -645,6 +764,37 @@ func SetAndPersist(key string, value any) error {
 			return err
 		}
 		return enforceConfigFilePermissions(path)
+	}
+	return nil
+}
+
+// writeAgentYAMLFromViperLocked serializes viper's settings to the config file
+// at path with every secret key removed, atomically. viper.Set(key, nil) does
+// NOT hide a value viper loaded from the file — lookups fall through to the
+// config layer — so a secret an older agent left in agent.yaml stays in memory
+// after the startup scrub and a plain WriteConfig would put it straight back
+// in the world-readable file. Callers must hold persistMu.
+func writeAgentYAMLFromViperLocked(path string) error {
+	if path == "" {
+		// No file was loaded, so viper holds no file-sourced secrets.
+		return viper.WriteConfig()
+	}
+	data, err := yaml.Marshal(viper.AllSettings())
+	if err != nil {
+		return fmt.Errorf("marshaling agent config: %w", err)
+	}
+	data, err = stripSecretsFromAgentConfig(data)
+	if err != nil {
+		return fmt.Errorf("writing agent config: %w", err)
+	}
+	if err := atomicWriteFile(path, data, 0644); err != nil {
+		return err
+	}
+	// The rename installs the temp file's private ACL; the content is already
+	// clear of secrets, so restore Helper read access now rather than only
+	// after the caller's follow-up steps succeed (same as saveToLocked).
+	if err := enforceConfigFilePermissions(path); err != nil {
+		log.Warn("failed to enforce config file permissions", "path", path, "error", err.Error())
 	}
 	return nil
 }
@@ -659,6 +809,9 @@ func SetSecretAndPersist(key string, value any) error {
 // persistMu.
 func setSecretAndPersistLocked(key string, value any) error {
 	path := secretsFilePath()
+	if err := checkConfigTarget(path); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return err
 	}
@@ -706,25 +859,187 @@ func Save(cfg *Config) error {
 	return SaveTo(cfg, "")
 }
 
+// SaveTo writes cfg to agent.yaml and its non-credential secrets to
+// secrets.yaml.
+//
+// Issue #2773 — SaveTo does NOT write credential state from cfg. The agent,
+// watchdog and helper tokens and the staged pending_* set are owned by
+// StagePendingCredentials / PromotePendingCredentials / ClearPendingCredentials,
+// which update secrets.yaml directly and never touch the caller's *Config, so
+// cfg is a snapshot that can be arbitrarily stale relative to them: Load copies
+// pending_* into the struct once at startup and nothing refreshes it, and the
+// mTLS renewal paths capture the bearer token before taking any lock. Letting
+// that snapshot win wrote credentials the server no longer accepts over the
+// ones it does. So whatever is on disk is preserved verbatim; cfg only fills a
+// credential the disk does not have yet (the first save of a fresh install).
+// Enrollment, the one caller whose in-memory credentials ARE authoritative,
+// uses SaveEnrollment.
+//
+// #8317 — the same holds for org_id/site_id: once agent.yaml has them, they
+// are preserved from disk (see identitySource); only enrollment and
+// PersistServerIdentity change them.
 func SaveTo(cfg *Config, cfgFile string) error {
 	persistMu.Lock()
 	defer persistMu.Unlock()
-	return saveToLocked(cfg, cfgFile)
+	return saveToLocked(cfg, cfgFile, credentialsFromDisk)
+}
+
+// SaveEnrollment is SaveTo for a freshly enrolled identity: cfg's agent,
+// watchdog and helper tokens replace whatever is on disk, and any staged
+// pending_* set is dropped — it belonged to the previous identity and can
+// never be promoted against the new one.
+func SaveEnrollment(cfg *Config, cfgFile string) error {
+	persistMu.Lock()
+	defer persistMu.Unlock()
+	return saveToLocked(cfg, cfgFile, credentialsFromConfig)
+}
+
+// credentialSource selects who is authoritative for credential keys in a
+// saveToLocked call. See SaveTo and SaveEnrollment.
+type credentialSource int
+
+const (
+	credentialsFromDisk credentialSource = iota
+	credentialsFromConfig
+)
+
+// resolveCredentialsForSave decides the credential values a saveToLocked call
+// writes. Callers must hold persistMu, which is what makes this read and the
+// rewrite that follows atomic against the credential writers.
+func resolveCredentialsForSave(cfg *Config, cfgPath string, source credentialSource) (PersistedCredentials, error) {
+	onDisk, readErr := readPersistedCredentialsAt(cfgPath)
+	if readErr != nil {
+		if !errors.Is(readErr, os.ErrNotExist) {
+			if source == credentialsFromDisk {
+				// Fail closed. The file exists but could not be parsed, and the
+				// write that follows replaces it wholesale: proceeding would drop
+				// every credential cfg lacks — including a staged set the server
+				// may already have promoted, i.e. the agent's only copy of its
+				// current credential.
+				return PersistedCredentials{}, fmt.Errorf("reading existing credentials before rewriting the secrets file: %w", readErr)
+			}
+			log.Warn("could not read existing credentials while saving an enrollment; replacing them",
+				"error", readErr.Error())
+		}
+		onDisk = &PersistedCredentials{}
+	}
+
+	pick := func(primary, fallback string) string {
+		if primary != "" {
+			return primary
+		}
+		return fallback
+	}
+	if source == credentialsFromConfig {
+		return PersistedCredentials{
+			AuthToken:         pick(cfg.AuthToken, onDisk.AuthToken),
+			WatchdogAuthToken: pick(cfg.WatchdogAuthToken, onDisk.WatchdogAuthToken),
+			HelperAuthToken:   pick(cfg.HelperAuthToken, onDisk.HelperAuthToken),
+		}, nil
+	}
+	return PersistedCredentials{
+		AuthToken:         pick(onDisk.AuthToken, cfg.AuthToken),
+		WatchdogAuthToken: pick(onDisk.WatchdogAuthToken, cfg.WatchdogAuthToken),
+		HelperAuthToken:   pick(onDisk.HelperAuthToken, cfg.HelperAuthToken),
+		// Never from cfg: its Pending* fields are the startup snapshot, so they
+		// either resurrect a set that was since cleared or replace a newer one.
+		PendingAuthToken:         onDisk.PendingAuthToken,
+		PendingWatchdogAuthToken: onDisk.PendingWatchdogAuthToken,
+		PendingHelperAuthToken:   onDisk.PendingHelperAuthToken,
+	}, nil
+}
+
+// ResolveSavePath returns the agent.yaml path SaveTo and SaveEnrollment write
+// for cfgFile: cfgFile itself, or the default agent.yaml in ConfigDir when the
+// --config flag was left empty. Use it wherever a message names the config
+// file, so an empty flag never prints as an empty path (#7394).
+func ResolveSavePath(cfgFile string) string {
+	if cfgFile != "" {
+		return cfgFile
+	}
+	return filepath.Join(configDir(), "agent.yaml")
+}
+
+// PrepareSaveDir creates and secures the directory SaveEnrollment will write
+// cfgFile's agent.yaml into, exactly as the save itself does first, without
+// writing any file. Enrollment calls it before the enroll request so that a
+// directory the agent cannot secure fails the enrollment before the server
+// creates a device, instead of after (#7394).
+func PrepareSaveDir(cfgFile string) error {
+	return prepareSaveDir(ResolveSavePath(cfgFile))
+}
+
+func prepareSaveDir(cfgPath string) error {
+	// Also the first step of every SaveTo / SaveEnrollment, so this one check
+	// keeps both inside a registered user workspace (#7629).
+	if err := checkConfigTarget(cfgPath); err != nil {
+		return err
+	}
+	dir := filepath.Dir(cfgPath)
+	if dir == "." {
+		return nil
+	}
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	return enforceConfigDirPermissions(dir)
 }
 
 // saveToLocked is SaveTo's body; callers must hold persistMu. Paired with
 // loadLocked so a read-modify-write of the config file is atomic against every
 // other viper user.
-func saveToLocked(cfg *Config, cfgFile string) error {
+func saveToLocked(cfg *Config, cfgFile string, source credentialSource) error {
+	identity := identityFromDisk
+	if source == credentialsFromConfig {
+		identity = identityFromConfig
+	}
+	return saveToLockedWithIdentity(cfg, cfgFile, source, identity)
+}
+
+// identitySource selects who is authoritative for org_id/site_id in a save.
+//
+// #8317 — they are written by enrollment and by PersistServerIdentity (a
+// server-signed reassignment) and by nothing else. Every other save passes a
+// *Config the caller loaded at startup — the token-rotation and mTLS paths
+// pass the heartbeat's — so between a reassignment and the restart that
+// applies it those copies still hold the old pair, and a plain SaveTo would
+// write it back over the new one. Same rule as credentials (#2773).
+type identitySource int
+
+const (
+	identityFromDisk identitySource = iota
+	identityFromConfig
+)
+
+func saveToLockedWithIdentity(cfg *Config, cfgFile string, source credentialSource, identity identitySource) error {
+	cfgPath := ResolveSavePath(cfgFile)
+	if err := prepareSaveDir(cfgPath); err != nil {
+		return err
+	}
+
+	// Resolved BEFORE anything is written, so an unreadable secrets file aborts
+	// the save without touching agent.yaml either.
+	creds, err := resolveCredentialsForSave(cfg, cfgPath, source)
+	if err != nil {
+		return err
+	}
+
+	orgID, siteID, ownershipEpoch := cfg.OrgID, cfg.SiteID, cfg.OwnershipEpoch
+	if identity == identityFromDisk {
+		orgID, siteID, ownershipEpoch = resolveIdentityForSave(cfgPath, orgID, siteID, ownershipEpoch)
+	}
+
 	viper.Set("agent_id", cfg.AgentID)
 	viper.Set("server_url", cfg.ServerURL)
 	viper.Set("backup_server_url", cfg.BackupServerURL)
-	viper.Set("org_id", cfg.OrgID)
-	viper.Set("site_id", cfg.SiteID)
+	viper.Set("org_id", orgID)
+	viper.Set("site_id", siteID)
+	viper.Set("ownership_epoch", ownershipEpoch)
 	viper.Set("device_id", cfg.DeviceID)
 	viper.Set("heartbeat_interval_seconds", cfg.HeartbeatIntervalSeconds)
 	viper.Set("metrics_interval_seconds", cfg.MetricsIntervalSeconds)
 	viper.Set("enabled_collectors", cfg.EnabledCollectors)
+	viper.Set("hardware.tool_dirs", cfg.Hardware.ToolDirs)
 	viper.Set("policy_registry_state_probes", cfg.PolicyRegistryStateProbes)
 	viper.Set("policy_config_state_probes", cfg.PolicyConfigStateProbes)
 	viper.Set("log_level", cfg.LogLevel)
@@ -735,35 +1050,14 @@ func saveToLocked(cfg *Config, cfgFile string) error {
 	viper.Set("allow_dev_update", cfg.AllowDevUpdate)
 	viper.Set("pinned_manifest_pub_keys", cfg.PinnedManifestPubKeys)
 	viper.Set("require_manifest_signing_key_id", cfg.RequireManifestSigningKeyID)
+	viper.Set("ech", cfg.ECH)
+	viper.Set("ech_server_enabled", cfg.ECHServerEnabled)
 	viper.Set("hp_warranty_collection_enabled", cfg.HPWarrantyCollectionEnabled)
 	viper.Set("manifest_delegation_epoch", cfg.ManifestDelegationEpoch)
-	// Write only the helper-scoped token to agent.yaml. Full agent and watchdog
-	// bearer tokens are persisted below in root-only secrets.yaml.
-	if cfg.HelperAuthToken != "" {
-		viper.Set("helper_auth_token", cfg.HelperAuthToken)
-	}
-
-	var cfgPath string
-	if cfgFile != "" {
-		cfgPath = cfgFile
-		dir := filepath.Dir(cfgPath)
-		if dir != "." {
-			if err := os.MkdirAll(dir, 0755); err != nil {
-				return err
-			}
-			if err := enforceConfigDirPermissions(dir); err != nil {
-				return err
-			}
-		}
-	} else {
-		cfgPath = filepath.Join(configDir(), "agent.yaml")
-		if err := os.MkdirAll(configDir(), 0755); err != nil {
-			return err
-		}
-		if err := enforceConfigDirPermissions(configDir()); err != nil {
-			return err
-		}
-	}
+	// helper_auth_token is deliberately NOT set here on any platform: agent.yaml
+	// is readable by every local user. It goes to secrets.yaml below; Windows
+	// delivers it to the console-session Breeze Assist over IPC, and Unix also
+	// writes the group-scoped helper token file (writeHelperTokenFileFor).
 
 	// Serialize via viper (same encoder as WriteConfigAs), strip secrets, then
 	// write atomically: tmp file in the same directory → fsync → rename. The
@@ -780,8 +1074,8 @@ func saveToLocked(cfg *Config, cfgFile string) error {
 		return fmt.Errorf("writing agent config: %w", err)
 	}
 	// agent.yaml is world-readable (0644) so the Breeze Helper, running as the
-	// logged-in user, can read it. It carries only the helper-scoped token;
-	// full tokens and mTLS keys are written to root-only secrets.yaml below.
+	// logged-in user, can read its server URL and agent id. It carries no
+	// tokens; every credential and mTLS key goes to root-only secrets.yaml below.
 	if err := atomicWriteFile(cfgPath, cfgYAML, 0644); err != nil {
 		return fmt.Errorf("writing agent config: %w", err)
 	}
@@ -799,52 +1093,27 @@ func saveToLocked(cfg *Config, cfgFile string) error {
 	sv := viper.New()
 
 	// Issue #2621 — SaveTo rebuilds the secrets file from scratch, so every
-	// credential it does not re-write is DROPPED. Two ways that bites:
-	//
-	//   - Staged rotation credentials on disk are invisible to an unrelated
-	//     caller (the mTLS renewal path calls config.Save mid-flight), so a cert
-	//     renewal during a rotation would delete the staged set the server may
-	//     already have promoted.
-	//   - The in-memory config clears tokens for security (AuthToken is zeroed
-	//     after startup) and applyRotatedCredentials updates the credential file
-	//     directly rather than the struct, so cfg's watchdog/helper tokens can be
-	//     stale or empty relative to disk.
-	//
-	// So for every credential: prefer a non-empty in-memory value, otherwise
-	// preserve exactly what is on disk. Never write an empty token over a real
-	// one. A read failure is logged rather than swallowed — silently proceeding
-	// would delete credentials this fallback exists to protect.
-	credsOnDisk, readErr := readPersistedCredentialsAt(cfgPath)
-	// A missing secrets file is the normal first-save/enrollment case, not a
-	// problem — there is simply nothing to preserve. Anything else means the file
-	// exists but could not be parsed, and we are about to overwrite it, so say so.
-	if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
-		log.Warn("could not read existing credentials while saving config; on-disk credential preservation is degraded",
-			"error", readErr.Error())
-	}
-	setCredential := func(key, fromCfg string, fromDisk func(*PersistedCredentials) string) {
-		if fromCfg != "" {
-			sv.Set(key, fromCfg)
-			return
-		}
-		if credsOnDisk != nil {
-			if v := fromDisk(credsOnDisk); v != "" {
-				sv.Set(key, v)
-			}
+	// credential it does not re-write is DROPPED. creds (resolved above under
+	// persistMu — see resolveCredentialsForSave for who wins) carries each one
+	// forward. An empty value is not written; it never blanks a real token.
+	setCredential := func(key, value string) {
+		if value != "" {
+			sv.Set(key, value)
 		}
 	}
-	setCredential(secretKeyAuthToken, cfg.AuthToken,
-		func(p *PersistedCredentials) string { return p.AuthToken })
-	setCredential(secretKeyWatchdogAuthToken, cfg.WatchdogAuthToken,
-		func(p *PersistedCredentials) string { return p.WatchdogAuthToken })
-	setCredential(secretKeyHelperAuthToken, cfg.HelperAuthToken,
-		func(p *PersistedCredentials) string { return p.HelperAuthToken })
-	setCredential(secretKeyPendingAuthToken, cfg.PendingAuthToken,
-		func(p *PersistedCredentials) string { return p.PendingAuthToken })
-	setCredential(secretKeyPendingWatchdogAuthToken, cfg.PendingWatchdogAuthToken,
-		func(p *PersistedCredentials) string { return p.PendingWatchdogAuthToken })
-	setCredential(secretKeyPendingHelperAuthToken, cfg.PendingHelperAuthToken,
-		func(p *PersistedCredentials) string { return p.PendingHelperAuthToken })
+	setCredential(secretKeyAuthToken, creds.AuthToken)
+	setCredential(secretKeyWatchdogAuthToken, creds.WatchdogAuthToken)
+	setCredential(secretKeyHelperAuthToken, creds.HelperAuthToken)
+
+	// Unix only (no-op on Windows): also persist the helper token to its own
+	// group-scoped file, from the same resolved value so the copies agree.
+	if err := writeHelperTokenFileFor(cfgPath, creds.HelperAuthToken); err != nil {
+		return fmt.Errorf("writing helper token file: %w", err)
+	}
+
+	setCredential(secretKeyPendingAuthToken, creds.PendingAuthToken)
+	setCredential(secretKeyPendingWatchdogAuthToken, creds.PendingWatchdogAuthToken)
+	setCredential(secretKeyPendingHelperAuthToken, creds.PendingHelperAuthToken)
 
 	sv.Set("mtls_cert_pem", cfg.MtlsCertPEM)
 	sv.Set("mtls_key_pem", cfg.MtlsKeyPEM)
@@ -1033,22 +1302,19 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 	return nil
 }
 
-// secretKeyAllowedInAgentYAML lists keys that look secret by suffix rules but
-// must remain in agent.yaml. The Breeze Helper ("Breeze Assist") runs as the
-// logged-in user and reads agent.yaml directly; it needs helper_auth_token.
-var secretKeyAllowedInAgentYAML = map[string]bool{
-	"helper_auth_token": true,
-}
-
 // isSecretYAMLKey reports whether key should be kept out of agent.yaml (i.e.
 // written only to secrets.yaml). It uses a suffix-based predicate so future
 // secret keys like backup_s3_access_key are caught automatically without
-// requiring an explicit list update. Keys in secretKeyAllowedInAgentYAML are
-// explicitly exempted regardless of suffix.
+// requiring an explicit list update.
+//
+// There are no exemptions. helper_auth_token in particular is a secret on
+// every platform even though the Breeze Helper runs as the logged-in user:
+// agent.yaml is readable by every local account, so the Helper gets the token
+// over IPC (Windows: console-session Breeze Assist only) or from the
+// breeze-group-scoped helper token file (Unix, helpertoken_unix.go). Because
+// the rule is suffix-based, FixConfigPermissions' migration also scrubs a
+// token an older agent left in agent.yaml.
 func isSecretYAMLKey(key string) bool {
-	if secretKeyAllowedInAgentYAML[key] {
-		return false
-	}
 	switch key {
 	case "auth_token", "watchdog_auth_token",
 		"mtls_cert_pem", "mtls_key_pem", "mtls_cert_expires",
@@ -1069,6 +1335,11 @@ func isSecretConfigKey(key string) bool {
 
 // GetDataDir returns the platform-specific data directory for the agent
 func GetDataDir() string {
+	// A support session keeps its data (audit log, state stores, the
+	// downloaded codec) inside its private folder (#7629).
+	if root := registeredUserWorkspace(); root != "" {
+		return filepath.Join(root, "data")
+	}
 	switch runtime.GOOS {
 	case "windows":
 		return filepath.Join(configDir(), "data")
@@ -1085,19 +1356,24 @@ func GetDataDir() string {
 // Safe to call on every startup — it is a no-op if permissions are already
 // correct or the paths don't exist yet.
 func FixConfigPermissions() {
-	dir := configDir()
+	dir := fixConfigPermissionsDir()
 	if info, err := os.Stat(dir); err == nil && info.IsDir() {
 		if err := enforceConfigDirPermissions(dir); err != nil {
 			log.Warn("Failed to fix config directory permissions", "dir", dir, "error", err.Error())
 		}
 	}
 	cfgPath := filepath.Join(dir, "agent.yaml")
+	removeStaleConfigScratchFiles(cfgPath)
 	if _, err := os.Stat(cfgPath); err == nil {
-		if err := migrateInlineSecretsToSecretFile(cfgPath); err != nil {
-			log.Warn("Failed to migrate inline config secrets", "path", cfgPath, "error", err.Error())
-		}
-		if err := enforceConfigFilePermissions(cfgPath); err != nil {
-			log.Warn("Failed to fix config file permissions", "path", cfgPath, "error", err.Error())
+		fixAgentYAMLPermissions(cfgPath)
+	}
+	// An agent started with --config elsewhere reads (and SetAndPersist
+	// rewrites) that file instead; scrub it too, exactly as SetAndPersist's
+	// own migration would on its first write there.
+	if active := viper.ConfigFileUsed(); active != "" && !sameConfigPath(active, cfgPath) {
+		if _, err := os.Stat(active); err == nil {
+			removeStaleConfigScratchFiles(active)
+			fixAgentYAMLPermissions(active)
 		}
 	}
 	// Secrets file must remain root-only.
@@ -1106,6 +1382,90 @@ func FixConfigPermissions() {
 		if err := enforceSecretFilePermissions(sPath); err != nil {
 			log.Warn("Failed to fix secrets file permissions", "path", sPath, "error", err.Error())
 		}
+	}
+	seedHelperTokenFileFromSecretsIfMissing(cfgPath)
+	reapplyHelperTokenFilePermissionsFor(cfgPath)
+}
+
+// fixConfigPermissionsDir is the default config directory FixConfigPermissions
+// works on; a package var so tests can point it at a temp directory.
+var fixConfigPermissionsDir = configDir
+
+// fixAgentYAMLPermissions is the path-parameterized core of
+// FixConfigPermissions' agent.yaml handling (split out so it can be tested
+// against a temp directory instead of the real, OS-specific config
+// directory). migrateInlineSecretsToSecretFile can fail partway through —
+// e.g. a Windows rename blocked by a concurrent open of agent.yaml — and
+// previously that error was only logged, after which the caller
+// unconditionally loosened agent.yaml to the Helper-readable mode (0644 /
+// BU:FR) regardless of whether inline secret material was still in it. This
+// re-checks the file on disk after the migration attempt (success or not)
+// and only loosens permissions when it is verifiably clear of secret keys;
+// otherwise it locks the file down to the same restrictive mode as
+// secrets.yaml until a later, successful migration can loosen it.
+func fixAgentYAMLPermissions(cfgPath string) {
+	if err := migrateInlineSecretsToSecretFile(cfgPath); err != nil {
+		log.Error("Failed to migrate inline config secrets", "path", cfgPath, "error", err.Error())
+	}
+	hasInline, err := agentYAMLHasInlineSecrets(cfgPath)
+	if err != nil {
+		log.Warn("Failed to verify agent.yaml is clear of inline secrets; leaving it locked down", "path", cfgPath, "error", err.Error())
+		hasInline = true
+	}
+	if hasInline {
+		// Error, not Warn: until a later migration succeeds, the Helper cannot
+		// read agent.yaml at all (no server URL or agent id for Breeze Assist).
+		log.Error("agent.yaml still contains inline secret material after migration; leaving it locked down instead of widening its permissions", "path", cfgPath)
+		if err := enforceSecretFilePermissions(cfgPath); err != nil {
+			log.Warn("Failed to lock down config file permissions", "path", cfgPath, "error", err.Error())
+		}
+		return
+	}
+	if err := enforceConfigFilePermissions(cfgPath); err != nil {
+		log.Warn("Failed to fix config file permissions", "path", cfgPath, "error", err.Error())
+	}
+}
+
+// agentYAMLHasInlineSecrets reports whether cfgPath still contains any key
+// that migrateInlineSecretsToSecretFile is meant to have moved out (see
+// isSecretYAMLKey). A read or parse error is reported as "has secrets" (the
+// caller fails closed) rather than silently treated as clean.
+func agentYAMLHasInlineSecrets(cfgPath string) (bool, error) {
+	data, err := os.ReadFile(cfgPath)
+	if err != nil {
+		return false, err
+	}
+	var cfgValues map[string]any
+	if err := yaml.Unmarshal(data, &cfgValues); err != nil {
+		return false, err
+	}
+	for key, value := range cfgValues {
+		if isSecretYAMLKey(key) && !isEmptyYAMLValue(value) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// seedHelperTokenFileFromSecretsIfMissing handles the upgrade case: an
+// existing install's helper_auth_token was inline in agent.yaml, and the
+// migration above (isSecretYAMLKey-driven, shared with every other secret
+// key) has just moved it into secrets.yaml — the correct destination for
+// every other secret, but not the group-readable one the Helper needs. If
+// the dedicated helper token file doesn't exist yet, seed it from whatever
+// secrets.yaml now holds. No-op on Windows (writeHelperTokenFile there is a
+// no-op) and on a fresh install (SaveTo already writes the file directly, so
+// it already exists by the time this runs).
+func seedHelperTokenFileFromSecretsIfMissing(cfgPath string) {
+	if _, err := os.Stat(helperTokenFilePathFor(cfgPath)); err == nil {
+		return // already present — nothing to seed
+	}
+	creds, err := readPersistedCredentialsAt(cfgPath)
+	if err != nil || creds == nil || creds.HelperAuthToken == "" {
+		return
+	}
+	if err := writeHelperTokenFileFor(cfgPath, creds.HelperAuthToken); err != nil {
+		log.Warn("failed to seed helper token file from secrets", "error", err.Error())
 	}
 }
 
@@ -1117,7 +1477,20 @@ func migrateInlineSecretsToSecretFile(cfgPath string) error {
 
 	var cfgValues map[string]any
 	if err := yaml.Unmarshal(data, &cfgValues); err != nil {
+		if legacyHelperTokenLine.Match(data) {
+			recordHelperTokenRotationOwed(cfgPath)
+		}
 		return err
+	}
+	// Before anything below rewrites the file: a helper token an older agent
+	// left here is rotated, not just moved (see helperTokenRotationMarkerName)
+	// — unless a later rotation has already replaced it.
+	if inline := cfgValues[secretKeyHelperAuthToken]; !isEmptyYAMLValue(inline) {
+		if inlineHelperTokenStillValid(cfgPath, inline) {
+			recordHelperTokenRotationOwed(cfgPath)
+		} else {
+			log.Info("helper token in agent.yaml was already replaced by a rotation; removing it without another rotation", "path", cfgPath)
+		}
 	}
 
 	hasInlineSecretKeys := false
@@ -1205,6 +1578,35 @@ func writeYAMLFile(path string, values map[string]any, mode os.FileMode) error {
 
 func secretsFilePath() string {
 	return secretsFilePathFor(viper.ConfigFileUsed())
+}
+
+// readSecretsFile reads the secrets file at path into a new viper instance,
+// or returns nil when it does not exist. The machine-wide secrets.yaml is
+// read only through the trust check.
+func readSecretsFile(path string) (*viper.Viper, error) {
+	sv := viper.New()
+	sv.SetConfigFile(path)
+	sv.SetConfigType("yaml")
+	if machineConfigFileNeedsTrust(path) {
+		data, err := readTrustedMachineConfigFileFn(path)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		if err := sv.ReadConfig(bytes.NewReader(data)); err != nil {
+			return nil, fmt.Errorf("reading secrets file: %w", err)
+		}
+		return sv, nil
+	}
+	if _, err := os.Stat(path); err != nil {
+		return nil, nil
+	}
+	if err := sv.ReadInConfig(); err != nil {
+		return nil, fmt.Errorf("reading secrets file: %w", err)
+	}
+	return sv, nil
 }
 
 func secretsFilePathFor(cfgFile string) string {

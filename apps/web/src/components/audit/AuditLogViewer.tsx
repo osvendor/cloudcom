@@ -17,41 +17,48 @@ import { cn } from '@/lib/utils';
 import { fetchWithAuth } from '../../stores/auth';
 import AuditLogDetail, { type AuditLogEntry } from './AuditLogDetail';
 import AuditFilters from './AuditFilters';
+import { appendFilterParams, hasActiveFilters, type ActiveFilters } from './auditFilterParams';
 import { navigateTo } from '@/lib/navigation';
 import { formatAuditDetails, useAuditActionFormatter } from '@/lib/auditFormat';
+import { downloadBlob } from '@/lib/downloadBlob';
+import { extractApiError } from '@/lib/apiError';
+import { showToast } from '../shared/Toast';
 import { formatDateTime } from '@/lib/dateTimeFormat';
 // Initializes the shared i18next singleton. Islands hydrate independently, so
 // an island that hydrates before whichever other island happens to pull i18n in
 // would otherwise render raw keys (and mismatch the SSR markup).
 import '../../lib/i18n';
+import { useStableT } from '@/lib/i18n/useStableT';
+import { actionBadgeClass } from './auditPresentation';
+
+/**
+ * `/audit-logs` returns flat entries (string `resource`, JSON-string `details`).
+ * `/audit-logs/search` returns the full shape (object `resource`, object
+ * `details`, no `resourceType`/`changes`). Normalize to the flat shape at the
+ * fetch boundary so the viewer has exactly one entry type.
+ */
+function normalizeAuditEntry(raw: unknown): AuditLogEntry {
+  const e = (raw ?? {}) as Record<string, any>;
+  const res = e.resource;
+  const resourceIsObject = res !== null && typeof res === 'object';
+  const detailsObj = e.details !== null && typeof e.details === 'object' ? e.details : null;
+  return {
+    ...e,
+    resource: resourceIsObject ? String(res.name || res.type || res.id || '') : (res ?? ''),
+    resourceType: e.resourceType ?? (resourceIsObject ? String(res.type ?? '') : ''),
+    details: detailsObj ? JSON.stringify(detailsObj) : (e.details ?? '{}'),
+    ipAddress: e.ipAddress ?? '',
+    userAgent: e.userAgent ?? '',
+    user: { name: '', email: '', role: '', department: '', ...(e.user ?? {}) },
+    changes: e.changes ?? { before: {}, after: detailsObj ?? {} },
+  } as AuditLogEntry;
+}
 
 type SortKey = 'timestamp' | 'user' | 'action' | 'resource' | 'details' | 'ipAddress';
 
 type SortConfig = {
   key: SortKey;
   direction: 'asc' | 'desc';
-};
-
-type DatePreset = 'today' | '7d' | '30d' | 'custom';
-
-type ActiveFilters = {
-  datePreset: DatePreset;
-  startDate?: string;
-  endDate?: string;
-  userId?: string;
-  userEmail?: string;
-  actions: string[];
-  resources: string[];
-  search: string;
-};
-
-const actionStyles: Record<string, string> = {
-  login: 'bg-emerald-100 text-emerald-700 border-emerald-200',
-  update: 'bg-blue-100 text-blue-700 border-blue-200',
-  delete: 'bg-rose-100 text-rose-700 border-rose-200',
-  create: 'bg-indigo-100 text-indigo-700 border-indigo-200',
-  export: 'bg-amber-100 text-amber-700 border-amber-200',
-  access: 'bg-slate-100 text-slate-700 border-slate-200'
 };
 
 const getSortValue = (entry: AuditLogEntry, key: SortKey) => {
@@ -73,50 +80,6 @@ const getSortValue = (entry: AuditLogEntry, key: SortKey) => {
   }
 };
 
-function computeDateRange(filters: ActiveFilters): { from?: string; to?: string } {
-  const now = new Date();
-  const to = now.toISOString();
-  switch (filters.datePreset) {
-    case 'today': {
-      const start = new Date(now);
-      start.setHours(0, 0, 0, 0);
-      return { from: start.toISOString(), to };
-    }
-    case '7d': {
-      const start = new Date(now);
-      start.setDate(start.getDate() - 7);
-      return { from: start.toISOString(), to };
-    }
-    case '30d': {
-      const start = new Date(now);
-      start.setDate(start.getDate() - 30);
-      return { from: start.toISOString(), to };
-    }
-    case 'custom': {
-      const result: { from?: string; to?: string } = {};
-      if (filters.startDate) result.from = new Date(filters.startDate).toISOString();
-      if (filters.endDate) {
-        const end = new Date(filters.endDate);
-        end.setHours(23, 59, 59, 999);
-        result.to = end.toISOString();
-      }
-      return result;
-    }
-    default:
-      return {};
-  }
-}
-
-function hasActiveFilters(filters: ActiveFilters | null): boolean {
-  if (!filters) return false;
-  return !!(
-    filters.userEmail ||
-    filters.actions.length > 0 ||
-    filters.resources.length > 0 ||
-    filters.search
-  );
-}
-
 interface AuditLogViewerProps {
   timezone?: string;
   /**
@@ -130,6 +93,7 @@ interface AuditLogViewerProps {
 
 export default function AuditLogViewer({ timezone, orgId }: AuditLogViewerProps) {
   const { t } = useTranslation('admin');
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   const formatAuditAction = useAuditActionFormatter();
   const [entries, setEntries] = useState<AuditLogEntry[]>([]);
   const columnLabels: Record<SortKey, string> = {
@@ -165,15 +129,7 @@ export default function AuditLogViewer({ timezone, orgId }: AuditLogViewerProps)
       params.set('page', String(page));
       params.set('limit', String(pageSize));
 
-      if (filters) {
-        const { from, to } = computeDateRange(filters);
-        if (from) params.set('from', from);
-        if (to) params.set('to', to);
-        if (filters.userEmail) params.set('user', filters.userEmail);
-        if (filters.actions.length > 0) params.set('action', filters.actions.join(','));
-        if (filters.resources.length > 0) params.set('resource', filters.resources.join(','));
-        if (filters.search) params.set('q', filters.search);
-      }
+      appendFilterParams(params, filters);
 
       // Fast-path: on page 1 with no active filters, skip the slow count(*)
       // and let the API use its LATERAL fast-path. From page 2 onward we
@@ -192,11 +148,12 @@ export default function AuditLogViewer({ timezone, orgId }: AuditLogViewerProps)
       }
 
       if (!response.ok) {
-        throw new Error(t('audit.auditLogViewer.errors.fetch'));
+        throw new Error(stableT('audit.auditLogViewer.errors.fetch'));
       }
 
       const data = await response.json();
-      setEntries(data.entries || data.data || data.logs || []);
+      const rawEntries: unknown[] = data.entries || data.data || data.logs || [];
+      setEntries(rawEntries.map(normalizeAuditEntry));
       if (data.pagination) {
         // When skipCount=true the API returns -1 sentinels; preserve them so
         // the UI can show "1 of ?" instead of a misleading "1 of 0".
@@ -204,11 +161,11 @@ export default function AuditLogViewer({ timezone, orgId }: AuditLogViewerProps)
         setTotalCount(data.pagination.total ?? 0);
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('audit.auditLogViewer.errors.load'));
+      setError(err instanceof Error ? err.message : stableT('audit.auditLogViewer.errors.load'));
     } finally {
       setIsLoading(false);
     }
-  }, [t, orgId]);
+  }, [stableT, orgId]);
 
   useEffect(() => {
     fetchAuditLogs(currentPage, activeFilters);
@@ -270,25 +227,36 @@ export default function AuditLogViewer({ timezone, orgId }: AuditLogViewerProps)
   };
 
   const handleExportLogs = async () => {
+    // The export accepts the same filters as the list (date range, user,
+    // action, resource, search) so the file matches what is on screen.
     try {
-      const response = await fetchWithAuth('/audit-logs/export', { orgIdOverride: orgId });
+      // Built inside the try: an unparseable custom date throws in
+      // computeDateRange and must surface as the export-error toast.
+      const params = new URLSearchParams();
+      appendFilterParams(params, activeFilters);
+      const query = params.toString();
+
+      const response = await fetchWithAuth(`/audit-logs/export${query ? `?${query}` : ''}`, {
+        orgIdOverride: orgId
+      });
 
       if (response.status === 401) {
         void navigateTo('/login', { replace: true });
         return;
       }
 
-      if (response.ok) {
-        const blob = await response.blob();
-        const url = window.URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = `audit-logs-${new Date().toISOString().split('T')[0]}.csv`;
-        a.click();
-        window.URL.revokeObjectURL(url);
+      if (!response.ok) {
+        const data = await response.json().catch(() => null);
+        showToast({
+          type: 'error',
+          message: extractApiError(data, stableT('audit.auditLogViewer.errors.export'))
+        });
+        return;
       }
+
+      downloadBlob(await response.blob(), `audit-logs-${new Date().toISOString().split('T')[0]}.csv`);
     } catch {
-      // Handle error silently or show notification
+      showToast({ type: 'error', message: stableT('audit.auditLogViewer.errors.export') });
     }
   };
 
@@ -365,7 +333,7 @@ export default function AuditLogViewer({ timezone, orgId }: AuditLogViewerProps)
               <span className="ml-1 inline-flex h-5 w-5 items-center justify-center rounded-full bg-primary text-xs text-primary-foreground">
                 {(activeFilters!.actions.length > 0 ? 1 : 0) +
                   (activeFilters!.resources.length > 0 ? 1 : 0) +
-                  (activeFilters!.userEmail ? 1 : 0) +
+                  (activeFilters!.userId || activeFilters!.userEmail ? 1 : 0) +
                   (activeFilters!.search ? 1 : 0)}
               </span>
             )}
@@ -393,6 +361,7 @@ export default function AuditLogViewer({ timezone, orgId }: AuditLogViewerProps)
 
       {showFilters && (
         <AuditFilters
+          initialFilters={activeFilters}
           onApply={handleApplyFilters}
           onClear={handleClearFilters}
         />
@@ -426,7 +395,7 @@ export default function AuditLogViewer({ timezone, orgId }: AuditLogViewerProps)
             ) : (
               sortedEntries.map(entry => {
                 const isExpanded = expandedRows.has(entry.id);
-                const badgeClass = actionStyles[entry.action] ?? actionStyles.access;
+                const badgeClass = actionBadgeClass(entry.action);
                 return (
                   <Fragment key={entry.id}>
                     <tr className="hover:bg-muted/30">
@@ -434,6 +403,7 @@ export default function AuditLogViewer({ timezone, orgId }: AuditLogViewerProps)
                         <div className="flex items-center gap-2">
                           <button
                             type="button"
+                            data-testid="audit-row-toggle"
                             onClick={() => toggleExpanded(entry.id)}
                             className="inline-flex h-6 w-6 items-center justify-center rounded-md border text-muted-foreground hover:text-foreground"
                           >
@@ -465,6 +435,7 @@ export default function AuditLogViewer({ timezone, orgId }: AuditLogViewerProps)
                       </td>
                       <td className="px-4 py-4 text-sm">
                         <span
+                          data-testid="audit-action-badge"
                           className={cn(
                             'inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-xs font-medium',
                             badgeClass
@@ -531,11 +502,14 @@ export default function AuditLogViewer({ timezone, orgId }: AuditLogViewerProps)
                               <p className="text-xs font-semibold uppercase text-muted-foreground">
                                 {t('audit.auditLogViewer.expanded.changes')}
                               </p>
-                              <p className="mt-2 text-sm text-foreground">
-                                {t('audit.auditLogViewer.expanded.fieldsUpdated', {
-                                  count: Object.keys(entry.changes?.after || {}).length,
-                                })}
-                              </p>
+                              {/* #9672: only an update with a recorded before-state has a field count to report. */}
+                              {Object.keys(entry.changes?.before || {}).length > 0 && (
+                                <p className="mt-2 text-sm text-foreground">
+                                  {t('audit.auditLogViewer.expanded.fieldsUpdated', {
+                                    count: Object.keys(entry.changes?.after || {}).length,
+                                  })}
+                                </p>
+                              )}
                               <button
                                 type="button"
                                 onClick={() => setSelectedEntry(entry)}

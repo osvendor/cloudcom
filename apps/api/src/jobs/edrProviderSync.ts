@@ -1,0 +1,1159 @@
+import { Job, type JobsOptions, Queue, UnrecoverableError, Worker } from 'bullmq';
+import { and, eq, ne, sql } from 'drizzle-orm';
+import { createInstrumentedQueue } from '../services/bullmqQueue';
+import { enqueueOrReplaceStale } from '../services/bullmqUtils';
+import * as dbModule from '../db';
+import { edrConnections, edrTenants } from '../db/schema';
+import { getBullMQConnection, getRedis } from '../services/redis';
+import { ackEdrHints, readEdrHints, type EdrHintSnapshot } from '../services/edrProviders/hints';
+import { captureException } from '../services/sentry';
+import { decryptEdrSecret } from '../services/edrProviders/credentials';
+import { getEdrProvider } from '../services/edrProviders/registry';
+import { buildEdrAdapterContext } from '../services/edrProviders/context';
+import { isStreamDue, planCadence } from '../services/edrProviders/scheduler';
+import {
+  EdrProviderRequestError,
+  type EdrAdapterContext,
+  type EdrDetectionPage,
+  type EdrDetectionRef,
+  type EdrProviderAdapter,
+} from '../services/edrProviders/types';
+import {
+  applyDetectionStatusUpdates,
+  clearExpiredTenantDenials,
+  isDeadlockError,
+  loadOpenDetectionRefs,
+  persistDetections,
+  persistInventory,
+  pruneMissingTenantEndpoints,
+  refreshDetectionDeviceLinks,
+  upsertTenants,
+  type EdrSyncTx,
+  type InventoryFetch,
+  type TenantFetch,
+} from '../services/edrProviders/persist';
+import { autoMapEdrTenants } from '../services/edrProviders/mapping';
+import { matchEdrEndpoints, strictMatchingFor } from '../services/edrProviders/deviceMatching';
+import {
+  evaluateEdrAlerts,
+  evaluateEdrEndpointHealth,
+  evaluateEdrStaleTenants,
+} from '../services/edrProviders/alerts';
+import { EDR_ACTION_UNKNOWN_GIVEUP_MS, pollEdrActionStatus } from '../services/edrProviders/actionStatus';
+import { ensureBuiltinPackage, getBuiltinPackage } from '../services/builtinDeploymentPackages';
+import {
+  installerRefreshDue,
+  installerStateSelect,
+  persistInstallerOutcomes,
+  pickInstallerFetches,
+  type InstallerOutcome,
+} from '../services/edrProviders/installerMaterial';
+import { isEdrInstallerProviderKey, type EdrInstallerProviderKey } from '../services/edrProviders/providerKeys';
+import { attachWorkerObservability } from './workerObservability';
+import { isFinalSyncAttempt, reportTerminalSyncFailure } from './syncAttempt';
+
+/**
+ * External EDR provider sync (#8164 W01b). Two independent streams per
+ * connection -- inventory (tenants + endpoints) and detections -- each with its
+ * own job id so neither coalesces the other away. Mirrors backupProviderSync.ts
+ * (three phases, final-attempt error recording, reauth marker).
+ */
+export const EDR_PROVIDER_SYNC_QUEUE = 'edr-provider-sync';
+
+export type EdrSyncStream = 'inventory' | 'detections';
+export type EdrSyncJobData =
+  | { type: 'sync-all' }
+  | { type: 'sync-inventory'; connectionId: string }
+  | { type: 'sync-detections'; connectionId: string }
+  /** W03 (#8167): settle open response actions; never re-sends (actionStatus.ts). */
+  | { type: 'sync-action-status'; connectionId: string };
+
+export const EDR_PROVIDER_SYNC_JOB_OPTS: Omit<JobsOptions, 'jobId'> = {
+  removeOnComplete: { count: 50 },
+  removeOnFail: { count: 200 },
+  attempts: 3,
+  backoff: { type: 'exponential', delay: 5000 },
+};
+
+let queue: Queue<EdrSyncJobData> | null = null;
+
+/** `createInstrumentedQueue` so an enqueue inside a held request transaction trips the #1105 tripwire. */
+export function getEdrProviderSyncQueue(): Queue<EdrSyncJobData> {
+  if (!queue) queue = createInstrumentedQueue<EdrSyncJobData>(EDR_PROVIDER_SYNC_QUEUE);
+  return queue;
+}
+
+export function edrSyncJobId(stream: EdrSyncStream, connectionId: string): string {
+  return `edr-${stream}-${connectionId}`;
+}
+
+/**
+ * Queue one stream for one connection (scheduled sync and "Sync now" coalesce on the job id).
+ * `rerun` uses a separate id: a running job that dropped a tenant at its Phase-3 fence asks for a
+ * follow-up run, and under its own id enqueueOrReplaceStale would return the ACTIVE job itself
+ * and queue nothing. Both ids serialize on the Phase-3 advisory lock.
+ */
+export async function enqueueEdrSync(
+  connectionId: string,
+  stream: EdrSyncStream,
+  o: { rerun?: boolean } = {},
+): Promise<string> {
+  if (!connectionId) throw new Error('enqueueEdrSync requires a connection id');
+  const type = stream === 'inventory' ? 'sync-inventory' : 'sync-detections';
+  const { id } = await enqueueOrReplaceStale(
+    getEdrProviderSyncQueue(),
+    type,
+    o.rerun ? `${edrSyncJobId(stream, connectionId)}-rerun` : edrSyncJobId(stream, connectionId),
+    { type, connectionId } as EdrSyncJobData,
+    EDR_PROVIDER_SYNC_JOB_OPTS,
+    '[EdrProviderSync]',
+  );
+  return id;
+}
+
+export function edrActionStatusJobId(connectionId: string): string {
+  return `edr-action-status-${connectionId}`;
+}
+
+/** Queue one action-status pass for a connection (coalesces on the job id). */
+export async function enqueueEdrActionStatus(connectionId: string): Promise<string> {
+  if (!connectionId) throw new Error('enqueueEdrActionStatus requires a connection id');
+  const { id } = await enqueueOrReplaceStale(
+    getEdrProviderSyncQueue(),
+    'sync-action-status',
+    edrActionStatusJobId(connectionId),
+    { type: 'sync-action-status', connectionId },
+    EDR_PROVIDER_SYNC_JOB_OPTS,
+    '[EdrProviderSync]',
+  );
+  return id;
+}
+
+export async function shutdownEdrProviderSyncQueue(): Promise<void> {
+  if (!queue) return;
+  await queue.close();
+  queue = null;
+}
+
+const { db } = dbModule;
+const runWithSystemDbAccess = async <T>(fn: () => Promise<T>, label: string): Promise<T> => {
+  if (typeof dbModule.withSystemDbAccessContext !== 'function') {
+    throw new Error('[EdrProviderSync] withSystemDbAccessContext is not available');
+  }
+  return dbModule.withSystemDbAccessContext(fn, label);
+};
+
+/** Vendor calls assumed per tenant/connection when an adapter declares no `capabilities.estimatedCalls`. */
+export const DEFAULT_ESTIMATED_CALLS = { perTenantDetection: 1, perTenantInventory: 3, perConnectionOverhead: 2 } as const;
+
+const SYNC_ALL_INTERVAL_MINUTES = 5;
+const ADVISORY_LOCK_NAMESPACE = 'edr-provider-sync';
+const MAX_SYNC_ERROR_LENGTH = 2000;
+/** Endpoints re-enriched per mapped tenant per inventory run, stalest first. */
+const DETAIL_ENRICH_PER_RUN = 50;
+/** Phase 3 retries on a Postgres deadlock (40P01) -- see persist.ts LOCK ORDER note. */
+const MAX_DEADLOCK_RETRIES = 3;
+
+/** Sentinel on an UnrecoverableError for a rejected credential (the typed error does not survive BullMQ). */
+const EDR_REAUTH_MARKER = '[edr-provider-reauth]';
+
+let edrProviderSyncWorker: Worker<EdrSyncJobData> | null = null;
+
+// ---------------------------------------------------------------------------
+// Due-ness
+// ---------------------------------------------------------------------------
+
+export interface DueRow {
+  connectionId: string;
+  lastInventorySyncAt: Date | null;
+  lastDetectionSyncAt: Date | null;
+  inventoryIntervalMinutes: number;
+  detectionIntervalMinutes: number;
+  /** W03 PR-B: unacked push-hint marker (`edr_connections.pending_hint_at`). */
+  pendingHintAt?: Date | null;
+}
+
+/**
+ * A pending hint makes detections due when it is newer than the last detection
+ * sync, or when it outlived a sync that finished at least one sync-all period
+ * ago: the run that saw it queued a `rerun`, but that enqueue may have coalesced
+ * into an already-active rerun job, so the sweep is the durable fallback.
+ */
+function isHintDue(row: DueRow, now: Date): boolean {
+  const hint = row.pendingHintAt;
+  if (!hint) return false;
+  const last = row.lastDetectionSyncAt;
+  if (!last || hint.getTime() > last.getTime()) return true;
+  return now.getTime() - last.getTime() >= SYNC_ALL_INTERVAL_MINUTES * 60_000;
+}
+
+/** PURE: which (connection, stream) pairs are due now. Each stream uses its own interval. */
+export function selectDueStreams(
+  rows: DueRow[],
+  now: Date,
+): Array<{ connectionId: string; stream: EdrSyncStream }> {
+  const out: Array<{ connectionId: string; stream: EdrSyncStream }> = [];
+  for (const row of rows) {
+    if (isStreamDue(row.lastInventorySyncAt, row.inventoryIntervalMinutes, now)) {
+      out.push({ connectionId: row.connectionId, stream: 'inventory' });
+    }
+    if (isStreamDue(row.lastDetectionSyncAt, row.detectionIntervalMinutes, now) || isHintDue(row, now)) {
+      out.push({ connectionId: row.connectionId, stream: 'detections' });
+    }
+  }
+  return out;
+}
+
+
+/**
+ * Phase 4 (#8166): post-commit notification, OUTSIDE any db context and after
+ * Phase 3 committed. Its own try/catch: an alert-path outage is logged and
+ * never fails the sync job or marks the connection errored.
+ */
+async function runPhase4(label: string, connectionId: string, fn: () => Promise<unknown>): Promise<void> {
+  try {
+    await dbModule.runOutsideDbContext(fn);
+  } catch (error) {
+    console.error(`[EdrProviderSync] Connection ${connectionId}: ${label} failed (sync result kept):`, error);
+    captureException(error instanceof Error ? error : new Error(String(error)), undefined, {
+      service: 'edrProviderSync', operation: label, connectionId,
+    });
+  }
+}
+
+/**
+ * Connections (of `ids`) that have open (queued/submitted) actions for the
+ * status pass. Runs under system context; one scan on edr_actions_open_status_idx.
+ * A row a remap detached is skipped until it is past the give-up window — the
+ * reconciler can only fail it then (`detached_unsettled`), so an earlier job
+ * would be a no-op every tick.
+ */
+export async function connectionsWithOpenEdrActions(ids: string[], now: Date): Promise<string[]> {
+  if (ids.length === 0) return [];
+  const giveUpBefore = new Date(now.getTime() - EDR_ACTION_UNKNOWN_GIVEUP_MS);
+  const open = (await runWithSystemDbAccess(() => db.execute(sql`
+    SELECT DISTINCT connection_id FROM edr_actions
+    WHERE status IN ('queued', 'submitted')
+      AND (detached_at IS NULL OR requested_at < ${giveUpBefore.toISOString()}::timestamptz)
+      AND connection_id IN (${sql.join(ids.map((id) => sql`${id}::uuid`), sql`, `)})
+  `), 'edrProviderSync.openActions')) as unknown as Array<{ connection_id: string }>;
+  return open.map((r) => r.connection_id);
+}
+
+async function processSyncAll(): Promise<{ queued: number }> {
+  // partner-axis table: a contextless read silently returns 0 rows (#1375).
+  // `reauth_required` connections are skipped; only "Sync now" after a credentials PATCH retries them.
+  const candidates = await runWithSystemDbAccess(() => db
+    .select({
+      id: edrConnections.id,
+      provider: edrConnections.provider,
+      lastInventorySyncAt: edrConnections.lastInventorySyncAt,
+      lastDetectionSyncAt: edrConnections.lastDetectionSyncAt,
+      pendingHintAt: edrConnections.pendingHintAt,
+      effectiveInventory: edrConnections.effectiveInventoryIntervalMinutes,
+      effectiveDetection: edrConnections.effectiveDetectionIntervalMinutes,
+      requestedInventory: edrConnections.inventoryIntervalMinutes,
+      requestedDetection: edrConnections.detectionIntervalMinutes,
+    })
+    .from(edrConnections)
+    .where(and(eq(edrConnections.isActive, true), ne(edrConnections.status, 'reauth_required'))),
+  'edrProviderSync.scan');
+
+  const rows: DueRow[] = [];
+  for (const c of candidates) {
+    let adapter: EdrProviderAdapter;
+    try {
+      adapter = getEdrProvider(c.provider);
+    } catch (error) {
+      console.error(`[EdrProviderSync] Connection ${c.id}: ${error instanceof Error ? error.message : error}`);
+      continue;
+    }
+    const d = adapter.capabilities.defaultIntervals;
+    rows.push({
+      connectionId: c.id,
+      lastInventorySyncAt: c.lastInventorySyncAt,
+      lastDetectionSyncAt: c.lastDetectionSyncAt,
+      pendingHintAt: c.pendingHintAt ?? null,
+      inventoryIntervalMinutes: c.effectiveInventory ?? Math.max(c.requestedInventory ?? d.inventoryMinutes, d.inventoryMinutes),
+      detectionIntervalMinutes: c.effectiveDetection ?? Math.max(c.requestedDetection ?? d.detectionsMinutes, d.detectionsMinutes),
+    });
+  }
+
+  // Enqueue with NO transaction held (#1105).
+  const due = selectDueStreams(rows, new Date());
+  await Promise.all(due.map((d) => enqueueEdrSync(d.connectionId, d.stream)));
+
+  // W03 (#8167): connections with open (queued/submitted) actions get a
+  // status pass. One scan on edr_actions_open_status_idx; never fails the tick.
+  await runPhase4('enqueueEdrActionStatus', 'all', async () => {
+    const ids = candidates.map((c) => c.id);
+    if (ids.length === 0) return;
+    for (const connectionId of await connectionsWithOpenEdrActions(ids, new Date())) {
+      try {
+        await enqueueEdrActionStatus(connectionId);
+      } catch (error) {
+        console.error(`[EdrProviderSync] Failed to queue action status for ${connectionId}:`, error);
+      }
+    }
+  });
+
+  // D10 (#8166): stale mapped tenants are checked on the tick, not after a
+  // sync, because a connection whose every sync throws before Phase 3 never
+  // reaches a post-commit hook. Never fails the tick.
+  await runPhase4('evaluateEdrStaleTenants', 'all', () => evaluateEdrStaleTenants(new Date()));
+  return { queued: due.length };
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function isEdrReauthFailure(error: unknown): boolean {
+  if (error instanceof EdrProviderRequestError) return error.reauth;
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes(EDR_REAUTH_MARKER);
+}
+
+/** Decrypted credential values worth scrubbing from any error text we persist (short values are noise). */
+function secretsOf(creds: unknown): string[] {
+  if (!creds || typeof creds !== 'object') return [];
+  return Object.values(creds as Record<string, unknown>)
+    .filter((v): v is string => typeof v === 'string' && v.length >= 4);
+}
+
+function scrub(text: string, secrets: readonly string[]): string {
+  let out = text;
+  for (const secret of secrets) out = out.split(secret).join('[redacted]');
+  return out;
+}
+
+function safeMessage(error: unknown, secrets: readonly string[] = []): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return scrub(message, secrets).slice(0, 500);
+}
+
+/** Every fetch attempted failed (and at least one was attempted): fail closed instead of recording success. */
+function throwIfAllFailed(results: ReadonlyArray<{ ok: boolean; error?: string }>): void {
+  if (results.length === 0) return;
+  const failures = results.filter((r) => !r.ok);
+  if (failures.length !== results.length) return;
+  throw new Error(`All ${results.length} tenant fetch(es) failed: ${failures[0]!.error ?? 'unknown error'}`);
+}
+
+/** Live tenant org / cursor as read inside the Phase-3 tx, keyed by vendor tenant id. */
+async function readCurrentTenants(
+  tx: EdrSyncTx,
+  connectionId: string,
+): Promise<Map<string, { orgId: string | null; detectionCursor: string | null }>> {
+  const rows = (await (tx as unknown as typeof db)
+    .select({
+      vendorTenantId: edrTenants.vendorTenantId,
+      orgId: edrTenants.orgId,
+      detectionCursor: edrTenants.detectionCursor,
+    })
+    .from(edrTenants)
+    .where(eq(edrTenants.connectionId, connectionId))) as Array<{
+    vendorTenantId: string; orgId: string | null; detectionCursor: string | null;
+  }>;
+  return new Map(rows.map((r) => [r.vendorTenantId, r]));
+}
+
+/** W03 PR-B: push-hint snapshot for a detections run, outside any DB context; null on failure. */
+async function snapshotHints(connectionId: string): Promise<EdrHintSnapshot | null> {
+  try {
+    return await dbModule.runOutsideDbContext(() => readEdrHints(connectionId, getRedis()));
+  } catch (error) {
+    console.error(`[EdrProviderSync] Connection ${connectionId}: push-hint snapshot failed (marker kept):`, error);
+    return null;
+  }
+}
+
+/**
+ * W03 PR-B: after Phase 3 COMMITTED, ack exactly the snapshot. Returns true when
+ * a newer hint is still pending (the caller enqueues one rerun). A failure keeps
+ * the sync result and the marker; `sync-all` picks the connection up.
+ */
+async function acknowledgeHints(connectionId: string, snap: EdrHintSnapshot): Promise<boolean> {
+  try {
+    const { stillPending } = await dbModule.runOutsideDbContext(() => ackEdrHints(connectionId, snap, getRedis()));
+    return stillPending;
+  } catch (error) {
+    console.error(`[EdrProviderSync] Connection ${connectionId}: push-hint ack failed (sync result kept):`, error);
+    return false;
+  }
+}
+
+/** Best-effort re-run of a stream whose tenants were dropped by the per-tenant fence. */
+async function reenqueueStream(connectionId: string, stream: EdrSyncStream): Promise<void> {
+  try {
+    await dbModule.runOutsideDbContext(() => enqueueEdrSync(connectionId, stream, { rerun: true }));
+  } catch (error) {
+    console.error(`[EdrProviderSync] Failed to re-enqueue ${stream} sync for ${connectionId}:`, error);
+  }
+}
+
+/** Run `fn` over `items` with bounded concurrency; the first thrown error stops new work and is rethrown. */
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  let failure: { error: unknown } | null = null;
+  const worker = async () => {
+    while (!failure) {
+      const i = next++;
+      if (i >= items.length) return;
+      try {
+        results[i] = await fn(items[i]!);
+      } catch (error) {
+        failure ??= { error };
+        return;
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.max(1, Math.min(concurrency, items.length)) }, worker));
+  if (failure) throw (failure as { error: unknown }).error;
+  return results;
+}
+
+const deadlockBackoffMs = (attempt: number): number => 10 * attempt + Math.floor(Math.random() * 25);
+
+interface LoadedTenant {
+  id: string;
+  vendorTenantId: string;
+  orgId: string | null;
+  apiHost: string | null;
+  detectionCursor: string | null;
+  installerHasMaterial: boolean;
+  installerFetchedAt: Date | null;
+  installerExpiresAt: Date | null;
+  installerFetchError: string | null;
+}
+
+/** The provider key when this run should refresh installer material: installer-capable AND released. */
+function installerRefreshProvider(adapter: EdrProviderAdapter): EdrInstallerProviderKey | null {
+  if (adapter.capabilities.installer === 'none' || !adapter.fetchInstallerMaterial) return null;
+  if (!isEdrInstallerProviderKey(adapter.key)) return null;
+  return getBuiltinPackage(adapter.key).released ? adapter.key : null;
+}
+
+/**
+ * Connections created before the package was released get their catalog row on
+ * the first run after it. Idempotent. A failure here must not cost the run its
+ * inventory; the next run tries again.
+ */
+async function provisionInstallerPackage(provider: EdrInstallerProviderKey, partnerId: string): Promise<void> {
+  try {
+    await ensureBuiltinPackage({ provider, partnerId });
+  } catch (error) {
+    console.error(`[EdrProviderSync] Failed to provision the ${provider} package for partner ${partnerId}:`, error);
+    captureException(error instanceof Error ? error : new Error(String(error)));
+  }
+}
+
+/**
+ * Phase 2, after inventory. An installer outcome never fails inventory, so every
+ * throw (a 401 included) becomes `vendor_error` for that tenant: the inventory
+ * calls alone decide the connection's status. No vendor text is kept.
+ */
+async function fetchInstallerOutcomes(
+  adapter: EdrProviderAdapter,
+  ctx: EdrAdapterContext,
+  tenants: LoadedTenant[],
+): Promise<Array<InstallerOutcome & { vendorTenantId: string }>> {
+  return mapWithConcurrency(tenants, adapter.capabilities.tenantFetchConcurrency, async (t) => {
+    const ids = { tenantId: t.id, vendorTenantId: t.vendorTenantId };
+    try {
+      const result = await adapter.fetchInstallerMaterial!(ctx, { vendorTenantId: t.vendorTenantId, apiHost: t.apiHost });
+      return { ...ids, ...result };
+    } catch (error) {
+      // The code or class only: vendor and adapter messages can quote the link.
+      if (error instanceof EdrProviderRequestError) {
+        console.warn(`[EdrProviderSync] installer fetch for tenant ${t.id} failed (${error.code})`);
+      } else {
+        const kind = error instanceof Error ? error.name : typeof error;
+        console.warn(`[EdrProviderSync] installer fetch for tenant ${t.id} threw (${kind})`);
+        captureException(new Error(`EDR installer fetch threw ${kind}`), undefined, {
+          service: 'edrProviderSync', operation: 'fetchInstallerMaterial', tenantId: t.id,
+        });
+      }
+      return { ...ids, ok: false as const, code: 'vendor_error' as const };
+    }
+  });
+}
+
+interface LoadedConnection {
+  row: typeof edrConnections.$inferSelect;
+  tenants: LoadedTenant[];
+  /** inventory only: tenant row id -> stalest vendor endpoint ids to enrich */
+  staleDetailIds: Map<string, string[]>;
+  /** inventory only: tenant row id -> every vendor endpoint id already stored */
+  knownEndpointIds: Map<string, Set<string>>;
+  /** inventory only, `reread_open_on_inventory` adapters: tenant row id -> live open detections to re-read (stalest first) */
+  openDetections: Map<string, EdrDetectionRef[]>;
+}
+
+/** Open detections re-read per mapped tenant per inventory run unless the adapter declares `rereadOpenPerRun`. */
+const DEFAULT_REREAD_OPEN_PER_RUN = 20;
+
+function rereadCap(adapter: EdrProviderAdapter): number {
+  return adapter.capabilities.detectionStatusModel === 'reread_open_on_inventory' && adapter.rereadDetectionStatus
+    ? (adapter.capabilities.rereadOpenPerRun ?? DEFAULT_REREAD_OPEN_PER_RUN)
+    : 0;
+}
+
+/**
+ * Endpoints to enrich this run: ones fetched for the first time (so a newly mapped company shows
+ * health / online / last-seen on its first sync, not an inventory cycle later), then the stalest
+ * stored ones, capped at DETAIL_ENRICH_PER_RUN.
+ */
+function enrichmentTargets(fetchedIds: readonly string[], known: ReadonlySet<string>, stale: readonly string[]): string[] {
+  const fresh = fetchedIds.filter((id) => !known.has(id));
+  return [...new Set([...fresh, ...stale])].slice(0, DETAIL_ENRICH_PER_RUN);
+}
+
+async function loadForSync(connectionId: string, stream: EdrSyncStream): Promise<LoadedConnection | null> {
+  return runWithSystemDbAccess(async () => {
+    const [row] = await db.select().from(edrConnections).where(eq(edrConnections.id, connectionId)).limit(1);
+    if (!row) {
+      console.warn(`[EdrProviderSync] Connection ${connectionId} not found, skipping sync`);
+      return null;
+    }
+    if (!row.isActive) {
+      console.warn(`[EdrProviderSync] Connection ${connectionId} is inactive, skipping sync`);
+      return null;
+    }
+    await db
+      .update(edrConnections)
+      .set(stream === 'inventory'
+        ? { lastInventorySyncStatus: 'running', lastInventorySyncError: null }
+        : { lastDetectionSyncStatus: 'running', lastDetectionSyncError: null })
+      .where(eq(edrConnections.id, connectionId));
+
+    const tenants = await db
+      .select({
+        id: edrTenants.id,
+        vendorTenantId: edrTenants.vendorTenantId,
+        orgId: edrTenants.orgId,
+        apiHost: edrTenants.apiHost,
+        detectionCursor: edrTenants.detectionCursor,
+        ...installerStateSelect(),
+      })
+      .from(edrTenants)
+      .where(and(eq(edrTenants.connectionId, connectionId), sql`${edrTenants.vendorMissingSince} IS NULL`));
+
+    const staleDetailIds = new Map<string, string[]>();
+    const knownEndpointIds = new Map<string, Set<string>>();
+    if (stream === 'inventory') {
+      // Every stored endpoint id (so phase 2 can tell which fetched endpoints are NEW), ranked
+      // stalest-detail first per tenant.
+      const rows = (await db.execute(sql`
+        SELECT tenant_id, vendor_endpoint_id,
+               row_number() OVER (PARTITION BY tenant_id ORDER BY vendor_detail_synced_at ASC NULLS FIRST) AS rn
+        FROM edr_endpoints WHERE connection_id = ${connectionId}::uuid
+      `)) as unknown as Array<{ tenant_id: string; vendor_endpoint_id: string; rn: number | string }>;
+      for (const r of rows) {
+        const known = knownEndpointIds.get(r.tenant_id) ?? new Set<string>();
+        known.add(r.vendor_endpoint_id);
+        knownEndpointIds.set(r.tenant_id, known);
+        if (Number(r.rn) <= DETAIL_ENRICH_PER_RUN) {
+          const list = staleDetailIds.get(r.tenant_id) ?? [];
+          list.push(r.vendor_endpoint_id);
+          staleDetailIds.set(r.tenant_id, list);
+        }
+      }
+    }
+    let openDetections = new Map<string, EdrDetectionRef[]>();
+    if (stream === 'inventory') {
+      let cap = 0;
+      try {
+        cap = rereadCap(getEdrProvider(row.provider));
+      } catch (error) {
+        // An unknown provider fails loudly later, in the main flow; log so a bug here cannot silently disable the re-read.
+        console.error(`[EdrProviderSync] Connection ${connectionId}: re-read capability lookup failed:`, error);
+      }
+      if (cap > 0) {
+        openDetections = await loadOpenDetectionRefs(
+          db as unknown as EdrSyncTx,
+          connectionId,
+          tenants.filter((t) => t.orgId).map((t) => t.id),
+          cap,
+        );
+      }
+    }
+    return { row, tenants, staleDetailIds, knownEndpointIds, openDetections };
+  }, `edrProviderSync.load.${stream}`);
+}
+
+function buildContext(
+  adapter: EdrProviderAdapter,
+  row: typeof edrConnections.$inferSelect,
+): { ctx: EdrAdapterContext; secrets: string[] } {
+  const creds = decryptEdrSecret('connection_credentials', row.id, row.credentialsEncrypted);
+  const ctx = buildEdrAdapterContext(adapter, {
+    creds,
+    baseUrl: row.baseUrl,
+    region: row.region,
+    vendorRootId: row.vendorRootId,
+  });
+  return { ctx, secrets: secretsOf(creds) };
+}
+
+type CredentialTuple = Pick<
+  typeof edrConnections.$inferSelect,
+  'credentialsEncrypted' | 'baseUrl' | 'region' | 'vendorRootId'
+>;
+
+/** The fence: same credential material the run loaded in Phase 1. */
+function sameCredentialTuple(current: CredentialTuple, loaded: CredentialTuple): boolean {
+  return current.credentialsEncrypted === loaded.credentialsEncrypted
+    && current.baseUrl === loaded.baseUrl
+    && current.region === loaded.region
+    && current.vendorRootId === loaded.vendorRootId;
+}
+
+/**
+ * Phase 3 wrapper: ONE system tx under the per-connection advisory lock. Re-reads
+ * the connection FOR UPDATE and returns null (writes nothing) when it was deleted,
+ * deactivated, or its credential material changed during the vendor fetch -- the
+ * fence is the credential tuple (not updated_at) because the two streams write
+ * the same row concurrently. A deadlock (40P01 against a device delete / org
+ * move, which lock in the opposite order) retries the whole tx with the fence
+ * re-read each time.
+ */
+async function runPhase3<T>(
+  loaded: LoadedConnection,
+  label: string,
+  body: (tx: EdrSyncTx, current: { id: string; partnerId: string; provider: string }) => Promise<T>,
+): Promise<T | null> {
+  const row = loaded.row;
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await runWithSystemDbAccess(async () => {
+        await db.execute(sql`
+          SELECT pg_advisory_xact_lock(hashtext(${ADVISORY_LOCK_NAMESPACE}), hashtext(${row.id}))
+        `);
+        const [current] = await db
+          .select({
+            id: edrConnections.id,
+            partnerId: edrConnections.partnerId,
+            provider: edrConnections.provider,
+            isActive: edrConnections.isActive,
+            credentialsEncrypted: edrConnections.credentialsEncrypted,
+            baseUrl: edrConnections.baseUrl,
+            region: edrConnections.region,
+            vendorRootId: edrConnections.vendorRootId,
+          })
+          .from(edrConnections)
+          .where(eq(edrConnections.id, row.id))
+          .for('update')
+          .limit(1);
+        if (!current || !current.isActive) return null;
+        if (!sameCredentialTuple(current, row)) return null;
+        return body(db as unknown as EdrSyncTx, current);
+      }, label);
+    } catch (error) {
+      if (isDeadlockError(error) && attempt < MAX_DEADLOCK_RETRIES) {
+        await new Promise((r) => setTimeout(r, deadlockBackoffMs(attempt + 1)));
+        continue;
+      }
+      throw error;
+    }
+  }
+}
+
+async function recordSyncFailure(
+  loaded: LoadedConnection,
+  stream: EdrSyncStream,
+  message: string,
+  reauth: boolean,
+): Promise<void> {
+  // A FRESH transaction: phase 3's is rolling back as we unwind. Fenced on the credential tuple
+  // loaded in Phase 1 (row locked FOR UPDATE), so a stale in-flight job holding an old key cannot
+  // flip a freshly re-credentialled connection to reauth_required / error.
+  const connectionId = loaded.row.id;
+  const clipped = message.slice(0, MAX_SYNC_ERROR_LENGTH);
+  try {
+    await dbModule.runOutsideDbContext(() => runWithSystemDbAccess(async () => {
+      const [current] = await db
+        .select({
+          credentialsEncrypted: edrConnections.credentialsEncrypted,
+          baseUrl: edrConnections.baseUrl,
+          region: edrConnections.region,
+          vendorRootId: edrConnections.vendorRootId,
+        })
+        .from(edrConnections)
+        .where(eq(edrConnections.id, connectionId))
+        .for('update')
+        .limit(1);
+      if (!current || !sameCredentialTuple(current, loaded.row)) return;
+      await db
+        .update(edrConnections)
+        .set({
+          ...(stream === 'inventory'
+            ? { lastInventorySyncStatus: 'error' as const, lastInventorySyncError: clipped }
+            : { lastDetectionSyncStatus: 'error' as const, lastDetectionSyncError: clipped }),
+          ...(reauth ? { status: 'reauth_required' as const } : {}),
+          updatedAt: new Date(),
+        })
+        .where(eq(edrConnections.id, connectionId));
+    }, 'edrProviderSync.recordError'));
+  } catch (dbError) {
+    console.error(`[EdrProviderSync] Failed to record sync error for ${connectionId}:`, dbError);
+    captureException(dbError instanceof Error ? dbError : new Error(String(dbError)));
+  }
+}
+
+/**
+ * Phase 3's fence wrote nothing (connection deleted, deactivated or re-credentialled), so undo
+ * Phase 1's `running` marker: an inactive connection is never polled again and would otherwise
+ * show as syncing forever. Restores the status/error read in Phase 1, only while still `running`.
+ */
+async function releaseRunningStatus(loaded: LoadedConnection, stream: EdrSyncStream): Promise<void> {
+  const { row } = loaded;
+  try {
+    await runWithSystemDbAccess(() => db
+      .update(edrConnections)
+      .set(stream === 'inventory'
+        ? { lastInventorySyncStatus: row.lastInventorySyncStatus, lastInventorySyncError: row.lastInventorySyncError }
+        : { lastDetectionSyncStatus: row.lastDetectionSyncStatus, lastDetectionSyncError: row.lastDetectionSyncError })
+      .where(and(
+        eq(edrConnections.id, row.id),
+        stream === 'inventory'
+          ? eq(edrConnections.lastInventorySyncStatus, 'running')
+          : eq(edrConnections.lastDetectionSyncStatus, 'running'),
+      )), 'edr-sync-release-running');
+  } catch (dbError) {
+    console.error(`[EdrProviderSync] Failed to release running status for ${row.id}:`, dbError);
+    captureException(dbError instanceof Error ? dbError : new Error(String(dbError)));
+  }
+}
+
+async function handleSyncError(
+  error: unknown,
+  loaded: LoadedConnection,
+  stream: EdrSyncStream,
+  isFinalAttempt: boolean,
+  secrets: readonly string[],
+): Promise<never> {
+  const message = scrub(error instanceof Error ? error.message : String(error), secrets);
+  const reauth = isEdrReauthFailure(error);
+  // rate_limited / rate_budget_exhausted are connection-scope but NOT reauth: they
+  // fall through to a plain rethrow so BullMQ backs off; nothing was persisted.
+  if (isFinalAttempt || reauth) {
+    await recordSyncFailure(loaded, stream, message, reauth);
+    // Connection health (W4): observe this kind soon instead of at its next poll.
+    reportTerminalSyncFailure('edr');
+  }
+  if (reauth) {
+    throw error instanceof UnrecoverableError ? error : new UnrecoverableError(`${EDR_REAUTH_MARKER} ${message}`);
+  }
+  throw error;
+}
+
+function requireRoot(row: typeof edrConnections.$inferSelect): string {
+  if (!row.vendorRootId) {
+    throw new UnrecoverableError(
+      `${EDR_REAUTH_MARKER} connection ${row.id} has no vendor root id -- re-test the connection`,
+    );
+  }
+  return row.vendorRootId;
+}
+
+// ---------------------------------------------------------------------------
+// Inventory stream
+// ---------------------------------------------------------------------------
+
+export async function syncEdrInventory(
+  connectionId: string,
+  options: { isFinalAttempt?: boolean } = {},
+): Promise<void> {
+  const isFinalAttempt = options.isFinalAttempt ?? true;
+
+  // ---- phase 1 ---------------------------------------------------------
+  const loaded = await loadForSync(connectionId, 'inventory');
+  if (!loaded) return;
+
+  let secrets: string[] = [];
+  try {
+    const rootId = requireRoot(loaded.row);
+    const adapter = getEdrProvider(loaded.row.provider);
+    const built = buildContext(adapter, loaded.row);
+    const ctx = built.ctx;
+    secrets = built.secrets;
+    const byVendorId = new Map(loaded.tenants.map((t) => [t.vendorTenantId, t]));
+    // Dormant providers stop here: no catalog row, no installer call (#8170).
+    const installerProvider = installerRefreshProvider(adapter);
+    if (installerProvider) await provisionInstallerPackage(installerProvider, loaded.row.partnerId);
+
+    // ---- phase 2 (NO DB) ---------------------------------------------
+    const fetched = await dbModule.runOutsideDbContext(async () => {
+      // listTenants is all-or-nothing: a failure throws and nothing is written.
+      const vendorTenants = await adapter.listTenants(ctx, { id: rootId, type: loaded.row.vendorRootType });
+      const results = await mapWithConcurrency(
+        vendorTenants,
+        adapter.capabilities.tenantFetchConcurrency,
+        async (t): Promise<TenantFetch<InventoryFetch>> => {
+          const known = byVendorId.get(t.vendorTenantId);
+          const ref = { vendorTenantId: t.vendorTenantId, apiHost: known?.apiHost ?? t.apiHost };
+          try {
+            if (!known?.orgId) {
+              // Unmapped: counted, never stored (D5).
+              return {
+                vendorTenantId: t.vendorTenantId,
+                ok: true,
+                value: {
+                  endpoints: [],
+                  details: [],
+                  count: adapter.countEndpoints ? await adapter.countEndpoints(ctx, ref) : undefined,
+                },
+              };
+            }
+            const endpoints = await adapter.listEndpoints(ctx, ref);
+            const details = adapter.enrichEndpoints
+              ? await adapter.enrichEndpoints(ctx, ref, enrichmentTargets(
+                endpoints.map((e) => e.vendorEndpointId),
+                loaded.knownEndpointIds.get(known.id) ?? new Set(),
+                loaded.staleDetailIds.get(known.id) ?? [],
+              ))
+              : [];
+            // A5: status changes on already-seen detections arrive by re-reading the open ones
+            // (read-only vendor calls). A throw fails this tenant's inventory like any endpoint failure.
+            const refs = loaded.openDetections.get(known.id) ?? [];
+            const reread = refs.length > 0 && adapter.rereadDetectionStatus
+              ? { refs, updates: await adapter.rereadDetectionStatus(ctx, ref, refs) }
+              : undefined;
+            return { vendorTenantId: t.vendorTenantId, ok: true, value: { endpoints, details, reread } };
+          } catch (err) {
+            // reauth / budget / rate limit: the whole run fails.
+            if (err instanceof EdrProviderRequestError && err.scope === 'connection') throw err;
+            return { vendorTenantId: t.vendorTenantId, ok: false, error: safeMessage(err, secrets), scope: 'tenant' };
+          }
+        },
+      );
+      // Only tenants the vendor still lists this run; a tombstone is not worth a call.
+      const listed = new Set(vendorTenants.map((t) => t.vendorTenantId));
+      const now = new Date();
+      const installerDue = installerProvider
+        ? loaded.tenants.filter((t) => listed.has(t.vendorTenantId) && installerRefreshDue({
+            orgId: t.orgId,
+            hasMaterial: t.installerHasMaterial,
+            fetchedAt: t.installerFetchedAt,
+            expiresAt: t.installerExpiresAt,
+            fetchError: t.installerFetchError,
+          }, now))
+        : [];
+      const installerOutcomes = await fetchInstallerOutcomes(adapter, ctx, pickInstallerFetches(installerDue));
+      return { vendorTenants, results, installerOutcomes };
+    });
+
+    throwIfAllFailed(fetched.results);
+
+    // ---- phase 3 -------------------------------------------------------
+    const done = await runPhase3(loaded, 'edrProviderSync.persistInventory', async (tx, current) => {
+      const now = new Date();
+      const conn = { id: current.id, partnerId: current.partnerId, provider: current.provider };
+      const tenantCounts = await upsertTenants(tx, conn, fetched.vendorTenants, now, {
+        hostAllowlist: adapter.hostAllowlist,
+      });
+      const mapped = await autoMapEdrTenants(tx, conn);
+      // Per-tenant fence: a tenant remapped (remapEdrTenant) or auto-mapped since Phase 1 must not
+      // get its Phase-2 result (fetched under the OLD org / unmapped state) written.
+      const currentTenants = await readCurrentTenants(tx, conn.id);
+      const keep = fetched.results.filter((r) => {
+        const snap = byVendorId.get(r.vendorTenantId);
+        const cur = currentTenants.get(r.vendorTenantId);
+        return (cur?.orgId ?? null) === (snap?.orgId ?? null);
+      });
+      const dropped = fetched.results.length - keep.length;
+      const inv = await persistInventory(tx, conn, keep, now);
+      if (installerProvider) {
+        // The same fence: a tenant unmapped since Phase 1 had its material cleared on purpose.
+        const installerKeep = fetched.installerOutcomes.filter((o) =>
+          (currentTenants.get(o.vendorTenantId)?.orgId ?? null) === (byVendorId.get(o.vendorTenantId)?.orgId ?? null));
+        if (installerKeep.length > 0) {
+          await persistInstallerOutcomes(
+            tx as unknown as typeof db,
+            installerProvider,
+            installerKeep.map(({ vendorTenantId: _vendorTenantId, ...outcome }) => outcome),
+            now,
+          );
+        }
+      }
+      // A5: apply the re-read verdicts (and rotate the omitted refs) BEFORE the open-count read below.
+      for (const r of keep) {
+        if (!r.ok || !r.value.reread) continue;
+        const snap = byVendorId.get(r.vendorTenantId);
+        if (!snap?.orgId) continue;
+        await applyDetectionStatusUpdates(tx, {
+          connectionId: conn.id,
+          tenantId: snap.id,
+          orgId: snap.orgId,
+          updates: r.value.reread.updates,
+          attempted: r.value.reread.refs.map((x) => ({ vendorDetectionId: x.vendorDetectionId, vendorKind: x.vendorKind })),
+        });
+      }
+      await pruneMissingTenantEndpoints(tx, conn.id, now);
+      await clearExpiredTenantDenials(tx, conn.id, now);
+      const match = await matchEdrEndpoints(tx, conn.id, {
+        strictUnique: strictMatchingFor(adapter.capabilities.endpointIdentifiers ?? []),
+      });
+      await refreshDetectionDeviceLinks(tx, conn.id);
+
+      const unmapped = Math.max(0, tenantCounts.unmapped - mapped.mapped);
+      const [open] = await tx
+        .select({ n: sql<number>`coalesce(sum(${edrTenants.openDetectionCount}), 0)::int` })
+        .from(edrTenants)
+        .where(eq(edrTenants.connectionId, conn.id));
+
+      const cadence = planCadence({
+        tenants: tenantCounts.total,
+        mappedTenants: Math.max(0, tenantCounts.total - unmapped),
+        capabilities: adapter.capabilities,
+        requested: {
+          detectionsMinutes: loaded.row.detectionIntervalMinutes,
+          inventoryMinutes: loaded.row.inventoryIntervalMinutes,
+        },
+        estimatedCalls: adapter.capabilities.estimatedCalls ?? DEFAULT_ESTIMATED_CALLS,
+      });
+
+      const failed = inv.failedTenants;
+      await tx
+        .update(edrConnections)
+        .set({
+          lastInventorySyncAt: now,
+          lastInventorySyncStatus: failed > 0 ? 'partial' : 'success',
+          lastInventorySyncError: failed > 0 ? `${failed} tenant(s) failed to sync` : null,
+          status: 'connected',
+          lastSyncTenants: tenantCounts.total,
+          lastSyncUnmappedTenants: unmapped,
+          lastSyncFailedTenants: failed,
+          lastSyncEndpoints: inv.endpoints,
+          lastSyncLinkedEndpoints: match.linked,
+          lastSyncAmbiguousEndpoints: match.ambiguous,
+          lastSyncOpenDetections: open?.n ?? 0,
+          effectiveDetectionIntervalMinutes: cadence.detectionsMinutes,
+          effectiveInventoryIntervalMinutes: cadence.inventoryMinutes,
+          updatedAt: now,
+        })
+        .where(eq(edrConnections.id, conn.id));
+      return { dropped };
+    });
+
+    if (done && done.dropped > 0) await reenqueueStream(connectionId, 'inventory');
+    if (done) await runPhase4('evaluateEdrEndpointHealth', connectionId, () => evaluateEdrEndpointHealth(connectionId));
+
+    if (!done) {
+      console.warn(
+        `[EdrProviderSync] Connection ${connectionId} changed during the vendor fetch `
+        + '(deleted, deactivated or re-credentialled); nothing written, the next poll retries',
+      );
+      await releaseRunningStatus(loaded, 'inventory');
+    }
+  } catch (error) {
+    await handleSyncError(error, loaded, 'inventory', isFinalAttempt, secrets);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Detection stream
+// ---------------------------------------------------------------------------
+
+export async function syncEdrDetections(
+  connectionId: string,
+  options: { isFinalAttempt?: boolean } = {},
+): Promise<void> {
+  const isFinalAttempt = options.isFinalAttempt ?? true;
+
+  const loaded = await loadForSync(connectionId, 'detections');
+  if (!loaded) return;
+
+  let secrets: string[] = [];
+  try {
+    requireRoot(loaded.row);
+    const adapter = getEdrProvider(loaded.row.provider);
+    // ONE context (and runCache) for the whole run: connection-wide vendor calls
+    // (incidents, quarantine) are memoized there and shared by every tenant.
+    const built = buildContext(adapter, loaded.row);
+    const ctx = built.ctx;
+    secrets = built.secrets;
+    // Unmapped tenants are not fetched.
+    const mappedTenants = loaded.tenants.filter((t) => t.orgId);
+
+    // W03 PR-B: snapshot (never clear) the push hints BEFORE the vendor fetch,
+    // so everything in the snapshot is covered by this run's window. Acked only
+    // after Phase 3 commits. A read failure just skips the ack (marker survives).
+    const hintSnapshot = await snapshotHints(connectionId);
+
+    // ---- phase 2 (NO DB) ---------------------------------------------
+    const now = new Date();
+    const results = await dbModule.runOutsideDbContext(() => mapWithConcurrency(
+      mappedTenants,
+      adapter.capabilities.tenantFetchConcurrency,
+      async (t): Promise<TenantFetch<EdrDetectionPage>> => {
+        try {
+          const page = await adapter.listDetections(
+            ctx,
+            { vendorTenantId: t.vendorTenantId, apiHost: t.apiHost },
+            t.detectionCursor,
+            now,
+          );
+          return { vendorTenantId: t.vendorTenantId, ok: true, value: page };
+        } catch (err) {
+          if (err instanceof EdrProviderRequestError && err.scope === 'connection') throw err;
+          return { vendorTenantId: t.vendorTenantId, ok: false, error: safeMessage(err, secrets), scope: 'tenant' };
+        }
+      },
+    ));
+
+    throwIfAllFailed(results);
+
+    // ---- phase 3 -------------------------------------------------------
+    const snapshot = new Map(loaded.tenants.map((t) => [t.vendorTenantId, t]));
+    const done = await runPhase3(loaded, 'edrProviderSync.persistDetections', async (tx, current) => {
+      const at = new Date();
+      const conn = { id: current.id, partnerId: current.partnerId, provider: current.provider };
+      // Per-tenant fence: a remap resets detection_cursor and changes org_id; persisting the stale
+      // page + cursor would write the old org's detections into the new org and skip its backfill.
+      const currentTenants = await readCurrentTenants(tx, conn.id);
+      const keep = results.filter((r) => {
+        const snap = snapshot.get(r.vendorTenantId);
+        const cur = currentTenants.get(r.vendorTenantId);
+        return !!snap && !!cur && cur.orgId === snap.orgId && cur.detectionCursor === snap.detectionCursor;
+      });
+      const dropped = results.length - keep.length;
+      const det = await persistDetections(tx, conn, keep, at);
+      if (det.skipped > 0) {
+        console.warn(`[EdrProviderSync] Connection ${conn.id}: ${det.skipped} detection(s) skipped during persist`);
+      }
+      const warnings = [...new Set(keep.flatMap((r) => (r.ok ? r.value.warnings ?? [] : [])))];
+      const issues = [
+        ...(det.failedTenants > 0 ? [`${det.failedTenants} tenant(s) failed to sync`] : []),
+        ...warnings,
+      ];
+      await refreshDetectionDeviceLinks(tx, conn.id);
+      const [open] = await tx
+        .select({ n: sql<number>`coalesce(sum(${edrTenants.openDetectionCount}), 0)::int` })
+        .from(edrTenants)
+        .where(eq(edrTenants.connectionId, conn.id));
+      await tx
+        .update(edrConnections)
+        .set({
+          lastDetectionSyncAt: at,
+          lastDetectionSyncStatus: issues.length > 0 ? 'partial' : 'success',
+          lastDetectionSyncError: issues.length > 0 ? issues.join('; ').slice(0, MAX_SYNC_ERROR_LENGTH) : null,
+          status: 'connected',
+          lastSyncOpenDetections: open?.n ?? 0,
+          updatedAt: at,
+        })
+        .where(eq(edrConnections.id, conn.id));
+      return { dropped };
+    });
+
+    const hintStillPending = done && hintSnapshot ? await acknowledgeHints(connectionId, hintSnapshot) : false;
+    if (done && (done.dropped > 0 || hintStillPending)) await reenqueueStream(connectionId, 'detections');
+    if (done) await runPhase4('evaluateEdrAlerts', connectionId, () => evaluateEdrAlerts(connectionId, { now: new Date() }));
+
+    if (!done) {
+      console.warn(
+        `[EdrProviderSync] Connection ${connectionId} changed during the vendor fetch `
+        + '(deleted, deactivated or re-credentialled); nothing written, the next poll retries',
+      );
+      await releaseRunningStatus(loaded, 'detections');
+    }
+  } catch (error) {
+    await handleSyncError(error, loaded, 'detections', isFinalAttempt, secrets);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Worker
+// ---------------------------------------------------------------------------
+
+// Moved to ./syncAttempt (shared with the backup/M365/Huntress workers, #8351).
+export { isFinalSyncAttempt };
+
+async function processJob(data: EdrSyncJobData, isFinalAttempt: boolean): Promise<unknown> {
+  switch (data.type) {
+    case 'sync-all':
+      return processSyncAll();
+    case 'sync-inventory':
+      return syncEdrInventory(data.connectionId, { isFinalAttempt });
+    case 'sync-detections':
+      return syncEdrDetections(data.connectionId, { isFinalAttempt });
+    case 'sync-action-status':
+      return pollEdrActionStatus(data.connectionId, new Date());
+    default:
+      throw new Error(`Unknown EDR provider sync job type: ${(data as { type: string }).type}`);
+  }
+}
+
+function createEdrProviderSyncWorker(): Worker<EdrSyncJobData> {
+  return new Worker<EdrSyncJobData>(
+    EDR_PROVIDER_SYNC_QUEUE,
+    async (job: Job<EdrSyncJobData>) => {
+      // No blanket system-context wrap: each path manages its own short contexts.
+      return processJob(job.data, isFinalSyncAttempt(job));
+    },
+    {
+      connection: getBullMQConnection(),
+      concurrency: 4,
+      lockDuration: 300_000,
+      stalledInterval: 60_000,
+      maxStalledCount: 2,
+    },
+  );
+}
+
+async function scheduleRepeatSyncAll(): Promise<void> {
+  const q = getEdrProviderSyncQueue();
+  for (const repeatable of await q.getRepeatableJobs()) {
+    if (repeatable.name === 'sync-all') await q.removeRepeatableByKey(repeatable.key);
+  }
+  await q.add(
+    'sync-all',
+    { type: 'sync-all' },
+    {
+      repeat: { every: SYNC_ALL_INTERVAL_MINUTES * 60_000 },
+      removeOnComplete: { count: 10 },
+      removeOnFail: { count: 30 },
+    },
+  );
+}
+
+export async function initializeEdrProviderSyncJob(): Promise<void> {
+  edrProviderSyncWorker = createEdrProviderSyncWorker();
+  attachWorkerObservability(edrProviderSyncWorker, 'edrProviderSyncWorker');
+  edrProviderSyncWorker.on('error', (error) => {
+    console.error('[EdrProviderSync] Worker error:', error);
+    captureException(error);
+  });
+  edrProviderSyncWorker.on('failed', (job, error) => {
+    // A rejected vendor credential is a config issue already on the connection row (BREEZE-1 lesson).
+    if (isEdrReauthFailure(error)) {
+      console.warn(
+        `[EdrProviderSync] Job ${job?.id} failed: provider credentials rejected -- `
+        + 'update them on the connection. Not retried, not reported to Sentry.',
+      );
+      return;
+    }
+    console.error(`[EdrProviderSync] Job ${job?.id} failed:`, error);
+    captureException(error);
+  });
+
+  await scheduleRepeatSyncAll();
+  console.log('[EdrProviderSync] EDR provider sync worker initialized');
+}
+
+export async function shutdownEdrProviderSyncJob(): Promise<void> {
+  if (edrProviderSyncWorker) {
+    await edrProviderSyncWorker.close();
+    edrProviderSyncWorker = null;
+  }
+  await shutdownEdrProviderSyncQueue();
+  console.log('[EdrProviderSync] EDR provider sync worker shut down');
+}
+
+export const __testOnly = { processSyncAll, processJob };

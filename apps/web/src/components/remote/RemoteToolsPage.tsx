@@ -13,7 +13,7 @@ import {
   ShieldOff
 } from 'lucide-react';
 import * as Sentry from '@sentry/astro';
-import { fetchWithAuth } from '@/stores/auth';
+import { fetchWithAuth, handleSessionExpired } from '@/stores/auth';
 import { extractApiError } from '@/lib/apiError';
 import { runAction } from '@/lib/runAction';
 import { navigateTo } from '@/lib/navigation';
@@ -28,8 +28,7 @@ import ScheduledTasks, { type ScheduledTask, type TaskDetails, type TaskHistory,
 import RegistryEditor from './RegistryEditor';
 import RemoteTerminal from './RemoteTerminal';
 import FileManager from './FileManager';
-import ConnectDesktopButton from './ConnectDesktopButton';
-import RemoteAccessAlternatives from '../cloudcom/RemoteAccessAlternatives';
+import ConnectDesktopButton, { type RemoteToolOption } from './ConnectDesktopButton';
 import { showToast } from '@/components/shared/Toast';
 import { getInitialFilePath } from './filePathUtils';
 import { useTranslation } from 'react-i18next';
@@ -71,6 +70,9 @@ type DeviceApiResponse = {
   desktopAccess?: DesktopAccessState | null;
   remoteAccessPolicy?: RemoteAccessPolicy | null;
   helperLifecycleMode?: 'always-on' | 'on-demand' | null;
+  // #10922 — the Connect button's tool menu.
+  remoteAccessProviders?: RemoteToolOption[];
+  remoteAccessDefaultProviderId?: string | null;
 };
 
 type ApiProcess = {
@@ -421,6 +423,10 @@ export default function RemoteToolsPage({
   const [desktopAccess, setDesktopAccess] = useState<DesktopAccessState | null>(null);
   const [remoteAccessPolicy, setRemoteAccessPolicy] = useState<RemoteAccessPolicy | null>(null);
   const [helperLifecycleMode, setHelperLifecycleMode] = useState<'always-on' | 'on-demand' | null>(null);
+  const [remoteTools, setRemoteTools] = useState<{ providers: RemoteToolOption[]; defaultProviderId: string | null }>({
+    providers: [],
+    defaultProviderId: null,
+  });
 
   // Process state
   const [processes, setProcesses] = useState<Process[]>([]);
@@ -530,6 +536,10 @@ export default function RemoteToolsPage({
       setDesktopAccess(data.desktopAccess ?? null);
       setRemoteAccessPolicy(data.remoteAccessPolicy ?? null);
       setHelperLifecycleMode(data.helperLifecycleMode ?? null);
+      setRemoteTools({
+        providers: Array.isArray(data.remoteAccessProviders) ? data.remoteAccessProviders : [],
+        defaultProviderId: data.remoteAccessDefaultProviderId ?? null,
+      });
     } catch (error) {
       console.error('Failed to load device info:', error);
       Sentry.captureException(error, { extra: { deviceId } });
@@ -605,7 +615,7 @@ export default function RemoteToolsPage({
       const res = await fetchWithAuth(`/system-tools/devices/${deviceId}/processes?limit=500`);
       if (!res.ok) {
         // An offline device answers 503 with
-        // `{ error: 'The device is offline.', code: 'device_offline' }`
+        // `{ error: 'The device is offline.', code: 'DEVICE_OFFLINE' }`
         // (apps/api/src/routes/systemTools/fileBrowserHelpers.ts). Discarding
         // that body and logging in the catch below is what made this tab read
         // "Processes 0 / No Data" — indistinguishable from a genuinely idle
@@ -631,13 +641,17 @@ export default function RemoteToolsPage({
   }, [deviceId]);
 
   const handleKillProcess = useCallback(async (pid: number) => {
-    const res = await fetchWithAuth(`/system-tools/devices/${deviceId}/processes/${pid}/kill`, {
-      method: 'POST'
+    // Kill / task run-enable-disable / registry writes: runAction toasts the
+    // failure (ScheduledTasks only console.error'd it, and the other panels'
+    // inline errors can sit behind their confirm dialogs), and the rejection
+    // still propagates so the calling panel keeps its dialog open (#3531).
+    await runAction({
+      request: () => fetchWithAuth(`/system-tools/devices/${deviceId}/processes/${pid}/kill`, {
+        method: 'POST'
+      }),
+      errorFallback: t('remoteToolsPage.errors.killProcess'),
+      onUnauthorized: handleSessionExpired,
     });
-    if (!res.ok) {
-      const json = await res.json();
-      throw new Error(json.error || t('remoteToolsPage.errors.killProcess'));
-    }
     await fetchProcesses();
   }, [deviceId, fetchProcesses]);
 
@@ -661,7 +675,7 @@ export default function RemoteToolsPage({
       const res = await fetchWithAuth(`/system-tools/devices/${deviceId}/services?limit=500`);
       if (!res.ok) {
         // Same reasoning as fetchProcesses above (#4935): an offline device's
-        // 503 body carries `{ error, code: 'device_offline' }` — discarding it
+        // 503 body carries `{ error, code: 'DEVICE_OFFLINE' }` — discarding it
         // here made the Services tab read "0 of 0 / No Services Available",
         // indistinguishable from a device that genuinely has none.
         const body = await res.json().catch(() => null);
@@ -683,6 +697,20 @@ export default function RemoteToolsPage({
     }
   }, [deviceId]);
 
+  // Services actions (start/stop/restart) must keep the device's own error
+  // prose (permission denied, dependent services running, restart timeout,
+  // etc.) intact -- it's specific and actionable. runAction's `errors:<CODE>`
+  // i18n branch would otherwise flatten it to the generic AGENT_EXECUTION_FAILED
+  // copy now that the API sends the correctly-cased code (Part of #3859, E2b).
+  const keepServiceActionErrorMessage = (
+    _code: string,
+    _message: string,
+    body?: unknown,
+  ): string | undefined => {
+    const raw = body && typeof body === 'object' ? (body as Record<string, unknown>).error : undefined;
+    return typeof raw === 'string' && raw.length > 0 ? raw : undefined;
+  };
+
   const handleStartService = useCallback(async (name: string) => {
     try {
       await runAction({
@@ -690,6 +718,8 @@ export default function RemoteToolsPage({
           method: 'POST'
         }),
         errorFallback: t('remoteToolsPage.errors.startService'),
+        friendly: keepServiceActionErrorMessage,
+        onUnauthorized: handleSessionExpired,
       });
     } finally {
       // Re-sync from the server whether the command succeeded or failed, so
@@ -706,6 +736,8 @@ export default function RemoteToolsPage({
           method: 'POST'
         }),
         errorFallback: t('remoteToolsPage.errors.stopService'),
+        friendly: keepServiceActionErrorMessage,
+        onUnauthorized: handleSessionExpired,
       });
     } finally {
       await fetchServices();
@@ -722,6 +754,8 @@ export default function RemoteToolsPage({
           { method: 'POST' }
         ),
         errorFallback: t('remoteToolsPage.errors.restartService'),
+        friendly: keepServiceActionErrorMessage,
+        onUnauthorized: handleSessionExpired,
       });
     } catch (err) {
       // Same re-sync-on-failure rule as start/stop above (#5088).
@@ -840,13 +874,13 @@ export default function RemoteToolsPage({
   }, [deviceId]);
 
   const handleRunTask = useCallback(async (path: string) => {
-    const res = await fetchWithAuth(`/system-tools/devices/${deviceId}/tasks/${encodeURIComponent(path)}/run`, {
-      method: 'POST'
+    await runAction({
+      request: () => fetchWithAuth(`/system-tools/devices/${deviceId}/tasks/${encodeURIComponent(path)}/run`, {
+        method: 'POST'
+      }),
+      errorFallback: t('remoteToolsPage.errors.runTask'),
+      onUnauthorized: handleSessionExpired,
     });
-    if (!res.ok) {
-      const json = await res.json();
-      throw new Error(json.error || t('remoteToolsPage.errors.runTask'));
-    }
     await fetchTasks();
   }, [deviceId, fetchTasks]);
 
@@ -872,24 +906,24 @@ export default function RemoteToolsPage({
   }, [deviceId]);
 
   const handleEnableTask = useCallback(async (path: string) => {
-    const res = await fetchWithAuth(`/system-tools/devices/${deviceId}/tasks/${encodeURIComponent(path)}/enable`, {
-      method: 'POST'
+    await runAction({
+      request: () => fetchWithAuth(`/system-tools/devices/${deviceId}/tasks/${encodeURIComponent(path)}/enable`, {
+        method: 'POST'
+      }),
+      errorFallback: t('remoteToolsPage.errors.enableTask'),
+      onUnauthorized: handleSessionExpired,
     });
-    if (!res.ok) {
-      const json = await res.json();
-      throw new Error(json.error || t('remoteToolsPage.errors.enableTask'));
-    }
     await fetchTasks();
   }, [deviceId, fetchTasks]);
 
   const handleDisableTask = useCallback(async (path: string) => {
-    const res = await fetchWithAuth(`/system-tools/devices/${deviceId}/tasks/${encodeURIComponent(path)}/disable`, {
-      method: 'POST'
+    await runAction({
+      request: () => fetchWithAuth(`/system-tools/devices/${deviceId}/tasks/${encodeURIComponent(path)}/disable`, {
+        method: 'POST'
+      }),
+      errorFallback: t('remoteToolsPage.errors.disableTask'),
+      onUnauthorized: handleSessionExpired,
     });
-    if (!res.ok) {
-      const json = await res.json();
-      throw new Error(json.error || t('remoteToolsPage.errors.disableTask'));
-    }
     await fetchTasks();
   }, [deviceId, fetchTasks]);
 
@@ -926,47 +960,47 @@ export default function RemoteToolsPage({
   }, [deviceId]);
 
   const handleSetRegistryValue = useCallback(async (hive: string, path: string, name: string, type: string, data: unknown) => {
-    const res = await fetchWithAuth(`/system-tools/devices/${deviceId}/registry/value`, {
-      method: 'PUT',
-      body: JSON.stringify({ hive, path, name, type, data })
+    await runAction({
+      request: () => fetchWithAuth(`/system-tools/devices/${deviceId}/registry/value`, {
+        method: 'PUT',
+        body: JSON.stringify({ hive, path, name, type, data })
+      }),
+      errorFallback: t('remoteToolsPage.errors.setRegistryValue'),
+      onUnauthorized: handleSessionExpired,
     });
-    if (!res.ok) {
-      const json = await res.json();
-      throw new Error(json.error || t('remoteToolsPage.errors.setRegistryValue'));
-    }
   }, [deviceId]);
 
   const handleDeleteRegistryValue = useCallback(async (hive: string, path: string, name: string) => {
     const params = new URLSearchParams({ hive, path, name });
-    const res = await fetchWithAuth(`/system-tools/devices/${deviceId}/registry/value?${params}`, {
-      method: 'DELETE'
+    await runAction({
+      request: () => fetchWithAuth(`/system-tools/devices/${deviceId}/registry/value?${params}`, {
+        method: 'DELETE'
+      }),
+      errorFallback: t('remoteToolsPage.errors.deleteRegistryValue'),
+      onUnauthorized: handleSessionExpired,
     });
-    if (!res.ok) {
-      const json = await res.json();
-      throw new Error(json.error || t('remoteToolsPage.errors.deleteRegistryValue'));
-    }
   }, [deviceId]);
 
   const handleCreateRegistryKey = useCallback(async (hive: string, path: string) => {
-    const res = await fetchWithAuth(`/system-tools/devices/${deviceId}/registry/key`, {
-      method: 'POST',
-      body: JSON.stringify({ hive, path })
+    await runAction({
+      request: () => fetchWithAuth(`/system-tools/devices/${deviceId}/registry/key`, {
+        method: 'POST',
+        body: JSON.stringify({ hive, path })
+      }),
+      errorFallback: t('remoteToolsPage.errors.createRegistryKey'),
+      onUnauthorized: handleSessionExpired,
     });
-    if (!res.ok) {
-      const json = await res.json();
-      throw new Error(json.error || t('remoteToolsPage.errors.createRegistryKey'));
-    }
   }, [deviceId]);
 
   const handleDeleteRegistryKey = useCallback(async (hive: string, path: string) => {
     const params = new URLSearchParams({ hive, path });
-    const res = await fetchWithAuth(`/system-tools/devices/${deviceId}/registry/key?${params}`, {
-      method: 'DELETE'
+    await runAction({
+      request: () => fetchWithAuth(`/system-tools/devices/${deviceId}/registry/key?${params}`, {
+        method: 'DELETE'
+      }),
+      errorFallback: t('remoteToolsPage.errors.deleteRegistryKey'),
+      onUnauthorized: handleSessionExpired,
     });
-    if (!res.ok) {
-      const json = await res.json();
-      throw new Error(json.error || t('remoteToolsPage.errors.deleteRegistryKey'));
-    }
   }, [deviceId]);
 
   // Load data on tab change
@@ -1001,8 +1035,15 @@ export default function RemoteToolsPage({
           </div>
         </div>
         <div className="flex items-center gap-2">
-          <ConnectDesktopButton deviceId={deviceId} isHeadless={isHeadless} desktopAccess={desktopAccess} remoteAccessPolicy={remoteAccessPolicy} helperLifecycleMode={helperLifecycleMode} />
-          <RemoteAccessAlternatives deviceId={deviceId} />
+          <ConnectDesktopButton
+            deviceId={deviceId}
+            isHeadless={isHeadless}
+            desktopAccess={desktopAccess}
+            remoteAccessPolicy={remoteAccessPolicy}
+            helperLifecycleMode={helperLifecycleMode}
+            remoteAccessProviders={remoteTools.providers}
+            remoteAccessDefaultProviderId={remoteTools.defaultProviderId}
+          />
           {shouldShowClose && (
             <button
               onClick={handleClose}

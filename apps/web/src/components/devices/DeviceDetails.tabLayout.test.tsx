@@ -9,6 +9,7 @@ import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import DeviceDetails from './DeviceDetails';
 import type { Device } from './DeviceList';
+import { useOrgStore } from '../../stores/orgStore';
 
 const fetchWithAuthMock = vi.hoisted(() => vi.fn());
 vi.mock('../../stores/auth', async (importOriginal) => {
@@ -51,16 +52,29 @@ const originalOffsetWidth = Object.getOwnPropertyDescriptor(HTMLElement.prototyp
 const originalClientWidth = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'clientWidth');
 
 let counts: Record<string, number> | null;
+// Sweep E1: undefined ⇒ no org context / hook not exercised by a given test
+// (the default — matches every pre-existing test in this file, which never
+// set an org and so never called GET /config/ml-feature-flags at all).
+let mlAnomaliesEnabled: boolean | undefined;
 
 beforeEach(() => {
   window.location.hash = '';
   Object.defineProperty(HTMLElement.prototype, 'offsetWidth', { configurable: true, value: 60 });
   Object.defineProperty(HTMLElement.prototype, 'clientWidth', { configurable: true, value: 4000 });
   counts = { alerts: 0, anomalies: 0, tickets: 0, operatorTasks: 0, monitoring: 0, compliance: 0 };
+  mlAnomaliesEnabled = undefined;
+  useOrgStore.setState({ currentOrgId: null });
   fetchWithAuthMock.mockImplementation((url: string) => {
     const href = String(url);
     if (href.includes('/tab-counts')) {
       return Promise.resolve(counts ? jsonResponse({ data: counts }) : notFound());
+    }
+    if (href.includes('/config/ml-feature-flags')) {
+      return Promise.resolve(jsonResponse({
+        mlFeatureFlags: {
+          'ml.anomalies.enabled': { flag: 'ml.anomalies.enabled', enabled: mlAnomaliesEnabled ?? true, defaultEnabled: true },
+        },
+      }));
     }
     return Promise.resolve(notFound());
   });
@@ -72,6 +86,7 @@ afterEach(() => {
   if (originalClientWidth) Object.defineProperty(HTMLElement.prototype, 'clientWidth', originalClientWidth);
   else delete (HTMLElement.prototype as any).clientWidth;
   window.location.hash = '';
+  useOrgStore.setState({ currentOrgId: null });
 });
 
 const visibleTabNames = () => screen.getAllByRole('tab').map((t) => t.textContent?.replace(/\d+$/, ''));
@@ -84,11 +99,36 @@ describe('DeviceDetails tab layout', () => {
     expect(visibleTabNames()).toEqual([
       'Overview', 'Details', 'Performance', 'Alerts', 'Event Log', 'Hardware', 'Software', 'Patches', 'Scripts',
     ]);
-    fireEvent.click(screen.getByRole('button', { name: /more/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^more$/i }));
     const items = screen.getAllByRole('menuitem').map((m) => m.textContent);
-    expect(items).toEqual(expect.arrayContaining(['Anomalies', 'Tickets', 'Operator Tasks', 'Monitoring', 'Compliance']));
+    expect(items).toEqual(expect.arrayContaining(['Anomalies', 'Tickets', 'AI Tasks', 'Monitoring', 'Compliance']));
     const headers = Array.from(screen.getByRole('menu').querySelectorAll('[data-overflow-group]')).map((h) => h.textContent);
     expect(headers).toEqual(['Monitoring', 'Inventory', 'Management', 'History & Network']);
+  });
+
+  it('gives the tabs data-testids (#9610)', async () => {
+    render(<DeviceDetails device={device} />);
+    await waitFor(() => expect(fetchWithAuthMock).toHaveBeenCalledWith(expect.stringContaining('/devices/device-1/tab-counts')));
+    expect(screen.getByTestId('device-tab-overview')).toBeInTheDocument();
+    expect(screen.getByTestId('device-tab-alerts')).toBeInTheDocument();
+  });
+
+  it('files Topology under the Monitoring header in "More" instead of orphaning it above (#9030)', async () => {
+    render(<DeviceDetails device={device} />);
+    fireEvent.click(screen.getByRole('button', { name: /^more$/i }));
+    const menu = screen.getByRole('menu');
+    const first = menu.querySelector('[data-overflow-group], [role="menuitem"]');
+    expect(first).toHaveAttribute('data-overflow-group', 'Monitoring');
+    const nodes = Array.from(menu.querySelectorAll('[data-overflow-group], [role="menuitem"]'));
+    const topologyIndex = nodes.findIndex((n) => n.textContent === 'Topology');
+    const inventoryIndex = nodes.findIndex((n) => n.getAttribute('data-overflow-group') === 'Inventory');
+    expect(topologyIndex).toBeGreaterThan(0);
+    expect(topologyIndex).toBeLessThan(inventoryIndex);
+  });
+
+  it('collapses the Activity rail without animating width (#9030)', () => {
+    const { container } = render(<DeviceDetails device={device} />);
+    expect(container.querySelector('[class*="transition-[width]"]')).toBeNull();
   });
 
   it('promotes Tickets into the primary row with a badge when the device has open tickets', async () => {
@@ -107,9 +147,9 @@ describe('DeviceDetails tab layout', () => {
     counts = { alerts: 0, anomalies: 0, tickets: 0, operatorTasks: 0, monitoring: 1, compliance: 3 };
     render(<DeviceDetails device={device} />);
 
-    await waitFor(() => expect(screen.getByTestId('overflow-tabs-hidden-dot')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByTestId('device-tab-overflow-tabs-hidden-dot')).toBeInTheDocument());
     expect(screen.queryByRole('tab', { name: /compliance/i })).toBeNull();
-    fireEvent.click(screen.getByRole('button', { name: /more/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^more$/i }));
     expect(screen.getByRole('menuitem', { name: /compliance/i })).toHaveTextContent('Compliance3');
     expect(screen.getByRole('menuitem', { name: /monitoring/i })).toHaveTextContent('Monitoring1');
   });
@@ -119,6 +159,77 @@ describe('DeviceDetails tab layout', () => {
     render(<DeviceDetails device={device} />);
     await waitFor(() => expect(fetchWithAuthMock).toHaveBeenCalledWith(expect.stringContaining('/tab-counts')));
     expect(screen.getByRole('tab', { name: /overview/i })).toBeInTheDocument();
-    expect(screen.queryByTestId('overflow-tabs-hidden-dot')).toBeNull();
+    expect(screen.queryByTestId('device-tab-overflow-tabs-hidden-dot')).toBeNull();
+  });
+
+  // Sweep E1: a stale open metric_anomalies count (server-side, device-scoped)
+  // must not badge or promote Anomalies once detection is confirmed OFF for
+  // this org — the panel behind that badge would just say "disabled".
+  it('never badges or promotes Anomalies once org detection is confirmed off, even with open episodes counted', async () => {
+    counts = { alerts: 0, anomalies: 2, tickets: 0, operatorTasks: 0, monitoring: 0, compliance: 0 };
+    mlAnomaliesEnabled = false;
+    useOrgStore.setState({ currentOrgId: 'org-1' });
+    render(<DeviceDetails device={device} />);
+
+    await waitFor(() => expect(fetchWithAuthMock).toHaveBeenCalledWith(expect.stringContaining('/config/ml-feature-flags')));
+    // Not promoted into the primary row (an enabled org would show it there,
+    // badged "2" — see the sibling Tickets-promotion test above).
+    expect(screen.queryByRole('tab', { name: /anomalies/i })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: /^more$/i }));
+    expect(screen.getByRole('menuitem', { name: /anomalies/i })).toHaveTextContent('Anomalies');
+    expect(screen.getByRole('menuitem', { name: /anomalies/i })).not.toHaveTextContent('Anomalies2');
+  });
+
+  it('still badges/promotes Anomalies normally when org detection is on', async () => {
+    counts = { alerts: 0, anomalies: 2, tickets: 0, operatorTasks: 0, monitoring: 0, compliance: 0 };
+    mlAnomaliesEnabled = true;
+    useOrgStore.setState({ currentOrgId: 'org-1' });
+    render(<DeviceDetails device={device} />);
+
+    const anomalies = await screen.findByRole('tab', { name: /anomalies/i });
+    expect(anomalies).toHaveTextContent('Anomalies2');
+  });
+
+  // Resolving the only open anomaly must clear the tab badge right away, not
+  // on the next tab switch.
+  it('refetches tab counts when an anomaly is resolved inside the Anomalies tab', async () => {
+    counts = { alerts: 0, anomalies: 1, tickets: 0, operatorTasks: 0, monitoring: 0, compliance: 0 };
+    mlAnomaliesEnabled = true;
+    useOrgStore.setState({ currentOrgId: 'org-1' });
+    window.location.hash = '#anomalies';
+    const openEpisode = {
+      id: 'ep-1', orgId: 'org-1', deviceId: 'device-1', episodeKey: 'k', sourceTable: 'device_metrics',
+      anomalyType: 'spike', metricFamily: 'cpu', metricNames: ['cpu_percent'], status: 'open', closeReason: null,
+      firstSeenAt: '2026-06-18T12:00:00.000Z', lastSeenAt: '2026-06-18T12:10:00.000Z', bucketCount: 2,
+      peakValue: 96.4, peakMetricName: 'cpu_percent', peakBaselineValue: 42.2, peakScore: 8.1, peakAt: '2026-06-18T12:05:00.000Z',
+      recurrenceCount: 0, attribution: null, linkedAlertId: null, snoozedUntil: null, resolvedAt: null, resolvedByUserId: null,
+      note: null, createdAt: '2026-06-18T12:00:00.000Z', updatedAt: '2026-06-18T12:10:00.000Z',
+      durationSeconds: 600, ongoing: true, promoted: false, snoozed: false, rangeMin: 90, rangeMax: 96.4,
+      peakAnomalyId: 'ep-1-peak', deviceLastSeenAt: null,
+    };
+    const base = fetchWithAuthMock.getMockImplementation()!;
+    fetchWithAuthMock.mockImplementation((url: string, init?: RequestInit) => {
+      const href = String(url);
+      if (href.includes('/anomaly-episodes/ep-1') && init?.method === 'PATCH') {
+        return Promise.resolve(jsonResponse({ data: { ...openEpisode, status: 'resolved', ongoing: false } }));
+      }
+      if (href.includes('/anomaly-episodes')) {
+        return Promise.resolve(jsonResponse({ data: [openEpisode], focusedEpisodeId: null }));
+      }
+      return base(url, init);
+    });
+    const countCalls = () =>
+      fetchWithAuthMock.mock.calls.filter(([u]) => String(u).includes('/tab-counts')).length;
+
+    render(<DeviceDetails device={device} />);
+    expect(await screen.findByRole('tab', { name: /anomalies/i })).toHaveTextContent('Anomalies1');
+    const before = countCalls();
+
+    counts = { ...counts!, anomalies: 0 };
+    fireEvent.click(await screen.findByRole('button', { name: /^resolve$/i }));
+
+    await waitFor(() => expect(countCalls()).toBeGreaterThan(before));
+    // Count is now 0: the badge is gone (the tab may also drop back into "More").
+    await waitFor(() => expect(screen.queryByRole('tab', { name: /anomalies\s*1/i })).toBeNull());
   });
 });

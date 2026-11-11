@@ -38,9 +38,13 @@
  * child's own egress.
  */
 
+import { agentSdkWireOptions } from '../aiModels/modelWireOptions';
+import { buildWireParams, toMessagesApiParams } from '../aiModels/wireParams';
 import Anthropic from '@anthropic-ai/sdk';
 import { z } from 'zod';
-import { buildGuardedLlmFetch } from './guardedLlmFetch';
+import { createAnthropicClient } from '../aiModels/connectionFactory';
+import { createIsolatedSdkCwd, type IsolatedSdkCwd } from '../aiModels/sdkChildEnv';
+import { SDK_CHILD_HOST_CONTEXT_GUARDS } from './sdkChildEnvGuards';
 
 /**
  * Bump this whenever the harness gets meaningfully stricter — verification
@@ -56,11 +60,37 @@ export const FIDELITY_STEP_NAMES = {
   sdkSubprocess: 'sdk_subprocess',
 } as const;
 
+/** Every direct request. Manual (budget) thinking needs >= 1024 and < max_tokens; 512 left no room (spec §7). */
+export const FIDELITY_HARNESS_MAX_TOKENS = 2048;
+
+/** Recorded capability probes. They never affect `passed` (spec §7: params are sent only where verified). */
+export const FIDELITY_PROBE_NAMES = {
+  adaptiveEffort: 'direct_adaptive_effort',
+} as const;
+
+const ADAPTIVE_PROBE_SENTINEL = 'FIDELITY-OK';
+const ADAPTIVE_PROBE_PROMPT = `Reply with exactly ${ADAPTIVE_PROBE_SENTINEL} and nothing else.`;
+
 export interface FidelityCheckInput {
   baseUrl: string;
   authMode: 'x-api-key' | 'bearer';
   providerModel: string;
   apiKey: string;
+}
+
+/**
+ * W06 (#7604): an alternative route to the model under test. The gateway
+ * verifier (services/aiModels/offeringVerification.ts) passes one so the SAME
+ * stages run through the loopback model gateway, exactly as production traffic
+ * flows. Omitted = the catalog path, byte-identical to before.
+ */
+export interface FidelityTransport {
+  /** Used for the direct stages and the adaptive probe instead of a guarded endpoint client. */
+  client: Anthropic;
+  /** Used for the Agent SDK subprocess stage instead of buildFidelityChildEnv(input). */
+  childEnv: Record<string, string>;
+  /** false when the connection kind cannot carry Anthropic thinking (openai_compatible): the probe is recorded as skipped. */
+  probeAdaptiveEffort: boolean;
 }
 
 export interface FidelityCheckStep {
@@ -72,6 +102,10 @@ export interface FidelityCheckStep {
 export interface FidelityCheckResult {
   passed: boolean;
   steps: FidelityCheckStep[];
+  /** Recorded capability probes; never part of `passed`. */
+  probes: FidelityCheckStep[];
+  /** What W03 may send to this endpoint/model beyond plain tool calling. */
+  verifiedCapabilities: { adaptiveEffort: boolean };
   harnessVersion: string;
 }
 
@@ -93,8 +127,14 @@ const DIRECT_REQUEST_TIMEOUT_MS = 60_000;
 const SDK_STAGE_TIMEOUT_MS = 150_000;
 const MAX_DETAIL_CHARS = 600;
 
+/**
+ * The direct stage offers the tool under the SAME name the Agent SDK exposes it
+ * as (`mcp__<server>__<tool>`), which is the shape of every Breeze tool. A
+ * server whose tool-call parser mishandles that shape (Ollama dropped it, #7795)
+ * must fail here instead of verifying on a bare name production never sends.
+ */
 const WEATHER_TOOL_SCHEMA = {
-  name: TOOL_NAME,
+  name: SDK_TOOL_NAME,
   description: TOOL_DESCRIPTION,
   input_schema: {
     type: 'object' as const,
@@ -222,6 +262,9 @@ export function buildFidelityChildEnv(
   const env: Record<string, string> = {
     CI: 'true',
     CLAUDE_AGENT_SDK_CLIENT_APP: 'breeze-api/provider-fidelity-harness',
+    // HOME is forwarded; keep the host's Claude Code memory away from the
+    // partner endpoint under test (#7444).
+    ...SDK_CHILD_HOST_CONTEXT_GUARDS,
   };
 
   for (const key of passthrough) {
@@ -253,19 +296,18 @@ export { LlmEgressViolationError } from './guardedLlmFetch';
  * registered in `middleware/selfManagedDbContextRoutes.ts`.
  */
 function buildAnthropicClient(input: FidelityCheckInput): Anthropic {
-  return new Anthropic({
-    baseURL: input.baseUrl,
-    ...(input.authMode === 'x-api-key'
-      ? { apiKey: input.apiKey, authToken: null }
-      : { authToken: input.apiKey, apiKey: null }),
-    fetch: buildGuardedLlmFetch({
-      allowedOrigin: new URL(input.baseUrl).origin,
+  return createAnthropicClient({
+    apiKey: input.apiKey,
+    target: {
+      kind: 'endpoint',
+      baseUrl: input.baseUrl,
+      authMode: input.authMode,
       // `llm_egress_events` is org-scoped (see `llmEgressRecorder.ts`), and the
       // harness is a platform-admin vetting tool with no tenant behind it —
       // there is no org/partner to attribute a row to. Partner traffic is
       // recorded where it has a tenant: the resolver-built clients in Wave 3.
       recordEgress: () => {},
-    }) as unknown as typeof fetch,
+    },
     timeout: DIRECT_REQUEST_TIMEOUT_MS,
     maxRetries: 1,
   });
@@ -276,16 +318,21 @@ interface DirectStageOutcome {
   toolResult: FidelityCheckStep;
 }
 
-async function runDirectStage(input: FidelityCheckInput): Promise<DirectStageOutcome> {
-  const client = buildAnthropicClient(input);
+async function runDirectStage(input: FidelityCheckInput, injected?: Anthropic): Promise<DirectStageOutcome> {
+  const client = injected ?? buildAnthropicClient(input);
   const userMessage = { role: 'user' as const, content: PROMPT };
 
   let first: { content?: unknown; stop_reason?: unknown };
   try {
     first = await client.messages.create({
       model: input.providerModel,
-      max_tokens: 512,
+      max_tokens: FIDELITY_HARNESS_MAX_TOKENS,
       tools: [WEATHER_TOOL_SCHEMA],
+      // A forced-tool probe: with exactly one tool offered, `any` requires a
+      // call to it. A capable server cannot answer with prose, so an answer
+      // without a tool_use means the server lost the call (#7795), not that the
+      // model chose not to call. The subprocess stage still covers unforced use.
+      tool_choice: { type: 'any' },
       messages: [userMessage],
     }) as { content?: unknown; stop_reason?: unknown };
   } catch (error) {
@@ -305,7 +352,7 @@ async function runDirectStage(input: FidelityCheckInput): Promise<DirectStageOut
       toolUse: {
         name: FIDELITY_STEP_NAMES.directToolUse,
         ok: false,
-        detail: `no tool_use block in the response (stop_reason=${String(first.stop_reason)})`,
+        detail: `no tool_use block in the response to a forced tool call (stop_reason=${String(first.stop_reason)})`,
       },
       toolResult: {
         name: FIDELITY_STEP_NAMES.directToolResult,
@@ -315,12 +362,12 @@ async function runDirectStage(input: FidelityCheckInput): Promise<DirectStageOut
     };
   }
 
-  if (block.name !== TOOL_NAME) {
+  if (block.name !== SDK_TOOL_NAME) {
     return {
       toolUse: {
         name: FIDELITY_STEP_NAMES.directToolUse,
         ok: false,
-        detail: `tool_use named '${block.name}', expected '${TOOL_NAME}'`,
+        detail: `tool_use named '${block.name}', expected '${SDK_TOOL_NAME}'`,
       },
       toolResult: {
         name: FIDELITY_STEP_NAMES.directToolResult,
@@ -371,7 +418,7 @@ async function runDirectStage(input: FidelityCheckInput): Promise<DirectStageOut
   try {
     second = await client.messages.create({
       model: input.providerModel,
-      max_tokens: 512,
+      max_tokens: FIDELITY_HARNESS_MAX_TOKENS,
       tools: [WEATHER_TOOL_SCHEMA],
       messages: [
         userMessage,
@@ -422,7 +469,7 @@ async function runDirectStage(input: FidelityCheckInput): Promise<DirectStageOut
   };
 }
 
-async function runSdkSubprocessStage(input: FidelityCheckInput): Promise<FidelityCheckStep> {
+async function runSdkSubprocessStage(input: FidelityCheckInput, childEnv?: Record<string, string>): Promise<FidelityCheckStep> {
   const name = FIDELITY_STEP_NAMES.sdkSubprocess;
 
   let sdk: typeof import('@anthropic-ai/claude-agent-sdk');
@@ -446,8 +493,13 @@ async function runSdkSubprocessStage(input: FidelityCheckInput): Promise<Fidelit
   const abortController = new AbortController();
   const timer = setTimeout(() => abortController.abort(), SDK_STAGE_TIMEOUT_MS);
   timer.unref?.();
+  // A transport child (the loopback gateway) talks to an untrusted endpoint:
+  // spawn it in an empty temp directory so the environment context the CLI
+  // sends upstream names no host path. The catalog path is unchanged.
+  let isolatedCwd: IsolatedSdkCwd | null = null;
 
   try {
+    if (childEnv) isolatedCwd = await createIsolatedSdkCwd();
     const session = sdk.query({
       prompt: PROMPT,
       options: {
@@ -464,9 +516,13 @@ async function runSdkSubprocessStage(input: FidelityCheckInput): Promise<Fidelit
         },
         settingSources: [],
         persistSession: false,
-        thinking: { type: 'disabled' },
+        // #7587, #7599: same per-model thinking/effort as production chat
+        // (agentSdkWireOptions), keyed on the catalog wire id (an id the
+        // registry and the bootstrap rules don't know keeps `disabled`).
+        ...agentSdkWireOptions(input.providerModel),
         abortController,
-        env: buildFidelityChildEnv(input),
+        env: childEnv ?? buildFidelityChildEnv(input),
+        ...(isolatedCwd ? { cwd: isolatedCwd.cwd } : {}),
       },
     } as Parameters<typeof sdk.query>[0]);
 
@@ -498,6 +554,38 @@ async function runSdkSubprocessStage(input: FidelityCheckInput): Promise<Fidelit
     return { name, ok: false, detail: `subprocess session errored: ${describeError(error)}` };
   } finally {
     clearTimeout(timer);
+    isolatedCwd?.remove();
+  }
+}
+
+async function runAdaptiveEffortProbe(input: FidelityCheckInput, injected?: Anthropic): Promise<FidelityCheckStep> {
+  const name = FIDELITY_PROBE_NAMES.adaptiveEffort;
+  // Built by the one wire-param owner (index invariant 2): adaptive thinking
+  // at the lowest effort. thinksWhenOmitted:true so the adapter always emits
+  // the params, because sending them is the point of the probe.
+  const params = toMessagesApiParams(buildWireParams({
+    thinkingMode: 'adaptive',
+    optionSupport: { effort: ['low'], thinkingDisplay: [], speed: ['standard'], inferenceGeo: [] },
+    requested: { effort: 'low' },
+    maxTokens: FIDELITY_HARNESS_MAX_TOKENS,
+  }), { thinksWhenOmitted: true });
+  const client = injected ?? buildAnthropicClient(input);
+  try {
+    const response = await client.messages.create({
+      model: input.providerModel,
+      max_tokens: FIDELITY_HARNESS_MAX_TOKENS,
+      ...params,
+      messages: [{ role: 'user' as const, content: ADAPTIVE_PROBE_PROMPT }],
+    } as Parameters<Anthropic['messages']['create']>[0]) as { content?: unknown; stop_reason?: unknown };
+    if (response.stop_reason !== 'end_turn') {
+      return { name, ok: false, detail: `expected stop_reason 'end_turn', got '${String(response.stop_reason)}'` };
+    }
+    if (!textOf(response.content).includes(ADAPTIVE_PROBE_SENTINEL)) {
+      return { name, ok: false, detail: 'the answer did not contain the probe sentinel' };
+    }
+    return { name, ok: true, detail: 'adaptive thinking with output_config.effort accepted' };
+  } catch (error) {
+    return { name, ok: false, detail: `request rejected: ${describeError(error)}` };
   }
 }
 
@@ -507,15 +595,15 @@ function sanitizeStep(step: FidelityCheckStep, secret: string): FidelityCheckSte
   return { name: step.name, ok: step.ok, detail };
 }
 
-export async function runFidelityCheck(input: FidelityCheckInput): Promise<FidelityCheckResult> {
-  const direct = await runDirectStage(input);
+export async function runFidelityCheck(input: FidelityCheckInput, transport?: FidelityTransport): Promise<FidelityCheckResult> {
+  const direct = await runDirectStage(input, transport?.client);
   const directPassed = direct.toolUse.ok && direct.toolResult.ok;
 
   // A stage that cannot run is a FAILING step, never an omitted one — the
   // caller persists these steps as the verification record, and a record with
   // a missing stage must never read as a pass.
   const subprocess = directPassed
-    ? await runSdkSubprocessStage(input)
+    ? await runSdkSubprocessStage(input, transport?.childEnv)
     : {
       name: FIDELITY_STEP_NAMES.sdkSubprocess,
       ok: false,
@@ -525,9 +613,18 @@ export async function runFidelityCheck(input: FidelityCheckInput): Promise<Fidel
   const steps = [direct.toolUse, direct.toolResult, subprocess]
     .map((step) => sanitizeStep(step, input.apiKey));
 
+  const probe: FidelityCheckStep = !directPassed
+    ? { name: FIDELITY_PROBE_NAMES.adaptiveEffort, ok: false, detail: 'skipped: the direct SDK stage did not pass' }
+    : (transport?.probeAdaptiveEffort ?? true)
+      ? await runAdaptiveEffortProbe(input, transport?.client)
+      : { name: FIDELITY_PROBE_NAMES.adaptiveEffort, ok: false, detail: 'skipped: not applicable to this connection kind' };
+  const probes = [sanitizeStep(probe, input.apiKey)];
+
   return {
     passed: steps.every((step) => step.ok),
     steps,
+    probes,
+    verifiedCapabilities: { adaptiveEffort: probes[0]!.ok },
     harnessVersion: FIDELITY_HARNESS_VERSION,
   };
 }

@@ -36,6 +36,13 @@ vi.mock('./quoteLifecycle', async (importActual) => {
   };
 });
 
+// #7507: send re-resolves a draft's tax rate; these suites are not about tax, so
+// the sync is a no-op (no extra db read queued into the mocked chain).
+vi.mock('./quoteService', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./quoteService')>();
+  return { ...actual, syncDraftQuoteTaxRate: vi.fn(async () => false) };
+});
+
 // Controllable Drizzle chain mock — same harness as quoteAcceptService.test.ts.
 const results: unknown[][] = [];
 function queueResult(rows: unknown[]) { results.push(rows); }
@@ -43,7 +50,7 @@ function queueResult(rows: unknown[]) { results.push(rows); }
 vi.mock('../db', () => {
   const makeChain = () => {
     const chain: Record<string, unknown> = {};
-    const methods = ['select', 'from', 'where', 'limit', 'orderBy', 'insert', 'values', 'returning', 'update', 'set', 'delete', 'for', 'innerJoin', 'execute', 'transaction'];
+    const methods = ['select', 'from', 'where', 'limit', 'orderBy', 'insert', 'values', 'returning', 'update', 'set', 'delete', 'for', 'innerJoin', 'leftJoin', 'execute', 'transaction'];
     for (const m of methods) chain[m] = vi.fn(() => chain);
     (chain as { then: unknown }).then = (resolve: (v: unknown) => unknown) => {
       const rows = results.shift() ?? [];
@@ -67,6 +74,7 @@ type Chain = {
   set: { mock: { calls: unknown[][] } };
   values: { mock: { calls: unknown[][] } };
   insert: { mock: { calls: unknown[][] } };
+  update: { mock: { calls: unknown[][] } };
 };
 
 const baseParams = {
@@ -399,6 +407,32 @@ describe('acceptQuote — origin on_behalf', () => {
     });
     expect(claimQuoteSentMock).not.toHaveBeenCalled();
     expect((db as unknown as Chain).insert.mock.calls.length).toBe(0);
+  });
+
+  // #9963: an item-less draft accepted on behalf used to be claimed to sent and
+  // converted into a $0 draft invoice. Refused before the claim, writing nothing.
+  it('refuses a draft with no customer-visible lines, before the claim (422 QUOTE_EMPTY)', async () => {
+    queueAcceptHappyPath({ status: 'draft' }, { customerVisible: false });
+    await expect(acceptQuote(onBehalfParams)).rejects.toMatchObject({
+      status: 422, code: 'QUOTE_EMPTY', message: 'Add at least one item before accepting',
+    });
+    expect(claimQuoteSentMock).not.toHaveBeenCalled();
+    expect((db as unknown as Chain).insert.mock.calls.length).toBe(0);
+  });
+
+  it('refuses a SENT quote with no lines on behalf, pointing at Revise', async () => {
+    results.length = 0;
+    queueResult([{
+      id: 'q1', orgId: 'org1', partnerId: 'p1', status: 'sent', expiryDate: null,
+      quoteNumber: 'Q-2026-0001', currencyCode: 'USD', depositType: 'none',
+    }]);
+    queueResult([]); // blocks
+    queueResult([]); // lines — none
+    const err = await acceptQuote(onBehalfParams).catch((e: unknown) => e);
+    expect(err).toMatchObject({ status: 422, code: 'QUOTE_EMPTY' });
+    expect((err as Error).message).toMatch(/Revise/);
+    expect((db as unknown as Chain).insert.mock.calls.length).toBe(0);
+    expect((db as unknown as Chain).update.mock.calls.length).toBe(0);
   });
 
   it('refuses a blank signer name rather than recording a nameless acceptance', async () => {

@@ -46,6 +46,8 @@ const conditionalChecks = ciSuccess.slice(blockingEnd);
 const PR_EXEMPT_JOBS = new Set(['build-smoke-images', 'smoke-test', 'guided-setup-smoke', 'workspace-runtime']);
 
 const UNGATED_JOBS = new Set([
+  'provenance-record', // W4 (#10748): writes the provenance artifact after CI Success; never a gate
+  'ci-gate-replay', // W02 (#10746): dispatch-only replay of the gate verdict; never a gate
   'ci-success', // the aggregate itself
   'main-red-alert', // runs after ci-success, alerts on a red main
   'rust-check-windows', // deliberately excluded, documented at its job definition: path-filtered and usually skipped
@@ -55,19 +57,11 @@ const UNGATED_JOBS = new Set([
   // criterion — a week of green, then move it into ci-success needs: with an env var and a
   // blocking assertion — is recorded at its job definition in ci.yml.
   'portal-dev-e2e',
-  // check-migrations is in ci-success needs: so its result can be read, but it is asserted ONLY
-  // on the tooling-only path (APP_CHANGED == 'false'), where it is the sole validation of the
-  // release-lineage / migration-immutability guards. For an application PR it remains
-  // non-blocking, exactly as before. #4227 (the reason it was left non-blocking) is closed and
-  // the job is green today, so promoting it for every PR is a reasonable follow-up — but that
-  // is a policy change to make deliberately, not as a side effect of a CI speed-up.
-  'lint-agent', // KNOWN GAP
-  'test-agent-race', // KNOWN GAP
-  'agent-windows-manifest-guard', // KNOWN GAP
+  'test-agent-race', // flaky under -race: #8488 #8489 #8490 #8491 — promote when they are closed
 ]);
-// The three KNOWN GAP jobs above run on every PR but are not in ci-success needs:, so they
-// cannot block a merge — the same defect as #3941. They are pinned here so the gap is visible
-// and any NEW job must be a conscious decision, not silently ungated.
+// Every other job is in ci-success needs: with a result env var and an unconditional blocking
+// assertion. A NEW job must make that decision consciously: gate it, or pin it above with a reason.
+// (lint-agent and agent-windows-manifest-guard were promoted in #4261; test-agent-race is deferred above.)
 
 describe('ci-success gating contract', () => {
   // Without this, a change to the `needs:` / `env:` / `run:` formatting would empty the parsed
@@ -187,18 +181,43 @@ describe('ci-success gating contract', () => {
     const exempt = new Set([
       'changes', 'docs-check', 'ci-success', 'main-red-alert', 'build-mobile-ios', 'recovery-media-e2e',
       'topology-browser-gate',
+      // path-read-contracts runs ONLY the tests that read docs/config by path, and must run on
+      // a docs-only PR (that is the point: a docs edit can break such a test). It is gated on
+      // the classifier's `path_readers` output and asserted fail-closed in ci-success
+      // (ci-pr-selection.test.mjs pins its lines).
+      'path-read-contracts',
+      // W4 (#10748): runs after a green CI Success on any PR (docs-only included) to write the
+      // provenance artifact; continue-on-error and outside ci-success needs, so never a gate.
+      // Its lines are pinned by queue-selection.test.mjs.
+      'provenance-record',
+      // W02 (#10746): dispatch-only replay of the gate verdict; never a gate.
+      // Its lines are pinned by ci-gate.test.mjs.
+      'ci-gate-replay',
     ]);
-    // lint/security-audit validate CI plumbing itself and must keep running on a
+    // lint/security-audit/release-ledger validate CI plumbing itself and must keep running on a
     // tooling-only PR, so they stay gated on `code` alone — never additionally on `app`.
-    const codeOnly = new Set(['lint', 'security-audit']);
+    const codeOnly = new Set(['lint', 'security-audit', 'release-ledger']);
     // Per-area gating (.github/scripts/ci-area-gating.test.mjs pins the exact per-job
     // lines): an area-gated job appends ONE area clause to the code+app gate, so a
     // docs-only or tooling-only PR still skips it. check-migrations is code AND api —
-    // never app, it is the release-lineage guard for tooling-only PRs.
+    // never app, it is the release-lineage guard for tooling-only PRs. integration-test
+    // carries the single-job `integration` clause instead of an area (#5936; pinned by
+    // classify-pr-paths.test.mjs). The seven agent jobs carry the `agent_code` area (W3, #10744;
+    // pinned by ci-area-gating.test.mjs).
     const areaClause =
-      "(?: && (?:needs\\.changes\\.outputs\\.(?:api|web|portal|addins|m365|rust) == 'true'|" +
+      "(?: && (?:needs\\.changes\\.outputs\\.(?:api|web|portal|addins|m365|rust|integration|agent_code) == 'true'|" +
       "\\(needs\\.changes\\.outputs\\.api == 'true' \\|\\| needs\\.changes\\.outputs\\.web == 'true' \\|\\| needs\\.changes\\.outputs\\.portal == 'true'\\)))?";
     const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    // W05 (#10749): a job ci-success has a thin `case` arm for may end its `if:` with the
+    // clause naming its own id (queue-selection.test.mjs requires it there); no other job may.
+    const thinArms = new Set(
+      [...ciSuccess.matchAll(/^ {14}([a-z0-9-]+)\) \[\[ "\$\{\w+_RESULT\}" != "skipped" \]\] \|\| \w+_RESULT=success ;;$/gm)].flatMap(
+        ([, job]) => (job ? [job] : []),
+      ),
+    );
+    const thinClause = (job: string) =>
+      thinArms.has(job) ? `(?:${escape(` && !contains(needs.changes.outputs.thin_skip, ',${job},')`)})?` : '';
+    expect(thinArms.size, 'the W05 normalization block lists the 27 thinnable jobs').toBe(27);
     const ungated = workflowJobs.filter((job) => {
       if (exempt.has(job)) return false;
       const body = jobBodies.get(job) ?? '';
@@ -208,7 +227,7 @@ describe('ci-success gating contract', () => {
         : job === 'check-migrations'
           ? escape("if: needs.changes.outputs.code == 'true' && needs.changes.outputs.api == 'true'")
           : escape("if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true'") + areaClause;
-      return !new RegExp(`^    ${expectedIf}$`, 'm').test(body);
+      return !new RegExp(`^    ${expectedIf}${thinClause(job)}$`, 'm').test(body);
     });
     expect(
       ungated,
@@ -223,6 +242,58 @@ describe('ci-success gating contract', () => {
     expect(body).toMatch(
       /^    if: needs\.changes\.outputs\.code == 'true' && needs\.changes\.outputs\.agent == 'true'$/m,
     );
+  });
+
+  it('lint-agent and the Windows manifest guard block a merge (regression guard for #4261)', () => {
+    const expected = {
+      LINT_AGENT_RESULT: 'lint-agent',
+      AGENT_WINDOWS_MANIFEST_GUARD_RESULT: 'agent-windows-manifest-guard',
+    };
+    // Branch placement matters: `!= success` belongs in the APP_CHANGED == true leg (under the
+    // agent_code area guard), and `!= skipped` in the APP_CHANGED == false leg. Swapping them would gate nothing on app
+    // changes (the #4261 defect) and red every tooling-only PR.
+    const skippedLegMarker = '{ [[ "${APP_CHANGED}" == "false" ]] && { \\';
+    const splitAt = blockingCondition.indexOf(skippedLegMarker);
+    expect(splitAt, 'could not locate the APP_CHANGED == false leg — the parser is stale').toBeGreaterThan(0);
+    const appLeg = blockingCondition.slice(0, splitAt);
+    const toolingLeg = blockingCondition.slice(splitAt);
+    for (const [envVar, job] of Object.entries(expected)) {
+      expect(neededJobs, `${job} is missing from ci-success needs:`).toContain(job);
+      expect(resultEnvByName.get(envVar), `${envVar} is not mapped to ${job}`).toBe(job);
+      // Agent area (W3, #10744): inside the app leg the job is required when agent_code is
+      // true, asserted skipped when it is false, and any other agent_code value fails closed.
+      expect(appLeg, `${job} must be required when agent code changed`).toContain(
+        `{ [[ "\${AGENT_CODE_CHANGED}" == "true" ]] && [[ "\${${envVar}}" != "success" ]]; }`,
+      );
+      expect(appLeg, `${job} must be asserted skipped when agent code did not change`).toContain(
+        `{ [[ "\${AGENT_CODE_CHANGED}" == "false" ]] && [[ "\${${envVar}}" != "skipped" ]]; }`,
+      );
+      expect(appLeg, 'agent_code must be fail-closed (only true/false accepted)').toContain(
+        '{ [[ "${AGENT_CODE_CHANGED}" != "true" ]] && [[ "${AGENT_CODE_CHANGED}" != "false" ]]; }',
+      );
+      // Every success/skipped check for the job in the app leg is guarded by agent_code — an
+      // unguarded `!= success` would red agent-free PRs, an unguarded `!= skipped` every agent PR.
+      const unguarded = appLeg
+        .split('\n')
+        .filter((line) => line.includes(`"\${${envVar}}"`) && !line.includes('"${AGENT_CODE_CHANGED}"'));
+      expect(unguarded, `${job} has an agent_code-unguarded check in the app leg`).toEqual([]);
+      expect(toolingLeg, `${job} must be asserted skipped on a tooling-only change`).toContain(
+        `[[ "\${${envVar}}" != "skipped" ]]`,
+      );
+      expect(toolingLeg, `${job} must not be required to succeed on a tooling-only change`).not.toContain(
+        `[[ "\${${envVar}}" != "success" ]]`,
+      );
+    }
+  });
+
+  it('test-agent-race stays non-blocking until its flakes are closed (#8488-#8491)', () => {
+    expect(UNGATED_JOBS.has('test-agent-race'), 'test-agent-race must be pinned in UNGATED_JOBS').toBe(true);
+    expect(neededJobs, 'test-agent-race must not be in ci-success needs: yet').not.toContain('test-agent-race');
+    expect(
+      [...resultEnvByName.values()],
+      'test-agent-race must not have a result env var yet',
+    ).not.toContain('test-agent-race');
+    expect(blockingCondition, 'test-agent-race must not be asserted yet').not.toContain('TEST_AGENT_RACE_RESULT');
   });
 
   it('test-mobile blocks a merge (regression guard for #3941)', () => {

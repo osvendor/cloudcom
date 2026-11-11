@@ -26,8 +26,15 @@ import { createPartner, createOrganization } from './db-utils';
 import { getTestDb } from './setup';
 import { normalizeGraphMessage } from '../../services/ticketMailbox/normalizeGraphMessage';
 import { processInboundEmail } from '../../services/inboundEmail/inboundEmailService';
-import { disableConnection } from '../../services/ticketMailbox/connectionService';
+import type { MailboxGenerationContext } from '../../services/inboundEmailQueue';
+import {
+  disableConnection,
+  listConnectedMailboxes,
+  listMailboxConnections,
+  updateTrustedArcSealers,
+} from '../../services/ticketMailbox/connectionService';
 import type { GraphMessage } from '../../services/ticketMailbox/graphMailClient';
+import type { ArcEvaluation } from '../../services/ticketMailbox/arcSeal';
 
 const runDb = it.runIf(!!process.env.DATABASE_URL);
 
@@ -81,6 +88,138 @@ describe('M365 inbound → ticket (real DB)', () => {
     expect(ticketRows).toHaveLength(0);
   });
 
+  describe('external sender auth (#10862)', () => {
+    const external = [
+      { name: 'X-MS-Exchange-Organization-AuthAs', value: 'Anonymous' },
+      { name: 'X-MS-Exchange-Organization-MessageDirectionality', value: 'Incoming' },
+    ];
+
+    async function seedConnection(label: string) {
+      const db = getTestDb() as any;
+      const suffix = `${label}-${Date.now()}-${Math.floor(performance.now())}`;
+      const tenantId = randomUUID();
+      const customerEmail = `cust-${suffix}@known.test`;
+      const mailboxAddress = `support-${suffix}@example.com`;
+      const seeded = await withSystemDbAccessContext(async () => {
+        const partner = await createPartner();
+        const org = await createOrganization({ partnerId: partner.id });
+        await db.insert(portalUsers).values({ orgId: org.id, email: customerEmail, name: 'Customer' });
+        await db.insert(ticketMailboxTenantOwnerships).values({
+          tenantId, partnerId: partner.id, verifiedMicrosoftOid: randomUUID(),
+        });
+        const [connection] = await db.insert(ticketMailboxConnections).values({
+          partnerId: partner.id, tenantId, mailboxAddress, status: 'connected',
+        }).returning({
+          id: ticketMailboxConnections.id,
+          consentAttemptId: ticketMailboxConnections.consentAttemptId,
+        });
+        return { partnerId: partner.id, connection: connection! };
+      });
+      return { ...seeded, suffix, tenantId, customerEmail, mailboxAddress };
+    }
+
+    async function ingest(seed: Awaited<ReturnType<typeof seedConnection>>, headers: { name: string; value: string }[], arc?: ArcEvaluation) {
+      const db = getTestDb() as any;
+      const msg: GraphMessage = {
+        id: `msg-${seed.suffix}`,
+        internetMessageId: `<${seed.suffix}@known.test>`,
+        subject: `External ${seed.suffix}`,
+        from: { emailAddress: { address: seed.customerEmail, name: 'Customer' } },
+        toRecipients: [{ emailAddress: { address: seed.mailboxAddress } }],
+        body: { contentType: 'text', content: 'hello' },
+        bodyPreview: 'hello',
+        hasAttachments: false,
+        internetMessageHeaders: headers,
+      };
+      const normalized = normalizeGraphMessage(msg, seed.partnerId, seed.mailboxAddress, arc ? { arc } : undefined);
+      await withSystemDbAccessContext(() => processInboundEmail(normalized, {
+        provider: 'm365' as const,
+        connectionId: seed.connection.id,
+        partnerId: seed.partnerId,
+        tenantId: seed.tenantId,
+        consentAttemptId: seed.connection.consentAttemptId,
+      }));
+      const rows = await db.select().from(ticketEmailInbound).where(and(
+        eq(ticketEmailInbound.partnerId, seed.partnerId),
+        eq(ticketEmailInbound.providerMessageId, msg.id),
+      ));
+      expect(rows).toHaveLength(1);
+      return rows[0];
+    }
+
+    const stamp = (domain: string, dmarc: string) => ({
+      name: 'Authentication-Results',
+      value: `mx.microsoft.com 1; spf=pass smtp.mailfrom=${domain}; dmarc=${dmarc} action=none header.from=${domain}`,
+    });
+
+    runDb('turns external mail Exchange passed into a ticket and records the source', async () => {
+      const seed = await seedConnection('eop-pass');
+      const row = await ingest(seed, [...external, stamp('known.test', 'pass')]);
+      expect(row.parseStatus).toBe('created');
+      expect(row.raw).toMatchObject({ senderAuthSource: 'exchange-online' });
+    });
+
+    runDb('quarantines a forged Exchange stamp on mail with no tenant org headers', async () => {
+      const seed = await seedConnection('forged');
+      const row = await ingest(seed, [stamp('known.test', 'pass')]);
+      expect(row.parseStatus).toBe('quarantined');
+      expect(row.error).toBe('unverified sender (SPF/DKIM/DMARC): no Exchange tenant proof on this message');
+    });
+
+    runDb('quarantines the issue fixture (Exchange fail, no sealer configured) and names the source', async () => {
+      const seed = await seedConnection('eop-fail');
+      const row = await ingest(seed, [
+        ...external,
+        stamp('known.test', 'fail'),
+        { name: 'Authentication-Results-Original', value: 'mx.gateway.test; dkim=pass header.d=known.test; spf=pass smtp.mailfrom=known.test' },
+      ]);
+      expect(row.parseStatus).toBe('quarantined');
+      expect(row.error).toBe('unverified sender (SPF/DKIM/DMARC): Exchange Online stamp: dmarc=fail');
+    });
+
+    runDb("creates a ticket on a verified trusted sealer's verdict even though Exchange failed the mail", async () => {
+      const seed = await seedConnection('sealed');
+      const row = await ingest(seed, [...external, stamp('known.test', 'fail')], {
+        status: 'verified', sealer: 'gateway.test', instance: 1, authResults: 'mx.gateway.test; dkim=pass header.d=known.test',
+      });
+      expect(row.parseStatus).toBe('created');
+      expect(row.raw).toMatchObject({ senderAuthSource: 'trusted-arc-sealer' });
+    });
+
+    runDb('stores trusted sealers on the connection, empty by default, for Microsoft 365 rows only', async () => {
+      const seed = await seedConnection('column');
+      const db = getTestDb() as any;
+      const before = await withSystemDbAccessContext(() => listMailboxConnections(seed.partnerId));
+      expect(before[0]!.trustedArcSealers).toEqual([]);
+
+      const updated = await withSystemDbAccessContext(
+        () => updateTrustedArcSealers(seed.connection.id, seed.partnerId, ['gateway.test']),
+      );
+      expect(updated?.id).toBe(seed.connection.id);
+
+      // The sweep reads on its own connection, so this has to follow the commit above.
+      const swept = (await listConnectedMailboxes()).find((c) => c.id === seed.connection.id);
+      expect(swept?.trustedArcSealers).toEqual(['gateway.test']);
+
+      // Another partner cannot reach it, and the column refuses what the API would too.
+      const other = await withSystemDbAccessContext(async () => (await createPartner()).id);
+      await expect(withSystemDbAccessContext(() => updateTrustedArcSealers(seed.connection.id, other, []))).resolves.toBeNull();
+
+      // A disabled mailbox is not edited.
+      const disabled = await seedConnection('column-disabled');
+      await withSystemDbAccessContext(() => db.update(ticketMailboxConnections)
+        .set({ status: 'disabled' }).where(eq(ticketMailboxConnections.id, disabled.connection.id)));
+      await expect(withSystemDbAccessContext(
+        () => updateTrustedArcSealers(disabled.connection.id, disabled.partnerId, ['gateway.test']),
+      )).resolves.toBeNull();
+      await expect(withSystemDbAccessContext(() => db.execute(sql`
+        UPDATE ticket_mailbox_connections
+        SET trusted_arc_sealers = ${sql.raw(`ARRAY[${Array.from({ length: 11 }, (_, i) => `'g${i}.test'`).join(',')}]`)}
+        WHERE id = ${seed.connection.id}
+      `))).rejects.toMatchObject({ cause: { constraint_name: 'ticket_mailbox_connections_trusted_arc_sealers_check' } });
+    });
+  });
+
   runDb('ingests only the exact connected mailbox generation', async () => {
     const db = getTestDb() as any;
     const suffix = `${Date.now()}-${Math.floor(performance.now())}`;
@@ -126,11 +265,146 @@ describe('M365 inbound → ticket (real DB)', () => {
     const normalized = normalizeGraphMessage(msg, seeded.partnerId, mailboxAddress);
 
     await withSystemDbAccessContext(() => processInboundEmail(normalized, {
+      provider: 'm365' as const,
       connectionId: seeded.connection.id,
       partnerId: seeded.partnerId,
       tenantId,
       consentAttemptId: seeded.connection.consentAttemptId,
     }));
+
+    const rows = await db.select().from(ticketEmailInbound).where(and(
+      eq(ticketEmailInbound.partnerId, seeded.partnerId),
+      eq(ticketEmailInbound.providerMessageId, msg.id),
+    ));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.parseStatus).toBe('created');
+  });
+
+  // No-loss (same generation): a transient poll failure moves the row off
+  // 'connected' without rotating consentAttemptId. A message enqueued while
+  // connected must still be ingested when consumed afterwards, because the poll
+  // cursor has already advanced past it. Retired/unconsented rows stay excluded.
+  for (const [status, ingests] of [
+    ['reauth_required', true],
+    ['error', true],
+    ['pending_consent', false],
+    ['disabled', false],
+  ] as const) {
+    runDb(`same generation, status ${status}: ${ingests ? 'still ingests' : 'is not ingested'}`, async () => {
+      const db = getTestDb() as any;
+      const suffix = `${status}-${Date.now()}-${Math.floor(performance.now())}`;
+      const tenantId = randomUUID();
+      const customerEmail = `gen-${suffix}@known.test`;
+      const mailboxAddress = `support-gen-${suffix}@example.com`;
+
+      const seeded = await withSystemDbAccessContext(async () => {
+        const partner = await createPartner();
+        const org = await createOrganization({ partnerId: partner.id });
+        await db.insert(portalUsers).values({ orgId: org.id, email: customerEmail, name: 'Customer' });
+        await db.insert(ticketMailboxTenantOwnerships).values({
+          tenantId,
+          partnerId: partner.id,
+          verifiedMicrosoftOid: randomUUID(),
+        });
+        const [connection] = await db.insert(ticketMailboxConnections).values({
+          partnerId: partner.id,
+          tenantId,
+          mailboxAddress,
+          status: 'connected',
+        }).returning({
+          id: ticketMailboxConnections.id,
+          consentAttemptId: ticketMailboxConnections.consentAttemptId,
+        });
+        // The status change after enqueue; the generation (consentAttemptId) is kept.
+        await db.update(ticketMailboxConnections)
+          .set({ status })
+          .where(eq(ticketMailboxConnections.id, connection!.id));
+        return { partnerId: partner.id, connection: connection! };
+      });
+
+      const msg: GraphMessage = {
+        id: `gen-${suffix}`,
+        internetMessageId: `<gen-${suffix}@known.test>`,
+        subject: `Generation ${suffix}`,
+        from: { emailAddress: { address: customerEmail, name: 'Customer' } },
+        toRecipients: [{ emailAddress: { address: mailboxAddress } }],
+        body: { contentType: 'text', content: 'same generation' },
+        bodyPreview: 'same generation',
+        hasAttachments: false,
+        internetMessageHeaders: [
+          { name: 'Authentication-Results', value: 'example.com; spf=pass; dkim=pass; dmarc=pass' },
+        ],
+      };
+      const normalized = normalizeGraphMessage(msg, seeded.partnerId, mailboxAddress);
+
+      await withSystemDbAccessContext(() => processInboundEmail(normalized, {
+        provider: 'm365',
+        connectionId: seeded.connection.id,
+        partnerId: seeded.partnerId,
+        tenantId,
+        consentAttemptId: seeded.connection.consentAttemptId,
+      }));
+
+      const rows = await db.select().from(ticketEmailInbound).where(and(
+        eq(ticketEmailInbound.partnerId, seeded.partnerId),
+        eq(ticketEmailInbound.providerMessageId, msg.id),
+      ));
+      if (ingests) {
+        expect(rows).toHaveLength(1);
+        expect(rows[0]?.parseStatus).toBe('created');
+      } else {
+        expect(rows).toHaveLength(0);
+      }
+    });
+  }
+
+  // Regression (upgrade compat): a mailbox generation enqueued BEFORE the
+  // provider field existed has NO provider. Such a legacy in-flight job must
+  // still ingest (definitionally m365), not be dropped at the provider-equality
+  // gate. Without the consumer's legacy default this asserts 0 rows.
+  runDb('ingests a LEGACY generation that has no provider field (treated as m365)', async () => {
+    const db = getTestDb() as any;
+    const suffix = `${Date.now()}-${Math.floor(performance.now())}`;
+    const tenantId = randomUUID();
+    const microsoftOid = randomUUID();
+    const customerEmail = `legacy-${suffix}@known.test`;
+    const mailboxAddress = `support-legacy-${suffix}@example.com`;
+
+    const seeded = await withSystemDbAccessContext(async () => {
+      const partner = await createPartner();
+      const org = await createOrganization({ partnerId: partner.id });
+      await db.insert(portalUsers).values({ orgId: org.id, email: customerEmail, name: 'Customer' });
+      await db.insert(ticketMailboxTenantOwnerships).values({ tenantId, partnerId: partner.id, verifiedMicrosoftOid: microsoftOid });
+      const [connection] = await db.insert(ticketMailboxConnections).values({
+        partnerId: partner.id, tenantId, mailboxAddress, status: 'connected',
+      }).returning({ id: ticketMailboxConnections.id, consentAttemptId: ticketMailboxConnections.consentAttemptId });
+      return { partnerId: partner.id, connection: connection! };
+    });
+
+    const msg: GraphMessage = {
+      id: `legacy-${suffix}`,
+      internetMessageId: `<legacy-${suffix}@known.test>`,
+      subject: `Legacy generation ${suffix}`,
+      from: { emailAddress: { address: customerEmail, name: 'Customer' } },
+      toRecipients: [{ emailAddress: { address: mailboxAddress } }],
+      body: { contentType: 'text', content: 'legacy generation' },
+      bodyPreview: 'legacy generation',
+      hasAttachments: false,
+      internetMessageHeaders: [
+        { name: 'Authentication-Results', value: 'example.com; spf=pass; dkim=pass; dmarc=pass' },
+      ],
+    };
+    const normalized = normalizeGraphMessage(msg, seeded.partnerId, mailboxAddress);
+
+    // The legacy envelope: no `provider` key (an old producer never set it).
+    const legacyGeneration = {
+      connectionId: seeded.connection.id,
+      partnerId: seeded.partnerId,
+      tenantId,
+      consentAttemptId: seeded.connection.consentAttemptId,
+    } as unknown as MailboxGenerationContext;
+
+    await withSystemDbAccessContext(() => processInboundEmail(normalized, legacyGeneration));
 
     const rows = await db.select().from(ticketEmailInbound).where(and(
       eq(ticketEmailInbound.partnerId, seeded.partnerId),
@@ -184,6 +458,7 @@ describe('M365 inbound → ticket (real DB)', () => {
     };
     const normalized = normalizeGraphMessage(msg, seeded.partnerId, mailboxAddress);
     const generation = {
+      provider: 'm365' as const,
       connectionId: seeded.connection.id,
       partnerId: seeded.partnerId,
       tenantId,
@@ -281,6 +556,7 @@ describe('M365 inbound → ticket (real DB)', () => {
     });
 
     const queuedGeneration = {
+      provider: 'm365' as const,
       connectionId: seeded.connection.id,
       partnerId: seeded.partnerId,
       tenantId,

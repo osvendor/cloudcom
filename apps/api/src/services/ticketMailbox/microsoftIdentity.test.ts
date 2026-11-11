@@ -1,6 +1,11 @@
 import { generateKeyPair, SignJWT } from 'jose';
 import { beforeAll, describe, expect, it, vi } from 'vitest';
 
+vi.mock('../../extensions/cloudCommandAdminRuntime', () => ({
+  cloudCommandAdminRuntime: { createClientAssertion: vi.fn(async () => 'signed-certificate-assertion') },
+}));
+import { cloudCommandAdminRuntime } from '../../extensions/cloudCommandAdminRuntime';
+
 import {
   GLOBAL_ADMIN_ROLE_ID,
   PRIVILEGED_ROLE_ADMIN_ROLE_ID,
@@ -154,6 +159,25 @@ describe('exchangeMicrosoftAuthorizationCode', () => {
       code: input.code,
       code_verifier: input.codeVerifier,
     });
+  });
+
+  it('exchanges the code using a bound Cloud Command certificate assertion without a client secret', async () => {
+    const fetchImpl = vi.fn<TestFetch>(async () => Response.json({ id_token: 'id-token' }));
+    await exchangeMicrosoftAuthorizationCode({ ...input, clientSecret: undefined, credentialVersion: 'cert-1' }, { fetch: fetchImpl });
+    expect(cloudCommandAdminRuntime.createClientAssertion).toHaveBeenCalledWith({ tenantId: TENANT, clientId: CLIENT_ID, credentialVersion: 'cert-1' });
+    const body = new URLSearchParams(fetchImpl.mock.calls[0]![1]!.body as string);
+    expect(body.get('client_assertion')).toBe('signed-certificate-assertion');
+    expect(body.get('client_assertion_type')).toBe('urn:ietf:params:oauth:client-assertion-type:jwt-bearer');
+    expect(body.has('client_secret')).toBe(false);
+    expect(body.get('code_verifier')).toBe(input.codeVerifier);
+    expect(body.get('redirect_uri')).toBe(input.redirectUri);
+  });
+
+  it('fails closed before contacting Microsoft when assertion generation rejects the binding', async () => {
+    vi.mocked(cloudCommandAdminRuntime.createClientAssertion).mockRejectedValueOnce(new Error('binding mismatch'));
+    const fetchImpl = vi.fn<TestFetch>();
+    await expect(exchangeMicrosoftAuthorizationCode({ ...input, clientSecret: undefined, credentialVersion: 'old-cert' }, { fetch: fetchImpl })).rejects.toThrow('Microsoft identity verification failed');
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 
   it('rejects a non-2xx token response without exposing its body', async () => {

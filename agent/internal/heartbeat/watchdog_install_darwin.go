@@ -5,8 +5,9 @@ package heartbeat
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
+
+	"github.com/breeze-rmm/agent/internal/procspawn"
 )
 
 // watchdogLaunchdLabel is the launchd label of the watchdog LaunchDaemon
@@ -24,11 +25,15 @@ func (h *Heartbeat) installAndRestartWatchdog(targetVersion string) error {
 	}
 	defer func() { _ = os.Remove(tempPath) }()
 
-	if err := replaceWatchdogBinaryUnix(tempPath, watchdogBinaryPathUnix); err != nil {
+	dest, err := watchdogBinaryPath()
+	if err != nil {
+		return fmt.Errorf("resolve watchdog binary path: %w", err)
+	}
+	if err := replaceWatchdogBinaryUnix(tempPath, dest); err != nil {
 		return err
 	}
 
-	if out, err := exec.Command("launchctl", "kickstart", "-k", "system/"+watchdogLaunchdLabel).CombinedOutput(); err != nil {
+	if out, err := procspawn.Command("launchctl", "kickstart", "-k", "system/"+watchdogLaunchdLabel).CombinedOutput(); err != nil {
 		return fmt.Errorf("launchctl kickstart %s: %s: %w", watchdogLaunchdLabel, strings.TrimSpace(string(out)), err)
 	}
 	return nil

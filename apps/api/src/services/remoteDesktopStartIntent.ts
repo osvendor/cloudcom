@@ -1,5 +1,5 @@
 /**
- * SEC-038 W02 (#5533) — the single serialized start decision for a remote
+ * #5533 — the single serialized start decision for a remote
  * desktop session.
  *
  * Three sites publish a desktop start today (`POST /remote/sessions/:id/offer`,
@@ -23,7 +23,8 @@
  * Immediately before the command is handed to the agent the caller re-reads
  * with `assertDesktopStartIntentCurrent`. That narrows the publish window to
  * microseconds; it does NOT close it, and it is not meant to — closing it is
- * the endpoint's job in W04/W05.
+ * the endpoint's job: the agent's start fence refuses a start that is not
+ * newer than everything it has seen, or that arrives after a stop.
  *
  * **How much the re-read can actually see depends on the caller's transaction
  * boundary, and the three start sites differ.** `authMiddleware` wraps a JWT
@@ -50,7 +51,10 @@
 import { and, eq, inArray, sql } from 'drizzle-orm';
 import { db, hasDbAccessContext } from '../db';
 import { remoteSessions } from '../db/schema';
-import type { SessionPromptMode } from '../routes/remote/helpers';
+import type { ConsentUnavailableBehavior, SessionPromptMode } from '../routes/remote/helpers';
+import { viewerAnswerTimeoutMs } from '../routes/remote/consentTiming';
+import { markDesktopStartInFlight, readDesktopStartInFlight } from './desktopStartInFlight';
+import { originalRemoteSessionStart } from './remoteSessionStaleness';
 
 /** Statuses a start may be published from. A terminal row is never resurrected. */
 export const LIVE_START_STATUSES = ['pending', 'connecting', 'active'] as const;
@@ -65,7 +69,13 @@ export type StartIntentDenial =
   /** The row left the live status set between read and commit. */
   | 'state_changed'
   /** A newer start generation committed after ours (supersession). */
-  | 'superseded';
+  | 'superseded'
+  /**
+   * #8947: an earlier WebRTC start for this session is still waiting for its
+   * answer, inside its viewer's answer budget. A second concurrent offer is
+   * refused instead of superseding it (see desktopStartInFlight.ts).
+   */
+  | 'start_in_flight';
 
 export interface DesktopStartIntent {
   ok: true;
@@ -100,6 +110,7 @@ export function startIntentDenialCode(reason: StartIntentDenial): string {
     case 'terminal': return 'SESSION_TERMINAL';
     case 'superseded': return 'SESSION_SUPERSEDED';
     case 'state_changed': return 'SESSION_STATE_CHANGED';
+    case 'start_in_flight': return 'START_IN_FLIGHT';
   }
 }
 
@@ -110,6 +121,7 @@ export function startIntentDenialMessage(reason: StartIntentDenial): string {
     case 'terminal': return 'This session has already been ended';
     case 'superseded': return 'This session was superseded by a newer start';
     case 'state_changed': return 'Session state changed while starting the stream';
+    case 'start_in_flight': return 'A desktop start for this session is already in progress';
   }
 }
 
@@ -126,6 +138,10 @@ interface LockedSession {
   status: string;
   terminationPhase: 'none' | 'pending' | 'confirmed';
   generation: bigint;
+  /** The command the current start is bound to, if any. */
+  startCommandId: string | null;
+  /** Whether an answer is stored for that start (the SDP itself is not read). */
+  hasAnswer: boolean;
 }
 
 async function lockSessionForStart(sessionId: string): Promise<LockedSession | null> {
@@ -134,6 +150,8 @@ async function lockSessionForStart(sessionId: string): Promise<LockedSession | n
       status: remoteSessions.status,
       terminationPhase: remoteSessions.terminationPhase,
       generation: remoteSessions.desktopStartGeneration,
+      startCommandId: remoteSessions.desktopStartCommandId,
+      hasAnswer: sql<boolean>`${remoteSessions.webrtcAnswer} IS NOT NULL`,
     })
     .from(remoteSessions)
     .where(eq(remoteSessions.id, sessionId))
@@ -145,6 +163,8 @@ async function lockSessionForStart(sessionId: string): Promise<LockedSession | n
     status: String(row.status),
     terminationPhase: (row.terminationPhase ?? 'none') as LockedSession['terminationPhase'],
     generation: BigInt(row.generation ?? 0),
+    startCommandId: row.startCommandId ?? null,
+    hasAnswer: row.hasAnswer === true,
   };
 }
 
@@ -163,13 +183,43 @@ function classifyLocked(
   return { ok: true, locked };
 }
 
+/**
+ * The consentUnavailableBehavior to bind to a start, read from the prompt
+ * block that start ships to the agent. Only a consent-mode prompt binds one;
+ * anything else — no prompt, notify mode, or a value outside the closed set —
+ * binds null, which the answer path treats as "not proceed" (#6819).
+ */
+export function boundConsentUnavailableBehavior(
+  prompt: Record<string, unknown> | undefined,
+): ConsentUnavailableBehavior | null {
+  if (prompt?.mode !== 'consent') return null;
+  const behavior = prompt.consentUnavailableBehavior;
+  return behavior === 'proceed' || behavior === 'block' ? behavior : null;
+}
+
 export interface CommitDesktopStartIntentInput {
   sessionId: string;
   /** The one-off command identity this exact start is bound to. */
   startCommandId: string;
   promptMode: SessionPromptMode;
+  /**
+   * The consentUnavailableBehavior shipped to the agent with this start, or
+   * null when the start carried no prompt block. Bound to the generation so a
+   * consent-mode answer reporting helper_absent/timeout can be checked against
+   * what this start actually allowed (#6819).
+   */
+  consentUnavailableBehavior: ConsentUnavailableBehavior | null;
   /** The viewer's SDP offer. */
   offer: string;
+}
+
+/**
+ * Is the locked row's current start still waiting for its answer? Only such a
+ * start can be in flight. A stored answer (or an `active`/`pending` row) means
+ * a new offer is a reconnect and supersedes as before.
+ */
+function hasUnansweredStart(locked: LockedSession): locked is LockedSession & { startCommandId: string } {
+  return locked.status === 'connecting' && locked.startCommandId !== null && !locked.hasAnswer;
 }
 
 /**
@@ -177,6 +227,12 @@ export interface CommitDesktopStartIntentInput {
  *
  * Bumps the generation, binds the command identity + prompt mode, publishes the
  * offer, clears any stale answer and moves the row to `connecting`.
+ *
+ * #8947: refuses with `start_in_flight` while the previous WebRTC start is
+ * unanswered and its viewer is still waiting for the answer. The check and the
+ * new start's marker are both made under this function's row lock, so of two
+ * concurrent offers exactly one commits. The release on a start that was never
+ * dispatched is the caller's (`releaseDesktopStartInFlight`).
  */
 export async function commitDesktopStartIntent(
   input: CommitDesktopStartIntentInput,
@@ -186,6 +242,13 @@ export async function commitDesktopStartIntent(
   const locked = classifyLocked(await lockSessionForStart(input.sessionId), LIVE_START_STATUSES);
   if (!locked.ok) return locked;
 
+  if (hasUnansweredStart(locked.locked)) {
+    const inFlight = await readDesktopStartInFlight(input.sessionId);
+    if (inFlight === locked.locked.startCommandId) {
+      return { ok: false, reason: 'start_in_flight' };
+    }
+  }
+
   const previousStatus = locked.locked.status as LiveStartStatus;
 
   const [updated] = await db
@@ -193,10 +256,17 @@ export async function commitDesktopStartIntent(
     .set({
       webrtcOffer: input.offer,
       webrtcAnswer: null,
+      // #9182: trickled candidates belong to one start; a new offer is a new
+      // ICE negotiation.
+      iceCandidates: [],
       desktopStartCommandId: input.startCommandId,
       desktopPromptMode: input.promptMode,
+      desktopConsentUnavailableBehavior: input.consentUnavailableBehavior,
       desktopStartGeneration: sql`${remoteSessions.desktopStartGeneration} + 1`,
       status: 'connecting',
+      // A re-offer moves a live session back to `connecting`, so stale cleanup
+      // has to measure it from now, not from its last answer (#11149).
+      lastStartAttemptAt: new Date(),
       ...(previousStatus === 'active' ? { endedAt: null } : {}),
     })
     .where(and(
@@ -208,35 +278,72 @@ export async function commitDesktopStartIntent(
 
   if (!updated) return { ok: false, reason: 'state_changed' };
 
+  // Still under the row lock: a concurrent offer waiting on it sees this
+  // marker as soon as it gets the lock. The TTL is how long this start's
+  // viewer polls for the answer; after that a new offer is a genuine retry.
+  await markDesktopStartInFlight(input.sessionId, input.startCommandId, viewerAnswerTimeoutMs(input.promptMode));
+
   return { ok: true, generation: BigInt(updated.generation ?? 0), previousStatus };
+}
+
+export interface CommitDesktopStreamStartIntentInput {
+  sessionId: string;
+  /** The one-off command identity this exact stream start is bound to. */
+  startCommandId: string;
+  promptMode: SessionPromptMode;
+  /** As for {@link CommitDesktopStartIntentInput.consentUnavailableBehavior}. */
+  consentUnavailableBehavior: ConsentUnavailableBehavior | null;
 }
 
 /**
  * Commit a WS-fallback desktop start decision (`desktop_stream_start`).
  *
- * The fallback transport carries no SDP offer and no per-start command
- * identity; it activates the row directly. It still takes the same row lock,
- * still refuses a terminal session, and still bumps the same generation, so the
- * endpoint fence orders it against every other start and every terminal.
+ * Same contract as the WebRTC start: row lock, terminal refusal, generation
+ * bump, and a one-off command identity plus the prompt mode and consent
+ * fallback this start ships. The row moves to `connecting`, NOT `active`: it
+ * becomes active only when the agent's result for this exact command arrives
+ * with a consent marker it is entitled to (routes/agentWs.ts), and a consent
+ * denial or a failed start finalizes it through the same finalizers the WebRTC
+ * path uses. The relay forwards nothing before that (routes/desktopWs.ts).
+ *
+ * The agent refuses a start whose generation is not current, or that arrives
+ * after a stop, only on builds that fence this path; older fence-capable
+ * builds ignore the generation on the WebSocket fallback. For those the
+ * handshake above is what keeps a late start from reaching a viewer.
  */
 export async function commitDesktopStreamStartIntent(
-  sessionId: string,
+  input: CommitDesktopStreamStartIntentInput,
 ): Promise<DesktopStartIntentResult> {
   requireDbAccessContext('commitDesktopStreamStartIntent');
 
   const allowed = ['pending', 'connecting'] as const;
-  const locked = classifyLocked(await lockSessionForStart(sessionId), allowed);
+  const locked = classifyLocked(await lockSessionForStart(input.sessionId), allowed);
   if (!locked.ok) return locked;
 
   const [updated] = await db
     .update(remoteSessions)
     .set({
-      status: 'active',
-      startedAt: new Date(),
+      // No SDP on this transport; clear any left by an abandoned WebRTC
+      // attempt so nothing can mistake it for this start's.
+      webrtcOffer: null,
+      webrtcAnswer: null,
+      iceCandidates: [],
+      desktopStartCommandId: input.startCommandId,
+      desktopPromptMode: input.promptMode,
+      desktopConsentUnavailableBehavior: input.consentUnavailableBehavior,
       desktopStartGeneration: sql`${remoteSessions.desktopStartGeneration} + 1`,
+      status: 'connecting',
+      // The stale-session cutoff runs from this attempt, so a start waiting on
+      // its consent prompt is not expired because of an earlier one (#11149).
+      lastStartAttemptAt: new Date(),
+      // The lease hard deadline is measured from the first start, as it was
+      // when this path activated the row at commit time. A row that already has
+      // a start keeps it: a WebRTC re-offer leaves a live session `connecting`,
+      // and this path must not restart its max duration (#11113).
+      startedAt: originalRemoteSessionStart(),
     })
     .where(and(
-      eq(remoteSessions.id, sessionId),
+      eq(remoteSessions.id, input.sessionId),
       eq(remoteSessions.terminationPhase, 'none'),
       inArray(remoteSessions.status, [...allowed]),
     ))

@@ -3,15 +3,18 @@
  *
  * One (monitor, device) pair has exactly one `monitor_device_state` row and at
  * most one OPEN `monitor_episodes` row. `recordMonitorEvaluation` is the single
- * writer of that pair's operational state and is called from the alert sweep
- * BEFORE the alert is created, so cooldown and flapping suppression can gate
- * the alert but never the episode — "noise controls cannot hide a loop".
+ * writer of that pair's operational state.
  *
- * Idempotency has two layers: the whole state machine runs inside one
- * transaction that takes `SELECT … FOR UPDATE` on the state row, and the
- * partial unique index `monitor_episodes_open_uidx` is the backstop for a
- * concurrent sweep that races past the lock (a caught 23505 re-reads the open
- * episode instead of throwing — an uncaught one surfaces as a 500).
+ * Legacy monitors record their observation before alert creation. Hardware
+ * subjects allocate only after an alert passes noise admission and wins its
+ * insert; allocation writes no observation. The sweep records one final
+ * observation from admitted open alerts, then activates recurrence and pause.
+ *
+ * State changes serialize under a row lock on monitor_device_state: an atomic
+ * conditional UPDATE for an existing healthy pair, otherwise SELECT FOR UPDATE.
+ * Episode insertion uses ON CONFLICT DO NOTHING against the one-open-episode
+ * index; an existing allocation is read back without aborting the transaction.
+ * Only the final breach observation activates an allocated subject episode.
  *
  * `org_id` is ALWAYS the device's org, never the monitor definition's: a
  * partner-wide monitor produces org-scoped episodes.
@@ -19,7 +22,7 @@
 
 import { and, eq, gte, isNull, sql } from 'drizzle-orm';
 import { db } from '../../db';
-import { monitorDeviceState, monitorEpisodes } from '../../db/schema';
+import { monitorDefinitions, monitorDeviceState, monitorEpisodes } from '../../db/schema';
 import type { MonitorDefinitionRow } from '../../db/schema';
 import type { MonitorResponseOutcome } from '../../db/schema/monitorEpisodes';
 
@@ -62,18 +65,85 @@ export interface RecordEvaluationResult {
   responsesPaused: boolean;
 }
 
-/** Postgres unique_violation. */
-const UNIQUE_VIOLATION = '23505';
+type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
 
-function isUniqueViolation(err: unknown): boolean {
-  return (
-    typeof err === 'object' &&
-    err !== null &&
-    (err as { code?: string }).code === UNIQUE_VIOLATION
-  );
+/**
+ * W03 — allocate (or adopt) a subject's episode WITHOUT recording an
+ * observation. Called only after a subject alert passes noise admission and
+ * wins its insert (Task 8's `createAlert`, under the outer transaction Task
+ * 10 opens), never speculatively — a rollback of that outer transaction
+ * removes both the new alert row and this allocation together.
+ *
+ * Uses the SAME state lock and open-episode index as `recordMonitorEvaluation`
+ * but changes neither `lastState`, the recurrence window counter, nor the
+ * pause latch: only the sweep's FINAL admitted breach observation (via
+ * `recordMonitorEvaluation`) adopts an allocated episode and runs that
+ * calculation, exactly once per sweep.
+ */
+export async function allocateSubjectEpisode(
+  input: Pick<RecordEvaluationInput, 'monitor' | 'deviceId' | 'orgId' | 'now'>,
+): Promise<string> {
+  return db.transaction(async (tx) => {
+    await tx
+      .insert(monitorDeviceState)
+      .values({
+        monitorId: input.monitor.id,
+        deviceId: input.deviceId,
+        orgId: input.orgId,
+      })
+      .onConflictDoNothing({
+        target: [monitorDeviceState.monitorId, monitorDeviceState.deviceId],
+      });
+
+    await tx
+      .select()
+      .from(monitorDeviceState)
+      .where(
+        and(
+          eq(monitorDeviceState.monitorId, input.monitor.id),
+          eq(monitorDeviceState.deviceId, input.deviceId),
+        ),
+      )
+      .for('update');
+
+    const [created] = await tx
+      .insert(monitorEpisodes)
+      .values({
+        monitorId: input.monitor.id,
+        deviceId: input.deviceId,
+        orgId: input.orgId,
+        startedAt: input.now ?? new Date(),
+      })
+      .onConflictDoNothing()
+      .returning({ id: monitorEpisodes.id });
+    if (created) return created.id;
+
+    const [open] = await tx
+      .select({ id: monitorEpisodes.id })
+      .from(monitorEpisodes)
+      .where(
+        and(
+          eq(monitorEpisodes.monitorId, input.monitor.id),
+          eq(monitorEpisodes.deviceId, input.deviceId),
+          isNull(monitorEpisodes.endedAt),
+        ),
+      )
+      .limit(1);
+    if (!open) throw new Error('Subject episode allocation lost its open episode');
+    return open.id;
+  });
 }
 
-type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
+export async function recordRecoveryObservation(
+  monitorId: string,
+  deviceId: string,
+  orgId: string,
+): Promise<void> {
+  const [monitor] = await db.select().from(monitorDefinitions)
+    .where(eq(monitorDefinitions.id, monitorId)).limit(1);
+  if (!monitor) return;
+  await recordMonitorEvaluation({ monitor, deviceId, orgId, observation: 'ok' });
+}
 
 export async function recordMonitorEvaluation(
   input: RecordEvaluationInput,
@@ -81,6 +151,39 @@ export async function recordMonitorEvaluation(
   const now = input.now ?? new Date();
 
   return db.transaction(async (tx) => {
+    if (input.observation === 'ok') {
+      // Most observations are an already-healthy pair. A conditional UPDATE
+      // takes the same row lock as SELECT FOR UPDATE and PostgreSQL rechecks
+      // currentEpisodeId after waiting for a concurrent breach/reset. If a
+      // breach opened an episode, fall through to the locked recovery path.
+      // Keep this inside the savepoint: callers catch bookkeeping failures,
+      // which must not poison their outer alert-evaluation transaction.
+      const [healthy] = await tx
+        .update(monitorDeviceState)
+        .set({ lastEvaluatedAt: now, lastState: 'ok', updatedAt: now })
+        .where(and(
+          eq(monitorDeviceState.monitorId, input.monitor.id),
+          eq(monitorDeviceState.deviceId, input.deviceId),
+          eq(monitorDeviceState.orgId, input.orgId),
+          isNull(monitorDeviceState.currentEpisodeId),
+        ))
+        .returning({
+          episodesInWindow: monitorDeviceState.episodesInWindow,
+          responsesPaused: monitorDeviceState.responsesPaused,
+        });
+      if (healthy) {
+        return {
+          episodeId: null,
+          episodeOpened: false,
+          episodeClosed: false,
+          episodesInWindow: healthy.episodesInWindow ?? 0,
+          latched: false,
+          needsEscalationAlert: false,
+          responsesPaused: healthy.responsesPaused ?? false,
+        };
+      }
+    }
+
     // Upsert first so the lock below always has a row to take.
     await tx
       .insert(monitorDeviceState)
@@ -202,28 +305,21 @@ export async function recordMonitorEvaluation(
       };
     }
 
-    // ---- breach, no open episode: open one. ----
-    let episodeId: string | null = null;
-    let episodeOpened = false;
-    try {
-      const [inserted] = await tx
-        .insert(monitorEpisodes)
-        .values({
-          monitorId: input.monitor.id,
-          deviceId: input.deviceId,
-          orgId: input.orgId,
-          startedAt: now,
-        })
-        .returning({ id: monitorEpisodes.id });
-      episodeId = inserted?.id ?? null;
-      episodeOpened = Boolean(episodeId);
-    } catch (err) {
-      if (!isUniqueViolation(err)) throw err;
-      // A concurrent sweep raced past the lock: adopt its episode rather than
-      // surfacing a 500 out of the request transaction.
-      console.warn(
-        `[EpisodeService] Concurrent sweep already opened an episode for monitor=${input.monitor.id} device=${input.deviceId}; adopting it`,
-      );
+    // ---- breach, no open episode: open one (or adopt an allocation, or a
+    // concurrent sweep's episode — all via ON CONFLICT DO NOTHING against the
+    // one-open-episode index, never a caught 23505). ----
+    const [inserted] = await tx
+      .insert(monitorEpisodes)
+      .values({
+        monitorId: input.monitor.id,
+        deviceId: input.deviceId,
+        orgId: input.orgId,
+        startedAt: now,
+      })
+      .onConflictDoNothing()
+      .returning({ id: monitorEpisodes.id });
+    let episodeId: string | null = inserted?.id ?? null;
+    if (!episodeId) {
       const [existing] = await tx
         .select({ id: monitorEpisodes.id })
         .from(monitorEpisodes)
@@ -236,16 +332,9 @@ export async function recordMonitorEvaluation(
         )
         .limit(1);
       episodeId = existing?.id ?? null;
-      episodeOpened = false;
-      if (!episodeId) {
-        // The racing sweep's episode closed between its insert and this read.
-        // Callers all guard for a null episodeId, so this is not fatal — but a
-        // RUN of these means something other than the intended benign race.
-        console.warn(
-          `[EpisodeService] 23505 on the open-episode index but no open episode found for monitor=${input.monitor.id} device=${input.deviceId}`,
-        );
-      }
     }
+    if (!episodeId) throw new Error('Admitted breach has no open episode');
+    const episodeOpened = Boolean(inserted);
 
     const threshold = input.monitor.recurrenceThreshold;
     const windowHours = input.monitor.recurrenceWindowHours;
@@ -363,12 +452,20 @@ export async function detachMonitorFromDevice(
   });
 }
 
-/** Stamp the alert that represents this breach onto its episode. */
-export async function linkEpisodeAlert(episodeId: string, alertId: string): Promise<void> {
-  await db
+/**
+ * Stamp the alert that represents this breach onto its episode, atomically.
+ * The `alertId is null` guard makes this claim a compare-and-swap: only the
+ * first caller to reach an episode still carrying no alert wins ownership of
+ * the episode's automation responses (W03 — two subjects racing to open the
+ * same episode must produce exactly one response run).
+ */
+export async function linkEpisodeAlert(episodeId: string, alertId: string): Promise<{ owner: boolean }> {
+  const claimed = await db
     .update(monitorEpisodes)
     .set({ alertId, updatedAt: new Date() })
-    .where(eq(monitorEpisodes.id, episodeId));
+    .where(and(eq(monitorEpisodes.id, episodeId), isNull(monitorEpisodes.alertId)))
+    .returning({ id: monitorEpisodes.id });
+  return { owner: claimed.length === 1 };
 }
 
 export interface RecordEpisodeResponseInput {

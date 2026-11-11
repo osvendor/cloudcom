@@ -23,6 +23,30 @@ import { deviceScopeCondition, resolveSiteAllowedDeviceIds, SITE_SCOPE_EMPTY_NOT
 import { getToolTimeout } from './toolTimeouts';
 import { createRemoteSession, RemoteSessionDeniedError } from './remoteSessionCreate';
 import { aiExecuteCommand } from './aiDispatch';
+import type { ToolExecutionContext } from './toolExecutionContext';
+import { checkScreenAccessConsentGate, type ScreenAccessSurface } from '../routes/remote/screenAccessConsentGate';
+import {
+  checkSessionRateLimit,
+  checkUserSessionRateLimit,
+  logSessionAudit,
+  MAX_ACTIVE_REMOTE_SESSIONS_PER_ORG,
+  MAX_ACTIVE_REMOTE_SESSIONS_PER_USER,
+} from '../routes/remote/helpers';
+import { checkRemoteAccess } from './remoteAccessPolicy';
+import { notParkedDeviceCondition } from './unassignedPool/selectorPredicate';
+import { inToolDbPhase } from './aiToolDbContext';
+
+/**
+ * #6911: `create_remote_session` is user-owned on release
+ * (`USER_OWNED_RELEASE_ACTIONS` in `jobs/intentReleaseWorker.ts`) — it writes
+ * `auth.user.id` into `remote_sessions.user_id`, a `users` FK. Under the
+ * rebuilt agent auth that id is an `aiAgents.id`, so refuse rather than write
+ * a row whose owner the worker and this handler's auth disagree about.
+ * Mirrors `aiToolsFleet.ts`'s `approverReleaseMismatch`.
+ */
+function approverReleaseMismatch(auth: AuthContext, context: ToolExecutionContext | undefined): boolean {
+  return !!context?.approverRelease && context.approverRelease.approverUserId !== auth.user.id;
+}
 
 type AiToolTier = 1 | 2 | 3 | 4;
 
@@ -34,7 +58,7 @@ async function verifyDeviceAccess(
   if (auth.allowedDeviceIds && !auth.allowedDeviceIds.includes(deviceId)) {
     return { error: 'Device not found or access denied' };
   }
-  const conditions: SQL[] = [eq(devices.id, deviceId)];
+  const conditions: SQL[] = [eq(devices.id, deviceId), notParkedDeviceCondition()];
   const orgCond = auth.orgCondition(devices.orgId);
   if (orgCond) conditions.push(orgCond);
   const [device] = await db.select().from(devices).where(and(...conditions)).limit(1);
@@ -48,6 +72,48 @@ async function verifyDeviceAccess(
       error: `Device ${device.hostname} is not online (status: ${device.status}). This tool needs a live connection; to run when the device reconnects use the Run Script / deployment tools instead.`,
     };
   return { device };
+}
+
+/**
+ * Screen capture and input control honour the device's remote access consent
+ * policy (see `checkScreenAccessConsentGate`). Returns the tool result to hand
+ * the model — `{ error, code }` — when the call must not dispatch, else null.
+ */
+async function screenAccessRefusal(
+  surface: ScreenAccessSurface,
+  device: typeof devices.$inferSelect,
+  auth: AuthContext,
+): Promise<string | null> {
+  const gate = await checkScreenAccessConsentGate({
+    deviceId: device.id,
+    orgId: device.orgId,
+    hostname: device.hostname,
+    surface,
+    actor: auth,
+    isEphemeral: device.isEphemeral === true,
+  });
+  return gate.ok ? null : JSON.stringify(gate.body);
+}
+
+/**
+ * The screen tools' checks before they dispatch: device access (online) and
+ * the consent gate, in ONE short caller-scoped context that has committed
+ * before the capture is awaited (#7918). The three screen tools are
+ * self-managed — the capture waits up to `getToolTimeout(<tool>)` (120 s),
+ * which under a per-call transaction outlived the production idle-in-
+ * transaction timeout.
+ */
+function screenToolPrecheck(
+  surface: ScreenAccessSurface,
+  deviceId: string,
+  auth: AuthContext,
+): Promise<{ refusal: string } | { device: typeof devices.$inferSelect }> {
+  return inToolDbPhase(auth, async () => {
+    const access = await verifyDeviceAccess(deviceId, auth, true);
+    if ('error' in access) return { refusal: JSON.stringify({ error: access.error }) };
+    const refusal = await screenAccessRefusal(surface, access.device, auth);
+    return refusal ? { refusal } : { device: access.device };
+  });
 }
 
 export function registerRemoteTools(aiTools: Map<string, AiTool>): void {
@@ -64,9 +130,11 @@ export function registerRemoteTools(aiTools: Map<string, AiTool>): void {
     domain: 'devices',
     searchHint: 'device screen capture, screenshot of the current display',
     deviceArgs: ['deviceId'],
+    // The capture waits up to 120 s; see `screenToolPrecheck` (#7918).
+    selfManagedDbContext: true,
     definition: {
       name: 'take_screenshot',
-      description: 'Capture a screenshot of the device screen. Returns the image for visual analysis. Use this when you need to see what is displayed on the device screen.',
+      description: 'Capture a screenshot of the device screen. Returns the image for visual analysis. Use this when you need to see what is displayed on the device screen. Refused on devices whose remote access policy requires user consent.',
       input_schema: {
         type: 'object' as const,
         properties: {
@@ -79,8 +147,8 @@ export function registerRemoteTools(aiTools: Map<string, AiTool>): void {
     handler: async (input, auth) => {
       const deviceId = input.deviceId as string;
 
-      const access = await verifyDeviceAccess(deviceId, auth, true);
-      if ('error' in access) return JSON.stringify({ error: access.error });
+      const access = await screenToolPrecheck('take_screenshot', deviceId, auth);
+      if ('refusal' in access) return access.refusal;
 
       const result = await aiExecuteCommand(auth, 'take_screenshot', deviceId, 'take_screenshot', {
         monitor: input.monitor ?? 0
@@ -122,9 +190,11 @@ export function registerRemoteTools(aiTools: Map<string, AiTool>): void {
     domain: 'devices',
     searchHint: 'device screen analysis, visual troubleshooting of what the user sees',
     deviceArgs: ['deviceId'],
+    // The capture waits up to 120 s; see `screenToolPrecheck` (#7918).
+    selfManagedDbContext: true,
     definition: {
       name: 'analyze_screen',
-      description: 'Take a screenshot and analyze what is visible on the device screen. Combines screenshot capture with device context for AI visual analysis. Use this for troubleshooting what the user sees.',
+      description: 'Take a screenshot and analyze what is visible on the device screen. Combines screenshot capture with device context for AI visual analysis. Use this for troubleshooting what the user sees. Refused on devices whose remote access policy requires user consent.',
       input_schema: {
         type: 'object' as const,
         properties: {
@@ -138,8 +208,8 @@ export function registerRemoteTools(aiTools: Map<string, AiTool>): void {
     handler: async (input, auth) => {
       const deviceId = input.deviceId as string;
 
-      const access = await verifyDeviceAccess(deviceId, auth, true);
-      if ('error' in access) return JSON.stringify({ error: access.error });
+      const access = await screenToolPrecheck('analyze_screen', deviceId, auth);
+      if ('refusal' in access) return access.refusal;
 
       const result = await aiExecuteCommand(auth, 'analyze_screen', deviceId, 'take_screenshot', {
         monitor: input.monitor ?? 0
@@ -188,9 +258,11 @@ export function registerRemoteTools(aiTools: Map<string, AiTool>): void {
     domain: 'devices',
     searchHint: 'mouse and keyboard: screenshot, click, double-click, move, scroll, press key, type',
     deviceArgs: ['deviceId'],
+    // The capture waits up to 120 s; see `screenToolPrecheck` (#7918).
+    selfManagedDbContext: true,
     definition: {
       name: 'computer_control',
-      description: 'Control a device by sending mouse/keyboard input and capturing screenshots. Returns a screenshot after each action by default (configurable via captureAfter). Actions: screenshot, left_click, right_click, middle_click, double_click, mouse_move, scroll, key, type.',
+      description: 'Control a device with mouse/keyboard input. Returns a screenshot after each action unless captureAfter is false. Actions: screenshot, left_click, right_click, middle_click, double_click, mouse_move, scroll, key, type. Refused on devices whose remote access policy requires user consent.',
       input_schema: {
         type: 'object' as const,
         properties: {
@@ -216,8 +288,8 @@ export function registerRemoteTools(aiTools: Map<string, AiTool>): void {
     handler: async (input, auth) => {
       const deviceId = input.deviceId as string;
 
-      const access = await verifyDeviceAccess(deviceId, auth, true);
-      if ('error' in access) return JSON.stringify({ error: access.error });
+      const access = await screenToolPrecheck('computer_control', deviceId, auth);
+      if ('refusal' in access) return access.refusal;
 
       const result = await aiExecuteCommand(auth, 'computer_control', deviceId, 'computer_action', {
         action: input.action,
@@ -388,13 +460,51 @@ export function registerRemoteTools(aiTools: Map<string, AiTool>): void {
         required: ['deviceId', 'type'],
       },
     },
-    handler: async (input, auth) => {
+    handler: async (input, auth, context) => {
+      // #6911: user-owned on release — see approverReleaseMismatch.
+      if (approverReleaseMismatch(auth, context)) {
+        return JSON.stringify({ error: 'approver_auth_mismatch' });
+      }
       const deviceId = input.deviceId as string;
       const sessionType = input.type as string;
 
       // Verify device access and require online status
       const access = await verifyDeviceAccess(deviceId, auth, true);
       if ('error' in access) return JSON.stringify({ error: access.error });
+
+      // W04-D11 (#6758): the same gates POST /remote/sessions applies
+      // (routes/remote/sessions.ts), in the same order — the tenant's remote
+      // access policy (terminal and file transfer are both `remoteTools`),
+      // then the org and per-user concurrent-session caps. The route's
+      // same-user stale-session teardown is a browser-reconnect convenience,
+      // not a gate, and is not mirrored.
+      const policyCheck = await checkRemoteAccess(deviceId, 'remoteTools');
+      if (!policyCheck.allowed) {
+        return JSON.stringify({
+          error: policyCheck.reason,
+          code: policyCheck.code ?? 'REMOTE_ACCESS_POLICY_DENIED',
+          capability: 'remoteTools',
+          policyName: policyCheck.policyName,
+        });
+      }
+      const orgLimit = await checkSessionRateLimit(access.device.orgId);
+      if (!orgLimit.allowed) {
+        return JSON.stringify({
+          error: 'Maximum concurrent sessions reached for this organization',
+          currentCount: orgLimit.currentCount,
+          maxAllowed: MAX_ACTIVE_REMOTE_SESSIONS_PER_ORG,
+        });
+      }
+      if (auth.scope !== 'system') {
+        const userLimit = await checkUserSessionRateLimit(auth.user.id);
+        if (!userLimit.allowed) {
+          return JSON.stringify({
+            error: 'Maximum concurrent sessions reached for this user',
+            currentCount: userLimit.currentCount,
+            maxAllowed: MAX_ACTIVE_REMOTE_SESSIONS_PER_USER,
+          });
+        }
+      }
 
       // Insert new remote session
       let session: { id: string; status: string };
@@ -414,6 +524,15 @@ export function registerRemoteTools(aiTools: Map<string, AiTool>): void {
         }
         throw e;
       }
+
+      // Same audit row as the route (it writes on its own connection and
+      // swallows its own failure, so it cannot undo the session).
+      await logSessionAudit('session_initiated', auth.user.id, access.device.orgId, {
+        sessionId: session.id,
+        deviceId,
+        deviceHostname: access.device.hostname,
+        type: sessionType,
+      });
 
       return JSON.stringify({
         id: session.id,

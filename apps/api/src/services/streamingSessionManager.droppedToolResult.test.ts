@@ -20,6 +20,14 @@ const { queryMock, insertedRows, updateCalls } = vi.hoisted(() => ({
 
 vi.mock('@anthropic-ai/claude-agent-sdk', () => ({ query: queryMock }));
 
+// Wisp W04 Task 4: getOrCreate resolves the session's delegation grant itself
+// (lookupWispGrant); every session in this suite is an ordinary one.
+vi.mock('./wisp/chatCeiling', () => ({
+  lookupWispGrant: vi.fn(async () => null),
+  unreachableWispAuth: (auth: unknown) => auth,
+  WispSessionUnavailableError: class WispSessionUnavailableError extends Error {},
+}));
+
 vi.mock('../db', () => ({
   db: {
     select: vi.fn(() => ({
@@ -47,10 +55,21 @@ vi.mock('../db', () => ({
 }));
 
 vi.mock('./aiCostTracker', () => ({
-  recordUsageFromSdkResult: vi.fn(() => Promise.resolve()),
   // Also consumed on the result/done path — see the note in clientLoop.test.ts.
   sumInputTokens: (u: Record<string, number | null | undefined> | null | undefined) =>
     (u?.input_tokens ?? 0) + (u?.cache_read_input_tokens ?? 0) + (u?.cache_creation_input_tokens ?? 0),
+}));
+vi.mock('./aiBudgetReservations', () => ({
+  markAiBudgetReservationIndeterminate: vi.fn(async () => ({ kind: 'indeterminate' })),
+  readSdkUsageSnapshot: vi.fn(async () => null),
+}));
+vi.mock('./aiModels/platformModels', async (orig) => ({
+  ...(await orig<typeof import('./aiModels/platformModels')>()),
+  getPlatformModelByModelId: vi.fn(async () => null),
+}));
+vi.mock('./aiModels/settleInvocation', async (orig) => ({
+  ...(await orig<typeof import('./aiModels/settleInvocation')>()),
+  settleInvocation: vi.fn(async () => ({ costCents: 0, invocationIds: [], deferred: false })),
 }));
 vi.mock('./aiAgent', () => ({ sanitizeErrorForClient: (e: unknown) => String(e) }));
 vi.mock('./sentry', () => ({ captureException: vi.fn() }));
@@ -67,8 +86,18 @@ vi.mock('./aiToolOutput', () => ({
   redactSensitiveToolInput: (input: Record<string, unknown>) => input,
 }));
 vi.mock('./clientIp', () => ({ getTrustedClientIpOrUndefined: () => undefined }));
+// A registered tool the CLI still calls unknown (e.g. removed from this
+// session by a grant ceiling) is a real gap, so it must stay a red failure.
+vi.mock('./aiToolNames', async (orig) => ({
+  ...(await orig<typeof import('./aiToolNames')>()),
+  hasCoreAiToolName: (name: string) => name === 'list_services',
+}));
+
+// Keeps the lazy real ./flows/flowTools graph (~5 s cold) out of whichever test reaches it first (#11011).
+vi.mock('./flows/flowTools', () => ({ resolveFlowTools: async () => [] }));
 
 import { StreamingSessionManager } from './streamingSessionManager';
+import { makeResolvedModel } from './aiModels/__fixtures__/resolvedModel';
 import type { AuthContext } from '../middleware/auth';
 
 const ORG = '0c0c0c0c-1111-4222-8333-444455556666';
@@ -76,17 +105,12 @@ const ORG = '0c0c0c0c-1111-4222-8333-444455556666';
 const DB_SESSION = {
   orgId: ORG,
   sdkSessionId: null,
-  model: 'claude-sonnet-4-5-20250929',
   maxTurns: 50,
   turnCount: 0,
   systemPrompt: null,
 };
 
-const PLATFORM_CONFIG = {
-  source: 'platform' as const,
-  apiKey: 'platform-key',
-  model: 'claude-sonnet-4-6',
-};
+const PLATFORM_CONFIG = makeResolvedModel('platform');
 
 const AUTH = {
   orgId: ORG,
@@ -220,6 +244,72 @@ describe('dropped tool_result fallback (#3094)', () => {
     const flagUpdates = updateCalls.filter((u) => typeof u.flagReason === 'string');
     expect(flagUpdates).toHaveLength(1);
     expect(flagUpdates[0]!.flagReason).toContain('set_device_context');
+  });
+
+  // #9855: the model called a tool that does not exist. The CLI answers with
+  // its own "No such tool available" error and the model retries; the result
+  // is marked unknownTool so the sidebar renders a neutral note, not a red
+  // Failed card.
+  it('marks a call to a nonexistent tool as unknownTool', async () => {
+    const id = 'toolu_unknown_01';
+    const name = 'mcp__breeze__list_processes_placeholder';
+    mockSdkQuery([
+      toolUseStreamEvent(id, name),
+      assistantToolUseMessage(id, name, {}),
+      userToolResultMessage(id, `<tool_use_error>Error: No such tool available: ${name}</tool_use_error>`),
+      RESULT_MSG,
+    ]);
+
+    const session = await manager.getOrCreate(
+      'sess-unknown', DB_SESSION, AUTH, undefined, 'PROMPT', undefined, PLATFORM_CONFIG,
+    );
+    await session.processorPromise;
+
+    const resultRows = insertedRows.filter((r) => r.role === 'tool_result');
+    expect(resultRows).toHaveLength(1);
+    expect(resultRows[0]).toMatchObject({ toolName: 'list_processes_placeholder', toolUseId: id });
+    expect(resultRows[0]!.toolOutput).toMatchObject({ droppedBeforeExecution: true, unknownTool: true });
+    const event = session.eventBus.getReplayEvents().find((e) => e.type === 'tool_result');
+    expect(event).toMatchObject({ toolUseId: id, isError: true, output: { unknownTool: true } });
+    // Still flagged: an invented tool name is a model-quality signal for review.
+    expect(updateCalls.filter((u) => typeof u.flagReason === 'string')).toHaveLength(1);
+  });
+
+  it('does not mark a registered tool the session lacks as unknownTool', async () => {
+    const id = 'toolu_unavailable_01';
+    const name = 'mcp__breeze__list_services';
+    mockSdkQuery([
+      toolUseStreamEvent(id, name),
+      assistantToolUseMessage(id, name, {}),
+      userToolResultMessage(id, `<tool_use_error>Error: No such tool available: ${name}</tool_use_error>`),
+      RESULT_MSG,
+    ]);
+
+    const session = await manager.getOrCreate(
+      'sess-unavailable', DB_SESSION, AUTH, undefined, 'PROMPT', undefined, PLATFORM_CONFIG,
+    );
+    await session.processorPromise;
+
+    const output = insertedRows.find((r) => r.role === 'tool_result')!.toolOutput as Record<string, unknown>;
+    expect(output).toMatchObject({ droppedBeforeExecution: true });
+    expect(output).not.toHaveProperty('unknownTool');
+  });
+
+  it('does not mark an input-validation drop as unknownTool', async () => {
+    mockSdkQuery([
+      toolUseStreamEvent(TOOL_USE_ID, 'mcp__breeze__set_device_context'),
+      assistantToolUseMessage(TOOL_USE_ID, 'mcp__breeze__set_device_context', PAREN_INPUT),
+      userToolResultMessage(TOOL_USE_ID, VALIDATION_ERROR_TEXT),
+      RESULT_MSG,
+    ]);
+
+    const session = await manager.getOrCreate(
+      'sess-validation', DB_SESSION, AUTH, undefined, 'PROMPT', undefined, PLATFORM_CONFIG,
+    );
+    await session.processorPromise;
+
+    const output = insertedRows.find((r) => r.role === 'tool_result')!.toolOutput as Record<string, unknown>;
+    expect(output).not.toHaveProperty('unknownTool');
   });
 
   it('does not double-record a tool_result already handled by postToolUse (id no longer queued)', async () => {

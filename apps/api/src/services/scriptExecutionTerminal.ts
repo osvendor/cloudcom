@@ -1,6 +1,8 @@
 import { and, eq, inArray, sql } from 'drizzle-orm';
 import { db } from '../db';
 import { scriptExecutions, scriptExecutionBatches } from '../db/schema';
+import { advanceOutcomesForTerminalExecution } from './fixMemory/scriptTerminalHook';
+import { emitScriptTerminalEvent } from './scriptTerminalEvents';
 
 /**
  * The ONE place a `script_executions` row is driven terminal by the server, and
@@ -28,7 +30,7 @@ import { scriptExecutions, scriptExecutionBatches } from '../db/schema';
  * transaction handle (the cancel-on-event sweeps and the heartbeat claim both
  * need the bookkeeping inside their own transaction).
  */
-type ScriptTerminalExecutor = Pick<typeof db, 'update' | 'select'>;
+type ScriptTerminalExecutor = Pick<typeof db, 'update' | 'select' | 'transaction'>;
 
 /**
  * Terminal states an execution can be driven to from the server side.
@@ -46,6 +48,12 @@ export async function finalizeScriptExecutionTerminal(params: {
   errorMessage: string | null;
   completedAt: Date;
   executor?: ScriptTerminalExecutor;
+  /**
+   * The caller knows the command never reached the device (the reaper's
+   * delivery clock, `kind: 'expired'`). Only the fix-outcome hook reads it: an
+   * undelivered fix attempt is inconclusive, not a failed attempt.
+   */
+  neverDelivered?: boolean;
 }): Promise<{ terminalised: boolean }> {
   const { executionId, outcome, errorMessage, completedAt } = params;
   const executor: ScriptTerminalExecutor = params.executor ?? db;
@@ -62,7 +70,15 @@ export async function finalizeScriptExecutionTerminal(params: {
         inArray(scriptExecutions.status, ['pending', 'queued', 'running']),
       ),
     )
-    .returning({ id: scriptExecutions.id });
+    .returning({
+      id: scriptExecutions.id,
+      orgId: scriptExecutions.orgId,
+      deviceId: scriptExecutions.deviceId,
+      scriptId: scriptExecutions.scriptId,
+      triggerType: scriptExecutions.triggerType,
+      automationRunId: scriptExecutions.automationRunId,
+      exitCode: scriptExecutions.exitCode,
+    });
 
   if (updated.length === 0) return { terminalised: false };
 
@@ -70,6 +86,33 @@ export async function finalizeScriptExecutionTerminal(params: {
   if (batchId) {
     await applyBatchCounter(executor, batchId, outcome);
   }
+
+  // AI Suggested Fixes W1 (D-a): only the CAS winner advances the attempt, on
+  // the caller's own executor when it passes one (cancel propagation, incl. the
+  // heartbeat claim), so that transaction stays one transaction. The reaper
+  // passes none.
+  // The hook opens a SAVEPOINT on that executor and swallows its own failure, so
+  // a fix-outcome error can never abort the cancel / reap it rides on.
+  await advanceOutcomesForTerminalExecution(
+    { executionId, status: outcome, neverDelivered: params.neverDelivered === true, completedAt },
+    params.executor,
+  );
+
+  // #7277 — public script.completed / script.failed, only from the CAS winner
+  // and only after the surrounding transaction commits (cancelled emits none).
+  // Last on purpose: a caller that swallows a later throw inside its own
+  // savepoint must not have announced a state it rolled back.
+  const won = updated[0]!;
+  emitScriptTerminalEvent({
+    executionId,
+    orgId: won.orgId,
+    deviceId: won.deviceId,
+    scriptId: won.scriptId ?? null,
+    triggerType: won.triggerType,
+    automationRunId: won.automationRunId ?? null,
+    exitCode: won.exitCode ?? null,
+    status: outcome,
+  });
 
   return { terminalised: true };
 }

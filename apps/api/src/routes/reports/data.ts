@@ -19,7 +19,9 @@ import {
 } from '../../services/siteScope';
 import { ensureOrgAccess, getOrgIdsForAuth } from './helpers';
 import { dataQuerySchema } from './schemas';
+import { alertOwningSiteIdSql } from '../alerts/helpers';
 
+import { notParkedDeviceCondition } from '../../services/unassignedPool/selectorPredicate';
 export const dataRoutes = new Hono();
 
 dataRoutes.use('*', authMiddleware);
@@ -37,17 +39,19 @@ function normalizeSiteIdList(siteIds: readonly string[]): string[] {
 }
 
 /**
- * Device-level site condition for one exact-organization live scope.
- * `unrestricted` adds no predicate; `restricted` binds its normalized UUIDs.
+ * Alert site condition for one exact-organization live scope, on the alert's
+ * OWNING site (a topology policy alert's topology site, M3-D6, else its
+ * device's current site). `unrestricted` adds no predicate; `restricted`
+ * binds its normalized UUIDs. Queries left-join devices.
  */
 function alertsDeviceSiteCondition(scope: OrgAxisLiveSiteScopeV1): SQL | undefined {
   return scope.kind === 'restricted'
-    ? inArray(devices.siteId, normalizeSiteIdList(scope.siteIds))
+    ? inArray(alertOwningSiteIdSql(), normalizeSiteIdList(scope.siteIds))
     : undefined;
 }
 
 /**
- * One parameterized device predicate of `(devices.org_id = orgX AND
+ * One parameterized predicate of `(alerts.org_id = orgX AND
  * siteCondition(scopeX))` branches for a partner multi-organization request.
  * Denied and restricted-empty organizations get no branch at all, so an empty
  * scope list returns `null` and the caller must answer zero-safe without
@@ -65,7 +69,9 @@ function alertsMultiOrgDeviceCondition(
   const branches = [...scopesByOrgId.values()]
     .sort((left, right) => left.orgId.localeCompare(right.orgId))
     .map((scope) => {
-      const orgCondition = eq(devices.orgId, scope.orgId);
+      // The ALERT's org: a site-owned topology alert stays in its site's org
+      // even after its origin device moved org.
+      const orgCondition = eq(alerts.orgId, scope.orgId);
       const siteCondition = alertsDeviceSiteCondition(scope);
       return siteCondition ? and(orgCondition, siteCondition)! : orgCondition;
     });
@@ -109,7 +115,7 @@ dataRoutes.get(
     // 'quick_support' org, which deliberately stays inside accessibleOrgIds so
     // RLS lets a tech reach their own session — every report enumeration in
     // this file has to exclude them explicitly.
-    const conditions: SQL[] = [eq(devices.isEphemeral, false)];
+    const conditions: SQL[] = [eq(devices.isEphemeral, false), notParkedDeviceCondition()];
 
     if (query.orgId) {
       const hasAccess = await ensureOrgAccess(query.orgId, auth);
@@ -159,7 +165,8 @@ dataRoutes.get(
         diskTotalGb: deviceHardware.diskTotalGb,
         manufacturer: deviceHardware.manufacturer,
         model: deviceHardware.model,
-        serialNumber: deviceHardware.serialNumber
+        serialNumber: deviceHardware.serialNumber,
+        productSku: deviceHardware.productSku
       })
       .from(devices)
       .leftJoin(deviceHardware, eq(devices.id, deviceHardware.deviceId))
@@ -198,7 +205,7 @@ dataRoutes.get(
     }
 
     // Build conditions
-    const conditions: SQL[] = [eq(devices.isEphemeral, false)];
+    const conditions: SQL[] = [eq(devices.isEphemeral, false), notParkedDeviceCondition()];
 
     if (query.orgId) {
       const hasAccess = await ensureOrgAccess(query.orgId, auth);
@@ -364,7 +371,7 @@ dataRoutes.get(
     }
 
     if (query.siteId) {
-      conditions.push(eq(devices.siteId, query.siteId));
+      conditions.push(eq(alertOwningSiteIdSql(), query.siteId));
     }
 
     if (query.startDate) {
@@ -384,7 +391,7 @@ dataRoutes.get(
         count: sql<number>`count(*)`
       })
       .from(alerts)
-      .innerJoin(devices, eq(alerts.deviceId, devices.id))
+      .leftJoin(devices, eq(alerts.deviceId, devices.id))
       .where(whereCondition)
       .groupBy(alerts.severity);
 
@@ -395,7 +402,7 @@ dataRoutes.get(
         count: sql<number>`count(*)`
       })
       .from(alerts)
-      .innerJoin(devices, eq(alerts.deviceId, devices.id))
+      .leftJoin(devices, eq(alerts.deviceId, devices.id))
       .where(whereCondition)
       .groupBy(alerts.status);
 
@@ -409,7 +416,7 @@ dataRoutes.get(
         count: sql<number>`count(*)`
       })
       .from(alerts)
-      .innerJoin(devices, eq(alerts.deviceId, devices.id))
+      .leftJoin(devices, eq(alerts.deviceId, devices.id))
       .where(and(...conditions, gte(alerts.triggeredAt, thirtyDaysAgo)))
       .groupBy(sql`date_trunc('day', ${alerts.triggeredAt})`)
       .orderBy(sql`date_trunc('day', ${alerts.triggeredAt})`);
@@ -423,7 +430,7 @@ dataRoutes.get(
       })
       .from(alerts)
       .innerJoin(alertRules, eq(alerts.ruleId, alertRules.id))
-      .innerJoin(devices, eq(alerts.deviceId, devices.id))
+      .leftJoin(devices, eq(alerts.deviceId, devices.id))
       .where(whereCondition)
       .groupBy(alerts.ruleId, alertRules.name)
       .orderBy(desc(sql`count(*)`))
@@ -433,7 +440,7 @@ dataRoutes.get(
     const countResult = await db
       .select({ count: sql<number>`count(*)` })
       .from(alerts)
-      .innerJoin(devices, eq(alerts.deviceId, devices.id))
+      .leftJoin(devices, eq(alerts.deviceId, devices.id))
       .where(whereCondition);
 
     return c.json({
@@ -465,7 +472,7 @@ dataRoutes.get(
     }
 
     // Build conditions
-    const conditions: ReturnType<typeof eq>[] = [eq(devices.isEphemeral, false)];
+    const conditions: ReturnType<typeof eq>[] = [eq(devices.isEphemeral, false), notParkedDeviceCondition()];
 
     if (query.orgId) {
       const hasAccess = await ensureOrgAccess(query.orgId, auth);
@@ -617,7 +624,7 @@ dataRoutes.get(
     }
 
     // Build conditions for devices
-    const deviceConditions: SQL[] = [eq(devices.isEphemeral, false)];
+    const deviceConditions: SQL[] = [eq(devices.isEphemeral, false), notParkedDeviceCondition()];
 
     if (query.orgId) {
       const hasAccess = await ensureOrgAccess(query.orgId, auth);

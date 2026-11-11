@@ -1,7 +1,15 @@
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+// #8928: a refused human approve tells the waiting end user "denied".
+const notifyMocks = vi.hoisted(() => ({ enqueuePamRequestNotify: vi.fn(async () => 'queued' as const) }));
+vi.mock('./pamRequestNotify', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./pamRequestNotify')>()),
+  enqueuePamRequestNotify: notifyMocks.enqueuePamRequestNotify,
+}));
 
 import {
   createPamDecisionIntent,
+  PAM_TARGET_HASH_UNVERIFIED_REASON,
   requestPamCleanup,
 } from './pamActuationLifecycle';
 
@@ -16,13 +24,58 @@ const request = {
 
 function txWithRows(rows: unknown[]) {
   return {
-    execute: vi.fn(async () => ({ rows: rows.shift() ?? [] })),
+    execute: vi.fn(async (_query: unknown) => ({ rows: rows.shift() ?? [] })),
   };
 }
 
+// The tx.execute calls are drizzle `sql` tagged-template objects, not plain
+// strings — pull the literal SQL text (with `?` placeholders) plus the raw
+// bound params out of queryChunks so a test can assert on statement shape.
+type SqlLike = { queryChunks: unknown[] };
+function sqlText(query: unknown): string {
+  const chunks = (query as SqlLike).queryChunks;
+  return chunks
+    .map((c) => (c && typeof c === 'object' && 'value' in (c as Record<string, unknown>)
+      ? (c as { value: string[] }).value.join('')
+      : '?'))
+    .join('');
+}
+function sqlParams(query: unknown): unknown[] {
+  const chunks = (query as SqlLike).queryChunks;
+  return chunks.filter((c) => !(c && typeof c === 'object' && 'value' in (c as Record<string, unknown>)));
+}
+
 describe('PAM actuation lifecycle', () => {
+  it('takes the device lock before any elevation_requests lock (spec §9, deadlock vs org move)', async () => {
+    const tx = txWithRows([
+      [{ ownership_epoch: 1 }],
+      [{ id: request.id, org_id: request.orgId, device_id: request.deviceId, revision: 7 }],
+      [{
+        id: '20000000-0000-4000-8000-000000000001',
+        elevation_request_id: request.id,
+        request_revision: 7,
+        generation: 1,
+        desired_state: 'active',
+      }],
+    ]);
+    await createPamDecisionIntent(tx as never, {
+      request,
+      requestRevision: 7,
+      decision: 'approved',
+      expiresAt: new Date(Date.now() + 60_000),
+    });
+    const texts = tx.execute.mock.calls.map((c) => sqlText(c[0]));
+    const deviceIdx = texts.findIndex((q) => /FROM devices[\s\S]*FOR SHARE/.test(q));
+    const requestIdx = texts.findIndex((q) => /FROM elevation_requests[\s\S]*FOR UPDATE/.test(q));
+    const actuationIdx = texts.findIndex((q) => /FROM pam_actuations[\s\S]*FOR UPDATE/.test(q));
+    expect(deviceIdx).toBe(0);
+    expect(requestIdx).toBeGreaterThan(deviceIdx);
+    expect(actuationIdx).toBeGreaterThan(requestIdx);
+  });
+
   it('creates exactly one generation-1 active actuation and outbox event', async () => {
     const tx = txWithRows([
+      [{ ownership_epoch: 1 }],
       [{ id: request.id, org_id: request.orgId, device_id: request.deviceId, revision: 7 }],
       [],
       [{
@@ -49,11 +102,12 @@ describe('PAM actuation lifecycle', () => {
       generation: 1,
       desiredState: 'active',
     });
-    expect(tx.execute).toHaveBeenCalledTimes(4);
+    expect(tx.execute).toHaveBeenCalledTimes(5);
   });
 
   it('creates denial as a generation-1 cleanup tombstone without requiring expiry', async () => {
     const tx = txWithRows([
+      [{ ownership_epoch: 1 }],
       [{ id: request.id, org_id: request.orgId, device_id: request.deviceId, revision: 8 }],
       [],
       [{
@@ -75,7 +129,7 @@ describe('PAM actuation lifecycle', () => {
 
     expect(result.desiredState).toBe('cleanup');
     expect(result.generation).toBe(1);
-    expect(tx.execute).toHaveBeenCalledTimes(4);
+    expect(tx.execute).toHaveBeenCalledTimes(5);
   });
 
   it('rejects an approved decision with a missing or elapsed expiry before writing', async () => {
@@ -87,6 +141,174 @@ describe('PAM actuation lifecycle', () => {
       expiresAt: null,
     })).rejects.toThrow('future expiry');
     expect(tx.execute).not.toHaveBeenCalled();
+  });
+
+  it('refuses to create an active actuation for a path-targeting decision with no target hash', async () => {
+    const tx = txWithRows([
+      [{ ownership_epoch: 1 }],
+      [{ id: request.id, org_id: request.orgId, device_id: request.deviceId, revision: 3 }],
+      [],
+      [], // UPDATE elevation_requests
+      [], // INSERT elevation_audit
+    ]);
+
+    const result = await createPamDecisionIntent(tx as never, {
+      request: { ...request, targetExecutableHash: null },
+      requestRevision: 3,
+      decision: 'approved',
+      expiresAt: new Date(Date.now() + 60_000),
+    });
+
+    expect(result).toEqual({
+      actuationId: '',
+      elevationRequestId: request.id,
+      requestRevision: 3,
+      generation: 0,
+      desiredState: 'cleanup',
+      refusalReason: PAM_TARGET_HASH_UNVERIFIED_REASON,
+    });
+    // device lock, locked-row select, existing-actuation select, the elevation_requests
+    // UPDATE, and the elevation_audit INSERT — no pam_actuations row and no
+    // outbox event, unlike the successful-creation path below.
+    expect(tx.execute).toHaveBeenCalledTimes(5);
+    const updateCall = tx.execute.mock.calls[3]![0];
+    expect(sqlText(updateCall)).toContain("SET status = 'denied'");
+    expect(sqlParams(updateCall)).toContain(PAM_TARGET_HASH_UNVERIFIED_REASON);
+    const auditCall = tx.execute.mock.calls[4]![0];
+    expect(sqlText(auditCall)).toContain('INSERT INTO elevation_audit');
+    expect(sqlText(auditCall)).toContain("'denied'");
+    expect(sqlText(auditCall)).toContain("'system'");
+    expect(sqlParams(auditCall)).toContain(PAM_TARGET_HASH_UNVERIFIED_REASON);
+  });
+
+  describe('end-user notice on a hash-unverified refusal (#8928)', () => {
+    beforeEach(() => notifyMocks.enqueuePamRequestNotify.mockClear());
+    const refusalRows = () => txWithRows([
+      [{ ownership_epoch: 1 }],
+      [{ id: request.id, org_id: request.orgId, device_id: request.deviceId, revision: 3 }],
+      [], [], [],
+    ]);
+
+    it('a refused technician approve (prior status pending) queues a denied notice with the user-facing reason', async () => {
+      const tx = refusalRows();
+      await createPamDecisionIntent(tx as never, {
+        request: { ...request, targetExecutableHash: null },
+        requestRevision: 3,
+        decision: 'approved',
+        expiresAt: new Date(Date.now() + 60_000),
+      });
+      expect(notifyMocks.enqueuePamRequestNotify).toHaveBeenCalledTimes(1);
+      expect(notifyMocks.enqueuePamRequestNotify).toHaveBeenCalledWith(
+        tx, { id: request.id, deviceId: request.deviceId }, 'denied', 'The program could not be verified.',
+      );
+      // The internal refusal constant is never what the end user sees.
+      expect((notifyMocks.enqueuePamRequestNotify.mock.calls[0] as unknown[])[3]).not.toBe(PAM_TARGET_HASH_UNVERIFIED_REASON);
+    });
+
+    it('an insert-time auto_approved refusal does not notify: nobody is waiting on IT', async () => {
+      const tx = refusalRows();
+      await createPamDecisionIntent(tx as never, {
+        request: { ...request, targetExecutableHash: null },
+        requestRevision: 3,
+        decision: 'auto_approved',
+        expiresAt: new Date(Date.now() + 60_000),
+      });
+      expect(notifyMocks.enqueuePamRequestNotify).not.toHaveBeenCalled();
+    });
+
+    it('a normal approve with a verifiable hash does not notify', async () => {
+      const tx = txWithRows([
+        [{ ownership_epoch: 1 }],
+        [{ id: request.id, org_id: request.orgId, device_id: request.deviceId, revision: 7 }],
+        [],
+        [{ id: '20000000-0000-4000-8000-000000000001', elevation_request_id: request.id, request_revision: 7, generation: 1, desired_state: 'active' }],
+        [],
+      ]);
+      await createPamDecisionIntent(tx as never, {
+        request, requestRevision: 7, decision: 'approved', expiresAt: new Date(Date.now() + 60_000),
+      });
+      expect(notifyMocks.enqueuePamRequestNotify).not.toHaveBeenCalled();
+    });
+  });
+
+  it('refuses a blank (whitespace-only) target hash the same as a missing one', async () => {
+    const tx = txWithRows([
+      [{ ownership_epoch: 1 }],
+      [{ id: request.id, org_id: request.orgId, device_id: request.deviceId, revision: 4 }],
+      [],
+      [],
+      [],
+    ]);
+
+    const result = await createPamDecisionIntent(tx as never, {
+      request: { ...request, targetExecutableHash: '   ' },
+      requestRevision: 4,
+      decision: 'auto_approved',
+      expiresAt: new Date(Date.now() + 60_000),
+    });
+
+    expect(result.refusalReason).toBe(PAM_TARGET_HASH_UNVERIFIED_REASON);
+    expect(result.desiredState).toBe('cleanup');
+  });
+
+  it('does not require a target hash for a decision with no target path (e.g. tech_jit_admin)', async () => {
+    const tx = txWithRows([
+      [{ ownership_epoch: 1 }],
+      [{ id: request.id, org_id: request.orgId, device_id: request.deviceId, revision: 5 }],
+      [],
+      [{
+        id: '20000000-0000-4000-8000-000000000004',
+        elevation_request_id: request.id,
+        request_revision: 5,
+        generation: 1,
+        desired_state: 'active',
+      }],
+      [],
+    ]);
+
+    const result = await createPamDecisionIntent(tx as never, {
+      request: { ...request, targetExecutablePath: '', targetExecutableHash: null },
+      requestRevision: 5,
+      decision: 'approved',
+      expiresAt: new Date(Date.now() + 60_000),
+    });
+
+    expect(result.refusalReason).toBeUndefined();
+    expect(result.desiredState).toBe('active');
+    expect(tx.execute).toHaveBeenCalledTimes(5);
+  });
+
+  it('still flows a path-targeting decision through to an active actuation when a hash is present', async () => {
+    const tx = txWithRows([
+      [{ ownership_epoch: 1 }],
+      [{ id: request.id, org_id: request.orgId, device_id: request.deviceId, revision: 6 }],
+      [],
+      [{
+        id: '20000000-0000-4000-8000-000000000005',
+        elevation_request_id: request.id,
+        request_revision: 6,
+        generation: 1,
+        desired_state: 'active',
+      }],
+      [],
+    ]);
+
+    const result = await createPamDecisionIntent(tx as never, {
+      request, // has a full-length hash and a non-empty path
+      requestRevision: 6,
+      decision: 'approved',
+      expiresAt: new Date(Date.now() + 60_000),
+    });
+
+    expect(result.refusalReason).toBeUndefined();
+    expect(result).toEqual({
+      actuationId: '20000000-0000-4000-8000-000000000005',
+      elevationRequestId: request.id,
+      requestRevision: 6,
+      generation: 1,
+      desiredState: 'active',
+    });
+    expect(tx.execute).toHaveBeenCalledTimes(5);
   });
 
   it('serializes concurrent cleanup requests so generation increments and publishes once', async () => {

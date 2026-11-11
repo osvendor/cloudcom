@@ -2,14 +2,37 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
 import { portalRoutes } from './portal';
 
+// Portal registration W3 (#11380): portalAuthMiddleware re-checks the portal
+// access policy on every request. Not under test here, so it resolves like an
+// org with no policy rows: password allowed, today's behaviour (the gate itself
+// is covered in authOrgStatusGate.test.ts and auth.logout.test.ts).
+vi.mock('../services/portalAccessPolicy', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../services/portalAccessPolicy')>();
+  return {
+    ...actual,
+    resolvePortalAccessPolicy: async (orgId: string) => ({
+      orgId, partnerId: 'partner-1', entraTenant: null,
+      ...actual.pickEffectivePortalAccessPolicy(null, null, actual.getPortalSignInCapabilities(), { entraTenantProven: false }),
+    }),
+  };
+});
 vi.mock('nanoid', () => ({
   nanoid: vi.fn(() => 'portal-session-token')
 }));
 
 vi.mock('../services/password', () => ({
+  getDummyPasswordHash: vi.fn(async () => 'dummy-hash'),
   hashPassword: vi.fn().mockResolvedValue('hashed-password'),
   isPasswordStrong: vi.fn(() => ({ valid: true, errors: [] })),
   verifyPassword: vi.fn()
+}));
+
+// Logout's durable signed-out record is stubbed here (covered by
+// routes/portal/auth.logout.test.ts and the portal logout integration test).
+const revokePortalSessionDurably = vi.hoisted(() => vi.fn(async (_token: string, _userId: string) => undefined));
+vi.mock('../services/portal/sessionRevocation', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../services/portal/sessionRevocation')>()),
+  revokePortalSessionDurably,
 }));
 
 vi.mock('../db', () => ({
@@ -59,13 +82,39 @@ vi.mock('../services/portal/timezone', () => ({
   resolveOrgTimezone: vi.fn(async () => 'UTC'),
 }));
 
+// The unified backup read model (#6012) builds SQL fragments from schema
+// columns at module load, which this file's partial schema mock does not
+// carry. No test here exercises a backup handler, so it is stubbed whole.
+vi.mock('../services/backupHealthReadModel', () => ({
+  listBackupHealthRows: vi.fn(async () => ({ rows: [], nextCursor: null })),
+  getFirstPartyCoverageForDevices: vi.fn(async () => new Map()),
+  getProviderCoverageForDevices: vi.fn(async () => new Map()),
+}));
+
 vi.mock('../db/schema', () => ({
+  // services/patchSeverityOverlay.ts builds module-level SQL fragments from these at import time.
+  patches: { severity: 'patches.severity', category: 'patches.category' },
+  OUTSTANDING_DEVICE_PATCH_STATUSES: ['pending'],
+  deviceVulnerabilities: {},
+  vulnerabilities: { severity: 'vulnerabilities.severity' },
+  devicePatches: { reportedSeverity: 'device_patches.reported_severity', reportedCategory: 'device_patches.reported_category' },
+  // Software summary ordering is constructed when the portal routes load.
+  softwareInventory: { name: 'softwareInventory.name', version: 'softwareInventory.version', vendor: 'softwareInventory.vendor' },
   assetCheckouts: {},
   backupConfigs: {},
   backupJobs: {},
   backupSlaEvents: {},
   backupVerifications: {},
+  deviceDisks: {},
+  deviceConnections: {},
+  deviceHardware: {},
+  deviceMemoryModules: {},
+  deviceNetwork: {},
+  deviceHardwareComponents: {},
+  deviceHardwareEvents: {},
+  deviceHardwareHealth: {},
   devices: {},
+  discoveredAssets: {},
   // networkBaseline.ts (pulled in transitively by the portal route graph) reads
   // discoveredAssetTypeEnum.enumValues at module load — required for the mock.
   discoveredAssetTypeEnum: { enumValues: [] },
@@ -81,13 +130,15 @@ vi.mock('../db/schema', () => ({
     name: 'portalUsers.name',
     passwordHash: 'portalUsers.passwordHash',
     authMethod: 'portalUsers.authMethod',
+    browserAccess: 'portalUsers.browserAccess',
     receiveNotifications: 'portalUsers.receiveNotifications',
     status: 'portalUsers.status',
     lastLoginAt: 'portalUsers.lastLoginAt',
     updatedAt: 'portalUsers.updatedAt'
   },
   recoveryReadiness: {},
-  RESTORABLE_BACKUP_JOB_STATUSES: ['completed', 'partial'],
+  RESTORABLE_BACKUP_JOB_STATUSES: ['completed', 'completed_with_errors', 'partial'],
+  DEGRADED_BACKUP_JOB_STATUSES: ['completed_with_errors', 'partial'],
   ticketComments: {},
   tickets: {}
 }));
@@ -102,6 +153,7 @@ const portalUser = {
   name: 'Portal User',
   passwordHash: 'hash',
   authMethod: 'password',
+  browserAccess: 'granted',
   receiveNotifications: true,
   status: 'active',
   authEpoch: 1,
@@ -230,6 +282,7 @@ describe('portal compatibility routes', () => {
       headers: { Authorization: `Bearer ${token}` }
     });
     expect(logoutRes.status).toBe(200);
+    expect(revokePortalSessionDurably).toHaveBeenCalledWith(token, portalUser.id);
 
     const profileRes = await app.request('/portal/profile', {
       method: 'GET',

@@ -30,6 +30,7 @@ const CATALOG: AgentToolCatalogDto = {
   capabilities: [
     { id: 'services_startup', tone: 'standard' },
     { id: 'scripts_commands', tone: 'standard' },
+    { id: 'automations_reports', tone: 'standard' },
   ],
   tools: [
     {
@@ -50,7 +51,7 @@ const CATALOG: AgentToolCatalogDto = {
       operations: [{ key: 'run_script', action: null, tier: 3, readOnly: false, policyDecidable: false, actEligible: true, actRequiresAuthorizedScripts: true }],
     },
   ],
-  presets: { triage: ['manage_services:restart'], patch: [], helpdesk: [], designer: [] },
+  presets: { triage: ['manage_services:restart'], patch: [], helpdesk: [], designer: [], research: [], troubleshoot: [] },
   unreachableTools: [],
 };
 
@@ -64,7 +65,6 @@ function makeAgents(): AiAgentDto[] {
       name: 'Org patcher',
       enabled: true,
       mode: 'shadow',
-      model: null,
       orgId: 'org-1',
       partnerId: null,
       ownerScope: 'organization',
@@ -85,6 +85,8 @@ function makeAgents(): AiAgentDto[] {
   ];
 }
 
+let flowsFixture: Array<Record<string, unknown>> = [];
+
 function mockEndpoints(overrides: {
   registry?: Array<{ key: string; toolName: string; action: string | null; note: string }>;
   roles?: Array<{ id: string; name: string; scope?: 'partner' | 'organization'; activeUserCount?: number }>;
@@ -97,6 +99,7 @@ function mockEndpoints(overrides: {
   const { registry = [], roles = [{ id: 'r-1', name: 'Org Admin' }], rolesStatus = 200, preview, createStatus = 201, createBody, ceilingStatus = 200 } = overrides;
   fetchMock.mockImplementation((url: string, init?: RequestInit) => {
     if (url === '/ai/agents/tool-catalog') return Promise.resolve(json({ data: CATALOG }));
+    if (url.startsWith('/flows')) return Promise.resolve(json({ flows: flowsFixture, total: flowsFixture.length }));
     if (url.startsWith('/ai/agents/ceiling')) {
       return Promise.resolve(ceilingStatus === 200 ? json({ data: null }) : json({ error: 'boom' }, false, ceilingStatus));
     }
@@ -136,6 +139,7 @@ function buildFakePreview() {
 
 beforeEach(() => {
   fetchMock.mockReset();
+  flowsFixture = [];
   orgState.current = {
     currentOrgId: null,
     allOrgs: true,
@@ -178,6 +182,63 @@ describe('AgentCreateFlow — header, footer and cancel', () => {
 
     fireEvent.click(screen.getByTestId('agent-create-flow-cancel'));
     expect(onCancel).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('AgentCreateFlow — flows as agent tools (#5220)', () => {
+  it('agent picker lists a manual flow and not a schedule flow', async () => {
+    flowsFixture = [
+      { id: 'f1', slug: 'restart-spooler', name: 'Restart spooler', status: 'enabled', effectiveTier: 3, triggerType: 'manual' },
+      { id: 'f2', slug: 'nightly', name: 'Nightly', status: 'enabled', effectiveTier: 3, triggerType: 'schedule' },
+    ];
+    mockEndpoints();
+    renderFlow();
+    fireEvent.change(screen.getByTestId('ai-agent-name'), { target: { value: 'Flow bot' } });
+    fireEvent.click(screen.getByTestId('agent-create-flow-next'));
+    await screen.findByTestId('ai-agent-permissions');
+    fireEvent.click(await screen.findByTestId('capability-toggle-automations_reports'));
+    expect(await screen.findByTestId('operation-row-flow__restart-spooler')).toBeInTheDocument();
+    expect(screen.queryByTestId('operation-row-flow__nightly')).toBeNull();
+  });
+});
+
+describe('AgentCreateFlow — flow tools degrade safely (#5220 review)', () => {
+  /** mockEndpoints(), but /flows answers with `flowsReply` instead of the fixture. */
+  function withFlowsReply(flowsReply: Response): void {
+    mockEndpoints();
+    const base = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation((url: string, init?: RequestInit) =>
+      url.startsWith('/flows') ? Promise.resolve(flowsReply) : base(url, init));
+  }
+
+  async function openPermissionsStep(): Promise<void> {
+    renderFlow();
+    fireEvent.change(screen.getByTestId('ai-agent-name'), { target: { value: 'Flow bot' } });
+    fireEvent.click(screen.getByTestId('agent-create-flow-next'));
+    await screen.findByTestId('ai-agent-permissions');
+  }
+
+  it('asks /flows for enabled flows only', async () => {
+    mockEndpoints();
+    await openPermissionsStep();
+    await waitFor(() => expect(fetchMock.mock.calls.some(([u]) => String(u).startsWith('/flows'))).toBe(true));
+    const url = String(fetchMock.mock.calls.find(([u]) => String(u).startsWith('/flows'))![0]);
+    expect(url).toContain('status=enabled');
+  });
+
+  it.each([
+    ['a 403', () => json({ error: 'forbidden' }, false, 403)],
+    ['a 200 body without flows', () => json({ total: 0 })],
+  ])('%s from /flows leaves the base catalog intact', async (_name, reply) => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    withFlowsReply(reply());
+    await openPermissionsStep();
+    fireEvent.click(await screen.findByTestId('capability-toggle-scripts_commands'));
+    expect(await screen.findByTestId('operation-row-run_script')).toBeInTheDocument();
+    await waitFor(() => expect(errSpy).toHaveBeenCalledWith('[useAgentToolCatalog] could not load flow tools', expect.anything()));
+    expect(document.querySelector('[data-testid^="operation-row-flow__"]')).toBeNull();
+    expect(screen.queryByTestId('ai-agent-catalog-unavailable')).toBeNull();
+    errSpy.mockRestore();
   });
 });
 
@@ -265,6 +326,16 @@ describe('AgentCreateFlow — default owner scope (#5048 QA)', () => {
     renderFlow({ defaultOwnerScope: 'organization', partnerBaselineKinds: new Set(['triage']) });
 
     expect(screen.getByTestId('ai-agent-owner-org')).toBeChecked();
+  });
+});
+
+describe('AgentCreateFlow — provisioned research kind (W2)', () => {
+  it('with all four ordinary kinds taken partner-wide, the flow does not auto-select research and shows the exhausted state', async () => {
+    mockEndpoints();
+    const taken = ['triage', 'patch', 'helpdesk', 'designer'].map((kind) => ({ ...makeAgents()[0]!, id: `p-${kind}`, kind, ownerScope: 'partner', orgId: null }) as unknown as AiAgentDto);
+    renderFlow({ agents: taken, defaultOwnerScope: 'partner' });
+    expect(screen.queryByTestId('ai-agent-kind-card-research')).toBeNull();
+    expect(await screen.findByTestId('ai-agent-kinds-exhausted')).toBeTruthy();
   });
 });
 
@@ -661,5 +732,25 @@ describe('AgentCreateFlow — review step preview and onCreated', () => {
     fireEvent.click(screen.getByTestId('agent-create-flow-create'));
 
     await waitFor(() => expect(postBody().enabled).toBe(true));
+  });
+});
+
+describe('AgentCreateFlow — research override (W2)', () => {
+  it('collapses to name + caps, then review, and posts only the projected body', async () => {
+    mockEndpoints();
+    orgState.current = { ...orgState.current, currentOrgId: 'org-1', allOrgs: false };
+    const baseline = { ...makeAgents()[0]!, id: 'rb', kind: 'research', ownerScope: 'partner', orgId: null, partnerId: 'p-1' } as unknown as AiAgentDto;
+    renderFlow({ agents: [baseline], defaultOwnerScope: 'organization', showOwnerScope: false, partnerBaselineKinds: new Set(['research']) });
+
+    fireEvent.click(await screen.findByTestId('ai-agent-kind-card-research'));
+    expect(screen.getByTestId('ai-agent-research-caps')).toBeInTheDocument();
+    expect(screen.queryByTestId('ai-agent-instructions')).toBeNull();
+    fireEvent.change(screen.getByTestId('ai-agent-name'), { target: { value: 'Acme research' } });
+    fireEvent.click(screen.getByTestId('agent-create-flow-next'));
+    fireEvent.click(await screen.findByTestId('agent-create-flow-create'));
+
+    await waitFor(() => expect(fetchMock.mock.calls.some(([url, init]) => url === '/ai/agents' && (init as RequestInit | undefined)?.method === 'POST')).toBe(true));
+    expect(Object.keys(postBody()).sort()).toEqual(['enabled', 'kind', 'limits', 'mode', 'name', 'orgId', 'ownerScope']);
+    expect(postBody()).toMatchObject({ kind: 'research', ownerScope: 'organization', mode: 'act' });
   });
 });

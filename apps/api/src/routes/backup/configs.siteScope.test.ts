@@ -1,4 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+// The holding-org refusal reads the org; the db mocks below do not model it.
+vi.mock('../../services/unassignedPool/protectedOrg', () => ({ isHoldingOrg: vi.fn(async () => false) }));
 import { Hono } from 'hono';
 
 const { authRef } = vi.hoisted(() => ({ authRef: { current: {} as any } }));
@@ -16,7 +19,10 @@ const insertMock = vi.fn(() => chainMock([]));
 const updateMock = vi.fn(() => chainMock([]));
 const deleteMock = vi.fn(() => chainMock([]));
 
+// Key history recording is covered by configs.test.ts and its integration suite.
+vi.mock('../../services/backupStorageCredentialHistory', () => ({ recordCredentialChange: async () => undefined }));
 vi.mock('../../db', () => ({
+  withDbTransaction: async (fn: () => Promise<unknown>) => fn(),
   db: {
     select: (...args: unknown[]) => selectMock(...(args as [])),
     insert: (...args: unknown[]) => insertMock(...(args as [])),

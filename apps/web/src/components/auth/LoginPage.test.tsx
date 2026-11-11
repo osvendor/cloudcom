@@ -1,4 +1,4 @@
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { act, render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../../stores/auth', () => ({
@@ -143,6 +143,16 @@ describe('LoginPage partner SSO button', () => {
     vi.clearAllMocks();
     // Restore the default empty-context resolution cleared above.
     vi.mocked(getLoginContext).mockResolvedValue({ branding: null, partnerSso: null });
+  });
+
+  it('asks for the slug-scoped context on a /login/<partner-slug> page (#4017)', async () => {
+    render(<LoginPage partnerSlug="acme-msp" />);
+    await waitFor(() => expect(getLoginContext).toHaveBeenCalledWith('acme-msp'));
+  });
+
+  it('asks for the singleton context on the stock /login page', async () => {
+    render(<LoginPage />);
+    await waitFor(() => expect(getLoginContext).toHaveBeenCalledWith(undefined));
   });
 
   it('renders a "Sign in with {provider}" button when partner SSO is available', async () => {
@@ -318,6 +328,140 @@ describe('LoginPage partner SSO button', () => {
 });
 
 describe('LoginPage Cloudflare Access redirect', () => {
+  it.each(['/devices', 'https://attacker.example'])('requires an explicit callback retry and sanitizes next %s', async (next) => {
+    const realLocation = window.location;
+    const assign = vi.fn();
+    Object.defineProperty(window, 'location', { configurable: true, value: { ...realLocation, search: '?error=cf-access&reason=binding', assign } });
+    let complete!: (response: Response) => void;
+    vi.mocked(fetch).mockImplementation(async (input) => String(input).endsWith('/config')
+      ? new Response(JSON.stringify({ cfAccessLogin: { enabled: true } }))
+      : new Promise<Response>((resolve) => { complete = resolve; }));
+    try {
+      render(<LoginPage next={next} />);
+      const button = await screen.findByRole('button', { name: 'Retry single sign-on' });
+      expect(vi.mocked(fetch).mock.calls.filter(([url]) => String(url).includes('/api/v1/'))).toHaveLength(0);
+      expect(assign).not.toHaveBeenCalled();
+      await act(async () => { fireEvent.click(button); fireEvent.click(button); });
+      expect(button).toBeDisabled();
+      expect(screen.getByRole('status')).toHaveTextContent('Preparing your sign-in');
+      expect(vi.mocked(fetch).mock.calls.filter(([url]) => String(url).includes('/api/v1/'))).toHaveLength(2);
+      expect(assign).not.toHaveBeenCalled();
+      await act(async () => { complete(new Response(null, { status: 204 })); });
+      expect(assign).toHaveBeenCalledExactlyOnceWith(next === '/devices'
+        ? '/api/v1/auth/cf-access-login?next=%2Fdevices' : '/api/v1/auth/cf-access-login');
+    } finally { Object.defineProperty(window, 'location', { configurable: true, value: realLocation }); }
+  });
+
+  it.each(['disabled', 'network', 'bootstrap'])('keeps callback retry actionable after %s failure', async (failure) => {
+    const realLocation = window.location;
+    const assign = vi.fn();
+    Object.defineProperty(window, 'location', { configurable: true, value: { ...realLocation, search: '?error=cf-access&reason=binding', assign } });
+    vi.mocked(fetch).mockImplementation(async (input) => {
+      if (failure === 'network') throw new Error('offline');
+      return String(input).endsWith('/config')
+        ? new Response(JSON.stringify({ cfAccessLogin: { enabled: failure !== 'disabled' } }))
+        : new Response(null, { status: 503 });
+    });
+    try {
+      render(<LoginPage />);
+      const button = await screen.findByRole('button', { name: 'Retry single sign-on' });
+      await act(async () => { fireEvent.click(button); });
+      expect(button).toBeEnabled();
+      expect(screen.getByRole('status')).toHaveTextContent(failure === 'bootstrap' ? 'Authentication bootstrap failed' : 'Single sign-on is unavailable');
+      expect(assign).not.toHaveBeenCalled();
+      const calls = vi.mocked(fetch).mock.calls.length;
+      await act(async () => { fireEvent.click(button); });
+      expect(vi.mocked(fetch).mock.calls.length).toBeGreaterThan(calls);
+    } finally { Object.defineProperty(window, 'location', { configurable: true, value: realLocation }); }
+  });
+
+  it.each(['?signedOut=1', '?cf-access-login=success'])('does not add callback retry to %s', async (search) => {
+    const realLocation = window.location;
+    Object.defineProperty(window, 'location', { configurable: true, value: { ...realLocation, search } });
+    try {
+      render(<LoginPage />);
+      await screen.findByTestId('login-page');
+      expect(screen.queryByTestId('cf-access-retry')).not.toBeInTheDocument();
+      expect(vi.mocked(fetch).mock.calls.filter(([url]) => String(url).includes('/api/v1/'))).toHaveLength(0);
+    } finally { Object.defineProperty(window, 'location', { configurable: true, value: realLocation }); }
+  });
+
+  it('shows a timed-out explicit retry without automatically starting another attempt', async () => {
+    vi.useFakeTimers();
+    const realLocation = window.location;
+    const assign = vi.fn();
+    Object.defineProperty(window, 'location', { configurable: true, value: { ...realLocation, search: '?error=cf-access', assign } });
+    let bootstrapCalls = 0;
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      if (String(input).endsWith('/config')) return new Response(JSON.stringify({ cfAccessLogin: { enabled: true } }));
+      if (!String(input).includes('/auth/browser-binding/bootstrap')) return new Response('{}');
+      bootstrapCalls++;
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true });
+      });
+    });
+    try {
+      render(<LoginPage />);
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+      const button = screen.getByRole('button', { name: 'Retry single sign-on' });
+      await act(async () => { fireEvent.click(button); });
+      await act(async () => { await vi.advanceTimersByTimeAsync(15_001); });
+      expect(screen.getByRole('status')).toHaveTextContent('Sign-in preparation timed out');
+      expect(button).toBeEnabled();
+      await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+      expect(bootstrapCalls).toBe(1);
+      expect(assign).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+      Object.defineProperty(window, 'location', { configurable: true, value: realLocation });
+    }
+  });
+
+  it('respects the separate login context that skips staff SSO', async () => {
+    const realLocation = window.location;
+    Object.defineProperty(window, 'location', { configurable: true, value: { ...realLocation, search: '?error=cf-access' } });
+    try {
+      render(<LoginPage skipAutomaticStaffSso />);
+      await screen.findByTestId('login-page');
+      expect(screen.queryByTestId('cf-access-retry')).not.toBeInTheDocument();
+      expect(vi.mocked(fetch).mock.calls.filter(([url]) => String(url).includes('/api/v1/'))).toHaveLength(0);
+    } finally { Object.defineProperty(window, 'location', { configurable: true, value: realLocation }); }
+  });
+
+  it('shows progress and an actionable retry when binding bootstrap times out', async () => {
+    vi.useFakeTimers();
+    const realLocation = window.location;
+    const assign = vi.fn();
+    Object.defineProperty(window, 'location', { configurable: true, value: { ...realLocation, search: '', assign } });
+    let bootstrapCalls = 0;
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      if (String(input).endsWith('/api/v1/config')) {
+        return new Response(JSON.stringify({ cfAccessLogin: { enabled: true } }), { status: 200 });
+      }
+      bootstrapCalls++;
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true });
+      });
+    });
+    try {
+      render(<LoginPage />);
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+      expect(screen.getByRole('status')).toHaveTextContent('Preparing your sign-in');
+      expect(bootstrapCalls).toBe(1);
+      await act(async () => { await vi.advanceTimersByTimeAsync(15_001); });
+      expect(screen.getByRole('status')).toHaveTextContent('Sign-in preparation timed out');
+      expect(assign).not.toHaveBeenCalled();
+      expect(bootstrapCalls).toBe(1);
+      await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Retry sign-in' })); });
+      expect(bootstrapCalls).toBe(2);
+      expect(screen.getByRole('status')).toHaveTextContent('Preparing your sign-in');
+      await act(async () => { await vi.advanceTimersByTimeAsync(15_001); });
+    } finally {
+      vi.useRealTimers();
+      Object.defineProperty(window, 'location', { configurable: true, value: realLocation });
+    }
+  });
+
   it('bootstraps the browser binding before automatic redirect-login navigation', async () => {
     const calls: string[] = [];
     vi.mocked(fetch).mockImplementation(async (input) => {

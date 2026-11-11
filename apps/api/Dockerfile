@@ -3,7 +3,7 @@
 # ============================================
 
 # Stage 1: Base image with pnpm
-FROM node:24-alpine@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1 AS base
+FROM node:24-alpine@sha256:06d7adf3e0ef61a13f1d28682726366f97a15aa1888c934d3ecec86c33918b53 AS base
 RUN npm install -g pnpm@10.34.5
 RUN apk add --no-cache libc6-compat python3 make g++
 WORKDIR /app
@@ -26,6 +26,7 @@ COPY packages/extension-testkit/package.json ./packages/extension-testkit/
 COPY ee/workspace/package.json ./ee/workspace/
 COPY packages/ext-rustdesk-access/package.json ./packages/ext-rustdesk-access/
 COPY packages/ext-cloud-command/package.json ./packages/ext-cloud-command/
+COPY packages/ext-credentials/package.json ./packages/ext-credentials/
 
 # Install all dependencies
 RUN pnpm install --frozen-lockfile --prefer-offline
@@ -55,6 +56,7 @@ COPY tsconfig.json ./
 RUN pnpm --filter @breeze/ext-workspace build:web
 RUN pnpm --filter @cloudcom/ext-rustdesk-access build:web
 RUN pnpm --filter @cloudcom/ext-cloud-command build:web
+RUN pnpm --filter @cloudcom/ext-credentials build:web
 
 # Build the API
 WORKDIR /app/apps/api
@@ -67,6 +69,7 @@ COPY --from=builder /app/apps/api/dist /apps/api/dist
 COPY --from=builder /app/ee/workspace/dist /ee/workspace/dist
 COPY --from=builder /app/packages/ext-rustdesk-access/dist /packages/ext-rustdesk-access/dist
 COPY --from=builder /app/packages/ext-cloud-command/dist /packages/ext-cloud-command/dist
+COPY --from=builder /app/packages/ext-credentials/dist /packages/ext-credentials/dist
 
 # Runtime source and workspace dependencies do not require compilation. Keeping
 # them separate lets release packaging skip builder when release-dist is supplied.
@@ -77,8 +80,25 @@ COPY apps/api/package.json ./apps/api/package.json
 COPY apps/api/migrations ./apps/api/migrations
 COPY apps/api/assets ./apps/api/assets
 
+# YARA rule pre-check (#6263 W03a): `breeze-yarac` is the agent's own compiler
+# and compile policy (agent/cmd/breeze-yarac), so a rule set that validates
+# here compiles on every agent of the same engine. Cross-compiled on the build
+# platform (pure Go, CGO off) instead of under QEMU for each target arch. The
+# Go tag must equal agent/go.mod's `go` directive
+# (scripts/security/check-go-version-pins.sh); the digest pins the image.
+FROM --platform=$BUILDPLATFORM golang:1.26.10-alpine@sha256:9ce231b28998b32e116927c61aa5c406183061d4f3f2d61b292c88e7f6bdf7ca AS yarac
+ARG TARGETOS
+ARG TARGETARCH
+ENV GOTOOLCHAIN=local GOFLAGS=-mod=readonly CGO_ENABLED=0
+WORKDIR /src/agent
+COPY agent/go.mod agent/go.sum ./
+RUN go mod download
+COPY agent/cmd/breeze-yarac ./cmd/breeze-yarac
+COPY agent/internal ./internal
+RUN GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -trimpath -ldflags "-s -w" -o /out/breeze-yarac ./cmd/breeze-yarac
+
 # Stage 4: Production runner
-FROM node:24-alpine@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1 AS runner
+FROM node:24-alpine@sha256:06d7adf3e0ef61a13f1d28682726366f97a15aa1888c934d3ecec86c33918b53 AS runner
 WORKDIR /app
 
 # Refresh libcrypto3/libssl3 because the pinned base digest predates the fix for
@@ -93,6 +113,10 @@ ENV NODE_ENV=production
 ENV API_PORT=3001
 ARG APP_VERSION=0.2.0
 ENV APP_VERSION=${APP_VERSION}
+# Server-only release images bake the binaries release they pair with (empty
+# for full releases); read by services/binarySource.ts. Never set via compose.
+ARG BREEZE_BINARIES_VERSION=""
+ENV BREEZE_BINARIES_VERSION=${BREEZE_BINARIES_VERSION}
 
 # Create non-root user for security
 RUN addgroup --system --gid 1001 nodejs && \
@@ -113,6 +137,7 @@ COPY --from=runtime-source --chown=hono:nodejs /app/ee ./apps/api/ee
 COPY --from=release-dist --chown=hono:nodejs /ee/workspace/dist ./apps/api/ee/workspace/dist
 COPY --from=release-dist --chown=hono:nodejs /packages/ext-rustdesk-access/dist ./packages/ext-rustdesk-access/dist
 COPY --from=release-dist --chown=hono:nodejs /packages/ext-cloud-command/dist ./packages/ext-cloud-command/dist
+COPY --from=release-dist --chown=hono:nodejs /packages/ext-credentials/dist ./packages/ext-credentials/dist
 
 # Copy migration files for auto-migrate on startup
 COPY --from=runtime-source --chown=hono:nodejs /app/apps/api/migrations ./apps/api/migrations
@@ -121,6 +146,9 @@ COPY --from=runtime-source --chown=hono:nodejs /app/apps/api/migrations ./apps/a
 # from process.cwd(), and this runner's cwd ends at /app/apps/api (WORKDIR
 # below), so the destination mirrors the migrations copy above.
 COPY --from=runtime-source --chown=hono:nodejs /app/apps/api/assets ./apps/api/assets
+# YARA pre-check binary (services/yaraPrecheck.ts default path). Root-owned and
+# not writable by the runtime user.
+COPY --from=yarac /out/breeze-yarac /usr/local/bin/breeze-yarac
 # Run the API from its workspace path so module resolution uses apps/api/node_modules first.
 WORKDIR /app/apps/api
 

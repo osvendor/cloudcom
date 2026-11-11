@@ -15,8 +15,12 @@
  * here and nothing else would catch a device that moved orgs between confirm
  * and execution. Such a device is SKIPPED (`ORG_CHANGED`), never deleted under
  * stale authorisation. A device that was restored in the same window is refused
- * by `purgeRemovedDevice`'s own status re-check (`NOT_REMOVED`), and one whose
- * agent uninstall is still collectable by its `UNINSTALL_PENDING` refusal.
+ * by `purgeRemovedDevice`'s own status re-check (`NOT_REMOVED`), one whose
+ * agent uninstall is still collectable by its `UNINSTALL_PENDING` refusal, and
+ * one whose agent never confirmed it came off by `UNINSTALL_NOT_CONFIRMED`
+ * (#11153). Bulk never passes `force`: there is no per-device "delete anyway"
+ * in a 500-device run, so such a device is skipped and named in the result,
+ * and the operator deletes it from its own page if they mean to.
  *
  * Module shape mirrors `jobs/orgMerge.ts`: lazy Queue/Worker singletons,
  * `enqueueOrReplaceStale` (a bare `queue.add` under a dedup'd jobId silently
@@ -32,7 +36,9 @@ import { getBullMQConnection, getRedis } from '../services/redis';
 import { enqueueOrReplaceStale } from '../services/bullmqUtils';
 import { createAuditLog } from '../services/auditService';
 import { invalidateOrgDeviceCount } from '../services/agentOrgRateLimit';
-import { purgeRemovedDevice, DeviceLifecycleError } from '../services/deviceLifecycle';
+import { purgeRemovedDevice, DeviceLifecycleError, type PurgeResult } from '../services/deviceLifecycle';
+import { listDeviceScreenshotStorageKeys } from '../services/screenshotStorage';
+import { removeScreenshotFiles } from '../services/screenshotFiles';
 import { attachWorkerObservability } from './workerObservability';
 
 // V2 uses a distinct queue, not merely a new field on the old payload. During
@@ -82,8 +88,10 @@ export type BulkPurgeSkipCode =
   | 'NOT_FOUND'
   | 'NOT_REMOVED'
   | 'UNINSTALL_PENDING'
+  | 'UNINSTALL_NOT_CONFIRMED'
   | 'SITE_ACCESS_DENIED'
   | 'STATE_CHANGED'
+  | 'BACKUP_PROTECTED'
   | 'AUTHORIZATION_CONTEXT_INVALID'
   | 'ORG_CHANGED'
   | 'ERROR';
@@ -146,6 +154,10 @@ interface PurgeOneOutcome {
   /** From `PurgeResult` — read under the lock. Null when nothing was purged. */
   linkGroupId: string | null;
   linkGroupDissolved: boolean;
+  /** From `PurgeResult`; 0 when nothing was purged. */
+  detachedTopologyAlerts?: number;
+  /** From `PurgeResult` (#11153); absent when nothing was purged. */
+  uninstallState?: PurgeResult['uninstallState'];
 }
 
 /**
@@ -170,10 +182,10 @@ async function purgeOne(
   target: DeviceBulkPurgeTarget,
   allowedSiteIds?: readonly string[],
 ): Promise<PurgeOneOutcome> {
-  return runOutsideDbContext(() =>
-    withSystemDbAccessContext(async () => {
+  const { screenshotStorageKeys, ...outcome } = await runOutsideDbContext(() =>
+    withSystemDbAccessContext(async (): Promise<PurgeOneOutcome & { screenshotStorageKeys?: string[] }> => {
       try {
-        return await db.transaction(async (tx): Promise<PurgeOneOutcome> => {
+        return await db.transaction(async (tx) => {
           const rows = (await tx.execute(
             sql`SELECT org_id FROM devices WHERE id = ${target.deviceId} FOR UPDATE`,
           )) as unknown as Array<{ org_id: string }>;
@@ -183,11 +195,17 @@ async function purgeOne(
             return { code: 'ORG_CHANGED', linkGroupId: null, linkGroupDissolved: false };
           }
 
+          // #8117 — under the devices row lock (which also blocks a concurrent
+          // capture's FK check), so the key list is complete.
+          const keys = await listDeviceScreenshotStorageKeys(tx, target.deviceId);
           const purged = await purgeRemovedDevice(tx, target.deviceId, allowedSiteIds);
           return {
             code: null,
             linkGroupId: purged.linkGroupId,
             linkGroupDissolved: purged.linkGroupDissolved,
+            detachedTopologyAlerts: purged.detachedTopologyAlerts,
+            uninstallState: purged.uninstallState,
+            screenshotStorageKeys: keys,
           };
         });
       } catch (err) {
@@ -196,12 +214,20 @@ async function purgeOne(
         // survivor outside the serialized site ceiling); catching inside the
         // callback would commit that partial delete while reporting SKIPPED.
         if (err instanceof DeviceLifecycleError) {
-          return { code: err.code, linkGroupId: null, linkGroupDissolved: false };
+          // DEVICE_LIMIT_REACHED is a restore-only refusal; purge never admits.
+          const code = err.code === 'DEVICE_LIMIT_REACHED' ? 'ERROR' : err.code;
+          return { code, linkGroupId: null, linkGroupDissolved: false };
         }
         throw err;
       }
     }, 'deviceBulkPurge.purgeOne'),
   );
+  // The system context above is a top-level transaction, so the purge has
+  // committed. Never throws; leftovers are retried by the orphan sweep.
+  if (outcome.code === null && screenshotStorageKeys && screenshotStorageKeys.length > 0) {
+    await removeScreenshotFiles(screenshotStorageKeys, `bulk device purge device=${target.deviceId}`);
+  }
+  return outcome;
 }
 
 /**
@@ -275,6 +301,10 @@ export async function processDeviceBulkPurgeJob(
                   linkGroupDissolved: outcome.linkGroupDissolved,
                 }
               : {}),
+            ...(outcome.detachedTopologyAlerts ? { detachedTopologyAlerts: outcome.detachedTopologyAlerts } : {}),
+            // #11153 — bulk never forces; the state is what let it through.
+            force: false,
+            ...(outcome.uninstallState ? { uninstallState: outcome.uninstallState } : {}),
           },
           result: 'success',
         });

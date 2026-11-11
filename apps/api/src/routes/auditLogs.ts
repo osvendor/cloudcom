@@ -3,11 +3,14 @@ import { zValidator } from '../lib/validation';
 import { z } from 'zod';
 import { and, desc, eq, gte, lte, ilike, inArray, not, or, sql, SQL } from 'drizzle-orm';
 import { db } from '../db';
+import { dateFromSqlValue } from '../services/portal/sqlTimestamp';
 import { auditLogs as auditLogsTable, users, devices } from '../db/schema';
 import { authMiddleware, requireMfa, requirePermission } from '../middleware/auth';
 import { writeRouteAudit } from '../services/auditEvents';
+import { auditLogReadCondition, auditPartnerScopeId } from '../services/auditReadScope';
 import { canAccessSite, PERMISSIONS, type UserPermissions } from '../services/permissions';
 import { csvRow } from '../services/spreadsheetExport';
+import { redactPersistedToolInput } from '../services/aiToolOutput';
 import type { ActorType, AuditResult } from '@breeze/shared';
 
 export const auditLogRoutes = new Hono();
@@ -30,6 +33,12 @@ auditLogRoutes.use('*', authMiddleware);
 const listLogsSchema = z.object({
   page: z.string().optional(),
   limit: z.string().optional(),
+  // The Audit Trail's user picker (#9671): match the actor by identity
+  // (audit_logs.actor_id), which also covers rows written without an actor
+  // email such as agent.command.*. ANDed with the org scope, so it only
+  // narrows what the caller can already see.
+  userId: z.string().guid().optional(),
+  // Free-text user match (email / name); see buildFilterConditions.
   user: z.string().min(1).optional(),
   action: z.string().min(1).optional(),
   resource: z.string().min(1).optional(),
@@ -121,6 +130,7 @@ const complianceActions = new Set([
   'policy.evaluate',
   'automation.policy.evaluate',
   'script.execute',
+  'script.execute_group_target',
   'organization.update'
 ]);
 
@@ -129,11 +139,15 @@ const dataChangeActions = new Set([
   'device.create',
   'device.delete',
   'device.update',
+  'device.site_move',
+  'device.site_assignment_confirmed',
+  'device.site_assignment_unconfirmed',
   'policy.update',
   'policy.evaluate',
   'automation.policy.evaluate',
   'policy.create',
   'script.execute',
+  'script.execute_group_target',
   'organization.update'
 ]);
 const exportActions = new Set(['data.export']);
@@ -204,6 +218,18 @@ export function resolveActorName(row: DbRow, details?: Record<string, unknown> |
   }
 
   if (row.log.actorType === 'api_key') {
+    // A partner service principal acts as ITSELF (Partner API): its domain
+    // rows carry the PRINCIPAL id as actor_id, not a key id, and name the
+    // principal in details. Render those by principal so they never read as
+    // "API Key <slice of a principal id>" next to rows that are keyed by a
+    // key id. The credential-level `partner_api.request` row IS keyed by the
+    // key id (it is about the credential) and keeps the label below.
+    const principalName = typeof details?.partnerServicePrincipalName === 'string'
+      ? details.partnerServicePrincipalName.trim()
+      : '';
+    if (principalName) return `Service principal ${principalName}`;
+    const principalId = typeof details?.partnerServicePrincipalId === 'string' ? details.partnerServicePrincipalId : null;
+    if (principalId) return `Service principal ${principalId.slice(0, 8)}`;
     return rawActorId ? `API Key ${rawActorId.slice(0, 8)}` : 'API Key';
   }
 
@@ -214,10 +240,28 @@ export function resolveActorName(row: DbRow, details?: Record<string, unknown> |
   return 'Unknown User';
 }
 
+/**
+ * #6577: `details` as it may be serialised to a client. Rows written before the
+ * write-side sanitiser (auditEvents.ts → sanitizeAuditPayload), and rows from
+ * direct createAuditLog writers, can hold raw credentials; every read path below
+ * redacts with the same helper the AI admin history reads use (#5570).
+ * Idempotent for already-sanitised rows. Internal lookups (actor name, session
+ * link) keep reading the raw value — they never echo a secret-named key.
+ */
+function redactedDetails(log: DbRow['log']): Record<string, unknown> | null {
+  if (log.details === null || log.details === undefined) return null;
+  return redactPersistedToolInput(log.details) as Record<string, unknown>;
+}
+
+function isUpdateAction(action: string): boolean {
+  return action === 'update' || action.endsWith('.update');
+}
+
 function flattenEntry(row: DbRow) {
   const log = row.log;
-  const details = log.details as Record<string, unknown> | null;
-  const actorName = resolveActorName(row, details);
+  const rawDetails = log.details as Record<string, unknown> | null;
+  const actorName = resolveActorName(row, rawDetails);
+  const details = redactedDetails(log);
   return {
     id: log.id,
     timestamp: log.timestamp.toISOString(),
@@ -227,17 +271,19 @@ function flattenEntry(row: DbRow) {
     details: details ? JSON.stringify(details) : '{}',
     ipAddress: log.ipAddress ?? '',
     userAgent: log.userAgent ?? '',
-    sessionId: details?.sessionId ?? null,
+    sessionId: rawDetails?.sessionId ?? null,
     user: {
       name: actorName,
       email: log.actorEmail ?? '',
-      role: log.actorType,
-      department: ''
+      role: log.actorType
     },
     initiatedBy: log.initiatedBy ?? null,
+    // #9672: only an update has a meaningful "after" snapshot; for every other
+    // action echoing the whole details object made the UI report "N fields
+    // updated" on a script run. No before-state is stored, so `before` is empty.
     changes: {
       before: {},
-      after: details ?? {}
+      after: isUpdateAction(log.action) ? (details ?? {}) : {}
     }
   };
 }
@@ -268,12 +314,12 @@ function toFullEntry(row: DbRow, includeDetails = true) {
     initiatedBy: log.initiatedBy ?? null,
   };
   if (includeDetails) {
-    entry.details = details ?? {};
+    entry.details = redactedDetails(log) ?? {};
   }
   return entry;
 }
 
-function parseExcludeActions(raw: string | undefined): string[] {
+function parseCommaList(raw: string | undefined): string[] {
   if (!raw) return [];
   return raw
     .split(',')
@@ -283,32 +329,70 @@ function parseExcludeActions(raw: string | undefined): string[] {
 
 function buildFilterConditions(
   orgCond: SQL | undefined,
-  filters: { user?: string; action?: string; resource?: string; from?: string; to?: string; excludeActions?: string }
+  filters: {
+    userId?: string;
+    user?: string;
+    action?: string;
+    resource?: string;
+    from?: string;
+    to?: string;
+    excludeActions?: string;
+  }
 ): SQL | undefined {
   const conditions: SQL[] = [];
 
   if (orgCond) conditions.push(orgCond);
 
+  if (filters.userId) {
+    conditions.push(eq(auditLogsTable.actorId, filters.userId));
+  }
+
   if (filters.user) {
     const term = `%${escapeIlike(filters.user)}%`;
+    // users.email (via the actor join) as well as actor_email: rows such as
+    // agent.command.* carry actor_id but no actor_email (#9671).
     conditions.push(
       or(
         ilike(auditLogsTable.actorEmail, term),
+        ilike(users.email, term),
         ilike(users.name, term)
       )!
     );
   }
 
-  if (filters.action) {
-    conditions.push(ilike(auditLogsTable.action, `%${escapeIlike(filters.action)}%`));
+  // #8975: the UI sends multi-select filters as a comma list; match each term
+  // on its own and OR them rather than as one literal "a,b" substring.
+  // A non-empty filter that yields no terms (e.g. ",") fails closed to zero rows
+  // rather than silently dropping the filter.
+  const actionTerms = parseCommaList(filters.action);
+  if (filters.action && actionTerms.length === 0) {
+    conditions.push(sql`false`);
+  } else if (actionTerms.length > 0) {
+    conditions.push(
+      // #9672: a dotted-code prefix (`script` matches `script.run`), not a
+      // substring - `dataset` or `device` would otherwise match unrelated codes.
+      or(
+        ...actionTerms.flatMap((t) => [
+          ilike(auditLogsTable.action, escapeIlike(t)),
+          ilike(auditLogsTable.action, `${escapeIlike(t)}.%`)
+        ])
+      )!
+    );
   }
 
-  if (filters.resource) {
-    const term = `%${escapeIlike(filters.resource)}%`;
+  const resourceTerms = parseCommaList(filters.resource);
+  if (filters.resource && resourceTerms.length === 0) {
+    conditions.push(sql`false`);
+  } else if (resourceTerms.length > 0) {
     conditions.push(
       or(
-        ilike(auditLogsTable.resourceType, term),
-        ilike(auditLogsTable.resourceName, term)
+        ...resourceTerms.flatMap((t) => {
+          return [
+            // resource_type matches as a prefix (#9672); the free-text name stays a substring.
+            ilike(auditLogsTable.resourceType, `${escapeIlike(t)}%`),
+            ilike(auditLogsTable.resourceName, `%${escapeIlike(t)}%`)
+          ];
+        })
       )!
     );
   }
@@ -321,7 +405,7 @@ function buildFilterConditions(
     conditions.push(lte(auditLogsTable.timestamp, new Date(filters.to)));
   }
 
-  const excludeList = parseExcludeActions(filters.excludeActions);
+  const excludeList = parseCommaList(filters.excludeActions);
   if (excludeList.length > 0) {
     conditions.push(not(inArray(auditLogsTable.action, excludeList)));
   }
@@ -338,6 +422,30 @@ function buildSearchCondition(q: string): SQL {
     ilike(auditLogsTable.resourceName, term),
     sql`${auditLogsTable.details}::text ILIKE ${term}`
   )!;
+}
+
+/**
+ * Org scope shared by the list and the export: a pinned ?orgId= narrows to that
+ * single org (caller must be able to access it), otherwise the standard
+ * accessible-org condition. `denied` mirrors the list's 403.
+ */
+function resolveListOrgScope(
+  auth: Parameters<typeof auditLogReadCondition>[0] & { canAccessOrg: (orgId: string) => boolean },
+  orgId: string | undefined
+): { denied: true } | { denied: false; orgCond: SQL | undefined } {
+  if (orgId && !auth.canAccessOrg(orgId)) return { denied: true };
+  return { denied: false, orgCond: orgId ? eq(auditLogsTable.orgId, orgId) : auditLogReadCondition(auth) };
+}
+
+/** Filter conditions plus the optional free-text `q` (search endpoint / export). */
+function buildListWhere(
+  orgCond: SQL | undefined,
+  query: Parameters<typeof buildFilterConditions>[1] & { q?: string }
+): SQL | undefined {
+  const filterWhere = buildFilterConditions(orgCond, query);
+  if (!query.q) return filterWhere;
+  const searchCond = buildSearchCondition(query.q);
+  return filterWhere ? and(filterWhere, searchCond) : searchCond;
 }
 
 async function queryRows(where: SQL | undefined, limit: number, offset: number): Promise<DbRow[]> {
@@ -368,6 +476,7 @@ async function queryRows(where: SQL | undefined, limit: number, offset: number):
 interface LateralAuditRow extends Record<string, unknown> {
   id: string;
   org_id: string | null;
+  partner_id: string | null;
   timestamp: Date | string;
   actor_type: ActorType;
   actor_id: string;
@@ -391,7 +500,11 @@ interface LateralAuditRow extends Record<string, unknown> {
 async function queryLatestPerOrg(
   orgIds: string[],
   limit: number,
-  excludeActions: string[] = []
+  excludeActions: string[] = [],
+  // Partner-scope callers only (auditPartnerScopeId): also merge in the newest
+  // partner-scoped rows (org_id NULL, partner_id = this) via their own partial
+  // index (audit_logs_partner_scope_idx, #7696).
+  partnerId: string | null = null
 ): Promise<DbRow[]> {
   const orgIdsSql = sql.join(orgIds.map((id) => sql`${id}::uuid`), sql`, `);
   // Apply the exclude filter INSIDE the LATERAL subquery so the per-org
@@ -400,21 +513,34 @@ async function queryLatestPerOrg(
   const excludeFilter = excludeActions.length > 0
     ? sql` AND audit_logs.action <> ALL(ARRAY[${sql.join(excludeActions.map((a) => sql`${a}`), sql`, `)}]::text[])`
     : sql``;
+  const partnerBranch = partnerId
+    ? sql`
+      UNION ALL
+      (
+        SELECT * FROM audit_logs
+        WHERE audit_logs.org_id IS NULL
+          AND audit_logs.partner_id = ${partnerId}::uuid${excludeFilter}
+        ORDER BY timestamp DESC
+        LIMIT ${limit}
+      )`
+    : sql``;
   const rows = await db.execute<LateralAuditRow>(sql`
     SELECT
-      al.id, al.org_id, al.timestamp, al.actor_type, al.actor_id,
+      al.id, al.org_id, al.partner_id, al.timestamp, al.actor_type, al.actor_id,
       al.actor_email, al.action, al.resource_type, al.resource_id,
       al.resource_name, al.details, al.ip_address, al.user_agent,
       al.result, al.error_message, al.checksum, al.initiated_by,
       u.name AS user_name,
       d.hostname AS device_hostname,
       d.display_name AS device_display_name
-    FROM unnest(ARRAY[${orgIdsSql}]::uuid[]) AS o(org_id)
-    CROSS JOIN LATERAL (
-      SELECT * FROM audit_logs
-      WHERE audit_logs.org_id = o.org_id${excludeFilter}
-      ORDER BY timestamp DESC
-      LIMIT ${limit}
+    FROM (
+      SELECT per_org.* FROM unnest(ARRAY[${orgIdsSql}]::uuid[]) AS o(org_id)
+      CROSS JOIN LATERAL (
+        SELECT * FROM audit_logs
+        WHERE audit_logs.org_id = o.org_id${excludeFilter}
+        ORDER BY timestamp DESC
+        LIMIT ${limit}
+      ) per_org${partnerBranch}
     ) al
     LEFT JOIN users u ON al.actor_id = u.id
     LEFT JOIN devices d
@@ -427,7 +553,8 @@ async function queryLatestPerOrg(
     log: {
       id: r.id,
       orgId: r.org_id,
-      timestamp: r.timestamp instanceof Date ? r.timestamp : new Date(r.timestamp),
+      partnerId: r.partner_id,
+      timestamp: r.timestamp instanceof Date ? r.timestamp : dateFromSqlValue(r.timestamp),
       actorType: r.actor_type,
       actorId: r.actor_id,
       actorEmail: r.actor_email,
@@ -450,9 +577,13 @@ async function queryLatestPerOrg(
 }
 
 async function countRows(where: SQL | undefined): Promise<number> {
+  // Same users join as queryRows: the user filter matches users.name, so a
+  // count over audit_logs alone fails with "missing FROM-clause entry for
+  // table users". A left join on the users PK cannot change the count.
   const [row] = await db
     .select({ count: sql<number>`count(*)::int` })
     .from(auditLogsTable)
+    .leftJoin(users, eq(auditLogsTable.actorId, users.id))
     .where(where);
   return row?.count ?? 0;
 }
@@ -484,7 +615,7 @@ function toExportRecord(row: DbRow, includeDetails: boolean): Record<AuditExport
     result: log.result,
     ipAddress: log.ipAddress ?? '',
     userAgent: log.userAgent ?? '',
-    details: includeDetails ? JSON.stringify(log.details ?? {}) : ''
+    details: includeDetails ? JSON.stringify(redactedDetails(log) ?? {}) : ''
   };
 }
 
@@ -573,7 +704,8 @@ function paginatedListHandler(
     // Explicit per-request org scope from the org-selector dropdown. If the
     // caller asks for an org they cannot access, return 403 — do NOT silently
     // fall back to the full accessible-org set.
-    if (query.orgId && !auth.canAccessOrg(query.orgId)) {
+    const scope = resolveListOrgScope(auth, query.orgId);
+    if (scope.denied) {
       return c.json({ error: 'Access denied' }, 403);
     }
     // BY DESIGN: the audit-log list is scoped to the org only, NOT the caller's
@@ -585,19 +717,22 @@ function paginatedListHandler(
     // list intentionally does not. (Site-scope review decision, 2026-05-31.)
     // A pinned ?orgId= narrows to that single (accessible) org; otherwise the
     // standard condition spans every accessible org.
-    const orgCond = query.orgId
-      ? eq(auditLogsTable.orgId, query.orgId)
-      : auth.orgCondition(auditLogsTable.orgId);
-    const where = buildFilterConditions(orgCond, query);
+    //
+    // Unpinned, a partner-scope caller also gets its own partner-scoped rows
+    // (org_id NULL, partner_id = caller's partner — #7696). A pinned org is an
+    // explicit "this org's events" filter, so partner rows are not included.
+    const where = buildFilterConditions(scope.orgCond, query);
     // count(*) on audit_logs is 2-3s under RLS even with the org_timestamp
     // index. The dashboard widget that calls /logs?limit=5 doesn't need the
     // count — it never displays "X of Y total". Pass skipCount=true there.
     const skipCount = query.skipCount === 'true';
-    const hasFilters = !!(query.user || query.action || query.resource || query.from || query.to);
+    // The LATERAL fast path applies none of these filters, so any of them
+    // (userId included, #9671) must force the standard path.
+    const hasFilters = !!(query.userId || query.user || query.action || query.resource || query.from || query.to);
     // excludeActions is compatible with the fast path — it's applied inside the
     // LATERAL subquery before the per-org LIMIT. The standard path picks it up
     // via buildFilterConditions(orgCond, query) above.
-    const excludeActions = parseExcludeActions(query.excludeActions);
+    const excludeActions = parseCommaList(query.excludeActions);
     // Fast-path org list: a pinned ?orgId= scopes the LATERAL per-org scan to
     // that single org; otherwise it spans every accessible org.
     const fastPathOrgIds: string[] | null = query.orgId
@@ -609,15 +744,18 @@ function paginatedListHandler(
       !hasFilters &&
       fastPathOrgIds !== null &&
       fastPathOrgIds.length > 0;
+    const fastPathPartnerId = query.orgId ? null : auditPartnerScopeId(auth);
     const [total, rows] = await Promise.all([
       skipCount ? Promise.resolve(-1) : countRows(where),
       canUseFastPath
-        ? queryLatestPerOrg(fastPathOrgIds as string[], limit, excludeActions)
+        ? queryLatestPerOrg(fastPathOrgIds as string[], limit, excludeActions, fastPathPartnerId)
         : queryRows(where, limit, offset)
     ]);
 
     return c.json({
-      [dataKey]: rows.map(mapFn),
+      // Arrow wrapper, not `rows.map(mapFn)`: map's index argument would land
+      // in toFullEntry's `includeDetails` and drop details from row 0.
+      [dataKey]: rows.map((row) => mapFn(row)),
       pagination: {
         page,
         limit,
@@ -653,7 +791,7 @@ auditLogRoutes.get(
     const auth = c.get('auth');
     const { id } = c.req.valid('param');
 
-    const orgCond = auth.orgCondition(auditLogsTable.orgId);
+    const orgCond = auditLogReadCondition(auth);
     const conditions: SQL[] = [eq(auditLogsTable.id, id)];
     if (orgCond) conditions.push(orgCond);
 
@@ -700,10 +838,13 @@ auditLogRoutes.get(
     const query = c.req.valid('query');
     const { page, limit, offset } = getPagination(query);
 
-    const orgCond = auth.orgCondition(auditLogsTable.orgId);
-    const filterWhere = buildFilterConditions(orgCond, query);
-    const searchCond = buildSearchCondition(query.q);
-    const where = filterWhere ? and(filterWhere, searchCond) : searchCond;
+    // Same org scope as the list and the export: honours a pinned ?orgId=
+    // (403 when inaccessible) so search results match the exported file.
+    const scope = resolveListOrgScope(auth, query.orgId);
+    if (scope.denied) {
+      return c.json({ error: 'Access denied' }, 403);
+    }
+    const where = buildListWhere(scope.orgCond, query);
 
     const [total, rows] = await Promise.all([
       countRows(where),
@@ -733,7 +874,7 @@ auditLogRoutes.post(
     const auth = c.get('auth');
     const body = c.req.valid('json');
 
-    const orgCond = auth.orgCondition(auditLogsTable.orgId);
+    const orgCond = auditLogReadCondition(auth);
     const where = buildFilterConditions(orgCond, {
       ...(body.filters ?? {}),
       from: body.dateRange?.from,
@@ -772,8 +913,18 @@ auditLogRoutes.post(
 );
 
 // GET /export — used by AuditLogViewer export button (CSV download)
+// Accepts the same filter set as the list/search endpoints (#8366) and builds
+// the WHERE through the same helpers, so the file matches what the viewer shows.
 const exportGetSchema = z.object({
-  userId: z.string().guid().optional(),
+  userId: listLogsSchema.shape.userId,
+  user: listLogsSchema.shape.user,
+  action: listLogsSchema.shape.action,
+  resource: listLogsSchema.shape.resource,
+  from: listLogsSchema.shape.from,
+  to: listLogsSchema.shape.to,
+  orgId: listLogsSchema.shape.orgId,
+  excludeActions: listLogsSchema.shape.excludeActions,
+  q: searchSchema.shape.q.optional(),
   columns: z.string().optional(),
   includeDetails: z.enum(['true', 'false']).optional().default('true')
 });
@@ -785,30 +936,43 @@ auditLogRoutes.get(
   zValidator('query', exportGetSchema),
   async (c) => {
     const auth = c.get('auth');
-    const orgCond = auth.orgCondition(auditLogsTable.orgId);
+    const query = c.req.valid('query');
+    const { userId, columns, includeDetails: includeDetailsRaw } = query;
+    const scope = resolveListOrgScope(auth, query.orgId);
+    if (scope.denied) {
+      return c.json({ error: 'Access denied' }, 403);
+    }
 
-    const { userId, columns, includeDetails: includeDetailsRaw } = c.req.valid('query');
     const includeDetails = includeDetailsRaw !== 'false';
     const parsedColumns = columns
       ?.split(',')
       .map((column) => column.trim())
       .filter((column): column is AuditExportColumn => (auditExportColumns as readonly string[]).includes(column));
     const exportColumns = normalizeExportColumns(parsedColumns, includeDetails);
-    const conditions: SQL[] = [];
-    if (orgCond) conditions.push(orgCond);
-    if (userId) conditions.push(eq(auditLogsTable.actorId, userId));
-
-    const where = conditions.length > 0 ? and(...conditions) : undefined;
+    const where = buildListWhere(scope.orgCond, query);
     const rows = await queryRows(where, 10000, 0);
 
+    // #9672: record the export in the trail that was exported. A partner
+    // technician has no orgId of their own, so a pinned (accessible - checked
+    // above) org wins; with none pinned the row stays partner-level.
     writeRouteAudit(c, {
-      orgId: auth.orgId,
+      orgId: query.orgId ?? auth.orgId,
       action: 'audit_logs.export',
       resourceType: 'audit_log',
       details: {
         format: 'csv',
         rowCount: rows.length,
-        filters: { userId: userId ?? null },
+        filters: {
+          userId: userId ?? null,
+          user: query.user ?? null,
+          action: query.action ?? null,
+          resource: query.resource ?? null,
+          from: query.from ?? null,
+          to: query.to ?? null,
+          orgId: query.orgId ?? null,
+          excludeActions: query.excludeActions ?? null,
+          q: query.q ?? null
+        },
         columns: exportColumns,
         includeDetails
       }
@@ -828,7 +992,7 @@ auditLogRoutes.get(
   async (c) => {
     const auth = c.get('auth');
     const query = c.req.valid('query');
-    const orgCond = auth.orgCondition(auditLogsTable.orgId);
+    const orgCond = auditLogReadCondition(auth);
     const rows = await fetchAllForReports(orgCond, query);
 
     const actionsPerUser = summarizeUsers(rows);
@@ -852,7 +1016,7 @@ auditLogRoutes.get(
   async (c) => {
     const auth = c.get('auth');
     const query = c.req.valid('query');
-    const orgCond = auth.orgCondition(auditLogsTable.orgId);
+    const orgCond = auditLogReadCondition(auth);
     const allRows = await fetchAllForReports(orgCond, query);
 
     const securityRows = allRows.filter((r) => securityActions.has(r.log.action));
@@ -880,7 +1044,7 @@ auditLogRoutes.get(
   async (c) => {
     const auth = c.get('auth');
     const query = c.req.valid('query');
-    const orgCond = auth.orgCondition(auditLogsTable.orgId);
+    const orgCond = auditLogReadCondition(auth);
     const allRows = await fetchAllForReports(orgCond, query);
 
     const complianceRows = allRows.filter((r) =>
@@ -910,7 +1074,7 @@ auditLogRoutes.get(
   async (c) => {
     const auth = c.get('auth');
     const query = c.req.valid('query');
-    const orgCond = auth.orgCondition(auditLogsTable.orgId);
+    const orgCond = auditLogReadCondition(auth);
     const rows = await fetchAllForReports(orgCond, query);
 
     const byCategory = summarizeCategories(rows);

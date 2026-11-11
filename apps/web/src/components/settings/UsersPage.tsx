@@ -1,14 +1,33 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import '@/lib/i18n';
 import UserList, { type User } from './UserList';
 import UserInviteForm, { type RoleOption } from './UserInviteForm';
-import { fetchWithAuth, useAuthStore } from '../../stores/auth';
+import OrgAccessFields, { type OrgAccessLevel } from './OrgAccessFields';
+import { fetchWithAuth, handleSessionExpired, useAuthStore } from '../../stores/auth';
+import { runAction, handleActionError } from '@/lib/runAction';
 import { useOrgStore } from '../../stores/orgStore';
 import { navigateTo } from '@/lib/navigation';
+import { useJwtClaims } from '../../lib/authScope';
 import AccessDenied from '../shared/AccessDenied';
+import { showToast } from '../shared/Toast';
 
 type ModalMode = 'closed' | 'invite' | 'edit' | 'remove' | 'resetMfa';
+
+/**
+ * #10111 — the user id in `#<userId>`. Wisp links a user as
+ * `/settings/users#<encodeURIComponent(id)>` (`wispEntityHref`), and that href
+ * is persisted on Wisp link rows, so this page owns resolving it.
+ */
+function userIdFromHash(hash: string): string | null {
+  const raw = hash.startsWith('#') ? hash.slice(1) : hash;
+  if (!raw) return null;
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
+}
 
 type InviteFormValues = {
   email: string;
@@ -18,15 +37,15 @@ type InviteFormValues = {
   orgIds?: string;
 };
 
-type Toast = {
-  id: string;
-  type: 'success' | 'warning' | 'error';
-  message: string;
-  inviteUrl?: string;
-};
-
 export default function UsersPage() {
   const { t } = useTranslation('settings');
+  // #6111 — session idle timeout lives on the Security tab of the partner
+  // (partner scope) or organization (org scope) settings page.
+  const jwt = useJwtClaims();
+  const securityHref =
+    jwt.status === 'resolved' && jwt.claims.scope === 'organization'
+      ? '/settings/organization#security'
+      : '/settings/partner#security';
   const currentUser = useAuthStore((s) => s.user);
   const organizations = useOrgStore((s) => s.organizations);
   const [users, setUsers] = useState<User[]>([]);
@@ -39,14 +58,40 @@ export default function UsersPage() {
   const [modalMode, setModalMode] = useState<ModalMode>('closed');
   const [selectedUser, setSelectedUser] = useState<User | null>(null);
   const [submitting, setSubmitting] = useState(false);
-  const [toasts, setToasts] = useState<Toast[]>([]);
+  // #7034: Edit-modal draft of the selected partner member's organization reach.
+  const [editOrgAccess, setEditOrgAccess] = useState<OrgAccessLevel>('none');
+  const [editOrgIds, setEditOrgIds] = useState<string[]>([]);
+  const [editOrgIdsError, setEditOrgIdsError] = useState<string>();
+  // #10111 — user selected by the URL hash (Wisp entity links).
+  const [linkedUserId, setLinkedUserId] = useState<string | null>(null);
+  // Scroll to the linked row once per navigation, not again after each
+  // refetch remounts the list. A hash navigation re-arms it.
+  const scrolledToUserIdRef = useRef<string | null>(null);
 
-  const addToast = useCallback((type: Toast['type'], message: string, inviteUrl?: string) => {
-    setToasts(prev => [...prev, { id: Date.now().toString(), type, message, inviteUrl }]);
+  useEffect(() => {
+    const applyHash = () => {
+      scrolledToUserIdRef.current = null;
+      setLinkedUserId(userIdFromHash(window.location.hash));
+    };
+    applyHash();
+    window.addEventListener('hashchange', applyHash);
+    return () => window.removeEventListener('hashchange', applyHash);
   }, []);
-
-  const dismissToast = useCallback((id: string) => {
-    setToasts(prev => prev.filter(t => t.id !== id));
+  // Shared toast helper (auto-dismisses). Only the manual-invite-link toast is
+  // sticky (duration 0) so the admin can still copy the link (#9603).
+  const addToast = useCallback((type: 'success' | 'warning' | 'error', message: string, inviteUrl?: string) => {
+    if (inviteUrl) {
+      showToast({
+        type,
+        message,
+        duration: 0,
+        copyValue: inviteUrl,
+        copyLabel: t('usersPage.toasts.copyLink'),
+        copiedLabel: t('usersPage.toasts.copied'),
+      });
+      return;
+    }
+    showToast({ type, message });
   }, [t]);
 
   const fetchUsers = useCallback(async () => {
@@ -82,6 +127,9 @@ export default function UsersPage() {
         // mfaStatus field, so UserList hides the column rather than mislabel it.
         mfaStatus: u.mfaStatus as User['mfaStatus'],
         mfaEnrollmentDeadline: (u.mfaEnrollmentDeadline as string | null | undefined) ?? null,
+        // #7034 — present only on partner-scope rows.
+        orgAccess: u.orgAccess as User['orgAccess'],
+        orgIds: (u.orgIds as string[] | null | undefined) ?? null,
       }));
       setUsers(rows);
     } catch (err) {
@@ -120,8 +168,16 @@ export default function UsersPage() {
 
   const handleEdit = (user: User) => {
     setSelectedUser(user);
+    setEditOrgAccess(user.orgAccess ?? 'none');
+    setEditOrgIds(user.orgIds ?? []);
+    setEditOrgIdsError(undefined);
     setModalMode('edit');
   };
+
+  // Organization access is a partner-membership field (absent on org-scope
+  // rows) and the API refuses changing your own, so the section is hidden then.
+  const canEditOrgAccess = (user: User | null): user is User =>
+    Boolean(user && user.orgAccess !== undefined && user.id !== currentUser?.id);
 
   const handleRemove = (user: User) => {
     setSelectedUser(user);
@@ -138,20 +194,21 @@ export default function UsersPage() {
 
     setSubmitting(true);
     try {
-      const response = await fetchWithAuth(`/users/${selectedUser.id}/mfa/reset`, {
-        method: 'POST'
+      await runAction({
+        request: () =>
+          fetchWithAuth(`/users/${selectedUser.id}/mfa/reset`, {
+            method: 'POST'
+          }),
+        errorFallback: t('usersPage.errors.resetMfa'),
+        onUnauthorized: handleSessionExpired,
       });
-
-      if (!response.ok) {
-        const body = await response.json().catch(() => null);
-        throw new Error(body?.error || t('usersPage.errors.resetMfa'));
-      }
 
       await fetchUsers();
       handleCloseModal();
       addToast('success', t('usersPage.toasts.mfaReset', { email: selectedUser.email }));
     } catch (err) {
-      addToast('error', err instanceof Error ? err.message : t('usersPage.errors.resetMfa'));
+      // runAction toasted the failure; the confirmation modal stays open.
+      handleActionError(err, t('usersPage.errors.resetMfa'));
     } finally {
       setSubmitting(false);
     }
@@ -159,17 +216,15 @@ export default function UsersPage() {
 
   const handleResendInvite = async (user: User) => {
     try {
-      const response = await fetchWithAuth('/users/resend-invite', {
-        method: 'POST',
-        body: JSON.stringify({ userId: user.id })
+      const body = await runAction<{ inviteEmailSent?: boolean; inviteUrl?: string } | null>({
+        request: () =>
+          fetchWithAuth('/users/resend-invite', {
+            method: 'POST',
+            body: JSON.stringify({ userId: user.id })
+          }),
+        errorFallback: t('usersPage.errors.resendInvite'),
+        onUnauthorized: handleSessionExpired,
       });
-
-      if (!response.ok) {
-        const body = await response.json().catch(() => null);
-        throw new Error(body?.error || t('usersPage.errors.resendInvite'));
-      }
-
-      const body = await response.json().catch(() => null);
 
       if (body?.inviteEmailSent === false) {
         addToast(
@@ -181,7 +236,7 @@ export default function UsersPage() {
         addToast('success', t('usersPage.toasts.resent', { email: user.email }));
       }
     } catch (err) {
-      addToast('error', err instanceof Error ? err.message : t('usersPage.errors.resendInvite'));
+      handleActionError(err, t('usersPage.errors.resendInvite'));
     }
   };
 
@@ -210,17 +265,15 @@ export default function UsersPage() {
           .filter(Boolean);
       }
 
-      const response = await fetchWithAuth('/users/invite', {
-        method: 'POST',
-        body: JSON.stringify(payload)
+      const body = await runAction<{ inviteEmailSent?: boolean; inviteUrl?: string } | null>({
+        request: () =>
+          fetchWithAuth('/users/invite', {
+            method: 'POST',
+            body: JSON.stringify(payload)
+          }),
+        errorFallback: t('usersPage.errors.sendInvite'),
+        onUnauthorized: handleSessionExpired,
       });
-
-      if (!response.ok) {
-        const body = await response.json().catch(() => null);
-        throw new Error(body?.error || t('usersPage.errors.sendInvite'));
-      }
-
-      const body = await response.json().catch(() => null);
 
       await fetchUsers();
       handleCloseModal();
@@ -235,7 +288,7 @@ export default function UsersPage() {
         addToast('success', t('usersPage.toasts.inviteSent', { email: values.email }));
       }
     } catch (err) {
-      addToast('error', err instanceof Error ? err.message : t('usersPage.errors.sendInvite'));
+      handleActionError(err, t('usersPage.errors.sendInvite'));
     } finally {
       setSubmitting(false);
     }
@@ -244,7 +297,21 @@ export default function UsersPage() {
   const handleEditSubmit = async (values: InviteFormValues) => {
     if (!selectedUser) return;
 
+    const orgAccessEditable = canEditOrgAccess(selectedUser);
+    if (orgAccessEditable && editOrgAccess === 'selected' && editOrgIds.length === 0) {
+      setEditOrgIdsError(t('userInviteForm.validation.orgRequired'));
+      return;
+    }
+    const previousOrgIds = selectedUser.orgIds ?? [];
+    const orgAccessChanged =
+      orgAccessEditable &&
+      (editOrgAccess !== selectedUser.orgAccess ||
+        (editOrgAccess === 'selected' &&
+          (editOrgIds.length !== previousOrgIds.length ||
+            editOrgIds.some(id => !previousOrgIds.includes(id)))));
+
     setSubmitting(true);
+    let failureFallback = t('usersPage.errors.updateRole');
     try {
       // Role lives on partner_users / organization_users; the dedicated
       // POST /users/:id/role endpoint writes it. selectedUser.role is the
@@ -255,19 +322,51 @@ export default function UsersPage() {
       // audit-log entry on no-op saves.
       const currentRoleId = roles.find(r => r.name === selectedUser.role)?.id;
       if (values.roleId && values.roleId !== currentRoleId) {
-        const roleRes = await fetchWithAuth(`/users/${selectedUser.id}/role`, {
-          method: 'POST',
-          body: JSON.stringify({ roleId: values.roleId })
+        await runAction({
+          request: () =>
+            fetchWithAuth(`/users/${selectedUser.id}/role`, {
+              method: 'POST',
+              body: JSON.stringify({ roleId: values.roleId })
+            }),
+          errorFallback: t('usersPage.errors.updateRole'),
+          successMessage: t('usersPage.toasts.roleUpdated'),
+          onUnauthorized: handleSessionExpired,
         });
-        if (!roleRes.ok) {
-          throw new Error(t('usersPage.errors.updateRole'));
+        // The role is committed. Record it so that if the org-access call
+        // below fails, the still-open modal reflects the new role and a retry
+        // does not POST the role (and audit it) a second time.
+        const newRoleName = roles.find(r => r.id === values.roleId)?.name;
+        if (newRoleName) {
+          setSelectedUser(prev => (prev ? { ...prev, role: newRoleName } : prev));
         }
+      }
+
+      // #7034: organization access has its own endpoint (partner scope only),
+      // likewise only called when it actually changed.
+      if (orgAccessChanged) {
+        failureFallback = t('usersPage.errors.updateOrgAccess');
+        await runAction({
+          request: () =>
+            fetchWithAuth(`/users/${selectedUser.id}/org-access`, {
+              method: 'POST',
+              body: JSON.stringify(
+                editOrgAccess === 'selected'
+                  ? { orgAccess: editOrgAccess, orgIds: editOrgIds }
+                  : { orgAccess: editOrgAccess }
+              )
+            }),
+          errorFallback: t('usersPage.errors.updateOrgAccess'),
+          successMessage: t('usersPage.toasts.orgAccessUpdated'),
+          onUnauthorized: handleSessionExpired,
+        });
       }
 
       await fetchUsers();
       handleCloseModal();
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('usersPage.errors.generic'));
+      // The page `error` banner renders behind this z-50 modal (#3531), so the
+      // failure is toasted by runAction and the edit modal stays open.
+      handleActionError(err, failureFallback);
     } finally {
       setSubmitting(false);
     }
@@ -278,18 +377,22 @@ export default function UsersPage() {
 
     setSubmitting(true);
     try {
-      const response = await fetchWithAuth(`/users/${selectedUser.id}`, {
-        method: 'DELETE'
+      await runAction({
+        request: () =>
+          fetchWithAuth(`/users/${selectedUser.id}`, {
+            method: 'DELETE'
+          }),
+        successMessage: t('usersPage.toasts.userRemoved', { name: selectedUser.name || selectedUser.email }),
+        errorFallback: t('usersPage.errors.removeUser'),
+        onUnauthorized: handleSessionExpired,
       });
-
-      if (!response.ok) {
-        throw new Error(t('usersPage.errors.removeUser'));
-      }
 
       await fetchUsers();
       handleCloseModal();
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('usersPage.errors.generic'));
+      // The page `error` banner renders behind the remove modal's z-50 scrim
+      // (#3531): runAction toasts instead, and the modal stays open to retry.
+      handleActionError(err, t('usersPage.errors.removeUser'));
     } finally {
       setSubmitting(false);
     }
@@ -330,6 +433,15 @@ export default function UsersPage() {
       <div>
         <h1 className="text-xl font-semibold tracking-tight">{t('usersPage.title')}</h1>
         <p className="text-muted-foreground">{t('usersPage.description')}</p>
+        <p className="mt-1 text-sm text-muted-foreground">
+          <a
+            href={securityHref}
+            className="underline underline-offset-2 hover:text-foreground"
+            data-testid="users-session-timeout-pointer"
+          >
+            {t('usersPage.sessionTimeoutPointer')}
+          </a>
+        </p>
       </div>
 
       {error && (
@@ -338,8 +450,22 @@ export default function UsersPage() {
         </div>
       )}
 
+      {/* #10111 — a linked user outside this viewer's list: say so rather
+          than land silently on the unfiltered list. */}
+      {linkedUserId && !users.some(u => u.id === linkedUserId) && (
+        <div
+          role="status"
+          data-testid="users-linked-user-missing"
+          className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-800 dark:text-amber-300"
+        >
+          {t('usersPage.linkedUserMissing')}
+        </div>
+      )}
+
       <UserList
         users={users}
+        highlightedUserId={linkedUserId}
+        scrolledToUserIdRef={scrolledToUserIdRef}
         currentUserId={currentUser?.id}
         onInvite={handleInvite}
         onEdit={handleEdit}
@@ -365,8 +491,8 @@ export default function UsersPage() {
 
       {/* Edit Modal */}
       {modalMode === 'edit' && selectedUser && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/80 px-4 py-8">
-          <div className="w-full max-w-lg rounded-lg border bg-card p-6 shadow-xs">
+        <div className="fixed inset-0 z-50 flex overflow-y-auto bg-background/80 px-4 py-8">
+          <div className="m-auto w-full max-w-lg rounded-lg border bg-card p-6 shadow-xs">
             <div className="space-y-1">
               <h2 className="text-lg font-semibold">{t('usersPage.edit.title')}</h2>
               <p className="text-sm text-muted-foreground">
@@ -416,6 +542,21 @@ export default function UsersPage() {
                   ))}
                 </select>
               </div>
+
+              {canEditOrgAccess(selectedUser) && (
+                <OrgAccessFields
+                  idPrefix="edit"
+                  orgAccess={editOrgAccess}
+                  orgIds={editOrgIds}
+                  organizations={organizations.map(o => ({ id: o.id, name: o.name }))}
+                  onChange={(access, ids) => {
+                    setEditOrgAccess(access);
+                    setEditOrgIds(ids);
+                    setEditOrgIdsError(undefined);
+                  }}
+                  orgIdsError={editOrgIdsError}
+                />
+              )}
 
               <div className="flex flex-wrap items-center justify-end gap-3">
                 <button
@@ -495,68 +636,6 @@ export default function UsersPage() {
               </button>
             </div>
           </div>
-        </div>
-      )}
-
-      {/* Toast notifications */}
-      {toasts.length > 0 && (
-        <div className="fixed bottom-4 right-4 z-50 flex flex-col gap-2 max-w-md">
-          {toasts.map(toast => (
-            <div
-              key={toast.id}
-              className={`relative rounded-lg px-4 py-3 pr-10 shadow-lg ${
-                toast.type === 'success'
-                  ? 'bg-green-600 text-white'
-                  : toast.type === 'warning'
-                    ? 'border border-yellow-500/40 bg-yellow-50 text-yellow-900 dark:bg-yellow-950 dark:text-yellow-100'
-                    : 'bg-destructive text-destructive-foreground'
-              }`}
-            >
-              <button
-                type="button"
-                onClick={() => dismissToast(toast.id)}
-                className={`absolute top-2 right-2 rounded p-1 transition hover:opacity-70 ${
-                  toast.type === 'warning'
-                    ? 'text-yellow-700 dark:text-yellow-300'
-                    : 'text-current'
-                }`}
-                aria-label={t('common:shared.toast.dismiss')}
-              >
-                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="h-4 w-4">
-                  <path d="M6.28 5.22a.75.75 0 00-1.06 1.06L8.94 10l-3.72 3.72a.75.75 0 101.06 1.06L10 11.06l3.72 3.72a.75.75 0 101.06-1.06L11.06 10l3.72-3.72a.75.75 0 00-1.06-1.06L10 8.94 6.28 5.22z" />
-                </svg>
-              </button>
-              <p className="text-sm font-medium">{toast.message}</p>
-              {toast.inviteUrl && (
-                <div className="mt-2 flex items-center gap-2">
-                  <input
-                    type="text"
-                    readOnly
-                    value={toast.inviteUrl}
-                    className="min-w-0 flex-1 rounded border border-yellow-400/50 bg-white/80 px-2 py-1 text-xs text-yellow-900 dark:bg-black/20 dark:text-yellow-100"
-                    onFocus={e => e.target.select()}
-                  />
-                  <button
-                    type="button"
-                    onClick={async () => {
-                      try {
-                        await navigator.clipboard.writeText(toast.inviteUrl!);
-                        const btn = document.getElementById(`copy-btn-${toast.id}`);
-                        if (btn) {
-                          btn.textContent = t('usersPage.toasts.copied');
-                          setTimeout(() => { btn.textContent = t('usersPage.toasts.copyLink'); }, 2000);
-                        }
-                      } catch { /* clipboard not available */ }
-                    }}
-                    id={`copy-btn-${toast.id}`}
-                    className="shrink-0 rounded bg-yellow-600 px-2 py-1 text-xs font-medium text-white transition hover:bg-yellow-700"
-                  >
-                    {t('usersPage.toasts.copyLink')}
-                  </button>
-                </div>
-              )}
-            </div>
-          ))}
         </div>
       )}
     </div>

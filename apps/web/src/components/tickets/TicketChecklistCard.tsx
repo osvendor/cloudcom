@@ -11,6 +11,7 @@ import {
   listChecklist,
   patchChecklistItem,
   reorderChecklist,
+  saveChecklistAsTemplate,
   type ChecklistItem,
 } from '../../lib/api/ticketChecklist';
 import {
@@ -33,6 +34,13 @@ interface Props {
    *  on those counts would then silently skip it at exactly the moment it is
    *  least safe to. Hosts must fail CLOSED on `known: false`. */
   onCountsChange?: (counts: { done: number; total: number; known: boolean }) => void;
+  /** Offer "all organizations" when saving the steps as a template (#9180). The
+   *  host decides (partner scope + canManagePartnerWide); the server re-checks. */
+  canSavePartnerWide?: boolean;
+  /** Merged (tombstone) ticket: every write is refused with 409 TICKET_MERGED,
+   *  so render the steps read-only (#10025). Implies the `compact` hide-set and
+   *  additionally disables ticking and editing. */
+  readOnly?: boolean;
 }
 
 const FRIENDLY: Record<string, string> = {
@@ -40,7 +48,7 @@ const FRIENDLY: Record<string, string> = {
   CHECKLIST_OPERATOR_STEP_WAITING: 'errors.operatorStepWaiting',
 };
 
-export default function TicketChecklistCard({ ticketId, mode = 'full', onCountsChange }: Props) {
+export default function TicketChecklistCard({ ticketId, mode = 'full', onCountsChange, canSavePartnerWide = false, readOnly = false }: Props) {
   const { t } = useTranslation('checklists');
   const [items, setItems] = useState<ChecklistItem[]>([]);
   const [loading, setLoading] = useState(true);
@@ -58,10 +66,22 @@ export default function TicketChecklistCard({ ticketId, mode = 'full', onCountsC
   const [pickerOpen, setPickerOpen] = useState(false);
   const [pickedTemplateId, setPickedTemplateId] = useState('');
   const [applyMode, setApplyMode] = useState<'append' | 'replace_unticked'>('append');
+  const [saveOpen, setSaveOpen] = useState(false);
+  const [saveName, setSaveName] = useState('');
+  const [savePartnerWide, setSavePartnerWide] = useState(false);
 
   const friendly = useCallback(
     (code: string) => (FRIENDLY[code] ? t(/* i18n-dynamic */ FRIENDLY[code]) : undefined),
     [t],
+  );
+  // Apply refuses with the same waiting-step code as delete (#6931), but the
+  // delete wording ("can't be deleted") would be wrong for a template apply.
+  const applyFriendly = useCallback(
+    (code: string) =>
+      code === 'CHECKLIST_OPERATOR_STEP_WAITING'
+        ? t('templates.errors.operatorStepWaiting')
+        : friendly(code),
+    [t, friendly],
   );
 
   const refresh = useCallback(async () => {
@@ -98,11 +118,14 @@ export default function TicketChecklistCard({ ticketId, mode = 'full', onCountsC
     setPickerOpen(false);
     setPickedTemplateId('');
     setApplyMode('append');
+    setSaveOpen(false);
+    setSaveName('');
+    setSavePartnerWide(false);
   }, [ticketId]);
 
   const done = items.filter((i) => i.done).length;
   const total = items.length;
-  const compactMode = mode === 'compact';
+  const compactMode = mode === 'compact' || readOnly;
 
   /**
    * A failed template fetch is NOT equivalent to "this MSP has no templates".
@@ -269,7 +292,7 @@ export default function TicketChecklistCard({ ticketId, mode = 'full', onCountsC
             templateId: pickedTemplateId,
             mode: applyMode,
           }),
-        { errorFallback: t('templates.errors.applyFailed') },
+        { errorFallback: t('templates.errors.applyFailed'), friendly: applyFriendly },
       );
       // Refresh from the returned summary rather than re-fetching.
       setItems(summary.items);
@@ -283,13 +306,52 @@ export default function TicketChecklistCard({ ticketId, mode = 'full', onCountsC
     }
   };
 
+  const saveFriendly = useCallback(
+    (code: string) => (code === 'CHECKLIST_NO_STEPS_TO_SAVE' ? t('templates.errors.noSteps') : undefined),
+    [t],
+  );
+
+  const submitSaveAsTemplate = async () => {
+    const name = saveName.trim();
+    if (!name || busy) return;
+    setBusy(true);
+    try {
+      const result = await runClientAction(
+        () =>
+          saveChecklistAsTemplate(fetchWithAuth, ticketId, {
+            name,
+            ownerScope: savePartnerWide ? 'partner' : 'organization',
+          }),
+        {
+          errorFallback: t('templates.errors.saveAsFailed'),
+          friendly: saveFriendly,
+          successMessage: (r) => {
+            const base = t('templates.saveAs.success', { name: r.template.name });
+            return r.skipped.operator + r.skipped.duplicates > 0
+              ? `${base} ${t('templates.saveAs.skipped', r.skipped)}`
+              : base;
+          },
+        },
+      );
+      // The new template becomes pickable without a reload (active by default).
+      setTemplates((prev) => (prev === null ? prev : [...prev, result.template]));
+      setSaveOpen(false);
+      setSaveName('');
+      setSavePartnerWide(false);
+    } catch (err) {
+      handleActionError(err, t('templates.errors.saveAsFailed'));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   // A ticket with no checklist gains no clutter — unless a template exists, in
   // which case the card is the only reachable way to get one. A ticket whose
   // checklist FAILED to load is neither, and must not disappear silently.
   const hasTemplates = Array.isArray(templates) && templates.length > 0;
   // `templatesFailed` keeps the card mounted: "we could not find out" must not
   // render identically to "there are none".
-  if (!loading && !loadFailed && total === 0 && mode === 'full' && !hasTemplates && !templatesFailed) {
+  if (!loading && !loadFailed && total === 0 && (readOnly || (mode === 'full' && !hasTemplates && !templatesFailed))) {
     return null;
   }
 
@@ -339,8 +401,8 @@ export default function TicketChecklistCard({ ticketId, mode = 'full', onCountsC
               <li key={item.id} className="text-xs" data-testid={`ticket-checklist-item-${item.id}`}>
                 {editing ? (
                   <div className="space-y-1 rounded-md border bg-muted/30 p-1.5">
-                    {item.done && (
-                      <p className="text-[11px] text-warning" data-testid="ticket-checklist-edit-warning">
+                    {item.done && editLabel.trim() !== item.label && (
+                      <p className="text-[11px] text-warning-ink" data-testid="ticket-checklist-edit-warning">
                         {t('editDoneWarning')}
                       </p>
                     )}
@@ -387,7 +449,7 @@ export default function TicketChecklistCard({ ticketId, mode = 'full', onCountsC
                       type="checkbox"
                       checked={item.done}
                       onChange={() => void toggle(item)}
-                      disabled={busy}
+                      disabled={busy || readOnly}
                       className="mt-0.5 shrink-0"
                       aria-label={item.label}
                       data-testid={`ticket-checklist-toggle-${item.id}`}
@@ -443,14 +505,16 @@ export default function TicketChecklistCard({ ticketId, mode = 'full', onCountsC
                           </button>
                         </>
                       )}
-                      <button
-                        type="button"
-                        onClick={() => openEdit(item)}
-                        className="rounded px-1 py-0.5 text-xs hover:bg-muted"
-                        data-testid={`ticket-checklist-edit-${item.id}`}
-                      >
-                        {t('actions.edit')}
-                      </button>
+                      {!readOnly && (
+                        <button
+                          type="button"
+                          onClick={() => openEdit(item)}
+                          className="rounded px-1 py-0.5 text-xs hover:bg-muted"
+                          data-testid={`ticket-checklist-edit-${item.id}`}
+                        >
+                          {t('actions.edit')}
+                        </button>
+                      )}
                       {!compact && (
                         <button
                           type="button"
@@ -595,6 +659,66 @@ export default function TicketChecklistCard({ ticketId, mode = 'full', onCountsC
               data-testid="ticket-checklist-apply-template"
             >
               {t('templates.apply')}
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Save the current steps as a new template (#9180). Needs steps to save. */}
+      {!compact && total > 0 && (
+        <div className="mt-2">
+          {saveOpen ? (
+            <div className="space-y-1.5 rounded-md border bg-muted/30 p-1.5" data-testid="ticket-checklist-save-template-form">
+              <input
+                type="text"
+                value={saveName}
+                onChange={(e) => setSaveName(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') void submitSaveAsTemplate(); }}
+                maxLength={200}
+                placeholder={t('templates.saveAs.name')}
+                aria-label={t('templates.saveAs.name')}
+                className="w-full rounded-md border bg-background px-2 py-1 text-xs"
+                data-testid="ticket-checklist-save-template-name"
+              />
+              {canSavePartnerWide && (
+                <label className="flex items-center gap-1.5 text-[11px]">
+                  <input
+                    type="checkbox"
+                    checked={savePartnerWide}
+                    onChange={(e) => setSavePartnerWide(e.target.checked)}
+                    data-testid="ticket-checklist-save-template-partner"
+                  />
+                  {t('templates.saveAs.allOrganizations')}
+                </label>
+              )}
+              <div className="flex justify-end gap-1">
+                <button
+                  type="button"
+                  onClick={() => setSaveOpen(false)}
+                  className="rounded px-1.5 py-0.5 text-xs hover:bg-muted"
+                  data-testid="ticket-checklist-save-template-cancel"
+                >
+                  {t('actions.cancel')}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void submitSaveAsTemplate()}
+                  disabled={!saveName.trim() || busy}
+                  className="rounded-md border px-2 py-0.5 text-xs hover:bg-muted disabled:opacity-50"
+                  data-testid="ticket-checklist-save-template-submit"
+                >
+                  {t('templates.saveAs.submit')}
+                </button>
+              </div>
+            </div>
+          ) : (
+            <button
+              type="button"
+              onClick={() => setSaveOpen(true)}
+              className="text-xs underline text-muted-foreground hover:text-foreground"
+              data-testid="ticket-checklist-save-template"
+            >
+              {t('templates.saveAs.cta')}
             </button>
           )}
         </div>

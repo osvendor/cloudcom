@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -71,6 +72,9 @@ func mutateSecretsAndPersist(mutate func(map[string]any)) error {
 	defer persistMu.Unlock()
 
 	path := secretsFilePath()
+	if err := checkConfigTarget(path); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return err
 	}
@@ -108,7 +112,11 @@ func mutateSecretsAndPersist(mutate func(map[string]any)) error {
 // write-then-verify: a Save that returned nil but produced an unreadable or
 // truncated file must not be treated as durable.
 func ReadPersistedCredentials() (*PersistedCredentials, error) {
-	return readPersistedCredentialsFrom(secretsFilePath())
+	path := secretsFilePath()
+	if err := checkConfigTarget(path); err != nil {
+		return nil, err
+	}
+	return readPersistedCredentialsFrom(path)
 }
 
 // readPersistedCredentialsAt reads the credential state from the secrets file
@@ -123,7 +131,12 @@ func readPersistedCredentialsFrom(path string) (*PersistedCredentials, error) {
 	sv := viper.New()
 	sv.SetConfigFile(path)
 	sv.SetConfigType("yaml")
-	if err := sv.ReadInConfig(); err != nil {
+	// The machine-wide secrets.yaml is read only through the trust check.
+	data, err := readConfigFileBytes(path)
+	if err != nil {
+		return nil, fmt.Errorf("reading secrets file: %w", err)
+	}
+	if err := sv.ReadConfig(bytes.NewReader(data)); err != nil {
 		return nil, fmt.Errorf("reading secrets file: %w", err)
 	}
 
@@ -211,15 +224,22 @@ func PromotePendingCredentials(authToken, watchdogAuthToken, helperAuthToken str
 		return fmt.Errorf("promoted credentials failed readback verification")
 	}
 
-	// The Breeze Helper runs as the logged-in user and cannot read the root-only
-	// secrets.yaml, so helper_auth_token is deliberately exempted from stripping
-	// and also lives in agent.yaml (see secretKeyAllowedInAgentYAML). Promoting
-	// only into secrets.yaml would leave the Helper reading the SUPERSEDED token
-	// and 401ing as soon as its 5-minute grace lapsed — the same stranding bug,
-	// one component over.
-	if err := SetAndPersist(secretKeyHelperAuthToken, helperAuthToken); err != nil {
-		return fmt.Errorf("persisting rotated helper token to agent config: %w", err)
+	// The Breeze Helper runs as the logged-in user and cannot read the
+	// root-only secrets.yaml, and must never find the token in the
+	// world-readable agent.yaml either. On Windows the caller pushes the
+	// rotated token to the console-session Assist over IPC
+	// (Heartbeat.sendHelperTokenUpdate). On Unix the Helper reads the
+	// dedicated, group-scoped helper_token.yaml (see helpertoken_unix.go),
+	// rewritten here — a no-op on Windows. Skipping this would leave the Helper
+	// on the SUPERSEDED token, 401ing once its 5-minute grace lapsed. Uses the
+	// same config-file resolution as the secrets.yaml write above
+	// (mutateSecretsAndPersist -> secretsFilePath -> viper.ConfigFileUsed()).
+	if err := writeHelperTokenFileFor(viper.ConfigFileUsed(), helperAuthToken); err != nil {
+		return fmt.Errorf("persisting rotated helper token file: %w", err)
 	}
+	// The promoted set supersedes any helper token an older agent kept in
+	// agent.yaml; the rotation recorded at scrub time is done.
+	clearHelperTokenRotationOwed()
 	return nil
 }
 

@@ -1,5 +1,6 @@
 import { and, desc, eq, gte, inArray, lte, sql, type SQL } from 'drizzle-orm';
-import * as dbModule from '../../db';
+import { db, withSystemDbAccessContext, withSystemDbAccessContextIsolated } from '../../db';
+import { reportBackupDbFallback } from './dbFallbackReport';
 import {
   backupJobs as backupJobsTable,
   backupSnapshots as backupSnapshotsTable,
@@ -9,7 +10,9 @@ import {
 import { createAuditLogAsync } from '../../services/auditService';
 import { recordBackupDispatchFailure } from '../../services/backupMetrics';
 import { resolveBackupProviderConfig, resolveBackupDestinationError, type BackupProviderConfig } from '../../services/backupProviderConfig';
+import { backupReadCredentialPayload } from '../../services/backupCommandCredentials';
 import { queueCommandForExecution } from '../../services/commandQueue';
+import type { AiOriginRef } from '@breeze/shared';
 import { publishEvent } from '../../services/eventBus';
 import { BACKUP_LOW_READINESS_THRESHOLD } from './constants';
 import {
@@ -38,19 +41,15 @@ import {
   captureRecoveryAuthorizationSubject,
   type CapturedRecoveryAuthorizationSubject,
 } from '../../services/recoveryAuthorizationSubject';
+import { isBackupHelperUpdateRequiredError } from '../../services/backupReadHelperGate';
+import { ATTESTATION_FAILED_VERIFICATION_REASON } from '../../services/backupAttestationFailureSettlement';
 
-const { db } = dbModule;
-const runWithSystemDbAccess = async <T>(fn: () => Promise<T>): Promise<T> => {
-  const withSystem = dbModule.withSystemDbAccessContext;
-  return typeof withSystem === 'function' ? withSystem(fn) : fn();
-};
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-export { BACKUP_LOW_READINESS_THRESHOLD } from './constants';
+export { BACKUP_HIGH_READINESS_THRESHOLD, BACKUP_LOW_READINESS_THRESHOLD } from './constants';
 export const BACKUP_READINESS_RECOVERY_THRESHOLD = 75;
-export const BACKUP_HIGH_READINESS_THRESHOLD = 85;
 export const BACKUP_RECENT_COVERAGE_DAYS = 30;
 export const BACKUP_MAX_RECENT_VERIFICATIONS = 12;
 
@@ -74,6 +73,8 @@ type VerificationFilters = {
   limit?: number;
   excludeSimulated?: boolean;
   allowedSiteIds?: readonly string[];
+  /** Called when the database read failed, so a caller can tell the fallback from a real empty result. */
+  onDbReadFailure?: () => void;
 };
 
 export type RunBackupVerificationInput = {
@@ -84,11 +85,13 @@ export type RunBackupVerificationInput = {
   snapshotId?: string;
   source: string;
   requestedBy?: string | null;
+  /** Who decided this command, when an AI surface did (`requireAiOrigin`); stamped on the command row. */
+  aiOrigin?: AiOriginRef;
 };
 
 export type RunScheduledBackupVerificationInput = Omit<
   RunBackupVerificationInput,
-  'snapshotId' | 'requestedBy' | 'source'
+  'snapshotId' | 'requestedBy' | 'source' | 'aiOrigin'
 > & {
   backupJobId: string;
   source: 'post-backup-integrity-check' | 'weekly-test-restore';
@@ -219,6 +222,7 @@ function normalizeDbSnapshotRow(row: {
   fileCount: number | null;
   label: string | null;
   location: string | null;
+  integrityStatus?: string | null;
 }): BackupSnapshot {
   return {
     id: row.id,
@@ -231,6 +235,7 @@ function normalizeDbSnapshotRow(row: {
     fileCount: row.fileCount,
     label: row.label,
     location: row.location,
+    integrityStatus: row.integrityStatus ?? null,
   };
 }
 
@@ -312,7 +317,7 @@ async function listBackupVerificationsFromDb(
   }
 
   try {
-    const rows = await runWithSystemDbAccess(() => db
+    const rows = await withSystemDbAccessContextIsolated(() => db
       .select()
       .from(backupVerificationsTable)
       .where(and(...conditions))
@@ -326,7 +331,8 @@ async function listBackupVerificationsFromDb(
       sizeBytes: row.sizeBytes as number | null,
     }));
   } catch (error) {
-    console.warn('[backupVerification] DB verification read failed; falling back to memory:', error);
+    reportBackupDbFallback('[backupVerification] DB verification read failed; falling back to memory', error);
+    filters.onDbReadFailure?.();
     if (filters.allowedSiteIds) return [];
     return null;
   }
@@ -337,7 +343,7 @@ export async function persistVerificationToDb(row: BackupVerification): Promise<
   if (row.snapshotId && !isUuid(row.snapshotId)) return;
 
   try {
-    await runWithSystemDbAccess(() => db.insert(backupVerificationsTable).values({
+    await withSystemDbAccessContextIsolated(() => db.insert(backupVerificationsTable).values({
       id: row.id,
       orgId: row.orgId,
       deviceId: row.deviceId,
@@ -366,14 +372,14 @@ export async function persistVerificationToDb(row: BackupVerification): Promise<
       }
     }));
   } catch (error) {
-    console.warn('[backupVerification] DB verification write failed; keeping memory record only:', error);
+    reportBackupDbFallback('[backupVerification] DB verification write failed; keeping memory record only', error);
   }
 }
 
 async function resolveSnapshot(orgId: string, snapshotId: string): Promise<BackupSnapshot> {
   if (supportsDbOrg(orgId) && isUuid(snapshotId)) {
     try {
-      const [row] = await runWithSystemDbAccess(() => db
+      const [row] = await withSystemDbAccessContextIsolated(() => db
         .select()
         .from(backupSnapshotsTable)
         .where(and(
@@ -389,7 +395,7 @@ async function resolveSnapshot(orgId: string, snapshotId: string): Promise<Backu
         });
       }
     } catch (error) {
-      console.warn('[backupVerification] DB snapshot lookup failed; falling back to memory:', error);
+      reportBackupDbFallback('[backupVerification] DB snapshot lookup failed; falling back to memory', error);
     }
   }
 
@@ -417,7 +423,7 @@ async function resolveBackupJob(
   if (dbIdentityShape) {
     try {
       if (backupJobId) {
-        const [row] = await runWithSystemDbAccess(() => db
+        const [row] = await withSystemDbAccessContextIsolated(() => db
           .select()
           .from(backupJobsTable)
           .where(and(
@@ -441,7 +447,7 @@ async function resolveBackupJob(
           throw new Error('Backup job not found for organization');
         }
       } else {
-        const [row] = await runWithSystemDbAccess(() => db
+        const [row] = await withSystemDbAccessContextIsolated(() => db
           .select()
           .from(backupJobsTable)
           .where(and(
@@ -467,7 +473,7 @@ async function resolveBackupJob(
         throw error;
       }
       if (requireCurrentDbLineage) throw error;
-      console.warn('[backupVerification] DB backup job lookup failed; falling back to memory:', error);
+      reportBackupDbFallback('[backupVerification] DB backup job lookup failed; falling back to memory', error);
     }
   }
 
@@ -501,7 +507,7 @@ async function resolveSnapshotForBackupJob(
 ): Promise<BackupSnapshot | null> {
   if (supportsDbOrg(orgId) && isUuid(backupJob.id)) {
     try {
-      const rows = await runWithSystemDbAccess(() => db
+      const rows = await withSystemDbAccessContextIsolated(() => db
         .select()
         .from(backupSnapshotsTable)
         .where(and(
@@ -521,7 +527,7 @@ async function resolveSnapshotForBackupJob(
       if (requireCurrentDbLineage) return null;
     } catch (error) {
       if (requireCurrentDbLineage) throw error;
-      console.warn('[backupVerification] DB snapshot lookup by job failed; falling back to memory:', error);
+      reportBackupDbFallback('[backupVerification] DB snapshot lookup by job failed; falling back to memory', error);
     }
   }
 
@@ -544,12 +550,12 @@ async function resolveVerificationProviderConfig(
 ): Promise<BackupProviderConfig | null> {
   if (supportsDbOrg(orgId) && isUuid(backupJob.configId)) {
     try {
-      const resolved = await runWithSystemDbAccess(() =>
+      const resolved = await withSystemDbAccessContextIsolated(() =>
         resolveBackupProviderConfig(backupJob.configId, orgId)
       );
       if (resolved) return resolved;
     } catch (error) {
-      console.warn('[backupVerification] DB provider config lookup failed; falling back to memory:', error);
+      reportBackupDbFallback('[backupVerification] DB provider config lookup failed; falling back to memory', error);
     }
   }
 
@@ -689,7 +695,7 @@ async function runBackupVerificationInternal(
         'verify',
       );
     const authorization = supportsDbOrg(input.orgId)
-      ? await runWithSystemDbAccess(authorizeCurrentLineage)
+      ? await withSystemDbAccessContext(authorizeCurrentLineage)
       : await authorizeCurrentLineage();
     const authorizedSnapshot = authorization.resources.resources.find(
       (resource) => resource.kind === 'snapshot' && resource.id === snapshot!.id,
@@ -713,6 +719,33 @@ async function runBackupVerificationInternal(
     );
   }
 
+  // A snapshot that failed its integrity check is never read again (delivery
+  // refuses every read of it). Record the verification as failed now, with
+  // that reason, instead of queueing a command that can only be refused.
+  if (snapshot?.integrityStatus === 'attestation_failed') {
+    const verification = addBackupVerification({
+      orgId: input.orgId,
+      deviceId: input.deviceId,
+      backupJobId: backupJob.id,
+      snapshotId,
+      verificationType: input.verificationType,
+      status: 'failed',
+      startedAt: now,
+      completedAt: new Date().toISOString(),
+      filesVerified: 0,
+      filesFailed: 0,
+      details: {
+        source: input.source,
+        requestedBy: input.requestedBy ?? null,
+        reason: ATTESTATION_FAILED_VERIFICATION_REASON,
+        failure: 'attestation_failed',
+      },
+    }, input.orgId);
+    await persistVerificationToDb(verification);
+    recordBackupDispatchFailure('backup_verification', 'attestation_failed');
+    return { verification, readiness: null };
+  }
+
   const commandType = input.verificationType === 'integrity' ? 'backup_verify' : 'backup_test_restore';
   const dispatchResult = await deps.queueCommand(
     input.deviceId,
@@ -720,10 +753,15 @@ async function runBackupVerificationInternal(
     {
       snapshotId: agentSnapshotId,
       verificationType: input.verificationType,
-      provider: providerConfig.provider,
-      providerConfig: providerConfig.providerConfig,
+      // A reference only: the destination is resolved when the command is
+      // delivered, so it is never written to the command row.
+      ...backupReadCredentialPayload(backupJob.configId, input.orgId, providerConfig.provider),
     },
-    { userId: input.requestedBy || undefined, expectedOrgId: input.orgId }
+    {
+      userId: input.requestedBy || undefined,
+      expectedOrgId: input.orgId,
+      ...(input.aiOrigin ? { aiOrigin: input.aiOrigin } : {}),
+    }
   );
 
   if (dispatchResult.error) {
@@ -760,13 +798,16 @@ async function runBackupVerificationInternal(
       recordBackupDispatchFailure('backup_verification', reason);
       throw new BackupVerificationDispatchError(dispatchResult.error, 409);
     }
+    const helperUpdateRequired = isBackupHelperUpdateRequiredError(dispatchResult.error);
     recordBackupDispatchFailure(
       'backup_verification',
-      dispatchResult.error.startsWith('Device is ') ? 'device_offline' : 'enqueue_failed'
+      helperUpdateRequired
+        ? 'helper_update_required'
+        : dispatchResult.error.startsWith('Device is ') ? 'device_offline' : 'enqueue_failed'
     );
     throw new BackupVerificationDispatchError(
       dispatchResult.error,
-      dispatchResult.error.startsWith('Device is ') ? 409 : 502
+      helperUpdateRequired || dispatchResult.error.startsWith('Device is ') ? 409 : 502
     );
   }
 

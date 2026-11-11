@@ -26,6 +26,8 @@ import {
   manifestSigningKeyDelegations,
 } from '../db/schema/manifestSigningKeys';
 import { encryptSecret, decryptForColumn } from './secretCrypto';
+import { HotPathTtlCache } from './hotPathCache';
+import { getClusterCacheBus, type PublishOutcome } from './clusterCacheBus';
 
 export interface ActiveSigningKey {
   keyId: string;
@@ -169,6 +171,7 @@ export async function ensureActiveSigningKey(): Promise<ActiveSigningKey> {
     return { keyId: winner.keyId, publicKeyB64: winner.publicKeyB64 };
   }
 
+  invalidateManifestTrustCaches();
   console.log(`[manifestSigning] Generated new deployment signing key ${keyId}`);
   return { keyId, publicKeyB64 };
 }
@@ -196,6 +199,17 @@ export async function signBytesWithActiveKey(
   };
 }
 
+/**
+ * The active deployment key's id, or null when this deployment has never
+ * generated one. Unlike ensureActiveSigningKey this never creates a key: an
+ * automatic caller must not be what introduces one, because every agent
+ * TOFU-pins the first deployment key it is sent and then also trusts it for
+ * update manifests (docs/deploy/agent-update-trust-bootstrap.md).
+ */
+export async function getActiveSigningKeyId(): Promise<string | null> {
+  return (await loadActive())?.keyId ?? null;
+}
+
 export async function getActivePublicKeys(): Promise<string[]> {
   const rows = await loadAllActive();
   return rows.map((r) => r.publicKeyB64);
@@ -208,6 +222,59 @@ export async function getActiveTrustKeyset(): Promise<ManifestTrustKey[]> {
     publicKeyB64: r.publicKeyB64,
     validFrom: r.createdAt.toISOString(),
   }));
+}
+
+// #8053 — the heartbeat delivers the trust keyset and the key delegations to
+// every agent on every beat, and both are GLOBAL (one row set for the whole
+// deployment). Reading them per beat cost two transactions per agent per
+// minute; a 60 s process cache makes that two per process per minute.
+//
+// Staleness is bounded and safe, and neither cached value carries the private
+// key column. Writers below invalidate every API instance within about 1 s
+// through the cluster bus (W05, #8144): a key this process generates itself
+// (ensureActiveSigningKey, via invalidateManifestTrustCaches, after its insert
+// has committed), and the out-of-process rotation CLI (notifyTrustCachesChanged,
+// after its transaction commits). Writers not listed rely on the TTL; an agent
+// only learns of a change at its next beat anyway.
+//
+// Only the heartbeat uses the cached readers. Enrollment and provisioning keep
+// the uncached ones: they run once per device, so freshness costs nothing there.
+export const MANIFEST_TRUST_CACHE_TTL_MS = 60_000;
+
+const trustKeysetCache = new HotPathTtlCache<'active', ManifestTrustKey[]>({
+  name: 'manifest-trust-keyset',
+  ttlMs: MANIFEST_TRUST_CACHE_TTL_MS,
+  maxEntries: 1,
+  cluster: true,
+});
+
+/** Cached {@link getActiveTrustKeyset} for the heartbeat hot path (#8053). */
+export async function getActiveTrustKeysetCached(): Promise<ManifestTrustKey[]> {
+  return trustKeysetCache.getOrLoad('active', getActiveTrustKeyset);
+}
+
+/**
+ * Drop both trust caches on this process now, and on every API instance once
+ * the surrounding transaction commits (at once when no context is held).
+ * Caller: `ensureActiveSigningKey`, after its insert has committed.
+ */
+export function invalidateManifestTrustCaches(): void {
+  // Whole cache (key null on the wire): the only key is a fixed literal.
+  trustKeysetCache.invalidateAroundCommit();
+  delegationRowsCache.invalidateAroundCommit();
+}
+
+/**
+ * For a writer in ANOTHER process (the rotation CLI): announce both trust
+ * caches to every API instance. Call only after the write has committed. Never
+ * throws; returns each publish's outcome so the caller can say what happened.
+ */
+export async function notifyTrustCachesChanged(): Promise<PublishOutcome[]> {
+  const bus = getClusterCacheBus();
+  return Promise.all([
+    bus.publish(trustKeysetCache.name, null),
+    bus.publish(delegationRowsCache.name, null),
+  ]);
 }
 
 // =====================================================================
@@ -418,15 +485,7 @@ export async function getActiveManifestKeyDelegations(
 ): Promise<ManifestKeyDelegation[]> {
   const rows = await withSystemDbAccessContext(async () => {
     return db
-      .select({
-        epoch: manifestSigningKeyDelegations.epoch,
-        oldKeyId: manifestSigningKeyDelegations.oldKeyId,
-        newKeyId: manifestSigningKeyDelegations.newKeyId,
-        newPublicKeyB64: manifestSigningKeyDelegations.newPublicKeyB64,
-        notBefore: manifestSigningKeyDelegations.notBefore,
-        notAfter: manifestSigningKeyDelegations.notAfter,
-        signatureB64: manifestSigningKeyDelegations.signatureB64,
-      })
+      .select(delegationColumns())
       .from(manifestSigningKeyDelegations)
       .where(
         and(
@@ -437,7 +496,33 @@ export async function getActiveManifestKeyDelegations(
       .orderBy(asc(manifestSigningKeyDelegations.epoch));
   });
 
-  return rows.map((row) => ({
+  return rows.map(toManifestKeyDelegation);
+}
+
+function delegationColumns() {
+  return {
+    epoch: manifestSigningKeyDelegations.epoch,
+    oldKeyId: manifestSigningKeyDelegations.oldKeyId,
+    newKeyId: manifestSigningKeyDelegations.newKeyId,
+    newPublicKeyB64: manifestSigningKeyDelegations.newPublicKeyB64,
+    notBefore: manifestSigningKeyDelegations.notBefore,
+    notAfter: manifestSigningKeyDelegations.notAfter,
+    signatureB64: manifestSigningKeyDelegations.signatureB64,
+  };
+}
+
+interface DelegationRow {
+  epoch: number | bigint | string;
+  oldKeyId: string;
+  newKeyId: string;
+  newPublicKeyB64: string;
+  notBefore: Date;
+  notAfter: Date;
+  signatureB64: string;
+}
+
+function toManifestKeyDelegation(row: DelegationRow): ManifestKeyDelegation {
+  return {
     schemaVersion: 1 as const,
     oldKeyId: row.oldKeyId,
     newKeyId: row.newKeyId,
@@ -446,5 +531,37 @@ export async function getActiveManifestKeyDelegations(
     notBefore: delegationTimestamp(row.notBefore),
     notAfter: delegationTimestamp(row.notAfter),
     signatureBase64: row.signatureB64,
-  }));
+  };
+}
+
+// The cache holds every NOT-YET-EXPIRED row (future windows included) and the
+// validity window is applied per call against the caller's `now`, so a window
+// that opens or closes inside the TTL still opens or closes on time. Only a row
+// INSERTED inside the TTL waits for the next load. See the note at
+// MANIFEST_TRUST_CACHE_TTL_MS.
+const delegationRowsCache = new HotPathTtlCache<'unexpired', DelegationRow[]>({
+  name: 'manifest-key-delegations',
+  ttlMs: MANIFEST_TRUST_CACHE_TTL_MS,
+  maxEntries: 1,
+  cluster: true,
+});
+
+/** Cached {@link getActiveManifestKeyDelegations} for the heartbeat hot path (#8053). */
+export async function getActiveManifestKeyDelegationsCached(
+  now: Date = new Date(),
+): Promise<ManifestKeyDelegation[]> {
+  const rows = await delegationRowsCache.getOrLoad('unexpired', () => {
+    const loadedAt = new Date();
+    return withSystemDbAccessContext(() =>
+      db
+        .select(delegationColumns())
+        .from(manifestSigningKeyDelegations)
+        .where(gt(manifestSigningKeyDelegations.notAfter, loadedAt))
+        .orderBy(asc(manifestSigningKeyDelegations.epoch)),
+    );
+  });
+  const at = now.getTime();
+  return rows
+    .filter((row) => row.notBefore.getTime() <= at && row.notAfter.getTime() > at)
+    .map(toManifestKeyDelegation);
 }

@@ -9,7 +9,14 @@ import type {
   ScriptPolicyDto,
   TouchClass,
 } from '@breeze/shared';
-import { LANE_HARD_DENIED_CLASSES, TOUCH_CLASSES } from '@breeze/shared';
+import {
+  LANE_HARD_DENIED_CLASSES,
+  TOUCH_CLASSES,
+  partnerScriptCeilingGrantResource,
+  scriptLaneEnableGrantResource,
+  scriptLaneWideningGrantResource,
+  type ScriptLaneEnableSaveBody,
+} from '@breeze/shared';
 import { fetchWithAuth } from '../../stores/auth';
 import { useOrgScope } from '@/hooks/useOrgScope';
 import { ActionError, runAction } from '@/lib/runAction';
@@ -17,6 +24,8 @@ import { showToast } from '../shared/Toast';
 import { mintStepUpGrant, StepUpMintError, type StepUpReauth } from '../../lib/mfaStepUp';
 import StepUpPrompt, { pickReauthTier, type ReauthTier } from './StepUpPrompt';
 import { listField, numberField } from './aiAgents/agentFields';
+import { useStableT } from '@/lib/i18n/useStableT';
+import ModelDefaultsLink from './aiModels/ModelDefaultsLink';
 
 /**
  * Classes the unattended lane only executes on Windows (a restore checkpoint
@@ -67,7 +76,6 @@ interface OrgDraft {
   maxUnattendedRiskTier: 'low' | 'medium';
   unattendedAllowedClasses: TouchClass[];
   maxUnattendedPerHour: number;
-  reviewerModel: string;
   protectedResources: ProtectedResourcesDraft;
 }
 
@@ -77,7 +85,6 @@ interface PartnerDraft {
   maxUnattendedRiskTier: 'low' | 'medium';
   unattendedAllowedClasses: TouchClass[];
   maxUnattendedPerHour: number;
-  reviewerModel: string;
   protectedResources: ProtectedResourcesDraft;
 }
 
@@ -112,7 +119,6 @@ function orgDraftFromPolicy(policy: ScriptPolicyDto | null, effective: Effective
     maxUnattendedRiskTier: normalizedTier(policy?.maxUnattendedRiskTier),
     unattendedAllowedClasses: policy?.unattendedAllowedClasses ?? [],
     maxUnattendedPerHour: policy?.maxUnattendedPerHour ?? Math.min(10, effective.maxUnattendedPerHour),
-    reviewerModel: policy?.reviewerModel ?? '',
     protectedResources: resourcesToDraft(policy?.protectedResources),
   };
 }
@@ -124,7 +130,6 @@ function partnerDraftFromPolicy(policy: ScriptPolicyDto | null): PartnerDraft {
     maxUnattendedRiskTier: normalizedTier(policy?.maxUnattendedRiskTier),
     unattendedAllowedClasses: policy?.unattendedAllowedClasses ?? [],
     maxUnattendedPerHour: policy?.maxUnattendedPerHour ?? 10,
-    reviewerModel: policy?.reviewerModel ?? '',
     protectedResources: resourcesToDraft(policy?.protectedResources),
   };
 }
@@ -139,6 +144,33 @@ interface OrgGetResponse {
 interface PartnerGetResponse {
   policy: ScriptPolicyDto | null;
   canManage: boolean;
+  /** The caller's partner — what the ceiling step-up grant is bound to (#8112). */
+  partnerId?: string | null;
+}
+
+type LaneGrantOperation = 'ai_script_lane_grant' | 'ai_partner_script_ceiling_grant';
+
+/** A save the server refused because it needs a step-up grant the request did
+ *  not carry. The web never reads ENABLE_2FA, so this 403 — not a client-side
+ *  guess — is what reveals the prompt for a widening save or a ceiling change
+ *  (same discovery as MaintenanceModeDialog); a 2FA-off deployment just saves. */
+function isStepUpRequired(err: unknown): boolean {
+  return err instanceof ActionError && err.status === 403 && err.code === 'STEP_UP_REQUIRED';
+}
+
+function draftValues(draft: OrgDraft | PartnerDraft): ScriptLaneEnableSaveBody {
+  return {
+    proposingEnabled: draft.proposingEnabled,
+    maxUnattendedRiskTier: draft.maxUnattendedRiskTier,
+    unattendedAllowedClasses: draft.unattendedAllowedClasses,
+    maxUnattendedPerHour: draft.maxUnattendedPerHour,
+    protectedResources: {
+      services: fromLines(draft.protectedResources.services),
+      paths: fromLines(draft.protectedResources.paths),
+      registryKeys: fromLines(draft.protectedResources.registryKeys),
+      deviceTags: fromLines(draft.protectedResources.deviceTags),
+    },
+  };
 }
 
 /** Discovers the strongest available step-up factor the same way
@@ -164,6 +196,7 @@ async function discoverReauthTier(): Promise<ReauthTier | null> {
 
 export default function ScriptAuthoringPage() {
   const { t } = useTranslation('settings');
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   const orgScope = useOrgScope();
   const orgId = orgScope.scope === 'org' ? orgScope.orgId : null;
 
@@ -188,12 +221,22 @@ export default function ScriptAuthoringPage() {
   // against the reset, or the other way round.
   const [resetStepUpOpen, setResetStepUpOpen] = useState(false);
   const [resetCode, setResetCode] = useState('');
+  // Set when the server 403s STEP_UP_REQUIRED on a save that is NOT an enable
+  // — i.e. it widens an already-enabled lane (#8096). The next Save mints a
+  // grant bound to the widening delta.
+  const [orgWideningStepUpOpen, setOrgWideningStepUpOpen] = useState(false);
 
   const [partnerPolicy, setPartnerPolicy] = useState<ScriptPolicyDto | null>(null);
   const [partnerCanManage, setPartnerCanManage] = useState(false);
   const [partnerFetchFailed, setPartnerFetchFailed] = useState(false);
   const [partnerDraft, setPartnerDraft] = useState<PartnerDraft | null>(null);
   const [partnerSaving, setPartnerSaving] = useState(false);
+  const [partnerId, setPartnerId] = useState<string | null>(null);
+  // The partner ceiling's own step-up (#8112): revealed by a 403
+  // STEP_UP_REQUIRED on Save, with its own code so a half-typed org code can
+  // never be minted against the ceiling, or the other way round.
+  const [partnerStepUpOpen, setPartnerStepUpOpen] = useState(false);
+  const [partnerCode, setPartnerCode] = useState('');
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -212,7 +255,7 @@ export default function ScriptAuthoringPage() {
         setLaneState(body.laneState);
         setOrgDraft(orgDraftFromPolicy(body.policy, body.effective));
       } else if (orgRes) {
-        setError(t('scriptAuthoringPage.loadFailed'));
+        setError(stableT('scriptAuthoringPage.loadFailed'));
       }
 
       // A 403 here is EXPECTED for an org-scoped token — it never means
@@ -224,24 +267,27 @@ export default function ScriptAuthoringPage() {
         setPartnerPolicy(body.policy);
         setPartnerCanManage(body.canManage);
         setPartnerFetchFailed(false);
+        setPartnerId(body.partnerId ?? null);
         setPartnerDraft(partnerDraftFromPolicy(body.policy));
       } else {
         setPartnerFetchFailed(true);
         setPartnerCanManage(false);
         setPartnerPolicy(null);
+        setPartnerId(null);
         setPartnerDraft(null);
       }
     } catch {
-      setError(t('scriptAuthoringPage.loadFailed'));
+      setError(stableT('scriptAuthoringPage.loadFailed'));
     } finally {
       setLoading(false);
     }
-  }, [orgId, orgScope.scope, t]);
+  }, [orgId, orgScope.scope, stableT]);
 
   useEffect(() => {
     void load();
-    // `load` is itself memoized on [orgId, orgScope.scope, t], so depending on
-    // it alone re-runs exactly when either input actually changes.
+    // `load` is itself memoized on [orgId, orgScope.scope, stableT], and
+    // `stableT` never changes identity (#3632), so this re-runs only when the
+    // org or scope actually changes, not on a locale switch.
   }, [load]);
 
   const ensureReauthTier = useCallback(async (): Promise<ReauthTier | null> => {
@@ -265,96 +311,155 @@ export default function ScriptAuthoringPage() {
     }
   }, [orgPolicy, ensureReauthTier]);
 
-  const mintLaneGrant = useCallback(async (resource: Record<string, unknown>, code: string): Promise<string> => {
+  const mintLaneGrant = useCallback(async (
+    resource: object,
+    code: string,
+    operation: LaneGrantOperation = 'ai_script_lane_grant',
+  ): Promise<string> => {
     const tier = await ensureReauthTier();
     if (!tier || tier === 'password') {
-      throw new StepUpMintError('unavailable', t('scriptAuthoringPage.stepUp.body'));
+      // null = factor discovery itself failed, not "no factor".
+      throw new StepUpMintError('unavailable', tier ? t('scriptAuthoringPage.stepUp.noFactor') : t('scriptAuthoringPage.saveFailed'));
     }
     const reauth: StepUpReauth = tier === 'passkey' ? { method: 'passkey' } : { method: 'totp', code };
-    return mintStepUpGrant({ operation: 'ai_script_lane_grant', resource, reauth });
+    return mintStepUpGrant({ operation, resource, reauth });
+  }, [ensureReauthTier, t]);
+
+  /** Opens a save's step-up prompt after the server asked for one. Resolves
+   *  the factor first so the code box (TOTP) or passkey note is what shows;
+   *  an account with neither gets told so instead of an unusable prompt. */
+  const revealStepUp = useCallback(async (open: () => void) => {
+    const tier = await ensureReauthTier();
+    if (!tier || tier === 'password') {
+      // null = factor discovery itself failed (network, /users/me error), which
+      // must not read as "your account has no factor".
+      setError(tier ? t('scriptAuthoringPage.stepUp.noFactor') : t('scriptAuthoringPage.saveFailed'));
+      return;
+    }
+    open();
   }, [ensureReauthTier, t]);
 
   const handleOrgSave = useCallback(async () => {
     if (!orgDraft || !orgId) return;
-    setOrgSaving(true);
-    setError(null);
     const wasEnabled = orgPolicy?.unattendedEnabled ?? false;
     const isEnabling = orgDraft.unattendedEnabled && !wasEnabled;
+    const values = draftValues(orgDraft);
+    // Enabling binds the grant to every value this save arms (#7873); a save
+    // the server already flagged as WIDENING an enabled lane binds it to the
+    // widening delta against the saved row instead (#8096).
+    const resource = isEnabling
+      ? scriptLaneEnableGrantResource(orgId, values)
+      : orgWideningStepUpOpen && wasEnabled && orgDraft.unattendedEnabled && orgPolicy
+        ? scriptLaneWideningGrantResource(orgId, orgPolicy, values)
+        : null;
+    if (resource && !isEnabling && reauthTier === 'totp' && reauthCode.length === 0) return;
+    setOrgSaving(true);
+    setError(null);
+    let stepUpGrant: string | undefined;
     try {
-      let stepUpGrant: string | undefined;
-      if (isEnabling) {
+      if (resource) {
         try {
-          stepUpGrant = await mintLaneGrant({ orgId, unattendedEnabled: true }, reauthCode);
+          stepUpGrant = await mintLaneGrant(resource, reauthCode);
         } catch (err) {
           setError(err instanceof Error ? err.message : t('scriptAuthoringPage.saveFailed'));
           return;
         }
       }
       const body: Record<string, unknown> = {
-        proposingEnabled: orgDraft.proposingEnabled,
-        unattendedEnabled: orgDraft.unattendedEnabled,
-        maxUnattendedRiskTier: orgDraft.maxUnattendedRiskTier,
-        unattendedAllowedClasses: orgDraft.unattendedAllowedClasses,
-        maxUnattendedPerHour: orgDraft.maxUnattendedPerHour,
-        reviewerModel: orgDraft.reviewerModel.trim() ? orgDraft.reviewerModel.trim() : null,
-        protectedResources: {
-          services: fromLines(orgDraft.protectedResources.services),
-          paths: fromLines(orgDraft.protectedResources.paths),
-          registryKeys: fromLines(orgDraft.protectedResources.registryKeys),
-          deviceTags: fromLines(orgDraft.protectedResources.deviceTags),
-        },
+        ...values,
+        // Only send the lane switch when it changes: the server treats any
+        // `unattendedEnabled: true` as the enable transition and requires a
+        // grant, so re-sending an unchanged `true` would 403 every later save.
+        ...(orgDraft.unattendedEnabled !== wasEnabled ? { unattendedEnabled: orgDraft.unattendedEnabled } : {}),
         ...(stepUpGrant ? { stepUpGrant } : {}),
       };
       const result = await runAction<OrgGetResponse | { policy: ScriptPolicyDto }>({
         request: () => fetchWithAuth('/ai/script-policy', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
         errorFallback: t('scriptAuthoringPage.saveFailed'),
         successMessage: t('scriptAuthoringPage.saved'),
+        // A widening save's first, grant-less attempt is how the prompt is
+        // discovered — not an error worth a toast.
+        suppressErrorToast: (status, code) => !stepUpGrant && status === 403 && code === 'STEP_UP_REQUIRED',
       });
       setReauthCode('');
+      setOrgWideningStepUpOpen(false);
       if ('policy' in result && result.policy) setOrgPolicy(result.policy);
       await load();
     } catch (err) {
       if (err instanceof ActionError && err.status === 401) return;
+      // Only the FIRST grant-less 403 opens the prompt. A repeat one means the
+      // page could not build a grant the server accepts (e.g. its copy of the
+      // saved row is stale) — re-opening the same prompt would loop silently.
+      if (!stepUpGrant && !isEnabling && !orgWideningStepUpOpen && isStepUpRequired(err)) {
+        await revealStepUp(() => setOrgWideningStepUpOpen(true));
+        return;
+      }
+      if (isStepUpRequired(err) && !stepUpGrant) showToast({ message: t('scriptAuthoringPage.saveFailed'), type: 'error' });
       if (!(err instanceof ActionError)) showToast({ message: t('scriptAuthoringPage.saveFailed'), type: 'error' });
       setError(err instanceof ActionError ? err.message : t('scriptAuthoringPage.saveFailed'));
     } finally {
       setOrgSaving(false);
     }
-  }, [orgDraft, orgId, orgPolicy, mintLaneGrant, reauthCode, load, t]);
+  }, [orgDraft, orgId, orgPolicy, orgWideningStepUpOpen, reauthTier, mintLaneGrant, revealStepUp, reauthCode, load, t]);
 
   const handlePartnerSave = useCallback(async () => {
     if (!partnerDraft) return;
+    const wasAllowed = partnerPolicy?.unattendedAllowed ?? false;
+    const values = draftValues(partnerDraft);
+    // Only mint once the server has asked (a 2FA-off deployment never does).
+    // The resource mirrors the route's enable/widen branches exactly (#8112).
+    const resource = partnerStepUpOpen && partnerId
+      ? partnerScriptCeilingGrantResource({
+        partnerId,
+        allowed: partnerDraft.unattendedAllowed,
+        saved: partnerPolicy ? { ...partnerPolicy, unattendedAllowed: wasAllowed } : null,
+        body: values,
+      })
+      : null;
+    if (resource && reauthTier === 'totp' && partnerCode.length === 0) return;
     setPartnerSaving(true);
     setError(null);
+    let stepUpGrant: string | undefined;
     try {
-      const body = {
-        proposingEnabled: partnerDraft.proposingEnabled,
-        unattendedAllowed: partnerDraft.unattendedAllowed,
-        maxUnattendedRiskTier: partnerDraft.maxUnattendedRiskTier,
-        unattendedAllowedClasses: partnerDraft.unattendedAllowedClasses,
-        maxUnattendedPerHour: partnerDraft.maxUnattendedPerHour,
-        reviewerModel: partnerDraft.reviewerModel.trim() ? partnerDraft.reviewerModel.trim() : null,
-        protectedResources: {
-          services: fromLines(partnerDraft.protectedResources.services),
-          paths: fromLines(partnerDraft.protectedResources.paths),
-          registryKeys: fromLines(partnerDraft.protectedResources.registryKeys),
-          deviceTags: fromLines(partnerDraft.protectedResources.deviceTags),
-        },
+      if (resource) {
+        try {
+          stepUpGrant = await mintLaneGrant(resource, partnerCode, 'ai_partner_script_ceiling_grant');
+        } catch (err) {
+          setError(err instanceof Error ? err.message : t('scriptAuthoringPage.saveFailed'));
+          return;
+        }
+      }
+      const body: Record<string, unknown> = {
+        ...values,
+        // Only send the ceiling switch when it changes: the route treats any
+        // `unattendedAllowed: true` as the enable transition, so re-sending an
+        // unchanged `true` would demand a grant on every later save.
+        ...(partnerDraft.unattendedAllowed !== wasAllowed ? { unattendedAllowed: partnerDraft.unattendedAllowed } : {}),
+        ...(stepUpGrant ? { stepUpGrant } : {}),
       };
       await runAction({
         request: () => fetchWithAuth('/partner/ai/script-policy', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
         errorFallback: t('scriptAuthoringPage.saveFailed'),
         successMessage: t('scriptAuthoringPage.saved'),
+        suppressErrorToast: (status, code) => !stepUpGrant && status === 403 && code === 'STEP_UP_REQUIRED',
       });
+      setPartnerCode('');
+      setPartnerStepUpOpen(false);
       await load();
     } catch (err) {
       if (err instanceof ActionError && err.status === 401) return;
+      // Only the FIRST grant-less 403 opens the prompt; see handleOrgSave.
+      if (!stepUpGrant && !partnerStepUpOpen && isStepUpRequired(err)) {
+        await revealStepUp(() => setPartnerStepUpOpen(true));
+        return;
+      }
+      if (isStepUpRequired(err) && !stepUpGrant) showToast({ message: t('scriptAuthoringPage.saveFailed'), type: 'error' });
       if (!(err instanceof ActionError)) showToast({ message: t('scriptAuthoringPage.saveFailed'), type: 'error' });
       setError(err instanceof ActionError ? err.message : t('scriptAuthoringPage.saveFailed'));
     } finally {
       setPartnerSaving(false);
     }
-  }, [partnerDraft, load, t]);
+  }, [partnerDraft, partnerPolicy, partnerId, partnerStepUpOpen, reauthTier, partnerCode, mintLaneGrant, revealStepUp, load, t]);
 
   const handleReset = useCallback(async () => {
     if (!orgId) return;
@@ -403,8 +508,10 @@ export default function ScriptAuthoringPage() {
     );
   }
 
-  const showTotpBox = orgDraft?.unattendedEnabled && !(orgPolicy?.unattendedEnabled ?? false) && reauthTier === 'totp';
-  const showPasskeyNote = orgDraft?.unattendedEnabled && !(orgPolicy?.unattendedEnabled ?? false) && reauthTier === 'passkey';
+  const orgIsEnabling = !!orgDraft?.unattendedEnabled && !(orgPolicy?.unattendedEnabled ?? false);
+  const usableTier = reauthTier === 'totp' || reauthTier === 'passkey';
+  const showOrgStepUp = (orgIsEnabling || orgWideningStepUpOpen) && usableTier;
+  const showPartnerStepUp = partnerStepUpOpen && usableTier;
 
   return (
     <div className="space-y-6">
@@ -482,13 +589,26 @@ export default function ScriptAuthoringPage() {
           />
         )}
 
+        {partnerCanManage && partnerDraft && showPartnerStepUp && (
+          <div className="space-y-2 rounded-md border p-3" data-testid="script-partner-stepup">
+            <p className="text-sm font-medium">{t('scriptAuthoringPage.stepUp.title')}</p>
+            <p className="text-xs text-muted-foreground">{t('scriptAuthoringPage.stepUp.ceilingBody')}</p>
+            <StepUpPrompt
+              tier={reauthTier as ReauthTier}
+              reauthValue={partnerCode}
+              onChange={setPartnerCode}
+              disabled={partnerSaving}
+            />
+          </div>
+        )}
+
         {partnerCanManage && partnerDraft && (
           <div className="flex items-center gap-3">
             <button
               type="button"
               data-testid="script-partner-save"
               onClick={() => void handlePartnerSave()}
-              disabled={partnerSaving}
+              disabled={partnerSaving || resolvingReauth}
               className="inline-flex items-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
             >
               {partnerSaving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
@@ -534,10 +654,12 @@ export default function ScriptAuthoringPage() {
             {resolvingReauth && (
               <p className="text-xs text-muted-foreground">{t('scriptAuthoringPage.loading')}</p>
             )}
-            {(showTotpBox || showPasskeyNote) && (
-              <div className="space-y-2 rounded-md border p-3">
+            {showOrgStepUp && (
+              <div className="space-y-2 rounded-md border p-3" data-testid="script-org-stepup">
                 <p className="text-sm font-medium">{t('scriptAuthoringPage.stepUp.title')}</p>
-                <p className="text-xs text-muted-foreground">{t('scriptAuthoringPage.stepUp.body')}</p>
+                <p className="text-xs text-muted-foreground">
+                  {orgIsEnabling ? t('scriptAuthoringPage.stepUp.body') : t('scriptAuthoringPage.stepUp.wideningBody')}
+                </p>
                 <StepUpPrompt
                   tier={reauthTier as ReauthTier}
                   reauthValue={reauthCode}
@@ -624,17 +746,10 @@ export default function ScriptAuthoringPage() {
               (next) => setOrgDraft({ ...orgDraft, maxUnattendedPerHour: next }),
             )}
 
-            <label className="block text-sm">
+            <div className="block text-sm">
               <span className="font-medium">{t('scriptAuthoringPage.fields.reviewerModel')}</span>
-              <input
-                type="text"
-                data-testid="script-reviewer-model"
-                value={orgDraft.reviewerModel}
-                onChange={(e) => setOrgDraft({ ...orgDraft, reviewerModel: e.target.value })}
-                className="mt-1 w-full rounded-md border bg-background px-2.5 py-1.5 text-sm"
-              />
-              <span className="mt-1 block text-xs text-muted-foreground">{t('scriptAuthoringPage.fields.reviewerModelHint')}</span>
-            </label>
+              <div className="mt-1"><ModelDefaultsLink surface="script_reviewer" orgId={orgId} level="org" /></div>
+            </div>
 
             <fieldset className="space-y-2 rounded-md border p-3">
               <legend className="px-1 text-xs font-medium uppercase text-muted-foreground">
@@ -670,7 +785,7 @@ export default function ScriptAuthoringPage() {
 /** Read-only summary rendered on the org card's neighbour when the partner
  *  row itself is unreadable (403 for an org-scoped token) — all we have then
  *  is the effective/ceiling projection off the org GET, not the partner's own
- *  protectedResources or reviewerModel. */
+ *  protectedResources. */
 function PartnerCeilingSummary({ effective, t }: { effective: EffectiveScriptPolicyDto; t: (key: string, opts?: Record<string, unknown>) => string }) {
   return (
     <div className="space-y-2 text-sm" data-testid="script-partner-ceiling-summary">
@@ -762,16 +877,10 @@ function PartnerForm({
         </div>
       </fieldset>
       {numberField('script-partner-max-per-hour', t('scriptAuthoringPage.fields.perHour'), draft.maxUnattendedPerHour, 0, 100, (next) => onChange({ ...draft, maxUnattendedPerHour: next }))}
-      <label className="block text-sm">
+      <div className="block text-sm">
         <span className="font-medium">{t('scriptAuthoringPage.fields.reviewerModel')}</span>
-        <input
-          type="text"
-          value={draft.reviewerModel}
-          disabled={disabled}
-          onChange={(e) => onChange({ ...draft, reviewerModel: e.target.value })}
-          className="mt-1 w-full rounded-md border bg-background px-2.5 py-1.5 text-sm"
-        />
-      </label>
+        <div className="mt-1"><ModelDefaultsLink surface="script_reviewer" level="partner" /></div>
+      </div>
       <fieldset className="space-y-2 rounded-md border p-3">
         <legend className="px-1 text-xs font-medium uppercase text-muted-foreground">
           {t('scriptAuthoringPage.fields.protectedResources')}

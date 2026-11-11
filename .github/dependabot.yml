@@ -20,6 +20,22 @@ updates:
     # 2026-08-17 through 2026-09-07, so anything sorted past the limit
     # was starved indefinitely.
     open-pull-requests-limit: 15
+    # An Expo SDK major is a coordinated move (expo, every expo-* native
+    # module, react-native, gesture-handler) done by hand with
+    # `npx expo install --fix`. Dependabot's expo-sdk group bumped `expo`
+    # 57→58 while ~15 expo-* modules stayed on 57 and react-native stayed
+    # below SDK 58's pin (#8687), so majors are ignored and the group only
+    # carries in-SDK patches/minors.
+    ignore:
+      - dependency-name: "expo"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "expo-*"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@expo/*"
+        update-types: ["version-update:semver-major"]
+      # react-native is pinned by the Expo SDK (bundledNativeModules); bump
+      # with the SDK migration, not via dependabot.
+      - dependency-name: "react-native"
     groups:
       # Expo SDK packages must move together: a solo expo major bump
       # (55→56 on 2026-06-09) left expo-* native modules behind on SDK 55.
@@ -45,6 +61,7 @@ updates:
         exclude-patterns:
           - "react-native-reanimated"
           - "react-native-worklets"
+          - "react-native"
       # Group minor and patch updates together
       typescript-tooling:
         patterns:
@@ -125,6 +142,15 @@ updates:
         update-types:
           - "minor"
           - "patch"
+      # Tauri JS packages move together. They must also track the
+      # `tauri` / `tauri-plugin-*` crates' major.minor in each app's
+      # Cargo.lock (the Tauri CLI refuses a mismatched build). Cargo and npm
+      # bumps cannot share one Dependabot PR here, so
+      # scripts/check-tauri-versions.mjs (ci.yml lint job) reds the half-bump
+      # PR and the other side gets bumped in the same PR before merging.
+      tauri:
+        patterns:
+          - "@tauri-apps/*"
     labels:
       - "dependencies"
       - "npm"
@@ -255,6 +281,12 @@ updates:
           - "cipher"
           - "aes*"
           - "crypto-common"
+      # tauri + tauri-plugin-* + tauri-build move together; the matching
+      # @tauri-apps/* npm bump is enforced by scripts/check-tauri-versions.mjs.
+      tauri:
+        patterns:
+          - "tauri"
+          - "tauri-*"
     labels:
       - "dependencies"
       - "rust"
@@ -285,6 +317,12 @@ updates:
           - "cipher"
           - "aes*"
           - "crypto-common"
+      # tauri + tauri-plugin-* + tauri-build move together; the matching
+      # @tauri-apps/* npm bump is enforced by scripts/check-tauri-versions.mjs.
+      tauri:
+        patterns:
+          - "tauri"
+          - "tauri-*"
     labels:
       - "dependencies"
       - "rust"
@@ -320,6 +358,21 @@ updates:
       docker-base-images:
         patterns:
           - "*"
+    labels:
+      - "dependencies"
+      - "docker"
+    commit-message:
+      prefix: "chore(deps):"
+
+  # Compose files at the repo root (incl. docker-compose.monitoring.yml). The
+  # `docker` ecosystem above only reads Dockerfiles. Best effort: Dependabot may
+  # not parse the digest default inside `${X_IMAGE_REF:-image:tag@sha256:...}`,
+  # in which case the monitoring pins are refreshed by hand (#7812).
+  - package-ecosystem: "docker-compose"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
     labels:
       - "dependencies"
       - "docker"

@@ -35,7 +35,8 @@ export function sellerLines(a: SellerSnapshot['address'] | null | undefined): st
 // (packages/shared/src/types/billing-enums.ts). Imported for the Record maps
 // below and re-exported so existing './invoiceTypes' consumers are unaffected.
 import type { InvoiceStatus, PaymentMethod, InvoiceLineSourceType, StripeCurrencyWarning } from '@breeze/shared';
-import { computeQuoteProfit, type QuoteProfit } from '@breeze/shared';
+import { computeQuoteProfit, lineWorkedVsBilled, type QuoteProfit, type InvoiceLineDetail } from '@breeze/shared';
+import type { AccountingProviderId } from '../../lib/accountingProviders';
 export type { InvoiceStatus, PaymentMethod, InvoiceLineSourceType };
 
 export interface InvoiceSummary {
@@ -45,6 +46,8 @@ export interface InvoiceSummary {
   siteId: string | null;
   status: InvoiceStatus;
   currencyCode: string;
+  /** Stamped when the invoice is issued. The email uses this for money glyphs. */
+  documentLocale?: string | null;
   issueDate: string | null;
   dueDate: string | null;
   sentAt: string | null;
@@ -73,6 +76,32 @@ export interface InvoiceSummary {
   updatedAt?: string | null;
   /** null identifies an invoice created before device evidence was recorded. */
   evidenceVersion?: number | null;
+  /** #8604 per-invoice labor-line overrides (draft only). null = inherit the
+   *  partner default; the resolved values ride on `InvoiceDetail.lineDetail`. */
+  lineGrouping?: 'entry' | 'day' | null;
+  lineShowDate?: boolean | null;
+  lineShowNote?: boolean | null;
+  lineShowWorkedTime?: boolean | null;
+}
+
+/** #8606: counts from POST /invoices/:id/refresh-time-lines. */
+export interface TimeLineRefreshSummary {
+  refreshed: number;
+  unchanged: number;
+  skipped: number;
+  quantityDrifted: number;
+}
+
+/** #8606: one line's refresh outcome (reason only on `skipped`). */
+export interface TimeLineRefreshOutcome {
+  lineId: string;
+  status: 'refreshed' | 'unchanged' | 'skipped' | 'quantityDrifted';
+  reason?: string;
+}
+
+export interface TimeLineRefreshResult {
+  summary: TimeLineRefreshSummary;
+  lines: TimeLineRefreshOutcome[];
 }
 
 export interface InvoiceLine {
@@ -104,6 +133,8 @@ export interface InvoiceLine {
    *  non-time-entry lines and legacy rows predating the column; optional
    *  because older test fixtures and API responses predate the field. */
   workedMinutes?: number | null;
+  /** #8604: partner-local day (YYYY-MM-DD) a time_entry line was worked; null otherwise. */
+  workDate?: string | null;
 }
 
 export interface InvoiceLineDevice {
@@ -118,13 +149,9 @@ export interface InvoiceLineDevice {
 }
 
 // A line's title falls back to its description for legacy lines created before
-// the name/description split; the blurb only renders when a distinct name exists.
+// the name/description split.
 export function lineTitle(l: { name: string | null; description: string | null }): string {
   return (l.name ?? l.description ?? '').trim();
-}
-export function lineBlurb(l: { name: string | null; description: string | null }): string | null {
-  const b = l.name ? (l.description ?? '').trim() : '';
-  return b || null;
 }
 
 /** #6467 — one line naming the worked time whenever it differs from the
@@ -141,10 +168,9 @@ export function lineWorkedVsBilledNote(
   t: (key: string, options?: Record<string, unknown>) => string
 ): string | null {
   if (l.workedMinutes == null) return null;
-  const worked = (l.workedMinutes / 60).toFixed(2);
-  const billed = Number(l.quantity).toFixed(2);
-  if (worked === billed) return null;
-  return t('tickets:ticketTimeBilling.billedVsWorked', { worked, billed });
+  const figures = lineWorkedVsBilled(l);
+  if (!figures) return null;
+  return t('tickets:ticketTimeBilling.billedVsWorked', figures);
 }
 
 /** Document branding resolved server-side (same partner/portal source the invoice
@@ -162,14 +188,14 @@ export interface InvoiceBranding {
 }
 
 /**
- * QuickBooks push status for this invoice (Phase C, Task 5). Read-only: the
- * web never calls QuickBooks and never derives this itself — it mirrors
+ * Accounting-provider push status for this invoice (Phase C, Task 5). Read-only: the
+ * web never calls the provider and never derives this itself — it mirrors
  * `accounting_entity_mappings` via a partner-scoped read, so it is `null`
  * whenever there is no connection/mapping yet OR the caller's ambient RLS
  * context can't see the (partner-axis) mapping row.
  */
 export interface AccountingSyncSummary {
-  provider: 'quickbooks';
+  provider: AccountingProviderId;
   syncStatus: 'pending' | 'synced' | 'error' | 'synced_with_tax_variance';
   lastSyncedAt: string | null;
   lastError: string | null;
@@ -191,7 +217,12 @@ export interface AccountingSyncSummary {
   remoteDeleted?: boolean;
 }
 
+import type { InvoiceAutopayView } from '@breeze/shared';
+export type { InvoiceAutopayView } from '@breeze/shared';
+
 export interface InvoiceDetail {
+  unappliedCount?: number;
+  autopay: InvoiceAutopayView | null;
   invoice: InvoiceSummary;
   lines: InvoiceLine[];
   branding?: InvoiceBranding;
@@ -222,6 +253,10 @@ export interface InvoiceDetail {
    *  bill-to name — never a substitute for the persisted billing-contact
    *  field on Organization Settings. */
   billToEmail?: string | null;
+  /** #8604: the RESOLVED labor-line itemization the document renders with
+   *  (draft: override ?? partner default; issued: frozen at issue). Absent on
+   *  older API responses → defaults. */
+  lineDetail?: InvoiceLineDetail;
 }
 
 export interface InvoicePayment {
@@ -235,17 +270,21 @@ export interface InvoicePayment {
   createdAt: string;
   /** Origin of the payment: 'stripe' = collected via online checkout (refund
    *  through Stripe, no manual void), 'manual' = recorded by an operator,
-   *  'quickbooks' = pulled back from QuickBooks by the accounting-reconcile
-   *  worker (Phase D). QuickBooks is the system of record for those, so they
+   *  an accounting provider id ('quickbooks', 'xero') = pulled back from that
+   *  provider by the accounting-reconcile worker (Phase D). The provider is the
+   *  system of record for those, so they
    *  are not hand-voidable either — a Breeze-side reverse would not touch the
    *  books and the next reconcile would pull the payment straight back in. */
-  source?: 'stripe' | 'manual' | 'quickbooks';
-  /** QuickBooks push state for a BREEZE-ORIGIN payment (Phase D2). Null when the
-   *  payment has no QuickBooks mapping, and always null for `source: 'quickbooks'`
-   *  (that badge already says QuickBooks owns the row). */
+  source?: 'stripe' | 'manual' | AccountingProviderId;
+  /** Accounting-provider push state for a BREEZE-ORIGIN payment (Phase D2).
+   *  Null when the payment has no accounting mapping, and always null when
+   *  `source` is a provider id (that badge already says the provider owns the
+   *  row). */
   accountingSync?: {
     status: 'pending' | 'synced' | 'error' | 'synced_with_tax_variance';
     lastError: string | null;
+    /** The provider this payment was pushed to (its mapping's own connection). Absent on older API responses. */
+    provider?: AccountingProviderId;
   } | null;
 }
 
@@ -299,6 +338,7 @@ export const PAYMENT_METHOD_LABELS: Record<PaymentMethod, string> = {
   bank_transfer: 'Bank transfer',
   card: 'Card',
   other: 'Other',
+  ach_debit: 'ACH debit',
 };
 
 // Money/date formatters live in ./shared/format (the canonical copies, shared

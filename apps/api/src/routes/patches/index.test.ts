@@ -60,6 +60,10 @@ vi.mock('drizzle-orm', () => {
 });
 
 vi.mock('../../db', () => ({
+  // readOwnPartnerAxisRows (db/partnerAxisRead.ts) reads the ambient context to
+  // decide whether a patch_approvals read can run on the request's own
+  // connection (#7663). Default: no ambient context → the system escape.
+  getCurrentDbAccessContext: vi.fn(() => undefined),
   runOutsideDbContext: vi.fn((fn) => fn()),
   withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn()),
   withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
@@ -98,6 +102,8 @@ vi.mock('../../db/schema', () => ({
     orgId: 'devicePatches.orgId',
     patchId: 'devicePatches.patchId',
     status: 'devicePatches.status',
+    reportedSeverity: 'devicePatches.reportedSeverity',
+    reportedCategory: 'devicePatches.reportedCategory',
     lastCheckedAt: 'devicePatches.lastCheckedAt'
   },
   patchApprovals: {
@@ -151,6 +157,36 @@ vi.mock('../../db/schema', () => ({
     reason: 'patchRollbacks.reason'
   },
   OUTSTANDING_DEVICE_PATCH_STATUSES: ['pending']
+}));
+
+// #4223 deployment overlay — real SQL is covered by
+// __tests__/integration/patchInstallFailureStatus.integration.test.ts.
+vi.mock('../../services/patchInstallFailures', () => ({
+  loadPatchInstallFailures: vi.fn(async () => new Map()),
+  loadFailedInstallPairs: vi.fn(async () => [])
+}));
+
+// #8728 outstanding-device overlay + drill-down — real SQL and scoping are
+// covered by __tests__/integration/patchOutstandingDevices.integration.test.ts.
+const OUTSTANDING_SCOPE = vi.hoisted(() => [{ op: 'outstandingScope' }]);
+vi.mock('../../services/patchOutstandingDevices', () => ({
+  resolveOutstandingDeviceScope: vi.fn(() => OUTSTANDING_SCOPE),
+  loadOutstandingDeviceCounts: vi.fn(async () => new Map()),
+  listOutstandingDevices: vi.fn(async () => ({ visible: true, devices: [], total: 0 }))
+}));
+
+// #9387 gap 2 severity provenance — real SQL and scoping are covered by
+// __tests__/integration/patchSeveritySource.integration.test.ts.
+vi.mock('../../services/patchSeveritySource', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../services/patchSeveritySource')>()),
+  loadCatalogReportedSeverities: vi.fn(async () => new Map())
+}));
+
+// W06 image term — real SQL is covered by
+// services/workloads/imageCompliance.integration.test.ts; no workload rows here.
+vi.mock('../../services/workloads/imageCompliance', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../services/workloads/imageCompliance')>()),
+  containerImageComplianceTerms: vi.fn(async () => new Map())
 }));
 
 vi.mock('../../services/commandQueue', () => ({
@@ -221,11 +257,18 @@ vi.mock('../../middleware/auth', () => ({
   requireMfa: vi.fn(() => async (_c: any, next: any) => next()),
 }));
 
-import { db, withSystemDbAccessContext } from '../../db';
+import { db, getCurrentDbAccessContext, runOutsideDbContext, withSystemDbAccessContext } from '../../db';
 import { devicePatches } from '../../db/schema';
 import { queueCommandForExecution } from '../../services/commandQueue';
 import { enqueuePatchComplianceReport } from '../../jobs/patchComplianceReportWorker';
 import { writeRouteAudit } from '../../services/auditEvents';
+import { loadPatchInstallFailures } from '../../services/patchInstallFailures';
+import {
+  listOutstandingDevices,
+  loadOutstandingDeviceCounts,
+  resolveOutstandingDeviceScope
+} from '../../services/patchOutstandingDevices';
+import { loadCatalogReportedSeverities } from '../../services/patchSeveritySource';
 // Real implementations (the mock above spreads the actual module). Fixtures
 // below must therefore carry a fingerprint the real decoder accepts.
 import {
@@ -293,6 +336,7 @@ function selectPatchListResult(rows: unknown[]) {
 // Like selectPatchListResult but records the orderBy/limit/offset args so a test
 // can assert how sort + pagination params were translated into the query.
 function selectPatchListCapture(rows: unknown[], capture: {
+  where?: unknown;
   orderBy?: unknown;
   orderByAll?: unknown[];
   limit?: unknown;
@@ -300,7 +344,9 @@ function selectPatchListCapture(rows: unknown[], capture: {
 }) {
   return {
     from: vi.fn().mockReturnValue({
-      where: vi.fn().mockReturnValue({
+      where: vi.fn().mockImplementation((where: unknown) => {
+        capture.where = where;
+        return {
         orderBy: vi.fn().mockImplementation((...args: unknown[]) => {
           const [arg] = args;
           capture.orderBy = arg;
@@ -317,9 +363,19 @@ function selectPatchListCapture(rows: unknown[], capture: {
             })
           };
         })
+        };
       })
     })
   };
+}
+
+// True when `target` appears anywhere inside a mocked drizzle expression tree
+// (`sql` is mocked to `{ strings, values }`, `and`/`eq` to `{ op, ... }`).
+function exprContains(expr: unknown, target: unknown, seen = new Set<unknown>()): boolean {
+  if (expr === target) return true;
+  if (expr === null || typeof expr !== 'object' || seen.has(expr)) return false;
+  seen.add(expr);
+  return Object.values(expr as Record<string, unknown>).some((v) => exprContains(v, target, seen));
 }
 
 function selectSourceCountsResult(rows: Array<{ source: string; count: number }> = []) {
@@ -338,6 +394,7 @@ describe('patch routes', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(db.execute).mockResolvedValue(undefined as any);
+    vi.mocked(getCurrentDbAccessContext).mockReturnValue(undefined);
     mockAuthState.scope = 'organization';
     mockAuthState.orgId = ACCESSIBLE_ORG_ID;
     mockAuthState.partnerId = null;
@@ -457,6 +514,18 @@ describe('patch routes', () => {
     expect(db.select).not.toHaveBeenCalled();
   });
 
+  it('denies patch detail without devices:read', async () => {
+    mockAuthState.permissions = [{ resource: 'reports', action: 'read' }];
+
+    const res = await app.request(`/patches/${PATCH_ID}`, {
+      method: 'GET',
+      headers: { Authorization: 'Bearer token' }
+    });
+
+    expect(res.status).toBe(403);
+    expect(db.select).not.toHaveBeenCalled();
+  });
+
   it('allows the patch list with devices:read', async () => {
     mockAuthState.permissions = [{ resource: 'devices', action: 'read' }];
     vi.mocked(db.select)
@@ -505,6 +574,257 @@ describe('patch routes', () => {
     expect(body.data).toHaveLength(1);
     expect(body.data[0].cveIds).toEqual(['CVE-2024-1234']);
     expect(body.data[0].version).toBe('128.0.3');
+    // No failed attempt → explicit null, not an absent field.
+    expect(body.data[0].installFailure).toBeNull();
+  });
+
+  it('overlays the last failed install attempt and its reason on the list row (#4223)', async () => {
+    const failure = {
+      deviceCount: 1,
+      error: 'preflight check "battery" failed: running on battery power (battery: 76%)',
+      failedAt: '2026-08-29T18:00:00.000Z'
+    };
+    vi.mocked(loadPatchInstallFailures).mockResolvedValueOnce(new Map([[PATCH_ID, failure]]));
+    vi.mocked(db.select)
+      .mockReturnValueOnce(selectPatchListResult([
+        {
+          id: PATCH_ID,
+          title: 'KB5041585',
+          description: null,
+          source: 'microsoft',
+          severity: 'important',
+          category: 'security',
+          version: null,
+          osTypes: ['windows'],
+          inferredOs: null,
+          cveIds: [],
+          releaseDate: null,
+          requiresReboot: true,
+          downloadSizeMb: null,
+          createdAt: new Date('2026-08-01T00:00:00.000Z')
+        }
+      ]) as any)
+      .mockReturnValueOnce(selectWhereResult([{ count: 1 }]) as any)
+      .mockReturnValueOnce(selectSourceCountsResult() as any);
+
+    const res = await app.request('/patches', {
+      method: 'GET',
+      headers: { Authorization: 'Bearer token' }
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data[0].installFailure).toEqual(failure);
+    expect(vi.mocked(loadPatchInstallFailures)).toHaveBeenCalledWith([PATCH_ID], { orgId: undefined });
+  });
+
+  describe('outstanding device count (#8728)', () => {
+    const OTHER_PATCH_ID = '88888888-8888-4888-8888-888888888888';
+    const listRow = (id: string) => ({
+      id,
+      title: `Patch ${id.slice(0, 4)}`,
+      description: null,
+      source: 'microsoft',
+      severity: 'important',
+      category: 'security',
+      version: null,
+      osTypes: ['windows'],
+      inferredOs: null,
+      cveIds: [],
+      releaseDate: null,
+      requiresReboot: false,
+      downloadSizeMb: null,
+      createdAt: new Date('2026-08-01T00:00:00.000Z')
+    });
+
+    function mockListPage() {
+      vi.mocked(db.select)
+        .mockReturnValueOnce(selectPatchListResult([listRow(PATCH_ID), listRow(OTHER_PATCH_ID)]) as any)
+        .mockReturnValueOnce(selectWhereResult([{ count: 2 }]) as any)
+        .mockReturnValueOnce(selectSourceCountsResult() as any);
+    }
+
+    it('overlays one integer per row from a single per-page load, 0 when absent', async () => {
+      vi.mocked(loadOutstandingDeviceCounts).mockResolvedValueOnce(new Map([[PATCH_ID, 7]]));
+      mockListPage();
+
+      const res = await app.request('/patches', { headers: { Authorization: 'Bearer token' } });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data[0].outstandingDeviceCount).toBe(7);
+      expect(body.data[1].outstandingDeviceCount).toBe(0);
+      expect(vi.mocked(loadOutstandingDeviceCounts)).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(loadOutstandingDeviceCounts)).toHaveBeenCalledWith(
+        [PATCH_ID, OTHER_PATCH_ID],
+        OUTSTANDING_SCOPE
+      );
+      // Scoped by the caller's auth; ?orgId= narrowing is covered against real
+      // Postgres in patchOutstandingDevices.integration.test.ts.
+      expect(vi.mocked(resolveOutstandingDeviceScope)).toHaveBeenCalledWith(
+        expect.objectContaining({ orgCondition: expect.any(Function) }),
+        expect.objectContaining({ orgId: undefined })
+      );
+    });
+
+    it('reports 0 for every row without querying when the caller can see no devices', async () => {
+      vi.mocked(resolveOutstandingDeviceScope).mockReturnValueOnce(null);
+      mockListPage();
+
+      const res = await app.request('/patches', { headers: { Authorization: 'Bearer token' } });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data.map((p: { outstandingDeviceCount: number }) => p.outstandingDeviceCount)).toEqual([0, 0]);
+      expect(vi.mocked(loadOutstandingDeviceCounts)).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('GET /patches severitySource (#9387 gap 2)', () => {
+    const OTHER_PATCH_ID = '99999999-9999-4999-8999-999999999999';
+    const listRow = (id: string, severity: string) => ({
+      id,
+      title: `Patch ${id.slice(0, 4)}`,
+      description: null,
+      source: 'microsoft',
+      severity,
+      category: 'security',
+      version: null,
+      osTypes: ['windows'],
+      inferredOs: null,
+      cveIds: [],
+      releaseDate: null,
+      requiresReboot: false,
+      downloadSizeMb: null,
+      createdAt: new Date('2026-08-01T00:00:00.000Z')
+    });
+
+    it('marks a row derived only when its displayed severity is the derived device report', async () => {
+      vi.mocked(loadCatalogReportedSeverities).mockResolvedValueOnce(new Map([
+        [PATCH_ID, { severity: 'important', source: 'derived' as const }],
+        // Displayed value differs from the device report (e.g. a trusted
+        // shared value) — the device's provenance must not be attached.
+        [OTHER_PATCH_ID, { severity: 'important', source: 'derived' as const }],
+      ]));
+      vi.mocked(db.select)
+        .mockReturnValueOnce(selectPatchListResult([listRow(PATCH_ID, 'important'), listRow(OTHER_PATCH_ID, 'unknown')]) as any)
+        .mockReturnValueOnce(selectWhereResult([{ count: 2 }]) as any)
+        .mockReturnValueOnce(selectSourceCountsResult() as any);
+
+      const res = await app.request('/patches', { headers: { Authorization: 'Bearer token' } });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data[0].severitySource).toBe('derived');
+      expect(body.data[1].severitySource).toBeNull();
+      expect(vi.mocked(loadCatalogReportedSeverities)).toHaveBeenCalledWith(
+        [PATCH_ID, OTHER_PATCH_ID],
+        OUTSTANDING_SCOPE
+      );
+    });
+
+    it('returns null provenance without querying when the caller can see no devices', async () => {
+      vi.mocked(resolveOutstandingDeviceScope).mockReturnValueOnce(null);
+      vi.mocked(db.select)
+        .mockReturnValueOnce(selectPatchListResult([listRow(PATCH_ID, 'important')]) as any)
+        .mockReturnValueOnce(selectWhereResult([{ count: 1 }]) as any)
+        .mockReturnValueOnce(selectSourceCountsResult() as any);
+
+      const res = await app.request('/patches', { headers: { Authorization: 'Bearer token' } });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data[0].severitySource).toBeNull();
+      expect(vi.mocked(loadCatalogReportedSeverities)).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('GET /patches/:id/devices (#8728)', () => {
+    const device = {
+      deviceId: DEVICE_A,
+      hostname: 'laptop-a',
+      status: 'online',
+      lastCheckedAt: '2026-10-01T12:00:00.000Z'
+    };
+
+    it('returns the outstanding devices with default pagination', async () => {
+      vi.mocked(listOutstandingDevices).mockResolvedValueOnce({ visible: true, devices: [device], total: 1 });
+
+      const res = await app.request(`/patches/${PATCH_ID}/devices`, {
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({
+        data: [device],
+        pagination: { page: 1, limit: 50, total: 1 }
+      });
+      expect(vi.mocked(listOutstandingDevices)).toHaveBeenCalledWith(PATCH_ID, OUTSTANDING_SCOPE, {
+        limit: 50,
+        offset: 0
+      });
+    });
+
+    it('caps the page size at 200 and turns page into an offset', async () => {
+      const res = await app.request(`/patches/${PATCH_ID}/devices?limit=1000&page=3`, {
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(200);
+      expect(vi.mocked(listOutstandingDevices)).toHaveBeenCalledWith(PATCH_ID, OUTSTANDING_SCOPE, {
+        limit: 200,
+        offset: 400
+      });
+    });
+
+    it('returns 404 when the patch is not visible in the caller\'s scope', async () => {
+      vi.mocked(listOutstandingDevices).mockResolvedValueOnce({ visible: false, devices: [], total: 0 });
+
+      const res = await app.request(`/patches/${PATCH_ID}/devices`, {
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(404);
+      expect(await res.json()).toEqual({ error: 'Patch not found' });
+    });
+
+    it('returns 404 without querying when the caller can see no devices', async () => {
+      vi.mocked(resolveOutstandingDeviceScope).mockReturnValueOnce(null);
+
+      const res = await app.request(`/patches/${PATCH_ID}/devices`, {
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(404);
+      expect(vi.mocked(listOutstandingDevices)).not.toHaveBeenCalled();
+    });
+
+    it('returns 403 for an ?orgId= the caller cannot access', async () => {
+      const res = await app.request(`/patches/${PATCH_ID}/devices?orgId=${BLOCKED_ORG_ID}`, {
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(403);
+      expect(vi.mocked(listOutstandingDevices)).not.toHaveBeenCalled();
+    });
+
+    it('denies the device list without devices:read', async () => {
+      mockAuthState.permissions = [{ resource: 'patches', action: 'read' }];
+
+      const res = await app.request(`/patches/${PATCH_ID}/devices`, {
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(403);
+    });
+
+    it('rejects a non-uuid patch id with 400', async () => {
+      const res = await app.request('/patches/not-a-uuid/devices', {
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(400);
+    });
   });
 
   it('defaults to newest-first (desc createdAt) when no sort params are supplied', async () => {
@@ -561,8 +881,9 @@ describe('patch routes', () => {
     });
 
     expect(res.status).toBe(200);
+    const projectedSeverity = (vi.mocked(db.select).mock.calls[0]?.[0] as { severity: unknown }).severity;
     expect(capture.orderByAll).toEqual([
-      { op: 'asc', value: 'patches.severity' },
+      { op: 'asc', value: projectedSeverity },
       { op: 'asc', value: 'patches.id' },
     ]);
   });
@@ -596,7 +917,81 @@ describe('patch routes', () => {
     });
 
     expect(res.status).toBe(200);
-    expect(capture.orderBy).toEqual({ op: 'asc', value: 'patches.severity' });
+    const projectedSeverity = (vi.mocked(db.select).mock.calls[0]?.[0] as { severity: unknown }).severity;
+    expect(capture.orderBy).toEqual({ op: 'asc', value: projectedSeverity });
+  });
+
+  // #9387 gap 1: `patches.severity` stays 'unknown' for microsoft/apple/linux
+  // rows, so the list resolves it from the caller's own device reports. The
+  // real SQL (highest report wins, tenant isolation, filter/sort agreement) is
+  // covered against Postgres in
+  // __tests__/integration/patchCatalogSeverity.integration.test.ts; these pin
+  // the wiring — one expression, scoped by the caller's device scope, used for
+  // the column, the filter and the sort.
+  describe('resolved severity (#9387)', () => {
+    function mockCapturedList(capture: { where?: unknown; orderBy?: unknown }) {
+      vi.mocked(db.select)
+        .mockReturnValueOnce(selectPatchListCapture([], capture) as any)
+        .mockReturnValueOnce(selectWhereResult([{ count: 0 }]) as any)
+        .mockReturnValueOnce(selectSourceCountsResult() as any);
+    }
+    const projectedSeverity = () =>
+      (vi.mocked(db.select).mock.calls[0]?.[0] as { severity: unknown }).severity;
+
+    it('projects a severity scoped by the caller\'s device scope, not the raw column', async () => {
+      mockCapturedList({});
+
+      const res = await app.request('/patches', { headers: { Authorization: 'Bearer token' } });
+
+      expect(res.status).toBe(200);
+      const severity = projectedSeverity();
+      expect(severity).not.toBe('patches.severity');
+      expect(exprContains(severity, 'patches.severity')).toBe(true);
+      expect(exprContains(severity, 'devicePatches.reportedSeverity')).toBe(true);
+      expect(exprContains(severity, OUTSTANDING_SCOPE[0])).toBe(true);
+    });
+
+    it('filters ?severity= on the same resolved expression the column shows', async () => {
+      const capture: { where?: unknown } = {};
+      mockCapturedList(capture);
+
+      const res = await app.request('/patches?severity=critical', {
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(200);
+      const severity = projectedSeverity();
+      expect(exprContains(capture.where, severity)).toBe(true);
+      expect(exprContains(capture.where, 'critical')).toBe(true);
+      expect(exprContains(capture.where, 'devicePatches.reportedSeverity')).toBe(true);
+      expect(exprContains(capture.where, OUTSTANDING_SCOPE[0])).toBe(true);
+    });
+
+    it('sorts sortBy=severity on the same scoped resolved expression', async () => {
+      const capture: { orderBy?: unknown } = {};
+      mockCapturedList(capture);
+
+      const res = await app.request('/patches?sortBy=severity&sortDir=desc', {
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(200);
+      expect(capture.orderBy).toEqual({ op: 'desc', value: projectedSeverity() });
+      expect(exprContains(capture.orderBy, 'devicePatches.reportedSeverity')).toBe(true);
+      expect(exprContains(capture.orderBy, OUTSTANDING_SCOPE[0])).toBe(true);
+    });
+
+    it('falls back to the trusted column only when the caller can see no devices', async () => {
+      vi.mocked(resolveOutstandingDeviceScope).mockReturnValueOnce(null);
+      mockCapturedList({});
+
+      const res = await app.request('/patches', { headers: { Authorization: 'Bearer token' } });
+
+      expect(res.status).toBe(200);
+      const severity = projectedSeverity();
+      expect(exprContains(severity, 'patches.severity')).toBe(true);
+      expect(exprContains(severity, 'devicePatches.reportedSeverity')).toBe(false);
+    });
   });
 
   it('rejects an unknown sortBy column with 400', async () => {
@@ -1058,6 +1453,119 @@ describe('patch routes', () => {
 
     expect(res.status).toBe(404);
     expect(await res.json()).toEqual({ error: 'Report not found' });
+  });
+
+  describe('report file retention', () => {
+    const reportId = '55555555-5555-5555-5555-555555555555';
+    const DAY_MS = 24 * 60 * 60 * 1000;
+
+    function reportRow(overrides: Record<string, unknown>) {
+      const capturedAt = new Date();
+      return {
+        id: reportId,
+        orgId: ACCESSIBLE_ORG_ID,
+        status: 'completed',
+        format: 'csv',
+        source: null,
+        severity: null,
+        summary: { total: 1 },
+        rowCount: 1,
+        errorMessage: null,
+        startedAt: capturedAt,
+        completedAt: capturedAt,
+        createdAt: capturedAt,
+        outputPath: `/tmp/${reportId}.csv`,
+        ...reportScopeColumns(restrictedReportScope(ACCESSIBLE_ORG_ID, [REPORT_SITE_A]), USER_ID, capturedAt),
+        ...overrides,
+      };
+    }
+
+    it('returns 410 for an expired report download', async () => {
+      mockAuthState.permissions = [{ resource: 'reports', action: 'export' }];
+      vi.mocked(db.select).mockReturnValueOnce(selectWhereLimitResult([
+        reportRow({ status: 'expired', outputPath: null }),
+      ]) as any);
+
+      const res = await app.request(`/patches/compliance/report/${reportId}/download`, {
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(410);
+      expect((await res.json()).error).toMatch(/expired/i);
+    });
+
+    it('returns 410 for a completed report past the retention window even before the sweep has run', async () => {
+      mockAuthState.permissions = [{ resource: 'reports', action: 'export' }];
+      const old = new Date(Date.now() - 31 * DAY_MS);
+      vi.mocked(db.select).mockReturnValueOnce(selectWhereLimitResult([
+        reportRow({ completedAt: old, createdAt: old }),
+      ]) as any);
+
+      const res = await app.request(`/patches/compliance/report/${reportId}/download`, {
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(410);
+    });
+
+    it('still returns an opaque not-found (not 410) when the caller cannot see an expired report', async () => {
+      mockAuthState.permissions = [{ resource: 'reports', action: 'export' }];
+      reportAuthorityState.result.authority.scope = restrictedReportScope(ACCESSIBLE_ORG_ID, [REPORT_SITE_B]);
+      vi.mocked(db.select).mockReturnValueOnce(selectWhereLimitResult([
+        reportRow({ status: 'expired', outputPath: null }),
+      ]) as any);
+
+      const res = await app.request(`/patches/compliance/report/${reportId}/download`, {
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(404);
+    });
+
+    it('reports the expired state with no download URL', async () => {
+      mockAuthState.permissions = [{ resource: 'reports', action: 'read' }];
+      vi.mocked(db.select).mockReturnValueOnce(selectWhereLimitResult([
+        reportRow({ status: 'expired', outputPath: null }),
+      ]) as any);
+
+      const res = await app.request(`/patches/compliance/report/${reportId}`, {
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data.status).toBe('expired');
+      expect(body.data.downloadUrl).toBeNull();
+    });
+
+    it('reports a completed report past the window as expired before the sweep has run', async () => {
+      mockAuthState.permissions = [{ resource: 'reports', action: 'read' }];
+      const old = new Date(Date.now() - 31 * DAY_MS);
+      vi.mocked(db.select).mockReturnValueOnce(selectWhereLimitResult([
+        reportRow({ completedAt: old, createdAt: old }),
+      ]) as any);
+
+      const res = await app.request(`/patches/compliance/report/${reportId}`, {
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      const body = await res.json();
+      expect(body.data.status).toBe('expired');
+      expect(body.data.downloadUrl).toBeNull();
+    });
+
+    it('keeps the download URL for a completed report inside the window', async () => {
+      mockAuthState.permissions = [{ resource: 'reports', action: 'read' }];
+      vi.mocked(db.select).mockReturnValueOnce(selectWhereLimitResult([reportRow({})]) as any);
+
+      const res = await app.request(`/patches/compliance/report/${reportId}`, {
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      const body = await res.json();
+      expect(body.data.status).toBe('completed');
+      expect(body.data.downloadUrl).toBe(`/api/v1/patches/compliance/report/${reportId}/download`);
+    });
   });
 
   it('queues rollback commands for accessible devices', async () => {
@@ -1672,5 +2180,169 @@ describe('patch routes', () => {
     // org-scoped caller. Assert the system-context escape was never entered
     // (states the isolation guarantee directly, rather than counting selects).
     expect(withSystemDbAccessContext).not.toHaveBeenCalled();
+  });
+
+  // #7663: patch_approvals carries an own-partner SELECT branch (#7662), so a
+  // caller whose ambient RLS context already covers the partner must read it on
+  // the request's own connection. runOutsideDbContext + withSystemDbAccessContext
+  // checks out a SECOND pooled connection while the request transaction holds
+  // the first — the hold-and-wait pool-deadlock shape.
+  describe('patch_approvals reads stay on the request connection (#7663)', () => {
+    const PATCH_ROW = {
+      id: PATCH_ID,
+      title: 'Windows Cumulative Update',
+      description: null,
+      source: 'microsoft',
+      severity: 'critical',
+      category: 'system',
+      osTypes: ['windows'],
+      inferredOs: null,
+      releaseDate: null,
+      requiresReboot: false,
+      downloadSizeMb: null,
+      createdAt: new Date('2026-02-07T00:00:00.000Z')
+    };
+
+    function mockPatchListWithApprovals(approvals: unknown[]) {
+      let approvalWhere: unknown;
+      vi.mocked(db.select)
+        .mockReturnValueOnce(selectPatchListResult([PATCH_ROW]) as any)
+        .mockReturnValueOnce(selectWhereResult([{ count: 1 }]) as any)
+        .mockReturnValueOnce(selectSourceCountsResult() as any)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockImplementation((cond: unknown) => {
+              approvalWhere = cond;
+              return Promise.resolve(approvals);
+            })
+          })
+        } as any);
+      return () => approvalWhere;
+    }
+
+    it('list: a partner context covering the partner reads approvals in place', async () => {
+      mockAuthState.scope = 'partner';
+      mockAuthState.orgId = null;
+      mockAuthState.partnerId = PARTNER_ID;
+      mockAuthState.accessibleOrgIds = [ACCESSIBLE_ORG_ID];
+      vi.mocked(getCurrentDbAccessContext).mockReturnValue({
+        scope: 'partner',
+        orgId: null,
+        accessibleOrgIds: [ACCESSIBLE_ORG_ID],
+        accessiblePartnerIds: [PARTNER_ID],
+        userId: USER_ID,
+        currentPartnerId: PARTNER_ID,
+      } as any);
+      const approvalWhere = mockPatchListWithApprovals([{ patchId: PATCH_ID, status: 'approved' }]);
+
+      const res = await app.request('/patches', { method: 'GET', headers: { Authorization: 'Bearer token' } });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data[0].approvalStatus).toBe('approved');
+      expect(approvalWhere()).toEqual({
+        op: 'and',
+        conditions: [{ op: 'eq', left: 'patchApprovals.partnerId', right: PARTNER_ID }]
+      });
+      expect(runOutsideDbContext).not.toHaveBeenCalled();
+      expect(withSystemDbAccessContext).not.toHaveBeenCalled();
+    });
+
+    it('list: a context that cannot see the partner still takes the system escape', async () => {
+      // Fallback contract: an ambient context for ANOTHER partner (or none) must
+      // not read in place — RLS would silently return zero rows (#2822).
+      mockAuthState.scope = 'partner';
+      mockAuthState.orgId = null;
+      mockAuthState.partnerId = PARTNER_ID;
+      mockAuthState.accessibleOrgIds = [ACCESSIBLE_ORG_ID];
+      vi.mocked(getCurrentDbAccessContext).mockReturnValue({
+        scope: 'partner',
+        orgId: null,
+        accessibleOrgIds: [ACCESSIBLE_ORG_ID],
+        accessiblePartnerIds: ['99999999-9999-4999-8999-999999999999'],
+        userId: USER_ID,
+        currentPartnerId: '99999999-9999-4999-8999-999999999999',
+      } as any);
+      mockPatchListWithApprovals([{ patchId: PATCH_ID, status: 'approved' }]);
+
+      const res = await app.request('/patches', { method: 'GET', headers: { Authorization: 'Bearer token' } });
+
+      expect(res.status).toBe(200);
+      expect((await res.json()).data[0].approvalStatus).toBe('approved');
+      expect(runOutsideDbContext).toHaveBeenCalledTimes(1);
+      expect(withSystemDbAccessContext).toHaveBeenCalledTimes(1);
+    });
+
+    it('compliance: an org user on its own partner ring reads both approval sets in place', async () => {
+      // Org-scoped token: accessiblePartnerIds is [] but currentPartnerId is the
+      // org's own partner, which is exactly what the own-partner SELECT branch keys on.
+      mockAuthState.scope = 'organization';
+      mockAuthState.orgId = ACCESSIBLE_ORG_ID;
+      mockAuthState.partnerId = PARTNER_ID;
+      mockAuthState.accessibleOrgIds = [ACCESSIBLE_ORG_ID];
+      vi.mocked(getCurrentDbAccessContext).mockReturnValue({
+        scope: 'organization',
+        orgId: ACCESSIBLE_ORG_ID,
+        accessibleOrgIds: [ACCESSIBLE_ORG_ID],
+        accessiblePartnerIds: [],
+        userId: USER_ID,
+        currentPartnerId: PARTNER_ID,
+      } as any);
+
+      const approvalWheres: unknown[] = [];
+      const approvalRead = (rows: unknown[]) => ({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockImplementation((cond: unknown) => {
+            approvalWheres.push(cond);
+            return Promise.resolve(rows);
+          })
+        })
+      });
+      const groupBy = vi.fn().mockResolvedValue([{ status: 'pending', count: 1 }]);
+      const innerJoin = vi.fn().mockReturnValue({ where: vi.fn().mockReturnValue({ groupBy }) });
+      const breakdownOrderBy = vi.fn().mockResolvedValue([]);
+      const breakdownInnerJoin1 = vi.fn().mockReturnValue({
+        innerJoin: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            groupBy: vi.fn().mockReturnValue({ having: vi.fn().mockReturnValue({ orderBy: breakdownOrderBy }) })
+          })
+        })
+      });
+      const severityInnerJoin = vi.fn().mockReturnValue({
+        where: vi.fn().mockReturnValue({ groupBy: vi.fn().mockResolvedValue([]) })
+      });
+
+      vi.mocked(db.select)
+        // ring lookup (patch_policies own-partner branch, request context)
+        .mockReturnValueOnce(selectWhereLimitResult([{ partnerId: PARTNER_ID }]) as any)
+        // org device IDs
+        .mockReturnValueOnce(selectWhereResult([{ id: DEVICE_A }]) as any)
+        // ring-approved patch scope (patch_approvals)
+        .mockReturnValueOnce(approvalRead([{ patchId: PATCH_ID }]) as any)
+        // candidatePatchRows
+        .mockReturnValueOnce(selectWhereResult([{ patchId: PATCH_ID }]) as any)
+        // approved-patch pre-fetch (patch_approvals)
+        .mockReturnValueOnce(approvalRead([{ patchId: PATCH_ID }]) as any)
+        // status counts / device breakdown / severity counts
+        .mockReturnValueOnce({ from: vi.fn().mockReturnValue({ innerJoin }) } as any)
+        .mockReturnValueOnce({ from: vi.fn().mockReturnValue({ innerJoin: breakdownInnerJoin1 }) } as any)
+        .mockReturnValueOnce({ from: vi.fn().mockReturnValue({ innerJoin: severityInnerJoin }) } as any);
+
+      const res = await app.request(`/patches/compliance?ringId=${RING_ID}`, {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(200);
+      // Both patch_approvals reads ran, each pinned to the ring's partner.
+      expect(approvalWheres).toHaveLength(2);
+      for (const where of approvalWheres) {
+        expect((where as { conditions: unknown[] }).conditions).toContainEqual(
+          { op: 'eq', left: 'patchApprovals.partnerId', right: PARTNER_ID }
+        );
+      }
+      expect(runOutsideDbContext).not.toHaveBeenCalled();
+      expect(withSystemDbAccessContext).not.toHaveBeenCalled();
+    });
   });
 });

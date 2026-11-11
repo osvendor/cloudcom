@@ -9,11 +9,14 @@
  * carrying a `config_policy_remote_access_settings` row, and an assignment at
  * the device level, then asserts the resolved prompt config reflects the row.
  *
- * Also asserts the default path (no remote_access policy → spec defaults) and
- * the pure `buildTechnicianDisplay` redaction at each identity level.
+ * Also asserts the default path (no remote_access policy → spec defaults), the
+ * refusal paths (unresolvable device; a remote_access link whose settings row
+ * is missing although the link carries prompt settings), the VNC consent gate,
+ * and the pure `buildTechnicianDisplay` redaction at each identity level.
  */
 import { describe, it, expect, beforeEach } from 'vitest';
 import './setup';
+import { withDbAccessContext, type DbAccessContext } from '../../db';
 import { getTestDb } from './setup';
 import {
   partners,
@@ -30,11 +33,14 @@ import {
   buildTechnicianDisplay,
   DEFAULT_REMOTE_SESSION_PROMPT_CONFIG,
 } from '../../routes/remote/helpers';
+import { RemoteSessionPromptPolicyError } from '../../routes/remote/consentGate';
+import { checkVncConsentGate } from '../../routes/remote/vncConsentGate';
 
 const hasDb = !!process.env.DATABASE_URL;
 
 let orgId: string;
 let siteId: string;
+let partnerId: string;
 
 async function seedTenant(sfx: string): Promise<void> {
   const db = getTestDb();
@@ -42,6 +48,7 @@ async function seedTenant(sfx: string): Promise<void> {
     .insert(partners)
     .values({ name: `PromptCfg ${sfx}`, slug: `promptcfg-${sfx}`, type: 'msp', plan: 'pro', status: 'active' })
     .returning({ id: partners.id });
+  partnerId = p!.id;
   const [o] = await db
     .insert(organizations)
     .values({ currencyCode: 'USD', partnerId: p!.id, name: `PromptOrg ${sfx}`, slug: `promptorg-${sfx}` })
@@ -87,7 +94,9 @@ async function assignRemoteAccessPolicy(
     notifyOnSessionEnd?: boolean;
     showActiveIndicator?: boolean;
     technicianIdentityLevel: string;
+    allowUserEndSession?: boolean;
   },
+  opts: { settingsRow?: boolean; linkInlineSettings?: Record<string, unknown> | null } = {},
 ): Promise<void> {
   const db = getTestDb();
   const [policy] = await db
@@ -96,15 +105,20 @@ async function assignRemoteAccessPolicy(
     .returning({ id: configurationPolicies.id });
   const [link] = await db
     .insert(configPolicyFeatureLinks)
-    .values({ configPolicyId: policy!.id, featureType: 'remote_access', inlineSettings: settings })
+    .values({
+      configPolicyId: policy!.id,
+      featureType: 'remote_access',
+      inlineSettings: opts.linkInlineSettings === undefined ? settings : opts.linkInlineSettings,
+    })
     .returning({ id: configPolicyFeatureLinks.id });
-  await db.insert(configPolicyRemoteAccessSettings).values({
+  if (opts.settingsRow !== false) await db.insert(configPolicyRemoteAccessSettings).values({
     featureLinkId: link!.id,
     sessionPromptMode: settings.sessionPromptMode,
     consentUnavailableBehavior: settings.consentUnavailableBehavior ?? 'proceed',
     notifyOnSessionEnd: settings.notifyOnSessionEnd ?? true,
     showActiveIndicator: settings.showActiveIndicator ?? true,
     technicianIdentityLevel: settings.technicianIdentityLevel,
+    ...(settings.allowUserEndSession === undefined ? {} : { allowUserEndSession: settings.allowUserEndSession }),
   });
   await db.insert(configPolicyAssignments).values({
     configPolicyId: policy!.id,
@@ -162,6 +176,21 @@ describe('resolveRemoteSessionPromptConfig', () => {
     expect(cfg.consentUnavailableBehavior).toBe('block');
     expect(cfg.notifyOnEnd).toBe(false);
     expect(cfg.showIndicator).toBe(false);
+    // #10190 W06: a row inserted without the column gets the DB default (ON).
+    expect(cfg.allowUserEndSession).toBe(true);
+  });
+
+  it.runIf(hasDb)('resolves allowUserEndSession = false from the assigned policy row (#10190 W06)', async () => {
+    const sfx = `no-user-end-${Date.now()}`;
+    const deviceId = await seedDevice(sfx);
+    await assignRemoteAccessPolicy(deviceId, sfx, {
+      sessionPromptMode: 'notify',
+      technicianIdentityLevel: 'name_email',
+      allowUserEndSession: false,
+    });
+
+    const cfg = await resolveRemoteSessionPromptConfig(deviceId);
+    expect(cfg.allowUserEndSession).toBe(false);
   });
 
   it.runIf(hasDb)('returns spec defaults when no remote_access policy applies', async () => {
@@ -172,5 +201,176 @@ describe('resolveRemoteSessionPromptConfig', () => {
     expect(cfg).toEqual(DEFAULT_REMOTE_SESSION_PROMPT_CONFIG);
     expect(cfg.mode).toBe('notify');
     expect(cfg.identityLevel).toBe('name_email');
+  });
+
+  it.runIf(hasDb)('refuses (throws) instead of returning notify when the device does not resolve', async () => {
+    await expect(resolveRemoteSessionPromptConfig('00000000-0000-4000-8000-000000000000'))
+      .rejects.toBeInstanceOf(RemoteSessionPromptPolicyError);
+  });
+
+  it.runIf(hasDb)('refuses when the settings row is missing but the link carries prompt settings', async () => {
+    const sfx = `missing-row-${Date.now()}`;
+    const deviceId = await seedDevice(sfx);
+    await assignRemoteAccessPolicy(deviceId, sfx, {
+      sessionPromptMode: 'consent',
+      consentUnavailableBehavior: 'block',
+      technicianIdentityLevel: 'name',
+    }, { settingsRow: false });
+
+    await expect(resolveRemoteSessionPromptConfig(deviceId))
+      .rejects.toThrow(/settings row missing/);
+  });
+
+  it.runIf(hasDb)('uses the stored-row defaults when a link saved without settings has no settings row', async () => {
+    const sfx = `no-settings-${Date.now()}`;
+    const deviceId = await seedDevice(sfx);
+    await assignRemoteAccessPolicy(deviceId, sfx, {
+      sessionPromptMode: 'notify',
+      technicianIdentityLevel: 'name_email',
+    }, { settingsRow: false, linkInlineSettings: null });
+
+    const cfg = await resolveRemoteSessionPromptConfig(deviceId);
+    expect(cfg).toEqual(DEFAULT_REMOTE_SESSION_PROMPT_CONFIG);
+  });
+});
+
+describe('checkVncConsentGate (real policy resolution)', () => {
+  beforeEach(async () => {
+    if (!hasDb) return;
+    await seedTenant(`vnc-${Date.now()}`);
+  });
+
+  it.runIf(hasDb)('refuses VNC for a device under a consent-mode policy', async () => {
+    const sfx = `vnc-consent-${Date.now()}`;
+    const deviceId = await seedDevice(sfx);
+    await assignRemoteAccessPolicy(deviceId, sfx, {
+      sessionPromptMode: 'consent',
+      consentUnavailableBehavior: 'proceed',
+      technicianIdentityLevel: 'name_email',
+    });
+
+    await expect(checkVncConsentGate(deviceId)).resolves.toMatchObject({
+      ok: false,
+      status: 409,
+      body: { code: 'CONSENT_REQUIRED_TRANSPORT_UNAVAILABLE' },
+    });
+  });
+
+  it.runIf(hasDb)('allows VNC for a notify-mode policy and for a device with no policy', async () => {
+    const sfx = `vnc-notify-${Date.now()}`;
+    const notifyDevice = await seedDevice(sfx);
+    await assignRemoteAccessPolicy(notifyDevice, sfx, {
+      sessionPromptMode: 'notify',
+      technicianIdentityLevel: 'name_email',
+    });
+    const bareDevice = await seedDevice(`${sfx}-bare`);
+
+    await expect(checkVncConsentGate(notifyDevice)).resolves.toEqual({ ok: true });
+    await expect(checkVncConsentGate(bareDevice)).resolves.toEqual({ ok: true });
+  });
+});
+
+/**
+ * Request routes (POST /tunnels, the JWT offer route) resolve the prompt policy
+ * in the caller's own DB context rather than a second system connection, so
+ * RLS applies as the caller. These pin that an RLS-invisible policy never reads
+ * as "no policy → notify": a partner-wide consent policy is visible to an
+ * org-scoped caller of that partner, and anything the caller cannot see refuses.
+ */
+describe('prompt policy resolution in an org-scoped request context', () => {
+  function orgContext(ctxOrgId: string, currentPartnerId: string | null): DbAccessContext {
+    return {
+      scope: 'organization',
+      orgId: ctxOrgId,
+      accessibleOrgIds: [ctxOrgId],
+      accessiblePartnerIds: [],
+      userId: null,
+      currentPartnerId,
+    };
+  }
+
+  async function assignPartnerWideConsentPolicy(sfx: string): Promise<void> {
+    const db = getTestDb();
+    const settings = {
+      vncRelay: true,
+      sessionPromptMode: 'consent',
+      consentUnavailableBehavior: 'block',
+      technicianIdentityLevel: 'name',
+    };
+    const [policy] = await db
+      .insert(configurationPolicies)
+      .values({ orgId: null, partnerId, name: `PartnerWideConsent ${sfx}`, status: 'active' })
+      .returning({ id: configurationPolicies.id });
+    const [link] = await db
+      .insert(configPolicyFeatureLinks)
+      .values({ configPolicyId: policy!.id, featureType: 'remote_access', inlineSettings: settings })
+      .returning({ id: configPolicyFeatureLinks.id });
+    await db.insert(configPolicyRemoteAccessSettings).values({
+      featureLinkId: link!.id,
+      sessionPromptMode: 'consent',
+      consentUnavailableBehavior: 'block',
+      technicianIdentityLevel: 'name',
+      // #10190 W06: a partner-wide policy can turn the user's End off.
+      allowUserEndSession: false,
+    });
+    await db.insert(configPolicyAssignments).values({
+      configPolicyId: policy!.id,
+      level: 'partner',
+      targetId: partnerId,
+    });
+  }
+
+  beforeEach(async () => {
+    if (!hasDb) return;
+    await seedTenant(`orgctx-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+  });
+
+  it.runIf(hasDb)('an org-scoped caller resolves a partner-wide consent policy as consent and VNC is refused', async () => {
+    const sfx = `pw-consent-${Date.now()}`;
+    const deviceId = await seedDevice(sfx);
+    await assignPartnerWideConsentPolicy(sfx);
+
+    const { cfg, gate } = await withDbAccessContext(orgContext(orgId, partnerId), async () => ({
+      cfg: await resolveRemoteSessionPromptConfig(deviceId),
+      gate: await checkVncConsentGate(deviceId),
+    }));
+
+    expect(cfg.mode).toBe('consent');
+    expect(cfg.consentUnavailableBehavior).toBe('block');
+    expect(cfg.allowUserEndSession).toBe(false);
+    expect(gate).toMatchObject({
+      ok: false,
+      status: 409,
+      body: { code: 'CONSENT_REQUIRED_TRANSPORT_UNAVAILABLE' },
+    });
+  });
+
+  it.runIf(hasDb)('refuses, rather than returning notify, when the partner-wide policy is invisible to the caller', async () => {
+    const sfx = `pw-blind-${Date.now()}`;
+    const deviceId = await seedDevice(sfx);
+    await assignPartnerWideConsentPolicy(sfx);
+
+    // Same org, but a context without the caller's own partner id: the
+    // SELECT-only partner-wide branch cannot fire.
+    await expect(withDbAccessContext(orgContext(orgId, null), () =>
+      resolveRemoteSessionPromptConfig(deviceId),
+    )).rejects.toBeInstanceOf(RemoteSessionPromptPolicyError);
+  });
+
+  it.runIf(hasDb)('refuses, rather than returning notify, for a device in another org', async () => {
+    const sfx = `other-org-${Date.now()}`;
+    const deviceId = await seedDevice(sfx);
+    const deviceOrgId = orgId;
+    const devicePartnerId = partnerId;
+    await seedTenant(`${sfx}-caller`);
+    expect(orgId).not.toBe(deviceOrgId);
+
+    await expect(withDbAccessContext(orgContext(orgId, partnerId), () =>
+      resolveRemoteSessionPromptConfig(deviceId),
+    )).rejects.toThrow(/did not resolve/);
+    // Same partner as the device, different org: still refused.
+    await expect(withDbAccessContext(orgContext(orgId, devicePartnerId), () =>
+      checkVncConsentGate(deviceId),
+    )).resolves.toMatchObject({ ok: false, status: 503 });
   });
 });

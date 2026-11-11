@@ -60,11 +60,6 @@ const WORKER_SRC = readFileSync(join(API_SRC, 'jobs/intentReleaseWorker.ts'), 'u
  * the suite rather than quietly widening the exemption.
  */
 const AGENT_UNREACHABLE: ReadonlySet<string> = new Set([
-  // aiToolsFleet.ts returns 'Action "setup_auto_approval" is disabled. Patch
-  // policies must be managed through configuration policies.' near the top of
-  // the manage_patches handler; the configuration_policies insert further down
-  // is dead defense-in-depth.
-  'manage_patches:setup_auto_approval',
   // #6206 review: both write a `users` FK (`maintenance_windows.created_by`,
   // `automations.created_by`) and both ARE in their tool's Zod enum, so the
   // validator admits them — but each handler refuses the action as disabled
@@ -210,7 +205,9 @@ function fleetWriteSites(): WriteSite[] {
 function workerAllowlist(): ReadonlySet<string> {
   const start = WORKER_SRC.indexOf('const USER_OWNED_RELEASE_ACTIONS');
   expect(start, 'USER_OWNED_RELEASE_ACTIONS not found in jobs/intentReleaseWorker.ts').toBeGreaterThan(-1);
-  const body = WORKER_SRC.slice(start, WORKER_SRC.indexOf(']);', start));
+  // Strip line comments first: an apostrophe in a comment (`the agent's`)
+  // would otherwise pair with a real quote and swallow an entry (#6907).
+  const body = WORKER_SRC.slice(start, WORKER_SRC.indexOf(']);', start)).replace(/\/\/.*$/gm, '');
   return new Set([...body.matchAll(/'([^']+:[^']*)'/g)].map((m) => m[1]!));
 }
 

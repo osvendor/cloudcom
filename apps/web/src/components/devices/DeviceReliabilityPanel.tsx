@@ -4,12 +4,17 @@ import { useTranslation } from 'react-i18next';
 
 import type { AiPageContext } from '@breeze/shared';
 import { formatDateTime } from '@/lib/dateTimeFormat';
+import { deviceEventLogHash } from '@/lib/deviceEventLogLink';
 import { fetchWithAuth } from '../../stores/auth';
+import { createCancellableRequest, type CancellableRequest } from '../../lib/cancellableRequest';
 import { useMlFeatureFlags } from '../../hooks/useMlFeatureFlags';
 import { useAiStore } from '../../stores/aiStore';
 import { usePermissions } from '../../lib/permissions';
 import HelpTooltip from '../shared/HelpTooltip';
+import HashLink from '../shared/HashLink';
+import ReliabilityBaselineSection, { type ReliabilityBaselineDetails } from './ReliabilityBaselineSection';
 import { formatNumber, formatPercent } from '@/lib/i18n/format';
+import { useStableT } from '@/lib/i18n/useStableT';
 
 type ReliabilityTopIssue = {
   type: 'crashes' | 'hangs' | 'services' | 'hardware' | 'uptime';
@@ -25,6 +30,11 @@ type ReliabilityDriver = {
   weight: number;
   lostPoints: number;
   evidence: Record<string, number>;
+  // #10053: the span the API scored this factor over, and (crashes, hangs,
+  // hardwareErrors) the event-log sources of every event it scored there.
+  windowStart?: string;
+  windowEnd?: string;
+  eventLogSources?: string[];
 };
 
 type ReliabilitySnapshot = {
@@ -45,6 +55,10 @@ type ReliabilitySnapshot = {
   drivers?: ReliabilityDriver[];
   computedAt: string;
   enrolledAt?: string | null;
+  // #5876: while the active baseline marker is provisional the API already
+  // reports trend 'stable' and MTBF null; the panel renders both as a dash.
+  provisional?: boolean;
+  baseline?: ReliabilityBaselineDetails | null;
 };
 
 type ReliabilityOffender = {
@@ -141,6 +155,7 @@ function buildReliabilitySeedPrompt(snapshot: ReliabilitySnapshot, drivers: Reli
     `Score ${snapshot.reliabilityScore}/100 (${scoreBandLabel(snapshot.reliabilityScore)}), trend ${snapshot.trendDirection}.`,
     `30-day uptime ${formatPercent(snapshot.uptime30d / 100, { minimumFractionDigits: 1, maximumFractionDigits: 1 })}, MTBF ${mtbf}.`,
     `Top factors dragging the score: ${driverText}.`,
+    `Before diagnosing, call get_device_hardware_health with includeReliability=true to see the actual scored events (source, event ID, count) behind these factors — do not guess a cause that tool output doesn't support.`,
     `What are the likely root causes, and what remediation — scripts, checks, or a ticket — do you recommend?`,
   ].join(' ');
 }
@@ -232,6 +247,66 @@ function factorEvidenceText(
 // Factors whose raw events appear in the offenders drill-down.
 const OFFENDER_FACTORS = new Set(['serviceFailures', 'hardwareErrors', 'hangs']);
 
+// Fault factors that link to the event log (uptime is exempt, spec §3.7).
+const LINKED_FACTORS = new Set(['crashes', 'hangs', 'serviceFailures', 'hardwareErrors']);
+
+type OffenderGroupKey = keyof ReliabilityOffenders;
+
+// The Windows SCM source every service-failure event is stored under. Service
+// failures carry a parsed service name, not a source, so this is the only
+// source a serviceFailures factor row can name (R2).
+const WINDOWS_SCM_SOURCE = 'Service Control Manager';
+
+// The factor whose scoring window an offender group's links carry.
+const OFFENDER_GROUP_FACTOR: Record<OffenderGroupKey, string> = {
+  services: 'serviceFailures',
+  hardware: 'hardwareErrors',
+  hangs: 'hangs',
+};
+
+type EventLogLink = { href: string; label: string; title: string; ariaLabel: string };
+type EventLogRow = { factor: string } | { group: OffenderGroupKey; key: string };
+
+// Which event-log sources a row's link carries, and whether that filter is
+// exactly the row's subject. Only an exact filter may read "View in event
+// log"; a link that merely narrows to a related source, or carries the window
+// only, reads "Open event log" (R2: never claim a view it does not deliver).
+// - factor rows: crashes/hangs/hardwareErrors name every source the API says
+//   their scored events came from (#10053); Windows serviceFailures names SCM.
+// - offenders: hardware/hang keys ARE the source; a service key is the source
+//   on macOS/Linux, but on Windows it is a service name parsed from the SCM
+//   message, so the link falls back to the SCM source (not exact).
+function eventLogSources(
+  osType: ReliabilitySnapshot['osType'],
+  row: EventLogRow,
+  driver: ReliabilityDriver | undefined,
+): { sources?: string[]; exact: boolean } {
+  if ('factor' in row) {
+    if (row.factor === 'serviceFailures') {
+      return osType === 'windows' ? { sources: [WINDOWS_SCM_SOURCE], exact: true } : { exact: false };
+    }
+    const scored = driver?.eventLogSources;
+    return scored && scored.length > 0 ? { sources: scored, exact: true } : { exact: false };
+  }
+  if (row.group !== 'services') return { sources: [row.key], exact: true };
+  if (osType === 'windows') return { sources: [WINDOWS_SCM_SOURCE], exact: false };
+  return osType ? { sources: [row.key], exact: true } : { exact: false };
+}
+
+// The factor's scoring window as the API reported it, or null when it is
+// missing or not a valid span — the caller then renders text, not a link.
+function driverWindow(driver: ReliabilityDriver | undefined): { from: string; to: string } | null {
+  if (!driver?.windowStart || !driver.windowEnd) return null;
+  const from = Date.parse(driver.windowStart);
+  const to = Date.parse(driver.windowEnd);
+  if (Number.isNaN(from) || Number.isNaN(to) || from > to) return null;
+  return { from: driver.windowStart, to: driver.windowEnd };
+}
+
+const EVENT_LOG_LINK_CLASS =
+  'ml-2 underline decoration-muted-foreground/40 underline-offset-2 transition-colors hover:decoration-current hover:text-foreground ' +
+  'rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1';
+
 function formatOffenderWhen(value: string | null): string | null {
   if (!value) return null;
   const date = new Date(value);
@@ -244,11 +319,13 @@ function OffenderGroup({
   Icon,
   offenders,
   testId,
+  linkFor,
 }: {
   title: string;
   Icon: typeof Wrench;
   offenders: ReliabilityOffender[];
   testId: string;
+  linkFor: (offender: ReliabilityOffender) => EventLogLink | null;
 }) {
   if (offenders.length === 0) return null;
   return (
@@ -260,6 +337,7 @@ function OffenderGroup({
       <ul className="mt-2 space-y-1.5">
         {offenders.map((offender) => {
           const when = formatOffenderWhen(offender.lastOccurrence);
+          const link = linkFor(offender);
           return (
             <li key={offender.key} className="flex items-center justify-between gap-3 text-sm">
               <span className="min-w-0 truncate">
@@ -276,6 +354,17 @@ function OffenderGroup({
                 >
                   {formatCount(offender.count)}×
                 </span>
+                {link && (
+                  <HashLink
+                    hash={link.href}
+                    title={link.title}
+                    aria-label={link.ariaLabel}
+                    data-testid={`reliability-offender-link-${offender.key}`}
+                    className={EVENT_LOG_LINK_CLASS}
+                  >
+                    {link.label}
+                  </HashLink>
+                )}
               </span>
             </li>
           );
@@ -287,40 +376,59 @@ function OffenderGroup({
 
 export default function DeviceReliabilityPanel({ deviceId }: DeviceReliabilityPanelProps) {
   const { t } = useTranslation('devices');
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   const mlFlags = useMlFeatureFlags();
   const [snapshot, setSnapshot] = useState<ReliabilitySnapshot | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
   const reliabilityDisabled = mlFlags.isDisabled('ml.device_reliability.enabled');
 
-  const fetchReliability = useCallback(async () => {
-    setLoading(true);
+  // The one in-flight snapshot request. A new load (device change, retry)
+  // cancels the previous one and unmount cancels whatever is left, so a soft
+  // navigation / org switch away from the device page does not leave this
+  // fetch holding a connection, and a late response for a previous device
+  // cannot overwrite the current one (#4513).
+  const snapshotRequestRef = useRef<CancellableRequest | null>(null);
+
+  // `silent` refreshes in place: the panel keeps rendering the current
+  // snapshot instead of swapping to the spinner, so children holding their own
+  // state (the baseline marker section's open history, its dialogs and their
+  // focus-return targets) stay mounted across a refetch after a marker write.
+  const fetchReliability = useCallback(async ({ silent = false }: { silent?: boolean } = {}) => {
+    snapshotRequestRef.current?.cancel();
+    const request = createCancellableRequest();
+    snapshotRequestRef.current = request;
+    if (!silent) setLoading(true);
     setError(undefined);
     try {
-      const response = await fetchWithAuth(`/reliability/${deviceId}`);
-      if (response.status === 404) {
-        setSnapshot(null);
-        return;
-      }
-      if (!response.ok) throw new Error(t('deviceReliabilityPanel.errors.loadScore'));
+      // sweep D15: no snapshot yet is an expected empty state, so the API
+      // answers 200 with snapshot: null (not 404) — a 404 here would now
+      // also wrongly mask a genuine "device not found".
+      const response = await fetchWithAuth(`/reliability/${deviceId}`, { signal: request.signal });
+      if (!response.ok) throw new Error(stableT('deviceReliabilityPanel.errors.loadScore'));
       const json = await response.json();
+      if (request.cancelled) return;
       setSnapshot(json?.snapshot ?? null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('deviceReliabilityPanel.errors.loadScore'));
+      if (request.cancelled) return;
+      setError(err instanceof Error ? err.message : stableT('deviceReliabilityPanel.errors.loadScore'));
     } finally {
-      setLoading(false);
+      request.settle();
+      if (!request.cancelled) setLoading(false);
     }
-  }, [deviceId, t]);
+  }, [deviceId, stableT]);
 
   useEffect(() => {
     if (!mlFlags.loaded) return;
     if (reliabilityDisabled) {
+      snapshotRequestRef.current?.cancel();
       setSnapshot(null);
       setError(undefined);
       setLoading(false);
       return;
     }
     void fetchReliability();
+    return () => snapshotRequestRef.current?.cancel();
   }, [fetchReliability, mlFlags.loaded, reliabilityDisabled]);
 
   const drivers = useMemo(() => (snapshot?.drivers ?? []).slice(0, 3), [snapshot?.drivers]);
@@ -342,7 +450,9 @@ export default function DeviceReliabilityPanel({ deviceId }: DeviceReliabilityPa
   const startDeviceTask = useAiStore((s) => s.startDeviceTask);
   // #6396: the sidebar is unmounted without ai_sessions:use, so this button
   // would be a dead click (and a background 403) for roles without it.
-  const canUseAi = usePermissions().can('ai_sessions', 'use');
+  const permissions = usePermissions();
+  const canUseAi = permissions.can('ai_sessions', 'use');
+  const canWriteDevices = permissions.can('devices', 'write');
 
   const askAi = useCallback(() => {
     if (!snapshot) return;
@@ -363,17 +473,22 @@ export default function DeviceReliabilityPanel({ deviceId }: DeviceReliabilityPa
   const [offendersLoading, setOffendersLoading] = useState(false);
   const [offendersError, setOffendersError] = useState<string>();
   const offendersFetchedRef = useRef(false);
+  const offendersRequestRef = useRef<CancellableRequest | null>(null);
 
   const loadOffenders = useCallback(async () => {
+    offendersRequestRef.current?.cancel();
+    const request = createCancellableRequest();
+    offendersRequestRef.current = request;
     offendersFetchedRef.current = true;
     setOffendersLoading(true);
     setOffendersError(undefined);
     try {
-      const response = await fetchWithAuth(`/reliability/${deviceId}/offenders`);
+      const response = await fetchWithAuth(`/reliability/${deviceId}/offenders`, { signal: request.signal });
       if (!response.ok) throw new Error(t('deviceReliabilityPanel.errors.loadDetail'));
       const json = await response.json();
       // A 200 with a missing/malformed body must not render a blank, retry-less
       // panel — treat it as a failure so the existing error+retry path handles it.
+      if (request.cancelled) return;
       const data = json?.offenders;
       if (!data || typeof data !== 'object') {
         throw new Error(t('deviceReliabilityPanel.errors.malformedDetail'));
@@ -384,21 +499,26 @@ export default function DeviceReliabilityPanel({ deviceId }: DeviceReliabilityPa
         hangs: Array.isArray(data.hangs) ? data.hangs : [],
       });
     } catch (err) {
+      if (request.cancelled) return;
       offendersFetchedRef.current = false; // allow a retry on next expand
       setOffendersError(err instanceof Error ? err.message : t('deviceReliabilityPanel.errors.loadDetail'));
     } finally {
-      setOffendersLoading(false);
+      request.settle();
+      if (!request.cancelled) setOffendersLoading(false);
     }
   }, [deviceId, t]);
 
   // Reset the drill-down when the panel is pointed at a different device, so a
   // stale offender list (and the fetched-once guard) can't bleed across devices.
+  // The cleanup cancels an in-flight offenders fetch on device change and on
+  // unmount (#4513).
   useEffect(() => {
     setOffendersOpen(false);
     setOffenders(null);
     setOffendersError(undefined);
     setOffendersLoading(false);
     offendersFetchedRef.current = false;
+    return () => offendersRequestRef.current?.cancel();
   }, [deviceId]);
 
   const toggleOffenders = useCallback(() => {
@@ -413,6 +533,22 @@ export default function DeviceReliabilityPanel({ deviceId }: DeviceReliabilityPa
     setOffendersOpen(true);
     if (!offendersFetchedRef.current) void loadOffenders();
   }, [offendersOpen, loadOffenders]);
+
+  // A marker write moves the scoring window, and /offenders only counts events
+  // since the active marker: re-read the score in place and drop the cached
+  // offender list (refetching it now if the drill-down is open).
+  const handleBaselineChanged = useCallback(() => {
+    void fetchReliability({ silent: true });
+    offendersRequestRef.current?.cancel();
+    setOffenders(null);
+    setOffendersError(undefined);
+    offendersFetchedRef.current = false;
+    if (offendersOpen) {
+      void loadOffenders();
+    } else {
+      setOffendersLoading(false);
+    }
+  }, [fetchReliability, offendersOpen, loadOffenders]);
 
   if (loading) {
     return (
@@ -448,7 +584,7 @@ export default function DeviceReliabilityPanel({ deviceId }: DeviceReliabilityPa
         <div className="flex items-center gap-3">
           <ShieldCheck className="h-5 w-5 text-muted-foreground" />
           <div>
-            <h3 className="text-base font-semibold">{t('deviceReliabilityPanel.title')}</h3>
+            <h2 className="text-base font-semibold">{t('deviceReliabilityPanel.title')}</h2>
             <p className="text-sm text-muted-foreground">{t('deviceReliabilityPanel.disabled')}</p>
           </div>
         </div>
@@ -456,17 +592,16 @@ export default function DeviceReliabilityPanel({ deviceId }: DeviceReliabilityPa
     );
   }
 
+  // #9029: no snapshot yet is one muted line, not an empty card body.
   if (!snapshot) {
     return (
-      <div className="rounded-lg border bg-card p-5 shadow-xs">
-        <div className="flex items-center gap-3">
-          <ShieldCheck className="h-5 w-5 text-muted-foreground" />
-          <div>
-            <h3 className="text-base font-semibold">{t('deviceReliabilityPanel.title')}</h3>
-            <p className="text-sm text-muted-foreground">{t('deviceReliabilityPanel.empty')}</p>
-          </div>
-        </div>
-      </div>
+      <p
+        data-testid="device-reliability-empty"
+        className="flex items-center gap-2 rounded-lg border bg-card px-5 py-3 text-sm text-muted-foreground"
+      >
+        <ShieldCheck className="h-4 w-4 shrink-0" aria-hidden="true" />
+        {t('deviceReliabilityPanel.empty')}
+      </p>
     );
   }
 
@@ -488,11 +623,36 @@ export default function DeviceReliabilityPanel({ deviceId }: DeviceReliabilityPa
   const offenderWindowText = t('deviceReliabilityPanel.lastDays', { count: OFFENDER_WINDOW_DAYS });
   // Short form for inline evidence: "24 in 30d".
   const windowPhrase = `in ${OFFENDER_WINDOW_DAYS}d`;
+
+  // Each link carries its factor's scoring window as the API reported it
+  // (#10053); offender rows use their group's factor.
+  const buildEventLogLink = (row: EventLogRow, subject: string): EventLogLink | null => {
+    const factor = 'factor' in row ? row.factor : OFFENDER_GROUP_FACTOR[row.group];
+    const driver = (snapshot.drivers ?? []).find((candidate) => candidate.factor === factor);
+    const scoringWindow = driverWindow(driver);
+    if (!scoringWindow) return null;
+    const { sources, exact } = eventLogSources(snapshot.osType, row, driver);
+    const source = sources?.join(', ');
+    const fmt = (iso: string) => formatDateTime(new Date(iso), { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+    const range = { from: fmt(scoringWindow.from), to: fmt(scoringWindow.to) };
+    const label = exact ? t('deviceReliabilityPanel.eventLogLinkExact') : t('deviceReliabilityPanel.eventLogLinkWindow');
+    return {
+      href: `#${deviceEventLogHash({ sources, ...scoringWindow })}`,
+      label,
+      // Starts with the visible text (WCAG 2.5.3) and names the row so the
+      // identical per-row links are distinguishable in a link list.
+      ariaLabel: `${label}: ${subject}`,
+      title: source
+        ? t('deviceReliabilityPanel.eventLogLinkTitleWithSource', { source, ...range })
+        : t('deviceReliabilityPanel.eventLogLinkTitle', range),
+    };
+  };
   // Young devices haven't lived a full window yet; a tooltip carries that
   // context instead of relabeling every window (the old "since enroll · Nd").
   const youngDevice = ageDays !== null && ageDays < OFFENDER_WINDOW_DAYS;
   const offenderEventTotal =
     snapshot.serviceFailureCount30d + snapshot.hardwareErrorCount30d + snapshot.hangCount30d;
+  const provisional = snapshot.provisional === true;
 
   return (
     <div className="rounded-lg border bg-card p-5 shadow-xs">
@@ -500,8 +660,10 @@ export default function DeviceReliabilityPanel({ deviceId }: DeviceReliabilityPa
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
             <ShieldCheck className="h-5 w-5 text-muted-foreground" />
-            <h3 className="text-base font-semibold">{t('deviceReliabilityPanel.title')}</h3>
-            {snapshot.reliabilityScore <= 70 && (
+            <h2 className="text-base font-semibold">{t('deviceReliabilityPanel.title')}</h2>
+            {/* A provisional score is not evidence either way (the fleet
+                finding excludes provisional devices too), so no at-risk pill. */}
+            {!provisional && snapshot.reliabilityScore <= 70 && (
               <span className="inline-flex items-center gap-1" data-testid="reliability-atrisk-help">
                 <span className="inline-flex items-center gap-1 rounded-full border border-warning/30 bg-warning/10 px-2 py-0.5 text-xs font-medium text-warning">
                   <AlertTriangle className="h-3.5 w-3.5" />
@@ -528,13 +690,27 @@ export default function DeviceReliabilityPanel({ deviceId }: DeviceReliabilityPa
                   })}
                 />
               </div>
-              <div className={`text-3xl font-semibold tabular-nums ${scoreClass(snapshot.reliabilityScore)}`}>
-                {snapshot.reliabilityScore}
+              <div className="flex items-center gap-2">
+                <div
+                  className={`text-3xl font-semibold tabular-nums ${provisional ? 'text-muted-foreground' : scoreClass(snapshot.reliabilityScore)}`}
+                >
+                  {snapshot.reliabilityScore}
+                </div>
+                {provisional && (
+                  <span
+                    data-testid="reliability-provisional-pill"
+                    className="rounded-full border bg-muted px-2 py-0.5 text-xs font-medium text-muted-foreground"
+                  >
+                    {t('deviceReliabilityPanel.baseline.provisional')}
+                  </span>
+                )}
               </div>
             </div>
             <div>
               <div className="text-xs text-muted-foreground">{t('deviceReliabilityPanel.trend')}</div>
-              <div className="text-sm font-medium capitalize">{t(/* i18n-dynamic */ `deviceReliabilityPanel.trends.${snapshot.trendDirection}`)}</div>
+              <div className="text-sm font-medium capitalize" data-testid="reliability-trend-value">
+                {provisional ? '—' : t(/* i18n-dynamic */ `deviceReliabilityPanel.trends.${snapshot.trendDirection}`)}
+              </div>
             </div>
             {showTopDragStat && topDrag ? (
               <div>
@@ -570,8 +746,8 @@ export default function DeviceReliabilityPanel({ deviceId }: DeviceReliabilityPa
             )}
             <div>
               <div className="text-xs text-muted-foreground">{t('deviceReliabilityPanel.mtbf')}</div>
-              <div className="text-sm font-medium tabular-nums">
-                {snapshot.mtbfHours === null ? '—' : `${Math.round(snapshot.mtbfHours)}h`}
+              <div className="text-sm font-medium tabular-nums" data-testid="reliability-mtbf-value">
+                {provisional || snapshot.mtbfHours === null ? '—' : `${Math.round(snapshot.mtbfHours)}h`}
               </div>
             </div>
           </div>
@@ -638,6 +814,21 @@ export default function DeviceReliabilityPanel({ deviceId }: DeviceReliabilityPa
         </div>
       </div>
 
+      <ReliabilityBaselineSection
+        deviceId={deviceId}
+        snapshot={{
+          reliabilityScore: snapshot.reliabilityScore,
+          crashCount30d: snapshot.crashCount30d,
+          hangCount30d: snapshot.hangCount30d,
+          serviceFailureCount30d: snapshot.serviceFailureCount30d,
+          hardwareErrorCount30d: snapshot.hardwareErrorCount30d,
+          provisional,
+          baseline: snapshot.baseline ?? null,
+        }}
+        canWrite={canWriteDevices}
+        onChanged={handleBaselineChanged}
+      />
+
       {factorRows.length > 0 ? (
         <div className="mt-5" data-testid="reliability-factors">
           <div className="flex items-center gap-1 text-xs font-medium text-muted-foreground">
@@ -651,6 +842,23 @@ export default function DeviceReliabilityPanel({ deviceId }: DeviceReliabilityPa
               const unweighted = driver.weight === 0;
               const problem = !unweighted && driver.lostPoints > 0;
               const evidenceText = factorEvidenceText(driver, snapshot, windowPhrase);
+              // Unweighted (workstation) fault rows still link when there is evidence.
+              const factorLink =
+                LINKED_FACTORS.has(driver.factor) &&
+                (problem || (unweighted && (factorCount30d(snapshot, driver.factor) ?? 0) > 0))
+                  ? buildEventLogLink({ factor: driver.factor }, driver.label)
+                  : null;
+              const eventLogLinkEl = factorLink ? (
+                <HashLink
+                  hash={factorLink.href}
+                  title={factorLink.title}
+                  aria-label={factorLink.ariaLabel}
+                  data-testid={`reliability-factor-link-${driver.factor}`}
+                  className={EVENT_LOG_LINK_CLASS}
+                >
+                  {factorLink.label}
+                </HashLink>
+              ) : null;
               const showDetailsLink =
                 problem && OFFENDER_FACTORS.has(driver.factor) && offenderEventTotal > 0 && !offendersOpen;
               return (
@@ -674,10 +882,11 @@ export default function DeviceReliabilityPanel({ deviceId }: DeviceReliabilityPa
                   </span>
                   <span className="min-w-0 flex-1 text-xs text-muted-foreground">
                     {unweighted ? (
-                      <>{t('deviceReliabilityPanel.notScoredForType')}{evidenceText ? ` — ${evidenceText}` : ''}</>
+                      <>{t('deviceReliabilityPanel.notScoredForType')}{evidenceText ? ` — ${evidenceText}` : ''}{eventLogLinkEl}</>
                     ) : problem ? (
                       <>
                         {evidenceText}
+                        {eventLogLinkEl}
                         {showDetailsLink && (
                           <button
                             type="button"
@@ -770,18 +979,21 @@ export default function DeviceReliabilityPanel({ deviceId }: DeviceReliabilityPa
                       title={t('deviceReliabilityPanel.offenders.topServices')}
                       Icon={Settings}
                       offenders={offenders.services}
+                      linkFor={(offender) => buildEventLogLink({ group: 'services', key: offender.key }, offender.label)}
                     />
                     <OffenderGroup
                       testId="reliability-offenders-hardware"
                       title={t('deviceReliabilityPanel.offenders.topHardware')}
                       Icon={Cpu}
                       offenders={offenders.hardware}
+                      linkFor={(offender) => buildEventLogLink({ group: 'hardware', key: offender.key }, offender.label)}
                     />
                     <OffenderGroup
                       testId="reliability-offenders-hangs"
                       title={t('deviceReliabilityPanel.offenders.topProcesses')}
                       Icon={Activity}
                       offenders={offenders.hangs}
+                      linkFor={(offender) => buildEventLogLink({ group: 'hangs', key: offender.key }, offender.label)}
                     />
                     <p className="text-xs text-muted-foreground">
                       {t('deviceReliabilityPanel.distinctEvents', { window: offenderWindowText })}

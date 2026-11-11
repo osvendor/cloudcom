@@ -1,13 +1,16 @@
 import {
   Activity,
   AlertTriangle,
+  Ban,
   CheckCircle2,
+  Clock,
   Database,
   HardDrive,
   ShieldAlert,
   XCircle
 } from 'lucide-react';
 import { formatNumber } from '@/lib/i18n/format';
+import type { BackupFailureCategory } from '@breeze/shared';
 
 // ── Types ──────────────────────────────────────────────────────────
 
@@ -33,6 +36,7 @@ export type BackupJob = {
   totalSize?: number | null;
   errorCount?: number | null;
   errorLog?: string | null;
+  failureCategory?: BackupFailureCategory | null;
   // Legacy fields for compatibility
   device?: string;
   config?: string;
@@ -55,6 +59,11 @@ export type StorageProvider = {
   used?: string | number;
   total?: string | number;
   percent?: number;
+  // What /backup/dashboard sends (#2562): raw usage, no capacity — object
+  // storage has no meaningful total, so the panel shows usage alone.
+  usedBytes?: number;
+  snapshots?: number;
+  configs?: number;
 };
 
 export type AttentionItem = {
@@ -100,6 +109,27 @@ export const statusConfig = {
     icon: AlertTriangle,
     label: 'Partial',
     className: 'text-warning bg-warning/10'
+  },
+  // completed_with_errors (#5396) is a milder, distinct degraded outcome from
+  // `partial`: a restorable snapshot with some (under-threshold) file
+  // failures. Warning severity, never green, and never the same label as
+  // `partial` or the generic `warning` bucket.
+  completed_with_errors: {
+    icon: AlertTriangle,
+    label: 'Completed with errors',
+    className: 'text-warning bg-warning/10'
+  },
+  // Neutral outcomes: a queued run (pending, e.g. a catch-up waiting for its
+  // device) and a cancelled run are neither healthy nor a problem.
+  pending: {
+    icon: Clock,
+    label: 'Queued',
+    className: 'text-muted-foreground bg-muted'
+  },
+  cancelled: {
+    icon: Ban,
+    label: 'Cancelled',
+    className: 'text-muted-foreground bg-muted'
   },
   warning: {
     icon: AlertTriangle,
@@ -214,18 +244,30 @@ export function parseUsageHistory(payload: unknown): UsageHistoryPoint[] {
   return parsed;
 }
 
-export function formatBytes(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
+/**
+ * The one byte formatter for every backup surface (#9931): binary units
+ * (1 KB = 1024 B) and three significant digits, so one snapshot reads the
+ * same on the health table, the snapshot browser, the device Restore Points
+ * list and the restore wizard. Do not add per-component copies.
+ *
+ * `missing` is what a null/undefined/non-finite/negative size renders as;
+ * each surface keeps its own empty-cell placeholder. Zero is "0 B".
+ */
+export function formatBytes(bytes: number | null | undefined, missing = '0 B'): string {
+  if (bytes == null || !Number.isFinite(bytes) || bytes < 0) return missing;
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];
   let value = bytes;
   let unitIndex = 0;
 
-  while (value >= 1024 && unitIndex < units.length - 1) {
+  // Compare against 1023.5 so a value that would round up to "1024 <unit>"
+  // is shown as "1.00 <next unit>" instead.
+  while (value >= 1023.5 && unitIndex < units.length - 1) {
     value /= 1024;
     unitIndex += 1;
   }
 
-  const precision = value >= 100 ? 0 : value >= 10 ? 1 : 2;
+  if (unitIndex === 0) return `${formatNumber(Math.round(value))} B`;
+  const precision = value >= 99.95 ? 0 : value >= 9.995 ? 1 : 2;
   return `${formatNumber(value, { minimumFractionDigits: precision, maximumFractionDigits: precision })} ${units[unitIndex]}`;
 }
 
@@ -280,3 +322,10 @@ export function buildLinePath(values: number[], maxValue: number): string {
     .join(' ');
 }
 import { formatDateTime } from '@/lib/dateTimeFormat';
+
+const ISO_TIMESTAMP_RE = /\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\b/g;
+
+/** Attention-item text is composed server-side with raw ISO timestamps; show them in the user's format (#7213). */
+export function localizeIsoTimestamps(text: string): string {
+  return text.replace(ISO_TIMESTAMP_RE, (iso) => formatDateTime(iso, { fallback: iso }));
+}

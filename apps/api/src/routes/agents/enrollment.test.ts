@@ -6,6 +6,7 @@ const { admitPartnerDeviceCapacityMock } = vi.hoisted(() => ({
   admitPartnerDeviceCapacityMock: vi.fn(),
 }));
 
+vi.mock('../../services/topology/identityDirty', () => ({ markTopologyIdentityDirty: vi.fn() }));
 vi.mock('../../services/partnerDeviceCapacity', () => ({
   admitPartnerDeviceCapacity: admitPartnerDeviceCapacityMock,
   PartnerDeviceCapacityError: class PartnerDeviceCapacityError extends Error {},
@@ -171,16 +172,36 @@ vi.mock('../../services/partnerTrust', () => ({
   })),
 }));
 
+// #9511 — device.enrolled is published after the enrollment commits.
+const publishEventMock = vi.hoisted(() => vi.fn().mockResolvedValue('evt-1'));
+vi.mock('../../services/eventBus', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../services/eventBus')>()),
+  publishEvent: publishEventMock,
+}));
+
 // #4630 — dynamic device group re-evaluation ENQUEUE on enrollment.
 const requestDeviceGroupReevaluationMock = vi.hoisted(() => vi.fn().mockResolvedValue('job-1'));
 vi.mock('../../jobs/deviceGroupJobs', () => ({
   requestDeviceGroupReevaluation: requestDeviceGroupReevaluationMock,
 }));
 
+// #9617 — org default device group applied inside the enrollment transaction.
+const applyOrgDefaultDeviceGroupMock = vi.hoisted(() => vi.fn().mockResolvedValue('added'));
+vi.mock('../../services/enrollmentDefaultGroup', () => ({
+  applyOrgDefaultDeviceGroup: applyOrgDefaultDeviceGroupMock,
+}));
+
+// #9521 — the org's partner-export lock, taken at the top of the device transaction.
+const lockPartnerExportOrgMock = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+vi.mock('../../db/partnerExportLock', () => ({
+  lockPartnerExportOrg: lockPartnerExportOrgMock,
+}));
+
 // ---------- imports after mocks ----------
 
 import { db, withSystemDbAccessContext } from '../../db';
 import { writeAuditEvent } from '../../services/auditEvents';
+import { captureException } from '../../services/sentry';
 import { recordAgentEnrollment } from '../../services/anomalyMetrics';
 import { getActiveOrgTenant } from '../../services/tenantStatus';
 import * as manifestSigning from '../../services/manifestSigning';
@@ -191,8 +212,10 @@ import { raiseDeviceIdentityCollisionAlert } from '../../services/deviceIdentity
 import { partnerTrustMode } from '../../config/partnerTrustMode';
 import { evaluateCapability, unresolvedPartnerDecision } from '../../services/partnerTrust';
 import { issueMtlsCertForDevice } from './helpers';
+import { rateLimiter } from '../../services/rate-limit';
 import {
   devices as devicesTable,
+  deviceHardware as deviceHardwareTable,
   enrollmentKeys as enrollmentKeysTable,
   partners as partnersTable,
   supportSessions as supportSessionsTable,
@@ -252,6 +275,10 @@ interface TxSpy {
   updatedTables: unknown[];
   /** set() payloads passed to tx.update(devices) — asserts in-place re-enrollment. */
   deviceUpdateValues: Record<string, unknown>[];
+  /** values() passed to tx.insert(deviceHardware). */
+  hardwareInsertValues: Record<string, unknown>[];
+  /** onConflictDoUpdate() `set` for tx.insert(deviceHardware). */
+  hardwareConflictSets: Record<string, unknown>[];
 }
 
 /**
@@ -259,13 +286,19 @@ interface TxSpy {
  * tx.update()/tx.insert() and returns `insertedDevice` from the first
  * tx.insert(devices).values().returning().
  */
-function mockTransaction(insertedDevice: Record<string, unknown>, keyId = 'key-x'): TxSpy {
+function mockTransaction(
+  insertedDevice: Record<string, unknown>,
+  keyId = 'key-x',
+  opts: { deviceUpdateRows?: Record<string, unknown>[] } = {},
+): TxSpy {
   const spy: TxSpy = {
     update: vi.fn(),
     insert: vi.fn(),
     deviceInsertValues: [],
     updatedTables: [],
     deviceUpdateValues: [],
+    hardwareInsertValues: [],
+    hardwareConflictSets: [],
   };
 
   vi.mocked(db.transaction).mockImplementation(async (fn: any) => {
@@ -280,14 +313,16 @@ function mockTransaction(insertedDevice: Record<string, unknown>, keyId = 'key-x
         spy.updatedTables.push(table);
         // The in-place re-enroll UPDATE(devices) returns the device row; the
         // enrollment-key consume returns the claimed key id.
-        const returned = table === devicesTable ? insertedDevice : { id: keyId };
+        const returned = table === devicesTable
+          ? (opts.deviceUpdateRows ?? [insertedDevice])
+          : [{ id: keyId }];
         return {
           set: vi.fn((values: Record<string, unknown>) => {
             if (table === devicesTable) spy.deviceUpdateValues.push(values);
             return {
               where: vi.fn(() => Object.assign(
                 Promise.resolve(undefined) as any,
-                { returning: vi.fn().mockResolvedValue([returned]) },
+                { returning: vi.fn().mockResolvedValue(returned) },
               )),
             };
           }),
@@ -298,9 +333,13 @@ function mockTransaction(insertedDevice: Record<string, unknown>, keyId = 'key-x
         return {
           values: vi.fn((values: Record<string, unknown>) => {
             if (table === devicesTable) spy.deviceInsertValues.push(values);
+            if (table === deviceHardwareTable) spy.hardwareInsertValues.push(values);
             return {
               returning: vi.fn().mockResolvedValue([insertedDevice]),
-              onConflictDoUpdate: vi.fn().mockResolvedValue(undefined),
+              onConflictDoUpdate: vi.fn((config: { set: Record<string, unknown> }) => {
+                if (table === deviceHardwareTable) spy.hardwareConflictSets.push(config.set);
+                return Promise.resolve(undefined);
+              }),
             };
           }),
         };
@@ -399,6 +438,28 @@ describe('POST /agents/enroll — backup server URL delivery (#2288)', () => {
   });
 });
 
+describe('POST /agents/enroll — org default device group (#9617)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    requestDeviceGroupReevaluationMock.mockResolvedValue('job-1');
+    applyOrgDefaultDeviceGroupMock.mockResolvedValue('added');
+    delete process.env.AGENT_ENROLLMENT_SECRET;
+    delete process.env.AGENT_BACKUP_SERVER_URL;
+    process.env.NODE_ENV = 'test';
+  });
+
+  it('applies the default group to the freshly inserted device, inside the transaction', async () => {
+    await enrollOk();
+
+    expect(applyOrgDefaultDeviceGroupMock).toHaveBeenCalledTimes(1);
+    expect(applyOrgDefaultDeviceGroupMock).toHaveBeenCalledWith(
+      // the transaction handle, never the bare pool
+      expect.objectContaining({ insert: expect.any(Function), delete: expect.any(Function) }),
+      { orgId: 'org-backup-url', deviceId: 'device-backup-url', siteId: 'site-backup-url' },
+    );
+  });
+});
+
 describe('POST /agents/enroll — dynamic device group re-evaluation enqueue (#4630)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -430,6 +491,49 @@ describe('POST /agents/enroll — dynamic device group re-evaluation enqueue (#4
     await enrollOk();
 
     expect(requestDeviceGroupReevaluationMock).toHaveBeenCalled();
+  });
+});
+
+describe('POST /agents/enroll — device.enrolled event (#9511)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    publishEventMock.mockResolvedValue('evt-1');
+    delete process.env.AGENT_ENROLLMENT_SECRET;
+    delete process.env.AGENT_BACKUP_SERVER_URL;
+    process.env.NODE_ENV = 'test';
+  });
+
+  it('publishes device.enrolled for the committed device with org + site scope', async () => {
+    await enrollOk();
+
+    expect(publishEventMock).toHaveBeenCalledTimes(1);
+    expect(publishEventMock).toHaveBeenCalledWith(
+      'device.enrolled',
+      'org-backup-url',
+      { deviceId: 'device-backup-url', hostname: 'host-1', agentVersion: '0.62.24', reenrollment: false },
+      'agent-enrollment',
+      { siteId: 'site-backup-url' },
+    );
+  });
+
+  it('a rejected publish is logged + captured and never fails an otherwise successful enrollment', async () => {
+    publishEventMock.mockRejectedValue(new Error('redis down'));
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    await enrollOk();
+    await new Promise((r) => setImmediate(r));
+    expect(errSpy).toHaveBeenCalledWith('[Enrollment] Failed to publish device.enrolled:', 'redis down');
+    expect(captureException).toHaveBeenCalled();
+    errSpy.mockRestore();
+  });
+
+  it('does not publish when enrollment is refused', async () => {
+    mockKeyLookup(undefined);
+    const resp = await buildApp().request('/agents/enroll', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(baseEnrollBody),
+    });
+    expect(resp.status).toBeGreaterThanOrEqual(400);
+    expect(publishEventMock).not.toHaveBeenCalled();
   });
 });
 
@@ -990,6 +1094,31 @@ describe('POST /agents/enroll — 401 reason disambiguation', () => {
     expect(tx.updatedTables).not.toContain(devicesTable);
   });
 
+  it('stores the product number from enrollment on insert and on conflict (#9593)', async () => {
+    mockKeyLookup({
+      id: 'key-sku',
+      orgId: 'org-sku',
+      siteId: 'site-sku',
+      keySecretHash: null,
+      expiresAt: new Date(Date.now() + 3600_000),
+      maxUsage: 10,
+      usageCount: 0,
+    });
+    mockSelectRows([{ partnerId: 'partner-sku' }]);
+    mockSelectRows([]);
+    const tx = mockTransaction({ id: 'device-sku', orgId: 'org-sku', siteId: 'site-sku', hostname: 'host-1' }, 'key-sku');
+
+    const resp = await buildApp().request('/agents/enroll', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ...baseEnrollBody, hardwareInfo: { serialNumber: 'S-1', productSku: '5S3F8EA#ABB' } }),
+    });
+
+    expect(resp.status).toBe(201);
+    expect(tx.hardwareInsertValues[0]).toMatchObject({ productSku: '5S3F8EA#ABB' });
+    expect(tx.hardwareConflictSets[0]).toMatchObject({ productSku: '5S3F8EA#ABB' });
+  });
+
   it('raises the identity-collision alert only when the colliding row is currently online', async () => {
     mockKeyLookup({
       id: 'key-alert-on',
@@ -1235,6 +1364,34 @@ describe('POST /agents/enroll — 401 reason disambiguation', () => {
     );
   });
 
+  it('M2 D15.2: an in-place re-enrollment that rewrites NIC MACs marks topology identity dirty; a fresh row does not', async () => {
+    const { markTopologyIdentityDirty } = await import('../../services/topology/identityDirty');
+    const validToken = 'valid-reenroll-token-nic';
+    const validHash = createHash('sha256').update(validToken).digest('hex');
+    mockKeyLookup({ id: 'key-nic', orgId: 'org-nic', siteId: 'site-nic', keySecretHash: null, expiresAt: new Date(Date.now() + 3600_000), maxUsage: 10, usageCount: 0 });
+    mockSelectRows([{ partnerId: 'partner-nic' }]);
+    mockSelectRows([{ id: 'device-nic', agentId: 'agent-nic', status: 'offline', agentTokenHash: validHash, previousTokenHash: null, previousTokenExpiresAt: null, agentTokenSuspendedAt: null }]);
+    mockTransaction({ id: 'device-nic', orgId: 'org-nic', siteId: 'site-nic', hostname: 'host-1' }, 'key-nic');
+    const resp = await buildApp().request('/agents/enroll', {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-agent-reenrollment-token': validToken },
+      body: JSON.stringify({ ...baseEnrollBody, networkInfo: [{ name: 'eth0', mac: '02:00:00:00:aa:01' }] }),
+    });
+    expect(resp.status).toBe(201);
+    expect(vi.mocked(markTopologyIdentityDirty)).toHaveBeenCalledWith(expect.anything(), { orgId: 'org-nic', siteId: 'site-nic' });
+
+    vi.mocked(markTopologyIdentityDirty).mockClear();
+    mockKeyLookup({ id: 'key-nic-2', orgId: 'org-nic', siteId: 'site-nic', keySecretHash: null, expiresAt: new Date(Date.now() + 3600_000), maxUsage: 10, usageCount: 0 });
+    mockSelectRows([{ partnerId: 'partner-nic' }]);
+    mockSelectRows([]);
+    mockTransaction({ id: 'device-nic-fresh', orgId: 'org-nic', siteId: 'site-nic', hostname: 'host-2' }, 'key-nic-2');
+    const fresh = await buildApp().request('/agents/enroll', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ...baseEnrollBody, hostname: 'host-2', networkInfo: [{ name: 'eth0', mac: '02:00:00:00:aa:02' }] }),
+    });
+    expect(fresh.status).toBe(201);
+    expect(vi.mocked(markTopologyIdentityDirty)).not.toHaveBeenCalled();
+  });
+
   it('matrix row 4: a valid existing-device token still re-enrolls the SAME row in place (no fresh row)', async () => {
     const validToken = 'valid-reenroll-token';
     const validHash = createHash('sha256').update(validToken).digest('hex');
@@ -1285,6 +1442,23 @@ describe('POST /agents/enroll — 401 reason disambiguation', () => {
     expect(tx.deviceUpdateValues).toHaveLength(1);
     expect(tx.deviceUpdateValues[0]).toMatchObject({ status: 'pending' });
     expect(tx.deviceUpdateValues[0]).not.toHaveProperty('lastSeenAt');
+    // The new install has not reported its backup helper yet: backups to it
+    // wait for that report instead of trusting what the previous install said.
+    expect(tx.deviceUpdateValues[0]).toMatchObject({
+      backupReadProtocolVersion: null,
+      backupIntegrityProtocolVersion: null,
+      backupWriteProtocolVersion: null,
+      // #8318 §6.2: a re-enroll is a new install; its rebind capability is
+      // rewritten from this enrollment (none declared here → 0).
+      rebindProtocolVersion: 0,
+    });
+    // #8318 §6.4 / §5.7: the claims the previous install stamped are cleared
+    // in the same UPDATE (the once-per-install edition-migration claim, and
+    // its uninstall intent), as at a reattach confirm's boundary.
+    expect(tx.deviceUpdateValues[0]).toMatchObject({
+      editionMigrationDispatchedAt: null,
+      uninstallIntentAt: null,
+    });
     expect(disconnectAgentCredentialGenerationMock).toHaveBeenCalledWith(
       'agent-id-before-reenroll',
       [validHash],
@@ -1296,6 +1470,58 @@ describe('POST /agents/enroll — 401 reason disambiguation', () => {
     });
     expect(admitPartnerDeviceCapacityMock).not.toHaveBeenCalled();
     expect(raiseDeviceIdentityCollisionAlert).not.toHaveBeenCalled();
+    // #9617: an in-place re-enrollment must not re-apply the org default group.
+    expect(applyOrgDefaultDeviceGroupMock).not.toHaveBeenCalled();
+    // #9511: same row re-enrolled in place -> reenrollment:true.
+    expect(publishEventMock).toHaveBeenCalledWith(
+      'device.enrolled', 'org-inplace',
+      expect.objectContaining({ deviceId: 'device-inplace', reenrollment: true }),
+      'agent-enrollment', { siteId: expect.anything() },
+    );
+  });
+
+  it('#8318 §6.4: refuses 409 reenrollment_conflict (audited, counted, no fresh row) when the matched row changed hands before the UPDATE', async () => {
+    const validToken = 'valid-reenroll-token-conflict';
+    const validHash = createHash('sha256').update(validToken).digest('hex');
+    mockKeyLookup({
+      id: 'key-conflict', orgId: 'org-conflict', siteId: 'site-conflict', keySecretHash: null,
+      expiresAt: new Date(Date.now() + 3600_000), maxUsage: 10, usageCount: 0,
+    });
+    mockSelectRows([{ partnerId: 'partner-conflict' }]);
+    mockSelectRows([{
+      id: 'device-conflict', agentId: 'agent-id-matched', status: 'offline', agentTokenHash: validHash,
+      previousTokenHash: null, previousTokenExpiresAt: null, agentTokenSuspendedAt: null,
+    }]);
+    // The UPDATE carries `agent_id = <matched>`; a confirm or another
+    // re-enroll changed it in between, so it matches 0 rows.
+    const tx = mockTransaction({ id: 'device-conflict' }, 'key-conflict', { deviceUpdateRows: [] });
+
+    const resp = await buildApp().request('/agents/enroll', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-agent-reenrollment-token': validToken },
+      body: JSON.stringify(baseEnrollBody),
+    });
+
+    expect(resp.status).toBe(409);
+    expect(await resp.json()).toEqual({
+      error: 'The device row changed during re-enrollment; retry the enrollment',
+      code: 'reenrollment_conflict',
+    });
+    expect(tx.deviceUpdateValues).toHaveLength(1);
+    expect(tx.deviceInsertValues).toHaveLength(0);
+    // The enrollment key is not consumed: the transaction stops at the refusal.
+    expect(tx.updatedTables).not.toContain(enrollmentKeysTable);
+    expect(recordAgentEnrollment).toHaveBeenCalledWith('error', 'partner-conflict');
+    expect(recordAgentEnrollment).not.toHaveBeenCalledWith('success', expect.anything());
+    expect(writeAuditEvent).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      orgId: 'org-conflict',
+      action: 'agent.enroll',
+      resourceType: 'device',
+      resourceId: 'device-conflict',
+      result: 'denied',
+      details: expect.objectContaining({ reason: 'reenrollment_conflict', enrollmentKeyId: 'key-conflict' }),
+    }));
+    expect(publishAgentCredentialRevocationMock).not.toHaveBeenCalled();
   });
 
   it('idempotency: a token matching a LATER colliding row re-enrolls that row instead of stacking another fresh row', async () => {
@@ -1725,6 +1951,12 @@ describe('POST /agents/enroll — 401 reason disambiguation', () => {
     // #914: response carries the FRESH device.id, NOT the prior one.
     expect(body.deviceId).toBe('device-decom-fresh-id');
     expect(body.deviceId).not.toBe('device-decom-existing');
+    // #9511: decom-bypass mints a brand-new row -> a new device, not a re-enrollment.
+    expect(publishEventMock).toHaveBeenCalledWith(
+      'device.enrolled', 'org-decom',
+      expect.objectContaining({ deviceId: 'device-decom-fresh-id', reenrollment: false }),
+      'agent-enrollment', expect.anything(),
+    );
     // Importantly: no 409 audit event was written for hostname_collision
     expect(writeAuditEvent).not.toHaveBeenCalledWith(
       expect.anything(),
@@ -2931,6 +3163,24 @@ describe('POST /agents/enroll — virtualization attribute persistence (#1387)',
     expect(deviceValues.virtualizationPlatform).toBe('hyperv');
   });
 
+  it('#8318 §6.2: records the declared rebind capability (exactly 1; anything else is 0)', async () => {
+    for (const [declared, recorded] of [[1, 1], [2, 0], ['1', 0], [undefined, 0]] as const) {
+      vi.clearAllMocks();
+      const deviceInsertValues = arrangeFreshEnroll();
+      const body = declared === undefined
+        ? baseEnrollBody
+        : { ...baseEnrollBody, securityCapabilities: { rebindProtocolVersion: declared } };
+      const resp = await buildApp().request('/agents/enroll', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      expect(resp.status, String(declared)).toBe(201);
+      const deviceValues = (deviceInsertValues.mock.calls as any[])[0]?.[0] as Record<string, unknown>;
+      expect(deviceValues.rebindProtocolVersion, String(declared)).toBe(recorded);
+    }
+  });
+
   it('persists a fresh enrollment as pending without fabricating a last-seen timestamp', async () => {
     const deviceInsertValues = arrangeFreshEnroll();
     const resp = await buildApp().request('/agents/enroll', {
@@ -3303,6 +3553,8 @@ describe('POST /agents/enroll — Quick Support ephemeral enrollment', () => {
     expect(resp.status).toBe(201);
     // Ephemeral support devices never enter licensed-device admission.
     expect(admitPartnerDeviceCapacityMock).not.toHaveBeenCalled();
+    // ...and never land in a customer's default device group (#9617).
+    expect(applyOrgDefaultDeviceGroupMock).not.toHaveBeenCalled();
     expect(spy.countWhere).toHaveLength(0);
     expect(spy.deviceInsertValues[0]).toEqual(
       expect.objectContaining({ isEphemeral: true }),
@@ -3355,5 +3607,170 @@ describe('POST /agents/enroll — Quick Support ephemeral enrollment', () => {
       expect.anything(),
       { orgId: 'org-count', expectedPartnerId: 'partner-count' },
     );
+  });
+});
+
+describe('POST /agents/enroll — configurable per-IP rate limit (#7472)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    delete process.env.AGENT_ENROLLMENT_SECRET;
+    delete process.env.AGENT_ENROLL_RATE_LIMIT;
+    delete process.env.AGENT_ENROLL_RATE_WINDOW_SECONDS;
+    process.env.NODE_ENV = 'test';
+  });
+  afterEach(() => {
+    delete process.env.AGENT_ENROLL_RATE_LIMIT;
+    delete process.env.AGENT_ENROLL_RATE_WINDOW_SECONDS;
+  });
+
+  const post = () => buildApp().request('/agents/enroll', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(baseEnrollBody),
+  });
+
+  it('uses 10 per 60s by default', async () => {
+    await post();
+    expect(rateLimiter).toHaveBeenCalledWith(
+      expect.anything(), 'agent-enroll:127.0.0.1', 10, 60,
+    );
+  });
+
+  it('uses AGENT_ENROLL_RATE_LIMIT / AGENT_ENROLL_RATE_WINDOW_SECONDS when set', async () => {
+    process.env.AGENT_ENROLL_RATE_LIMIT = '200';
+    process.env.AGENT_ENROLL_RATE_WINDOW_SECONDS = '30';
+    await post();
+    expect(rateLimiter).toHaveBeenCalledWith(
+      expect.anything(), 'agent-enroll:127.0.0.1', 200, 30,
+    );
+  });
+
+  it('returns 429 with Retry-After when the limiter denies', async () => {
+    (rateLimiter as Mock).mockResolvedValueOnce({ allowed: false, resetAt: new Date(Date.now() + 45000) });
+    const resp = await post();
+    expect(resp.status).toBe(429);
+    expect(Number(resp.headers.get('Retry-After'))).toBeGreaterThan(0);
+  });
+});
+
+describe('POST /agents/enroll — lock order and lost lock races (#9521)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    admitPartnerDeviceCapacityMock.mockResolvedValue({
+      allowed: true,
+      partnerId: 'partner-9521',
+      maxDevices: null,
+      activeCount: null,
+    });
+    lockPartnerExportOrgMock.mockResolvedValue(undefined);
+    delete process.env.AGENT_ENROLLMENT_SECRET;
+    delete process.env.AGENT_BACKUP_SERVER_URL;
+    process.env.NODE_ENV = 'test';
+  });
+
+  function mockFreshEnrollmentLookups() {
+    vi.mocked(manifestSigning.getActiveTrustKeyset).mockResolvedValue([]);
+    vi.mocked(manifestSigning.getActiveManifestKeyDelegations).mockResolvedValue([]);
+    mockKeyLookup({
+      id: 'key-9521',
+      orgId: 'org-9521',
+      siteId: 'site-9521',
+      keySecretHash: null,
+      expiresAt: new Date(Date.now() + 3600_000),
+      maxUsage: 10,
+      usageCount: 0,
+    });
+    mockSelectRows([{ partnerId: 'partner-9521' }]);
+    mockSelectRows([]); // no colliding device: a fresh row
+  }
+
+  const deadlock = () => Object.assign(new Error('deadlock detected'), { code: '40P01' });
+  const lostRaceWarnings = (warn: Mock, attempt: string) =>
+    warn.mock.calls.filter(([m]) => String(m).includes(`[enrollment] transient lock error 40P01 on attempt ${attempt}`));
+
+  function post(): Promise<Response> {
+    return Promise.resolve(buildApp().request('/agents/enroll', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(baseEnrollBody),
+    }));
+  }
+
+  it('takes the org export lock on the transaction handle, after admission and before the devices INSERT', async () => {
+    mockFreshEnrollmentLookups();
+    const spy = mockTransaction({ id: 'device-9521', orgId: 'org-9521', siteId: 'site-9521', hostname: 'host-1' }, 'key-9521');
+
+    const resp = await post();
+
+    expect(resp.status).toBe(201);
+    expect(lockPartnerExportOrgMock).toHaveBeenCalledTimes(1);
+    expect(lockPartnerExportOrgMock).toHaveBeenCalledWith(
+      expect.objectContaining({ insert: expect.any(Function), update: expect.any(Function) }),
+      'org-9521',
+    );
+    const lockOrder = lockPartnerExportOrgMock.mock.invocationCallOrder[0]!;
+    expect(admitPartnerDeviceCapacityMock.mock.invocationCallOrder[0]!).toBeLessThan(lockOrder);
+    const firstDevicesInsert = spy.insert.mock.calls.findIndex(([table]) => table === devicesTable);
+    expect(firstDevicesInsert).toBeGreaterThanOrEqual(0);
+    expect(lockOrder).toBeLessThan(spy.insert.mock.invocationCallOrder[firstDevicesInsert]!);
+  });
+
+  it('re-runs the device transaction once after a deadlock and enrolls (201)', async () => {
+    mockFreshEnrollmentLookups();
+    mockTransaction({ id: 'device-9521', orgId: 'org-9521', siteId: 'site-9521', hostname: 'host-1' }, 'key-9521');
+    const realAttempt = vi.mocked(db.transaction).getMockImplementation()!;
+    vi.mocked(db.transaction)
+      .mockImplementationOnce(async () => { throw deadlock(); })
+      .mockImplementation(realAttempt);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    const resp = await post();
+
+    expect(resp.status).toBe(201);
+    expect((await resp.json()).deviceId).toBe('device-9521');
+    expect(db.transaction).toHaveBeenCalledTimes(2);
+    expect(lostRaceWarnings(warn as unknown as Mock, '1/3')).toHaveLength(1);
+    expect(captureException).not.toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it('answers 503 + Retry-After (never 500) when every attempt loses its lock race, and reports it', async () => {
+    mockFreshEnrollmentLookups();
+    vi.mocked(db.transaction).mockImplementation(async () => { throw deadlock(); });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    const resp = await post();
+
+    expect(resp.status).toBe(503);
+    expect(resp.headers.get('Retry-After')).toBe('2');
+    expect(await resp.json()).toMatchObject({ reason: 'enrollment_contended' });
+    expect(db.transaction).toHaveBeenCalledTimes(3);
+    expect(lostRaceWarnings(warn as unknown as Mock, '3/3')).toHaveLength(1);
+    expect(captureException).toHaveBeenCalledWith(
+      expect.objectContaining({ code: '40P01' }),
+      expect.anything(),
+      expect.objectContaining({ route: 'agent_enroll', reason: 'enrollment_contended', org_id: 'org-9521' }),
+      { fingerprint: ['agent-enroll', 'enrollment_contended', '40P01'] },
+    );
+    expect(writeAuditEvent).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      orgId: 'org-9521',
+      action: 'agent.enroll',
+      result: 'failure',
+      details: expect.objectContaining({ reason: 'enrollment_contended', enrollmentKeyId: 'key-9521', sqlState: '40P01' }),
+    }));
+    expect(recordAgentEnrollment).toHaveBeenCalledWith('error', 'partner-9521');
+    warn.mockRestore();
+  });
+
+  it('does not retry an ordinary failure: one attempt, then the normal error path', async () => {
+    mockFreshEnrollmentLookups();
+    vi.mocked(db.transaction).mockImplementation(async () => {
+      throw Object.assign(new Error('duplicate key'), { code: '23505' });
+    });
+
+    const resp = await post();
+
+    expect(resp.status).toBe(500);
+    expect(db.transaction).toHaveBeenCalledTimes(1);
   });
 });

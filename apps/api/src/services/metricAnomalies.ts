@@ -100,6 +100,24 @@ const SEASONAL_MIN_BASELINE_ACTIVE_DAYS = 3;
 const MIN_BASELINE_BUCKETS = 12;
 const MIN_SEASONAL_BASELINE_BUCKETS = 8;
 const MIN_TREND_BUCKETS = 6;
+/**
+ * Memory growth novelty window. A RAM growth trend fires only when it ends
+ * above every 5-minute bucket of the same metric in the
+ * GROWTH_NOVELTY_LOOKBACK_DAYS before the trend window. A device that climbs
+ * to the same level every day (a nightly job, a workday working set) is its
+ * own normal; a leak keeps setting new highs and still fires. Prod 2026-10-02:
+ * 48 of 54 RAM growth episodes in 2.4 days ended below the device's own 7-day
+ * high. Disk is NOT gated: disk use does not cycle daily, and a disk filling
+ * back up after a cleanup must still fire.
+ */
+const GROWTH_NOVELTY_LOOKBACK_DAYS = 7;
+
+/**
+ * Novelty gate for the upward baseline and process-sample detectors: beat the
+ * baseline's own max. Evaluated in a `chosen` row (columns avg_value and
+ * baseline_max); NULL baseline_max cannot happen past MIN_BASELINE_BUCKETS.
+ */
+const NOVEL_OVER_BASELINE_MAX = sql.raw('b.avg_value > coalesce(b.baseline_max, 0)');
 
 /**
  * `scan` (default) — the 10-minute cron. `backfill` — an explicit historical
@@ -376,9 +394,18 @@ function candidateUpsertAssignments(): SQL {
  * not used: their window_start is the start of a multi-bucket trend window, not
  * an anomalous bucket (plan deviation 6).
  */
-function openEpisodeBucketsSql(orgId: string, sourceTable: 'device_metrics' | 'device_process_samples'): SQL {
+function openEpisodeBucketsSql(
+  orgId: string,
+  sourceTable: 'device_metrics' | 'device_process_samples',
+  window: { fromIso: string; lookbackHours: number },
+): SQL {
+  // A baseline bucket lies in [r.bucket_start - lookback, r.bucket_start) with
+  // r.bucket_start >= from, so no open row older than `from - lookback` can
+  // ever match the LEFT JOIN. Bounding here keeps stale open rows (US prod
+  // 2026-10-12: 860 three-week-old pre-episode rows on one org) out of the
+  // per-row join entirely instead of being probed and discarded 192k times.
   return sql`
-    SELECT DISTINCT ma.device_id, ma.metric_name, ma.window_start
+    SELECT ma.device_id, ma.metric_name, ma.window_start
     FROM metric_anomaly_episodes e
     JOIN metric_anomalies ma ON ma.episode_id = e.id
     WHERE e.org_id = ${orgId}
@@ -386,6 +413,19 @@ function openEpisodeBucketsSql(orgId: string, sourceTable: 'device_metrics' | 'd
       AND ma.org_id = ${orgId}
       AND ma.source_table = ${sourceTable}
       AND ma.anomaly_type NOT IN ('memory_growth', 'disk_growth')
+      AND ma.window_start >= ${window.fromIso}::timestamp - (${window.lookbackHours} * interval '1 hour')
+    UNION
+    -- Rows still waiting on the persistence gate (open, no episode yet): left
+    -- in, a pending bucket would raise baseline_max and the novelty gate would
+    -- hide the second bucket of the very island it is waiting for.
+    SELECT ma.device_id, ma.metric_name, ma.window_start
+    FROM metric_anomalies ma
+    WHERE ma.org_id = ${orgId}
+      AND ma.episode_id IS NULL
+      AND ma.status = 'open'
+      AND ma.source_table = ${sourceTable}
+      AND ma.anomaly_type NOT IN ('memory_growth', 'disk_growth')
+      AND ma.window_start >= ${window.fromIso}::timestamp - (${window.lookbackHours} * interval '1 hour')
   `;
 }
 
@@ -458,7 +498,7 @@ async function detectBaselineDeviations(options: MetricAnomalyRange): Promise<vo
         AND mr.avg_value IS NOT NULL
         AND mr.sample_count > 0
     ),
-    open_episode_buckets AS (${openEpisodeBucketsSql(options.orgId, 'device_metrics')}),
+    open_episode_buckets AS (${openEpisodeBucketsSql(options.orgId, 'device_metrics', { fromIso, lookbackHours: BASELINE_LOOKBACK_HOURS })}),
     baseline AS (
       SELECT
         r.org_id,
@@ -515,18 +555,27 @@ async function detectBaselineDeviations(options: MetricAnomalyRange): Promise<vo
     scored AS (
       SELECT
         b.*,
+        -- Upward types also need NOVELTY: the bucket must beat the highest
+        -- bucket of the (anti-contaminated) 24 h baseline. A level the device
+        -- already reached yesterday — the nightly Defender scan, Windows
+        -- Update, an indexer — is its routine, not an anomaly (2026-09-26 prod
+        -- review: this alone removed ~60% of episodes).
         CASE
           WHEN b.metric_name = 'bandwidth_out_bps'
             AND b.avg_value >= greatest(coalesce(b.baseline_value, 0) + (4 * greatest(coalesce(b.baseline_stddev, 0), 1)), coalesce(b.baseline_value, 0) * 3, 1000000)
+            AND ${NOVEL_OVER_BASELINE_MAX}
             THEN 'network_egress'
           WHEN b.metric_name = 'process_count'
-            AND b.avg_value >= greatest(coalesce(b.baseline_value, 0) + (3 * greatest(coalesce(b.baseline_stddev, 0), 1)), coalesce(b.baseline_value, 0) + 20)
+            AND b.avg_value >= greatest(coalesce(b.baseline_value, 0) + (3 * greatest(coalesce(b.baseline_stddev, 0), 1)), coalesce(b.baseline_value, 0) * 1.25, coalesce(b.baseline_value, 0) + 50)
+            AND ${NOVEL_OVER_BASELINE_MAX}
             THEN 'process_runaway'
           WHEN b.metric_name IN ('cpu_percent', 'ram_percent', 'disk_percent')
             AND b.avg_value >= greatest(coalesce(b.baseline_value, 0) + (3 * greatest(coalesce(b.baseline_stddev, 0), 1)), coalesce(b.baseline_value, 0) * 1.5, 90)
+            AND ${NOVEL_OVER_BASELINE_MAX}
             THEN 'spike'
           WHEN b.metric_name IN ('disk_read_bps', 'disk_write_bps', 'bandwidth_in_bps')
             AND b.avg_value >= greatest(coalesce(b.baseline_value, 0) + (4 * greatest(coalesce(b.baseline_stddev, 0), 1)), coalesce(b.baseline_value, 0) * 3, 1000000)
+            AND ${NOVEL_OVER_BASELINE_MAX}
             THEN 'spike'
           WHEN b.metric_name IN ('cpu_percent', 'ram_percent', 'disk_percent', 'process_count')
             AND coalesce(b.baseline_value, 0) >= 25
@@ -685,7 +734,18 @@ async function detectGrowthTrends(options: MetricAnomalyRange): Promise<void> {
           WHEN r.metric_name IN ('disk_percent', 'disk_used_gb') THEN 'disk_growth'
           ELSE 'trend'
         END AS anomaly_type,
-        greatest(r.last_value - r.first_value, 0)::double precision AS score
+        -- Growth in multiples of the metric's gate, x4 — the scale the z-score
+        -- detectors use (their gates sit at 3-4 sigma). Raw deltas (MB, GB,
+        -- points) made every promoted growth alert 'critical' (score >= 10)
+        -- and left an agent's minAnomalyScore meaningless across types.
+        (
+          4 * greatest(r.last_value - r.first_value, 0)
+          / CASE r.metric_name
+              WHEN 'ram_used_mb' THEN greatest(512, r.first_value * 0.25)
+              WHEN 'disk_used_gb' THEN greatest(5, r.first_value * 0.10)
+              ELSE 15
+            END
+        )::double precision AS score
       FROM recent r
       WHERE r.bucket_count >= ${MIN_TREND_BUCKETS}
         AND r.last_value > r.first_value
@@ -694,6 +754,22 @@ async function detectGrowthTrends(options: MetricAnomalyRange): Promise<void> {
           OR (r.metric_name = 'ram_used_mb' AND r.last_value >= r.first_value * 1.25 AND r.last_value - r.first_value >= 512)
           OR (r.metric_name = 'disk_used_gb' AND r.last_value >= r.first_value * 1.10 AND r.last_value - r.first_value >= 5)
         )
+        -- RAM novelty: a new GROWTH_NOVELTY_LOOKBACK_DAYS high. Strict, like
+        -- the baseline detectors' avg > baseline_max. No history -> fires.
+        AND (r.metric_name NOT IN ('ram_percent', 'ram_used_mb') OR NOT EXISTS (
+          SELECT 1
+          FROM metric_rollups p
+          WHERE p.org_id = r.org_id
+            AND p.device_id = r.device_id
+            AND p.source_table = r.source_table
+            AND p.metric_type = r.metric_type
+            AND p.metric_name = r.metric_name
+            AND p.bucket_seconds = r.bucket_seconds
+            AND p.bucket_start >= r.window_start - (${GROWTH_NOVELTY_LOOKBACK_DAYS}::integer * interval '1 day')
+            AND p.bucket_start < r.window_start
+            AND p.sample_count > 0
+            AND p.avg_value >= r.last_value
+        ))
     )
     INSERT INTO metric_anomalies (
       org_id,
@@ -732,7 +808,9 @@ async function detectGrowthTrends(options: MetricAnomalyRange): Promise<void> {
       t.min_value,
       t.max_value,
       t.score,
-      least(0.98, greatest(0.55, 0.55 + (t.score / 100)))::double precision,
+      -- At the gate (score 4) this is 0.75: 'medium' on promotion; 'critical'
+      -- (>= 0.95, or score >= 10) needs 2.5x the gate.
+      least(0.98, greatest(0.55, 0.55 + (t.score / 20)))::double precision,
       t.sample_count,
       jsonb_build_object(
         'modelVersion', ${METRIC_ANOMALY_VERSION}::text,
@@ -788,7 +866,7 @@ async function detectProcessSampleRunaways(options: MetricAnomalyRange): Promise
         AND mr.avg_value IS NOT NULL
         AND mr.sample_count > 0
     ),
-    open_episode_buckets AS (${openEpisodeBucketsSql(options.orgId, 'device_process_samples')}),
+    open_episode_buckets AS (${openEpisodeBucketsSql(options.orgId, 'device_process_samples', { fromIso, lookbackHours: BASELINE_LOOKBACK_HOURS })}),
     baseline AS (
       SELECT
         r.org_id,
@@ -854,6 +932,8 @@ async function detectProcessSampleRunaways(options: MetricAnomalyRange): Promise
         )::double precision AS score
       FROM chosen b
       WHERE b.baseline_count >= ${MIN_BASELINE_BUCKETS}
+        -- Novelty, as in detectBaselineDeviations.
+        AND ${NOVEL_OVER_BASELINE_MAX}
         AND (
           (
             b.metric_name IN ('top_process_cpu_percent_sum', 'top_process_cpu_percent_max')
@@ -1034,6 +1114,9 @@ async function upsertMetricAnomalyIncidents(options: MetricAnomalyRange): Promis
     FROM metric_anomalies ma
     WHERE ma.org_id = ${options.orgId}
       AND ma.status = 'open'
+      -- Persistence gate: a row still waiting for a second bucket (or one
+      -- that never gets it) has no episode and must not reach an agent.
+      AND ma.episode_id IS NOT NULL
       AND ma.window_end >= ${fromIso}::timestamp
     GROUP BY ma.org_id, ma.device_id, ma.anomaly_type, ma.bucket_seconds, ma.window_start
     ON CONFLICT (org_id, device_id, anomaly_type, bucket_seconds, window_start)

@@ -159,6 +159,7 @@ vi.mock('../services/permissions', () => ({
   })),
   userCanDecideApprovals: vi.fn(() => true),
   canAccessOrg: vi.fn(() => true),
+  canAccessSite: vi.fn(() => true),
   // Real matching semantics (exact resource/action or a wildcard) so a test
   // that swaps in a narrower permissions array actually drives a denial,
   // rather than a stub that always returns true regardless of what's granted.
@@ -212,6 +213,9 @@ vi.mock('./lifecycle', () => ({
 
 const pamLifecycleMocks = vi.hoisted(() => ({ createPamDecisionIntent: vi.fn() }));
 vi.mock('../services/pamActuationLifecycle', () => pamLifecycleMocks);
+// #8928: the elevation deny path queues the end-user outcome notice.
+const pamNotifyMocks = vi.hoisted(() => ({ enqueuePamRequestNotify: vi.fn(async () => 'queued' as const) }));
+vi.mock('../services/pamRequestNotify', () => pamNotifyMocks);
 pamLifecycleMocks.createPamDecisionIntent.mockImplementation(async (_tx, input) => ({
   actuationId: 'actuation-1',
   elevationRequestId: input.request.id,
@@ -300,6 +304,7 @@ vi.mock('../middleware/auth', () => ({
   }),
   // Same rule as the real helper (middleware/auth.ts): an allowlist of ONE.
   isInteractiveUserSession: (auth: any) => auth?.principal?.kind === 'user_session',
+  hasSatisfiedMfa: vi.fn(() => true),
   requirePermission: vi.fn(() => (c: any, next: any) => next()),
   requireScope: vi.fn(() => (c: any, next: any) => next()),
   requireMfa: vi.fn(() => (c: any, next: any) => next()),
@@ -310,13 +315,13 @@ import { approvalRoutes } from './approvals';
 import { approvalRequests } from '../db/schema/approvals';
 import { actionIntents } from '../db/schema/actionIntents';
 import { db } from '../db';
-import { authMiddleware } from '../middleware/auth';
+import { authMiddleware, hasSatisfiedMfa } from '../middleware/auth';
 import { assertApprovalAssurance, StepUpRequiredError, ReauthRequiredError } from '../services/authenticatorAssurance';
 import { generateApprovalAssertionOptions } from '../services/approverWebAuthn';
 import { issueMobileAssertionNonce } from '../services/mobileHwKey';
 import { requireCurrentPasswordStepUp } from './auth/helpers';
 import { recordActionIntentEvent } from '../services/actionIntents/metrics';
-import { getUserPermissions, userCanDecideApprovals, canAccessOrg } from '../services/permissions';
+import { getUserPermissions, userCanDecideApprovals, canAccessOrg, canAccessSite } from '../services/permissions';
 import { resolveIntentApprovers, isAgentIntentDecideAuthorized } from '../services/actionIntents/intentApprovers';
 import { checkToolPermission } from '../services/aiGuardrails';
 import { buildAuthContextForIntent } from '../services/actionIntents/actorContext';
@@ -571,6 +576,13 @@ function buildPendingApproval(overrides: Record<string, unknown> = {}) {
     ...overrides,
   };
 }
+
+// B-W04 (#6158, D-B35): the MCP-origin branch of report-suspicious. Default:
+// not an MCP-origin intent (null) → today's behaviour, 204.
+const mcpOriginReportMock = vi.hoisted(() => ({ reportSuspiciousMcpOrigin: vi.fn(async () => null) }));
+vi.mock('../services/mcpIntentCreation', () => ({
+  reportSuspiciousMcpOrigin: mcpOriginReportMock.reportSuspiciousMcpOrigin,
+}));
 
 describe('GET /approvals/pending', () => {
   it('returns only pending non-expired approvals for the authed user', async () => {
@@ -1675,6 +1687,20 @@ describe('POST /approvals/:id/deny', () => {
 describe('#1254 PAM mobile bridge: mirror decision back to elevation', () => {
   let elevationSet = vi.fn();
   let auditValues = vi.fn();
+  // #7526: the locked elevation read (`tx.select().from().where().for()`) the
+  // decide transaction takes BEFORE the approval CAS. Defaults to pending;
+  // a test returns another status via lockedElevationRows.
+  let lockedElevationRows: unknown[] = [{ status: 'pending' }];
+  let lockedFor = vi.fn();
+  let lockedSelect = vi.fn();
+
+  function makeLockedElevationSelect() {
+    lockedFor = vi.fn(async () => lockedElevationRows);
+    lockedSelect = vi.fn(() => ({
+      from: vi.fn(() => ({ where: vi.fn(() => ({ for: lockedFor })) })),
+    }));
+    return lockedSelect;
+  }
 
   function mockElevationTx(elevationUpdateRows: unknown[]) {
     elevationSet = vi.fn().mockReturnValue({
@@ -1730,9 +1756,20 @@ describe('#1254 PAM mobile bridge: mirror decision back to elevation', () => {
     // audit, and sibling expiry.
     const casReturning = vi.fn().mockResolvedValue([updatedRow]);
     const casSet = vi.fn().mockReturnValue({ where: vi.fn().mockReturnValue({ returning: casReturning }) });
-    const siblingExpireSet = vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue(undefined) });
+    // Every later approval_requests write in the transaction: the refusal
+    // write-back (awaited through `.returning()`, echoing the row with the
+    // written values) and the sibling expiry (awaited bare).
+    const siblingExpireSet = vi.fn((values: Record<string, unknown>) => ({
+      where: vi.fn(() =>
+        Object.assign(Promise.resolve(undefined), {
+          returning: vi.fn().mockResolvedValue([{ ...updatedRow, ...values }]),
+        }),
+      ),
+    }));
     let updateCall = 0;
+    lockedElevationRows = [{ status: 'pending' }];
     const mainTx = {
+      select: makeLockedElevationSelect(),
       update: vi.fn(() => {
         updateCall += 1;
         if (updateCall === 1) return { set: casSet } as any;
@@ -1742,16 +1779,20 @@ describe('#1254 PAM mobile bridge: mirror decision back to elevation', () => {
       insert: vi.fn(() => ({ values: auditValues } as any)),
     };
     vi.mocked(db.transaction).mockImplementationOnce(async (fn: any) => fn(mainTx));
-    return { updatedRow, casSet, siblingExpireSet };
+    return { updatedRow, casSet, siblingExpireSet, mainTx };
   }
 
   it('approve mirrors elevation to approved + expires siblings', async () => {
-    const { siblingExpireSet } = mockDecideWithElevation({ status: 'pending', riskTier: 'medium', elevationRequestId: 'elev-1' });
+    const { siblingExpireSet, casSet } = mockDecideWithElevation({ status: 'pending', riskTier: 'medium', elevationRequestId: 'elev-1' });
     const tx = mockElevationTx([{ id: 'elev-1', orgId: 'org-9' }]);
 
     const res = await buildApp().request('/approvals/appr-1/approve', { method: 'POST' });
     expect(res.status).toBe(200);
     expect(db.transaction).toHaveBeenCalledTimes(1);
+    // #7526: the elevation is locked (`for no key update`) BEFORE the approval
+    // CAS, so every path takes elevation-then-approval-rows.
+    expect(lockedFor).toHaveBeenCalledWith('no key update');
+    expect(lockedFor.mock.invocationCallOrder[0]!).toBeLessThan(casSet.mock.invocationCallOrder[0]!);
     expect(tx.elevationSet).toHaveBeenCalledWith(
       expect.objectContaining({ status: 'approved', approvedByUserId: TEST_USER.id }),
     );
@@ -1771,35 +1812,226 @@ describe('#1254 PAM mobile bridge: mirror decision back to elevation', () => {
     expect(pamLifecycleMocks.createPamDecisionIntent).toHaveBeenCalledOnce();
   });
 
-  it('deny mirrors elevation to denied', async () => {
+  it('an approve refused for an unverifiable target reports refused with the reason', async () => {
+    const refusal = 'Target identity could not be verified on the device; re-request elevation.';
+    mockDecideWithElevation({ status: 'pending', riskTier: 'medium', elevationRequestId: 'elev-1' });
+    mockElevationTx([{ id: 'elev-1', orgId: 'org-9', deviceId: 'dev-1', revision: 1 }]);
+    pamLifecycleMocks.createPamDecisionIntent.mockResolvedValueOnce({
+      actuationId: '',
+      elevationRequestId: 'elev-1',
+      requestRevision: 1,
+      generation: 0,
+      desiredState: 'cleanup',
+      refusalReason: refusal,
+    });
+
+    const res = await buildApp().request('/approvals/appr-1/approve', { method: 'POST' });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.enforcementStatus).toBe('refused');
+    // The client has nothing else to show the approver why their approve did
+    // not take effect.
+    expect(body.reason).toBe(refusal);
+  });
+
+  // The approval row itself must say the approve did not take effect: the
+  // mobile app and the inbox's Recent panel read `approval.status`, not
+  // `enforcementStatus`.
+  it('an approve refused for an unverifiable target is stored and returned as denied, with the refusal reason', async () => {
+    const refusal = 'Target identity could not be verified on the device; re-request elevation.';
+    const { siblingExpireSet } = mockDecideWithElevation({ status: 'pending', riskTier: 'medium', elevationRequestId: 'elev-1' });
+    mockElevationTx([{ id: 'elev-1', orgId: 'org-9', deviceId: 'dev-1', revision: 1 }]);
+    pamLifecycleMocks.createPamDecisionIntent.mockResolvedValueOnce({
+      actuationId: '',
+      elevationRequestId: 'elev-1',
+      requestRevision: 1,
+      generation: 0,
+      desiredState: 'cleanup',
+      refusalReason: refusal,
+    });
+
+    const res = await buildApp().request('/approvals/appr-1/approve', { method: 'POST' });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+
+    // Written in the decide transaction: the row leaves 'approved' for
+    // 'denied' and records why.
+    expect(siblingExpireSet).toHaveBeenCalledWith({ status: 'denied', refusalReason: refusal });
+    expect(body.approval.status).toBe('denied');
+    expect(body.approval.refusalReason).toBe(refusal);
+    // The approver's own decision stays on the row: who (the row's user) and
+    // when. `decisionReason` is the approver's reason, never the refusal.
+    expect(body.approval.decidedAt).toEqual(expect.any(String));
+    expect(body.approval.decisionReason).toBeNull();
+  });
+
+  it('a normal elevation approve carries no refusal reason', async () => {
+    const { siblingExpireSet } = mockDecideWithElevation({ status: 'pending', riskTier: 'medium', elevationRequestId: 'elev-1' });
+    mockElevationTx([{ id: 'elev-1', orgId: 'org-9' }]);
+
+    const res = await buildApp().request('/approvals/appr-1/approve', { method: 'POST' });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.enforcementStatus).toBe('pending_dispatch');
+    expect(body).not.toHaveProperty('reason');
+    expect(body.approval.status).toBe('approved');
+    expect(body.approval.refusalReason).toBeNull();
+    expect(siblingExpireSet).not.toHaveBeenCalledWith(expect.objectContaining({ status: 'denied' }));
+  });
+
+  it('flags a grace-allowed under-assured approve in the elevation audit details', async () => {
+    mockDecideWithElevation({ status: 'pending', riskTier: 'high', elevationRequestId: 'elev-1' });
+    const tx = mockElevationTx([{ id: 'elev-1', orgId: 'org-9' }]);
+    vi.mocked(assertApprovalAssurance).mockResolvedValueOnce({
+      requiredLevel: 3,
+      decidedAssuranceLevel: 1,
+      decidedVia: 'session_tap',
+      authenticatorDeviceId: null,
+      graceDowngrade: true,
+    });
+
+    const res = await buildApp().request('/approvals/appr-1/approve', { method: 'POST' });
+    expect(res.status).toBe(200);
+    expect(tx.auditValues).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventType: 'approved',
+        details: expect.objectContaining({
+          assurance_downgraded_grace: true,
+          required_assurance_level: 3,
+        }),
+      }),
+    );
+  });
+
+  it('omits the grace marker from the elevation audit details when assurance met the floor', async () => {
+    mockDecideWithElevation({ status: 'pending', riskTier: 'medium', elevationRequestId: 'elev-1' });
+    const tx = mockElevationTx([{ id: 'elev-1', orgId: 'org-9' }]);
+
+    const res = await buildApp().request('/approvals/appr-1/approve', { method: 'POST' });
+    expect(res.status).toBe(200);
+    const details = (tx.auditValues.mock.calls[0]![0] as { details: Record<string, unknown> }).details;
+    expect(details).not.toHaveProperty('assurance_downgraded_grace');
+    expect(details).not.toHaveProperty('required_assurance_level');
+  });
+
+  it.each([
+    [undefined, 'Denied without reason'],
+    ['', 'Denied without reason'],
+    [' \t\n ', 'Denied without reason'],
+    ['not allowed', 'not allowed'],
+    ['  not allowed  ', 'not allowed'],
+  ])('deny mirrors elevation with reason %j as %j', async (reason, expectedReason) => {
     mockDecideWithElevation({ status: 'pending', riskTier: 'medium', elevationRequestId: 'elev-1' });
     const tx = mockElevationTx([{ id: 'elev-1', orgId: 'org-9' }]);
 
     const res = await buildApp().request('/approvals/appr-1/deny', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ reason: 'not allowed' }),
+      body: JSON.stringify({ reason }),
     });
     expect(res.status).toBe(200);
     expect(tx.elevationSet).toHaveBeenCalledWith(
-      expect.objectContaining({ status: 'denied', deniedByUserId: TEST_USER.id, denialReason: 'not allowed' }),
+      expect.objectContaining({ status: 'denied', deniedByUserId: TEST_USER.id, denialReason: expectedReason }),
     );
     expect(tx.auditValues).toHaveBeenCalledWith(
       expect.objectContaining({ eventType: 'denied', actor: 'technician' }),
     );
   });
 
-  it('elevation already non-pending (CAS 0 rows) -> decide still 200, no audit/sibling write', async () => {
-    const { siblingExpireSet } = mockDecideWithElevation({ status: 'pending', riskTier: 'medium', elevationRequestId: 'elev-1' });
-    const tx = mockElevationTx([]); // lost the race
+  describe('end-user outcome notice (#8928)', () => {
+    beforeEach(() => pamNotifyMocks.enqueuePamRequestNotify.mockClear());
+
+    it('a uac_intercept deny queues one denied notice in the decide transaction, with the raw reason', async () => {
+      const { mainTx } = mockDecideWithElevation({ status: 'pending', riskTier: 'medium', elevationRequestId: 'elev-1' });
+      mockElevationTx([{ id: 'elev-1', orgId: 'org-9', deviceId: 'dev-1', revision: 1, flowType: 'uac_intercept' }]);
+      const res = await buildApp().request('/approvals/appr-1/deny', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ reason: 'Not on the list' }),
+      });
+      expect(res.status).toBe(200);
+      expect(pamNotifyMocks.enqueuePamRequestNotify).toHaveBeenCalledTimes(1);
+      expect(pamNotifyMocks.enqueuePamRequestNotify).toHaveBeenCalledWith(
+        mainTx, { id: 'elev-1', deviceId: 'dev-1' }, 'denied', 'Not on the list',
+        // #10190 W07: the approver's name resolver, for decidedBy.technicianName.
+        expect.any(Function),
+      );
+    });
+
+    it('an approve does not notify', async () => {
+      mockDecideWithElevation({ status: 'pending', riskTier: 'medium', elevationRequestId: 'elev-1' });
+      mockElevationTx([{ id: 'elev-1', orgId: 'org-9', deviceId: 'dev-1', revision: 1, flowType: 'uac_intercept' }]);
+      expect((await buildApp().request('/approvals/appr-1/approve', { method: 'POST' })).status).toBe(200);
+      expect(pamNotifyMocks.enqueuePamRequestNotify).not.toHaveBeenCalled();
+    });
+
+    it('a deny of a request no end user waits on (not uac_intercept) does not notify', async () => {
+      mockDecideWithElevation({ status: 'pending', riskTier: 'medium', elevationRequestId: 'elev-1' });
+      mockElevationTx([{ id: 'elev-1', orgId: 'org-9', deviceId: 'dev-1', revision: 1, flowType: 'ai_tool_action' }]);
+      const res = await buildApp().request('/approvals/appr-1/deny', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ reason: 'x' }),
+      });
+      expect(res.status).toBe(200);
+      expect(pamNotifyMocks.enqueuePamRequestNotify).not.toHaveBeenCalled();
+    });
+
+    it('a deny that lost the race (elevation decided elsewhere) does not notify', async () => {
+      mockDecideWithElevation({ status: 'pending', riskTier: 'medium', elevationRequestId: 'elev-1' });
+      mockElevationTx([{ id: 'elev-1', orgId: 'org-9', deviceId: 'dev-1', flowType: 'uac_intercept' }]);
+      lockedElevationRows = [{ status: 'denied' }];
+      const res = await buildApp().request('/approvals/appr-1/deny', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ reason: 'x' }),
+      });
+      expect(res.status).toBe(409);
+      expect(pamNotifyMocks.enqueuePamRequestNotify).not.toHaveBeenCalled();
+    });
+  });
+
+  it.each([
+    ['approve', undefined],
+    ['deny', JSON.stringify({ reason: 'nope' })],
+  ])('elevation already decided elsewhere (%s) -> 409 Already decided, own row expired, nothing else written', async (route, body) => {
+    const { casSet, siblingExpireSet } = mockDecideWithElevation({ status: 'pending', riskTier: 'medium', elevationRequestId: 'elev-1' });
+    const tx = mockElevationTx([{ id: 'elev-1', orgId: 'org-9' }]);
+    lockedElevationRows = [{ status: 'approved' }];
+
+    const res = await buildApp().request(`/approvals/appr-1/${route}`, {
+      method: 'POST',
+      ...(body ? { headers: { 'content-type': 'application/json' }, body } : {}),
+    });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ error: 'Already decided', finalStatus: 'expired' });
+    expect(lockedFor).toHaveBeenCalledWith('no key update');
+    // The decider's own row is stored as expired — never as their approve/deny.
+    expect(casSet).toHaveBeenCalledTimes(1);
+    expect(casSet).toHaveBeenCalledWith(expect.objectContaining({ status: 'expired', decidedAt: expect.any(Date) }));
+    expect(casSet).not.toHaveBeenCalledWith(expect.objectContaining({ status: 'approved' }));
+    expect(casSet).not.toHaveBeenCalledWith(expect.objectContaining({ status: 'denied' }));
+    expect(tx.elevationSet).not.toHaveBeenCalled();
+    expect(tx.auditValues).not.toHaveBeenCalled();
+    expect(siblingExpireSet).not.toHaveBeenCalled();
+  });
+
+  it('locked elevation row missing -> 409 Already decided, own row expired', async () => {
+    const { casSet } = mockDecideWithElevation({ status: 'pending', riskTier: 'medium', elevationRequestId: 'elev-1' });
+    const tx = mockElevationTx([]);
+    lockedElevationRows = [];
 
     const res = await buildApp().request('/approvals/appr-1/approve', { method: 'POST' });
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ error: 'Already decided', finalStatus: 'expired' });
+    expect(casSet).toHaveBeenCalledWith(expect.objectContaining({ status: 'expired' }));
+    expect(tx.elevationSet).not.toHaveBeenCalled();
+    expect(tx.auditValues).not.toHaveBeenCalled();
+  });
+
+  it('elevation pending under the lock but its UPDATE matches 0 rows -> 500 decide_failed (rolled back), no audit', async () => {
+    mockDecideWithElevation({ status: 'pending', riskTier: 'medium', elevationRequestId: 'elev-1' });
+    const tx = mockElevationTx([]); // locked read says pending, UPDATE returns nothing
+
+    const res = await buildApp().request('/approvals/appr-1/approve', { method: 'POST' });
+    expect(res.status).toBe(500);
+    expect(await res.json()).toEqual({ error: 'decide_failed', retryable: true });
     expect(tx.elevationSet).toHaveBeenCalled();
     expect(tx.auditValues).not.toHaveBeenCalled();
-    // wonElevation stays false on a lost race, so the post-commit sibling-expiry
-    // db.update is never invoked.
-    expect(siblingExpireSet).not.toHaveBeenCalled();
   });
 
   it('approval without elevationRequestId never opens the mirror transaction', async () => {
@@ -1859,7 +2091,7 @@ describe('#1254 PAM mobile bridge: mirror decision back to elevation', () => {
       // Call 2 (NEW, §6C): resolve the elevation's orgId to authorize against,
       // BEFORE any assurance ladder / CAS write.
       vi.mocked(db.select).mockReturnValueOnce({
-        from: vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue([{ orgId: 'org-9' }]) }),
+        from: vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue([{ orgId: 'org-9', flowType: 'uac_intercept', deviceId: 'dev-1' }]) }),
       } as any);
     }
 
@@ -1899,19 +2131,24 @@ describe('#1254 PAM mobile bridge: mirror decision back to elevation', () => {
       expect(db.transaction).not.toHaveBeenCalled();
     });
 
-    it('a decider holding pam:approve for the elevation org proceeds to the CAS write', async () => {
+    it('a decider holding pam:approve and devices:execute for the elevation org proceeds to the CAS write', async () => {
       mockPreFetchAndElevationOrgLookup();
       vi.mocked(getUserPermissions).mockResolvedValueOnce({
         scope: 'organization',
         orgId: 'org-9',
-        permissions: [{ resource: 'pam', action: 'approve' }],
+        permissions: [{ resource: 'pam', action: 'approve' }, { resource: 'devices', action: 'execute' }],
+      } as any);
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue([{ orgId: 'org-9', siteId: 'site-a' }]) }),
       } as any);
       const tx = mockElevationTx([{ id: 'elev-1', orgId: 'org-9' }]);
       const casReturning = vi.fn().mockResolvedValue([{ ...pendingRow, status: 'approved' }]);
       const casSet = vi.fn().mockReturnValue({ where: vi.fn().mockReturnValue({ returning: casReturning }) });
       const siblingExpireSet = vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue(undefined) });
       let updateCall = 0;
+      lockedElevationRows = [{ status: 'pending' }];
       const mainTx = {
+        select: makeLockedElevationSelect(),
         update: vi.fn(() => {
           updateCall += 1;
           if (updateCall === 1) return { set: casSet } as any;
@@ -1926,6 +2163,42 @@ describe('#1254 PAM mobile bridge: mirror decision back to elevation', () => {
 
       expect(res.status).toBe(200);
       expect(db.transaction).toHaveBeenCalledTimes(1);
+    });
+
+    it('UAC approve also requires devices:execute before the CAS write', async () => {
+      mockPreFetchAndElevationOrgLookup();
+      vi.mocked(getUserPermissions).mockResolvedValueOnce({
+        scope: 'organization', orgId: 'org-9', permissions: [{ resource: 'pam', action: 'approve' }],
+      } as any);
+      const res = await buildApp().request('/approvals/appr-1/approve', { method: 'POST' });
+      expect(res.status).toBe(403);
+      expect(await res.json()).toEqual({ error: 'devices_execute_required' });
+      expect(db.transaction).not.toHaveBeenCalled();
+    });
+
+    it('UAC approve requires an MFA-assured session', async () => {
+      mockPreFetchAndElevationOrgLookup();
+      vi.mocked(hasSatisfiedMfa).mockReturnValueOnce(false);
+      const res = await buildApp().request('/approvals/appr-1/approve', { method: 'POST' });
+      expect(res.status).toBe(403);
+      expect(await res.json()).toEqual({ error: 'MFA required', code: 'MFA_REQUIRED' });
+      expect(db.transaction).not.toHaveBeenCalled();
+    });
+
+    it('UAC approve checks the current device site', async () => {
+      mockPreFetchAndElevationOrgLookup();
+      vi.mocked(getUserPermissions).mockResolvedValueOnce({
+        scope: 'organization', orgId: 'org-9', allowedSiteIds: ['site-a'],
+        permissions: [{ resource: 'pam', action: 'approve' }, { resource: 'devices', action: 'execute' }],
+      } as any);
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue([{ orgId: 'org-9', siteId: 'site-b' }]) }),
+      } as any);
+      vi.mocked(canAccessSite).mockReturnValueOnce(false);
+      const res = await buildApp().request('/approvals/appr-1/approve', { method: 'POST' });
+      expect(res.status).toBe(403);
+      expect(await res.json()).toEqual({ error: 'site_access_denied' });
+      expect(db.transaction).not.toHaveBeenCalled();
     });
 
     // Gap: hasPermission(perms, 'pam', 'approve') alone says nothing about
@@ -2119,6 +2392,44 @@ describe('Task 5: decide-handler bound to action_intents', () => {
     expect(recordActionIntentEvent).toHaveBeenCalledWith(
       expect.objectContaining({ orgId: 'org-9', intentId: 'intent-1', outcome: 'approved' }),
     );
+  });
+
+  it('marks a grace-allowed under-assured four-eyes approve in the intent event details', async () => {
+    mockDecideWithIntent({ requestedByUserId: 'requester-1' });
+    mockIntentFanInTx();
+    vi.mocked(assertApprovalAssurance).mockResolvedValueOnce({
+      requiredLevel: 3,
+      decidedAssuranceLevel: 1,
+      decidedVia: 'session_tap',
+      authenticatorDeviceId: null,
+      graceDowngrade: true,
+    });
+
+    const res = await buildApp().request('/approvals/appr-1/approve', { method: 'POST' });
+    expect(res.status).toBe(200);
+    expect(recordActionIntentEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        outcome: 'approved',
+        details: expect.objectContaining({
+          decidedAssuranceLevel: 1,
+          decidedVia: 'session_tap',
+          assuranceDowngradedGrace: true,
+          requiredAssuranceLevel: 3,
+        }),
+      }),
+    );
+  });
+
+  it('leaves the grace marker off a four-eyes approve whose assurance met the floor', async () => {
+    mockDecideWithIntent({ requestedByUserId: 'requester-1' });
+    mockIntentFanInTx();
+
+    const res = await buildApp().request('/approvals/appr-1/approve', { method: 'POST' });
+    expect(res.status).toBe(200);
+    const call = vi.mocked(recordActionIntentEvent).mock.calls.find(([e]) => e.outcome === 'approved');
+    expect(call).toBeDefined();
+    expect(call![0].details).not.toHaveProperty('assuranceDowngradedGrace');
+    expect(call![0].details).not.toHaveProperty('requiredAssuranceLevel');
   });
 
   it('refuses an intent-linked APPROVE (403) when the decider no longer holds approvals:decide', async () => {
@@ -2369,6 +2680,42 @@ describe('Task 5: decide-handler bound to action_intents', () => {
         details: expect.objectContaining({ errorCode: 'not_sole_approver' }),
       }),
     );
+  });
+
+  // Decide-side twin of the fan-out exclusion: even a sole operator (the
+  // only eligible approver) may not approve their own PAM elevation intent.
+  // The fan-out never creates the requester-owned row; this refuses anyway.
+  it('refuses a sole-operator self-approve of request_elevation (403 self_approval_forbidden)', async () => {
+    mockDecideWithIntent({ requestedByUserId: TEST_USER.id, actionName: 'request_elevation' });
+    // Refused before the assurance ladder, so no L3 proof is ever consulted
+    // (and none can be burned). The module-default approver set is
+    // [TEST_USER] — a genuine sole operator.
+
+    const res = await buildApp().request('/approvals/appr-1/approve', { method: 'POST' });
+    expect(res.status).toBe(403);
+    const body = await res.json();
+    expect(body.error).toBe('self_approval_forbidden');
+    expect(db.transaction).not.toHaveBeenCalled();
+    expect(assertApprovalAssurance).not.toHaveBeenCalled();
+    expect(recordActionIntentEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        outcome: 'approver_unauthorized',
+        actorId: TEST_USER.id,
+        details: expect.objectContaining({ errorCode: 'self_approval_forbidden' }),
+      }),
+    );
+  });
+
+  it('still allows a self-DENY of a request_elevation intent', async () => {
+    mockDecideWithIntent({ requestedByUserId: TEST_USER.id, actionName: 'request_elevation' });
+    mockIntentFanInTx();
+
+    const res = await buildApp().request('/approvals/appr-1/deny', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ reason: 'changed my mind' }),
+    });
+    expect(res.status).toBe(200);
   });
 
   it('refuses a self-approve BEFORE consuming an assurance proof (no WebAuthn challenge burned)', async () => {
@@ -2703,6 +3050,62 @@ describe('Task 6: supervised intent plain-decide branch', () => {
     // Gated to approve-only — a deny never spends a partner-policy read.
     expect(loadPartnerPolicy).not.toHaveBeenCalled();
     expect(assertApprovalAssurance).not.toHaveBeenCalled();
+  });
+
+  it('marks a plain-click supervised approve below the risk floor as a grace downgrade, recording the same L1/session_tap', async () => {
+    mockDecideWithSupervisedIntent({ riskTier: 'high' });
+    const { approvalCasSet } = mockSupervisedFanInTx();
+
+    const res = await buildApp().request('/approvals/appr-1/approve', { method: 'POST' });
+    expect(res.status).toBe(200);
+    // The recorded level/factor are unchanged by the marker.
+    expect(approvalCasSet).toHaveBeenCalledWith(
+      expect.objectContaining({ decidedAssuranceLevel: 1, decidedVia: 'session_tap' }),
+    );
+    expect(recordActionIntentEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        outcome: 'approved',
+        details: expect.objectContaining({
+          approvalMethod: 'supervised_self',
+          decidedAssuranceLevel: 1,
+          assuranceDowngradedGrace: true,
+          requiredAssuranceLevel: 3,
+        }),
+      }),
+    );
+  });
+
+  it('applies the partner raise-only floor when deciding the supervised grace marker', async () => {
+    mockDecideWithSupervisedIntent({ riskTier: 'low' });
+    mockSupervisedFanInTx();
+    vi.mocked(loadPartnerPolicy).mockResolvedValueOnce({
+      partnerId: 'partner-123',
+      floorOverrides: { low: 2 },
+      requireEnrollment: false,
+      enforceFrom: null,
+    } as any);
+
+    const res = await buildApp().request('/approvals/appr-1/approve', { method: 'POST' });
+    expect(res.status).toBe(200);
+    expect(recordActionIntentEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        details: expect.objectContaining({
+          assuranceDowngradedGrace: true,
+          requiredAssuranceLevel: 2,
+        }),
+      }),
+    );
+  });
+
+  it('leaves the grace marker off a supervised approve whose floor is L1', async () => {
+    mockDecideWithSupervisedIntent({ riskTier: 'low' });
+    mockSupervisedFanInTx();
+
+    const res = await buildApp().request('/approvals/appr-1/approve', { method: 'POST' });
+    expect(res.status).toBe(200);
+    const call = vi.mocked(recordActionIntentEvent).mock.calls.find(([e]) => e.outcome === 'approved');
+    expect(call).toBeDefined();
+    expect(call![0].details).not.toHaveProperty('assuranceDowngradedGrace');
   });
 
   it('records session_tap/L1 (no proof consumed) on a supervised approve', async () => {
@@ -3113,6 +3516,24 @@ describe('POST /approvals/:id/report-suspicious', () => {
     expect(db.insert).toHaveBeenCalled();
   });
 
+  // The pending check above the flip is a separate read. A decide that
+  // commits between the two (for example an approve stored as denied because
+  // the server refused it) must keep its outcome: the flip may only move a
+  // row that is still pending.
+  it('flips a non-intent row to reported only while it is still pending', async () => {
+    const { approvalUpdateSet } = wireRevocationStubs({ existing: baseRow });
+
+    const res = await buildApp().request('/approvals/a1/report-suspicious', { method: 'POST' });
+    expect(res.status).toBe(204);
+    expect(approvalUpdateSet.mock.results[0]!.value.where).toHaveBeenCalledWith(
+      and(
+        eq(approvalRequests.id, 'a1'),
+        eq(approvalRequests.userId, TEST_USER.id),
+        eq(approvalRequests.status, 'pending'),
+      ),
+    );
+  });
+
   it('returns 404 when the approval does not exist for this user', async () => {
     vi.mocked(db.select).mockReturnValueOnce({
       from: vi.fn().mockReturnValue({
@@ -3122,6 +3543,49 @@ describe('POST /approvals/:id/report-suspicious', () => {
 
     const res = await buildApp().request('/approvals/missing/report-suspicious', { method: 'POST' });
     expect(res.status).toBe(404);
+  });
+
+  describe('B-W04: MCP-origin intent', () => {
+    function wireIntentRow() {
+      const intentRow = { ...baseRow, executionId: null, intentId: 'intent-mcp', requestingClientId: null };
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue([intentRow]) }),
+      } as any);
+      const casReturning = vi.fn().mockResolvedValue([{ orgId: 'org-9', actionName: 'execute_command', argumentDigest: 'd', source: 'mcp_api' }]);
+      const tx = {
+        select: txSelectForUpdateStub(),
+        update: vi.fn()
+          .mockReturnValueOnce({ set: vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue(undefined) }) } as any)
+          .mockReturnValueOnce({ set: vi.fn().mockReturnValue({ where: vi.fn().mockReturnValue({ returning: casReturning }) }) } as any)
+          .mockReturnValueOnce({ set: vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue(undefined) }) } as any),
+        insert: vi.fn().mockReturnValue({ values: vi.fn().mockResolvedValue(undefined) } as any),
+      };
+      vi.mocked(db.transaction).mockImplementation(async (fn: any) => fn(tx));
+      vi.mocked(db.insert).mockReturnValue({ values: vi.fn().mockResolvedValue(undefined) } as any);
+    }
+
+    it('reported by its requester → origin revoked, 200 with credentialRevoked true', async () => {
+      wireIntentRow();
+      mcpOriginReportMock.reportSuspiciousMcpOrigin.mockResolvedValueOnce({ credentialRevoked: true } as never);
+      const res = await buildApp().request('/approvals/a1/report-suspicious', { method: 'POST' });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ reported: true, credentialRevoked: true });
+      expect(mcpOriginReportMock.reportSuspiciousMcpOrigin).toHaveBeenCalledWith('intent-mcp', TEST_USER.id);
+    });
+
+    it('a revocation failure is reported, never a silent 204', async () => {
+      wireIntentRow();
+      mcpOriginReportMock.reportSuspiciousMcpOrigin.mockResolvedValueOnce({ credentialRevoked: false, revocationError: 'revocation_failed' } as never);
+      const res = await buildApp().request('/approvals/a1/report-suspicious', { method: 'POST' });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ reported: true, credentialRevoked: false, revocationError: 'revocation_failed' });
+    });
+
+    it('a non-mcp intent keeps today\'s 204', async () => {
+      wireIntentRow();
+      const res = await buildApp().request('/approvals/a1/report-suspicious', { method: 'POST' });
+      expect(res.status).toBe(204);
+    });
   });
 
   it('rejects the linked action intent and expires sibling approvals for an intent-backed row', async () => {
@@ -3755,10 +4219,15 @@ describe('wave 3b Task 6: agent-originated intents — see it, decide it', () =>
     );
   });
 
-  it('403s human_decision_required for a non-user_session principal', async () => {
+  // B-W04 (#6158, D-B30): an MCP credential is never an approver — pinned for
+  // both MCP principal kinds.
+  it.each([
+    { kind: 'api_key', apiKeyId: 'key-1' },
+    { kind: 'oauth_grant', grantId: 'grant-1' },
+  ])('403s human_decision_required for a non-user_session principal (%o)', async (principal) => {
     vi.mocked(authMiddleware).mockImplementationOnce((c: any, next: any) => {
       c.set('auth', {
-        principal: { kind: 'api_key', apiKeyId: 'key-1' },
+        principal,
         scope: 'partner',
         partnerId: 'partner-123',
         orgId: null,
@@ -4303,6 +4772,31 @@ describe('GET /approvals/pending?view=recent (#6022)', () => {
     });
   });
 
+  // An elevation approve the server refused is stored as denied with its
+  // refusal reason; Recent must say why, not "denied" with no reason.
+  it('reports a refused elevation approve with the refusal reason', async () => {
+    const refusal = 'Target identity could not be verified on the device; re-request elevation.';
+    mockRecentJoinResolves([
+      {
+        approval: buildPendingApproval({
+          id: 'a-refused',
+          intentId: null,
+          elevationRequestId: 'elev-1',
+          status: 'denied',
+          decidedAt: new Date(),
+          decisionReason: null,
+          refusalReason: refusal,
+        }),
+        intent: null,
+      },
+    ]);
+
+    const body = await (await buildApp().request('/approvals/pending?view=recent')).json();
+    expect(body.approvals).toHaveLength(1);
+    expect(body.approvals[0].refusalReason).toBe(refusal);
+    expect(body.approvals[0].intentOutcome).toMatchObject({ status: 'denied', reason: refusal });
+  });
+
   it('never reports an unlinked row as outcome-less', async () => {
     for (const status of ['expired', 'reported']) {
       mockRecentJoinResolves([
@@ -4341,5 +4835,166 @@ describe('GET /approvals/pending?view=recent (#6022)', () => {
 
     const body = await (await buildApp().request('/approvals/pending?view=recent&limit=2')).json();
     expect(body.approvals).toHaveLength(2);
+  });
+});
+
+// Tool catalog W04 (#5219) review finding 1: a supervised FLOW intent has no
+// requester (requestedByUserId NULL) and no agent run (requestingAgentRunId
+// NULL). Before the fix it fell through to the human `requestedByUserId ===
+// userId` rule and was invisible on every read surface, so nobody could ever
+// see — let alone decide — a flow approval.
+describe('W04 #5219: supervised flow intents are visible to their pool', () => {
+  const FLOW_RUN_ID = 'flow-run-1';
+
+  function buildFlowIntent(overrides: Record<string, unknown> = {}) {
+    return {
+      id: 'intent-fl-1',
+      orgId: 'org-9',
+      actionName: 'execute_command',
+      arguments: { deviceId: 'dev-1', commandType: 'kill_process' },
+      argumentDigest: 'digest-fl',
+      source: 'flow',
+      status: 'pending_approval',
+      approvalScope: 'supervised',
+      requestedByUserId: null,
+      requestingAgentRunId: null,
+      requestingFlowRunId: FLOW_RUN_ID,
+      toolSourceToolId: null,
+      requestingClientLabel: 'Nightly cleanup',
+      scopeKind: null,
+      scopeDeviceId: null,
+      scopeTicketId: null,
+      ...overrides,
+    };
+  }
+
+  function buildFlowApproval(overrides: Record<string, unknown> = {}) {
+    return {
+      id: 'appr-fl-1',
+      userId: TEST_USER.id,
+      requestingClientLabel: 'Nightly cleanup',
+      requestingMachineLabel: null,
+      requestingClientId: null,
+      requestingSessionId: null,
+      actionLabel: 'Kill process on dev-1',
+      actionToolName: 'execute_command',
+      actionArguments: { deviceId: 'dev-1', commandType: 'kill_process' },
+      riskTier: 'high',
+      riskSummary: 'Terminates a process on a managed device.',
+      status: 'pending',
+      expiresAt: new Date(Date.now() + 60_000),
+      decidedAt: null,
+      decisionReason: null,
+      executionId: null,
+      elevationRequestId: null,
+      intentId: 'intent-fl-1',
+      boundArgumentDigest: 'digest-fl',
+      isRecursive: false,
+      createdAt: new Date(),
+      ...overrides,
+    };
+  }
+
+  /** Every `db.select()` gets its own chain resolving the next queued result
+   *  (or `[]`), whatever builder methods the call site uses. */
+  function queueSelects(results: unknown[][]) {
+    const queue = [...results];
+    vi.mocked(db.select).mockImplementation((() => {
+      const result = queue.shift() ?? [];
+      const node: any = {};
+      for (const m of ['from', 'leftJoin', 'innerJoin', 'where', 'orderBy', 'limit']) {
+        node[m] = vi.fn(() => node);
+      }
+      node.then = (resolve: (v: unknown) => void, reject?: (e: unknown) => void) =>
+        Promise.resolve(result).then(resolve, reject);
+      return node;
+    }) as any);
+  }
+
+  it('GET /pending lists a supervised flow row for a pool member, via the pool authorizer', async () => {
+    queueSelects([[{ approval: buildFlowApproval(), intent: buildFlowIntent() }]]);
+
+    const res = await buildApp().request('/approvals/pending');
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.approvals.map((a: any) => a.id)).toEqual(['appr-fl-1']);
+    expect(body.approvals[0].approvalScope).toBe('supervised');
+    expect(vi.mocked(isAgentIntentDecideAuthorized)).toHaveBeenCalledWith(
+      TEST_USER.id,
+      expect.objectContaining({ id: 'intent-fl-1', requestingFlowRunId: FLOW_RUN_ID }),
+    );
+  });
+
+  it('GET /pending/count counts it', async () => {
+    queueSelects([[{ approval: buildFlowApproval(), intent: buildFlowIntent() }]]);
+
+    const res = await buildApp().request('/approvals/pending/count');
+    expect(await res.json()).toEqual({ count: 1 });
+  });
+
+  it('hides it from a user outside the pool', async () => {
+    vi.mocked(isAgentIntentDecideAuthorized).mockResolvedValue(false);
+    queueSelects([[{ approval: buildFlowApproval(), intent: buildFlowIntent() }]]);
+    const body = await (await buildApp().request('/approvals/pending')).json();
+    expect(body.approvals).toEqual([]);
+
+    queueSelects([[{ approval: buildFlowApproval(), intent: buildFlowIntent() }]]);
+    const count = await (await buildApp().request('/approvals/pending/count')).json();
+    expect(count).toEqual({ count: 0 });
+  });
+
+  it('GET /:id returns it to a pool member and 404s for a non-member', async () => {
+    queueSelects([[buildFlowApproval()], [buildFlowIntent()]]);
+    const res = await buildApp().request('/approvals/appr-fl-1');
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.approval.id).toBe('appr-fl-1');
+    expect(body.approval.approvalScope).toBe('supervised');
+
+    vi.mocked(isAgentIntentDecideAuthorized).mockResolvedValue(false);
+    queueSelects([[buildFlowApproval()], [buildFlowIntent()]]);
+    const denied = await buildApp().request('/approvals/appr-fl-1');
+    expect(denied.status).toBe(404);
+    expect(await denied.text()).not.toContain('kill_process');
+  });
+
+  it('POST /:id/assertion-challenge mints for a pool member and 404s for a non-member', async () => {
+    // approval row, intent, webauthn devices, mobile devices
+    queueSelects([[buildFlowApproval()], [buildFlowIntent()], [], []]);
+    const res = await buildApp().request('/approvals/appr-fl-1/assertion-challenge', { method: 'POST' });
+    expect(res.status).toBe(200);
+    expect(generateApprovalAssertionOptions).toHaveBeenCalledWith(
+      expect.objectContaining({ approvalId: 'appr-fl-1', userId: TEST_USER.id }),
+    );
+
+    vi.mocked(generateApprovalAssertionOptions).mockClear();
+    vi.mocked(isAgentIntentDecideAuthorized).mockResolvedValue(false);
+    queueSelects([[buildFlowApproval()], [buildFlowIntent()], [], []]);
+    const denied = await buildApp().request('/approvals/appr-fl-1/assertion-challenge', { method: 'POST' });
+    expect(denied.status).toBe(404);
+    expect(generateApprovalAssertionOptions).not.toHaveBeenCalled();
+  });
+
+  it('a four_eyes flow intent uses the org approvals:decide rule, not the pool', async () => {
+    queueSelects([[{ approval: buildFlowApproval(), intent: buildFlowIntent({ approvalScope: 'four_eyes' }) }]]);
+    const body = await (await buildApp().request('/approvals/pending')).json();
+    expect(body.approvals.map((a: any) => a.id)).toEqual(['appr-fl-1']);
+    expect(vi.mocked(isAgentIntentDecideAuthorized)).not.toHaveBeenCalled();
+
+    vi.mocked(userCanDecideApprovals).mockReturnValueOnce(false);
+    queueSelects([[{ approval: buildFlowApproval(), intent: buildFlowIntent({ approvalScope: 'four_eyes', id: 'intent-fl-2' }) }]]);
+    const hidden = await (await buildApp().request('/approvals/pending')).json();
+    expect(hidden.approvals).toEqual([]);
+  });
+
+  it('the Recent view shows a terminal supervised flow row to a pool member', async () => {
+    queueSelects([[
+      {
+        approval: buildFlowApproval({ status: 'approved', decidedAt: new Date() }),
+        intent: buildFlowIntent({ status: 'completed', errorCode: null, result: null, executedAt: new Date() }),
+      },
+    ]]);
+    const body = await (await buildApp().request('/approvals/pending?view=recent')).json();
+    expect(body.approvals.map((a: any) => a.id)).toEqual(['appr-fl-1']);
   });
 });

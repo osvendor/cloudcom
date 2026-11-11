@@ -11,12 +11,22 @@ import "os"
 // agent ID, and helper-scoped token. The full agent/watchdog tokens and mTLS
 // keys are NOT in agent.yaml — they live in secrets.yaml, which stays
 // owner-only (0600).
+//
+// Inside a registered user workspace (the Quick Support client's temp dir,
+// see user_workspace.go) there is no Helper to read anything, so the directory
+// is 0700 and every file 0600.
 
 func enforceConfigDirPermissions(path string) error {
+	if inUserWorkspace(path) {
+		return secureUserWorkspaceDir(path)
+	}
 	return os.Chmod(path, 0755)
 }
 
 func enforceConfigFilePermissions(path string) error {
+	if inUserWorkspace(path) {
+		return os.Chmod(path, 0600)
+	}
 	return os.Chmod(path, 0644)
 }
 
@@ -35,3 +45,13 @@ var enforceSecretFilePermissions = enforceSecretFilePermissionsImpl
 func programDataDirACLDrifted(string) (bool, error) { return false, nil }
 
 func enforceProgramDataDirPermissions(string) error { return nil }
+
+// configDirOwnerDrifted mirrors programDataDirACLDrifted above: ownership
+// drift on the ProgramData root is a Windows-only concept, so this always
+// reports "clean" here. See permissions_drift.go.
+func configDirOwnerDrifted(string) (bool, error) { return false, nil }
+
+// createProgramDataDir has no hardened-create counterpart off Windows: a
+// missing logs/data dir is left for the code that owns it to create. See
+// permissions_drift.go.
+func createProgramDataDir(string) error { return errProgramDataDirCreateUnsupported }

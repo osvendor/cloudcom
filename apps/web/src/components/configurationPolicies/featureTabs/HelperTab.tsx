@@ -8,27 +8,40 @@ import { useTranslation } from "react-i18next";
 import { i18n } from "@/lib/i18n";
 type HelperSettings = {
   enabled: boolean;
-  /**
-   * Whether the tray icon is drawn at all. Independent of the menu-item
-   * toggles below — with this off, Breeze Assist still serves chat,
-   * remote-access consent and PAM dialogs, it just has no tray presence.
-   */
-  showTrayIcon: boolean;
   showOpenPortal: boolean;
   showDeviceInfo: boolean;
   showRequestSupport: boolean;
   portalUrl?: string;
   lifecycleMode?: "auto" | "always-on" | "on-demand";
+  // Lets technicians send messages to the person at the device (#8742).
+  // `allowUserReply` (#8743) lets the user answer a technician-started chat;
+  // absent means on.
+  endpointMessaging: { enabled: boolean; allowUserReply: boolean };
 };
 const defaults: HelperSettings = {
+  endpointMessaging: { enabled: false, allowUserReply: true },
   enabled: false,
-  showTrayIcon: true,
   showOpenPortal: true,
   showDeviceInfo: true,
   showRequestSupport: true,
   portalUrl: "",
   lifecycleMode: "auto",
 };
+// Inline settings as stored, minus keys that are no longer settings. A policy
+// saved before #8138 may carry `showTrayIcon`; dropping it here keeps it out
+// of every later save, where a pre-#8138 agent would still act on it.
+function storedSettings(raw: unknown): Partial<HelperSettings> {
+  const { showTrayIcon: _removed, ...rest } = (raw ?? {}) as Partial<HelperSettings> & {
+    showTrayIcon?: unknown;
+  };
+  if (rest.endpointMessaging !== undefined) {
+    rest.endpointMessaging = {
+      enabled: rest.endpointMessaging?.enabled === true,
+      allowUserReply: rest.endpointMessaging?.allowUserReply !== false,
+    };
+  }
+  return rest;
+}
 export default function HelperTab({
   policyId,
   existingLink,
@@ -40,16 +53,23 @@ export default function HelperTab({
   const { save, remove, saving, error, clearError } = useFeatureLink(policyId);
   const isInherited = !!parentLink && !existingLink;
   const effectiveLink = existingLink ?? parentLink;
+  // OD-11 (#10190): a helper policy being created deploys Breeze Assist by
+  // default (the API applies the same default on create). A stored link that
+  // does not decide `enabled` resolves to off on the server, so it shows off.
   const [settings, setSettings] = useState<HelperSettings>(() => ({
     ...defaults,
-    ...(effectiveLink?.inlineSettings as Partial<HelperSettings> | undefined),
+    enabled: !effectiveLink,
+    ...storedSettings(effectiveLink?.inlineSettings),
   }));
   useEffect(() => {
     const link = existingLink ?? parentLink;
-    if (link?.inlineSettings) {
+    if (link) {
+      // Also for a link with no settings (it decides nothing, so the server
+      // resolves it as off), which may arrive after the first render.
       setSettings((prev) => ({
         ...prev,
-        ...(link.inlineSettings as Partial<HelperSettings>),
+        enabled: false,
+        ...storedSettings(link.inlineSettings),
       }));
     }
   }, [existingLink, parentLink]);
@@ -128,11 +148,75 @@ export default function HelperTab({
           </div>
           <button
             type="button"
+            role="switch"
+            aria-checked={settings.enabled}
+            aria-label={i18n.t(
+              "policies:configurationPolicies.featureTabs.helperTab.deployBreezeAssistToDevices",
+            )}
+            data-testid="helper-deploy"
             onClick={() => update("enabled", !settings.enabled)}
             className={`relative inline-flex h-6 w-11 items-center rounded-full border transition ${settings.enabled ? "bg-emerald-500/80" : "bg-muted"}`}
           >
             <span
               className={`inline-block h-5 w-5 rounded-full bg-white transition ${settings.enabled ? "translate-x-5" : "translate-x-1"}`}
+            />
+          </button>
+        </div>
+
+        {/* Endpoint messaging: independent of the tray options below. */}
+        <div className="flex items-center justify-between rounded-md border bg-background px-4 py-3">
+          <div>
+            <p className="text-sm font-medium">
+              {i18n.t("policies:configurationPolicies.featureTabs.helperTab.endpointMessaging")}
+            </p>
+            <p className="text-xs text-muted-foreground">
+              {i18n.t("policies:configurationPolicies.featureTabs.helperTab.endpointMessagingHelp")}
+            </p>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={settings.endpointMessaging.enabled}
+            data-testid="helper-endpoint-messaging"
+            onClick={() =>
+              update("endpointMessaging", {
+                ...settings.endpointMessaging,
+                enabled: !settings.endpointMessaging.enabled,
+              })
+            }
+            className={`relative inline-flex h-6 w-11 items-center rounded-full border transition ${settings.endpointMessaging.enabled ? "bg-emerald-500/80" : "bg-muted"}`}
+          >
+            <span
+              className={`inline-block h-5 w-5 rounded-full bg-white transition ${settings.endpointMessaging.enabled ? "translate-x-5" : "translate-x-1"}`}
+            />
+          </button>
+        </div>
+
+        {/* Chat replies (#8743): stored beside `enabled`, settable while messaging is off. */}
+        <div className={`flex items-center justify-between rounded-md border bg-background px-4 py-3 ${settings.endpointMessaging.enabled ? "" : "opacity-60"}`}>
+          <div>
+            <p className="text-sm font-medium">
+              {i18n.t("policies:configurationPolicies.featureTabs.helperTab.allowUserReply")}
+            </p>
+            <p className="text-xs text-muted-foreground">
+              {i18n.t("policies:configurationPolicies.featureTabs.helperTab.allowUserReplyHelp")}
+            </p>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={settings.endpointMessaging.allowUserReply}
+            data-testid="helper-allow-user-reply"
+            onClick={() =>
+              update("endpointMessaging", {
+                ...settings.endpointMessaging,
+                allowUserReply: !settings.endpointMessaging.allowUserReply,
+              })
+            }
+            className={`relative inline-flex h-6 w-11 items-center rounded-full border transition ${settings.endpointMessaging.allowUserReply ? "bg-emerald-500/80" : "bg-muted"}`}
+          >
+            <span
+              className={`inline-block h-5 w-5 rounded-full bg-white transition ${settings.endpointMessaging.allowUserReply ? "translate-x-5" : "translate-x-1"}`}
             />
           </button>
         </div>
@@ -167,34 +251,6 @@ export default function HelperTab({
             className={`space-y-4 ${settings.enabled ? "" : "pointer-events-none opacity-50"}`}
             aria-disabled={!settings.enabled}
           >
-            {/*
-              Tray icon visibility (#3202). Listed first because it gates
-              whether the menu below is reachable at all — the items stay
-              editable when it is off so a later re-show keeps the config.
-            */}
-            <label className="flex items-center gap-3 rounded-md border bg-background px-4 py-3 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={settings.showTrayIcon}
-                disabled={!settings.enabled}
-                onChange={(e) => update("showTrayIcon", e.target.checked)}
-                data-testid="helper-show-tray-icon"
-                className="h-4 w-4 rounded border-border"
-              />
-              <div>
-                <p className="text-sm font-medium">
-                  {i18n.t(
-                    "policies:configurationPolicies.featureTabs.helperTab.systemTrayIcon",
-                  )}
-                </p>
-                <p className="text-xs text-muted-foreground">
-                  {i18n.t(
-                    "policies:configurationPolicies.featureTabs.helperTab.showsTheBreezeAssistIconInThe",
-                  )}
-                </p>
-              </div>
-            </label>
-
             {/* Open Portal */}
             <label className="flex items-center gap-3 rounded-md border bg-background px-4 py-3 cursor-pointer">
               <input

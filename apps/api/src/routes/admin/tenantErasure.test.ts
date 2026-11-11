@@ -22,6 +22,25 @@ vi.mock('../../services/clientIp', () => ({
   getTrustedClientIpOrUndefined: vi.fn(() => '127.0.0.1'),
 }));
 
+const { legalHoldMock, isolationMock, findEvidenceHoldMock } = vi.hoisted(() => ({
+  legalHoldMock: vi.fn(async () => false),
+  isolationMock: vi.fn(async () => false),
+  findEvidenceHoldMock: vi.fn(async (_orgId: string): Promise<null | { survivorOrgId: string; mergeEventId: string; reason: string }> => null),
+}));
+
+vi.mock('../../services/orgEvidenceHold', () => ({
+  EVIDENCE_HOLD_DEFERRED_ACTION: 'tenant.erasure.deferred_evidence_hold',
+  findEvidenceHold: findEvidenceHoldMock,
+}));
+
+vi.mock('../../services/tenantCascade', () => ({
+  hasActiveBackupLegalHold: legalHoldMock,
+  hasUnresolvedNetworkIsolations: isolationMock,
+  LEGAL_HOLD_ACTIVE_MESSAGE:
+    'This organization has one or more backup snapshots under legal hold. '
+    + 'Release the hold before erasing the organization.',
+}));
+
 // Stub authMiddleware: tests inject their own `auth` context via the
 // pre-route middleware shim below.
 vi.mock('../../middleware/auth', async () => {
@@ -132,6 +151,76 @@ describe('POST /admin/tenant-erasure', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     orgLookup.current = { id: ORG_ID, name: 'Acme Inc', partnerId: 'p-1' };
+    legalHoldMock.mockResolvedValue(false);
+    isolationMock.mockResolvedValue(false);
+    findEvidenceHoldMock.mockResolvedValue(null);
+  });
+
+  it('enqueues a held org (erasure is scoped), audits what the hold retains, and says so in the 202', async () => {
+    findEvidenceHoldMock.mockResolvedValue({ survivorOrgId: 'survivor-1', mergeEventId: 'merge-evt-1', reason: 'pam_evidence' });
+    const app = buildApp(platformAdminAuth);
+    const res = await app.request('/admin/tenant-erasure', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ orgId: ORG_ID, confirmEmail: 'admin@breeze.test' }),
+    });
+    expect(res.status).toBe(202);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body.status).toBe('accepted');
+    expect(body.evidenceHold).toEqual({ retained: true, survivorOrgId: 'survivor-1' });
+    expect(findEvidenceHoldMock).toHaveBeenCalledWith(ORG_ID);
+    expect(enqueueMock).toHaveBeenCalledWith(expect.objectContaining({ orgId: ORG_ID, source: 'platform_admin' }));
+    expect(createAuditLogMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: 'tenant.erasure.deferred_evidence_hold',
+        resourceId: ORG_ID,
+        result: 'success',
+        details: expect.objectContaining({
+          stage: 'admin_request',
+          survivorOrgId: 'survivor-1',
+          mergeEventId: 'merge-evt-1',
+          holdReason: 'pam_evidence',
+        }),
+      }),
+    );
+    expect(createAuditLogMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: 'tenant.erasure.enqueued',
+        details: expect.objectContaining({ evidenceHoldScoped: true }),
+      }),
+    );
+  });
+
+  it('returns 409 and does not enqueue while network isolation is unresolved', async () => {
+    isolationMock.mockResolvedValue(true);
+    const res = await buildApp(platformAdminAuth).request('/admin/tenant-erasure', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ orgId: ORG_ID, confirmEmail: 'admin@breeze.test' }),
+    });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ error: 'isolation_unresolved', message: 'Release network isolation first' });
+    expect(enqueueMock).not.toHaveBeenCalled();
+  });
+
+  it('returns 409 and does not enqueue when the org has a snapshot under legal hold', async () => {
+    legalHoldMock.mockResolvedValue(true);
+    const app = buildApp(platformAdminAuth);
+    const res = await app.request('/admin/tenant-erasure', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ orgId: ORG_ID, confirmEmail: 'admin@breeze.test' }),
+    });
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body.code).toBe('LEGAL_HOLD_ACTIVE');
+    expect(enqueueMock).not.toHaveBeenCalled();
+    expect(createAuditLogMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: 'tenant.erasure.refused_legal_hold',
+        resourceId: ORG_ID,
+        result: 'failure',
+      }),
+    );
   });
 
   it('returns 403 when caller is not a platform admin', async () => {

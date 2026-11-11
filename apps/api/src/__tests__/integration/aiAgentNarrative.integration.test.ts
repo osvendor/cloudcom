@@ -69,6 +69,11 @@ import {
 } from '../../services/aiAgents/runService';
 import { loadNarrativeContext } from '../../services/aiAgents/narrativeContext';
 import { createOrganization, createPartner, createUser } from './db-utils';
+import { usePlatformAiKeyPlaceholder } from './helpers/platformAiKey';
+
+// W03 (#7601): agent admission resolves the agent's model first; the
+// platform default is only usable with a platform key configured.
+usePlatformAiKeyPlaceholder();
 
 /** Monday 07:00 UTC — the only cron shape `isWeeklyLiteralCron` admits. */
 const NARRATIVE_CRON = '0 7 * * 1';
@@ -534,11 +539,12 @@ describe('ai_agent_schedules.kind constraints (real Postgres)', () => {
  * `unavailable`; anything else means a statement threw.
  */
 describe('loadNarrativeContext against real Postgres', () => {
-  /** The seven windowed loaders. A statement that throws shows up as its own
+  /** The eight block loaders (seven windowed + the current-state third-party
+   *  backup block, #6012). A statement that throws shows up as its own
    *  block name in `unavailable` AND as `available: false` — both are asserted,
    *  because the first is what a reader greps for and the second is what the
    *  prompt actually renders. */
-  const LOADER_BLOCKS = ['alerts', 'sweeps', 'fixes', 'tickets', 'patching', 'backups', 'fleet'];
+  const LOADER_BLOCKS = ['alerts', 'sweeps', 'fixes', 'tickets', 'patching', 'backups', 'backupProviders', 'fleet'];
 
   it('executes every statement — no windowed loader block is reported unavailable', async () => {
     const f = await seedFixture();
@@ -553,6 +559,8 @@ describe('loadNarrativeContext against real Postgres', () => {
     // exists for the org, not whether the loader ran. A fixture org has none,
     // so the bare-name check below is what proves the statement executed.
     expect(context.backups.available).toBe(true);
+    // Current-state, not windowed — but a statement all the same (#6012).
+    expect(context.backupProviders.available).toBe(true);
     expect(context.fleet.available).toBe(true);
 
     // `unavailable` legitimately carries the two STRUCTURALLY_UNAVAILABLE

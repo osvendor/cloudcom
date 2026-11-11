@@ -13,7 +13,7 @@ let permissionsState: any;
 
 function chainMock(resolvedValue: unknown = []) {
   const chain: Record<string, any> = {};
-  for (const method of ['from', 'where', 'leftJoin', 'orderBy', 'limit', 'as']) {
+  for (const method of ['from', 'where', 'leftJoin', 'orderBy', 'groupBy', 'limit', 'as']) {
     chain[method] = vi.fn(() => Object.assign(Promise.resolve(resolvedValue), chain));
   }
   chain.then = (onFulfilled: (value: unknown) => unknown, onRejected?: (reason: unknown) => unknown) =>
@@ -31,6 +31,7 @@ vi.mock('../../db', () => ({
   db: {
     select: (...args: unknown[]) => selectMock(...(args as [])),
   },
+  withDbTransaction: (fn: () => Promise<unknown>) => fn(),
 }));
 
 vi.mock('../../db/schema', () => ({
@@ -53,6 +54,12 @@ vi.mock('../../db/schema', () => ({
     errorCount: 'backup_jobs.error_count',
     errorLog: 'backup_jobs.error_log',
   },
+  backupStorageSessions: {
+    jobId: 'backup_storage_sessions.job_id',
+    scope: 'backup_storage_sessions.scope',
+    resumedAt: 'backup_storage_sessions.resumed_at',
+  },
+  IN_FLIGHT_BACKUP_JOB_STATUSES: ['pending', 'running'] as const,
   backupSnapshots: {
     orgId: 'backup_snapshots.org_id',
     deviceId: 'backup_snapshots.device_id',
@@ -68,7 +75,8 @@ vi.mock('../../db/schema', () => ({
   },
   // `partial` counts as a restore point (#3000) — the status route reads this
   // to decide lastSuccessAt.
-  RESTORABLE_BACKUP_JOB_STATUSES: ['completed', 'partial'] as const,
+  RESTORABLE_BACKUP_JOB_STATUSES: ['completed', 'completed_with_errors', 'partial'],
+  DEGRADED_BACKUP_JOB_STATUSES: ['completed_with_errors', 'partial'] as const,
 }));
 
 vi.mock('../../services/featureConfigResolver', () => ({
@@ -87,12 +95,38 @@ vi.mock('drizzle-orm', () => ({
   lte: (column: unknown, value: unknown) => ({ op: 'lte', column, value }),
   inArray: (column: unknown, values: unknown[]) => ({ op: 'inArray', column, values }),
   desc: (value: unknown) => ({ op: 'desc', value }),
+  isNotNull: (column: unknown) => ({ op: 'isNotNull', column }),
+  max: (column: unknown) => ({ op: 'max', column }),
   sql: (strings: TemplateStringsArray, ...values: unknown[]) => ({
     op: 'sql',
     strings,
     values,
     as: (alias: string) => ({ op: 'sql', strings, values, alias }),
   }),
+}));
+
+const getProviderCoverageMock = vi.fn(async () => new Map());
+const getFirstPartyCoverageMock = vi.fn(async () => new Map());
+const getProviderAttentionItemsMock = vi.fn((..._args: unknown[]) => Promise.resolve([] as unknown[]));
+
+vi.mock('../../services/backupHealthReadModel', () => ({
+  getProviderCoverageForDevices: (...a: unknown[]) => getProviderCoverageMock(...(a as [])),
+  getFirstPartyCoverageForDevices: (...a: unknown[]) => getFirstPartyCoverageMock(...(a as [])),
+  getProviderAttentionItems: (...a: unknown[]) => getProviderAttentionItemsMock(...(a as [])),
+}));
+
+const getStorageByProviderMock = vi.fn(async (..._args: unknown[]) => [] as unknown[]);
+
+vi.mock('../../services/backupStorageByProvider', () => ({
+  getStorageByProvider: (...a: unknown[]) => getStorageByProviderMock(...(a as [])),
+}));
+
+const sumStoredSnapshotBytesMock = vi.fn(async (..._args: unknown[]) => ({ totalBytes: 0, count: 0 }));
+const storedSnapshotBytesByProviderSinceMock = vi.fn(async (..._args: unknown[]) => [] as unknown[]);
+
+vi.mock('../../services/backupStoredBytes', () => ({
+  sumStoredSnapshotBytes: (...a: unknown[]) => sumStoredSnapshotBytesMock(...(a as [])),
+  storedSnapshotBytesByProviderSince: (...a: unknown[]) => storedSnapshotBytesByProviderSinceMock(...(a as [])),
 }));
 
 describe('backup dashboard routes', () => {
@@ -137,7 +171,6 @@ describe('backup dashboard routes', () => {
       .mockReturnValueOnce(chainMock([{ count: 1 }]))
       .mockReturnValueOnce(chainMock([{ count: 1 }]))
       .mockReturnValueOnce(chainMock([{ completed: 1, failed: 0, running: 0, pending: 0 }]))
-      .mockReturnValueOnce(chainMock([{ totalBytes: 1024, count: 1 }]))
       .mockReturnValueOnce(chainMock([
         makeRecentJob({ deviceId: DEVICE_ID, deviceName: 'Allowed Device' }),
         makeRecentJob({ id: 'job-out', deviceId: OTHER_DEVICE_ID, deviceName: 'Other Device' }),
@@ -152,6 +185,178 @@ describe('backup dashboard routes', () => {
     expect(body.data.latestJobs.map((job: any) => job.deviceId)).toEqual([DEVICE_ID]);
   });
 
+  it('serializes storageProviders so the Overview panel is not stuck on its empty state (#2562)', async () => {
+    resolveAllBackupAssignedDevicesMock.mockResolvedValueOnce([]);
+    const rows = [{ id: 'backblaze', name: 'Backblaze B2', usedBytes: 4096, snapshots: 2, configs: 1 }];
+    getStorageByProviderMock.mockResolvedValueOnce(rows);
+
+    const res = await app.request('/backup/dashboard');
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data.storageProviders).toEqual(rows);
+    // Unrestricted caller: no site narrowing.
+    expect(getStorageByProviderMock).toHaveBeenCalledWith(ORG_ID, null);
+  });
+
+  it('passes the site-scoped device list to the storage-by-provider read', async () => {
+    permissionsState = { allowedSiteIds: [SITE_A] };
+    resolveAllBackupAssignedDevicesMock.mockResolvedValueOnce([]);
+    selectMock.mockReturnValueOnce(chainMock([
+      { id: DEVICE_ID, siteId: SITE_A },
+      { id: OTHER_DEVICE_ID, siteId: SITE_B },
+    ]));
+
+    const res = await app.request('/backup/dashboard');
+
+    expect(res.status).toBe(200);
+    expect(getStorageByProviderMock).toHaveBeenCalledWith(ORG_ID, [DEVICE_ID]);
+  });
+
+  it('reports Storage Used as stored bytes from the stored-bytes service (#9631)', async () => {
+    resolveAllBackupAssignedDevicesMock.mockResolvedValueOnce([]);
+    sumStoredSnapshotBytesMock.mockResolvedValueOnce({ totalBytes: 669, count: 5 });
+
+    const res = await app.request('/backup/dashboard');
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data.storage).toEqual({ totalBytes: 669, snapshots: 5 });
+    expect(sumStoredSnapshotBytesMock).toHaveBeenCalledWith({
+      op: 'and',
+      conditions: [{ op: 'eq', column: 'backup_snapshots.org_id', value: ORG_ID }, undefined],
+    });
+  });
+
+  it('narrows Storage Used to the site-scoped device list (#9631)', async () => {
+    permissionsState = { allowedSiteIds: [SITE_A] };
+    resolveAllBackupAssignedDevicesMock.mockResolvedValueOnce([]);
+    selectMock.mockReturnValueOnce(chainMock([
+      { id: DEVICE_ID, siteId: SITE_A },
+      { id: OTHER_DEVICE_ID, siteId: SITE_B },
+    ]));
+
+    const res = await app.request('/backup/dashboard');
+
+    expect(res.status).toBe(200);
+    expect(sumStoredSnapshotBytesMock).toHaveBeenCalledWith({
+      op: 'and',
+      conditions: [
+        { op: 'eq', column: 'backup_snapshots.org_id', value: ORG_ID },
+        { op: 'inArray', column: 'backup_snapshots.device_id', values: [DEVICE_ID] },
+      ],
+    });
+  });
+
+  it('starts the storage trend at the stored bytes captured before the window (#9631)', async () => {
+    const today = new Date();
+    today.setUTCHours(0, 0, 0, 0);
+    const dayKey = today.toISOString().slice(0, 10);
+    storedSnapshotBytesByProviderSinceMock.mockResolvedValueOnce([
+      { provider: 's3', day: null, bytes: 100 },
+      { provider: 's3', day: dayKey, bytes: 19 },
+    ]);
+
+    const res = await app.request('/backup/usage-history?days=3');
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    const totals = body.data.points.map((point: { totalBytes: number }) => point.totalBytes);
+    // Two earlier days hold the pre-window level; today adds the new uploads.
+    expect(totals).toEqual([100, 100, 119]);
+    expect(body.data.providers).toEqual(['s3']);
+    const [where, since] = storedSnapshotBytesByProviderSinceMock.mock.calls[0]!;
+    expect(where).toEqual({
+      op: 'and',
+      conditions: [{ op: 'eq', column: 'backup_snapshots.org_id', value: ORG_ID }, undefined],
+    });
+    expect((since as Date).toISOString().slice(0, 10)).toBe(
+      new Date(today.getTime() - 2 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10),
+    );
+  });
+
+  it('narrows the storage trend to the site-scoped device list like Storage Used (#9631)', async () => {
+    permissionsState = { allowedSiteIds: [SITE_A] };
+    selectMock.mockReturnValueOnce(chainMock([
+      { id: DEVICE_ID, siteId: SITE_A },
+      { id: OTHER_DEVICE_ID, siteId: SITE_B },
+    ]));
+
+    const res = await app.request('/backup/usage-history?days=3');
+
+    expect(res.status).toBe(200);
+    expect(storedSnapshotBytesByProviderSinceMock.mock.calls[0]![0]).toEqual({
+      op: 'and',
+      conditions: [
+        { op: 'eq', column: 'backup_snapshots.org_id', value: ORG_ID },
+        { op: 'inArray', column: 'backup_snapshots.device_id', values: [DEVICE_ID] },
+      ],
+    });
+  });
+
+  it('reads no storage trend for a site-restricted caller who can see no devices', async () => {
+    permissionsState = { allowedSiteIds: [SITE_A] };
+    selectMock.mockReturnValueOnce(chainMock([{ id: OTHER_DEVICE_ID, siteId: SITE_B }]));
+
+    const res = await app.request('/backup/usage-history?days=3');
+
+    expect(res.status).toBe(200);
+    expect(storedSnapshotBytesByProviderSinceMock).not.toHaveBeenCalled();
+    const body = await res.json();
+    expect(body.data.points.every((point: { totalBytes: number }) => point.totalBytes === 0)).toBe(true);
+  });
+
+  it('adds dataAccounting to dashboard latestJobs', async () => {
+    resolveAllBackupAssignedDevicesMock.mockResolvedValueOnce([]);
+    selectMock
+      .mockReturnValueOnce(chainMock([{ count: 0 }]))
+      .mockReturnValueOnce(chainMock([{ count: 0 }]))
+      .mockReturnValueOnce(chainMock([{ count: 2 }]))
+      .mockReturnValueOnce(chainMock([{ completed: 1, failed: 1, running: 0, pending: 0 }]))
+      .mockReturnValueOnce(chainMock([
+        makeRecentJob({
+          id: 'job-inc', status: 'completed', backupMode: 'file',
+          totalSize: 1000, referencedSize: 900, baseSnapshotId: 'snap-base',
+        }),
+        makeRecentJob({
+          id: 'job-bad', status: 'failed', backupMode: 'file',
+          totalSize: 2000, transferredSize: 1500, baseSnapshotId: null, fullBackupReason: 'base_expired',
+        }),
+      ]));
+
+    const res = await app.request('/backup/dashboard');
+
+    expect(res.status).toBe(200);
+    const { data } = await res.json();
+    expect(data.latestJobs[0].dataAccounting).toMatchObject({ uploadedBytes: 100, reusedBytes: 900, runKind: 'incremental' });
+    expect(data.latestJobs[1].dataAccounting).toMatchObject({
+      uploadedBytes: null,
+      processedBytes: 1500,
+      runKind: 'full',
+      fullRunReason: 'base_expired',
+    });
+  });
+
+  it('adds failureCategory to dashboard latestJobs', async () => {
+    resolveAllBackupAssignedDevicesMock.mockResolvedValueOnce([]);
+    selectMock
+      .mockReturnValueOnce(chainMock([{ count: 0 }]))
+      .mockReturnValueOnce(chainMock([{ count: 0 }]))
+      .mockReturnValueOnce(chainMock([{ count: 2 }]))
+      .mockReturnValueOnce(chainMock([{ completed: 1, failed: 1, running: 0, pending: 0 }]))
+      .mockReturnValueOnce(chainMock([
+        makeRecentJob({ id: 'job-bad', status: 'failed', errorLog: 'failed to upload file to s3: SlowDown' }),
+        makeRecentJob({ id: 'job-ok', status: 'completed', errorLog: null }),
+      ]));
+
+    const res = await app.request('/backup/dashboard');
+
+    expect(res.status).toBe(200);
+    const { data } = await res.json();
+    expect(data.latestJobs[0].failureCategory).toBe('storage');
+    expect(data.latestJobs[1]).toHaveProperty('failureCategory', null);
+  });
+
   it('keeps unrestricted dashboard behavior unchanged', async () => {
     resolveAllBackupAssignedDevicesMock.mockResolvedValueOnce([
       { deviceId: DEVICE_ID, configId: 'config-1', featureLinkId: 'feature-1' },
@@ -162,7 +367,6 @@ describe('backup dashboard routes', () => {
       .mockReturnValueOnce(chainMock([{ count: 2 }]))
       .mockReturnValueOnce(chainMock([{ count: 2 }]))
       .mockReturnValueOnce(chainMock([{ completed: 1, failed: 1, running: 0, pending: 0 }]))
-      .mockReturnValueOnce(chainMock([{ totalBytes: 2048, count: 2 }]))
       .mockReturnValueOnce(chainMock([
         makeRecentJob({ deviceId: DEVICE_ID, deviceName: 'Allowed Device' }),
         makeRecentJob({ id: 'job-out', deviceId: OTHER_DEVICE_ID, deviceName: 'Other Device' }),
@@ -174,9 +378,10 @@ describe('backup dashboard routes', () => {
     const body = await res.json();
     expect(body.data.totals.policies).toBe(2);
     expect(body.data.latestJobs).toHaveLength(2);
-    // 6 base aggregation queries + 2 for the attention-items ranked-jobs lookup
-    // (subquery build + the awaited select over it).
-    expect(selectMock).toHaveBeenCalledTimes(8);
+    // 5 base aggregation queries + 2 for the attention-items ranked-jobs lookup
+    // (subquery build + the awaited select over it). Storage Used comes from
+    // the stored-bytes service (#9631), mocked here.
+    expect(selectMock).toHaveBeenCalledTimes(7);
     expect(body.data.attentionItems).toEqual([]);
   });
 
@@ -187,7 +392,6 @@ describe('backup dashboard routes', () => {
       .mockReturnValueOnce(chainMock([{ count: 2 }])) // jobCount
       .mockReturnValueOnce(chainMock([{ count: 0 }])) // snapshotCount
       .mockReturnValueOnce(chainMock([{ completed: 0, failed: 2, running: 0, pending: 0 }])) // last24hStats
-      .mockReturnValueOnce(chainMock([{ totalBytes: 0, count: 0 }])) // storageStats
       .mockReturnValueOnce(chainMock([])) // recentJobsRaw
       .mockReturnValueOnce(chainMock([])) // ranked-jobs subquery build (value unused)
       .mockReturnValueOnce(chainMock([
@@ -228,6 +432,77 @@ describe('backup dashboard routes', () => {
     expect(body.data.attentionError).toBe(false);
   });
 
+  // #9543: the agent's deliberate "reparse points were not backed up" note is
+  // informational; it must not stand in for (or bury) the failure reason.
+  it('keeps skipped reparse points out of an attention item reason', async () => {
+    const reparseNote =
+      '159 reparse point(s) were not backed up (junctions and mount points are skipped, not followed; 159 other): ' +
+      'C:\\a.exe (other reparse point, tag 0x8000001B); C:\\b.exe (other reparse point, tag 0x8000001B); ' +
+      'C:\\c.exe (other reparse point, tag 0x8000001B); C:\\d.exe (other reparse point, tag 0x8000001B); ' +
+      'C:\\e.exe (other reparse point, tag 0x8000001B) (+154 more)';
+    resolveAllBackupAssignedDevicesMock.mockResolvedValueOnce([]);
+    selectMock
+      .mockReturnValueOnce(chainMock([{ count: 0 }])) // configCount
+      .mockReturnValueOnce(chainMock([{ count: 2 }])) // jobCount
+      .mockReturnValueOnce(chainMock([{ count: 0 }])) // snapshotCount
+      .mockReturnValueOnce(chainMock([{ completed: 0, failed: 2, running: 0, pending: 0 }])) // last24hStats
+      .mockReturnValueOnce(chainMock([])) // recentJobsRaw
+      .mockReturnValueOnce(chainMock([])) // ranked-jobs subquery build (value unused)
+      .mockReturnValueOnce(chainMock([
+        {
+          deviceId: FAILING_DEVICE_ID,
+          status: 'failed',
+          errorLog: `backup stopped; ${reparseNote}`,
+          completedAt: new Date('2026-07-14T10:00:00.000Z'),
+          createdAt: new Date('2026-07-14T09:55:00.000Z'),
+          rn: 1,
+          deviceName: 'Finance Laptop',
+          deviceHostname: 'fin-laptop-01',
+        },
+      ])); // ranked-jobs rows
+
+    const res = await app.request('/backup/dashboard');
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data.attentionItems).toHaveLength(1);
+    expect(body.data.attentionItems[0].description).toMatch(/^backup stopped · Last unsuccessful /);
+    expect(body.data.attentionItems[0].description).not.toContain('reparse');
+  });
+
+  // #11026: rows persisted before the server stopped storing it can still carry
+  // the note that a file list did not fit in the result. It is never the reason.
+  it('keeps the recoverable index drop note out of an attention item reason', async () => {
+    const indexNote = 'snapshot file index omitted (17950 entries): the result exceeded the 4934464 byte server result budget, so per-file restore browsing is unavailable for this snapshot';
+    resolveAllBackupAssignedDevicesMock.mockResolvedValueOnce([]);
+    selectMock
+      .mockReturnValueOnce(chainMock([{ count: 0 }])) // configCount
+      .mockReturnValueOnce(chainMock([{ count: 2 }])) // jobCount
+      .mockReturnValueOnce(chainMock([{ count: 0 }])) // snapshotCount
+      .mockReturnValueOnce(chainMock([{ completed: 0, failed: 2, running: 0, pending: 0 }])) // last24hStats
+      .mockReturnValueOnce(chainMock([])) // recentJobsRaw
+      .mockReturnValueOnce(chainMock([])) // ranked-jobs subquery build (value unused)
+      .mockReturnValueOnce(chainMock([
+        {
+          deviceId: FAILING_DEVICE_ID,
+          status: 'failed',
+          errorLog: `backup stopped || bounded: ${indexNote}`,
+          completedAt: new Date('2026-07-14T10:00:00.000Z'),
+          createdAt: new Date('2026-07-14T09:55:00.000Z'),
+          rn: 1,
+          deviceName: 'Finance Laptop',
+          deviceHostname: 'fin-laptop-01',
+        },
+      ])); // ranked-jobs rows
+
+    const res = await app.request('/backup/dashboard');
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data.attentionItems[0].description).toMatch(/^backup stopped · Last unsuccessful /);
+    expect(body.data.attentionItems[0].description).not.toContain('snapshot file index');
+  });
+
   // #3000: a device whose latest backup landed `partial` (a real snapshot, but
   // a disproportionate share of the data missing) must reach attentionItems.
   // Before the partial status existed such a run was indistinguishable from a
@@ -239,7 +514,6 @@ describe('backup dashboard routes', () => {
       .mockReturnValueOnce(chainMock([{ count: 1 }])) // jobCount
       .mockReturnValueOnce(chainMock([{ count: 0 }])) // snapshotCount
       .mockReturnValueOnce(chainMock([{ completed: 0, failed: 0, partial: 1, running: 0, pending: 0 }])) // last24hStats
-      .mockReturnValueOnce(chainMock([{ totalBytes: 0, count: 0 }])) // storageStats
       .mockReturnValueOnce(chainMock([])) // recentJobsRaw
       .mockReturnValueOnce(chainMock([])) // ranked-jobs subquery build (value unused)
       .mockReturnValueOnce(chainMock([
@@ -274,6 +548,56 @@ describe('backup dashboard routes', () => {
     expect(body.data.jobsLast24h).toMatchObject({ completed: 0, failed: 0, partial: 1 });
   });
 
+  // #5396: `completed` now means every file was read. A latest run that missed
+  // files under the threshold (completed_with_errors) is a restore point, but
+  // an operator must see it — as its own warning, never as a failure streak.
+  it('flags a device whose latest backup completed with file errors, and serializes the counter', async () => {
+    resolveAllBackupAssignedDevicesMock.mockResolvedValueOnce([]);
+    selectMock
+      .mockReturnValueOnce(chainMock([{ count: 0 }])) // configCount
+      .mockReturnValueOnce(chainMock([{ count: 1 }])) // jobCount
+      .mockReturnValueOnce(chainMock([{ count: 0 }])) // snapshotCount
+      .mockReturnValueOnce(chainMock([{ completed: 0, completedWithErrors: 1, failed: 1, partial: 0, running: 0, pending: 0 }])) // last24hStats
+      .mockReturnValueOnce(chainMock([])) // recentJobsRaw
+      .mockReturnValueOnce(chainMock([])) // ranked-jobs subquery build (value unused)
+      .mockReturnValueOnce(chainMock([
+        {
+          deviceId: FAILING_DEVICE_ID,
+          status: 'completed_with_errors',
+          errorLog: '1 file(s) could not be read during collection: perm-denied.txt: permission denied',
+          completedAt: new Date('2026-07-14T10:00:00.000Z'),
+          createdAt: new Date('2026-07-14T09:55:00.000Z'),
+          rn: 1,
+          deviceName: 'Finance Laptop',
+          deviceHostname: 'fin-laptop-01',
+        },
+        {
+          deviceId: FAILING_DEVICE_ID,
+          status: 'failed',
+          errorLog: 'provider unreachable',
+          completedAt: new Date('2026-07-13T10:00:00.000Z'),
+          createdAt: new Date('2026-07-13T09:55:00.000Z'),
+          rn: 2,
+          deviceName: 'Finance Laptop',
+          deviceHostname: 'fin-laptop-01',
+        },
+      ])); // ranked-jobs rows
+
+    const res = await app.request('/backup/dashboard');
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data.attentionItems).toHaveLength(1);
+    expect(body.data.attentionItems[0]).toMatchObject({
+      id: `backup-failing-${FAILING_DEVICE_ID}`,
+      severity: 'warning',
+    });
+    expect(body.data.attentionItems[0].title).toContain('completed with file errors');
+    expect(body.data.attentionItems[0].title).not.toContain('consecutive');
+    expect(body.data.attentionItems[0].description).toContain('perm-denied.txt');
+    expect(body.data.jobsLast24h).toMatchObject({ completed: 0, completedWithErrors: 1, failed: 1 });
+  });
+
   // Two consecutive partial runs are two degraded-but-usable restore points.
   // They must not escalate to `critical` the way two hard failures do.
   it('does not escalate consecutive partial runs to critical severity', async () => {
@@ -293,7 +617,6 @@ describe('backup dashboard routes', () => {
       .mockReturnValueOnce(chainMock([{ count: 2 }]))
       .mockReturnValueOnce(chainMock([{ count: 0 }]))
       .mockReturnValueOnce(chainMock([{ completed: 0, failed: 0, partial: 2, running: 0, pending: 0 }]))
-      .mockReturnValueOnce(chainMock([{ totalBytes: 0, count: 0 }]))
       .mockReturnValueOnce(chainMock([]))
       .mockReturnValueOnce(chainMock([]))
       .mockReturnValueOnce(chainMock([partialRow(1, '14'), partialRow(2, '13')]));
@@ -315,7 +638,6 @@ describe('backup dashboard routes', () => {
       .mockReturnValueOnce(chainMock([{ count: 1 }])) // jobCount
       .mockReturnValueOnce(chainMock([{ count: 0 }])) // snapshotCount
       .mockReturnValueOnce(chainMock([{ completed: 0, failed: 0, partial: 0, running: 0, pending: 0 }])) // last24hStats
-      .mockReturnValueOnce(chainMock([{ totalBytes: 0, count: 0 }])) // storageStats
       .mockReturnValueOnce(chainMock([])) // recentJobsRaw
       .mockReturnValueOnce(chainMock([])) // ranked-jobs subquery build (value unused)
       .mockReturnValueOnce(chainMock([
@@ -360,7 +682,6 @@ describe('backup dashboard routes', () => {
       .mockReturnValueOnce(chainMock([{ count: 1 }])) // jobCount
       .mockReturnValueOnce(chainMock([{ count: 0 }])) // snapshotCount
       .mockReturnValueOnce(chainMock([{ completed: 0, failed: 1, running: 0, pending: 0 }])) // last24hStats
-      .mockReturnValueOnce(chainMock([{ totalBytes: 0, count: 0 }])) // storageStats
       .mockReturnValueOnce(chainMock([])) // recentJobsRaw
       .mockReturnValueOnce(chainMock([])) // ranked-jobs subquery build (value unused)
       .mockReturnValueOnce(failingRankedRows); // awaited ranked-jobs select rejects
@@ -385,7 +706,6 @@ describe('backup dashboard routes', () => {
       .mockReturnValueOnce(chainMock([{ count: 2 }])) // jobCount
       .mockReturnValueOnce(chainMock([{ count: 0 }])) // snapshotCount
       .mockReturnValueOnce(chainMock([{ completed: 1, failed: 1, running: 0, pending: 0 }])) // last24hStats
-      .mockReturnValueOnce(chainMock([{ totalBytes: 0, count: 0 }])) // storageStats
       .mockReturnValueOnce(chainMock([])) // recentJobsRaw
       .mockReturnValueOnce(chainMock([])) // ranked-jobs subquery build (value unused)
       .mockReturnValueOnce(chainMock([
@@ -472,6 +792,64 @@ describe('backup dashboard routes', () => {
       const body = await res.json();
       expect(body.data.lastJob).toHaveProperty('vssMetadata');
       expect(body.data.lastJob.vssMetadata).toBeNull();
+    });
+
+    it('status lastJob carries dataAccounting', async () => {
+      mockStatusQueries(makeJob({
+        status: 'completed',
+        backupMode: 'system_image',
+        totalSize: 1000,
+        referencedSize: 0,
+        baseSnapshotId: 'snap-base',
+      }));
+
+      const res = await app.request(`/backup/status/${DEVICE_ID}`);
+
+      expect(res.status).toBe(200);
+      const { data } = await res.json();
+      expect(data.lastJob.dataAccounting).toMatchObject({
+        uploadedBytes: 1000,
+        runKind: 'full',
+        fullRunReason: 'nothing_reused',
+      });
+    });
+
+    it('status lastJob and lastFailure carry failureCategory', async () => {
+      mockStatusQueries(makeJob({ status: 'failed', errorLog: 'backup helper exited unexpectedly' }));
+
+      const res = await app.request(`/backup/status/${DEVICE_ID}`);
+
+      expect(res.status).toBe(200);
+      const { data } = await res.json();
+      expect(data.lastJob.failureCategory).toBe('agent');
+      expect(data.lastFailureCategory).toBe('agent');
+    });
+
+    it('classifies lastFailure from the failed run when a later run succeeded', async () => {
+      resolveBackupConfigForDeviceMock.mockResolvedValueOnce(null);
+      selectMock
+        .mockReturnValueOnce(chainMock([{ id: DEVICE_ID, siteId: SITE_A }]))
+        .mockReturnValueOnce(chainMock([
+          makeJob({ id: 'job-ok', status: 'completed', createdAt: new Date('2026-04-02T00:00:00.000Z') }),
+          makeJob({ id: 'job-bad', status: 'failed', errorLog: 'Agent not connected' }),
+        ]));
+
+      const res = await app.request(`/backup/status/${DEVICE_ID}`);
+
+      expect(res.status).toBe(200);
+      const { data } = await res.json();
+      expect(data.lastJob.failureCategory).toBeNull();
+      expect(data.lastFailureCategory).toBe('device_offline');
+    });
+
+    it('reports null failure categories for a device with no failed run', async () => {
+      mockStatusQueries(makeJob());
+
+      const res = await app.request(`/backup/status/${DEVICE_ID}`);
+
+      const { data } = await res.json();
+      expect(data.lastJob).toHaveProperty('failureCategory', null);
+      expect(data).toHaveProperty('lastFailureCategory', null);
     });
 
     it('includes errorLog — the ONLY channel a total VSS failure has', async () => {
@@ -603,6 +981,201 @@ describe('backup dashboard routes', () => {
       expect(JSON.stringify(orderTerms[0])).toContain('backup_jobs.started_at');
       expect(orderTerms[1]).toEqual({ op: 'desc', value: 'backup_jobs.created_at' });
       expect(orderTerms[2]).toEqual({ op: 'desc', value: 'backup_jobs.id' });
+    });
+  });
+
+  describe('GET /status/:deviceId — activeJobs (#11027)', () => {
+    function inFlight(overrides: Record<string, unknown> = {}) {
+      return {
+        id: 'job-x',
+        status: 'running',
+        backupMode: 'file',
+        backupType: 'file',
+        createdAt: new Date('2026-11-05T10:00:00.000Z'),
+        startedAt: new Date('2026-11-05T10:01:00.000Z'),
+        completedAt: null,
+        totalSize: 400,
+        transferredSize: 100,
+        fileCount: 10,
+        totalFiles: 40,
+        lastProgressAt: new Date('2026-11-05T10:05:00.000Z'),
+        lastKeepaliveAt: new Date('2026-11-05T10:06:00.000Z'),
+        errorLog: null,
+        vssMetadata: null,
+        ...overrides,
+      };
+    }
+
+    it('status returns activeJobs running-first with resumedAt', async () => {
+      resolveBackupConfigForDeviceMock.mockResolvedValueOnce(null);
+      const sessionsChain = chainMock([
+        { jobId: 'job-running', resumedAt: new Date('2026-11-05T10:02:00.000Z') },
+      ]);
+      selectMock
+        .mockReturnValueOnce(chainMock([{ id: DEVICE_ID, siteId: SITE_A }]))
+        .mockReturnValueOnce(chainMock([
+          // Created later and never started: a second mode queued behind the
+          // running one on the same device (#11012's shape).
+          inFlight({
+            id: 'job-pending',
+            status: 'pending',
+            backupMode: 'system_image',
+            backupType: 'system_image',
+            createdAt: new Date('2026-11-05T10:00:00.000Z'),
+            startedAt: null,
+            totalSize: null,
+            transferredSize: null,
+            lastProgressAt: null,
+            lastKeepaliveAt: new Date('2026-11-05T10:06:00.000Z'),
+          }),
+          inFlight({ id: 'job-running', transferredSize: 0 }),
+          inFlight({ id: 'job-done', status: 'completed', completedAt: new Date('2026-11-04T10:00:00.000Z'), startedAt: new Date('2026-11-04T09:00:00.000Z') }),
+        ]))
+        .mockReturnValueOnce(sessionsChain);
+
+      const res = await app.request(`/backup/status/${DEVICE_ID}`);
+
+      expect(res.status).toBe(200);
+      const { data } = await res.json();
+      expect(data.activeJobs.map((j: { id: string }) => j.id)).toEqual(['job-running', 'job-pending']);
+      expect(data.activeJobs[0]).toMatchObject({
+        status: 'running',
+        backupMode: 'file',
+        totalSize: 400,
+        transferredSize: 0,
+        fileCount: 10,
+        totalFiles: 40,
+        startedAt: '2026-11-05T10:01:00.000Z',
+        lastKeepaliveAt: '2026-11-05T10:06:00.000Z',
+        resumedAt: '2026-11-05T10:02:00.000Z',
+      });
+      expect(data.activeJobs[1]).toMatchObject({ status: 'pending', startedAt: null, resumedAt: null });
+
+      // One grouped query, scoped to the active ids and to resumed write sessions.
+      const where = JSON.stringify(sessionsChain.where.mock.calls[0]);
+      expect(where).toContain('backup_storage_sessions.job_id');
+      expect(where).toContain('job-running');
+      expect(where).toContain('job-pending');
+      expect(where).not.toContain('job-done');
+      expect(where).toContain('snapshot_write');
+      expect(where).toContain('isNotNull');
+      expect(sessionsChain.groupBy).toHaveBeenCalledWith('backup_storage_sessions.job_id');
+    });
+
+    it('orders same-status jobs by startedAt then createdAt ascending', async () => {
+      resolveBackupConfigForDeviceMock.mockResolvedValueOnce(null);
+      selectMock
+        .mockReturnValueOnce(chainMock([{ id: DEVICE_ID, siteId: SITE_A }]))
+        .mockReturnValueOnce(chainMock([
+          inFlight({ id: 'p-late', status: 'pending', startedAt: null, createdAt: new Date('2026-11-05T11:00:00.000Z') }),
+          inFlight({ id: 'p-early', status: 'pending', startedAt: null, createdAt: new Date('2026-11-05T09:00:00.000Z') }),
+          inFlight({ id: 'r-late', startedAt: new Date('2026-11-05T10:30:00.000Z') }),
+          inFlight({ id: 'r-early', startedAt: new Date('2026-11-05T10:10:00.000Z') }),
+        ]))
+        .mockReturnValueOnce(chainMock([]));
+
+      const res = await app.request(`/backup/status/${DEVICE_ID}`);
+
+      const { data } = await res.json();
+      expect(data.activeJobs.map((j: { id: string }) => j.id)).toEqual(['r-early', 'r-late', 'p-early', 'p-late']);
+    });
+
+    it('status returns empty activeJobs and skips the session query when nothing is in flight', async () => {
+      resolveBackupConfigForDeviceMock.mockResolvedValueOnce(null);
+      selectMock
+        .mockReturnValueOnce(chainMock([{ id: DEVICE_ID, siteId: SITE_A }]))
+        .mockReturnValueOnce(chainMock([
+          inFlight({ id: 'job-done', status: 'completed', completedAt: new Date('2026-11-04T10:00:00.000Z') }),
+        ]));
+
+      const res = await app.request(`/backup/status/${DEVICE_ID}`);
+
+      expect(res.status).toBe(200);
+      const { data } = await res.json();
+      expect(data.activeJobs).toEqual([]);
+      // device lookup + job history only — no backup_storage_sessions read.
+      expect(selectMock).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe('provider-aware coverage', () => {
+    it('lists an assigned device with no fresh backup under overdueDevices', async () => {
+      resolveAllBackupAssignedDevicesMock.mockResolvedValueOnce([
+        { deviceId: DEVICE_ID, configId: 'config-1', featureLinkId: 'feature-1' },
+      ]);
+      getFirstPartyCoverageMock.mockResolvedValueOnce(
+        new Map([[DEVICE_ID, { covered: false, health: 'critical', status: 'failed', lastSuccessAt: null }]]),
+      );
+      getProviderCoverageMock.mockResolvedValueOnce(new Map());
+
+      const body = await (await app.request('/backup/dashboard')).json();
+
+      expect(body.data.overdueDevices).toEqual([
+        expect.objectContaining({ id: DEVICE_ID, lastBackup: null }),
+      ]);
+    });
+
+    it('drops a device from overdueDevices when a provider backup covers it', async () => {
+      resolveAllBackupAssignedDevicesMock.mockResolvedValueOnce([
+        { deviceId: DEVICE_ID, configId: 'config-1', featureLinkId: 'feature-1' },
+      ]);
+      getFirstPartyCoverageMock.mockResolvedValueOnce(
+        new Map([[DEVICE_ID, { covered: false, health: 'critical', status: 'failed', lastSuccessAt: null }]]),
+      );
+      getProviderCoverageMock.mockResolvedValueOnce(
+        new Map([[DEVICE_ID, { covered: true, health: 'healthy' }]]),
+      );
+
+      const body = await (await app.request('/backup/dashboard')).json();
+
+      expect(body.data.overdueDevices).toEqual([]);
+    });
+
+    it('counts a provider-covered device as protected', async () => {
+      resolveAllBackupAssignedDevicesMock.mockResolvedValueOnce([]);
+      getProviderCoverageMock.mockResolvedValueOnce(
+        new Map([[DEVICE_ID, { covered: true, health: 'healthy' }]]),
+      );
+
+      const body = await (await app.request('/backup/dashboard')).json();
+
+      expect(body.data.coverage.protectedDevices).toBe(1);
+    });
+
+    it('appends critical provider rows to attentionItems with a provider: id', async () => {
+      resolveAllBackupAssignedDevicesMock.mockResolvedValueOnce([]);
+      getProviderAttentionItemsMock.mockResolvedValueOnce([
+        { id: 'provider:row-1', title: 'ACME-SRV02: external backup needs attention', description: 'ACME-SRV02 (Acme North) — failed', severity: 'critical' },
+      ]);
+
+      const body = await (await app.request('/backup/dashboard')).json();
+
+      expect(body.data.attentionItems).toContainEqual(
+        expect.objectContaining({ id: 'provider:row-1', severity: 'critical' }),
+      );
+    });
+
+    it('passes the site-allowed device ids to the provider attention query', async () => {
+      resolveAllBackupAssignedDevicesMock.mockResolvedValueOnce([]);
+      permissionsState = { allowedSiteIds: [SITE_A] };
+      selectMock.mockReturnValueOnce(chainMock([{ id: DEVICE_ID, siteId: SITE_A }]));
+
+      await app.request('/backup/dashboard');
+
+      expect(getProviderAttentionItemsMock.mock.calls[0]![1]).toMatchObject({ allowedDeviceIds: [DEVICE_ID] });
+    });
+
+    it('survives a read-model failure without 500ing the dashboard', async () => {
+      resolveAllBackupAssignedDevicesMock.mockResolvedValueOnce([]);
+      getProviderCoverageMock.mockRejectedValueOnce(new Error('boom'));
+      getProviderAttentionItemsMock.mockRejectedValueOnce(new Error('boom'));
+
+      const res = await app.request('/backup/dashboard');
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      // Degraded, but never an implied all-clear.
+      expect(body.data.attentionError).toBe(true);
     });
   });
 });

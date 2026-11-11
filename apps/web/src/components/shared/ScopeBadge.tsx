@@ -12,12 +12,15 @@ export function ScopeBadge({
   isSystem,
   orgName,
   className,
+  testId = 'scope-badge',
 }: {
   orgId: string | null;
   partnerId: string | null;
   isSystem: boolean;
   orgName?: string;
   className?: string;
+  /** Per-row id for lists where several badges render at once (#9935). */
+  testId?: string;
 }) {
   const { t } = useTranslation('common');
   let icon = <Building2 className="h-3 w-3" />;
@@ -34,11 +37,18 @@ export function ScopeBadge({
     icon = <Layers className="h-3 w-3" />;
     label = t('shared.scope.partnerWide');
     tone = 'bg-primary/10 text-primary';
+  } else if (orgId === null && partnerId === null && import.meta.env.DEV) {
+    // Unreachable for rows guarded by the DB `<table>_one_owner_chk` XOR check,
+    // so an owner-less non-system row means the caller passed the wrong fields
+    // (#2600). It still renders as an org badge — make the mislabel loud in dev.
+    console.warn('ScopeBadge: non-system row has neither orgId nor partnerId; rendering as organization', {
+      orgName,
+    });
   }
 
   return (
     <span
-      data-testid="scope-badge"
+      data-testid={testId}
       className={cn('inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium', tone, className)}
     >
       {icon}

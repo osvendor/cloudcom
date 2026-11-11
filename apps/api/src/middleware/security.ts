@@ -1,5 +1,11 @@
 import type { Context, MiddlewareHandler, Next } from 'hono';
-import { canonicalHttpsRedirect, effectiveRequestScheme, isCanonicalRequestHost } from '../services/requestTransport';
+import {
+  canonicalHttpsRedirect,
+  effectiveRequestScheme,
+  isCanonicalRequestHost,
+  isInternalServiceRequest,
+  parseInternalServiceConfig,
+} from '../services/requestTransport';
 import {
   getImmediatePeerIpOrUndefined,
   hasTrustGatedForwardedHeaders,
@@ -128,6 +134,31 @@ interface SecurityMiddlewareOptions {
   cspConnectHosts?: string;
   /** Override PUBLIC_API_URL for testing. Defaults to process.env.PUBLIC_API_URL */
   publicApiUrl?: string;
+  /** Override INTERNAL_SERVICE_CIDRS (#9700) for testing. Defaults to process.env.INTERNAL_SERVICE_CIDRS */
+  internalServiceCidrs?: string;
+  /** Override INTERNAL_API_HOSTS (#9700) for testing. Defaults to process.env.INTERNAL_API_HOSTS, then `api:3001` */
+  internalApiHosts?: string;
+  /**
+   * Path prefix for which this middleware's own response headers
+   * (Content-Security-Policy, Report-To, Permissions-Policy) are skipped —
+   * used by the tunnel-http reverse-proxy route, which sets its own
+   * conflicting CSP on every response it returns and must not have this
+   * middleware's `frame-ancestors 'none'` CSP win on top of it.
+   *
+   * HTTP->HTTPS redirect and canonical-Host enforcement below are NOT part
+   * of this skip: they're a different concern (transport/Host validation,
+   * not response headers) and stay active for every path, including this
+   * prefix.
+   */
+  skipHeadersPathPrefix?: string;
+  /** Predicate form of skipHeadersPathPrefix (tunnel-host requests, spec 2026-10-06 §3). Headers only. */
+  skipHeadersWhen?: (c: Context) => boolean;
+  /**
+   * Paths whose CSP says `frame-ancestors 'self'` instead of `'none'`; every other directive is unchanged. index.ts
+   * passes `isSameOriginFramePath` (middleware/sameOriginFrame.ts): the inline PDF routes the portal embeds in an
+   * iframe (#10192, #10290).
+   */
+  sameOriginFrameWhen?: (path: string) => boolean;
 }
 
 /**
@@ -167,6 +198,13 @@ export function securityMiddleware(options?: SecurityMiddlewareOptions): Middlew
   const normalized = forceHttps?.trim().toLowerCase();
   const isForceHttps = normalized === 'true' || normalized === '1';
   const publicApiUrlRaw = options?.publicApiUrl ?? process.env.PUBLIC_API_URL;
+  const skipHeadersPathPrefix = options?.skipHeadersPathPrefix;
+  // #9700: the plain-HTTP in-cluster hop (portal/web SSR -> http://api:3001).
+  // Socket-peer gated; see isInternalServiceRequest for the trust argument.
+  const internalService = parseInternalServiceConfig(
+    options?.internalServiceCidrs ?? process.env.INTERNAL_SERVICE_CIDRS,
+    options?.internalApiHosts ?? process.env.INTERNAL_API_HOSTS,
+  );
   // Parsed once at middleware setup, not per-request. When FORCE_HTTPS is true
   // but PUBLIC_API_URL is missing/unparsable, the redirect/reject logic below
   // is skipped entirely (config/validate.ts refuses production boot in that
@@ -187,7 +225,8 @@ export function securityMiddleware(options?: SecurityMiddlewareOptions): Middlew
   const isUnsafeInlineRequested = unsafeInlineNormalized === 'true' || unsafeInlineNormalized === '1';
   const isUnsafeInlineAllowed = nodeEnv !== 'production' && isUnsafeInlineRequested;
 
-  // Pre-build the CSP header value (it doesn't change per-request)
+  // Pre-build the CSP header values (they don't change per-request)
+  const FRAME_ANCESTORS_NONE = "frame-ancestors 'none'";
   const cspDirectives = [
     "default-src 'self'",
     isUnsafeInlineAllowed ? "script-src 'self' 'unsafe-inline'" : "script-src 'self'",
@@ -195,7 +234,7 @@ export function securityMiddleware(options?: SecurityMiddlewareOptions): Middlew
     "img-src 'self' data: blob:",
     "font-src 'self'",
     buildConnectSrc(nodeEnv, cspConnectHosts),
-    "frame-ancestors 'none'",
+    FRAME_ANCESTORS_NONE,
     "base-uri 'self'",
     "form-action 'self'",
   ];
@@ -206,6 +245,9 @@ export function securityMiddleware(options?: SecurityMiddlewareOptions): Middlew
   }
 
   const cspValue = cspDirectives.join('; ');
+  const sameOriginFrameCspValue = cspDirectives
+    .map((d) => (d === FRAME_ANCESTORS_NONE ? "frame-ancestors 'self'" : d))
+    .join('; ');
 
   // Build Report-To header if CSP_REPORT_URI is set
   const reportToValue = cspReportUri
@@ -224,7 +266,7 @@ export function securityMiddleware(options?: SecurityMiddlewareOptions): Middlew
 
     // --- HTTP -> HTTPS redirect ---
     if (isForceHttps && publicApiUrl && !HEALTH_CHECK_PATHS.has(path)) {
-      if (effectiveRequestScheme(c) === 'http') {
+      if (effectiveRequestScheme(c) === 'http' && !isInternalServiceRequest(c, internalService)) {
         const canonicalHost = isCanonicalRequestHost(c, publicApiUrl);
         // Warn before returning either way: the 400 branch is the same
         // misconfiguration seen through a non-canonical Host, and it is just as
@@ -234,7 +276,16 @@ export function securityMiddleware(options?: SecurityMiddlewareOptions): Middlew
         if (!canonicalHost) {
           // Never reflect an unrecognized Host into a redirect — reject
           // instead of redirecting to a domain the client didn't ask for.
-          return c.text('Bad Request', 400);
+          // A stable machine code makes the 400 diagnosable (#7875) without
+          // echoing the received or configured Host back to the caller.
+          c.set('rejectReason', 'force_https_non_canonical_host');
+          return c.json(
+            {
+              error: 'FORCE_HTTPS_NON_CANONICAL_HOST',
+              docs: 'https://docs.breezermm.com/deploy/tls/',
+            },
+            400,
+          );
         }
         const location = canonicalHttpsRedirect(c, publicApiUrl);
         if (location) {
@@ -243,16 +294,22 @@ export function securityMiddleware(options?: SecurityMiddlewareOptions): Middlew
       }
     }
 
-    // --- Content Security Policy ---
-    c.header('Content-Security-Policy', cspValue);
+    // Truthiness guard: an empty prefix means "skip nothing" (every path
+    // startsWith ''), matching the pre-predicate behaviour of this option.
+    const skipHeaders = (!!skipHeadersPathPrefix && path.startsWith(skipHeadersPathPrefix))
+      || options?.skipHeadersWhen?.(c) === true;
+    if (!skipHeaders) {
+      // --- Content Security Policy ---
+      c.header('Content-Security-Policy', options?.sameOriginFrameWhen?.(path) === true ? sameOriginFrameCspValue : cspValue);
 
-    // --- Report-To (for CSP reporting) ---
-    if (reportToValue) {
-      c.header('Report-To', reportToValue);
+      // --- Report-To (for CSP reporting) ---
+      if (reportToValue) {
+        c.header('Report-To', reportToValue);
+      }
+
+      // --- Permissions-Policy ---
+      c.header('Permissions-Policy', permissionsPolicyValue);
     }
-
-    // --- Permissions-Policy ---
-    c.header('Permissions-Policy', permissionsPolicyValue);
 
     await next();
   };

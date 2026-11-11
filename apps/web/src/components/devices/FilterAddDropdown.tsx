@@ -5,7 +5,8 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { Search, Plus } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import type { FilterFieldDefinition } from '@breeze/shared';
-import { V2_FILTER_FIELDS, fieldCategoryLabel } from './filterFields';
+import { getAllFilterFields, fieldCategoryLabel } from './filterFields';
+import { useCustomFieldDefinitionsStore } from '../../stores/customFieldDefinitions';
 import { useClickOutside } from '../../hooks/useClickOutside';
 
 export interface FilterAddDropdownProps {
@@ -19,14 +20,14 @@ export interface FilterAddDropdownProps {
   // trigger sits near the right edge (the Devices toolbar) so the 320px menu
   // doesn't spill off-screen.
   align?: 'left' | 'right';
-  // Optional footer shortcut to create a new device group — restores the
-  // "+ New Group" affordance the old group-filter dropdown had. Shown only when
-  // provided. The "Device Group" field above is the start of the group-filter
-  // journey, so creating one from here keeps that flow in one place.
-  onCreateGroup?: () => void;
+  // Optional footer link to create a new device group. Shown only when
+  // provided. It navigates to the Device Groups page create flow rather than
+  // running a create form of its own: an inline modal here once made empty
+  // static groups with no org owner (#9865), so groups have one create path.
+  createGroupHref?: string;
 }
 
-export function FilterAddDropdown({ onSelect, renderTrigger, align = 'left', onCreateGroup }: FilterAddDropdownProps) {
+export function FilterAddDropdown({ onSelect, renderTrigger, align = 'left', createGroupHref }: FilterAddDropdownProps) {
   const { t } = useTranslation('devices');
   const [open, setOpen] = useState(false);
   const [q, setQ] = useState('');
@@ -39,13 +40,19 @@ export function FilterAddDropdown({ onSelect, renderTrigger, align = 'left', onC
 
   useClickOutside(open, containerRef, () => setOpen(false));
 
+  // Subscribed (not just read) so the field list re-renders once #6594's
+  // GET /custom-fields resolves — getAllFilterFields() itself reads a plain
+  // module cache with no signal of its own, so useMemo needs a reactive
+  // dependency to know when to recompute.
+  const customFieldCount = useCustomFieldDefinitionsStore((s) => s.definitions.length);
   const groups = useMemo(() => {
+    const allFields = getAllFilterFields();
     const lcq = q.toLowerCase().trim();
     const filtered = lcq
-      ? V2_FILTER_FIELDS.filter(f =>
+      ? allFields.filter(f =>
           f.label.toLowerCase().includes(lcq) ||
           f.key.toLowerCase().includes(lcq))
-      : V2_FILTER_FIELDS;
+      : allFields;
     const byCat = new Map<string, FilterFieldDefinition[]>();
     for (const f of filtered) {
       const list = byCat.get(f.category) ?? [];
@@ -53,7 +60,7 @@ export function FilterAddDropdown({ onSelect, renderTrigger, align = 'left', onC
       byCat.set(f.category, list);
     }
     return Array.from(byCat.entries());
-  }, [q]);
+  }, [q, customFieldCount]);
 
   return (
     <div className="relative inline-block" ref={containerRef}>
@@ -115,20 +122,15 @@ export function FilterAddDropdown({ onSelect, renderTrigger, align = 'left', onC
               </div>
             ))}
           </div>
-          {onCreateGroup && (
-            <button
-              type="button"
+          {createGroupHref && (
+            <a
+              href={createGroupHref}
               data-testid="filter-add-new-group"
-              onClick={() => {
-                onCreateGroup();
-                setOpen(false);
-                setQ('');
-              }}
               className="flex w-full items-center gap-2 border-t px-3 py-2 text-left text-sm text-muted-foreground hover:bg-muted hover:text-foreground"
             >
               <Plus className="h-3.5 w-3.5 shrink-0" />
               {t('filterAddDropdown.newGroup')}
-            </button>
+            </a>
           )}
         </div>
       )}

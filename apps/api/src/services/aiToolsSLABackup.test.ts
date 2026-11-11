@@ -1,5 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+vi.mock('./deviceGroupOwnership', async (importOriginal) => ({
+  ...await importOriginal<typeof import('./deviceGroupOwnership')>(),
+  findPartnerOwnedGroupIds: vi.fn(async () => [] as string[]),
+}));
+import { findPartnerOwnedGroupIds } from './deviceGroupOwnership';
+
 vi.mock('../db', () => ({
   runOutsideDbContext: vi.fn((fn) => fn()),
   withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn()),
@@ -210,6 +216,18 @@ describe('aiToolsSLABackup handlers', () => {
     toolMap = buildToolMap();
   });
 
+  it.each(['create', 'update'])('%s refuses partner-group SLA targets without writes and checks the supplied group ids', async (action) => {
+    const groupId = '77777777-7777-4777-8777-777777777777';
+    vi.mocked(findPartnerOwnedGroupIds).mockResolvedValueOnce([groupId]);
+    const result = JSON.parse(await toolMap.get('configure_backup_sla')!.handler({
+      action, configId: CONFIG_ID, name: 'SLA', rpoTargetMinutes: 60, rtoTargetMinutes: 120, targetGroups: [groupId],
+    }, makeAuth()));
+    expect(result).toMatchObject({ code: 'PARTNER_GROUP_TARGET_UNSUPPORTED', groupIds: [groupId] });
+    expect(findPartnerOwnedGroupIds).toHaveBeenCalledWith([groupId]);
+    expect(db.insert).not.toHaveBeenCalled();
+    expect(db.update).not.toHaveBeenCalled();
+  });
+
   it.each([
     ['query_backup_sla', {}],
     ['get_sla_breaches', {}],
@@ -240,5 +258,59 @@ describe('aiToolsSLABackup handlers', () => {
     const parsed = JSON.parse(result);
 
     expect(parsed).toEqual({ error: 'Operation failed. Check server logs for details.' });
+  });
+});
+
+describe('configure_backup_sla:create write-org resolution (#6667)', () => {
+  let toolMap: Map<string, AiTool>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    setDefaultDbMocks();
+    toolMap = buildToolMap();
+  });
+
+  // A partner tech reachable to TWO orgs with no anchored auth.orgId — the
+  // shape that silently picked accessibleOrgIds[0] before the fix.
+  function multiOrgAuth(): AuthContext {
+    return {
+      user: { id: 'user-1', email: 'test@example.com', name: 'Test User' },
+      token: {} as any,
+      partnerId: 'partner-1',
+      orgId: null,
+      scope: 'partner',
+      accessibleOrgIds: [ORG_ID, 'org-2'],
+      canAccessOrg: (orgId: string) => orgId === ORG_ID || orgId === 'org-2',
+      orgCondition: vi.fn(() => undefined),
+    } as any;
+  }
+
+  const CREATE_INPUT = { action: 'create', name: 'Gold SLA', rpoTargetMinutes: 60, rtoTargetMinutes: 120 };
+
+  it('refuses with the ambiguous-org error and inserts nothing when orgId is omitted', async () => {
+    const result = JSON.parse(await toolMap.get('configure_backup_sla')!.handler(CREATE_INPUT, multiOrgAuth()));
+    expect(result.error).toBe('orgId is required: you have access to multiple organizations');
+    expect(db.insert).not.toHaveBeenCalled();
+  });
+
+  it('uses the explicit accessible orgId for the insert', async () => {
+    let insertedValues: Record<string, unknown> | undefined;
+    vi.mocked(db.insert).mockImplementation(() => {
+      const chain: any = {};
+      chain.values = vi.fn((v: Record<string, unknown>) => {
+        insertedValues = v;
+        return chain;
+      });
+      chain.returning = vi.fn(() => Promise.resolve([{ id: 'sla-1', orgId: 'org-2', name: 'Gold SLA' }]));
+      return chain;
+    });
+
+    const result = JSON.parse(await toolMap.get('configure_backup_sla')!.handler(
+      { ...CREATE_INPUT, orgId: 'org-2' },
+      multiOrgAuth(),
+    ));
+
+    expect(result.success).toBe(true);
+    expect(insertedValues?.orgId).toBe('org-2');
   });
 });

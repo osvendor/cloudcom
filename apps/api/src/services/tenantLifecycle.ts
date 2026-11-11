@@ -1,11 +1,12 @@
 import { and, eq, gt, inArray, isNotNull, isNull, or } from 'drizzle-orm';
-import { db, getCurrentDbAccessContext, runOutsideDbContext, withSystemDbAccessContext } from '../db';
+import { db, getCurrentDbAccessContext, hasDbAccessContext, runOutsideDbContext, withDbTransaction, withSystemDbAccessContext } from '../db';
 import { apiKeys, devices, enrollmentKeys, organizationUsers, organizations, partnerUsers } from '../db/schema';
 import { revokeAllOrgOauthArtifacts, revokeAllPartnerOauthArtifacts } from '../oauth/grantRevocation';
 import { AGENT_TOKEN_SUSPEND_REASON } from './agentTokenSuspension';
 import { clearPermissionCache } from './permissions';
 import { invalidateAgentTenantCache } from './tenantStatus';
 import { revokeAllUserTokens } from './tokenRevocation';
+import { captureException } from './sentry';
 
 export interface TenantRevocationResult {
   apiKeysRevoked: number;
@@ -76,10 +77,13 @@ export async function disconnectLiveAgentSocketsForOrgIds(orgIds: string[], reas
     const connected = getConnectedAgentIds();
     if (connected.length > 0) {
       const connectedSet = new Set(connected);
-      const deviceRows = await db
+      const readDevices = async () => db
         .select({ agentId: devices.agentId })
         .from(devices)
         .where(and(inArray(devices.orgId, orgIds), isNotNull(devices.agentId)));
+      // A savepoint when a context is held: a failed read here must not abort
+      // the transaction carrying the credential revocation (#11203).
+      const deviceRows = await (hasDbAccessContext() ? withDbTransaction(readDevices) : readDevices());
       for (const row of deviceRows) {
         if (row.agentId && connectedSet.has(row.agentId)) {
           disconnectAgent(row.agentId, 4001, reason);
@@ -87,7 +91,10 @@ export async function disconnectLiveAgentSocketsForOrgIds(orgIds: string[], reas
       }
     }
   } catch (err) {
+    // Reported, not only logged: the revocation commits regardless, so this is
+    // the one signal that live sockets outlived it (#11203).
     console.error('[tenantLifecycle] Failed to sever live agent sockets after credential cutoff:', err);
+    captureException(err instanceof Error ? err : new Error(String(err)));
   }
 }
 
@@ -121,6 +128,7 @@ export async function severAgentCredentialsForOrgIds(
 
   const now = new Date();
 
+  // own-device-row-allowlisted: tenant-lifecycle-credentials
   const suspended = await db
     .update(devices)
     .set({ agentTokenSuspendedAt: now, agentTokenSuspendedReason: TENANT_SUSPENDED_TOKEN_REASON })
@@ -217,6 +225,7 @@ export async function prepareAgentDrainForOrgIds(
 async function restoreAgentCredentialsForOrgIds(orgIds: string[]): Promise<TenantRestorationResult> {
   if (orgIds.length === 0) return { agentTokensRestored: 0 };
 
+  // own-device-row-allowlisted: tenant-lifecycle-credentials
   const restored = await db
     .update(devices)
     .set({ agentTokenSuspendedAt: null, agentTokenSuspendedReason: null })
@@ -242,6 +251,7 @@ export async function suspendOrganizationTenantAccessReversibly(
 ): Promise<{ agentTokensSuspended: number }> {
   return inAmbientOrNewSystemContext(async () => {
     await invalidateAgentTenantCache([orgId]);
+    // own-device-row-allowlisted: tenant-lifecycle-credentials
     const suspended = await db
       .update(devices)
       .set({
@@ -274,6 +284,7 @@ export async function suspendOrganizationTenantAccessReversibly(
 /** Lift only archive-owned device suspensions; security suspensions survive. */
 export async function liftArchiveSuspension(orgId: string): Promise<TenantRestorationResult> {
   return inAmbientOrNewSystemContext(async () => {
+    // own-device-row-allowlisted: tenant-lifecycle-credentials
     const restored = await db
       .update(devices)
       .set({ agentTokenSuspendedAt: null, agentTokenSuspendedReason: null })

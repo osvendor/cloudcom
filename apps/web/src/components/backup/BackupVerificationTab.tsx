@@ -13,7 +13,7 @@ import {
 import { formatDateTime } from '@/lib/dateTimeFormat';
 import { fetchWithAuth } from '../../stores/auth';
 import { friendlyFetchError } from '../../lib/utils';
-import { formatNumber } from '@/lib/i18n/format';
+import { formatBytes } from './backupDashboardHelpers';
 import { useTranslation } from 'react-i18next';
 import '../../lib/i18n';
 
@@ -68,12 +68,6 @@ function formatDuration(seconds: number | null | undefined): string {
   return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
 }
 
-function formatBytes(bytes: number | null | undefined): string {
-  if (bytes == null) return '-';
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${formatNumber(bytes / 1024, { minimumFractionDigits: 1, maximumFractionDigits: 1 })} KB`;
-  return `${formatNumber(bytes / (1024 * 1024), { minimumFractionDigits: 1, maximumFractionDigits: 1 })} MB`;
-}
 
 function readinessColor(score: number): string {
   if (score >= 85) return 'text-success';
@@ -226,17 +220,19 @@ export default function BackupVerificationTab({
             </div>
             <div>
               {readiness.riskFactors.length > 0 ? (
-                <div className="flex flex-wrap gap-1">
+                // The API's `message` is the human sentence ("No restore test
+                // has run in the last 30 days."); the code is only a fallback
+                // for a row that somehow arrives without one.
+                <ul className="space-y-1">
                   {readiness.riskFactors.map((rf) => (
-                    <span
+                    <li
                       key={rf.code}
-                      className={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium ${severityColors[rf.severity] || ''}`}
-                      title={rf.message}
+                      className={`rounded-md border px-2 py-1 text-xs font-medium ${severityColors[rf.severity] || ''}`}
                     >
-                      {rf.code.replace(/_/g, ' ')}
-                    </span>
+                      {rf.message?.trim() || rf.code.replace(/_/g, ' ')}
+                    </li>
                   ))}
-                </div>
+                </ul>
               ) : (
                 <span className="text-xs text-success">{t('backupVerificationTab.noRiskFactors')}</span>
               )}
@@ -362,7 +358,7 @@ export default function BackupVerificationTab({
                       </td>
                       <td className="py-2 pr-4 text-success">{v.filesVerified}</td>
                       <td className="py-2 pr-4 text-destructive">{v.filesFailed}</td>
-                      <td className="py-2">{formatBytes(v.sizeBytes)}</td>
+                      <td className="py-2">{formatBytes(v.sizeBytes, '-')}</td>
                     </tr>
                   );
                 })}

@@ -22,6 +22,7 @@ import {
   configPolicyAssignments,
   configurationPolicies,
   contacts,
+  contactRoles,
   devices,
   invoices,
   organizations,
@@ -29,9 +30,12 @@ import {
   sites,
   tickets,
 } from '../db/schema';
+import type { orgTypeEnum } from '../db/schema/orgs';
 import { INVOICE_OPEN_STATUSES, TICKET_OPEN_STATUSES, sqlStatusList } from './openWorkStatuses';
 
-export type OrgType = 'customer' | 'internal' | 'quick_support';
+import { notHiddenOrgType } from './unassignedPool/visibility';
+/** Tracks the org_type enum so a new label cannot drift out of this union. */
+export type OrgType = (typeof orgTypeEnum.enumValues)[number];
 
 export interface AcceptedOrg {
   id: string;
@@ -85,7 +89,7 @@ export async function resolveAcceptedOrgs(input: ResolveAcceptedOrgsInput): Prom
         isNull(organizations.deletedAt),
         // Inside accessibleOrgIds by design (RLS lets a tech reach their own
         // support session) but never enumerated — same rule as GET /orgs.
-        ne(organizations.type, 'quick_support'),
+        notHiddenOrgType(),
         input.accessibleOrgIds === null ? undefined : inArray(organizations.id, input.accessibleOrgIds),
       ),
     );
@@ -286,9 +290,23 @@ function queryContactSignals(ids: string[]) {
       primaryEmail: sql<string | null>`max(${contacts.email}) ${primary}`,
       primaryPhone: sql<string | null>`max(${contacts.phone}) ${primary}`,
       primaryMobile: sql<string | null>`max(${contacts.mobile}) ${primary}`,
-      billingRole: sql<boolean>`bool_or(${contacts.roles} @> ARRAY['billing']::text[])`,
+      // Organization readiness requires an explicit Organization-scoped
+      // billing responsibility; Site/Device Group assignments are insufficient.
+      // The filtered LEFT JOIN keeps the decision on canonical contact_roles
+      // while the aggregates retain one result row per organization.
+      billingRole: sql<boolean>`bool_or(${contactRoles.id} IS NOT NULL)`,
     })
     .from(contacts)
+    .leftJoin(
+      contactRoles,
+      and(
+        eq(contactRoles.contactId, contacts.id),
+        eq(contactRoles.orgId, contacts.orgId),
+        eq(contactRoles.role, 'billing'),
+        isNull(contactRoles.siteId),
+        isNull(contactRoles.deviceGroupId),
+      ),
+    )
     .where(inArray(contacts.orgId, ids))
     .groupBy(contacts.orgId);
 }
@@ -324,6 +342,7 @@ function queryTicketCounts(ids: string[]) {
       and(
         inArray(tickets.orgId, ids),
         isNull(tickets.deletedAt),
+        isNull(tickets.mergedIntoTicketId), // #8972: merged tombstones never count
         sql`${tickets.status} in (${sqlStatusList(TICKET_OPEN_STATUSES)})`,
       ),
     )

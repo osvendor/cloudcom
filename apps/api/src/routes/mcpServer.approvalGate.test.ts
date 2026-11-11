@@ -1,4 +1,4 @@
-import { describe, expect, it, vi, beforeEach } from 'vitest';
+import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 
 // MCP interactive-approval-only gate (user decision, 2026-08-02): ALL Tier 3
 // tools now require interactive approval, unconditionally, including tools
@@ -14,7 +14,24 @@ import { describe, expect, it, vi, beforeEach } from 'vitest';
 
 const testState = vi.hoisted(() => ({
   scopes: ['ai:read', 'ai:write', 'ai:execute'] as string[],
+  redis: null as unknown,
+  apiKeyExtra: {} as Record<string, unknown>,
+  // A partner-scoped key, for a tool whose handler refuses every org-scoped caller (#11287).
+  partnerKey: false,
+  // null = the real hasSatisfiedMfa (ENABLE_2FA defaults on, and MCP callers
+  // carry token:{}, so it refuses). true simulates an MFA-satisfied caller
+  // (equivalently, an ENABLE_2FA=false deployment).
+  mfaSatisfied: null as boolean | null,
 }));
+
+vi.mock('../middleware/auth', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../middleware/auth')>();
+  return {
+    ...actual,
+    hasSatisfiedMfa: (auth: Parameters<typeof actual.hasSatisfiedMfa>[0]) =>
+      testState.mfaSatisfied ?? actual.hasSatisfiedMfa(auth),
+  };
+});
 
 const mocks = vi.hoisted(() => ({
   executeTool: vi.fn(),
@@ -23,6 +40,13 @@ const mocks = vi.hoisted(() => ({
   ledgerBegin: vi.fn(),
   ledgerComplete: vi.fn(),
   writeAuditEvent: vi.fn(),
+}));
+
+// B-W04 (#6158): the MCP-side intent creation (its own suite covers it).
+const intentMocks = vi.hoisted(() => ({ createMcpActionIntent: vi.fn() }));
+vi.mock('../services/mcpIntentCreation', () => ({
+  createMcpActionIntent: (...args: any[]) => intentMocks.createMcpActionIntent(...args),
+  resolveMcpClientLabel: vi.fn(async () => 'MCP · test'),
 }));
 
 vi.mock('../services/mcpToolExecutionLedger', () => ({
@@ -74,16 +98,18 @@ vi.mock('../db/schema', async () => {
 vi.mock('../middleware/apiKeyAuth', () => ({
   apiKeyAuthMiddleware: async (c: any, next: any) => {
     c.set('apiKey', {
-      id: 'key-1',
-      orgId: 'org-1',
+      id: '11111111-1111-4111-8111-111111111111',
+      orgId: testState.partnerKey ? null : 'org-1',
       partnerId: 'partner-1',
       name: 'test',
       keyPrefix: 'brz_test',
+      mcpDomains: null,
       scopes: testState.scopes,
       rateLimit: 1000,
-      createdBy: 'user-1',
+      createdBy: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      ...testState.apiKeyExtra,
     });
-    c.set('apiKeyOrgId', 'org-1');
+    c.set('apiKeyOrgId', testState.partnerKey ? null : 'org-1');
     await next();
   },
   requireApiKeyScope: () => async (_c: any, next: any) => next(),
@@ -96,7 +122,7 @@ vi.mock('../services/aiTools', () => ({
   getToolTier: (...args: any[]) => mocks.getToolTier(...args),
 }));
 
-vi.mock('../services/redis', () => ({ getRedis: () => null }));
+vi.mock('../services/redis', () => ({ getRedis: () => testState.redis }));
 vi.mock('../services/rate-limit', () => ({
   rateLimiter: vi.fn(async () => ({ allowed: true, resetAt: new Date(Date.now() + 60000) })),
 }));
@@ -154,23 +180,42 @@ const FULL_PERMISSIONS_BASELINE = [
   { resource: 'automations', action: 'write' },
 ];
 
+// An org service-principal key is authorized against the PRINCIPAL; the real
+// implementation reads `service_principals` through the DB, which this file's
+// `../db` mock cannot serve. Resolve ok with the passed scopes so the call
+// reaches the Tier-3 approval gate (same shape as mcpServer.creatorAuthz.test.ts).
+vi.mock('../services/apiKeyAuthorization', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../services/apiKeyAuthorization')>();
+  return {
+    ...actual,
+    authorizeServicePrincipalKey: vi.fn(async (input: { principalId: string; scopes: string[] }) => ({
+      ok: true,
+      permissions: null,
+      allowedSiteIds: undefined,
+      clampedScopes: input.scopes,
+    })),
+  };
+});
+
 vi.mock('../services/permissions', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../services/permissions')>();
   return {
     ...actual,
     getUserPermissions: vi.fn(async () => ({
       permissions: FULL_PERMISSIONS_BASELINE,
-      partnerId: null,
-      orgId: 'org-1',
+      ...(testState.partnerKey
+        ? { partnerId: 'partner-1', orgId: null, scope: 'partner' as const, orgAccess: 'all' as const }
+        : { partnerId: null, orgId: 'org-1', scope: 'organization' as const }),
       roleId: 'role-1',
-      scope: 'organization' as const,
       allowedSiteIds: undefined,
     })),
   };
 });
 
-import { mcpServerRoutes } from './mcpServer';
-import { checkGuardrails, TIER3_ACTIONS } from '../services/aiGuardrails';
+import { mcpServerRoutes, __isMcpApprovalRequiredForTests } from './mcpServer';
+import {
+  checkGuardrails, isReadOnlyResolution, resolveApprovalScope, TIER2_ACTIONS, TIER3_ACTIONS, TIER3_FOUR_EYES_TOOLS,
+} from '../services/aiGuardrails';
 
 // Real JSON schemas for the multiplexed tools these tests target, trimmed to
 // just the `action` enum the gate inspects (mirrors the real registry
@@ -215,9 +260,23 @@ const MANAGE_POLICY_FEATURE_LINK_SCHEMA = {
   },
 };
 
+// manage_tickets' comment action, trimmed the same way as the schemas above
+// — the multiplexer's full enum lives in aiToolSchemas.ts, unreachable from
+// this suite for the same db-mocking reason MANAGE_ORGANIZATIONS_SCHEMA is.
+const MANAGE_TICKETS_COMMENT_SCHEMA = {
+  type: 'object',
+  properties: {
+    action: { type: 'string', enum: ['comment', 'create', 'update_status'] },
+    isPublic: { type: 'boolean' },
+  },
+};
+
 beforeEach(() => {
   vi.clearAllMocks();
   testState.scopes = ['ai:read', 'ai:write', 'ai:execute'];
+  testState.apiKeyExtra = {};
+  testState.mfaSatisfied = null;
+  testState.partnerKey = false;
   mocks.executeTool.mockReset().mockResolvedValue(JSON.stringify({ ok: true }));
   mocks.getToolDefinitions.mockReset().mockReturnValue([]);
   mocks.getToolTier.mockReset().mockReturnValue(undefined);
@@ -250,7 +309,9 @@ async function listTools() {
   return res;
 }
 
-describe('MCP interactive-approval-only gate (all Tier 3, tier-driven)', () => {
+// With MCP_TIER3_INTENTS_ENABLED off (the default) this whole describe is the
+// byte-for-byte pin of today's fail-closed behaviour (B-W04 D-B37).
+describe('MCP interactive-approval-only gate (all Tier 3, tier-driven) — MCP_TIER3_INTENTS_ENABLED off', () => {
   // (a) A flat Tier 3 tool — absent from tools/list, denied on tools/call.
   describe('flat Tier 3 tool (execute_command) — wholly gated', () => {
     beforeEach(() => {
@@ -326,7 +387,7 @@ describe('MCP interactive-approval-only gate (all Tier 3, tier-driven)', () => {
       expect(mocks.executeTool).not.toHaveBeenCalled();
     });
 
-    // SR5-01 applied to registry reads (2026-09-17 ROLE audit §2.4): read_key /
+    // The privileged-read rule applied to registry reads (2026-09-17 ROLE audit §2.4): read_key /
     // get_value moved into TIER2_ACTIONS, so they still clear the Tier-3
     // approval gate but are no longer reachable on an `ai:read` key.
     it('action:"get_value" (now Tier 2) is refused on an ai:read-only key', async () => {
@@ -341,6 +402,8 @@ describe('MCP interactive-approval-only gate (all Tier 3, tier-driven)', () => {
       expect(body.error).toEqual({
         code: -32603,
         message: 'Tool "registry_operations" requires ai:write scope',
+        // B-W02 (#6156): tier-scope denials carry a structured reason.
+        data: { reason: 'insufficient_scope', requiredScope: 'ai:write' },
       });
       expect(mocks.executeTool).not.toHaveBeenCalled();
     });
@@ -362,6 +425,8 @@ describe('MCP interactive-approval-only gate (all Tier 3, tier-driven)', () => {
   // (c) manage_invoices — mixed multiplexer: issue/void/payment Tier 3, drafting is not.
   describe('manage_invoices — mixed multiplexer (draft actions stay usable)', () => {
     beforeEach(() => {
+      // Invoices are partner-scope only: an org-scoped key is refused before the gate (#11287).
+      testState.partnerKey = true;
       mocks.getToolDefinitions.mockReturnValue([
         { name: 'manage_invoices', description: 'Create and manage invoices.', input_schema: MANAGE_INVOICES_SCHEMA },
       ]);
@@ -524,6 +589,61 @@ describe('MCP interactive-approval-only gate (all Tier 3, tier-driven)', () => {
     });
   });
 
+  // (c4) manage_tickets:comment — a customer-visible reply escalates by
+  // input (isPublic), same mechanism as manage_policy_feature_link above.
+  // aiToolsTicketing.ts/aiGuardrails.ts prove the SHARED checkGuardrails
+  // function resolves this correctly; this block is the missing MCP-specific
+  // proof that a public-comment request actually reaches Tier 3 (and is
+  // therefore refused, MCP having no interactive-approval surface) when it
+  // arrives over `tools/call`, not just when checkGuardrails is called
+  // directly in a unit test.
+  describe('manage_tickets:comment — a customer-visible reply escalates by input (isPublic)', () => {
+    beforeEach(() => {
+      mocks.getToolDefinitions.mockReturnValue([
+        { name: 'manage_tickets', description: 'Manage tickets.', input_schema: MANAGE_TICKETS_COMMENT_SCHEMA },
+      ]);
+      // Base tier 2 in the real registry — the gate comes from the
+      // input-aware escalation (TIER3_INPUT_AWARE_ACTIONS), not the base tier.
+      mocks.getToolTier.mockImplementation((name: string) => (name === 'manage_tickets' ? 2 : undefined));
+    });
+
+    it('an explicit isPublic:true comment is denied MCP_APPROVAL_REQUIRED without executing', async () => {
+      const res = await callTool('manage_tickets', {
+        action: 'comment', ticketId: 'ticket-1', body: 'Restarted the service.', isPublic: true,
+      });
+      const body = await res.json();
+      expect(body.result.isError).toBe(true);
+      expect(JSON.parse(body.result.content[0].text).code).toBe('MCP_APPROVAL_REQUIRED');
+      expect(mocks.executeTool).not.toHaveBeenCalled();
+    });
+
+    it('a comment with isPublic omitted (defaults private) still executes — this gate is narrow, not a tool ban', async () => {
+      const res = await callTool('manage_tickets', {
+        action: 'comment', ticketId: 'ticket-1', body: 'Internal note.',
+      });
+      const body = await res.json();
+      expect(body.result.isError).toBeFalsy();
+      expect(mocks.executeTool).toHaveBeenCalledWith(
+        'manage_tickets',
+        expect.objectContaining({ action: 'comment' }),
+        expect.anything(),
+      );
+    });
+
+    it('a comment with isPublic:false explicitly set also executes ungated', async () => {
+      const res = await callTool('manage_tickets', {
+        action: 'comment', ticketId: 'ticket-1', body: 'Internal note.', isPublic: false,
+      });
+      const body = await res.json();
+      expect(body.result.isError).toBeFalsy();
+      expect(mocks.executeTool).toHaveBeenCalledWith(
+        'manage_tickets',
+        expect.objectContaining({ action: 'comment' }),
+        expect.anything(),
+      );
+    });
+  });
+
   // (d) A plain Tier 2 tool proceeds fully ungated.
   describe('Tier 2 tools proceed ungated', () => {
     it('manage_tags {action: "add"} (Tier 2) is not gated — needs only ai:write, not approval', async () => {
@@ -611,10 +731,839 @@ describe('MCP interactive-approval-only gate (all Tier 3, tier-driven)', () => {
 
     it('the real checkGuardrails still ALLOWS collect_evidence at Tier 2 — the MCP extras gate is route-only', () => {
       const result = checkGuardrails('collect_evidence', {
-        incidentId: 'inc-1', deviceId: 'dev-1', evidenceTypes: ['screenshot'],
+        incidentId: 'inc-1', deviceId: 'dev-1', evidenceTypes: ['processes'],
       });
       expect(result.allowed).toBe(true);
       expect(result.tier).toBe(2);
     });
+
+    it('a screenshot in collect_evidence is Tier 3 supervised in-app (W04-D3, #6758), still allowed', () => {
+      const result = checkGuardrails('collect_evidence', {
+        incidentId: 'inc-1', deviceId: 'dev-1', evidenceTypes: ['screenshot'],
+      });
+      expect(result.allowed).toBe(true);
+      expect(result.tier).toBe(3);
+      expect(result.approvalScope).toBe('supervised');
+    });
+  });
+});
+
+// Operator opt-in MCP_UNATTENDED_TIER3_PRINCIPALS (default: nobody). It removes
+// ONLY the approval-only deny, ONLY for the named principals; scope gates,
+// RBAC, ledger and audit still run.
+const PENDING_ID = '77777777-7777-4777-8777-777777777777';
+function pendingOutcome(toolName: string, isNew = true) {
+  return {
+    kind: 'pending', isNew,
+    status: {
+      actionId: PENDING_ID, status: 'pending_approval', toolName, approvalScope: 'four_eyes',
+      expiresAt: '2027-01-01T00:00:00.000Z', approvalUrl: `https://app.example.com/approvals#intent-${PENDING_ID}`,
+    },
+  };
+}
+
+// Today's exact refusal text, pinned so the flag-off path can be proven
+// byte-identical (B-W04 D-B25/D-B37).
+const TODAY_APPROVAL_REQUIRED_TEXT = JSON.stringify({
+  error: 'This action requires interactive approval and cannot be executed over MCP. Run it from the Breeze web app AI assistant, where it goes through the approval workflow.',
+  code: 'MCP_APPROVAL_REQUIRED',
+});
+
+describe('B-W04: flag off reproduces today byte-for-byte', () => {
+  beforeEach(() => {
+    delete process.env.MCP_TIER3_INTENTS_ENABLED;
+    mocks.getToolDefinitions.mockReturnValue([
+      { name: 'execute_command', description: 'Execute a system command.', input_schema: {} },
+    ]);
+    mocks.getToolTier.mockImplementation((name: string) => (name === 'execute_command' ? 3 : undefined));
+  });
+
+  it('tools/call body is exactly today\'s, even without ai:execute, and the per-tool rate limiter is not charged', async () => {
+    const { checkToolRateLimit } = await import('../services/aiGuardrails');
+    for (const scopes of [['ai:read', 'ai:write', 'ai:execute'], ['ai:read']]) {
+      const body = await (await callTool('execute_command', { deviceId: 'd1', command: 'whoami' }, scopes)).json();
+      expect(body.result).toEqual({ content: [{ type: 'text', text: TODAY_APPROVAL_REQUIRED_TEXT }], isError: true });
+    }
+    expect(checkToolRateLimit).not.toHaveBeenCalled();
+    expect(intentMocks.createMcpActionIntent).not.toHaveBeenCalled();
+  });
+
+  it('tools/list gains only get_action_status and cancel_action', async () => {
+    const names = (await (await listTools()).json()).result.tools.map((t: any) => t.name);
+    expect(names.sort()).toEqual(['cancel_action', 'get_action_status', 'whoami']);
+  });
+});
+
+describe('B-W04: Tier-3 tools/call files an approval intent (MCP_TIER3_INTENTS_ENABLED on)', () => {
+  beforeEach(() => {
+    process.env.MCP_TIER3_INTENTS_ENABLED = 'true';
+    testState.mfaSatisfied = true;
+    intentMocks.createMcpActionIntent.mockReset().mockImplementation(async (i: { toolName: string }) => pendingOutcome(i.toolName));
+  });
+  afterEach(() => {
+    delete process.env.MCP_TIER3_INTENTS_ENABLED;
+    process.env.NODE_ENV = 'test';
+  });
+
+  function useTools(defs: Array<{ name: string; tier: number; schema?: unknown; description?: string }>) {
+    mocks.getToolDefinitions.mockReturnValue(defs.map((d) => ({
+      name: d.name, description: d.description ?? `${d.name}.`, input_schema: d.schema ?? {},
+    })));
+    mocks.getToolTier.mockImplementation((name: string) => defs.find((d) => d.name === name)?.tier);
+  }
+
+  async function pendingBody(res: Response) {
+    const body = await res.json();
+    expect(body.result.isError).toBeUndefined();
+    expect(body.result.structuredContent).toMatchObject({ status: 'pending_approval', actionId: PENDING_ID });
+    expect(body.result.structuredContent.next).toContain('get_action_status');
+    return body;
+  }
+
+  it('flat Tier 3 (execute_command) is listed with the approval suffix and returns pending_approval without executing', async () => {
+    useTools([{ name: 'execute_command', tier: 3, description: 'Execute a system command.' }]);
+    const tools = (await (await listTools()).json()).result.tools;
+    const ec = tools.find((t: any) => t.name === 'execute_command');
+    // #10027: the read-only commandTypes run directly, and the description says so.
+    expect(ec.description).toBe('Execute a system command. (Requires approval in the Breeze mobile or web app: the call returns a pending action — use get_action_status. Read-only commandType values "event_logs_list", "file_list", "list_processes" run directly without approval.)');
+
+    await pendingBody(await callTool('execute_command', { deviceId: 'd1', command: 'whoami' }));
+    expect(mocks.executeTool).not.toHaveBeenCalled();
+    expect(intentMocks.createMcpActionIntent).toHaveBeenCalledTimes(1);
+    expect(intentMocks.createMcpActionIntent.mock.calls[0]![0]).toMatchObject({
+      toolName: 'execute_command', executionOrgId: 'org-1', toolInput: { deviceId: 'd1', command: 'whoami' },
+    });
+  });
+
+  it('mixed tool: registry_operations set_value → pending; get_value executes', async () => {
+    useTools([{ name: 'registry_operations', tier: 1, schema: REGISTRY_OPERATIONS_SCHEMA }]);
+    await pendingBody(await callTool('registry_operations', { action: 'set_value', deviceId: 'd1', path: 'HKLM\\x', value: '1' }));
+    expect(mocks.executeTool).not.toHaveBeenCalled();
+    const body = await (await callTool('registry_operations', { action: 'get_value', deviceId: 'd1', path: 'HKLM\\x' })).json();
+    expect(body.result.isError).toBeUndefined();
+    expect(mocks.executeTool).toHaveBeenCalledTimes(1);
+    expect(intentMocks.createMcpActionIntent).toHaveBeenCalledTimes(1);
+  });
+
+  it('manage_invoices issue → pending; create_draft executes; manage_tickets comment isPublic → pending', async () => {
+    // Invoices are partner-scope only (#11287).
+    testState.partnerKey = true;
+    useTools([
+      { name: 'manage_invoices', tier: 2, schema: MANAGE_INVOICES_SCHEMA },
+      { name: 'manage_tickets', tier: 2, schema: MANAGE_TICKETS_COMMENT_SCHEMA },
+    ]);
+    await pendingBody(await callTool('manage_invoices', { action: 'issue', invoiceId: 'inv-1' }));
+    await callTool('manage_invoices', { action: 'create_draft', orgId: 'org-1' });
+    expect(mocks.executeTool).toHaveBeenCalledTimes(1);
+    await pendingBody(await callTool('manage_tickets', { action: 'comment', ticketId: 't1', body: 'hi', isPublic: true }));
+    expect(intentMocks.createMcpActionIntent).toHaveBeenCalledTimes(2);
+  });
+
+  it('scope gates run BEFORE intent creation: no ai:execute → -32603 requires ai:execute', async () => {
+    useTools([{ name: 'execute_command', tier: 3 }]);
+    const body = await (await callTool('execute_command', { deviceId: 'd1' }, ['ai:read', 'ai:write'])).json();
+    expect(body.error.code).toBe(-32603);
+    expect(body.error.message).toContain('requires ai:execute');
+    expect(intentMocks.createMcpActionIntent).not.toHaveBeenCalled();
+  });
+
+  it('RBAC denial → refused, no intent', async () => {
+    useTools([{ name: 'execute_command', tier: 3 }]);
+    const { checkToolPermission } = await import('../services/aiGuardrails');
+    vi.mocked(checkToolPermission).mockResolvedValueOnce('Insufficient permissions');
+    const body = await (await callTool('execute_command', { deviceId: 'd1' })).json();
+    expect(body.error.message).toBe('Insufficient permissions');
+    expect(intentMocks.createMcpActionIntent).not.toHaveBeenCalled();
+  });
+
+  it('domain-denied call never creates an intent', async () => {
+    useTools([{ name: 'execute_command', tier: 3 }]);
+    testState.apiKeyExtra = { mcpDomains: ['core'] };
+    const body = await (await callTool('execute_command', { deviceId: 'd1' })).json();
+    expect(body.error).toBeDefined();
+    expect(intentMocks.createMcpActionIntent).not.toHaveBeenCalled();
+  });
+
+  it('MFA-gated Tier-3 action for a caller without MFA → MCP_APPROVAL_REQUIRED with reason mfa_required', async () => {
+    testState.mfaSatisfied = false;
+    useTools([{ name: 'manage_policy_feature_link', tier: 2, schema: MANAGE_POLICY_FEATURE_LINK_SCHEMA }]);
+    const body = await (await callTool('manage_policy_feature_link', {
+      action: 'add', policyId: 'p1', featureType: 'maintenance', featurePolicyId: 'fp1',
+    })).json();
+    expect(body.result.isError).toBe(true);
+    expect(JSON.parse(body.result.content[0].text)).toMatchObject({ code: 'MCP_APPROVAL_REQUIRED', reason: 'mfa_required' });
+    expect(intentMocks.createMcpActionIntent).not.toHaveBeenCalled();
+  });
+
+  it('a flat Tier-3 multiplexer gets the flat suffix once, not the per-action sentence too', async () => {
+    useTools([{ name: 'manage_services', tier: 3, description: 'Services.', schema: {
+      type: 'object', properties: { action: { type: 'string', enum: ['list', 'restart', 'stop'] } },
+    } }]);
+    const tool = (await (await listTools()).json()).result.tools.find((t: any) => t.name === 'manage_services');
+    expect(tool.description).toBe('Services. (Requires approval in the Breeze mobile or web app: the call returns a pending action — use get_action_status. Read-only actions "list" run directly without approval.)');
+  });
+
+  it('#10027: a flat Tier-3 tool whose only below-Tier-3 action is not read-only keeps the plain suffix (edr_endpoint_action scan is filed)', async () => {
+    useTools([{ name: 'edr_endpoint_action', tier: 3, description: 'EDR.', schema: {
+      type: 'object', properties: { action: { type: 'string', enum: ['scan', 'isolate', 'unisolate'] } },
+    } }]);
+    const tool = (await (await listTools()).json()).result.tools.find((t: any) => t.name === 'edr_endpoint_action');
+    expect(tool.description).toBe('EDR. (Requires approval in the Breeze mobile or web app: the call returns a pending action — use get_action_status.)');
+  });
+
+  it('mixed tool listing uses the per-action approval wording', async () => {
+    useTools([{ name: 'registry_operations', tier: 1, schema: REGISTRY_OPERATIONS_SCHEMA, description: 'Registry.' }]);
+    const tool = (await (await listTools()).json()).result.tools.find((t: any) => t.name === 'registry_operations');
+    expect(tool.description).toContain('require approval in the Breeze mobile or web app: the call returns a pending action — use get_action_status.');
+    expect(tool.description).not.toContain('not available over MCP');
+  });
+
+  it('collect_evidence stays MCP_APPROVAL_REQUIRED (approval_extra) and unlisted', async () => {
+    useTools([{ name: 'collect_evidence', tier: 2 }]);
+    expect((await (await listTools()).json()).result.tools.map((t: any) => t.name)).not.toContain('collect_evidence');
+    const body = await (await callTool('collect_evidence', { deviceId: 'd1' })).json();
+    expect(JSON.parse(body.result.content[0].text)).toMatchObject({ code: 'MCP_APPROVAL_REQUIRED', reason: 'approval_extra' });
+    expect(intentMocks.createMcpActionIntent).not.toHaveBeenCalled();
+  });
+
+  it('Tier 4 stays unlisted and denied', async () => {
+    useTools([{ name: 'wipe_everything', tier: 4 }]);
+    expect((await (await listTools()).json()).result.tools.map((t: any) => t.name)).not.toContain('wipe_everything');
+    const body = await (await callTool('wipe_everything', {})).json();
+    expect(JSON.parse(body.result.content[0].text)).toMatchObject({ code: 'MCP_APPROVAL_REQUIRED', reason: 'not_tier3' });
+    expect(intentMocks.createMcpActionIntent).not.toHaveBeenCalled();
+  });
+
+  it('an org service-principal key is refused with principal_not_supported', async () => {
+    useTools([{ name: 'execute_command', tier: 3 }]);
+    testState.apiKeyExtra = { principalType: 'service', principalId: 'sp-1' };
+    const body = await (await callTool('execute_command', { deviceId: 'd1' })).json();
+    expect(body.error).toBeUndefined();
+    expect(JSON.parse(body.result.content[0].text)).toMatchObject({ code: 'MCP_APPROVAL_REQUIRED', reason: 'principal_not_supported' });
+    expect(intentMocks.createMcpActionIntent).not.toHaveBeenCalled();
+  });
+
+  it('replayed call returns the same actionId', async () => {
+    useTools([{ name: 'execute_command', tier: 3 }]);
+    intentMocks.createMcpActionIntent.mockResolvedValue(pendingOutcome('execute_command', false));
+    const a = await pendingBody(await callTool('execute_command', { deviceId: 'd1' }));
+    const b = await pendingBody(await callTool('execute_command', { deviceId: 'd1' }));
+    expect(a.result.structuredContent.actionId).toBe(b.result.structuredContent.actionId);
+  });
+
+  it('a refusal from creation (cap) is an isError tool result naming its code', async () => {
+    useTools([{ name: 'execute_command', tier: 3 }]);
+    intentMocks.createMcpActionIntent.mockResolvedValueOnce({ kind: 'refused', code: 'too_many_pending_actions', message: 'Too many.' });
+    const body = await (await callTool('execute_command', { deviceId: 'd1' })).json();
+    expect(body.result.isError).toBe(true);
+    expect(JSON.parse(body.result.content[0].text)).toMatchObject({ code: 'too_many_pending_actions' });
+  });
+
+  it('whoami reports approvalGate.tier3', async () => {
+    useTools([]);
+    const call = async () => JSON.parse((await (await callTool('whoami', {})).json()).result.content[0].text);
+    expect((await call()).approvalGate).toMatchObject({ tier3: 'approval_intent', tier3RequiresWebApp: false });
+    delete process.env.MCP_TIER3_INTENTS_ENABLED;
+    expect((await call()).approvalGate).toMatchObject({ tier3: 'web_app_only', tier3RequiresWebApp: true });
+  });
+});
+
+// #10027: the MCP gate and createActionIntent must agree on which calls are
+// filed. The intent service classifies with checkGuardrails(toolName, input)
+// and refuses a READ-ONLY call below Tier 3 with `tool_not_tier3`; a
+// non-read call below Tier 3 on a registry-Tier-3 tool that MCP files is
+// approved at the tool's Tier 3 (mcpRegistryTierApproval). The mock below
+// enforces that same rule, so a call the gate files but the service would
+// refuse surfaces exactly as it does in production: -32000 "Unable to file
+// the action for approval".
+describe('#10027: only a read-only action below Tier 3 on a flat Tier-3 tool runs directly (MCP_TIER3_INTENTS_ENABLED on)', () => {
+  const EXECUTE_COMMAND_SCHEMA = {
+    type: 'object',
+    properties: { deviceId: { type: 'string' }, commandType: { type: 'string' } },
+  };
+  const MANAGE_SERVICES_SCHEMA = {
+    type: 'object',
+    properties: { action: { type: 'string', enum: ['list', 'start', 'stop', 'restart'] } },
+  };
+
+  beforeEach(() => {
+    process.env.MCP_TIER3_INTENTS_ENABLED = 'true';
+    testState.mfaSatisfied = true;
+    mocks.getToolDefinitions.mockReturnValue([
+      { name: 'execute_command', description: 'Execute a system command.', input_schema: EXECUTE_COMMAND_SCHEMA },
+      { name: 'manage_services', description: 'Services.', input_schema: MANAGE_SERVICES_SCHEMA },
+    ]);
+    mocks.getToolTier.mockImplementation((name: string) => (
+      name === 'execute_command' || name === 'manage_services' ? 3 : undefined
+    ));
+    intentMocks.createMcpActionIntent.mockReset().mockImplementation(async (i: { toolName: string; toolInput: Record<string, unknown> }) => {
+      const check = checkGuardrails(i.toolName, i.toolInput);
+      if (check.tier <= 2 && isReadOnlyResolution(i.toolName, check)) {
+        throw new Error(`tool_not_tier3: ${i.toolName} is tier ${check.tier}`);
+      }
+      return pendingOutcome(i.toolName);
+    });
+  });
+  afterEach(() => {
+    delete process.env.MCP_TIER3_INTENTS_ENABLED;
+  });
+
+  const READ_COMMAND_TYPES = TIER2_ACTIONS.execute_command ?? [];
+
+  it('the read-only commandTypes under test are exactly the tier-2 execute_command entries', () => {
+    expect([...READ_COMMAND_TYPES].sort()).toEqual(['event_logs_list', 'file_list', 'list_processes']);
+  });
+
+  it.each(READ_COMMAND_TYPES)('execute_command %s runs directly (no intent, Tier-3 ledger kept)', async (commandType) => {
+    const input = { deviceId: 'd1', commandType };
+    const body = await (await callTool('execute_command', input)).json();
+    expect(body.error).toBeUndefined();
+    expect(body.result.isError).toBeUndefined();
+    expect(intentMocks.createMcpActionIntent).not.toHaveBeenCalled();
+    expect(mocks.executeTool).toHaveBeenCalledTimes(1);
+    expect(mocks.executeTool.mock.calls[0]![0]).toBe('execute_command');
+    expect(mocks.executeTool.mock.calls[0]![1]).toEqual(input);
+    // The scope tier is still the tool's static Tier 3, so the fail-closed
+    // Tier-3 ledger still records the call — at tier 3, not the action's tier.
+    expect(mocks.ledgerBegin).toHaveBeenCalledTimes(1);
+    expect(mocks.ledgerBegin.mock.calls[0]![0]).toMatchObject({ tier: 3 });
+    // Not an approval bypass: only a named unattended principal is marked so.
+    const audit = mocks.writeAuditEvent.mock.calls
+      .map((args: any[]) => args[1])
+      .find((event: any) => event?.action === 'mcp.tool.execute_command');
+    expect(audit).toBeDefined();
+    expect(audit.details.tier).toBe(3);
+    expect(audit.details.approvalBypass).toBeUndefined();
+    expect(audit.details.approvalBypassPrincipal).toBeUndefined();
+  });
+
+  it('edr_endpoint_action scan (Tier 2 but NOT read-only: starts an EDR scan) is filed for approval, never run directly', async () => {
+    // Todd's ruling on #10027: only read-only actions are lifted. scan is
+    // rated Tier 2 (#8167) but changes endpoint state, so it keeps the
+    // approval path, and it must be fileable (not the -32000 dead end).
+    mocks.getToolTier.mockImplementation((name: string) => (name === 'edr_endpoint_action' ? 3 : undefined));
+    const scanInput = { action: 'scan', deviceId: 'd1' };
+    const scanCheck = checkGuardrails('edr_endpoint_action', scanInput);
+    expect(scanCheck.tier).toBe(2);
+    expect(isReadOnlyResolution('edr_endpoint_action', scanCheck)).toBe(false);
+    const scan = await (await callTool('edr_endpoint_action', scanInput)).json();
+    expect(scan.error).toBeUndefined();
+    expect(scan.result.structuredContent).toMatchObject({ status: 'pending_approval', actionId: PENDING_ID });
+    expect(mocks.executeTool).not.toHaveBeenCalled();
+    expect(intentMocks.createMcpActionIntent).toHaveBeenCalledTimes(1);
+    expect(intentMocks.createMcpActionIntent.mock.calls[0]![0]).toMatchObject({ toolName: 'edr_endpoint_action', toolInput: scanInput });
+    const isolate = await (await callTool('edr_endpoint_action', { action: 'isolate', deviceId: 'd1' })).json();
+    expect(isolate.result.structuredContent).toMatchObject({ status: 'pending_approval' });
+    expect(mocks.executeTool).not.toHaveBeenCalled();
+    const noScope = await (await callTool('edr_endpoint_action', scanInput, ['ai:read', 'ai:write'])).json();
+    expect(noScope.error.message).toContain('requires ai:execute');
+  });
+
+  it('flag off: edr_endpoint_action scan keeps today\'s refusal (unchanged)', async () => {
+    delete process.env.MCP_TIER3_INTENTS_ENABLED;
+    mocks.getToolTier.mockImplementation((name: string) => (name === 'edr_endpoint_action' ? 3 : undefined));
+    const body = await (await callTool('edr_endpoint_action', { action: 'scan', deviceId: 'd1' })).json();
+    expect(body.result).toEqual({ content: [{ type: 'text', text: TODAY_APPROVAL_REQUIRED_TEXT }], isError: true });
+    expect(mocks.executeTool).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'kill_process', 'start_service', 'stop_service', 'restart_service',
+    'file_read', 'list_services', 'event_logs_query', 'not_a_real_command',
+  ])('mutating / privileged execute_command %s still files an approval intent and never executes', async (commandType) => {
+    const input = { deviceId: 'd1', commandType };
+    expect(checkGuardrails('execute_command', input).tier).toBe(3);
+    const body = await (await callTool('execute_command', input)).json();
+    expect(body.error).toBeUndefined();
+    expect(body.result.structuredContent).toMatchObject({ status: 'pending_approval', actionId: PENDING_ID });
+    expect(mocks.executeTool).not.toHaveBeenCalled();
+    expect(intentMocks.createMcpActionIntent).toHaveBeenCalledTimes(1);
+    expect(intentMocks.createMcpActionIntent.mock.calls[0]![0]).toMatchObject({ toolName: 'execute_command', toolInput: input });
+  });
+
+  it('execute_command with no commandType fails closed to an approval intent', async () => {
+    const body = await (await callTool('execute_command', { deviceId: 'd1', command: 'whoami' })).json();
+    expect(body.result.structuredContent).toMatchObject({ status: 'pending_approval' });
+    expect(mocks.executeTool).not.toHaveBeenCalled();
+  });
+
+  it('the scope gate still follows the tool\'s Tier 3: list_processes without ai:execute → -32603', async () => {
+    const body = await (await callTool('execute_command', { deviceId: 'd1', commandType: 'list_processes' }, ['ai:read', 'ai:write'])).json();
+    expect(body.error.code).toBe(-32603);
+    expect(body.error.message).toContain('requires ai:execute');
+    expect(mocks.executeTool).not.toHaveBeenCalled();
+    expect(intentMocks.createMcpActionIntent).not.toHaveBeenCalled();
+  });
+
+  it('the production allowlist still applies to the read commandTypes', async () => {
+    // Same harness as the MCP_UNATTENDED_TIER3_PRINCIPALS production cases:
+    // the allowlist is empty in this suite, and production needs a redis.
+    vi.stubEnv('NODE_ENV', 'production');
+    vi.stubEnv('MCP_REQUIRE_EXECUTE_ADMIN', 'false');
+    testState.redis = {};
+    try {
+      const body = await (await callTool('execute_command', { deviceId: 'd1', commandType: 'list_processes' })).json();
+      expect(body.error.code).toBe(-32603);
+      expect(body.error.message).toContain('MCP_EXECUTE_TOOL_ALLOWLIST');
+      expect(mocks.executeTool).not.toHaveBeenCalled();
+      expect(intentMocks.createMcpActionIntent).not.toHaveBeenCalled();
+    } finally {
+      testState.redis = null;
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('production: ai:execute_admin is still required for the read commandTypes', async () => {
+    vi.stubEnv('NODE_ENV', 'production');
+    testState.redis = {};
+    try {
+      const body = await (await callTool('execute_command', { deviceId: 'd1', commandType: 'list_processes' })).json();
+      expect(body.error.message).toContain('ai:execute_admin');
+      expect(mocks.executeTool).not.toHaveBeenCalled();
+    } finally {
+      testState.redis = null;
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('manage_services list runs directly; restart is filed for approval', async () => {
+    const list = await (await callTool('manage_services', { action: 'list', deviceId: 'd1' })).json();
+    expect(list.result.isError).toBeUndefined();
+    expect(mocks.executeTool).toHaveBeenCalledTimes(1);
+    expect(intentMocks.createMcpActionIntent).not.toHaveBeenCalled();
+    const restart = await (await callTool('manage_services', { action: 'restart', deviceId: 'd1', serviceName: 'spooler' })).json();
+    expect(restart.result.structuredContent).toMatchObject({ status: 'pending_approval' });
+    expect(mocks.executeTool).toHaveBeenCalledTimes(1);
+    expect(intentMocks.createMcpActionIntent).toHaveBeenCalledTimes(1);
+  });
+
+  it('a Tier-4 tool is never lifted, even for an action a per-action table rates Tier 2', async () => {
+    mocks.getToolTier.mockImplementation((name: string) => (name === 'manage_services' ? 4 : undefined));
+    expect(checkGuardrails('manage_services', { action: 'list', deviceId: 'd1' }).tier).toBe(2);
+    const body = await (await callTool('manage_services', { action: 'list', deviceId: 'd1' })).json();
+    expect(JSON.parse(body.result.content[0].text)).toMatchObject({ code: 'MCP_APPROVAL_REQUIRED', reason: 'not_tier3' });
+    expect(mocks.executeTool).not.toHaveBeenCalled();
+    expect(intentMocks.createMcpActionIntent).not.toHaveBeenCalled();
+  });
+
+  it('flag off: execute_command list_processes keeps today\'s refusal (unchanged)', async () => {
+    delete process.env.MCP_TIER3_INTENTS_ENABLED;
+    const body = await (await callTool('execute_command', { deviceId: 'd1', commandType: 'list_processes' })).json();
+    expect(body.result).toEqual({ content: [{ type: 'text', text: TODAY_APPROVAL_REQUIRED_TEXT }], isError: true });
+    expect(mocks.executeTool).not.toHaveBeenCalled();
+  });
+});
+
+describe('MCP_UNATTENDED_TIER3_PRINCIPALS operator opt-in', () => {
+  beforeEach(() => {
+    vi.unstubAllEnvs();
+    mocks.getToolDefinitions.mockReturnValue([
+      { name: 'execute_command', description: 'Execute a system command.', input_schema: {} },
+      { name: 'registry_operations', description: 'Read or modify the registry.', input_schema: REGISTRY_OPERATIONS_SCHEMA },
+      { name: 'collect_evidence', description: 'Collect forensic evidence.', input_schema: {} },
+    ]);
+    mocks.getToolTier.mockImplementation((name: string) => {
+      if (name === 'execute_command') return 3;
+      if (name === 'registry_operations') return 1;
+      if (name === 'collect_evidence') return 2;
+      return undefined;
+    });
+  });
+
+  it.each([undefined, '', 'true', '11111111-1111-4111-8111-111111111111', 'api_key:other-key', 'oauth_client:key-1', ' api_key:22222222-2222-4222-8222-222222222222'])('stays gated for this key when MCP_UNATTENDED_TIER3_PRINCIPALS is %s', async (value) => {
+    if (value !== undefined) vi.stubEnv('MCP_UNATTENDED_TIER3_PRINCIPALS', value);
+    const res = await callTool('execute_command', { deviceId: 'dev-1', commandType: 'list_processes' });
+    const payload = JSON.parse((await res.json()).result.content[0].text);
+    expect(payload.code).toBe('MCP_APPROVAL_REQUIRED');
+    expect(mocks.executeTool).not.toHaveBeenCalled();
+    const names = (await (await listTools()).json()).result.tools.map((t: any) => t.name);
+    expect(names).not.toContain('execute_command');
+    expect(names).not.toContain('collect_evidence');
+    vi.unstubAllEnvs();
+  });
+
+  describe('when enabled', () => {
+    beforeEach(() => { vi.stubEnv('MCP_UNATTENDED_TIER3_PRINCIPALS', 'oauth_client_user:someone/99999999-9999-4999-8999-999999999999, api_key:11111111-1111-4111-8111-111111111111'); });
+
+    it('never lifts Tier 4 (no approval path): unlisted and denied even for a designated principal', async () => {
+      mocks.getToolDefinitions.mockReturnValue([
+        { name: 'forbidden_tool', description: 'Tier 4.', input_schema: {} },
+      ]);
+      mocks.getToolTier.mockImplementation((name: string) => (name === 'forbidden_tool' ? 4 : undefined));
+      const names = (await (await listTools()).json()).result.tools.map((t: any) => t.name);
+      expect(names).not.toContain('forbidden_tool');
+      const body = await (await callTool('forbidden_tool', {})).json();
+      if (body.result) {
+        expect(body.result.isError).toBe(true);
+      } else {
+        expect(body.error).toBeDefined();
+      }
+      expect(mocks.executeTool).not.toHaveBeenCalled();
+    });
+
+    it('lists Tier 3 tools for an ai:execute caller, with no "not available over MCP" note', async () => {
+      const tools = (await (await listTools()).json()).result.tools;
+      const names = tools.map((t: any) => t.name);
+      expect(names).toEqual(expect.arrayContaining(['execute_command', 'registry_operations', 'collect_evidence']));
+      const registry = tools.find((t: any) => t.name === 'registry_operations');
+      expect(registry.description).not.toContain('not available over MCP');
+    });
+
+    it('designated principal WITHOUT ai:execute: multiplexer keeps its approval note (listed ⇒ callable)', async () => {
+      testState.scopes = ['ai:read', 'ai:write'];
+      const tools = (await (await listTools()).json()).result.tools;
+      const registry = tools.find((t: any) => t.name === 'registry_operations');
+      expect(registry).toBeDefined();
+      expect(registry.description).toContain('not available over MCP');
+      expect(registry.description).toContain('set_value');
+    });
+
+    it('still hides Tier 3 tools from a caller without ai:execute', async () => {
+      testState.scopes = ['ai:read', 'ai:write'];
+      const names = (await (await listTools()).json()).result.tools.map((t: any) => t.name);
+      expect(names).not.toContain('execute_command');
+    });
+
+    it('executes a flat Tier 3 tool through the ledger and audit', async () => {
+      const res = await callTool('execute_command', { deviceId: 'dev-1', commandType: 'list_processes' });
+      const body = await res.json();
+      expect(body.result.isError).toBeFalsy();
+      expect(mocks.executeTool).toHaveBeenCalledTimes(1);
+      expect(mocks.ledgerBegin).toHaveBeenCalledTimes(1);
+      expect(mocks.ledgerComplete).toHaveBeenCalledTimes(1);
+    });
+
+    it('marks the audit row when approval was bypassed, naming the matched principal', async () => {
+      await callTool('execute_command', { deviceId: 'dev-1', commandType: 'list_processes' });
+      const tier3Audit = mocks.writeAuditEvent.mock.calls
+        .map((args: any[]) => args[1])
+        .find((event: any) => event?.action === 'mcp.tool.execute_command');
+      expect(tier3Audit).toBeDefined();
+      expect(tier3Audit.details).toMatchObject({
+        approvalId: null,
+        approvalBypass: 'unattended_principal',
+        approvalBypassPrincipal: 'api_key:11111111-1111-4111-8111-111111111111',
+        tier: 3,
+      });
+    });
+
+    it('does not mark a call that never needed approval (Tier 2 action)', async () => {
+      await callTool('registry_operations', {
+        action: 'get_value', deviceId: 'dev-1', keyPath: 'HKLM\\Software\\Foo', valueName: 'Bar',
+      });
+      const audit = mocks.writeAuditEvent.mock.calls
+        .map((args: any[]) => args[1])
+        .find((event: any) => event?.action === 'mcp.tool.registry_operations');
+      expect(audit).toBeDefined();
+      expect(audit.details.tier).toBe(2);
+      expect(audit.details.approvalBypass).toBeUndefined();
+      expect(audit.details.approvalBypassPrincipal).toBeUndefined();
+    });
+
+    it('matches an uppercase-UUID entry at runtime, exactly as the boot warning reports it', async () => {
+      vi.stubEnv('MCP_UNATTENDED_TIER3_PRINCIPALS', 'api_key:11111111-1111-4111-8111-111111111111'.toUpperCase().replace('API_KEY', 'api_key'));
+      const body = await (await callTool('execute_command', { deviceId: 'dev-1', commandType: 'list_processes' })).json();
+      expect(body.result.isError).toBeFalsy();
+      expect(mocks.executeTool).toHaveBeenCalledTimes(1);
+    });
+
+    it('records the OAuth client+user ref for a bypassed OAuth call', async () => {
+      testState.apiKeyExtra = { id: 'oauth:jti-9', oauthGrantId: 'grant-9', oauthClientId: 'someone', createdBy: '99999999-9999-4999-8999-999999999999' };
+      await callTool('execute_command', { deviceId: 'dev-1', commandType: 'list_processes' });
+      const audit = mocks.writeAuditEvent.mock.calls
+        .map((args: any[]) => args[1])
+        .find((event: any) => event?.action === 'mcp.tool.execute_command');
+      expect(audit?.details).toMatchObject({
+        approvalBypass: 'unattended_principal',
+        approvalBypassPrincipal: 'oauth_client_user:someone/99999999-9999-4999-8999-999999999999',
+      });
+    });
+
+    it('executes a Tier-3-escalated multiplexer action (registry set_value)', async () => {
+      await callTool('registry_operations', {
+        action: 'set_value', deviceId: 'dev-1', keyPath: 'HKLM\\Software\\Foo', valueName: 'Bar', valueData: '1',
+      });
+      expect(mocks.executeTool).toHaveBeenCalledTimes(1);
+    });
+
+    it('treats the approval extra (collect_evidence) as Tier 3: denied and unlisted without ai:execute', async () => {
+      const res = await callTool('collect_evidence', {
+        incidentId: 'inc-1', deviceId: 'dev-1', evidenceTypes: ['screenshot'],
+      }, ['ai:read', 'ai:write']);
+      expect((await res.json()).error.message).toContain('requires ai:execute scope');
+      expect(mocks.executeTool).not.toHaveBeenCalled();
+      const names = (await (await listTools()).json()).result.tools.map((t: any) => t.name);
+      expect(names).not.toContain('collect_evidence');
+    });
+
+    it('executes the approval extra (collect_evidence) through the Tier 3 ledger for an ai:execute caller', async () => {
+      await callTool('collect_evidence', {
+        incidentId: 'inc-1', deviceId: 'dev-1', evidenceTypes: ['screenshot'],
+      });
+      expect(mocks.executeTool).toHaveBeenCalledTimes(1);
+      expect(mocks.ledgerBegin).toHaveBeenCalledTimes(1);
+    });
+
+    it('production: a Tier 3 tool missing from MCP_EXECUTE_TOOL_ALLOWLIST is neither listed nor callable', async () => {
+      // MCP_EXECUTE_TOOL_ALLOWLIST is parsed at module load and is empty in
+      // this suite, so every Tier 3 tool is outside the production allowlist.
+      vi.stubEnv('NODE_ENV', 'production');
+      // Isolate the allowlist predicate from the execute_admin lever.
+      vi.stubEnv('MCP_REQUIRE_EXECUTE_ADMIN', 'false');
+      testState.redis = {};
+      try {
+        const names = (await (await listTools()).json()).result.tools.map((t: any) => t.name);
+        expect(names).not.toContain('execute_command');
+        expect(names).not.toContain('collect_evidence');
+        const body = await (await callTool('execute_command', { deviceId: 'dev-1', commandType: 'list_processes' })).json();
+        expect(body.error.message).toContain('MCP_EXECUTE_TOOL_ALLOWLIST');
+        expect(mocks.executeTool).not.toHaveBeenCalled();
+      } finally {
+        testState.redis = null;
+      }
+    });
+
+    it('production: ai:execute_admin is still required for Tier 3', async () => {
+      vi.stubEnv('NODE_ENV', 'production');
+      testState.redis = {};
+      try {
+        const body = await (await callTool('execute_command', { deviceId: 'dev-1', commandType: 'list_processes' })).json();
+        expect(body.error.message).toContain('ai:execute_admin');
+        expect(mocks.executeTool).not.toHaveBeenCalled();
+      } finally {
+        testState.redis = null;
+      }
+    });
+
+    it('binds OAuth callers by client AND user, never by client alone or the synthetic oauth:<jti> id', async () => {
+      const call = () => callTool('execute_command', { deviceId: 'dev-1', commandType: 'list_processes' });
+      const expectDenied = async () => {
+        const body = await (await call()).json();
+        expect(JSON.parse(body.result.content[0].text).code).toBe('MCP_APPROVAL_REQUIRED');
+      };
+      // One user's grant and another user's grant through the SAME shared client.
+      testState.apiKeyExtra = { id: 'oauth:jti-1', oauthGrantId: 'grant-1', oauthClientId: 'cc-1', createdBy: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' };
+      for (const value of ['api_key:oauth:jti-1', 'oauth_client:cc-1', 'oauth_client_user:cc-1/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', 'oauth_client_user:cc-2/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa']) {
+        vi.stubEnv('MCP_UNATTENDED_TIER3_PRINCIPALS', value);
+        await expectDenied();
+      }
+      expect(mocks.executeTool).not.toHaveBeenCalled();
+
+      vi.stubEnv('MCP_UNATTENDED_TIER3_PRINCIPALS', 'oauth_client_user:cc-1/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa');
+      await call();
+      expect(mocks.executeTool).toHaveBeenCalledTimes(1);
+
+      // Same client, different user: still approval-only.
+      testState.apiKeyExtra = { id: 'oauth:jti-2', oauthGrantId: 'grant-2', oauthClientId: 'cc-1', createdBy: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' };
+      await expectDenied();
+      expect(mocks.executeTool).toHaveBeenCalledTimes(1);
+    });
+
+    it('still requires ai:execute for Tier 3 — the scope gate is not bypassed', async () => {
+      const res = await callTool('execute_command', { deviceId: 'dev-1', commandType: 'list_processes' }, ['ai:read', 'ai:write']);
+      const body = await res.json();
+      expect(body.error.message).toContain('requires ai:execute scope');
+      expect(mocks.executeTool).not.toHaveBeenCalled();
+      expect(mocks.ledgerBegin).not.toHaveBeenCalled();
+    });
+  });
+});
+
+// #8340 — config-policy mutations are MFA-gated in their handlers
+// (services/aiToolMfaGate.ts). The catalog must say so for a caller that can't
+// clear that gate, instead of advertising only the Tier 3 approval gate.
+describe('MFA-gated config-policy actions in tools/list (#8340)', () => {
+  const FEATURE_LINK_SCHEMA = {
+    type: 'object',
+    properties: { action: { type: 'string', enum: ['add', 'update', 'remove', 'list', 'describe'] } },
+  };
+  const MANAGE_CONFIG_POLICY_SCHEMA = {
+    type: 'object',
+    properties: { action: { type: 'string', enum: ['create', 'update', 'activate', 'deactivate', 'delete'] } },
+  };
+
+  beforeEach(() => {
+    // The preceding suite's "when enabled" block leaves this key designated.
+    vi.unstubAllEnvs();
+    mocks.getToolDefinitions.mockReturnValue([
+      { name: 'manage_policy_feature_link', description: 'Manage feature links.', input_schema: FEATURE_LINK_SCHEMA },
+      { name: 'manage_configuration_policy', description: 'Manage policies.', input_schema: MANAGE_CONFIG_POLICY_SCHEMA },
+      { name: 'apply_configuration_policy', description: 'Assign a policy.', input_schema: { type: 'object', properties: {} } },
+      { name: 'remove_configuration_policy_assignment', description: 'Remove an assignment.', input_schema: { type: 'object', properties: {} } },
+      { name: 'list_configuration_policies', description: 'List policies.', input_schema: { type: 'object', properties: {} } },
+    ]);
+    mocks.getToolTier.mockImplementation((name: string) => {
+      if (name === 'list_configuration_policies') return 1;
+      if (name.includes('configuration_polic') || name === 'manage_policy_feature_link') return 2;
+      return undefined;
+    });
+  });
+
+  async function listedTools(): Promise<Array<{ name: string; description: string }>> {
+    return (await (await listTools()).json()).result.tools;
+  }
+
+  it('an API-key caller (2FA on) sees add/update advertised as unavailable, not just remove', async () => {
+    const tool = (await listedTools()).find((t) => t.name === 'manage_policy_feature_link');
+    expect(tool).toBeDefined();
+    expect(tool!.description).toMatch(/Actions "add", "update" require a multi-factor-authenticated session and are not available over MCP/);
+    // remove keeps its approval note; reads stay advertised as available.
+    expect(tool!.description).toMatch(/Actions "remove" require interactive approval/);
+    expect(tool!.description).not.toContain('"list"');
+    expect(tool!.description).not.toContain('"describe"');
+  });
+
+  it('hides the wholly MFA-gated tools from that caller and keeps the reads', async () => {
+    const names = (await listedTools()).map((t) => t.name);
+    expect(names).not.toContain('manage_configuration_policy');
+    expect(names).not.toContain('apply_configuration_policy');
+    expect(names).not.toContain('remove_configuration_policy_assignment');
+    expect(names).toEqual(expect.arrayContaining(['list_configuration_policies', 'manage_policy_feature_link']));
+  });
+
+  it('an MFA-satisfied caller is unaffected: every tool listed, no MFA note', async () => {
+    testState.mfaSatisfied = true;
+    const tools = await listedTools();
+    expect(tools.map((t) => t.name)).toEqual(expect.arrayContaining([
+      'manage_configuration_policy', 'apply_configuration_policy', 'remove_configuration_policy_assignment',
+    ]));
+    for (const tool of tools) expect(tool.description).not.toContain('multi-factor');
+    const featureLink = tools.find((t) => t.name === 'manage_policy_feature_link')!;
+    expect(featureLink.description).toMatch(/Actions "remove" require interactive approval/);
+  });
+
+  it('a designated unattended principal still cannot clear MFA: remove moves to the MFA note', async () => {
+    vi.stubEnv('MCP_UNATTENDED_TIER3_PRINCIPALS', 'api_key:11111111-1111-4111-8111-111111111111');
+    try {
+      const tool = (await listedTools()).find((t) => t.name === 'manage_policy_feature_link')!;
+      expect(tool.description).toMatch(/Actions "add", "update", "remove" require a multi-factor-authenticated session/);
+      expect(tool.description).not.toContain('interactive approval');
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("tools/call surfaces the handler's coded MFA refusal as an MCP error with its code intact", async () => {
+    const { mfaGatedToolError } = await import('../services/aiToolMfaGate');
+    const refusal = mfaGatedToolError('manage_policy_feature_link', 'update', { token: {} } as any);
+    expect(refusal).not.toBeNull();
+    mocks.executeTool.mockResolvedValue(refusal);
+    const body = await (await callTool('manage_policy_feature_link', {
+      action: 'update', configPolicyId: 'p1', featureLinkId: 'l1', featureType: 'patch', inlineSettings: {},
+    })).json();
+    expect(body.result.isError).toBe(true);
+    const payload = JSON.parse(body.result.content[0].text);
+    expect(payload.code).toBe('MFA_REQUIRED');
+    expect(payload.error).toContain('web app');
+  });
+});
+
+// Network isolation must use its episode service, never an MCP principal lift or intent.
+describe('network isolation bypass refusal', () => {
+  const principal = 'api_key:11111111-1111-4111-8111-111111111111';
+  const isolationArgs = {
+    deviceId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+    incidentId: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee',
+    actionType: 'network_isolation',
+  };
+
+  beforeEach(() => {
+    vi.unstubAllEnvs();
+    testState.mfaSatisfied = true;
+    mocks.getToolTier.mockImplementation((name: string) =>
+      ['execute_containment', 'release_containment', 'execute_command'].includes(name) ? 3 : undefined);
+    intentMocks.createMcpActionIntent.mockReset().mockImplementation(async (input: { toolName: string }) => pendingOutcome(input.toolName));
+  });
+  afterEach(() => vi.unstubAllEnvs());
+
+  it.each(['execute_containment', 'release_containment'])('direct approval guard refuses %s even for an unattended principal', name => {
+    expect(__isMcpApprovalRequiredForTests(name, 3, {
+      unattendedPrincipal: true, toolInput: isolationArgs,
+    })).toBe(true);
+    expect(__isMcpApprovalRequiredForTests('execute_command', 3, {
+      unattendedPrincipal: true, toolInput: { command: 'hostname' },
+    })).toBe(false);
+  });
+
+  it.each([
+    ['execute_containment', false, false],
+    ['execute_containment', false, true],
+    ['execute_containment', true, false],
+    ['execute_containment', true, true],
+    ['release_containment', false, false],
+    ['release_containment', false, true],
+    ['release_containment', true, false],
+    ['release_containment', true, true],
+  ] as const)('refuses %s with intents=%s unattended=%s before execution or intent creation', async (name, intents, unattended) => {
+    vi.stubEnv('MCP_TIER3_INTENTS_ENABLED', String(intents));
+    vi.stubEnv('MCP_UNATTENDED_TIER3_PRINCIPALS', unattended ? principal : '');
+    const body = await (await callTool(name, isolationArgs)).json();
+    expect(body.result.isError).toBe(true);
+    expect(JSON.parse(body.result.content[0].text)).toMatchObject({ code: 'MCP_APPROVAL_REQUIRED' });
+    expect(mocks.executeTool).not.toHaveBeenCalled();
+    expect(mocks.ledgerBegin).not.toHaveBeenCalled();
+    expect(intentMocks.createMcpActionIntent).not.toHaveBeenCalled();
+  });
+
+  // W13 (#10101): the AI tool is now REGISTERED — Tier 3 in the registry and
+  // TOOL_TIERS (pinned by aiGuardrails.releaseContainment.test.ts), four-eyes in
+  // the REAL guardrail tables this suite runs on. Registration must not open an
+  // MCP path: drive the gate with that tier and the real tool input, under every
+  // intents/unattended combination.
+  it.each([
+    [false, false], [false, true], [true, false], [true, true],
+  ] as const)('the registered release_containment stays refused (intents=%s unattended=%s)', async (intents, unattended) => {
+    expect(TIER3_FOUR_EYES_TOOLS.has('release_containment')).toBe(true);
+    expect(resolveApprovalScope('release_containment', undefined, {})).toBe('four_eyes');
+    const registeredTier = 3; // TOOL_TIERS.release_containment (pinned elsewhere)
+    mocks.getToolTier.mockImplementation((name: string) => (name === 'release_containment' ? registeredTier : undefined));
+    vi.stubEnv('MCP_TIER3_INTENTS_ENABLED', String(intents));
+    vi.stubEnv('MCP_UNATTENDED_TIER3_PRINCIPALS', unattended ? principal : '');
+    const releaseArgs = {
+      deviceId: isolationArgs.deviceId,
+      isolationId: '33333333-3333-4333-8333-333333333333',
+      reason: 'Incident contained and cleaned',
+    };
+    expect(__isMcpApprovalRequiredForTests('release_containment', registeredTier, {
+      unattendedPrincipal: true, toolInput: releaseArgs,
+    })).toBe(true);
+    const body = await (await callTool('release_containment', releaseArgs)).json();
+    expect(body.result.isError).toBe(true);
+    expect(JSON.parse(body.result.content[0].text)).toMatchObject({ code: 'MCP_APPROVAL_REQUIRED' });
+    expect(mocks.executeTool).not.toHaveBeenCalled();
+    expect(mocks.ledgerBegin).not.toHaveBeenCalled();
+    expect(intentMocks.createMcpActionIntent).not.toHaveBeenCalled();
+  });
+
+  it('refuses release_containment by name before it is registered', async () => {
+    mocks.getToolTier.mockReturnValue(undefined);
+    const body = await (await callTool('release_containment', {})).json();
+    expect(body.result?.isError).toBe(true);
+    expect(JSON.parse(body.result.content[0].text)).toMatchObject({ code: 'MCP_APPROVAL_REQUIRED' });
+    expect(mocks.executeTool).not.toHaveBeenCalled();
+    expect(intentMocks.createMcpActionIntent).not.toHaveBeenCalled();
+  });
+
+  it('preserves unattended process_kill and another Tier 3 tool', async () => {
+    vi.stubEnv('MCP_UNATTENDED_TIER3_PRINCIPALS', principal);
+    for (const [name, args] of [
+      ['execute_containment', { ...isolationArgs, actionType: 'process_kill', parameters: { pid: 123 } }],
+      ['execute_command', { deviceId: isolationArgs.deviceId, commandType: 'list_processes' }],
+    ] as const) {
+      const body = await (await callTool(name, args)).json();
+      expect(body.result.isError).toBeFalsy();
+    }
+    expect(mocks.executeTool).toHaveBeenCalledTimes(2);
+    expect(mocks.ledgerBegin).toHaveBeenCalledTimes(2);
+    expect(intentMocks.createMcpActionIntent).not.toHaveBeenCalled();
+  });
+
+  it('preserves intent eligibility for process_kill', async () => {
+    vi.stubEnv('MCP_TIER3_INTENTS_ENABLED', 'true');
+    vi.stubEnv('MCP_UNATTENDED_TIER3_PRINCIPALS', '');
+    const body = await (await callTool('execute_containment', { ...isolationArgs, actionType: 'process_kill' })).json();
+    expect(body.result.structuredContent).toMatchObject({ status: 'pending_approval' });
+    expect(intentMocks.createMcpActionIntent).toHaveBeenCalledTimes(1);
+    expect(mocks.executeTool).not.toHaveBeenCalled();
   });
 });

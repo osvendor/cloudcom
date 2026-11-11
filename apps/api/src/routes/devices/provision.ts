@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import { zValidator } from '../../lib/validation';
 import { and, eq, isNull } from 'drizzle-orm';
 import { createHash } from 'crypto';
-import { db, runOutsideDbContext, withSystemDbAccessContext } from '../../db';
+import { db, runOutsideDbContext, withSystemDbAccessContext, withDbTransaction } from '../../db';
 import { devices, organizations, sites, provisionCredentialHandles } from '../../db/schema';
 import {
   authMiddleware,
@@ -30,6 +30,8 @@ import {
   type PartnerDeviceCapacityResult,
 } from '../../services/partnerDeviceCapacity';
 
+import { isHoldingOrg } from '../../services/unassignedPool/protectedOrg';
+import { PROTECTED_ORG_ERROR } from '../../services/unassignedPool/orgType';
 export const provisionRoutes = new Hono();
 
 provisionRoutes.use('*', authMiddleware);
@@ -78,6 +80,8 @@ provisionRoutes.post(
     if (!auth.canAccessOrg(data.orgId)) {
       return c.json({ error: 'Caller does not have access to target organization' }, 403);
     }
+    // canAccessOrg is true for system scope: the holding org is never a target.
+    if (await isHoldingOrg(data.orgId)) return c.json(PROTECTED_ORG_ERROR, 409);
 
     // ----------- validate the target site belongs to the target org -----------
     const [targetSite] = await db
@@ -378,9 +382,10 @@ provisionRoutes.get('/provision/fetch/:token', async (c) => {
   // ── 3. Expiry ───────────────────────────────────────────────────────────
   if (new Date(row.expiresAt) < new Date()) {
     // Best-effort cleanup of the expired row; ignore failures.
-    await db
+    // Savepoint so a failed delete cannot poison the request transaction (#11203).
+    await withDbTransaction(async () => db
       .delete(provisionCredentialHandles)
-      .where(eq(provisionCredentialHandles.id, row.id))
+      .where(eq(provisionCredentialHandles.id, row.id)))
       .catch(() => {});
     return c.json({ error: 'handle expired' }, 410);
   }
@@ -405,10 +410,11 @@ provisionRoutes.get('/provision/fetch/:token', async (c) => {
   }
 
   // ── 5. Hard-delete so plaintext secrets don't linger at rest ────────────
+  // Fail closed: no catch. A failed delete must fail the request so the consume
+  // above rolls back with it; the plaintext never outlives a successful consume.
   await db
     .delete(provisionCredentialHandles)
-    .where(eq(provisionCredentialHandles.id, row.id))
-    .catch(() => {});
+    .where(eq(provisionCredentialHandles.id, row.id));
 
   writeRouteAudit(c, {
     orgId: row.orgId,

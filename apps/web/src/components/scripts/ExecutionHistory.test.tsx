@@ -42,12 +42,23 @@ const rows = [
   },
 ] as unknown as ScriptExecution[];
 
-// The data rows carry role="button" (the whole row is clickable), so the
-// implicit "row" ARIA role is gone — query the DOM directly instead.
+// Query the DOM directly rather than by role: the buttons inside each row
+// (Cancel, View details) are the only interactive controls now (#7179 —
+// the row itself used to double as role="button", which nested-interactive
+// controls inside another interactive element, an axe violation).
 function bodyRows(): HTMLElement[] {
   const body = screen.getByRole('table').querySelector('tbody')!;
   return Array.from(body.querySelectorAll('tr'));
 }
+
+describe('ExecutionHistory filter selects accessible name (#7156)', () => {
+  it('gives the status and date-range filter selects a real accessible name', () => {
+    render(<ExecutionHistory executions={rows} />);
+
+    expect(screen.getByRole('combobox', { name: 'Status' })).toBeInTheDocument();
+    expect(screen.getByRole('combobox', { name: 'Date range' })).toBeInTheDocument();
+  });
+});
 
 describe('ExecutionHistory', () => {
   it('filters on a search term without throwing when scriptName or deviceHostname is missing', () => {
@@ -133,6 +144,19 @@ describe('ExecutionHistory', () => {
 
     expect(onViewDetails).toHaveBeenCalledWith(expect.objectContaining({ id: 'e1' }));
   });
+
+  // axe (nested-interactive): the row carried role="button" + tabIndex while
+  // containing real <button> controls (Cancel, View details) — a screen
+  // reader has no way to represent an interactive element nested inside
+  // another interactive element. The buttons are the only controls now.
+  it('does not expose the row itself as an interactive control', () => {
+    render(<ExecutionHistory executions={rows} onViewDetails={vi.fn()} />);
+
+    for (const row of bodyRows()) {
+      expect(row).not.toHaveAttribute('role', 'button');
+      expect(row).not.toHaveAttribute('tabindex');
+    }
+  });
 });
 
 // A `pending` execution has no `started_at` yet (the API returns NULL until
@@ -180,5 +204,31 @@ describe('ExecutionHistory pending/duration rendering', () => {
 
     const row = bodyRows()[0];
     expect(within(row).getByText('1m 0s')).toBeInTheDocument();
+  });
+});
+
+// #9563 — the row chip on /scripts/:id/executions used to read "Queued —
+// device offline" for every queued run; it now follows the device's status.
+describe('ExecutionHistory queued label follows the device status (#9563)', () => {
+  const queuedRow = (deviceStatus?: string) => [{
+    id: 'q1',
+    scriptId: 's1',
+    scriptName: 'Disk Cleanup',
+    deviceId: 'd1',
+    deviceHostname: 'alpha-01',
+    status: 'queued',
+    startedAt: null,
+    deviceStatus,
+  }] as unknown as ScriptExecution[];
+
+  it('an online device reads awaiting pickup, not offline', () => {
+    render(<ExecutionHistory executions={queuedRow('online')} />);
+    expect(within(bodyRows()[0]!).getByText('Queued — awaiting pickup')).toBeInTheDocument();
+    expect(screen.queryByText(/device offline/i)).toBeNull();
+  });
+
+  it('an offline device reads device offline', () => {
+    render(<ExecutionHistory executions={queuedRow('offline')} />);
+    expect(within(bodyRows()[0]!).getByText('Queued — device offline')).toBeInTheDocument();
   });
 });

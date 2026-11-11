@@ -22,7 +22,11 @@ const { redisMock, redisStore, ttls, getRedisMock } = vi.hoisted(() => {
 
 vi.mock('./redis', () => ({ getRedis: getRedisMock }));
 
-import { mintStepUpGrant, validateStepUpGrant, consumeStepUpGrant, readStepUpGrant, rollbackResourceDigest, maintenanceResourceDigest, moveOrgResourceDigest, passkeyRemovalResourceDigest, scriptLanePolicyResourceDigest, stepUpGrantTtlSeconds, type StepUpOperation } from './mfaStepUpGrant';
+import { mintStepUpGrant, validateStepUpGrant, consumeStepUpGrant, readStepUpGrant, rollbackResourceDigest, maintenanceResourceDigest, moveOrgResourceDigest, parkedAssignResourceDigest, parkedBulkAssignResourceDigest, passkeyRemovalResourceDigest, callerVerificationAdministrativeDigest, scriptLanePolicyResourceDigest, partnerScriptCeilingResourceDigest, stepUpGrantTtlSeconds, type StepUpOperation, type ScriptLaneWideningDelta } from './mfaStepUpGrant';
+import { scriptLaneStepUpResource, partnerScriptCeilingStepUpResource } from '../routes/auth/schemas';
+import { wispGrantResourceDigest } from './mfaStepUpGrant';
+import { wispGrantStepUpResource, mfaStepUpSchema } from '../routes/auth/schemas';
+import { createHash } from 'node:crypto';
 
 const bind = (operation: StepUpOperation) => ({
   userId: 'user-1',
@@ -125,6 +129,51 @@ describe('moveOrgResourceDigest', () => {
   });
 });
 
+describe('parkedAssignResourceDigest', () => {
+  const base = {
+    deviceId: '55555555-5555-4555-8555-555555555555',
+    targetOrgId: '22222222-2222-4222-8222-222222222222',
+    targetSiteId: '44444444-4444-4444-8444-444444444444',
+  };
+
+  it('is stable and insensitive to input key order', () => {
+    const reordered = { targetSiteId: base.targetSiteId, targetOrgId: base.targetOrgId, deviceId: base.deviceId };
+    expect(parkedAssignResourceDigest(reordered)).toBe(parkedAssignResourceDigest(base));
+    expect(parkedAssignResourceDigest(base)).toMatch(/^sha256:[0-9a-f]{64}$/);
+  });
+
+  it('binds each field', () => {
+    expect(parkedAssignResourceDigest({ ...base, deviceId: '55555555-5555-4555-8555-555555555556' })).not.toBe(parkedAssignResourceDigest(base));
+    expect(parkedAssignResourceDigest({ ...base, targetOrgId: '22222222-2222-4222-8222-222222222223' })).not.toBe(parkedAssignResourceDigest(base));
+    expect(parkedAssignResourceDigest({ ...base, targetSiteId: '44444444-4444-4444-8444-444444444445' })).not.toBe(parkedAssignResourceDigest(base));
+  });
+
+  it('never equals the move-org digest for the same values', () => {
+    expect(parkedAssignResourceDigest(base)).not.toBe(moveOrgResourceDigest(base));
+  });
+});
+
+describe('parkedBulkAssignResourceDigest', () => {
+  const a = { deviceId: '11111111-1111-4111-8111-111111111111', targetOrgId: '22222222-2222-4222-8222-222222222222', targetSiteId: '33333333-3333-4333-8333-333333333333' };
+  const b = { deviceId: '44444444-4444-4444-8444-444444444444', targetOrgId: '22222222-2222-4222-8222-222222222222', targetSiteId: '33333333-3333-4333-8333-333333333333' };
+  const c = { deviceId: '66666666-6666-4666-8666-666666666666', targetOrgId: '77777777-7777-4777-8777-777777777777', targetSiteId: '88888888-8888-4888-8888-888888888888' };
+
+  it('sorts by deviceId, so item order does not matter', () => {
+    expect(parkedBulkAssignResourceDigest([b, a, c])).toBe(parkedBulkAssignResourceDigest([a, b, c]));
+  });
+
+  it('changes when an item is added, removed or changed', () => {
+    const digest = parkedBulkAssignResourceDigest([a, b]);
+    expect(parkedBulkAssignResourceDigest([a, b, c])).not.toBe(digest);
+    expect(parkedBulkAssignResourceDigest([a])).not.toBe(digest);
+    expect(parkedBulkAssignResourceDigest([a, { ...b, targetSiteId: c.targetSiteId }])).not.toBe(digest);
+  });
+
+  it('a one-item batch never equals the single-assignment digest for that item', () => {
+    expect(parkedBulkAssignResourceDigest([a])).not.toBe(parkedAssignResourceDigest(a));
+  });
+});
+
 describe('scriptLanePolicyResourceDigest (#5612 W04)', () => {
   it('binds the org AND the requested value AND the reset flag', () => {
     const a = scriptLanePolicyResourceDigest({ orgId: 'org-1', unattendedEnabled: true });
@@ -133,6 +182,56 @@ describe('scriptLanePolicyResourceDigest (#5612 W04)', () => {
     expect(a).not.toBe(scriptLanePolicyResourceDigest({ orgId: 'org-1', unattendedEnabled: false }));
     expect(a).not.toBe(scriptLanePolicyResourceDigest({ orgId: 'org-2', unattendedEnabled: true }));
     expect(a).not.toBe(scriptLanePolicyResourceDigest({ orgId: 'org-1', unattendedEnabled: true, reset: true }));
+  });
+});
+
+describe('script-lane widening digest no longer binds reviewerModel (W08, #7606)', () => {
+  const ORG = '11111111-1111-4111-8111-111111111111';
+  const PARTNER = '22222222-2222-4222-8222-222222222222';
+  // What the routes build server-side on the REDEEM side (effectiveGrantValues / computeWidening).
+  const widening: ScriptLaneWideningDelta = {
+    maxUnattendedRiskTier: 'low',
+    unattendedAllowedClasses: ['services', 'dns_cache'],
+    maxUnattendedPerHour: 1,
+    protectedResourcesEmptied: false,
+    proposingEnabled: true,
+  };
+  // What a cached pre-W08 client still sends on the MINT side (POST /auth/mfa/step-up).
+  const staleClientWidening = { ...widening, unattendedAllowedClasses: ['dns_cache', 'services'], reviewerModel: 'claude-x' };
+
+  it('an extra reviewerModel key on the delta cannot change the digest', () => {
+    const withKey = { ...widening, reviewerModel: null } as unknown as ScriptLaneWideningDelta;
+    expect(scriptLanePolicyResourceDigest({ orgId: ORG, unattendedEnabled: true, widening: withKey }))
+      .toBe(scriptLanePolicyResourceDigest({ orgId: ORG, unattendedEnabled: true, widening }));
+    expect(partnerScriptCeilingResourceDigest({ partnerId: PARTNER, unattendedAllowed: true, widening: withKey }))
+      .toBe(partnerScriptCeilingResourceDigest({ partnerId: PARTNER, unattendedAllowed: true, widening }));
+  });
+
+  it('org lane: the minted digest (client resource parsed by the step-up schema) equals the redeemed one (server-built delta)', () => {
+    const minted = scriptLaneStepUpResource.parse({ orgId: ORG, unattendedEnabled: true, widening: staleClientWidening });
+    expect(minted.widening).not.toHaveProperty('reviewerModel');
+    expect(scriptLanePolicyResourceDigest(minted))
+      .toBe(scriptLanePolicyResourceDigest({ orgId: ORG, unattendedEnabled: true, widening }));
+  });
+
+  it('partner ceiling: the minted digest equals the redeemed one', () => {
+    const minted = partnerScriptCeilingStepUpResource.parse({ partnerId: PARTNER, unattendedAllowed: true, widening: staleClientWidening });
+    expect(minted.widening).not.toHaveProperty('reviewerModel');
+    expect(partnerScriptCeilingResourceDigest(minted))
+      .toBe(partnerScriptCeilingResourceDigest({ partnerId: PARTNER, unattendedAllowed: true, widening }));
+  });
+
+  it('every bound widening value still changes the digest', () => {
+    const base = scriptLanePolicyResourceDigest({ orgId: ORG, unattendedEnabled: true, widening });
+    for (const changed of [
+      { maxUnattendedRiskTier: 'medium' },
+      { unattendedAllowedClasses: ['services'] },
+      { maxUnattendedPerHour: 2 },
+      { protectedResourcesEmptied: true },
+      { proposingEnabled: false },
+    ]) {
+      expect(scriptLanePolicyResourceDigest({ orgId: ORG, unattendedEnabled: true, widening: { ...widening, ...changed } })).not.toBe(base);
+    }
   });
 });
 
@@ -296,6 +395,62 @@ describe('mfaStepUpGrant operation isolation', () => {
     // Non-consuming: the record is still present afterward.
     expect(redisStore.has(`mfa:stepup:${id}`)).toBe(true);
   });
+
+  // #4045: the SSO re-auth callback now mints one of TWO purposes. Each must be
+  // useless for the other — an IdP login that proved "enroll my first factor"
+  // must never authorize removing one, and vice versa — and the new purpose
+  // gets the same single-use / user / session / epoch binding as every other.
+  describe('sso_reauth_manage_factor (#4045)', () => {
+    // Mint-site shape from routes/sso.ts: no resourceDigest.
+    const ssoBind = (overrides: Partial<ReturnType<typeof bind>> = {}) => {
+      const { resourceDigest: _omit, ...rest } = bind('sso_reauth_manage_factor');
+      return { ...rest, ...overrides };
+    };
+
+    it('validates non-consumingly, then consumes exactly once (reuse fails)', async () => {
+      const id = await mintStepUpGrant(ssoBind());
+      await expect(validateStepUpGrant(id!, ssoBind())).resolves.toBe(true);
+      await expect(consumeStepUpGrant(id!, ssoBind())).resolves.toBe(true);
+      await expect(consumeStepUpGrant(id!, ssoBind())).resolves.toBe(false);
+      await expect(validateStepUpGrant(id!, ssoBind())).resolves.toBe(false);
+    });
+
+    it('is not usable as enroll_first_factor, and an enroll_first_factor grant is not usable as it', async () => {
+      const manage = await mintStepUpGrant(ssoBind());
+      const enroll = await mintStepUpGrant(ssoBind({ operation: 'enroll_first_factor' }));
+      await expect(validateStepUpGrant(manage!, ssoBind({ operation: 'enroll_first_factor' }))).resolves.toBe(false);
+      await expect(validateStepUpGrant(enroll!, ssoBind())).resolves.toBe(false);
+      await expect(consumeStepUpGrant(enroll!, ssoBind())).resolves.toBe(false);
+    });
+
+    it('is not usable as any existing-factor operation (it can never stand in for the factor proof)', async () => {
+      const manage = await mintStepUpGrant(ssoBind());
+      for (const op of ['rotate_recovery_codes', 'delete_passkey', 'add_factor'] as const) {
+        await expect(validateStepUpGrant(manage!, ssoBind({ operation: op }))).resolves.toBe(false);
+      }
+    });
+
+    it("rejects another user's grant", async () => {
+      const id = await mintStepUpGrant(ssoBind());
+      await expect(validateStepUpGrant(id!, ssoBind({ userId: 'user-2' }))).resolves.toBe(false);
+      await expect(consumeStepUpGrant(id!, ssoBind({ userId: 'user-2' }))).resolves.toBe(false);
+    });
+
+    it('rejects a stale grant after a factor or auth change (epoch bump) or from another session', async () => {
+      const a = await mintStepUpGrant(ssoBind());
+      const b = await mintStepUpGrant(ssoBind());
+      const s = await mintStepUpGrant(ssoBind());
+      await expect(validateStepUpGrant(a!, ssoBind({ mfaEpoch: 3 }))).resolves.toBe(false);
+      await expect(validateStepUpGrant(b!, ssoBind({ authEpoch: 2 }))).resolves.toBe(false);
+      await expect(validateStepUpGrant(s!, ssoBind({ sid: 'sid-2' }))).resolves.toBe(false);
+    });
+
+    it('expires on the default 300s TTL', async () => {
+      const id = await mintStepUpGrant(ssoBind());
+      expect(ttls.get(`mfa:stepup:${id}`)).toBe(300);
+      expect(stepUpGrantTtlSeconds('sso_reauth_manage_factor')).toBe(300);
+    });
+  });
 });
 
 /**
@@ -347,5 +502,53 @@ describe('readStepUpGrant', () => {
   it('does not make the context part of the binding', async () => {
     const id = await mintStepUpGrant(bind('add_factor'), { anything: 'at all' });
     await expect(validateStepUpGrant(id!, bind('add_factor'))).resolves.toBe(true);
+  });
+});
+
+describe('callerVerificationAdministrativeDigest', () => {
+  it('binds administrative step-up to org, tenant, OID and trimmed reason', () => {
+    const input = {
+      orgId: '11111111-1111-4111-8111-111111111111',
+      entraTenantId: '22222222-2222-4222-8222-222222222222',
+      entraOid: '33333333-3333-4333-8333-333333333333',
+      reason: 'Confirmed offboarding request',
+    };
+    const digest = callerVerificationAdministrativeDigest(input);
+    expect(digest).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(callerVerificationAdministrativeDigest({ ...input, reason: ` ${input.reason} ` })).toBe(digest);
+    for (const key of ['orgId', 'entraTenantId', 'entraOid', 'reason'] as const) {
+      expect(callerVerificationAdministrativeDigest({ ...input, [key]: input[key] + 'x' })).not.toBe(digest);
+    }
+  });
+});
+
+describe('wisp_grant step-up (Wisp design §4.2, W02)', () => {
+  it('wisp_grant grants live 10 minutes', () => {
+    expect(stepUpGrantTtlSeconds('wisp_grant')).toBe(600);
+  });
+
+  it('wisp_grant digest binds grantor, partner, scope and the requested ceiling', () => {
+    const base = { grantorUserId: 'u1', partnerId: 'p1', orgId: null, requestedCeilingHash: 'a'.repeat(64) };
+    expect(wispGrantResourceDigest(base)).toBe(
+      `sha256:${createHash('sha256').update(`u1:p1:*:${'a'.repeat(64)}`).digest('hex')}`,
+    );
+    expect(wispGrantResourceDigest({ ...base, orgId: 'o1' })).not.toBe(wispGrantResourceDigest(base));
+    expect(wispGrantResourceDigest({ ...base, requestedCeilingHash: 'b'.repeat(64) })).not.toBe(wispGrantResourceDigest(base));
+    expect(wispGrantResourceDigest({ ...base, grantorUserId: 'u2' })).not.toBe(wispGrantResourceDigest(base));
+    expect(wispGrantResourceDigest({ ...base, partnerId: 'p2' })).not.toBe(wispGrantResourceDigest(base));
+  });
+
+  it('the resource schema is strict and requires a 64-hex ceiling hash', () => {
+    const ok = { partnerId: '11111111-1111-4111-8111-111111111111', orgId: null, requestedCeilingHash: 'c'.repeat(64) };
+    expect(wispGrantStepUpResource.safeParse(ok).success).toBe(true);
+    expect(wispGrantStepUpResource.safeParse({ ...ok, requestedCeilingHash: 'z'.repeat(64) }).success).toBe(false);
+    // The grantor is always the caller; a body field naming one is refused.
+    expect(wispGrantStepUpResource.safeParse({ ...ok, grantorUserId: 'u1' }).success).toBe(false);
+  });
+
+  it('a wisp_grant resource survives the step-up body union intact', () => {
+    const resource = { partnerId: '11111111-1111-4111-8111-111111111111', orgId: '22222222-2222-4222-8222-222222222222', requestedCeilingHash: 'd'.repeat(64) };
+    const parsed = mfaStepUpSchema.parse({ method: 'totp', code: '123456', operation: 'wisp_grant', resource });
+    expect(parsed.resource).toEqual(resource);
   });
 });

@@ -26,6 +26,7 @@ import {
 } from '../db/schema';
 import { evaluatePamToolActionRules } from './pamRuleEngine';
 import { publishEvent } from './eventBus';
+import { currentOwnershipEpochSql } from './deviceOwnershipEpoch';
 
 const AUTO_APPROVE_DEFAULT_DURATION_MINUTES = 15;
 
@@ -138,6 +139,7 @@ async function decideInContext(params: ToolActionParams): Promise<ToolActionDeci
       siteId,
       // partner_id stays null, matching the uac_intercept ingest.
       deviceId: params.deviceId,
+      deviceEpoch: currentOwnershipEpochSql(params.deviceId),
       flowType: 'ai_tool_action',
       subjectUserId: null,
       subjectUsername: params.subjectUsername,
@@ -159,8 +161,9 @@ async function decideInContext(params: ToolActionParams): Promise<ToolActionDeci
     })
     .returning({ id: elevationRequests.id });
 
-  // Audit chain (best-effort — an audit hiccup must not flip a safe decision
-  // into a throw, mirroring ingest's posture).
+  // Audit chain. Deliberately no savepoint (#11225): a failed insert fails this
+  // transaction's next statement and its commit, so the gate fails closed and an
+  // auto-approval is never mirrored to the execution row with no audit trail.
   try {
     await db.insert(elevationAudit).values({
       orgId: params.orgId,

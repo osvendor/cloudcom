@@ -27,165 +27,8 @@ function walk(dir: string, out: string[] = []): string[] {
 
 /** Gap entries as of this wave. This list only SHRINKS. Adding a route module with no tool means writing the tool or a real exemption. */
 const FROZEN_GAPS: ReadonlySet<string> = new Set([
-  'accessReviews.ts',
-  'accounting/index.ts',
-  'actionIntents.ts',
-  'agentRollback.ts',
-  'ai.ts',
-  'ai/scriptPolicy.ts',
-  'aiAgentSchedules.ts',
-  'aiArtifacts.ts',
-  'aiOperatorTasks.ts',
-  'aiProvider.ts',
-  'alertTemplates/correlations.ts',
-  'alerts/correlations.ts',
-  'approvals.ts',
-  'auditBaselines.ts',
-  'backup/bmr.ts',
-  'backup/bmrRecoveries.ts',
-  'backup/encryption.ts',
-  'backup/reconcile.ts',
-  'backup/verification.ts',
-  'backup/vss.ts',
-  'billingProfiles.ts',
-  'c2c/configs.ts',
-  'c2c/m365Auth.ts',
-  'catalog/enrich.ts',
-  'config.ts',
-  'configurationPolicies/alertRuleTest.ts',
-  'connectedApps.ts',
-  'contracts/bulk.ts',
-  'contracts/documents.ts',
-  'contracts/generate.ts',
-  'contracts/periods.ts',
-  'contracts/reports.ts',
-  'contracts/templates.ts',
-  'customFieldImport.ts',
-  'devPush.ts',
-  'devices/actuateElevation.ts',
-  'devices/aiOrigin.ts',
-  'devices/anomalies.ts',
-  'devices/billing.ts',
-  'devices/bulkLifecycle.ts',
-  'devices/customFieldImport.ts',
-  'devices/diagnose.ts',
-  'devices/diagnosticLogs.ts',
-  'devices/events.ts',
-  'devices/filesystemSystemCleanup.ts',
-  'devices/function.ts',
-  'devices/health.ts',
-  'devices/homebrewBootstrap.ts',
-  'devices/links.ts',
-  'devices/manual.ts',
-  'devices/moveOrg.ts',
-  'devices/options.ts',
-  'devices/posture.ts',
-  'devices/processSamples.ts',
-  'devices/provision.ts',
-  'devices/removalConfig.ts',
-  'devices/software.ts',
-  'devices/softwareActions.ts',
-  'devices/stats.ts',
-  'devices/tabCounts.ts',
-  'devices/warranty.ts',
-  'devices/watchdogLogs.ts',
-  'discoveryAssetProbe.ts',
-  'enrollmentKeys.ts',
-  'externalServices.ts',
-  'fleetDesign.ts',
-  'google.ts',
-  'integrations.ts',
-  'invoices/bulk.ts',
-  'invoices/evidence.ts',
-  'invoices/pdf.ts',
-  'invoices/settings.ts',
-  'lifecycle.ts',
-  'm365.ts',
-  'm365CustomerGraphActions.ts',
-  'mobile.ts',
-  'monitoringAssetMetrics.ts',
-  'networkKnownGuests.ts',
-  'notifications.ts',
-  'onedrive.ts',
-  'orgAccountReadiness.ts',
-  'orgArchive.ts',
-  'orgAuditRetentionSettings.ts',
-  'orgBillingProfile.ts',
-  'orgMerge.ts',
-  'orgPortalSettings.ts',
-  'orgPortalUsers.ts',
-  'orgSummary.ts',
-  'orgTicketSettings.ts',
-  'packageSearch.ts',
-  'partner.ts',
-  'partnerAiScriptPolicy.ts',
-  'partnerApi/configuration.ts',
-  'partnerApi/contracts.ts',
-  'partnerApi/devices.ts',
-  'partnerApi/inventory.ts',
-  'partnerApi/organizations.ts',
-  'partnerApi/provisioning.ts',
-  'partnerApi/relationships.ts',
-  'partnerLoginBranding.ts',
-  'partnerSendingDomains.ts',
-  'partnerTrust.ts',
-  'patchPlan.ts',
-  'patchPolicies.ts',
-  'patches/appOptions.ts',
-  'pax8.ts',
-  'pax8Orders.ts',
-  'permissionsCatalog.ts',
-  'plugins.ts',
-  'policyManagement/actions.ts',
-  'quotes/bulk.ts',
-  'reliability.ts',
-  'remote/index.ts',
-  'remote/supportSessions.ts',
-  'reports/recipients.ts',
-  'roles.ts',
-  'scriptAi.ts',
-  'scriptBundle.ts',
-  'search.ts',
-  'security/compliance.ts',
-  'security/dashboard.ts',
-  'security/policies.ts',
-  'security/recommendations.ts',
-  'security/recoveryKeys.ts',
-  'security/status.ts',
-  'snmp.ts',
-  'software.ts',
-  'softwareInstallMethods.ts',
-  'softwareInventory.ts',
-  'softwareUploads.ts',
-  'stripeConnect/index.ts',
-  'system.ts',
-  'systemTools/eventLogs.ts',
-  'tenantVariables.ts',
-  'thirdPartyCatalog/list.ts',
-  'thirdPartyCatalog/operations.ts',
-  'ticketCategories.ts',
-  'ticketChecklistTemplates.ts',
-  'ticketConfig.ts',
-  'tickets/attachments.ts',
-  'tickets/bulk.ts',
   'tickets/export.ts',
-  'tickets/forms.ts',
-  'tickets/mailboxConnect.ts',
-  'tickets/ticketResponseTemplates.ts',
-  'timeEntries/suggestions.ts',
-  'toolSources.ts',
-  'topology/diagnostics.ts',
-  'topology/graphs.ts',
-  'topology/layouts.ts',
-  'topology/manual.ts',
-  'topology/policies.ts',
-  'topology/settings.ts',
-  'topology/targets.ts',
-  'topology/templateApplications.ts',
-  'topology/templates.ts',
-  'tunnels.ts',
   'unifi/index.ts',
-  'users.ts',
 ]);
 
 describe('MCP_COVERAGE (route module → tool surface)', () => {
@@ -201,12 +44,30 @@ describe('MCP_COVERAGE (route module → tool surface)', () => {
     const set = new Set(modules);
     expect(Object.keys(MCP_COVERAGE).filter((k) => !set.has(k)), 'entries for files that do not exist / register no routes').toEqual([]);
   });
+  it('pins devices/bulkSite.ts as human_only_bulk_destructive (#9796; an MFA-gated bulk write stays off the AI surface)', () => {
+    expect(MCP_COVERAGE['devices/bulkSite.ts']).toMatchObject({ exempt: 'human_only_bulk_destructive' });
+  });
+  it('pins orgPortalPreview.ts as a permanent staff_ui_render exemption (#11129; a staff-only rendering that adds no capability over the per-domain read tools)', () => {
+    expect(MCP_COVERAGE['orgPortalPreview.ts']).toMatchObject({ exempt: 'staff_ui_render' });
+    expect((MCP_COVERAGE['orgPortalPreview.ts'] as { note?: string }).note).toMatch(/#11129/);
+  });
+  it('pins partnerSettingsInheritance.ts to its read tool (#9763; the tool_in_later_wave exemption is burned down)', () => {
+    expect(MCP_COVERAGE['partnerSettingsInheritance.ts']).toEqual({ tools: ['get_partner_settings_inheritance'] });
+  });
   it('every tool named exists in the registry, and tool entries are non-empty', () => {
     const bad: string[] = [];
     for (const [k, e] of Object.entries(MCP_COVERAGE)) if ('tools' in e) {
       if (e.tools.length === 0) bad.push(`${k}: empty tools[]`);
       for (const t of e.tools) if (!registered.has(t)) bad.push(`${k}: unknown tool ${t}`);
     }
+    expect(bad).toEqual([]);
+  });
+  it('tool_in_later_wave entries name the issue that ships the tool', () => {
+    // Not a parking lot: an entry without the shipping wave's issue would be a
+    // gap under another name, escaping FROZEN_GAPS.
+    const bad = Object.entries(MCP_COVERAGE)
+      .filter(([, e]) => 'exempt' in e && e.exempt === 'tool_in_later_wave' && !/#\d+/.test(e.note ?? ''))
+      .map(([k]) => k);
     expect(bad).toEqual([]);
   });
   it('gap entries are frozen: none outside FROZEN_GAPS, and FROZEN_GAPS has no stale entry', () => {
@@ -221,4 +82,15 @@ describe('MCP_COVERAGE (route module → tool surface)', () => {
     expect((MCP_COVERAGE['discovery.ts'] as { tools: string[] }).tools).toEqual(expect.arrayContaining(['list_network_assets', 'get_network_asset', 'network_discovery']));
     expect(aiTools.size).toBeGreaterThan(150);
   });
+  it('the W04 flow tools cover the flows route module', () => {
+    expect((MCP_COVERAGE['flows.ts'] as { tools: string[] }).tools).toEqual(
+      expect.arrayContaining(['list_flows', 'get_flow', 'run_flow', 'list_flow_runs', 'get_flow_run', 'cancel_flow_run']),
+    );
+  });
+});
+
+
+it('W15 burns down both Pax8 route gaps with the PR A surface', () => {
+  expect(MCP_COVERAGE['pax8.ts']).toEqual({ tools: ['get_pax8_status', 'manage_pax8_subscriptions'] });
+  expect(MCP_COVERAGE['pax8Orders.ts']).toEqual({ tools: ['manage_pax8_orders', 'search_pax8_products', 'manage_pax8_subscriptions'] });
 });

@@ -1,5 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+const actorGate = vi.hoisted(() => ({ refusal: vi.fn(async (): Promise<unknown> => null) }));
+vi.mock('./backupRestoreActorGate', () => ({
+  restoreIntegrityRefusalForActor: (...args: unknown[]) => actorGate.refusal(...(args as [])),
+}));
 vi.mock('../db', () => ({
   runOutsideDbContext: vi.fn((fn) => fn()),
   withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn()),
@@ -21,6 +25,12 @@ vi.mock('./commandQueue', () => ({
   },
 }));
 
+// The org/cross-site restore authorization is covered by
+// aiToolsRestoreAuthorization.test.ts and aiToolsRestoreScope.integration.test.ts;
+// here it is stubbed so the select sequences below stay the handler's own.
+vi.mock('./aiToolsRestoreAuthorization', () => ({
+  authorizeAiRestore: vi.fn(async () => ({ ok: true })),
+}));
 vi.mock('./aiDispatch', () => ({
   aiQueueCommandForExecution: vi.fn(),
 }));
@@ -333,13 +343,36 @@ describe('aiToolsHyperv handlers', () => {
         // backup config, the normal state for every policy-managed device.
         configId: CONFIG_ID,
         provider: 'local',
-        providerConfig: { path: '/tmp/backups' },
+        providerConfigRef: { configId: CONFIG_ID, orgId: ORG_ID },
         storageEncryption: { required: false, mode: 'disabled' },
         vmName: 'Accounting VM',
         consistencyType: 'crash',
       },
       expect.objectContaining({ userId: 'user-1' })
     );
+  });
+
+  it('records the destination storage identity on the backup job it creates', async () => {
+    prepareHandlerMocks('trigger_hyperv_backup');
+    // Swap the destination row (the second select) for an S3 destination.
+    const baseSelect = vi.mocked(db.select).getMockImplementation()!;
+    let selectCall = 0;
+    vi.mocked(db.select).mockImplementation(((...args: unknown[]) => (++selectCall === 2
+      ? createQueryChain([{
+        provider: 's3',
+        providerConfig: { endpoint: 'https://Storage.Example.com:9443', bucket: 'Backups', accessKeyId: 'AKIA', secretAccessKey: 'secret' },
+        encryption: false,
+      }])
+      : (baseSelect as (...a: unknown[]) => unknown)(...args))) as any);
+    const jobInsert = createInsertChain([{ id: 'job-1' }]);
+    vi.mocked(db.insert).mockReset().mockImplementation(() => jobInsert as any);
+
+    await toolMap.get('trigger_hyperv_backup')!.handler({ vmId: VM_ID, consistencyType: 'application' }, makeAuth());
+
+    expect(jobInsert.values).toHaveBeenCalledWith(expect.objectContaining({
+      backupType: 'application',
+      storageIdentity: 's3::storage.example.com:9443::Backups',
+    }));
   });
 
   // D20b follow-up: a resolved config id whose backup_configs row has since
@@ -386,10 +419,35 @@ describe('aiToolsHyperv handlers', () => {
         // D20b follow-up: the helper builds its read provider from THIS
         // command's own payload the same way REST /hyperv/restore does.
         provider: 'local',
-        providerConfig: { path: '/tmp/backups' },
+        providerConfigRef: { configId: CONFIG_ID, orgId: ORG_ID },
       },
       expect.objectContaining({ userId: 'user-1' })
     );
+  });
+
+  it('refuses an AI Hyper-V restore of a snapshot without an integrity attestation, before queueing anything', async () => {
+    prepareHandlerMocks('restore_hyperv_vm');
+    actorGate.refusal.mockResolvedValueOnce({
+      code: 'snapshot_integrity_unavailable',
+      message: 'This backup has no integrity attestation. A technician must restore it from the Breeze console with two-factor confirmation.',
+    });
+
+    const result = await toolMap.get('restore_hyperv_vm')!.handler(
+      { deviceId: DEVICE_ID, snapshotId: '66666666-6666-4666-8666-666666666666', vmName: 'Recovered VM' },
+      makeAuth()
+    );
+
+    expect(JSON.parse(result)).toEqual({
+      error: 'This backup has no integrity attestation. A technician must restore it from the Breeze console with two-factor confirmation.',
+      code: 'snapshot_integrity_unavailable',
+    });
+    expect(actorGate.refusal).toHaveBeenCalledWith({
+      snapshotDbId: '66666666-6666-4666-8666-666666666666',
+      targetDeviceId: DEVICE_ID,
+      commandType: 'hyperv_restore',
+      actor: 'ai_agent',
+    });
+    expect(aiQueueCommandForExecution).not.toHaveBeenCalled();
   });
 
   // D20b follow-up: a snapshot that predates destination tracking (configId

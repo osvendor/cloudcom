@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { and, desc, eq, gte, ilike, inArray, isNull, lte, or, sql, type SQL } from 'drizzle-orm';
 import type { PgColumn } from 'drizzle-orm/pg-core';
 import { escapeLike } from '../utils/sql';
-import { db } from '../db';
+import { db, runAfterDbContextCommit } from '../db';
 import {
   devices,
   dnsActionEnum,
@@ -20,11 +20,29 @@ import {
 import { authMiddleware, requireMfa, requirePermission, requireScope, type AuthContext } from '../middleware/auth';
 import { requireOrgWideIntegrationAccess } from '../middleware/integrationConnectionScope';
 import { scheduleDnsEventSync, schedulePolicySync } from '../jobs/dnsSyncJob';
+import { DNS_INTEGRATION_DELETING_STATUS, enqueueDnsIntegrationDelete } from '../jobs/dnsSecurityRetention';
 import { writeRouteAudit } from '../services/auditEvents';
+import {
+  decodeDnsEventsCursor,
+  dnsEventsActionCondition,
+  listDnsSecurityEventsPage,
+  resolveDnsEventsWindow,
+  type DnsEventsCursor
+} from '../services/dnsSecurityEventsPage';
+import { captureException } from '../services/sentry';
 import { encryptSecret } from '../services/secretCrypto';
+import {
+  allowedTrafficCoverage,
+  applyAllowedTrafficCoverage,
+  storesAllowedTraffic,
+  type AllowedTrafficCoverage
+} from '../services/dnsProviders/syncScope';
 import { PERMISSIONS, canAccessSite, type UserPermissions } from '../services/permissions';
 import { checkSsrfSafe, type SsrfMode } from '../services/ssrfGuard';
+import { canMutateOrgWideGovernance, SITE_CEILING_WRITE_DENIED_MESSAGE } from '../services/siteCeilingAccess';
 
+import { isHoldingOrg } from '../services/unassignedPool/protectedOrg';
+import { PROTECTED_ORG_ERROR } from '../services/unassignedPool/orgType';
 // Per-provider URL guard mode.
 //
 // - umbrella / cloudflare / dnsfilter accept apiEndpoint mostly as a no-op
@@ -158,6 +176,55 @@ function resolveOrgId(
   return { error: 'orgId is required for this scope', status: 400 };
 }
 
+type OrgConditionFor = (column: PgColumn) => SQL | undefined;
+
+/**
+ * #10931 — the org filter for a list or aggregate read. /dns-security is an
+ * org-or-all page: fetchWithAuth adds the switcher's `?orgId=` to every call
+ * when an org is selected, and nothing in the All-organizations view.
+ *
+ * - No `orgId`: every org the caller can reach, as before.
+ * - An `orgId` the caller can reach: that org only. The caller's own reach is
+ *   still ANDed in, so a selection can only narrow the read.
+ * - Any other `orgId` (a foreign partner's org, or another org for an
+ *   org-scope token): 403, before any query runs.
+ *
+ * Mutation routes address one row by id and check the row's own org, so they
+ * do not take `?orgId=`.
+ */
+function resolveReadOrgScope(
+  auth: Pick<AuthContext, 'orgCondition' | 'canAccessOrg'>,
+  requestedOrgId: string | undefined
+): { orgCondition: OrgConditionFor } | { error: string; status: 403 } {
+  if (!requestedOrgId) {
+    return { orgCondition: (column) => auth.orgCondition(column) };
+  }
+  if (!auth.canAccessOrg(requestedOrgId)) {
+    return { error: 'Access to this organization denied', status: 403 };
+  }
+  return { orgCondition: (column) => and(eq(column, requestedOrgId), auth.orgCondition(column)) };
+}
+
+/**
+ * #10054 — whether the active integrations behind a stats read store allowed
+ * traffic, so the response can say "not stored" instead of reporting zero.
+ * Integration config is org-wide (no site axis) and only this flag is derived
+ * from it, so a site-restricted caller learns nothing site-specific.
+ */
+async function loadAllowedTrafficCoverage(
+  orgCondition: OrgConditionFor,
+  integrationId: string | undefined
+): Promise<AllowedTrafficCoverage> {
+  const conditions: SQL[] = [eq(dnsFilterIntegrations.isActive, true)];
+  withOrgCondition(conditions, orgCondition(dnsFilterIntegrations.orgId));
+  if (integrationId) conditions.push(eq(dnsFilterIntegrations.id, integrationId));
+  const rows = await db
+    .select({ config: dnsFilterIntegrations.config })
+    .from(dnsFilterIntegrations)
+    .where(and(...conditions));
+  return allowedTrafficCoverage(rows.map((row) => row.config));
+}
+
 const integrationConfigSchema = z.object({
   organizationId: z.string().min(1).optional(),
   accountId: z.string().min(1).optional(),
@@ -175,7 +242,10 @@ const integrationConfigSchema = z.object({
   // on-prem appliance providers (Pi-hole / AdGuard Home) on a self-hosted
   // deployment; inert on hosted. Default absent (blocked). Enabling it is
   // recorded by the create-integration audit event below.
-  allowCarrierNatEgress: z.boolean().optional()
+  allowCarrierNatEgress: z.boolean().optional(),
+  // #10054 — store allowed DNS queries too. Default absent = blocked and
+  // redirected events only. Editable later through PATCH /integrations/:id.
+  storeAllowedTraffic: z.boolean().optional()
 });
 
 const createIntegrationSchema = z.object({
@@ -260,7 +330,15 @@ const createIntegrationSchema = z.object({
   }
 });
 
+// #10931 — the org selected in the switcher; see resolveReadOrgScope.
+const readOrgIdSchema = z.string().guid().optional();
+
+const orgOnlyQuerySchema = z.object({
+  orgId: readOrgIdSchema
+});
+
 const listEventsQuerySchema = z.object({
+  orgId: readOrgIdSchema,
   start: z.string().optional(),
   end: z.string().optional(),
   action: z.enum(dnsActionEnum.enumValues).optional(),
@@ -269,10 +347,13 @@ const listEventsQuerySchema = z.object({
   deviceId: z.string().guid().optional(),
   integrationId: z.string().guid().optional(),
   limit: z.coerce.number().int().min(1).max(500).optional(),
-  offset: z.coerce.number().int().min(0).optional()
+  offset: z.coerce.number().int().min(0).optional(),
+  // Opaque keyset cursor from a previous page's `pagination.nextCursor` (#10054).
+  cursor: z.string().min(1).max(512).optional()
 });
 
 const statsQuerySchema = z.object({
+  orgId: readOrgIdSchema,
   start: z.string().optional(),
   end: z.string().optional(),
   integrationId: z.string().guid().optional(),
@@ -283,6 +364,7 @@ const statsQuerySchema = z.object({
 });
 
 const topBlockedQuerySchema = z.object({
+  orgId: readOrgIdSchema,
   start: z.string().optional(),
   end: z.string().optional(),
   limit: z.coerce.number().int().min(1).max(100).optional()
@@ -326,11 +408,16 @@ dnsSecurityRoutes.get(
   // event/stat routes and the web/AI entry points instead of allowing every
   // authenticated tenant member to enumerate provider and sync metadata.
   requirePermission(PERMISSIONS.DEVICES_READ.resource, PERMISSIONS.DEVICES_READ.action),
+  zValidator('query', orgOnlyQuerySchema),
   async (c) => {
     const auth = c.get('auth');
+    const scope = resolveReadOrgScope(auth, c.req.valid('query').orgId);
+    if ('error' in scope) {
+      return c.json({ error: scope.error }, scope.status);
+    }
 
     const conditions: SQL[] = [];
-    withOrgCondition(conditions, auth.orgCondition(dnsFilterIntegrations.orgId));
+    withOrgCondition(conditions, scope.orgCondition(dnsFilterIntegrations.orgId));
 
     const integrations = await db
       .select({
@@ -371,6 +458,8 @@ dnsSecurityRoutes.post(
     if ('error' in orgResult) {
       return c.json({ error: orgResult.error }, orgResult.status);
     }
+    // canAccessOrg is true for system scope: the holding org is never a target.
+    if (await isHoldingOrg(orgResult.orgId)) return c.json(PROTECTED_ORG_ERROR, 409);
 
     const [integration] = await db
       .insert(dnsFilterIntegrations)
@@ -419,7 +508,8 @@ dnsSecurityRoutes.post(
         syncScheduled,
         // Record the carrier-NAT egress opt-in explicitly so enabling it leaves
         // an audit trail, not just a config blob.
-        allowCarrierNatEgress: body.config?.allowCarrierNatEgress === true
+        allowCarrierNatEgress: body.config?.allowCarrierNatEgress === true,
+        storeAllowedTraffic: storesAllowedTraffic(body.config)
       }
     });
 
@@ -451,7 +541,9 @@ dnsSecurityRoutes.delete(
       .select({
         id: dnsFilterIntegrations.id,
         orgId: dnsFilterIntegrations.orgId,
-        name: dnsFilterIntegrations.name
+        name: dnsFilterIntegrations.name,
+        isActive: dnsFilterIntegrations.isActive,
+        lastSyncStatus: dnsFilterIntegrations.lastSyncStatus
       })
       .from(dnsFilterIntegrations)
       .where(and(...conditions))
@@ -461,21 +553,141 @@ dnsSecurityRoutes.delete(
       return c.json({ error: 'Integration not found' }, 404);
     }
 
-    await db.transaction(async (tx) => {
-      await tx.delete(dnsPolicies).where(eq(dnsPolicies.integrationId, integration.id));
-      await tx.delete(dnsSecurityEvents).where(eq(dnsSecurityEvents.integrationId, integration.id));
-      await tx.delete(dnsFilterIntegrations).where(eq(dnsFilterIntegrations.id, integration.id));
-    });
+    // #10019 — two-phase delete. An integration's history can be tens of
+    // millions of event and aggregation rows; deleting them inside this request
+    // ran for minutes and deadlocked with the sync worker still inserting for
+    // the same integration. Here we only stop the integration (the sync job
+    // skips inactive rows) and mark it; the rows go in batches in
+    // jobs/dnsSecurityRetention.ts, which then removes the integration itself.
+    // A repeat DELETE on a row already being deleted just re-queues the job
+    // (which is idempotent). The UI disables the button on a deleting row, so
+    // that is an API-only recovery; the nightly sweep re-queues it otherwise.
+    const alreadyDeleting = !integration.isActive
+      && integration.lastSyncStatus === DNS_INTEGRATION_DELETING_STATUS;
+    if (!alreadyDeleting) {
+      await db
+        .update(dnsFilterIntegrations)
+        .set({ isActive: false, lastSyncStatus: DNS_INTEGRATION_DELETING_STATUS, updatedAt: new Date() })
+        .where(eq(dnsFilterIntegrations.id, integration.id));
+    }
+
+    // Enqueue only once the deactivation has COMMITTED, so the job never reads
+    // the row as still active. Fire-and-forget: if Redis is unavailable the
+    // failure goes to Sentry and the nightly retention sweep re-enqueues every
+    // row still marked deleting.
+    runAfterDbContextCommit('dnsSecurity.integrationDelete', () =>
+      enqueueDnsIntegrationDelete(integration.id).catch((error) => {
+        console.error(
+          `[dns-security] Background delete of integration ${integration.id} was not queued; ` +
+          'the nightly retention sweep will retry it:',
+          error
+        );
+        captureException(error);
+      })
+    );
+
+    if (!alreadyDeleting) {
+      writeRouteAudit(c, {
+        orgId: integration.orgId,
+        action: 'dns.integration.delete',
+        resourceType: 'dns_integration',
+        resourceId: integration.id,
+        resourceName: integration.name,
+        details: { mode: 'background' }
+      });
+    }
+
+    return c.json({ success: true, id: integration.id, status: DNS_INTEGRATION_DELETING_STATUS }, 202);
+  }
+);
+
+const updateIntegrationSchema = z.object({
+  // null clears the override, so the deployment default
+  // (DNS_SECURITY_RETENTION_DAYS_DEFAULT, 90 days) applies.
+  retentionDays: z.number().int().min(1).max(365).nullable().optional(),
+  // #10054 — store allowed DNS queries too (default: blocked + redirected
+  // only). false removes the key, so the default applies. Future syncs only:
+  // turning it off does not delete allowed rows already stored.
+  storeAllowedTraffic: z.boolean().optional()
+}).strict().refine(
+  (body) => body.retentionDays !== undefined || body.storeAllowedTraffic !== undefined,
+  { message: 'Provide retentionDays or storeAllowedTraffic' }
+);
+
+// #10020 / #10054 — the integration fields editable after create are what
+// Breeze stores for it: the retention window and the allowed-traffic opt-in.
+// Strict schema: credentials and provider config are not editable here
+// (re-create the integration to change them).
+dnsSecurityRoutes.patch(
+  '/integrations/:id',
+  requireScope('organization', 'partner', 'system'),
+  requirePermission(PERMISSIONS.ORGS_WRITE.resource, PERMISSIONS.ORGS_WRITE.action),
+  requireMfa(),
+  requireOrgWideIntegrationAccess,
+  zValidator('json', updateIntegrationSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const integrationId = c.req.param('id')!;
+    const body = c.req.valid('json');
+
+    const conditions: SQL[] = [eq(dnsFilterIntegrations.id, integrationId)];
+    withOrgCondition(conditions, auth.orgCondition(dnsFilterIntegrations.orgId));
+
+    const [integration] = await db
+      .select({
+        id: dnsFilterIntegrations.id,
+        orgId: dnsFilterIntegrations.orgId,
+        name: dnsFilterIntegrations.name,
+        config: dnsFilterIntegrations.config,
+        isActive: dnsFilterIntegrations.isActive,
+        lastSyncStatus: dnsFilterIntegrations.lastSyncStatus
+      })
+      .from(dnsFilterIntegrations)
+      .where(and(...conditions))
+      .limit(1);
+
+    if (!integration) {
+      return c.json({ error: 'Integration not found' }, 404);
+    }
+    if (!integration.isActive && integration.lastSyncStatus === DNS_INTEGRATION_DELETING_STATUS) {
+      return c.json({ error: 'Integration is being deleted' }, 409);
+    }
+
+    const previous = (integration.config ?? {}) as DnsIntegrationConfig;
+    const config: DnsIntegrationConfig = { ...previous };
+    const details: Record<string, { from: unknown; to: unknown }> = {};
+
+    if (body.retentionDays !== undefined) {
+      if (body.retentionDays === null) delete config.retentionDays;
+      else config.retentionDays = body.retentionDays;
+      details.retentionDays = { from: previous.retentionDays ?? null, to: body.retentionDays };
+    }
+    if (body.storeAllowedTraffic !== undefined) {
+      // Only an explicit true is stored; off removes the key (the default).
+      if (body.storeAllowedTraffic) config.storeAllowedTraffic = true;
+      else delete config.storeAllowedTraffic;
+      details.storeAllowedTraffic = { from: storesAllowedTraffic(previous), to: body.storeAllowedTraffic };
+    }
+
+    await db
+      .update(dnsFilterIntegrations)
+      .set({ config, updatedAt: new Date() })
+      .where(eq(dnsFilterIntegrations.id, integration.id));
 
     writeRouteAudit(c, {
       orgId: integration.orgId,
-      action: 'dns.integration.delete',
+      action: 'dns.integration.update',
       resourceType: 'dns_integration',
       resourceId: integration.id,
-      resourceName: integration.name
+      resourceName: integration.name,
+      details
     });
 
-    return c.json({ success: true });
+    return c.json({
+      id: integration.id,
+      retentionDays: config.retentionDays ?? null,
+      storeAllowedTraffic: storesAllowedTraffic(config)
+    });
   }
 );
 
@@ -493,7 +705,9 @@ dnsSecurityRoutes.post(
     const [integration] = await db
       .select({
         id: dnsFilterIntegrations.id,
-        orgId: dnsFilterIntegrations.orgId
+        orgId: dnsFilterIntegrations.orgId,
+        isActive: dnsFilterIntegrations.isActive,
+        lastSyncStatus: dnsFilterIntegrations.lastSyncStatus
       })
       .from(dnsFilterIntegrations)
       .where(and(...conditions))
@@ -501,6 +715,9 @@ dnsSecurityRoutes.post(
 
     if (!integration) {
       return c.json({ error: 'Integration not found' }, 404);
+    }
+    if (!integration.isActive && integration.lastSyncStatus === DNS_INTEGRATION_DELETING_STATUS) {
+      return c.json({ error: 'Integration is being deleted' }, 409);
     }
 
     const jobId = await scheduleDnsEventSync(integration.id);
@@ -518,6 +735,10 @@ dnsSecurityRoutes.get(
   async (c) => {
     const auth = c.get('auth');
     const query = c.req.valid('query');
+    const scope = resolveReadOrgScope(auth, query.orgId);
+    if ('error' in scope) {
+      return c.json({ error: scope.error }, scope.status);
+    }
 
     const start = parseDateOrNull(query.start);
     if (query.start && !start) {
@@ -529,16 +750,30 @@ dnsSecurityRoutes.get(
       return c.json({ error: 'Invalid end date' }, 400);
     }
 
-    const windowError = validateTimeWindow(start, end);
-    if (windowError) {
-      return c.json({ error: windowError }, 400);
+    // #10054: a request with no `start` reads the last 7 days, not the org's
+    // whole history, and the 90-day ceiling covers an open-ended `start` too.
+    const window = resolveDnsEventsWindow(start, end);
+    if (!window.ok) {
+      return c.json({ error: window.error }, 400);
+    }
+
+    let cursor: DnsEventsCursor | null = null;
+    if (query.cursor !== undefined) {
+      if (query.offset !== undefined) {
+        return c.json({ error: 'cursor and offset cannot be combined' }, 400);
+      }
+      cursor = decodeDnsEventsCursor(query.cursor);
+      if (!cursor) {
+        return c.json({ error: 'Invalid cursor' }, 400);
+      }
     }
 
     const conditions: SQL[] = [];
-    withOrgCondition(conditions, auth.orgCondition(dnsSecurityEvents.orgId));
-    if (start) conditions.push(gte(dnsSecurityEvents.timestamp, start));
-    if (end) conditions.push(lte(dnsSecurityEvents.timestamp, end));
-    if (query.action) conditions.push(eq(dnsSecurityEvents.action, query.action));
+    withOrgCondition(conditions, scope.orgCondition(dnsSecurityEvents.orgId));
+    conditions.push(gte(dnsSecurityEvents.timestamp, window.start));
+    if (window.end) conditions.push(lte(dnsSecurityEvents.timestamp, window.end));
+    // Literal, so the blocked-only list can use the partial index under a cached plan.
+    if (query.action) conditions.push(dnsEventsActionCondition(query.action));
     if (query.category) conditions.push(eq(dnsSecurityEvents.category, query.category));
     if (query.deviceId) conditions.push(eq(dnsSecurityEvents.deviceId, query.deviceId));
     if (query.integrationId) conditions.push(eq(dnsSecurityEvents.integrationId, query.integrationId));
@@ -558,46 +793,27 @@ dnsSecurityRoutes.get(
 
     const limit = query.limit ?? 100;
     const offset = query.offset ?? 0;
-    const where = whereOrUndefined(conditions);
 
-    const [events, totalRows] = await Promise.all([
-      db
-        .select({
-          id: dnsSecurityEvents.id,
-          orgId: dnsSecurityEvents.orgId,
-          integrationId: dnsSecurityEvents.integrationId,
-          deviceId: dnsSecurityEvents.deviceId,
-          timestamp: dnsSecurityEvents.timestamp,
-          domain: dnsSecurityEvents.domain,
-          queryType: dnsSecurityEvents.queryType,
-          action: dnsSecurityEvents.action,
-          category: dnsSecurityEvents.category,
-          threatType: dnsSecurityEvents.threatType,
-          sourceIp: dnsSecurityEvents.sourceIp,
-          sourceHostname: dnsSecurityEvents.sourceHostname,
-          providerEventId: dnsSecurityEvents.providerEventId,
-          metadata: dnsSecurityEvents.metadata,
-          deviceHostname: devices.hostname
-        })
-        .from(dnsSecurityEvents)
-        .leftJoin(devices, eq(dnsSecurityEvents.deviceId, devices.id))
-        .where(where)
-        .orderBy(desc(dnsSecurityEvents.timestamp), desc(dnsSecurityEvents.id))
-        .limit(limit)
-        .offset(offset),
-      db
-        .select({ count: sql<number>`count(*)::int` })
-        .from(dnsSecurityEvents)
-        .where(where)
-    ]);
+    const page = await listDnsSecurityEventsPage({
+      where: whereOrUndefined(conditions),
+      limit,
+      cursor,
+      offset,
+    });
 
     return c.json({
-      data: events,
+      data: page.rows,
       pagination: {
         limit,
         offset,
-        total: Number(totalRows[0]?.count ?? 0)
-      }
+        total: page.total,
+        totalCapped: page.totalCapped,
+        nextCursor: page.nextCursor,
+      },
+      window: {
+        start: window.start.toISOString(),
+        end: window.end ? window.end.toISOString() : null,
+      },
     });
   }
 );
@@ -612,6 +828,10 @@ dnsSecurityRoutes.get(
   async (c) => {
     const auth = c.get('auth');
     const query = c.req.valid('query');
+    const scope = resolveReadOrgScope(auth, query.orgId);
+    if ('error' in scope) {
+      return c.json({ error: scope.error }, scope.status);
+    }
 
     const start = parseDateOrNull(query.start);
     if (query.start && !start) {
@@ -629,7 +849,7 @@ dnsSecurityRoutes.get(
     }
 
     const conditions: SQL[] = [];
-    withOrgCondition(conditions, auth.orgCondition(dnsSecurityEvents.orgId));
+    withOrgCondition(conditions, scope.orgCondition(dnsSecurityEvents.orgId));
     if (start) conditions.push(gte(dnsSecurityEvents.timestamp, start));
     if (end) conditions.push(lte(dnsSecurityEvents.timestamp, end));
     if (query.integrationId) conditions.push(eq(dnsSecurityEvents.integrationId, query.integrationId));
@@ -655,7 +875,7 @@ dnsSecurityRoutes.get(
 
     if (shouldUseAggregations(start, end)) {
       const aggConditions: SQL[] = [];
-      withOrgCondition(aggConditions, auth.orgCondition(dnsEventAggregations.orgId));
+      withOrgCondition(aggConditions, scope.orgCondition(dnsEventAggregations.orgId));
       if (start) aggConditions.push(gte(dnsEventAggregations.date, toDateKey(start)));
       if (end) aggConditions.push(lte(dnsEventAggregations.date, toDateKey(end)));
       if (query.integrationId) aggConditions.push(eq(dnsEventAggregations.integrationId, query.integrationId));
@@ -778,12 +998,11 @@ dnsSecurityRoutes.get(
         const blockedRate = summaryRow.totalQueries > 0
           ? Number(((summaryRow.blockedQueries / summaryRow.totalQueries) * 100).toFixed(2))
           : 0;
+        const allowedTraffic = await loadAllowedTrafficCoverage(scope.orgCondition, query.integrationId);
 
         return c.json({
-          summary: {
-            ...summaryRow,
-            blockedRate
-          },
+          summary: applyAllowedTrafficCoverage({ ...summaryRow, blockedRate }, allowedTraffic, query.action),
+          allowedTraffic,
           topBlockedDomains,
           topCategories,
           topDevices,
@@ -850,12 +1069,11 @@ dnsSecurityRoutes.get(
     const blockedRate = summaryRow.totalQueries > 0
       ? Number(((summaryRow.blockedQueries / summaryRow.totalQueries) * 100).toFixed(2))
       : 0;
+    const allowedTraffic = await loadAllowedTrafficCoverage(scope.orgCondition, query.integrationId);
 
     return c.json({
-      summary: {
-        ...summaryRow,
-        blockedRate
-      },
+      summary: applyAllowedTrafficCoverage({ ...summaryRow, blockedRate }, allowedTraffic, query.action),
+      allowedTraffic,
       topBlockedDomains,
       topCategories,
       topDevices,
@@ -876,6 +1094,10 @@ dnsSecurityRoutes.get(
   async (c) => {
     const auth = c.get('auth');
     const query = c.req.valid('query');
+    const scope = resolveReadOrgScope(auth, query.orgId);
+    if ('error' in scope) {
+      return c.json({ error: scope.error }, scope.status);
+    }
 
     const start = parseDateOrNull(query.start);
     if (query.start && !start) {
@@ -902,7 +1124,7 @@ dnsSecurityRoutes.get(
     }
 
     const conditions: SQL[] = [eq(dnsSecurityEvents.action, 'blocked')];
-    withOrgCondition(conditions, auth.orgCondition(dnsSecurityEvents.orgId));
+    withOrgCondition(conditions, scope.orgCondition(dnsSecurityEvents.orgId));
     if (start) conditions.push(gte(dnsSecurityEvents.timestamp, start));
     if (end) conditions.push(lte(dnsSecurityEvents.timestamp, end));
     if (allowedDeviceIds !== null) {
@@ -911,7 +1133,7 @@ dnsSecurityRoutes.get(
 
     if (shouldUseAggregations(start, end)) {
       const aggConditions: SQL[] = [];
-      withOrgCondition(aggConditions, auth.orgCondition(dnsEventAggregations.orgId));
+      withOrgCondition(aggConditions, scope.orgCondition(dnsEventAggregations.orgId));
       if (start) aggConditions.push(gte(dnsEventAggregations.date, toDateKey(start)));
       if (end) aggConditions.push(lte(dnsEventAggregations.date, toDateKey(end)));
       if (allowedDeviceIds !== null) {
@@ -968,10 +1190,15 @@ dnsSecurityRoutes.get(
   '/policies',
   requireScope('organization', 'partner', 'system'),
   requirePermission(PERMISSIONS.DEVICES_READ.resource, PERMISSIONS.DEVICES_READ.action),
+  zValidator('query', orgOnlyQuerySchema),
   async (c) => {
     const auth = c.get('auth');
+    const scope = resolveReadOrgScope(auth, c.req.valid('query').orgId);
+    if ('error' in scope) {
+      return c.json({ error: scope.error }, scope.status);
+    }
     const conditions: SQL[] = [];
-    withOrgCondition(conditions, auth.orgCondition(dnsPolicies.orgId));
+    withOrgCondition(conditions, scope.orgCondition(dnsPolicies.orgId));
 
     const policies = await db
       .select({
@@ -1008,12 +1235,26 @@ dnsSecurityRoutes.post(
   zValidator('json', createPolicySchema),
   async (c) => {
     const auth = c.get('auth');
+    // A DNS policy applies to the whole organization; a site- or
+    // device-restricted caller cannot create or edit it.
+    if (!canMutateOrgWideGovernance(auth)) {
+      return c.json({ error: SITE_CEILING_WRITE_DENIED_MESSAGE }, 403);
+    }
     const body = c.req.valid('json');
 
-    const orgResult = resolveOrgId(auth, body.orgId);
-    if ('error' in orgResult) {
-      return c.json({ error: orgResult.error }, orgResult.status);
+    // The owning org comes from the integration, not the request (#8329).
+    // Integrations are org-owned and a policy always targets one, so a
+    // partner user with several orgs needs no `orgId` in the body. An explicit
+    // `orgId` is still access-checked first and must match the integration.
+    if (body.orgId) {
+      const orgResult = resolveOrgId(auth, body.orgId);
+      if ('error' in orgResult) {
+        return c.json({ error: orgResult.error }, orgResult.status);
+      }
     }
+
+    const integrationConditions: SQL[] = [eq(dnsFilterIntegrations.id, body.integrationId)];
+    withOrgCondition(integrationConditions, auth.orgCondition(dnsFilterIntegrations.orgId));
 
     const [integration] = await db
       .select({
@@ -1021,16 +1262,20 @@ dnsSecurityRoutes.post(
         orgId: dnsFilterIntegrations.orgId
       })
       .from(dnsFilterIntegrations)
-      .where(
-        and(
-          eq(dnsFilterIntegrations.id, body.integrationId),
-          eq(dnsFilterIntegrations.orgId, orgResult.orgId)
-        )
-      )
+      .where(and(...integrationConditions))
       .limit(1);
 
-    if (!integration) {
+    // Same 404 for "does not exist" and "not yours", so integration IDs in
+    // other tenants cannot be probed. canAccessOrg re-checks the row's org on
+    // top of the scoped query.
+    if (!integration || !auth.canAccessOrg(integration.orgId)) {
       return c.json({ error: 'Integration not found' }, 404);
+    }
+
+    if (body.orgId && body.orgId !== integration.orgId) {
+      return c.json({
+        error: 'orgId does not match the organization that owns this integration; omit orgId to use the integration\'s organization'
+      }, 400);
     }
 
     const nowIso = new Date().toISOString();
@@ -1105,6 +1350,11 @@ dnsSecurityRoutes.patch(
   zValidator('json', patchPolicyDomainsSchema),
   async (c) => {
     const auth = c.get('auth');
+    // A DNS policy applies to the whole organization; a site- or
+    // device-restricted caller cannot create or edit it.
+    if (!canMutateOrgWideGovernance(auth)) {
+      return c.json({ error: SITE_CEILING_WRITE_DENIED_MESSAGE }, 403);
+    }
     const policyId = c.req.param('id')!;
     const body = c.req.valid('json');
 

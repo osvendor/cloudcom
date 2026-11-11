@@ -8,6 +8,11 @@
     "monitorLabel": "Monitor"
   },
   "list": {
+    "views": {
+      "ariaLabel": "Monitor views",
+      "all": "All monitors",
+      "needsConversion": "Needs conversion"
+    },
     "title": "Monitors",
     "description": "Watch a condition, respond on the device, notify, and escalate when it keeps happening.",
     "new": "New monitor",
@@ -32,7 +37,48 @@
     },
     "deleteConfirm": "Delete monitor {{name}}? Its alert rule and response automation are removed too.",
     "builtIn": "Built-in",
-    "builtInHint": "Provisioned by Breeze. Edit thresholds, disable it, or delete it — it will not come back."
+    "builtInHint": "Provisioned by Breeze. Edit thresholds, disable it, or delete it — it will not come back.",
+    "recommended": {
+      "title": "Recommended",
+      "description": "Attach the built-in monitors to a policy."
+    }
+  },
+  "lifecycle": {
+    "autoResolveOn": "On",
+    "autoResolveOff": "Off",
+    "rearmLabel": "Re-arm",
+    "rearmNewEvidence": "New evidence",
+    "rearmAfterDelay": "After N minutes",
+    "rearmAfterMinutes_one": "After {{count}} minute",
+    "rearmAfterMinutes_other": "After {{count}} minutes",
+    "rearmDelayLabel": "Re-arm after (minutes)",
+    "rearmHelp": "New evidence: only an event the closed alert has not seen re-opens it. After N minutes: older events can also re-open it once N minutes have passed since it closed.",
+    "inheritOption": "Inherit ({{value}}, {{source}})",
+    "inheritOptionPlain": "Inherit",
+    "sources": {
+      "org": "Org default",
+      "partner": "Partner default",
+      "builtin": "Built-in default"
+    },
+    "errors": {
+      "cooldown": "Enter a whole number from 0 to 1440.",
+      "cooldownOrInherit": "Enter a whole number from 0 to 1440, or leave it blank to inherit.",
+      "rearmDelay": "Enter a whole number of minutes from 1 to 1440."
+    }
+  },
+  "lifecycleDefaults": {
+    "title": "Lifecycle defaults",
+    "descriptionPartner": "The default for every organization's monitors. An organization can override it, and a monitor's own setting beats both.",
+    "descriptionOrg": "Overrides the partner default for this organization. Leave a field blank to inherit it. A monitor's own setting beats this.",
+    "readOnly": "You do not have permission to change the partner default.",
+    "saved": "Lifecycle defaults saved",
+    "saveAction": "Save defaults",
+    "overrideCount_one": "{{count}} monitor overrides this",
+    "overrideCount_other": "{{count}} monitors override this",
+    "errors": {
+      "load": "Could not load the lifecycle defaults.",
+      "save": "Could not save the lifecycle defaults."
+    }
   },
   "editor": {
     "attachedToPolicy": "Monitor created and attached to the policy",
@@ -44,11 +90,22 @@
     },
     "sections": {
       "watch": "What to watch",
-      "noise": "Severity & noise",
+      "lifecycle": "Alert lifecycle",
       "respond": "Respond",
       "notify": "Notify",
       "escalate": "Escalate to a human",
       "deployed": "Deployed to"
+    },
+    "lifecycle": {
+      "overrides": {
+        "org": "This monitor overrides the org default ({{value}})",
+        "partner": "This monitor overrides the partner default ({{value}})",
+        "builtin": "This monitor overrides the built-in default ({{value}})",
+        "unknown": "This monitor overrides the inherited default."
+      },
+      "partnerWideHint": "An organization with its own default uses that instead of the inherited value shown here.",
+      "inheritedUnavailable": "Could not load the inherited values. You can still save.",
+      "windowWarning": "The event window ({{window}} min) is shorter than the cooldown ({{cooldown}} min). A new event during the cooldown can age out of the window before the alert re-opens."
     },
     "tabs": {
       "settings": "Settings",
@@ -68,7 +125,8 @@
       "recurrenceThreshold": "Escalate after",
       "recurrenceWindowDays": "episodes within (days)",
       "pauseResponses": "Pause automatic responses until a person resets",
-      "aiAgent": "AI agent (enables AI triage responses)"
+      "aiAgent": "AI agent (enables AI triage responses)",
+      "psaBoard": "PSA board for alert tickets"
     },
     "deliveryModes": {
       "inherit": "Use routing rules",
@@ -88,14 +146,18 @@
       "create": "Create monitor",
       "test": "Test on a device",
       "deploy": "Deploy to…",
-      "delete": "Delete"
+      "delete": "Delete",
+      "backToMonitors": "Back to Monitors"
     },
     "errors": {
       "load": "Failed to load monitor",
       "save": "Failed to save monitor",
       "delete": "Failed to delete monitor",
       "test": "Test failed",
-      "generic": "Something went wrong"
+      "generic": "Something went wrong",
+      "invalidCondition": "Some condition values are missing or out of range. Nothing was saved.",
+      "invalidResponses": "Some response settings are missing or out of range. Nothing was saved.",
+      "restartServiceRequiresName": "Restart service requires a service name."
     },
     "saved": "Monitor saved",
     "deleted": "Monitor deleted",
@@ -109,7 +171,8 @@
     "testDialog": {
       "title": "Test on a device",
       "selectDevice": "Device",
-      "run": "Run test"
+      "run": "Run test",
+      "saveToTest": "Save to test your changes"
     },
     "deliveryPreview": {
       "selectOrg": "Select an organization to preview delivery.",
@@ -139,6 +202,40 @@
         "disabled": "disabled",
         "unavailable": "unavailable"
       }
+    },
+    "composite": {
+      "children": "Child conditions",
+      "add": "Add condition",
+      "matchLabel": "Match"
+    },
+    "restart": {
+      "label": "Restart service on the device",
+      "maxAttempts": "Maximum restart attempts",
+      "cooldownSeconds": "Restart cooldown (seconds)"
+    },
+    "networkCheckAsset": {
+      "label": "Asset",
+      "unbound": "No asset binding",
+      "failed": "Could not load assets",
+      "orgRequired": "Select organization ownership to bind an asset.",
+      "pingName": "Ping {{label}}"
+    },
+    "psaBoardDefault": "Use the connection’s default board",
+    "psaBoardHelp": "Alert tickets for this monitor are created on this board instead of the connection’s default.",
+    "psaBoardReadOnly": "Alert tickets go to PSA board #{{id}}",
+    "psaBoardUnavailable": "Could not load PSA boards, so the board override is unavailable right now.",
+    "clearsWhen": {
+      "title": "Clears when",
+      "hint": "Clears only on an event logged after the alert's trigger event.",
+      "noneHint": "No recovery condition is set, so the alert clears once the trigger stops matching.",
+      "add": "Add a recovery condition",
+      "removeCondition": "Remove",
+      "keepCustom": "Keep the custom condition",
+      "customTitle": "Custom recovery condition (API)",
+      "customHint": "This condition was set through the API and can't be edited here. Saving keeps it as it is.",
+      "replaceCustom": "Replace",
+      "invalid": "One of the recovery condition's values isn't valid.",
+      "customUnusable": "This condition can't be evaluated, so this monitor's alerts won't auto-resolve. Replace it to fix this."
     }
   },
   "kinds": {
@@ -152,7 +249,7 @@
     "service": "Service stopped",
     "process": "Process stopped",
     "process_resource": "Process resource",
-    "cert_expiry": "Certificate expiry",
+    "cert_expiry": "Agent mTLS certificate expiry",
     "bandwidth": "Bandwidth",
     "disk_io": "Disk I/O",
     "network_errors": "Network errors",
@@ -160,7 +257,10 @@
     "software_presence": "Software presence",
     "backup_continuity": "Backup continuity",
     "script": "Script check",
-    "network_check": "Network check"
+    "network_check": "Network check",
+    "hardware_health": "Hardware health",
+    "time_sync": "Time synchronization",
+    "container_image_currency": "Container image currency"
   },
   "fields": {
     "operator": "Comparison",
@@ -201,7 +301,20 @@
     "port": "Port",
     "expectStatus": "Expected status code",
     "pollingIntervalSeconds": "Poll every (seconds)",
-    "match": "Match"
+    "match": "Match",
+    "pingCount": "Echo requests",
+    "expectBanner": "Expected banner",
+    "httpMethod": "HTTP method",
+    "expectedBody": "Response must contain",
+    "followRedirects": "Follow redirects",
+    "verifySsl": "Verify TLS certificate",
+    "recordType": "Record type",
+    "expectedValue": "Expected value",
+    "nameserver": "Nameserver",
+    "degradedIsFailure": "Treat degraded as failure",
+    "maxResponseMs": "Fail when slower than (ms)",
+    "eventLogCollectionNoSource": "Information and Warning Application events are collected only from {{providers}}. Events from other sources match this rule only at Error or Critical level, unless an Event Logs configuration policy lists it (Configuration policy → Event Logs → Application providers).",
+    "eventLogCollectionSourceNotCollected": "The agent does not collect Information or Warning Application events from \"{{source}}\", unless an Event Logs configuration policy lists it (Configuration policy → Event Logs → Application providers). Otherwise, this rule only matches its Error or Critical events. Built-in providers: {{providers}}."
   },
   "operators": {
     "gt": "greater than",
@@ -225,6 +338,7 @@
     "system": "System"
   },
   "eventLevels": {
+    "info": "Information",
     "warning": "Warning",
     "error": "Error",
     "critical": "Critical"
@@ -257,7 +371,8 @@
   },
   "backupChecks": {
     "no_successful_backup": "No successful backup",
-    "consecutive_failures": "Consecutive failures"
+    "consecutive_failures": "Consecutive failures",
+    "completed_with_errors": "Completed with file errors"
   },
   "checkTypes": {
     "icmp_ping": "ICMP ping",
@@ -275,6 +390,7 @@
       "device_group": "a device group"
     },
     "selectPolicy": "Configuration policy",
+    "attachToPolicy": "Attach to policy…",
     "selectTarget": "Target",
     "noOrgSelected": "Select an organization to deploy to.",
     "policyName": "Policy name",
@@ -283,9 +399,13 @@
     "cancel": "Cancel",
     "detachConfirm": "Detach from {{policy}}?",
     "errors": {
+      "loadGroups": "Couldn't load device groups.",
       "attach": "Failed to attach monitor",
-      "detach": "Failed to detach monitor"
-    }
+      "detach": "Failed to detach monitor",
+      "linkedFeature": "This policy's monitors come from a shared feature policy. Edit that policy or choose another one."
+    },
+    "partnerWideGroups": "All orgs (partner-wide)",
+    "organizationGroups": "Organization groups"
   },
   "policyTab": {
     "title": "Monitors",
@@ -313,7 +433,7 @@
   "legacy": {
     "title": "Legacy alert rules",
     "description": "Standalone alert rules that are not managed by a monitor. Convert them to get responses, delivery and escalation in one place.",
-    "empty": "No legacy rules.",
+    "empty": "No standalone alert rules need conversion.",
     "columns": {
       "name": "Name",
       "template": "Template",
@@ -324,9 +444,30 @@
     "convert": "Convert to monitor",
     "converted": "Converted",
     "notConvertible": "This rule's conditions cannot be expressed as a single monitor.",
+    "systemManaged": "System-managed rule. Breeze raises this alert itself, so there is nothing to convert.",
     "errors": {
       "fetch": "Failed to load alert rules",
       "convert": "Failed to convert rule"
+    }
+  },
+  "builtInRules": {
+    "title": "Built-in alerts",
+    "description": "Alerts Breeze raises itself. Switch one off to stop that alert for its organization; alerts already open stay open until you resolve them.",
+    "columns": {
+      "name": "Name",
+      "organization": "Organization",
+      "active": "Active"
+    },
+    "kinds": {
+      "policyViolation": "Policy violations: {{subject}}",
+      "configCompliance": "Configuration compliance: {{subject}}"
+    },
+    "toggle": "Switch {{name}} on or off",
+    "switchedOn": "{{name}} switched on",
+    "switchedOff": "{{name}} switched off",
+    "errors": {
+      "fetch": "Failed to load built-in alerts",
+      "toggle": "Failed to update built-in alert"
     }
   },
   "devices": {
@@ -385,5 +526,218 @@
         "skippedNoResponse": "Skipped (no response configured)"
       }
     }
+  },
+  "conversion": {
+    "banner": {
+      "rowsCount_one": "{{count}} legacy rule",
+      "rowsCount_other": "{{count}} legacy rules",
+      "policiesCount_one": "{{count}} policy",
+      "policiesCount_other": "{{count}} policies",
+      "text": "{{rows}} across {{policies}} have not been converted to monitors.",
+      "review": "Review",
+      "convertEverything": "Convert everything…",
+      "confirmTitle": "Convert every legacy rule, watch and alert-triggered automation across all your policies?",
+      "confirmBody": "{{rows}} in {{policies}} across the whole partner. Converted rows retire in place. Unconvertible rows remain for review or manual retirement now; a future release converts leftovers and retires those it cannot convert.",
+      "confirmRun": "Convert everything",
+      "convertedAll": "Converted {{rows}} across {{policies}}; {{unconvertible}} could not be converted.",
+      "errors": {
+        "convertAll": "Failed to convert everything"
+      }
+    },
+    "pendingPolicies": {
+      "title": "Policies with legacy rules",
+      "loading": "Loading policies…",
+      "empty": "No policy carries inline alert rules, watches or alert-triggered automations.",
+      "error": "Couldn't load the policies with legacy rules. Refresh to try again."
+    },
+    "title": "Needs conversion",
+    "description": "Inline alert rules, service/process watches and alert-triggered automations on this policy have not been converted to monitors yet. Converting retires the source row in place; nothing is deleted.",
+    "checking": "Checking devices…",
+    "devicesChecked_one": "{{count}} device checked for identical behavior.",
+    "devicesChecked_other": "{{count}} devices checked for identical behavior.",
+    "blocked": {
+      "parent_unconverted": "Convert the parent policy first — its inline rules decide what this policy inherits.",
+      "prerequisite_missing": "A prerequisite fix is not deployed on this server yet. Conversion is disabled until it is."
+    },
+    "refusedTitle_one": "Conversion refused: {{count}} device would change behavior.",
+    "refusedTitle_other": "Conversion refused: {{count}} devices would change behavior.",
+    "convert": "Convert",
+    "convertAll_one": "Convert {{count}} convertible",
+    "convertAll_other": "Convert all {{count}} convertible",
+    "retire": "Retire",
+    "converted": "Converted {{rows}} legacy rows into {{monitors}} monitors.",
+    "retired": "Retired {{name}}.",
+    "undone_one": "Reverted {{count}} conversion.",
+    "undone_other": "Reverted {{count}} conversions.",
+    "openAlerts_one": "{{count}} open alert moves to the monitor",
+    "openAlerts_other": "{{count}} open alerts move to the monitor",
+    "sourceTables": {
+      "config_policy_alert_rules": "Inline alert rule",
+      "config_policy_monitoring_watches": "Service/process watch",
+      "alert_templates": "Alert template",
+      "automations": "Alert-triggered automation",
+      "config_policy_automations": "Policy automation",
+      "network_monitors": "Network check"
+    },
+    "outcomes": {
+      "convertible": "Convertible",
+      "unconvertible": "Cannot convert"
+    },
+    "roles": {
+      "primary": "Monitor",
+      "resource_cpu": "CPU monitor",
+      "resource_memory": "Memory monitor",
+      "response": "Response"
+    },
+    "reasons": {
+      "unknown": "Cannot convert ({{code}}).",
+      "nested_group": "The rule nests condition groups; a composite monitor is one flat group.",
+      "no_condition": "The template has no evaluable condition and never fired.",
+      "escalation_policy_axis": "The escalation policy is org-owned but the policy is partner-wide.",
+      "custom": "Custom conditions have no monitor kind.",
+      "process_count": "Process-count conditions have no monitor kind."
+    },
+    "errors": {
+      "preview": "Failed to load the conversion preview",
+      "convert": "Failed to convert",
+      "retire": "Failed to retire",
+      "revert": "Failed to revert the conversion"
+    },
+    "ledger": {
+      "title": "Conversion history",
+      "undo": "Undo",
+      "more": "Load more",
+      "empty": "No conversion history.",
+      "system": "System",
+      "unknownUser": "Unknown user",
+      "reverted": "Reverted",
+      "deadline": "Undo is unavailable after the legacy alerting retirement removes the source runtime."
+    },
+    "errorCodes": {
+      "preview_stale": "The policy changed since this preview. Preview again before converting.",
+      "conversion_contended": "Other changes were happening at the same time, so the conversion did not complete. Nothing was changed. Try again.",
+      "preview_failed": "The preview could not be produced. Try again later.",
+      "equivalence_delta": "The converted monitors would not behave like the legacy rules on every device. Review the preview before converting.",
+      "CONVERSION_PREREQUISITE_MISSING": "A required platform update has not been deployed yet, so this cannot be converted.",
+      "blocked": "This conversion is blocked. Convert the parent policy first, then try again.",
+      "already_converted": "These rules were already converted. Refresh to see the current state.",
+      "partner_wide_denied": "Full partner access is required to convert partner-wide policies.",
+      "policy_not_found": "The policy was not found. It may have been deleted.",
+      "source_not_found": "The legacy rule was not found. It may already be converted or deleted.",
+      "conversion_not_found": "That conversion was not found.",
+      "conversion_revert_unavailable": "This conversion can no longer be undone.",
+      "invalid_reason": "That retirement reason is not valid.",
+      "unknown": "The conversion failed. Try again."
+    },
+    "retirement": {
+      "summary_one": "{{count}} legacy rule could not be converted to a monitor — review it.",
+      "summary_other": "{{count}} legacy rules could not be converted to monitors — review them.",
+      "review": "Review",
+      "dismiss": "Dismiss",
+      "openAlertsNote": "These rules no longer fire. Their open alerts stay open until someone resolves them; recreate the condition as a monitor if it is still needed.",
+      "reasons": {
+        "custom_condition": "custom condition",
+        "nested_group": "nested condition group",
+        "no_condition": "no evaluable condition",
+        "equivalence_delta": "conversion would change what fires on some devices",
+        "escalation_policy_axis": "escalation policy belongs to a single organization",
+        "parent_unconverted": "parent policy was not converted",
+        "policy_inactive": "policy is inactive or archived",
+        "prerequisite_missing": "a prerequisite fix is missing on this server",
+        "metric_without_kind": "metric has no monitor kind",
+        "child_kind_not_composable": "condition cannot be part of a composite monitor",
+        "too_many_conditions": "too many conditions",
+        "too_many_responses": "more than ten responses would be required",
+        "auto_resolve_conditions": "custom resolution conditions cannot be preserved",
+        "target_unconvertible": "the response target cannot be converted",
+        "already_managed": "already managed by a monitor",
+        "no_org": "check does not belong to an organization",
+        "asset_missing": "the linked discovered asset no longer exists",
+        "condition_invalid": "check settings do not form a valid monitor condition",
+        "no_active_rules": "check has no active alert rule",
+        "multiple_network_rules": "check has more than one active alert rule",
+        "network_predicate_unsupported": "alert condition has no monitor equivalent",
+        "network_threshold_out_of_range": "failure threshold is out of range (at most 100 consecutive failures)",
+        "site_binding_unrepresentable": "site-bound check is not linked to a discovered asset",
+        "config_override_unrepresentable": "custom target or timeout override cannot be preserved",
+        "built_in": "built-in system rule; it keeps alerting on its own",
+        "no_rules": "template has no rules to convert",
+        "target_or_owner": "a rule's target or owner differs from its template",
+        "blocked": "conversion is blocked",
+        "disabled_response_automation": "response automation is disabled",
+        "alert_workflow_kept": "alert workflow kept as is",
+        "unknown": "conversion was refused; review the source"
+      }
+    }
+  },
+  "device": {
+    "title": "Effective monitors",
+    "empty": "No monitors apply to this device.",
+    "error": "Could not load effective monitors.",
+    "monitor": "Monitor",
+    "kind": "Kind",
+    "policy": "Source policy",
+    "state": "State",
+    "episode": "Open episode",
+    "escalation": "Escalation"
+  },
+  "monitors": {
+    "fields": {
+      "hardware_health": {
+        "componentTypes": "Components",
+        "minHealth": "Minimum health",
+        "includePredictiveFailure": "Include predictive failure",
+        "consecutiveSnapshots": "Consecutive snapshots",
+        "componentTypeOptions": {
+          "controller": "Controllers",
+          "virtual_disk": "Virtual disks",
+          "physical_disk": "Physical disks",
+          "cache_battery": "Cache batteries",
+          "enclosure": "Enclosures",
+          "collector": "Monitoring tools"
+        },
+        "minHealthOptions": {
+          "warning": "Warning",
+          "critical": "Critical"
+        }
+      },
+      "time_sync": {
+        "findings": "Findings",
+        "consecutiveSnapshots": "Consecutive snapshots",
+        "findingOptions": {
+          "pdc_no_external_source": "Forest root PDC has no external source",
+          "source_local_clock": "Using the local clock",
+          "dc_vm_host_sync": "DC is syncing with the VM host",
+          "ntp_server_unresolvable": "NTP server name is invalid or unresolved",
+          "ntp_peer_unreachable": "NTP peer is unreachable",
+          "domain_source_unavailable": "Domain time source unavailable",
+          "member_not_on_hierarchy": "Not using the domain hierarchy",
+          "sync_disabled": "Time synchronization is disabled",
+          "sync_stale": "No recent successful synchronization",
+          "correction_refused": "Time correction was refused",
+          "timezone_mismatch": "Timezone differs from expected",
+          "policy_not_applied": "Time policy was not applied",
+          "policy_conflict_gpo": "Group Policy controls time settings"
+        }
+      },
+      "container_image_currency": {
+        "minDaysBehind": "Minimum days behind"
+      }
+    }
+  },
+  "httpMethods": {
+    "GET": "GET (retrieve)",
+    "HEAD": "HEAD (headers only)",
+    "POST": "POST (submit)",
+    "PUT": "PUT (replace)",
+    "OPTIONS": "OPTIONS (capabilities)"
+  },
+  "dnsRecordTypes": {
+    "A": "A (IPv4 address)",
+    "AAAA": "AAAA (IPv6 address)",
+    "MX": "MX (mail server)",
+    "CNAME": "CNAME (alias)",
+    "TXT": "TXT (text)",
+    "NS": "NS (nameserver)"
   }
 }

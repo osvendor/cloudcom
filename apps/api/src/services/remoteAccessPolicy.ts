@@ -13,6 +13,8 @@ import { resolveEffectiveConfig } from './configurationPolicy';
 import { remoteAccessInlineSettingsSchema } from '@breeze/shared/validators';
 import type { AuthContext } from '../middleware/auth';
 import { getRemoteAccessBaseline } from './policyBaselineDefaults';
+import { db, runAfterDbContextExit, withDbTransaction } from '../db';
+import { isParkedDevice, PARKED_DEVICE_COMMAND_REFUSAL_CODE } from './unassignedPool/deliveryEligibility';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -43,6 +45,11 @@ export interface RemoteAccessSettings {
 export interface PolicyCheckResult {
   allowed: boolean;
   reason?: string;
+  /**
+   * Machine-readable refusal; set only for a device parked in a holding org.
+   * The same code the command-delivery refusal carries; routes pass it through.
+   */
+  code?: typeof PARKED_DEVICE_COMMAND_REFUSAL_CODE;
   policyName?: string;
   policyId?: string;
 }
@@ -53,6 +60,9 @@ export type RemoteCapability = 'webrtcDesktop' | 'vncRelay' | 'remoteTools' | 'p
 // clipboard direction (Finding #7) — live in policyBaselineDefaults.ts
 // (single source of truth, #1725).
 const DEFAULTS: RemoteAccessSettings = getRemoteAccessBaseline();
+
+const PARKED_DEVICE_REMOTE_REFUSAL =
+  'This device is waiting to be assigned to an organization; remote access is unavailable until then';
 
 const CAPABILITY_LABELS: Record<RemoteCapability, string> = {
   webrtcDesktop: 'Remote desktop',
@@ -133,33 +143,73 @@ export function clampSettings(
 }
 
 // ---------------------------------------------------------------------------
-// Cache — simple in-memory TTL (30 s)
+// Cache — in-memory, max age chosen per caller
 // ---------------------------------------------------------------------------
 
 interface CacheEntry {
   settings: RemoteAccessSettings;
   policyName: string | null;
   policyId: string | null;
-  expiresAt: number;
+  resolvedAt: number;
 }
 
 const cache = new Map<string, CacheEntry>();
-const CACHE_TTL_MS = 30_000;
+
+/**
+ * Default max age (30 s). Capability checks (`checkRemoteAccess`) and the
+ * desktop-session policy use it: a policy that switches a capability OFF must
+ * bite quickly.
+ */
+const DEFAULT_CACHE_MAX_AGE_MS = 30_000;
+
+/**
+ * #8053 — the heartbeat's max age. The heartbeat reads only `vncRelay` (whether
+ * the agent manages the remote-management tunnel), on a 60 s beat, so the 30 s
+ * default could never hit and every beat re-ran the full effective-config
+ * resolution inside the org transaction. Three minutes lets two beats in three
+ * reuse it. The policy CRUD, assignment and remote_access feature-link routes
+ * call `invalidateRemoteAccessCache()`, so on this process those changes land
+ * on the next beat. Everything else that can change a device's effective
+ * policy (device-group membership, a device moving site/org, writes on another
+ * API instance) is bounded by this max age instead. Never pass it from a
+ * capability gate.
+ */
+export const HEARTBEAT_REMOTE_ACCESS_MAX_AGE_MS = 180_000;
+
+// Entries are kept for the longest max age any caller may ask for.
+const CACHE_RETENTION_MS = Math.max(DEFAULT_CACHE_MAX_AGE_MS, HEARTBEAT_REMOTE_ACCESS_MAX_AGE_MS);
 
 // Sweep stale entries every 60 s
 setInterval(() => {
   const now = Date.now();
   for (const [key, entry] of cache) {
-    if (entry.expiresAt <= now) cache.delete(key);
+    if (now - entry.resolvedAt >= CACHE_RETENTION_MS) cache.delete(key);
   }
 }, 60_000).unref();
 
-export function invalidateRemoteAccessCache(deviceId?: string): void {
+// Bumped on every invalidation. A resolution that started before a bump still
+// answers its own caller but is not stored, so a read that saw pre-change rows
+// cannot repopulate the cache after the change invalidated it.
+let cacheGeneration = 0;
+
+function dropCached(deviceId?: string): void {
+  cacheGeneration += 1;
   if (deviceId) {
     cache.delete(deviceId);
   } else {
     cache.clear();
   }
+}
+
+/**
+ * Drop cached resolutions now AND again once the caller's DB transaction has
+ * settled. Policy routes call this from inside their request transaction,
+ * before COMMIT; without the second drop, a heartbeat resolving in that window
+ * would re-cache the pre-change policy for the heartbeat's whole max age.
+ */
+export function invalidateRemoteAccessCache(deviceId?: string): void {
+  dropCached(deviceId);
+  runAfterDbContextExit('remoteAccessPolicy.invalidateCache', () => dropCached(deviceId));
 }
 
 // ---------------------------------------------------------------------------
@@ -186,21 +236,37 @@ interface ResolvedRemoteAccess {
   settings: RemoteAccessSettings;
   policyName: string | null;
   policyId: string | null;
+  /**
+   * #8616: true when an effective config was found for the device (including
+   * "no remote_access policy applies", a real decision). False when it was not
+   * (e.g. the device is not visible), in which case `settings` are the
+   * defaults, not a decision; the heartbeat then retains the agent's state for
+   * a protocol-aware agent. Additive: existing callers keep reading `settings`.
+   */
+  resolved: boolean;
 }
 
 export async function resolveRemoteAccessForDevice(
   deviceId: string,
-  options: { bypassCache?: boolean } = {},
+  options: { bypassCache?: boolean; maxAgeMs?: number; savepoint?: boolean } = {},
 ): Promise<ResolvedRemoteAccess> {
   // Check cache
   const now = Date.now();
+  const maxAgeMs = Math.min(options.maxAgeMs ?? DEFAULT_CACHE_MAX_AGE_MS, CACHE_RETENTION_MS);
   const cached = options.bypassCache ? undefined : cache.get(deviceId);
-  if (cached && cached.expiresAt > now) {
-    return { settings: cached.settings, policyName: cached.policyName, policyId: cached.policyId };
+  if (cached && now - cached.resolvedAt < maxAgeMs) {
+    // Only resolutions that found an effective config are cached (below).
+    return { settings: cached.settings, policyName: cached.policyName, policyId: cached.policyId, resolved: true };
   }
 
   // Resolve via the generic config policy engine
-  const effective = await resolveEffectiveConfig(deviceId, systemAuth);
+  const generationAtStart = cacheGeneration;
+  // #8997: `savepoint` (caller must be inside a DB context) confines a failed
+  // read to a savepoint so a caller that catches the error does not leave the
+  // surrounding transaction aborted. Only the cache-miss path pays for it.
+  const effective = options.savepoint
+    ? await withDbTransaction(() => resolveEffectiveConfig(deviceId, systemAuth))
+    : await resolveEffectiveConfig(deviceId, systemAuth);
 
   let settings = { ...DEFAULTS };
   let policyName: string | null = null;
@@ -230,12 +296,13 @@ export async function resolveRemoteAccessForDevice(
     policyId = feature.sourcePolicyId ?? null;
   }
 
-  // Only cache successful resolutions (don't cache when device not found)
-  if (effective) {
-    cache.set(deviceId, { settings, policyName, policyId, expiresAt: now + CACHE_TTL_MS });
+  // Only cache successful resolutions (don't cache when device not found), and
+  // only when no invalidation landed while this one was in flight.
+  if (effective && generationAtStart === cacheGeneration) {
+    cache.set(deviceId, { settings, policyName, policyId, resolvedAt: now });
   }
 
-  return { settings, policyName, policyId };
+  return { settings, policyName, policyId, resolved: effective != null };
 }
 
 // ---------------------------------------------------------------------------
@@ -252,6 +319,17 @@ export async function checkRemoteAccess(
   let policyId: string | null = null;
 
   try {
+    // A device parked in its partner's holding org gets no remote capability,
+    // whatever the policy (none assigned means everything enabled). Asked on
+    // every call, never cached: a parked device can be assigned out of the
+    // holding org, and the answer must follow it immediately.
+    if (await isParkedDevice(db, deviceId)) {
+      return {
+        allowed: false,
+        code: PARKED_DEVICE_COMMAND_REFUSAL_CODE,
+        reason: PARKED_DEVICE_REMOTE_REFUSAL,
+      };
+    }
     const resolved = await resolveRemoteAccessForDevice(deviceId, options);
     settings = resolved.settings;
     policyName = resolved.policyName;
@@ -300,7 +378,8 @@ export interface DesktopSessionPolicy {
 
 // Safe-but-restrictive policy shipped to the agent when policy resolution
 // fails. Clipboard is OFF in both directions (no silent exfil, no paste) and
-// the session gets a short idle timeout + the default max duration so a
+// the session gets a 5-minute idle timeout (deliberately shorter than the
+// 30-minute baseline in policyBaselineDefaults.ts) + the default max duration so a
 // resolution outage can't leave a long-lived, fully-permissive session. The
 // capability gate itself is already enforced fail-closed by `checkRemoteAccess`
 // (which the offer handlers call first), so this only governs the in-session

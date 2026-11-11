@@ -8,6 +8,7 @@ import { showToast } from '../shared/Toast';
 
 vi.mock('../../stores/auth', () => ({
   fetchWithAuth: vi.fn(),
+  registerOrgIdProvider: vi.fn(),
   useAuthStore: (sel: (s: { tokens: null; user: undefined }) => unknown) => sel({ tokens: null, user: undefined }),
 }));
 vi.mock('../../hooks/useEventStream', () => ({ useEventStream: () => ({ subscribe: vi.fn() }) }));
@@ -20,8 +21,6 @@ vi.mock('../../services/deviceActions', () => ({
   exitMaintenanceMode: vi.fn(),
   decommissionDevice: vi.fn(),
   clearDeviceSessions: vi.fn(),
-  restoreDevice: vi.fn(),
-  permanentDeleteDevice: vi.fn(),
   sendWakeCommand: vi.fn(),
   watchWakeOutcome: vi.fn(),
   WakeCommandError: class WakeCommandError extends Error {},

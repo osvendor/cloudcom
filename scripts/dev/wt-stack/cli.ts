@@ -1,12 +1,16 @@
 // scripts/dev/wt-stack/cli.ts
 import { execFileSync } from 'node:child_process';
-import { deriveProjectName, descriptorPath } from './project';
-import { writeDescriptor, readDescriptor, type StackDescriptor } from './descriptor';
-import { writeEnvStack, readStackEnvValue } from './env';
-import { composeUp, waitHealthy, publishedPort, containerName, seedDatabase, composeDown } from './compose';
+import { resolveProject, assertCaddyPortAvailable, descriptorPath, SHARED_PROJECT } from './project';
+import { downStack } from './down';
+import { writeDescriptor, readDescriptor, readRecordedProject, removeDescriptor } from './descriptor';
+import { writeEnvStack, readStackEnvValue, pinWebAuthnForStack, caddyPortPin } from './env';
+import {
+  composeUp, waitHealthy, publishedPort, containerName, seedDatabase, composeDown, recreateService,
+  listBreezeProjects, composeProjectExists, portOwners,
+} from './compose';
+import { upStack } from './up';
 
 const ADMIN = { email: 'admin@breeze.local', password: 'BreezeAdmin123!' };
-const HEALTH_SERVICES = ['postgres', 'redis', 'api', 'web', 'portal', 'caddy'];
 
 function currentBranch(): string | undefined {
   try {
@@ -17,25 +21,22 @@ function currentBranch(): string | undefined {
 
 function up(shared: boolean, rebuild: boolean): void {
   const worktreePath = process.cwd();
-  const project = deriveProjectName({ worktreePath, branch: currentBranch(), shared });
-  console.log(`[wt-stack] project=${project} engine=${dockerContext()}`);
-  writeEnvStack(worktreePath);
-  composeUp(project, { rebuild });
-  waitHealthy(project, HEALTH_SERVICES, 5 * 60_000);
-  seedDatabase(project);
-  const caddyPort = publishedPort(project, 'caddy', 80);
-  const baseUrl = `http://localhost:${caddyPort}`;
-  const descriptor: StackDescriptor = {
-    project,
-    baseUrl,
-    apiUrl: `${baseUrl}/api`,
-    portalUrl: `${baseUrl}/portal`,
-    webPort: caddyPort,
-    pgContainer: containerName(project, 'postgres'),
-    redisContainer: containerName(project, 'redis'),
-    admin: ADMIN,
-  };
-  writeDescriptor(worktreePath, descriptor);
+  // #9864 — reuse the project this worktree's descriptor recorded, so a
+  // checkout (detached HEAD, branch switch) re-ups the same stack, not a second one.
+  // A descriptor left by `up --shared` does not pull a plain `up` onto the
+  // shared stack (pre-#9864 behaviour); `down` still insists on --shared.
+  const recorded = readRecordedProject(worktreePath);
+  const { project, source } = resolveProject({
+    worktreePath, shared, recordedProject: recorded === SHARED_PROJECT ? null : recorded,
+    override: process.env.BREEZE_WT_PROJECT,
+  });
+  console.log(`[wt-stack] project=${project} (from ${source}) engine=${dockerContext()}`);
+  const pinnedCaddyPort = caddyPortPin();
+  if (pinnedCaddyPort !== null) assertCaddyPortAvailable(pinnedCaddyPort, project, portOwners(pinnedCaddyPort));
+  const descriptor = upStack({ worktreePath, project, rebuild, admin: ADMIN, pinnedCaddyPort }, {
+    writeEnvStack, composeUp, waitHealthy, seedDatabase, publishedPort,
+    pinWebAuthnForStack, recreateService, containerName, writeDescriptor,
+  });
   console.log(JSON.stringify(descriptor, null, 2));
 }
 
@@ -49,8 +50,13 @@ function info(): void {
 }
 
 function down(keepVolumes: boolean): void {
-  const project = deriveProjectName({ worktreePath: process.cwd(), branch: currentBranch(), shared: process.argv.includes('--shared') });
-  composeDown(project, !keepVolumes);
+  downStack({
+    worktreePath: process.cwd(), shared: process.argv.includes('--shared'), keepVolumes,
+    branch: currentBranch(), override: process.env.BREEZE_WT_PROJECT,
+  }, {
+    readRecordedProject, composeProjectExists, listBreezeProjects, composeDown, removeDescriptor,
+    log: (m) => console.log(m),
+  });
 }
 
 function test(passthrough: string[]): void {
@@ -108,4 +114,9 @@ function main(): void {
   }
 }
 
-main();
+try {
+  main();
+} catch (err) {
+  console.error(err instanceof Error ? err.message : err);
+  process.exit(1);
+}

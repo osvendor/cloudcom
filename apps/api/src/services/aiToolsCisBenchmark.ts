@@ -8,6 +8,7 @@
  */
 
 import { db } from '../db';
+import { pageEnvelope, pageParamSchema, readPageArgs } from './aiToolPagination';
 import {
   devices,
   cisBaselines,
@@ -26,6 +27,9 @@ import {
   runFrozenDeviceIds,
   SITE_SCOPE_EMPTY_NOTE,
 } from './aiToolsSiteScope';
+// #6911: apply_cis_remediation writes auth.user.id into cis_remediation_actions.approved_by/requested_by, a users FK; refused on an approver-release mismatch.
+import { approverReleaseMismatch } from './aiToolReleaseGuards';
+import { notParkedDeviceCondition } from './unassignedPool/selectorPredicate';
 
 type AiToolTier = 1 | 2 | 3 | 4;
 
@@ -42,7 +46,7 @@ async function verifyDeviceAccess(
   if (auth.allowedDeviceIds && !auth.allowedDeviceIds.includes(deviceId)) {
     return { error: 'Device not found or access denied' };
   }
-  const conditions: SQL[] = [eq(devices.id, deviceId)];
+  const conditions: SQL[] = [eq(devices.id, deviceId), notParkedDeviceCondition()];
   const orgCond = auth.orgCondition(devices.orgId);
   if (orgCond) conditions.push(orgCond);
   const [device] = await db.select().from(devices).where(and(...conditions)).limit(1);
@@ -84,11 +88,19 @@ registerTool({
         osType: { type: 'string', enum: ['windows', 'macos', 'linux'], description: 'Filter by operating system' },
         minScore: { type: 'number', description: 'Minimum score filter (0-100)' },
         maxScore: { type: 'number', description: 'Maximum score filter (0-100)' },
-        limit: { type: 'number', description: 'Max results (default 100, max 500)' },
+        includeSummary: { type: 'boolean', description: 'Include the per-device summary object (default false)' },
+        ...pageParamSchema(12, 500),
       },
     },
   },
   handler: async (input, auth) => {
+    // A-W05 (5c follow-up): the plan's default of 25 measured 12 568 raw
+    // chars for realistic rows (baseline/device metadata, no per-row
+    // summary) — over the 8 000 budget. 12 measured 6 516; lowered.
+    const page = readPageArgs('get_cis_compliance', input, { defaultLimit: 12, maxLimit: 500 });
+    if (!page.ok) return JSON.stringify({ error: page.error, code: page.code });
+    const { limit, offset, fingerprint } = page;
+    const includeSummary = input.includeSummary === true;
     const conditions: SQL[] = [];
     const orgCondition = auth.orgCondition(cisBaselineResults.orgId);
     if (orgCondition) conditions.push(orgCondition);
@@ -116,7 +128,7 @@ registerTool({
       count: 0,
       totalMatched: 0,
       summary: { averageScore: 100, devicesAudited: 0, failingDevices: 0, compliantDevices: 0 },
-      results: [],
+      ...pageEnvelope({ key: 'results', items: [] as unknown[], limit, offset, fingerprint, total: 0 }),
       scopeNote: SITE_SCOPE_EMPTY_NOTE,
     });
     if (auth.allowedSiteIds && auth.canAccessSite) {
@@ -191,7 +203,8 @@ registerTool({
       .from(rankedResults)
       .where(and(...latestConditions));
 
-    const limit = Math.min(Math.max(1, Number(input.limit) || 100), 500);
+    // A-W05 (5c): offset mode; `summary` (jsonb) is included only when
+    // `includeSummary` is set.
     const rows = await db
       .select({
         orgId: rankedResults.orgId,
@@ -214,8 +227,9 @@ registerTool({
       })
       .from(rankedResults)
       .where(and(...latestConditions))
-      .orderBy(desc(rankedResults.checkedAt))
-      .limit(limit);
+      .orderBy(desc(rankedResults.checkedAt), desc(rankedResults.resultId))
+      .limit(limit)
+      .offset(offset);
 
     const items = rows.map((row) => ({
       orgId: row.orgId,
@@ -234,7 +248,7 @@ registerTool({
       totalChecks: row.totalChecks,
       passedChecks: row.passedChecks,
       failedChecks: row.failedChecks,
-      summary: row.summary ?? {},
+      ...(includeSummary ? { summary: row.summary ?? {} } : {}),
     }));
 
     const totalMatched = Number(summaryRow?.total ?? 0);
@@ -249,7 +263,7 @@ registerTool({
         count: 0,
         totalMatched: 0,
         summary: { averageScore: 100, devicesAudited: 0, failingDevices: 0, compliantDevices: 0 },
-        results: [],
+        ...pageEnvelope({ key: 'results', items: [] as unknown[], limit, offset, fingerprint, total: 0 }),
       });
     }
 
@@ -262,7 +276,7 @@ registerTool({
         failingDevices,
         compliantDevices: Math.max(0, totalMatched - failingDevices),
       },
-      results: items,
+      ...pageEnvelope({ key: 'results', items, limit, offset, fingerprint, total: totalMatched }),
     });
   },
 });
@@ -284,7 +298,7 @@ registerTool({
       properties: {
         deviceId: { type: 'string', description: 'Device UUID' },
         baselineId: { type: 'string', description: 'Optional baseline UUID filter' },
-        limit: { type: 'number', description: 'Number of recent reports to return (default 20, max 100)' },
+        limit: { type: 'number', description: 'Max recent reports (default 20, max 100)' },
       },
       required: ['deviceId'],
     },
@@ -371,7 +385,11 @@ registerTool({
       required: ['deviceId', 'checkIds'],
     },
   },
-  handler: async (input, auth) => {
+  handler: async (input, auth, context) => {
+    // #6911: user-owned on release — see approverReleaseMismatch.
+    if (approverReleaseMismatch(auth, context)) {
+      return JSON.stringify({ error: 'approver_auth_mismatch' });
+    }
     const deviceId = input.deviceId as string;
     const checkIdsRaw = Array.isArray(input.checkIds) ? input.checkIds : [];
     const checkIds = Array.from(new Set(checkIdsRaw.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)));

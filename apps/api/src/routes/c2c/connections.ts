@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import { zValidator } from '../../lib/validation';
 import { eq, and } from 'drizzle-orm';
-import { db } from '../../db';
+import { db, withDbTransaction } from '../../db';
 import { c2cConnections } from '../../db/schema';
 import { requireMfa, requirePermission } from '../../middleware/auth';
 import { writeRouteAudit } from '../../services/auditEvents';
@@ -12,6 +12,8 @@ import { createConnectionSchema, idParamSchema } from './schemas';
 import { resolveScopedOrgId, maskSecret } from './helpers';
 import { PERMISSIONS } from '../../services/permissions';
 
+import { isHoldingOrg } from '../../services/unassignedPool/protectedOrg';
+import { PROTECTED_ORG_ERROR } from '../../services/unassignedPool/orgType';
 export const connectionsRoutes = new Hono();
 const requireC2cRead = requirePermission(PERMISSIONS.ORGS_READ.resource, PERMISSIONS.ORGS_READ.action);
 const requireC2cWrite = requirePermission(PERMISSIONS.ORGS_WRITE.resource, PERMISSIONS.ORGS_WRITE.action);
@@ -65,6 +67,8 @@ connectionsRoutes.post(
     const auth = c.get('auth');
     const orgId = resolveScopedOrgId(auth, c.req.query('orgId'));
     if (!orgId) return c.json({ error: 'orgId is required for this scope' }, 400);
+    // canAccessOrg is true for system scope: the holding org is never a target.
+    if (await isHoldingOrg(orgId)) return c.json(PROTECTED_ORG_ERROR, 409);
 
     const payload = c.req.valid('json');
 
@@ -179,10 +183,11 @@ connectionsRoutes.post(
         if (tokenResult) {
           // Update stored token if refreshed (scoped to orgId for defense-in-depth)
           const tokenExpiresAt = new Date(Date.now() + tokenResult.expiresIn * 1000);
-          await db
+          // Savepoint so a failed update rolls back and the request transaction survives the catch (#11203).
+          await withDbTransaction(async () => db
             .update(c2cConnections)
             .set({ accessToken: encryptSecret(tokenResult.accessToken), tokenExpiresAt, updatedAt: new Date() })
-            .where(and(eq(c2cConnections.id, row.id), eq(c2cConnections.orgId, orgId)));
+            .where(and(eq(c2cConnections.id, row.id), eq(c2cConnections.orgId, orgId))));
 
           testStatus = 'success';
           message = 'Platform app token is valid and Graph API is accessible';

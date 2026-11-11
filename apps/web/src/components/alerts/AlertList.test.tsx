@@ -4,6 +4,8 @@ import { describe, it, expect, vi } from 'vitest';
 import type { AlertAiVerdictSummaryDto } from '@breeze/shared';
 import AlertList, { type Alert } from './AlertList';
 
+vi.mock('@/lib/navigation', () => ({ navigateTo: vi.fn() }));
+
 const baseAlert: Alert = {
   id: 'a-1',
   title: 'CPU high',
@@ -29,6 +31,17 @@ const baseVerdict: AlertAiVerdictSummaryDto = {
   createdAt: '2026-08-28T00:00:00Z',
 };
 
+describe('AlertList filter selects accessible name (#7156)', () => {
+  it('gives the status/severity/date-range filter selects a real accessible name once expanded', () => {
+    render(<AlertList alerts={[baseAlert]} />);
+    fireEvent.click(screen.getByRole('button', { name: /filters/i }));
+
+    expect(screen.getByRole('combobox', { name: 'Status' })).toBeInTheDocument();
+    expect(screen.getByRole('combobox', { name: 'Severity' })).toBeInTheDocument();
+    expect(screen.getByRole('combobox', { name: 'Date range' })).toBeInTheDocument();
+  });
+});
+
 describe('AlertList — Organization column follows fleet view', () => {
   it('hides the Organization column in single-org scope', () => {
     render(<AlertList alerts={[baseAlert]} showOrgColumn={false} />);
@@ -53,6 +66,23 @@ describe('AlertList — Organization column follows fleet view', () => {
     const { container } = render(<AlertList alerts={[]} showOrgColumn />);
     const emptyCell = container.querySelector('td[colspan]');
     expect(emptyCell?.getAttribute('colspan')).toBe('9');
+  });
+});
+
+describe('AlertList — org link (ui-flow W03)', () => {
+  it('links the org cell to the org record and keeps row selection separate', () => {
+    const onSelect = vi.fn();
+    render(<AlertList alerts={[baseAlert]} showOrgColumn onSelect={onSelect} />);
+    const link = screen.getByTestId('org-record-link');
+    expect(link).toHaveAttribute('href', '/organizations/org-1');
+    fireEvent.click(link);
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
+  it('prints the org as text when the alert has no orgId', () => {
+    render(<AlertList alerts={[{ ...baseAlert, orgId: null }]} showOrgColumn />);
+    expect(screen.queryByTestId('org-record-link')).toBeNull();
+    expect(screen.getByText('Acme Corp')).toBeInTheDocument();
   });
 });
 
@@ -115,5 +145,62 @@ describe('AlertList blocked scope (RMM-QA-153)', () => {
     expect(screen.getAllByRole('checkbox').every(input => (input as HTMLInputElement).disabled)).toBe(true);
     expect(screen.queryByRole('menuitem', { name: new RegExp(action, 'i') })).toBeNull();
     expect(onBulkAction).not.toHaveBeenCalled();
+  });
+});
+
+// #7215: write actions are now gated on the caller's permissions. These suites
+// exercise the actions themselves, so grant everything; the role-aware
+// behaviour is covered in the *.permissions.test.tsx suites.
+vi.mock('../../lib/permissions', () => ({
+  usePermissions: () => ({ permissions: [], can: () => true }),
+  hasPermission: () => true,
+}));
+
+
+describe('AlertList org subjects', () => {
+  it('renders a workload chip and omits its device filter', () => {
+    const { container } = render(<AlertList alerts={[{ ...baseAlert, deviceId: null, deviceName: '', ownerKind: 'backup_workload', subjectName: 'Microsoft 365 mail backup · Example organization' }]} />);
+    expect(screen.getByTestId('alert-subject-chip')).toHaveAttribute('href', '/backup');
+    expect(container.querySelector('a[href*="/devices/"]')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: /filters/i }));
+    expect(screen.queryByRole('combobox', { name: 'Device' })).toBeNull();
+  });
+
+  it('does not expose a topology origin device as a device filter', () => {
+    const { container } = render(<AlertList alerts={[{ ...baseAlert, ownerKind: 'topology_site', topologySiteId: 'site-1', subjectName: 'Branch' }]} />);
+    expect(screen.getByTestId('alert-subject-chip')).toHaveAttribute('href', '/discovery#topology/site/site-1');
+    expect(container.querySelector('a[href*="/devices/"]')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: /filters/i }));
+    expect(screen.queryByRole('combobox', { name: 'Device' })).toBeNull();
+  });
+
+  it('searches subjectName for a workload alert', () => {
+    render(<AlertList alerts={[{ ...baseAlert, deviceId: null, deviceName: '', ownerKind: 'backup_workload', subjectName: 'Microsoft 365 mail backup · Example organization' }]} />);
+    fireEvent.change(screen.getByRole('searchbox'), { target: { value: 'Microsoft 365' } });
+    expect(screen.getByText(baseAlert.title)).toBeInTheDocument();
+  });
+});
+
+describe('AlertList e2e hooks (#10040)', () => {
+  it('exposes the count and per-alert rows', () => {
+    render(<AlertList alerts={[baseAlert, { ...baseAlert, id: 'a-2' }]} />);
+    const count = screen.getByTestId('alert-list-count');
+    expect(count).toHaveAttribute('data-filtered', '2');
+    expect(count).toHaveAttribute('data-total', '2');
+    expect(screen.getByTestId('alert-row-a-1')).toBeInTheDocument();
+    expect(screen.getByTestId('alert-row-a-2')).toBeInTheDocument();
+  });
+
+  it('reports filtered vs total separately when a filter is active', () => {
+    render(
+      <AlertList
+        alerts={[baseAlert, { ...baseAlert, id: 'a-2', severity: 'low' }]}
+        initialSeverity={['critical']}
+      />,
+    );
+    const count = screen.getByTestId('alert-list-count');
+    expect(count).toHaveAttribute('data-filtered', '1');
+    expect(count).toHaveAttribute('data-total', '2');
+    expect(screen.queryByTestId('alert-row-a-2')).toBeNull();
   });
 });

@@ -39,25 +39,48 @@ export async function loadLatestReview(proposalId: string, orgId: string) {
   );
 }
 
+/**
+ * A proposal's runs, read in whatever DB context the CALLER holds, so RLS
+ * scopes them to the caller's tenant. The `get_script_proposal` AI tool reads
+ * them this way inside its per-call transaction (#7918): escaping to a system
+ * context there would take a second pooled connection while the first is held.
+ */
+export function selectProposalExecutions(proposalId: string) {
+  return db
+    .select({
+      id: scriptExecutions.id,
+      deviceId: scriptExecutions.deviceId,
+      status: scriptExecutions.status,
+      exitCode: scriptExecutions.exitCode,
+      startedAt: scriptExecutions.startedAt,
+      completedAt: scriptExecutions.completedAt,
+      hostname: devices.hostname,
+    })
+    .from(scriptExecutions)
+    .leftJoin(devices, eq(devices.id, scriptExecutions.deviceId))
+    .where(eq(scriptExecutions.proposalId, proposalId))
+    .orderBy(desc(scriptExecutions.startedAt));
+}
+
+/**
+ * A proposal's newest MODEL review, read in the CALLER's context (RLS-scoped)
+ * for the same reason as `selectProposalExecutions` above: the
+ * `get_script_proposal` AI tool reads it inside its per-call transaction
+ * (#10399), where escaping to system scope would hold a second pooled
+ * connection under the first. Same row `waitForReviewCompletion` returns.
+ */
+export async function selectLatestModelReview(proposalId: string) {
+  const [row] = await db
+    .select()
+    .from(scriptProposalReviews)
+    .where(and(eq(scriptProposalReviews.proposalId, proposalId), eq(scriptProposalReviews.reviewerKind, 'model')))
+    .orderBy(desc(scriptProposalReviews.createdAt))
+    .limit(1);
+  return row ?? null;
+}
+
 export async function loadProposalExecutions(proposalId: string) {
-  return runOutsideDbContext(() =>
-    withSystemDbAccessContext(() =>
-      db
-        .select({
-          id: scriptExecutions.id,
-          deviceId: scriptExecutions.deviceId,
-          status: scriptExecutions.status,
-          exitCode: scriptExecutions.exitCode,
-          startedAt: scriptExecutions.startedAt,
-          completedAt: scriptExecutions.completedAt,
-          hostname: devices.hostname,
-        })
-        .from(scriptExecutions)
-        .leftJoin(devices, eq(devices.id, scriptExecutions.deviceId))
-        .where(eq(scriptExecutions.proposalId, proposalId))
-        .orderBy(desc(scriptExecutions.startedAt)),
-    ),
-  );
+  return runOutsideDbContext(() => withSystemDbAccessContext(() => selectProposalExecutions(proposalId)));
 }
 
 /**

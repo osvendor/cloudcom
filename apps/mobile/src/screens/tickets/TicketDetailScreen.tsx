@@ -40,6 +40,13 @@ import {
 } from '../../services/localTimer';
 import { useNetworkConnected } from '../../lib/useNetworkConnected';
 import {
+  fetchWorkTypes,
+  shouldReportWorkTypeLoadFailure,
+  type WorkType,
+} from '../../services/workTypes';
+import { WorkTypePicker } from '../../components/WorkTypePicker';
+import { shouldShowWorkTypePicker } from '../../components/workTypePickerOptions';
+import {
   addTicketComment,
   allowedQuickStatuses,
   changeTicketStatus,
@@ -65,7 +72,7 @@ import { navigateToTicket } from '../../navigation/navigationRef';
 import { AttachmentChip } from '../../components/AttachmentChip';
 import { useToast } from '../../components/toast/ToastHost';
 import { relativeTime } from '../../lib/relativeTime';
-import { reportInternalError } from '../../lib/errorReporting';
+import { reportInternalError, safeReportInternalError } from '../../lib/errorReporting';
 
 import {
   isVisibleActivityEntry,
@@ -87,7 +94,8 @@ import {
   submitLabel,
   type CommentMode,
 } from './commentMode';
-import { startForTicket, stopRunningTimer } from './timerActions';
+import { APPROVAL_REQUIRED_PROMPT, startForTicket, stopRunningTimer } from './timerActions';
+import { SitePinButton } from '../time/SitePinButton';
 import {
   startOutcomeEffects,
   stopComposerTicketId,
@@ -182,6 +190,10 @@ export function TicketDetailScreen() {
   const { show: showToast } = useToast();
   const [timerNotice, setTimerNotice] = useState<string | null>(null);
   const [timerBusy, setTimerBusy] = useState(false);
+  // #4628 W04. `undefined` = Default: the start omits workTypeId and the server
+  // applies the ticket category's default work type (§3.1).
+  const [workTypes, setWorkTypes] = useState<WorkType[]>([]);
+  const [workTypeId, setWorkTypeId] = useState<string | undefined>(undefined);
   const [chips, setChips] = useState<Chip[]>([]);
   /**
    * Mirror of `chips` readable synchronously.
@@ -572,19 +584,43 @@ export function TicketDetailScreen() {
     }
   }, [dispatch]);
 
-  const onStartTimer = useCallback(async () => {
+  useEffect(() => {
+    let cancelled = false;
+    // Fail soft: a technician must always be able to start a timer. A failed
+    // load hides the picker and the start omits workTypeId, so the server
+    // applies the ticket category's default work type (#4628 §3.1).
+    fetchWorkTypes()
+      .then((types) => {
+        if (!cancelled) setWorkTypes(types);
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        setWorkTypes([]);
+        if (shouldReportWorkTypeLoadFailure(err)) safeReportInternalError(err, 'ticket-work-types-load');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const onStartTimer = useCallback(async (nonBillable = false) => {
     if (timerInFlight.current) return;
     timerInFlight.current = true;
     setTimerBusy(true);
     setTimerNotice(null);
     try {
-      const outcome = await startForTicket(ticketId, {
-        startTimer,
-        writeLocalTimer,
-        clearLocalTimer,
-        isConnected: () => connected,
-        stamp: stampNow,
-      });
+      const outcome = await startForTicket(
+        ticketId,
+        {
+          startTimer,
+          writeLocalTimer,
+          clearLocalTimer,
+          isConnected: () => connected,
+          stamp: stampNow,
+        },
+        // startForTicket owns the tri-state: undefined is omitted from the start.
+        { workTypeId, ...(nonBillable ? { isBillable: false as const } : {}) }
+      );
       if (!mounted.current) return;
       // One decision table, shared with the TimerBar — see timerOutcomeEffects.ts.
       const effects = startOutcomeEffects(outcome);
@@ -596,11 +632,19 @@ export function TicketDetailScreen() {
       if (!mounted.current) return;
       setTimerNotice(effects.notice);
       showToast(effects.toast);
+      if (effects.offerNonBillable) {
+        // #8196: the customer-approval gate refused a billable start. Retrying
+        // is the technician's call, so ask rather than silently re-sending.
+        Alert.alert('Approval required', APPROVAL_REQUIRED_PROMPT, [
+          { text: 'Cancel', style: 'cancel' },
+          { text: 'Log as non-billable', onPress: () => void onStartTimer(true) },
+        ]);
+      }
     } finally {
       timerInFlight.current = false;
       if (mounted.current) setTimerBusy(false);
     }
-  }, [ticketId, connected, dispatch, refreshQueueDepth]);
+  }, [ticketId, connected, dispatch, refreshQueueDepth, workTypeId]);
 
   const onStopTimer = useCallback(async () => {
     if (timerInFlight.current) return;
@@ -816,6 +860,17 @@ export function TicketDetailScreen() {
           </Text>
         ) : (
           <>
+            {!shouldShowWorkTypePicker(running, ticketId) ? null : (
+              // Priced at START (§3.7), so the choice only matters before the
+              // tap; a running timer's work type is edited from the web.
+              <WorkTypePicker
+                workTypes={workTypes}
+                value={workTypeId}
+                onChange={setWorkTypeId}
+                disabled={timerBusy}
+                testID="start-timer-work-type"
+              />
+            )}
             <Pressable
               onPress={() => (running ? void onStopTimer() : void onStartTimer())}
               disabled={timerBusy}
@@ -828,6 +883,9 @@ export function TicketDetailScreen() {
                 {timerBusy ? 'Working…' : running ? 'Stop timer' : 'Start timer'}
               </Text>
             </Pressable>
+            {/* #8211: renders nothing unless the partner flag is on, this user may
+                pin sites, and the ticket's org has an unpinned site. */}
+            <SitePinButton orgId={ticket?.orgId ?? null} />
             {running && running.ticketId !== ticketId ? (
               // `startTimer` auto-stops the caller's previous timer before
               // inserting (timeEntryService.ts), so starting here silently

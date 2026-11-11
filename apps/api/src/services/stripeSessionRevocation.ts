@@ -16,7 +16,7 @@ import {
 import { requestLikeFromSnapshot, writeAuditEventAsync } from './auditEvents';
 
 /**
- * Fail-closed Stripe Checkout session revocation (SEC-2026-09-05-150).
+ * Fail-closed Stripe Checkout session revocation.
  *
  * A Checkout session stays payable ON STRIPE after Breeze resets the public
  * link, records an alternate payment, voids the invoice or replaces the key.
@@ -44,6 +44,7 @@ import { requestLikeFromSnapshot, writeAuditEventAsync } from './auditEvents';
 export type RevocationReason =
   | 'link_reset'
   | 'manual_payment'
+  | 'autopay_collection'
   | 'invoice_void'
   | 'key_replaced'
   | 'account_changed'
@@ -54,7 +55,7 @@ export type RevocationReason =
   | 'operator_abandoned';
 
 /** Pinned API version — must match partnerStripe.ts. */
-const STRIPE_API_VERSION = '2026-06-24.dahlia';
+const STRIPE_API_VERSION = '2026-08-26.dahlia';
 
 /** Per-attempt provider timeout. Matches the observed Stripe call latency. */
 export const EXPIRE_TIMEOUT_MS = 8_000;
@@ -695,14 +696,13 @@ export async function markSessionChargedRepair(stripeObjectId: string, detail: s
  * collect, so each is a second charge waiting to happen. This is intent ONLY —
  * the provider call belongs to the sweep — and that is not a shortcut:
  *
- *   `recordStripePayment` holds the invoice row FOR UPDATE, and its caller
- *   (`settleCheckoutSession` via the portal return route, or the reconcile
- *   sweep) has already opened the enclosing system context, so the "post-commit"
- *   half of that function still runs INSIDE the transaction. Escaping with
+ *   `recordStripePayment` holds the invoice row FOR UPDATE for the whole of
+ *   its transaction, and this runs inside it. Escaping with
  *   `runOutsideDbContext` to take the same invoice lock on a second pooled
  *   connection self-deadlocks: the new connection waits for a lock the caller
  *   will not release until the new connection returns. Participating in the
- *   caller's transaction (no escape, no second lock) is the only safe shape.
+ *   caller's transaction (no escape, no second lock) is the only safe shape —
+ *   and it also means the intent commits atomically with the capture.
  *
  * A revocation failure must never fail a capture, and here it structurally
  * cannot: nothing is called out to Stripe.

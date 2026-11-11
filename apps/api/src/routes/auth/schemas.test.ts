@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mfaVerifySchema, mfaStepUpSchema } from './schemas';
+import { mfaVerifySchema, mfaStepUpSchema, unattestedRestoreStepUpResource, callerVerificationAdministrativeStepUpResource, forceRebootStepUpResource } from './schemas';
+import type { StepUpOperation } from '../../services/mfaStepUpGrant';
 
 // SR2-09: mfaVerifySchema must accept a 6-digit TOTP/SMS code OR the
 // `XXXX-XXXX` recovery-code form, and the `method` enum must include
@@ -110,6 +111,17 @@ describe('mfaStepUpSchema operation field', () => {
     ).toThrow();
   });
 
+  // #10650: removing the authenticator app is provable by a passkey or the
+  // authenticator itself. A recovery code can only ever mint delete_passkey;
+  // SMS is refused by the /mfa/step-up handler (it is a valid schema shape).
+  it('accepts remove_totp for totp and passkey, never for a recovery code', () => {
+    expect(mfaStepUpSchema.parse({ method: 'totp', code: '123456', operation: 'remove_totp' }).operation).toBe('remove_totp');
+    expect(mfaStepUpSchema.parse({ method: 'passkey', credential: { id: 'cred-1' }, operation: 'remove_totp' }).operation).toBe('remove_totp');
+    expect(() =>
+      mfaStepUpSchema.parse({ method: 'recovery', code: 'ABCD-1234', operation: 'remove_totp', passkeyId: '10000000-0000-4000-8000-000000000009' })
+    ).toThrow();
+  });
+
   // #4018: enroll_first_factor is a REAL StepUpOperation, so the `satisfies`
   // constraint on STEP_UP_OPERATIONS would happily accept it being added to
   // the client-requestable list — nothing in the type system stops that. But
@@ -122,6 +134,26 @@ describe('mfaStepUpSchema operation field', () => {
     expect(() =>
       mfaStepUpSchema.parse({ method: 'totp', code: '123456', operation: 'enroll_first_factor' })
     ).toThrow();
+  });
+
+  // #4045: the other SSO-reauth-minted purpose. It stands in for the PASSWORD
+  // leg of factor management; letting a client mint it from a TOTP code would
+  // turn one factor proof into both legs of a two-proof step-up.
+  it('rejects sso_reauth_manage_factor — SSO-reauth-mint only, never client-requestable', () => {
+    expect(() =>
+      mfaStepUpSchema.parse({ method: 'totp', code: '123456', operation: 'sso_reauth_manage_factor' })
+    ).toThrow();
+  });
+
+  // An unattested restore is confirmed only with a proven second factor
+  // (operation backup_unattested_restore); there is no other grant for it.
+  it('rejects backup_unattested_restore_typed — not a step-up operation', () => {
+    expect(() =>
+      mfaStepUpSchema.parse({ method: 'totp', code: '123456', operation: 'backup_unattested_restore_typed' })
+    ).toThrow();
+    // @ts-expect-error -- not a grant operation, so no grant for it can be minted or consumed
+    const removed: StepUpOperation = 'backup_unattested_restore_typed';
+    expect(removed).toBe('backup_unattested_restore_typed');
   });
 
   // RMM-QA-176 D11 (T12): entering/extending device maintenance mode is a
@@ -154,6 +186,66 @@ describe('mfaStepUpSchema operation field', () => {
   // resource binding must be accepted by this schema. acceptCurrencyMismatch
   // is optional here because the device route's body schema makes it optional
   // — the digest normalises the omission to false.
+  // Restoring a backup without an integrity attestation: client-requestable,
+  // bound to exactly one snapshot, target device and privileged restore type.
+  it('accepts backup_unattested_restore with a restore resource binding', () => {
+    const resource = {
+      snapshotId: '00000000-0000-4000-8000-000000000010',
+      targetDeviceId: '00000000-0000-4000-8000-000000000020',
+      commandType: 'backup_restore',
+    };
+    const parsed = mfaStepUpSchema.parse({ method: 'totp', code: '123456', operation: 'backup_unattested_restore', resource });
+    expect(parsed.operation).toBe('backup_unattested_restore');
+    expect(parsed.resource).toEqual(resource);
+  });
+
+  it('rejects a backup_unattested_restore resource for a command that is not a privileged restore', () => {
+    expect(unattestedRestoreStepUpResource.safeParse({
+      snapshotId: '00000000-0000-4000-8000-000000000010',
+      targetDeviceId: '00000000-0000-4000-8000-000000000020',
+      commandType: 'backup_verify',
+    }).success).toBe(false);
+  });
+
+  it.each([
+    ['autopay_charge_now', { invoiceId: '00000000-0000-4000-8000-000000000010' }],
+    ['partner_payment_settings_update', { partnerId: '00000000-0000-4000-8000-000000000020',
+      settings: { remindersEnabled: true, feeAttestation: { acquirerAndNetworksNotified30DaysAgo: true, doesNotExceedAcceptanceCost: true } } }],
+    ['autopay_request_recipient', { orgIds: ['00000000-0000-4000-8000-000000000030'], recipientOverride: 'accounts@example.test', mode: 'reauthorize' }],
+    ['org_payment_settings_update', { orgId: '00000000-0000-4000-8000-000000000040',
+      settings: { autopayCapEnabled: true, autopayCapAmount: '500.00', autopayCapCurrency: 'USD', reminderRepeatDays: null } }],
+    ['device_force_reboot', { deviceId: '00000000-0000-4000-8000-000000000050' }],
+  ] as const)('accepts %s with its resource binding, unchanged', (operation, resource) => {
+    const parsed = mfaStepUpSchema.parse({ method: 'totp', code: '123456', operation, resource });
+    expect(parsed.operation).toBe(operation);
+    expect(parsed.resource).toEqual(resource);
+  });
+
+  // #9380 review: pin `.strict()` on the force-reboot binding directly. The
+  // union-order test below cannot do it: that one passes if EITHER the member
+  // order or the strictness protects the richer bindings, so it stays green
+  // when only `.strict()` is removed. Both tests are load-bearing — this one
+  // for strictness, the one below for position — so neither is redundant.
+  it('rejects a force-reboot binding that carries any key besides deviceId', () => {
+    expect(forceRebootStepUpResource.safeParse({ deviceId: '00000000-0000-4000-8000-000000000010' }).success).toBe(true);
+    expect(forceRebootStepUpResource.safeParse({
+      deviceId: '00000000-0000-4000-8000-000000000010',
+      targetOrgId: '00000000-0000-4000-8000-000000000020',
+    }).success).toBe(false);
+  });
+
+  // #8729: the force-reboot binding is a bare { deviceId }. It is strict and
+  // last in the union, so a richer device binding never collapses onto it.
+  it('keeps a move-org resource whole now that a { deviceId }-only binding exists', () => {
+    const resource = {
+      deviceId: '00000000-0000-4000-8000-000000000010',
+      targetOrgId: '00000000-0000-4000-8000-000000000020',
+      targetSiteId: '00000000-0000-4000-8000-000000000030',
+    };
+    const parsed = mfaStepUpSchema.parse({ method: 'totp', code: '123456', operation: 'device_move_org', resource });
+    expect(parsed.resource).toEqual(resource);
+  });
+
   it('accepts device_move_org with a move-org resource binding', () => {
     const parsed = mfaStepUpSchema.parse({
       method: 'totp',
@@ -197,5 +289,25 @@ describe('mfaStepUpSchema operation field', () => {
         },
       })
     ).toThrow();
+  });
+});
+
+describe('caller verification administrative step-up', () => {
+  const resource = {
+    orgId: '11111111-1111-4111-8111-111111111111',
+    entraTenantId: 'tenant',
+    entraOid: 'oid',
+    reason: 'Confirmed offboarding request',
+  };
+  it('accepts the operation and rejects a short, long or extra-field resource', () => {
+    const body = { method: 'totp', code: '123456', operation: 'caller_verification_administrative_disable', resource };
+    expect(mfaStepUpSchema.safeParse(body).success).toBe(true);
+    expect(callerVerificationAdministrativeStepUpResource.safeParse(resource).success).toBe(true);
+    expect(callerVerificationAdministrativeStepUpResource.safeParse({ ...resource, reason: 'short' }).success).toBe(false);
+    expect(callerVerificationAdministrativeStepUpResource.safeParse({ ...resource, reason: 'x'.repeat(2001) }).success).toBe(false);
+    expect(callerVerificationAdministrativeStepUpResource.safeParse({ ...resource, extra: 1 }).success).toBe(false);
+  });
+  it('trims the reason before measuring it', () => {
+    expect(callerVerificationAdministrativeStepUpResource.safeParse({ ...resource, reason: `   ${'a'.repeat(10)}   ` }).success).toBe(false);
   });
 });

@@ -24,6 +24,18 @@ import { devices } from '../db/schema/devices';
 import { eq, inArray, type SQL } from 'drizzle-orm';
 import type { PgColumn } from 'drizzle-orm/pg-core';
 import type { AuthContext } from '../middleware/auth';
+import { normalizeSiteAllowlist } from './siteAllowlist';
+
+/**
+ * The caller's site allowlist under the one normalization rule (#6790):
+ * `undefined` = unrestricted, an array passes through, anything else (a raw
+ * `null`, a non-array) = no sites. Every site-axis gate in this module reads
+ * the allowlist through this — never through a truthiness check on
+ * `auth.allowedSiteIds`, which would read a malformed value as unrestricted.
+ */
+export function siteAllowlistOf(auth: AuthContext): readonly string[] | undefined {
+  return normalizeSiteAllowlist(auth.allowedSiteIds);
+}
 
 /**
  * Annotation for tool results that are empty/indeterminate solely because a
@@ -33,6 +45,17 @@ import type { AuthContext } from '../middleware/auth';
  */
 export const SITE_SCOPE_EMPTY_NOTE =
   'No devices are within your site access — this result is limited by site-based access restrictions, not necessarily an absence of data.';
+
+/**
+ * An org-id column restricted to one org or to a list of orgs (#10396). The
+ * list is the caller's own reach from `resolveReadableToolOrgScope`; callers
+ * must not pass an empty list (it would read as "no orgs", which `inArray`
+ * renders as a false predicate, but a caller should have refused earlier).
+ */
+export function orgIdIn(column: PgColumn, orgIds: string | readonly string[]): SQL {
+  if (typeof orgIds === 'string') return eq(column, orgIds);
+  return orgIds.length === 1 ? eq(column, orgIds[0]!) : inArray(column, [...orgIds]);
+}
 
 /** Exact device scope is independent of site scope. Empty means no devices. */
 export function runFrozenDeviceIds(auth: AuthContext): string[] | null {
@@ -71,7 +94,8 @@ export function deviceScopeCondition(auth: AuthContext, column: PgColumn): SQL |
  * likewise denies a restricted caller a null site.
  */
 export function siteScopeCondition(auth: AuthContext, siteColumn: PgColumn): SQL | undefined {
-  return auth.allowedSiteIds ? inArray(siteColumn, [...auth.allowedSiteIds]) : undefined;
+  const allowed = siteAllowlistOf(auth);
+  return allowed ? inArray(siteColumn, [...allowed]) : undefined;
 }
 
 /**
@@ -96,16 +120,22 @@ export function filterToDeviceScope<T>(
  * restricted on neither axis (unrestricted — no narrowing, and no query); an
  * empty array means restricted with nothing in scope, which is NOT the same
  * thing and must never be collapsed into `null` by a caller.
+ *
+ * `orgId` may be a list (a read across every org the caller reaches, #10396):
+ * the scan then covers those orgs in one query. The list must come from the
+ * caller's own reach (`resolveReadableToolOrgScope`); it is not access-checked
+ * here.
  */
 export async function resolveSiteAllowedDeviceIds(
-  orgId: string,
+  orgId: string | readonly string[],
   auth: AuthContext,
 ): Promise<string[] | null> {
-  if (!auth.allowedSiteIds && !auth.allowedDeviceIds) return null;
+  if (siteAllowlistOf(auth) === undefined && !auth.allowedDeviceIds) return null;
+  if (typeof orgId !== 'string' && orgId.length === 0) return [];
   const orgDevices = await db
     .select({ id: devices.id, siteId: devices.siteId })
     .from(devices)
-    .where(eq(devices.orgId, orgId));
+    .where(orgIdIn(devices.orgId, orgId));
   return orgDevices
     .filter((d) => !deviceSiteDenied(auth, d.siteId, d.id))
     .map((d) => d.id);
@@ -132,7 +162,7 @@ export async function scopeDeviceIdsToCaller(
   orgId: string,
   deviceIds: unknown,
 ): Promise<string[] | null> {
-  if (!auth.allowedSiteIds && !auth.allowedDeviceIds) return null;
+  if (siteAllowlistOf(auth) === undefined && !auth.allowedDeviceIds) return null;
   const ids = (Array.isArray(deviceIds) ? deviceIds : [])
     .filter((id): id is string => typeof id === 'string');
   let scoped = ids;
@@ -140,7 +170,7 @@ export async function scopeDeviceIdsToCaller(
     const exact = new Set(auth.allowedDeviceIds);
     scoped = scoped.filter((id) => exact.has(id));
   }
-  if (!auth.allowedSiteIds || scoped.length === 0) return scoped;
+  if (siteAllowlistOf(auth) === undefined || scoped.length === 0) return scoped;
   const siteAllowed = new Set((await resolveSiteAllowedDeviceIds(orgId, auth)) ?? []);
   return scoped.filter((id) => siteAllowed.has(id));
 }
@@ -162,7 +192,7 @@ export async function resolveSiteDevicePartition(
   orgId: string,
   auth: AuthContext,
 ): Promise<{ allowed: string[]; forbidden: string[] } | null> {
-  if (!auth.allowedSiteIds && !auth.allowedDeviceIds) return null;
+  if (siteAllowlistOf(auth) === undefined && !auth.allowedDeviceIds) return null;
   const orgDevices = await db
     .select({ id: devices.id, siteId: devices.siteId })
     .from(devices)
@@ -203,7 +233,9 @@ export function deviceSiteDenied(
   // A site alone cannot establish membership in an exact device scope.
   if (auth.allowedDeviceIds && deviceId !== undefined
     && (deviceId === null || !auth.allowedDeviceIds.includes(deviceId))) return true;
-  if (auth.allowedSiteIds && !auth.canAccessSite) return true;
+  const allowedSites = siteAllowlistOf(auth);
+  if (allowedSites !== undefined
+    && (!auth.canAccessSite || !siteId || !allowedSites.includes(siteId))) return true;
   if (!auth.canAccessSite) return false;
   return !auth.canAccessSite(siteId);
 }
@@ -219,7 +251,7 @@ export async function deviceIdSiteDenied(
   deviceId: string,
 ): Promise<boolean> {
   if (auth.allowedDeviceIds && !auth.allowedDeviceIds.includes(deviceId)) return true;
-  if (!auth.canAccessSite && !auth.allowedSiteIds) return false;
+  if (!auth.canAccessSite && siteAllowlistOf(auth) === undefined) return false;
   const [row] = await db
     .select({ siteId: devices.siteId })
     .from(devices)

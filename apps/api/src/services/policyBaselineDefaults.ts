@@ -14,6 +14,7 @@
 // service into pamSettings/helpers test suites (#1725 PR review).
 import { CONFIG_FEATURE_TYPES, type ConfigFeatureType } from './configFeatureTypes';
 import type { RemoteAccessSettings } from './remoteAccessPolicy';
+import { HARDWARE_MONITORING_DEFAULTS, TIME_SYNC_DEFAULTS, WORKLOAD_INVENTORY_DEFAULTS } from '@breeze/shared';
 
 export interface BaselineEntry {
   featureType: ConfigFeatureType;
@@ -47,7 +48,13 @@ export function getRemoteAccessBaseline(): RemoteAccessSettings {
     defaultAllowedPorts: [],
     autoEnableProxy: false,
     maxConcurrentTunnels: 5,
-    idleTimeoutMinutes: 5,
+    // 30 min, not 5: watching an install, a reboot-pending dialog or a long
+    // script routinely goes 5 min without viewer input, and every device with
+    // no Remote Access policy (or a policy that omits this field) gets this
+    // value (#10422).
+    // The resolution-failure FAILSAFE_DESKTOP_POLICY in remoteAccessPolicy.ts
+    // stays at 5 min on purpose.
+    idleTimeoutMinutes: 30,
     maxSessionDurationHours: 8,
   };
 }
@@ -59,12 +66,13 @@ export function getPamBaseline(): { uacInterceptionEnabled: boolean } {
 // label + behavior + applied/inlineSettings for every feature type. Order
 // follows CONFIG_FEATURE_TYPES. "Not enforced" entries describe the real-world
 // effect of having no policy.
-const NOT_ENFORCED: Record<Exclude<ConfigFeatureType, 'remote_access' | 'pam'>, { label: string; behavior: string }> = {
+const NOT_ENFORCED: Record<
+  Exclude<ConfigFeatureType, 'remote_access' | 'pam' | 'hardware_monitoring' | 'time_sync' | 'workload_inventory'>,
+  { label: string; behavior: string }
+> = {
   patch:             { label: 'Patches',            behavior: 'Not enforced — no patch deployments are created from policy.' },
-  alert_rule:        { label: 'Alerts',             behavior: 'Not enforced — no policy alert rules fire.' },
   backup:            { label: 'Backup',             behavior: 'Not enforced — no backups are scheduled.' },
   security:          { label: 'Security',           behavior: 'Not enforced — no security posture is applied.' },
-  monitoring:        { label: 'Monitoring',         behavior: 'Not enforced — no service/process monitoring runs.' },
   maintenance:       { label: 'Maintenance',        behavior: 'Not enforced — no maintenance windows apply.' },
   compliance:        { label: 'Compliance',         behavior: 'Not enforced — no compliance checks run.' },
   automation:        { label: 'Automations',        behavior: 'Not enforced — no automations execute.' },
@@ -78,6 +86,12 @@ const NOT_ENFORCED: Record<Exclude<ConfigFeatureType, 'remote_access' | 'pam'>, 
   vulnerability:     { label: 'Vulnerability Scanning', behavior: 'Not enforced — vulnerability correlation does not run for these devices.' },
   device_lifecycle:  { label: 'Device Lifecycle',    behavior: 'Not enforced — removed devices are kept until deleted manually.' },
   monitors:          { label: 'Monitors',           behavior: 'Not enforced — no monitors are evaluated for these devices.' },
+  // Describes the platform default (beforePatching true, the other two false),
+  // which is the agent's existing behaviour — not "nothing happens".
+  system_protection: { label: 'System Protection',  behavior: 'Not enforced — patch installs still attempt a Windows restore point; scripts and software installs do not.' },
+  containment:       { label: 'Containment', behavior: 'Not enforced — isolation uses the fixed defaults: 72 h TTL, remote relay on, no extra permits, no dead-man.' },
+  security_agents:   { label: 'Security Agents',    behavior: 'Not enforced — no third-party security agents are installed from policy.' },
+  oem_updates:       { label: 'Vendor Updates',     behavior: 'Not enforced — no vendor (Dell, Surface, HP, Lenovo) updates are scheduled for these devices.' },
 };
 
 export function getPolicyBaselineDefaults(): BaselineEntry[] {
@@ -98,6 +112,40 @@ export function getPolicyBaselineDefaults(): BaselineEntry[] {
         applied: true,
         inlineSettings: getPamBaseline(),
         behavior: 'UAC elevation capture is OFF by default (opt-in via a policy).',
+      };
+    }
+    if (ft === 'hardware_monitoring') {
+      return {
+        featureType: ft,
+        label: 'Hardware Monitoring',
+        applied: true,
+        inlineSettings: { ...HARDWARE_MONITORING_DEFAULTS },
+        behavior: 'Hardware collection is ON by default: RAID every 10 minutes and disk health every 60 minutes.',
+      };
+    }
+    if (ft === 'time_sync') {
+      // applied:false describes enforcement only — observation is always on.
+      return {
+        featureType: ft,
+        label: 'Time Sync',
+        applied: false,
+        inlineSettings: {
+          ...TIME_SYNC_DEFAULTS,
+          ntpServers: [],
+          timezone: { ...TIME_SYNC_DEFAULTS.timezone },
+        },
+        behavior:
+          'NTP enforcement and timezone auto-fix are OFF by default; expected timezone follows the site.',
+      };
+    }
+    if (ft === 'workload_inventory') {
+      return {
+        featureType: ft,
+        label: 'Workload Inventory',
+        applied: false,
+        inlineSettings: { ...WORKLOAD_INVENTORY_DEFAULTS },
+        behavior:
+          'Workload listing is OFF by default: container and VM runtimes are detected, but their workloads are not listed until a policy enables it.',
       };
     }
     const meta = NOT_ENFORCED[ft];

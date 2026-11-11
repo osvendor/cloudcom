@@ -1,7 +1,10 @@
+import { MIGRATION_WINDOW_MAX_ORGS } from '../../services/migrationWindowLimits';
 import { z } from 'zod';
+import { isMfaRecoveryCode, orgPaymentSettingsPatchSchema, partnerPaymentSettingsPatchSchema, launchPurchaseSelectionSchema, signupIntentSchema } from '@breeze/shared';
 import { envFlag } from '../../utils/envFlag';
 import type { StepUpOperation } from '../../services/mfaStepUpGrant';
 import { MAINTENANCE_MAX_BULK_DEVICES, MAINTENANCE_MAX_DURATION_HOURS } from '../../services/maintenanceStepUpLimits';
+import { PARKED_ASSIGN_MAX_BULK_ITEMS } from '../../services/unassignedPool/limits';
 
 // ============================================
 // Feature flags
@@ -36,6 +39,10 @@ export const registerSchema = z.object({
 
 export const registerPartnerSchema = z.object({
   companyName: z.string().min(2).max(255),
+  // What the signup is for. `purchaseSelection` is the legacy launch tuple, accepted
+  // only so an old cached client does not break; it normalizes to the default intent.
+  signupIntent: signupIntentSchema.optional(),
+  purchaseSelection: launchPurchaseSelectionSchema.optional(),
   email: z.string().email(),
   password: z.string().min(8),
   name: z.string().min(1).max(255),
@@ -47,10 +54,9 @@ export const registerPartnerSchema = z.object({
 // TOTP/SMS codes are 6 digits; recovery codes are `XXXX-XXXX` (8 [A-Z0-9]
 // with a hyphen). Accept either shape here; the handler routes on `method`.
 const totpOrSmsCode = /^\d{6}$/;
-const recoveryCode = /^[A-Z0-9]{4}-[A-Z0-9]{4}$/i;
 export const mfaVerifySchema = z.object({
   code: z.string().refine(
-    (v) => totpOrSmsCode.test(v.trim()) || recoveryCode.test(v.trim()),
+    (v) => totpOrSmsCode.test(v.trim()) || isMfaRecoveryCode(v),
     { message: 'Invalid code format' },
   ),
   tempToken: z.string().optional(),
@@ -146,6 +152,10 @@ const stepUpAssertion = z.object({ id: z.string().min(1) }).passthrough();
 // only after a forced IdP round-trip proves identity for a PASSWORDLESS
 // account; letting a client request one here would turn a re-authentication
 // proof into a checkbox for anyone who can already satisfy step-up.
+// #4045: `sso_reauth_manage_factor`, the callback's other output, is excluded
+// for the same reason — it stands in for the PASSWORD leg of factor
+// management, so minting it from a factor proof would collapse two proofs
+// into one.
 //
 // A plain `satisfies readonly StepUpOperation[]` would NOT have stopped that —
 // it only constrains membership, so appending 'enroll_first_factor' still
@@ -156,14 +166,32 @@ const STEP_UP_OPERATIONS = [
   'add_factor',
   'rotate_recovery_codes',
   'delete_passkey',
+  // #10650: POST /auth/mfa/totp/remove. Provable by passkey or TOTP only —
+  // /mfa/step-up refuses SMS for it, and the recovery variant below stays
+  // limited to delete_passkey.
+  'remove_totp',
   'register_approver_device',
   'agent_rollback',
   'device_maintenance',
   'device_move_org',
+  'device_force_reboot',
+  'parked_device_assign',
+  'parked_device_assign_bulk',
+  'pre_assignment_enable',
   'ai_script_lane_grant',
+  'ai_partner_script_ceiling_grant',
+  'topology_arm',
+  'backup_unattested_restore',
+  'autopay_charge_now',
+  'partner_payment_settings_update',
+  'autopay_request_recipient',
+  'org_payment_settings_update',
+  'migration_window_open',
+  'caller_verification_administrative_disable',
+  'wisp_grant',
 ] as const satisfies readonly Exclude<
   StepUpOperation,
-  'enroll_first_factor' | 'approval_decide'
+  'enroll_first_factor' | 'sso_reauth_manage_factor' | 'approval_decide'
 >[];
 const stepUpOperation = z
   .enum(STEP_UP_OPERATIONS)
@@ -196,18 +224,132 @@ export const moveOrgStepUpResource = z.object({
   targetSiteId: z.string().uuid(),
   acceptCurrencyMismatch: z.boolean().optional(),
 });
+// #8729 force reboot: one device. `.strict()` AND last in `stepUpResource`
+// below: the union parses the body before the per-operation schema does, and a
+// loose `{ deviceId }` member placed earlier would match (and strip) the
+// richer device bindings such as move-org's.
+export const forceRebootStepUpResource = z.object({
+  deviceId: z.string().uuid(),
+}).strict();
+// Parked-device assignment bindings. Mirror the pre-assignment route bodies
+// (routes/preAssignment.ts): one device + destination, or a batch of them.
+export const parkedAssignStepUpResource = z.object({
+  deviceId: z.string().uuid(),
+  targetOrgId: z.string().uuid(),
+  targetSiteId: z.string().uuid(),
+});
+export const parkedBulkAssignStepUpResource = z.object({
+  items: z.array(parkedAssignStepUpResource).min(1).max(PARKED_ASSIGN_MAX_BULK_ITEMS),
+});
+// Turning ON deploy-key enrollment for a partner: bound to the partner, and
+// only ever to enabled=true (turning it off needs no step-up).
+export const preAssignmentEnableStepUpResource = z.object({
+  partnerId: z.string().uuid(),
+  enabled: z.literal(true),
+});
 // Coarse pre-filter only. The AUTHORITY on "does this resource match this
 // operation" is RESOURCE_BOUND_OPERATIONS in routes/auth/mfa.ts, which
 // re-parses under the operation's own schema — a union member alone would
 // happily accept a rollback-shaped body under operation:'device_maintenance'.
 // AI script authoring W04 (#5612): the unattended-lane grant / reset binding.
 // One org, one value — mirrors scriptLanePolicyResourceDigest exactly.
+// `widening` is present only for a WIDENING save (tier/classes/rate/emptied
+// protectedResources/proposingEnabled) on an already-enabled
+// lane, so the grant is bound to the exact wider values shown to the
+// operator, not just the boolean flip.
+const scriptLaneWideningResource = z.object({
+  maxUnattendedRiskTier: z.enum(['low', 'medium']),
+  unattendedAllowedClasses: z.array(z.string()),
+  maxUnattendedPerHour: z.number().int().min(0).max(100),
+  protectedResourcesEmptied: z.boolean(),
+  // reviewerModel retired (W08, #7606). Non-strict object: a cached client that
+  // still sends it has the key stripped, and the digest is computed server-side
+  // from explicitly picked fields on both the mint and the redeem side.
+  proposingEnabled: z.boolean(),
+});
 export const scriptLaneStepUpResource = z.object({
   orgId: z.string().uuid(),
   unattendedEnabled: z.boolean(),
   reset: z.boolean().optional(),
+  widening: scriptLaneWideningResource.optional(),
 });
-const stepUpResource = z.union([rollbackStepUpResource, maintenanceStepUpResource, moveOrgStepUpResource, scriptLaneStepUpResource]);
+// Partner-wide sibling: raising the PARTNER ceiling (`unattendedAllowed`) is
+// the same class of action, fanned out to every opted-in org under it.
+export const partnerScriptCeilingStepUpResource = z.object({
+  partnerId: z.string().uuid(),
+  unattendedAllowed: z.boolean(),
+  widening: scriptLaneWideningResource.optional(),
+});
+// Topology M3 arm binding — mirrors topologyArmResourceDigest exactly.
+export const topologyArmStepUpResource = z.object({
+  siteId: z.string().uuid(),
+  action: z.enum(['arm_policy', 'arm_telemetry']),
+  subjectId: z.string().uuid(),
+});
+// Unattested restore binding — mirrors unattestedRestoreResourceDigest
+// (services/mfaStepUpGrant.ts). commandType is limited to the privileged
+// restore types (services/backupRestoreGate.ts): read-only validation never
+// needs a step-up, so a grant for it could never be spent.
+export const unattestedRestoreStepUpResource = z.object({
+  snapshotId: z.string().uuid(),
+  targetDeviceId: z.string().uuid(),
+  commandType: z.enum([
+    'backup_restore', 'mssql_restore', 'hyperv_restore', 'vm_restore_from_backup', 'vm_instant_boot',
+    'bmr_recover', 'bare_metal_rebuild',
+  ]),
+});
+// Autopay charge now: one invoice (routes/invoices/autopay.ts).
+export const autopayChargeNowStepUpResource = z.object({ invoiceId: z.string().uuid() });
+// Partner payment settings: the partner and the exact patch, parsed by the
+// same shared schema the PUT route uses, so a grant can be minted only for a
+// patch the route would accept (routes/billingPaymentSettings.ts).
+export const partnerPaymentSettingsStepUpResource = z.object({
+  partnerId: z.string().uuid(),
+  settings: partnerPaymentSettingsPatchSchema,
+});
+// Organization payment settings: the organization and the exact patch, parsed
+// by the same shared schema the org PUT route uses. `guid`, as on that route's
+// path parameter (routes/billingPaymentSettings.ts).
+export const orgPaymentSettingsStepUpResource = z.object({
+  orgId: z.string().guid(),
+  settings: orgPaymentSettingsPatchSchema,
+});
+// Opening a ticket migration window (#8313): mirrors the POST
+// /migration-windows body the grant is consumed by (routes/migrationWindows.ts).
+export const migrationWindowOpenStepUpResource = z.object({
+  partnerId: z.string().guid(),
+  principalId: z.string().guid(),
+  orgIds: z.array(z.string().guid()).min(1).max(MIGRATION_WINDOW_MAX_ORGS),
+  endsAt: z.string().datetime(),
+  writesPerHour: z.number().int().optional(),
+});
+// Redirected authorization request: mirrors the request body of
+// POST /billing/autopay/requests when recipientOverride is set.
+export const autopayRequestRecipientStepUpResource = z.object({
+  orgIds: z.array(z.string().uuid()).min(1).max(500),
+  recipientOverride: z.string().email().max(255),
+  mode: z.enum(['request', 'reauthorize']).optional(),
+});
+// Caller verification administrative disable (#6354 W05): mirrors
+// administrativeCallerVerificationSchema's reason bounds; the digest binds the
+// exact Entra subject so a grant cannot be spent against another contact.
+export const callerVerificationAdministrativeStepUpResource = z.object({
+  orgId: z.string().uuid(),
+  entraTenantId: z.string().min(1).max(64),
+  entraOid: z.string().min(1).max(64),
+  reason: z.string().trim().min(20).max(2000),
+}).strict();
+// Wisp W02 (Wisp design §4.2): grant create/refresh. `requestedCeilingHash` is
+// the server-computed hash from GET /wisp/grants/preview. `.strict()` and FIRST
+// in `stepUpResource`: the non-strict { partnerId } members below would
+// otherwise match first and strip orgId/requestedCeilingHash. No grantor
+// field — the digest always uses the authenticated caller.
+export const wispGrantStepUpResource = z.object({
+  partnerId: z.string().uuid(),
+  orgId: z.string().uuid().nullable(),
+  requestedCeilingHash: z.string().regex(/^[a-f0-9]{64}$/),
+}).strict();
+const stepUpResource = z.union([wispGrantStepUpResource, callerVerificationAdministrativeStepUpResource, rollbackStepUpResource, maintenanceStepUpResource, moveOrgStepUpResource, parkedAssignStepUpResource, parkedBulkAssignStepUpResource, scriptLaneStepUpResource, partnerScriptCeilingStepUpResource, topologyArmStepUpResource, preAssignmentEnableStepUpResource, unattestedRestoreStepUpResource, autopayChargeNowStepUpResource, partnerPaymentSettingsStepUpResource, autopayRequestRecipientStepUpResource, orgPaymentSettingsStepUpResource, forceRebootStepUpResource]);
 export const mfaStepUpSchema = z.discriminatedUnion('method', [
   z.object({
     method: z.literal('totp'),
@@ -229,6 +371,13 @@ export const mfaStepUpSchema = z.discriminatedUnion('method', [
     operation: stepUpOperation,
     resource: stepUpResource.optional(),
     passkeyId: z.string().uuid().optional(),
+  }),
+  z.object({
+    method: z.literal('recovery'),
+    code: z.string().refine(isMfaRecoveryCode, { message: 'Invalid code' }),
+    operation: z.literal('delete_passkey'),
+    passkeyId: z.string().uuid(),
+    resource: z.never().optional(),
   }),
 ]);
 

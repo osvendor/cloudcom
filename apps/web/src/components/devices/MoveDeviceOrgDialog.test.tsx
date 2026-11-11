@@ -339,7 +339,7 @@ describe('MoveDeviceOrgDialog (device move-org step-up D5)', () => {
     expect(screen.queryByTestId('move-org-currency-accept')).not.toBeInTheDocument();
   });
 
-  it('surfaces a 409 PAM_DEVICE_MOVE_BLOCKED message verbatim', async () => {
+  it('explains a 409 PAM_DEVICE_MOVE_BLOCKED in localized copy, not the raw server text', async () => {
     moveMock.mockRejectedValueOnce(Object.assign(
       new Error('Device organization move is blocked because durable PAM lifecycle evidence exists'),
       { status: 409, code: 'PAM_DEVICE_MOVE_BLOCKED' },
@@ -347,8 +347,41 @@ describe('MoveDeviceOrgDialog (device move-org step-up D5)', () => {
     renderDialog();
     await chooseTarget();
     await userEvent.click(screen.getByTestId('move-org-submit'));
-    await waitFor(() => expect(screen.getByText(/durable PAM lifecycle evidence/)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByTestId('move-org-error')).toHaveTextContent(/not enabled on this deployment/i));
+    expect(screen.getByTestId('move-org-error')).not.toHaveTextContent(/durable PAM lifecycle evidence/);
     expect(screen.queryByTestId('move-org-stepup-code')).not.toBeInTheDocument();
+  });
+
+  it('explains a 409 PAM_DEVICE_MOVE_ACTIVE as a session that has not finished cleanup', async () => {
+    moveMock.mockRejectedValueOnce(Object.assign(
+      new Error('raw server text'),
+      { status: 409, code: 'PAM_DEVICE_MOVE_ACTIVE' },
+    ));
+    renderDialog();
+    await chooseTarget();
+    await userEvent.click(screen.getByTestId('move-org-submit'));
+    await waitFor(() => expect(screen.getByTestId('move-org-error')).toHaveTextContent(/not finished cleanup/i));
+    expect(screen.getByTestId('move-org-error')).not.toHaveTextContent('raw server text');
+    expect(screen.queryByTestId('move-org-stepup-code')).not.toBeInTheDocument();
+  });
+
+  it('on a client timeout says the move may still be completing instead of a bare failure (#7988)', async () => {
+    const onCompleted = vi.fn();
+    moveMock.mockRejectedValueOnce(new DOMException('Request timed out after 300s', 'TimeoutError'));
+    renderDialog({ onCompleted });
+    await chooseTarget();
+    await userEvent.click(screen.getByTestId('move-org-submit'));
+    await waitFor(() => expect(screen.getByText(/may still be completing/i)).toBeInTheDocument());
+    expect(screen.queryByText(/timed out after 300s/)).not.toBeInTheDocument();
+    expect(onCompleted).not.toHaveBeenCalled();
+  });
+
+  it.each([502, 504, 524])('treats a %i gateway timeout as possibly still completing (#7988)', async (status) => {
+    moveMock.mockRejectedValueOnce(Object.assign(new Error('Failed to move device'), { status }));
+    renderDialog();
+    await chooseTarget();
+    await userEvent.click(screen.getByTestId('move-org-submit'));
+    await waitFor(() => expect(screen.getByText(/may still be completing/i)).toBeInTheDocument());
   });
 
   it('shows the no-other-org state when every other org is inactive', () => {

@@ -123,6 +123,86 @@ describe('QuoteEditor', () => {
     expect(showToast).not.toHaveBeenCalledWith(expect.objectContaining({ message: 'Terms saved' }));
   });
 
+  describe('footer line (quotes.terms, #6648)', () => {
+    const withInherited = (extra: Partial<QuoteDetailData['quote']> = {}): QuoteDetailData => ({
+      ...draftDetail(extra),
+      branding: {
+        partnerName: 'Acme', logoUrl: null, primaryColor: null, footer: 'Partner footer line',
+        currencyCode: 'USD', seller: null,
+        inheritedFooter: { text: 'Partner footer line', source: 'partner' },
+      },
+    });
+    const patchBody = () => {
+      const call = fetchMock.mock.calls.find((c) => c[0] === '/quotes/q-1' && (c[1] as RequestInit)?.method === 'PATCH');
+      return call ? JSON.parse((call[1] as RequestInit).body as string) : null;
+    };
+
+    it('shows the inherited footer and its source when blank', async () => {
+      render(<QuoteEditor detail={withInherited()} onChanged={vi.fn()} />);
+      const input = screen.getByTestId('quote-footer') as HTMLInputElement;
+      expect(input.value).toBe('');
+      expect(screen.getByTestId('quote-footer-inherited')).toHaveTextContent('Partner footer line');
+      expect(screen.getByTestId('quote-footer-inherited')).toHaveTextContent('Using the partner document footer from Billing settings');
+    });
+
+    it('labels the org footer source (#7510), and says so when no default footer exists', async () => {
+      const brand: QuoteDetailData = { ...withInherited(), branding: { ...withInherited().branding!, inheritedFooter: { text: 'Footer X', source: 'brand' } } };
+      const view = render(<QuoteEditor detail={brand} onChanged={vi.fn()} />);
+      expect(screen.getByTestId('quote-footer-inherited')).toHaveTextContent("Using this organization's footer text from its Portal settings");
+      view.unmount();
+      const none: QuoteDetailData = { ...withInherited(), branding: { ...withInherited().branding!, inheritedFooter: null } };
+      render(<QuoteEditor detail={none} onChanged={vi.fn()} />);
+      expect(screen.getByTestId('quote-footer-inherited')).toHaveTextContent('No default footer is set');
+    });
+
+    it('hides the inherited hint once an override is typed, and reseeds from a refetch', async () => {
+      const view = render(<QuoteEditor detail={withInherited()} onChanged={vi.fn()} />);
+      fireEvent.change(screen.getByTestId('quote-footer'), { target: { value: 'Mine' } });
+      expect(screen.getByTestId('quote-footer-inherited')).toBeEmptyDOMElement();
+      view.rerender(<QuoteEditor detail={withInherited({ terms: 'From server' })} onChanged={vi.fn()} />);
+      expect((screen.getByTestId('quote-footer') as HTMLInputElement).value).toBe('From server');
+    });
+
+    it('a failed save keeps the draft and toasts', async () => {
+      fetchMock.mockImplementation(async () => json({ error: 'boom' }, false, 500));
+      render(<QuoteEditor detail={withInherited()} onChanged={vi.fn()} />);
+      const input = screen.getByTestId('quote-footer') as HTMLInputElement;
+      fireEvent.change(input, { target: { value: 'Draft' } });
+      fireEvent.blur(input);
+      await waitFor(() => expect(showToast).toHaveBeenCalledWith(expect.objectContaining({ type: 'error' })));
+      expect(input.value).toBe('Draft');
+    });
+
+    it('pre-fills an existing override, distinct from Terms & Conditions', async () => {
+      render(<QuoteEditor detail={withInherited({ terms: 'Valid until 1 Oct', termsAndConditions: 'Net 30' })} onChanged={vi.fn()} />);
+      expect((screen.getByTestId('quote-footer') as HTMLInputElement).value).toBe('Valid until 1 Oct');
+      expect((screen.getByTestId('quote-terms') as HTMLTextAreaElement).value).toBe('Net 30');
+    });
+
+    it('blur PATCHes { terms } only, via runAction', async () => {
+      render(<QuoteEditor detail={withInherited()} onChanged={vi.fn()} />);
+      const input = screen.getByTestId('quote-footer');
+      fireEvent.change(input, { target: { value: 'Valid until 1 Oct' } });
+      fireEvent.blur(input);
+      await waitFor(() => expect(patchBody()).toEqual({ terms: 'Valid until 1 Oct' }));
+      await waitFor(() => expect(screen.getByTestId('quote-footer-saved')).toHaveTextContent('Saved'));
+    });
+
+    it('clearing an override sends terms: null so the footer inherits again', async () => {
+      render(<QuoteEditor detail={withInherited({ terms: 'Old' })} onChanged={vi.fn()} />);
+      const input = screen.getByTestId('quote-footer');
+      fireEvent.change(input, { target: { value: '   ' } });
+      fireEvent.blur(input);
+      await waitFor(() => expect(patchBody()).toEqual({ terms: null }));
+    });
+
+    it('caps the input at 160 chars and warns that it prints on every page', async () => {
+      render(<QuoteEditor detail={withInherited()} onChanged={vi.fn()} />);
+      expect(screen.getByTestId('quote-footer')).toHaveAttribute('maxlength', '160');
+      expect(screen.getByTestId('quote-footer-helper')).toHaveTextContent(/every page/i);
+    });
+  });
+
   it('editing the title and blurring issues PATCH /quotes/:id with { title }', async () => {
     // The editable title moved to the workspace header (QuoteHeaderMeta).
     render(<QuoteHeaderMeta detail={draftDetail()} onChanged={vi.fn()} />);
@@ -228,6 +308,36 @@ describe('QuoteEditor', () => {
     // reading 'Net 30' is the old effect-driven seed — the window that made
     // the field clobberable mid-keystroke.
     expect(seen).toEqual(['Net 45']);
+  });
+
+  // #4296: the blur-save fires a refetch it does not await, and the field
+  // re-enables as soon as the PATCH resolves. Text typed before that refetch
+  // lands is NEWER than the echo it carries, so the resync must keep it — and
+  // keep it dirty, or the next blur no-ops and the edit is silently lost.
+  it.each([
+    // [prop, testId, value the server stores for the first save]
+    ['termsAndConditions', 'quote-terms', 'First save '],
+    // The footer PATCH trims, so the echo is the TRIMMED value.
+    ['terms', 'quote-footer', 'First save'],
+  ] as const)('keeps %s typed during the save round-trip when the refetch echoes the saved value (#4296)', async (field, testId, echo) => {
+    const onChanged = vi.fn();
+    const { rerender } = render(<QuoteEditor detail={draftDetail({ [field]: 'Original' })} onChanged={onChanged} />);
+    await waitFor(() => expect(screen.getByTestId('quote-editor')).toBeInTheDocument());
+
+    fireEvent.change(screen.getByTestId(testId), { target: { value: 'First save ' } });
+    fireEvent.blur(screen.getByTestId(testId));
+    await waitFor(() => expect(onChanged).toHaveBeenCalled());
+    await waitFor(() => expect(screen.getByTestId(testId)).not.toBeDisabled());
+
+    fireEvent.change(screen.getByTestId(testId), { target: { value: 'First save, then more' } });
+    rerender(<QuoteEditor detail={draftDetail({ [field]: echo })} onChanged={onChanged} />);
+    expect(screen.getByTestId(testId)).toHaveValue('First save, then more');
+
+    fireEvent.blur(screen.getByTestId(testId));
+    await waitFor(() => expect(fetchMock.mock.calls.some(
+      (c) => (c[1] as RequestInit)?.method === 'PATCH'
+        && String((c[1] as RequestInit)?.body).includes('First save, then more'),
+    )).toBe(true));
   });
 
   // The deposit-percent draft has the identical shape: a live-typed numeric

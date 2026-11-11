@@ -1,5 +1,6 @@
 {
   "titles": {
+    "adminMonitorConversion": "Conversione avvisi legacy",
     "notFound": "Pagina non trovata",
     "serverError": "Qualcosa è andato storto",
     "acceptInvite": "Accetta invito",
@@ -14,22 +15,26 @@
     "adminConnectedApps": "App connesse (admin)",
     "adminLlmProviderCatalog": "Catalogo dei fornitori LLM",
     "adminQuarantined": "Dispositivi in quarantena",
+    "adminSystem": "Sistema",
     "adminThirdPartyCatalog": "Catalogo di terze parti",
     "adminTrustAct": "Azione di attendibilità del partner",
     "adminTrustQueue": "Coda di attendibilità del partner",
     "adminSendingDomains": "Domini di invio del partner",
     "adminUsersDetailDevices": "Dispositivi dell'utente",
     "aiAgentsImpact": "Impatto IA",
+    "aiAgentsFixMemory": "Memoria delle correzioni",
+    "flows": "Flussi",
+    "flowDetail": "Flusso",
+    "flowRun": "Esecuzione flusso",
     "aiAgentsRunsDetail": "Dettaglio esecuzione",
     "aiAgentsRuns": "Esecuzioni degli agenti",
-    "aiForOffice": "AI per Office",
+    "aiForOffice": "Breeze AI for Office",
     "aiRisk": "Motore di rischio IA",
     "alertsDelivery": "Avvisi – Consegna",
     "alertsCorrelations": "Correlazioni degli avvisi",
     "alertsDetail": "Dettagli avviso",
     "alertsMonitors": "Avvisi – Monitor",
     "alertsMonitorDetail": "Avvisi – Monitor",
-    "alertsRules": "Avvisi – Regole legacy",
     "alerts": "Avvisi",
     "analytics": "Analisi",
     "approvals": "Approvazioni",
@@ -59,6 +64,7 @@
     "contractsNew": "Nuovo contratto",
     "devicesCompare": "Confronto dispositivi",
     "devicesGroups": "Gruppi di dispositivi",
+    "devicesUnassigned": "Dispositivi non assegnati",
     "devicesDetail": "Dettagli dispositivo",
     "devices": "Dispositivi e asset",
     "devicesNetworkDetail": "Dettagli dispositivo di rete",
@@ -67,18 +73,19 @@
     "dnsSecurity": "Sicurezza DNS",
     "dr": "Ripristino di emergenza",
     "extensionsNamePath": "Estensione",
-    "fleet": "Orchestrazione della flotta",
+    "fleet": "Rilevazioni",
     "forgotPassword": "Password dimenticata",
     "incidentsDetail": "Dettaglio incidente",
-    "incidents": "Incidenti",
+    "incidents": "Incidenti di sicurezza",
     "dashboard": "Dashboard",
     "integrations": "Integrazioni",
     "integrationsPsa": "Integrazioni PSA",
     "integrationsWebhooks": "Webhook",
     "login": "Accedi",
     "logs": "Registri",
-    "monitoring": "Monitoraggio",
+    "monitoring": "Rete",
     "oauthConsent": "Autorizza accesso",
+    "oauthError": "Connessione dell’app non riuscita",
     "onedrive": "OneDrive",
     "organizations": "Organizzazioni",
     "organizationsDetail": "Organizzazione",
@@ -91,6 +98,7 @@
     "policies": "Criteri",
     "policiesNew": "Nuovo criterio",
     "quick": "Supporto rapido",
+    "verify": "Controlla una richiesta di assistenza",
     "registerPartner": "Registra la tua azienda",
     "remoteFilesDevice": "Gestione file remota",
     "remoteFiles": "Avvia trasferimento file",
@@ -106,6 +114,7 @@
     "reportsDetailEdit": "Modifica report",
     "reports": "Report",
     "reportsNew": "Crea report",
+    "reportsSeriesEdit": "Modifica report multi-organizzazione",
     "reportsTemplates": "Modelli di report",
     "resetPassword": "Reimposta password",
     "scriptsDetail": "Modifica script",
@@ -130,12 +139,11 @@
     "settingsAiUsage": "Utilizzo AI",
     "settingsAiScriptAuthoring": "Creazione di script",
     "settingsToolSources": "Fonti degli strumenti",
-    "settingsAlertTemplatesDetail": "Modello di avviso",
-    "settingsAlertTemplates": "Modelli di avviso",
     "settingsApiKeys": "Chiavi API",
     "settingsBilling": "Impostazioni di fatturazione",
     "settingsCatalog": "Catalogo prodotti",
     "settingsConnectedApps": "App connesse",
+    "settingsDeliverableTemplates": "Modelli di deliverable",
     "settingsCustomFields": "Campi personalizzati",
     "settingsEnrollmentKeys": "Chiavi di registrazione",
     "settingsFilters": "Filtri salvati",
@@ -149,6 +157,7 @@
     "settingsProfile": "Impostazioni profilo",
     "settingsRoles": "Ruoli",
     "settingsSitesDetail": "Impostazioni sede",
+    "settingsSites": "Siti",
     "settingsSso": "Single Sign-On (SSO)",
     "settingsUsers": "Utenti",
     "settingsVariables": "Variabili",
@@ -162,14 +171,28 @@
     "ticketsNew": "Crea ticket",
     "timesheet": "Foglio ore",
     "vulnerabilities": "Vulnerabilità",
-    "workspace": "Assistente IA",
     "aiAgentsFleetDesign": "Progettazione flotta",
     "agreementTemplates": "Modelli di accordo",
     "agreementTemplateDetail": "Modello di accordo",
     "agreementTemplateNew": "Nuovo modello di accordo",
     "signedAgreements": "Accordi firmati",
     "settingsTicketing": "Impostazioni ticket",
-    "securityScans": "Scansioni IOC"
+    "securityScans": "Scansioni IOC",
+    "devicesTime": "Sincronizzazione dell’ora",
+    "adminAiModels": "Modelli di IA",
+    "adminWisp": "Wisp",
+    "billingAutopay": "Pagamenti automatici",
+    "endpointMessages": "Messaggi agli endpoint",
+    "securityDetectionRules": "Regole di rilevamento",
+    "settingsPlan": "Piano e funzionalità",
+    "settingsWispMemory": "Memoria di Wisp",
+    "wispThread": "Thread di Wisp",
+    "wisp": "Wisp",
+    "wispChat": "Breeze AI",
+    "aiTasks": "Attività IA",
+    "aiTask": "Attività IA",
+    "settingsAi": "Impostazioni IA",
+    "settingsFlowLimits": "Limiti dei flussi"
   },
   "layout": {
     "metaDescription": "Breeze RMM - Monitoraggio e gestione remota",
@@ -178,12 +201,43 @@
   "authShell": {
     "tagline": "La piattaforma RMM moderna pensata per velocità, chiarezza e scalabilità."
   },
+  "authFooter": {
+    "reportAbuse": "Segnala un abuso",
+    "security": "Sicurezza"
+  },
   "errorPage": {
     "notFoundBody": "La pagina che stai cercando non esiste o potrebbe essere stata spostata.",
     "serverErrorBody": "Si è verificato un errore imprevisto da parte nostra. Il nostro team è stato avvisato — riprova tra un momento.",
     "referenceIdLabel": "ID di riferimento:",
     "dashboardLink": "Vai alla dashboard",
     "signInLink": "Accedi"
+  },
+  "oauthErrorPage": {
+    "invalidClient": {
+      "heading": "Questa app non può connettersi",
+      "body": "Breeze non riconosce l’app che ti ha mandato qui, oppure l’app non è autorizzata a connettersi a questo server Breeze. Verifica che l’app sia configurata con l’indirizzo di questo server, quindi riprova."
+    },
+    "invalidRedirectUri": {
+      "heading": "L’indirizzo di ritorno di questa app non è registrato",
+      "body": "L’app ha chiesto a Breeze di rimandarti a un indirizzo che non ha mai registrato, quindi Breeze si è fermato qui per proteggere il tuo account. Lo sviluppatore dell’app o il tuo amministratore deve correggere l’URL di reindirizzamento dell’app."
+    },
+    "sessionExpired": {
+      "heading": "Questo accesso è scaduto",
+      "body": "La connessione ha richiesto troppo tempo oppure è stata avviata in un altro browser. Torna all’app e connettiti di nuovo."
+    },
+    "invalidRequest": {
+      "heading": "L’app ha inviato una richiesta che Breeze non può accettare",
+      "body": "La richiesta di connessione dell’app era incompleta o chiedeva qualcosa che questo server non supporta. Torna all’app e riprova. Se il problema persiste, contatta lo sviluppatore dell’app."
+    },
+    "serverError": {
+      "heading": "Breeze non è riuscito a completare la connessione",
+      "body": "Si è verificato un errore da parte nostra. Attendi qualche minuto, poi torna all’app e riprova."
+    },
+    "generic": {
+      "heading": "Impossibile completare questa connessione",
+      "body": "Torna all’app e avvia di nuovo la connessione. Se il problema persiste, contatta il tuo amministratore Breeze."
+    },
+    "nextStep": "Non è stato concesso alcun accesso. Puoi chiudere questa pagina."
   },
   "settingsIndex": {
     "heading": "Impostazioni",
@@ -219,7 +273,7 @@
       },
       "connectedApps": {
         "title": "App connesse",
-        "description": "Rivedi e revoca gli assistenti IA e i client MCP autorizzati ad accedere al tuo tenant."
+        "description": "Rivedi e revoca i client AI autorizzati ad accedere al tuo tenant."
       },
       "officeAddinBindings": {
         "title": "Associazioni componente aggiuntivo Outlook",
@@ -236,8 +290,45 @@
       "ticketChecklistTemplates": {
         "title": "Modelli di checklist per i ticket",
         "description": "Elenchi di passaggi riutilizzabili che i tuoi tecnici possono applicare a qualsiasi ticket."
+      },
+      "profile": {
+        "title": "Il mio profilo"
+      },
+      "apiKeys": {
+        "title": "Chiavi API"
+      },
+      "partnerServicePrincipals": {
+        "title": "Entità servizio"
+      },
+      "alertTemplates": {
+        "title": "Modelli di avviso"
+      },
+      "plan": {
+        "title": "Piano e funzionalità",
+        "description": "Il tuo piano, quali funzionalità include e da dove proviene ciascuna."
+      },
+      "wispMemory": {
+        "title": "Memoria di Wisp",
+        "description": "Controlla, conferma e ritira ciò che Wisp ricorda."
+      },
+      "flowLimits": {
+        "title": "Limiti dei flussi",
+        "description": "Limiti mensili di esecuzioni e limite di token IA per i flussi."
       }
-    }
+    },
+    "groups": {
+      "account": "Account e accesso",
+      "billing": "Fatturazione e service desk",
+      "devices": "Dispositivi e registrazione",
+      "data": "Automazione e dati",
+      "ai": "IA",
+      "integrations": "Integrazioni"
+    },
+    "search": {
+      "label": "Cerca impostazioni",
+      "placeholder": "Cerca impostazioni…"
+    },
+    "noResults": "Nessuna impostazione corrisponde alla ricerca."
   },
   "settingsBillingPage": {
     "heading": "Impostazioni di fatturazione",
@@ -245,7 +336,7 @@
   },
   "settingsConnectedAppsPage": {
     "heading": "App connesse",
-    "description": "Assistenti IA e altri client MCP autorizzati ad accedere al tuo tenant tramite OAuth. Revoca l'accesso in qualsiasi momento — il token dell'app verrà rifiutato entro 10 minuti."
+    "description": "Client AI autorizzati ad accedere al tuo tenant tramite OAuth. Revoca l'accesso in qualsiasi momento — il token dell'app verrà rifiutato entro 10 minuti."
   },
   "settingsOrganizationBillingPage": {
     "backLink": "← Impostazioni organizzazione",

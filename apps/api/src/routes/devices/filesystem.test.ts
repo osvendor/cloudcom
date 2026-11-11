@@ -63,10 +63,16 @@ vi.mock('../../services/commandQueue', () => ({
   }
 }));
 
+vi.mock('../../services/aiRemoteToolsPolicy', () => ({
+  REMOTE_TOOLS_DISABLED_BY_POLICY: 'REMOTE_TOOLS_DISABLED_BY_POLICY',
+  checkDeviceRemoteToolsPolicy: vi.fn(async () => ({ allowed: true })),
+}));
+
 vi.mock('../../services/filesystemAnalysis', () => ({
   getLatestFilesystemSnapshot: vi.fn(),
   getFilesystemScanState: vi.fn(),
   setFilesystemScanGeneration: vi.fn(),
+  findInFlightFilesystemScan: vi.fn(async () => null),
   readHotDirectories: vi.fn(() => []),
   readCheckpointPendingDirectories: vi.fn(() => []),
   parseFilesystemAnalysisStdout: vi.fn(),
@@ -110,6 +116,7 @@ import { runCleanupExecution } from '../../services/filesystemCleanupExecution';
 import { db } from '../../db';
 import { writeRouteAudit } from '../../services/auditEvents';
 import { filesystemRoutes } from './filesystem';
+import { checkDeviceRemoteToolsPolicy } from '../../services/aiRemoteToolsPolicy';
 import { getDeviceWithOrgAndSiteCheck, SITE_ACCESS_DENIED } from './helpers';
 import { executeCommand, executeCommandWithSystemPrecheck, queueCommandForExecution } from '../../services/commandQueue';
 import {
@@ -117,6 +124,7 @@ import {
   getLatestFilesystemCleanupSnapshot,
   getFilesystemScanState,
   setFilesystemScanGeneration,
+  findInFlightFilesystemScan,
   readHotDirectories,
   readCheckpointPendingDirectories,
   buildCleanupPreview,
@@ -165,6 +173,7 @@ describe('device filesystem routes', () => {
     const actual = await vi.importActual<typeof import('../../services/filesystemCleanupExecution')>('../../services/filesystemCleanupExecution');
     vi.mocked(runCleanupExecution).mockReset().mockImplementation(actual.runCleanupExecution);
     vi.mocked(listFilesystemVolumes).mockResolvedValue([]);
+    vi.mocked(findInFlightFilesystemScan).mockReset().mockResolvedValue(null);
     app = new Hono();
     app.route('/devices', filesystemRoutes);
   });
@@ -652,6 +661,44 @@ describe('device filesystem routes', () => {
     expect(getLatestFilesystemSnapshot).not.toHaveBeenCalled();
   });
 
+  // The scan and the cleanup delete dispatch to the device, the
+  // same class as /system-tools, and honour the per-device remote-tools policy.
+  it('refuses the filesystem scan when the remote-tools policy is off, before queueing', async () => {
+    vi.mocked(getDeviceWithOrgAndSiteCheck).mockResolvedValue({ id: deviceId, orgId: 'org-123', hostname: 'host-1' } as never);
+    vi.mocked(checkDeviceRemoteToolsPolicy).mockResolvedValueOnce({ allowed: false, reason: 'Remote tools is disabled by policy "Locked"' });
+
+    const res = await app.request(`/devices/${deviceId}/filesystem/scan`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: '/tmp' }),
+    });
+
+    expect(res.status).toBe(403);
+    const body = await res.json();
+    expect(body.success).toBe(false);
+    expect(body.code).toBe('REMOTE_TOOLS_DISABLED_BY_POLICY');
+    expect(checkDeviceRemoteToolsPolicy).toHaveBeenCalledWith(deviceId);
+    expect(queueCommandForExecution).not.toHaveBeenCalled();
+  });
+
+  it('refuses cleanup-execute when the remote-tools policy is off, without claiming the run or deleting', async () => {
+    vi.mocked(getDeviceWithOrgAndSiteCheck).mockResolvedValue({ id: deviceId, orgId: 'org-123', hostname: 'host-1', osType: 'linux', agentVersion: '0.115.0' } as never);
+    vi.mocked(checkDeviceRemoteToolsPolicy).mockResolvedValueOnce({ allowed: false, reason: 'Remote tools is disabled by policy "Locked"' });
+
+    const res = await app.request(`/devices/${deviceId}/filesystem/cleanup-execute`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ paths: ['/tmp/a.tmp'], cleanupRunId: '22222222-2222-2222-2222-222222222222' }),
+    });
+
+    expect(res.status).toBe(403);
+    const body = await res.json();
+    expect(body.code).toBe('REMOTE_TOOLS_DISABLED_BY_POLICY');
+    expect(db.update).not.toHaveBeenCalled();
+    expect(runCleanupExecution).not.toHaveBeenCalled();
+    expect(executeCommandWithSystemPrecheck).not.toHaveBeenCalled();
+  });
+
   it('denies filesystem scan when site scope excludes the device', async () => {
     vi.mocked(getDeviceWithOrgAndSiteCheck).mockResolvedValue(SITE_ACCESS_DENIED as never);
 
@@ -1122,6 +1169,58 @@ describe('device filesystem routes', () => {
       });
 
       expect(setFilesystemScanGeneration).toHaveBeenCalledWith(deviceId, 'org-123', 'D:\\', 'cmd-gen');
+    });
+
+    it('returns the in-flight scan instead of queueing a second one (#8509)', async () => {
+      // Overlapping scans on a DC each froze VSS for 40-149 s. A scan already
+      // pending/sent to this device — of ANY volume, since the agent runs one
+      // walker at a time — is returned rather than duplicated.
+      vi.mocked(getDeviceWithOrgAndSiteCheck).mockResolvedValue(windowsDevice as never);
+      vi.mocked(listFilesystemVolumes).mockResolvedValue(twoWindowsVolumes() as never);
+      vi.mocked(getFilesystemScanState).mockResolvedValue(null as never);
+      const createdAt = new Date('2026-10-12T09:00:00Z');
+      vi.mocked(findInFlightFilesystemScan).mockResolvedValueOnce({
+        id: 'cmd-running', status: 'sent', createdAt, scanPath: 'C:\\',
+      });
+
+      const res = await app.request(`/devices/${deviceId}/filesystem/scan`, {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: 'D:\\' }),
+      });
+
+      expect(res.status).toBe(202);
+      const body = await res.json();
+      expect(body.success).toBe(true);
+      expect(body.data).toMatchObject({
+        commandId: 'cmd-running',
+        status: 'sent',
+        inFlight: true,
+        scanPath: 'C:\\',
+        createdAt: createdAt.toISOString(),
+      });
+      expect(findInFlightFilesystemScan).toHaveBeenCalledWith(deviceId);
+      expect(queueCommandForExecution).not.toHaveBeenCalled();
+      // Re-pointing the generation at a command that never runs would drop the
+      // running scan's result as superseded.
+      expect(setFilesystemScanGeneration).not.toHaveBeenCalled();
+    });
+
+    it('still refuses on the remote-tools policy before reporting an in-flight scan', async () => {
+      vi.mocked(getDeviceWithOrgAndSiteCheck).mockResolvedValue(windowsDevice as never);
+      vi.mocked(checkDeviceRemoteToolsPolicy).mockResolvedValueOnce({ allowed: false, reason: 'off' });
+      vi.mocked(findInFlightFilesystemScan).mockResolvedValueOnce({
+        id: 'cmd-running', status: 'sent', createdAt: new Date(), scanPath: 'C:\\',
+      });
+
+      const res = await app.request(`/devices/${deviceId}/filesystem/scan`, {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: 'C:\\' }),
+      });
+
+      expect(res.status).toBe(403);
+      expect(findInFlightFilesystemScan).not.toHaveBeenCalled();
     });
 
     it('does not record a generation when the command could not be queued', async () => {

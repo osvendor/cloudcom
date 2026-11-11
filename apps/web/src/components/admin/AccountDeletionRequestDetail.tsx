@@ -8,6 +8,8 @@ import { formatAbsolute, formatRelative } from '../account/relativeTime';
 // an island that hydrates before whichever other island happens to pull i18n in
 // would otherwise render raw keys (and mismatch the SSR markup).
 import '../../lib/i18n';
+import { useStableT } from '@/lib/i18n/useStableT';
+import { usePageItemName } from '../layout/usePageItemName';
 
 interface AdminDeletionRequest {
   requestId: string;
@@ -46,7 +48,9 @@ interface Props {
 
 export default function AccountDeletionRequestDetail({ requestId }: Props) {
   const { t } = useTranslation('admin');
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   const [state, setState] = useState<LoadState>({ kind: 'loading' });
+  usePageItemName(state.kind === 'ready' ? state.request.user?.name || state.request.user?.email : undefined);
   const [dialog, setDialog] = useState<ConfirmDialogState | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
@@ -58,14 +62,14 @@ export default function AccountDeletionRequestDetail({ requestId }: Props) {
       if (res.status === 404) return setState({ kind: 'not-found' });
       if (!res.ok) {
         const body = (await res.json().catch(() => ({}))) as { error?: string };
-        return setState({ kind: 'error', message: body.error ?? t('admin.accountDeletionRequestDetail.errors.requestFailed', { status: res.status }) });
+        return setState({ kind: 'error', message: body.error ?? stableT('admin.accountDeletionRequestDetail.errors.requestFailed', { status: res.status }) });
       }
       const body = (await res.json()) as AdminDeletionRequest;
       setState({ kind: 'ready', request: body });
     } catch (err) {
-      setState({ kind: 'error', message: err instanceof Error ? err.message : t('admin.accountDeletionRequestDetail.errors.network') });
+      setState({ kind: 'error', message: err instanceof Error ? err.message : stableT('admin.accountDeletionRequestDetail.errors.network') });
     }
-  }, [requestId, t]);
+  }, [requestId, stableT]);
 
   useEffect(() => {
     void load();

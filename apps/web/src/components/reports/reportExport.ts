@@ -2,9 +2,18 @@ import type { PostureSummary, ExecutiveSummary, OrgNarrativeReportSummary, Fleet
   EndpointManagementSummary,
   VulnerabilityManagementSummary,
   IdentityAccessSummary,
+  TicketSlaSummary,
+  TechnicianTimeSummary,
+  AiUsageByClientSummary,
+  ArAgingSummary,
+  MrrRenewalsSummary,
+  QuoteWinRateSummary,
+  ClientProfitabilitySummary,
+  TicketSlaPerformanceSummary,
 } from '@breeze/shared';
+import { isTicketSlaPerformanceSummary, rowsToXlsx, sheetsToXlsx, ticketSlaPerformanceSheets, XLSX_MIME_TYPE } from '@breeze/shared';
 import { formatDateTime } from '@/lib/dateTimeFormat';
-import { escapeCsvCell, escapeTsvCell, neutralizeSpreadsheetFormula, rowsToCsv, rowsToTsv } from '@/lib/csvExport';
+import { escapeCsvCell, escapeTsvCell, neutralizeSpreadsheetFormula, rowsToCsv } from '@/lib/csvExport';
 import { downloadBlob } from '@/lib/downloadBlob';
 import { sanitizeImageSrc } from '@/lib/safeImageSrc';
 import { fetchWithAuth } from '../../stores/auth';
@@ -25,7 +34,7 @@ export function getBrowserTimezone(): string {
 }
 
 /**
- * Export report rows as CSV, Excel (TSV with .xls extension), or PDF.
+ * Export report rows as CSV, Excel (.xlsx workbook), or PDF.
  *
  * Throws if rows is empty for CSV/Excel formats. When `summary` is supplied for
  * the security_compliance_posture report, the PDF leads with a posture scorecard
@@ -51,7 +60,12 @@ export async function exportReport(
     // summary that does not typecheck here gets dropped at the call site, and
     // the PDF silently falls through to the generic renderer, keeping the
     // sign-in rows while losing every limit printed alongside them.
-    summary?: PostureSummary | ExecutiveSummary | OrgNarrativeReportSummary | FleetDesignReportSummary | EndpointManagementSummary | VulnerabilityManagementSummary | IdentityAccessSummary;
+    // #3198 W03: further widened for the three business report types (ticket
+    // SLA attainment, technician time & billability, AR aging) — see
+    // reportExport.business.test.tsx.
+    summary?: PostureSummary | ExecutiveSummary | OrgNarrativeReportSummary | FleetDesignReportSummary | EndpointManagementSummary | VulnerabilityManagementSummary | IdentityAccessSummary
+      | TicketSlaSummary | TechnicianTimeSummary | ArAgingSummary | AiUsageByClientSummary | MrrRenewalsSummary | QuoteWinRateSummary
+      | ClientProfitabilitySummary | TicketSlaPerformanceSummary;
     /** Slim baseline from the previous completed run (report_runs.result.previous),
      * used to draw the scorecard trend chip; ignored by non-cover report types. */
     previous?: { generatedAt?: string | null; summary?: unknown };
@@ -72,8 +86,20 @@ export async function exportReport(
 
   if (format === 'excel') {
     if (rows.length === 0) throw new Error('No data to export');
-    const tsvContent = rowsToTsv(rows);
-    downloadBlob(new Blob([tsvContent], { type: 'application/vnd.ms-excel' }), `${baseFilename}.xls`);
+    // #9956: a real workbook (was TSV text saved as .xls). Throws
+    // XlsxLimitError past Excel's worksheet limits; callers surface the message.
+    let workbook: Uint8Array<ArrayBuffer>;
+    if (reportType === 'ticket_sla_performance') {
+      // A priorities-only workbook would read as complete while every breach is missing.
+      if (!isTicketSlaPerformanceSummary(summary)) {
+        throw new Error('This SLA performance run has no readable summary, so its breaches cannot be exported.');
+      }
+      // Shared with the API's stored-run download (#11277) so the two cannot drift.
+      workbook = sheetsToXlsx(ticketSlaPerformanceSheets(rows, summary));
+    } else {
+      workbook = rowsToXlsx(rows);
+    }
+    downloadBlob(new Blob([workbook], { type: XLSX_MIME_TYPE }), `${baseFilename}.xlsx`);
     return;
   }
 

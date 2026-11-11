@@ -577,6 +577,87 @@ describe('POST /verify-email — SR2-21 pending-registration finalization (step 
     transitionState.events = [];
   });
 
+  it('resolves a record with neither intent nor selection to the cloud intent only when creating a new account, including its billing hook', async () => {
+    vi.mocked(peekPendingRegistration).mockResolvedValueOnce({ ...PENDING_RECORD, rawToken: 'old-pending' });
+    primeFinalizeSelects();
+    vi.mocked(dispatchHook).mockResolvedValueOnce(null);
+    const res = await postJson('/verify-email', { token: 'old-pending' });
+    const purchaseSelection = { intent: 'cloud' };
+    expect(res.status).toBe(200);
+    expect(createPartner).toHaveBeenCalledWith(expect.objectContaining({ purchaseSelection, status: 'pending' }), expect.objectContaining({ tx: expect.anything() }));
+    expect(dispatchHook).toHaveBeenCalledWith('registration', 'p-1', expect.objectContaining({ purchaseSelection }));
+    expect((await res.json()).redirectUrl).toBe('/billing/plans');
+  });
+
+  it('maps an old record carrying the launch tuple to the cloud intent', async () => {
+    vi.mocked(peekPendingRegistration).mockResolvedValueOnce({ ...PENDING_RECORD, rawToken: 'old-tuple', purchaseSelection: { catalogVersion: 'launch-2026-10', capacity: 500, billingPeriod: 'annual' } });
+    primeFinalizeSelects();
+    vi.mocked(dispatchHook).mockResolvedValueOnce(null);
+    const res = await postJson('/verify-email', { token: 'old-tuple' });
+    expect(res.status).toBe(200);
+    expect(createPartner).toHaveBeenCalledWith(expect.objectContaining({ purchaseSelection: { intent: 'cloud' } }), expect.anything());
+    expect(dispatchHook).toHaveBeenCalledWith('registration', 'p-1', expect.objectContaining({ purchaseSelection: { intent: 'cloud' } }));
+  });
+
+  it('does not infer launch intent for an old pending snapshot belonging to an existing user', async () => {
+    vi.mocked(peekPendingRegistration).mockResolvedValueOnce({ ...PENDING_RECORD, rawToken: 'existing-old-pending' });
+    primeFinalizeSelects([{ id: 'existing-user' }]);
+    const res = await postJson('/verify-email', { token: 'existing-old-pending' });
+    expect(await res.json()).toEqual({ verified: false, status: 'sign_in' });
+    expect(createPartner).not.toHaveBeenCalled();
+    expect(dispatchHook).not.toHaveBeenCalled();
+    expect(db.update).not.toHaveBeenCalled();
+  });
+
+  it('commits selected intent with account authority and recovers the billing redirect when the hook is unavailable', async () => {
+    const purchaseSelection = { intent: 'wisp' as const, offer: 'founding' };
+    vi.mocked(peekPendingRegistration).mockResolvedValueOnce({ ...PENDING_RECORD, rawToken: 'other-device', signupIntent: purchaseSelection });
+    primeFinalizeSelects();
+    vi.mocked(dispatchHook).mockResolvedValueOnce(null);
+    const res = await postJson('/verify-email', { token: 'other-device' });
+    expect(res.status).toBe(200);
+    expect(createPartner).toHaveBeenCalledWith(expect.objectContaining({ purchaseSelection, status: 'pending' }), expect.objectContaining({ tx: expect.anything() }));
+    expect(dispatchHook).toHaveBeenCalledWith('registration', 'p-1', expect.objectContaining({ purchaseSelection }));
+    expect((await res.json()).redirectUrl).toBe('/billing/plans');
+  });
+
+  it('preserves an explicit pending review hold with no checkout action or redirect', async () => {
+    vi.mocked(peekPendingRegistration).mockResolvedValueOnce({ ...PENDING_RECORD, rawToken: 'review', signupIntent: { intent: 'cloud', offer: 'founding' } });
+    primeFinalizeSelects();
+    vi.mocked(dispatchHook).mockResolvedValueOnce({ status: 'pending', message: 'Your account is under review.' });
+    const res = await postJson('/verify-email', { token: 'review' });
+    expect(res.status).toBe(200);
+    expect(await res.json()).not.toHaveProperty('redirectUrl');
+  });
+
+  it.each(['suspended', 'churned'])('does not bypass an explicit %s hook hold with a selected billing fallback', async (status) => {
+    vi.mocked(peekPendingRegistration).mockResolvedValueOnce({ ...PENDING_RECORD, rawToken: 'hold', signupIntent: { intent: 'cloud' } });
+    primeFinalizeSelects();
+    vi.mocked(dispatchHook).mockResolvedValueOnce({ status });
+    const res = await postJson('/verify-email', { token: 'hold' });
+    expect(res.status).toBe(200);
+    expect(await res.json()).not.toHaveProperty('redirectUrl');
+  });
+
+  it('returns the normalized signupIntent, never a purchaseSelection, for a legacy launch-tuple record on the sign_in path', async () => {
+    vi.mocked(peekPendingRegistration).mockResolvedValueOnce({ ...PENDING_RECORD, rawToken: 'existing-legacy', purchaseSelection: { catalogVersion: 'launch-2026-10', capacity: 1000, billingPeriod: 'annual' } });
+    primeFinalizeSelects([{ id: 'existing-user' }]);
+    const res = await postJson('/verify-email', { token: 'existing-legacy' });
+    const body = await res.json();
+    expect(body).toEqual({ verified: false, status: 'sign_in', signupIntent: { intent: 'cloud' } });
+    expect(Object.hasOwn(body, 'purchaseSelection')).toBe(false);
+  });
+
+  it('does not overwrite existing accounts with intent from a replay or concurrent signup', async () => {
+    vi.mocked(peekPendingRegistration).mockResolvedValueOnce({ ...PENDING_RECORD, rawToken: 'existing', signupIntent: { intent: 'wisp', offer: 'founding' } });
+    primeFinalizeSelects([{ id: 'existing-user' }]);
+    const res = await postJson('/verify-email', { token: 'existing' });
+    expect(await res.json()).toEqual({ verified: false, status: 'sign_in', signupIntent: { intent: 'wisp', offer: 'founding' } });
+    expect(createPartner).not.toHaveBeenCalled();
+    expect(dispatchHook).not.toHaveBeenCalled();
+    expect(db.update).not.toHaveBeenCalled();
+  });
+
   it('audits signup probation once under enforce and not under shadow', async () => {
     const previousMode = process.env.PARTNER_TRUST_MODE;
     try {
@@ -724,6 +805,35 @@ describe('POST /verify-email — SR2-21 pending-registration finalization (step 
     expect(transitionState.issuedFamilies).toEqual(['guarded-family-1']);
     expect(beginAuthIssuance).toHaveBeenCalledWith({ kind: 'browser', value: 'a'.repeat(64) });
     expect(beginAuthIssuance).toHaveBeenCalledWith({ kind: 'browser', value: 'b'.repeat(64) });
+  });
+
+  it('echoes the recorded signupIntent when a cross-binding loser maps to sign_in', async () => {
+    vi.mocked(peekPendingRegistration)
+      .mockResolvedValueOnce({ ...PENDING_RECORD, rawToken: 'raw' })
+      .mockResolvedValueOnce({ ...PENDING_RECORD, rawToken: 'raw', signupIntent: { intent: 'wisp', offer: 'founding' } });
+    primeFinalizeSelects([]);
+    const winnerResponse = await postJson('/verify-email', { token: 'raw' }, {
+      'x-breeze-auth-transition': 'v1',
+      'x-test-auth-binding': 'a'.repeat(64),
+    });
+    expect(winnerResponse.status).toBe(200);
+
+    vi.mocked(db.select)
+      .mockReturnValueOnce(selectChain([]) as never)
+      .mockReturnValueOnce(selectChain([{ id: 'u-1' }]) as never);
+    vi.mocked(createPartner).mockRejectedValueOnce({
+      cause: {
+        code: '23505',
+        constraint_name: 'partners_slug_unique',
+      },
+    });
+    const loserResponse = await postJson('/verify-email', { token: 'raw' }, {
+      'x-breeze-auth-transition': 'v1',
+      'x-test-auth-binding': 'b'.repeat(64),
+    });
+
+    expect(loserResponse.status).toBe(200);
+    expect(await loserResponse.json()).toEqual({ verified: false, status: 'sign_in', signupIntent: { intent: 'wisp', offer: 'founding' } });
   });
 
   it('maps a 23505 with no durable email winner to a retryable conflict and leaves Redis untouched', async () => {

@@ -1,13 +1,19 @@
-import { pgTable, uuid, varchar, text, integer, timestamp, boolean, jsonb, pgEnum, index } from 'drizzle-orm/pg-core';
+import { pgTable, uuid, varchar, text, integer, timestamp, boolean, jsonb, pgEnum, index, uniqueIndex, numeric, char, foreignKey } from 'drizzle-orm/pg-core';
+import { sql } from 'drizzle-orm';
+import { xid8 } from './columnTypes';
 import { organizations, partners } from './orgs';
 import { devices } from './devices';
 import { users } from './users';
+import { businessCalendarRevisions } from './businessCalendars';
 
 export const ticketStatusEnum = pgEnum('ticket_status', ['new', 'open', 'pending', 'on_hold', 'resolved', 'closed']);
 export const ticketPriorityEnum = pgEnum('ticket_priority', ['low', 'normal', 'high', 'urgent']);
 export const ticketSourceEnum = pgEnum('ticket_source', ['portal', 'email', 'alert', 'manual', 'api', 'ai']);
 // Spec #5573 §4.8: planned work (service deliverables, project tasks) is typed, not tagged.
 export const ticketWorkKindEnum = pgEnum('ticket_work_kind', ['support', 'deliverable', 'project_task']);
+// #7900: fixed ITIL classification (what the ticket is ABOUT). A separate axis
+// from work_kind (how the work is delivered/billed). Labels live in i18n only.
+export const ticketTypeEnum = pgEnum('ticket_type', ['incident', 'service_request', 'problem', 'change']);
 export const ticketCommentTypeEnum = pgEnum('ticket_comment_type', ['comment', 'internal', 'status_change', 'assignment', 'time_entry', 'system']);
 
 export const portalBranding = pgTable('portal_branding', {
@@ -54,12 +60,69 @@ export const portalBranding = pgTable('portal_branding', {
   // MSP can turn on generic report self-service before exposing the
   // replacement plan, which names specific machines.
   enableLifecycle: boolean('enable_lifecycle').notNull().default(false),
+  // Portal Advanced Visibility W01 (#7731): independent, fail-closed gate for
+  // the read-only hardware health surface (component state, events, disks,
+  // battery). Inside "Enable all" (low sensitivity).
+  enableHardwareHealth: boolean('enable_hardware_health').notNull().default(false),
+  // Portal Advanced Visibility W02 (#7732): independent, fail-closed gate for
+  // the read-only hardware inventory surface (make, model, processor, memory,
+  // network adapters, connection counts). Inside "Enable all" (low sensitivity).
+  enableHardwareInventory: boolean('enable_hardware_inventory').notNull().default(false),
+  // Portal Advanced Visibility W03 (#7733): read-only CPU, memory, disk and
+  // network performance trends. Inside "Enable all" (low sensitivity).
+  enablePerformanceMetrics: boolean('enable_performance_metrics').notNull().default(false),
+  // W04 (#7734): independent read-only software inventory flag, inside Enable all.
+  enableSoftwareInventory: boolean('enable_software_inventory').notNull().default(false),
   // Customer Portal Network Visibility (#5861): independent, fail-closed
   // visibility gate for the read-only networking surface.
   enableNetworkVisibility: boolean('enable_network_visibility').notNull().default(false),
+  // Customer Portal Network Visibility (#5861 PR 3): independent, fail-closed
+  // gate for asset-level alert/ticket enrichment. Distinct sensitivity tier
+  // from asset inventory (enableNetworkVisibility above), so it is NOT part
+  // of PORTAL_VISIBILITY_FLAG_KEYS / "Enable all".
+  enableNetworkAlerts: boolean('enable_network_alerts').notNull().default(false),
+  // Block hours W04 (#8179): independent, fail-closed gate for the read-only
+  // "Support hours" card inside the Support usage section. A prepaid-hours
+  // balance is a billing figure the MSP must choose to show, so — like
+  // enableNetworkAlerts — it is NOT part of PORTAL_VISIBILITY_FLAG_KEYS /
+  // "Enable all".
+  enableHourBlock: boolean('enable_hour_block').notNull().default(false),
+  // Portal Advanced Visibility W05 (#7735): read-only per-host patch status.
+  // Sensitive (points at patch gaps): NOT in PORTAL_VISIBILITY_FLAG_KEYS or
+  // "Enable all"; listed in PORTAL_SENSITIVE_FLAG_KEYS.
+  enablePatchDetail: boolean('enable_patch_detail').notNull().default(false),
+  // Portal Advanced Visibility W06 (#7736): read-only per-host CVE findings.
+  // Sensitive (points at vulnerabilities): NOT in PORTAL_VISIBILITY_FLAG_KEYS or
+  // "Enable all"; listed in PORTAL_SENSITIVE_FLAG_KEYS.
+  enableVulnerabilityDetail: boolean('enable_vulnerability_detail').notNull().default(false),
+  // Customer Portal Environment Visibility W1 (#8775): physical placement
+  // (rack and room). Sensitive (reveals physical layout): NOT in
+  // PORTAL_VISIBILITY_FLAG_KEYS or "Enable all"; listed in PORTAL_SENSITIVE_FLAG_KEYS.
+  enablePhysicalPlacement: boolean('enable_physical_placement').notNull().default(false),
+  // EDR provider framework W02 (#8166): strict fail-closed flag for the
+  // vendor-neutral "Managed endpoint protection" leg of the security view.
+  // Inside "Enable all" (not sensitive: no vendor/product names are exposed).
+  enableEdrVisibility: boolean('enable_edr_visibility').notNull().default(false),
+  // Trust Center W3d: permission flag (PORTAL_PERMISSION_FLAG_KEYS). Lets the
+  // org's admin contacts edit part of the trust page draft from the portal.
+  // Never in "Enable all"; publishing stays with the MSP.
+  enableTrustPageEditing: boolean('enable_trust_page_editing').notNull().default(false),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull()
 });
+
+/**
+ * Portal account lifecycle (`portal_users.status`, SQL CHECK
+ * `portal_users_status_chk`). Every writer of `status` / `browser_access` goes
+ * through services/portalAccountState.ts. The column itself stays `varchar` so the
+ * many fixture files that write plain strings keep compiling.
+ */
+export type PortalAccountStatus = 'invited' | 'active' | 'disabled';
+/** Browser portal access (`portal_users.browser_access`, SQL CHECK `portal_users_browser_access_chk`). */
+export type PortalBrowserAccess = 'granted' | 'none';
+/** How an external identity was linked to its portal account (`portal_user_identities.linked_via`). */
+export type PortalIdentityLinkedVia = 'jit' | 'invite' | 'self_link' | 'scim' | 'migrated' | 'msp';
+export type PortalIdentityProvider = 'entra' | 'google';
 
 export const portalUsers = pgTable('portal_users', {
   id: uuid('id').primaryKey().defaultRandom(),
@@ -74,7 +137,7 @@ export const portalUsers = pgTable('portal_users', {
   // partial-index convention.
   entraOid: text('entra_oid'),
   entraTenantId: text('entra_tenant_id'),
-  authMethod: text('auth_method').notNull().default('password'), // 'password' | 'entra' (SQL CHECK)
+  authMethod: text('auth_method').notNull().default('password'), // 'password' | 'entra' | 'google' (SQL CHECK portal_users_auth_method_check); only 'password' is password-eligible
   // Durable generation snapshotted by portal and client-AI sessions. Redis
   // deletion is cleanup; live authorization compares this column instead.
   authEpoch: integer('auth_epoch').notNull().default(1),
@@ -109,12 +172,63 @@ export const portalUsers = pgTable('portal_users', {
   receiveNotifications: boolean('receive_notifications').notNull().default(true),
   lastLoginAt: timestamp('last_login_at'),
   status: varchar('status', { length: 20 }).notNull().default('active'),
+  // Browser portal access, separate from the account lifecycle (portal
+  // registration W2, spec §5.1). A browser session requires
+  // status='active' AND browser_access='granted'; an add-in (AI for Office)
+  // session never grants it (spec §6 invariant 9).
+  //
+  // The DB has NO column default. The BEFORE INSERT trigger
+  // `portal_users_browser_access_fill` (2027-01-22-211700-portal-account-
+  // foundations.sql) derives it from auth_method when an insert omits it, so an
+  // older API binary inserting during a rolling deploy cannot grant browser
+  // access to an add-in row. `.default` here only makes the field optional in
+  // Drizzle insert types (Drizzle emits DEFAULT, the trigger fills it).
+  // Production writers pass it explicitly via services/portalAccountState.ts.
+  browserAccess: text('browser_access').$type<PortalBrowserAccess>().notNull().default('none'),
   invitedBy: uuid('invited_by').references(() => users.id),
   invitedAt: timestamp('invited_at'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull()
 }, (table) => ({
   orgIdIdx: index('portal_users_org_id_idx').on(table.orgId),
+  // `portal_users_id_org_uq` UNIQUE (id, org_id) — the composite-FK target for
+  // portal_user_identities — is SQL-only (2027-01-22-211700-portal-account-
+  // foundations.sql), the same convention as `tickets_id_org_uq`.
+}));
+
+/**
+ * External identities of a portal account (portal registration W2, spec
+ * §5.2): the single source of truth for external identity from identities
+ * release B on. Tenancy shape 1 (direct org_id, forced RLS).
+ *
+ * Release A (W2): backfilled from portal_users.entra_* and dual-written by the
+ * AI for Office exchange. Release B (W3): every read of external identity
+ * comes from this table (services/portalUserIdentities.ts); writers still
+ * dual-write portal_users.entra_* until release C drops them.
+ *
+ * The real tenancy constraint lives in SQL only — the composite FK
+ * `portal_user_identities_user_org_fk` (portal_user_id, org_id) →
+ * portal_users (id, org_id) ON DELETE CASCADE DEFERRABLE INITIALLY IMMEDIATE,
+ * plus the provider / linked_via / issuer CHECKs (same convention as
+ * `portal_users_contact_org_fk` above).
+ */
+export const portalUserIdentities = pgTable('portal_user_identities', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  orgId: uuid('org_id').notNull(),
+  portalUserId: uuid('portal_user_id').notNull(),
+  provider: text('provider').$type<PortalIdentityProvider>().notNull(),
+  // Entra: https://login.microsoftonline.com/{tid}/v2.0 ; Google: https://accounts.google.com
+  issuer: text('issuer').notNull(),
+  // Entra oid ; Google sub
+  subject: text('subject').notNull(),
+  entraTenantId: text('entra_tenant_id'),
+  linkedVia: text('linked_via').$type<PortalIdentityLinkedVia>().notNull(),
+  lastUsedAt: timestamp('last_used_at', { withTimezone: true }),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+}, (table) => ({
+  issuerSubjectUq: uniqueIndex('portal_user_identities_issuer_subject_uq').on(table.issuer, table.subject),
+  userProviderUq: uniqueIndex('portal_user_identities_user_provider_uq').on(table.portalUserId, table.provider),
+  orgIdx: index('portal_user_identities_org_id_idx').on(table.orgId),
 }));
 
 // P2-4 (#4191): tickets also gains a composite-FK target unique index,
@@ -168,8 +282,30 @@ export const tickets = pgTable('tickets', {
   slaBreachReason: text('sla_breach_reason'),
   slaPausedAt: timestamp('sla_paused_at'),
   slaPausedMinutes: integer('sla_paused_minutes').default(0),
+  // #8973 W3 stored deadlines (2027-01-02-190100, backfilled by 190200).
+  // Written only by services/ticketSlaDeadlines.ts at the write points in spec
+  // §4.3; every SLA reader compares against these instead of re-deriving
+  // created_at + target + paused. Business minutes equal sla_paused_minutes
+  // until a calendar applies (W4). A NULL target leaves its due/warn NULL.
+  slaPausedBusinessMinutes: integer('sla_paused_business_minutes').notNull().default(0),
+  responseDueAt: timestamp('response_due_at'),
+  resolutionDueAt: timestamp('resolution_due_at'),
+  responseWarnAt: timestamp('response_warn_at'),
+  resolutionWarnAt: timestamp('resolution_warn_at'),
+  // #8973 W4 (2027-01-03-160100): the business-calendar revision the stored
+  // deadlines are computed on, snapshotted at create (spec §4.3); NULL = 24×7.
+  // FK tickets_sla_calendar_revision_id_fk ON DELETE SET NULL (declared below).
+  slaCalendarRevisionId: uuid('sla_calendar_revision_id'),
+  // #8883 W5 (2027-01-04-120100): the routing rule matched at create (spec
+  // §5.4); NULL = none. FK tickets_routing_rule_id_fk → ticket_routing_rules
+  // ON DELETE SET NULL lives in SQL only (importing ticketRoutingRules.ts here
+  // would close a module-load import cycle; see that file).
+  routingRuleId: uuid('routing_rule_id'),
   source: ticketSourceEnum('source').notNull().default('portal'),
   workKind: ticketWorkKindEnum('work_kind').notNull().default('support'),
+  // #7900 (2026-12-26-170000): constant default, so existing rows read as
+  // 'incident' without a backfill. Per-source defaults: services/ticketType.ts.
+  ticketType: ticketTypeEnum('ticket_type').notNull().default('incident'),
   internalNumber: varchar('internal_number', { length: 20 }),
   emailMessageId: text('email_message_id'),
   emailThreadKey: text('email_thread_key'),
@@ -191,16 +327,72 @@ export const tickets = pgTable('tickets', {
   // rather than NULL. jsonb -> excludedOpen in the export policy regardless
   // of contents (CLAUDE.md: any json/jsonb/bytea column is excludedOpen).
   fieldProvenance: jsonb('field_provenance')
-    .$type<Record<string, 'user' | 'ai_agent' | 'system'>>()
+    .$type<Record<string, 'user' | 'ai_agent' | 'system' | 'service_principal'>>()
     .notNull()
-    .default({})
-});
+    .default({}),
+  // Partner API tickets feed change stamp (2026-12-13-120000): the xid8 of
+  // the writing transaction, set by a BEFORE INSERT OR UPDATE trigger on
+  // every write (app-supplied values are overwritten). Decimal string end to
+  // end — see schema/columnTypes.ts. Existing rows keep '1', which sorts
+  // before every real transaction id, so a first full sync covers them.
+  partnerFeedXid: xid8('partner_feed_xid').notNull().default(sql`'1'::xid8`),
+  // #4617 spec §4.2: per-ticket labour ceiling (a document value, no default).
+  // CHECK tickets_budget_chk (SQL-only, 2026-12-20-200300): each > 0 when set,
+  // budget_currency_code set iff budget_amount is, and ^[A-Z]{3}$.
+  budgetMinutes: integer('budget_minutes'),
+  budgetAmount: numeric('budget_amount', { precision: 12, scale: 2 }),
+  budgetCurrencyCode: char('budget_currency_code', { length: 3 }),
+  // Ticket migration windows (#8313, 2026-12-25-120000): the window that
+  // imported this ticket, null for live tickets. An FK-less snapshot, so it
+  // outlives window retention and never couples an org table to a partner
+  // table. Partial index idx_tickets_migration_window (2026-12-25-120100) is
+  // not modeled here, like the other partial indexes in this file.
+  migrationWindowId: uuid('migration_window_id'),
+  // #8972 ticket merge (2027-01-04-110000): a merged source stays as a
+  // read-only tombstone pointing at its survivor, one hop (merge compresses
+  // paths, so the target is never itself merged). Composite same-org FK
+  // tickets_merged_into_org_fk below — DEFERRABLE INITIALLY IMMEDIATE in SQL
+  // (both org movers defer it), ON DELETE NO ACTION (a survivor cannot be
+  // hard-deleted alone). SQL-only CHECKs: tickets_merged_into_not_self_chk,
+  // tickets_merged_pair_chk ((merged_into_ticket_id IS NULL) = (merged_at IS NULL)).
+  mergedIntoTicketId: uuid('merged_into_ticket_id'),
+  mergedAt: timestamp('merged_at'),
+  // Null for a machine principal (AI on approval, Partner API); the audit row
+  // carries the full actor identity.
+  mergedByUserId: uuid('merged_by_user_id').references(() => users.id, { onDelete: 'set null' }),
+}, (table) => ({
+  mergedIntoOrgFk: foreignKey({
+    columns: [table.mergedIntoTicketId, table.orgId],
+    foreignColumns: [table.id, table.orgId],
+    name: 'tickets_merged_into_org_fk',
+  }),
+  mergedIntoIdx: index('tickets_merged_into_idx').on(table.mergedIntoTicketId).where(sql`merged_into_ticket_id IS NOT NULL`),
+  // #8973 W3 SLA breach sweep (2027-01-02-190300, CONCURRENTLY). Predicates
+  // must stay identical to the sweep in jobs/ticketSlaWorker.ts.
+  slaResponseDueIdx: index('tickets_sla_response_due_idx').on(table.responseDueAt).where(sql`status IN ('new','open') AND work_kind = 'support' AND sla_paused_at IS NULL AND first_response_at IS NULL AND response_due_at IS NOT NULL`),
+  slaResolutionDueIdx: index('tickets_sla_resolution_due_idx').on(table.resolutionDueAt).where(sql`status IN ('new','open') AND work_kind = 'support' AND sla_paused_at IS NULL AND resolved_at IS NULL AND resolution_due_at IS NOT NULL`),
+  // Gate B12 heal pass (empty in steady state).
+  // Rebuilt by 2027-01-03-160100 (W4): calendar tickets are owned by the
+  // calendar-aware writers, never by the wall-clock heal.
+  slaDeadlinesMissingIdx: index('tickets_sla_deadlines_missing_idx').on(table.createdAt).where(sql`sla_calendar_revision_id IS NULL AND ((response_sla_minutes IS NOT NULL AND response_due_at IS NULL) OR (resolution_sla_minutes IS NOT NULL AND resolution_due_at IS NULL) OR sla_paused_business_minutes < COALESCE(sla_paused_minutes, 0))`),
+  // #8973 W4 (2027-01-03-160100, CONCURRENTLY): recompute, apply-revision,
+  // delete-in-use and the FK's SET NULL find tickets by revision.
+  slaCalendarRevisionIdx: index('tickets_sla_calendar_revision_idx').on(table.slaCalendarRevisionId).where(sql`sla_calendar_revision_id IS NOT NULL`),
+  // #8883 W5 (2027-01-04-120100, CONCURRENTLY): the FK's SET NULL and the
+  // per-rule reporting read find tickets by rule.
+  routingRuleIdx: index('tickets_routing_rule_idx').on(table.routingRuleId).where(sql`routing_rule_id IS NOT NULL`),
+  slaCalendarRevisionFk: foreignKey({
+    name: 'tickets_sla_calendar_revision_id_fk',
+    columns: [table.slaCalendarRevisionId],
+    foreignColumns: [businessCalendarRevisions.id],
+  }).onDelete('set null'),
+}));
 
 export const ticketComments = pgTable('ticket_comments', {
   id: uuid('id').primaryKey().defaultRandom(),
-  ticketId: uuid('ticket_id').notNull().references(() => tickets.id),
-  portalUserId: uuid('portal_user_id').references(() => portalUsers.id),
-  userId: uuid('user_id').references(() => users.id),
+  ticketId: uuid('ticket_id').notNull().references(() => tickets.id, { onDelete: 'cascade' }),
+  portalUserId: uuid('portal_user_id').references(() => portalUsers.id, { onDelete: 'set null' }),
+  userId: uuid('user_id').references(() => users.id, { onDelete: 'set null' }),
   authorName: varchar('author_name', { length: 255 }),
   authorType: varchar('author_type', { length: 50 }),
   content: text('content').notNull(),
@@ -227,6 +419,14 @@ export const ticketComments = pgTable('ticket_comments', {
   // (ticketHelpdeskSubscriber, Task 3) treats anything NOT 'user' as suspect
   // and skips admission — see the migration header for the full rationale.
   originPrincipalKind: text('origin_principal_kind').notNull().default('user'),
+  // The principal behind a machine-authored row when `origin_principal_kind`
+  // alone cannot answer "did MY integration write this?": the partner
+  // service principal id for 'service_principal' (Partner API tickets
+  // surface, 2026-12-04-101100), the AGENT id for 'ai_agent' rows (same
+  // convention as action_intents.origin_principal_id — the RUN is
+  // `agent_run_id` below), null for humans and system notes. No FK: it
+  // points at different tables by kind.
+  originPrincipalId: uuid('origin_principal_id'),
   // Loop-guard link to the agent run that authored this comment. Written by
   // addAiTriageNote() (services/ticketService.ts, P2-4a #4300) — every
   // AI-agent `comment` tool call that carries an agentRunId inserts a row
@@ -262,7 +462,24 @@ export const ticketComments = pgTable('ticket_comments', {
   // ticket_comments_one_ai_note_per_run_uq. Not modeled in Drizzle for the
   // same "partial index" reason as that index and ticketDrafts.ts's
   // ticket_drafts_active_uq.
-  proposedByRunId: uuid('proposed_by_run_id')
+  proposedByRunId: uuid('proposed_by_run_id'),
+  // Ticket migration windows (#8313, 2026-12-25-120000), all null on live
+  // comments. migrationWindowId marks an imported comment (FK-less, like
+  // tickets.migration_window_id). originalAuthorEmail/originalAuthorKind
+  // ('staff' | 'requester', CHECK ticket_comments_original_author_kind_chk)
+  // are the display-only "originally by" of an imported comment: authorName
+  // carries the original name and no user or contact is created.
+  // importSourceId is the source's comment id, unique per principal through
+  // the partial index ticket_comments_import_source_uq (2026-12-25-120100),
+  // so a rerun skips what it already imported.
+  migrationWindowId: uuid('migration_window_id'),
+  originalAuthorEmail: varchar('original_author_email', { length: 320 }),
+  originalAuthorKind: text('original_author_kind').$type<'staff' | 'requester'>(),
+  importSourceId: varchar('import_source_id', { length: 255 }),
+  // #8972 ticket merge (2027-01-04-110000): the ticket this comment was merged
+  // from, set only when null so a comment merged twice keeps its earliest
+  // origin. Plain FK, ON DELETE SET NULL.
+  mergedFromTicketId: uuid('merged_from_ticket_id').references(() => tickets.id, { onDelete: 'set null' }),
 });
 
 export const assetCheckouts = pgTable('asset_checkouts', {

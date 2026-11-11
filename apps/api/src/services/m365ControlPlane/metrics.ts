@@ -18,6 +18,12 @@ export const M365_CUSTOMER_GRAPH_READ_EVENTS = [
   // On-demand tenant sync requested by a technician (spec §5.2). Outcome is
   // always 'initiated' — the run's own outcome is the sync worker's event.
   'm365.customer_graph_read.sync_requested',
+  // #7910 identity-first consent: the administrator's identity was verified
+  // (phase 1). Records WHO signed in — not that they granted consent.
+  'm365.customer_graph_read.admin_identity_verified',
+  // #7913 W03: the Breeze user confirmed the verified tenant on the
+  // confirm-tenant interstitial, before Microsoft's consent screen.
+  'm365.customer_graph_read.tenant_confirmed',
 ] as const;
 
 export type M365CustomerGraphReadEvent = typeof M365_CUSTOMER_GRAPH_READ_EVENTS[number];
@@ -43,6 +49,18 @@ export const M365_CUSTOMER_GRAPH_READ_OUTCOMES = [
   'manifest_stale',
   'organization_probe_failed',
   'executor_unavailable',
+  // Appended: Microsoft returned a consent error (Conditional Access block, or
+  // any other non-cancel provider error).
+  'conditional_access_blocked',
+  'consent_provider_error',
+  // #7910 identity-first consent, appended (order pinned by metrics.test.ts).
+  'identity_verified',
+  'application_verification_started',
+  // #7913 W03: the operator confirmed the verified tenant (appended).
+  'tenant_confirmed',
+  // #9322: Microsoft refused the sign-in because the tenant disallows user
+  // consent and the signer is not an administrator (appended last).
+  'user_consent_blocked',
 ] as const;
 
 export type M365CustomerGraphReadOutcome = typeof M365_CUSTOMER_GRAPH_READ_OUTCOMES[number];
@@ -58,7 +76,42 @@ const SUCCESS_OUTCOMES: readonly M365CustomerGraphReadOutcome[] = [
   'active',
   'degraded',
   'revoked',
+  'identity_verified',
+  'application_verification_started',
+  'tenant_confirmed',
 ];
+
+/**
+ * Internal cause of a consent verification failure (#9322). Never shown to a
+ * customer — the public outcome stays generic — but recorded in audit details,
+ * the server log (keyed by correlation ID), and a bounded metric so an
+ * operator can tell an unreachable executor from version skew or a bug.
+ */
+export const M365_CONSENT_FAILURE_CAUSES = [
+  'executor_unreachable',
+  'executor_timeout',
+  /** 404 from the executor: it predates the route (version skew). */
+  'executor_route_missing',
+  /** 401/403: signing-key or audience mismatch between API and executor. */
+  'executor_auth_rejected',
+  /** Other 4xx (400/413/415…): request contract mismatch. */
+  'executor_request_rejected',
+  /** 5xx: the executor failed. */
+  'executor_error',
+  /** A 2xx the API could not accept (content type, size, JSON, schema). */
+  'executor_response_invalid',
+  'consent_url_build_failed',
+  /** A throw inside the API itself (DB, code, configuration). */
+  'internal_error',
+] as const;
+
+export type M365ConsentFailureCause = typeof M365_CONSENT_FAILURE_CAUSES[number];
+
+const FAILURE_CAUSE_SET = new Set<string>(M365_CONSENT_FAILURE_CAUSES);
+
+function isHttpStatus(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 100 && value <= 599;
+}
 
 interface M365ConsentMetricsRecorder<Event extends string, Outcome extends string> {
   onEvent: (event: Event, outcome: Outcome) => void;
@@ -83,6 +136,17 @@ export interface M365ConsentAuditInput<
   outcome: Outcome;
   correlationId?: string;
   verifiedTenantId?: string;
+  /**
+   * Object id of the administrator whose identity Breeze verified in the
+   * identity phase. Deliberately a separate field from `actorId` (the Breeze
+   * user who started the flow): Breeze cannot observe who clicked Accept on
+   * Microsoft's consent screen, so this never claims that.
+   */
+  verifiedAdministratorObjectId?: string;
+  /** #9322: bounded internal cause of a failure; dropped unless an enum member. */
+  failureCause?: M365ConsentFailureCause;
+  /** #9322: the executor's HTTP status, when the failure was one. */
+  httpStatus?: number;
   actorId?: string;
   actorEmail?: string;
 }
@@ -151,6 +215,13 @@ function createConsentObservability<Event extends string, Outcome extends string
     details.outcome = input.outcome;
     if (input.correlationId !== undefined) details.correlationId = input.correlationId;
     if (input.verifiedTenantId !== undefined) details.tenantId = input.verifiedTenantId;
+    if (input.verifiedAdministratorObjectId !== undefined) {
+      details.verifiedAdministratorObjectId = input.verifiedAdministratorObjectId;
+    }
+    if (input.failureCause !== undefined && FAILURE_CAUSE_SET.has(input.failureCause)) {
+      details.failureCause = input.failureCause;
+    }
+    if (isHttpStatus(input.httpStatus)) details.httpStatus = input.httpStatus;
 
     writeAuditEvent(request, {
       orgId: input.orgId,
@@ -204,6 +275,12 @@ export const M365_CUSTOMER_GRAPH_ACTIONS_EVENTS = [
   'm365.customer_graph_actions.grant_drift_detected',
   'm365.customer_graph_actions.retested',
   'm365.customer_graph_actions.disconnected',
+  // #7910 identity-first consent, appended last.
+  'm365.customer_graph_actions.admin_identity_verified',
+  // #7913 W03 confirm-tenant interstitial, appended last.
+  'm365.customer_graph_actions.tenant_confirmed',
+  // #8745 actions manifest upgrade consent, appended last.
+  'm365.customer_graph_actions.upgrade_consent_initiated',
 ] as const;
 
 export type M365CustomerGraphActionsEvent = typeof M365_CUSTOMER_GRAPH_ACTIONS_EVENTS[number];
@@ -234,3 +311,38 @@ export const setM365CustomerGraphActionsMetricsRecorder = actionsObservability.s
 export const recordM365CustomerGraphActionsMetric = actionsObservability.recordMetric;
 export const registerM365CustomerGraphActionsPrometheusCounter = actionsObservability.registerPrometheusCounter;
 export const recordM365CustomerGraphActionsEvent = actionsObservability.recordEvent;
+
+// --- consent verification failure causes (#9322) ------------------------------
+
+/**
+ * A sibling counter rather than a new label on the lifecycle counters, so the
+ * existing series keep their exact shape. Both labels are fixed enums.
+ */
+const FAILURE_CAUSE_PROFILES = new Set<string>(['customer-graph-read', 'customer-graph-actions']);
+const FAILURE_CAUSE_COUNTER_NAME = 'breeze_m365_consent_verification_failure_causes_total';
+
+type M365ConsentFailureProfile = 'customer-graph-read' | 'customer-graph-actions';
+
+let onFailureCause: (profile: M365ConsentFailureProfile, cause: M365ConsentFailureCause) => void = () => {};
+
+export function recordM365ConsentFailureCause(
+  profile: M365ConsentFailureProfile,
+  cause: M365ConsentFailureCause,
+): void {
+  if (!FAILURE_CAUSE_PROFILES.has(profile) || !FAILURE_CAUSE_SET.has(cause)) return;
+  onFailureCause(profile, cause);
+}
+
+export function registerM365ConsentFailureCausePrometheusCounter(
+  registry: Registry,
+): Counter<'profile' | 'cause'> {
+  const existing = registry.getSingleMetric(FAILURE_CAUSE_COUNTER_NAME);
+  const counter = (existing as Counter<'profile' | 'cause'> | undefined) ?? new Counter({
+    name: FAILURE_CAUSE_COUNTER_NAME,
+    help: 'M365 consent verification failures by profile and fixed internal cause',
+    labelNames: ['profile', 'cause'] as const,
+    registers: [registry],
+  });
+  onFailureCause = (profile, cause) => counter.labels(profile, cause).inc();
+  return counter;
+}

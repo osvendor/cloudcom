@@ -7,10 +7,10 @@ const baselineOnlyResponse = {
   deviceId: 'dev-1',
   features: {
     patch: { featureType: 'patch', featurePolicyId: null, inlineSettings: null, sourceLevel: 'default', sourceTargetId: 'breeze-defaults', sourcePolicyId: 'breeze-defaults', sourcePolicyName: 'Breeze Defaults', sourcePriority: 0 },
-    alert_rule: { featureType: 'alert_rule', featurePolicyId: null, inlineSettings: null, sourceLevel: 'default', sourceTargetId: 'breeze-defaults', sourcePolicyId: 'breeze-defaults', sourcePolicyName: 'Breeze Defaults', sourcePriority: 0 },
+    monitors: { featureType: 'monitors', featurePolicyId: null, inlineSettings: null, sourceLevel: 'default', sourceTargetId: 'breeze-defaults', sourcePolicyId: 'breeze-defaults', sourcePolicyName: 'Breeze Defaults', sourcePriority: 0 },
   },
   inheritanceChain: [
-    { level: 'default', targetId: 'breeze-defaults', policyId: 'breeze-defaults', policyName: 'Breeze Defaults', priority: 0, featureTypes: ['patch', 'alert_rule'] },
+    { level: 'default', targetId: 'breeze-defaults', policyId: 'breeze-defaults', policyName: 'Breeze Defaults', priority: 0, featureTypes: ['patch', 'monitors'] },
   ],
 };
 
@@ -20,11 +20,11 @@ const mixedResponse = {
   deviceId: 'dev-2',
   features: {
     patch: { featureType: 'patch', featurePolicyId: null, inlineSettings: null, sourceLevel: 'organization', sourceTargetId: 'org-1', sourcePolicyId: 'pol-org', sourcePolicyName: 'Org Patch Policy', sourcePriority: 10 },
-    alert_rule: { featureType: 'alert_rule', featurePolicyId: null, inlineSettings: null, sourceLevel: 'default', sourceTargetId: 'breeze-defaults', sourcePolicyId: 'breeze-defaults', sourcePolicyName: 'Breeze Defaults', sourcePriority: 0 },
+    monitors: { featureType: 'monitors', featurePolicyId: null, inlineSettings: null, sourceLevel: 'default', sourceTargetId: 'breeze-defaults', sourcePolicyId: 'breeze-defaults', sourcePolicyName: 'Breeze Defaults', sourcePriority: 0 },
   },
   inheritanceChain: [
     { level: 'organization', targetId: 'org-1', policyId: 'pol-org', policyName: 'Org Patch Policy', priority: 10, featureTypes: ['patch'] },
-    { level: 'default', targetId: 'breeze-defaults', policyId: 'breeze-defaults', policyName: 'Breeze Defaults', priority: 0, featureTypes: ['alert_rule'] },
+    { level: 'default', targetId: 'breeze-defaults', policyId: 'breeze-defaults', policyName: 'Breeze Defaults', priority: 0, featureTypes: ['monitors'] },
   ],
 };
 
@@ -150,7 +150,15 @@ describe('DeviceEffectiveConfigTab baseline labeling', () => {
     // CARD specifically, so this can't pass on the chain alone (the original bug).
     await screen.findByRole('heading', { level: 4, name: 'Warranty' });
     // Inline settings are summarized on the card so the enabled state is visible.
-    expect(screen.getByText(/enabled: yes/i)).toBeInTheDocument();
+    // #7214: label and value render in separate spans (so CSS title-casing
+    // never reaches the value), so match on the containing <li>'s text.
+    expect(
+      screen.getByText(
+        (_, element) =>
+          element?.tagName.toLowerCase() === 'li' &&
+          /enabled: yes/i.test(element.textContent ?? ''),
+      ),
+    ).toBeInTheDocument();
     // The header counts only the enforced feature, not the baseline fall-through.
     expect(screen.getByText(/1 enforced feature/i)).toBeInTheDocument();
     // Baseline fall-through (backup) is collapsed into the compact strip, not a card.

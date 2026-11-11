@@ -62,6 +62,7 @@ import { requiredPermissionsForTool } from '../aiGuardrails';
 import { getUserPermissions, type UserPermissions } from '../permissions';
 import {
   DEVICE_COMPLETE_TARGET_TOOLS,
+  flowIntentApproverRule,
   isOrgWideGovernanceIntent,
   isAgentIntentDecideAuthorized,
   resolveAgentIntentApprovers,
@@ -244,6 +245,54 @@ describe('resolveIntentApprovers — requireOrgWideGovernance (audit §1.1 fan-o
       requireOrgWideGovernance: true,
     });
     expect(result).toEqual(['u-open']);
+  });
+});
+
+describe('resolveIntentApprovers: requirePartnerAxis (partner-wide intents)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(db.select).mockReset();
+  });
+
+  /** The org's partner, then the granting roles, then the partner's members. */
+  function queuePartnerAxis(partnerId: string | null, partnerMembers: Array<{ userId: string; orgAccess: string; orgIds: string[] | null }>) {
+    vi.mocked(db.select).mockReturnValueOnce({
+      from: vi.fn().mockReturnValue({
+        where: vi.fn().mockReturnValue({ limit: vi.fn().mockResolvedValue(partnerId ? [{ partnerId }] : []) }),
+      }),
+    } as any);
+    if (!partnerId) return;
+    vi.mocked(db.select).mockReturnValueOnce({
+      from: vi.fn().mockReturnValue({ innerJoin: vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue([{ roleId: 'role-decide' }]) }) }),
+    } as any);
+    vi.mocked(db.select).mockReturnValueOnce({
+      from: vi.fn().mockReturnValue({ innerJoin: vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue(partnerMembers) }) }),
+    } as any);
+  }
+
+  it('counts only full-partner members: a selected member is not eligible, and no org-member query runs', async () => {
+    queuePartnerAxis('partner-1', [
+      { userId: 'u-all', orgAccess: 'all', orgIds: null },
+      { userId: 'u-selected', orgAccess: 'selected', orgIds: ['org-1'] },
+    ]);
+    await expect(resolveIntentApprovers('org-1', { requirePartnerAxis: true })).resolves.toEqual(['u-all']);
+    expect(db.select).toHaveBeenCalledTimes(3);
+  });
+
+  it('is empty when the org has no partner: no fallback to org members', async () => {
+    queuePartnerAxis(null, []);
+    await expect(resolveIntentApprovers('org-1', { requirePartnerAxis: true })).resolves.toEqual([]);
+    expect(db.select).toHaveBeenCalledTimes(1);
+  });
+
+  it('CONTROL: without it, an org member stays eligible', async () => {
+    queueSelects({
+      grantingRoles: [{ roleId: 'role-decide' }],
+      org: [{ partnerId: 'partner-1' }],
+      orgMembers: [{ userId: 'u-org' }],
+      partnerMembers: [],
+    });
+    await expect(resolveIntentApprovers('org-1')).resolves.toEqual(['u-org']);
   });
 });
 
@@ -1108,5 +1157,26 @@ describe('isOrgWideGovernanceIntent (audit §1.1)', () => {
     await expect(
       resolveIntentTargetScope('manage_ai_agents', { action: 'authorize_supervised_key' }, { deviceId: 'dev-1' }, 'org-1'),
     ).resolves.toEqual({ kind: 'indirect' });
+  });
+});
+
+// Tool catalog W05 (#5220), Decision 12: a Tier-3 BUILT-IN flow step (an
+// http_request write) has no core RBAC mapping; without its own rule nobody
+// would be eligible and every such intent would cancel no_eligible_approvers.
+describe('flowIntentApproverRule', () => {
+  it('a built-in step is approved by holders of its built-in permission over an indirect (org-wide) target', () => {
+    vi.mocked(requiredPermissionsForTool).mockReturnValue(null);
+    expect(flowIntentApproverRule({ actionName: 'http_request', toolSourceToolId: null })).toEqual({
+      required: [{ resource: 'external_tools', action: 'write' }], indirect: true,
+    });
+  });
+  it('an external tool keeps the external-tool grant; a core tool its own mapping and device target', () => {
+    expect(flowIntentApproverRule({ actionName: 'acme__restart', toolSourceToolId: 'tool-1' })).toEqual({
+      required: [{ resource: 'external_tools', action: 'write' }], indirect: true,
+    });
+    vi.mocked(requiredPermissionsForTool).mockReturnValue([{ resource: 'scripts', action: 'execute' }]);
+    expect(flowIntentApproverRule({ actionName: 'run_script', toolSourceToolId: null, arguments: { scriptId: 's' } })).toEqual({
+      required: [{ resource: 'scripts', action: 'execute' }], indirect: false,
+    });
   });
 });

@@ -1,8 +1,8 @@
 import { Hono } from 'hono';
 import { zValidator } from '../../lib/validation';
 import { z } from 'zod';
-import { and, eq } from 'drizzle-orm';
-import { db, runOutsideDbContext, withSystemDbAccessContext } from '../../db';
+import { and, eq, getTableColumns } from 'drizzle-orm';
+import { db, runOutsideDbContext, withDbTransaction, withSystemDbAccessContext } from '../../db';
 import { dbWriteExpectingRows } from '../../db/dbWriteExpectingRows';
 import { commandCasPriorStatusTags } from '../../services/commandCasDiagnostics';
 import { deviceCommands } from '../../db/schema';
@@ -23,6 +23,8 @@ import {
   handleCisCommandResult,
 } from './helpers';
 import { captureException } from '../../services/sentry';
+import { ingestRestorePointOutcome } from '../../services/restorePointIngest';
+import { markCommandResultProcessingFailed } from '../../services/commandResultProcessingFailure';
 import { processCollectedAuditPolicyCommandResult } from '../../services/auditBaselineService';
 import { CommandTypes, queueCommandForExecution } from '../../services/commandQueue';
 import { claimPendingCommandsForDevice } from '../../services/commandDispatch';
@@ -34,8 +36,8 @@ import { applyVaultSyncCommandResult } from '../../services/vaultSyncPersistence
 import { processBackupVerificationResult } from '../backup/verificationService';
 import { updateRestoreJobByCommandId } from '../../services/restoreResultPersistence';
 import { detectResultValidationFamily, validateCriticalCommandResult, DR_COMMAND_TYPES } from '../../services/agentCommandResultValidation';
-import { redactSecretsFromOutput, redactAgentResultErrorFields } from '../../services/secretRedaction';
-import { isRawStdoutArtifactCommand } from '../../services/commandAudit';
+import { redactAgentResultErrorFields } from '../../services/secretRedaction';
+import { buildStoredCommandResult } from '../../services/storedCommandResult';
 import {
   reconcileSoftwareInstallResult,
 } from '../../services/softwareDeploymentResult';
@@ -46,17 +48,19 @@ import {
   commandAcceptsAgentResult,
   commandAcceptsAgentResultCondition,
 } from '../../services/commandResultAcceptance';
+import { commandIncarnationIsCurrentCondition, commandStampMatchesCaller } from '../../services/commandIncarnation';
 import { QUEUED_BACKUP_WORKLOAD_COMMAND_TYPES } from '../../services/commandTypes';
 import { tryParseBackupResultPayload, isBackupQueuedAck, isBackupStartedAck } from '../../services/backupProgress';
 import {
   pamAgentResultV2Schema,
-  type PamActuationResultClassification,
+  toV1PamResultClassification,
+  type PamActuationResultClassificationV1,
 } from '../../services/pamActuationResult';
 import { consumePamReconciliationRateLimit } from '../../services/pamReconciliationRateLimit';
 
 export type PamResultAcknowledgement = {
   protocolVersion: 1;
-  classification: PamActuationResultClassification;
+  classification: PamActuationResultClassificationV1;
 };
 
 export const commandsRoutes = new Hono();
@@ -87,6 +91,10 @@ export const commandsRoutes = new Hono();
  * receive — a behaviour change beyond this PR's one intentional one.
  */
 const REGISTRY_DISPATCHED_COMMAND_TYPES = new Set([
+  'wake_on_lan',
+  // Vendor updates (#11065): both transports reach the same handler.
+  'oem_update_run',
+  'oem_update_release',
   // Disk Cleanup v2 W04. Listed here because this route has NO inline block
   // for it — the handler is registry-only precisely so both transports run
   // exactly the same code.
@@ -110,6 +118,22 @@ const REGISTRY_DISPATCHED_COMMAND_TYPES = new Set([
   // than through the inline restore branch below (which would only do the
   // first half and, if listed in both, do it twice).
   'bare_metal_rebuild',
+  // #8385: a vault configuration the helper could not apply is recorded on
+  // the vault. Registry-only, like system_cleanup_run.
+  'vault_configure',
+  // #6354 W02: caller verification. Registry-only so both transports apply
+  // the human's answer through the same leaf handler.
+  'caller_verify',
+  // #8742 W02: endpoint-message delivery state follows the notify_user result.
+  'notify_user',
+  'retract_message',
+  // #8743 W03: conversation / message state follows the chat command results.
+  'chat_open',
+  'chat_message',
+  // #9662: the incident action follows the execute_containment result.
+  // Registry-only, so both transports apply the same leaf handler.
+  'execute_containment',
+  'release_containment',
 ]);
 
 const PAM_COMMAND_TYPES = new Set(['pam_apply_v2', 'pam_cleanup_v2']);
@@ -117,30 +141,6 @@ const PAM_COMMAND_TYPES = new Set(['pam_apply_v2', 'pam_cleanup_v2']);
 function commandResultToStdout(data: z.infer<typeof commandResultSchema>): string | undefined {
   return data.stdout ??
     (data.result !== undefined ? JSON.stringify(data.result) : undefined);
-}
-
-function buildStoredCommandResult(
-  commandType: string,
-  data: z.infer<typeof commandResultSchema>,
-  stdout: string | undefined,
-) {
-  // Defense-in-depth: strip full PEM private-key blocks from agent output
-  // before it is persisted and later shown to scripts:read users. Pre-update
-  // agents don't redact server-side-visible output, so we redact here.
-  // Preserve null/undefined (don't coerce to '') to keep the stored shape stable.
-  //
-  // Exception: artifact-bearing stdout (capture_pprof base64 profiles) must be
-  // stored byte-for-byte -- the redaction patterns statistically fire inside
-  // megabytes of random base64 and would silently corrupt the artifact (#2401).
-  const skipStdoutRedaction = isRawStdoutArtifactCommand(commandType);
-  return {
-    status: data.status,
-    exitCode: data.exitCode,
-    stdout: stdout != null && !skipStdoutRedaction ? redactSecretsFromOutput(stdout) : stdout,
-    stderr: data.stderr != null ? redactSecretsFromOutput(data.stderr) : data.stderr,
-    durationMs: data.durationMs,
-    error: data.error != null ? redactSecretsFromOutput(data.error) : data.error,
-  };
 }
 
 function normalizeCriticalResultIfNeeded(
@@ -229,7 +229,7 @@ commandsRoutes.get('/:id/commands', async (c) => {
   const deliverableCommands = await runOutsideDbContext(() =>
     withSystemDbAccessContext(async () => {
       const commands = await claimPendingCommandsForDevice(
-        agent.deviceId,
+        { deviceId: agent.deviceId, agentId: agent.agentId, installIncarnation: agent.installIncarnation },
         10,
         agent.role,
         // #2774 / #3986 — drain narrowing (tenant offboarding OR device
@@ -298,9 +298,16 @@ commandsRoutes.post(
     // device_commands ever gains an RLS policy, this read becomes a silent
     // 0-row no-op and MUST move into withSystemDbAccessContext — same caveat as
     // services/commandDispatch.ts.
+    //
+    // #8318: `incarnationCurrent` is read in the same statement — is the row
+    // stamped for the device's CURRENT install incarnation? (A SECURITY
+    // DEFINER resolver, so it answers on this contextless read.)
     const [command] = await runOutsideDbContext(() =>
       db
-        .select()
+        .select({
+          ...getTableColumns(deviceCommands),
+          incarnationCurrent: commandIncarnationIsCurrentCondition(),
+        })
         .from(deviceCommands)
         .where(
           and(
@@ -329,6 +336,28 @@ commandsRoutes.post(
     const commandTargetRole = command.targetRole === 'watchdog' ? 'watchdog' : 'agent';
     if (commandTargetRole !== agent.role) {
       return c.json({ error: 'Command role mismatch' }, 403);
+    }
+
+    // #8318 §5.2: work queued for an EARLIER install incarnation of this
+    // device. Nothing about it is recorded — not the result, not a late
+    // caller-verification receipt, not cleanup evidence, not PAM evidence —
+    // and it is acknowledged like any other result the server no longer
+    // wants, so a replaying outbox stops. The terminal CAS below carries the
+    // same check in SQL (commandAcceptsAgentResultCondition); this answers
+    // before any of the branches that bypass it. Compared with `=== false`
+    // because the column is always a boolean from the database.
+    //
+    // §6.4, the caller half: a row stamped for a LATER incarnation than the
+    // one this request authenticated under (enqueued after a reattach confirm
+    // the request predates) is refused the same way.
+    if (
+      command.incarnationCurrent === false
+      || !commandStampMatchesCaller(command.deviceIncarnation, agent.installIncarnation)
+    ) {
+      if (PAM_COMMAND_TYPES.has(command.type)) {
+        return c.json<PamResultAcknowledgement>({ protocolVersion: 1, classification: 'stale' });
+      }
+      return c.json({ success: true });
     }
 
     // Supplemental PAM evidence for every terminal command state, including a
@@ -366,7 +395,7 @@ commandsRoutes.post(
       }
       return c.json<PamResultAcknowledgement>({
         protocolVersion: 1,
-        classification: outcome.classification,
+        classification: toV1PamResultClassification(outcome.classification),
       });
     }
     if (isTerminalPamCommand) {
@@ -378,6 +407,33 @@ commandsRoutes.post(
     // reaper) remains acceptable for non-PAM commands. Every other terminal
     // result preserves the historical short circuit.
     const acceptsResult = commandAcceptsAgentResult(command.status, command.result, command.type);
+
+    // Caller verification (#6354 W02): "This is not me" must survive a
+    // command that is already terminal. The row was authorized above (this
+    // device, agent role); the receipt is merged into it without reopening
+    // it, and the decision runs in the same savepoint — a failure rolls both
+    // back and the agent's retry re-applies it.
+    if (!acceptsResult && command.type === 'caller_verify') {
+      const late = await import('../../services/callerVerification/workstationResult');
+      const lateStdout = commandResultToStdout(data);
+      if (late.isCallerNotMe(lateStdout, data.result)) {
+        await withDbTransaction(async () => {
+          const recorded = await late.persistCallerNotMeReceipt({
+            commandId, deviceId: command.deviceId, stdout: lateStdout, result: data.result,
+          });
+          if (!recorded) {
+            console.warn(`[agents] late caller rejection for command ${commandId} could not be recorded; ignored`);
+          } else {
+            await late.handleCallerVerifyResult({
+              agentId: agent.agentId ?? agentId, command, commandId, result: data,
+              resolvedDeviceId: command.deviceId, stdout: lateStdout,
+            });
+          }
+        });
+      }
+      return c.json({ success: true });
+    }
+
     if (!acceptsResult && command.type !== 'file_delete' && command.type !== 'system_cleanup_run') {
       return c.json({ success: true });
     }
@@ -442,86 +498,303 @@ commandsRoutes.post(
         return isBackupQueuedAck(parsed) || isBackupStartedAck(parsed);
       })();
 
-    // Terminal compare-and-set, outside the agentAuth transaction for the same
-    // visibility reasons as the lookup above, and under an explicit system
-    // context so this is not a contextless bare-pool write (#1375). Mirrors the
-    // WS twin in agentWs.processCommandResult; device_commands is intentionally
-    // system-scoped (no RLS), so the context changes nothing about what the
-    // write can touch — it makes the guard's invariant in db/index.ts true on
-    // this path too. Without it, this route was the largest remaining source of
-    // BREEZE-7 events after the WS path was fixed.
+    // #3530 — the terminal compare-and-set and the per-type persistence now run
+    // in ONE savepoint (withDbTransaction) on the request transaction that
+    // agentAuthMiddleware already holds open for this route (org-scoped; this
+    // path is not one of SELF_MANAGED_DB_CONTEXT_ACTIONS). Previously the CAS
+    // committed in its own system transaction first and every persistence
+    // failure below was caught and answered `{success:true}`, so the history
+    // said "completed" while the feature record was missing and the row
+    // refused any resubmission. Now a persistence failure rolls back to the
+    // savepoint — CAS included — the row is parked as a reopenable
+    // `result_processing_failed`, and the agent gets a 500.
     //
-    // BREEZE-X: this branch used to return `{success:true}` silently on 0 rows,
-    // so the WS twin's Sentry warning had no REST-side counterpart to correlate
-    // against — you could not confirm a cross-transport race from one side
-    // alone. It gets its own `cas_label` and the same `prior_status` tag. It
-    // should be RARER than the WS twin because the terminal pre-read above
-    // usually short-circuits first — which is itself a useful signal.
-    let updated: unknown;
+    // The CAS moved off `runOutsideDbContext + withSystemDbAccessContext`:
+    // device_commands has no RLS (intentionally system-scoped), so the org
+    // request context changes nothing about what the write can touch, and it is
+    // still an explicit context (#1375). READ COMMITTED re-evaluates the
+    // predicate against the latest committed row, so the CAS semantics are
+    // unchanged; a concurrent duplicate simply waits on the row lock and then
+    // matches 0 rows. Holding that lock for the rest of the request is safe: no
+    // handler writes this row on a separate connection (swept for #3530).
+    //
+    // BREEZE-X: the 0-row branch gets its own `cas_label` and the same
+    // `prior_status` tag as the WS twin, so a cross-transport race can be
+    // confirmed from either side. It should be RARER than the WS twin because
+    // the terminal pre-read above usually short-circuits first — which is
+    // itself a useful signal.
     const terminalCompletedAt = new Date();
-    const storedCommandResult = buildStoredCommandResult(command.type, normalizedData, stdout);
-    const updatedRows = await runOutsideDbContext(async () => withSystemDbAccessContext(async () =>
-      dbWriteExpectingRows(
-        'device_commands.rest_result_terminal_cas',
-        async () => {
-          const query = db
-            .update(deviceCommands)
-            .set({
-              status: normalizedData.status === 'completed' ? 'completed' : 'failed',
-              completedAt: terminalCompletedAt,
-              // D20-D: a queue-ack stays 'completed' at the top level (the
-              // caller — e.g. a HTTP-polling agent's dispatch loop — must
-              // still see it as delivered) but the STORED result.status is
-              // overridden to the marker so commandAcceptsAgentResultCondition
-              // reopens the row for the real terminal result later.
-              result: isBackupAck
-                ? { ...storedCommandResult, status: BACKUP_QUEUE_ACK_RESULT_STATUS }
-                : storedCommandResult,
-              // Credentials ride the payload for some command types (FileVault
-              // rotation, and the #3409 script secret envelope); strip them
-              // once the command is terminal. Shared with the ten other
-              // terminal writers that previously retained them.
-              ...terminalPayloadErasureSet(),
-            })
-            .where(and(
-              eq(deviceCommands.id, commandId),
-              eq(deviceCommands.deviceId, deviceId),
-              eq(deviceCommands.targetRole, agent.role),
-              commandAcceptsAgentResultCondition()
-            )) as any;
+    const storedCommandResult = buildStoredCommandResult(command.type, normalizedData, stdout, command.payload);
+    const commandPayload =
+      command.payload && typeof command.payload === 'object' && !Array.isArray(command.payload)
+        ? command.payload as Record<string, unknown>
+        : {};
+    const drExecutionId =
+      DR_COMMAND_TYPES.has(command.type) && typeof commandPayload.drExecutionId === 'string'
+        ? commandPayload.drExecutionId
+        : null;
+    let pamAcknowledgement: PamResultAcknowledgement | undefined;
 
-          updated = typeof query.returning === 'function'
-            ? await query.returning({ id: deviceCommands.id })
-            : await query;
+    let finalized: 'stale' | 'queue_ack' | 'rejected' | 'recorded';
+    try {
+      finalized = await withDbTransaction(async () => {
+        let updated: unknown;
+        const updatedRows = await dbWriteExpectingRows(
+          'device_commands.rest_result_terminal_cas',
+          async () => {
+            const query = db
+              .update(deviceCommands)
+              .set({
+                status: normalizedData.status === 'completed' ? 'completed' : 'failed',
+                completedAt: terminalCompletedAt,
+                // D20-D: a queue-ack stays 'completed' at the top level (the
+                // caller — e.g. a HTTP-polling agent's dispatch loop — must
+                // still see it as delivered) but the STORED result.status is
+                // overridden to the marker so commandAcceptsAgentResultCondition
+                // reopens the row for the real terminal result later.
+                result: isBackupAck
+                  ? { ...storedCommandResult, status: BACKUP_QUEUE_ACK_RESULT_STATUS }
+                  : storedCommandResult,
+                // Credentials ride the payload for some command types (FileVault
+                // rotation, and the #3409 script secret envelope); strip them
+                // once the command is terminal. Shared with the ten other
+                // terminal writers that previously retained them.
+                ...terminalPayloadErasureSet(),
+              })
+              .where(and(
+                eq(deviceCommands.id, commandId),
+                eq(deviceCommands.deviceId, deviceId),
+                eq(deviceCommands.targetRole, agent.role),
+                commandAcceptsAgentResultCondition(agent)
+              )) as any;
 
-          return Array.isArray(updated) ? updated : [];
-        },
-        () => commandCasPriorStatusTags(commandId)
-      )
-    ));
+            updated = typeof query.returning === 'function'
+              ? await query.returning({ id: deviceCommands.id })
+              : await query;
 
-    if (updated === undefined) {
-      console.warn(`[agents] command result update returned undefined for ${commandId} — treating as failed update`);
+            return Array.isArray(updated) ? updated : [];
+          },
+          () => commandCasPriorStatusTags(commandId)
+        );
+
+        if (updated === undefined) {
+          console.warn(`[agents] command result update returned undefined for ${commandId} — treating as failed update`);
+        }
+        if (updatedRows.length === 0) return 'stale';
+
+        if (isBackupAck) {
+          // D20-D: non-terminal signal — no applyCommandAutomationTerminal, no
+          // per-type handler dispatch. Without this guard,
+          // handleProviderBackedBackupResult would parse {"queued":true}/
+          // {"started":true} against the all-optional backupCommandResultSchema,
+          // "succeed" vacuously, and mark the backup_jobs row completed with no
+          // snapshot at all — a false-positive this fix would otherwise
+          // introduce now that the command payload carries jobId (D20-E).
+          return 'queue_ack';
+        }
+
+        if (validationError) return 'rejected';
+
+        // Per-type persistence. Every failure PROPAGATES (#3530) — the
+        // catch below turns it into a rollback + park + 500. Genuinely
+        // best-effort follow-ups (the post-apply audit-policy re-collect, DR
+        // reconcile enqueue, topology telemetry) run after the savepoint.
+        if (
+          command.type === securityCommandTypes.collectStatus ||
+          command.type === securityCommandTypes.scan ||
+          command.type === securityCommandTypes.quarantine ||
+          command.type === securityCommandTypes.remove ||
+          command.type === securityCommandTypes.restore
+        ) {
+          await handleSecurityCommandResult(command, normalizedData);
+        }
+
+        if (command.type === filesystemAnalysisCommandType) {
+          await handleFilesystemAnalysisCommandResult(command, normalizedData, agent.orgId);
+        }
+
+        if (
+          command.type === sensitiveDataCommandTypes.scan ||
+          command.type === sensitiveDataCommandTypes.encrypt ||
+          command.type === sensitiveDataCommandTypes.secureDelete ||
+          command.type === sensitiveDataCommandTypes.quarantine
+        ) {
+          await handleSensitiveDataCommandResult(command, normalizedData);
+        }
+
+        // Software-install results carry the persisted command UUID. Reconcile
+        // deployment_results using the authenticated device and the
+        // server-written deploymentId/retryCount payload. The helper's
+        // pending-status and attempt guards make replays and retry-superseded
+        // results a no-op.
+        if (command.type === 'software_install') {
+          // #5128: shared with the websocket transport so the two cannot drift.
+          await reconcileSoftwareInstallResult(command, deviceId, normalizedData);
+        }
+
+        if (command.type === 'software_uninstall') {
+          await handleSoftwareRemediationCommandResult(command, normalizedData);
+        }
+
+        if (command.type === 'collect_audit_policy' && normalizedData.status === 'completed') {
+          await processCollectedAuditPolicyCommandResult(command.deviceId, stdout);
+        }
+
+        if (command.type === 'cis_benchmark' || command.type === 'apply_cis_remediation') {
+          await handleCisCommandResult(command, normalizedData);
+        }
+
+        if (command.type === 'backup_verify' || command.type === 'backup_test_restore') {
+          await processBackupVerificationResult(commandId, {
+            status: normalizedData.status,
+            stdout,
+            error: normalizedData.error,
+          });
+        }
+
+        if (
+          command.type === 'backup_restore' ||
+          command.type === 'bmr_recover' ||
+          command.type === 'vm_restore_from_backup' ||
+          command.type === 'vm_instant_boot'
+        ) {
+          await updateRestoreJobByCommandId({
+            commandId,
+            deviceId: command.deviceId,
+            commandType: command.type,
+            result: normalizedData,
+          });
+        }
+
+        if (command.type === CommandTypes.VAULT_SYNC) {
+          await applyVaultSyncCommandResult({
+            deviceId: command.deviceId,
+            command,
+            resultStatus: normalizedData.status,
+            stdout,
+            stderr: normalizedData.stderr,
+            error: normalizedData.error,
+          });
+        }
+
+        if (drExecutionId) {
+          const { handleDrCommandResult } = await import('../backup/drResultHandler');
+          await handleDrCommandResult({
+            commandId,
+            commandType: command.type,
+            deviceId: command.deviceId,
+            status: normalizedData.status,
+            result: normalizedData.result,
+            payload: commandPayload,
+          });
+        }
+
+        // #3097 — the shared per-type handlers this transport never registered.
+        //
+        // No extra DB-context wrap: agentAuthMiddleware's request-long org
+        // context (scope 'organization', the device's orgId, accessibleOrgIds
+        // [orgId], no partner access) is the one this savepoint sits in — the
+        // same shape the websocket's finalize wrap builds. Opening a second real
+        // transaction would be the #1105 double-hold this route was cleaned up
+        // to avoid.
+        if (REGISTRY_DISPATCHED_COMMAND_TYPES.has(command.type)) {
+          // Imported dynamically: the registry pulls in the discovery and SNMP
+          // workers, and through them the Drizzle schema module, which is more
+          // than this hot route should carry in its static graph — and enough
+          // to break suites that partially mock `db/schema`.
+          const { commandResultHandlers } = await import('../../services/commandResultHandlers');
+          const handler = commandResultHandlers[command.type];
+          if (handler) {
+            const outcome = await handler({
+              // Handlers use this for log lines and one audit `actorId`, never
+              // a lookup. Prefer the authenticated agent record over the path
+              // param, matching this route's own writeAuditEvent actor below.
+              agentId: agent.agentId ?? agentId,
+              command,
+              commandId,
+              result: normalizedData,
+              // The lookup above constrains deviceId to the authenticated
+              // agent's device, so these are the same value the websocket
+              // resolves.
+              resolvedDeviceId: command.deviceId,
+              stdout,
+            });
+            if (PAM_COMMAND_TYPES.has(command.type)) {
+              if (!outcome || outcome.kind !== 'pam') {
+                throw new Error(`PAM result handler returned no acknowledgement for ${command.type}`);
+              }
+              pamAcknowledgement = {
+                protocolVersion: 1,
+                classification: toV1PamResultClassification(outcome.classification),
+              };
+            }
+          }
+        }
+        return 'recorded';
+      });
+    } catch (persistErr) {
+      // The savepoint rolled back: the CAS and any partial persistence are
+      // gone and the request transaction is usable again. Park the row as
+      // failed + reopenable on it (committed with the request), so the history
+      // is honest and a resubmission is reprocessed. No terminal audit and no
+      // automation terminal — neither describes what happened.
+      console.error(
+        `[agents] failed to record ${command.type} result ${commandId}; command parked as result_processing_failed:`,
+        persistErr,
+      );
+      captureException(persistErr, undefined, {
+        command_result_phase: 'rest_result_persistence',
+        commandType: command.type,
+        commandId,
+      });
+      try {
+        await markCommandResultProcessingFailed({
+          commandId,
+          deviceId,
+          targetRole: agent.role,
+          caller: agent,
+          storedResult: storedCommandResult,
+        });
+      } catch (markErr) {
+        // The row keeps its pre-result state and the stale reaper will fail
+        // it; the persistence failure above is already reported.
+        console.error(`[agents] failed to park command ${commandId} as result_processing_failed:`, markErr);
+        captureException(markErr, undefined, {
+          command_result_phase: 'rest_result_processing_failed_mark',
+          commandId,
+        });
+      }
+      return c.json({ error: 'result_processing_failed' }, 500);
     }
 
-    if (updatedRows.length === 0) {
+    if (finalized === 'stale') {
       await recordSupplementalCleanup();
       return c.json({ success: true });
     }
+    if (finalized === 'queue_ack') return c.json({ success: true });
 
-    if (isBackupAck) {
-      // D20-D: non-terminal signal — no applyCommandAutomationTerminal, no
-      // per-type handler dispatch. Without this guard,
-      // handleProviderBackedBackupResult would parse {"queued":true}/
-      // {"started":true} against the all-optional backupCommandResultSchema,
-      // "succeed" vacuously, and mark the backup_jobs row completed with no
-      // snapshot at all — a false-positive this fix would otherwise introduce
-      // now that the command payload carries jobId (D20-E).
-      return c.json({ success: true });
+    // #4757 W06: terminalise the restore-point ledger only after the CAS won
+    // (a losing duplicate returned 'stale' above), outside the savepoint so a
+    // ledger failure can never roll the result back, and before the
+    // 'rejected' return (the command still went terminal). The ingest escapes
+    // this request's org-scoped transaction into its own system context, so
+    // the ledger write commits independently of the request's final commit.
+    // Skipped entirely when the agent sent no restorePoint. Never fails the
+    // result.
+    if (data.restorePoint !== undefined) {
+      try {
+        await ingestRestorePointOutcome(data.restorePoint, {
+          orgId: agent.orgId, deviceId, deviceCommandId: commandId,
+        });
+      } catch (err) {
+        console.error(`[agents] restore-point ledger ingest failed for ${commandId}; result unaffected:`, err);
+        captureException(err, undefined, { restore_point_ingest: 'call_site' });
+      }
     }
 
-    // The guarded command transition is the authority. Reconcile before the
-    // validation-error return so malformed terminal frames cannot strand an
+    // The guarded command transition is the authority, so the automation
+    // ledger follows it only once it (and its persistence) succeeded. Before
+    // the validation-error return so malformed terminal frames cannot strand an
     // automation action after the command itself became terminal.
     await applyCommandAutomationTerminal({
       commandId,
@@ -531,89 +804,14 @@ commandsRoutes.post(
       completedAt: terminalCompletedAt,
     });
 
-    if (validationError) {
+    if (finalized === 'rejected') {
       console.warn(`[agents] ${validationError}`);
       return c.json({ success: true });
     }
 
-    if (
-      command.type === securityCommandTypes.collectStatus ||
-      command.type === securityCommandTypes.scan ||
-      command.type === securityCommandTypes.quarantine ||
-      command.type === securityCommandTypes.remove ||
-      command.type === securityCommandTypes.restore
-    ) {
-      try {
-        await handleSecurityCommandResult(command, normalizedData);
-      } catch (err) {
-        console.error(`[agents] security command post-processing failed for ${commandId}:`, err);
-        captureException(err);
-      }
-    }
-
-    if (command.type === filesystemAnalysisCommandType) {
-      try {
-        await handleFilesystemAnalysisCommandResult(command, normalizedData, agent.orgId);
-      } catch (err) {
-        console.error(`[agents] filesystem analysis post-processing failed for ${commandId}:`, err);
-        captureException(err);
-      }
-    }
-
-    if (
-      command.type === sensitiveDataCommandTypes.scan ||
-      command.type === sensitiveDataCommandTypes.encrypt ||
-      command.type === sensitiveDataCommandTypes.secureDelete ||
-      command.type === sensitiveDataCommandTypes.quarantine
-    ) {
-      try {
-        await handleSensitiveDataCommandResult(command, normalizedData);
-      } catch (err) {
-        console.error(`[agents] sensitive data post-processing failed for ${commandId}:`, err);
-        captureException(err);
-      }
-    }
-
-    // Software-install results carry the persisted command UUID. Reconcile
-    // deployment_results using the authenticated device and the server-written
-    // deploymentId/retryCount payload. The helper's pending-status and attempt
-    // guards make replays and retry-superseded results a no-op.
-    if (command.type === 'software_install') {
-      try {
-        // #5128: shared with the websocket transport so the two cannot drift.
-        await reconcileSoftwareInstallResult(command, deviceId, normalizedData);
-      } catch (err) {
-        console.error(`[agents] software install deployment-result reconciliation failed for ${commandId}:`, err);
-        captureException(err);
-      }
-    }
-
-    if (command.type === 'software_uninstall') {
-      try {
-        await handleSoftwareRemediationCommandResult(command, normalizedData);
-      } catch (err) {
-        const policyId = command.payload && typeof command.payload === 'object'
-          ? (command.payload as Record<string, unknown>).policyId ?? 'unknown'
-          : 'unknown';
-        console.error(
-          `[agents] software remediation post-processing failed for command ${commandId} ` +
-          `(device ${command.deviceId}, policy ${policyId}) — device may be stuck in_progress:`,
-          err
-        );
-        captureException(err);
-      }
-    }
-
-    if (command.type === 'collect_audit_policy' && normalizedData.status === 'completed') {
-      try {
-        await processCollectedAuditPolicyCommandResult(command.deviceId, stdout);
-      } catch (err) {
-        console.error(`[agents] audit policy command post-processing failed for ${commandId}:`, err);
-        captureException(err);
-      }
-    }
-
     if (command.type === CommandTypes.APPLY_AUDIT_POLICY_BASELINE && normalizedData.status === 'completed') {
+      // Best-effort follow-up (#3530 classification): this enqueues a NEW
+      // verification command; it persists nothing about this result.
       try {
         // Break out of the request-scoped transaction so the follow-up command
         // row is committed before the agent can submit its result.
@@ -638,63 +836,10 @@ commandsRoutes.post(
       }
     }
 
-    if (command.type === 'cis_benchmark' || command.type === 'apply_cis_remediation') {
-      try {
-        await handleCisCommandResult(command, normalizedData);
-      } catch (err) {
-        console.error(`[agents] CIS command post-processing failed for ${commandId}:`, err);
-        captureException(err);
-      }
-    }
-
-    if (command.type === 'backup_verify' || command.type === 'backup_test_restore') {
-      try {
-        await processBackupVerificationResult(commandId, {
-          status: normalizedData.status,
-          stdout,
-          error: normalizedData.error,
-        });
-      } catch (err) {
-        console.error(`[agents] backup verification post-processing failed for ${commandId}:`, err);
-        captureException(err);
-      }
-    }
-
-    if (
-      command.type === 'backup_restore' ||
-      command.type === 'bmr_recover' ||
-      command.type === 'vm_restore_from_backup' ||
-      command.type === 'vm_instant_boot'
-    ) {
-      try {
-        await updateRestoreJobByCommandId({
-          commandId,
-          deviceId: command.deviceId,
-          commandType: command.type,
-          result: normalizedData,
-        });
-      } catch (err) {
-        console.error(`[agents] restore job post-processing failed for ${commandId}:`, err);
-        captureException(err);
-      }
-    }
-
-    if (command.type === CommandTypes.VAULT_SYNC) {
-      try {
-        await applyVaultSyncCommandResult({
-          deviceId: command.deviceId,
-          command,
-          resultStatus: normalizedData.status,
-          stdout,
-          stderr: normalizedData.stderr,
-          error: normalizedData.error,
-        });
-      } catch (err) {
-        console.error(`[agents] vault sync post-processing failed for ${commandId}:`, err);
-        captureException(err);
-      }
-    }
-
+    // Topology ingestion stays best-effort and outside the savepoint (#3530
+    // classification): both sinks deliberately open their own bounded system
+    // transaction, so they cannot share the CAS's, and they are observational
+    // telemetry re-collected on the next diagnostic / poll cycle.
     if (command.type === 'network_diagnostic') {
       try {
         const { ingestTopologyDiagnosticCommandResult } = await import(
@@ -713,83 +858,31 @@ commandsRoutes.post(
       }
     }
 
-    if (DR_COMMAND_TYPES.has(command.type)) {
+    if (command.type === 'topology_interface_poll') {
       try {
-        const commandPayload =
-          command.payload && typeof command.payload === 'object' && !Array.isArray(command.payload)
-            ? command.payload as Record<string, unknown>
-            : {};
-        if (typeof commandPayload.drExecutionId === 'string') {
-          const { handleDrCommandResult } = await import('../backup/drResultHandler');
-          await handleDrCommandResult({
-            commandId,
-            commandType: command.type,
-            deviceId: command.deviceId,
-            status: normalizedData.status,
-            result: normalizedData.result,
-            payload: commandPayload,
-          });
-
-          const { enqueueDrExecutionReconcile } = await import('../../jobs/drExecutionWorker');
-          await enqueueDrExecutionReconcile(commandPayload.drExecutionId);
-        }
+        const { ingestTopologyInterfacePollResult } = await import('../../services/topology/snmpInterfaceMetrics');
+        await ingestTopologyInterfacePollResult({
+          commandType: command.type,
+          commandId,
+          deviceId: command.deviceId,
+          status: normalizedData.status,
+          result: normalizedData.result,
+          stdout: normalizedData.stdout,
+        });
       } catch (err) {
-        console.error(`[agents] DR command post-processing failed for ${commandId}:`, err);
+        console.error(`[agents] topology interface poll post-processing failed for ${commandId}:`, err);
         captureException(err);
       }
     }
 
-    // #3097 — the shared per-type handlers this transport never registered.
-    //
-    // No DB-context wrap here, unlike the websocket twin's
-    // `runWithAgentOrgDbAccess`: agentAuthMiddleware already holds an
-    // org-scoped `withDbAccessContext` open around this whole request, with the
-    // same shape the websocket wrap builds (scope 'organization', the device's
-    // orgId, accessibleOrgIds [orgId], no partner access). The websocket needs
-    // its own wrap only because that path deliberately runs contextless (#3021).
-    // This route is not one of the SELF_MANAGED_DB_CONTEXT_ACTIONS — those match
-    // on the final path segment, which here is `result`, not `commands` — so the
-    // request-long wrap is active. Adding a nested one would be a no-op anyway:
-    // `withDbAccessContext` returns `fn()` unchanged when a context is already
-    // on the async-local store, and opening a second real transaction is the
-    // #1105 double-hold this route was explicitly cleaned up to avoid.
-    let pamAcknowledgement: PamResultAcknowledgement | undefined;
-    if (REGISTRY_DISPATCHED_COMMAND_TYPES.has(command.type)) {
-      // Imported dynamically, like the DR handler below: the registry pulls in
-      // the discovery and SNMP workers, and through them the Drizzle schema
-      // module, which is more than this hot route should carry in its static
-      // graph — and enough to break suites that partially mock `db/schema`.
-      const { commandResultHandlers } = await import('../../services/commandResultHandlers');
-      const handler = commandResultHandlers[command.type];
-      if (handler) {
-        try {
-          const outcome = await handler({
-            // Handlers use this for log lines and one audit `actorId`, never a
-            // lookup. Prefer the authenticated agent record over the path
-            // param, matching this route's own writeAuditEvent actor below.
-            agentId: agent.agentId ?? agentId,
-            command,
-            commandId,
-            result: normalizedData,
-            // The lookup above constrains deviceId to the authenticated agent's
-            // device, so these are the same value the websocket resolves.
-            resolvedDeviceId: command.deviceId,
-            stdout,
-          });
-          if (PAM_COMMAND_TYPES.has(command.type)) {
-            if (!outcome || outcome.kind !== 'pam') {
-              throw new Error(`PAM result handler returned no acknowledgement for ${command.type}`);
-            }
-            pamAcknowledgement = {
-              protocolVersion: 1,
-              classification: outcome.classification,
-            };
-          }
-        } catch (err) {
-          console.error(`[agents] shared ${command.type} result handler failed for ${commandId}:`, err);
-          captureException(err);
-          if (PAM_COMMAND_TYPES.has(command.type)) throw err;
-        }
+    // Best-effort: the DR worker also reconciles on its own schedule.
+    if (drExecutionId) {
+      try {
+        const { enqueueDrExecutionReconcile } = await import('../../jobs/drExecutionWorker');
+        await enqueueDrExecutionReconcile(drExecutionId);
+      } catch (err) {
+        console.error(`[agents] DR reconcile enqueue failed for ${commandId}:`, err);
+        captureException(err);
       }
     }
 

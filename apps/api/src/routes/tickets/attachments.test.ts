@@ -4,7 +4,7 @@ import { Hono } from 'hono';
 const {
   authRef, getScopedTicketOr404Mock, dbSelectMock, dbInsertReturningMock,
   selectColumnArgs, insertedValues, putBytesMock, deleteBytesMock, auditMock, rateLimitAllowed,
-  openBytesMock, dbRowMock, deletedRowIds, dbEventOrder, resolveArtifactMock,
+  openBytesMock, dbRowMock, deletedRowIds, dbEventOrder, findArtifactForAuthMock,
 } = vi.hoisted(() => ({
   authRef: {
     current: {
@@ -25,7 +25,7 @@ const {
   putBytesMock: vi.fn(),
   deleteBytesMock: vi.fn(),
   openBytesMock: vi.fn(),
-  resolveArtifactMock: vi.fn(),
+  findArtifactForAuthMock: vi.fn(),
   dbRowMock: vi.fn(),
   deletedRowIds: [] as unknown[],
   // Side effects recorded from INSIDE the request, so orderings are observable.
@@ -33,6 +33,15 @@ const {
   auditMock: vi.fn(),
   rateLimitAllowed: { current: true },
 }));
+
+// #8972 W0: every ticket-child writer now locks the ticket row first; the lock is
+// mocked here (real SQL is covered by ticketChildLockOrder.integration.test.ts).
+const { lockTicketForWriteMock } = vi.hoisted(() => ({
+  lockTicketForWriteMock: vi.fn(async (_tx: unknown, id: string): Promise<{
+    id: string; orgId: string; partnerId: string; status: string; deletedAt: Date | null; workKind: string;
+  } | null> => ({ id, orgId: 'org-1', partnerId: 'p-1', status: 'open', deletedAt: null, workKind: 'support' })),
+}));
+vi.mock('../../services/ticketRowLock', () => ({ lockTicketForWrite: lockTicketForWriteMock, lockTicketsForWrite: vi.fn(async () => []) }));
 
 vi.mock('../../middleware/auth', async () => ({
   authMiddleware: vi.fn(async (c: any, next: any) => {
@@ -113,7 +122,7 @@ vi.mock('../../services/auditService', () => ({ createAuditLogAsync: auditMock }
 // Execution plane W05 (spec §6.3) — the from-artifact attach route resolves the
 // handle through this; its own coverage is artifactService.test.ts.
 vi.mock('../../services/artifacts/artifactService', () => ({
-  resolveArtifact: resolveArtifactMock,
+  findArtifactForAuth: findArtifactForAuthMock,
   openArtifactStream: vi.fn(),
 }));
 
@@ -187,6 +196,8 @@ describe('POST /tickets/:id/attachments (W08 #3902)', () => {
     expect(keys).not.toContain('storageBackend');
     expect(keys).not.toContain('sha256');
     expect(keys).not.toContain('data');
+    // #8972 W0: the ticket row is locked before the attachment insert
+    expect(lockTicketForWriteMock).toHaveBeenCalledWith(expect.anything(), TICKET_ID);
   });
 
   it('403s an organization-scoped caller with no orgId', async () => {
@@ -208,6 +219,22 @@ describe('POST /tickets/:id/attachments (W08 #3902)', () => {
     const res = await upload(oneFile(PNG));
     expect(res.status).toBe(409);
     expect((await res.json()).code).toBe('TICKET_DELETED');
+  });
+
+  // #8972 W0: re-checked on the locked row; the stored bytes never outlive a refusal.
+  it.each([
+    ['gone while it waited', null, 404, 'TICKET_NOT_FOUND'],
+    ['moved to another org while it waited', { orgId: 'org-2', deletedAt: null }, 404, 'TICKET_NOT_FOUND'],
+    ['deleted while it waited', { orgId: 'org-1', deletedAt: new Date() }, 409, 'TICKET_DELETED'],
+  ] as const)('refuses a ticket %s, inserts nothing and discards the stored bytes', async (_label, lockedRow, status, code) => {
+    lockTicketForWriteMock.mockResolvedValueOnce(
+      lockedRow && { id: TICKET_ID, partnerId: 'p-1', status: 'open', workKind: 'support', ...lockedRow },
+    );
+    const res = await upload(oneFile(PNG));
+    expect(res.status).toBe(status);
+    expect((await res.json()).code).toBe(code);
+    expect(insertedValues).toEqual([]);
+    expect(deleteBytesMock).toHaveBeenCalledTimes(1);
   });
 
   it('400s when the request carries no file part', async () => {
@@ -372,6 +399,28 @@ describe('GET /tickets/:id/attachments/:attachmentId/content (W08 #3902)', () =>
     expect(res.status).toBe(200);
   });
 
+  // #8313 W1 (spec 2026-10-19 §4.3): an import reservation is a pending row
+  // with NO uploader and provisional metadata (generic type, zero digest).
+  // It is served to no one, a tickets:manage holder included, until the
+  // import's claim replaces the metadata.
+  it('404s a pending IMPORT reservation (no uploader) for every caller, tickets:manage included', async () => {
+    const reservation = { commentId: null, uploadedByUserId: null, storageBackend: 's3', storageKey: `ticket-attachments/${ATT_ID}`, data: null, contentType: 'application/octet-stream', sha256: '0'.repeat(64) };
+    dbRowMock.mockReturnValue(joinRow(reservation, null));
+    expect((await content()).status).toBe(404);
+    authRef.current = { ...authRef.current, permissions: { permissions: [{ resource: 'tickets', action: 'manage' }] } } as never;
+    expect((await content()).status).toBe(404);
+    expect(openBytesMock).not.toHaveBeenCalled();
+  });
+
+  it('serves an attached imported file outside the allowlist download-only, with nosniff', async () => {
+    dbRowMock.mockReturnValue(joinRow({ uploadedByUserId: null, contentType: 'application/octet-stream', originalFilename: 'minutes.docx' }));
+    const res = await content();
+    expect(res.status).toBe(200);
+    expect(res.headers.get('Content-Type')).toBe('application/octet-stream');
+    expect(res.headers.get('X-Content-Type-Options')).toBe('nosniff');
+    expect(res.headers.get('Content-Disposition')).toBe(`attachment; filename="minutes.docx"; filename*=UTF-8''minutes.docx`);
+  });
+
   it('404s when the parent comment is soft-deleted and the caller lacks tickets:manage', async () => {
     dbRowMock.mockReturnValue(joinRow({}, { deletedAt: new Date() }));
     const res = await content();
@@ -477,6 +526,8 @@ describe('DELETE /tickets/:id/attachments/:attachmentId (W08 #3902)', () => {
     dbRowMock.mockReturnValue(joinRow({ commentId: null, uploadedByUserId: 'u-1' }, null));
     expect((await del()).status).toBe(204);
     expect(deleteBytesMock).toHaveBeenCalledTimes(1);
+    // #8972 W0: the ticket row is locked before the attachment row delete
+    expect(lockTicketForWriteMock).toHaveBeenCalledWith(expect.anything(), TICKET_ID);
   });
 
   it('403s another user\'s attachment without tickets:manage', async () => {
@@ -527,7 +578,7 @@ describe('POST /tickets/:id/attachments/from-artifact', () => {
   }
 
   beforeEach(() => {
-    resolveArtifactMock.mockResolvedValue({
+    findArtifactForAuthMock.mockResolvedValue({
       id: ART,
       orgId: 'org-1',
       runId: RUN,
@@ -568,20 +619,39 @@ describe('POST /tickets/:id/attachments/from-artifact', () => {
     });
   });
 
-  it('404s a handle that does not resolve in the ticket org, without saying why', async () => {
-    resolveArtifactMock.mockResolvedValue(null);
+  it('404s a handle the caller cannot read (object-level check, same as GET /ai/artifacts/:id), without saying why', async () => {
+    // findArtifactForAuth is the CANONICAL read route's own authorization
+    // helper — a null here means the caller is not authorized to read this
+    // specific artifact under that route's own scoping, not merely that the
+    // row is missing.
+    findArtifactForAuthMock.mockResolvedValue(null);
     const res = await attach();
     expect(res.status).toBe(404);
     expect((await res.json()).code).toBe('ARTIFACT_NOT_FOUND');
     expect(insertedValues).toHaveLength(0);
   });
 
-  it('resolves the handle against the TICKET org, not the caller org', async () => {
-    // A partner-scope tech can reach many orgs; the artifact must belong to the
-    // org whose ticket is being written, or a sibling org's file lands on this
-    // customer's ticket. `authRef` is partner-scoped with orgId null here.
+  it('resolves the handle through the caller\'s own auth context (object-level check)', async () => {
+    // findArtifactForAuth(handle, auth) is the SAME helper the canonical
+    // GET /ai/artifacts/:id route uses — the caller must be able to read this
+    // specific artifact under their own org-axis scoping, not merely hold a
+    // coarse tickets:write permission.
     await attach();
-    expect(resolveArtifactMock).toHaveBeenCalledWith(ART, { orgId: 'org-1' });
+    expect(findArtifactForAuthMock).toHaveBeenCalledWith(ART, authRef.current);
+  });
+
+  it('refuses an artifact whose own org does not match the ticket org, even though the caller can read it', async () => {
+    // A partner-scope tech can reach many orgs; findArtifactForAuth alone only
+    // proves the CALLER may read the artifact somewhere — the artifact must
+    // ALSO belong to the ticket's own org, or a sibling org's file lands on
+    // this customer's ticket (independent of the caller's own org breadth).
+    findArtifactForAuthMock.mockResolvedValue({
+      id: ART, orgId: 'org-OTHER', runId: RUN, name: 'x.csv', contentType: 'text/csv', bytes: 1, sha256: SHA,
+    });
+    const res = await attach();
+    expect(res.status).toBe(404);
+    expect((await res.json()).code).toBe('ARTIFACT_NOT_FOUND');
+    expect(insertedValues).toHaveLength(0);
   });
 
   it('refuses to attach to a deleted ticket', async () => {
@@ -590,13 +660,13 @@ describe('POST /tickets/:id/attachments/from-artifact', () => {
     });
     const res = await attach();
     expect(res.status).toBe(409);
-    expect(resolveArtifactMock).not.toHaveBeenCalled();
+    expect(findArtifactForAuthMock).not.toHaveBeenCalled();
   });
 
   it('rejects a non-uuid handle before touching the artifact service', async () => {
     const res = await attach('not-a-uuid');
     expect(res.status).toBe(400);
-    expect(resolveArtifactMock).not.toHaveBeenCalled();
+    expect(findArtifactForAuthMock).not.toHaveBeenCalled();
   });
 });
 

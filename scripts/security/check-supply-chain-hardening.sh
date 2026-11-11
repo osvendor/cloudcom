@@ -154,6 +154,29 @@ require_grep 'minisign -S' .github/workflows/release.yml \
   "release workflow must sign the release artifact manifest"
 require_grep 'minisign -V' .github/workflows/release.yml \
   "release workflow must verify the release artifact manifest signature before publishing"
+
+# Signing material (release-manifest private keys, Tauri updater key, Apple,
+# SSL.com) is stored only in the signing-production /
+# signing-prerelease environments, whose deployment policy admits v* tags
+# alone. The per-job rule for every workflow lives in
+# .github/scripts/check-workflow-security.mjs
+# (signing-secrets-must-use-signing-environment); pin that it stays wired, and
+# that the job holding the manifest private keys declares the environment.
+require_grep "SIGNING_ENVIRONMENT_RULE = 'signing-secrets-must-use-signing-environment'" \
+  .github/scripts/check-workflow-security.mjs \
+  "workflow security checker must enforce signing-secrets-must-use-signing-environment"
+require_grep 'signingEnvironmentViolations\(file, lines\)' \
+  .github/scripts/check-workflow-security.mjs \
+  "workflow security checker must run the signing-environment rule on every workflow"
+CREATE_RELEASE_JOB="$GUARD_TMP_DIR/create-release.yml"
+extract_yaml_job create-release .github/workflows/release.yml "$CREATE_RELEASE_JOB"
+require_grep 'secrets\.RELEASE_MANIFEST_ED25519_PRIVATE_KEY' "$CREATE_RELEASE_JOB" \
+  "create-release must be the job that signs the release artifact manifest"
+require_grep "^    environment:\$" "$CREATE_RELEASE_JOB" \
+  "create-release must declare a signing environment (manifest private keys live only there)"
+require_grep "^      name: \\\$\\{\\{ contains\\(github\\.ref_name, '-'\\) && 'signing-prerelease' \\|\\| 'signing-production' \\}\\}\$" \
+  "$CREATE_RELEASE_JOB" \
+  "create-release must select signing-prerelease for prerelease tags and signing-production otherwise"
 require_grep 'releaseArtifactManifest' apps/api/src/services/installerBuilder.ts \
   "installer fallback fetches must use API-side release artifact manifest verification"
 require_grep 'RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS' apps/api/src/services/releaseArtifactManifest.ts \
@@ -208,13 +231,13 @@ done
 # comment gives Dependabot no tag to resolve against, so it tracks the default
 # branch and each weekly group PR carries the next branch head forward. Four of
 # the six call sites are release.yml jobs that build signed customer binaries,
-# so the restored cache feeds compiled output. Pin every site to the 2.9.2
+# so the restored cache feeds compiled output. Pin every site to the 2.9.3
 # release commit and require the precise `# vX.Y.Z` comment, so a re-drift fails
 # here rather than inside a signed release build.
-RUST_CACHE_PIN='Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2'
+RUST_CACHE_PIN='Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3'
 for workflow in .github/workflows/ci.yml .github/workflows/release.yml; do
   require_grep "uses: ${RUST_CACHE_PIN//./\\.}\$" "$workflow" \
-    "$workflow must pin Swatinem/rust-cache to the v2.9.2 release commit"
+    "$workflow must pin Swatinem/rust-cache to the v2.9.3 release commit"
 done
 # require_grep only proves one good line exists; this proves no site deviates.
 # Capture the scan's own status rather than letting a trailing `|| true` absorb
@@ -537,15 +560,32 @@ reject_grep 'continue-on-error:[[:space:]]*true' .github/workflows/security.yml 
 # must keep invoking the real gate, and the scanner binary must stay pinned and
 # checksum-verified before install.
 for audit_workflow in .github/workflows/ci.yml .github/workflows/security.yml; do
-  require_grep 'scripts/security/check-npm-audit\.sh' "$audit_workflow" \
-    "$audit_workflow must run the blocking dependency audit gate"
   require_grep 'scripts/security/install-osv-scanner\.sh' "$audit_workflow" \
     "$audit_workflow must install osv-scanner via the checksum-verified installer"
 done
-require_grep 'OSV_SCANNER_VERSION:-[0-9]+\.[0-9]+\.[0-9]+' scripts/security/install-osv-scanner.sh \
+require_grep 'scripts/security/check-npm-audit\.sh' .github/workflows/security.yml \
+  ".github/workflows/security.yml must run the blocking dependency audit gate"
+# ci.yml runs the gate through the base/head comparison (W1, #10744), which
+# must itself keep invoking the real gate on the head.
+require_grep '^[[:space:]]*run: bash \.github/scripts/security-audit-compare\.sh' .github/workflows/ci.yml \
+  ".github/workflows/ci.yml must run the blocking dependency audit gate (.github/scripts/security-audit-compare.sh)"
+require_grep '^gate=scripts/security/check-npm-audit\.sh$' .github/scripts/security-audit-compare.sh \
+  ".github/scripts/security-audit-compare.sh must run the blocking dependency audit gate"
+require_grep '^bash "\$gate" --findings-json "\$head_json"$' .github/scripts/security-audit-compare.sh \
+  ".github/scripts/security-audit-compare.sh must scan the head with the blocking dependency audit gate"
+# The digest is pinned in the repo and has no environment override, so a cached
+# copy is verified offline and a download is never trusted on its origin
+# alone (#11367). install-osv-scanner.test.mjs exercises the behaviour.
+require_grep '^OSV_SCANNER_VERSION=[0-9]+\.[0-9]+\.[0-9]+$' scripts/security/install-osv-scanner.sh \
   "osv-scanner install must pin an explicit version"
-require_grep 'sha256sum -c -' scripts/security/install-osv-scanner.sh \
-  "osv-scanner install must verify the downloaded binary checksum"
+require_grep '^OSV_SCANNER_SHA256=[0-9a-f]{64}$' scripts/security/install-osv-scanner.sh \
+  "osv-scanner install must pin the binary's SHA-256 in the repo"
+reject_grep 'OSV_SCANNER_SHA256:-' scripts/security/install-osv-scanner.sh \
+  "osv-scanner install must not let the environment override the pinned SHA-256"
+require_grep '"\$got" != "\$OSV_SCANNER_SHA256"' scripts/security/install-osv-scanner.sh \
+  "osv-scanner install must verify every downloaded binary against the pinned SHA-256"
+require_grep '"\$cached_sha" == "\$OSV_SCANNER_SHA256"' scripts/security/install-osv-scanner.sh \
+  "osv-scanner install must verify a cached binary against the pinned SHA-256"
 reject_grep 'curl .*\|[[:space:]]*(sudo )?(tar|sh|bash)' scripts/security/install-osv-scanner.sh \
   "osv-scanner install must not pipe remote payloads into a shell or archiver"
 require_grep 'produced no parseable report' scripts/security/check-npm-audit.sh \
@@ -578,8 +618,8 @@ require_grep '(directory: |^ +- )"/apps/web"$' .github/dependabot.yml \
   "Dependabot must cover Web Dockerfiles before digest pinning can be maintained"
 require_grep '(directory: |^ +- )"/docker"$' .github/dependabot.yml \
   "Dependabot must cover release/security Dockerfiles before digest pinning can be maintained"
-require_grep 'language: \[javascript-typescript, go\]' .github/workflows/codeql.yml \
-  "CodeQL must analyze both TypeScript and Go"
+require_grep 'language: \[javascript-typescript, go, actions\]' .github/workflows/codeql.yml \
+  "CodeQL must analyze TypeScript, Go and the Actions workflows"
 
 require_grep "severity: 'HIGH,CRITICAL'" .github/workflows/security.yml \
   "Trivy must fail on HIGH and CRITICAL vulnerabilities"
@@ -769,6 +809,12 @@ require_grep 'metrics_scrape_token:' docker-compose.monitoring.yml \
 require_grep 'environment: METRICS_SCRAPE_TOKEN' docker-compose.monitoring.yml \
   "monitoring compose must source metrics scrape token from the environment"
 
+# Every monitoring image must be digest-pinned (default inside *_IMAGE_REF), #7812.
+for monitoring_ref_var in PROMETHEUS_IMAGE_REF GRAFANA_IMAGE_REF ALERTMANAGER_IMAGE_REF LOKI_IMAGE_REF PROMTAIL_IMAGE_REF REDIS_EXPORTER_IMAGE_REF POSTGRES_EXPORTER_IMAGE_REF; do
+  require_grep "image: \\$\\{${monitoring_ref_var}:-[^}]*@sha256:[0-9a-f]{64}\\}" docker-compose.monitoring.yml \
+    "monitoring compose must digest-pin ${monitoring_ref_var}"
+done
+
 # docker-compose.monitoring.yml must compose cleanly on top of BOTH base
 # stacks: the self-host root docker-compose.yml (which runs a local `postgres`
 # service) and deploy/docker-compose.prod.yml (which has no local Postgres —
@@ -791,8 +837,6 @@ if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1 &
   rm -f "$monitoring_err"
 fi
 
-require_grep 'envFlag..ENABLE_REGISTRATION., false' apps/api/src/routes/system.ts \
-  "system config status must default registration to disabled"
 require_grep "envFlag\\('ENABLE_REGISTRATION', false\\)" apps/api/src/routes/auth/schemas.ts \
   "API registration must default to disabled"
 require_grep "envFlag\\('ENABLE_REGISTRATION', false\\)" apps/api/src/routes/config.ts \

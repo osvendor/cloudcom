@@ -1,12 +1,21 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { dbSelect, partnerRead, globallyDisabled } = vi.hoisted(() => ({
+const { dbSelect, partnerRead, globallyDisabled, systemContext } = vi.hoisted(() => ({
   dbSelect: vi.fn(),
   partnerRead: vi.fn(async (fn: () => Promise<unknown>) => fn()),
   globallyDisabled: vi.fn(() => false),
+  systemContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
 }));
 
-vi.mock('../../db', () => ({ db: { select: dbSelect } }));
+vi.mock('../../db', () => ({
+  db: { select: dbSelect },
+  withSystemDbAccessContext: systemContext,
+  // #8053 per-org cache (services/hotPathCache.ts); no ambient context here.
+  hasDbAccessContext: () => false,
+  runAfterDbContextExit: (_label: string, work: () => unknown) => { work(); },
+  // W05 (#8144): cluster caches publish their invalidation after commit.
+  runAfterDbContextCommit: (_label: string, work: () => unknown) => { work(); },
+}));
 vi.mock('../../db/partnerAxisRead', () => ({
   readWithPartnerAxisVisibility: partnerRead,
 }));
@@ -22,11 +31,15 @@ vi.mock('../../config/env', () => ({ topologyGloballyDisabled: globallyDisabled 
 
 import {
   getTopologyCapabilities,
+  loadAgentTopologyFlags,
   loadTopologyFlags,
   resolveTopologyFlags,
+  topologyPhysicalExposed,
   withResolvedTopologyFlags,
   type TopologyRequestContextLike,
 } from './flags';
+import { AGENT_ORG_SETTINGS_CACHE_TTL_MS, invalidateAgentOrgSettingsCaches } from '../agentOrgSettingsCache';
+import { __resetHotPathCachesForTests } from '../hotPathCacheRegistry';
 
 const ctx = {
   scope: {
@@ -212,6 +225,11 @@ describe('topology capabilities', () => {
     expect(capabilities.ui).toEqual({ available: false, reason: 'topology_preparing' });
   });
 
+  it('reports a recorded first-snapshot import failure instead of preparing (#7557)', () => {
+    expect(getTopologyCapabilities(allFlags, 'import_failed', {}).ui).toEqual({ available: false, reason: 'topology_import_failed' });
+    expect(getTopologyCapabilities({ ...allFlags, materialization: false }, 'import_failed', {}).ui).toEqual({ available: false, reason: 'materialization_disabled' });
+  });
+
   it('keeps pre-M1 collection and diagnostics unavailable with machine reasons', () => {
     const capabilities = getTopologyCapabilities(allFlags, true, {});
     expect(capabilities.ui).toEqual({ available: true, reason: null });
@@ -234,8 +252,8 @@ describe('topology capabilities', () => {
         physical: true,
         interfaceHealth: true,
         diagnostics: true,
-        ai: true,
       },
+      true,
     );
 
     expect(capabilities.collection).toEqual({ available: true, reason: null });
@@ -243,6 +261,31 @@ describe('topology capabilities', () => {
     expect(capabilities.interfaceHealth).toEqual({ available: true, reason: null });
     expect(capabilities.diagnostics).toEqual({ available: true, reason: null });
     expect(capabilities.ai).toEqual({ available: true, reason: null });
+  });
+
+  it('derives AI readiness from the policy argument, never an agent capability (M4-D4)', () => {
+    expect(getTopologyCapabilities(allFlags, true, {}).ai).toEqual({ available: false, reason: 'ai_unavailable' });
+    expect(getTopologyCapabilities(allFlags, true, {}, true).ai).toEqual({ available: true, reason: null });
+    expect(getTopologyCapabilities({ ...allFlags, ai: false }, true, {}, true).ai).toEqual({ available: false, reason: 'ai_disabled' });
+  });
+
+  it('names a server with no model provider as ai_not_configured, behind the flags', () => {
+    expect(getTopologyCapabilities(allFlags, true, {}, false, true).ai).toEqual({ available: false, reason: 'ai_not_configured' });
+    expect(getTopologyCapabilities({ ...allFlags, ai: false }, true, {}, false, true).ai).toEqual({ available: false, reason: 'ai_disabled' });
+    expect(getTopologyCapabilities({ ...allFlags, materialization: false }, true, {}, false, true).ai).toEqual({ available: false, reason: 'materialization_disabled' });
+  });
+});
+
+describe('physical exposure (D9/D15.4)', () => {
+  const base = resolveTopologyFlags({});
+  it('is the deployed capability materialization && physical, independent of collectors', () => {
+    expect(topologyPhysicalExposed({ ...base, materialization: true, physical: true })).toBe(true);
+    expect(topologyPhysicalExposed({ ...base, materialization: true, physical: false })).toBe(false);
+    expect(topologyPhysicalExposed({ ...base, materialization: false, physical: true })).toBe(false);
+  });
+  it('reports the settings capability from the same predicate', () => {
+    const capabilities = getTopologyCapabilities({ ...base, materialization: true, physical: true }, true, { physical: topologyPhysicalExposed({ ...base, materialization: true, physical: true }) });
+    expect(capabilities.physical).toEqual({ available: true, reason: null });
   });
 });
 
@@ -295,5 +338,70 @@ describe('pre-resolved topology flags (no nested pool connection)', () => {
 
     await expect(loadTopologyFlags(ctx)).resolves.toEqual(resolveTopologyFlags({}));
     expect(dbSelect).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('loadAgentTopologyFlags — agent hot-path per-org cache (#8053)', () => {
+  const ORG_A = '11111111-1111-4111-8111-11111111111a';
+  const ORG_B = '11111111-1111-4111-8111-11111111111b';
+  const T0 = Date.parse('2026-10-07T12:00:00Z');
+
+  function seedOrg(materialization: boolean) {
+    dbSelect
+      .mockReturnValueOnce(selectResult([{
+        partnerId: '33333333-3333-4333-8333-333333333333',
+        settings: { topologyFeatureFlags: { materialization } },
+      }]))
+      .mockReturnValueOnce(selectResult([{ settings: {} }]));
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    globallyDisabled.mockReturnValue(false);
+    __resetHotPathCachesForTests();
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(T0);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('resolves in its own system context and serves the org from cache until the TTL', async () => {
+    seedOrg(true);
+    expect((await loadAgentTopologyFlags(ORG_A)).materialization).toBe(true);
+    expect(systemContext).toHaveBeenCalledTimes(1);
+
+    vi.setSystemTime(T0 + AGENT_ORG_SETTINGS_CACHE_TTL_MS - 1);
+    expect((await loadAgentTopologyFlags(ORG_A)).materialization).toBe(true);
+    expect(dbSelect).toHaveBeenCalledTimes(2);
+
+    seedOrg(false);
+    vi.setSystemTime(T0 + AGENT_ORG_SETTINGS_CACHE_TTL_MS);
+    expect((await loadAgentTopologyFlags(ORG_A)).materialization).toBe(false);
+    expect(systemContext).toHaveBeenCalledTimes(2);
+  });
+
+  it('keys by org: one org\'s flags are never served to another', async () => {
+    seedOrg(true);
+    await loadAgentTopologyFlags(ORG_A);
+    seedOrg(false);
+    expect((await loadAgentTopologyFlags(ORG_B)).materialization).toBe(false);
+    expect((await loadAgentTopologyFlags(ORG_A)).materialization).toBe(true);
+  });
+
+  it('an org settings write lands on the next read', async () => {
+    seedOrg(false);
+    await loadAgentTopologyFlags(ORG_A);
+    invalidateAgentOrgSettingsCaches(ORG_A);
+    seedOrg(true);
+    expect((await loadAgentTopologyFlags(ORG_A)).materialization).toBe(true);
+  });
+
+  it('never caches a failed resolution', async () => {
+    dbSelect.mockImplementationOnce(() => { throw new Error('pool busy'); });
+    await expect(loadAgentTopologyFlags(ORG_A)).rejects.toThrow('pool busy');
+    seedOrg(true);
+    expect((await loadAgentTopologyFlags(ORG_A)).materialization).toBe(true);
   });
 });

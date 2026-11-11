@@ -1,13 +1,15 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import type { KeyboardEvent } from "react";
 import {
   AlertTriangle,
   CheckCircle2,
+  ChevronRight,
   Clock3,
   Loader2,
   PauseCircle,
   RefreshCw,
-  ShieldCheck,
   Unplug,
+  UserCog,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { M365_PERMISSION_PROFILES } from "@breeze/shared";
@@ -16,9 +18,12 @@ import { useOrgStore } from "../../stores/orgStore";
 import { getJwtClaims } from "../../lib/authScope";
 import { usePermissions } from "../../lib/permissions";
 import { handleActionError, runAction } from "../../lib/runAction";
-import { navigateTo } from "@/lib/navigation";
+import { navigateTo, navigateToMicrosoftLogin } from "@/lib/navigation";
 import { formatDateTime } from "@/lib/dateTimeFormat";
 import "@/lib/i18n";
+import { M365ConfirmTenantPanel, M365ConsentSteps } from "./M365ConfirmTenantPanel";
+import { parseOnboardingAvailability } from "./m365ConsentSummary";
+import type { M365ConsentStepSummary, M365OnboardingAvailability } from "./m365ConsentSummary";
 
 const STATUSES = [
   "pending-consent",
@@ -39,6 +44,9 @@ const STABLE_ERROR_CODES = [
   "consent_expired",
   "consent_state_mismatch",
   "consent_cancelled",
+  "conditional_access_blocked",
+  "consent_provider_error",
+  "user_consent_blocked",
   "admin_role_required",
   "tenant_mismatch",
   "tenant_already_bound",
@@ -67,6 +75,9 @@ export const M365_CUSTOMER_GRAPH_ACTIONS_CALLBACK_RESULTS = [
   "active",
   "degraded",
   ...STABLE_ERROR_CODES,
+  // Not an outcome: the identity callback parked a verified tenant and the
+  // operator must confirm it before Microsoft's consent screen (#7913 W03).
+  "confirm-tenant",
 ] as const;
 export type M365CustomerGraphActionsCallbackResult =
   (typeof M365_CUSTOMER_GRAPH_ACTIONS_CALLBACK_RESULTS)[number];
@@ -74,6 +85,17 @@ export type M365CustomerGraphActionsCallbackResult =
 interface M365CustomerGraphActionsCardProps {
   callbackResult?: M365CustomerGraphActionsCallbackResult | null;
   callbackRefreshKey?: number;
+  /** Reports load state and connection identity to the tenant section. */
+  onStateChange?: (summary: M365ConsentStepSummary) => void;
+  /** The tenant panel header already shows the tenant name and ID. */
+  hideTenantIdentity?: boolean;
+  /**
+   * Whether Read access (step 1) is connected. `false` shows the note that AI
+   * lookups and reports need it; omitted means the caller does not know.
+   */
+  readConnected?: boolean;
+  /** Who the pre-flight names as the tenant to sign in to (tenant or org name). */
+  consentTarget?: string | null;
 }
 
 type Grant = {
@@ -109,11 +131,12 @@ type Envelope = {
     requiredGrants: Grant[];
   };
   onboardingEnabled: boolean;
+  onboardingAvailability: M365OnboardingAvailability;
   connection: Connection | null;
 };
 
 type LoadState = "unavailable" | "loading" | "ready" | "error";
-type ActionName = "consent" | "retest" | "disconnect";
+type ActionName = "consent" | "upgrade" | "retest" | "disconnect";
 type OrgGeneration = {
   orgId: string | null;
   generation: number;
@@ -168,6 +191,22 @@ function parseGrants(value: unknown): Grant[] | null {
 }
 
 const TRUSTED_PROFILE = M365_PERMISSION_PROFILES["customer-graph-actions"];
+
+// The two roles every connection held before the W05 write catalog (manifest
+// v2). A kept-stale row (manifest older than current) is still executing on
+// exactly these, so losing one of them is a revocation, not an expected gap.
+const PRE_W05_ROLE_VALUES = new Set(["User.ReadWrite.All", "User-PasswordProfile.ReadWrite.All"]);
+/** Role value -> i18n key suffix. Role values contain dots, which i18next
+ *  reads as key nesting, so they can never be used as keys directly. */
+const ROLE_PURPOSE_KEY: Record<string, string> = {
+  "User.ReadWrite.All": "userReadWrite",
+  "User-PasswordProfile.ReadWrite.All": "userPasswordProfile",
+  "User.RevokeSessions.All": "userRevokeSessions",
+  "GroupMember.ReadWrite.All": "groupMember",
+  "DeviceManagementManagedDevices.PrivilegedOperations.All": "intunePrivileged",
+  "MailboxSettings.ReadWrite": "mailboxSettings",
+  "Organization.Read.All": "organizationRead",
+};
 
 function grantTuple(grant: Grant): string {
   return `${grant.resourceApplicationId.toLowerCase()}:${grant.appRoleId.toLowerCase()}:${grant.value}`;
@@ -237,7 +276,15 @@ function parseConnection(value: unknown): Connection | null | undefined {
 }
 
 function parseEnvelope(value: unknown): Envelope | null {
-  if (!isRecord(value) || !hasExactKeys(value, ["profile", "onboardingEnabled", "connection"])) return null;
+  if (!isRecord(value)) return null;
+  // `onboardingAvailability` is optional on the wire (an API that predates it
+  // omits it); every other key stays strictly required.
+  const { onboardingAvailability: rawAvailability, ...rest } = value;
+  if (!hasExactKeys(rest, ["profile", "onboardingEnabled", "connection"])) return null;
+  const onboardingAvailability = typeof value.onboardingEnabled === "boolean"
+    ? parseOnboardingAvailability(rawAvailability, value.onboardingEnabled)
+    : null;
+  if (onboardingAvailability === null) return null;
   if (!isRecord(value.profile) || !hasExactKeys(value.profile, ["id", "displayName", "manifestVersion", "requiredGrants"])) return null;
   const grants = parseGrants(value.profile.requiredGrants);
   const connection = parseConnection(value.connection);
@@ -257,6 +304,7 @@ function parseEnvelope(value: unknown): Envelope | null {
       requiredGrants: grants,
     },
     onboardingEnabled: value.onboardingEnabled,
+    onboardingAvailability,
     connection,
   };
 }
@@ -311,6 +359,10 @@ function GrantList({ grants, testId }: { grants: Grant[]; testId?: string }) {
 export default function M365CustomerGraphActionsCard({
   callbackResult = null,
   callbackRefreshKey = 0,
+  onStateChange,
+  hideTenantIdentity = false,
+  readConnected,
+  consentTarget = null,
 }: M365CustomerGraphActionsCardProps) {
   const { t } = useTranslation("integrations");
   const currentOrgId = useOrgStore((value) => value.currentOrgId);
@@ -333,6 +385,12 @@ export default function M365CustomerGraphActionsCard({
   });
   const [actionState, setActionState] = useState<ScopedAction | null>(null);
   const actionRef = useRef<ScopedAction | null>(null);
+  // The pre-flight is scoped to the org generation it was opened for, so an
+  // org switch closes it rather than carrying one org's warning to another.
+  const [preflightScope, setPreflightScope] = useState<OrgGeneration | null>(null);
+  const preflightTriggerRef = useRef<HTMLButtonElement>(null);
+  const preflightHeadingRef = useRef<HTMLHeadingElement>(null);
+  const preflightId = useId();
   const canWrite = can("organizations", "write");
   const isCurrent = useCallback((target: OrgGeneration) => scopeRef.current === target, []);
 
@@ -451,6 +509,36 @@ export default function M365CustomerGraphActionsCard({
     });
   }, [canWrite, data, isCurrent, orgId, perform, scope, scopedRequest, t]);
 
+  const startUpgradeConsent = useCallback(() => {
+    if (!orgId || !data?.connection || !canWrite || !data.onboardingEnabled) return;
+    const target = scope;
+    const connectionId = data.connection.id;
+    // Upgrade consent keeps the row active and executing on the grants it
+    // already holds; it does NOT use /connections/consent, which would move
+    // the row to pending-consent and stop writes until the admin returns.
+    void perform(target, "upgrade", async () => {
+      try {
+        const url = await runAction<string>({
+          request: () => scopedRequest(
+            target,
+            () => fetchWithAuth(
+              `/m365/customer-graph-actions/connections/${connectionId}/upgrade-consent?orgId=${target.orgId}`,
+              { method: "POST" },
+            ),
+            { adminConsentUrl: "https://login.microsoftonline.com/organizations/" },
+          ),
+          parseSuccess: parseConsentUrl,
+          errorFallback: t("m365CustomerGraphActions.v2.upgradeFailed"),
+        });
+        if (isCurrent(target)) navigateToMicrosoftLogin(url);
+      } catch (error) {
+        if (isCurrent(target)) {
+          handleActionError(error, t("m365CustomerGraphActions.v2.upgradeFailed"));
+        }
+      }
+    });
+  }, [canWrite, data, isCurrent, orgId, perform, scope, scopedRequest, t]);
+
   const retest = useCallback(() => {
     if (
       !orgId
@@ -510,35 +598,122 @@ export default function M365CustomerGraphActionsCard({
   }, [canWrite, data, isCurrent, load, orgId, perform, scope, scopedRequest, t]);
 
   const connection = data?.connection ?? null;
-  const displayedMissingGrants = connection?.missingGrants ?? [];
+
+  // Report a projection of what this step loaded to the tenant section. The
+  // callback is read through a ref so a parent passing an inline function
+  // cannot turn this into a render loop.
+  const onStateChangeRef = useRef(onStateChange);
+  onStateChangeRef.current = onStateChange;
+  const summary = useMemo<M365ConsentStepSummary>(() => ({
+    loadState,
+    onboardingEnabled: data?.onboardingEnabled ?? false,
+    onboardingAvailability: data?.onboardingAvailability ?? "instance_disabled",
+    connection: connection
+      ? {
+          tenantId: connection.tenantId,
+          displayName: connection.displayName,
+          lastVerifiedAt: connection.lastVerifiedAt,
+          status: connection.status,
+        }
+      : null,
+  }), [connection, data, loadState]);
+  useEffect(() => {
+    onStateChangeRef.current?.(summary);
+  }, [summary]);
+
+  const preflightOpen = preflightScope === scope;
+  useEffect(() => {
+    if (preflightOpen) preflightHeadingRef.current?.focus();
+  }, [preflightOpen]);
+  const togglePreflight = () => {
+    setPreflightScope(preflightOpen ? null : scope);
+  };
+  const closePreflight = () => {
+    setPreflightScope(null);
+    preflightTriggerRef.current?.focus();
+  };
+  const onPreflightKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (event.key !== "Escape") return;
+    event.stopPropagation();
+    closePreflight();
+  };
+  const preflightTarget = connection?.displayName
+    || consentTarget
+    || t("m365CustomerGraphActions.preflight.defaultTarget");
+
+  const manifestStale = !!connection && (
+    connection.grantHealth === "manifest-stale"
+    || connection.manifestVersion < connection.currentManifestVersion
+  );
+  const newRoleGrants = useMemo(
+    () => (data?.profile.requiredGrants ?? []).filter((grant) => !PRE_W05_ROLE_VALUES.has(grant.value ?? "")),
+    [data],
+  );
+  // While the manifest is stale the API reports every new role as missing.
+  // That is expected (the upgrade notice explains it), so only roles the row
+  // already had can be a genuine missing-grant error.
+  const displayedMissingGrants = (connection?.missingGrants ?? []).filter(
+    (grant) => !manifestStale || PRE_W05_ROLE_VALUES.has(grant.value ?? ""),
+  );
+  // A kept-stale row has lastErrorCode "manifest_stale", which can hide a
+  // revoked pre-existing role. Read it off the observed grants instead.
+  const revokedGrantValues = connection && manifestStale && connection.grantsVerifiedAt
+    ? [...PRE_W05_ROLE_VALUES].filter((value) => !connection.observedGrants.some((grant) => grant.value === value))
+    : [];
   const displayedUnexpectedGrants = connection?.unexpectedGrants ?? [];
   const unexpectedAlert = t("m365CustomerGraphActions.grants.unexpectedAlert");
   const canRetestConnection = connection?.status === "active" || connection?.status === "degraded";
   const StatusIcon = connection ? statusIcon(connection.status) : Unplug;
+  // "Retest" wording only makes sense where the Retest button is shown; a
+  // connection still pending consent has to be connected again instead.
+  const errorKey = (code: string) => (code === "executor_unavailable" && connection && !canRetestConnection
+    ? "executor_unavailablePending"
+    : code);
   const errorCopy = useMemo(() => {
     if (!connection?.lastErrorCode) return null;
+    // The callback banner above already says this; don't repeat it.
+    if (callbackResult === connection.lastErrorCode) return null;
     return isStableErrorCode(connection.lastErrorCode)
-      ? t(/* i18n-dynamic */ `m365CustomerGraphActions.errors.${connection.lastErrorCode}`)
+      ? t(/* i18n-dynamic */ `m365CustomerGraphActions.errors.${errorKey(connection.lastErrorCode)}`)
       : t("m365CustomerGraphActions.errors.unknown");
-  }, [connection, t]);
+  }, [connection, callbackResult, canRetestConnection, t]);
   const callbackCopy = callbackResult === "active"
     ? t("m365CustomerGraphActions.callback.active")
     : callbackResult === "degraded"
       ? t("m365CustomerGraphActions.callback.degraded")
-      : callbackResult
-        ? t(/* i18n-dynamic */ `m365CustomerGraphActions.errors.${callbackResult}`)
+      : callbackResult && callbackResult !== "confirm-tenant"
+        ? t(/* i18n-dynamic */ `m365CustomerGraphActions.errors.${errorKey(callbackResult)}`)
         : null;
+  const showConfirmTenant = callbackResult === "confirm-tenant" && !!orgId;
+  const reloadAfterCancel = useCallback(() => { void load(scope); }, [load, scope]);
+
+  // Onboarding is gated by an instance-level server flag, not by anything the
+  // org can change. With nothing connected there is nothing to manage, so the
+  // card collapses to its header and one neutral status line instead of a
+  // permission list and a Connect button that can never be pressed.
+  const instanceUnavailable = loadState === "ready" && !!data && !data.onboardingEnabled && !connection;
+  const instanceUnavailableId = "customer-graph-actions-instance-unavailable";
 
   return (
-    <section className="rounded-xl border bg-card p-5 sm:p-6" aria-labelledby="customer-graph-actions-title">
+    <section
+      aria-labelledby="customer-graph-actions-title"
+      aria-describedby={instanceUnavailable ? instanceUnavailableId : undefined}
+      data-testid="m365-actions-step"
+    >
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div className="flex min-w-0 items-start gap-3">
-          <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
-            <ShieldCheck aria-hidden="true" className="h-5 w-5" />
+          <span
+            className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-muted text-muted-foreground"
+            data-testid="m365-actions-step-icon"
+          >
+            <UserCog aria-hidden="true" className="h-5 w-5" />
           </span>
           <div className="min-w-0">
-            <h2 id="customer-graph-actions-title" className="text-lg font-semibold text-foreground">{t("m365CustomerGraphActions.title")}</h2>
-            <p className="mt-1 max-w-3xl text-sm leading-6 text-muted-foreground">{t("m365CustomerGraphActions.description")}</p>
+            <h3 id="customer-graph-actions-title" className="text-base font-semibold text-foreground">
+              <span className="font-normal text-muted-foreground">{t("m365TenantPanel.stepLabel", { number: 2 })} · </span>
+              {t("m365CustomerGraphActions.stepTitle")}
+            </h3>
+            <p className="mt-1 max-w-3xl text-sm leading-6 text-muted-foreground">{t("m365CustomerGraphActions.stepDescription")}</p>
           </div>
         </div>
         {connection && (
@@ -562,6 +737,17 @@ export default function M365CustomerGraphActionsCard({
         </p>
       )}
 
+      {showConfirmTenant && orgId && (
+        <M365ConfirmTenantPanel
+          key={orgId}
+          apiBase="/m365/customer-graph-actions/connections/consent"
+          orgId={orgId}
+          canWrite={canWrite}
+          onCancelled={reloadAfterCancel}
+          testId="m365-actions-confirm-tenant"
+        />
+      )}
+
       {loadState === "unavailable" && (
         <p className="mt-6 rounded-md bg-muted p-4 text-sm text-muted-foreground">{t("m365CustomerGraphActions.selectOrganization")}</p>
       )}
@@ -578,8 +764,25 @@ export default function M365CustomerGraphActionsCard({
         </div>
       )}
 
-      {loadState === "ready" && data && (
-        <div className="mt-6 space-y-6">
+      {instanceUnavailable && (
+        <p id={instanceUnavailableId} className="mt-4 text-sm text-muted-foreground">
+          {data?.onboardingAvailability === "org_not_enabled"
+            ? t("m365CustomerGraphActions.notEnabledForOrg")
+            : t("m365CustomerGraphActions.notAvailableOnInstance")}
+        </p>
+      )}
+
+      {loadState === "ready" && data && !instanceUnavailable && (
+        <div className="mt-5 space-y-6">
+          {readConnected === false && (
+            <p
+              data-testid="m365-actions-read-note"
+              className="flex items-start gap-2 rounded-md border border-warning/40 bg-warning/10 p-3 text-sm text-foreground"
+            >
+              <AlertTriangle aria-hidden="true" className="mt-0.5 h-4 w-4 shrink-0 text-warning" />
+              {t("m365CustomerGraphActions.readRequiredNote")}
+            </p>
+          )}
           {!data.onboardingEnabled && (
             <p className="rounded-md bg-muted p-3 text-sm text-muted-foreground">
               {t("m365CustomerGraphActions.onboardingUnavailable")}
@@ -589,11 +792,61 @@ export default function M365CustomerGraphActionsCard({
             <p className="rounded-md border border-warning/40 bg-warning/10 p-3 text-sm text-foreground">{errorCopy}</p>
           )}
 
+          {connection && manifestStale && (
+            <div
+              data-testid="m365-actions-upgrade-notice"
+              className="rounded-md border border-warning/40 bg-warning/10 p-4 text-sm text-foreground"
+            >
+              <div className="flex items-start gap-2">
+                <AlertTriangle aria-hidden="true" className="mt-0.5 h-4 w-4 shrink-0 text-warning" />
+                <div>
+                  <p className="font-semibold">{t("m365CustomerGraphActions.v2.title")}</p>
+                  <p className="mt-1">{t("m365CustomerGraphActions.v2.intro")}</p>
+                  <p className="mt-1">{t("m365CustomerGraphActions.v2.keepsWorking")}</p>
+                </div>
+              </div>
+              <ul className="mt-3 space-y-1.5">
+                {newRoleGrants.map((grant) => {
+                  const purposeKey = ROLE_PURPOSE_KEY[grant.value ?? ""] ?? "unknown";
+                  return (
+                    <li key={`${grant.resourceApplicationId}:${grant.appRoleId}`} data-testid="m365-actions-v2-purpose" className="flex items-start gap-2">
+                      <CheckCircle2 aria-hidden="true" className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
+                      {t(/* i18n-dynamic */ `m365CustomerGraphActions.v2.purpose.${purposeKey}`)}
+                    </li>
+                  );
+                })}
+              </ul>
+              <button
+                type="button"
+                onClick={startUpgradeConsent}
+                disabled={!canWrite || !data.onboardingEnabled || action !== null}
+                className="mt-3 inline-flex min-h-11 items-center justify-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {action === "upgrade" && <Loader2 aria-hidden="true" className="h-4 w-4 animate-spin" />}
+                {t("m365CustomerGraphActions.v2.upgradeAction")}
+              </button>
+            </div>
+          )}
+
+          {revokedGrantValues.length > 0 && (
+            <p
+              role="alert"
+              data-testid="m365-actions-revoked-grant"
+              className="rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive"
+            >
+              {t("m365CustomerGraphActions.v2.revokedGrant", { grants: revokedGrantValues.join(", ") })}
+            </p>
+          )}
+
           {connection && (
             <div className="border-t pt-5">
               <dl className="grid gap-x-8 gap-y-4 sm:grid-cols-2 lg:grid-cols-3">
-                <div><dt className="text-xs font-medium text-muted-foreground">{t("m365CustomerGraphActions.tenant")}</dt><dd className="mt-1 text-sm font-medium text-foreground">{connection.displayName || t("m365CustomerGraphActions.unnamedTenant")}</dd></div>
-                <div><dt className="text-xs font-medium text-muted-foreground">{t("m365CustomerGraphActions.tenantId")}</dt><dd className="mt-1 break-all font-mono text-xs text-foreground">{connection.tenantId || t("m365CustomerGraphActions.notVerified")}</dd></div>
+                {!hideTenantIdentity && (
+                  <>
+                    <div><dt className="text-xs font-medium text-muted-foreground">{t("m365CustomerGraphActions.tenant")}</dt><dd className="mt-1 text-sm font-medium text-foreground">{connection.displayName || t("m365CustomerGraphActions.unnamedTenant")}</dd></div>
+                    <div><dt className="text-xs font-medium text-muted-foreground">{t("m365CustomerGraphActions.tenantId")}</dt><dd className="mt-1 break-all font-mono text-xs text-foreground">{connection.tenantId || t("m365CustomerGraphActions.notVerified")}</dd></div>
+                  </>
+                )}
                 <div><dt className="text-xs font-medium text-muted-foreground">{t("m365CustomerGraphActions.manifest")}</dt><dd className="mt-1 text-sm text-foreground">{t("m365CustomerGraphActions.manifestVersion", { version: connection.manifestVersion })}</dd></div>
                 <div><dt className="text-xs font-medium text-muted-foreground">{t("m365CustomerGraphActions.grants.grantsVerifiedAt")}</dt><dd className="mt-1 text-sm text-foreground">{connection.grantsVerifiedAt ? formatDateTime(connection.grantsVerifiedAt) : t("m365CustomerGraphActions.never")}</dd></div>
                 <div><dt className="text-xs font-medium text-muted-foreground">{t("m365CustomerGraphActions.lastVerifiedAt")}</dt><dd className="mt-1 text-sm text-foreground">{connection.lastVerifiedAt ? formatDateTime(connection.lastVerifiedAt) : t("m365CustomerGraphActions.never")}</dd></div>
@@ -601,25 +854,33 @@ export default function M365CustomerGraphActionsCard({
             </div>
           )}
 
-          <div className="grid gap-6 border-t pt-5 lg:grid-cols-2">
-            <div>
-              <h3 className="mb-3 text-sm font-semibold text-foreground">{t("m365CustomerGraphActions.grants.required")}</h3>
-              <GrantList grants={data.profile.requiredGrants} testId="required-grant" />
-            </div>
-            {connection && (
+          <details className="group border-t pt-5" data-testid="m365-actions-permissions">
+            <summary className="inline-flex min-h-11 cursor-pointer list-none items-center gap-1.5 rounded-md text-sm font-medium text-primary underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary [&::-webkit-details-marker]:hidden">
+              <ChevronRight aria-hidden="true" className="h-4 w-4 transition-transform group-open:rotate-90" />
+              {t("m365CustomerGraphActions.showPermissions")}
+            </summary>
+            <div className="mt-3 grid gap-6 lg:grid-cols-2">
               <div>
-                <h3 className="mb-3 text-sm font-semibold text-foreground">{t("m365CustomerGraphActions.grants.observed")}</h3>
-                <GrantList grants={connection.observedGrants} />
+                <h4 className="mb-3 text-sm font-semibold text-foreground">{t("m365CustomerGraphActions.grants.required")}</h4>
+                <GrantList grants={data.profile.requiredGrants} testId="required-grant" />
               </div>
-            )}
-          </div>
+              {connection && (
+                <div>
+                  <h4 className="mb-3 text-sm font-semibold text-foreground">{t("m365CustomerGraphActions.grants.observed")}</h4>
+                  <GrantList grants={connection.observedGrants} />
+                </div>
+              )}
+            </div>
+          </details>
 
           {connection && (displayedMissingGrants.length > 0 || displayedUnexpectedGrants.length > 0) && (
             <div className="grid gap-6 border-t pt-5 lg:grid-cols-2">
-              <div>
-                <h3 className="mb-3 text-sm font-semibold text-foreground">{t("m365CustomerGraphActions.grants.missing")}</h3>
-                <GrantList grants={displayedMissingGrants} />
-              </div>
+              {displayedMissingGrants.length > 0 && (
+                <div>
+                  <h4 className="mb-3 text-sm font-semibold text-foreground">{t("m365CustomerGraphActions.grants.missing")}</h4>
+                  <GrantList grants={displayedMissingGrants} />
+                </div>
+              )}
               {displayedUnexpectedGrants.length > 0 && (
                 <div role="alert" aria-label={unexpectedAlert} className="rounded-md border border-destructive/40 bg-destructive/10 p-4 text-destructive">
                   <div className="mb-3 flex items-center gap-2 font-semibold"><AlertTriangle aria-hidden="true" className="h-4 w-4" />{unexpectedAlert}</div>
@@ -630,9 +891,16 @@ export default function M365CustomerGraphActionsCard({
           )}
 
           <div className="flex flex-col gap-3 border-t pt-5 sm:flex-row sm:flex-wrap sm:items-center">
-            <button type="button" onClick={startConsent} disabled={!canWrite || !data.onboardingEnabled || action !== null} className="inline-flex min-h-11 items-center justify-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary disabled:cursor-not-allowed disabled:opacity-50">
-              {action === "consent" && <Loader2 aria-hidden="true" className="h-4 w-4 animate-spin" />}
-              {connection ? t("m365CustomerGraphActions.actions.reconsent") : t("m365CustomerGraphActions.actions.connect")}
+            <button
+              ref={preflightTriggerRef}
+              type="button"
+              onClick={togglePreflight}
+              aria-expanded={preflightOpen}
+              aria-controls={preflightOpen ? preflightId : undefined}
+              disabled={!canWrite || !data.onboardingEnabled || action !== null}
+              className="inline-flex min-h-11 items-center justify-center gap-2 rounded-md border bg-background px-4 py-2 text-sm font-medium text-foreground hover:bg-muted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {connection ? t("m365CustomerGraphActions.actions.reconsent") : t("m365CustomerGraphActions.actions.grant")}
             </button>
             {connection && (
               <>
@@ -648,6 +916,62 @@ export default function M365CustomerGraphActionsCard({
             )}
             {!canWrite && <p className="text-sm text-muted-foreground">{t("m365CustomerGraphActions.actions.permissionRequired")}</p>}
           </div>
+
+          {preflightOpen && (
+            <div
+              id={preflightId}
+              role="region"
+              aria-labelledby={`${preflightId}-title`}
+              data-testid="m365-actions-preflight"
+              onKeyDown={onPreflightKeyDown}
+              className="rounded-lg bg-muted/60 p-4 sm:p-5"
+            >
+              <h4
+                id={`${preflightId}-title`}
+                ref={preflightHeadingRef}
+                tabIndex={-1}
+                className="text-sm font-semibold text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+              >
+                {t("m365CustomerGraphActions.preflight.title")}
+              </h4>
+              <p className="mt-3 text-sm text-foreground">{t("m365CustomerGraphActions.preflight.canDoIntro")}</p>
+              <ul className="mt-2 space-y-1.5 text-sm text-foreground">
+                <li className="flex items-start gap-2">
+                  <CheckCircle2 aria-hidden="true" className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
+                  {t("m365CustomerGraphActions.preflight.resetPasswords")}
+                </li>
+                <li className="flex items-start gap-2">
+                  <CheckCircle2 aria-hidden="true" className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
+                  {t("m365CustomerGraphActions.preflight.disableSignIn")}
+                </li>
+              </ul>
+              <p className="mt-3 max-w-prose text-sm text-foreground">
+                {t("m365CustomerGraphActions.preflight.adminRequired", { target: preflightTarget })}
+              </p>
+              <M365ConsentSteps className="mt-3" />
+              <p className="mt-2 max-w-prose text-sm text-muted-foreground">
+                {t("m365CustomerGraphActions.preflight.revoke")}
+              </p>
+              <div className="mt-4 flex flex-col gap-3 sm:flex-row sm:items-center">
+                <button
+                  type="button"
+                  onClick={startConsent}
+                  disabled={!canWrite || !data.onboardingEnabled || action !== null}
+                  className="inline-flex min-h-11 items-center justify-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {action === "consent" && <Loader2 aria-hidden="true" className="h-4 w-4 animate-spin" />}
+                  {t("m365CustomerGraphActions.preflight.continue")}
+                </button>
+                <button
+                  type="button"
+                  onClick={closePreflight}
+                  className="inline-flex min-h-11 items-center justify-center rounded-md border bg-background px-4 py-2 text-sm font-medium text-foreground hover:bg-muted focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+                >
+                  {t("common:actions.cancel")}
+                </button>
+              </div>
+            </div>
+          )}
 
           <p className="text-xs leading-5 text-muted-foreground">
             {t("m365CustomerGraphActions.microsoftConsentHelp")} {" "}

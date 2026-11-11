@@ -12,6 +12,7 @@ import {
   sites,
 } from '../../db/schema';
 import { reapStaleBackupJobs } from '../../jobs/staleCommandReaper';
+import { applyBackupProgress } from '../../services/backupProgress';
 
 const runDb = it.runIf(!!process.env.DATABASE_URL);
 
@@ -82,5 +83,168 @@ runDb('reaps an in-flight stalled backup job but leaves a terminal (completed) j
     // reaper would clobber this completed job to failed.
     expect(completedRow!.status).toBe('completed');
     expect(completedRow!.errorLog ?? '').not.toContain('[stale-backup-reaper]');
+  });
+});
+
+// #2798: a live agent (keepalive fresh) whose transfer counters stopped moving
+// used to be unreapable, because the keepalive refreshed last_progress_at. The
+// no-transfer rule keys on last_progress_at alone, with a window sized so a
+// legitimately slow single large file is not killed.
+runDb('reaps a live-but-wedged job on the no-transfer rule, but spares a live job that may still be uploading a large file', async () => {
+  const unique = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const fresh = new Date(Date.now() - 60 * 1000);
+  const threeHoursAgo = new Date(Date.now() - 3 * 60 * 60 * 1000);
+  const GiB = 1024 * 1024 * 1024;
+
+  const ids = await withSystemDbAccessContext(async () => {
+    const [partner] = await db
+      .insert(partners)
+      .values({ name: `Wedge Partner ${unique}`, slug: `wedge-partner-${unique}`, type: 'msp', plan: 'pro', status: 'active' })
+      .returning({ id: partners.id });
+    const [org] = await db
+      .insert(organizations)
+      .values({ currencyCode: 'USD', partnerId: partner!.id, name: `Wedge Org ${unique}`, slug: `wedge-org-${unique}`, type: 'customer', status: 'active' })
+      .returning({ id: organizations.id });
+    const [site] = await db.insert(sites).values({ orgId: org!.id, name: `Wedge Site ${unique}` }).returning({ id: sites.id });
+    // Offline status keeps the reap on the no-stop-command branch (no Redis);
+    // the fresh keepalive keeps rule B (offline grace) from firing first.
+    const [device] = await db
+      .insert(devices)
+      .values({
+        orgId: org!.id,
+        siteId: site!.id,
+        agentId: `wedge-agent-${unique}`,
+        hostname: `wedge-host-${unique}`,
+        osType: 'windows',
+        osVersion: '11',
+        architecture: 'x86_64',
+        agentVersion: '0.0.0-test',
+        status: 'offline',
+      })
+      .returning({ id: devices.id });
+    const [config] = await db
+      .insert(backupConfigs)
+      .values({ orgId: org!.id, name: `Wedge Config ${unique}`, type: 'file', provider: 'local', providerConfig: {} })
+      .returning({ id: backupConfigs.id });
+
+    const base = {
+      orgId: org!.id, configId: config!.id, deviceId: device!.id, status: 'running' as const,
+      startedAt: threeHoursAgo, lastProgressAt: threeHoursAgo, lastKeepaliveAt: fresh,
+    };
+    // 1 GiB left: the 2h floor applies, 3h without a transfer is a wedge.
+    const [wedged] = await db
+      .insert(backupJobs)
+      .values({ ...base, totalSize: 10 * GiB, transferredSize: 9 * GiB })
+      .returning({ id: backupJobs.id });
+    // 90 GiB left: at the 512 KiB/s floor rate one remaining file could still
+    // legitimately be in flight after 3h, so this must be spared.
+    const [bigFile] = await db
+      .insert(backupJobs)
+      .values({ ...base, totalSize: 100 * GiB, transferredSize: 10 * GiB })
+      .returning({ id: backupJobs.id });
+    return { wedged: wedged!.id, bigFile: bigFile!.id };
+  });
+
+  await withSystemDbAccessContext(() => reapStaleBackupJobs());
+
+  await withSystemDbAccessContext(async () => {
+    const [wedgedRow] = await db.select().from(backupJobs).where(eq(backupJobs.id, ids.wedged));
+    expect(wedgedRow!.status).toBe('failed');
+    expect(wedgedRow!.errorLog ?? '').toContain('no data transferred');
+
+    const [bigRow] = await db.select().from(backupJobs).where(eq(backupJobs.id, ids.bigFile));
+    expect(bigRow!.status).toBe('running');
+  });
+});
+
+// #11014: a resumed multi-TB snapshot re-reads everything an earlier run
+// already uploaded before its first upload, so transferred_size sits at 0 for
+// hours. The agent now reports the files/bytes it has checked; their movement
+// advances last_progress_at through the real progress path, which keeps the
+// job alive past 24 h. A job whose checked counters stop moving is still
+// reaped on the same rule.
+runDb('a resume pass whose verified counters keep moving is spared past 24 h; one whose counters froze is reaped', async () => {
+  const unique = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const fresh = new Date(Date.now() - 60 * 1000);
+  const thirtyHoursAgo = new Date(Date.now() - 30 * 60 * 60 * 1000);
+  const GiB = 1024 * 1024 * 1024;
+  const agentId = `verify-agent-${unique}`;
+
+  const ids = await withSystemDbAccessContext(async () => {
+    const [partner] = await db
+      .insert(partners)
+      .values({ name: `Verify Partner ${unique}`, slug: `verify-partner-${unique}`, type: 'msp', plan: 'pro', status: 'active' })
+      .returning({ id: partners.id });
+    const [org] = await db
+      .insert(organizations)
+      .values({ currencyCode: 'USD', partnerId: partner!.id, name: `Verify Org ${unique}`, slug: `verify-org-${unique}`, type: 'customer', status: 'active' })
+      .returning({ id: organizations.id });
+    const [site] = await db.insert(sites).values({ orgId: org!.id, name: `Verify Site ${unique}` }).returning({ id: sites.id });
+    // Offline keeps the reap on the no-stop-command branch (no Redis); the
+    // fresh keepalive keeps rule B (offline grace) from firing first.
+    const [device] = await db
+      .insert(devices)
+      .values({
+        orgId: org!.id,
+        siteId: site!.id,
+        agentId,
+        hostname: `verify-host-${unique}`,
+        osType: 'windows',
+        osVersion: '11',
+        architecture: 'x86_64',
+        agentVersion: '0.0.0-test',
+        status: 'offline',
+      })
+      .returning({ id: devices.id });
+    const [config] = await db
+      .insert(backupConfigs)
+      .values({ orgId: org!.id, name: `Verify Config ${unique}`, type: 'file', provider: 'local', providerConfig: {} })
+      .returning({ id: backupConfigs.id });
+
+    // 30 h into a resume of a 2.4 TB selection, nothing uploaded yet, 400 GiB
+    // of the earlier run's files checked so far.
+    const base = {
+      orgId: org!.id, configId: config!.id, deviceId: device!.id, status: 'running' as const,
+      startedAt: thirtyHoursAgo, lastProgressAt: thirtyHoursAgo, lastKeepaliveAt: fresh,
+      totalSize: 2400 * GiB, transferredSize: 0, fileCount: 0, totalFiles: 1_100_000,
+      verifiedSize: 400 * GiB, verifiedFiles: 180_000,
+    };
+    const [moving] = await db.insert(backupJobs).values(base).returning({ id: backupJobs.id });
+    const [filesOnly] = await db.insert(backupJobs).values(base).returning({ id: backupJobs.id });
+    const [frozen] = await db.insert(backupJobs).values(base).returning({ id: backupJobs.id });
+    return { moving: moving!.id, filesOnly: filesOnly!.id, frozen: frozen!.id };
+  });
+
+  const report = (jobId: string, verifiedBytes: number, verifiedFiles: number) =>
+    withSystemDbAccessContext(() => applyBackupProgress({
+      agentId,
+      commandId: jobId,
+      progress: {
+        phase: 'uploading', current: 0, total: 2400 * GiB, filesDone: 0, filesTotal: 1_100_000,
+        verifiedBytes, verifiedFiles,
+      },
+    }));
+  expect(await report(ids.moving, 401 * GiB, 180_400)).toEqual({ applied: true });
+  // Many small files: the count moves even when the byte total barely does.
+  // Either counter alone is progress.
+  expect(await report(ids.filesOnly, 400 * GiB, 180_050)).toEqual({ applied: true });
+  // The keepalive re-sends unchanged counters: liveness, not progress.
+  expect(await report(ids.frozen, 400 * GiB, 180_000)).toEqual({ applied: true });
+
+  await withSystemDbAccessContext(() => reapStaleBackupJobs());
+
+  await withSystemDbAccessContext(async () => {
+    const [movingRow] = await db.select().from(backupJobs).where(eq(backupJobs.id, ids.moving));
+    expect(movingRow!.status).toBe('running');
+    expect(movingRow!.verifiedSize).toBe(401 * GiB);
+    expect(movingRow!.verifiedFiles).toBe(180_400);
+    expect(movingRow!.lastProgressAt!.getTime()).toBeGreaterThan(Date.now() - 5 * 60 * 1000);
+
+    const [filesOnlyRow] = await db.select().from(backupJobs).where(eq(backupJobs.id, ids.filesOnly));
+    expect(filesOnlyRow!.status).toBe('running');
+
+    const [frozenRow] = await db.select().from(backupJobs).where(eq(backupJobs.id, ids.frozen));
+    expect(frozenRow!.status).toBe('failed');
+    expect(frozenRow!.errorLog ?? '').toContain('no data transferred or verified');
   });
 });

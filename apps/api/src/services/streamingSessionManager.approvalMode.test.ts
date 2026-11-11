@@ -9,9 +9,10 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
-const { queryMock, getEffectiveAiBudgetMock } = vi.hoisted(() => ({
+const { queryMock, getEffectiveAiBudgetMock, loadApprovalWaitBudgetMsMock } = vi.hoisted(() => ({
   queryMock: vi.fn(),
   getEffectiveAiBudgetMock: vi.fn(),
+  loadApprovalWaitBudgetMsMock: vi.fn(),
 }));
 
 vi.mock('@anthropic-ai/claude-agent-sdk', () => ({ query: queryMock }));
@@ -20,6 +21,14 @@ const dbSelectMock = vi.fn(() => ({
   from: vi.fn(() => ({
     where: vi.fn(() => ({ limit: vi.fn(() => Promise.resolve([])) })),
   })),
+}));
+
+// Wisp W04 Task 4: getOrCreate resolves the session's delegation grant itself
+// (lookupWispGrant); every session in this suite is an ordinary one.
+vi.mock('./wisp/chatCeiling', () => ({
+  lookupWispGrant: vi.fn(async () => null),
+  unreachableWispAuth: (auth: unknown) => auth,
+  WispSessionUnavailableError: class WispSessionUnavailableError extends Error {},
 }));
 
 vi.mock('../db', () => ({
@@ -36,9 +45,25 @@ vi.mock('./effectiveSettings', () => ({
   getEffectiveAiBudget: (...args: unknown[]) => getEffectiveAiBudgetMock(...args),
 }));
 
+vi.mock('./aiApprovalTimeout', () => ({
+  DEFAULT_APPROVAL_WAIT_BUDGET_MS: 300_000,
+  loadApprovalWaitBudgetMs: (...args: unknown[]) => loadApprovalWaitBudgetMsMock(...args),
+}));
+
 vi.mock('./aiCostTracker', () => ({
-  recordUsageFromSdkResult: vi.fn(() => Promise.resolve()),
   sumInputTokens: () => 0,
+}));
+vi.mock('./aiBudgetReservations', () => ({
+  markAiBudgetReservationIndeterminate: vi.fn(async () => ({ kind: 'indeterminate' })),
+  readSdkUsageSnapshot: vi.fn(async () => null),
+}));
+vi.mock('./aiModels/platformModels', async (orig) => ({
+  ...(await orig<typeof import('./aiModels/platformModels')>()),
+  getPlatformModelByModelId: vi.fn(async () => null),
+}));
+vi.mock('./aiModels/settleInvocation', async (orig) => ({
+  ...(await orig<typeof import('./aiModels/settleInvocation')>()),
+  settleInvocation: vi.fn(async () => ({ costCents: 0, invocationIds: [], deferred: false })),
 }));
 vi.mock('./aiAgent', () => ({ sanitizeErrorForClient: (e: unknown) => String(e) }));
 vi.mock('./sentry', () => ({ captureException: vi.fn(), captureMessage: vi.fn() }));
@@ -56,8 +81,16 @@ vi.mock('./aiToolOutput', () => ({
   redactSensitiveToolInput: (s: unknown) => s,
 }));
 vi.mock('./clientIp', () => ({ getTrustedClientIpOrUndefined: () => undefined }));
+// Keeps the lazy real ./flows/flowTools graph (~5 s cold) out of whichever test reaches it first (#11011).
+vi.mock('./flows/flowTools', () => ({ resolveFlowTools: async () => [] }));
 
-import { StreamingSessionManager } from './streamingSessionManager';
+import {
+  StreamingSessionManager,
+  PROCESSING_STALL_TIMEOUT_MS,
+  processingStallTimeoutMsFor,
+  turnTimeoutMsFor,
+} from './streamingSessionManager';
+import { makeResolvedModel } from './aiModels/__fixtures__/resolvedModel';
 import { buildOrgAccessClosures } from '../middleware/auth';
 import type { AuthContext } from '../middleware/auth';
 
@@ -67,18 +100,13 @@ const USER_ID = 'eeeeeeee-1111-4222-8333-444455556666';
 const DB_SESSION = {
   orgId: ORG_ID,
   sdkSessionId: null,
-  model: 'claude-sonnet-4-5-20250929',
   maxTurns: 50,
   turnCount: 0,
   systemPrompt: null,
   deviceId: null,
 };
 
-const PLATFORM_CONFIG = {
-  source: 'platform' as const,
-  apiKey: 'platform-key',
-  model: 'claude-sonnet-4-6',
-};
+const PLATFORM_CONFIG = makeResolvedModel('platform');
 
 function makeAuth(): AuthContext {
   return {
@@ -121,6 +149,7 @@ describe('getOrCreate — effective approval mode (#5593)', () => {
       close: vi.fn(),
     }));
     getEffectiveAiBudgetMock.mockResolvedValue(budget('per_step'));
+    loadApprovalWaitBudgetMsMock.mockResolvedValue(300_000);
     manager = new StreamingSessionManager();
   });
 
@@ -179,5 +208,71 @@ describe('getOrCreate — effective approval mode (#5593)', () => {
     const session = await create(manager, 'sess-error');
 
     expect(session.approvalMode).toBe('per_step');
+  });
+});
+
+describe('interactive approval timeout (#6475)', () => {
+  let manager: StreamingSessionManager;
+  const MIN = 60_000;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    queryMock.mockImplementation(() => ({
+      async *[Symbol.asyncIterator]() {
+        await new Promise(() => undefined);
+      },
+      interrupt: vi.fn(),
+      close: vi.fn(),
+    }));
+    getEffectiveAiBudgetMock.mockResolvedValue(budget('per_step'));
+    loadApprovalWaitBudgetMsMock.mockResolvedValue(300_000);
+    manager = new StreamingSessionManager();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    manager.shutdown();
+  });
+
+  it('turn timeout and stall window keep their old values at the 5-minute default', () => {
+    expect(turnTimeoutMsFor(5 * MIN)).toBe(6 * MIN);
+    expect(processingStallTimeoutMsFor(5 * MIN)).toBe(PROCESSING_STALL_TIMEOUT_MS);
+  });
+
+  it('turn timeout and stall window scale past a longer configured wait', () => {
+    expect(turnTimeoutMsFor(60 * MIN)).toBe(61 * MIN);
+    expect(processingStallTimeoutMsFor(60 * MIN)).toBe(65 * MIN);
+  });
+
+  it('loads the budget for a new session and refreshes it on reuse between turns only', async () => {
+    loadApprovalWaitBudgetMsMock.mockResolvedValue(30 * MIN);
+    const session = await create(manager, 'sess-budget');
+    expect(loadApprovalWaitBudgetMsMock).toHaveBeenCalledWith(ORG_ID);
+    expect(session.approvalWaitBudgetMs).toBe(30 * MIN);
+
+    loadApprovalWaitBudgetMsMock.mockResolvedValue(45 * MIN);
+    await create(manager, 'sess-budget');
+    expect(session.approvalWaitBudgetMs).toBe(45 * MIN);
+
+    session.state = 'processing';
+    loadApprovalWaitBudgetMsMock.mockResolvedValue(10 * MIN);
+    await create(manager, 'sess-budget');
+    expect(session.approvalWaitBudgetMs).toBe(45 * MIN);
+  });
+
+  it('the per-turn timeout does not fire at 6 minutes when the org allows a 30-minute wait', async () => {
+    loadApprovalWaitBudgetMsMock.mockResolvedValue(30 * MIN);
+    const session = await create(manager, 'sess-long-turn');
+    const publish = vi.spyOn(session.eventBus, 'publish');
+    const errored = () => publish.mock.calls.some(([e]) => e.type === 'error');
+    vi.useFakeTimers();
+    session.state = 'processing';
+    manager.startTurnTimeout(session);
+
+    vi.advanceTimersByTime(6 * MIN + 1);
+    expect(errored()).toBe(false);
+
+    vi.advanceTimersByTime(25 * MIN);
+    expect(errored()).toBe(true);
   });
 });

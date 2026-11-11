@@ -1,14 +1,20 @@
+import { createHmac } from 'node:crypto';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { PgDialect } from 'drizzle-orm/pg-core';
 import { graphResponseSchema } from '@breeze/shared';
 import type { TopologyRequestContext } from './access';
 
-const mocks = vi.hoisted(() => ({ execute: vi.fn(), transaction: vi.fn(), version: vi.fn(), access: vi.fn(), permissions: vi.fn() }));
+const mocks = vi.hoisted(() => ({ execute: vi.fn(), transaction: vi.fn(), version: vi.fn(), access: vi.fn(), permissions: vi.fn(), flags: vi.fn(), exclusions: vi.fn(), coverage: vi.fn(), declarations: vi.fn() }));
 vi.mock('../../db', () => ({ db: { execute: mocks.execute, transaction: mocks.transaction } }));
 vi.mock('../permissions', async (original) => ({ ...await original<object>(), getPermissionAuthorityVersion: mocks.version, getUserPermissions: mocks.permissions }));
 vi.mock('./access', async (original) => ({ ...await original<object>(), requireTopologySiteAccess: mocks.access }));
+vi.mock('./flags', async (original) => ({ ...await original<object>(), loadTopologyFlags: mocks.flags }));
+vi.mock('./exclusions', async (original) => ({ ...await original<object>(), loadActiveExclusions: mocks.exclusions }));
+vi.mock('./physicalCoverage', async (original) => ({ ...await original<object>(), readGraphCoverage: mocks.coverage }));
+vi.mock('./siteNetworkDeclarations', async (original) => ({ ...await original<object>(), readSiteNetworkDeclarations: mocks.declarations }));
 vi.mock('../secretCrypto', () => ({ getSecretDerivedKeyMaterials: () => ({ active: { key: Buffer.alloc(32, 7) }, retained: [{ key: Buffer.alloc(32, 7) }] }) }));
-import { getTopologyGraph, listTopologyNodes, expandTopologyGraph, getTopologyRelationshipEvidence, getTopologyHealth, getTopologyNode, getTopologyGroupMembers } from './graph';
+import { getTopologyGraph, listTopologyNodes, expandTopologyGraph, getTopologyRelationship, getTopologyRelationshipEvidence, getTopologyHealth, getTopologyLinkHealth, getTopologyNode, getTopologyGroupMembers } from './graph';
+import { relationshipDetailResponseSchema, relationshipEvidenceResponseSchema, topologyLinkHealthResponseSchema } from '@breeze/shared';
 import { issueGraphToken, verifyGraphToken, GraphReadError } from './graphCursor';
 
 const ORG = '10000000-0000-4000-8000-000000000001';
@@ -20,6 +26,7 @@ const ctx = { auth: { user: { id: '50000000-0000-4000-8000-000000000001' }, scop
 const query = { view: 'overview', hops: 1, includeHealth: false, limit: 1 } as const;
 const state = [{ graph: '9007199254740993', health: '4' }];
 const node = { id: NODE, kind: 'endpoint', role: null, label: 'Visible endpoint', lifecycle: 'active', lastObservedAt: null, legacy: true, bindings: [] };
+const flagsOn = { materialization: true, ui: true, physical: true, interfaceHealth: false, diagnostics: false, ai: false };
 const dialect = new PgDialect();
 function sqlText(call: unknown[]) { return dialect.sqlToQuery(call[0] as Parameters<PgDialect['sqlToQuery']>[0]); }
 beforeEach(() => {
@@ -29,6 +36,10 @@ beforeEach(() => {
   mocks.version.mockResolvedValue('0:0');
   mocks.permissions.mockResolvedValue(ctx.permissions);
   mocks.access.mockResolvedValue(ctx);
+  mocks.flags.mockResolvedValue(flagsOn);
+  mocks.exclusions.mockResolvedValue(new Set());
+  mocks.coverage.mockResolvedValue({ state: 'limited', reasons: [{ code: 'legacy_evidence_only', message: 'Legacy only' }] });
+  mocks.declarations.mockResolvedValue({ prefixes: new Map(), ignored: 0 });
 });
 
 it('starts with a nonempty bounded graph and reports omitted entities and boundary provenance', async () => {
@@ -68,7 +79,8 @@ describe('attributed health overlay', () => {
     mocks.execute.mockResolvedValueOnce(state).mockResolvedValueOnce([])
       .mockResolvedValueOnce([{ count: '1' }]).mockResolvedValueOnce([{ count: '0' }])
       .mockResolvedValueOnce([node]).mockResolvedValueOnce([]).mockResolvedValueOnce([])
-      .mockResolvedValueOnce([binding]).mockResolvedValueOnce([{ monitorId: MONITOR, count: '1' }]);
+      .mockResolvedValueOnce([binding]).mockResolvedValueOnce([{ monitorId: MONITOR, count: '1' }])
+      .mockResolvedValueOnce([]); // presentation group inputs
 
     const graph = await getTopologyGraph(ctx, healthQuery);
 
@@ -89,7 +101,7 @@ describe('attributed health overlay', () => {
   it('leaves health unmeasured with a reason when the projection does not ask for it', async () => {
     mocks.execute.mockResolvedValueOnce(state).mockResolvedValueOnce([])
       .mockResolvedValueOnce([{ count: '1' }]).mockResolvedValueOnce([{ count: '0' }])
-      .mockResolvedValueOnce([node]).mockResolvedValueOnce([]).mockResolvedValueOnce([]);
+      .mockResolvedValueOnce([node]).mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([]);
 
     const graph = await getTopologyGraph(ctx, query);
 
@@ -110,12 +122,68 @@ describe('attributed health overlay', () => {
   });
 
   it('reports a canonical entity with no bound monitor as unmonitored, not healthy', async () => {
-    mocks.execute.mockResolvedValueOnce(state).mockResolvedValueOnce([{ id: NODE }]).mockResolvedValueOnce([]);
+    mocks.execute.mockResolvedValueOnce(state).mockResolvedValueOnce([{ id: NODE }]).mockResolvedValueOnce([]).mockResolvedValueOnce([]); // bindings, policy health
 
     const health = await getTopologyHealth(ctx, { nodeIds: [NODE], relationshipIds: [] });
 
     expect(health.nodes[0]!.health).toMatchObject({ status: 'unknown', coverage: 'unmonitored', resultId: null });
     expect(health.nodes[0]!.health.reasons[0]!.code).toBe('no_monitor_binding');
+  });
+
+  describe('interface measurement health (M3 Task 6)', () => {
+    const IF = 'b0000000-0000-4000-8000-000000000001';
+    const SOURCE = 'c0000000-0000-4000-8000-000000000001';
+    const physicalRel = { id: REL, kind: 'physical_link', evidenceClass: 'observed', sourceInterfaceId: IF, targetInterfaceId: null };
+    const measurement = (operStatus: string, secondsAgo = 10) => ({ interface_id: IF, epoch: 'gen:1', retired: false, source_id: SOURCE, producer_kind: 'snmp',
+      producer_epoch: 'p1', revoked: false, last_received_at: new Date(Date.now() - secondsAgo * 1000 + 500).toISOString(),
+      sampled_at: new Date(Date.now() - secondsAgo * 1000).toISOString(),
+      readings: { v: 1, expectedIntervalSeconds: 60, adminStatus: 'up', operStatus, counterWidth: 64, inOctets: '0', outOctets: '0' } });
+
+    it('folds a fresh port-down into relationship health and exposes freshUntil, with zero writes or dispatch', async () => {
+      mocks.flags.mockResolvedValue({ ...flagsOn, interfaceHealth: true });
+      mocks.execute.mockResolvedValueOnce(state).mockResolvedValueOnce([{ id: REL }])
+        .mockResolvedValueOnce([]) // monitor bindings
+        .mockResolvedValueOnce([physicalRel]).mockResolvedValueOnce([measurement('down')])
+        .mockResolvedValueOnce([]); // policy health
+      const health = await getTopologyHealth(ctx, { nodeIds: [], relationshipIds: [REL] });
+      expect(health.relationships[0]!.health).toMatchObject({ status: 'failed_check', freshness: 'fresh' });
+      expect(health.relationships[0]!.health.reasons.map((r) => r.code)).toContain('interface_link_down');
+      expect(Date.parse(health.freshUntil!)).toBeGreaterThan(Date.now());
+      for (const call of mocks.execute.mock.calls) {
+        const statement = sqlText(call).sql;
+        expect(statement).not.toMatch(/\b(insert|update|delete)\b/i);
+        expect(statement).not.toMatch(/device_commands/i);
+      }
+    });
+
+    it('reads no interface measurement when the capability is off', async () => {
+      mocks.execute.mockResolvedValueOnce(state).mockResolvedValueOnce([{ id: REL }]).mockResolvedValueOnce([]).mockResolvedValueOnce([]); // bindings, policy health
+      const health = await getTopologyHealth(ctx, { nodeIds: [], relationshipIds: [REL] });
+      expect(health.relationships[0]!.health.status).toBe('unknown');
+      expect(health.freshUntil).toBeNull();
+      expect(mocks.execute.mock.calls.some((call) => /topology_interface_samples/.test(sqlText(call).sql))).toBe(false);
+    });
+
+    it('serves link health with each endpoint as its own view and never a summed rate', async () => {
+      mocks.flags.mockResolvedValue({ ...flagsOn, interfaceHealth: true });
+      const row = { id: REL, kind: 'physical_link', sourceNodeId: NODE, targetNodeId: OTHER, directness: 'direct', confidence: 'high', evidenceClass: 'observed',
+        lifecycle: 'active', lastSupportedAt: null, supportCount: '1', legacy: false, sourceInterfaceId: IF, targetInterfaceId: null, method: 'lldp' };
+      mocks.execute.mockResolvedValueOnce(state).mockResolvedValueOnce([row])
+        .mockResolvedValueOnce([measurement('up'), measurement('up', 70)])
+        .mockResolvedValueOnce([]) // monitor bindings
+        .mockResolvedValueOnce([]); // policy health
+      const link = await getTopologyLinkHealth(ctx, REL);
+      expect(topologyLinkHealthResponseSchema.safeParse(link).success).toBe(true);
+      expect(link).toMatchObject({ relationshipId: REL, interfaceEvidence: { applies: true, reason: null }, endpoints: { target: null } });
+      expect(link.endpoints.source).toMatchObject({ interfaceId: IF, operStatus: 'up', sourceKind: 'snmp' });
+      expect(link.health.scope).toBe('relationship');
+    });
+
+    it('hides link health for a gated physical relationship', async () => {
+      mocks.flags.mockResolvedValue({ ...flagsOn, physical: false });
+      mocks.execute.mockResolvedValueOnce(state).mockResolvedValueOnce([]);
+      await expect(getTopologyLinkHealth(ctx, REL)).rejects.toMatchObject({ status: 404 });
+    });
   });
 });
 
@@ -171,6 +239,42 @@ describe('signed graph cursor authority', () => {
     expect(() => verifyGraphToken(token, 'b'.repeat(64), ctx.scope, 101)).toThrow(GraphReadError);
     expect(() => verifyGraphToken(token, claims.authority, { ...ctx.scope, siteId: OTHER }, 101)).toThrow(GraphReadError);
   });
+
+  describe('group-scoped claims (#7818)', () => {
+    const group = { kind: 'network', key: 'c'.repeat(64) } as const;
+    const key = Buffer.alloc(32, 7);
+    /** Sign arbitrary claims with the (mocked) cursor key, as only the server could. */
+    const forge = (body: object) => {
+      const encoded = Buffer.from(JSON.stringify(body)).toString('base64url');
+      return `${encoded}.${createHmac('sha256', key).update(`topology-read-cursor:v1.${encoded}`).digest('base64url')}`;
+    };
+    const decode = (token: string) => JSON.parse(Buffer.from(token.split('.')[0]!, 'base64url').toString());
+
+    it('round trips a group claim under the same org/site/authority/revision binding', () => {
+      const token = issueGraphToken({ ...claims, group }, 100);
+      expect(verifyGraphToken(token, claims.authority, ctx.scope, 101).group).toEqual(group);
+      expect(() => verifyGraphToken(token, claims.authority, { ...ctx.scope, siteId: OTHER }, 101)).toThrow(GraphReadError);
+      expect(() => verifyGraphToken(token, claims.authority, { ...ctx.scope, orgId: OTHER }, 101)).toThrow(GraphReadError);
+      expect(() => verifyGraphToken(token, claims.authority, ctx.scope, 701)).toThrow(GraphReadError);
+    });
+
+    it('rejects a group claim edited to name another group without re-signing', () => {
+      const token = issueGraphToken({ ...claims, group }, 100);
+      const edited = Buffer.from(JSON.stringify({ ...decode(token), group: { ...group, key: 'd'.repeat(64) } })).toString('base64url');
+      expect(() => verifyGraphToken(`${edited}.${token.split('.')[1]}`, claims.authority, ctx.scope, 101)).toThrow(GraphReadError);
+    });
+
+    it('never signs or accepts a group on a focused, physical or non-graph claim, or a malformed key', () => {
+      expect(() => issueGraphToken({ ...claims, group, filter: { ...query, focusNodeId: NODE } }, 100)).toThrow();
+      expect(() => issueGraphToken({ ...claims, group, filter: { ...query, view: 'physical' } }, 100)).toThrow();
+      expect(() => issueGraphToken({ ...claims, group, kind: 'nodes', filter: { lifecycle: 'active', limit: 100 } }, 100)).toThrow();
+      const valid = decode(issueGraphToken({ ...claims, group }, 100));
+      for (const body of [
+        { ...valid, filter: { ...query, focusNodeId: NODE } }, { ...valid, filter: { ...query, view: 'physical' } },
+        { ...valid, group: { kind: 'network', key: 'not-a-hash' } }, { ...valid, group: { ...group, extra: true } },
+      ]) expect(() => verifyGraphToken(forge(body), claims.authority, ctx.scope, 101)).toThrow(GraphReadError);
+    });
+  });
 });
 
 
@@ -180,7 +284,7 @@ it('rejects malformed canonical IDs before authorization or SQL', async () => {
 });
 
 it('revalidates live site ceilings before using a previously issued frontier', async () => {
-  mocks.execute.mockResolvedValueOnce(state).mockResolvedValueOnce([]).mockResolvedValueOnce([{ count: '2' }]).mockResolvedValueOnce([{ count: '0' }]).mockResolvedValueOnce([node]).mockResolvedValueOnce([]).mockResolvedValueOnce([]);
+  mocks.execute.mockResolvedValueOnce(state).mockResolvedValueOnce([]).mockResolvedValueOnce([{ count: '2' }]).mockResolvedValueOnce([{ count: '0' }]).mockResolvedValueOnce([node]).mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([]);
   const first = await getTopologyGraph(ctx, query);
   mocks.access.mockRejectedValueOnce(new GraphReadError('topology_site_not_found', 404, 'Not found'));
   mocks.execute.mockClear();
@@ -202,14 +306,250 @@ it('fails closed if authority generation changes during the live permission read
 
 it('keeps canonical plus boundary edges within one cap and pages omitted boundary edges', async () => {
   const edges = ['1', '2', '3'].map((suffix) => ({ id: `40000000-0000-4000-8000-00000000000${suffix}`, sourceNodeId: NODE, targetNodeId: OTHER, remaining: '3' }));
-  mocks.execute.mockResolvedValueOnce(state).mockResolvedValueOnce([]).mockResolvedValueOnce([{ count: '2' }]).mockResolvedValueOnce([{ count: '3' }]).mockResolvedValueOnce([node]).mockResolvedValueOnce([]).mockResolvedValueOnce(edges);
+  mocks.execute.mockResolvedValueOnce(state).mockResolvedValueOnce([]).mockResolvedValueOnce([{ count: '2' }]).mockResolvedValueOnce([{ count: '3' }]).mockResolvedValueOnce([node]).mockResolvedValueOnce([]).mockResolvedValueOnce(edges).mockResolvedValueOnce([]);
   const first = await getTopologyGraph(ctx, query);
   expect(first.relationships.length + first.presentation.edges.length).toBe(2);
   const cursor = first.frontier.find((item) => item.label === 'More boundary connections')!;
   expect(cursor.memberCount).toBe(1);
-  mocks.execute.mockReset().mockResolvedValueOnce(state).mockResolvedValueOnce([]).mockResolvedValueOnce([{ count: '2' }]).mockResolvedValueOnce([{ count: '3' }]).mockResolvedValueOnce([node]).mockResolvedValueOnce([{ ...edges[2], remaining: '1' }]);
+  mocks.execute.mockReset().mockResolvedValueOnce(state).mockResolvedValueOnce([]).mockResolvedValueOnce([{ count: '2' }]).mockResolvedValueOnce([{ count: '3' }]).mockResolvedValueOnce([node]).mockResolvedValueOnce([{ ...edges[2], remaining: '1' }]).mockResolvedValueOnce([]);
   const next = await expandTopologyGraph(ctx, cursor.token);
   expect(next.presentation.edges).toHaveLength(1);
   expect(next.presentation.edges[0]!.contributingRelationshipIds).toEqual([edges[2]!.id]);
   expect(next.frontier.some((item) => item.label === 'More boundary connections')).toBe(false);
+});
+
+describe('M2 physical exposure, exclusions and detail (D9, D11, D17)', () => {
+  const graphRows = () => mocks.execute.mockResolvedValueOnce(state).mockResolvedValueOnce([])
+    .mockResolvedValueOnce([{ count: '2' }]).mockResolvedValueOnce([{ count: '0' }])
+    .mockResolvedValueOnce([node]).mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([]);
+  const relRow = { id: REL, kind: 'attachment', sourceNodeId: NODE, targetNodeId: OTHER, directness: 'unknown', confidence: 'low', evidenceClass: 'inferred',
+    lifecycle: 'active', lastSupportedAt: null, supportCount: '1', legacy: false, method: 'fdb', sourceInterfaceId: null, targetInterfaceId: null, physical: null };
+
+  it('gates collected physical rows and this view\'s exclusions in counts, rows and neighborhoods', async () => {
+    mocks.flags.mockResolvedValue({ ...flagsOn, physical: false });
+    mocks.exclusions.mockResolvedValue(new Set([REL]));
+    graphRows();
+    const graph = await getTopologyGraph(ctx, { ...query, view: 'overview' });
+    expect(graphResponseSchema.safeParse(graph).success).toBe(true);
+    // Read inside the graph's own FOR SHARE transaction, not the ambient db.
+    expect(mocks.exclusions).toHaveBeenCalledWith(ctx.scope, 'overview', expect.objectContaining({ execute: mocks.execute }));
+    expect(mocks.coverage).toHaveBeenCalledWith(expect.anything(), ctx.scope, 'overview', false);
+    const relationshipCount = mocks.execute.mock.calls.map(sqlText).find((q) => /count\(\*\)::text AS count FROM topology_relationships r/i.test(q.sql))!;
+    expect(relationshipCount.sql).toMatch(/->>'method'/);
+    expect(relationshipCount.params).toContain(`{${REL}}`);
+    const nodeCount = sqlText(mocks.execute.mock.calls[2]!);
+    expect(nodeCount.sql).toMatch(/identity_material/);
+  });
+
+  it('does not gate or exclude anything when physical is exposed and nothing is hidden', async () => {
+    graphRows();
+    await getTopologyGraph(ctx, query);
+    for (const call of mocks.execute.mock.calls) expect(sqlText(call).sql).not.toMatch(/->>'method'\), ''\) IN/);
+  });
+
+  it('folds the physical capability into cursor authority, so a toggle invalidates frontiers', async () => {
+    graphRows();
+    const first = await getTopologyGraph(ctx, query);
+    expect(first.frontier.length).toBeGreaterThan(0);
+    mocks.flags.mockResolvedValue({ ...flagsOn, physical: false });
+    mocks.execute.mockReset();
+    await expect(expandTopologyGraph(ctx, first.frontier[0]!.token)).rejects.toMatchObject({ code: 'invalid_topology_cursor', status: 400 });
+    expect(mocks.execute).not.toHaveBeenCalled();
+  });
+
+  it('returns 404 for a gated relationship detail, evidence and health', async () => {
+    mocks.flags.mockResolvedValue({ ...flagsOn, physical: false });
+    mocks.execute.mockResolvedValueOnce(state).mockResolvedValueOnce([]);
+    await expect(getTopologyRelationship(ctx, REL)).rejects.toMatchObject({ status: 404 });
+    expect(sqlText(mocks.execute.mock.calls[1]!).sql).toMatch(/->>'method'/);
+    mocks.execute.mockReset().mockResolvedValueOnce(state).mockResolvedValueOnce([]);
+    await expect(getTopologyRelationshipEvidence(ctx, REL, { limit: 50 })).rejects.toMatchObject({ status: 404 });
+    expect(sqlText(mocks.execute.mock.calls[1]!).sql).toMatch(/->>'method'/);
+    mocks.execute.mockReset().mockResolvedValueOnce(state).mockResolvedValueOnce([]);
+    await expect(getTopologyHealth(ctx, { nodeIds: [], relationshipIds: [REL] })).rejects.toMatchObject({ status: 404 });
+    expect(sqlText(mocks.execute.mock.calls[1]!).sql).toMatch(/->>'method'/);
+  });
+
+  it('serves relationship detail with exclusion state even when the view hides it', async () => {
+    mocks.execute.mockResolvedValueOnce(state).mockResolvedValueOnce([relRow])
+      .mockResolvedValueOnce([{ id: '90000000-0000-4000-8000-000000000001', view: 'overview', reason: 'Not a real cable', createdAt: '2026-09-26T10:00:00.000Z' }])
+      .mockResolvedValueOnce([{ id: NODE, label: 'Switch' }, { id: OTHER, label: 'Desk' }])
+      .mockResolvedValueOnce([]) // monitor bindings for the detail's health
+      .mockResolvedValueOnce([]); // policy health
+    const detail = await getTopologyRelationship(ctx, REL);
+    expect(relationshipDetailResponseSchema.safeParse(detail).success).toBe(true);
+    expect(detail.relationship.excluded).toBe(true);
+    expect(detail.exclusions.map((e) => e.view)).toEqual(['overview']);
+    expect(mocks.exclusions).not.toHaveBeenCalled();
+  });
+
+  it('pages evidence through a signed cursor bound to the relationship and graph revision', async () => {
+    const obs = (n: number) => ({ id: `a0000000-0000-4000-8000-00000000000${n}`, method: 'fdb', evidenceClass: 'inferred', producerKind: 'discovery', protocol: 'fdb',
+      observedAt: '2026-09-26T10:00:00.000Z', effectiveAt: '2026-09-26T10:00:00.000Z', receivedAt: `2026-09-26T10:0${n}:00.000Z`, freshUntil: '2999-01-01T00:00:00.000Z', withdrawnAt: null });
+    mocks.execute.mockResolvedValueOnce(state).mockResolvedValueOnce([relRow]).mockResolvedValueOnce([obs(2), obs(1)]).mockResolvedValueOnce([]);
+    const first = await getTopologyRelationshipEvidence(ctx, REL, { limit: 1 });
+    expect(relationshipEvidenceResponseSchema.safeParse(first).success).toBe(true);
+    expect(first.observations).toHaveLength(1);
+    expect(first.cursor).toEqual(expect.any(String));
+    mocks.execute.mockReset().mockResolvedValueOnce(state).mockResolvedValueOnce([relRow]).mockResolvedValueOnce([obs(1)]);
+    const second = await getTopologyRelationshipEvidence(ctx, REL, { limit: 1, cursor: first.cursor! });
+    expect(second.observations.map((o) => o.id)).toEqual([obs(1).id]);
+    expect(second.cursor).toBeNull();
+    await expect(getTopologyRelationshipEvidence(ctx, OTHER, { limit: 1, cursor: first.cursor! })).rejects.toMatchObject({ code: 'invalid_topology_cursor' });
+    mocks.execute.mockReset().mockResolvedValueOnce([{ graph: '9007199254740994', health: '4' }]);
+    await expect(getTopologyRelationshipEvidence(ctx, REL, { limit: 1, cursor: first.cursor! })).rejects.toMatchObject({ code: 'graph_revision_changed', status: 409 });
+  });
+});
+
+describe('grouped overview presentation (2026-10-02)', () => {
+  const NET = 'a0000000-0000-4000-8000-0000000000aa';
+  const network = { ...node, id: NET, kind: 'network', label: '10.1.2.0/24', legacy: false };
+  const groupInput = [{ networks: [{ id: NET, prefix: '10.1.2.0/24' }],
+    memberships: [{ id: REL, endpointId: NODE, networkId: NET, interfaceId: null, fresh: true }], routes: [], unplaced: [] }];
+  const twoNodes = { ...query, limit: 2 } as const;
+  const rows = () => mocks.execute.mockResolvedValueOnce(state).mockResolvedValueOnce([])
+    .mockResolvedValueOnce([{ count: '2' }]).mockResolvedValueOnce([{ count: '1' }])
+    .mockResolvedValueOnce([node, network]).mockResolvedValueOnce([]).mockResolvedValueOnce([]);
+  const groupRead = () => mocks.execute.mock.calls.map(sqlText).find((q) => /AS unplaced/.test(q.sql));
+
+  it.each(['overview', 'logical'] as const)('adds inferred network cards to the %s view from one complete-site read', async (view) => {
+    rows().mockResolvedValueOnce(groupInput);
+    const graph = await getTopologyGraph(ctx, { ...twoNodes, view });
+    expect(graphResponseSchema.safeParse(graph).success).toBe(true);
+    const card = graph.presentation.nodes.find((entry) => entry.role === 'network_group')!;
+    expect(card).toMatchObject({ view, label: '10.1.2.0/24', authority: false, memberCount: 1 });
+    expect(card.group).toMatchObject({ kind: 'network', canonicalNodeIds: [NET], members: [{ nodeId: NODE, placement: 'observed', primary: true, stale: false }] });
+    expect(card.frontierToken).toEqual(expect.any(String));
+    const read = groupRead()!;
+    expect(read.params).toContain(ORG); expect(read.params).toContain(SITE);
+    expect(read.sql).toMatch(/network_member/); expect(read.sql).toMatch(/default_route/);
+    expect(read.sql).not.toMatch(/\b(insert|update|delete)\b/i);
+  });
+
+  it('marks cards with this site\'s declarations, read once for the viewed scope (site location W1)', async () => {
+    mocks.declarations.mockResolvedValue({ prefixes: new Map([['10.1.2.0/24', [{ kind: 'discovery_profile', id: REL }]], ['10.1.9.0/24', [{ kind: 'network_baseline', id: NET }]]]), ignored: 1 });
+    rows().mockResolvedValueOnce(groupInput);
+    const graph = await getTopologyGraph(ctx, { ...twoNodes, view: 'overview' });
+    expect(graphResponseSchema.safeParse(graph).success).toBe(true);
+    expect(mocks.declarations).toHaveBeenCalledTimes(1);
+    expect(mocks.declarations.mock.calls[0]![1]).toEqual({ orgId: ORG, siteId: SITE });
+    const cards = Object.fromEntries(graph.presentation.nodes.filter((entry) => entry.group?.kind === 'network').map((entry) => [entry.group!.prefix, entry.group!]));
+    expect(cards['10.1.2.0/24']).toMatchObject({ basis: 'inferred_site_prefix', declaration: { state: 'declared', sources: ['discovery_profile'] } });
+    expect(cards['10.1.9.0/24']).toMatchObject({ basis: 'declared_site_network', members: [], declaration: { state: 'declared', sources: ['network_baseline'] } });
+  });
+
+  it('skips the complete-site group read when the caller does not render groups (AI reads)', async () => {
+    mocks.declarations.mockResolvedValue({ prefixes: new Map([['10.1.2.0/24', [{ kind: 'discovery_profile', id: REL }]]]), ignored: 0 });
+    rows();
+    const graph = await getTopologyGraph(ctx, { ...twoNodes, view: 'overview' }, { presentationGroups: false });
+    expect(graph.presentation.nodes.some((entry) => entry.group)).toBe(false);
+    expect(groupRead()).toBeUndefined();
+    // Site location W1 (S§14): AI reads never consult declarations and never serialize them.
+    expect(mocks.declarations).not.toHaveBeenCalled();
+    expect(JSON.stringify(graph)).not.toMatch(/declaration|declared_site_network/);
+  });
+
+  it('never groups the physical view and never re-reads groups for a group-member read', async () => {
+    rows();
+    const graph = await getTopologyGraph(ctx, { ...twoNodes, view: 'physical' });
+    expect(graph.presentation.nodes.some((entry) => entry.group)).toBe(false);
+    expect(groupRead()).toBeUndefined();
+    mocks.execute.mockReset();
+    mocks.execute.mockResolvedValueOnce(state).mockResolvedValueOnce([]).mockResolvedValueOnce([{ id: NET, kind: 'network', role: null }])
+      .mockResolvedValueOnce([{ count: '2' }]).mockResolvedValueOnce([{ count: '1' }]).mockResolvedValueOnce([node, network])
+      .mockResolvedValueOnce([]).mockResolvedValueOnce([]);
+    await getTopologyGroupMembers(ctx, NET, twoNodes);
+    expect(groupRead()).toBeUndefined();
+  });
+
+  describe('group-scoped expansion (#7818)', () => {
+    const PEER = '30000000-0000-4000-8000-000000000003';
+    const peer = { ...node, id: PEER, label: 'Second endpoint' };
+    // One LAN card over three canonical nodes; the page holds two.
+    const siteGroup = [{ networks: [{ id: NET, prefix: '10.1.2.0/24' }], routes: [], unplaced: [],
+      memberships: [{ id: REL, endpointId: NODE, networkId: NET, interfaceId: null, fresh: true },
+        { id: '40000000-0000-4000-8000-000000000009', endpointId: PEER, networkId: NET, interfaceId: null, fresh: true }] }];
+    const claimsOf = (token: string) => JSON.parse(Buffer.from(token.split('.')[0]!, 'base64url').toString());
+    const membersParam = (q: { params: unknown[] }) => q.params.find((p): p is string => typeof p === 'string' && p.startsWith('{') && p.includes(PEER));
+    async function cardToken() {
+      rows().mockResolvedValueOnce(siteGroup);
+      const graph = await getTopologyGraph(ctx, twoNodes);
+      mocks.execute.mockReset();
+      return graph.presentation.nodes.find((entry) => entry.role === 'network_group')!.frontierToken;
+    }
+
+    it('expands a card to its whole group within page bounds and pages the rest under the same group claim', async () => {
+      const token = await cardToken();
+      expect(claimsOf(token).group).toEqual({ kind: 'network', key: expect.stringMatching(/^[a-f0-9]{64}$/) });
+      expect(claimsOf(token).filter.focusNodeId).toBeUndefined();
+      mocks.execute.mockResolvedValueOnce(state).mockResolvedValueOnce([]).mockResolvedValueOnce(siteGroup)
+        .mockResolvedValueOnce([{ count: '3', remaining: '3' }]).mockResolvedValueOnce([{ count: '1' }])
+        .mockResolvedValueOnce([node, peer]).mockResolvedValueOnce([]).mockResolvedValueOnce([]);
+      const expanded = await expandTopologyGraph(ctx, token);
+      expect(graphResponseSchema.safeParse(expanded).success).toBe(true);
+      expect(expanded.counts).toMatchObject({ totalNodes: 3, visibleNodes: 2, omittedNodes: 1 });
+      const calls = mocks.execute.mock.calls.map(sqlText);
+      // One complete-site group read resolves membership AND renders the card.
+      expect(calls.filter((q) => /AS unplaced/.test(q.sql))).toHaveLength(1);
+      const nodeRead = calls.find((q) => q.sql.includes('as "bindings"'))!;
+      expect(nodeRead.params).toContain(2);
+      expect(membersParam(nodeRead)!.split(/[{},]/).filter(Boolean).sort()).toEqual([NODE, PEER, NET].sort());
+      expect(membersParam(calls.find((q) => /count\(\*\) FILTER/.test(q.sql))!)).toBeDefined();
+      // Relationship count, induced edges and boundary edges: both endpoints bounded by the group.
+      const relationshipReads = calls.filter((q) => /FROM topology_relationships r\s+WHERE/.test(q.sql) && !/AS unplaced/.test(q.sql));
+      expect(relationshipReads).toHaveLength(3);
+      for (const read of relationshipReads) expect(read.params.filter((p) => p === membersParam(read))).toHaveLength(2);
+      expect(expanded.presentation.nodes.find((entry) => entry.role === 'network_group')!.group!.members.map((m) => m.nodeId)).toEqual([NODE, PEER]);
+      const more = expanded.frontier.find((item) => item.label === 'More devices')!;
+      expect(more.memberCount).toBe(1);
+      expect(claimsOf(more.token).group).toEqual(claimsOf(token).group);
+
+      mocks.execute.mockReset().mockResolvedValueOnce(state).mockResolvedValueOnce([]).mockResolvedValueOnce(siteGroup)
+        .mockResolvedValueOnce([{ count: '3', remaining: '1' }]).mockResolvedValueOnce([{ count: '1' }])
+        .mockResolvedValueOnce([network]).mockResolvedValueOnce([]).mockResolvedValueOnce([]);
+      const next = await expandTopologyGraph(ctx, more.token);
+      expect(next.nodes.map((entry) => entry.id)).toEqual([NET]);
+      expect(next.presentation.nodes.find((entry) => entry.role === 'network_group')!.group!.canonicalNodeIds).toEqual([NET]);
+      expect(membersParam(mocks.execute.mock.calls.map(sqlText).find((q) => q.sql.includes('as "bindings"'))!)).toBeDefined();
+      expect(next.frontier.some((item) => item.label === 'More devices')).toBe(false);
+    });
+
+    it('carries the group claim on edge and boundary continuations too', async () => {
+      const token = await cardToken();
+      const edge = (n: number) => ({ id: `40000000-0000-4000-8000-00000000010${n}`, kind: 'network_member', sourceNodeId: NODE, targetNodeId: PEER,
+        directness: 'direct', confidence: 'high', evidenceClass: 'observed', lifecycle: 'active', lastSupportedAt: null, supportCount: '1', legacy: false, remaining: '5' });
+      // limit 2 → edge budget 4: five induced edges overflow it and leave no room for boundary edges.
+      mocks.execute.mockResolvedValueOnce(state).mockResolvedValueOnce([]).mockResolvedValueOnce(siteGroup)
+        .mockResolvedValueOnce([{ count: '3', remaining: '3' }]).mockResolvedValueOnce([{ count: '6' }])
+        .mockResolvedValueOnce([node, peer]).mockResolvedValueOnce([1, 2, 3, 4, 5].map(edge))
+        .mockResolvedValueOnce([{ id: '40000000-0000-4000-8000-000000000201', sourceNodeId: PEER, targetNodeId: NET, remaining: '1' }]);
+      const expanded = await expandTopologyGraph(ctx, token);
+      const labels = ['More connections in this projection', 'More boundary connections'];
+      for (const label of labels) expect(claimsOf(expanded.frontier.find((item) => item.label === label)!.token).group).toEqual(claimsOf(token).group);
+    });
+
+    it('refuses a card whose group no longer resolves at this revision instead of expanding something else', async () => {
+      const token = await cardToken();
+      mocks.execute.mockResolvedValueOnce(state).mockResolvedValueOnce([])
+        .mockResolvedValueOnce([{ networks: [{ id: NET, prefix: '10.9.9.0/24' }], memberships: siteGroup[0]!.memberships, routes: [], unplaced: [] }]);
+      await expect(expandTopologyGraph(ctx, token)).rejects.toMatchObject({ code: 'presentation_group_changed', status: 409 });
+      expect(mocks.execute).toHaveBeenCalledTimes(3);
+    });
+
+    it('issues an unfocused group token for a card drawn inside a focused read', async () => {
+      mocks.execute.mockResolvedValueOnce(state).mockResolvedValueOnce([]).mockResolvedValueOnce([{ id: NODE, kind: 'endpoint', role: null }])
+        .mockResolvedValueOnce([{ count: '2' }]).mockResolvedValueOnce([{ count: '1' }])
+        .mockResolvedValueOnce([node, network]).mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce(siteGroup);
+      const focused = await getTopologyGraph(ctx, { ...twoNodes, focusNodeId: NODE });
+      const claims = claimsOf(focused.presentation.nodes.find((entry) => entry.role === 'network_group')!.frontierToken);
+      expect(claims.group.kind).toBe('network');
+      expect(claims.filter.focusNodeId).toBeUndefined();
+    });
+
+    it('never accepts a group token as a canonical group-members cursor', async () => {
+      const token = await cardToken();
+      await expect(getTopologyGroupMembers(ctx, NET, twoNodes, token)).rejects.toMatchObject({ code: 'invalid_topology_cursor' });
+      expect(mocks.execute).not.toHaveBeenCalled();
+    });
+  });
 });

@@ -83,6 +83,8 @@ vi.mock('../middleware/auth', () => ({
 }));
 
 import { db } from '../db';
+import { authMiddleware } from '../middleware/auth';
+import { withHostTimeZone } from '../testUtils/hostTimeZone';
 
 describe('audit log routes', () => {
   let app: Hono;
@@ -116,6 +118,32 @@ describe('audit log routes', () => {
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.data).toEqual([]);
+    });
+
+    it('joins users on the count query too when filtering by user (users.name is in the WHERE)', async () => {
+      // Each db.select() chain records whether it joined before filtering. The
+      // user filter references users.name, so a count that reads audit_logs
+      // alone fails in Postgres with "missing FROM-clause entry for table users".
+      const chains: Array<{ joined: boolean; filtered: boolean }> = [];
+      vi.mocked(db.select).mockImplementation((() => {
+        const rec = { joined: false, filtered: false };
+        chains.push(rec);
+        const base = createDbChain();
+        const from = base.from();
+        return {
+          from: vi.fn(() => ({
+            leftJoin: vi.fn((...args: unknown[]) => { rec.joined = true; return (from.leftJoin as any)(...args); }),
+            where: vi.fn((...args: unknown[]) => { rec.filtered = true; return (from.where as any)(...args); }),
+          })),
+        };
+      }) as any);
+
+      const res = await app.request('/audit-logs/logs?user=riley');
+
+      expect(res.status).toBe(200);
+      expect(chains.length).toBeGreaterThanOrEqual(2);
+      expect(chains.filter((c) => c.filtered && !c.joined)).toEqual([]);
+      vi.mocked(db.select).mockImplementation((() => createDbChain()) as any);
     });
 
     it('filters logs by action', async () => {
@@ -162,12 +190,202 @@ describe('audit log routes', () => {
       expect(body.data).toEqual([]);
     });
 
+    it.each(['America/Denver', 'Asia/Tokyo'] as const)(
+      'reads LATERAL fast-path timestamp text as UTC on a %s host',
+      async (zone) => {
+        await withHostTimeZone(zone, async () => {
+          vi.mocked(authMiddleware).mockImplementationOnce(((c: any, next: any) => {
+            c.set('auth', {
+              user: { id: 'user-123', email: 'test@example.com' },
+              scope: 'organization',
+              orgId: 'org-123',
+              accessibleOrgIds: ['org-123'],
+              orgCondition: vi.fn(() => undefined),
+            });
+            return next();
+          }) as never);
+          // audit_logs.timestamp is `timestamp WITHOUT time zone`: raw execute() hands back offsetless text.
+          const hadExecute = Object.prototype.hasOwnProperty.call(db, 'execute');
+          const previousExecute = (db as any).execute;
+          (db as any).execute = vi.fn().mockResolvedValue([
+            {
+              id: 'audit-1',
+              org_id: 'org-123',
+              timestamp: '2026-08-25 18:34:15.123',
+              actor_type: 'user',
+              actor_id: 'user-123',
+              actor_email: 'tech@example.com',
+              action: 'device.update',
+              resource_type: 'device',
+              resource_id: 'dev-1',
+              resource_name: null,
+              details: null,
+              ip_address: null,
+              user_agent: null,
+              result: 'success',
+              error_message: null,
+              checksum: null,
+              initiated_by: 'manual',
+              user_name: 'Tech',
+              device_hostname: null,
+              device_display_name: null,
+            },
+          ]);
+
+          try {
+            const res = await app.request('/audit-logs/logs?limit=5&skipCount=true');
+
+            expect(res.status).toBe(200);
+            const body = await res.json();
+            expect((db as any).execute).toHaveBeenCalledTimes(1);
+            expect(body.data[0].timestamp).toBe('2026-08-25T18:34:15.123Z');
+          } finally {
+            if (hadExecute) (db as any).execute = previousExecute;
+            else delete (db as any).execute;
+          }
+        });
+      }
+    );
+
     it('ignores empty excludeActions tokens', async () => {
       const res = await app.request('/audit-logs/logs?excludeActions=,,%20,');
 
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.data).toEqual([]);
+    });
+  });
+
+  describe('secret redaction of persisted details (#6577)', () => {
+    // Historical rows (pre write-side sanitiser) and direct createAuditLog
+    // writers can hold raw credentials in details; every read path must
+    // redact before serialising.
+    const planted = 'ghp_PLANTEDsecretTOKENvalue6577abcdef';
+    const secretRow = () => ({
+      log: {
+        id: 'audit-secret',
+        timestamp: new Date('2026-05-02T12:00:00Z'),
+        actorId: 'user-123',
+        actorEmail: 'tech@example.com',
+        actorType: 'user',
+        action: 'ai.tool.manage_backup_configs',
+        resourceType: 'ai_session',
+        resourceId: 'session-1',
+        resourceName: null,
+        result: 'success',
+        ipAddress: '10.0.0.1',
+        userAgent: 'browser',
+        initiatedBy: 'ai',
+        details: {
+          sessionId: 'session-1',
+          toolInput: {
+            providerConfig: { secretKey: planted },
+            apiToken: planted,
+            note: `Authorization: Bearer ${planted}`,
+          },
+          durationMs: 12,
+        },
+      },
+      userName: 'Tech',
+      deviceHostname: null,
+      deviceDisplayName: null,
+      deviceSiteId: null,
+    });
+    const listChain = (row: ReturnType<typeof secretRow> = secretRow()) => ({
+      from: vi.fn().mockReturnValue({
+        leftJoin: vi.fn().mockReturnValue({
+          leftJoin: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              orderBy: vi.fn().mockReturnValue({
+                limit: vi.fn().mockReturnValue({
+                  offset: vi.fn().mockResolvedValue([row]),
+                }),
+              }),
+            }),
+          }),
+        }),
+      }),
+    });
+
+    it('GET / (viewer shape) redacts details and keeps the session link', async () => {
+      vi.mocked(db.select).mockReturnValueOnce(listChain() as never);
+      const res = await app.request('/audit-logs?skipCount=true');
+      expect(res.status).toBe(200);
+      const text = await res.text();
+      expect(text).not.toContain(planted);
+      const body = JSON.parse(text);
+      const details = JSON.parse(body.entries[0].details);
+      expect(details.toolInput.apiToken).toBe('[REDACTED]');
+      expect(details.durationMs).toBe(12);
+      // #9672: a non-update action carries no fabricated "after" snapshot.
+      expect(body.entries[0].changes).toEqual({ before: {}, after: {} });
+      expect(body.entries[0].user.department).toBeUndefined();
+      expect(body.entries[0].sessionId).toBe('session-1');
+    });
+
+    it('GET / (viewer shape) keeps a redacted "after" snapshot only for update actions (#9672)', async () => {
+      const upd = secretRow();
+      upd.log.action = 'device.update';
+      vi.mocked(db.select).mockReturnValueOnce(listChain(upd) as never);
+      const text = await (await app.request('/audit-logs?skipCount=true')).text();
+      expect(text).not.toContain(planted);
+      expect(JSON.parse(text).entries[0].changes.after.toolInput.providerConfig.secretKey).toBe('[REDACTED]');
+
+      const notUpd = secretRow();
+      notUpd.log.action = 'device.update_status';
+      vi.mocked(db.select).mockReturnValueOnce(listChain(notUpd) as never);
+      const body = await (await app.request('/audit-logs?skipCount=true')).json();
+      expect(body.entries[0].changes.after).toEqual({});
+    });
+
+    it('GET /logs (full shape) redacts details', async () => {
+      vi.mocked(db.select).mockReturnValueOnce(listChain() as never);
+      const res = await app.request('/audit-logs/logs?skipCount=true');
+      expect(res.status).toBe(200);
+      const text = await res.text();
+      expect(text).not.toContain(planted);
+      expect(JSON.parse(text).data[0].details.toolInput.apiToken).toBe('[REDACTED]');
+    });
+
+    it('GET /logs/:id redacts details', async () => {
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          leftJoin: vi.fn().mockReturnValue({
+            leftJoin: vi.fn().mockReturnValue({
+              where: vi.fn().mockResolvedValue([secretRow()]),
+            }),
+          }),
+        }),
+      } as never);
+      const res = await app.request('/audit-logs/logs/audit-secret');
+      expect(res.status).toBe(200);
+      const text = await res.text();
+      expect(text).not.toContain(planted);
+      expect(JSON.parse(text).details.toolInput.providerConfig.secretKey).toBe('[REDACTED]');
+    });
+
+    it('POST /export redacts details in CSV and JSON', async () => {
+      vi.mocked(db.select).mockReturnValueOnce(listChain() as never);
+      const csvRes = await app.request('/audit-logs/export', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ format: 'csv' }),
+      });
+      expect(csvRes.status).toBe(200);
+      const csv = await csvRes.text();
+      expect(csv).toContain('[REDACTED]');
+      expect(csv).not.toContain(planted);
+
+      vi.mocked(db.select).mockReturnValueOnce(listChain() as never);
+      const jsonRes = await app.request('/audit-logs/export', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ format: 'json' }),
+      });
+      expect(jsonRes.status).toBe(200);
+      const json = await jsonRes.text();
+      expect(json).toContain('[REDACTED]');
+      expect(json).not.toContain(planted);
     });
   });
 

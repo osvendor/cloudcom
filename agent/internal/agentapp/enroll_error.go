@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/breeze-rmm/agent/internal/config"
+	"github.com/breeze-rmm/agent/internal/ech"
 	"github.com/breeze-rmm/agent/internal/eventlog"
 	"github.com/breeze-rmm/agent/pkg/api"
 )
@@ -45,10 +46,15 @@ func (c enrollErrCategory) exitCode() int { return int(c) + 10 }
 // enroll request may have reached the server and created a device despite
 // the failure the agent observed (a network error can mean the response was
 // merely lost in flight; a 5xx can mean the transaction committed before an
-// unrelated later failure). catConfig is excluded because it fires before
-// any HTTP call is ever made — there is nothing to refund. catUnknown is
-// excluded because it covers genuinely ambiguous failures (including a
-// non-JSON or unparseable 2xx body, i.e. a call that may have succeeded).
+// unrelated later failure). catConfig is excluded for two reasons: most
+// catConfig failures (input validation, the hostname check, the config
+// directory pre-flight) fire before the enroll request is sent, and the rest
+// (the backup-host gate on the enroll response, and a config save that fails
+// after the server accepted the enrollment) fire AFTER the server created the
+// device row, when the slot is genuinely in use and must not be refunded.
+// catUnknown is excluded because it covers genuinely ambiguous failures
+// (including a non-JSON or unparseable 2xx body, i.e. a call that may have
+// succeeded).
 func (c enrollErrCategory) isRefundable4xx() bool {
 	switch c {
 	case catAuth, catNotFound, catRateLimit, catIdentityConflict:
@@ -65,6 +71,7 @@ var (
 	osExit              = os.Exit
 	writeLastErrorFile  = defaultWriteLastErrorFile
 	eventLogError       = eventlog.Error
+	eventLogWarning     = eventlog.Warning
 	enrollLastErrorPath = defaultEnrollLastErrorPath
 )
 
@@ -232,6 +239,20 @@ func classifyEnrollError(err error, serverURL string) (enrollErrCategory, string
 		}
 	}
 
+	// A server certificate the machine does not trust is a network-layer
+	// failure too (same category and exit code), but "check firewall, DNS"
+	// is the wrong advice for it — name the certificate fix instead (#4979).
+	if friendly, ok := certVerificationHint(err, serverURL); ok {
+		return catNetwork, friendly
+	}
+
+	// An ISP gateway filter that hijacks the connection by SNI answers the TLS
+	// handshake with plaintext HTTP. That is a network-layer failure too, but
+	// "check firewall, DNS" sends the admin the wrong way: name the filter.
+	if friendly, ok := filterSignatureHint(err, serverURL); ok {
+		return catNetwork, friendly
+	}
+
 	// Network-layer errors come through as *url.Error wrapping dial/DNS/TLS/timeout.
 	var urlErr *url.Error
 	if errors.As(err, &urlErr) {
@@ -241,4 +262,18 @@ func classifyEnrollError(err error, serverURL string) (enrollErrCategory, string
 	}
 
 	return catUnknown, err.Error()
+}
+
+// filterSignatureHint reports whether err carries the plaintext-HTTP-on-TLS
+// fingerprint of a network security filter (ech.IsFilterSignature) and, if
+// so, the friendly message for it.
+func filterSignatureHint(err error, serverURL string) (string, bool) {
+	if !ech.IsFilterSignature(err) {
+		return "", false
+	}
+	return fmt.Sprintf(
+		"a network security filter answered the TLS handshake to %s with plaintext HTTP instead of the server — "+
+			"this is usually an ISP or home/office gateway security feature (for example an ISP \"advanced security\" or \"security shield\" "+
+			"option) blocking the server's domain. Allow the domain in that feature or turn it off for this network, or install from a different network, then retry",
+		serverURL), true
 }

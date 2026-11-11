@@ -17,6 +17,59 @@ const VALID_UUID = '550e8400-e29b-41d4-a716-446655440000';
 // ============================================
 
 describe('aiPageContextSchema', () => {
+  it('accepts a ticket record', () => {
+    const context = {
+      type: 'record', kind: 'ticket', id: VALID_UUID,
+      orgId: VALID_UUID, label: 'Ticket 123',
+    };
+    expect(aiPageContextSchema.parse(context)).toEqual(context);
+  });
+
+  it.each(['ticket', 'quote', 'invoice', 'contract', 'organization', 'site'])(
+    'accepts a %s record without orgId/label', (kind) => {
+      const context = { type: 'record', kind, id: VALID_UUID };
+      expect(aiPageContextSchema.parse(context)).toEqual(context);
+    },
+  );
+
+  it('rejects an unknown record kind', () => {
+    expect(aiPageContextSchema.safeParse({
+      type: 'record', kind: 'unknown', id: VALID_UUID,
+    }).success).toBe(false);
+  });
+
+  it('rejects extra keys on a record', () => {
+    expect(aiPageContextSchema.safeParse({
+      type: 'record', kind: 'ticket', id: VALID_UUID, data: { subject: 'Untrusted' },
+    }).success).toBe(false);
+  });
+
+  it('rejects a label over 200', () => {
+    expect(aiPageContextSchema.safeParse({
+      type: 'record', kind: 'ticket', id: VALID_UUID, label: 'x'.repeat(201),
+    }).success).toBe(false);
+  });
+
+  it('accepts a label at 200 code points', () => {
+    expect(aiPageContextSchema.safeParse({
+      type: 'record', kind: 'ticket', id: VALID_UUID, label: '😀'.repeat(200),
+    }).success).toBe(true);
+  });
+
+  it.each(['id', 'orgId'])('accepts a non-RFC GUID %s on a record', (field) => {
+    const context = {
+      type: 'record', kind: 'ticket', id: VALID_UUID,
+      [field]: '11111111-2222-3333-4444-555555555555',
+    };
+    expect(aiPageContextSchema.parse(context)).toEqual(context);
+  });
+
+  it.each(['id', 'orgId'])('rejects a non-GUID %s on a record', (field) => {
+    expect(aiPageContextSchema.safeParse({
+      type: 'record', kind: 'ticket', id: VALID_UUID, [field]: 'not-a-guid',
+    }).success).toBe(false);
+  });
+
   it('should accept device context', () => {
     const result = aiPageContextSchema.safeParse({
       type: 'device',
@@ -147,17 +200,28 @@ describe('createAiSessionSchema', () => {
   it('should accept session with all fields', () => {
     const result = createAiSessionSchema.safeParse({
       pageContext: { type: 'dashboard' },
-      model: 'claude-3-opus',
       title: 'Help with server issue',
     });
     expect(result.success).toBe(true);
   });
 
-  it('should reject model over 100 chars', () => {
-    const result = createAiSessionSchema.safeParse({
-      model: 'x'.repeat(101),
-    });
-    expect(result.success).toBe(false);
+  // W03 (#7601): a session names a registry offering + per-call options.
+  it('accepts an offering id and partial options', () => {
+    const result = createAiSessionSchema.safeParse({ offeringId: VALID_UUID, options: { effort: 'high' } });
+    expect(result.success).toBe(true);
+    expect(result.success && result.data).toMatchObject({ offeringId: VALID_UUID, options: { effort: 'high' } });
+  });
+
+  it('rejects a non-uuid offering id', () => {
+    expect(createAiSessionSchema.safeParse({ offeringId: 'off-1' }).success).toBe(false);
+  });
+
+  it.each([
+    [{ effort: 'ludicrous' }],
+    [{ speed: 'warp' }],
+    [{ inferenceGeo: 'eu' }],
+  ])('rejects options %j outside the option schema (strict, no geo)', (options) => {
+    expect(createAiSessionSchema.safeParse({ options }).success).toBe(false);
   });
 
   it('should reject title over 255 chars', () => {

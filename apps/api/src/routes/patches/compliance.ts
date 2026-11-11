@@ -3,7 +3,8 @@ import { zValidator } from '../../lib/validation';
 import { readFile } from 'node:fs/promises';
 import { and, eq, sql, inArray } from 'drizzle-orm';
 import { requirePermission, requireScope } from '../../middleware/auth';
-import { db, runOutsideDbContext, withSystemDbAccessContext } from '../../db';
+import { db } from '../../db';
+import { readOwnPartnerAxisRows } from '../../db/partnerAxisRead';
 import { writeRouteAudit } from '../../services/auditEvents';
 import { enqueuePatchComplianceReport } from '../../jobs/patchComplianceReportWorker';
 import { PERMISSIONS, type UserPermissions } from '../../services/permissions';
@@ -17,6 +18,13 @@ import {
   OUTSTANDING_DEVICE_PATCH_STATUSES
 } from '../../db/schema';
 import { complianceSchema, complianceReportSchema } from './schemas';
+import {
+  buildComplianceDeviceRows,
+  complianceDeviceListFields,
+  type ComplianceDeviceDetail,
+  type NeedingDevice,
+} from './complianceDevices';
+import { EFFECTIVE_PATCH_SEVERITY_SQL } from '../../services/patchSeverityOverlay';
 import { resolvePatchReportOrgId, resolvePartnerIdForOrg } from './helpers';
 import {
   decodeSiteScope,
@@ -25,7 +33,16 @@ import {
   resolveRequestReportAuthority,
   type PersistedSiteScopeColumns,
 } from '../../services/siteScope';
+import { loadFailedInstallPairs } from '../../services/patchInstallFailures';
+import { isPatchReportPastRetention } from '../../services/patchReportFiles';
 
+import { techFacingDeviceConditions } from '../../services/deviceStats';
+import { compliancePercentWithImageTerm } from '@breeze/shared';
+import {
+  containerImageComplianceTerms,
+  imageTermAppliesToView,
+  sumContainerImageTerms,
+} from '../../services/workloads/imageCompliance';
 export const complianceRoutes = new Hono();
 
 // A device_patches row that still needs installing. 'missing' is a stale
@@ -33,6 +50,20 @@ export const complianceRoutes = new Hono();
 const isOutstanding = inArray(devicePatches.status, [...OUTSTANDING_DEVICE_PATCH_STATUSES]);
 const requireReportRead = requirePermission(PERMISSIONS.REPORTS_READ.resource, PERMISSIONS.REPORTS_READ.action);
 const requireReportExport = requirePermission(PERMISSIONS.REPORTS_EXPORT.resource, PERMISSIONS.REPORTS_EXPORT.action);
+
+/**
+ * A report whose file the retention job removed, or a completed report already
+ * past PATCH_REPORT_RETENTION_DAYS whose file the next daily run will remove.
+ * Both read as expired so a download is never served past the window.
+ */
+function isReportExpired(report: {
+  status: string;
+  completedAt: Date | null;
+  createdAt: Date | null;
+}): boolean {
+  return report.status === 'expired'
+    || (report.status === 'completed' && isPatchReportPastRetention(report));
+}
 
 // GET /patches/compliance - Get compliance summary
 complianceRoutes.get(
@@ -74,9 +105,10 @@ complianceRoutes.get(
     }
 
     // Get devices scoped to org (or all accessible orgs for partner/system).
-    // Ephemeral Quick Support devices stay inside accessibleOrgIds for RLS by
-    // design, so exclude them from the patch-compliance population explicitly.
-    const deviceConditions = [eq(devices.isEphemeral, false)];
+    // Same population as the device KPIs (#9611): decommissioned, ephemeral
+    // Quick Support (inside accessibleOrgIds for RLS by design) and parked
+    // devices are excluded, so the card's "N of M devices" matches Total Devices.
+    const deviceConditions = techFacingDeviceConditions();
     const perms = c.get('permissions') as UserPermissions | undefined;
     if (effectiveOrgId) {
       deviceConditions.push(eq(devices.orgId, effectiveOrgId));
@@ -99,15 +131,28 @@ complianceRoutes.get(
             criticalSummary: { total: 0, patched: 0, pending: 0 },
             importantSummary: { total: 0, patched: 0, pending: 0 },
             unratedSummary: { total: 0, patched: 0, pending: 0 },
-            devicesNeedingPatches: []
+            devicesNeedingPatches: [],
+            ...complianceDeviceListFields([], 0, query)
           }
         });
       }
       deviceConditions.push(inArray(devices.siteId, perms.allowedSiteIds));
     }
 
-    const orgDevices = await db
-      .select({ id: devices.id })
+    // The counted population doubles as the device list source (#9791 C), so
+    // the row columns the Patches page renders are selected here. orgId is
+    // load-bearing: the page derives bulk-action confirmation scope from it.
+    const orgDevices: ComplianceDeviceDetail[] = await db
+      .select({
+        id: devices.id,
+        hostname: devices.hostname,
+        displayName: devices.displayName,
+        osType: devices.osType,
+        lastSeenAt: devices.lastSeenAt,
+        status: devices.status,
+        orgId: devices.orgId,
+        pendingReboot: devices.pendingReboot
+      })
       .from(devices)
       .where(deviceConditions.length > 0 ? and(...deviceConditions) : undefined);
 
@@ -123,7 +168,8 @@ complianceRoutes.get(
           criticalSummary: { total: 0, patched: 0, pending: 0 },
           importantSummary: { total: 0, patched: 0, pending: 0 },
           unratedSummary: { total: 0, patched: 0, pending: 0 },
-          devicesNeedingPatches: []
+          devicesNeedingPatches: [],
+          ...complianceDeviceListFields([], 0, query)
         }
       });
     }
@@ -132,31 +178,32 @@ complianceRoutes.get(
     // Approvals are partner-scoped; use effectivePartnerId resolved above.
     let ringPatchScope: string[] | null = null;
     if (query.ringId && effectivePartnerId) {
-      // patch_approvals is partner-axis RLS; org-scoped callers get 0 rows in
-      // request context (accessiblePartnerIds=[]). Partner is SERVER-DERIVED
-      // from the ring's partnerId (already access-checked above).
-      const ringApprovedPatches = await runOutsideDbContext(() =>
-        withSystemDbAccessContext(() =>
-          db
-            .select({ patchId: patchApprovals.patchId })
-            .from(patchApprovals)
-            .where(
-              and(
-                eq(patchApprovals.partnerId, effectivePartnerId!),
-                eq(patchApprovals.ringId, query.ringId!),
-                eq(patchApprovals.status, 'approved')
-              )
+      // patch_approvals is partner-axis RLS with an own-partner SELECT branch
+      // (#7647), read on the request's own connection when the ambient context
+      // covers the partner (#7663). Partner is SERVER-DERIVED from the ring's
+      // partnerId (already access-checked above).
+      const ringPartnerId = effectivePartnerId;
+      const ringApprovedPatches = await readOwnPartnerAxisRows(ringPartnerId, () =>
+        db
+          .select({ patchId: patchApprovals.patchId })
+          .from(patchApprovals)
+          .where(
+            and(
+              eq(patchApprovals.partnerId, ringPartnerId),
+              eq(patchApprovals.ringId, query.ringId!),
+              eq(patchApprovals.status, 'approved')
             )
-        )
+          )
       );
       ringPatchScope = ringApprovedPatches.map(a => a.patchId);
     }
 
-    // Pre-fetch approved patch IDs in system context when we have a known partner.
-    // patch_approvals is partner-axis RLS; org-scoped callers cannot read it in
-    // request context (accessiblePartnerIds=[]). The partner is SERVER-DERIVED
-    // from the org/ring (already access-checked), so reading their approvals in
-    // system context does not leak cross-partner data.
+    // Pre-fetch approved patch IDs when we have a known partner. patch_approvals
+    // is partner-axis RLS with an own-partner SELECT branch (#7647), so
+    // readOwnPartnerAxisRows reads it on the request's own connection when the
+    // ambient context covers the partner and only falls back to the system
+    // escape otherwise (#7663). The partner is SERVER-DERIVED from the org/ring
+    // (already access-checked) and the query stays pinned to it.
     // For the system-wide case (effectivePartnerId=null, no ringId, no orgId),
     // we fall back to the correlated SQL subquery which resolves per-device partner.
     let preApprovedPatchIds: Set<string> | null = null;
@@ -176,13 +223,11 @@ complianceRoutes.get(
         if (query.ringId) {
           approvalConditions.push(eq(patchApprovals.ringId, query.ringId));
         }
-        const approvedRows = await runOutsideDbContext(() =>
-          withSystemDbAccessContext(() =>
-            db
-              .select({ patchId: patchApprovals.patchId })
-              .from(patchApprovals)
-              .where(and(...approvalConditions))
-          )
+        const approvedRows = await readOwnPartnerAxisRows(effectivePartnerId, () =>
+          db
+            .select({ patchId: patchApprovals.patchId })
+            .from(patchApprovals)
+            .where(and(...approvalConditions))
         );
         preApprovedPatchIds = new Set(approvedRows.map(r => r.patchId));
       } else {
@@ -204,7 +249,12 @@ complianceRoutes.get(
             importantSummary: { total: 0, patched: 0, pending: 0 },
             unratedSummary: { total: 0, patched: 0, pending: 0 },
             devicesNeedingPatches: [],
-            ringId: query.ringId ?? null
+            ringId: query.ringId ?? null,
+            ...complianceDeviceListFields(
+              buildComplianceDeviceRows(orgDevices, new Map()),
+              deviceIds.length,
+              query
+            )
           }
         });
       }
@@ -214,7 +264,11 @@ complianceRoutes.get(
       complianceConditions.push(eq(patches.source, query.source));
     }
     if (query.severity) {
-      complianceConditions.push(eq(patches.severity, query.severity));
+      // Effective severity: the shared, trusted classification when known,
+      // else this device's own reported severity — see
+      // services/patchSeverityOverlay.ts. Rows here are already scoped to
+      // deviceIds (this request's org/partner), so this stays tenant-safe.
+      complianceConditions.push(sql`${EFFECTIVE_PATCH_SEVERITY_SQL} = ${query.severity}`);
     }
 
     const approvalRingScope = query.ringId
@@ -269,10 +323,31 @@ complianceRoutes.get(
     // not over summary.total — total includes stale 'missing' tombstones and
     // 'skipped' rows, which would otherwise deflate the percentage. This matches
     // the device-detail view (routes/devices/patches.ts: installed / (pending + installed)).
+    //
+    // W06 (#8195): container images fold in as items — a stale image is a
+    // pending item, a current image an installed item, unknowns stay out.
+    // Severity-, source- and ring-filtered views are about patches with those
+    // properties, which an image does not have, so they exclude the term.
+    const imageTermsByDevice = imageTermAppliesToView(query)
+      ? await containerImageComplianceTerms({ deviceIds })
+      : new Map<string, { stale: number; current: number; unknown: number }>();
+    const imageTerms = sumContainerImageTerms(imageTermsByDevice.values());
     const relevantTotal = summary.installed + summary.pending;
-    const compliancePercent = relevantTotal > 0
-      ? Math.round((summary.installed / relevantTotal) * 100)
-      : 100;
+    const compliancePercent = compliancePercentWithImageTerm(summary.installed, relevantTotal, imageTerms);
+
+    // #7214: an outstanding patch whose latest install attempt failed is a failed
+    // install, not "pending approval". Split it out of the approval buckets so
+    // approved + unapproved + failed partition missingCount.
+    const failedPairs = await loadFailedInstallPairs(deviceIds);
+    const isFailedInstall = failedPairs.length > 0
+      // One jsonb bind parameter regardless of pair count (a tuple list costs
+      // 2 binds per pair, which overflows Postgres' 65,535 limit on big fleets).
+      ? sql`(${devicePatches.deviceId}, ${devicePatches.patchId}) in (
+          select fp.d, fp.p
+          from jsonb_to_recordset(${JSON.stringify(failedPairs.map(p => ({ d: p.deviceId, p: p.patchId })))}::jsonb)
+            as fp(d uuid, p uuid)
+        )`
+      : sql`false`;
 
     // Per-device patch breakdown for "devices needing patches" table
     const deviceBreakdown = await db
@@ -282,22 +357,23 @@ complianceRoutes.get(
         osType: devices.osType,
         lastSeenAt: devices.lastSeenAt,
         missingCount: sql<number>`count(*) filter (where ${isOutstanding})`,
+        failedMissing: sql<number>`count(*) filter (where ${isOutstanding} and ${isFailedInstall})`,
         approvedMissing: preApprovedPatchIds !== null
-          ? sql<number>`count(*) filter (where ${isOutstanding} and ${
+          ? sql<number>`count(*) filter (where ${isOutstanding} and not ${isFailedInstall} and ${
               preApprovedPatchIds.size > 0
                 ? inArray(devicePatches.patchId, [...preApprovedPatchIds])
                 : sql`false`
             })`
-          : sql<number>`count(*) filter (where ${isOutstanding} and ${isApprovedForInstall})`,
+          : sql<number>`count(*) filter (where ${isOutstanding} and not ${isFailedInstall} and ${isApprovedForInstall})`,
         unapprovedMissing: preApprovedPatchIds !== null
-          ? sql<number>`count(*) filter (where ${isOutstanding} and ${
+          ? sql<number>`count(*) filter (where ${isOutstanding} and not ${isFailedInstall} and ${
               preApprovedPatchIds.size > 0
                 ? sql`not ${inArray(devicePatches.patchId, [...preApprovedPatchIds])}`
                 : sql`true`
             })`
-          : sql<number>`count(*) filter (where ${isOutstanding} and not ${isApprovedForInstall})`,
-        criticalCount: sql<number>`count(*) filter (where ${isOutstanding} and ${patches.severity} = 'critical')`,
-        importantCount: sql<number>`count(*) filter (where ${isOutstanding} and ${patches.severity} = 'important')`,
+          : sql<number>`count(*) filter (where ${isOutstanding} and not ${isFailedInstall} and not ${isApprovedForInstall})`,
+        criticalCount: sql<number>`count(*) filter (where ${isOutstanding} and ${EFFECTIVE_PATCH_SEVERITY_SQL} = 'critical')`,
+        importantCount: sql<number>`count(*) filter (where ${isOutstanding} and ${EFFECTIVE_PATCH_SEVERITY_SQL} = 'important')`,
         osMissing: sql<number>`count(*) filter (where ${isOutstanding} and ${patches.source} in ('microsoft', 'apple', 'linux'))`,
         thirdPartyMissing: sql<number>`count(*) filter (where ${isOutstanding} and ${patches.source} in ('third_party', 'custom'))`,
         lastInstalledAt: sql<string | null>`max(case when ${devicePatches.status} = 'installed' and ${devicePatches.installedAt} is not null then ${devicePatches.installedAt}::timestamptz::text end)`,
@@ -320,15 +396,20 @@ complianceRoutes.get(
       .where(and(...complianceConditions))
       .groupBy(devicePatches.deviceId, devices.hostname, devices.osType, devices.lastSeenAt)
       .having(sql`count(*) filter (where ${isOutstanding}) > 0`)
-      .orderBy(sql`count(*) filter (where ${isOutstanding} and ${patches.severity} = 'critical') desc`);
+      .orderBy(sql`count(*) filter (where ${isOutstanding} and ${EFFECTIVE_PATCH_SEVERITY_SQL} = 'critical') desc`);
 
-    const devicesNeedingPatches = deviceBreakdown.map(row => ({
+    const imageFields = (deviceId: string) => {
+      const terms = imageTermsByDevice.get(deviceId);
+      return terms ? { staleImages: terms.stale, unknownImages: terms.unknown } : {};
+    };
+    const devicesNeedingPatches: NeedingDevice[] = deviceBreakdown.map(row => ({
       id: row.deviceId,
       name: row.hostname,
       os: row.osType,
       missingCount: Number(row.missingCount),
       approvedMissing: Number(row.approvedMissing),
       unapprovedMissing: Number(row.unapprovedMissing),
+      failedMissing: Number(row.failedMissing),
       criticalCount: Number(row.criticalCount),
       importantCount: Number(row.importantCount),
       osMissing: Number(row.osMissing),
@@ -336,22 +417,56 @@ complianceRoutes.get(
       lastInstalledAt: row.lastInstalledAt ?? undefined,
       pendingReboot: row.pendingReboot ?? false,
       lastScannedAt: row.lastScannedAt ?? undefined,
-      lastSeen: row.lastSeenAt?.toISOString() ?? undefined
+      lastSeen: row.lastSeenAt?.toISOString() ?? undefined,
+      ...imageFields(row.deviceId)
     }));
+
+    // W06: a device with no outstanding OS patch but a stale image still
+    // needs an update, so it is listed (all patch counts zero) and is not
+    // compliant: totalDevices - compliantDevices === devicesNeedingPatches.length.
+    const listed = new Set(devicesNeedingPatches.map(d => d.id));
+    const staleOnlyIds = [...imageTermsByDevice.entries()]
+      .filter(([id, terms]) => terms.stale > 0 && !listed.has(id))
+      .map(([id]) => id);
+    if (staleOnlyIds.length > 0) {
+      // Already loaded with the counted population above; no second query.
+      const staleOnlySet = new Set(staleOnlyIds);
+      const staleOnly = orgDevices.filter(d => staleOnlySet.has(d.id));
+      for (const d of staleOnly.sort((a, b) => (a.hostname ?? '').localeCompare(b.hostname ?? ''))) {
+        devicesNeedingPatches.push({
+          id: d.id,
+          name: d.hostname ?? '',
+          os: d.osType ?? 'unknown',
+          missingCount: 0,
+          approvedMissing: 0,
+          unapprovedMissing: 0,
+          failedMissing: 0,
+          criticalCount: 0,
+          importantCount: 0,
+          osMissing: 0,
+          thirdPartyMissing: 0,
+          lastInstalledAt: undefined,
+          pendingReboot: false,
+          lastScannedAt: undefined,
+          lastSeen: d.lastSeenAt?.toISOString() ?? undefined,
+          ...imageFields(d.id)
+        });
+      }
+    }
 
     // Severity-level summaries. "total" is the RELEVANT set (installed +
     // outstanding) for that severity, NOT count(*) over all statuses — stale
     // 'missing' tombstones must not be counted as pending here either.
     const severityCounts = await db
       .select({
-        severity: patches.severity,
+        severity: EFFECTIVE_PATCH_SEVERITY_SQL,
         installed: sql<number>`count(*) filter (where ${devicePatches.status} = 'installed')`,
         outstanding: sql<number>`count(*) filter (where ${isOutstanding})`
       })
       .from(devicePatches)
       .innerJoin(patches, eq(devicePatches.patchId, patches.id))
       .where(and(...complianceConditions))
-      .groupBy(patches.severity);
+      .groupBy(EFFECTIVE_PATCH_SEVERITY_SQL);
 
     const severityMap: Record<string, { total: number; patched: number; pending: number }> = {};
     for (const row of severityCounts) {
@@ -390,7 +505,14 @@ complianceRoutes.get(
           source: query.source ?? null,
           severity: query.severity ?? null,
           ringId: query.ringId ?? null
-        }
+        },
+        ...(imageTerms ? { containerImages: imageTerms } : {}),
+        // #9791 C: device %, per-status device counts and the paginated list.
+        ...complianceDeviceListFields(
+          buildComplianceDeviceRows(orgDevices, new Map(devicesNeedingPatches.map(d => [d.id, d]))),
+          compliantDeviceCount,
+          query
+        )
       }
     });
   }
@@ -529,10 +651,11 @@ complianceRoutes.get(
       return c.json({ error: 'Report not found' }, 404);
     }
 
+    const expired = isReportExpired(report);
     return c.json({
       data: {
         id: report.id,
-        status: report.status,
+        status: expired ? 'expired' : report.status,
         format: report.format,
         source: report.source,
         severity: report.severity,
@@ -542,7 +665,7 @@ complianceRoutes.get(
         startedAt: report.startedAt,
         completedAt: report.completedAt,
         createdAt: report.createdAt,
-        downloadUrl: report.outputPath
+        downloadUrl: report.outputPath && !expired
           ? `/api/v1/patches/compliance/report/${report.id}/download`
           : null
       }
@@ -566,6 +689,8 @@ complianceRoutes.get(
         status: patchComplianceReports.status,
         format: patchComplianceReports.format,
         outputPath: patchComplianceReports.outputPath,
+        completedAt: patchComplianceReports.completedAt,
+        createdAt: patchComplianceReports.createdAt,
         executionScopeVersion: patchComplianceReports.executionScopeVersion,
         executionScopeKind: patchComplianceReports.executionScopeKind,
         executionScopeSiteIds: patchComplianceReports.executionScopeSiteIds,
@@ -602,6 +727,10 @@ complianceRoutes.get(
       }
     } catch {
       return c.json({ error: 'Report not found' }, 404);
+    }
+
+    if (isReportExpired(report)) {
+      return c.json({ error: 'This report has expired. Generate a new report to download it.' }, 410);
     }
 
     if (report.status !== 'completed') {

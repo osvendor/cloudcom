@@ -1,3 +1,4 @@
+import type { MouseEvent } from 'react';
 import { ChevronRight } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 // Initializes the shared i18next singleton. Islands hydrate independently, so
@@ -8,6 +9,20 @@ import '../../lib/i18n';
 interface BreadcrumbItem {
   label: string;
   href?: string;
+  /** Hover text, e.g. the hostname behind a device's display name. */
+  title?: string;
+  /** Extra context for assistive tech (rendered as `aria-description`). */
+  description?: string;
+  /**
+   * Handles a plain left click instead of following `href` (e.g. soft-navigate
+   * through the router). Modifier/middle clicks still open
+   * `href` normally, so the crumb stays a real link.
+   */
+  onClick?: () => void;
+}
+
+function isPlainLeftClick(e: MouseEvent<HTMLAnchorElement>): boolean {
+  return e.button === 0 && !e.metaKey && !e.ctrlKey && !e.shiftKey && !e.altKey;
 }
 
 interface BreadcrumbsProps {
@@ -19,22 +34,41 @@ export default function Breadcrumbs({ items }: BreadcrumbsProps) {
   if (items.length <= 1) return null;
 
   return (
-    <nav aria-label={t('layout.breadcrumb')} className="mb-4">
-      <ol className="flex items-center gap-1 text-sm text-muted-foreground">
+    <nav aria-label={t('layout.breadcrumb')} className="mb-4 min-w-0">
+      <ol className="flex min-w-0 items-center gap-1 text-sm text-muted-foreground">
         {items.map((item, index) => (
-          <li key={index} className="flex items-center gap-1">
+          <li
+            key={index}
+            className={`flex min-w-0 items-center gap-1 ${
+              index === items.length - 1 ? 'max-w-[70%] shrink-0' : ''
+            }`}
+          >
             {index > 0 && (
               <ChevronRight className="h-3.5 w-3.5 text-muted-foreground/50 shrink-0" />
             )}
             {item.href && index < items.length - 1 ? (
               <a
                 href={item.href}
-                className="hover:text-foreground transition-colors"
+                title={item.title}
+                aria-description={item.description}
+                onClick={
+                  item.onClick
+                    ? (e) => {
+                        if (!isPlainLeftClick(e)) return;
+                        e.preventDefault();
+                        item.onClick?.();
+                      }
+                    : undefined
+                }
+                className="truncate transition-colors hover:text-foreground max-md:min-h-[32px] max-md:leading-8"
               >
                 {item.label}
               </a>
             ) : (
-              <span className={index === items.length - 1 ? 'text-foreground font-medium truncate max-w-[200px]' : ''}>
+              <span
+                title={item.title}
+                className={index === items.length - 1 ? 'truncate text-foreground font-medium max-w-[200px]' : 'truncate'}
+              >
                 {item.label}
               </span>
             )}

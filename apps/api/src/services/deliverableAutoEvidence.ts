@@ -41,7 +41,9 @@
  * nightly sweep does not spam the ticket.
  */
 import { and, eq } from 'drizzle-orm';
-import { db, runOutsideDbContext, withSystemDbAccessContext } from '../db';
+import { safeErrorMessage } from './aiModels/safeDbError';
+import { reportRunOwnerColumns } from './reportRunOwner';
+import { db, runOutsideDbContext, withSystemDbAccessContext, withDbTransaction } from '../db';
 import { reports, reportRuns } from '../db/schema/reports';
 import { serviceDeliverableEvidence, serviceDeliverableOccurrences } from '../db/schema/serviceDeliverables';
 import { ticketComments } from '../db/schema/portal';
@@ -63,6 +65,8 @@ import {
   type PersistedSiteScopeColumns, type ReportExecutionAuthority,
 } from './siteScope';
 import type { SweepDeliverable } from './serviceDeliverableService';
+import { lockTicketForWrite } from './ticketRowLock';
+import { assertTicketNotMerged } from './ticketMerge/errors';
 
 export const AUTO_EVIDENCE_TICKET_NOTE = 'Report attached, review and resolve';
 
@@ -182,6 +186,8 @@ export async function generateAutoEvidenceForOccurrence(args: AutoEvidenceOccurr
    * i.e. the first refusal). `not_due` / `already_attached` never get here.
    */
   const recordRefusal = async (reason: AutoEvidenceRefusal): Promise<AutoEvidenceOutcome> => {
+    // #8972 W0: the ticket before the occurrence and the note.
+    if (args.ticketId) assertTicketNotMerged(await lockTicketForWrite(db, args.ticketId));
     await db.update(serviceDeliverableOccurrences)
       .set({ autoEvidenceAttemptedAt: new Date(), autoEvidenceRefusal: reason })
       .where(eq(serviceDeliverableOccurrences.id, args.occurrenceId));
@@ -221,6 +227,8 @@ export async function generateAutoEvidenceForOccurrence(args: AutoEvidenceOccurr
     });
     if (previous) result.previous = previous;
 
+    // #8972 W0: the ticket before the occurrence, the run and the note.
+    if (args.ticketId) assertTicketNotMerged(await lockTicketForWrite(db, args.ticketId));
     // A recovered deliverable clears its refusal state.
     await db.update(serviceDeliverableOccurrences)
       .set({ autoEvidenceAttemptedAt: new Date(), autoEvidenceRefusal: null })
@@ -235,9 +243,9 @@ export async function generateAutoEvidenceForOccurrence(args: AutoEvidenceOccurr
 
     await db.insert(serviceDeliverableEvidence).values({
         orgId: args.orgId, occurrenceId: args.occurrenceId, kind: 'report_run',
-        // report_id proves org ownership: report_runs has no org_id of its own,
-        // so the composite FK (report_id, org_id) -> reports(id, org_id) is what
-        // keeps a foreign run out.
+        // report_id proves org ownership: the composite FK (report_id, org_id)
+        // -> reports(id, org_id) keeps a foreign run out (it predates
+        // report_runs.org_id, #4247, and still guards the evidence row).
         reportId: definition.id, reportRunId: runId, createdByUserId: null,
       }).returning({ id: serviceDeliverableEvidence.id });
 
@@ -260,6 +268,7 @@ export async function generateAutoEvidenceForOccurrence(args: AutoEvidenceOccurr
   ): Promise<AutoEvidenceOutcome> => {
     const [run] = await db.insert(reportRuns).values({
         reportId: definition.id, status: 'running', startedAt: new Date(),
+        ...reportRunOwnerColumns(definition),
         // The sweep requested this run; no human did.
         requestedByKind: 'system', requestedByUserId: null, requestedByPortalUserId: null,
         ...scopeValues,
@@ -270,17 +279,18 @@ export async function generateAutoEvidenceForOccurrence(args: AutoEvidenceOccurr
     try {
       // Savepoint: a Postgres error inside the generator must not poison this
       // occurrence's transaction, or the failed-run stamp below could not run.
-      result = await db.transaction(() => generate());
+      result = await withDbTransaction(() => generate());
     } catch (err) {
       // Log the generator's own failure BEFORE the bookkeeping writes: if one of
       // those throws, the whole occurrence transaction rolls back and only the
       // secondary error would otherwise reach the caller and Sentry.
       console.error('[deliverables] auto-evidence generation failed', `occurrenceId=${args.occurrenceId}`,
-        `reportId=${definition.id}`, err instanceof Error ? err.message : String(err));
+        `reportId=${definition.id}`, safeErrorMessage(err));
       const outcome = await recordRefusal('generation_failed');
       await db.update(reportRuns).set({
           status: 'failed', completedAt: new Date(),
-          errorMessage: err instanceof Error ? err.message : 'Failed to generate report',
+          // Stored on the run: never the failed query's values.
+          errorMessage: err instanceof Error ? safeErrorMessage(err) : 'Failed to generate report',
         })
         .where(eq(reportRuns.id, run.id));
       return outcome;

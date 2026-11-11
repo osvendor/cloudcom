@@ -37,9 +37,27 @@ export async function deviceInSiteScope(
 }
 
 /**
+ * By-id site gate for an ALERT (M3-D6). The exact-device axis binds the
+ * alert's device exactly as {@link deviceInSiteScope}; the site axis follows
+ * the alert's OWNING site — its topology site when it is a site-owned topology
+ * policy alert (whose origin device is provenance only and may since have
+ * moved site or org), else its device's current site.
+ */
+export async function alertInSiteScope(
+  auth: Pick<AuthContext, 'allowedSiteIds' | 'allowedDeviceIds'>,
+  alert: { deviceId: string | null; topologySiteId: string | null },
+): Promise<boolean> {
+  if (auth.allowedDeviceIds && (!alert.deviceId || !auth.allowedDeviceIds.includes(alert.deviceId))) return false;
+  if (alert.topologySiteId) {
+    return auth.allowedSiteIds ? siteAccessCheck(auth.allowedSiteIds)(alert.topologySiteId) : true;
+  }
+  return alert.deviceId ? deviceInSiteScope(auth, alert.deviceId) : auth.allowedSiteIds === undefined;
+}
+
+/**
  * Site-axis filter for a batch of alert-like rows. Mirrors the alert list
- * narrowing (`alerts.ts` GET /): a site-restricted caller sees deviceless
- * (org-wide) alerts plus alerts whose device is in their allowed sites; alerts
+ * narrowing (`alerts.ts` GET /): a site-restricted caller sees alerts owned by
+ * their allowed topology sites or devices in their allowed sites; alerts
  * on out-of-site devices (or devices that no longer exist) are dropped.
  * Unrestricted callers (partner/system scope, or org users with no site
  * restriction) get the input back unchanged.
@@ -49,14 +67,19 @@ export async function deviceInSiteScope(
  * bulk endpoint, and so it evaluates the site axis (which RLS does NOT enforce)
  * uniformly across both call sites.
  */
-export async function filterAlertsBySiteScope<T extends { deviceId: string | null }>(
+export async function filterAlertsBySiteScope<T extends { deviceId: string | null; topologySiteId: string | null }>(
   auth: Pick<AuthContext, 'allowedSiteIds'> & { orgId?: string | null },
   rows: T[],
 ): Promise<T[]> {
   const allowed = auth.allowedSiteIds;
   if (!allowed) return rows;
 
-  const deviceIds = [...new Set(rows.map((row) => row.deviceId).filter((id): id is string => Boolean(id)))];
+  // A site-owned topology alert (M3-D6) is gated by its topology site alone;
+  // its origin device is provenance and is never looked up for the site axis.
+  const deviceIds = [...new Set(rows
+    .filter((row) => !row.topologySiteId)
+    .map((row) => row.deviceId)
+    .filter((id): id is string => Boolean(id)))];
   const deviceSites = new Map<string, string | null>();
   if (deviceIds.length > 0) {
     // Belt-and-suspenders org scope on the device lookup (mirrors alerts.ts:186):
@@ -77,9 +100,9 @@ export async function filterAlertsBySiteScope<T extends { deviceId: string | nul
 
   const allowSite = siteAccessCheck(allowed);
   return rows.filter((row) => {
-    // Deviceless (org-wide) alerts are not site-bound — keep them visible,
-    // matching the GET /alerts narrowing.
-    if (!row.deviceId) return true;
+    if (row.topologySiteId) return allowSite(row.topologySiteId);
+    // Org-level alerts have no site ownership and require unrestricted access.
+    if (!row.deviceId) return false;
     return allowSite(deviceSites.get(row.deviceId) ?? null);
   });
 }
@@ -104,4 +127,22 @@ export function ticketSiteScopeCondition(auth: AuthContext): SQL | undefined {
       db.select({ id: devices.id }).from(devices).where(inArray(devices.siteId, allowed))
     )
   )!;
+}
+
+/**
+ * The visibility getScopedTicketOr404 applies to ONE ticket, as a list
+ * condition on the other end of a ticket link: the site axis, plus the
+ * exact-device axis of a device-bound AI run (allowedDeviceIds), which
+ * {@link ticketSiteScopeCondition} does not cover. Deviceless tickets stay
+ * visible on both axes, as there. Shared by GET /tickets/:id/links and the
+ * manage_tickets `list_links` action so the two cannot drift.
+ */
+export function ticketCounterpartScopeCondition(auth: AuthContext): SQL | undefined {
+  const site = ticketSiteScopeCondition(auth);
+  const allowed = auth.allowedDeviceIds;
+  if (!allowed) return site;
+  const device = allowed.length === 0
+    ? isNull(tickets.deviceId)
+    : or(isNull(tickets.deviceId), inArray(tickets.deviceId, allowed))!;
+  return site ? and(site, device) : device;
 }

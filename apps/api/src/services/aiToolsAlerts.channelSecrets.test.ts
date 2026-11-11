@@ -25,14 +25,18 @@ const mocks = vi.hoisted(() => ({
   deviceIdSiteDenied: vi.fn().mockReturnValue(false),
 }));
 
-vi.mock('../db', () => ({
-  db: {
+vi.mock('../db', () => {
+  const dbMock = {
     insert: mocks.dbInsert,
     select: mocks.dbSelect,
     update: mocks.dbUpdate,
     delete: mocks.dbDelete,
-  },
-}));
+    // Channel row + config row (#6379) commit together inside db.transaction.
+    // The mocked insert/update above already stand in for the tx executor.
+    transaction: (fn: (tx: unknown) => unknown) => fn(dbMock),
+  };
+  return { db: dbMock };
+});
 
 vi.mock('./notificationChannelSecrets', () => ({
   encryptNotificationChannelConfig: mocks.encryptNotificationChannelConfig,
@@ -155,7 +159,13 @@ describe('manage_notification_channels — create action', () => {
     const insertReturningMock = vi.fn().mockResolvedValue([
       { id: 'chan-1', name: 'My Slack', type: 'slack' },
     ]);
-    const insertValuesMock = vi.fn(() => ({ returning: insertReturningMock }));
+    // Serves both db.insert() calls (#6379): the channel row insert chains
+    // .returning(), writeNotificationChannelConfig's insert chains
+    // .onConflictDoUpdate() instead.
+    const insertValuesMock = vi.fn(() => ({
+      returning: insertReturningMock,
+      onConflictDoUpdate: vi.fn().mockResolvedValue(undefined),
+    }));
     mocks.dbInsert.mockReturnValue({ values: insertValuesMock });
 
     const result = JSON.parse(
@@ -171,8 +181,14 @@ describe('manage_notification_channels — create action', () => {
     // encrypt was called before insert
     expect(mocks.encryptNotificationChannelConfig).toHaveBeenCalledWith('slack', SLACK_CONFIG);
 
-    // the value passed to db.insert().values() must use the ENCRYPTED config
-    const insertedValues = (insertValuesMock.mock.calls[0] as any)[0] as Record<string, unknown>;
+    // the channel row insert (call 0) no longer carries config (#6379)
+    const channelInsertValues = (insertValuesMock.mock.calls[0] as any)[0] as Record<string, unknown>;
+    expect(channelInsertValues.config).toBeUndefined();
+
+    // the value passed to writeNotificationChannelConfig's insert (call 1)
+    // must use the ENCRYPTED config
+    const insertedValues = (insertValuesMock.mock.calls[1] as any)[0] as Record<string, unknown>;
+    expect(insertedValues.channelId).toBe('chan-1');
     expect(insertedValues.config).toEqual(ENCRYPTED_CONFIG);
     // plaintext secret must NOT be stored
     expect(JSON.stringify(insertedValues.config)).not.toContain(PLAINTEXT_WEBHOOK_URL);
@@ -198,6 +214,66 @@ describe('manage_notification_channels — create action', () => {
   });
 });
 
+// ---- tests: write-org resolution (#6667) -----------------------------------
+
+describe('manage_notification_channels — create write-org resolution (#6667)', () => {
+  let handler: AiTool['handler'];
+
+  // A partner tech reachable to TWO orgs with no anchored auth.orgId — the
+  // shape that silently picked accessibleOrgIds[0] before the fix.
+  function multiOrgAuth(): AuthContext {
+    return {
+      user: { id: 'u1', email: 'tech@test.com', name: 'Tech', isPlatformAdmin: false },
+      token: {} as never,
+      partnerId: 'partner-1',
+      orgId: null,
+      scope: 'partner',
+      accessibleOrgIds: ['org-1', 'org-2'],
+      orgCondition: () => undefined,
+      canAccessOrg: (id: string) => id === 'org-1' || id === 'org-2',
+    } as unknown as AuthContext;
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    handler = getHandler('manage_notification_channels');
+    mocks.validateNotificationChannelConfig.mockReturnValue([]);
+    mocks.encryptNotificationChannelConfig.mockReturnValue(ENCRYPTED_CONFIG);
+  });
+
+  it('refuses with the ambiguous-org error and inserts nothing when orgId is omitted', async () => {
+    const result = JSON.parse(
+      await handler(
+        { action: 'create', name: 'My Slack', type: 'slack', config: SLACK_CONFIG, enabled: true },
+        multiOrgAuth(),
+      ) as string,
+    );
+
+    expect(result.error).toBe('orgId is required: you have access to multiple organizations');
+    expect(mocks.dbInsert).not.toHaveBeenCalled();
+  });
+
+  it('uses the explicit accessible orgId for the insert', async () => {
+    const insertReturningMock = vi.fn().mockResolvedValue([{ id: 'chan-1', name: 'My Slack', type: 'slack' }]);
+    const insertValuesMock = vi.fn(() => ({
+      returning: insertReturningMock,
+      onConflictDoUpdate: vi.fn().mockResolvedValue(undefined),
+    }));
+    mocks.dbInsert.mockReturnValue({ values: insertValuesMock });
+
+    const result = JSON.parse(
+      await handler(
+        { action: 'create', name: 'My Slack', type: 'slack', config: SLACK_CONFIG, enabled: true, orgId: 'org-2' },
+        multiOrgAuth(),
+      ) as string,
+    );
+
+    expect(result.success).toBe(true);
+    const insertedValues = (insertValuesMock.mock.calls[0] as any)[0] as Record<string, unknown>;
+    expect(insertedValues.orgId).toBe('org-2');
+  });
+});
+
 // ---- tests: update ----------------------------------------------------------
 
 describe('manage_notification_channels — update action', () => {
@@ -212,11 +288,20 @@ describe('manage_notification_channels — update action', () => {
     enabled: true,
   };
 
+  // selectNotificationChannelsWithConfig (services/notificationChannelConfig.ts,
+  // #6379) chains .leftJoin().where().orderBy().$dynamic() before the terminal
+  // .limit(1) — not the old bare .from().where().limit(1).
   function mockChannelLookup(channel: unknown | null) {
     mocks.dbSelect.mockReturnValueOnce({
       from: vi.fn(() => ({
-        where: vi.fn(() => ({
-          limit: vi.fn().mockResolvedValue(channel ? [channel] : []),
+        leftJoin: vi.fn(() => ({
+          where: vi.fn(() => ({
+            orderBy: vi.fn(() => ({
+              $dynamic: vi.fn(() => ({
+                limit: vi.fn().mockResolvedValue(channel ? [channel] : []),
+              })),
+            })),
+          })),
         })),
       })),
     });
@@ -228,6 +313,17 @@ describe('manage_notification_channels — update action', () => {
         where: vi.fn().mockResolvedValue(undefined),
       })),
     });
+  }
+
+  // writeNotificationChannelConfig's insert (#6379) — queue this whenever a
+  // test's patch includes `config`, since the update action now writes it via
+  // a separate insert into notification_channel_configs, not db.update().set().
+  // The legacy notification_channels.config column is gone (#7028), so
+  // nothing else is written: the channel row's db.update() is the only update.
+  function mockConfigInsertChain() {
+    const values = vi.fn(() => ({ onConflictDoUpdate: vi.fn().mockResolvedValue(undefined) }));
+    mocks.dbInsert.mockReturnValueOnce({ values });
+    return values;
   }
 
   beforeEach(() => {
@@ -350,6 +446,7 @@ describe('manage_notification_channels — update action', () => {
     mocks.encryptNotificationChannelConfig.mockReturnValueOnce({ encrypted: true });
     mocks.validateNotificationChannelConfig.mockReturnValueOnce([]);
     mockUpdateChain();
+    const configValues = mockConfigInsertChain();
 
     const result = JSON.parse(
       await handler({ action: 'update', channelId: 'chan-1', config: patch }, makeAuth()) as string,
@@ -358,6 +455,12 @@ describe('manage_notification_channels — update action', () => {
     expect(result.success).toBe(true);
     expect(mocks.encryptNotificationChannelConfig).toHaveBeenCalled();
     expect(mocks.dbUpdate).toHaveBeenCalled();
+    // The new config lands in notification_channel_configs (#6379), not in the
+    // notificationChannels row itself.
+    expect(configValues).toHaveBeenCalledWith({ channelId: 'chan-1', config: { encrypted: true } });
+    // ...and nowhere else: the legacy column mirror is gone (#7028), so the
+    // channel row update is the only db.update().
+    expect(mocks.dbUpdate).toHaveBeenCalledTimes(1);
   });
 
   it('rejects a channel type change before any crypto runs (would corrupt the row)', async () => {
@@ -389,8 +492,10 @@ describe('manage_notification_channels — update action', () => {
     mocks.decryptNotificationChannelConfig.mockReturnValue(decryptedForValidation);
     mocks.validateNotificationChannelConfig.mockReturnValue([]);
 
+    // The only db.update() is the channel row (no legacy mirror since #7028).
     const setMock = vi.fn(() => ({ where: vi.fn().mockResolvedValue(undefined) }));
-    mocks.dbUpdate.mockReturnValue({ set: setMock });
+    mocks.dbUpdate.mockReturnValueOnce({ set: setMock });
+    const configValues = mockConfigInsertChain();
 
     const result = JSON.parse(
       await handler(
@@ -412,11 +517,17 @@ describe('manage_notification_channels — update action', () => {
     // validate was called on the decrypted form
     expect(mocks.validateNotificationChannelConfig).toHaveBeenCalledWith('slack', decryptedForValidation);
 
-    // the value passed to db.update().set() must store the ENCRYPTED merged config
+    // notificationChannels.set() must NOT carry config any more — it now goes
+    // through a separate notification_channel_configs insert (#6379).
     const setCallArg = (setMock.mock.calls[0] as any)[0] as Record<string, unknown>;
-    expect(setCallArg.config).toEqual(mergedEncrypted);
+    expect(setCallArg.config).toBeUndefined();
+
+    // the value passed to writeNotificationChannelConfig's insert must store
+    // the ENCRYPTED merged config
+    expect(configValues).toHaveBeenCalledWith({ channelId: 'chan-1', config: mergedEncrypted });
+    expect(mocks.dbUpdate).toHaveBeenCalledTimes(1);
     // plaintext must NOT appear in the persisted value
-    expect(JSON.stringify(setCallArg.config)).not.toContain('NEW_TOKEN');
+    expect(JSON.stringify(mergedEncrypted)).not.toContain('NEW_TOKEN');
 
     expect(result.success).toBe(true);
   });
@@ -435,6 +546,25 @@ describe('manage_notification_channels — update action', () => {
     expect(mocks.encryptNotificationChannelConfig).not.toHaveBeenCalled();
     expect(mocks.validateNotificationChannelConfig).not.toHaveBeenCalled();
     expect(result.success).toBe(true);
+  });
+
+  it('refuses a config update when the channel has no notification_channel_configs row (#6379)', async () => {
+    mockChannelLookup({ ...EXISTING_CHANNEL, config: null });
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const result = JSON.parse(
+        await handler(
+          { action: 'update', channelId: 'chan-1', config: SLACK_CONFIG },
+          makeAuth(),
+        ) as string,
+      );
+
+      expect(result.error).toBe('Notification channel has no stored configuration');
+      expect(mocks.encryptNotificationChannelConfig).not.toHaveBeenCalled();
+      expect(mocks.dbUpdate).not.toHaveBeenCalled();
+    } finally {
+      errorSpy.mockRestore();
+    }
   });
 
   it('returns error when channel not found', async () => {
@@ -475,11 +605,20 @@ describe('manage_notification_channels — partner-wide gating (#2130)', () => {
     enabled: true,
   };
 
+  // selectNotificationChannelsWithConfig (services/notificationChannelConfig.ts,
+  // #6379) chains .leftJoin().where().orderBy().$dynamic() before the terminal
+  // .limit(1) — not the old bare .from().where().limit(1).
   function mockChannelLookup(channel: unknown | null) {
     mocks.dbSelect.mockReturnValueOnce({
       from: vi.fn(() => ({
-        where: vi.fn(() => ({
-          limit: vi.fn().mockResolvedValue(channel ? [channel] : []),
+        leftJoin: vi.fn(() => ({
+          where: vi.fn(() => ({
+            orderBy: vi.fn(() => ({
+              $dynamic: vi.fn(() => ({
+                limit: vi.fn().mockResolvedValue(channel ? [channel] : []),
+              })),
+            })),
+          })),
         })),
       })),
     });
@@ -564,5 +703,39 @@ describe('manage_notification_channels — partner-wide gating (#2130)', () => {
 
     expect(result.success).toBe(true);
     expect(mocks.dbDelete).toHaveBeenCalled();
+  });
+});
+
+// W02-D9 (#6756): `test` stays tier 2 ONLY while it sends nothing. The REST
+// route (routes/alerts/channels.ts POST /:id/test) delivers a real message;
+// this handler is a lookup stub. Making it real must red here and force a
+// reclassification (anything that leaves the tenant cannot be tier 2).
+describe('manage_notification_channels — test sends nothing (W02-D9, #6756)', () => {
+  let handler: AiTool['handler'];
+  beforeEach(() => {
+    vi.clearAllMocks();
+    handler = getHandler('manage_notification_channels');
+  });
+
+  it('a found channel returns a verification result with no outbound call, event or write', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+    mocks.dbSelect.mockReturnValueOnce({
+      from: vi.fn(() => ({
+        where: vi.fn(() => ({
+          limit: vi.fn().mockResolvedValue([{ id: 'chan-1', name: 'Ops Slack', type: 'slack', enabled: true }]),
+        })),
+      })),
+    });
+    const out = JSON.parse(await handler({ action: 'test', channelId: 'chan-1' }, makeAuth()));
+    expect(out.success).toBe(true);
+    expect(out.channel).toMatchObject({ id: 'chan-1', type: 'slack' });
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(mocks.publishEvent).not.toHaveBeenCalled();
+    expect(mocks.dbInsert).not.toHaveBeenCalled();
+    expect(mocks.dbUpdate).not.toHaveBeenCalled();
+    expect(mocks.dbDelete).not.toHaveBeenCalled();
+    // Never even reads the destination secret.
+    expect(mocks.decryptNotificationChannelConfig).not.toHaveBeenCalled();
+    fetchSpy.mockRestore();
   });
 });

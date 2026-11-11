@@ -1,0 +1,463 @@
+/**
+ * Cleanup for brokered backup writes (services/backupStorageWriteSessions.ts),
+ * a repeatable job every 5 minutes. Makes every abort durable and finishes
+ * the reservation lifecycle the database starts:
+ *
+ *  1. Recorded multipart uploads still creating/open/completing whose session
+ *     was revoked, whose job ended, or that outlived any possible session are
+ *     aborted in storage (an upload that no longer exists counts as aborted)
+ *     and marked aborted.
+ *  2. Once per finished prefix (sealing past its horizon, published, or
+ *     abandoned — issued by the server), every multipart upload still open in
+ *     storage under `snapshots/<id>/` is aborted unless it was completed
+ *     through the session. This also catches an upload whose creation
+ *     succeeded in storage but was never recorded.
+ *  3. A sealing reservation whose sealed_until has passed, with no recorded
+ *     upload still open, is published, and its snapshot is handed straight
+ *     to attestation verification (jobs/backupSnapshotAttestationWorker.ts)
+ *     rather than waiting for that worker's next sweep.
+ *  4. A reserved id whose job has ended, whose issued URLs have all expired
+ *     (plus the transfer margin), and with no recorded upload or delete still
+ *     in flight, is abandoned
+ *     (a late result or reconcile for that job may still publish it within
+ *     the adoption window; storage reclaim may remove the prefix once it is
+ *     older than the orphan window).
+ *  5. A delete marker left behind by a call that never finished is cleared
+ *     once the (time-bounded) storage delete can no longer be running.
+ *  6. The sealed connection settings of storage keys replaced more than 30
+ *     days ago are erased (services/backupStorageCredentialHistory.ts): after
+ *     that the old key can only be confirmed as disabled, not checked.
+ * Publication (rule 3) and abandonment (rule 4) also wait for any in-flight
+ * delete.
+ *
+ * The scans and the state writes run in short system contexts; no DB context
+ * is held across a storage call.
+ *
+ * Every storage key is composed from the reservation's recorded key root
+ * (#7081): `object_key` and `snapshots/<id>/` are logical, and their physical
+ * keys come from `physicalKeyFor`. A reservation whose root is missing or
+ * unreadable is skipped, logged and reported — never acted on at the bucket
+ * root (an upload row with no upload id needs no storage call and is not
+ * skipped).
+ */
+import { Queue, Worker } from 'bullmq';
+import { and, eq, inArray, isNotNull, isNull, lt, or, sql } from 'drizzle-orm';
+import { db, withSystemDbAccessContext } from '../db';
+import {
+  backupConfigs,
+  backupJobs,
+  backupSnapshotIdReservations,
+  backupStorageSessionUploads,
+  backupStorageSessions,
+} from '../db/schema';
+import { recordBackupWriteJanitor } from '../services/backupMetrics';
+import { keyRootId, logicalKeyFrom, physicalKeyFor, snapshotKeyRootOf } from '../services/backupKeyLayout';
+import { resolveBackupWriteCommandDestination } from '../services/backupProviderConfig';
+import { abortMultipartUpload, listMultipartUploads } from '../services/backupStoragePresign';
+import {
+  STORAGE_DELETE_SETTLE_MS,
+  STORAGE_WRITE_SESSION_DEADLINE_MS,
+  STORAGE_WRITE_TRANSFER_MARGIN_MS,
+} from '../services/backupStorageWriteSessions';
+import { getBullMQConnection } from '../services/redis';
+import { captureException } from '../services/sentry';
+import { attachWorkerObservability } from './workerObservability';
+
+const QUEUE_NAME = 'backup-write-session-janitor';
+const JOB_NAME = 'backup-write-session-janitor';
+const REPEAT_JOB_ID = 'backup-write-session-janitor-repeat';
+// A literal, so the schedule registry contract can read it statically; kept
+// equal to RESERVATION_CLEANUP_EVERY_MS (services/backupSnapshotIdReservations.ts),
+// which attestation verification uses to predict publication (unit-tested).
+const RUN_EVERY_MS = 5 * 60 * 1000;
+const BATCH = 200;
+const OPEN_UPLOAD_STATES = ['creating', 'open', 'completing'];
+
+export type JanitorStorage = {
+  abortMultipart(cfg: Record<string, unknown>, key: string, uploadId: string): Promise<void>;
+  listMultipart(cfg: Record<string, unknown>, prefix: string): Promise<Array<{ key: string; uploadId: string }>>;
+};
+
+export type JanitorDeps = {
+  now(): Date;
+  storage: JanitorStorage;
+  /**
+   * Receives the backup_snapshots ids whose reservations this run published
+   * (rule 3), after the publication has committed. Absent = nobody is told.
+   */
+  onPublished?(snapshotDbIds: string[]): Promise<unknown>;
+  /**
+   * Rule 6: erases the sealed connection settings of storage keys replaced
+   * more than 30 days ago (services/backupStorageCredentialHistory.ts).
+   * Absent = skipped. Returns how many were erased.
+   */
+  eraseExpiredSealedSettings?(now: Date): Promise<number>;
+};
+
+const defaultDeps: JanitorDeps = {
+  now: () => new Date(),
+  storage: {
+    abortMultipart: (cfg, key, uploadId) => abortMultipartUpload(cfg, key, uploadId),
+    listMultipart: (cfg, prefix) => listMultipartUploads(cfg, prefix),
+  },
+  onPublished: async (snapshotDbIds) => {
+    const { enqueueVerificationForPublishedSnapshots } = await import('./backupSnapshotAttestationWorker');
+    return enqueueVerificationForPublishedSnapshots(snapshotDbIds);
+  },
+  eraseExpiredSealedSettings: async (now) => {
+    const { eraseExpiredSealedSettings } = await import('../services/backupStorageCredentialHistory');
+    return eraseExpiredSealedSettings(now);
+  },
+};
+
+export type JanitorSummary = {
+  abortedUploads: number;
+  settledDeletes: number;
+  sweptPrefixes: number;
+  published: number;
+  abandoned: number;
+  erasedSealedSettings: number;
+  failures: number;
+};
+
+/**
+ * The destination a session or reservation was issued for, by configuration
+ * id alone (system context). The row's own org_id is not used: after a
+ * device moves to another organization its write rows carry the new org,
+ * while the configuration — and the bucket holding the uploads — stays with
+ * the original one.
+ */
+async function destinationFor(configId: string | null): Promise<Record<string, unknown> | null> {
+  if (!configId) return null;
+  const result = await withSystemDbAccessContext(async () => {
+    const [config] = await db
+      .select({ orgId: backupConfigs.orgId })
+      .from(backupConfigs)
+      .where(eq(backupConfigs.id, configId))
+      .limit(1);
+    return config ? resolveBackupWriteCommandDestination(configId, config.orgId) : null;
+  });
+  if (!result || !result.ok || result.destination.provider !== 's3') return null;
+  return result.destination.providerConfig;
+}
+
+/**
+ * An unreadable reservation root is an invariant breach (roots are validated
+ * when reserved and immutable after): reported, with constant text so repeat
+ * runs group as one issue; the ids are in the log line before it.
+ */
+function reportUnreadableRoot(): void {
+  captureException(new Error(
+    '[BackupWriteSessionJanitor] a reservation records a key root this server cannot read; its uploads are left in place',
+  ));
+}
+
+/** Rule 1. */
+async function abortRecordedUploads(deps: JanitorDeps, summary: JanitorSummary): Promise<void> {
+  const now = deps.now();
+  const tooOld = new Date(now.getTime() - STORAGE_WRITE_SESSION_DEADLINE_MS - 60 * 60 * 1000);
+  const rows = await withSystemDbAccessContext(() =>
+    db
+      .select({
+        id: backupStorageSessionUploads.id,
+        orgId: backupStorageSessionUploads.orgId,
+        objectKey: backupStorageSessionUploads.objectKey,
+        uploadId: backupStorageSessionUploads.uploadId,
+        reservationSnapshotId: backupStorageSessionUploads.reservationSnapshotId,
+        configId: backupStorageSessions.configId,
+        keyLayout: backupSnapshotIdReservations.keyLayout,
+        keyPrefix: backupSnapshotIdReservations.keyPrefix,
+      })
+      .from(backupStorageSessionUploads)
+      .innerJoin(backupStorageSessions, eq(backupStorageSessions.id, backupStorageSessionUploads.sessionId))
+      .leftJoin(backupJobs, eq(backupJobs.id, backupStorageSessions.jobId))
+      .leftJoin(
+        backupSnapshotIdReservations,
+        eq(backupSnapshotIdReservations.snapshotId, backupStorageSessionUploads.reservationSnapshotId),
+      )
+      .where(and(
+        inArray(backupStorageSessionUploads.state, OPEN_UPLOAD_STATES),
+        or(
+          isNotNull(backupStorageSessions.revokedAt),
+          isNull(backupJobs.id),
+          sql`${backupJobs.status}::text NOT IN ('pending', 'running')`,
+          lt(backupStorageSessionUploads.createdAt, tooOld),
+        ),
+      ))
+      .limit(BATCH),
+  );
+  for (const row of rows) {
+    // The upload's physical key is under its reservation's root (#7081). A
+    // missing or unreadable root leaves the row open, logged, rather than
+    // aborting a guessed key (an abort of a key that does not exist would
+    // read as success and strand the real upload). A row with no upload id
+    // makes no storage call, so its root does not matter.
+    const root = row.keyLayout === null ? null : snapshotKeyRootOf({ keyLayout: row.keyLayout, keyPrefix: row.keyPrefix });
+    const physicalKey = root ? physicalKeyFor(root, row.objectKey) : null;
+    if (row.uploadId && physicalKey === null) {
+      summary.failures++;
+      recordBackupWriteJanitor('abort_upload', 'failed');
+      console.warn('[BackupWriteSessionJanitor] not aborting an upload: its reservation\'s key root is missing or unreadable', {
+        uploadRowId: row.id,
+        snapshotId: row.reservationSnapshotId,
+      });
+      reportUnreadableRoot();
+      continue;
+    }
+    try {
+      if (row.uploadId && physicalKey !== null) {
+        const cfg = await destinationFor(row.configId);
+        if (!cfg) throw new Error('destination unavailable');
+        await deps.storage.abortMultipart(cfg, physicalKey, row.uploadId);
+      }
+      await withSystemDbAccessContext(() =>
+        db.update(backupStorageSessionUploads)
+          .set({ state: 'aborted', updatedAt: new Date() })
+          .where(and(eq(backupStorageSessionUploads.id, row.id), inArray(backupStorageSessionUploads.state, OPEN_UPLOAD_STATES))),
+      );
+      summary.abortedUploads++;
+      recordBackupWriteJanitor('abort_upload', 'ok');
+    } catch (err) {
+      summary.failures++;
+      recordBackupWriteJanitor('abort_upload', 'failed');
+      console.warn('[BackupWriteSessionJanitor] could not abort a multipart upload; will retry', {
+        uploadRowId: row.id,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+}
+
+/** Rule 4: re-checked inside the updating statement. */
+async function abandonEndedReservations(deps: JanitorDeps, summary: JanitorSummary): Promise<void> {
+  const now = deps.now();
+  // An upload started just before its URL expired may still be landing.
+  const horizonCutoff = new Date(now.getTime() - STORAGE_WRITE_TRANSFER_MARGIN_MS);
+  const rows = await withSystemDbAccessContext(() =>
+    db.execute(sql`
+      UPDATE backup_snapshot_id_reservations r
+         SET state = 'abandoned', updated_at = ${now.toISOString()}::timestamptz
+       WHERE r.state = 'reserved'
+         AND r.source = 'server_minted'
+         AND NOT EXISTS (
+               SELECT 1 FROM backup_jobs j
+                WHERE j.id = r.current_job_id AND j.status::text IN ('pending', 'running'))
+         AND NOT EXISTS (
+               SELECT 1 FROM backup_storage_sessions s
+                WHERE s.reservation_snapshot_id = r.snapshot_id
+                  AND s.url_horizon_at IS NOT NULL
+                  AND s.url_horizon_at >= ${horizonCutoff.toISOString()}::timestamptz)
+         AND NOT EXISTS (
+               SELECT 1 FROM backup_storage_session_uploads u
+                WHERE u.reservation_snapshot_id = r.snapshot_id
+                  AND u.state IN ('creating', 'open', 'completing'))
+         AND NOT EXISTS (
+               SELECT 1 FROM backup_storage_sessions s
+                WHERE s.reservation_snapshot_id = r.snapshot_id
+                  AND s.deleting_since IS NOT NULL)
+      RETURNING r.snapshot_id
+    `),
+  );
+  const n = (rows as unknown as unknown[]).length;
+  summary.abandoned += n;
+  if (n > 0) recordBackupWriteJanitor('abandon', 'ok', n);
+}
+
+/** Rule 3; the published snapshots are then handed to deps.onPublished. */
+async function publishSealed(deps: JanitorDeps, summary: JanitorSummary): Promise<void> {
+  const now = deps.now();
+  const rows = await withSystemDbAccessContext(() =>
+    db.execute(sql`
+      UPDATE backup_snapshot_id_reservations r
+         SET state = 'published', updated_at = ${now.toISOString()}::timestamptz
+       WHERE r.state = 'sealing'
+         AND r.sealed_until IS NOT NULL
+         AND r.sealed_until < ${now.toISOString()}::timestamptz
+         AND NOT EXISTS (
+               SELECT 1 FROM backup_storage_session_uploads u
+                WHERE u.reservation_snapshot_id = r.snapshot_id
+                  AND u.state IN ('creating', 'open', 'completing'))
+         AND NOT EXISTS (
+               SELECT 1 FROM backup_storage_sessions s
+                WHERE s.reservation_snapshot_id = r.snapshot_id
+                  AND s.deleting_since IS NOT NULL)
+      RETURNING r.snapshot_id, r.published_snapshot_db_id
+    `),
+  );
+  const published = rows as unknown as Array<{ snapshot_id: string; published_snapshot_db_id: string | null }>;
+  const n = published.length;
+  summary.published += n;
+  if (n > 0) recordBackupWriteJanitor('publish', 'ok', n);
+
+  const snapshotDbIds = published.flatMap((r) => (r.published_snapshot_db_id ? [r.published_snapshot_db_id] : []));
+  if (snapshotDbIds.length === 0 || !deps.onPublished) return;
+  try {
+    await deps.onPublished(snapshotDbIds);
+  } catch (err) {
+    // The publication stands; a verification that could not be queued now is
+    // retried by the attestation worker's sweep when due.
+    console.warn('[BackupWriteSessionJanitor] could not hand published snapshots to attestation verification', {
+      count: snapshotDbIds.length,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+/**
+ * Rule 5: a delete marker left by a call that never cleared it (process
+ * gone). The storage delete itself is time-bounded, so after
+ * STORAGE_DELETE_SETTLE_MS it has either happened or will not.
+ */
+async function settleStuckDeletes(deps: JanitorDeps, summary: JanitorSummary): Promise<void> {
+  const cutoff = new Date(deps.now().getTime() - STORAGE_DELETE_SETTLE_MS);
+  const rows = await withSystemDbAccessContext(() =>
+    db.update(backupStorageSessions)
+      .set({ deletingSince: null })
+      .where(lt(backupStorageSessions.deletingSince, cutoff))
+      .returning({ id: backupStorageSessions.id }),
+  );
+  summary.settledDeletes += rows.length;
+  if (rows.length > 0) recordBackupWriteJanitor('settle_delete', 'ok', rows.length);
+}
+
+/** Rule 2. */
+async function sweepFinishedPrefixes(deps: JanitorDeps, summary: JanitorSummary): Promise<void> {
+  const now = deps.now();
+  const candidates = await withSystemDbAccessContext(() =>
+    db
+      .select({
+        snapshotId: backupSnapshotIdReservations.snapshotId,
+        orgId: backupSnapshotIdReservations.orgId,
+        configId: backupSnapshotIdReservations.configId,
+        keyLayout: backupSnapshotIdReservations.keyLayout,
+        keyPrefix: backupSnapshotIdReservations.keyPrefix,
+      })
+      .from(backupSnapshotIdReservations)
+      .where(and(
+        eq(backupSnapshotIdReservations.source, 'server_minted'),
+        isNull(backupSnapshotIdReservations.uploadsSweptAt),
+        or(
+          inArray(backupSnapshotIdReservations.state, ['published', 'abandoned']),
+          and(
+            eq(backupSnapshotIdReservations.state, 'sealing'),
+            lt(backupSnapshotIdReservations.sealedUntil, now),
+          ),
+        ),
+      ))
+      .limit(BATCH),
+  );
+  for (const r of candidates) {
+    const root = snapshotKeyRootOf({ keyLayout: r.keyLayout, keyPrefix: r.keyPrefix });
+    if (!root) {
+      summary.failures++;
+      recordBackupWriteJanitor('sweep_prefix', 'failed');
+      console.warn('[BackupWriteSessionJanitor] not sweeping a snapshot prefix: its reservation\'s key root is unreadable', {
+        snapshotId: r.snapshotId,
+      });
+      reportUnreadableRoot();
+      continue;
+    }
+    // Listed, compared and aborted as physical keys under the reservation's
+    // root; completed uploads are recorded with logical keys.
+    const prefix = physicalKeyFor(root, `snapshots/${r.snapshotId}/`);
+    try {
+      const completed = await withSystemDbAccessContext(async () => {
+        const rows = await db
+          .select({ objectKey: backupStorageSessionUploads.objectKey, uploadId: backupStorageSessionUploads.uploadId })
+          .from(backupStorageSessionUploads)
+          .where(and(
+            eq(backupStorageSessionUploads.reservationSnapshotId, r.snapshotId),
+            eq(backupStorageSessionUploads.state, 'completed'),
+          ));
+        return new Set(rows.map((u) => `${u.objectKey}\u0000${u.uploadId}`));
+      });
+      const cfg = await destinationFor(r.configId);
+      if (!cfg) throw new Error('destination unavailable');
+      const open = await deps.storage.listMultipart(cfg, prefix);
+      for (const u of open) {
+        if (!u.key.startsWith(prefix)) continue;
+        const logical = logicalKeyFrom(root, u.key);
+        if (logical === null || completed.has(`${logical}\u0000${u.uploadId}`)) continue;
+        await deps.storage.abortMultipart(cfg, u.key, u.uploadId);
+      }
+      await withSystemDbAccessContext(() =>
+        db.update(backupSnapshotIdReservations)
+          .set({ uploadsSweptAt: now })
+          .where(eq(backupSnapshotIdReservations.snapshotId, r.snapshotId)),
+      );
+      summary.sweptPrefixes++;
+      recordBackupWriteJanitor('sweep_prefix', 'ok');
+    } catch (err) {
+      summary.failures++;
+      recordBackupWriteJanitor('sweep_prefix', 'failed');
+      console.warn('[BackupWriteSessionJanitor] could not sweep multipart uploads under a snapshot prefix; will retry', {
+        snapshotId: r.snapshotId,
+        keyRoot: keyRootId(root),
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+}
+
+export async function runBackupWriteSessionJanitor(deps: JanitorDeps = defaultDeps): Promise<JanitorSummary> {
+  const summary: JanitorSummary = {
+    abortedUploads: 0, settledDeletes: 0, sweptPrefixes: 0, published: 0, abandoned: 0, erasedSealedSettings: 0, failures: 0,
+  };
+  await abortRecordedUploads(deps, summary);
+  await settleStuckDeletes(deps, summary);
+  await abandonEndedReservations(deps, summary);
+  await publishSealed(deps, summary);
+  await sweepFinishedPrefixes(deps, summary);
+  if (deps.eraseExpiredSealedSettings) {
+    try {
+      summary.erasedSealedSettings = await deps.eraseExpiredSealedSettings(deps.now());
+    } catch (err) {
+      summary.failures += 1;
+      captureException(err instanceof Error ? err : new Error(String(err)));
+    }
+  }
+  return summary;
+}
+
+let queue: Queue | null = null;
+let worker: Worker | null = null;
+
+function getQueue(): Queue {
+  if (!queue) queue = new Queue(QUEUE_NAME, { connection: getBullMQConnection() });
+  return queue;
+}
+
+export async function initializeBackupWriteSessionJanitor(): Promise<void> {
+  worker = new Worker(
+    QUEUE_NAME,
+    async () => {
+      const summary = await runBackupWriteSessionJanitor();
+      if (summary.failures > 0) {
+        console.warn('[BackupWriteSessionJanitor] run finished with failures', summary);
+      }
+      return summary;
+    },
+    { connection: getBullMQConnection(), concurrency: 1 },
+  );
+  attachWorkerObservability(worker, 'backupWriteSessionJanitor');
+  worker.on('failed', (job, error) => {
+    console.error(`[BackupWriteSessionJanitor] Job ${job?.id} failed:`, error);
+    captureException(error);
+  });
+  await getQueue().add(JOB_NAME, {}, {
+    jobId: REPEAT_JOB_ID,
+    repeat: { every: RUN_EVERY_MS },
+    removeOnComplete: { count: 10 },
+    removeOnFail: { count: 25 },
+  });
+  console.log('[BackupWriteSessionJanitor] Worker initialized');
+}
+
+export const __testOnly = { defaultDeps, RUN_EVERY_MS };
+
+export async function shutdownBackupWriteSessionJanitor(): Promise<void> {
+  await worker?.close();
+  worker = null;
+  await queue?.close();
+  queue = null;
+}

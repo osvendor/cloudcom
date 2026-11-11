@@ -6,7 +6,7 @@ sidebar:
   label: "TLS & Reverse Proxy"
 ---
 
-import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+import { Tabs, TabItem, Aside, Steps } from '@astrojs/starlight/components';
 
 ## Caddy (Default)
 
@@ -59,6 +59,65 @@ docker compose exec caddy cat /data/caddy/pki/authorities/local/root.crt
 
 Leave the variable empty for any internet-reachable deployment. You do not need it for `localhost` or a bare IP address, which Caddy already self-signs.
 
+### Trusting the internal CA on agents
+
+Browsers are not the only clients that must trust a self-issued certificate. The Breeze agent, the Windows install one-liner and the MSI all verify the server certificate against the operating system's trust store, exactly like a browser. Until the endpoint trusts your internal root, every install fails before the agent enrolls:
+
+| Install path | What you see |
+|---|---|
+| Windows MSI | *"There is a problem with this Windows Installer package. A program run as part of the setup did not finish as expected."* The agent's own message, which names the certificate problem, is in `C:\ProgramData\Breeze\logs\enroll-last-error.txt` and in the Windows Application event log (source `BreezeAgent`) |
+| Windows PowerShell one-liner | `Breeze: this machine rejected the TLS certificate of … (… UntrustedRoot)`. The text in parentheses is the reason Windows gave: `UntrustedRoot` means the CA is not trusted, while `RemoteCertificateNameMismatch` means the server URL does not match a name on the certificate. Older copies of the one-liner show `Could not establish trust relationship for the SSL/TLS secure channel` instead |
+| macOS / Linux one-liner | `curl: (60) SSL certificate problem: self-signed certificate` or `unable to get local issuer certificate` |
+| `breeze-agent enroll` | `Enrollment failed: the TLS certificate presented by … is not trusted by this machine` |
+
+The fix is to trust the CA on each endpoint, not to turn verification off. Breeze has no option to skip certificate verification, and none is planned. An agent that accepts any certificate would hand its enrollment secret and device token to anyone who can intercept the connection.
+
+<Steps>
+1. Export the root certificate from the server. Trust the root, not the site certificate: Caddy renews the site certificate and its intermediate often, but the root stays the same.
+
+   ```bash
+   docker compose exec caddy cat /data/caddy/pki/authorities/local/root.crt > breeze-root.crt
+   ```
+
+   The same file covers a bare IP address or `localhost`, which Caddy also signs from its internal CA. If you front Breeze with your own proxy and a certificate from your organization's CA, use that CA's root instead.
+
+2. Install it into the **machine** trust store on every endpoint, before you run the installer. The agent runs as `SYSTEM` or `root`, so a per-user store does not work.
+
+   <Tabs>
+     <TabItem label="Windows">
+       ```powershell
+       # Elevated PowerShell
+       Import-Certificate -FilePath .\breeze-root.crt -CertStoreLocation Cert:\LocalMachine\Root
+       ```
+       To reach a whole fleet, deploy the certificate with Group Policy (**Computer Configuration → Policies → Windows Settings → Security Settings → Public Key Policies → Trusted Root Certification Authorities**) or an Intune trusted-certificate profile.
+     </TabItem>
+     <TabItem label="macOS">
+       ```bash
+       sudo security add-trusted-cert -d -r trustRoot \
+         -k /Library/Keychains/System.keychain breeze-root.crt
+       ```
+       For managed Macs, push the certificate in an MDM configuration profile.
+     </TabItem>
+     <TabItem label="Linux">
+       ```bash
+       # Debian / Ubuntu
+       sudo cp breeze-root.crt /usr/local/share/ca-certificates/breeze-root.crt
+       sudo update-ca-certificates
+
+       # RHEL / Fedora / Rocky / Alma
+       sudo cp breeze-root.crt /etc/pki/ca-trust/source/anchors/breeze-root.crt
+       sudo update-ca-trust
+       ```
+     </TabItem>
+   </Tabs>
+
+3. Run the installer again.
+</Steps>
+
+<Aside type="caution" title="Keep the Caddy data volume">
+  Caddy generates its internal root once and stores it in its data volume. If that volume is deleted, Caddy creates a new root on the next start, and every enrolled agent loses its connection until you distribute the new root. Back up the volume with the rest of the deployment. A publicly trusted certificate (Let's Encrypt, or a commercial CA with a DNS challenge for internal names) avoids this step completely.
+</Aside>
+
 ### WebSocket Proxying
 
 Caddy automatically handles WebSocket upgrade for:
@@ -69,6 +128,29 @@ Caddy automatically handles WebSocket upgrade for:
 It also disables buffering (but does not upgrade the connection) for the SSE endpoints used by MCP and streaming AI chat: `/api/v1/mcp/sse`, `/api/v1/helper/chat/sessions/*/messages`, and `/api/v1/ai/sessions/*/stream`.
 
 No additional configuration needed.
+
+### Troubleshooting: remote tools time out / event socket returns 400 behind your own proxy
+
+With `FORCE_HTTPS=true`, a request that reaches the API looking like plain `http` with a `Host` other than the one in `PUBLIC_API_URL` is rejected with `400` and the body `{"error":"FORCE_HTTPS_NON_CANONICAL_HOST"}`. The API request log shows the same thing as `reason=force_https_non_canonical_host` on the `-->` line. Browsers hide the status and body of a failed WebSocket upgrade, so from the page it only reads as "failed to connect".
+
+Check that your proxy:
+
+- forwards `X-Forwarded-Proto: https` on WebSocket upgrade requests, not just plain requests;
+- preserves the original `Host` header on upgrades (nginx: `proxy_set_header Host $host;`);
+- has its IP in `TRUSTED_PROXY_CIDRS`, otherwise the API ignores the forwarded headers.
+
+The API also logs a rate-limited `[force-https]` warning on this path with the values it saw.
+
+### Customer portal pages fail with `FORCE_HTTPS_NON_CANONICAL_HOST`
+
+The portal (and the web app) render pages on the server by calling the API over the private Docker network at `INTERNAL_API_URL` (`http://api:3001` by default). That hop is plain HTTP by design. The API lets it through `FORCE_HTTPS` only when all of these hold:
+
+- the connection's source address is inside `INTERNAL_SERVICE_CIDRS`. The bundled compose files set this to the Docker network (`BREEZE_DOCKER_SUBNET`). The API checks the socket address, not a header;
+- the source is not one of your `TRUSTED_PROXY_CIDRS`, so a request relayed through Caddy never qualifies;
+- the request carries no `X-Forwarded-For`, `X-Real-IP` or `CF-Connecting-IP` header. Proxies add these, so relayed traffic never qualifies even if `TRUSTED_PROXY_CIDRS` is stale;
+- the `Host` is listed in `INTERNAL_API_HOSTS` (default `api:3001`).
+
+If portal pages return this error, check that `INTERNAL_SERVICE_CIDRS` covers the network the portal runs on and that `INTERNAL_API_HOSTS` matches the host and port in `INTERNAL_API_URL`. Do not add the portal to `TRUSTED_PROXY_CIDRS` instead: a trusted proxy can set the client IP, scheme and host the API sees, and an application container must not have that power. `INTERNAL_SERVICE_CIDRS` takes only ranges that sit entirely inside a private network. Setting it to an empty value turns the exemption off.
 
 ## Nginx (Alternative)
 
@@ -162,6 +244,10 @@ If you prefer nginx, here's an equivalent configuration.
   When using nginx instead of Caddy, remove the `caddy` service from `docker-compose.yml` and set `TRUST_PROXY_HEADERS=true` in your `.env`.
 </Aside>
 
+<Aside type="caution" title="Trust Center embeds and proxy-added framing headers">
+  The server-level `add_header X-Frame-Options "DENY" always;` above also lands on `/portal/trust/embed/` responses, the one portal path that may be framed by the websites a [Trust Center embed](/security/trust-center-embed/) allows. A proxy that adds its own `Content-Security-Policy` to those responses always breaks embedding, because a second, restrictive CSP is enforced alongside the portal's. A proxy-added `X-Frame-Options` is ignored by modern browsers when the portal's `frame-ancestors` is present, but it still blocks the embed in older browsers. Exclude `location /portal/trust/embed/` from both, for example with its own `location` block that sets only the headers you need (nginx does not inherit server-level `add_header` into a block that declares its own).
+</Aside>
+
 ## Security Headers
 
 Both configurations include these security headers:
@@ -170,4 +256,10 @@ Both configurations include these security headers:
 |---|---|---|
 | `Strict-Transport-Security` | `max-age=31536000; includeSubDomains; preload` | Force HTTPS for 1 year |
 | `X-Content-Type-Options` | `nosniff` | Prevent MIME sniffing |
-| `Referrer-Policy` | `strict-origin-when-cross-origin` | Control referrer information |
+| `Referrer-Policy` | `strict-origin-when-cross-origin` | Control referrer information. From v0.124.0 the bundled `Caddyfile.prod` sets it as a default only (`?Referrer-Policy`), so the stricter `no-referrer` the application sends on capability URLs (verification pages, public invoices, unsubscribe links) is kept rather than overwritten. If you front Breeze with your own proxy, do not add a `Referrer-Policy` header on those paths. |
+| `Permissions-Policy` | `camera=(), microphone=(), geolocation=(), payment=()` | Turn off browser features Breeze never uses. Since v0.125.0 the bundled `Caddyfile.prod` sets it as a default (`?Permissions-Policy`), so static assets that the web application does not handle get it too. |
+| `Cross-Origin-Resource-Policy` | `same-site` | Stop other sites from loading Breeze pages and assets (v0.125.0+, Caddy only). Set as a default on every path **except** `/api/*`, `/s/*`, `/i/*`, `/activate/*`, `/health*`, `/ready`, `/metrics/*`, `/oauth/*` and `/.well-known/*`, so the public Trust Center badge and branding images stay embeddable on customers' own sites. |
+
+Since v0.125.0 the bundled `Caddyfile.prod` sets `Strict-Transport-Security` and `X-Content-Type-Options` with Caddy's `>` (replace) form, so a response that already carries one from the application is not sent with the header twice. If you maintain your own copy of `Caddyfile.prod`, carry over the `>` form, the `?Permissions-Policy` default and the `Cross-Origin-Resource-Policy` block with its path exclusions.
+
+The web application adds its own headers on top of the proxy's. From v0.125.0 HTML pages are sent with `Cache-Control: no-store`, and the `Content-Security-Policy` `connect-src` list is built per request from your configured API and WebSocket hosts, with no plaintext `ws:` in production. If a page needs to reach another origin, add it with `CSP_CONNECT_HOSTS` on the `web` service. See [HTTP Security Headers](/security/overview/#http-security-headers).

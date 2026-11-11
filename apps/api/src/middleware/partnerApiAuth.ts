@@ -1,7 +1,8 @@
-import { createHash } from 'node:crypto';
 import type { Context, MiddlewareHandler, Next } from 'hono';
 import { HTTPException } from 'hono/http-exception';
+import { markPermissionGate } from './permissionGate';
 import { and, eq, isNull, ne, sql } from 'drizzle-orm';
+import { UNASSIGNED_POOL_ORG_TYPE } from '../services/unassignedPool/orgType';
 import {
   db,
   runOutsideDbContext,
@@ -10,18 +11,17 @@ import {
 } from '../db';
 import {
   organizations,
-  partners,
   partnerServicePrincipalKeys,
-  partnerServicePrincipals,
 } from '../db/schema';
 import { getRedis, rateLimiter } from '../services';
 import { writeAuditEventAsync } from '../services/auditEvents';
 import { getTrustedClientIpOrUndefined } from '../services/clientIp';
-import { ipMatchesAny, isValidIpOrCidr } from '../services/ipMatch';
 import {
-  type PartnerServicePrincipalScope,
-  validatePartnerServicePrincipalScopes,
-} from '../services/partnerServicePrincipalScopes';
+  hashPartnerApiKey,
+  isPartnerServicePrincipalKeyFormat,
+  loadPartnerServicePrincipalCredential,
+} from '../services/partnerServicePrincipalCredential';
+import type { PartnerServicePrincipalScope } from '../services/partnerServicePrincipalScopes';
 import { enforcePreLookupProbeRateLimit } from './apiKeyAuth';
 
 export interface PartnerApiPrincipalContext {
@@ -44,7 +44,6 @@ declare module 'hono' {
 
 type CredentialBootstrap = Omit<PartnerApiPrincipalContext, 'accessibleOrgIds'>;
 
-const PARTNER_API_KEY_PATTERN = /^brz_sp_[A-Za-z0-9_-]{43}$/;
 const AUTH_REQUIRED_MESSAGE = 'Partner API authentication required';
 const INVALID_CREDENTIALS_MESSAGE = 'Invalid partner API credentials';
 
@@ -58,99 +57,57 @@ const INVALID_CREDENTIALS_MESSAGE = 'Invalid partner API credentials';
  */
 export const PARTNER_API_WRITE_RATE_LIMIT_PER_HOUR = 120;
 
+/**
+ * Ticket writes are a workload, not a provisioning event: a PSA/ITSM mirror
+ * posts a comment or status change per technician action across every
+ * customer, so they get their own hourly bucket with a higher default
+ * (`PARTNER_API_TICKET_WRITE_RATE_LIMIT_PER_HOUR`), still capped by the
+ * key's own limit. Provisioning writes keep the 120/hour bucket untouched —
+ * ticket volume can never spend the provisioning budget, nor vice versa.
+ */
+export const PARTNER_API_TICKET_WRITE_RATE_LIMIT_PER_HOUR_DEFAULT = 1200;
+/**
+ * Second ceiling, partner-wide. A partner admin can create service
+ * principals, so a per-principal bucket alone is multiplied by however many
+ * they mint; the partner bucket is what that number cannot be multiplied
+ * past (same two-bucket shape as enrollment-key minting). Charged after the
+ * per-principal bucket, and never lower than it.
+ */
+export const PARTNER_API_TICKET_WRITE_PARTNER_RATE_LIMIT_PER_HOUR_DEFAULT = 6000;
+const TICKET_WRITE_PATH = /(?:^|\/partner-api)\/tickets(?:\/|$)/u;
+
+function positiveEnvInt(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+export type PartnerApiWriteLimit =
+  | { bucket: 'default'; limit: number }
+  | { bucket: 'tickets'; limit: number; partnerLimit: number };
+
+/** The write bucket(s) and ceiling(s) for a non-GET request, by path family. */
+export function partnerApiWriteLimitFor(path: string, keyLimit: number): PartnerApiWriteLimit {
+  if (TICKET_WRITE_PATH.test(path)) {
+    const limit = Math.min(keyLimit, positiveEnvInt('PARTNER_API_TICKET_WRITE_RATE_LIMIT_PER_HOUR', PARTNER_API_TICKET_WRITE_RATE_LIMIT_PER_HOUR_DEFAULT));
+    const partnerLimit = Math.max(limit, positiveEnvInt('PARTNER_API_TICKET_WRITE_PARTNER_RATE_LIMIT_PER_HOUR', PARTNER_API_TICKET_WRITE_PARTNER_RATE_LIMIT_PER_HOUR_DEFAULT));
+    return { bucket: 'tickets', limit, partnerLimit };
+  }
+  return { bucket: 'default', limit: Math.min(keyLimit, PARTNER_API_WRITE_RATE_LIMIT_PER_HOUR) };
+}
+
 function invalidCredentials(): HTTPException {
   return new HTTPException(401, { message: INVALID_CREDENTIALS_MESSAGE });
-}
-
-function hashPartnerApiKey(rawKey: string): string {
-  // Service-principal keys are generated high-entropy tokens. Persist and
-  // compare only their SHA-256 digest; never include plaintext or digest in
-  // errors, logs, context, or audit payloads.
-  // lgtm[js/insufficient-password-hash]
-  return createHash('sha256').update(rawKey).digest('hex');
-}
-
-function isExpired(value: Date | string | null | undefined, now: number): boolean {
-  if (!value) return false;
-  const timestamp = value instanceof Date ? value.getTime() : new Date(value).getTime();
-  return !Number.isFinite(timestamp) || timestamp <= now;
 }
 
 async function bootstrapCredential(
   keyHash: string,
   trustedClientIp: string | undefined,
 ): Promise<CredentialBootstrap> {
-  return withSystemDbAccessContext(async () => {
-    const [credential] = await db
-      .select({
-        keyId: partnerServicePrincipalKeys.id,
-        keyStatus: partnerServicePrincipalKeys.status,
-        keyExpiresAt: partnerServicePrincipalKeys.expiresAt,
-        rateLimit: partnerServicePrincipalKeys.rateLimit,
-        partnerServicePrincipalId: partnerServicePrincipals.id,
-        partnerId: partnerServicePrincipals.partnerId,
-        name: partnerServicePrincipals.name,
-        principalStatus: partnerServicePrincipals.status,
-        principalExpiresAt: partnerServicePrincipals.expiresAt,
-        scopes: partnerServicePrincipals.scopes,
-        sourceCidrs: partnerServicePrincipals.sourceCidrs,
-        partnerStatus: partners.status,
-        partnerDeletedAt: partners.deletedAt,
-      })
-      .from(partnerServicePrincipalKeys)
-      .innerJoin(
-        partnerServicePrincipals,
-        and(
-          eq(partnerServicePrincipals.id, partnerServicePrincipalKeys.partnerServicePrincipalId),
-          eq(partnerServicePrincipals.partnerId, partnerServicePrincipalKeys.partnerId),
-        ),
-      )
-      .innerJoin(partners, eq(partners.id, partnerServicePrincipals.partnerId))
-      .where(eq(partnerServicePrincipalKeys.keyHash, keyHash))
-      .limit(1);
-
-    const now = Date.now();
-    if (
-      !credential
-      || credential.keyStatus !== 'active'
-      || isExpired(credential.keyExpiresAt, now)
-      || credential.principalStatus !== 'active'
-      || isExpired(credential.principalExpiresAt, now)
-      || credential.partnerStatus !== 'active'
-      || credential.partnerDeletedAt
-    ) {
-      throw invalidCredentials();
-    }
-
-    const validatedScopes = validatePartnerServicePrincipalScopes(credential.scopes);
-    if (!validatedScopes.ok) {
-      throw invalidCredentials();
-    }
-
-    const sourceCidrs = credential.sourceCidrs ?? [];
-    if (sourceCidrs.some((entry) => !isValidIpOrCidr(entry))) {
-      throw invalidCredentials();
-    }
-    if (
-      sourceCidrs.length > 0
-      && (!trustedClientIp || !ipMatchesAny(trustedClientIp, sourceCidrs))
-    ) {
-      // A configured allowlist is authoritative. If proxy trust cannot
-      // resolve one canonical client address, fail closed.
-      throw invalidCredentials();
-    }
-
-    return {
-      partnerServicePrincipalId: credential.partnerServicePrincipalId,
-      keyId: credential.keyId,
-      partnerId: credential.partnerId,
-      name: credential.name,
-      scopes: validatedScopes.scopes,
-      rateLimit: credential.rateLimit,
-      principalExpiresAt: credential.principalExpiresAt,
-      sourceCidrs,
-    };
-  });
+  // Shared with the MCP endpoint (middleware/partnerServicePrincipalMcpAuth.ts)
+  // so both surfaces enforce one credential lifecycle.
+  return (await loadPartnerServicePrincipalCredential(keyHash, trustedClientIp)).credential;
 }
 
 // The hidden per-partner 'quick_support' org is an internal Quick Support
@@ -168,6 +125,8 @@ async function discoverAccessibleOrgIds(partnerId: string): Promise<string[]> {
       eq(organizations.status, 'active'),
       isNull(organizations.deletedAt),
       ne(organizations.type, 'quick_support'),
+      // Holding org is never human-reachable.
+      ne(organizations.type, UNASSIGNED_POOL_ORG_TYPE),
     ));
   return activeOrganizations.map((organization) => organization.id);
 }
@@ -264,7 +223,7 @@ export async function partnerApiAuthMiddleware(c: Context, next: Next): Promise<
   // the same shared protection used by human-owned API keys.
   await enforcePreLookupProbeRateLimit(c);
 
-  if (!PARTNER_API_KEY_PATTERN.test(rawKey)) {
+  if (!isPartnerServicePrincipalKeyFormat(rawKey)) {
     throw invalidCredentials();
   }
 
@@ -318,13 +277,32 @@ export async function partnerApiAuthMiddleware(c: Context, next: Next): Promise<
     // Handlers therefore receive NO ambient DB context and must open their
     // own bounded withDbAccessContext / withSystemDbAccessContext per
     // operation (the contextless-write guard enforces this).
-    const writeLimit = Math.min(bootstrap.rateLimit, PARTNER_API_WRITE_RATE_LIMIT_PER_HOUR);
-    const writeCheck = await rateLimiter(
+    const writeFamily = partnerApiWriteLimitFor(c.req.path, bootstrap.rateLimit);
+    let writeLimit = writeFamily.limit;
+    let writeCheck = await rateLimiter(
       getRedis(),
-      `partner_api_write_rate:${bootstrap.partnerServicePrincipalId}:${bootstrap.keyId}`,
+      writeFamily.bucket === 'default'
+        ? `partner_api_write_rate:${bootstrap.partnerServicePrincipalId}:${bootstrap.keyId}`
+        : `partner_api_write_rate:${writeFamily.bucket}:${bootstrap.partnerServicePrincipalId}:${bootstrap.keyId}`,
       writeLimit,
       3600,
     );
+    // Two buckets, both charged, narrowest first: the partner-wide ceiling is
+    // only consulted (and only spent) once the per-principal bucket admits
+    // the request, so a principal that is already over budget cannot drain
+    // its siblings' shared allowance.
+    if (writeCheck.allowed && writeFamily.bucket === 'tickets') {
+      const partnerCheck = await rateLimiter(
+        getRedis(),
+        `partner_api_write_rate:${writeFamily.bucket}:partner:${bootstrap.partnerId}`,
+        writeFamily.partnerLimit,
+        3600,
+      );
+      if (!partnerCheck.allowed) {
+        writeLimit = writeFamily.partnerLimit;
+        writeCheck = partnerCheck;
+      }
+    }
     setRateLimitHeaders(c, writeLimit, writeCheck);
     if (!writeCheck.allowed) {
       c.header('Retry-After', String(Math.max(
@@ -402,7 +380,7 @@ export async function partnerApiAuthMiddleware(c: Context, next: Next): Promise<
 export function requirePartnerApiScope(
   ...required: PartnerServicePrincipalScope[]
 ): MiddlewareHandler {
-  return async (c, next) => {
+  return markPermissionGate(async (c, next) => {
     const principal = c.get('partnerApiPrincipal');
     if (!principal) {
       throw new HTTPException(401, { message: AUTH_REQUIRED_MESSAGE });
@@ -413,5 +391,5 @@ export function requirePartnerApiScope(
     }
 
     await next();
-  };
+  }, `partner-api:${required.join('+')}`);
 }

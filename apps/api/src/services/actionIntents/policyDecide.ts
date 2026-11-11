@@ -107,7 +107,15 @@ async function loadIntentForAttempt(intentId: string): Promise<LoadedIntentForAt
 }
 
 interface LoadedRunAndAgent {
-  run: { id: string; agentId: string; orgId: string; deviceId: string | null; policySnapshot: AiAgentPolicySnapshot };
+  run: {
+    id: string;
+    agentId: string;
+    orgId: string;
+    deviceId: string | null;
+    policySnapshot: AiAgentPolicySnapshot;
+    /** See the check in `attemptPolicyDecision` below. */
+    modeAtStart: string;
+  };
   agent: { id: string; name: string; kind: AiAgentKind };
   partnerId: string;
   deviceSiteId: string | null;
@@ -144,6 +152,7 @@ async function loadRunAndAgent(
         orgId: aiAgentRuns.orgId,
         deviceId: aiAgentRuns.deviceId,
         policySnapshot: aiAgentRuns.policySnapshot,
+        modeAtStart: aiAgentRuns.modeAtStart,
       })
       .from(aiAgentRuns)
       .where(eq(aiAgentRuns.id, runId))
@@ -414,6 +423,7 @@ async function notifyRecipientsOfPolicyAuthorization(args: {
   agentName: string;
   intentId: string;
   targetSummary: string;
+  runId: string;
 }): Promise<void> {
   try {
     const userIds = await resolveRecipientUserIds(
@@ -430,9 +440,9 @@ async function notifyRecipientsOfPolicyAuthorization(args: {
           message: `${args.targetSummary} — executing`,
           // Review fix (#3827): a policy-decided intent has NO approval_requests
           // row (that's the whole point — no human ever reviewed it), so
-          // `/approvals` is a dead end for this notification. No run-detail
-          // page exists yet to link to instead — that lands in wave 6.
-          link: null,
+          // `/approvals` is a dead end for this notification. Deep-link to the
+          // run detail page instead (#4461).
+          link: `/ai-agents/runs/${args.runId}`,
           metadata: { intentId: args.intentId, decidedVia: 'policy' },
           dedupeKey: `intent-policy-authorized:${args.intentId}`,
         });
@@ -574,6 +584,21 @@ export async function attemptPolicyDecision(intentId: string): Promise<void> {
       return;
     }
 
+    // The run's OWN admission-time mode, distinct from
+    // both the current live policy above and `run.policySnapshot.effective
+    // .mode` below. An anomaly- or ticket-triggered run is admitted with
+    // `modeAtStart: 'shadow'` even when the resolved policy's mode is 'act'
+    // (runService.ts's forced-shadow downgrade — "an unproven detector must
+    // never drive act mode"); `policySnapshot.effective.mode` still records
+    // the resolved 'act' mode unchanged, so neither of the checks above
+    // would catch a run that was never actually admitted as act. Checked
+    // here, at decide time, as the second enforcement point alongside
+    // `resolvePolicyDecisionState`'s creation-time check (intentService.ts).
+    if (run.modeAtStart !== 'act') {
+      await degradeToHumanRequired(intentId, 'agent_mode_not_act', { modeAtStart: run.modeAtStart });
+      return;
+    }
+
     const authorizedKeys = current.effective.actAssets.supervisedActionKeys ?? [];
     if (!authorizedKeys.includes(key)) {
       await degradeToHumanRequired(intentId, 'not_agent_authorized', { key });
@@ -682,6 +707,7 @@ export async function attemptPolicyDecision(intentId: string): Promise<void> {
       agentName: agent.name,
       intentId: intent.id,
       targetSummary: intent.targetSummary,
+      runId: run.id,
     });
   } catch (err) {
     if (err instanceof PolicyDecisionRaceLostError) {

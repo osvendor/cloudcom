@@ -5,6 +5,8 @@
  */
 
 import { z } from 'zod';
+import { pageZodShape } from './aiToolPagination';
+import { GENERATE_REPORT_TYPES } from './aiReportTypes';
 
 const uuid = z.string().guid();
 
@@ -21,6 +23,7 @@ export const fleetToolInputSchemas: Record<string, z.ZodType> = {
     rolloutConfig: z.record(z.string(), z.unknown()).optional(),
     schedule: z.record(z.string(), z.unknown()).optional(),
     limit: z.number().int().min(1).max(100).optional(),
+    orgId: uuid.optional(),
   }).refine(
     (d) => {
       const needsId = ['get', 'device_status', 'start', 'pause', 'resume', 'cancel'];
@@ -33,26 +36,29 @@ export const fleetToolInputSchemas: Record<string, z.ZodType> = {
   ),
 
   manage_patches: z.object({
-    action: z.enum(['list', 'compliance', 'scan', 'approve', 'decline', 'defer', 'bulk_approve', 'install', 'rollback', 'setup_auto_approval']),
+    action: z.enum(['list', 'compliance', 'scan', 'approve', 'decline', 'defer', 'bulk_approve', 'install', 'rollback', 'setup_auto_approval', 'device_history']),
     patchId: uuid.optional(),
     patchName: z.string().min(1).max(300).optional(),
     patchIds: z.array(uuid).max(50).optional(),
     deviceIds: z.array(uuid).max(50).optional(),
+    deviceId: uuid.optional(),
     ringId: uuid.optional(),
     allRings: z.boolean().optional(),
     source: z.enum(['microsoft', 'apple', 'linux', 'third_party', 'custom']).optional(),
     severity: z.enum(['critical', 'important', 'moderate', 'low', 'unknown']).optional(),
     status: z.enum(['pending', 'approved', 'rejected', 'deferred']).optional(),
+    resultStatus: z.enum(['pending', 'running', 'queued', 'completed', 'failed', 'skipped']).optional(),
+    since: z.string().datetime({ offset: true }).optional(),
+    until: z.string().datetime({ offset: true }).optional(),
     deferUntil: z.string().datetime({ offset: true }).optional(),
     notes: z.string().max(1000).optional(),
     configPolicyId: uuid.optional(),
-    autoApprove: z.boolean().optional(),
-    autoApproveSeverities: z.array(z.enum(['critical', 'important', 'moderate', 'low'])).optional(),
     scheduleFrequency: z.enum(['daily', 'weekly', 'monthly']).optional(),
     scheduleTime: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/).optional(),
     rebootPolicy: z.enum(['if_required', 'always', 'never']).optional(),
     sources: z.array(z.enum(['os', 'third_party', 'custom'])).optional(),
-    limit: z.number().int().min(1).max(100).optional(),
+    ...pageZodShape(25, 100),
+    orgId: uuid.optional(),
   }).refine(
     (d) => {
       // rollback keeps a hard patchId requirement (it also needs deviceIds, a
@@ -81,6 +87,9 @@ export const fleetToolInputSchemas: Record<string, z.ZodType> = {
   ).refine(
     (d) => !d.allRings || d.action === 'decline',
     { message: 'allRings is only valid for the decline action' },
+  ).refine(
+    (d) => d.action !== 'device_history' || !!d.deviceId,
+    { message: 'deviceId is required for device_history' },
   ),
 
   manage_groups: z.object({
@@ -92,6 +101,7 @@ export const fleetToolInputSchemas: Record<string, z.ZodType> = {
     filterConditions: z.record(z.string(), z.unknown()).optional(),
     deviceIds: z.array(uuid).max(100).optional(),
     limit: z.number().int().min(1).max(200).optional(),
+    orgId: uuid.optional(),
   }).refine(
     (d) => {
       const needsId = ['get', 'membership_log', 'update', 'delete', 'add_devices', 'remove_devices'];
@@ -162,38 +172,26 @@ export const fleetToolInputSchemas: Record<string, z.ZodType> = {
   ),
 
   manage_alert_rules: z.object({
-    action: z.enum(['list_templates', 'list_rules', 'get_rule', 'create_rule', 'update_rule', 'delete_rule', 'test_rule', 'list_channels', 'alert_summary']),
+    action: z.enum(['list_rules', 'get_rule', 'test_rule', 'list_channels', 'alert_summary']),
     ruleId: uuid.optional(),
-    name: z.string().min(1).max(200).optional(),
-    templateId: uuid.optional(),
-    targetType: z.enum(['device', 'group', 'site', 'org', 'all']).optional(),
-    targetId: uuid.optional(),
-    overrideSettings: z.record(z.string(), z.unknown()).optional(),
-    isActive: z.boolean().optional(),
-    category: z.string().max(100).optional(),
     severity: z.enum(['critical', 'high', 'medium', 'low', 'info']).optional(),
     limit: z.number().int().min(1).max(100).optional(),
   }).refine(
-    (d) => {
-      const needsId = ['get_rule', 'update_rule', 'delete_rule', 'test_rule'];
-      return !needsId.includes(d.action) || !!d.ruleId;
-    },
+    (d) => !['get_rule', 'test_rule'].includes(d.action) || !!d.ruleId,
     { message: 'ruleId is required for this action' },
-  ).refine(
-    (d) => d.action !== 'create_rule' || (!!d.name && !!d.templateId && !!d.targetType && !!d.targetId),
-    { message: 'name, templateId, targetType, and targetId are required for create_rule' },
   ),
 
   generate_report: z.object({
     action: z.enum(['list', 'generate', 'data', 'create', 'update', 'delete', 'history', 'download']),
     reportId: uuid.optional(),
     reportRunId: uuid.optional(),
-    reportType: z.enum(['device_inventory', 'software_inventory', 'alert_summary', 'compliance', 'performance', 'executive_summary']).optional(),
+    reportType: z.enum(GENERATE_REPORT_TYPES).optional(),
     name: z.string().min(1).max(255).optional(),
     config: z.record(z.string(), z.unknown()).optional(),
     schedule: z.enum(['one_time', 'daily', 'weekly', 'monthly']).optional(),
     format: z.enum(['csv', 'pdf', 'excel']).optional(),
     limit: z.number().int().min(1).max(100).optional(),
+    orgId: uuid.optional(),
   }).refine(
     (d) => {
       const needsId = ['update', 'delete', 'history'];

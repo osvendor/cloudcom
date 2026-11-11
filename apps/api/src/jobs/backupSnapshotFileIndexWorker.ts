@@ -1,7 +1,9 @@
 // W09 (#6464) Task 4 — BullMQ worker that runs hydrateSnapshotFileIndex
-// (services/backupSnapshotFileIndex.ts) out of band. Enqueued from three
-// places: a backup result with referencedFiles > 0
-// (backupResultPersistence.ts), a bare-metal recovery creation preflight
+// (services/backupSnapshotFileIndex.ts) out of band. Enqueued from: a
+// persisted backup result — every S3 snapshot a brokered read can serve, plus
+// any snapshot with referencedFiles > 0 (backupResultPersistence.ts); the
+// first brokered-read delivery that finds no complete index
+// (backupStorageSessions.ts); a bare-metal recovery creation preflight
 // (bareMetalRecoveryService.ts, Task 5), and the exchange/authenticate
 // negotiation's 'pending' branch (recoveryCapabilities.ts route glue, Task
 // 5). jobId is snapshot-scoped so BullMQ's own dedupe collapses concurrent
@@ -10,8 +12,8 @@
 // non-retryable failures).
 import { Job, Queue, UnrecoverableError, Worker } from 'bullmq';
 import { getBullMQConnection } from '../services/redis';
-import { withSystemDbAccessContext } from '../db';
 import { hydrateSnapshotFileIndex } from '../services/backupSnapshotFileIndex';
+import { cleanStaleManifestSpools } from '../services/backupManifestSpool';
 import { attachWorkerObservability } from './workerObservability';
 import { isReusableState } from '../services/bullmqUtils';
 import { captureException } from '../services/sentry';
@@ -26,8 +28,38 @@ const JOB_OPTIONS = {
 
 type HydrationJobData = {
   snapshotDbId: string;
-  reason: 'result' | 'recovery_create' | 'authenticate' | 'exchange' | 'manual';
+  reason:
+    | 'result'
+    | 'result_brokered_read'
+    | 'recovery_create'
+    | 'authenticate'
+    | 'exchange'
+    | 'manual'
+    | 'brokered_read'
+    // #11026: someone browsed the snapshot, or asked for a selective restore
+    // of it, and it has no index to list.
+    | 'browse'
+    // #11026: someone asked for its file list to be built again.
+    | 'rebuild';
+  /** Rebuild even an index that is already complete (#11026 rebuild). */
+  force?: boolean;
 };
+
+/**
+ * Reasons that need an authoritative index even for a full snapshot (no
+ * referenced older snapshots): a brokered storage read authorizes objects by
+ * exact index membership. `result_brokered_read` is the eager request made
+ * when a backup result lands on a destination brokered reads can serve.
+ * Browsing lists every file, so a full snapshot needs its index too.
+ */
+const FULL_INDEX_REASONS: ReadonlySet<HydrationJobData['reason']> = new Set([
+  'brokered_read',
+  'result_brokered_read',
+  'browse',
+  'rebuild',
+]);
+
+export type SnapshotFileIndexHydrationReason = HydrationJobData['reason'];
 
 let queue: Queue<HydrationJobData> | null = null;
 let worker: Worker<HydrationJobData> | null = null;
@@ -53,6 +85,7 @@ export function hydrationJobId(snapshotDbId: string): string {
 export async function enqueueSnapshotFileIndexHydration(
   snapshotDbId: string,
   reason: HydrationJobData['reason'],
+  opts?: { force?: boolean },
 ): Promise<string> {
   const q = getQueue();
   const jobId = hydrationJobId(snapshotDbId);
@@ -73,12 +106,24 @@ export async function enqueueSnapshotFileIndexHydration(
     });
     console.log(`[BackupSnapshotFileIndexWorker] Removed stale ${state} job ${jobId}; re-enqueuing`);
   }
-  const job = await q.add('hydrate', { snapshotDbId, reason }, { jobId, ...JOB_OPTIONS });
+  const data: HydrationJobData = { snapshotDbId, reason, ...(opts?.force ? { force: true } : {}) };
+  const job = await q.add('hydrate', data, { jobId, ...JOB_OPTIONS });
   return job.id!;
 }
 
 async function processHydrationJob(job: Job<HydrationJobData>): Promise<{ status: string }> {
-  const outcome = await withSystemDbAccessContext(() => hydrateSnapshotFileIndex(job.data.snapshotDbId));
+  // hydrateSnapshotFileIndex opens its own system-scoped context
+  // (runOutsideDbContext + withSystemDbAccessContext) around its DB work.
+  // Wrapping it in a SECOND one here held a whole pooled connection idle in
+  // a transaction — doing nothing — for the entire hydration, including the
+  // uncapped manifest download inside it (two connections tied
+  // up per job across a large download). Let the callee own its own context.
+  // A brokered storage read needs an authoritative index even for a full
+  // snapshot (no referenced older snapshots), which the other reasons skip.
+  const outcome = await hydrateSnapshotFileIndex(job.data.snapshotDbId, {
+    includeUnreferenced: FULL_INDEX_REASONS.has(job.data.reason),
+    ...(job.data.force === true ? { force: true } : {}),
+  });
   if (outcome.status === 'failed' && !outcome.retryable) {
     // A non-retryable failure (bad manifest, unverifiable provenance, drifted
     // storage identity) will never succeed on retry — completing the job
@@ -97,6 +142,11 @@ async function processHydrationJob(job: Job<HydrationJobData>): Promise<{ status
   if (outcome.status === 'failed' && outcome.retryable) {
     throw new Error(`snapshot file-index hydration failed (retryable): ${outcome.failure}: ${outcome.reason}`);
   }
+  if (outcome.status === 'skipped' && outcome.reason === 'superseded') {
+    // Not an error (a newer claim, an org move or a newer result won), but a
+    // run that kept losing its claim would otherwise leave no trace.
+    console.warn(`[BackupSnapshotFileIndexWorker] Hydration of snapshot ${job.data.snapshotDbId} was superseded (reason: ${job.data.reason})`);
+  }
   return { status: outcome.status };
 }
 
@@ -108,6 +158,11 @@ function createWorker(): Worker<HydrationJobData> {
 }
 
 export async function initializeBackupSnapshotFileIndexWorker(): Promise<void> {
+  // A run killed mid-hydration leaves its manifest spool behind (#11026).
+  // Not awaited: a slow or failing sweep must never hold the worker back.
+  void cleanStaleManifestSpools().catch((error) => {
+    console.warn('[BackupSnapshotFileIndexWorker] Could not sweep stale manifest spools:', error);
+  });
   worker = createWorker();
   attachWorkerObservability(worker, 'backupSnapshotFileIndexWorker');
   worker.on('error', (error) => {

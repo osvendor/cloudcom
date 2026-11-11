@@ -68,7 +68,7 @@ vi.mock('../db', () => ({
       from: vi.fn((tbl: unknown) => {
         selectFromTablesMock((tbl as { __t?: string })?.__t ?? 'unknown');
         return {
-          where: vi.fn(() => ({ limit: vi.fn(() => selectMock()) }))
+          where: vi.fn(() => ({ limit: vi.fn(() => selectMock()), orderBy: vi.fn(() => selectMock()) }))
         };
       })
     })),

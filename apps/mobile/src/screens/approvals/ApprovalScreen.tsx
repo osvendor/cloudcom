@@ -10,8 +10,16 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { ScrollView } from 'react-native-gesture-handler';
 
 import { useAppDispatch, useAppSelector } from '../../store';
-import { approve, deny, markExpired, reportSuspicious } from '../../store/approvalsSlice';
-import { selectFocusedApproval } from '../../navigation/approvalTakeover';
+import {
+  approve,
+  deferFocused,
+  deny,
+  focusNext,
+  focusPrev,
+  markExpired,
+  reportSuspicious,
+} from '../../store/approvalsSlice';
+import { selectFocusedApproval, selectQueuePosition } from '../../navigation/approvalTakeover';
 import { useApprovalTheme, type, spacing, palette } from '../../theme';
 import { duration, ease, haptic } from '../../lib/motion';
 import { track } from '../../lib/analytics';
@@ -29,14 +37,24 @@ import { ActionHeadline } from './components/ActionHeadline';
 import { DetailsCollapse } from './components/DetailsCollapse';
 import { UacInterceptDetails } from './components/UacInterceptDetails';
 import { ScriptProposalDetails } from './components/ScriptProposalDetails';
+import { OperatorPlanDetails } from './components/OperatorPlanDetails';
+import { isOperatorPlanReadable } from './operatorPlanCopy';
+import { isOperatorPlanApproval } from '../../services/approvals';
 import { RiskBand } from './components/RiskBand';
 import { CustomerTenantBadge } from './components/CustomerTenantBadge';
 import { ApprovalButtons } from './components/ApprovalButtons';
 import { resolveApprovalFlowType, extractProposalId } from './approvalFlow';
-import { getApprovalCopy } from './approvalCopy';
+import { approveOutcomeToast, getApprovalCopy } from './approvalCopy';
 import { decisionTarget, type CapturedRequestId } from './decisionTarget';
 import { SuspiciousReportSheet } from './components/SuspiciousReportSheet';
 import { ToastOutlet, useToast } from '../../components/toast/ToastHost';
+import { CriticalReauthField } from './components/CriticalReauthField';
+import {
+  buildReauthFactor,
+  reauthErrorMessage,
+  requiresCriticalReauth,
+  type ReauthMode,
+} from './criticalReauth';
 
 export function ApprovalScreen() {
   const insets = useSafeAreaInsets();
@@ -46,6 +64,11 @@ export function ApprovalScreen() {
   // #5172: shared with ApprovalGate so the takeover Modal's visibility and
   // this screen's content branch can never drift apart — see approvalTakeover.ts.
   const focused = useAppSelector((s) => selectFocusedApproval(s.approvals));
+  // #6212: "2 of 5" pager, shown only when more than one approval is pending
+  // so the single-pending takeover is unchanged. Primitive selectors keep it
+  // from re-rendering on unrelated store updates.
+  const queueIndex = useAppSelector((s) => selectQueuePosition(s.approvals)?.index ?? 0);
+  const queueTotal = useAppSelector((s) => selectQueuePosition(s.approvals)?.total ?? 0);
   const inFlight = useAppSelector((s) =>
     focused ? (s.approvals.decisionInFlight[focused.id] ?? null) : null
   );
@@ -81,6 +104,15 @@ export function ApprovalScreen() {
   // this doesn't need its own focus-tracking effect.
   const [acknowledgedPatterns, setAcknowledgedPatterns] = useState<string[]>([]);
   const [proposalApproveBlocked, setProposalApproveBlocked] = useState<'acknowledge' | 'permission' | null>(null);
+  // #4052: critical-tier re-auth. Held only in component state for the one
+  // approve it is typed for: cleared the moment Approve is pressed and
+  // whenever focus moves to another request, never persisted or logged.
+  const [reauthMode, setReauthMode] = useState<ReauthMode>('password');
+  const [reauthSecret, setReauthSecret] = useState('');
+  const focusedId = focused?.id ?? null;
+  useEffect(() => {
+    setReauthSecret('');
+  }, [focusedId]);
 
   // When does the user "see" the approval? When ApprovalScreen mounts onto a
   // focused approval — that's the takeover moment. We stamp it per approval
@@ -153,6 +185,17 @@ export function ApprovalScreen() {
       showToast({ owner: APPROVAL_TOAST_OWNER, kind: 'error', text: 'This request changed before you confirmed — review it again.' });
       return;
     }
+    // #4052: a critical approve carries the re-auth typed for THIS request.
+    // Taken into a local and cleared from state right away — one attempt per
+    // entry, so a rejected password is retyped rather than silently resent.
+    const reauth = requiresCriticalReauth(target.riskTier)
+      ? buildReauthFactor(reauthMode, reauthSecret)
+      : undefined;
+    setReauthSecret('');
+    if (requiresCriticalReauth(target.riskTier) && !reauth) {
+      showToast({ owner: APPROVAL_TOAST_OWNER, kind: 'error', text: reauthErrorMessage('REAUTH_REQUIRED')! });
+      return;
+    }
     successWash.value = withSequence(
       withTiming(1, { duration: 200, easing: ease }),
       withTiming(0, { duration: 600, easing: ease })
@@ -163,22 +206,31 @@ export function ApprovalScreen() {
     // Recomputed from the captured snapshot (not the outer `flowType`) so the
     // decision matches exactly what the user consented to at press time.
     const isScriptProposal = resolveApprovalFlowType(approvalSnap) === 'script_proposal';
+    const acks = isScriptProposal && acknowledgedPatterns.length > 0 ? acknowledgedPatterns : undefined;
     dispatch(
       approve(
-        isScriptProposal && acknowledgedPatterns.length > 0
-          ? { id: approvalSnap.id, acknowledgedPatterns }
+        acks || reauth
+          ? {
+              id: approvalSnap.id,
+              ...(acks ? { acknowledgedPatterns: acks } : {}),
+              // A getter, not the value — see ApproveArg.takeReauth.
+              ...(reauth ? { takeReauth: () => reauth } : {}),
+            }
           : approvalSnap.id
       )
     )
       .unwrap()
-      .then(() => {
+      .then((decided) => {
         track('approval_decided', {
           decision: 'approve',
           risk_tier: approvalSnap.riskTier,
           is_recursive: approvalSnap.isRecursive,
           seconds_to_decide: decideSeconds,
         });
-        showToast({ owner: APPROVAL_TOAST_OWNER, sourceId: approvalSnap.id, kind: 'success', text: `Approved · ${approvalSnap.actionLabel}` });
+        // Read from the returned row: an approve the server refused comes
+        // back `denied` and must not be confirmed as approved.
+        const outcome = approveOutcomeToast(decided, approvalSnap.actionLabel);
+        showToast({ owner: APPROVAL_TOAST_OWNER, sourceId: approvalSnap.id, kind: outcome.kind, text: outcome.text });
       })
       .catch((err: Error) => {
         showToast({ owner: APPROVAL_TOAST_OWNER, kind: 'error', text: messageForDecisionError(err.message, 'Approve') });
@@ -218,6 +270,8 @@ export function ApprovalScreen() {
   function messageForDecisionError(code: string, verb: 'Approve' | 'Deny'): string {
     if (code === 'ALREADY_DECIDED') return 'Already decided elsewhere.';
     if (code === 'EXPIRED') return 'This request expired.';
+    const reauthMessage = reauthErrorMessage(code);
+    if (reauthMessage) return reauthMessage;
     return `${verb} failed. Try again.`;
   }
 
@@ -305,6 +359,7 @@ export function ApprovalScreen() {
   // other flow keeps the existing actionLabel + generic JSON details.
   const flowType = resolveApprovalFlowType(focused);
   const copy = getApprovalCopy(focused);
+  const needsReauth = requiresCriticalReauth(focused.riskTier);
 
   return (
     <View style={{ flex: 1, backgroundColor: theme.bg0 }}>
@@ -335,7 +390,61 @@ export function ApprovalScreen() {
           </Pressable>
         </View>
 
-        <ScrollView style={{ flex: 1 }} contentContainerStyle={{ paddingBottom: spacing[16] }}>
+        {queueTotal > 1 ? (
+          <View
+            testID="approval-queue-nav"
+            style={{
+              paddingHorizontal: spacing[6],
+              paddingTop: spacing[3],
+              flexDirection: 'row',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+            }}
+          >
+            <Pressable
+              onPress={() => dispatch(focusPrev())}
+              disabled={inFlight !== null}
+              hitSlop={12}
+              accessibilityRole="button"
+              accessibilityLabel="Previous approval"
+            >
+              <Text style={[type.meta, { color: theme.textMd }]}>‹ Prev</Text>
+            </Pressable>
+            <View style={{ alignItems: 'center' }}>
+              <Text
+                style={[type.meta, { color: theme.textHi }]}
+                accessibilityLabel={`Approval ${queueIndex} of ${queueTotal}`}
+              >
+                {queueIndex} of {queueTotal}
+              </Text>
+              <Pressable
+                onPress={() => dispatch(deferFocused())}
+                disabled={inFlight !== null}
+                hitSlop={12}
+                accessibilityRole="button"
+                accessibilityLabel="Decide this approval later"
+                accessibilityHint="Sets this request aside and shows the next one without deciding it"
+              >
+                <Text style={[type.meta, { color: theme.brand }]}>Later</Text>
+              </Pressable>
+            </View>
+            <Pressable
+              onPress={() => dispatch(focusNext())}
+              disabled={inFlight !== null}
+              hitSlop={12}
+              accessibilityRole="button"
+              accessibilityLabel="Next approval"
+            >
+              <Text style={[type.meta, { color: theme.textMd }]}>Next ›</Text>
+            </Pressable>
+          </View>
+        ) : null}
+
+        <ScrollView
+          style={{ flex: 1 }}
+          contentContainerStyle={{ paddingBottom: spacing[16] }}
+          keyboardShouldPersistTaps="handled"
+        >
           <RequesterRow
             clientLabel={focused.requestingClientLabel}
             machineLabel={focused.requestingMachineLabel}
@@ -346,6 +455,15 @@ export function ApprovalScreen() {
             <CustomerTenantBadge tenant={focused.customerTenant} />
           ) : null}
           <RiskBand tier={focused.riskTier} summary={focused.riskSummary} />
+          {needsReauth ? (
+            <CriticalReauthField
+              mode={reauthMode}
+              value={reauthSecret}
+              onChangeMode={setReauthMode}
+              onChangeValue={setReauthSecret}
+              editable={inFlight === null}
+            />
+          ) : null}
           {flowType === 'uac_intercept' ? (
             <UacInterceptDetails args={focused.actionArguments} />
           ) : flowType === 'script_proposal' ? (
@@ -354,6 +472,8 @@ export function ApprovalScreen() {
               onAcknowledgementsChange={setAcknowledgedPatterns}
               onApproveBlockedChange={setProposalApproveBlocked}
             />
+          ) : isOperatorPlanApproval(focused) ? (
+            <OperatorPlanDetails args={focused.actionArguments} />
           ) : (
             <DetailsCollapse toolName={focused.actionToolName} args={focused.actionArguments} />
           )}
@@ -361,14 +481,20 @@ export function ApprovalScreen() {
 
         <View style={{ paddingBottom: insets.bottom + spacing[5] }}>
           <ApprovalButtons
+            key={focused.id}
             requestId={focused.id}
             isRecursive={isRecursive}
             inFlight={inFlight}
             approveLabel={copy.approveLabel}
             holdLabel={copy.holdLabel}
+            denyShownToEndUser={flowType === 'uac_intercept'}
             onApprove={handleApprove}
             onDeny={handleDeny}
-            approveDisabled={flowType === 'script_proposal' && proposalApproveBlocked !== null}
+            approveDisabled={
+              (flowType === 'script_proposal' && proposalApproveBlocked !== null) ||
+              (isOperatorPlanApproval(focused) && !isOperatorPlanReadable(focused.actionArguments)) ||
+              (needsReauth && !buildReauthFactor(reauthMode, reauthSecret))
+            }
           />
         </View>
       </Animated.View>

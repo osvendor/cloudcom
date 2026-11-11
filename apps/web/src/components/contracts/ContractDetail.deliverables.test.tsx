@@ -42,7 +42,9 @@ const resp = (payload: unknown, ok = true): Response =>
   ({ ok, status: ok ? 200 : 500, statusText: 'OK', json: vi.fn().mockResolvedValue(payload) }) as unknown as Response;
 
 const activeDetail: ContractDetailData = {
+  autopayEnabled: false,
   contract: {
+    autopayExcluded: false,
     id: 'ct-1', partnerId: 'p1', orgId: 'org-77', name: 'Acme MSA', status: 'active',
     billingTiming: 'advance', intervalMonths: 1, startDate: '2026-06-01', endDate: null,
     nextBillingAt: null, autoIssue: false, autoRenew: false, renewalTermMonths: null, renewalNoticeDays: null,
@@ -80,5 +82,18 @@ describe('ContractDetail — service deliverables section', () => {
     render(<ContractDetail detail={activeDetail} onChanged={vi.fn()} />);
     await waitFor(() => expect(fetchWithAuthMock).toHaveBeenCalledWith('/orgs/org-77/deliverables?contractId=ct-1'));
     expect(await screen.findByText(/No deliverables yet/)).toBeInTheDocument();
+  });
+
+  it('#9309: a draft contract says its deliverables are paused until activation', async () => {
+    const draft = { ...activeDetail, contract: { ...activeDetail.contract, status: 'draft' as const } };
+    render(<ContractDetail detail={draft} onChanged={vi.fn()} />);
+    const notice = await screen.findByTestId('contract-deliverables-paused');
+    expect(notice).toHaveTextContent('Paused until the contract is activated');
+  });
+
+  it('#9309: an active contract shows no paused notice', async () => {
+    render(<ContractDetail detail={activeDetail} onChanged={vi.fn()} />);
+    await screen.findByTestId('contract-deliverables');
+    expect(screen.queryByTestId('contract-deliverables-paused')).not.toBeInTheDocument();
   });
 });

@@ -1,3 +1,8 @@
+vi.mock('../services/deviceGroupOwnership', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../services/deviceGroupOwnership')>(),
+  findPartnerOwnedGroupIds: vi.fn().mockResolvedValue([]),
+}));
+import { findPartnerOwnedGroupIds } from '../services/deviceGroupOwnership';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
@@ -27,10 +32,12 @@ import { buildOrgAccessClosures } from '../middleware/auth';
 // Real (unmocked): access.ts is the single source of truth for who may mutate
 // an agent row, and POST /:id/enable calls it directly.
 import { AgentAccessDeniedError } from '../services/aiAgents/access';
+import { AgentModelNotAllowedError } from '../services/aiAgents/agentModelErrors';
 // Resolves to the MOCKED class (vi.mock('../services/aiAgents/agentService')
 // below) — needed so a PATCH test can construct the exact instance
 // `updateAgentMock` rejects with.
 import { ModeNotAllowedForKindError } from '../services/aiAgents/agentService';
+import { TroubleshootAgentEditError } from '../services/aiAgents/troubleshootAgentEdit';
 
 const {
   selectMock,
@@ -150,6 +157,25 @@ vi.mock('../services/aiAgents/skipVisibility', () => ({
   readAgentRunSkipSummary: readAgentRunSkipSummaryMock,
 }));
 
+// #7943 — models withAuthDbAccessContext as a short context that commits when
+// its callback returns. `depth` is how many request-scoped contexts are open at
+// the moment a service mock runs, so a test can prove admission ran with none
+// held (the self-managed POST /:id/runs contract).
+const authDbCtx = vi.hoisted(() => {
+  const state = { depth: 0 };
+  return {
+    state,
+    withAuthDbAccessContextMock: vi.fn(async (_auth: unknown, fn: () => Promise<unknown>) => {
+      state.depth += 1;
+      try {
+        return await fn();
+      } finally {
+        state.depth -= 1;
+      }
+    }),
+  };
+});
+
 vi.mock('../middleware/auth', async (importOriginal) => {
   // Review round 1 (Task 18): `buildOrgAccessClosures` is the REAL
   // implementation (via importOriginal), not a hand-rolled stand-in — a test
@@ -172,6 +198,7 @@ vi.mock('../middleware/auth', async (importOriginal) => {
       hasPermMock(resource, action) ? next() : c.json({ error: 'Permission denied' }, 403)
     ),
     buildOrgAccessClosures: actual.buildOrgAccessClosures,
+    withAuthDbAccessContext: authDbCtx.withAuthDbAccessContextMock,
   };
 });
 
@@ -195,6 +222,9 @@ const { ActPrerequisitesNotMetError, InvalidSupervisedActionKeysError, Supervise
     }
   },
 }));
+
+// W5 PR C (#5220): the save-time flow-tool warning reads flows; stubbed here.
+vi.mock('../services/flows/agentFlowTools', () => ({ unknownFlowToolNames: vi.fn(async () => []) }));
 
 vi.mock('../services/aiAgents/agentService', () => ({
   AgentInvariantError: class AgentInvariantError extends Error {},
@@ -495,7 +525,7 @@ function minimalToolCatalogDto(overrides: Partial<AgentToolCatalogDto> = {}): Ag
         ],
       },
     ],
-    presets: { triage: ['manage_services:restart'], patch: [], helpdesk: [], designer: [] },
+    presets: { triage: ['manage_services:restart'], patch: [], helpdesk: [], designer: [], research: [], troubleshoot: [] },
     unreachableTools: [],
     ...overrides,
   };
@@ -541,6 +571,7 @@ function trigger(app: Hono, body: unknown = { deviceId: DEVICE_ID }, id = AGENT_
 }
 
 beforeEach(() => {
+  vi.mocked(findPartnerOwnedGroupIds).mockReset().mockResolvedValue([]);
   vi.clearAllMocks();
   hasPermMock.mockReturnValue(true);
   loadMeasuredImpactMock.mockResolvedValue({ schemaVersion: 1, window: 30 });
@@ -743,6 +774,50 @@ describe('POST /ai-agents/:id/runs', () => {
     expect(malformed.status).toBe(400);
     expect(smuggled.status).toBe(400);
     expect(createAndEnqueueAgentRunMock).not.toHaveBeenCalled();
+  });
+
+  // #7943 — admission opens its own system transaction(s) and enqueues the
+  // BullMQ job after they commit. Under the ambient request transaction every
+  // manual run pinned a second pooled connection for the length of admission
+  // (#2417 / #6671 pool class). The route is self-managed: authorization reads
+  // run in ONE short caller-scoped (RLS) context that commits, and admission
+  // runs with no context held.
+  it('authorizes in one short caller-scoped context, then admits with no DB context held (#7943)', async () => {
+    const depths: Record<string, number> = {};
+    getAgentMock.mockImplementation(async () => {
+      depths.getAgent = authDbCtx.state.depth;
+      return agent();
+    });
+    verifyDeviceAccessMock.mockImplementation(async () => {
+      depths.verifyDeviceAccess = authDbCtx.state.depth;
+      return { device: { id: DEVICE_ID, orgId: ORG_ID, siteId: null } };
+    });
+    createAndEnqueueAgentRunMock.mockImplementation(async () => {
+      depths.admission = authDbCtx.state.depth;
+      return { created: true, run: { id: RUN_ID, status: 'queued' } };
+    });
+    writeRouteAuditMock.mockImplementation(() => {
+      depths.audit = authDbCtx.state.depth;
+    });
+
+    const res = await trigger(buildApp());
+
+    expect(res.status).toBe(202);
+    expect(depths).toEqual({ getAgent: 1, verifyDeviceAccess: 1, admission: 0, audit: 0 });
+    // One context for both authorization reads, opened with the caller's own
+    // auth (dbAccessContextFromAuth — the request transaction's tenant scope).
+    expect(authDbCtx.withAuthDbAccessContextMock).toHaveBeenCalledTimes(1);
+    expect(authDbCtx.withAuthDbAccessContextMock).toHaveBeenCalledWith(
+      expect.objectContaining({ user: expect.objectContaining({ id: USER_ID }) }),
+      expect.any(Function),
+    );
+  });
+
+  it('opens no DB context at all for a non-uuid agent id (#7943)', async () => {
+    const res = await trigger(buildApp(), { deviceId: DEVICE_ID }, 'not-a-uuid');
+
+    expect(res.status).toBe(404);
+    expect(authDbCtx.withAuthDbAccessContextMock).not.toHaveBeenCalled();
   });
 
   it('lets a missing-organization HTTPException reach the global error handler', async () => {
@@ -1056,6 +1131,15 @@ const runDetailResponseSchema = z.object({
     deviceId: z.string().nullable(),
     deviceHostname: z.string().nullable(),
     alertId: z.string().nullable(),
+    // W2 #11085: the run card shows Continue only for a device_troubleshooting run.
+    profile: z.string(),
+    wisp: z.object({
+      grantId: z.string(),
+      grantorUserId: z.string(),
+      grantorName: z.string().nullable(),
+      depth: z.union([z.literal(0), z.literal(1)]),
+      requestedByRunId: z.string().nullable(),
+    }).strict().nullable(),
     triggerKind: z.string(),
     modeAtStart: z.string(),
     status: z.string(),
@@ -1088,6 +1172,9 @@ const runDetailResponseSchema = z.object({
       actionName: z.string(),
       approvalScope: z.string(),
       decidedVia: z.string().nullable(),
+      // W2 #11085: the caller's own pending approval row (label + id) for inline approve.
+      actionLabel: z.string().nullable(),
+      approvalRequestId: z.string().nullable(),
     }).strict()),
     // Wave 6 PR 3 (#3828, Task 4); reshaped in P2-4 (#4191) onto the
     // `TicketTriageProposal` outcome (@breeze/shared) — no args/toolInput/
@@ -1443,6 +1530,54 @@ describe('GET /ai-agents/runs/:runId (execution-trace detail, #3828)', () => {
     expect(await res.json()).toEqual({ error: 'Run not found' });
   });
 
+  it('GET /runs/:id returns wisp provenance for a grant-bearing run and null otherwise', async () => {
+    const GRANT_ID = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+    const GRANTOR_ID = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+    const PARENT_RUN = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+    const app = buildApp();
+    // Every select after the first (run) row — intents, workspace, artifacts — is empty.
+    selectMock.mockReturnValue(selectChain([]));
+
+    selectMock.mockReturnValueOnce(selectChain([runRow({
+      sessionId: null, intentIds: [],
+      grantId: GRANT_ID, grantorUserId: GRANTOR_ID, grantorName: 'Todd',
+      depth: 1, requestedByRunId: PARENT_RUN,
+    })]));
+    const withGrant = await app.request(`/ai-agents/runs/${RUN_ID}`);
+    expect(withGrant.status).toBe(200);
+    const withBody = await withGrant.json() as { data: { wisp: unknown } };
+    expect(withBody.data.wisp).toEqual({
+      grantId: GRANT_ID, grantorUserId: GRANTOR_ID, grantorName: 'Todd',
+      depth: 1, requestedByRunId: PARENT_RUN,
+    });
+
+    // Grant id set but the grant/user rows invisible (null join) -> grantorName
+    // null when only the user is invisible.
+    selectMock.mockReturnValueOnce(selectChain([runRow({
+      sessionId: null, intentIds: [],
+      grantId: GRANT_ID, grantorUserId: GRANTOR_ID, grantorName: null,
+      depth: 0, requestedByRunId: null,
+    })]));
+    const noName = await app.request(`/ai-agents/runs/${RUN_ID}`);
+    expect(((await noName.json()) as { data: { wisp: { grantorName: unknown; depth: unknown } } }).data.wisp)
+      .toMatchObject({ grantorName: null, depth: 0 });
+
+    selectMock.mockReturnValueOnce(selectChain([runRow({
+      sessionId: null, intentIds: [], grantId: null, grantorUserId: null, grantorName: null,
+      depth: 0, requestedByRunId: null,
+    })]));
+    const without = await app.request(`/ai-agents/runs/${RUN_ID}`);
+    expect(((await without.json()) as { data: { wisp: unknown } }).data.wisp).toBeNull();
+
+    // Grant row invisible under RLS (grantor id comes back null) -> null.
+    selectMock.mockReturnValueOnce(selectChain([runRow({
+      sessionId: null, intentIds: [], grantId: GRANT_ID, grantorUserId: null, grantorName: null,
+      depth: 0, requestedByRunId: null,
+    })]));
+    const invisible = await app.request(`/ai-agents/runs/${RUN_ID}`);
+    expect(((await invisible.json()) as { data: { wisp: unknown } }).data.wisp).toBeNull();
+  });
+
   it('rejects a non-uuid run id without touching the database', async () => {
     const res = await buildApp().request('/ai-agents/runs/not-a-uuid');
     expect(res.status).toBe(404);
@@ -1596,6 +1731,30 @@ describe('GET /ai-agents/runs/:runId (execution-trace detail, #3828)', () => {
     expect(JSON.stringify(body)).not.toContain('"patchIds"');
   });
 
+
+  it('W2 #11085: a pending intent carries the caller\'s own approval row (id + label); others carry nulls; profile is on the DTO', async () => {
+    const PENDING = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+    const DONE = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+    selectMock
+      .mockReturnValueOnce(selectChain([runRow({ sessionId: null, profile: 'device_troubleshooting' })]))
+      .mockReturnValueOnce(selectChain([
+        { id: PENDING, status: 'pending_approval', actionName: 'manage_services', approvalScope: 'supervised', decidedVia: null,
+          approvalRequestId: 'ffffffff-ffff-4fff-8fff-ffffffffffff', actionLabel: 'Restart the Print Spooler service on WS-01' },
+        // A duplicate join row for the same intent never doubles it.
+        { id: PENDING, status: 'pending_approval', actionName: 'manage_services', approvalScope: 'supervised', decidedVia: null,
+          approvalRequestId: 'ffffffff-ffff-4fff-8fff-ffffffffffff', actionLabel: 'Restart the Print Spooler service on WS-01' },
+        { id: DONE, status: 'completed', actionName: 'set_device_context', approvalScope: 'supervised', decidedVia: 'human',
+          approvalRequestId: null, actionLabel: null },
+      ]));
+    const res = await buildApp().request(`/ai-agents/runs/${RUN_ID}`);
+    expect(res.status).toBe(200);
+    const parsed = runDetailResponseSchema.parse(await res.json());
+    expect(parsed.data.profile).toBe('device_troubleshooting');
+    expect(parsed.data.intents).toEqual([
+      expect.objectContaining({ id: PENDING, approvalRequestId: 'ffffffff-ffff-4fff-8fff-ffffffffffff', actionLabel: 'Restart the Print Spooler service on WS-01' }),
+      expect.objectContaining({ id: DONE, approvalRequestId: null, actionLabel: null }),
+    ]);
+  });
 
   it('reads intents by requesting_agent_run_id and reports a COMPLETED sweep intent that run.intentIds dropped', async () => {
     // #4442 W05 — the exact regression act mode introduces. `run.intent_ids`
@@ -2390,7 +2549,7 @@ describe('GET /ai-agents/runs/:runId (execution-trace detail, #3828)', () => {
     expect(sqlParams(intentWhere)).toContain(RUN_ID);
     expect(parsed.data.intents).toEqual([{
       id: SWEEP_INTENT_ID, status: 'completed', actionName: 'manage_services:restart',
-      approvalScope: 'supervised', decidedVia: 'policy',
+      approvalScope: 'supervised', decidedVia: 'policy', actionLabel: null, approvalRequestId: null,
     }]);
     expect(parsed.data.artifacts).toEqual([]);
     expect(parsed.data.workspace).toBeNull();
@@ -3178,7 +3337,6 @@ describe('AI agents impact routes — registration order (#4193 A8)', () => {
       ...agent(),
       enabled: true,
       mode: 'supervised',
-      model: 'default',
       toolAllowlist: [],
       protectedResources: [],
       limits: AI_AGENT_LIMIT_DEFAULTS,
@@ -4196,7 +4354,6 @@ function agentRow(overrides: Record<string, unknown> = {}) {
     name: 'Triage',
     enabled: false,
     mode: 'shadow',
-    model: null,
     orgId: ORG_ID,
     partnerId: null,
     toolAllowlist: [],
@@ -4533,6 +4690,129 @@ describe('PATCH /ai-agents/:id — mode vs kind (Fleet Designer W01)', () => {
   });
 });
 
+describe('troubleshoot agent edit restrictions (#11084)', () => {
+  it('PATCH maps TroubleshootAgentEditError to 400 troubleshoot_agent_edit_restricted with fields', async () => {
+    updateAgentMock.mockRejectedValueOnce(new TroubleshootAgentEditError(['mode', 'toolAllowlist']));
+
+    const res = await buildApp().request(`/ai-agents/${AGENT_ID}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ mode: 'act' }),
+    });
+
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({
+      code: 'troubleshoot_agent_edit_restricted',
+      fields: ['mode', 'toolAllowlist'],
+    });
+  });
+
+  it('mapError maps it directly', () => {
+    const jsonMock = vi.fn((body: unknown, status: number) => ({ body, status }));
+    const ctx = { json: jsonMock } as unknown as Parameters<typeof mapError>[0];
+    mapError(ctx, new TroubleshootAgentEditError(['kind']));
+    expect(jsonMock).toHaveBeenCalledWith(
+      expect.objectContaining({ code: 'troubleshoot_agent_edit_restricted', fields: ['kind'] }),
+      400,
+    );
+  });
+
+  it('POST with kind troubleshoot is refused at the zod layer (400) and never reaches createAgent', async () => {
+    const { createAgent } = await import('../services/aiAgents/agentService');
+    vi.mocked(createAgent).mockClear();
+    const res = await buildApp().request('/ai-agents', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'T', kind: 'troubleshoot', mode: 'shadow' }),
+    });
+    expect(res.status).toBe(400);
+    expect(vi.mocked(createAgent)).not.toHaveBeenCalled();
+  });
+});
+
+// AI model registry W03 (Task 12 Step 7A): the policy model is bound to a
+// registry offering at write time; a refusal is an actionable 400 (503 while
+// the partner's registry cutover is pending).
+describe('PATCH /ai-agents/:id — policy model binding (AI model registry W03)', () => {
+  function patchAgent(app: Hono, body: unknown, id = AGENT_ID) {
+    return app.request(`/ai-agents/${id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  }
+
+  it('400s with code not_permitted when the model is outside the ai_agents permitted set', async () => {
+    updateAgentMock.mockRejectedValueOnce(new AgentModelNotAllowedError('This AI model is not permitted for AI agents here. Choose another model.', 'not_permitted'));
+
+    const res = await patchAgent(buildApp(), { offeringId: '0b8f1f2e-6a1c-4c55-9a39-6a7f1e1c0a02' });
+
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({
+      error: 'This AI model is not permitted for AI agents here. Choose another model.', code: 'not_permitted',
+    });
+  });
+
+  it('503s with code registry_unavailable while the registry cutover is pending', async () => {
+    updateAgentMock.mockRejectedValueOnce(new AgentModelNotAllowedError('AI configuration is being upgraded. Try again in a moment.', 'registry_unavailable'));
+
+    const res = await patchAgent(buildApp(), { offeringId: '0b8f1f2e-6a1c-4c55-9a39-6a7f1e1c0a02' });
+
+    expect(res.status).toBe(503);
+    expect(await res.json()).toMatchObject({ code: 'registry_unavailable' });
+  });
+
+  // W05 (#7603): the picker's path binds by offering id, judged for the WRITER.
+  const OFFERING_ID = '0b8f1f2e-6a1c-4c55-9a39-6a7f1e1c0a01';
+
+  it('PATCH with an offering the writer may not use → 403 permission_required (W05)', async () => {
+    updateAgentMock.mockRejectedValueOnce(new AgentModelNotAllowedError('Your role does not allow this AI model. Choose another model.', 'permission_required'));
+
+    const res = await patchAgent(buildApp(), { offeringId: OFFERING_ID });
+
+    expect(res.status).toBe(403);
+    expect(await res.json()).toMatchObject({ code: 'permission_required' });
+  });
+
+  it('PATCH forwards offeringId to the service; a non-uuid offeringId is a 400 before it (W05)', async () => {
+    updateAgentMock.mockResolvedValueOnce({ ...agentRow(), offeringId: OFFERING_ID });
+    const ok = await patchAgent(buildApp(), { offeringId: OFFERING_ID });
+    expect(ok.status).toBe(200);
+    expect(updateAgentMock).toHaveBeenCalledWith(expect.anything(), AGENT_ID, expect.objectContaining({ offeringId: OFFERING_ID }));
+    expect((await ok.json()).data).toMatchObject({ offeringId: OFFERING_ID });
+
+    updateAgentMock.mockClear();
+    const bad = await patchAgent(buildApp(), { offeringId: 'opus' });
+    expect(bad.status).toBe(400);
+    expect(updateAgentMock).not.toHaveBeenCalled();
+  });
+
+  it('the agent DTO carries offeringId, null when unbound (W05)', async () => {
+    getAgentMock.mockResolvedValueOnce(agentRow());
+    const res = await buildApp().request(`/ai-agents/${AGENT_ID}`);
+    expect(res.status).toBe(200);
+    expect((await res.json()).data).toHaveProperty('offeringId', null);
+  });
+
+  // W08 (#7606): the policy model string is retired. Rejected, never stripped:
+  // a 400 naming offeringId, and nothing in the request reaches the service.
+  it('PATCH /ai/agents/:id with model (any value, including null) → 400 naming offeringId; nothing applied', async () => {
+    for (const model of ['claude-opus-5-5', null]) {
+      const res = await patchAgent(buildApp(), { name: 'Renamed', model });
+      expect(res.status).toBe(400);
+      expect(JSON.stringify(await res.json())).toContain('offeringId');
+    }
+    expect(updateAgentMock).not.toHaveBeenCalled();
+  });
+
+  it('the agent DTO no longer carries model, even from a row that still has the column (W08)', async () => {
+    getAgentMock.mockResolvedValueOnce({ ...agentRow(), model: 'claude-legacy' });
+    const res = await buildApp().request(`/ai-agents/${AGENT_ID}`);
+    expect(res.status).toBe(200);
+    expect((await res.json()).data).not.toHaveProperty('model');
+  });
+});
+
 describe('POST /ai-agents/:id/enable', () => {
   const ENABLE = `/ai-agents/${AGENT_ID}/enable`;
 
@@ -4829,9 +5109,62 @@ describe('POST /ai-agents (create)', () => {
     const body = (await res.json()) as { details: { fieldErrors: Record<string, string[]> } };
     expect(body.details.fieldErrors.mode?.[0]).toMatch(/not available for a designer agent/);
   });
+
+  it('POST /ai/agents with model (any value, including null) → 400 naming offeringId; createAgent never runs (W08, #7606)', async () => {
+    const { createAgent } = await import('../services/aiAgents/agentService');
+    for (const model of ['claude-x', null]) {
+      const res = await createAgentRequest(buildApp(), { kind: 'triage', name: 'Triage', model });
+      expect(res.status).toBe(400);
+      expect(JSON.stringify(await res.json())).toContain('offeringId');
+    }
+    expect(vi.mocked(createAgent)).not.toHaveBeenCalled();
+  });
+
+  // W5 PR C (#5220, Decision 9): an allowlisted `flow__<slug>` with no such
+  // enabled manual flow for the agent's owner is saved (the TOOL_REF regex
+  // admits it; the flow may be enabled later) but the response warns.
+  it('agent save with an unknown flow__ name warns, not errors', async () => {
+    const { createAgent } = await import('../services/aiAgents/agentService');
+    const { unknownFlowToolNames } = await import('../services/flows/agentFlowTools');
+    vi.mocked(createAgent).mockResolvedValueOnce(agentRow({ toolAllowlist: ['flow__nope', 'flow__report', 'query_devices'] }) as never);
+    vi.mocked(unknownFlowToolNames).mockResolvedValueOnce(['flow__nope']);
+
+    const res = await createAgentRequest(buildApp(), { kind: 'triage', name: 'Triage', toolAllowlist: ['flow__nope', 'flow__report', 'query_devices'] });
+
+    expect(res.status).toBe(201);
+    expect((await res.json()).warnings).toEqual([{ code: 'flow_tool_unknown', tools: ['flow__nope'] }]);
+    expect(vi.mocked(unknownFlowToolNames)).toHaveBeenCalledWith({ orgId: ORG_ID, partnerId: null }, ['flow__nope', 'flow__report', 'query_devices']);
+  });
+
+  it('a save whose flow tools all exist carries no warnings key', async () => {
+    const { createAgent } = await import('../services/aiAgents/agentService');
+    const { unknownFlowToolNames } = await import('../services/flows/agentFlowTools');
+    vi.mocked(createAgent).mockResolvedValueOnce(agentRow({ toolAllowlist: ['flow__report'] }) as never);
+    vi.mocked(unknownFlowToolNames).mockResolvedValueOnce([]);
+    const res = await createAgentRequest(buildApp(), { kind: 'triage', name: 'Triage', toolAllowlist: ['flow__report'] });
+    expect(res.status).toBe(201);
+    expect(await res.json()).not.toHaveProperty('warnings');
+  });
+
+  it('answers a site-restricted create refusal with 403 and the standard message, not a 404', async () => {
+    const { createAgent } = await import('../services/aiAgents/agentService');
+    const { AgentSiteCeilingDeniedError } = await import('../services/aiAgents/access');
+    vi.mocked(createAgent).mockRejectedValueOnce(new AgentSiteCeilingDeniedError());
+
+    const res = await createAgentRequest(buildApp(), { kind: 'triage', name: 'Triage' });
+
+    expect(res.status).toBe(403);
+    expect((await res.json()).error).toMatch(/Site-restricted users cannot modify/);
+  });
 });
 
 describe('POST /ai-agents/preview', () => {
+  it('400s a draft carrying the retired model string, naming offeringId (W08, #7606)', async () => {
+    const res = await previewRequest(buildApp(), { kind: 'triage', model: 'claude-x' });
+    expect(res.status).toBe(400);
+    expect(JSON.stringify(await res.json())).toContain('offeringId');
+  });
+
   it('evaluates a draft policy against the mocked catalog', async () => {
     loadPartnerBaselineCeilingMock.mockResolvedValueOnce(null);
 
@@ -5173,5 +5506,22 @@ describe('GET /ai-agents/runs/:runId/artifacts (execution-plane W01, reconciliat
     expect(Array.isArray(detailBody.data)).toBe(false);
     expect(detailBody.data).not.toHaveProperty('downloadPath');
     expect(listArtifactsForAuthMock).toHaveBeenCalledTimes(1);   // detail did not hit the list
+  });
+});
+
+describe('partner-owned AI agent run scope', () => {
+  it.each(['POST', 'PATCH'])('%s refuses partner group triggers with 400 before persisting', async (method) => {
+    const { createAgent, updateAgent } = await import('../services/aiAgents/agentService');
+    vi.mocked(findPartnerOwnedGroupIds).mockResolvedValueOnce([AGENT_ID]);
+    const res = await buildApp().request(method === 'POST' ? '/ai-agents' : `/ai-agents/${AGENT_ID}`, {
+      method,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ...(method === 'POST' ? { kind: 'triage', name: 'Triage' } : {}), triggers: { deviceGroupIds: [AGENT_ID] } }),
+    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ code: 'PARTNER_GROUP_TARGET_UNSUPPORTED', groupIds: [AGENT_ID] });
+    expect(createAgent).not.toHaveBeenCalled();
+    expect(updateAgent).not.toHaveBeenCalled();
+    expect(findPartnerOwnedGroupIds).toHaveBeenCalledWith([AGENT_ID]);
   });
 });

@@ -1,4 +1,5 @@
 import { sql, type SQL } from 'drizzle-orm';
+import { TOPOLOGY_INTERFACE_POLL_SECRET_FIELDS } from '@breeze/shared';
 import { deviceCommands } from '../db/schema';
 import { decryptSecret, encryptSecret } from './secretCrypto';
 import {
@@ -9,6 +10,7 @@ import {
   type SecretPayloadContext,
 } from './scriptSecretEnvelope';
 import { captureException } from './sentry';
+import { CommandTypes } from './commandTypes';
 
 // device_commands is intentionally system-scoped (no RLS) and its payload
 // column is plaintext JSONB. Commands whose payload carries credentials are
@@ -32,9 +34,14 @@ const AAD = 'device_commands.payload';
 
 const SENSITIVE_PAYLOAD_FIELDS: Record<string, readonly string[]> = {
   encryption_rotate_key: ['password', 'currentRecoveryKey'],
+  execute_containment: ['breakGlassSecret'],
   // W05a: the payload carries a server-minted recovery token (a bearer
   // credential for the public /bmr/recover/* routes) — never the 9-char code.
   bare_metal_rebuild: ['token'],
+  // M3-D2: the standing interface poll carries the discovery profile's SNMP
+  // community / v3 passphrases as top-level strings (the poll contract's
+  // TOPOLOGY_INTERFACE_POLL_SECRET_FIELDS), encrypted before enqueue.
+  topology_interface_poll: TOPOLOGY_INTERFACE_POLL_SECRET_FIELDS,
 };
 
 /**
@@ -46,8 +53,93 @@ const SENSITIVE_PAYLOAD_FIELDS: Record<string, readonly string[]> = {
  */
 const ENVELOPE_COMMAND_TYPES = new Set(['script']);
 
+/**
+ * 3. STORAGE DESTINATION — backup/restore/verify command types whose agent
+ *    handler reads a storage destination (`providerConfig`: bucket
+ *    credentials, a filesystem path) from the payload. The API's own enqueue
+ *    sites persist only a reference and resolve the destination at delivery
+ *    (services/backupCommandCredentials.ts). This is the backstop for any
+ *    payload that still arrives with an inline destination: the two
+ *    `device_commands` insert sites in commandQueue.ts seal it into
+ *    `providerConfigEnvelope` under an AAD bound to the command id, device id
+ *    and type before the row is written, and `decryptCommandForDelivery`
+ *    opens it for the agent. Both fields are erased at terminal state.
+ */
+export const STORAGE_DESTINATION_FIELD = 'providerConfig';
+export const STORAGE_DESTINATION_ENVELOPE_FIELD = 'providerConfigEnvelope';
+const STORAGE_DESTINATION_ENVELOPE_VERSION = 1;
+
+const STORAGE_DESTINATION_COMMAND_TYPES: ReadonlySet<string> = new Set([
+  CommandTypes.BACKUP_RUN,
+  CommandTypes.BACKUP_RESTORE,
+  CommandTypes.BACKUP_VERIFY,
+  CommandTypes.BACKUP_TEST_RESTORE,
+  CommandTypes.MSSQL_BACKUP,
+  CommandTypes.MSSQL_RESTORE,
+  CommandTypes.MSSQL_VERIFY,
+  CommandTypes.HYPERV_BACKUP,
+  CommandTypes.HYPERV_RESTORE,
+  CommandTypes.VM_RESTORE_FROM_BACKUP,
+  CommandTypes.VM_INSTANT_BOOT,
+  CommandTypes.BMR_RECOVER,
+]);
+
 export function hasSensitivePayload(type: string): boolean {
-  return type in SENSITIVE_PAYLOAD_FIELDS || ENVELOPE_COMMAND_TYPES.has(type);
+  return (
+    type in SENSITIVE_PAYLOAD_FIELDS
+    || ENVELOPE_COMMAND_TYPES.has(type)
+    || STORAGE_DESTINATION_COMMAND_TYPES.has(type)
+  );
+}
+
+function buildStorageDestinationAad(type: string, ctx: SecretPayloadContext): string {
+  return [
+    AAD,
+    STORAGE_DESTINATION_ENVELOPE_FIELD,
+    `v${STORAGE_DESTINATION_ENVELOPE_VERSION}`,
+    type,
+    ctx.commandId,
+    ctx.deviceId,
+  ].join('|');
+}
+
+/** True when persisting this payload would write an inline storage destination. */
+export function needsStorageDestinationSeal(type: string, payload: unknown): boolean {
+  if (!STORAGE_DESTINATION_COMMAND_TYPES.has(type)) return false;
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return false;
+  const value = (payload as Record<string, unknown>)[STORAGE_DESTINATION_FIELD];
+  return value !== undefined && value !== null;
+}
+
+/**
+ * Seal an inline storage destination before the payload is persisted. A pure
+ * passthrough (same object) for other command types and for payloads with no
+ * inline destination — which, for the API's own enqueue sites, is every
+ * payload: they carry a reference instead.
+ */
+export function sealStorageCredentialsForPersistence(
+  type: string,
+  payload: Record<string, unknown>,
+  ctx: SecretPayloadContext,
+): Record<string, unknown> {
+  if (!needsStorageDestinationSeal(type, payload)) return payload;
+  if (!ctx?.commandId || !ctx?.deviceId) {
+    throw new Error('[sensitiveCommandPayload] sealing a storage destination requires (commandId, deviceId)');
+  }
+  const { [STORAGE_DESTINATION_FIELD]: destination, ...rest } = payload;
+  const sealed = encryptSecret(JSON.stringify(destination), { aad: buildStorageDestinationAad(type, ctx) });
+  if (!sealed) {
+    throw new Error('[sensitiveCommandPayload] storage destination encryption produced no ciphertext');
+  }
+  return { ...rest, [STORAGE_DESTINATION_ENVELOPE_FIELD]: sealed };
+}
+
+function openStorageDestination(type: string, envelope: string, ctx: SecretPayloadContext): unknown {
+  const plaintext = decryptSecret(envelope, { aad: buildStorageDestinationAad(type, ctx) });
+  if (!plaintext) {
+    throw new Error('[sensitiveCommandPayload] storage destination envelope decrypted to empty');
+  }
+  return JSON.parse(plaintext);
 }
 
 /**
@@ -59,10 +151,40 @@ export function hasSensitivePayload(type: string): boolean {
  */
 export const TERMINAL_PAYLOAD_STRIP_KEYS: readonly string[] = [
   ...new Set([
-    ...Object.values(SENSITIVE_PAYLOAD_FIELDS).flat(),
+    // Isolation's secret is type-scoped; preserve unrelated process-kill forensics.
+    ...Object.entries(SENSITIVE_PAYLOAD_FIELDS).filter(([type]) => type !== 'execute_containment').flatMap(([, fields]) => fields),
     SCRIPT_SECRET_ENVELOPE_FIELD,
+    // Stripped for EVERY type, not just the storage-destination ones: a
+    // destination is credential material wherever it appears, and rows queued
+    // before references existed carry it inline in plaintext.
+    STORAGE_DESTINATION_FIELD,
+    STORAGE_DESTINATION_ENVELOPE_FIELD,
   ]),
 ].sort();
+
+/**
+ * Keys erased at terminal state for ONE command type only. Endpoint messages
+ * (`notify_user`, #8741) carry technician-authored `title`/`body`; those must
+ * not outlive delivery in this RLS-free, unbounded-retention table, but
+ * `title`/`body` are ordinary forensic fields on other command types, so they
+ * are NOT in the global list above and `notify_user` is deliberately NOT in
+ * SENSITIVE_PAYLOAD_FIELDS (that would also encrypt the fields at enqueue).
+ * `messageId`, `batchId`, `severity`, `expiresAt` survive: the message-events
+ * route uses `messageId` as its proof that a message was sent to the device.
+ */
+export const TYPE_SCOPED_TERMINAL_STRIP_KEYS: Readonly<Record<string, readonly string[]>> = {
+  execute_containment: ['breakGlassSecret'],
+  [CommandTypes.NOTIFY_USER]: ['title', 'body'],
+  // PAM outcome notice (#8928): `reason` is the technician's deny reason as
+  // shown to the end user. `requestId` / `outcome` survive for forensics.
+  [CommandTypes.PAM_REQUEST_NOTIFY]: ['reason'],
+  // Endpoint live chat (#8743): `message` holds the chat body and the sender
+  // name. The top-level `conversationId` / `chatMessageId` survive: the chat
+  // result handlers and forensics key on them. Bodies live (with retention)
+  // in endpoint_conversation_messages, never here.
+  [CommandTypes.CHAT_OPEN]: ['message'],
+  [CommandTypes.CHAT_MESSAGE]: ['message'],
+};
 
 /**
  * The `.set({...})` fragment every terminal `device_commands` update must
@@ -84,12 +206,19 @@ export function terminalPayloadErasureSet(): { payload: SQL } {
   // never sql.raw string interpolation, even for module-owned identifiers.
   // The explicit ::text cast is required: `jsonb - anyelement` is ambiguous
   // between the text and integer overloads for an untyped placeholder.
-  const stripped = TERMINAL_PAYLOAD_STRIP_KEYS.reduce<SQL>(
-    (expr, key) => sql`${expr} - ${key}::text`,
-    sql`${deviceCommands.payload}`,
+  const subtract = (base: SQL, keys: readonly string[]): SQL =>
+    keys.reduce<SQL>((expr, key) => sql`${expr} - ${key}::text`, base);
+  const stripped = subtract(sql`${deviceCommands.payload}`, TERMINAL_PAYLOAD_STRIP_KEYS);
+  // Type-scoped branches: only rows of that command type lose the extra keys.
+  // Built with nested template fragments (not sql.join) so every caller's
+  // `sql`-template-only drizzle mock keeps working.
+  const caseExpr = Object.entries(TYPE_SCOPED_TERMINAL_STRIP_KEYS).reduce<SQL>(
+    (expr, [type, keys]) =>
+      sql`${expr} WHEN ${deviceCommands.type} = ${type} THEN ${subtract(stripped, keys)}`,
+    sql`CASE WHEN ${deviceCommands.payload} IS NULL THEN NULL`,
   );
   return {
-    payload: sql`CASE WHEN ${deviceCommands.payload} IS NULL THEN NULL ELSE ${stripped} END`,
+    payload: sql`${caseExpr} ELSE ${stripped} END`,
   };
 }
 
@@ -141,7 +270,11 @@ export function decryptSensitivePayloadFields(
     ? source[SCRIPT_SECRET_ENVELOPE_FIELD]
     : undefined;
   const hasEnvelope = typeof envelope === 'string' && envelope.length > 0;
-  if (!fields && !hasEnvelope) return payload;
+  const storageEnvelope = STORAGE_DESTINATION_COMMAND_TYPES.has(type)
+    ? source[STORAGE_DESTINATION_ENVELOPE_FIELD]
+    : undefined;
+  const hasStorageEnvelope = typeof storageEnvelope === 'string' && storageEnvelope.length > 0;
+  if (!fields && !hasEnvelope && !hasStorageEnvelope) return payload;
 
   const out: Record<string, unknown> = { ...source };
   for (const field of fields ?? []) {
@@ -162,6 +295,18 @@ export function decryptSensitivePayloadFields(
     }
     delete out[SCRIPT_SECRET_ENVELOPE_FIELD];
     out[SCRIPT_SECRET_ENV_FIELD] = openSecretEnv(envelope as string, ctx);
+  }
+
+  if (hasStorageEnvelope) {
+    // Same fail-closed rule as the script envelope: without the binding the
+    // command is dropped by decryptCommandForDelivery, never delivered sealed.
+    if (!ctx) {
+      throw new Error(
+        '[sensitiveCommandPayload] storage destination envelope requires a decryption context (commandId, deviceId)',
+      );
+    }
+    delete out[STORAGE_DESTINATION_ENVELOPE_FIELD];
+    out[STORAGE_DESTINATION_FIELD] = openStorageDestination(type, storageEnvelope as string, ctx);
   }
 
   return out;

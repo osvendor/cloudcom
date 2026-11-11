@@ -5,6 +5,7 @@ import {
   getCurrentDbAccessContext,
   runOutsideDbContext,
   withSystemDbAccessContext,
+  withDbTransactionIfHeld,
 } from '../db';
 import {
   automationActionResults,
@@ -18,7 +19,7 @@ import { recordEpisodeResponse } from './monitors/episodeService';
 import type { MonitorResponseOutcome } from '../db/schema/monitorEpisodes';
 
 export type AutomationActionResultStatus =
-  | 'pending' | 'queued' | 'delivered' | 'running'
+  | 'pending' | 'dispatching' | 'queued' | 'delivered' | 'running'
   | 'succeeded' | 'failed' | 'skipped' | 'timed_out' | 'cancelled';
 
 export type AutomationActionTerminalSource =
@@ -81,11 +82,15 @@ type ActionPatch = Partial<{
   completedAt: Date | null;
 }>;
 
+// #3189 — `dispatching` is the claim: one attempt owns the action and is
+// creating its effect. It ranks above `pending` (a claimed row is never walked
+// back) and below `queued` (the stamped outcome always advances it).
 const NONTERMINAL_RANK: Partial<Record<AutomationActionResultStatus, number>> = {
   pending: 0,
-  queued: 1,
-  delivered: 2,
-  running: 3,
+  dispatching: 1,
+  queued: 2,
+  delivered: 3,
+  running: 4,
 };
 const TERMINAL = new Set<AutomationActionResultStatus>([
   'succeeded', 'failed', 'skipped', 'timed_out', 'cancelled',
@@ -251,6 +256,22 @@ async function inDeliberateSystemContext<T>(fn: () => Promise<T>): Promise<T> {
   return runOutsideDbContext(() => withSystemDbAccessContext(fn));
 }
 
+/**
+ * #3189 — every ledger mutator takes the run row BEFORE any action row.
+ *
+ * Reconciliation needs the run `FOR UPDATE`, and the dispatch claim holds the
+ * run `FOR KEY SHARE` while it CASes an action row
+ * (`claimAutomationActionDispatches`), as does `cancelAutomationRun` (run
+ * `FOR UPDATE`, then its bulk `pending` update). A writer that locked an action
+ * row first and asked for the run second would deadlock against a claimer that
+ * read that row as `pending` just before. Taking the run first makes the order
+ * the same everywhere; `reconcileInCurrentContext` re-locking it is a no-op.
+ */
+async function lockRunForLedgerWrite(runId: string): Promise<void> {
+  await db.select({ id: automationRuns.id }).from(automationRuns)
+    .where(eq(automationRuns.id, runId)).limit(1).for('update');
+}
+
 function stateCas(row: ActionState & { id: string }): SQL[] {
   return [
     eq(automationActionResults.id, row.id),
@@ -325,11 +346,11 @@ async function recordMonitorEpisodeOutcomes(
 
   let monitorId: string | null | undefined;
   try {
-    const [automation] = await db
+    const [automation] = await withDbTransactionIfHeld(() => db
       .select({ monitorId: automations.managedByMonitorId })
       .from(automations)
       .where(eq(automations.id, automationId))
-      .limit(1);
+      .limit(1));
     monitorId = automation?.monitorId;
   } catch (error) {
     captureException(error, undefined, {
@@ -350,7 +371,7 @@ async function recordMonitorEpisodeOutcomes(
   // and the capture has to name the device to be actionable.
   for (const deviceId of deviceIds) {
     try {
-      await recordEpisodeResponse({ monitorId, deviceId, outcome });
+      await withDbTransactionIfHeld(() => recordEpisodeResponse({ monitorId, deviceId, outcome }));
     } catch (error) {
       captureException(error, undefined, {
         errorId: 'monitor-episode-response-outcome-failed',
@@ -379,6 +400,28 @@ async function reconcileInCurrentContext(
     status: automationRuns.status,
   }).from(automationRuns).where(eq(automationRuns.id, runId)).limit(1).for('update');
   if (!run) return [];
+
+  if (run.status === 'cancelled') {
+    // #8104 — a device whose `pending` result row was seeded but whose action
+    // rows never were (the cancel committed between the two seeds) can never
+    // gain an action row now: `seedAutomationActionResults` refuses to insert
+    // for a cancelled run. Nothing else would ever close it, and a `pending`
+    // device row keeps the run aggregate `running`, so the cancelled run would
+    // never get its completed_at. Settle it here, under the run lock.
+    await db.update(automationRunDeviceResults).set({
+      status: 'cancelled',
+      completedAt: new Date(),
+      updatedAt: new Date(),
+    }).where(and(
+      eq(automationRunDeviceResults.runId, runId),
+      eq(automationRunDeviceResults.status, 'pending'),
+      sql`NOT EXISTS (
+        SELECT 1 FROM automation_action_results aar
+        WHERE aar.run_id = ${automationRunDeviceResults.runId}
+          AND aar.device_id = ${automationRunDeviceResults.deviceId}
+      )`,
+    ));
+  }
 
   const actionRows = await db.select({
     id: automationActionResults.id,
@@ -571,18 +614,43 @@ async function reconcileInCurrentContext(
   return buildPublications(aggregate.status);
 }
 
+/**
+ * Seed one `pending` ledger row per action for one device of a run.
+ *
+ * #8104 — the seed is itself a dispatch-side write, so it is FENCED against a
+ * run-wide cancel in the same transaction as the insert. `cancelAutomationRun`
+ * terminalises only rows that are `pending` when it commits; a row inserted
+ * after that commit would sit `pending` forever, since the runtime's next
+ * fence check just stops dispatching. The runtime's own pre-seed check runs in
+ * an earlier transaction and cannot close that window, so the run row is read
+ * here `FOR KEY SHARE`, which conflicts with the cancel's `FOR UPDATE`: either
+ * this seed commits first and the cancel's sweep sees its rows, or the cancel
+ * commits first and this returns `run_cancelled` without inserting anything.
+ * The run row is locked BEFORE the device row, matching the run-before-action
+ * order every other dispatch path uses.
+ */
 export async function seedAutomationActionResults(input: {
   trigger?: RemediationTrigger;
   runId: string;
   device: { id: string; orgId: string };
   actions: Array<{ actionIndex: number; actionType: string }>;
-}): Promise<void> {
+}): Promise<'seeded' | 'run_cancelled'> {
   const indexes = new Set(input.actions.map((action) => action.actionIndex));
   if (indexes.size !== input.actions.length) throw new Error('Automation action indexes must be unique per device');
   if (input.actions.some((action) => action.actionIndex < 0)) throw new Error('Automation action indexes must be non-negative');
-  if (input.actions.length === 0) return;
+  if (input.actions.length === 0) return 'seeded';
 
-  await inDeliberateSystemContext(async () => {
+  return inDeliberateSystemContext(async () => {
+    const runRows = await db.execute(sql`
+      SELECT status
+      FROM automation_runs
+      WHERE id = ${input.runId}::uuid
+      FOR KEY SHARE
+    `) as unknown as Array<{ status: string }>;
+    const run = runRows[0];
+    if (!run) throw new Error(`Automation run ${input.runId} not found`);
+    if (run.status === 'cancelled') return 'run_cancelled' as const;
+
     const locked = await db.execute(sql`
       SELECT id, org_id
       FROM devices
@@ -620,6 +688,7 @@ export async function seedAutomationActionResults(input: {
         throw new Error(`Automation action seed conflict at index ${action.actionIndex}`);
       }
     }
+    return 'seeded' as const;
   });
 }
 
@@ -634,14 +703,27 @@ export async function recordAutomationActionDispatch(input: {
   /** #5290 — set by the ai_triage action so its child run can terminalise it. */
   agentRunId?: string;
   message?: string;
+  /**
+   * #3189 — write only if nobody has claimed the action yet. Every writer that
+   * is NOT the attempt holding the claim (trailing skips, authority loss,
+   * catch-block failures, deterministic deploy skips) sets this, so it can
+   * never overwrite an action another attempt of the same run dispatched.
+   * Returns false when the row is past `pending`; the caller then treats the
+   * action as owned elsewhere.
+   */
+  onlyFromPending?: boolean;
 }): Promise<boolean> {
   const result = await inDeliberateSystemContext(async () => {
+    await lockRunForLedgerWrite(input.runId);
     const [row] = await db.select().from(automationActionResults).where(and(
       eq(automationActionResults.runId, input.runId),
       eq(automationActionResults.deviceId, input.deviceId),
       eq(automationActionResults.actionIndex, input.actionIndex),
     )).limit(1).for('update');
     if (!row) return { changed: false, publications: [] as Publication[] };
+    if (input.onlyFromPending && row.status !== 'pending') {
+      return { changed: false, publications: [] as Publication[] };
+    }
     const patch = decideDispatchTransition(row, input);
     if (!patch) return { changed: false, publications: [] as Publication[] };
     const changed = await db.update(automationActionResults).set({ ...patch, updatedAt: new Date() })
@@ -651,6 +733,260 @@ export async function recordAutomationActionDispatch(input: {
   });
   await publishAll(result.publications);
   return result.changed;
+}
+
+/** #3189 — what a replaying attempt needs to reuse an already-claimed action. */
+export type AutomationActionLedgerState = {
+  status: AutomationActionResultStatus;
+  /** Who terminalised the row; `dispatch` means the runtime's own dispatch path. */
+  terminalSource: AutomationActionTerminalSource | null;
+  commandId: string | null;
+  scriptExecutionId: string | null;
+  deploymentResultId: string | null;
+  agentRunId: string | null;
+  message: string | null;
+  error: string | null;
+};
+
+async function readLedgerStates(
+  runId: string,
+  actionIndex: number,
+  deviceIds: readonly string[],
+): Promise<Map<string, AutomationActionLedgerState>> {
+  if (deviceIds.length === 0) return new Map();
+  const rows = await db.select({
+    deviceId: automationActionResults.deviceId,
+    status: automationActionResults.status,
+    terminalSource: automationActionResults.terminalSource,
+    commandId: automationActionResults.commandId,
+    scriptExecutionId: automationActionResults.scriptExecutionId,
+    deploymentResultId: automationActionResults.deploymentResultId,
+    agentRunId: automationActionResults.agentRunId,
+    message: automationActionResults.message,
+    error: automationActionResults.error,
+  }).from(automationActionResults).where(and(
+    eq(automationActionResults.runId, runId),
+    eq(automationActionResults.actionIndex, actionIndex),
+    inArray(automationActionResults.deviceId, [...deviceIds]),
+  ));
+  return new Map(rows.map(({ deviceId, ...state }) => [deviceId, state]));
+}
+
+/** #3189 — read one action's ledger state (null when it was never seeded). */
+export async function readAutomationActionState(input: {
+  runId: string;
+  deviceId: string;
+  actionIndex: number;
+}): Promise<AutomationActionLedgerState | null> {
+  return inDeliberateSystemContext(async () => (
+    (await readLedgerStates(input.runId, input.actionIndex, [input.deviceId])).get(input.deviceId) ?? null
+  ));
+}
+
+function assertInDispatchTransaction(what: string): void {
+  // The claim is only worth anything when it commits or rolls back TOGETHER
+  // with the effect it guards. A claim on the pooled db would autocommit and
+  // could strand a `dispatching` row with no effect behind it.
+  if (getCurrentDbAccessContext()?.scope !== 'system') {
+    throw new Error(`${what} must run inside the system-scoped dispatch transaction`);
+  }
+}
+
+export type AutomationActionClaims = {
+  /** The run was cancelled: nothing was claimed and nothing may be dispatched. */
+  runCancelled: boolean;
+  /** Devices this attempt now owns (pending -> dispatching), in claim order. */
+  claimed: string[];
+  /** Devices whose action another attempt already claimed, with its state. */
+  alreadyClaimed: Map<string, AutomationActionLedgerState>;
+};
+
+/**
+ * #3189 — claim one action for a set of devices before dispatching it.
+ *
+ * MUST run inside the transaction that then creates the action's effect and
+ * stamps its outcome (`stampClaimedAutomationActionOutcome`), so the claim,
+ * the effect rows and the stamped correlation ids commit or roll back as one.
+ * A BullMQ stalled-job replay of the same run then finds the row past
+ * `pending` and reuses what is stored instead of dispatching again.
+ *
+ * Lock order is run row, then action rows: the order `cancelAutomationRun`
+ * uses (run FOR UPDATE, then its bulk `pending` update). Taking the action row
+ * first and the run's FK KEY SHARE later (the script_executions insert) would
+ * deadlock against a concurrent cancel.
+ *
+ * Each device is read without a lock first. A row already past `pending` is
+ * reported without waiting on its lock, which the owning attempt may hold
+ * across its own reconcile (action row, then run FOR UPDATE). Only a row that
+ * still reads `pending` is claimed with the CAS; a concurrent claimer blocks on
+ * it, re-evaluates after the owner commits, and loses. Devices are claimed one
+ * at a time in ascending id order so two batch claimers lock in the same order.
+ */
+export async function claimAutomationActionDispatches(input: {
+  runId: string;
+  actionIndex: number;
+  deviceIds: readonly string[];
+}): Promise<AutomationActionClaims> {
+  assertInDispatchTransaction('claimAutomationActionDispatches');
+  const claims: AutomationActionClaims = { runCancelled: false, claimed: [], alreadyClaimed: new Map() };
+  const deviceIds = [...new Set(input.deviceIds)].sort();
+  if (deviceIds.length === 0) return claims;
+
+  const runRows = await db.execute(sql`
+    SELECT status
+    FROM automation_runs
+    WHERE id = ${input.runId}::uuid
+    FOR KEY SHARE
+  `) as unknown as Array<{ status: string }>;
+  const run = runRows[0];
+  if (!run) throw new Error(`Automation run ${input.runId} not found`);
+  if (run.status === 'cancelled') return { ...claims, runCancelled: true };
+
+  const before = await readLedgerStates(input.runId, input.actionIndex, deviceIds);
+  for (const deviceId of deviceIds) {
+    const state = before.get(deviceId);
+    if (!state) {
+      // Seeding always precedes dispatch. A missing row means the ledger that
+      // makes this action idempotent does not exist, so refuse rather than
+      // send an effect nothing can deduplicate.
+      throw new Error(
+        `Automation action result missing for run=${input.runId} device=${deviceId} action=${input.actionIndex}`,
+      );
+    }
+    if (state.status !== 'pending') {
+      claims.alreadyClaimed.set(deviceId, state);
+      continue;
+    }
+    const won = await db.update(automationActionResults)
+      .set({ status: 'dispatching', updatedAt: new Date() })
+      .where(and(
+        eq(automationActionResults.runId, input.runId),
+        eq(automationActionResults.deviceId, deviceId),
+        eq(automationActionResults.actionIndex, input.actionIndex),
+        eq(automationActionResults.status, 'pending'),
+      ))
+      .returning({ id: automationActionResults.id });
+    if (won.length === 1) {
+      claims.claimed.push(deviceId);
+      continue;
+    }
+    const after = (await readLedgerStates(input.runId, input.actionIndex, [deviceId])).get(deviceId);
+    if (!after) {
+      throw new Error(
+        `Automation action result vanished for run=${input.runId} device=${deviceId} action=${input.actionIndex}`,
+      );
+    }
+    claims.alreadyClaimed.set(deviceId, after);
+  }
+  return claims;
+}
+
+/**
+ * #7188 — claim the on-failure notification for one failed action.
+ *
+ * A single compare-and-swap: the UPDATE that sets `failure_notified_at` is the
+ * statement that decides to send, so of any number of attempts of the same run
+ * (a first attempt, a stalled-job replay, two of them racing) exactly one wins
+ * and sends. Returns `claimed` when this caller won and must send,
+ * `already_claimed` when another attempt did, and `missing` when the action
+ * has no ledger row (nothing can deduplicate the send, so the caller must not
+ * send and should report it).
+ *
+ * Claimed before sending, and never released: a worker that dies after this
+ * commits but before the channel accepts the message, or a send the channel
+ * rejects, still loses that alert. The claim narrows the crash window to the
+ * claim statement to the send, not (as before) everything between recording
+ * the failure and sending. Delivery retries are not this claim's job.
+ *
+ * Always runs in its own system-scoped transaction (never an ambient one), and
+ * locks only this one action row, so it cannot join the run-then-action lock
+ * order described at `lockRunForLedgerWrite`. Callers invoke it after the
+ * dispatch transaction that held this row's lock has committed. Deliberately
+ * leaves `updated_at` alone: it orders the action reaper, and a notification
+ * claim is not a ledger state change.
+ */
+export async function claimAutomationFailureNotification(input: {
+  runId: string;
+  deviceId: string;
+  actionIndex: number;
+}): Promise<'claimed' | 'already_claimed' | 'missing'> {
+  return runOutsideDbContext(() => withSystemDbAccessContext(async () => {
+    const where = and(
+      eq(automationActionResults.runId, input.runId),
+      eq(automationActionResults.deviceId, input.deviceId),
+      eq(automationActionResults.actionIndex, input.actionIndex),
+    );
+    const won = await db.update(automationActionResults)
+      .set({ failureNotifiedAt: new Date() })
+      .where(and(where, isNull(automationActionResults.failureNotifiedAt)))
+      .returning({ id: automationActionResults.id });
+    if (won.length === 1) return 'claimed';
+    // Lost the CAS, or there is no row to claim. Only the first is a dedupe.
+    const [row] = await db.select({ id: automationActionResults.id })
+      .from(automationActionResults).where(where).limit(1);
+    return row ? 'already_claimed' : 'missing';
+  }));
+}
+
+/** #3189 — single-device form of `claimAutomationActionDispatches`. */
+export async function claimAutomationActionDispatch(input: {
+  runId: string;
+  deviceId: string;
+  actionIndex: number;
+}): Promise<
+  | { kind: 'claimed' }
+  | { kind: 'already_claimed'; state: AutomationActionLedgerState }
+  | { kind: 'run_cancelled' }
+> {
+  const claims = await claimAutomationActionDispatches({
+    runId: input.runId,
+    actionIndex: input.actionIndex,
+    deviceIds: [input.deviceId],
+  });
+  if (claims.runCancelled) return { kind: 'run_cancelled' };
+  const state = claims.alreadyClaimed.get(input.deviceId);
+  if (state) return { kind: 'already_claimed', state };
+  return { kind: 'claimed' };
+}
+
+/**
+ * #3189 — record a claimed action's dispatch outcome INSIDE the claim
+ * transaction, so a committed claim always carries either its correlation ids
+ * (command / script execution / deployment result / agent run) or its terminal
+ * status. Without this, a crash between commit and the post-commit
+ * `recordAutomationActionDispatch` would leave a `dispatching` row that no
+ * result path can find and no replay may redo.
+ *
+ * Deliberately does not reconcile or publish: this transaction has not
+ * committed, and an `automation.completed` event must never describe state
+ * that could still roll back. The caller reconciles after commit.
+ *
+ * Only moves a row this attempt holds in `dispatching`; returns false (and
+ * writes nothing) otherwise.
+ */
+export async function stampClaimedAutomationActionOutcome(input: {
+  runId: string;
+  deviceId: string;
+  actionIndex: number;
+  status: 'queued' | 'delivered' | 'running' | 'succeeded' | 'failed' | 'skipped';
+  commandId?: string;
+  scriptExecutionId?: string;
+  deploymentResultId?: string;
+  agentRunId?: string;
+  message?: string;
+}): Promise<boolean> {
+  assertInDispatchTransaction('stampClaimedAutomationActionOutcome');
+  const [row] = await db.select().from(automationActionResults).where(and(
+    eq(automationActionResults.runId, input.runId),
+    eq(automationActionResults.deviceId, input.deviceId),
+    eq(automationActionResults.actionIndex, input.actionIndex),
+  )).limit(1).for('update');
+  if (!row || row.status !== 'dispatching') return false;
+  const patch = decideDispatchTransition(row, input);
+  if (!patch) return false;
+  const changed = await db.update(automationActionResults).set({ ...patch, updatedAt: new Date() })
+    .where(and(...stateCas(row))).returning({ id: automationActionResults.id });
+  return changed.length === 1;
 }
 
 export async function applyAutomationActionTerminal(input: {
@@ -677,6 +1013,12 @@ export async function applyAutomationActionTerminal(input: {
         : eq(automationActionResults.agentRunId, input.agentRunId!);
 
   const result = await inDeliberateSystemContext(async () => {
+    // #3189 — run row before action row, like every other ledger mutator. The
+    // correlation id is all we have, so find the run first without a lock.
+    const [located] = await db.select({ runId: automationActionResults.runId })
+      .from(automationActionResults).where(identity).limit(1);
+    if (!located) return { changed: false, publications: [] as Publication[] };
+    await lockRunForLedgerWrite(located.runId);
     const [row] = await db.select().from(automationActionResults).where(identity).limit(1).for('update');
     if (!row) return { changed: false, publications: [] as Publication[] };
     const patch = decideTerminalTransition(row, input);

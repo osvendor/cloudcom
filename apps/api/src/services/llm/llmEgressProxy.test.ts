@@ -257,13 +257,22 @@ async function newRawServer(): Promise<RawServer> {
 
 const openRawServers: RawServer[] = [];
 
-/** A port that is guaranteed to refuse: bound, its number captured, then closed. */
-async function closedPort(): Promise<number> {
-  const server = net.createServer();
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const port = (server.address() as AddressInfo).port;
-  await new Promise<void>((resolve) => server.close(() => resolve()));
-  return port;
+/**
+ * A port that refuses: bound, its number captured, then closed. Callers start
+ * every listener the test needs FIRST and pass their ports as `exclude`: the
+ * kernel hands a just-freed ephemeral port straight back to the next listen(0),
+ * so a proxy started after this could take the same number and the "refused"
+ * dial would reach the proxy itself (#6853).
+ */
+async function closedPort(exclude: readonly number[] = []): Promise<number> {
+  for (let attempt = 0; attempt < 20; attempt++) {
+    const server = net.createServer();
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = (server.address() as AddressInfo).port;
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    if (!exclude.includes(port)) return port;
+  }
+  throw new Error(`closedPort: no free port outside ${exclude.join(',')}`);
 }
 
 /** Resolver that hands back a fixed IP for any host — no gating. */
@@ -420,6 +429,26 @@ describe('llmEgressProxy — allowlist enforcement', () => {
     expect(out).toEqual({ kind: 'status', status: 502 });
     expect(events).toEqual([{ host: PROVIDER_HOST, resolvedIp: null, blocked: true }]);
   });
+
+  it('a null grant refuses every CONNECT and audits it as blocked (W06 deny-all)', async () => {
+    let resolved = 0;
+    __setResolverForTests(async () => { resolved += 1; return { safe: [{ address: '127.0.0.1', family: 4 }], allIps: ['127.0.0.1'] }; });
+    const proxy = await newProxy();
+    const events: LlmEgressAttempt[] = [];
+    const { proxyUrl } = proxy.grant('s-deny', null, (e) => events.push(e));
+
+    for (const target of ['api.anthropic.com:443', `${PROVIDER_HOST}:443`, '127.0.0.1:443']) {
+      const out = await proxyConnect({ port: proxy.port(), token: extractToken(proxyUrl), target });
+      expect(out).toEqual({ kind: 'status', status: 403 });
+    }
+    expect(events).toEqual([
+      { host: 'api.anthropic.com', resolvedIp: null, blocked: true },
+      { host: PROVIDER_HOST, resolvedIp: null, blocked: true },
+      { host: '127.0.0.1', resolvedIp: null, blocked: true },
+    ]);
+    // Never resolved, never dialled.
+    expect(resolved).toBe(0);
+  });
 });
 
 describe('llmEgressProxy — tunnelling', () => {
@@ -555,8 +584,8 @@ describe('llmEgressProxy — tunnelling', () => {
 
   it('records a blocked attempt and answers 502 when the upstream dial is refused', async () => {
     fixedResolver();
-    const port = await closedPort();
     const proxy = await newProxy();
+    const port = await closedPort([proxy.port()]);
     const events: LlmEgressAttempt[] = [];
     const { proxyUrl } = proxy.grant('s1', grantFor(PROVIDER_HOST, port), (e) => events.push(e));
 
@@ -574,8 +603,8 @@ describe('llmEgressProxy — tunnelling', () => {
 
   it('records exactly one event per CONNECT, never a second on teardown', async () => {
     fixedResolver();
-    const port = await closedPort();
     const proxy = await newProxy();
+    const port = await closedPort([proxy.port()]);
     const events: LlmEgressAttempt[] = [];
     const { proxyUrl } = proxy.grant('s1', grantFor(PROVIDER_HOST, port), (e) => events.push(e));
 

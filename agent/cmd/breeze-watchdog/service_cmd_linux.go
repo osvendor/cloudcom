@@ -5,10 +5,11 @@ package main
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
+	"github.com/breeze-rmm/agent/internal/branding"
+	"github.com/breeze-rmm/agent/internal/procspawn"
 	"github.com/spf13/cobra"
 )
 
@@ -96,7 +97,7 @@ func serviceInstallCmd() *cobra.Command {
 
 			// Stop existing service before replacing binary.
 			if _, err := os.Stat(watchdogUnitDst); err == nil {
-				if stopErr := exec.Command("systemctl", "stop", watchdogServiceName).Run(); stopErr != nil {
+				if stopErr := procspawn.Command("systemctl", "stop", watchdogServiceName).Run(); stopErr != nil {
 					fmt.Fprintf(os.Stderr, "Warning: failed to stop existing service: %v\n", stopErr)
 				} else {
 					fmt.Println("Stopped existing Breeze Watchdog service.")
@@ -114,18 +115,14 @@ func serviceInstallCmd() *cobra.Command {
 			}
 
 			if exePath != watchdogBinaryPath {
-				data, err := os.ReadFile(exePath)
-				if err != nil {
-					return fmt.Errorf("failed to read binary: %w", err)
-				}
-				if err := os.WriteFile(watchdogBinaryPath, data, 0755); err != nil {
+				if err := installBinaryAtomically(exePath, watchdogBinaryPath); err != nil {
 					return fmt.Errorf("failed to copy binary to %s: %w", watchdogBinaryPath, err)
 				}
 				fmt.Printf("Binary installed to %s\n", watchdogBinaryPath)
 			}
 
 			// Write systemd unit file.
-			if err := os.WriteFile(watchdogUnitDst, []byte(watchdogUnit), 0644); err != nil {
+			if err := writeFileAtomically(watchdogUnitDst, []byte(currentWatchdogUnit()), 0o644); err != nil {
 				return fmt.Errorf("failed to write unit file: %w", err)
 			}
 			fmt.Printf("Systemd unit installed to %s\n", watchdogUnitDst)
@@ -161,12 +158,12 @@ func serviceUninstallCmd() *cobra.Command {
 			}
 
 			// Stop the service.
-			if err := exec.Command("systemctl", "stop", watchdogServiceName).Run(); err != nil {
+			if err := procspawn.Command("systemctl", "stop", watchdogServiceName).Run(); err != nil {
 				fmt.Fprintf(os.Stderr, "Warning: failed to stop service: %v\n", err)
 			}
 
 			// Disable the service.
-			if err := exec.Command("systemctl", "disable", watchdogServiceName).Run(); err != nil {
+			if err := procspawn.Command("systemctl", "disable", watchdogServiceName).Run(); err != nil {
 				fmt.Fprintf(os.Stderr, "Warning: failed to disable service: %v\n", err)
 			}
 
@@ -176,7 +173,7 @@ func serviceUninstallCmd() *cobra.Command {
 			}
 
 			// Reload systemd.
-			if err := exec.Command("systemctl", "daemon-reload").Run(); err != nil {
+			if err := procspawn.Command("systemctl", "daemon-reload").Run(); err != nil {
 				fmt.Fprintf(os.Stderr, "Warning: failed to reload systemd: %v\n", err)
 			}
 
@@ -204,7 +201,7 @@ func serviceStartCmd() *cobra.Command {
 				return fmt.Errorf("service not installed — run 'sudo breeze-watchdog service install' first")
 			}
 
-			out, err := exec.Command("systemctl", "start", watchdogServiceName).CombinedOutput()
+			out, err := procspawn.Command("systemctl", "start", watchdogServiceName).CombinedOutput()
 			if err != nil {
 				return fmt.Errorf("failed to start service: %s", strings.TrimSpace(string(out)))
 			}
@@ -225,7 +222,7 @@ func serviceStopCmd() *cobra.Command {
 				return fmt.Errorf("must run as root (sudo breeze-watchdog service stop)")
 			}
 
-			out, err := exec.Command("systemctl", "stop", watchdogServiceName).CombinedOutput()
+			out, err := procspawn.Command("systemctl", "stop", watchdogServiceName).CombinedOutput()
 			if err != nil {
 				return fmt.Errorf("failed to stop service: %s", strings.TrimSpace(string(out)))
 			}
@@ -238,7 +235,7 @@ func serviceStopCmd() *cobra.Command {
 
 // restartWatchdogService restarts the watchdog via systemctl.
 func restartWatchdogService() error {
-	out, err := exec.Command("systemctl", "restart", watchdogServiceName).CombinedOutput()
+	out, err := procspawn.Command("systemctl", "restart", watchdogServiceName).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("systemctl restart failed: %s: %w", strings.TrimSpace(string(out)), err)
 	}
@@ -248,4 +245,16 @@ func restartWatchdogService() error {
 // agentBinaryPath returns the platform-specific agent binary path.
 func agentBinaryPath() string {
 	return "/usr/local/bin/breeze-agent"
+}
+
+// currentWatchdogUnit returns the unit written to disk: the embedded
+// watchdogUnit, with only its Description= line replaced when the build
+// carries a brand (see internal/branding). A brand that is not valid falls
+// back to the embedded unit and prints a warning.
+func currentWatchdogUnit() string {
+	unit, err := branding.UnitWithDescription(watchdogUnit, branding.WatchdogServiceDescription)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: ignoring the branded service description: %v\n", err)
+	}
+	return unit
 }

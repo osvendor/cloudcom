@@ -21,8 +21,9 @@ import { fetchWithAuth, resolveApiOrigin } from "../../stores/auth";
 import { fetchAllOrganizationsFrom } from "../../lib/fetchAllOrganizations";
 import { type Organization, useOrgStore } from "../../stores/orgStore";
 import { formatDateTime } from "@/lib/dateTimeFormat";
-import { useTranslation } from "react-i18next";
+import { Trans, useTranslation } from "react-i18next";
 import "@/lib/i18n";
+import { IntegrationPanelHeader } from "./IntegrationPanelHeader";
 
 type Integration = {
   id: string;
@@ -660,24 +661,16 @@ export default function HuntressIntegration() {
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center gap-3">
-        <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-primary/10 text-primary">
-          <Shield className="h-5 w-5" />
-        </div>
-        <div>
-          <h1 className="text-2xl font-semibold">
-            {t("huntressIntegration.huntressIntegration")}
-          </h1>
-          <p className="text-sm text-muted-foreground">
-            {t(
-              "huntressIntegration.connectOnePartnerLevelHuntressAccountAndMap",
-            )}
-          </p>
-        </div>
-      </div>
+      <IntegrationPanelHeader
+        icon={<Shield className="h-4 w-4" />}
+        title={t("huntressIntegration.huntressIntegration")}
+        description={t(
+          "huntressIntegration.connectOnePartnerLevelHuntressAccountAndMap",
+        )}
+      />
 
       {loadError && (
-        <div className="rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">
+        <div className="rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">
           {loadError}
         </div>
       )}
@@ -725,10 +718,11 @@ export default function HuntressIntegration() {
 
           <div className="mt-5 grid gap-4 md:grid-cols-2">
             <div>
-              <label className="mb-1 block text-sm font-medium">
+              <label htmlFor="huntress-connection-name" className="mb-1 block text-sm font-medium">
                 {t("common:labels.name")}
               </label>
               <input
+                id="huntress-connection-name"
                 type="text"
                 value={name}
                 onChange={(e) => setName(e.target.value)}
@@ -737,13 +731,14 @@ export default function HuntressIntegration() {
               />
             </div>
             <div>
-              <label className="mb-1 block text-sm font-medium">
+              <label htmlFor="huntress-account-id" className="mb-1 block text-sm font-medium">
                 {t("huntressIntegration.accountID")}
                 <span className="text-xs text-muted-foreground">
                   {t("huntressIntegration.optional")}
                 </span>
               </label>
               <input
+                id="huntress-account-id"
                 type="text"
                 value={accountId}
                 onChange={(e) => setAccountId(e.target.value)}
@@ -963,24 +958,24 @@ export default function HuntressIntegration() {
 
           <div className="mt-4 rounded-md border bg-muted/30 p-3 text-xs text-muted-foreground">
             <p className="font-medium text-foreground">
-              {t("huntressIntegration.signingSchemeToConfigureOnHuntress")}
+              {t("huntressIntegration.webhookVerificationHeading")}
             </p>
             <ul className="mt-1 list-disc space-y-1 pl-4">
               <li>
-                {t("huntressIntegration.header")}
-                <code className="font-mono">x-huntress-signature</code>:{" "}
-                <code className="font-mono">
-                  sha256=HMAC-SHA256(&#123;timestamp&#125;.&#123;rawBody&#125;,
-                  secret)
-                </code>
+                <Trans
+                  i18nKey="huntressIntegration.webhookVerificationSecret"
+                  t={t}
+                  components={{ code: <code className="font-mono" /> }}
+                />
               </li>
               <li>
-                {t("huntressIntegration.header")}
-                <code className="font-mono">x-huntress-timestamp</code>
-                {t(
-                  "huntressIntegration.unixSecondsSignedAlongsideTheBodyRequestsOlder",
-                )}
+                <Trans
+                  i18nKey="huntressIntegration.webhookVerificationHeaders"
+                  t={t}
+                  components={{ code: <code className="font-mono" /> }}
+                />
               </li>
+              <li>{t("huntressIntegration.webhookVerificationSendTest")}</li>
               <li>
                 {t("common:labels.optional")}
                 <code className="font-mono">x-huntress-account-id</code> /{" "}
@@ -1117,6 +1112,9 @@ export default function HuntressIntegration() {
                   value={mappingSearch}
                   onChange={(event) => setMappingSearch(event.target.value)}
                   placeholder={t(
+                    "huntressIntegration.searchHuntressOrBreezeOrganizations",
+                  )}
+                  aria-label={t(
                     "huntressIntegration.searchHuntressOrBreezeOrganizations",
                   )}
                   className="h-9 w-full rounded-md border bg-background pl-9 pr-8 text-sm outline-hidden focus:ring-2 focus:ring-primary/30"

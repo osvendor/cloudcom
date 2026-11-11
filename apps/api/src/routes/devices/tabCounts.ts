@@ -7,13 +7,15 @@ import {
   aiOperatorTasks,
   alerts,
   automationPolicyCompliance,
-  metricAnomalies,
+  metricAnomalyEpisodes,
   serviceProcessCheckResults,
   tickets,
 } from '../../db/schema';
 import { authMiddleware, requirePermission, requireScope } from '../../middleware/auth';
 import { PERMISSIONS } from '../../services/permissions';
 import { getDeviceWithOrgAndSiteCheck, SITE_ACCESS_DENIED } from './helpers';
+import { alertTopologySiteGate } from '../alerts/helpers';
+import { filterToActiveWatches, loadActiveWatchKeys, watchKey } from '../../services/monitoringActiveWatches';
 
 /**
  * GET /devices/:id/tab-counts — one "needs attention" count per signal tab on
@@ -23,7 +25,11 @@ import { getDeviceWithOrgAndSiteCheck, SITE_ACCESS_DENIED } from './helpers';
  * look", not "how many rows exist":
  *
  *   alerts        active + acknowledged (not resolved/suppressed/dismissed)
- *   anomalies     status = open
+ *   anomalies     open metric_anomaly_episodes, not raw metric_anomalies
+ *                 rows: one episode spans many rows, and rows never
+ *                 assembled into an episode would badge a tab whose panel
+ *                 (which reads episodes) is empty. Snoozed episodes are
+ *                 `dismissed`, so status = open excludes them.
  *   tickets       not resolved/closed (and not soft-deleted)
  *   operatorTasks live states (queued/running/waiting/paused)
  *   monitoring    latest result per (watchType, name) that is not `running`
@@ -72,12 +78,12 @@ tabCountsRoutes.get(
       await Promise.all([
         countRows(
           db.select({ count: countExpr }).from(alerts).where(
-            and(eq(alerts.deviceId, deviceId), inArray(alerts.status, ['active', 'acknowledged'])),
+            and(eq(alerts.deviceId, deviceId), inArray(alerts.status, ['active', 'acknowledged']), alertTopologySiteGate(auth.allowedSiteIds)),
           ),
         ),
         countRows(
-          db.select({ count: countExpr }).from(metricAnomalies).where(
-            and(eq(metricAnomalies.deviceId, deviceId), eq(metricAnomalies.status, 'open')),
+          db.select({ count: countExpr }).from(metricAnomalyEpisodes).where(
+            and(eq(metricAnomalyEpisodes.deviceId, deviceId), eq(metricAnomalyEpisodes.status, 'open')),
           ),
         ),
         countRows(
@@ -126,8 +132,10 @@ tabCountsRoutes.get(
     // Defensive dedupe — DISTINCT ON already guarantees one row per watch.
     const seen = new Set<string>();
     let monitoringCount = 0;
-    for (const r of monitoringRows) {
-      const key = `${r.watchType}:${r.name}`;
+    // #8287: results for watches removed from the policy are not "needs attention".
+    const activeMonitoringRows = filterToActiveWatches(monitoringRows, await loadActiveWatchKeys(deviceId, device.orgId));
+    for (const r of activeMonitoringRows) {
+      const key = watchKey(r.watchType, r.name);
       if (seen.has(key)) continue;
       seen.add(key);
       if (r.status !== 'running') monitoringCount += 1;

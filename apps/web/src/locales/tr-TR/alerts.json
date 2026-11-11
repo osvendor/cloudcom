@@ -31,6 +31,8 @@
     "confidenceValue": "{{confidence}}% güven"
   },
   "alertDetailPage": {
+    "externalTickets": "Harici destek talepleri",
+    "externalTicketsFailedToLoad": "Harici destek talepleri yüklenemedi.",
     "loadingAlert": "Uyarı yükleniyor...",
     "backToAlerts": "Uyarılara geri dön",
     "goBack": "Geri dön",
@@ -60,14 +62,14 @@
     "resolved": "Çözüldü",
     "contextData": "Bağlam Verileri",
     "alertNotFound": "Uyarı Bulunamadı",
-    "failedToFetchAlert": "Uyarı Getirilemedi",
+    "failedToFetchAlert": "Uyarı yüklenemedi",
     "unknownDevice": "Bilinmeyen Cihaz",
-    "failedToAcknowledgeAlert": "Uyarı Kabul Edilemedi",
-    "alertAcknowledged": "Uyarı Onaylandı",
-    "failedToResolveAlert": "Uyarı Çözümlenemedi",
-    "alertResolved": "Uyarı Çözümlendi",
-    "alertsBreadcrumb": "Uyarılar İçerik Kırıntısı",
-    "alertFallback": "Geri Dönüş Uyarısı",
+    "failedToAcknowledgeAlert": "Uyarı onaylanamadı",
+    "alertAcknowledged": "Uyarı onaylandı",
+    "failedToResolveAlert": "Uyarı çözülemedi",
+    "alertResolved": "Uyarı çözüldü",
+    "alertsBreadcrumb": "Uyarılar",
+    "alertFallback": "Uyarı",
     "unknownMetric": "Bilinmeyen Metrik",
     "severity": {
       "critical": "Kritik",
@@ -82,6 +84,21 @@
       "resolved": "Çözüldü",
       "suppressed": "Bastırıldı",
       "dismissed": "Görevden alındı"
+    },
+    "createPsaTicket": "PSA bileti oluştur",
+    "psaTicketRequested": "PSA bileti istendi",
+    "failedToCreatePsaTicket": "PSA bileti istenemedi",
+    "lifecycleLine": {
+      "text": "{{rearm}} · bekleme süresi {{minutes}} dk ({{source}})",
+      "rearmNewEvidence": "Yeni kanıtla yeniden devreye girer",
+      "rearmAfterDelay": "{{minutes}} dk sonra yeniden devreye girer",
+      "sources": {
+        "monitor": "bu monitör",
+        "org": "kuruluş varsayılanı",
+        "partner": "iş ortağı varsayılanı",
+        "builtin": "yerleşik varsayılan",
+        "legacy": "uyarı kuralı"
+      }
     }
   },
   "alertDetails": {
@@ -112,6 +129,7 @@
     "close": "Kapat",
     "createALinkedTicketPreFilledFrom": "Bu uyarıdan önceden doldurulmuş bağlantılı bir bilet oluşturun",
     "createTicket": "Bilet oluştur",
+    "viewTicket": "Bileti görüntüle {{ticket}}",
     "silenceThisAlertStopsNotificationsWithoutResolving": "Bu uyarıyı sessize alın — bildirimleri çözüme kavuşturmadan durdurur",
     "suppress": "Bastır",
     "dismissPermanentlyHidesThisAlertForGood": "Kalıcı olarak kapat — bu uyarıyı tamamen gizler (garanti süresinin dolması aynı bitiş tarihi için yeniden uyarı vermez; diğer koşullar tekrarlanırsa yine de yeni bir uyarı açabilir)",
@@ -124,7 +142,7 @@
     "unknownMetric": "Bilinmeyen Metrik",
     "statusChange": "{{from}} → {{to}}",
     "resolveAlert": "Çözüm Uyarısı",
-    "ticketCreationFailedRetry": "Bilet Oluşturma Başarısız Yeniden Deneme",
+    "ticketCreationFailedRetry": "Bilet oluşturulamadı. Tekrar deneyin",
     "ticketCreated": "Bilet {{ticket}} oluşturuldu",
     "severity": {
       "critical": "Kritik",
@@ -221,7 +239,11 @@
       "resolved": "Çözüldü",
       "suppressed": "Bastırıldı",
       "dismissed": "Görevden alındı"
-    }
+    },
+    "filterStatusLabel": "Durum filtresi",
+    "filterSeverityLabel": "Önem derecesi filtresi",
+    "filterDeviceLabel": "Cihaz filtresi",
+    "filterDateRangeLabel": "Tarih aralığı filtresi"
   },
   "alertRuleEditPage": {
     "loadingAlertRule": "Uyarı kuralı yükleniyor...",
@@ -430,98 +452,6 @@
     "evaluatedAgainst": "{{hostname}} için değerlendirildi",
     "fireSuppressionNote": "Etkin bir bakım penceresi, bekleme süresi (cooldown), zaten açık olan bir uyarı veya çalkalanma (flapping) bastırma, kural çalıştığında bir uyarı oluşturulmasını yine de engelleyebilir."
   },
-  "alertTemplateEditor": {
-    "loadingAlertTemplate": "Uyarı şablonu yükleniyor...",
-    "tryAgain": "Tekrar deneyin",
-    "templateMetadata": "Şablon meta verileri",
-    "name": "Ad",
-    "availableTo": "Kullanılabilir",
-    "allMyOrganizations": "Tüm kuruluşlarım",
-    "partnerWide": "(iş ortağı çapında)",
-    "aSpecificOrganization": "Belirli bir kuruluş",
-    "organization": "Organizasyon",
-    "selectAnOrganization": "Bir kuruluş seçin",
-    "severity": "Önem",
-    "category": "Kategori",
-    "description": "Açıklama",
-    "conditionBuilder": "Koşul oluşturucu",
-    "combineMetricThresholdsWithEventPatternsTo": "Uyarıları tetiklemek için metrik eşiklerini olay düzenleriyle birleştirin.",
-    "addMetric": "Metrik ekle",
-    "addEvent": "Etkinlik ekle",
-    "trigger": "Tetikleyici",
-    "remove": "Kaldır",
-    "type": "Tür",
-    "metricThreshold": "Metrik eşiği",
-    "eventPattern": "Etkinlik modeli",
-    "metric": "Metrik",
-    "operator": "Operatör",
-    "thresholdValue": "Eşik değeri",
-    "durationMin": "Süre (dak)",
-    "frequencyCount": "Frekans sayımı",
-    "eventSource": "Olay kaynağı",
-    "pattern": "Desen",
-    "thresholdConfiguration": "Eşik yapılandırması",
-    "defaultsUsedWhenAddingNewMetricTriggers": "Yeni metrik tetikleyiciler eklenirken kullanılan varsayılanlar. Tetik başına gerektiği gibi ayarlayın.",
-    "defaultValue": "Varsayılan değer",
-    "defaultDurationMin": "Varsayılan süre (dak)",
-    "defaultFrequencyCount": "Varsayılan frekans sayısı",
-    "escalationRules": "Sorunu iletme kuralları",
-    "routeAlertsBasedOnTimeAndSeverity": "Uyarıları zamana ve önem derecesine göre yönlendirin.",
-    "addEscalation": "İlerletme ekle",
-    "step": "Adım",
-    "afterMin": "Sonra (dk)",
-    "route": "Rota",
-    "suppressionRules": "Bastırma kuralları",
-    "avoidNoiseDuringMaintenanceAndDuplicates": "Bakım ve kopyalama sırasında gürültüden kaçının.",
-    "addWindow": "Pencere ekle",
-    "suppressDuplicateAlerts": "Yinelenen uyarıları bastır",
-    "cooldownMinutes": "Bekleme süresi dakikaları",
-    "noMaintenanceWindowsConfiguredAddOneTo": "Yapılandırılmış bakım penceresi yok. Planlanan çalışma sırasında uyarıları susturmak için bir tane ekleyin.",
-    "timezone": "Saat Dilimi",
-    "starts": "Başlıyor",
-    "ends": "Biter",
-    "notificationRouting": "Bildirim yönlendirme",
-    "autoRemediation": "Otomatik düzeltme",
-    "linkAnAutomationPlaybookToRunWhen": "Bu uyarı tetiklendiğinde çalışacak bir otomasyon çalışma kitabını bağlayın.",
-    "enableAutoRemediation": "Otomatik düzeltmeyi etkinleştir",
-    "automation": "Otomasyon",
-    "selectAutomation": "Otomasyonu seçin",
-    "noAutomationsAvailableCreateOneInAutomations": "Otomasyon mevcut değil. Düzeltmeyi etkinleştirmek için Otomasyonlar'da bir tane oluşturun.",
-    "targetScope": "Hedef kapsamı",
-    "applyThisTemplateToOrganizationsSitesOr": "Bu şablonu kuruluşlara, sitelere veya gruplara uygulayın.",
-    "scopeType": "Kapsam türü",
-    "organizations": "Organizasyonlar",
-    "sites": "Siteler",
-    "groups": "Gruplar",
-    "no": "Hayır",
-    "optionsAvailableThisTemplateWillApplyBroadly": "seçenekleri mevcut. Bu şablon geniş anlamda geçerli olacaktır."
-  },
-  "alertTemplateList": {
-    "tryAgain": "Tekrar deneyin",
-    "alertTemplates": "Uyarı Şablonları",
-    "of": "arasında",
-    "templates": "şablonları",
-    "addTemplate": "Şablon ekle",
-    "allSeverity": "Tüm önem derecesi",
-    "critical": "Kritik",
-    "high": "Yüksek",
-    "medium": "Orta",
-    "low": "Düşük",
-    "info": "Bilgi",
-    "allScopes": "Tüm kapsamlar",
-    "partnerWide": "İş ortağı çapında",
-    "organization": "Organizasyon",
-    "builtIn": "Dahili",
-    "name": "İsim",
-    "scope": "Kapsam",
-    "severity": "Önem",
-    "category": "Kategori",
-    "actions": "Eylemler",
-    "noTemplatesMatchYourFilters": "Filtrelerinizle eşleşen şablon yok.",
-    "deleteConfirm": "\"{{name}}\" şablonu silinsin mi? Bu geri alınamaz.",
-    "deleteFailed": "Şablon silinemedi.",
-    "deleted": "Şablon silindi"
-  },
   "alertVerdict": {
     "label": {
       "actionable": "Eylem gerekli",
@@ -545,23 +475,22 @@
     "loadingAlerts": "Uyarılar yükleniyor...",
     "tryAgain": "Tekrar deneyin",
     "alerts": "Uyarılar",
-    "monitorAlertsAcrossYourDevicesRulesAre": "Cihazlarınız genelinde uyarıları izleyin. Kurallar şurada yönetilir:",
-    "configurationPolicies": "Yapılandırma Politikaları",
     "alert": "uyarı",
     "dismissedAlertsAreHiddenForGoodWarranty": "Kapatılan uyarılar tamamen gizlenir. Garantinin sona ermesi aynı bitiş tarihi için yeniden uyarı vermez; diğer uyarılar, durumları tekrarlanırsa yine de tetiklenebilir.",
     "cancel": "İptal",
     "allClear": "Her şey yolunda",
     "noActiveAlertsYourFleetIsHealthy": "Etkin uyarı yok. Filonuz sağlıklı.",
     "setUpAlertRules": "Uyarı kurallarını ayarlama",
-    "failedToFetchAlerts": "Uyarılar Alınamadı",
+    "failedToFetchAlerts": "Uyarılar yüklenemedi",
     "unknownDevice": "Bilinmeyen Cihaz",
     "genericError": "Genel Hata",
-    "failedToAcknowledgeAlert": "Uyarı Kabul Edilemedi",
-    "alertAcknowledged": "Uyarı Onaylandı",
-    "failedToResolveAlert": "Uyarı Çözümlenemedi",
-    "alertResolved": "Uyarı Çözüldü",
+    "failedToAcknowledgeAlert": "Uyarı onaylanamadı",
+    "alertAcknowledged": "Uyarı onaylandı",
+    "failedToResolveAlert": "Uyarı çözülemedi",
+    "alertResolved": "Uyarı çözüldü",
     "alertSuppressed": "\"{{title}}\" bastırıldı",
-    "failedToSuppressAlert": "Uyarıyı Bastıramadı",
+    "failedToSuppressAlert": "Uyarı bastırılamadı",
+    "failedToRestoreAlert": "Uyarı geri yüklenemedi. Hâlâ sessize alınmış durumda.",
     "failedBulkAction": "{{action}} uyarıları alınamadı",
     "skippedCount": "{{count}} atlandı",
     "failedCount": "{{count}} başarısız oldu",
@@ -591,7 +520,8 @@
     "noDevicesInstallAgentToSeeAlerts": "Burada uyarıları görmeye başlamak için ilk cihazınıza aracıyı yükleyin.",
     "installYourFirstDevice": "İlk cihazınızı yükleyin",
     "noActiveAlerts": "Etkin uyarı yok",
-    "deviceStatusUnavailable": "Cihaz durumunuz yüklenemedi. Yeniden denemek için sayfayı yenileyin."
+    "deviceStatusUnavailable": "Cihaz durumunuz yüklenemedi. Yeniden denemek için sayfayı yenileyin.",
+    "subtitle": "Cihazlarınız genelinde uyarıları izleyin. Eşikler <monitors>İzleyiciler</monitors> bölümünde tanımlanır; bunları müşterilere <policies>Yapılandırma Politikaları</policies> ile dağıtın."
   },
   "alertsSummary": {
     "activeAlerts": "Aktif Uyarılar",
@@ -619,7 +549,6 @@
       "alerts": "Uyarılar",
       "correlations": "Korelasyonlar",
       "monitors": "Monitörler",
-      "rules": "Kurallar",
       "delivery": "Teslimat"
     }
   },
@@ -632,7 +561,8 @@
     "sections": {
       "channels": "Kanallar",
       "routing": "Yönlendirme",
-      "escalation": "Yükseltme ilkeleri"
+      "escalation": "Yükseltme ilkeleri",
+      "inheritedChannels": "Ortağınız tarafından paylaşılanlar"
     },
     "routing": {
       "everythingElse": "Diğer her şey",
@@ -739,6 +669,7 @@
       "info": "Bilgi"
     },
     "status": {
+      "open": "Açık",
       "active": "Aktif",
       "acknowledged": "Onaylandı",
       "resolved": "Çözüldü",
@@ -961,7 +892,8 @@
       "webhook": "Web kancası",
       "sms": "SMS",
       "pushover": "Pushover"
-    }
+    },
+    "typeLabel": "Tür"
   },
   "notificationChannelsPage": {
     "loadingNotificationChannels": "Bildirim kanalları yükleniyor...",
@@ -1051,5 +983,10 @@
       "body": "Mevcut şablonlar burada düzenlenebilir kalır ve bir sonraki sürümde dönüştürülür.",
       "link": "Monitörleri aç"
     }
+  },
+  "subject": {
+    "label": "Etkilenen öğe",
+    "backupWorkload": "Yedekleme iş yükü",
+    "topologySite": "Topoloji sitesi"
   }
 }

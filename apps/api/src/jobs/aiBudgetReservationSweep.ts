@@ -6,11 +6,18 @@ import {
   AI_BUDGET_RESERVATION_ACTIVE_TTL_MS,
   AI_BUDGET_RESERVATION_INDETERMINATE_TTL_MS,
   expireStaleAiBudgetReservations,
+  listUndebitedPlatformSettlements,
+  replayPendingAiSettlements,
 } from '../services/aiBudgetReservations';
+import { isBillingServiceConfigured } from '../services/aiCostTracker';
+import { safeErrorMessage } from '../services/aiModels/safeDbError';
+import { debitSettledCredits } from '../services/aiModels/settleInvocation';
+import { retryUndeliveredCreditDebits } from '../services/aiCreditDebitOutbox';
+import { countAiBillingOperatorBacklog, type AiBillingOperatorBacklog } from '../services/aiCreditDebits';
 import { attachWorkerObservability } from './workerObservability';
 
 /**
- * Expiry sweep for durable AI budget reservations (SEC-142/143, review B3).
+ * Expiry sweep for durable AI budget reservations.
  *
  * An admission reserves the organization's ENTIRE remaining daily/monthly cap
  * and every unknown provider outcome is deliberately kept `indeterminate`, so
@@ -32,6 +39,8 @@ const QUEUE_NAME = 'ai-budget-reservation-sweep';
 const JOB_NAME = 'expire-stale-ai-budget-reservations';
 const INTERVAL_MS = 5 * 60 * 1000; // every 5 min
 const MAX_PER_RUN = 500;
+const MAX_REPLAYS_PER_RUN = 100;
+const MAX_DEBITS_PER_RUN = 100;
 
 type SweepJobData = { type: 'expire-stale-ai-budget-reservations'; queuedAt: string };
 
@@ -97,12 +106,103 @@ export async function sweepExpiredAiBudgetReservations(): Promise<number> {
   return expired.length;
 }
 
+/**
+ * W03 (#7601) Step 8a, BEFORE expiry each run:
+ * 1. Replay settlements deferred by org-lock contention (`pending_settlement`),
+ *    through the same idempotent settlement — a second run finds nothing — and
+ *    debit the ones this run moved to `settled`.
+ * 2. Retry keyed platform credit debits that are due but unconfirmed, with the
+ *    amount first stored and the same key (`ai-settlement:<id>` on the
+ *    reservation; `ai-compute:` / `ai-invocation:` rows in ai_credit_debits),
+ *    so the billing service dedupes a debit whose first response was lost.
+ *    Rows stamped failed (4xx, or retries exhausted) are not listed: they wait
+ *    for an operator re-drive (services/aiCreditDebits.ts, /admin/ai-billing).
+ *
+ * Every helper here opens its own short transaction, and this runs OUTSIDE
+ * the expiry pass's system context: the debit is an HTTP call, and a pooled
+ * connection must never be held across one (#1105).
+ */
+export async function settleAndDebitAiReservations(): Promise<{ replayed: number; debitsAttempted: number }> {
+  const handled = new Set<string>();
+  let debitsAttempted = 0;
+  const replayed = await replayPendingAiSettlements(MAX_REPLAYS_PER_RUN);
+  for (const settled of replayed) {
+    if (settled.kind !== 'settled' || !settled.creditsDebitDue) continue;
+    handled.add(settled.reservationId);
+    debitsAttempted++;
+    await debitSettledCredits({ orgId: settled.orgId, reservationId: settled.reservationId, costCents: settled.actualCostCents });
+  }
+  if (isBillingServiceConfigured()) {
+    for (const missed of await listUndebitedPlatformSettlements(MAX_DEBITS_PER_RUN)) {
+      if (handled.has(missed.reservationId)) continue;
+      handled.add(missed.reservationId);
+      debitsAttempted++;
+      await debitSettledCredits({ orgId: missed.orgId, reservationId: missed.reservationId, costCents: missed.costCents });
+    }
+    // #9451 / #7717 item 2: compute and unreserved token debits (the outbox).
+    debitsAttempted += await retryUndeliveredCreditDebits(MAX_DEBITS_PER_RUN);
+  }
+  if (replayed.length > 0 || debitsAttempted > 0) {
+    console.warn(`[AiBudgetReservationSweep] replayed ${replayed.length} deferred settlement(s), attempted ${debitsAttempted} credit debit(s)`);
+  }
+  return { replayed: replayed.length, debitsAttempted };
+}
+
+const BACKLOG_REPORT_INTERVAL_MS = 60 * 60 * 1000;
+let lastBacklogReportAt = 0;
+
+/**
+ * #7717 item 3: page when platform credit debits or deferred settlements are
+ * waiting on an operator (terminally failed debits, dead pending settlements),
+ * or when an owed debit has sat unresolved for over an hour.
+ * Neither is ever retried automatically, so a non-zero count is unbilled spend
+ * until someone acts at /admin/ai-billing. At most one Sentry event per hour
+ * per process; the counts ride along as tags.
+ */
+export async function reportAiBillingOperatorBacklog(now = Date.now()): Promise<AiBillingOperatorBacklog> {
+  const backlog = await countAiBillingOperatorBacklog();
+  if (backlog.failedDebits + backlog.deadSettlements + backlog.staleUndeliveredDebits === 0) return backlog;
+  console.warn('[AiBudgetReservationSweep] AI billing items need an operator', backlog);
+  if (now - lastBacklogReportAt >= BACKLOG_REPORT_INTERVAL_MS) {
+    lastBacklogReportAt = now;
+    captureMessage('AI billing items are waiting on an operator (failed credit debits / dead settlements)', {
+      eventCode: 'ai_billing_operator_backlog',
+      level: 'warning',
+      tags: {
+        ai_failed_credit_debits: String(backlog.failedDebits),
+        ai_dead_pending_settlements: String(backlog.deadSettlements),
+        ai_stale_undelivered_credit_debits: String(backlog.staleUndeliveredDebits),
+      },
+    });
+  }
+  return backlog;
+}
+
+export function __resetAiBillingBacklogReportForTests(): void {
+  lastBacklogReportAt = 0;
+}
+
 function createWorker(): Worker<SweepJobData> {
   return new Worker<SweepJobData>(
     QUEUE_NAME,
     async (_job: Job<SweepJobData>) => {
+      // Replay + debit first; a failure there is reported but must not stop
+      // the expiry pass, which is what frees held caps.
+      let settlement: { replayed: number; debitsAttempted: number } | null = null;
       try {
-        return { expired: await runWithSystemDbAccess(sweepExpiredAiBudgetReservations) };
+        settlement = await settleAndDebitAiReservations();
+      } catch (err) {
+        const message = safeErrorMessage(err);
+        console.error('[AiBudgetReservationSweep] settlement replay / debit retry failed:', message);
+        captureException(new Error(`AI settlement replay / debit retry failed: ${message}`));
+      }
+      try {
+        await reportAiBillingOperatorBacklog();
+      } catch (err) {
+        console.error('[AiBudgetReservationSweep] operator backlog check failed:', safeErrorMessage(err));
+      }
+      try {
+        return { expired: await runWithSystemDbAccess(sweepExpiredAiBudgetReservations), ...(settlement ?? {}) };
       } catch (err) {
         console.error('[AiBudgetReservationSweep] run failed:', err);
         captureException(err instanceof Error ? err : new Error(String(err)));

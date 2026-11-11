@@ -1,6 +1,8 @@
 import type { DashboardDto, SecurityScoreBand, TileStatus } from '@breeze/shared';
 import type { ReactNode } from 'react';
 import { withBase } from '@/lib/basePath';
+import type { PortalAgreementSummary } from '@/lib/api';
+import { AgreementsAwaitingSignature } from './AgreementsAwaitingSignature';
 import { cn, formatDateTime, formatRelativeTime } from '@/lib/utils';
 import { ErrorNotice, PageHeader, StatusMark } from './ui';
 
@@ -64,13 +66,13 @@ function accountHeadline(dashboard: DashboardDto): string {
   ) {
     clauses.push(
       devices.protected === devices.total
-        ? `All ${devices.total} ${devices.total === 1 ? 'device' : 'devices'} protected`
-        : `${devices.protected} of ${devices.total} devices protected`,
+        ? `All ${devices.total} ${devices.total === 1 ? 'device has' : 'devices have'} endpoint protection`
+        : `${devices.protected} of ${devices.total} devices have endpoint protection`,
     );
   }
 
   const backup = dashboard.backup;
-  if (backup.status === 'ok' && backup.completedAt) {
+  if (backup && backup.status === 'ok' && backup.completedAt) {
     clauses.push(`backups verified ${midSentenceWhen(backup.completedAt)}`);
   }
 
@@ -86,7 +88,10 @@ function accountHeadline(dashboard: DashboardDto): string {
   }
 
   if (clauses.length === 0) return "We're still gathering data for this account.";
-  return `${clauses.join(', ')}.`;
+  // Clauses are written for mid-sentence use ("backups verified …"); when the
+  // devices clause is skipped the backup one leads, so capitalise the start.
+  const sentence = clauses.join(', ');
+  return `${sentence.charAt(0).toUpperCase()}${sentence.slice(1)}.`;
 }
 
 /**
@@ -128,7 +133,14 @@ function countPhrase(count: number, singular: string, plural: string): string {
 }
 
 /** The one line on this page the customer can act on, so it leads. */
-function AwaitingYou({ awaitingYou }: { awaitingYou: DashboardDto['awaitingYou'] }) {
+function AwaitingYou({
+  awaitingYou,
+  agreementsToSign,
+}: {
+  awaitingYou: DashboardDto['awaitingYou'];
+  /** Agreements the signed-in user can sign now (#10202), read by the page, not the dashboard DTO. */
+  agreementsToSign: number;
+}) {
   const { status, proposals, invoices } = awaitingYou;
 
   const links: ReactNode[] = [];
@@ -147,20 +159,28 @@ function AwaitingYou({ awaitingYou }: { awaitingYou: DashboardDto['awaitingYou']
     );
   }
 
+  if (agreementsToSign > 0) {
+    links.push(
+      <a key="agreements" className={LINK} href={withBase('/agreements')}>
+        {countPhrase(agreementsToSign, 'agreement', 'agreements')}
+      </a>,
+    );
+  }
+
   const bothKnown = proposals != null && invoices != null;
-  const singular = links.length === 1 && (proposals === 1 || invoices === 1);
+  const singular = links.length === 1 && (proposals === 1 || invoices === 1 || agreementsToSign === 1);
 
   let statement: ReactNode;
   if (links.length > 0) {
+    // "A", "A and B", "A, B and C".
     statement = (
       <>
-        {links.length === 2 ? (
-          <>
-            {links[0]} and {links[1]}
-          </>
-        ) : (
-          links[0]
-        )}
+        {links.map((link, i) => (
+          <span key={i}>
+            {i > 0 && (i === links.length - 1 ? ' and ' : ', ')}
+            {link}
+          </span>
+        ))}
         {singular ? ' is waiting for you.' : ' are waiting for you.'}
       </>
     );
@@ -268,7 +288,7 @@ function DevicesValue({ tile }: { tile: DashboardDto['devicesProtected'] }) {
   );
 }
 
-function BackupValue({ tile, timezone }: { tile: DashboardDto['backup']; timezone: string }) {
+function BackupValue({ tile, timezone }: { tile: NonNullable<DashboardDto['backup']>; timezone: string }) {
   if (tile.completedAt == null) return null;
   // A date is a figure column (tabular), but not a serif moment: Literata is
   // reserved for titles and money.
@@ -293,7 +313,14 @@ function ServiceValue({ tile }: { tile: NonNullable<DashboardDto['service']> }) 
   );
 }
 
-export function DashboardTiles({ dashboard }: { dashboard: DashboardDto }) {
+export function DashboardTiles({
+  dashboard,
+  agreements = [],
+}: {
+  dashboard: DashboardDto;
+  /** The portal agreements read; signable ones feed the awaiting-you line and the card under the heading. */
+  agreements?: PortalAgreementSummary[];
+}) {
   const {
     securityScore,
     devicesProtected,
@@ -309,12 +336,14 @@ export function DashboardTiles({ dashboard }: { dashboard: DashboardDto }) {
     <div>
       <PageHeader title="Dashboard" lede={accountHeadline(dashboard)} />
 
-      <AwaitingYou awaitingYou={awaitingYou} />
+      <AgreementsAwaitingSignature agreements={agreements} timezone={dashboard.timezone} />
+
+      <AwaitingYou awaitingYou={awaitingYou} agreementsToSign={agreements.filter((a) => a.canSign).length} />
 
       <dl className="divide-y divide-border/70">
         <LedgerRow
           testId="portal-dashboard-tile-devices"
-          label="Devices protected"
+          label="Endpoint protection"
           status={effectiveStatus(
             devicesProtected.status,
             devicesProtected.protected != null &&
@@ -351,13 +380,15 @@ export function DashboardTiles({ dashboard }: { dashboard: DashboardDto }) {
           )}
         </LedgerRow>
 
-        <LedgerRow
-          testId="portal-dashboard-tile-backup"
-          label="Last backup verified"
-          status={effectiveStatus(backup.status, backup.completedAt != null)}
-        >
-          <BackupValue tile={backup} timezone={dashboard.timezone} />
-        </LedgerRow>
+        {backup && (
+          <LedgerRow
+            testId="portal-dashboard-tile-backup"
+            label="Last backup verified"
+            status={effectiveStatus(backup.status, backup.completedAt != null)}
+          >
+            <BackupValue tile={backup} timezone={dashboard.timezone} />
+          </LedgerRow>
+        )}
 
         {/* Capability -> protection -> work delivered -> requests. Absent
             entirely when the org has not enabled the Service surface. */}

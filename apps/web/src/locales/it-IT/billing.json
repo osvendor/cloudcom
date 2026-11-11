@@ -24,7 +24,8 @@
         "perDeviceRole": "Per ruolo dispositivo",
         "perDeviceGroup": "Per gruppo di dispositivi",
         "perSeat": "Per postazione",
-        "manual": "Quantità manuale"
+        "manual": "Quantità manuale",
+        "hourBlock": "Monte ore"
       },
       "dynamicGroup": "dinamico",
       "deletedGroup": "{{name}} (gruppo eliminato)",
@@ -54,7 +55,8 @@
         "auto": "auto",
         "groupDeleted": "gruppo eliminato",
         "siteDeleted": "sede eliminata",
-        "siteDeletedNamed": "sede eliminata: {{name}}"
+        "siteDeletedNamed": "sede eliminata: {{name}}",
+        "manualQuantityMissing": "quantità mancante"
       },
       "lineScope": {
         "site": "Sede: {{name}}"
@@ -70,7 +72,7 @@
         "autoIssue": "Emissione automatica",
         "renewal": "Rinnovo",
         "estimatedPerPeriod": "Stima / periodo",
-        "notes": "Note",
+        "notes": "Note interne",
         "invoiceNote": "Nota in fattura"
       },
       "values": {
@@ -135,7 +137,14 @@
         "flaggedOverage": "{{count}} riga/righe superano la quantità inclusa e non sono state fatturate: {{names}}",
         "uncoveredDevices": "Fattura generata, ma {{count}} dispositivo/i non sono fatturati da alcuna riga di questo contratto: {{breakdown}}",
         "priceBookGaps": "{{count}} riga/righe di catalogo fatturate al prezzo salvato nel contratto — nessun prezzo in {{currency}} nel catalogo: {{lines}}",
-        "draftDeleted": "Bozza eliminata"
+        "draftDeleted": "Bozza eliminata",
+        "skipped": {
+          "already_billed": "Nessuna fattura generata: questo periodo di fatturazione è già stato fatturato.",
+          "not_due": "Nessuna fattura generata: questo contratto non è ancora in scadenza di fatturazione.",
+          "renewal_pending": "Nessuna fattura generata: questo contratto ha superato la data di fine ed è in attesa di rinnovo.",
+          "expired": "Nessuna fattura generata: questo contratto è scaduto.",
+          "unknown": "Non è stata generata alcuna fattura per questo contratto."
+        }
       },
       "cancelConfirm": {
         "title": "Annullare questo contratto?",
@@ -220,8 +229,8 @@
       },
       "content": {
         "title": "Contenuto",
-        "notesOptional": "Note (facoltative, aggiunte al blocco Note delle fatture generate)",
-        "termsOptional": "Nota in fattura (facoltativa, aggiunta al blocco Note delle fatture generate)",
+        "notesOptional": "Note interne (mai mostrate al cliente)",
+        "termsOptional": "Nota in fattura (facoltativa, stampata su ogni fattura generata)",
         "termsPlaceholder": "es. 30 giorni netto. Rinnovo automatico salvo annullamento 30 giorni prima."
       },
       "lines": {
@@ -254,6 +263,8 @@
         "descriptionPlaceholder": "es. Gestione workstation",
         "unitPrice": "Prezzo unitario",
         "quantity": "Quantità",
+        "quantityInvalid": "Inserisci una quantità (fino a 2 decimali).",
+        "quantityTooLarge": "La quantità è troppo grande (al massimo 10 cifre prima del separatore decimale).",
         "siteOptional": "Sito (facoltativo: limita il conteggio dei dispositivi)",
         "allSites": "Tutti i siti",
         "linkCatalogItemOptional": "Collega elemento di catalogo (facoltativo)",
@@ -384,7 +395,9 @@
         "message_other": "Eliminare {{count}} contratti in bozza? Vengono eliminate solo le bozze{{untouched}}; l'operazione non può essere annullata.",
         "untouchedSuffix": " — eventuali contratti attivi o in pausa nella selezione restano invariati",
         "confirm": "Elimina bozze"
-      }
+      },
+      "fromQuoteReady": "Da {{number}} · pronto da attivare",
+      "fromQuoteReadyUnnumbered": "Da un preventivo · pronto da attivare"
     },
     "contractPax8Drawer": {
       "title": "Collega un abbonamento Pax8",
@@ -588,6 +601,94 @@
       "warnings": {
         "markupRemoved": "Salvato, ma è stata rimossa una formattazione non supportata: {{tags}}. Il corpo degli accordi supporta titoli, grassetto, corsivo, sottolineato, elenchi e collegamenti."
       }
+    },
+    "hourBlock": {
+      "form": {
+        "hoursPerPeriod": "Ore incluse per periodo",
+        "extraRate": "Prezzo per ora aggiuntiva",
+        "rolloverMode": "Ore non utilizzate a fine periodo",
+        "rolloverExpire": "Scadono",
+        "rolloverCarry": "Riportate",
+        "carryCap": "Limite di ore riportabili (vuoto per nessun limite)",
+        "alertPct": "Avvisa al % del monte ore utilizzato (facoltativo)",
+        "required": "Inserisci le ore incluse e il prezzo per ora aggiuntiva.",
+        "firstPeriod": "Le ore contano dal primo periodo di fatturazione ancora da fatturare; in un contratto in bozza viene stabilito all'attivazione. Il tempo precedente viene fatturato come di consueto.",
+        "midPeriodEdit": "Le modifiche si applicano al periodo aperto corrente ({{start}} – {{end}}) alla sua chiusura.",
+        "midPeriodEditNoDates": "Le modifiche si applicano al periodo aperto corrente alla sua chiusura.",
+        "onlyOne": "Questa organizzazione ha già un monte ore attivo. Ritiralo prima di aggiungerne un altro."
+      },
+      "row": {
+        "perPeriod": "{{hours}} ore per periodo",
+        "retiredBadge": "Ritirato",
+        "startsOn": "Conta dal {{date}}"
+      },
+      "errors": {
+        "exists": "Questa organizzazione ha già una riga di monte ore attiva. Ritirala prima, poi aggiungi quella nuova.",
+        "locked": "Questo campo non può essere modificato su una riga di monte ore."
+      },
+      "retire": {
+        "title": "Ritira il monte ore",
+        "message": "«{{description}}» ha uno storico di fatturazione, quindi viene ritirato anziché eliminato. Nessun nuovo periodo; i periodi già fatturati vengono comunque regolati. I periodi chiusi restano nel contratto.",
+        "confirm": "Ritira monte ore",
+        "toast": "Monte ore ritirato"
+      },
+      "detail": {
+        "title": "Monte ore",
+        "usage": "{{used}} di {{included}} ore usate · {{remaining}} rimanenti · il periodo termina il {{end}}",
+        "carried": "Include {{hours}} ore riportate.",
+        "unapproved": "{{hours}} ore di questo tempo non sono ancora approvate.",
+        "foreign": "{{hours}} ore sono state registrate in un'altra valuta; consumano comunque il monte ore.",
+        "over": "{{hours}} ore oltre il monte ore → {{amount}} alla chiusura del periodo",
+        "advanceNote": "L'eccedenza viene fatturata nella fattura successiva.",
+        "arrearsNote": "L'eccedenza viene fatturata nella fattura di questo periodo.",
+        "lateEntry": "{{hours}} ore sono state inserite dopo la chiusura del loro periodo e vengono fatturate separatamente.",
+        "startsLater": "Il monte ore inizia il {{date}}.",
+        "extraRate": "Ore aggiuntive: {{rate}} ciascuna",
+        "loadFailed": "Impossibile caricare l'utilizzo del monte ore."
+      },
+      "history": {
+        "title": "Periodi di monte ore chiusi",
+        "empty": "Nessun periodo di monte ore è ancora stato chiuso.",
+        "included": "Incluse",
+        "carriedIn": "Riportate in ingresso",
+        "used": "Usate",
+        "over": "Eccedenza",
+        "carriedOut": "Riportate in uscita",
+        "loadMore": "Carica altro",
+        "invoiceRemoved": "Fattura dell'eccedenza rimossa — ore non fatturate"
+      }
+    },
+    "relatedNotice": {
+      "title_one": "Questa organizzazione ha {{count}} altro contratto",
+      "title_other": "Questa organizzazione ha altri {{count}} contratti",
+      "overlapWarning": "Un altro contratto fattura con la stessa cadenza in date che si sovrappongono. Attivandoli entrambi, il cliente paga per tutti e due.",
+      "sameCadence": "Stessa cadenza, date sovrapposte",
+      "perPeriod": "{{amount}} per periodo",
+      "estimateUnavailable": "Stima per periodo non disponibile",
+      "deliverables_one": "{{count}} deliverable del servizio",
+      "deliverables_other": "{{count}} deliverable del servizio",
+      "signedAgreements_one": "{{count}} accordo firmato",
+      "signedAgreements_other": "{{count}} accordi firmati",
+      "activateConfirm": {
+        "title": "Attivare insieme a un altro contratto?",
+        "message": "Questa organizzazione ha già un contratto che fattura con la stessa cadenza in date che si sovrappongono. Attivando questo, il cliente paga per entrambi.",
+        "confirm": "Attiva comunque"
+      },
+      "adopt": {
+        "action": "Unisci a questo contratto",
+        "title": "Unire “{{name}}” a questo contratto?",
+        "message": "Usalo quando “{{name}}” copre gli stessi servizi di questo contratto, così il cliente non viene fatturato due volte.",
+        "deliverables_one": "Il suo {{count}} deliverable del servizio viene spostato qui, con la sua cronologia.",
+        "deliverables_other": "I suoi {{count}} deliverable del servizio vengono spostati qui, con la loro cronologia.",
+        "agreements_one": "Il suo {{count}} accordo firmato viene collegato a questo contratto.",
+        "agreements_other": "I suoi {{count}} accordi firmati vengono collegati a questo contratto.",
+        "noLines": "Le sue righe non vengono copiate. Le righe e i prezzi di questo contratto restano invariati.",
+        "deleted": "“{{name}}” viene poi eliminato. L'operazione non può essere annullata.",
+        "confirm": "Unisci ed elimina la bozza",
+        "success": "“{{name}}” è stato unito a questo contratto",
+        "error": "Impossibile unire la bozza a questo contratto",
+        "collision": "Questi nomi di deliverable esistono già in questo contratto: {{names}}. Rinominali o rimuovili da una delle due parti, quindi riprova."
+      }
     }
   },
   "agreements": {
@@ -613,7 +714,24 @@
       "viewContract": "Vedi contratto",
       "notLinked": "Non collegato",
       "rowSubtitle": "Accettato con il preventivo {{quoteNumber}} da {{signer}} il {{date}}",
-      "rowSubtitleNoQuote": "Firmato da {{signer}} il {{date}}"
+      "rowSubtitleNoQuote": "Firmato da {{signer}} il {{date}}",
+      "evidenceUnavailable": "Accettato tramite preventivo — prova di accettazione non disponibile",
+      "recordSigned": "Registra accordo firmato",
+      "source": {
+        "quote": "tramite il preventivo {{number}}",
+        "recorded": "registrato dall'MSP — {{method}}"
+      },
+      "fileType": {
+        "image": "copia scansionata"
+      },
+      "sendForSignature": "Invia per la firma",
+      "filter": {
+        "pending": "In attesa di firma",
+        "signed": "Firmati",
+        "closed": "Rifiutati / annullati / scaduti"
+      },
+      "downloadOriginal": "Originale",
+      "certifiedUnavailable": "Non è stato possibile generare la copia certificata di questo accordo: è stato scaricato il file originale."
     },
     "templateEditor": {
       "usage": "Usato su {{quotes}} preventivi · {{signed}} accordi firmati",
@@ -627,7 +745,154 @@
       }
     },
     "contractPill": {
-      "under": "In base a {{template}} v{{n}}"
+      "under": "In base a {{template}} v{{n}}",
+      "fromQuote": "Dal preventivo {{number}}"
+    },
+    "recordSigned": {
+      "title": "Registra accordo firmato",
+      "organization": "Organizzazione",
+      "organizationPlaceholder": "Seleziona un'organizzazione",
+      "orgFallback": "questa organizzazione",
+      "template": "Modello di accordo",
+      "templatePlaceholder": "Seleziona un modello di accordo",
+      "templatesError": "Impossibile caricare i modelli di accordo.",
+      "orgsError": "Impossibile caricare le organizzazioni.",
+      "contractError": "Impossibile caricare questo contratto.",
+      "contractsError": "Impossibile caricare i contratti di questa organizzazione. Puoi comunque registrare l'accordo e collegarlo a un contratto in seguito.",
+      "contract": "Contratto (facoltativo)",
+      "contractNone": "Non collegato a un contratto",
+      "method": "Come è stato concordato",
+      "reference": "Riferimento",
+      "referenceHelp": "Dove un revisore troverebbe l'accordo firmato: un numero d'ordine, un'e-mail con data o un ticket.",
+      "signerName": "Chi ha dato l'assenso",
+      "signerEmail": "La sua e-mail (facoltativa)",
+      "signedAt": "Data di firma",
+      "file": "Copia firmata (facoltativa)",
+      "fileHelp": "PDF, PNG o JPEG, fino a 10 MB. Se alleghi una copia firmata, viene archiviato quel file.",
+      "fileTooLarge": "Il file supera i 10 MB.",
+      "fileWrongType": "Allega un file PDF, PNG o JPEG.",
+      "variables": "Dati dell'accordo",
+      "unresolved": "Indica un valore per: {{names}}",
+      "needsSignedCopy": "Breeze non può compilare {{names}} senza un preventivo. Allega la copia firmata per registrare questo accordo.",
+      "consequence": "Questo archivia un accordo firmato per {{org}}. In seguito non potrà essere eliminato.",
+      "submit": "Registra accordo firmato",
+      "success": "Accordo firmato registrato.",
+      "error": "Impossibile registrare l'accordo firmato."
+    },
+    "requests": {
+      "columns": {
+        "template": "Modello",
+        "organization": "Organizzazione",
+        "recipients": "Destinatari",
+        "sent": "Inviato",
+        "expires": "Scade",
+        "status": "Stato"
+      },
+      "status": {
+        "draft": "Bozza",
+        "sent": "In attesa di firma",
+        "viewed": "Visualizzato",
+        "signed": "Firmato",
+        "declined": "Rifiutato",
+        "voided": "Annullato",
+        "expired": "Scaduto"
+      },
+      "empty": {
+        "pending": {
+          "title": "Nulla in attesa di firma",
+          "description": "Gli accordi inviati per la firma compaiono qui finché il cliente non firma."
+        },
+        "closed": {
+          "title": "Nessuna richiesta rifiutata, annullata o scaduta",
+          "description": "Le richieste rifiutate, annullate o scadute compaiono qui."
+        }
+      },
+      "loadError": "Impossibile caricare le richieste di accordo.",
+      "recipientsMore": "+{{count}} altri",
+      "notSent": "Non inviato",
+      "declinedReason": "Rifiutato: {{reason}}",
+      "voidedReason": "Annullato: {{reason}}",
+      "copyLink": {
+        "label": "Copia link",
+        "success": "Link di firma copiato",
+        "error": "Impossibile copiare il link di firma.",
+        "clipboardError": "Impossibile copiare negli appunti. Link di firma: {{link}}"
+      },
+      "void": {
+        "label": "Annulla",
+        "title": "Annullare questa richiesta di accordo?",
+        "description": "Il link di firma smette di funzionare e i destinatari non potranno più firmare questo accordo.",
+        "reasonLabel": "Motivo (facoltativo)",
+        "confirm": "Annulla richiesta",
+        "confirming": "Annullamento…",
+        "success": "Richiesta di accordo annullata.",
+        "error": "Impossibile annullare la richiesta di accordo."
+      },
+      "deleteDraft": {
+        "label": "Elimina bozza",
+        "success": "Bozza eliminata.",
+        "error": "Impossibile eliminare la bozza."
+      },
+      "remind": {
+        "label": "Sollecita",
+        "success_one": "Sollecito inviato a {{count}} destinatario",
+        "success_other": "Sollecito inviato a {{count}} destinatari",
+        "error": "Impossibile inviare il sollecito.",
+        "notEmailed": {
+          "no_email_service": "Sollecito registrato, ma l’e-mail non è configurata. Copia il link di firma e condividilo.",
+          "no_recipients": "Sollecito registrato, ma non c’erano destinatari a cui inviare l’e-mail. Copia il link di firma e condividilo.",
+          "send_failed": "Sollecito registrato, ma l’e-mail non è stata recapitata. Copia il link di firma e condividilo."
+        }
+      },
+      "remindedCount_one": "Sollecitato {{count}} volta",
+      "remindedCount_other": "Sollecitato {{count}} volte"
+    },
+    "send": {
+      "title": "Invia per la firma",
+      "contract": "Archivia con un contratto (facoltativo)",
+      "contractsError": "Impossibile caricare i contratti di questa organizzazione. Puoi comunque inviare l’accordo e collegarlo a un contratto in seguito.",
+      "recipients": "Destinatari",
+      "recipientsHelp": "Indirizzi email, separati da virgole o a capo. Precompilati con il contatto di fatturazione dell’organizzazione.",
+      "recipientsRequired": "Aggiungi almeno un indirizzo email destinatario.",
+      "recipientsInvalid": "Questi non sembrano indirizzi email: {{emails}}",
+      "recipientsTooMany": "Al massimo 50 destinatari.",
+      "cover": "Messaggio di accompagnamento (facoltativo)",
+      "expiry": "Il link scade il",
+      "expiryPast": "Scegli una data di scadenza futura.",
+      "expiryDefaultHint_one": "Predefinito: {{count}} giorno, da Impostazioni di fatturazione → Accordi.",
+      "expiryDefaultHint_other": "Predefinito: {{count}} giorni, da Impostazioni di fatturazione → Accordi.",
+      "autoReminderHint_one": "I promemoria automatici vengono inviati ogni giorno, fino a un massimo di {{max}}.",
+      "autoReminderHint_other": "I promemoria automatici vengono inviati ogni {{count}} giorni, fino a un massimo di {{max}}.",
+      "expiryDefaultUnavailable": "Impossibile caricare la scadenza predefinita dalle Impostazioni di fatturazione. Lascia la data vuota e il predefinito verrà applicato alla creazione dell’accordo.",
+      "expiryBlankHint": "Lascia vuoto per usare il predefinito da Impostazioni di fatturazione → Accordi.",
+      "label": "Etichetta (facoltativo)",
+      "labelHint": "Solo interno. I clienti vedono il nome del modello.",
+      "createDraft": "Crea bozza e anteprima",
+      "creating": "Creazione…",
+      "preview": {
+        "title": "Anteprima",
+        "loading": "Caricamento anteprima…",
+        "error": "Impossibile caricare l’anteprima.",
+        "uploaded": "Questo modello è un documento caricato. Il cliente firma il file caricato."
+      },
+      "unresolved": {
+        "title": "Compila i valori mancanti prima dell’invio"
+      },
+      "updatePreview": "Aggiorna anteprima",
+      "updating": "Aggiornamento…",
+      "submit": "Invia",
+      "sending": "Invio…",
+      "createError": "Impossibile creare la bozza.",
+      "updateError": "Impossibile aggiornare l’accordo.",
+      "sendError": "Impossibile inviare l’accordo.",
+      "discardError": "Impossibile eliminare la bozza: è ancora elencata in In attesa di firma, dove puoi eliminarla.",
+      "sent_one": "Accordo inviato a {{count}} destinatario",
+      "sent_other": "Accordo inviato a {{count}} destinatari",
+      "notEmailed": {
+        "no_email_service": "Inviato, ma l’email non è configurata. Copia il link di firma da «In attesa di firma» e condividilo.",
+        "no_recipients": "Inviato, ma non c’erano destinatari a cui scrivere. Copia il link di firma da «In attesa di firma» e condividilo.",
+        "send_failed": "Inviato, ma l’email non è stata recapitata. Copia il link di firma da «In attesa di firma» e condividilo."
+      }
     }
   },
   "quotes": {
@@ -835,6 +1100,7 @@
         "reorderSections": "Impossibile riordinare le sezioni.",
         "saveCoverPage": "Impossibile salvare la copertina",
         "saveCustomer": "Impossibile cambiare il cliente.",
+        "saveFooter": "Impossibile salvare la riga del piè di pagina.",
         "saveTerms": "Impossibile salvare i termini.",
         "saveTitle": "Impossibile salvare il titolo.",
         "unitPriceZeroOrMore": "Inserisci un prezzo unitario pari o superiore a 0.",
@@ -845,7 +1111,9 @@
         "uploadImage": "Impossibile caricare l'immagine.",
         "noPriceForCurrency": "Nessun prezzo in {{currency}} per questo elemento. Aggiungine uno nel catalogo o inserisci una riga manuale.",
         "sectionAddedListStale": "Sezione aggiunta, ma non è stato possibile aggiornare l'elenco. Ricarica la pagina per vederla.",
-        "lineAddedListStale": "Riga aggiunta, ma non è stato possibile aggiornare l'elenco. Ricarica la pagina per vederla."
+        "lineAddedListStale": "Riga aggiunta, ma non è stato possibile aggiornare l'elenco. Ricarica la pagina per vederla.",
+        "saveExpiry": "Impossibile salvare la data di scadenza.",
+        "saveIntroNotes": "Impossibile salvare le note introduttive."
       },
       "image": {
         "alt": "Immagine del preventivo",
@@ -886,7 +1154,8 @@
         "showLess": "Mostra meno",
         "showMore": "Mostra altro",
         "skuHelp": "Il tuo numero di catalogo o del distributore per questo elemento.",
-        "tidyWithAi": "Sistema con AI"
+        "tidyWithAi": "Sistema con AI",
+        "partNumberRequiredHint": "Aggiungi un codice articolo per includerla nell'ordine dei componenti."
       },
       "liveTotals": {
         "annualRecurring": "Ricorrente annuale",
@@ -898,7 +1167,7 @@
         "srUpdatedWithTax": "Totali aggiornati. Una tantum {{oneTime}}, ricorrente mensile {{monthly}}, ricorrente annuale {{annual}}, imposta {{tax}}, dovuto all'accettazione {{due}}.",
         "tax": "Imposta",
         "taxRate": "Aliquota fiscale",
-        "taxRateHelp": "Si applica alle righe contrassegnate come imponibili. Impostata nelle impostazioni fiscali dell'organizzazione.",
+        "taxRateHelp": "Si applica alle righe contrassegnate come imponibili. Deriva dalle impostazioni fiscali dell'organizzazione oppure, se l'organizzazione non ne ha, dalla tua aliquota predefinita. Segue tali impostazioni finché il preventivo è una bozza e viene fissata all'invio del preventivo.",
         "title": "Totali in tempo reale",
         "firstPeriodSubtotal": "Subtotale primo periodo",
         "subtotal": "Subtotale",
@@ -966,6 +1235,15 @@
         "headerStyleAccent": "Accento",
         "reshapedWarning": "Questa tabella superava il limite di {{columns}} colonne x {{rows}} righe ed è stata adattata. Il salvataggio sostituisce la tabella memorizzata con quella mostrata qui."
       },
+      "footer": {
+        "title": "Riga del piè di pagina (ogni pagina)",
+        "helper": "Una breve riga stampata in fondo a ogni pagina, ad esempio le date di validità. Lascia vuoto per usare il piè di pagina predefinito. Il testo in piccolo va in Termini e condizioni, non qui.",
+        "placeholder": "Vuoto = usa il piè di pagina predefinito",
+        "inheritedPartner": "Utilizza il piè di pagina dei documenti del partner dalle impostazioni di fatturazione: “{{text}}”",
+        "inheritedBrand": "Utilizza il testo del piè di pagina di questa organizzazione dalle sue impostazioni del portale: “{{text}}”",
+        "inheritedNone": "Nessun piè di pagina predefinito impostato nelle Impostazioni: il piè di pagina resterà vuoto.",
+        "counter": "{{count}} / {{max}}"
+      },
       "terms": {
         "placeholder": "Termini di pagamento, note di consegna, ecc.",
         "title": "Termini e condizioni (testo semplice)",
@@ -986,6 +1264,7 @@
         "noPublishedVersion": "Questo modello non ha ancora una versione pubblicata. Pubblicalo prima di aggiungerlo a un preventivo.",
         "pinnedVersion": "Fissato a v{{version}}",
         "autoVariablesTitle": "Compilate automaticamente dal preventivo",
+        "autoValueBlank": "Vuoto",
         "autoHint": "Questi valori vengono risolti dal preventivo quando la proposta viene inviata.",
         "manualVariablesTitle": "Compila per questa proposta",
         "labelFieldLabel": "Etichetta sezione",
@@ -996,11 +1275,13 @@
         "readOnlyHint": "Rimuovi e riaggiungi questa sezione per cambiare template, versione o variabili.",
         "updateToVersion": "Aggiorna a v{{version}}",
         "saveVariables": "Salva variabili",
-        "unresolvedWarning": "Variabili non risolte (bloccheranno l'invio): {{names}}"
+        "unresolvedWarning": "Variabili non risolte (bloccheranno l'invio): {{names}}",
+        "placementHint": "I clienti lo vedono dopo i totali, compresso finché non lo aprono. Nel PDF segue il prezzo."
       },
       "coverPage": {
         "title": "Copertina",
         "enable": "Mostra una copertina",
+        "showContents": "Aggiungi un indice al PDF",
         "summaryOn": "Mostrata come prima pagina della proposta.",
         "summaryOff": "Nessuna copertina: la proposta inizia con il suo contenuto.",
         "titleLabel": "Titolo copertina",
@@ -1077,6 +1358,14 @@
       },
       "warnings": {
         "markupRemoved": "Salvato, ma è stata rimossa una formattazione non supportata: {{tags}}. Il testo formattato supporta titoli, grassetto, corsivo, sottolineato, elenchi e collegamenti."
+      },
+      "intro": {
+        "expiryLabel": "Valida fino al",
+        "expiryHelper": "Stampata sulla proposta. Il cliente può accettarla fino alla fine di questo giorno. Lascia vuoto per nessuna scadenza.",
+        "expiryPast": "Questa data è già passata — il cliente non può accettare una proposta scaduta.",
+        "notesLabel": "Note introduttive",
+        "notesHelper": "Stampate sopra la prima sezione della proposta.",
+        "notesPlaceholder": "Una breve nota per il cliente, ad es. cosa copre questa proposta."
       }
     },
     "actions": {
@@ -1125,15 +1414,21 @@
         "recipientRequired": "Inserisci almeno un destinatario per l'invio.",
         "signaturePreviewLabel": "Firma (impostata in Impostazioni → Branding):",
         "subjectLabel": "Oggetto",
-        "subjectPlaceholder": "Proposta {{number}} dalla tua azienda",
-        "subjectPlaceholderNoNumber": "Proposta dalla tua azienda",
+        "subjectPartnerFallback": "parte della tua azienda",
+        "subjectPlaceholder": "Proposta {{number}} da {{partner}}",
+        "subjectPlaceholderNoNumber": "Proposta da {{partner}}",
+        "subjectPlaceholderTemplate": "Usa l'oggetto del tuo modello email della proposta",
+        "subjectPlaceholderTitled": "{{title}} — proposta da {{partner}}",
         "title": "Inviare questa proposta?",
         "toLabel": "A",
         "toPlaceholder": "Aggiungi destinatario…",
         "tooManyRecipients": "Usa al massimo {{max}} indirizzi.",
         "zeroTotalWarning": "Il totale di questo preventivo è {{zero}}: verifica che gli elementi abbiano un prezzo prima dell'invio.",
         "noBillingContactHint": "Nessun contatto di fatturazione è salvato per questa organizzazione — inserisci un'email oppure aggiungine uno nelle <orgLink>impostazioni dell'organizzazione</orgLink>.",
-        "revisionWarning": "L’invio sostituisce {{number}} e disattiva il link che il cliente possiede già."
+        "revisionWarning": "L’invio sostituisce {{number}} e disattiva il link che il cliente possiede già.",
+        "noPartNumberWarning_one": "{{count}} riga di prodotto non ha un codice articolo e non verrà aggiunta all'ordine dei componenti.",
+        "noPartNumberWarning_other": "{{count}} righe di prodotto non hanno un codice articolo e non verranno aggiunte all'ordine dei componenti.",
+        "sendAnyway": "Invia comunque"
       },
       "sendEmailWarning": {
         "noBillingContact": "Proposta contrassegnata come Inviata, ma nessuna email è stata consegnata: {{orgName}} non ha un'email di contatto per la fatturazione. Aggiungine una nelle impostazioni dell'organizzazione, poi invia di nuovo.",
@@ -1181,6 +1476,9 @@
       "currencyUnknown": "La valuta di regolamento del tuo account Stripe non è ancora in cache, quindi non è stato possibile confrontarla con questo preventivo in {{documentCurrency}}. Aggiorna i dettagli dell'account Stripe in Impostazioni → Integrazioni per abilitare il controllo.",
       "acceptOnBehalf": {
         "button": "Accetta per conto del cliente",
+        "emptyDraftTitle": "Aggiungi almeno un elemento prima dell'accettazione.",
+        "emptySentTitle": "Questo preventivo non contiene elementi. Usa Rivedi preventivo per emettere una versione con elementi.",
+        "errorQuoteEmpty": "Questo preventivo non contiene elementi. Chiudi questa finestra e aggiungi un elemento, oppure usa Rivedi preventivo se è già stato inviato.",
         "title": "Registra l'accettazione del cliente",
         "methodLabel": "Come ha dato il suo assenso?",
         "method": {
@@ -1195,8 +1493,10 @@
         "signerNameLabel": "Chi ha dato l'assenso",
         "signerEmailLabel": "La sua e-mail (facoltativa)",
         "consequenceInvoice": "Verrà emessa e numerata subito una fattura di {{amount}}.",
+        "consequenceInvoiceDraft": "Verrà creata una fattura in bozza. Non è ancora emessa né numerata.",
         "consequenceContracts": "Le righe ricorrenti diventano contratti in bozza da attivare in seguito.",
-        "consequenceEmail": "La fattura verrà inviata via e-mail al cliente.",
+        "consequenceEmail": "La fattura verrà inviata via e-mail a {{recipients}}.",
+        "consequenceEmailNotConfigured": "Nessun servizio e-mail è configurato; la fattura non verrà inviata via e-mail. Condividila dalla pagina della fattura.",
         "consequenceDraft": "Questo preventivo non è mai stato inviato. La prima cosa che il cliente ne vedrà sarà la fattura.",
         "submit": "Accetta ed emetti fattura",
         "success": "Preventivo accettato. Fattura {{number}} emessa.",
@@ -1209,7 +1509,17 @@
         "evidenceHelp": "PDF, PNG o JPEG, fino a 10 MB — ad esempio l'ordine d'acquisto firmato o il documento.",
         "evidenceTooLarge": "Questo file supera i 10 MB. Scegli un file più piccolo.",
         "evidenceAttached": "Prova allegata.",
-        "evidenceError": "L'accettazione è stata registrata, ma non è stato possibile allegare il file di prova. Allegalo dalla pagina del preventivo."
+        "evidenceError": "L'accettazione è stata registrata, ma non è stato possibile allegare il file di prova. Allegalo dalla pagina del preventivo.",
+        "consequenceEmailNoRecipient": "Nessun destinatario è registrato su questo preventivo, quindi la fattura potrebbe non essere inviata via e-mail. Se necessario, inviala tu stesso al cliente.",
+        "successNoRecipient": "Preventivo accettato. Fattura {{number}} emessa. Potrebbe non essere stata inviata via e-mail: nessun destinatario è registrato su questo preventivo.",
+        "successNoEmailService": "Preventivo accettato. Fattura {{number}} emessa. Non è stata inviata via e-mail: nessun servizio e-mail è configurato. Condividila dalla pagina della fattura.",
+        "overlap": {
+          "title": "Questa organizzazione ha già un contratto con la stessa cadenza",
+          "body": "L’accettazione ha creato una nuova bozza di contratto. Attivandola insieme a quello esistente, il cliente paga per entrambi. Controlla entrambi prima di attivarne uno.",
+          "newContract": "Nuova bozza da questo preventivo",
+          "existingContract": "Contratto esistente",
+          "done": "Fatto"
+        }
       },
       "declineOnBehalf": {
         "button": "Rifiuta per conto del cliente",
@@ -1304,7 +1614,9 @@
           "vendor": "Fornitore"
         },
         "title": "Da ordinare",
-        "unknownVendor": "Altro / fornitore sconosciuto"
+        "unknownVendor": "Altro / fornitore sconosciuto",
+        "excluded": "Non inclusi in questo ordine (nessun codice articolo): {{names}}",
+        "untitledLine": "Riga senza titolo"
       },
       "pax8Order": {
         "message_one": "Questo preventivo ha preparato un ordine Pax8 ({{count}} elemento) in attesa dei dettagli di provisioning",
@@ -1359,6 +1671,14 @@
         "attachError": "Impossibile allegare il file di prova.",
         "downloadError": "Impossibile scaricare il file di prova.",
         "tooLarge": "Questo file supera i 10 MB. Scegli un file più piccolo."
+      },
+      "generatedContracts": {
+        "title_one": "Questo preventivo ha creato {{count}} contratto",
+        "title_other": "Questo preventivo ha creato {{count}} contratti",
+        "draftHint_one": "{{count}} bozza non fattura nulla finché non viene attivata. Verificala e attivala per avviare la fatturazione.",
+        "draftHint_other": "{{count}} bozze non fatturano nulla finché non vengono attivate. Verificale e attivale per avviare la fatturazione.",
+        "ready": "Pronto da attivare",
+        "unavailable": "Impossibile caricare i contratti creati da questo preventivo. Ricarica la pagina per riprovare."
       }
     },
     "currency": {
@@ -1417,65 +1737,24 @@
     },
     "document": {
       "deviceSet": {
-        "badge": "Stima",
-        "estimate": "Quantità stimata — fatturata in base al numero effettivo di {{set}} in ogni periodo di fatturazione.",
         "setDevices": "dispositivi",
         "setSeats": "postazioni",
-        "setGroup": "dispositivi in “{{name}}”",
-        "atSite": "{{set}} presso {{site}}",
-        "allowanceBill": "Include {{included}}; le unità aggiuntive sono fatturate a {{price}} ciascuna.",
-        "allowanceFlag": "Include {{included}}; le unità aggiuntive sono segnalate per revisione, non fatturate automaticamente."
+        "setGroup": "dispositivi in “{{name}}”"
       },
       "additionalItems": "Elementi aggiuntivi",
       "contract": {
-        "download": "Scarica accordo",
-        "previewTitle": "Accordo {{name}}",
         "unavailable": "File accordo non disponibile",
         "versionFooter": "{{name}} — v{{version}}"
       },
-      "draft": "Bozza",
-      "empty": "Questa proposta non contiene ancora contenuti.",
-      "imageUnavailable": "Immagine non disponibile",
-      "issued": "Emesso",
-      "preparedFor": "Preparato per",
-      "taxId": "ID fiscale: {{id}}",
-      "imageZoomAria": "Visualizza immagine più grande",
       "preview": {
         "description": "Questo è ciò che il cliente vede nel link della proposta.",
         "downloadPdf": "Scarica PDF",
-        "preparing": "Preparazione…"
-      },
-      "pricing": "Prezzi",
-      "pricingScrollAria": "Prezzi — scorri lateralmente per altre colonne",
-      "proposal": "Proposta",
-      "proposalImageAlt": "Immagine della proposta",
-      "recurrence": {
-        "annual": "Annuale",
-        "monthly": "Mensile"
-      },
-      "table": {
-        "amount": "Importo",
-        "description": "Descrizione",
-        "qty": "Qtà",
-        "tax": "Imposta",
-        "unitPrice": "Prezzo unitario"
-      },
-      "terms": "Termini",
-      "totals": {
-        "annualRecurring": "Ricorrente annuale",
-        "depositDue": "Acconto dovuto",
-        "depositDueNow": "Acconto dovuto ora",
-        "dueOnAcceptance": "Dovuto all'accettazione",
-        "firstPeriodSubtotal": "Subtotale primo periodo",
-        "firstPeriodTotal": "Totale primo periodo",
-        "monthlyRecurring": "Ricorrente mensile",
-        "recurringNote": "Accettando questa proposta vengono fatturati ora gli addebiti una tantum. Le righe ricorrenti vengono fatturate secondo la propria pianificazione.",
-        "remainingBalance": "Saldo residuo (dovuto secondo i termini)",
-        "subtotal": "Subtotale",
-        "tax": "Imposta"
-      },
-      "unsupportedBlock": "Questo tipo di blocco non è ancora supportato da questo visualizzatore.",
-      "validUntil": "Valido fino al"
+        "preparing": "Preparazione…",
+        "loading": "Caricamento della vista cliente…",
+        "loadError": "Impossibile caricare la vista cliente di questa proposta.",
+        "retry": "Riprova",
+        "signatureInert": "Qui firma il cliente"
+      }
     },
     "page": {
       "accessDenied": "Non hai l'autorizzazione per visualizzare i preventivi.",
@@ -1680,7 +1959,8 @@
       "saveNotes": "Impossibile salvare le note.",
       "saveTerms": "Impossibile salvare i termini.",
       "updateLine": "Impossibile aggiornare la riga.",
-      "noPriceForCurrency": "Nessun prezzo in {{currency}} per questo elemento. Aggiungine uno nel catalogo o inserisci una riga manuale."
+      "noPriceForCurrency": "Nessun prezzo in {{currency}} per questo elemento. Aggiungine uno nel catalogo o inserisci una riga manuale.",
+      "saveLineDetail": "Impossibile aggiornare la stampa dei tempi registrati"
     },
     "fields": {
       "descriptionOptional": "Descrizione (facoltativa)",
@@ -1747,6 +2027,35 @@
     "linesScrollAria": "Righe della fattura — scorri lateralmente per altre colonne",
     "unsavedField": {
       "lines": "Righe"
+    },
+    "lineDetail": {
+      "default": "Predefinito di fatturazione",
+      "grouping": "Disposizione",
+      "groupingDay": "Raggruppa per giorno",
+      "groupingEntry": "Una riga per registrazione",
+      "help": "Sostituisce l’impostazione predefinita di fatturazione solo per questa bozza.",
+      "hide": "Nascondi",
+      "show": "Mostra",
+      "showDate": "Data del lavoro",
+      "showNote": "Nota del tecnico",
+      "showWorkedTime": "Tempo lavorato e fatturato",
+      "title": "Righe dei tempi registrati"
+    },
+    "refreshTimeLines": {
+      "billedElsewhere": "{{count}} righe bloccheranno l'emissione: le registrazioni ore sono state fatturate su un'altra fattura. Rimuovile prima di emettere:",
+      "billedElsewhere_one": "{{count}} riga bloccherà l'emissione: la registrazione ore è stata fatturata su un'altra fattura. Rimuovila prima di emettere:",
+      "billedElsewhere_other": "{{count}} righe bloccheranno l'emissione: le registrazioni ore sono state fatturate su un'altra fattura. Rimuovile prima di emettere:",
+      "button": "Aggiorna dalle registrazioni ore",
+      "drifted": "{{count}} righe invariate: il tempo fatturato delle registrazioni non corrisponde più alla quantità. Modifica la quantità o crea una nuova bozza.",
+      "drifted_one": "{{count}} riga invariata: il tempo fatturato della registrazione non corrisponde più alla quantità. Modifica la quantità o crea una nuova bozza.",
+      "drifted_other": "{{count}} righe invariate: il tempo fatturato delle registrazioni non corrisponde più alla quantità. Modifica la quantità o crea una nuova bozza.",
+      "error": "Impossibile aggiornare dalle registrazioni ore",
+      "help": "Aggiorna note, date di lavoro e approvazione dalle registrazioni ore. Quantità, prezzi e descrizioni modificate a mano non cambiano mai.",
+      "running": "Aggiornamento…",
+      "skipped": "{{count}} righe saltate: le registrazioni ore sono state fatturate altrove, rimosse o non sono più fatturabili in questa bozza.",
+      "skipped_one": "{{count}} riga saltata: la registrazione ore è stata fatturata altrove, rimossa o non è più fatturabile in questa bozza.",
+      "skipped_other": "{{count}} righe saltate: le registrazioni ore sono state fatturate altrove, rimosse o non sono più fatturabili in questa bozza.",
+      "summary": "Aggiornate: {{refreshed}} · Già aggiornate: {{unchanged}}"
     }
   },
   "invoiceActions": {
@@ -1813,6 +2122,7 @@
       "title": "Inviare questa fattura?",
       "message": "La fattura da {{amount}} verrà inviata via e-mail a {{customer}}."
     },
+    "sourceHeldForHourBlock": "Parte del tempo in questa bozza è trattenuta per il monte ore di questa organizzazione e verrà fatturata alla chiusura del periodo del monte ore. Rimuovi quelle righe, poi emetti la fattura.",
     "unsavedHint": "\"{{field}}\" contiene una modifica non salvata — l'emissione si sblocca una volta salvata.",
     "unsavedTitle": "\"{{field}}\" contiene una modifica non salvata — l'emissione si sblocca una volta salvata."
   },
@@ -1883,7 +2193,8 @@
       "check": "Assegno",
       "bank_transfer": "Bonifico bancario",
       "card": "Carta",
-      "other": "Altro"
+      "other": "Altro",
+      "ach_debit": "Addebito ACH"
     },
     "payments": {
       "amount": "Importo",
@@ -1917,19 +2228,21 @@
       },
       "reverseError": "Impossibile stornare il pagamento.",
       "reverseSuccess": "Pagamento stornato",
-      "reverseInQuickbooksToo": "Storna questo pagamento anche in QuickBooks",
       "sendLink": "Invia link di pagamento",
       "setUp": "Configura",
       "shareLinkPrompt": "Condividi questo link di pagamento con il cliente:",
       "stripeNudge": "Collega Stripe per accettare pagamenti online con carta.",
       "title": "Pagamenti",
       "viaStripe": "tramite Stripe",
-      "quickbooks": "QuickBooks",
-      "viaQuickbooks": "tramite QuickBooks",
-      "inQuickbooks": "Presente in QuickBooks",
-      "syncingToQuickbooks": "Sincronizzazione…",
-      "quickbooksSyncFailed": "Sincronizzazione con QuickBooks non riuscita",
-      "currencyUnknown": "La valuta di regolamento del tuo account Stripe non è ancora in cache, quindi non è stato possibile confrontarla con questa fattura in {{documentCurrency}}. Aggiorna i dettagli dell'account Stripe in Impostazioni → Integrazioni per abilitare il controllo."
+      "currencyUnknown": "La valuta di regolamento del tuo account Stripe non è ancora in cache, quindi non è stato possibile confrontarla con questa fattura in {{documentCurrency}}. Aggiorna i dettagli dell'account Stripe in Impostazioni → Integrazioni per abilitare il controllo.",
+      "inProvider": "Presente in {{provider}}",
+      "syncingToProvider": "Sincronizzazione…",
+      "providerSyncFailed": "Sincronizzazione con {{provider}} non riuscita",
+      "reverseInProviderToo": "Storna questo pagamento anche in {{provider}}",
+      "overpayment": "L'importo supera il saldo dovuto ({{balance}}).",
+      "fillLabel": "Compila importo",
+      "fillDeposit": "Acconto ({{amount}})",
+      "fillBalance": "Saldo totale ({{amount}})"
     },
     "requestPayment": {
       "invoiceSent": "Fattura inviata",
@@ -1944,7 +2257,8 @@
       "paid": "Pagato",
       "subtotal": "Subtotale",
       "tax": "Imposta",
-      "total": "Totale"
+      "total": "Totale",
+      "depositDueNow": "Acconto dovuto ora"
     },
     "terms": "Termini e condizioni",
     "void": {
@@ -1969,54 +2283,35 @@
       "error": "Impossibile reimpostare il link"
     },
     "accountingSync": {
-      "title": "Sincronizzazione QuickBooks",
+      "title": "Sincronizzazione {{provider}}",
       "status": {
         "pending": "Non ancora inviata",
         "synced": "Sincronizzata",
         "error": "Sincronizzazione non riuscita",
         "synced_with_tax_variance": "Sincronizzata con differenza d'imposta"
       },
-      "taxVarianceHint": "QuickBooks ha calcolato un totale imposte diverso. Confronta entrambi i record prima di chiudere il periodo.",
-      "docNumber": "Documento QuickBooks {{docNumber}}",
+      "taxVarianceHint": "{{provider}} ha calcolato un totale imposte diverso. Confronta entrambi i record prima di chiudere il periodo.",
+      "docNumber": "Documento {{provider}} {{docNumber}}",
       "lastSynced": "Ultima sincronizzazione: {{when}}",
       "syncing": "Sincronizzazione…",
-      "push": "Invia a QuickBooks",
-      "pushed": "Fattura inviata a QuickBooks.",
-      "pushFailed": "Impossibile inviare la fattura a QuickBooks.",
-      "voidedHint": "Questa fattura è annullata — non c'è nulla da inviare a QuickBooks.",
-      "remoteDeletedHint": "Questa fattura è stata eliminata in QuickBooks. Inviarla di nuovo creerebbe un duplicato — risolvi prima la situazione in QuickBooks."
+      "push": "Invia a {{provider}}",
+      "pushed": "Fattura inviata a {{provider}}.",
+      "pushFailed": "Impossibile inviare la fattura a {{provider}}.",
+      "voidedHint": "Questa fattura è annullata — non c'è nulla da inviare a {{provider}}.",
+      "remoteDeletedHint": "Questa fattura è stata eliminata in {{provider}}. Inviarla di nuovo creerebbe un duplicato — risolvi prima la situazione in {{provider}}."
     }
   },
   "invoiceDocument": {
-    "billTo": "Fattura a",
-    "documentType": "Fattura",
-    "due": "Scadenza",
-    "empty": "Questa fattura non contiene ancora righe.",
-    "fallbackTitle": "Fattura",
-    "issued": "Emessa",
     "preview": {
       "description": "Questo è ciò che il cliente vede sulla fattura.",
       "downloadError": "Impossibile scaricare il PDF della fattura.",
       "downloadPdf": "Scarica PDF",
-      "preparing": "Preparazione…"
+      "loadError": "Impossibile caricare la vista cliente di questa fattura.",
+      "loading": "Caricamento della vista cliente…",
+      "preparing": "Preparazione…",
+      "retry": "Riprova"
     },
-    "table": {
-      "amount": "Importo",
-      "description": "Descrizione",
-      "qty": "Qtà",
-      "tax": "Imposta",
-      "unitPrice": "Prezzo unitario"
-    },
-    "terms": "Termini e condizioni",
-    "ticketHeader": "Ticket n. {{number}}",
-    "ticketWork": "Lavoro relativo al ticket",
-    "totals": {
-      "amountDue": "Importo dovuto",
-      "paid": "Pagato",
-      "subtotal": "Subtotale",
-      "tax": "Imposta",
-      "total": "Totale"
-    }
+    "ticketHeader": "Ticket n. {{number}}"
   },
   "invoiceWorkspace": {
     "backLabel": "Fatture",
@@ -2047,11 +2342,11 @@
       "success": "{{succeeded}} {{verb}}",
       "void": "Storna",
       "voidedVerb": "stornate",
-      "quickbooks": "Invia a QuickBooks",
-      "quickbooksQueued": "{{enqueued}} in coda per QuickBooks",
-      "quickbooksQueuedPartial": "{{enqueued}} in coda per QuickBooks, {{skipped}} ignorate",
-      "quickbooksQueuedFailed": "{{enqueued}} in coda per QuickBooks, {{skipped}} ignorate, {{failed}} non accodate",
-      "quickbooksFailed": "Impossibile accodare l'invio a QuickBooks. Riprova."
+      "pushToProvider": "Invia a {{provider}}",
+      "providerQueued": "{{enqueued}} in coda per {{provider}}",
+      "providerQueuedPartial": "{{enqueued}} in coda per {{provider}}, {{skipped}} ignorate",
+      "providerQueuedFailed": "{{enqueued}} in coda per {{provider}}, {{skipped}} ignorate, {{failed}} non accodate",
+      "providerFailed": "Impossibile accodare l'invio a {{provider}}. Riprova."
     },
     "bulkDelete": {
       "message": "Eliminare {{count}} fatture selezionate? Verranno eliminate solo le fatture in stato DRAFT; l'operazione non può essere annullata.",
@@ -2090,7 +2385,9 @@
       "sourceAria": "Origine fattura",
       "title": "Nuova fattura",
       "to": "A",
-      "working": "Elaborazione…"
+      "working": "Elaborazione…",
+      "heldForHourBlock_one": "{{count}} registrazione di tempo ({{hours}} ore) è trattenuta per il monte ore di questa organizzazione e verrà fatturata alla chiusura del periodo del monte ore.",
+      "heldForHourBlock_other": "{{count}} registrazioni di tempo ({{hours}} ore) sono trattenute per il monte ore di questa organizzazione e verranno fatturate alla chiusura del periodo del monte ore."
     },
     "empty": {
       "description": "Componi tempo e parti non fatturati in una bozza oppure parti da una fattura vuota.",
@@ -2146,17 +2443,18 @@
       "title": "Indirizzo di fatturazione"
     },
     "contact": {
-      "description": "Preventivi e fatture vengono inviati via email a questo indirizzo. Senza un contatto, l'invio di una proposta la contrassegna come Inviata ma non spedisce alcuna email.",
-      "email": "Email contatto",
-      "emailInvalid": "Inserisci un indirizzo email valido",
-      "emailPlaceholder": "billing@customer.example",
-      "name": "Nome contatto",
+      "description": "Per impostazione predefinita, preventivi e fatture vengono inviati via email al contatto di fatturazione dell'organizzazione, cioè il contatto a livello di organizzazione con il ruolo Fatturazione. Puoi comunque modificare i destinatari a ogni invio.",
+      "manage": "Gestisci contatti",
+      "noEmail": "{{name}} ha il ruolo Fatturazione ma nessun indirizzo email: preventivi e fatture non possono essere inviati via email finché non ne viene aggiunto uno.",
+      "none": "Nessun contatto ha il ruolo Fatturazione. Finché non ce n'è uno, l'invio di una proposta la contrassegna come Inviata ma non spedisce alcuna email.",
+      "recipientLabel": "Destinatario predefinito:",
       "title": "Contatto di fatturazione"
     },
     "currency": {
       "title": "Valuta",
       "description": "I nuovi preventivi, fatture, contratti, voci di tempo e ricambi di questa organizzazione vengono marcati con questa valuta. Nulla di già esistente viene modificato.",
       "label": "Valuta di fatturazione",
+      "partnerDefault": "Non ereditata: ogni organizzazione mantiene la propria valuta di fatturazione. Il predefinito partner ({{currency}}) si applica solo alle organizzazioni create da ora in poi.",
       "loading": "Verifica di cosa comporterebbe il passaggio a {{currency}}…",
       "error": "Impossibile caricare il riepilogo del cambio valuta.",
       "panelTitle": "Cambiare la valuta di fatturazione in {{currency}}?",
@@ -2202,22 +2500,48 @@
       "taxId": "ID fiscale",
       "taxRate": "Aliquota fiscale (%)",
       "title": "Imposta"
+    },
+    "terms": {
+      "description": "Giorni dall'emissione alla scadenza delle fatture di questa organizzazione. Lascia vuoto per usare il valore predefinito del partner. Le modifiche si applicano alle fatture emesse da ora in poi; le fatture già emesse mantengono la loro data di scadenza.",
+      "invalid": "Inserisci un numero intero di giorni da 0 a 365.",
+      "partnerDefault": "Predefinito partner",
+      "paymentTermsDays": "Termini di pagamento (giorni)",
+      "title": "Termini di pagamento"
     }
   },
   "partnerBillingSettings": {
+    "agreements": {
+      "title": "Accordi",
+      "description": "Valori predefiniti per gli accordi che invii per la firma. I mittenti possono comunque scegliere una scadenza diversa per ogni richiesta.",
+      "expiryDays": "Scadenza predefinita del link (giorni)",
+      "expiryDaysHelp": "Il link di firma di una nuova richiesta di accordo scade dopo questo numero di giorni dalla creazione, a meno che il mittente non scelga un’altra data.",
+      "expiryDaysInvalid": "Inserisci un numero intero di giorni da {{min}} a {{max}}.",
+      "remindersEnabled": "Invia promemoria automatici",
+      "remindersHelp": "Invia di nuovo via e-mail lo stesso link di firma ai destinatari finché l’accordo non viene firmato, rifiutato, annullato o scade.",
+      "intervalDays": "Ricorda ogni (giorni)",
+      "intervalDaysInvalid": "Inserisci un numero intero di giorni da {{min}} a {{max}}.",
+      "maxReminders": "Interrompi dopo (promemoria)",
+      "maxRemindersHelp": "Conta tutti i promemoria della richiesta, manuali o automatici.",
+      "maxRemindersInvalid": "Inserisci un numero intero da {{min}} a {{max}}.",
+      "readOnlyNoSend": "Modificare i valori predefiniti degli accordi richiede l’autorizzazione a inviare accordi. Hai accesso di sola lettura."
+    },
     "company": {
+      "addressInherited": "Uguale ai dettagli dell'azienda",
       "addressLine1": "Indirizzo riga 1",
       "addressLine2": "Indirizzo riga 2",
+      "addressTitle": "Indirizzo",
       "city": "Città",
       "country": "Paese",
       "defaultTerms": "Termini e condizioni predefiniti",
       "defaultTermsPlaceholder": "Termini di pagamento, liberatorie, testo di garanzia, ecc.",
       "description": "Mostrato come venditore su preventivi e fatture.",
+      "inheritedFromCompanyDetails": "Dettagli dell'azienda",
       "name": "Nome azienda",
       "phone": "Telefono",
       "postal": "Codice postale",
       "region": "Stato / regione",
       "title": "Contatto aziendale",
+      "useCompanyAddress": "Usa l'indirizzo dell'azienda",
       "website": "Sito web"
     },
     "defaults": {
@@ -2230,30 +2554,45 @@
       "autoEmailInvoiceHelp": "Quando un cliente accetta una proposta, la fattura emessa viene inviata subito via email con un link sicuro per visualizzare e pagare — senza accesso.",
       "notifyOnBehalfAcceptance": "Avvisa il cliente via email quando registri un'accettazione per suo conto",
       "notifyOnBehalfAcceptanceHelp": "Quando qualcuno del tuo team accetta un preventivo per un cliente, il cliente riceve una breve nota che indica chi l'ha registrata e quando, con il numero di fattura se ne è stata emessa una. Può rispondere se qualcosa non è corretto. Disattivato per impostazione predefinita.",
-      "currencyCode": "Codice valuta",
+      "currencyCode": "Valuta predefinita per le nuove organizzazioni",
+      "currencyHelp": "Le nuove organizzazioni iniziano con questa valuta. Quelle esistenti mantengono la propria: modificala nella scheda Fatturazione di ciascuna organizzazione.",
       "defaultMarkup": "Ricarico predefinito (%)",
       "defaultTaxRate": "Aliquota fiscale predefinita (%)",
-      "description": "Valuta, imposte, numerazione e termini applicati a nuovi preventivi e fatture per tutti i clienti.",
+      "description": "Valori predefiniti per preventivi e fatture dei tuoi clienti. Un'organizzazione può impostare la propria aliquota fiscale e i propri termini di pagamento. La sua valuta parte da quella predefinita impostata qui e si modifica nella scheda Fatturazione dell'organizzazione.",
       "deviceAppendix": "Includi l'appendice dei dispositivi fatturati nei PDF delle fatture",
       "deviceAppendixHelp": "Aggiunge una pagina con tutti i dispositivi conteggiati su ogni riga della fattura. Disattivata per impostazione predefinita; la scelta viene congelata all'emissione.",
       "documentPageSize": "Formato pagina",
       "documentPageSizeA4": "A4",
       "documentPageSizeLetter": "Lettera",
-      "documentTheme": "Tema documento",
-      "documentThemeClassic": "Classico",
-      "documentThemeCondensed": "Condensato",
-      "invoiceFooter": "Piè di pagina fattura",
+      "documentTheme": "Caratteri del documento",
+      "documentThemeClassic": "Helvetica",
+      "documentThemeCondensed": "Barlow Condensed + DM Sans",
+      "invoiceFooter": "Piè di pagina dei documenti",
+      "invoiceFooterHelp": "Stampato in fondo a ogni pagina di preventivi e fatture. Il testo del piè di pagina di un'organizzazione (nelle sue impostazioni del portale) lo sostituisce per quell'organizzazione, e il piè di pagina di un singolo preventivo sostituisce entrambi.",
       "invoiceFooterPlaceholder": "Istruzioni di pagamento, nota di ringraziamento, ecc.",
       "invoiceNumberPrefix": "Prefisso numero fattura",
       "markupHelp": "Ricarico predefinito sul costo del distributore, usato per precompilare il prezzo di vendita quando importi elementi di catalogo. Il margine lordo risultante viene mostrato durante l'importazione.",
       "paymentTermsDays": "Termini di pagamento (giorni)",
-      "title": "Valori predefiniti di fatturazione"
+      "prefixInvalid": "Inserisci un prefisso da 1 a 12 caratteri.",
+      "taxRateInvalid": "Inserisci un'aliquota fiscale da 0 a 100.",
+      "termsDaysInvalid": "Inserisci un numero intero di giorni da 0 a 365.",
+      "title": "Valori predefiniti di fatturazione",
+      "lineDetailTitle": "Righe dei tempi registrati nelle fatture",
+      "lineDetailHelp": "Scegli cosa vedono i clienti per i tempi registrati. Una bozza di fattura può sostituire questa scelta; viene bloccata all’emissione della fattura.",
+      "lineShowDate": "Mostra la data del lavoro",
+      "lineShowNote": "Mostra la nota del tecnico",
+      "lineShowWorkedTime": "Mostra tempo lavorato e fatturato",
+      "lineGrouping": "Disposizione",
+      "lineGroupingEntry": "Una riga per registrazione",
+      "lineGroupingDay": "Raggruppa per giorno"
     },
     "loadError": "Impossibile caricare le impostazioni di fatturazione.",
     "loading": "Caricamento impostazioni di fatturazione…",
     "saveButton": "Salva impostazioni di fatturazione",
     "saveError": "Impossibile salvare le impostazioni di fatturazione.",
-    "saveSuccess": "Impostazioni di fatturazione salvate"
+    "saveSuccess": "Impostazioni di fatturazione salvate",
+    "readOnlyNotice": "Hai accesso in sola lettura alle impostazioni di fatturazione. Chiedi a un amministratore di modificarle.",
+    "readOnlyNoPartnerWideNotice": "Le impostazioni di fatturazione si applicano a tutte le organizzazioni, quindi modificarle richiede l'accesso completo alle organizzazioni del partner. Hai accesso in sola lettura."
   },
   "shared": {
     "documentWorkspace": {
@@ -2272,13 +2611,15 @@
   "partnerBillingSettingsTabs": {
     "defaults": "Predefiniti",
     "documents": "Documenti",
+    "agreements": "Accordi",
     "connections": "Connessioni",
-    "rates": "Tariffe"
+    "rates": "Tariffe",
+    "payments": "Pagamenti"
   },
   "billingConnectionsTab": {
     "accounting": {
       "title": "Contabilità",
-      "description": "Stripe e QuickBooks si collegano da Integrazioni — gestiscili lì.",
+      "description": "Stripe, QuickBooks e Xero si collegano da Integrazioni — gestiscili lì.",
       "cta": "Gestisci connessioni contabili →"
     },
     "catalog": {
@@ -2306,7 +2647,8 @@
     "currencyWarning": "Il profilo di fatturazione assegnato usa {{currency}}. Dopo questa modifica si applicherà il profilo predefinito del partner nella valuta corrispondente.",
     "loadError": "Impossibile caricare i profili di fatturazione.",
     "saveError": "Impossibile salvare il profilo di fatturazione.",
-    "partialSave": "Il profilo di fatturazione è stato salvato, ma le altre impostazioni di fatturazione no. Salva di nuovo per completare."
+    "partialSave": "Il profilo di fatturazione è stato salvato, ma le altre impostazioni di fatturazione no. Salva di nuovo per completare.",
+    "aiUsage": "Utilizzo IA: {{summary}}"
   },
   "rates": {
     "title": "Tariffe",
@@ -2324,6 +2666,8 @@
     "setDefault": "Imposta come predefinito",
     "archive": "Archivia",
     "usageUnavailable": "L’utilizzo da parte delle organizzazioni non è disponibile.",
+    "readOnlyNotice": "Hai accesso in sola lettura alle tariffe di fatturazione. Chiedi a un amministratore di modificarle.",
+    "readOnlyNoPartnerWideNotice": "Le tariffe di fatturazione si applicano a tutte le organizzazioni, quindi modificarle richiede l'accesso completo alle organizzazioni del partner. Hai accesso in sola lettura.",
     "edit": "Modifica profilo di fatturazione",
     "name": "Nome",
     "currency": "Valuta",
@@ -2340,6 +2684,305 @@
     "minimumSummary": "Minimo {{minutes}} min",
     "roundingSummary": "Arrotonda a {{minutes}} min",
     "inherits": "Usa Tutti gli altri lavori",
-    "currencyHelp": "Non è possibile cambiare la valuta di un profilo predefinito o con tariffe. Un arrotondamento vuoto significa nessun arrotondamento."
+    "currencyHelp": "Non è possibile cambiare la valuta di un profilo predefinito o con tariffe. Un arrotondamento vuoto significa nessun arrotondamento.",
+    "ai": {
+      "column": "Utilizzo IA",
+      "sectionTitle": "Utilizzo dell'IA",
+      "sectionHelp": "Come viene addebitato l'utilizzo di Breeze AI da parte delle organizzazioni con questo profilo di fatturazione. Fatturi il costo di Breeze più un ricarico oppure imposti un prezzo per modello.",
+      "coverage": "Fatturazione dell'utilizzo IA",
+      "coverageBillable": "Fatturabile",
+      "coverageIncluded": "Incluso",
+      "coverageNotBilled": "Non fatturato",
+      "markup": "Ricarico sul costo (%)",
+      "markupHelp": "Aggiunto al costo in USD di Breeze per ogni richiesta. 25 fattura il costo più il 25%. Lasci vuoto per fatturare solo i modelli del listino.",
+      "markupInvalid": "Inserisca una percentuale da 0 a 1000 con al massimo due decimali.",
+      "priceListTitle": "Listino prezzi",
+      "priceListHelp": "I prezzi sono in {{currency}} per milione di token. Un modello nel listino usa il proprio prezzo invece del ricarico.",
+      "priceListEmpty": "Nessun prezzo per modello.",
+      "addRate": "Aggiungi prezzo del modello",
+      "removeRate": "Rimuovi",
+      "modelId": "Modello",
+      "modelPlaceholder": "Scelga o digiti un ID modello",
+      "inputPrice": "Ingresso",
+      "outputPrice": "Uscita",
+      "cacheReadPrice": "Lettura cache",
+      "cacheWritePrice": "Scrittura cache",
+      "rowInvalid": "Inserisca un ID modello e tutti e quattro i prezzi, ad esempio 3.00 o 0.30.",
+      "rowDuplicate": "Questo modello è già nel listino.",
+      "choicesUnavailable": "I suggerimenti di modelli non sono disponibili. Digiti invece un ID modello.",
+      "usdOnlyWarning": "Il ricarico si applica solo ai profili in USD; aggiunga un listino in {{currency}} o l'utilizzo verrà registrato senza prezzo.",
+      "summaryBillableMarkup": "Fatturabile · costo +{{percent}}%",
+      "summaryBillablePriceList_one": "Fatturabile · listino ({{count}} modello)",
+      "summaryBillablePriceList_other": "Fatturabile · listino ({{count}} modelli)",
+      "summaryBillablePriceListMarkup_one": "Fatturabile · listino ({{count}} modello), gli altri costo +{{percent}}%",
+      "summaryBillablePriceListMarkup_other": "Fatturabile · listino ({{count}} modelli), gli altri costo +{{percent}}%",
+      "summaryBillableUnpriced": "Fatturabile · senza prezzo",
+      "summaryIncluded": "Incluso",
+      "summaryNotBilled": "Non fatturato"
+    }
+  },
+  "autopay": {
+    "chargeConfirmTitle": "Conferma pagamento automatico",
+    "chargeConfirmMessage": "Addebitare fino a {{amount}}, incluse eventuali commissioni di elaborazione, per la fattura {{invoice}} tramite {{method}}?",
+    "noticeQueued": "Avviso di pagamento automatico in coda",
+    "requestDeliveryFailed": "Impossibile recapitare l’e-mail di richiesta. Inviala di nuovo.",
+    "skipNoContact": "Nessun indirizzo e-mail di fatturazione disponibile. Aggiungine uno o indica un destinatario.",
+    "skipStripeNotReady": "Stripe non è pronto per i pagamenti automatici. Controlla la connessione e le autorizzazioni.",
+    "skipAlreadyActive": "I pagamenti automatici sono già attivi o sospesi.",
+    "title": "Pagamento automatico",
+    "loading": "Caricamento dei pagamenti automatici…",
+    "error": "Impossibile completare questa azione. Riprova.",
+    "saved": "Pagamento automatico aggiornato",
+    "save": "Salva",
+    "invalid": "Inserisci da 0 a 60 giorni interi e un importo massimo positivo con un codice valuta di tre lettere.",
+    "offset-days": "Giorni dall’emissione",
+    "offset-rule": "Confronto con la data di scadenza",
+    "cap-enabled": "Limite di pagamento automatico",
+    "cap-amount": "Importo massimo",
+    "cap-currency": "Valuta",
+    "ach-mode": "Metodi di pagamento",
+    "inherit": "{{value}} — ereditato da {{source}}",
+    "source": {
+      "org": "Organizzazione",
+      "partner": "Valore predefinito del partner",
+      "default": "Valore predefinito di Breeze"
+    },
+    "option": {
+      "earlier": "La data precedente",
+      "later": "La data successiva",
+      "false": "Illimitato",
+      "true": "Limite attivato",
+      "ach_preferred": "Conto bancario preferito; carte accettate",
+      "ach_only": "Solo conto bancario"
+    },
+    "achRisk": "I pagamenti bancari sono disponibili per i conti statunitensi idonei in USD. La tua azienda è responsabile degli storni ACH e delle commissioni di storno Stripe; gli storni dei singoli conti possono arrivare fino a 60 giorni dopo.",
+    "stripeNotReady": "I pagamenti automatici non sono disponibili. Controlla le autorizzazioni Stripe: {{permissions}}.",
+    "stripeDisconnected": "Collega prima Stripe",
+    "card": "Carta",
+    "bank": "Conto bancario",
+    "done": "Richiesta completata.",
+    "status": {
+      "not_requested": "Non richiesto",
+      "requested": "Richiesto",
+      "active": "Attivo",
+      "paused": "In pausa",
+      "cancelled": "Disattivato",
+      "needs_attention": "Richiede attenzione"
+    },
+    "pending": "La verifica bancaria è in sospeso. Non è ancora possibile effettuare pagamenti automatici.",
+    "effective": "Si applica alle fatture emesse dopo {{date}}",
+    "recipient": "Destinatario alternativo della richiesta (facoltativo)",
+    "request": "Invia richiesta",
+    "resend": "Invia di nuovo la richiesta",
+    "pause": "Metti in pausa",
+    "resume": "Riprendi",
+    "turnOff": "Disattiva",
+    "cancel": "Annulla",
+    "processingWarning": "I pagamenti automatici futuri verranno interrotti. Un pagamento bancario già in elaborazione non può essere richiamato.",
+    "unasked_one": "{{count}} cliente non ancora contattato",
+    "unasked_other": "{{count}} clienti non ancora contattati",
+    "sendNow": "Invia ora",
+    "dismiss": "Nascondi",
+    "select": "Seleziona",
+    "client": "Cliente",
+    "statusLabel": "Stato",
+    "method": "Metodo di pagamento",
+    "selectClient": "Seleziona {{name}}",
+    "empty": "Nessun cliente trovato.",
+    "requestedCount_one": "Richiesta inviata a {{count}} cliente.",
+    "requestedCount_other": "Richieste inviate a {{count}} clienti.",
+    "chargeDate": "Addebito intorno al {{date}}",
+    "excludeInvoice": "Escludi questa fattura dai pagamenti automatici",
+    "excludeRefusedProcessing": "Il pagamento di questa fattura è già in elaborazione e non può essere interrotto. Puoi escludere la fattura quando il pagamento sarà completato o non riuscito.",
+    "excludeContract": "Escludi le fatture che contengono questo contratto",
+    "failed": "Impossibile aggiornare il pagamento automatico. Riprova.",
+    "states": {
+      "awaiting_notice": "In attesa dell’avviso",
+      "scheduled": "Programmato",
+      "collecting": "Riscossione in corso",
+      "retry_scheduled": "Nuovo tentativo programmato",
+      "action_required": "Conferma richiesta",
+      "succeeded": "Pagamento ricevuto",
+      "failed": "Pagamento non riuscito",
+      "skipped_by_client": "Saltato dal cliente",
+      "excluded_by_msp": "Escluso dal fornitore",
+      "cancelled": "Annullato",
+      "not_needed": "Nessun pagamento necessario",
+      "reserved": "Pagamento riservato",
+      "created": "Pagamento creato",
+      "confirming": "Conferma del pagamento in corso",
+      "processing": "Pagamento in elaborazione",
+      "requires_action": "Conferma richiesta",
+      "canceled": "Annullato",
+      "unapplied": "Il pagamento richiede riconciliazione"
+    },
+    "reasons": {
+      "not_enrolled": "Non iscritto",
+      "enrolled_after_issue": "Iscrizione successiva all’emissione della fattura",
+      "method_not_usable": "Metodo di pagamento non disponibile",
+      "over_cap": "Limite di pagamento automatico superato",
+      "above_authorized_cap": "Oltre il limite autorizzato dal cliente",
+      "issued_before_authorization": "Emessa prima dell'autorizzazione aggiornata del cliente: incassare manualmente",
+      "cap_currency_mismatch": "La valuta del limite non corrisponde",
+      "ach_currency_unsupported": "Valuta non supportata per i pagamenti bancari",
+      "excluded_contract": "Contratto escluso",
+      "excluded_invoice": "Fattura esclusa",
+      "charging_disabled": "Addebito automatico disattivato",
+      "stripe_unavailable": "Stripe non disponibile",
+      "bank_unverified": "Non addebitata: il conto bancario del cliente non è stato verificato in tempo. Incassare manualmente",
+      "charging_on_hold": "Non addebitata: i pagamenti automatici sono rimasti disattivati. Incassare manualmente",
+      "service_unavailable": "Non addebitata: Stripe è rimasto irraggiungibile. Incassare manualmente",
+      "control_pending:skip": "Richiesta di salto ricevuta; arresto del pagamento in sospeso",
+      "control_pending:exclude": "Esclusione richiesta; arresto del pagamento in sospeso",
+      "control_pending:stop": "Interruzione richiesta; arresto del pagamento in sospeso",
+      "control_pending:renotice": "Aggiornamento dell’avviso; interruzione del pagamento in sospeso",
+      "skip": "Saltato dal cliente",
+      "exclude": "Escluso dal fornitore",
+      "stop": "Pagamenti automatici interrotti",
+      "client_request": "Richiesto dal cliente",
+      "no_billing_contact": "Nessun contatto di fatturazione",
+      "delivery_failed": "Invio dell’avviso non riuscito",
+      "consent_required": "L’autorizzazione al pagamento è mancante. Richiedi una nuova autorizzazione."
+    },
+    "chargeFailed": "Impossibile avviare il pagamento. Riprova.",
+    "chargeResultUnknown": "Non è stato possibile confermare l’esito di questo pagamento. Aggiornamento della fattura per mostrarne lo stato attuale.",
+    "chargeStarted": "Tentativo di pagamento avviato",
+    "chargeNow": "Addebita ora",
+    "noCharge": "Nessun addebito",
+    "noticeStuck": "Avviso di pagamento da verificare",
+    "unapplied": "{{count}} pagamento/i richiedono riconciliazione. Verifica gli importi irrisolti prima di un nuovo addebito.",
+    "lastCharge": "Ultimo addebito",
+    "attention": "Da verificare",
+    "attemptStates": {
+      "reserved": "Pagamento riservato",
+      "created": "Pagamento creato",
+      "confirming": "Conferma del pagamento in corso",
+      "processing": "Pagamento in elaborazione",
+      "succeeded": "Pagamento ricevuto",
+      "failed": "Pagamento non riuscito",
+      "requires_action": "Conferma richiesta",
+      "canceled": "Annullato",
+      "unapplied": "Il pagamento richiede riconciliazione",
+      "returned": "Stornato",
+      "refunded": "Rimborsato",
+      "disputed": "Contestato"
+    },
+    "fees": {
+      "title": "Commissioni di elaborazione",
+      "cardBps": "Commissione carta di credito (punti base, 0–300)",
+      "ach": "Commissione pagamento bancario (USD, 0.00–25.00)",
+      "inactive": "Le commissioni sulle carte restano inattive finché l’amministratore del partner non conferma entrambe le dichiarazioni seguenti.",
+      "notified": "Ho informato il mio acquirer (Stripe) e i circuiti delle carte almeno 30 giorni fa",
+      "cost": "Questa commissione non supera il mio costo di accettazione delle carte",
+      "rules": "Solo carte di credito. Nessuna commissione sulle carte in CA, CT, ME o MA; in Colorado il limite è del 2%. Le commissioni si applicano solo ai pagamenti automatici statunitensi idonei in USD. I link di pagamento una tantum non prevedono commissioni.",
+      "legal": "Breeze non fornisce consulenza legale. Sei responsabile dell’ammissibilità dei supplementi, delle comunicazioni e del trattamento fiscale.",
+      "lowerAuthorization": "Clienti con termini autorizzati inferiori: {{count}}. L’autorizzazione attuale resta valida fino all’accettazione dei nuovi termini.",
+      "authorizedCard": "Autorizzati: {{accepted}} punti base; configurati: {{configured}}",
+      "authorizedAch": "Autorizzato: USD {{accepted}}; configurato: USD {{configured}}",
+      "authorizedCap": "Limite autorizzato: {{accepted}}; configurato: {{configured}}",
+      "noCap": "nessun limite",
+      "requestAuthorization": "Richiedi autorizzazione aggiornata",
+      "requestFailed": "Impossibile richiedere l’autorizzazione aggiornata. Verifica il contatto di fatturazione e la disponibilità di Stripe.",
+      "requested": "Autorizzazione aggiornata richiesta. L’autorizzazione attuale resta valida.",
+      "attestationOnFile": "Attestazione registrata: {{name}} ha confermato entrambe le dichiarazioni il {{date}}.",
+      "attestationOnFileUnknown": "Attestazione registrata: entrambe le dichiarazioni sono state confermate il {{date}}.",
+      "reattestHelp": "Per attestare di nuovo, seleziona entrambe le dichiarazioni e salva. Viene registrata una nuova attestazione a tuo nome con la data corrente, che sostituisce quella registrata. Le commissioni autorizzate dai clienti non cambiano.",
+      "authorizedCardNone": "Nessuna autorizzazione registrata; configurati: {{configured}} punti base",
+      "authorizedAchNone": "Nessuna autorizzazione registrata; configurato: USD {{configured}}",
+      "lowerAuthorizationOrg": "Questo cliente non ha autorizzato i termini configurati. Qualsiasi autorizzazione esistente resta valida fino all’accettazione dei nuovi termini.",
+      "blankPartner": "Se vuoto, si usa il valore predefinito di Breeze (nessuna commissione). Per esentare un cliente, imposta la sua commissione a 0 nella pagina Fatturazione del cliente.",
+      "blankOrg": "Se vuoto, si usa il valore predefinito del partner. Inserisci 0 per esentare questo cliente.",
+      "inactiveOrg": "Le commissioni sulle carte restano inattive finché un amministratore del partner non conferma entrambe le dichiarazioni sulle commissioni nella scheda Payments delle impostazioni di fatturazione del partner.",
+      "missingAuthorization": "Nessuna autorizzazione registrata: {{count}}. I pagamenti automatici non possono addebitare questi clienti finché non autorizzano il metodo di pagamento salvato.",
+      "missingAuthorizationOrg": "Questo cliente non ha un’autorizzazione registrata per il metodo di pagamento salvato. I pagamenti automatici non possono addebitarlo finché il cliente non lo autorizza.",
+      "requestMissingAuthorization": "Richiedi autorizzazione"
+    },
+    "enrollmentTitle": "Adesione al pagamento automatico",
+    "requestSentTo": "Richiesta inviata a {{email}}.",
+    "result": {
+      "paused": "Pagamenti automatici sospesi.",
+      "resumed": "Pagamenti automatici ripresi.",
+      "turnedOff": "Pagamenti automatici disattivati."
+    },
+    "needsAttention": {
+      "method_unusable": "Non è possibile addebitare il metodo di pagamento salvato.",
+      "stripe_account_changed": "L’account Stripe collegato è cambiato dopo l’adesione di questo cliente.",
+      "key_missing_permissions": "Alla chiave Stripe mancano autorizzazioni necessarie per i pagamenti automatici.",
+      "verification_failed": "La verifica del conto bancario non è riuscita."
+    },
+    "chargeOutcome": {
+      "succeeded": "Pagamento ricevuto.",
+      "processing": "Pagamento inviato. È in elaborazione e la fattura si aggiornerà quando verrà regolato.",
+      "requiresAction": "La banca del cliente richiede che confermi questo pagamento. Se è registrato un contatto di fatturazione, riceve via e-mail un link per confermarlo.",
+      "declined": "Il pagamento non è andato a buon fine.",
+      "cardDeclined": "La carta è stata rifiutata.",
+      "expiredCard": "La carta è scaduta. Chiedi al cliente di aggiornare il metodo di pagamento.",
+      "insufficientFunds": "Il pagamento è stato rifiutato per fondi insufficienti.",
+      "canceled": "Il pagamento è stato annullato prima del completamento.",
+      "unapplied": "Il pagamento è stato incassato ma richiede riconciliazione. Verificalo prima di addebitare di nuovo."
+    },
+    "chargeRefused": {
+      "notice_lead": "Il periodo di preavviso del cliente non è ancora terminato. La fattura potrà essere addebitata al termine.",
+      "no_eligible_notice": "Questa fattura non ha un avviso di pagamento automatico, quindi non può essere addebitata automaticamente.",
+      "renotice_required": "L’avviso di pagamento deve essere inviato di nuovo prima di poter addebitare questa fattura.",
+      "collection_in_progress": "Per questa fattura è già in corso un pagamento.",
+      "checkout_session_unrevoked": "Il cliente potrebbe star pagando questa fattura online in questo momento. Riprova tra qualche minuto.",
+      "retry_not_due": "Il prossimo tentativo non è ancora previsto.",
+      "not_payable": "Questa fattura non è aperta al pagamento.",
+      "nothing_to_pay": "Non resta nulla da pagare su questa fattura.",
+      "enrollment_inactive": "I pagamenti automatici non sono attivi per questo cliente.",
+      "schedule_inactive": "Questa fattura non è più programmata per il pagamento automatico.",
+      "generic": "Impossibile avviare il pagamento automatico. Aggiorna la fattura per vederne lo stato attuale.",
+      "excluded_contract": "Il contratto di questa fattura è escluso dai pagamenti automatici, quindi non è stato addebitato nulla. Se il cliente era stato avvisato di questo pagamento, ha ricevuto un'email che non avverrà."
+    },
+    "stepUp": {
+      "heading": "Conferma che sei tu",
+      "intro": {
+        "autopay_charge_now": "Addebitare ora questa fattura richiede una nuova verifica a due fattori.",
+        "partner_payment_settings_update": "Modificare le impostazioni di pagamento richiede una nuova verifica a due fattori per questi valori specifici.",
+        "org_payment_settings_update": "Modificare le impostazioni di pagamento di questa organizzazione richiede una nuova verifica a due fattori per questi valori specifici.",
+        "autopay_request_recipient": "Inviare la richiesta di autorizzazione a un indirizzo diverso dal contatto di fatturazione richiede una nuova verifica a due fattori."
+      },
+      "code": "Codice dell'autenticatore",
+      "passkey": "Confermerai con la tua passkey.",
+      "noFactor": "Aggiungi prima un'app di autenticazione o una passkey al tuo account.",
+      "noFactorSmsOnly": "I codici via SMS non possono confermare questa azione. Aggiungi prima un'app di autenticazione o una passkey al tuo account.",
+      "enrollLink": "Configura un secondo fattore",
+      "confirm": "Conferma",
+      "failed": "Verifica non riuscita. Riprova.",
+      "unavailable": "Impossibile avviare la verifica"
+    },
+    "notEnabled": {
+      "title": "I pagamenti automatici non sono abilitati per il tuo account",
+      "hint": "I pagamenti automatici non sono ancora stati attivati. Chiedi al tuo amministratore Breeze di abilitarli, poi torna qui per richiedere l'adesione ai tuoi clienti."
+    }
+  },
+  "reminders": {
+    "title": "Promemoria di pagamento",
+    "description": "Invia promemoria per le fatture non pagate al contatto di fatturazione dell’organizzazione. I promemoria funzionano anche senza pagamenti automatici.",
+    "enabled": "Invia promemoria di pagamento",
+    "on": "Attivati",
+    "off": "Disattivati",
+    "inherit": "Usa {{source}}: {{value}}",
+    "before": "Giorni prima della scadenza",
+    "repeat": "Ripeti prima della scadenza ogni (giorni)",
+    "overdue": "Ricorda dopo la scadenza ogni (giorni)",
+    "noRepeat": "Nessuna ripetizione",
+    "orgRepeatHelp": "Lasciando il campo vuoto si eredita l’impostazione del partner. Non è possibile disattivare solo le ripetizioni prima della scadenza se il partner le ha attivate; disattiva i promemoria per questa organizzazione per interromperli tutti.",
+    "partnerRepeatHelp": "Lascia vuoto l’intervallo di ripetizione per inviare un solo promemoria prima della scadenza. Gli altri campi vuoti usano il valore predefinito visualizzato.",
+    "cadenceHelp": "Non viene inviato alcun promemoria il giorno della scadenza. Il primo promemoria di ritardo viene inviato un intervallo dopo la scadenza. Modificare date o intervalli non invia nuovamente i promemoria già assegnati.",
+    "invalid": "Inserisci un numero intero di giorni da 1 a 31 oppure lascia il campo vuoto per ereditare il valore.",
+    "sources": {
+      "org": "organizzazione",
+      "partner": "valore predefinito del partner",
+      "default": "valore predefinito di Breeze"
+    },
+    "save": "Salva impostazioni di pagamento",
+    "saving": "Salvataggio…",
+    "saved": "Impostazioni dei promemoria salvate",
+    "saveFailed": "Impossibile salvare le impostazioni dei promemoria",
+    "loadFailed": "Impossibile caricare le impostazioni dei promemoria",
+    "retry": "Riprova",
+    "loading": "Caricamento delle impostazioni di pagamento…"
   }
 }

@@ -1,3 +1,5 @@
+const setPageContext = vi.hoisted(() => vi.fn());
+vi.mock('@/stores/aiStore', () => ({ useAiStore: (select: (s: unknown) => unknown) => select({ setPageContext }) }));
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -15,15 +17,21 @@ vi.mock('../../stores/auth', () => ({
     { getState: () => ({ tokens: null }) },
   ),
 }));
-// The Preview tab's InvoiceDocument reads the org list off orgStore; stub it so
-// the real module (which registers an org-id provider on the auth store at import
-// time) is never pulled into this partially-mocked auth setup.
+// Other workspace children read the org list off orgStore; stub it so the real
+// module (which registers an org-id provider on the auth store at import time)
+// is never pulled into this partially-mocked auth setup.
 vi.mock('../../stores/orgStore', () => ({
   useOrgStore: (selector: (s: { organizations: { id: string; name: string }[] }) => unknown) =>
     selector({ organizations: [] }),
 }));
 vi.mock('@/lib/navigation', () => ({ navigateTo: vi.fn() }));
 vi.mock('../shared/Toast', () => ({ showToast: vi.fn() }));
+// The real button self-gates on the Wisp flag + grant (its own suite covers that).
+vi.mock('@/components/wisp/WispTalkButton', () => ({
+  default: ({ kind, id, orgId, label }: { kind: string; id: string; orgId: string | null; label: string }) => (
+    <div data-testid="wisp-talk-button-mock" data-kind={kind} data-id={id} data-org={orgId ?? ''} data-label={label} />
+  ),
+}));
 
 const fetchMock = vi.mocked(fetchWithAuth);
 const json = (payload: unknown, ok = true, status = ok ? 200 : 500): Response =>
@@ -98,6 +106,22 @@ describe('InvoiceWorkspace', () => {
     render(<InvoiceWorkspace id="inv-1" />);
     await waitFor(() => expect(screen.getByTestId('invoice-workspace-title')).toHaveTextContent('Draft invoice'));
     expect(screen.getByTestId('invoice-editor')).toBeInTheDocument();
+    expect(setPageContext).toHaveBeenCalledWith(expect.objectContaining({ type: 'record', kind: 'invoice', id: 'inv-1', orgId: 'org-1', label: 'Draft invoice' }));
+  });
+
+  it('mounts the Talk-to-Wisp button in the header with the loaded invoice and its org (W08 Task 10)', async () => {
+    fetchMock.mockImplementation(async (input: string) => {
+      if (input.startsWith('/catalog')) return json({ data: [] });
+      if (input === '/invoices/inv-1') return json({ data: invoice({}) });
+      return json({ data: {} });
+    });
+    render(<InvoiceWorkspace id="inv-1" />);
+    await waitFor(() => expect(screen.getByTestId('invoice-editor')).toBeInTheDocument());
+    const button = await screen.findByTestId('wisp-talk-button-mock');
+    expect(button).toHaveAttribute('data-label', 'Draft invoice');
+    expect(button).toHaveAttribute('data-kind', 'invoice');
+    expect(button).toHaveAttribute('data-id', 'inv-1');
+    expect(button).toHaveAttribute('data-org', 'org-1');
   });
 
   it('surfaces an error card when the invoice fails to load', async () => {
@@ -107,6 +131,16 @@ describe('InvoiceWorkspace', () => {
     });
     render(<InvoiceWorkspace id="inv-1" />);
     await waitFor(() => expect(screen.getByTestId('invoice-workspace-error')).toBeInTheDocument());
+  });
+
+  it('renders AccessDenied (not a load error) when the invoice GET is 403', async () => {
+    fetchMock.mockImplementation(async (input: string) => {
+      if (input === '/invoices/inv-1') return json({ error: 'forbidden' }, false, 403);
+      return json({ data: {} });
+    });
+    render(<InvoiceWorkspace id="inv-1" />);
+    expect(await screen.findByTestId('invoice-workspace-denied')).toBeInTheDocument();
+    expect(screen.queryByTestId('invoice-workspace-error')).not.toBeInTheDocument();
   });
 
   // #1418: issuing a draft must flip the header from "Draft invoice" to the
@@ -341,4 +375,53 @@ describe('InvoiceWorkspace', () => {
     await waitFor(() => expect(screen.getByTestId('invoice-tab-editor')).toHaveAttribute('aria-selected', 'true'));
     expect(window.location.hash).toBe('#editor&devices=line-1');
   });
+});
+
+it('renders the real invoice autopay panel only for an enabled projection',async()=>{
+ window.location.hash='';
+ const detail={...invoice({status:'sent',invoiceNumber:'INV-1'}),autopay:{state:'scheduled',reason:null,collectOn:'2026-10-15',noticeSentAt:null,excluded:false,canExclude:true,canChargeNow:false,processing:false,unapplied:false}};
+ fetchMock.mockImplementation(async(input:string)=>json({data:input==='/invoices/inv-1'?detail:[]}));
+ render(<InvoiceWorkspace id="inv-1"/>);expect(await screen.findByTestId('autopay-invoice-panel')).toBeInTheDocument();expect(screen.getByTestId('autopay-invoice-excluded')).toBeInTheDocument();
+});
+
+it('hides autopay controls on the real workspace when rollout is disabled and no money needs attention',async()=>{
+ window.location.hash='';
+ fetchMock.mockImplementation(async(input:string)=>json({data:input==='/invoices/inv-1'?{...invoice({status:'sent',invoiceNumber:'INV-1'}),autopay:null}:[]}));
+ render(<InvoiceWorkspace id="inv-1"/>);
+ await screen.findByTestId('invoice-detail');
+ expect(screen.queryByTestId('autopay-invoice-panel')).toBeNull();
+ expect(screen.queryByTestId('autopay-invoice-excluded')).toBeNull();
+});
+
+it('keeps unresolved-money attention visible with enrollment disabled, until resolution',async()=>{
+  let count=1;
+  fetchMock.mockImplementation(async(input:string)=>{
+    if(input==='/billing/autopay')return json({error:'autopay_not_enabled'},false,404);
+    if(input==='/invoices/inv-1')return json({data:{...invoice({status:'sent',invoiceNumber:'INV-1'}),autopay:null,unappliedCount:count}});
+    if(input==='/invoices/inv-1/payments')return json({data:[]});
+    return json({data:[]});
+  });
+  const first=render(<InvoiceWorkspace id="inv-1"/>);
+  expect(await screen.findByTestId('autopay-unapplied-banner')).toBeVisible();
+  fireEvent.click(screen.getByTestId('invoice-tab-preview'));
+  expect(screen.getByTestId('autopay-unapplied-banner')).toBeVisible();
+  expect(fetchMock.mock.calls.some(([path])=>path==='/billing/autopay')).toBe(false);
+  first.unmount();count=0;render(<InvoiceWorkspace id="inv-1"/>);
+  await screen.findByTestId('invoice-workspace-title');
+  expect(screen.queryByTestId('autopay-unapplied-banner')).not.toBeInTheDocument();
+});
+it('Charge now conflict surfaces an error without a successful workspace refresh',async()=>{
+ window.location.hash='';
+ const {showToast}=await import('../shared/Toast');vi.mocked(showToast).mockClear();
+ const detail={...invoice({status:'sent',invoiceNumber:'INV-1'}),autopay:{state:'scheduled',reason:null,collectOn:'2099-01-01',noticeSentAt:'2020-01-01',excluded:false,canExclude:true,canChargeNow:true,chargePreview:{amount:'10.00',currency:'USD',methodLabel:'Visa ••4242'},processing:false,unapplied:false}};
+ fetchMock.mockImplementation(async(input:string,init?:RequestInit)=>{
+  if(input==='/invoices/inv-1/autopay/charge-now')return json({error:'notice_lead',code:'notice_lead'},false,409);
+  return json({data:input==='/invoices/inv-1'?detail:[]});
+ });
+ render(<InvoiceWorkspace id="inv-1"/>);fireEvent.click(await screen.findByTestId('autopay-charge-now'));
+ fireEvent.click(screen.getByTestId('autopay-charge-confirm'));
+ await waitFor(()=>expect(showToast).toHaveBeenCalledWith(expect.objectContaining({type:'error'})));
+ expect(fetchMock).toHaveBeenCalledWith('/invoices/inv-1/autopay/charge-now',{method:'POST'});
+ expect(fetchMock.mock.calls.filter(([path])=>path==='/invoices/inv-1')).toHaveLength(1);
+ expect(vi.mocked(showToast).mock.calls.some(([toast])=>toast.type==='success')).toBe(false);
 });

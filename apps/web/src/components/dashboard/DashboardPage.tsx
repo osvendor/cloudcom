@@ -1,7 +1,8 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { RefreshCw } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useAuthStore } from '../../stores/auth';
+import { hasPermission } from '../../lib/permissions';
 import { useOrgStore } from '../../stores/orgStore';
 import { useAiStore } from '@/stores/aiStore';
 import { DEFAULT_DASHBOARD_EXCLUDE_ACTIONS } from '@/lib/auditFormat';
@@ -18,6 +19,8 @@ import SecurityPostureCard from './SecurityPostureCard';
 import PatchComplianceCard from './PatchComplianceCard';
 import VulnerabilitiesCard from './VulnerabilitiesCard';
 import RecentActivity from './RecentActivity';
+import RecentlyViewedCard, { RECENTLY_VIEWED_LIMIT } from './RecentlyViewedCard';
+import { useRecentsStore, selectRecentEntries } from '../../stores/recentsStore';
 import type {
   AlertRow,
   AlertsSummary,
@@ -56,6 +59,21 @@ export default function DashboardPage() {
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
   const [updatedText, setUpdatedText] = useState('');
 
+  // The recents store is filled client-side after hydration; render the card
+  // only once mounted so the first client render matches the server HTML.
+  const recentDevices = useRecentsStore((s) => s.devices);
+  const recentPages = useRecentsStore((s) => s.pages);
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => { setMounted(true); }, []);
+  const recentEntries = useMemo(
+    () =>
+      mounted
+        ? selectRecentEntries({ devices: recentDevices, pages: recentPages }, window.location.pathname, RECENTLY_VIEWED_LIMIT)
+        : [],
+    [mounted, recentDevices, recentPages],
+  );
+  const showRecentlyViewed = recentEntries.length > 0;
+
   // Heavy endpoints (security/patch/vuln aggregations) poll at 1/5th the
   // rate of the cheap counters. A manual refresh bumps tick by 5 so it
   // always crosses a boundary and refreshes these too.
@@ -75,10 +93,14 @@ export default function DashboardPage() {
     (j: any) => j.data ?? []
   );
   const tickets = useDashboardQuery<TicketStats>('/tickets/stats', tick, (j: any) => j.data);
+  // GET /audit-logs/logs requires audit:read, which read-only roles such as
+  // Partner Viewer lack — skip the request rather than 403 every tick (#10295).
+  // Permissions still loading (undefined) also skip; the slot fetches once they land.
   const activity = useDashboardQuery<AuditLogEntry[]>(
     AUDIT_PATH,
     tick,
-    (j: any) => j.logs ?? j.auditLogs ?? j.data ?? []
+    (j: any) => j.logs ?? j.auditLogs ?? j.data ?? [],
+    { enabled: hasPermission(user?.permissions, 'audit', 'read') }
   );
   const patch = useDashboardQuery<PatchCompliance>('/patches/compliance', heavyTick, (j: any) => j.data);
   const security = useDashboardQuery<SecurityOverview>('/security/dashboard', heavyTick, (j: any) => j.data);
@@ -183,7 +205,12 @@ export default function DashboardPage() {
         </div>
       )}
 
-      <RecentActivity activity={activity} onRetry={refresh} />
+      <div className={cn('grid items-start gap-6', showRecentlyViewed && 'lg:grid-cols-3')}>
+        <div className={cn(showRecentlyViewed && 'lg:col-span-2')}>
+          <RecentActivity activity={activity} onRetry={refresh} />
+        </div>
+        {showRecentlyViewed && <RecentlyViewedCard entries={recentEntries} />}
+      </div>
     </div>
   );
 }

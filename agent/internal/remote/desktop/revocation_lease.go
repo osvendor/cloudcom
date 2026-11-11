@@ -51,7 +51,7 @@ const (
 	StopReasonLeaseExpired = "lease_expired"
 	StopReasonHardDeadline = "max_session_duration_exceeded"
 	// StopReasonLeaseUnavailableAtStart — the control plane could not answer
-	// this session's FIRST renewal (SEC-038 owner decision 2). A session the
+	// this session's FIRST renewal. A session the
 	// control plane has never once confirmed has no standing to ride the 90 s
 	// grace window through an outage, so it stops immediately.
 	StopReasonLeaseUnavailableAtStart = "lease_unavailable_at_start"
@@ -66,7 +66,7 @@ type revocationLeaseState struct {
 	grace        time.Duration
 	renewEvery   time.Duration
 	// established is set by the first successful renewal. Until then an
-	// `unavailable` answer is fatal rather than graced (SEC-038 decision 2).
+	// `unavailable` answer is fatal rather than graced.
 	established   bool
 	revoked       bool
 	revokedReason string
@@ -350,12 +350,17 @@ func (m *SessionManager) watchSessionLifetime(
 			}
 
 			stop, reason := false, ""
+			revokedReason := ""
 			if session.leaseState != nil {
-				stop, reason = evaluateRevocationLease(now, session.leaseState.snapshot())
+				snap := session.leaseState.snapshot()
+				stop, reason = evaluateRevocationLease(now, snap)
+				revokedReason = snap.revokedReason
 			}
+			fromLifetime := false
 			if !stop {
 				lastActivity := time.Unix(0, session.lastInputUnixNano.Load())
 				stop, reason = shouldStopForLifetime(now, startWall, lastActivity, policy)
+				fromLifetime = stop
 			}
 			if !stop {
 				continue
@@ -368,13 +373,16 @@ func (m *SessionManager) watchSessionLifetime(
 			case StopReasonLeaseExpired:
 				slog.Warn("Desktop session revocation lease expired past its grace window, stopping",
 					"session", sessionID)
-			case "idle_timeout_exceeded":
+			case StopReasonIdleTimeout:
 				slog.Warn("Desktop session idle timeout, stopping", "session", sessionID)
 			default:
 				slog.Warn("Desktop session reached max duration, stopping",
 					"session", sessionID, "maxDuration", ClampMaxDuration(policy.MaxDuration))
 			}
 
+			// Tell the viewer why before the peer closes (#10421), so it shows
+			// the reason instead of auto-reconnecting into a dead session.
+			m.sendSessionEnding(session, sessionEndingNotice(reason, revokedReason, policy, fromLifetime))
 			m.StopSession(sessionID)
 			if m.OnSessionStopped != nil {
 				// session.LastStopReason() is "" here — a lifetime/lease stop

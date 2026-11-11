@@ -130,6 +130,7 @@ vi.mock('../../db', async (importOriginal) => ({
 
 import {
   recordMonitorEvaluation,
+  recordRecoveryObservation,
   detachMonitorFromDevice,
   linkEpisodeAlert,
   recordEpisodeResponse,
@@ -230,6 +231,60 @@ function compiledUpdateWhereSql(n = 0): string {
 }
 
 describe('recordMonitorEvaluation', () => {
+  it.each([
+    { episodesInWindow: 0, responsesPaused: false },
+    { episodesInWindow: 4, responsesPaused: true },
+  ])('records existing healthy pairs in one statement without resetting recurrence %j', async (healthy) => {
+    const now = new Date('2026-10-27T23:00:00.000Z');
+    state.updateRows = [[healthy]];
+    const result = await recordMonitorEvaluation({
+      monitor: monitor(), deviceId: DEVICE, orgId: ORG, observation: 'ok', now,
+    });
+    expect(result).toEqual({
+      episodeId: null, episodeOpened: false, episodeClosed: false,
+      episodesInWindow: healthy.episodesInWindow, responsesPaused: healthy.responsesPaused,
+      latched: false, needsEscalationAlert: false,
+    });
+    expect(dbMock.transaction).toHaveBeenCalledTimes(1);
+    expect(state.inserts).toHaveLength(0);
+    expect(state.capturedSelectSql).toHaveLength(0);
+    expect(state.updates).toHaveLength(1);
+    expect(updateSets()).toEqual([{ lastEvaluatedAt: now, lastState: 'ok', updatedAt: now }]);
+    const where = compiledUpdateWhereSql();
+    expect(where).toContain('"monitor_device_state"."current_episode_id" is null');
+    expect(where).toContain('"monitor_device_state"."org_id"');
+    expect(where).toContain('"monitor_device_state"."monitor_id"');
+    expect(where).toContain('"monitor_device_state"."device_id"');
+  });
+
+  it('falls back to creating and locking state for a first healthy observation', async () => {
+    state.updateRows = [[]];
+    state.insertRows = [[]];
+    state.selectRows = [[stateRow()]];
+    const result = await recordMonitorEvaluation({ monitor: monitor(), deviceId: DEVICE, orgId: ORG, observation: 'ok' });
+    expect(result).toMatchObject({ episodeClosed: false, episodeOpened: false, episodesInWindow: 0, responsesPaused: false });
+    expect(state.inserts).toHaveLength(1);
+    expect(state.capturedSelectSql[0]).toContain('for update');
+    expect(state.updates).toHaveLength(2);
+  });
+
+  it('keeps a failed healthy fast-path statement inside the driver transaction', async () => {
+    const failure = new Error('statement failed');
+    let entered = false;
+    dbMock.transaction.mockImplementation(async (cb) => {
+      entered = true;
+      const transaction = tx();
+      transaction.update = () => ({
+        set: () => ({ where: () => ({ returning: async () => { throw failure; } }) }),
+      }) as never;
+      return cb(transaction);
+    });
+    await expect(recordMonitorEvaluation({ monitor: monitor(), deviceId: DEVICE, orgId: ORG, observation: 'ok' })).rejects.toBe(failure);
+    expect(entered).toBe(true);
+    expect(dbMock.update).not.toHaveBeenCalled();
+    expect(state.inserts).toHaveLength(0);
+  });
+
   it('opens an episode on the first breach and reports episodeOpened', async () => {
     state.selectRows = [[stateRow()]];
     state.insertRows = [[], [{ id: EPISODE, startedAt: new Date() }]];
@@ -462,10 +517,9 @@ describe('recordMonitorEvaluation', () => {
     );
   });
 
-  it('adopts the concurrent winner\'s episode when the open-episode unique fires', async () => {
+  it('adopts the existing episode without recording an extra insertion', async () => {
     state.selectRows = [[stateRow()], [{ id: EPISODE }]];
-    state.insertRows = [[]];
-    state.insertThrow = Object.assign(new Error('duplicate key'), { code: '23505' });
+    state.insertRows = [[], []];
 
     const result = await recordMonitorEvaluation({
       monitor: monitor(),
@@ -474,10 +528,9 @@ describe('recordMonitorEvaluation', () => {
       observation: 'breach',
     });
 
-    // The racing sweep already opened it: adopt, do not throw (an uncaught
-    // 23505 inside a request transaction surfaces as a 500).
     expect(result.episodeId).toBe(EPISODE);
     expect(result.episodeOpened).toBe(false);
+    expect(state.inserts[1]!.some(call => call.method === 'onConflictDoNothing')).toBe(true);
   });
 
   it('rethrows an insert error that is NOT a unique violation', async () => {
@@ -708,5 +761,32 @@ describe('recordEpisodeResponse', () => {
     expect(sql).toMatch(/"monitor_id" = \$/);
     expect(sql).toMatch(/"device_id" = \$/);
     expect(sql).toMatch(/"ended_at" is null/);
+  });
+});
+
+describe('recordRecoveryObservation', () => {
+  it('loads the monitor and closes the breach episode with an ok observation for the device org', async () => {
+    state.selectRows = [[monitor()], [stateRow({ currentEpisodeId: EPISODE, lastState: 'breach' })]];
+
+    await recordRecoveryObservation(MONITOR, DEVICE, ORG);
+
+    expect(state.capturedSelectSql[0]).toContain('"monitor_definitions"');
+    expect(state.capturedSelectSql[0]).toContain('"monitor_definitions"."id" =');
+    expect(updateSets()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ endReason: 'recovered', endedAt: expect.any(Date) }),
+      expect.objectContaining({ lastState: 'ok', currentEpisodeId: null }),
+    ]));
+    expect(state.inserts[0]?.find(call => call.method === 'values')?.args[0]).toEqual({
+      monitorId: MONITOR, deviceId: DEVICE, orgId: ORG,
+    });
+  });
+
+  it('returns silently when the monitor is missing', async () => {
+    state.selectRows = [[]];
+
+    await expect(recordRecoveryObservation(MONITOR, DEVICE, ORG)).resolves.toBeUndefined();
+
+    expect(dbMock.transaction).not.toHaveBeenCalled();
+    expect(state.updates).toEqual([]);
   });
 });

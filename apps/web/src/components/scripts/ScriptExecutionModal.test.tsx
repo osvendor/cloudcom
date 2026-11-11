@@ -313,7 +313,7 @@ describe('ScriptExecutionModal admission truth', () => {
     expect(screen.getByText('Some devices were admitted and queued. Review the remaining targets.')).toBeInTheDocument();
     expect(screen.getAllByText('ws-01').length).toBeGreaterThan(0);
     expect(screen.getAllByText('ws-02').length).toBeGreaterThan(0);
-    expect(screen.getByText(/maintenance_suppressed/)).toBeInTheDocument();
+    expect(screen.getByText(/Skipped: device is in a maintenance window/)).toBeInTheDocument();
     await act(async () => { await vi.advanceTimersByTimeAsync(1600); });
     expect(onClose).not.toHaveBeenCalled();
   });
@@ -329,7 +329,7 @@ describe('ScriptExecutionModal admission truth', () => {
     await execute();
     await act(async () => { await Promise.resolve(); });
     expect(screen.getByText('No devices were admitted. Review the reasons below.')).toBeInTheDocument();
-    expect(screen.getByText(/site_access_denied/)).toBeInTheDocument();
+    expect(screen.getByText(/You don't have access to this device's site/)).toBeInTheDocument();
     await act(async () => { await vi.advanceTimersByTimeAsync(1600); });
     expect(onClose).not.toHaveBeenCalled();
   });
@@ -694,5 +694,65 @@ describe('ScriptExecutionModal initial values (#4885 Run again)', () => {
 
     await waitFor(() => expect(onExecute).toHaveBeenCalledTimes(1));
     expect(onExecute).toHaveBeenCalledWith('sc-1', ['d-1'], { message: 'kept' }, 'system');
+  });
+});
+
+describe('ScriptExecutionModal device-org pinning (#7479)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    fetchWithAuthMock.mockImplementation(async () => new Response(JSON.stringify({
+      data: [],
+      page: { nextCursor: null, returned: 0, total: 0, hasMore: false, observedAt: '2026-09-30T00:00:00.000Z' },
+    }), { status: 200 }));
+  });
+
+  function renderPinned() {
+    return render(
+      <ScriptExecutionModal
+        script={baseScript}
+        isOpen
+        onClose={vi.fn()}
+        onExecute={vi.fn()}
+        initialDeviceIds={['d-1']}
+        orgId="org-b"
+      />
+    );
+  }
+
+  it('requests device options pinned to the supplied orgId', async () => {
+    renderPinned();
+    await waitFor(() => expect(fetchWithAuthMock).toHaveBeenCalled());
+    const urls = fetchWithAuthMock.mock.calls.map((c) => String(c[0]));
+    for (const url of urls) {
+      expect(url).toContain('/devices/options');
+      expect(new URL(url, 'http://x').searchParams.get('orgId')).toBe('org-b');
+    }
+  });
+
+  it('pins the status-filter probe request to the orgId too', async () => {
+    render(
+      <ScriptExecutionModal script={baseScript} isOpen onClose={vi.fn()} onExecute={vi.fn()} orgId="org-b" />
+    );
+    // Empty picker + default 'online' filter + single-OS script => unfiltered probe (status omitted).
+    await waitFor(() => {
+      const urls = fetchWithAuthMock.mock.calls.map((c) => new URL(String(c[0]), 'http://x'));
+      expect(urls.some((u) => !u.searchParams.has('status'))).toBe(true);
+    });
+    for (const call of fetchWithAuthMock.mock.calls) {
+      expect(new URL(String(call[0]), 'http://x').searchParams.get('orgId')).toBe('org-b');
+    }
+  });
+
+  it('does not show the blocked reason while device options are still loading', () => {
+    fetchWithAuthMock.mockImplementation(() => new Promise(() => {}));
+    renderPinned();
+    expect(screen.queryByTestId('script-execute-blocked-reason')).toBeNull();
+  });
+
+  it('explains why Execute is disabled when a selected device cannot be resolved', async () => {
+    renderPinned();
+    const reason = await screen.findByTestId('script-execute-blocked-reason');
+    expect(reason).toHaveTextContent(/cannot run/i);
+    expect(screen.getByText('Execute').closest('button')).toBeDisabled();
   });
 });

@@ -230,7 +230,6 @@ const POLICY_SNAPSHOT: AiAgentPolicySnapshot = {
   effective: {
     enabled: true,
     mode: 'act',
-    model: null,
     toolAllowlist: ['manage_services'],
     protectedResources: { services: [], paths: [], registryKeys: [], deviceTags: [] },
     limits: {
@@ -308,6 +307,13 @@ const POLICY_SNAPSHOT: AiAgentPolicySnapshot = {
       taskDeadlineHours: AI_AGENT_LIMIT_DEFAULTS.taskDeadlineHours,
       taskMaxActiveTargets: AI_AGENT_LIMIT_DEFAULTS.taskMaxActiveTargets,
       taskMaxPendingPerOrg: AI_AGENT_LIMIT_DEFAULTS.taskMaxPendingPerOrg,
+      maxConcurrentResearchRuns: AI_AGENT_LIMIT_DEFAULTS.maxConcurrentResearchRuns,
+      maxResearchRunsPerHour: AI_AGENT_LIMIT_DEFAULTS.maxResearchRunsPerHour,
+      maxAutoResearchRunsPerHour: AI_AGENT_LIMIT_DEFAULTS.maxAutoResearchRunsPerHour,
+      researchQuickMaxTurns: AI_AGENT_LIMIT_DEFAULTS.researchQuickMaxTurns,
+      researchDeepMaxTurns: AI_AGENT_LIMIT_DEFAULTS.researchDeepMaxTurns,
+      researchQuickBudgetCentsPerRun: AI_AGENT_LIMIT_DEFAULTS.researchQuickBudgetCentsPerRun,
+      researchDeepBudgetCentsPerRun: AI_AGENT_LIMIT_DEFAULTS.researchDeepBudgetCentsPerRun,
     },
     triggers: { alertSeverities: [], respectMaintenanceWindows: false },
     recipients: { userIds: ['recipient-1'], roleIds: [] },
@@ -347,6 +353,10 @@ function makeRunRow(overrides?: Record<string, unknown>) {
     orgId: ORG_ID,
     deviceId: DEVICE_ID,
     policySnapshot: POLICY_SNAPSHOT,
+    // Matches POLICY_SNAPSHOT.effective.mode by default, like a real,
+    // never-forced-shadow run — hardening tests below deliberately diverge
+    // this from the snapshot's mode.
+    modeAtStart: 'act',
     ...overrides,
   };
 }
@@ -656,6 +666,26 @@ describe('attemptPolicyDecision', () => {
     expect(guardrailMock.checkAgentGuardrails).not.toHaveBeenCalled();
   });
 
+  it('agent currently in act mode, run\'s policy snapshot ALSO reads act — but the run was actually admitted with modeAtStart \'shadow\' (anomaly/ticket forced-shadow downgrade) -> human path, never authorized', async () => {
+    // Distinct from the SAFETY GATE test above, which forces the CURRENT
+    // live policy to shadow. Here the current live policy AND the run's own
+    // policySnapshot.effective.mode both genuinely read 'act' (an anomaly-
+    // or ticket-triggered run is admitted against an agent whose resolved
+    // policy mode is 'act' — runService.ts's forced-shadow downgrade only
+    // changes what the run RECORDS as `modeAtStart`, never the snapshot's
+    // own `effective.mode`). Neither the current-policy check nor the
+    // snapshot-key check catches this; only a direct `modeAtStart` read
+    // does.
+    pushRows('action_intents', [makeIntentRow()]);
+    queueRunAndAgent({ run: { modeAtStart: 'shadow' } });
+    await attemptPolicyDecision(INTENT_ID);
+    expect(intentServiceMock.runDeferredHumanFanout).toHaveBeenCalledWith(INTENT_ID);
+    // Never reached the guardrail re-run or the authorize transaction.
+    expect(guardrailMock.checkAgentGuardrails).not.toHaveBeenCalled();
+    expect(dbMockState.insertValues.ai_unattended_exposure ?? []).toHaveLength(0);
+    expect(dbMockState.updateSets.action_intents ?? []).toHaveLength(0);
+  });
+
   it('deterministic: key not in the agent\'s CURRENT supervisedActionKeys -> human path', async () => {
     pushRows('action_intents', [makeIntentRow()]);
     queueRunAndAgent();
@@ -846,11 +876,11 @@ describe('attemptPolicyDecision', () => {
         details: expect.objectContaining({ decidedVia: 'policy', policyAuthorizationKey: 'manage_services:restart' }),
       }),
     );
-    // Notification to recipients. Review fix (#3827): `link: null`, not
-    // '/approvals' — a policy-decided intent has no approval_requests row for
-    // that link to point at; no run-detail page exists yet (wave 6).
+    // Notification to recipients. Review fix (#3827): never '/approvals' — a
+    // policy-decided intent has no approval_requests row for that link to
+    // point at. #4461: deep-links to the run detail page instead of `null`.
     expect(notifyMock.createNotification).toHaveBeenCalledWith(
-      expect.objectContaining({ userId: 'recipient-1', orgId: ORG_ID, link: null }),
+      expect.objectContaining({ userId: 'recipient-1', orgId: ORG_ID, link: `/ai-agents/runs/${RUN_ID}` }),
     );
   });
 

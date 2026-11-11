@@ -1,3 +1,4 @@
+import { findPartnerOwnedGroupIds, partnerGroupTargetRefusal } from '../services/deviceGroupOwnership';
 import { Hono, type Context } from 'hono';
 import { zValidator } from '../lib/validation';
 import { z } from 'zod';
@@ -400,6 +401,8 @@ maintenanceRoutes.post(
   async (c) => {
     const auth = c.get('auth');
     const body = c.req.valid('json');
+    const partnerGroupIds = await findPartnerOwnedGroupIds(body.groupIds ?? []);
+    if (partnerGroupIds.length > 0) return c.json(partnerGroupTargetRefusal(partnerGroupIds), 400);
 
     // Resolve the ownership axis (#2131): partner-wide creation requires the
     // partner-wide capability; the default path stays org-owned.
@@ -548,6 +551,8 @@ maintenanceRoutes.patch(
     const auth = c.get('auth');
     const windowId = c.req.param('id')!;
     const updates = c.req.valid('json');
+    const partnerGroupIds = await findPartnerOwnedGroupIds(updates.groupIds ?? []);
+    if (partnerGroupIds.length > 0) return c.json(partnerGroupTargetRefusal(partnerGroupIds), 400);
 
     if (Object.keys(updates).length === 0) {
       return c.json({ error: 'No updates provided' }, 400);
@@ -665,17 +670,12 @@ maintenanceRoutes.delete(
     const siteScopeDenied = await enforceWindowSiteScope(c, window);
     if (siteScopeDenied) return siteScopeDenied;
 
-    // Delete only future occurrences (preserve past ones for audit)
-    await db
-      .delete(maintenanceOccurrences)
-      .where(
-        and(
-          eq(maintenanceOccurrences.windowId, windowId),
-          gte(maintenanceOccurrences.startTime, new Date())
-        )
-      );
-
-    // Delete the window
+    // Delete the window. Its occurrences, past and future, go with it:
+    // maintenance_occurrences.window_id is ON DELETE CASCADE (an occurrence
+    // has no meaning without its window, and org erasure relies on this).
+    // Past occurrences were never actually kept here -- with any past
+    // occurrence present the old NO ACTION FK made this delete fail. The
+    // record of the deletion is the maintenance_window.delete audit entry.
     await db.delete(maintenanceWindows).where(eq(maintenanceWindows.id, windowId));
 
     writeRouteAudit(c, {

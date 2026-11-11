@@ -22,8 +22,8 @@ func TestBuildRestartScript_AgentOnly(t *testing.T) {
 	if !strings.Contains(got, `Copy-Item -Path 'C:\Windows\Temp\breeze-agent-1234.exe' -Destination 'C:\Program Files\Breeze\breeze-agent.exe' -Force`) {
 		t.Fatalf("expected agent Copy-Item line; script was:\n%s", got)
 	}
-	if strings.Contains(got, "breeze-user-helper") {
-		t.Fatalf("agent-only script should not mention user-helper; script was:\n%s", got)
+	if strings.Count(got, "Copy-Item -Path") != 1 || strings.Count(got, "Remove-Item -Path") != 2 {
+		t.Fatalf("agent-only script must only copy/remove the agent artifact and remove its script; script was:\n%s", got)
 	}
 	if !strings.Contains(got, "Start-Service -Name 'BreezeAgent'") {
 		t.Fatalf("expected Start-Service line; script was:\n%s", got)
@@ -46,8 +46,8 @@ func TestBuildRestartScript_NilUserHelperIsAbsent(t *testing.T) {
 		UserHelper: nil,
 	})
 
-	if strings.Contains(got, "breeze-user-helper") {
-		t.Fatalf("nil UserHelper script must not mention breeze-user-helper; script was:\n%s", got)
+	if strings.Count(got, "Copy-Item -Path") != 1 || strings.Count(got, "Remove-Item -Path") != 2 {
+		t.Fatalf("nil UserHelper script must not copy/remove a helper artifact; script was:\n%s", got)
 	}
 	// Defense in depth: also verify no second Copy-Item snuck in. The agent
 	// Copy-Item is the only Copy-Item line we expect.
@@ -164,6 +164,65 @@ func TestBuildRestartScript_FailureLogUsesTemp(t *testing.T) {
 	// Defense-in-depth: no hardcoded C:\ProgramData log path crept in.
 	if strings.Contains(got, `C:\ProgramData\Breeze\breeze-update-failure`) {
 		t.Fatalf("failure log must not be written under C:\\ProgramData\\Breeze (may not exist on fresh installs); script was:\n%s", got)
+	}
+}
+
+// TestBuildRestartScript_FailureLogStampIsCultureInvariant guards the catch
+// block's log-name stamp (#9751). Windows PowerShell 5.1 renders
+// `Get-Date -UFormat %s` with a fractional part, and [double]::Parse uses the
+// host culture, so a culture whose separators reject "." throws INSIDE the
+// catch block. The failure log is never written and the closing Start-Service
+// never runs, which leaves the agent service stopped. The heartbeat reads that
+// log to report why a swap failed, so it must always be written.
+func TestBuildRestartScript_FailureLogStampIsCultureInvariant(t *testing.T) {
+	got := buildRestartScript(restartScriptOptions{
+		Agent: BinaryPair{
+			Temp:   `C:\tmp\agent.exe`,
+			Target: `C:\Program Files\Breeze\breeze-agent.exe`,
+		},
+	})
+	for _, banned := range []string{"[double]::Parse", "-UFormat"} {
+		if strings.Contains(got, banned) {
+			t.Fatalf("failure-log stamp must not use culture-sensitive %q; script was:\n%s", banned, got)
+		}
+	}
+	if !strings.Contains(got, "[DateTime]::UtcNow.Ticks") {
+		t.Fatalf("expected the culture-invariant [DateTime]::UtcNow.Ticks stamp; script was:\n%s", got)
+	}
+}
+
+// TestBuildRestartScript_CatchBlockCannotAbortBeforeStartService guards the
+// other way the catch block could leave the service stopped (#9751): under the
+// script-wide 'Stop' preference a failing Out-File would end the script before
+// the closing Start-Service. The catch block must relax the preference first.
+func TestBuildRestartScript_CatchBlockCannotAbortBeforeStartService(t *testing.T) {
+	got := buildRestartScript(restartScriptOptions{
+		Agent: BinaryPair{Temp: `C:\tmp\agent.exe`, Target: `C:\Program Files\Breeze\breeze-agent.exe`},
+	})
+	catchIdx := strings.Index(got, "} catch {")
+	relaxIdx := strings.Index(got, "$ErrorActionPreference = 'Continue'")
+	outFileIdx := strings.Index(got, "Out-File")
+	if catchIdx < 0 || relaxIdx < catchIdx || outFileIdx < relaxIdx {
+		t.Fatalf("catch block must set $ErrorActionPreference = 'Continue' before Out-File (catch=%d relax=%d outfile=%d); script was:\n%s",
+			catchIdx, relaxIdx, outFileIdx, got)
+	}
+}
+
+// TestBuildRestartScript_FailureLogMatchesTheHeartbeatParser pins the contract
+// with heartbeat/update_outcome.go, which globs the log by prefix and reads its
+// "operation:" and "exception:" lines to report why a swap failed (#9751).
+func TestBuildRestartScript_FailureLogMatchesTheHeartbeatParser(t *testing.T) {
+	got := buildRestartScript(restartScriptOptions{
+		Agent: BinaryPair{Temp: `C:\tmp\agent.exe`, Target: `C:\Program Files\Breeze\breeze-agent.exe`},
+	})
+	for _, want := range []string{
+		UpdateHelperFailureLogPrefix + "$stamp.log",
+		`"operation: $op"`,
+		`"exception: $($_.Exception.Message)"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("script must contain %q for the heartbeat's failure-log parser; script was:\n%s", want, got)
+		}
 	}
 }
 

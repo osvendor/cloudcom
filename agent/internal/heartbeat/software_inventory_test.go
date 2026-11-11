@@ -26,7 +26,7 @@ func TestSendSoftwareInventoryUploadsV2IncompleteEvidenceWithRunningVersion(t *t
 	}))
 	defer server.Close()
 
-	h := NewWithVersion(&config.Config{AgentID: "agent-1", AuthToken: "token", ServerURL: server.URL}, "6.7.8", nil, nil)
+	h := newTestHeartbeatWithVersion(&config.Config{AgentID: "agent-1", AuthToken: "token", ServerURL: server.URL}, "6.7.8", nil, nil)
 	h.softwareObservationFn = func() (collectors.SoftwareInventoryObservationV2, error) {
 		return collectors.SoftwareInventoryObservationV2{
 			SchemaVersion: 2, ObservationID: "89c5b6c4-e185-4e24-8467-dc17c82b8233",

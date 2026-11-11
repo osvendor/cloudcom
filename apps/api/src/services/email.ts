@@ -1,3 +1,4 @@
+import type { AlertOwnerKind } from '@breeze/shared';
 import nodemailer, { type Transporter } from 'nodemailer';
 import { Resend } from 'resend';
 import { captureException } from './sentry';
@@ -6,6 +7,7 @@ import {
   getSupportEmail,
   renderButton,
   renderLayout,
+  renderLinkRow,
 } from './emailLayout';
 import type { PartnerLaneMailPurpose, PlatformMailPurpose } from './emailDomains/mailPurposes';
 import { platformFallbackFrom, resolveSender } from './emailDomains/senderResolution';
@@ -143,7 +145,7 @@ export type PasswordResetEmailParams = {
   supportEmail?: string;
 } & (
   | { purpose: 'auth.password_reset' }
-  | { purpose: 'portal.password_reset'; partnerId: string | null }
+  | { purpose: 'portal.password_reset'; partnerId: string | null; partnerName?: string | null }
 );
 
 export interface PortalInviteEmailParams {
@@ -162,6 +164,70 @@ export interface PortalInviteEmailParams {
   partnerName?: string;
   /** Partner-saved template override; null/absent uses code defaults. */
   custom?: PartnerEmailCustom | null;
+  /**
+   * Portal registration W4 (#11381), spec §5.5: the invitation-bound "Sign in
+   * with Microsoft" link (the invite link with `&method=microsoft`), present
+   * only when Microsoft is effective for the org. It becomes the primary button.
+   */
+  microsoftUrl?: string;
+  /**
+   * Whether the org's effective policy allows password sign-in. False
+   * (`sso_only`): the email never offers a password.
+   */
+  passwordAllowed: boolean;
+}
+
+/**
+ * A decision on a portal access request (portal registration W3, #11380, OD3),
+ * sent to the person who asked. Partner lane, `support` stream, like the
+ * invite: `partnerId` must come from a row the call site already read or from
+ * the verified auth context, never from request input (§8.1).
+ */
+export interface PortalAccessDecisionEmailParams {
+  to: string | string[];
+  orgName?: string;
+  partnerId: string | null;
+  partnerName?: string;
+}
+
+export interface PortalAccessApprovedEmailParams extends PortalAccessDecisionEmailParams {
+  /** The portal sign-in page, built with `buildPortalUrl` at the call site. */
+  loginUrl: string;
+}
+
+export type PortalAccessDeclinedEmailParams = PortalAccessDecisionEmailParams;
+
+/**
+ * Portal registration W4 (#11381, plan D7): another organization proved the
+ * Microsoft tenant one of this partner's orgs was linked to, so the link was
+ * removed. Platform mail from Breeze to the partner's active admins; it never
+ * names the organization that proved the tenant.
+ */
+export interface PortalEntraTenantDisplacedEmailParams {
+  to: string | string[];
+  partnerName: string;
+  orgName: string;
+  tenantId: string;
+}
+
+export type PortalDomainVerificationLostReason =
+  | 'record_missing'
+  | 'not_in_directory'
+  | 'tenant_not_proven'
+  | 'connection_missing'
+  | 'stale'
+  | 'displaced';
+
+/**
+ * Portal registration W5 (#11382): a customer org's domain stopped being
+ * verified. Platform mail from Breeze to the partner's active admins.
+ */
+export interface PortalDomainVerificationLostEmailParams {
+  to: string | string[];
+  partnerName: string;
+  orgName: string;
+  domain: string;
+  reason: PortalDomainVerificationLostReason;
 }
 
 export interface VerificationEmailParams {
@@ -184,6 +250,12 @@ export interface InviteEmailParams {
   orgName?: string;
   inviteUrl: string;
   supportEmail?: string;
+  /** Owning partner's name: brands the layout footer and fills {{partner_name}}. */
+  partnerName?: string;
+  /** Days until the invite link expires; defaults to the invite TTL (7). */
+  expiresDays?: number;
+  /** Partner-saved template override; null/absent uses code defaults. */
+  custom?: PartnerEmailCustom | null;
 }
 
 export interface AccountLockedEmailParams {
@@ -227,6 +299,8 @@ export interface AlertNotificationEmailParams {
   severity: AlertSeverity;
   summary: string;
   deviceName?: string;
+  subjectName?: string;
+  ownerKind?: AlertOwnerKind;
   occurredAt?: Date | string;
   dashboardUrl?: string;
   orgName?: string;
@@ -526,7 +600,8 @@ export class EmailService {
         html: template.html,
         text: template.text,
         purpose: 'portal.password_reset',
-        partnerId: params.partnerId
+        partnerId: params.partnerId,
+        partnerName: params.partnerName ?? null,
       });
       return;
     }
@@ -551,7 +626,7 @@ export class EmailService {
   }
 
   async sendInvite(params: InviteEmailParams): Promise<void> {
-    const template = buildInviteTemplate(params);
+    const template = buildStaffInviteTemplate(params);
     await this.sendEmail({
       to: params.to,
       subject: template.subject,
@@ -613,7 +688,56 @@ export class EmailService {
       html: template.html,
       text: template.text,
       purpose: 'portal.invite',
-      partnerId: params.partnerId
+      partnerId: params.partnerId,
+      partnerName: params.partnerName ?? null,
+    });
+  }
+
+  async sendPortalAccessApproved(params: PortalAccessApprovedEmailParams): Promise<void> {
+    const template = buildPortalAccessApprovedTemplate(params);
+    await this.sendEmail({
+      to: params.to,
+      subject: template.subject,
+      html: template.html,
+      text: template.text,
+      purpose: 'portal.access_request.approved',
+      partnerId: params.partnerId,
+      partnerName: params.partnerName ?? null,
+    });
+  }
+
+  async sendPortalAccessDeclined(params: PortalAccessDeclinedEmailParams): Promise<void> {
+    const template = buildPortalAccessDeclinedTemplate(params);
+    await this.sendEmail({
+      to: params.to,
+      subject: template.subject,
+      html: template.html,
+      text: template.text,
+      purpose: 'portal.access_request.declined',
+      partnerId: params.partnerId,
+      partnerName: params.partnerName ?? null,
+    });
+  }
+
+  async sendPortalEntraTenantDisplaced(params: PortalEntraTenantDisplacedEmailParams): Promise<void> {
+    const template = buildPortalEntraTenantDisplacedTemplate(params);
+    await this.sendEmail({
+      to: params.to,
+      subject: template.subject,
+      html: template.html,
+      text: template.text,
+      purpose: 'partner.portal_entra_tenant.displaced',
+    });
+  }
+
+  async sendPortalDomainVerificationLost(params: PortalDomainVerificationLostEmailParams): Promise<void> {
+    const template = buildPortalDomainVerificationLostTemplate(params);
+    await this.sendEmail({
+      to: params.to,
+      subject: template.subject,
+      html: template.html,
+      text: template.text,
+      purpose: 'partner.portal_domain_verification.lost',
     });
   }
 }
@@ -831,7 +955,9 @@ function resolveMailgunConfig(
   };
 }
 
-function resolveEmailProviderConfig(): ResolvedProviderConfig {
+// Exported for the System page drift test (system/connections/customStatus.drift.test.ts),
+// which checks emailStatus against this resolver. Not for other callers.
+export function resolveEmailProviderConfig(): ResolvedProviderConfig {
   const selection = parseEmailProviderSelection();
   const resendApiKey = getEnvString('RESEND_API_KEY');
   const emailFrom = getEnvString('EMAIL_FROM');
@@ -1073,6 +1199,16 @@ function buildPasswordResetTemplate(params: PasswordResetEmailParams): EmailTemp
   return { subject, html, text };
 }
 
+/**
+ * The portal invite. Which sign-in methods it offers follows the org's
+ * effective policy (W4 #11381, spec §5.5):
+ *  - password only (Microsoft off): unchanged — one "Set your password" button;
+ *  - Microsoft and password: "Sign in with Microsoft" is the button, and
+ *    "Or set a password" a secondary link;
+ *  - `sso_only`: Microsoft only; no password line, link or wording.
+ * The subject never changes. A partner's custom button label was written for
+ * the password button, so it never relabels the Microsoft one.
+ */
 export function buildPortalInviteTemplate(params: PortalInviteEmailParams): EmailTemplate {
   const orgName = params.orgName?.trim();
   const inviter = params.inviterName?.trim();
@@ -1081,30 +1217,155 @@ export function buildPortalInviteTemplate(params: PortalInviteEmailParams): Emai
     ? `<p style="${BODY_PARA}">${escapeHtml(customMessage)}</p>`
     : '';
   const custom = params.custom ?? null;
+  const microsoftUrl = params.microsoftUrl || undefined;
+  const passwordOnly = !microsoftUrl && params.passwordAllowed;
+  // No password and no Microsoft: an SSO-only org whose method is not Microsoft
+  // (Google, W7). The plain invite link; its page offers what the org allows.
+  const primary = microsoftUrl
+    ? { url: microsoftUrl, label: 'Sign in with Microsoft', preheader: 'Sign in with Microsoft to access your support portal.' }
+    : passwordOnly
+      ? { url: params.inviteUrl, label: undefined, preheader: 'Set your password to access your support portal.' }
+      : { url: params.inviteUrl, label: 'Accept your invite', preheader: 'Accept your invite to access your support portal.' };
+  const passwordSecondary = Boolean(microsoftUrl) && params.passwordAllowed;
   const rendered = renderPartnerEmail({
     id: 'portal_invite',
-    custom,
+    custom: !passwordOnly && custom ? { ...custom, buttonLabel: null } : custom,
     vars: {
       requester_name: inviter ?? '',
       partner_name: params.partnerName ?? '',
-      invite_url: params.inviteUrl,
+      // A custom body's `{{invite_url}}` is the link that works for this invitee.
+      invite_url: params.passwordAllowed ? params.inviteUrl : primary.url,
       org_name: orgName ?? '',
     },
-    ctaUrl: params.inviteUrl,
+    ctaUrl: primary.url,
+    ctaLabel: primary.label,
     footer: supportFooter(params.supportEmail, 'Need help? Contact'),
-    preheader: 'Set your password to access your support portal.',
+    preheader: primary.preheader,
     bodyBeforeCta: messageBlock,
-    bodyAfterCta: '',
+    bodyAfterCta: passwordSecondary ? renderLinkRow([{ label: 'Or set a password', url: params.inviteUrl }]) : '',
   });
   const support = getSupportEmail(params.supportEmail);
+  const actionLines = microsoftUrl
+    ? [`Sign in with Microsoft: ${microsoftUrl}`, passwordSecondary ? `Or set a password: ${params.inviteUrl}` : null]
+    : [passwordOnly ? `Set your password: ${params.inviteUrl}` : `Accept your invite: ${params.inviteUrl}`];
   const text = [
     orgName ? `You're invited to the ${orgName} support portal.` : `You're invited to your support portal.`,
     customMessage || null,
-    `Set your password: ${params.inviteUrl}`,
+    ...actionLines,
     'This invite link expires in 7 days.',
     support ? `Need help? Contact ${support}.` : null
   ].filter(Boolean).join('\n');
   return { subject: rendered.subject, html: rendered.html, text };
+}
+
+/**
+ * Portal access request approved (W3 #11380, OD3): an SSO-origin or add-in
+ * request now has browser access. One button to the portal sign-in page. No
+ * support footer: the platform support address is not the customer's IT
+ * provider.
+ */
+export function buildPortalAccessApprovedTemplate(params: PortalAccessApprovedEmailParams): EmailTemplate {
+  const orgName = params.orgName?.trim();
+  const subject = orgName ? `You can now sign in to the ${orgName} portal` : 'You can now sign in to your portal';
+  const lead = orgName
+    ? `Your request for access to the ${orgName} portal was approved.`
+    : 'Your request for portal access was approved.';
+  const html = renderLayout({
+    title: subject,
+    preheader: lead,
+    heading: 'You can now sign in',
+    body: `
+      <p style="${BODY_PARA}">${escapeHtml(lead)}</p>
+      ${renderButton('Sign in', params.loginUrl)}
+    `,
+    brandName: params.partnerName?.trim() || undefined,
+  });
+  const text = [lead, `Sign in: ${params.loginUrl}`].join('\n');
+  return { subject, html, text };
+}
+
+/** Portal access request declined (W3 #11380, spec §5.10): neutral, no link. */
+export function buildPortalAccessDeclinedTemplate(params: PortalAccessDeclinedEmailParams): EmailTemplate {
+  const orgName = params.orgName?.trim();
+  const subject = 'Your portal access request';
+  const copy = orgName
+    ? `Your request for access to the ${orgName} portal was not approved. If you think this is a mistake, contact your IT provider.`
+    : 'Your request for portal access was not approved. If you think this is a mistake, contact your IT provider.';
+  const html = renderLayout({
+    title: subject,
+    preheader: 'An update on your portal access request.',
+    heading: subject,
+    body: `<p style="${BODY_PARA}">${escapeHtml(copy)}</p>`,
+    brandName: params.partnerName?.trim() || undefined,
+  });
+  return { subject, html, text: copy };
+}
+
+/**
+ * Microsoft tenant link removed (portal registration W4 #11381, plan D7): sent
+ * after commit to the displaced partner's active admins. A notice, not a call
+ * to action: no link, and the org that proved the tenant is never named.
+ * Breeze-branded (platform mail to MSP staff), same idiom as
+ * partnerTrustPartnerMail.ts.
+ */
+export function buildPortalEntraTenantDisplacedTemplate(params: PortalEntraTenantDisplacedEmailParams): EmailTemplate {
+  const orgName = params.orgName.trim();
+  const subject = `Microsoft tenant link removed from ${orgName}`;
+  const lead = `${orgName} was linked to the Microsoft tenant ${params.tenantId}. An administrator of that tenant proved it for another organization in Breeze, so the link was removed from ${orgName}.`;
+  const impact = `Microsoft sign-in to the ${orgName} portal and Breeze AI for Office no longer work for that tenant, and people signed in through it were signed out.`;
+  const next = "If you didn't expect this, contact the tenant's administrator.";
+  const why = `You're receiving this because you administer ${params.partnerName} in Breeze.`;
+  const html = renderLayout({
+    title: subject,
+    preheader: `The Microsoft tenant link was removed from ${orgName}.`,
+    heading: 'Microsoft tenant link removed',
+    body: `
+      <p style="${BODY_PARA}">${escapeHtml(lead)}</p>
+      <p style="${BODY_PARA}">${escapeHtml(impact)}</p>
+      <p style="${BODY_PARA}">${escapeHtml(next)}</p>
+      <p style="${MUTED_PARA}">${escapeHtml(why)}</p>
+    `,
+    footer: supportFooter(undefined, 'Need help? Contact'),
+  });
+  const text = [lead, impact, next, why].join('\n');
+  return { subject, html, text };
+}
+
+const PORTAL_DOMAIN_LOST_REASON_TEXT: Record<PortalDomainVerificationLostReason, string> = {
+  record_missing: 'the DNS verification record was not found on two consecutive daily checks',
+  not_in_directory: "the domain is no longer a verified domain in the customer's Microsoft 365 or Google Workspace directory",
+  tenant_not_proven: "the organization's Microsoft Entra tenant is no longer proven",
+  connection_missing: 'the Microsoft 365 or Google Workspace connection used to verify it was removed',
+  stale: 'it could not be re-checked for 7 days',
+  displaced: "another organization proved control of the domain while this organization's evidence no longer checked out",
+};
+
+/**
+ * Domain verification lost (portal registration W5 #11382): sent to the
+ * partner's active admins when a customer org's domain stops being verified.
+ * A notice with no link. Breeze-branded platform mail, same idiom as
+ * buildPortalEntraTenantDisplacedTemplate.
+ */
+export function buildPortalDomainVerificationLostTemplate(params: PortalDomainVerificationLostEmailParams): EmailTemplate {
+  const orgName = params.orgName.trim();
+  const domain = params.domain.trim();
+  const subject = `Domain verification lost: ${domain}`;
+  const lead = `${domain} is no longer verified for ${orgName}, because ${PORTAL_DOMAIN_LOST_REASON_TEXT[params.reason]}.`;
+  const impact = `Portal self-registration and Google sign-in for ${domain} stop until it is verified again under Organization › Domains.`;
+  const why = `You're receiving this because you administer ${params.partnerName} in Breeze.`;
+  const html = renderLayout({
+    title: subject,
+    preheader: `${domain} is no longer verified for ${orgName}.`,
+    heading: 'Domain verification lost',
+    body: `
+      <p style="${BODY_PARA}">${escapeHtml(lead)}</p>
+      <p style="${BODY_PARA}">${escapeHtml(impact)}</p>
+      <p style="${MUTED_PARA}">${escapeHtml(why)}</p>
+    `,
+    footer: supportFooter(undefined, 'Need help? Contact'),
+  });
+  const text = [lead, impact, why].join('\n');
+  return { subject, html, text };
 }
 
 function buildVerificationTemplate(params: VerificationEmailParams): EmailTemplate {
@@ -1176,45 +1437,67 @@ function buildSignupAttemptOnExistingAccountTemplate(
   return { subject, html, text };
 }
 
-function buildInviteTemplate(params: InviteEmailParams): EmailTemplate {
+/** Mirrors INVITE_TOKEN_TTL_SECONDS (routes/auth/schemas.ts): 7 days. */
+const DEFAULT_INVITE_EXPIRES_DAYS = 7;
+
+/**
+ * Caller verification (#6354 W03) link email to the CONTACT. Names the exact
+ * request and offers "This is not me"; never carries a challenge number or the
+ * reverse code (those exist only on the anonymous page). Partner-supplied text
+ * is escaped. Sent on the partner support stream
+ * (`security.caller_verification_link`).
+ */
+export function buildCallerVerificationTemplate(p: {
+  partnerName: string; technicianLabel: string; requestLabel: string; url: string;
+}): EmailTemplate {
+  const subject = 'Review a support request';
+  const request = `${p.technicianLabel} from ${p.partnerName} wants to ${p.requestLabel}.`;
+  const caution = `If you are not sure, hang up and call ${p.partnerName} on the number you already have.`;
+  const body = `<p style="${BODY_PARA}">${escapeHtml(request)}</p>
+    ${renderButton('Review request', p.url)}
+    <p style="${MUTED_PARA}">The page shows the request and lets you choose “This is not me”. This link expires in 10 minutes.</p>
+    <p style="${MUTED_PARA}">${escapeHtml(caution)}</p>`;
+  return {
+    subject,
+    html: renderLayout({ title: subject, preheader: request, heading: subject, body, brandName: p.partnerName }),
+    text: [request, `Review request: ${p.url}`, 'The link expires in 10 minutes.',
+      'Choose “This is not me” if you did not request this.', caution].join('\n\n'),
+  };
+}
+
+export function buildStaffInviteTemplate(params: InviteEmailParams): EmailTemplate {
   const name = params.name?.trim() || 'there';
   const inviter = params.inviterName?.trim() || 'A teammate';
-  const orgName = params.orgName?.trim();
-  const subject = orgName
-    ? `${inviter} invited you to ${orgName} on Breeze`
-    : `${inviter} invited you to Breeze`;
-  const preheader = orgName
-    ? `Accept your invitation to ${orgName} on Breeze.`
-    : 'Accept your invitation to Breeze.';
-  const heading = orgName ? `Join ${orgName}` : 'You are invited';
-
-  const body = `
-      <p style="${BODY_PARA}">Hi ${escapeHtml(name)},</p>
-      <p style="${BODY_PARA}">${escapeHtml(inviter)} invited you${orgName ? ` to ${escapeHtml(orgName)}` : ''} on Breeze.</p>
-      ${renderButton('Accept invitation', params.inviteUrl)}
-      <p style="${MUTED_PARA}">This invitation expires in 7 days. If you weren't expecting it, you can ignore this email.</p>
-  `;
-
-  const html = renderLayout({
-    title: heading,
-    preheader,
-    heading,
-    body,
+  const orgName = params.orgName?.trim() ?? '';
+  const expiresDays = params.expiresDays ?? DEFAULT_INVITE_EXPIRES_DAYS;
+  const rendered = renderPartnerEmail({
+    id: 'staff_invite',
+    custom: params.custom ?? null,
+    vars: {
+      name,
+      inviter_name: inviter,
+      org_name: orgName,
+      partner_name: params.partnerName ?? '',
+      invite_url: params.inviteUrl,
+      expires_days: String(expiresDays),
+    },
+    ctaUrl: params.inviteUrl,
+    brandName: params.partnerName?.trim() || undefined,
     footer: supportFooter(params.supportEmail, 'Questions? Contact'),
+    preheader: orgName
+      ? `Accept your invitation to ${orgName} on Breeze.`
+      : 'Accept your invitation to Breeze.',
   });
 
   const support = getSupportEmail(params.supportEmail);
   const text = [
-    `Hi ${name},`,
-    `${inviter} invited you${orgName ? ` to ${orgName}` : ''} on Breeze.`,
-    `Accept invitation: ${params.inviteUrl}`,
-    "This invitation expires in 7 days. If you weren't expecting it, you can ignore this email.",
+    rendered.bodyText,
     support ? `Questions? Contact ${support}.` : null,
   ]
     .filter(Boolean)
     .join('\n');
 
-  return { subject, html, text };
+  return { subject: rendered.subject, html: rendered.html, text };
 }
 
 export function buildInvoiceTemplate(params: InvoiceEmailParams): EmailTemplate {
@@ -1291,6 +1574,8 @@ export interface QuoteOutcomeEmailParams {
   invoiceNumber?: string | null;
   /** Deep link to the quote in the web app; omitted when no app base is configured. */
   quoteUrl?: string | null;
+  /** #10361: draft contracts the accept created and nobody has activated yet. */
+  draftContractCount?: number | null;
 }
 
 /**
@@ -1314,10 +1599,21 @@ export function buildQuoteOutcomeTemplate(params: QuoteOutcomeEmailParams): Emai
   const invoiceLine = params.outcome === 'accepted' && params.invoiceNumber
     ? `<p style="${BODY_PARA}">Invoice <strong>${escapeHtml(params.invoiceNumber)}</strong> has been issued and emailed to the customer.</p>`
     : '';
+  // #10361: the recurring half of an accept lands as draft contracts that bill
+  // nothing until someone activates them — say so, or approved revenue waits
+  // unnoticed in the contracts list.
+  const drafts = params.outcome === 'accepted' ? Math.max(0, Math.trunc(params.draftContractCount ?? 0)) : 0;
+  const draftContractText = drafts === 0
+    ? null
+    : drafts === 1
+      ? '1 recurring contract was created as a draft. Review and activate it to start billing.'
+      : `${drafts} recurring contracts were created as drafts. Review and activate them to start billing.`;
+  const draftContractLine = draftContractText ? `<p style="${BODY_PARA}">${escapeHtml(draftContractText)}</p>` : '';
   const body = `
       <p style="${BODY_PARA}">${escapeHtml(who)} has <strong>${verb}</strong> quote <strong>${escapeHtml(params.quoteNumber)}</strong>.</p>
       ${reasonBlock}
       ${invoiceLine}
+      ${draftContractLine}
       ${params.quoteUrl ? renderButton('View quote', params.quoteUrl) : ''}
   `;
   const html = renderLayout({
@@ -1330,6 +1626,7 @@ export function buildQuoteOutcomeTemplate(params: QuoteOutcomeEmailParams): Emai
     `${who} has ${verb} quote ${params.quoteNumber}.`,
     reason ? `Their note: ${reason}` : null,
     params.outcome === 'accepted' && params.invoiceNumber ? `Invoice ${params.invoiceNumber} has been issued and emailed to the customer.` : null,
+    draftContractText,
     params.quoteUrl ? `View quote: ${params.quoteUrl}` : null,
   ]
     .filter(Boolean)
@@ -1338,19 +1635,21 @@ export function buildQuoteOutcomeTemplate(params: QuoteOutcomeEmailParams): Emai
 }
 
 function buildAlertNotificationTemplate(params: AlertNotificationEmailParams): EmailTemplate {
+  const subjectName = params.subjectName || params.deviceName;
+  const subjectLabel = params.ownerKind && params.ownerKind !== 'device' ? 'Subject' : 'Device';
   const severityLabel = params.severity.toUpperCase();
   const subject = `Alert ${severityLabel}: ${params.alertName}`;
   const timestamp = formatTimestamp(params.occurredAt);
   const { bg: pillBg, fg: pillFg } = alertSeverityPalette(params.severity);
   const preheader = [
     severityLabel,
-    params.deviceName ? `on ${params.deviceName}` : null,
+    subjectName ? `on ${subjectName}` : null,
     timestamp ? `at ${timestamp}` : null,
   ]
     .filter(Boolean)
     .join(' ');
   const details = [
-    params.deviceName ? `Device: ${params.deviceName}` : null,
+    subjectName ? `${subjectLabel}: ${subjectName}` : null,
     `Severity: ${severityLabel}`,
     timestamp ? `Detected: ${timestamp}` : null,
   ].filter(Boolean) as string[];
@@ -1380,7 +1679,7 @@ function buildAlertNotificationTemplate(params: AlertNotificationEmailParams): E
   const text = [
     `${params.alertName} (${severityLabel})`,
     params.summary,
-    params.deviceName ? `Device: ${params.deviceName}` : undefined,
+    subjectName ? `${subjectLabel}: ${subjectName}` : undefined,
     timestamp ? `Detected: ${timestamp}` : undefined,
     params.dashboardUrl ? `View details: ${params.dashboardUrl}` : undefined,
   ]

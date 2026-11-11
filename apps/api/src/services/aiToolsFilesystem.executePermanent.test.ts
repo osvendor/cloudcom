@@ -24,6 +24,9 @@ const previewState = vi.hoisted(() => ({
 }));
 
 vi.mock('../db', () => ({
+  // These handlers run as under the per-call transaction: `inToolDbPhase`
+  // (#7918) joins it rather than opening a context of its own.
+  hasDbAccessContext: vi.fn(() => true),
   runOutsideDbContext: vi.fn((fn) => fn()),
   withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn()),
   db: {
@@ -59,6 +62,13 @@ vi.mock('../db', () => ({
 
 const executeCommandWithSystemPrecheck = vi.hoisted(() => vi.fn());
 
+// The remote-tools policy check has its own suites
+// (aiDispatch.test.ts, aiRemoteToolsPolicy.contract.test.ts); allow it here.
+vi.mock('./aiRemoteToolsPolicy', () => ({
+  REMOTE_TOOLS_DISABLED_BY_POLICY: 'REMOTE_TOOLS_DISABLED_BY_POLICY',
+  checkAiRemoteToolsPolicy: vi.fn(async () => ({ allowed: true })),
+  assertAiRemoteToolsAllowed: vi.fn(async () => undefined),
+}));
 vi.mock('./commandQueue', () => ({
   // The AI system-precheck adapter preserves the origin and tenant binding.
   // so asserting here asserts exactly what reaches the device.
@@ -267,6 +277,6 @@ describe('disk_cleanup execute dispatches a permanent, guarded delete', () => {
     // Explicit run ids coexist with volume selection and the remembered preview.
     expect(properties).toHaveProperty('path', expect.objectContaining({ type: 'string' }));
     expect(properties).toHaveProperty('cleanupRunId', expect.objectContaining({ type: 'string', format: 'uuid' }));
-    expect(Object.keys(properties).sort()).toEqual(['action', 'categories', 'cleanupRunId', 'deviceId', 'maxCandidates', 'path', 'paths']);
+    expect(Object.keys(properties).sort()).toEqual(['action', 'categories', 'cleanupRunId', 'deviceId', 'includeReasons', 'maxCandidates', 'path', 'paths']);
   });
 });

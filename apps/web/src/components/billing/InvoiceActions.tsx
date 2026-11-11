@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { approvalFriendly } from '../../lib/ticketApproval';
 import { Loader2 } from 'lucide-react';
 import '../../lib/i18n';
 import { fetchWithAuth } from '../../stores/auth';
@@ -11,6 +12,7 @@ import { ConfirmDialog } from '../shared/ConfirmDialog';
 import { usePdfDownload } from './shared/usePdfDownload';
 import InvoiceSendComposer, { type ComposedInvoiceEmail } from './InvoiceSendComposer';
 import { type InvoiceDetail as InvoiceDetailData, formatMoney } from './invoiceTypes';
+import { useStableT } from '@/lib/i18n/useStableT';
 
 const UNAUTHORIZED = () => void navigateTo('/login', { replace: true });
 
@@ -64,6 +66,7 @@ interface Props {
  */
 export default function InvoiceActions({ detail, onChanged, variant, savePending = false, unsavedFieldLabel = null, saveFailureNonce = 0, onIssueWhilePending }: Props) {
   const { t } = useTranslation('billing');
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   const { can } = usePermissions();
   const { invoice, lines } = detail;
   const currency = invoice.currencyCode;
@@ -127,36 +130,46 @@ export default function InvoiceActions({ detail, onChanged, variant, savePending
 
   const issue = useCallback(async (alsoSend: boolean, opts?: ComposedInvoiceEmail) => {
     if (issuing) return;
+    // Issue's own 409 refusals: held for a block of hours (#8970), then the
+    // customer-approval codes (409 SOURCE_AWAITING_APPROVAL, #8196).
+    const approval = approvalFriendly(stableT);
+    const issueFriendly = (code: string) => (code === 'SOURCE_HELD_FOR_HOUR_BLOCK'
+      ? stableT('invoiceActions.sourceHeldForHourBlock')
+      : approval(code));
     setIssuing(true);
     try {
       if (alsoSend) {
         // /send owns draft issue + email as one lifecycle action. In particular,
         // it persists includeDeviceAppendix while the invoice is still a draft,
         // before issue freezes the PDF evidence choice.
-        const result = await runAction<{ data: { emailed: boolean } }>({
+        const result = await runAction<{ data: { emailed: boolean; reason?: string } }>({
           request: () => fetchWithAuth(`/invoices/${invoice.id}/send`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(opts ?? {}),
           }),
-          errorFallback: t('invoiceActions.issueSendError'),
+          errorFallback: stableT('invoiceActions.issueSendError'),
+          friendly: issueFriendly,
           onUnauthorized: UNAUTHORIZED,
         });
-        if (result?.data?.emailed) {
-          showToast({ type: 'success', message: t('invoiceActions.issueSentSuccess') });
+        if (result?.data?.reason === 'notice_queued') {
+          showToast({ type: 'success', message: stableT('autopay.noticeQueued') });
+        } else if (result?.data?.emailed) {
+          showToast({ type: 'success', message: stableT('invoiceActions.issueSentSuccess') });
         } else {
-          showToast({ type: 'warning', message: t('invoiceActions.issueNoEmailWarning') });
+          showToast({ type: 'warning', message: stableT('invoiceActions.issueNoEmailWarning') });
         }
       } else {
         await runAction({
           request: () => fetchWithAuth(`/invoices/${invoice.id}/issue`, { method: 'POST' }),
-          errorFallback: t('invoiceActions.issueError'),
-          successMessage: t('invoiceActions.issueSuccess'),
+          errorFallback: stableT('invoiceActions.issueError'),
+          successMessage: stableT('invoiceActions.issueSuccess'),
+          friendly: issueFriendly,
           onUnauthorized: UNAUTHORIZED,
         });
       }
     } catch (err) {
-      handleActionError(err, t('invoiceActions.issueError'));
+      handleActionError(err, stableT('invoiceActions.issueError'));
     } finally {
       // Always refresh: if issue succeeded but send threw, we still need to leave
       // the draft editor so a second click doesn't re-issue and hit 409 NOT_A_DRAFT.
@@ -164,7 +177,7 @@ export default function InvoiceActions({ detail, onChanged, variant, savePending
       setIssuing(false);
       setIssueSendOpen(false);
     }
-  }, [issuing, invoice.id, refresh, t]);
+  }, [issuing, invoice.id, refresh, stableT]);
 
   // Refuse a click (or a queued click reaching quiescence) that can only ever
   // wait on a save that isn't coming — name the field instead. Hoisted above
@@ -190,7 +203,7 @@ export default function InvoiceActions({ detail, onChanged, variant, savePending
     if (!queued) return;
     if (saveFailureNonce !== queued.atFailureNonce) {
       setQueued(null);
-      showToast({ type: 'error', message: t('invoiceActions.issueCanceledSaveFailed') });
+      showToast({ type: 'error', message: stableT('invoiceActions.issueCanceledSaveFailed') });
       return;
     }
     if (savePending) return;
@@ -209,14 +222,14 @@ export default function InvoiceActions({ detail, onChanged, variant, savePending
     // last customer-visible line may have been sitting in its undo window, and
     // the flush this very click triggered is what deleted it for good.
     if (!hasVisibleLines) {
-      showToast({ type: 'warning', message: t('invoiceActions.noVisibleLineHint') });
+      showToast({ type: 'warning', message: stableT('invoiceActions.noVisibleLineHint') });
       return;
     }
     // Plain Issue runs directly (it's reversible via Void); Issue & Send opens
     // its confirm dialog — the user still confirms the email before it sends.
     if (queued.kind === 'issue') void issue(false);
     else void openIssueSendComposer();
-  }, [queued, saveFailureNonce, savePending, unsavedFieldLabel, refuseForUnsaved, hasVisibleLines, issue, openIssueSendComposer, t]);
+  }, [queued, saveFailureNonce, savePending, unsavedFieldLabel, refuseForUnsaved, hasVisibleLines, issue, openIssueSendComposer, stableT]);
 
   // Slow-save backstop: with failures handled above, the only way a queue waits
   // this long is a save that is genuinely still in flight (or a pending-state
@@ -227,10 +240,10 @@ export default function InvoiceActions({ detail, onChanged, variant, savePending
     if (!queued) return;
     const timer = setTimeout(() => {
       setQueued(null);
-      showToast({ type: 'warning', message: t('invoiceActions.issueCanceledStillSaving') });
+      showToast({ type: 'warning', message: stableT('invoiceActions.issueCanceledStillSaving') });
     }, 15_000);
     return () => clearTimeout(timer);
-  }, [queued, t]);
+  }, [queued, stableT]);
 
   // Whether this invoice has ever been emailed. `issueInvoice` deliberately
   // leaves sent_at null (a plain Issue reads "Issued", not "Sent"), so the first
@@ -265,7 +278,7 @@ export default function InvoiceActions({ detail, onChanged, variant, savePending
       // out. Both routes swallow delivery failures into `reason`, so the
       // outcome is post-processed below — `emailed !== true` (not `=== false`)
       // so an unexpected response shape can't be read as success.
-      const result = await runAction<{ data?: { emailed?: boolean } }>({
+      const result = await runAction<{ data?: { emailed?: boolean; reason?: string } }>({
         request: () => fetchWithAuth(`/invoices/${invoice.id}/${neverEmailed ? 'send' : 'resend'}`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -278,7 +291,9 @@ export default function InvoiceActions({ detail, onChanged, variant, savePending
       // A first send stamps sent_at (which flips this very button's label), and
       // even a re-send may reveal other stale detail — reconcile either way.
       refresh();
-      if (result?.data?.emailed !== true) {
+      if (result?.data?.reason === 'notice_queued') {
+        showToast({ type: 'success', message: stableT('autopay.noticeQueued') });
+      } else if (result?.data?.emailed !== true) {
         showToast({ type: 'warning', message: t('invoiceDetail.requestPayment.noEmailWarning') });
       } else {
         showToast({
@@ -297,7 +312,7 @@ export default function InvoiceActions({ detail, onChanged, variant, savePending
     } finally {
       setResending(false);
     }
-  }, [resending, invoice.id, neverEmailed, partiallyPaid, refresh, t]);
+  }, [resending, invoice.id, neverEmailed, partiallyPaid, refresh, t, stableT]);
 
   // Copy the customer-facing DURABLE view-and-pay link without emailing
   // anything — for pasting into a chat/SMS/reply by hand. Mirrors the quote's
@@ -569,6 +584,12 @@ export default function InvoiceActions({ detail, onChanged, variant, savePending
         onSend={(opts) => isDraft ? void issue(true, opts) : void resend(opts)}
         orgId={invoice.orgId}
         invoiceNumber={invoice.invoiceNumber}
+        dueDate={invoice.dueDate}
+        currencyCode={currency}
+        amountPaid={invoice.amountPaid}
+        balance={invoice.balance}
+        depositDue={invoice.depositDue ?? null}
+        documentLocale={invoice.documentLocale ?? null}
         isDraft={isDraft}
         title={isDraft
           ? t('invoiceActions.issueSendConfirm.title')

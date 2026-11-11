@@ -101,11 +101,156 @@ const DEV_ENV: Record<string, string> = {
   // values already present in the developer's root .env via compose interpolation.
 };
 
-export function writeEnvStack(worktreePath: string): string {
+/**
+ * A wt-stack is a throwaway QA stack and must never send outbound mail, but a
+ * developer's root .env carries a real RESEND_API_KEY (EMAIL_PROVIDER=auto).
+ * .env.stack is passed to compose last, so empty values here blank the root
+ * ones. Opt out with BREEZE_WT_STACK_LIVE_MAIL=1.
+ */
+const NO_LIVE_MAIL_KEYS = ['RESEND_API_KEY', 'MAILGUN_API_KEY', 'SMTP_HOST'] as const;
+
+/** Keys set after compose runs (see setStackEnvValues); a rewrite keeps them. */
+const RUNTIME_KEYS = [
+  'WEBAUTHN_ORIGIN', 'WEBAUTHN_RP_ID',
+  // Network Proxy host mode on a local stack (#8155 W03): set by
+  // e2e-tests/helpers/tunnelOriginStack.ts once caddy's port is known.
+  // PUBLIC_PORTAL_URL travels with them: with the template set, the API's
+  // config validator refuses compose's `https://${BREEZE_DOMAIN}/portal`
+  // default (no host), so dropping it on a re-up would leave api unbootable.
+  'TUNNEL_ORIGIN_TEMPLATE', 'TUNNEL_FRAME_ANCESTOR', 'TUNNEL_SITE_ADDRESS', 'TUNNEL_HOST_SUFFIX',
+  'PUBLIC_PORTAL_URL',
+  // #9777 — public URLs pinned to the stack's caddy base URL (see pinWebAuthnForStack).
+  'PUBLIC_APP_URL', 'PUBLIC_API_URL', 'DASHBOARD_URL',
+] as const;
+
+/**
+ * The dev images are built locally from the worktree, but docker-compose.yml
+ * defaults DOCKER_PLATFORM to linux/amd64. On an arm64 host that builds and
+ * runs the API under emulation: the main thread then blocks ~15 s after boot,
+ * and every detached startup task (AI model registry reconcile, backup storage
+ * key history, built-in monitors) times out on its database prologue. Build
+ * native, unless the root .env pins a platform explicitly.
+ */
+function nativeDockerPlatform(worktreePath: string, arch: string): string | null {
+  if (arch !== 'arm64') return null;
+  const rootEnv = path.join(worktreePath, '.env');
+  const pinned = existsSync(rootEnv)
+    && readFileSync(rootEnv, 'utf8').split('\n').some((line) => /^\s*DOCKER_PLATFORM\s*=/.test(line));
+  return pinned ? null : 'linux/arm64';
+}
+
+/**
+ * #8718 — opt-in fixed host port for caddy. The worktree override publishes
+ * caddy as `${BREEZE_WT_CADDY_PORT:-0}:80`; unset keeps the random port. A
+ * `docker restart` re-allocates a random port, so a storm scenario that
+ * restarts caddy (`socket-drop`) strands every client holding `baseUrl`.
+ */
+export function caddyPortPin(env: NodeJS.ProcessEnv = process.env): number | null {
+  const raw = env.BREEZE_WT_CADDY_PORT?.trim();
+  if (!raw) return null;
+  const n = Number(raw);
+  if (!/^\d+$/.test(raw) || !Number.isInteger(n) || n < 1 || n > 65535) {
+    throw new Error(`BREEZE_WT_CADDY_PORT must be an integer 1-65535, got ${JSON.stringify(raw)}`);
+  }
+  return n;
+}
+
+export function writeEnvStack(worktreePath: string, opts: { arch?: string } = {}): string {
   const p = envStackPath(worktreePath);
-  const body = Object.entries(DEV_ENV).map(([k, v]) => `${k}=${v}`).join('\n') + '\n';
+  // Carry runtime keys across a re-`up` so an unchanged stack is not recreated
+  // twice (drop, then re-add); `up` still corrects a value that went stale.
+  // Read .env.stack alone: a value in the root .env must not be copied here.
+  const previous = existsSync(p) ? readFileSync(p, 'utf8').split('\n') : [];
+  const kept = previous.filter((line) =>
+    RUNTIME_KEYS.some((k) => new RegExp(`^\\s*${k}\\s*=`).test(line)));
+  const platform = nativeDockerPlatform(worktreePath, opts.arch ?? process.arch);
+  const blankMail = process.env.BREEZE_WT_STACK_LIVE_MAIL !== '1';
+  if (blankMail) {
+    console.log('[wt-stack] outbound mail disabled (RESEND_API_KEY/MAILGUN_API_KEY/SMTP_HOST blanked; set BREEZE_WT_STACK_LIVE_MAIL=1 to keep them)');
+  }
+  const caddyPin = caddyPortPin();
+  const body = [
+    ...Object.entries(DEV_ENV).map(([k, v]) => `${k}=${v}`),
+    ...(caddyPin !== null ? [`BREEZE_WT_CADDY_PORT=${caddyPin}`] : []),
+    ...(blankMail ? NO_LIVE_MAIL_KEYS.map((k) => `${k}=`) : []),
+    ...(platform ? [`DOCKER_PLATFORM=${platform}`] : []),
+    ...kept,
+  ].join('\n') + '\n';
   writeFileSync(p, body, 'utf8');
   return p;
+}
+
+/**
+ * #6443 — upsert keys into `.env.stack` once their values are known. The
+ * WebAuthn origin is the caddy port compose publishes (`0:80`, random), which
+ * exists only after `composeUp`, so it cannot live in DEV_ENV. Existing lines
+ * for a key are replaced in place, never duplicated.
+ */
+export function setStackEnvValues(worktreePath: string, values: Record<string, string>): string {
+  const p = envStackPath(worktreePath);
+  const pending = new Map(Object.entries(values));
+  const lines = existsSync(p) ? readFileSync(p, 'utf8').replace(/\n$/, '').split('\n') : [];
+  const out: string[] = [];
+  for (const line of lines) {
+    const key = /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=/.exec(line)?.[1];
+    if (key !== undefined && values[key] !== undefined) {
+      if (pending.has(key)) { out.push(`${key}=${values[key]}`); pending.delete(key); }
+      continue;
+    }
+    out.push(line);
+  }
+  for (const [k, v] of pending) out.push(`${k}=${v}`);
+  writeFileSync(p, out.join('\n') + '\n', 'utf8');
+  return p;
+}
+
+/**
+ * #9777 — the public URLs for a local stack. BREEZE_DOMAIN is empty there, so
+ * compose would default these to `https://` / `https:///portal`, and every
+ * customer-facing link the API mints (quote accept, invoice mail, Stripe
+ * returns, portal invites) derives from them. Same shape as prod: no /api
+ * suffix, portal under /portal.
+ */
+export function localPublicUrls(baseUrl: string): Record<string, string> {
+  return {
+    PUBLIC_APP_URL: baseUrl,
+    PUBLIC_API_URL: baseUrl,
+    DASHBOARD_URL: baseUrl,
+    PUBLIC_PORTAL_URL: `${baseUrl}/portal`,
+  };
+}
+
+/** Put the local public URLs back (e.g. when tunnel host mode is torn down). Never blank them. */
+export function restoreLocalPublicUrls(worktreePath: string, baseUrl: string): void {
+  setStackEnvValues(worktreePath, localPublicUrls(baseUrl));
+}
+
+/**
+ * #6443 — make passkeys work on this stack. The API verifies the browser origin
+ * against WEBAUTHN_ORIGIN and the RP ID against WEBAUTHN_RP_ID, each falling
+ * back to root-.env values that never describe a local stack on a random caddy
+ * port. Pin both in `.env.stack` (which compose reads last, so it wins) and
+ * recreate api when either differs from what compose would resolve. Returns
+ * whether api was recreated.
+ */
+export function pinWebAuthnForStack(
+  worktreePath: string,
+  baseUrl: string,
+  deps: { recreateApi: () => void; waitApiHealthy: () => void },
+): boolean {
+  const wanted: Record<string, string> = {
+    WEBAUTHN_ORIGIN: baseUrl,
+    WEBAUTHN_RP_ID: new URL(baseUrl).hostname,
+    ...localPublicUrls(baseUrl),
+  };
+  // A Network Proxy tunnel stack (#8155) sets its own PUBLIC_PORTAL_URL; keep it.
+  if (readStackEnvValue(worktreePath, 'TUNNEL_ORIGIN_TEMPLATE')) delete wanted.PUBLIC_PORTAL_URL;
+  const stale = Object.entries(wanted).some(([k, v]) => readStackEnvValue(worktreePath, k) !== v);
+  if (!stale) return false;
+  setStackEnvValues(worktreePath, wanted);
+  deps.recreateApi();
+  deps.waitApiHealthy();
+  return true;
 }
 
 /**

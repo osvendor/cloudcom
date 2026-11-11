@@ -6,7 +6,7 @@ import { getRedis } from '../redis';
  * Lives in the SERVICES layer on purpose. `services/portal/reportsSelfService`
  * rate-limits report generation, and a service importing
  * `routes/portal/helpers` for it dragged `routes/auth/helpers` → the services
- * barrel → `commandQueue` → `agentWs` → the discovery worker into every module
+ * barrel → the command-queue graph → the discovery worker into every module
  * graph that touches portal flags (#4562 W10 broke `orgPortalSettings.test.ts`
  * that way). Routes keep importing these names from `routes/portal/helpers` /
  * `routes/portal/schemas`, which re-export them.
@@ -23,6 +23,19 @@ export const PORTAL_RATE_LIMIT_REDIS_KEYS = {
   attempts: (key: string) => `portal:rl:attempts:${key}`,
   block: (key: string) => `portal:rl:block:${key}`,
 };
+
+/**
+ * Account-scoped rate-limit key for a pre-auth portal identifier lookup
+ * (login, forgot-password). Keyed on the normalized email ALONE. At the point
+ * this key is built, any caller-supplied `orgId` is still unvalidated — no DB
+ * lookup has run — so folding it into the key let a fresh, syntactically
+ * valid `orgId` on every request always miss the bucket, defeating the
+ * account-scoped brake while the sibling IP-keyed bucket stayed unaffected.
+ * Both callers of this helper must use it identically.
+ */
+export function portalAccountRateLimitKey(prefix: 'login' | 'forgot', normalizedEmail: string): string {
+  return `portal:${prefix}:account:${normalizedEmail}`;
+}
 
 export const portalRateLimitBuckets = new Map<string, {
   count: number;

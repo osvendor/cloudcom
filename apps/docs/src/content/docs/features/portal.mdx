@@ -23,6 +23,75 @@ You can configure a per-organization custom domain in branding (`customDomain`, 
 
 Inviting a customer from **Settings → Organizations → [organization] → Customer Portal** sends a laid-out email with a **Set your password** button. Partners edit that mail under **Settings → Partner → Email templates** (Portal invite) -- subject, heading, button label, and HTML body. Merge variables: `{{requester_name}}` (the inviter), `{{partner_name}}`, `{{org_name}}`, and `{{invite_url}}`. The button always uses the server invite link; partners cannot point it somewhere else. The invite expires in 7 days. This does not change the email card's accent bar or pull colors from the Branding tab.
 
+### Give contacts portal access
+
+You can give a contact a portal login straight from the organization's **Contacts** tab (**Settings → Organizations → [organization] → Contacts**), instead of typing the address again on the Customer Portal tab. This is available to partner users only. The **Portal** column shows each contact as **No access**, **Requested**, **Invited**, **Active**, or **Disabled**. **Requested** means the contact has no login with browser access and their email has a pending access request (see [Access requests](#access-requests)); approve or deny it on the Customer Portal tab.
+
+- **One contact:** use **Give portal access** in the row actions. For a contact who was invited but has not set a password yet, the action is **Resend invite**.
+- **Several contacts:** tick the row checkboxes and choose **Give portal access (N)**. A single request covers up to 100 contacts.
+- **When creating a contact:** tick **Give portal access** on the create form. The invite goes to the email address you entered, so the box needs an email.
+
+The invite is the same email as above, and the login is tied to that contact. A contact's ticket history comes with the login, so Breeze only creates it for the address the contact already has. If you invite with a different email, the request is refused with `PORTAL_INVITE_EMAIL_MISMATCH`; update the contact's email first.
+
+A login that is already tied to a different contact is never moved. The request fails with `PORTAL_INVITE_CONTACT_CONFLICT`; unlink the login from its current contact first, then invite again.
+
+<Aside type="note" title="AI for Office sign-ins">
+Only logins with browser access to the portal count. A person who only signs in through AI for Office (Microsoft Entra) shows as **No access** here, because that is not browser access to the portal.
+</Aside>
+
+#### Bulk results
+
+The bulk action reports one result per contact. If any selected contact is not in the organization, the whole request is refused with a 404 and no invites are sent.
+
+| Outcome | Meaning |
+|---------|---------|
+| `invited` | A portal login was created (or a pending one re-invited) and bound to the contact. `emailSent` says whether the invite email went out |
+| `already_has_access` | The contact already has a login. The reason is `active`, `disabled`, `external_identity` (an AI for Office or other external sign-in), or `login_email_differs` (the contact's email was changed after the login was linked). Nothing was changed |
+| `no_email` | The contact has no email address. Add one and try again |
+| `email_bound_to_other_contact` | A login with this email is already tied to another contact. Unlink it first |
+| `duplicate_email_in_batch` | Two or more selected contacts share one email. None of them is invited; invite one at a time |
+
+If the login was created but the invite email did not go out (`emailSent: false`, shown as a warning toast: "Portal login created, but the invite email could not be sent"), use **Resend invite** on that contact.
+
+## Sign-in & registration
+
+Each organization has a sign-in policy. It decides how the organization's people sign in to the portal, and how new people get browser access. You set it at two levels:
+
+- **Partner default:** **Settings → Partner → Customer portal**. It applies to every customer organization. Changing it needs full partner access; partner users limited to selected organizations see the tab read-only.
+- **Organization override:** **Settings → Organizations → [organization] → Customer Portal → Sign-in & registration**. A field left on **Inherit** follows the partner default. The field always shows the value it inherits and where that value comes from (**Partner default** or **Breeze default**).
+
+A saved change applies from the next portal request. Nothing is cached.
+
+### How people sign in
+
+| Setting | Values | Breeze default |
+|---------|--------|----------------|
+| Password sign-in | **Allowed**, **Off — Microsoft/Google only** | Allowed |
+
+**Off — Microsoft/Google only** can be chosen only while Microsoft or Google sign-in is on for the organization. Sign in with Microsoft is available once the organization's Microsoft tenant is proven and your deployment has the portal Microsoft app configured; see [Microsoft sign-in for the Customer Portal](/features/portal-microsoft-sign-in/). Google sign-in to the browser portal is not available yet, so the Google row does not appear on the card. Features that rely on a customer's email domains need those domains verified; see [Customer domain verification](/features/portal-domain-verification/).
+
+If the policy says **Off** but no Microsoft or Google sign-in is in effect any more (for example, the partner default that enabled it was changed), password sign-in stays on. The card shows: "Password sign-in is on because no Microsoft or Google sign-in is enabled."
+
+The **Password reset** toggle on the Customer Portal tab is a separate setting. It controls self-service reset for people who sign in with a password; this policy decides whether password sign-in exists at all.
+
+### How new people get browser access
+
+- **Invites from the MSP** are always on: you can invite people from the Customer Portal tab or the Contacts tab whatever the other settings say. Password sign-in **Off** also stops an invited person from setting a password.
+- **First sign-in with Microsoft** follows the organization's first-sign-in mode: invited only, approval, or instant. See [Microsoft sign-in for the Customer Portal](/features/portal-microsoft-sign-in/).
+- Self-registration and first sign-in with Google appear on the card once the portal supports them.
+
+### Access requests
+
+When someone asks for portal access through a route that needs your approval, the request waits in **Access requests**, above the organization's portal users list. The list only appears while requests are waiting, and the **Requests (N)** button on the Sign-in & registration card jumps to it. It shows the first 100 requests; decide those to see the rest.
+
+- **Approve:** for a self-registration request, Breeze creates the login and sends the normal invite email. For a Microsoft or Google request, it creates the account and emails the person that they can now sign in. For an AI for Office user, it turns on browser access for their existing login and sends the same "you can now sign in" email.
+- **Deny:** asks you to confirm, then emails the person that the request was not approved.
+- **Several at once:** tick the rows and choose **Approve selected** or **Deny selected**. Each row reports its own result, and rows that could not be decided are marked in the list.
+- A request whose email already has a portal login shows **Already has an account — Deny to dismiss**. Approve is disabled for it.
+- A request expires after 14 days. An organization holds at most 200 pending requests.
+
+The partner **Customer portal** tab lists every organization with pending requests, with a link to each organization's Customer Portal tab.
+
 ## Key Concepts
 
 ### Portal Feature Toggles
@@ -35,6 +104,7 @@ Each organization can enable or disable portal features independently through th
 | `enableAssetCheckout` | `false` | Allow portal users to check out and return shared devices (parked: API only, no portal UI yet) |
 | `enableSelfService` | `true` | Allow portal users to view organization devices |
 | `enablePasswordReset` | `true` | Allow portal users to reset their password via email |
+| `enableTrustPageEditing` | `false` | **Customer trust page editing** (v0.124.0+): let the customer's admin contacts with a portal login edit the trust page draft -- security contact, website, hidden controls and what the page shows -- and withdraw the published page. You still publish their changes. Changing it needs MFA, and **Enable all visibility** leaves it off. See [Customer trust page editing](/security/trust-center-portal-editing/) |
 
 ### Visibility settings
 
@@ -49,9 +119,33 @@ The service-insight sections — Dashboard, Security, Backups, Reports, support 
 | **Backups** | Off | Backup coverage, verification, restore tests, and readiness |
 | **Reports** | Off | The ability to generate and download approved reports |
 | **Support usage** | Off | Month-to-date billable support-time totals, and SLA badges in the ticket list |
+| **Support hours** | Off | A read-only card inside the Support section showing prepaid block hours used and remaining. Requires **Support usage**. Not turned on by **Enable all visibility** -- switch it on per customer |
+| **Patch detail** | Off | A read-only list of each device's pending, installed and failed patches (title, severity, version, vendor KB link). **Sensitive:** every portal login for the organization sees which machines are missing patches, so **Enable all visibility** deliberately leaves it off -- switch it on per customer. It never shows error text, failure counts, or anything about your patch policies, approvals or jobs, and patches the agent no longer reports (or that you skipped) are left out |
+| **Vulnerability detail** | Off | A read-only list of each device's open CVE findings with the CVE ID, description, severity, CVSS score, whether a patch is available, status and dates. **Sensitive:** every portal login for the organization sees which machines are vulnerable and how severe each finding is, so **Enable all visibility** deliberately leaves it off -- switch it on per customer. It never shows exploit-intelligence data (known-exploited and exploit-likelihood flags), CVSS vectors, reference links, raw scanner records, your risk-acceptance notes or who accepted a finding, linked tickets, risk scores, or anything about remediation |
+| **Physical placement** | Off | A **Location** column in the network assets table (room, rack and rack position). Requires **Network**. **Sensitive:** it reveals the physical layout of the customer's environment, so **Enable all visibility** deliberately leaves it off -- switch it on per customer |
 | **Service** | Off | Scheduled deliverables, what was delivered, and key dates (v0.113.0+) |
 | **Documents** | Off | The documents you have shared with them, for download (v0.113.0+) |
 | **Hardware lifecycle** | Off | The live replacement plan for the customer's machines — see [Hardware Lifecycle](#hardware-lifecycle) below |
+| **Hardware health** | Off (v0.122.1+) | Component health, hardware events, disks and battery for their machines — API only for now, see [Hardware and performance data](#hardware-and-performance-data) |
+| **Hardware inventory** | Off (v0.122.1+) | Per-device make, model, processor, memory and network adapters — API only for now |
+| **Performance metrics** | Off (v0.122.1+) | Read-only CPU, memory, disk and network trends — API only for now |
+| **Software inventory** | Off (v0.122.1+) | Installed software name, version, vendor, install date and last seen — API only for now, and **not** turned on by **Enable all visibility** |
+
+#### Advanced visibility families (complete)
+
+The advanced visibility feature adds six read-only families, each behind its own per-organization toggle and each off by default (a missing or non-`true` setting is refused with `403`):
+
+| Toggle | Setting | Enable all visibility |
+|--------|---------|-----------------------|
+| Hardware health | `enableHardwareHealth` | Turns it on |
+| Hardware inventory | `enableHardwareInventory` | Turns it on |
+| Performance | `enablePerformanceMetrics` | Turns it on |
+| Software inventory | `enableSoftwareInventory` | Turns it on |
+| Endpoint protection (EDR) | `enableEdrVisibility` | Turns it on |
+| Patch detail | `enablePatchDetail` | **Sensitive: left off** |
+| Vulnerability detail | `enableVulnerabilityDetail` | **Sensitive: left off** |
+
+Patch detail and Vulnerability detail point at weaknesses (missing patches and open CVEs), and every portal login for the organization sees them, so they are never switched on by **Enable all visibility**. Turn them on per customer.
 
 To change them:
 
@@ -61,7 +155,7 @@ To change them:
 
 2. Open the **Customer Portal** tab (under **Portal & Branding**).
 
-3. In the **Visibility** panel, turn on the sections this customer should see. **Enable all visibility** turns them all on at once.
+3. In the **Visibility** panel, turn on the sections this customer should see. **Enable all visibility** turns them all on at once, except **Software inventory** and **Network alerts**, which you switch on individually.
 
 4. Save. The customer's next page load reflects the change.
 
@@ -159,10 +253,10 @@ Each organization can customize the portal appearance and contact information. B
 | `accentColor` | CSS color | Highlight color for interactive elements |
 | `customDomain` | String | Custom domain for the portal (e.g., `support.acme.com`) |
 | `domainVerified` | Boolean | Whether the custom domain has been verified |
-| `welcomeMessage` | Text | Welcome text displayed on the portal login page |
+| `welcomeMessage` | Text | Plain-text welcome shown at the top of the customer's landing page (Dashboard when enabled, otherwise Proposals) and on the sign-in page of a verified custom domain. Line breaks are kept; HTML is shown as text |
 | `supportEmail` | Email | Support contact email shown in the portal |
 | `supportPhone` | Phone | Support phone number shown in the portal |
-| `footerText` | Text | Custom footer text |
+| `footerText` | Text | Custom footer text. Also printed on the organization's quotes and invoices, in place of the partner document footer |
 | `customCss` | CSS | Custom CSS injected into the portal pages |
 
 <Aside type="caution">
@@ -176,6 +270,8 @@ Each organization can customize the portal appearance and contact information. B
 When **Dashboard** visibility is on, signing in lands the customer on a service-health summary instead of a device list: what is being looked after, what needs attention, and what has been done for them recently. It is the answer to "what am I paying you for", written for a business owner rather than a technician.
 
 Leave it off and portal users land on their devices as before.
+
+While the organization's public trust page is live, the dashboard also carries a **Public trust page** link to it (v0.124.0+). Nothing is shown while the page is unpublished.
 
 ---
 
@@ -192,6 +288,10 @@ The device list is controlled by its own **Devices** visibility toggle (v0.114.0
 ## Network
 
 With **Network** visibility on, the customer sees a summary of their discovered network assets: total assets, how many are verified online or offline, how many SNMP devices are being polled, and how many monitors are currently down. Online and offline counts don't have to add up to the total — an asset whose reachability hasn't been verified yet counts in neither figure. If discovery hasn't found any assets for the organization yet, the page says so instead of showing an empty table.
+
+Below the summary, the network assets table can be filtered by type and status and, when the organization's assets span more than one site, by **Site**. The selected filters are kept in the page link, so a filtered view can be bookmarked or shared.
+
+With **Physical placement** also on, the table gains a **Location** column built from the placement you recorded on the device or asset, for example `Room 2 · Rack B · U12 (2U)`. Fields you left empty are skipped, an asset with no placement shows `—`, and the placement's site appears only when it differs from the **Site** column. With the toggle off, or when no asset has a placement, the column does not appear.
 
 This toggle is separate from the [Network Topology](/features/discovery/#site-map) partner module — it surfaces discovery/monitoring data, not the topology map itself.
 
@@ -220,6 +320,8 @@ With **Reports** visibility on, the customer can generate and download reports t
 
 A finished run offers both **PDF** and **CSV** downloads. These are the same report types described in [Reports](/features/reports/); only the trigger is different.
 
+Reports you produce as evidence for a [service deliverable](/features/contracts/#service-deliverables) also appear here, once you deliver the occurrence and not before. The customer can download these but can't generate them. They include the [SLA performance](/features/reports/#sla-performance-report) report, which shows how the organization's support tickets did against their SLA for the period. Every portal user of the organization can read a delivered report, and the SLA report never shows ticket subjects.
+
 With Reports off, a customer who navigates to the reports URL is redirected to their proposals — the same as every other section that is off.
 
 ---
@@ -229,6 +331,19 @@ With Reports off, a customer who navigates to the reports URL is redirected to t
 With **Hardware lifecycle** visibility on, the customer sees a live replacement plan for the machines you manage for them: a status bar and schedule summary, then plan tables broken out by **Workstations and laptops** and, if the customer has any, **Servers**. Each table lists every device with its operating system, age, purchase date, warranty status, current status, and replacement timeline, color-coded (Replace now / Due soon / On track / Unknown) and with risk tags on devices whose OS has stopped or is about to stop receiving security updates. Below the tables, a **What we recommend** section calls out specific actions, and **Other equipment we manage** lists devices that aren't on a replacement timeline.
 
 A **Refresh** button regenerates the plan on demand. Device names link back to the device's entry in the portal's device list only when **Devices** visibility (or Self-service) is also on for that organization.
+
+---
+
+## Hardware and performance data
+
+**Hardware health**, **Hardware inventory**, **Performance metrics** and **Software inventory** are visibility toggles for the customer's hardware and performance data. In v0.122.1 each one opens a read-only portal API for that organization; the customer portal does not have pages for them yet. Turning a toggle on today does not change what the customer sees in the portal's navigation, so you can enable them ahead of the pages shipping, or leave them off until then.
+
+- **Hardware health** returns per-device component health, hardware events, disks and battery. Health is worked out from the components the customer can see; serial numbers, firmware and internal collector detail are never returned.
+- **Hardware inventory** returns per-device make, model, processor, memory, network adapters and connection counts.
+- **Performance metrics** returns CPU, memory, disk and network trends over the last 24 hours, 7 days or 30 days.
+- **Software inventory** returns installed software (name, version, vendor, install date, last seen) for the organization and per device. It is deliberately left out of **Enable all visibility**; switch it on individually for each organization that should have it.
+
+Like every other visibility toggle, each starts **off**, and an organization with the toggle off gets a **403** from the matching endpoints. See [Hardware and performance](#hardware-and-performance) in the API reference below.
 
 ---
 
@@ -261,7 +376,7 @@ Portal users can submit support tickets, track their status, and add comments to
 4. Submit the ticket. A unique ticket number is auto-generated.
 </Steps>
 
-Tickets are automatically associated with the submitter's portal user account and organization. Each ticket receives a unique alphanumeric ticket number for easy reference.
+Tickets are automatically associated with the submitter's portal user account and organization. Each ticket receives a unique alphanumeric ticket number for easy reference. The ticket list and detail show the ticket's [type](/features/ticketing/#ticket-types) (Incident, Service request, Problem or Change) as a label beside the number; customers cannot choose it, so a portal ticket starts as an Incident until a technician changes it.
 
 ### Ticket Comments
 
@@ -280,6 +395,16 @@ Requesters who only ever email you (no portal login) should **reply to the email
 ### SLA badges and support usage
 
 Turning on **Support usage** visibility adds two things to the customer's view: an SLA badge on tickets in the list (the ticket detail always shows one), and a month-to-date total of billable support time. Use it with customers on a block-hours or time-and-materials arrangement who would otherwise find the invoice a surprise; leave it off for customers on a flat-rate agreement, where a running time total invites the wrong conversation.
+
+### Support hours (block hours)
+
+If a customer has a [Block hours](/features/contracts/#block-hours) line on an active contract, you can show them their balance. Turn on **Support hours** in the organization's portal settings (Org, Portal; it needs **Support usage** on as well, and **Enable all visibility** deliberately leaves it off). The card appears above the support-time table and shows:
+
+- hours used against the block (the included hours plus anything carried over), the hours remaining, or the hours over the block;
+- the current billing period; and
+- the contracted overage rate and when an overage would be billed.
+
+It does not show a calculated overage amount, only hours and the rate from the contract. Time that has not been approved yet counts toward the hours used, matching how the block is drawn down. While the setting is on, support time the block covers is listed under **Covered by your support hours** instead of **To be billed**; with it off, the page reads exactly as before and the customer is never told a block exists. A paused, draft or ended contract, or a retired block, shows no card.
 
 ### External Ticket Integration
 
@@ -313,7 +438,7 @@ Only issued invoices appear in the portal -- drafts are never shown. The **Pay n
 ## Asset Checkout
 
 <Aside type="caution">
-  Parked. The checkout/check-in API and the admin toggle exist, but the customer portal does not yet offer the Check Out / Check In actions described below, so the setting defaults to off, and upgrading parks it for organizations that had it on. Enabling it today only adds an "Equipment" page that mirrors Devices.
+  Parked. The checkout/check-in API and the admin toggle exist, but the customer portal does not yet offer the Check Out / Check In actions described below, so the setting defaults to off, and upgrading parks it for organizations that had it on. Enabling it today only adds a read-only "Equipment" page listing the devices currently checked out to the signed-in portal user; a browsable list of devices available to borrow will arrive with the Check Out action.
 </Aside>
 
 The asset checkout system lets portal users borrow shared devices from their organization's inventory and return them when finished.
@@ -434,6 +559,20 @@ All portal endpoints are mounted under `/api/v1/portal`. Public routes (branding
 | `GET` | `/reports/runs/:id/pdf` | Yes | Download a finished run as PDF |
 | `GET` | `/reports/runs/:id/csv` | Yes | Download a finished run as CSV |
 
+### Hardware and performance
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `GET` | `/hardware-health/overview` | Yes | Hardware health summary. Requires **Hardware health** visibility |
+| `GET` | `/hardware-health/devices` | Yes | Per-device hardware health (paginated). Requires **Hardware health** visibility |
+| `GET` | `/hardware-health/devices/:deviceId` | Yes | One device's components, events, disks and battery. Requires **Hardware health** visibility |
+| `GET` | `/hardware-inventory/devices` | Yes | Per-device hardware inventory (paginated). Requires **Hardware inventory** visibility |
+| `GET` | `/hardware-inventory/devices/:deviceId` | Yes | One device's hardware inventory. Requires **Hardware inventory** visibility |
+| `GET` | `/performance/overview` | Yes | Performance summary; `range` is `24h` (default), `7d` or `30d`. Requires **Performance metrics** visibility |
+| `GET` | `/performance/devices/:deviceId` | Yes | One device's performance series for the same ranges. Requires **Performance metrics** visibility |
+| `GET` | `/software/summary` | Yes | Software installed across the organization (paginated). Requires **Software inventory** visibility |
+| `GET` | `/software/devices/:deviceId` | Yes | Software installed on one device (paginated). Requires **Software inventory** visibility |
+
 <Aside type="note">
   Every endpoint marked "Requires … visibility" answers **403** when the organization has that section turned off — including when the organization has no portal settings saved at all. There is no partial response and no silent fallback.
 </Aside>
@@ -447,6 +586,11 @@ All portal endpoints are mounted under `/api/v1/portal`. Public routes (branding
 | `GET` | `/tickets/:id` | Yes | Get ticket details with public comments |
 | `POST` | `/tickets/:id/comments` | Yes | Add a comment to a ticket |
 | `GET` | `/tickets/usage` | Yes | Month-to-date billable support time. Requires **Support usage** visibility |
+| `GET` | `/support-usage/hour-block` | Yes | The live block-hours balance for the organization, or `null`. Requires **Support usage** and **Support hours** visibility |
+| `GET` | `/patches/summary` | Yes | Per-patch counts of pending, failed and installed devices for the organization. Requires **Patch detail** visibility |
+| `GET` | `/patches/devices/:deviceId` | Yes | One device's pending, installed and failed patches. Requires **Patch detail** visibility |
+| `GET` | `/vulnerabilities/summary` | Yes | Per-CVE counts of affected devices, worst severity first. Takes a `status` filter (`open` by default; also `patched`, `mitigated`, `accepted`). Requires **Vulnerability detail** visibility |
+| `GET` | `/vulnerabilities/findings` | Yes | Per-device CVE findings, worst severity first. Takes `status` (default `open`) and an optional `deviceId` filter. Requires **Vulnerability detail** visibility |
 
 ### Invoices
 
@@ -506,9 +650,9 @@ All mutating portal actions are recorded in the audit log with an `actorType` of
 
 ## Troubleshooting
 
-### Portal login returns "Multiple portal accounts found"
+### Portal login with an email that exists in several organizations
 
-This error occurs when the same email address exists in multiple organizations and no `orgId` was provided in the login request. The portal frontend should prompt the user to select their organization or include the `orgId` field in the login payload.
+Portal login with an email that exists in several organizations succeeds only when exactly one of those accounts has the entered password; otherwise it returns the ordinary invalid-credentials error. The response never reveals that the address has more than one account. If the same person uses the same password in two organizations, they can sign in by including that organization's `orgId` in the login request, or by setting different passwords.
 
 ### Custom domain branding returns 404
 

@@ -39,9 +39,10 @@
     },
     "confirm": {
       "title": "Yama onayını onaylayın",
-      "selectedOrganization": "seçilen kuruluş",
-      "messageOne": "{{count}} cihazındaki yamayı {{org}}'de onaylasın mı?",
-      "messageMany": "{{count}} cihazlarda {{org}} içindeki yama onaylansın mı?"
+      "selectedRing": "(adsız)",
+      "messageRingOne": "{{ring}} halkasındaki tüm kuruluşlarda {{count}} cihazda yama onaylansın mı?",
+      "messageRingMany": "{{ring}} halkasındaki tüm kuruluşlarda {{count}} cihazda yama onaylansın mı?",
+      "messagePartnerWide": "Yama, iş ortağınızın altındaki tüm kuruluşlar için onaylansın mı?"
     },
     "checkingAccess": "Erişiminiz kontrol ediliyor..."
   },
@@ -72,7 +73,9 @@
       "queued": "Uyumluluk raporu {{reportId}} sıraya alındı. İndirmeye hazırlanıyor...",
       "ready": "Uyumluluk raporu {{reportId}} hazır. İndirme başlatılıyor...",
       "failed": "Uyumluluk raporu {{reportId}} başarısız oldu",
+      "expired": "{{reportId}} numaralı uyumluluk raporunun süresi doldu. İndirmek için yeni bir rapor oluşturun.",
       "checkFailed": "Rapor durumu kontrol edilemedi",
+      "downloadFailed": "{{reportId}} uyumluluk raporu indirilemedi",
       "noReportId": "Rapor sıraya alındı ancak rapor kimliği döndürülmedi"
     },
     "summary": {
@@ -81,13 +84,19 @@
       "pendingDevices": "{{count}} bekleyen yamalar var",
       "approved": "{{count}} onaylandı",
       "pendingApproval": "{{count}} onay bekleniyor",
+      "failedInstalls_one": "{{count}} başarısız kurulum",
+      "failedInstalls_other": "{{count}} başarısız kurulum",
       "critical": "{{count}} kritik",
-      "reboot": "{{count}} yeniden başlat"
+      "reboot": "{{count}} yeniden başlat",
+      "imagesNotChecked_one": "{{count}} kapsayıcı imajı denetlenmedi",
+      "imagesNotChecked_other": "{{count}} kapsayıcı imajı denetlenmedi"
     },
     "filters": {
       "allDevices": "Tüm Cihazlar ({{count}})",
+      "statusFilterLabel": "Uyumluluk durumuna göre filtrele",
       "pendingPatches": "Bekleyen Yamalar ({{count}})",
       "critical": "Kritik ({{count}})",
+      "failed": "Başarısız Kurulumlar ({{count}})",
       "pendingReboot": "Yeniden Başlatma Bekleniyor ({{count}})",
       "thirdPartyPending": "3. Taraf Beklemede ({{count}})",
       "compliant": "Uyumlu ({{count}})"
@@ -106,6 +115,8 @@
       "approvedTitle": "Kurulum için onaylanan olağanüstü yamalar",
       "pendingApproval": "Onay Bekleniyor",
       "pendingApprovalTitle": "Öne çıkan yamalar hâlâ onay bekliyor",
+      "failed": "Başarısız",
+      "failedTitle": "Son kurulum denemesi başarısız olan bekleyen yamalar",
       "osPatches": "İşletim Sistemi Yamaları",
       "osPatchesTitle": "Windows Update, Apple veya Linux paket yöneticilerinden olağanüstü güncellemeler",
       "thirdParty": "3. Taraf",
@@ -150,6 +161,11 @@
       "messageOne": "{{action}}?\n{{org}} içindeki {{count}} cihazlarda ",
       "messageMany": "{{action}}?\n{{org}} kuruluşlardaki {{count}} cihazlarda ",
       "messageMultiOrg": "{{action}}, {{orgNames}} dahil {{orgCount}} kuruluşta bulunan {{count}} cihazda uygulansın mı?"
+    },
+    "pager": {
+      "range": "{{from}}–{{to}} / {{total}}",
+      "previous": "Önceki sayfa",
+      "next": "Sonraki sayfa"
     }
   },
   "patchInstallHistory": {
@@ -250,7 +266,9 @@
       "moderate": "Orta",
       "low": "Düşük",
       "unrated": "Derecelendirilmemiş",
-      "unratedNote": "Otomatik onaylanmayacak"
+      "unratedNote": "Otomatik onaylanmayacak",
+      "derivedNote": "Türetilmiş derecelendirme",
+      "derivedTooltip": "Satıcı bu güncelleme için bir derecelendirme yayımlamadı. Bu önem derecesi, sınıflandırmasından ve başlığından türetildi."
     },
     "approval": {
       "pending": "Beklemede",
@@ -264,7 +282,11 @@
       "moreFilters": "Daha fazla filtre",
       "lessFilters": "Daha az filtre",
       "allSources": "Tüm Kaynaklar",
-      "allOs": "Tüm İşletim Sistemi"
+      "allOs": "Tüm İşletim Sistemi",
+      "severityLabel": "Önem derecesi",
+      "statusLabel": "Onay durumu",
+      "sourceLabel": "Kaynak",
+      "osLabel": "İşletim sistemi"
     },
     "actions": {
       "deploy": "Dağıt",
@@ -294,11 +316,36 @@
       "os": "İşletim Sistemi",
       "release": "Yayınla",
       "approval": "Onay",
+      "devices": "Cihazlar",
       "actions": "Eylemler"
     },
+    "releaseUnknown": "Bilinmiyor",
     "pagination": {
       "rowsPerPage": "Sayfa başına satır",
       "pageStatus": "Sayfa {{current}} / {{total}}"
+    },
+    "installFailure": {
+      "badgeDevices_one": "Kurulum {{count}} cihazda başarısız oldu",
+      "badgeDevices_other": "Kurulum {{count}} cihazda başarısız oldu",
+      "noReason": "Ajan bir neden bildirmedi",
+      "failedAt": "Son kurulum denemesi başarısız oldu: {{when}}"
+    },
+    "outstandingDevices": {
+      "badge_one": "{{count}} cihaz",
+      "badge_other": "{{count}} cihaz",
+      "none": "Kapsamdaki hiçbir cihazın artık bu yamaya ihtiyacı yok",
+      "open": "{{title}} güncellemesine hâlâ ihtiyaç duyan cihazları göster",
+      "heading": "{{title}} güncellemesine hâlâ ihtiyaç duyan cihazlar",
+      "loading": "Cihazlar yükleniyor…",
+      "error": "Cihaz listesi yüklenemedi.",
+      "showing": "{{total}} cihazdan {{shown}} tanesi gösteriliyor",
+      "loadMore": "Daha fazla yükle",
+      "lastChecked": "Son denetim: {{when}}"
+    },
+    "disambiguator": {
+      "version": "Paket sürümü {{version}}",
+      "id": "Katalog kimliği {{id}}",
+      "title": "Başka bir katalog girdisi aynı başlığa sahip. Her biri ayrı ayrı onaylanır."
     }
   },
   "patchesPage": {
@@ -309,6 +356,8 @@
     "tabs": {
       "compliance": "Uyumluluk",
       "patches": "Yamalar",
+      "vendorUpdates": "Üretici güncellemeleri",
+      "jobs": "İşler",
       "updateRings": "Zilleri Güncelle"
     },
     "actions": {
@@ -326,6 +375,7 @@
     "errors": {
       "fetchRings": "Güncelleme halkaları getirilemedi",
       "fetchPatches": "Yamalar getirilemedi",
+      "fetchJobs": "Yama işleri alınamadı",
       "partnerLevel": "Yama onayları iş ortağı düzeyinde yönetilir",
       "approvePatches": "Yamalar onaylanamadı",
       "approveCountOne": "{{count}} yaması onaylanamadı",
@@ -337,7 +387,8 @@
       "createRing": "Güncelleme halkası oluşturulamadı",
       "deleteRing": "Zil silinemedi",
       "approveUnknown": "Onay durumu bilinmiyor — sunucu yanıtı okunamadı. Hangi yamaların onaylandığını onaylamak için yenileyin.",
-      "approveAbortedWithFailures": "{{message}} ({{count}} yamaları da bundan önce sunucu tarafından reddedilmişti.)"
+      "approveAbortedWithFailures": "{{message}} ({{count}} yamaları da bundan önce sunucu tarafından reddedilmişti.)",
+      "checkRingLinks": "Bu halkayı hangi ilkelerin kullandığı denetlenemedi; hiçbir şey silinmedi"
     },
     "toast": {
       "ringSaved": "Güncelleme halkası kaydedildi",
@@ -367,7 +418,84 @@
       "createTitle": "Güncelleme halkası oluştur"
     },
     "truncatedNotice": "{{total}} yamalardan {{shown}} gösteriliyor. Buradaki filtreler yalnızca önceden yüklenmiş olanları daraltır, dolayısıyla geri kalanlara bu görünümden erişilemez; kataloğun tamamı üzerinde çalışmak için API yamalarını kullanın.",
-    "shiftedNotice": "{{total}} yamasından {{shown}} gösteriliyor — katalog yüklenirken değişti. Gerisini görmek için yeniden yükleyin."
+    "emptyRingSeverityNotice": "Bu halkada henüz cihaz yok. Cihazların bildirdiği önem derecesi cihazlar atandığında görünür; o zamana kadar yamaların çoğu Derecelendirilmemiş olarak görünür.",
+    "shiftedNotice": "{{total}} yamasından {{shown}} gösteriliyor — katalog yüklenirken değişti. Gerisini görmek için yeniden yükleyin.",
+    "ringDelete": {
+      "messageNone": "Bu halkayı kullanan ilke yok. Onay kuralları ve zamanlama ayarları silinecek ve geri yüklenemeyecek.",
+      "title": "{{name}} silinsin mi?",
+      "messageOne": "1 ilke, siz başka bir halka seçene kadar zamanlanmış yama uygulamayı durduracak.",
+      "messageMany": "{{count}} ilke, siz başka bir halka seçene kadar zamanlanmış yama uygulamayı durduracak.",
+      "confirm": "Halkayı sil"
+    }
+  },
+  "patchJobsList": {
+    "empty": "Henüz yama işi yok. Politikalar, güncelleme halkaları veya Breeze AI tarafından oluşturulan işler burada görünecek.",
+    "loading": "Yama işleri yükleniyor...",
+    "columns": {
+      "name": "İş",
+      "status": "Durum",
+      "devices": "Cihazlar",
+      "createdBy": "Oluşturan",
+      "scheduled": "Planlandı",
+      "started": "Başladı",
+      "completed": "Tamamlandı"
+    },
+    "status": {
+      "scheduled": "Planlandı",
+      "running": "Çalışıyor",
+      "completed": "Tamamlandı",
+      "failed": "Başarısız",
+      "cancelled": "İptal edildi"
+    },
+    "devicesSummary": "{{completed}}/{{total}} tamamlandı",
+    "devicesSummaryWithFailed": "{{completed}}/{{total}} tamamlandı, {{failed}} başarısız",
+    "createdBySystem": "Sistem",
+    "notScheduled": "—",
+    "actions": {
+      "tryAgain": "Tekrar dene",
+      "previousPage": "Önceki",
+      "nextPage": "Sonraki"
+    },
+    "pagination": "Sayfa {{page}} / {{totalPages}}",
+    "filters": {
+      "allStatuses": "Tüm durumlar"
+    }
+  },
+  "patchJobDetail": {
+    "title": "Yama işi",
+    "loading": "İş ayrıntıları yükleniyor...",
+    "notFound": "Bu yama işi bulunamadı.",
+    "summary": {
+      "status": "Durum",
+      "source": "Kaynak",
+      "scheduled": "Planlandı",
+      "started": "Başladı",
+      "completed": "Tamamlandı",
+      "createdBy": "Oluşturan"
+    },
+    "resultsTitle": "Cihaz sonuçları ({{count}})",
+    "resultsEmpty": "Henüz cihaz bazlı sonuç yok.",
+    "columns": {
+      "device": "Cihaz",
+      "patch": "Yama",
+      "status": "Durum",
+      "started": "Başladı",
+      "completed": "Tamamlandı",
+      "reboot": "Yeniden başlatma"
+    },
+    "rebootRequired": "Gerekli",
+    "rebootDone": "Tamamlandı",
+    "rebootNotRequired": "—",
+    "skipReasons": {
+      "no_approved_patches": "Atlandı: bu cihazdaki bekleyen güncellemelerin hiçbiri onaylanmadı.",
+      "ring_deleted": "Gönderimden önce iptal edildi: güncelleme halkası silindi.",
+      "ring_disabled": "Gönderimden önce iptal edildi: güncelleme halkası devre dışı bırakıldı.",
+      "ring_unavailable": "Atlandı: güncelleme halkası bu cihaza gönderilmeden önce silindi veya devre dışı bırakıldı.",
+      "all_managed_by_vendor_updates": "Atlandı: bu cihazdaki bekleyen tüm güncellemeler Üretici güncellemeleri tarafından yönetiliyor, onay gerekmiyor."
+    },
+    "errors": {
+      "load": "Yama işi yüklenemedi"
+    }
   },
   "ringSelector": {
     "label": "Güncelleme Zil Sesi:",
@@ -431,6 +559,22 @@
       "title": "Yaptırımı yükle",
       "description": "Cihazların onaylı yamaları ne kadar süreyle yüklemesi gerektiği ve kullanıcının yeniden başlatmayı ne kadar süreyle erteleyebileceği. Yeniden başlatma davranışının kendisi, Yama sekmesindeki politikaya göre ayarlanır."
     },
+    "featureUpdates": {
+      "title": "Windows özellik güncellemeleri",
+      "description": "Bu halkadaki cihazların Windows özellik sürümlerini (örneğin 25H2) alıp almayacağı. Breeze bunları yalnızca aşağıdaki onay kurallarıyla yükler; otomatik onaylamak için bir Özellik Güncellemeleri geçersiz kılması ekleyin.",
+      "modeBlock": "Engelle",
+      "modeAllow": "En yeni sürüme izin ver",
+      "modePin": "Bir sürüme sabitle",
+      "productLabel": "Windows sürümü",
+      "productWindows11": "Windows 11",
+      "productWindows10": "Windows 10",
+      "releaseLabel": "Sürüm",
+      "releasePlaceholder": "25H2",
+      "pinNote": "Her cihazdaki Windows Update bu sürümü hedefleyecek şekilde ayarlanır (Windows Update for Business hedef sürüm ilkesi). İlkenin \"Breeze tek Windows Update kaynağıdır\" ayarı açık değilse Windows, sürümü Breeze onayı dışında kendi zamanlamasına göre indirip yükleyebilir.",
+      "validation": {
+        "release": "25H2 gibi bir sürüm girin."
+      }
+    },
     "approvalPolicy": {
       "title": "Onay politikası",
       "description": "Bu ringde nelerin otomatik olarak onaylandığı ve satıcı tarafından yayınlandıktan sonra bir yamanın ne kadar süreyle tutulacağı. Varsayılan her kategori için geçerlidir; birini farklı şekilde ele almak için geçersiz kılma ekleyin.",
@@ -486,7 +630,84 @@
     "badges": {
       "manual": "Manuel",
       "os": "İşletim Sistemi: {{severities}}",
-      "thirdParty": "3. taraf uygulamalar"
+      "thirdParty": "3. taraf uygulamalar",
+      "appRules_one": "{{count}} uygulama kuralı",
+      "appRules_other": "{{count}} uygulama kuralı",
+      "featureUpdatesNewest": "Özellik güncellemeleri: en yeni",
+      "featureUpdatesPinned": "Özellik güncellemeleri: {{release}}"
     }
+  },
+  "ringAppRules": {
+    "applicationRules": "Başvuru Kuralları",
+    "blockSpecificApplicationsFromAutomatedPatchingOr": "Belirli uygulamaların otomatik yama uygulanmasını engelleyin veya bunları maksimum sürüme sabitleyin.",
+    "blocked": "Engellendi",
+    "pinned": "Sabitlendi",
+    "maxVersion": "Maksimum sürüm",
+    "pinnedApplicationsNeedAVersion": "Sabitlenen uygulamaların bir sürümü olması gerekir.",
+    "addApplication": "Uygulama ekle",
+    "searchCatalogAndDetectedApplications": "Katalogda ve algılanan uygulamalarda arama yapın...",
+    "searching": "Aranıyor...",
+    "catalog": "katalog",
+    "couldnTLoadApplicationsYouCanStill": "Uygulamalar yüklenemedi — hâlâ aşağıdaki paket kimliğine göre ekleyebilirsiniz.",
+    "noMatches": "Eşleşme yok.",
+    "orEnterAPackageIDManually": "Veya manuel olarak bir paket kimliği girin",
+    "removeRuleFor": "{{application}} kuralını kaldır",
+    "scopeNote": "Bu kurallar, yapılandırma ilkesi bu halkaya bağlı olan her cihaz için geçerlidir.",
+    "linuxPackage": "Linux paketi",
+    "appPackage": "Uygulama paketi",
+    "manualRuleType": "Kural türü",
+    "linuxPinHint": "Yama listesindeki tam sürümü, varsa epoch dahil girin (ör. 5:24.0.7-1)."
+  },
+  "patchDetails": {
+    "unknown": "Bilinmiyor",
+    "source": "Kaynak",
+    "packageId": "KB / paket kimliği",
+    "severity": "Önem derecesi",
+    "releaseDate": "Yayın tarihi",
+    "firstSeen": "Katalogda ilk görülme",
+    "rings": {
+      "title": "Güncelleme halkaları",
+      "note": "Her halkanın bu yamayı ne zaman otomatik onayladığı (halka düzeyinde kural; kategori geçersiz kılmaları gösterilmez).",
+      "none": "Yapılandırılmış güncelleme halkası yok.",
+      "manual": "Otomatik onaylanmaz — elle onay gerekir",
+      "immediate": "Hemen otomatik onaylanır",
+      "needsDate": "Bekletiliyor — {{count}} günlük pencereyi başlatacak yayın tarihi yok",
+      "autoApproves": "{{date}} tarihinde otomatik onaylanır",
+      "hold_one": "{{count}} gün erteleme",
+      "hold_other": "{{count}} gün erteleme"
+    }
+  },
+  "vendorUpdates": {
+    "description": "Her üreticinin kendi güncelleme aracı, bir Yapılandırma Politikası ile zamanlanmış şekilde çalışır durumda tutulur. Böyle bir politikanın ulaşmadığı cihazlar Yönetilmiyor olarak görünür.",
+    "loadError": "Üretici güncellemeleri yüklenemedi.",
+    "retry": "Tekrar dene",
+    "pickOrganization": "Üretici güncellemelerini görmek için bir kuruluş seçin.",
+    "loading": "Üretici güncellemeleri yükleniyor",
+    "empty": "Bu filtreyle eşleşen cihaz yok.",
+    "vendorFilter": "Üretici",
+    "allVendors": "Tüm üreticiler",
+    "state": {
+      "upToDate": "Güncel",
+      "overdue": "Gecikmiş",
+      "failing": "Başarısız",
+      "notSupported": "Desteklenmiyor",
+      "notManaged": "Yönetilmiyor",
+      "waitingForReboot": "Yeniden başlatma bekleniyor",
+      "rebootOverdue": "Yeniden başlatma gecikmiş"
+    },
+    "columns": {
+      "device": "Cihaz",
+      "organization": "Kuruluş",
+      "site": "Konum",
+      "vendor": "Üretici",
+      "state": "Durum",
+      "lastRun": "Son çalıştırma",
+      "lastSuccess": "Son başarı"
+    },
+    "never": "Hiçbir zaman",
+    "scheduleNotHandedBack": "Breeze üretici aracının zamanlamasını geri veremedi",
+    "range": "{{from}}–{{to}} / {{total}}",
+    "previous": "Önceki",
+    "next": "Sonraki"
   }
 }

@@ -46,6 +46,7 @@ import { buildAgentAuthContext } from '../../services/aiAgents/agentAuthContext'
 import { createActionIntent, transitionIntent } from '../../services/actionIntents/intentService';
 import { claimTaskLinkedIntentForDispatch } from '../../services/aiOperator/dispatchClaim';
 import { claimTaskLease, TASK_LEASE_MS } from '../../services/aiOperator/taskCoordinator';
+import { readTaskSpentCents } from '../../services/aiOperator/taskLimitsLoader';
 import { readServiceRunning } from '../../services/aiOperator/verification';
 import {
   createAndEnqueueAgentRun,
@@ -61,6 +62,11 @@ import {
   grantRolePermissions,
 } from './db-utils';
 import { PERMISSIONS } from '../../services/permissions';
+import { usePlatformAiKeyPlaceholder } from './helpers/platformAiKey';
+
+// W03 (#7601): agent admission resolves the agent's model first; the
+// platform default is only usable with a platform key configured.
+usePlatformAiKeyPlaceholder();
 
 const TOOL_NAME = 'manage_services';
 const TASK_STEP_KEY = 'investigate';
@@ -583,6 +589,27 @@ describe('AI Operator task-linked run admission (real Postgres)', () => {
       // assertion that matters anyway: it IS the reclaim UPDATE, which the
       // task-linked path never reaches.
     })).rejects.toThrow(/update "ai_agent_runs" set "agent_id"/);
+  });
+});
+
+describe('AI Operator task budget rollup (real Postgres, #6590)', () => {
+  runDb('readTaskSpentCents sums cost_cents over THIS task\'s runs only, as a number', async () => {
+    const t = await seedTenant();
+    const task = await createTask(t);
+    const other = await createTask(t);
+    expect(await readTaskSpentCents(t.orgId, task.id)).toBe(0);
+
+    const setCost = (id: string, costCents: number) => withSystemDbAccessContext(() =>
+      db.update(aiAgentRuns).set({ costCents }).where(eq(aiAgentRuns.id, id)));
+    await setCost(await insertRun(t, { taskId: task.id, taskStepKey: 'investigate', attemptOrdinal: 0 }), 120);
+    await setCost(await insertRun(t, { taskId: task.id, taskStepKey: 'investigate', attemptOrdinal: 1 }), 95);
+    // Neither another task's run nor an unlinked run counts.
+    await setCost(await insertRun(t, { taskId: other.id, taskStepKey: 'investigate', attemptOrdinal: 0 }), 1000);
+    await setCost(await insertRun(t, null), 1000);
+
+    const spent = await readTaskSpentCents(t.orgId, task.id);
+    expect(spent).toBe(215);
+    expect(typeof spent).toBe('number');
   });
 });
 

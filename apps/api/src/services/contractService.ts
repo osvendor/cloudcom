@@ -1,23 +1,28 @@
-import { and, desc, eq, inArray, sql } from 'drizzle-orm';
+import { isAutopayEnabledForPartner } from './autopay/autopayGate';
+import { and, count, desc, eq, gte, inArray, isNull, ne, sql } from 'drizzle-orm';
 import { assertInTransaction, db } from '../db';
 import {
   contracts, contractLines, contractBillingPeriods, contractBillingPeriodOutcomes,
   organizations, sites, deviceGroups, catalogItemPrices, catalogItemOrgPricing,
-  invoices, invoiceLineDevices,
+  invoices, invoiceLineDevices, contractHourPeriods, contractDocuments, serviceDeliverables,
+  quotes,
 } from '../db/schema';
 import { ContractServiceError, actorCan, type ContractActor, type ContractLineAudit } from './contractTypes';
-import type { ContractLineInput, InvoiceLineDeviceCountedAs, UpdateContractInput } from '@breeze/shared';
+import type { ContractLineInput, HourBlockEstimate, InvoiceLineDeviceCountedAs, UpdateContractInput } from '@breeze/shared';
 import {
   ALLOWANCE_LINE_TYPES, BILLABLE_DEVICE_ROLES, fromCents, isRepresentableInCurrency, minorUnitExponent,
-  multiplyToCurrency, roundToCurrency, toCents, PERMISSION_GRANTS,
+  multiplyToCurrency, toCents, PERMISSION_GRANTS,
   contractLineInvariantIssues, isSiteDeletedLine, mergeContractLinePatch, patchHasKey, SITE_SCOPABLE_LINE_TYPES,
-  type DeviceRole, type UpdateContractLineInput,
+  type ContractLineType, type DeviceRole, type RolloverPolicy, type UpdateContractLineInput,
+  RELATED_CONTRACT_STATUSES, contractsOverlapCadence, type RelatedContract,
 } from '@breeze/shared';
 import type { NewContractSpec } from './quoteToContract';
-import { periodIndexFor, nextBillingDate, computePeriod, isExpired, duePeriodStartFor } from './contractMath';
+import { computeOpenHourBlockPeriod } from './contractHourBlockEstimate';
+import { periodIndexFor, nextBillingDate, isExpired, todayISO, firstUnclaimedPeriodStart, advancePastClaimed, billingRunPeriods, isAutoRenewing, pointerPastClaimed } from './contractMath';
 import { emitContractEvent } from './contractEvents';
+import { rebaseUnmaterializedDeliverables } from './serviceDeliverableService';
 import { readOrgStampingDefaults, OrgCurrencyServiceError, type DbExecutor as OrgLockExecutor } from './orgCurrencyCore';
-import { pgErrorNode } from '../utils/pgErrors';
+import { pgErrorNode, isPgUniqueViolation } from '../utils/pgErrors';
 
 /**
  * Boundary mapping for the org SHARE barrier (#3778, review finding 1).
@@ -40,8 +45,8 @@ async function lockOrgStampingDefaults(tx: OrgLockExecutor, orgId: string): Prom
 }
 
 import { createManualInvoice, addContractLine, deleteDraftInvoice } from './invoiceService';
+import { closeHourBlockPeriods, lockHourBlockSourceTickets, type HourBlockCloseSummary } from './contractHourBlockClose';
 import { resolvePrice, CatalogServiceError } from './catalogService';
-import { resolvePriceFrom, isPriceGap } from './catalogPricing';
 import { countContractSeats, type DeviceSnapshotRow } from './contractQuantities';
 import { buildOrgDeviceSnapshot } from './contractSnapshot';
 import {
@@ -164,7 +169,46 @@ export async function getOwnedContractOr404(contractId: string, actor: ContractA
 export type DecoratedContractLine = typeof contractLines.$inferSelect & {
   site: { id: string; name: string } | null;
   deviceGroup: { id: string; name: string; type: 'static' | 'dynamic' } | null;
+  /** #4547 W03: block lines only — the same predicate that decides retire-vs-delete. */
+  hourBlockHasHistory?: boolean;
 };
+
+/** True when a block line has billing history: a ledger row for it, or ANY claimed
+ *  period at or after its first_period_start. The SAME predicate drives retire-vs-delete
+ *  and the UI's "retire" confirm copy, so the copy can never disagree with the action.
+ *  Agrees with W02's close entitlement (selectClosablePeriods): a retired line still
+ *  closes every period claimed while it was live, and retire stamps clock_timestamp()
+ *  under the contract lock, so every claim existing at that moment is entitled — "any
+ *  claim at or after first_period_start" is exactly "something W02 may still close".
+ *  Two short indexed reads, ledger first; runs on the caller's executor so remove sees
+ *  it under the contract row lock. */
+async function hourBlockHasHistory(
+  tx: DbExecutor,
+  line: { id: string; contractId: string; hourBlockFirstPeriodStart: string | null },
+): Promise<boolean> {
+  const [ledger] = await tx.select({ id: contractHourPeriods.id }).from(contractHourPeriods)
+    .where(eq(contractHourPeriods.contractLineId, line.id)).limit(1);
+  if (ledger) return true;
+  if (line.hourBlockFirstPeriodStart === null) return false;
+  const [claimed] = await tx.select({ id: contractBillingPeriods.id }).from(contractBillingPeriods)
+    .where(and(
+      eq(contractBillingPeriods.contractId, line.contractId),
+      gte(contractBillingPeriods.periodStart, line.hourBlockFirstPeriodStart),
+    )).limit(1);
+  return !!claimed;
+}
+
+async function withBlockHistory<T extends { id: string; contractId: string; lineType: string; hourBlockFirstPeriodStart: string | null; hourBlockRetiredAt: Date | string | null }>(
+  rows: T[],
+): Promise<Array<T & { hourBlockHasHistory?: boolean }>> {
+  const out: Array<T & { hourBlockHasHistory?: boolean }> = [];
+  for (const r of rows) {
+    if (r.lineType !== 'hour_block') { out.push(r); continue; }
+    // A retired block always has history (it is only ever retired because it did).
+    out.push({ ...r, hourBlockHasHistory: r.hourBlockRetiredAt !== null ? true : await hourBlockHasHistory(db, r) });
+  }
+  return out;
+}
 
 /** #3205 W03: one decorator for every line read. The group leg is W02's
  *  (renamed from withDeviceGroup); the site leg is the W01-deferred detail-page
@@ -201,8 +245,10 @@ const AUDITED_LINE_COLUMNS = [
   'description', 'unitPrice', 'taxable', 'catalogItemId', 'manualQuantity',
   'siteId', 'deviceRoles', 'deviceGroupId', 'deviceGroupName', 'sortOrder',
   'includedQuantity', 'overageMode', 'overageUnitPrice',
+  'rolloverPolicy', 'rolloverCapHours', 'hourBlockAlertPct',
 ] as const;
 type AuditedLineColumn = typeof AUDITED_LINE_COLUMNS[number];
+const BLOCK_AUDIT_COLUMNS = ['includedQuantity', 'overageUnitPrice', 'rolloverPolicy', 'rolloverCapHours', 'hourBlockAlertPct'] as const;
 type ContractLineRowT = typeof contractLines.$inferSelect;
 
 function lineColumnChanged(field: AuditedLineColumn, before: ContractLineRowT, after: ContractLineRowT): boolean {
@@ -225,6 +271,16 @@ function diffLineAudit(
   c: { id: string; orgId: string; name: string },
 ): ContractLineAudit {
   const changedFields = AUDITED_LINE_COLUMNS.filter((f) => lineColumnChanged(f, before, after));
+  // #4547 W03: a block edit applies at the next close, so the audit keeps before/after.
+  // Numbers and enum values only — never free text.
+  const blockChanges = after.lineType === 'hour_block'
+    ? (() => {
+        const moved = BLOCK_AUDIT_COLUMNS.filter((f) => changedFields.includes(f));
+        if (moved.length === 0) return {};
+        const v = (x: unknown): string | number | null => (x === null || x === undefined ? null : typeof x === 'number' ? x : String(x));
+        return { blockChanges: Object.fromEntries(moved.map((f) => [f, { before: v(before[f]), after: v(after[f]) }])) };
+      })()
+    : {};
   return {
     orgId: c.orgId, contractId: c.id, contractName: c.name,
     contractLineId: after.id, lineType: after.lineType,
@@ -232,6 +288,7 @@ function diffLineAudit(
     ...(changedFields.includes('unitPrice')
       ? { oldUnitPrice: before.unitPrice, newUnitPrice: after.unitPrice }
       : {}),
+    ...blockChanges,
   };
 }
 
@@ -243,7 +300,47 @@ export function contractLineAuditDetails(audit: ContractLineAudit) {
     ...(audit.changedFields !== undefined ? { changedFields: audit.changedFields } : {}),
     ...(audit.oldUnitPrice !== undefined ? { oldUnitPrice: audit.oldUnitPrice } : {}),
     ...(audit.newUnitPrice !== undefined ? { newUnitPrice: audit.newUnitPrice } : {}),
+    ...(audit.retired !== undefined ? { retired: audit.retired } : {}),
+    ...(audit.blockChanges ? { blockChanges: audit.blockChanges } : {}),
   };
+}
+
+/** #9509: the latest claimed period start for a contract (null when nothing is claimed). One
+ *  read on the (contract_id, period_start) unique index; run under the contract row lock. */
+async function latestClaimedPeriodStart(tx: DbExecutor, contractId: string): Promise<string | null> {
+  const [row] = await tx.select({ periodStart: contractBillingPeriods.periodStart }).from(contractBillingPeriods)
+    .where(eq(contractBillingPeriods.contractId, contractId))
+    .orderBy(desc(contractBillingPeriods.periodStart)).limit(1);
+  return row?.periodStart ?? null;
+}
+
+/** #9509: the pointer for a paused -> active transition. The period containing `asOfISO` (no
+ *  back-billing of the paused gap), moved past any period the ledger already claimed: a pause
+ *  and resume inside an already-billed advance period must not park the pointer on it. */
+async function resumedBillingPointer(tx: DbExecutor, c: typeof contracts.$inferSelect, asOfISO: string): Promise<string> {
+  return pointerPastClaimed({
+    startDate: c.startDate, intervalMonths: c.intervalMonths, billingTiming: c.billingTiming as 'advance' | 'arrears',
+    candidateIdx: periodIndexFor(c.startDate, c.intervalMonths, asOfISO),
+    latestClaimedStart: await latestClaimedPeriodStart(tx, c.id),
+  });
+}
+
+/** Index C9: where a block's entitlement starts. Pure candidate from the billing pointer (Task 2),
+ *  then walked past periods that are already claimed. Since #9509 resume no longer parks the
+ *  pointer on a claimed period, but a contract stuck before that fix can still carry one until
+ *  its next billing run heals it. A draft has nothing claimed. Run under the contract lock. */
+async function blockFirstPeriodStart(tx: DbExecutor, c: typeof contracts.$inferSelect): Promise<string> {
+  const candidate = firstUnclaimedPeriodStart({
+    status: c.status, startDate: c.startDate, intervalMonths: c.intervalMonths,
+    billingTiming: c.billingTiming as 'advance' | 'arrears', nextBillingAt: c.nextBillingAt,
+  });
+  if (candidate === null) {
+    throw new ContractServiceError('The contract has no billing pointer to start a block-hours line from', 409, 'INVALID_STATE');
+  }
+  if (c.status === 'draft') return candidate;
+  const claimed = await tx.select({ periodStart: contractBillingPeriods.periodStart }).from(contractBillingPeriods)
+    .where(and(eq(contractBillingPeriods.contractId, c.id), gte(contractBillingPeriods.periodStart, candidate)));
+  return advancePastClaimed(candidate, new Set(claimed.map((r) => r.periodStart)), c.startDate, c.intervalMonths);
 }
 
 function assertDraft(c: { status: string }): void {
@@ -278,6 +375,31 @@ async function assertGroupInOrg(tx: DbExecutor, groupId: string, orgId: string) 
 /** Postgres 23503 on contract_lines_device_group_org_fk = the group vanished
  *  between assertGroupInOrg and the insert (deleteDeviceGroup holds FOR UPDATE
  *  on the group row, so the insert waited and then lost). Same answer. */
+/** Fields a block-hours line cannot take (index C7). The shared validator's
+ *  invariants would also reject most of them on the merged row, but as the
+ *  generic INVALID_LINE_PATCH; naming them HOUR_BLOCK_FIELD_LOCKED tells the
+ *  caller this is a property of the line type, not a typo. A key present with
+ *  any value — including null — counts, like the rest of the patch logic. */
+const HOUR_BLOCK_LOCKED_KEYS = ['siteId', 'deviceRoles', 'deviceGroupId', 'manualQuantity'] as const;
+
+function assertBlockPatchAllowed(
+  current: { hourBlockRetiredAt: Date | string | null },
+  patch: UpdateContractLineInput,
+): void {
+  if (current.hourBlockRetiredAt !== null) {
+    throw new ContractServiceError('A retired block-hours line cannot be edited', 400, 'HOUR_BLOCK_FIELD_LOCKED', { fields: ['retired'] });
+  }
+  const locked: string[] = HOUR_BLOCK_LOCKED_KEYS.filter((k) => patchHasKey(patch, k));
+  // Open Decision 10 (A): the mode stays 'bill'. Re-sending 'bill' is a no-op.
+  if (patchHasKey(patch, 'overageMode') && patch.overageMode !== 'bill') locked.push('overageMode');
+  if (locked.length > 0) {
+    throw new ContractServiceError(
+      `These fields cannot be changed on a block-hours line: ${locked.join(', ')}`,
+      400, 'HOUR_BLOCK_FIELD_LOCKED', { fields: locked },
+    );
+  }
+}
+
 function isGroupFkViolation(err: unknown): boolean {
   const node = pgErrorNode(err);
   const constraint = node?.constraint_name ?? node?.constraint;
@@ -350,8 +472,66 @@ export async function createContract(input: {
   return row!;
 }
 
-export async function getContract(contractId: string, actor: ContractActor) {
+/**
+ * #9303: the org's OTHER contracts that bill now or can be turned on to bill
+ * (draft/active/paused), for the warn-and-confirm notice on a contract's page.
+ * Reads through the ambient `db`, i.e. the caller's own access context — RLS
+ * applies — and filters to the viewed contract's org explicitly, so a partner
+ * reader who can see several orgs never gets a sister org's contract here.
+ * Ordered oldest first: the hand-built contract a quote accept landed next to
+ * is usually the one to keep.
+ */
+export async function listRelatedContracts(
+  contract: Pick<ContractRow, 'id' | 'orgId' | 'intervalMonths' | 'startDate' | 'endDate'>,
+  actor: ContractActor,
+): Promise<RelatedContract[]> {
+  requireOrgAccess(actor, contract.orgId);
+  const siblings = await db.select().from(contracts)
+    .where(and(
+      eq(contracts.orgId, contract.orgId),
+      ne(contracts.id, contract.id),
+      inArray(contracts.status, [...RELATED_CONTRACT_STATUSES]),
+    ))
+    .orderBy(contracts.createdAt, contracts.id);
+  if (siblings.length === 0) return [];
+  const priced = await withEstimatedPeriodValues(siblings, actor);
+  if (priced.length === 0) return [];
+  const ids = priced.map((r) => r.id);
+  // Sequential, not Promise.all: inside a request both share one transaction's
+  // connection, which serializes them anyway.
+  const deliverableRows = await db.select({ contractId: serviceDeliverables.contractId, n: count() })
+    .from(serviceDeliverables)
+    .where(and(inArray(serviceDeliverables.contractId, ids), eq(serviceDeliverables.active, true)))
+    .groupBy(serviceDeliverables.contractId);
+  const agreementRows = await db.select({ contractId: contractDocuments.contractId, n: count() })
+    .from(contractDocuments)
+    .where(inArray(contractDocuments.contractId, ids))
+    .groupBy(contractDocuments.contractId);
+  const deliverables = new Map(deliverableRows.map((r) => [r.contractId, Number(r.n)]));
+  const agreements = new Map(agreementRows.map((r) => [r.contractId, Number(r.n)]));
+  return priced.map((r) => ({
+    id: r.id,
+    name: r.name,
+    status: r.status as RelatedContract['status'],
+    intervalMonths: r.intervalMonths,
+    currencyCode: r.currencyCode,
+    recurringTotal: r.estimatedPeriodValue,
+    deliverableCount: deliverables.get(r.id) ?? 0,
+    signedAgreementCount: agreements.get(r.id) ?? 0,
+    overlapsCadence: contractsOverlapCadence(contract, r),
+  }));
+}
+
+export async function getContract(
+  contractId: string,
+  actor: ContractActor,
+  /** #9303: `includeRelated` adds `relatedContracts`. Opt-in so the AI tools,
+   *  the partner API and the generate route's authorization read keep their
+   *  existing shape and cost; only the web contract page asks for it. */
+  options: { includeRelated?: boolean } = {},
+) {
   const contract = await getOwnedContractOr404(contractId, actor);
+  const autopayEnabled = await isAutopayEnabledForPartner(db, contract.partnerId);
   // #3205 W03: (sortOrder, createdAt, id). sortOrder alone is not a total order
   // — addContractLineToContract defaults it to 0, so everything created through
   // the editor ties — and Postgres was free to reshuffle the table on any edit.
@@ -361,6 +541,16 @@ export async function getContract(contractId: string, actor: ContractActor) {
   // Site axis: a restricted actor sees only its reachable lines, and a contract
   // with none is denied (see contractLineSiteDenied). No-op when unrestricted.
   const lines = visibleLinesOrDeny(actor, allLines);
+  // After the site-axis deny above, so a reader denied this contract never
+  // pays for (or learns anything from) its siblings.
+  // #10361: the page also names the contract's source quote, so a quote's
+  // pending draft says where it came from even with no executed agreement.
+  const related = options.includeRelated
+    ? {
+        relatedContracts: await listRelatedContracts(contract, actor),
+        sourceQuote: (await withSourceQuotes([contract], actor))[0]!.sourceQuote,
+      }
+    : {};
   // #6110 finding 3: a PARTIAL read must not look like a complete one. When any
   // line was hidden, say so, and withhold the billing-period history — every
   // number in it (invoice totals, snapshot/uncovered/overage counts) is a
@@ -370,7 +560,7 @@ export async function getContract(contractId: string, actor: ContractActor) {
     ? lines.length !== allLines.length
     : undefined;
   if (linesFilteredBySiteScope === true) {
-    return { contract, lines: await withLineRefs(lines), periods: null, linesFilteredBySiteScope };
+    return { autopayEnabled, contract, lines: await withBlockHistory(await withLineRefs(lines)), periods: null, linesFilteredBySiteScope, ...related };
   }
   // #3205 W07: one LEFT JOIN supplies the per-period outcome summary for the
   // detail table. JSON digests remain exclusive to the expanded outcome read.
@@ -396,10 +586,12 @@ export async function getContract(contractId: string, actor: ContractActor) {
     .where(eq(contractBillingPeriods.contractId, contractId))
     .orderBy(desc(contractBillingPeriods.periodStart));
   return {
+    autopayEnabled,
     contract,
-    lines: await withLineRefs(lines),
+    lines: await withBlockHistory(await withLineRefs(lines)),
     periods: periods as typeof periods | null,
     ...(linesFilteredBySiteScope === undefined ? {} : { linesFilteredBySiteScope }),
+    ...related,
   };
 }
 
@@ -416,12 +608,20 @@ export type ContractListRow = ContractRow & {
   linesFilteredBySiteScope?: boolean;
 };
 
+/** #10361: the quote whose accept created a contract, as the list names it.
+ *  `quoteNumber` is null for a quote accepted before it was ever numbered. */
+export interface ContractSourceQuote { id: string; quoteNumber: string | null }
+export type ContractListRowWithSource = ContractListRow & { sourceQuote: ContractSourceQuote | null };
+
 export async function listContracts(query: {
   orgId?: string; status?: string; limit?: number;
-}, actor: ContractActor): Promise<ContractListRow[]> {
+  /** #10361: only the contracts a given quote's accept created (quote detail). */
+  sourceQuoteId?: string;
+}, actor: ContractActor): Promise<ContractListRowWithSource[]> {
   const conds = [];
   if (query.orgId) { requireOrgAccess(actor, query.orgId); conds.push(eq(contracts.orgId, query.orgId)); }
   if (query.status) conds.push(eq(contracts.status, query.status as never));
+  if (query.sourceQuoteId) conds.push(eq(contracts.sourceQuoteId, query.sourceQuoteId));
   // Defense-in-depth: when the actor has a restricted org list, add an explicit app-level filter
   // so the query never depends solely on RLS (consistent with other billing list endpoints).
   // null accessibleOrgIds = system/admin context — no extra filter needed.
@@ -444,6 +644,54 @@ export async function listContracts(query: {
     .where(conds.length ? and(...conds) : undefined)
     .orderBy(desc(contracts.createdAt))
     .limit(Math.min(query.limit ?? 50, 100));
+  return withSourceQuotes(await withEstimatedPeriodValues(rows, actor), actor);
+}
+
+/**
+ * #10361: name each row's source quote so the list can mark a quote's pending
+ * draft. One query for the page, and none at all when no row came from a
+ * quote. The composite (source_quote_id, org_id) FK already guarantees the
+ * quote is in the contract's own org; the org predicate repeats that axis
+ * explicitly (as the other billing reads do) rather than leaning on RLS alone.
+ * A quote this actor cannot read reads as "no source quote", never an error.
+ *
+ * SITE AXIS (app-layer only — RLS does not defend it): reaching a contract
+ * through one of its lines does not make its quote readable. A site-restricted
+ * actor is told about the quote only when the quote's own site is in their
+ * allowlist — byte-for-byte quoteTypes.assertSite, where a null quote site is
+ * DENIED to a restricted actor.
+ */
+async function withSourceQuotes<T extends ContractRow>(
+  rows: T[],
+  actor: Pick<ContractActor, 'allowedSiteIds'>,
+): Promise<Array<T & { sourceQuote: ContractSourceQuote | null }>> {
+  const quoteIds = [...new Set(rows.map((r) => r.sourceQuoteId).filter((id): id is string => !!id))];
+  const none = () => rows.map((r) => ({ ...r, sourceQuote: null }));
+  if (quoteIds.length === 0) return none();
+  if (actor.allowedSiteIds && actor.allowedSiteIds.length === 0) return none();
+  const orgIds = [...new Set(rows.map((r) => r.orgId))];
+  const found = await db.select({ id: quotes.id, orgId: quotes.orgId, quoteNumber: quotes.quoteNumber })
+    .from(quotes)
+    .where(and(
+      inArray(quotes.id, quoteIds),
+      inArray(quotes.orgId, orgIds),
+      actor.allowedSiteIds ? inArray(quotes.siteId, actor.allowedSiteIds) : undefined,
+    ));
+  const byKey = new Map(found.map((q) => [`${q.id}:${q.orgId}`, q]));
+  return rows.map((r) => {
+    const q = r.sourceQuoteId ? byKey.get(`${r.sourceQuoteId}:${r.orgId}`) : undefined;
+    return { ...r, sourceQuote: q ? { id: q.id, quoteNumber: q.quoteNumber ?? null } : null };
+  });
+}
+
+/**
+ * The list row enrichment, shared by listContracts and the detail read's
+ * relatedContracts (#9303) so both show the same per-period number. Applies the
+ * site axis exactly as the list always has: a contract with no line this actor
+ * can reach is OMITTED, and one with an unreachable line has its estimate
+ * withheld (null) and is flagged.
+ */
+async function withEstimatedPeriodValues(rows: ContractRow[], actor: ContractActor): Promise<ContractListRow[]> {
   if (rows.length === 0) return [];
 
   // Enrich each row with estimatedPeriodValue (live counts for per_device/per_seat
@@ -510,9 +758,13 @@ interface OrgSnapshotEntry {
    *  must not be queried again on the next line of the same calculation. */
   attempted: Set<string>;
 }
-type DeviceCache = Map<string, OrgSnapshotEntry>; // key orgId
-type SeatCache = Map<string, number>;              // key orgId
+export type DeviceCache = Map<string, OrgSnapshotEntry>; // key orgId
+export type SeatCache = Map<string, number>;              // key orgId
 type ContractLineRow = typeof contractLines.$inferSelect;
+
+/** Why a line has no resolvable quantity: its group or site was deleted, or
+ *  (#9664) it is a manual line with no quantity. */
+export type UnresolvedLineReason = 'group_deleted' | 'site_deleted' | 'manual_quantity_missing';
 
 /** A wave-2 group line whose group is gone: all-zero, no allowance, so the
  *  estimate never shows a number the invoice cannot carry (generation refuses
@@ -526,16 +778,21 @@ const UNRESOLVED_QTY: ResolvedQuantity = {
  *  Both legs go through the exact-decimal primitives — `Number(a) * b` is what
  *  turned 0.02 × 7.25 into 0.14. `overageValue` is the currency's zero whenever
  *  the line is not billing an overage, so there is no branch here. */
-function lineCents(r: ResolvedQuantity, unitPrice: string, l: ContractLineRow, currencyCode: string): number {
-  return toCents(multiplyToCurrency(r.billed, unitPrice, currencyCode))
+export function lineCents(r: ResolvedQuantity, unitPrice: string, l: ContractLineRow, currencyCode: string): number {
+  return baseCents(r, unitPrice, currencyCode)
     + toCents(overageValue(r, l, currencyCode));
+}
+
+/** The base leg of `lineCents` alone: the billed quantity at `unitPrice`. */
+export function baseCents(r: Pick<ResolvedQuantity, 'billed'>, unitPrice: string, currencyCode: string): number {
+  return toCents(multiplyToCurrency(r.billed, unitPrice, currencyCode));
 }
 
 function emptySnapshot(): OrgDeviceSnapshot {
   return { devices: [], groups: new Map() };
 }
 
-function groupIdsOf(lines: readonly Pick<ContractLineRow, 'lineType' | 'deviceGroupId'>[]): string[] {
+export function groupIdsOf(lines: readonly Pick<ContractLineRow, 'lineType' | 'deviceGroupId'>[]): string[] {
   return [...new Set(lines.filter((l) => l.lineType === 'per_device_group' && l.deviceGroupId).map((l) => l.deviceGroupId!))];
 }
 
@@ -544,7 +801,7 @@ function groupIdsOf(lines: readonly Pick<ContractLineRow, 'lineType' | 'deviceGr
  *  estimate is all-or-nothing, and listContracts / the MRR rollup already catch
  *  GROUP_EVALUATION_FAILED per contract. The assembly itself now lives in
  *  contractSnapshot.buildOrgDeviceSnapshot so quote estimation shares it. */
-async function orgSnapshot(orgId: string, dc: DeviceCache, groupIds: readonly string[] = []): Promise<OrgDeviceSnapshot> {
+export async function orgSnapshot(orgId: string, dc: DeviceCache, groupIds: readonly string[] = []): Promise<OrgDeviceSnapshot> {
   let entry = dc.get(orgId);
   const priorFailure = groupIds.map((id) => entry?.failures.get(id)).find((failure) => failure !== undefined);
   if (priorFailure) throw priorFailure;
@@ -619,6 +876,9 @@ const BILLABLE_DEVICE_ROLE_SET = new Set<string>(BILLABLE_DEVICE_ROLES);
 // not import a value they only need as a membership test.
 const ALLOWANCE_LINE_TYPE_SET: ReadonlySet<string> = new Set(ALLOWANCE_LINE_TYPES);
 
+/** #4547: the partial unique index that allows one live block-hours line per org. */
+const HOUR_BLOCK_LIVE_INDEX = 'contract_lines_one_live_hour_block_per_org_uq';
+
 /** The three allowance columns normalised for an insert: present only on a type
  *  that may carry them, NULL everywhere else (same shape as the manualQuantity /
  *  deviceRoles / siteId normalisation beside it). */
@@ -668,14 +928,18 @@ function assertSpecDeviceSetLine(line: {
  * function is the identity — so a future allowance-bearing type cannot be
  * forgotten in one branch (#3205 W04).
  */
-async function resolveLineQty(
+export async function resolveLineQty(
   orgId: string, line: ContractLineRow, dc: DeviceCache, sc: SeatCache,
-): Promise<ResolvedQuantity & { live: boolean; unresolved?: 'group_deleted' | 'site_deleted' }> {
+): Promise<ResolvedQuantity & { live: boolean; unresolved?: UnresolvedLineReason }> {
   switch (line.lineType) {
     case 'flat':
       return { ...applyAllowance(1, line, 'included_units'), live: false };
     case 'manual':
-      return { ...applyAllowance(Number(line.manualQuantity ?? '0'), line, 'included_units'), live: false };
+      // #9664: NULL is a MISSING quantity, never 0. Billing it as 0 put a
+      // silent $0 line on the invoice; it is unresolved like a deleted
+      // site/group (generation refuses with MANUAL_QUANTITY_MISSING).
+      if (line.manualQuantity === null) return { ...UNRESOLVED_QTY, live: false, unresolved: 'manual_quantity_missing' };
+      return { ...applyAllowance(Number(line.manualQuantity), line, 'included_units'), live: false };
     case 'per_device':
     case 'per_device_role': {
       // #4693: site_id NULL with a stamped name means the site was DELETED.
@@ -697,6 +961,18 @@ async function resolveLineQty(
     case 'per_seat': {
       if (!sc.has(orgId)) sc.set(orgId, await countContractSeats(orgId));
       return { ...applyAllowance(sc.get(orgId)!, line, 'included_units'), live: true };
+    }
+    case 'hour_block': {
+      // #4547 W03 (index C7, delta 8): FEE ONLY. The period's hours are closed by
+      // the billing path (W02) and shown by the estimate's `hourBlock`; they must
+      // never appear as an allowance overage here, because aiToolsBilling's
+      // interactive "add contract line to invoice" reads this arm and would
+      // materialize hours as quantity. A retired block bills nothing (W02's
+      // generateDueInvoice skips it), so it must not promise a fee either.
+      if (line.hourBlockRetiredAt !== null) {
+        return { counted: 0, billed: 0, included: null, overage: 0, overageMode: null, live: false };
+      }
+      return { counted: 1, billed: 1, included: null, overage: 0, overageMode: null, live: false };
     }
     default: {
       // Exhaustiveness: a new line type is a compile error here, not a silent qty 0.
@@ -841,13 +1117,16 @@ export interface ContractEstimate {
     overageMode: 'bill' | 'flag' | null;
     /** multiplyToCurrency(overage, overageUnitPrice), or the currency's zero. NEVER folded into `value`. */
     overageValue: string;
-    unresolved?: 'group_deleted' | 'site_deleted';
+    unresolved?: UnresolvedLineReason;
   }>;
   /** Devices no device-counted line bills (#3205). null when the contract has
    *  no per_device / per_device_role / per_device_group line, so the UI can tell "n/a" from "0". */
   uncoveredDevices: UncoveredDevices | null;
   /** One entry per allowance line that is OVER, in either mode. [] when none. */
   overages: OverageSummary[];
+  /** #4547 W03 (C8): the OPEN block period, live; null when the contract has no
+   *  live block line (or the caller opted out via includeHourBlock:false). */
+  hourBlock: HourBlockEstimate | null;
 }
 
 /** Per-line resolved quantities + values + period total for one contract, using
@@ -857,6 +1136,7 @@ export async function computeContractEstimate(
   actor: ContractActor,
   /** Internal capture for interactive materialization; never part of the public estimate response. */
   deviceEvidence?: Map<string, readonly DeviceSnapshotRow[]>,
+  opts: { includeHourBlock?: boolean } = {},
 ): Promise<ContractEstimate> {
   const contract = await getOwnedContractOr404(contractId, actor);
   // The estimate totals EVERY line into one number, so it is a whole-document read.
@@ -901,16 +1181,24 @@ export async function computeContractEstimate(
     const snapshot = await orgSnapshot(contract.orgId, dc, groupIds);
     uncoveredDevices = uncoveredByRole(snapshot, resolvableLines(lines, snapshot));
   }
-  return { currencyCode: contract.currencyCode, periodTotal: fromCents(cents), lines: out, uncoveredDevices, overages };
+  // #4547 W03: the OPEN period of the live block, if any. Ambient context (see
+  // contractHourBlockEstimate.ts for why there is no escalation); the AI add-line
+  // action opts out because it reads lines[] only.
+  const liveBlock = lines.find((l) => l.lineType === 'hour_block' && l.hourBlockRetiredAt === null);
+  const hourBlock = liveBlock && opts.includeHourBlock !== false
+    ? await computeOpenHourBlockPeriod(contract, liveBlock)
+    : null;
+  return { currencyCode: contract.currencyCode, periodTotal: fromCents(cents), lines: out, uncoveredDevices, overages, hourBlock };
 }
 
-// ---- per-currency MRR rollup (multi-currency wave 7, #3779) ----------------
-
-export interface OrgCurrencyMrr { currencyCode: string; amount: string }
+// ---- price-book inputs for the per-currency MRR rollup (#3779) -------------
+// The partner-dashboard rollup and its per-contract rows live in contractMrr.ts
+// (#9828), which imports these helpers. Never import
+// contractMrr.ts from here — that would be an import cycle.
 
 /** `${catalogItemId}|${currencyCode}|${orgId}` */
-type PriceKey = string;
-function priceKey(itemId: string, currencyCode: string, orgId: string): PriceKey {
+export type PriceKey = string;
+export function priceKey(itemId: string, currencyCode: string, orgId: string): PriceKey {
   return `${itemId}|${currencyCode}|${orgId}`;
 }
 
@@ -919,7 +1207,7 @@ function priceKey(itemId: string, currencyCode: string, orgId: string): PriceKey
  * org overrides for the orgs in play and price-book rows for the currencies in
  * play, in two queries total rather than three per line.
  */
-async function loadCatalogPriceInputs(
+export async function loadCatalogPriceInputs(
   itemIds: string[], orgIds: string[], currencyCodes: string[],
 ): Promise<{
   overrides: Map<string, { unitPrice: string; currencyCode: string }>;
@@ -946,168 +1234,6 @@ async function loadCatalogPriceInputs(
   return { overrides, bookRows };
 }
 
-/**
- * Estimated monthly recurring revenue per org, GROUPED BY the contract's own
- * stamped currency (multi-currency spec §8: honest per-currency segmentation,
- * never a cross-currency sum). One org can legitimately hold active contracts
- * in several currencies after an org-default change — history keeps its stamp.
- *
- * "Estimated" because per_device/per_seat quantities are resolved live; the
- * figure is never persisted. No FX happens here: converting to a single
- * reporting currency is the CALLER's optional, explicitly-approximate step.
- *
- * Catalog-backed lines are priced through the SAME resolver recurring billing
- * uses (`resolvePriceFrom`, spec §6: org override in the contract's currency →
- * price-book row for that currency → the line's stamped snapshot on a gap), so
- * the dashboard agrees with the invoices it predicts. Never converts and never
- * falls through to another currency's price.
- */
-/**
- * The billing sites' expiry test, evaluated against the period the sweep is
- * NEXT going to bill (`duePeriodStartFor`, exactly as generateDueInvoice does).
- * A contract with no pointer can never produce another invoice, so it is judged
- * against today instead. Open-ended (endDate null) is never past its end.
- */
-function isPastEndForReporting(
-  c: { endDate: string | null; nextBillingAt: string | null; billingTiming: 'advance' | 'arrears'; intervalMonths: number },
-  asOfISO: string,
-): boolean {
-  if (c.endDate === null || c.endDate === undefined) return false;
-  const periodStart = c.nextBillingAt
-    ? duePeriodStartFor(c.billingTiming, c.nextBillingAt, c.intervalMonths > 0 ? c.intervalMonths : 1)
-    : asOfISO;
-  return isExpired({ endDate: c.endDate, periodStart });
-}
-
-export async function summarizeActiveContractMrrByOrg(
-  orgIds: readonly string[],
-  asOf: Date = new Date(),
-): Promise<Map<string, OrgCurrencyMrr[]>> {
-  const out = new Map<string, OrgCurrencyMrr[]>();
-  if (orgIds.length === 0) return out;
-
-  const active = await db.select().from(contracts)
-    .where(and(inArray(contracts.orgId, [...orgIds]), eq(contracts.status, 'active' as never)));
-  // `status = 'active'` alone is NOT "still running": a contract is flipped to
-  // 'expired' LAZILY inside generateDueInvoice / renewal, at its next billing
-  // date — there is no expiry reaper — so an ended annual contract keeps the
-  // 'active' stamp for up to a whole interval. Billing already skips it via
-  // isExpired, so reporting it here would break this rollup's contract that the
-  // dashboard agrees with the invoices it predicts. Same guard, same inputs.
-  const rows = active.filter((c) => !isPastEndForReporting(c, todayISO(asOf)));
-  if (rows.length === 0) return out;
-
-  const allLines = await db.select().from(contractLines)
-    .where(inArray(contractLines.contractId, rows.map((r) => r.id)));
-  const byContract = new Map<string, typeof allLines>();
-  for (const l of allLines) {
-    const list = byContract.get(l.contractId);
-    if (list) list.push(l); else byContract.set(l.contractId, [l]);
-  }
-
-  // Price-book inputs, loaded once for the whole dashboard.
-  const catalogItemIds = [...new Set(allLines.map((l) => l.catalogItemId).filter((v): v is string => !!v))];
-  let overrides = new Map<string, { unitPrice: string; currencyCode: string }>();
-  let bookRows = new Map<string, { unitPrice: string }>();
-  if (catalogItemIds.length > 0) {
-    const contractsWithCatalog = rows.filter((c) => (byContract.get(c.id) ?? []).some((l) => l.catalogItemId));
-    const loaded = await loadCatalogPriceInputs(
-      catalogItemIds,
-      [...new Set(contractsWithCatalog.map((c) => c.orgId))],
-      [...new Set(contractsWithCatalog.map((c) => c.currencyCode))],
-    );
-    overrides = loaded.overrides;
-    bookRows = loaded.bookRows;
-  }
-  // Resolve once per distinct (itemId, currencyCode, orgId), like the device and
-  // seat caches below.
-  const priceCache = new Map<PriceKey, string | null>();
-  function resolvedUnitPrice(itemId: string, currencyCode: string, orgId: string): string | null {
-    const key = priceKey(itemId, currencyCode, orgId);
-    if (priceCache.has(key)) return priceCache.get(key)!;
-    // The rollup consumes only the unit price; candidate selection and
-    // representability depend solely on the override/book rows and the target
-    // currency, never on the item's cost snapshot — so the cost fields are
-    // stubbed rather than loading every catalog item for a figure that ignores
-    // them. A gap (either kind) is a null here: the caller bills the stamped
-    // snapshot, exactly as addContractLine does.
-    const resolved = resolvePriceFrom(
-      { costBasis: null, costCurrency: currencyCode, taxable: false, taxCategory: null },
-      overrides.get(`${itemId}|${orgId}`) ?? null,
-      bookRows.get(`${itemId}|${currencyCode}`) ?? null,
-      currencyCode,
-    );
-    const price = isPriceGap(resolved) ? null : resolved.unitPrice;
-    priceCache.set(key, price);
-    return price;
-  }
-
-  // Shared across ALL orgs in this call, so a distinct (org, site) device count
-  // and a distinct org seat count each run exactly once for the whole dashboard.
-  const dc: DeviceCache = new Map();
-  const sc: SeatCache = new Map();
-  const totals = new Map<string, Map<string, number>>(); // orgId -> currency -> monthly
-
-  for (const c of rows) {
-    let cents = 0;
-    let siteDeleted = false;
-    try {
-      const lines = byContract.get(c.id) ?? [];
-      const groupIds = groupIdsOf(lines);
-      if (groupIds.length > 0) await orgSnapshot(c.orgId, dc, groupIds);
-      for (const l of lines) {
-        const r = await resolveLineQty(c.orgId, l, dc, sc);
-        if (r.unresolved === 'group_deleted') {
-          console.warn(
-            '[contracts] MRR rollup: contract %s line %s bills a deleted device group (%s); counted as 0',
-            c.id,
-            l.id,
-            l.deviceGroupName,
-          );
-        }
-        if (r.unresolved === 'site_deleted') {
-          console.warn(
-            '[contracts] MRR rollup skipped contract %s: line %s bills deleted site %s',
-            c.id,
-            l.id,
-            l.siteName,
-          );
-          siteDeleted = true;
-          break;
-        }
-        const unitPrice = l.catalogItemId
-          ? (resolvedUnitPrice(l.catalogItemId, c.currencyCode, c.orgId) ?? l.unitPrice)
-          : l.unitPrice;
-        // The BASE leg may be catalog-resolved; the overage leg never is
-        // (decision 13), so lineCents reads the stamped overage_unit_price.
-        cents += lineCents(r, unitPrice, l, c.currencyCode);
-      }
-    } catch (err) {
-      if (err instanceof ContractServiceError && err.code === 'GROUP_EVALUATION_FAILED') {
-        console.warn('[contracts] MRR rollup skipped contract %s: %s', c.id, err.message);
-        continue;
-      }
-      throw err;
-    }
-    if (siteDeleted) continue;
-    const periodValue = Number(fromCents(cents));
-    const months = c.intervalMonths > 0 ? c.intervalMonths : 1;
-    // Round each contract in ITS OWN currency before grouping — a JPY contract
-    // must never contribute a fractional yen.
-    const monthly = Number(roundToCurrency(periodValue / months, c.currencyCode));
-    const perOrg = totals.get(c.orgId) ?? new Map<string, number>();
-    perOrg.set(c.currencyCode, (perOrg.get(c.currencyCode) ?? 0) + monthly);
-    totals.set(c.orgId, perOrg);
-  }
-
-  for (const [orgId, perCurrency] of totals) {
-    out.set(orgId, [...perCurrency.entries()]
-      .sort(([a], [b]) => a.localeCompare(b))
-      .map(([currencyCode, amount]) => ({ currencyCode, amount: roundToCurrency(amount, currencyCode) })));
-  }
-  return out;
-}
-
 export async function updateContract(contractId: string, patch: UpdateContractInput, actor: ContractActor) {
   const c = await getOwnedContractOr404(contractId, actor);
   await requireWholeContractSiteAccess(actor, contractId);
@@ -1124,6 +1250,7 @@ export async function updateContract(contractId: string, patch: UpdateContractIn
   // nextBillingAt, or currencyCode from caller input. Status transitions belong
   // to dedicated lifecycle functions.
   const safeSet: Record<string, unknown> = { updatedAt: new Date() };
+  if (patch.autopayExcluded !== undefined) safeSet.autopayExcluded = patch.autopayExcluded;
   if (patch.name !== undefined)           safeSet.name           = patch.name;
   // Schedule fields are draft-only (guarded above).
   if (c.status === 'draft' && patch.billingTiming !== undefined)  safeSet.billingTiming  = patch.billingTiming;
@@ -1146,15 +1273,33 @@ export async function updateContract(contractId: string, patch: UpdateContractIn
   if (effectiveAutoRenew && (effectiveEndDate == null || effectiveTerm == null)) {
     throw new ContractServiceError('auto-renew requires an end date and renewal term', 400);
   }
-  await db.update(contracts).set(safeSet).where(eq(contracts.id, contractId));
+  // #9309: a draft's deliverables are paused and still pinned to the old start;
+  // move the unmaterialized ones with it, in the same transaction.
+  const newStart = c.status === 'draft' && patch.startDate !== undefined && patch.startDate !== c.startDate
+    ? patch.startDate : null;
+  if (newStart === null) {
+    await db.update(contracts).set(safeSet).where(eq(contracts.id, contractId));
+  } else {
+    await db.transaction(async (tx) => {
+      // CAS on the draft + old start `c` was read with: a concurrent activation
+      // or start edit must not have the re-base run against a stale `from`.
+      const [updated] = await tx.update(contracts).set(safeSet)
+        .where(and(eq(contracts.id, contractId), eq(contracts.status, 'draft'), eq(contracts.startDate, c.startDate)))
+        .returning({ id: contracts.id });
+      if (!updated) throw new ContractServiceError('Contract changed while it was being edited; reload and retry', 409, 'INVALID_STATE');
+      await rebaseUnmaterializedDeliverables(contractId, c.orgId, { from: c.startDate, to: newStart }, tx);
+    });
+  }
   return getOwnedContractOr404(contractId, actor);
 }
 
-export async function deleteDraftContract(contractId: string, actor: ContractActor) {
+/** Returns the deleted contract's id, org and name so the caller can audit the delete. */
+export async function deleteDraftContract(contractId: string, actor: ContractActor): Promise<{ id: string; orgId: string; name: string }> {
   const c = await getOwnedContractOr404(contractId, actor);
   await requireWholeContractSiteAccess(actor, contractId);
   assertDraft(c);
   await db.delete(contracts).where(eq(contracts.id, contractId)); // lines cascade
+  return { id: c.id, orgId: c.orgId, name: c.name };
 }
 
 // ---------------------------------------------------------------------------
@@ -1569,6 +1714,11 @@ export async function addContractLineToContract(contractId: string, input: Contr
     await requireWholeContractSiteAccess(actor, contractId, tx);
     assertEditable(c);
     assertSpecDeviceSetLine(input);
+    // #9664: never fabricate a quantity. The route validator requires one; a
+    // caller that skips it must get an error, not a manual line billing 0.
+    if (input.lineType === 'manual' && input.manualQuantity == null) {
+      throw new ContractServiceError('manual line requires manualQuantity', 400, 'MANUAL_QUANTITY_MISSING');
+    }
     // A restricted actor may only create a line inside its sites; a non-site-scopable
     // (org-level, siteId null) line is denied, as a null-site invoice/quote is.
     // Checked BEFORE pricing so the answer is the authorization one, not a 400.
@@ -1607,6 +1757,28 @@ export async function addContractLineToContract(contractId: string, input: Contr
     // Note this runs on BOTH branches: a catalog-linked base line still carries
     // a hand-entered overage rate (the overage leg is never catalog-priced).
     if (allowance.overageUnitPrice !== null) assertRepresentable(allowance.overageUnitPrice, c.currencyCode);
+    // #4547 W03: block-hours columns (index C2). The first counted period is
+    // server-stamped (C9) and never client input.
+    const isBlock = input.lineType === 'hour_block';
+    if (isBlock && !input.rolloverPolicy) {
+      // Service-level backstop for internal callers; the shared validator already requires it.
+      throw new ContractServiceError('rolloverPolicy is required on hour_block lines', 400, 'INVALID_STATE');
+    }
+    // C9 (refined): where entitlement starts = where the fee starts. Reads the
+    // contract's claimed periods when the contract is active; runs inside the contract row lock.
+    const firstPeriodStart = isBlock ? await blockFirstPeriodStart(tx, c) : null;
+    const blockColumns = isBlock
+      ? {
+          rolloverPolicy: input.rolloverPolicy!,
+          rolloverCapHours: input.rolloverCapHours ?? null,
+          hourBlockAlertPct: input.hourBlockAlertPct ?? null,
+          hourBlockFirstPeriodStart: firstPeriodStart,
+          hourBlockRetiredAt: null,
+        }
+      : {
+          rolloverPolicy: null, rolloverCapHours: null, hourBlockAlertPct: null,
+          hourBlockFirstPeriodStart: null, hourBlockRetiredAt: null,
+        };
     const siteId = SITE_SCOPABLE_LINE_TYPES.has(input.lineType) ? (input.siteId ?? null) : null;
     const site = siteId ? await assertSiteInOrg(tx, siteId, c.orgId) : null;
     const group = input.lineType === 'per_device_group' && input.deviceGroupId
@@ -1615,7 +1787,7 @@ export async function addContractLineToContract(contractId: string, input: Contr
       const [row] = await tx.insert(contractLines).values({
         contractId, orgId: c.orgId, lineType: input.lineType, description: input.description,
         catalogItemId: input.catalogItemId ?? null, unitPrice,
-        manualQuantity: input.lineType === 'manual' ? (input.manualQuantity ?? '0') : null,
+        manualQuantity: input.lineType === 'manual' ? input.manualQuantity! : null,
         siteId: site?.id ?? null,
         siteName: site?.name ?? null,
         // #3205: roles only on per_device_role (CHECK-enforced); the validator
@@ -1624,12 +1796,22 @@ export async function addContractLineToContract(contractId: string, input: Contr
         deviceGroupId: group?.id ?? null,
         deviceGroupName: group?.name ?? null,
         ...allowance,
+        ...blockColumns,
         taxable, sortOrder: input.sortOrder ?? 0
       }).returning();
       return { ...row!, contractName: c.name };
     } catch (err) {
       if (isGroupFkViolation(err)) {
         throw new ContractServiceError('Device group does not belong to this organization', 400, 'GROUP_NOT_IN_ORG');
+      }
+      // The live-block index is the ONLY race-proof guard (two concurrent adds on
+      // two contracts both pass any read-then-insert check). Open Decision 13 (A):
+      // a draft contract's block counts too — the copy says retire the current one first.
+      if (isPgUniqueViolation(err, HOUR_BLOCK_LIVE_INDEX)) {
+        throw new ContractServiceError(
+          'This organization already has an active block-hours line. Retire it first, then add the new one.',
+          409, 'HOUR_BLOCK_EXISTS',
+        );
       }
       throw err;
     }
@@ -1651,6 +1833,12 @@ export async function addContractLineToContract(contractId: string, input: Contr
  * invoice lines carry their own copies of description, quantity, unit price and
  * taxable (invoiceService.ts:405-450), and nothing re-reads a contract line's
  * CONTENT after generation.
+ *
+ * EXCEPTION (#4547, Open Decision 15): on an `hour_block` line `includedQuantity`,
+ * `overageUnitPrice`, `rolloverPolicy` and `rolloverCapHours` are read by the close
+ * (W02) at close time, so an edit applies to the open period when it closes; closed
+ * periods are frozen in `contract_hour_periods`. The audit records before/after
+ * (`blockChanges`).
  */
 export async function updateContractLine(
   contractId: string, lineId: string, patch: UpdateContractLineInput, actor: ContractActor,
@@ -1663,6 +1851,7 @@ export async function updateContractLine(
     const [current] = await tx.select().from(contractLines)
       .where(and(eq(contractLines.id, lineId), eq(contractLines.contractId, contractId))).limit(1);
     if (!current) throw new ContractServiceError('Contract line not found', 404, 'LINE_NOT_FOUND');
+    if (current.lineType === 'hour_block') assertBlockPatchAllowed(current, patch);
 
     // ---- catalog transition table (spec § Validators (d)) ------------------
     const touchesLink = patchHasKey(patch, 'catalogItemId');
@@ -1763,6 +1952,11 @@ export async function updateContractLine(
         includedQuantity: merged.includedQuantity,
         overageMode: merged.overageMode,
         overageUnitPrice: merged.overageUnitPrice,
+        // #4547 W03: NULL on every non-block line (the merge carries current values,
+        // and the invariants above reject a block field on another type).
+        rolloverPolicy: (merged.rolloverPolicy ?? null) as RolloverPolicy | null,
+        rolloverCapHours: merged.rolloverCapHours ?? null,
+        hourBlockAlertPct: merged.hourBlockAlertPct ?? null,
       }).where(and(eq(contractLines.id, lineId), eq(contractLines.contractId, contractId))).returning();
       if (!row) throw new ContractServiceError('Contract line not found', 404, 'LINE_NOT_FOUND');
       updated = row;
@@ -1793,17 +1987,33 @@ export async function removeContractLine(
     // lineType, and so a miss is a typed 404 rather than a silent 200 (the
     // pre-W03 behaviour deleted by (id, contract_id) and never checked whether
     // a row matched). Its permissiveness is exactly what would make the audit lie.
-    const [row] = await tx.select({ id: contractLines.id, lineType: contractLines.lineType })
-      .from(contractLines)
+    const [row] = await tx.select({
+      id: contractLines.id, lineType: contractLines.lineType,
+      hourBlockFirstPeriodStart: contractLines.hourBlockFirstPeriodStart,
+      hourBlockRetiredAt: contractLines.hourBlockRetiredAt,
+    }).from(contractLines)
       .where(and(eq(contractLines.id, lineId), eq(contractLines.contractId, contractId))).limit(1);
     if (!row) throw new ContractServiceError('Contract line not found', 404, 'LINE_NOT_FOUND');
+    const audit = { orgId: c.orgId, contractId, contractName: c.name, contractLineId: row.id, lineType: row.lineType };
+    if (row.lineType === 'hour_block') {
+      // Already retired: idempotent, and retired_at must not move (W02 entitles claims
+      // with generated_at <= retired_at).
+      if (row.hourBlockRetiredAt !== null) return { ...audit, retired: true };
+      // Index C7: history => retire (never delete: the ledger FK is ON DELETE RESTRICT and a
+      // claimed-but-unclosed period must still close via W02's sweep); else delete.
+      if (await hourBlockHasHistory(tx, { id: row.id, contractId, hourBlockFirstPeriodStart: row.hourBlockFirstPeriodStart })) {
+        // clock_timestamp(), same as retireLiveHourBlocks: now() is the transaction START and
+        // would predate a claim committed while this request waited on the contract lock.
+        await tx.update(contractLines).set({ hourBlockRetiredAt: sql`clock_timestamp()` })
+          .where(and(eq(contractLines.id, lineId), eq(contractLines.contractId, contractId)));
+        return { ...audit, retired: true };
+      }
+      await tx.delete(contractLines).where(and(eq(contractLines.id, lineId), eq(contractLines.contractId, contractId)));
+      return { ...audit, retired: false };
+    }
     await tx.delete(contractLines).where(and(eq(contractLines.id, lineId), eq(contractLines.contractId, contractId)));
-    return { orgId: c.orgId, contractId, contractName: c.name, contractLineId: row.id, lineType: row.lineType };
+    return audit;
   });
-}
-
-function todayISO(asOf: Date = new Date()): string {
-  return asOf.toISOString().slice(0, 10);
 }
 
 export async function activateContract(contractId: string, actor: ContractActor, asOf: Date = new Date()) {
@@ -1817,16 +2027,51 @@ export async function activateContract(contractId: string, actor: ContractActor,
       throw new ContractServiceError('Only draft/paused contracts can be activated', 409, 'INVALID_STATE');
     }
     // Count lines via a lightweight id-only select (simple + explicit).
-    const lineRows = await tx.select({ id: contractLines.id }).from(contractLines)
+    const lineRows = await tx.select({ id: contractLines.id, lineType: contractLines.lineType }).from(contractLines)
       .where(eq(contractLines.contractId, contractId));
     if (lineRows.length === 0) {
       throw new ContractServiceError('Contract needs at least one line', 409, 'NO_LINES');
     }
-    const idx = periodIndexFor(c.startDate, c.intervalMonths, todayISO(asOf));
-    const nextAt = nextBillingDate({ startDate: c.startDate, intervalMonths: c.intervalMonths, billingTiming: c.billingTiming as 'advance' | 'arrears', periodIndex: idx });
+    // A draft has claimed nothing. A paused contract re-activated here is a resume
+    // and must skip the periods it already billed (#9509), exactly like resumeContract.
+    const nextAt = c.status === 'paused'
+      ? await resumedBillingPointer(tx, c, todayISO(asOf))
+      : nextBillingDate({
+        startDate: c.startDate, intervalMonths: c.intervalMonths, billingTiming: c.billingTiming as 'advance' | 'arrears',
+        periodIndex: periodIndexFor(c.startDate, c.intervalMonths, todayISO(asOf)),
+      });
+    // #4547 W03 (index C9): entitlement starts where the fee starts. A draft's block was stamped
+    // provisionally at add time (its first period); the period activation will actually claim is
+    // duePeriodStartFor over the pointer set below. DRAFTS ONLY: a paused->active resume has
+    // already-claimed periods behind it, and moving first_period_start forward would strand them.
+    if (c.status === 'draft' && lineRows.some((l) => l.lineType === 'hour_block')) {
+      await tx.update(contractLines)
+        .set({
+          // a draft has claimed nothing, so the pure candidate is already the first unclaimed period
+          hourBlockFirstPeriodStart: firstUnclaimedPeriodStart({
+            status: 'active', startDate: c.startDate, intervalMonths: c.intervalMonths,
+            billingTiming: c.billingTiming as 'advance' | 'arrears', nextBillingAt: nextAt,
+          })!,
+        })
+        .where(and(
+          eq(contractLines.contractId, contractId),
+          eq(contractLines.lineType, 'hour_block'),
+          isNull(contractLines.hourBlockRetiredAt),
+        ));
+    }
     const [row] = await tx.update(contracts)
       .set({ status: 'active', nextBillingAt: nextAt, updatedAt: asOf })
       .where(eq(contracts.id, contractId)).returning();
+    // #9309: the sweep skipped this contract's deliverables while it was a draft.
+    // Re-base the ones with no occurrence yet onto the real start — or onto today
+    // when that start already passed, so a re-based deliverable is not born
+    // overdue or missed (rebaseUnmaterializedDeliverables says which it moves).
+    // DRAFTS ONLY: resume (paused -> active) also emits contract.activated, and
+    // a live contract's deliverables keep the schedule they were given.
+    if (c.status === 'draft') {
+      const today = todayISO(asOf);
+      await rebaseUnmaterializedDeliverables(contractId, c.orgId, { from: c.startDate, to: c.startDate > today ? c.startDate : today }, tx);
+    }
     return { row: row!, c };
   });
   await emitContractEvent({ type: 'contract.activated', contractId, orgId: c.orgId, partnerId: c.partnerId, actorUserId: actor.userId ?? undefined });
@@ -1847,27 +2092,36 @@ export async function pauseContract(contractId: string, actor: ContractActor) {
 }
 
 export async function resumeContract(contractId: string, actor: ContractActor, asOfISO: string = todayISO()) {
-  const c = await getOwnedContractOr404(contractId, actor);
-  await requireWholeContractSiteAccess(actor, contractId);
-  if (c.status !== 'paused') {
-    throw new ContractServiceError('Only paused contracts can be resumed', 409, 'INVALID_STATE');
-  }
-  const idx = periodIndexFor(c.startDate, c.intervalMonths, asOfISO);
-  const nextAt = nextBillingDate({ startDate: c.startDate, intervalMonths: c.intervalMonths, billingTiming: c.billingTiming as 'advance' | 'arrears', periodIndex: idx });
-  const [row] = await db.update(contracts)
-    .set({ status: 'active', nextBillingAt: nextAt, updatedAt: new Date() })
-    .where(eq(contracts.id, contractId)).returning();
+  // Contract row lock first, so the ledger read and the pointer write cannot
+  // interleave with a billing run or another lifecycle write.
+  const { row, c } = await db.transaction(async (tx) => {
+    const c = await lockContract(tx, contractId, actor);
+    await requireWholeContractSiteAccess(actor, contractId, tx);
+    if (c.status !== 'paused') {
+      throw new ContractServiceError('Only paused contracts can be resumed', 409, 'INVALID_STATE');
+    }
+    const nextAt = await resumedBillingPointer(tx, c, asOfISO);
+    const [row] = await tx.update(contracts)
+      .set({ status: 'active', nextBillingAt: nextAt, updatedAt: new Date() })
+      .where(eq(contracts.id, contractId)).returning();
+    return { row: row!, c };
+  });
   await emitContractEvent({ type: 'contract.activated', contractId, orgId: c.orgId, partnerId: c.partnerId, actorUserId: actor.userId ?? undefined });
-  return row!;
+  return row;
 }
 
 export async function cancelContract(contractId: string, actor: ContractActor) {
   const c = await getOwnedContractOr404(contractId, actor);
   await requireWholeContractSiteAccess(actor, contractId);
   if (c.status === 'cancelled') return c;
+  // #8181: lock BEFORE retiring the block line. A billing run that claims a
+  // period while this request is in flight must commit first, so its claim's
+  // generated_at precedes the retirement instant below.
+  await lockContractRow(db, contractId);
   const [row] = await db.update(contracts)
     .set({ status: 'cancelled', nextBillingAt: null, updatedAt: new Date() })
     .where(eq(contracts.id, contractId)).returning();
+  await retireLiveHourBlocks(contractId);
   await emitContractEvent({ type: 'contract.cancelled', contractId, orgId: c.orgId, partnerId: c.partnerId, actorUserId: actor.userId ?? undefined });
   return row!;
 }
@@ -1934,7 +2188,9 @@ function chunksOf<T>(items: readonly T[], size: number): T[][] {
 export interface GenerateResult {
   generated: boolean;
   invoiceId?: string;
-  skipped?: 'already_billed' | 'expired' | 'not_due';
+  /** `renewal_pending` (#9243): an auto-renew contract's due period is past end_date and
+   *  the renewal sweep has not extended it yet; nothing was billed or expired. */
+  skipped?: 'already_billed' | 'expired' | 'not_due' | 'renewal_pending';
   /** True only when the contract opts into auto-issue AND an invoice was generated. */
   autoIssue: boolean;
   /** The InvoiceActor the caller needs to finish issue+send post-commit. Present only when generated. */
@@ -1950,6 +2206,38 @@ export interface GenerateResult {
    *  `mode: 'flag'` entries were NOT invoiced — the worker warns and the
    *  generate UI toasts on exactly those. */
   overages: OverageSummary[];
+  /** Block-hour periods closed on this run (#8181). Always present (`[]`). Never
+   *  folded into `overages`, whose counts are whole devices/seats. */
+  hourBlockCloses: HourBlockCloseSummary[];
+  /** True when a block line's close backlog hit HOUR_BLOCK_CLOSE_CAP this run. */
+  hourBlockCloseTruncated: boolean;
+}
+
+/** Every non-generating GenerateResult carries the block-hours fields too. */
+const NO_HOUR_BLOCK_CLOSES = { hourBlockCloses: [], hourBlockCloseTruncated: false } as const satisfies
+  Pick<GenerateResult, 'hourBlockCloses' | 'hourBlockCloseTruncated'>;
+
+/** The block FEE bills like flat: no allowance reaches the device materializer. */
+const NO_ALLOWANCE = { includedQuantity: null, overageMode: null, overageUnitPrice: null } as const;
+
+/**
+ * Expire/cancel end the block (#8181, plan-time amendment 5): stamp the live
+ * line retired so the one-live-block-per-org index frees for a successor.
+ * Pre-retirement claimed periods still close via runHourBlockCloseOutSweep —
+ * entitlement is generated_at <= retired_at. CALLER MUST HOLD THE CONTRACT ROW
+ * LOCK. clock_timestamp(), not now(): now() is the transaction START, which for
+ * a request that waited on the lock predates a claim committed while it waited.
+ * After the lock, clock_timestamp() is >= every committed claim's generated_at
+ * (DEFAULT now(), the claiming transaction's start) — including a final period
+ * claimed earlier in this same transaction. Never pass asOf here.
+ */
+async function retireLiveHourBlocks(contractId: string): Promise<void> {
+  await db.update(contractLines).set({ hourBlockRetiredAt: sql`clock_timestamp()` })
+    .where(and(
+      eq(contractLines.contractId, contractId),
+      eq(contractLines.lineType, 'hour_block'),
+      isNull(contractLines.hourBlockRetiredAt),
+    ));
 }
 
 /**
@@ -2009,22 +2297,38 @@ export async function generateDueInvoice(contractId: string, asOf: Date = new Da
   // plain string but drizzle types it as the narrow union; `as never` keeps tsc happy
   // while the runtime check stays a simple string compare (mirrors listContracts).
   if ((c.status as never) !== ('active' as never) || c.nextBillingAt === null) {
-    return { generated: false, autoIssue: false, skipped: 'not_due', priceBookGaps: [], uncoveredDevices: null, overages: [] };
+    return { generated: false, autoIssue: false, skipped: 'not_due', priceBookGaps: [], uncoveredDevices: null, overages: [], ...NO_HOUR_BLOCK_CLOSES };
   }
-  if (c.nextBillingAt > todayISO(asOf)) return { generated: false, autoIssue: false, skipped: 'not_due', priceBookGaps: [], uncoveredDevices: null, overages: [] };
+  if (c.nextBillingAt > todayISO(asOf)) return { generated: false, autoIssue: false, skipped: 'not_due', priceBookGaps: [], uncoveredDevices: null, overages: [], ...NO_HOUR_BLOCK_CLOSES };
 
   // Which period does this billing run cover?
   // advance: the period whose START == nextBillingAt.
   // arrears: the just-completed period (whose END == nextBillingAt) → one index back.
-  const idxAt = periodIndexFor(c.startDate, c.intervalMonths, c.nextBillingAt);
-  const idx = Math.max(0, c.billingTiming === 'advance' ? idxAt : idxAt - 1);
-  const period = computePeriod(c.startDate, c.intervalMonths, idx);
+  const { idx: periodIdx, due: period, next: nextPeriod } = billingRunPeriods({
+    startDate: c.startDate, intervalMonths: c.intervalMonths,
+    billingTiming: c.billingTiming as 'advance' | 'arrears', nextBillingAt: c.nextBillingAt,
+  });
+  const autoRenewing = isAutoRenewing(c);
 
   // Expiry at due-check: if this period starts on/after the end date, expire (do not bill).
   if (isExpired({ endDate: c.endDate, periodStart: period.periodStart })) {
+    // #9243: billing never expires an auto-renewing contract; the renewal sweep
+    // owns that term and extends it on end_date. Reaching here means the sweep
+    // has not renewed it yet. Either the manual /generate route ran first on the
+    // renewal day, or the daily sweep missed it. Defer with no writes: nothing is
+    // billed past the term and nothing is expired. The next daily job renews it
+    // and then bills this period.
+    if (autoRenewing) {
+      console.warn(
+        '[contract-billing] renewal pending: auto-renew contract %s reached billing past end_date %s before the renewal sweep extended it; deferring (not billed, not expired)',
+        contractId, c.endDate,
+      );
+      return { generated: false, autoIssue: false, skipped: 'renewal_pending', priceBookGaps: [], uncoveredDevices: null, overages: [], ...NO_HOUR_BLOCK_CLOSES };
+    }
     await db.update(contracts).set({ status: 'expired', nextBillingAt: null, updatedAt: asOf }).where(eq(contracts.id, contractId));
+    await retireLiveHourBlocks(contractId);
     await emitContractEvent({ type: 'contract.expired', contractId, orgId: c.orgId, partnerId: c.partnerId });
-    return { generated: false, autoIssue: false, skipped: 'expired', priceBookGaps: [], uncoveredDevices: null, overages: [] };
+    return { generated: false, autoIssue: false, skipped: 'expired', priceBookGaps: [], uncoveredDevices: null, overages: [], ...NO_HOUR_BLOCK_CLOSES };
   }
 
   // Build an InvoiceActor for the contract. createdBy is nullable on system-seeded /
@@ -2038,11 +2342,15 @@ export async function generateDueInvoice(contractId: string, asOf: Date = new Da
     .where(eq(contractLines.contractId, contractId))
     .orderBy(contractLines.sortOrder, contractLines.createdAt, contractLines.id);
 
+  // #8181: a RETIRED block line bills no fee (its pre-retirement periods close
+  // via the close-out sweep). `lines` stays whole for the structural checks below.
+  const billable = lines.filter((l) => !(l.lineType === 'hour_block' && l.hourBlockRetiredAt !== null));
+
   // Never bill an empty (zero-line) contract: don't create/claim/issue a $0 invoice.
   // This generation-side guard remains the backstop for an active contract whose
   // final line was removed before the billing run.
-  if (lines.length === 0) {
-    return { generated: false, autoIssue: false, skipped: 'not_due', priceBookGaps: [], uncoveredDevices: null, overages: [] };
+  if (billable.length === 0) {
+    return { generated: false, autoIssue: false, skipped: 'not_due', priceBookGaps: [], uncoveredDevices: null, overages: [], ...NO_HOUR_BLOCK_CLOSES };
   }
 
   // #4693: refusing before invoice creation makes the whole run a no-write
@@ -2053,6 +2361,15 @@ export async function generateDueInvoice(contractId: string, asOf: Date = new Da
       throw new ContractServiceError(
         `contract line ${l.id} is scoped to site "${l.siteName}", which no longer exists`,
         409, 'SITE_DELETED', { contractLineId: l.id, siteName: l.siteName },
+      );
+    }
+    // #9664: a manual line with no quantity must never bill as 0 (a silent $0
+    // line). contract_lines_manual_quantity_chk forbids it for new writes; a
+    // row that predates the CHECK (NOT VALID) is refused here, before any write.
+    if (l.lineType === 'manual' && l.manualQuantity === null) {
+      throw new ContractServiceError(
+        `Contract line "${l.description}" is a manual line with no quantity`,
+        409, 'MANUAL_QUANTITY_MISSING', { contractLineId: l.id },
       );
     }
   }
@@ -2070,14 +2387,15 @@ export async function generateDueInvoice(contractId: string, asOf: Date = new Da
     }
   }
 
-  // 1. Draft invoice. Carry contract notes + terms onto the invoice notes
-  //    (the engine has no terms param on create).
-  const noteParts = [c.notes, c.terms].filter(Boolean) as string[];
+  // 1. Draft invoice. The contract's Invoice note (`terms`) becomes the invoice
+  //    notes. Contract `notes` are internal-only and never printed (#9347);
+  //    2027-01-02-100900 copied pre-existing notes into `terms` so old
+  //    contracts keep printing the same text.
   // B2: the invoice copies the CONTRACT's stamped currency (spec §5 snapshots
   // rule) — never the org's current setting, which may have changed since the
   // contract was created.
   const inv = await createManualInvoice(
-    { orgId: c.orgId, notes: noteParts.length ? noteParts.join('\n\n') : undefined, currencyCode: c.currencyCode },
+    { orgId: c.orgId, notes: c.terms || undefined, currencyCode: c.currencyCode },
     actor
   );
 
@@ -2088,7 +2406,7 @@ export async function generateDueInvoice(contractId: string, asOf: Date = new Da
   const priceBookGaps: PriceBookGap[] = [];
   const overages: OverageSummary[] = [];
   const pendingEvidence: PendingEvidence[] = [];
-  for (const l of lines) {
+  for (const l of billable) {
     let quantity: string;
     // The ONE device source for this line. `quantity` IS its length, so there is
     // no second walk to disagree with. W06's parity test pins quantityFor to the
@@ -2099,7 +2417,8 @@ export async function generateDueInvoice(contractId: string, asOf: Date = new Da
         quantity = '1';
         break;
       case 'manual':
-        quantity = l.manualQuantity ?? '0';
+        // Non-null: refused above (#9664).
+        quantity = l.manualQuantity!;
         break;
       case 'per_device':
       case 'per_device_role':
@@ -2111,6 +2430,13 @@ export async function generateDueInvoice(contractId: string, asOf: Date = new Da
       case 'per_seat':
         quantity = String(await countContractSeats(c.orgId));
         break;
+      case 'hour_block':
+        // The block FEE bills like flat (qty 1, unit_price = the whole block).
+        // Hours settle in closeHourBlockPeriods after the claim below; the
+        // allowance columns are deliberately NOT passed to applyAllowance, or
+        // the materializer would treat included hours as a unit allowance.
+        quantity = '1';
+        break;
       default: {
         // Exhaustiveness: adding a 5th line type becomes a compile error here
         // (instead of silently billing qty 1).
@@ -2120,7 +2446,9 @@ export async function generateDueInvoice(contractId: string, asOf: Date = new Da
     }
 
     // The ONE definition of the split, shared with resolveLineQty.
-    const r = applyAllowance(Number(quantity), l, 'included_units');
+    const r = l.lineType === 'hour_block'
+      ? applyAllowance(1, NO_ALLOWANCE, 'single_block')
+      : applyAllowance(Number(quantity), l, 'included_units');
     // The materializer owns the base quantity, including allowance formatting.
 
     const materialized = await materializeContractLineOntoInvoice(actor, {
@@ -2152,7 +2480,28 @@ export async function generateDueInvoice(contractId: string, asOf: Date = new Da
 
   if (claimed.length === 0) {
     await deleteDraftInvoice(inv.id, actor); // still a draft here — safe to remove
-    return { generated: false, autoIssue: false, skipped: 'already_billed', priceBookGaps: [], uncoveredDevices: null, overages: [] };
+    // #9509: never leave the pointer on a claimed period. Returning without moving
+    // it made every later run land here again, so the contract stopped billing for
+    // good. Move it past the latest claim (one jump, at least one period forward,
+    // idempotent under the contract lock). Expiry of the period it now points at is
+    // decided by the next run's due-check, like any other pointer.
+    const healedAt = pointerPastClaimed({
+      startDate: c.startDate, intervalMonths: c.intervalMonths, billingTiming: c.billingTiming as 'advance' | 'arrears',
+      candidateIdx: periodIdx + 1,
+      latestClaimedStart: await latestClaimedPeriodStart(db, contractId),
+    });
+    const healed = await db.update(contracts).set({ nextBillingAt: healedAt, updatedAt: asOf })
+      .where(eq(contracts.id, contractId)).returning({ id: contracts.id });
+    if (healed.length === 0) {
+      // The row is locked above, so 0 rows means a missing RLS scope. Fail loudly
+      // instead of reporting a move that never happened and staying stuck.
+      throw new ContractServiceError(`contract ${contractId} billing pointer could not be moved past claimed period ${period.periodStart}`, 500, 'INVALID_STATE');
+    }
+    console.warn(
+      '[contract-billing] already billed: contract %s period %s was already claimed; moved next_billing_at %s -> %s',
+      contractId, period.periodStart, c.nextBillingAt, healedAt,
+    );
+    return { generated: false, autoIssue: false, skipped: 'already_billed', priceBookGaps: [], uncoveredDevices: null, overages: [], ...NO_HOUR_BLOCK_CLOSES };
   }
 
   // 3b. Billing evidence (#3205 W07). The period id does not exist until the
@@ -2160,6 +2509,22 @@ export async function generateDueInvoice(contractId: string, asOf: Date = new Da
   //     written before this point. Everything here shares the caller-supplied
   //     transaction with the draft, lines and claim.
   const periodId = claimed[0]!.id;
+
+  // 3a. Block hours (#8181): close every closable claimed period of each LIVE
+  //     block line onto this run's own draft. Same transaction as the claim, so
+  //     a failure rolls back fee, claim and drawdown together. Runs after the
+  //     claim so a period claimed on THIS run is visible to the selector.
+  const hourBlockCloses: HourBlockCloseSummary[] = [];
+  let hourBlockCloseTruncated = false;
+  const blockLines = billable.filter((l) => l.lineType === 'hour_block');
+  // #8972 W0: every close's tickets in one ascending batch, after the contract
+  // row this transaction locked first (lockHourBlockSourceTickets).
+  if (blockLines.length > 0) await lockHourBlockSourceTickets(c, blockLines, asOf);
+  for (const l of blockLines) {
+    const hb = await closeHourBlockPeriods({ contract: c, line: l, overageInvoice: { id: inv.id, actor }, closeSource: 'billing_run', asOf });
+    hourBlockCloses.push(...hb.closes);
+    hourBlockCloseTruncated ||= hb.truncated;
+  }
   for (const chunk of chunksOf(pendingEvidence, EVIDENCE_INSERT_CHUNK)) {
     await db.insert(invoiceLineDevices).values(
       chunk.map((p) => ({ ...p, invoiceId: inv.id, orgId: c.orgId })),
@@ -2183,13 +2548,27 @@ export async function generateDueInvoice(contractId: string, asOf: Date = new Da
     overages,
   });
 
-  // 4. Advance the pointer to the next period (or expire if the next period is past end_date).
-  const nextIdx = idx + 1;
-  const nextPeriod = computePeriod(c.startDate, c.intervalMonths, nextIdx);
-  if (isExpired({ endDate: c.endDate, periodStart: nextPeriod.periodStart })) {
+  // 4. Advance the pointer to the next period, or expire if the next period is past
+  //    end_date. #9243: an auto-renewing contract is never expired here. Its final
+  //    invoice leaves it active with the pointer at the next period, and the
+  //    renewal sweep extends end_date on end_date (the date the advance notice
+  //    promised) before that period is billed. Expiring here is what stopped
+  //    auto-renew from ever firing: the sweep only looks at active contracts.
+  if (!autoRenewing && isExpired({ endDate: c.endDate, periodStart: nextPeriod.periodStart })) {
     await db.update(contracts).set({ status: 'expired', nextBillingAt: null, updatedAt: asOf }).where(eq(contracts.id, contractId));
+    await retireLiveHourBlocks(contractId);
     await emitContractEvent({ type: 'contract.expired', contractId, orgId: c.orgId, partnerId: c.partnerId });
   } else {
+    // Crossing end_date BEFORE it arrives is the normal final invoice of an
+    // auto-renewing term. Doing it on/after end_date means the renewal sweep
+    // should already have extended the term and did not, so make that visible.
+    // The contract stays active; the next daily sweep renews it.
+    if (autoRenewing && c.endDate !== null && todayISO(asOf) >= c.endDate && isExpired({ endDate: c.endDate, periodStart: nextPeriod.periodStart })) {
+      console.warn(
+        '[contract-billing] renewal overdue: auto-renew contract %s billed past end_date %s without a renewal; left active for the next renewal sweep',
+        contractId, c.endDate,
+      );
+    }
     const nextAt = c.billingTiming === 'advance' ? nextPeriod.periodStart : nextPeriod.periodEnd;
     await db.update(contracts).set({ nextBillingAt: nextAt, updatedAt: asOf }).where(eq(contracts.id, contractId));
   }
@@ -2197,7 +2576,10 @@ export async function generateDueInvoice(contractId: string, asOf: Date = new Da
   await emitContractEvent({ type: 'contract.invoiced', contractId, orgId: c.orgId, partnerId: c.partnerId, invoiceId: inv.id });
   // Auto-issue + email are intentionally returned to the caller (NOT done here) so they
   // run post-commit, outside the billing transaction. See the doc-comment above.
-  return { generated: true, invoiceId: inv.id, autoIssue: c.autoIssue, actor, priceBookGaps, uncoveredDevices, overages };
+  return {
+    generated: true, invoiceId: inv.id, autoIssue: c.autoIssue, actor, priceBookGaps, uncoveredDevices, overages,
+    hourBlockCloses, hourBlockCloseTruncated,
+  };
 }
 
 // INTERNAL (Phase 4): persist a contract + lines built by buildContractSpecsFromQuote.
@@ -2217,6 +2599,11 @@ export interface CreatedContractWithLines {
 export async function createContractWithLinesDetailed(
   spec: NewContractSpec,
 ): Promise<CreatedContractWithLines> {
+  // #4547 W03 (index C7): a quote cannot express a block, and this path inserts
+  // the contract row BEFORE its lines — reject first so no orphan draft remains.
+  if (spec.lines.some((l) => (l.lineType as string) === 'hour_block')) {
+    throw new ContractServiceError('Block-hours lines cannot be created from a quote', 400, 'INVALID_STATE');
+  }
   const [contract] = await db
     .insert(contracts)
     .values({
@@ -2233,6 +2620,7 @@ export async function createContractWithLinesDetailed(
       notes: spec.notes ?? null,
       terms: spec.terms ?? null,
       createdBy: spec.createdBy ?? null,
+      sourceQuoteId: spec.sourceQuoteId ?? null,
     })
     .returning();
 
@@ -2245,7 +2633,8 @@ export async function createContractWithLinesDetailed(
 
   const createdLines: CreatedContractWithLines['lines'] = [];
   for (let i = 0; i < spec.lines.length; i++) {
-    const l = spec.lines[i]! as DeviceSetContractLineSpec;
+    // Narrowed for the shared invariant helpers: blocks were rejected before the insert above.
+    const l = spec.lines[i]! as DeviceSetContractLineSpec & { lineType: ContractLineType };
     const issues = contractLineInvariantIssues(l, { mode: 'create' });
     if (issues.length > 0) {
       throw new ContractServiceError(issues[0]!.message, 400, 'INVALID_STATE', { issues });
@@ -2269,7 +2658,8 @@ export async function createContractWithLinesDetailed(
         description: l.description,
         catalogItemId: l.catalogItemId ?? null,
         unitPrice: l.unitPrice,
-        manualQuantity: l.lineType === 'manual' ? (l.manualQuantity ?? '0') : null,
+        // Non-null on a manual line: contractLineInvariantIssues (create) above rejects it otherwise.
+        manualQuantity: l.lineType === 'manual' ? l.manualQuantity! : null,
         siteId: site?.id ?? null,
         // #4693: acceptance passes the string the customer SIGNED. Prefer it
         // over a fresh read; every other caller falls back to the live name.

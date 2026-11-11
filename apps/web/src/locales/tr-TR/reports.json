@@ -12,6 +12,7 @@
         "low": "Düşük",
         "medium": "Orta"
       },
+      "customRangeIncomplete": "Özel bir aralık uygulamak için bir başlangıç ve bitiş tarihi seçin (önce başlangıç, en fazla 366 gün arayla).",
       "dashboardOptions": {
         "capacity": "Kapasite Planlama",
         "operations": "İşlemlere Genel Bakış",
@@ -31,7 +32,8 @@
       "subtitle": "Filonuz ve hizmetleriniz hakkında bilgiler",
       "title": "Analitik",
       "trend": {
-        "operationalHealth": "Operasyonel sağlık"
+        "operationalHealth": "Operasyonel sağlık",
+        "weekOf": "{{date}} haftası"
       },
       "widgets": {
         "alertTable": {
@@ -40,7 +42,7 @@
           "title": "Uyarı İstatistikleri"
         },
         "capacity": {
-          "title": "Kapasite Tahmini"
+          "title": "Disk kapasitesi tahmini"
         },
         "complianceGauge": {
           "policiesEvaluated": "{{count}} politikaları değerlendirildi",
@@ -61,10 +63,11 @@
           "title": "Uzaktan Oturumlar"
         },
         "uptime": {
-          "label": "Filonun çalışma süresi",
+          "label": "Şu anda çevrimiçi",
           "title": "Çalışma Süresi"
         }
-      }
+      },
+      "dateRangeSelectLabel": "Tarih aralığı"
     },
     "capacityForecast": {
       "actual": "Gerçek",
@@ -103,6 +106,7 @@
     },
     "gaugeWidget": {
       "criticalValue": "Kritik {{value}}",
+      "noData": "Değerlendirilecek uyumluluk denetimi yok",
       "warnValue": "Uyarı {{value}}"
     },
     "queryBuilder": {
@@ -113,7 +117,8 @@
         "p95": "P95",
         "sum": "Toplam"
       },
-      "description": "Gösterge tablonuz için ölçümleri ve toplamayı yapılandırın",
+      "coverageNote": "Sorgular yalnızca ilk {{count}} çevrimiçi cihazı kapsar. Çevrimdışı cihazlar ve daha büyük bir filonun geri kalanı dahil değildir.",
+      "description": "Çevrimiçi cihazlarınızı sorgulamak için bir ölçüm ve toplama seçin",
       "errors": {
         "failedToExecuteQuery": "Sorgu yürütülemedi",
         "noDevicesSelected": "Sorgu için seçili cihaz yok"
@@ -127,28 +132,13 @@
         "timeRange": "Zaman aralığı"
       },
       "metricNames": {
-        "activeDevices": "Aktif Cihazlar",
-        "automationRuns": "Otomasyon Çalıştırmaları",
         "cpuUtilization": "CPU Kullanımı",
         "diskUsage": "Disk Kullanımı",
-        "incidentCount": "Olay Sayımı",
-        "loginVolume": "Giriş Hacmi",
         "memoryUtilization": "Bellek Kullanımı",
-        "mfaAdoption": "MFA'nın Kabulü",
-        "networkThroughput": "Ağ Verimi",
-        "patchCompliance": "Yama Uyumluluğu",
-        "remoteSessions": "Uzaktan Oturumlar",
-        "responseTime": "Yanıt Süresi",
-        "slaCompliance": "SLA Uyumluluk",
-        "threatAlerts": "Tehdit Uyarıları",
-        "uptime": "Çalışma Süresi",
-        "vulnerabilityScore": "Güvenlik Açığı Puanı"
+        "networkThroughput": "Ağ Verimi"
       },
       "metricTypes": {
-        "availability": "Kullanılabilirlik",
-        "performance": "Performans",
-        "security": "Güvenlik",
-        "usage": "Kullanım"
+        "performance": "Performans"
       },
       "runQuery": "Sorguyu Çalıştır",
       "running": "Koşuyor...",
@@ -164,7 +154,16 @@
     "slaComplianceCard": {
       "defaultPeriodLabel": "Son 30 gün",
       "downtime": "Kesinti {{value}}",
+      "exclusions": {
+        "maintenanceApplied": "Bakım pencereleri hariç",
+        "maintenanceSkipped": "Bakım pencereleri hariç tutulmadı: kontrol edilecek cihaz sayısı çok fazla",
+        "maintenanceUnavailable": "Bakım pencereleri hariç tutulmadı: durum kullanılamıyor",
+        "none": "Hariç tutulan yok",
+        "title": "Hariç tutulanlar",
+        "weekends": "Hafta sonları hariç"
+      },
       "incidents": "{{count}} olaylar",
+      "noDevices": "Henüz ölçülen cihaz yok",
       "status": {
         "atRisk": "Risk altında",
         "breach": "İhlal",
@@ -172,6 +171,34 @@
       },
       "targetUptime": "%{{target}} kesintisiz çalışma süresini hedefleyin",
       "title": "SLA Uyumluluk"
+    },
+    "slaEmptyState": {
+      "create": "SLA tanımı oluştur",
+      "created": "SLA tanımı oluşturuldu",
+      "description": "SLA tanımı, bu sekmenin cihazlarınızı ölçtüğü çalışma süresi hedefini belirler. Uyumluluğu izlemeye başlamak için bir tane oluşturun.",
+      "errors": {
+        "create": "SLA tanımı oluşturulamadı"
+      },
+      "form": {
+        "cancel": "İptal",
+        "excludeMaintenance": "Bakım penceresindeki cihazları hariç tut",
+        "excludeWeekends": "Hafta sonlarını hariç tut",
+        "measurementWindow": "Ölçüm aralığı",
+        "name": "Ad",
+        "organization": "Kuruluş",
+        "scopeNote": "Kuruluştaki tüm cihazları ölçer.",
+        "selectOrganization": "Bir kuruluş seçin",
+        "submit": "Oluştur",
+        "uptimeTarget": "Çalışma süresi hedefi (%)",
+        "uptimeTargetInvalid": "0 ile 100 arasında bir değer girin.",
+        "windows": {
+          "daily": "Günlük",
+          "monthly": "Aylık",
+          "weekly": "Haftalık"
+        }
+      },
+      "noPermission": "Bir SLA tanımı oluşturması için kuruluş yönetimi erişimi olan bir yöneticiye başvurun.",
+      "title": "Henüz SLA tanımı yok"
     },
     "tableWidget": {
       "filterPlaceholder": "Filtre",
@@ -224,6 +251,16 @@
       "serverReplaceAgeYears": "Sunucu değişimini planla (yıl sonra)",
       "serverReplaceAgeYearsHelp": "Sunucular kendi zaman çizelgesini izler ve raporun ayrı bir bölümünde listelenir."
     },
+    "backupStatusOptions": {
+      "cancel": "İptal",
+      "createReport": "Rapor oluştur",
+      "includeDevicesWithoutBackup": "Hiç yedeklemesi olmayan cihazları dahil et",
+      "includeDevicesWithoutBackupHelp": "Kapalıyken rapor yalnızca sağlayıcının kendi özet e-postasında olduğu gibi bir miktar yedekleme kanıtı olan cihazları listeler.",
+      "sources": "Yedekleme kaynakları",
+      "sourcesHelp": "Rapora hangi yedekleme kaynaklarının dahil edileceğini seçin.",
+      "sourceBreeze": "Breeze yedeklemesi",
+      "sourceProvider": "Bağlı yedekleme sağlayıcıları"
+    },
     "vulnerabilityManagementOptions": {
       "cancel": "İptal",
       "createReport": "Rapor oluştur",
@@ -252,6 +289,12 @@
     },
     "reportEditPage": {
       "backToReports": "Raporlara Geri Dön",
+      "backupPreview": {
+        "description": "Yukarıdaki seçeneklerle güncel yedekleme anlık görüntüsünü oluşturur. Yalnızca siz istediğinizde çalışır.",
+        "error": "Önizleme oluşturulamadı.",
+        "run": "Önizleme oluştur",
+        "title": "Önizleme"
+      },
       "description": "\"{{name}}\" için yapılandırmayı güncelleyin.",
       "errors": {
         "fetchReport": "Rapor getirilemedi",
@@ -300,6 +343,13 @@
         "replaceNow": "Şimdi değiştir",
         "unknownAge": "Yaş bilinmiyor"
       },
+      "backupStatus": {
+        "healthy": "Sağlıklı",
+        "warning": "Uyarı",
+        "critical": "Kritik",
+        "unknown": "Bilinmiyor",
+        "truncated": "Cihaz listesi satır sınırına ulaştı ve eksik."
+      },
       "vulnerabilityManagement": {
         "critical": "Açık kritik",
         "expiringExceptions": "Sonraki dönemde sona eren istisnalar",
@@ -322,7 +372,16 @@
         "security_compliance_posture": "Güvenlik ve Uyumluluk Duruşu",
         "software_inventory": "Yazılım Envanteri",
         "threat_detection_review": "Tehdit Tespiti İncelemesi",
-        "endpoint_management_review": "Uç Nokta Yönetimi İncelemesi"
+        "endpoint_management_review": "Uç Nokta Yönetimi İncelemesi",
+        "ticket_sla_attainment": "Bilet SLA Başarımı",
+        "technician_time_billability": "Teknisyen Zamanı ve Faturalandırılabilirlik",
+        "ar_aging": "Alacak Yaşlandırması (AR Aging)",
+        "ai_usage_by_client": "Müşteri Bazında Yapay Zekâ Kullanımı",
+        "mrr_renewals": "MRR ve Yenilemeler",
+        "quote_win_rate": "Teklif kazanma oranı",
+        "client_profitability": "Müşteri karlılığı",
+        "ticket_sla_performance": "SLA performansı",
+        "backup_status": "Yedekleme Durumu"
       },
       "threatDetection": {
         "agents": "Tespit aracısı olan uç noktalar",
@@ -351,6 +410,29 @@
         "noncompliant": "Uyumlu değil",
         "notMeasured": "Yok",
         "staleEnrolments": "Eskimiş kayıtlar"
+      },
+      "slaPerformance": {
+        "priority": "Öncelik",
+        "ticketsOpened": "Açılan talepler",
+        "firstResponse": "İlk yanıt",
+        "resolution": "Çözüm",
+        "target": "Hedef",
+        "measured": "Ölçülen",
+        "withinSla": "SLA içinde %",
+        "median": "Medyan",
+        "mean": "Ortalama",
+        "varies": "değişken",
+        "breaches": "İhlaller",
+        "breachCount_one": "{{count}} ihlal",
+        "breachCount_other": "{{count}} ihlal",
+        "unavailable": "Bu çalıştırmanın SLA özeti okunamadı, bu yüzden burada gösterilemiyor. Raporu yeniden oluşturun.",
+        "notes": "Neler ölçülür",
+        "priorities": {
+          "urgent": "Acil",
+          "high": "Yüksek",
+          "normal": "Normal",
+          "low": "Düşük"
+        }
       },
       "identityAccess": {
         "notMeasured": "Yok",
@@ -390,7 +472,7 @@
         "fetchReports": "Raporlar getirilemedi",
         "generateReport": "Rapor oluşturulamadı",
         "generic": "Bir hata oluştu",
-        "noCompletedRun": "Açılacak tamamlanmış anlatı henüz yok"
+        "noCompletedRun": "Açılacak tamamlanmış çalıştırma henüz yok"
       },
       "formats": {
         "csv": "CSV",
@@ -399,6 +481,7 @@
       },
       "loading": "Raporlar yükleniyor...",
       "never": "Hiçbir zaman",
+      "notGeneratedYet": "Henüz oluşturulmadı",
       "success": {
         "generated": "\"{{name}}\" raporu oluşturuldu."
       },
@@ -419,14 +502,24 @@
         "security_compliance_posture": "Güvenlik ve Uyumluluk Duruşu",
         "software_inventory": "Yazılım Envanteri",
         "threat_detection_review": "Tehdit Tespiti İncelemesi",
-        "endpoint_management_review": "Uç Nokta Yönetimi İncelemesi"
+        "endpoint_management_review": "Uç Nokta Yönetimi İncelemesi",
+        "ticket_sla_attainment": "Bilet SLA Başarımı",
+        "technician_time_billability": "Teknisyen Zamanı ve Faturalandırılabilirlik",
+        "ar_aging": "Alacak Yaşlandırması (AR Aging)",
+        "ai_usage_by_client": "Müşteri Bazında Yapay Zekâ Kullanımı",
+        "mrr_renewals": "MRR ve Yenilemeler",
+        "quote_win_rate": "Teklif kazanma oranı",
+        "client_profitability": "Müşteri karlılığı",
+        "ticket_sla_performance": "SLA performansı",
+        "backup_status": "Yedekleme Durumu"
       },
       "runsTable": {
         "actions": "Eylemler",
         "completed": "Tamamlandı",
         "report": "Rapor Et",
         "started": "Başlatıldı",
-        "status": "Durum"
+        "status": "Durum",
+        "organization": "Kuruluş"
       },
       "schedules": {
         "daily": "Günlük",
@@ -446,7 +539,8 @@
         "lastGenerated": "Son Oluşturulan",
         "name": "İsim",
         "schedule": "Program",
-        "type": "Tür"
+        "type": "Tür",
+        "covers": "Kapsam"
       },
       "tabs": {
         "recentRuns": "Son Çalıştırmalar",
@@ -455,7 +549,21 @@
       "templates": "Şablonlar",
       "title": "Raporlar",
       "tryAgain": "Tekrar deneyin",
-      "unknownReport": "Bilinmeyen Rapor"
+      "unknownReport": "Bilinmeyen Rapor",
+      "partnerWideIncomplete": "Tüm kuruluşları kapsayan bazı raporlar yüklenemedi, bu nedenle bu liste eksik olabilir. Tüm raporları görmek için Tüm kuruluşlar görünümüne geçin.",
+      "covers": {
+        "combined": "Tüm kuruluşlar · Birleşik",
+        "unknownOrg": "Bilinmeyen kuruluş",
+        "seriesAll": "Tüm kuruluşlar · {{count}} · Kuruluş başına bir",
+        "seriesSelected_one": "{{count}} kuruluş · Kuruluş başına bir",
+        "seriesSelected_other": "{{count}} kuruluş · Kuruluş başına bir"
+      },
+      "delivery": {
+        "noRecipients": "Alıcı yok",
+        "noRecipientsHint": "Son zamanlanmış çalıştırmada e-posta gönderilecek kimse yoktu. Bu raporu teslim etmek için alıcı ekleyin.",
+        "partial": "Kısmen teslim edildi",
+        "failed": "E-posta gönderilmedi"
+      }
     },
     "reportBuilder": {
       "actions": {
@@ -729,6 +837,7 @@
           "os": "İşletim Sistemi",
           "owner": "Sahip",
           "patch_level": "Yama düzeyi",
+          "product_number": "Ürün Numarası",
           "serial": "Seri",
           "site": "Sitesi",
           "status": "Durum"
@@ -800,7 +909,11 @@
         "updateFailed": "Rapor alıcıları güncellenemedi",
         "convertFailed": "Bu e-posta adresi dönüştürülemedi",
         "mfaRequired": "Bir alıcıyı dönüştürmek için çok faktörlü kimlik doğrulama gerekir. Profilinizde MFA'yı etkinleştirin ve tekrar deneyin.",
-        "loadFailed": "Rapor alıcıları yüklenemedi"
+        "loadFailed": "Rapor alıcıları yüklenemedi",
+        "businessEmailOnly": "İş raporları yalnızca aşağıdaki e-posta adreslerine gönderilir. Kuruluş kişileri eklenemez.",
+        "partnerOwnedEmailOnly": "Bu rapor tüm kuruluşları kapsadığından yalnızca aşağıdaki e-posta adreslerine gönderilir. Kuruluş kişileri eklenemez.",
+        "oneTimeNotEmailed": "Tek seferlik raporlar e-postayla gönderilmez. Bu raporu kişilere göndermek için yinelenen bir zamanlama seçin.",
+        "emailAddresses": "E-posta adresleri"
       },
       "previewTable": {
         "selectFields": "Önizleme tablosunun doldurulacağı alanları seçin."
@@ -834,6 +947,9 @@
         "everyDay": "Her gün"
       },
       "scheduleOptions": {
+        "one_time": {
+          "label": "Tek seferlik"
+        },
         "daily": {
           "label": "Günlük"
         },
@@ -878,6 +994,7 @@
           "title": "Rapor türü"
         }
       },
+      "removeField": "{{field}} alanını kaldır",
       "selectedFields": "Seçilen alanlar",
       "success": {
         "created": "\"{{name}}\" raporu kaydedildi.",
@@ -897,7 +1014,12 @@
         "tuesday": "Salı",
         "wednesday": "Çarşamba"
       },
-      "where": "Nerede"
+      "where": "Nerede",
+      "filterLabels": {
+        "logic": "Filtre mantığı",
+        "field": "Filtre alanı",
+        "operator": "Filtre operatörü"
+      }
     },
     "reportTemplates": {
       "blankConfigurationDescription": "Bir raporu sıfırdan yapılandırın veya boş bir yapılandırmayla başlayın.",
@@ -934,7 +1056,16 @@
         "security_compliance_posture": "Güvenlik ve Uyumluluk Duruşu",
         "software_inventory": "Yazılım Envanteri",
         "threat_detection_review": "Tehdit Tespiti İncelemesi",
-        "endpoint_management_review": "Uç Nokta Yönetimi İncelemesi"
+        "endpoint_management_review": "Uç Nokta Yönetimi İncelemesi",
+        "ticket_sla_attainment": "Bilet SLA Başarımı",
+        "technician_time_billability": "Teknisyen Zamanı ve Faturalandırılabilirlik",
+        "ar_aging": "Alacak Yaşlandırması (AR Aging)",
+        "ai_usage_by_client": "Müşteri Bazında Yapay Zekâ Kullanımı",
+        "mrr_renewals": "MRR ve Yenilemeler",
+        "quote_win_rate": "Teklif kazanma oranı",
+        "client_profitability": "Müşteri karlılığı",
+        "ticket_sla_performance": "SLA performansı",
+        "backup_status": "Yedekleme Durumu"
       },
       "schedules": {
         "daily": "Günlük",
@@ -945,6 +1076,8 @@
       "spec": {
         "cadence": "Ritim",
         "defaultRange": "Varsayılan aralık",
+        "lastFullMonth": "Son tam ay",
+        "asOfRunDate": "Çalıştırma tarihi itibarıyla",
         "format": "Biçimi"
       },
       "success": {
@@ -988,11 +1121,59 @@
         "endpoint_management_review": {
           "description": "Microsoft Intune kanıtı: kayıt kapsamı, 30 günlük eğilimle uyumluluk dağılımı, eskimiş kayıtlar ve lisans koltukları; her eşitlemenin güncelliği belirtilir.",
           "name": "Intune Uç Nokta Yönetimi İncelemesi"
+        },
+        "ticket_sla_attainment": {
+          "name": "Bilet SLA Başarımı",
+          "description": "Dönem için yanıt ve çözüm başarımı, ihlal damgalarından okunmak yerine bilet zaman damgalarından yeniden hesaplanır — böylece geç ama sonunda yanıtlanan bir bilet yine de kaçırılmış sayılır. Kuruma, önceliğe, teknisyene veya kategoriye göre gruplandırılır."
+        },
+        "technician_time_billability": {
+          "name": "Teknisyen Zamanı ve Faturalandırılabilirlik",
+          "description": "Varsayılan haftalık kapasiteye karşı kaydedilen zaman, faturalandırılabilir / dahil / faturalandırılamaz ayrımı ve faturalandırılabilir zamanın ne kadarının fiilen onaylandığı ve faturalandırıldığı. Dönemde kaydı olmayan teknisyenler atılmak yerine sıfır olarak listelenir."
+        },
+        "ar_aging": {
+          "name": "Alacak Yaşlandırması (AR Aging)",
+          "description": "Ödenmemiş fatura bakiyeleri güncel / 1–30 / 31–60 / 61–90 / 90+ gün gecikmiş olarak gruplandırılır, para birimi başına dönüşüm yapılmadan tek bir toplam kullanılır. Vade tarihi olmayan faturalar kendi grubunu alır, asla “güncel” sayılmaz."
+        },
+        "ai_usage_by_client": {
+          "name": "Müşteri Bazında Yapay Zekâ Kullanımı",
+          "description": "Dönem için müşteri başına platform yapay zekâ kullanımı: istek sayısı, token, Breeze maliyeti, müşterinin faturalandırma profiline göre tahsil edilecek tutar ve halihazırda faturalanan kısım. Kapsama dahil kullanım ve fiyatı olmayan modeller ayrı gösterilir, asla karıştırılmaz."
+        },
+        "mrr_renewals": {
+          "name": "MRR ve Yenilemeler",
+          "description": "Aktif sözleşmelerden aylık ve yıllık yinelenen gelir; rapor çalıştırıldığı gün ölçülür. Seçilen ufuk içinde yenilenen sözleşmeler ve yinelenen olarak gerçekten faturalanan tutar da yer alır. Para birimi başına bir toplam kümesi, dönüştürme yapılmaz."
+        },
+        "quote_win_rate": {
+          "name": "Teklif kazanma oranı",
+          "description": "Gönderilen tekliflerin ne kadarının kazanıldığı; fırsat başına sayılır, bu yüzden revize edilip yeniden gönderilen bir teklif yalnızca bir kez sayılır. Ana oran yalnızca sonuçlanmış fırsatları kapsar, yanında hâlâ açık olanların sayısı gösterilir. Değerler vergiden önceki tutarlardır, para birimi başına bir küme halindedir ve dönüştürülmez."
+        },
+        "ticket_sla_performance": {
+          "name": "SLA performansı",
+          "description": "Müşteriye hazır, önceliğe göre SLA karşısında yanıt ve çözüm süreleri ile ihlaller."
+        },
+        "client_profitability": {
+          "name": "Müşteri karlılığı",
+          "description": "Dönem için müşteri başına faturalanan gelir; kaynağa göre (yinelenen, iş gücü, ürünler, yapay zekâ, diğer), bunlara karşılık kaydedilen saatler ve tek bir ortak saatlik ücretten isteğe bağlı iş gücü maliyeti tahmini ile. Bu ücreti kullanan rakamlar tahmin olarak etiketlenir. Para birimi başına bir toplam kümesi, asla dönüştürülmez."
+        },
+        "backup_status": {
+          "name": "Yedekleme Durumu Raporu",
+          "description": "Breeze ve bağlı yedekleme sağlayıcıları genelinde her cihazın yedekleme durumu tek bir anlık görüntüde: kapsam kategorileri, son başarılı yedekleme ve cihaz başına 28 günlük geçmiş."
         }
       },
       "title": "Rapor Şablonları",
       "useTemplate": "Şablonu kullan",
-      "useTemplateTitle": "{{name}} kullanın"
+      "useTemplateTitle": "{{name}} kullanın",
+      "groups": {
+        "business": "İş",
+        "general": "Genel",
+        "businessDescription": "Müşteri cihazlarına değil, MSP'nin kendi işine ait rakamlar — yalnızca personel için."
+      },
+      "delivery": {
+        "contactsLoading": "Kuruluş kişileri yükleniyor…",
+        "contactsFailed": "Bu kuruluşun kişileri yüklenemedi. Yine de e-posta adresi ekleyebilirsiniz.",
+        "noContacts": "Bu kuruluşun e-posta adresi olan kişisi yok.",
+        "removeEmail": "{{email}} adresini kaldır",
+        "recipientsFailed": "\"{{name}}\" raporu oluşturuldu, ancak alıcılarının tümü eklenemedi. Bunları rapordan ekleyin."
+      }
     },
     "threatDetectionOptions": {
       "cancel": "İptal",
@@ -1024,6 +1205,388 @@
       "adminDetail": "Yönetici oturum açma ayrıntısını dahil et",
       "adminDetailHelp": "Yönetici rolü taşıyan bir hesabın her etkileşimli oturum açmasını, geldiği adres dahil listeler. Denetçinin ilk okuduğu bölüm budur.",
       "coverageNote": "Rapor yalnızca etkileşimli oturum açmaları kapsar ve gerçekte kapsadığı aralığı yazar. Microsoft oturum açma günlüklerini yaklaşık 30 gün saklar ve bunları vermek için Entra ID P1 veya P2 lisansı ister; bu nedenle toplama açıldıktan sonraki ilk rapor eksiktir ve bunu açıkça belirtir."
+    },
+    "reportPeriod": {
+      "label": "Rapor dönemi",
+      "kinds": {
+        "last_full_month": "Son tam ay",
+        "last_30_days": "Son 30 gün",
+        "last_quarter": "Son tam çeyrek",
+        "custom": "Özel tarihler"
+      },
+      "start": "Başlangıç tarihi",
+      "end": "Bitiş tarihi (dahil)",
+      "help": "Hazır dönemler rapor her çalıştığında yeniden hesaplanır; bu nedenle aylık bir zamanlama her zaman yeni biten ayı kapsar.",
+      "errors": {
+        "missing": "Hem başlangıç hem de bitiş tarihi seçin.",
+        "invalid": "Her iki tarih de gerçek takvim tarihleri olmalıdır.",
+        "order": "Başlangıç tarihi bitiş tarihinden sonra olamaz."
+      }
+    },
+    "ticketSlaOptions": {
+      "approximationNote": "Uyum, ihlal işaretlerinden okunmak yerine talep zaman damgalarından yeniden hesaplanır; bu nedenle geç yanıtlanan bir talep yine ihlal sayılır. Duraklatma süresi toplam olarak saklanır, bu yüzden ilk yanıttan sonraki duraklamalar yanıt uyumunu biraz olduğundan iyi gösterir.",
+      "groupBy": "Gruplama ölçütü",
+      "groupByAutomatic": "Otomatik: tüm kuruluşlar için kuruluşa, tek bir kuruluş için önceliğe göre",
+      "groupByValues": {
+        "organization": "Kuruluş",
+        "priority": "Öncelik",
+        "technician": "Teknisyen (mevcut atanan)",
+        "category": "Kategori"
+      },
+      "technicianNote": "Talepler mevcut atanan kişiye göre gruplanır. Yeniden atama geçmişi tutulmaz; bu nedenle yanıt veren teknisyen olmayabilir.",
+      "includeNoSla": "SLA hedefi olmayan talepleri listele",
+      "includeNoSlaHelp": "SLA hedefi olmayan talepler her zaman ayrı sayılır ve uyumu asla etkilemez. Bu seçenek yalnızca ayrıntı satırlarında görünüp görünmeyeceklerini belirler.",
+      "cancel": "İptal",
+      "createReport": "Rapor oluştur"
+    },
+    "technicianTimeOptions": {
+      "groupBy": "Gruplama ölçütü",
+      "groupByValues": {
+        "technician": "Teknisyen",
+        "organization": "Kuruluş",
+        "work_type": "İş türü"
+      },
+      "orgAxisNote": "Bir kuruluşa bağlı olmayan zaman kayıtları kendi \"Kuruluş yok\" satırında görünür. Tek bir kuruluşa ait rapor yalnızca o kuruluşun taleplerine girilen süreyi görür.",
+      "capacityHours": "Teknisyen başına haftalık kapasite (saat)",
+      "capacityHoursHelp": "Kullanım oranı her teknisyen için aynı kapasiteyi varsayar ve iş günlerine orantılar. İzinler ve yarı zamanlı çalışma hesaba katılmaz.",
+      "cancel": "İptal",
+      "createReport": "Rapor oluştur"
+    },
+    "arAgingOptions": {
+      "asOf": "Bakiyelerin yaşlandırma tarihi",
+      "asOfHelp": "Raporun çalıştığı güne göre yaşlandırmak için boş bırakın. Bir tarih yalnızca yaşlandırma referans tarihini değiştirir: bakiyeler güncel bakiyelerdir, bu nedenle geçmiş bakiyeleri yeniden oluşturmaz ve o tarihten sonra kaydedilen ödemeleri geri almaz.",
+      "asOfInvalid": "Gerçek bir takvim tarihi girin veya alanı boş bırakın.",
+      "groupBy": "Gruplama ölçütü",
+      "groupByValues": {
+        "organization": "Kuruluş",
+        "currency": "Para birimi"
+      },
+      "currencyNote": "Her para biriminin kendi toplamları vardır. Tutarlar para birimleri arasında dönüştürülmez.",
+      "includePaidInPeriod": "Ay başından bu yana ödenen faturaları listele",
+      "includePaidInPeriodHelp": "Referans ayının ilk gününden referans tarihine kadar tamamen ödenen faturaları listeleyen bir not ekler. Yaşlandırma dilimlerini asla değiştirmez.",
+      "cancel": "İptal",
+      "createReport": "Rapor oluştur"
+    },
+    "aiUsageByClientOptions": {
+      "groupBy": "Gruplama ölçütü",
+      "groupByAutomatic": "Otomatik: tüm kuruluşlar için kuruluşa, tek bir kuruluş için modele göre",
+      "groupByValues": {
+        "organization": "Kuruluş",
+        "model": "Yapay zekâ modeli"
+      },
+      "periodNote": "Ücretler UTC takvim ayına göre faturalandırılır. Başka bir saat diliminde ayarlanan bir dönem, ay sınırlarına yakın kullanım için faturadan farklı olabilir.",
+      "unpricedNote": "Müşterinin faturalandırma profilinde fiyatı olmayan bir modelin kullanımı fiyatsız olarak sayılır. Asla ücretsiz kabul edilmez.",
+      "cancel": "İptal",
+      "createReport": "Rapor oluştur"
+    },
+    "mrrRenewalsOptions": {
+      "runTimeNote": "Bu rapor her zaman çalıştırıldığı gün ölçülür. Ayarlanacak bir dönem ya da referans tarihi yoktur.",
+      "groupBy": "Gruplandırma",
+      "groupByValues": {
+        "organization": "Kuruluş",
+        "contract": "Sözleşme"
+      },
+      "renewalHorizon": "Yenileme ufku",
+      "renewalHorizonOption": "Sonraki {{days}} gün",
+      "renewalHorizonHelp": "Süresi bu aralıkta sona eren sözleşmeler yenileme olarak listelenir.",
+      "cancel": "İptal",
+      "createReport": "Rapor oluştur"
+    },
+    "quoteWinRateOptions": {
+      "groupBy": "Gruplandırma",
+      "groupByAutomatic": "Otomatik: tüm kuruluşlar için kuruluşa göre, tek bir kuruluş için yazara göre",
+      "groupByValues": {
+        "organization": "Kuruluş",
+        "author": "Yazar",
+        "currency": "Para birimi"
+      },
+      "periodNote": "Dönem, teklifin ilk gönderildiği tarihe uygulanır. Revize edilip yeniden gönderilen bir teklif tek bir fırsat olarak yalnızca bir kez sayılır.",
+      "cancel": "İptal",
+      "createReport": "Rapor oluştur"
+    },
+    "ticketSlaPerformanceOptions": {
+      "includeSubjects": "Talep konularını dahil et",
+      "includeSubjectsHelp": "Teslim edilen raporlar bu kuruluşun tüm portal kullanıcılarına görünür. Her kullanıcı her talebin konusunu göremeyecekse kapalı bırakın.",
+      "cancel": "İptal",
+      "createReport": "Rapor oluştur"
+    },
+    "clientProfitabilityOptions": {
+      "groupBy": "Gruplandırma",
+      "groupByDefault": "Raporun kapsamına göre varsayılan",
+      "groupByValues": {
+        "organization": "Kuruluş",
+        "source": "Kaynak"
+      },
+      "groupByHelp": "Varsayılan olarak tüm kuruluşları kapsayan raporda kuruluşa göre, tek kuruluşta ise kaynağa göre gruplanır.",
+      "laborEnabled": "İş gücü maliyetini tahmin et",
+      "laborAmount": "Saatlik iş gücü maliyeti",
+      "laborCurrency": "Para birimi",
+      "laborHelp": "Tüm teknisyenler için tek bir ortak ücret. Bu ücreti kullanan rakamlar tahmin olarak etiketlenir.",
+      "cancel": "İptal",
+      "createReport": "Rapor oluştur"
+    },
+    "ownerScope": {
+      "legend": "Raporun kapsamı",
+      "allOrganizations": "Tüm kuruluşlar",
+      "allOrganizationsHint": "Her çalıştırmada belirlenen tüm aktif ve deneme sürümündeki kuruluşları kapsar. Hariç tutulan kuruluşlar raporun notlarında listelenir. Tüm kuruluşlara erişim gerektirir.",
+      "singleOrganization": "Tek bir kuruluş",
+      "singleOrganizationHint": "Kuruluş seçicide seçili olan kuruluş.",
+      "singleOrganizationDisabledHint": "Kuruluş kapsamlı bir rapor oluşturmak için kuruluş seçicide bir kuruluş seçin.",
+      "needsOrganizationHint": "Bu raporu oluşturmak için kuruluş seçicide bir kuruluş seçin. Tüm kuruluşları kapsayan raporlar, tüm kuruluşlara erişim gerektirir."
+    },
+    "orgPicker": {
+      "label": "Kuruluş",
+      "placeholder": "Bir kuruluş seçin",
+      "hint": "Tüm kuruluşları görüntülüyorsunuz. Bu raporun ait olduğu kuruluşu seçin.",
+      "required": "Bu raporu kaydetmeden önce bir kuruluş seçin.",
+      "chooseFirst": "Şablon kullanmadan önce yukarıdan bir kuruluş seçin.",
+      "previewNeedsOrg": "Canlı önizleme için bir kuruluş seçin."
+    },
+    "series": {
+      "covers": {
+        "legend": "Rapor kapsamı",
+        "org": "Tek bir kuruluş",
+        "orgHint": "Bir müşteri için, o kuruluşun kişilerine gönderilen rapor.",
+        "series": "Kuruluş başına bir rapor",
+        "seriesHint": "Kapsadığı her kuruluş için ayrı bir kopyası olan, her biri o kuruluşun kişilerine gönderilen tek bir tanım.",
+        "combined": "Tüm kuruluşlar birleşik",
+        "combinedHint": "Kendi ekibiniz için tüm kuruluşlarınızı kapsayan tek bir birleşik rapor."
+      },
+      "schedule": {
+        "label": "Her kuruluşun kopyasının ne sıklıkla gönderileceği",
+        "placeholder": "Bir zamanlama seçin",
+        "hint": "Birçok kuruluşa gönderilen rapor bir zamanlamaya göre çalışır, bu yüzden tek seferlik olamaz. Her kuruluşun kopyasının ne sıklıkla gönderileceğini seçin.",
+        "required": "Raporun ne sıklıkla gönderileceğini seçin."
+      },
+      "targeting": {
+        "legend": "Hangi kuruluşlar",
+        "all": "Tüm kuruluşlar",
+        "allHint": "Mevcut ve gelecekteki tüm kuruluşları içerir. Atlamak istediklerinizin işaretini kaldırın.",
+        "selected": "Seçilen kuruluşlar",
+        "selectedHint": "Yalnızca işaretlediğiniz kuruluşları içerir.",
+        "search": "Kuruluşlarda ara",
+        "summary": "{{total}} kuruluştan {{covered}} tanesini kapsar",
+        "noneSelected": "En az bir kuruluş seçin.",
+        "empty": "Eşleşen kuruluş yok."
+      },
+      "recipients": {
+        "legend": "Her kuruluşun kopyasını kim alır",
+        "primaryContact": "Kuruluşun birincil kişisi",
+        "roles": "Bu rollere sahip kişiler",
+        "noRuleWarning": "Hiçbir kural seçilmedi, bu yüzden bir kuruluş kopyasını yalnızca o kuruluşun kopyasına kişi eklediğinizde alır.",
+        "internalCc": "Dahili kopyalar",
+        "internalCcHint": "Her kuruluşun kopyası ekibinizdeki bu adreslere de gönderilir.",
+        "ccPlaceholder": "name@example.com",
+        "ccAdd": "Ekle",
+        "ccInvalid": "Geçerli bir e-posta adresi girin.",
+        "ccRemove": "{{email}} adresini kaldır",
+        "previewLoading": "Alıcılar kontrol ediliyor…",
+        "previewContacts_one": "{{count}} kişiye karşılık gelir",
+        "previewContacts_other": "{{count}} kişiye karşılık gelir",
+        "previewOrgs_one": "{{count}} kuruluşta",
+        "previewOrgs_other": "{{count}} kuruluşta",
+        "previewMissing_one": "{{count}} kuruluşun müşteri alıcısı yok: {{names}}",
+        "previewMissing_other": "{{count}} kuruluşun müşteri alıcısı yok: {{names}}",
+        "previewMore": "ve {{count}} tane daha",
+        "previewFailed": "Alıcılar kontrol edilemedi. Yine de her kuruluşun raporu çalıştığında o kuruluş için belirlenirler.",
+        "previewNoTargets": "Raporu kimin alacağını görmek için kuruluşları seçin."
+      },
+      "builder": {
+        "filtersDisabled": "Site, cihaz ve grup filtreleri burada kullanılamaz: her kuruluşun kopyası kuruluşun tamamını kapsar.",
+        "created": "“{{name}}” çok kuruluşlu raporu oluşturuldu",
+        "saved": "“{{name}}” çok kuruluşlu raporu kaydedildi",
+        "saveFailed": "Çok kuruluşlu rapor kaydedilemedi.",
+        "targetsFailed": "Ayarlar kaydedildi, ancak kapsanan kuruluşlar güncellenmedi. Yeniden kaydetmeyi deneyin."
+      },
+      "list": {
+        "filtersLabel": "Göster",
+        "filters": {
+          "all": "Tümü",
+          "multi": "Çok kuruluşlu",
+          "single": "Tek kuruluşlu",
+          "combined": "Birleşik"
+        },
+        "noMatches": "Bu filtreyle eşleşen rapor yok.",
+        "loadFailed": "Çok kuruluşlu raporlar yüklenemedi. Diğer raporlar gösteriliyor.",
+        "multiOrgBadge": "Çok kuruluşlu",
+        "multiOrgBadgeTitle": "“{{name}}” çok kuruluşlu raporunun parçası",
+        "expand": "Kuruluşları göster",
+        "collapse": "Kuruluşları gizle",
+        "summary": "{{date}} · {{delivered}}/{{total}} teslim edildi",
+        "summaryNoRecipient_one": "{{count}} alıcısız",
+        "summaryNoRecipient_other": "{{count}} alıcısız",
+        "summaryBlocked_one": "{{count}} engellendi",
+        "summaryBlocked_other": "{{count}} engellendi",
+        "summaryNever": "Henüz çalıştırılmadı",
+        "runsSeriesColumn": "Çok kuruluşlu rapor",
+        "actions": {
+          "edit": "Çok kuruluşlu raporu düzenle",
+          "transferOwner": "Sahipliği devret",
+          "delete": "Çok kuruluşlu raporu sil",
+          "pause": "Duraklat",
+          "resume": "Sürdür"
+        },
+        "pausedBadge": "Duraklatıldı",
+        "pausedTitle": "Duraklatıldı: siz sürdürene kadar hiçbir kuruluşun kopyası çalışmaz.",
+        "paused": "“{{name}}” duraklatıldı",
+        "resumed": "“{{name}}” sürdürüldü",
+        "pauseFailed": "Çok kuruluşlu rapor duraklatılamadı veya sürdürülemedi.",
+        "deleteTitle": "Çok kuruluşlu rapor silinsin mi?",
+        "deleteMessage": "“{{name}}” çalışmayı durdurur. Her kuruluşun kopyası çalıştırma geçmişiyle birlikte arşivlenir.",
+        "deleteConfirm": "Sil",
+        "deleted": "“{{name}}” çok kuruluşlu raporu silindi",
+        "deleteFailed": "Çok kuruluşlu rapor silinemedi."
+      },
+      "drilldown": {
+        "columns": {
+          "org": "Kuruluş",
+          "state": "Durum",
+          "lastRun": "Son çalıştırma",
+          "delivery": "Teslimat",
+          "recipients": "Alıcılar",
+          "actions": "Eylemler"
+        },
+        "states": {
+          "active": "Aktif",
+          "excluded": "Hariç tutuldu",
+          "ineligible": "Uygun değil",
+          "blocked_no_authority": "Engellendi: sahibin erişimi yok",
+          "blocked_no_recipients": "Müşteri alıcısı yok",
+          "detached": "Ayrıldı"
+        },
+        "delivery": {
+          "sent": "Gönderildi",
+          "not_scheduled": "E-posta gönderilmedi"
+        },
+        "neverRun": "Henüz çalıştırılmadı",
+        "actions": {
+          "runNow": "Şimdi çalıştır",
+          "editRecipients": "Alıcıları düzenle",
+          "exclude": "Hariç tut",
+          "include": "Dahil et",
+          "detach": "Ayır"
+        },
+        "lastOrgHint": "Seçili kuruluşlara sahip çok kuruluşlu rapor en az bir kuruluş gerektirir. Bunun yerine raporu silin.",
+        "noAuthorityHint": "Sahip bu kuruluşa erişemiyor, bu yüzden kopyası çalışmaz. Düzeltmek için sahipliği devredin.",
+        "excludeTitle": "{{org}} hariç tutulsun mu?",
+        "excludeMessage": "{{org}} artık bu raporu almaz. Kopyası çalıştırma geçmişiyle birlikte arşivlenir; yeniden dahil etmek aynı kopyayı geri yükler.",
+        "excludeConfirm": "Hariç tut",
+        "detachTitle": "{{org}} ayrılsın mı?",
+        "detachMessage": "{{org}} kuruluşunun kopyası, özgürce düzenleyebileceğiniz bağımsız bir rapor olur. Çalıştırma geçmişini korur ve bu çok kuruluşlu raporu izlemeyi bırakır. Bu bağımsız kopya varken, kuruluşu yeniden dahil etseniz bile {{org}} çok kuruluşlu raporun dışında kalır.",
+        "detachConfirm": "Ayır",
+        "excluded": "{{org}} hariç tutuldu",
+        "included": "{{org}} dahil edildi",
+        "detached": "{{org}} ayrıldı",
+        "generated": "{{org}} için rapor oluşturuldu",
+        "updateFailed": "Çok kuruluşlu rapor güncellenemedi.",
+        "detachFailed": "Rapor ayrılamadı.",
+        "generateFailed": "Rapor oluşturulamadı.",
+        "detachedHint": "Bağımsız kopyası ayrı olarak yönetiliyor. Bu kuruluşu çok kuruluşlu rapora geri almak için o raporu silin."
+      },
+      "transferOwner": {
+        "title": "Sahipliği devret",
+        "description": "Her kuruluşun kopyası sahibin erişimiyle çalışır. Tüm kuruluşlara erişimi olan bir iş ortağı kullanıcısı seçin.",
+        "label": "Yeni sahip",
+        "placeholder": "Bir kullanıcı seçin",
+        "current": "{{name}} (mevcut sahip)",
+        "confirm": "Devret",
+        "loadFailed": "Kullanıcılar yüklenemedi.",
+        "forbidden": "Sahipliği devretmek için kullanıcıları görüntüleme izniniz olmalı.",
+        "noCandidates": "Tüm kuruluşlara erişimi olan başka kullanıcı yok.",
+        "transferred": "Sahiplik {{name}} kullanıcısına devredildi",
+        "failed": "Sahiplik devredilemedi."
+      },
+      "child": {
+        "partOf": "“{{name}}” çok kuruluşlu raporunun parçası",
+        "partOfUnnamed": "Bir çok kuruluşlu raporun parçası",
+        "lockedExplanation": "Ortak ayarlar çok kuruluşlu raporda düzenlenir. Burada yalnızca bu kuruluşun alıcıları değiştirilebilir.",
+        "managedByMsp": "MSP'niz tarafından yönetiliyor",
+        "managedExplanation": "MSP'niz bu raporu yönetir. Kuruluşunuzda raporu kimin alacağını değiştirebilirsiniz.",
+        "editSeries": "Çok kuruluşlu raporu düzenle",
+        "detach": "Ayır",
+        "archived": "Bu kopya arşivlendi: kuruluş artık çok kuruluşlu rapor kapsamında değil.",
+        "summary": {
+          "type": "Tür",
+          "schedule": "Zamanlama",
+          "format": "Biçim"
+        },
+        "recipients": {
+          "title": "Bu kuruluşun alıcıları",
+          "description": "Çok kuruluşlu raporun kuralına ek olarak bu kuruluşun kopyasını kimin alacağını seçin.",
+          "default": "Kuralı izle",
+          "add": "Her zaman gönder",
+          "remove": "Asla gönderme",
+          "byRule": "Kuralla dahil",
+          "loadFailed": "Alıcılar yüklenemedi.",
+          "updated": "Alıcılar güncellendi",
+          "updateFailed": "Alıcılar güncellenemedi.",
+          "empty": "Bu kuruluşta e-posta adresi olan kişi yok."
+        }
+      },
+      "editPage": {
+        "title": "Çok kuruluşlu raporu düzenle",
+        "description": "Değişiklikler “{{name}}” raporunun her kuruluştaki kopyasına uygulanır.",
+        "breadcrumb": "Raporlar",
+        "back": "Raporlara dön",
+        "loading": "Çok kuruluşlu rapor yükleniyor…",
+        "notFound": "Bu çok kuruluşlu rapor artık yok.",
+        "loadFailed": "Çok kuruluşlu rapor yüklenemedi."
+      },
+      "errors": {
+        "seriesTypeUnsupported": "Bu rapor türü kuruluş başına bir rapor olarak gönderilemez.",
+        "seriesConfigOrgSpecific": "Site, cihaz ve grup filtrelerini kaldırın: çok kuruluşlu rapor kuruluşların tamamını kapsar.",
+        "seriesManaged": "Bu rapor bir çok kuruluşlu rapora ait. Çok kuruluşlu raporu düzenleyin veya önce bu kopyayı ayırın.",
+        "seriesOwnerIneligible": "Bu kullanıcı çok kuruluşlu raporun sahibi olamaz.",
+        "seriesOwnerIneligiblePermission": "Bu kullanıcı çok kuruluşlu raporun sahibi olamaz: rolü rapor dışa aktarma iznini (reports:export) vermiyor.",
+        "seriesOwnerIneligibleOrgAccess": "Bu kullanıcı çok kuruluşlu raporun sahibi olamaz: tüm kuruluşlara erişimi olmalıdır.",
+        "seriesOwnerIneligibleInactive": "Bu kullanıcının hesabı etkin değil, bu nedenle çok kuruluşlu raporun sahibi olamaz.",
+        "seriesOwnerIneligibleMembership": "Bu kullanıcı artık iş ortağınızın üyesi değil, bu nedenle çok kuruluşlu raporun sahibi olamaz.",
+        "seriesOwnerIneligibleNotPartner": "Bu kullanıcı iş ortağınıza ait değil, bu nedenle çok kuruluşlu raporun sahibi olamaz.",
+        "seriesOwnerIneligibleTenantInactive": "İş ortağı hesabınız etkin değil, bu nedenle çok kuruluşlu bir rapora yeni sahip atanamaz.",
+        "seriesNotFound": "Bu çok kuruluşlu rapor artık yok.",
+        "seriesWriteDenied": "Çok kuruluşlu raporları yalnızca tüm kuruluşlara erişimi olan iş ortağı kullanıcıları değiştirebilir.",
+        "seriesTargetOrgInaccessible": "Seçilen kuruluşlardan biri sizin için kullanılamıyor.",
+        "seriesTargetOrgHidden": "Quick Support ve atanmamış cihazların bekleme kuruluşu çok kuruluşlu bir rapora dahil edilemez.",
+        "reportNotSeriesChild": "Bu rapor artık bir çok kuruluşlu raporun parçası değil.",
+        "recipientModeRequiresSeries": "\"Asla gönderme\" yalnızca çok kuruluşlu raporun bir kopyası için geçerlidir.",
+        "recipientsNeedExportAndMfa": "Raporları alıcılara göndermek için dışa aktarma izni ve çok faktörlü oturum açma gerekir.",
+        "seriesAuthorityUnverifiable": "Sahibin erişimi şu anda doğrulanamadı. Birazdan yeniden deneyin."
+      }
+    },
+    "seriesCombine": {
+      "banner": "Bazı kuruluşların tek bir çok kuruluşlu rapor altında birleştirilebilecek neredeyse aynı raporları var. Bulunan gruplar: {{groups}}",
+      "review": "İncele",
+      "title": "Tek bir çok kuruluşlu raporda birleştir",
+      "groupLabel": "Grup",
+      "groupSummary": "{{type}} · {{schedule}} · kuruluşlar: {{orgs}}",
+      "nameLabel": "Çok kuruluşlu rapor adı",
+      "targetLegend": "Kapsanan kuruluşlar",
+      "targetSelected": "Yalnızca bu kuruluşlar (yeni bir şey gönderilmez)",
+      "targetAll": "Sonradan eklenenler dahil tüm kuruluşlar",
+      "targetAllWarning": "Bugün kopyası olmayan kuruluşlar bu raporu almaya başlar; müşteri alıcıları ekleyene kadar yalnızca dahili bilgi kopyası alıcılarına gönderilir.",
+      "adopt": "Korunur ve dönüştürülür",
+      "archive": "Yinelenen, arşivlenecek",
+      "deliverableLinked": "Hizmet teslimatı kanıtı olarak kullanılıyor",
+      "lastRun": "Son çalıştırma {{date}}",
+      "neverRun": "Hiç çalıştırılmadı",
+      "contacts": "Müşteri alıcıları: {{list}}",
+      "noContacts": "Müşteri alıcısı yok",
+      "ccShared": "Her kopyadaki dahili bilgi kopyası: {{list}}",
+      "ccNone": "Dahili bilgi kopyası yok",
+      "ccConflictHeading": "Bu bilgi kopyası adresleri bu raporların yalnızca bazılarında var. Her biri için ne olacağını seçin:",
+      "ccInclude": "Her kopyaya ekle",
+      "ccDrop": "Bilgi kopyasından çıkar",
+      "ccUnresolved": "Birleştirmeden önce her bilgi kopyası adresi için ne olacağını seçin.",
+      "ruleNote": "Her müşteri bugün sahip olduğu alıcıları aynen korur. Alıcı kuralını daha sonra çok kuruluşlu raporda ekleyebilirsiniz.",
+      "confirm": "Birleştir",
+      "success": "“{{name}}” içinde birleştirildi",
+      "failed": "Bu raporlar birleştirilemedi.",
+      "groupChanged": "Bu raporlar pencereyi açtığınızdan beri değişti. Liste yenilendi.",
+      "stalled": "Bugün gönderilmiyor (sahibi erişimini kaybetti). Birleştirme gönderimi sürdürür.",
+      "ccHeldBy": "Şu anda bilgi kopyası olarak eklendiği raporlar: {{list}}",
+      "ownerIneligible": "Bu kuruluşlar için bir raporun sahibi olamazsınız: {{list}}",
+      "ccTooMany": "Çok fazla dahili bilgi kopyası adresi (en fazla {{max}}).",
+      "otherOrgs": "diğer kuruluşlar"
     }
   }
 }

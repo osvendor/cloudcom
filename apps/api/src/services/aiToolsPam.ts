@@ -12,6 +12,7 @@ import type { AuthContext } from '../middleware/auth';
 import type { AiTool } from './aiTools';
 import { publishEvent, type EventType } from './eventBus';
 import { evaluatePamRules, type PamRuleMatch } from './pamRuleEngine';
+import { PamActuationNotFoundError, requestPamCleanup } from './pamActuationLifecycle';
 import {
   deviceScopeCondition,
   deviceSiteDenied,
@@ -19,13 +20,19 @@ import {
   runFrozenDeviceIds,
   SITE_SCOPE_EMPTY_NOTE,
 } from './aiToolsSiteScope';
+import type { ToolExecutionContext } from './toolExecutionContext';
+import { isAutomationPrincipal } from '../middleware/principalKind';
+import { notParkedDeviceCondition } from './unassignedPool/selectorPredicate';
+import { currentOwnershipEpochSql } from './deviceOwnershipEpoch';
 
 // Input schemas for these tools live in the canonical `toolInputSchemas`
 // registry in ./aiToolSchemas (validated centrally by executeTool).
 
-type PamHandler = (input: Record<string, unknown>, auth: AuthContext) => Promise<string>;
-type ElevationStatus = 'pending' | 'auto_approved' | 'denied';
-
+type PamHandler = (
+  input: Record<string, unknown>,
+  auth: AuthContext,
+  context?: ToolExecutionContext,
+) => Promise<string>;
 const ACTIVE_STATUSES = ['approved', 'auto_approved', 'actuating'] as const;
 const DEFAULT_DURATION_MINUTES = 30;
 
@@ -34,15 +41,50 @@ function orgWhere(auth: AuthContext, orgIdCol: Parameters<AuthContext['orgCondit
 }
 
 function safeHandler(toolName: string, fn: PamHandler): PamHandler {
-  return async (input, auth) => {
+  return async (input, auth, context) => {
     try {
-      return await fn(input, auth);
+      return await fn(input, auth, context);
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Internal error';
       console.error(`[pam:${toolName}] ${err?.constructor?.name ?? 'Error'}:`, message, err);
       return JSON.stringify({ error: 'Operation failed. Check server logs for details.' });
     }
   };
+}
+
+/**
+ * #6911: `request_elevation` is user-owned on release
+ * (`USER_OWNED_RELEASE_ACTIONS` in `jobs/intentReleaseWorker.ts`) — it writes
+ * `auth.user.id` into `elevation_requests.subject_user_id` and
+ * `elevation_audit_entries.actor_user_id`, both `users` FKs. Under the
+ * rebuilt agent auth that id is an `aiAgents.id`, so refuse rather than write
+ * a row whose owner the worker and this handler's auth disagree about.
+ * Mirrors `aiToolsFleet.ts`'s `approverReleaseMismatch`.
+ */
+function approverReleaseMismatch(auth: AuthContext, context: ToolExecutionContext | undefined): boolean {
+  return !!context?.approverRelease && context.approverRelease.approverUserId !== auth.user.id;
+}
+
+/**
+ * #6911: `true` when the caller is an AI-agent principal, i.e. `auth.user.id`
+ * is an `aiAgents.id` (attribution only, never a `users` row), not a real
+ * user id. `revoke_elevation` is Tier 2 (auto-executes inline, no approval
+ * step, so there is no approver for `USER_OWNED_RELEASE_ACTIONS` to
+ * substitute) and writes `auth.user.id` into
+ * `elevation_requests.revoked_by_user_id` / `elevation_audit_entries.actor_user_id`
+ * — a genuine, agent-mintable write via the `agentTier2` lane. Refuse before
+ * the write rather than let it fail as a 23503. Mirrors `aiToolsFleet.ts`'s
+ * `isAgentPrincipalCaller` (#6206).
+ */
+function isAgentPrincipalCaller(auth: AuthContext): boolean {
+  return isAutomationPrincipal(auth);
+}
+
+/** #6911: the refusal `revoke_elevation` returns to an agent principal. */
+function refusePamAgentPrincipal(action: string): string {
+  return JSON.stringify({
+    error: `Action "${action}" requires a real user identity and cannot be performed by an AI agent.`,
+  });
 }
 
 async function safePublish(
@@ -68,7 +110,8 @@ function toIso(value: unknown): string | null {
 }
 
 async function loadDeviceWithAccess(deviceId: string, auth: AuthContext) {
-  const conditions: SQL[] = [eq(devices.id, deviceId)];
+  // Never a device parked in a holding org, whatever the caller's scope.
+  const conditions: SQL[] = [eq(devices.id, deviceId), notParkedDeviceCondition()];
   const oc = orgWhere(auth, devices.orgId);
   if (oc) conditions.push(oc);
 
@@ -103,51 +146,13 @@ async function loadEnabledPamRules(device: { orgId: string; siteId: string | nul
   return db.select().from(pamRules).where(and(...conditions));
 }
 
-function resolveDecision(
-  ruleMatch: PamRuleMatch | null,
-  requestedDurationMinutes: number,
-): {
-  status: ElevationStatus;
-  expiresAt: Date | null;
-  approvedAt: Date | null;
-  denialReason: string | null;
-  effectiveDurationMinutes: number;
-} {
-  const now = new Date();
-  const effectiveDurationMinutes = clampNumber(
-    ruleMatch?.approvalDurationMinutes ?? requestedDurationMinutes,
-    requestedDurationMinutes,
-    480,
-  );
-
-  if (ruleMatch?.verdict === 'auto_approve') {
-    return {
-      status: 'auto_approved',
-      approvedAt: now,
-      expiresAt: new Date(now.getTime() + effectiveDurationMinutes * 60_000),
-      denialReason: null,
-      effectiveDurationMinutes,
-    };
-  }
-  if (ruleMatch?.verdict === 'auto_deny') {
-    return {
-      status: 'denied',
-      approvedAt: null,
-      expiresAt: null,
-      denialReason: `Blocked by PAM rule "${ruleMatch.ruleName}"`,
-      effectiveDurationMinutes,
-    };
-  }
-  return { status: 'pending', approvedAt: null, expiresAt: null, denialReason: null, effectiveDurationMinutes };
-}
-
 function eventPayload(row: {
   id: string;
   deviceId: string;
   flowType: string;
   status: string;
   subjectUsername?: string;
-}, ruleMatch?: PamRuleMatch | null) {
+}, denyRule?: PamRuleMatch | null) {
   return {
     elevationRequestId: row.id,
     deviceId: row.deviceId,
@@ -155,7 +160,7 @@ function eventPayload(row: {
     status: row.status,
     ...(row.subjectUsername ? { subjectUsername: row.subjectUsername } : {}),
     triggerSource: 'brain',
-    ...(ruleMatch ? { pamRuleId: ruleMatch.ruleId } : {}),
+    ...(denyRule ? { pamRuleId: denyRule.ruleId } : {}),
   };
 }
 
@@ -171,7 +176,7 @@ export function registerPamTools(aiTools: Map<string, AiTool>): void {
     deviceArgs: ['deviceId'],
     definition: {
       name: 'request_elevation',
-      description: 'Request a temporary PAM elevation for an OS/user account on a managed device.',
+      description: 'Request a temporary PAM elevation for an OS/user account on a managed device. The request is created pending (or denied when an auto-deny PAM rule matches); a PAM approver other than the requester must approve it.',
       input_schema: {
         type: 'object' as const,
         properties: {
@@ -182,13 +187,17 @@ export function registerPamTools(aiTools: Map<string, AiTool>): void {
           subjectAdGroups: {
             type: 'array',
             items: { type: 'string' },
-            description: 'Optional AD/local groups for PAM rule matching',
+            description: 'Optional AD/local groups for PAM rule matching (auto-deny rules apply; AI requests are never auto-approved — a PAM approver decides)',
           },
         },
         required: ['deviceId', 'subjectUsername', 'reason'],
       },
     },
-    handler: safeHandler('request_elevation', async (input, auth) => {
+    handler: safeHandler('request_elevation', async (input, auth, context) => {
+      // #6911: user-owned on release — see approverReleaseMismatch.
+      if (approverReleaseMismatch(auth, context)) {
+        return JSON.stringify({ error: 'approver_auth_mismatch' });
+      }
       const deviceId = input.deviceId as string;
       const subjectUsername = input.subjectUsername as string;
       const reason = input.reason as string;
@@ -199,6 +208,13 @@ export function registerPamTools(aiTools: Map<string, AiTool>): void {
       const device = await loadDeviceWithAccess(deviceId, auth);
       if (!device) return JSON.stringify({ error: 'Device not found or access denied' });
 
+      // An AI-originated elevation request is never auto-approved: it is
+      // inserted `pending` and a PAM approver decides it through routes/pam.ts,
+      // whose maker/checker check refuses the requester (subjectUserId below).
+      // Same as routes/remediationSuggestions.ts, which also inserts pending.
+      // The subject username and AD groups come from the tool input, so an
+      // auto_approve verdict matched on them is not applied. An auto_deny
+      // verdict is applied, exactly as on the other elevation paths.
       const now = new Date();
       const durationMinutes = clampNumber(input.durationMinutes, DEFAULT_DURATION_MINUTES, 480);
       const rules = await loadEnabledPamRules(device, auth);
@@ -209,12 +225,12 @@ export function registerPamTools(aiTools: Map<string, AiTool>): void {
           : undefined,
         at: now,
       });
-      const decision = resolveDecision(ruleMatch, durationMinutes);
+      const denyRule = ruleMatch?.verdict === 'auto_deny' ? ruleMatch : null;
       const metadata = {
         triggerSource: 'brain',
         requestedByUserId: auth.user.id,
         requestedDurationMinutes: durationMinutes,
-        ...(ruleMatch ? { pamRuleId: ruleMatch.ruleId, pamRuleName: ruleMatch.ruleName } : {}),
+        ...(denyRule ? { pamRuleId: denyRule.ruleId, pamRuleName: denyRule.ruleName } : {}),
       };
 
       const [row] = await db
@@ -224,6 +240,7 @@ export function registerPamTools(aiTools: Map<string, AiTool>): void {
           siteId: device.siteId ?? null,
           partnerId: device.partnerId ?? auth.partnerId ?? null,
           deviceId: device.id,
+          deviceEpoch: currentOwnershipEpochSql(device.id),
           flowType: 'tech_jit_admin',
           // tech_jit_admin requires subject_user_id IS NOT NULL (DB CHECK
           // elevation_requests_flow_shape_chk). The subject is the operator on
@@ -233,11 +250,11 @@ export function registerPamTools(aiTools: Map<string, AiTool>): void {
           subjectUserId: auth.user.id,
           subjectUsername,
           reason,
-          status: decision.status,
+          status: denyRule ? 'denied' : 'pending',
           requestedAt: now,
-          approvedAt: decision.approvedAt,
-          expiresAt: decision.expiresAt,
-          denialReason: decision.denialReason,
+          approvedAt: null,
+          expiresAt: null,
+          denialReason: denyRule ? `Blocked by PAM rule "${denyRule.ruleName}"` : null,
           metadata,
         })
         .returning({
@@ -263,19 +280,16 @@ export function registerPamTools(aiTools: Map<string, AiTool>): void {
           occurredAt: now,
         },
       ];
-      if (ruleMatch && (decision.status === 'auto_approved' || decision.status === 'denied')) {
+      if (denyRule) {
         auditRows.push({
           orgId: device.orgId,
           elevationRequestId: row.id,
-          eventType: decision.status,
+          eventType: 'denied',
           actor: 'policy',
           details: {
-            pamRuleId: ruleMatch.ruleId,
-            pamRuleName: ruleMatch.ruleName,
+            pamRuleId: denyRule.ruleId,
+            pamRuleName: denyRule.ruleName,
             triggerSource: 'brain',
-            ...(decision.status === 'auto_approved'
-              ? { durationMinutes: decision.effectiveDurationMinutes }
-              : {}),
           },
           occurredAt: now,
         });
@@ -290,20 +304,17 @@ export function registerPamTools(aiTools: Map<string, AiTool>): void {
           status: row.status,
           subjectUsername,
         },
-        ruleMatch,
+        denyRule,
       );
       await safePublish('elevation.requested', device.orgId, payload);
-      if (decision.status === 'auto_approved') {
-        await safePublish('elevation.auto_approved', device.orgId, payload);
-      } else if (decision.status === 'denied') {
+      if (denyRule) {
         await safePublish('elevation.denied', device.orgId, payload);
       }
 
       return JSON.stringify({
         elevationRequestId: row.id,
         status: row.status,
-        ...(row.expiresAt ? { expiresAt: toIso(row.expiresAt) } : {}),
-        ...(ruleMatch ? { pamRuleId: ruleMatch.ruleId } : {}),
+        ...(denyRule ? { pamRuleId: denyRule.ruleId } : {}),
       });
     }),
   });
@@ -325,6 +336,11 @@ export function registerPamTools(aiTools: Map<string, AiTool>): void {
       },
     },
     handler: safeHandler('revoke_elevation', async (input, auth) => {
+      // #6911: no approver to substitute at Tier 2 — refuse an agent
+      // principal before the write. See isAgentPrincipalCaller.
+      if (isAgentPrincipalCaller(auth)) {
+        return refusePamAgentPrincipal('revoke_elevation');
+      }
       const elevationRequestId = input.elevationRequestId as string;
       const reason = input.reason as string;
       if (!elevationRequestId || !reason) {
@@ -395,7 +411,21 @@ export function registerPamTools(aiTools: Map<string, AiTool>): void {
           occurredAt: now,
         });
 
-        return { kind: 'ok' as const, row: existing };
+        // W04-D10 (#6758): same transaction, same call as the REST revoke
+        // (routes/pam.ts) — an already-actuated grant gets its device-side
+        // cleanup outboxed. The expiry sweep skips `revoked` rows, so without
+        // this nothing ever removes the elevation on the device. No actuation
+        // row means nothing was ever dispatched (the expiry enforcer's own
+        // reading, jobs/pamJobs.ts); any other failure aborts the revoke.
+        let enforcementStatus: 'cleanup_pending' | 'none_dispatched' = 'cleanup_pending';
+        try {
+          await requestPamCleanup(tx, { elevationRequestId: existing.id, cause: 'revoked' });
+        } catch (err) {
+          if (!(err instanceof PamActuationNotFoundError)) throw err;
+          enforcementStatus = 'none_dispatched';
+        }
+
+        return { kind: 'ok' as const, row: existing, enforcementStatus };
       });
 
       if (result.kind === 'not_found') {
@@ -416,7 +446,11 @@ export function registerPamTools(aiTools: Map<string, AiTool>): void {
         triggerSource: 'brain',
       });
 
-      return JSON.stringify({ elevationRequestId: result.row.id, status: 'revoked' });
+      return JSON.stringify({
+        elevationRequestId: result.row.id,
+        status: 'revoked',
+        enforcementStatus: result.enforcementStatus,
+      });
     }),
   });
 

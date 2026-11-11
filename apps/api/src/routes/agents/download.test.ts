@@ -1,16 +1,19 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { fetchVerifiedMacosPkgMock } = vi.hoisted(() => ({
+const { fetchVerifiedMacosPkgMock, fetchVerifiedHelperInstallerMock } = vi.hoisted(() => ({
   fetchVerifiedMacosPkgMock: vi.fn(),
+  fetchVerifiedHelperInstallerMock: vi.fn(),
 }));
 
 vi.mock('../../services/installerBuilder', () => ({
   fetchVerifiedMacosPkg: fetchVerifiedMacosPkgMock,
+  fetchVerifiedHelperInstaller: fetchVerifiedHelperInstallerMock,
 }));
 
 vi.mock('../../services/s3Storage', () => ({
   isS3Configured: vi.fn(() => false),
   getPresignedUrl: vi.fn(),
+  getObjectStream: vi.fn(),
   isS3NotFound: (err: unknown) => {
     const name = (err as { name?: string }).name;
     return name === 'NotFound' || name === 'NoSuchKey';
@@ -33,6 +36,18 @@ vi.mock('../../services/binarySource', () => ({
   },
 }));
 
+const { rateLimiterMock } = vi.hoisted(() => ({
+  rateLimiterMock: vi.fn(async (..._args: unknown[]) => ({ allowed: true, remaining: 19, resetAt: new Date() })),
+}));
+
+vi.mock('../../services', () => ({
+  getRedis: vi.fn(() => ({})),
+}));
+
+vi.mock('../../services/rate-limit', () => ({
+  rateLimiter: (...args: unknown[]) => rateLimiterMock(...args),
+}));
+
 vi.mock('../../services/promotedAgentVersion', () => ({
   // Default: no promoted row, so every pre-existing test keeps exercising the
   // historical env-resolved redirect path unchanged.
@@ -50,10 +65,19 @@ import { createHash } from 'node:crypto';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { Readable } from 'node:stream';
 import { downloadRoutes } from './download';
 import { getBinarySource, getGithubReleaseVersion, getGithubAgentUrl, getGithubHelperUrl, getGithubUserHelperUrl, getGithubWatchdogUrl, getGithubBackupUrl } from '../../services/binarySource';
-import { isS3Configured, getPresignedUrl } from '../../services/s3Storage';
+import { isS3Configured, getPresignedUrl, getObjectStream } from '../../services/s3Storage';
 import { getPromotedComponentVersion, getRegisteredComponentVersion } from '../../services/promotedAgentVersion';
+
+// File-scoped so every describe block below gets a permissive default for
+// the .pkg route's per-IP rate limiter, regardless of describe nesting or an
+// earlier block's vi.restoreAllMocks().
+beforeEach(() => {
+  rateLimiterMock.mockReset();
+  rateLimiterMock.mockImplementation(async () => ({ allowed: true, remaining: 19, resetAt: new Date() }));
+});
 
 describe('public agent binary downloads', () => {
   const originalAgentDir = process.env.AGENT_BINARY_DIR;
@@ -63,7 +87,11 @@ describe('public agent binary downloads', () => {
     process.env.AGENT_BINARY_DIR = '/tmp/breeze-secret-agent-binaries';
     process.env.HELPER_BINARY_DIR = '/tmp/breeze-secret-helper-binaries';
     vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
     fetchVerifiedMacosPkgMock.mockRejectedValue(new Error('package unavailable'));
+    fetchVerifiedHelperInstallerMock.mockRejectedValue(new Error('installer unavailable'));
+    rateLimiterMock.mockReset();
+    rateLimiterMock.mockImplementation(async () => ({ allowed: true, remaining: 19, resetAt: new Date() }));
   });
 
   afterEach(() => {
@@ -87,17 +115,22 @@ describe('public agent binary downloads', () => {
     );
   });
 
-  it('does not disclose HELPER_BINARY_DIR in public 404 responses', async () => {
+  it('does not disclose the underlying failure in a public helper-installer 503 response', async () => {
+    // Helper no longer streams from HELPER_BINARY_DIR/S3 directly — it always
+    // goes through the manifest-verified fetch (fetchVerifiedHelperInstaller),
+    // same as the .pkg route. See the dedicated describe block below for the
+    // full verified-fetch behavior; this just pins that a rejection is
+    // sanitized like every other privileged-artifact failure.
+    fetchVerifiedHelperInstallerMock.mockRejectedValue(new Error('digest mismatch at /private/path'));
+
     const res = await downloadRoutes.request('/download/helper/linux/amd64');
     const body = await res.text();
 
-    expect(res.status).toBe(404);
+    expect(res.status).toBe(503);
     expect(body).not.toContain('/tmp/breeze-secret-helper-binaries');
     expect(body).not.toContain('HELPER_BINARY_DIR');
-    expect(console.warn).toHaveBeenCalledWith(
-      '[helper-download] Local binary missing',
-      { filename: 'breeze-desktop-helper-linux-amd64' },
-    );
+    expect(body).not.toContain('digest mismatch');
+    expect(body).not.toContain('/private/path');
   });
 
   it('does not disclose AGENT_BINARY_DIR in public watchdog 404 responses', async () => {
@@ -315,7 +348,7 @@ describe('component downloads serve the DB-promoted version (issue #3499)', () =
     );
   });
 
-  it('serves watchdog, user-helper and helper from their own promoted rows', async () => {
+  it('serves watchdog and user-helper from their own promoted rows', async () => {
     const watchdog = await downloadRoutes.request('/download/watchdog/windows/amd64');
     expect(watchdog.headers.get('location')).toBe(
       `https://github.test/releases/download/v${PROMOTED_VERSION}/breeze-watchdog-windows-amd64`,
@@ -328,14 +361,10 @@ describe('component downloads serve the DB-promoted version (issue #3499)', () =
     );
     expect(getPromotedComponentVersion).toHaveBeenCalledWith('user-helper', 'windows', 'amd64');
 
-    // The helper builder is per-OS, but its promoted row is still looked up
-    // per (os, arch) — HELPER_TARGETS registers darwin/amd64 and darwin/arm64
-    // as separate rows pointing at the same .dmg.
-    const helper = await downloadRoutes.request('/download/helper/darwin/arm64');
-    expect(helper.headers.get('location')).toBe(
-      `https://github.test/releases/download/v${PROMOTED_VERSION}/breeze-helper-darwin`,
-    );
-    expect(getPromotedComponentVersion).toHaveBeenCalledWith('helper', 'darwin', 'arm64');
+    // Helper (the Tauri desktop app) is deliberately NOT in this promoted-row
+    // redirect family any more — it now always goes through the manifest-
+    // verified fetch (fetchVerifiedHelperInstaller), same as the .pkg route.
+    // See the dedicated helper-download describe block below.
   });
 
   it('falls back to the env-resolved version when no promoted row exists', async () => {
@@ -498,7 +527,6 @@ describe('component downloads honour an explicit ?version= pin (issue #5159)', (
   it.each([
     ['watchdog', '/download/watchdog/linux/amd64', 'linux', 'amd64', 'breeze-watchdog-linux-amd64'],
     ['backup', '/download/backup/linux/amd64', 'linux', 'amd64', 'breeze-backup-linux-amd64'],
-    ['helper', '/download/helper/darwin/arm64', 'darwin', 'arm64', 'breeze-helper-darwin'],
     ['user-helper', '/download/user-helper/windows/amd64', 'windows', 'amd64', 'breeze-user-helper-windows-amd64'],
   ])(
     'pins the %s route to the requested version, resolved for ITS OWN component',
@@ -508,10 +536,6 @@ describe('component downloads honour an explicit ?version= pin (issue #5159)', (
       // neighbour's component) would resolve the wrong row in production and
       // still produce a correct-looking Location here.
       vi.mocked(getRegisteredComponentVersion).mockClear();
-      vi.mocked(getGithubHelperUrl).mockImplementation(
-        (o: string, version?: string) =>
-          `https://github.test/releases/download/v${version ?? ENV_VERSION}/breeze-helper-${o}`,
-      );
       vi.mocked(getGithubUserHelperUrl).mockImplementation(urlFor('user-helper'));
 
       const res = await downloadRoutes.request(`${path}?version=${PINNED_VERSION}`);
@@ -646,9 +670,9 @@ describe('S3 transport failures surface as 500, not a masked 404 (issue #1802)',
   });
 
   it.each([
+    // watchdog streams from object storage instead of presigning (#7576) —
+    // its transport-fault/NotFound cases live in the #7576 describe below.
     ['agent', '/download/linux/amd64', '[agent-download]'],
-    ['helper', '/download/helper/linux/amd64', '[helper-download]'],
-    ['watchdog', '/download/watchdog/linux/amd64', '[watchdog-download]'],
     ['user-helper', '/download/user-helper/windows/amd64', '[user-helper-download]'],
     ['backup', '/download/backup/linux/amd64', '[backup-download]'],
   ])('returns 500 for the %s route on a non-NotFound S3 error', async (_name, path, logTag) => {
@@ -666,8 +690,6 @@ describe('S3 transport failures surface as 500, not a masked 404 (issue #1802)',
 
   it.each([
     ['agent', '/download/linux/amd64', '[agent-download]', 'NotFound'],
-    ['helper', '/download/helper/linux/amd64', '[helper-download]', 'NoSuchKey'],
-    ['watchdog', '/download/watchdog/linux/amd64', '[watchdog-download]', 'NotFound'],
     ['user-helper', '/download/user-helper/windows/amd64', '[user-helper-download]', 'NotFound'],
     ['backup', '/download/backup/linux/amd64', '[backup-download]', 'NotFound'],
   ])(
@@ -699,6 +721,153 @@ describe('S3 transport failures surface as 500, not a masked 404 (issue #1802)',
 
     expect(res.status).toBe(500);
     expect(console.error).toHaveBeenCalled();
+  });
+});
+
+describe('watchdog object-storage copies are served on the control-plane origin, never via a presigned redirect (#7576)', () => {
+  // A hosted agent's first-install watchdog bootstrap (`service install`)
+  // follows redirects only to GitHub release hosts and its own control plane.
+  // A 302 to a presigned object-storage URL is refused as "release redirect to
+  // untrusted origin", so the watchdog was never installed. The bytes must come
+  // back on the route's own origin; integrity is still bound by the signed
+  // release manifest the agent checks after the download.
+  const originalAgentDir = process.env.AGENT_BINARY_DIR;
+  const WATCHDOG_BYTES = Buffer.from('MZ-fake-watchdog-bytes-for-7576');
+  const PRESIGNED = 'https://storage.example.test/bucket/key?X-Amz-Signature=abc';
+
+  beforeEach(() => {
+    process.env.AGENT_BINARY_DIR = '/tmp/breeze-nonexistent-agent-binaries-7576';
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    vi.mocked(getBinarySource).mockReturnValue('local');
+    vi.mocked(isS3Configured).mockReturnValue(true);
+    vi.mocked(getPresignedUrl).mockResolvedValue(PRESIGNED);
+  });
+
+  afterEach(() => {
+    if (originalAgentDir === undefined) delete process.env.AGENT_BINARY_DIR;
+    else process.env.AGENT_BINARY_DIR = originalAgentDir;
+    vi.restoreAllMocks();
+    vi.mocked(getBinarySource).mockReset();
+    vi.mocked(isS3Configured).mockReset();
+    vi.mocked(getPresignedUrl).mockReset();
+    vi.mocked(getObjectStream).mockReset();
+  });
+
+  it('streams the watchdog object on this origin with its exact bytes and length', async () => {
+    vi.mocked(getObjectStream).mockResolvedValue({
+      body: Readable.from([WATCHDOG_BYTES]),
+      contentLength: WATCHDOG_BYTES.length,
+    });
+
+    const res = await downloadRoutes.request('/download/watchdog/windows/amd64');
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get('location')).toBeNull();
+    expect(res.headers.get('content-length')).toBe(String(WATCHDOG_BYTES.length));
+    expect(res.headers.get('content-disposition')).toContain('breeze-watchdog-windows-amd64.exe');
+    expect(Buffer.from(await res.arrayBuffer()).equals(WATCHDOG_BYTES)).toBe(true);
+    // The same key the presign path used: the agent store's prefix (#7515).
+    expect(getObjectStream).toHaveBeenCalledWith('agent/breeze-watchdog-windows-amd64.exe');
+    expect(getPresignedUrl).not.toHaveBeenCalled();
+  });
+
+  it('omits Content-Length rather than guessing when object storage does not report one', async () => {
+    vi.mocked(getObjectStream).mockResolvedValue({
+      body: Readable.from([WATCHDOG_BYTES]),
+      contentLength: null,
+    });
+
+    const res = await downloadRoutes.request('/download/watchdog/linux/amd64');
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-length')).toBeNull();
+    expect(Buffer.from(await res.arrayBuffer()).equals(WATCHDOG_BYTES)).toBe(true);
+  });
+
+  it('falls back to disk (404 here) when the object is genuinely absent', async () => {
+    vi.mocked(getObjectStream).mockResolvedValue({ body: null, contentLength: null });
+
+    const res = await downloadRoutes.request('/download/watchdog/linux/amd64');
+
+    expect(res.status).toBe(404);
+    expect(console.error).not.toHaveBeenCalled();
+    expect(console.warn).toHaveBeenCalledWith(
+      expect.stringContaining('[watchdog-download] S3 object missing'),
+    );
+    expect(getPresignedUrl).not.toHaveBeenCalled();
+  });
+
+  it('returns 500 on an object-storage transport fault instead of masking it as a disk 404', async () => {
+    vi.mocked(getObjectStream).mockRejectedValue(
+      Object.assign(new Error('credentials expired'), { name: 'CredentialsProviderError' }),
+    );
+
+    const res = await downloadRoutes.request('/download/watchdog/linux/amd64');
+    const body = await res.text();
+
+    expect(res.status).toBe(500);
+    expect(body).not.toContain('not available');
+    expect(body).not.toContain('/tmp');
+    expect(console.error).toHaveBeenCalledWith(
+      expect.stringContaining('[watchdog-download] S3 fetch failed'),
+      expect.anything(),
+    );
+    expect(getPresignedUrl).not.toHaveBeenCalled();
+  });
+
+  function failingBody(err: Error): Readable {
+    let sent = false;
+    return new Readable({
+      read() {
+        if (!sent) {
+          sent = true;
+          this.push(WATCHDOG_BYTES);
+          return;
+        }
+        this.destroy(err);
+      },
+    });
+  }
+
+  it('logs an object-storage fault that breaks the stream mid-body', async () => {
+    vi.mocked(getObjectStream).mockResolvedValue({
+      body: failingBody(Object.assign(new Error('socket reset'), { code: 'ECONNRESET' })),
+      contentLength: WATCHDOG_BYTES.length * 2,
+    });
+
+    const res = await downloadRoutes.request('/download/watchdog/linux/amd64');
+    expect(res.status).toBe(200);
+    await expect(res.arrayBuffer()).rejects.toThrow();
+
+    expect(console.error).toHaveBeenCalledWith(
+      expect.stringContaining('[watchdog-download] S3 stream error'),
+      expect.anything(),
+    );
+  });
+
+  it('does not report a client hang-up (AbortError) as an object-storage fault', async () => {
+    vi.mocked(getObjectStream).mockResolvedValue({
+      body: failingBody(Object.assign(new Error('The operation was aborted'), { name: 'AbortError' })),
+      contentLength: WATCHDOG_BYTES.length * 2,
+    });
+
+    const res = await downloadRoutes.request('/download/watchdog/linux/amd64');
+    await res.arrayBuffer().catch(() => undefined);
+
+    expect(console.error).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['agent', '/download/linux/amd64'],
+    ['user-helper', '/download/user-helper/windows/amd64'],
+    ['backup', '/download/backup/linux/amd64'],
+  ])('leaves the %s route on the presigned redirect (bandwidth offload unchanged)', async (_name, path) => {
+    const res = await downloadRoutes.request(path);
+
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toBe(PRESIGNED);
+    expect(getObjectStream).not.toHaveBeenCalled();
   });
 });
 
@@ -792,6 +961,146 @@ describe('public agent .pkg downloads — per-arch serving', () => {
     expect(res.headers.get('retry-after')).toBe('30');
     expect(body).not.toContain('digest mismatch');
     expect(body).not.toContain('/private/path');
+  });
+
+  // This route is exempt from the global limiter (the whole
+  // /api/v1/agents/ prefix is skipped) and had no route-level limiter of
+  // its own — an anonymous caller could pull the cached (up to
+  // MAX_MACOS_INSTALLER_BYTES) package as fast as the network allowed.
+  it('rate-limits the public .pkg download per client IP', async () => {
+    rateLimiterMock.mockResolvedValueOnce({ allowed: false, remaining: 0, resetAt: new Date() });
+
+    const res = await downloadRoutes.request('/download/darwin/amd64/pkg');
+
+    expect(res.status).toBe(429);
+    expect(fetchVerifiedMacosPkgMock).not.toHaveBeenCalled();
+    expect(rateLimiterMock).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.stringContaining('public-pkg-download:'),
+      expect.any(Number),
+      expect.any(Number),
+    );
+  });
+
+  it('fails closed (503) when Redis is unavailable for the rate limiter', async () => {
+    const { getRedis } = await import('../../services');
+    vi.mocked(getRedis).mockReturnValueOnce(null);
+
+    const res = await downloadRoutes.request('/download/darwin/amd64/pkg');
+
+    expect(res.status).toBe(503);
+    expect(fetchVerifiedMacosPkgMock).not.toHaveBeenCalled();
+  });
+
+  // Serving `new Uint8Array(buffer)` copies the whole (shared, cached)
+  // artifact into a fresh buffer per response. Streaming the same
+  // underlying bytes must still deliver byte-identical content to the
+  // client — this pins that the switch to Readable.from(buffer) didn't
+  // change what's on the wire.
+  it('streams the cached artifact rather than duplicating it, with identical bytes on the wire', async () => {
+    const res = await downloadRoutes.request('/download/darwin/amd64/pkg');
+    expect(res.status).toBe(200);
+    expect(res.body).not.toBeNull();
+    const body = await res.text();
+    expect(body).toBe('AMD64-PKG-BODY');
+    expect(res.headers.get('content-length')).toBe(String(Buffer.byteLength('AMD64-PKG-BODY')));
+  });
+});
+
+describe('public Helper installer downloads — manifest-verified serving', () => {
+  // Filenames the test-wide binarySource mock (top of file) assigns
+  // HELPER_FILENAMES — deliberately NOT the real production names, so
+  // assertions here match what the route actually looks up in this suite.
+  const MOCK_HELPER_FILENAMES: Record<string, string> = {
+    linux: 'breeze-desktop-helper-linux-amd64',
+    darwin: 'breeze-desktop-helper-darwin',
+    windows: 'breeze-desktop-helper-windows.exe',
+  };
+
+  beforeEach(() => {
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    fetchVerifiedHelperInstallerMock.mockClear();
+    fetchVerifiedHelperInstallerMock.mockImplementation(async (os: string) => {
+      const buffer = Buffer.from(`${os.toUpperCase()}-HELPER-BODY`);
+      return {
+        buffer,
+        artifact: {
+          assetName: MOCK_HELPER_FILENAMES[os],
+          sha256: 'b'.repeat(64),
+          size: buffer.length,
+          release: 'v1.2.3',
+          repository: 'lanternops/breeze',
+          platformTrust: null,
+          intendedUse: null,
+          edition: 'self-host',
+          signingIdentity: null,
+          signingTeamId: null,
+        },
+      };
+    });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    fetchVerifiedHelperInstallerMock.mockReset();
+  });
+
+  it('rejects invalid OS/arch before ever calling the verified fetch', async () => {
+    const badOs = await downloadRoutes.request('/download/helper/solaris/amd64');
+    expect(badOs.status).toBe(400);
+    const badArch = await downloadRoutes.request('/download/helper/linux/sparc');
+    expect(badArch.status).toBe(400);
+    expect(fetchVerifiedHelperInstallerMock).not.toHaveBeenCalled();
+  });
+
+  it('serves manifest-verified bytes with the artifact headers, not a redirect', async () => {
+    const res = await downloadRoutes.request('/download/helper/darwin/amd64');
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get('location')).toBeNull();
+    expect(res.headers.get('content-disposition')).toContain(MOCK_HELPER_FILENAMES.darwin);
+    expect(res.headers.get('x-breeze-artifact-sha256')).toBe('b'.repeat(64));
+    expect(await res.text()).toBe('DARWIN-HELPER-BODY');
+    expect(fetchVerifiedHelperInstallerMock).toHaveBeenCalledWith('darwin');
+  });
+
+  it('serves the OS-appropriate installer for windows and linux too', async () => {
+    const win = await downloadRoutes.request('/download/helper/windows/amd64');
+    expect(win.status).toBe(200);
+    expect(win.headers.get('content-disposition')).toContain(MOCK_HELPER_FILENAMES.windows);
+
+    const linux = await downloadRoutes.request('/download/helper/linux/amd64');
+    expect(linux.status).toBe(200);
+    expect(linux.headers.get('content-disposition')).toContain(MOCK_HELPER_FILENAMES.linux);
+  });
+
+  it('fails closed (503) with a sanitized body when manifest verification fails — the core regression guard', async () => {
+    // The route verifies the hash/manifest at serve time: any verification
+    // failure refuses to serve rather than falling back to unverified bytes.
+    fetchVerifiedHelperInstallerMock.mockRejectedValue(new Error('digest mismatch at /private/path'));
+
+    const res = await downloadRoutes.request('/download/helper/darwin/amd64');
+    const body = await res.text();
+
+    expect(res.status).toBe(503);
+    expect(res.headers.get('retry-after')).toBe('30');
+    expect(body).not.toContain('digest mismatch');
+    expect(body).not.toContain('/private/path');
+  });
+
+  it('never falls back to a GitHub redirect or S3 presign for the helper installer', async () => {
+    vi.mocked(getBinarySource).mockReturnValue('github');
+    vi.mocked(isS3Configured).mockReturnValue(true);
+
+    const res = await downloadRoutes.request('/download/helper/darwin/amd64');
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get('location')).toBeNull();
+    expect(getPresignedUrl).not.toHaveBeenCalled();
+
+    vi.mocked(getBinarySource).mockReturnValue('local');
+    vi.mocked(isS3Configured).mockReturnValue(false);
   });
 });
 
@@ -887,18 +1196,43 @@ describe('GET /install.sh — generated installer script', () => {
     expect(backupStepIdx).toBeGreaterThan(agentInstalledIdx);
   });
 
+  it('never appends the deprecated --site-id to the enroll command (#8474)', async () => {
+    const script = await fetchScript();
+    // Positive anchor: both the darwin and linux enroll blocks still exist.
+    expect(script.match(/ENROLL_ARGS=\(enroll --server "\$BREEZE_SERVER"\)/g)).toHaveLength(2);
+    // The arg parser keeps a `--site-id)` case (accept and ignore); no other
+    // `--site-id` may remain on any ENROLL_ARGS or enroll line.
+    expect(script).not.toMatch(/ENROLL_ARGS[^\n]*--site-id/);
+    expect(script).not.toMatch(/enroll[^\n]*--site-id/);
+  });
+
   it('accepts a --token argument for enrollment-key based enrollment', async () => {
     const script = await fetchScript();
-    // Argument parser handles --token and forwards it to `enroll` as the
-    // positional enrollment key (the flow the Add Device UI uses).
+    // Argument parser handles --token; the script's own $BREEZE_ENROLL_TOKEN
+    // variable then carries it (the flow the Add Device UI uses).
     expect(script).toContain('--token)');
-    expect(script.match(/ENROLL_ARGS=\(enroll\)/g)).toHaveLength(2);
-    // The token and conditional secret must be appended in BOTH the darwin
-    // and linux branches — a single match means one platform lost enrollment.
-    expect(script.match(/ENROLL_ARGS\+=\("\$BREEZE_ENROLL_TOKEN"\)/g)).toHaveLength(2);
+    expect(script.match(/ENROLL_ARGS=\(enroll --server "\$BREEZE_SERVER"\)/g)).toHaveLength(2);
+    // The token and secret must never be appended to ENROLL_ARGS (argv) — see
+    // the next assertion — and the enroll invocation that consumes them via
+    // environment variables must appear in BOTH the darwin and linux
+    // branches — a single match means one platform lost enrollment.
+    expect(script).not.toContain('ENROLL_ARGS+=("$BREEZE_ENROLL_TOKEN")');
+    expect(script).not.toContain('--enrollment-secret "$BREEZE_ENROLLMENT_SECRET"');
     expect(
-      script.match(/ENROLL_ARGS\+=\(--enrollment-secret "\$BREEZE_ENROLLMENT_SECRET"\)/g),
+      script.match(
+        /BREEZE_AGENT_ENROLLMENT_KEY="\$BREEZE_ENROLL_TOKEN" BREEZE_AGENT_ENROLLMENT_SECRET="\$BREEZE_ENROLLMENT_SECRET"/g,
+      ),
     ).toHaveLength(2);
+  });
+
+  it('never places the enrollment token or secret in the enroll command argv', async () => {
+    const script = await fetchScript();
+    // The token/secret must reach breeze-agent only via environment
+    // variables scoped to the enroll invocation, never as CLI arguments —
+    // another local account can read a process's argv but not its
+    // environment.
+    expect(script).not.toMatch(/ENROLL_ARGS\+=\(\s*"\$BREEZE_ENROLL_TOKEN"/);
+    expect(script).not.toMatch(/ENROLL_ARGS\+=\(--enrollment-secret/);
   });
 
   it('requires the enrollment token, treating --enrollment-secret as a supplement', async () => {
@@ -947,6 +1281,156 @@ describe('GET /install.sh — generated installer script', () => {
   it('documents --token usage in the script header', async () => {
     const script = await fetchScript();
     expect(script).toContain('--token YOUR_ENROLLMENT_TOKEN');
+  });
+});
+
+describe('install.sh — Linux data dir, breeze group and agent version floor (#9566)', () => {
+  async function fetchScript(): Promise<string> {
+    const res = await downloadRoutes.request('/install.sh');
+    return res.text();
+  }
+
+  it('creates /var/lib/breeze and the breeze group before enrolling', async () => {
+    const script = await fetchScript();
+    const mkdirAt = script.indexOf('mkdir -p /var/lib/breeze');
+    const groupAt = script.indexOf('groupadd --system breeze');
+    const enrollAt = script.indexOf('# ----- Enroll agent -----');
+    expect(mkdirAt).toBeGreaterThan(-1);
+    expect(groupAt).toBeGreaterThan(-1);
+    expect(enrollAt).toBeGreaterThan(mkdirAt);
+    expect(enrollAt).toBeGreaterThan(groupAt);
+    expect(script).toContain('command -v groupadd');
+  });
+
+  it('explains version skew instead of leaving the bare cobra arity error', async () => {
+    const script = await fetchScript();
+    expect(script).toContain('MIN_AGENT_VERSION="0.118.0"');
+    expect(script).toContain("older than this server's install flow");
+    expect(script).toContain('Set BREEZE_VERSION on the server');
+    // The check must run before the existing install is replaced.
+    expect(script.indexOf('MIN_AGENT_VERSION="0.118.0"')).toBeLessThan(
+      script.indexOf('# ----- Install binary -----'),
+    );
+  });
+
+  describe('version floor, executed', () => {
+    let tmp: string;
+    beforeEach(() => {
+      tmp = mkdtempSync(join(tmpdir(), 'breeze-minver-'));
+    });
+    afterEach(() => {
+      rmSync(tmp, { recursive: true, force: true });
+    });
+
+    async function runFloor(versionOutput: string | null): Promise<{ code: number; output: string }> {
+      const script = await fetchScript();
+      const start = script.indexOf('MIN_AGENT_VERSION="0.118.0"');
+      const end = script.indexOf('# ----- Stop existing service');
+      const block = script.slice(start, end);
+      const bin = join(tmp, 'agent');
+      writeFileSync(
+        bin,
+        versionOutput === null ? '#!/bin/sh\nexit 1\n' : `#!/bin/sh\necho '${versionOutput}'\n`,
+        { mode: 0o755 },
+      );
+      const harness = join(tmp, 'harness.sh');
+      writeFileSync(harness, `set -euo pipefail\nfatal() { echo "FATAL: $*"; exit 1; }\nTMPFILE='${bin}'\n${block}\necho PASSED\n`);
+      return new Promise((resolve) => {
+        execFile('bash', [harness], (err, stdout, stderr) => {
+          resolve({ code: err && typeof err.code === 'number' ? err.code : err ? 1 : 0, output: `${stdout}${stderr}` });
+        });
+      });
+    }
+
+    it('fails clearly for an agent older than the floor', async () => {
+      const r = await runFloor('Breeze Agent v0.117.9');
+      expect(r.code).toBe(1);
+      expect(r.output).toContain('FATAL');
+      expect(r.output).toContain('v0.117.9');
+      expect(r.output).toContain('BREEZE_VERSION');
+    });
+
+    it.each(['Breeze Agent v0.118.0', 'Breeze Agent v0.124.0', 'Breeze Agent v1.0.0', 'Breeze Agent v0.200.1', 'Breeze Agent v10.2.3'])(
+      'lets %s through',
+      async (out) => {
+        const r = await runFloor(out);
+        expect(r.code).toBe(0);
+        expect(r.output).toContain('PASSED');
+      },
+    );
+
+    it('lets unparseable or unexecutable versions through (conservative)', async () => {
+      expect((await runFloor('Breeze Agent vdev')).output).toContain('PASSED');
+      expect((await runFloor(null)).output).toContain('PASSED');
+    });
+  });
+});
+
+describe('install.sh — macOS enrolls with the binary the .pkg actually installed (#8778)', () => {
+  // The .pkg (agent/installer/macos/install-location.sh) installs to
+  // /Library/Breeze/bin when the agent is already there or /usr/local/bin is
+  // unsafe for a root daemon, else to /usr/local/bin. install.sh used to
+  // enroll with a hard-coded /usr/local/bin/breeze-agent. The resolver is run
+  // here against temp directories standing in for the two real ones.
+  let tmp: string;
+  let legacy: string;
+  let trusted: string;
+  let fn: string;
+
+  beforeEach(async () => {
+    const res = await downloadRoutes.request('/install.sh');
+    const script = await res.text();
+    const m = script.match(/^resolve_macos_agent_bin\(\) \{[\s\S]*?^\}$/m);
+    expect(m, 'install.sh defines resolve_macos_agent_bin').not.toBeNull();
+    fn = m![0];
+    tmp = mkdtempSync(join(tmpdir(), 'breeze-mac-bin-'));
+    legacy = join(tmp, 'usr-local-bin');
+    trusted = join(tmp, 'Library-Breeze-bin');
+    mkdirSync(legacy);
+    mkdirSync(trusted);
+  });
+
+  afterEach(() => {
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  function resolve(): { code: number; out: string } {
+    const harness = `${fn}\nINSTALL_DIR='${legacy}'\nMACOS_TRUSTED_BIN_DIR='${trusted}'\nBINARY_NAME=breeze-agent\nresolve_macos_agent_bin`;
+    try {
+      return { code: 0, out: execFileSync('bash', ['-c', harness]).toString().trim() };
+    } catch (e) {
+      return { code: (e as { status?: number }).status ?? 1, out: '' };
+    }
+  }
+  const agent = (dir: string) => writeFileSync(join(dir, 'breeze-agent'), '#!/bin/sh\n', { mode: 0o755 });
+
+  it('uses /Library/Breeze/bin when the .pkg installed there (the reported case)', () => {
+    agent(trusted);
+    expect(resolve()).toEqual({ code: 0, out: join(trusted, 'breeze-agent') });
+  });
+
+  it('uses /usr/local/bin when the .pkg installed there', () => {
+    agent(legacy);
+    expect(resolve()).toEqual({ code: 0, out: join(legacy, 'breeze-agent') });
+  });
+
+  it('prefers /Library/Breeze/bin over a leftover pre-relocation /usr/local/bin copy', () => {
+    agent(legacy);
+    agent(trusted);
+    expect(resolve()).toEqual({ code: 0, out: join(trusted, 'breeze-agent') });
+  });
+
+  it('fails when neither location has an executable agent', () => {
+    expect(resolve().code).not.toBe(0);
+  });
+
+  it('enrolls through the resolved path, not a hard-coded /usr/local/bin', async () => {
+    const res = await downloadRoutes.request('/install.sh');
+    const script = await res.text();
+    const mac = script.slice(script.indexOf('installer -pkg'), script.indexOf('Agent enrolled successfully'));
+    expect(mac).toContain('MACOS_AGENT_BIN="$(resolve_macos_agent_bin)"');
+    expect(mac).toContain('"$MACOS_AGENT_BIN" "${ENROLL_ARGS[@]}"');
+    expect(mac).not.toContain('"$INSTALL_DIR/$BINARY_NAME" "${ENROLL_ARGS[@]}"');
   });
 });
 
@@ -1002,7 +1486,7 @@ describe('GET /uninstall.sh — generated uninstaller script', () => {
     const tmp = mkdtempSync(join(tmpdir(), 'breeze-uninstall-exec-'));
     const calls = join(tmp, 'calls');
     try {
-      for (const name of ['id', 'uname', 'launchctl', 'pkgutil', 'rm', 'ps']) {
+      for (const name of ['id', 'uname', 'launchctl', 'pkgutil', 'rm', 'rmdir', 'ps']) {
         let body = '#!/bin/sh\nprintf "%s %s\\n" "${0##*/}" "$*" >> "$FIXTURE_CALLS"\n';
         if (name === 'id') body += 'echo 0\n';
         if (name === 'uname') body += 'echo Darwin\n';
@@ -1030,7 +1514,13 @@ describe('GET /uninstall.sh — generated uninstaller script', () => {
       }
       for (const binary of ['breeze-agent', 'breeze-watchdog', 'breeze-backup', 'breeze-desktop-helper']) {
         expect(commands).toContain(`/usr/local/bin/${binary}`);
+        // #7831: both install locations, whichever one was live.
+        expect(commands).toContain(`/Library/Breeze/bin/${binary}`);
       }
+      // #7831: the empty trusted-dir tree goes, and a launchd disable left by
+      // self_uninstall is cleared so a reinstall's bootstrap does not hit EIO 5.
+      expect(commands).toContain('rmdir /Library/Breeze/pkg-staging /Library/Breeze/bin /Library/Breeze');
+      expect(commands).toContain('launchctl enable system/com.breeze.agent');
       expect(commands).not.toContain('rm -rf');
       expect(commands).not.toContain('com.breeze.agent-user');
       expect(commands).not.toContain('com.breeze.helper');
@@ -1408,5 +1898,208 @@ describe('raw agent MSI download', () => {
     expect(res.status).toBe(404);
     expect(body).not.toContain('/tmp/breeze-secret-agent-binaries');
     expect(body).not.toContain('AGENT_BINARY_DIR');
+  });
+});
+
+describe('public RustDesk host MSI download', () => {
+  const originalAgentDir = process.env.AGENT_BINARY_DIR;
+  const originalHostDir = process.env.CLOUDCOM_RUSTDESK_HOST_DIR;
+  beforeEach(() => { delete process.env.CLOUDCOM_RUSTDESK_HOST_DIR; });
+
+  afterEach(() => {
+    if (originalAgentDir === undefined) delete process.env.AGENT_BINARY_DIR;
+    else process.env.AGENT_BINARY_DIR = originalAgentDir;
+    if (originalHostDir === undefined) delete process.env.CLOUDCOM_RUSTDESK_HOST_DIR;
+    else process.env.CLOUDCOM_RUSTDESK_HOST_DIR = originalHostDir;
+    vi.restoreAllMocks();
+  });
+
+  it('keeps pinned host downloads separate from the stable package', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'breeze-managed-host-versioned-'));
+    try {
+      process.env.CLOUDCOM_RUSTDESK_HOST_DIR = dir;
+      writeFileSync(join(dir, 'cloudcom-rustdesk-host.msi'), 'stable-68');
+      writeFileSync(join(dir, 'cloudcom-rustdesk-host-1.5.0.68.msi'), 'pinned-68');
+      writeFileSync(join(dir, 'cloudcom-rustdesk-host-1.5.0.69.msi'), 'canary-69');
+      const stable = await downloadRoutes.request('/download/rustdesk/windows/amd64/msi');
+      const previous = await downloadRoutes.request('/download/rustdesk/windows/amd64/msi/1.5.0.68');
+      const canary = await downloadRoutes.request('/download/rustdesk/windows/amd64/msi/1.5.0.69');
+      expect(await stable.text()).toBe('stable-68');
+      expect(await previous.text()).toBe('pinned-68');
+      expect(canary.status).toBe(200);
+      expect(await canary.text()).toBe('canary-69');
+      expect(canary.headers.get('content-disposition')).toBe('attachment; filename="cloudcom-rustdesk-host-1.5.0.69.msi"');
+      expect((await downloadRoutes.request('/download/rustdesk/windows/amd64/msi/unknown')).status).toBe(404);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('applies the public download rate limit to pinned host packages', async () => {
+    rateLimiterMock.mockResolvedValueOnce({ allowed: false, remaining: 0, resetAt: new Date() });
+    const res = await downloadRoutes.request('/download/rustdesk/windows/amd64/msi/1.5.0.69');
+    expect(res.status).toBe(429);
+  });
+
+  it('serves the staged host MSI bytes verbatim', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'breeze-rustdesk-host-msi-test-'));
+    try {
+      const content = Buffer.from('fake-rustdesk-host-msi-bytes');
+      writeFileSync(join(dir, 'cloudcom-rustdesk-host.msi'), content);
+      process.env.AGENT_BINARY_DIR = dir;
+
+      const res = await downloadRoutes.request('/download/rustdesk/windows/amd64/msi');
+      expect(res.status).toBe(200);
+      expect(res.headers.get('content-disposition')).toBe('attachment; filename="cloudcom-rustdesk-host.msi"');
+      expect(Buffer.from(await res.arrayBuffer()).equals(content)).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('404s without disclosing the host MSI directory when the file is absent', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    process.env.AGENT_BINARY_DIR = '/tmp/breeze-secret-rustdesk-host-binaries';
+
+    const res = await downloadRoutes.request('/download/rustdesk/windows/amd64/msi');
+    const body = await res.text();
+
+    expect(res.status).toBe(404);
+    expect(body).not.toContain('/tmp/breeze-secret-rustdesk-host-binaries');
+    expect(body).not.toContain('AGENT_BINARY_DIR');
+  });
+
+  it('keeps the managed host artifact independent of agent binary promotions', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'breeze-managed-host-stable-'));
+    try {
+      writeFileSync(join(dir, 'cloudcom-rustdesk-host.msi'), 'stable-host-package');
+      process.env.CLOUDCOM_RUSTDESK_HOST_DIR = dir;
+      process.env.AGENT_BINARY_DIR = '/missing/new-agent-release';
+      const res = await downloadRoutes.request('/download/rustdesk/windows/amd64/msi');
+      expect(res.status).toBe(200);
+      expect(await res.text()).toBe('stable-host-package');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('per-IP rate limiting on the remaining unauthenticated agent/helper download routes', () => {
+  beforeEach(() => {
+    rateLimiterMock.mockReset();
+    rateLimiterMock.mockImplementation(async () => ({ allowed: true, remaining: 19, resetAt: new Date() }));
+  });
+
+  it('rate-limits the agent component download per client IP', async () => {
+    rateLimiterMock.mockResolvedValueOnce({ allowed: false, remaining: 0, resetAt: new Date() });
+
+    const res = await downloadRoutes.request('/download/linux/amd64');
+
+    expect(res.status).toBe(429);
+    expect(rateLimiterMock).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.stringContaining('public-agent-download:'),
+      expect.any(Number),
+      expect.any(Number),
+    );
+  });
+
+  it('rate-limits the watchdog component download per client IP', async () => {
+    rateLimiterMock.mockResolvedValueOnce({ allowed: false, remaining: 0, resetAt: new Date() });
+
+    const res = await downloadRoutes.request('/download/watchdog/linux/amd64');
+
+    expect(res.status).toBe(429);
+  });
+
+  it('rate-limits the helper installer download per client IP, before any verified fetch', async () => {
+    rateLimiterMock.mockResolvedValueOnce({ allowed: false, remaining: 0, resetAt: new Date() });
+    fetchVerifiedHelperInstallerMock.mockClear();
+
+    const res = await downloadRoutes.request('/download/helper/darwin/amd64');
+
+    expect(res.status).toBe(429);
+    expect(fetchVerifiedHelperInstallerMock).not.toHaveBeenCalled();
+    expect(rateLimiterMock).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.stringContaining('public-agent-download:helper-download:'),
+      expect.any(Number),
+      expect.any(Number),
+    );
+  });
+
+  it('rate-limits the raw MSI download per client IP', async () => {
+    rateLimiterMock.mockResolvedValueOnce({ allowed: false, remaining: 0, resetAt: new Date() });
+
+    const res = await downloadRoutes.request('/download/windows/amd64/msi');
+
+    expect(res.status).toBe(429);
+  });
+
+  it('rate-limits install.sh per client IP', async () => {
+    rateLimiterMock.mockResolvedValueOnce({ allowed: false, remaining: 0, resetAt: new Date() });
+
+    const res = await downloadRoutes.request('/install.sh');
+
+    expect(res.status).toBe(429);
+  });
+
+  it('rate-limits uninstall.sh per client IP', async () => {
+    rateLimiterMock.mockResolvedValueOnce({ allowed: false, remaining: 0, resetAt: new Date() });
+
+    const res = await downloadRoutes.request('/uninstall.sh');
+
+    expect(res.status).toBe(429);
+  });
+
+  it('fails closed (503) when Redis is unavailable for the component download limiter', async () => {
+    const { getRedis } = await import('../../services');
+    vi.mocked(getRedis).mockReturnValueOnce(null);
+
+    const res = await downloadRoutes.request('/download/linux/amd64');
+
+    expect(res.status).toBe(503);
+  });
+});
+
+// Server-only images: the local binaries volume holds the PAIRED binaries
+// release, so the local-mode "is this the build on disk?" guard must compare a
+// requested version against the pairing (via the real getBinariesVersion), not
+// the server's own BREEZE_VERSION.
+describe('local-mode version guard follows the binaries pairing', () => {
+  const originalEnv = process.env;
+
+  beforeEach(async () => {
+    process.env = { ...originalEnv };
+    delete process.env.BINARY_VERSION;
+    process.env.BREEZE_VERSION = '0.118.2';
+    process.env.BREEZE_BINARIES_VERSION = '0.118.0';
+    const actual = await vi.importActual<typeof import('../../services/binarySource')>(
+      '../../services/binarySource',
+    );
+    vi.mocked(getBinarySource).mockReturnValue('local');
+    vi.mocked(getGithubReleaseVersion).mockImplementation(actual.getBinariesVersion);
+    vi.mocked(getRegisteredComponentVersion).mockResolvedValue('0.118.0');
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+  });
+
+  afterEach(() => {
+    process.env = originalEnv;
+    vi.mocked(getGithubReleaseVersion).mockReset();
+    vi.mocked(getGithubReleaseVersion).mockReturnValue('latest');
+    vi.mocked(getRegisteredComponentVersion).mockReset();
+    vi.mocked(getRegisteredComponentVersion).mockResolvedValue(null);
+    vi.restoreAllMocks();
+  });
+
+  it('serves a request for the paired version (not a 409)', async () => {
+    const res = await downloadRoutes.request('/download/linux/amd64?version=0.118.0');
+    // No binary staged in this test env: 404 proves the guard let it through.
+    expect(res.status).toBe(404);
+  });
+
+  it("refuses a request for the server's own version, which has no binaries", async () => {
+    const res = await downloadRoutes.request('/download/linux/amd64?version=0.118.2');
+    expect(res.status).toBe(409);
   });
 });

@@ -5,6 +5,41 @@ vi.mock('../services/mfaPolicyActivation', async (importOriginal) => ({
   lockMfaPolicySettings: vi.fn().mockResolvedValue(undefined),
   countMfaPolicyLockouts: vi.fn().mockResolvedValue(0),
 }));
+// PR #7117 T3 — site delete removes the site's owned topology alerts first
+// (proven against real Postgres in siteDeleteTopologyAlerts.integration).
+// M4-D2 (#6000) — it also deletes the site's pinned topology AI investigations
+// in the same transaction (children-first order proven against real Postgres
+// in topologyAiSessionLifecycle / siteTopologySessions integration suites).
+const siteDelete = vi.hoisted(() => ({
+  calls: [] as string[],
+  lockSiteForDelete: vi.fn(async () => true),
+  deleteSiteOwnedTopologyAlerts: vi.fn(async () => 0),
+  deleteSiteTopologyAiSessions: vi.fn(async () => ({
+    investigations: 0, messages: 0, toolExecutions: 0, actionPlans: 0, screenshots: 0, screenshotStorageKeys: [] as string[],
+  })),
+  removeUnreferencedScreenshotFiles: vi.fn(async (_keys: readonly string[], _context: string) => ({
+    removed: 0, missing: 0, failed: 0, unresolvable: 0, stillReferenced: 0,
+  })),
+  // Records when deferred work was handed over, then runs it (the real helper
+  // starts it once the request transaction has settled).
+  runAfterDbContextExit: vi.fn((_label: string, work: () => unknown) => {
+    siteDelete.calls.push('afterContextExit');
+    return work();
+  }),
+}));
+vi.mock('../services/siteOwnedAlerts', () => ({
+  lockSiteForDelete: siteDelete.lockSiteForDelete,
+  deleteSiteOwnedTopologyAlerts: siteDelete.deleteSiteOwnedTopologyAlerts,
+}));
+vi.mock('../services/topology/siteTopologySessions', () => ({
+  deleteSiteTopologyAiSessions: siteDelete.deleteSiteTopologyAiSessions,
+}));
+// #8117 — the deleted investigations' screenshot FILES are removed once the
+// request transaction settles, re-checked against the rows (file side proven in
+// screenshotStorage.files.test.ts).
+vi.mock('../services/screenshotStorage', () => ({
+  removeUnreferencedScreenshotFiles: siteDelete.removeUnreferencedScreenshotFiles,
+}));
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Hono } from 'hono';
 import { orgRoutes } from './orgs';
@@ -15,6 +50,12 @@ vi.mock('../services/monitors/builtInMonitors', () => ({
   ensureBuiltInMonitorsForPartner: vi.fn(async () => ({ provisioned: true, monitorIds: [] })),
   ensureBuiltInMonitorsForAllPartners: vi.fn(async () => ({ provisioned: 0, skipped: 0, failed: 0 })),
 }));
+// #8053 — org/partner settings writes invalidate the agent heartbeat's per-org
+// caches (covered in orgs.test.ts and hotPathCache.test.ts).
+vi.mock('../services/agentOrgSettingsCache', () => ({
+  invalidateAgentOrgSettingsCaches: vi.fn(),
+}));
+vi.mock('../services/trustPage/servingSet', () => ({ scheduleServingRefreshForPartner: vi.fn() }));
 vi.mock('../db', () => {
   const db: Record<string, unknown> = {
     select: vi.fn(() => ({
@@ -57,6 +98,7 @@ vi.mock('../db', () => {
     withDbAccessContext: vi.fn(async (_ctx: any, fn: any) => fn()),
     withSystemDbAccessContext: vi.fn(async (fn: any) => fn()),
     runOutsideDbContext: vi.fn((fn: any) => fn()),
+    runAfterDbContextExit: siteDelete.runAfterDbContextExit,
     // tenantOffboarding's inCallerOrSystemDbContext (#2877) consults the
     // ambient-context metadata at runtime on the DELETE partner/org paths
     // (abort*Offboarding); undefined = no ambient context → fresh system
@@ -163,6 +205,7 @@ vi.mock('../middleware/auth', () => ({
 
 import { db } from '../db';
 import { authMiddleware } from '../middleware/auth';
+import { writeRouteAudit } from '../services/auditEvents';
 
 describe('organization routes', () => {
   let app: Hono;
@@ -541,6 +584,14 @@ describe('organization routes', () => {
               groupBy: vi.fn().mockResolvedValue([{ siteId: 'site-1', count: 1 }])
             })
           })
+        } as any)
+        // Per-site removed (decommissioned) device-count query (#7471).
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              groupBy: vi.fn().mockResolvedValue([])
+            })
+          })
         } as any);
 
       const res = await app.request(`/orgs/sites?orgId=${orgId}&page=1&limit=50`, {
@@ -598,15 +649,24 @@ describe('organization routes', () => {
         return next();
       });
 
-      vi.mocked(db.select).mockReturnValue({
-        from: vi.fn().mockReturnValue({
-          where: vi.fn().mockReturnValue({
-            limit: vi.fn().mockResolvedValue([
-              { id: 'site-1', orgId, name: 'HQ' }
-            ])
+      vi.mocked(db.select)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue([
+                { id: 'site-1', orgId, name: 'HQ' }
+              ])
+            })
           })
-        })
-      } as any);
+        } as any)
+        // GET /sites/:id also runs the grouped device-count queries (#9792).
+        .mockReturnValue({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              groupBy: vi.fn().mockResolvedValue([])
+            })
+          })
+        } as any);
 
       const res = await app.request('/orgs/sites/site-1', {
         method: 'GET',
@@ -675,7 +735,9 @@ describe('organization routes', () => {
         return next();
       });
 
-      vi.mocked(db.select).mockReturnValue({
+      // Default: `.from().where().limit()` chain (site lookup + holding-org probe);
+      // the in-transaction device guard (no `.limit()`) is queued last below.
+      const limitChain = {
         from: vi.fn().mockReturnValue({
           where: vi.fn().mockReturnValue({
             limit: vi.fn().mockResolvedValue([
@@ -683,10 +745,33 @@ describe('organization routes', () => {
             ])
           })
         })
-      } as any);
+      } as any;
+      vi.mocked(db.select)
+        .mockReturnValueOnce(limitChain)
+        .mockReturnValueOnce(limitChain)
+        // In-transaction device guard (#7471): no devices (active or removed) on the site.
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockResolvedValue([{ removed: 0, other: 0 }])
+          })
+        } as any);
 
+      siteDelete.calls.length = 0;
+      siteDelete.lockSiteForDelete.mockImplementation(async () => { siteDelete.calls.push('lock'); return true; });
+      siteDelete.deleteSiteOwnedTopologyAlerts.mockImplementation(async () => { siteDelete.calls.push('alerts'); return 2; });
+      siteDelete.deleteSiteTopologyAiSessions.mockImplementation(async () => {
+        siteDelete.calls.push('topologySessions');
+        return {
+          investigations: 1, messages: 3, toolExecutions: 2, actionPlans: 0, screenshots: 1,
+          screenshotStorageKeys: ['screenshots/o/d/f.jpg'],
+        };
+      });
+      siteDelete.removeUnreferencedScreenshotFiles.mockImplementation(async () => {
+        siteDelete.calls.push('screenshotFiles');
+        return { removed: 1, missing: 0, failed: 0, unresolvable: 0, stillReferenced: 0 };
+      });
       vi.mocked(db.delete).mockReturnValue({
-        where: vi.fn().mockResolvedValue(undefined)
+        where: vi.fn(async () => { siteDelete.calls.push('site'); })
       } as any);
 
       const res = await app.request('/orgs/sites/site-1', {
@@ -697,6 +782,60 @@ describe('organization routes', () => {
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.success).toBe(true);
+      // Pinned topology investigations and owned alerts go first, under the
+      // site row lock, in the same transaction as the site row.
+      // The screenshot files are handed to runAfterDbContextExit — i.e. removed
+      // only once the REQUEST transaction settles, not after the savepoint (#8117).
+      expect(siteDelete.calls).toEqual(['lock', 'alerts', 'topologySessions', 'site', 'afterContextExit', 'screenshotFiles']);
+      expect(siteDelete.deleteSiteTopologyAiSessions).toHaveBeenCalledWith(db, { orgId, siteId: 'site-1' });
+      expect(siteDelete.removeUnreferencedScreenshotFiles).toHaveBeenCalledWith(['screenshots/o/d/f.jpg'], expect.stringContaining('site-1'));
+      // Counts only on the audit row — never the storage keys.
+      expect(vi.mocked(writeRouteAudit)).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: 'site.delete',
+        details: {
+          removedTopologyAlerts: 2,
+          topologyInvestigationsDeleted: { investigations: 1, messages: 3, toolExecutions: 2, actionPlans: 0, screenshots: 1 },
+        },
+      }));
+    });
+
+    it('schedules no screenshot file removal when the site delete is refused (#8117)', async () => {
+      const orgId = '11111111-1111-1111-1111-111111111111';
+      vi.mocked(authMiddleware).mockImplementation((c: any, next: any) => {
+        c.set('auth', {
+          scope: 'organization',
+          partnerId: null,
+          orgId,
+          user: { id: 'user-123', email: 'test@example.com' },
+          canAccessOrg: (id: string) => id === orgId
+        });
+        return next();
+      });
+      const limitChain = {
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([{ id: 'site-1', orgId, name: 'HQ' }])
+          })
+        })
+      } as any;
+      vi.mocked(db.select)
+        .mockReturnValueOnce(limitChain)
+        .mockReturnValueOnce(limitChain)
+        // A device is still on the site → 409 before anything is deleted.
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue([{ removed: 0, other: 1 }]) })
+        } as any);
+      siteDelete.runAfterDbContextExit.mockClear();
+      siteDelete.removeUnreferencedScreenshotFiles.mockClear();
+
+      const res = await app.request('/orgs/sites/site-1', {
+        method: 'DELETE',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(409);
+      expect(siteDelete.runAfterDbContextExit).not.toHaveBeenCalled();
+      expect(siteDelete.removeUnreferencedScreenshotFiles).not.toHaveBeenCalled();
     });
   });
 

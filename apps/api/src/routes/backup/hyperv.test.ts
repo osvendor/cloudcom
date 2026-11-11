@@ -9,6 +9,31 @@ const VM_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 vi.mock('../../services', () => ({}));
 
 const executeCommandMock = vi.fn();
+// The depth-0 dispatch entry point: recorded separately, answered by the same
+// mock so every case can script the device's reply in one place.
+const executeCommandWithSystemPrecheckSpy = vi.fn();
+// Models withAuthDbAccessContext as a fresh transaction that COMMITS when its
+// callback resolves: `stack` is the contexts open right now, `committed` the
+// ids whose callback has finished.
+const authDbContexts = { seq: 0, stack: [] as number[], committed: new Set<number>() };
+function openAuthContext(): number | null {
+  return authDbContexts.stack[authDbContexts.stack.length - 1] ?? null;
+}
+const queueCommandForExecutionMock = vi.fn();
+const dispatchTrackedDbRestoreMock = vi.fn();
+vi.mock('./dbRestoreJob', () => ({
+  dispatchTrackedDbRestore: (...args: unknown[]) => dispatchTrackedDbRestoreMock(...(args as [])),
+}));
+
+// The integrity check itself is covered in restoreIntegrityGate.test.ts; here
+// only how the route uses its answer.
+const integrityGate = vi.hoisted(() => ({ gate: vi.fn(), check: vi.fn(), record: vi.fn() }));
+vi.mock('./restoreIntegrityGate', () => ({
+  gateRestoreCommand: (...args: unknown[]) => integrityGate.gate(...args),
+  checkRestoreIntegrityRequest: (...args: unknown[]) => integrityGate.check(...args),
+  recordRequestAuthorization: (...args: unknown[]) => integrityGate.record(...args),
+  restoreIntegrityResponse: (c: any, check: any) => c.json(check.body, check.status),
+}));
 const authorizeResilienceResourcesMock = vi.fn();
 const resolveAllBackupAssignedDevicesMock = vi.fn();
 
@@ -135,6 +160,11 @@ vi.mock('../../services/backupProgress', async (importOriginal) => {
 
 vi.mock('../../services/commandQueue', () => ({
   executeCommand: (...args: unknown[]) => executeCommandMock(...(args as [])),
+  executeCommandWithSystemPrecheck: (...args: unknown[]) => {
+    executeCommandWithSystemPrecheckSpy(...args);
+    return executeCommandMock(...(args as []));
+  },
+  queueCommandForExecution: (...args: unknown[]) => queueCommandForExecutionMock(...(args as [])),
   CommandTypes: {
     HYPERV_DISCOVER: 'HYPERV_DISCOVER',
     HYPERV_BACKUP: 'HYPERV_BACKUP',
@@ -160,16 +190,34 @@ vi.mock('../../middleware/auth', () => ({
   requireScope: vi.fn(() => (c: any, next: any) => next()),
   requirePermission: vi.fn(() => (c: any, next: any) => next()),
   requireMfa: vi.fn(() => (c: any, next: any) => next()),
+  withAuthDbAccessContext: vi.fn(async (_auth: any, fn: any) => {
+    const id = ++authDbContexts.seq;
+    authDbContexts.stack.push(id);
+    try {
+      return await fn();
+    } finally {
+      authDbContexts.stack.pop();
+      authDbContexts.committed.add(id);
+    }
+  }),
 }));
 
 import { authMiddleware } from '../../middleware/auth';
 import { ResilienceAuthorizationError } from '../../services/resilienceSiteAuthorization';
+import { BACKUP_HELPER_UPDATE_REQUIRED_MESSAGE } from '../../services/backupReadHelperGate';
+import { BACKUP_WRITE_HELPER_UPDATE_REQUIRED_MESSAGE } from '../../services/backupWriteHelperGate';
 
 describe('hyperv routes', () => {
   let app: Hono;
 
   beforeEach(() => {
     vi.clearAllMocks();
+    integrityGate.gate.mockResolvedValue({ ok: true });
+    integrityGate.check.mockResolvedValue({ ok: true, authorizationReason: null });
+    integrityGate.record.mockResolvedValue('authorization-1');
+    authDbContexts.seq = 0;
+    authDbContexts.stack = [];
+    authDbContexts.committed = new Set();
     selectMock.mockReset();
     selectMock.mockImplementation(() => chainMock([]));
     authState = {
@@ -220,6 +268,7 @@ describe('hyperv routes', () => {
     expect(selectMock).not.toHaveBeenCalled();
     expect(insertMock).not.toHaveBeenCalled();
     expect(executeCommandMock).not.toHaveBeenCalled();
+    expect(queueCommandForExecutionMock).not.toHaveBeenCalled();
   });
 
   it('returns an empty Hyper-V VM list', async () => {
@@ -377,7 +426,7 @@ describe('hyperv routes', () => {
         // policy-managed device.
         configId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
         provider: 'local',
-        providerConfig: { path: '/tmp/backups' },
+        providerConfigRef: { configId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', orgId: ORG_ID },
         storageEncryption: { required: false, mode: 'disabled' },
         vmName: 'Accounting VM',
         consistencyType: 'application',
@@ -389,6 +438,109 @@ describe('hyperv routes', () => {
         jobId: '44444444-4444-4444-8444-444444444444',
         resultStatus: 'completed',
       })
+    );
+  });
+
+  // The helper's write session is minted when the command is DELIVERED, on
+  // the delivery path's own connection, and only for a backup job that
+  // connection can see. A job inserted in the request transaction is still
+  // uncommitted when executeCommand pushes the command, so delivery found no
+  // live job and sent the storage destination instead of a write session.
+  it('commits the backup job before dispatching the backup, and dispatches holding no context', async () => {
+    let insertedIn: number | null = null;
+    insertMock.mockImplementationOnce(() => {
+      insertedIn = openAuthContext();
+      return chainMock([{ id: '44444444-4444-4444-8444-444444444444' }]);
+    });
+    queueDestinationConfigSelect({ provider: 's3', providerConfig: { endpoint: 'https://storage.example.com', bucket: 'b', accessKeyId: 'AKIA', secretAccessKey: 'secret' } });
+    let dispatchState: { open: number | null; jobCommitted: boolean } | null = null;
+    executeCommandMock.mockImplementationOnce(async () => {
+      dispatchState = { open: openAuthContext(), jobCommitted: insertedIn !== null && authDbContexts.committed.has(insertedIn) };
+      return { status: 'completed', stdout: JSON.stringify({ queued: true }) };
+    });
+    let ackIn: number | null = null;
+    applyBackupStartedAckMock.mockImplementationOnce(async () => { ackIn = openAuthContext(); });
+
+    const res = await app.request('/backup/hyperv/backup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({ deviceId: DEVICE_ID, vmName: 'Accounting VM', consistencyType: 'application' }),
+    });
+
+    expect(res.status).toBe(202);
+    // The job row was written inside a short context of its own...
+    expect(insertedIn).not.toBeNull();
+    // ...that had committed by the time the command was dispatched, and the
+    // dispatch (which waits on the device) held no context at all.
+    expect(dispatchState).toEqual({ open: null, jobCommitted: true });
+    // No context is held across the wait, so the precheck opens its own and
+    // must be told which organization the request decided under.
+    expect(executeCommandWithSystemPrecheckSpy).toHaveBeenCalledWith(
+      DEVICE_ID,
+      'HYPERV_BACKUP',
+      expect.objectContaining({ jobId: '44444444-4444-4444-8444-444444444444' }),
+      expect.objectContaining({ userId: 'user-123', expectedOrgId: ORG_ID }),
+    );
+    // Recording the device's reply writes the job again, in a fresh context.
+    expect(ackIn).not.toBeNull();
+    expect(ackIn).not.toBe(insertedIn);
+  });
+
+  it('writes a failed result into a context of its own after the dispatch', async () => {
+    insertMock.mockReturnValueOnce(chainMock([{ id: '44444444-4444-4444-8444-444444444444' }]));
+    queueDestinationConfigSelect();
+    executeCommandMock.mockResolvedValueOnce({ status: 'failed', error: 'helper crashed', stdout: 'not json' });
+    let markedIn: number | null = null;
+    markBackupJobFailedIfInFlightMock.mockImplementationOnce(async () => { markedIn = openAuthContext(); });
+
+    const res = await app.request('/backup/hyperv/backup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({ deviceId: DEVICE_ID, vmName: 'Accounting VM', consistencyType: 'application' }),
+    });
+
+    expect(res.status).toBe(500);
+    expect(markBackupJobFailedIfInFlightMock).toHaveBeenCalledWith('44444444-4444-4444-8444-444444444444', expect.any(String));
+    expect(markedIn).not.toBeNull();
+  });
+
+  it('records the destination storage identity on the on-demand job it creates', async () => {
+    const jobInsert = chainMock([{ id: '44444444-4444-4444-8444-444444444444' }]);
+    insertMock.mockReturnValueOnce(jobInsert);
+    queueDestinationConfigSelect({ provider: 's3', providerConfig: { endpoint: 'https://Storage.Example.com:9443', bucket: 'Backups', accessKeyId: 'AKIA', secretAccessKey: 'secret' } });
+    executeCommandMock.mockResolvedValueOnce({ status: 'completed', stdout: JSON.stringify({ queued: true }) });
+
+    const res = await app.request('/backup/hyperv/backup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({ deviceId: DEVICE_ID, vmName: 'Accounting VM', consistencyType: 'application' }),
+    });
+
+    expect(res.status).toBe(202);
+    expect(jobInsert.values).toHaveBeenCalledWith(expect.objectContaining({
+      backupType: 'application',
+      storageIdentity: 's3::storage.example.com:9443::Backups',
+    }));
+  });
+
+  it('answers 409 and fails the job with the update message when the helper cannot write through a storage session', async () => {
+    insertMock.mockReturnValueOnce(chainMock([{ id: '44444444-4444-4444-8444-444444444444' }]));
+    
+    queueDestinationConfigSelect();
+    executeCommandMock.mockResolvedValueOnce({ status: 'failed', error: BACKUP_WRITE_HELPER_UPDATE_REQUIRED_MESSAGE });
+
+    const res = await app.request('/backup/hyperv/backup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({ deviceId: DEVICE_ID, vmName: 'Accounting VM', consistencyType: 'application' }),
+    });
+
+    expect(res.status).toBe(409);
+    const json = await res.json();
+    expect(json).toMatchObject({ error: BACKUP_WRITE_HELPER_UPDATE_REQUIRED_MESSAGE, reason: 'helper_update_required' });
+    expect(markBackupJobFailedIfInFlightMock).toHaveBeenCalledWith(
+      '44444444-4444-4444-8444-444444444444',
+      BACKUP_WRITE_HELPER_UPDATE_REQUIRED_MESSAGE,
     );
   });
 
@@ -473,7 +625,50 @@ describe('hyperv routes', () => {
     expect(applyBackupStartedAckMock).toHaveBeenCalledWith({ jobId, deviceId: DEVICE_ID, queued: true });
   });
 
-  it('dispatches Hyper-V restore using a backup_snapshots UUID', async () => {
+  // #6437: a real Hyper-V VM restore can run well past 10 minutes, so the
+  // route must dispatch async (queueCommandForExecution) and return as soon
+  // as the command is queued, instead of blocking the HTTP request on
+  // executeCommand's 10-minute waitForCommandResult poll — which terminalised
+  // any longer-running restore as failed regardless of the reaper's ceiling.
+  describe('restore integrity', () => {
+    const snapshotRow = () => {
+      selectMock.mockReturnValueOnce(chainMock([{
+        id: '55555555-5555-4555-8555-555555555555',
+        providerSnapshotId: 'hyperv-accounting-1',
+        metadata: { backupKind: 'hyperv_export' },
+        configId: 'config-1',
+      }]));
+      queueDestinationConfigSelect();
+    };
+    const post = () => app.request('/backup/hyperv/restore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({ deviceId: DEVICE_ID, snapshotId: '55555555-5555-4555-8555-555555555555', vmName: 'Recovered VM' }),
+    });
+
+    it('answers an integrity refusal and queues nothing', async () => {
+      snapshotRow();
+      integrityGate.gate.mockResolvedValueOnce({ ok: false, status: 409, body: { code: 'attestation_pending', error: 'wait' } });
+      const res = await post();
+      expect(res.status).toBe(409);
+      expect(dispatchTrackedDbRestoreMock).not.toHaveBeenCalled();
+      expect(integrityGate.gate).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        snapshotDbId: '55555555-5555-4555-8555-555555555555', targetDeviceId: DEVICE_ID, commandType: 'HYPERV_RESTORE',
+        executingDeviceId: DEVICE_ID,
+      }));
+    });
+
+    it('queues a confirmed restore with the command id its authorization is bound to', async () => {
+      snapshotRow();
+      integrityGate.gate.mockResolvedValueOnce({ ok: true, commandId: 'reserved-command' });
+      dispatchTrackedDbRestoreMock.mockResolvedValueOnce({ ok: true, command: { id: 'reserved-command', status: 'pending' }, restoreJobId: 'job-1' });
+      const res = await post();
+      expect(res.status).toBe(202);
+      expect(dispatchTrackedDbRestoreMock.mock.lastCall?.[0]).toMatchObject({ commandId: 'reserved-command' });
+    });
+  });
+
+  it('dispatches Hyper-V restore asynchronously instead of blocking on executeCommand', async () => {
     selectMock.mockReturnValueOnce(
       chainMock([
           {
@@ -489,9 +684,10 @@ describe('hyperv routes', () => {
     // already does — resolveBackupProviderConfig looks up the destination
     // config the BACKUP wrote this snapshot to.
     queueDestinationConfigSelect();
-    executeCommandMock.mockResolvedValueOnce({
-      status: 'completed',
-      stdout: JSON.stringify({ status: 'completed' }),
+    dispatchTrackedDbRestoreMock.mockResolvedValueOnce({
+      ok: true,
+      command: { id: 'command-1', status: 'sent' },
+      restoreJobId: 'restore-job-1',
     });
 
     const res = await app.request('/backup/hyperv/restore', {
@@ -505,19 +701,136 @@ describe('hyperv routes', () => {
       }),
     });
 
-    expect(res.status).toBe(200);
-    expect(executeCommandMock).toHaveBeenCalledWith(
-      DEVICE_ID,
-      'HYPERV_RESTORE',
-      {
-        snapshotId: 'hyperv-accounting-1',
+    expect(res.status).toBe(202);
+    const body = await res.json();
+    expect(body.data).toEqual(expect.objectContaining({
+      commandId: 'command-1',
+      restoreJobId: 'restore-job-1',
+      status: 'sent',
+      deviceId: DEVICE_ID,
+      vmName: 'Recovered VM',
+    }));
+    // executeCommand must NOT be used for restore dispatch any more — it is
+    // the synchronous, 10-minute-bounded path this fix removes.
+    expect(executeCommandMock).not.toHaveBeenCalled();
+    // #6974: dispatched through the restore_jobs-tracked helper so the
+    // terminal result is persisted (commandResultHandlers.hyperv_restore).
+    expect(queueCommandForExecutionMock).not.toHaveBeenCalled();
+    const opts = dispatchTrackedDbRestoreMock.mock.lastCall?.[0] as any;
+    expect(opts).toEqual(expect.objectContaining({
+      orgId: ORG_ID,
+      snapshotId: '55555555-5555-4555-8555-555555555555',
+      deviceId: DEVICE_ID,
+      userId: 'user-123',
+      commandType: 'HYPERV_RESTORE',
+      engine: 'hyperv',
+    }));
+    // The restore job id must be stamped into the command payload.
+    expect(opts.buildPayload('restore-job-1')).toEqual({
+      restoreJobId: 'restore-job-1',
+      snapshotId: 'hyperv-accounting-1',
+      vmName: 'Recovered VM',
+      generateNewId: true,
+      provider: 'local',
+      providerConfigRef: { configId: 'config-1', orgId: ORG_ID },
+    });
+    expect(opts.buildPayload('restore-job-1')).not.toHaveProperty('providerConfig');
+  });
+
+  it('reports a 502 when Hyper-V restore fails to dispatch for a non-offline reason', async () => {
+    selectMock.mockReturnValueOnce(
+      chainMock([
+          {
+            id: '55555555-5555-4555-8555-555555555555',
+            providerSnapshotId: 'hyperv-accounting-1',
+            metadata: { backupKind: 'hyperv_export' },
+            configId: 'config-1',
+          },
+      ])
+    );
+    queueDestinationConfigSelect();
+    dispatchTrackedDbRestoreMock.mockResolvedValueOnce({ ok: false, error: 'Failed to enqueue command' });
+
+    const res = await app.request('/backup/hyperv/restore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({
+        deviceId: DEVICE_ID,
+        snapshotId: '55555555-5555-4555-8555-555555555555',
         vmName: 'Recovered VM',
         generateNewId: true,
-        provider: 'local',
-        providerConfig: { path: '/tmp/backups' },
-      },
-      expect.objectContaining({ userId: 'user-123' })
+      }),
+    });
+
+    expect(res.status).toBe(502);
+    expect(await res.json()).toEqual({ error: 'Failed to enqueue command' });
+  });
+
+  // Mirrors routes/backup/restore.ts / vmrestore.ts: a device that is offline
+  // is a routine, expected dispatch outcome — not the same as a genuine
+  // enqueue/infra failure — so it must map to 409, not the blanket 502.
+  it('reports a 409 when the target device is offline', async () => {
+    selectMock.mockReturnValueOnce(
+      chainMock([
+          {
+            id: '55555555-5555-4555-8555-555555555555',
+            providerSnapshotId: 'hyperv-accounting-1',
+            metadata: { backupKind: 'hyperv_export' },
+            configId: 'config-1',
+          },
+      ])
     );
+    queueDestinationConfigSelect();
+    dispatchTrackedDbRestoreMock.mockResolvedValueOnce({
+      ok: false,
+      error: 'Device is offline, cannot execute command',
+    });
+
+    const res = await app.request('/backup/hyperv/restore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({
+        deviceId: DEVICE_ID,
+        snapshotId: '55555555-5555-4555-8555-555555555555',
+        vmName: 'Recovered VM',
+        generateNewId: true,
+      }),
+    });
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ error: 'Device is offline, cannot execute command' });
+  });
+
+  it('reports a 409 with the update instruction when the device backup helper is too old', async () => {
+    selectMock.mockReturnValueOnce(
+      chainMock([
+          {
+            id: '55555555-5555-4555-8555-555555555555',
+            providerSnapshotId: 'hyperv-accounting-1',
+            metadata: { backupKind: 'hyperv_export' },
+            configId: 'config-1',
+          },
+      ])
+    );
+    queueDestinationConfigSelect();
+    dispatchTrackedDbRestoreMock.mockResolvedValueOnce({
+      ok: false,
+      error: BACKUP_HELPER_UPDATE_REQUIRED_MESSAGE,
+    });
+
+    const res = await app.request('/backup/hyperv/restore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({
+        deviceId: DEVICE_ID,
+        snapshotId: '55555555-5555-4555-8555-555555555555',
+        vmName: 'Recovered VM',
+        generateNewId: true,
+      }),
+    });
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ error: BACKUP_HELPER_UPDATE_REQUIRED_MESSAGE });
   });
 
   // D20b item D: a snapshot that predates destination tracking (configId

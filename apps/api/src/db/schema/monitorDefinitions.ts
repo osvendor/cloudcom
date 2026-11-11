@@ -12,6 +12,7 @@ import {
   uniqueIndex,
 } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
+import type { RearmMode } from '@breeze/shared';
 import { organizations, partners } from './orgs';
 import { users } from './users';
 import { alertSeverityEnum, escalationPolicies } from './alerts';
@@ -54,6 +55,14 @@ export const monitorKindEnum = pgEnum('monitor_kind', [
   'network_check',
   // W05c1 — 2026-10-23-103000-monitor-kind-composite.sql
   'composite',
+  // W03 (hardware & RAID monitoring) —
+  // 2026-10-30-110200-monitor-kind-hardware-health.sql
+  'hardware_health',
+  // W02 (time sync) — 2026-11-10-110100-monitor-kind-time-sync.sql
+  'time_sync',
+  // W06 (workload inventory) —
+  // 2026-12-26-180000-container-image-currency-monitor.sql
+  'container_image_currency',
 ]);
 
 export const monitorDefinitions = pgTable(
@@ -68,8 +77,15 @@ export const monitorDefinitions = pgTable(
     enabled: boolean('enabled').notNull().default(true),
     condition: jsonb('condition').notNull().$type<Record<string, unknown>>(),
     severity: alertSeverityEnum('severity').notNull(),
-    cooldownMinutes: integer('cooldown_minutes').notNull().default(5),
-    autoResolve: boolean('auto_resolve').notNull().default(false),
+    // Alert re-arm lifecycle W2 (#10765): the MONITOR override. NULL = inherit
+    // the device's org override, then its partner default (no column default:
+    // a new monitor inherits). Read ONLY via services/alertLifecycle/resolve.ts;
+    // the compiler copies `?? BUILTIN` into the NOT NULL template columns.
+    // CHECK: rearm_delay_minutes (1–1440) set iff rearm_mode = 'after_delay'.
+    cooldownMinutes: integer('cooldown_minutes'),
+    autoResolve: boolean('auto_resolve'),
+    rearmMode: text('rearm_mode').$type<RearmMode>(),
+    rearmDelayMinutes: integer('rearm_delay_minutes'),
     autoResolveConditions: jsonb('auto_resolve_conditions').$type<Record<string, unknown> | null>(),
     responses: jsonb('responses').notNull().default([]).$type<Array<Record<string, unknown>>>(),
     deliveryMode: varchar('delivery_mode', { length: 16 }).notNull().default('inherit'),
@@ -95,6 +111,12 @@ export const monitorDefinitions = pgTable(
     // builtInMonitors.ts ('cpu_high' | 'memory_high' | 'disk_full'). NULL for
     // every user-authored monitor. CHECK: builtin_key IS NULL OR partner_id IS NOT NULL.
     builtinKey: varchar('builtin_key', { length: 64 }),
+    // Alert → PSA ticket (#10499 W2-A, #10528): the PSA board this monitor's
+    // alert tickets go to, overriding the bound connection's
+    // alert_ticketing.boardId. NULL = connection default. Partner-level config:
+    // only callers who can manage partner-wide config may set it (route gate).
+    // CHECK psa_board_id IS NULL OR psa_board_id > 0.
+    psaBoardId: integer('psa_board_id'),
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
   },

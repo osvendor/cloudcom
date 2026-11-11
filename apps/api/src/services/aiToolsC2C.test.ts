@@ -33,6 +33,7 @@ import { enqueueC2cRestore, enqueueC2cSync } from '../jobs/c2cEnqueue';
 import { validateToolInput } from './aiToolSchemas';
 import { createC2cSyncJobIfIdle } from './c2cJobCreation';
 import { registerC2CTools } from './aiToolsC2C';
+import { maskSecret } from '../routes/c2c/helpers';
 
 const ORG_ID = '11111111-1111-1111-1111-111111111111';
 const CONFIG_ID = '22222222-2222-2222-2222-222222222222';
@@ -51,7 +52,7 @@ const EXPECTED_TIERS: Record<(typeof EXPECTED_TOOLS)[number], number> = {
   query_c2c_connections: 1,
   query_c2c_jobs: 1,
   search_c2c_items: 1,
-  trigger_c2c_sync: 2,
+  trigger_c2c_sync: 3, // W03 (#6757): supervised
   restore_c2c_items: 3,
 };
 
@@ -233,6 +234,8 @@ function prepareHandlerMocks(toolName: string) {
   }
 }
 
+const CONNECTION_FOR_W03 = '77777777-7777-4777-8777-777777777777';
+
 describe('registerC2CTools', () => {
   let toolMap: Map<string, AiTool>;
 
@@ -304,6 +307,33 @@ describe('aiToolsC2C handlers', () => {
     expect(auth.orgCondition).toHaveBeenCalled();
   });
 
+  it('masks clientId like the REST route (routes/c2c/connections.ts:232, maskSecret), never the raw value', async () => {
+    mockSelectSequence([[
+      {
+        id: 'conn-1',
+        provider: 'm365',
+        displayName: 'Tenant A',
+        tenantId: 'tenant-1',
+        clientId: 'abcd1234efgh5678',
+        hasClientSecret: true,
+        hasRefreshToken: true,
+        hasAccessToken: true,
+        tokenExpiresAt: new Date('2026-03-10T00:00:00Z'),
+        scopes: ['mail.read'],
+        status: 'connected',
+        lastSyncAt: new Date('2026-03-02T00:00:00Z'),
+        createdAt: new Date('2026-03-01T00:00:00Z'),
+        updatedAt: new Date('2026-03-02T00:00:00Z'),
+      },
+    ]]);
+
+    const result = await toolMap.get('query_c2c_connections')!.handler({}, makeAuth());
+    const parsed = JSON.parse(result);
+
+    expect(parsed.connections[0].clientId).not.toBe('abcd1234efgh5678');
+    expect(parsed.connections[0].clientId).toBe(maskSecret('abcd1234efgh5678'));
+  });
+
   it('safeHandler returns error JSON when the handler throws', async () => {
     vi.mocked(db.select).mockImplementation(() => {
       throw new Error('boom');
@@ -326,6 +356,34 @@ describe('aiToolsC2C handlers', () => {
       configId: CONFIG_ID,
       auth,
     });
+  });
+
+  // W03-D11 (#6757, quorum QW4): the connection and the items are each
+  // org-scoped, so a multi-org caller could pair org A's items with org B's
+  // connection. The route binds both to one org; the tool must too.
+  it('refuses a target connection outside the items\' org (W03-D11)', async () => {
+    const OTHER_ORG = '99999999-9999-4999-8999-999999999999';
+    mockSelectSequence([
+      [{ id: CONNECTION_FOR_W03, orgId: OTHER_ORG }],
+      [{ id: ITEM_ID, orgId: ORG_ID, configId: CONFIG_ID }],
+    ]);
+    const result = JSON.parse(await toolMap.get('restore_c2c_items')!.handler(
+      { itemIds: [ITEM_ID], targetConnectionId: CONNECTION_FOR_W03 }, makeAuth(),
+    ));
+    expect(result.error).toBe('Target connection not found or access denied');
+    expect(db.insert).not.toHaveBeenCalled();
+  });
+
+  it('accepts a target connection in the items\' org (W03-D11)', async () => {
+    mockSelectSequence([
+      [{ id: CONNECTION_FOR_W03, orgId: ORG_ID }],
+      [{ id: ITEM_ID, orgId: ORG_ID, configId: CONFIG_ID }],
+    ]);
+    vi.mocked(db.insert).mockReturnValueOnce(createInsertChain([{ id: JOB_ID, status: 'pending' }]) as any);
+    const result = JSON.parse(await toolMap.get('restore_c2c_items')!.handler(
+      { itemIds: [ITEM_ID], targetConnectionId: CONNECTION_FOR_W03 }, makeAuth(),
+    ));
+    expect(result.error).toBeUndefined();
   });
 
   it('persists restore kind and the actual AI run subject before enqueue', async () => {

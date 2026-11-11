@@ -1,6 +1,18 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+// routes/ai.ts reaches the model registry (ticket-draft) -> candidateLoader,
+// which this file's partial schema mock does not cover. Not under test here.
+vi.mock('../services/aiModels/sessionModel', () => ({
+  resolveSessionTurn: vi.fn(),
+}));
 import { Hono } from 'hono';
 
+// Topology M4-D2: the admin/session reads resolve the caller's pinned-site visibility.
+vi.mock('../services/topology/aiSessionAccess', () => ({
+  resolveTopologySessionVisibility: vi.fn(async () => ({ kind: 'all' })),
+  topologySessionAccessCondition: vi.fn(async () => undefined),
+  topologySessionCondition: vi.fn(() => undefined),
+}));
 vi.mock('../db', () => ({
   runOutsideDbContext: vi.fn((fn) => fn()),
   withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn()),
@@ -111,6 +123,7 @@ vi.mock('../services/aiAgent', () => ({
 vi.mock('../services/aiCostTracker', () => ({
   getSessionHistory: vi.fn(),
   getUsageSummary: vi.fn(),
+  getAggregateUsageSummary: vi.fn(),
   updateBudget: vi.fn(),
 }));
 
@@ -148,6 +161,11 @@ vi.mock('../services/effectiveSettings', () => ({
   assertNotLocked: vi.fn(),
 }));
 
+vi.mock('../services/aiToolRateLimits', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../services/aiToolRateLimits')>()),
+  resolveToolRateLimitMultiplier: vi.fn(),
+}));
+
 vi.mock('../services/aiBudgetAlerts', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../services/aiBudgetAlerts')>();
   return { ...actual, evaluateAiBudgetThresholds: vi.fn().mockResolvedValue([]) };
@@ -165,9 +183,10 @@ import {
   handleApproval,
   searchSessions,
 } from '../services/aiAgent';
-import { getUsageSummary, updateBudget, getSessionHistory } from '../services/aiCostTracker';
+import { getUsageSummary, getAggregateUsageSummary, updateBudget, getSessionHistory } from '../services/aiCostTracker';
 import { evaluateAiBudgetThresholds } from '../services/aiBudgetAlerts';
 import { assertNotLocked } from '../services/effectiveSettings';
+import { resolveToolRateLimitMultiplier } from '../services/aiToolRateLimits';
 import { streamingSessionManager } from '../services/streamingSessionManager';
 import { runPreFlightChecks, abortActivePlan } from '../services/aiAgentSdk';
 
@@ -319,6 +338,16 @@ describe('AI routes', () => {
         return next();
       });
 
+      // #9667: no-org requests now aggregate across accessible orgs.
+      vi.mocked(getAggregateUsageSummary).mockResolvedValueOnce({
+        daily: { inputTokens: 0, outputTokens: 0, totalCostCents: 0, messageCount: 0 },
+        monthly: { inputTokens: 0, outputTokens: 0, totalCostCents: 0, messageCount: 0 },
+        budget: null,
+        billedTo: 'platform',
+        credits: null,
+        alerts: { fired: [] },
+      } as never);
+
       const res = await app.request('/ai/usage', {
         method: 'GET',
         headers: { Authorization: 'Bearer token' },
@@ -328,6 +357,7 @@ describe('AI routes', () => {
       const body = await res.json();
       expect(body.budget).toBeNull();
       expect(body.alerts).toEqual({ fired: [] });
+      expect(getAggregateUsageSummary).toHaveBeenCalledWith(null);
       expect(getUsageSummary).not.toHaveBeenCalled();
     });
   });
@@ -405,6 +435,33 @@ describe('AI routes', () => {
       );
     });
 
+    // #6476 — the multiplier can only raise limits; the API rejects anything
+    // outside the 1–10 integer range rather than clamping it.
+    it.each([0, -1, 11, 2.5])('rejects toolRateLimitMultiplier %s', async (m) => {
+      const res = await app.request('/ai/budget', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ toolRateLimitMultiplier: m }),
+      });
+
+      expect(res.status).toBe(400);
+      expect(updateBudget).not.toHaveBeenCalled();
+    });
+
+    it('stores a valid toolRateLimitMultiplier and checks the partner lock for it', async () => {
+      vi.mocked(updateBudget).mockResolvedValueOnce(undefined);
+
+      const res = await app.request('/ai/budget', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ toolRateLimitMultiplier: 3 }),
+      });
+
+      expect(res.status).toBe(200);
+      expect(assertNotLocked).toHaveBeenCalledWith(ORG_ID, 'aiBudgets', { toolRateLimitMultiplier: 3 });
+      expect(updateBudget).toHaveBeenCalledWith(ORG_ID, { toolRateLimitMultiplier: 3 });
+    });
+
     it('checks the partner lock against the normalised thresholds, not the raw submitted order (finding #2a)', async () => {
       // assertNotLocked (services/effectiveSettings.ts) compares with
       // isDeepStrictEqual, which is array-order-sensitive. Passing the raw body
@@ -480,7 +537,8 @@ describe('AI routes', () => {
 
       expect(getSessionHistory).toHaveBeenCalledWith(
         ORG_ID,
-        expect.objectContaining({ flagged: true })
+        expect.objectContaining({ flagged: true }),
+        { kind: 'all' },
       );
     });
   });
@@ -522,6 +580,55 @@ describe('AI routes', () => {
       const body = await res.json();
       expect(body.data).toHaveLength(1);
       expect(body.data[0].action).toContain('ai.security');
+    });
+
+    it('redacts secrets persisted in audit details before serialising (#6577)', async () => {
+      // Historical rows (pre write-side sanitiser) and direct createAuditLog
+      // writers can hold raw tool input in details.
+      const planted = 'ghp_PLANTEDsecretTOKENvalue6577abcdef';
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            orderBy: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue([
+                {
+                  id: 'event-2',
+                  timestamp: new Date(),
+                  action: 'ai.tool.manage_backup_configs',
+                  actorType: 'user',
+                  actorEmail: 'test@example.com',
+                  resourceType: 'ai_session',
+                  resourceId: SESSION_ID,
+                  result: 'success',
+                  errorMessage: null,
+                  details: {
+                    toolInput: {
+                      providerConfig: { accessKey: planted, secretKey: planted },
+                      apiToken: planted,
+                      note: `Authorization: Bearer ${planted}`,
+                    },
+                    durationMs: 12,
+                  },
+                },
+              ]),
+            }),
+          }),
+        }),
+      } as any);
+
+      const res = await app.request(`/ai/admin/security-events?orgId=${ORG_ID}`, {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(200);
+      const text = await res.text();
+      expect(text).not.toContain(planted);
+      const body = JSON.parse(text);
+      expect(body.data[0].details.toolInput.providerConfig.secretKey).toBe('[REDACTED]');
+      expect(body.data[0].details.toolInput.apiToken).toBe('[REDACTED]');
+      // Non-secret fields survive.
+      expect(body.data[0].details.durationMs).toBe(12);
     });
 
     it('returns 403 for unauthorized org access', async () => {
@@ -644,6 +751,59 @@ describe('AI routes', () => {
       const execFields = selectCalls[selectCalls.length - 1]![0] as Record<string, unknown>;
       expect(execFields).toHaveProperty('intentId');
       expect(execFields).toHaveProperty('tempPasswordState');
+    });
+  });
+
+  describe('GET /ai/admin/tool-executions refusal series (#10411)', () => {
+    const makeChainMock = (result: unknown[]) => {
+      const chain: any = {};
+      for (const m of ['from', 'innerJoin', 'leftJoin', 'where', 'groupBy', 'orderBy', 'limit']) chain[m] = vi.fn(() => chain);
+      chain.then = (resolve: any, reject: any) => Promise.resolve(result).then(resolve, reject);
+      return chain;
+    };
+
+    it('reports platform refusals as their own daily series, apart from approval rejections', async () => {
+      vi.mocked(db.select)
+        .mockReturnValueOnce(makeChainMock([{ status: 'rejected', count: 1 }, { status: 'refused', count: 3 }]))
+        .mockReturnValueOnce(makeChainMock([]))
+        .mockReturnValueOnce(makeChainMock([{ date: '2026-10-29', completed: '0', failed: '0', rejected: '1', refused: '3' }]))
+        .mockReturnValueOnce(makeChainMock([]));
+
+      const res = await app.request(`/ai/admin/tool-executions?orgId=${ORG_ID}`, { headers: { Authorization: 'Bearer token' } });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.summary.byStatus).toEqual({ rejected: 1, refused: 3 });
+      expect(body.timeSeries).toEqual([{ date: '2026-10-29', completed: 0, failed: 0, rejected: 1, refused: 3 }]);
+      const seriesFields = vi.mocked(db.select).mock.calls.at(-2)![0] as Record<string, unknown>;
+      expect(seriesFields).toHaveProperty('refused');
+    });
+  });
+
+  describe('M4-D2 pinned-site filter on the admin analytics reads', () => {
+    const makeChainMock = (result: unknown[]) => {
+      const chain: any = {};
+      for (const m of ['from', 'innerJoin', 'leftJoin', 'where', 'groupBy', 'orderBy', 'limit']) chain[m] = vi.fn(() => chain);
+      chain.then = (resolve: any, reject: any) => Promise.resolve(result).then(resolve, reject);
+      return chain;
+    };
+
+    it('tool-executions applies the caller\'s site condition to every query, before aggregation and LIMIT', async () => {
+      const { resolveTopologySessionVisibility, topologySessionCondition } = await import('../services/topology/aiSessionAccess');
+      const visibility = { kind: 'sites' as const, siteIds: ['site-b'] };
+      vi.mocked(resolveTopologySessionVisibility).mockResolvedValueOnce(visibility);
+      const SITE_FILTER = { sentinel: 'site-filter' };
+      vi.mocked(topologySessionCondition).mockReturnValueOnce(SITE_FILTER as never);
+      const chains = [makeChainMock([]), makeChainMock([]), makeChainMock([]), makeChainMock([])];
+      for (const chain of chains) vi.mocked(db.select).mockReturnValueOnce(chain);
+
+      const res = await app.request(`/ai/admin/tool-executions?orgId=${ORG_ID}`, { headers: { Authorization: 'Bearer token' } });
+
+      expect(res.status).toBe(200);
+      expect(topologySessionCondition).toHaveBeenCalledWith(visibility);
+      for (const chain of chains) {
+        expect(JSON.stringify(chain.where.mock.calls[0])).toContain('site-filter');
+      }
     });
   });
 
@@ -791,4 +951,52 @@ describe('AI routes', () => {
     });
   });
 
+});
+
+describe('GET /ai/tool-rate-limits (#6476)', () => {
+  let app: Hono;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    app = new Hono();
+    app.route('/ai', aiRoutes);
+  });
+
+  it('serves the effective limits for the org, scaled by its multiplier', async () => {
+    vi.mocked(resolveToolRateLimitMultiplier).mockResolvedValueOnce(3);
+
+    const res = await app.request('/ai/tool-rate-limits', {
+      method: 'GET',
+      headers: { Authorization: 'Bearer token' },
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(resolveToolRateLimitMultiplier).toHaveBeenCalledWith({ orgId: ORG_ID, partnerId: null });
+    expect(body.multiplier).toBe(3);
+    const runScript = body.limits.find((l: { toolName: string }) => l.toolName === 'run_script');
+    expect(runScript).toMatchObject({ baseLimit: 5, limit: 15, windowSeconds: 300 });
+  });
+
+  it('serves the shipped limits at multiplier 1', async () => {
+    vi.mocked(resolveToolRateLimitMultiplier).mockResolvedValueOnce(1);
+
+    const res = await app.request('/ai/tool-rate-limits', {
+      method: 'GET',
+      headers: { Authorization: 'Bearer token' },
+    });
+
+    const body = await res.json();
+    for (const row of body.limits) expect(row.limit).toBe(row.baseLimit);
+  });
+
+  it('403s for an org the caller cannot access', async () => {
+    const res = await app.request('/ai/tool-rate-limits?orgId=other-org', {
+      method: 'GET',
+      headers: { Authorization: 'Bearer token' },
+    });
+
+    expect(res.status).toBe(403);
+    expect(resolveToolRateLimitMultiplier).not.toHaveBeenCalled();
+  });
 });

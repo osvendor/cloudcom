@@ -1,7 +1,8 @@
 {
   "aiInitiator": {
-    "assistant": "Yapay zekâ asistanı",
+    "assistant": "Breeze AI",
     "agent": "Yapay zekâ ajanı",
+    "flow": "Akış",
     "originUnavailable": "Kaynak kullanılamıyor",
     "openSession": "Görüşmeyi aç",
     "openAgentRun": "Ajan çalıştırmasını aç",
@@ -21,15 +22,16 @@
     "pendingApprovals_one": "{{count}} bekleyen onay",
     "pendingApprovals_other": "{{count}} bekleyen onay",
     "tickets": "Biletler",
-    "incidents": "Olaylar",
+    "incidents": "Güvenlik Olayları",
     "remoteAccess": "Uzaktan Erişim",
     "scripts": "Komut Dosyaları",
     "patches": "Yamalar",
     "vulnerabilities": "Güvenlik Açıkları",
     "oneDrive": "OneDrive",
-    "aiForOffice": "Office için AI",
-    "networkMonitor": "Ağ İzleyicisi",
+    "aiForOffice": "Breeze AI for Office",
+    "networkMonitor": "Ağ",
     "jobs": "İşler",
+    "flows": "Akışlar",
     "monitoring": "İzleme",
     "networkDiscovery": "Ağ Keşfi",
     "edr": "EDR",
@@ -47,6 +49,8 @@
     "timesheets": "Zaman Çizelgeleri",
     "productCatalog": "Ürün Kataloğu",
     "deviceGroups": "Cihaz Grupları",
+    "sites": "Siteler",
+    "unassignedDevices": "Atanmamış Cihazlar",
     "configPolicies": "Yapılandırma Politikaları",
     "integrations": "Entegrasyonlar",
     "cloudBackup": "Bulut Yedekleme",
@@ -59,15 +63,14 @@
     "billing": "Faturalandırma",
     "organizations": "Organizasyonlar",
     "aiUsage": "Yapay Zeka Kullanımı",
+    "aiProvidersModels": "Yapay zeka sağlayıcıları ve modelleri",
     "scriptAuthoring": "Betik yazımı",
     "toolSources": "Araç Kaynakları",
     "aiAgents": "Yapay Zeka Aracıları",
-    "aiAgentRuns": "Yapay Zeka Ajan Çalıştırmaları",
-    "aiImpact": "Yapay Zeka Etkisi",
-    "fleetDesign": "Filo Tasarımı",
     "customFields": "Özel Alanlar",
     "variables": "Değişkenler",
     "savedFilters": "Kayıtlı Filtreler",
+    "moreSettings": "Diğer ayarlar",
     "users": "Kullanıcılar",
     "roles": "Roller",
     "sso": "TOA",
@@ -84,13 +87,14 @@
     "sectionExtensions": "Uzantılar",
     "llmProviderCatalog": "LLM Sağlayıcı Kataloğu",
     "aiKillSwitch": "Yapay Zeka Acil Durdurma Anahtarı",
+    "wisp": "Wisp",
     "sectionAi": "Yapay Zeka",
     "sectionFleetManagement": "Filo Yönetimi",
     "sectionBilling": "Faturalama",
     "sectionAdministration": "Yönetim",
-    "fleetOrchestration": "Filo Orkestrasyonu",
-    "aiAssistant": "Yapay Zeka Asistanı",
     "software": "Yazılım",
+    "softwareInventory": "Yazılım Envanteri",
+    "softwarePolicies": "Yazılım Politikaları",
     "securityOverview": "Genel Bakış",
     "aiRisk": "Yapay Zeka Riski",
     "deviceBackup": "Cihaz Yedekleme",
@@ -98,7 +102,29 @@
     "serviceManagement": "Servis yönetimi",
     "ticketing": "Bilet Sistemi",
     "deliverableTemplates": "Teslimat Şablonları",
-    "securityScans": "IOC Taramaları"
+    "securityScans": "IOC Taramaları",
+    "system": "Sistem",
+    "monitorConversion": "İzleyici Dönüşümü",
+    "timeSync": "Saat eşitleme",
+    "aiModels": "Yapay zeka modelleri",
+    "autopay": "Autopay",
+    "payments": "Ödemeler",
+    "ticketsIncidents": "Olaylar",
+    "ticketsServiceRequests": "Hizmet talepleri",
+    "ticketsProblems": "Sorunlar",
+    "ticketsChanges": "Değişiklikler",
+    "endpointMessages": "Mesajlar",
+    "securityDetectionRules": "Tespit Kuralları",
+    "planAndFeatures": "Plan ve özellikler",
+    "breezeAi": "Breeze AI",
+    "workersHeading": "Çalışanlar",
+    "agents": "Ajanlar",
+    "runs": "Çalıştırmalar",
+    "aiTasks": "Yapay Zekâ Görevleri",
+    "findings": "Bulgular",
+    "impact": "Etki",
+    "aiKnowledgeSources": "Bilgi kaynakları",
+    "wispLockedServer": "Wisp, Breeze Cloud üzerinde çalışır. Bu sunucuda kullanılamaz."
   },
   "documentTitles": {
     "dashboard": "Kontrol Paneli",
@@ -218,7 +244,7 @@
     "mcp": {
       "connecting": "Bir yapay zeka temsilcisine mi bağlanıyorsunuz?",
       "title": "AI temsilcinizi buraya yönlendirin",
-      "description": "Bu URL'yi MCP istemcinize (Claude.ai, ChatGPT, Cursor,…) yapıştırın. Bağlantıyı OAuth aracılığıyla yetkilendirmek için buraya geri gönderileceksiniz."
+      "description": "Bu URL'yi MCP istemcinize (Claude.ai, ChatGPT, Cursor,…) yapıştırın. Bağlantıyı OAuth aracılığıyla yetkilendirmek için buraya geri gönderileceksiniz. Bir API anahtarını mı tercih edersiniz? ai:read/ai:write kapsamıyla bir X-API-Key başlığı gönderin."
     },
     "progress": {
       "count": "{{current}} / {{total}}",
@@ -298,6 +324,17 @@
       "action": "Eylem",
       "target": "Hedef",
       "time": "Zaman"
+    },
+    "recentlyViewed": {
+      "title": "Kaldığınız yerden devam edin",
+      "kind": {
+        "device": "Cihaz",
+        "org": "Kuruluş",
+        "ticket": "Bilet",
+        "alert": "Uyarı",
+        "site": "Site",
+        "page": "Sayfa"
+      }
     },
     "alerts": {
       "title": "Son Uyarılar",
@@ -396,13 +433,23 @@
       "unratedPending": "{{count}} derecelendirilmemiş yama beklemede (otomatik onaylanmayacak)",
       "unratedPending_one": "{{count}} derecelendirilmemiş yama beklemede (otomatik onaylanmayacak)",
       "unratedPending_other": "{{count}} derecelendirilmemiş yama beklemede (otomatik onaylanmayacak)",
-      "empty": "Henüz yama verisi yok"
+      "empty": "Henüz yama verisi yok",
+      "imagesNotChecked_one": "{{count}} kapsayıcı imajı denetlenmedi",
+      "imagesNotChecked_other": "{{count}} kapsayıcı imajı denetlenmedi",
+      "devicesNeedPatches_one": "{{count}} cihazın yamaya ihtiyacı var",
+      "devicesNeedPatches_other": "{{count}} cihazın yamaya ihtiyacı var",
+      "viewPendingDevices": "Bekleyen yaması olan cihazları göster",
+      "viewFailedDevices": "Başarısız yaması olan cihazları göster",
+      "viewCriticalDevices": "Kritik yaması olan cihazları göster"
     },
     "vuln": {
       "title": "Güvenlik Açıkları",
       "criticalOpen": "Kritik açık",
       "kev": "Kullanıldığı biliniyor",
       "patchReady": "Yama mevcut",
+      "viewCritical": "Kritik CVE'leri göster",
+      "viewPatchReady": "Yaması hazır CVE'leri göster",
+      "viewOpen": "Açık CVE'leri görüntüle",
       "totalOpen": "{{count}} açık bulgular",
       "totalOpen_one": "{{count}} açık bulgu",
       "totalOpen_other": "{{count}} açık bulgular",
@@ -464,7 +511,10 @@
       "createFirst": "İlk filtrenizi oluşturun",
       "created": "Oluşturuldu {{date}}",
       "deleteConfirm": "Bu filtre silinsin mi?",
-      "duplicate": "Çoğalt"
+      "duplicate": "Çoğalt",
+      "saveFailed": "Filtre kaydedilemedi",
+      "deleteFailed": "Filtre silinemedi",
+      "ownerOrgHint": "Kayıtlı filtreler tek bir kuruluşa aittir. Bu filtrenin hangi kuruluşa ait olacağını seçin."
     },
     "targets": {
       "modes": {
@@ -482,7 +532,9 @@
       "noGroups": "Kullanılabilir cihaz grubu yok",
       "deviceCount": "{{count}} cihazlar",
       "loadSaved": "Kaydedilen filtreyi yükle:",
-      "select": "Seç"
+      "select": "Seç",
+      "dynamic": "Dinamik",
+      "refusedGroup": "Hedef olarak kullanılamaz: bu grubun kuralları cihazın kendisinin bildirdiği alanlara dayanıyor ({{fields}})."
     },
     "preview": {
       "title": "Eşleşen Cihazlar",
@@ -517,7 +569,9 @@
       "after": "peşinde",
       "between": "arasındadır",
       "withinLast": "sonuncu içinde",
-      "notWithinLast": "sonuncusu içinde değil"
+      "notWithinLast": "sonuncusu içinde değil",
+      "below": "daha düşük",
+      "atLeast": "en az"
     },
     "value": {
       "noValue": "Değere gerek yok",
@@ -539,7 +593,9 @@
       },
       "enumOverrides": {
         "decommissioned": "Çıkarıldı"
-      }
+      },
+      "softwareName": "Yazılım adı",
+      "softwareVersion": "Yazılım sürümü"
     }
   },
   "account": {
@@ -623,7 +679,7 @@
     },
     "apps": {
       "title": "Bağlı uygulamalar",
-      "description": "AI asistanları ve diğer MCP istemcileri (Claude.ai, ChatGPT, Cursor,…) sizin adınıza hareket etme yetkisine sahipsiniz. Erişimi istediğiniz zaman iptal edin; jetonlar 10 dakika içinde çalışmayı durdurur.",
+      "description": "Sizin adınıza hareket etme yetkisi verdiğiniz AI istemcileri (Claude.ai, ChatGPT, Cursor, …). Erişimi istediğiniz zaman iptal edin; jetonlar 10 dakika içinde çalışmayı durdurur.",
       "empty": "Bağlı uygulama yok",
       "emptyDescription": "Bir Claude.ai sohbetine, ChatGPT'ye, Cursor'a veya başka bir MCP istemcisine yetki verdiğinizde, daha sonra iptal edebilmeniz için burada görünecektir.",
       "authorized": "Yetkili",
@@ -633,7 +689,7 @@
       "revokeTitle": "{{app}} iptal edilsin mi?",
       "revokeDescription": "Bu müşteriye yönelik tüm hibeler ve yenileme jetonları silinecek. Jetonlar 10 dakika içinde çalışmayı durdurur. Bir sonraki kullanımınızda yeniden yetkilendirmeniz gerekecektir.",
       "onlyAppTitle": "Bu sizin tek yetkili uygulamanızdır.",
-      "onlyAppDescription": "İptal ettikten sonra, herhangi bir AI asistanının kiracınız üzerinde işlem yapabilmesi için yeniden yetkilendirme yapmanız gerekecektir.",
+      "onlyAppDescription": "İptal ettikten sonra, herhangi bir AI istemcisinin kiracınız üzerinde işlem yapabilmesi için yeniden yetkilendirme yapmanız gerekecektir.",
       "reasonPlaceholder": "Artık gerekmiyor, şüpheli etkinlik, …",
       "revokeAction": "Erişimi iptal et"
     }
@@ -662,19 +718,36 @@
       "toast": {
         "showingAll": "Tüm kuruluşlar gösteriliyor",
         "showing": "{{name}} gösteriliyor",
-        "switched": "{{name}} olarak değiştirildi"
+        "switched": "{{name}} olarak değiştirildi",
+        "linkedOrgUnavailable": "Bağlantıdaki kuruluş kullanılamıyor. Bunun yerine geçerli seçiminiz gösteriliyor."
       },
       "fleetView": "Filo görünümü · {{count}} kuruluş",
       "noSelection": "Kuruluşu seçin",
       "searchOrganizations": "Arama kuruluşları…",
       "noMatches": "Hiçbir kuruluş eşleşmiyor",
-      "legacyFilterNotice": "Organizasyon filtreleme artık başlık seçiciyi takip ediyor."
+      "legacyFilterNotice": "Organizasyon filtreleme artık başlık seçiciyi takip ediyor.",
+      "recent": "Son kullanılanlar",
+      "pane": {
+        "destinations": {
+          "overview": "Genel bakış",
+          "devices": "Cihazlar",
+          "tickets": "Biletler",
+          "alerts": "Uyarılar",
+          "sites": "Siteler",
+          "billing": "Faturalama"
+        },
+        "offlineCount": "{{count}} çevrimdışı",
+        "openCount": "{{count}} açık",
+        "criticalCount": "{{count}} kritik",
+        "noCritical": "yok",
+        "hint": "Geçiş yapmak için bir ada tıklayın · geçiş yapıp gitmek için bir sayfaya tıklayın"
+      }
     },
     "header": {
       "menu": "Menü",
       "openMenu": "Gezinme menüsünü aç",
-      "ai": "Yapay Zeka Asistanı",
-      "aiTitle": "Yapay Zeka Asistanı (Cmd+Shift+A)",
+      "ai": "Breeze AI",
+      "aiTitle": "Breeze AI (⌘⇧A)",
       "help": "Yardım ve dokümanlar",
       "helpTitle": "Yardım ve Belgeler (Cmd+Shift+H)",
       "theme": "Tema",
@@ -718,9 +791,9 @@
     },
     "search": {
       "prompt": "Ara Breeze",
-      "placeholder": "Cihazları, komut dosyalarını, uyarıları, kullanıcıları, ayarları arayın…",
+      "placeholder": "Cihazları, komut dosyalarını, uyarıları, ayarları arayın…",
       "searching": "Aranıyor…",
-      "startTyping": "Cihazlar, komut dosyaları, uyarılar, kullanıcılar ve ayarlar arasında arama yapmak için yazmaya başlayın.",
+      "startTyping": "Cihazlar, komut dosyaları, uyarılar ve ayarlar arasında arama yapmak için yazmaya başlayın.",
       "noResults": "Sonuç bulunamadı. Farklı bir sorgu deneyin.",
       "navigationHint": "Gezinmek için okları kullanın, açmak için Enter'ı kullanın",
       "closeHint": "Esc kapatılacak",
@@ -743,8 +816,13 @@
         "alertRules": "Uyarı kuralları",
         "alertRulesDescription": "Yapılandırma Politikalarında uyarıları yönetin",
         "keyboardShortcuts": "Klavye kısayolları",
-        "keyboardShortcutsDescription": "Tüm tuşlar ve tuş dizileri tek kartta"
-      }
+        "keyboardShortcutsDescription": "Tüm tuşlar ve tuş dizileri tek kartta",
+        "askBreezeAi": "Breeze AI’a sor",
+        "askBreezeAiDescription": "Breeze AI yan panelini aç",
+        "wispHome": "Wisp’i aç",
+        "wispHomeDescription": "Wisp ana sayfanıza gidin"
+      },
+      "numberHint": "Açmak için {{mod}}1–9"
     },
     "notifications": {
       "title": "Bildirimler",
@@ -784,9 +862,9 @@
       "expand": "Kenar çubuğunu genişlet",
       "collapseSections": "Tüm bölümleri daralt",
       "closeMenu": "Menüyü kapat",
-      "recentDevices": "Son açılan cihazlar",
-      "hideRecentDevices": "Son açılan cihazları gizle",
-      "showRecentDevices": "Son açılan cihazları göster"
+      "recent": "Son açılanlar",
+      "hideRecent": "Son açılanları gizle",
+      "showRecent": "Son açılanları göster"
     },
     "orgRequired": {
       "title": "Bir kuruluş seçin",
@@ -809,8 +887,35 @@
       "cycleSidebar": "Kenar çubuğu modunu değiştir",
       "help": "Yardım panelini aç",
       "showThis": "Bu kartı göster",
+      "orgSwitcher": "Kuruluş seçiciyi aç",
+      "aiSidebar": "Breeze AI’ı aç veya kapat",
       "close": "Bir iletişim kutusunu veya menüyü kapat",
-      "typingNote": "Bir alana yazarken tek tuşlu kısayollar duraklatılır."
+      "typingNote": "Bir alana yazarken tek tuşlu kısayollar duraklatılır.",
+      "create": "Oluştur",
+      "createHint": "c tuşuna basıp bırakın, ardından tuşa basın.",
+      "paletteNumber": "Bir arama sonucunu numarasıyla açın",
+      "newItems": {
+        "ticket": "Yeni talep",
+        "quote": "Yeni teklif",
+        "invoice": "Yeni fatura",
+        "contract": "Yeni sözleşme",
+        "script": "Yeni betik"
+      },
+      "charKeysOn": "Tek tuşlu kısayollar açık.",
+      "charKeysOff": "Tek tuşlu kısayollar kapalı. Yalnızca Ctrl/Cmd kısayolları çalışır.",
+      "charKeysManage": "Profil ayarlarından değiştir",
+      "queueTitle": "Bilet kuyruğu",
+      "queueHint": "Biletler sayfasında, bir metin alanının dışında.",
+      "queue": {
+        "next": "Sonraki bilet",
+        "previous": "Önceki bilet",
+        "open": "Bileti tam sayfada aç",
+        "toggleBulk": "Toplu seçime ekle veya çıkar",
+        "assignMe": "Bana ata",
+        "reply": "Yanıt yaz",
+        "internal": "Dahili not yaz",
+        "resolve": "Notla çöz"
+      }
     }
   },
   "migrationBanner": {
@@ -871,97 +976,18 @@
       }
     },
     "monitors": {
-      "CreateMonitorForm": {
-        "actions": {
-          "createMonitor": "Monitör Oluştur",
-          "creating": "Oluşturuluyor..."
-        },
-        "errors": {
-          "createMonitor": "Monitör oluşturulamadı",
-          "generic": "Bir hata oluştu",
-          "nameRequired": "İsim gerekli",
-          "targetRequired": "Hedef gerekli"
-        },
-        "fields": {
-          "expectedBanner": "Beklenen Banner (isteğe bağlı)",
-          "expectedBody": "Beklenen Gövde İçeriği (isteğe bağlı)",
-          "expectedStatus": "Beklenen Durum",
-          "expectedValue": "Beklenen Değer (isteğe bağlı)",
-          "followRedirects": "Yönlendirmeleri Takip Et",
-          "hostname": "Çözümlenecek Ana Bilgisayar Adı",
-          "method": "Yöntem",
-          "monitorType": "Monitör Türü",
-          "nameserver": "Özel Ad Sunucusu (isteğe bağlı)",
-          "pingCount": "Ping Sayısı",
-          "pollingInterval": "Yoklama Aralığı (saniye)",
-          "port": "Bağlantı noktası",
-          "recordType": "Kayıt Türü",
-          "target": "Hedef (IP/Ana Bilgisayar Adı)",
-          "timeout": "Zaman aşımı (saniye)",
-          "url": "URL'si",
-          "verifySsl": "SSL'yi doğrulayın"
-        },
-        "monitorTypes": {
-          "dnsCheck": {
-            "description": "DNS kayıtlarının doğru şekilde çözümlendiğini doğrulayın",
-            "label": "DNS Kontrol et"
-          },
-          "httpCheck": {
-            "description": "HTTP/HTTPS uç noktalarını izleyin",
-            "label": "HTTP Kontrolü"
-          },
-          "icmpPing": {
-            "description": "Bir ana bilgisayara ping yoluyla ulaşılıp ulaşılamadığını kontrol edin",
-            "label": "ICMP Ping'i"
-          },
-          "tcpPort": {
-            "description": "TCP bağlantı noktasının açık olup olmadığını ve yanıt verip vermediğini kontrol edin",
-            "label": "TCP Bağlantı Noktası"
-          }
-        },
-        "placeholders": {
-          "expectedBanner": "ör. SSH-",
-          "expectedBody": "ör. \"durum\":\"tamam\"",
-          "expectedValue": "ör. 93.184.216.34",
-          "hostname": "example.com",
-          "name": "ör. Üretim Web Sunucusu",
-          "nameserver": "8.8.8.8",
-          "target": "192.168.1.1 veya sunucu.example.com",
-          "url": "https://example.com/health"
-        },
-        "subtitle": "Bir ağ hedefi için yeni bir izleme kontrolü ayarlayın.",
-        "title": "Ağ İzleyicisi Oluştur"
-      },
       "MonitorDetailModal": {
         "actions": {
-          "cancelEdit": "Düzenlemeyi İptal Et",
-          "checkNow": "Şimdi Kontrol Et",
-          "deleteMonitor": "Monitörü sil",
-          "deleting": "Siliniyor...",
-          "yesDelete": "Evet, sil"
-        },
-        "alertRules": {
-          "disabled": "(devre dışı)",
-          "title": "Uyarı Kuralları"
+          "checkNow": "Şimdi Kontrol Et"
         },
         "consecutiveFailures": "{{count}} ardışık hata",
         "consecutiveFailures_plural": "{{count}} ardışık hatalar",
-        "delete": {
-          "confirmShort": "Emin misin?"
-        },
         "errors": {
-          "deleteMonitor": "Monitör silinemedi",
           "generic": "Bir hata oluştu",
           "loadDetails": "Monitör ayrıntıları yüklenemedi",
-          "triggerCheck": "Denetim tetiklenemedi",
-          "updateMonitor": "Monitör güncellenemedi"
+          "triggerCheck": "Denetim tetiklenemedi"
         },
         "fallbackTitle": "Monitör",
-        "fields": {
-          "interval": "Aralık (lar)",
-          "timeout": "Zaman Aşımı (s)",
-          "target": "Hedef URL"
-        },
         "labels": {
           "lastChecked": "Son kontrol: {{time}}",
           "response": "Yanıt: {{response}}",
@@ -989,8 +1015,6 @@
           "icmpPing": "ICMP Ping'i",
           "tcpPort": "TCP Bağlantı Noktası"
         },
-        "targetResetNote": "URL değiştirildiğinde TLS gözlemi sıfırlanır.",
-        "saved": "İzleyici güncellendi",
         "certificate": {
           "title": "Sertifika",
           "issuer": "Veren kuruluş",
@@ -1002,27 +1026,22 @@
             "handshakeFailed": "TLS el sıkışması başarısız",
             "notTls": "TLS yok"
           }
-        }
+        },
+        "openMonitor": "Bu denetimin monitörünü aç",
+        "notConverted": "Dönüşümü Sonuçlar sekmesinde inceleyin."
       },
       "NetworkMonitorList": {
         "actions": {
-          "addMonitor": "Monitör Ekle",
-          "deleteMonitor": "Monitörü sil",
           "runCheckNow": "Şimdi kontrolü çalıştır",
-          "viewDetails": "Ayrıntıları görüntüle"
+          "viewDetails": "Ayrıntıları görüntüle",
+          "newCheck": "Yeni denetim"
         },
         "assetFilter": "Monitörler seçilen varlığa göre filtreleniyor.",
-        "delete": {
-          "confirmLabel": "Monitörü Sil",
-          "message": "Bu monitörü silmek istediğinizden emin misiniz? Bu aynı zamanda tüm sonuçları ve uyarı kurallarını da kaldıracaktır. Bu eylem geri alınamaz.",
-          "title": "Ağ İzleyicisini Sil"
-        },
         "empty": {
-          "action": "Şimdi bir tane oluşturun.",
-          "prefix": "Yapılandırılmış ağ monitörü yok."
+          "action": "Monitör oluştur.",
+          "prefix": "Henüz ağ denetimi yok."
         },
         "errors": {
-          "deleteMonitor": "Monitör silinemedi",
           "fetchMonitors": "Monitörler getirilemedi",
           "generic": "Bir hata oluştu",
           "triggerCheck": "Denetim tetiklenemedi"
@@ -1035,11 +1054,13 @@
           "interval": "Aralık",
           "lastChecked": "Son Kontrol Edildi",
           "response": "Yanıt",
-          "target": "Hedef"
+          "target": "Hedef",
+          "monitor": "Monitör",
+          "openMonitor": "Monitörü aç"
         },
         "loading": "Monitörler yükleniyor...",
         "messages": {
-          "monitorDeleted": "Monitör silindi"
+          "checkQueued": "Ağ denetimi sıraya alındı"
         },
         "status": {
           "degraded": "Bozulmuş"
@@ -1056,10 +1077,87 @@
           "httpCheck": "HTTP Kontrolü",
           "icmpPing": "ICMP Ping'i",
           "tcpPort": "TCP Bağlantı Noktası"
+        },
+        "notConverted": "Dönüştürülmedi"
+      },
+      "NetworkCheckConversionBanner": {
+        "pending_one": "{{count}} ağ denetimi inceleme bekliyor.",
+        "pending_other": "{{count}} ağ denetimi inceleme bekliyor.",
+        "review": "Dönüşümü incele",
+        "title": "Ağ denetimi dönüşümü",
+        "convert": "{{count}} öğeyi dönüştür",
+        "converted_one": "{{count}} ağ denetimi dönüştürüldü",
+        "converted_other": "{{count}} ağ denetimi dönüştürüldü",
+        "failed": "Ağ denetimleri dönüştürülemedi",
+        "outcome": {
+          "convertible": "Dönüştürülebilir",
+          "unconvertible": "Dönüştürülemez"
         }
       }
     },
     "psa": {
+      "PsaAlertTicketingCard": {
+        "title": "Uyarı ticket’ları",
+        "scopeNote": "Tüm iş ortağı için geçerlidir; kuruluş bazında geçersiz kılma yoktur.",
+        "pausedBanner": "Duraklatıldı: PSA kimlik bilgilerini reddetti. Devam etmek için “Bağlantıyı test et” işlemini çalıştırın.",
+        "yes": "Açık",
+        "no": "Kapalı",
+        "selectPlaceholder": "Seçin…",
+        "priorityDefault": "PSA varsayılanı",
+        "closedSuffix": "{{name}} (kapalı)",
+        "saved": "Uyarı ticket’ı ayarları kaydedildi",
+        "saving": "Kaydediliyor…",
+        "save": "Kaydet",
+        "conflict": "Bu ayarlar başka bir yerde değiştirildi. En son değerler yüklendi; gözden geçirip yeniden kaydedin.",
+        "errors": {
+          "save": "Uyarı ticket’ı ayarları kaydedilemedi"
+        },
+        "status": {
+          "active": "Bu bağlantı için uyarı ticket’ları etkin.",
+          "notExternal": "Uyarı ticket’larını kullanmak için bu bağlantıyı hizmet yönetimi PSA’sı (harici mod) olarak bağlayın.",
+          "disabled": "Uyarı ticket’ları kapalı.",
+          "paused": "PSA bağlantısı yeniden çalışana kadar uyarı ticket’ları duraklatıldı.",
+          "companyLinksUnverified": "Bu PSA örneği için şirket bağlantılarını onaylayın.",
+          "invalidConfig": "Kayıtlı uyarı ticket’ı ayarları geçerli değil. Gözden geçirip yeniden kaydedin.",
+          "unsupportedProvider": "Uyarı ticket’ları bu PSA sağlayıcısı için kullanılamıyor.",
+          "credentialsUnusable": "Bu bağlantının kimlik bilgileri eksik veya okunamıyor. Bağlantıyı düzenleyin ve bilgileri yeniden girin."
+        },
+        "fields": {
+          "enabled": "Uyarı ticket’larını etkinleştir",
+          "board": "Pano",
+          "openStatus": "Yeni ticket durumu",
+          "closedStatus": "Kapalı durumu",
+          "priorityHeading": "Uyarı önem derecesine göre PSA önceliği",
+          "minSeverity": "En düşük önem derecesi",
+          "minSeverityHelp": "Düşük, uyarı düzeyindeki monitörleri de kapsar",
+          "closeOnResolve": "Uyarı çözüldüğünde ticket’ı kapat",
+          "noteOnAcknowledge": "Uyarı onaylandığında not ekle",
+          "confirmCompanyLinks": "Kuruluşların şirket bağlantıları bu PSA örneğiyle eşleşiyor"
+        },
+        "severity": {
+          "critical": "Kritik",
+          "high": "Yüksek",
+          "medium": "Orta",
+          "low": "Düşük",
+          "info": "Bilgi"
+        },
+        "options": {
+          "error": "Seçenekler PSA’dan yüklenemedi",
+          "retry": "Tekrar dene",
+          "truncated": "PSA’dan yalnızca ilk sonuçlar gösteriliyor."
+        },
+        "readOnly": {
+          "enabled": "Uyarı ticket’ları"
+        },
+        "loadError": {
+          "message": "Uyarı ticket ayarları yüklenemedi",
+          "retry": "Yeniden dene"
+        },
+        "configInvalid": {
+          "warning": "Kaydedilmiş uyarı ticket ayarları okunamadı. Kaydetmek bunların yerine geçer.",
+          "confirm": "Okunamayan ayarları değiştir"
+        }
+      },
       "PsaCompanyImport": {
         "title": "İthalat şirketleri",
         "subtitle": "{{name}} şirketlerinden organizasyonlar oluşturun.",
@@ -1153,27 +1251,10 @@
           "basicInformation": "Temel Bilgiler",
           "connectionDetails": "Bağlantı Detayları",
           "credentials": "Kimlik Bilgileri",
-          "syncSettings": "Senkronizasyon Ayarları"
+          "syncSettings": "Bilet Senkronizasyonu"
         },
         "sync": {
-          "autoClose": "PSA biletlerini otomatik kapatma",
-          "autoCloseHelp": "Breeze uyarıları çözümlendiğinde bağlantılı biletleri kapatın.",
-          "enable": "Senkronizasyonu etkinleştir",
-          "enableHelp": "Biletleri ve uyarı bağlantılarını bir programa göre güncel tutun.",
-          "notes": "Uyarı notlarını senkronize et",
-          "notesHelp": "Breeze yorumlarını ve güncellemelerini PSA destek zaman çizelgesine aktarın."
-        },
-        "syncDirections": {
-          "bidirectional": "Çift Yönlü",
-          "inbound": "PSA → Breeze",
-          "outbound": "Breeze → PSA"
-        },
-        "syncIntervals": {
-          "daily": "Günlük",
-          "every15Minutes": "Her 15 dakikada bir",
-          "every30Minutes": "Her 30 dakikada bir",
-          "every6Hours": "Her 6 saatte bir",
-          "everyHour": "Her saat"
+          "unavailable": "Bilet senkronizasyonu henüz kullanılamıyor. Bağlantılar test edilebilir ve şirketleri kuruluş olarak içe aktarmak için kullanılabilir; Breeze ile PSA'nız arasında bilet verisi aktarılmaz."
         },
         "testDirtyHint": "Önce kaydet — Test, kaydedilmemiş düzenlemelerinizi değil, depolanan kimlik bilgilerini kontrol eder.",
         "validation": {
@@ -1197,12 +1278,13 @@
         },
         "connectionCount": "{{filtered}} / {{total}} bağlantı",
         "empty": {
-          "noConnections": "Biletleri senkronize etmeye başlamak için bir PSA sağlayıcısına bağlanın.",
+          "noConnections": "Bir PSA sağlayıcısını test etmek ve şirketlerini içe aktarmak için bağlayın.",
           "noMatches": "Aramanızla veya filtrelerinizle eşleşen bağlantı yok.",
           "title": "Yapılandırılmış PSA bağlantısı yok"
         },
         "filters": {
-          "allStatuses": "Tüm durumlar"
+          "allStatuses": "Tüm durumlar",
+          "statusFilterLabel": "Bağlantı durumu"
         },
         "headers": {
           "connection": "Bağlantı",
@@ -1230,7 +1312,7 @@
           "tryAgain": "Tekrar deneyin"
         },
         "delete": {
-          "activeWarning": "Bu bağlantı etkin. Bilet senkronizasyonu hemen durdurulacaktır.",
+          "activeWarning": "Bu bağlantı etkin. Silindiğinde bağlantı hemen kaldırılır.",
           "confirm": "{{name}} silmek istediğinizden emin misiniz?",
           "irreversible": "Bu işlem geri alınamaz.",
           "title": "PSA Bağlantısını Sil",
@@ -1249,10 +1331,10 @@
         "modal": {
           "addDescription": "Kuruluşunuz için yeni bir PSA bağlantısı kurun.",
           "addTitle": "PSA Bağlantısı Ekle",
-          "editDescription": "PSA bağlantı ayrıntılarını ve senkronizasyon tercihlerini güncelleyin.",
+          "editDescription": "PSA bağlantı ayrıntılarını güncelleyin.",
           "editTitle": "PSA Bağlantısını Düzenle"
         },
-        "subtitle": "Biletleri senkronize etmek ve uyarıları bağlamak için PSA'nızı bağlayın.",
+        "subtitle": "PSA bağlantılarını test edin ve şirketleri kuruluş olarak içe aktarın.",
         "test": {
           "failedMessage": "PSA sağlayıcısına bağlanılamıyor.",
           "failedTitle": "Bağlantı başarısız oldu",
@@ -1267,11 +1349,12 @@
       "PsaTicketList": {
         "empty": {
           "noMatches": "Aramanızla veya filtrelerinizle eşleşen bilet yok.",
-          "noTickets": "Biletleri burada görmek için ilk PSA bağlantınızı senkronize edin.",
-          "title": "Senkronize edilen PSA bileti yok"
+          "noTickets": "Henüz uyarı bileti yok. Başlamak için bağlı ConnectWise Manage bağlantısında uyarı biletlerini etkinleştirin.",
+          "title": "PSA bileti yok"
         },
         "filters": {
-          "allStatuses": "Tüm durumlar"
+          "allStatuses": "Tüm durumlar",
+          "statusFilterLabel": "Bilet durumu"
         },
         "headers": {
           "linkedAlert": "Bağlantılı Uyarı",
@@ -1279,19 +1362,53 @@
           "updated": "Güncellendi"
         },
         "searchPlaceholder": "Bilet arayın",
-        "status": {
-          "closed": "Kapalı",
-          "inProgress": "Devam Ediyor",
-          "open": "Aç",
-          "resolved": "Çözüldü",
-          "waiting": "Bekleniyor"
-        },
         "ticketCount": "{{filtered}} / {{total}} bilet",
-        "title": "Senkronize Biletler",
+        "title": "Uyarı biletleri",
         "unlinked": "Bağlantı kaldırıldı"
+      },
+      "PsaAlertTicketingActivity": {
+        "title": "Bilet etkinliği",
+        "refresh": "Yenile",
+        "redrive": "Yeniden dene",
+        "loading": "Bilet etkinliği yükleniyor…",
+        "loadFailed": "Bilet etkinliği yüklenemedi. Yeniden denemek için yenileyin.",
+        "actionFailed": "Bilet etkinliği güncellenemedi.",
+        "actionSucceeded": "Bilet etkinliği güncellendi.",
+        "help": "Yeniden dene, başarısız oluşturma işlemlerini ve şirket bağlantısı olmayan uyarıları tekrar işler. İşlendi olarak işaretle, PSA biletini değiştirmeden işlemeyi durdurur.",
+        "empty": "İlgilenilmesi gereken bilet yok.",
+        "viewAlert": "Uyarıyı görüntüle",
+        "createAnyway": "Yine de oluştur",
+        "markHandled": "İşlendi olarak işaretle",
+        "duplicateWarning": "PSA sisteminde zaten bir bilet olabilir. Önce kontrol edin: bu tek seferlik yeniden deneme yinelenen bir bilet oluşturabilir.",
+        "confirmCreate": "Bir bilet daha oluştur",
+        "cancel": "İptal",
+        "previous": "Önceki",
+        "next": "Sonraki",
+        "page": "Sayfa {{page}} / {{total}}",
+        "states": {
+          "never_attempted": "Kuyrukta",
+          "create_in_flight": "Oluşturuluyor",
+          "created": "Oluşturuldu",
+          "create_outcome_unknown": "Oluşturma sonucu bilinmiyor",
+          "rejected": "Reddedildi",
+          "failed": "Başarısız",
+          "needs_attention": "İlgilenilmesi gerekiyor",
+          "handled": "İşlendi",
+          "skipped_no_company": "Şirket bağlantısı yok",
+          "skipped_ambiguous_company": "Belirsiz şirket bağlantısı",
+          "skipped_resolved_before_create": "Oluşturmadan önce çözüldü"
+        }
       }
     },
     "webhooks": {
+      "ownership": {
+        "label": "Sahiplik",
+        "allOrganizations": "Tüm kuruluşlar",
+        "thisOrganizationOnly": "Yalnızca bu kuruluş",
+        "all": "Tümü",
+        "organization": "Kuruluş",
+        "test": "Test gönderimi"
+      },
       "WebhookDeliveryHistory": {
         "deliveryAttempts": "{{count}} teslimat denemeleri",
         "empty": "Henüz teslimat girişimi yok.",
@@ -1344,6 +1461,10 @@
             "description": "Bir cihaz bağlandığında tetiklenir.",
             "label": "Cihaz Çevrimiçi"
           },
+          "deviceReinstalled": {
+            "description": "Yeniden kurulan bir makine mevcut cihaz kaydına yeniden bağlandığında tetiklenir.",
+            "label": "Cihaz Yeniden Kuruldu"
+          },
           "scriptCompleted": {
             "description": "Bir komut dosyası tamamlandığında tetiklenir.",
             "label": "Komut Dosyası Tamamlandı"
@@ -1351,6 +1472,50 @@
           "ticketCreated": {
             "description": "Bir bilet oluşturulduğunda tetiklenir.",
             "label": "Bilet Oluşturuldu"
+          },
+          "ticketMerged": {
+            "description": "Bir bilet başka bir bilete birleştirildiğinde tetiklenir.",
+            "label": "Bilet Birleştirildi"
+          },
+          "ticketCommented": {
+            "description": "Bir bilete yorum veya not eklendiğinde tetiklenir.",
+            "label": "Bilete Yorum Yapıldı"
+          },
+          "ticketStatusChanged": {
+            "description": "Bir biletin durumu değiştiğinde tetiklenir.",
+            "label": "Bilet Durumu Değişti"
+          },
+          "ticketUpdated": {
+            "description": "Bilet alanları düzenlendiğinde tetiklenir.",
+            "label": "Bilet Güncellendi"
+          },
+          "ticketAssigned": {
+            "description": "Bir bilet atandığında veya ataması kaldırıldığında tetiklenir.",
+            "label": "Bilet Atandı"
+          },
+          "migrationWindowClosed": {
+            "description": "Bir bilet taşıma penceresi kapandığında, içe aktarılan sayılarla birlikte kuruluş başına bir kez tetiklenir.",
+            "label": "Taşıma penceresi kapandı"
+          },
+          "integrationHealthOpened": {
+            "description": "Bir kuruluşun bağlantısı için sağlık olayı açıldığında tetiklenir.",
+            "label": "Bağlantı sağlık olayı açıldı"
+          },
+          "integrationHealthResolved": {
+            "description": "Bir bağlantının sağlık olayı çözüldüğünde tetiklenir.",
+            "label": "Bağlantı sağlık olayı çözüldü"
+          },
+          "alertAcknowledged": {
+            "label": "Uyarı onaylandı",
+            "description": "Bir uyarı onaylandığında tetiklenir."
+          },
+          "alertSuppressed": {
+            "label": "Uyarı susturuldu",
+            "description": "Bir uyarı susturulduğunda tetiklenir."
+          },
+          "alertEscalated": {
+            "label": "Uyarı yükseltildi",
+            "description": "Hâlâ etkin olan bir uyarı için yükseltme ilkesinin bir adımı çalıştığında tetiklenir."
           }
         },
         "fields": {
@@ -1372,6 +1537,12 @@
           "signingSecret": "Webhook imzalarını doğrulamak için bu sırrı kullanın."
         },
         "invalidJsonPreview": "Şablonda geçersiz JSON.",
+        "otherEvents": {
+          "allEvents": "Tüm olaylar (*)",
+          "allEventsHint": "Bu webhook tüm olaylara abone olduğundan aşağıdaki tekil olaylar kullanılmaz. Belirli olayları seçmek için \"Tüm olaylar\" öğesini kaldırın.",
+          "remove": "{{event}} öğesini kaldır",
+          "title": "Diğer abone olunan olaylar"
+        },
         "payload": {
           "previewEmpty": "JSON geçerli olduğunda önizleme görüntülenir.",
           "subtitle": "Hedefinize gönderilen JSON verisi şeklini tanımlayın.",
@@ -1385,7 +1556,7 @@
           "name": "Prodüksiyon Web Kancası",
           "signingSecret": "İmza sırrını girin"
         },
-        "subtitle": "Teslimatı, kimlik doğrulamayı ve yük davranışını ayarlayın.",
+        "subtitle": "Hedefi, etkinlikleri, kimlik doğrulamayı ve üstbilgileri ayarlayın.",
         "title": "Web kancası yapılandırması",
         "validation": {
           "eventRequired": "En az bir etkinlik seçin",
@@ -1396,6 +1567,22 @@
           "secretRequired": "HMAC kimlik doğrulaması için gizli bilgi gereklidir",
           "tokenRequired": "Taşıyıcı kimlik doğrulaması için jeton gereklidir",
           "urlRequired": "URL'si gerekli"
+        },
+        "neverDelivered": {
+          "marker": "Hiç iletilmez",
+          "explanation": "Breeze bu olayı hiçbir zaman göndermez. Bu webhook kaydedildiğinde olay kaldırılır.",
+          "banner": "Breeze bu olayı hiçbir zaman göndermez; bu nedenle bu webhook hiç teslimat yapmamıştır. Kaydetmeden önce başka bir olay seçin."
+        },
+        "payloadVersion": {
+          "title": "Veri sürümü",
+          "v2": {
+            "label": "v2 (önerilen)",
+            "description": "Uyarı olayları ana makine adını, konumu, kuruluşu, durumu ve uyarıya bağlantıyı içerir."
+          },
+          "v1": {
+            "label": "v1 (özgün)",
+            "description": "Mevcut entegrasyonlar için korunan özgün uyarı verileri."
+          }
         }
       },
       "WebhookList": {
@@ -1407,7 +1594,8 @@
         "empty": "Web kancası bulunamadı.",
         "failedCount": "{{count}} başarısız oldu",
         "filters": {
-          "allStatuses": "Tüm durumlar"
+          "allStatuses": "Tüm durumlar",
+          "statusFilterLabel": "Webhook durumu"
         },
         "headers": {
           "events": "Etkinlikler",
@@ -1446,7 +1634,7 @@
           "noPayloadTemplate": "Henüz kayıtlı yük şablonu yok.",
           "payloadPreview": "Yük şablonu önizlemesi",
           "testEvent": "Test etkinliği",
-          "testEventHelp": "Testler, seçilen etkinliği ve yük şablonunuzu kullanır.",
+          "testEventHelp": "Seçilen etkinlik için bu uç noktaya örnek bir yük gönderir.",
           "title": "Web kancası ayrıntıları"
         },
         "emptySelection": "Teslimat geçmişini ve test araçlarını görüntülemek için bir web kancası seçin.",
@@ -1470,6 +1658,15 @@
           "editTitle": "Web Kancasını Düzenle"
         },
         "subtitle": "Olayları harici sistemlere iletin.",
+        "success": {
+          "created": "Web kancası oluşturuldu",
+          "disabled": "Web kancası devre dışı bırakıldı",
+          "enabled": "Web kancası etkinleştirildi",
+          "retryQueued": "Teslimat yeniden deneme kuyruğa alındı",
+          "testQueued": "Test teslimatı kuyruğa alındı",
+          "updated": "Web kancası güncellendi",
+          "deleted": "\"{{name}}\" web kancası silindi"
+        },
         "title": "Web kancaları"
       }
     },
@@ -1678,18 +1875,24 @@
         "friendly": {
           "adminRequired": "Zaman çizelgelerini onaylamak yönetici rolü gerektirir.",
           "approvedImmutable": "Onaylanan girişler yalnızca yönetici tarafından değiştirilebilir.",
-          "notOwnEntry": "Yalnızca kendi zaman girişlerinizi düzenleyebilirsiniz."
+          "notOwnEntry": "Yalnızca kendi zaman girişlerinizi düzenleyebilirsiniz.",
+          "entryBilled": "Bu giriş faturalandırıldığı için silinemez. Önce faturayı iptal et.",
+          "notOwnEntryDelete": "Yalnızca kendi zaman girişlerini silebilirsin.",
+          "entryDeleteLost": "Giriş silinirken değişti. Yeniden yükleyip tekrar dene.",
+          "entryNotFound": "Bu giriş artık mevcut değil."
         },
         "errors": {
           "bulkApprovalFailed": "Toplu onay başarısız oldu. Tekrar dene.",
           "saveEntryFailed": "Giriş kaydedilemedi. Tekrar dene.",
-          "loadTimesheetFailed": "Zaman çizelgesi yüklenemedi. Tekrar dene."
+          "loadTimesheetFailed": "Zaman çizelgesi yüklenemedi. Tekrar dene.",
+          "deleteEntryFailed": "Giriş silinemedi. Tekrar dene."
         },
         "toasts": {
           "bulkSkipped": "{{updated}} güncellendi, {{skipped}} atlandı ({{reasons}})",
           "bulkApproved": "{{count}} onaylandı",
           "bulkUnapproved": "{{count}} onaylanmadı",
-          "entryUpdated": "Giriş güncellendi"
+          "entryUpdated": "Giriş güncellendi",
+          "entryDeleted": "Giriş silindi"
         },
         "title": "Zaman Çizelgesi",
         "selectTechnician": "Teknisyeni seçin",
@@ -1714,7 +1917,12 @@
         "editEntry": "Girişi düzenle {{id}}",
         "total": "Toplam: {{duration}}",
         "billableTotal": "Faturalandırılabilir: {{duration}}",
-        "billedVsWorked": "{{worked}} sa çalışıldı · {{billed}} sa faturalandı"
+        "billedVsWorked": "{{worked}} sa çalışıldı · {{billed}} sa faturalandı",
+        "deleteEntry": "Girişi sil {{id}}",
+        "deleteConfirmTitle": "Zaman girişi silinsin mi?",
+        "deleteConfirmMessage": "Bu işlem {{ticket}} biletindeki {{duration}} girişini kalıcı olarak kaldırır. Geri alınamaz.",
+        "deleteConfirmMessageNoTicket": "Bu işlem {{duration}} girişini kalıcı olarak kaldırır. Geri alınamaz.",
+        "noteInvoiceCue": "Faturalama ayarlarınız notları gizlemedikçe müşteriler bu notu faturalarında görür."
       },
       "sourceBadge": {
         "timer": "Zamanlayıcı",
@@ -1838,7 +2046,7 @@
         "configureMonitoring": "İzlemeyi Yapılandırma",
         "pauseSnmpPolling": "SNMP oylamayı duraklatın",
         "resumeSnmpPolling": "SNMP oylamayı sürdürün",
-        "disableAllActiveMonitoring": "Bu varlık için tüm etkin izlemeyi devre dışı bırak",
+        "disableSnmpMonitoring": "SNMP izlemeyi devre dışı bırak",
         "needsOrgSelection": "Ağ izleme varlıkları tek bir kuruluş kapsamına alınmıştır.",
         "loadingAssets": "İzleme varlıkları yükleniyor...",
         "showingAllDiscoveredAssets": "Keşfedilen tüm varlıklar gösteriliyor",
@@ -1934,11 +2142,12 @@
       "MonitoringPage": {
         "tabs": {
           "assets": "Varlıklar",
-          "checks": "Ağ Kontrolleri",
-          "templates": "SNMP Şablonlar"
+          "templates": "SNMP Şablonlar",
+          "results": "Sonuçlar"
         },
-        "title": "İzleme",
-        "description": "SNMP yoklama ve ağ kontrolleri. Keşif izlemeyi besleyebilir ancak izleme burada yönetilir."
+        "title": "Ağ",
+        "description": "Varlıklar, SNMP şablonları ve ağ denetimi sonuçları. Denetimler Uyarılar altında monitör olarak oluşturulur.",
+        "newCheck": "Yeni denetim"
       }
     },
     "fleet": {
@@ -1946,8 +2155,8 @@
         "errors": {
           "loadFailed": "Filo istatistikleri yüklenemedi"
         },
-        "title": "Filo Düzenlemesi",
-        "description": "Filonuz genelinde politikaları, dağıtımları, yamaları ve otomasyonları yönetin",
+        "title": "Bulgular",
+        "description": "Çalışanların cihazlar arasında bulduğu örüntüler: birçok işlem yerine tek bir işlem",
         "partialWarning": "Bazı veriler eksik olabilir. Yükleme başarısız oldu: {{endpoints}}",
         "cards": {
           "policies": "Politikalar",
@@ -1961,7 +2170,7 @@
           "reports": "Raporlar"
         },
         "aiFleetActions": "Yapay Zeka Filo Eylemleri",
-        "aiFleetActionsHint": "Yapay zeka asistanına sormak için tıklayın",
+        "aiFleetActionsHint": "Breeze AI'a sormak için tıklayın",
         "quickActions": {
           "checkCompliance": "Uyumluluğu kontrol edin",
           "activeDeployments": "Etkin dağıtımlar",
@@ -2174,11 +2383,12 @@
         },
         "loading": "Olaylar yükleniyor...",
         "tryAgain": "Tekrar deneyin",
-        "title": "Olaylar",
+        "title": "Güvenlik Olayları",
         "description": "Kuruluşlarınız genelinde takip edilen olaylar ve EDR bulguları.",
         "filters": {
           "tracked": "Takip edildi",
-          "findings": "Bulgular"
+          "findings": "Bulgular",
+          "kindLabel": "Tür"
         },
         "emptyTitle": "Hiçbir olay bulunamadı",
         "emptyFiltered": "Mevcut filtrelerle eşleşen olay yok.",
@@ -2199,9 +2409,15 @@
         "viewInSource": "{{source}}'da görüntüle",
         "promoteFromEdr": "EDR görünümünden yükseltme",
         "pagination": "Sayfa {{page}} / {{totalPages}} ({{total}} toplam)",
-        "previous": "Önceki"
+        "previous": "Önceki",
+        "genericEdrProvider": "EDR sağlayıcısı"
       },
       "IncidentDetailPage": {
+        "actors": {
+          "brain": "Breeze AI",
+          "user": "Teknisyen",
+          "system": "Sistem"
+        },
         "errors": {
           "notFound": "Olay bulunamadı",
           "fetchFailed": "Olay getirilemedi"
@@ -2305,6 +2521,8 @@
         "clientId": "Müşteri Kimliği: {{clientId}}",
         "unverifiedLabel": "Doğrulanmamış entegrasyon",
         "unverifiedDescription": "Breeze bu entegrasyonu doğrulamadı. Adı kendisi tarafından bildiriliyor ve güvenilir bir uygulamanın kimliğine bürünebiliyor. Yalnızca bu bağlantıyı başlattıysanız ve aşağıdaki geri arama hedefini tanıyorsanız onaylayın.",
+        "metadataHostedAt": "Uygulama bilgilerini yayımlayan: {{host}}",
+        "localhostRedirectWarning": "Bu uygulama erişimi bu bilgisayarda alacak. Yalnızca bu bağlantıyı kendiniz başlattıysanız devam edin.",
         "callbackLabel": "Yetki kodu şu adrese gönderilecek:",
         "missingRedirectTitle": "Geri arama hedefi doğrulanamıyor",
         "missingRedirectDescription": "Bu yetkilendirme isteği bir geri arama hedefi içermediğinden güvenli bir şekilde onaylanamaz. MCP istemcinize dönün ve bağlantıyı yeniden başlatın.",
@@ -2332,15 +2550,15 @@
           },
           "search": {
             "title": "İstediğiniz şeyi arayın",
-            "description": "Cihazları, komut dosyalarını, uyarıları, kullanıcıları veya ayarları anında bulmak için Cmd+K tuşlarına basın."
+            "description": "Cihazları, komut dosyalarını, uyarıları veya ayarları anında bulmak için Cmd+K tuşlarına basın."
           },
           "switchOrgs": {
             "title": "Kuruluşları değiştir",
             "description": "Birden fazla müşteriyi mi yönetiyorsunuz? Burada kuruluşlar arasında geçiş yapın."
           },
           "aiHelp": {
-            "title": "Yapay zeka destekli yardım",
-            "description": "Filonuzla ilgili sorular sorun, sorunları giderin veya raporlar oluşturun. İstediğiniz zaman Cmd+Shift+A tuşlarına basın."
+            "title": "Breeze AI",
+            "description": "Filonuzla ilgili sorular sorun, sorunları giderin veya raporlar oluşturun. İstediğiniz zaman ⌘⇧A tuşlarına basın."
           }
         },
         "skipTour": "Turu atla",
@@ -2401,7 +2619,9 @@
           "unknown": "Bilinmiyor"
         },
         "lastSeen": "Son görülme",
-        "noDeviceInventory": "Henüz müşterilerden gelen cihaz envanteri yok."
+        "noDeviceInventory": "Henüz müşterilerden gelen cihaz envanteri yok.",
+        "healthFilterLabel": "Sağlık",
+        "sortFilterLabel": "Sırala"
       }
     },
     "remediation": {
@@ -2410,7 +2630,10 @@
           "script": "Komut Dosyası",
           "template": "Şablon",
           "playbook": "Başucu Kitabı",
-          "diagnostic": "Teşhis"
+          "diagnostic": "Teşhis",
+          "builtin": "Yerleşik eylem",
+          "manualSteps": "Elle adımlar",
+          "scriptDraft": "Betik taslağı"
         },
         "targetIdentifiers": {
           "script": "komut dosyası {{id}}\nKomut dosyası kimliği olmayan ",
@@ -2419,7 +2642,8 @@
           "templateMissing": "şablonu",
           "playbook": "başucu kitabı {{id}}",
           "playbookMissing": "Başucu kitabı kimliği olmayan başucu kitabı",
-          "diagnostic": "teşhis eylemi"
+          "diagnostic": "teşhis eylemi",
+          "builtin": "yerleşik eylem {{action}}"
         },
         "targetDevices": {
           "none": "Bu öneride hedef cihaz yok",
@@ -2431,9 +2655,12 @@
           "generateFailed": "Önerilen düzeltmeler oluşturulamadı",
           "updateFailed": "Önerilen düzeltme güncellenemedi",
           "executeFailed": "Önerilen düzeltme yürütülemedi",
-          "approvalFailed": "Onay istenemedi"
+          "approvalFailed": "Onay istenemedi",
+          "researchFailed": "Araştırma başlatılamadı",
+          "draftFailed": "Betik taslağı açılamadı."
         },
         "messages": {
+          "draftCopied": "Depolama engelli — özet kopyalandı; betik oluşturucuya yapıştırın.",
           "disabled": "Önerilen düzeltmeler devre dışı bırakıldı",
           "generated": "Önerilen düzeltmeler oluşturuldu",
           "accepted": "Önerilen düzeltme kabul edildi",
@@ -2445,7 +2672,7 @@
         },
         "title": "Önerilen Düzeltmeler",
         "refresh": "Önerilen düzeltmeleri yenileyin",
-        "disabledTitle": "Bu kuruluş için önerilen düzeltmeler devre dışı bırakıldı",
+        "disabledTitle": "Bu kuruluş için önerilen düzeltmeler kapalı. Ayarlar → İş Ortağı → Yapay Zekâ Özellikleri bölümünden veya tek bir kuruluş için o kuruluşun Yapay Zekâ sekmesinden açın.",
         "suggestionsDisabled": "Öneriler devre dışı bırakıldı",
         "generate": "Oluştur",
         "empty": "Henüz önerilen bir düzeltme yok.",
@@ -2488,7 +2715,82 @@
         "requesting": "İsteniyor...",
         "requestApproval": "Onay iste",
         "waitingApprovalTitle": "PAM onayı bekleniyor",
-        "approvalPending": "Onay bekleniyor"
+        "approvalPending": "Onay bekleniyor",
+        "proven": {
+          "badge": "Kanıtlanmış çözüm",
+          "trackAllClients": "Müşterilerinizde {{attempts}} denemenin {{verified}} tanesinde işe yaradı",
+          "trackThisClient": "Bu müşteride {{attempts}} denemenin {{verified}} tanesinde işe yaradı"
+        },
+        "feedback": {
+          "worked": "İşe yaradı",
+          "didNotWork": "İşe yaramadı",
+          "recorded": "Geri bildirim kaydedildi",
+          "failed": "Geri bildirim kaydedilemedi"
+        },
+        "done": {
+          "button": "Tamamlandı",
+          "recorded": "Tamamlandı olarak işaretlendi — düzelme izleniyor",
+          "failed": "Tamamlandı olarak işaretlenemedi"
+        },
+        "outcome": {
+          "label": "Sonuç: {{state}}",
+          "state": {
+            "pending": "çalışıyor",
+            "awaitingRecovery": "düzelme izleniyor",
+            "holding": "düzeldi — kalıcılığı doğrulanıyor",
+            "verified": "düzeltme doğrulandı",
+            "failed": "sorunu düzeltmedi",
+            "recurred": "tekrarladı",
+            "inconclusive": "belirsiz",
+            "cancelled": "iptal edildi"
+          }
+        },
+        "groups": {
+          "proven": "Kanıtlanmış düzeltmeler",
+          "ai": "Yapay zekâ önerileri",
+          "similar": "Benzer düzeltmeler",
+          "legacy": "Önceki anahtar kelime eşleşmeleri"
+        },
+        "badges": {
+          "aiResearched": "Yapay zekâ araştırdı",
+          "aiWritten": "Yapay zekâ tarafından yazıldı — izlemeden önce gözden geçirin"
+        },
+        "track": {
+          "lastVerified": "son doğrulama {{days}} gün önce",
+          "neverVerified": "henüz doğrulanmadı"
+        },
+        "research": {
+          "running": "Araştırılıyor…",
+          "runningDeep": "Derinlemesine araştırılıyor…",
+          "stalled": "Araştırma sürüyor — birkaç dakika sonra tekrar bakın.",
+          "failed": "Araştırma başarısız oldu.",
+          "noSafeFix": "Yapay zekâ bu sorun için güvenli bir düzeltme bulamadı.",
+          "checkBudget": "Yapay zekâ bütçesini kontrol edin",
+          "deeper": "Daha derin araştır",
+          "retry": "Yeniden dene",
+          "denial": {
+            "credits": "Bu faturalama dönemi için yapay zekâ kredileri tükendi.",
+            "dailyBudget": "Araştırma için günlük yapay zekâ bütçesine ulaşıldı.",
+            "orgBudget": "Bu kuruluşun yapay zekâ bütçesine ulaşıldı.",
+            "autoCap": "Otomatik araştırma sınırına ulaşıldı. Araştırmayı yine de elle başlatabilirsiniz.",
+            "busy": "Araştırma şu anda meşgul. Birkaç dakika sonra tekrar deneyin.",
+            "permission": "Yapay zekâ araştırması başlatma izniniz yok.",
+            "unavailable": "Yapay zekâ araştırması geçici olarak kullanılamıyor.",
+            "modelUnavailable": "Araştırma için yapay zekâ modeli kullanılamıyor.",
+            "notProvisioned": "Yapay zekâ araştırması bu kurulum için henüz ayarlanmadı."
+          }
+        },
+        "runBuiltin": "{{action}} çalıştır",
+        "draftScript": "Betik taslağı hazırla",
+        "emptyHint": "Oluştur önce kanıtlanmış düzeltmelere bakar, ardından yapay zekâya sorar.",
+        "reviewed": {
+          "pickerLabel": "Gözden geçirilmiş adımlar",
+          "asWritten": "Yazıldığı gibi adımlar (paylaşılmaz)",
+          "save": "Gözden geçirilmiş adımlar olarak kaydet",
+          "saved": "Gözden geçirilmiş adımlar olarak kaydedildi",
+          "failed": "Gözden geçirilmiş adımlar kaydedilemedi",
+          "stepsLabel": "Adımlar (satır başına bir)"
+        }
       }
     },
     "support": {
@@ -2514,6 +2816,34 @@
         "sending": "Gönderiliyor…",
         "send": "Gönder"
       }
+    },
+    "mcpDomains": {
+      "legend": "Araç erişimi",
+      "allLabel": "Tüm araçlar (sonradan eklenen alanlar dahil)",
+      "selectedLabel": "Yalnızca bu alanlar",
+      "coreLabel": "Çekirdek (her zaman dahil)",
+      "error": "En az bir alan seçin veya Tüm araçlar seçeneğini işaretleyin.",
+      "allEquivalentNote": "Tüm alanlar seçili; bu, daha sonra eklenecek alanlar dahil Tüm araçlar ile aynıdır.",
+      "reconnectNote": "Bu bağlantı için geçerlidir. Mevcut bir bağlantıyı daraltmak için Bağlı uygulamalar bölümünden iptal edin, ardından yeniden bağlanın.",
+      "apiKeyHint": "Bu anahtarın yapay zekâ/MCP arayüzü üzerinden kullanabileceği araç alanlarını seçin.",
+      "allTools": "Tüm araçlar",
+      "areaCount_one": "{{count}} alan",
+      "areaCount_other": "{{count}} alan",
+      "labels": {
+        "devices": "Cihazlar",
+        "scripts": "Komut dosyaları ve otomasyon",
+        "patching": "Yama ve yazılım",
+        "monitoring": "İzleme ve uyarılar",
+        "network": "Ağ",
+        "security": "Güvenlik ve uyumluluk",
+        "backup": "Yedekleme ve kurtarma",
+        "tickets": "Destek kayıtları ve süre",
+        "billing": "Faturalama",
+        "accounts": "Hesaplar",
+        "integrations": "Entegrasyonlar",
+        "admin": "Yönetim",
+        "ai": "Yapay zekâ ajanları"
+      }
     }
   },
   "whatsNew": {
@@ -2537,7 +2867,8 @@
     "dismiss": "İki faktörlü kimlik doğrulama hatırlatıcısını kapat"
   },
   "mfaPolicyOffBanner": {
-    "message": "Ekibiniz için çok faktörlü kimlik doğrulama zorunlu değil. Yalnızca parola ile açılan oturumlar betik çalıştırabilir, cihazları taşıyabilir ve ilkeleri değiştirebilir.",
+    "label": "MFA hatırlatması",
+    "message": "Ekibiniz için MFA zorunlu değil. Yalnızca parolalı oturumlar betik çalıştırabilir.",
     "cta": "MFA'yı zorunlu kıl",
     "dismiss": "MFA ilkesi hatırlatmasını bugünlük kapat"
   },
@@ -2546,5 +2877,78 @@
     "noneConfigured": "Yapılandırılmış {{source}} yok",
     "overriding": "{{source}} değerini geçersiz kılıyor",
     "overridingWithValue": "{{source}} değerini geçersiz kılıyor ({{value}})"
+  },
+  "fixMemoryPage": {
+    "title": "Düzeltme belleği",
+    "subtitle": "Ekibinizin uyguladığı düzeltmeler ve bunların gerçekten ne sıklıkla kalıcı olduğu.",
+    "tabs": {
+      "fixes": "Düzeltmeler",
+      "steps": "İncelenmiş adımlar"
+    },
+    "filters": {
+      "os": "İşletim sistemi",
+      "anyOs": "Herhangi bir işletim sistemi",
+      "status": "Durum",
+      "anyStatus": "Herhangi bir durum",
+      "scope": "Kapsam",
+      "anyScope": "Herhangi bir kapsam",
+      "condition": "Koşula göre ara"
+    },
+    "columns": {
+      "fix": "Düzeltme",
+      "record": "Sonuç geçmişi",
+      "rate": "Başarı oranı",
+      "scope": "Kapsam",
+      "os": "İS",
+      "condition": "Koşul",
+      "lastVerified": "Son doğrulama",
+      "status": "Durum",
+      "actions": "Eylemler"
+    },
+    "status": {
+      "active": "Etkin",
+      "demoted": "Düşürüldü",
+      "retired": "Kullanımdan kaldırıldı",
+      "stale": "Eski"
+    },
+    "scope": {
+      "everyClient": "Tüm müşteriler",
+      "oneClient": "Bu müşteri"
+    },
+    "signature": "İmza {{prefix}}",
+    "retire": {
+      "action": "Kaldır",
+      "confirmTitle": "Bu düzeltme kaldırılsın mı?",
+      "confirmBody": "Kaldırılan düzeltmeler artık önerilmez. Geçmişi saklanır.",
+      "confirm": "Düzeltmeyi kaldır",
+      "success": "Düzeltme kaldırıldı.",
+      "failed": "Düzeltme kaldırılamadı."
+    },
+    "steps": {
+      "heading": "Adımlar",
+      "retire": "Adımları kaldır",
+      "success": "Adımlar kaldırıldı.",
+      "failed": "Adımlar kaldırılamadı.",
+      "empty": "Henüz incelenmiş adım yok. Burada görmek için bir öneriden adımları kaydedin."
+    },
+    "empty": "Henüz hatırlanan düzeltme yok. Düzeltmeler, çalıştırılıp sonuçları gözlemlendikten sonra burada görünür.",
+    "loadMore": "Daha fazla yükle",
+    "never": "Hiçbir zaman",
+    "retry": "Yeniden dene",
+    "errors": {
+      "loadFailed": "Düzeltme belleği yüklenemedi."
+    }
+  },
+  "islandError": {
+    "title": "Bu bölüm çöktü",
+    "description": "Bir görüntüleme hatası bu sayfanın gösterilmesini engelledi. Tekrar deneyin; sorun devam ederse bildirirken aşağıdaki mesajı ekleyin.",
+    "retry": "Tekrar dene"
+  },
+  "featureLock": {
+    "lockedLabel": "Kilitli",
+    "upgrade": "Planları gör"
+  },
+  "inheritChoice": {
+    "inherit": "Devral — {{value}} ({{source}})"
   }
 }

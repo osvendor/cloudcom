@@ -1,9 +1,12 @@
 import { and, eq, ne, gte, lte, sql } from 'drizzle-orm';
 import { db } from '../db';
-import { timeEntries, ticketParts } from '../db/schema';
+import { aiUsageCharges, timeEntries, ticketParts } from '../db/schema';
 import { computeLineTotal } from './invoiceMath';
 import type { InvoiceLineSourceType } from './invoiceTypes';
-import type { BillingStatus } from '@breeze/shared';
+import { billedLaborMinutes, laborHours, roundToCurrency, type BillingStatus } from '@breeze/shared';
+import { hourBlockHoldWindows, isHeldForHourBlock } from './contractHourBlockHolds';
+import { sumEntryHours } from './contractHourBlocks';
+import { toPartnerLocalDate } from './invoiceWorkDate';
 
 export interface DraftLineSpec {
   sourceType: InvoiceLineSourceType;
@@ -23,6 +26,11 @@ export interface DraftLineSpec {
    *  display time, never baked into `description` (a description edit must
    *  never erase the §3.5 disclosure). */
   workedMinutes: number | null;
+  /** #8603: the day a time_entry line was worked (`YYYY-MM-DD`), from the
+   *  entry's `started_at` in the partner timezone. NULL for every other line
+   *  type (parts, AI usage, block-hours overage) and when `started_at` is
+   *  unknown. Structured data only: never baked into `description`. */
+  workDate: string | null;
 }
 
 /** A billable time entry that has NO hourly rate (match-or-skip found no rate in
@@ -45,7 +53,12 @@ export interface AssemblyResult {
   blockedByCurrency: Record<string, DraftLineSpec[]>;
   /** Billable time entries with a NULL rate — an assembly gap, never a zero line (review #1). */
   missingRate: MissingRateSpec[];
+  /** Not-billed entries inside a block-of-hours hold window (#8181). The block's
+   *  period close bills them, never an ad-hoc invoice. Reported, never silent. */
+  heldForHourBlock: { count: number; hours: number };
 }
+
+const NOTHING_HELD = (): AssemblyResult['heldForHourBlock'] => ({ count: 0, hours: 0 });
 
 /** Defensive bucket for a time entry with a null snapshot (impossible while the CHECK holds). */
 export const UNKNOWN_CURRENCY_KEY = 'UNKNOWN';
@@ -69,7 +82,7 @@ export function isMissingRateGap(rate: string | number | null, billingStatus: Bi
 export function partitionByCurrency<R extends { currencyCode?: string | null }>(
   rows: R[], headerCurrency: string, toSpec: (row: R, currency: string) => DraftLineSpec
 ): AssemblyResult {
-  const result: AssemblyResult = { included: [], blockedByCurrency: {}, missingRate: [] };
+  const result: AssemblyResult = { included: [], blockedByCurrency: {}, missingRate: [], heldForHourBlock: NOTHING_HELD() };
   for (const row of rows) {
     if (row.currencyCode === headerCurrency) { result.included.push(toSpec(row, headerCurrency)); continue; }
     const key = row.currencyCode ?? UNKNOWN_CURRENCY_KEY;
@@ -79,10 +92,15 @@ export function partitionByCurrency<R extends { currencyCode?: string | null }>(
 }
 
 export function mergeAssembly(...parts: AssemblyResult[]): AssemblyResult {
-  const out: AssemblyResult = { included: [], blockedByCurrency: {}, missingRate: [] };
+  const out: AssemblyResult = { included: [], blockedByCurrency: {}, missingRate: [], heldForHourBlock: NOTHING_HELD() };
   for (const p of parts) {
     out.included.push(...p.included);
     out.missingRate.push(...p.missingRate);
+    out.heldForHourBlock = {
+      count: out.heldForHourBlock.count + p.heldForHourBlock.count,
+      // Hundredths, so 0.33 + 0.67 is exactly 1.00.
+      hours: Math.round((out.heldForHourBlock.hours + p.heldForHourBlock.hours) * 100) / 100,
+    };
     for (const [code, specs] of Object.entries(p.blockedByCurrency)) (out.blockedByCurrency[code] ??= []).push(...specs);
   }
   return out;
@@ -96,10 +114,14 @@ type TimeEntryRow = {
   billableMinutes: number | null;
   hourlyRate: string | null; isApproved: boolean;
   currencyCode?: string | null;
+  /** #8603: source of `workDate`. Optional so callers that never select it
+   *  (and pre-existing fixtures) produce a NULL date, never a fabricated one. */
+  startedAt?: Date | null;
 };
 
-/** Billed quantity (§3.5): COALESCE(billable_minutes, duration_minutes), hours to 2 dp. */
-const entryHours = (r: TimeEntryRow) => (((r.billableMinutes ?? r.durationMinutes) ?? 0) / 60).toFixed(2);
+/** Billed quantity (§3.5): COALESCE(billable_minutes, duration_minutes), hours to 2 dp —
+ *  the shared labour rule (#9561, `@breeze/shared` laborMath). */
+const entryHours = (r: TimeEntryRow) => laborHours(billedLaborMinutes(r));
 
 /** Base line description — never carries the worked-vs-billed disclosure
  *  (#6467). The §3.5 "when they differ the invoice line says so" note is
@@ -113,8 +135,10 @@ const entryDescription = (r: TimeEntryRow) => r.description?.trim() || 'Labor';
  *  20 min × 1,000 JPY = 0.33 × 1000 = 330 — never 333.
  *  A NULL rate is never a zero line: route such rows through `partitionTimeEntries`
  *  (→ `missingRate`) — reaching this with one is a programming error. An explicit
- *  '0.00' rate entered by the user IS a valid zero line. */
-export function timeEntryToLineSpec(r: TimeEntryRow, currencyCode: string): DraftLineSpec {
+ *  '0.00' rate entered by the user IS a valid zero line.
+ *  `timeZone` is the partner's zone (#8603): `workDate` is the START date of
+ *  the entry there. Amounts never depend on it. */
+export function timeEntryToLineSpec(r: TimeEntryRow, currencyCode: string, timeZone: string = 'UTC'): DraftLineSpec {
   if (r.hourlyRate == null) {
     throw new Error(`time entry ${r.id} has no hourly rate and cannot become an invoice line`);
   }
@@ -128,7 +152,8 @@ export function timeEntryToLineSpec(r: TimeEntryRow, currencyCode: string): Draf
     // #6467: always carry the worked minutes for a time_entry line — renderers
     // decide whether to show the note (only when it differs from the billed
     // quantity), the same condition the old description suffix used.
-    workedMinutes: r.durationMinutes ?? null
+    workedMinutes: r.durationMinutes ?? null,
+    workDate: r.startedAt ? toPartnerLocalDate(r.startedAt, timeZone) : null
   };
 }
 
@@ -137,7 +162,7 @@ export function timeEntryToLineSpec(r: TimeEntryRow, currencyCode: string): Draf
  *  `missingRate` gap — it has hours but no amount, so it is neither included
  *  (would bill at zero and get marked billed) nor currency-blocked (there is no
  *  amount to report). Rated rows partition by currency as usual. */
-export function partitionTimeEntries(rows: TimeEntryRow[], headerCurrency: string): AssemblyResult {
+export function partitionTimeEntries(rows: TimeEntryRow[], headerCurrency: string, timeZone: string = 'UTC'): AssemblyResult {
   const rated: TimeEntryRow[] = [];
   const missingRate: MissingRateSpec[] = [];
   for (const r of rows) {
@@ -153,7 +178,7 @@ export function partitionTimeEntries(rows: TimeEntryRow[], headerCurrency: strin
       rated.push(r);
     }
   }
-  const result = partitionByCurrency(rated, headerCurrency, timeEntryToLineSpec);
+  const result = partitionByCurrency(rated, headerCurrency, (r, c) => timeEntryToLineSpec(r, c, timeZone));
   result.missingRate = missingRate;
   return result;
 }
@@ -169,7 +194,7 @@ export function ticketPartToLineSpec(r: {
     quantity: r.quantity, unitPrice: r.unitPrice, costBasis: r.costBasis ?? null,
     taxable: true, customerVisible: true,
     lineTotal: computeLineTotal(r.quantity, r.unitPrice, currencyCode), isUnapprovedTime: false,
-    workedMinutes: null
+    workedMinutes: null, workDate: null
   };
 }
 
@@ -177,12 +202,16 @@ export function ticketPartToLineSpec(r: {
  *  `headerCurrency` is the currency of the draft invoice the specs will land on —
  *  rows whose snapshot `currency_code` differs are returned under `blockedByCurrency`
  *  (never converted, never silently dropped); included line totals round at the
- *  header currency's minor unit (JPY → whole units). */
-export async function gatherOrgTimeEntries(orgId: string, from: Date, to: Date, headerCurrency: string): Promise<AssemblyResult> {
+ *  header currency's minor unit (JPY → whole units). `timeZone` is the partner's
+ *  zone, used only to date each line (#8603). */
+export async function gatherOrgTimeEntries(
+  orgId: string, from: Date, to: Date, headerCurrency: string, asOf: Date = new Date(), timeZone: string = 'UTC',
+): Promise<AssemblyResult> {
   const rows = await db.select({
     id: timeEntries.id, ticketId: timeEntries.ticketId, description: timeEntries.description,
     durationMinutes: timeEntries.durationMinutes, billableMinutes: timeEntries.billableMinutes, hourlyRate: timeEntries.hourlyRate, isApproved: timeEntries.isApproved,
-    currencyCode: timeEntries.currencyCode
+    currencyCode: timeEntries.currencyCode, orgId: timeEntries.orgId, endedAt: timeEntries.endedAt,
+    startedAt: timeEntries.startedAt
   }).from(timeEntries).where(and(
     eq(timeEntries.orgId, orgId),
     eq(timeEntries.isBillable, true),
@@ -194,7 +223,30 @@ export async function gatherOrgTimeEntries(orgId: string, from: Date, to: Date, 
     gte(timeEntries.endedAt, from),
     lte(timeEntries.endedAt, to)
   ));
-  return partitionTimeEntries(rows, headerCurrency);
+  return partitionHoldingBlockHours(rows, headerCurrency, asOf, timeZone);
+}
+
+/**
+ * #8181 (Open Decision 9 A): set aside not_billed entries that a block of hours
+ * will bill at its period close, then partition the rest as usual. Held rows
+ * are counted in `heldForHourBlock`, never dropped silently.
+ */
+async function partitionHoldingBlockHours(
+  rows: Array<TimeEntryRow & { orgId: string | null; endedAt: Date | null }>, headerCurrency: string, asOf: Date,
+  timeZone: string,
+): Promise<AssemblyResult> {
+  const orgIds = [...new Set(rows.map((r) => r.orgId).filter((o): o is string => o !== null))];
+  const windows = new Map<string, Awaited<ReturnType<typeof hourBlockHoldWindows>>>();
+  for (const orgId of orgIds) windows.set(orgId, await hourBlockHoldWindows(orgId, asOf));
+  const isHeld = (r: (typeof rows)[number]) =>
+    r.orgId !== null && r.endedAt !== null && isHeldForHourBlock(windows.get(r.orgId) ?? [], r.endedAt);
+  const held = rows.filter(isHeld);
+  const result = partitionTimeEntries(rows.filter((r) => !isHeld(r)), headerCurrency, timeZone);
+  result.heldForHourBlock = {
+    count: held.length,
+    hours: sumEntryHours(held.map((r) => (r.billableMinutes ?? r.durationMinutes) ?? 0)),
+  };
+  return result;
 }
 
 /** Unbilled billable ticket parts for an org within [from, to] (by created_at).
@@ -218,12 +270,15 @@ export async function gatherOrgParts(orgId: string, from: Date, to: Date, header
 }
 
 /** Per-ticket: all unbilled billable time + parts for one ticket.
- *  `headerCurrency`: see gatherOrgTimeEntries. */
-export async function gatherTicketBillables(ticketId: string, headerCurrency: string): Promise<AssemblyResult> {
+ *  `headerCurrency`, `timeZone`: see gatherOrgTimeEntries. */
+export async function gatherTicketBillables(
+  ticketId: string, headerCurrency: string, asOf: Date = new Date(), timeZone: string = 'UTC',
+): Promise<AssemblyResult> {
   const te = await db.select({
     id: timeEntries.id, ticketId: timeEntries.ticketId, description: timeEntries.description,
     durationMinutes: timeEntries.durationMinutes, billableMinutes: timeEntries.billableMinutes, hourlyRate: timeEntries.hourlyRate, isApproved: timeEntries.isApproved,
-    currencyCode: timeEntries.currencyCode
+    currencyCode: timeEntries.currencyCode, orgId: timeEntries.orgId, endedAt: timeEntries.endedAt,
+    startedAt: timeEntries.startedAt
   }).from(timeEntries).where(and(
     eq(timeEntries.ticketId, ticketId), eq(timeEntries.isBillable, true), eq(timeEntries.billingStatus, 'not_billed'),
     // Explicit exclusions (redundant with = 'not_billed', kept for intent/future-proofing).
@@ -240,7 +295,80 @@ export async function gatherTicketBillables(ticketId: string, headerCurrency: st
     ne(ticketParts.billingStatus, 'contract'), ne(ticketParts.billingStatus, 'no_charge')
   ));
   return mergeAssembly(
-    partitionTimeEntries(te, headerCurrency),
+    await partitionHoldingBlockHours(te, headerCurrency, asOf, timeZone),
     partitionByCurrency(parts, headerCurrency, ticketPartToLineSpec)
   );
+}
+
+// ---------------------------------------------------------------------------
+// AI chargeback (#7608): monthly AI usage charges as billable sources
+// ---------------------------------------------------------------------------
+
+/** AI usage lines are non-taxable by default (decided 2026-10-02, #7598). One
+ *  constant so a later per-card or per-partner tax setting has one place to
+ *  replace. */
+export const AI_USAGE_LINE_TAXABLE = false;
+
+/** One AI chargeback charge (#7608) as a billable source row. */
+export type AiUsageChargeRow = {
+  id: string; servedModel: string; modelLabel: string; periodStart: string; usagePeriodStart: string;
+  invocationCount: number; inputTokens: number; outputTokens: number; cacheReadTokens: number;
+  cacheWriteTokens: number; amount: string | null; currencyCode: string;
+};
+
+/** AI usage line rule (#7608 RR5): one line per charge, quantity 1, unit price =
+ *  the charge amount, already rounded once in its own currency by the monthly
+ *  close (RR4), so the line total equals the charge amount. A late
+ *  (carried-forward) charge says which month the usage was from. Never a $0 or
+ *  unpriced line: the gather only reads 'not_billed' charges, and an unpriced
+ *  one reaching here is a programming error. */
+export function aiUsageChargeToLineSpec(r: AiUsageChargeRow, currencyCode: string, locale = 'en'): DraftLineSpec {
+  if (r.amount == null) throw new Error(`AI usage charge ${r.id} is unpriced and cannot become an invoice line`);
+  const month = r.periodStart.slice(0, 7);
+  const usageMonth = r.usagePeriodStart.slice(0, 7);
+  const tokens = r.inputTokens + r.outputTokens + r.cacheReadTokens + r.cacheWriteTokens;
+  const late = usageMonth !== month ? ` (usage from ${usageMonth})` : '';
+  const unitPrice = roundToCurrency(r.amount, currencyCode);
+  // #9669: the customer reads this text on the invoice, PDF and portal, so the
+  // counts are grouped in the DOCUMENT locale ("23,514,000", "23.514.000").
+  // The string is stored, so this applies to newly assembled lines only.
+  const count = new Intl.NumberFormat(locale, { maximumFractionDigits: 0 });
+  return {
+    sourceType: 'ai_usage', sourceId: r.id, catalogItemId: null, ticketId: null,
+    description: `AI usage — ${r.modelLabel} — ${month}${late} · ${count.format(r.invocationCount)} requests · ${count.format(tokens)} tokens`,
+    quantity: '1.00', unitPrice, costBasis: null, taxable: AI_USAGE_LINE_TAXABLE, customerVisible: true,
+    lineTotal: computeLineTotal('1.00', unitPrice, currencyCode), isUnapprovedTime: false, workedMinutes: null, workDate: null,
+  };
+}
+
+/** Every unbilled AI usage charge for an org whose billing period
+ *  (period_start, a UTC month start) began on or before `through` — the UTC
+ *  calendar date of the draft's `to`. There is deliberately NO lower bound: a
+ *  charge for month P only exists after the close on the 1st of P+1, so a range
+ *  that starts after a month's 1st (a rolling "last 30 days", an anniversary
+ *  15th→14th cycle) would otherwise never reach it and the charge would sit
+ *  unbilled forever. An older unbilled charge therefore rides the next draft;
+ *  its line names the month it bills. Double-billing is prevented by
+ *  billing_status and issueInvoice's SOURCE_ALREADY_BILLED lock, not by the
+ *  range. Only 'not_billed' is gathered: 'no_charge' (rounded to zero),
+ *  'unpriced' (no client price) and 'billed' never are. Other-currency charges
+ *  come back under `blockedByCurrency`, never converted. Runs under the
+ *  caller's RLS context. */
+export async function gatherOrgAiUsageCharges(
+  orgId: string, through: Date, headerCurrency: string,
+  /** Document locale for the line text's number grouping (#9669). */
+  locale = 'en',
+): Promise<AssemblyResult> {
+  const rows = await db.select({
+    id: aiUsageCharges.id, servedModel: aiUsageCharges.servedModel, modelLabel: aiUsageCharges.modelLabel,
+    periodStart: aiUsageCharges.periodStart, usagePeriodStart: aiUsageCharges.usagePeriodStart,
+    invocationCount: aiUsageCharges.invocationCount, inputTokens: aiUsageCharges.inputTokens,
+    outputTokens: aiUsageCharges.outputTokens, cacheReadTokens: aiUsageCharges.cacheReadTokens,
+    cacheWriteTokens: aiUsageCharges.cacheWriteTokens, amount: aiUsageCharges.amount, currencyCode: aiUsageCharges.currencyCode,
+  }).from(aiUsageCharges).where(and(
+    eq(aiUsageCharges.orgId, orgId),
+    eq(aiUsageCharges.billingStatus, 'not_billed'),
+    lte(aiUsageCharges.periodStart, through.toISOString().slice(0, 10)),
+  )).orderBy(aiUsageCharges.periodStart, aiUsageCharges.usagePeriodStart, aiUsageCharges.servedModel, aiUsageCharges.id);
+  return partitionByCurrency(rows, headerCurrency, (r, c) => aiUsageChargeToLineSpec(r, c, locale));
 }

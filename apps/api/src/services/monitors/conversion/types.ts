@@ -74,15 +74,16 @@ export interface ConvertPolicyResult { conversionIds: string[]; retired: number;
 export interface ConvertPartnerResult { policies: number; converted: number; unconvertible: number }
 export interface PendingConversionCounts { policies: number; rows: number }
 export interface PartnerConversionPreview {
+  blocked?: Array<{ orgId: string; sourceTable: 'network_monitors'; reason: 'prerequisite_missing'; missingPrerequisites: string[] }>;
   partnerId: string; previewHash: string; policies: number; rows: number; convertible: number;
   unconvertible: Array<{ policyId: string | null; policyName: string | null;
     sourceTable: ConversionSourceTable; sourceId: string; name: string; reason: string }>;
 }
 export interface ConversionLedgerEntry {
   id: string; sourceTable: ConversionSourceTable; sourceId: string; sourceName: string;
-  policyId: string | null; convertedBy: string | null; convertedAt: string;
+  policyId: string | null; convertedBy: string | null; convertedByName: string | null; convertedAt: string;
   revertedAt: string | null; revertable: boolean;
-  outputs: Array<{ monitorId: string; role: string; reused: boolean }>;
+  outputs: Array<{ monitorId: string; monitorName: string | null; role: string; reused: boolean }>;
 }
 
 

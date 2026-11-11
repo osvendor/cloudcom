@@ -1,3 +1,5 @@
+import { PERMISSION_GRANTS, type PermissionGrant } from './constants/permissions';
+
 /**
  * THE canonical list of report types (#3198 spec §6). `reportTypeSchema`
  * (apps/api/src/routes/reports/schemas.ts), the API `ReportType` union
@@ -44,19 +46,74 @@ export const REPORT_TYPES = [
   'ticket_sla_attainment',
   'technician_time_billability',
   'ar_aging',
+  // Backup Provider Integration W05 (#6013): generated on demand from the
+  // unified backup health read model. Not portal-visible, not managed evidence.
+  'backup_status',
+  // AI chargeback W10 (#7608): per-client AI usage and chargeable amounts over
+  // the authoritative ai_invocations ledger. Business type (msp_staff, partner
+  // capable); never portal-visible, never managed evidence.
+  'ai_usage_by_client',
+  // Business reports phase 2 W1 (#9828): MRR & renewals over contracts, as of
+  // run time. Business type (msp_staff, partner capable); never portal-visible.
+  'mrr_renewals',
+  // Business reports phase 2 W2 (#9828): quote win rate over revision lineages.
+  // Business type (msp_staff, partner capable); never portal-visible.
+  'quote_win_rate',
+  // Business reports phase 2 W3 (#9828): client profitability over issued
+  // invoice lines and time entries. Business type (msp_staff, partner
+  // capable); never portal-visible.
+  'client_profitability',
+  // Customer SLA performance (#11018): per-priority response and resolution
+  // against SLA for one org and period. Org-only, audience 'any'; deliberately
+  // NOT a business type (those are MSP-internal and partner-only-delivery).
+  'ticket_sla_performance',
 ] as const satisfies readonly string[];
 
 export type ReportType = (typeof REPORT_TYPES)[number];
 
-/** The #3198 Phase 1 trio. Used by the registry's scope table and by W03's
- *  "Business" template grouping. */
+/** The business report types: the #3198 Phase 1 trio, plus ai_usage_by_client
+ *  (#7608 W10). Used by the registry's scope table and by W03's "Business"
+ *  template grouping. */
 export const BUSINESS_REPORT_TYPES = [
   'ticket_sla_attainment',
   'technician_time_billability',
   'ar_aging',
+  'ai_usage_by_client',
+  'mrr_renewals',
+  'quote_win_rate',
+  'client_profitability',
 ] as const satisfies readonly ReportType[];
 
 export type BusinessReportType = (typeof BUSINESS_REPORT_TYPES)[number];
+
+/**
+ * The underlying read grants each business report type requires (#3198 W02,
+ * ruling P8) — THE one source: the API registry's `requiredPermissions`
+ * (apps/api/src/services/reportRegistry.ts) points at these entries, and the
+ * web gallery's card gate (apps/web/src/components/reports/
+ * businessReportAccess.ts) re-exports this object. Both pin identity in tests.
+ */
+export const BUSINESS_REPORT_REQUIRED_PERMISSIONS = {
+  ticket_sla_attainment: [PERMISSION_GRANTS.TICKETS_READ],
+  technician_time_billability: [PERMISSION_GRANTS.TIME_ENTRIES_READ, PERMISSION_GRANTS.TICKETS_READ],
+  ar_aging: [PERMISSION_GRANTS.INVOICES_READ],
+  // Money owed AND every AI session in the org: both reads are required.
+  ai_usage_by_client: [PERMISSION_GRANTS.INVOICES_READ, PERMISSION_GRANTS.AI_SESSIONS_READ_ALL],
+  mrr_renewals: [PERMISSION_GRANTS.CONTRACTS_READ],
+  quote_win_rate: [PERMISSION_GRANTS.QUOTES_READ],
+  // Billed money and cost snapshots AND every technician's hours.
+  client_profitability: [PERMISSION_GRANTS.INVOICES_READ, PERMISSION_GRANTS.TIME_ENTRIES_READ],
+} as const satisfies Record<BusinessReportType, readonly PermissionGrant[]>;
+
+/**
+ * Every report type gated on an underlying read grant: the business entries by
+ * reference, plus the non-business types that need one (#11018). The API
+ * registry's `requiredPermissions` and the web gallery's card gate both read it.
+ */
+export const REPORT_TYPE_REQUIRED_PERMISSIONS: Readonly<Partial<Record<ReportType, readonly PermissionGrant[]>>> = {
+  ...BUSINESS_REPORT_REQUIRED_PERMISSIONS,
+  ticket_sla_performance: [PERMISSION_GRANTS.TICKETS_READ],
+};
 
 const REPORT_TYPE_SET: ReadonlySet<string> = new Set(REPORT_TYPES);
 

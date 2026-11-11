@@ -6,9 +6,8 @@
  *   - patch-job-devices: per-device execution (resolve patches, install, reboot)
  */
 
-import { Queue, Worker, Job } from 'bullmq';
+import { DelayedError, Queue, Worker, Job } from 'bullmq';
 import { z } from 'zod';
-import { policyAppRuleSchema } from '@breeze/shared/validators';
 import * as dbModule from '../db';
 import {
   patchJobs,
@@ -22,14 +21,15 @@ import { eq, and, sql, inArray } from 'drizzle-orm';
 import { getBullMQConnection } from '../services/redis';
 import { isReusableState } from '../services/bullmqUtils';
 import {
+  coerceAppRuleList,
   type CategoryRule,
   type PolicyAppRule,
-  type PolicyAutoApproveConfig,
   type RingConfig,
 } from '../services/patchApprovalEvaluator';
+import { ringFeatureUpdatesSchema, DEFAULT_RING_FEATURE_UPDATES, type RingFeatureUpdates } from '@breeze/shared/validators';
 // W02 (#5748): the DB-facing resolver moved to patchEligibility.ts; the call
 // below and its behaviour are unchanged (golden-fixture parity test there).
-import { resolveApprovedPatchesForDevice } from '../services/patchEligibility';
+import { resolveApprovedPatchesForDevice, areAllPendingPatchesManagedByVendorLane } from '../services/patchEligibility';
 import { dispatchDeviceCommand } from '../services/dispatchDeviceCommand';
 import {
   deliveryTtlMs,
@@ -39,20 +39,21 @@ import {
   checkAndFinalizeJob,
   finalizePatchJobDevice,
   type ApprovedPatchRef,
+  type PatchDeviceContext,
   type PatchDeviceTerminal,
 } from '../services/patchJobFinalizer';
 import { captureException } from '../services/sentry';
-import { attachWorkerObservability } from './workerObservability';
+import { RING_UNAVAILABLE_SKIP_REASON } from '../services/updateRingQueuedWork';
 
-// Strict shape for patches.policyAutoApprove as stored in the job JSONB.
-// deferralDays must be a valid non-negative integer when present — a malformed
-// value must NOT be coerced to 0, because that silently removes the deferral
-// safety window. Absent deferralDays is fine and defaults to 0.
-const jobPolicyAutoApproveSchema = z.object({
-  enabled: z.boolean(),
-  severities: z.array(z.string()),
-  deferralDays: z.number().int().min(0).optional(),
-});
+/** Job-history skip reason: every pending update was left to a vendor lane (#11243). Web label: patchJobDetail.skipReasons. */
+const ALL_MANAGED_BY_VENDOR_SKIP_REASON = 'all_managed_by_vendor_updates';
+import {
+  buildRestorePointRequest,
+  discardRestorePointRequest,
+  linkRestorePointCommand,
+  restorePointPayloadField,
+} from '../services/restorePointRequest';
+import { attachWorkerObservability } from './workerObservability';
 
 // Strict shape for one patches.categoryRules entry as stored in the job JSONB.
 // Matches the evaluator's CategoryRule: severityFilter is the legacy stored
@@ -86,6 +87,47 @@ export function parseJobCategoryList(value: unknown): string[] | null | undefine
   if (!Array.isArray(value)) return null;
   if (value.some((v) => typeof v !== 'string')) return null;
   return (value as string[]).filter((v) => v.length > 0);
+}
+
+/**
+ * Parse an app-rule list from a job snapshot key (`apps` — policy rules — or
+ * `ringAppRules` — ring rules, #8184). Absent → undefined (a job from before
+ * that key existed). Present but not an array → undefined, loudly; the caller
+ * decides the posture (`apps`: run without them, as it always has;
+ * `ringAppRules`: skip the device). Entries go through `coerceAppRuleList`: malformed but
+ * identifiable rules become `block` (dropping a restriction would widen
+ * install scope); entries with no usable identity are dropped, loudly.
+ */
+export function parseJobAppRules(
+  value: unknown,
+  patchJobId: string,
+  key: 'apps' | 'ringAppRules'
+): PolicyAppRule[] | undefined {
+  if (value === undefined) return undefined;
+  const rules = coerceAppRuleList(value, `[PatchJobExecutor] Job ${patchJobId} (patches.${key})`);
+  if (rules === null) {
+    const message = `[PatchJobExecutor] Job ${patchJobId} has malformed patches.${key}; ignoring those app rules`;
+    console.warn(`${message}:`, JSON.stringify(value));
+    captureException(new Error(message));
+    return undefined;
+  }
+  return rules;
+}
+
+/**
+ * Parse the ring's Windows feature-release policy from a job snapshot
+ * (`ringFeatureUpdates`). Absent → block: a job frozen before the control
+ * existed never offered feature releases, so block is what it meant. Present
+ * but malformed → block, loudly (never widen to allow).
+ */
+export function parseJobFeatureUpdates(value: unknown, patchJobId: string): RingFeatureUpdates {
+  if (value === undefined) return DEFAULT_RING_FEATURE_UPDATES;
+  const parsed = ringFeatureUpdatesSchema.safeParse(value);
+  if (parsed.success) return parsed.data;
+  const message = `[PatchJobExecutor] Job ${patchJobId} has malformed patches.ringFeatureUpdates; treating Windows feature updates as blocked`;
+  console.warn(`${message}:`, JSON.stringify(value));
+  captureException(new Error(message));
+  return DEFAULT_RING_FEATURE_UPDATES;
 }
 
 const { db } = dbModule;
@@ -173,6 +215,19 @@ export class PatchCompletionCheckError extends Error {
 }
 
 /**
+ * A per-device job kept finding its parent `scheduled` after every recheck
+ * (#6632). The orchestrator commits the claim before it enqueues any device
+ * job, so this should be unreachable; if it fires, a new fan-out path is
+ * enqueueing ahead of its own commit.
+ */
+export class PatchParentNotRunningError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = 'PatchParentNotRunningError';
+  }
+}
+
+/**
  * Return the reusable queue job for one of `candidateIds`, clearing any
  * terminal leftover so the caller can re-add on the same stable jobId.
  *
@@ -254,6 +309,12 @@ interface ExecutePatchJobDeviceData {
   patchJobId: string;
   deviceId: string;
   orgId: string;
+  /**
+   * How many times this device job has re-delayed itself because its parent
+   * was still `scheduled` (#6632). Absent on first run. Written by the job
+   * itself via `updateData`, never by the enqueuer.
+   */
+  parentNotRunningRechecks?: number;
 }
 
 interface CheckCompletionData {
@@ -458,14 +519,17 @@ export function createPatchJobWorker(): Worker<PatchJobData> {
   return new Worker<PatchJobData>(
     PATCH_JOB_QUEUE,
     async (job: Job<PatchJobData>) => {
-      return runWithSystemDbAccess(async () => {
-        switch (job.data.type) {
-          case 'execute-patch-job':
-            return processExecutePatchJob(job.data);
-          case 'check-completion':
-            return processCheckCompletion(job.data);
-        }
-      });
+      const data = job.data;
+      switch (data.type) {
+        case 'execute-patch-job':
+          // NOT wrapped in one runWithSystemDbAccess (#6632): the claim must
+          // COMMIT before any per-device job is enqueued, so
+          // processExecutePatchJob opens its own short contexts and does every
+          // Redis call outside them.
+          return processExecutePatchJob(data);
+        case 'check-completion':
+          return runWithSystemDbAccess(() => processCheckCompletion(data));
+      }
     },
     {
       connection: getBullMQConnection(),
@@ -477,10 +541,19 @@ export function createPatchJobWorker(): Worker<PatchJobData> {
   );
 }
 
-async function processExecutePatchJob(data: ExecutePatchJobData): Promise<unknown> {
-  const { patchJobId } = data;
+type PatchJobClaim =
+  | { kind: 'claimed'; orgId: string; deviceIds: string[] }
+  | { kind: 'already_running' }
+  | { kind: 'done'; result: unknown };
 
-  // Load and verify job
+/**
+ * Load the job and flip it `scheduled` → `running`. DB-only; the caller runs it
+ * in its own short system context so the flip COMMITS before any per-device job
+ * is enqueued (#6632). A device worker picks its job up within about a
+ * millisecond and reads the parent in a separate transaction, so a claim still
+ * open at enqueue time reads as `scheduled` there.
+ */
+async function claimPatchJob(patchJobId: string): Promise<PatchJobClaim> {
   const [patchJob] = await db
     .select()
     .from(patchJobs)
@@ -489,14 +562,17 @@ async function processExecutePatchJob(data: ExecutePatchJobData): Promise<unknow
 
   if (!patchJob) {
     console.error(`[PatchJobExecutor] Job ${patchJobId} not found`);
-    return { error: 'Job not found' };
+    return { kind: 'done', result: { error: 'Job not found' } };
+  }
+
+  if (patchJob.status === 'running') {
+    return { kind: 'already_running' };
   }
 
   if (patchJob.status !== 'scheduled') {
-    return { skipped: true, reason: `Job status is ${patchJob.status}` };
+    return { kind: 'done', result: { skipped: true, reason: `Job status is ${patchJob.status}` } };
   }
 
-  // Transition to running
   const claimed = await db
     .update(patchJobs)
     .set({ status: 'running', startedAt: new Date() })
@@ -504,7 +580,7 @@ async function processExecutePatchJob(data: ExecutePatchJobData): Promise<unknow
     .returning({ id: patchJobs.id });
 
   if (claimed.length === 0) {
-    return { skipped: true, reason: 'Job was already claimed' };
+    return { kind: 'done', result: { skipped: true, reason: 'Job was already claimed' } };
   }
 
   // Extract target device IDs from the JSONB targets field
@@ -516,10 +592,38 @@ async function processExecutePatchJob(data: ExecutePatchJobData): Promise<unknow
       .update(patchJobs)
       .set({ status: 'completed', completedAt: new Date() })
       .where(eq(patchJobs.id, patchJobId));
-    return { completed: true, reason: 'No target devices' };
+    return { kind: 'done', result: { completed: true, reason: 'No target devices' } };
   }
 
-  // Fan out to per-device queue.
+  return { kind: 'claimed', orgId: patchJob.orgId, deviceIds };
+}
+
+async function processExecutePatchJob(data: ExecutePatchJobData): Promise<unknown> {
+  const { patchJobId } = data;
+
+  // Phase 1 — claim, in its own transaction, committed on return.
+  const claim = await runWithSystemDbAccess(() => claimPatchJob(patchJobId));
+  if (claim.kind === 'done') {
+    return claim.result;
+  }
+  if (claim.kind === 'already_running') {
+    // The claim commits before fan-out, so a worker that died in between left
+    // this row `running` with no device jobs and no completion check. BullMQ's
+    // stall detection re-runs this job, and this branch is where that re-run
+    // lands. Nothing else would ever settle the row: the #1733 sweep only
+    // scans `scheduled`. Device jobs are NOT re-added, because one may already
+    // have run and re-adding clears a completed stable id. Guaranteeing the
+    // completion check (idempotent on its stable id) means undispatched
+    // devices are force-failed at the timeout.
+    await enqueueCompletionCheck(patchJobId);
+    return { skipped: true, reason: 'Job status is running' };
+  }
+  const { orgId, deviceIds } = claim;
+
+  // Phase 2 — fan out. Runs OUTSIDE any DB context: the claim above is
+  // committed, so every device worker reads the parent as `running`, and no
+  // pooled connection sits idle-in-transaction across the Redis round-trips
+  // below (#1105).
   //
   // Every device is dispatched inside its own try/catch, and a failure costs
   // ONLY that device. This runs AFTER the claim UPDATE above has already
@@ -543,7 +647,7 @@ async function processExecutePatchJob(data: ExecutePatchJobData): Promise<unknow
             type: 'execute-patch-job-device',
             patchJobId,
             deviceId,
-            orgId: patchJob.orgId,
+            orgId,
           } satisfies ExecutePatchJobDeviceData,
           {
             ...PATCH_JOB_RETENTION,
@@ -565,9 +669,12 @@ async function processExecutePatchJob(data: ExecutePatchJobData): Promise<unknow
   // by the 35-minute completion checker — and only if that checker was itself
   // enqueued. Recording them as failed keeps the counters exact and lets the
   // normal `devicesPending === 0` finalization close the job out on its own.
+  // One short context per device: DB-only work, never spanning a Redis call.
   for (const failure of dispatchFailures) {
     try {
-      await markDeviceDispatchFailed(patchJobId, failure.deviceId, failure.error);
+      await runWithSystemDbAccess(() =>
+        markDeviceDispatchFailed(patchJobId, failure.deviceId, failure.error),
+      );
     } catch (error) {
       console.error(
         `[PatchJobExecutor] Failed to record dispatch failure for device ${failure.deviceId} `
@@ -761,12 +868,17 @@ async function processCheckCompletion(data: CheckCompletionData): Promise<unknow
 export function createPatchJobDeviceWorker(): Worker<PatchJobDeviceData> {
   return new Worker<PatchJobDeviceData>(
     PATCH_JOB_DEVICE_QUEUE,
-    async (job: Job<PatchJobDeviceData>) => {
+    async (job: Job<PatchJobDeviceData>, token?: string) => {
       // NOT wrapped in one runWithSystemDbAccess: processExecuteDevice manages its
       // own short contexts so the up-to-30-min completion poll never holds a
       // pooled connection in an open transaction (#1105 conn-hold that starved
       // the DB pool under concurrency 10 → user-facing 503s).
-      return processExecuteDevice(job.data);
+      const outcome = await processExecuteDevice(job.data);
+      if (isParentNotStarted(outcome)) {
+        // Outside any DB context: the re-delay is Redis-only.
+        return deferUntilParentRunning(job, token);
+      }
+      return outcome;
     },
     {
       connection: getBullMQConnection(),
@@ -799,8 +911,105 @@ type QueuedDeviceExecution = {
   patchCount: number;
 };
 
+/**
+ * The push's claim-time eligibility check cancelled the install before it was
+ * delivered. Terminal: the device is closed out here (skipped, with the reason,
+ * exactly as any other cancel door records it) and nothing is polled.
+ */
+type CancelledDeviceExecution = {
+  kind: 'cancelled';
+  commandId: string;
+  reason: string;
+  applied: boolean;
+};
+
 type SkippedDeviceExecution = { kind: 'skipped'; skipped: true; reason: string };
 type FailedDeviceExecution = { kind: 'error'; error: string };
+
+/**
+ * The parent was still `scheduled` when this device job read it (#6632). Not
+ * terminal: the worker wrapper re-delays the job and reads again. Only
+ * `scheduled` maps here; a missing, cancelled, completed or failed parent stays
+ * a terminal skip.
+ */
+type ParentNotStartedExecution = { kind: 'parent_not_started' };
+
+const JOB_NOT_RUNNING_SKIP: SkippedDeviceExecution = {
+  kind: 'skipped',
+  skipped: true,
+  reason: 'Job not running',
+};
+
+/**
+ * Recheck budget for a parent still `scheduled`: delays of 2s, 4s, 8s, 16s,
+ * 32s and 64s, about two minutes in total. The orchestrator commits its claim
+ * before enqueueing, so in practice the first read already sees `running` —
+ * this only bounds how long a regression can hide before it is reported.
+ */
+const MAX_PARENT_NOT_RUNNING_RECHECKS = 6;
+const PARENT_NOT_RUNNING_BASE_DELAY_MS = 2_000;
+
+function isParentNotStarted(outcome: unknown): outcome is ParentNotStartedExecution {
+  return (
+    typeof outcome === 'object'
+    && outcome !== null
+    && (outcome as { kind?: unknown }).kind === 'parent_not_started'
+  );
+}
+
+/**
+ * Re-delay this device job until its parent is `running`, via BullMQ's
+ * `moveToDelayed` + `DelayedError` (same mechanism as fixWatchWorker.ts). It
+ * keeps the stable jobId and consumes no attempt; a re-`add()` on that id
+ * would be a silent no-op while this job is still active.
+ *
+ * When the budget is spent it returns the old terminal skip and reports it.
+ * The device stays pending, so the 35-minute completion check still settles
+ * the run if the parent ever starts. If the parent is still `scheduled` when
+ * the orchestrator does claim it, resolveActiveQueueJob clears this completed
+ * job and re-adds it.
+ */
+async function deferUntilParentRunning(
+  job: Job<PatchJobDeviceData>,
+  token: string | undefined,
+): Promise<SkippedDeviceExecution> {
+  const { patchJobId, deviceId } = job.data;
+  const raw = job.data.parentNotRunningRechecks;
+  const rechecks = typeof raw === 'number' && Number.isInteger(raw) && raw >= 0 ? raw : 0;
+
+  if (rechecks >= MAX_PARENT_NOT_RUNNING_RECHECKS || !token) {
+    const message =
+      `[PatchJobExecutor] Device job ${patchJobId}/${deviceId} still found its parent `
+      + `scheduled after ${rechecks} recheck(s); giving up`
+      + (token ? '' : ' (no lock token to re-delay with)');
+    console.error(message);
+    captureException(new PatchParentNotRunningError(message), undefined, {
+      patch_reconcile_stage: 'device_parent_not_running',
+    });
+    return JOB_NOT_RUNNING_SKIP;
+  }
+
+  try {
+    await job.updateData({ ...job.data, parentNotRunningRechecks: rechecks + 1 });
+    await job.moveToDelayed(
+      Date.now() + PARENT_NOT_RUNNING_BASE_DELAY_MS * 2 ** rechecks,
+      token,
+    );
+  } catch (error) {
+    // A Redis failure here must not vanish into a bare BullMQ failure. Report
+    // it and fall back to the terminal skip. The device stays pending for the
+    // completion check, and a later claim clears this job's id and re-adds it.
+    const message =
+      `[PatchJobExecutor] Device job ${patchJobId}/${deviceId} could not re-delay while its `
+      + 'parent is scheduled';
+    console.error(`${message}:`, error instanceof Error ? error.message : error);
+    captureException(new PatchParentNotRunningError(message, { cause: error }), undefined, {
+      patch_reconcile_stage: 'device_parent_not_running',
+    });
+    return JOB_NOT_RUNNING_SKIP;
+  }
+  throw new DelayedError();
+}
 
 /**
  * Deliberately discriminated on `kind` rather than probed with `in`: a
@@ -812,8 +1021,10 @@ type FailedDeviceExecution = { kind: 'error'; error: string };
 type DeviceExecutionOutcome =
   | PreparedDeviceExecution
   | QueuedDeviceExecution
+  | CancelledDeviceExecution
   | SkippedDeviceExecution
-  | FailedDeviceExecution;
+  | FailedDeviceExecution
+  | ParentNotStartedExecution;
 
 async function processExecuteDevice(data: ExecutePatchJobDeviceData): Promise<unknown> {
   // Phased so the up-to-30-min completion poll never holds a pooled connection
@@ -822,8 +1033,10 @@ async function processExecuteDevice(data: ExecutePatchJobDeviceData): Promise<un
   const prep = await runWithSystemDbAccess(() => prepareDeviceExecution(data));
   switch (prep.kind) {
     case 'queued':
+    case 'cancelled':
     case 'skipped':
     case 'error':
+    case 'parent_not_started':
       return prep;
     case 'prepared': {
       const finalCommand = await pollForPatchCommandResult(prep.commandId);
@@ -891,8 +1104,13 @@ async function prepareDeviceExecution(
     .where(eq(patchJobs.id, patchJobId))
     .limit(1);
 
+  // `scheduled` means the orchestrator's claim is not visible yet (#6632), so
+  // look again later. Every other non-running status is terminal.
+  if (patchJob?.status === 'scheduled') {
+    return { kind: 'parent_not_started' };
+  }
   if (!patchJob || patchJob.status !== 'running') {
-    return { kind: 'skipped', skipped: true, reason: 'Job not running' };
+    return JOB_NOT_RUNNING_SKIP;
   }
 
   if (orgId !== patchJob.orgId) {
@@ -913,7 +1131,7 @@ async function prepareDeviceExecution(
   }
 
   const [device] = await db
-    .select({ id: devices.id })
+    .select({ id: devices.id, osType: devices.osType })
     .from(devices)
     .where(and(eq(devices.id, deviceId), eq(devices.orgId, patchJob.orgId)))
     .limit(1);
@@ -933,8 +1151,11 @@ async function prepareDeviceExecution(
     excludeCategories?: unknown;
     autoApprove?: unknown;
     sources?: unknown;
-    policyAutoApprove?: unknown;
+    // Frozen snapshots may also carry `policyAutoApprove`; it was never
+    // consulted by the evaluator and is not read (#8188).
     apps?: unknown;
+    ringAppRules?: unknown;
+    ringFeatureUpdates?: unknown;
   };
   const targets = patchJob.targets as {
     deployment?: { rebootPolicy?: string; offlineBehavior?: string };
@@ -963,78 +1184,19 @@ async function prepareDeviceExecution(
     return { kind: 'skipped', skipped: true, reason: 'Invalid patch source filter' };
   }
 
-  // Malformed auto-approve config degrades to disabled because silently
-  // ENABLING auto-approval is the dangerous direction.
-  let policyAutoApprove: PolicyAutoApproveConfig | undefined;
-  if (patchesConfig?.policyAutoApprove !== undefined) {
-    const parsed = jobPolicyAutoApproveSchema.safeParse(patchesConfig.policyAutoApprove);
-    if (parsed.success) {
-      policyAutoApprove = {
-        enabled: parsed.data.enabled,
-        severities: parsed.data.severities,
-        deferralDays: parsed.data.deferralDays ?? 0,
-      };
-    } else {
-      const message = `[PatchJobExecutor] Job ${patchJobId} has malformed patches.policyAutoApprove; treating as disabled`;
-      console.warn(`${message}:`, JSON.stringify(patchesConfig.policyAutoApprove));
-      captureException(new Error(message));
-    }
-  }
-
-  // Malformed-but-identifiable rules coerce to 'block' rather than being
-  // dropped — dropping a block rule would silently widen install scope; only
-  // rules whose identity (source + packageId) is unusable are dropped, loudly.
-  let jobApps: PolicyAppRule[] | undefined;
-  if (patchesConfig?.apps !== undefined) {
-    if (!Array.isArray(patchesConfig.apps)) {
-      const message = `[PatchJobExecutor] Job ${patchJobId} has malformed patches.apps; ignoring app rules`;
-      console.warn(`${message}:`, JSON.stringify(patchesConfig.apps));
-      captureException(new Error(message));
-    } else {
-      const valid: PolicyAppRule[] = [];
-      for (const entry of patchesConfig.apps) {
-        const parsed = policyAppRuleSchema.safeParse(entry);
-        if (parsed.success) {
-          // Strip displayName and any other extra fields before handing to the evaluator.
-          const { source, packageId, action, pinnedVersion } = parsed.data;
-          if (action === 'pin' && pinnedVersion) {
-            valid.push({ source, packageId, action: 'pin', pinnedVersion });
-          } else {
-            // action === 'block' (pin without pinnedVersion is rejected by the schema).
-            valid.push({ source, packageId, action: 'block' });
-          }
-          continue;
-        }
-
-        const e = entry as { source?: unknown; packageId?: unknown } | null;
-        const identifiable =
-          e !== null &&
-          typeof e === 'object' &&
-          typeof e.source === 'string' &&
-          e.source.length > 0 &&
-          typeof e.packageId === 'string' &&
-          e.packageId.length > 0;
-
-        if (identifiable) {
-          // Fail closed: the admin intended to restrict this app; a malformed
-          // restriction (e.g. pin without a version) becomes an outright block.
-          console.warn(
-            `[PatchJobExecutor] Job ${patchJobId} coercing malformed app rule to block (fail-closed):`,
-            JSON.stringify(entry)
-          );
-          valid.push({
-            source: e.source as string,
-            packageId: e.packageId as string,
-            action: 'block',
-          });
-        } else {
-          const message = `[PatchJobExecutor] Job ${patchJobId} dropping malformed app rule with unusable identity`;
-          console.warn(`${message}:`, JSON.stringify(entry));
-          captureException(new Error(message));
-        }
-      }
-      jobApps = valid;
-    }
+  // App rules from the ring (`ringAppRules`, #8184) and the legacy `apps` key
+  // are parsed identically and both enforced by the evaluator. New snapshots
+  // no longer write `apps` (#8188), but jobs frozen before that still carry
+  // it, so it is still parsed.
+  const jobApps = parseJobAppRules(patchesConfig?.apps, patchJobId, 'apps');
+  const jobRingAppRules = parseJobAppRules(patchesConfig?.ringAppRules, patchJobId, 'ringAppRules');
+  // A present-but-unparseable `ringAppRules` skips the device rather than
+  // running it with no ring restrictions. The key is new, so no legacy
+  // snapshot can carry a bad value; `apps` keeps its historical
+  // ignore-and-run posture (parseJobAppRules already reported both).
+  if (patchesConfig?.ringAppRules !== undefined && jobRingAppRules === undefined) {
+    await markDeviceSkipped(patchJobId, deviceId, 'invalid_patch_app_rules');
+    return { kind: 'skipped', skipped: true, reason: 'Invalid ring app rules' };
   }
 
   // Ring category include/exclude filters (#2117). Mirror the sources posture:
@@ -1072,7 +1234,7 @@ async function prepareDeviceExecution(
   }
 
   // Category rules were the one snapshot field cast blind while every sibling
-  // (sources, apps, policyAutoApprove, categories) is validated loudly — and a
+  // (sources, apps, categories) is validated loudly — and a
   // matching rule is now TERMINAL in the evaluator, so a malformed entry
   // silently became a deny. Mirror the apps posture: a rule with a usable
   // category but bad shape coerces to an explicit deny (fail-closed, matching
@@ -1115,29 +1277,57 @@ async function prepareDeviceExecution(
     categories: jobCategories,
     excludeCategories: jobExcludeCategories,
     sources: jobSources,
-    policyAutoApprove,
     apps: jobApps,
+    ringAppRules: jobRingAppRules,
+    featureUpdates: parseJobFeatureUpdates(patchesConfig?.ringFeatureUpdates, patchJobId),
   };
 
   // If we have a ringId, load deferralDays and partnerId from the ring.
   // partnerId is threaded into ringConfig so the evaluator can guard against
   // cross-partner ring links (a config policy featurePolicyId is unconstrained).
+  //
+  // #8909: the ring must still be live at DISPATCH time, not just when the job
+  // was created. A deleted ring is soft-deleted (`enabled = false`), so the
+  // row survives and only the flag says it is gone; a missing row fails closed
+  // the same way. The read takes FOR SHARE and this whole function runs in one
+  // transaction that also creates the device command, so:
+  //  - a delete/disable that committed first is seen here (the locking read
+  //    returns the latest committed row), and the device is skipped;
+  //  - a delete/disable still uncommitted makes this read WAIT for it, then
+  //    see the disabled row — instead of reading the stale enabled version;
+  //  - a delete/disable that arrives after this read waits on the share lock
+  //    until this dispatch commits, and its sweep
+  //    (services/updateRingQueuedWork.ts) then sees the committed command and
+  //    cancels it if it was only queued, never delivered.
   if (ringConfig.ringId) {
     const [ring] = await db
-      .select({ deferralDays: patchPolicies.deferralDays, partnerId: patchPolicies.partnerId })
+      .select({
+        deferralDays: patchPolicies.deferralDays,
+        partnerId: patchPolicies.partnerId,
+        enabled: patchPolicies.enabled,
+      })
       .from(patchPolicies)
       .where(and(eq(patchPolicies.id, ringConfig.ringId), eq(patchPolicies.kind, 'ring')))
-      .limit(1);
-    if (ring) {
-      ringConfig.deferralDays = ring.deferralDays;
-      ringConfig.ringPartnerId = ring.partnerId;
+      .limit(1)
+      .for('share');
+    if (!ring || ring.enabled !== true) {
+      console.warn(
+        `[PatchJobExecutor] Skipping device ${deviceId} of job ${patchJobId}: update ring ${ringConfig.ringId} `
+        + `is ${ring ? 'deleted or disabled' : 'missing'} (#8909)`
+      );
+      await markDeviceSkipped(patchJobId, deviceId, RING_UNAVAILABLE_SKIP_REASON);
+      return { kind: 'skipped', skipped: true, reason: 'Update ring deleted or disabled' };
     }
+    ringConfig.deferralDays = ring.deferralDays;
+    ringConfig.ringPartnerId = ring.partnerId;
   }
 
   // 1. Resolve approved patches
   let approvedPatches;
   try {
-    approvedPatches = await resolveApprovedPatchesForDevice(deviceId, orgId, ringConfig);
+    // Savepoint: the catch writes the skipped row on this same transaction (#11225).
+    approvedPatches = await dbModule.withDbTransaction(() =>
+      resolveApprovedPatchesForDevice(deviceId, orgId, ringConfig));
   } catch (err) {
     console.error(`[PatchJobExecutor] Failed to resolve patches for device ${deviceId}:`, err instanceof Error ? err.message : err);
     await markDeviceSkipped(patchJobId, deviceId, 'error_resolving_patches');
@@ -1146,21 +1336,73 @@ async function prepareDeviceExecution(
 
   // 2. No approved patches → skip
   if (approvedPatches.length === 0) {
+    // #11243: every pending update left to a vendor lane is not "nothing approved".
+    let allVendorManaged = false;
+    try {
+      // Isolated: this runs inside the device transaction, so the read needs its
+      // own savepoint for the catch below to contain a failure (CLAUDE.md).
+      allVendorManaged = await dbModule.withSystemDbAccessContextIsolated(() =>
+        areAllPendingPatchesManagedByVendorLane(deviceId, orgId, ringConfig));
+    } catch (err) {
+      // Reason refinement only: fall back to the generic reason, never fail the device.
+      console.warn(`[PatchJobExecutor] vendor-lane skip classification failed for device ${deviceId}:`, err instanceof Error ? err.message : err);
+      captureException(err instanceof Error ? err : new Error(String(err)), undefined, { patchJobId, deviceId });
+    }
+    if (allVendorManaged) {
+      await markDeviceSkipped(patchJobId, deviceId, ALL_MANAGED_BY_VENDOR_SKIP_REASON);
+      return { kind: 'skipped', skipped: true, reason: 'All pending updates are managed by vendor updates' };
+    }
     await markDeviceSkipped(patchJobId, deviceId, 'no_approved_patches');
     return { kind: 'skipped', skipped: true, reason: 'No approved patches' };
   }
 
   // 3. Send install_patches command
   const patchIds = approvedPatches.map((p) => p.patchId);
-  const patchRecords = await db
-    .select({
-      id: patches.id,
-      source: patches.source,
-      externalId: patches.externalId,
-      title: patches.title,
-    })
-    .from(patches)
-    .where(inArray(patches.id, patchIds));
+
+  // #4609 W05: the System Restore checkpoint decision is made HERE, when the
+  // concrete per-device command is created. Null (no policy, non-Windows)
+  // leaves the payload exactly as it was before the feature. A resolution
+  // failure fails this device visibly rather than dispatching an install the
+  // policy may have wanted protected.
+  let restorePoint;
+  try {
+    restorePoint = await buildRestorePointRequest({
+      deviceId,
+      orgId,
+      osType: device.osType,
+      trigger: 'patch',
+      label: `install ${patchIds.length} update${patchIds.length === 1 ? '' : 's'}`,
+      patchJobId,
+    });
+  } catch (err) {
+    console.error(
+      `[PatchJobExecutor] System Restore checkpoint policy resolution failed for device ${deviceId}:`,
+      err instanceof Error ? err.message : err,
+    );
+    captureException(err);
+    await markDeviceSkipped(patchJobId, deviceId, 'error_resolving_restore_point');
+    return { kind: 'error', error: 'Failed to resolve the System Restore checkpoint policy' };
+  }
+
+  let patchRecords;
+  try {
+    patchRecords = await db
+      .select({
+        id: patches.id,
+        source: patches.source,
+        externalId: patches.externalId,
+        title: patches.title,
+        // Only alongside a stamped block: the agent's definitions-only skip
+        // (W07) needs it, and without a block the payload stays byte-identical.
+        ...(restorePoint ? { category: patches.category } : {}),
+      })
+      .from(patches)
+      .where(inArray(patches.id, patchIds));
+  } catch (err) {
+    // No command can exist yet, so the requested row would be a false record.
+    await discardRestorePointRequest(restorePoint);
+    throw err;
+  }
 
   // Enqueue through the single dispatch seam so offline devices can wait for delivery.
   // `patchJobId` is now in the payload: it is what lets a result arriving days
@@ -1180,12 +1422,14 @@ async function prepareDeviceExecution(
   const res = await dispatchDeviceCommand({
     deviceId,
     type: 'install_patches',
-    payload: { patchJobId, patchIds, patches: patchRecords },
+    payload: { patchJobId, patchIds, patches: patchRecords, ...restorePointPayloadField(restorePoint) },
     expectedOrgId: patchJob.orgId,
     offlinePolicy: offline.policy,
   });
 
   if (!res.ok) {
+    // No command exists, so nothing was asked of the agent.
+    await discardRestorePointRequest(restorePoint);
     // An offline device with `offlineBehavior: 'skip'` is still recorded
     // skipped, with the seam's own code as the reason. A stale-deadline
     // fallback gets its own reason so it is not mistaken for a configured skip.
@@ -1201,9 +1445,12 @@ async function prepareDeviceExecution(
 
   const commandId = res.command?.id;
   if (!commandId) {
+    await discardRestorePointRequest(restorePoint);
     await markDeviceSkipped(patchJobId, deviceId, 'command_creation_failed');
     return { kind: 'error', error: 'Failed to create command' };
   }
+
+  await linkRestorePointCommand(restorePoint, commandId);
 
   if (res.delivery === 'queued_offline') {
     await recordDeviceQueued(patchJobId, deviceId, approvedPatches);
@@ -1215,7 +1462,43 @@ async function prepareDeviceExecution(
     };
   }
 
+  if (res.delivery === 'cancelled') {
+    // The push's claim-time check refused the install and cancelled the row.
+    // Its own propagation cannot close this device (a deferred door with no
+    // result rows yet defers to this task), so close it here — the same
+    // `cancelled` terminal every other cancel door records — instead of
+    // polling a terminal row for 30 minutes.
+    const reason = res.cancelReason ?? 'cancelled';
+    const { applied } = await finalizePatchJobDevice({
+      patchJobId,
+      deviceId,
+      commandId,
+      completedAt: new Date(),
+      terminal: { kind: 'cancelled', reason },
+      source: { kind: 'synchronous', context: synchronousContext(orgId, targets, approvedPatches) },
+    });
+    return { kind: 'cancelled', commandId, reason, applied };
+  }
+
   return { kind: 'prepared', commandId, approvedPatches, targets };
+}
+
+function synchronousContext(
+  orgId: string,
+  targets: PreparedDeviceExecution['targets'] | undefined,
+  approvedPatches: PreparedDeviceExecution['approvedPatches'],
+): PatchDeviceContext {
+  return {
+    orgId,
+    rebootPolicy: targets?.deployment?.rebootPolicy ?? 'if_required',
+    approvedPatches: approvedPatches.map(
+      (p): ApprovedPatchRef => ({
+        patchId: p.patchId,
+        externalId: p.externalId,
+        requiresReboot: p.requiresReboot,
+      }),
+    ),
+  };
 }
 
 /**
@@ -1287,7 +1570,9 @@ async function pollForPatchCommandResult(commandId: string) {
     );
 
     if (!updated) return null;
-    if (updated.status === 'completed' || updated.status === 'failed') {
+    // `cancelled` is terminal too (a claim-time refusal, an org move, a user
+    // cancel): nothing will ever complete it, so stop polling.
+    if (updated.status === 'completed' || updated.status === 'failed' || updated.status === 'cancelled') {
       return updated;
     }
   }
@@ -1326,7 +1611,12 @@ async function recordDeviceExecution(
   // terminal — not a `result` carrying nothing, which would run the agent-result
   // parsing path and log "no patch installed successfully" for a run whose
   // result never arrived at all.
-  const terminal: PatchDeviceTerminal = finalCommand
+  const terminal: PatchDeviceTerminal = finalCommand?.status === 'cancelled'
+    ? {
+        kind: 'cancelled',
+        reason: (finalCommand.result as { reason?: string } | null)?.reason ?? 'cancelled',
+      }
+    : finalCommand
     ? {
         kind: 'result',
         commandResult: {
@@ -1345,20 +1635,7 @@ async function recordDeviceExecution(
     commandId: prep.commandId,
     completedAt: new Date(),
     terminal,
-    source: {
-      kind: 'synchronous',
-      context: {
-        orgId,
-        rebootPolicy: targets?.deployment?.rebootPolicy ?? 'if_required',
-        approvedPatches: approvedPatches.map(
-          (p): ApprovedPatchRef => ({
-            patchId: p.patchId,
-            externalId: p.externalId,
-            requiresReboot: p.requiresReboot,
-          }),
-        ),
-      },
-    },
+    source: { kind: 'synchronous', context: synchronousContext(orgId, targets, approvedPatches) },
   });
 
   return {
@@ -1448,4 +1725,5 @@ export const __testOnly = {
    * Postgres without a Redis connection.
    */
   processExecuteDevice,
+  MAX_PARENT_NOT_RUNNING_RECHECKS,
 };

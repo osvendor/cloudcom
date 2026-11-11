@@ -27,6 +27,23 @@ function setup() {
   };
 }
 describe('organization-bound Microsoft administration execution', () => {
+  it('fences and audits a typed read-only OneDrive link lookup', async () => {
+    const s = setup();
+    s.fetch.mockImplementation(async url => url.includes('/organization?')
+      ? Response.json({ value: [{ id: tenantId }] })
+      : url.includes(`/users/${id}?`)
+        ? Response.json({ id, assignedLicenses: [] })
+        : url.endsWith(`/users/${id}/drive`)
+          ? Response.json({ webUrl: 'https://tenant-my.sharepoint.com/personal/qa' })
+          : (() => { throw new Error(`Unexpected ${url}`); })());
+    await expect(s.run(request, orgId, { type: 'user.drive.link.get', id })).resolves.toEqual({ url: 'https://tenant-my.sharepoint.com/personal/qa' });
+    expect(s.authorize).toHaveBeenCalledWith(request, orgId, 'user.drive.link.get');
+    expect(s.fetch.mock.calls.every(([, init]) => init.method === 'GET')).toBe(true);
+    expect(s.audit.mock.calls.map(([event]) => event)).toEqual([
+      expect.objectContaining({ phase: 'intent', operation: 'user.drive.link.get', changedFields: [] }),
+      expect.objectContaining({ phase: 'outcome', operation: 'user.drive.link.get', outcome: 'success' }),
+    ]);
+  });
   it('authorizes, audits, and fences one typed group creation write', async () => {
     const s = setup();
     s.acquireToken.mockResolvedValue(`h.${Buffer.from(JSON.stringify({ roles: ['Group.ReadWrite.All', 'User.ReadWrite.All'] })).toString('base64url')}.s`);
@@ -61,7 +78,28 @@ describe('organization-bound Microsoft administration execution', () => {
     ]);
     expect(s.fetch.mock.calls.every(([, init]) => init.method === 'GET')).toBe(true);
   });
-  it('creates a user with manager authorization, audit fencing, and no password in audit events', async () => {
+  it('authorizes the typed group people read and audits only the selected group', async () => {
+    const s = setup();
+    s.acquireToken.mockResolvedValue(`h.${Buffer.from(JSON.stringify({ roles: ['Group.Read.All'] })).toString('base64url')}.s`);
+    s.fetch.mockImplementation(async (url, init) => {
+      if (url.includes('/organization?')) return Response.json({ value: [{ id: tenantId }] });
+      if (url.includes(`/groups/${id}?`)) return Response.json({ id, displayName: 'QA', mailEnabled: true,
+        securityEnabled: false, groupTypes: ['Unified'], onPremisesSyncEnabled: null });
+      if (url.endsWith(`/groups/${id}/members`)) return Response.json({ value: [{ id: actorId,
+        '@odata.type': '#microsoft.graph.user', displayName: 'QA member' }] });
+      if (url.endsWith(`/groups/${id}/owners`)) return Response.json({ value: [] });
+      throw new Error(`Unexpected ${url} ${init.method}`);
+    });
+    await expect(s.run(request, orgId, { type: 'group.people.list', id }))
+      .resolves.toMatchObject({ groupId: id, complete: true, members: [{ id: actorId }], owners: [] });
+    expect(s.authorize).toHaveBeenCalledWith(request, orgId, 'group.people.list');
+    expect(s.audit.mock.calls.map(([event]) => event)).toEqual([
+      expect.objectContaining({ phase: 'intent', operation: 'group.people.list', targets: { groupId: id }, changedFields: [] }),
+      expect.objectContaining({ phase: 'outcome', operation: 'group.people.list', outcome: 'success' }),
+    ]);
+    expect(s.fetch.mock.calls.every(([, init]) => init.method === 'GET')).toBe(true);
+  });
+  it.each([{}, { password: 'Chosen-Example9!', forceChangePasswordNextSignIn: false }])('creates a user with manager authorization, audit fencing, and no password in audit events: %j', async passwordOptions => {
     const s = setup();
     s.acquireToken.mockResolvedValue(`h.${Buffer.from(JSON.stringify({ roles: ['User.ReadWrite.All'] })).toString('base64url')}.s`);
     s.fetch.mockImplementation(async (url, init) => {
@@ -70,8 +108,8 @@ describe('organization-bound Microsoft administration execution', () => {
       if (url.endsWith('/users') && init.method === 'POST') return Response.json({ id, userPrincipalName: 'new@example.test' }, { status: 201 });
       throw new Error(`Unexpected ${url}`);
     });
-    const result = await s.run(request, orgId, { type: 'user.create', user: { displayName: 'New User', userPrincipalName: 'new@example.test' } });
-    expect(result).toMatchObject({ accepted: true, id, userPrincipalName: 'new@example.test', forceChangePasswordNextSignIn: true });
+    const result = await s.run(request, orgId, { type: 'user.create', user: { displayName: 'New User', userPrincipalName: 'new@example.test', ...passwordOptions } });
+    expect(result).toMatchObject({ accepted: true, id, userPrincipalName: 'new@example.test', forceChangePasswordNextSignIn: passwordOptions.forceChangePasswordNextSignIn ?? true });
     expect(s.authorize.mock.calls.every(([, , operation]) => operation === 'user.create')).toBe(true);
     expect(s.audit.mock.calls.map(([event]) => event)).toEqual([
       expect.objectContaining({ phase: 'intent', operation: 'user.create', changedFields: ['displayName', 'userPrincipalName', 'passwordProfile'] }),
@@ -111,6 +149,25 @@ describe('organization-bound Microsoft administration execution', () => {
     await expect(s.run(request, orgId, { type: 'user.license.assign', id, license: { skuId: id, disabledPlans: [] } }))
       .rejects.toMatchObject({ code: 'invalid_operation' });
     expect(s.authorize).not.toHaveBeenCalled();
+  });
+  it('requires a fixed confirmation and audits one direct-license removal', async () => {
+    const s = setup();
+    const skuId = '55555555-5555-4555-8555-555555555555';
+    await expect(s.run(request, orgId, { type: 'user.license.remove', id, skuId }))
+      .rejects.toMatchObject({ code: 'invalid_operation' });
+    expect(s.authorize).not.toHaveBeenCalled();
+    s.acquireToken.mockResolvedValue(`h.${Buffer.from(JSON.stringify({ roles: ['LicenseAssignment.ReadWrite.All'] })).toString('base64url')}.s`);
+    let reads = 0;
+    s.fetch.mockImplementation(async (url, init) => {
+      if (url.includes('/organization?')) return Response.json({ value: [{ id: tenantId }] });
+      if (url.includes('?$select=id,licenseAssignmentStates')) return Response.json({ id, licenseAssignmentStates: reads++ ? [] : [{ skuId, assignedByGroup: null }] });
+      if (url.includes('/assignLicense') && init.method === 'POST') return Response.json({ id });
+      throw new Error(`Unexpected ${url}`);
+    });
+    await expect(s.run(request, orgId, { type: 'user.license.remove', id, skuId, confirmation: 'REMOVE_LICENSE' }))
+      .resolves.toEqual({ accepted: true, changed: true, verified: true });
+    expect(s.audit).toHaveBeenCalledWith(expect.objectContaining({ operation: 'user.license.remove', phase: 'intent', targets: { userId: id, licenseSkuId: skuId } }));
+    expect(s.fetch.mock.calls.filter(([, init]) => init.method !== 'GET')).toHaveLength(1);
   });
   it('audits accepted but unverified license assignment as unknown without a second write', async () => {
     const s = setup();
@@ -198,24 +255,70 @@ describe('organization-bound Microsoft administration execution', () => {
     ]);
     expect(JSON.stringify(s.audit.mock.calls)).not.toMatch(/4567|secret/);
   });
-  it('fences and audits one typed MFA removal without recording method details', async () => {
+  it.each(['phone', 'fido2'] as const)('fences and audits one typed %s removal without recording method details', async kind => {
     const s = setup();
-    const methodId = actorId;
+    const methodId = kind === 'phone' ? actorId : '_jpuR-TGZtk6aQCLF3BQjA2';
     s.acquireToken.mockResolvedValue(`h.${Buffer.from(JSON.stringify({ roles: ['UserAuthenticationMethod.ReadWrite.All'] })).toString('base64url')}.s`);
     s.fetch.mockImplementation(async (url, init) => {
       if (init.method !== 'GET') return new Response(null, { status: 204 });
       if (url.includes('/organization?')) return Response.json({ value: [{ id: tenantId }] });
-      if (url.includes('/authentication/methods')) return Response.json({ value: [{ id: methodId, '@odata.type': '#microsoft.graph.phoneAuthenticationMethod', phoneType: 'mobile', phoneNumber: '+1 555 123 4567' }] });
+      if (url.includes('/authentication/methods')) return Response.json({ value: [{ id: methodId, '@odata.type': `#microsoft.graph.${kind}AuthenticationMethod`, phoneType: 'mobile', phoneNumber: '+1 555 123 4567' }] });
       throw new Error(`unexpected ${init.method} ${url}`);
     });
-    await expect(s.run(request, orgId, { type: 'user.mfa.method.remove', id, kind: 'phone', methodId, confirmation: 'REMOVE_AUTH_METHOD' }))
+    await expect(s.run(request, orgId, { type: 'user.mfa.method.remove', id, kind, methodId, confirmation: 'REMOVE_AUTH_METHOD' }))
       .resolves.toEqual({ accepted: true });
     expect(s.fetch.mock.calls.filter(([, init]) => init.method !== 'GET')).toHaveLength(1);
     expect(s.audit.mock.calls.map(([event]) => event)).toEqual([
-      expect.objectContaining({ phase: 'intent', operation: 'user.mfa.method.remove', targets: { userId: id, methodKind: 'phone', methodId }, changedFields: ['authenticationMethod'] }),
-      expect.objectContaining({ phase: 'outcome', outcome: 'success', targets: { userId: id, methodKind: 'phone', methodId }, changedFields: ['authenticationMethod'] }),
+      expect.objectContaining({ phase: 'intent', operation: 'user.mfa.method.remove', targets: { userId: id, methodKind: kind, methodId }, changedFields: ['authenticationMethod'] }),
+      expect.objectContaining({ phase: 'outcome', outcome: 'success', targets: { userId: id, methodKind: kind, methodId }, changedFields: ['authenticationMethod'] }),
     ]);
     expect(JSON.stringify(s.audit.mock.calls)).not.toMatch(/4567|REMOVE_AUTH_METHOD/);
+  });
+  it('requires recovery-email confirmation, then audits only the field and performs one write', async () => {
+    const s = setup();
+    await expect(s.run(request, orgId, { type: 'user.mfa.recoveryEmail.set', id, emailAddress: 'qa@example.net', confirmation: 'yes' }))
+      .rejects.toMatchObject({ code: 'invalid_operation' });
+    expect(s.authorize).not.toHaveBeenCalled();
+    s.acquireToken.mockResolvedValue(`h.${Buffer.from(JSON.stringify({ roles: ['UserAuthenticationMethod.ReadWrite.All'] })).toString('base64url')}.s`);
+    let wrote = false;
+    s.fetch.mockImplementation(async (url, init) => {
+      if (url.includes('/organization?')) return Response.json({ value: [{ id: tenantId }] });
+      if (url.includes('/authentication/methods')) return Response.json({ value: wrote
+        ? [{ '@odata.type': '#microsoft.graph.emailAuthenticationMethod', emailAddress: 'qa@example.net' }] : [] });
+      if (url.endsWith('/authentication/emailMethods') && init.method === 'POST') { wrote = true; return Response.json({ id: '3ddfcfc8-9383-446f-83cc-3ab9be4be18f' }, { status: 201 }); }
+      throw new Error(`unexpected ${init.method} ${url}`);
+    });
+    await expect(s.run(request, orgId, { type: 'user.mfa.recoveryEmail.set', id, emailAddress: 'qa@example.net', confirmation: 'SET_RECOVERY_EMAIL' }))
+      .resolves.toEqual({ accepted: true, verified: true });
+    expect(s.authorize.mock.calls.every(([, , operation]) => operation === 'user.mfa.recoveryEmail.set')).toBe(true);
+    expect(s.fetch.mock.calls.filter(([, init]) => init.method !== 'GET')).toHaveLength(1);
+    expect(s.audit.mock.calls.map(([event]) => event)).toEqual([
+      expect.objectContaining({ phase: 'intent', operation: 'user.mfa.recoveryEmail.set', targets: { userId: id }, changedFields: ['authenticationMethod'] }),
+      expect.objectContaining({ phase: 'outcome', outcome: 'success', targets: { userId: id }, changedFields: ['authenticationMethod'] }),
+    ]);
+    expect(JSON.stringify(s.audit.mock.calls)).not.toContain('qa@example.net');
+  });
+  it('requires mobile-phone confirmation and never audits the phone number', async () => {
+    const s = setup();
+    await expect(s.run(request, orgId, { type: 'user.mfa.mobilePhone.set', id, phoneNumber: '+1 5555551234', confirmation: 'yes' }))
+      .rejects.toMatchObject({ code: 'invalid_operation' });
+    expect(s.authorize).not.toHaveBeenCalled();
+    s.acquireToken.mockResolvedValue(`h.${Buffer.from(JSON.stringify({ roles: ['UserAuthenticationMethod.ReadWrite.All'] })).toString('base64url')}.s`);
+    s.fetch.mockImplementation(async (url, init) => {
+      if (url.includes('/organization?')) return Response.json({ value: [{ id: tenantId }] });
+      if (url.endsWith('/authentication/methods')) return Response.json({ value: [] });
+      if (url.endsWith('/authentication/phoneMethods') && init.method === 'POST') return Response.json({ id: '3179e48a-750b-4051-897c-87b9720928f7' }, { status: 201 });
+      if (url.endsWith('/authentication/phoneMethods/3179e48a-750b-4051-897c-87b9720928f7')) return Response.json({ id: '3179e48a-750b-4051-897c-87b9720928f7', phoneType: 'mobile', phoneNumber: '+1 5555551234' });
+      throw new Error(`unexpected ${init.method} ${url}`);
+    });
+    await expect(s.run(request, orgId, { type: 'user.mfa.mobilePhone.set', id, phoneNumber: '+1 5555551234', confirmation: 'SET_MOBILE_PHONE' }))
+      .resolves.toEqual({ accepted: true, verified: true });
+    expect(s.fetch.mock.calls.filter(([, init]) => init.method !== 'GET')).toHaveLength(1);
+    expect(s.audit.mock.calls.map(([event]) => event)).toEqual([
+      expect.objectContaining({ phase: 'intent', operation: 'user.mfa.mobilePhone.set', targets: { userId: id }, changedFields: ['authenticationMethod'] }),
+      expect.objectContaining({ phase: 'outcome', outcome: 'success', targets: { userId: id }, changedFields: ['authenticationMethod'] }),
+    ]);
+    expect(JSON.stringify(s.audit.mock.calls)).not.toContain('5555551234');
   });
   it('denies unauthorized callers before reading a connection or credential', async () => {
     const s = setup(); s.authorize.mockResolvedValue(null);

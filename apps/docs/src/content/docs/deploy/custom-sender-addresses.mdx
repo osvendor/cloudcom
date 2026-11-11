@@ -47,6 +47,13 @@ you can give it a display name:
 EMAIL_FROM="Acme IT <support@acme.com>"
 ```
 
+Customer-facing mail (invoices, quotes, portal invites and password resets,
+ticket replies and notices, scheduled reports) is sent with the partner's
+company name as the display name when `EMAIL_FROM` is a bare address such as
+`support@acme.com`. Before v0.122.1 it read "Company via Breeze". An
+`EMAIL_FROM` that already has its own display name is sent unchanged. Staff and
+security mail keeps the platform sender.
+
 Nothing else on this page applies. Skip to [Environment
 Variables](/deploy/environment/) if that is all you wanted.
 
@@ -155,6 +162,14 @@ removing it from Breeze drops the local record and leaves your provider account
 untouched. That matters because the domain you are most likely to add is the one
 your `EMAIL_FROM` already uses.
 
+From v0.118.0, adopting a domain that already exists at the provider needs proof
+that the partner adding it controls it: either a DNS TXT record at
+`_breeze-verify.<domain>`, or the domain listed in
+`EMAIL_DOMAINS_ADOPT_EXISTING_ALLOWLIST` (comma-separated) by the operator.
+Without either, provisioning ends as failed with a provider conflict. On a
+self-hosted install, add the domain your `EMAIL_FROM` uses to the allowlist
+before adding it in Breeze.
+
 ## Environment variables
 
 Every one of these is optional, and none is ever required by an upgrade.
@@ -167,6 +182,7 @@ with no key, or `fake` in production.
 | `EMAIL_DOMAINS_STATIC_ALLOWED` | empty | `static` only. Comma-separated `domain` or `domain:partner-slug`. Your statement that this server's relay may send as these domains |
 | `EMAIL_DOMAINS_RESEND_API_KEY` | — | `resend` only, required. A `full_access` key; a sending-only key cannot manage domains |
 | `EMAIL_DOMAINS_RESEND_SENDING_KEY` | falls back to the key above | Optional sending-only key of the same account, so the send path never holds the management key |
+| `EMAIL_DOMAINS_ADOPT_EXISTING_ALLOWLIST` | empty | **v0.118.0+.** Comma-separated domains that may be adopted when they already exist at the provider, without the `_breeze-verify` TXT record |
 | `EMAIL_DOMAINS_REGION` | `us-east-1` | Region for newly created domains: `us-east-1`, `eu-west-1`, `sa-east-1`, `ap-northeast-1` |
 | `EMAIL_DOMAINS_MAX_PER_PARTNER` | `3` | How many sending domains one partner may hold |
 | `EMAIL_DOMAINS_DAILY_SEND_CAP` | unlimited when self-hosted | Messages per partner per UTC day on the custom-domain lane. `0` is unlimited. Over the cap, mail goes out from `EMAIL_FROM` as it would today |

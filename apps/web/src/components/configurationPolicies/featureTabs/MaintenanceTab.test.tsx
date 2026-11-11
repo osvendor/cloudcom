@@ -17,6 +17,27 @@ vi.mock('./useFeatureLink', () => ({
   }),
 }));
 
+describe('MaintenanceTab — suppression toggles (#7212)', () => {
+  const renderTab = () => render(
+    <MaintenanceTab policyId="policy-1" existingLink={undefined} linkedPolicyId={null} onLinkChanged={vi.fn()} />,
+  );
+
+  it('describes Suppress alerts as preventing alert creation, not muting notifications', () => {
+    renderTab();
+    expect(screen.queryByText(/mute alert notifications/i)).toBeNull();
+    expect(screen.getByText(/no new alerts are created during the window/i)).toBeTruthy();
+  });
+
+  it('exposes each suppression toggle as a labelled switch with on/off state', () => {
+    renderTab();
+    const alerts = screen.getByRole('switch', { name: /suppress alerts/i });
+    expect(alerts.getAttribute('aria-checked')).toBe('true');
+    expect(screen.getByRole('switch', { name: /suppress patching/i }).getAttribute('aria-checked')).toBe('false');
+    fireEvent.click(alerts);
+    expect(alerts.getAttribute('aria-checked')).toBe('false');
+  });
+});
+
 describe('MaintenanceTab — rebootIfPending', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -279,5 +300,51 @@ describe('MaintenanceTab — timezone picker', () => {
 
     const [, payload] = saveMock.mock.calls[0] as [string | null, { featurePolicyId: string | null }];
     expect(payload.featurePolicyId).toBeNull();
+  });
+});
+
+// #9565: "Weekly" had no day-of-week field and the form never said which day a
+// weekly window opens on. The scheduler pins weekly windows to Sunday and
+// monthly windows to the 1st (featureConfigResolver.ts); until a day picker
+// exists end to end, the form states that rule.
+describe('MaintenanceTab — recurrence day rule (#9565)', () => {
+  const renderTab = () => render(
+    <MaintenanceTab policyId="policy-1" existingLink={undefined} linkedPolicyId={null} onLinkChanged={vi.fn()} />,
+  );
+
+  it('states that a weekly window opens every Sunday', () => {
+    renderTab();
+    expect(screen.getByTestId('maintenance-recurrence-rule')).toHaveTextContent(/every sunday/i);
+  });
+
+  it('states that a monthly window opens on the 1st', () => {
+    renderTab();
+    fireEvent.change(screen.getByTestId('maintenance-recurrence'), { target: { value: 'monthly' } });
+    expect(screen.getByTestId('maintenance-recurrence-rule')).toHaveTextContent(/1st of each month/i);
+  });
+
+  it('shows no day rule for daily or one-off windows', () => {
+    renderTab();
+    fireEvent.change(screen.getByTestId('maintenance-recurrence'), { target: { value: 'daily' } });
+    expect(screen.queryByTestId('maintenance-recurrence-rule')).toBeNull();
+    fireEvent.change(screen.getByTestId('maintenance-recurrence'), { target: { value: 'once' } });
+    expect(screen.queryByTestId('maintenance-recurrence-rule')).toBeNull();
+  });
+
+  it('reboot-if-pending toggle has a literal data-testid (#9634)', () => {
+    renderTab();
+    expect(screen.getByTestId('maintenance-reboot-if-pending-toggle')).toBeTruthy();
+  });
+
+  it('describes Suppress patching as skipping, not delaying (#9634)', () => {
+    renderTab();
+    expect(screen.queryByText(/delay patch installations/i)).toBeNull();
+    expect(screen.getByText(/skipped and run at the next scheduled occurrence/i)).toBeTruthy();
+  });
+
+  it('points the reboot description at the patch policy reboot delay (#9634)', () => {
+    renderTab();
+    expect(screen.queryByText(/~5 minutes/)).toBeNull();
+    expect(screen.getByText(/patch policy reboot delay/i)).toBeTruthy();
   });
 });

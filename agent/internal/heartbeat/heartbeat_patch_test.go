@@ -289,6 +289,32 @@ func TestInstalledPatchesToMapsOmitsUnknownInstalledAt(t *testing.T) {
 	}
 }
 
+// #9723: a provider-set install date reaches the API payload unchanged.
+func TestInstalledPatchesToMapsForwardsKnownInstalledAt(t *testing.T) {
+	h := &Heartbeat{}
+
+	items := h.installedPatchesToMaps([]patching.InstalledPatch{
+		{
+			ID:          "windows-update:kb5050001",
+			Provider:    "windows-update",
+			Title:       "2026-01 Cumulative Update for Windows 11 (KB5050001)",
+			KBNumber:    "KB5050001",
+			InstalledAt: "2026-01-15T03:04:05Z",
+		},
+		{ID: "Git.Git", Provider: "winget", Title: "Git", Version: "2.51.0.2", InstalledAt: "2026-01-05"},
+	})
+
+	if len(items) != 2 {
+		t.Fatalf("expected 2 mapped items, got %d", len(items))
+	}
+	if got := items[0]["installedAt"]; got != "2026-01-15T03:04:05Z" {
+		t.Errorf("items[0].installedAt = %v, want 2026-01-15T03:04:05Z", got)
+	}
+	if got := items[1]["installedAt"]; got != "2026-01-05" {
+		t.Errorf("items[1].installedAt = %v, want 2026-01-05", got)
+	}
+}
+
 func TestAvailablePatchesToMapsDerivesHomebrewCaskCategory(t *testing.T) {
 	h := &Heartbeat{}
 
@@ -318,5 +344,67 @@ func TestAvailablePatchesToMapsDerivesHomebrewCaskCategory(t *testing.T) {
 	}
 	if got := items[1]["category"]; got != "homebrew" {
 		t.Fatalf("expected second category homebrew, got %#v", got)
+	}
+}
+
+type skippingMockProvider struct{ heartbeatMockProvider }
+
+func (p *skippingMockProvider) Install(patchID string) (patching.InstallResult, error) {
+	if patchID == "current-pkg" {
+		return patching.InstallResult{
+			PatchID:    patchID,
+			Message:    "No available upgrade found.",
+			Skipped:    true,
+			SkipReason: patching.SkipReasonAlreadyCurrent,
+		}, nil
+	}
+	return patching.InstallResult{PatchID: patchID, Message: "ok", RebootRequired: true}, nil
+}
+
+// #6910: a skipped install (already current / no longer offered) is neither a
+// failure nor an install. The command succeeds, the item stays visible in
+// results[] as status "skipped" with its reason and message, and it is
+// counted in skippedCount — never failedCount or installedCount.
+func TestExecutePatchInstallCommandReportsSkippedAsNonFailure(t *testing.T) {
+	provider := &skippingMockProvider{heartbeatMockProvider{id: "winget"}}
+	h := &Heartbeat{patchMgr: patching.NewPatchManager(provider), stopChan: make(chan struct{})}
+	defer close(h.stopChan)
+
+	result := h.executePatchInstallCommand(map[string]any{
+		"patchIds": []any{"winget:current-pkg", "winget:other-pkg"},
+	}, false)
+
+	if result.Status != "completed" {
+		t.Fatalf("expected completed status, got %s (%s)", result.Status, result.Error)
+	}
+	var summary struct {
+		Success        bool             `json:"success"`
+		InstalledCount int              `json:"installedCount"`
+		SkippedCount   int              `json:"skippedCount"`
+		FailedCount    int              `json:"failedCount"`
+		RebootRequired bool             `json:"rebootRequired"`
+		Results        []map[string]any `json:"results"`
+	}
+	if err := json.Unmarshal([]byte(result.Stdout), &summary); err != nil {
+		t.Fatalf("expected JSON stdout, got parse error: %v", err)
+	}
+	if !summary.Success || summary.InstalledCount != 1 || summary.SkippedCount != 1 || summary.FailedCount != 0 {
+		t.Fatalf("unexpected counts: %+v", summary)
+	}
+	if !summary.RebootRequired {
+		t.Fatal("rebootRequired from the real install must survive")
+	}
+	var skipped map[string]any
+	for _, r := range summary.Results {
+		if r["installId"] == "winget:current-pkg" {
+			skipped = r
+		}
+	}
+	if skipped == nil {
+		t.Fatalf("skipped item missing from results: %+v", summary.Results)
+	}
+	if skipped["status"] != "skipped" || skipped["skipReason"] != patching.SkipReasonAlreadyCurrent ||
+		skipped["message"] != "No available upgrade found." || skipped["rebootRequired"] != false {
+		t.Fatalf("unexpected skipped entry: %+v", skipped)
 	}
 }

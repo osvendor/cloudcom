@@ -1,4 +1,4 @@
-import { render } from '@testing-library/react';
+import { fireEvent, render } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 
 import AiToolCallCard from './AiToolCallCard';
@@ -258,6 +258,66 @@ describe('AiToolCallCard', () => {
       );
       expect(queryByTestId('ai-tool-failed-reason')).toBeNull();
       expect(queryByTestId('ai-tool-failed')).toBeNull();
+    });
+  });
+
+  // #9855: the model called a tool name that does not exist (the live repro
+  // was `list_processes_placeholder`). The CLI rejected it and the model
+  // retried with a real tool; the card must not read as a red failure, nor
+  // humanize the invented name into "Listed processes placeholder".
+  describe('call to a nonexistent tool (#9855)', () => {
+    const unknown = {
+      error: '<tool_use_error>Error: No such tool available: mcp__breeze__list_processes_placeholder</tool_use_error>',
+      droppedBeforeExecution: true,
+      unknownTool: true,
+    };
+
+    it('renders a neutral note with the raw name, never a red Failed card', () => {
+      const { container, getByTestId, queryByTestId } = render(
+        <AiToolCallCard toolName="list_processes_placeholder" input={{}} output={unknown} isError />,
+      );
+      expect(getByTestId('ai-tool-unknown').textContent).toBe('aiToolCallCard.unknownTool');
+      expect(container.textContent).toContain('list_processes_placeholder');
+      expect(container.textContent).not.toContain('Listed processes');
+      expect(queryByTestId('ai-tool-failed')).toBeNull();
+      expect(queryByTestId('ai-tool-failed-reason')).toBeNull();
+      expect(container.querySelector('.text-red-400, .text-red-500')).toBeNull();
+    });
+
+    it('keeps the CLI error reachable on expand', () => {
+      const { container, getByRole } = render(
+        <AiToolCallCard toolName="list_processes_placeholder" output={unknown} isError />,
+      );
+      fireEvent.click(getByRole('button'));
+      expect(container.textContent).toContain('No such tool available');
+    });
+
+    it('a tool payload without the dropped-call marker still renders as failed', () => {
+      const { getByTestId, queryByTestId } = render(
+        <AiToolCallCard toolName="system_cleanup" output={{ error: 'boom', unknownTool: true }} isError />,
+      );
+      expect(getByTestId('ai-tool-failed')).toBeTruthy();
+      expect(queryByTestId('ai-tool-unknown')).toBeNull();
+    });
+  });
+
+  describe('retention tombstone (#8855)', () => {
+    it('renders a scrubbed output as an expired notice, never the marker JSON', () => {
+      const { container, getByRole, getByTestId } = render(
+        <AiToolCallCard toolName="file_operations" input={{ action: 'read' }} output={{ _retention: 'scrubbed', at: '2026-10-01T00:00:00Z' }} />,
+      );
+      fireEvent.click(getByRole('button'));
+      expect(getByTestId('ai-tool-output-expired').textContent).toBe('aiToolCallCard.outputExpired');
+      expect(container.textContent).not.toContain('_retention');
+    });
+
+    it('still renders a normal output as JSON', () => {
+      const { container, getByRole, queryByTestId } = render(
+        <AiToolCallCard toolName="file_operations" output={{ content: 'hello' }} />,
+      );
+      fireEvent.click(getByRole('button'));
+      expect(queryByTestId('ai-tool-output-expired')).toBeNull();
+      expect(container.textContent).toContain('hello');
     });
   });
 });

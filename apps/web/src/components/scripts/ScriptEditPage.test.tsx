@@ -5,6 +5,7 @@ import '@/lib/i18n';
 import ScriptEditPage from './ScriptEditPage';
 import { fetchWithAuth } from '../../stores/auth';
 import { navigateTo } from '@/lib/navigation';
+import { useScriptAiStore } from '@/stores/scriptAiStore';
 
 vi.mock('../../stores/auth', () => ({
   fetchWithAuth: vi.fn()
@@ -160,5 +161,78 @@ describe('ScriptEditPage form seeding', () => {
         ([p]) => p.defaultValues?.category === null
       )
     ).toBe(false);
+  });
+});
+
+describe('ScriptEditPage header (#7151)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('stacks the title/back-link and action buttons below md, and keeps the back link from squashing', async () => {
+    fetchWithAuthMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === '/scripts/script-1') return makeJsonResponse(baseScript);
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<ScriptEditPage scriptId="script-1" />);
+
+    const duplicateButton = await screen.findByRole('button', { name: /duplicate/i });
+    const headerRow = duplicateButton.closest('[class*="flex-col"]');
+    expect(headerRow).not.toBeNull();
+    expect(headerRow?.className).toMatch(/md:flex-row/);
+
+    const actionsContainer = duplicateButton.closest('[class*="flex-wrap"]');
+    expect(actionsContainer).not.toBeNull();
+
+    // The h-10 w-10 back-link pill must not squash when the row wraps.
+    const backLink = screen
+      .getAllByRole('link')
+      .find((el) => el.getAttribute('href') === '/scripts' && el.className.includes('h-10'));
+    expect(backLink?.className).toContain('shrink-0');
+  });
+});
+
+describe('ScriptEditPage back link (#7158 a11y)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('gives the icon-only back-to-scripts link an accessible name', () => {
+    render(<ScriptEditPage />);
+
+    expect(screen.getByRole('link', { name: 'Back to Scripts' })).toHaveAttribute('href', '/scripts');
+  });
+});
+
+describe('ScriptEditPage draft hand-off (AI Suggested Fixes W2)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    sessionStorage.clear();
+    useScriptAiStore.setState({ panelOpen: false, draftInput: null });
+  });
+
+  it('a new script opened from a draft hand-off defaults name/language, opens the AI panel and pre-fills (not sends) the brief', async () => {
+    const sendMessageSpy = vi.fn();
+    useScriptAiStore.setState({ sendMessage: sendMessageSpy });
+    sessionStorage.setItem('breeze.scriptDraftHandoff', JSON.stringify({ brief: 'Clear queue', language: 'powershell', title: 'Clear print queue', suggestionId: 's-1' }));
+    render(<ScriptEditPage />);
+    await waitFor(() => expect(useScriptAiStore.getState().panelOpen).toBe(true));
+    expect(useScriptAiStore.getState().draftInput).toBe('Write a PowerShell script for this fix: Clear queue');
+    expect(scriptFormPropsSpy).toHaveBeenCalledWith(expect.objectContaining({
+      defaultValues: expect.objectContaining({ name: 'Clear print queue', language: 'powershell', osTypes: ['windows'] }),
+    }));
+    expect(sendMessageSpy).not.toHaveBeenCalled();
+    expect(sessionStorage.getItem('breeze.scriptDraftHandoff')).toBeNull();
+  });
+
+  it('an existing script never consumes a hand-off', async () => {
+    sessionStorage.setItem('breeze.scriptDraftHandoff', JSON.stringify({ brief: 'x', language: 'bash', title: 't', suggestionId: 's' }));
+    fetchWithAuthMock.mockResolvedValue(makeJsonResponse(baseScript));
+    render(<ScriptEditPage scriptId="script-1" />);
+    await screen.findByText('script form');
+    expect(useScriptAiStore.getState().panelOpen).toBe(false);
+    expect(sessionStorage.getItem('breeze.scriptDraftHandoff')).not.toBeNull();
   });
 });

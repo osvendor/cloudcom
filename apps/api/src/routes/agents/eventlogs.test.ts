@@ -9,6 +9,7 @@ const mocks = vi.hoisted(() => ({
   select: vi.fn(),
   insert: vi.fn(),
   rateLimiter: vi.fn(),
+  checkAndConsumeIngestQuota: vi.fn(),
   getDeviceEventLogSettings: vi.fn(),
   enqueueLogForwarding: vi.fn(),
   getOrgForwardingConfig: vi.fn(),
@@ -30,6 +31,7 @@ vi.mock('../../db', () => ({
     select: mocks.select,
     insert: mocks.insert,
   },
+  withDbTransaction: vi.fn(async (fn: () => Promise<unknown>) => fn()),
   withDbAccessContext: vi.fn(async (ctx: Record<string, unknown>, fn: () => Promise<unknown>) => {
     dbContextCalls.push(ctx);
     contextDepth += 1;
@@ -58,6 +60,10 @@ vi.mock('../../services/rate-limit', () => ({
   rateLimiter: mocks.rateLimiter,
 }));
 
+vi.mock('../../services/ingestQuota', () => ({
+  checkAndConsumeIngestQuota: mocks.checkAndConsumeIngestQuota,
+}));
+
 vi.mock('../../services/auditEvents', () => ({
   writeAuditEvent: mocks.writeAuditEvent,
 }));
@@ -73,6 +79,9 @@ vi.mock('../../services/logForwarding', () => ({
 vi.mock('../../services/sentry', () => ({
   captureException: vi.fn(),
 }));
+
+const recordAgentIngestSubmission = vi.hoisted(() => vi.fn());
+vi.mock('../metrics', () => ({ recordAgentIngestSubmission }));
 
 vi.mock('./helpers', () => {
   const sanitizeTimestamp = (value: unknown): Date | null => {
@@ -95,6 +104,7 @@ vi.mock('./helpers', () => {
 });
 
 import { eventLogsRoutes } from './eventlogs';
+import { EVENT_LOG_EMPTY_MESSAGE_PLACEHOLDER } from './schemas';
 
 function mockDeviceLookup(overrides: Record<string, unknown> = {}) {
   mocks.select.mockReturnValueOnce({
@@ -175,10 +185,289 @@ describe('agent event log routes', () => {
       resetAt: new Date('2026-05-02T13:00:00.000Z'),
     });
     mocks.getOrgForwardingConfig.mockResolvedValue({ endpoint: 'https://logs.example.com' });
+    mocks.checkAndConsumeIngestQuota.mockResolvedValue({ allowed: true, rowsUsed: 1, bytesUsed: 100 });
   });
 
   afterEach(() => {
     vi.useRealTimers();
+  });
+
+  describe('per-row validation (#10494)', () => {
+    const submit = (events: unknown) => app.request(`/agents/${AGENT_ID}/eventlogs`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ events }),
+    });
+
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    it.each(['', '   '])('coerces a blank message %j while preserving every row', async (message) => {
+      mockDeviceLookup();
+      const values = mockInsertSuccess();
+      const events = [
+        makeEvent({ eventId: '1', message: 'first' }),
+        makeEvent({ eventId: '2', message }),
+        makeEvent({ eventId: '3', message: 'last' }),
+      ];
+      const res = await submit(events);
+      expect(res.status).toBe(200);
+      expect(EVENT_LOG_EMPTY_MESSAGE_PLACEHOLDER).toBe('(no message text)');
+      expect(values).toHaveBeenCalledExactlyOnceWith([
+        expect.objectContaining({ eventId: '1', message: 'first' }),
+        expect.objectContaining({ eventId: '2', message: EVENT_LOG_EMPTY_MESSAGE_PLACEHOLDER }),
+        expect.objectContaining({ eventId: '3', message: 'last' }),
+      ]);
+      expect(await res.json()).toMatchObject({
+        success: true, count: 3, invalidDropped: 0, emptyMessageCoerced: 1,
+      });
+      // The SIEM must get the same coerced text the DB stored, not the raw ''.
+      expect(mocks.enqueueLogForwarding).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+        events: [
+          expect.objectContaining({ message: 'first' }),
+          expect.objectContaining({ message: EVENT_LOG_EMPTY_MESSAGE_PLACEHOLDER }),
+          expect.objectContaining({ message: 'last' }),
+        ],
+      }));
+    });
+
+    it.each([
+      ['oversized message', { message: 'a'.repeat(2001) }],
+      ['oversized details', { details: { text: 'a'.repeat(65536) } }],
+      ['missing message', { message: undefined }],
+      ['null message', { message: null }],
+      ['non-string message', { message: 42 }],
+      // device_event_logs.event_id is varchar(100): an over-long id used to
+      // pass validation and fail the whole insert batch (#10731).
+      ['event id longer than the varchar(100) column', { eventId: 'x'.repeat(101) }],
+      ['non-string event id', { eventId: 42 }],
+    ])('drops a row with %s and preserves valid row identities', async (_label, invalid) => {
+      mockDeviceLookup();
+      const values = mockInsertSuccess();
+      const res = await submit([
+        makeEvent({ eventId: '1', message: 'first' }),
+        makeEvent({ eventId: '2', ...invalid }),
+        makeEvent({ eventId: '3', message: 'last' }),
+      ]);
+      expect(res.status).toBe(200);
+      expect(values).toHaveBeenCalledExactlyOnceWith([
+        expect.objectContaining({ eventId: '1', message: 'first' }),
+        expect.objectContaining({ eventId: '3', message: 'last' }),
+      ]);
+      expect(await res.json()).toMatchObject({
+        success: true, count: 2, invalidDropped: 1, emptyMessageCoerced: 0,
+      });
+      // Forwarding pairs parsed events with inserted rows by index; a dropped
+      // row must not shift one row's message onto another row's key.
+      expect(mocks.enqueueLogForwarding).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+        events: [
+          expect.objectContaining({ message: 'first' }),
+          expect.objectContaining({ message: 'last' }),
+        ],
+      }));
+    });
+
+    it('accepts an event id of exactly 100 characters, counted as characters not bytes (#10731)', async () => {
+      mockDeviceLookup();
+      const values = mockInsertSuccess();
+      // 100 two-byte characters: 200 UTF-8 bytes, still fits varchar(100).
+      const id = 'ä'.repeat(100);
+      const res = await submit([makeEvent({ eventId: id })]);
+      expect(res.status).toBe(200);
+      expect(values).toHaveBeenCalledExactlyOnceWith([expect.objectContaining({ eventId: id })]);
+      expect(await res.json()).toMatchObject({ success: true, count: 1, invalidDropped: 0 });
+    });
+
+    it('counts astral characters once, like Postgres varchar(100) (#10731)', async () => {
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      mockDeviceLookup();
+      const values = mockInsertSuccess();
+      // 100 code points = 200 UTF-16 units: fits; 101 code points does not.
+      const fits = '😀'.repeat(100);
+      const over = '😀'.repeat(101);
+      const res = await submit([makeEvent({ eventId: fits }), makeEvent({ eventId: over })]);
+      expect(res.status).toBe(200);
+      expect(values).toHaveBeenCalledExactlyOnceWith([expect.objectContaining({ eventId: fits })]);
+      expect(await res.json()).toMatchObject({ success: true, count: 1, invalidDropped: 1 });
+    });
+
+    it('truncates an over-long source to the varchar(255) column width instead of losing the batch (#11279)', async () => {
+      mockDeviceLookup();
+      const values = mockInsertSuccess();
+      const events = Array.from({ length: 150 }, (_, i) =>
+        makeEvent({ eventId: String(i), source: i === 119 ? 'S'.repeat(300) : 'Security' }));
+      const res = await submit(events);
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({ success: true, count: 150, invalidDropped: 0 });
+      const stored = values.mock.calls.flatMap(([batch]) => batch as Array<{ source: string }>);
+      expect(stored).toHaveLength(150);
+      expect(stored[119]!.source).toBe('S'.repeat(255));
+      expect(Math.max(...stored.map((r) => Array.from(r.source).length))).toBeLessThanOrEqual(255);
+    });
+
+    it('drops non-object rows inside a valid envelope without failing the batch', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      mockDeviceLookup();
+      const values = mockInsertSuccess();
+      const res = await submit([null, 42, 'x', [], makeEvent({ eventId: 'ok' })]);
+      expect(res.status).toBe(200);
+      expect(values).toHaveBeenCalledExactlyOnceWith([expect.objectContaining({ eventId: 'ok' })]);
+      expect(await res.json()).toMatchObject({
+        success: true, count: 1, invalidDropped: 4, emptyMessageCoerced: 0,
+      });
+      expect(warn.mock.calls[0]!.join(' ')).toContain('events[0]:invalid_type');
+    });
+
+    it('does not count a blank message as coerced when its row is dropped for another field', async () => {
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      mockDeviceLookup();
+      mockInsertSuccess();
+      const res = await submit([makeEvent({ message: '', level: 'bogus' }), makeEvent()]);
+      expect(await res.json()).toMatchObject({
+        success: true, count: 1, invalidDropped: 1, emptyMessageCoerced: 0,
+      });
+    });
+
+    it('does not warn for a clean batch', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      mockDeviceLookup();
+      mockInsertSuccess();
+      const res = await submit([makeEvent({ eventId: '1' }), makeEvent({ eventId: '2' })]);
+      expect(res.status).toBe(200);
+      expect(warn).not.toHaveBeenCalled();
+    });
+
+    it('names the rejected level/category value (bounded) so enum drift is diagnosable', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      mockDeviceLookup();
+      mockInsertSuccess();
+      await submit([
+        makeEvent({ level: 'verbose' }),
+        makeEvent({ category: `x${'y'.repeat(100)}` }),
+        makeEvent(),
+      ]);
+      const line = warn.mock.calls[0]!.join(' ');
+      expect(line).toContain('events[0].level:invalid_value="verbose"');
+      expect(line).toContain(`events[1].category:invalid_value="x${'y'.repeat(31)}"`);
+      expect(line).not.toContain('y'.repeat(32));
+    });
+
+    it('acknowledges an all-invalid batch without inserting', async () => {
+      mockDeviceLookup();
+      const res = await submit([
+        makeEvent({ level: 'bogus' }), makeEvent({ message: 'a'.repeat(2001) }),
+      ]);
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({
+        success: true, count: 0, filtered: 0, invalidDropped: 2, emptyMessageCoerced: 0,
+      });
+      expect(mocks.insert).not.toHaveBeenCalled();
+    });
+
+    it('includes zero validation counts for an empty batch', async () => {
+      const res = await submit([]);
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({
+        success: true, count: 0, filtered: 0, invalidDropped: 0, emptyMessageCoerced: 0,
+      });
+      expect(mocks.insert).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['non-array events', 'invalid'],
+      ['missing events', undefined],
+      ['5001 events', Array.from({ length: 5001 }, () => makeEvent())],
+    ])('keeps the envelope strict for %s', async (_label, events) => {
+      const res = await submit(events);
+      expect(res.status).toBe(400);
+      expect(mocks.insert).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['level filter', 200], ['rate limit', 429], ['quota', 429], ['insert failure', 500],
+    ])('includes validation counts after %s', async (outcome, status) => {
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      mockDeviceLookup();
+      mockInsertSuccess();
+      if (outcome === 'level filter') {
+        mocks.getDeviceEventLogSettings.mockResolvedValue({ minimumLevel: 'critical', rateLimitPerHour: 1000 });
+      } else if (outcome === 'rate limit') {
+        mocks.rateLimiter.mockResolvedValue({ allowed: false, remaining: 0, resetAt: new Date() });
+      } else if (outcome === 'quota') {
+        mocks.checkAndConsumeIngestQuota.mockResolvedValue({ allowed: false, rowsUsed: 100, bytesUsed: 100 });
+      } else {
+        mocks.insert.mockReturnValue({ values: vi.fn(() => ({
+          onConflictDoNothing: vi.fn(() => ({ returning: vi.fn().mockRejectedValue(new Error('insert failed')) })),
+        })) });
+      }
+      const res = await submit([
+        makeEvent({ level: 'info', message: '' }), makeEvent({ message: null }),
+      ]);
+      expect(res.status).toBe(status);
+      expect(await res.json()).toMatchObject({
+        invalidDropped: 1, emptyMessageCoerced: 1,
+        ...(outcome === 'level filter' ? { success: true, count: 0, filtered: 1 } : {}),
+        ...(outcome === 'quota' ? { count: 0, filtered: 0, dropped: 1 } : {}),
+        ...(outcome === 'insert failure' ? { success: false, count: 0, filtered: 0, expectedCount: 1 } : {}),
+      });
+      if (outcome === 'insert failure') {
+        expect(mocks.writeAuditEvent).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+          details: expect.objectContaining({ invalidDroppedCount: 1, emptyMessageCoercedCount: 1 }),
+        }));
+      } else {
+        expect(mocks.writeAuditEvent).not.toHaveBeenCalled();
+        expect(mocks.insert).not.toHaveBeenCalled();
+      }
+    });
+
+    it.each([false, true])('adds counts only to existing audit triggers (clamped=%s)', async (clamped) => {
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      mockDeviceLookup();
+      mockInsertSuccess();
+      const res = await submit([
+        makeEvent({ message: '', ...(clamped ? { timestamp: '2026-05-02T13:00:00.000Z' } : {}) }),
+        makeEvent({ message: null }),
+      ]);
+      expect(res.status).toBe(200);
+      if (clamped) {
+        expect(mocks.writeAuditEvent).toHaveBeenCalledExactlyOnceWith(expect.anything(), expect.objectContaining({
+          details: expect.objectContaining({
+            submittedCount: 2, insertedCount: 1, filteredCount: 0, timestampClampedCount: 1,
+            invalidDroppedCount: 1, emptyMessageCoercedCount: 1,
+          }),
+        }));
+      } else {
+        expect(mocks.writeAuditEvent).not.toHaveBeenCalled();
+      }
+    });
+
+    it('warns once with counts and bounded issue paths, without logging contents', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      mockDeviceLookup();
+      mockInsertSuccess();
+      const secretMessage = 'private-message-'.repeat(150);
+      const secretDetails = 'private-details-'.repeat(5000);
+      const res = await submit([
+        makeEvent({ message: '' }),
+        ...Array.from({ length: 6 }, () => makeEvent({ message: secretMessage })),
+        makeEvent({ details: { text: secretDetails } }),
+      ]);
+      expect(res.status).toBe(200);
+      expect(warn).toHaveBeenCalledTimes(1);
+      const line = warn.mock.calls[0]!.join(' ');
+      expect(line).toMatch(/^\[EventLogs\]/);
+      expect(line).toContain(`=${AGENT_ID}`);
+      expect(line).toContain(`=${DEVICE_ID}`);
+      expect(line).toContain('submitted=8');
+      expect(line).toContain('invalidDropped=7');
+      expect(line).toContain('emptyMessageCoerced=1');
+      expect(line).toContain('events[1].message:too_big');
+      expect((line.match(/events\[\d+\]/g) ?? []).length).toBeLessThanOrEqual(5);
+      expect(line).not.toContain('private-message');
+      expect(line).not.toContain('private-details');
+    });
   });
 
   it('clamps excessive future event timestamps before storing and forwarding', async () => {
@@ -229,6 +518,42 @@ describe('agent event log routes', () => {
     // The removed `rawData` field must not resurface in the forward payload.
     const forwarded = mocks.enqueueLogForwarding.mock.calls[0]?.[0];
     expect(forwarded.events[0]).not.toHaveProperty('rawData');
+  });
+
+  it('drops the batch with 429 once the per-device daily byte budget is exceeded', async () => {
+    mockDeviceLookup();
+    const values = mockInsertSuccess();
+    mocks.checkAndConsumeIngestQuota.mockResolvedValueOnce({
+      allowed: false,
+      rowsUsed: 1,
+      bytesUsed: 3 * 1024 * 1024 * 1024,
+    });
+
+    const res = await app.request(`/agents/${AGENT_ID}/eventlogs`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ events: [makeEvent()] }),
+    });
+
+    expect(res.status).toBe(429);
+    expect(values).not.toHaveBeenCalled();
+  });
+
+  it('drops the batch with 429 once the per-org daily row/byte budget is exceeded', async () => {
+    mockDeviceLookup();
+    const values = mockInsertSuccess();
+    mocks.checkAndConsumeIngestQuota
+      .mockResolvedValueOnce({ allowed: true, rowsUsed: 1, bytesUsed: 100 }) // device check
+      .mockResolvedValueOnce({ allowed: false, rowsUsed: 2_000_100, bytesUsed: 100 }); // org check
+
+    const res = await app.request(`/agents/${AGENT_ID}/eventlogs`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ events: [makeEvent()] }),
+    });
+
+    expect(res.status).toBe(429);
+    expect(values).not.toHaveBeenCalled();
   });
 
   it('runs the rate limiter and the forwarding enqueue with NO DB context open (#6097 / #1105)', async () => {
@@ -316,6 +641,101 @@ describe('agent event log routes', () => {
     const body = await res.json();
     expect(body.count).toBe(0); // nothing actually inserted
     expect(mocks.enqueueLogForwarding).not.toHaveBeenCalled();
+  });
+});
+
+// #4340 — routine event-log submits are counted, not audited. Only an insert
+// failure or a clamped timestamp (an anomaly worth a chained record) is audited.
+describe('eventlogs ingest audit (#4340)', () => {
+  let app: Hono;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-05-02T12:00:00.000Z'));
+    contextDepth = 0;
+    dbContextCalls.length = 0;
+    app = new Hono();
+    app.use('*', async (c, next) => {
+      c.set('agent', { deviceId: 'dev-1', agentId: 'agent-1', orgId: ORG_ID, partnerId: 'partner-1', siteId: 'site-1', role: 'agent' } as never);
+      return next();
+    });
+    app.route('/agents', eventLogsRoutes);
+    mocks.getDeviceEventLogSettings.mockResolvedValue({ minimumLevel: 'info', rateLimitPerHour: 1000 });
+    mocks.rateLimiter.mockResolvedValue({ allowed: true, remaining: 999, resetAt: new Date('2026-05-02T13:00:00.000Z') });
+    mocks.getOrgForwardingConfig.mockResolvedValue(null);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const submit = (events: unknown[]) => app.request(`/agents/${AGENT_ID}/eventlogs`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ events }),
+  });
+
+  it('does NOT audit a clean submit — counts it in the ingest metric', async () => {
+    mockDeviceLookup();
+    mockInsertSuccess();
+
+    const res = await submit([makeEvent(), makeEvent({ eventId: '4624' })]);
+
+    expect(res.status).toBe(200);
+    expect(mocks.writeAuditEvent).not.toHaveBeenCalled();
+    expect(recordAgentIngestSubmission).toHaveBeenCalledTimes(1);
+    expect(recordAgentIngestSubmission).toHaveBeenCalledWith('eventlogs', 'success');
+  });
+
+  it('does NOT audit a submit whose rows were all absorbed as duplicates', async () => {
+    mockDeviceLookup();
+    mockInsertAllConflicts();
+
+    const res = await submit([makeEvent()]);
+
+    expect(res.status).toBe(200);
+    expect(mocks.writeAuditEvent).not.toHaveBeenCalled();
+    expect(recordAgentIngestSubmission).toHaveBeenCalledWith('eventlogs', 'success');
+  });
+
+  it('audits a submit with a clamped future timestamp', async () => {
+    mockDeviceLookup();
+    mockInsertSuccess();
+
+    const res = await submit([makeEvent({ timestamp: '2026-05-02T13:00:00.000Z' }), makeEvent({ eventId: '4624' })]);
+
+    expect(res.status).toBe(200);
+    expect(mocks.writeAuditEvent).toHaveBeenCalledTimes(1);
+    expect(mocks.writeAuditEvent.mock.calls[0]![1]).toMatchObject({
+      orgId: ORG_ID,
+      actorType: 'agent',
+      action: 'agent.eventlogs.submit',
+      resourceType: 'device',
+      resourceId: DEVICE_ID,
+      result: 'success',
+      details: { submittedCount: 2, insertedCount: 2, filteredCount: 0, timestampClampedCount: 1 },
+    });
+    expect(recordAgentIngestSubmission).toHaveBeenCalledWith('eventlogs', 'success');
+  });
+
+  it('audits an insert failure as a failure result', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    mockDeviceLookup();
+    const returning = vi.fn().mockRejectedValue(new Error('insert failed'));
+    mocks.insert.mockReturnValue({ values: vi.fn().mockReturnValue({ onConflictDoNothing: vi.fn().mockReturnValue({ returning }) }) });
+
+    const res = await submit([makeEvent()]);
+
+    expect(res.status).toBe(500);
+    expect(mocks.writeAuditEvent).toHaveBeenCalledTimes(1);
+    expect(mocks.writeAuditEvent.mock.calls[0]![1]).toMatchObject({
+      action: 'agent.eventlogs.submit',
+      result: 'failure',
+      details: { submittedCount: 1, insertedCount: 0, filteredCount: 0 },
+    });
+    expect(recordAgentIngestSubmission).toHaveBeenCalledWith('eventlogs', 'failed');
+    consoleError.mockRestore();
   });
 });
 

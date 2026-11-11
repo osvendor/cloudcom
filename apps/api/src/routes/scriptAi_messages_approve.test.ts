@@ -1,6 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
 
+// #3127: depth of the (mocked) short per-phase DB contexts the message-send
+// handler opens now that it no longer runs inside a request transaction.
+const dbCtx = vi.hoisted(() => ({ depth: 0 }));
+
 // ── Mocks ──────────────────────────────────────────────────────────
 
 vi.mock('../db', () => ({
@@ -12,6 +16,7 @@ vi.mock('../db', () => ({
   runOutsideDbContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
   withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn()),
   withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+  withDbTransaction: vi.fn(async (fn: () => Promise<unknown>) => fn()),
 }));
 
 vi.mock('../db/schema', () => ({
@@ -24,6 +29,14 @@ vi.mock('../middleware/auth', () => ({
   requireScope: vi.fn(() => async (_c: any, next: any) => next()),
   requirePermission: vi.fn(() => async (_c: any, next: any) => next()),
   requireMfa: vi.fn(() => async (_c: any, next: any) => next()),
+  withAuthDbAccessContext: vi.fn(async (_auth: unknown, fn: () => Promise<unknown>) => {
+    dbCtx.depth += 1;
+    try {
+      return await fn();
+    } finally {
+      dbCtx.depth -= 1;
+    }
+  }),
 }));
 
 // Mock zValidator to parse body/query and pass through (avoids needing real Zod schemas)
@@ -98,6 +111,10 @@ vi.mock('../services/scriptBuilderTools', () => ({
   SCRIPT_BUILDER_MCP_TOOL_NAMES: [],
 }));
 
+// W03 Task 9: session create resolves through the registry (not exercised here).
+vi.mock('../services/aiModels/sessionModel', () => ({ chooseSessionModel: vi.fn() }));
+vi.mock('../services/aiModels/candidateLoader', () => ({ readOrgPartnerId: vi.fn() }));
+
 vi.mock('../services/sentry', () => ({
   captureException: vi.fn(),
 }));
@@ -107,10 +124,14 @@ import { scriptAiRoutes } from './scriptAi';
 import {
   getScriptBuilderSession,
 } from '../services/scriptBuilderService';
-import { runPreFlightChecks } from '../services/aiAgentSdk';
+import { runPreFlightChecks, settleBlockedTurnForNewMessage } from '../services/aiAgentSdk';
+import { reserveAiBudget } from '../services/aiBudgetReservations';
+import { db } from '../db';
 import { streamingSessionManager } from '../services/streamingSessionManager';
 import { LlmUnavailableError } from '../services/llm/llmConfigResolver';
 import { handleApproval } from '../services/aiAgent';
+import { makeResolvedModel } from '../services/aiModels/__fixtures__/resolvedModel';
+import { turnBindingFrom } from '../services/aiModels/turnBinding';
 
 // ── Constants ──────────────────────────────────────────────────────
 
@@ -171,6 +192,43 @@ describe('scriptAi routes — messages, interrupt, approve', () => {
       expect(streamingSessionManager.getOrCreate).not.toHaveBeenCalled();
     });
 
+    it.each([
+      ['credits_exhausted', { error: 'out of credits', code: 'credits_exhausted' }],
+      ['plan_not_eligible', { error: 'out of credits', code: 'plan_not_eligible' }],
+      [undefined, { error: 'out of credits' }],
+    ] as const)('returns a gate denial (%s) as 402 with its code (#9450)', async (billingCode, expected) => {
+      vi.mocked(runPreFlightChecks).mockResolvedValue({
+        ok: false,
+        error: 'out of credits',
+        status: 402,
+        ...(billingCode ? { billingCode } : {}),
+      });
+
+      const res = await app.request(`/ai/script-builder/sessions/${SESSION_ID}/messages`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: 'Hello' }),
+      });
+
+      expect(res.status).toBe(402);
+      expect(await res.json()).toEqual(expected);
+      expect(streamingSessionManager.getOrCreate).not.toHaveBeenCalled();
+    });
+
+    it('returns ai_not_configured as 503 before touching the SDK manager', async () => {
+      vi.mocked(runPreFlightChecks).mockResolvedValue({ ok: false, error: 'ai_not_configured', status: 503 });
+
+      const res = await app.request(`/ai/script-builder/sessions/${SESSION_ID}/messages`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: 'Hello' }),
+      });
+
+      expect(res.status).toBe(503);
+      expect(await res.json()).toEqual({ error: expect.stringMatching(/not configured/i), code: 'ai_not_configured' });
+      expect(streamingSessionManager.getOrCreate).not.toHaveBeenCalled();
+    });
+
     it('preserves the structured retryable 503 from resolver preflight failures', async () => {
       vi.mocked(runPreFlightChecks).mockResolvedValue({
         ok: false,
@@ -189,15 +247,177 @@ describe('scriptAi routes — messages, interrupt, approve', () => {
       expect(streamingSessionManager.getOrCreate).not.toHaveBeenCalled();
     });
 
-    it('threads the resolved config into SDK session creation', async () => {
-      const resolved = {
-        source: 'partner' as const,
-        partnerId: 'partner-1',
-        apiKey: 'partner-key',
-        model: 'claude-sonnet-4-6',
-        configId: 'config-1',
-        configVersion: 4,
+    it('#3127: waits and reserves with no DB context held; reads and writes each run in a short one', async () => {
+      const depths: Record<string, number> = {};
+      vi.mocked(runPreFlightChecks).mockImplementation(async (...args) => {
+        // #10415: called with no context held, handed a runner that opens one
+        // per DB phase (the Redis rate limit runs between phases).
+        depths.preflight = dbCtx.depth;
+        await args[6]!(async () => { depths.preflightPhase = dbCtx.depth; });
+        return {
+          ok: true,
+          session: {
+            id: SESSION_ID,
+            type: 'script_builder',
+            orgId: ORG_ID,
+            sdkSessionId: null,
+            model: 'claude-sonnet-4-6',
+            maxTurns: 50,
+            turnCount: 0,
+            systemPrompt: 'System prompt',
+            title: 'existing',
+          },
+          sanitizedContent: 'Hello',
+          systemPrompt: 'System prompt',
+          maxBudgetUsd: 1,
+          model: makeResolvedModel('platform', { surface: 'script_builder' }),
+        } as any;
+      });
+      const activeSession = {
+        state: 'processing',
+        inputController: { pushMessage: vi.fn() },
+        eventBus: {
+          subscribe: vi.fn(() => (async function* () { yield { type: 'done' }; })()),
+          unsubscribe: vi.fn(),
+          publish: vi.fn(),
+        },
+      } as any;
+      vi.mocked(streamingSessionManager.get)
+        .mockReturnValueOnce(activeSession)
+        .mockReturnValueOnce(undefined);
+      vi.mocked(settleBlockedTurnForNewMessage).mockImplementationOnce(async () => {
+        depths.settle = dbCtx.depth;
+        return 'concluded';
+      });
+      const reserveImpl = vi.mocked(reserveAiBudget).getMockImplementation()!;
+      vi.mocked(reserveAiBudget).mockImplementationOnce(async (...args) => {
+        depths.reserve = dbCtx.depth;
+        return reserveImpl(...args);
+      });
+      vi.mocked(streamingSessionManager.getOrCreate).mockImplementation(async () => {
+        depths.getOrCreate = dbCtx.depth;
+        return activeSession;
+      });
+      vi.mocked(streamingSessionManager.tryTransitionToProcessing).mockReturnValue(true);
+      vi.mocked(db.insert).mockImplementation(() => {
+        depths.insert = dbCtx.depth;
+        return { values: vi.fn().mockResolvedValue(undefined) } as any;
+      });
+
+      const res = await app.request(`/ai/script-builder/sessions/${SESSION_ID}/messages`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: 'Hello' }),
+      });
+
+      expect(res.status).toBe(200);
+      await res.text();
+      expect(depths).toEqual({ preflight: 0, preflightPhase: 1, settle: 0, reserve: 0, getOrCreate: 1, insert: 1 });
+      expect(activeSession.inputController.pushMessage).toHaveBeenCalledWith('Hello');
+      expect(dbCtx.depth).toBe(0);
+    });
+
+    it('#7783: subscribes to the session events BEFORE the turn is pushed: a transport that answers at once still reaches the client', async () => {
+      // The real SessionEventBus has no replay: an event published while nobody
+      // is subscribed is gone. Model a transport fast enough to publish the
+      // whole turn synchronously when the message is pushed.
+      const subscribers = new Map<string, Array<{ type: string; message?: string }>>();
+      const waiters = new Map<string, () => void>();
+      const bus = {
+        subscribe: vi.fn((id: string) => {
+          subscribers.set(id, []);
+          return (async function* () {
+            for (;;) {
+              const queue = subscribers.get(id)!;
+              while (queue.length) {
+                const event = queue.shift()!;
+                yield event;
+                if (event.type === 'done') return;
+              }
+              await new Promise<void>((resolve) => { waiters.set(id, resolve); });
+            }
+          })();
+        }),
+        unsubscribe: vi.fn((id: string) => { subscribers.delete(id); }),
+        publish: vi.fn((event: { type: string; message?: string }) => {
+          for (const [id, queue] of subscribers) { queue.push(event); waiters.get(id)?.(); }
+        }),
       };
+      vi.mocked(runPreFlightChecks).mockResolvedValue({
+        ok: true,
+        session: {
+          id: SESSION_ID, type: 'script_builder', orgId: ORG_ID, sdkSessionId: null,
+          model: 'claude-sonnet-4-6', maxTurns: 50, turnCount: 0, systemPrompt: 'System prompt', title: 'existing',
+        },
+        sanitizedContent: 'Hello',
+        systemPrompt: 'System prompt',
+        maxBudgetUsd: 1,
+        model: makeResolvedModel('platform', { surface: 'script_builder' }),
+      } as any);
+      const activeSession = {
+        state: 'processing',
+        inputController: {
+          pushMessage: vi.fn(() => {
+            bus.publish({ type: 'error', message: 'script builder turn failed fast' });
+            bus.publish({ type: 'done' });
+          }),
+        },
+        eventBus: bus,
+      } as any;
+      vi.mocked(streamingSessionManager.get).mockReturnValue(undefined);
+      vi.mocked(streamingSessionManager.getOrCreate).mockResolvedValue(activeSession);
+      vi.mocked(streamingSessionManager.tryTransitionToProcessing).mockReturnValue(true);
+      vi.mocked(db.insert).mockImplementation(() => ({ values: vi.fn().mockResolvedValue(undefined) }) as any);
+
+      const res = await app.request(`/ai/script-builder/sessions/${SESSION_ID}/messages`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: 'Hello' }),
+      });
+
+      expect(res.status).toBe(200);
+      const text = await res.text();
+      expect(text).toContain('script builder turn failed fast');
+      expect(bus.unsubscribe).toHaveBeenCalled();
+    });
+
+    it('#7783: drops the pre-push subscription when the dispatch context fails', async () => {
+      const bus = { subscribe: vi.fn((_id: string) => (async function* () { /* never read */ })()), unsubscribe: vi.fn(), publish: vi.fn() };
+      vi.mocked(runPreFlightChecks).mockResolvedValue({
+        ok: true,
+        session: {
+          id: SESSION_ID, type: 'script_builder', orgId: ORG_ID, sdkSessionId: null,
+          model: 'claude-sonnet-4-6', maxTurns: 50, turnCount: 0, systemPrompt: 'System prompt', title: 'existing',
+        },
+        sanitizedContent: 'Hello',
+        systemPrompt: 'System prompt',
+        maxBudgetUsd: 1,
+        model: makeResolvedModel('platform', { surface: 'script_builder' }),
+      } as any);
+      const activeSession = {
+        state: 'processing',
+        inputController: { pushMessage: vi.fn() },
+        eventBus: bus,
+      } as any;
+      vi.mocked(streamingSessionManager.get).mockReturnValue(undefined);
+      vi.mocked(streamingSessionManager.getOrCreate).mockResolvedValue(activeSession);
+      vi.mocked(streamingSessionManager.tryTransitionToProcessing).mockReturnValue(true);
+      vi.mocked(db.insert).mockImplementation(() => ({ values: vi.fn().mockResolvedValue(undefined) }) as any);
+      vi.mocked(streamingSessionManager.startTurnTimeout).mockImplementationOnce(() => { throw new Error('timeout boom'); });
+
+      const res = await app.request(`/ai/script-builder/sessions/${SESSION_ID}/messages`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: 'Hello' }),
+      });
+
+      expect(res.status).toBe(500);
+      expect(bus.subscribe).toHaveBeenCalledTimes(1);
+      expect(bus.unsubscribe).toHaveBeenCalledWith(bus.subscribe.mock.calls[0]![0]);
+    });
+
+    it('dispatches and reserves exactly the model preflight resolved (finding 13)', async () => {
+      const model = makeResolvedModel('anthropic_byok', { surface: 'script_builder' });
       vi.mocked(runPreFlightChecks).mockResolvedValue({
         ok: true,
         session: {
@@ -205,7 +425,7 @@ describe('scriptAi routes — messages, interrupt, approve', () => {
           type: 'script_builder',
           orgId: ORG_ID,
           sdkSessionId: null,
-          model: resolved.model,
+          model: 'claude-sonnet-5-5',
           maxTurns: 50,
           turnCount: 0,
           systemPrompt: 'System prompt',
@@ -213,7 +433,7 @@ describe('scriptAi routes — messages, interrupt, approve', () => {
         sanitizedContent: 'Hello',
         systemPrompt: 'System prompt',
         maxBudgetUsd: 1,
-        resolved,
+        model,
       } as any);
       vi.mocked(streamingSessionManager.getOrCreate).mockResolvedValue({ state: 'processing' } as any);
       vi.mocked(streamingSessionManager.tryTransitionToProcessing).mockReturnValue(false);
@@ -227,20 +447,45 @@ describe('scriptAi routes — messages, interrupt, approve', () => {
       expect(res.status).toBe(409);
       expect(streamingSessionManager.getOrCreate).toHaveBeenCalledWith(
         SESSION_ID,
-        expect.anything(),
+        expect.not.objectContaining({ model: expect.anything() }),
         expect.anything(),
         expect.anything(),
         'System prompt',
         undefined,
-        resolved,
+        model,
         expect.anything(),
         expect.anything(),
-        expect.objectContaining({ budgetReservationId: expect.any(String) }),
+        expect.objectContaining({ budgetReservationId: expect.any(String), ledgerUserId: expect.any(String) }),
+      );
+      expect(vi.mocked(streamingSessionManager.getOrCreate).mock.calls[0]![6]).toBe(model);
+      expect(reserveAiBudget).toHaveBeenCalledWith(expect.objectContaining({
+        billingSource: 'partner_key', binding: turnBindingFrom(model),
+      }));
+      expect(streamingSessionManager.tryTransitionToProcessing).toHaveBeenCalledWith(
+        expect.anything(), expect.any(String), expect.objectContaining({ turnBinding: turnBindingFrom(model) }),
       );
     });
 
+    it('an ineligible stored model is a recoverable 409 with its code and takes no reservation', async () => {
+      vi.mocked(runPreFlightChecks).mockResolvedValue({
+        ok: false, error: 'Model Opus 5.5 is no longer available — choose another.', status: 409, code: 'model_unavailable',
+      });
+
+      const res = await app.request(`/ai/script-builder/sessions/${SESSION_ID}/messages`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: 'Hello' }),
+      });
+
+      expect(res.status).toBe(409);
+      expect(await res.json()).toEqual({
+        error: 'Model Opus 5.5 is no longer available — choose another.', code: 'model_unavailable', recoverable: true,
+      });
+      expect(reserveAiBudget).not.toHaveBeenCalled();
+      expect(streamingSessionManager.getOrCreate).not.toHaveBeenCalled();
+    });
+
     it('maps a wire-model fail-close from the SDK manager to 503 ai_unavailable', async () => {
-      const resolved = { source: 'platform', apiKey: 'k', model: 'claude-sonnet-4-6' };
       vi.mocked(runPreFlightChecks).mockResolvedValue({
         ok: true,
         session: {
@@ -248,7 +493,7 @@ describe('scriptAi routes — messages, interrupt, approve', () => {
           orgId: ORG_ID,
           type: 'script_builder',
           sdkSessionId: null,
-          model: resolved.model,
+          model: 'claude-sonnet-4-6',
           maxTurns: 50,
           turnCount: 0,
           systemPrompt: 'System prompt',
@@ -256,12 +501,10 @@ describe('scriptAi routes — messages, interrupt, approve', () => {
         sanitizedContent: 'Hello',
         systemPrompt: 'System prompt',
         maxBudgetUsd: 1,
-        resolved,
+        model: makeResolvedModel('platform', { surface: 'script_builder' }),
       } as any);
-      // `getOrCreate` resolves the wire model INSIDE the manager, so a pinned
-      // revision with no verified mapping for this session's model throws from
-      // here — the resolver-level 503 the caller already handles elsewhere has
-      // no visibility into it (#3922 W3 review round 2).
+      // Last-resort guard: an LlmUnavailableError from the manager (e.g. a
+      // wire option the transport cannot carry) maps to 503, never a 500.
       vi.mocked(streamingSessionManager.getOrCreate).mockRejectedValue(new LlmUnavailableError());
 
       const res = await app.request(`/ai/script-builder/sessions/${SESSION_ID}/messages`, {

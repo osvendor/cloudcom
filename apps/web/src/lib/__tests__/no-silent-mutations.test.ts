@@ -32,7 +32,89 @@ const FIXTURE_ROOT = resolve(__dirname, 'fixtures/no-silent-mutations/src');
 
 // WS-A "targeted set": files that have ADOPTED runAction and must not regress
 // to silent mutations. Grows as more handlers migrate (see the backlog).
+// To guard a file, add its line here; there is no total to bump (#10030).
+// MIN_GUARDED_FILES below is a floor that additions never touch.
 const TARGET_GLOBS = [
+  // Partner-wide groups: policy assignment mutations surface outcomes.
+  'src/components/configurationPolicies/PartnerGroupAssignmentSection.tsx',
+  // Tool Catalog W4 (#5219): flow enable/disable/run/cancel mutations go through runAction.
+  'src/components/flows/api.ts',
+  // Trust Center W1 (#8768): publish/unpublish/preview/partner-home are the public-exposure
+  // mutations; the sections (Task 16) add their own entries.
+  'src/components/trustCenter/TrustCenterTab.tsx',
+  'src/components/trustCenter/TrustStatusCard.tsx',
+  'src/components/trustCenter/TrustPublishDialog.tsx',
+  'src/components/trustCenter/TrustControlsSection.tsx',
+  'src/components/trustCenter/TrustContentSection.tsx',
+  'src/components/trustCenter/TrustDocumentsSection.tsx',
+  // Trust Center W2 (#8770): W02a pre-lists every W2 section that will mutate (stubs until W02b/d/e/f/g fill
+  // them) and the W02i OrganizationForm slug-rename warning, so no sub-wave edits this shared list.
+  'src/components/trustCenter/TrustDeclarationsSection.tsx',
+  'src/components/trustCenter/TrustFrameworksSection.tsx',
+  'src/components/trustCenter/TrustSubprocessorsSection.tsx',
+  'src/components/trustCenter/TrustFaqSection.tsx',
+  'src/components/trustCenter/TrustHistorySection.tsx',
+  'src/components/trustCenter/TrustAccessSection.tsx',
+  'src/components/trustCenter/TrustTemplateSettings.tsx',
+  'src/components/trustCenter/TrustEmbedSection.tsx',
+  'src/components/settings/OrganizationForm.tsx',
+  // Caller verification W04 (#6354): technician client + the three components that mutate through it.
+  'src/lib/api/callerVerification.ts',
+  'src/components/callerVerification/VerifyCallerModal.tsx',
+  'src/components/callerVerification/ContactVerificationDrawer.tsx',
+  'src/components/callerVerification/CallerVerificationPolicyForm.tsx',
+  // #8385: vault sync/deactivate/save mutations must surface failures (they were silently swallowed)
+  'src/components/backup/VaultDashboard.tsx',
+  'src/components/backup/VaultConfigDialog.tsx',
+  'src/components/settings/TicketPushoverSettings.tsx',
+  // Business-hours calendars (#8973): every mutation through runAction.
+  'src/components/settings/BusinessHoursCard.tsx',
+  'src/components/settings/BusinessHoursForm.tsx',
+  'src/components/settings/BusinessHoursHolidays.tsx',
+  'src/components/settings/BusinessHoursApplyDialog.tsx',
+  // #8330: saved-filter create/edit/delete surface the API's error text.
+  'src/components/filters/SavedFilterList.tsx',
+  // Endpoint messaging W1 (#8741): the send POST goes through runAction from birth.
+  'src/lib/endpointMessages.ts',
+  'src/components/endpointMessages/SendMessageDialog.tsx',
+  'src/components/devices/DeviceSettingsModal.tsx', // device tags/name/site PATCH via runAction (success toast)
+  'src/components/billing/PaymentsSettingsTab.tsx',
+  'src/components/billing/autopayClient.ts',
+  'src/components/monitoring/conversion/ConversionLedger.tsx',
+  'src/components/monitoring/conversion/NeedsConversionPanel.tsx',
+  'src/components/monitoring/conversion/ConversionPendingBanner.tsx',
+  'src/components/admin/MonitorConversionAdmin.tsx',
+  'src/components/ai/AiContinuationPrompt.tsx', // W05 #7603: POST /ai/sessions/:id/continue via runAction
+  // Wisp W04b (#9916): grant create/refresh/revoke/settings and thread attachments go through runAction.
+  'src/components/ai/WispGrantStepUpModal.tsx',
+  'src/components/ai/WispThreadHeader.tsx',
+  'src/components/ai/WispThreadAttachments.tsx',
+  // Wisp W05a (#9911): concerns list snooze/dismiss/resolve go through runAction.
+  'src/components/ai/WispConcernsPanel.tsx',
+  'src/lib/wispConcernsApi.ts',
+  // Wisp W06b (#9918): grant pause/resume go through runAction; the thread page (reads only today) is
+  // listed per the W06 plan so a mutation added there later cannot go silent.
+  'src/components/wisp/WispThreadPage.tsx',
+  'src/components/wisp/WispGrantPauseControl.tsx',
+  // Wisp W08b (#9921): links add/remove and the partner "Wisp enabled" switch go through runAction;
+  // the home page and needs-you section are listed so a mutation added later cannot go silent.
+  'src/lib/wispLinksApi.ts',
+  'src/lib/wispPartnerSettingsApi.ts',
+  'src/components/wisp/WispHomePage.tsx',
+  'src/components/wisp/WispLinksPanel.tsx',
+  'src/components/wisp/WispNeedsYou.tsx',
+  'src/components/wisp/WispEntityPicker.tsx',
+  'src/components/wisp/WispTalkButton.tsx',
+  'src/components/settings/WispPartnerSettingsCard.tsx',
+  'src/components/wisp/WispHomeContent.tsx',
+  'src/components/wisp/WispHomeThread.tsx',
+  'src/components/admin/AiModels.tsx', // W01 #7599: /admin/ai-models (PATCH + refresh via runAction)
+  'src/components/configurationPolicies/featureTabs/useFeatureLink.ts',
+  // Old storage key check / operator confirmation: both mutations surface
+  // their outcome through runAction from birth.
+  'src/components/configurationPolicies/featureTabs/StorageKeyRevocationCard.tsx',
+  // Per-rule legacy convert (POST /monitor-definitions/convert-from-rule).
+  'src/components/monitoring/LegacyRulesTable.tsx',
   // Disk Cleanup v2 W01: scan and cleanup-preview failures must surface.
   'src/components/devices/DeviceFilesystemTab.tsx',
   // Disk Cleanup v2 W03: cleanup-execute moved into this panel.
@@ -45,6 +127,10 @@ const TARGET_GLOBS = [
   // Network device "Check now" (#5988 W05): the probe reads liveness outside
   // W04's settings writer and must surface every mutation outcome.
   'src/components/devices/networkDevice/useAssetProbe.ts',
+  // Parked-device assignment: single and bulk assign mutations go through
+  // runAction from birth.
+  'src/components/devices/AssignParkedDeviceDialog.tsx',
+  'src/components/devices/UnassignedDevicesPage.tsx',
   'src/components/alerts/delivery/deliveryActions.ts',
   'src/components/alerts/AlertsPage.tsx',
   'src/components/alerts/AlertDetailPage.tsx',
@@ -58,7 +144,21 @@ const TARGET_GLOBS = [
   // gone when it is still being stamped.
   'src/components/settings/WorkTypesCard.tsx',
   'src/components/settings/PartnerSettingsPage.tsx',
-  'src/components/settings/PartnerAiProviderTab.tsx',
+  'src/components/settings/partnerSettings/usePartnersMeUnit.ts',
+  'src/components/settings/partnerSettings/units/callerVerificationUnit.ts',
+  'src/components/settings/partnerSettings/units/loginBrandingUnit.ts',
+  'src/components/settings/partnerSettings/units/trustCenterUnit.ts',
+  'src/components/settings/partnerSettings/units/aiFeatureDefaultsUnit.ts',
+  'src/components/settings/partnerSettings/units/aiDataPolicyUnit.ts',
+  'src/components/settings/KnownGuestsSettings.tsx',
+  'src/components/settings/aiModels/PartnerAiModelsTab.tsx',
+  'src/components/settings/aiModels/ConnectionDrawer.tsx',
+  'src/components/settings/aiModels/ResidencySwitch.tsx',
+  'src/components/settings/aiModels/ModelsCard.tsx',
+  'src/components/settings/aiModels/OfferingDrawer.tsx',
+  'src/components/settings/aiModels/ManualModelForm.tsx', // W06 #7604: POST manual model via runAction
+  'src/components/settings/aiModels/FeatureDefaultsCard.tsx',
+  'src/components/settings/aiModels/OrgModelDefaultsCard.tsx',
   'src/components/settings/OrgSettingsPage.tsx',
   // Tool catalog W01 PR C (#5216): the Tool Sources surface authors the
   // credentials and risk tiers that decide what the assistant may call on a
@@ -72,7 +172,7 @@ const TARGET_GLOBS = [
   'src/components/toolSources/ToolTestDrawer.tsx',
   // Execution plane W05 (#5716) — the per-org AI external-processing consent
   // switch and the attach-artifact-to-ticket control. Both mutate through
-  // runAction; the count assertion below was bumped by exactly these two.
+  // runAction.
   'src/components/settings/OrgAiProcessingToggle.tsx',
   'src/components/aiAgents/AttachArtifactToTicket.tsx',
   // Account board (W02): org create and restore go through runAction in the
@@ -84,6 +184,9 @@ const TARGET_GLOBS = [
   // POST are advisory-then-destructive mutations against a partner's tenant
   // tree, so a silent failure here is exactly the class this guard exists for.
   'src/components/settings/MergeOrgModal.tsx',
+  // #9796: the bulk site move (POST /devices/bulk/site) — a multi-device tenant write that must
+  // never ride ChangeSiteModal.tsx's migration-backlog exemption.
+  'src/components/devices/bulkSiteMove.ts',
   // Org archive (org-lifecycle Wave 5), replacing the org delete flow: the
   // archive POST hides an org, uninstalls its agents, and stops its billing —
   // a silent failure here is exactly the class this guard exists for.
@@ -119,6 +222,13 @@ const TARGET_GLOBS = [
   // drawer needs its own entry or its mutations are invisible to it.
   'src/components/aiAgents/ImpactWeightsDrawer.tsx',
   'src/components/devices/DeviceInfoTab.tsx',
+  // Metric anomaly episodes W04: card actions (dismiss/resolve/promote/unsnooze)
+  // are the only mutation surface for the rewritten panel.
+  'src/components/devices/AnomalyEpisodeCard.tsx',
+  // AI Suggested Fixes W1: Generate/accept/dismiss/execute plus the 👍/👎 vote
+  // and Done feed the fix-memory outcome record — a silent failure here loses
+  // the evidence a proven fix is built from.
+  'src/components/remediation/RemediationSuggestionsPanel.tsx',
   // Fleet Designer W02 (#5652): the Function field's PUT is its own file.
   'src/components/devices/DeviceFunctionField.tsx',
   'src/components/devices/DevicePatchStatusTab.tsx',
@@ -126,9 +236,15 @@ const TARGET_GLOBS = [
   'src/components/dnsSecurity/AddDnsIntegrationModal.tsx',
   'src/components/dnsSecurity/DnsSecurityPoliciesTab.tsx',
   'src/components/dnsSecurity/AddDnsPolicyModal.tsx',
+  // #6958 PR D: provisions Breeze-pinned DNS client packages (POST /software/builtin-packages/:key).
+  'src/components/software/BuiltinPackagesPanel.tsx',
   'src/components/devices/DeviceSoftwareInventory.tsx',
   'src/components/devices/DeviceLinkedProfilesTab.tsx',
   'src/components/devices/DeviceWarrantyCard.tsx',
+  // Physical placement W1-D1 (#8134): the placement PUT is its own file.
+  'src/components/devices/PhysicalPlacementCard.tsx',
+  // Physical placement W1-D2 (#8134): the WAN role PATCH is its own file.
+  'src/components/devices/AssetCircuitCard.tsx',
   'src/components/devices/PossibleReplacementBanner.tsx',
   'src/components/pam/PamRespondModal.tsx',
   'src/components/pam/PamRevokeModal.tsx',
@@ -172,12 +288,19 @@ const TARGET_GLOBS = [
   'src/components/billing/quotes/QuotesPage.tsx',
   'src/components/billing/quotes/QuoteEditor.tsx',
   'src/components/alerts/CorrelatedAlertGroups.tsx',
+  // M365 confirm-tenant interstitial (#7913 W03): continue/cancel are the
+  // last step before Microsoft consent — in the targeted set from birth, with
+  // the two cards that host it.
+  'src/components/integrations/M365ConfirmTenantPanel.tsx',
+  'src/components/integrations/M365CustomerGraphReadCard.tsx',
+  'src/components/integrations/M365CustomerGraphActionsCard.tsx',
   'src/components/integrations/SecurityIntegration.tsx',
-  // QuickBooks entity mapping workbench: confirm/create/unlink/sync decisions
+  // Accounting entity mapping workbench (QuickBooks, and Xero from W02):
+  // confirm/create/unlink/sync decisions
   // and the income-account save all mutate a partner's accounting linkage —
   // a bare fetchWithAuth here would silently fail a mapping the operator
   // believes was saved.
-  'src/components/integrations/QuickbooksMappingWorkbench.tsx',
+  'src/components/integrations/AccountingMappingWorkbench.tsx',
   'src/components/devices/DeviceVulnerabilitiesTab.tsx',
   'src/components/vulnerabilities/VulnerabilityFleetPage.tsx',
   'src/components/vulnerabilities/SoftwareGroupDrawer.tsx',
@@ -240,16 +363,40 @@ const TARGET_GLOBS = [
   // page-level error banner was painted behind the scrim — an unrecoverable
   // silent failure, not merely an unguarded one.
   'src/components/configurationPolicies/ConfigurationPoliciesPage.tsx',
+  // #3531: destructive confirmations whose failures rendered behind the z-50 modal.
+  'src/components/settings/ApiKeysPage.tsx',
+  'src/components/admin/QuarantinedDevices.tsx',
+  'src/components/automations/AutomationsPage.tsx',
+  // #5313: create-monitor and site-edit saves confirmed nothing on 2xx.
+  'src/components/monitors/NetworkCheckConversionBanner.tsx',
+  'src/components/monitors/NetworkMonitorList.tsx',
+  'src/components/monitors/MonitorDetailModal.tsx',
+  'src/components/settings/SiteDetailPage.tsx',
+  'src/components/automations/PoliciesPage.tsx',
+  // #3531 sweep: the same hidden-failure pattern (destructive action behind an
+  // open overlay, or console-only failure) found outside the original four.
+  'src/components/auditBaselines/BaselineList.tsx',
+  'src/components/remote/RemoteToolsPage.tsx',
+  'src/components/discovery/NetworkBaselinesPanel.tsx',
+  'src/components/sensitiveData/PoliciesTab.tsx',
+  'src/components/settings/EnrollmentKeyManager.tsx',
+  'src/components/settings/UsersPage.tsx',
+  'src/components/webhooks/WebhooksPage.tsx',
   // Quick Support: the create/end mutations mint and revoke live remote-access
   // codes, so a silent failure would leave a tech reading out a dead code or
   // believing a session was torn down when it wasn't.
   'src/components/remote/QuickSupportPage.tsx',
+  // File browser "New folder" (#10975).
+  'src/components/remote/FileManager.tsx',
   // PSA connections: create/update/delete/status/test all mutate stored PSA
   // credentials or a live connection's state. They were rewritten with bare
   // fetchWithAuth + setError, which the page's error banner only renders when
   // the connection list is empty — so a failed save on a populated page was
   // silent (#3291 review).
   'src/components/psa/PsaConnectionsPage.tsx',
+  // Alert -> PSA ticket settings (#10535): the PUT enables automatic ticket creation in the
+  // partner's PSA; a silent failure would leave the tech believing alerts are ticketed.
+  'src/components/psa/PsaAlertTicketingCard.tsx',
   // CIS hardening: the whole directory has exactly two mutations (baseline
   // create/update, trigger scan) and both now route through runAction. The scan
   // queues work that changes nothing on screen — the results land minutes later
@@ -288,12 +435,39 @@ const TARGET_GLOBS = [
   // so a slow response invited a duplicate-creating double click. The mount at
   // /reports/builder passed no onSubmit, the only success path.
   'src/components/reports/ReportBuilder.tsx',
-  // QuickBooks connection panel (Phase D): connect/disconnect/push-mode/settings
+  // Business reports (#3198 W03): the curated-template create POST is the only
+  // mutation in this file and it is runAction-wrapped. A partner-wide create
+  // that 403s on the all-organizations access gate must never look identical
+  // to one that succeeded.
+  'src/components/reports/ReportTemplates.tsx',
+  // Multi-org report series W04 (Combine): the combine POST rewrites and
+  // archives existing reports across orgs; a silent failure would read as
+  // "combined" while every duplicate keeps sending.
+  'src/components/reports/series/CombineDialog.tsx',
+  // Multi-org report series (W03): the one client for every series mutation
+  // (create/edit/targets/transfer/delete/detach, per-org run, recipient
+  // overrides). A silent failure here reads as "this org was excluded" or
+  // "this customer will receive it" when neither is true.
+  'src/components/reports/series/seriesApi.ts',
+  // Accounting connection panel (formerly the QuickBooks-only panel, Phase D): connect/disconnect/push-mode/settings
   // -refresh already routed through runAction, but the file was never guarded —
   // so the pull-payments PATCH and the "Sync now" enqueue would have shipped
   // unguarded next to them. A silent failure on either reads as "payment sync
   // is on / a sync is running" while the books and Breeze quietly diverge.
-  'src/components/integrations/QuickbooksIntegration.tsx',
+  'src/components/integrations/AccountingConnectionPanel.tsx',
+  // Accounting customer import: the import POST creates Breeze organizations
+  // from provider customers. It already used runAction but was never listed
+  // (Xero W01 Task 18), so a regression to a bare fetch would have gone unseen.
+  'src/components/integrations/AccountingCustomerImport.tsx',
+  // Xero organisation (tenant) picker: select/cancel both mutate the pending
+  // tenant-selection row. A silent failure here would leave the partner
+  // believing an organisation was connected (or the pending grant cancelled)
+  // when the API never confirmed either.
+  'src/components/integrations/AccountingTenantPicker.tsx',
+  // Xero settings step: the four default-account/tax/bank picker PATCH is a
+  // one-page Save — a silent failure here would leave the operator believing
+  // new defaults are live when the server never saved them.
+  'src/components/integrations/AccountingSettingsStep.tsx',
   // Partner trust action links approve or suspend an entire partner. Keep the
   // TOTP-confirmed mutation inside runAction so this high-impact result cannot
   // fail without operator feedback.
@@ -359,10 +533,9 @@ const TARGET_GLOBS = [
   'src/components/monitoring/DeployMonitorDialog.tsx',
   // #4050 (deferred from #4018 / PR #4041): the account-security surface — MFA
   // enable/disable, recovery-code rotation, passkey register/rename/delete, SSO
-  // re-auth, password and avatar changes. Every mutation here already reports
-  // its outcome, but through section-scoped inline banners rather than
-  // runAction, so each existing call site carries a reasoned
-  // `runaction-exempt:` marker. The point of guarding the file is the NEXT
+  // re-auth and password changes. The remaining exempt mutations report their
+  // outcome through section-scoped inline banners. The point of guarding the
+  // file is the NEXT
   // mutation: without an entry here, a bare fetchWithAuth added beside them
   // ships with zero CI signal on the one page where a silently-failed
   // "Disable MFA" or "Delete passkey" is a security-posture lie.
@@ -389,7 +562,79 @@ const TARGET_GLOBS = [
   'src/components/security/SecurityScanManager.tsx',
   'src/components/security/ThreatList.tsx',
   'src/components/security/ThreatDetail.tsx',
+  // #6263 W05 PR C: the IOC sweep client. Preview, create and the two cancels
+  // are POSTs that start or stop a fleet-wide scan; a swallowed failure would
+  // leave a tech believing a sweep ran (or stopped) when it did not.
+  'src/components/security/sweeps/sweepsApi.ts',
+  // Alert workflows typed filter (#6367 W05c2 Task 9): the save handler now
+  // wraps its create/update POST/PUT in runAction — a silent failure here is
+  // a tech believing a workflow's severity/kind restriction is live when the
+  // save never landed.
+  'src/components/automations/AutomationEditPage.tsx',
+  // Device Monitoring tab (#6367 W05c2 Task 10): the escalation reset POST.
+  'src/components/devices/DeviceMonitoringTab.tsx',
+  // Library Recommended strip (#6367 W05c2 Task 13): the feature-link write
+  // that attaches built-ins to a policy.
+  'src/components/monitoring/RecommendedMonitors.tsx',
+  // Backup provider integration (W03, #6011): these three write partner-level
+  // connector credentials and the customer→org mapping that decides whose
+  // backup data lands in whose tenant. A silent failure here is invisible until
+  // a customer's devices quietly stop appearing.
+  'src/components/integrations/BackupProvidersIntegration.tsx',
+  'src/components/integrations/BackupProviderConnectionCard.tsx',
+  'src/components/integrations/BackupProviderCustomerMapping.tsx',
+  // Device-tab external backup (W03, #6011): Unlink detaches a provider row
+  // from a Breeze device; a silent failure leaves the tech believing the link
+  // is gone while alerts keep firing against it.
+  'src/components/backup/ExternalBackupCard.tsx',
+  // Topology M2 (#5998 Task 9): hide/restore of a connection in one view. A
+  // silent failure leaves a tech believing a false cable is hidden (or back).
+  'src/components/topology/RelationshipExclusionAction.tsx',
+  // Topology M3 (#5999 Task 11): arming recurring monitoring and port
+  // measurement. A silent failure leaves a tech believing a site is being
+  // measured (or no longer is) when it is not.
+  'src/components/topology/MonitoringPolicyPanel.tsx',
+  'src/components/topology/InterfaceTelemetrySettings.tsx',
+  // Reliability baseline markers (#5876 W02 Task 12): "Mark work done" (POST)
+  // and Clear (DELETE). A silent failure leaves a tech believing the score
+  // restarted from their fix — or reverted to full history — when it did not.
+  'src/components/devices/ReliabilityBaselineDialog.tsx',
+  'src/components/devices/ReliabilityBaselineSection.tsx',
+  // Sweep G4: peripheral policy save + config-policy partner-wide toggle toast their outcome.
+  'src/components/peripherals/PeripheralPolicyForm.tsx',
+  'src/components/configurationPolicies/OrganizationScopePanel.tsx',
+  // Operator Recipe Library W06 R1b (#6171): "allow these tools" widens what an
+  // AI agent may call on customer systems; a silent failure leaves the tech
+  // believing the recipe is set up when it is not.
+  'src/components/aiOperator/RecipeCard.tsx',
+  // The draft preview and the admission that starts a four-eyes offboarding.
+  'src/components/aiOperator/StartRecipeForm.tsx',
+  // Portal registration W3 (#11380): the sign-in policy writes (org card, partner unit) and the
+  // access-request approve/deny/decide calls, plus the portal-user and contact surfaces they touch.
+  'src/components/settings/portalAccess/OrgSignInRegistrationCard.tsx',
+  'src/components/settings/partnerSettings/units/portalAccessPolicyUnit.ts',
+  'src/components/settings/partnerSettings/PartnerCustomerPortalTab.tsx',
+  'src/components/settings/portalAccess/PortalAccessRequestsList.tsx',
+  'src/components/settings/OrgPortalUsersEditor.tsx',
+  'src/components/settings/contactPortalAccess.ts',
+  // Portal registration W4 (#11381): the tenant proof actions (prove, proof link, remove) and the
+  // sso_only flow's Microsoft sign-in invites.
+  'src/components/settings/portalAccess/EntraTenantPanel.tsx',
+  'src/components/settings/portalAccess/ssoOnlyActions.ts',
+  'src/components/settings/portalAccess/StrandedAccountsList.tsx',
+  // Portal registration W5 (#11382): Organization › Domains — add, toggle, move, delete, and the
+  // DNS start / verification check / remove-verification calls.
+  'src/components/settings/orgDomains/OrgDomainsTab.tsx',
+  'src/components/settings/orgDomains/AddDomainForm.tsx',
+  'src/components/settings/orgDomains/DomainVerificationPanel.tsx',
 ];
+
+// Ratchet floor, not a total: adding an entry above never touches this line.
+// Lower it only in a PR that deliberately un-guards files (deletes a guarded
+// component, moves one to the backlog); leave a little headroom when you do,
+// so two removals in the queue at once don't both claim the same new floor.
+// Raising it is optional housekeeping.
+const MIN_GUARDED_FILES = 286;
 
 const absoluteFiles: string[] = TARGET_GLOBS.map((rel) => resolve(WEB_ROOT, '..', rel));
 const allowAbsolute = new Set(RUN_ACTION_ALLOWLIST.map((a) => resolve(REPO_ROOT, a.file)));
@@ -680,85 +925,33 @@ describe('no silent mutations in targeted set', () => {
   const program = ts.createProgram({ rootNames: programFiles, options: parsedConfig.options });
   const checker = program.getTypeChecker();
 
-  it('finds files to scan', () => {
-    // 106: 99 since #3989 added OrganizationsPage.tsx, plus MergeOrgModal.tsx
-    // (org-lifecycle Wave 3), plus ArchiveOrgModal.tsx (org-lifecycle Wave 5),
-    // plus SsoProvidersPage.tsx and ReportBuilder.tsx (2026-08-28 pre-release sweep),
-    // plus AlertVerdictBadge.tsx (P2-1 Task 15), plus
-    // AiAgentSchedulesSection.tsx (P2-2 Task 13, #4189), plus
-    // QuickbooksMappingWorkbench.tsx (QuickBooks entity mapping, Task 6), plus
-    // ImpactPage.tsx (P2-6 Task 10, #4193), plus ImpactWeightsDrawer.tsx
-    // (P2-6 Task 11, #4193), plus AccountingSyncCard.tsx (QuickBooks invoice
-    // push, Phase C Task 7), plus QuickbooksIntegration.tsx (QuickBooks payment
-    // pull-back, Phase D Task 7 — the pull-payments PATCH and the "Sync now"
-    // enqueue joined four pre-existing unguarded mutations in that file), plus
-    // AiAgentGraduationPanel.tsx (P2-5 Task 20, #4192). ApprovalsInbox.tsx was
-    // already guarded before P2-5 — Task 21's promote mutation needed no list
-    // edit. Also plus BulkContactImport.tsx, ContactImportPreviewTable.tsx and
-    // ContactsCard.tsx (#3258 W04, the contacts tab and its CSV importer), plus
-    // TrustActionPage.tsx (partner trust probation, #4549 — the TOTP-confirmed
-    // approve/suspend action), plus TrustQueue.tsx (partner trust probation,
-    // #4549 W07 — the admin trust queue page's approve/suspend actions).
-    // NOTE: merge-base held 108; this branch added 1 (TrustActionPage.tsx) and
-    // main added 3 in parallel, so the true merged count was 113. A prior
-    // commit added 1 more (TrustQueue.tsx) to reach 114. A prior commit added 1
-    // more (AssignmentsTab.tsx) to reach 115. A prior commit added 3 more
-    // (#4767 — ExecutionHistory.tsx, ExecutionDetails.tsx,
-    // ScriptExecutionsPage.tsx) to reach 118. This commit adds 1 more
-    // (AutomationRunHistory.tsx), so the count was 119. Task 13 (#5051) adds
-    // 1 more (AgentCreateFlow.tsx), so the count is now 120 — bump it
-    // deliberately on every merge, never by resolving the hunk.
-    // #4622 W04 adds ManualAssetModal.tsx and #5213 W02 adds
-    // AddNetworkAssetModal.tsx, so the count is now 125. #5612 W03 adds
-    // lib/api/scriptProposals.ts (request-changes + promote), so the count is
-    // now 126. #5612 W05 Tasks 23-24 add ScriptAuthoringPage.tsx, so the
-    // count is now 127. Fleet Designer W02 (#5652) adds
-    // devices/DeviceFunctionField.tsx, so the count is now 128. Fleet
-    // Designer W03 (#5653) adds fleetDesign/FleetDesignPage.tsx and
-    // fleetDesign/ApplyDrawer.tsx, so the count was 130. Account board (W02,
-    // #5723) replaces the deleted OrganizationsPage.tsx entry with two files
-    // (OrganizationsBoardPage.tsx, useManualOrder.ts), so the count is now 131.
-    // Monitor Activity tab (#5287 W03 / #5290) adds MonitorActivityTab.tsx, so
-    // the count is now 132. Agreements W03 (#5825) moves three contracts files
-    // into components/agreements/ and DELETES ContractDocumentsSection.tsx
-    // (contract detail embeds the shared list instead), so the count is 131.
-    // Execution plane W05 (#5716) adds two adopters (AiRunCard attach-to-ticket
-    // and the per-org external-processing switch), so the count is 133.
-    // Tool catalog W01 PR C (#5216) took the count to 138; sweep G1-4 added
-    // MonitorEditor.tsx and DeployMonitorDialog.tsx (140); network device page
-    // truth W04 (#5992) adds the network asset single writer: 140 → 141.
-    // Network device page truth W05 adds the probe hook: 141 → 142.
-    // #4050 adds settings/ProfilePage.tsx (account security): 142 → 143.
-    // Partner sending domains W05 adds lib/api/sendingDomains.ts and
-    // settings/PartnerSendingDomainTab.tsx: 143 → 145.
-    // W01 settings consolidation (#6224): PartnerBillingSettings.tsx ->
-    // PartnerBillingSettingsPage.tsx (net 0) then + CatalogDefaultsCard.tsx:
-    // 145 → 146.
-    // Bare-metal W05a adds backup/VMRestoreWizard.tsx (rebuild engine): 146 → 147.
-    // Outbound email templates (PR1 settings UI) add EmailTemplatesTab.tsx
-    // and EmailTemplateEditor.tsx: 147 → 149.
-    // Disk Cleanup v2 W01 adds DeviceFilesystemTab.tsx: 149 → 150.
-    // Work types (#4628 W01) add WorkTypesCard.tsx: 150 → 151.
-    // Disk Cleanup v2 W03 adds filesystem/CleanupPanel.tsx: 151 → 152.
-    // Disk Cleanup v2 W04 adds filesystem/SystemCleanupPanel.tsx: 152 → 153.
-    // Billing profiles W02 adds Rates and the org assignment writer: 153 → 155.
-    // DR plan / BMR token create (#6495) adds DRPlanEditor.tsx and
-    // RecoveryBootstrapTab.tsx: 155 → 157.
-    // #6263 W01 adds SecurityScanManager.tsx, ThreatList.tsx, ThreatDetail.tsx: 157 → 160.
-    // Accept on behalf adds quotes/AcceptOnBehalfDialog.tsx: 160 → 161.
-    // Decline on behalf (#6634) adds quotes/DeclineOnBehalfDialog.tsx: 161 → 162.
-    // Accept-on-behalf evidence (#6633) adds quotes/AcceptanceEvidenceControl.tsx: 162 → 163.
-    expect(absoluteFiles.length).toBe(163);
-    for (const f of absoluteFiles) {
-      expect(() => statSync(f)).not.toThrow();
-    }
+  it('finds files to scan, and every guarded file exists', () => {
+    // No exact total (#10030). The old `toBe(<n>)` was bumped by every PR that
+    // guarded a file, so any two such PRs collided in the merge queue: a
+    // textual conflict when their bumps differed, a red merged group when they
+    // matched. Adding an entry now touches nothing else. The floor below is a
+    // ratchet against the list shrinking (a bad conflict resolution, or an
+    // entry deleted to silence its scan): only a PR that deliberately un-guards
+    // files below it has to lower it. A deleted or renamed source file fails
+    // here, by name.
+    expect(
+      new Set(TARGET_GLOBS).size,
+      'TARGET_GLOBS shrank below MIN_GUARDED_FILES — restore the dropped entries, ' +
+        'or lower the floor in the same PR that deliberately un-guards a file',
+    ).toBeGreaterThanOrEqual(MIN_GUARDED_FILES);
+    const missing = TARGET_GLOBS.filter((_, i) => {
+      try {
+        return !statSync(absoluteFiles[i]).isFile();
+      } catch {
+        return true;
+      }
+    });
+    expect(missing, 'TARGET_GLOBS entries with no file on disk').toEqual([]);
   });
 
   it('lists every guarded file exactly once', () => {
-    // A duplicated entry inflates the count above without adding coverage: the
-    // file is scanned twice and the next person to bump the counter inherits an
-    // off-by-one that is invisible unless they dedupe the list by hand. Assert
-    // it mechanically instead, and name the offenders so the fix is obvious.
+    // A duplicated entry is scanned twice without adding coverage and makes the
+    // list look longer than it is. Name the offenders so the fix is obvious.
     const seen = new Set<string>();
     const duplicates = TARGET_GLOBS.filter((rel) => {
       if (seen.has(rel)) return true;
@@ -766,7 +959,6 @@ describe('no silent mutations in targeted set', () => {
       return false;
     });
     expect(duplicates).toEqual([]);
-    expect(seen.size).toBe(absoluteFiles.length);
   });
 
   for (const absPath of absoluteFiles) {

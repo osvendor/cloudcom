@@ -13,13 +13,17 @@ import type { AuthContext } from '../middleware/auth';
 import type { AiTool } from './aiTools';
 import { CommandTypes } from './commandQueue';
 import { aiQueueCommandForExecution } from './aiDispatch';
+import { buildVaultConfigurePayload, resolveLatestVaultSyncSnapshotId } from './vaultDeviceCommands';
+import { updateVaultWithinCurrentSite } from './localVaultUpdate';
 import {
   deviceScopeCondition,
   deviceSiteDenied,
   deviceIdSiteDenied,
   resolveSiteAllowedDeviceIds,
   runFrozenDeviceIds,
+  siteAllowlistOf,
 } from './aiToolsSiteScope';
+import { notInHoldingOrgCondition, notParkedDeviceCondition } from './unassignedPool/selectorPredicate';
 
 type VaultHandler = (input: Record<string, unknown>, auth: AuthContext) => Promise<string>;
 
@@ -50,6 +54,35 @@ function clampLimit(value: unknown, fallback = 25, max = 100): number {
 
 function getOrgId(auth: AuthContext): string | null {
   return auth.orgId ?? auth.accessibleOrgIds?.[0] ?? null;
+}
+
+type DeviceConfigOutcome = { status: 'queued' } | { status: 'failed'; error: string };
+
+/**
+ * Push the device's vault configuration (#8385) after configure_vault saved a
+ * row. The row is already written, so a failed push is reported in the tool
+ * result rather than thrown into safeHandler's generic error.
+ */
+async function pushDeviceVaultConfig(auth: AuthContext, deviceId: string, orgId: string): Promise<DeviceConfigOutcome> {
+  try {
+    const payload = await buildVaultConfigurePayload(deviceId, orgId);
+    const { error } = await aiQueueCommandForExecution(
+      auth,
+      'configure_vault',
+      deviceId,
+      CommandTypes.VAULT_CONFIGURE,
+      payload,
+      { userId: auth.user?.id, expectedOrgId: orgId },
+    );
+    if (error) {
+      console.error(`[vault:configure_vault] vault_configure for device ${deviceId} was not queued: ${error}`);
+      return { status: 'failed', error };
+    }
+    return { status: 'queued' };
+  } catch (err) {
+    console.error(`[vault:configure_vault] Failed to queue vault_configure for device ${deviceId}:`, err);
+    return { status: 'failed', error: 'Failed to send the vault configuration to the device' };
+  }
 }
 
 // ============================================
@@ -95,6 +128,11 @@ export function registerVaultTools(aiTools: Map<string, AiTool>): void {
       // Site axis: a site-restricted caller may only see vaults for devices in
       // their allowed sites (RLS does NOT enforce site). Narrow to that set.
       const orgId = getOrgId(auth);
+      // Fail closed: a site-restricted caller whose org never
+      // resolves must not fall through to an unfiltered query.
+      if (auth.allowedSiteIds && !orgId) {
+        return JSON.stringify({ vaults: [], showing: 0 });
+      }
       if (auth.allowedSiteIds && orgId) {
         const allowed = await resolveSiteAllowedDeviceIds(orgId, auth);
         if (!allowed || allowed.length === 0) {
@@ -168,7 +206,7 @@ export function registerVaultTools(aiTools: Map<string, AiTool>): void {
       const deviceId = input.deviceId as string;
       if (!deviceId) return JSON.stringify({ error: 'deviceId is required' });
 
-      const deviceConditions: SQL[] = [eq(devices.id, deviceId)];
+      const deviceConditions: SQL[] = [eq(devices.id, deviceId), notParkedDeviceCondition()];
       const dc = orgWhere(auth, devices.orgId);
       if (dc) deviceConditions.push(dc);
       const [device] = await db
@@ -240,7 +278,8 @@ export function registerVaultTools(aiTools: Map<string, AiTool>): void {
   // ============================================
 
   registerTool({
-    tier: 2,
+    // W03 (#6757): tier 3 supervised — queues VAULT_SYNC on the device.
+    tier: 3,
     domain: 'backup',
     searchHint: 'local backup vault synchronization for a vault or selected snapshot',
     definition: {
@@ -259,7 +298,7 @@ export function registerVaultTools(aiTools: Map<string, AiTool>): void {
       const vaultId = input.vaultId as string;
       if (!vaultId) return JSON.stringify({ error: 'vaultId is required' });
 
-      const vaultConditions: SQL[] = [eq(localVaults.id, vaultId)];
+      const vaultConditions: SQL[] = [eq(localVaults.id, vaultId), notInHoldingOrgCondition(localVaults.orgId)];
       const vc = orgWhere(auth, localVaults.orgId);
       if (vc) vaultConditions.push(vc);
       const [vault] = await db
@@ -267,6 +306,7 @@ export function registerVaultTools(aiTools: Map<string, AiTool>): void {
           id: localVaults.id,
           orgId: localVaults.orgId,
           deviceId: localVaults.deviceId,
+          vaultPath: localVaults.vaultPath,
           isActive: localVaults.isActive,
         })
         .from(localVaults)
@@ -281,6 +321,15 @@ export function registerVaultTools(aiTools: Map<string, AiTool>): void {
         return JSON.stringify({ error: 'Vault not found or access denied' });
       }
 
+      // The helper requires a snapshot id; default to the device's newest
+      // file-backup snapshot (#8385).
+      const snapshotId = typeof input.snapshotId === 'string'
+        ? input.snapshotId
+        : await resolveLatestVaultSyncSnapshotId(vault.deviceId, vault.orgId);
+      if (!snapshotId) {
+        return JSON.stringify({ error: 'No backup snapshot to sync yet: run a file backup on this device first' });
+      }
+
       // Repeat the tenant and device axes the checks above authorized: the
       // vault was read in a separate statement, so `id` alone would leave a
       // check-then-act window.
@@ -288,7 +337,7 @@ export function registerVaultTools(aiTools: Map<string, AiTool>): void {
         .update(localVaults)
         .set({
           lastSyncStatus: 'pending',
-          lastSyncSnapshotId: typeof input.snapshotId === 'string' ? input.snapshotId : null,
+          lastSyncSnapshotId: snapshotId,
           updatedAt: new Date(),
         })
         .where(and(
@@ -302,10 +351,7 @@ export function registerVaultTools(aiTools: Map<string, AiTool>): void {
         'trigger_vault_sync',
         vault.deviceId,
         CommandTypes.VAULT_SYNC,
-        {
-          vaultId: vault.id,
-          snapshotId: typeof input.snapshotId === 'string' ? input.snapshotId : undefined,
-        },
+        { vaultId: vault.id, vaultPath: vault.vaultPath, snapshotId },
         { userId: auth.user?.id, expectedOrgId: vault.orgId }
       );
 
@@ -378,7 +424,7 @@ export function registerVaultTools(aiTools: Map<string, AiTool>): void {
           return JSON.stringify({ error: 'deviceId and vaultPath are required for create' });
         }
 
-        const deviceConditions: SQL[] = [eq(devices.id, deviceId)];
+        const deviceConditions: SQL[] = [eq(devices.id, deviceId), notParkedDeviceCondition()];
         const dc = orgWhere(auth, devices.orgId);
         if (dc) deviceConditions.push(dc);
         const [device] = await db
@@ -412,14 +458,15 @@ export function registerVaultTools(aiTools: Map<string, AiTool>): void {
           })
           .returning();
 
-        return JSON.stringify({ success: true, vault });
+        const deviceConfig = await pushDeviceVaultConfig(auth, deviceId, device.orgId);
+        return JSON.stringify({ success: true, vault, deviceConfig });
       }
 
       if (action === 'update') {
         const vaultId = input.vaultId as string;
         if (!vaultId) return JSON.stringify({ error: 'vaultId is required for update' });
 
-        const vaultConditions: SQL[] = [eq(localVaults.id, vaultId)];
+        const vaultConditions: SQL[] = [eq(localVaults.id, vaultId), notInHoldingOrgCondition(localVaults.orgId)];
         const vc = orgWhere(auth, localVaults.orgId);
         if (vc) vaultConditions.push(vc);
         const [existing] = await db
@@ -440,17 +487,26 @@ export function registerVaultTools(aiTools: Map<string, AiTool>): void {
         if (input.retentionCount !== undefined) updateData.retentionCount = Number(input.retentionCount);
         if (typeof input.isActive === 'boolean') updateData.isActive = input.isActive;
 
-        const [vault] = await db
-          .update(localVaults)
-          .set(updateData)
-          .where(and(
-            eq(localVaults.id, vaultId),
-            eq(localVaults.orgId, existing.orgId),
-            eq(localVaults.deviceId, existing.deviceId),
-          ))
-          .returning();
+        // W03-D12 (#6757, quorum QW5): a site-restricted caller writes through
+        // the route's locked update (the device row is locked inside its
+        // sites), so a concurrent site move cannot land between the check
+        // above and this write. Unrestricted callers keep the CAS-bound update.
+        const allowedSites = siteAllowlistOf(auth);
+        const [vault] = allowedSites !== undefined
+          ? [await updateVaultWithinCurrentSite(existing.orgId, vaultId, updateData, allowedSites)]
+          : await db
+            .update(localVaults)
+            .set(updateData)
+            .where(and(
+              eq(localVaults.id, vaultId),
+              eq(localVaults.orgId, existing.orgId),
+              eq(localVaults.deviceId, existing.deviceId),
+            ))
+            .returning();
 
-        return JSON.stringify({ success: true, vault });
+        if (!vault) return JSON.stringify({ error: 'Vault not found or access denied' });
+        const deviceConfig = await pushDeviceVaultConfig(auth, existing.deviceId, existing.orgId);
+        return JSON.stringify({ success: true, vault, deviceConfig });
       }
 
       const orgId = getOrgId(auth);

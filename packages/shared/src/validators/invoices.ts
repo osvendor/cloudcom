@@ -5,6 +5,8 @@ import { INVOICE_STATUSES, PAYMENT_METHODS } from '../types/billing-enums';
 import { BULK_ID_LIMIT } from '../constants';
 import { nullableHttpUrlField } from './httpUrl';
 import { currencyCodeSchema } from './currency';
+import { INVOICE_LINE_GROUPINGS } from '../utils/invoiceLineDetail';
+import { agreementDefaultsSettingsFields } from './agreementRequests';
 
 const money = z.number().nonnegative().multipleOf(0.01);
 const positiveQty = z.number().positive().multipleOf(0.01);
@@ -72,15 +74,34 @@ export const updateInvoiceSchema = z.object({
   notes: z.string().max(5000).optional(),
   siteId: z.string().guid().nullable().optional(),
   dueDate: isoDate.optional(),
-  termsAndConditions: z.string().max(20_000).nullable().optional()
+  termsAndConditions: z.string().max(20_000).nullable().optional(),
+  // #8604 per-invoice line itemization override (drafts only — the PATCH is
+  // draft-locked). null = inherit the partner default; frozen at issue.
+  lineGrouping: z.enum([...INVOICE_LINE_GROUPINGS]).nullable().optional(),
+  lineShowDate: z.boolean().nullable().optional(),
+  lineShowNote: z.boolean().nullable().optional(),
+  lineShowWorkedTime: z.boolean().nullable().optional()
 });
+
+/**
+ * A caller-chosen key naming ONE intended payment (#3803). Opaque and
+ * case-sensitive: 1–255 visible ASCII characters, no whitespace, so the same
+ * key survives an HTTP header round trip unchanged. Send a fresh key per
+ * payment and the same key on every retry of it.
+ */
+export const idempotencyKeySchema = z.string().regex(
+  /^[\x21-\x7E]{1,255}$/,
+  'idempotency key must be 1-255 visible ASCII characters with no whitespace'
+);
 
 export const recordPaymentSchema = z.object({
   amount: z.number().positive().multipleOf(0.01),
   method: z.enum([...PAYMENT_METHODS]),
   reference: z.string().max(255).optional(),
   receivedAt: isoDate,
-  note: z.string().max(2000).optional()
+  note: z.string().max(2000).optional(),
+  // Also accepted as the Idempotency-Key header (routes/invoices/payments.ts).
+  idempotencyKey: idempotencyKeySchema.optional()
 });
 
 export const voidInvoiceSchema = z.object({
@@ -113,6 +134,12 @@ export const partnerBillingSettingsSchema = z.object({
   // OFF (partners.invoice_device_appendix NOT NULL DEFAULT false). Resolved once
   // at issue onto invoices.device_appendix and frozen there.
   invoiceDeviceAppendix: z.boolean().optional(),
+  // #8604: invoice labor line itemization defaults (date / note / worked time /
+  // per-day grouping). Resolved once at issue onto invoices.line_* and frozen.
+  invoiceLineGrouping: z.enum([...INVOICE_LINE_GROUPINGS]).optional(),
+  invoiceLineShowDate: z.boolean().optional(),
+  invoiceLineShowNote: z.boolean().optional(),
+  invoiceLineShowWorkedTime: z.boolean().optional(),
   // Auto-email the issued invoice (with its public pay link) when a quote is
   // accepted. Default ON — see partners.auto_email_invoice_on_quote_accept.
   autoEmailInvoiceOnQuoteAccept: z.boolean().optional(),
@@ -141,6 +168,10 @@ export const partnerBillingSettingsSchema = z.object({
   billingAddressPostalCode: z.string().max(40).nullable().optional(),
   billingAddressCountry: z.string().length(2).nullable().optional(),
   billingTermsAndConditions: z.string().max(20_000).nullable().optional(),
+  // #9075 W4a (OD8): agreement-request defaults (partner level only — no org
+  // override). The route additionally requires agreements:send when any of
+  // these is present, since they decide customer-facing reminder emails.
+  ...agreementDefaultsSettingsFields,
 });
 
 export const orgBillingSettingsSchema = z.object({
@@ -148,6 +179,10 @@ export const orgBillingSettingsSchema = z.object({
   taxId: z.string().max(100).nullable().optional(),
   taxExempt: z.boolean().optional(),
   taxRate: taxRate.nullable().optional(),
+  // Settings consolidation W06 (#6229): org override of the partner's payment
+  // terms. null clears it (= inherit partners.invoiceTermsDays). Same 0–365
+  // bounds as the partner default and the DB CHECK. Frozen as due_date at issue.
+  invoiceTermsDays: z.number().int().min(0).max(365).nullable().optional(),
   // Billing contact — the recipient quotes/invoices are actually emailed to
   // (org.billingContact jsonb). Kept here, alongside the address, so the whole
   // "who + where we bill" lives on one form. Clearing the field must send null,

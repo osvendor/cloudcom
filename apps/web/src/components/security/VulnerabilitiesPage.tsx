@@ -2,6 +2,7 @@ import { useTranslation } from "react-i18next";
 import "@/lib/i18n";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useHashState } from "@/lib/useHashState";
+import { parseThreatsHash } from "./threatsHash";
 import {
   AlertTriangle,
   Loader2,
@@ -18,6 +19,7 @@ import {
 } from "@/lib/utils";
 import { errorKindOf, throwIfNotOk, type LoadErrorKind } from "@/lib/httpError";
 import { fetchWithAuth } from "@/stores/auth";
+import { FilterSelect } from "../shared/FilterSelect";
 import AccessDenied from "../shared/AccessDenied";
 import SecurityPageHeader from "./SecurityPageHeader";
 import SecurityStatCard from "./SecurityStatCard";
@@ -26,6 +28,7 @@ import {
   DataCard,
   CardField,
 } from "../shared/ResponsiveTable";
+import { replaceUrl } from '../../lib/replaceUrl';
 type Threat = {
   id: string;
   deviceId: string;
@@ -80,9 +83,13 @@ export default function VulnerabilitiesPage() {
   // Adopted post-mount to avoid an SSR hydration mismatch (#2421).
   const [severity, setSeverity] = useHashState<string>(
     "",
-    (h) => h.match(/severity=(critical|high|medium|low)/)?.[1],
+    (h) => parseThreatsHash(h).severity || undefined,
   );
-  const [status, setStatus] = useState("");
+  // `#status=active` (dashboard "N active threats" link) seeds the status filter.
+  const [status, setStatus] = useHashState<string>(
+    "",
+    (h) => parseThreatsHash(h).status || undefined,
+  );
   const [category, setCategory] = useState("");
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const abortRef = useRef<AbortController | null>(null);
@@ -298,18 +305,15 @@ export default function VulnerabilitiesPage() {
           />
         </div>
         <div className="flex flex-wrap gap-2">
-          <select
+          <FilterSelect
+            label={t("securityVulnerabilitiesPage.severityFilterLabel")}
             value={severity}
             onChange={(e) => {
               const value = e.target.value;
               setSeverity(value);
-              window.history.replaceState(
-                null,
-                "",
-                value ? `#severity=${value}` : window.location.pathname,
-              );
+              replaceUrl(value ? `#severity=${value}` : window.location.pathname);
             }}
-            className="h-10 rounded-md border bg-background px-3 text-sm"
+            className="h-10"
           >
             <option value="">
               {t("securityVulnerabilitiesPage.allSeverities")}
@@ -324,11 +328,12 @@ export default function VulnerabilitiesPage() {
               {t("securityVulnerabilitiesPage.medium")}
             </option>
             <option value="low">{t("securityVulnerabilitiesPage.low")}</option>
-          </select>
-          <select
+          </FilterSelect>
+          <FilterSelect
+            label={t("securityVulnerabilitiesPage.statusFilterLabel")}
             value={status}
             onChange={(e) => setStatus(e.target.value)}
-            className="h-10 rounded-md border bg-background px-3 text-sm"
+            className="h-10"
           >
             <option value="">
               {t("securityVulnerabilitiesPage.allStatuses")}
@@ -342,11 +347,12 @@ export default function VulnerabilitiesPage() {
             <option value="removed">
               {t("securityVulnerabilitiesPage.removed")}
             </option>
-          </select>
-          <select
+          </FilterSelect>
+          <FilterSelect
+            label={t("securityVulnerabilitiesPage.categoryFilterLabel")}
             value={category}
             onChange={(e) => setCategory(e.target.value)}
-            className="h-10 rounded-md border bg-background px-3 text-sm"
+            className="h-10"
           >
             <option value="">
               {t("securityVulnerabilitiesPage.allCategories")}
@@ -364,7 +370,7 @@ export default function VulnerabilitiesPage() {
               {t("securityVulnerabilitiesPage.spyware")}
             </option>
             <option value="pup">{t("securityVulnerabilitiesPage.pup")}</option>
-          </select>
+          </FilterSelect>
         </div>
       </div>
 
@@ -409,6 +415,7 @@ export default function VulnerabilitiesPage() {
                 <th className="px-4 py-3">
                   <input
                     type="checkbox"
+                    aria-label={t("securityVulnerabilitiesPage.selectAllThreats")}
                     checked={allSelected}
                     ref={(el) => {
                       if (el) el.indeterminate = someSelected && !allSelected;
@@ -453,6 +460,9 @@ export default function VulnerabilitiesPage() {
                     <td className="px-4 py-3">
                       <input
                         type="checkbox"
+                        aria-label={t("securityVulnerabilitiesPage.selectThreat", {
+                          name: threat.name,
+                        })}
                         checked={selectedIds.has(threat.id)}
                         onChange={(e) => toggleOne(threat.id, e.target.checked)}
                         className="h-4 w-4 rounded border-border"

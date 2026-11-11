@@ -4,6 +4,7 @@ import { db } from '../../db';
 import {
   getOrgCascadeDeleteOrder,
   topologicalCascadeOrder,
+  CASCADE_ORDER_SET_NULL_EDGE_BREAKS,
 } from '../../services/tenantCascade';
 
 /**
@@ -37,6 +38,9 @@ const NOT_CASCADE_SCOPED: ReadonlySet<string> = new Set<string>([
   'partner_export_site_material_state',
   'third_party_package_catalog', // system-wide curated catalog
   'third_party_release_tests', // system-wide release test results
+  // NOTE: ticket_mailbox_connections is NOT exempt any more — its Gmail rows
+  // carry org_id and are now in CORE_ORG_CASCADE_DELETE_ORDER so an org merge
+  // repoints them to the survivor instead of the FK cascade-deleting them (#6592).
 ]);
 
 const cascadeOrder = getOrgCascadeDeleteOrder();
@@ -122,7 +126,9 @@ describe('Tenant cascade list contract', () => {
     const edges = (await db.execute(sql`
       SELECT
         tc.relname AS child_table,
-        tp.relname AS parent_table
+        tp.relname AS parent_table,
+        c.conname AS conname,
+        c.confdeltype::text AS confdeltype
       FROM pg_constraint c
       JOIN pg_class tc ON tc.oid = c.conrelid
       JOIN pg_class tp ON tp.oid = c.confrelid
@@ -132,11 +138,13 @@ describe('Tenant cascade list contract', () => {
         AND nc.nspname = 'public'
         AND np.nspname = 'public'
         AND tc.relname <> tp.relname;
-    `)) as unknown as Array<{ child_table: string; parent_table: string }>;
+    `)) as unknown as Array<{ child_table: string; parent_table: string; conname: string; confdeltype: string }>;
 
     const violations: Array<{ child: string; parent: string }> = [];
     for (const e of edges) {
       if (!cascadeSet.has(e.child_table) || !cascadeSet.has(e.parent_table)) continue;
+      // A SET NULL cycle break is safe in either order (see the next test).
+      if (CASCADE_ORDER_SET_NULL_EDGE_BREAKS.has(e.conname) && e.confdeltype === 'n') continue;
       const ci = indexOf.get(e.child_table)!;
       const pi = indexOf.get(e.parent_table)!;
       // Child must be deleted before parent → child must come first.
@@ -149,5 +157,28 @@ describe('Tenant cascade list contract', () => {
         `AFTER their parents, leaving orphan rows):\n` +
         `${JSON.stringify(violations, null, 2)}`,
     ).toEqual([]);
+  });
+
+  it('every CASCADE_ORDER_SET_NULL_EDGE_BREAKS entry exists, is ON DELETE SET NULL, and is on nullable columns', async () => {
+    const names = [...CASCADE_ORDER_SET_NULL_EDGE_BREAKS];
+    // The columns the action actually nulls: the PG15+ column-list form
+    // `ON DELETE SET NULL (col)` records them in confdelsetcols (e.g.
+    // wisp_grants_current_revision_fk nulls current_revision_id, never its
+    // NOT NULL `id` half); otherwise every FK column is nulled.
+    const rows = (await db.execute(sql`
+      SELECT c.conname,
+             c.confdeltype::text AS confdeltype,
+             bool_and(NOT a.attnotnull) AS all_nullable
+        FROM pg_constraint c
+        JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY (COALESCE(c.confdelsetcols, c.conkey))
+       WHERE c.contype = 'f'
+         AND c.conname IN (${sql.join(names.map((n) => sql`${n}`), sql`, `)})
+       GROUP BY c.conname, c.confdeltype
+    `)) as unknown as Array<{ conname: string; confdeltype: string; all_nullable: boolean }>;
+    expect(rows.map((r) => r.conname).sort()).toEqual(names.sort());
+    for (const r of rows) {
+      expect(r.confdeltype, `${r.conname} must stay ON DELETE SET NULL`).toBe('n');
+      expect(r.all_nullable, `${r.conname} columns must be nullable`).toBe(true);
+    }
   });
 });

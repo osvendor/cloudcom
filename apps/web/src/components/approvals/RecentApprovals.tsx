@@ -40,6 +40,11 @@ export interface RecentApprovalRow {
   orgName: string | null;
   decidedAt: string | null;
   createdAt: string;
+  /** Set when the approver approved but the server refused it; the row is
+   *  then `denied`. Absent from older API responses. */
+  refusalReason?: string | null;
+  /** The approver's own free-text deny reason (#9658). Absent/null when none. */
+  decisionReason?: string | null;
   intentOutcome: {
     status: string;
     errorCode: string | null;
@@ -61,6 +66,11 @@ const SUCCESS_STATUSES = new Set(['completed', 'approved']);
  * success branch: "we don't know" rendered as a green check is the exact
  * failure mode #6022 is about.
  */
+/** The API's outcome reasons are lowercase clauses (shared with the chat read-back); render them as sentences. */
+function sentenceCase(text: string): string {
+  return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
 export function outcomeKind(row: RecentApprovalRow): 'success' | 'failure' | 'unknown' {
   const status = row.intentOutcome?.status ?? '';
   if (FAILURE_STATUSES.has(status)) return 'failure';
@@ -150,7 +160,10 @@ export default function RecentApprovals() {
             <ul className="divide-y">
               {rows.map((row) => {
                 const kind = outcomeKind(row);
-                const status = row.intentOutcome?.status ?? 'unknown';
+                // A refused approve is stored as denied, but the approver
+                // approved it: label it refused so it never reads as the
+                // approver's own denial.
+                const status = row.refusalReason ? 'refused' : (row.intentOutcome?.status ?? 'unknown');
                 return (
                   <li key={row.id} className="py-2" data-testid={`approvals-recent-row-${row.id}`}>
                     <div className="flex items-start gap-2" data-outcome={kind}>
@@ -165,7 +178,7 @@ export default function RecentApprovals() {
                         <p className="truncate text-sm font-medium">{row.actionLabel}</p>
                         <p className="text-xs text-muted-foreground">
                           <span data-testid={`approvals-recent-status-${row.id}`}>
-                            {/* One key per terminal intent status, all eight
+                            {/* One key per terminal status (plus `refused`),
                                 present in every locale; a status the locale
                                 files do not know renders raw rather than
                                 blank. */}
@@ -181,9 +194,28 @@ export default function RecentApprovals() {
                             className="mt-1 text-xs text-destructive"
                             data-testid={`approvals-recent-reason-${row.id}`}
                           >
-                            {row.intentOutcome.reason}
+                            {sentenceCase(row.intentOutcome.reason)}
                           </p>
                         )}
+                        {/* #9658: the deny form promises the reason is "shared with
+                            the requester" — show it here too. Skipped when it
+                            only repeats the outcome reason (an intent-less
+                            denial derives its outcome reason from this field). */}
+                        {(() => {
+                          const approverReason = row.decisionReason?.trim();
+                          // A refused approve stores the approve-time note here, not a denial reason.
+                          if (row.refusalReason || !approverReason || approverReason === row.intentOutcome?.reason?.trim()) return null;
+                          return (
+                            <p
+                              className="mt-1 text-xs text-muted-foreground"
+                              data-testid={`approvals-recent-decision-reason-${row.id}`}
+                            >
+                              <span className="font-medium">{t('recent.decisionReasonLabel')}</span>
+                              {': '}
+                              {approverReason}
+                            </p>
+                          );
+                        })()}
                       </div>
                     </div>
                   </li>

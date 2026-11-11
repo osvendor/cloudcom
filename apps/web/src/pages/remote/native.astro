@@ -1,0 +1,8 @@
+---
+import DashboardLayout from '../../layouts/DashboardLayout.astro';
+import StaffNativeAuthorizationPage from '../../components/remote/StaffNativeAuthorizationPage';
+---
+
+<DashboardLayout title="Remote Access authorization">
+  <StaffNativeAuthorizationPage client:only="react" />
+</DashboardLayout>

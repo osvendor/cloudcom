@@ -6,7 +6,7 @@
  * and backup configs. These must be created before they can be linked to a config policy.
  */
 
-import { db } from '../db';
+import { db, hasDbAccessContext, withDbTransaction } from '../db';
 import { pgErrorCode } from '../utils/pgErrors';
 import { patchPolicies } from '../db/schema/patches';
 import { softwarePolicies } from '../db/schema/softwarePolicies';
@@ -20,6 +20,9 @@ import { canMutateOrgWideGovernance, SITE_CEILING_WRITE_DENIED_MESSAGE } from '.
 import { bumpApprovalGeneration } from './approvalGeneration';
 import {
   ringAutoApproveSchema,
+  ringAppRulesSchema,
+  ringFeatureUpdatesSchema,
+  type RingFeatureUpdates,
   mergeRingAutoApproveWrite,
   backupProfileSelectionsSchema,
 } from '@breeze/shared/validators';
@@ -30,12 +33,37 @@ import {
   AI_AUTO_INSTALL_REFUSAL_MESSAGE,
   remediationOptionsArmsAutoInstall,
 } from './aiToolsSoftwarePolicyAudit';
+import { managedSoftwarePolicyRefusal } from './securityAgents/managedSoftwarePolicyGuard';
 import { sanitizeThrownToolError } from './aiToolErrors';
 import { validateS3Details } from '../routes/backup/schemas';
+import {
+  isRecord,
+  isRedactedSecretMarker,
+  preserveSecretFields,
+  redactProviderConfig,
+  s3EndpointOriginChanged,
+} from './backupProviderConfigSecrets';
+import { findCiphertextShapedValue } from './backupProviderConfigSealing';
 import {
   resolvePeripheralPolicyDeviceIds,
   schedulePeripheralPolicyDevices,
 } from '../jobs/peripheralJobs';
+import { resolveWritableToolOrgId } from './aiToolWriteOrg';
+import type { ToolExecutionContext } from './toolExecutionContext';
+
+/**
+ * #6911: `manage_update_rings:create`, `manage_software_policies:create` and
+ * `manage_peripheral_policies:create` are user-owned on release
+ * (`USER_OWNED_RELEASE_ACTIONS` in `jobs/intentReleaseWorker.ts`) — each
+ * writes `auth.user.id` into a `created_by` `users` FK
+ * (`patch_policies` / `software_policies` / `peripheral_policies`). Under the
+ * rebuilt agent auth that id is an `aiAgents.id`, so refuse rather than write
+ * a row whose owner the worker and this handler's auth disagree about.
+ * Mirrors `aiToolsFleet.ts`'s `approverReleaseMismatch`.
+ */
+function approverReleaseMismatch(auth: AuthContext, context: ToolExecutionContext | undefined): boolean {
+  return !!context?.approverRelease && context.approverRelease.approverUserId !== auth.user.id;
+}
 
 /**
  * Defense-in-depth (#1317): the manage_update_rings AI tool writes `autoApprove`
@@ -64,6 +92,32 @@ function validateRingAutoApprove(
 }
 
 /**
+ * Validate the ring's per-app block/pin rules through the same shared schema
+ * the REST route uses (#8184): max 200, unique canonical keys, pin needs a
+ * version. Returns the parsed rules or an error string.
+ */
+function validateRingAppRules(raw: unknown): { value: unknown[] } | { error: string } {
+  const parsed = ringAppRulesSchema.safeParse(raw);
+  if (!parsed.success) {
+    return { error: parsed.error.issues[0]?.message ?? 'Invalid appRules configuration.' };
+  }
+  return { value: parsed.data };
+}
+
+/**
+ * Validate the ring's Windows feature-release policy through the shared schema
+ * the REST route uses: block | allow | pin (pin needs a known product and a
+ * release like 25H2). Returns the parsed value or an error string.
+ */
+function validateRingFeatureUpdates(raw: unknown): { value: RingFeatureUpdates } | { error: string } {
+  const parsed = ringFeatureUpdatesSchema.safeParse(raw);
+  if (!parsed.success) {
+    return { error: parsed.error.issues[0]?.message ?? 'Invalid featureUpdates configuration.' };
+  }
+  return { value: parsed.data };
+}
+
+/**
  * manage_backup_configs used to write `providerConfig` straight to the DB,
  * bypassing the REST routes' S3 endpoint validation entirely (the one
  * remaining save-time hole in Sentry BREEZE-P). Route s3 configs through the
@@ -74,12 +128,19 @@ function validateRingAutoApprove(
  * coercion of its own.
  */
 function resolveS3ProviderConfig(
-  raw: Record<string, unknown>
+  raw: Record<string, unknown>,
+  opts: { storedPrefix?: unknown } = {},
 ): { value: Record<string, unknown> } | { error: string } {
   const details: Record<string, unknown> = { ...raw };
-  const { error, region, endpoint } = validateS3Details(details);
+  const { error, region, endpoint, prefix, keepStoredPrefix } = validateS3Details(details, opts);
   if (error) return { error };
   if (region) details.region = region;
+  // #7081: persist the normalized key prefix; none is an absent key. An
+  // unchanged stored prefix is left as it is (see validateS3Details).
+  if (!keepStoredPrefix) {
+    if (prefix) details.prefix = prefix;
+    else delete details.prefix;
+  }
   if (endpoint) {
     details.endpoint = endpoint;
   } else {
@@ -93,11 +154,11 @@ function resolveS3ProviderConfig(
 
 type AiToolTier = 1 | 2 | 3 | 4;
 
-type Handler = (input: Record<string, unknown>, auth: AuthContext) => Promise<string>;
-
-function getOrgId(auth: AuthContext): string | null {
-  return auth.orgId ?? auth.accessibleOrgIds?.[0] ?? null;
-}
+type Handler = (
+  input: Record<string, unknown>,
+  auth: AuthContext,
+  context?: ToolExecutionContext,
+) => Promise<string>;
 
 function orgWhere(auth: AuthContext, orgIdCol: any): SQL | undefined {
   return auth.orgCondition(orgIdCol) ?? undefined;
@@ -151,9 +212,10 @@ function backupProfileWhere(auth: AuthContext): SQL | undefined {
 }
 
 function safeHandler(toolName: string, fn: Handler): Handler {
-  return async (input, auth) => {
+  return async (input, auth, context) => {
     try {
-      return await fn(input, auth);
+      // In a savepoint, or the error JSON below is lost to the commit (#11203).
+      return await (hasDbAccessContext() ? withDbTransaction(() => fn(input, auth, context)) : fn(input, auth, context));
     } catch (err: unknown) {
       const code = pgErrorCode(err);
       // Log BEFORE the pg-code early returns — those branches return without
@@ -202,14 +264,16 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
           gracePeriodHours: { type: 'number', description: 'Hours after deadline before reboot is forced (default: 4)' },
           categories: { type: 'array', items: { type: 'string' }, description: 'Patch categories to include (e.g. ["critical","important","security"])' },
           excludeCategories: { type: 'array', items: { type: 'string' }, description: 'Patch categories to exclude' },
+          appRules: { type: 'array', items: { type: 'object' }, description: '[{source:"third_party"|"custom"|"linux",packageId,action:"block"|"pin",pinnedVersion (pin),displayName?}]. Linux: apt/dnf name. 200 unique max; update replaces.' },
+          featureUpdates: { type: 'object', description: '{mode:"block"|"allow"|"pin", product:"windows-11"|"windows-10", targetVersion:"25H2"} (pin needs both). Default block. Pin sets WUfB target release.' },
           autoApprove: { type: 'object', description: "enabled, severities, deferralDays, thirdPartyApps, thirdPartyDeferralDays. Enabled needs severities or thirdPartyApps; omitted third-party fields persist." },
           enabled: { type: 'boolean', description: 'Whether ring is active (for update)' },
-          limit: { type: 'number', description: 'Max results for list (default 25)' },
+          limit: { type: 'number', description: 'Max results for list (default 25, max 100)' },
         },
         required: ['action'],
       },
     },
-    handler: safeHandler('manage_update_rings', async (input, auth) => {
+    handler: safeHandler('manage_update_rings', async (input, auth, context) => {
       const action = input.action as string;
 
       if (auth.scope === 'organization') {
@@ -261,6 +325,10 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
       }
 
       if (action === 'create') {
+        // #6911: user-owned on release — see approverReleaseMismatch.
+        if (approverReleaseMismatch(auth, context)) {
+          return JSON.stringify({ error: 'approver_auth_mismatch', action });
+        }
         if (!partnerId) return JSON.stringify({ error: 'Partner context required' });
         // Rings are partner-owned by construction — they govern patching for
         // every org under the partner (security review 2026-08-16 §1.1 #3).
@@ -279,6 +347,20 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
           autoApprove = validated.value;
         }
 
+        let appRules: unknown[] = [];
+        if (input.appRules != null) {
+          const validated = validateRingAppRules(input.appRules);
+          if ('error' in validated) return JSON.stringify({ error: validated.error });
+          appRules = validated.value;
+        }
+
+        let featureUpdates: RingFeatureUpdates = { mode: 'block' };
+        if (input.featureUpdates != null) {
+          const validated = validateRingFeatureUpdates(input.featureUpdates);
+          if ('error' in validated) return JSON.stringify({ error: validated.error });
+          featureUpdates = validated.value;
+        }
+
         const rows = await db.insert(patchPolicies).values({
           partnerId,
           kind: 'ring',
@@ -290,6 +372,8 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
           categories: (input.categories as string[]) ?? [],
           excludeCategories: (input.excludeCategories as string[]) ?? [],
           autoApprove,
+          appRules,
+          featureUpdates,
           createdBy: auth.user.id,
         }).returning();
         const ring = rows[0];
@@ -330,6 +414,16 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
           if ('error' in validated) return JSON.stringify({ error: validated.error });
           updates.autoApprove = validated.value;
         }
+        if (input.appRules != null) {
+          const validated = validateRingAppRules(input.appRules);
+          if ('error' in validated) return JSON.stringify({ error: validated.error });
+          updates.appRules = validated.value;
+        }
+        if (input.featureUpdates != null) {
+          const validated = validateRingFeatureUpdates(input.featureUpdates);
+          if ('error' in validated) return JSON.stringify({ error: validated.error });
+          updates.featureUpdates = validated.value;
+        }
         if (typeof input.enabled === 'boolean') updates.enabled = input.enabled;
 
         await db
@@ -359,7 +453,7 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
         properties: {
           action: { type: 'string', enum: ['list', 'get', 'create', 'update'], description: 'Action to perform' },
           policyId: { type: 'string', description: 'Software policy UUID (required for get/update)' },
-          ownerScope: { type: 'string', enum: ['organization', 'partner'], description: "Create ownership: organization (default, current org) or partner (all-org template; requires full partner org access)." },
+          ownerScope: { type: 'string', enum: ['organization', 'partner'], description: "Create ownership: organization (default; needs orgId unless one org accessible) or partner (all-org template; requires full partner org access)." },
           name: { type: 'string', description: 'Policy name (required for create)' },
           description: { type: 'string', description: 'Policy description' },
           mode: { type: 'string', enum: ['allowlist', 'blocklist', 'audit'], description: 'Policy mode (required for create)' },
@@ -367,18 +461,21 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
           enforceMode: { type: 'boolean', description: 'Whether to enforce (block/uninstall) or just alert (default: false)' },
           remediationOptions: { type: 'object', description: "Options: autoUninstall, notifyUser, gracePeriod, cooldownMinutes, maintenanceWindowOnly. autoInstall is forbidden here; arming installs needs a human with MFA." },
           isActive: { type: 'boolean', description: 'Active state (for update)' },
-          limit: { type: 'number', description: 'Max results for list (default 25)' },
+          limit: { type: 'number', description: 'Max results for list (default 25, max 100)' },
+          orgId: {
+            type: 'string',
+            description: 'Organization UUID that will own the new policy (create with ownerScope "organization" only). Required unless you can access exactly one organization.',
+          },
         },
         required: ['action'],
       },
     },
-    handler: safeHandler('manage_software_policies', async (input, auth) => {
+    handler: safeHandler('manage_software_policies', async (input, auth, context) => {
       const action = input.action as string;
       // Reads (list/get) are not gated by the site-ceiling — only create/update/delete.
       if (action !== 'list' && action !== 'get' && !canMutateOrgWideGovernance(auth)) {
         return JSON.stringify({ error: SITE_CEILING_WRITE_DENIED_MESSAGE });
       }
-      const orgId = getOrgId(auth);
 
       if (action === 'list') {
         const conditions: SQL[] = [];
@@ -419,6 +516,10 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
       }
 
       if (action === 'create') {
+        // #6911: user-owned on release — see approverReleaseMismatch.
+        if (approverReleaseMismatch(auth, context)) {
+          return JSON.stringify({ error: 'approver_auth_mismatch', action });
+        }
         // Ownership axis (#2126): partner-wide templates apply to every org
         // under the partner, so creation is gated on the same capability as
         // the HTTP route. The partner is derived from the caller's own token.
@@ -430,8 +531,9 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
           }
           owner = { orgId: null, partnerId: auth.partnerId };
         } else {
-          if (!orgId) return JSON.stringify({ error: 'Organization context required' });
-          owner = { orgId, partnerId: null };
+          const resolvedSoftwarePolicyOrg = resolveWritableToolOrgId(auth, typeof input.orgId === 'string' && input.orgId ? input.orgId : undefined);
+          if (!resolvedSoftwarePolicyOrg.orgId) return JSON.stringify({ error: resolvedSoftwarePolicyOrg.error ?? 'Organization context required' });
+          owner = { orgId: resolvedSoftwarePolicyOrg.orgId, partnerId: null };
         }
         if (!input.name) return JSON.stringify({ error: 'name is required' });
         if (!input.mode) return JSON.stringify({ error: 'mode is required (allowlist, blocklist, or audit)' });
@@ -492,6 +594,10 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
         if (existing.orgId === null && !canManagePartnerWidePolicies(auth)) {
           return JSON.stringify({ error: 'Modifying a partner-wide software policy requires full partner org access (orgAccess must be "all")' });
         }
+
+        // #6960: a generated (security_agents) policy is owned by its config policy.
+        const managed = await managedSoftwarePolicyRefusal(existing);
+        if (managed) return JSON.stringify(managed);
 
         // Contract-A D4: AI callers may never arm software installation.
         if (remediationOptionsArmsAutoInstall(input.remediationOptions)) {
@@ -559,18 +665,21 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
           action_type: { type: 'string', enum: ['allow', 'block', 'read_only', 'alert'], description: 'Action to take (required for create). Named action_type to avoid collision with action param.' },
           exceptions: { type: 'array', items: { type: 'object' }, description: 'Exception rules: [{ vendor?, product?, serialNumber?, allow: true, reason?, expiresAt? }]' },
           isActive: { type: 'boolean', description: 'Active state (for update)' },
-          limit: { type: 'number', description: 'Max results for list (default 25)' },
+          limit: { type: 'number', description: 'Max results for list (default 25, max 100)' },
+          orgId: {
+            type: 'string',
+            description: 'Organization UUID that will own the new policy (create only). Required unless you can access exactly one organization.',
+          },
         },
         required: ['action'],
       },
     },
-    handler: safeHandler('manage_peripheral_policies', async (input, auth) => {
+    handler: safeHandler('manage_peripheral_policies', async (input, auth, context) => {
       const action = input.action as string;
       // Reads (list/get) are not gated by the site-ceiling — only create/update/delete.
       if (action !== 'list' && action !== 'get' && !canMutateOrgWideGovernance(auth)) {
         return JSON.stringify({ error: SITE_CEILING_WRITE_DENIED_MESSAGE });
       }
-      const orgId = getOrgId(auth);
 
       if (action === 'list') {
         const conditions: SQL[] = [];
@@ -610,7 +719,13 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
       }
 
       if (action === 'create') {
-        if (!orgId) return JSON.stringify({ error: 'Organization context required' });
+        // #6911: user-owned on release — see approverReleaseMismatch.
+        if (approverReleaseMismatch(auth, context)) {
+          return JSON.stringify({ error: 'approver_auth_mismatch', action });
+        }
+        const resolvedPeripheralOrg = resolveWritableToolOrgId(auth, typeof input.orgId === 'string' && input.orgId ? input.orgId : undefined);
+        if (!resolvedPeripheralOrg.orgId) return JSON.stringify({ error: resolvedPeripheralOrg.error ?? 'Organization context required' });
+        const orgId = resolvedPeripheralOrg.orgId;
         if (!input.name) return JSON.stringify({ error: 'name is required' });
         if (!input.deviceClass) return JSON.stringify({ error: 'deviceClass is required (storage, all_usb, bluetooth, thunderbolt)' });
         if (!input.action_type) return JSON.stringify({ error: 'action_type is required (allow, block, read_only, alert)' });
@@ -696,9 +811,13 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
           profileId: { type: 'string', description: 'Backup profile UUID (required for get/update/delete)' },
           name: { type: 'string', description: 'Profile name (required for create)' },
           description: { type: 'string', description: 'Optional description' },
-          ownerScope: { type: 'string', enum: ['organization', 'partner'], description: 'create only: "organization" (default, current org) or "partner" ("all orgs" — requires full partner access)' },
+          ownerScope: { type: 'string', enum: ['organization', 'partner'], description: 'create only: "organization" (default; needs orgId unless you can access exactly one organization) or "partner" ("all orgs" — requires full partner access)' },
           selections: { type: 'object', description: 'Backup sources: file, system_image, mssql, hyperv. At least one enabled; file requires paths.' },
           isActive: { type: 'boolean', description: 'Active state' },
+          orgId: {
+            type: 'string',
+            description: 'Organization UUID that will own the new profile (create with ownerScope "organization" only). Required unless you can access exactly one organization.',
+          },
         },
         required: ['action'],
       },
@@ -763,9 +882,9 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
           }
           owner = { orgId: null, partnerId: auth.partnerId };
         } else {
-          const orgId = getOrgId(auth);
-          if (!orgId) return JSON.stringify({ error: 'Organization context required' });
-          owner = { orgId, partnerId: null };
+          const resolvedProfileOrg = resolveWritableToolOrgId(auth, typeof input.orgId === 'string' && input.orgId ? input.orgId : undefined);
+          if (!resolvedProfileOrg.orgId) return JSON.stringify({ error: resolvedProfileOrg.error ?? 'Organization context required' });
+          owner = { orgId: resolvedProfileOrg.orgId, partnerId: null };
         }
         const [profile] = await db
           .insert(backupProfiles)
@@ -819,7 +938,18 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
         if (!updated) {
           return JSON.stringify({ error: 'Backup profile not found or access denied' });
         }
-        return JSON.stringify({ success: true, profile: updated });
+        // W03 quorum QW6 (#6757): the approver saw only the new values, so
+        // return what was replaced — the change can be undone from here.
+        return JSON.stringify({
+          success: true,
+          profile: updated,
+          previous: {
+            name: existing.name,
+            description: existing.description,
+            selections: existing.selections,
+            isActive: existing.isActive,
+          },
+        });
       }
 
       if (action === 'delete') {
@@ -872,14 +1002,18 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
           configId: { type: 'string', description: 'Backup config UUID (required for get/update)' },
           name: { type: 'string', description: 'Config name (required for create)' },
           type: { type: 'string', enum: ['file', 'system_image', 'database', 'application'], description: 'Backup type (required for create)' },
-          provider: { type: 'string', enum: ['s3', 'azure_blob', 'google_cloud', 'backblaze', 'local'], description: 'Storage provider (required for create)' },
+          provider: { type: 'string', enum: ['s3', 'local'], description: 'Storage provider (required for create)' },
           providerConfig: { type: 'object', description: 'Provider settings. S3: { bucket, region, accessKey, secretKey, endpoint? }. Local: { path }' },
           schedule: { type: 'object', description: 'Schedule config: { frequency: "daily"|"weekly"|"monthly", time: "02:00", dayOfWeek?, dayOfMonth? }' },
           retention: { type: 'object', description: 'Retention config: { days: 30, versions: 5 }' },
           compression: { type: 'boolean', description: 'Enable compression (default: true)' },
           encryption: { type: 'boolean', description: 'Enable encryption (default: true)' },
           isActive: { type: 'boolean', description: 'Active state (for update)' },
-          limit: { type: 'number', description: 'Max results for list (default 25)' },
+          limit: { type: 'number', description: 'Max results for list (default 25, max 100)' },
+          orgId: {
+            type: 'string',
+            description: 'Organization UUID that will own the new backup config (create only). Required unless you can access exactly one organization.',
+          },
         },
         required: ['action'],
       },
@@ -890,7 +1024,16 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
       if (action !== 'list' && action !== 'get' && !canMutateOrgWideGovernance(auth)) {
         return JSON.stringify({ error: SITE_CEILING_WRITE_DENIED_MESSAGE });
       }
-      const orgId = getOrgId(auth);
+
+      if ((action === 'create' || action === 'update') && input.providerConfig) {
+        // Same refusal as the REST schema (routes/backup/schemas.ts): a value
+        // already in the stored encrypted format would be opened by the server
+        // as if it had sealed it itself.
+        const presealed = findCiphertextShapedValue(input.providerConfig);
+        if (presealed) {
+          return JSON.stringify({ error: `providerConfig.${presealed}: destination settings cannot contain values in the internal encrypted format` });
+        }
+      }
 
       if (action === 'list') {
         const conditions: SQL[] = [];
@@ -928,15 +1071,17 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
         const [config] = await db.select().from(backupConfigs).where(and(...conditions)).limit(1);
         if (!config) return JSON.stringify({ error: 'Backup config not found or access denied' });
         // Redact sensitive provider config fields
-        const safeConfig = { ...config, providerConfig: config.providerConfig ? { ...config.providerConfig as Record<string, unknown>, secretKey: undefined, accessKey: undefined, encryptionKey: undefined } : null };
+        const safeConfig = { ...config, providerConfig: config.providerConfig ? redactProviderConfig(config.providerConfig) : null };
         return JSON.stringify({ config: safeConfig });
       }
 
       if (action === 'create') {
-        if (!orgId) return JSON.stringify({ error: 'Organization context required' });
+        const resolvedConfigOrg = resolveWritableToolOrgId(auth, typeof input.orgId === 'string' && input.orgId ? input.orgId : undefined);
+        if (!resolvedConfigOrg.orgId) return JSON.stringify({ error: resolvedConfigOrg.error ?? 'Organization context required' });
+        const orgId = resolvedConfigOrg.orgId;
         if (!input.name) return JSON.stringify({ error: 'name is required' });
         if (!input.type) return JSON.stringify({ error: 'type is required (file, system_image, database, application)' });
-        if (!input.provider) return JSON.stringify({ error: 'provider is required (s3, azure_blob, google_cloud, backblaze, local)' });
+        if (!input.provider) return JSON.stringify({ error: 'provider is required (s3 or local)' });
         if (!input.providerConfig) return JSON.stringify({ error: 'providerConfig is required (provider-specific settings)' });
 
         let providerConfig = input.providerConfig as Record<string, unknown>;
@@ -946,19 +1091,35 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
           providerConfig = resolved.value;
         }
 
-        const rows = await db.insert(backupConfigs).values({
-          orgId,
-          name: input.name as string,
-          type: input.type as any,
-          provider: input.provider as any,
-          providerConfig: providerConfig as any,
-          schedule: (input.schedule as any) ?? null,
-          retention: (input.retention as any) ?? null,
-          compression: input.compression !== false,
-          encryption: input.encryption !== false,
-          isActive: input.isActive !== false,
-        }).returning();
-        const config = rows[0];
+        // The destination and its key record are written in one transaction.
+        // The history module is loaded on use: it pulls in storage code this
+        // tool registry does not otherwise need.
+        const { recordCredentialChange } = await import('./backupStorageCredentialHistory');
+        const config = await withDbTransaction(async () => {
+          const rows = await db.insert(backupConfigs).values({
+            orgId,
+            name: input.name as string,
+            type: input.type as any,
+            provider: input.provider as any,
+            providerConfig: providerConfig as any,
+            schedule: (input.schedule as any) ?? null,
+            retention: (input.retention as any) ?? null,
+            compression: input.compression !== false,
+            encryption: input.encryption !== false,
+            isActive: input.isActive !== false,
+          }).returning();
+          const created = rows[0];
+          if (created) {
+            // A key configured from now on has never been sent to a device.
+            await recordCredentialChange({
+              orgId,
+              configId: created.id,
+              previous: null,
+              next: { provider: created.provider, providerConfig: created.providerConfig },
+            });
+          }
+          return created;
+        });
         if (!config) return JSON.stringify({ error: 'Failed to create backup config' });
 
         return JSON.stringify({
@@ -975,7 +1136,9 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
         const oc = orgWhere(auth, backupConfigs.orgId);
         if (oc) conditions.push(oc);
 
-        const [existing] = await db.select().from(backupConfigs).where(and(...conditions)).limit(1);
+        // Locked: the key change recorded below compares against exactly this
+        // state, and a concurrent change waits for this one to commit.
+        const [existing] = await db.select().from(backupConfigs).where(and(...conditions)).limit(1).for('update');
         if (!existing) return JSON.stringify({ error: 'Backup config not found or access denied' });
 
         const updates: Record<string, unknown> = {
@@ -989,12 +1152,44 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
         if (typeof input.provider === 'string') updates.provider = input.provider;
         if (input.providerConfig) {
           const targetProvider = typeof input.provider === 'string' ? input.provider : existing.provider;
+          const incomingProviderConfig = input.providerConfig as Record<string, unknown>;
+          const existingProviderConfig = isRecord(existing.providerConfig) ? existing.providerConfig : {};
+
+          // Same origin-binding contract as credentialOriginBinding.ts: an S3
+          // endpoint change must not carry the stored access/secret key
+          // forward to a new destination without re-entering it.
           if (targetProvider === 's3') {
-            const resolved = resolveS3ProviderConfig(input.providerConfig as Record<string, unknown>);
+            const storedHasAccessKey = typeof existingProviderConfig.accessKey === 'string' && existingProviderConfig.accessKey.length > 0;
+            const storedHasSecretKey = typeof existingProviderConfig.secretKey === 'string' && existingProviderConfig.secretKey.length > 0;
+            if (
+              (storedHasAccessKey || storedHasSecretKey)
+              && s3EndpointOriginChanged(existingProviderConfig.endpoint, incomingProviderConfig.endpoint)
+            ) {
+              const hasFreshAccessKey = typeof incomingProviderConfig.accessKey === 'string'
+                && incomingProviderConfig.accessKey.length > 0
+                && !isRedactedSecretMarker(incomingProviderConfig.accessKey);
+              const hasFreshSecretKey = typeof incomingProviderConfig.secretKey === 'string'
+                && incomingProviderConfig.secretKey.length > 0
+                && !isRedactedSecretMarker(incomingProviderConfig.secretKey);
+              if (!hasFreshAccessKey || !hasFreshSecretKey) {
+                return JSON.stringify({ error: 'Changing the storage endpoint requires re-entering the access key and secret key' });
+              }
+            }
+          }
+
+          // Merge against the stored config the way the REST route does
+          // (preserveSecretFields) instead of replacing providerConfig
+          // wholesale — an endpoint-only or bucket-only update must not
+          // silently delete the stored credentials for fields it never
+          // mentioned.
+          const mergedProviderConfig = preserveSecretFields(incomingProviderConfig, existingProviderConfig) as Record<string, unknown>;
+
+          if (targetProvider === 's3') {
+            const resolved = resolveS3ProviderConfig(mergedProviderConfig, { storedPrefix: existingProviderConfig.prefix });
             if ('error' in resolved) return JSON.stringify({ error: resolved.error });
             updates.providerConfig = resolved.value;
           } else {
-            updates.providerConfig = input.providerConfig;
+            updates.providerConfig = mergedProviderConfig;
           }
         }
         if (input.schedule) updates.schedule = input.schedule;
@@ -1003,7 +1198,26 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
         if (typeof input.encryption === 'boolean') updates.encryption = input.encryption;
         if (typeof input.isActive === 'boolean') updates.isActive = input.isActive;
 
-        await db.update(backupConfigs).set(updates).where(eq(backupConfigs.id, existing.id));
+        const destinationChanged = updates.provider !== undefined || updates.providerConfig !== undefined;
+        const { recordCredentialChange } = destinationChanged
+          ? await import('./backupStorageCredentialHistory')
+          : { recordCredentialChange: null };
+        // The change and its key record are written in one transaction.
+        await withDbTransaction(async () => {
+          await db.update(backupConfigs).set(updates).where(eq(backupConfigs.id, existing.id));
+          if (recordCredentialChange) {
+            // A replaced key stays listed until there is evidence it was disabled.
+            await recordCredentialChange({
+              orgId: existing.orgId,
+              configId: existing.id,
+              previous: { provider: existing.provider, providerConfig: existing.providerConfig },
+              next: {
+                provider: (updates.provider as string | undefined) ?? existing.provider,
+                providerConfig: updates.providerConfig ?? existing.providerConfig,
+              },
+            });
+          }
+        });
         return JSON.stringify({ success: true, message: `Backup config "${existing.name}" updated` });
       }
 

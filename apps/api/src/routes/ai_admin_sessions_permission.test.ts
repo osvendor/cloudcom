@@ -1,4 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+// routes/ai.ts reaches the model registry (ticket-draft) -> candidateLoader,
+// which this file's partial schema mock does not cover. Not under test here.
+vi.mock('../services/aiModels/sessionModel', () => ({
+  resolveSessionTurn: vi.fn(),
+}));
 import { Hono } from 'hono';
 
 // SR5-09(b): GET /admin/sessions enumerates OTHER users' AI sessions and must be
@@ -9,6 +15,12 @@ import { Hono } from 'hono';
 type Perm = { resource: string; action: string };
 let currentAuth: any;
 
+// Topology M4-D2: the admin/session reads resolve the caller's pinned-site visibility.
+vi.mock('../services/topology/aiSessionAccess', () => ({
+  resolveTopologySessionVisibility: vi.fn(async () => ({ kind: 'all' })),
+  topologySessionAccessCondition: vi.fn(async () => undefined),
+  topologySessionCondition: vi.fn(() => undefined),
+}));
 vi.mock('../db', () => ({
   runOutsideDbContext: vi.fn((fn) => fn()),
   withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn()),
@@ -59,7 +71,6 @@ vi.mock('../services/aiCostTracker', () => ({
   getSessionHistory: vi.fn().mockResolvedValue([]),
   getUsageSummary: vi.fn(),
   updateBudget: vi.fn(),
-  recordUsage: vi.fn(),
 }));
 
 vi.mock('../services/streamingSessionManager', () => ({

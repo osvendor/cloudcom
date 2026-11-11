@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { buildPortalApiUrl, portalApi, publicApiPath } from './api';
+import { apiPost, buildPortalApiUrl, buildServerForwardHeaders, portalApi, publicApiPath } from './api';
 
 // Regression guard for the same-origin client API base (the deploy relies on it):
 // with PUBLIC_API_URL unset, the browser must issue RELATIVE /api/v1 requests so
@@ -57,6 +57,21 @@ describe('portalApi.getTicketForms request path', () => {
     expect(url).toContain('/portal/tickets/forms');
     expect(url).not.toContain('/portal/ticket-forms');
     expect(result.data).toEqual([]);
+  });
+});
+
+describe('portalApi remote-session ICE opt-in', () => {
+  afterEach(() => { vi.unstubAllGlobals(); });
+
+  it('opts in only for bootstrap, leaving status polls without credential minting', async () => {
+    const fetchMock = vi.fn().mockImplementation(async () => new Response(JSON.stringify({ session: {}, iceServers: [] }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    await portalApi.getRemoteSession('session', {}, true);
+    await portalApi.getRemoteSession('session');
+    const bootstrap = new URL(String(fetchMock.mock.calls[0][0]), 'https://portal.example.test');
+    const poll = new URL(String(fetchMock.mock.calls[1][0]), 'https://portal.example.test');
+    expect(bootstrap.pathname + bootstrap.search).toBe('/api/v1/portal/remote/sessions/session?includeIce=1');
+    expect(poll.pathname + poll.search).toBe('/api/v1/portal/remote/sessions/session');
   });
 });
 
@@ -354,6 +369,7 @@ describe('portalApi customer reports', () => {
       startedAt: '2026-09-02T12:00:00.000Z',
       completedAt: '2026-09-02T12:01:00.000Z',
       rowCount: 4,
+      csvAvailable: true,
       createdAt: '2026-09-02T12:00:00.000Z',
     };
     const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
@@ -452,5 +468,111 @@ describe('portalApi customer reports', () => {
       code: 'PORTAL_REPORT_NOT_GENERATED',
       statusCode: 404,
     });
+  });
+});
+
+// A refusal's structured reason (e.g. an autopay skip refused because the payment is
+// already processing) must reach the caller: the code alone is shared by other refusals.
+describe('error details', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('surfaces an error body\'s details separately from data', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      error: 'A payment is already processing', code: 'COLLECTION_IN_PROGRESS', details: { reason: 'payment_processing' },
+    }), { status: 409 })));
+    const result = await apiPost('/autopay/public/token/skip', {}, { redirectOnUnauthorized: false });
+    expect(result).toMatchObject({ code: 'COLLECTION_IN_PROGRESS', statusCode: 409, errorDetails: { reason: 'payment_processing' } });
+    expect(result.data).toBeUndefined();
+  });
+});
+
+describe('portalApi approvals (#8200)', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('getApprovals hits /portal/approvals, with ?status=pending when pendingOnly', async () => {
+    const fetchMock = vi.fn().mockImplementation(async () => new Response(JSON.stringify({ data: [] }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    await portalApi.getApprovals();
+    await portalApi.getApprovals({}, { pendingOnly: true });
+    expect(String(fetchMock.mock.calls[0][0])).toMatch(/\/portal\/approvals$/);
+    expect(String(fetchMock.mock.calls[1][0])).toMatch(/\/portal\/approvals\?status=pending$/);
+  });
+
+  it('approve and deny POST the decision body to the right path', async () => {
+    const fetchMock = vi.fn().mockImplementation(async () => new Response(JSON.stringify({ data: { status: 'approved' } }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const body = { revision: 3, signerName: 'Pat Doe', note: 'ok' };
+    await portalApi.approveApproval('abc', body);
+    await portalApi.denyApproval('abc', body);
+    expect(String(fetchMock.mock.calls[0][0])).toMatch(/\/portal\/approvals\/abc\/approve$/);
+    expect(String(fetchMock.mock.calls[1][0])).toMatch(/\/portal\/approvals\/abc\/deny$/);
+    expect(fetchMock.mock.calls[0][1].method).toBe('POST');
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual(body);
+  });
+});
+
+// #8972 W2: GET /portal/tickets/:id answers a merged tombstone with a TOP-LEVEL
+// `{ merged: true, mergedInto, mergedAt, survivorDeleted? }` and no `ticket`
+// key. Reading `body.ticket` alone turned it into "Ticket not found".
+describe('portalApi.getTicket — merged tombstone envelope', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const stub = (body: unknown) => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify(body), { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  };
+
+  it('returns the merged result when the survivor is readable', async () => {
+    stub({ merged: true, mergedInto: { id: 'surv-1', ticketNumber: 'HD0XTUGGVV' }, mergedAt: '2026-10-20T12:00:00.000Z' });
+    const result = await portalApi.getTicket('tomb-1');
+    expect(result.statusCode).toBe(200);
+    expect(result.data).toEqual({
+      merged: true,
+      mergedInto: { id: 'surv-1', ticketNumber: 'HD0XTUGGVV' },
+      mergedAt: '2026-10-20T12:00:00.000Z',
+      survivorDeleted: false,
+    });
+  });
+
+  it('carries survivorDeleted when the survivor was soft-deleted', async () => {
+    stub({ merged: true, mergedInto: null, mergedAt: '2026-10-20T12:00:00.000Z', survivorDeleted: true });
+    const result = await portalApi.getTicket('tomb-1');
+    expect(result.data).toEqual({ merged: true, mergedInto: null, mergedAt: '2026-10-20T12:00:00.000Z', survivorDeleted: true });
+  });
+
+  it('still returns body.ticket for a live ticket', async () => {
+    stub({ ticket: { id: 't-1', ticketNumber: 'T-1', subject: 'Printer', comments: [] } });
+    const result = await portalApi.getTicket('t-1');
+    expect(result.data).toMatchObject({ id: 't-1', subject: 'Printer' });
+    expect(result.data).not.toHaveProperty('merged');
+  });
+});
+
+// #9700: undici drops a caller-set Host, so forwarding the browser's Host never
+// reached the API — the API always sees the INTERNAL_API_URL host (api:3001),
+// which is what its FORCE_HTTPS internal-service exemption keys on. Keep the
+// header set honest about what actually crosses the hop.
+describe('buildServerForwardHeaders', () => {
+  it('forwards cookie and forwarded headers but never a Host', () => {
+    const request = new Request('https://portal.example.com/tickets', {
+      headers: {
+        cookie: 'session=abc',
+        host: 'portal.example.com',
+        'x-forwarded-host': 'portal.example.com',
+        'x-forwarded-proto': 'https',
+      },
+    });
+    const headers = buildServerForwardHeaders(request);
+    expect(headers.get('cookie')).toBe('session=abc');
+    expect(headers.get('x-forwarded-host')).toBe('portal.example.com');
+    expect(headers.get('x-forwarded-proto')).toBe('https');
+    expect(headers.has('host')).toBe(false);
   });
 });

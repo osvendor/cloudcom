@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, relative } from 'node:path';
 
 // Files allowed to read config_policy_feature_links DIRECTLY: they edit or
@@ -28,17 +28,41 @@ const DIRECT_READ_ALLOWLIST = new Set([
   // therefore reads the AUTHORED links for the policy and its parent and ranks
   // the attachments itself (closest attachment wins, per monitor).
   'services/monitors/monitorResolver.ts',
+  // The interval inherits field-level (own explicit interval else parent's).
+  // The effective view returns the child's monitors link whenever it exists,
+  // hiding the parent's interval. Other feature resolvers still use the view.
+  'routes/agents/helpers.ts',
   // #5289 — attachment CRUD and the "which policies attach this monitor" view:
   // the policy's own links, never an inherited projection of them.
   'routes/monitorDefinitions.ts',
   // #5289 — AI-tool mirror of routes/monitorDefinitions.ts above: every read
   // here is either reporting a monitor's own (authored) policy attachments
-  // (get_monitor) or the attach/detach read-modify-write path over the same
-  // authored rows (currentAttachmentItems, mirroring that file's currentItems).
+  // (get_monitor) or the attach/detach path over the same authored rows.
   // None of these resolve a policy's EFFECTIVE monitor set — that's
   // services/monitors/monitorResolver.ts's job — so there is no call site here
   // that should switch to the view.
   'services/aiToolsMonitors.ts',
+  // Tool Catalog W06 (#5221, Decision 16): isComplianceRemediationTarget asks
+  // "does ANY compliance rule in this partner name this Job's script" to keep
+  // S+R Jobs from converting. It must see every AUTHORED rule link (a superset
+  // of any one policy's effective set — a false positive only keeps a Job on
+  // the legacy engine); it resolves nothing per device and writes nothing.
+  'services/policyEvaluationService.ts',
+  // W05d boot-time system sweep: finds partners that still own an unretired
+  // legacy source row. It must see AUTHORED links, including the retired
+  // `alert_rule` / `monitoring` types the effective view no longer exposes.
+  'services/monitors/conversion/retirementSweep.ts',
+  // #6371 — the attach/detach read-modify-write shared by the two files above.
+  // It rewrites the policy's OWN link (items + its `inheritance`), so it must
+  // read that authored row; an inherited projection would write a parent's
+  // settings back onto the child.
+  'services/monitors/monitorAttachments.ts',
+
+  // Auto-quarantine stored authority: reads the execution_authority_* columns
+  // of ONE link by id — the link the effective view already chose as winner
+  // (an inherited row keeps the parent's link id). The envelope columns are not
+  // projected by the view, so the authored row is the only place to read them.
+  'services/securityScanQuarantineAuthority.ts',
 
   // #6370 W05c1 — conversion operates on the policy's OWN authored rows: it
   // retires them and re-homes their alerts. The effective view would hand back
@@ -51,17 +75,62 @@ const DIRECT_READ_ALLOWLIST = new Set([
   'services/monitors/conversion/loadSources.ts',
   'services/monitors/conversion/previewScope.ts',
 
+  // #6371 W05c2 — the hosted-sweep backlog counts UNRETIRED legacy rows per
+  // partner in one raw aggregate. It joins the authored links because that is
+  // where a legacy row physically hangs; the effective view would fold a
+  // parent's link into every child policy and count the same rows repeatedly.
+  'services/monitors/conversion/partnerBacklog.ts',
+
+  // The retirement sweep counts source rows attached to authored links. An
+  // effective projection would count a parent's source once for every child.
+  'services/monitors/conversion/retirementSweep.ts',
+
+  // #6373 W05e — network adoption appends to, and revert rewrites, the
+  // generated policy's OWN monitors link (items + `inheritance`) and resolves
+  // which authored policy owns an attachment. An inherited projection would
+  // write a parent's settings back onto the generated policy.
+  'services/monitors/conversion/networkChecks.ts',
+  'services/monitors/conversion/networkHistory.ts',
+
   // Authored link CRUD + listFeatureLinks (the editor's own-links view). This
   // file's own effective-config resolver imports the view instead.
   'services/configurationPolicy.ts',
   // Authored-vs-effective split inside: loadPolicyLocalPatchConfig reads the
   // view, the reference/ownership lookups stay authored. Each query is marked.
   'services/configPolicyPatching.ts',
+  // #6669 — ownership lookup only: joins a compliance rule to the ONE authored
+  // link it hangs on (feature_link_id) to find the policy that owns it, then
+  // checks that owner against the device's org. Through the view one link id
+  // maps to the parent AND every inheriting child, so the owner check would
+  // pick an arbitrary row. Which rules apply to a device is decided upstream by
+  // resolveComplianceRulesForDevice; this never decides what a device gets.
+  'services/configComplianceAlertBridge.ts',
+  // Ownership lookup only: resolves the ONE authored link a generated software
+  // policy hangs on (managed_by_link_id) to name the owning config policy in the
+  // 409 refusal. Through the view one link id maps to the parent AND every
+  // inheriting child, so the owner would be ambiguous. Never decides what a
+  // device gets.
+  'services/securityAgents/managedSoftwarePolicyGuard.ts',
+  // #6960 W02 — the generator's repair sweep re-derives each security_agents
+  // link's OWN generated policy: it enumerates and locks the AUTHORED link rows
+  // (one generated policy per authored link id). Through the view a parent's
+  // link would appear once per inheriting child. Never decides what a device
+  // gets — that is resolveSecurityAgentsLinkForDevice (the view).
+  'services/securityAgents/managedPolicyGenerator.ts',
+  // #6960 W02 — reads the ONE authored link a generated policy hangs on
+  // (managed_by_link_id), by primary key, for its per-vendor platform list.
+  // Which devices the policy reaches was already decided through the view.
+  'services/securityAgents/managedRuleApplicability.ts',
+  // Reason text only: once resolveComplianceAssignmentForDevice (the view) has
+  // decided a compliance rule no longer applies to a device, this looks up the
+  // ONE authored link the alert was raised under to say why (rule set renamed,
+  // feature removed, policy deleted or inactive). It never decides what a
+  // device gets.
+  'services/complianceAlertReconcile.ts',
   // Evidence naming for RCA output only — never decides what a device gets.
   'services/alertCorrelationRca.ts',
   // AI tools operate on a policy's own links (create/update/remove/list).
   'services/aiToolsConfigPolicy.ts',
-  'services/aiToolsFleet.ts',
   'services/aiToolsBackup.ts',
   // Approval-digest content pin for the AI tool `manage_policy_feature_link:update`.
   // It pins the CURRENT content of the one authored row the approver evaluated,
@@ -82,16 +151,31 @@ const DIRECT_READ_ALLOWLIST = new Set([
   // through the view a parent's link would read as "extra" drift on a child
   // policy nobody edited. Never decides what a device gets.
   'services/fleetDesign/drift.ts',
+  // Rollback checks the authored link's identity under an authorized policy
+  // before refusing restoration of retired formats. It never resolves config.
+  'services/fleetDesign/rollback.ts',
+  // W16 PR B (#6786): the four-eyes digest pins the AUTHORED monitors link of the
+  // policies this design's apply wrote, which is the row apply appends to and rollback
+  // rewrites. Neither writes a parent's link. Through the view, a child with no link
+  // would read its parent's, so a parent edit that changes nothing here would refuse a
+  // matching approval, and monitors resolve cumulatively anyway (monitorResolver.ts).
+  // Never decides what a device gets.
+  'services/fleetDesign/applyTargets.ts',
 
   // Standalone-entity delete guards and authored-link editors.
   'routes/updateRingsHelpers.ts',
+  // #8909 — ring delete/disable preflight lists the policies whose AUTHORED
+  // link names this ring, the same authored-row set updateRingsHelpers.ts's
+  // delete guard reads; an inherited projection would list child policies the
+  // tech never attached and could not detach.
+  'routes/updateRingLinkedPolicies.ts',
   'routes/policyManagement/helpers.ts',
   'routes/scripts.ts',
   'routes/backup/profiles.ts',
-  'routes/softwareInventory.ts',
+  // W12 (#6782): moved verbatim from routes/softwareInventory.ts (shared with the manage_software_inventory AI tool).
+  'services/softwareInventoryPolicy.ts',
   // Partner API exports the AUTHORED form; consumers derive the effective set.
   'routes/partnerApi/configuration.ts',
-  'scripts/migrateToConfigPolicies.ts',
 ]);
 
 const SRC = join(__dirname, '..');
@@ -112,10 +196,25 @@ function walk(dir: string, out: string[] = []): string[] {
 // a table reference — the trailing \b keeps it from matching, and the same goes
 // for any other `config_policy_feature_links_*` identifier.
 function readsBaseTable(src: string): boolean {
-  return /\bconfigPolicyFeatureLinks\b/.test(src) || /\bconfig_policy_feature_links\b/.test(src);
+  // Documentation naming a table does not constitute a direct read.
+  const code = src.replace(/^\s*\/\/.*$/gm, '');
+  return /\bconfigPolicyFeatureLinks\b/.test(code) || /\bconfig_policy_feature_links\b/.test(code);
 }
 
 describe('feature-link readers contract', () => {
+  it('removes the one-shot legacy migration script', () => {
+    expect(existsSync(join(SRC, 'scripts/migrateToConfigPolicies.ts'))).toBe(false);
+  });
+
+  it('scripts cannot recreate retired config-policy alert rules', () => {
+    // Retirement removed the last script, so a checkout may have no directory.
+    const scripts = join(SRC, 'scripts');
+    const writers = (existsSync(scripts) ? walk(scripts) : []).filter((file) =>
+      /(?:insert\s*\(\s*configPolicyAlertRules\b|INSERT\s+INTO\s+config_policy_alert_rules\b)/i.test(readFileSync(file, 'utf8'))
+    );
+    expect(writers.map((file) => relative(SRC, file))).toEqual([]);
+  });
+
   it('only allowlisted files read config_policy_feature_links directly', () => {
     const offenders: string[] = [];
     for (const file of walk(SRC)) {
@@ -179,7 +278,9 @@ describe('feature-link readers contract', () => {
     // authored table and the file-level check would stay green.
     const MUST_USE_VIEW: Array<{ file: string; fn: string }> = [
       { file: 'jobs/patchSchedulerWorker.ts', fn: 'scanAndCreateJobs' },
-      { file: 'jobs/backupWorker.ts', fn: 'processCheckSchedules' },
+      // #6597: the scheduled sweep's org enumeration moved out of
+      // processCheckSchedules into its own short-context helper.
+      { file: 'jobs/backupWorker.ts', fn: 'loadScheduledBackupOrgIds' },
       { file: 'jobs/automationWorker.ts', fn: 'processTriggerConfigPolicySchedule' },
       { file: 'services/configPolicyPatching.ts', fn: 'loadPolicyLocalPatchConfig' },
       { file: 'services/automationRuntime.ts', fn: 'resolveConfigPolicyAutomationContext' },

@@ -1,9 +1,11 @@
 import '@/lib/i18n';
 import { useTranslation } from 'react-i18next';
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, type ReactNode } from 'react';
 import { Bot, Coins, DollarSign, Flag, MessageSquare, Zap, Loader2 } from 'lucide-react';
 import { fetchWithAuth } from '../../stores/auth';
 import { useOrgStore } from '../../stores/orgStore';
+import AiUsageBreakdown from './aiModels/AiUsageBreakdown';
+import BuyCreditsLink from '../ai/BuyCreditsLink';
 import { formatDate, formatDateTime } from '@/lib/dateTimeFormat';
 import { formatCurrency, formatNumber } from '@/lib/i18n/format';
 import {
@@ -80,6 +82,7 @@ const BUDGET_FIELD_LABEL_KEYS: Record<AiBudgetField, string> = {
   messagesPerHourPerOrg: 'aiUsagePage.msgsHrPerOrg',
   approvalMode: 'aiUsagePage.approvalMode',
   alertThresholdPercents: 'aiUsagePage.alertThresholds',
+  toolRateLimitMultiplier: 'aiUsagePage.toolRateLimitMultiplier',
 };
 
 const APPROVAL_MODE_LABEL_KEYS: Record<string, string> = {
@@ -186,6 +189,25 @@ export default function AiUsagePage() {
 
   const formatTokens = (n: number) => n >= 1_000_000 ? `${formatNumber(n / 1_000_000, { minimumFractionDigits: 1, maximumFractionDigits: 1 })}M` : n >= 1_000 ? `${formatNumber(n / 1_000, { minimumFractionDigits: 1, maximumFractionDigits: 1 })}K` : formatNumber(n);
 
+  /**
+   * A fired threshold survives raising or removing the budget it fired
+   * against — the alert row is history, not a live gauge. Sweep E8: this
+   * showed "80% monthly alert sent" while the effective monthly budget read
+   * "No limit". Hide a rung once its period's CURRENT effective budget is
+   * confirmed null (no limit); `effectiveBudget === null` just means it
+   * hasn't loaded yet (or there's no org context), so those rungs stay
+   * visible rather than flickering off and back on.
+   */
+  const budgetForPeriod = (period: string): number | null | undefined => {
+    if (!effectiveBudget) return undefined;
+    if (period === 'monthly') return effectiveBudget.monthlyBudgetCents;
+    if (period === 'daily') return effectiveBudget.dailyBudgetCents;
+    return undefined;
+  };
+  const visibleFiredRungs = (usage?.alerts?.fired ?? []).filter(
+    (f) => budgetForPeriod(f.period) !== null,
+  );
+
   return (
     <div className="space-y-6">
       <div>
@@ -210,24 +232,24 @@ export default function AiUsagePage() {
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <StatCard
           icon={DollarSign}
-          label="Today's Cost"
+          label={t('aiUsagePage.todaysCost')}
           value={formatCost(usage?.daily.totalCostCents ?? 0)}
           sub={usage?.budget?.dailyBudgetCents ? t('aiUsagePage.ofLimit', { limit: formatCost(usage.budget.dailyBudgetCents) }) : undefined}
         />
         <StatCard
           icon={DollarSign}
-          label="Monthly Cost"
+          label={t('aiUsagePage.monthlyCost')}
           value={formatCost(usage?.monthly.totalCostCents ?? 0)}
           sub={usage?.budget?.monthlyBudgetCents ? t('aiUsagePage.ofLimit', { limit: formatCost(usage.budget.monthlyBudgetCents) }) : undefined}
         />
         <StatCard
           icon={MessageSquare}
-          label="Messages Today"
+          label={t('aiUsagePage.messagesToday')}
           value={String(usage?.daily.messageCount ?? 0)}
         />
         <StatCard
           icon={Zap}
-          label="Tokens This Month"
+          label={t('aiUsagePage.tokensThisMonth')}
           value={formatTokens((usage?.monthly.inputTokens ?? 0) + (usage?.monthly.outputTokens ?? 0))}
           sub={t('aiUsagePage.tokensInOut', {
             input: formatTokens(usage?.monthly.inputTokens ?? 0),
@@ -239,13 +261,14 @@ export default function AiUsagePage() {
             icon={Coins}
             label={t('aiUsagePage.creditsRemaining')}
             value={formatNumber(usage.credits.remaining)}
+            action={<BuyCreditsLink className="mt-1 inline-block text-xs font-medium text-primary underline underline-offset-2 hover:opacity-80" />}
           />
         )}
       </div>
 
-      {usage?.alerts?.fired?.length ? (
+      {visibleFiredRungs.length ? (
         <p data-testid="ai-budget-fired-rungs" className="text-xs text-muted-foreground">
-          {usage.alerts.fired.map((f) => {
+          {visibleFiredRungs.map((f) => {
             const periodKey = PERIOD_LABEL_KEYS[f.period as keyof typeof PERIOD_LABEL_KEYS];
             return t('aiUsagePage.firedRung', {
               pct: f.thresholdPct,
@@ -319,6 +342,8 @@ export default function AiUsagePage() {
         </p>
       )}
 
+      <AiUsageBreakdown orgId={currentOrgId ?? null} />
+
       {/* Session history */}
       <div className="rounded-lg border bg-card">
         <div className="border-b px-6 py-4 flex items-center justify-between">
@@ -390,11 +415,13 @@ export default function AiUsagePage() {
   );
 }
 
-function StatCard({ icon: Icon, label, value, sub }: {
+function StatCard({ icon: Icon, label, value, sub, action }: {
   icon: typeof Bot;
   label: string;
   value: string;
   sub?: string;
+  /** Optional trailing control (renders nothing when the node itself does). */
+  action?: ReactNode;
 }) {
   return (
     <div className="rounded-lg border bg-card p-5">
@@ -404,6 +431,7 @@ function StatCard({ icon: Icon, label, value, sub }: {
       </div>
       <p className="mt-2 text-2xl font-bold">{value}</p>
       {sub && <p className="text-xs text-muted-foreground mt-0.5">{sub}</p>}
+      {action}
     </div>
   );
 }

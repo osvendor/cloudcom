@@ -27,6 +27,9 @@ vi.mock('../db', () => {
       where: () => chain,
       orderBy: () => chain,
       limit: () => chain,
+      // notificationChannels + notificationChannelConfigs reads (#6379) chain
+      // .leftJoin() right after .from().
+      leftJoin: () => chain,
       then: (resolve: (value: unknown) => unknown, reject?: (e: unknown) => unknown) =>
         Promise.resolve(selectQueue.shift() ?? []).then(resolve, reject)
     };
@@ -156,6 +159,26 @@ const DEFAULT_ROW_C1 = {
   conditions: {}, channelIds: ['aaaaaaaa-0000-4000-8000-000000000013'], enabled: true, escalationPolicyId: null, isDefault: true,
 };
 
+describe('processAlertNotifications missing alert row (#10926)', () => {
+  it('logs a structured warning instead of returning silently when the alert row is not visible', async () => {
+    // No alert row: the job ran before the inserting transaction committed,
+    // or the alert was deleted. Either way nothing is sent, and it must show.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const result = await processAlertNotifications({ type: 'process-alert', alertId: 'alert-missing' });
+
+      expect(result).toEqual({ queued: 0, inAppSent: false, durationMs: expect.any(Number) });
+      expect(sendInAppNotificationMock).not.toHaveBeenCalled();
+      expect(queueAddBulkMock).not.toHaveBeenCalled();
+      const line = warn.mock.calls.find(([first]) => String(first).includes('process-alert'));
+      expect(line, 'a warning naming process-alert').toBeDefined();
+      expect(JSON.parse(String(line![1]))).toEqual({ errorId: 'PROCESS_ALERT_ROW_NOT_FOUND', alertId: 'alert-missing' });
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});
+
 describe('processAlertNotifications status guard (a)', () => {
   it('no-ops (no addBulk, no in-app send lookups) when the loaded alert is resolved', async () => {
     selectQueue.push([makeAlert({ status: 'resolved' })]);
@@ -261,8 +284,9 @@ describe('scheduleEscalation job options (carried Task 8 review handoff)', () =>
     selectQueue.push(
       [makeAlert({ status: 'active', ruleId: 'rule-1' })], // alert
       [{ id: 'device-1', displayName: 'Server-1' }], // device
-      [{ overrideSettings: { notificationChannelIds: ['aaaaaaaa-0000-4000-8000-000000000013'], escalationPolicyId: 'policy-1' } }], // rule
+      [], // No compiled monitor identity.
       ORG_LOOKUP, ORG_LOOKUP,
+      [{ ...DEFAULT_ROW_C1, escalationPolicyId: 'policy-1' }],
       [{ id: 'aaaaaaaa-0000-4000-8000-000000000013', type: 'webhook', config: webhookConfig }], // validChannels (baseline)
       [{ id: 'policy-1', orgId: 'org-1', partnerId: null, steps: [{ delayMinutes: 5, channelIds: ['aaaaaaaa-0000-4000-8000-000000000013'] }] }], // escalation policy
       [{ id: 'aaaaaaaa-0000-4000-8000-000000000013', type: 'webhook', config: webhookConfig }] // validChannels (escalation)
@@ -270,7 +294,21 @@ describe('scheduleEscalation job options (carried Task 8 review handoff)', () =>
 
     await processAlertNotifications({ type: 'process-alert', alertId: 'alert-1' });
 
-    expect(queueAddMock).toHaveBeenCalledTimes(1);
+    // The send, then the occurrence's alert.escalated job (#10565), which gets
+    // the same retry/removal shape so a failed publish cannot pin its jobId.
+    expect(queueAddMock).toHaveBeenCalledTimes(2);
+    expect(queueAddMock.mock.calls[1]).toEqual([
+      'escalation-event',
+      { type: 'escalation-event', alertId: 'alert-1', escalationStep: 1, escalationPolicyId: 'policy-1' },
+      {
+        delay: 5 * 60 * 1000,
+        jobId: 'escalation-alert-1-step1-event',
+        attempts: 3,
+        backoff: { type: 'exponential', delay: 30_000 },
+        removeOnComplete: true,
+        removeOnFail: { age: 3600 },
+      },
+    ]);
     expect(webhookTotalAttemptsMock).toHaveBeenCalledTimes(2);
     expect(webhookTotalAttemptsMock).toHaveBeenNthCalledWith(1, webhookConfig);
     expect(webhookTotalAttemptsMock).toHaveBeenNthCalledWith(2, webhookConfig);
@@ -350,8 +388,9 @@ describe('scheduleEscalation failed-job recovery (same exposure as the baseline 
     selectQueue.push(
       [makeAlert({ status: 'active', ruleId: 'rule-1' })], // alert
       [{ id: 'device-1', displayName: 'Server-1' }], // device
-      [{ overrideSettings: { notificationChannelIds: ['aaaaaaaa-0000-4000-8000-000000000013'], escalationPolicyId: 'policy-1' } }], // rule
+      [], // No compiled monitor identity.
       ORG_LOOKUP, ORG_LOOKUP,
+      [{ ...DEFAULT_ROW_C1, escalationPolicyId: 'policy-1' }],
       [{ id: 'aaaaaaaa-0000-4000-8000-000000000013' }], // validChannels (baseline)
       [{ id: 'policy-1', orgId: 'org-1', partnerId: null, steps: [{ delayMinutes: 5, channelIds: ['aaaaaaaa-0000-4000-8000-000000000013'] }] }], // escalation policy
       [{ id: 'aaaaaaaa-0000-4000-8000-000000000013' }] // validChannels (escalation)

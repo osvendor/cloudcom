@@ -54,6 +54,19 @@ const PARTNER_API_NON_GET_ROUTE_ALLOWLIST: readonly string[] = [
   'POST /contracts/:id/lines',
   'PATCH /contracts/:id/lines/:lineId',
   'DELETE /contracts/:id/lines/:lineId',
+  // Partner API tickets (wave 3). Gated on opt-in tickets:write; every write
+  // goes through ticketService with a 'service_principal' actor. No delete,
+  // restore, move-org, bulk, attachments or time entries — those stay human.
+  'POST /tickets', // supports X-Idempotency-Key
+  'PATCH /tickets/:id',
+  'POST /tickets/:id/status',
+  'POST /tickets/:id/assign',
+  'POST /tickets/:id/comments', // supports X-Idempotency-Key
+  // Opt-in alerts:write; CAS, idempotent; no suppress/dismiss/delete/bulk.
+  'POST /alerts/:id/acknowledge',
+  'POST /alerts/:id/resolve',
+  'PUT /alerts/:id/external-ticket',
+  'DELETE /alerts/:id/external-ticket',
 ];
 
 describe('partner API write surface', () => {

@@ -12,11 +12,15 @@ import { navigateTo } from '@/lib/navigation';
 import { getJwtClaims } from '@/lib/authScope';
 import { runAction, handleActionError } from '@/lib/runAction';
 import { cloneScript } from '@/lib/api/scripts';
+import { draftPrompt, takeScriptDraft } from '@/lib/scriptDraftHandoff';
+import { useScriptAiStore } from '@/stores/scriptAiStore';
 import Breadcrumbs from '../layout/Breadcrumbs';
 // Initializes the shared i18next singleton. Islands hydrate independently, so
 // an island that hydrates before whichever other island happens to pull i18n in
 // would otherwise render raw keys (and mismatch the SSR markup).
 import '../../lib/i18n';
+import { useStableT } from '@/lib/i18n/useStableT';
+import { usePageItemName } from '../layout/usePageItemName';
 
 type ScriptEditPageProps = {
   scriptId?: string;
@@ -30,6 +34,7 @@ type ScriptScope = {
 
 export default function ScriptEditPage({ scriptId }: ScriptEditPageProps) {
   const { t } = useTranslation('scripts');
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   const [script, setScript] = useState<ScriptFormValues | null>(null);
   const [scriptScope, setScriptScope] = useState<ScriptScope | null>(null);
   const [loading, setLoading] = useState(!!scriptId);
@@ -38,6 +43,13 @@ export default function ScriptEditPage({ scriptId }: ScriptEditPageProps) {
   const [duplicating, setDuplicating] = useState(false);
 
   const isNew = !scriptId;
+  // Read-once hand-off from a research draft request; new scripts only.
+  const [draft] = useState(() => (!scriptId ? takeScriptDraft() : null));
+  useEffect(() => {
+    if (!draft) return;
+    useScriptAiStore.getState().openPanel();
+    useScriptAiStore.getState().setDraftInput(draftPrompt(draft));
+  }, [draft]);
   const { organizations } = useOrgStore();
   const { scope: jwtScope } = getJwtClaims();
 
@@ -53,7 +65,7 @@ export default function ScriptEditPage({ scriptId }: ScriptEditPageProps) {
           void navigateTo('/login', { replace: true });
           return;
         }
-        throw new Error(t('scriptEditPage.errors.fetch'));
+        throw new Error(stableT('scriptEditPage.errors.fetch'));
       }
       const data = await response.json();
       const scriptData = data.script ?? data;
@@ -86,11 +98,11 @@ export default function ScriptEditPage({ scriptId }: ScriptEditPageProps) {
         isSystem: scriptData.isSystem ?? false,
       });
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('scriptEditPage.errors.generic'));
+      setError(err instanceof Error ? err.message : stableT('scriptEditPage.errors.generic'));
     } finally {
       setLoading(false);
     }
-  }, [scriptId, t]);
+  }, [scriptId, stableT]);
 
   useEffect(() => {
     fetchScript();
@@ -197,6 +209,8 @@ export default function ScriptEditPage({ scriptId }: ScriptEditPageProps) {
     }
   };
 
+  usePageItemName(script?.name);
+
   if (loading) {
     return (
       <div className="flex items-center justify-center py-12">
@@ -237,11 +251,12 @@ export default function ScriptEditPage({ scriptId }: ScriptEditPageProps) {
         { label: t('scriptEditPage.breadcrumb.scripts'), href: '/scripts' },
         { label: isNew ? t('scriptEditPage.breadcrumb.new') : (script?.name || t('scriptEditPage.breadcrumb.edit')) }
       ]} />
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-4">
+      <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+        <div className="flex min-w-0 flex-wrap items-center gap-4">
           <a
             href="/scripts"
-            className="flex h-10 w-10 items-center justify-center rounded-md border hover:bg-muted"
+            className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md border hover:bg-muted"
+            aria-label={t('scriptEditPage.actions.backToScripts')}
           >
             <ArrowLeft className="h-5 w-5" />
           </a>
@@ -258,7 +273,7 @@ export default function ScriptEditPage({ scriptId }: ScriptEditPageProps) {
           )}
         </div>
         {!isNew && (
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <button
               type="button"
               onClick={() => void handleDuplicate()}
@@ -290,7 +305,11 @@ export default function ScriptEditPage({ scriptId }: ScriptEditPageProps) {
       <ScriptForm
         onSubmit={handleSubmit}
         onCancel={handleCancel}
-        defaultValues={script || undefined}
+        defaultValues={script || (draft ? {
+          name: draft.title,
+          language: draft.language,
+          osTypes: draft.language === 'bash' ? ['linux', 'macos'] : draft.language === 'python' ? ['windows', 'linux', 'macos'] : ['windows'],
+        } : undefined)}
         submitLabel={isNew ? t('scriptEditPage.actions.create') : t('scriptEditPage.actions.saveChanges')}
         loading={submitting}
         isNew={isNew}

@@ -6,12 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
+
+	"github.com/breeze-rmm/agent/internal/procspawn"
 )
 
 const plistPath = "/Library/LaunchAgents/com.breeze.helper.plist"
@@ -36,7 +37,7 @@ func uninstallPackage() error {
 }
 
 // installPackage mounts the DMG, copies the .app bundle, and unmounts.
-func installPackage(dmgPath, _ string) error {
+func installPackage(dmgPath, _, _ string) error {
 	// Mount the DMG to a temp mount point
 	mountPoint, err := os.MkdirTemp("", "breeze-helper-mount-")
 	if err != nil {
@@ -44,11 +45,11 @@ func installPackage(dmgPath, _ string) error {
 	}
 	defer os.RemoveAll(mountPoint)
 
-	if out, err := exec.Command("hdiutil", "attach", dmgPath, "-mountpoint", mountPoint, "-nobrowse", "-noautoopen", "-quiet").CombinedOutput(); err != nil {
+	if out, err := procspawn.Command("hdiutil", "attach", dmgPath, "-mountpoint", mountPoint, "-nobrowse", "-noautoopen", "-quiet").CombinedOutput(); err != nil {
 		return fmt.Errorf("mount dmg: %w (output: %s)", err, strings.TrimSpace(string(out)))
 	}
 	defer func() {
-		if out, err := exec.Command("hdiutil", "detach", mountPoint, "-quiet").CombinedOutput(); err != nil {
+		if out, err := procspawn.Command("hdiutil", "detach", mountPoint, "-quiet").CombinedOutput(); err != nil {
 			log.Warn("failed to detach dmg", "mountpoint", mountPoint, "error", err.Error(), "output", strings.TrimSpace(string(out)))
 		}
 	}()
@@ -64,7 +65,7 @@ func installPackage(dmgPath, _ string) error {
 		return fmt.Errorf("remove old app: %w", err)
 	}
 
-	if out, err := exec.Command("cp", "-R", srcApp, destAppPath).CombinedOutput(); err != nil {
+	if out, err := procspawn.Command("cp", "-R", srcApp, destAppPath).CombinedOutput(); err != nil {
 		return fmt.Errorf("copy app: %w (output: %s)", err, strings.TrimSpace(string(out)))
 	}
 
@@ -135,20 +136,17 @@ func spawnWithConfig(binaryPath, sessionKey, configPath string) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("lookup uid %s: %w", sessionKey, err)
 	}
-	gid, err := strconv.ParseUint(u.Gid, 10, 32)
-	if err != nil {
-		return 0, fmt.Errorf("parse gid %q: %w", u.Gid, err)
-	}
 
-	cmd := exec.Command(binaryPath, "--config", configPath)
+	cmd := procspawn.Command(binaryPath, "--config", configPath)
 	cmd.Dir = filepath.Dir(binaryPath)
 	if os.Geteuid() == 0 && uint32(uid) != uint32(os.Geteuid()) {
-		cmd.SysProcAttr = &syscall.SysProcAttr{
-			Credential: &syscall.Credential{
-				Uid: uint32(uid),
-				Gid: uint32(gid),
-			},
+		// spawnCredential carries the user's supplementary groups (notably
+		// breeze) across the drop; see #8398.
+		cred, err := spawnCredential(u)
+		if err != nil {
+			return 0, fmt.Errorf("build credential for uid %s: %w", sessionKey, err)
 		}
+		cmd.SysProcAttr = &syscall.SysProcAttr{Credential: cred}
 	}
 	cmd.Env = append(os.Environ(),
 		"HOME="+u.HomeDir,

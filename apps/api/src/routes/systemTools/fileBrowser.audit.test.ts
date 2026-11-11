@@ -33,6 +33,9 @@ vi.mock('../../middleware/auth', () => ({
     await next();
   },
   requireScope: () => async (_c: unknown, next: () => Promise<void>) => next(),
+  // The scripts:execute gate on upload/copy/move is covered by
+  // fileWriteRequiresScriptsExecute.test.ts against the real router.
+  requirePermission: () => async (_c: unknown, next: () => Promise<void>) => next(),
 }));
 
 vi.mock('../../services/commandQueue', () => ({
@@ -57,6 +60,7 @@ vi.mock('../../services/auditService', () => ({
 
 vi.mock('./helpers', () => ({
   getDeviceWithOrgAndSiteCheck: getDeviceMock,
+  requireDevicesExecute: vi.fn().mockResolvedValue(true),
   SITE_ACCESS_DENIED: siteAccessDenied,
 }));
 

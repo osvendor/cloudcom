@@ -7,10 +7,14 @@
  * - execution of automation runs
  */
 
+import { captureException } from '../services/sentry';
+import { recordAlertDeviceConsumerSkipped } from '../services/alertDeviceConsumerMetrics';
 import { Job, Queue, Worker } from 'bullmq';
 import { and, eq, isNull, or } from 'drizzle-orm';
+import { groupOwnerMatchesMembershipOrg } from '../services/deviceGroupOwnership';
 import * as dbModule from '../db';
 import {
+  automationRuns,
   automations,
   configPolicyAutomations,
   configPolicyEffectiveFeatureLinks,
@@ -24,13 +28,16 @@ import {
 import { type BreezeEvent } from '../services/eventBus';
 import {
   type AutomationTrigger,
+  type AutomationTargetDiagnostics,
   type AutomationTriggerContext,
+  checkAutomationTargetsWithinSiteScope,
   createAutomationRunRecord,
   executeAutomationRun,
   executeConfigPolicyAutomationRun,
   formatScheduleTriggerKey,
   isCronDue,
   normalizeAutomationTrigger,
+  resolveAutomationTargetDeviceIds,
 } from '../services/automationRuntime';
 import {
   scanScheduledAutomations,
@@ -47,6 +54,36 @@ import { automationQueueJobDataSchema, type AutomationAssignmentLevel, type Auto
 import { attachWorkerObservability } from './workerObservability';
 import { policyWorkflowApplies } from '../services/monitors/conversion/workflows';
 import { recordEpisodeResponse } from '../services/monitors/episodeService';
+import { admitSubjectResponse, drainSubjectResponseOutbox } from '../services/subjectResponseOutbox';
+import { getUserPermissions, canAccessSite } from '../services/permissions';
+import { writeAuditEvent, requestLikeFromSnapshot } from '../services/auditEvents';
+import { resolveExecutionSafeGroupIds, auditRefusedExecutionGroups } from '../services/executionTargetGating';
+import { notHoldingOrgCondition } from '../services/unassignedPool/selectorPredicate';
+import { isUnassignedPoolOrgType } from '../services/unassignedPool/orgType';
+import { occurrenceKey } from '@breeze/shared';
+import {
+  OccurrenceClaimedError,
+  claimOccurrence,
+  currentConversionForAutomation,
+  eventInstant,
+  eventOccurrenceKey,
+  legacyPrefers,
+  loadSwitchedConvertedAutomations,
+  reportOccurrenceAnomaly,
+  scheduleInstantFromSlotKey,
+  switchedConvertedAutomationCondition,
+  type ClaimExisting,
+  type ConversionStateView,
+  type ShadowFanoutView,
+} from '../services/flows/conversion/claims';
+import type { ShadowRunTrigger } from '../services/flows/conversion/shadow';
+
+/**
+ * #5221 B4 — the shadow hooks load on first use: only a row with a shadow
+ * conversion ever reaches them, so the worker (and every suite that mocks its
+ * DB and schema partially) never loads the converter's read path otherwise.
+ */
+const loadShadow = () => import('../services/flows/conversion/shadow');
 
 const { db } = dbModule;
 const runWithSystemDbAccess = async <T>(fn: () => Promise<T>): Promise<T> => {
@@ -106,10 +143,10 @@ function normalizePayload(value: unknown): Record<string, unknown> {
 const TRIGGER_SEVERITIES = ['critical', 'high', 'medium', 'low', 'info'] as const;
 
 /**
- * There are SIX publishers of `alert.triggered` with heterogeneous payloads
- * (alertService.ts:155 and :706, automationRuntime.ts:1303, networkBaseline.ts:681,
- * warrantyAlertEvaluator.ts:277, metricAnomalyPromotion.ts:278) — some omit `ruleId`
- * entirely, and severity is not guaranteed to be one of the five literals. An
+ * `alert.triggered` comes from many producers with heterogeneous payloads (the
+ * alert outbox for createAlert / createSourcedAlert / createAutomationStyleAlert
+ * envelopes, offline effects, topology and network-isolation alerts) — some
+ * omit `ruleId` entirely, and severity is not guaranteed to be one of the five literals. An
  * out-of-enum value passed straight through would fail `automationTriggerContextSchema`
  * at the execute-run DEQUEUE boundary and dead-letter the whole run, so coerce
  * anything unrecognised to null here instead.
@@ -371,10 +408,19 @@ async function processScanSchedules(_scanAt: string): Promise<{ due: number }> {
     .select()
     .from(automations)
     .where(eq(automations.enabled, true));
+  // #5221 B2 (Decision 6) — legacy keeps loading SWITCHED rows (the switch
+  // disabled them), for the occurrences it still prefers: those before
+  // switch_at. A row disabled any other way is never read here.
+  const switchedRows = await loadSwitchedConvertedAutomations(db);
+  const slotInstant = new Date(Math.floor(scanDate.getTime() / 60_000) * 60_000);
 
   let due = 0;
 
-  for (const automation of candidates) {
+  const entries: Array<{ automation: typeof candidates[number]; switched: ConversionStateView | null }> = [
+    ...candidates.map((automation) => ({ automation, switched: null })),
+    ...switchedRows.map(({ automation, conversion }) => ({ automation, switched: conversion })),
+  ];
+  for (const { automation, switched } of entries) {
     let trigger;
     try {
       trigger = normalizeAutomationTrigger(automation.trigger);
@@ -390,6 +436,10 @@ async function processScanSchedules(_scanAt: string): Promise<{ due: number }> {
       continue;
     }
 
+    if (switched && !legacyPrefers(switched, slotInstant, false)) {
+      continue;
+    }
+
     due += 1;
 
     await queue.add(
@@ -399,6 +449,7 @@ async function processScanSchedules(_scanAt: string): Promise<{ due: number }> {
         automationId: automation.id,
         slotKey,
         scanAt: scanDate.toISOString(),
+        ...(switched ? { enqueuedWhileUnswitched: false } : {}),
       },
       {
         jobId: `automation-schedule-${automation.id}-${slotKey}`,
@@ -451,11 +502,159 @@ async function processScanSchedules(_scanAt: string): Promise<{ due: number }> {
   return { due };
 }
 
-async function processTriggerSchedule(data: TriggerScheduleJobData): Promise<{ runId?: string; skipped?: string }> {
+/**
+ * #7187 — what a trigger handler decided inside its transaction. `afterCommit`
+ * (the #3445 continuation shape) carries the `execute-run` enqueue: the run row
+ * is INSERTed in the handler's transaction, and the execute-run worker reads it
+ * on its own connection, so the job must not exist until that row commits.
+ * Enqueued inside the transaction, a fast worker finds no run and throws
+ * `Automation run not found`, and a rollback leaves a job for a run that never
+ * existed.
+ */
+type TriggerAdmission<R extends object> = R & { afterCommit?: () => Promise<void> };
+
+/**
+ * Runs a trigger handler in its own system transaction, then — only once that
+ * transaction has committed — runs the enqueue it deferred. A transaction that
+ * throws (including a failed commit) propagates before `afterCommit` runs, so a
+ * rolled-back run is never enqueued. The worker calls these under
+ * `runOutsideDbAccess`, so this transaction is the outermost one and really
+ * commits when it returns.
+ */
+async function commitThenEnqueue<R extends object>(
+  admit: () => Promise<TriggerAdmission<R>>,
+): Promise<R> {
+  const { afterCommit, ...result } = await runWithSystemDbAccess(admit);
+  if (afterCommit) await afterCommit();
+  return result as unknown as R;
+}
+
+type TriggerResult = { runId?: string; skipped?: string; claimedBy?: ClaimExisting };
+
+/**
+ * #5221 B2 (Decision 6) — the legacy half of the occurrence-claim contract,
+ * for a STANDALONE row (classes M, A and P can never carry a conversion and
+ * never reach this). Runs inside the admission transaction, right before the
+ * run insert:
+ *  - locks the automation row and reads its generation
+ *    (`currentConversionForAutomation`); no generation ⇒ today's path, no hook;
+ *  - `legacyPrefers` false ⇒ the occurrence is not attempted at all;
+ *  - otherwise returns the `onCreated` hook that claims the occurrence in the
+ *    run's own transaction and, on a conflict, throws `OccurrenceClaimedError`
+ *    so the run rolls back with it.
+ * An occurrence with no key (an event id that is not a uuid) is admitted
+ * without a claim; a switched flow never attempts it.
+ */
+async function legacyOccurrenceGate(
+  automation: typeof automations.$inferSelect,
+  o: { key: string | null; instant: Date | null; enqueuedWhileUnswitched: boolean; eventLabel?: string },
+): Promise<{
+  skip?: 'occurrence_not_preferred';
+  onCreated?: NonNullable<Parameters<typeof createAutomationRunRecord>[0]['onCreated']>;
+  conversion?: ConversionStateView;
+}> {
+  const conversion = await currentConversionForAutomation(db, automation.id);
+  if (!conversion) return {};
+  if (o.eventLabel !== undefined) {
+    if (!o.key) reportOccurrenceAnomaly('flow_conversion_event_key_unbuildable', 'legacy', o.eventLabel);
+    else if (!o.instant) reportOccurrenceAnomaly('flow_conversion_event_instant_missing', 'legacy', o.key);
+  }
+  if (!legacyPrefers(conversion, o.instant, o.enqueuedWhileUnswitched)) return { skip: 'occurrence_not_preferred', conversion };
+  const key = o.key;
+  if (!key) {
+    if (o.eventLabel === undefined) console.warn(`[AutomationWorker] automation ${automation.id}: occurrence has no claim key; admitted without a claim`);
+    return { conversion };
+  }
+  return {
+    conversion,
+    onCreated: async (tx, run) => {
+      const claim = await claimOccurrence(tx, {
+        automationId: automation.id,
+        owner: { orgId: automation.orgId, partnerId: automation.partnerId },
+        keys: [key],
+        engine: 'legacy',
+        conversionId: conversion.id,
+        legacyRunId: run.id,
+        occurrenceAt: o.instant,
+      });
+      if (!claim.ok) throw new OccurrenceClaimedError(claim.existing);
+    },
+  };
+}
+
+/** `createAutomationRunRecord` with the gate's hook; a lost claim becomes the `occurrence_claimed` skip. */
+async function createGatedRunRecord(
+  options: Parameters<typeof createAutomationRunRecord>[0],
+  onCreated: Parameters<typeof createAutomationRunRecord>[0]['onCreated'],
+): Promise<Awaited<ReturnType<typeof createAutomationRunRecord>> | { claimedBy: ClaimExisting }> {
+  try {
+    return await createAutomationRunRecord(onCreated ?{ ...options, onCreated } : options);
+  } catch (err) {
+    if (err instanceof OccurrenceClaimedError) return { claimedBy: err.existing };
+    throw err;
+  }
+}
+
+/**
+ * #5221 B4 (Decision 3) — after a legacy run of a SHADOW row commits, compare
+ * it with the converted draft (target set, fleet cap, would-park). Gated on the
+ * conversion the occurrence gate already read: a row without a conversion, or
+ * a switched / reverted one, does nothing here. Best effort: the observation
+ * never throws, and this wrapper guarantees a failure can never fail the run.
+ */
+async function observeShadowAfterRun(
+  conversion: ConversionStateView | undefined,
+  automation: typeof automations.$inferSelect,
+  run: ShadowRunTrigger,
+  legacyTargetIds: readonly string[],
+): Promise<void> {
+  if (conversion?.state !== 'shadow') return;
+  try {
+    const { observeShadowRun } = await loadShadow();
+    await observeShadowRun({
+      conversionId: conversion.id,
+      automation: { id: automation.id, orgId: automation.orgId, partnerId: automation.partnerId },
+      run,
+      legacyTargetIds,
+    });
+  } catch (err) {
+    console.error(`[AutomationWorker] shadow observation failed for automation ${automation.id}`, err);
+    captureException(err);
+  }
+}
+
+/** #5221 B4 — the fan-out's trigger comparison for a shadow row (both directions). Never throws. */
+async function observeShadowTrigger(
+  conversionId: string,
+  shadow: ShadowFanoutView,
+  event: BreezeEvent<Record<string, unknown>>,
+  legacyMatched: boolean,
+): Promise<void> {
+  try {
+    const { recordShadow, shadowTriggerVerdict } = await loadShadow();
+    const verdict = shadowTriggerVerdict({ flowTrigger: shadow.flowTrigger, eventType: event.type, payload: event.payload, legacyMatched });
+    if (verdict) await recordShadow(conversionId, { ...verdict, documentDigest: shadow.documentDigest });
+  } catch (err) {
+    console.error(`[AutomationWorker] shadow trigger comparison failed for conversion ${conversionId}`, err);
+    captureException(err);
+  }
+}
+
+function processTriggerSchedule(data: TriggerScheduleJobData): Promise<TriggerResult> {
+  return commitThenEnqueue(() => admitTriggerSchedule(data));
+}
+
+async function admitTriggerSchedule(
+  data: TriggerScheduleJobData,
+): Promise<TriggerAdmission<TriggerResult>> {
+  // #5221 B2: or a switched row (its own predicate; see the scan).
   const [automation] = await db
     .select()
     .from(automations)
-    .where(and(eq(automations.id, data.automationId), eq(automations.enabled, true)))
+    .where(and(
+      eq(automations.id, data.automationId),
+      or(eq(automations.enabled, true), switchedConvertedAutomationCondition()),
+    ))
     .limit(1);
 
   if (!automation) {
@@ -478,18 +677,100 @@ async function processTriggerSchedule(data: TriggerScheduleJobData): Promise<{ r
     return { skipped: 'not_due' };
   }
 
-  const { run, targetDeviceIds } = await createAutomationRunRecord({
+  // Unattended cron dispatch: checkAutomationTargetsWithinSiteScope otherwise
+  // only runs at create/update time and at manual-trigger time (both have a
+  // caller in the request), against the target set resolved THEN. A `groups`
+  // target that resolved to 0 (or fewer) devices at that time passes cleanly;
+  // members added to the group since — including ones outside the creator's
+  // site allowlist — are targeted by this schedule run with no recheck at
+  // all. Re-derive the creator's CURRENT site allowlist and re-resolve the
+  // CURRENT target set here, dropping anything outside it, before the run is
+  // created. An unrestricted creator (no allowedSiteIds) is unaffected.
+  let boundDeviceIds: string[] | undefined;
+  let boundTargetDiagnostics: AutomationTargetDiagnostics | undefined;
+  if (automation.createdBy) {
+    const perms = await getUserPermissions(automation.createdBy, {
+      orgId: automation.orgId ?? undefined,
+      partnerId: automation.partnerId ?? undefined,
+    });
+    if (perms?.allowedSiteIds) {
+      const check = await checkAutomationTargetsWithinSiteScope(automation, perms);
+      if (!check.ok) {
+        if (check.unbounded) {
+          console.warn(
+            `[AutomationWorker] Skipping automation ${automation.id}: schedule_target_unbounded_outside_site_ceiling`,
+          );
+          return { skipped: 'schedule_target_unbounded_outside_site_ceiling' };
+        }
+
+        // Reuse the target set `checkAutomationTargetsWithinSiteScope` already
+        // resolved instead of re-resolving here: group/filter membership (and
+        // Field-provenance exclusions, which are computed fresh on every
+        // resolution) can change between two independent calls, so a second
+        // resolution is not guaranteed to agree with the one the site-scope
+        // decision above was actually based on.
+        const outOfScope = new Set(check.outOfScopeDeviceIds);
+        boundDeviceIds = check.targetDeviceIds.filter((id) => !outOfScope.has(id));
+        // #8598 — a broken group target must still fail the run visibly.
+        boundTargetDiagnostics = check.targetDiagnostics;
+
+        writeAuditEvent(requestLikeFromSnapshot({}), {
+          orgId: automation.orgId ?? null,
+          action: 'automation.schedule_run_targets_dropped_outside_site_ceiling',
+          resourceType: 'automation',
+          resourceId: automation.id,
+          result: 'success',
+          actorType: 'system',
+          details: {
+            droppedDeviceIds: check.outOfScopeDeviceIds,
+            slotKey: data.slotKey,
+          },
+        });
+
+        if (boundDeviceIds.length === 0 && !boundTargetDiagnostics?.problems.length) {
+          return { skipped: 'schedule_targets_all_outside_site_ceiling' };
+        }
+      }
+    }
+  }
+
+  // #5221 B2 — the claim is the UTC ISO minute of the slot (automation_runs
+  // keeps legacy's compact spelling; claims.ts reads both as history).
+  const slotInstant = scheduleInstantFromSlotKey(data.slotKey);
+  const gate = await legacyOccurrenceGate(automation, {
+    key: slotInstant ? occurrenceKey.schedule(slotInstant) : null,
+    instant: slotInstant,
+    enqueuedWhileUnswitched: data.enqueuedWhileUnswitched ?? true,
+  });
+  if (gate.skip) return { skipped: gate.skip };
+
+  // #3189 — the slot is the occurrence. A replay of this job (stalled-job
+  // recovery) gets the run the first attempt minted back, and the enqueue
+  // below then either dedupes on the stable `automation-run-<runId>` job id,
+  // resumes a half-dispatched run, or short-circuits a finished one.
+  const created = await createGatedRunRecord({
     automation,
     triggeredBy: `schedule:${data.slotKey}`,
     details: {
       slotKey: data.slotKey,
       scanAt: data.scanAt,
     },
-  });
+    ...(boundDeviceIds ? { boundDeviceIds } : {}),
+    ...(boundDeviceIds && boundTargetDiagnostics ? { targetDiagnostics: boundTargetDiagnostics } : {}),
+    occurrenceKey: `schedule:${data.slotKey}`,
+  }, gate.onCreated);
+  if ('claimedBy' in created) return { skipped: 'occurrence_claimed', claimedBy: created.claimedBy };
+  const { run, targetDeviceIds } = created;
 
-  await enqueueAutomationRun(run.id, targetDeviceIds);
-
-  return { runId: run.id };
+  return {
+    runId: run.id,
+    // #7187 — enqueued only after this transaction commits (commitThenEnqueue).
+    afterCommit: async () => {
+      await enqueueAutomationRun(run.id, targetDeviceIds);
+      // A replayed job that got its first run back was observed the first time.
+      if (!created.reused) await observeShadowAfterRun(gate.conversion, automation, { kind: 'schedule', at: slotInstant }, targetDeviceIds);
+    },
+  };
 }
 
 /** Recheck maintenance at both boundaries; a failed lookup must not run a workflow. */
@@ -505,11 +786,21 @@ async function policyWorkflowMaintenanceSuppressed(deviceId: string): Promise<bo
   }
 }
 
-async function processTriggerEvent(data: TriggerEventJobData): Promise<{ runId?: string; skipped?: string }> {
+function processTriggerEvent(data: TriggerEventJobData): Promise<TriggerResult> {
+  return commitThenEnqueue(() => admitTriggerEvent(data));
+}
+
+async function admitTriggerEvent(
+  data: TriggerEventJobData,
+): Promise<TriggerAdmission<TriggerResult>> {
+  // #5221 B2: or a switched row (see the scan).
   const [automation] = await db
     .select()
     .from(automations)
-    .where(and(eq(automations.id, data.automationId), eq(automations.enabled, true), isNull(automations.retiredAt)))
+    .where(and(
+      eq(automations.id, data.automationId),
+      or(and(eq(automations.enabled, true), isNull(automations.retiredAt)), switchedConvertedAutomationCondition()),
+    ))
     .limit(1);
 
   if (!automation) {
@@ -528,6 +819,7 @@ async function processTriggerEvent(data: TriggerEventJobData): Promise<{ runId?:
   }
 
   const payload = normalizePayload(data.eventPayload);
+  const isPolicyWorkflow = Boolean(trigger.filter?._policyWorkflow);
   if (trigger.filter?._policyWorkflow) {
     const deviceId = typeof payload.deviceId === 'string' ? payload.deviceId : undefined;
     if (!deviceId || !await policyWorkflowApplies(automation, deviceId, db)) {
@@ -541,6 +833,18 @@ async function processTriggerEvent(data: TriggerEventJobData): Promise<{ runId?:
   }
   if (!shouldTriggerEventAutomation(trigger, data.eventType, payload)) {
     return { skipped: 'filter_mismatch' };
+  }
+
+  // Alert events without a device must never fall back to static/org targets.
+  if (data.eventType.startsWith('alert.') && typeof payload.deviceId !== 'string') {
+    console.warn(`[AutomationWorker] Skipping automation ${automation.id}: alert_has_no_device`, {
+      reason: 'alert_has_no_device', automationId: automation.id,
+      alertId: payload.alertId ?? null, eventId: data.eventId ?? null,
+      orgId: data.eventOrgId ?? payload.orgId ?? automation.orgId,
+      owner: payload.owner ?? { kind: payload.ownerKind ?? null, ref: payload.ownerRef ?? null },
+    });
+    recordAlertDeviceConsumerSkipped('automation');
+    return { skipped: 'alert_has_no_device' };
   }
 
   // `typeof === 'string'` rather than `!== null`: an absent property (a
@@ -574,6 +878,14 @@ async function processTriggerEvent(data: TriggerEventJobData): Promise<{ runId?:
     // the state row lock before the alert is ever published, so this read can
     // never observe a half-latched pair.
     if (isMonitorManaged) {
+      // W03 Task 11 — only the episode's atomic first-alert owner runs its
+      // compiled response. Two subjects on the same device both publish
+      // `alert.triggered`, but exactly one carries `responsesOwner: true`
+      // (Task 8's `linkEpisodeAlert` CAS). Returns before even reading pause
+      // state or `monitorDeviceState`, so a non-owner event costs one query.
+      if (payload.responsesOwner === false) {
+        return { skipped: 'subject_alert_not_response_owner' };
+      }
       const monitorId = automation.managedByMonitorId as string;
       const [state] = await db
         .select({ paused: monitorDeviceState.responsesPaused })
@@ -603,7 +915,7 @@ async function processTriggerEvent(data: TriggerEventJobData): Promise<{ runId?:
     // Event targets must not fall back to the static fleet-wide conditions.
     // Recheck current ownership: the device/org may have moved since publication.
     const [device] = await db
-      .select({ orgId: devices.orgId, partnerId: organizations.partnerId })
+      .select({ orgId: devices.orgId, partnerId: organizations.partnerId, siteId: devices.siteId })
       .from(devices)
       .innerJoin(organizations, eq(devices.orgId, organizations.id))
       .where(eq(devices.id, payload.deviceId))
@@ -615,10 +927,71 @@ async function processTriggerEvent(data: TriggerEventJobData): Promise<{ runId?:
       console.warn(`[AutomationWorker] Skipping automation ${automation.id}: event_device_outside_automation_scope (device ${payload.deviceId})`);
       return { skipped: 'event_device_outside_automation_scope' };
     }
+
+    // Event triggers bind straight to the triggering device with no site
+    // check — checkAutomationTargetsWithinSiteScope only runs at create/update
+    // time, against the resolved STATIC target set. A site-restricted creator
+    // could therefore end up with an automation whose event trigger fires on
+    // devices at sites outside their allowlist, whenever that device raises
+    // the subscribed event. Re-derive the creator's CURRENT site ceiling here
+    // (it may have narrowed since creation) and re-check the actual device.
+    if (automation.createdBy) {
+      const perms = await getUserPermissions(automation.createdBy, {
+        orgId: automation.orgId ?? undefined,
+        partnerId: automation.partnerId ?? undefined,
+      });
+      const ceiling = perms?.allowedSiteIds;
+      if (ceiling && !(typeof device.siteId === 'string' && canAccessSite(perms!, device.siteId))) {
+        console.warn(`[AutomationWorker] Skipping automation ${automation.id}: event_device_outside_automation_site_ceiling (device ${payload.deviceId})`);
+        return { skipped: 'event_device_outside_automation_site_ceiling' };
+      }
+    }
+
     boundDeviceIds = [payload.deviceId];
   }
 
-  const { run, targetDeviceIds } = await createAutomationRunRecord({
+  // W03 Task 10 — a hardware-subject event routes through the durable
+  // response-admission outbox instead of the legacy synchronous path: the
+  // admission CAS on `monitor_episodes.responses_admitted_at` is the
+  // single-response-owner guarantee, and `automation.started` publishes only
+  // after that admission transaction commits. Missing/NULL-subject events
+  // (every other monitor-managed or unmanaged automation) keep today's path,
+  // including recurrence actions.
+  if (isMonitorManaged && typeof payload.subjectKey === 'string') {
+    if (payload.responsesOwner !== true || typeof payload.episodeId !== 'string'
+        || typeof payload.alertId !== 'string' || !boundDeviceIds?.[0] || !triggerContext) {
+      return { skipped: 'subject_response_identity_missing' };
+    }
+    return admitSubjectResponse({
+      automation,
+      episodeId: payload.episodeId,
+      alertId: payload.alertId,
+      deviceId: boundDeviceIds[0],
+      eventType: data.eventType,
+      eventId: data.eventId,
+      eventTimestamp: data.eventTimestamp,
+      triggerContext,
+    });
+  }
+
+  // #5221 B2 — a standalone row only: classes M, A and P never carry a
+  // conversion (the converter refuses managed_row / policy_workflow), so their
+  // admission is left exactly as it was.
+  let onCreated: Parameters<typeof createAutomationRunRecord>[0]['onCreated'];
+  let conversion: ConversionStateView | undefined;
+  if (!isManaged && !isPolicyWorkflow) {
+    const gate = await legacyOccurrenceGate(automation, {
+      key: eventOccurrenceKey(data.eventId),
+      instant: eventInstant(data.eventTimestamp),
+      enqueuedWhileUnswitched: data.enqueuedWhileUnswitched ?? true,
+      eventLabel: `event:${data.eventId ?? 'missing'}`,
+    });
+    if (gate.skip) return { skipped: gate.skip };
+    onCreated = gate.onCreated;
+    conversion = gate.conversion;
+  }
+
+  const created = await createGatedRunRecord({
     automation,
     triggeredBy: `event:${data.eventType}`,
     details: {
@@ -627,13 +1000,12 @@ async function processTriggerEvent(data: TriggerEventJobData): Promise<{ runId?:
       eventTimestamp: data.eventTimestamp,
     },
     ...(boundDeviceIds ? { boundDeviceIds } : {}),
-  });
-
-  if (triggerContext) {
-    await enqueueAutomationRun(run.id, targetDeviceIds, triggerContext);
-  } else {
-    await enqueueAutomationRun(run.id, targetDeviceIds);
-  }
+    // #3189 — one run per (automation, event). Without an event id there is no
+    // occurrence identity to deduplicate on.
+    ...(data.eventId ? { occurrenceKey: `event:${data.eventId}` } : {}),
+  }, onCreated);
+  if ('claimedBy' in created) return { skipped: 'occurrence_claimed', claimedBy: created.claimedBy };
+  const { run, targetDeviceIds } = created;
 
   // #5290 — record the response attempt on the OPEN episode for the pair. The
   // outcome walks forward only: automationActionResults terminalises it to
@@ -648,7 +1020,18 @@ async function processTriggerEvent(data: TriggerEventJobData): Promise<{ runId?:
     });
   }
 
-  return { runId: run.id };
+  return {
+    runId: run.id,
+    // #7187 — enqueued only after this transaction commits (commitThenEnqueue).
+    afterCommit: async () => {
+      if (triggerContext) {
+        await enqueueAutomationRun(run.id, targetDeviceIds, triggerContext);
+      } else {
+        await enqueueAutomationRun(run.id, targetDeviceIds);
+      }
+      if (!created.reused) await observeShadowAfterRun(conversion, automation, { kind: 'event', eventType: data.eventType, payload }, targetDeviceIds);
+    },
+  };
 }
 
 async function processExecuteRun(data: ExecuteRunJobData): Promise<{ runId: string }> {
@@ -676,7 +1059,8 @@ async function processExecuteRun(data: ExecuteRunJobData): Promise<{ runId: stri
  * that resolves a SET of devices filters them out; the explicit device-level
  * branches are by-id lookups of an operator-chosen target and are left alone.
  */
-async function resolveDeviceIdsForAssignment(
+/** @internal exported for tests */
+export async function resolveDeviceIdsForAssignment(
   assignmentLevel: string,
   assignmentTargetId: string,
   // null for partner-owned library policies (#1724, #2280) — they have no
@@ -698,6 +1082,8 @@ async function resolveDeviceIdsForAssignment(
     const conditions = [
       eq(organizations.partnerId, assignmentTargetId),
       eq(devices.isEphemeral, false),
+      // Never a device parked in the partner's holding org.
+      notHoldingOrgCondition(),
     ];
     if (policyOrgId) conditions.push(eq(devices.orgId, policyOrgId));
     const partnerDevices = await db
@@ -745,21 +1131,23 @@ async function resolveDeviceIdsForAssignment(
     }
 
     case 'device_group': {
-      // #3182 — the group id arrives from an assignment row and is
-      // dereferenced through device_group_memberships, so BOTH joins carry an
-      // org-equality condition rather than a bare id match. Neither of the two
-      // clamps below is sufficient on its own:
-      //   * the partner branch joins organizations through the MEMBERSHIP's
-      //     org_id, so it only ever proved that the membership's own org sits
-      //     under the policy's partner — never that the group does;
-      //   * the org branch's `memberships.org_id = policyOrgId` proved the same
-      //     for the policy's org.
-      // A membership row was free to name a group in a different org until
-      // #3182's composite FK landed, and a cross-org device move produced
-      // exactly that shape, so an org A group could resolve an org B device.
-      // Requiring group.org_id = membership.org_id = device.org_id makes the
-      // query reject it independently of the constraint. This worker runs under
-      // a system DB context, so there is no RLS behind it to catch a miss.
+      // #3182: memberships and devices share an org. Org groups share that
+      // org; partner groups belong to the membership org's partner. Keep this
+      // owner check as well as the policy clamp in both system-context paths.
+      // Execution-target field-provenance tiering — a device_group-level assignment
+      // resolved here feeds `processTriggerConfigPolicySchedule`, which
+      // dispatches an automation run: always execution-bearing, unlike the
+      // config-policy resolver's per-feature-type tiering. Gate before
+      // resolving membership, same as the deployment-target resolver,
+      // update-ring expansion and patch scheduling.
+      const { allowedGroupIds, refusedGroups } = await resolveExecutionSafeGroupIds([assignmentTargetId]);
+      if (refusedGroups.length > 0) {
+        auditRefusedExecutionGroups(policyOrgId, 'automation_schedule.execution_target_refused_agent_reported_fields', refusedGroups);
+      }
+      if (allowedGroupIds.length === 0) {
+        return [];
+      }
+
       if (needsPartnerClamp) {
         const members = await db
           .select({ deviceId: deviceGroupMemberships.deviceId })
@@ -769,7 +1157,7 @@ async function resolveDeviceIdsForAssignment(
             deviceGroups,
             and(
               eq(deviceGroupMemberships.groupId, deviceGroups.id),
-              eq(deviceGroups.orgId, deviceGroupMemberships.orgId),
+              groupOwnerMatchesMembershipOrg(),
             ),
           )
           .innerJoin(
@@ -800,7 +1188,7 @@ async function resolveDeviceIdsForAssignment(
           deviceGroups,
           and(
             eq(deviceGroupMemberships.groupId, deviceGroups.id),
-            eq(deviceGroups.orgId, deviceGroupMemberships.orgId),
+            groupOwnerMatchesMembershipOrg(),
           ),
         )
         .innerJoin(
@@ -1043,6 +1431,7 @@ async function processTriggerConfigPolicySchedule(
       configPolicyId: assignedPolicyId,
       targetDeviceIds: winners.sort(),
       triggeredBy: `schedule:${data.slotKey}`,
+      occurrenceKey: `${cpAutomation.id}:schedule:${data.slotKey}`,
     },
     `cp-automation-run-${cpAutomation.id}-${assignedPolicyId}-${data.slotKey}`,
   );
@@ -1086,9 +1475,32 @@ async function processExecuteConfigPolicyRun(
     data.configPolicyId,
     data.targetDeviceIds,
     data.triggeredBy,
+    data.occurrenceKey ? { occurrenceKey: data.occurrenceKey } : {},
   );
 
   return { runId: result.runId };
+}
+
+/**
+ * W03 Task 10 — dispatch every committed-but-undelivered response admission.
+ * Uses the queue directly rather than `enqueueAutomationRun`: that helper can
+ * swallow an enqueue failure and fall back to an in-memory inline execution,
+ * which cannot acknowledge a durable outbox envelope. The stable `jobId`
+ * (keyed on the episode's admitted run, not the triggering event) lets a
+ * retry after an enqueue-success/ack-failure find the same execution job
+ * rather than creating a duplicate; ordinary trigger jobs keep their existing
+ * 200-job retention policy untouched. The database admission marker — not
+ * either retention policy — is what prevents a second response run for the
+ * episode.
+ */
+async function drainCommittedSubjectResponses(): Promise<void> {
+  await drainSubjectResponseOutbox((pending) =>
+    getAutomationQueue().add(
+      'execute-run',
+      { type: 'execute-run', runId: pending.runId, targetDeviceIds: [pending.deviceId], triggerContext: pending.triggerContext },
+      { jobId: `automation-run-${pending.runId}`, removeOnComplete: false, removeOnFail: false },
+    ),
+  );
 }
 
 export function createAutomationWorker(): Worker<AutomationJobData> {
@@ -1109,22 +1521,40 @@ export function createAutomationWorker(): Worker<AutomationJobData> {
         assertQueueJobName(AUTOMATION_QUEUE, job, 'execute-config-policy-run');
         return runOutsideDbAccess(() => processExecuteConfigPolicyRun(data));
       }
-      return runWithSystemDbAccess(async () => {
+      // W03 Task 10 — a trigger-event admission commits its response outbox
+      // envelope inside processTriggerEvent's own transaction; the drain below
+      // MUST run after runWithSystemDbAccess returns (outside any ambient
+      // context) or drainSubjectResponseOutbox's "must run after commit" guard
+      // throws. scan-schedules drains too so a crash between a prior
+      // admission's commit and its dispatch retries on the next minute tick
+      // even without another alert event.
+      //
+      // #7187 — both trigger handlers own their transaction (commitThenEnqueue)
+      // and enqueue `execute-run` only after it commits, so they run with NO
+      // ambient context here: wrapped in a worker transaction, theirs would
+      // join it and the enqueue would again precede the commit.
+      if (data.type === 'trigger-event') {
+        assertQueueJobName(AUTOMATION_QUEUE, job, 'trigger-event');
+        const result = await runOutsideDbAccess(() => processTriggerEvent(data));
+        await drainCommittedSubjectResponses();
+        return result;
+      }
+      if (data.type === 'trigger-schedule') {
+        assertQueueJobName(AUTOMATION_QUEUE, job, 'trigger-schedule');
+        return runOutsideDbAccess(() => processTriggerSchedule(data));
+      }
+      const result = await runWithSystemDbAccess(async () => {
         switch (data.type) {
           case 'scan-schedules':
             assertQueueJobName(AUTOMATION_QUEUE, job, 'scan-schedules');
             return processScanSchedules(data.scanAt);
-          case 'trigger-schedule':
-            assertQueueJobName(AUTOMATION_QUEUE, job, 'trigger-schedule');
-            return processTriggerSchedule(data);
-          case 'trigger-event':
-            assertQueueJobName(AUTOMATION_QUEUE, job, 'trigger-event');
-            return processTriggerEvent(data);
           case 'trigger-config-policy-schedule':
             assertQueueJobName(AUTOMATION_QUEUE, job, 'trigger-config-policy-schedule');
             return processTriggerConfigPolicySchedule(data);
         }
       });
+      if (data.type === 'scan-schedules') await drainCommittedSubjectResponses();
+      return result;
     },
     {
       connection: getBullMQConnection(),
@@ -1160,10 +1590,73 @@ async function scheduleAutomationScans(): Promise<void> {
   );
 }
 
+const SCRIPT_TERMINAL_EVENT_TYPES: ReadonlySet<string> = new Set(['script.completed', 'script.failed']);
+
+/** The exact `triggeredBy` strings this worker stamps on a run minted by a script terminal event. */
+function isScriptTerminalEventRunTrigger(triggeredBy: string): boolean {
+  for (const type of SCRIPT_TERMINAL_EVENT_TYPES) {
+    if (triggeredBy === `event:${type}` || triggeredBy === `config-policy-event:${type}`) return true;
+  }
+  return false;
+}
+
+/**
+ * #7277 - script->script loop guard for `script.completed` / `script.failed`.
+ *
+ * An automation "on script completed -> run script" would otherwise trigger
+ * itself: its script's completion is the very event it listens for. The event
+ * payload names the automation run that queued the execution
+ * (`automationRunId`); that run says how it started.
+ *
+ *  - The origin run was itself started by a script terminal event: this is the
+ *    second hop of a script-event chain. The event is not fanned out at all,
+ *    which bounds every cycle (self-trigger and A->B->A) at one hop. The cost is
+ *    that a two-step script-event chain stops after its first step.
+ *  - Otherwise the event is delivered, except to the automation whose own run
+ *    queued the script (`originAutomationId`), so a scheduled/alert automation
+ *    that also listens for script events cannot answer its own script.
+ *  - The run cannot be found (automation deleted, run purged): deliver. A run
+ *    that no longer exists cannot be part of a live loop.
+ *
+ * Events with no `automationRunId` (manual, scheduled, API, monitor runs) are
+ * unaffected. A failed lookup throws so the dispatcher retries (see
+ * handleAutomationEvent).
+ */
+async function resolveScriptEventOrigin(
+  event: BreezeEvent<Record<string, unknown>>,
+): Promise<{ drop: boolean; originAutomationId: string | null }> {
+  const none = { drop: false, originAutomationId: null };
+  if (!SCRIPT_TERMINAL_EVENT_TYPES.has(event.type)) return none;
+  const runId = normalizePayload(event.payload).automationRunId;
+  if (typeof runId !== 'string' || runId.length === 0) return none;
+
+  const [run] = await db
+    .select({ automationId: automationRuns.automationId, triggeredBy: automationRuns.triggeredBy })
+    .from(automationRuns)
+    .where(eq(automationRuns.id, runId))
+    .limit(1);
+
+  if (!run) {
+    // Deleted automation (runs cascade) or a retention-purged run. Neither can be
+    // part of a live loop, and dropping would silence every unrelated listener.
+    console.warn(`[AutomationWorker] ${event.type} ${event.id}: originating automation run ${runId} not found; delivering (loop guard cannot apply)`);
+    return none;
+  }
+  if (isScriptTerminalEventRunTrigger(run.triggeredBy)) {
+    console.warn(`[AutomationWorker] ${event.type} ${event.id}: script was queued by a run started by a script event (${run.triggeredBy}); not fanning out (loop guard)`);
+    return { drop: true, originAutomationId: run.automationId ?? null };
+  }
+  return { drop: false, originAutomationId: run.automationId ?? null };
+}
+
 // Exported for the partner-RLS integration suite, which proves the dual-axis
 // fan-out query against real Postgres (the BullMQ queue is mocked there).
 export async function queueEventTriggers(event: BreezeEvent<Record<string, unknown>>): Promise<void> {
   const queue = getAutomationQueue();
+
+  // #7277 - before any fan-out query.
+  const scriptOrigin = await resolveScriptEventOrigin(event);
+  if (scriptOrigin.drop) return;
 
   // --- Legacy standalone automations ---
   // Dual-ownership fan-out (#2133): match the event org's own automations OR
@@ -1185,6 +1678,11 @@ export async function queueEventTriggers(event: BreezeEvent<Record<string, unkno
   if (eventOrg?.type === 'quick_support') {
     return;
   }
+  // Same for an event raised for a device parked in its partner's holding
+  // org: nothing partner-wide runs against a device that is not managed yet.
+  if (isUnassignedPoolOrgType(eventOrg?.type)) {
+    return;
+  }
 
   const ownershipCondition = eventOrg?.partnerId
     ? or(
@@ -1197,10 +1695,29 @@ export async function queueEventTriggers(event: BreezeEvent<Record<string, unkno
     .select()
     .from(automations)
     .where(and(ownershipCondition, eq(automations.enabled, true), isNull(automations.retiredAt)));
+  // #5221 B2 (Decision 6) — switched rows of the same owners. Their job says
+  // what this read saw (`enqueuedWhileUnswitched: false`), and an event at or
+  // after switch_at is the flow's: not enqueued here, and refused again at
+  // admission if a job for it exists anyway.
+  // #5221 B4 — the same read also returns the owners' SHADOW generations (with
+  // the draft's trigger), the only rows the shadow hook looks at; a row with
+  // no conversion is never in it.
+  const convertedRows = await loadSwitchedConvertedAutomations(db, ownershipCondition, { withShadow: true });
+  const switchedRows = convertedRows.filter((r) => r.conversion.state === 'switched');
+  const shadowById = new Map(convertedRows.flatMap((r) => (r.shadow ? [[r.automation.id, { conversionId: r.conversion.id, view: r.shadow }] as const] : [])));
+  const eventAt = eventInstant(event.metadata?.timestamp);
 
   const payload = normalizePayload(event.payload);
 
-  for (const automation of candidates) {
+  const entries: Array<{ automation: typeof candidates[number]; switched: ConversionStateView | null }> = [
+    ...candidates.map((automation) => ({ automation, switched: null })),
+    ...switchedRows.map(({ automation, conversion }) => ({ automation, switched: conversion })),
+  ];
+  for (const { automation, switched } of entries) {
+    if (switched && !legacyPrefers(switched, eventAt, false)) continue;
+    // #7277: never hand an automation the terminal event of its own script.
+    if (scriptOrigin.originAutomationId && automation.id === scriptOrigin.originAutomationId) continue;
+
     let trigger;
     try {
       trigger = normalizeAutomationTrigger(automation.trigger);
@@ -1220,7 +1737,10 @@ export async function queueEventTriggers(event: BreezeEvent<Record<string, unkno
       trigger = { ...trigger, filter };
     }
 
-    if (!shouldTriggerEventAutomation(trigger, event.type, payload)) {
+    const legacyMatched = shouldTriggerEventAutomation(trigger, event.type, payload);
+    const shadow = switched ? undefined : shadowById.get(automation.id);
+    if (shadow) await observeShadowTrigger(shadow.conversionId, shadow.view, event, legacyMatched);
+    if (!legacyMatched) {
       continue;
     }
 
@@ -1231,8 +1751,10 @@ export async function queueEventTriggers(event: BreezeEvent<Record<string, unkno
         automationId: automation.id,
         eventType: event.type,
         eventId: event.id,
+        eventOrgId: event.orgId,
         eventPayload: payload,
         eventTimestamp: event.metadata.timestamp,
+        ...(switched ? { enqueuedWhileUnswitched: false } : {}),
       },
       {
         jobId: `automation-event-${automation.id}-${event.id}`,
@@ -1285,6 +1807,7 @@ export async function queueEventTriggers(event: BreezeEvent<Record<string, unkno
             configPolicyId: cpAssignedPolicyId,
             targetDeviceIds: [deviceId],
             triggeredBy: `config-policy-event:${event.type}`,
+            occurrenceKey: `${cpAutomation.id}:event:${deviceId}:${event.id}`,
           },
           `cp-automation-event-${cpAutomation.id}-${cpAssignedPolicyId}-${deviceId}-${event.id}`,
         );
@@ -1360,5 +1883,6 @@ export const __testOnly = {
   processScanSchedules,
   processTriggerConfigPolicySchedule,
   processTriggerEvent,
+  processTriggerSchedule,
   processExecuteRun,
 };

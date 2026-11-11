@@ -31,6 +31,8 @@
     "confidenceValue": "{{confidence}} % Konfidenz"
   },
   "alertDetailPage": {
+    "externalTickets": "Externe Tickets",
+    "externalTicketsFailedToLoad": "Externe Tickets konnten nicht geladen werden.",
     "loadingAlert": "Benachrichtigung wird geladen...",
     "backToAlerts": "Zurück zu den Benachrichtigungen",
     "goBack": "Zurück",
@@ -66,8 +68,8 @@
     "alertAcknowledged": "Warnung bestätigt",
     "failedToResolveAlert": "Warnung konnte nicht gelöst werden",
     "alertResolved": "Warnung behoben",
-    "alertsBreadcrumb": "Warnungen Breadcrumb",
-    "alertFallback": "Alarm-Fallback",
+    "alertsBreadcrumb": "Warnungen",
+    "alertFallback": "Warnung",
     "unknownMetric": "Unbekannte Metrik",
     "severity": {
       "critical": "Kritisch",
@@ -82,6 +84,21 @@
       "resolved": "Gelöst",
       "suppressed": "Unterdrückt",
       "dismissed": "Verworfen"
+    },
+    "createPsaTicket": "PSA-Ticket erstellen",
+    "psaTicketRequested": "PSA-Ticket angefordert",
+    "failedToCreatePsaTicket": "PSA-Ticket konnte nicht angefordert werden",
+    "lifecycleLine": {
+      "text": "{{rearm}} · Abklingzeit {{minutes}} Min. ({{source}})",
+      "rearmNewEvidence": "Wird bei neuen Nachweisen wieder scharf",
+      "rearmAfterDelay": "Wird nach {{minutes}} Min. wieder scharf",
+      "sources": {
+        "monitor": "dieser Monitor",
+        "org": "Org-Standard",
+        "partner": "Partner-Standard",
+        "builtin": "integrierter Standard",
+        "legacy": "Alarmregel"
+      }
     }
   },
   "alertDetails": {
@@ -112,6 +129,7 @@
     "close": "Schließen",
     "createALinkedTicketPreFilledFrom": "Erstellen Sie ein verknüpftes Ticket, das aus dieser Benachrichtigung vorab ausgefüllt ist",
     "createTicket": "Ticket erstellen",
+    "viewTicket": "Ticket {{ticket}} anzeigen",
     "silenceThisAlertStopsNotificationsWithoutResolving": "Diese Warnung stummschalten – stoppt Benachrichtigungen ohne Lösung",
     "suppress": "Unterdrücken",
     "dismissPermanentlyHidesThisAlertForGood": "Dauerhaft schließen – blendet diese Warnung endgültig aus (bei Ablauf der Garantie wird keine erneute Warnung für dasselbe Enddatum angezeigt; andere Bedingungen können dennoch eine neue Warnung öffnen, wenn sie erneut auftreten)",
@@ -124,7 +142,7 @@
     "unknownMetric": "Unbekannte Metrik",
     "statusChange": "{{from}} → {{to}}",
     "resolveAlert": "Alarm beheben",
-    "ticketCreationFailedRetry": "Ticketerstellung fehlgeschlagen. Wiederholen",
+    "ticketCreationFailedRetry": "Ticket konnte nicht erstellt werden. Bitte erneut versuchen",
     "ticketCreated": "Ticket {{ticket}} erstellt",
     "severity": {
       "critical": "Kritisch",
@@ -221,7 +239,11 @@
       "resolved": "Gelöst",
       "suppressed": "Unterdrückt",
       "dismissed": "Verworfen"
-    }
+    },
+    "filterStatusLabel": "Statusfilter",
+    "filterSeverityLabel": "Schweregradfilter",
+    "filterDeviceLabel": "Gerätefilter",
+    "filterDateRangeLabel": "Zeitraumfilter"
   },
   "alertRuleEditPage": {
     "loadingAlertRule": "Warnungsregel wird geladen...",
@@ -430,98 +452,6 @@
     "evaluatedAgainst": "Gegen {{hostname}} ausgewertet",
     "fireSuppressionNote": "Ein aktives Wartungsfenster, Cooldown, eine bereits offene Warnung oder eine Flapping-Unterdrückung können weiterhin verhindern, dass beim Ausführen der Regel eine Warnung ausgelöst wird."
   },
-  "alertTemplateEditor": {
-    "loadingAlertTemplate": "Benachrichtigungsvorlage wird geladen...",
-    "tryAgain": "Versuchen Sie es erneut",
-    "templateMetadata": "Metadaten der Vorlage",
-    "name": "Name",
-    "availableTo": "Verfügbar für",
-    "allMyOrganizations": "Alle meine Organisationen",
-    "partnerWide": "(partnerweit)",
-    "aSpecificOrganization": "Eine bestimmte Organisation",
-    "organization": "Organisation",
-    "selectAnOrganization": "Wählen Sie eine Organisation aus",
-    "severity": "Schweregrad",
-    "category": "Kategorie",
-    "description": "Beschreibung",
-    "conditionBuilder": "Bedingungsersteller",
-    "combineMetricThresholdsWithEventPatternsTo": "Kombinieren Sie metrische Schwellenwerte mit Ereignismustern, um Warnungen auszulösen.",
-    "addMetric": "Metrik hinzufügen",
-    "addEvent": "Ereignis hinzufügen",
-    "trigger": "Auslöser",
-    "remove": "Entfernen",
-    "type": "Typ",
-    "metricThreshold": "Metrikschwelle",
-    "eventPattern": "Ereignismuster",
-    "metric": "Metrisch",
-    "operator": "Betreiber",
-    "thresholdValue": "Schwellenwert",
-    "durationMin": "Dauer (Min.)",
-    "frequencyCount": "Häufigkeitszählung",
-    "eventSource": "Ereignisquelle",
-    "pattern": "Muster",
-    "thresholdConfiguration": "Schwellenwertkonfiguration",
-    "defaultsUsedWhenAddingNewMetricTriggers": "Standardwerte, die beim Hinzufügen neuer Metrik-Trigger verwendet werden. Je nach Bedarf pro Auslöser anpassen.",
-    "defaultValue": "Standardwert",
-    "defaultDurationMin": "Standarddauer (Min.)",
-    "defaultFrequencyCount": "Standardhäufigkeitsanzahl",
-    "escalationRules": "Eskalationsregeln",
-    "routeAlertsBasedOnTimeAndSeverity": "Leiten Sie Warnungen basierend auf Zeit und Schweregrad weiter.",
-    "addEscalation": "Eskalation hinzufügen",
-    "step": "Schritt",
-    "afterMin": "Nach (Min.)",
-    "route": "Route",
-    "suppressionRules": "Unterdrückungsregeln",
-    "avoidNoiseDuringMaintenanceAndDuplicates": "Vermeiden Sie Lärm bei Wartungsarbeiten und Duplikate.",
-    "addWindow": "Fenster hinzufügen",
-    "suppressDuplicateAlerts": "Unterdrücken Sie doppelte Warnungen",
-    "cooldownMinutes": "Abklingminuten",
-    "noMaintenanceWindowsConfiguredAddOneTo": "Keine Wartungsfenster konfiguriert. Fügen Sie eine hinzu, um Warnungen während geplanter Arbeiten stummzuschalten.",
-    "timezone": "Zeitzone",
-    "starts": "Beginnt",
-    "ends": "Endet",
-    "notificationRouting": "Benachrichtigungsweiterleitung",
-    "autoRemediation": "Automatische Korrektur",
-    "linkAnAutomationPlaybookToRunWhen": "Verknüpfen Sie ein Automatisierungs-Playbook, das ausgeführt werden soll, wenn diese Warnung ausgelöst wird.",
-    "enableAutoRemediation": "Aktivieren Sie die automatische Korrektur",
-    "automation": "Automatisierung",
-    "selectAutomation": "Wählen Sie Automatisierung aus",
-    "noAutomationsAvailableCreateOneInAutomations": "Keine Automatisierungen verfügbar. Erstellen Sie eine in den Automatisierungen, um die Behebung zu ermöglichen.",
-    "targetScope": "Zielumfang",
-    "applyThisTemplateToOrganizationsSitesOr": "Wenden Sie diese Vorlage auf Organisationen, Standorte oder Gruppen an.",
-    "scopeType": "Bereichstyp",
-    "organizations": "Organisationen",
-    "sites": "Standorte",
-    "groups": "Gruppen",
-    "no": "Nein",
-    "optionsAvailableThisTemplateWillApplyBroadly": "Optionen verfügbar. Diese Vorlage gilt allgemein."
-  },
-  "alertTemplateList": {
-    "tryAgain": "Versuchen Sie es erneut",
-    "alertTemplates": "Warnvorlagen",
-    "of": "von",
-    "templates": "Vorlagen",
-    "addTemplate": "Vorlage hinzufügen",
-    "allSeverity": "Alle Schweregrade",
-    "critical": "Kritisch",
-    "high": "Hoch",
-    "medium": "Mittel",
-    "low": "Niedrig",
-    "info": "Infos",
-    "allScopes": "Alle Bereiche",
-    "partnerWide": "Partnerweit",
-    "organization": "Organisation",
-    "builtIn": "Eingebaut",
-    "name": "Name",
-    "scope": "Umfang",
-    "severity": "Schweregrad",
-    "category": "Kategorie",
-    "actions": "Aktionen",
-    "noTemplatesMatchYourFilters": "Keine Vorlage entspricht Ihren Filtern.",
-    "deleteConfirm": "Vorlage „{{name}}“ löschen? Dies kann nicht rückgängig gemacht werden.",
-    "deleteFailed": "Vorlage konnte nicht gelöscht werden.",
-    "deleted": "Vorlage gelöscht"
-  },
   "alertVerdict": {
     "label": {
       "actionable": "Handlungsbedarf",
@@ -545,8 +475,6 @@
     "loadingAlerts": "Benachrichtigungen werden geladen...",
     "tryAgain": "Versuchen Sie es erneut",
     "alerts": "Warnungen",
-    "monitorAlertsAcrossYourDevicesRulesAre": "Überwachen Sie Warnungen auf Ihren Geräten. Regeln werden in verwaltet",
-    "configurationPolicies": "Konfigurationsrichtlinien",
     "alert": "Alarm",
     "dismissedAlertsAreHiddenForGoodWarranty": "Verworfene Warnungen werden endgültig ausgeblendet. Bei Ablauf der Garantie wird für dasselbe Enddatum keine erneute Benachrichtigung angezeigt. Andere Warnungen können weiterhin ausgelöst werden, wenn ihr Zustand erneut auftritt.",
     "cancel": "Abbrechen",
@@ -567,6 +495,7 @@
     "alertResolved": "Warnung behoben",
     "alertSuppressed": "„{{title}}“ unterdrückt",
     "failedToSuppressAlert": "Warnung konnte nicht unterdrückt werden",
+    "failedToRestoreAlert": "Die Warnung konnte nicht wiederhergestellt werden. Sie ist weiterhin stummgeschaltet.",
     "failedBulkAction": "{{action}} Warnungen konnten nicht erstellt werden",
     "skippedCount": "{{count}} übersprungen",
     "failedCount": "{{count}} fehlgeschlagen",
@@ -591,7 +520,8 @@
     },
     "bulkConfirmQuestion": "{{action}} {{count}} Alarm?",
     "bulkConfirmQuestion_one": "{{action}} {{count}} Alarm?",
-    "bulkConfirmQuestion_other": "{{action}} {{count}} Warnungen?"
+    "bulkConfirmQuestion_other": "{{action}} {{count}} Warnungen?",
+    "subtitle": "Überwachen Sie Warnungen auf Ihren Geräten. Schwellenwerte werden unter <monitors>Monitore</monitors> festgelegt und über <policies>Konfigurationsrichtlinien</policies> an Kunden ausgerollt."
   },
   "alertsSummary": {
     "activeAlerts": "Aktive Warnungen",
@@ -619,7 +549,6 @@
       "alerts": "Warnungen",
       "correlations": "Korrelationen",
       "monitors": "Monitore",
-      "rules": "Regeln",
       "delivery": "Zustellung"
     }
   },
@@ -632,7 +561,8 @@
     "sections": {
       "channels": "Kanäle",
       "routing": "Weiterleitung",
-      "escalation": "Eskalationsrichtlinien"
+      "escalation": "Eskalationsrichtlinien",
+      "inheritedChannels": "Von Ihrem Partner bereitgestellt"
     },
     "routing": {
       "everythingElse": "Alles andere",
@@ -739,6 +669,7 @@
       "info": "Infos"
     },
     "status": {
+      "open": "Offen",
       "active": "Aktiv",
       "acknowledged": "Anerkannt",
       "resolved": "Gelöst",
@@ -961,7 +892,8 @@
       "webhook": "Webhook",
       "sms": "SMS",
       "pushover": "Pushover"
-    }
+    },
+    "typeLabel": "Typ"
   },
   "notificationChannelsPage": {
     "loadingNotificationChannels": "Benachrichtigungskanäle werden geladen...",
@@ -1051,5 +983,10 @@
       "body": "Bestehende Vorlagen bleiben hier bearbeitbar und werden im nächsten Release umgewandelt.",
       "link": "Monitore öffnen"
     }
+  },
+  "subject": {
+    "label": "Betroffenes Objekt",
+    "backupWorkload": "Backup-Workload",
+    "topologySite": "Topologiestandort"
   }
 }

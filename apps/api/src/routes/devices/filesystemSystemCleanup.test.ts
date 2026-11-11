@@ -74,9 +74,25 @@ vi.mock('../../services/commandQueue', () => ({
 
 vi.mock('../../services/auditEvents', () => ({ writeRouteAudit: writeRouteAuditMock }));
 
+// The route-level check (checkDeviceRemoteToolsPolicy) and the
+// service-level check the AI lane shares (checkAiRemoteToolsPolicy).
+const { checkDeviceRemoteToolsPolicyMock, checkAiRemoteToolsPolicyMock } = vi.hoisted(() => ({
+  checkDeviceRemoteToolsPolicyMock: vi.fn(),
+  checkAiRemoteToolsPolicyMock: vi.fn(),
+}));
+vi.mock('../../services/aiRemoteToolsPolicy', () => ({
+  REMOTE_TOOLS_DISABLED_BY_POLICY: 'REMOTE_TOOLS_DISABLED_BY_POLICY',
+  checkDeviceRemoteToolsPolicy: checkDeviceRemoteToolsPolicyMock,
+  checkAiRemoteToolsPolicy: checkAiRemoteToolsPolicyMock,
+}));
+
 // No mock of services/systemCleanup: the gate, the schemas, the queue/start
 // seam and the shared run-status resolver (with its cancel-and-fail
 // transaction) all run for real against the mocked db above.
+
+vi.mock('./commandOrgScope', () => ({
+  deviceCommandsInCurrentOrg: vi.fn(async () => ({ type: 'commandOrgScope' })),
+}));
 
 vi.mock('./helpers', () => ({
   SITE_ACCESS_DENIED: Symbol.for('site-access-denied'),
@@ -116,6 +132,8 @@ beforeEach(() => {
   vi.clearAllMocks();
   selectMock.mockReturnValue(selectReturning([]));
   getDeviceWithOrgAndSiteCheckMock.mockResolvedValue(modernDevice);
+  checkDeviceRemoteToolsPolicyMock.mockResolvedValue({ allowed: true });
+  checkAiRemoteToolsPolicyMock.mockResolvedValue({ allowed: true });
   queueCommandForExecutionMock.mockResolvedValue({ command: { id: COMMAND_ID, status: 'pending', createdAt: new Date('2026-09-19T10:00:00Z') } });
 });
 
@@ -421,6 +439,19 @@ describe('POST /devices/:id/filesystem/system-cleanup/run/:cleanupRunId/cancel',
     expect(updateMock.mock.calls[0]![0]).toMatchObject({ id: 'runs.id' });
     expect(writeRouteAuditMock).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       action: 'device.filesystem.system_cleanup.cancel',
+      details: { cleanupRunId: RUN_ID, commandId: COMMAND_ID, commandCancelled: true },
+    }));
+  });
+
+  it('records that the command was NOT cancelled when the device had already claimed it (#10161 review)', async () => {
+    selectMock.mockReturnValueOnce(selectReturning([{ id: RUN_ID, deviceId: DEVICE_ID, orgId: 'org-1', kind: 'system', status: 'running', commandId: COMMAND_ID }]));
+    updateReturning([{ id: RUN_ID, commandId: COMMAND_ID }], []); // the command CAS (status = 'pending') matched nothing
+
+    const res = await app().request(`/devices/${DEVICE_ID}/filesystem/system-cleanup/run/${RUN_ID}/cancel`, { method: 'POST' });
+
+    expect(res.status).toBe(200);
+    expect(writeRouteAuditMock).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      details: { cleanupRunId: RUN_ID, commandId: COMMAND_ID, commandCancelled: false },
     }));
   });
 
@@ -474,5 +505,38 @@ describe('POST /devices/:id/filesystem/system-cleanup/run/:cleanupRunId/cancel',
     selectMock.mockReturnValue(selectReturning([]));
     const res = await app().request(`/devices/${DEVICE_ID}/filesystem/system-cleanup/run/${RUN_ID}/cancel`, { method: 'POST' });
     expect(res.status).toBe(404);
+  });
+});
+
+describe('system cleanup honours the per-device remote-tools policy', () => {
+  const denied = { allowed: false, reason: 'Remote tools is disabled by policy "Locked"' };
+
+  it('POST list refuses with 403 and queues nothing', async () => {
+    checkDeviceRemoteToolsPolicyMock.mockResolvedValue(denied);
+    const res = await app().request(`/devices/${DEVICE_ID}/filesystem/system-cleanup/list`, { method: 'POST' });
+    expect(res.status).toBe(403);
+    await expect(res.json()).resolves.toMatchObject({ success: false, code: 'REMOTE_TOOLS_DISABLED_BY_POLICY' });
+    expect(checkDeviceRemoteToolsPolicyMock).toHaveBeenCalledWith(DEVICE_ID);
+    expect(queueCommandForExecutionMock).not.toHaveBeenCalled();
+  });
+
+  it('POST run refuses with 403, records no run and queues nothing', async () => {
+    checkDeviceRemoteToolsPolicyMock.mockResolvedValue(denied);
+    const res = await app().request(`/devices/${DEVICE_ID}/filesystem/system-cleanup/run`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ actionIds: ['linux_pkg_cache_clean'] }),
+    });
+    expect(res.status).toBe(403);
+    await expect(res.json()).resolves.toMatchObject({ success: false, code: 'REMOTE_TOOLS_DISABLED_BY_POLICY' });
+    expect(insertMock).not.toHaveBeenCalled();
+    expect(queueCommandForExecutionMock).not.toHaveBeenCalled();
+  });
+
+  it('does not consult the policy for a device the caller cannot see', async () => {
+    getDeviceWithOrgAndSiteCheckMock.mockResolvedValue(null);
+    const res = await app().request(`/devices/${DEVICE_ID}/filesystem/system-cleanup/list`, { method: 'POST' });
+    expect(res.status).toBe(404);
+    expect(checkDeviceRemoteToolsPolicyMock).not.toHaveBeenCalled();
   });
 });

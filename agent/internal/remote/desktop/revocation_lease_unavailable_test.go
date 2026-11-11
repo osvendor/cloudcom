@@ -7,7 +7,7 @@ import (
 	"github.com/breeze-rmm/agent/internal/ipc"
 )
 
-// SEC-038 owner decision 2: a start whose FIRST lease renewal comes back
+// A start whose FIRST lease renewal comes back
 // `unavailable` hard-stops instead of riding the 90 s grace — a session that
 // has never been confirmed by the control plane has no standing to keep
 // streaming through an outage. Renewals after the session is established keep
@@ -69,12 +69,12 @@ func TestUnavailableAfterRevocationKeepsOriginalReason(t *testing.T) {
 // The manager-level entry point the agent calls when the control plane answers
 // `revocation_lease_unavailable`. An unknown session id is ignored.
 func TestSessionManagerNoteLeaseUnavailableIsSafeForUnknownSession(t *testing.T) {
-	m := NewSessionManager()
+	m := NewSessionManagerWithPreloader(nil)
 	m.NoteLeaseUnavailable("nope") // must not panic
 }
 
 func TestApplyLeaseUpdateRoutesUnavailable(t *testing.T) {
-	m := NewSessionManager()
+	m := NewSessionManagerWithPreloader(nil)
 	// No session: the call is a no-op, but it must be ROUTED as unavailable,
 	// not decoded as a renewal with zero deadlines (which would mark the
 	// session established and hand it the grace window it must not get).

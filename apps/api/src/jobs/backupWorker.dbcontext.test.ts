@@ -49,6 +49,13 @@ const { mockDb, ctxState } = vi.hoisted(() => {
   };
 });
 
+// A device parked in a holding org is covered in backupWorker.test.ts; here
+// every device is an ordinary customer device.
+vi.mock('../services/unassignedPool/deliveryEligibility', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../services/unassignedPool/deliveryEligibility')>()),
+  isParkedDevice: vi.fn(async () => false),
+}));
+
 vi.mock('../db', () => ({
   db: mockDb,
   // Real-ish context wrapper: tracks depth around fn so the tests can assert
@@ -118,6 +125,23 @@ const agentRelayMock = {
   isAgentConnectedAnywhere: vi.fn(async () => true),
   dispatchCommandToAgent: vi.fn(async (): Promise<DispatchOutcome> => ({ status: 'sent', via: 'local' })),
 };
+// Brokered write delivery is covered by backupStorageWriteDelivery.test.ts and
+// the write-session integration suites; here the helper never reports it
+// unless a test says otherwise.
+const writeDeliveryMock = vi.hoisted(() => ({
+  broker: vi.fn(async (input: { provider: string; payload: Record<string, unknown> }) => ({
+    mode: input.provider === 'local' ? 'local' : 'legacy',
+    reason: input.provider === 'local' ? 'no_credential' : 'helper_unsupported',
+    payload: input.payload,
+  })),
+}));
+vi.mock('../services/backupStorageWriteDelivery', () => ({
+  brokerWorkerBackupPayload: writeDeliveryMock.broker,
+  backupWriteRefusalMessage: (reason: string) => (reason === 'mint_failed'
+    ? 'The backup was not started: a secure storage session could not be issued for it. Run the backup again.'
+    : reason),
+}));
+
 vi.mock('../services/agentCommandRelay', () => ({
   isAgentConnectedAnywhere: agentRelayMock.isAgentConnectedAnywhere,
   dispatchCommandToAgent: agentRelayMock.dispatchCommandToAgent,
@@ -127,7 +151,7 @@ const { __testOnly } = await import('./backupWorker');
 
 describe('processDispatchBackup DB-context scoping (final-review fix, #4084/#1105)', () => {
   const DATA = { type: 'dispatch-backup' as const, jobId: 'job-1', configId: 'config-1', orgId: 'org-1', deviceId: 'device-1' };
-  const CONFIG_ROW = { id: 'config-1', provider: 'local', providerConfig: {}, encryption: false };
+  const CONFIG_ROW = { id: 'config-1', orgId: 'org-1', provider: 'local', providerConfig: {}, encryption: false };
   const JOB_ROW = { featureLinkId: null, backupMode: 'file', modeTargets: { paths: ['/data'] } };
 
   // Route every db.select() call by the shape of its column-selector argument
@@ -147,8 +171,9 @@ describe('processDispatchBackup DB-context scoping (final-review fix, #4084/#110
         rows = cancelled ? [{ status: 'cancelled' }] : []; label = 'cancelledSelect'; // isBackupJobCancelled
       } else if (keys.length === 1 && keys[0] === 'orgId') {
         rows = [{ orgId: 'org-1' }]; label = 'deviceOrgSelect';
-      } else if (keys.length === 1 && keys[0] === 'agentId') {
-        rows = [{ agentId: 'agent-1' }]; label = 'deviceSelect'; // device -> agent lookup
+      } else if (keys[0] === 'agentId') {
+        // device -> agent lookup + the helper protocols it reported (an older helper)
+        rows = [{ agentId: 'agent-1', backupWriteProtocolVersion: 0, backupIntegrityProtocolVersion: 0 }]; label = 'deviceSelect';
       } else if (keys.includes('featureLinkId')) {
         rows = [JOB_ROW]; label = 'jobSelect'; // job mode lookup
       } else if (keys.length === 2 && keys.includes('id') && keys.includes('snapshotId')) {
@@ -162,6 +187,10 @@ describe('processDispatchBackup DB-context scoping (final-review fix, #4084/#110
         rows = []; label = 'baseFallbackProbeSelect';
       } else if (keys.length === 1 && keys[0] === 'id') {
         rows = []; label = 'baseLockOrRetirementSelect';
+      } else if (keys.length === 2 && keys[0] === 'integrityVersion' && keys[1] === 'incarnationStartedAt') {
+        // stampDispatchPinAndIdentity's helper-capability read: an older
+        // helper, so the legacy base selection runs.
+        rows = []; label = 'deviceIntegritySelect';
       } else {
         throw new Error(`unexpected select shape: ${JSON.stringify(keys)}`);
       }
@@ -240,9 +269,12 @@ describe('processDispatchBackup DB-context scoping (final-review fix, #4084/#110
       // D18 W01: stampDispatchPinAndIdentity's base-candidate lookup + the
       // tentative identity/lease stamp UPDATE, both inside this same short
       // context (no eligible base -> one candidate select, one update).
+      'deviceIntegritySelect@depth1',
       'baseCandidateSelect@depth1',
       'update@depth1',
       'baseFallbackProbeSelect@depth1',
+      // #11027: the diagnosed fallback reason, still in this short context.
+      'update@depth1',
       'recordExpectation@depth1',
       'ctx:exit',
       // Phase 4: the actual send, NO context held. This is the #1105 fix —
@@ -252,6 +284,11 @@ describe('processDispatchBackup DB-context scoping (final-review fix, #4084/#110
       'deviceOrgSelect@depth1',
       'ctx:exit',
       'wsDispatch@depth0',
+      // Ownership re-read once the command is out (a move can land between
+      // the pre-send read and the send) — its own short context.
+      'ctx:enter',
+      'deviceOrgSelect@depth1',
+      'ctx:exit',
       // Phase 5 (settle): final cancellation guard + status flip — ONE short
       // context.
       'ctx:enter',
@@ -305,6 +342,43 @@ describe('processDispatchBackup DB-context scoping (final-review fix, #4084/#110
     ]);
   });
 
+  // #11027: the reason is explanatory. Dispatch has committed by the time it is
+  // stored, so losing it must not turn an accepted full copy into a failed job.
+  it('stores the diagnosed fallback reason, and only over a NULL', async () => {
+    const realUpdate = mockDb.update.getMockImplementation()!;
+    const payloads: Array<Record<string, unknown>> = [];
+    mockDb.update.mockImplementation(((...args: unknown[]) => {
+      const chain = (realUpdate as (...a: unknown[]) => { set: (p: Record<string, unknown>) => unknown })(...args);
+      return { set: (payload: Record<string, unknown>) => { payloads.push(payload); return chain.set(payload); } };
+    }) as never);
+
+    await __testOnly.processDispatchBackup(DATA as any);
+
+    // In the dispatch transaction: no base, so no reason yet (an older helper).
+    expect(payloads[0]).toMatchObject({ baseSnapshotId: null, fullBackupReason: null });
+    // After commit: the probe found no snapshot at all.
+    expect(payloads[1]).toEqual({ fullBackupReason: 'no_prior_snapshot' });
+  });
+
+  it('still dispatches when storing the diagnosed fallback reason fails', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const realUpdate = mockDb.update.getMockImplementation()!;
+    let updates = 0;
+    mockDb.update.mockImplementation(((...args: unknown[]) => {
+      updates += 1;
+      // The second UPDATE is the post-commit reason stamp (see the order above).
+      if (updates === 2) throw new Error('reason stamp failed');
+      return (realUpdate as (...a: unknown[]) => unknown)(...args);
+    }) as never);
+
+    const result = await __testOnly.processDispatchBackup(DATA as any);
+
+    expect(result).toEqual({ dispatched: true });
+    expect(agentRelayMock.dispatchCommandToAgent).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('diagnosing or recording the reason failed: reason stamp failed'));
+    warn.mockRestore();
+  });
+
   it('marks the job failed in Phase 5 (its own short context) when the outcome is offline', async () => {
     agentRelayMock.dispatchCommandToAgent.mockImplementation(async () => {
       ctxState.events.push(`wsDispatch@depth${ctxState.depth}`);
@@ -331,9 +405,12 @@ describe('processDispatchBackup DB-context scoping (final-review fix, #4084/#110
       // D18 W01: stampDispatchPinAndIdentity's base-candidate lookup + the
       // tentative identity/lease stamp UPDATE, both inside this same short
       // context (no eligible base -> one candidate select, one update).
+      'deviceIntegritySelect@depth1',
       'baseCandidateSelect@depth1',
       'update@depth1',
       'baseFallbackProbeSelect@depth1',
+      // #11027: the diagnosed fallback reason, still in this short context.
+      'update@depth1',
       'recordExpectation@depth1',
       'ctx:exit',
       'ctx:enter',

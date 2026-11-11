@@ -2,14 +2,32 @@ import { z } from 'zod';
 import type { GuardedFetch } from './transport';
 
 const ORIGIN = 'https://graph.microsoft.com/v1.0';
+const EMAIL_METHOD_ID = '3ddfcfc8-9383-446f-83cc-3ab9be4be18f';
+const MOBILE_METHOD_ID = '3179e48a-750b-4051-897c-87b9720928f7';
 const uuid = z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i)
   .transform(value => value.toLowerCase());
-const removal = z.discriminatedUnion('kind', [
+export const authenticationMethodKindSchema = z.enum(['phone', 'microsoftAuthenticator', 'email', 'fido2', 'softwareOath', 'temporaryAccessPass', 'windowsHelloForBusiness', 'platformCredential']);
+// Graph passkey/device-method IDs are opaque, case-sensitive base64url strings, not UUIDs.
+export const authenticationMethodIdSchema = z.string().min(1).max(512).regex(/^[A-Za-z0-9_-]+$/);
+export const authenticationMethodRemovalSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('phone'), methodId: uuid }).strict(),
   z.object({ kind: z.literal('microsoftAuthenticator'), methodId: uuid }).strict(),
+  z.object({ kind: z.literal('email'), methodId: z.literal(EMAIL_METHOD_ID) }).strict(),
+  z.object({ kind: z.literal('softwareOath'), methodId: uuid }).strict(),
+  z.object({ kind: z.literal('temporaryAccessPass'), methodId: uuid }).strict(),
+  z.object({ kind: z.literal('fido2'), methodId: authenticationMethodIdSchema }).strict(),
+  z.object({ kind: z.literal('windowsHelloForBusiness'), methodId: authenticationMethodIdSchema }).strict(),
+  z.object({ kind: z.literal('platformCredential'), methodId: authenticationMethodIdSchema }).strict(),
 ]);
+const methodCollections = {
+  phone: 'phoneMethods', microsoftAuthenticator: 'microsoftAuthenticatorMethods', email: 'emailMethods',
+  fido2: 'fido2Methods', softwareOath: 'softwareOathMethods', temporaryAccessPass: 'temporaryAccessPassMethods',
+  windowsHelloForBusiness: 'windowsHelloForBusinessMethods', platformCredential: 'platformCredentialMethods',
+} as const;
+const recoveryEmail = z.string().trim().min(3).max(320).email();
+const mobileNumber = z.string().trim().min(8).max(40).regex(/^\+[1-9]\d{0,2} [0-9][0-9 ]{5,24}(?:x[0-9]{1,8})?$/);
 
-export type AuthenticationMethodRemoval = z.infer<typeof removal>;
+export type AuthenticationMethodRemoval = { kind: z.infer<typeof authenticationMethodKindSchema>; methodId: string };
 export type AuthenticationMethodErrorCode = 'invalid_input' | 'credential_unavailable' | 'tenant_identity_mismatch'
   | 'provider_access_denied' | 'provider_rate_limited' | 'provider_rejected' | 'provider_unreachable'
   | 'invalid_provider_response' | 'method_not_removable' | 'unknown_write_outcome';
@@ -58,13 +76,36 @@ function sanitizeMethods(value: unknown): SanitizedMethod[] {
       case '#microsoft.graph.microsoftAuthenticatorAuthenticationMethod':
         return { ...(id.success ? { id: id.data } : {}), type: 'microsoftAuthenticator' as const,
           ...(shortText(item.displayName) ? { detail: shortText(item.displayName) } : {}), removable: id.success };
-      case '#microsoft.graph.emailAuthenticationMethod': return { type: 'email' as const, removable: false };
-      case '#microsoft.graph.fido2AuthenticationMethod': return { type: 'fido2' as const, removable: false };
+      case '#microsoft.graph.emailAuthenticationMethod': {
+        const address = recoveryEmail.safeParse(item.emailAddress);
+        return { ...(item.id === EMAIL_METHOD_ID ? { id: EMAIL_METHOD_ID } : {}), type: 'email' as const, ...(address.success ? { detail: address.data } : {}), removable: item.id === EMAIL_METHOD_ID };
+      }
+      case '#microsoft.graph.fido2AuthenticationMethod': {
+        const methodId = authenticationMethodIdSchema.safeParse(item.id);
+        return { ...(methodId.success ? { id: methodId.data } : {}), type: 'fido2' as const,
+          ...(shortText(item.displayName) ? { detail: shortText(item.displayName) } : {}), removable: methodId.success };
+      }
       case '#microsoft.graph.passwordAuthenticationMethod': return { type: 'password' as const, removable: false };
-      case '#microsoft.graph.softwareOathAuthenticationMethod': return { type: 'softwareOath' as const, removable: false };
-      case '#microsoft.graph.temporaryAccessPassAuthenticationMethod': return { type: 'temporaryAccessPass' as const, removable: false };
-      case '#microsoft.graph.windowsHelloForBusinessAuthenticationMethod': return { type: 'windowsHelloForBusiness' as const, removable: false };
-      case '#microsoft.graph.platformCredentialAuthenticationMethod': return { type: 'platformCredential' as const, removable: false };
+      case '#microsoft.graph.softwareOathAuthenticationMethod': {
+        const methodId = id;
+        return { ...(methodId.success ? { id: methodId.data } : {}), type: 'softwareOath' as const,
+          ...(shortText(item.displayName) ? { detail: shortText(item.displayName) } : {}), removable: methodId.success };
+      }
+      case '#microsoft.graph.temporaryAccessPassAuthenticationMethod': {
+        const methodId = id;
+        return { ...(methodId.success ? { id: methodId.data } : {}), type: 'temporaryAccessPass' as const,
+          ...(shortText(item.displayName) ? { detail: shortText(item.displayName) } : {}), removable: methodId.success };
+      }
+      case '#microsoft.graph.windowsHelloForBusinessAuthenticationMethod': {
+        const methodId = authenticationMethodIdSchema.safeParse(item.id);
+        return { ...(methodId.success ? { id: methodId.data } : {}), type: 'windowsHelloForBusiness' as const,
+          ...(shortText(item.displayName) ? { detail: shortText(item.displayName) } : {}), removable: methodId.success };
+      }
+      case '#microsoft.graph.platformCredentialAuthenticationMethod': {
+        const methodId = authenticationMethodIdSchema.safeParse(item.id);
+        return { ...(methodId.success ? { id: methodId.data } : {}), type: 'platformCredential' as const,
+          ...(shortText(item.displayName) ? { detail: shortText(item.displayName) } : {}), removable: methodId.success };
+      }
       default: return { type: 'other' as const, removable: false };
     }
   });
@@ -82,11 +123,12 @@ export function createAuthenticationMethodsProvider(options: {
   acquireToken: (tenantId: string) => Promise<string>;
 }) {
   const tenantId = fail(uuid, options.tenantId, 'invalid_input');
-  async function request(token: string, path: string, method = 'GET') {
+  async function request(token: string, path: string, method = 'GET', body?: unknown) {
     const mutation = method !== 'GET';
     try {
       const result = await options.fetch(`${ORIGIN}${path}`, {
-        method, headers: { Authorization: `Bearer ${token}` }, redirect: 'error',
+        method, headers: { Authorization: `Bearer ${token}`, ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }), redirect: 'error',
         signal: AbortSignal.timeout(15000), timeoutMs: 15000, maxBytes: 1024 * 1024,
       });
       if (result.status === 401 || result.status === 403) throw new AuthenticationMethodError('provider_access_denied');
@@ -128,16 +170,45 @@ export function createAuthenticationMethodsProvider(options: {
     },
     async remove(userId: string, input: AuthenticationMethodRemoval, guard?: () => Promise<void>) {
       userId = fail(uuid, userId, 'invalid_input');
-      const target = fail(removal, input, 'invalid_input');
+      const target = fail(authenticationMethodRemovalSchema, input, 'invalid_input');
       const token = await session(true);
       await guard?.();
       const methods = await listWithToken(token, userId);
       if (!methods.some(method => method.id === target.methodId && method.type === target.kind && method.removable))
         throw new AuthenticationMethodError('method_not_removable');
       await guard?.();
-      const collection = target.kind === 'phone' ? 'phoneMethods' : 'microsoftAuthenticatorMethods';
-      await request(token, `/users/${userId}/authentication/${collection}/${target.methodId}`, 'DELETE');
+      const collection = methodCollections[target.kind];
+      await request(token, `/users/${userId}/authentication/${collection}/${encodeURIComponent(target.methodId)}`, 'DELETE');
       return { accepted: true as const };
+    },
+    async setRecoveryEmail(userId: string, value: string, guard?: () => Promise<void>) {
+      userId = fail(uuid, userId, 'invalid_input');
+      const emailAddress = fail(recoveryEmail, value, 'invalid_input');
+      const token = await session(true);
+      await guard?.();
+      const before = await listWithToken(token, userId);
+      const existing = before.find(item => item.type === 'email');
+      await guard?.();
+      await request(token, `/users/${userId}/authentication/emailMethods${existing ? `/${EMAIL_METHOD_ID}` : ''}`,
+        existing ? 'PATCH' : 'POST', { emailAddress });
+      await guard?.();
+      const after = await listWithToken(token, userId);
+      return { accepted: true as const, verified: after.some(item => item.type === 'email' && item.detail?.toLowerCase() === emailAddress.toLowerCase()) };
+    },
+    async setMobilePhone(userId: string, value: string, guard?: () => Promise<void>) {
+      userId = fail(uuid, userId, 'invalid_input');
+      const phoneNumber = fail(mobileNumber, value, 'invalid_input');
+      const token = await session(true);
+      await guard?.();
+      const before = await listWithToken(token, userId);
+      const existing = before.find(item => item.type === 'phone' && item.id === MOBILE_METHOD_ID);
+      await guard?.();
+      await request(token, `/users/${userId}/authentication/phoneMethods${existing ? `/${MOBILE_METHOD_ID}` : ''}`,
+        existing ? 'PATCH' : 'POST', { phoneNumber, phoneType: 'mobile' });
+      await guard?.();
+      const after = fail(z.object({ id: uuid, phoneType: z.literal('mobile'), phoneNumber: z.string() }).passthrough(),
+        await request(token, `/users/${userId}/authentication/phoneMethods/${MOBILE_METHOD_ID}`), 'invalid_provider_response');
+      return { accepted: true as const, verified: after.id === MOBILE_METHOD_ID && after.phoneNumber === phoneNumber };
     },
   };
 }

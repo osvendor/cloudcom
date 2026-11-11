@@ -1,6 +1,18 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+// routes/ai.ts reaches the model registry (ticket-draft) -> candidateLoader,
+// which this file's partial schema mock does not cover. Not under test here.
+vi.mock('../services/aiModels/sessionModel', () => ({
+  resolveSessionTurn: vi.fn(),
+}));
 import { Hono } from 'hono';
 
+// Topology M4-D2: the admin/session reads resolve the caller's pinned-site visibility.
+vi.mock('../services/topology/aiSessionAccess', () => ({
+  resolveTopologySessionVisibility: vi.fn(async () => ({ kind: 'all' })),
+  topologySessionAccessCondition: vi.fn(async () => undefined),
+  topologySessionCondition: vi.fn(() => undefined),
+}));
 vi.mock('../db', () => ({
   runOutsideDbContext: vi.fn((fn) => fn()),
   withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn()),
@@ -276,7 +288,8 @@ describe('GET /ai/admin/sessions?flagged filter', () => {
     expect(res.status).toBe(200);
     expect(getSessionHistory).toHaveBeenCalledWith(
       '11111111-1111-1111-1111-111111111111',
-      expect.objectContaining({ flagged: true })
+      expect.objectContaining({ flagged: true }),
+      { kind: 'all' },
     );
   });
 
@@ -290,7 +303,8 @@ describe('GET /ai/admin/sessions?flagged filter', () => {
     expect(res.status).toBe(200);
     expect(getSessionHistory).toHaveBeenCalledWith(
       '11111111-1111-1111-1111-111111111111',
-      expect.objectContaining({ flagged: undefined })
+      expect.objectContaining({ flagged: undefined }),
+      { kind: 'all' },
     );
   });
 });

@@ -32,7 +32,7 @@ vi.mock('../services/commandQueue', () => ({
 function chainMock(resolvedValue: unknown = []) {
   const terminal = vi.fn(() => Promise.resolve(resolvedValue));
   const chain: Record<string, any> = {};
-  for (const method of ['from', 'where', 'leftJoin', 'innerJoin', 'orderBy', 'groupBy', 'limit', 'returning', 'values', 'set']) {
+  for (const method of ['from', 'where', 'leftJoin', 'innerJoin', 'orderBy', 'groupBy', 'limit', 'for', 'returning', 'values', 'set']) {
     chain[method] = vi.fn(() => Object.assign(Promise.resolve(resolvedValue), chain));
   }
   // Make the chain itself thenable
@@ -44,7 +44,27 @@ const insertMock = vi.fn(() => chainMock([]));
 const updateMock = vi.fn(() => chainMock([]));
 const deleteMock = vi.fn(() => chainMock([]));
 
+// Key history recording is covered by configs.test.ts and its integration suite.
+vi.mock('../services/backupStorageCredentialHistory', () => ({ recordCredentialChange: async () => undefined }));
+// Stored-bytes aggregates (#9631) are a window-function subquery the mocked
+// db chain cannot build; the SQL is proven against real Postgres in
+// __tests__/integration/backupStoredBytes.integration.test.ts.
+const storedBytesMocks = vi.hoisted(() => ({
+  sumStoredSnapshotBytes: vi.fn(async () => ({ totalBytes: 0, count: 0 })),
+  storedSnapshotBytesByProviderSince: vi.fn(async () => [] as Array<{ provider: string | null; day: string | null; bytes: number }>),
+  sumStoredSnapshotBytesByProvider: vi.fn(async () => [] as Array<{ provider: string | null; bytes: number; snapshots: number }>),
+}));
+vi.mock('../services/backupStoredBytes', () => storedBytesMocks);
+// Restore integrity checks are covered in backup/restoreIntegrityGate.test.ts.
+vi.mock('./backup/restoreIntegrityGate', () => ({
+  checkRestoreIntegrityRequest: async () => ({ ok: true, authorizationReason: null }),
+  gateRestoreCommand: async () => ({ ok: true }),
+  recordRequestAuthorization: async () => 'authorization-1',
+  restoreIntegrityResponse: (c: any, check: any) => c.json(check.body, check.status),
+}));
 vi.mock('../db', () => ({
+  withDbTransaction: async (fn: () => Promise<unknown>) => fn(),
+  withDbTransactionIfHeld: vi.fn(async (fn: () => any) => fn()),
   db: {
     select: (...args: unknown[]) => selectMock(...(args as [])),
     insert: (...args: unknown[]) => insertMock(...(args as [])),
@@ -426,6 +446,20 @@ describe('backup routes', () => {
     expect(fetched.data.resultDetails.status).toBe('failed');
   });
 
+  it('has no endpoint that confirms a restore without a second factor', async () => {
+    const res = await app.request(`/backup/restore-confirmations?orgId=${ORG_ID}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({
+        snapshotId: SNAPSHOT_ID,
+        targetDeviceId: DEVICE_ID,
+        commandType: 'backup_restore',
+        confirmationText: 'Front Desk PC',
+      }),
+    });
+    expect(res.status).toBe(404);
+  });
+
   it('should list restore jobs with structured result details', async () => {
     const now = new Date();
     selectMock.mockReturnValueOnce(
@@ -468,8 +502,11 @@ describe('backup routes', () => {
   });
 
   it('should return provider usage history timeline', async () => {
-    // Mock for usage-history: select snapshots with leftJoin
-    selectMock.mockReturnValueOnce(chainMock([]));
+    const today = new Date().toISOString().slice(0, 10);
+    storedBytesMocks.storedSnapshotBytesByProviderSince.mockResolvedValueOnce([
+      { provider: 's3', day: null, bytes: 100 },
+      { provider: 's3', day: today, bytes: 19 },
+    ]);
 
     const res = await app.request('/backup/usage-history?days=7', {
       method: 'GET',
@@ -481,7 +518,10 @@ describe('backup routes', () => {
     expect(payload.data.days).toBe(7);
     expect(Array.isArray(payload.data.points)).toBe(true);
     expect(payload.data.points.length).toBe(7);
-    expect(Array.isArray(payload.data.providers)).toBe(true);
+    expect(payload.data.providers).toEqual(['s3']);
+    // Starts at the pre-window stored level and ends at it plus today's uploads.
+    expect(payload.data.points[0].totalBytes).toBe(100);
+    expect(payload.data.points[6].totalBytes).toBe(119);
   });
 
   it('should run backup verification and expose readiness data', async () => {

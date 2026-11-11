@@ -50,6 +50,7 @@ import { useManualOrder } from './useManualOrder';
 import { useArchivedOrganizations } from './useArchivedOrganizations';
 import { RollupBand, type RollupCell } from './RollupBand';
 import { AccountBoardTable, REORDER_HINT_ID } from './AccountBoardTable';
+import { useStableT } from '@/lib/i18n/useStableT';
 
 type BoardOrganization = Organization & { partnerId?: string };
 
@@ -79,7 +80,6 @@ type OrganizationFormValues = {
   slug: string;
   type: 'customer' | 'internal';
   status: 'active' | 'trial' | 'suspended' | 'churned' | 'offboarding';
-  maxDevices: number;
   contractStart?: string;
   contractEnd?: string;
 };
@@ -121,6 +121,7 @@ const CHIP_BUTTON = (pressed: boolean) =>
 
 export default function OrganizationsBoardPage() {
   const { t } = useTranslation('organizations');
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   const { t: tSettings } = useTranslation('settings');
   // Merge is partner-scope only (the API's merge routes require partner/system
   // scope). `useJwtClaims()` so this stays reactive to the token landing after
@@ -188,19 +189,19 @@ export default function OrganizationsBoardPage() {
               handleSessionExpired();
               return null;
             }
-            throw new Error(t('orgBoard.errors.fetchOrganizations'));
+            throw new Error(stableT('orgBoard.errors.fetchOrganizations'));
           }
           return response.json();
         }, { order: 'server' });
         if (list === null) return;
         setOrganizations(list);
       } catch (err) {
-        setError(err instanceof Error ? err.message : t('orgBoard.errors.generic'));
+        setError(err instanceof Error ? err.message : stableT('orgBoard.errors.generic'));
       } finally {
         if (!silent) setLoading(false);
       }
     },
-    [t],
+    [stableT],
   );
   const refetchSilently = useCallback(() => fetchOrganizations({ silent: true }), [fetchOrganizations]);
   const manualOrder = useManualOrder({ organizations, setOrganizations, refetch: refetchSilently });
@@ -397,7 +398,14 @@ export default function OrganizationsBoardPage() {
   };
   const handleCloseModal = () => setModalMode('closed');
   /** LIST-STATE UPDATE ONLY: the modal stays open on its own `done` phase. */
-  const handleArchiveComplete = (archivedId: string) => setOrganizations((prev) => prev.filter((o) => o.id !== archivedId));
+  const handleArchiveComplete = (archivedId: string) => {
+    setOrganizations((prev) => prev.filter((o) => o.id !== archivedId));
+    // Header org switcher reads the global store; without this it keeps listing the archived org (#8371).
+    useOrgStore
+      .getState()
+      .fetchOrganizations()
+      .catch((storeErr: unknown) => console.warn('[OrganizationsBoardPage] org store refresh failed after archive', storeErr));
+  };
   const handleArchiveDoneClose = () => {
     setTargetOrg(null);
     handleCloseModal();

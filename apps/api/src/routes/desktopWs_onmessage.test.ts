@@ -4,6 +4,18 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 // Mocks — must be declared before any import that triggers the modules
 // -------------------------------------------------------------------
 
+// Existing route cases exercise the non-isolated ICE plan.
+vi.mock('./remote/desktopRelayPolicy', async () => {
+  const { getIceServers } = await import('./remote/helpers');
+  return {
+    resolveDesktopIcePlan: async (_deviceId: string, scope: import('./remote/helpers').TurnCredentialScope) => ({
+      ok: true,
+      relayOnly: false,
+      iceServers: getIceServers(scope),
+    }),
+  };
+});
+
 vi.mock('../db', () => ({
   runOutsideDbContext: vi.fn((fn: () => unknown) => fn()),
   withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn()),
@@ -83,8 +95,10 @@ vi.mock('../services/rate-limit', () => ({
 }));
 
 vi.mock('./remote/helpers', () => ({
+  createDesktopStartCommandId: vi.fn((id: string) => `desk-start-${id}-${crypto.randomUUID()}`),
   logSessionAudit: vi.fn(async () => undefined),
   getIceServers: vi.fn(() => []),
+  buildRemoteSessionPromptPayload: vi.fn(async () => undefined),
 }));
 
 vi.mock('../services/clientIp', () => ({
@@ -128,7 +142,23 @@ import {
   isDesktopSessionOwnedByAgent,
   getActiveDesktopSessionCount,
   __resetDesktopWsForTest,
+  settleDesktopStreamStart,
 } from './desktopWs';
+
+/**
+ * Play the agent accepting the relay's published desktop_stream_start (the
+ * relay forwards nothing and sends no "connected" before that). Throws when the
+ * open published no start: call it only where one is expected.
+ */
+function acceptPublishedStart(): void {
+  const calls = vi.mocked(sendCommandToAgent).mock.calls.filter(
+    ([, cmd]) => (cmd as { type?: string }).type === 'desktop_stream_start',
+  );
+  const last = calls.at(-1);
+  if (!last) throw new Error("acceptPublishedStart: the open published no desktop_stream_start");
+  const [agentId, cmd] = last as unknown as [string, { id: string; payload: { sessionId: string } }];
+  settleDesktopStreamStart(cmd.payload.sessionId, agentId, cmd.id, { outcome: 'accepted' });
+}
 
 // -------------------------------------------------------------------
 // Helpers
@@ -199,7 +229,7 @@ function mockUpdateNoReturn() {
 }
 
 // select().from().where().limit().for('update') — the row-locked read
-// commitDesktopStreamStartIntent issues (SEC-038 W02, real impl in
+// commitDesktopStreamStartIntent issues (real impl in
 // remoteDesktopStartIntent.ts, not mocked in this file).
 function mockSelectLimitForChain(result: unknown) {
   return {
@@ -282,7 +312,7 @@ function setupSuccessfulValidation() {
         })
       })
     } as any)
-    // commitDesktopStreamStartIntent: row-locked read (SEC-038 W02)
+    // commitDesktopStreamStartIntent: row-locked read
     .mockReturnValueOnce(mockSelectLimitForChain([{
       status: session.status,
       terminationPhase: 'none',
@@ -334,6 +364,8 @@ describe('desktopWs', () => {
       ws = wsMock();
 
       await handlers.onOpen({}, ws);
+
+      acceptPublishedStart();
       ws.send.mockClear();
       vi.mocked(sendCommandToAgent).mockClear();
     });

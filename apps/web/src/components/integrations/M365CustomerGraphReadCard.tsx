@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   CheckCircle2,
+  ChevronRight,
   Clock3,
   Loader2,
   PauseCircle,
@@ -11,7 +12,8 @@ import {
   Unplug,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
-import { M365_PERMISSION_PROFILES } from "@breeze/shared";
+import { M365_PERMISSION_PROFILES, isM365SyncDomain } from "@breeze/shared";
+import type { M365SyncDomain } from "@breeze/shared";
 import { fetchWithAuth } from "../../stores/auth";
 import { useOrgStore } from "../../stores/orgStore";
 import { getJwtClaims } from "../../lib/authScope";
@@ -20,6 +22,9 @@ import { handleActionError, runAction } from "../../lib/runAction";
 import { navigateToMicrosoftLogin } from "@/lib/navigation";
 import { formatDateTime, formatRelativeTime } from "@/lib/dateTimeFormat";
 import "@/lib/i18n";
+import { M365ConfirmTenantPanel, M365ConsentSteps } from "./M365ConfirmTenantPanel";
+import { parseOnboardingAvailability } from "./m365ConsentSummary";
+import type { M365ConsentStepSummary, M365OnboardingAvailability } from "./m365ConsentSummary";
 
 const STATUSES = [
   "pending-consent",
@@ -35,6 +40,9 @@ const STABLE_ERROR_CODES = [
   "consent_expired",
   "consent_state_mismatch",
   "consent_cancelled",
+  "conditional_access_blocked",
+  "consent_provider_error",
+  "user_consent_blocked",
   "admin_role_required",
   "tenant_mismatch",
   "tenant_already_bound",
@@ -60,10 +68,13 @@ const GRANT_HEALTH_STATES = [
 ] as const;
 type GrantHealthState = (typeof GRANT_HEALTH_STATES)[number];
 
-const SYNC_DOMAINS = [
-  "users", "signin_activity", "intune_devices", "ca_policies", "skus", "secure_score",
-] as const;
-type SyncDomain = (typeof SYNC_DOMAINS)[number];
+// The domain vocabulary comes from @breeze/shared (M365_SYNC_DOMAINS), the same
+// list the API's summary is built from, so the two cannot drift. A domain this
+// bundle still does not know (a newer API, a rolling deploy) degrades to an
+// "unknown" label; it must never fail the envelope and hide the tenant (#9392).
+const SYNC_DOMAIN_WIRE_PATTERN = /^[a-z][a-z0-9_]{0,63}$/;
+// Bounds the parse, not the vocabulary: well above the real domain count.
+const MAX_SYNC_DOMAINS = 64;
 
 const SYNC_STATUSES = [
   "success", "partial", "needs_consent", "throttled", "error", "never",
@@ -71,7 +82,10 @@ const SYNC_STATUSES = [
 type SyncStatus = (typeof SYNC_STATUSES)[number];
 
 type SyncDomainState = {
-  domain: SyncDomain;
+  /** The wire name, kept for React keys only; never rendered. */
+  wireDomain: string;
+  /** `null` when this bundle does not know the domain. */
+  domain: M365SyncDomain | null;
   status: SyncStatus;
   asOf: string | null;
   truncated: boolean;
@@ -88,6 +102,9 @@ export const M365_CUSTOMER_GRAPH_READ_CALLBACK_RESULTS = [
   "active",
   "degraded",
   ...STABLE_ERROR_CODES,
+  // Not an outcome: the identity callback parked a verified tenant and the
+  // operator must confirm it before Microsoft's consent screen (#7913 W03).
+  "confirm-tenant",
 ] as const;
 export type M365CustomerGraphReadCallbackResult =
   (typeof M365_CUSTOMER_GRAPH_READ_CALLBACK_RESULTS)[number];
@@ -95,6 +112,10 @@ export type M365CustomerGraphReadCallbackResult =
 interface M365CustomerGraphReadCardProps {
   callbackResult?: M365CustomerGraphReadCallbackResult | null;
   callbackRefreshKey?: number;
+  /** Reports load state and connection identity to the tenant section. */
+  onStateChange?: (summary: M365ConsentStepSummary) => void;
+  /** The tenant panel header already shows the tenant name and ID. */
+  hideTenantIdentity?: boolean;
 }
 
 type Grant = {
@@ -130,6 +151,7 @@ type Envelope = {
     requiredGrants: Grant[];
   };
   onboardingEnabled: boolean;
+  onboardingAvailability: M365OnboardingAvailability;
   connection: Connection | null;
   syncEnabled: boolean;
   sync: SyncSummary | null;
@@ -269,14 +291,15 @@ function parseSyncDomain(value: unknown): SyncDomainState | null {
   if (!isRecord(value) || !hasExactKeys(value, ["domain", "status", "asOf", "truncated", "unlicensed"])) return null;
   const asOf = parseTimestamp(value.asOf);
   if (
-    typeof value.domain !== "string" || !(SYNC_DOMAINS as readonly string[]).includes(value.domain)
+    typeof value.domain !== "string" || !SYNC_DOMAIN_WIRE_PATTERN.test(value.domain)
     || typeof value.status !== "string" || !(SYNC_STATUSES as readonly string[]).includes(value.status)
     || asOf === undefined
     || typeof value.truncated !== "boolean"
     || typeof value.unlicensed !== "boolean"
   ) return null;
   return {
-    domain: value.domain as SyncDomain,
+    wireDomain: value.domain,
+    domain: isM365SyncDomain(value.domain) ? value.domain : null,
     status: value.status as SyncStatus,
     asOf,
     truncated: value.truncated,
@@ -292,7 +315,7 @@ function parseSync(value: unknown): SyncSummary | null | undefined {
   const users = parseCount(value.users);
   const devices = parseCount(value.devices);
   if (
-    !Array.isArray(value.domains) || value.domains.length > SYNC_DOMAINS.length
+    !Array.isArray(value.domains) || value.domains.length > MAX_SYNC_DOMAINS
     || lastSuccessAt === undefined || users === undefined || devices === undefined
   ) return undefined;
   const domains = value.domains.map(parseSyncDomain);
@@ -301,9 +324,17 @@ function parseSync(value: unknown): SyncSummary | null | undefined {
 }
 
 function parseEnvelope(value: unknown): Envelope | null {
-  if (!isRecord(value) || !hasExactKeys(value, [
+  if (!isRecord(value)) return null;
+  // `onboardingAvailability` is optional on the wire (an API that predates it
+  // omits it); every other key stays strictly required.
+  const { onboardingAvailability: rawAvailability, ...rest } = value;
+  if (!hasExactKeys(rest, [
     "profile", "onboardingEnabled", "connection", "syncEnabled", "sync",
   ])) return null;
+  const onboardingAvailability = typeof value.onboardingEnabled === "boolean"
+    ? parseOnboardingAvailability(rawAvailability, value.onboardingEnabled)
+    : null;
+  if (onboardingAvailability === null) return null;
   if (!isRecord(value.profile) || !hasExactKeys(value.profile, ["id", "displayName", "manifestVersion", "requiredGrants"])) return null;
   const grants = parseGrants(value.profile.requiredGrants);
   const connection = parseConnection(value.connection);
@@ -326,6 +357,7 @@ function parseEnvelope(value: unknown): Envelope | null {
       requiredGrants: grants,
     },
     onboardingEnabled: value.onboardingEnabled,
+    onboardingAvailability,
     connection,
     syncEnabled: value.syncEnabled,
     sync,
@@ -382,6 +414,8 @@ function GrantList({ grants, testId }: { grants: Grant[]; testId?: string }) {
 export default function M365CustomerGraphReadCard({
   callbackResult = null,
   callbackRefreshKey = 0,
+  onStateChange,
+  hideTenantIdentity = false,
 }: M365CustomerGraphReadCardProps) {
   const { t } = useTranslation("integrations");
   const currentOrgId = useOrgStore((value) => value.currentOrgId);
@@ -637,6 +671,29 @@ export default function M365CustomerGraphReadCard({
   }, [canWrite, data, isCurrent, load, orgId, perform, scope, scopedRequest, t]);
 
   const connection = data?.connection ?? null;
+
+  // Report a projection of what this step loaded to the tenant section. The
+  // callback is read through a ref so a parent passing an inline function
+  // cannot turn this into a render loop.
+  const onStateChangeRef = useRef(onStateChange);
+  onStateChangeRef.current = onStateChange;
+  const summary = useMemo<M365ConsentStepSummary>(() => ({
+    loadState,
+    onboardingEnabled: data?.onboardingEnabled ?? false,
+    onboardingAvailability: data?.onboardingAvailability ?? "instance_disabled",
+    connection: connection
+      ? {
+          tenantId: connection.tenantId,
+          displayName: connection.displayName,
+          lastVerifiedAt: connection.lastVerifiedAt,
+          status: connection.status,
+        }
+      : null,
+  }), [connection, data, loadState]);
+  useEffect(() => {
+    onStateChangeRef.current?.(summary);
+  }, [summary]);
+
   const reconciliationUnavailable = connection?.lastErrorCode === "grant_reconciliation_unavailable";
   const hasLastKnownGrantHealth = reconciliationUnavailable && connection.grantsVerifiedAt !== null;
   const grantHealthUnknown = reconciliationUnavailable && connection.grantsVerifiedAt === null;
@@ -653,56 +710,95 @@ export default function M365CustomerGraphReadCard({
     : t("m365CustomerGraphRead.grants.unexpectedAlert");
   const canRetestConnection = connection?.status === "active" || connection?.status === "degraded";
   const StatusIcon = connection ? statusIcon(connection.status) : Unplug;
+  // "Retest" wording only makes sense where the Retest button is shown; a
+  // connection still pending consent has to be connected again instead.
+  const errorKey = (code: string) => (code === "executor_unavailable" && connection && !canRetestConnection
+    ? "executor_unavailablePending"
+    : code);
   const errorCopy = useMemo(() => {
     if (!connection?.lastErrorCode) return null;
+    // The callback banner above already says this; don't repeat it.
+    if (callbackResult === connection.lastErrorCode) return null;
     // The banner below already says this, in words an administrator can act on.
     if (connection.grantHealth === "manifest-stale" && connection.lastErrorCode === "manifest_stale") {
       return null;
     }
     return isStableErrorCode(connection.lastErrorCode)
-      ? t(/* i18n-dynamic */ `m365CustomerGraphRead.errors.${connection.lastErrorCode}`)
+      ? t(/* i18n-dynamic */ `m365CustomerGraphRead.errors.${errorKey(connection.lastErrorCode)}`)
       : t("m365CustomerGraphRead.errors.unknown");
-  }, [connection, t]);
+  }, [connection, callbackResult, canRetestConnection, t]);
   const syncChips = useMemo(() => {
     const chips: { key: string; label: string }[] = [];
     for (const entry of data?.sync?.domains ?? []) {
-      const domain = t(/* i18n-dynamic */ `m365CustomerGraphRead.sync.domains.${entry.domain}`);
-      if (entry.unlicensed) {
+      const domain = entry.domain
+        ? t(/* i18n-dynamic */ `m365CustomerGraphRead.sync.domains.${entry.domain}`)
+        : t("m365CustomerGraphRead.sync.domains.unknown");
+      if (entry.unlicensed && entry.domain) {
         // Its own sentence, not "{{domain}}: unlicensed": the actionable fact is
-        // that the TENANT needs Entra ID P1, not that a sync went wrong.
-        chips.push({ key: `${entry.domain}:unlicensed`, label: t("m365CustomerGraphRead.sync.chips.unlicensed") });
+        // that the TENANT needs Entra ID P1, not that a sync went wrong. Only for
+        // a known domain: the card cannot say which license an unknown one needs,
+        // so that falls through to its status chip.
+        chips.push({ key: `${entry.wireDomain}:unlicensed`, label: t("m365CustomerGraphRead.sync.chips.unlicensed") });
       } else if (entry.status === "throttled") {
-        chips.push({ key: `${entry.domain}:throttled`, label: t("m365CustomerGraphRead.sync.chips.throttled", { domain }) });
+        chips.push({ key: `${entry.wireDomain}:throttled`, label: t("m365CustomerGraphRead.sync.chips.throttled", { domain }) });
       } else if (entry.status === "needs_consent") {
-        chips.push({ key: `${entry.domain}:needs-consent`, label: t("m365CustomerGraphRead.sync.chips.needsConsent", { domain }) });
+        chips.push({ key: `${entry.wireDomain}:needs-consent`, label: t("m365CustomerGraphRead.sync.chips.needsConsent", { domain }) });
       } else if (entry.status === "error") {
-        chips.push({ key: `${entry.domain}:error`, label: t("m365CustomerGraphRead.sync.chips.error", { domain }) });
+        chips.push({ key: `${entry.wireDomain}:error`, label: t("m365CustomerGraphRead.sync.chips.error", { domain }) });
       } else if (entry.status === "partial" || entry.truncated) {
-        chips.push({ key: `${entry.domain}:partial`, label: t("m365CustomerGraphRead.sync.chips.partial", { domain }) });
+        chips.push({ key: `${entry.wireDomain}:partial`, label: t("m365CustomerGraphRead.sync.chips.partial", { domain }) });
       }
       // 'success' and 'never' get no chip: the summary line already says whether
       // anything has ever synced, and a chip per healthy domain is noise.
     }
-    return chips;
+    // Two domains can produce the same sentence (signin_activity and
+    // signin_events both need Entra ID P1; two unrecognized domains share one
+    // label). One chip per distinct sentence.
+    const seen = new Set<string>();
+    return chips.filter((chip) => !seen.has(chip.label) && !!seen.add(chip.label));
   }, [data, t]);
   const callbackCopy = callbackResult === "active"
     ? t("m365CustomerGraphRead.callback.active")
     : callbackResult === "degraded"
       ? t("m365CustomerGraphRead.callback.degraded")
-      : callbackResult
-        ? t(/* i18n-dynamic */ `m365CustomerGraphRead.errors.${callbackResult}`)
+      : callbackResult && callbackResult !== "confirm-tenant"
+        ? t(/* i18n-dynamic */ `m365CustomerGraphRead.errors.${errorKey(callbackResult)}`)
         : null;
+  const showConfirmTenant = callbackResult === "confirm-tenant" && !!orgId;
+  const reloadAfterCancel = useCallback(() => { void load(scope); }, [load, scope]);
+
+  // Onboarding is gated by server-side switches the org cannot change: an
+  // instance-wide flag AND a per-org allowlist (`onboardingAvailability` says
+  // which one is off, #9319). With nothing connected there is nothing to manage, so the
+  // card collapses to its header and one neutral status line instead of a
+  // permission list and a Connect button that can never be pressed.
+  const instanceUnavailable = loadState === "ready" && !!data && !data.onboardingEnabled && !connection;
+  const instanceUnavailableId = "customer-graph-read-instance-unavailable";
 
   return (
-    <section className="rounded-xl border bg-card p-5 sm:p-6" aria-labelledby="customer-graph-read-title">
+    <section
+      aria-labelledby="customer-graph-read-title"
+      aria-describedby={instanceUnavailable ? instanceUnavailableId : undefined}
+      data-testid="m365-read-step"
+    >
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div className="flex min-w-0 items-start gap-3">
           <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
             <ShieldCheck aria-hidden="true" className="h-5 w-5" />
           </span>
           <div className="min-w-0">
-            <h2 id="customer-graph-read-title" className="text-lg font-semibold text-foreground">{t("m365CustomerGraphRead.title")}</h2>
-            <p className="mt-1 max-w-3xl text-sm leading-6 text-muted-foreground">{t("m365CustomerGraphRead.description")}</p>
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+              <h3 id="customer-graph-read-title" className="text-base font-semibold text-foreground">
+                <span className="font-normal text-muted-foreground">{t("m365TenantPanel.stepLabel", { number: 1 })} · </span>
+                {t("m365CustomerGraphRead.stepTitle")}
+              </h3>
+              {!connection && (
+                <span className="inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium text-muted-foreground">
+                  {t("m365CustomerGraphRead.recommendedFirst")}
+                </span>
+              )}
+            </div>
+            <p className="mt-1 max-w-3xl text-sm leading-6 text-muted-foreground">{t("m365CustomerGraphRead.stepDescription")}</p>
           </div>
         </div>
         {connection && (
@@ -726,6 +822,17 @@ export default function M365CustomerGraphReadCard({
         </p>
       )}
 
+      {showConfirmTenant && orgId && (
+        <M365ConfirmTenantPanel
+          key={orgId}
+          apiBase="/m365/connections/customer-graph-read/consent"
+          orgId={orgId}
+          canWrite={canWrite}
+          onCancelled={reloadAfterCancel}
+          testId="m365-read-confirm-tenant"
+        />
+      )}
+
       {loadState === "unavailable" && (
         <p className="mt-6 rounded-md bg-muted p-4 text-sm text-muted-foreground">{t("m365CustomerGraphRead.selectOrganization")}</p>
       )}
@@ -742,8 +849,27 @@ export default function M365CustomerGraphReadCard({
         </div>
       )}
 
-      {loadState === "ready" && data && (
-        <div className="mt-6 space-y-6">
+      {instanceUnavailable && (
+        <p id={instanceUnavailableId} className="mt-4 text-sm text-muted-foreground">
+          {data?.onboardingAvailability === "org_not_enabled"
+            ? t("m365CustomerGraphRead.notEnabledForOrg")
+            : t("m365CustomerGraphRead.notAvailableOnInstance")}
+        </p>
+      )}
+
+      {loadState === "ready" && data && !instanceUnavailable && (
+        <div className="mt-5 space-y-6">
+          <div>
+            <p className="text-sm text-foreground">{t("m365CustomerGraphRead.capabilities.intro")}</p>
+            <ul className="mt-2 space-y-1.5 text-sm text-foreground">
+              {(["users", "devices", "posture"] as const).map((key) => (
+                <li key={key} className="flex items-start gap-2">
+                  <CheckCircle2 aria-hidden="true" className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
+                  <span>{t(/* i18n-dynamic */ `m365CustomerGraphRead.capabilities.${key}`)}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
           {!data.onboardingEnabled && (
             <p className="rounded-md bg-muted p-3 text-sm text-muted-foreground">
               {t("m365CustomerGraphRead.onboardingUnavailable")}
@@ -779,8 +905,12 @@ export default function M365CustomerGraphReadCard({
           {connection && (
             <div className="border-t pt-5">
               <dl className="grid gap-x-8 gap-y-4 sm:grid-cols-2 lg:grid-cols-3">
-                <div><dt className="text-xs font-medium text-muted-foreground">{t("m365CustomerGraphRead.tenant")}</dt><dd className="mt-1 text-sm font-medium text-foreground">{connection.displayName || t("m365CustomerGraphRead.unnamedTenant")}</dd></div>
-                <div><dt className="text-xs font-medium text-muted-foreground">{t("m365CustomerGraphRead.tenantId")}</dt><dd className="mt-1 break-all font-mono text-xs text-foreground">{connection.tenantId || t("m365CustomerGraphRead.notVerified")}</dd></div>
+                {!hideTenantIdentity && (
+                  <>
+                    <div><dt className="text-xs font-medium text-muted-foreground">{t("m365CustomerGraphRead.tenant")}</dt><dd className="mt-1 text-sm font-medium text-foreground">{connection.displayName || t("m365CustomerGraphRead.unnamedTenant")}</dd></div>
+                    <div><dt className="text-xs font-medium text-muted-foreground">{t("m365CustomerGraphRead.tenantId")}</dt><dd className="mt-1 break-all font-mono text-xs text-foreground">{connection.tenantId || t("m365CustomerGraphRead.notVerified")}</dd></div>
+                  </>
+                )}
                 <div><dt className="text-xs font-medium text-muted-foreground">{t("m365CustomerGraphRead.manifest")}</dt><dd className="mt-1 text-sm text-foreground">{t("m365CustomerGraphRead.manifestVersion", { version: connection.manifestVersion })}</dd></div>
                 <div><dt className="text-xs font-medium text-muted-foreground">{t("m365CustomerGraphRead.grants.grantsVerifiedAt")}</dt><dd className="mt-1 text-sm text-foreground">{connection.grantsVerifiedAt ? formatDateTime(connection.grantsVerifiedAt) : t("m365CustomerGraphRead.never")}</dd></div>
                 <div><dt className="text-xs font-medium text-muted-foreground">{t("m365CustomerGraphRead.lastVerifiedAt")}</dt><dd className="mt-1 text-sm text-foreground">{connection.lastVerifiedAt ? formatDateTime(connection.lastVerifiedAt) : t("m365CustomerGraphRead.never")}</dd></div>
@@ -816,29 +946,35 @@ export default function M365CustomerGraphReadCard({
             </div>
           )}
 
-          <div className="grid gap-6 border-t pt-5 lg:grid-cols-2">
-            <div>
-              <h3 className="mb-3 text-sm font-semibold text-foreground">{t("m365CustomerGraphRead.grants.required")}</h3>
-              <GrantList grants={data.profile.requiredGrants} testId="required-grant" />
-            </div>
-            {connection && (
+          <details className="group border-t pt-5" data-testid="m365-read-permissions">
+            <summary className="inline-flex min-h-11 cursor-pointer list-none items-center gap-1.5 rounded-md text-sm font-medium text-primary underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary [&::-webkit-details-marker]:hidden">
+              <ChevronRight aria-hidden="true" className="h-4 w-4 transition-transform group-open:rotate-90" />
+              {t("m365CustomerGraphRead.showPermissions")}
+            </summary>
+            <div className="mt-3 grid gap-6 lg:grid-cols-2">
               <div>
-                <h3 className="mb-3 text-sm font-semibold text-foreground">{observedHeading}</h3>
-                {hasLastKnownGrantHealth && (
-                  <p className="mb-3 text-sm text-muted-foreground">{t("m365CustomerGraphRead.grants.lastKnownHelp")}</p>
-                )}
-                {grantHealthUnknown && (
-                  <p className="mb-3 text-sm text-muted-foreground">{t("m365CustomerGraphRead.grants.unknownHelp")}</p>
-                )}
-                <GrantList grants={connection.observedGrants} />
+                <h4 className="mb-3 text-sm font-semibold text-foreground">{t("m365CustomerGraphRead.grants.required")}</h4>
+                <GrantList grants={data.profile.requiredGrants} testId="required-grant" />
               </div>
-            )}
-          </div>
+              {connection && (
+                <div>
+                  <h4 className="mb-3 text-sm font-semibold text-foreground">{observedHeading}</h4>
+                  {hasLastKnownGrantHealth && (
+                    <p className="mb-3 text-sm text-muted-foreground">{t("m365CustomerGraphRead.grants.lastKnownHelp")}</p>
+                  )}
+                  {grantHealthUnknown && (
+                    <p className="mb-3 text-sm text-muted-foreground">{t("m365CustomerGraphRead.grants.unknownHelp")}</p>
+                  )}
+                  <GrantList grants={connection.observedGrants} />
+                </div>
+              )}
+            </div>
+          </details>
 
           {connection && (displayedMissingGrants.length > 0 || displayedUnexpectedGrants.length > 0) && (
             <div className="grid gap-6 border-t pt-5 lg:grid-cols-2">
               <div>
-                <h3 className="mb-3 text-sm font-semibold text-foreground">{missingHeading}</h3>
+                <h4 className="mb-3 text-sm font-semibold text-foreground">{missingHeading}</h4>
                 <GrantList grants={displayedMissingGrants} />
               </div>
               {displayedUnexpectedGrants.length > 0 && (
@@ -850,10 +986,14 @@ export default function M365CustomerGraphReadCard({
             </div>
           )}
 
+          {data.onboardingEnabled && !canRetestConnection && (
+            <M365ConsentSteps className="border-t pt-5" />
+          )}
+
           <div className="flex flex-col gap-3 border-t pt-5 sm:flex-row sm:flex-wrap sm:items-center">
             <button type="button" onClick={startConsent} disabled={!canWrite || !data.onboardingEnabled || action !== null} className="inline-flex min-h-11 items-center justify-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary disabled:cursor-not-allowed disabled:opacity-50">
               {action === "consent" && <Loader2 aria-hidden="true" className="h-4 w-4 animate-spin" />}
-              {connection ? t("m365CustomerGraphRead.actions.reconsent") : t("m365CustomerGraphRead.actions.connect")}
+              {connection ? t("m365CustomerGraphRead.actions.reconsent") : t("m365CustomerGraphRead.actions.connectTenant")}
             </button>
             {connection && (
               <>

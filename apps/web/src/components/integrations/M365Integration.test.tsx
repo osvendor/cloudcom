@@ -1,11 +1,16 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import i18n from "i18next";
 import M365Integration from "./M365Integration";
 import { fetchWithAuth } from "../../stores/auth";
+import { useOrgStore } from "../../stores/orgStore";
 
 vi.mock("../../stores/auth", () => ({
   fetchWithAuth: vi.fn(),
   registerOrgIdProvider: vi.fn(),
+  useAuthStore: Object.assign(vi.fn(), {
+    getState: () => ({ tokens: null }),
+  }),
 }));
 
 const fetchWithAuthMock = vi.mocked(fetchWithAuth);
@@ -91,5 +96,191 @@ describe("M365Integration", () => {
       ).toBeInTheDocument(),
     );
     expect(screen.queryByTestId("m365-not-enabled")).not.toBeInTheDocument();
+  });
+  describe("connected legacy card", () => {
+    const CONNECTED = {
+      connected: true,
+      tenantId: "44444444-4444-4444-8444-444444444444",
+      clientId: "55555555-5555-4555-8555-555555555555",
+      displayName: "Northwind Traders",
+      status: "active",
+      lastVerifiedAt: "2026-07-10T10:00:00.000Z",
+    };
+
+    it("never renders an h1 — the page owns the only one", async () => {
+      fetchWithAuthMock.mockResolvedValue(makeResponse(CONNECTED));
+      render(<M365Integration />);
+      expect(
+        await screen.findByRole("heading", { level: 2, name: /legacy app registration/i }),
+      ).toBeInTheDocument();
+      expect(screen.queryAllByRole("heading", { level: 1 })).toHaveLength(0);
+      expect(screen.getByRole("heading", { level: 3, name: "Connection" })).toBeInTheDocument();
+    });
+
+    it("never renders an h1 in the not-enabled state either", async () => {
+      fetchWithAuthMock.mockResolvedValue(
+        makeResponse({ error: "Microsoft 365 integration is not enabled" }, false, 404),
+      );
+      render(<M365Integration />);
+      await screen.findByTestId("m365-not-enabled");
+      expect(screen.queryAllByRole("heading", { level: 1 })).toHaveLength(0);
+      expect(screen.getByRole("heading", { level: 2, name: "Microsoft 365" })).toBeInTheDocument();
+    });
+
+    it("asks for confirmation before disconnecting and does nothing when declined", async () => {
+      const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+      fetchWithAuthMock.mockResolvedValue(makeResponse(CONNECTED));
+      render(<M365Integration />);
+      fireEvent.click(await screen.findByRole("button", { name: /Disconnect/i }));
+      expect(confirm).toHaveBeenCalledWith(
+        expect.stringMatching(/Breeze deletes the stored app registration credentials/),
+      );
+      expect(fetchWithAuthMock).toHaveBeenCalledTimes(1);
+      expect(fetchWithAuthMock).not.toHaveBeenCalledWith("/m365/connection", { method: "DELETE" });
+    });
+
+    it("disconnects once confirmed", async () => {
+      vi.spyOn(window, "confirm").mockReturnValue(true);
+      fetchWithAuthMock
+        .mockResolvedValueOnce(makeResponse(CONNECTED))
+        .mockResolvedValueOnce(makeResponse({ connected: false }));
+      render(<M365Integration />);
+      fireEvent.click(await screen.findByRole("button", { name: /Disconnect/i }));
+      await waitFor(() =>
+        expect(fetchWithAuthMock).toHaveBeenCalledWith("/m365/connection", { method: "DELETE" }),
+      );
+      expect(await screen.findByRole("button", { name: /Save & verify/i })).toBeInTheDocument();
+    });
+
+    it("shows the Legacy badge and precedence note only when asked to", async () => {
+      fetchWithAuthMock.mockResolvedValue(makeResponse(CONNECTED));
+      const view = render(<M365Integration />);
+      await screen.findByRole("heading", { level: 2, name: /Microsoft 365/ });
+      expect(screen.queryByTestId("m365-legacy-badge")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("m365-legacy-precedence-note")).not.toBeInTheDocument();
+
+      view.rerender(<M365Integration legacyBadge showPrecedenceNote />);
+      expect(screen.getByTestId("m365-legacy-badge")).toHaveTextContent("Legacy");
+      expect(screen.getByTestId("m365-legacy-precedence-note")).toBeInTheDocument();
+    });
+
+    it("reports its connection status to the container", async () => {
+      const onStatusChange = vi.fn();
+      fetchWithAuthMock.mockResolvedValue(makeResponse(CONNECTED));
+      render(<M365Integration onStatusChange={onStatusChange} />);
+      await waitFor(() => expect(onStatusChange).toHaveBeenLastCalledWith("connected"));
+      expect(onStatusChange).toHaveBeenCalledWith("loading");
+    });
+  });
+
+  describe("legacy card scope copy (#9320)", () => {
+    beforeEach(() => {
+      useOrgStore.setState({
+        currentOrgId: "org-1",
+        organizations: [{ id: "org-1", name: "Northwind Traders" }],
+      } as never);
+    });
+
+    it("names the organization and the legacy scope in the heading", async () => {
+      fetchWithAuthMock.mockResolvedValue(makeResponse({ connected: false }));
+      render(<M365Integration />);
+      const h = await screen.findByRole("heading", { level: 2 });
+      expect(h).toHaveTextContent(/legacy app registration/i);
+      expect(h).toHaveTextContent(/Breeze AI only/i);
+      expect(h).toHaveTextContent("Northwind Traders");
+    });
+
+    it("lists what it does not power", async () => {
+      fetchWithAuthMock.mockResolvedValue(makeResponse({ connected: false }));
+      render(<M365Integration />);
+      const list = await screen.findByTestId("m365-legacy-does-not-power");
+      expect(list).toHaveTextContent(/tenant sync/i);
+      expect(list).toHaveTextContent("m365_query_*");
+      expect(screen.getByTestId("m365-legacy-powers")).toHaveTextContent(/reset password/i);
+      expect(screen.queryByTestId("m365-legacy-use-consent")).not.toBeInTheDocument();
+    });
+
+    it("points to Connect with Microsoft when consent is available", async () => {
+      fetchWithAuthMock.mockResolvedValue(makeResponse({ connected: false }));
+      render(<M365Integration consentAvailable />);
+      expect(await screen.findByTestId("m365-legacy-use-consent")).toBeInTheDocument();
+    });
+
+    it("uses a GUID placeholder, not the onmicrosoft domain", async () => {
+      fetchWithAuthMock.mockResolvedValue(makeResponse({ connected: false }));
+      render(<M365Integration />);
+      const input = await screen.findByLabelText(/Tenant ID/i);
+      expect(input.getAttribute("placeholder")).not.toMatch(/onmicrosoft/i);
+      expect(input.getAttribute("placeholder")).toMatch(/00000000-0000-0000-0000-000000000000/);
+    });
+
+    it("rejects a domain-form tenant id client-side: Save disabled, hint shown, no request", async () => {
+      fetchWithAuthMock.mockResolvedValue(makeResponse({ connected: false }));
+      render(<M365Integration />);
+      fireEvent.change(await screen.findByLabelText(/Tenant ID/i), {
+        target: { value: "contoso.onmicrosoft.com" },
+      });
+      fireEvent.change(screen.getByLabelText(/App \(client\) ID/i), {
+        target: { value: "55555555-5555-4555-8555-555555555555" },
+      });
+      fireEvent.change(screen.getByLabelText(/^Client secret/i), { target: { value: "s3cret" } });
+      const save = screen.getByRole("button", { name: /Save & verify/i });
+      expect(save).toBeDisabled();
+      expect(screen.getByTestId("m365-tenant-id-hint")).toHaveTextContent(/Directory \(tenant\) ID/);
+      fireEvent.click(save);
+      expect(fetchWithAuthMock).toHaveBeenCalledTimes(1); // only the initial GET
+    });
+
+    it("enables Save for a valid tenant GUID with no hint", async () => {
+      fetchWithAuthMock.mockResolvedValue(makeResponse({ connected: false }));
+      render(<M365Integration />);
+      fireEvent.change(await screen.findByLabelText(/Tenant ID/i), {
+        target: { value: "44444444-4444-4444-8444-444444444444" },
+      });
+      fireEvent.change(screen.getByLabelText(/App \(client\) ID/i), {
+        target: { value: "55555555-5555-4555-8555-555555555555" },
+      });
+      fireEvent.change(screen.getByLabelText(/^Client secret/i), { target: { value: "s3cret" } });
+      expect(screen.getByRole("button", { name: /Save & verify/i })).toBeEnabled();
+      expect(screen.queryByTestId("m365-tenant-id-hint")).not.toBeInTheDocument();
+    });
+
+    it("tells the admin to search All applications for an existing Breeze app", async () => {
+      fetchWithAuthMock.mockResolvedValue(makeResponse({ connected: false }));
+      render(<M365Integration />);
+      await screen.findByLabelText(/Tenant ID/i);
+      expect(document.body.textContent).toMatch(/All applications/);
+    });
+  });
+
+  describe("legacy card strings are localized", () => {
+    const KEYS = {
+      "m365Integration.savingRequiresMfa": "SENTINEL_MFA",
+      "m365Integration.clientSecretPlaceholder": "SENTINEL_SECRET",
+      "m365Integration.clientSecretStoredPlaceholder": "SENTINEL_STORED",
+    };
+    beforeEach(() => {
+      for (const [k, v] of Object.entries(KEYS)) i18n.addResource("en", "integrations", k, v);
+    });
+
+    it("renders the MFA note and the not-connected secret placeholder from locale keys", async () => {
+      fetchWithAuthMock.mockResolvedValue(makeResponse({ connected: false }));
+      render(<M365Integration />);
+      expect(await screen.findByText(/SENTINEL_MFA/)).toBeInTheDocument();
+      expect(screen.getByPlaceholderText("SENTINEL_SECRET")).toBeInTheDocument();
+    });
+
+    it("renders the stored-secret placeholder from a locale key when connected", async () => {
+      fetchWithAuthMock.mockResolvedValue(makeResponse({
+        connected: true,
+        tenantId: "44444444-4444-4444-8444-444444444444",
+        clientId: "55555555-5555-4555-8555-555555555555",
+        displayName: "Northwind Traders",
+        status: "active",
+        lastVerifiedAt: "2026-07-10T10:00:00.000Z",
+      }));
+      render(<M365Integration />);
+      expect(await screen.findByPlaceholderText("SENTINEL_STORED")).toBeInTheDocument();
+    });
   });
 });

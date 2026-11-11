@@ -3,10 +3,9 @@ import { z } from 'zod';
 import { zValidator } from '../lib/validation';
 import { eq, and, inArray, isNull } from 'drizzle-orm';
 import { db, runOutsideDbContext, withSystemDbAccessContext } from '../db';
-import { quotes, quoteBlocks, quoteLines } from '../db/schema/quotes';
+import { quotes, quoteBlocks } from '../db/schema/quotes';
 import { partners } from '../db/schema/orgs';
-import { portalBranding } from '../db/schema/portal';
-import { acceptQuoteSchema, declineQuoteSchema } from '@breeze/shared';
+import { acceptQuoteSchema, declineQuoteSchema, ERROR_CODES } from '@breeze/shared';
 import { verifyQuoteAcceptToken, isQuoteAcceptJtiRevoked, revokeQuoteAcceptJti, type QuoteAcceptClaims } from '../services/quoteAcceptToken';
 import { resolveMergedOrgIds } from '../services/orgMerge';
 import { markQuoteViewed } from '../services/quoteLifecycle';
@@ -14,17 +13,23 @@ import { acceptQuote, emitAcceptInvoiceIssued, resolveAcceptInvoiceUrl, autoEmai
 import { notifyQuoteOutcome } from '../services/quoteOutcomeNotify';
 import { readQuoteImage, loadCustomerLineImage } from '../services/quoteImageStorage';
 import { QuoteServiceError } from '../services/quoteTypes';
-import { toCustomerLines, attachCustomerLineImages, sanitizeQuoteBlocksForRead } from '../services/quoteService';
-import { loadContractBlockRenderData, renderContractBlocksForClient } from '../services/contractTemplateRender';
+import { loadContractBlockRenderData } from '../services/contractTemplateRender';
 import { ContractTemplateServiceError } from '../services/contractTemplateService';
 import { isQuoteExpired } from '../services/quoteExpiry';
-import { computeQuoteTotals, toQuoteDepositConfig, type QuoteLineForMath } from '../services/quoteMath';
 import { captureException } from '../services/sentry';
 import { getTrustedClientIpOrUndefined } from '../services/clientIp';
-import { toPublicQuoteHeader, toPublicQuotePresentation } from '../services/publicQuoteDto';
+import { toPublicQuotePresentation } from '../services/publicQuoteDto';
 import { resolveQuoteLinkOrgGate, PUBLIC_LINK_ORG_UNAVAILABLE, type PublicLinkOrgGate } from '../services/publicLinkOrgGate';
-import { resolveThemeId, resolvePageSize } from '../services/documentThemes';
-import { resolvePartnerDocumentLocale } from '../services/documentLocale';
+import { isPayOnAcceptAvailable, resolveAcceptCheckoutUrl, publicInvoiceCheckoutUrls } from '../services/quoteAcceptCheckout';
+import { assembleCustomerQuoteDocument } from '../services/customerQuoteDocument';
+import { renderCustomerQuotePdf, customerQuotePdfFilename } from '../services/customerQuotePdf';
+import { PdfMergeError } from '../services/pdfMerge';
+import { getConvertedInvoicePayment, type ConvertedQuotePayment } from '../services/quotePay';
+import { createInvoicePayLink } from '../services/invoiceCheckout';
+import { InvoiceServiceError } from '../services/invoiceTypes';
+import { CUSTOMER_SAFE_CURRENCY_UNSUPPORTED_MESSAGE } from '../services/stripeCheckoutErrors';
+import { getRedis } from '../services/redis';
+import { rateLimiter } from '../services/rate-limit';
 
 /**
  * Unauthenticated, token-gated quote acceptance surface for prospects without a
@@ -112,39 +117,29 @@ quotesPublicRoutes.get('/:token', zValidator('param', tokenParam), async (c) => 
           .where(eq(partners.id, quote.partnerId)).limit(1);
         return { superseded: true as const, partnerName: p?.name ?? 'your provider' };
       }
-      const rawBlocks = sanitizeQuoteBlocksForRead(await db.select().from(quoteBlocks).where(eq(quoteBlocks.quoteId, quote.id)).orderBy(quoteBlocks.sortOrder));
-      const lines = toCustomerLines((await db.select().from(quoteLines).where(eq(quoteLines.quoteId, quote.id)).orderBy(quoteLines.sortOrder)).filter((l) => l.customerVisible));
-      const [partner] = await db.select({ name: partners.name, documentTheme: partners.documentTheme, documentPageSize: partners.documentPageSize, settings: partners.settings }).from(partners).where(eq(partners.id, quote.partnerId)).limit(1);
-      // supportEmail/supportPhone travel with the branding so the public
-      // proposal page can tell a prospect how to reach the company asking them
-      // to sign. Both are the MSP's own published contact details, already
-      // surfaced to signed-in customers by /portal/branding.
-      const [brand] = await db.select({ logoUrl: portalBranding.logoUrl, primaryColor: portalBranding.primaryColor, supportEmail: portalBranding.supportEmail, supportPhone: portalBranding.supportPhone }).from(portalBranding).where(eq(portalBranding.orgId, quote.orgId)).limit(1);
+      // The customer document (#9418): the one assembler every quote surface
+      // uses. 'public' keeps the public link's status mapping (sent → viewed)
+      // and refuses a retired status (410, mapped below); the token scopes the
+      // asset paths. Branding carries the MSP's published support contact so the
+      // page can tell a prospect how to reach the company asking them to sign.
+      const enc = encodeURIComponent(token);
+      const doc = await assembleCustomerQuoteDocument(quote, 'public', {
+        assets: {
+          lineImage: (l) => `/quotes/public/${enc}/line-image/${l.id}`,
+          contractFile: (blockId) => `/quotes/public/${enc}/contract-file/${blockId}`,
+        },
+      });
       // Cosmetic view-stamping only — must never fail the render. Mirrors the
-      // authenticated counterpart at portal/quotes.ts:48.
+      // authenticated counterpart in portal/quotes.ts. After assembly, so a
+      // proposal that failed to render is not recorded as viewed.
       try { await markQuoteViewed(quote.id, quote.orgId); } catch (err) { console.error('[quotesPublic] quote markViewed failed', { id: quote.id, err }); }
-      // Derive the amount accept actually invoices (one-time only) so the prospect
-      // sees an accurate "due on acceptance" instead of the recurring-inclusive total,
-      // plus the deposit due + per-category subtotals for the summary panel.
-      const totals = computeQuoteTotals(lines as QuoteLineForMath[], quote.taxRate ? parseFloat(quote.taxRate) : null, toQuoteDepositConfig(quote.depositType, quote.depositPercent), quote.currencyCode);
-      // Resolves every `contract` block's pinned template version (system context)
-      // and replaces its raw authoring content with the token-gated render contract.
-      // Public link serves sent (stamped) quotes: quote.documentLocale is the
-      // render locale; null only for pre-wave-5 sends, which resolve to the
-      // partner's language — the same fallback the quote PDF uses.
-      const blocks = await renderContractBlocksForClient(rawBlocks, quote, (blockId) => `/quotes/public/${encodeURIComponent(token)}/contract-file/${blockId}`, quote.documentLocale ?? resolvePartnerDocumentLocale(partner));
-      const serializedLines = attachCustomerLineImages(lines, (lineId) => `/quotes/public/${encodeURIComponent(token)}/line-image/${lineId}`);
-      // Snapshot-first precedence (Task 5, shared with resolveQuoteBranding): a
-      // sent quote's frozen presentation always wins over the partner's live
-      // theme/pageSize columns.
-      const presentationSnap = quote.presentationSnapshot as { theme?: string; pageSize?: string } | null;
-      const theme = resolveThemeId(presentationSnap?.theme ?? partner?.documentTheme);
-      const pageSize = resolvePageSize(presentationSnap?.pageSize ?? partner?.documentPageSize);
-      return { quote: toPublicQuoteHeader(quote, totals), blocks, lines: serializedLines, branding: {
-        partnerName: partner?.name ?? 'Proposal', logoUrl: brand?.logoUrl ?? null, primaryColor: brand?.primaryColor ?? null,
-        supportEmail: brand?.supportEmail ?? null, supportPhone: brand?.supportPhone ?? null,
-        theme, pageSize,
-      }, presentation: toPublicQuotePresentation(theme, pageSize) };
+      const { theme, pageSize } = doc.branding;
+      return { owner: { partnerId: quote.partnerId }, payload: {
+        quote: doc.quote, blocks: doc.blocks, lines: doc.lines,
+        branding: { ...doc.branding, partnerName: doc.branding.partnerName ?? 'Proposal' },
+        presentation: toPublicQuotePresentation(theme, pageSize),
+        documentLocale: doc.documentLocale,
+      } };
     }));
     if (data && 'superseded' in data) {
       // Deliberately withhold the successor: the latest email is the customer's
@@ -155,8 +150,19 @@ quotesPublicRoutes.get('/:token', zValidator('param', tokenParam), async (c) => 
         data: { branding: { partnerName: data.partnerName } },
       }, 410);
     }
-    if (!data) return c.json({ error: 'Quote not found' }, 404);
-    return c.json({ data });
+    if (!data) return c.json({ error: 'Quote not found', code: ERROR_CODES.NOT_FOUND }, 404);
+    // #8231: tells the page whether signing goes straight on to card checkout,
+    // so the button can say "Sign & pay". Read AFTER the system context above
+    // closed (it opens its own) and best-effort: a failed read only costs the
+    // copy, never the proposal. The accept route re-checks it before minting.
+    let payOnAccept = false;
+    try {
+      payOnAccept = await isPayOnAcceptAvailable(data.owner.partnerId);
+    } catch (err) {
+      console.error('[quotesPublic] pay-on-accept availability read failed', { quoteId: claims.quoteId, err });
+      captureException(err instanceof Error ? err : new Error(String(err)));
+    }
+    return c.json({ data: { ...data.payload, payOnAccept } });
   } catch (err) {
     if (err instanceof ContractTemplateServiceError) return c.json({ error: err.message, code: err.code }, err.status);
     // Fail-closed floor for any retired status that reaches serialization.
@@ -176,7 +182,7 @@ quotesPublicRoutes.get('/:token/images/:imageId', zValidator('param', tokenImage
     if (!quote) return null;
     return readQuoteImage(imageId, quote.id);
   }));
-  if (!img) return c.json({ error: 'Image not found' }, 404);
+  if (!img) return c.json({ error: 'Image not found', code: ERROR_CODES.NOT_FOUND }, 404);
   return new Response(new Uint8Array(img.data), { status: 200, headers: { 'Content-Type': img.mime, 'Content-Length': String(img.byteSize), 'Cache-Control': 'private, max-age=300' } });
 });
 
@@ -196,7 +202,7 @@ quotesPublicRoutes.get('/:token/line-image/:lineId', zValidator('param', tokenLi
     if (!quote) return null;
     return loadCustomerLineImage(quote.id, lineId);
   }));
-  if (!img) return c.json({ error: 'Image not found' }, 404);
+  if (!img) return c.json({ error: 'Image not found', code: ERROR_CODES.NOT_FOUND }, 404);
   return new Response(new Uint8Array(img.data), { status: 200, headers: { 'Content-Type': img.mime, 'Content-Length': String(img.byteSize), 'Cache-Control': 'private, max-age=300' } });
 });
 
@@ -215,10 +221,82 @@ quotesPublicRoutes.get('/:token/contract-file/:blockId', zValidator('param', tok
     const [b] = await db.select().from(quoteBlocks).where(and(eq(quoteBlocks.id, blockId), eq(quoteBlocks.quoteId, quote.id), eq(quoteBlocks.blockType, 'contract'))).limit(1);
     return b ?? null;
   }));
-  if (!block) return c.json({ error: 'Contract file not found' }, 404);
+  if (!block) return c.json({ error: 'Contract file not found', code: ERROR_CODES.NOT_FOUND }, 404);
   const [renderData] = await loadContractBlockRenderData([block], { includeFileData: true });
-  if (!renderData || renderData.sourceType !== 'uploaded' || !renderData.fileData) return c.json({ error: 'Contract file not found' }, 404);
-  return new Response(new Uint8Array(renderData.fileData), { status: 200, headers: { 'Content-Type': 'application/pdf', 'Content-Length': String(renderData.fileData.length), 'Cache-Control': 'private, max-age=300' } });
+  if (!renderData || renderData.sourceType !== 'uploaded' || !renderData.fileData) return c.json({ error: 'Contract file not found', code: ERROR_CODES.NOT_FOUND }, 404);
+  // c.body, not a bare `new Response`: headers middleware sets via c.header() before next() (the path-selected CSP
+  // with `frame-ancestors 'self'`, #10192) are held as prepared headers and only applied to a response built through
+  // the context.
+  const bytes = new Uint8Array(renderData.fileData);
+  return c.body(bytes, 200, { 'Content-Type': 'application/pdf', 'Content-Length': String(bytes.byteLength), 'Cache-Control': 'private, max-age=300' });
+});
+
+/** Same no-store / no-referrer / noindex set as the public invoice routes: the
+ *  URL is the capability, so it must never land in caches, referrer logs or
+ *  crawlers. */
+function applyPublicLinkHeaders(c: { header: (k: string, v: string) => void }): void {
+  c.header('Cache-Control', 'no-store');
+  c.header('Referrer-Policy', 'no-referrer');
+  c.header('X-Robots-Tag', 'noindex, nofollow, noarchive');
+}
+
+/** Per-quote cap on PDF renders from the public link (the render is the
+ *  expensive part of this unauthenticated surface). Same shape and size as the
+ *  public invoice PDF's cap. Fail-open on a Redis outage, as there: a download
+ *  is read-only, so availability wins over a strict cap. */
+async function overPublicPdfLimit(quoteId: string): Promise<boolean> {
+  const redis = getRedis();
+  if (!redis) return false;
+  try {
+    return !(await rateLimiter(redis, `quote-public:pdf:${quoteId}`, 10, 60)).allowed;
+  } catch {
+    return false;
+  }
+}
+
+// GET /:token/pdf — the proposal as a PDF download (#9860), the same document
+// the logged-in portal's Download PDF renders. Same gates as GET /:token
+// (signature + exp, revoked jti, org lifecycle, token org set, draft) and the
+// shared isPublicLinkDead predicate: a superseded or link-revoked proposal is
+// not served — 404, like the asset routes, since withdrawn prices must not
+// leave as a file either. An expired proposal is served, as the page is.
+quotesPublicRoutes.get('/:token/pdf', zValidator('param', tokenParam), async (c) => {
+  applyPublicLinkHeaders(c);
+  const resolved = await resolve(c);
+  if (!resolved) return c.json({ error: 'This link is invalid or has expired' }, 401);
+  if (resolved.gate.blocked) return c.json(PUBLIC_LINK_ORG_UNAVAILABLE, 410);
+  const { claims, orgIds } = resolved;
+  const quote = await runOutsideDbContext(() => withSystemDbAccessContext(async () => {
+    const [q] = await db.select().from(quotes).where(and(eq(quotes.id, claims.quoteId), inArray(quotes.orgId, orgIds))).limit(1);
+    if (!q || q.status === 'draft' || isPublicLinkDead(q)) return null;
+    return q;
+  }));
+  if (!quote) return c.json({ error: 'Quote not found', code: ERROR_CODES.NOT_FOUND }, 404);
+  if (await overPublicPdfLimit(quote.id)) return c.json({ error: 'Too many requests', code: ERROR_CODES.RATE_LIMITED }, 429);
+  try {
+    // System scope: this router has no auth middleware, so the renderer's quote
+    // reads need a context or RLS returns zero rows. Its partner read opens its own.
+    const pdf = await runOutsideDbContext(() => withSystemDbAccessContext(() => renderCustomerQuotePdf(quote)));
+    const bytes = new Uint8Array(pdf);
+    // c.body, not a bare Response, so the headers set above (and middleware's
+    // prepared headers) are applied — see the contract-file route.
+    return c.body(bytes, 200, {
+      'Content-Type': 'application/pdf',
+      'Content-Disposition': `attachment; filename="${customerQuotePdfFilename(quote)}"`,
+      'Content-Length': String(bytes.byteLength),
+    });
+  } catch (err) {
+    // An unreadable uploaded contract keeps its typed 4xx status and code, as on the portal
+    // route, but not its message: that carries the PDF parser's own text, which an
+    // unauthenticated caller has no use for. It is a fault in stored bytes that a 4xx hides
+    // from 5xx alerting, so it is logged and reported here.
+    if (err instanceof PdfMergeError) {
+      console.error('[quotesPublic] proposal PDF contract merge failed', { quoteId: quote.id, err });
+      captureException(err);
+      return c.json({ error: 'This proposal’s PDF is unavailable right now. Please contact the sender.', code: err.code }, err.status);
+    }
+    throw err;
+  }
 });
 
 // POST /:token/accept — typed signature. System-scope write, token-resolved.
@@ -263,7 +341,22 @@ quotesPublicRoutes.post('/:token/accept', zValidator('param', tokenParam), zVali
     // delay the accept response; both swallow their own errors.
     void autoEmailAcceptedInvoice(res);
     void notifyQuoteOutcome({ quoteId: claims.quoteId, outcome: 'accepted', source: 'customer', signerName: body.signerName });
-    return c.json({ data: { status: res.quote.status, invoiceNumber: null, invoiceUrl, payDeferred, pax8OrderId: res.pax8OrderId } });
+    // #8231 Sign & pay: on top of that durable url, mint the Stripe checkout for
+    // the charge-now amount so the customer goes straight from signing to
+    // payment. It is the PUBLIC-LINK session family (same return urls and
+    // idempotency key as the invoice page's own Pay button), consumed by an
+    // immediate redirect, and Stripe success/cancel both land back on the
+    // durable page — not the retired one-shot payUrl. null → the page falls
+    // back to invoiceUrl (no Stripe, nothing to pay, autopay, mint failure).
+    const checkoutUrl = await resolveAcceptCheckoutUrl(res, invoiceUrl, {
+      ip: getTrustedClientIpOrUndefined(c) ?? null, userAgent: c.req.header('user-agent') ?? null,
+    });
+    // #3740: with no durable invoice page to land on, the confirmation page
+    // must still make payment the next step rather than a passive "accepted".
+    // It shows what is due and pays through POST /:token/pay, which this
+    // (now spent) token may still use because it is the token that accepted.
+    const payment = payDeferred ? await readPaymentBestEffort(res.invoiceId, res.quote.orgId) : null;
+    return c.json({ data: { status: res.quote.status, invoiceNumber: null, invoiceUrl, checkoutUrl, payDeferred, payment, pax8OrderId: res.pax8OrderId } });
   } catch (err) {
     if (err instanceof QuoteServiceError) {
       if (err.code === 'RESPONSE_CONSUMED') {
@@ -332,7 +425,7 @@ quotesPublicRoutes.post('/:token/decline', zValidator('param', tokenParam), zVal
     try { await revokeQuoteAcceptJti(claims.jti); } catch { /* durable backstop holds */ }
     return c.json({ error: 'This link is invalid or has expired', code: 'RESPONSE_CONSUMED' }, 401);
   }
-  if (result !== 'ok') return c.json({ error: 'This quote can no longer be declined' }, 409);
+  if (result !== 'ok') return c.json({ error: 'This quote can no longer be declined', code: ERROR_CODES.CONFLICT }, 409);
   // Consume the single-use token post-commit so a declined link can't be replayed.
   // A failed revoke leaves the link replayable (security-relevant) → capture.
   try { await revokeQuoteAcceptJti(claims.jti); } catch (err) { console.error('[quotesPublic] jti revoke failed', err); captureException(err instanceof Error ? err : new Error(String(err))); }
@@ -341,4 +434,153 @@ quotesPublicRoutes.post('/:token/decline', zValidator('param', tokenParam), zVal
   // SMTP latency must not delay the customer's response; errors are swallowed.
   void notifyQuoteOutcome({ quoteId: claims.quoteId, outcome: 'declined', source: 'customer' });
   return c.json({ data: { status: 'declined' } });
+});
+
+// ---------------------------------------------------------------------------
+// Payment after acceptance (#3740)
+//
+// Accepting spends the token: its jti is revoked in Redis and recorded on the
+// row (public_response_jti + outcome), so every route above answers 401 to it
+// and a revisit of the quote link had no way back to payment. These two routes
+// are the ONLY ones that tolerate a spent token, and only the token that
+// accepted THIS quote. They reach exactly one thing — the quote's converted
+// invoice's payment — never the proposal document, its assets, or accept /
+// decline:
+//   GET  /:token/payment  what is due now (display), or payment:null
+//   POST /:token/pay      mint the Stripe Checkout for that invoice
+// Spent-token rule: a revoked jti is accepted only when the row's durable
+// consumption record names this jti with outcome 'accepted' AND the quote is
+// converted. A live (unspent) token on a converted quote is accepted too — it
+// is the recipient's own link and can already open the document. Everything
+// else gets the same generic 401 the strict routes give.
+// Tenancy: the row is matched on the signed quoteId AND the token org's merge
+// chain (resolveMergedOrgIds); the invoice is the row's own
+// converted_invoice_id, read and minted under the ROW's org (the mint refuses
+// any invoice outside accessibleOrgIds). Signature, expiry and the org gate
+// apply exactly as on every other route.
+// ---------------------------------------------------------------------------
+
+/** Verify + gate for the payment routes: like resolve(), but a revoked jti is
+ *  reported (spent) instead of refused; the row decides whether it may pay. */
+async function resolvePaymentAccess(c: { req: { valid: (k: 'param') => { token: string } } }): Promise<{ claims: QuoteAcceptClaims; orgIds: string[]; gate: PublicLinkOrgGate; spent: boolean } | null> {
+  const { token } = c.req.valid('param');
+  const claims = await verifyQuoteAcceptToken(token);
+  if (!claims) return null;
+  // Fails closed (true) on a Redis outage: a live token then needs the same
+  // accepted-by-this-jti record a spent one does — never a wider door.
+  const spent = await isQuoteAcceptJtiRevoked(claims.jti);
+  const orgIds = await resolveMergedOrgIds(claims.orgId, claims.partnerId);
+  const gate = await resolveQuoteLinkOrgGate(claims.quoteId, orgIds);
+  return { claims, orgIds, gate, spent };
+}
+
+type PayableQuote = { orgId: string; partnerId: string; convertedInvoiceId: string };
+
+/** The token's converted quote, or why the token may not pay through it. */
+async function loadPayableQuote(
+  claims: QuoteAcceptClaims, orgIds: string[], spent: boolean,
+): Promise<{ ok: true; quote: PayableQuote } | { ok: false; reason: 'invalid' | 'not_converted' }> {
+  const [q] = await db.select({
+    ...publicLinkColumns, orgId: quotes.orgId, partnerId: quotes.partnerId,
+    convertedInvoiceId: quotes.convertedInvoiceId,
+    publicResponseJti: quotes.publicResponseJti, publicResponseOutcome: quotes.publicResponseOutcome,
+  }).from(quotes).where(and(eq(quotes.id, claims.quoteId), inArray(quotes.orgId, orgIds))).limit(1);
+  if (!q || isPublicLinkDead(q)) return { ok: false, reason: 'invalid' };
+  const acceptedByThisToken = q.publicResponseOutcome === 'accepted' && q.publicResponseJti === claims.jti;
+  if (spent && !acceptedByThisToken) return { ok: false, reason: 'invalid' };
+  if (q.status !== 'converted' || !q.convertedInvoiceId) return { ok: false, reason: spent ? 'invalid' : 'not_converted' };
+  return { ok: true, quote: { orgId: q.orgId, partnerId: q.partnerId, convertedInvoiceId: q.convertedInvoiceId } };
+}
+
+const invalidLink = { error: 'This link is invalid or has expired' } as const;
+const notConverted = { error: 'This proposal has not been accepted yet', code: 'NOT_CONVERTED' } as const;
+
+/** Display read for the payment step. A failure only hides the Pay button
+ *  (the page then points at the partner), so it is captured, not thrown. */
+async function readPaymentBestEffort(invoiceId: string, orgId: string): Promise<ConvertedQuotePayment | null> {
+  try {
+    return await getConvertedInvoicePayment(invoiceId, orgId);
+  } catch (err) {
+    console.error('[quotesPublic] converted-invoice payment read failed', { invoiceId, err });
+    captureException(err instanceof Error ? err : new Error(String(err)));
+    return null;
+  }
+}
+
+/** Per-invoice cap on Checkout mints from the quote link. Same Redis bucket as
+ *  the public invoice page's Pay (invoice-public:pay:<invoiceId>), so the two
+ *  surfaces share one budget. Fail-open on a Redis outage, as there: the mint
+ *  is idempotency-keyed, so availability wins over a strict cap. */
+async function overPublicPayLimit(invoiceId: string): Promise<boolean> {
+  const redis = getRedis();
+  if (!redis) return false;
+  try {
+    return !(await rateLimiter(redis, `invoice-public:pay:${invoiceId}`, 10, 60)).allowed;
+  } catch {
+    return false;
+  }
+}
+
+// GET /:token/payment — what the accepted quote's invoice would charge now.
+quotesPublicRoutes.get('/:token/payment', zValidator('param', tokenParam), async (c) => {
+  applyPublicLinkHeaders(c);
+  const access = await resolvePaymentAccess(c);
+  if (!access) return c.json(invalidLink, 401);
+  if (access.gate.blocked) return c.json(PUBLIC_LINK_ORG_UNAVAILABLE, 410);
+  const { claims, orgIds, spent } = access;
+  const loaded = await runOutsideDbContext(() => withSystemDbAccessContext(async () => {
+    const r = await loadPayableQuote(claims, orgIds, spent);
+    if (!r.ok) return r;
+    const [p] = await db.select({ name: partners.name }).from(partners).where(eq(partners.id, r.quote.partnerId)).limit(1);
+    return { ...r, partnerName: p?.name ?? null };
+  }));
+  if (!loaded.ok) return loaded.reason === 'not_converted' ? c.json(notConverted, 409) : c.json(invalidLink, 401);
+  // Read AFTER the context above closed: it opens its own.
+  const payment = await readPaymentBestEffort(loaded.quote.convertedInvoiceId, loaded.quote.orgId);
+  return c.json({ data: { partnerName: loaded.partnerName, payment } });
+});
+
+// POST /:token/pay — mint the Stripe Checkout for the accepted quote's invoice.
+// The PUBLIC-LINK session family (publicInvoiceCheckoutUrls): session-id-only
+// return urls landing on the invoice's durable page, and the same idempotency
+// key as Sign & pay and the invoice page's own Pay, so the three never mint
+// competing sessions for one charge.
+quotesPublicRoutes.post('/:token/pay', zValidator('param', tokenParam), async (c) => {
+  applyPublicLinkHeaders(c);
+  // Same-origin fetch shape (as /invoices/public/:token/pay): a cross-site form
+  // cannot set a JSON content type, and there is no ambient credential anyway.
+  if (!(c.req.header('content-type') ?? '').includes('application/json')) {
+    return c.json({ error: 'Invalid request' }, 400);
+  }
+  const access = await resolvePaymentAccess(c);
+  if (!access) return c.json(invalidLink, 401);
+  if (access.gate.blocked) return c.json(PUBLIC_LINK_ORG_UNAVAILABLE, 410);
+  const { claims, orgIds, spent } = access;
+  const loaded = await runOutsideDbContext(() => withSystemDbAccessContext(() => loadPayableQuote(claims, orgIds, spent)));
+  if (!loaded.ok) return loaded.reason === 'not_converted' ? c.json(notConverted, 409) : c.json(invalidLink, 401);
+  const { quote } = loaded;
+  if (await overPublicPayLimit(quote.convertedInvoiceId)) return c.json({ error: 'Too many requests', code: ERROR_CODES.RATE_LIMITED }, 429);
+  try {
+    // createInvoicePayLink owns every payment guard (org access, PAYABLE,
+    // collection in progress / held money, pending revocation, charge-now > 0,
+    // Stripe connected) and opens its own short DB contexts — none is held here.
+    const link = await createInvoicePayLink(
+      quote.convertedInvoiceId,
+      { userId: null, partnerId: null, accessibleOrgIds: [quote.orgId] },
+      { ...publicInvoiceCheckoutUrls(), ip: getTrustedClientIpOrUndefined(c) ?? null, userAgent: c.req.header('user-agent') ?? null },
+    );
+    return c.json({ data: { url: link.url } });
+  } catch (err) {
+    if (err instanceof InvoiceServiceError) {
+      // Customer-facing wording, as on the public invoice page: never name the
+      // partner's Stripe setup to their customer.
+      if (err.code === 'COLLECTION_IN_PROGRESS') return c.json({ error: 'A payment is already processing', code: err.code }, 409);
+      if (err.code === 'STRIPE_NOT_CONNECTED') {
+        return c.json({ error: 'Online payment is not available for this invoice — please contact the sender', code: err.code }, 409);
+      }
+      if (err.code === 'STRIPE_CURRENCY_UNSUPPORTED') return c.json({ error: CUSTOMER_SAFE_CURRENCY_UNSUPPORTED_MESSAGE, code: err.code }, 409);
+      return c.json({ error: err.message, code: err.code }, err.status);
+    }
+    throw err;
+  }
 });

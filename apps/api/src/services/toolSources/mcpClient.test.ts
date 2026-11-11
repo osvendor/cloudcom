@@ -171,6 +171,28 @@ describe('McpClient', () => {
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
+  it('(f) keeps surfacing auth-builder failures as McpClientError after the shared-builder refactor (W2)', async () => {
+    const mismatch = new McpClient({
+      endpointUrl: BASE_URL,
+      credentialOrigin: 'https://attacker.example.com',
+      auth: { authKind: 'bearer', token: 'tok123' },
+      fetchImpl: vi.fn(),
+    });
+    const mismatchErr = await mismatch.listTools().catch((e) => e);
+    expect(mismatchErr).toBeInstanceOf(McpClientError);
+    expect(mismatchErr.code).toBe('origin_mismatch');
+
+    const tokenFails = new McpClient({
+      endpointUrl: BASE_URL,
+      credentialOrigin: ORIGIN,
+      auth: { authKind: 'oauth2_client_credentials', tokenUrl: 'https://id.example.com/token', clientId: 'w2-refactor', clientSecret: 's' },
+      fetchImpl: vi.fn().mockResolvedValue(new Response('denied', { status: 401 })),
+    });
+    const tokenErr = await tokenFails.listTools().catch((e) => e);
+    expect(tokenErr).toBeInstanceOf(McpClientError);
+    expect(tokenErr.code).toBe('auth');
+  });
+
   it('(f) does not require origin agreement when auth is none', async () => {
     const fetchImpl = vi.fn().mockResolvedValueOnce(jsonResponse({ jsonrpc: '2.0', id: 1, result: { tools: [] } }));
     const client = new McpClient({
@@ -236,6 +258,38 @@ describe('McpClient', () => {
 
     await expect(client.listTools()).rejects.toMatchObject({ code: 'protocol' });
     expect(fetchImpl).toHaveBeenCalledTimes(50);
+  });
+
+  it('(k) rejects once the aggregate tool count across pages exceeds the per-source cap', async () => {
+    // Each page stays well under maxResponseBytes on its own, but a peer
+    // returning many small pages can still accumulate an unbounded total
+    // tool count if nothing checks the running total.
+    const fetchImpl = vi.fn().mockImplementation(async (_url: string, init: { body?: unknown }) => {
+      const req = requestBody([_url, init]);
+      const cursor = req.params?.cursor as string | undefined;
+      const nextPage = (cursor ? Number(cursor.split('-')[1]) : 0) + 1;
+      const tools = Array.from({ length: 20 }, (_, i) => ({ name: `t${nextPage}-${i}`, inputSchema: {} }));
+      return jsonResponse({ jsonrpc: '2.0', id: req.id, result: { tools, nextCursor: `page-${nextPage}` } });
+    });
+
+    const client = new McpClient({ endpointUrl: BASE_URL, credentialOrigin: ORIGIN, auth: { authKind: 'none' }, fetchImpl });
+
+    await expect(client.listTools()).rejects.toMatchObject({ code: 'too_large' });
+  });
+
+  it('(l) rejects once the aggregate descriptive-text byte total across pages exceeds the cap', async () => {
+    const bigDescription = 'x'.repeat(200_000);
+    let calls = 0;
+    const fetchImpl = vi.fn().mockImplementation(async (_url: string, init: { body?: unknown }) => {
+      calls += 1;
+      const req = requestBody([_url, init]);
+      const tools = [{ name: `big-${calls}`, description: bigDescription, inputSchema: {} }];
+      return jsonResponse({ jsonrpc: '2.0', id: req.id, result: { tools, nextCursor: `page-${calls}` } });
+    });
+
+    const client = new McpClient({ endpointUrl: BASE_URL, credentialOrigin: ORIGIN, auth: { authKind: 'none' }, fetchImpl });
+
+    await expect(client.listTools()).rejects.toMatchObject({ code: 'too_large' });
   });
 
   it('treats any 3xx response as a transport error and never follows it', async () => {

@@ -1,9 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
 
-const { siteDenied } = vi.hoisted(() => ({
+const { siteDenied, checkScreenAccessConsentGate } = vi.hoisted(() => ({
   siteDenied: Symbol('SITE_ACCESS_DENIED'),
+  checkScreenAccessConsentGate: vi.fn(),
 }));
+
+vi.mock('../remote/screenAccessConsentGate', () => ({ checkScreenAccessConsentGate }));
 
 vi.mock('../../db', () => ({
   db: {
@@ -84,6 +87,7 @@ describe('device diagnose route', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    checkScreenAccessConsentGate.mockResolvedValue({ ok: true });
     app = new Hono();
     app.route('/devices', diagnoseRoutes);
   });
@@ -188,5 +192,85 @@ describe('device diagnose route', () => {
       bandwidthInBps: null,
       bandwidthOutBps: null,
     });
+  });
+
+  it.each([
+    [409, 'CONSENT_REQUIRED_SCREEN_ACCESS_UNAVAILABLE'],
+    [503, 'REMOTE_PROMPT_POLICY_UNAVAILABLE'],
+  ] as const)('refuses with %i %s before capturing when the consent gate refuses', async (status, code) => {
+    vi.mocked(getDeviceWithOrgAndSiteCheck).mockResolvedValue({
+      id: DEVICE_ID,
+      orgId: 'org-123',
+      hostname: 'macbook-pro',
+      osType: 'darwin',
+      osVersion: '15.3',
+      status: 'online',
+    } as never);
+    checkScreenAccessConsentGate.mockResolvedValueOnce({
+      ok: false,
+      status,
+      body: { error: 'refused', code },
+    });
+
+    const res = await app.request(`/devices/${DEVICE_ID}/diagnose`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer token' },
+    });
+
+    expect(res.status).toBe(status);
+    expect(await res.json()).toEqual({ error: 'refused', code });
+    expect(executeCommand).not.toHaveBeenCalled();
+    expect(db.select).not.toHaveBeenCalled();
+    expect(checkScreenAccessConsentGate).toHaveBeenCalledWith(expect.objectContaining({
+      deviceId: DEVICE_ID,
+      orgId: 'org-123',
+      hostname: 'macbook-pro',
+      surface: 'device_diagnose',
+      isEphemeral: false,
+    }));
+  });
+
+  it('tells the consent gate when the device is a Quick Support device', async () => {
+    vi.mocked(getDeviceWithOrgAndSiteCheck).mockResolvedValue({
+      id: DEVICE_ID,
+      orgId: 'org-123',
+      hostname: 'qs-pc',
+      osType: 'windows',
+      osVersion: '11',
+      status: 'online',
+      isEphemeral: true,
+    } as never);
+    checkScreenAccessConsentGate.mockResolvedValueOnce({
+      ok: false,
+      status: 409,
+      body: { error: 'refused', code: 'SCREEN_ACCESS_UNAVAILABLE_IN_QUICK_SUPPORT' },
+    });
+
+    const res = await app.request(`/devices/${DEVICE_ID}/diagnose`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer token' },
+    });
+
+    expect(res.status).toBe(409);
+    expect(executeCommand).not.toHaveBeenCalled();
+    expect(checkScreenAccessConsentGate).toHaveBeenCalledWith(expect.objectContaining({ isEphemeral: true }));
+  });
+
+  it('does not run the consent gate for an offline device', async () => {
+    vi.mocked(getDeviceWithOrgAndSiteCheck).mockResolvedValue({
+      id: DEVICE_ID,
+      orgId: 'org-123',
+      hostname: 'macbook-pro',
+      status: 'offline',
+    } as never);
+
+    const res = await app.request(`/devices/${DEVICE_ID}/diagnose`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer token' },
+    });
+
+    expect(res.status).toBe(400);
+    expect(checkScreenAccessConsentGate).not.toHaveBeenCalled();
+    expect(executeCommand).not.toHaveBeenCalled();
   });
 });

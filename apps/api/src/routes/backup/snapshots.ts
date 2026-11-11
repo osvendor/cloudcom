@@ -1,9 +1,9 @@
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import { zValidator } from '../../lib/validation';
 import { z } from 'zod';
 import { eq, and, desc, inArray } from 'drizzle-orm';
 import { db } from '../../db';
-import { backupConfigs, backupSnapshotFiles, backupSnapshots } from '../../db/schema';
+import { backupConfigs, backupSnapshots, organizations } from '../../db/schema';
 import { requireMfa, requirePermission, requireScope } from '../../middleware/auth';
 import { writeRouteAudit } from '../../services/auditEvents';
 import {
@@ -11,6 +11,7 @@ import {
   backupLayoutManifestKey,
   checkBackupProviderCapabilities,
 } from '../../services/backupSnapshotStorage';
+import { resolveSnapshotPlatform } from '../../services/bareMetalRebuildSchemas';
 import { PERMISSIONS } from '../../services/permissions';
 import { resolveScopedOrgId } from './helpers';
 import {
@@ -18,7 +19,27 @@ import {
   snapshotListSchema,
   snapshotProtectionReasonSchema,
 } from './schemas';
-import type { SnapshotTreeItem } from './types';
+import { attachDeviceNames } from './deviceNames';
+import {
+  BROWSE_DEFAULT_LIMIT,
+  BROWSE_MAX_LIMIT,
+  decodeBrowseCursor,
+  decodeSearchCursor,
+  dirSegments,
+  IndexQueryTimeoutError,
+  listSnapshotDirectory,
+  SEARCH_DEFAULT_LIMIT,
+  SEARCH_MAX_LIMIT,
+  SEARCH_QUERY_MAX_LENGTH,
+  SEARCH_QUERY_MIN_LENGTH,
+  searchSnapshotFiles,
+} from '../../services/backupSnapshotBrowse';
+import { readSnapshotIndexView, type SnapshotIndexView } from '../../services/backupSnapshotIndexView';
+import { enqueueSnapshotFileIndexHydration } from '../../jobs/backupSnapshotFileIndexWorker';
+import { requestFileIndexHydrationAfterContext } from './fileIndexHydrationRequest';
+import { captureException } from '../../services/sentry';
+import { getRedis } from '../../services/redis';
+import { ERROR_CODES } from '@breeze/shared';
 import {
   authorizeRouteResilienceResources,
   resolveRouteAuthorizedDeviceIds,
@@ -27,6 +48,88 @@ import {
 export const snapshotsRoutes = new Hono();
 
 const snapshotIdParamSchema = z.object({ id: z.string().guid() });
+
+/** How long after an accepted rebuild the same snapshot refuses another (#11180). */
+export const FILE_INDEX_REBUILD_COOLDOWN_SECONDS = 10 * 60;
+
+const rebuildCooldownKey = (snapshotDbId: string) => `backup:file-index-rebuild:${snapshotDbId}`;
+
+/**
+ * Claim the snapshot's rebuild slot (SET NX EX). Fails OPEN when Redis is
+ * unavailable: the cooldown only bounds how often a rebuild runs, and the
+ * queue's own job-id dedupe still applies, so an outage must not stop a person
+ * from recovering their file list.
+ */
+async function takeRebuildCooldown(
+  snapshotDbId: string,
+): Promise<{ blocked: false } | { blocked: true; retryAfterSeconds: number }> {
+  try {
+    const redis = getRedis();
+    if (!redis) return { blocked: false };
+    const key = rebuildCooldownKey(snapshotDbId);
+    const taken = await redis.set(key, '1', 'EX', FILE_INDEX_REBUILD_COOLDOWN_SECONDS, 'NX');
+    if (taken === 'OK') return { blocked: false };
+    // The key is held, so the request is blocked even if the TTL read fails.
+    const remaining = await redis.ttl(key).catch(() => -1);
+    return {
+      blocked: true,
+      retryAfterSeconds: remaining > 0 ? remaining : FILE_INDEX_REBUILD_COOLDOWN_SECONDS,
+    };
+  } catch (err) {
+    console.error(`[backup] File-index rebuild cooldown check failed for snapshot ${snapshotDbId} (allowing the rebuild):`, err);
+    return { blocked: false };
+  }
+}
+
+async function releaseRebuildCooldown(snapshotDbId: string): Promise<void> {
+  try {
+    await getRedis()?.del(rebuildCooldownKey(snapshotDbId));
+  } catch (err) {
+    console.error(`[backup] Could not release the file-index rebuild cooldown for snapshot ${snapshotDbId}:`, err);
+  }
+}
+
+// #8230: browse is one directory level per request. `dir` is a tree path as
+// returned in a previous page's directory entries (or a raw Windows path);
+// omitted = the snapshot root.
+const snapshotBrowseQuerySchema = z.object({
+  dir: z.string().max(4096).optional(),
+  limit: z.coerce.number().int().min(1).max(BROWSE_MAX_LIMIT).default(BROWSE_DEFAULT_LIMIT),
+  cursor: z.string().max(2048).optional(),
+});
+
+// #11026: `cursor` carries a stored path (up to 32k on Windows), base64url.
+const snapshotSearchQuerySchema = z.object({
+  // Postgres cannot take a NUL as text: a 400, not a 500 from the query.
+  q: z.string().min(SEARCH_QUERY_MIN_LENGTH).max(SEARCH_QUERY_MAX_LENGTH).refine((q) => !q.includes('\0'), 'q must not contain a NUL'),
+  limit: z.coerce.number().int().min(1).max(SEARCH_MAX_LIMIT).default(SEARCH_DEFAULT_LIMIT),
+  cursor: z.string().max(65_536).optional(),
+});
+
+/** A browse or search past its statement timeout: try again, nothing is wrong with the snapshot. */
+function indexQueryTimeout(c: Context) {
+  return c.json({ error: 'Listing this snapshot took too long. Try again in a moment.', code: 'index_query_timeout' }, 503);
+}
+
+/**
+ * True once this org's erasure cascade has been handed to the worker
+ * (`organizations.status = 'purging'` — the same marker
+ * `jobs/tenantErasure.ts`'s status guard and `routes/orgs.ts`'s lifecycle
+ * freeze read). A hold accepted after that point cannot retroactively protect
+ * anything: the cascade's own `backup_snapshots` step re-checks for an active
+ * hold immediately before deleting (`services/tenantCascade.ts`), so a hold
+ * placed here either loses that race outright or gives the requester a false
+ * sense that the snapshot is now safe. Refuse up front instead of letting the
+ * write silently do nothing useful.
+ */
+async function isOrgErasureInProgress(orgId: string): Promise<boolean> {
+  const [org] = await db
+    .select({ status: organizations.status })
+    .from(organizations)
+    .where(eq(organizations.id, orgId))
+    .limit(1);
+  return org?.status === 'purging';
+}
 
 type SnapshotProtectionState = {
   legalHold: boolean;
@@ -39,73 +142,6 @@ type SnapshotProtectionState = {
   immutabilityFallbackReason: string | null;
   retentionBlockedReason: 'legal_hold' | 'immutable_until' | null;
 };
-
-type SnapshotFileRow = {
-  sourcePath: string;
-  size: number | null;
-  modifiedAt: Date | null;
-};
-
-function normalizeSourcePath(value: string): string {
-  return value.replaceAll('\\', '/');
-}
-
-function buildSnapshotTree(files: SnapshotFileRow[]): SnapshotTreeItem[] {
-  const root: SnapshotTreeItem[] = [];
-
-  const ensureDirectory = (container: SnapshotTreeItem[], name: string, path: string): SnapshotTreeItem => {
-    const existing = container.find((entry) => entry.type === 'directory' && entry.path === path);
-    if (existing) return existing;
-    const next: SnapshotTreeItem = { name, path, type: 'directory', children: [] };
-    container.push(next);
-    return next;
-  };
-
-  for (const file of files) {
-    const normalizedPath = normalizeSourcePath(file.sourcePath);
-    const parts = normalizedPath.split('/').filter(Boolean);
-    if (parts.length === 0) continue;
-
-    let currentLevel = root;
-    let currentPath = '';
-    for (let index = 0; index < parts.length; index += 1) {
-      const part = parts[index]!;
-      currentPath = `${currentPath}/${part}`.replace('//', '/');
-      const isLeaf = index === parts.length - 1;
-
-      if (isLeaf) {
-        const existingLeafIndex = currentLevel.findIndex((entry) => entry.type === 'file' && entry.path === normalizedPath);
-        const nextLeaf: SnapshotTreeItem = {
-          name: part,
-          path: normalizedPath,
-          type: 'file',
-          sizeBytes: file.size ?? undefined,
-          modifiedAt: file.modifiedAt?.toISOString(),
-        };
-        if (existingLeafIndex >= 0) currentLevel[existingLeafIndex] = nextLeaf;
-        else currentLevel.push(nextLeaf);
-        continue;
-      }
-
-      const directory = ensureDirectory(currentLevel, part, currentPath);
-      directory.children = directory.children ?? [];
-      currentLevel = directory.children;
-    }
-  }
-
-  const sortNodes = (nodes: SnapshotTreeItem[]): SnapshotTreeItem[] =>
-    nodes
-      .map((node) => ({
-        ...node,
-        children: node.children ? sortNodes(node.children) : undefined,
-      }))
-      .sort((left, right) => {
-        if (left.type !== right.type) return left.type === 'directory' ? -1 : 1;
-        return left.name.localeCompare(right.name);
-      });
-
-  return sortNodes(root);
-}
 
 function computeImmutableUntilFromNow(immutableDays: number): Date {
   const immutableUntil = new Date();
@@ -236,7 +272,7 @@ snapshotsRoutes.get(
       .where(and(...conditions))
       .orderBy(desc(backupSnapshots.timestamp));
 
-    return c.json({ data: rows.map(toSnapshotResponse) });
+    return c.json({ data: await attachDeviceNames(orgId, rows.map(toSnapshotResponse)) });
   }
 );
 
@@ -271,7 +307,7 @@ snapshotsRoutes.get('/snapshots/:id', requirePermission(PERMISSIONS.BACKUP_READ.
   return c.json(toSnapshotResponse(row));
 });
 
-snapshotsRoutes.get('/snapshots/:id/browse', requirePermission(PERMISSIONS.BACKUP_READ.resource, PERMISSIONS.BACKUP_READ.action), zValidator('param', snapshotIdParamSchema), async (c) => {
+snapshotsRoutes.get('/snapshots/:id/browse', requirePermission(PERMISSIONS.BACKUP_READ.resource, PERMISSIONS.BACKUP_READ.action), zValidator('param', snapshotIdParamSchema), zValidator('query', snapshotBrowseQuerySchema), async (c) => {
   const auth = c.get('auth');
   const orgId = resolveScopedOrgId(auth, c.req.query('orgId'));
   if (!orgId) {
@@ -279,44 +315,195 @@ snapshotsRoutes.get('/snapshots/:id/browse', requirePermission(PERMISSIONS.BACKU
   }
 
   const { id: snapshotId } = c.req.valid('param');
+  const query = c.req.valid('query');
   const authorization = await authorizeRouteResilienceResources(c, orgId, [
     { kind: 'snapshot', id: snapshotId, role: 'source' },
   ], 'read');
   if (!authorization.ok) return authorization.response;
 
-  const [row] = await db
-    .select()
-    .from(backupSnapshots)
-    .where(
-      and(
-        eq(backupSnapshots.id, snapshotId),
-        eq(backupSnapshots.orgId, orgId)
-      )
-    )
-    .limit(1);
-
-  if (!row) {
+  const index = await readSnapshotIndexView(snapshotId, orgId);
+  if (!index) {
     return c.json({ error: 'Snapshot not found' }, 404);
   }
 
-  const files = await db
-    .select({
-      sourcePath: backupSnapshotFiles.sourcePath,
-      size: backupSnapshotFiles.size,
-      modifiedAt: backupSnapshotFiles.modifiedAt,
-    })
-    .from(backupSnapshotFiles)
-    .where(eq(backupSnapshotFiles.snapshotDbId, row.id))
-    .orderBy(backupSnapshotFiles.sourcePath);
+  const cursor = query.cursor ? decodeBrowseCursor(query.cursor) : null;
+  if (query.cursor && !cursor) {
+    return c.json({ error: 'Invalid cursor' }, 400);
+  }
 
-  const tree = buildSnapshotTree(files);
-  const manifestUnavailable = files.length === 0 && (row.fileCount ?? 0) > 0;
+  // #11026: a snapshot with no index to list (persisted before eager
+  // hydration, or whose request or job failed) builds one from its manifest
+  // when someone browses it, instead of staying empty until a restore asks.
+  if (index.shouldRequestHydration) {
+    requestFileIndexHydrationAfterContext(index.id, 'browse');
+  }
+
+  // Bounded, SQL-side one-level listing: only `limit + 1` grouped entries
+  // leave Postgres, so the request's DB context is held for one cheap query
+  // instead of materialising and serialising the whole file index (#8230).
+  // The listing itself only reads an index that may be trusted.
+  const segments = dirSegments(query.dir);
+  let page: Awaited<ReturnType<typeof listSnapshotDirectory>>;
+  try {
+    page = await listSnapshotDirectory({
+      snapshotDbId: index.id,
+      segments,
+      limit: query.limit,
+      cursor,
+    });
+  } catch (err) {
+    if (err instanceof IndexQueryTimeoutError) return indexQueryTimeout(c);
+    throw err;
+  }
+
+  // Kept for web bundles that predate `index`.
+  const manifestUnavailable =
+    segments.length === 0 && !cursor && page.entries.length === 0 && (index.fileCount ?? 0) > 0;
   return c.json({
-    snapshotId: row.id,
+    snapshotId: index.id,
     manifestUnavailable,
-    data: tree,
+    index: index.view,
+    dir: segments.length > 0 ? `/${segments.join('/')}` : '',
+    data: page.entries,
+    nextCursor: page.nextCursor,
   });
 });
+
+// #11026: find a snapshot's files by part of a name or folder, without walking
+// the tree. Same authorization and index gate as browse.
+snapshotsRoutes.get('/snapshots/:id/search', requirePermission(PERMISSIONS.BACKUP_READ.resource, PERMISSIONS.BACKUP_READ.action), zValidator('param', snapshotIdParamSchema), zValidator('query', snapshotSearchQuerySchema), async (c) => {
+  const auth = c.get('auth');
+  const orgId = resolveScopedOrgId(auth, c.req.query('orgId'));
+  if (!orgId) {
+    return c.json({ error: 'orgId is required for this scope' }, 400);
+  }
+
+  const { id: snapshotId } = c.req.valid('param');
+  const query = c.req.valid('query');
+  const authorization = await authorizeRouteResilienceResources(c, orgId, [
+    { kind: 'snapshot', id: snapshotId, role: 'source' },
+  ], 'read');
+  if (!authorization.ok) return authorization.response;
+
+  const index = await readSnapshotIndexView(snapshotId, orgId);
+  if (!index) {
+    return c.json({ error: 'Snapshot not found' }, 404);
+  }
+
+  const after = query.cursor ? decodeSearchCursor(query.cursor) : null;
+  if (query.cursor && after === null) {
+    return c.json({ error: 'Invalid cursor' }, 400);
+  }
+
+  if (index.shouldRequestHydration) {
+    requestFileIndexHydrationAfterContext(index.id, 'browse');
+  }
+
+  try {
+    const page = await searchSnapshotFiles({ snapshotDbId: index.id, query: query.q, limit: query.limit, after });
+    return c.json({ data: page.entries, nextCursor: page.nextCursor, index: index.view });
+  } catch (err) {
+    if (err instanceof IndexQueryTimeoutError) return indexQueryTimeout(c);
+    throw err;
+  }
+});
+
+// #11026: build a snapshot's file list again from its manifest, for a person
+// whose browse ended in "can't read the list". Changes derived data only (the
+// index is rebuilt from bytes the attestation names), so it needs backup write
+// but not a fresh second factor.
+snapshotsRoutes.post(
+  '/snapshots/:id/file-index/rebuild',
+  requireScope('organization', 'partner', 'system'),
+  requirePermission(PERMISSIONS.BACKUP_WRITE.resource, PERMISSIONS.BACKUP_WRITE.action),
+  zValidator('param', snapshotIdParamSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const orgId = resolveScopedOrgId(auth, c.req.query('orgId'));
+    if (!orgId) {
+      return c.json({ error: 'orgId is required for this scope' }, 400);
+    }
+
+    const { id: snapshotId } = c.req.valid('param');
+    const authorization = await authorizeRouteResilienceResources(c, orgId, [
+      { kind: 'snapshot', id: snapshotId, role: 'source' },
+    ], 'verify');
+    if (!authorization.ok) return authorization.response;
+
+    const index = await readSnapshotIndexView(snapshotId, orgId);
+    if (!index) {
+      return c.json({ error: 'Snapshot not found' }, 404);
+    }
+    // Rebuilding cannot help a snapshot whose stored bytes are not the
+    // attested ones: it would only fail the same way.
+    if (
+      index.view.state === 'unavailable'
+      && (index.view.failure === 'attestation_failed' || index.view.failure === 'manifest_differs_from_attestation')
+    ) {
+      return c.json({ error: "This snapshot failed its integrity check, so its file list can't be rebuilt.", code: 'attestation_failed' }, 409);
+    }
+
+    // BullMQ's job id only dedupes a rebuild that is still queued; a client
+    // that asks again after each completion would re-hydrate a large manifest
+    // back to back (#11180). Take the per-snapshot cooldown before any write.
+    const cooldown = await takeRebuildCooldown(index.id);
+    if (cooldown.blocked) {
+      c.header('Retry-After', String(cooldown.retryAfterSeconds));
+      return c.json({
+        error: "This snapshot's file list was rebuilt recently. Try again in a few minutes.",
+        code: ERROR_CODES.RATE_LIMITED,
+        retryAfterSeconds: cooldown.retryAfterSeconds,
+      }, 429);
+    }
+
+    // A failed index stays failed until the worker claims it, and a person
+    // polling meanwhile would read the old failure back and stop. Set it to
+    // not-built first: the view then reads as building (and asks again on its
+    // own if this request is lost). Only a failed row: never one a hydration
+    // is running on or one that is complete.
+    try {
+      await db
+        .update(backupSnapshots)
+        .set({ fileIndexStatus: 'none', fileIndexError: null })
+        .where(and(
+          eq(backupSnapshots.id, index.id),
+          eq(backupSnapshots.orgId, orgId),
+          eq(backupSnapshots.fileIndexStatus, 'failed'),
+        ));
+    } catch (err) {
+      // Nothing was started: do not lock the person out for the window. The
+      // error is rethrown unchanged (not caught into a 4xx/200), so the request
+      // still fails as before.
+      await releaseRebuildCooldown(index.id);
+      throw err;
+    }
+
+    try {
+      await enqueueSnapshotFileIndexHydration(index.id, 'rebuild', { force: true });
+    } catch (err) {
+      console.error(`[backup] Failed to request a file-index rebuild for snapshot ${index.id}:`, err);
+      captureException(err instanceof Error ? err : new Error(String(err)));
+      // Nothing was started, so the person may try again at once.
+      await releaseRebuildCooldown(index.id);
+      return c.json({ error: "Couldn't start rebuilding the file list. Try again in a moment.", code: 'rebuild_unavailable' }, 503);
+    }
+
+    writeRouteAudit(c, {
+      orgId,
+      action: 'backup.snapshot.file_index.rebuild',
+      resourceType: 'backup_snapshot',
+      resourceId: index.id,
+      details: {
+        snapshotIds: [index.id],
+        previousState: index.view.state,
+        ...(index.view.state === 'unavailable' ? { previousFailure: index.view.failure } : {}),
+      },
+    });
+
+    const building: SnapshotIndexView = { state: 'building' };
+    return c.json({ index: building }, 202);
+  },
+);
 
 snapshotsRoutes.post(
   '/snapshots/:id/legal-hold',
@@ -338,6 +525,13 @@ snapshotsRoutes.post(
       { kind: 'snapshot', id: snapshotId, role: 'source' },
     ], 'verify');
     if (!authorization.ok) return authorization.response;
+
+    if (await isOrgErasureInProgress(orgId)) {
+      return c.json(
+        { error: 'This organization is being erased; a new legal hold cannot be placed.' },
+        409,
+      );
+    }
 
     const [before] = await db
       .select()
@@ -550,6 +744,8 @@ snapshotsRoutes.post(
           provider: storage.provider,
           providerConfig: storage.providerConfig,
           snapshotId: updated.snapshotId,
+          keyLayout: updated.keyLayout,
+          keyPrefix: updated.keyPrefix,
           metadata: updated.metadata,
           retainUntil: immutableUntil,
         });
@@ -666,6 +862,36 @@ snapshotsRoutes.post(
   },
 );
 
+type SnapshotHardwareSizing = {
+  cpuCores: number | null;
+  totalMemoryMB: number | null;
+  disks: { sizeBytes: number }[];
+};
+
+/**
+ * Restore-as-VM snapshot cards show CPU / memory / disk chips. The stored
+ * profile (the agent's systemstate.HardwareProfile) also carries NICs with MAC
+ * addresses, BIOS and board strings the list has no use for, so only the
+ * sizing fields ride, under their stored names. Null when none was captured.
+ */
+function toHardwareSizing(profile: unknown): SnapshotHardwareSizing | null {
+  if (!profile || typeof profile !== 'object' || Array.isArray(profile)) return null;
+  const stored = profile as Record<string, unknown>;
+  const positive = (value: unknown): number | null =>
+    typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : null;
+  const disks = Array.isArray(stored.disks)
+    ? stored.disks.flatMap((disk) => {
+        const sizeBytes = disk && typeof disk === 'object' ? positive((disk as Record<string, unknown>).sizeBytes) : null;
+        return sizeBytes === null ? [] : [{ sizeBytes }];
+      })
+    : [];
+  return {
+    cpuCores: positive(stored.cpuCores),
+    totalMemoryMB: positive(stored.totalMemoryMB),
+    disks,
+  };
+}
+
 function toSnapshotResponse(row: typeof backupSnapshots.$inferSelect) {
   return {
     id: row.id,
@@ -680,6 +906,11 @@ function toSnapshotResponse(row: typeof backupSnapshots.$inferSelect) {
     // run captured none. Restore-as-VM offers the rebuild engine only for
     // snapshots that carry one (W05a); the manifest body stays off the list.
     layoutManifestKey: row.layoutManifest ? backupLayoutManifestKey(row.snapshotId) : null,
+    // W06d: the layout's platform ('linux' | 'windows', null when absent or
+    // unknown). The rebuild engine is platform-matched, so Restore-as-VM
+    // filters rebuild hosts by it; a null platform cannot be rebuilt.
+    layoutPlatform: resolveSnapshotPlatform(row.layoutManifest),
+    hardwareProfile: toHardwareSizing(row.hardwareProfile),
     sizeBytes: row.size ?? null,
     fileCount: row.fileCount ?? null,
     label: row.label ?? null,
@@ -694,5 +925,10 @@ function toSnapshotResponse(row: typeof backupSnapshots.$inferSelect) {
     requestedImmutabilityEnforcement: row.requestedImmutabilityEnforcement ?? null,
     immutabilityFallbackReason: row.immutabilityFallbackReason ?? null,
     retentionBlockedReason: computeRetentionBlockedReason(row),
+    // Display projection of the snapshot attestation (restores decide on the
+    // attestation itself): 'attested' | 'producer_only' | 'pending' |
+    // 'unattested' | 'unattested_legacy' | 'attestation_failed'. A row read
+    // without the column reads as written before attestations.
+    integrityStatus: row.integrityStatus ?? 'unattested_legacy',
   };
 }

@@ -3,7 +3,10 @@ import { useState, useEffect } from 'react';
 import { ShieldAlert, AlertTriangle, CheckCircle, Activity } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { fetchWithAuth } from '../../stores/auth';
+import { useStableT } from '@/lib/i18n/useStableT';
 import { RISK_CHART_COLORS, DATA_TYPE_CHART_COLORS } from './constants';
+import { useSensitiveDataLabels, sortByRisk } from './useSensitiveDataLabels';
+import SensitiveDataAccessDenied from './SensitiveDataAccessDenied';
 
 type DashboardData = {
   totals: {
@@ -29,7 +32,7 @@ function StatCard({ label, value, icon, accent }: { label: string; value: number
   );
 }
 
-function BarChart({ data, colorMap, title }: { data: Record<string, number>; colorMap: Record<string, string>; title: string }) {
+function BarChart({ data, colorMap, title, labelFor }: { data: Record<string, number>; colorMap: Record<string, string>; title: string; labelFor: (key: string) => string }) {
   const { t } = useTranslation('security');
   const entries = Object.entries(data);
   const max = Math.max(...entries.map(([, v]) => v), 1);
@@ -46,7 +49,7 @@ function BarChart({ data, colorMap, title }: { data: Record<string, number>; col
         {entries.map(([key, count]) => (
           <div key={key}>
             <div className="flex items-center justify-between text-sm">
-              <span className="capitalize">{key.replace('_', ' ')}</span>
+              <span>{labelFor(key)}</span>
               <span className="font-medium">{count}</span>
             </div>
             <div className="mt-1 h-2 w-full rounded-full bg-muted">
@@ -65,9 +68,9 @@ function BarChart({ data, colorMap, title }: { data: Record<string, number>; col
   );
 }
 
-function PieChart({ data, colorMap, title }: { data: Record<string, number>; colorMap: Record<string, string>; title: string }) {
+function PieChart({ data, colorMap, title, labelFor, order }: { data: Record<string, number>; colorMap: Record<string, string>; title: string; labelFor: (key: string) => string; order?: (entries: Array<[string, number]>) => Array<[string, number]> }) {
   const { t } = useTranslation('security');
-  const entries = Object.entries(data);
+  const entries = order ? order(Object.entries(data)) : Object.entries(data);
   const total = entries.reduce((sum, [, v]) => sum + v, 0);
 
   let cumulativePercent = 0;
@@ -98,7 +101,7 @@ function PieChart({ data, colorMap, title }: { data: Record<string, number>; col
           {segments.map((s) => (
             <div key={s.key} className="flex items-center gap-2 text-sm">
               <span className="h-3 w-3 rounded-full" style={{ backgroundColor: s.color }} />
-              <span className="capitalize">{s.key}</span>
+              <span>{labelFor(s.key)}</span>
               <span className="text-muted-foreground">({s.count})</span>
             </div>
           ))}
@@ -115,19 +118,33 @@ function PieChart({ data, colorMap, title }: { data: Record<string, number>; col
 
 export default function DashboardTab() {
   const { t } = useTranslation('security');
+  // Effects use the stable translator so a locale change does not re-run them
+  // (#3632); JSX keeps the plain `t` so rendered text still re-translates.
+  const stableT = useStableT(t);
+  const { riskLabel, dataTypeLabel } = useSensitiveDataLabels();
   const [data, setData] = useState<DashboardData | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
+  const [forbidden, setForbidden] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
     async function fetch() {
       try {
         setLoading(true);
+        setError(undefined);
+        setForbidden(false);
         const res = await fetchWithAuth('/sensitive-data/dashboard');
+        if (res.status === 403) {
+          if (!cancelled) {
+            setData(null);
+            setForbidden(true);
+          }
+          return;
+        }
         if (!res.ok) {
           throw new Error(
-            t('sensitiveDataDashboardTab.errors.fetchDashboard', {
+            stableT('sensitiveDataDashboardTab.errors.fetchDashboard', {
               defaultValue: 'Failed to fetch dashboard',
             }),
           );
@@ -136,10 +153,11 @@ export default function DashboardTab() {
         if (!cancelled) setData(json.data);
       } catch (err) {
         if (!cancelled) {
+          setData(null);
           setError(
             err instanceof Error
               ? err.message
-              : t('sensitiveDataDashboardTab.errors.generic', { defaultValue: 'An error occurred' }),
+              : stableT('sensitiveDataDashboardTab.errors.generic', { defaultValue: 'An error occurred' }),
           );
         }
       } finally {
@@ -148,7 +166,7 @@ export default function DashboardTab() {
     }
     fetch();
     return () => { cancelled = true; };
-  }, [t]);
+  }, [stableT]);
 
   if (loading) {
     return (
@@ -157,6 +175,8 @@ export default function DashboardTab() {
       </div>
     );
   }
+
+  if (forbidden) return <SensitiveDataAccessDenied />;
 
   if (error) {
     return (
@@ -178,8 +198,8 @@ export default function DashboardTab() {
       </div>
 
       <div className="grid gap-6 lg:grid-cols-2">
-        <BarChart data={data.byDataType} colorMap={DATA_TYPE_CHART_COLORS} title={t('sensitiveDataDashboardTab.charts.findingsByDataType', { defaultValue: 'Findings by Data Type' })} />
-        <PieChart data={data.byRisk} colorMap={RISK_CHART_COLORS} title={t('sensitiveDataDashboardTab.charts.riskDistribution', { defaultValue: 'Risk Distribution' })} />
+        <BarChart labelFor={dataTypeLabel} data={data.byDataType} colorMap={DATA_TYPE_CHART_COLORS} title={t('sensitiveDataDashboardTab.charts.findingsByDataType', { defaultValue: 'Findings by Data Type' })} />
+        <PieChart labelFor={riskLabel} order={sortByRisk} data={data.byRisk} colorMap={RISK_CHART_COLORS} title={t('sensitiveDataDashboardTab.charts.riskDistribution', { defaultValue: 'Risk Distribution' })} />
       </div>
     </div>
   );

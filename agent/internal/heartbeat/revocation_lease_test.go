@@ -162,7 +162,7 @@ func TestDecoderParityOnMaxDuration(t *testing.T) {
 }
 
 func TestStartDesktopRefusesWithoutRevocationLease(t *testing.T) {
-	h := &Heartbeat{desktopMgr: desktop.NewSessionManager()}
+	h := &Heartbeat{desktopMgr: desktop.NewSessionManagerWithPreloader(nil)}
 
 	result := handleStartDesktop(h, Command{
 		ID:   "cmd-nolease",

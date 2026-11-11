@@ -17,6 +17,9 @@ var (
 	// a var so security tests can assert it does NOT run when integrity
 	// verification of the downloaded package fails.
 	installPackageFunc = installPackage
+	// legacyBinaryPathFunc is a seam so tests can point the legacy path at a
+	// temp file without touching the real install locations.
+	legacyBinaryPathFunc = legacyBinaryPath
 )
 
 // legacyBinaryPath returns the old "Breeze Helper" binary path.
@@ -38,7 +41,14 @@ func legacyBinaryPath() string {
 // migrateFromLegacyName cleans up old "Breeze Helper" installations.
 // Called at the top of Apply() under the manager mutex. Idempotent.
 func (m *Manager) migrateFromLegacyName() {
-	oldPath := legacyBinaryPath()
+	oldPath := legacyBinaryPathFunc()
+	// On Linux the old and current names are the same file
+	// (/usr/local/bin/breeze-helper), so there is nothing to migrate. Without
+	// this guard every Apply would stop the helper and delete the binary it
+	// just installed, and the next heartbeat would download it again (#8541).
+	if samePath(oldPath, m.binaryPath) {
+		return
+	}
 	if _, err := os.Stat(oldPath); err != nil {
 		return
 	}
@@ -117,7 +127,7 @@ func (m *Manager) migrateToSessions() {
 			log.Warn("failed to prepare session dir", "session", key, "error", err.Error())
 		}
 		if len(globalConfig) > 0 {
-			if err := os.WriteFile(filepath.Join(sessionDir, configName), globalConfig, 0600); err != nil {
+			if err := writeHelperConfigFile(filepath.Join(sessionDir, configName), globalConfig, 0600); err != nil {
 				log.Warn("failed to copy legacy config", "session", key, "error", err.Error())
 			}
 		}
@@ -132,4 +142,12 @@ func (m *Manager) migrateToSessions() {
 
 func stopHelperGlobal() {
 	stopHelperLegacyFunc()
+}
+
+// samePath reports whether a and b name the same file location after cleaning.
+func samePath(a, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	return filepath.Clean(a) == filepath.Clean(b)
 }

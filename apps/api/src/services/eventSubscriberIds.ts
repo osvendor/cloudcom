@@ -19,9 +19,26 @@ export const EVENT_SUBSCRIBER_IDS = [
   // into a delivery record per the deliverable's completion policy.
   'deliverable-status',
   'dns-threat-alerts',
+  // AI Suggested Fixes W1 — attach proven fix memory to a newly triggered alert.
+  'fix-memory-attach',
+  // AI Suggested Fixes W1 — fast path for the fix-outcome state machine
+  // (alert.resolved only). The sweeper is authoritative.
+  'fix-outcome-watcher',
+  // Tool catalog W04 (#5219), Task A9 — admits event-triggered flow runs
+  // (services/flows/eventTrigger.ts). Event flows enable only when this id is
+  // in EVENT_DISPATCH_QUEUE_SUBSCRIBERS and dispatch is `enforce`.
+  'flow-event-trigger',
   'notification-dispatcher',
   'policy-alert-bridge',
+  'psa-alert-ticketing',
   'webhook-delivery',
+  // Wisp event check-ins W04 (#11493, #10410) — the event fast path of a
+  // check-in waiting on a device coming online, a script finishing or a run
+  // settling. Its own id, so the assessment wake never sees device.online.
+  'wisp-check-in-trigger',
+  // Wisp W05b Task 9 (#9917) — wakes the assessment engine: one debounced
+  // assessment request per active grant covering the event's org.
+  'wisp-wake',
 ] as const;
 
 export type SubscriberId = (typeof EVENT_SUBSCRIBER_IDS)[number];

@@ -2,63 +2,17 @@ import { Hono } from 'hono';
 import { zValidator } from '../lib/validation';
 import { z } from 'zod';
 import { and, desc, eq, inArray, or } from 'drizzle-orm';
-import { db } from '../db';
+import { db, withDbTransaction } from '../db';
 import { customFieldWriteConflict } from '../services/customFields/writeErrors';
-
-// Custom field schemas (defined locally to avoid rootDir issues)
-// Must match the database enum: 'text', 'number', 'boolean', 'dropdown', 'date'
-const customFieldTypeSchema = z.enum(['text', 'number', 'boolean', 'dropdown', 'date']);
-
-// Mirrors CustomFieldOptions in packages/shared/src/types/filters.ts. The
-// {label,value} choice shape is the one the shared contract, the web form and
-// services/customFields/validateValue.ts readChoices() all use; the bare-string
-// array is accepted for the rows already stored that way. Widening here was a
-// live bug fix, not a nicety: a dropdown created through the UI was rejected by
-// this very schema (#3257 Phase 0).
-const customFieldChoiceSchema = z.union([
-  z.string().min(1).max(255),
-  z.object({ label: z.string().min(1).max(255), value: z.string().min(1).max(255) })
-]);
-
-const customFieldOptionsSchema = z.object({
-  choices: z.array(customFieldChoiceSchema).max(200).optional(),
-  min: z.number().optional(),
-  max: z.number().optional(),
-  minLength: z.number().int().nonnegative().optional(),
-  maxLength: z.number().int().positive().optional(),
-  pattern: z.string().max(512).optional(),
-  placeholder: z.string().max(255).optional()
-});
-
-const createCustomFieldSchema = z.object({
-  name: z.string().min(1).max(100),
-  fieldKey: z
-    .string()
-    .min(1)
-    .max(100)
-    .regex(/^[a-z][a-z0-9_]*$/, 'Field key must be lowercase alphanumeric with underscores'),
-  type: customFieldTypeSchema,
-  // .nullable().optional() so the create form can send explicit null
-  // for unused fields. The web form serializes unused fields as null
-  // rather than omitting them — without .nullable() the validator
-  // rejects every non-Dropdown create (Text, Number, Boolean, Date).
-  options: customFieldOptionsSchema.nullable().optional(),
-  required: z.boolean().default(false),
-  defaultValue: z.unknown().optional(),
-  deviceTypes: z.array(z.enum(['windows', 'macos', 'linux'])).nullable().optional(),
-  // #2698 — may a script running on a device write this field via the
-  // ::breeze:custom-fields:: marker? Default false: opting in is deliberate.
-  scriptWrite: z.boolean().default(false)
-});
-
-const updateCustomFieldSchema = z.object({
-  name: z.string().min(1).max(100).optional(),
-  options: customFieldOptionsSchema.optional(),
-  required: z.boolean().optional(),
-  defaultValue: z.unknown().optional(),
-  deviceTypes: z.array(z.enum(['windows', 'macos', 'linux'])).nullable().optional(),
-  scriptWrite: z.boolean().optional() // #2698
-});
+import {
+  canEditField,
+  createCustomFieldSchema,
+  customFieldTypeSchema,
+  ensureOrgAccess,
+  getCustomFieldWithAccess,
+  mapCustomFieldRow,
+  updateCustomFieldSchema,
+} from '../services/customFields/definitionAdmin';
 
 const customFieldQuerySchema = z.object({
   orgId: z.string().guid().optional(),
@@ -76,26 +30,11 @@ import {
   PARTNER_WIDE_WRITE_DENIED_MESSAGE,
   canManagePartnerWidePolicies,
 } from '../services/partnerWideAccess';
+import { canMutateOrgWideGovernance, SITE_CEILING_WRITE_DENIED_MESSAGE } from '../services/siteCeilingAccess';
 
 export const customFieldRoutes = new Hono();
 const requireCustomFieldRead = requirePermission(PERMISSIONS.DEVICES_READ.resource, PERMISSIONS.DEVICES_READ.action);
 const requireCustomFieldWrite = requirePermission(PERMISSIONS.DEVICES_WRITE.resource, PERMISSIONS.DEVICES_WRITE.action);
-
-type CustomFieldDefinition = {
-  id: string;
-  orgId: string | null;
-  partnerId: string | null;
-  name: string;
-  fieldKey: string;
-  type: string;
-  options: unknown;
-  required: boolean;
-  defaultValue: unknown;
-  deviceTypes: string[] | null;
-  scriptWrite: boolean;
-  createdAt: string;
-  updatedAt: string;
-};
 
 const customFieldIdParamSchema = z.object({
   id: z.string().guid()
@@ -107,21 +46,6 @@ const createCustomFieldRequestSchema = createCustomFieldSchema.extend({
 });
 
 customFieldRoutes.use('*', authMiddleware);
-
-async function ensureOrgAccess(
-  orgId: string,
-  auth: Pick<AuthContext, 'scope' | 'orgId' | 'accessibleOrgIds' | 'canAccessOrg'>
-) {
-  if (auth.scope === 'organization') {
-    return auth.orgId === orgId;
-  }
-
-  if (auth.scope === 'partner') {
-    return auth.canAccessOrg(orgId);
-  }
-
-  return true;
-}
 
 async function getOrgIdsForAuth(
   auth: Pick<AuthContext, 'scope' | 'orgId' | 'accessibleOrgIds'>
@@ -138,81 +62,6 @@ async function getOrgIdsForAuth(
   return null;
 }
 
-function canEditField(
-  field: typeof customFieldDefinitions.$inferSelect,
-  auth: Pick<AuthContext, 'scope' | 'partnerId' | 'orgId' | 'partnerOrgAccess'>
-) {
-  if (auth.scope === 'system') {
-    return true;
-  }
-
-  if (field.orgId) {
-    return auth.scope === 'organization'
-      ? auth.orgId === field.orgId
-      : auth.scope === 'partner'
-        ? Boolean(auth.partnerId)
-        : false;
-  }
-
-  if (field.partnerId) {
-    // Partner-wide row (org_id NULL): epic #2135 capability gate, not just
-    // scope. A `selected` partner user whose selection happens to cover every
-    // current org still must not administer partner-wide state.
-    return auth.partnerId === field.partnerId && canManagePartnerWidePolicies(auth);
-  }
-
-  return false;
-}
-
-async function getCustomFieldWithAccess(
-  fieldId: string,
-  auth: Pick<AuthContext, 'scope' | 'partnerId' | 'orgId' | 'accessibleOrgIds' | 'canAccessOrg'>
-) {
-  const [field] = await db
-    .select()
-    .from(customFieldDefinitions)
-    .where(eq(customFieldDefinitions.id, fieldId))
-    .limit(1);
-
-  if (!field) {
-    return null;
-  }
-
-  if (field.orgId) {
-    const hasAccess = await ensureOrgAccess(field.orgId, auth);
-    if (!hasAccess) {
-      return null;
-    }
-  } else if (field.partnerId) {
-    if (auth.scope !== 'system' && auth.partnerId !== field.partnerId) {
-      return null;
-    }
-  } else if (auth.scope !== 'system') {
-    return null;
-  }
-
-  return field;
-}
-
-function mapCustomFieldRow(
-  field: typeof customFieldDefinitions.$inferSelect
-): CustomFieldDefinition {
-  return {
-    id: field.id,
-    orgId: field.orgId,
-    partnerId: field.partnerId,
-    name: field.name,
-    fieldKey: field.fieldKey,
-    type: field.type,
-    options: field.options ?? null,
-    required: field.required,
-    defaultValue: field.defaultValue ?? null,
-    deviceTypes: field.deviceTypes ?? null,
-    scriptWrite: field.scriptWrite,
-    createdAt: field.createdAt.toISOString(),
-    updatedAt: field.updatedAt.toISOString()
-  };
-}
 
 // GET / - List custom field definitions
 customFieldRoutes.get(
@@ -262,7 +111,16 @@ customFieldRoutes.get(
       .where(whereCondition)
       .orderBy(desc(customFieldDefinitions.createdAt));
 
-    let results = fields;
+    // #7572: alphabetical by display name for every consumer (settings page,
+    // device details, filters). Done in JS — Postgres collation is deployment-
+    // dependent. There is no explicit position column, so name is the sole key;
+    // fieldKey then id make the order deterministic for equal names.
+    let results = [...fields].sort(
+      (a, b) =>
+        a.name.localeCompare(b.name, undefined, { sensitivity: 'base', numeric: true }) ||
+        a.fieldKey.localeCompare(b.fieldKey) ||
+        a.id.localeCompare(b.id)
+    );
     if (query.search) {
       const term = query.search.toLowerCase();
       results = results.filter((field) =>
@@ -304,6 +162,13 @@ customFieldRoutes.post(
   zValidator('json', createCustomFieldRequestSchema),
   async (c) => {
     const auth = c.get('auth');
+    // A definition is an org-wide (or partner-wide) governance object with no
+    // per-site ownership model — same capability class as
+    // `canMutateOrgWideGovernance`'s other objects, even though this table
+    // isn't in that contract's hand-listed set yet.
+    if (!canMutateOrgWideGovernance(auth)) {
+      return c.json({ error: SITE_CEILING_WRITE_DENIED_MESSAGE }, 403);
+    }
     const payload = c.req.valid('json');
 
     if (payload.orgId && payload.partnerId) {
@@ -346,21 +211,25 @@ customFieldRoutes.post(
 
     let field;
     try {
-      [field] = await db
-        .insert(customFieldDefinitions)
-        .values({
-          orgId,
-          partnerId,
-          name: payload.name,
-          fieldKey: payload.fieldKey,
-          type: payload.type,
-          options: payload.options,
-          required: payload.required,
-          defaultValue: payload.defaultValue,
-          deviceTypes: payload.deviceTypes,
-          scriptWrite: payload.scriptWrite
-        })
-        .returning();
+      // Savepoint so the caught constraint violation cannot poison the request
+      // transaction and turn the 409 into a 500 at commit (#11203).
+      [field] = await withDbTransaction(async () =>
+        db
+          .insert(customFieldDefinitions)
+          .values({
+            orgId,
+            partnerId,
+            name: payload.name,
+            fieldKey: payload.fieldKey,
+            type: payload.type,
+            options: payload.options,
+            required: payload.required,
+            defaultValue: payload.defaultValue,
+            deviceTypes: payload.deviceTypes,
+            scriptWrite: payload.scriptWrite
+          })
+          .returning()
+      );
     } catch (err) {
       // Both mapped conditions are the caller's own to fix and neither is a
       // server fault, so neither may surface as a 500. The mapping itself lives
@@ -402,6 +271,9 @@ customFieldRoutes.patch(
   zValidator('json', updateCustomFieldSchema),
   async (c) => {
     const auth = c.get('auth');
+    if (!canMutateOrgWideGovernance(auth)) {
+      return c.json({ error: SITE_CEILING_WRITE_DENIED_MESSAGE }, 403);
+    }
     const { id } = c.req.valid('param');
     const payload = c.req.valid('json');
 
@@ -454,6 +326,9 @@ customFieldRoutes.delete(
   zValidator('param', customFieldIdParamSchema),
   async (c) => {
     const auth = c.get('auth');
+    if (!canMutateOrgWideGovernance(auth)) {
+      return c.json({ error: SITE_CEILING_WRITE_DENIED_MESSAGE }, 403);
+    }
     const { id } = c.req.valid('param');
 
     const field = await getCustomFieldWithAccess(id, auth);

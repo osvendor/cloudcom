@@ -18,7 +18,7 @@ async function gfetch(url: string, token: string, init: RequestInit): Promise<Re
 }
 
 /** Threaded reply from the support mailbox: createReply -> set body -> send. */
-export async function sendThreadedReply(t: GraphSendTarget, originalMessageId: string, html: string): Promise<void> {
+export async function sendThreadedReply(t: GraphSendTarget, originalMessageId: string, html: string, to: string, subject: string): Promise<void> {
   const token = await getMailboxToken(t.tenantId);
   const base = `${GRAPH}/users/${encodeURIComponent(t.mailbox)}/messages`;
 
@@ -30,7 +30,8 @@ export async function sendThreadedReply(t: GraphSendTarget, originalMessageId: s
 
   await gfetch(`${base}/${encodeURIComponent(draft.id)}`, token, {
     method: 'PATCH', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ body: { contentType: 'HTML', content: html } }),
+    body: JSON.stringify({ body: { contentType: 'HTML', content: html }, subject,
+      toRecipients: [{ emailAddress: { address: to } }], ccRecipients: [], bccRecipients: [], }),
   });
 
   await gfetch(`${base}/${encodeURIComponent(draft.id)}/send`, token, {

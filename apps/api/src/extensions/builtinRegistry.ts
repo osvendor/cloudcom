@@ -17,6 +17,7 @@ import {
 import type { ExtensionTenancyDeclaration } from '@breeze/extension-sdk';
 import workspaceExtension from '@breeze/ext-workspace';
 import remoteAccessExtension from '@cloudcom/ext-rustdesk-access';
+import { createCredentialsExtension } from '@cloudcom/ext-credentials';
 import { createCloudCommandExtension } from '@cloudcom/ext-cloud-command';
 
 /** One statically-imported, first-party extension. */
@@ -63,6 +64,13 @@ export interface BuiltinExtension {
    * configuration that decides whether the built-in is loaded at all.
    */
   enableEnvVar: string;
+  /**
+   * Extra env names that enable this built-in exactly as `enableEnvVar` does
+   * (same strict `'true'` rule; any one of them suffices). For a product rename
+   * that must not break the original deployment contract: `enableEnvVar` stays
+   * the canonical name every diagnostic reports, and an alias only adds a way in.
+   */
+  enableEnvAliases?: readonly string[];
 }
 
 /**
@@ -267,6 +275,19 @@ export const BUILTINS: readonly BuiltinExtension[] = [
       setSuspended: async (request, input) => (await import('./cloudCommandGoogle')).nativeGoogleServices.setSuspended(request, input),
       auditProfile: async (request, userId, stage) => (await import('./cloudCommandGoogle')).nativeGoogleServices.auditProfile(request, userId, stage),
       updateProfile: async (request, input) => (await import('./cloudCommandGoogle')).nativeGoogleServices.updateProfile(request, input),
+    }, async auth => (await import('./operationsHealth')).readOperationsHealth(auth), async (auth, work) => {
+      const { withAuthDbAccessContext } = await import('../middleware/auth');
+      return withAuthDbAccessContext(auth as import('../middleware/auth').AuthContext, work);
+    }, {
+      version: 1,
+      connection: async request => (await import('./cloudCommandHarmony')).nativeHarmonyServices.connection(request),
+      refreshDue: async () => (await import('./cloudCommandHarmony')).nativeHarmonyServices.refreshDue(),
+      configure: async (request, input) => (await import('./cloudCommandHarmony')).nativeHarmonyServices.configure(request, input),
+      discover: async request => (await import('./cloudCommandHarmony')).nativeHarmonyServices.discover(request),
+      map: async (request, input) => (await import('./cloudCommandHarmony')).nativeHarmonyServices.map(request, input),
+      sync: async request => (await import('./cloudCommandHarmony')).nativeHarmonyServices.sync(request),
+      inventory: async request => (await import('./cloudCommandHarmony')).nativeHarmonyServices.inventory(request),
+      link: async (request, input) => (await import('./cloudCommandHarmony')).nativeHarmonyServices.link(request, input),
     }),
     name: 'cloudcommand',
     packageDir: 'packages/ext-cloud-command',
@@ -285,10 +306,26 @@ export const BUILTINS: readonly BuiltinExtension[] = [
     // Default OFF: workspace's migrations require a pgvector-enabled Postgres,
     // which a stock `postgres:16-alpine` deployment does not have.
     enableEnvVar: 'BREEZE_WORKSPACE_ENABLED',
+    // Wisp W08 (spec §17.2, w00 A35): users know this connector as "Wisp", so
+    // the flag has a Wisp-named alias. It is NOT the engine flag
+    // BREEZE_WISP_ENABLED — the connector needs pgvector and the engine does
+    // not, so enabling Wisp must never imply loading this built-in.
+    enableEnvAliases: ['BREEZE_WISP_CONNECTOR_ENABLED'],
   }),
   defineBuiltin({ module: remoteAccessExtension, name: 'rustdeskaccess',
     packageDir: 'packages/ext-rustdesk-access', packageName: '@cloudcom/ext-rustdesk-access',
     helperRoutes: false, enableEnvVar: 'CLOUDCOM_REMOTE_ACCESS_ENABLED' }),
+  defineBuiltin({ module: createCredentialsExtension(async event => {
+    // The general SDK audit sink queues failures. Secret disclosure requires
+    // a durable audit write, so use the strict core variant for this extension.
+    const { createAuditLog } = await import('../services/auditService');
+    await createAuditLog(event);
+  }, async (auth,input)=>{
+    const { authorizeBrowserCompanion }=await import('../services/browserCompanionSession');
+    return authorizeBrowserCompanion(auth as import('../middleware/auth').AuthContext,input);
+  }), name: 'credentials',
+    packageDir: 'packages/ext-credentials', packageName: '@cloudcom/ext-credentials',
+    helperRoutes: false, enableEnvVar: 'CLOUDCOM_CREDENTIALS_ENABLED' }),
 ];
 
 export const BUILTIN_EXTENSION_NAMES: ReadonlySet<string> = new Set(

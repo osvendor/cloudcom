@@ -8,7 +8,13 @@
 import { Hono } from 'hono';
 import { zValidator } from '../lib/validation';
 import { streamSSE } from 'hono/streaming';
-import { authMiddleware, requireMfa, requirePermission, requireScope } from '../middleware/auth';
+import {
+  authMiddleware,
+  requireMfa,
+  requirePermission,
+  requireScope,
+  withAuthDbAccessContext,
+} from '../middleware/auth';
 import {
   createScriptBuilderSession,
   getScriptBuilderSession,
@@ -17,6 +23,7 @@ import {
   closeScriptBuilderSession,
 } from '../services/scriptBuilderService';
 import { runPreFlightChecks, settleBlockedTurnForNewMessage } from '../services/aiAgentSdk';
+import { turnBindingFrom } from '../services/aiModels/turnBinding';
 import { streamingSessionManager } from '../services/streamingSessionManager';
 import { handleApproval } from '../services/aiAgent';
 import { writeRouteAudit } from '../services/auditEvents';
@@ -32,11 +39,15 @@ import {
   SCRIPT_BUILDER_MCP_TOOL_NAMES,
 } from '../services/scriptBuilderTools';
 import { captureException } from '../services/sentry';
+import { persistAutoSessionTitle } from '../services/aiSessionTitle';
 import { db } from '../db';
 import { aiSessions, aiMessages } from '../db/schema';
 import { eq } from 'drizzle-orm';
 import { PERMISSIONS } from '../services/permissions';
-import { LlmUnavailableError, resolveLlmConfigForOrg } from '../services/llm/llmConfigResolver';
+import { LlmUnavailableError, llmUnavailableBody } from '../services/llm/llmUnavailableError';
+import { AI_NOT_CONFIGURED_BODY, LlmNotConfiguredError } from '../services/llm/llmAvailability';
+import { readOrgPartnerId } from '../services/aiModels/candidateLoader';
+import { chooseSessionModel, type SessionModelChoice } from '../services/aiModels/sessionModel';
 import {
   isAiBudgetLockTimeout,
   releaseUnusedAiBudgetReservation,
@@ -85,19 +96,25 @@ scriptAiRoutes.post(
     const orgId = auth.orgId ?? auth.accessibleOrgIds?.[0] ?? null;
     if (!orgId) return c.json({ error: 'Organization context required' }, 400);
 
-    let resolved;
+    // The builder's model is picked through the registry (W03 #7601) and runs
+    // on the Agent SDK. An MCP_LLM_* OpenAI-compatible endpoint reaches it only
+    // as a registry offering (env-managed gateway connection), never as a
+    // separate provider branch. Refuse before a session exists: with no model
+    // the builder's first message could only come back empty.
+    let choice: SessionModelChoice;
     try {
-      resolved = await resolveLlmConfigForOrg(orgId);
+      const partnerId = await readOrgPartnerId(orgId);
+      if (!partnerId) return c.json({ error: 'ai_unavailable' }, 503);
+      choice = await chooseSessionModel({ partnerId, orgId, userId: auth.user.id, surface: 'script_builder' });
     } catch (err) {
+      if (err instanceof LlmNotConfiguredError) return c.json(AI_NOT_CONFIGURED_BODY, 503);
+      if (err instanceof LlmUnavailableError) return c.json(llmUnavailableBody(err), 503);
       captureException(err, c);
       return c.json({ error: 'AI configuration could not be loaded. Try again.' }, 503);
     }
 
     try {
-      if (resolved.source === 'unavailable') {
-        return c.json({ error: 'ai_unavailable' }, 503);
-      }
-      const session = await createScriptBuilderSession(auth, body, resolved.model);
+      const session = await createScriptBuilderSession(auth, body, choice);
       writeRouteAudit(c, {
         orgId: session.orgId,
         action: 'ai.script_builder.session.create',
@@ -185,12 +202,26 @@ scriptAiRoutes.post(
     const sessionId = c.req.param('id')!;
     const { content, editorContext } = c.req.valid('json');
 
-    // Run pre-flight checks (rate limits, budget, session status)
-    const preflight = await runPreFlightChecks(sessionId, content, auth, undefined, c);
+    // #3127: this route is registered in selfManagedDbContextRoutes, so no
+    // request transaction is held across the handler. Each DB phase runs in its
+    // own short context carrying the caller's exact scope, and the settle wait
+    // and the budget reservation (which opens its own system transaction) run
+    // between them with no connection checked out.
+    const inRequestDb = <T>(fn: () => Promise<T>): Promise<T> => withAuthDbAccessContext(auth, fn);
+
+    // Run pre-flight checks (rate limits, budget, session status). #10415: not
+    // wrapped in inRequestDb — the pre-flight opens its own DB phases with it
+    // and runs the Redis rate limit between them.
+    const preflight = await runPreFlightChecks(sessionId, content, auth, undefined, c, undefined, inRequestDb);
     if (!preflight.ok) {
       const err = preflight.error;
+      if (err === 'ai_not_configured') return c.json(AI_NOT_CONFIGURED_BODY, 503);
       if (err === 'ai_unavailable') return c.json({ error: 'ai_unavailable' }, 503);
+      // W03: a stored model that went ineligible is recoverable (choose another).
+      if (preflight.code) return c.json({ error: err, code: preflight.code, recoverable: true }, preflight.status === 503 ? 503 : 409);
       if (preflight.status === 503) return c.json({ error: err }, 503);
+      // The credit / plan gate (and spend caps): 402, with a code the client can act on.
+      if (preflight.status === 402) return c.json(preflight.billingCode ? { error: err, code: preflight.billingCode } : { error: err }, 402);
       if (err === 'Session not found') return c.json({ error: err }, 404);
       if (err.includes('rate limit') || err.includes('Rate limit')) return c.json({ error: err }, 429);
       if (err.includes('budget') || err.includes('Budget')) return c.json({ error: err }, 402);
@@ -203,13 +234,17 @@ scriptAiRoutes.post(
       return c.json({ error: 'Session not found' }, 404);
     }
 
-    const { session: dbSession, sanitizedContent, systemPrompt, resolved } = preflight;
+    const { session: dbSession, sanitizedContent, systemPrompt, model: resolvedModel } = preflight;
+    // A script-builder session always runs the Agent SDK, so preflight always resolves its model.
+    if (!resolvedModel) throw new Error('script builder preflight returned no resolved model');
+    const model = resolvedModel;
+    const binding = turnBindingFrom(model);
 
     // Now safe to update editor context
     let updatedSystemPrompt: string | undefined;
     if (editorContext) {
       try {
-        updatedSystemPrompt = await updateEditorContext(sessionId, editorContext, auth);
+        updatedSystemPrompt = await inRequestDb(() => updateEditorContext(sessionId, editorContext, auth));
       } catch (err) {
         captureException(err, c);
         console.error('[ScriptAI] Failed to update editor context:', err);
@@ -219,6 +254,7 @@ scriptAiRoutes.post(
 
     const priorSession = streamingSessionManager.get(sessionId);
     if (priorSession?.state === 'processing') {
+      // #3127: runs with no DB context held (see inRequestDb above).
       const settle = await settleBlockedTurnForNewMessage(priorSession);
       if (settle !== 'concluded') {
         return c.json({
@@ -241,9 +277,10 @@ scriptAiRoutes.post(
     try {
       reservation = await reserveAiBudget({
         orgId: dbSession.orgId,
-        billingSource: resolved.source === 'partner' ? 'partner_key' : 'platform',
+        billingSource: model.funding,
         sessionId,
         idempotencyKey: `script-chat:${sessionId}:${crypto.randomUUID()}`,
+        binding,
       });
     } catch (err) {
       if (isAiBudgetLockTimeout(err)) return c.json({ error: 'AI_BUDGET_LOCK_TIMEOUT' }, 503);
@@ -255,99 +292,114 @@ scriptAiRoutes.post(
       ? reservation.reservedCostCents / 100
       : undefined;
 
-    // Get or create streaming session with script builder MCP tools.
-    //
-    // The pre-flight above already turns an unavailable partner config into a
-    // 503, but it cannot see this one: `getOrCreate` resolves the WIRE model
-    // inside the manager, so a catalog revision with no verified mapping for
-    // THIS session's model fails closed only here. Same catch shape as
-    // ai.ts — otherwise it reaches `app.onError` as a 500, telling the UI "we
-    // broke" instead of the documented "reconnect your AI provider".
-    let activeSession;
-    try {
-      activeSession = await streamingSessionManager.getOrCreate(
-        sessionId,
-        {
-          orgId: dbSession.orgId,
-          sdkSessionId: dbSession.sdkSessionId,
-          model: dbSession.model,
-          maxTurns: dbSession.maxTurns,
-          turnCount: dbSession.turnCount,
-          systemPrompt: dbSession.systemPrompt,
-        },
-        auth,
-        c,
-        effectiveSystemPrompt,
-        reservedMaxBudgetUsd,
-        resolved,
-        SCRIPT_BUILDER_MCP_TOOL_NAMES,
-        // Custom MCP server factory for script builder tools
-        (getAuth, onPreToolUse, onPostToolUse) => ({
-          server: createScriptBuilderMcpServer(getAuth, onPreToolUse, onPostToolUse),
-          name: SCRIPT_BUILDER_MCP_SERVER_NAME,
-        }),
-        { budgetReservationId },
-      );
-    } catch (err) {
-      await releaseUnusedAiBudgetReservation({ orgId: dbSession.orgId, reservationId: budgetReservationId });
-      if (err instanceof LlmUnavailableError) return c.json({ error: 'ai_unavailable' }, 503);
-      throw err;
-    }
-
-    // Concurrent message guard - atomic check-and-set. If the turn is blocked
-    // only on pending approval waits, settle them so the assistant can
-    // conclude and answer this message (#3089 — shared helper, see ai.ts).
-    if (!streamingSessionManager.tryTransitionToProcessing(activeSession, budgetReservationId)) {
-      await releaseUnusedAiBudgetReservation({ orgId: dbSession.orgId, reservationId: budgetReservationId });
-      return c.json({ error: 'A message is already being processed for this session' }, 409);
-    }
-
-    writeRouteAudit(c, {
-      orgId: dbSession.orgId,
-      action: 'ai.script_builder.message.send',
-      resourceType: 'ai_session',
-      resourceId: sessionId,
-      details: { contentLength: content.length },
-    });
-
-    // Save user message to DB
-    try {
-      await db.insert(aiMessages).values({
-        sessionId,
-        role: 'user',
-        content: sanitizedContent,
-      });
-    } catch (err) {
-      captureException(err, c);
-      console.error('[ScriptAI] Failed to save user message to DB:', err);
-      activeSession.state = 'idle';
-      await releaseUnusedAiBudgetReservation({ orgId: dbSession.orgId, reservationId: budgetReservationId });
-      return c.json({ error: 'Failed to save message' }, 500);
-    }
-
-    // Auto-generate title from first user message
-    if (!dbSession.title) {
-      const title = generateSessionTitle(sanitizedContent);
+    // Get or create streaming session with script builder MCP tools. The model
+    // was resolved (wire id included) in preflight; the LlmUnavailableError
+    // catch is a last-resort guard with ai.ts's shape, never a 500.
+    type ActiveScriptSession = Awaited<ReturnType<typeof streamingSessionManager.getOrCreate>>;
+    const subscriptionId = crypto.randomUUID();
+    let subscribedSession: ActiveScriptSession | null = null;
+    const dispatch = await inRequestDb(async (): Promise<
+      | { kind: 'dispatched'; activeSession: ActiveScriptSession; events: ReturnType<ActiveScriptSession['eventBus']['subscribe']> }
+      | { kind: 'refused'; response: Response }
+      | { kind: 'failed'; error: unknown }
+    > => {
+      let activeSession: ActiveScriptSession;
       try {
-        await db.update(aiSessions)
-          .set({ title })
-          .where(eq(aiSessions.id, sessionId));
-        activeSession.eventBus.publish({ type: 'title_updated', title });
+        activeSession = await streamingSessionManager.getOrCreate(
+          sessionId,
+          {
+            orgId: dbSession.orgId,
+            sdkSessionId: dbSession.sdkSessionId,
+            maxTurns: dbSession.maxTurns,
+            turnCount: dbSession.turnCount,
+            systemPrompt: dbSession.systemPrompt,
+          },
+          auth,
+          c,
+          effectiveSystemPrompt,
+          reservedMaxBudgetUsd,
+          model,
+          SCRIPT_BUILDER_MCP_TOOL_NAMES,
+          // Custom MCP server factory for script builder tools
+          (getAuth, onPreToolUse, onPostToolUse) => ({
+            server: createScriptBuilderMcpServer(getAuth, onPreToolUse, onPostToolUse),
+            name: SCRIPT_BUILDER_MCP_SERVER_NAME,
+          }),
+          { budgetReservationId, ledgerUserId: auth.user.id },
+        );
+      } catch (err) {
+        if (err instanceof LlmUnavailableError) {
+          return { kind: 'refused', response: c.json(llmUnavailableBody(err), 503) };
+        }
+        return { kind: 'failed', error: err };
+      }
+
+      // Concurrent message guard - atomic check-and-set. If the turn is blocked
+      // only on pending approval waits, settle them so the assistant can
+      // conclude and answer this message (#3089 — shared helper, see ai.ts).
+      if (!streamingSessionManager.tryTransitionToProcessing(activeSession, budgetReservationId, { turnBinding: binding })) {
+        return { kind: 'refused', response: c.json({ error: 'A message is already being processed for this session' }, 409) };
+      }
+
+      writeRouteAudit(c, {
+        orgId: dbSession.orgId,
+        action: 'ai.script_builder.message.send',
+        resourceType: 'ai_session',
+        resourceId: sessionId,
+        details: { contentLength: content.length },
+      });
+
+      // Save user message to DB
+      try {
+        await db.insert(aiMessages).values({
+          sessionId,
+          role: 'user',
+          content: sanitizedContent,
+        });
       } catch (err) {
         captureException(err, c);
-        console.error('[ScriptAI] Failed to auto-set session title:', err);
+        console.error('[ScriptAI] Failed to save user message to DB:', err);
+        activeSession.state = 'idle';
+        return { kind: 'refused', response: c.json({ error: 'Failed to save message' }, 500) };
       }
+
+      // Auto-generate title from first user message
+      if (!dbSession.title) {
+        const title = generateSessionTitle(sanitizedContent);
+        try {
+          await persistAutoSessionTitle(sessionId, title);
+          activeSession.eventBus.publish({ type: 'title_updated', title });
+        } catch (err) {
+          captureException(err, c);
+          console.error('[ScriptAI] Failed to auto-set session title:', err);
+        }
+      }
+
+      // Push message to the streaming input and start turn timeout
+      // Subscribe BEFORE the turn is pushed: the session event bus has no
+      // replay, and a fast transport can publish the turn's events (even its
+      // error and done) before the SSE callback below would run (#7783).
+      const events = activeSession.eventBus.subscribe(subscriptionId);
+      subscribedSession = activeSession;
+      activeSession.inputController.pushMessage(sanitizedContent);
+      streamingSessionManager.startTurnTimeout(activeSession);
+      return { kind: 'dispatched', activeSession, events };
+    }).catch((err: unknown) => {
+      // The dispatch context failed after subscribing (e.g. its commit): drop
+      // the subscription so the bus doesn't keep a dead queue.
+      subscribedSession?.eventBus.unsubscribe(subscriptionId);
+      throw err;
+    });
+    if (dispatch.kind !== 'dispatched') {
+      // Released only after the dispatch context has closed, so the release's
+      // own system transaction never runs beside a held request connection.
+      await releaseUnusedAiBudgetReservation({ orgId: dbSession.orgId, reservationId: budgetReservationId });
+      if (dispatch.kind === 'failed') throw dispatch.error;
+      return dispatch.response;
     }
-
-    // Push message to the streaming input and start turn timeout
-    activeSession.inputController.pushMessage(sanitizedContent);
-    streamingSessionManager.startTurnTimeout(activeSession);
-
-    const subscriptionId = crypto.randomUUID();
+    const { activeSession, events } = dispatch;
 
     return streamSSE(c, async (stream) => {
-      const events = activeSession.eventBus.subscribe(subscriptionId);
-
       try {
         for await (const event of events) {
           await stream.writeSSE({

@@ -2,14 +2,16 @@ import { Hono } from 'hono';
 import { zValidator } from '../../lib/validation';
 import { requireScope, requirePermission } from '../../middleware/auth';
 import { PERMISSIONS } from '../../services/permissions';
-import { billablesExportQuerySchema } from '@breeze/shared';
+import { billablesExportQuerySchema, ERROR_CODES } from '@breeze/shared';
 import { listBillables } from '../../services/timeEntryService';
 import { csvRow } from '../../services/spreadsheetExport';
 import { auditSensitiveRead } from '../../services/sensitiveReadAudit';
 
 export const ticketExportRoutes = new Hono();
 
-const CSV_HEADERS = ['type', 'date', 'organization', 'ticket', 'description', 'technician', 'quantity', 'rate', 'amount', 'currency', 'billing_status', 'approved'];
+const CSV_HEADERS = ['type', 'date', 'organization', 'ticket', 'description', 'technician', 'quantity', 'rate', 'amount', 'currency', 'billing_status', 'approved',
+  // #4628 W04 — APPENDED, never inserted: existing importers map by column index.
+  'work_type', 'included_minutes'];
 
 ticketExportRoutes.get(
   '/export/billables.csv',
@@ -24,7 +26,7 @@ ticketExportRoutes.get(
     // the export to the caller's org allowlist (time_entries is partner-axis RLS,
     // so omitting orgId would otherwise leak every org under the partner).
     if (q.orgId && !auth.canAccessOrg(q.orgId)) {
-      return c.json({ error: 'Access to this organization denied' }, 403);
+      return c.json({ error: 'Access to this organization denied', code: ERROR_CODES.ACCESS_DENIED }, 403);
     }
     const { rows } = await listBillables(q.from, q.to, q.orgId, auth.accessibleOrgIds);
     const lines = [csvRow(CSV_HEADERS)];
@@ -36,7 +38,10 @@ ticketExportRoutes.get(
         // real $0.00 line (#6461). MISSING_RATE is an explicit, greppable
         // marker rather than a blank cell that could be read as "unset".
         r.missingRate ? 'MISSING_RATE' : (r.amount ?? ''), r.currencyCode ?? '', r.billingStatus,
-        r.isApproved === null ? '' : String(r.isApproved)
+        r.isApproved === null ? '' : String(r.isApproved),
+        r.workTypeName ?? '',
+        // Worked minutes covered by the contract; empty for a part (no labour).
+        r.kind === 'time' ? String(r.includedMinutes) : ''
       ]));
     }
     const body = lines.join('\n');

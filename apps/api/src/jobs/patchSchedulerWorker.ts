@@ -15,8 +15,6 @@ import {
   deviceCommands,
   patchJobs,
   devices,
-  deviceGroupMemberships,
-  deviceGroups,
   organizations,
   partners,
   sites,
@@ -24,8 +22,13 @@ import {
 import { and, eq, gte, inArray, ne } from 'drizzle-orm';
 import { resolveEffectiveTimezone, canonicalizeTimezone } from '@breeze/shared';
 import { getBullMQConnection } from '../services/redis';
+import { getLocalTimeParts, normalizeTimezone, zonedWallClockToUtc } from '../services/zonedTime';
 import { attachWorkerObservability } from './workerObservability';
-import { checkDeviceMaintenanceWindow } from '../services/featureConfigResolver';
+import {
+  checkDeviceMaintenanceWindow,
+  resolvePatchPolicyWinnersForDevices,
+  type PatchPolicyWinner,
+} from '../services/featureConfigResolver';
 import {
   enqueuePatchJob,
   selectStaleScheduledJobIds,
@@ -43,6 +46,10 @@ import {
   summarizePatchInventory,
   type PatchInlineSettings,
 } from '../services/configPolicyPatching';
+import {
+  resolveAssignmentDevices,
+  type AssignmentToExpand,
+} from '../services/configPolicyAssignmentDevices';
 
 const { db } = dbModule;
 const runWithSystemDbAccess = async <T>(fn: () => Promise<T>): Promise<T> => {
@@ -74,16 +81,6 @@ function getSchedulerQueue(): Queue {
   return schedulerQueue;
 }
 
-interface LocalTimeParts {
-  year: number;
-  month: number;
-  day: number;
-  hour: number;
-  minute: number;
-  second: number;
-  weekday: 'sun' | 'mon' | 'tue' | 'wed' | 'thu' | 'fri' | 'sat';
-}
-
 interface DeviceSchedulingContext {
   deviceId: string;
   orgId: string;
@@ -113,44 +110,6 @@ function parsePartnerTimezone(column: string | null | undefined, settings: unkno
   const fromSettings = parseOrgTimezone(settings);
   if (fromSettings) return fromSettings;
   return canonicalColumn;
-}
-
-function normalizeTimezone(timezone: string | null | undefined): string {
-  const candidate = timezone || 'UTC';
-  try {
-    new Intl.DateTimeFormat('en-US', { timeZone: candidate }).format(new Date());
-    return candidate;
-  } catch (err) {
-    console.warn(`[PatchScheduler] Invalid timezone "${candidate}", falling back to UTC:`, err);
-    return 'UTC';
-  }
-}
-
-function getLocalTimeParts(now: Date, timezone: string): LocalTimeParts {
-  const formatter = new Intl.DateTimeFormat('en-US', {
-    timeZone: normalizeTimezone(timezone),
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    weekday: 'short',
-    hourCycle: 'h23',
-  });
-  const parts = formatter.formatToParts(now);
-  const get = (type: string) => parts.find((part) => part.type === type)?.value ?? '0';
-  const weekday = get('weekday').toLowerCase().slice(0, 3) as LocalTimeParts['weekday'];
-
-  return {
-    year: Number.parseInt(get('year'), 10),
-    month: Number.parseInt(get('month'), 10),
-    day: Number.parseInt(get('day'), 10),
-    hour: Number.parseInt(get('hour'), 10),
-    minute: Number.parseInt(get('minute'), 10),
-    second: Number.parseInt(get('second'), 10),
-    weekday,
-  };
 }
 
 function getDueOccurrenceKey(settings: PatchInlineSettings, timezone: string, now: Date): string | null {
@@ -190,49 +149,6 @@ function getDueOccurrenceKey(settings: PatchInlineSettings, timezone: string, no
 
 const WEEKDAY_KEYS = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'] as const;
 type WeekdayKey = (typeof WEEKDAY_KEYS)[number];
-
-/** The zone's UTC offset (ms) in force at `instant`. */
-function zoneOffsetMsAt(instant: number, timezone: string): number {
-  const local = getLocalTimeParts(new Date(instant), timezone);
-  return (
-    Date.UTC(local.year, local.month - 1, local.day, local.hour, local.minute, 0) - instant
-  );
-}
-
-/**
- * The UTC instant of a wall-clock time in `timezone`.
- *
- * Deliberately NOT a convergence loop. The naive guess uses the offset in force
- * at `wallAsUtc`, which is the wrong offset for a wall clock on the far side of
- * a DST transition; correcting once and re-checking is right for every ordinary
- * time, but on a SPRING-FORWARD day the requested wall clock does not exist at
- * all (02:00 is skipped) and the two candidates oscillate forever — a loop
- * settles on 01:00, an hour BEFORE the window the admin asked for.
- *
- * So: try the correction, accept it if the offset it implies is self-consistent,
- * and otherwise take the later of the two candidates — the same "shift forward
- * into the gap" rule Luxon and date-fns-tz use. Ambiguous fall-back times
- * resolve to the first (pre-transition) occurrence.
- */
-function zonedWallClockToUtc(
-  parts: { year: number; month: number; day: number; hour: number; minute: number },
-  timezone: string,
-): Date {
-  const wallAsUtc = Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, 0);
-
-  const firstOffset = zoneOffsetMsAt(wallAsUtc, timezone);
-  const firstCandidate = wallAsUtc - firstOffset;
-
-  const secondOffset = zoneOffsetMsAt(firstCandidate, timezone);
-  if (secondOffset === firstOffset) return new Date(firstCandidate);
-
-  const secondCandidate = wallAsUtc - secondOffset;
-  if (zoneOffsetMsAt(secondCandidate, timezone) === secondOffset) {
-    return new Date(secondCandidate);
-  }
-
-  return new Date(Math.max(firstCandidate, secondCandidate));
-}
 
 /**
  * The next occurrence of a patch schedule, strictly after `now`, as a UTC
@@ -404,207 +320,135 @@ async function supersedePreviousOccurrenceInstalls(params: {
 }
 
 /**
- * Quick Support exclusion (applies to every set-resolution query below):
- * ephemeral devices (`devices.isEphemeral`) live in the hidden per-partner
- * 'quick_support' org and are a stranger's personal machine borrowed for one
- * ~20-minute session. That org stays inside technicians' accessibleOrgIds for
- * RLS reasons, so the partner-wide fan-out would otherwise sweep it up and
- * schedule patch installs on a home PC. Every branch that resolves a SET of
- * devices filters them out; the explicit device-level branches are by-id
- * lookups of an operator-chosen target and are left alone.
+ * The devices one assignment schedules, after its role / OS filter (#8442).
+ * The expansion itself lives in services/configPolicyAssignmentDevices.ts,
+ * shared with the update-ring count so the two cannot drift. Patch scheduling
+ * is protective, so a device_group refused for agent-reported rule fields is
+ * still resolved (only audited) — see AssignmentExpansionOptions.
  */
 async function resolveDeviceIdsForAssignment(
-  assignmentLevel: string,
-  assignmentTargetId: string,
-  // null for partner-owned library policies (#1724, #2280) — they have no
-  // single owning org and may carry a partner-level assignment (resolved
-  // across all the partner's orgs) AND/OR org/site/group/device-level SUBSET
-  // assignments into individual orgs under the partner.
+  assignment: AssignmentToExpand,
+  // null for partner-owned library policies (#1724, #2280).
   policyOrgId: string | null,
-  // The policy's own partnerId (set for partner-owned policies, null for
-  // org-owned ones). Used ONLY to re-clamp subset (org/site/group/device)
-  // resolution below when policyOrgId is null — see the comment above the
-  // switch for why this exists (#2280 review finding).
+  // Re-clamps subset levels when policyOrgId is null (#2280 TOCTOU).
   policyPartnerId: string | null
 ): Promise<string[]> {
-  if (assignmentLevel === 'partner') {
-    // A partner-wide policy (policyOrgId null, #1724) resolves EVERY device
-    // under the assigned partner. A legacy org-owned policy at partner level
-    // (now rejected at assign time) still clamps to its own org as a backstop.
-    //
-    // NOTE: this deliberately does NOT filter organizations by billing status,
-    // unlike the auth-layer visibility scope (computeAccessibleOrgIds, which
-    // limits to active/trial). Scheduling patches for a device is a security
-    // action we want to keep running even for orgs in a lapsed billing state,
-    // so the scheduling scope is intentionally broader than the visibility
-    // scope. If product decides suspended orgs should stop receiving patches,
-    // add the organizations.status filter here.
-    const conditions = [
-      eq(organizations.partnerId, assignmentTargetId),
-      eq(devices.isEphemeral, false),
-    ];
-    if (policyOrgId) conditions.push(eq(devices.orgId, policyOrgId));
-    const partnerDevices = await db
-      .select({ id: devices.id })
-      .from(devices)
-      .innerJoin(organizations, eq(devices.orgId, organizations.id))
-      .where(and(...conditions));
-    return partnerDevices.map((d) => d.id);
+  const { deviceIds } = await resolveAssignmentDevices(
+    assignment,
+    { policyOrgId, policyPartnerId },
+    { refusedGroups: 'resolve', auditAction: 'patch_schedule.execution_target_refused_agent_reported_fields' }
+  );
+  return deviceIds;
+}
+
+/** Per-tick #9632 lookups shared by every policy the scan visits. */
+interface ClosestWinsCache {
+  /** Device id -> its winning patch policy (null: no policy wins it). */
+  winners: Map<string, PatchPolicyWinner | null>;
+  /** Config policy id -> whether the scheduler can run it (it loads and its ring is valid). */
+  schedulable: Map<string, boolean>;
+  /**
+   * Set once a lookup has exhausted its retries this tick. Later lookups then
+   * try once without waiting, so a persistent failure cannot stall the scan by
+   * ~2 s per due group past the 60 s tick.
+   */
+  retriesExhausted: boolean;
+}
+
+/** Waits between winner-lookup attempts. The due window is a single minute (getDueOccurrenceKey). */
+const CLOSEST_WINS_RETRY_DELAYS_MS = [500, 1500];
+
+async function withClosestWinsRetry<T>(
+  configPolicyId: string,
+  cache: ClosestWinsCache,
+  fn: () => Promise<T>,
+): Promise<T> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await fn();
+    } catch (err) {
+      const delay = cache.retriesExhausted ? undefined : CLOSEST_WINS_RETRY_DELAYS_MS[attempt];
+      if (delay === undefined) {
+        cache.retriesExhausted = true;
+        // The caller's per-policy catch only logs to the console, and the
+        // occurrence's minute passes with it: this must reach Sentry.
+        const message = `[PatchScheduler] Failed to resolve winning patch policies for config policy ${configPolicyId}`;
+        console.error(`${message}:`, err instanceof Error ? err.message : err);
+        captureException(err instanceof Error ? err : new Error(message), undefined, {
+          patch_scheduler_stage: 'closest_wins_resolve_failed',
+        }, { fingerprint: ['patch-scheduler', 'closest-wins-resolve-failed'] });
+        throw err;
+      }
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+  }
+}
+
+/**
+ * #9632: the devices of `deviceIds` this config policy should schedule: those
+ * whose winning patch policy (resolvePatchPolicyWinnersForDevices, the batched
+ * resolvePatchConfigPolicyForDevice) is this one.
+ *
+ *  - A device with NO winner is kept. The per-device resolver needs a
+ *    normalized patch settings row, so a policy still on the inline fallback
+ *    would otherwise patch nothing.
+ *  - A device a DIFFERENT policy wins is dropped; that policy schedules it.
+ *  - If that winner cannot be scheduled (its ring reference is invalid, e.g. a
+ *    disabled ring, #8678), the device is still dropped: falling back to this
+ *    broader policy would apply the ring and reboot policy the override exists
+ *    to replace, and #8678 already fails a broken ring closed for the devices
+ *    it governs (their Patches tab denies every candidate). It is reported to
+ *    Sentry so the unpatched devices are not silent.
+ *
+ * A lookup that still fails after retries throws, so the policy is skipped for
+ * this tick: a later patch beats a reboot outside the window.
+ */
+async function keepDevicesThisPolicyWins(
+  configPolicyId: string,
+  orgId: string,
+  deviceIds: string[],
+  cache: ClosestWinsCache,
+): Promise<{ kept: string[]; skippedByWinner: Map<string, number> }> {
+  await withClosestWinsRetry(configPolicyId, cache, async () => {
+    const missing = deviceIds.filter((id) => !cache.winners.has(id));
+    if (missing.length > 0) {
+      const resolved = await runWithSystemDbAccess(() => resolvePatchPolicyWinnersForDevices(missing));
+      for (const id of missing) cache.winners.set(id, resolved.get(id) ?? null);
+    }
+    for (const id of deviceIds) {
+      const winnerId = cache.winners.get(id)?.configPolicyId;
+      if (!winnerId || winnerId === configPolicyId || cache.schedulable.has(winnerId)) continue;
+      const local = await runWithSystemDbAccess(() => loadPolicyLocalPatchConfig(winnerId));
+      cache.schedulable.set(winnerId, !!local && local.ring.valid);
+    }
+  });
+
+  const kept: string[] = [];
+  const skippedByWinner = new Map<string, number>();
+  const unschedulableWinners = new Map<string, number>();
+  for (const id of deviceIds) {
+    const winner = cache.winners.get(id) ?? null;
+    if (!winner || winner.configPolicyId === configPolicyId) {
+      kept.push(id);
+      continue;
+    }
+    skippedByWinner.set(winner.configPolicyId, (skippedByWinner.get(winner.configPolicyId) ?? 0) + 1);
+    if (cache.schedulable.get(winner.configPolicyId) === false) {
+      unschedulableWinners.set(winner.configPolicyId, (unschedulableWinners.get(winner.configPolicyId) ?? 0) + 1);
+    }
   }
 
-  // Every remaining level is org/site/group/device-scoped. For an org-owned
-  // policy, policyOrgId clamps the target to the policy's own org as
-  // defense-in-depth. For a partner-owned library policy (#2280) resolving a
-  // SUBSET assignment — org/site/group/device, not the partner-wide 'partner'
-  // level above — policyOrgId is null: there is no single owning org to clamp
-  // to, since the same policy can carry subset assignments into several of the
-  // partner's orgs. The target itself was partner-scoped at ASSIGN time
-  // (validateAssignmentTarget), but that check is a point-in-time snapshot —
-  // if the target org is later reparented to a different partner, the stale
-  // assignment row would otherwise still resolve those devices (TOCTOU). So
-  // every subset branch below re-clamps to the policy's partner on every run
-  // via an inner join on organizations, the same re-verification the
-  // 'partner' branch above already does for assignmentTargetId.
-  const needsPartnerClamp = !policyOrgId && Boolean(policyPartnerId);
-
-  switch (assignmentLevel) {
-    case 'device': {
-      if (needsPartnerClamp) {
-        const [device] = await db
-          .select({ id: devices.id })
-          .from(devices)
-          .innerJoin(organizations, eq(devices.orgId, organizations.id))
-          .where(and(eq(devices.id, assignmentTargetId), eq(organizations.partnerId, policyPartnerId!)))
-          .limit(1);
-        return device ? [device.id] : [];
-      }
-      const conditions = [eq(devices.id, assignmentTargetId)];
-      if (policyOrgId) conditions.push(eq(devices.orgId, policyOrgId));
-      const [device] = await db
-        .select({ id: devices.id })
-        .from(devices)
-        .where(and(...conditions))
-        .limit(1);
-      return device ? [device.id] : [];
-    }
-
-    case 'device_group': {
-      // #3182 — the group id arrives from an assignment row and is
-      // dereferenced through device_group_memberships, so BOTH joins carry an
-      // org-equality condition rather than a bare id match. Neither of the two
-      // clamps below is sufficient on its own:
-      //   * the partner branch joins organizations through the MEMBERSHIP's
-      //     org_id, so it only ever proved that the membership's own org sits
-      //     under the policy's partner — never that the group does;
-      //   * the org branch's `memberships.org_id = policyOrgId` proved the same
-      //     for the policy's org.
-      // A membership row was free to name a group in a different org until
-      // #3182's composite FK landed, and a cross-org device move produced
-      // exactly that shape, so an org A group could resolve an org B device.
-      // Requiring group.org_id = membership.org_id = device.org_id makes the
-      // query reject it independently of the constraint. This worker runs under
-      // a system DB context, so there is no RLS behind it to catch a miss.
-      if (needsPartnerClamp) {
-        const members = await db
-          .select({ deviceId: deviceGroupMemberships.deviceId })
-          .from(deviceGroupMemberships)
-          .innerJoin(organizations, eq(deviceGroupMemberships.orgId, organizations.id))
-          .innerJoin(
-            deviceGroups,
-            and(
-              eq(deviceGroupMemberships.groupId, deviceGroups.id),
-              eq(deviceGroups.orgId, deviceGroupMemberships.orgId)
-            )
-          )
-          .innerJoin(
-            devices,
-            and(
-              eq(deviceGroupMemberships.deviceId, devices.id),
-              eq(devices.orgId, deviceGroupMemberships.orgId)
-            )
-          )
-          .where(
-            and(
-              eq(deviceGroupMemberships.groupId, assignmentTargetId),
-              eq(organizations.partnerId, policyPartnerId!),
-              eq(devices.isEphemeral, false)
-            )
-          );
-        return members.map((m) => m.deviceId);
-      }
-      const conditions = [
-        eq(deviceGroupMemberships.groupId, assignmentTargetId),
-        eq(devices.isEphemeral, false),
-      ];
-      if (policyOrgId) conditions.push(eq(deviceGroupMemberships.orgId, policyOrgId));
-      const members = await db
-        .select({ deviceId: deviceGroupMemberships.deviceId })
-        .from(deviceGroupMemberships)
-        .innerJoin(
-          deviceGroups,
-          and(
-            eq(deviceGroupMemberships.groupId, deviceGroups.id),
-            eq(deviceGroups.orgId, deviceGroupMemberships.orgId)
-          )
-        )
-        .innerJoin(
-          devices,
-          and(
-            eq(deviceGroupMemberships.deviceId, devices.id),
-            eq(devices.orgId, deviceGroupMemberships.orgId)
-          )
-        )
-        .where(and(...conditions));
-      return members.map((m) => m.deviceId);
-    }
-
-    case 'site': {
-      if (needsPartnerClamp) {
-        const siteDevices = await db
-          .select({ id: devices.id })
-          .from(devices)
-          .innerJoin(organizations, eq(devices.orgId, organizations.id))
-          .where(and(
-            eq(devices.siteId, assignmentTargetId),
-            eq(organizations.partnerId, policyPartnerId!),
-            eq(devices.isEphemeral, false)
-          ));
-        return siteDevices.map((d) => d.id);
-      }
-      const conditions = [eq(devices.siteId, assignmentTargetId), eq(devices.isEphemeral, false)];
-      if (policyOrgId) conditions.push(eq(devices.orgId, policyOrgId));
-      const siteDevices = await db
-        .select({ id: devices.id })
-        .from(devices)
-        .where(and(...conditions));
-      return siteDevices.map((d) => d.id);
-    }
-
-    case 'organization': {
-      if (needsPartnerClamp) {
-        const orgDevices = await db
-          .select({ id: devices.id })
-          .from(devices)
-          .innerJoin(organizations, eq(devices.orgId, organizations.id))
-          .where(and(
-            eq(devices.orgId, assignmentTargetId),
-            eq(organizations.partnerId, policyPartnerId!),
-            eq(devices.isEphemeral, false)
-          ));
-        return orgDevices.map((d) => d.id);
-      }
-      const conditions = [eq(devices.orgId, assignmentTargetId), eq(devices.isEphemeral, false)];
-      if (policyOrgId) conditions.push(eq(devices.orgId, policyOrgId));
-      const orgDevices = await db
-        .select({ id: devices.id })
-        .from(devices)
-        .where(and(...conditions));
-      return orgDevices.map((d) => d.id);
-    }
-
-    default:
-      return [];
+  for (const [winnerId, count] of unschedulableWinners) {
+    const message =
+      `[PatchScheduler] ${count} device(s) in org ${orgId} are not patched: their closest patch policy ${winnerId} ` +
+      `cannot be scheduled (invalid ring reference), so the broader policy ${configPolicyId} leaves them out`;
+    console.error(message);
+    captureException(new Error(message), undefined, {
+      patch_scheduler_stage: 'closest_wins_winner_unschedulable',
+    }, { fingerprint: ['patch-scheduler', 'closest-wins-winner-unschedulable'] });
   }
+
+  return { kept, skippedByWinner };
 }
 
 async function loadDeviceSchedulingContexts(deviceIds: string[]): Promise<DeviceSchedulingContext[]> {
@@ -708,6 +552,9 @@ async function scanAndCreateJobs(): Promise<{
   // context pinned the pooled connection idle-in-transaction across Redis
   // round-trips, a contributor to the #1105 pool-poisoning pattern.
   const enqueueJobIds: string[] = [];
+  // #9632: each device's winning patch policy, resolved once per tick and
+  // shared by every policy that reaches the device.
+  const closestWins: ClosestWinsCache = { winners: new Map(), schedulable: new Map(), retriesExhausted: false };
 
   const patchPoliciesWithSchedules = await runWithSystemDbAccess(() =>
     db
@@ -740,11 +587,15 @@ async function scanAndCreateJobs(): Promise<{
       const policyPartnerId = row.policyPartnerId;
 
       const policyLocal = await runWithSystemDbAccess(() => loadPolicyLocalPatchConfig(row.configPolicyId));
+      closestWins.schedulable.set(row.configPolicyId, !!policyLocal && policyLocal.ring.valid);
       if (!policyLocal) continue;
 
       if (!policyLocal.ring.valid) {
+        // Repeats every tick until the link is repointed (or, for a deleted
+        // ring, the ring re-enabled, #8678); name the ring so it is actionable.
         console.error(
-          `[PatchScheduler] Skipping config policy ${row.configPolicyId}: invalid ring reference (${policyLocal.ring.classification})`
+          `[PatchScheduler] Skipping config policy ${row.configPolicyId}: invalid ring reference ` +
+            `${policyLocal.featurePolicyId ?? '(none)'} (${policyLocal.ring.classification})`
         );
         continue;
       }
@@ -754,6 +605,10 @@ async function scanAndCreateJobs(): Promise<{
         .select({
           level: configPolicyAssignments.level,
           targetId: configPolicyAssignments.targetId,
+          // #8442: the assignment's role / OS filter scopes which of the
+          // target's devices this policy patches.
+          roleFilter: configPolicyAssignments.roleFilter,
+          osFilter: configPolicyAssignments.osFilter,
         })
         .from(configPolicyAssignments)
         .where(eq(configPolicyAssignments.configPolicyId, row.configPolicyId))
@@ -764,7 +619,7 @@ async function scanAndCreateJobs(): Promise<{
       const allDeviceIds = new Set<string>();
       for (const assignment of assignments) {
         const ids = await runWithSystemDbAccess(() =>
-          resolveDeviceIdsForAssignment(assignment.level, assignment.targetId, policyOrgId, policyPartnerId)
+          resolveDeviceIdsForAssignment(assignment, policyOrgId, policyPartnerId)
         );
         for (const id of ids) allDeviceIds.add(id);
       }
@@ -807,11 +662,33 @@ async function scanAndCreateJobs(): Promise<{
           continue;
         }
 
+        // #9632: closest level wins. A device reached by several patch policies
+        // belongs to the one its effective configuration shows. Without this
+        // each policy scheduled its own job for it, so a broader policy's ring
+        // and reboot policy (e.g. "If required") applied to a device a closer
+        // override had moved to a maintenance-window reboot.
+        const { kept: closestDeviceIds, skippedByWinner } = await keepDevicesThisPolicyWins(
+          row.configPolicyId,
+          group.orgId,
+          group.deviceIds,
+          closestWins,
+        );
+        if (skippedByWinner.size > 0) {
+          const winners = Array.from(skippedByWinner, ([policyId, count]) => `${policyId} (${count})`).join(', ');
+          console.log(
+            `[PatchScheduler] Config policy ${row.configPolicyId}: skipped ${group.deviceIds.length - closestDeviceIds.length} ` +
+              `device(s) in ${group.orgId} whose patch settings come from a closer policy: ${winners}`
+          );
+        }
+        if (closestDeviceIds.length === 0) {
+          continue;
+        }
+
         // Per-device maintenance check: each lookup is its OWN short context so
         // this loop never holds one pooled connection across the whole device
         // set (#1105/#1896 conn-hold). checkDeviceMaintenanceWindow is DB-backed.
         const eligibleDeviceIds: string[] = [];
-        for (const deviceId of group.deviceIds) {
+        for (const deviceId of closestDeviceIds) {
           const maintenance = await runWithSystemDbAccess(() => checkDeviceMaintenanceWindow(deviceId));
           if (!maintenance.active || !maintenance.suppressPatching) {
             eligibleDeviceIds.push(deviceId);

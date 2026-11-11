@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { normalizeSignupIntent, type SignupIntent } from '@breeze/shared';
 import type { Context } from 'hono';
 import { zValidator } from '../../lib/validation';
 import { eq, sql } from 'drizzle-orm';
@@ -379,10 +380,17 @@ verifyEmailRoutes.post('/resend-verification', authMiddleware, async (c) => {
   return c.json({ sent: true });
 });
 
+/** sign_in responses echo the normalized intent when the record carried one; never a purchaseSelection. */
+function signInIntent(rec: PendingRegistration): { signupIntent?: SignupIntent } {
+  const carried = rec.signupIntent ?? rec.purchaseSelection;
+  return carried ? { signupIntent: normalizeSignupIntent(carried) } : {};
+}
+
 type CreatedRegistration = Awaited<ReturnType<typeof createPartner>>;
 
 interface RegistrationFacts {
   created: CreatedRegistration;
+  purchaseSelection: SignupIntent;
   partnerRow: {
     id: string;
     name: string;
@@ -421,6 +429,10 @@ async function createRegistrationAccount(
     .limit(1);
   if (existing) return null;
 
+  // Old pending snapshots can predate signup intent or carry the legacy launch
+  // tuple. Resolve the cloud default only after ruling out an existing user, and
+  // carry the same value through the durable insert and the post-commit billing hook.
+  const purchaseSelection = normalizeSignupIntent(rec.signupIntent ?? rec.purchaseSelection);
   const created = await createPartner({
     orgName: rec.companyName,
     adminEmail: rec.email,
@@ -428,6 +440,7 @@ async function createRegistrationAccount(
     passwordHash: rec.passwordHash,
     origin: { mcp: false, ip: rec.signupIp, userAgent: rec.signupUserAgent },
     status: rec.hostedExpectation ? 'pending' : 'active',
+    purchaseSelection,
   }, { tx });
 
   const [partnerRow] = await tx
@@ -481,6 +494,7 @@ async function createRegistrationAccount(
 
   return {
     created,
+    purchaseSelection,
     partnerRow,
     userRow,
     roleRow,
@@ -630,7 +644,7 @@ async function finalizePendingRegistration(
           reason: 'already_registered',
           email: rec.email,
         });
-        return c.json({ verified: false, status: 'sign_in' as const }, 200);
+        return c.json({ verified: false, status: 'sign_in' as const, ...signInIntent(rec) }, 200);
       }
       return c.json({ error: 'Authentication temporarily unavailable' }, 409);
     }
@@ -649,7 +663,7 @@ async function finalizePendingRegistration(
       reason: 'already_registered',
       email: rec.email,
     });
-    return c.json({ verified: false, status: 'sign_in' as const }, 200);
+    return c.json({ verified: false, status: 'sign_in' as const, ...signInIntent(rec) }, 200);
   }
 
   const { facts } = committed;
@@ -691,6 +705,7 @@ async function finalizePendingRegistration(
       email: facts.userRow.email,
       partnerName: facts.partnerRow.name,
       plan: facts.partnerRow.plan,
+      purchaseSelection: facts.purchaseSelection,
     });
 
     let effectiveStatus: PartnerStatus = facts.partnerRow.status;
@@ -773,9 +788,13 @@ async function finalizePendingRegistration(
     // guard). A bare leading-slash test is NOT sufficient: `//evil.com` is
     // protocol-relative and navigates off-origin, and browsers normalize
     // `/\evil.com` into the same thing. Mirrors apps/web's getSafeNext.
+    // An explicit hook response owns routing, including a pending review hold
+    // with no redirect. Recover selected intent only when the hook is unavailable.
     const redirectUrl = isSafeRelativeRedirect(hookResponse?.redirectUrl)
       ? hookResponse!.redirectUrl
-      : undefined;
+      : rec.hostedExpectation && hookResponse == null
+        ? '/billing/plans'
+        : undefined;
 
     const responseBase = {
       verified: true,

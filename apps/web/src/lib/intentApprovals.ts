@@ -9,7 +9,22 @@ import { i18n } from './i18n';
 import { ActionError, runAction } from './runAction';
 import { showToast } from '../components/shared/Toast';
 
-export type IntentDecisionOutcome = 'decided' | 'needs_device' | 'not_sole_approver';
+/** `refused`: the server accepted the approve but refused to apply it (the
+ *  linked elevation's target could not be verified), so the request is now
+ *  denied. Already shown to the user as an error with the server's reason. */
+export type IntentDecisionOutcome =
+  | 'decided'
+  | 'needs_device'
+  | 'not_sole_approver'
+  | 'fresh_factor_required'
+  | 'refused';
+
+type DecideResponse = { stepUpGrantId?: unknown; enforcementStatus?: unknown; reason?: unknown } | null;
+
+/** A 200 approve whose effect the server refused (see IntentDecisionOutcome). */
+function isRefusedDecision(data: DecideResponse): boolean {
+  return data?.enforcementStatus === 'refused';
+}
 
 /** One row's outcome inside a batch decide. `httpStatus < 300` means that row
  *  was actually decided; anything else is a per-row failure (409 lost race,
@@ -81,6 +96,22 @@ export function isStepUpRequired(err: unknown): boolean {
 }
 
 /**
+ * Topology M4-D3 (#6000): the decide route's 403 `step_up_required` with
+ * `reason: 'fresh_mfa_required'` — the tool (today `diagnose_connectivity`)
+ * is approved only by a hardware-backed factor asserted for THIS decision.
+ * Unlike a missing authenticator, the viewer may simply retry the ceremony
+ * with a platform passkey, so it maps to its own outcome.
+ */
+export function isFreshFactorRequired(err: unknown): boolean {
+  if (!isStepUpRequired(err)) return false;
+  const body = (err as ActionError).body as { reason?: unknown } | null | undefined;
+  return body?.reason === 'fresh_mfa_required';
+}
+
+/** Tools whose approve must carry a fresh WebAuthn assertion (mirrors the API's FRESH_APPROVER_FACTOR_TOOLS). */
+export const FRESH_APPROVER_FACTOR_TOOLS: ReadonlySet<string> = new Set(['diagnose_connectivity']);
+
+/**
  * The decide handler re-derives sole-operator status at decide time (#2685) and
  * answers 403 `not_sole_approver` once the org has gained another eligible
  * approver since the intent was created. Unlike `step_up_required` there is no
@@ -106,6 +137,14 @@ export function isSiteCeiling(err: unknown): boolean {
   return errorToken(err) === 'site_ceiling';
 }
 
+/**
+ * A 403 answered when a partner-wide intent is decided by someone without full partner
+ * access. Terminal like `site_ceiling`: only a partner-level approver can decide the card.
+ */
+export function isApproverScopeRequired(err: unknown): boolean {
+  return errorToken(err) === 'approver_scope_required';
+}
+
 /** Bare machine tokens the decide route emits in `error` (no `code`), mapped to
  *  translated copy. Without this the user is shown the literal token. Keys are
  *  spelled out as literals so the i18n key-usage scanner can see them. */
@@ -113,6 +152,7 @@ export function decideErrorCopy(token: string): string | undefined {
   if (token === 'step_up_required') return i18n.t('ai:aiApprovalDialog.noApproverDevice');
   if (token === 'not_sole_approver') return i18n.t('ai:aiApprovalDialog.notSoleApprover');
   if (token === 'site_ceiling') return i18n.t('ai:aiApprovalDialog.siteCeiling');
+  if (token === 'approver_scope_required') return i18n.t('ai:aiApprovalDialog.approverScopeRequired');
   // W03 (#5612): the decide route's 422 refusals of a submitted
   // acknowledgedPatterns set — the server re-derives (submitted ∩
   // strict_hits) and refuses either when the viewer may not acknowledge at
@@ -259,7 +299,9 @@ export function __resetStepUpGrantCacheForTests(): void {
  * 'not_sole_approver' when the server answers that token: the org gained
  * another eligible approver, so self-approval is off the table for good and the
  * caller should settle the card terminally rather than re-offer a button.
- * Throws
+ * Returns 'refused' when the approve came back 200 but the server refused to
+ * apply it (`enforcementStatus: 'refused'`): the request is denied, and the
+ * refusal and its reason have already been toasted as an error. Throws
  * CeremonyError on a cancelled/failed ceremony (nothing was POSTed) and
  * ActionError on server rejection (runAction has already toasted the latter).
  *
@@ -290,7 +332,23 @@ export async function decideIntentApproval(
    * intentApprovals.stepUpGrant.test.ts), so repurposing it would break both
    * suites for no reason — this is purely additive.
    */
-  opts?: { acknowledgedPatterns?: string[] },
+  opts?: {
+    acknowledgedPatterns?: string[];
+    /**
+     * Topology M4-D3 (#6000): the tool requires a FRESH hardware-backed
+     * factor for this approval. Approve then always runs the ceremony first
+     * (never the proofless optimistic attempt, never a cached step-up grant —
+     * the server refuses both), and never caches a grant it mints.
+     */
+    freshFactor?: boolean;
+    /**
+     * #9658: the caller shows its own, more specific success toast (the
+     * approvals inbox: "Approved {action} for {org}"), so skip the generic one
+     * here — otherwise one click shows two. Errors and the refused-approve
+     * toast are unaffected.
+     */
+    silentSuccess?: boolean;
+  },
 ): Promise<IntentDecisionOutcome> {
   const body: Record<string, unknown> = {};
   if (opts?.acknowledgedPatterns?.length) {
@@ -298,7 +356,8 @@ export async function decideIntentApproval(
   }
   // Only an APPROVE of a supervised row may go prooflessly; deny never carries
   // a proof anyway, and an unknown scope must fall back to the strict path.
-  const supervisedApprove = decision === 'approve' && approvalScope === 'supervised';
+  const freshFactor = opts?.freshFactor === true;
+  const supervisedApprove = decision === 'approve' && approvalScope === 'supervised' && !freshFactor;
   // #5601: ONLY a supervised approve may spend a live step-up grant — it rides
   // the optimistic attempt in place of the proofless body, which is what lets
   // an enforcing partner's floor be met without a second passkey scan. Read
@@ -397,7 +456,7 @@ export async function decideIntentApproval(
   }
 
   try {
-    const data = await runAction<{ stepUpGrantId?: unknown } | null>({
+    const data = await runAction<DecideResponse>({
       // Kept inline rather than hoisted: the no-silent-mutations guard walks
       // parents for an enclosing runAction call, so a hoisted thunk reads as an
       // unwrapped mutation even when passed straight in. `settledResponse` is
@@ -418,12 +477,28 @@ export async function decideIntentApproval(
       // expiry. Wiring a /login redirect here would bounce a user out of the app
       // because their fingerprint scan failed.
       treatUnauthorizedAsError: true,
-      friendly: decideErrorCopy,
-      successMessage:
-        decision === 'approve'
-          ? i18n.t('ai:aiApprovalDialog.approvedToast')
-          : i18n.t('ai:aiApprovalDialog.deniedToast'),
+      // A fresh-factor refusal is a retryable scan, not "register a device".
+      friendly: freshFactor
+        ? (token: string) => token === 'step_up_required' ? i18n.t('ai:aiApprovalDialog.freshFactorRequired') : decideErrorCopy(token)
+        : decideErrorCopy,
+      // No success toast for a refused approve: it is reported as an error
+      // below, never as "approved".
+      successMessage: (result) =>
+        isRefusedDecision(result) || opts?.silentSuccess
+          ? ''
+          : decision === 'approve'
+            ? i18n.t('ai:aiApprovalDialog.approvedToast')
+            : i18n.t('ai:aiApprovalDialog.deniedToast'),
     });
+    if (isRefusedDecision(data)) {
+      const reason = typeof data?.reason === 'string' && data.reason.trim() ? data.reason.trim() : undefined;
+      showToast({
+        type: 'error',
+        message: i18n.t('ai:aiApprovalDialog.refusedToast'),
+        ...(reason ? { detail: reason } : {}),
+      });
+      return 'refused';
+    }
     // #5601: a genuine ceremony on a SUPERVISED decide (an enforcing partner
     // forced one via the retry above) may have minted a reusable grant. Cache
     // it so the NEXT card of this conversation skips the scan. A supervised
@@ -438,6 +513,9 @@ export async function decideIntentApproval(
     if (err instanceof ActionError && (err.status === 401 || err.status === 403)) {
       stepUpGrant = null;
     }
+    // Only a caller that asked for the fresh-factor path handles this outcome;
+    // everyone else (e.g. the approvals inbox) keeps the pre-existing mapping.
+    if (freshFactor && isFreshFactorRequired(err)) return 'fresh_factor_required';
     if (isStepUpRequired(err)) return 'needs_device';
     if (isNotSoleApprover(err)) return 'not_sole_approver';
     throw err;

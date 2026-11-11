@@ -13,28 +13,33 @@ import {
   type DeviceVulnFinding,
 } from '@breeze/shared';
 
-import { db, runOutsideDbContext, withSystemDbAccessContext } from '../db';
+import { db, runOutsideDbContext, withSystemDbAccessContext, withDbTransaction } from '../db';
+import { pgErrorCode } from '../utils/pgErrors';
 import { deviceVulnerabilities, devices, vulnerabilities, vulnerabilitySources } from '../db/schema';
 import { authMiddleware, requireMfa, requirePermission, requireScope, type AuthContext } from '../middleware/auth';
 import { PERMISSIONS, type UserPermissions } from '../services/permissions';
 import { remediateVulnerabilities } from '../services/vulnerabilityRemediation';
 import {
-  buildGroupDetail,
   buildGroupKey,
   computeDeviceStats,
-  computeStats,
-  filterFindings,
   groupFindings,
   toGroupFinding,
   type FleetFindingRow,
 } from '../services/vulnerabilityFleetAggregation';
-import { fetchCveCatalogRecord, fetchFleetFindingRows } from '../services/vulnerabilityFleetQueries';
+import { fetchCveCatalogRecord, fetchFleetFindingRows, resolveReadyFindingIds } from '../services/vulnerabilityFleetQueries';
+import {
+  aggregateFleetStats,
+  getSoftwareGroupDetail,
+  getSoftwareGroupDeviceFindings,
+  listSoftwareGroups,
+} from '../services/vulnerabilityFleetSql';
 import { writeRouteAudit } from '../services/auditEvents';
 import { createTicket } from '../services/ticketService';
 import { platformAdminMiddleware } from '../middleware/platformAdmin';
 import { userRateLimit } from '../middleware/userRateLimit';
 import { enqueueVulnSourceSync, enqueueVulnCorrelation } from '../jobs/vulnerabilityJobs';
 
+import { notParkedDeviceCondition } from '../services/unassignedPool/selectorPredicate';
 export const vulnerabilityRoutes = new Hono();
 
 const requireVulnerabilityRead = requirePermission(
@@ -472,7 +477,7 @@ async function listVulnerabilities(filters: {
     const allowedDeviceRows = await db
       .select({ id: devices.id })
       .from(devices)
-      .where(and(inArray(devices.siteId, filters.allowedSiteIds), eq(devices.isEphemeral, false)));
+      .where(and(inArray(devices.siteId, filters.allowedSiteIds), eq(devices.isEphemeral, false), notParkedDeviceCondition()));
     const allowedDeviceIds = allowedDeviceRows.map((r) => r.id);
     if (allowedDeviceIds.length === 0) {
       return [];
@@ -515,7 +520,10 @@ type FleetRow = {
   epssScore: number | null;
   riskScore: number | null;
   deviceCount: number;
+  /** Vendor fix published (global catalog flag) — NOT "Ready". */
   patchAvailable: boolean;
+  /** Distinct devices whose open finding for this CVE is Ready (#9533). */
+  patchReadyDeviceCount: number;
   statuses: string[];
 };
 
@@ -525,10 +533,16 @@ type FleetRow = {
  * we take the max riskScore across devices to be safe. Sort: riskScore DESC,
  * knownExploited (true first), epssScore DESC, cvssScore DESC — all nulls last.
  */
-function aggregateFleet(items: MergedItem[]): FleetRow[] {
+function aggregateFleet(items: MergedItem[], readyIds: ReadonlySet<string>): FleetRow[] {
   const byVuln = new Map<string, FleetRow>();
   const statusesByVuln = new Map<string, Set<string>>();
+  const readyDevicesByVuln = new Map<string, Set<string>>();
   for (const item of items) {
+    if (readyIds.has(item.id)) {
+      const devicesReady = readyDevicesByVuln.get(item.vulnerabilityId) ?? new Set<string>();
+      devicesReady.add(item.deviceId);
+      readyDevicesByVuln.set(item.vulnerabilityId, devicesReady);
+    }
     const statuses = statusesByVuln.get(item.vulnerabilityId);
     if (statuses) {
       statuses.add(item.status);
@@ -554,6 +568,7 @@ function aggregateFleet(items: MergedItem[]): FleetRow[] {
       riskScore: item.riskScore,
       deviceCount: 1,
       patchAvailable: item.patchAvailable,
+      patchReadyDeviceCount: 0,
       statuses: [],
     });
   }
@@ -561,6 +576,7 @@ function aggregateFleet(items: MergedItem[]): FleetRow[] {
   for (const row of byVuln.values()) {
     const statuses = statusesByVuln.get(row.id);
     row.statuses = statuses ? [...statuses].sort() : [];
+    row.patchReadyDeviceCount = readyDevicesByVuln.get(row.id)?.size ?? 0;
   }
 
   return Array.from(byVuln.values()).sort((a, b) => {
@@ -612,7 +628,15 @@ vulnerabilityRoutes.get('/', zValidator('query', fleetListQuerySchema), async (c
     ...query,
     allowedSiteIds: perms?.allowedSiteIds,
   });
-  const rows = aggregateFleet(items);
+  // "Ready" means what it means on the By-software column and the "Patch
+  // ready" tile: Remediate's resolver finds a pending, partner-approved patch
+  // (#7499). The catalog flag alone is vendor-level, and showing it as Ready
+  // gave this lens a third answer to "is there a patch?" (#9533).
+  const readyIds = await resolveReadyFindingIds(items);
+  let rows = aggregateFleet(items, readyIds);
+  // The patch-ready filter (the tile's preset) narrows to CVEs with a Ready
+  // finding; readCatalogRows' catalog-flag condition is only a pre-filter.
+  if (query.patchAvailable) rows = rows.filter((r) => r.patchReadyDeviceCount > 0);
   return c.json({
     items: rows.slice(0, FLEET_CVE_CAP),
     hasMore: rows.length > FLEET_CVE_CAP,
@@ -629,26 +653,27 @@ vulnerabilityRoutes.get('/software', zValidator('query', softwareQuerySchema), a
     return c.json({ error: 'Access to this organization denied' }, 403);
   }
   const perms = c.get('permissions') as UserPermissions | undefined;
-  const rows = await fetchFleetFindingRows({
-    status: query.status,
-    allowedSiteIds: perms?.allowedSiteIds,
-    orgId: query.orgId,
-  });
-  const filtered = filterFindings(rows, {
-    status: query.status,
-    severity: query.severity,
-    kevOnly: query.kevOnly,
-    patchAvailable: query.patchAvailable,
-    expiringWithinDays: query.expiringWithinDays,
-  });
-  const groups = groupFindings(filtered, { search: query.search });
+  // Aggregated in Postgres (#2262) — never loads the per-device-per-CVE rows.
+  const groups = await listSoftwareGroups(
+    { allowedSiteIds: perms?.allowedSiteIds, orgId: query.orgId },
+    {
+      status: query.status,
+      severity: query.severity,
+      kevOnly: query.kevOnly,
+      patchAvailable: query.patchAvailable,
+      expiringWithinDays: query.expiringWithinDays,
+    },
+    { search: query.search },
+  );
   return c.json({
     items: groups.slice(0, SOFTWARE_GROUP_CAP),
     hasMore: groups.length > SOFTWARE_GROUP_CAP,
   });
 });
 
-// Software-group drawer payload: group summary + per-CVE rollup + raw findings.
+// Software-group drawer payload: group summary + per-CVE rollup + installed
+// versions + ONE ROW PER DEVICE (#2262). All statuses, so the drawer can show
+// accepted/mitigated work alongside open (reopen lives in the drill-down).
 vulnerabilityRoutes.get('/software/:groupKey', zValidator('param', groupKeyParamSchema), zValidator('query', orgScopeQuerySchema), async (c) => {
   const auth = c.get('auth');
   const { groupKey } = c.req.valid('param');
@@ -657,20 +682,40 @@ vulnerabilityRoutes.get('/software/:groupKey', zValidator('param', groupKeyParam
     return c.json({ error: 'Access to this organization denied' }, 403);
   }
   const perms = c.get('permissions') as UserPermissions | undefined;
-  // status 'all' so the drawer can show accepted/mitigated findings alongside
-  // open ones (reopen lives in the drawers).
-  const rows = await fetchFleetFindingRows({ status: 'all', allowedSiteIds: perms?.allowedSiteIds, orgId });
-  const detail = buildGroupDetail(groupKey, rows);
+  const detail = await getSoftwareGroupDetail(groupKey, { allowedSiteIds: perms?.allowedSiteIds, orgId });
   if (!detail) {
     return c.json({ error: 'Group not found' }, 404);
   }
   return c.json(detail);
 });
 
+// Drawer drill-down: one device's per-CVE findings within a group, fetched
+// lazily when the operator expands that device. RLS + the site axis scope it;
+// a device the caller cannot reach yields an empty list.
+vulnerabilityRoutes.get(
+  '/software/:groupKey/devices/:deviceId',
+  zValidator('param', groupKeyParamSchema.merge(deviceParamSchema)),
+  zValidator('query', orgScopeQuerySchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const { groupKey, deviceId } = c.req.valid('param');
+    const { orgId } = c.req.valid('query');
+    if (orgId && !auth.canAccessOrg(orgId)) {
+      return c.json({ error: 'Access to this organization denied' }, 403);
+    }
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    const findings = await getSoftwareGroupDeviceFindings(groupKey, deviceId, {
+      allowedSiteIds: perms?.allowedSiteIds,
+      orgId,
+    });
+    return c.json({ findings });
+  },
+);
+
 // The four stat-card numbers in one call. Needs every status: open findings
 // feed three cards, accepted findings feed the expiring-soon card. Also carries
-// totalFindings/lastDetectedAt (computed from the same rows — no extra query)
-// so the empty states can tell a clean fleet from one that never produced data.
+// totalFindings/lastDetectedAt (same query) so the empty states can tell a
+// clean fleet from one that never produced data.
 vulnerabilityRoutes.get('/stats', zValidator('query', orgScopeQuerySchema), async (c) => {
   const auth = c.get('auth');
   const { orgId } = c.req.valid('query');
@@ -678,12 +723,7 @@ vulnerabilityRoutes.get('/stats', zValidator('query', orgScopeQuerySchema), asyn
     return c.json({ error: 'Access to this organization denied' }, 403);
   }
   const perms = c.get('permissions') as UserPermissions | undefined;
-  const rows = await fetchFleetFindingRows({
-    status: 'all',
-    allowedSiteIds: perms?.allowedSiteIds,
-    orgId,
-  });
-  return c.json(computeStats(rows, new Date()));
+  return c.json(await aggregateFleetStats({ allowedSiteIds: perms?.allowedSiteIds, orgId }, new Date()));
 });
 
 vulnerabilityRoutes.get(
@@ -753,7 +793,14 @@ vulnerabilityRoutes.get('/:cveId/devices', zValidator('param', cveIdParamSchema)
     return c.json({ error: 'CVE not found' }, 404);
   }
   const perms = c.get('permissions') as UserPermissions | undefined;
-  const rows = await fetchFleetFindingRows({ status: 'all', allowedSiteIds: perms?.allowedSiteIds, orgId });
+  // Narrowed to this CVE in SQL (#7071); the JS filter below stays as a
+  // belt-and-braces check on the match.
+  const rows = await fetchFleetFindingRows({
+    status: 'all',
+    allowedSiteIds: perms?.allowedSiteIds,
+    orgId,
+    cveId: cve.cveId,
+  });
   const target = cveId.toLowerCase();
   const findings = rows
     .filter((r) => r.cveId.toLowerCase() === target)
@@ -936,14 +983,19 @@ vulnerabilityRoutes.post(
       }
       const description = buildTicketDescription(rows, deviceNameById, cveByVulnId, note);
       try {
-        const ticket = await createTicket(
-          { orgId, subject: title, description, priority, source: 'manual' },
-          { userId: auth.user.id, name: auth.user.name, email: auth.user.email },
-        );
-        await db
-          .update(deviceVulnerabilities)
-          .set({ ticketId: ticket.id, updatedAt: new Date() })
-          .where(inArray(deviceVulnerabilities.id, rows.map((r) => r.id)));
+        // Savepoint so a failed ticket create or link rolls back and the next
+        // org's ticket still runs in a live transaction (#11203).
+        const ticket = await withDbTransaction(async () => {
+          const created = await createTicket(
+            { orgId, subject: title, description, priority, source: 'manual' },
+            { kind: 'user', userId: auth.user.id, name: auth.user.name, email: auth.user.email },
+          );
+          await db
+            .update(deviceVulnerabilities)
+            .set({ ticketId: created.id, updatedAt: new Date() })
+            .where(inArray(deviceVulnerabilities.id, rows.map((r) => r.id)));
+          return created;
+        });
         writeRouteAudit(c, {
           orgId,
           action: 'vulnerability.ticket_create',
@@ -952,7 +1004,9 @@ vulnerabilityRoutes.post(
           details: { deviceVulnerabilityIds: rows.map((r) => r.id), title },
         });
         tickets.push({ ticketId: ticket.id, orgId, findingCount: rows.length });
-      } catch {
+      } catch (err) {
+        // The code, not the message: a drizzle error's message carries the query params.
+        console.error('[vulnerabilities] ticket creation failed', { orgId, findingCount: rows.length, code: pgErrorCode(err) ?? (err instanceof Error ? err.name : 'unknown') });
         // TicketServiceError message is dynamic prose; collapse to the closest code.
         for (const r of rows) skipped.push({ id: r.id, reason: 'ticket_create_failed' });
       }

@@ -1,9 +1,27 @@
-import { db, getCurrentDbAccessContext, runOutsideDbContext, withSystemDbAccessContext } from '../db';
+import { db, getCurrentDbAccessContext, runAfterDbContextExit, runOutsideDbContext, withSystemDbAccessContext } from '../db';
 import { roles, permissions, rolePermissions, partnerUsers, organizationUsers, users } from '../db/schema';
 import { eq, and } from 'drizzle-orm';
 import { getRedis } from './redis';
 import { PERMISSION_GRANTS } from '@breeze/shared';
 import { permissionGrantMatches } from './permissionMatching';
+import { normalizeSiteAllowlist } from './siteAllowlist';
+import { AsyncLocalStorage } from 'node:async_hooks';
+
+/**
+ * Request-scoped "never serve this user's permissions from cache". Used for a
+ * partner service principal's MCP request (middleware/
+ * partnerServicePrincipalMcpAuth.ts): its owner gate reads permissions
+ * uncached, and every per-tool check later in the SAME request
+ * (aiGuardrails.checkPermissionRequirements and the tools' own
+ * getUserPermissions(auth.user.id) reads) must see that same fresh state, not
+ * an in-process entry that a lost cross-process invalidation left stale. The
+ * fresh result is written back to the cache, which also heals the stale entry.
+ */
+const uncachedPermissionsFor = new AsyncLocalStorage<{ userId: string }>();
+
+export function runWithUncachedPermissionsFor<T>(userId: string, fn: () => Promise<T>): Promise<T> {
+  return uncachedPermissionsFor.run({ userId }, fn);
+}
 
 export interface Permission {
   resource: string;
@@ -192,7 +210,14 @@ export async function getUserPermissions(
   const versions = await getPermissionCacheVersions(userId);
   const cached = permissionCache.get(cacheKey);
 
-  if (!options?.bypassCache && cached && cached.expiresAt > Date.now() && cacheVersionsMatch(cached.versions, versions)) {
+  const forceFresh = uncachedPermissionsFor.getStore()?.userId === userId;
+  if (
+    !options?.bypassCache
+    && !forceFresh
+    && cached
+    && cached.expiresAt > Date.now()
+    && cacheVersionsMatch(cached.versions, versions)
+  ) {
     return cached.userPerms;
   }
 
@@ -351,13 +376,59 @@ export function canAccessOrg(
 }
 
 export function canAccessSite(
-  userPerms: UserPermissions,
+  userPerms: Pick<UserPermissions, 'allowedSiteIds'>,
   siteId: string
 ): boolean {
-  // If no site restrictions, allow access
-  if (!userPerms.allowedSiteIds) return true;
+  // undefined = unrestricted; a malformed (non-array) allowlist fails closed (#6790).
+  const allowed = normalizeSiteAllowlist(userPerms.allowedSiteIds);
+  if (allowed === undefined) return true;
 
-  return userPerms.allowedSiteIds.includes(siteId);
+  return allowed.includes(siteId);
+}
+
+/**
+ * Called after a user's permission authority may have changed (Wisp W02: the
+ * grant lifecycle re-evaluates that user's delegation grants). Registered at
+ * boot; see onPermissionAuthorityChanged.
+ */
+export type PermissionChangeListener = (userId: string) => Promise<void>;
+
+const permissionChangeListeners = new Set<PermissionChangeListener>();
+
+/**
+ * Subscribe to per-user authority changes. Every status change, role
+ * assignment, org-access change and role-permission edit already passes
+ * through `clearPermissionCache(userId)`, so that is the one choke point.
+ * Returns the unsubscribe handle.
+ */
+export function onPermissionAuthorityChanged(listener: PermissionChangeListener): () => void {
+  permissionChangeListeners.add(listener);
+  return () => {
+    permissionChangeListeners.delete(listener);
+  };
+}
+
+async function runPermissionChangeListeners(userId: string): Promise<void> {
+  await Promise.all([...permissionChangeListeners].map(async (listener) => {
+    try {
+      await listener(userId);
+    } catch (err) {
+      // A listener must never break the caller's permission change.
+      console.error(`[permissions] permission-change listener failed for user ${userId}:`, err);
+    }
+  }));
+}
+
+function notifyPermissionAuthorityChanged(userId: string): Promise<void> | void {
+  if (permissionChangeListeners.size === 0) return;
+  // Inside a request/worker transaction the change is not committed yet, so a
+  // listener reading in its own (system) context would see the OLD state.
+  // Defer until the outermost transaction settles; outside any context run now.
+  if (getCurrentDbAccessContext()) {
+    runAfterDbContextExit('permission-authority-changed', () => runPermissionChangeListeners(userId));
+    return;
+  }
+  return runPermissionChangeListeners(userId);
 }
 
 export async function clearPermissionCache(userId?: string): Promise<void> {
@@ -373,6 +444,7 @@ export async function clearPermissionCache(userId?: string): Promise<void> {
   }
 
   await bumpSharedPermissionCacheVersion(userId);
+  if (userId) await notifyPermissionAuthorityChanged(userId);
 }
 
 // Built-in system permissions. The registry itself lives in @breeze/shared (as

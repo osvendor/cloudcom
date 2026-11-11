@@ -1,17 +1,37 @@
 import { Hono } from 'hono';
 import { zValidator } from '../../lib/validation';
 import { eq } from 'drizzle-orm';
-import { db, withDbAccessContext } from '../../db';
+import { db, withDbAccessContext, withDbTransaction } from '../../db';
 import { devices, deviceEventLogs } from '../../db/schema';
 import { writeAuditEvent } from '../../services/auditEvents';
+import { recordAgentIngestSubmission } from '../metrics';
 import { getRedis } from '../../services/redis';
 import { rateLimiter } from '../../services/rate-limit';
-import { submitEventLogsSchema } from './schemas';
+import { checkAndConsumeIngestQuota } from '../../services/ingestQuota';
+import { eventLogRowSchema, submitEventLogsSchema } from './schemas';
 import { getDeviceEventLogSettings, EVENT_LOG_DEFAULTS, sanitizeTimestamp, type EventLogSettings } from './helpers';
 import { enqueueLogForwarding } from '../../jobs/logForwardingWorker';
 import { getOrgForwardingConfig } from '../../services/logForwarding';
 import { requireAgentRole } from '../../middleware/requireAgentRole';
 import { captureException } from '../../services/sentry';
+import { envInt } from '../../utils/envInt';
+
+/**
+ * `settings.rateLimitPerHour` (default 12,000/device/hour) already bounds
+ * per-device ROW volume, but not bytes (a row can be up to ~67.5KB — 2000
+ * char message + 64KB details — so the row cap alone still admits ~19GB/day
+ * from one device) and not an ORG-wide aggregate across its whole fleet.
+ * These close both gaps.
+ */
+const AGENT_EVENTLOG_MAX_BYTES_PER_DEVICE_PER_DAY = envInt(
+  'AGENT_EVENTLOG_MAX_BYTES_PER_DEVICE_PER_DAY',
+  2 * 1024 * 1024 * 1024,
+);
+const AGENT_EVENTLOG_MAX_ROWS_PER_ORG_PER_DAY = envInt('AGENT_EVENTLOG_MAX_ROWS_PER_ORG_PER_DAY', 2_000_000);
+const AGENT_EVENTLOG_MAX_BYTES_PER_ORG_PER_DAY = envInt(
+  'AGENT_EVENTLOG_MAX_BYTES_PER_ORG_PER_DAY',
+  10 * 1024 * 1024 * 1024,
+);
 
 const LEVEL_ORDER: Record<string, number> = {
   info: 0,
@@ -80,6 +100,47 @@ interface InsertPhaseResult {
   forwardEvents: ForwardEvent[] | null;
 }
 
+// For a rejected `level` / `category` (agent-defined enums, never free text),
+// echo the first 32 chars of the received value so an agent build that ships a
+// new enum value is diagnosable from the log line. Never applied to `message`
+// or `details`.
+const ECHOED_ENUM_FIELDS = new Set(['level', 'category']);
+function rejectedEnumValue(row: unknown, path: PropertyKey[]): string {
+  const field = path.length === 1 ? path[0] : undefined;
+  if (typeof field !== 'string' || !ECHOED_ENUM_FIELDS.has(field)) return '';
+  if (typeof row !== 'object' || row === null) return '';
+  const value = (row as Record<string, unknown>)[field];
+  return `=${JSON.stringify(String(value).slice(0, 32))}`;
+}
+
+function validateEventLogRows(submitted: unknown[]) {
+  const events: Array<ReturnType<typeof eventLogRowSchema.parse>> = [];
+  let invalidDropped = 0;
+  let emptyMessageCoerced = 0;
+  const issues: string[] = [];
+
+  for (const [index, row] of submitted.entries()) {
+    const parsed = eventLogRowSchema.safeParse(row);
+    if (!parsed.success) {
+      invalidDropped++;
+      for (const issue of parsed.error.issues) {
+        if (issues.length >= 5) break;
+        const path = issue.path.length > 0 ? `.${issue.path.join('.')}` : '';
+        issues.push(`events[${index}]${path}:${issue.code}${rejectedEnumValue(row, issue.path)}`);
+      }
+      continue;
+    }
+    // Only successfully parsed rows can have a message stored or forwarded.
+    if (typeof row === 'object' && row !== null && 'message' in row
+      && typeof row.message === 'string' && row.message.trim() === '') {
+      emptyMessageCoerced++;
+    }
+    events.push(parsed.data);
+  }
+
+  return { events, invalidDropped, emptyMessageCoerced, issues };
+}
+
 export const eventLogsRoutes = new Hono();
 // Event-log ingest is the main agent's job; reject watchdog-role tokens so a
 // weaker credential can't falsify operator-facing event-log posture (F8).
@@ -124,8 +185,11 @@ eventLogsRoutes.put('/:id/eventlogs', zValidator('json', submitEventLogsSchema),
     currentPartnerId: agent.partnerId ?? null,
   };
 
+  const { events, invalidDropped, emptyMessageCoerced, issues } = validateEventLogRows(data.events);
+  const validationCounts = { invalidDropped, emptyMessageCoerced };
+
   if (data.events.length === 0) {
-    return c.json({ success: true, count: 0, filtered: 0 });
+    return c.json({ success: true, count: 0, filtered: 0, ...validationCounts });
   }
 
   // Phase 1 (short org-scoped context): resolve the device and its event_log
@@ -146,7 +210,7 @@ eventLogsRoutes.put('/:id/eventlogs', zValidator('json', submitEventLogsSchema),
 
     let settings: EventLogSettings | null;
     try {
-      settings = await getDeviceEventLogSettings(device.id);
+      settings = await withDbTransaction(() => getDeviceEventLogSettings(device.id, { orgId: device.orgId }));
     } catch (err) {
       console.error(`[EventLogs] Failed to resolve settings for device ${device.id}, using conservative defaults:`, err);
       settings = EVENT_LOG_DEFAULTS;
@@ -156,7 +220,7 @@ eventLogsRoutes.put('/:id/eventlogs', zValidator('json', submitEventLogsSchema),
   });
 
   if (!lookup.ok) {
-    return c.json({ error: 'Device not found' }, 404);
+    return c.json({ error: 'Device not found', ...validationCounts }, 404);
   }
   // deviceOrgId (the DB row's own org) is used for the inserted rows'
   // `orgId` column below; everywhere else (RLS context, forwarding config,
@@ -165,16 +229,23 @@ eventLogsRoutes.put('/:id/eventlogs', zValidator('json', submitEventLogsSchema),
   // only because they did).
   const { deviceId, deviceOrgId, hostname, settings } = lookup;
 
+  if (invalidDropped > 0 || emptyMessageCoerced > 0) {
+    console.warn(
+      `[EventLogs] agentId=${agentId} deviceId=${deviceId} submitted=${data.events.length} `
+      + `invalidDropped=${invalidDropped} emptyMessageCoerced=${emptyMessageCoerced} issues=${issues.join(',')}`,
+    );
+  }
+
   // Filter events by minimum level — pure, no DB/Redis, no context needed.
   const minLevel = settings ? LEVEL_ORDER[settings.minimumLevel] ?? 0 : 0;
   const filteredEvents = minLevel > 0
-    ? data.events.filter((event: any) => (LEVEL_ORDER[event.level] ?? 0) >= minLevel)
-    : data.events;
+    ? events.filter((event) => (LEVEL_ORDER[event.level] ?? 0) >= minLevel)
+    : events;
 
-  const filteredCount = data.events.length - filteredEvents.length;
+  const filteredCount = events.length - filteredEvents.length;
 
   if (filteredEvents.length === 0) {
-    return c.json({ success: true, count: 0, filtered: filteredCount });
+    return c.json({ success: true, count: 0, filtered: filteredCount, ...validationCounts });
   }
 
   // Rate limit check (after filtering, so we check against actual insert
@@ -192,6 +263,7 @@ eventLogsRoutes.put('/:id/eventlogs', zValidator('json', submitEventLogsSchema),
     if (!rateCheck.allowed) {
       return c.json({
         error: 'Rate limit exceeded',
+        ...validationCounts,
         remaining: rateCheck.remaining,
         resetAt: rateCheck.resetAt.toISOString(),
       }, 429);
@@ -199,8 +271,10 @@ eventLogsRoutes.put('/:id/eventlogs', zValidator('json', submitEventLogsSchema),
   }
 
   const now = new Date();
-  const rows = filteredEvents.map((event: any) => {
+  let timestampClampedCount = 0;
+  const rows = filteredEvents.map((event) => {
     const normalized = normalizeEventLogTimestamp(event.timestamp, now);
+    if (normalized.timestampClamped) timestampClampedCount++;
     return {
       deviceId,
       orgId: deviceOrgId,
@@ -213,6 +287,47 @@ eventLogsRoutes.put('/:id/eventlogs', zValidator('json', submitEventLogsSchema),
       details: mergeEventDetails(event.details, normalized)
     };
   });
+
+  // Daily per-device byte and per-org row+byte ingest budget, checked before
+  // the batch is written — outside any held DB context, same as the rate
+  // limiter above.
+  {
+    const eventBatchBytes = Buffer.byteLength(JSON.stringify(rows), 'utf-8');
+    const quotaRedis = getRedis();
+    const [deviceQuota, orgQuota] = await Promise.all([
+      checkAndConsumeIngestQuota({
+        redis: quotaRedis,
+        prefix: 'event_logs',
+        scope: 'device',
+        id: deviceId,
+        rows: rows.length,
+        bytes: eventBatchBytes,
+        // Row volume is already bounded by settings.rateLimitPerHour above;
+        // only bytes need a fresh daily ceiling here.
+        maxRows: Number.POSITIVE_INFINITY,
+        maxBytes: AGENT_EVENTLOG_MAX_BYTES_PER_DEVICE_PER_DAY,
+      }),
+      checkAndConsumeIngestQuota({
+        redis: quotaRedis,
+        prefix: 'event_logs',
+        scope: 'org',
+        id: deviceOrgId,
+        rows: rows.length,
+        bytes: eventBatchBytes,
+        maxRows: AGENT_EVENTLOG_MAX_ROWS_PER_ORG_PER_DAY,
+        maxBytes: AGENT_EVENTLOG_MAX_BYTES_PER_ORG_PER_DAY,
+      }),
+    ]);
+
+    if (!deviceQuota.allowed || !orgQuota.allowed) {
+      console.warn(
+        `[EventLogs] Daily ingest budget exceeded for device ${deviceId} org ${deviceOrgId} `
+        + `(device bytes=${deviceQuota.bytesUsed}, org rows=${orgQuota.rowsUsed} bytes=${orgQuota.bytesUsed}) `
+        + `— dropping ${rows.length} row(s)`,
+      );
+      return c.json({ error: 'Daily event-log ingest budget exceeded', count: 0, filtered: filteredCount, dropped: rows.length, ...validationCounts }, 429);
+    }
+  }
 
   // Key matching the device_event_logs_dedup_idx axes (deviceId is constant
   // per request) so forwarding can be gated on rows that actually inserted.
@@ -238,11 +353,13 @@ eventLogsRoutes.put('/:id/eventlogs', zValidator('json', submitEventLogsSchema),
           // a window after a sub-collector failure (#2390 retry semantics), so
           // duplicates are expected — they must be absorbed here, not
           // re-forwarded to the org's SIEM below.
-          const insertedRows = await db.insert(deviceEventLogs).values(batch).onConflictDoNothing().returning({
+          // A savepoint per batch: a failed batch must keep the batches before it,
+          // which the partial-failure answer below reports (#11225).
+          const insertedRows = await withDbTransaction(() => db.insert(deviceEventLogs).values(batch).onConflictDoNothing().returning({
             source: deviceEventLogs.source,
             eventId: deviceEventLogs.eventId,
             timestamp: deviceEventLogs.timestamp,
-          });
+          }));
           inserted += insertedRows.length;
           for (const r of insertedRows) {
             insertedKeys.add(eventLogRowKey(r.source, r.eventId, r.timestamp));
@@ -250,7 +367,10 @@ eventLogsRoutes.put('/:id/eventlogs', zValidator('json', submitEventLogsSchema),
         }
       } catch (err) {
         insertError = err;
-        console.error(`[EventLogs] Error batch inserting events for device ${deviceId}:`, err);
+        // The SQLSTATE or error name only: a Drizzle query error serializes its
+        // bound parameters, which here are the customer's event messages.
+        const { cause, name } = err as { cause?: { code?: unknown }; name?: unknown };
+        console.error(`[EventLogs] Error batch inserting events for device ${deviceId}: ${String(cause?.code ?? name ?? 'unknown')}`);
         return { inserted, insertError, forwardEvents: null };
       }
 
@@ -261,11 +381,11 @@ eventLogsRoutes.put('/:id/eventlogs', zValidator('json', submitEventLogsSchema),
       }
 
       try {
-        const fwdConfig = await getOrgForwardingConfig(orgId);
+        const fwdConfig = await withDbTransaction(() => getOrgForwardingConfig(orgId));
         if (!fwdConfig) {
           return { inserted, insertError, forwardEvents: null };
         }
-        const forwardEvents = filteredEvents.flatMap((event: any, index: number) => {
+        const forwardEvents = filteredEvents.flatMap((event, index) => {
           const row = rows[index];
           if (!row || !insertedKeys.has(eventLogRowKey(row.source, row.eventId, row.timestamp))) {
             return [];
@@ -277,7 +397,7 @@ eventLogsRoutes.put('/:id/eventlogs', zValidator('json', submitEventLogsSchema),
             message: event.message,
             timestamp: row.timestamp.toISOString(),
             // The agent's structured per-event context lives in `details`
-            // (see submitEventLogsSchema). The forward payload historically
+            // (see eventLogRowSchema). The forward payload historically
             // read `event.rawData`, a field the schema strips — so it was
             // always `undefined` and nothing reached the SIEM. Forward the
             // persisted `row.details` so the SIEM matches what was stored
@@ -310,21 +430,36 @@ eventLogsRoutes.put('/:id/eventlogs', zValidator('json', submitEventLogsSchema),
     }
   }
 
+  // #4340 — audit only an anomalous submit: an insert error or server-clamped
+  // future timestamps. A routine submit (including one whose rows were all
+  // absorbed as #2390 retry duplicates) is only counted; the events themselves
+  // are the durable record in device_event_logs.
+  //
   // writeAuditEvent self-manages its own DB context (services/auditEvents.ts
   // → auditService.ts persistAuditLog), so it is safe to call with none open.
-  writeAuditEvent(c, {
-    orgId,
-    actorType: 'agent',
-    actorId: agent.agentId ?? agentId,
-    action: 'agent.eventlogs.submit',
-    resourceType: 'device',
-    resourceId: deviceId,
-    details: {
-      submittedCount: data.events.length,
-      insertedCount: inserted,
-      filteredCount,
-    },
-  });
+  recordAgentIngestSubmission(
+    'eventlogs',
+    insertError ? (inserted > 0 ? 'partial' : 'failed') : 'success',
+  );
+  if (insertError || timestampClampedCount > 0) {
+    writeAuditEvent(c, {
+      orgId,
+      actorType: 'agent',
+      actorId: agent.agentId ?? agentId,
+      action: 'agent.eventlogs.submit',
+      resourceType: 'device',
+      resourceId: deviceId,
+      result: insertError ? 'failure' : 'success',
+      details: {
+        submittedCount: data.events.length,
+        insertedCount: inserted,
+        filteredCount,
+        ...(timestampClampedCount > 0 ? { timestampClampedCount } : {}),
+        ...(invalidDropped > 0 ? { invalidDroppedCount: invalidDropped } : {}),
+        ...(emptyMessageCoerced > 0 ? { emptyMessageCoercedCount: emptyMessageCoerced } : {}),
+      },
+    });
+  }
 
   if (insertError) {
     return c.json({
@@ -333,8 +468,9 @@ eventLogsRoutes.put('/:id/eventlogs', zValidator('json', submitEventLogsSchema),
       count: inserted,
       filtered: filteredCount,
       expectedCount: rows.length,
+      ...validationCounts,
     }, 500);
   }
 
-  return c.json({ success: true, count: inserted, filtered: filteredCount });
+  return c.json({ success: true, count: inserted, filtered: filteredCount, ...validationCounts });
 });

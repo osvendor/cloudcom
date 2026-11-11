@@ -9,8 +9,15 @@ import { Hono } from 'hono';
 import { zValidator } from '../lib/validation';
 import { z } from 'zod';
 import { streamSSE } from 'hono/streaming';
-import { authMiddleware, requireMfa, requirePermission, requireScope } from '../middleware/auth';
+import {
+  authMiddleware,
+  requireMfa,
+  requirePermission,
+  requireScope,
+  withAuthDbAccessContext,
+} from '../middleware/auth';
 import { aiScriptAuthoringEnabled } from '../config/env';
+import { WispSessionError } from '../services/wisp/sessionGrant';
 import { loadScriptProposalReviewerDisagreements } from '../services/scriptProposals/metrics';
 import {
   createSession,
@@ -20,33 +27,40 @@ import {
   getSessionMessages,
   handleApproval,
   isIntentBackedExecution,
+  getDecidedExecutionOutcome,
   searchSessions,
   listM365Connections,
-  resolveDefaultModel,
   sanitizeErrorForClient,
 } from '../services/aiAgent';
+import { InvalidSessionModelError } from '../services/aiModels/invalidSessionModelError';
 import { runPreFlightChecks, abortActivePlan, settleBlockedTurnForNewMessage } from '../services/aiAgentSdk';
 import { sanitizeThrownToolError } from '../services/aiToolErrors';
 import { redactPersistedToolInput } from '../services/aiToolOutput';
 import { streamingSessionManager } from '../services/streamingSessionManager';
+import { exitPreStreamTiming, timePreStreamPhase, withPreStreamTiming } from '../services/aiPreStreamTiming';
+import { registerAiAttachRoute } from './aiAttach';
 import { drainPendingRunResults } from '../services/workspace/chatRunBridge';
 import {
-  calculateCatalogCostCents,
-  calculateCostCents,
+  checkBudgetDetailed,
   getUsageSummary,
+  getAggregateUsageSummary,
   updateBudget,
   getSessionHistory,
-  recordUsage,
-  type CatalogPricingSnapshot,
 } from '../services/aiCostTracker';
-import { createTicket, changeTicketStatus, TicketServiceError } from '../services/ticketService';
+import { aiDenialBody } from '../services/aiDenialCode';
+import { createTicket, changeTicketStatus, TicketServiceError, type TicketActor } from '../services/ticketService';
 import { createTimeEntry, TimeEntryServiceError } from '../services/timeEntryService';
 import { writeRouteAudit } from '../services/auditEvents';
 import { assertNotLocked } from '../services/effectiveSettings';
+import {
+  listEffectiveToolRateLimits,
+  resolveToolRateLimitMultiplier,
+  toolRateLimitMultiplierSchema,
+} from '../services/aiToolRateLimits';
 import { normalizeAlertThresholds, evaluateAiBudgetThresholds } from '../services/aiBudgetAlerts';
-import { db } from '../db';
+import { db, withDbTransaction } from '../db';
 import { aiSessions, aiMessages, aiToolExecutions, auditLogs, organizations, devices, actionIntents, scriptProposals, scriptExecutions, aiScriptLaneState } from '../db/schema';
-import { eq, and, desc, gte, lte, count, avg, sql as drizzleSql } from 'drizzle-orm';
+import { eq, and, desc, gte, lte, count, avg, isNotNull, isNull, ne, notExists, notInArray, or, sql as drizzleSql, type SQL } from 'drizzle-orm';
 import { REVEAL_WINDOW_DAYS } from '../services/actionIntents/resultSecrets';
 import { PERMISSIONS } from '../services/permissions';
 import {
@@ -55,23 +69,84 @@ import {
   approveToolSchema,
   approvePlanSchema,
   pauseAiSchema,
-  aiSessionQuerySchema
-} from '@breeze/shared/validators/ai';
+  aiSessionQuerySchema,
+  continueAiSessionSchema,
+} from '@breeze/shared/validators';
 import { aiActionPlans } from '../db/schema';
 import { captureException } from '../services/sentry';
-import { getConfig } from '../config/validate';
-import { OpenAICompatibleProvider } from '../services/llm/openaiCompatibleProvider';
-import { OpenAISessionManager } from '../services/llm/openaiSessionManager';
+import { safeErrorMessage } from '../services/aiModels/safeDbError';
+import { persistAutoSessionTitle } from '../services/aiSessionTitle';
+import { expireIfStale, isExpirableChatSession } from '../services/aiSessionExpiry';
 import {
   draftTicketFromTranscript,
   ThinTranscriptError,
   TicketDraftFailedError,
 } from '../services/aiTicketDraft';
-import { getAnthropicClientForPartner, LlmUnavailableError, resolveWireModel } from '../services/llm/llmConfigResolver';
-import { createTicketFromChatSchema, type AiTicketDraft } from '@breeze/shared';
+import { LlmUnavailableError } from '../services/llm/llmConfigResolver';
+import { llmUnavailableBody } from '../services/llm/llmUnavailableError';
+import { anthropicClientFor, type MessageAttempt } from '../services/aiModels/connectionFactory';
+import {
+  FailoverExhaustedError,
+  isPreOutputMessagesFailure,
+  reserveFailoverHop,
+  runWithFailover,
+  settleZeroUsageHop,
+  type FailoverHop,
+} from '../services/aiModels/failoverDispatch';
+import { messagesUsage, messagesUsageAfterDispatchError } from '../services/aiModels/invocationUsage';
+import { oneShotUnavailableAnswer } from '../services/aiModels/oneShotUnavailable';
+import { settleInvocation } from '../services/aiModels/settleInvocation';
+import { resolveSessionTurn } from '../services/aiModels/sessionModel';
+import { loadContinuationSummary, withContinuationContext } from '../services/aiModels/continuation';
+// A leaf module (db + sanitizer): it does not load the Wisp graph.
+import { loadFiredCheckIns, markCheckInsConsumed, renderCheckInBlock, type FiredCheckIn } from '../services/wisp/checkInTurn';
+import { AI_NOT_CONFIGURED_BODY, LlmNotConfiguredError } from '../services/llm/llmAvailability';
+import type { ResolvedModel } from '../services/aiModels/resolveModel';
+import { liveQueryKey, turnBindingFrom, withCarriedRates } from '../services/aiModels/turnBinding';
+import { continuationMessage, planModelTransition, planTransitionWithFailover, readPreviousTurn, readSessionOfferingId } from '../services/aiModels/modelTransition';
+import { lastTurnModelOf, turnDisplayFrom } from '../services/aiModels/turnModel';
+import { TopologyAiSessionError } from '../services/topology/aiToolGate';
+import type { PreparedTopologyInvestigation } from '../services/topology/aiInvestigation';
+// Loaded lazily, only for a topology session: its tool/transport graph must not
+// load for every chat route (and every route unit test's partial mocks).
+const loadTopologyTurn = () => import('./aiTopologyTurn');
+// W05 (#7603): the continuation handler, loaded on first use for the same reason.
+const loadSessionContinuation = () => import('./aiSessionContinue');
+// #10426: the Wisp standing-state block, only for a Wisp session (it loads the Wisp graph).
+const loadStandingStateTurn = () => import('../services/wisp/standingStateTurn');
+/** Topology sessions get a fixed title: no model or evidence text ever names a session. */
+const TOPOLOGY_SESSION_TITLE = 'Topology investigation';
+import {
+  resolveTopologySessionVisibility,
+  topologySessionCondition,
+  type TopologySessionVisibility,
+} from '../services/topology/aiSessionAccess';
+
+/**
+ * M4-D2 for audit rows: an `ai_session` audit row (tool calls, authority
+ * changes, injection flags) names its session and carries the tool input, so a
+ * row about a topology session pinned to a site the caller cannot read is
+ * withheld exactly like the session itself. Applied in SQL before LIMIT.
+ */
+function topologyAuditSessionCondition(visibility: TopologySessionVisibility): SQL | undefined {
+  if (visibility.kind === 'all') return undefined;
+  const hidden = visibility.kind === 'none'
+    ? isNotNull(aiSessions.topologySiteId)
+    : and(isNotNull(aiSessions.topologySiteId), notInArray(aiSessions.topologySiteId, visibility.siteIds));
+  return or(
+    ne(auditLogs.resourceType, 'ai_session'),
+    isNull(auditLogs.resourceId),
+    notExists(
+      db.select({ one: drizzleSql`1` }).from(aiSessions).where(and(eq(aiSessions.id, auditLogs.resourceId), hidden)),
+    ),
+  );
+}
+import { createTicketFromChatSchema, type AiContinuationRequired, type AiTicketDraft } from '@breeze/shared';
 import { deviceInSiteScope } from './tickets/siteScope';
 import { timeActorFrom } from './timeEntries/timeEntries';
+import { pageContextWriteDefaultOrgId } from '../services/aiSessionOrgAnchor';
 import {
+  AiBudgetSessionBusyError,
   isAiBudgetLockTimeout,
   markAiBudgetReservationIndeterminate,
   releaseUnusedAiBudgetReservation,
@@ -79,47 +154,14 @@ import {
   type ReserveAiBudgetResult,
 } from '../services/aiBudgetReservations';
 
-// Provider check that tolerates an unvalidated config: route unit tests never
-// call validateConfig(), and getConfig() throws in that state. Without a
-// validated config, behave as the default anthropic path. Production always
-// validates at boot, so this never masks a misconfiguration there.
-export function isOpenAICompatibleProvider(): boolean {
-  try {
-    return getConfig().MCP_LLM_PROVIDER === 'openai-compatible';
-  } catch {
-    return false;
-  }
-}
-
-// Lazy singleton for the openai-compatible path.
-// Only constructed on first use when MCP_LLM_PROVIDER=openai-compatible.
-let _openaiSessionManager: OpenAISessionManager | null = null;
-function getOpenAISessionManager(): OpenAISessionManager {
-  if (!_openaiSessionManager) {
-    const cfg = getConfig();
-    if (!cfg.MCP_LLM_BASE_URL) {
-      // Should be caught at startup by the superRefine cross-field validation,
-      // but guard here in case getConfig() is called before validateConfig().
-      throw new Error('MCP_LLM_BASE_URL is required when MCP_LLM_PROVIDER is openai-compatible');
-    }
-    if (
-      cfg.MCP_LLM_PROVIDER === 'openai-compatible' &&
-      cfg.MCP_LLM_PRICE_INPUT_PER_M_USD === 0 &&
-      cfg.MCP_LLM_PRICE_OUTPUT_PER_M_USD === 0
-    ) {
-      console.warn(
-        'MCP_LLM_PROVIDER=openai-compatible but both MCP_LLM_PRICE_*_PER_M_USD are 0: cost tracking and budget enforcement are no-ops on this path.'
-      );
-    }
-    const provider = new OpenAICompatibleProvider({
-      baseUrl: cfg.MCP_LLM_BASE_URL,
-      apiKey: cfg.MCP_LLM_API_KEY!,
-      priceInputPerMUsd: cfg.MCP_LLM_PRICE_INPUT_PER_M_USD,
-      priceOutputPerMUsd: cfg.MCP_LLM_PRICE_OUTPUT_PER_M_USD,
-    });
-    _openaiSessionManager = new OpenAISessionManager(provider);
-  }
-  return _openaiSessionManager;
+/**
+ * Topology answer cache key (M4 Task 3): moves whenever the dispatch identity
+ * moves — the live-query key of the resolved model (connection, config
+ * version, catalog revision, wire model, wire params). W06: every chat turn,
+ * env OpenAI-compatible deployments included, resolves through the registry.
+ */
+function topologyProviderRevision(model: ResolvedModel): string {
+  return `sdk:${liveQueryKey(turnBindingFrom(model))}`;
 }
 
 const createAiSessionSchema = sharedCreateAiSessionSchema.extend({
@@ -130,7 +172,10 @@ const createAiSessionSchema = sharedCreateAiSessionSchema.extend({
   deviceId: z.string().guid().optional(),
   // Let the caller pick the approval posture (e.g. plan-first for open-ended
   // device tasks). Defaults to the column default (per_step) when omitted.
-  approvalMode: z.enum(['per_step', 'action_plan', 'auto_approve', 'hybrid_plan']).optional()
+  approvalMode: z.enum(['per_step', 'action_plan', 'auto_approve', 'hybrid_plan']).optional(),
+  // Wisp W04: open the session under the caller's own delegation grant.
+  // Validated (flag, ownership, status, entitlement, scope) in createSession.
+  wispGrantId: z.string().guid().optional()
 });
 
 /**
@@ -165,6 +210,12 @@ async function releaseUnusedTurn(orgId: string, dispatch: AiTurnBudgetDispatch):
 }
 
 export const aiRoutes = new Hono();
+
+// Sessions with an approve-plan decision currently being persisted (#7077).
+// The write happens before the in-memory resolver is released, so without
+// this a second request could slip past the pending check and persist a
+// conflicting decision.
+const planDecisionsInFlight = new WeakSet<object>();
 const requireAiRead = requirePermission(PERMISSIONS.ORGS_READ.resource, PERMISSIONS.ORGS_READ.action);
 // Org-level AI config (budget) and cross-owner moderation (flag/unflag) stay
 // organizations:write actions.
@@ -214,8 +265,13 @@ aiRoutes.post(
       });
       return c.json(session, 201);
     } catch (err) {
-      if (err instanceof LlmUnavailableError) return c.json({ error: 'ai_unavailable' }, 503);
+      if (err instanceof WispSessionError) return c.json({ error: err.message, code: err.code }, err.status);
+      if (err instanceof LlmNotConfiguredError) return c.json(AI_NOT_CONFIGURED_BODY, 503);
+      if (err instanceof InvalidSessionModelError) return c.json({ error: err.message, code: err.code }, 400);
+      if (err instanceof LlmUnavailableError) return c.json(llmUnavailableBody(err), 503);
+      if (err instanceof TopologyAiSessionError) return c.json({ error: err.message, code: err.code }, err.status);
       const message = err instanceof Error ? err.message : 'Failed to create session';
+      if (message === 'Invalid topology context') return c.json({ error: message }, 400);
       if (message === 'Organization context required') return c.json({ error: message }, 400);
       if (message === 'Invalid M365 connection') return c.json({ error: message }, 400);
       if (message === 'Invalid device') return c.json({ error: message }, 400);
@@ -294,9 +350,36 @@ aiRoutes.get(
       return c.json({ error: 'Session not found' }, 404);
     }
 
-    return c.json(result);
+    // #11430: a client resumes from this read, so it must not call a session
+    // 'active' that the next send refuses with 410. A chat session past the
+    // send's own age/idle rule, with no turn running, is stamped 'expired' here
+    // (Wisp summary finalized after commit) and reported as such. The stamp is
+    // housekeeping: if it fails, the read still answers (savepoint, so the
+    // request transaction survives) and the idle sweep retires the row later.
+    let session = result.session;
+    if (isExpirableChatSession(session)) {
+      try {
+        if (await withDbTransaction(() => expireIfStale(result.session, Date.now(), { unlessTurnInFlight: true }))) {
+          session = { ...session, status: 'expired' as const };
+        }
+      } catch (err) {
+        console.error(`[AI] Could not stamp stale session ${sessionId} expired on read; the idle sweep will retire it:`, err);
+        captureException(err);
+      }
+    }
+
+    // W05: what ran the last turn, persisted on the (owner-bound) session row
+    // — no extra query, and never a guess from ledger rows (D13). Parsed, so
+    // an unrecognised stored value reads as absent; the web store reads it
+    // off `session`, the plan's contract names the top-level field.
+    const lastTurnModel = lastTurnModelOf(session);
+    return c.json({ ...result, session: { ...session, lastTurnModel }, lastTurnModel });
   }
 );
+
+// GET /sessions/:id/stream - Attach to the session's current turn (#9427).
+// Same ownership surface as GET /sessions/:id; see routes/aiAttach.ts.
+registerAiAttachRoute(aiRoutes);
 
 // DELETE /sessions/:id - Close a session
 aiRoutes.delete(
@@ -313,11 +396,7 @@ aiRoutes.delete(
       return c.json({ error: 'Session not found' }, 404);
     }
 
-    const manager =
-      isOpenAICompatibleProvider()
-        ? getOpenAISessionManager()
-        : streamingSessionManager;
-    manager.remove(sessionId);
+    streamingSessionManager.remove(sessionId);
 
     writeRouteAudit(c, {
       orgId: closed.orgId,
@@ -446,7 +525,6 @@ aiRoutes.post(
     const { session, messages } = loaded;
 
     const elapsedMinutes = Math.max(0, Math.round((Date.now() - new Date(session.createdAt).getTime()) / 60000));
-    const model = session.model ?? resolveDefaultModel();
     const [org] = await db
       .select({ name: organizations.name, partnerId: organizations.partnerId })
       .from(organizations)
@@ -454,116 +532,167 @@ aiRoutes.post(
       .limit(1);
     if (!org) return c.json({ error: 'ai_unavailable' }, 503);
 
-    let draft;
-    let billingSource: 'platform' | 'partner_key' = 'platform';
-    let catalogPricing: CatalogPricingSnapshot | undefined;
-    let reservationId: string | undefined;
+    // The ticket draft inherits the chat session's offering (spec §4) but is a
+    // Messages API one-shot, so it resolves for that transport's carriage.
+    const turn = await resolveSessionTurn({
+      sessionId, surface: 'chat', userId: auth.user.id, maxTokens: 1024, transport: 'messages_api',
+    });
+    if (!turn.ok) {
+      const answer = oneShotUnavailableAnswer(turn);
+      return c.json(answer.body, answer.status);
+    }
+    let client;
     try {
-      const { client, resolved } = await getAnthropicClientForPartner(org.partnerId ?? null, {
-        surface: 'one_shot_ticket_draft',
+      client = anthropicClientFor(turn, { surface: 'one_shot_ticket_draft', orgId: session.orgId });
+    } catch (err) {
+      if (err instanceof LlmUnavailableError) return c.json(llmUnavailableBody(err), 503);
+      throw err;
+    }
+    // reserveAiBudget enforces caps, NOT prepaid credits or the plan gate —
+    // check them with the resolved funding before reserving.
+    const denial = await checkBudgetDetailed(session.orgId, turn.funding);
+    if (denial) return c.json(aiDenialBody(denial), 402);
+
+    const binding = turnBindingFrom(turn);
+    // S8: no stable request identity reaches this surface — the client sends
+    // no message/draft id — so the key is random per dispatch. The unique
+    // (org_id, idempotency_key) index is therefore a structural guarantee
+    // that two dispatches never share a reservation row, NOT a replay guard.
+    // SESSIONLESS on purpose: a ticket draft is not a session turn. Passing
+    // the chat session here would stamp this one-shot's binding onto the chat
+    // session and bind the reservation to it, which the sessionless
+    // settlement below then refuses (session-bound reservations require a
+    // session settlement). Authorization against the session already happened
+    // in getSessionMessages above.
+    // Hop 0's key; a failover hop n reserves `<key>:hop:<n>` (W09).
+    const reservationKey = `ticket-draft:${sessionId}:${crypto.randomUUID()}`;
+    let reservation;
+    try {
+      reservation = await reserveAiBudget({
         orgId: session.orgId,
-      });
-      billingSource = resolved.source === 'partner' ? 'partner_key' : 'platform';
-      // The session's model translated to what the resolved endpoint speaks —
-      // a catalog endpoint 404s on the platform-logical id. Throws
-      // LlmUnavailableError (handled below as a 503) when the pinned revision
-      // has no verified mapping for this session's model.
-      const wire = resolveWireModel(resolved, model);
-      catalogPricing = wire.catalogPricing;
-      // S8: no stable request identity reaches this surface — the client sends
-      // no message/draft id — so the key is random per dispatch. The unique
-      // (org_id, idempotency_key) index is therefore a structural guarantee
-      // that two dispatches never share a reservation row, NOT a replay guard.
-      // The one caller with a real identity uses it: `ai-agent-run:${run.id}`
-      // in services/aiAgents/runLoop.ts. Give this one a stable key only when
-      // the request schema starts carrying a client-generated id.
-      let reservation;
-      try {
-        reservation = await reserveAiBudget({
-          orgId: session.orgId,
-          idempotencyKey: `ticket-draft:${sessionId}:${crypto.randomUUID()}`,
-          billingSource,
-          sessionId,
-        });
-      } catch (err) {
-        // Same fail-fast answer as the other admission sites: contention on the
-        // org row is a 503 the client can retry, not a 500.
-        if (isAiBudgetLockTimeout(err)) return c.json({ error: 'AI_BUDGET_LOCK_TIMEOUT' }, 503);
-        throw err;
-      }
-      if (reservation.kind === 'denied') return c.json({ error: reservation.message }, 429);
-      reservationId = reservation.reservationId;
-      draft = await draftTicketFromTranscript({
-        messages: messages.map((m) => ({ role: m.role, content: m.content })),
-        contextSnapshot: session.contextSnapshot,
-        elapsedMinutes,
-        model: wire.model,
-        partnerId: org.partnerId ?? null,
-        orgId: session.orgId,
-        client,
-        ...(reservation.kind === 'reserved'
-          ? {
-            budgetCents: reservation.reservedCostCents,
-            calculateCostCents: catalogPricing
-              ? (inputTokens, outputTokens) => calculateCatalogCostCents(catalogPricing!, inputTokens, outputTokens)
-              : (inputTokens, outputTokens) => calculateCostCents(model, inputTokens, outputTokens),
-          }
-          : {}),
+        idempotencyKey: reservationKey,
+        billingSource: turn.funding,
+        binding,
       });
     } catch (err) {
-      if (reservationId) {
-        try {
-          if (err instanceof ThinTranscriptError
-            || (err instanceof TicketDraftFailedError
-              && !err.providerOutcomeUnknown && err.inputTokens === 0 && err.outputTokens === 0)) {
-            await releaseUnusedAiBudgetReservation({ orgId: session.orgId, reservationId });
-          } else if (err instanceof TicketDraftFailedError && !err.providerOutcomeUnknown) {
-            await recordUsage(
-              sessionId,
-              session.orgId,
-              model,
-              err.inputTokens,
-              err.outputTokens,
-              false,
-              billingSource,
-              catalogPricing,
-              reservationId,
-            );
-          } else {
-            await markAiBudgetReservationIndeterminate({ orgId: session.orgId, reservationId });
-          }
-        } catch (budgetError) {
-          captureException(budgetError);
+      // Same fail-fast answer as the other admission sites: contention on the
+      // org row is a 503 the client can retry, not a 500.
+      if (isAiBudgetLockTimeout(err)) return c.json({ error: 'AI_BUDGET_LOCK_TIMEOUT' }, 503);
+      throw err;
+    }
+    if (reservation.kind === 'denied') return c.json({ error: reservation.message }, 429);
+
+    // W09 (#7607): a pre-output provider failure fails over along the session
+    // offering's fallback list; each hop is admitted, reserved and settled on
+    // its own (failoverDispatch.ts). `current` is the hop in flight: failure
+    // handling settles THAT hop. With no list the original error comes
+    // straight back and the W03 handling below is unchanged.
+    let current: FailoverHop = {
+      index: 0, resolved: turn, binding, reservationId: reservation.reservationId, idempotencyKey: reservationKey,
+      reservedCostCents: reservation.kind === 'reserved' ? reservation.reservedCostCents : null,
+    };
+
+    // Ledger rows carry sessionId null deliberately: a ticket draft is not a
+    // chat turn, and its cost in the chat session's total_cost_cents would
+    // double-attribute it in the session list. The ledger keeps it as
+    // surface 'chat', source_ref 'ticket_draft'.
+    const holdIndeterminate = (reservationId: string) => markAiBudgetReservationIndeterminate({ orgId: session.orgId, reservationId })
+      .catch((markError) => {
+        captureException(new Error(`ticket draft reservation not retained as indeterminate: ${safeErrorMessage(markError)}`), undefined, {
+          org_id: session.orgId, ai_reservation_id: reservationId,
+        });
+      });
+    // Best effort, never throws: a settlement failure (or an unrecorded
+    // deferral, S1) holds the reservation indeterminate and is reported
+    // scrubbed (S7) — it is never released. Always on THAT hop's binding and
+    // reservation (W09 F5).
+    const settleOn = async (hop: FailoverHop, attempts: MessageAttempt[], dispatchFailed = false): Promise<void> => {
+      const reservationId = hop.reservationId;
+      try {
+        const { usage, outcome } = dispatchFailed
+          ? messagesUsageAfterDispatchError(hop.binding, attempts)
+          : messagesUsage(hop.binding, attempts);
+        const settled = await settleInvocation({
+          binding: hop.binding, orgId: session.orgId, userId: auth.user.id, sessionId: null, agentRunId: null,
+          sourceRef: 'ticket_draft', usage, outcome, reservationId,
+        });
+        if (settled.unrecorded) await holdIndeterminate(reservationId);
+      } catch (settleError) {
+        const message = safeErrorMessage(settleError);
+        console.error('[AI] ticket draft settlement failed', { reservationId, error: message });
+        captureException(new Error(`ticket draft settlement failed: ${message}`), undefined, {
+          org_id: session.orgId, ai_reservation_id: reservationId,
+        });
+        await holdIndeterminate(reservationId);
+      }
+    };
+
+    let draft;
+    let served: FailoverHop;
+    try {
+      ({ value: draft, hop: served } = await runWithFailover({
+        first: current,
+        reResolve: ({ excludeOfferingIds, cause, origin }) => resolveSessionTurn({
+          sessionId, surface: 'chat', userId: auth.user.id, maxTokens: 1024, transport: 'messages_api',
+          excludeOfferingIds, failoverCause: cause, failoverOrigin: origin,
+        }),
+        // Sessionless, like hop 0: settled with sessionId null.
+        reserveHop: reserveFailoverHop({ orgId: session.orgId }),
+        attempt: (hop) => {
+          current = hop;
+          return draftTicketFromTranscript({
+            messages: messages.map((m) => ({ role: m.role, content: m.content })),
+            contextSnapshot: session.contextSnapshot,
+            elapsedMinutes,
+            resolved: hop.resolved,
+            client: hop.index === 0 ? client : anthropicClientFor(hop.resolved, { surface: 'one_shot_ticket_draft', orgId: session.orgId }),
+            // This hop's OWN allowance (Codex review 6), never hop 0's.
+            ...(hop.reservedCostCents !== null ? { budgetCents: hop.reservedCostCents } : {}),
+          });
+        },
+        settleFailedHop: settleZeroUsageHop({
+          orgId: session.orgId, userId: auth.user.id, sessionId: null, agentRunId: null, sourceRef: 'ticket_draft',
+        }),
+        // A draft error carrying a completed attempt never fails over: those tokens bill on this hop.
+        isPreOutput: isPreOutputMessagesFailure,
+      }));
+    } catch (err) {
+      if (err instanceof FailoverExhaustedError) {
+        // Every hop runWithFailover tried is already settled on its own reservation.
+        console.error('[AI] Ticket draft failed on every configured model:', safeErrorMessage(err.lastError), {
+          stop: err.stop, admission: err.admissionMessage,
+        });
+        // The backup's credits / budget refused it: say so, like hop 0's own denial (402).
+        if (err.stop === 'admission_denied' && err.admissionMessage) return c.json({ error: err.admissionMessage }, 402);
+        return c.json({ error: 'ai_unavailable' }, 503);
+      }
+      const reservationId = current.reservationId;
+      const settle = (attempts: MessageAttempt[], dispatchFailed = false) => settleOn(current, attempts, dispatchFailed);
+      try {
+        if (err instanceof TicketDraftFailedError && err.attempts.length > 0) {
+          // The provider answered (at least once): the burned tokens bill —
+          // including a refused attempt whose fallback call then threw.
+          await settle(err.attempts, err.providerOutcomeUnknown);
+        } else if (err instanceof TicketDraftFailedError && err.providerOutcomeUnknown) {
+          await markAiBudgetReservationIndeterminate({ orgId: session.orgId, reservationId });
+        } else {
+          // Thin transcript / prompt over budget / nothing sent: hand it back.
+          await releaseUnusedAiBudgetReservation({ orgId: session.orgId, reservationId });
         }
+      } catch (budgetError) {
+        captureException(new Error(`ticket draft reservation bookkeeping failed: ${safeErrorMessage(budgetError)}`), undefined, {
+          org_id: session.orgId, ai_reservation_id: reservationId,
+        });
       }
       if (err instanceof ThinTranscriptError) return c.json({ error: err.message }, 422);
-      if (err instanceof LlmUnavailableError) return c.json({ error: 'ai_unavailable' }, 503);
+      if (err instanceof LlmUnavailableError) return c.json(llmUnavailableBody(err), 503);
       console.error('[AI] Ticket draft failed:', err);
       captureException(err);
       return c.json({ error: 'Could not draft a ticket from this conversation' }, 502);
     }
 
-    // Best-effort cost accounting; never fails the request.
-    try {
-      await recordUsage(
-        sessionId,
-        session.orgId,
-        model,
-        draft.inputTokens,
-        draft.outputTokens,
-        false,
-        billingSource,
-        // Catalog traffic meters from the revision snapshot, never Anthropic
-        // list rates.
-        catalogPricing,
-        reservationId,
-      );
-    } catch (err) {
-      captureException(err);
-      if (reservationId) {
-        await markAiBudgetReservationIndeterminate({ orgId: session.orgId, reservationId }).catch(captureException);
-      }
-    }
+    // Best-effort cost accounting on the hop that served; never fails the request.
+    await settleOn(served, draft.attempts);
 
     let deviceHostname: string | null = null;
     if (session.deviceId) {
@@ -591,6 +720,28 @@ aiRoutes.post(
   }
 );
 
+// POST /sessions/:id/continue — W05 (#7603; spec §9.2, §15 #4): a model
+// switch that cannot resume continues in a NEW chat on the target offering,
+// linked back to this one and seeded with a summary the TARGET writes.
+// D12: registered in selfManagedDbContextRoutes (it makes a provider call).
+// The handler (routes/aiSessionContinue.ts) loads lazily, like the topology
+// turn: its resolver / candidate-loader graph must not load for every route.
+aiRoutes.post(
+  '/sessions/:id/continue',
+  requireScope('organization', 'partner', 'system'),
+  requireAiUse,
+  requireMfa(),
+  zValidator('json', continueAiSessionSchema),
+  async (c) => {
+    const { continueAiSession } = await loadSessionContinuation();
+    return continueAiSession(c, {
+      auth: c.get('auth'),
+      sessionId: c.req.param('id')!,
+      choice: c.req.valid('json').model,
+    });
+  }
+);
+
 aiRoutes.post(
   '/sessions/:id/ticket',
   requireScope('organization', 'partner', 'system'),
@@ -608,7 +759,7 @@ aiRoutes.post(
     let deviceId: string | undefined = session.deviceId ?? undefined;
     if (deviceId && !(await deviceInSiteScope(auth, deviceId))) deviceId = undefined;
 
-    const actor = { userId: auth.user.id, name: auth.user.name, email: auth.user.email };
+    const actor: TicketActor = { kind: 'user', userId: auth.user.id, name: auth.user.name, email: auth.user.email };
 
     let ticket;
     try {
@@ -667,128 +818,148 @@ aiRoutes.post(
   requireAiUse,
   requireMfa(),
   zValidator('json', sendAiMessageSchema),
-  async (c) => {
+  // #11004: everything before streamSSE returns runs on the main thread ahead
+  // of the first byte; time it per phase and warn once when a phase is slow.
+  async (c) => withPreStreamTiming('chat.message', { sessionId: c.req.param('id') }, async () => {
     const auth = c.get('auth');
     const sessionId = c.req.param('id')!;
     const body = c.req.valid('json');
+    // #3127: this route is registered in selfManagedDbContextRoutes, so no
+    // request transaction is held across the handler. Each DB phase runs in its
+    // own short context carrying the caller's exact scope, and the settle wait
+    // and the budget reservation (which opens its own system transaction) run
+    // between them with no connection checked out.
+    const inRequestDb = <T>(fn: () => Promise<T>): Promise<T> => withAuthDbAccessContext(auth, fn);
 
-    // Pre-flight checks (rate limits, budget, session status, input sanitization)
-    const preflight = await runPreFlightChecks(sessionId, body.content, auth, body.pageContext, c);
+    // Pre-flight checks (rate limits, budget, session status, input sanitization).
+    // #10415: not wrapped in inRequestDb — the pre-flight opens its own DB
+    // phases with it and runs the Redis rate limit between them.
+    const preflight = await timePreStreamPhase('preflight', () => runPreFlightChecks(sessionId, body.content, auth, body.pageContext, c, body.model, inRequestDb));
     if (!preflight.ok) {
       const err = preflight.error;
+      if (err === 'ai_not_configured') return c.json(AI_NOT_CONFIGURED_BODY, 503);
       if (err === 'ai_unavailable') return c.json({ error: 'ai_unavailable' }, 503);
+      // W03: a stored model that went ineligible is recoverable (choose another), never a silent switch.
+      if (preflight.code) return c.json({ error: err, code: preflight.code, recoverable: true }, preflight.status === 503 ? 503 : 409);
       if (preflight.status === 503) return c.json({ error: err }, 503);
+      // The credit / plan gate (and spend caps): 402, with a code the client can act on.
+      if (preflight.status === 402) return c.json(preflight.billingCode ? { error: err, code: preflight.billingCode } : { error: err }, 402);
       if (err === 'Session not found') return c.json({ error: err }, 404);
       if (err.includes('rate limit') || err.includes('Rate limit')) return c.json({ error: err }, 429);
       if (err.includes('budget') || err.includes('Budget')) return c.json({ error: err }, 402);
-      if (err.includes('expired')) return c.json({ error: err }, 410);
+      // #11430: coded so a client can tell a retired session (nothing ran; a fresh one can carry the message) from any other refusal.
+      if (err.includes('expired')) return c.json({ error: err, code: 'session_expired' }, 410);
       return c.json({ error: err }, 400);
     }
 
-    const { session: dbSession, sanitizedContent, systemPrompt, resolved } = preflight;
+    const { session: dbSession, sanitizedContent, systemPrompt, model: resolvedModel } = preflight;
 
-    // ---- OpenAI-compatible path (chat-only, no tool-calling) ----
-    const useOpenAICompatibleProvider = isOpenAICompatibleProvider();
-    if (useOpenAICompatibleProvider && resolved.source === 'partner') {
-      return c.json({ error: 'ai_unavailable' }, 503);
-    }
-    if (useOpenAICompatibleProvider) {
-      const billingSource = resolved.source === 'partner' ? 'partner_key' : 'platform';
-      // S8: no stable request identity reaches this surface — the client sends
-      // no message/draft id — so the key is random per dispatch. The unique
-      // (org_id, idempotency_key) index is therefore a structural guarantee
-      // that two dispatches never share a reservation row, NOT a replay guard.
-      // The one caller with a real identity uses it: `ai-agent-run:${run.id}`
-      // in services/aiAgents/runLoop.ts. Give this one a stable key only when
-      // the request schema starts carrying a client-generated id.
-      let reservation;
-      try {
-        reservation = await reserveAiBudget({
-          orgId: dbSession.orgId,
-          billingSource,
-          sessionId,
-          idempotencyKey: `chat:${sessionId}:${crypto.randomUUID()}`,
-        });
-      } catch (err) {
-        if (isAiBudgetLockTimeout(err)) return c.json({ error: 'AI_BUDGET_LOCK_TIMEOUT' }, 503);
-        throw err;
-      }
-      if (reservation.kind === 'denied') {
-        return c.json({ error: reservation.message }, 402);
-      }
-      const budgetDispatch = budgetDispatchFrom(reservation)!;
-      const openaiManager = getOpenAISessionManager();
-      const openaiSession = openaiManager.getOrCreate(sessionId, dbSession.orgId, auth, c);
-
-      if (!openaiManager.tryTransitionToProcessing(openaiSession)) {
-        await releaseUnusedTurn(dbSession.orgId, budgetDispatch);
-        return c.json({ error: 'A message is already being processed for this session' }, 409);
-      }
-
-      writeRouteAudit(c, {
-        orgId: dbSession.orgId,
-        action: 'ai.message.send',
-        resourceType: 'ai_session',
-        resourceId: sessionId,
-        details: { contentLength: body.content.length },
-      });
-
-      try {
-        await db.insert(aiMessages).values({
-          sessionId,
-          role: 'user',
-          content: sanitizedContent,
-        });
-      } catch (err) {
-        console.error('[AI/OpenAI] Failed to save user message to DB:', err);
-        openaiSession.state = 'idle';
-        await releaseUnusedTurn(dbSession.orgId, budgetDispatch);
-        return c.json({ error: 'Failed to save message' }, 500);
-      }
-
-      if (!dbSession.title) {
-        const title = generateSessionTitle(sanitizedContent);
+    // Topology M4 Task 3 (#6000): a topology session runs a bounded
+    // investigation on this same transport. The pinned site is re-authorized,
+    // quotas reserved and sanitized evidence built BEFORE any provider call;
+    // a re-authorized cached answer returns without one. Provider text for
+    // the turn goes to the runtime's output gate, never to SSE.
+    //
+    // #3127: the preparation resolves the org's topology flags/readiness with
+    // no context held, then runs in ONE short caller-scoped context
+    // (inRequestDb) — closed before the settle wait, the reservation and the
+    // model stream. The runtime it returns opens its own short contexts for
+    // every later read (aiInvestigation.ts); its lease lives in Redis, so
+    // aborting it (every refusal below) needs no DB context.
+    let topology: Extract<PreparedTopologyInvestigation, { kind: 'live' }> | null = null;
+    let topologyTurn: Awaited<ReturnType<typeof loadTopologyTurn>> | null = null;
+    if (dbSession.type === 'topology') {
+      topologyTurn = await loadTopologyTurn();
+      const { prepareTopologyTurn, cachedTopologyEvents } = topologyTurn;
+      const prepared = await prepareTopologyTurn(auth, dbSession, sanitizedContent, topologyProviderRevision(resolvedModel), inRequestDb);
+      if (!prepared.ok) return c.json(prepared.body, prepared.status);
+      if (prepared.prepared.kind === 'cached') {
+        const explanation = prepared.prepared.explanation;
         try {
-          await db.update(aiSessions).set({ title }).where(eq(aiSessions.id, sessionId));
-          openaiSession.eventBus.publish({ type: 'title_updated', title });
+          // Its own short context: a failed write never poisons another phase's transaction.
+          await inRequestDb(() => db.insert(aiMessages).values([
+            { sessionId, role: 'user', content: sanitizedContent },
+            { sessionId, role: 'assistant', content: JSON.stringify(explanation), contentBlocks: [{ type: 'topology_explanation', explanation }] as unknown as Record<string, unknown>[] },
+          ]));
         } catch (err) {
-          console.error('[AI/OpenAI] Failed to auto-set session title:', err);
+          console.error('[AI] Failed to save cached topology explanation:', err);
         }
-      }
-
-      openaiManager.startTurn(
-        openaiSession,
-        dbSession.model,
-        systemPrompt,
-        sanitizedContent,
-        budgetDispatch,
-      );
-
-      const subscriptionId = crypto.randomUUID();
-      return streamSSE(c, async (stream) => {
-        const events = openaiSession.eventBus.subscribe(subscriptionId);
-        try {
-          for await (const event of events) {
+        return streamSSE(c, async (stream) => {
+          for (const event of cachedTopologyEvents(explanation)) {
             await stream.writeSSE({ event: event.type, data: JSON.stringify(event) });
-            if (event.type === 'done') break;
           }
-        } catch (err) {
-          // Never stream a raw error to the browser (#2603). Uses the stream
-          // sanitizer (not the tool one) so user-actionable conditions — rate
-          // limit, budget, approval timeout — survive, while driver text does
-          // not. sanitizeErrorForClient is now detector-gated.
-          console.error('[AI/OpenAI] Stream error:', err);
-          const message = sanitizeErrorForClient(err);
-          await stream.writeSSE({
-            event: 'error',
-            data: JSON.stringify({ type: 'error', message }),
-          });
-        } finally {
-          openaiSession.eventBus.unsubscribe(subscriptionId);
-        }
-      });
+        });
+      }
+      topology = prepared.prepared;
     }
-    // ---- End OpenAI-compatible path ----
+    const abortTopology = async () => { await topology?.runtime.abort(); };
+
+    // W05 (#7603): a continuation's FIRST turn (no SDK transcript yet) is
+    // seeded with the summary its creation stored; later turns resume the SDK
+    // transcript, which already contains it. The summary is model output over
+    // tool results, so it is untrusted: it is only ever prefixed to this user
+    // turn (below), never the system prompt. Read here, in its own short
+    // caller-scoped context, before anything is reserved or claimed.
+    const continuationSummary = !topology && dbSession.continuedFromSessionId && !dbSession.sdkSessionId
+      ? await timePreStreamPhase('continuationSummary', () => inRequestDb(() => loadContinuationSummary(sessionId)))
+      : null;
+    if (!topology && dbSession.continuedFromSessionId && !dbSession.sdkSessionId && continuationSummary === null) {
+      // The continuation was created with a summary; it is gone (or unreadable).
+      // The turn proceeds without the prior context — report it, never content.
+      console.warn('[AI] continuation summary missing on the first turn; sending without prior context', {
+        orgId: dbSession.orgId, sessionId, continuedFromSessionId: dbSession.continuedFromSessionId,
+      });
+      captureException(new Error('continuation summary missing on first turn'), undefined, { org_id: dbSession.orgId });
+    }
+
+    // Wisp check-in timers W04 (#10995; spec §4): check-ins this grant's
+    // timers fired since the last turn ride on THIS turn as delimited,
+    // sanitised, untrusted background (services/wisp/checkInTurn.ts) — never
+    // the system prompt. Read here, before anything is reserved or claimed;
+    // consumed only once the turn is dispatched (below), so a refused turn
+    // leaves them for the next one. A failed read never blocks the turn.
+    // Only the rows actually rendered into the block are consumed later.
+    let firedCheckIns: FiredCheckIn[] = [];
+    let checkInBlock: string | null = null;
+    const wispGrantId = !topology ? dbSession.wispGrantId : null;
+    if (wispGrantId) {
+      try {
+        const rows = await inRequestDb(() => loadFiredCheckIns(wispGrantId, auth.user.id));
+        checkInBlock = renderCheckInBlock(rows);
+        firedCheckIns = rows;
+      } catch (err) {
+        console.warn('[AI] failed to read fired Wisp check-ins; sending the turn without them', {
+          orgId: dbSession.orgId, sessionId, grantId: wispGrantId, error: err instanceof Error ? err.message : String(err),
+        });
+        captureException(err, c, { wisp_check_in_phase: 'read' }, { fingerprint: ['wisp-check-in-turn', 'read'] });
+      }
+    }
+
+    // #10426: Wisp's standing state (loop cadence, first look, concerns,
+    // watches, check-ins, spend, alerts) rides on THIS turn ahead of the
+    // check-ins, so the system prompt stays cache-stable
+    // (services/wisp/standingStateTurn.ts; facts cached up to 60 s). Null
+    // when nothing changed since the last block this session was sent;
+    // recorded as sent only once the turn is dispatched (below). A failure
+    // never blocks the turn.
+    let standingState: { block: string; hash: string } | null = null;
+    // Held from this import, so nothing after dispatch can fail on loading it.
+    let markStandingStateSent: ((sessionId: string, hash: string) => Promise<void>) | null = null;
+    const wispGrantRevisionId = wispGrantId ? dbSession.wispGrantRevisionId : null;
+    if (wispGrantId && wispGrantRevisionId) {
+      try {
+        const standingStateTurn = await loadStandingStateTurn();
+        markStandingStateSent = standingStateTurn.markStandingStateSent;
+        standingState = await timePreStreamPhase('wispStandingState', () => standingStateTurn.standingStateForTurn({
+          grantId: wispGrantId, revisionId: wispGrantRevisionId, sessionId, auth,
+        }));
+      } catch (err) {
+        console.warn('[AI] failed to build the Wisp standing state; sending the turn without it', {
+          orgId: dbSession.orgId, sessionId, grantId: wispGrantId, error: err instanceof Error ? err.message : String(err),
+        });
+        captureException(err, c, { wisp_standing_state_phase: 'read' });
+      }
+    }
 
     // A Claude SDK query's maxBudgetUsd is immutable after creation. Finish any
     // approval-only prior turn, then rotate the idle query so this turn is
@@ -804,12 +975,16 @@ aiRoutes.post(
       // concludes the turn, and this message then proceeds normally. If the
       // session is busy for any other reason (model actively working), or the
       // turn doesn't conclude in time, fall back to a 409 as before.
-      const settle = await settleBlockedTurnForNewMessage(priorSession);
+      // #3127: runs with no DB context held (see inRequestDb above).
+      const settle = await timePreStreamPhase('settlePriorTurn', () => settleBlockedTurnForNewMessage(priorSession));
       if (settle !== 'concluded') {
+        await abortTopology();
+        // #9427: coded so a client can attach to the running turn instead.
         return c.json({
           error: settle === 'not_blocked_on_approvals'
             ? 'A message is already being processed for this session'
             : 'The assistant is wrapping up the previous turn — please try again in a moment',
+          code: 'turn_in_progress',
         }, 409);
       }
     }
@@ -817,7 +992,76 @@ aiRoutes.post(
       streamingSessionManager.remove(sessionId);
     }
 
-    const billingSource = resolved.source === 'partner' ? 'partner_key' : 'platform';
+    // W09: a failover hop replaces the dispatched model.
+    let model = resolvedModel;
+    // W05 (spec §9.2; spike constraints 1–3): every model change passes ONE
+    // gate before anything is reserved. Same model → W03 reuse; another
+    // connection or funding, a transcript too large for the target, or one
+    // whose fit can't be proven → the client offers a continuation.
+    // W09 (#7607): a resolution-time failover candidate passes the same gate;
+    // one that would need a continuation is passed over for the next backup
+    // (or the cooling primary) before anything is reserved.
+    // #3127: every read opens its own system context; no request DB context
+    // is held here (between inRequestDb phases).
+    let previous: Awaited<ReturnType<typeof readPreviousTurn>>;
+    let transition: Awaited<ReturnType<typeof planModelTransition>>;
+    try {
+      // Values come back out of the timed phase (not assigned inside it) so
+      // definite-assignment analysis still sees them.
+      ({ previous, model, transition } = await timePreStreamPhase('modelTransition', async () => {
+        const priorTurn = await readPreviousTurn({ orgId: dbSession.orgId, sessionId });
+        // The preflight's session row predates resolveModel's lazy partner
+        // cutover, which stamps a pre-W03 session's offering_id: re-read it so a
+        // plain same-offering message is not refused as fit_unverifiable.
+        const freshOfferingId = await readSessionOfferingId({ orgId: dbSession.orgId, sessionId });
+        const planned = await planTransitionWithFailover({
+          first: resolvedModel,
+          plan: (target) => planModelTransition({
+            orgId: dbSession.orgId,
+            sdkSessionId: dbSession.sdkSessionId,
+            sessionOfferingId: freshOfferingId === undefined ? (dbSession.offeringId ?? null) : freshOfferingId,
+            previous: priorTurn,
+            target,
+            systemPrompt: topology ? topology.systemPrompt : systemPrompt,
+            pendingUserTurn: topology ? topology.prompt : sanitizedContent,
+          }),
+          reResolve: (excludeOfferingIds) => resolveSessionTurn({
+            sessionId, surface: resolvedModel.surface, userId: auth.user.id, transport: resolvedModel.transport, excludeOfferingIds,
+          }),
+        });
+        return { previous: priorTurn, model: planned.model, transition: planned.transition };
+      }));
+    } catch (err) {
+      // Nothing is reserved yet; release the topology lease like every other refusal.
+      await abortTopology();
+      throw err;
+    }
+    if (transition.kind === 'continuation_required') {
+      await abortTopology();
+      // A continuation (routes/aiSessionContinue.ts) refuses topology
+      // sessions, so offering one here would be a dead end.
+      if (topology) {
+        return c.json({
+          error: 'The AI model for this investigation changed. Start a new investigation to continue.',
+          code: 'topology_model_changed',
+          recoverable: true,
+        }, 409);
+      }
+      const answer: AiContinuationRequired = {
+        error: continuationMessage(transition.reason, model.offering.displayName),
+        code: 'continuation_required',
+        reason: transition.reason,
+        recoverable: true,
+        target: { offeringId: model.offering.id, displayName: model.offering.displayName },
+      };
+      return c.json(answer, 409);
+    }
+    // Spec §9.2: the turn binding (offering, options, rate, connection
+    // identity, wire model) is written onto the reservation in its own
+    // transaction; funding is the resolved offering's, decided before admission.
+    // W05: a resumed session also carries the rates of the models it switched
+    // away from, so their late deltas bill at their own rate (spike Q6).
+    const binding = withCarriedRates(turnBindingFrom(model), transition.kind === 'fresh' ? [] : transition.carriedRates);
     // S8: no stable request identity reaches this surface — the client sends
     // no message/draft id — so the key is random per dispatch. The unique
     // (org_id, idempotency_key) index is therefore a structural guarantee
@@ -827,106 +1071,211 @@ aiRoutes.post(
     // the request schema starts carrying a client-generated id.
     let reservation;
     try {
-      reservation = await reserveAiBudget({
+      reservation = await timePreStreamPhase('budgetReserve', () => reserveAiBudget({
         orgId: dbSession.orgId,
-        billingSource,
+        billingSource: model.funding,
         sessionId,
         idempotencyKey: `chat:${sessionId}:${crypto.randomUUID()}`,
-      });
+        binding,
+        // W05 spike constraint 3: claimed only against the turn this plan
+        // read, and never re-stamped mid-turn.
+        sessionSwitchGuard: { expectedPreviousChatReservationId: previous?.reservationId ?? null },
+      }));
     } catch (err) {
+      await abortTopology();
+      if (err instanceof AiBudgetSessionBusyError) return c.json({ error: err.message, code: 'turn_in_progress' }, 409);
       if (isAiBudgetLockTimeout(err)) return c.json({ error: 'AI_BUDGET_LOCK_TIMEOUT' }, 503);
       throw err;
     }
     if (reservation.kind === 'denied') {
+      await abortTopology();
       return c.json({ error: reservation.message }, 402);
     }
     const budgetDispatch = budgetDispatchFrom(reservation)!;
 
-    let activeSession;
-    try {
-      activeSession = await streamingSessionManager.getOrCreate(
-        sessionId,
-        {
-          orgId: dbSession.orgId,
-          sdkSessionId: dbSession.sdkSessionId,
-          model: dbSession.model,
-          maxTurns: dbSession.maxTurns,
-          turnCount: dbSession.turnCount,
-          systemPrompt: dbSession.systemPrompt,
-          // Device-bound sessions narrow tool execution to the device's org
-          // (ai_sessions.org_id), not the login org (#3087).
-          deviceId: dbSession.deviceId,
-        },
-        auth,
-        c,
-        systemPrompt,
-        budgetDispatch.maxBudgetUsd,
-        resolved,
-        undefined,
-        undefined,
-        { budgetReservationId: budgetDispatch.reservationId },
-      );
-    } catch (err) {
-      await releaseUnusedTurn(dbSession.orgId, budgetDispatch);
-      throw err;
-    }
-
-    if (!streamingSessionManager.tryTransitionToProcessing(activeSession, budgetDispatch.reservationId)) {
-      await releaseUnusedTurn(dbSession.orgId, budgetDispatch);
-      return c.json({ error: 'A message is already being processed for this session' }, 409);
-    }
-
-    writeRouteAudit(c, {
-      orgId: dbSession.orgId,
-      action: 'ai.message.send',
-      resourceType: 'ai_session',
-      resourceId: sessionId,
-      details: { contentLength: body.content.length }
-    });
-
-    try {
-      await db.insert(aiMessages).values({
-        sessionId,
-        role: 'user',
-        content: sanitizedContent,
-      });
-    } catch (err) {
-      console.error('[AI] Failed to save user message to DB:', err);
-      activeSession.state = 'idle';
-      await releaseUnusedTurn(dbSession.orgId, budgetDispatch);
-      return c.json({ error: 'Failed to save message' }, 500);
-    }
-
-    // Auto-generate title from first user message
-    if (!dbSession.title) {
-      const title = generateSessionTitle(sanitizedContent);
+    type ActiveChatSession = Awaited<ReturnType<typeof streamingSessionManager.getOrCreate>>;
+    const subscriptionId = crypto.randomUUID();
+    let subscribedSession: ActiveChatSession | null = null;
+    const dispatch = await timePreStreamPhase('dispatch', () => inRequestDb(async (): Promise<
+      | { kind: 'dispatched'; activeSession: ActiveChatSession; events: ReturnType<ActiveChatSession['eventBus']['subscribe']> }
+      | { kind: 'refused'; response: Response }
+      | { kind: 'failed'; error: unknown }
+    > => {
+      let activeSession: ActiveChatSession;
       try {
-        await db.update(aiSessions)
-          .set({ title })
-          .where(eq(aiSessions.id, sessionId));
-        activeSession.eventBus.publish({ type: 'title_updated', title });
+        activeSession = await streamingSessionManager.getOrCreate(
+          sessionId,
+          {
+            orgId: dbSession.orgId,
+            sdkSessionId: dbSession.sdkSessionId,
+            maxTurns: dbSession.maxTurns,
+            turnCount: dbSession.turnCount,
+            systemPrompt: dbSession.systemPrompt,
+            // Device-bound sessions narrow tool execution to the device's org
+            // (ai_sessions.org_id), not the login org (#3087).
+            deviceId: dbSession.deviceId,
+            // A chat opened from a device page defaults its org-scoped WRITES to
+            // the page's org (#6675); reads keep the caller's full scope.
+            writeDefaultOrgId: pageContextWriteDefaultOrgId(dbSession),
+          },
+          auth,
+          c,
+          topology ? topology.systemPrompt : systemPrompt,
+          budgetDispatch.maxBudgetUsd,
+          model,
+          // Topology: the SDK is handed ONLY the topology tools; the pre-tool
+          // gate re-checks the allowlist, read budget and live scope.
+          topology ? topology.allowedMcpTools : undefined,
+          topology && topologyTurn ? topologyTurn.topologyMcpServerFactory : undefined,
+          topology
+            ? { budgetReservationId: budgetDispatch.reservationId, injectApprovalModeInstructions: false, ledgerUserId: auth.user.id, modelSwitch: transition.kind === 'switch_resume' }
+            // A-W04: only a full-registry chat turn may defer tools behind
+            // ToolSearch; the host/budget/operator policy decides the rest.
+            : { budgetReservationId: budgetDispatch.reservationId, toolSearch: true, ledgerUserId: auth.user.id, modelSwitch: transition.kind === 'switch_resume' },
+        );
       } catch (err) {
-        console.error('[AI] Failed to auto-set session title:', err);
+        return { kind: 'failed', error: err };
+      }
+
+      // The topology runtime is bound by the transition itself, and only when
+      // this request wins the slot (PR #7147 F1).
+      if (!streamingSessionManager.tryTransitionToProcessing(activeSession, budgetDispatch.reservationId, {
+        topologyInvestigation: topology?.runtime, turnBinding: binding, turnDisplay: turnDisplayFrom(model),
+        // #10428: the technician's own text, for a Wisp session's turn-end instruction capture.
+        ...(topology ? {} : { userMessage: sanitizedContent }),
+      })) {
+        return { kind: 'refused', response: c.json({ error: 'A message is already being processed for this session', code: 'turn_in_progress' }, 409) };
+      }
+
+      writeRouteAudit(c, {
+        orgId: dbSession.orgId,
+        action: 'ai.message.send',
+        resourceType: 'ai_session',
+        resourceId: sessionId,
+        details: { contentLength: body.content.length }
+      });
+
+      try {
+        const [userRow] = await db.insert(aiMessages).values({
+          sessionId,
+          role: 'user',
+          content: sanitizedContent,
+        }).returning({ id: aiMessages.id });
+        // #9427: the anchor an attaching client splices this turn's replay
+        // after. Set before the turn is pushed.
+        activeSession.turnUserMessageId = userRow?.id ?? null;
+        if (!userRow) {
+          console.warn('[AI] User message insert returned no row; attaching clients get no turn anchor', { sessionId });
+        }
+      } catch (err) {
+        console.error('[AI] Failed to save user message to DB:', err);
+        activeSession.state = 'idle';
+        activeSession.topologyInvestigation = undefined;
+        return { kind: 'refused', response: c.json({ error: 'Failed to save message' }, 500) };
+      }
+
+      // Auto-generate title from first user message
+      if (!dbSession.title) {
+        const title = topology ? TOPOLOGY_SESSION_TITLE : generateSessionTitle(sanitizedContent);
+        try {
+          await persistAutoSessionTitle(sessionId, title);
+          activeSession.eventBus.publish({ type: 'title_updated', title });
+        } catch (err) {
+          captureException(err, c);
+          console.error('[AI] Failed to auto-set session title:', err);
+        }
+      }
+
+      // Execution plane (spec §5.5): an `analysis` run associated with this
+      // session may have finished between turns (chat-initiated launch is
+      // currently disabled, #6086, but a preconfigured agent's run can still
+      // report back to a session this way). Its summary is prepended HERE
+      // rather than pushed when it arrived — pushing then would start a turn
+      // with no SSE subscriber, so the assistant's reply would never reach the
+      // browser.
+      const pendingRunResults = drainPendingRunResults(activeSession);
+      // W05 (#7603): a continuation's FIRST turn carries the summary (read
+      // above) as delimited, sanitised, untrusted background — never the
+      // system prompt. The persisted user row above keeps the plain text, so
+      // the prefix reaches only the model.
+      const baseTurn = topology
+        ? topology.prompt
+        : continuationSummary ? withContinuationContext(continuationSummary, sanitizedContent) : sanitizedContent;
+      // W04 (#10995) / #10426: after any analysis results (outermost), the
+      // standing state, then fired check-ins; the user's own text stays last.
+      const turnContent = [standingState?.block, checkInBlock, baseTurn].filter(Boolean).join('\n\n');
+      // Subscribe BEFORE the turn is pushed: the session event bus has no
+      // replay, and a fast transport can publish the turn's events (even its
+      // error and done) before the SSE callback below would run.
+      const events = activeSession.eventBus.subscribe(subscriptionId);
+      subscribedSession = activeSession;
+      activeSession.inputController.pushMessage(
+        pendingRunResults && !topology ? `${pendingRunResults}\n\n${turnContent}` : turnContent,
+      );
+      streamingSessionManager.startTurnTimeout(activeSession);
+      return { kind: 'dispatched', activeSession, events };
+    }).catch((err: unknown) => {
+      // The dispatch context failed after subscribing (e.g. its commit): drop
+      // the subscription so the bus doesn't keep a dead queue.
+      subscribedSession?.eventBus.unsubscribe(subscriptionId);
+      throw err;
+    }));
+    if (dispatch.kind !== 'dispatched') {
+      // Released only after the dispatch context has closed, so the release's
+      // own system transaction never runs beside a held request connection.
+      await abortTopology();
+      await releaseUnusedTurn(dbSession.orgId, budgetDispatch);
+      // Wisp W04: getOrCreate refuses a grant-pinned session it cannot gate
+      // (services/wisp/chatCeiling.ts WispSessionUnavailableError) — a typed
+      // 409, never a 500 and never an ungated turn. Matched on `code` so this
+      // route does not load the Wisp graph.
+      if (dispatch.kind === 'failed' && (dispatch.error as { code?: unknown } | null)?.code === 'wisp_session_unavailable') {
+        return c.json({ error: (dispatch.error as Error).message, code: 'wisp_session_unavailable' }, 409);
+      }
+      if (dispatch.kind === 'failed') throw dispatch.error;
+      return dispatch.response;
+    }
+    const { activeSession, events } = dispatch;
+
+    // W04 (#10995): the turn carrying the check-ins is dispatched, so they are
+    // consumed now (fired → consumed; a row cancelled meanwhile stays
+    // cancelled). A failure only means they are prepended again next turn.
+    if (wispGrantId && firedCheckIns.length > 0) {
+      const ids = firedCheckIns.map((row) => row.id);
+      try {
+        const consumed = await inRequestDb(() => markCheckInsConsumed({ grantId: wispGrantId, ids }));
+        if (consumed === 0) {
+          // Every row was cancelled since the read — or the UPDATE matched
+          // nothing under RLS, which would re-prepend them every turn.
+          console.warn('[AI] no Wisp check-in was marked consumed', { orgId: dbSession.orgId, sessionId, grantId: wispGrantId, ids });
+        }
+      } catch (err) {
+        console.warn('[AI] failed to mark Wisp check-ins consumed; they will be prepended again next turn', {
+          orgId: dbSession.orgId, sessionId, grantId: wispGrantId, ids, error: err instanceof Error ? err.message : String(err),
+        });
+        captureException(err, c, { wisp_check_in_phase: 'consume' }, { fingerprint: ['wisp-check-in-turn', 'consume'] });
+      }
+    }
+    // #10426: the model has this standing state now; an unchanged one is not
+    // re-sent. A failure only re-sends it next turn: logged, never thrown.
+    if (standingState && markStandingStateSent) {
+      try {
+        await markStandingStateSent(sessionId, standingState.hash);
+      } catch (err) {
+        // The turn is already dispatched: never fail its response over this.
+        console.warn('[AI] failed to record the Wisp standing state as sent; it is sent again next turn', {
+          orgId: dbSession.orgId, sessionId, error: err instanceof Error ? err.message : String(err),
+        });
       }
     }
 
-    // Execution plane (spec §5.5): an `analysis` run associated with this
-    // session may have finished between turns (chat-initiated launch is
-    // currently disabled, #6086, but a preconfigured agent's run can still
-    // report back to a session this way). Its summary is prepended HERE
-    // rather than pushed when it arrived — pushing then would start a turn
-    // with no SSE subscriber, so the assistant's reply would never reach the
-    // browser.
-    const pendingRunResults = drainPendingRunResults(activeSession);
-    activeSession.inputController.pushMessage(
-      pendingRunResults ? `${pendingRunResults}\n\n${sanitizedContent}` : sanitizedContent,
-    );
-    streamingSessionManager.startTurnTimeout(activeSession);
-
-    const subscriptionId = crypto.randomUUID();
-
-    return streamSSE(c, async (stream) => {
-      const events = activeSession.eventBus.subscribe(subscriptionId);
+    // The stream outlives the timed request: detach it from the timer.
+    return exitPreStreamTiming(() => streamSSE(c, async (stream) => {
+      // #9427: a client that goes away stops listening at once; the turn is
+      // NOT interrupted (another surface may be attached to it).
+      stream.onAbort(() => {
+        activeSession.eventBus.unsubscribe(subscriptionId);
+      });
 
       try {
         for await (const event of events) {
@@ -937,8 +1286,10 @@ aiRoutes.post(
           if (event.type === 'done') break;
         }
       } catch (err) {
-        // Never stream a raw error to the browser (#2603). See the OpenAI
-        // branch above for why this uses the stream sanitizer.
+        // Never stream a raw error to the browser (#2603). Uses the stream
+        // sanitizer (not the tool one) so user-actionable conditions — rate
+        // limit, budget, approval timeout — survive, while driver text does
+        // not. sanitizeErrorForClient is detector-gated.
         console.error('[AI] Stream error:', err);
         const message = sanitizeErrorForClient(err);
         await stream.writeSSE({
@@ -951,8 +1302,8 @@ aiRoutes.post(
       } finally {
         activeSession.eventBus.unsubscribe(subscriptionId);
       }
-    });
-  }
+    }));
+  })
 );
 
 // ============================================
@@ -976,11 +1327,7 @@ aiRoutes.post(
 
     let result: { interrupted: boolean; reason?: string };
     try {
-      const manager =
-        isOpenAICompatibleProvider()
-          ? getOpenAISessionManager()
-          : streamingSessionManager;
-      result = await manager.interrupt(sessionId);
+      result = await streamingSessionManager.interrupt(sessionId);
     } catch (err) {
       console.error('[AI] Interrupt failed:', err);
       return c.json({ error: 'Failed to interrupt session' }, 500);
@@ -1042,6 +1389,17 @@ aiRoutes.post(
           message: 'This action needs approval in the Approvals area or the Breeze mobile app.',
         });
       }
+      // #9431: a stale card (decided in another window, in Approvals, on
+      // mobile, or timed out). handleApproval's CAS already refused a second
+      // decision; say so, with the outcome, so the card can show it.
+      const decided = await getDecidedExecutionOutcome(executionId, sessionId);
+      if (decided) {
+        return c.json({
+          error: 'This request was already decided.',
+          code: 'approval_already_decided',
+          outcome: decided,
+        }, 409);
+      }
       return c.json({ error: 'Execution not found or already processed' }, 404);
     }
 
@@ -1075,16 +1433,6 @@ aiRoutes.post(
     const session = await getSession(sessionId, auth);
     if (!session) {
       return c.json({ error: 'Session not found' }, 404);
-    }
-
-    if (isOpenAICompatibleProvider()) {
-      return c.json(
-        {
-          error: 'This operation is not supported when using the OpenAI-compatible provider.',
-          code: 'NOT_SUPPORTED_ON_PROVIDER',
-        },
-        501,
-      );
     }
 
     const activeSession = streamingSessionManager.get(sessionId);
@@ -1134,16 +1482,6 @@ aiRoutes.post(
       return c.json({ error: 'Session not found' }, 404);
     }
 
-    if (isOpenAICompatibleProvider()) {
-      return c.json(
-        {
-          error: 'This operation is not supported when using the OpenAI-compatible provider.',
-          code: 'NOT_SUPPORTED_ON_PROVIDER',
-        },
-        501,
-      );
-    }
-
     const activeSession = streamingSessionManager.get(sessionId);
     if (!activeSession) {
       return c.json({ error: 'Session not active in memory' }, 404);
@@ -1153,29 +1491,57 @@ aiRoutes.post(
       return c.json({ error: 'No pending plan approval' }, 400);
     }
 
-    // Resolve the in-memory promise
-    activeSession.planApprovalResolver(approved);
-    activeSession.planApprovalResolver = null;
+    if (planDecisionsInFlight.has(activeSession)) {
+      return c.json({ error: 'A decision on this plan is already being saved' }, 409);
+    }
 
-    // Update DB plan record
-    if (activeSession.activePlanId || !approved) {
-      try {
-        const planId = activeSession.activePlanId;
-        if (planId) {
-          await db.update(aiActionPlans)
+    // Persist the decision BEFORE releasing the agent (#7077). If the write
+    // fails, the approval stays pending so the user can retry, and the agent
+    // never acts on (or abandons) a plan whose recorded status disagrees.
+    const resolvePlanApproval = activeSession.planApprovalResolver;
+    const planId = activeSession.activePlanId;
+    planDecisionsInFlight.add(activeSession);
+    try {
+      if (planId) {
+        try {
+          // Only a still-pending plan takes a decision: an abort that landed
+          // first must not be overwritten with approved/rejected.
+          const updated = await db.update(aiActionPlans)
             .set({
               status: approved ? 'approved' : 'rejected',
               approvedBy: auth.user.id,
               approvedAt: new Date(),
             })
-            .where(eq(aiActionPlans.id, planId));
+            .where(and(eq(aiActionPlans.id, planId), eq(aiActionPlans.status, 'pending')))
+            .returning({ id: aiActionPlans.id });
+          if (updated.length === 0) {
+            return c.json({ error: 'The plan approval is no longer pending' }, 409);
+          }
+        } catch (err) {
+          console.error('[AI] Failed to update plan status:', err);
+          captureException(err);
+          return c.json(
+            { error: 'The plan decision could not be saved. Please try again.' },
+            500,
+          );
         }
-      } catch (err) {
-        console.error('[AI] Failed to update plan status:', err);
-        captureException(err);
-        return c.json({ success: true, approved, warning: 'Plan processed but database record could not be updated.' });
       }
+    } finally {
+      planDecisionsInFlight.delete(activeSession);
     }
+
+    // The approval can time out, or the plan be aborted, while the write
+    // above is in flight. Don't release the agent onto a plan that is gone.
+    if (
+      activeSession.planApprovalResolver !== resolvePlanApproval ||
+      activeSession.activePlanId !== planId
+    ) {
+      return c.json({ error: 'The plan approval is no longer pending' }, 409);
+    }
+
+    // Resolve the in-memory promise
+    resolvePlanApproval(approved);
+    activeSession.planApprovalResolver = null;
 
     writeRouteAudit(c, {
       orgId: session.orgId,
@@ -1205,16 +1571,6 @@ aiRoutes.post(
     const session = await getSession(sessionId, auth);
     if (!session) {
       return c.json({ error: 'Session not found' }, 404);
-    }
-
-    if (isOpenAICompatibleProvider()) {
-      return c.json(
-        {
-          error: 'This operation is not supported when using the OpenAI-compatible provider.',
-          code: 'NOT_SUPPORTED_ON_PROVIDER',
-        },
-        501,
-      );
     }
 
     const activeSession = streamingSessionManager.get(sessionId);
@@ -1254,20 +1610,11 @@ aiRoutes.get(
     const orgId = c.req.query('orgId') || auth.orgId;
 
     if (!orgId) {
-      // System/partner users without a specific org: no org to resolve an
-      // effective budget for, so budget stays null. #4388: alerts.fired must
-      // still be present (empty) so callers can read it unconditionally.
-      return c.json({
-        daily: { inputTokens: 0, outputTokens: 0, totalCostCents: 0, messageCount: 0 },
-        monthly: { inputTokens: 0, outputTokens: 0, totalCostCents: 0, messageCount: 0 },
-        budget: null,
-        billedTo: 'platform' as const,
-        // #4388 W04: present (null) on every /ai/usage response, same
-        // rationale as `alerts.fired` above: callers read `usage.credits`
-        // unconditionally.
-        credits: null,
-        alerts: { fired: [] },
-      });
+      // System/partner users on "All organizations" (#9667): aggregate usage
+      // over exactly the orgs this caller can access. No single org means no
+      // effective budget to resolve, so budget stays null. #4388: alerts.fired
+      // is present (empty) so callers can read it unconditionally.
+      return c.json(await getAggregateUsageSummary(auth.accessibleOrgIds));
     }
 
     if (orgId !== auth.orgId && !auth.canAccessOrg(orgId)) {
@@ -1300,6 +1647,8 @@ aiRoutes.put(
     messagesPerHourPerOrg: z.number().int().min(1).max(10000).optional(),
     approvalMode: z.enum(['per_step', 'action_plan', 'auto_approve', 'hybrid_plan']).optional(),
     alertThresholdPercents: z.array(z.number().int().min(1).max(99)).max(5).nullable().optional(),
+    // #6476 — raises every per-tool AI/MCP rate limit; 1–10, never lowers one.
+    toolRateLimitMultiplier: toolRateLimitMultiplierSchema.optional(),
   })),
   async (c) => {
     const auth = c.get('auth');
@@ -1344,6 +1693,34 @@ aiRoutes.put(
   }
 );
 
+// GET /tool-rate-limits - Effective per-tool AI/MCP rate limits (#6476).
+// The limits checkToolRateLimit enforces for this org: TOOL_RATE_LIMITS scaled
+// by the org's effective toolRateLimitMultiplier (partner value wins). With no
+// org (partner/system caller, no org selected) the partner's own value is used,
+// matching the MCP partner-scope fallback. Config, not usage — gated like
+// GET /usage. The AI Risk → Rate Limits tab reads this instead of a web copy.
+aiRoutes.get(
+  '/tool-rate-limits',
+  requireScope('organization', 'partner', 'system'),
+  requireAiUse,
+  async (c) => {
+    const auth = c.get('auth');
+    const orgId = c.req.query('orgId') || auth.orgId || null;
+
+    if (orgId && orgId !== auth.orgId && !auth.canAccessOrg(orgId)) {
+      return c.json({ error: 'Access denied to this organization' }, 403);
+    }
+
+    const multiplier = await resolveToolRateLimitMultiplier({
+      orgId,
+      partnerId: orgId ? null : auth.partnerId ?? null,
+    });
+    const limits = listEffectiveToolRateLimits(multiplier);
+
+    return c.json({ orgId, multiplier, limits });
+  }
+);
+
 // GET /admin/sessions - Get session history for admin dashboard.
 // SR5-09: enumerates other users' sessions (id, userId, title, cost, flags), so
 // it requires ai_sessions:read_all — a stricter gate than the ordinary AI reads.
@@ -1369,7 +1746,7 @@ aiRoutes.get(
     const offset = parseInt(c.req.query('offset') ?? '0', 10) || 0;
     const flagged = c.req.query('flagged') === 'true' ? true : undefined;
 
-    const sessions = await getSessionHistory(orgId, { limit, offset, flagged });
+    const sessions = await getSessionHistory(orgId, { limit, offset, flagged }, await resolveTopologySessionVisibility(auth));
     return c.json({ data: sessions });
   }
 );
@@ -1399,11 +1776,13 @@ aiRoutes.get(
       ? new Date(sinceParam)
       : new Date(Date.now() - 7 * 24 * 60 * 60 * 1000); // Default: last 7 days
 
-    const conditions = [
+    const conditions: SQL[] = [
       eq(auditLogs.orgId, orgId),
       gte(auditLogs.timestamp, since),
       drizzleSql`(${auditLogs.action} LIKE 'ai.security.%' OR ${auditLogs.action} LIKE 'ai.tool.%')`,
     ];
+    const siteCondition = topologyAuditSessionCondition(await resolveTopologySessionVisibility(auth));
+    if (siteCondition) conditions.push(siteCondition);
 
     if (actionFilter) {
       conditions.push(eq(auditLogs.action, actionFilter));
@@ -1427,7 +1806,15 @@ aiRoutes.get(
       .orderBy(desc(auditLogs.timestamp))
       .limit(limit);
 
-    return c.json({ data: events });
+    // #6577: rows written before the write-side sanitiser, and rows from
+    // direct createAuditLog writers, can hold raw tool input / credentials in
+    // details. Redact on read, as the #5570 history reads do.
+    return c.json({
+      data: events.map((event) => ({
+        ...event,
+        details: redactPersistedToolInput(event.details),
+      })),
+    });
   }
 );
 
@@ -1471,12 +1858,16 @@ aiRoutes.get(
       return c.json({ error: `Invalid 'until' date: ${untilParam}` }, 400);
     }
 
-    // Base conditions: org-scoped via session join + date range
-    const baseConditions = [
+    // Base conditions: org-scoped via session join + date range, plus the
+    // M4-D2 pinned-site filter — in SQL, so counts, per-tool stats, the time
+    // series and the LIMITed list all exclude an unreadable site's session.
+    const baseConditions: SQL[] = [
       eq(aiSessions.orgId, orgId),
       gte(aiToolExecutions.createdAt, since),
       lte(aiToolExecutions.createdAt, until),
     ];
+    const siteCondition = topologySessionCondition(await resolveTopologySessionVisibility(auth));
+    if (siteCondition) baseConditions.push(siteCondition);
     if (statusFilter) {
       baseConditions.push(drizzleSql`${aiToolExecutions.status} = ${statusFilter}`);
     }
@@ -1530,6 +1921,9 @@ aiRoutes.get(
         completed: drizzleSql<number>`COUNT(*) FILTER (WHERE ${aiToolExecutions.status} = 'completed')`,
         failed: drizzleSql<number>`COUNT(*) FILTER (WHERE ${aiToolExecutions.status} = 'failed')`,
         rejected: drizzleSql<number>`COUNT(*) FILTER (WHERE ${aiToolExecutions.status} = 'rejected')`,
+        // #10411: platform refusals (guardrail, RBAC, rate limit, validation)
+        // are their own series; `rejected` stays the approval outcome.
+        refused: drizzleSql<number>`COUNT(*) FILTER (WHERE ${aiToolExecutions.status} = 'refused')`,
       })
       .from(aiToolExecutions)
       .innerJoin(aiSessions, eq(aiToolExecutions.sessionId, aiSessions.id))
@@ -1579,6 +1973,7 @@ aiRoutes.get(
         completed: Number(row.completed),
         failed: Number(row.failed),
         rejected: Number(row.rejected),
+        refused: Number(row.refused),
       })),
       executions: executions.map((execution) => ({
         ...execution,

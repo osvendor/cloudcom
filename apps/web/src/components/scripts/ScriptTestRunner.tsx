@@ -9,7 +9,9 @@ import { asList } from '@/lib/asList';
 import { deviceScriptsHref } from '@/lib/deviceScriptsLink';
 import { RunContextSelect, RunContextChip, type RunContextChoice, type RunContextValue } from '../common/RunContext';
 import { fetchLiveSessions, type LiveSession } from '@/services/deviceActions';
-import { OutputSection } from './ExecutionDetails';
+import { usePermissions } from '@/lib/permissions';
+import { OutputSection, CustomFieldWriteSummarySection } from './ExecutionDetails';
+import type { ScriptCustomFieldWriteResult } from './ExecutionHistory';
 import type { OSType } from './ScriptList';
 import { runtimeParameters, type ScriptParameter } from './ScriptFormSchema';
 import type { ScriptAdmissionResult, ExecutionStatus } from '@breeze/shared';
@@ -49,6 +51,13 @@ type TestRunExecution = {
    */
   runAs?: RunContextValue | null;
   targetSessionId?: number | null;
+  /**
+   * #6537 — the #2698 custom-field write-back outcome. NULL for a run that
+   * emitted no marker. Shown here because the test runner is where a script
+   * author checks a marker, and a rejected write (every new field starts
+   * `script_write = false`) is otherwise invisible.
+   */
+  customFieldResult?: ScriptCustomFieldWriteResult | null;
 };
 
 type ScriptTestRunnerProps = {
@@ -287,9 +296,13 @@ export default function ScriptTestRunner({
   const pinnedDevice = compatibleDevices.find(d => d.id === selectedDeviceId);
   const showSessionTarget =
     runAs === 'user' && !!selectedDeviceId && pinnedDevice?.helperLifecycleMode === 'on-demand';
+  // Listing a device's live sessions needs devices.execute or remote.access on
+  // the API; without either the picker offers "any active session" alone.
+  const { can } = usePermissions();
+  const canListLiveSessions = can('devices', 'execute') || can('remote', 'access');
 
   useEffect(() => {
-    if (!showSessionTarget || !selectedDeviceId) {
+    if (!showSessionTarget || !selectedDeviceId || !canListLiveSessions) {
       setLiveSessions([]);
       return;
     }
@@ -306,7 +319,7 @@ export default function ScriptTestRunner({
       }
     })();
     return () => { cancelled = true; };
-  }, [showSessionTarget, selectedDeviceId]);
+  }, [showSessionTarget, selectedDeviceId, canListLiveSessions]);
 
   // A session id pinned against a device (or context) that no longer supports
   // one must not ride along on the next POST — the API refuses the pair.
@@ -500,7 +513,11 @@ export default function ScriptTestRunner({
           <Terminal className="h-4 w-4 text-muted-foreground" />
           {t('testRunner.title')}
         </span>
+        <label htmlFor="test-device-select" className="sr-only">
+          {t('testRunner.deviceSelectLabel')}
+        </label>
         <select
+          id="test-device-select"
           value={selectedDeviceId}
           onChange={event => handleDeviceSelect(event.target.value)}
           disabled={!scriptId || busy}
@@ -614,7 +631,13 @@ export default function ScriptTestRunner({
           {t('testRunner.requiredParams', { params: missingRequiredParams.join(', ') })}
         </p>
       )}
-      {scriptId && selectedDevice && selectedDevice.status !== 'online' && !busy && (
+      {/* sweep E5: this "will wait until it reconnects" notice must not
+          survive the wait — once a completed/failed/timed-out/cancelled
+          result is showing below, the device's now-stale online/offline
+          status (it can, and often does, go back offline right after the
+          run) is no longer relevant to what's on screen. */}
+      {scriptId && selectedDevice && selectedDevice.status !== 'online' && !busy &&
+        !(execution && TERMINAL_STATUSES.includes(execution.status)) && (
         <p className="flex items-center gap-1.5 border-t px-3 py-2 text-xs text-warning">
           <Clock className="h-3 w-3" />
           {t('testRunner.offlineWarning')}
@@ -657,6 +680,7 @@ export default function ScriptTestRunner({
               {t('testRunner.runAgain')}
             </button>
           </div>
+          <CustomFieldWriteSummarySection result={execution.customFieldResult} />
           <OutputSection
             title={t('executionDetails.output.stdout')}
             content={execution.stdout ?? undefined}

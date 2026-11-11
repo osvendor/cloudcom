@@ -1,8 +1,9 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { ChevronDown, ChevronUp, X, Filter, BookmarkIcon } from 'lucide-react';
 import type { FilterConditionGroup, SavedFilter } from '@breeze/shared';
-import { FilterBuilder, DEFAULT_FILTER_FIELDS } from './FilterBuilder';
+import { FilterBuilder } from './FilterBuilder';
 import { fetchWithAuth } from '../../stores/auth';
+import { useDeviceFilterFields } from './useDeviceFilterFields';
 import { useTranslation } from 'react-i18next';
 
 interface DeviceFilterBarProps {
@@ -46,6 +47,10 @@ export function DeviceFilterBar({
   const [savedFilters, setSavedFilters] = useState<SavedFilter[]>([]);
   const [savedFiltersLoading, setSavedFiltersLoading] = useState(false);
   const [selectedFilterId, setSelectedFilterId] = useState<string>('');
+
+  // #6594 — org/partner custom fields as selectable `custom.<key>` fields in
+  // this legacy builder's field picker, same as the default chip-bar UI.
+  const filterFields = useDeviceFilterFields();
 
   const conditionCount = value ? countConditions(value) : 0;
 
@@ -99,6 +104,7 @@ export function DeviceFilterBar({
 
         {showSavedFilters && (
           <select
+            aria-label={t('filters.saved.title')}
             value={selectedFilterId}
             onChange={(e) => handleSavedFilterSelect(e.target.value)}
             disabled={savedFiltersLoading}
@@ -157,7 +163,7 @@ export function DeviceFilterBar({
           <FilterBuilder
             value={value ?? EMPTY_FILTER}
             onChange={handleFilterChange}
-            filterFields={DEFAULT_FILTER_FIELDS}
+            filterFields={filterFields}
             showPreview={false}
           />
         </div>

@@ -4,12 +4,14 @@ import { and, desc, eq, inArray } from 'drizzle-orm';
 import type { Context } from 'hono';
 
 import { db } from '../../db';
-import { devices, deviceRecoveryKeys, recoveryKeyAccessEvents } from '../../db/schema';
-import { requirePermission, requireScope } from '../../middleware/auth';
+import { devices, deviceRecoveryKeys, recoveryKeyAccessEvents, users } from '../../db/schema';
+import { requireMfa, requirePermission, requireScope } from '../../middleware/auth';
 import type { AuthContext } from '../../middleware/auth';
 import { canAccessSite, getUserPermissions, type UserPermissions } from '../../services/permissions';
 import { decryptForColumn } from '../../services/secretCrypto';
 import { writeRouteAudit } from '../../services/auditEvents';
+import { rateLimiter } from '../../services/rate-limit';
+import { getRedis } from '../../services/redis';
 import { CommandTypes, queueCommand } from '../../services/commandQueue';
 import { encryptSensitivePayloadFields } from '../../services/sensitiveCommandPayload';
 import { deviceIdParamSchema, recoveryKeyRevealParamSchema, rotateRecoveryKeySchema } from './schemas';
@@ -89,10 +91,14 @@ recoveryKeysRoutes.get(
             id: recoveryKeyAccessEvents.id,
             keyId: recoveryKeyAccessEvents.keyId,
             userEmail: recoveryKeyAccessEvents.userEmail,
+            // Display name for the panel; null when the user row is gone or
+            // not visible, in which case the UI falls back to the email.
+            userName: users.name,
             action: recoveryKeyAccessEvents.action,
             createdAt: recoveryKeyAccessEvents.createdAt,
           })
           .from(recoveryKeyAccessEvents)
+          .leftJoin(users, eq(users.id, recoveryKeyAccessEvents.userId))
           .where(inArray(recoveryKeyAccessEvents.keyId, keyIds))
           .orderBy(desc(recoveryKeyAccessEvents.createdAt))
           .limit(25)
@@ -108,17 +114,63 @@ recoveryKeysRoutes.get(
   }
 );
 
+/**
+ * Per-user cap on recovery-key reveals. Generous enough for a technician
+ * working through a batch of locked machines, low enough that bulk reads of
+ * key material across a fleet are throttled. Keyed by user, not device, so
+ * the cap spans every device and org the user can reach.
+ */
+export const RECOVERY_KEY_REVEAL_LIMIT = 20;
+export const RECOVERY_KEY_REVEAL_WINDOW_SECONDS = 60 * 60;
+
 // Audited fetch-on-demand reveal: ledger row + route audit; plaintext returned once.
 recoveryKeysRoutes.post(
   '/encryption/devices/:deviceId/recovery-keys/:keyId/reveal',
   requireScope('organization', 'partner', 'system'),
   requirePermission('devices', 'read'),
+  // Plaintext disk-encryption key material — require a fresh MFA-satisfied
+  // session on top of the read permission, matching the step-up gate used
+  // elsewhere for secret-bearing operations (e.g. backup/vault.ts writes,
+  // enrollmentKeys.ts token issuance).
+  requireMfa(),
   zValidator('param', recoveryKeyRevealParamSchema),
   async (c) => {
     const auth = c.get('auth');
     const { deviceId, keyId } = c.req.valid('param');
     const { device, denied } = await loadAccessibleDevice(c, deviceId);
     if (!device) return denied;
+
+    // Checked before the key is read or decrypted. Fails closed: without
+    // Redis there is no cap, so no reveal.
+    const redis = getRedis();
+    if (!redis) {
+      console.error('[security] recovery key reveal rate limit unavailable: redis client missing');
+      return c.json({ error: 'Service temporarily unavailable' }, 503);
+    }
+    const rate = await rateLimiter(
+      redis,
+      `recovery-key-reveal:user:${auth.user.id}`,
+      RECOVERY_KEY_REVEAL_LIMIT,
+      RECOVERY_KEY_REVEAL_WINDOW_SECONDS,
+      1,
+      { refundOnReject: true },
+    );
+    if (!rate.allowed) {
+      writeRouteAudit(c, {
+        orgId: device.orgId,
+        action: 'device.recovery_key.reveal',
+        resourceType: 'device',
+        resourceId: deviceId,
+        result: 'denied',
+        details: { keyId, reason: 'rate_limited' },
+      });
+      const retryAfterSeconds = Math.max(1, Math.ceil((rate.resetAt.getTime() - Date.now()) / 1000));
+      c.header('Retry-After', String(retryAfterSeconds));
+      return c.json(
+        { error: 'Recovery key reveal limit reached. Try again later.', retryAfter: rate.resetAt.toISOString() },
+        429,
+      );
+    }
 
     const [key] = await db
       .select()
@@ -160,7 +212,8 @@ recoveryKeysRoutes.post(
   }
 );
 
-// Rotate: Windows needs nothing (defaults volumeMount C:); macOS needs a
+// Rotate: Windows takes a volumeMount (defaulted only when exactly one volume
+// is escrowed; otherwise required); macOS needs a
 // FileVault user's credentials or the current recovery key (encrypted into
 // the command payload; see sensitiveCommandPayload.ts).
 recoveryKeysRoutes.post(
@@ -178,8 +231,27 @@ recoveryKeysRoutes.post(
 
     const os = (device.osType ?? '').toLowerCase();
     let payload: Record<string, unknown>;
+    let rotatedVolume: string | null = null;
     if (os === 'windows') {
-      payload = { volumeMount: body.volumeMount ?? 'C:' };
+      rotatedVolume = body.volumeMount ?? null;
+      if (!rotatedVolume) {
+        // Only default when the choice is unambiguous: exactly one escrowed
+        // volume. Otherwise a silent C: default would rotate the wrong one.
+        const escrowed = await db
+          .select({ volumeMount: deviceRecoveryKeys.volumeMount })
+          .from(deviceRecoveryKeys)
+          .where(and(eq(deviceRecoveryKeys.deviceId, device.id), eq(deviceRecoveryKeys.status, 'active')));
+        const mounts = [...new Set(escrowed.map((r) => r.volumeMount).filter((m): m is string => !!m))];
+        if (mounts.length !== 1) {
+          return c.json({
+            error: mounts.length === 0
+              ? 'volumeMount is required: no escrowed volume was found for this device'
+              : `volumeMount is required: this device has several escrowed volumes (${mounts.join(', ')})`,
+          }, 400);
+        }
+        rotatedVolume = mounts[0]!;
+      }
+      payload = { volumeMount: rotatedVolume };
     } else if (os === 'macos' || os === 'darwin') {
       const hasCreds = (body.username && body.password) || body.currentRecoveryKey;
       if (!hasCreds) {
@@ -201,7 +273,7 @@ recoveryKeysRoutes.post(
       action: 'device.recovery_key.rotate',
       resourceType: 'device',
       resourceId: deviceId,
-      details: { os, volumeMount: os === 'windows' ? (body.volumeMount ?? 'C:') : null },
+      details: { os, volumeMount: os === 'windows' ? rotatedVolume : null },
     });
 
     return c.json({ data: { commandId: command.id, status: 'queued' } }, 202);

@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
+  CONNECTOR_SETTINGS_HREF,
+  NOT_LINKED_CONNECTOR_SYSTEMS,
+  SYSTEM_DISPLAY_NAMES,
   deriveReadinessChips,
   purgeCountdownDays,
   repairHref,
@@ -409,5 +412,17 @@ describe('hash', () => {
 
   it('treats a bare uuid as a row highlight (the incumbent’s selected-org deep link)', () => {
     expect(parseBoardHash('#AAAAAAAA-1111-4111-8111-111111111111')).toEqual({ highlightOrgId: 'aaaaaaaa-1111-4111-8111-111111111111' });
+  });
+});
+
+describe('CONNECTOR_SETTINGS_HREF', () => {
+  it('sends Xero to the Xero panel of the integrations page (D12)', () => {
+    expect(CONNECTOR_SETTINGS_HREF.xero).toBe('/integrations#xero');
+  });
+
+  it('sends EDR to the EDR providers panel and gives it a display name and a not-linked slot', () => {
+    expect(CONNECTOR_SETTINGS_HREF.edr).toBe('/integrations#edr');
+    expect(SYSTEM_DISPLAY_NAMES.edr).toBe('EDR');
+    expect(NOT_LINKED_CONNECTOR_SYSTEMS).toContain('edr');
   });
 });

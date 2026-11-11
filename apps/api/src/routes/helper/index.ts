@@ -10,8 +10,8 @@ import { Hono } from 'hono';
 import { zValidator } from '../../lib/validation';
 import { z } from 'zod';
 import { streamSSE } from 'hono/streaming';
-import { eq, and, desc, sql, asc } from 'drizzle-orm';
-import { db, withSystemDbAccessContext } from '../../db';
+import { eq, and, desc, sql, asc, isNull } from 'drizzle-orm';
+import { db, runOutsideDbContext, withDbAccessContext, withSystemDbAccessContext, withDbTransaction } from '../../db';
 import { aiSessions, aiMessages, devices } from '../../db/schema';
 import { streamingSessionManager } from '../../services/streamingSessionManager';
 import { buildHelperSystemPrompt } from '../../services/helperAiAgent';
@@ -19,25 +19,41 @@ import {
   clientToolsSchema,
   createClientDeclaredMcpServer,
   clientDeclaredToolMcpNames,
-  requestClientDeclaredTool,
+  dispatchClientDeclaredTool,
   resolveClientDeclaredTool,
   peekClientDeclaredToolName,
   failPendingClientDeclaredForSession,
   CLIENT_DECLARED_MCP_SERVER_NAME,
   type ClientToolDeclaration,
 } from '../../services/clientSessionTools';
-import { getHelperAllowedMcpToolNames, type HelperPermissionLevel } from '../../services/helperToolFilter';
+import { getHelperAllowedMcpToolNames, getHelperAllowedTools, type HelperPermissionLevel } from '../../services/helperToolFilter';
+import { createBreezeMcpServer } from '../../services/aiAgentSdkTools';
 import { resolveHelperPermissionLevelForDevice } from '../../services/helperPermissions';
 import { sanitizeUserMessage } from '../../services/aiInputSanitizer';
-import { storeScreenshot } from '../../services/screenshotStorage';
-import { checkBudget } from '../../services/aiCostTracker';
+import { storeScreenshot, ScreenshotQuotaExceededError, ScreenshotTooLargeError } from '../../services/screenshotStorage';
+import { envInt } from '../../utils/envInt';
+import { checkBudgetDetailed, checkSystemAiRateLimit } from '../../services/aiCostTracker';
+import { aiDenialClientCode, type AiDenialClientCode } from '../../services/aiDenialCode';
 import { getEffectiveAiBudget } from '../../services/effectiveSettings';
 import { getRedis, rateLimiter } from '../../services';
 import { createSessionPreToolUse, createSessionPostToolUse, settleBlockedTurnForNewMessage } from '../../services/aiAgentSdk';
-import { helperAuth, type HelperDevice } from '../../middleware/helperAuth';
+import { helperAuth, helperDbAccessContext, type HelperDevice } from '../../middleware/helperAuth';
 import type { ActiveSession } from '../../services/streamingSessionManager';
-import { LlmUnavailableError, resolveLlmConfig, type UsableLlmConfig } from '../../services/llm/llmConfigResolver';
+import { LlmUnavailableError } from '../../services/llm/llmConfigResolver';
+import { LlmNotConfiguredError } from '../../services/llm/llmAvailability';
+import type { ResolveFailureReason } from '../../services/aiModels/eligibility';
+import type { ResolvedModel } from '../../services/aiModels/resolveModel';
+import { chooseSessionModel, resolveSessionTurn, type SessionModelChoice } from '../../services/aiModels/sessionModel';
+import { turnBindingFrom } from '../../services/aiModels/turnBinding';
 import { captureException } from '../../services/sentry';
+import { persistAutoSessionTitle } from '../../services/aiSessionTitle';
+import { callerVerificationEnabled } from '../../config/env';
+import {
+  callerHelperBranding,
+  callerHelperLogo,
+  type CallerHelperBranding,
+  type CallerHelperLogo,
+} from '../../services/callerVerification/helperBranding';
 import {
   isAiBudgetLockTimeout,
   releaseUnusedAiBudgetReservation,
@@ -48,6 +64,13 @@ const SESSION_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const HELPER_RATE_LIMIT = 30;
 const HELPER_RATE_WINDOW_SECONDS = 60;
 const DEFAULT_PERMISSION_LEVEL: HelperPermissionLevel = 'basic';
+// `/api/v1/helper/` is skipped by the global rate limiter (helper tokens have
+// their own auth path), so screenshot upload needs its own per-device budget:
+// without one, one device can post requests fast enough to exhaust the shared
+// screenshot storage before the per-device byte/count quota below ever gets a
+// chance to reject it.
+const HELPER_SCREENSHOT_RATE_LIMIT = envInt('HELPER_SCREENSHOT_RATE_LIMIT', 12);
+const HELPER_SCREENSHOT_RATE_WINDOW_SECONDS = envInt('HELPER_SCREENSHOT_RATE_WINDOW_SECONDS', 60);
 
 export const helperRoutes = new Hono();
 
@@ -66,20 +89,62 @@ function clientToolsFromSession(session: typeof aiSessions.$inferSelect): Client
   return Array.isArray(raw) ? (raw as ClientToolDeclaration[]) : [];
 }
 
+/**
+ * Ownership predicate every helper session route must apply in addition to
+ * `deviceId = <this device>`: `ai_sessions` is org-axis scoped only, so a
+ * device-id match alone still reaches a technician's device-bound session (or
+ * an agent run) for the SAME device — those have a `userId`/`agentId` set and
+ * never carry `contextSnapshot.source = 'helper'`. Sessions this route itself
+ * creates always set `userId: null` and `contextSnapshot.source: 'helper'`
+ * (see the POST /chat/sessions handler below), so this predicate limits every
+ * helper-token read/write to sessions the helper itself created. Portal-client
+ * and AI-agent sessions keep `userId` null (single-principal check), so their
+ * principal columns are excluded explicitly rather than trusting the stamp.
+ */
+function helperOwnedSessionConditions() {
+  return [
+    isNull(aiSessions.userId),
+    isNull(aiSessions.clientUserId),
+    isNull(aiSessions.agentId),
+    sql`${aiSessions.contextSnapshot}->>'source' = 'helper'`,
+  ];
+}
+
+
+/**
+ * A-W04 (#6151): the device-scoped Breeze server for a session without client
+ * tools. Only the permission level's tools are REGISTERED (not merely
+ * allow-listed), so the other ~190 definitions never ride along on the
+ * model's input. No tenant tools: none are in Helper's allowlist. Helper
+ * recreates its SDK session every turn, so a level change applies on the next
+ * message.
+ */
+function helperMcpServerFactory(level: HelperPermissionLevel) {
+  const onlyTools = new Set(getHelperAllowedTools(level));
+  return (
+    getAuth: Parameters<typeof createBreezeMcpServer>[0],
+    onPreToolUse: Parameters<typeof createBreezeMcpServer>[1],
+    onPostToolUse: Parameters<typeof createBreezeMcpServer>[2],
+    getSession: Parameters<typeof createBreezeMcpServer>[3],
+  ) => ({
+    server: createBreezeMcpServer(getAuth, onPreToolUse, onPostToolUse, getSession, [], { onlyTools }),
+    name: 'breeze',
+  });
+}
+
 async function runHelperPreFlight(
   sessionId: string,
   content: string,
   device: HelperDevice,
-  partnerId: string | null,
 ): Promise<
-  | { ok: true; session: typeof aiSessions.$inferSelect; sanitizedContent: string; systemPrompt: string; maxBudgetUsd: number | undefined; allowedTools: string[]; clientTools: ClientToolDeclaration[]; resolved: UsableLlmConfig }
-  | { ok: false; error: string; status: number }
+  | { ok: true; session: typeof aiSessions.$inferSelect; sanitizedContent: string; systemPrompt: string; maxBudgetUsd: number | undefined; allowedTools: string[]; permissionLevel: HelperPermissionLevel; clientTools: ClientToolDeclaration[]; model: ResolvedModel }
+  | { ok: false; error: string; status: number; code?: ResolveFailureReason; billingCode?: AiDenialClientCode }
 > {
   // Fetch session
   const [session] = await db
     .select()
     .from(aiSessions)
-    .where(and(eq(aiSessions.id, sessionId), eq(aiSessions.deviceId, device.id)))
+    .where(and(eq(aiSessions.id, sessionId), eq(aiSessions.deviceId, device.id), ...helperOwnedSessionConditions()))
     .limit(1);
 
   if (!session) {
@@ -104,15 +169,19 @@ async function runHelperPreFlight(
     return { ok: false, error: `Session turn limit reached (${session.maxTurns})`, status: 400 };
   }
 
-  let resolved;
+  // W03 Task 7: the helper surface's turn, re-resolved from the session's
+  // stored offering (device-initiated: no Breeze user, no permission gate).
+  // Funding comes from the resolved offering, before any admission check.
+  let model: ResolvedModel;
   try {
-    resolved = await resolveLlmConfig(partnerId);
+    const turn = await resolveSessionTurn({ sessionId, surface: 'helper', userId: null });
+    if (!turn.ok) {
+      return { ok: false, error: turn.message, status: turn.reason === 'registry_unavailable' ? 503 : 409, code: turn.reason };
+    }
+    model = turn;
   } catch (error) {
     captureException(error, undefined, { service: 'helperRoutes', orgId: device.orgId });
     return { ok: false, error: 'AI configuration could not be loaded. Try again.', status: 503 };
-  }
-  if (resolved.source === 'unavailable') {
-    return { ok: false, error: 'ai_unavailable', status: 503 };
   }
 
   // Rate limit per device
@@ -125,13 +194,27 @@ async function runHelperPreFlight(
     }
   }
 
+  // Org-axis AI rate limiter — the same ceiling technician chat enforces via
+  // checkAiRateLimit (services/aiCostTracker.ts). Helper sessions are
+  // device-scoped with no acting user id, so this uses the org-only variant
+  // (checkSystemAiRateLimit) rather than the per-user+per-org pair; the
+  // per-device 30/min limiter above bounds a single runaway device, this
+  // bounds the whole org regardless of how many devices are spraying turns.
+  try {
+    const orgRateError = await checkSystemAiRateLimit(device.orgId);
+    if (orgRateError) return { ok: false, error: orgRateError, status: 429 };
+  } catch (err) {
+    console.error('[Helper] Org rate limit check failed:', err);
+    return { ok: false, error: 'Unable to verify rate limit.', status: 500 };
+  }
+
   // Budget check
   try {
-    const budgetError = await checkBudget(
-      device.orgId,
-      resolved.source === 'partner' ? 'partner_key' : 'platform',
-    );
-    if (budgetError) return { ok: false, error: budgetError, status: 402 };
+    const denial = await checkBudgetDetailed(device.orgId, model.funding);
+    if (denial) {
+      const billingCode = aiDenialClientCode(denial.reason);
+      return { ok: false, error: denial.message, status: 402, ...(billingCode ? { billingCode } : {}) };
+    }
   } catch (err) {
     console.error('[Helper] Budget check failed:', err);
     return { ok: false, error: 'Unable to verify budget.', status: 500 };
@@ -166,7 +249,7 @@ async function runHelperPreFlight(
     ? clientDeclaredToolMcpNames(clientTools)
     : getHelperAllowedMcpToolNames(permissionLevel);
 
-  return { ok: true, session, sanitizedContent, systemPrompt, maxBudgetUsd: undefined, allowedTools, clientTools, resolved };
+  return { ok: true, session, sanitizedContent, systemPrompt, maxBudgetUsd: undefined, allowedTools, permissionLevel, clientTools, model };
 }
 
 // ============================================
@@ -195,15 +278,20 @@ helperRoutes.post(
     const device = c.get('helperDevice');
     const auth = c.get('auth');
     const body = c.req.valid('json') ?? {};
-    let resolved;
+    // W03 (#7601): the session is created on the registry's `helper`
+    // offering for the DEVICE's partner (never a body field). No user: the
+    // helper is device-initiated, so no permission gate applies.
+    const partnerId = auth.helperDevicePartnerId;
+    if (!partnerId) return c.json({ error: 'ai_unavailable' }, 503);
+    let choice: SessionModelChoice;
     try {
-      resolved = await resolveLlmConfig(auth.helperDevicePartnerId ?? null);
+      choice = await chooseSessionModel({ partnerId, orgId: device.orgId, userId: null, surface: 'helper' });
     } catch (error) {
+      if (error instanceof LlmUnavailableError || error instanceof LlmNotConfiguredError) {
+        return c.json({ error: 'ai_unavailable' }, 503);
+      }
       captureException(error, c, { service: 'helperRoutes', orgId: device.orgId });
       return c.json({ error: 'AI configuration could not be loaded. Try again.' }, 503);
-    }
-    if (resolved.source === 'unavailable') {
-      return c.json({ error: 'ai_unavailable' }, 503);
     }
     const permissionLevel: HelperPermissionLevel = await resolveHelperPermissionLevelForDevice(
       device.id,
@@ -238,7 +326,11 @@ helperRoutes.post(
         orgId: device.orgId,
         userId: null,
         deviceId: device.id,
-        model: resolved.model,
+        model: choice.model,
+        offeringId: choice.offeringId,
+        offeringPartnerId: choice.offeringPartnerId,
+        options: choice.options,
+        billingSource: choice.billingSource,
         systemPrompt,
         maxTurns: budget.maxTurnsPerSession,
         contextSnapshot: {
@@ -276,18 +368,32 @@ helperRoutes.post(
     const sessionId = c.req.param('id');
     const { content } = c.req.valid('json');
 
+    // #3127: this route is registered in selfManagedDbContextRoutes, so
+    // helperAuth holds no request transaction across the handler. Each DB phase
+    // re-enters the exact helper context in a short transaction of its own, and
+    // the settle wait and the budget reservation (which opens its own system
+    // transaction) run between them with no connection checked out.
+    const helperDbContext = helperDbAccessContext({
+      orgId: device.orgId,
+      partnerId: auth.helperDevicePartnerId,
+    });
+    const inRequestDb = <T>(fn: () => Promise<T>): Promise<T> =>
+      runOutsideDbContext(() => withDbAccessContext(helperDbContext, fn));
+
     // Pre-flight checks
-    const preflight = await runHelperPreFlight(
-      sessionId,
-      content,
-      device,
-      auth.helperDevicePartnerId ?? null,
-    );
+    const preflight = await inRequestDb(() => runHelperPreFlight(sessionId, content, device));
     if (!preflight.ok) {
+      if (preflight.code) {
+        return c.json({ error: preflight.error, code: preflight.code, recoverable: true }, preflight.status as 409);
+      }
+      if (preflight.billingCode) {
+        return c.json({ error: preflight.error, code: preflight.billingCode }, 402);
+      }
       return c.json({ error: preflight.error }, preflight.status as 400);
     }
 
-    const { session: dbSession, sanitizedContent, systemPrompt, allowedTools, clientTools, resolved } = preflight;
+    const { session: dbSession, sanitizedContent, systemPrompt, allowedTools, permissionLevel, clientTools, model } = preflight;
+    const binding = turnBindingFrom(model);
 
     // When the session declared client tools, build the generic client-declared
     // MCP server: each model tool call publishes `client_tool_request` and parks
@@ -300,17 +406,15 @@ helperRoutes.post(
           _onPostToolUse: unknown,
           getSession: () => ActiveSession,
         ) => ({
-          server: createClientDeclaredMcpServer(clientTools, (toolName, input) => {
-            const session = getSession();
-            const toolUseId = session.toolUseIdQueue.shift() ?? crypto.randomUUID();
-            return requestClientDeclaredTool(session, toolUseId, toolName, input);
-          }),
+          server: createClientDeclaredMcpServer(clientTools, (toolName, input, sdkToolUseId) =>
+            dispatchClientDeclaredTool(getSession(), toolName, input, sdkToolUseId)),
           name: CLIENT_DECLARED_MCP_SERVER_NAME,
         })
-      : undefined;
+      : helperMcpServerFactory(permissionLevel);
 
     const priorSession = streamingSessionManager.get(sessionId);
     if (priorSession?.state === 'processing') {
+      // #3127: runs with no DB context held (see inRequestDb above).
       const settle = await settleBlockedTurnForNewMessage(priorSession);
       if (settle !== 'concluded') {
         return c.json({
@@ -333,9 +437,10 @@ helperRoutes.post(
     try {
       reservation = await reserveAiBudget({
         orgId: dbSession.orgId,
-        billingSource: resolved.source === 'partner' ? 'partner_key' : 'platform',
+        billingSource: model.funding,
         sessionId,
         idempotencyKey: `helper-chat:${sessionId}:${crypto.randomUUID()}`,
+        binding,
       });
     } catch (err) {
       if (isAiBudgetLockTimeout(err)) return c.json({ error: 'AI_BUDGET_LOCK_TIMEOUT' }, 503);
@@ -347,85 +452,101 @@ helperRoutes.post(
       ? reservation.reservedCostCents / 100
       : undefined;
 
-    // Get or create streaming session.
-    //
-    // The `resolveLlmConfig` check earlier in this handler already 503s an
-    // unavailable partner config, but it cannot see this one: `getOrCreate`
-    // resolves the WIRE model inside the manager, so a catalog revision with no
-    // verified mapping for THIS session's model fails closed only here. Same
-    // catch shape as ai.ts — otherwise it reaches `app.onError` as a 500.
-    let activeSession;
-    try {
-      activeSession = await streamingSessionManager.getOrCreate(
-        sessionId,
-        {
-          orgId: dbSession.orgId,
-          sdkSessionId: dbSession.sdkSessionId,
-          model: dbSession.model,
-          maxTurns: dbSession.maxTurns,
-          turnCount: dbSession.turnCount,
-          systemPrompt: dbSession.systemPrompt,
-        },
-        auth,
-        c,
-        systemPrompt,
-        reservedMaxBudgetUsd,
-        resolved,
-        allowedTools,
-        mcpServerFactory as Parameters<typeof streamingSessionManager.getOrCreate>[8],
-        { budgetReservationId },
-      );
-    } catch (err) {
-      await releaseUnusedAiBudgetReservation({ orgId: dbSession.orgId, reservationId: budgetReservationId });
-      if (err instanceof LlmUnavailableError) return c.json({ error: 'ai_unavailable' }, 503);
-      throw err;
-    }
-
-    // Concurrent message guard. If the turn is blocked only on pending
-    // approval waits (PAM-gated helper tools), settle them so the assistant
-    // can conclude and answer this message (#3089 — shared helper, see ai.ts).
-    if (!streamingSessionManager.tryTransitionToProcessing(activeSession, budgetReservationId)) {
-      await releaseUnusedAiBudgetReservation({ orgId: dbSession.orgId, reservationId: budgetReservationId });
-      return c.json({ error: 'A message is already being processed for this session' }, 409);
-    }
-
-    // Save user message
-    try {
-      await db.insert(aiMessages).values({
-        sessionId,
-        role: 'user',
-        content: sanitizedContent,
-      });
-    } catch (err) {
-      console.error('[Helper] Failed to save user message:', err);
-      activeSession.state = 'idle';
-      await releaseUnusedAiBudgetReservation({ orgId: dbSession.orgId, reservationId: budgetReservationId });
-      return c.json({ error: 'Failed to save message' }, 500);
-    }
-
-    // Auto-generate title from first message
-    if (!dbSession.title) {
-      const title = generateSessionTitle(sanitizedContent);
-      try {
-        await db
-          .update(aiSessions)
-          .set({ title })
-          .where(eq(aiSessions.id, sessionId));
-        activeSession.eventBus.publish({ type: 'title_updated', title });
-      } catch (err) {
-        console.error('[Helper] Failed to auto-set session title:', err);
-      }
-    }
-
-    // Push message and start timeout
-    activeSession.inputController.pushMessage(sanitizedContent);
-    streamingSessionManager.startTurnTimeout(activeSession);
-
+    // Get or create streaming session. The model was resolved (and its wire
+    // id translated) in preflight; a LlmUnavailableError here is a
+    // last-resort guard with the same catch shape as ai.ts, never a 500.
     const subscriptionId = crypto.randomUUID();
+    let subscribedSession: ActiveSession | null = null;
+    const dispatch = await inRequestDb(async (): Promise<
+      | { kind: 'dispatched'; activeSession: ActiveSession; events: ReturnType<ActiveSession['eventBus']['subscribe']> }
+      | { kind: 'refused'; response: Response }
+      | { kind: 'failed'; error: unknown }
+    > => {
+      let activeSession: ActiveSession;
+      try {
+        activeSession = await streamingSessionManager.getOrCreate(
+          sessionId,
+          {
+            orgId: dbSession.orgId,
+            sdkSessionId: dbSession.sdkSessionId,
+            maxTurns: dbSession.maxTurns,
+            turnCount: dbSession.turnCount,
+            systemPrompt: dbSession.systemPrompt,
+          },
+          auth,
+          c,
+          systemPrompt,
+          reservedMaxBudgetUsd,
+          model,
+          allowedTools,
+          mcpServerFactory as Parameters<typeof streamingSessionManager.getOrCreate>[8],
+          // Device-initiated: the ledger attributes no Breeze user.
+          { budgetReservationId, ledgerUserId: null },
+        );
+      } catch (err) {
+        if (err instanceof LlmUnavailableError) {
+          return { kind: 'refused', response: c.json({ error: 'ai_unavailable' }, 503) };
+        }
+        return { kind: 'failed', error: err };
+      }
+
+      // Concurrent message guard. If the turn is blocked only on pending
+      // approval waits (PAM-gated helper tools), settle them so the assistant
+      // can conclude and answer this message (#3089 — shared helper, see ai.ts).
+      if (!streamingSessionManager.tryTransitionToProcessing(activeSession, budgetReservationId, { turnBinding: binding })) {
+        return { kind: 'refused', response: c.json({ error: 'A message is already being processed for this session' }, 409) };
+      }
+
+      // Save user message
+      try {
+        await db.insert(aiMessages).values({
+          sessionId,
+          role: 'user',
+          content: sanitizedContent,
+        });
+      } catch (err) {
+        console.error('[Helper] Failed to save user message:', err);
+        activeSession.state = 'idle';
+        return { kind: 'refused', response: c.json({ error: 'Failed to save message' }, 500) };
+      }
+
+      // Auto-generate title from first message
+      if (!dbSession.title) {
+        const title = generateSessionTitle(sanitizedContent);
+        try {
+          await persistAutoSessionTitle(sessionId, title);
+          activeSession.eventBus.publish({ type: 'title_updated', title });
+        } catch (err) {
+          captureException(err, c, { service: 'helperRoutes', orgId: dbSession.orgId });
+          console.error('[Helper] Failed to auto-set session title:', err);
+        }
+      }
+
+      // Push message and start timeout
+      // Subscribe BEFORE the turn is pushed: the session event bus has no
+      // replay, and a fast transport can publish the turn's events (even its
+      // error and done) before the SSE callback below would run (#7783).
+      const events = activeSession.eventBus.subscribe(subscriptionId);
+      subscribedSession = activeSession;
+      activeSession.inputController.pushMessage(sanitizedContent);
+      streamingSessionManager.startTurnTimeout(activeSession);
+      return { kind: 'dispatched', activeSession, events };
+    }).catch((err: unknown) => {
+      // The dispatch context failed after subscribing (e.g. its commit): drop
+      // the subscription so the bus doesn't keep a dead queue.
+      subscribedSession?.eventBus.unsubscribe(subscriptionId);
+      throw err;
+    });
+    if (dispatch.kind !== 'dispatched') {
+      // Released only after the dispatch context has closed, so the release's
+      // own system transaction never runs beside a held request connection.
+      await releaseUnusedAiBudgetReservation({ orgId: dbSession.orgId, reservationId: budgetReservationId });
+      if (dispatch.kind === 'failed') throw dispatch.error;
+      return dispatch.response;
+    }
+    const { activeSession, events } = dispatch;
 
     return streamSSE(c, async (stream) => {
-      const events = activeSession.eventBus.subscribe(subscriptionId);
-
       try {
         for await (const event of events) {
           await stream.writeSSE({
@@ -472,7 +593,7 @@ helperRoutes.post(
     const [session] = await db
       .select({ id: aiSessions.id })
       .from(aiSessions)
-      .where(and(eq(aiSessions.id, sessionId), eq(aiSessions.deviceId, device.id)))
+      .where(and(eq(aiSessions.id, sessionId), eq(aiSessions.deviceId, device.id), ...helperOwnedSessionConditions()))
       .limit(1);
 
     if (!session) {
@@ -498,13 +619,14 @@ helperRoutes.post(
     // place a client tool's output is recorded. Generic: output = whatever the
     // client posted (its output, or an { error } payload).
     try {
-      await db.insert(aiMessages).values({
+      // Savepoint so a failed insert rolls back and the request transaction survives (#11203).
+      await withDbTransaction(async () => db.insert(aiMessages).values({
         sessionId,
         role: 'tool_result',
         toolName: toolName ?? null,
         toolOutput: error !== undefined ? { error } : (output ?? null),
         toolUseId,
-      });
+      }));
     } catch (err) {
       console.error('[Helper] Failed to persist tool_result message:', err);
     }
@@ -555,13 +677,71 @@ helperRoutes.get('/device-info', async (c) => {
 
 helperRoutes.get('/config', async (c) => {
   const device = c.get('helperDevice');
-  const permissionLevel = await resolveHelperPermissionLevelForDevice(device.id, DEFAULT_PERMISSION_LEVEL);
+  const partnerId = c.get('auth').helperDevicePartnerId;
+
+  // #10190 W04: this route is registered in selfManagedDbContextRoutes, so
+  // helperAuth holds no request transaction across the handler. The reads run
+  // in one short transaction under the device's own helper context; the logo
+  // reference is resolved after it, with no connection held (it opens its own
+  // short system read on a cache miss, as the heartbeat does).
+  const { permissionLevel, baseBranding } = await runOutsideDbContext(() =>
+    withDbAccessContext(helperDbAccessContext({ orgId: device.orgId, partnerId }), async () => {
+      const level = await resolveHelperPermissionLevelForDevice(device.id, DEFAULT_PERMISSION_LEVEL);
+      // Caller verification (#6354 W02): partner branding for the Assist card,
+      // derived from the authenticated device's org (never a client value).
+      // Null while the feature is dark or on any failure — branding must never
+      // delay or break the card, and must never fail this config response.
+      let base: Omit<CallerHelperBranding, 'logo'> | null = null;
+      if (callerVerificationEnabled()) {
+        try {
+          base = await callerHelperBranding(device.orgId);
+        } catch (err) {
+          // Logged and reported, never swallowed: a DB failure here blanks the
+          // card's branding for the whole org until it clears.
+          // This catch sits INSIDE the transaction: if the failed statement
+          // aborted it, any statement after this point in the callback would
+          // fail too. Keep the catch last; add no statement after it.
+          console.warn('[helper] caller verification branding unavailable', {
+            deviceId: device.id,
+            orgId: device.orgId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          captureException(err, c, { service: 'helperRoutes', orgId: device.orgId });
+        }
+      }
+      return { permissionLevel: level, baseBranding: base };
+    }),
+  );
+
+  // The caller-verify logo (#10190 W04, decision 1): the sha the heartbeat's
+  // promptIdentity block carries for this device, so Assist can draw the
+  // bytes the agent synced. Every id is the helper-authenticated device's
+  // (device → org → partner). Null on a cold https cache, an invalid logo or
+  // any failure; never delays or fails this response.
+  let branding: CallerHelperBranding | null = null;
+  if (baseBranding) {
+    let logo: CallerHelperLogo | null = null;
+    try {
+      logo = await callerHelperLogo({ deviceId: device.id, orgId: device.orgId, partnerId });
+    } catch (err) {
+      console.warn('[helper] caller verification logo unavailable', {
+        deviceId: device.id,
+        orgId: device.orgId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      captureException(err, c, { service: 'helperRoutes', orgId: device.orgId });
+    }
+    branding = { ...baseBranding, logo };
+  }
 
   return c.json({
-    enabled: true,
+    // Resolved by helperAuth (services/helperSettings — same resolver as the
+    // agent heartbeat); helperAuth refuses a disabled device before this runs.
+    enabled: c.get('helperEnabled') === true,
     permissionLevel,
     allowScreenCapture: true,
     sessionRetentionHours: 24,
+    branding,
   });
 });
 
@@ -582,24 +762,61 @@ helperRoutes.post(
     const device = c.get('helperDevice');
     const { imageBase64, width, height, sessionId, reason } = c.req.valid('json');
 
-    const stored = await storeScreenshot({
-      deviceId: device.id,
-      orgId: device.orgId,
-      sessionId,
-      imageBase64,
-      width,
-      height,
-      capturedBy: 'helper',
-      reason,
-      retentionHours: 24,
-    });
+    const redis = getRedis();
+    if (redis) {
+      const rateKey = `helper_screenshot_rate:${device.id}`;
+      const rateCheck = await rateLimiter(
+        redis,
+        rateKey,
+        HELPER_SCREENSHOT_RATE_LIMIT,
+        HELPER_SCREENSHOT_RATE_WINDOW_SECONDS,
+      );
+      if (!rateCheck.allowed) {
+        return c.json({ error: 'Rate limit exceeded. Please wait before uploading another screenshot.' }, 429);
+      }
+    }
 
-    return c.json({
-      id: stored.id,
-      storageKey: stored.storageKey,
-      sizeBytes: stored.sizeBytes,
-      expiresAt: stored.expiresAt,
-    });
+    // An attached sessionId must be one the helper created; otherwise a local
+    // user could plant images on a technician's device-bound session.
+    if (sessionId) {
+      const [session] = await db
+        .select({ id: aiSessions.id })
+        .from(aiSessions)
+        .where(and(eq(aiSessions.id, sessionId), eq(aiSessions.deviceId, device.id), ...helperOwnedSessionConditions()))
+        .limit(1);
+      if (!session) {
+        return c.json({ error: 'Session not found' }, 404);
+      }
+    }
+
+    try {
+      const stored = await storeScreenshot({
+        deviceId: device.id,
+        orgId: device.orgId,
+        sessionId,
+        imageBase64,
+        width,
+        height,
+        capturedBy: 'helper',
+        reason,
+        retentionHours: 24,
+      });
+
+      return c.json({
+        id: stored.id,
+        storageKey: stored.storageKey,
+        sizeBytes: stored.sizeBytes,
+        expiresAt: stored.expiresAt,
+      });
+    } catch (err) {
+      if (err instanceof ScreenshotTooLargeError) {
+        return c.json({ error: 'Screenshot exceeds the maximum allowed size.' }, 413);
+      }
+      if (err instanceof ScreenshotQuotaExceededError) {
+        return c.json({ error: 'Device screenshot storage quota exceeded. Wait for older screenshots to expire.' }, 429);
+      }
+      throw err;
+    }
   },
 );
 
@@ -611,7 +828,7 @@ helperRoutes.get('/chat/sessions', async (c) => {
   const device = c.get('helperDevice');
   const helperUser = c.req.query('helperUser');
 
-  const conditions = [eq(aiSessions.deviceId, device.id)];
+  const conditions = [eq(aiSessions.deviceId, device.id), ...helperOwnedSessionConditions()];
 
   if (helperUser) {
     conditions.push(
@@ -659,7 +876,7 @@ helperRoutes.get('/chat/sessions/:id/messages', async (c) => {
   const [session] = await db
     .select({ id: aiSessions.id })
     .from(aiSessions)
-    .where(and(eq(aiSessions.id, sessionId), eq(aiSessions.deviceId, device.id)))
+    .where(and(eq(aiSessions.id, sessionId), eq(aiSessions.deviceId, device.id), ...helperOwnedSessionConditions()))
     .limit(1);
 
   if (!session) {
@@ -693,7 +910,7 @@ helperRoutes.delete('/chat/sessions/:id', async (c) => {
   const [session] = await db
     .select()
     .from(aiSessions)
-    .where(and(eq(aiSessions.id, sessionId), eq(aiSessions.deviceId, device.id)))
+    .where(and(eq(aiSessions.id, sessionId), eq(aiSessions.deviceId, device.id), ...helperOwnedSessionConditions()))
     .limit(1);
 
   if (!session) {
@@ -727,7 +944,7 @@ helperRoutes.post(
     const [session] = await db
       .select({ id: aiSessions.id })
       .from(aiSessions)
-      .where(and(eq(aiSessions.id, sessionId), eq(aiSessions.deviceId, device.id)))
+      .where(and(eq(aiSessions.id, sessionId), eq(aiSessions.deviceId, device.id), ...helperOwnedSessionConditions()))
       .limit(1);
 
     if (!session) {

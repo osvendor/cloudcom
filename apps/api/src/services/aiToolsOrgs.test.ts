@@ -1,5 +1,6 @@
 const { ensureDefaultProfile } = vi.hoisted(() => ({ ensureDefaultProfile: vi.fn(async () => ({ id: 'default-profile' })) }));
 vi.mock('./billingProfileService', () => ({ ensureDefaultProfile }));
+import { notHoldingOrgCondition, notInHoldingOrgCondition } from './unassignedPool/selectorPredicate';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 vi.mock('../db', () => ({
@@ -95,7 +96,8 @@ function makeSelectChain() {
     return chain;
   });
   chain.orderBy = vi.fn(() => chain);
-  chain.limit = vi.fn(() => Promise.resolve(rows()));
+  chain.limit = vi.fn(() => chain);
+  chain.offset = vi.fn(() => Promise.resolve(rows()));
   chain.then = (res: (v: unknown) => unknown, rej: (e: unknown) => unknown) =>
     Promise.resolve(rows()).then(res, rej);
   return chain;
@@ -215,9 +217,10 @@ describe('list_organizations', () => {
     expect(out.organizations).toHaveLength(2);
     expect(out.organizations[0]).toEqual({
       id: ORG_1, name: 'Acme Dental', slug: 'acme-dental', status: 'active',
-      sites: [{ id: SITE_1, name: 'Main Office' }],
+      sites: [{ id: SITE_1, name: 'Main Office' }], siteCount: 1,
     });
     expect(out.organizations[1].sites).toEqual([{ id: SITE_2, name: 'Warehouse' }]);
+    expect(out).toMatchObject({ limit: 25, offset: 0, hasMore: false, nextCursor: null });
 
     // The org query is narrowed to the caller's accessible orgs, and the hidden
     // 'quick_support' org is excluded (it stays inside accessibleOrgIds by design).
@@ -225,6 +228,7 @@ describe('list_organizations', () => {
       and(
         isNull(organizations.deletedAt),
         ne(organizations.type, 'quick_support'),
+        notHoldingOrgCondition(),
         inArray(organizations.id, [ORG_1, ORG_2])
       )
     );
@@ -239,6 +243,7 @@ describe('list_organizations', () => {
       and(
         isNull(organizations.deletedAt),
         ne(organizations.type, 'quick_support'),
+        notHoldingOrgCondition(),
         ilike(organizations.name, '%acme%'),
         inArray(organizations.id, [ORG_1, ORG_2])
       )
@@ -252,11 +257,13 @@ describe('list_organizations', () => {
     const out = JSON.parse(await getTools().list.handler({}, orgAuth()));
     expect(out.organizations).toHaveLength(1);
     expect(out.organizations[0].id).toBe(ORG_1);
+    expect(out.organizations[0].siteCount).toBe(1);
     // The org query is pinned to the caller's own org id.
     expect(whereSpy.mock.calls[0]![0]).toEqual(
       and(
         isNull(organizations.deletedAt),
         ne(organizations.type, 'quick_support'),
+        notHoldingOrgCondition(),
         eq(organizations.id, ORG_1)
       )
     );
@@ -264,7 +271,7 @@ describe('list_organizations', () => {
 
   it('org scope with no orgId returns empty without querying', async () => {
     const out = JSON.parse(await getTools().list.handler({}, orgAuth({ orgId: null })));
-    expect(out).toEqual({ organizations: [], showing: 0 });
+    expect(out).toEqual({ organizations: [], showing: 0, limit: 25, offset: 0, hasMore: false, nextCursor: null });
     expect(mockDb.select).not.toHaveBeenCalled();
   });
 
@@ -272,7 +279,7 @@ describe('list_organizations', () => {
     const out = JSON.parse(
       await getTools().list.handler({}, partnerAuth({ accessibleOrgIds: [], canAccessOrg: () => false }))
     );
-    expect(out).toEqual({ organizations: [], showing: 0 });
+    expect(out).toEqual({ organizations: [], showing: 0, limit: 25, offset: 0, hasMore: false, nextCursor: null });
     expect(mockDb.select).not.toHaveBeenCalled();
   });
 
@@ -286,6 +293,20 @@ describe('list_organizations', () => {
     expect(mockDb.select).toHaveBeenCalledTimes(1);
   });
 
+  // #6737: AuthContext types allowedSiteIds as `string[] | undefined`, but a
+  // raw DB NULL leaking through would read `.length` off null and 500. A
+  // non-array allowlist is an invariant breach — deny sites, never widen.
+  it('fails closed (no crash, no sites) when allowedSiteIds is null', async () => {
+    selectQueue.push([{ id: ORG_1, name: 'Acme Dental', slug: 'acme-dental', status: 'active' }]);
+
+    const out = JSON.parse(
+      await getTools().list.handler({}, orgAuth({ allowedSiteIds: null } as unknown as Partial<AuthContext>))
+    );
+    expect(out.organizations[0].sites).toEqual([]);
+    expect(out.organizations[0].siteCount).toBe(0);
+    expect(mockDb.select).toHaveBeenCalledTimes(1);
+  });
+
   it('site-restricted caller only sees allowed sites', async () => {
     selectQueue.push([{ id: ORG_1, name: 'Acme Dental', slug: 'acme-dental', status: 'active' }]);
     selectQueue.push([{ id: SITE_1, name: 'Main Office', orgId: ORG_1 }]);
@@ -294,6 +315,29 @@ describe('list_organizations', () => {
     expect(whereSpy.mock.calls[1]![0]).toEqual(
       and(inArray(sites.orgId, [ORG_1]), inArray(sites.id, [SITE_1]))
     );
+  });
+
+  it('caps sites per org at 20 and reports the real siteCount', async () => {
+    selectQueue.push([{ id: ORG_1, name: 'Acme Dental', slug: 'acme-dental', status: 'active' }]);
+    selectQueue.push(
+      Array.from({ length: 25 }, (_, i) => ({ id: `s${i}`, name: `Site ${i}`, orgId: ORG_1 }))
+    );
+
+    const out = JSON.parse(await getTools().list.handler({}, orgAuth()));
+    expect(out.organizations[0].sites).toHaveLength(20);
+    expect(out.organizations[0].siteCount).toBe(25);
+  });
+
+  it('over-fetches by one to report hasMore/nextCursor, and trims the page to `limit`', async () => {
+    selectQueue.push(
+      Array.from({ length: 26 }, (_, i) => ({ id: `org-${i}`, name: `Org ${i}`, slug: `org-${i}`, status: 'active' }))
+    );
+    selectQueue.push([]);
+
+    const out = JSON.parse(await getTools().list.handler({}, partnerAuth()));
+    expect(out.organizations).toHaveLength(25);
+    expect(out.hasMore).toBe(true);
+    expect(typeof out.nextCursor).toBe('string');
   });
 });
 
@@ -578,6 +622,59 @@ describe('manage_organizations create_site', () => {
     expect(out.error).toMatch(/name is required/i);
     expect(mockDb.insert).not.toHaveBeenCalled();
   });
+
+  describe('device-page chat write default (#6675)', () => {
+    it('a multi-org caller with no orgId creates the site in the page org', async () => {
+      insertQueue.push([{ id: SITE_2, name: 'Branch', orgId: ORG_2 }]);
+      const out = JSON.parse(
+        await getTools().manage.handler(
+          { action: 'create_site', name: 'Branch' },
+          partnerAuth({ aiWriteDefaultOrgId: ORG_2 }),
+        )
+      );
+      expect(out.site.orgId).toBe(ORG_2);
+      expect(insertValuesSpy.mock.calls[0]![1]).toMatchObject({ orgId: ORG_2 });
+    });
+
+    it('an explicit accessible orgId still wins over the page org', async () => {
+      insertQueue.push([{ id: SITE_1, name: 'Branch', orgId: ORG_1 }]);
+      await getTools().manage.handler(
+        { action: 'create_site', orgId: ORG_1, name: 'Branch' },
+        partnerAuth({ aiWriteDefaultOrgId: ORG_2 }),
+      );
+      expect(insertValuesSpy.mock.calls[0]![1]).toMatchObject({ orgId: ORG_1 });
+    });
+
+    it('an explicit inaccessible orgId is refused even with a page org', async () => {
+      const out = JSON.parse(
+        await getTools().manage.handler(
+          { action: 'create_site', orgId: OTHER_ORG, name: 'Rogue' },
+          partnerAuth({ aiWriteDefaultOrgId: ORG_2 }),
+        )
+      );
+      expect(out.error).toMatch(/access denied/i);
+      expect(mockDb.insert).not.toHaveBeenCalled();
+    });
+
+    it('a page org the caller cannot access is no default', async () => {
+      const out = JSON.parse(
+        await getTools().manage.handler(
+          { action: 'create_site', name: 'Branch' },
+          partnerAuth({ aiWriteDefaultOrgId: OTHER_ORG }),
+        )
+      );
+      expect(out.error).toMatch(/orgId is required/i);
+      expect(mockDb.insert).not.toHaveBeenCalled();
+    });
+
+    it('a non-page chat still has to name the org (#6667)', async () => {
+      const out = JSON.parse(
+        await getTools().manage.handler({ action: 'create_site', name: 'Branch' }, partnerAuth())
+      );
+      expect(out.error).toMatch(/orgId is required: you have access to multiple organizations/);
+      expect(mockDb.insert).not.toHaveBeenCalled();
+    });
+  });
 });
 
 // ── manage_organizations: add_contact ────────────────────────────────────────
@@ -672,6 +769,17 @@ describe('manage_organizations add_contact', () => {
       await getTools().manage.handler(
         { action: 'add_contact', orgId: ORG_1, siteId: SITE_2, name: 'Rogue Site Contact' },
         orgAuth({ allowedSiteIds: [SITE_1] } as Partial<AuthContext>)
+      )
+    );
+    expect(out.code).toBe('site-access-denied');
+    expect(mockCreateContact).not.toHaveBeenCalled();
+  });
+
+  it('denies a site-targeted contact when allowedSiteIds is null (#6737, fail closed)', async () => {
+    const out = JSON.parse(
+      await getTools().manage.handler(
+        { action: 'add_contact', orgId: ORG_1, siteId: SITE_1, name: 'Null Scope Contact' },
+        orgAuth({ allowedSiteIds: null, canAccessSite: () => true } as unknown as Partial<AuthContext>)
       )
     );
     expect(out.code).toBe('site-access-denied');

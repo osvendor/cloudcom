@@ -1,8 +1,11 @@
 import { monitorsInheritanceSchema, type MonitorsInheritance } from '@breeze/shared';
-import { and, eq, inArray, sql } from 'drizzle-orm';
+import { hierarchyFor } from '../deviceHierarchy';
+import { applicableCandidates, policySetFor, type ApplicabilityRule, type DevicePolicySetOpts } from '../devicePolicySet';
+import { and, asc, eq, inArray, sql } from 'drizzle-orm';
 import { db } from '../../db';
 import { devices, deviceGroupMemberships } from '../../db/schema/devices';
 import { organizations } from '../../db/schema/orgs';
+import { isQuickSupportOrgType } from '../quickSupportOrg';
 import {
   configPolicyAssignments,
   configPolicyFeatureLinks,
@@ -10,6 +13,7 @@ import {
 } from '../../db/schema/configurationPolicies';
 import { configPolicyMonitors } from '../../db/schema/monitorDefinitions';
 import { buildRoleOsFilterConditions } from '../featureConfigResolver';
+import { isUnassignedPoolOrgType } from '../unassignedPool/orgType';
 
 /**
  * Monitor resolution for one device (#5287 W02).
@@ -168,6 +172,79 @@ export function selectContributingAttachments(args: {
   return out;
 }
 
+/** #8142: monitors' own rules — raw partner for ownership, NO partner-level target for quick_support / unassigned_pool, SQL role/OS only. */
+const MONITOR_APPLICABILITY: ApplicabilityRule = {
+  ownership: 'orgOrPartner', partnerTarget: 'partnerUnlessQuickSupportOrUnassignedPool', roleOs: 'sql',
+};
+
+/** Cumulative/replace attachment resolution over the RAW links of each assigned policy and its parent (unchanged). */
+async function monitorsFromAssignments(assignments: AssignmentRow[], executor: DbExecutor): Promise<MonitorResolution> {
+  if (assignments.length === 0) return { kind: 'resolved', monitors: [] };
+
+  const policyIds = new Set<string>();
+  for (const a of assignments) {
+    policyIds.add(a.policyId);
+    if (a.parentPolicyId) policyIds.add(a.parentPolicyId);
+  }
+
+  const attachmentRows = await executor
+    .select({
+      configPolicyId: configPolicyFeatureLinks.configPolicyId,
+      monitorId: configPolicyMonitors.monitorId,
+      enabled: configPolicyMonitors.enabled,
+      overrides: configPolicyMonitors.overrides,
+      inlineSettings: configPolicyFeatureLinks.inlineSettings,
+    })
+    .from(configPolicyFeatureLinks)
+    .leftJoin(
+      configPolicyMonitors,
+      eq(configPolicyMonitors.featureLinkId, configPolicyFeatureLinks.id),
+    )
+    .where(
+      and(
+        inArray(configPolicyFeatureLinks.configPolicyId, [...policyIds]),
+        eq(configPolicyFeatureLinks.featureType, 'monitors'),
+      ),
+    );
+
+  const byPolicy = new Map<string, AttachmentRow[]>();
+  const inheritanceByPolicy = new Map<string, MonitorsInheritance>();
+  for (const row of attachmentRows) {
+    // A visible link with no visible attachments still controls inheritance.
+    // In particular, an empty replace link must continue to suppress its parent
+    // and farther replace links. The LEFT JOIN retains that row without a
+    // second query; RLS still applies independently to both joined tables.
+    if (!inheritanceByPolicy.has(row.configPolicyId)) {
+      const parsed = monitorsInheritanceSchema.safeParse((row.inlineSettings as { inheritance?: unknown } | null)?.inheritance);
+      inheritanceByPolicy.set(row.configPolicyId, parsed.success ? parsed.data : 'cumulative');
+    }
+    if (row.monitorId === null || row.enabled === null) continue;
+    const list = byPolicy.get(row.configPolicyId) ?? [];
+    list.push({ configPolicyId: row.configPolicyId, monitorId: row.monitorId, enabled: row.enabled, overrides: row.overrides ?? null });
+    byPolicy.set(row.configPolicyId, list);
+  }
+
+  const candidates = new Map<string, MonitorCandidate[]>();
+  for (const candidate of selectContributingAttachments({ assignments, byPolicy, inheritanceByPolicy })) {
+    const list = candidates.get(candidate.monitorId) ?? [];
+    list.push(candidate);
+    candidates.set(candidate.monitorId, list);
+  }
+
+  const monitors = [...candidates.values()].map((list) => {
+    const winner = pickWinner(list);
+    return {
+      monitorId: winner.monitorId,
+      enabled: winner.enabled,
+      overrides: winner.overrides,
+      sourcePolicyId: winner.sourcePolicyId,
+      sourceLevel: winner.sourceLevel,
+      inheritedFromParent: winner.inheritedFromParent,
+    };
+  });
+  return { kind: 'resolved', monitors };
+}
+
 /**
  * Every monitor that applies to this device, winner-per-monitor.
  *
@@ -178,31 +255,53 @@ export function selectContributingAttachments(args: {
 export async function resolveMonitorsForDevice(
   deviceId: string,
   executor: DbExecutor = db,
+  opts?: DevicePolicySetOpts,
 ): Promise<MonitorResolution> {
-  const [device] = await executor
-    .select({
-      id: devices.id,
-      orgId: devices.orgId,
-      siteId: devices.siteId,
-      deviceRole: devices.deviceRole,
-      osType: devices.osType,
-    })
-    .from(devices)
-    .where(eq(devices.id, deviceId))
-    .limit(1);
+  // #8053 W1a-1: the heartbeat passes its hierarchy; other callers read below.
+  const passed = hierarchyFor(deviceId, opts);
+  const set = policySetFor(deviceId, opts);
+  if (set) {
+    if (!set.hierarchy.org) return { kind: 'device_missing' };
+    const applicable = applicableCandidates(set, MONITOR_APPLICABILITY);
+    // Exact, statement-free: no effective monitors link => no attachment rows.
+    if (!applicable.some((c) => c.links.monitors)) return { kind: 'resolved', monitors: [] };
+    return monitorsFromAssignments(applicable.map((c) => ({
+      policyId: c.policyId, parentPolicyId: c.parentPolicyId, level: c.level, priority: c.priority, createdAt: c.assignmentCreatedAt,
+    })), executor);
+  }
+  const [device] = passed
+    ? [{ id: passed.deviceId, orgId: passed.orgId, siteId: passed.siteId, deviceRole: passed.deviceRole, osType: passed.osType }]
+    : await executor
+      .select({
+        id: devices.id,
+        orgId: devices.orgId,
+        siteId: devices.siteId,
+        deviceRole: devices.deviceRole,
+        osType: devices.osType,
+      })
+      .from(devices)
+      .where(eq(devices.id, deviceId))
+      .limit(1);
   if (!device) return { kind: 'device_missing' };
 
-  const [org] = await executor
-    .select({ partnerId: organizations.partnerId })
-    .from(organizations)
-    .where(eq(organizations.id, device.orgId))
-    .limit(1);
+  const [org] = passed
+    ? (passed.org ? [{ partnerId: passed.org.partnerId, type: passed.org.type }] : [])
+    : await executor
+      .select({ partnerId: organizations.partnerId, type: organizations.type })
+      .from(organizations)
+      .where(eq(organizations.id, device.orgId))
+      .limit(1);
+  // Without the org row the partner-level assignments and partner-wide
+  // monitors below silently drop out, so a partial answer would pass for
+  // "resolved". Report it as unresolvable, like a vanished device (#2949).
+  if (!org) return { kind: 'device_missing' };
 
-  const groupRows = await executor
-    .select({ groupId: deviceGroupMemberships.groupId })
-    .from(deviceGroupMemberships)
-    .where(eq(deviceGroupMemberships.deviceId, deviceId));
-  const groupIds = groupRows.map((r) => r.groupId);
+  const groupIds = passed
+    ? [...passed.groupIds]
+    : (await executor
+      .select({ groupId: deviceGroupMemberships.groupId })
+      .from(deviceGroupMemberships)
+      .where(eq(deviceGroupMemberships.deviceId, deviceId))).map((r) => r.groupId);
 
   const targetConditions = [
     and(eq(configPolicyAssignments.level, 'device'), eq(configPolicyAssignments.targetId, deviceId))!,
@@ -224,7 +323,12 @@ export async function resolveMonitorsForDevice(
       and(eq(configPolicyAssignments.level, 'site'), eq(configPolicyAssignments.targetId, device.siteId))!,
     );
   }
-  if (org?.partnerId) {
+  // A partner-level assignment must never reach an ephemeral Quick Support
+  // device — the hidden quick_support org is a stranger's own machine mid
+  // support session, not fleet the partner authored partner-wide policies
+  // against. Same exclusion as monitorScriptWorker.ts's partner-wide fan-out.
+  // Same for a device parked in its partner's holding org: not managed yet.
+  if (org?.partnerId && !isQuickSupportOrgType(org.type) && !isUnassignedPoolOrgType(org.type)) {
     targetConditions.push(
       and(
         eq(configPolicyAssignments.level, 'partner'),
@@ -258,77 +362,10 @@ export async function resolveMonitorsForDevice(
     .where(and(
       sql`(${sql.join(targetConditions, sql` OR `)})`,
       ...buildRoleOsFilterConditions(device),
-    ));
+    ))
+    .orderBy(asc(configPolicyAssignments.createdAt), asc(configPolicyAssignments.id));
 
-  if (assignments.length === 0) return { kind: 'resolved', monitors: [] };
-
-  const policyIds = new Set<string>();
-  for (const a of assignments) {
-    policyIds.add(a.policyId);
-    if (a.parentPolicyId) policyIds.add(a.parentPolicyId);
-  }
-
-  const attachmentRows = await executor
-    .select({
-      configPolicyId: configPolicyFeatureLinks.configPolicyId,
-      monitorId: configPolicyMonitors.monitorId,
-      enabled: configPolicyMonitors.enabled,
-      overrides: configPolicyMonitors.overrides,
-      inlineSettings: configPolicyFeatureLinks.inlineSettings,
-    })
-    .from(configPolicyFeatureLinks)
-    .innerJoin(
-      configPolicyMonitors,
-      eq(configPolicyMonitors.featureLinkId, configPolicyFeatureLinks.id),
-    )
-    .where(
-      and(
-        inArray(configPolicyFeatureLinks.configPolicyId, [...policyIds]),
-        eq(configPolicyFeatureLinks.featureType, 'monitors'),
-      ),
-    );
-
-  const byPolicy = new Map<string, AttachmentRow[]>();
-  const inheritanceByPolicy = new Map<string, MonitorsInheritance>();
-  for (const row of attachmentRows) {
-    const list = byPolicy.get(row.configPolicyId) ?? [];
-    list.push({ configPolicyId: row.configPolicyId, monitorId: row.monitorId, enabled: row.enabled, overrides: row.overrides ?? null });
-    byPolicy.set(row.configPolicyId, list);
-    if (!inheritanceByPolicy.has(row.configPolicyId)) {
-      const parsed = monitorsInheritanceSchema.safeParse((row.inlineSettings as { inheritance?: unknown } | null)?.inheritance);
-      inheritanceByPolicy.set(row.configPolicyId, parsed.success ? parsed.data : 'cumulative');
-    }
-  }
-
-  const replaceLinks = await executor
-    .select({ configPolicyId: configPolicyFeatureLinks.configPolicyId })
-    .from(configPolicyFeatureLinks)
-    .where(and(
-      inArray(configPolicyFeatureLinks.configPolicyId, [...policyIds]),
-      eq(configPolicyFeatureLinks.featureType, 'monitors'),
-      sql`${configPolicyFeatureLinks.inlineSettings} ->> 'inheritance' = 'replace'`,
-    ));
-  for (const r of replaceLinks) inheritanceByPolicy.set(r.configPolicyId, 'replace');
-
-  const candidates = new Map<string, MonitorCandidate[]>();
-  for (const candidate of selectContributingAttachments({ assignments, byPolicy, inheritanceByPolicy })) {
-    const list = candidates.get(candidate.monitorId) ?? [];
-    list.push(candidate);
-    candidates.set(candidate.monitorId, list);
-  }
-
-  const monitors = [...candidates.values()].map((list) => {
-    const winner = pickWinner(list);
-    return {
-      monitorId: winner.monitorId,
-      enabled: winner.enabled,
-      overrides: winner.overrides,
-      sourcePolicyId: winner.sourcePolicyId,
-      sourceLevel: winner.sourceLevel,
-      inheritedFromParent: winner.inheritedFromParent,
-    };
-  });
-  return { kind: 'resolved', monitors };
+  return monitorsFromAssignments(assignments, executor);
 }
 
 export async function resolveMonitorOverrideForDevice(

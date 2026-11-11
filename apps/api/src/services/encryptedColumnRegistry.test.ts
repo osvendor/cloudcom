@@ -7,11 +7,13 @@ vi.mock('../db', () => ({
 
 import {
   columnAad,
+  encryptedColumnRegistry,
   encryptColumnValueForWrite,
   reencryptRegisteredSecrets,
   transformEncryptedColumnValue,
 } from './encryptedColumnRegistry';
-import { decryptSecret, encryptSecret } from './secretCrypto';
+import { decryptForColumn, decryptSecret, encryptSecret } from './secretCrypto';
+import { decryptNotificationChannelConfig } from './notificationChannelSecrets';
 
 const ENV_KEYS = [
   'APP_ENCRYPTION_KEY',
@@ -41,6 +43,48 @@ describe('encryptedColumnRegistry', () => {
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
     }
+  });
+
+  it('registers the EDR provider secret columns with row-bound AAD (#8165)', () => {
+    // A ciphertext pasted into another partner's connection / tenant row must
+    // not decrypt, so every EDR secret column binds its AAD to the row id.
+    for (const [table, column] of [
+      ['edr_connections', 'credentials_encrypted'],
+      ['edr_connections', 'webhook_secret_encrypted'],
+      ['edr_tenants', 'installer_secret_encrypted'],
+    ] as const) {
+      const spec = encryptedColumnRegistry.find((c) => c.table === table && c.column === column);
+      expect(spec, `${table}.${column} missing from encryptedColumnRegistry`).toBeDefined();
+      expect(spec).toMatchObject({ kind: 'text', aadBinding: 'row' });
+    }
+  });
+
+  it('device_network_isolations.break_glass_secret_enc is row-bound (#10089)', () => {
+    // A break-glass secret pasted onto another episode's row must not decrypt there: its HMAC codes would
+    // release a different device. Key rotation must also reach it, or a retired key strands the secret.
+    const spec = encryptedColumnRegistry.find(
+      (c) => c.table === 'device_network_isolations' && c.column === 'break_glass_secret_enc',
+    );
+    expect(spec, 'device_network_isolations.break_glass_secret_enc missing from encryptedColumnRegistry').toBeDefined();
+    expect(spec).toMatchObject({ kind: 'text', aadBinding: 'row' });
+    expect(spec?.idColumn).toBeUndefined();
+  });
+
+  it('flows.webhook_secret_encrypted is row-bound', () => {
+    // A flow's webhook signing secret pasted onto another flow's row must not decrypt.
+    const spec = encryptedColumnRegistry.find((c) => c.table === 'flows' && c.column === 'webhook_secret_encrypted');
+    expect(spec, 'flows.webhook_secret_encrypted missing from encryptedColumnRegistry').toBeDefined();
+    expect(spec).toMatchObject({ kind: 'text', aadBinding: 'row', aadTag: 'flows.webhook_secret_encrypted' });
+  });
+
+  it('registers the ticket import source credential with row-bound AAD (#8313 W4)', () => {
+    const spec = encryptedColumnRegistry.find(
+      (c) => c.table === 'ticket_import_sources' && c.column === 'credentials_encrypted',
+    );
+    expect(spec).toMatchObject({ kind: 'text', aadBinding: 'row' });
+    // Row-bound columns have a dedicated writer (sourceCredentials.ts); the
+    // generic write helper must refuse them.
+    expect(() => encryptColumnValueForWrite('ticket_import_sources', 'credentials_encrypted', '{}')).toThrow();
   });
 
   it('transforms text columns from legacy ciphertext to the active v2 key id', () => {
@@ -205,6 +249,125 @@ describe('encryptedColumnRegistry', () => {
     expect(executor.execute).toHaveBeenCalledTimes(3);
   });
 
+  it('never overwrites a value that changed after it was read (compare-and-set), counting it as contended', async () => {
+    setEncryptionEnv({ APP_ENCRYPTION_KEY: 'current-key-material', APP_ENCRYPTION_KEY_ID: 'current' });
+    const rowId = '44444444-4444-4444-8444-444444444444';
+    const { PgDialect } = await import('drizzle-orm/pg-core');
+    const dialect = new PgDialect();
+    const updates: Array<{ sql: string; params: unknown[] }> = [];
+    const executor = {
+      execute: vi.fn(async (query: any) => {
+        const call = executor.execute.mock.calls.length;
+        if (call === 1) return [{ present: true }];
+        if (call === 2) return [{ id: rowId, value: { bucket: 'b', password: 'plaintext-secret' } }];
+        if (call === 3) {
+          updates.push(dialect.sqlToQuery(query));
+          return []; // a concurrent save changed the row: the compare matched nothing
+        }
+        return [];
+      }),
+    };
+
+    const stats = await reencryptRegisteredSecrets({
+      dryRun: false,
+      executor,
+      registry: [{ table: 'backup_configs', column: 'provider_config', kind: 'json', description: 'test' }],
+      logger: { log: vi.fn(), warn: vi.fn(), error: vi.fn() },
+    });
+
+    expect(updates).toHaveLength(1);
+    expect(updates[0]!.sql).toMatch(/"provider_config" = \$\d+::jsonb/);
+    expect(updates[0]!.params).toContain(JSON.stringify({ bucket: 'b', password: 'plaintext-secret' }));
+    expect(stats.changed).toBe(1);
+    expect(stats.updated).toBe(0);
+    expect(stats.contended).toBe(1);
+    expect(stats.errors).toEqual([]);
+  });
+
+  describe('moved column keeps its AAD tag (#6379)', () => {
+    it('notification channel config is registered on notification_channel_configs under the old notification_channels.config tag', () => {
+      const spec = encryptedColumnRegistry.find((s) => s.table === 'notification_channel_configs' && s.column === 'config');
+      expect(spec).toBeDefined();
+      expect(spec!.idColumn).toBe('channel_id');
+      expect(columnAad(spec!)).toBe('notification_channels.config');
+      // Contract step (#7028): the legacy notification_channels.config column is
+      // dropped, so the key-rotation walker must no longer target it (an entry
+      // would fail with 42703 at rotation time).
+      const legacy = encryptedColumnRegistry.filter((s) => s.table === 'notification_channels');
+      expect(legacy).toEqual([]);
+    });
+
+    it('a value rotated by the walker under the moved spec decrypts on the read path', () => {
+      setEncryptionEnv({
+        APP_ENCRYPTION_KEY: 'current-key-material',
+        APP_ENCRYPTION_KEY_ID: 'current',
+      });
+      const previous = process.env.ENABLE_AAD_V3;
+      process.env.ENABLE_AAD_V3 = 'true';
+      try {
+        const spec = encryptedColumnRegistry.find((s) => s.table === 'notification_channel_configs')!;
+        const rotated = transformEncryptedColumnValue(spec, { webhookUrl: 'https://hooks.slack.example/s3cret' }, 'channel-1') as {
+          webhookUrl: string;
+        };
+        expect(rotated.webhookUrl).toMatch(/^enc:v3:current:/);
+        // The read path (notificationChannelSecrets) decrypts under the old tag.
+        expect(decryptForColumn('notification_channels', 'config', rotated.webhookUrl)).toBe('https://hooks.slack.example/s3cret');
+        expect(decryptNotificationChannelConfig('slack', rotated)).toEqual({ webhookUrl: 'https://hooks.slack.example/s3cret' });
+      } finally {
+        if (previous === undefined) delete process.env.ENABLE_AAD_V3;
+        else process.env.ENABLE_AAD_V3 = previous;
+      }
+    });
+  });
+
+  describe('partner AI connections keep the legacy partner_llm_configs AAD tag (#7600 W02)', () => {
+    const connectionSpec = () => encryptedColumnRegistry.find((s) => s.table === 'partner_ai_connections' && s.column === 'api_key_encrypted')!;
+    const rowId = '22222222-2222-4222-8222-222222222222';
+
+    it('is registered row-bound under the legacy tag', () => {
+      expect(connectionSpec()).toMatchObject({ kind: 'text', aadBinding: 'row', aadTag: 'partner_llm_configs.api_key_encrypted' });
+      expect(columnAad(connectionSpec(), rowId)).toBe(`partner_llm_configs.api_key_encrypted:${rowId}`);
+    });
+
+    it('a legacy ciphertext decrypts under the connection spec for the same id, and only that id', () => {
+      setEncryptionEnv({ APP_ENCRYPTION_KEY: 'current-key-material', APP_ENCRYPTION_KEY_ID: 'current' });
+      const sealed = transformEncryptedColumnValue(connectionSpec(), 'sk-ant-api03-legacy', rowId) as string;
+      expect(decryptSecret(sealed, { aad: columnAad(connectionSpec(), rowId) })).toBe('sk-ant-api03-legacy');
+      expect(() => decryptSecret(sealed, { aad: columnAad(connectionSpec(), '33333333-3333-4333-8333-333333333333') })).toThrow();
+    });
+
+    it('the rotation walker re-seals a connection key under the legacy tag + row id', async () => {
+      setEncryptionEnv({ APP_ENCRYPTION_KEY: 'old-key-material', APP_ENCRYPTION_KEY_ID: 'old' });
+      const sealedOld = transformEncryptedColumnValue(connectionSpec(), 'sk-ant-api03-rotate', rowId) as string;
+      setEncryptionEnv({
+        APP_ENCRYPTION_KEY: 'current-key-material',
+        APP_ENCRYPTION_KEY_ID: 'current',
+        APP_ENCRYPTION_KEYRING: JSON.stringify({ old: 'old-key-material', current: 'current-key-material' }),
+      });
+      const executor = {
+        execute: vi.fn(async () => {
+          const call = executor.execute.mock.calls.length;
+          if (call === 1) return [{ present: true }];
+          if (call === 2) return [{ id: rowId, value: sealedOld }];
+          if (call === 3) return [{ updated: 1 }];
+          return [];
+        }),
+      };
+      const stats = await reencryptRegisteredSecrets({
+        dryRun: false,
+        executor,
+        registry: [connectionSpec()],
+        logger: { log: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      });
+      expect(stats.errors).toEqual([]);
+      expect(stats.updated).toBe(1);
+      // Whatever the walker sealed decrypts under the connection spec for the same row.
+      const resealed = transformEncryptedColumnValue(connectionSpec(), sealedOld, rowId) as string;
+      expect(resealed).toMatch(/^enc:v3:current:/);
+      expect(decryptSecret(resealed, { aad: columnAad(connectionSpec(), rowId) })).toBe('sk-ant-api03-rotate');
+    });
+  });
+
   describe('row-bound AAD (#3409)', () => {
     const rowSpec = {
       table: 'tenant_variables',
@@ -282,7 +445,7 @@ describe('encryptedColumnRegistry', () => {
           if (call === 2) return [{ id: rowId, value: sealedUnderOldKey }];
           if (call === 3) {
             updates.push(query);
-            return [];
+            return [{ updated: 1 }];
           }
           return [];
         }),
@@ -298,6 +461,61 @@ describe('encryptedColumnRegistry', () => {
       expect(stats.errors).toEqual([]);
       expect(stats.updated).toBe(1);
       expect(updates).toHaveLength(1);
+    });
+  });
+
+  describe('notification settings secrets in partners/organizations.settings', () => {
+    const SLACK = 'https://hooks.slack.example/services/T000/B000/abcdef';
+    const EXTRA = 'https://hooks.example.com/incoming/abc?token=xyz';
+
+    it.each(['partners', 'organizations'] as const)(
+      'seals the Slack URL, Pushover credentials and extra webhook URLs in %s.settings.notifications',
+      (table) => {
+        setEncryptionEnv({ APP_ENCRYPTION_KEY: 'current-key-material', APP_ENCRYPTION_KEY_ID: 'current' });
+
+        const sealed = encryptColumnValueForWrite(table, 'settings', {
+          notifications: {
+            slackWebhookUrl: SLACK,
+            slackChannel: '#ops-alerts',
+            pushoverAppToken: 'azGDORePK8gMaC0QOYAMyEEuzJnyUi',
+            pushoverDefaultUser: 'uQiRzpo4DXghDmr9QzzfQu27cmVRsG',
+            pushoverDefaultSound: 'pushover',
+            webhooks: [EXTRA, ''],
+          },
+        }) as { notifications: Record<string, unknown> };
+
+        const n = sealed.notifications;
+        expect(n.slackChannel).toBe('#ops-alerts');
+        expect(n.pushoverDefaultSound).toBe('pushover');
+        for (const field of ['slackWebhookUrl', 'pushoverAppToken', 'pushoverDefaultUser'] as const) {
+          expect(n[field]).toMatch(/^enc:v2:current:/);
+        }
+        const webhooks = n.webhooks as string[];
+        expect(webhooks[0]).toMatch(/^enc:v2:current:/);
+        expect(webhooks[1]).toBe('');
+        expect(JSON.stringify(sealed)).not.toContain('hooks.');
+        expect(decryptForColumn(table, 'settings', n.slackWebhookUrl as string)).toBe(SLACK);
+        expect(decryptForColumn(table, 'settings', webhooks[0])).toBe(EXTRA);
+        expect(decryptForColumn(table, 'settings', n.pushoverAppToken as string)).toBe('azGDORePK8gMaC0QOYAMyEEuzJnyUi');
+      },
+    );
+
+    it('treats `webhooks` as a secret only under notifications, not wherever the key appears', () => {
+      setEncryptionEnv({ APP_ENCRYPTION_KEY: 'current-key-material', APP_ENCRYPTION_KEY_ID: 'current' });
+
+      const value = {
+        webhooks: ['webhook-id-1'],
+        ticketing: { webhooks: ['ticket.created'] },
+        monitoring: { webhooks: { enabled: true, endpoints: [{ id: 'e1', name: 'Ops' }] } },
+      };
+      expect(encryptColumnValueForWrite('partners', 'settings', value)).toEqual(value);
+    });
+
+    it('applies the settings paths only to the settings columns', () => {
+      setEncryptionEnv({ APP_ENCRYPTION_KEY: 'current-key-material', APP_ENCRYPTION_KEY_ID: 'current' });
+
+      const value = { notifications: { slackWebhookUrl: 'https://example.com/x', webhooks: ['https://example.com/y'] } };
+      expect(encryptColumnValueForWrite('psa_connections', 'credentials', value)).toEqual(value);
     });
   });
 });

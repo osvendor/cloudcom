@@ -6,6 +6,8 @@ node_modules/
 dist/
 .astro/
 .turbo/
+# tsc --build declaration output (apps/api/tsconfig.src.json, #6270)
+.tsbuild/
 
 # Environment
 .env
@@ -46,6 +48,8 @@ coverage/
 # Go
 agent/breeze-agent
 agent/breeze-backup
+agent/cmd/breeze-backup/breeze-backup
+agent/cmd/breeze-backup/breeze-backup.exe
 agent/breeze-watchdog
 agent/bin/
 viewer/bin/
@@ -135,3 +139,10 @@ docker-compose.override.pam.yml
 
 # Measured acceptance/soak artifacts (topology fleet gates, ad-hoc harness runs)
 test-results/
+
+# Research eval outputs (model output + cost figures belong in the PR, not the tree)
+research-eval-report.json
+research-eval-summary.md
+
+# Integration TimingSequencer plans, written under CI (W07a, #10751)
+apps/api/shard-plan-*.json

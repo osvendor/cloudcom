@@ -1,11 +1,29 @@
-import { and, eq, ne, sql } from 'drizzle-orm';
+import { and, eq, ne, sql, type SQL } from 'drizzle-orm';
 import type { db } from '../db';
 import { lockTimeoutWasChanged, tightenLockTimeout } from '../db/lockTimeout';
 import { devices, organizations, partners } from '../db/schema';
+import { UNASSIGNED_POOL_ORG_TYPE } from './unassignedPool/orgType';
 
 export type PartnerDeviceCapacityTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
 
 export const PARTNER_DEVICE_CAPACITY_LOCK_TIMEOUT_MS = 3_000;
+
+/** A billing allowance can widen admission, never erase the reserved limit. */
+export function effectivePartnerAdmissionLimit(partner: {
+  maxDevices: number | null;
+  plan?: string;
+  billingSubscriptionStatus?: string | null;
+  billingAdmissionLimit?: number | null;
+  billingAdmissionExpiresAt?: Date | string | null;
+}, now = new Date()): number | null {
+  if (partner.maxDevices === null) return null;
+  const expiry = partner.billingAdmissionExpiresAt ? new Date(partner.billingAdmissionExpiresAt).getTime() : NaN;
+  const limit = partner.billingAdmissionLimit;
+  if (partner.plan === 'community' && partner.billingSubscriptionStatus === 'active'
+    && typeof limit === 'number' && Number.isInteger(limit) && limit > 0 && limit <= 1100
+    && Number.isFinite(expiry) && expiry > now.getTime()) return Math.max(partner.maxDevices, limit);
+  return partner.maxDevices;
+}
 
 export type PartnerDeviceCapacityResult =
   | { allowed: true; partnerId: string; maxDevices: number | null; activeCount: number | null }
@@ -30,7 +48,17 @@ export class PartnerDeviceCapacityError extends Error {
  */
 export async function admitPartnerDeviceCapacity(
   tx: PartnerDeviceCapacityTx,
-  input: { orgId: string; expectedPartnerId: string },
+  input: {
+    orgId: string;
+    expectedPartnerId: string;
+    /**
+     * A device this transaction has ALREADY placed in a counted org (parked
+     * assignment moves the device first and admits last, so the partner row
+     * lock is held only from here to commit). Left out of the count, so the
+     * answer is still "may one more device be added".
+     */
+    excludeDeviceId?: string;
+  },
 ): Promise<PartnerDeviceCapacityResult> {
   const priorLockTimeout = await tightenLockTimeout(tx, PARTNER_DEVICE_CAPACITY_LOCK_TIMEOUT_MS);
 
@@ -51,7 +79,9 @@ export async function admitPartnerDeviceCapacity(
   }
 
   const [partner] = await tx
-    .select({ maxDevices: partners.maxDevices })
+    .select({ maxDevices: partners.maxDevices, plan: partners.plan,
+      billingSubscriptionStatus: partners.billingSubscriptionStatus,
+      billingAdmissionLimit: partners.billingAdmissionLimit, billingAdmissionExpiresAt: partners.billingAdmissionExpiresAt })
     .from(partners)
     .where(eq(partners.id, input.expectedPartnerId))
     .limit(1)
@@ -63,22 +93,99 @@ export async function admitPartnerDeviceCapacity(
     await tx.execute(sql`select set_config('lock_timeout', ${`${priorLockTimeout}ms`}, true)`);
   }
 
-  const maxDevices = partner.maxDevices;
+  return decideCapacity(tx, input, effectivePartnerAdmissionLimit(partner));
+}
+
+/**
+ * Same answer as admitPartnerDeviceCapacity, WITHOUT row locks: an early,
+ * advisory read so a caller can refuse before spending anything (a step-up
+ * grant). Never an admission — the caller must still run
+ * admitPartnerDeviceCapacity before its device write commits.
+ */
+export async function previewPartnerDeviceCapacity(
+  tx: PartnerDeviceCapacityTx,
+  input: { orgId: string; expectedPartnerId: string },
+): Promise<PartnerDeviceCapacityResult> {
+  const [org] = await tx
+    .select({ partnerId: organizations.partnerId })
+    .from(organizations)
+    .where(eq(organizations.id, input.orgId))
+    .limit(1);
+  if (!org || org.partnerId !== input.expectedPartnerId) {
+    throw new PartnerDeviceCapacityError('ORG_PARTNER_CHANGED', 'Organization partner changed during device admission');
+  }
+  const [partner] = await tx
+    .select({ maxDevices: partners.maxDevices, plan: partners.plan,
+      billingSubscriptionStatus: partners.billingSubscriptionStatus,
+      billingAdmissionLimit: partners.billingAdmissionLimit, billingAdmissionExpiresAt: partners.billingAdmissionExpiresAt })
+    .from(partners)
+    .where(eq(partners.id, input.expectedPartnerId))
+    .limit(1);
+  if (!partner) {
+    throw new PartnerDeviceCapacityError('PARTNER_NOT_FOUND', 'Partner not found during device admission');
+  }
+  return decideCapacity(tx, input, effectivePartnerAdmissionLimit(partner));
+}
+
+/**
+ * Whether a device would take a licensed slot once it is active again, by the
+ * same rule the admission count uses. A path that brings an existing device
+ * back into service (restoring a decommissioned device) admits only when this
+ * is true: restoring an ephemeral or parked device adds nothing to the count.
+ * Unlocked, and deliberately independent of which partner owns the org, so a
+ * concurrent org move cannot turn "admit" into "skip"; the caller pins the
+ * device row itself before acting on the answer.
+ */
+export async function deviceTakesLicensedSlot(
+  tx: PartnerDeviceCapacityTx,
+  deviceId: string,
+): Promise<boolean> {
+  const [row] = await tx
+    .select({ id: devices.id })
+    .from(devices)
+    .where(and(eq(devices.id, deviceId), ...licensedDeviceConditions(tx)))
+    .limit(1);
+  return row !== undefined;
+}
+
+/**
+ * The devices that take a licensed slot while they are not decommissioned:
+ * non-ephemeral devices outside a holding org, counted per partner. Devices
+ * parked in the partner's holding org never consume licensed capacity (their
+ * number is bounded separately, per partner); a parked device starts counting
+ * when it is assigned, which calls this admission.
+ */
+function licensedDeviceConditions(tx: PartnerDeviceCapacityTx, partnerId?: string): SQL[] {
+  const licensedOrgIds = tx
+    .select({ id: organizations.id })
+    .from(organizations)
+    .where(and(
+      ...(partnerId ? [eq(organizations.partnerId, partnerId)] : []),
+      ne(organizations.type, UNASSIGNED_POOL_ORG_TYPE),
+    ));
+  return [
+    sql`${devices.orgId} IN (${licensedOrgIds})`,
+    eq(devices.isEphemeral, false),
+  ];
+}
+
+async function decideCapacity(
+  tx: PartnerDeviceCapacityTx,
+  input: { expectedPartnerId: string; excludeDeviceId?: string },
+  maxDevices: number | null,
+): Promise<PartnerDeviceCapacityResult> {
   if (maxDevices == null) {
     return { allowed: true, partnerId: input.expectedPartnerId, maxDevices: null, activeCount: null };
   }
 
-  const partnerOrgIds = tx
-    .select({ id: organizations.id })
-    .from(organizations)
-    .where(eq(organizations.partnerId, input.expectedPartnerId));
+  const licensed = licensedDeviceConditions(tx, input.expectedPartnerId);
   const [countResult] = await tx
     .select({ count: sql<number>`count(*)` })
     .from(devices)
     .where(and(
-      sql`${devices.orgId} IN (${partnerOrgIds})`,
+      ...licensed,
       ne(devices.status, 'decommissioned'),
-      eq(devices.isEphemeral, false),
+      ...(input.excludeDeviceId ? [ne(devices.id, input.excludeDeviceId)] : []),
     ));
   const activeCount = Number(countResult?.count ?? 0);
   if (activeCount >= maxDevices) {

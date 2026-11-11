@@ -15,6 +15,7 @@ import { cn } from '@/lib/utils';
 import { formatDateTime } from '@/lib/dateTimeFormat';
 import { useHashState } from '@/lib/useHashState';
 import { Dialog } from '../shared/Dialog';
+import { PageHeader } from '../shared/PageHeader';
 import { fetchWithAuth } from '../../stores/auth';
 import { runAction, ActionError } from '@/lib/runAction';
 import DRExecutionView from './DRExecutionView';
@@ -49,8 +50,19 @@ type DRExecution = {
   createdAt: string;
 };
 
+// #6496: `formatDateTime` with no style options falls back to the runtime's
+// default `toLocaleString`, which on en-US renders the short numeric date
+// (9/20/2026, 8:15:17 PM) — not the app's own long format used everywhere
+// else (Sep 20, 2026, 02:08 PM).
 function formatDate(value: string | null): string {
-  return formatDateTime(value, { fallback: '-' });
+  return formatDateTime(value, {
+    fallback: '-',
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
 }
 
 function formatDuration(startedAt: string | null, completedAt: string | null): string {
@@ -209,32 +221,33 @@ function DRDashboardInner() {
   return (
     <div className="space-y-6">
       <AlphaBadge variant="banner" disclaimer="Disaster Recovery orchestration is in early access. DR plans, recovery groups, and rehearsal executions are functional but should be thoroughly tested in a non-production environment before relying on them for actual disaster recovery." />
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl font-bold tracking-tight text-foreground">{t('dRDashboard.disasterRecovery')}</h1>
-          <p className="text-sm text-muted-foreground">
-            {t('dRDashboard.buildRecoveryPlansLaunchRehearsalsAndTrackLive')} </p>
-        </div>
-        <div className="flex gap-3">
-          <button
-            type="button"
-            onClick={() => void refreshAll()}
-            className="inline-flex items-center gap-2 rounded-md border px-4 py-2 text-sm font-medium hover:bg-muted"
-          >
-            <RefreshCw className="h-4 w-4" />
-            {t('dRDashboard.refresh')} </button>
-          <button
-            type="button"
-            onClick={() => {
-              setEditingPlanId(null);
-              setPlanEditorOpen(true);
-            }}
-            className="inline-flex items-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:opacity-90"
-          >
-            <Plus className="h-4 w-4" />
-            {t('dRDashboard.createPlan')} </button>
-        </div>
-      </div>
+      <PageHeader
+        title={t('dRDashboard.disasterRecovery')}
+        description={t('dRDashboard.buildRecoveryPlansLaunchRehearsalsAndTrackLive')}
+        actions={
+          <>
+            <button
+              type="button"
+              onClick={() => void refreshAll()}
+              className="inline-flex items-center gap-2 rounded-md border px-4 py-2 text-sm font-medium hover:bg-muted"
+            >
+              <RefreshCw className="h-4 w-4" />
+              {t('dRDashboard.refresh')}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setEditingPlanId(null);
+                setPlanEditorOpen(true);
+              }}
+              className="inline-flex items-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:opacity-90"
+            >
+              <Plus className="h-4 w-4" />
+              {t('dRDashboard.createPlan')}
+            </button>
+          </>
+        }
+      />
 
       {error && (
         <div className="rounded-lg border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">
@@ -265,7 +278,7 @@ function DRDashboardInner() {
       </div>
 
       {activeTab === 'plans' && (
-        <div className="rounded-lg border">
+        <div className="overflow-x-auto rounded-lg border">
           <table className="w-full text-sm">
             <thead>
               <tr className="border-b bg-muted/50">
@@ -328,7 +341,7 @@ function DRDashboardInner() {
       )}
 
       {activeTab === 'executions' && (
-        <div className="rounded-lg border">
+        <div className="overflow-x-auto rounded-lg border">
           <table className="w-full text-sm">
             <thead>
               <tr className="border-b bg-muted/50">

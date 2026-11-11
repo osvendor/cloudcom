@@ -245,7 +245,8 @@ describe('enrollment key routes — installer download', () => {
         method: 'GET', headers: { Authorization: 'Bearer token' },
       });
 
-      expect(res.status).toBe(403);
+      expect(res.status).toBe(404);
+      await expect(res.json()).resolves.toEqual({ error: 'Enrollment key not found' });
       expect(issueBootstrapTokenForKey).not.toHaveBeenCalled();
       expect(db.insert).not.toHaveBeenCalled();
       expect(createAuditLogAsync).not.toHaveBeenCalled();
@@ -272,7 +273,7 @@ describe('enrollment key routes — installer download', () => {
       expect(res.status).toBe(404);
     });
 
-    it('returns 403 for cross-org access', async () => {
+    it('returns the not-found 404 for cross-org access', async () => {
       mockSelectFromWhereLimit([makeEnrollmentKey({ orgId: 'other-org' })]);
 
       const res = await app.request(`/enrollment-keys/${KEY_ID}/installer/windows`, {
@@ -280,7 +281,8 @@ describe('enrollment key routes — installer download', () => {
         headers: { Authorization: 'Bearer token' },
       });
 
-      expect(res.status).toBe(403);
+      expect(res.status).toBe(404);
+      await expect(res.json()).resolves.toEqual({ error: 'Enrollment key not found' });
     });
 
     it('returns 410 for expired key', async () => {
@@ -512,6 +514,53 @@ describe('enrollment key routes — installer download', () => {
       );
     });
 
+    // #9615: Settings → Enrollment Keys now sends the admin's device count, so
+    // the legacy macOS child key must carry it as its own max_usage.
+    it('sizes the legacy macOS child key from the count query param (#9615)', async () => {
+      mockSelectFromWhereLimit([makeEnrollmentKey({ maxUsage: 55, usageCount: 3 })]);
+      mockInsertValuesReturning([
+        makeEnrollmentKey({ id: 'child-key-id', name: 'Test Key (installer x52)', maxUsage: 52 }),
+      ]);
+
+      const res = await app.request(`/enrollment-keys/${KEY_ID}/installer/macos?count=52`, {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(200);
+      const valuesFn = vi.mocked(db.insert).mock.results[0]!.value.values;
+      expect(valuesFn).toHaveBeenCalledWith(
+        expect.objectContaining({ maxUsage: 52, name: 'Test Key (installer x52)' }),
+      );
+    });
+
+    it('#7974: macOS installer_download audit never stores the live short code', async () => {
+      mockSelectFromWhereLimit([makeEnrollmentKey()]);
+      mockInsertValuesReturning([
+        makeEnrollmentKey({ id: 'child-key-id', name: 'Test Key (installer)', maxUsage: 1 }),
+      ]);
+
+      await app.request(`/enrollment-keys/${KEY_ID}/installer/macos`, {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      const insertMock = vi.mocked(db.insert).mock.results[0]!.value;
+      const liveCode = insertMock.values.mock.calls[0][0].shortCode as string;
+      expect(liveCode).toMatch(/^[A-Za-z0-9]{10}$/);
+
+      const call = vi
+        .mocked(createAuditLogAsync)
+        .mock.calls.map(([arg]) => arg)
+        .find((arg) => arg.action === 'enrollment_key.installer_download');
+      expect(call).toBeDefined();
+      expect(JSON.stringify(call)).not.toContain(liveCode);
+      expect(call!.details).not.toHaveProperty('shortCode');
+      expect(call!.details).toMatchObject({
+        shortCodeRef: expect.stringMatching(/^[0-9a-f]{12}$/),
+      });
+    });
+
     it('windows bootstrap passes maxUsage to issueBootstrapTokenForKey (count query param)', async () => {
       mockSelectFromWhereLimit([makeEnrollmentKey()]);
 
@@ -528,6 +577,23 @@ describe('enrollment key routes — installer download', () => {
       expect(db.insert).not.toHaveBeenCalled();
     });
 
+    // #9615: a caller that omits `count` still gets a single-device token. The
+    // default is deliberately unchanged — every console caller now sends a
+    // count, and an absent one must never widen the credential.
+    it('windows bootstrap defaults to a single device when count is omitted (#9615)', async () => {
+      mockSelectFromWhereLimit([makeEnrollmentKey({ maxUsage: 55 })]);
+
+      const res = await app.request(`/enrollment-keys/${KEY_ID}/installer/windows`, {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(200);
+      expect(issueBootstrapTokenForKey).toHaveBeenCalledWith(
+        expect.objectContaining({ maxUsage: 1 }),
+      );
+    });
+
     it('passes the ttlMinutes query param through to the bootstrap token (windows) (#2775)', async () => {
       mockSelectFromWhereLimit([makeEnrollmentKey()]);
 
@@ -540,6 +606,75 @@ describe('enrollment key routes — installer download', () => {
       expect(issueBootstrapTokenForKey).toHaveBeenCalledWith(
         expect.objectContaining({ maxUsage: 5, ttlMinutes: 43200 }),
       );
+    });
+
+    // The installer embeds a credential (a bootstrap token, or on the legacy
+    // macOS path a child enrollment key) that lives at most 30 days. An
+    // explicit longer pick is refused with a 400 rather than silently
+    // shortened, so the admin learns the installer will not last that long.
+    it.each([
+      ['windows', 43201],
+      ['windows', 129600],
+      ['macos', 525600],
+    ] as const)('rejects (400) a %s installer ttlMinutes of %i, above the 30-day maximum', async (platform, ttlMinutes) => {
+      mockSelectFromWhereLimit([makeEnrollmentKey()]);
+
+      const res = await app.request(
+        `/enrollment-keys/${KEY_ID}/installer/${platform}?ttlMinutes=${ttlMinutes}`,
+        { method: 'GET', headers: { Authorization: 'Bearer token' } },
+      );
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toContain('43200');
+      expect(body.error).toContain('30 days');
+      expect(issueBootstrapTokenForKey).not.toHaveBeenCalled();
+      expect(db.insert).not.toHaveBeenCalled();
+    });
+
+    // Legacy macOS zip: the embedded credential is a child enrollment key.
+    // With no explicit ttlMinutes it falls back to CHILD_ENROLLMENT_KEY_TTL_MINUTES,
+    // which an operator may have set to a year; the downloaded zip must still
+    // stop enrolling after 30 days. The constant is read at import, so the
+    // route module is re-imported under the stubbed env.
+    it('bounds the legacy macOS child key to 30 days even when CHILD_ENROLLMENT_KEY_TTL_MINUTES is longer', async () => {
+      vi.stubEnv('CHILD_ENROLLMENT_KEY_TTL_MINUTES', '525600');
+      vi.resetModules();
+      try {
+        const { enrollmentKeyRoutes: freshRoutes } = await import('./enrollmentKeys');
+        const { db: freshDb } = await import('../db');
+        const rows = (r: unknown[]) => ({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({ limit: vi.fn().mockResolvedValue(r) }),
+          }),
+        });
+        vi.mocked(freshDb.select)
+          .mockReturnValueOnce(rows([makeEnrollmentKey()]) as any) // parent key
+          .mockReturnValueOnce(rows([]) as any); // allocateShortCode probe
+        const values = vi.fn().mockReturnValue({
+          returning: vi.fn().mockResolvedValue([
+            makeEnrollmentKey({ id: 'child-key-id', name: 'Test Key (installer)', maxUsage: 1 }),
+          ]),
+        });
+        vi.mocked(freshDb.insert).mockReturnValueOnce({ values } as any);
+
+        const freshApp = new Hono();
+        freshApp.route('/enrollment-keys', freshRoutes);
+        const before = Date.now();
+        const res = await freshApp.request(`/enrollment-keys/${KEY_ID}/installer/macos`, {
+          method: 'GET', headers: { Authorization: 'Bearer token' },
+        });
+        const after = Date.now();
+
+        expect(res.status).toBe(200);
+        const childExpiryMs = (values.mock.calls[0]![0] as { expiresAt: Date }).expiresAt.getTime();
+        expect(childExpiryMs).toBeGreaterThanOrEqual(before + 43200 * 60_000 - 50);
+        expect(childExpiryMs).toBeLessThanOrEqual(after + 43200 * 60_000 + 50);
+        expect(clampTtlToCapMock).toHaveBeenCalledWith(ORG_ID, 43200);
+      } finally {
+        vi.unstubAllEnvs();
+        vi.resetModules();
+      }
     });
 
     it('child key honors the ttlMinutes query param (per-link picker) (macos)', async () => {
@@ -782,6 +917,160 @@ describe('enrollment key routes — installer download', () => {
         expect(res.status).toBe(200);
         expect(rateLimiter).not.toHaveBeenCalled();
       });
+    });
+  });
+
+  // ============================================
+  // #7217 — ?discardKeyOnFailure=1: a failed build must not leave the parent
+  // key that Add Device minted for this attempt live.
+  // ============================================
+  describe('discardKeyOnFailure (#7217)', () => {
+    /** Capture db.delete().where().returning() — the guarded discard. */
+    function mockDiscardDelete(rows: any[] = [{ id: KEY_ID, orgId: ORG_ID, name: 'Add device installer' }]) {
+      const where = vi.fn().mockReturnValue({
+        returning: vi.fn().mockResolvedValue(rows),
+      });
+      vi.mocked(db.delete).mockReturnValueOnce({ where } as any);
+      return where;
+    }
+
+    it('deletes the parent key when the Windows build fails (non-https server)', async () => {
+      process.env.PUBLIC_API_URL = 'http://self-hosted.example.com:8080';
+      mockSelectFromWhereLimit([makeEnrollmentKey({ maxUsage: 1 })]);
+      const where = mockDiscardDelete();
+
+      const res = await app.request(
+        `/enrollment-keys/${KEY_ID}/installer/windows?discardKeyOnFailure=1`,
+        { method: 'GET', headers: { Authorization: 'Bearer token' } },
+      );
+
+      expect(res.status).toBe(400);
+      expect(db.delete).toHaveBeenCalledTimes(1);
+      expect(where).toHaveBeenCalledTimes(1);
+      expect(createAuditLogAsync).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'enrollment_key.delete',
+          resourceId: KEY_ID,
+          details: expect.objectContaining({
+            reason: 'artifact_not_produced',
+            route: 'installer',
+            status: 400,
+          }),
+        }),
+      );
+    });
+
+    it('deletes the parent key (and with it the bootstrap token) when the MSI fetch fails', async () => {
+      const { fetchRegularMsi } = await import('../services/installerBuilder');
+      vi.mocked(fetchRegularMsi).mockRejectedValueOnce(new Error('GitHub 404'));
+      mockSelectFromWhereLimit([makeEnrollmentKey()]);
+      mockDiscardDelete();
+
+      const res = await app.request(
+        `/enrollment-keys/${KEY_ID}/installer/windows?discardKeyOnFailure=1`,
+        { method: 'GET', headers: { Authorization: 'Bearer token' } },
+      );
+
+      expect(res.status).toBe(503);
+      // A token was issued before the failure; deleting the parent cascades it
+      // (installer_bootstrap_tokens.parent_enrollment_key_id ON DELETE CASCADE).
+      expect(issueBootstrapTokenForKey).toHaveBeenCalledTimes(1);
+      expect(db.delete).toHaveBeenCalledTimes(1);
+    });
+
+    it('deletes the parent key when the handler throws', async () => {
+      vi.mocked(issueBootstrapTokenForKey).mockRejectedValueOnce(new Error('db down'));
+      mockSelectFromWhereLimit([makeEnrollmentKey()]);
+      mockDiscardDelete();
+
+      const res = await app.request(
+        `/enrollment-keys/${KEY_ID}/installer/windows?discardKeyOnFailure=1`,
+        { method: 'GET', headers: { Authorization: 'Bearer token' } },
+      );
+
+      expect(res.status).toBe(500);
+      expect(db.delete).toHaveBeenCalledTimes(1);
+    });
+
+    it('keeps the parent key when the installer is produced', async () => {
+      mockSelectFromWhereLimit([makeEnrollmentKey()]);
+
+      const res = await app.request(
+        `/enrollment-keys/${KEY_ID}/installer/windows?discardKeyOnFailure=1`,
+        { method: 'GET', headers: { Authorization: 'Bearer token' } },
+      );
+
+      expect(res.status).toBe(200);
+      expect(db.delete).not.toHaveBeenCalled();
+    });
+
+    it('never deletes on failure without the flag (Settings downloads reuse long-lived keys)', async () => {
+      process.env.PUBLIC_API_URL = 'http://self-hosted.example.com:8080';
+      mockSelectFromWhereLimit([makeEnrollmentKey()]);
+
+      const res = await app.request(`/enrollment-keys/${KEY_ID}/installer/windows`, {
+        method: 'GET', headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(400);
+      expect(db.delete).not.toHaveBeenCalled();
+    });
+
+    it('does not audit a delete when the guard matched nothing (key used, or not the caller\'s)', async () => {
+      process.env.PUBLIC_API_URL = 'http://self-hosted.example.com:8080';
+      mockSelectFromWhereLimit([makeEnrollmentKey()]);
+      mockDiscardDelete([]);
+
+      const res = await app.request(
+        `/enrollment-keys/${KEY_ID}/installer/windows?discardKeyOnFailure=1`,
+        { method: 'GET', headers: { Authorization: 'Bearer token' } },
+      );
+
+      expect(res.status).toBe(400);
+      expect(db.delete).toHaveBeenCalledTimes(1);
+      expect(createAuditLogAsync).not.toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'enrollment_key.delete' }),
+      );
+    });
+
+    it('logs (never swallows) a failed discard and still returns the original error', async () => {
+      process.env.PUBLIC_API_URL = 'http://self-hosted.example.com:8080';
+      mockSelectFromWhereLimit([makeEnrollmentKey()]);
+      vi.mocked(db.delete).mockReturnValueOnce({
+        where: vi.fn().mockReturnValue({
+          returning: vi.fn().mockRejectedValue(new Error('connection reset')),
+        }),
+      } as any);
+      const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+      const res = await app.request(
+        `/enrollment-keys/${KEY_ID}/installer/windows?discardKeyOnFailure=1`,
+        { method: 'GET', headers: { Authorization: 'Bearer token' } },
+      );
+
+      expect(res.status).toBe(400);
+      expect(errSpy).toHaveBeenCalledWith(
+        expect.stringMatching(/could not discard/i),
+        expect.objectContaining({ keyId: KEY_ID }),
+      );
+      errSpy.mockRestore();
+    });
+
+    it('does not delete when the caller is denied the key\'s site', async () => {
+      siteScope.allowedSiteIds = ['site-visible'];
+      mockSelectFromWhereLimit([makeEnrollmentKey({ siteId: 'site-hidden' })]);
+      mockDiscardDelete([]);
+
+      const res = await app.request(
+        `/enrollment-keys/${KEY_ID}/installer/windows?discardKeyOnFailure=1`,
+        { method: 'GET', headers: { Authorization: 'Bearer token' } },
+      );
+
+      expect(res.status).toBe(404);
+      await expect(res.json()).resolves.toEqual({ error: 'Enrollment key not found' });
+      // The guard carries the site ceiling, so the DB-side delete matches
+      // nothing; nothing is audited.
+      expect(createAuditLogAsync).not.toHaveBeenCalled();
     });
   });
 });

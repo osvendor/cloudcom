@@ -1,4 +1,5 @@
 import {
+  M365_READ_ACTION_FIELDS,
   SIGNIN_EVENTS_DEFAULT_WINDOW_DAYS,
   type M365SyncAction,
   type M365SyncActionResponse,
@@ -14,13 +15,24 @@ import { GraphClientError, type GraphSyncPageSet } from './graphClient';
  * days and a quarterly one 90, so pagination and a per-run item budget belong
  * in a sync action, not in a technician-facing read.
  *
- * Interactive sign-ins only: `signInEventTypes/any(t: t eq 'interactiveUser')`.
- * Non-interactive, service-principal and managed-identity sign-ins are out of
- * the first cut.
+ * Interactive sign-ins only, by construction: the client is rooted at Graph
+ * v1.0, and v1.0 /auditLogs/signIns IS the interactive-user sign-in collection.
+ * Do NOT add a `signInEventTypes` clause — that property exists only on /beta,
+ * and v1.0 answers 400 to any $filter that names it (#9393). Non-interactive,
+ * service-principal and managed-identity sign-ins live on /beta and are out of
+ * the first cut. `isInteractive` is still projected so downstream can check.
  *
- * Ordered by createdDateTime ASCENDING so a continuation resumes
- * deterministically, and bounded by a half-open [since, until) window so two
- * adjacent runs cannot both claim an event on the boundary.
+ * NO `$orderby` (#9394). An explicit ascending sort over a
+ * `createdDateTime` window was the shape whose first page did not return
+ * inside the 30 s per-request budget on a reporting tenant; without it Graph
+ * was observed to serve this collection newest-first, and an unsorted,
+ * narrowly selected read over a day came back promptly. Order is not what makes the walk resumable: the continuation is the
+ * sealed `@odata.nextLink`, and the API's next window is computed from what a
+ * COMPLETED walk proved (`signinEventsWindow` in the API), never from the
+ * newest row a half-finished walk happened to persist. Pages are small and
+ * `$select`-ed to the projected fields for the same reason. The window stays
+ * half-open [since, until) so two adjacent runs cannot both claim an event on
+ * the boundary.
  *
  * Its own token bucket (`signinEventsLimiter`), NOT signinLimiter's:
  * /users?$select=signInActivity is a different Graph surface with a different
@@ -31,9 +43,6 @@ import { GraphClientError, type GraphSyncPageSet } from './graphClient';
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
 export const SIGNIN_EVENTS_PATH = '/auditLogs/signIns';
-
-/** Graph's own event-type discriminator for a human, interactive sign-in. */
-export const SIGNIN_EVENTS_INTERACTIVE_FILTER = "signInEventTypes/any(t: t eq 'interactiveUser')";
 
 export interface SigninEventsWindow {
   since: string;
@@ -54,15 +63,22 @@ export function resolveSigninEventsWindow(
   return { since, until };
 }
 
+/** Only the fields the sync projects — a full signIn object is several KB. */
+const SIGNIN_EVENTS_SELECT = M365_READ_ACTION_FIELDS['m365.sync.signin_events'].join(',');
+
+export function signinEventsQuery(window: SigninEventsWindow, pageSize: number): Record<string, string> {
+  return {
+    '$filter': signinEventsFilter(window),
+    '$select': SIGNIN_EVENTS_SELECT,
+    '$top': String(pageSize),
+  };
+}
+
 export function signinEventsFilter(window: SigninEventsWindow): string {
   // Both bounds are ISO instants produced by Zod's `.datetime()` validation on
   // the way in (or by toISOString here), so there is nothing quote-shaped to
   // escape — Graph takes bare timestamps in $filter.
-  return [
-    `createdDateTime ge ${window.since}`,
-    `createdDateTime lt ${window.until}`,
-    SIGNIN_EVENTS_INTERACTIVE_FILTER,
-  ].join(' and ');
+  return `createdDateTime ge ${window.since} and createdDateTime lt ${window.until}`;
 }
 
 /**

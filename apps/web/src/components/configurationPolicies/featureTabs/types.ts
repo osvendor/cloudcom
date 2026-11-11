@@ -1,4 +1,5 @@
 import type { ConfigFeatureType } from '@breeze/shared';
+import { i18n } from '@/lib/i18n';
 
 // Derived from the canonical CONFIG_FEATURE_TYPES (single source of truth in
 // @breeze/shared) so the config-policy editor's feature tabs can't silently
@@ -6,11 +7,9 @@ import type { ConfigFeatureType } from '@breeze/shared';
 // type makes FEATURE_META below fail to compile until a tab entry is added, and
 // featureTypeParity.test.ts asserts the exclusion stays honest. (#2004)
 //
-// The exclusion list is currently EMPTY — every canonical feature type has an
-// editor tab (onedrive_helper gained one in the OneDrive Helper phase-3 work).
-// The mechanism (const tuple + Exclude) is intentionally retained so a future
-// feature type that legitimately has no tab can be excluded here in one place
-// without re-plumbing the type derivation.
+// Every canonical feature type now has an editor tab (containment gained
+// ContainmentTab in #10100), so the tuple is empty. It is kept so a future
+// type that ships before its tab can be excluded here deliberately.
 //
 // FeatureType is sourced FROM this tuple (not a parallel literal) so the runtime
 // exclusion list and the compile-time Exclude can't drift from each other.
@@ -22,6 +21,14 @@ export type FeatureLink = {
   featureType: FeatureType;
   featurePolicyId: string | null;
   inlineSettings: Record<string, unknown> | null;
+  /**
+   * `security` links only (list/detail reads): 'reapproval_required' = auto-
+   * quarantine is on but has no stored approval, so scans run detect-only
+   * until a user with devices:execute saves the link.
+   */
+  autoQuarantineApproval?: 'approved' | 'legacy_grandfathered' | 'reapproval_required' | 'not_enabled';
+  /** Why re-approval is required; 'approver_invalid' = the approver lost devices:execute or left. */
+  autoQuarantineApprovalReason?: 'approver_invalid' | 'not_approved' | 'invalid_approval' | null;
   createdAt?: string;
   updatedAt?: string;
 };
@@ -48,12 +55,24 @@ export type FeatureTabProps = {
   /** Parent policy's feature link for this tab (for inheritance display) */
   parentLink?: FeatureLink | undefined;
   /**
+   * Every feature link on the policy, including this tab's own. Read-only;
+   * changes go through useFeatureLink and onLinkChanged.
+   */
+  siblingLinks?: FeatureLink[];
+  /**
    * Org this policy is scoped to (null for partner-wide policies — #1724).
    * Optional: only tabs that need to make an org-scoped fetch on behalf of
    * the policy (e.g. OneDriveHelperTab -> OneDriveLibraryPicker's M365/Graph
    * calls) destructure it; every other tab ignores it.
    */
   orgId?: string | null;
+  /**
+   * Partner that owns a partner-wide policy (null for org policies). Lets the
+   * Security tab's rule-set picker (#6267) offer a partner-wide policy only
+   * its own partner's sets. Org policies are not narrowed by partner in the
+   * picker; the server gate resolves the org's partner and decides.
+   */
+  partnerId?: string | null;
 };
 
 export const FEATURE_META: Record<FeatureType, {
@@ -62,11 +81,9 @@ export const FEATURE_META: Record<FeatureType, {
   description: string;
 }> = {
   patch:        { label: 'Patches',      fetchUrl: '/update-rings',        description: 'Patch management settings' },
-  alert_rule:   { label: 'Alerts',       fetchUrl: '/alerts/rules',        description: 'Server-evaluated alert rules: CPU/RAM/disk thresholds, offline detection, event log alerts' },
   monitors:     { label: 'Monitors',     fetchUrl: '/monitor-definitions', description: 'Monitors attached to this policy: condition, response, delivery and escalation in one object' },
   backup:       { label: 'Backup',       fetchUrl: '/backup/configs',      description: 'Backup schedule and retention' },
   security:     { label: 'Security',     fetchUrl: '/security/policies',   description: 'Security policy settings' },
-  monitoring:   { label: 'Service & Process Monitoring', fetchUrl: '/monitoring', description: 'Agent-side watches: service/process stop detection, auto-restart, resource limits per process' },
   maintenance:  { label: 'Maintenance',  fetchUrl: '/maintenance/windows', description: 'Maintenance window settings' },
   compliance:   { label: 'Compliance',   fetchUrl: '/policies',            description: 'Compliance rules and enforcement' },
   automation:   { label: 'Automations',  fetchUrl: '/automations',         description: 'Automated tasks and responses' },
@@ -81,4 +98,59 @@ export const FEATURE_META: Record<FeatureType, {
   vulnerability: { label: 'Vulnerability Scanning', fetchUrl: null,       description: 'Enable per-device CVE correlation (vulnerability detection)' },
   onedrive_helper: { label: 'OneDrive Helper', fetchUrl: null, description: 'Silently sign in OneDrive, enforce Files On-Demand and Known Folder Move, and auto-mount SharePoint libraries per user.' },
   device_lifecycle: { label: 'Device Lifecycle', fetchUrl: null, description: 'Permanently delete removed devices after a retention window' },
+  hardware_monitoring: { label: 'Hardware Monitoring', fetchUrl: null, description: 'RAID and disk health collection intervals' },
+  time_sync: {
+    get label() {
+      return i18n.t('devices:timeSync.management.title');
+    },
+    fetchUrl: null,
+    get description() {
+      return i18n.t('devices:timeSync.management.description');
+    },
+  },
+  workload_inventory: {
+    get label() {
+      return i18n.t('devices:workloads.policy.title');
+    },
+    fetchUrl: null,
+    get description() {
+      return i18n.t('devices:workloads.policy.description');
+    },
+  },
+  security_agents: {
+    get label() {
+      return i18n.t('policies:configurationPolicies.featureTabs.securityAgentsTab.title');
+    },
+    fetchUrl: null,
+    get description() {
+      return i18n.t('policies:configurationPolicies.featureTabs.securityAgentsTab.description');
+    },
+  },
+  system_protection: {
+    get label() {
+      return i18n.t('policies:configurationPolicies.featureTabs.systemProtectionTab.title');
+    },
+    fetchUrl: null,
+    get description() {
+      return i18n.t('policies:configurationPolicies.featureTabs.systemProtectionTab.description');
+    },
+  },
+  containment: {
+    get label() {
+      return i18n.t('policies:configurationPolicies.featureTabs.containmentTab.title');
+    },
+    fetchUrl: null,
+    get description() {
+      return i18n.t('policies:configurationPolicies.featureTabs.containmentTab.description');
+    },
+  },
+  oem_updates: {
+    get label() {
+      return i18n.t('policies:configurationPolicies.featureTabs.vendorUpdatesTab.title');
+    },
+    fetchUrl: null,
+    get description() {
+      return i18n.t('policies:configurationPolicies.featureTabs.vendorUpdatesTab.description');
+    },
+  },
 };

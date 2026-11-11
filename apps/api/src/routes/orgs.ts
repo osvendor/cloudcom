@@ -1,3 +1,6 @@
+import { findPartnerOwnedGroupIds, partnerGroupTargetRefusal } from '../services/deviceGroupOwnership';
+import { deleteSiteTopologyAiSessions } from '../services/topology/siteTopologySessions';
+import { removeUnreferencedScreenshotFiles } from '../services/screenshotStorage';
 import { ensureDefaultProfile } from '../services/billingProfileService';
 import { lockMfaPolicySettings, countMfaPolicyLockouts, mfaPolicyLockoutResponse } from '../services/mfaPolicyActivation';
 import { MFA_ENROLLMENT_GRACE_DAYS_MAX } from '../services/mfaEnrollmentGrace';
@@ -6,10 +9,13 @@ import { Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
 import type { Context, Next } from 'hono';
 import { zValidator } from '../lib/validation';
+import { refuseReservedBrandName } from '../lib/reservedBrandName';
 import { z } from 'zod';
 import { and, eq, ilike, inArray, isNull, ne, not, notInArray, or, sql } from 'drizzle-orm';
-import { db, runOutsideDbContext, withSystemDbAccessContext } from '../db';
+import { scheduleServingRefreshForPartner } from '../services/trustPage/servingSet';
+import { db, runAfterDbContextExit, runOutsideDbContext, withSystemDbAccessContext } from '../db';
 import { resolveAuditOrgIdForPartner } from '../services/auditOrgResolver';
+import { deleteSiteOwnedTopologyAlerts, lockSiteForDelete } from '../services/siteOwnedAlerts';
 import { partners, organizations, sites, devices, agentVersions, partnerUsers } from '../db/schema';
 // Imported from the CONCRETE schema module, not the '../db/schema' barrel:
 // several suites mock that barrel with a non-partial factory, and a plain
@@ -22,12 +28,22 @@ import { ORG_SLUG_UNIQUE_INDEX } from '../db/schema/orgs';
 // on the mock") before a single test runs.
 import { psaConnections } from '../db/schema/integrations';
 import { authMiddleware, requireMfa, requirePermission, requireScope, requirePartner, type AuthContext } from '../middleware/auth';
+import { isAutomationPrincipal } from '../middleware/principalKind';
+import { markPermissionGate } from '../middleware/permissionGate';
+import { wispEnabled } from '../config/env';
 import { writeAuditEvent, writeRouteAudit } from '../services/auditEvents';
 import { getEffectiveOrgSettings, assertNotLocked } from '../services/effectiveSettings';
+import {
+  clampSessionTimeoutInSettings,
+  sessionTimeoutSettingsError,
+} from '../services/sessionTimeoutLimits';
+import { getAiApprovalTimeout } from '../services/aiApprovalTimeout';
 import { normalizeAlertThresholds } from '../services/aiBudgetAlerts';
 import { enqueueAiBudgetEvaluationForPartner } from '../jobs/aiBudgetAlertDelivery';
 import { clearPartnerScopePolicyCache } from '../oauth/partnerScopePolicy';
+import { invalidateAgentOrgSettingsCaches } from '../services/agentOrgSettingsCache';
 import { PERMISSIONS, canAccessSite, type UserPermissions } from '../services/permissions';
+import { defaultAssigneeSettingsError, isAssignableInboundDefaultUser, listAssignableInboundDefaultUsers } from '../services/inboundEmail/defaultAssigneeEligibility';
 import {
   restoreOrganizationTenantAccess,
   restorePartnerTenantAccess,
@@ -53,12 +69,27 @@ import { resolvePartnerOrgReach } from '../services/partnerOrgSelection';
 import { stripOrgLifecycleInternalSettings } from '../services/orgSettingsInternalKeys';
 import { captureException } from '../services/sentry';
 import { encryptColumnValueForWrite } from '../services/encryptedColumnRegistry';
+import {
+  LOG_FORWARDING_ORIGIN_CHANGE_MESSAGE,
+  LOG_FORWARDING_SECRET_DESTINATIONS,
+  REMOTE_ACCESS_LAUNCHER_ORIGIN_CHANGE_MESSAGE,
+  REMOTE_ACCESS_LAUNCHER_SECRET_DESTINATIONS,
+  SettingsSecretInputError,
+  maskSettingsSecrets,
+  restoreMaskedSettingsSecrets,
+  withMaskedSettings,
+} from '../services/settingsSecretMasking';
+import { settingsSecretWouldFollowNewOrigin } from '../services/credentialOriginBinding';
+import { isMaskedIntegrationSecret } from '../services/notificationChannelSecrets';
 import { syncBillingContactRow, syncSiteContactRow } from '../services/contacts/compat';
 import { escapeLike } from '../utils/sql';
 import { PG_UUID_REGEX } from '../utils/uuid';
 import { isPgUniqueViolation } from '../utils/pgErrors';
-import { isAllowedLauncherScheme, isValidIanaTimezone, canonicalizeTimezone, isValidMaintenanceWindow, MAINTENANCE_WINDOW_ERROR_MESSAGE, normalizeVersionPin, PINNABLE_COMPONENTS, agentVersionPinsSchema, enrollmentDefaultsSchema, httpUrlValue, httpUrlField, SUPPORTED_LOCALES, ticketingInboundSettingsSchema, timeTrackingSessionSuggestionsSchema, EMAIL_TEMPLATE_IDS, isBlankEmailTemplateHtml } from '@breeze/shared';
+import { isAllowedLauncherScheme, isValidIanaTimezone, canonicalizeTimezone, isValidMaintenanceWindow, MAINTENANCE_WINDOW_ERROR_MESSAGE, normalizeVersionPin, PINNABLE_COMPONENTS, agentVersionPinsSchema, enrollmentDefaultsSchema, aiApprovalSettingsSchema, httpUrlField, keptSecretOrHttpUrlValue, SUPPORTED_LOCALES, ticketingInboundSettingsSchema, timeTrackingSessionSuggestionsSchema, EMAIL_TEMPLATE_IDS, isBlankEmailTemplateHtml, securityLimitSchemas, portalCustomCssSchema } from '@breeze/shared';
 import type { IpAllowlistStatus, ResolvedEnrollmentDefaults, SupportedLocale } from '@breeze/shared';
+import { ERROR_CODES, siteLocationFieldsShape, siteLocationPairIsConsistent, SITE_LOCATION_PAIR_MESSAGE, DEFAULT_SIGNUP_INTENT } from '@breeze/shared';
+import { siteLocationRoutes } from './siteLocation';
+import { partnerSettingsInheritanceRoutes } from './partnerSettingsInheritance';
 import { getEnrollmentDefaultsForOrg } from '../services/enrollmentDefaults';
 import { isValidIpOrCidr } from '../services/ipMatch';
 import { applyNewPartnerDefaultSettings } from '../services/partnerDefaultSettings';
@@ -80,13 +111,25 @@ import { writeOrgImportAudits } from '../services/orgImport/audit';
 import { commitImportRowSchema, importRowSchema } from '../services/orgImport/schemas';
 import { resolveImportPartnerId } from './importScope';
 import { registerOrgContactsRoutes } from './orgContacts';
+import { registerOrgContactResponsibilitiesRoutes } from './orgContactResponsibilities';
 import { registerOrgPortalSettingsRoutes } from './orgPortalSettings';
+import { registerPortalAccessPolicyRoutes } from './orgPortalAccessPolicy';
+import { registerPortalEntraTenantRoutes } from './orgPortalEntraTenant';
+import { registerOrgCustomerDomainRoutes } from './orgCustomerDomains';
+import { registerOrgPortalPreviewRoutes } from './orgPortalPreview';
 import { registerOrgPortalUsersRoutes } from './orgPortalUsers';
+import { registerOrgPortalAccessRequestRoutes } from './orgPortalAccessRequests';
 import { registerOrgTicketSettingsRoutes } from './orgTicketSettings';
 import { registerOrgBillingProfileRoutes } from './orgBillingProfile';
 import { registerOrgAuditRetentionSettingsRoutes } from './orgAuditRetentionSettings';
 import { TOPOLOGY_FLAG_KEYS } from '../services/topology/flags';
+import { toolRateLimitMultiplierSchema } from '../services/aiToolRateLimits';
+import { isHoldingOrg } from '../services/unassignedPool/protectedOrg';
+import { PROTECTED_ORG_ERROR } from '../services/unassignedPool/orgType';
 
+import { notHiddenOrgType, notInHiddenOrgCondition } from '../services/unassignedPool/visibility';
+import { partnerVisibleOrgConditions } from '../services/partnerVisibleOrgs';
+import { notParkedDeviceCondition } from '../services/unassignedPool/selectorPredicate';
 /**
  * Fold the legacy `security.allowedMfaMethods` input alias into the canonical
  * `security.allowedMethods` and drop the alias key so it is never persisted.
@@ -177,6 +220,16 @@ const paginationSchema = z.object({
   limit: z.string().optional()
 });
 
+/** UUID enrollment defaults name groups; legacy sentinels remain valid. */
+async function partnerEnrollmentGroupIds(settings: unknown): Promise<string[]> {
+  if (!settings || typeof settings !== 'object') return [];
+  const defaults = (settings as Record<string, unknown>).defaults;
+  if (!defaults || typeof defaults !== 'object') return [];
+  const groupId = (defaults as Record<string, unknown>).deviceGroup;
+  if (typeof groupId !== 'string' || !z.string().guid().safeParse(groupId).success) return [];
+  return findPartnerOwnedGroupIds([groupId]);
+}
+
 /**
  * Save-time validation for agent/watchdog version pins on a `settings.defaults`
  * object (issue #2124). A pin of 'latest' / unset is always valid. A concrete
@@ -211,13 +264,15 @@ async function validateAgentVersionPins(defaults: unknown): Promise<string | nul
 }
 
 const createPartnerSchema = z.object({
-  name: z.string().min(1),
+  name: refuseReservedBrandName(z.string().min(1)),
   slug: z.string().min(1).max(100),
   type: z.enum(['msp', 'enterprise', 'internal']).optional(),
   // plan and maxDevices are managed by the billing service (via direct DB writes).
   // They are intentionally excluded from the API schema to prevent self-service changes.
   maxOrganizations: z.number().int().nullable().optional(),
-  settings: z.any().optional(),
+  settings: z.any().optional().refine((settings) => sessionTimeoutSettingsError(settings) === null, {
+    message: 'security.sessionTimeout must be an integer between 1 and 720 minutes (12 hours)',
+  }),
   billingEmail: z.string().email().optional()
 });
 
@@ -240,10 +295,27 @@ const updatePartnerSchema = createPartnerSchema.partial().extend({
   // Operator-only per-partner AI for Office entitlement. Settable here (system
   // scope) but NOT on /partners/me (partner scope) — partners can't self-enable.
   aiForOfficeEnabled: z.boolean().optional(),
+  // Operator-only: remove the "Powered by Breeze" attribution from this partner's
+  // public trust pages. Settable here (system scope), NOT on /partners/me.
+  trustPageUnbranded: z.boolean().optional(),
   settings: z.any().optional().refine(settingsAllowlistEntriesValid, {
     message: 'Each IP allowlist entry must be a valid IP address or CIDR range',
+  }).refine((settings) => sessionTimeoutSettingsError(settings) === null, {
+    message: 'security.sessionTimeout must be an integer between 1 and 720 minutes (12 hours)',
   }),
 });
+
+/**
+ * A settings subtree with its own home (e.g. `flows`, written only by
+ * PUT /flows/limits): a wholesale settings write keeps the stored subtree and
+ * ignores an incoming one, so it can neither erase nor set it. Mutates `next`.
+ */
+function keepOwnedSettingsSubtree(next: Record<string, unknown>, currentSettings: unknown, key: string): void {
+  const stored = currentSettings && typeof currentSettings === 'object' && !Array.isArray(currentSettings)
+    ? (currentSettings as Record<string, unknown>)[key]
+    : undefined;
+  if (stored === undefined) delete next[key]; else next[key] = stored;
+}
 
 // PATCH /partners/:id writes the settings column wholesale. A write whose
 // settings (or security object) simply omits `ipAllowlist` must not silently
@@ -272,12 +344,14 @@ function preserveIpAllowlistOnOmit(
 
 export const createOrganizationSchema = z.object({
   partnerId: z.string().guid().optional(),
-  name: z.string().min(1),
+  name: refuseReservedBrandName(z.string().min(1)),
   slug: z.string().min(1).max(100),
   type: z.enum(['customer', 'internal']).optional(),
   status: z.enum(['active', 'suspended', 'trial', 'churned']).optional(),
   // maxDevices is managed by the billing service — excluded from API schema
-  settings: z.any().optional(),
+  settings: z.any().optional().refine((settings) => sessionTimeoutSettingsError(settings) === null, {
+    message: 'security.sessionTimeout must be an integer between 1 and 720 minutes (12 hours)',
+  }),
   contractStart: z.string().nullable().optional(),
   contractEnd: z.string().nullable().optional(),
   billingContact: z.any().optional()
@@ -391,7 +465,17 @@ const createSiteSchema = siteBaseSchema.extend({
   timezone: z.string().refine(isValidIanaTimezone, 'Invalid IANA timezone').default('UTC')
 });
 
-const updateSiteSchema = siteBaseSchema.partial().omit({ orgId: true });
+// Location fields are PATCH-only: create never accepts them (zod strips them), so
+// POST /sites cannot write an unstamped pin. latitude/longitude are a pair.
+const updateSiteSchema = siteBaseSchema
+  .partial()
+  .omit({ orgId: true })
+  .extend(siteLocationFieldsShape)
+  .superRefine((v, ctx) => {
+    if (!siteLocationPairIsConsistent(v)) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: SITE_LOCATION_PAIR_MESSAGE, path: ['latitude'] });
+    }
+  });
 
 function getPagination(query: { page?: string; limit?: string }) {
   const page = Math.max(1, Number.parseInt(query.page ?? '1', 10) || 1);
@@ -415,7 +499,38 @@ async function ensureOrgAccess(
 }
 
 
+/**
+ * Resolve an incoming `settings` value (organization, partner or site) against
+ * the stored one before it is sealed and written: masked markers and omitted
+ * secret keys keep the stored secret, and a log-forwarding destination or a
+ * remote-access launcher may not move to a new origin while a stored
+ * credential is kept rather than re-entered. `stored` is undefined on create, where there is nothing to keep.
+ */
+function resolveIncomingSettingsSecrets(
+  incoming: unknown,
+  stored: unknown,
+): { ok: true; settings: unknown } | { ok: false; error: string } {
+  if (settingsSecretWouldFollowNewOrigin(incoming, stored, LOG_FORWARDING_SECRET_DESTINATIONS, isMaskedIntegrationSecret)) {
+    return { ok: false, error: LOG_FORWARDING_ORIGIN_CHANGE_MESSAGE };
+  }
+  if (settingsSecretWouldFollowNewOrigin(incoming, stored, REMOTE_ACCESS_LAUNCHER_SECRET_DESTINATIONS, isMaskedIntegrationSecret)) {
+    return { ok: false, error: REMOTE_ACCESS_LAUNCHER_ORIGIN_CHANGE_MESSAGE };
+  }
+  try {
+    return { ok: true, settings: restoreMaskedSettingsSecrets(incoming, stored) };
+  } catch (err) {
+    if (err instanceof SettingsSecretInputError) return { ok: false, error: err.message };
+    throw err;
+  }
+}
+
 orgRoutes.use('*', authMiddleware);
+
+// Mounted after authMiddleware so the pin route inherits authentication.
+orgRoutes.route('/', siteLocationRoutes);
+// Partner settings inheritance read model (#9170): after authMiddleware, before
+// /partners/:id. Its middleware is per endpoint, never a wildcard.
+orgRoutes.route('/', partnerSettingsInheritanceRoutes);
 
 // GET / - List organizations accessible to the current user
 orgRoutes.get('/', requireScope('organization', 'partner', 'system'), requireOrgRead, async (c) => {
@@ -423,7 +538,7 @@ orgRoutes.get('/', requireScope('organization', 'partner', 'system'), requireOrg
 
   // The per-partner 'quick_support' org stays inside accessibleOrgIds so RLS
   // lets a tech reach their own support session — it must never be enumerated.
-  const conditions = [isNull(organizations.deletedAt), ne(organizations.type, 'quick_support')];
+  const conditions = [isNull(organizations.deletedAt), notHiddenOrgType()];
 
   if (auth.scope === 'organization' && auth.orgId) {
     conditions.push(eq(organizations.id, auth.orgId));
@@ -442,7 +557,7 @@ orgRoutes.get('/', requireScope('organization', 'partner', 'system'), requireOrg
     .where(and(...conditions))
     .orderBy(organizations.name);
 
-  return c.json({ data });
+  return c.json({ data: data.map(withMaskedSettings) });
 });
 
 // --- Partners (system admins) ---
@@ -500,8 +615,17 @@ const partnerPublicColumns = () => ({
   defaultMarkupPercent: partners.defaultMarkupPercent,
   autoTaxHardware: partners.autoTaxHardware,
   invoiceDeviceAppendix: partners.invoiceDeviceAppendix,
+  invoiceLineGrouping: partners.invoiceLineGrouping,
+  invoiceLineShowDate: partners.invoiceLineShowDate,
+  invoiceLineShowNote: partners.invoiceLineShowNote,
+  invoiceLineShowWorkedTime: partners.invoiceLineShowWorkedTime,
   catalogAiStyle: partners.catalogAiStyle,
+  // #9075 W4a: Settings → Billing → Agreements reads these back.
+  agreementDefaultExpiryDays: partners.agreementDefaultExpiryDays,
+  agreementReminderIntervalDays: partners.agreementReminderIntervalDays,
+  agreementMaxReminders: partners.agreementMaxReminders,
   aiForOfficeEnabled: partners.aiForOfficeEnabled,
+  trustPageUnbranded: partners.trustPageUnbranded,
   serviceManagementMode: partners.serviceManagementMode,
   serviceManagementPsaConnectionId: partners.serviceManagementPsaConnectionId,
   createdAt: partners.createdAt,
@@ -527,7 +651,7 @@ orgRoutes.get('/partners', requireScope('system'), requireOrgRead, zValidator('q
     .orderBy(partners.createdAt, partners.id);
 
   return c.json({
-    data,
+    data: data.map(withMaskedSettings),
     pagination: { page, limit, total: Number(count) }
   });
 });
@@ -545,6 +669,23 @@ orgRoutes.post('/partners', requireScope('system'), requireOrgWrite, requireMfa(
   // otherwise it mints `{}`-settings partners that the inbound readers' legacy
   // absent-means-enabled fallback treats as opted IN (the #3608 regression).
   data.settings = applyNewPartnerDefaultSettings(data.settings);
+  // A partner being created has no members, so it cannot have a default
+  // inbound assignee yet (settings is free-form on this system route).
+  const createAssigneeError = await defaultAssigneeSettingsError(data.settings, null);
+  if (createAssigneeError) {
+    return c.json({ error: createAssigneeError, code: 'DEFAULT_ASSIGNEE_NOT_ASSIGNABLE' }, 400);
+  }
+  const partnerGroupIds = await partnerEnrollmentGroupIds(data.settings);
+  if (partnerGroupIds.length > 0) return c.json(partnerGroupTargetRefusal(partnerGroupIds), 400);
+
+  const createSecrets = resolveIncomingSettingsSecrets(data.settings, undefined);
+  if (!createSecrets.ok) {
+    return c.json({ error: createSecrets.error }, 400);
+  }
+  // settings.flows is owned by PUT /flows/limits (W05 #5220): a create cannot seed it.
+  if (createSecrets.settings && typeof createSecrets.settings === 'object' && !Array.isArray(createSecrets.settings)) {
+    keepOwnedSettingsSubtree(createSecrets.settings as Record<string, unknown>, undefined, 'flows');
+  }
 
   const clash = await db
     .select({ id: partners.id })
@@ -555,7 +696,7 @@ orgRoutes.post('/partners', requireScope('system'), requireOrgWrite, requireMfa(
     ))
     .limit(1);
   if (clash[0]) {
-    return c.json({ error: 'That partner identifier is already in use' }, 409);
+    return c.json({ error: 'That partner identifier is already in use', code: ERROR_CODES.CONFLICT }, 409);
   }
 
   const [partner] = await db.transaction(async (tx) => {
@@ -566,7 +707,10 @@ orgRoutes.post('/partners', requireScope('system'), requireOrgWrite, requireMfa(
         slug: data.slug,
         type: data.type,
         maxOrganizations: data.maxOrganizations,
-        settings: data.settings,
+        // This route bypasses createPartner. Persist the fresh-business offer
+        // here too; existing partners' absent intent remains a legacy commitment.
+        purchaseSelection: { ...DEFAULT_SIGNUP_INTENT },
+        settings: encryptColumnValueForWrite('partners', 'settings', createSecrets.settings),
         billingEmail: data.billingEmail
       })
       .returning(partnerPublicColumns());
@@ -595,18 +739,12 @@ orgRoutes.post('/partners', requireScope('system'), requireOrgWrite, requireMfa(
     }
   });
 
-  return c.json(partner, 201);
+  return c.json(withMaskedSettings(partner), 201);
 });
 
 // --- Partner Self-Service (partner-scoped users) ---
 // NOTE: all /partners/me handlers (GET, PATCH) must stay above /partners/:id in this file
 // so Hono's router matches the static segment "me" before the dynamic :id handler.
-
-const dayScheduleSchema = z.object({
-  start: z.string(),
-  end: z.string(),
-  closed: z.boolean().optional()
-});
 
 const supportedLocales = SUPPORTED_LOCALES;
 
@@ -615,13 +753,13 @@ const supportedLocales = SUPPORTED_LOCALES;
  * shared `httpUrlValue`/`httpUrlField` helpers (`@breeze/shared`). They split
  * into two risk classes and both land on the same guard:
  *
- *  - `contact.website` — a partner-authored value shaped like a link. Its only
- *    consumers today are this settings form itself (PartnerSettingsPage /
- *    PartnerCompanyTab), so there is no live XSS sink; the guard is here so the
- *    first person to put it in an `href` inherits a safe value. NOTE: the
- *    website printed on branded PDFs/invoices/quotes is a DIFFERENT column,
- *    `partners.billing_website` (see `buildSellerSnapshot`), validated by
- *    `partnerBillingSettingsSchema` in `@breeze/shared`.
+ *  - `contact.website` — a partner-authored value shaped like a link. As of
+ *    #6228, this is no longer form-only: `buildSellerSnapshot` (sellerSnapshot.ts)
+ *    falls back to `contact.website`/`contact.phone` on branded PDFs/invoices/
+ *    quotes whenever the billing letterhead override (`partners.billing_website`,
+ *    validated by `partnerBillingSettingsSchema` in `@breeze/shared`) is blank —
+ *    so this guard is now a genuine second line of defense for a real render
+ *    sink, not just a courtesy for a future `href`.
  *  - values the SERVER dials outbound (Slack webhook, extra webhooks, the
  *    Elasticsearch endpoint), where a non-http scheme like `file://` is a
  *    scheme-confusion problem rather than an XSS one. This guard covers the
@@ -637,6 +775,16 @@ const supportedLocales = SUPPORTED_LOCALES;
  * the web form and the billing-settings schema enforce the identical rule.
  */
 
+export const mlSettingsSchema = z.object({
+  anomalies: z.object({
+    enabled: z.boolean().optional(),
+    create_alerts: z.boolean().optional(),
+  }).optional(),
+  remediation_suggestions: z.object({
+    enabled: z.boolean().optional(),
+  }).optional(),
+});
+
 const partnerSettingsSchema = z.object({
   // Partner tz is the canonical default for every downstream tz field (#1318),
   // so police it as a real IANA zone on write (was previously unvalidated).
@@ -644,10 +792,10 @@ const partnerSettingsSchema = z.object({
   dateFormat: z.enum(['MM/DD/YYYY', 'DD/MM/YYYY', 'YYYY-MM-DD']).optional(),
   timeFormat: z.enum(['12h', '24h']).optional(),
   language: z.enum(supportedLocales).optional(),
-  businessHours: z.object({
-    preset: z.enum(['24/7', 'business', 'extended', 'custom']),
-    custom: z.record(z.string(), dayScheduleSchema).optional()
-  }).optional(),
+  // businessHours retired (#8973 W4, Gate B5): business hours are business
+  // calendars now (routes/businessCalendars.ts). Zod strips the key, so a stale
+  // client's value never reaches the shallow merge below and the stored blob
+  // (imported into a calendar by 2027-01-03-160000) is left untouched.
   contact: z.object({
     name: z.string().optional(),
     email: z.string().email().optional().or(z.literal('')),
@@ -666,9 +814,14 @@ const partnerSettingsSchema = z.object({
     country: z.string().length(2).optional().or(z.literal('')),
   }).optional(),
   security: z.object({
-    minLength: z.number().int().min(6).max(128).optional(),
-    complexity: z.enum(['standard', 'strict', 'passphrase']).optional(),
-    expirationDays: z.number().int().min(0).optional(),
+    // The scalar limits below accept an explicit `null` meaning "clear back to
+    // the inherited default" (#8976). The handler deep-merges `security`, so an
+    // omitted key keeps the stored value; `null` is the only way to unset one.
+    // The numeric bounds live in @breeze/shared (securityLimits.ts) so the
+    // partner settings form validates against the same limits (#10081).
+    minLength: securityLimitSchemas.minLength.nullable().optional(),
+    complexity: z.enum(['standard', 'strict', 'passphrase']).nullable().optional(),
+    expirationDays: securityLimitSchemas.expirationDays.nullable().optional(),
     requireMfa: z.boolean().optional(),
     // #5306 — how long a user whose ROLE forces MFA (roles.force_mfa) may keep
     // working before enrolment is enforced. Optional on purpose: a PATCH that
@@ -688,8 +841,8 @@ const partnerSettingsSchema = z.object({
     // `allowedMethods` at write time (foldAllowedMfaMethodsAlias) and never
     // persisted as a second source of truth.
     allowedMfaMethods: z.object({ totp: z.boolean().optional(), sms: z.boolean().optional() }).optional(),
-    sessionTimeout: z.number().int().min(1).optional(),
-    maxSessions: z.number().int().min(1).optional(),
+    sessionTimeout: securityLimitSchemas.sessionTimeout.nullable().optional(),
+    maxSessions: securityLimitSchemas.maxSessions.nullable().optional(),
     ipAllowlist: z
       .array(z.string())
       .optional()
@@ -707,14 +860,22 @@ const partnerSettingsSchema = z.object({
     smtpUsername: z.string().optional(),
     smtpEncryption: z.enum(['tls', 'ssl', 'none']).optional(),
     // Server dials this outbound; `file://`/internal targets are SSRF.
-    slackWebhookUrl: httpUrlField('Slack webhook URL'),
+    // Stored sealed and returned masked; the marker keeps the stored value.
+    // keptSecretOrHttpUrlValue accepts that marker (`********`, or
+    // `********:<key>` for a list entry — settingsSecretMasking.ts) or a typed
+    // http(s) URL; a rejection carries the human message, never the marker
+    // regex (#8369).
+    slackWebhookUrl: keptSecretOrHttpUrlValue('Slack webhook URL').optional(),
     slackChannel: z.string().optional(),
-    webhooks: z.array(httpUrlValue('Webhook URL')).optional(),
+    // Each saved entry comes back as a keyed marker; sending it keeps that
+    // entry, leaving it out removes it, and a typed URL is added.
+    webhooks: z.array(keptSecretOrHttpUrlValue('Webhook URL')).optional(),
     preferences: z.record(z.string(), z.record(z.string(), z.boolean())).optional(),
     pushoverAppToken: z.string().max(30).optional(),
     pushoverDefaultUser: z.string().max(30).optional(),
     pushoverDefaultSound: z.string().max(40).optional(),
     pushoverDefaultPriority: z.number().int().min(-2).max(2).optional(),
+    pushoverTicketAssignmentFallback: z.boolean().optional(),
   }).optional(),
   eventLogs: z.object({
     enabled: z.boolean().optional(),
@@ -727,12 +888,15 @@ const partnerSettingsSchema = z.object({
   }).optional(),
   defaults: z.object({
     policyDefaults: z.record(z.string(), z.string()).optional(),
+    // #9617: a real device_groups.id (org level only; a partner-level value
+    // cannot name a per-org group). Legacy display strings are accepted so old
+    // clients don't 400, but enrollment ignores anything that isn't a group id.
+    // `alertThreshold` and `autoEnrollment.sendWelcome` were removed (no
+    // consumer); z.object strips them from old clients' payloads rather than 400.
     deviceGroup: z.string().optional(),
-    alertThreshold: z.string().optional(),
     autoEnrollment: z.object({
       enabled: z.boolean(),
       requireApproval: z.boolean(),
-      sendWelcome: z.boolean(),
     }).optional(),
     agentUpdatePolicy: z.string().optional(),
     // Reject malformed windows on the partner (/partners/me) write path at save
@@ -762,7 +926,9 @@ const partnerSettingsSchema = z.object({
     primaryColor: z.string().optional(),
     secondaryColor: z.string().optional(),
     theme: z.enum(['light', 'dark', 'system']).optional(),
-    customCss: z.string().optional(),
+    // #9674: layered ahead of each child org's own CSS on the portal
+    // (routes/portal/portalCustomCss.ts), so it gets the org path's rules.
+    customCss: portalCustomCssSchema,
   }).optional(),
   aiBudgets: z.object({
     enabled: z.boolean().optional(),
@@ -773,6 +939,8 @@ const partnerSettingsSchema = z.object({
     messagesPerHourPerOrg: z.number().int().min(1).max(10000).optional(),
     approvalMode: z.enum(['per_step', 'action_plan', 'auto_approve', 'hybrid_plan']).optional(),
     alertThresholdPercents: z.array(z.number().int().min(1).max(99)).max(5).optional(),
+    // #6476 — partner value wins and locks, like every other aiBudgets key.
+    toolRateLimitMultiplier: toolRateLimitMultiplierSchema.optional(),
   }).optional(),
   organizationOrder: z.array(z.string().guid()).max(10_000).optional(),
   remoteAccessProviders: z.object({
@@ -865,13 +1033,38 @@ const partnerSettingsSchema = z.object({
     // sites validate against the same contract this write boundary enforces.
     inbound: ticketingInboundSettingsSchema.optional(),
   }).optional(),
+  // #6475 — partner DEFAULT for the interactive AI approval timeout (5-60 min).
+  // Replaced wholesale (one field); `{}` clears it back to the product default.
+  // Inherit-with-override: an org value at the same key WINS (resolver:
+  // resolveAiApprovalTimeout in @breeze/shared) — NOT partner-locked.
+  aiApprovals: aiApprovalSettingsSchema.optional(),
   // One-level merge by template id (see PATCH /partners/me). Unknown ids 400.
   emailTemplates: z.partialRecord(z.enum(EMAIL_TEMPLATE_IDS), emailTemplateOverrideSchema).optional(),
+  // ML feature switches, read by services/mlFeatureFlags.ts (nested shape:
+  // `settings.ml.<feature>.<flag>`). Partner value is the default every child
+  // org inherits; an org sets the same key on its own settings to override.
+  // PATCH /partners/me deep-merges `ml` one level, so each card section sends
+  // only the feature block it owns (`ml.anomalies`, `ml.remediation_suggestions`)
+  // and must send that block COMPLETE.
+  ml: mlSettingsSchema.optional(),
+  // Network Proxy transport (#8155). Partner-only: no org override, since
+  // it chooses how every session of this partner is served. Read by
+  // services/tunnelOriginOptIn.ts. Replaced wholesale (one field).
+  networkProxy: z.object({ dedicatedTunnelOrigin: z.boolean().optional() }).strict().optional(),
 });
+
+// Scalar security limits a partner can clear back to "inherit" by sending null.
+const PARTNER_SECURITY_CLEARABLE_KEYS = [
+  'minLength',
+  'complexity',
+  'expirationDays',
+  'sessionTimeout',
+  'maxSessions',
+] as const;
 
 const updatePartnerSettingsSchema = z.object({
   settings: partnerSettingsSchema.optional(),
-  name: z.string().min(1).optional(),
+  name: refuseReservedBrandName(z.string().min(1)).optional(),
   billingEmail: z.string().email().optional(),
   // Plain-text signature appended to outbound customer emails (quote sends).
   emailSignature: z.string().max(2000).nullable().optional(),
@@ -904,11 +1097,36 @@ orgRoutes.get('/partners/me', requireScope('partner'), requirePartner, requireOr
     .limit(1);
 
   if (!partner) {
-    return c.json({ error: 'Partner not found' }, 404);
+    return c.json({ error: 'Partner not found', code: ERROR_CODES.NOT_FOUND }, 404);
   }
 
-  return c.json(partner);
+  // #6111 — a session timeout stored above the 720-minute ceiling reads back clamped.
+  // wispEnabled (Wisp W03): computed per request, not a column — the web nav gate
+  // for the Wisp memory page, sat beside the platform-granted aiForOfficeEnabled.
+  return c.json(withMaskedSettings({
+    ...partner,
+    settings: clampSessionTimeoutInSettings(partner.settings),
+    wispEnabled: wispEnabled(),
+  }));
 });
+
+// Candidates for the Inbound email card's default-assignee picker. Gated like
+// the PATCH that saves the setting (minus MFA, which gates writes), so anyone
+// who can save it can list who it accepts, without needing users:read.
+orgRoutes.get(
+  '/partners/me/default-assignee-candidates',
+  requireScope('partner'),
+  requirePartner,
+  requireOrgWrite,
+  async (c) => {
+    const auth = c.get('auth');
+    if (!canManagePartnerWidePolicies(auth)) {
+      return c.json({ error: 'Full partner access required', code: ERROR_CODES.ACCESS_DENIED }, 403);
+    }
+    const data = await listAssignableInboundDefaultUsers(auth.partnerId as string);
+    return c.json({ data });
+  },
+);
 
 orgRoutes.get('/partners/me/ip-allowlist/status', requireScope('partner'), requirePartner, requireOrgRead, async (c) => {
   const auth = c.get('auth');
@@ -938,7 +1156,7 @@ orgRoutes.patch(
   requireMfa(),
   async (c, next) => {
     if (!canManagePartnerWidePolicies(c.get('auth'))) {
-      return c.json({ error: 'Full partner access required' }, 403);
+      return c.json({ error: 'Full partner access required', code: ERROR_CODES.ACCESS_DENIED }, 403);
     }
     await next();
   },
@@ -950,6 +1168,9 @@ orgRoutes.patch(
   async (c) => {
   const auth = c.get('auth');
   const body = c.req.valid('json');
+
+  const partnerGroupIds = await partnerEnrollmentGroupIds(body.settings);
+  if (partnerGroupIds.length > 0) return c.json(partnerGroupTargetRefusal(partnerGroupIds), 400);
 
   // Agent/watchdog version pins (issue #2124) — reject unknown versions at save
   // time so a partner-locked pin can't silently freeze every child org's fleet.
@@ -970,11 +1191,18 @@ orgRoutes.patch(
     .limit(1);
 
   if (!current) {
-    return c.json({ error: 'Partner not found' }, 404);
+    return c.json({ error: 'Partner not found', code: ERROR_CODES.NOT_FOUND }, 404);
   }
 
   // Merge settings (top-level shallow merge, except `security` and `ticketing` below)
   const currentSettings = (current.settings as Record<string, unknown>) || {};
+  if (body.settings) {
+    const resolvedSecrets = resolveIncomingSettingsSecrets(body.settings, currentSettings);
+    if (!resolvedSecrets.ok) {
+      return c.json({ error: resolvedSecrets.error }, 400);
+    }
+    body.settings = resolvedSecrets.settings as typeof body.settings;
+  }
   const newSettings: Record<string, unknown> = body.settings
     ? { ...currentSettings, ...body.settings }
     : { ...currentSettings };
@@ -986,10 +1214,16 @@ orgRoutes.patch(
   // explicit `ipAllowlist: []` still clears the list deliberately.
   if (body.settings?.security) {
     foldAllowedMfaMethodsAlias(body.settings); // canonicalize before deep-merge
-    newSettings.security = {
+    const mergedSecurity: Record<string, unknown> = {
       ...((currentSettings.security as Record<string, unknown> | undefined) ?? {}),
       ...body.settings.security,
     };
+    // An explicit null unsets the key (#8976) so it falls back to the inherited
+    // default instead of persisting a literal null that readers must special-case.
+    for (const key of PARTNER_SECURITY_CLEARABLE_KEYS) {
+      if (mergedSecurity[key] === null) delete mergedSecurity[key];
+    }
+    newSettings.security = mergedSecurity;
   }
 
   // Deep-merge the `ticketing` sub-object one level for the same reason: today it
@@ -1021,6 +1255,16 @@ orgRoutes.patch(
     newSettings.topologyFeatureFlags = {
       ...((currentSettings.topologyFeatureFlags as Record<string, unknown> | undefined) ?? {}),
       ...body.settings.topologyFeatureFlags,
+    };
+  }
+
+  // Deep-merge `ml` one level: the AI-features card sends only the feature
+  // block it owns (e.g. `ml.anomalies` or `ml.remediation_suggestions`), and
+  // the sibling blocks must not be wiped by it.
+  if (body.settings?.ml) {
+    newSettings.ml = {
+      ...((currentSettings.ml as Record<string, unknown> | undefined) ?? {}),
+      ...body.settings.ml,
     };
   }
 
@@ -1060,6 +1304,23 @@ orgRoutes.patch(
       .limit(1);
     if (!orgOk) {
       return c.json({ error: 'defaultTriageOrgId must reference an organization in your partner' }, 400);
+    }
+  }
+
+  // Default inbound assignee: every save that carries a user must name an
+  // active member of THIS partner with ticket access
+  // (isAssignableInboundDefaultUser; its partner_id predicates are the tenant
+  // boundary), like defaultTriageOrgId above. The card re-sends the complete
+  // inbound object, so a user who stopped qualifying after being picked must be
+  // replaced or cleared before the card saves again; the card shows them as
+  // unavailable. Ingest also re-checks per ticket.
+  const nextDefaultAssignee = body.settings?.ticketing?.inbound?.defaultAssigneeUserId;
+  if (typeof nextDefaultAssignee === 'string') {
+    if (!(await isAssignableInboundDefaultUser(nextDefaultAssignee, auth.partnerId as string))) {
+      return c.json({
+        error: 'defaultAssigneeUserId must be an active member of your partner who can be assigned tickets',
+        code: 'DEFAULT_ASSIGNEE_NOT_ASSIGNABLE',
+      }, 400);
     }
   }
 
@@ -1158,7 +1419,7 @@ orgRoutes.patch(
         ))
         .limit(1);
       if (clash[0]) {
-        return c.json({ error: 'That inbound address is already taken' }, 409);
+        return c.json({ error: 'That inbound address is already taken', code: ERROR_CODES.CONFLICT }, 409);
       }
       updateData.inboundLocalPart = candidate;
     }
@@ -1183,7 +1444,7 @@ orgRoutes.patch(
     .returning(partnerPublicColumns());
 
   if (!partner) {
-    return c.json({ error: 'Partner not found' }, 404);
+    return c.json({ error: 'Partner not found', code: ERROR_CODES.NOT_FOUND }, 404);
   }
 
   // Invalidate the OAuth scope-policy cache so a change to
@@ -1191,6 +1452,9 @@ orgRoutes.patch(
   // next token mint without waiting for the 60s TTL.
   clearPartnerScopePolicyCache(partner.id);
   clearPartnerAllowlistCache(partner.id);
+  // Partner defaults feed every org's agent update policy and topology flags
+  // (#8053 heartbeat cache); a partner write can touch any of its orgs.
+  invalidateAgentOrgSettingsCaches();
 
   // Caps or rungs changed fleet-wide: re-evaluate every org off-request (spec
   // §4.2 #3). Compare the value actually PERSISTED (post-normalisation) against
@@ -1218,9 +1482,9 @@ orgRoutes.patch(
   });
 
   if (emailTemplateWarnings.length > 0) {
-    return c.json({ ...partner, warnings: emailTemplateWarnings });
+    return c.json({ ...withMaskedSettings(partner), warnings: emailTemplateWarnings });
   }
-  return c.json(partner);
+  return c.json(withMaskedSettings(partner));
 });
 
 // --- Individual partner management (system-scoped) ---
@@ -1235,10 +1499,10 @@ orgRoutes.get('/partners/:id', requireScope('system'), requireOrgRead, async (c)
     .limit(1);
 
   if (!partner) {
-    return c.json({ error: 'Partner not found' }, 404);
+    return c.json({ error: 'Partner not found', code: ERROR_CODES.NOT_FOUND }, 404);
   }
 
-  return c.json(partner);
+  return c.json(withMaskedSettings(partner));
 });
 
 orgRoutes.patch('/partners/:id', requireScope('system'), requireOrgWrite, requireMfa(), zValidator('json', updatePartnerSchema), async (c) => {
@@ -1246,10 +1510,13 @@ orgRoutes.patch('/partners/:id', requireScope('system'), requireOrgWrite, requir
   const id = c.req.param('id')!;
 
   const data = c.req.valid('json');
+  const partnerGroupIds = await partnerEnrollmentGroupIds(data.settings);
+  if (partnerGroupIds.length > 0) return c.json(partnerGroupTargetRefusal(partnerGroupIds), 400);
+
   const updates: Record<string, unknown> = { ...data, updatedAt: new Date() };
 
   if (Object.keys(data).length === 0) {
-    return c.json({ error: 'No updates provided' }, 400);
+    return c.json({ error: 'No updates provided', code: ERROR_CODES.NO_UPDATES_PROVIDED }, 400);
   }
 
   if (data.slug !== undefined) {
@@ -1263,7 +1530,7 @@ orgRoutes.patch('/partners/:id', requireScope('system'), requireOrgWrite, requir
       ))
       .limit(1);
     if (clash[0]) {
-      return c.json({ error: 'That partner identifier is already in use' }, 409);
+      return c.json({ error: 'That partner identifier is already in use', code: ERROR_CODES.CONFLICT }, 409);
     }
   }
 
@@ -1286,11 +1553,30 @@ orgRoutes.patch('/partners/:id', requireScope('system'), requireOrgWrite, requir
         .from(partners)
         .where(and(eq(partners.id, id), isNull(partners.deletedAt)))
         .limit(1);
+      const resolvedSecrets = resolveIncomingSettingsSecrets(updates.settings, currentPartner?.settings);
+      if (!resolvedSecrets.ok) {
+        return c.json({ error: resolvedSecrets.error }, 400);
+      }
+      updates.settings = resolvedSecrets.settings;
       if (currentPartner) {
         updates.settings = preserveIpAllowlistOnOmit(
           currentPartner.settings,
           updates.settings as Record<string, unknown>,
         );
+        // settings.ai is owned by /ai/models/residency (one home, W04 #7602): a
+        // wholesale settings write keeps the stored subtree and ignores any incoming one.
+        const next = updates.settings as Record<string, unknown>;
+        const stored = (currentPartner.settings as Record<string, unknown> | null)?.ai;
+        if (stored === undefined) delete next.ai; else next.ai = stored;
+        // settings.flows is owned by PUT /flows/limits (W05 #5220): same rule.
+        keepOwnedSettingsSubtree(next, currentPartner.settings, 'flows');
+
+        // Same contract as PATCH /partners/me: a default inbound assignee
+        // must be an assignable member of THIS partner.
+        const assigneeError = await defaultAssigneeSettingsError(next, id);
+        if (assigneeError) {
+          return c.json({ error: assigneeError, code: 'DEFAULT_ASSIGNEE_NOT_ASSIGNABLE' }, 400);
+        }
       }
 
       // Keep the first-class `partners.timezone` column in sync with the
@@ -1352,8 +1638,11 @@ orgRoutes.patch('/partners/:id', requireScope('system'), requireOrgWrite, requir
     : await runPartnerUpdate();
 
   if (!partner) {
-    return c.json({ error: 'Partner not found' }, 404);
+    return c.json({ error: 'Partner not found', code: ERROR_CODES.NOT_FOUND }, 404);
   }
+
+  // Trust Center (Ruling 26): a slug/status change can publish or hide this partner's trust pages.
+  if (data.slug !== undefined || data.status !== undefined) scheduleServingRefreshForPartner(partner.id, 'partner.update');
 
   // Invalidate the OAuth scope-policy cache (settings may have changed).
   clearPartnerScopePolicyCache(partner.id);
@@ -1361,6 +1650,9 @@ orgRoutes.patch('/partners/:id', requireScope('system'), requireOrgWrite, requir
   // enforcement picks up the new list immediately (mirrors /partners/me).
   if (data.settings !== undefined) {
     clearPartnerAllowlistCache(partner.id);
+    // Partner defaults feed every org's agent update policy and topology flags
+    // (#8053 heartbeat cache).
+    invalidateAgentOrgSettingsCaches();
   }
   // Only the terminal-ish states sever the fleet. `pending` is reversible
   // (signup/billing limbo) and is already blocked for agents by the live
@@ -1395,7 +1687,7 @@ orgRoutes.patch('/partners/:id', requireScope('system'), requireOrgWrite, requir
     }
   });
 
-  return c.json(partner);
+  return c.json(withMaskedSettings(partner));
 });
 
 orgRoutes.delete('/partners/:id', requireScope('system'), requireOrgWrite, requireMfa(), async (c) => {
@@ -1418,10 +1710,11 @@ orgRoutes.delete('/partners/:id', requireScope('system'), requireOrgWrite, requi
   );
 
   if (!partner) {
-    return c.json({ error: 'Partner not found' }, 404);
+    return c.json({ error: 'Partner not found', code: ERROR_CODES.NOT_FOUND }, 404);
   }
 
   await revokePartnerTenantAccess(partner.id);
+  scheduleServingRefreshForPartner(partner.id, 'partner.delete');
 
   const auditOrgId = auth.orgId ?? await resolveAuditOrgIdForPartner(id);
   writeAuditEvent(c, {
@@ -1499,17 +1792,43 @@ async function resolveArchivedOrgScope(
   return null;
 }
 
+// Requests on GET /organizations that passed WITHOUT organizations:read and
+// must be served the name-level projection only (see the gate below).
+const nameLevelOrgListRequests = new WeakSet<Context>();
+
 // Org-scope callers may read their OWN org's name-level row without the
 // organizations:read permission (UI shell / tickets cold load, #1245 residual)
 // — every org user implicitly needs their org's name to render the app shell.
-// Partner/system scope still requires the permission: they list many orgs and
-// receive full rows. The handler's organization branch is hard-scoped to
-// auth.orgId and projects to safe fields only.
+// The handler's organization branch is hard-scoped to auth.orgId and projects
+// to safe fields only.
+//
+// Partner-scope callers get full rows only with organizations:read. Without it
+// (#9528: an org-restricted technician on a custom "Remote Control" role) they
+// still need the NAMES of the orgs they can already reach — the top-nav org
+// switcher and the /devices org filter are fed by this route — so they fall
+// back to the same name-level projection, limited to auth.accessibleOrgIds and
+// never including the archived block. organizations:read stays the permission
+// for managing orgs and for reading full org rows.
+//
+// The strict gate is PROBED (its `next` only records success) rather than
+// re-implemented, so whatever it grants keeps the full-row path and any
+// non-403 failure still propagates. Automation principals never get the
+// fallback: requirePermission denies them outright, and so does this gate.
+// System scope is unchanged — it is not tied to an accessible-org set.
 const requireOrgReadUnlessOwnOrg = async (c: Context, next: Next) => {
   const auth = c.get('auth') as AuthContext | undefined;
   if (!auth) throw new HTTPException(401, { message: 'Not authenticated' });
   if (auth.scope === 'organization') return next();
-  return requireOrgRead(c, next);
+  if (auth.scope !== 'partner' || isAutomationPrincipal(auth)) return requireOrgRead(c, next);
+
+  let granted = false;
+  try {
+    await requireOrgRead(c, async () => { granted = true; });
+  } catch (err) {
+    if (!(err instanceof HTTPException) || err.status !== 403) throw err;
+  }
+  if (!granted) nameLevelOrgListRequests.add(c);
+  return next();
 };
 
 orgRoutes.get('/organizations', requireScope('organization', 'partner', 'system'), requireOrgReadUnlessOwnOrg, zValidator('query', listOrganizationsSchema), async (c) => {
@@ -1559,14 +1878,17 @@ orgRoutes.get('/organizations', requireScope('organization', 'partner', 'system'
   // they are read through the READ ONLY archived context and appended. A
   // partner-scope caller is hard-pinned to its own verified partner id; a
   // partner token with no partnerId gets nothing rather than every partner's.
-  const archivedScope = includeArchived === 'true'
+  // #9528 — a partner caller admitted without organizations:read (see
+  // requireOrgReadUnlessOwnOrg): name-level rows of its accessible orgs only.
+  const nameLevelOnly = nameLevelOrgListRequests.has(c);
+  const archivedScope = includeArchived === 'true' && !nameLevelOnly
     ? await resolveArchivedOrgScope(auth, queryPartnerId)
     : null;
 
   // The hidden 'quick_support' org is inside accessibleOrgIds by design (RLS),
   // so it has to be excluded from the paginated list — one shared `conditions`
   // covers both the count and the row query below.
-  const notQuickSupport = ne(organizations.type, 'quick_support');
+  const notQuickSupport = notHiddenOrgType();
   let conditions;
   // A partner whose only orgs are archived reaches zero accessible ids. That
   // used to short-circuit the whole handler, which would have made
@@ -1581,7 +1903,8 @@ orgRoutes.get('/organizations', requireScope('organization', 'partner', 'system'
     // would select the whole table. Fail closed even in dead code.
     conditions = noLiveOrgs
       ? sql`false`
-      : and(inArray(organizations.id, orgIds), notQuickSupport, isNull(organizations.deletedAt), searchCondition);
+      // Shared with the partner settings inheritance counts (#9170).
+      : and(...partnerVisibleOrgConditions(orgIds), searchCondition);
   } else {
     // #4166 — system scope short-circuits every RLS predicate and this branch
     // carries NO status filter, so archive-lifecycle orgs already come back
@@ -1665,6 +1988,26 @@ orgRoutes.get('/organizations', requireScope('organization', 'partner', 'system'
   // `created_at, id` the tiebreaker, so LIMIT/OFFSET slices the intended
   // sequence. `buildOrganizationListQuery` owns that shape and is pinned on the
   // compiled SQL in `orgs.listQuery.test.ts`.
+  if (nameLevelOnly) {
+    // Same population, order and pagination as the full list — only the
+    // projection differs, and no device counts or archived block ride along.
+    const data = noLiveOrgs
+      ? []
+      : await buildOrganizationListQuery({
+          conditions,
+          limit,
+          offset,
+          preferredOrder,
+          columns: {
+            id: organizations.id,
+            name: organizations.name,
+            slug: organizations.slug,
+            status: organizations.status,
+          },
+        });
+    return c.json({ data, pagination: { page, limit, total: Number(count) } });
+  }
+
   const ordered = noLiveOrgs
     ? []
     : await buildOrganizationListQuery({ conditions, limit, offset, preferredOrder });
@@ -1718,7 +2061,7 @@ orgRoutes.get('/organizations', requireScope('organization', 'partner', 'system'
     : null;
 
   return c.json({
-    data: [...liveRows, ...(archived?.orgs ?? [])],
+    data: [...liveRows, ...(archived?.orgs ?? [])].map(withMaskedSettings),
     pagination: { page, limit, total: Number(count) },
     // Present only on the page that actually carries the archived block, so it
     // is never a claim about a page that didn't look. Archived orgs are capped
@@ -1751,7 +2094,7 @@ orgRoutes.patch(
   async (c) => {
     const auth = c.get('auth') as AuthContext;
     if (!canManagePartnerWidePolicies(auth)) {
-      return c.json({ error: 'Full partner access required' }, 403);
+      return c.json({ error: 'Full partner access required', code: ERROR_CODES.ACCESS_DENIED }, 403);
     }
     const { orderedIds } = c.req.valid('json');
     const partnerId = auth.partnerId as string;
@@ -1782,7 +2125,7 @@ orgRoutes.patch(
       .where(and(eq(partners.id, partnerId), isNull(partners.deletedAt)))
       .limit(1);
     if (!current) {
-      return c.json({ error: 'Partner not found' }, 404);
+      return c.json({ error: 'Partner not found', code: ERROR_CODES.NOT_FOUND }, 404);
     }
     const currentSettings = (current.settings as Record<string, unknown>) || {};
     const newSettings = { ...currentSettings, organizationOrder: sanitized };
@@ -1796,7 +2139,7 @@ orgRoutes.patch(
       .where(and(eq(partners.id, partnerId), isNull(partners.deletedAt)))
       .returning();
     if (!partner) {
-      return c.json({ error: 'Partner not found' }, 404);
+      return c.json({ error: 'Partner not found', code: ERROR_CODES.NOT_FOUND }, 404);
     }
 
     const auditOrgId = await resolveAuditOrgIdForPartner(partnerId);
@@ -1813,11 +2156,45 @@ orgRoutes.patch(
   },
 );
 
+/** Thrown inside the create-organization transaction to roll back an insert
+ *  that a concurrent create pushed past `partner.maxOrganizations` — mirrors
+ *  the identically-named class in `routes/partnerApi/provisioning.ts`. */
+class OrgQuotaExceededError extends Error {
+  constructor(readonly cap: number) {
+    super('partner organization quota exceeded');
+    this.name = 'OrgQuotaExceededError';
+  }
+}
+
+/** Same tally `routes/partnerApi/provisioning.ts` uses for the same cap. */
+async function countPartnerOrganizations(partnerId: string): Promise<number> {
+  const [tally] = await db
+    .select({ value: sql<number>`count(*)::int` })
+    .from(organizations)
+    .where(and(
+      eq(organizations.partnerId, partnerId),
+      isNull(organizations.deletedAt),
+      notHiddenOrgType(),
+    ));
+  return tally?.value ?? 0;
+}
+
 orgRoutes.post('/organizations', requireScope('partner', 'system'), requireOrgWrite, requireMfa(), zValidator('json', createOrganizationSchema), async (c) => {
   const auth = c.get('auth');
   const data = c.req.valid('json');
   // M8: canonicalize the MFA allowed-methods alias on CREATE (see /partners).
   data.settings = foldAllowedMfaMethodsAlias(data.settings);
+  const partnerGroupIds = await partnerEnrollmentGroupIds(data.settings);
+  if (partnerGroupIds.length > 0) return c.json(partnerGroupTargetRefusal(partnerGroupIds), 400);
+
+  const createSecrets = resolveIncomingSettingsSecrets(data.settings, undefined);
+  if (!createSecrets.ok) {
+    return c.json({ error: createSecrets.error }, 400);
+  }
+  // settings.flows is owned by PUT /flows/limits (W05 #5220): a create cannot seed it.
+  if (createSecrets.settings && typeof createSecrets.settings === 'object' && !Array.isArray(createSecrets.settings)) {
+    keepOwnedSettingsSubtree(createSecrets.settings as Record<string, unknown>, undefined, 'flows');
+  }
 
   let targetPartnerId: string | null = null;
 
@@ -1826,7 +2203,7 @@ orgRoutes.post('/organizations', requireScope('partner', 'system'), requireOrgWr
       return c.json({ error: 'Partner context required to create organizations' }, 400);
     }
     if (data.partnerId && data.partnerId !== auth.partnerId) {
-      return c.json({ error: 'Access denied to this partner' }, 403);
+      return c.json({ error: 'Access denied to this partner', code: ERROR_CODES.ACCESS_DENIED }, 403);
     }
     targetPartnerId = auth.partnerId;
   } else {
@@ -1837,19 +2214,34 @@ orgRoutes.post('/organizations', requireScope('partner', 'system'), requireOrgWr
   }
 
   const [partnerRow] = await db
-    .select({ currencyCode: partners.currencyCode })
+    .select({ currencyCode: partners.currencyCode, maxOrganizations: partners.maxOrganizations })
     .from(partners)
     .where(and(eq(partners.id, targetPartnerId), isNull(partners.deletedAt)))
     .limit(1);
   if (!partnerRow) {
-    return c.json({ error: 'Partner not found' }, 404);
+    return c.json({ error: 'Partner not found', code: ERROR_CODES.NOT_FOUND }, 404);
+  }
+
+  // Same cap `POST /partner-api/organizations` already enforces
+  // (partners.maxOrganizations, NULL = unlimited) — this human-facing route
+  // had no quota at all, so a partner (or an org member with org-access-all
+  // creating orgs) had no ceiling on how many orgs — and therefore how many
+  // event-WS Redis subscriptions and how much other per-org fan-out — a
+  // single partner could accumulate. Fast-path pre-check only; racy by
+  // construction like the slug check just below, and backed the same way —
+  // see the post-insert recount inside `insertOrganization()`.
+  if (partnerRow.maxOrganizations != null) {
+    const orgCount = await countPartnerOrganizations(targetPartnerId);
+    if (orgCount >= partnerRow.maxOrganizations) {
+      return c.json({ error: 'Organization quota reached for this partner', code: ERROR_CODES.LIMIT_REACHED }, 409);
+    }
   }
 
   // #3967 — refuse a duplicate slug with a 409 before inserting. Backed by the
   // 23505 catch below, which is what actually closes the race.
   const slugConflict = await findOrgSlugConflict(targetPartnerId, data.slug);
   if (slugConflict) {
-    return c.json({ error: orgSlugConflictMessage(slugConflict) }, 409);
+    return c.json({ error: orgSlugConflictMessage(slugConflict), code: ERROR_CODES.CONFLICT }, 409);
   }
 
   const insertValues = {
@@ -1861,7 +2253,11 @@ orgRoutes.post('/organizations', requireScope('partner', 'system'), requireOrgWr
     status: data.status,
     // The lifecycle engine owns some keys in this blob (prior status, purge
     // warning markers, the purge-retry counter). Never let a client seed them.
-    settings: stripOrgLifecycleInternalSettings(data.settings),
+    settings: encryptColumnValueForWrite(
+      'organizations',
+      'settings',
+      stripOrgLifecycleInternalSettings(createSecrets.settings)
+    ),
     contractStart: data.contractStart ? new Date(data.contractStart) : null,
     contractEnd: data.contractEnd ? new Date(data.contractEnd) : null,
     billingContact: data.billingContact
@@ -1882,10 +2278,24 @@ orgRoutes.post('/organizations', requireScope('partner', 'system'), requireOrgWr
       // for the same reason the insert above needs one: the new org's id is not
       // in the caller's accessible_org_ids yet, so breeze_has_org_access(org_id)
       // would reject the contacts INSERT exactly as it rejects the organizations
-      // one. The blob itself is already persisted by the insert, so this only
-      // mirrors the row.
+      // one. The insert wrote the request's blob; the sync files it as the
+      // org's billing contact and re-projects the column from that contact,
+      // and the response carries what was actually stored.
       if (created[0] && data.billingContact) {
-        await syncBillingContactRow(db, created[0].id, data.billingContact, auth.user?.id ?? null);
+        created[0].billingContact = await syncBillingContactRow(db, created[0].id, data.billingContact, auth.user?.id ?? null);
+      }
+      // Race-free quota enforcement, same trick `POST /partner-api/organizations`
+      // uses: the insert's own AFTER trigger takes the partner discovery lock
+      // EXCLUSIVE, so a concurrent same-partner org insert serializes on it
+      // until COMMIT — by the time a second transaction's insert returns, the
+      // first one's row is already visible to this READ COMMITTED recount.
+      // Over the cap after the real insert -> throw, which rolls this whole
+      // transaction (including the insert we just made) back.
+      if (created[0] && partnerRow.maxOrganizations != null) {
+        const recount = await countPartnerOrganizations(insertValues.partnerId);
+        if (recount > partnerRow.maxOrganizations) {
+          throw new OrgQuotaExceededError(partnerRow.maxOrganizations);
+        }
       }
       return created;
     })
@@ -1898,13 +2308,17 @@ orgRoutes.post('/organizations', requireScope('partner', 'system'), requireOrgWr
   try {
     [organization] = await insertOrganization();
   } catch (error) {
+    if (error instanceof OrgQuotaExceededError) {
+      // The transaction (including the over-cap insert) has already rolled back.
+      return c.json({ error: 'Organization quota reached for this partner', code: ERROR_CODES.LIMIT_REACHED }, 409);
+    }
     if (isPgUniqueViolation(error, ORG_SLUG_UNIQUE_INDEX)) {
       // Only reachable when a concurrent write claimed the slug between the
       // pre-check and this statement. Logged because a spike here means the
       // pre-check has stopped working, and a bare 409 would look identical to
       // ordinary user error in Sentry.
       console.warn(`[orgs] ${ORG_SLUG_UNIQUE_INDEX} race lost — duplicate slug rejected by the index, not the pre-check`);
-      return c.json({ error: 'That organization slug is already in use' }, 409);
+      return c.json({ error: 'That organization slug is already in use', code: ERROR_CODES.CONFLICT }, 409);
     }
     throw error;
   }
@@ -1918,7 +2332,7 @@ orgRoutes.post('/organizations', requireScope('partner', 'system'), requireOrgWr
     details: { partnerId: organization?.partnerId, status: organization?.status, type: organization?.type }
   });
 
-  return c.json(organization, 201);
+  return c.json(withMaskedSettings(organization), 201);
 });
 
 // --- Bulk org/site import (#3242) ---
@@ -1933,7 +2347,7 @@ orgRoutes.post('/organizations', requireScope('partner', 'system'), requireOrgWr
 const requireFullPartnerOrgImportAccess = async (c: Context, next: Next) => {
   const auth = c.get('auth') as AuthContext;
   if (!canManagePartnerWidePolicies(auth)) {
-    return c.json({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE }, 403);
+    return c.json({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE, code: ERROR_CODES.ACCESS_DENIED }, 403);
   }
   return next();
 };
@@ -2003,7 +2417,7 @@ orgRoutes.get('/organizations/:id', requireScope('partner', 'system'), requireOr
   // A malformed id cannot name a real org, so it is a 404, same as a valid id
   // for an org that doesn't exist.
   if (!PG_UUID_REGEX.test(id)) {
-    return c.json({ error: 'Organization not found' }, 404);
+    return c.json({ error: 'Organization not found', code: ERROR_CODES.NOT_FOUND }, 404);
   }
 
   // An archive-lifecycle org (`archived`, or mid-archive-drain `offboarding` —
@@ -2018,8 +2432,8 @@ orgRoutes.get('/organizations/:id', requireScope('partner', 'system'), requireOr
     const archived = archivedScope
       ? await loadArchivedOrg({ orgId: id, scope: archivedScope })
       : null;
-    if (archived) return c.json(archived);
-    return c.json({ error: 'Organization not found' }, 404);
+    if (archived) return c.json(withMaskedSettings(archived));
+    return c.json({ error: 'Organization not found', code: ERROR_CODES.NOT_FOUND }, 404);
   }
 
   const conditions = and(eq(organizations.id, id), isNull(organizations.deletedAt));
@@ -2031,7 +2445,7 @@ orgRoutes.get('/organizations/:id', requireScope('partner', 'system'), requireOr
     .limit(1);
 
   if (!organization) {
-    return c.json({ error: 'Organization not found' }, 404);
+    return c.json({ error: 'Organization not found', code: ERROR_CODES.NOT_FOUND }, 404);
   }
 
   // System scope never fails `canAccessOrg`, so an archive-lifecycle org
@@ -2045,18 +2459,25 @@ orgRoutes.get('/organizations/:id', requireScope('partner', 'system'), requireOr
   // request context — no escalation: this route already requires `partner` or
   // `system` scope, and `partners` RLS grants a partner-scoped actor its own
   // partner row, so `readWithPartnerAxisVisibility` would buy nothing here.
+  // #6229 adds the partner's payment terms the same way, for the org's
+  // payment-terms InheritedField (org `invoiceTermsDays` NULL = inherit this).
+  // #7510 adds the partner currency — NOT an inherited value (org
+  // `currency_code` is NOT NULL, stamped at creation); the org Billing tab
+  // names it only to say the partner default applies to new organizations.
   const [partnerRow] = await db
-    .select({ defaultTaxRate: partners.defaultTaxRate })
+    .select({ defaultTaxRate: partners.defaultTaxRate, invoiceTermsDays: partners.invoiceTermsDays, currencyCode: partners.currencyCode })
     .from(partners)
     .where(eq(partners.id, organization.partnerId))
     .limit(1);
   const partnerDefaultTaxRate = partnerRow?.defaultTaxRate ?? null;
+  const partnerDefaultInvoiceTermsDays = partnerRow?.invoiceTermsDays ?? null;
+  const partnerDefaultCurrencyCode = partnerRow?.currencyCode ?? null;
 
   if (isArchiveLifecycleRow(organization)) {
-    return c.json({ ...organization, archived: true as const, partnerDefaultTaxRate });
+    return c.json({ ...withMaskedSettings(organization), archived: true as const, partnerDefaultTaxRate, partnerDefaultInvoiceTermsDays, partnerDefaultCurrencyCode });
   }
 
-  return c.json({ ...organization, partnerDefaultTaxRate });
+  return c.json({ ...withMaskedSettings(organization), partnerDefaultTaxRate, partnerDefaultInvoiceTermsDays, partnerDefaultCurrencyCode });
 });
 
 orgRoutes.get('/organizations/:id/effective-settings',
@@ -2067,14 +2488,20 @@ orgRoutes.get('/organizations/:id/effective-settings',
     const id = c.req.param('id')!;
 
     if (auth.scope === 'organization' && id !== auth.orgId) {
-      return c.json({ error: 'Access denied' }, 403);
+      return c.json({ error: 'Access denied', code: ERROR_CODES.ACCESS_DENIED }, 403);
     }
     if (auth.scope === 'partner' && !auth.canAccessOrg(id)) {
-      return c.json({ error: 'Organization not found' }, 404);
+      return c.json({ error: 'Organization not found', code: ERROR_CODES.NOT_FOUND }, 404);
     }
 
     const result = await getEffectiveOrgSettings(id);
-    return c.json(result);
+    // #6475 — the interactive AI approval timeout is inherit-with-override
+    // (org wins), so it is resolved by its own resolver rather than through
+    // getEffectiveOrgSettings' partner-locks merge, and reported separately:
+    // { minutes, source, inheritedMinutes, inheritedSource } for the org UI's
+    // "Inherit (…)" label.
+    const aiApprovalTimeout = await getAiApprovalTimeout(id);
+    return c.json({ ...result, effective: maskSettingsSecrets(result.effective), aiApprovalTimeout });
   }
 );
 
@@ -2220,18 +2647,21 @@ async function readOrgLifecycleStatus(orgId: string): Promise<string | null> {
 // and platformAdminMiddleware (/admin/*) already treats that flag as the
 // grant, so this mirrors the established authority model. Applied ONLY to the
 // org update route, not globally.
-const requireOrgWriteOrPlatformAdmin = async (c: Context, next: Next) => {
+const requireOrgWriteOrPlatformAdmin = markPermissionGate(async (c: Context, next: Next) => {
   const auth = c.get('auth') as AuthContext | undefined;
   if (auth?.scope === 'system' && auth.user?.isPlatformAdmin === true) {
     return next();
   }
   return requireOrgWrite(c, next);
-};
+}, 'orgs:write|platform-admin');
 
 const updateOrgHandler = [requireScope('partner', 'system'), requireOrgWriteOrPlatformAdmin, requireMfa(), zValidator('json', updateOrganizationSchema), async (c: any) => {
   const auth = c.get('auth') as AuthContext;
   const id = c.req.param('id')!;
   const data = c.req.valid('json');
+
+  const partnerGroupIds = await partnerEnrollmentGroupIds(data.settings);
+  if (partnerGroupIds.length > 0) return c.json(partnerGroupTargetRefusal(partnerGroupIds), 400);
 
   // #2879 — suspended orgs are outside canAccessOrg/accessibleOrgIds, so a
   // partner-scope status-only lifecycle transition (suspended→offboarding /
@@ -2240,8 +2670,13 @@ const updateOrgHandler = [requireScope('partner', 'system'), requireOrgWriteOrPl
   if (auth.scope === 'partner' && !auth.canAccessOrg(id)) {
     suspendedLifecycleOverride = await canApplySuspendedOrgLifecycleTransition(auth, id, data);
     if (!suspendedLifecycleOverride) {
-      return c.json({ error: 'Organization not found' }, 404);
+      return c.json({ error: 'Organization not found', code: ERROR_CODES.NOT_FOUND }, 404);
     }
+  }
+
+  // The unassigned-device holding org is managed by Breeze.
+  if (await isHoldingOrg(id)) {
+    return c.json(PROTECTED_ORG_ERROR, 409);
   }
 
   if (data.settings !== undefined) {
@@ -2305,6 +2740,24 @@ const updateOrgHandler = [requireScope('partner', 'system'), requireOrgWriteOrPl
       }
     }
 
+    // #6475 — the org override for the interactive AI approval timeout. The
+    // org `settings` blob is z.any(), so validate the block explicitly (same
+    // reason as the defaults checks above). Deliberately NOT in the partner-
+    // lock loop below: this is inherit-with-override and the org wins.
+    // Omitting the key (or `{}`) inherits the partner default.
+    if (settingsObj.aiApprovals !== undefined) {
+      const parsed = aiApprovalSettingsSchema.safeParse(settingsObj.aiApprovals);
+      if (!parsed.success) {
+        return c.json({ error: 'Invalid AI approval settings', details: parsed.error.issues }, 400);
+      }
+    }
+
+    // #6111 — security.sessionTimeout ceiling (the org settings blob is z.any()).
+    const sessionTimeoutError = sessionTimeoutSettingsError(settingsObj);
+    if (sessionTimeoutError) {
+      return c.json({ error: sessionTimeoutError }, 400);
+    }
+
     // Enforce partner locks on settings categories (after auth check).
     for (const category of ['security', 'notifications', 'eventLogs', 'defaults', 'branding']) {
       if (settingsObj[category] && typeof settingsObj[category] === 'object') {
@@ -2338,7 +2791,7 @@ const updateOrgHandler = [requireScope('partner', 'system'), requireOrgWriteOrPl
   }
 
   if (Object.keys(data).length === 0) {
-    return c.json({ error: 'No updates provided' }, 400);
+    return c.json({ error: 'No updates provided', code: ERROR_CODES.NO_UPDATES_PROVIDED }, 400);
   }
 
   // #3967 — same per-partner slug guard as create. The org's own partner is
@@ -2356,11 +2809,11 @@ const updateOrgHandler = [requireScope('partner', 'system'), requireOrgWriteOrPl
       )
     );
     if (!target) {
-      return c.json({ error: 'Organization not found' }, 404);
+      return c.json({ error: 'Organization not found', code: ERROR_CODES.NOT_FOUND }, 404);
     }
     const slugConflict = await findOrgSlugConflict(target.partnerId, data.slug, id);
     if (slugConflict) {
-      return c.json({ error: orgSlugConflictMessage(slugConflict) }, 409);
+      return c.json({ error: orgSlugConflictMessage(slugConflict), code: ERROR_CODES.CONFLICT }, 409);
     }
   }
 
@@ -2379,28 +2832,48 @@ const updateOrgHandler = [requireScope('partner', 'system'), requireOrgWriteOrPl
     const count = await countMfaPolicyLockouts({ kind: 'organization', id }, data.settings);
     if (count) return c.json(mfaPolicyLockoutResponse(count), 409);
 
-    // This write replaces `settings` WHOLESALE, so a client payload naming a
-    // lifecycle-internal key would become that key's stored value. Strip them
-    // first: a preseeded `purgingRecoveryAttempts` would neuter the purge-retry
-    // ceiling, and a preseeded `archivePriorStatus`/`mergePriorStatus` would
-    // choose what a later restore/unfence reactivates the tenant AS.
+    // This write replaces `settings` WHOLESALE, and the settings editor
+    // re-posts the whole blob as it was read — secrets included, as the
+    // masked marker. Resolve those against the stored settings so the write
+    // keeps them, and refuse a log-forwarding destination moved to a new
+    // origin while a stored credential would follow it instead of being
+    // re-entered (same contract as credentialOriginBinding.ts).
+    const [currentOrg] = await db
+      .select({ settings: organizations.settings })
+      .from(organizations)
+      .where(eq(organizations.id, id))
+      .limit(1);
+    const resolvedSecrets = resolveIncomingSettingsSecrets(data.settings, currentOrg?.settings);
+    if (!resolvedSecrets.ok) {
+      return c.json({ error: resolvedSecrets.error }, 400);
+    }
+
+    // A client payload naming a lifecycle-internal key would become that
+    // key's stored value. Strip them first: a preseeded
+    // `purgingRecoveryAttempts` would neuter the purge-retry ceiling, and a
+    // preseeded `archivePriorStatus`/`mergePriorStatus` would choose what a
+    // later restore/unfence reactivates the tenant AS.
     // Encrypt secret-bearing fields (e.g. logForwarding.elasticsearchApiKey)
     // before writing organizations.settings. See encryptedColumnRegistry.
-    updates.settings = encryptColumnValueForWrite(
-      'organizations',
-      'settings',
-      stripOrgLifecycleInternalSettings(data.settings)
-    );
+    const orgSettingsNext = stripOrgLifecycleInternalSettings(resolvedSecrets.settings);
+    // settings.flows is owned by PUT /flows/limits (W05 #5220; orgs:write is
+    // not automations:write): the wholesale write keeps the stored block.
+    if (orgSettingsNext && typeof orgSettingsNext === 'object' && !Array.isArray(orgSettingsNext)) {
+      keepOwnedSettingsSubtree(orgSettingsNext as Record<string, unknown>, currentOrg?.settings, 'flows');
+    }
+    updates.settings = encryptColumnValueForWrite('organizations', 'settings', orgSettingsNext);
   }
-  // The blob write stays in THIS update rather than going through
-  // replaceBillingContact: the #2879 override path below re-asserts
-  // partner-ownership and suspended-status in the UPDATE's own WHERE, and the
-  // compat writer targets a bare eq(id, orgId), which would let a billing
-  // contact land on an org that stopped qualifying between check and write.
-  // The `contacts` row is mirrored by syncBillingContactRow once the guarded
-  // update has succeeded — exactly the "caller already wrote the blob" case
-  // that entry point exists for.
-  if (data.billingContact !== undefined) updates.billingContact = data.billingContact;
+  // `billingContact` is deliberately NOT in this UPDATE. It is written by
+  // syncBillingContactRow in runUpdate below, only after this guarded UPDATE
+  // (the #2879 override path re-asserts partner-ownership and suspended-status
+  // in its own WHERE) has matched and so holds the org row lock. The sync edits
+  // the BILLING contact — the org-level contact holding the `billing` role,
+  // never the primary — and re-projects the column from it. Writing the
+  // request's value here first would also break that contact's selection:
+  // with several billing contacts, the "current recipient" tiebreak reads this
+  // column, and would compare against the new address instead of the old one.
+  // `updates` always carries `updatedAt`, so a billingContact-only PATCH still
+  // runs (and locks) the guarded UPDATE.
   if (data.contractStart !== undefined) {
     updates.contractStart = data.contractStart ? new Date(data.contractStart) : null;
   }
@@ -2447,7 +2920,8 @@ const updateOrgHandler = [requireScope('partner', 'system'), requireOrgWriteOrPl
     // cannot see a suspended org — and `contacts` is policed by
     // breeze_has_org_access(org_id), so it could not see the row either.
     if (rows[0] && data.billingContact !== undefined) {
-      await syncBillingContactRow(db, rows[0].id, data.billingContact, auth.user?.id ?? null);
+      // Answer with the re-projected column, not the pre-sync RETURNING row.
+      rows[0].billingContact = await syncBillingContactRow(db, rows[0].id, data.billingContact, auth.user?.id ?? null);
     }
     return rows;
   };
@@ -2510,7 +2984,7 @@ const updateOrgHandler = [requireScope('partner', 'system'), requireOrgWriteOrPl
       // pre-check has stopped working, and a bare 409 would look identical to
       // ordinary user error in Sentry.
       console.warn(`[orgs] ${ORG_SLUG_UNIQUE_INDEX} race lost — duplicate slug rejected by the index, not the pre-check`);
-      return c.json({ error: 'That organization slug is already in use' }, 409);
+      return c.json({ error: 'That organization slug is already in use', code: ERROR_CODES.CONFLICT }, 409);
     }
     throw error;
   }
@@ -2529,7 +3003,15 @@ const updateOrgHandler = [requireScope('partner', 'system'), requireOrgWriteOrPl
         return c.json({ error: frozen, code: 'ORG_LIFECYCLE_FROZEN', currentStatus: raced }, 409);
       }
     }
-    return c.json({ error: 'Organization not found' }, 404);
+    return c.json({ error: 'Organization not found', code: ERROR_CODES.NOT_FOUND }, 404);
+  }
+
+  // The org's agent update policy and topology flags are served to its agents
+  // from a per-org heartbeat cache (#8053).
+  invalidateAgentOrgSettingsCaches(organization.id);
+  // Trust Center (Ruling 26): a slug/status change can publish or hide this org's trust page.
+  if ((data.slug !== undefined || data.status !== undefined) && organization.partnerId) {
+    scheduleServingRefreshForPartner(organization.partnerId, 'organization.update');
   }
 
   if (data.status === 'offboarding') {
@@ -2564,7 +3046,7 @@ const updateOrgHandler = [requireScope('partner', 'system'), requireOrgWriteOrPl
     }
   });
 
-  return c.json(organization);
+  return c.json(withMaskedSettings(organization));
 }] as const;
 
 orgRoutes.patch('/organizations/:id', ...updateOrgHandler);
@@ -2572,8 +3054,18 @@ orgRoutes.put('/organizations/:id', ...updateOrgHandler);
 
 // Customer-portal settings (portal_branding) — see routes/orgPortalSettings.ts
 registerOrgPortalSettingsRoutes(orgRoutes);
+// Customer-portal sign-in & registration policy (portal_access_policies) — see routes/orgPortalAccessPolicy.ts
+registerPortalAccessPolicyRoutes(orgRoutes);
+// Customer-portal Entra tenant proof + proof-run links (client_ai_tenant_mappings) — see routes/orgPortalEntraTenant.ts
+registerPortalEntraTenantRoutes(orgRoutes);
+// Customer sender domains + ownership verification (customer_email_domains) — see routes/orgCustomerDomains.ts
+registerOrgCustomerDomainRoutes(orgRoutes);
+// Staff read-only "Customer view" of the portal read models (#9350)
+registerOrgPortalPreviewRoutes(orgRoutes);
 // Customer-portal users (portal_users invite/manage) — see routes/orgPortalUsers.ts
 registerOrgPortalUsersRoutes(orgRoutes);
+// Customer-portal access-request queue (portal_access_requests) — see routes/orgPortalAccessRequests.ts
+registerOrgPortalAccessRequestRoutes(orgRoutes);
 // Org ticketing overrides (org_ticket_settings) — see routes/orgTicketSettings.ts
 registerOrgTicketSettingsRoutes(orgRoutes);
 registerOrgBillingProfileRoutes(orgRoutes);
@@ -2581,13 +3073,20 @@ registerOrgBillingProfileRoutes(orgRoutes);
 registerOrgAuditRetentionSettingsRoutes(orgRoutes);
 // First-class contacts (contacts + the dedicated importer) — see routes/orgContacts.ts
 registerOrgContactsRoutes(orgRoutes);
+// Read-only who-to-contact resolution (Site / Device) — see routes/orgContactResponsibilities.ts
+registerOrgContactResponsibilitiesRoutes(orgRoutes);
 
 orgRoutes.delete('/organizations/:id', requireScope('partner', 'system'), requireOrgWrite, requireMfa(), async (c) => {
   const auth = c.get('auth') as AuthContext;
   const id = c.req.param('id')!;
 
   if (auth.scope === 'partner' && !auth.canAccessOrg(id)) {
-    return c.json({ error: 'Organization not found' }, 404);
+    return c.json({ error: 'Organization not found', code: ERROR_CODES.NOT_FOUND }, 404);
+  }
+
+  // The unassigned-device holding org is managed by Breeze.
+  if (await isHoldingOrg(id)) {
+    return c.json(PROTECTED_ORG_ERROR, 409);
   }
 
   const conditions = and(eq(organizations.id, id), isNull(organizations.deletedAt));
@@ -2609,10 +3108,11 @@ orgRoutes.delete('/organizations/:id', requireScope('partner', 'system'), requir
   );
 
   if (!organization) {
-    return c.json({ error: 'Organization not found' }, 404);
+    return c.json({ error: 'Organization not found', code: ERROR_CODES.NOT_FOUND }, 404);
   }
 
   await revokeOrganizationTenantAccess(organization.id);
+  if (organization.partnerId) scheduleServingRefreshForPartner(organization.partnerId, 'organization.delete');
 
   writeRouteAudit(c, {
     orgId: organization.id,
@@ -2627,7 +3127,58 @@ orgRoutes.delete('/organizations/:id', requireScope('partner', 'system'), requir
 
 // --- Sites (organization-scoped) ---
 
-orgRoutes.get('/sites', requireScope('organization', 'partner', 'system'), requireSiteRead, zValidator('query', listSitesSchema), async (c) => {
+/**
+ * Per-site device counts for a set of sites, shared by the Sites list and
+ * `GET /sites/:id` so the number a tile/list shows and the number the site page
+ * shows cannot drift (#9791).
+ *
+ * `deviceCount` excludes ephemeral (Quick Support), parked and decommissioned
+ * rows, so it equals what the agent-class, site-filtered Devices list shows.
+ * `removedDeviceCount` (#7471) counts decommissioned rows, which keep their
+ * site FK and block site deletion.
+ *
+ * Takes no org: the list route spans orgs for a partner-wide read, and
+ * `devices` is org-scoped under RLS, so the grouped query stays
+ * tenant-isolated either way. An empty id list never issues `site_id IN ()`.
+ */
+async function getDeviceCountsBySite(siteIds: string[]): Promise<{
+  deviceCountBySite: Map<string, number>;
+  removedCountBySite: Map<string, number>;
+}> {
+  const deviceCountBySite = new Map<string, number>();
+  const removedCountBySite = new Map<string, number>();
+  if (siteIds.length === 0) return { deviceCountBySite, removedCountBySite };
+
+  const counts = await db
+    .select({ siteId: devices.siteId, count: sql<number>`count(*)` })
+    .from(devices)
+    // Removed (decommissioned) devices are excluded alongside the ephemeral
+    // Quick Support ones (#5315): the org record's Devices tab lists
+    // `GET /devices`, which drops decommissioned rows by default, so counting
+    // them here made the Sites table disagree with the tab beside it.
+    .where(and(
+      inArray(devices.siteId, siteIds),
+      eq(devices.isEphemeral, false), notParkedDeviceCondition(),
+      ne(devices.status, 'decommissioned'),
+    ))
+    .groupBy(devices.siteId);
+  for (const row of counts) {
+    deviceCountBySite.set(row.siteId, Number(row.count));
+  }
+  // The DELETE guard (409 SITE_HAS_DEVICES) counts decommissioned rows the same
+  // way. (The guard also counts ephemeral/parked rows that `deviceCount` hides.)
+  const removedCounts = await db
+    .select({ siteId: devices.siteId, count: sql<number>`count(*)` })
+    .from(devices)
+    .where(and(inArray(devices.siteId, siteIds), eq(devices.status, 'decommissioned')))
+    .groupBy(devices.siteId);
+  for (const row of removedCounts) {
+    removedCountBySite.set(row.siteId, Number(row.count));
+  }
+  return { deviceCountBySite, removedCountBySite };
+}
+
+orgRoutes.get('/sites',requireScope('organization', 'partner', 'system'), requireSiteRead, zValidator('query', listSitesSchema), async (c) => {
   const auth = c.get('auth') as AuthContext;
   const { orgId, organizationId, includeEnrollmentDefaults, ...pagination } = c.req.valid('query');
 
@@ -2648,7 +3199,7 @@ orgRoutes.get('/sites', requireScope('organization', 'partner', 'system'), requi
     // Specific org requested - check access
     const allowed = await ensureOrgAccess(effectiveOrgId, auth);
     if (!allowed) {
-      return c.json({ error: 'Access to this organization denied' }, 403);
+      return c.json({ error: 'Access to this organization denied', code: ERROR_CODES.ACCESS_DENIED }, 403);
     }
     conditions = eq(sites.orgId, effectiveOrgId);
   } else {
@@ -2689,10 +3240,7 @@ orgRoutes.get('/sites', requireScope('organization', 'partner', 'system'), requi
   // picker. Written as raw SQL rather than `notInArray(sites.orgId, db.select(…))`
   // deliberately: the builder form issues a second `db.select()` chain, which
   // the route tests' queue-based db mock would consume as if it were a real query.
-  const notQuickSupportSite = sql`NOT EXISTS (
-    SELECT 1 FROM ${organizations} qs_org
-    WHERE qs_org.id = ${sites.orgId} AND qs_org.type = 'quick_support'
-  )`;
+  const notQuickSupportSite = notInHiddenOrgCondition(sites.orgId);
   const whereCondition = allowedSiteIds
     ? and(baseCondition, notQuickSupportSite, inArray(sites.id, allowedSiteIds))
     : and(baseCondition, notQuickSupportSite);
@@ -2718,30 +3266,31 @@ orgRoutes.get('/sites', requireScope('organization', 'partner', 'system'), requi
   // it with a single grouped query over the returned page's site ids —
   // `devices` is org-scoped under RLS so this stays tenant-isolated. Guard on a
   // non-empty page so an empty list never issues a `site_id IN ()` query.
-  const deviceCountBySite = new Map<string, number>();
-  const siteIds = data.map((s) => s.id);
-  if (siteIds.length > 0) {
-    const counts = await db
-      .select({ siteId: devices.siteId, count: sql<number>`count(*)` })
-      .from(devices)
-      // Removed (decommissioned) devices are excluded alongside the ephemeral
-      // Quick Support ones (#5315): the org record's Devices tab lists
-      // `GET /devices`, which drops decommissioned rows by default, so counting
-      // them here made the Sites table disagree with the tab beside it.
-      .where(and(
-        inArray(devices.siteId, siteIds),
-        eq(devices.isEphemeral, false),
-        ne(devices.status, 'decommissioned'),
-      ))
-      .groupBy(devices.siteId);
-    for (const row of counts) {
-      deviceCountBySite.set(row.siteId, Number(row.count));
+  const { deviceCountBySite, removedCountBySite } = await getDeviceCountsBySite(data.map((s) => s.id));
+
+  // A listing with no org filter spans orgs (the fleet-wide Sites page,
+  // #9794), so each row names its org for the Organization column. One
+  // request-context (RLS-scoped) lookup over the page's distinct org ids, never
+  // a query per row. An org-filtered listing skips it: the caller already
+  // knows the org, and this route is on the org-switch hot path.
+  let orgNameById: Map<string, string> | undefined;
+  if (!effectiveOrgId) {
+    orgNameById = new Map();
+    const pageOrgIds = [...new Set(data.map((s) => s.orgId).filter((id): id is string => Boolean(id)))];
+    if (pageOrgIds.length > 0) {
+      const orgRows = await db
+        .select({ id: organizations.id, name: organizations.name })
+        .from(organizations)
+        .where(inArray(organizations.id, pageOrgIds));
+      for (const row of orgRows) orgNameById.set(row.id, row.name);
     }
   }
 
   const dataWithCounts = data.map((site) => ({
-    ...site,
-    deviceCount: deviceCountBySite.get(site.id) ?? 0
+    ...withMaskedSettings(site),
+    deviceCount: deviceCountBySite.get(site.id) ?? 0,
+    removedDeviceCount: removedCountBySite.get(site.id) ?? 0,
+    ...(orgNameById && { orgName: orgNameById.get(site.orgId) ?? null }),
   }));
 
   // Ride the org's resolved enrollment defaults along on this response (#2776).
@@ -2803,7 +3352,17 @@ orgRoutes.post('/sites', requireScope('organization', 'partner', 'system'), requ
 
   const allowed = await ensureOrgAccess(data.orgId, auth);
   if (!allowed) {
-    return c.json({ error: 'Access to this organization denied' }, 403);
+    return c.json({ error: 'Access to this organization denied', code: ERROR_CODES.ACCESS_DENIED }, 403);
+  }
+
+  // The unassigned-device holding org is managed by Breeze.
+  if (await isHoldingOrg(data.orgId)) {
+    return c.json(PROTECTED_ORG_ERROR, 409);
+  }
+
+  const createSecrets = resolveIncomingSettingsSecrets(data.settings, undefined);
+  if (!createSecrets.ok) {
+    return c.json({ error: createSecrets.error }, 400);
   }
 
   const [site] = await db
@@ -2814,7 +3373,7 @@ orgRoutes.post('/sites', requireScope('organization', 'partner', 'system'), requ
       address: data.address,
       timezone: data.timezone,
       contact: data.contact,
-      settings: data.settings
+      settings: encryptColumnValueForWrite('sites', 'settings', createSecrets.settings)
     })
     .returning();
 
@@ -2833,7 +3392,7 @@ orgRoutes.post('/sites', requireScope('organization', 'partner', 'system'), requ
     resourceName: site?.name
   });
 
-  return c.json(site, 201);
+  return c.json(withMaskedSettings(site), 201);
 });
 
 orgRoutes.get('/sites/:id', requireScope('organization', 'partner', 'system'), requireSiteRead, async (c) => {
@@ -2847,20 +3406,28 @@ orgRoutes.get('/sites/:id', requireScope('organization', 'partner', 'system'), r
     .limit(1);
 
   if (!site) {
-    return c.json({ error: 'Site not found' }, 404);
+    return c.json({ error: 'Site not found', code: ERROR_CODES.NOT_FOUND }, 404);
   }
 
   const allowed = await ensureOrgAccess(site.orgId, auth);
   if (!allowed) {
-    return c.json({ error: 'Access to this site denied' }, 403);
+    return c.json({ error: 'Access to this site denied', code: ERROR_CODES.ACCESS_DENIED }, 403);
   }
 
   const permissions = c.get('permissions') as UserPermissions | undefined;
   if (permissions?.allowedSiteIds && !canAccessSite(permissions, site.id)) {
-    return c.json({ error: 'Access to this site denied' }, 403);
+    return c.json({ error: 'Access to this site denied', code: ERROR_CODES.ACCESS_DENIED }, 403);
   }
 
-  return c.json(site);
+  // Same helper as the list route, so the site page's count and its
+  // "View all devices" link agree with the Sites list (#9791).
+  const { deviceCountBySite, removedCountBySite } = await getDeviceCountsBySite([site.id]);
+
+  return c.json({
+    ...withMaskedSettings(site),
+    deviceCount: deviceCountBySite.get(site.id) ?? 0,
+    removedDeviceCount: removedCountBySite.get(site.id) ?? 0,
+  });
 });
 
 orgRoutes.patch('/sites/:id', requireScope('organization', 'partner', 'system'), requireSiteWrite, requireMfa(), zValidator('json', updateSiteSchema), async (c) => {
@@ -2869,7 +3436,7 @@ orgRoutes.patch('/sites/:id', requireScope('organization', 'partner', 'system'),
   const data = c.req.valid('json');
 
   if (Object.keys(data).length === 0) {
-    return c.json({ error: 'No updates provided' }, 400);
+    return c.json({ error: 'No updates provided', code: ERROR_CODES.NO_UPDATES_PROVIDED }, 400);
   }
 
   const [site] = await db
@@ -2879,24 +3446,42 @@ orgRoutes.patch('/sites/:id', requireScope('organization', 'partner', 'system'),
     .limit(1);
 
   if (!site) {
-    return c.json({ error: 'Site not found' }, 404);
+    return c.json({ error: 'Site not found', code: ERROR_CODES.NOT_FOUND }, 404);
   }
 
   const allowed = await ensureOrgAccess(site.orgId, auth);
   if (!allowed) {
-    return c.json({ error: 'Access to this site denied' }, 403);
+    return c.json({ error: 'Access to this site denied', code: ERROR_CODES.ACCESS_DENIED }, 403);
+  }
+
+  // The unassigned-device holding org is managed by Breeze.
+  if (await isHoldingOrg(site.orgId)) {
+    return c.json(PROTECTED_ORG_ERROR, 409);
   }
 
   const permissions = c.get('permissions') as UserPermissions | undefined;
   if (permissions?.allowedSiteIds && !canAccessSite(permissions, site.id)) {
-    return c.json({ error: 'Access to this site denied' }, 403);
+    return c.json({ error: 'Access to this site denied', code: ERROR_CODES.ACCESS_DENIED }, 403);
   }
 
   // Encrypt secret-bearing fields inside sites.settings before writing —
   // matches the registry walker so UI edits don't regress to plaintext.
   const writeData: Record<string, unknown> = { ...data, updatedAt: new Date() };
+  if (data.latitude !== undefined) {
+    // Coordinates changed through the generic edit path: stamp provenance as
+    // 'manual' (technician pins go through POST /sites/:id/location). Clearing
+    // the pair clears the provenance with it.
+    const pinned = data.latitude !== null;
+    writeData.locationSource = pinned ? 'manual' : null;
+    writeData.locationSetBy = pinned ? auth.user.id : null;
+    writeData.locationSetAt = pinned ? new Date() : null;
+  }
   if (writeData.settings !== undefined) {
-    writeData.settings = encryptColumnValueForWrite('sites', 'settings', writeData.settings);
+    const resolvedSecrets = resolveIncomingSettingsSecrets(writeData.settings, site.settings);
+    if (!resolvedSecrets.ok) {
+      return c.json({ error: resolvedSecrets.error }, 400);
+    }
+    writeData.settings = encryptColumnValueForWrite('sites', 'settings', resolvedSecrets.settings);
   }
 
   const [updated] = await db
@@ -2929,7 +3514,7 @@ orgRoutes.patch('/sites/:id', requireScope('organization', 'partner', 'system'),
     details: { changedFields: Object.keys(data) }
   });
 
-  return c.json(updated);
+  return c.json(withMaskedSettings(updated));
 });
 
 orgRoutes.delete('/sites/:id', requireScope('organization', 'partner', 'system'), requireSiteWrite, requireMfa(), async (c) => {
@@ -2943,27 +3528,100 @@ orgRoutes.delete('/sites/:id', requireScope('organization', 'partner', 'system')
     .limit(1);
 
   if (!site) {
-    return c.json({ error: 'Site not found' }, 404);
+    return c.json({ error: 'Site not found', code: ERROR_CODES.NOT_FOUND }, 404);
   }
 
   const allowed = await ensureOrgAccess(site.orgId, auth);
   if (!allowed) {
-    return c.json({ error: 'Access to this site denied' }, 403);
+    return c.json({ error: 'Access to this site denied', code: ERROR_CODES.ACCESS_DENIED }, 403);
+  }
+
+  // The unassigned-device holding org is managed by Breeze.
+  if (await isHoldingOrg(site.orgId)) {
+    return c.json(PROTECTED_ORG_ERROR, 409);
   }
 
   const permissions = c.get('permissions') as UserPermissions | undefined;
   if (permissions?.allowedSiteIds && !canAccessSite(permissions, site.id)) {
-    return c.json({ error: 'Access to this site denied' }, 403);
+    return c.json({ error: 'Access to this site denied', code: ERROR_CODES.ACCESS_DENIED }, 403);
   }
 
-  await db.delete(sites).where(eq(sites.id, id));
+  // The site's topology domain cascades with it, but two kinds of row point at
+  // it through NO ACTION FKs and must go first, under the site row lock, in ONE
+  // transaction — otherwise the delete aborts with 23503:
+  //  - the topology policy alerts it OWNS (M3-D6, PR #7117 T3) and their
+  //    NO ACTION children;
+  //  - its topology investigation sessions (M4-D2, #6000), pinned to it by
+  //    ai_sessions.topology_site_id, children first.
+  // Both counts land on the audit row.
+  const removed = await db.transaction(async (tx) => {
+    if (!(await lockSiteForDelete(tx, site.id))) return null;
+    // #7471 — devices.site_id is NO ACTION, so ANY device row still pointing at
+    // the site (including soft-deleted 'decommissioned' ones, which the Sites
+    // list does not count) aborts the delete with 23503 → opaque 500. Count them
+    // here, under the site row lock, and refuse with a 409 that says what to do.
+    // Removed rows are deliberately NOT detached: they keep their site for
+    // history/reporting until an operator permanently deletes them.
+    const [siteDevices] = await tx
+      .select({
+        removed: sql<number>`count(*) filter (where ${devices.status} = 'decommissioned')`,
+        other: sql<number>`count(*) filter (where ${devices.status} <> 'decommissioned')`,
+      })
+      .from(devices)
+      .where(eq(devices.siteId, site.id));
+    const removedDevices = Number(siteDevices?.removed ?? 0);
+    const otherDevices = Number(siteDevices?.other ?? 0);
+    if (removedDevices > 0 || otherDevices > 0) {
+      return { blocked: { removedDevices, otherDevices } } as const;
+    }
+    const removedTopologyAlerts = await deleteSiteOwnedTopologyAlerts(tx, site.orgId, site.id);
+    const topologyAiSessions = await deleteSiteTopologyAiSessions(tx, { orgId: site.orgId, siteId: site.id });
+    await tx.delete(sites).where(eq(sites.id, id));
+    return { removedTopologyAlerts, topologyAiSessions };
+  });
+  if (removed === null) {
+    return c.json({ error: 'Site not found', code: ERROR_CODES.NOT_FOUND }, 404);
+  }
+  if (removed.blocked) {
+    const { removedDevices, otherDevices } = removed.blocked;
+    const parts: string[] = [];
+    if (otherDevices > 0) {
+      parts.push(`${otherDevices} device${otherDevices === 1 ? '' : 's'} still assigned to it (move or remove them first; this includes Quick Support sessions the list hides)`);
+    }
+    if (removedDevices > 0) {
+      parts.push(`${removedDevices} removed device${removedDevices === 1 ? '' : 's'} that must be permanently deleted first (Devices → show removed → Delete permanently)`);
+    }
+    return c.json({
+      error: `This site cannot be deleted: it still has ${parts.join(' and ')}.`,
+      code: 'SITE_HAS_DEVICES',
+      removedDeviceCount: removedDevices,
+      deviceCount: otherDevices,
+    }, 409);
+  }
+  const { removedTopologyAlerts, topologyAiSessions: { screenshotStorageKeys, ...topologyAiSessions } } = removed;
+  // #8117 — remove the deleted investigations' screenshot files. Not here: the
+  // db.transaction above is a savepoint inside the request's transaction, which
+  // commits only after this handler returns. Deferred until that transaction
+  // settles, the helper re-checks the rows and unlinks only keys no row still
+  // references, so a rollback removes nothing. Any leftover is reclaimed by the
+  // screenshot orphan sweep.
+  if (screenshotStorageKeys.length > 0) {
+    const context = `site delete site=${site.id}`;
+    runAfterDbContextExit('siteDelete.screenshotFiles', () =>
+      removeUnreferencedScreenshotFiles(screenshotStorageKeys, context));
+  }
+  const siteDeleteDetails = {
+    ...(removedTopologyAlerts > 0 ? { removedTopologyAlerts } : {}),
+    ...(topologyAiSessions.investigations > 0 ? { topologyInvestigationsDeleted: topologyAiSessions } : {}),
+  };
 
   writeRouteAudit(c, {
     orgId: site.orgId,
     action: 'site.delete',
     resourceType: 'site',
     resourceId: site.id,
-    resourceName: site.name
+    resourceName: site.name,
+    ...(Object.keys(siteDeleteDetails).length > 0 ? { details: siteDeleteDetails } : {}),
   });
 
   return c.json({ success: true });

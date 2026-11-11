@@ -30,6 +30,7 @@ vi.mock('../db/schema', () => ({
   organizations: {
     id: 'organizations.id',
     partnerId: 'organizations.partnerId',
+    type: 'organizations.type',
   },
 }));
 
@@ -47,7 +48,12 @@ vi.mock('../services/tenantStatus', () => ({
   getAgentTenantState: vi.fn(async () => 'active'),
 }));
 
-import { helperAuth } from './helperAuth';
+vi.mock('../services/helperSettings', () => ({
+  buildHelperConfigUpdate: vi.fn(),
+}));
+
+import { helperAuth, helperDbAccessContext } from './helperAuth';
+import { buildHelperConfigUpdate } from '../services/helperSettings';
 import { db, withDbAccessContext } from '../db';
 import { matchAgentTokenHash } from './agentAuth';
 import { getAgentTenantState } from '../services/tenantStatus';
@@ -101,6 +107,7 @@ describe('helperAuth middleware', () => {
     vi.clearAllMocks();
     vi.mocked(matchAgentTokenHash).mockReturnValue(true as never);
     vi.mocked(getAgentTenantState).mockResolvedValue('active');
+    vi.mocked(buildHelperConfigUpdate).mockResolvedValue({ enabled: true } as never);
   });
 
   it('rejects a missing bearer token', async () => {
@@ -134,6 +141,27 @@ describe('helperAuth middleware', () => {
 
     const res = await app.request('/probe', { headers: { Authorization: 'Bearer brz_' + 'a'.repeat(64) } });
     expect(res.status).toBe(401);
+  });
+
+  // Pre-assignment: a device parked in its partner's
+  // holding org gets credential rotation and nothing else. A Helper session is
+  // interactive AI/remote surface, so its helper token is refused.
+  it('refuses a helper token for a device parked in a holding org', async () => {
+    mockDeviceRow({ organizationType: 'unassigned_pool' });
+
+    const res = await app.request('/probe', { headers: { Authorization: 'Bearer brz_' + 'a'.repeat(64) } });
+
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: 'device_pending_assignment' });
+    expect(withDbAccessContext).not.toHaveBeenCalled();
+  });
+
+  it('admits a helper token for a device in a regular org (positive control)', async () => {
+    mockDeviceRow({ organizationType: 'customer' });
+
+    const res = await app.request('/probe', { headers: { Authorization: 'Bearer brz_' + 'a'.repeat(64) } });
+
+    expect(res.status).toBe(200);
   });
 
   it('sets helperDevice and synthetic org auth for a valid token', async () => {
@@ -210,5 +238,110 @@ describe('helperAuth middleware', () => {
     expect(ctx.accessiblePartnerIds).toEqual([]);
     // read-only partner axis is unchanged
     expect(ctx.currentPartnerId).toBe('partner-1');
+  });
+
+  // #3127 — the chat message-send route may wait (bounded) for a turn blocked
+  // on approvals to conclude. It is registered in selfManagedDbContextRoutes, so
+  // helperAuth must NOT wrap it in a request transaction: the handler opens its
+  // own short contexts (via helperDbAccessContext) around that wait.
+  describe('self-managed DB context routes (#3127)', () => {
+    const SID = '11111111-1111-4111-8111-111111111111';
+    const selfManagedApp = new Hono();
+    selfManagedApp.use('*', helperAuth);
+    selfManagedApp.post('/api/v1/helper/chat/sessions/:id/messages', (c) => c.json({
+      deviceId: c.get('helperDevice').id,
+      orgId: c.get('auth').orgId,
+    }));
+    selfManagedApp.get('/api/v1/helper/chat/sessions/:id/messages', (c) => c.json({ ok: true }));
+
+    it('authenticates but opens no request transaction for the message-send POST', async () => {
+      mockDeviceRow();
+
+      const res = await selfManagedApp.request(`/api/v1/helper/chat/sessions/${SID}/messages`, {
+        method: 'POST',
+        headers: { Authorization: 'Bearer brz_' + 'a'.repeat(64) },
+      });
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ deviceId: 'dev-1', orgId: 'org-1' });
+      expect(withDbAccessContext).not.toHaveBeenCalled();
+    });
+
+    it('still wraps sibling routes in the request transaction', async () => {
+      mockDeviceRow();
+
+      const res = await selfManagedApp.request(`/api/v1/helper/chat/sessions/${SID}/messages`, {
+        headers: { Authorization: 'Bearer brz_' + 'a'.repeat(64) },
+      });
+
+      expect(res.status).toBe(200);
+      expect(withDbAccessContext).toHaveBeenCalledTimes(1);
+    });
+
+    it('helperDbAccessContext is exactly the context the middleware opens', async () => {
+      mockDeviceRow();
+
+      await app.request('/probe', { headers: { Authorization: 'Bearer brz_' + 'a'.repeat(64) } });
+
+      const middlewareCtx = vi.mocked(withDbAccessContext).mock.calls[0]?.[0];
+      expect(middlewareCtx).toEqual(helperDbAccessContext({ orgId: 'org-1', partnerId: 'partner-1' }));
+    });
+  });
+  describe('Helper disabled by policy', () => {
+    const TOKEN = { Authorization: 'Bearer brz_' + 'a'.repeat(64) };
+    const disabledApp = new Hono();
+    disabledApp.use('*', helperAuth);
+    disabledApp.get('/api/v1/helper/config', (c) => c.json({ ok: true, deviceId: c.get('helperDevice').id }));
+    disabledApp.get('/api/v1/helper/chat/sessions', (c) => c.json({ ok: true }));
+    disabledApp.get('/api/v1/extensions/acme/helper/config', (c) => c.json({ ok: true }));
+
+    beforeEach(() => {
+      vi.mocked(buildHelperConfigUpdate).mockResolvedValue({ enabled: false } as never);
+    });
+
+    it('resolves the effective setting for the authenticated device and org', async () => {
+      mockDeviceRow();
+      await disabledApp.request('/api/v1/helper/chat/sessions', { headers: TOKEN });
+      expect(buildHelperConfigUpdate).toHaveBeenCalledWith('dev-1', 'org-1');
+    });
+
+    it('refuses an ordinary helper route with 403 helper_disabled', async () => {
+      mockDeviceRow();
+      const res = await disabledApp.request('/api/v1/helper/chat/sessions', { headers: TOKEN });
+      expect(res.status).toBe(403);
+      expect(await res.json()).toEqual({
+        error: 'Breeze Helper is disabled for this device by policy',
+        code: 'helper_disabled',
+      });
+      expect(withDbAccessContext).not.toHaveBeenCalled();
+    });
+
+    it('refuses GET /helper/config too (no route is exempt)', async () => {
+      mockDeviceRow();
+      const res = await disabledApp.request('/api/v1/helper/config', { headers: TOKEN });
+      expect(res.status).toBe(403);
+      expect(await res.json()).toMatchObject({ code: 'helper_disabled' });
+    });
+
+    it('refuses extension /helper/* routes', async () => {
+      mockDeviceRow();
+      const res = await disabledApp.request('/api/v1/extensions/acme/helper/config', { headers: TOKEN });
+      expect(res.status).toBe(403);
+    });
+
+    it('admits ordinary routes when the effective setting is enabled (control)', async () => {
+      vi.mocked(buildHelperConfigUpdate).mockResolvedValue({ enabled: true } as never);
+      mockDeviceRow();
+      const res = await disabledApp.request('/api/v1/helper/chat/sessions', { headers: TOKEN });
+      expect(res.status).toBe(200);
+    });
+
+    it('answers 503 when the effective setting cannot be resolved', async () => {
+      vi.mocked(buildHelperConfigUpdate).mockRejectedValue(new Error('db down'));
+      mockDeviceRow();
+      const res = await disabledApp.request('/api/v1/helper/chat/sessions', { headers: TOKEN });
+      expect(res.status).toBe(503);
+      expect(res.headers.get('Retry-After')).toBe('30');
+    });
   });
 });

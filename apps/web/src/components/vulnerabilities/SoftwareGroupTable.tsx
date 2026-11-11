@@ -6,7 +6,8 @@ import '@/lib/i18n';
 import HelpTooltip from '../shared/HelpTooltip';
 import { SeverityBadge } from './SeverityBadge';
 import { KevBadge } from './KevBadge';
-import { RISK_EXPLANATION } from './vulnExplanations';
+import { PATCH_EXPLANATION, RISK_EXPLANATION } from './vulnExplanations';
+import { groupPatchState } from './patchState';
 import { VulnEmptyState, type VulnEmptyVariant } from './VulnEmptyState';
 import { densityTableClasses, readDensity, subscribeDensity, type Density } from '../../lib/density';
 import {
@@ -14,6 +15,7 @@ import {
   type SoftwareGroup,
   type VulnFleetFilters,
 } from '../../lib/api/vulnerabilities';
+import { useStableT } from '@/lib/i18n/useStableT';
 
 // Keyboard path into the drawer: the whole row stays mouse-clickable, but the
 // primary cell carries a real <button> so keyboard/screen-reader users can
@@ -53,6 +55,7 @@ export function SoftwareGroupTable({
   onClearFilters: () => void;
 }) {
   const { t } = useTranslation('vulnerabilities');
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   const [items, setItems] = useState<SoftwareGroup[]>([]);
   const [hasMore, setHasMore] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -74,7 +77,7 @@ export function SoftwareGroupTable({
         setHasMore(res.hasMore);
       })
       .catch((err: unknown) => {
-        if (!cancelled) setError(err instanceof Error ? err.message : t('softwareGroupTable.errors.load'));
+        if (!cancelled) setError(err instanceof Error ? err.message : stableT('softwareGroupTable.errors.load'));
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -82,15 +85,32 @@ export function SoftwareGroupTable({
     return () => {
       cancelled = true;
     };
-  }, [filters, refreshKey, retryKey, t]);
+  }, [filters, refreshKey, retryKey, stableT]);
 
   // Skeleton only on empty loads (first paint / after an error retry). A
   // filter-change refetch keeps the previous rows on screen instead of flashing.
   const showSkeleton = loading && items.length === 0;
-  const patchLabel = (g: SoftwareGroup): string =>
-    g.patchReadyFindingCount > 0
-      ? t('softwareGroupTable.patch.ready', { ready: g.patchReadyDeviceCount, total: g.deviceCount, count: g.patchReadyDeviceCount })
-      : '—';
+  // #7071: null = some CVE has no known fix version, so the honest advice is "latest".
+  const targetLabel = (g: SoftwareGroup): string =>
+    g.targetVersion
+      ? t('softwareGroupTable.target.version', { version: g.targetVersion })
+      : t('softwareGroupTable.target.latest');
+
+  // #9533: one answer to "is there a patch?" shared with the By-CVE lens and
+  // the "Patch ready" tile. Ready leads with the device split and keeps the
+  // target as context; a vendor fix with no Ready managed patch leads with the
+  // update advice; nothing known is a bare "—".
+  const patchCell = (g: SoftwareGroup): { primary: string; target: string | null } => {
+    const state = groupPatchState(g);
+    if (state === 'ready') {
+      return {
+        primary: t('softwareGroupTable.patch.ready', { ready: g.patchReadyDeviceCount, total: g.deviceCount, count: g.patchReadyDeviceCount }),
+        target: targetLabel(g),
+      };
+    }
+    if (state === 'update') return { primary: targetLabel(g), target: null };
+    return { primary: '—', target: null };
+  };
 
   const table = useMemo(
     () => (
@@ -107,9 +127,13 @@ export function SoftwareGroupTable({
                 <HelpTooltip side="bottom" ariaLabel={t('softwareGroupTable.help.riskAria')} text={RISK_EXPLANATION} />
               </span>
             </th>
-            <th className="px-4 py-3">{t('softwareGroupTable.table.cves')}</th>
             <th className="px-4 py-3">{t('softwareGroupTable.table.devices')}</th>
-            <th className="px-4 py-3">{t('softwareGroupTable.table.patch')}</th>
+            <th className="px-4 py-3">
+              <span className="inline-flex items-center gap-1">
+                {t('softwareGroupTable.table.patch')}
+                <HelpTooltip side="bottom" ariaLabel={t('softwareGroupTable.help.patchAria')} text={PATCH_EXPLANATION} />
+              </span>
+            </th>
           </tr>
         </thead>
         {showSkeleton ? (
@@ -122,8 +146,7 @@ export function SoftwareGroupTable({
                 </td>
                 <td className="px-4 py-3"><div className={`${SKELETON_BAR} h-5 w-16 rounded-full`} /></td>
                 <td className="px-4 py-3"><div className={`${SKELETON_BAR} w-8`} /></td>
-                <td className="px-4 py-3"><div className={`${SKELETON_BAR} w-8`} /></td>
-                <td className="px-4 py-3"><div className={`${SKELETON_BAR} w-8`} /></td>
+                <td className="px-4 py-3"><div className={`${SKELETON_BAR} w-20`} /></td>
                 <td className="px-4 py-3"><div className={`${SKELETON_BAR} w-24`} /></td>
               </tr>
             ))}
@@ -161,9 +184,15 @@ export function SoftwareGroupTable({
                   </span>
                 </td>
                 <td className="px-4 py-3 text-sm tabular-nums">{fmtRisk(g.maxRiskScore)}</td>
-                <td className="px-4 py-3 text-sm tabular-nums">{g.cveCount}</td>
-                <td className="px-4 py-3 text-sm tabular-nums">{g.deviceCount}</td>
-                <td className="px-4 py-3 text-sm">{patchLabel(g)}</td>
+                <td className="px-4 py-3 text-sm" data-testid={`software-group-devices-${g.groupKey}`}>
+                  {/* #2262: the remediation unit (devices to update) is the
+                      headline; the per-CVE fan-out is secondary context. */}
+                  <span className="block font-medium tabular-nums">{t('softwareGroupTable.devices', { count: g.deviceCount })}</span>
+                  <span className="block text-xs text-muted-foreground tabular-nums">{t('softwareGroupTable.cves', { count: g.cveCount })}</span>
+                </td>
+                <td className="px-4 py-3 text-sm" data-testid={`software-group-patch-${g.groupKey}`}>
+                  <PatchCellContent cell={patchCell(g)} targetTestId={`software-group-target-${g.groupKey}`} />
+                </td>
               </tr>
             ))}
           </tbody>
@@ -208,9 +237,13 @@ export function SoftwareGroupTable({
               </div>
               <div className="mt-3 space-y-2 border-t pt-3">
                 <CardField label={t('softwareGroupTable.table.risk')}><span className="text-sm tabular-nums" title={RISK_EXPLANATION}>{fmtRisk(g.maxRiskScore)}</span></CardField>
-                <CardField label={t('softwareGroupTable.table.cves')}><span className="text-sm tabular-nums">{g.cveCount}</span></CardField>
-                <CardField label={t('softwareGroupTable.table.devices')}><span className="text-sm tabular-nums">{g.deviceCount}</span></CardField>
-                <CardField label={t('softwareGroupTable.table.patch')}><span className="text-sm">{patchLabel(g)}</span></CardField>
+                <CardField label={t('softwareGroupTable.table.devices')}>
+                  <span className="text-sm tabular-nums">{t('softwareGroupTable.devices', { count: g.deviceCount })}</span>
+                  <span className="ml-1.5 text-xs text-muted-foreground tabular-nums">{t('softwareGroupTable.cves', { count: g.cveCount })}</span>
+                </CardField>
+                <CardField label={t('softwareGroupTable.table.patch')}>
+                  <PatchCellContent cell={patchCell(g)} title={PATCH_EXPLANATION} />
+                </CardField>
               </div>
             </DataCard>
           )),
@@ -257,6 +290,19 @@ export function SoftwareGroupTable({
         </p>
       )}
     </div>
+  );
+}
+
+function PatchCellContent({ cell, targetTestId, title }: { cell: { primary: string; target: string | null }; targetTestId?: string; title?: string }) {
+  return (
+    <>
+      <span className="block text-sm" title={title}>{cell.primary}</span>
+      {cell.target && (
+        <span data-testid={targetTestId} className="block text-xs text-muted-foreground">
+          {cell.target}
+        </span>
+      )}
+    </>
   );
 }
 

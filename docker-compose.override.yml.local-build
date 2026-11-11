@@ -13,6 +13,9 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile.api
+      args:
+        # Baked into the image; Compose never overrides APP_VERSION (#7024).
+        APP_VERSION: ${BREEZE_VERSION:-dev}
     environment:
       BINARY_SOURCE: local
       ENROLLMENT_KEY_PEPPER: ${ENROLLMENT_KEY_PEPPER:?Set ENROLLMENT_KEY_PEPPER in .env}
@@ -24,6 +27,12 @@ services:
       TURN_HOST: ${TURN_HOST:-}
       TURN_PORT: ${TURN_PORT:-3478}
       TURN_SECRET: ${TURN_SECRET:-}
+
+  # `--profile worker-split` must run the locally built image, not the
+  # registry ref the base file requires (#4144). Reuses the image `api` builds.
+  worker:
+    image: breeze-api:local
+    platform: linux/arm64
 
   web:
     image: breeze-web:local

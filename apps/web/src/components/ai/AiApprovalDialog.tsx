@@ -10,14 +10,18 @@ import {
 } from "lucide-react";
 import { cn, widthPercentClass } from "@/lib/utils";
 import { useTranslation } from "react-i18next";
-import { CeremonyError, decideIntentApproval } from "@/lib/intentApprovals";
+import { CeremonyError, decideIntentApproval, FRESH_APPROVER_FACTOR_TOOLS } from "@/lib/intentApprovals";
 import { ActionError } from "@/lib/runAction";
 import { navigateTo } from "@/lib/navigation";
 import { useRunContextLabel } from "../common/RunContext";
 import ScriptProposalApprovalCard from "./ScriptProposalApprovalCard";
-import type { AiApprovalScope, AiScriptRunContext } from "@breeze/shared";
+import type { AiApprovalOutcome, AiApprovalScope, AiScriptRunContext, AiStandingInstructionConflict } from "@breeze/shared";
+import { useStableT } from '@/lib/i18n/useStableT';
 
-// Must be <= server-side waitForApproval timeout (300s). Plan approvals use 10-min timeout.
+// Fallback only: the product default (also `AI_APPROVAL_TIMEOUT_DEFAULT_MINUTES`
+// in @breeze/shared) for an approval card whose server didn't send
+// `approvalWindowMs` yet (#6475 — older API build). Plan approvals use their
+// own separate 10-min timeout.
 const AUTO_DENY_MS = 5 * 60 * 1000;
 
 /** Keys that are internal identifiers — not useful to show the user */
@@ -79,6 +83,24 @@ interface AiApprovalDialogProps {
    */
   intentExpiresAt?: string;
   /**
+   * #6475 — the org's configured interactive-approval window (5-60 min,
+   * `resolveAiApprovalTimeout`), sent on every approval card. Replaces
+   * AUTO_DENY_MS as the countdown/progress-bar denominator when present, so
+   * an org that raised its timeout to 30 minutes actually sees 30 minutes
+   * here instead of the hard-coded 5. Falls back to AUTO_DENY_MS for an
+   * older API build that doesn't send it yet.
+   */
+  approvalWindowMs?: number;
+  /**
+   * #6475 — this specific wait's real server-side deadline (ISO), sent on
+   * the legacy (non-intent) approval path — the non-intent twin of
+   * `intentExpiresAt`. `intentExpiresAt` wins when both are present (it
+   * never coexists with this in practice, since a card is either
+   * intent-backed or legacy, but the precedence is explicit rather than
+   * accidental).
+   */
+  approvalExpiresAt?: string;
+  /**
    * #4888 — the run context a script launch will execute in, resolved
    * server-side (assistant override, else the script's saved default).
    * Rendered as its own always-visible row rather than left inside the
@@ -88,8 +110,23 @@ interface AiApprovalDialogProps {
    * choice and a machine-level run. Absent for every non-script tool.
    */
   scriptRunContext?: AiScriptRunContext | null;
+  /** W06: the call conflicts with a remembered standing instruction; shown as a red banner above the description. */
+  standingInstructionConflict?: AiStandingInstructionConflict;
   /** Called after a successful inline decide so the parent clears pendingApproval. */
   onIntentDecided?: () => void;
+  /**
+   * #9431: the server says this card's wait already ended — decided here or
+   * anywhere else (another window, Approvals, mobile), timed out, or settled.
+   * The card then says how it ended, stops its countdown (no client auto-deny)
+   * and offers nothing to click.
+   */
+  resolution?: AiApprovalOutcome;
+  /**
+   * Prefix for the decision controls' `data-testid`s
+   * (`<prefix>-approve` / `-deny` / `-error`). Defaults to `ai-approval`; the
+   * topology Explain panel embeds this same card as `topology-proposal`.
+   */
+  testIdPrefix?: string;
 }
 
 /**
@@ -249,18 +286,30 @@ export default function AiApprovalDialog({
   selfApprovalRequestId,
   approvalScope,
   intentExpiresAt,
+  approvalWindowMs,
+  approvalExpiresAt,
   scriptRunContext,
+  standingInstructionConflict,
   onIntentDecided,
+  resolution,
+  testIdPrefix = "ai-approval",
 }: AiApprovalDialogProps) {
   const { t } = useTranslation("ai");
-  // Seed from the intent's real deadline when we have one, clamped to the
-  // AUTO_DENY_MS window so the progress bar (denominator AUTO_DENY_MS) can't
-  // exceed 100%. Falls back to the mount-relative constant for the legacy path.
-  const [remainingMs, setRemainingMs] = useState(() =>
-    intentExpiresAt
-      ? Math.max(0, Math.min(AUTO_DENY_MS, new Date(intentExpiresAt).getTime() - Date.now()))
-      : AUTO_DENY_MS,
-  );
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
+  // #6475: the org's configured window replaces the hard-coded 5 minutes when
+  // the server sends one; an older API build that doesn't send it yet keeps
+  // the AUTO_DENY_MS fallback.
+  const windowMs = approvalWindowMs ?? AUTO_DENY_MS;
+  // Seed from the real deadline when we have one (intent-backed, then legacy
+  // non-intent), clamped to windowMs so the progress bar (denominator
+  // windowMs) can't exceed 100%. Falls back to the window itself when no
+  // server deadline was sent at all.
+  const [remainingMs, setRemainingMs] = useState(() => {
+    const deadlineIso = intentExpiresAt ?? approvalExpiresAt;
+    return deadlineIso
+      ? Math.max(0, Math.min(windowMs, new Date(deadlineIso).getTime() - Date.now()))
+      : windowMs;
+  });
   const [intentDecideState, setIntentDecideState] = useState<
     "idle" | "deciding" | "needs_device" | "decided" | "unavailable"
   >("idle");
@@ -268,10 +317,18 @@ export default function AiApprovalDialog({
   const [intentError, setIntentError] = useState<string | null>(null);
 
   const canSelfDecide = Boolean(intentBacked && selfApprovalRequestId);
+  // #9534: whether Approve runs a WebAuthn ceremony up front — the same rule
+  // decideIntentApproval applies. A supervised approve goes proofless (#5600),
+  // so its button must not promise a verification ("Verify & Approve" + a
+  // fingerprint) that never happens. If an enforcing partner policy then
+  // demands a step-up, the OS passkey prompt explains itself.
+  const verifiesOnApprove =
+    approvalScope !== "supervised" || FRESH_APPROVER_FACTOR_TOOLS.has(toolName);
   // The card is only passive (no time signal, nothing to act on) in the
   // four-eyes case. The sole-operator card is actionable and its intent still
   // expires after CHAT_EXPIRY_MS, so it gets the countdown too.
-  const showCountdown = !intentBacked || canSelfDecide;
+  // #9431: a card decided elsewhere has no deadline left to count down.
+  const showCountdown = (!intentBacked || canSelfDecide) && !resolution;
 
   // Read inside the interval callback without listing the state in the
   // effect's deps — doing so would restart the timer (and reset `start`) on
@@ -300,19 +357,34 @@ export default function AiApprovalDialog({
     const priorState = intentDecideState;
     setIntentDecideState("deciding");
     setIntentError(null);
+    // Topology M4-D3: a fresh-factor tool's APPROVE must carry a WebAuthn
+    // assertion made for this decision (no proofless attempt, no reused grant).
+    const freshFactor = decision === "approve" && FRESH_APPROVER_FACTOR_TOOLS.has(toolName);
+    const decideOpts = {
+      ...(opts?.acknowledgedPatterns ? { acknowledgedPatterns: opts.acknowledgedPatterns } : {}),
+      ...(freshFactor ? { freshFactor: true } : {}),
+    };
     try {
       const outcome = await decideIntentApproval(
         selfApprovalRequestId,
         decision,
         undefined,
         approvalScope,
-        // Only ever passed for a proposal-backed run's Approve — omitted
-        // entirely (not even as `undefined`) so a plain intent decide keeps
-        // calling with its original 4 arguments.
-        ...(opts?.acknowledgedPatterns ? [opts] : []),
+        // Only ever passed for a proposal-backed run's Approve or a
+        // fresh-factor approve — omitted entirely (not even as `undefined`)
+        // so a plain intent decide keeps calling with its original 4 arguments.
+        ...(Object.keys(decideOpts).length ? [decideOpts] : []),
       );
       if (outcome === "needs_device") {
         setIntentDecideState("needs_device");
+        return;
+      }
+      // The server wants a FRESH hardware-backed assertion for this approval
+      // (e.g. a synced passkey or a reused grant fell short). Retryable: keep
+      // Approve on screen for another scan.
+      if (outcome === "fresh_factor_required") {
+        setIntentError(t("aiApprovalDialog.freshFactorRequired"));
+        setIntentDecideState("idle");
         return;
       }
       // The org gained another eligible approver since this intent was created
@@ -325,6 +397,15 @@ export default function AiApprovalDialog({
       if (outcome === "not_sole_approver") {
         setIntentError(t("aiApprovalDialog.notSoleApprover"));
         setIntentDecideState("unavailable");
+        return;
+      }
+      // The server refused to apply the approve and denied the request
+      // (already toasted as an error with the reason). Terminal, and never
+      // shown as "approved".
+      if (outcome === "refused") {
+        setIntentError(t("aiApprovalDialog.refusedToast"));
+        setIntentDecideState("unavailable");
+        onIntentDecided?.();
         return;
       }
       // Terminal: the parent normally unmounts this card via onIntentDecided,
@@ -383,12 +464,14 @@ export default function AiApprovalDialog({
   // terminal "expired" presentation a server 410 produces.
   useEffect(() => {
     if (intentBacked && !canSelfDecide) return;
-    // Anchor to the intent's real server-side expiry when we have it, so the
-    // countdown matches the deadline the server will actually enforce. The
-    // legacy path has none, so it counts down the mount-relative window.
-    const deadline = intentExpiresAt
-      ? new Date(intentExpiresAt).getTime()
-      : Date.now() + AUTO_DENY_MS;
+    // #9431: already decided — never fire the client auto-deny against it.
+    if (resolution) return;
+    // Anchor to the real server-side expiry when we have one (intent-backed,
+    // then legacy non-intent's approvalExpiresAt), so the countdown matches
+    // the deadline the server will actually enforce. With neither, count down
+    // the mount-relative window (org-configured, or AUTO_DENY_MS fallback).
+    const deadlineIso = intentExpiresAt ?? approvalExpiresAt;
+    const deadline = deadlineIso ? new Date(deadlineIso).getTime() : Date.now() + windowMs;
     const interval = setInterval(() => {
       // Card already settled (decided / unavailable — via the decide handler's
       // not_sole_approver or a server 409/410) — stop ticking so the countdown
@@ -400,7 +483,7 @@ export default function AiApprovalDialog({
         clearInterval(interval);
         return;
       }
-      const remaining = Math.min(AUTO_DENY_MS, deadline - Date.now());
+      const remaining = Math.min(windowMs, deadline - Date.now());
       if (remaining <= 0) {
         clearInterval(interval);
         setRemainingMs(0);
@@ -414,7 +497,7 @@ export default function AiApprovalDialog({
           decideStateRef.current === "idle" ||
           decideStateRef.current === "needs_device"
         ) {
-          setIntentError(t("aiApprovalDialog.expired"));
+          setIntentError(stableT("aiApprovalDialog.expired"));
           setIntentDecideState("unavailable");
         }
       } else {
@@ -422,12 +505,12 @@ export default function AiApprovalDialog({
       }
     }, 1000);
     return () => clearInterval(interval);
-  }, [onReject, intentBacked, canSelfDecide, t, intentExpiresAt]);
+  }, [onReject, intentBacked, canSelfDecide, stableT, intentExpiresAt, approvalExpiresAt, windowMs, resolution]);
 
   const minutes = Math.floor(remainingMs / 60000);
   const seconds = Math.floor((remainingMs % 60000) / 1000);
   const countdown = `${minutes}:${seconds.toString().padStart(2, "0")}`;
-  const progressPct = (remainingMs / AUTO_DENY_MS) * 100;
+  const progressPct = (remainingMs / windowMs) * 100;
 
   const visibleInput = filterInput(input);
   const hasVisibleInput = Object.keys(visibleInput).length > 0;
@@ -442,7 +525,7 @@ export default function AiApprovalDialog({
   // — force the card read-only rather than trust the DTO's own `canDecide`,
   // which reflects role/permission only, not "is this the approval row fanned
   // out to you". Someone else decides it on the /approvals surface instead.
-  const proposalReadOnly = Boolean(intentBacked) && !canSelfDecide;
+  const proposalReadOnly = (Boolean(intentBacked) && !canSelfDecide) || Boolean(resolution);
 
   const isUrgent = showCountdown && remainingMs < 30_000;
 
@@ -506,13 +589,44 @@ export default function AiApprovalDialog({
         </div>
       )}
 
+      {standingInstructionConflict && (
+        <div
+          role="alert"
+          data-testid="approval-standing-instruction-banner"
+          className="mt-2 rounded-md border border-destructive/50 bg-destructive/10 px-2.5 py-1.5 text-xs font-medium text-destructive"
+        >
+          {t("wisp.instruction.conflictBanner", { text: standingInstructionConflict.text })}
+        </div>
+      )}
+
       <p className="mt-2 text-sm text-gray-700 dark:text-gray-300">
         {description}
       </p>
 
-      {intentBacked && !canSelfDecide && (
+      {intentBacked && !canSelfDecide && !resolution && (
         <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
           {t("aiApprovalDialog.pendingApproverDescription")}
+        </p>
+      )}
+
+      {/* #9431: the wait ended — decided here or anywhere else, timed out, or
+          settled. Said in words; the buttons below are disabled or hidden. */}
+      {resolution && (
+        <p
+          role="status"
+          data-testid={`${testIdPrefix}-resolved`}
+          className="mt-2 flex items-center gap-1.5 text-xs font-medium text-gray-700 dark:text-gray-200"
+        >
+          {resolution === "approved" ? (
+            <Check className="h-3.5 w-3.5 text-green-500" />
+          ) : (
+            <X className="h-3.5 w-3.5 text-gray-500" />
+          )}
+          {resolution === "approved"
+            ? t("aiApprovalDialog.resolvedApproved")
+            : resolution === "not_approved"
+              ? t("aiApprovalDialog.resolvedNotApproved")
+              : t("aiApprovalDialog.resolvedEnded")}
         </p>
       )}
 
@@ -553,7 +667,8 @@ export default function AiApprovalDialog({
           <button
             type="button"
             onClick={onApprove}
-            className="flex items-center gap-1.5 rounded-md bg-green-600 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-green-500"
+            disabled={Boolean(resolution)}
+            className="flex items-center gap-1.5 rounded-md bg-green-600 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-green-500 disabled:cursor-not-allowed disabled:opacity-50"
           >
             <Check className="h-3.5 w-3.5" />
             {t("aiApprovalDialog.approve")}
@@ -561,7 +676,8 @@ export default function AiApprovalDialog({
           <button
             type="button"
             onClick={onReject}
-            className="flex items-center gap-1.5 rounded-md bg-gray-200 px-3 py-1.5 text-xs font-medium text-gray-700 transition-colors hover:bg-gray-300 dark:bg-gray-700 dark:text-gray-300 dark:hover:bg-gray-600"
+            disabled={Boolean(resolution)}
+            className="flex items-center gap-1.5 rounded-md bg-gray-200 px-3 py-1.5 text-xs font-medium text-gray-700 transition-colors hover:bg-gray-300 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-gray-700 dark:text-gray-300 dark:hover:bg-gray-600"
           >
             <X className="h-3.5 w-3.5" />
             {t("aiApprovalDialog.reject")}
@@ -591,24 +707,35 @@ export default function AiApprovalDialog({
           above), so this row would otherwise duplicate them. */}
       {canSelfDecide &&
         !proposalId &&
+        !resolution &&
         intentDecideState !== "decided" &&
         intentDecideState !== "unavailable" && (
         <div className="mt-3 flex gap-2">
           {intentDecideState !== "needs_device" && (
             <button
               type="button"
+              data-testid={`${testIdPrefix}-approve`}
               disabled={intentDecideState === "deciding"}
               onClick={() => handleIntentDecision("approve")}
               className="flex items-center gap-1.5 rounded-md bg-green-600 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-green-500 disabled:opacity-50"
             >
-              <Fingerprint className="h-3.5 w-3.5" />
+              {verifiesOnApprove ? (
+                <Fingerprint className="h-3.5 w-3.5" />
+              ) : (
+                <Check className="h-3.5 w-3.5" />
+              )}
               {intentDecideState === "deciding"
-                ? t("aiApprovalDialog.verifying")
-                : t("aiApprovalDialog.approveVerify")}
+                ? verifiesOnApprove
+                  ? t("aiApprovalDialog.verifying")
+                  : t("aiApprovalDialog.approving")
+                : verifiesOnApprove
+                  ? t("aiApprovalDialog.approveVerify")
+                  : t("aiApprovalDialog.approve")}
             </button>
           )}
           <button
             type="button"
+            data-testid={`${testIdPrefix}-deny`}
             disabled={intentDecideState === "deciding"}
             onClick={() => handleIntentDecision("deny")}
             className="flex items-center gap-1.5 rounded-md bg-gray-200 px-3 py-1.5 text-xs font-medium text-gray-700 transition-colors hover:bg-gray-300 disabled:opacity-50 dark:bg-gray-700 dark:text-gray-300 dark:hover:bg-gray-600"
@@ -639,7 +766,7 @@ export default function AiApprovalDialog({
       )}
 
       {canSelfDecide && intentError && (
-        <p role="alert" className="mt-2 text-xs text-red-500">
+        <p role="alert" data-testid={`${testIdPrefix}-error`} className="mt-2 text-xs text-red-500">
           {intentError}
         </p>
       )}

@@ -31,6 +31,8 @@ import { useBulkSelection } from '../billing/bulk/useBulkSelection';
 import { BulkActionBar } from '../billing/bulk/BulkActionBar';
 import { ConfirmDialog } from '../shared/ConfirmDialog';
 import AccessDenied from '../shared/AccessDenied';
+import { useStableT } from '@/lib/i18n/useStableT';
+import HashLink from '@/components/shared/HashLink';
 
 interface Organization {
   id: string;
@@ -94,6 +96,7 @@ interface Props {
 
 export function ContractsList({ lockedOrgId }: Props = {}) {
   const { t } = useTranslation('billing');
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   const { can } = usePermissions();
   const bulk = useBulkSelection();
   const [contracts, setContracts] = useState<ContractSummary[]>([]);
@@ -133,9 +136,9 @@ export function ContractsList({ lockedOrgId }: Props = {}) {
       setOrgs(await fetchAllOrganizationsFrom<Organization>('/orgs/organizations'));
     } catch (err) {
       if (err instanceof ListFetchError && err.status === 401) return UNAUTHORIZED();
-      handleActionError(err, t('contracts.contractsList.errors.loadOrganizations'));
+      handleActionError(err, stableT('contracts.contractsList.errors.loadOrganizations'));
     }
-  }, [t]);
+  }, [stableT]);
 
   const loadContracts = useCallback(async (f: Filters) => {
     // Latest-request-wins. A deep-linked load (`/contracts#status=active`) fires
@@ -151,18 +154,18 @@ export function ContractsList({ lockedOrgId }: Props = {}) {
       if (seq !== fetchSeq.current) return;
       if (res.status === 401) return UNAUTHORIZED();
       if (res.status === 403) { setForbidden(true); return; }
-      if (!res.ok) throw new Error(t('contracts.contractsList.errors.loadContracts'));
+      if (!res.ok) throw new Error(stableT('contracts.contractsList.errors.loadContracts'));
       const body = (await res.json().catch(() => null)) as { data: ContractSummary[] } | null;
       if (seq !== fetchSeq.current) return;
-      if (!body) throw new Error(t('contracts.contractsList.errors.loadContracts'));
+      if (!body) throw new Error(stableT('contracts.contractsList.errors.loadContracts'));
       setContracts(body.data ?? []);
     } catch (err) {
       if (seq !== fetchSeq.current) return;
-      setError(err instanceof Error ? err.message : t('contracts.contractsList.errors.loadContracts'));
+      setError(err instanceof Error ? err.message : stableT('contracts.contractsList.errors.loadContracts'));
     } finally {
       if (seq === fetchSeq.current) setLoading(false);
     }
-  }, [t]);
+  }, [stableT]);
 
   useEffect(() => { void loadOrgs(); }, [loadOrgs]);
   useEffect(() => { void loadContracts(filters); }, [loadContracts, filters]);
@@ -373,10 +376,10 @@ export function ContractsList({ lockedOrgId }: Props = {}) {
           </span>
           {/* A plain hash link is enough: ContractsTabs' useHashState already
               subscribes to hashchange, so this swaps the view with no navigation. */}
-          <a href="#tab=currency-mismatches" data-testid="contracts-currency-mismatch-open"
+          <HashLink hash="tab=currency-mismatches" data-testid="contracts-currency-mismatch-open"
              className="font-medium text-primary hover:underline">
             {t('contracts.contractsList.currencyBanner.review')}
-          </a>
+          </HashLink>
         </div>
       )}
 
@@ -528,6 +531,22 @@ export function ContractsList({ lockedOrgId }: Props = {}) {
                         >
                           {ctr.name}
                         </a>
+                        {/* #10361: a draft a quote accept created bills nothing until
+                            someone activates it — mark it so it cannot pass for a
+                            hand-started draft. Only drafts: once live, it is no
+                            longer pending. */}
+                        {ctr.status === 'draft' && ctr.sourceQuote && (
+                          <a
+                            href={`/billing/quotes/${ctr.sourceQuote.id}`}
+                            onClick={(e) => e.stopPropagation()}
+                            data-testid={`contract-from-quote-${ctr.id}`}
+                            className="ml-2 inline-flex items-center rounded-full bg-primary/10 px-2 py-0.5 align-middle text-xs font-normal text-primary hover:bg-primary/20"
+                          >
+                            {ctr.sourceQuote.quoteNumber
+                              ? t('contracts.contractsList.fromQuoteReady', { number: ctr.sourceQuote.quoteNumber })
+                              : t('contracts.contractsList.fromQuoteReadyUnnumbered')}
+                          </a>
+                        )}
                       </td>
                       {!lockedOrgId && <td className="px-3 py-3">{orgName(ctr.orgId)}</td>}
                       <td className="px-3 py-3">

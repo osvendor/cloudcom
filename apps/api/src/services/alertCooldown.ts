@@ -38,10 +38,20 @@ function memorySetCooldown(key: string, cooldownMinutes: number): void {
 }
 
 /**
+ * Compose the rule/device[/subject] identity used for both the in-memory
+ * fallback map key and the Redis key suffix. `subjectKey` isolates noise
+ * controls per hardware component (W03) without disturbing the legacy
+ * rule:device identity when it is omitted.
+ */
+function subjectIdentity(ruleId: string, deviceId: string, subjectKey?: string): string {
+  return `${ruleId}:${deviceId}${subjectKey === undefined ? '' : `:${subjectKey}`}`;
+}
+
+/**
  * Build Redis key for cooldown tracking
  */
-function buildCooldownKey(ruleId: string, deviceId: string): string {
-  return `${COOLDOWN_PREFIX}:${ruleId}:${deviceId}`;
+function buildCooldownKey(ruleId: string, deviceId: string, subjectKey?: string): string {
+  return `${COOLDOWN_PREFIX}:${subjectIdentity(ruleId, deviceId, subjectKey)}`;
 }
 
 /**
@@ -49,24 +59,18 @@ function buildCooldownKey(ruleId: string, deviceId: string): string {
  *
  * @param ruleId - Alert rule ID
  * @param deviceId - Device ID
+ * @param subjectKey - Optional component subject (W03) isolating cooldown state within the rule/device pair
  * @returns true if cooldown is active (should NOT create alert), false otherwise
  */
-export async function isCooldownActive(ruleId: string, deviceId: string): Promise<boolean> {
-  if (!isRedisAvailable()) {
+export async function isCooldownActive(ruleId: string, deviceId: string, subjectKey?: string): Promise<boolean> {
+  const redis = isRedisAvailable() ? getRedis() : null;
+  if (!redis) {
     // Fail closed: suppress duplicate alerts when Redis is down
     console.error('[AlertCooldown] Redis unavailable, using in-memory fallback (fail-closed)');
-    const memKey = `${ruleId}:${deviceId}`;
-    return memoryHasCooldown(memKey);
+    return memoryHasCooldown(subjectIdentity(ruleId, deviceId, subjectKey));
   }
 
-  const redis = getRedis();
-  if (!redis) {
-    console.error('[AlertCooldown] Redis client null, using in-memory fallback (fail-closed)');
-    const memKey = `${ruleId}:${deviceId}`;
-    return memoryHasCooldown(memKey);
-  }
-
-  const key = buildCooldownKey(ruleId, deviceId);
+  const key = buildCooldownKey(ruleId, deviceId, subjectKey);
   const exists = await redis.exists(key);
 
   return exists === 1;
@@ -78,31 +82,25 @@ export async function isCooldownActive(ruleId: string, deviceId: string): Promis
  * @param ruleId - Alert rule ID
  * @param deviceId - Device ID
  * @param cooldownMinutes - Duration of cooldown in minutes
+ * @param subjectKey - Optional component subject (W03) isolating cooldown state within the rule/device pair
  */
 export async function setCooldown(
   ruleId: string,
   deviceId: string,
-  cooldownMinutes: number
+  cooldownMinutes: number,
+  subjectKey?: string
 ): Promise<void> {
-  if (!isRedisAvailable()) {
-    console.error('[AlertCooldown] Redis unavailable, setting in-memory cooldown fallback');
-    const memKey = `${ruleId}:${deviceId}`;
-    memorySetCooldown(memKey, cooldownMinutes);
-    return;
-  }
-
-  const redis = getRedis();
+  const redis = isRedisAvailable() ? getRedis() : null;
   if (!redis) {
-    console.error('[AlertCooldown] Redis client null, setting in-memory cooldown fallback');
-    const memKey = `${ruleId}:${deviceId}`;
-    memorySetCooldown(memKey, cooldownMinutes);
+    console.error('[AlertCooldown] Redis unavailable, setting in-memory cooldown fallback');
+    memorySetCooldown(subjectIdentity(ruleId, deviceId, subjectKey), cooldownMinutes);
     return;
   }
 
-  const key = buildCooldownKey(ruleId, deviceId);
+  const key = buildCooldownKey(ruleId, deviceId, subjectKey);
 
   // Phase 6c: Adaptive cooldown — increase multiplier on repeated triggers
-  const adaptiveKey = `${COOLDOWN_PREFIX}:adaptive:${ruleId}:${deviceId}`;
+  const adaptiveKey = `${COOLDOWN_PREFIX}:adaptive:${subjectIdentity(ruleId, deviceId, subjectKey)}`;
   let multiplier = 1;
 
   try {
@@ -288,83 +286,6 @@ export async function extendCooldown(
   }
 }
 
-// ============================================
-// Config Policy Alert Rule Cooldowns
-// ============================================
-
-// Key pattern for config policy alert rule cooldowns uses a 'cpar:' segment
-// to distinguish from legacy standalone alert rule cooldowns.
-const CONFIG_POLICY_COOLDOWN_PREFIX = `${COOLDOWN_PREFIX}:cpar`;
-
-/**
- * Build Redis key for config policy alert rule cooldown tracking
- */
-function buildConfigPolicyCooldownKey(ruleId: string, deviceId: string): string {
-  return `${CONFIG_POLICY_COOLDOWN_PREFIX}:${ruleId}:${deviceId}`;
-}
-
-/**
- * Check if a cooldown is currently active for a config policy alert rule / device combination
- *
- * @param ruleId - Config policy alert rule ID (from config_policy_alert_rules)
- * @param deviceId - Device ID
- * @returns true if cooldown is active (should NOT create alert), false otherwise
- */
-export async function isConfigPolicyRuleCooling(ruleId: string, deviceId: string): Promise<boolean> {
-  if (!isRedisAvailable()) {
-    console.error('[AlertCooldown] Redis unavailable, using in-memory fallback (fail-closed) [config policy]');
-    const memKey = `cpar:${ruleId}:${deviceId}`;
-    return memoryHasCooldown(memKey);
-  }
-
-  const redis = getRedis();
-  if (!redis) {
-    console.error('[AlertCooldown] Redis client null, using in-memory fallback (fail-closed) [config policy]');
-    const memKey = `cpar:${ruleId}:${deviceId}`;
-    return memoryHasCooldown(memKey);
-  }
-
-  const key = buildConfigPolicyCooldownKey(ruleId, deviceId);
-  const exists = await redis.exists(key);
-
-  return exists === 1;
-}
-
-/**
- * Set a cooldown for a config policy alert rule / device combination
- *
- * @param ruleId - Config policy alert rule ID (from config_policy_alert_rules)
- * @param deviceId - Device ID
- * @param cooldownMinutes - Duration of cooldown in minutes
- */
-export async function markConfigPolicyRuleCooldown(
-  ruleId: string,
-  deviceId: string,
-  cooldownMinutes: number
-): Promise<void> {
-  if (!isRedisAvailable()) {
-    console.error('[AlertCooldown] Redis unavailable, setting in-memory cooldown fallback [config policy]');
-    const memKey = `cpar:${ruleId}:${deviceId}`;
-    memorySetCooldown(memKey, cooldownMinutes);
-    return;
-  }
-
-  const redis = getRedis();
-  if (!redis) {
-    console.error('[AlertCooldown] Redis client null, setting in-memory cooldown fallback [config policy]');
-    const memKey = `cpar:${ruleId}:${deviceId}`;
-    memorySetCooldown(memKey, cooldownMinutes);
-    return;
-  }
-
-  const key = buildConfigPolicyCooldownKey(ruleId, deviceId);
-  const ttlSeconds = cooldownMinutes * 60;
-
-  await redis.setex(key, ttlSeconds, Date.now().toString());
-
-  console.log(`[AlertCooldown] Set config policy cooldown for cpar=${ruleId} device=${deviceId} for ${cooldownMinutes}min`);
-}
-
 async function moveCooldownKeys(redis: Redis, fromPattern: string, toKey: (deviceId: string) => string): Promise<number> {
   let cursor = '0'; let moved = 0;
   do {
@@ -396,11 +317,11 @@ export async function rekeyRuleCooldowns(fromRuleId: string, toRuleId: string): 
 /** `cpar:<source>:<device>` → `<compiledRule>:<device>` (W05c1 §Open alerts). */
 export async function rekeyConfigPolicyCooldowns(sourceRuleId: string, compiledRuleId: string): Promise<number> {
   const redis = getRedis(); if (!redis) return 0;
-  return moveCooldownKeys(redis, `${CONFIG_POLICY_COOLDOWN_PREFIX}:${sourceRuleId}:*`, (d) => buildCooldownKey(compiledRuleId, d));
+  return moveCooldownKeys(redis, `${COOLDOWN_PREFIX}:cpar:${sourceRuleId}:*`, (d) => buildCooldownKey(compiledRuleId, d));
 }
 export async function rekeyCooldownsBackToConfigPolicy(compiledRuleId: string, sourceRuleId: string): Promise<number> {
   const redis = getRedis(); if (!redis) return 0;
-  return moveCooldownKeys(redis, `${COOLDOWN_PREFIX}:${compiledRuleId}:*`, (d) => buildConfigPolicyCooldownKey(sourceRuleId, d));
+  return moveCooldownKeys(redis, `${COOLDOWN_PREFIX}:${compiledRuleId}:*`, (d) => `${COOLDOWN_PREFIX}:cpar:${sourceRuleId}:${d}`);
 }
 
 // ============================================
@@ -416,20 +337,16 @@ const FLAP_PREFIX = 'breeze:alerts:flap';
 export async function recordStateTransition(
   ruleId: string,
   deviceId: string,
-  state: 'triggered' | 'resolved'
+  state: 'triggered' | 'resolved',
+  subjectKey?: string
 ): Promise<void> {
-  if (!isRedisAvailable()) {
+  const redis = isRedisAvailable() ? getRedis() : null;
+  if (!redis) {
     console.warn('[AlertCooldown] Redis unavailable, flapping detection disabled — state transition not recorded');
     return;
   }
 
-  const redis = getRedis();
-  if (!redis) {
-    console.warn('[AlertCooldown] Redis client null, flapping detection disabled — state transition not recorded');
-    return;
-  }
-
-  const key = `${FLAP_PREFIX}:${ruleId}:${deviceId}`;
+  const key = `${FLAP_PREFIX}:${subjectIdentity(ruleId, deviceId, subjectKey)}`;
   const entry = JSON.stringify({ state, timestamp: Date.now() });
 
   // Push to list and trim to last 20 entries
@@ -453,20 +370,16 @@ export async function isFlapping(
   ruleId: string,
   deviceId: string,
   windowMinutes: number = 10,
-  threshold: number = 4
+  threshold: number = 4,
+  subjectKey?: string
 ): Promise<boolean> {
-  if (!isRedisAvailable()) {
+  const redis = isRedisAvailable() ? getRedis() : null;
+  if (!redis) {
     console.warn('[AlertCooldown] Redis unavailable, flapping detection disabled');
     return false;
   }
 
-  const redis = getRedis();
-  if (!redis) {
-    console.warn('[AlertCooldown] Redis client null, flapping detection disabled');
-    return false;
-  }
-
-  const key = `${FLAP_PREFIX}:${ruleId}:${deviceId}`;
+  const key = `${FLAP_PREFIX}:${subjectIdentity(ruleId, deviceId, subjectKey)}`;
   const entries = await redis.lrange(key, 0, -1);
 
   if (entries.length < threshold) return false;
@@ -514,6 +427,7 @@ export async function listActiveCooldowns(): Promise<Array<{
     const [nextCursor, keys] = await redis.scan(cursor, 'MATCH', pattern, 'COUNT', 100);
     cursor = nextCursor;
 
+    // Retired ':cpar:' keys expire on their own TTL; exclude them from active cooldowns.
     const filteredKeys = keys.filter(k => !k.includes(':adaptive:') && !k.includes(':cpar:'));
 
     for (const key of filteredKeys) {

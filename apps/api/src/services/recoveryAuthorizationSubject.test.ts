@@ -168,6 +168,15 @@ describe('captureRecoveryAuthorizationSubject', () => {
     expect(subject.authorizationPrincipalId).toBe(RUN_ID);
   });
 
+  it('refuses a flow principal: no flow kind is persisted and a flow run is not an agent run (W04 #5219)', async () => {
+    await expect(captureRecoveryAuthorizationSubject(
+      auth({ kind: 'flow', flowId: PRINCIPAL_ID, runId: RUN_ID }),
+      ORG_ID,
+      { operation: 'restore', requiredAiTool: 'execute_dr_plan' },
+      dependencies(),
+    )).rejects.toMatchObject({ code: 'principal_kind_not_supported' });
+  });
+
   it('accepts only an allowlisted system reason for its operation', async () => {
     await expect(captureRecoveryAuthorizationSubject(
       auth({ kind: 'system', reason: 'backup-verification-scheduler' }),
@@ -192,6 +201,7 @@ describe('captureRecoveryAuthorizationSubject', () => {
     [{ kind: 'unknown' } as const, 'unknown_principal'],
     [{ kind: 'agent', deviceId: PRINCIPAL_ID } as const, 'principal_kind_not_supported'],
     [{ kind: 'helper', deviceId: PRINCIPAL_ID } as const, 'principal_kind_not_supported'],
+    [{ kind: 'api_key', apiKeyId: PRINCIPAL_ID, partnerServicePrincipalId: PRINCIPAL_ID } as const, 'principal_kind_not_supported'],
     [{ kind: 'api_key' } as const, 'principal_id_missing'],
   ])('rejects unsupported or incomplete principal %#', async (principal, code) => {
     await expect(captureRecoveryAuthorizationSubject(

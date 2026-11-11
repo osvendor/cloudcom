@@ -12,6 +12,12 @@ import {
 // device stats build inArray(devices.siteId, allowedSiteIds) and alert stats
 // build inArray(alerts.deviceId, resolvedDeviceIds). Removing either production
 // narrowing line makes the matching assertion fail.
+// Topology M4-D2: the admin/session reads resolve the caller's pinned-site visibility.
+vi.mock('../services/topology/aiSessionAccess', () => ({
+  resolveTopologySessionVisibility: vi.fn(async () => ({ kind: 'all' })),
+  topologySessionAccessCondition: vi.fn(async () => undefined),
+  topologySessionCondition: vi.fn(() => undefined),
+}));
 vi.mock('drizzle-orm', async (importOriginal) => {
   const actual = await importOriginal<typeof import('drizzle-orm')>();
   return {
@@ -28,8 +34,27 @@ const {
   executeScriptOnDevicesMock,
   assertDeviceExecuteAllowedMock,
   rateLimitState,
-  authState
-} = vi.hoisted(() => ({
+  authState,
+  dbContextState,
+  withAuthDbAccessContextMock,
+  dispatchWakeMock
+} = vi.hoisted(() => {
+  // #7109 — models withAuthDbAccessContext as a context that COMMITS when its
+  // callback returns: `depth` says whether a DB call ran inside one, `events`
+  // records the commit so a test can order it against the agent send.
+  const dbContextState = { depth: 0, events: [] as string[] };
+  return {
+  dispatchWakeMock: vi.fn(),
+  dbContextState,
+  withAuthDbAccessContextMock: vi.fn(async (_auth: unknown, fn: () => Promise<unknown>) => {
+    dbContextState.depth += 1;
+    try {
+      return await fn();
+    } finally {
+      dbContextState.depth -= 1;
+      dbContextState.events.push('commit');
+    }
+  }),
   publishEventMock: vi.fn().mockResolvedValue('event-1'),
   setCooldownMock: vi.fn().mockResolvedValue(undefined),
   emitAlertStateFeedbackMock: vi.fn().mockResolvedValue(undefined),
@@ -41,7 +66,25 @@ const {
     permissions: undefined as { allowedSiteIds?: string[] } | undefined,
     token: undefined as { mdid?: string } | undefined
   }
-}));
+  };
+});
+
+// Devices parked in a holding org, by id. The helper's query is proven against
+// Postgres in parkedCommandDelivery.integration.test.ts.
+const parkedDeviceIds = vi.hoisted(() => new Set<string>());
+vi.mock('../services/unassignedPool/deliveryEligibility', async () => {
+  const actual = await vi.importActual<typeof import('../services/unassignedPool/deliveryEligibility')>(
+    '../services/unassignedPool/deliveryEligibility',
+  );
+  return {
+    ...actual,
+    assertCommandDeliverable: vi.fn(async (_reader: unknown, input: { deviceId: string; commandType: string }) => {
+      if (!actual.isParkedDeliverableCommandType(input.commandType) && parkedDeviceIds.has(input.deviceId)) {
+        throw new actual.ParkedDeviceCommandRefusedError(input.deviceId, input.commandType);
+      }
+    }),
+  };
+});
 
 vi.mock('../db', () => ({
   db: {
@@ -51,6 +94,7 @@ vi.mock('../db', () => ({
     delete: vi.fn(),
     transaction: vi.fn()
   },
+  withDbTransaction: (fn: () => Promise<unknown>) => fn(),
   runOutsideDbContext: vi.fn((fn: () => any) => fn()),
   withSystemDbAccessContext: vi.fn(async (fn: () => any) => fn())
 }));
@@ -88,7 +132,8 @@ vi.mock('../middleware/auth', () => ({
     if (authState.permissions) c.set('permissions', authState.permissions);
     return next();
   }),
-  requireMfa: vi.fn(() => async (_c: any, next: any) => next())
+  requireMfa: vi.fn(() => async (_c: any, next: any) => next()),
+  withAuthDbAccessContext: withAuthDbAccessContextMock
 }));
 
 vi.mock('../services/eventBus', () => ({
@@ -104,6 +149,11 @@ vi.mock('../services/auditEvents', async (importOriginal) => ({
 
 vi.mock('../services/alertCooldown', () => ({
   setCooldown: setCooldownMock
+}));
+
+vi.mock('../services/wakeOnLan', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../services/wakeOnLan')>()),
+  dispatchWake: dispatchWakeMock
 }));
 
 vi.mock('../services/scriptExecution', () => ({
@@ -129,7 +179,8 @@ vi.mock('../middleware/userRateLimit', () => ({
 }));
 
 import { db } from '../db';
-import { inArray } from 'drizzle-orm';
+import { inArray, type SQL } from 'drizzle-orm';
+import { PgDialect } from 'drizzle-orm/pg-core';
 import { devices, alerts, mobileDevices } from '../db/schema';
 import { authMiddleware, requirePermission } from '../middleware/auth';
 
@@ -371,6 +422,8 @@ describe('mobile routes', () => {
     vi.mocked(db.transaction).mockReset();
     executeScriptOnDevicesMock.mockReset();
     assertDeviceExecuteAllowedMock.mockResolvedValue(undefined);
+    dbContextState.depth = 0;
+    dbContextState.events = [];
     _resetRegistrationFallbackReportsForTests();
     app = new Hono();
     app.route('/mobile', mobileRoutes);
@@ -842,7 +895,8 @@ describe('mobile routes', () => {
               deviceHostname: 'host-1',
               deviceOsType: 'linux',
               deviceStatus: 'online',
-              category: 'Security'
+              category: 'Security',
+              source: 'maintenance-reboot-sweep'
             },
             {
               id: 'alert-2',
@@ -860,7 +914,8 @@ describe('mobile routes', () => {
               deviceStatus: null,
               // Alerts can be created without a rule, so the joined category
               // is nullable.
-              category: null
+              category: null,
+              source: null
             }
           ]) as any
         );
@@ -880,6 +935,15 @@ describe('mobile routes', () => {
       // constant the removed TYPE row used to display.
       expect(body.data[0].category).toBe('Security');
       expect(body.data[1].category).toBeNull();
+      // The emitter tag from `context.source` is what lets mobile offer
+      // "Reboot now" on a reboot-pending alert; absent context maps to null.
+      expect(body.data[0].source).toBe('maintenance-reboot-sweep');
+      expect(body.data[1].source).toBeNull();
+      // The rows above are fixtures, so also pin the projection that produces
+      // `source` from the alert's context JSON.
+      const inboxSelection = vi.mocked(db.select).mock.calls[1]?.[0] as Record<string, SQL> | undefined;
+      expect(inboxSelection?.source).toBeDefined();
+      expect(new PgDialect().sqlToQuery(inboxSelection!.source!).sql).toBe(`"alerts"."context"->>'source'`);
     });
 
     it('should require organization context for org scope', async () => {
@@ -1229,7 +1293,7 @@ describe('mobile routes', () => {
       expect(db.update).toHaveBeenCalled();
     });
 
-    it('should leave deviceless alert visible to a site-restricted caller', async () => {
+    it('should hide deviceless alert to a site-restricted caller', async () => {
       authState.permissions = { allowedSiteIds: [SITE_A] };
       vi.mocked(db.select).mockReturnValue(
         mockSelectLimitChain([
@@ -1244,8 +1308,8 @@ describe('mobile routes', () => {
         method: 'POST'
       });
 
-      expect(res.status).toBe(200);
-      expect(db.update).toHaveBeenCalled();
+      expect(res.status).toBe(404);
+      expect(db.update).not.toHaveBeenCalled();
     });
 
     it('should not narrow an unrestricted caller (allowedSiteIds undefined)', async () => {
@@ -1386,7 +1450,7 @@ describe('mobile routes', () => {
       expect(db.update).toHaveBeenCalled();
     });
 
-    it('should leave deviceless alert visible to a site-restricted caller', async () => {
+    it('should hide deviceless alert to a site-restricted caller', async () => {
       authState.permissions = { allowedSiteIds: [SITE_A] };
       vi.mocked(db.select).mockReturnValue(
         mockSelectLimitChain([
@@ -1403,8 +1467,8 @@ describe('mobile routes', () => {
         body: JSON.stringify({ note: 'done' })
       });
 
-      expect(res.status).toBe(200);
-      expect(db.update).toHaveBeenCalled();
+      expect(res.status).toBe(404);
+      expect(db.update).not.toHaveBeenCalled();
     });
 
     it('should not narrow an unrestricted caller (allowedSiteIds undefined)', async () => {
@@ -2168,6 +2232,27 @@ describe('mobile routes', () => {
       expect(res.status).toBe(404);
     });
 
+    it('refuses a device action for a device parked in a holding org', async () => {
+      vi.mocked(db.select).mockReturnValue(
+        mockSelectLimitChain([
+          { id: '11111111-2222-4333-8444-555555555555', orgId: 'org-123', status: 'online', siteId: null }
+        ]) as any
+      );
+      parkedDeviceIds.add('11111111-2222-4333-8444-555555555555');
+      try {
+        const res = await app.request('/mobile/devices/11111111-2222-4333-8444-555555555555/actions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'reboot' })
+        });
+        expect(res.status).toBe(409);
+        await expect(res.json()).resolves.toMatchObject({ code: 'DEVICE_PENDING_ASSIGNMENT' });
+      } finally {
+        parkedDeviceIds.clear();
+      }
+      expect(db.insert).not.toHaveBeenCalled();
+    });
+
     it('should reject decommissioned devices', async () => {
       vi.mocked(db.select).mockReturnValue(
         mockSelectLimitChain([
@@ -2390,6 +2475,189 @@ describe('mobile routes', () => {
       expect(res.status).toBe(201);
       const body = await res.json();
       expect('ignoredParameters' in body).toBe(false);
+    });
+
+    // #7109 — the route is registered in selfManagedDbContextRoutes.ts, so no
+    // request transaction wraps it. run_script must hand the service a runner
+    // that opens (and commits) the caller's own context, so the command is sent
+    // only after its rows are visible to the agent-result path.
+    describe('commit-before-send (#7109)', () => {
+      const onlineDevice = { id: mobileDeviceId, orgId: 'org-123', status: 'online', osType: 'linux', siteId: null };
+
+      // Stands in for executeScriptOnDevices' contract (#7103, pinned in
+      // scriptExecution.commitBeforeSend.test.ts): rows are created through the
+      // runner when one is given, else inline in the ambient context; the send
+      // happens after that. Only the route's choice is under test here.
+      const serviceThatSends = () => async (input: { runInDbContext?: <T>(fn: () => Promise<T>) => Promise<T> }) => {
+        const createRows = async () => {
+          dbContextState.events.push(dbContextState.depth > 0 ? 'rows:in-context' : 'rows:contextless');
+        };
+        if (input.runInDbContext) await input.runInDbContext(createRows);
+        else await createRows();
+        dbContextState.events.push('send');
+        return admittedScriptResult();
+      };
+
+      it('sends the run_script command only after the context that created its rows committed', async () => {
+        vi.mocked(db.select).mockReturnValue(mockSelectLimitChain([onlineDevice]) as any);
+        executeScriptOnDevicesMock.mockImplementationOnce(serviceThatSends());
+
+        const res = await app.request(`/mobile/devices/${mobileDeviceId}/actions`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'run_script', scriptId: mobileScriptId })
+        });
+
+        expect(res.status).toBe(201);
+        const { events } = dbContextState;
+        const rows = events.indexOf('rows:in-context');
+        const send = events.indexOf('send');
+        expect(rows).toBeGreaterThanOrEqual(0);
+        expect(send).toBeGreaterThan(rows);
+        // A commit lands strictly between row creation and the send.
+        expect(events.slice(rows + 1, send)).toContain('commit');
+      });
+
+      it('passes a runner that opens the caller\'s own DB access context', async () => {
+        vi.mocked(db.select).mockReturnValue(mockSelectLimitChain([onlineDevice]) as any);
+        executeScriptOnDevicesMock.mockResolvedValueOnce(admittedScriptResult());
+
+        await app.request(`/mobile/devices/${mobileDeviceId}/actions`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'run_script', scriptId: mobileScriptId })
+        });
+
+        const input = executeScriptOnDevicesMock.mock.calls[0]![0];
+        expect(typeof input.runInDbContext).toBe('function');
+        withAuthDbAccessContextMock.mockClear();
+        const inner = vi.fn(async () => 'ran');
+        await expect(input.runInDbContext(inner)).resolves.toBe('ran');
+        expect(withAuthDbAccessContextMock).toHaveBeenCalledWith(input.auth, inner);
+      });
+
+      it('reads the device inside a context, and not while the service runs', async () => {
+        let lookupDepth = -1;
+        vi.mocked(db.select).mockImplementation((() => {
+          lookupDepth = dbContextState.depth;
+          return mockSelectLimitChain([onlineDevice]);
+        }) as any);
+        let serviceDepth = -1;
+        executeScriptOnDevicesMock.mockImplementationOnce(async () => {
+          serviceDepth = dbContextState.depth;
+          return admittedScriptResult();
+        });
+
+        const res = await app.request(`/mobile/devices/${mobileDeviceId}/actions`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'run_script', scriptId: mobileScriptId })
+        });
+
+        expect(res.status).toBe(201);
+        expect(lookupDepth).toBe(1);
+        // #6671 — the service opens its own contexts; the route must not hold
+        // one across it.
+        expect(serviceDepth).toBe(0);
+      });
+
+      it('keeps a non-script action in one context: lookup, trust check and insert', async () => {
+        const depths: Record<string, number> = {};
+        vi.mocked(db.select).mockImplementation((() => {
+          depths.select = dbContextState.depth;
+          return mockSelectLimitChain([onlineDevice]);
+        }) as any);
+        assertDeviceExecuteAllowedMock.mockImplementationOnce(async () => {
+          depths.trust = dbContextState.depth;
+        });
+        vi.mocked(db.insert).mockImplementation((() => {
+          depths.insert = dbContextState.depth;
+          return mockInsertReturning([{ id: 'cmd-1' }]);
+        }) as any);
+
+        const res = await app.request(`/mobile/devices/${mobileDeviceId}/actions`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'reboot' })
+        });
+
+        expect(res.status).toBe(201);
+        expect(depths).toEqual({ select: 1, trust: 1, insert: 1 });
+        expect(withAuthDbAccessContextMock).toHaveBeenCalledTimes(1);
+        expect(executeScriptOnDevicesMock).not.toHaveBeenCalled();
+      });
+
+      it('keeps wake preparation in one context and delivers after it commits', async () => {
+        const depths: Record<string, number> = {};
+        vi.mocked(db.select).mockImplementation((() => {
+          depths.select = dbContextState.depth;
+          return mockSelectLimitChain([onlineDevice]);
+        }) as any);
+        dispatchWakeMock.mockImplementationOnce(async () => {
+          depths.wake = dbContextState.depth;
+          const prepared = {
+            ok: true,
+            commandId: 'cmd-wake',
+            wakeAttemptId: 'attempt-1',
+            relayDeviceId: 'relay-1',
+            relayHostname: 'relay-host',
+            network: '10.0.0.0/24',
+            broadcast: '10.0.0.255',
+            macs: ['aa:bb:cc:dd:ee:ff'],
+          };
+          return {
+            ...prepared,
+            deliver: async () => {
+              depths.deliver = dbContextState.depth;
+              return prepared;
+            },
+          };
+        });
+
+        const res = await app.request(`/mobile/devices/${mobileDeviceId}/actions`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'wake' })
+        });
+
+        expect(res.status).toBe(202);
+        expect(await res.json()).toMatchObject({ action: 'wake', commandId: 'cmd-wake', wakeAttemptId: 'attempt-1' });
+        expect(depths).toEqual({ select: 1, wake: 1, deliver: 0 });
+        expect(withAuthDbAccessContextMock).toHaveBeenCalledTimes(1);
+        expect(executeScriptOnDevicesMock).not.toHaveBeenCalled();
+      });
+
+      it('returns 412 when wake delivery fails after the commit', async () => {
+        vi.mocked(db.select).mockReturnValue(mockSelectLimitChain([onlineDevice]) as any);
+        dispatchWakeMock.mockResolvedValueOnce({
+          ok: true,
+          commandId: 'cmd-wake',
+          deliver: async () => ({ ok: false, code: 'WS_SEND_FAILED', message: 'Relay agent went offline' }),
+        });
+
+        const res = await app.request(`/mobile/devices/${mobileDeviceId}/actions`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'wake' })
+        });
+
+        expect(res.status).toBe(412);
+        expect(await res.json()).toEqual({ error: 'Relay agent went offline', code: 'WS_SEND_FAILED' });
+      });
+
+      it('returns the device gate result from inside the context without running the action', async () => {
+        vi.mocked(db.select).mockReturnValue(mockSelectLimitChain([{ ...onlineDevice, status: 'decommissioned' }]) as any);
+
+        const res = await app.request(`/mobile/devices/${mobileDeviceId}/actions`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'wake' })
+        });
+
+        expect(res.status).toBe(400);
+        expect(await res.json()).toEqual({ error: 'Device is decommissioned' });
+        expect(dispatchWakeMock).not.toHaveBeenCalled();
+      });
     });
 
     it('returns a trust probation denial without inserting a device command', async () => {
@@ -2674,25 +2942,24 @@ describe('mobile routes', () => {
         expect(inArray).toHaveBeenCalledWith(alerts.deviceId, ['dev-1']);
       });
 
-      it('returns zero alerts (but real device counts) when resolveSiteAllowedDeviceIds returns empty', async () => {
+      it('still counts alerts OWNED by an allowed site when that site has no devices (M3-D6)', async () => {
         authState.permissions = { allowedSiteIds: ['site-1'] };
 
         const selectMock = vi.mocked(db.select);
-        // Device stats: some devices returned
         selectMock
           .mockReturnValueOnce(mockAggregateChain({ total: 2, online: 1, offline: 1, maintenance: 0 }) as any)
           // resolveSiteAllowedDeviceIds: no devices in the allowed site
-          .mockReturnValueOnce(mockDeviceSiteChain([]) as any);
+          .mockReturnValueOnce(mockDeviceSiteChain([]) as any)
+          .mockReturnValueOnce(mockAggregateChain({ total: 1, active: 1, acknowledged: 0, resolved: 0, critical: 1 }) as any);
 
         const res = await app.request('/mobile/summary', { method: 'GET' });
         expect(res.status).toBe(200);
         const body = await res.json();
-        // Device stats already computed before the site-device resolution
         expect(body.devices.total).toBe(2);
-        // Alert stats zeroed because no in-scope device IDs
-        expect(body.alerts.total).toBe(0);
-        // Only two db.select calls: no alert-agg issued (short-circuited)
-        expect(selectMock).toHaveBeenCalledTimes(2);
+        // A topology policy alert owned by site-1 counts, though site-1 has no devices.
+        expect(body.alerts.total).toBe(1);
+        expect(selectMock).toHaveBeenCalledTimes(3);
+        expect(inArray).toHaveBeenCalledWith(alerts.topologySiteId, ['site-1']);
       });
     });
 
@@ -2806,7 +3073,8 @@ describe('mobile routes', () => {
         triggeredAt: new Date('2026-05-02T09:00:00Z'),
         deviceId: 'dev-1',
         deviceHostname: 'macbook',
-        deviceDisplayName: 'Tech Mac'
+        deviceDisplayName: 'Tech Mac',
+        source: 'maintenance-reboot-sweep'
       };
       const sessionRow = {
         id: 'sess-1',
@@ -2837,6 +3105,12 @@ describe('mobile routes', () => {
       expect(body.results[0].kind).toBe('alert');
       expect(body.results[0].id).toBe('alert-1');
       expect(body.results[0].meta.severity).toBe('critical');
+      expect(body.results[0].meta.source).toBe('maintenance-reboot-sweep');
+      // The row above is a fixture, so also pin the projection that produces
+      // `source` from the alert's context JSON.
+      const alertSelection = vi.mocked(db.select).mock.calls[1]?.[0] as Record<string, SQL> | undefined;
+      expect(alertSelection?.source).toBeDefined();
+      expect(new PgDialect().sqlToQuery(alertSelection!.source!).sql).toBe(`"alerts"."context"->>'source'`);
     });
 
     it('narrows device and alert search results for a site-restricted caller', async () => {

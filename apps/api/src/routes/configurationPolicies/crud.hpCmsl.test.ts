@@ -26,6 +26,8 @@ vi.mock('../../services/configurationPolicy', async (importOriginal) => {
     ...original,
     createConfigPolicy: createConfigPolicyMock,
     parentPolicyEnablesHpCmslCollection: parentPolicyEnablesHpCmslCollectionMock,
+    // #11070's vendor updates door runs on the same create; crud.oemUpdates.test.ts covers it.
+    parentPolicyArmsOemUpdates: vi.fn(async () => false),
   };
 });
 vi.mock('../../db', () => ({
@@ -40,7 +42,7 @@ vi.mock('../../middleware/auth', () => ({
   authMiddleware: vi.fn((c: any, next: any) => next()),
   requireScope: vi.fn(() => (c: any, next: any) => next()),
   requirePermission: vi.fn(() => (c: any, next: any) => next()),
-  // Route-level MFA (SEC-107) stand-in; crud.test.ts exercises the real one.
+  // Route-level MFA stand-in; crud.test.ts exercises the real one.
   requireMfa: vi.fn(() => async (c: any, next: any) => {
     if (!mfaState.satisfied) return c.json({ error: 'MFA required', code: 'MFA_REQUIRED' }, 403);
     await next();

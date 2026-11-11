@@ -24,7 +24,7 @@
  * `breeze_app` pool that `processInboundEmail` runs against.
  */
 import '../../__tests__/integration/setup';
-import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { and, eq, sql } from 'drizzle-orm';
 import { withSystemDbAccessContext } from '../../db';
 import {
@@ -40,10 +40,28 @@ import {
 } from '../../db/schema';
 import { createOrganization, createPartner, createUser } from '../../__tests__/integration/db-utils';
 import { getTestDb } from '../../__tests__/integration/setup';
-import { processInboundEmail } from './inboundEmailService';
+import { processInboundEmail, InboundEmailProcessingRecorded } from './inboundEmailService';
 import { moveTicketOrg } from '../ticketService';
-import { fourDigitSuffix } from './fixtureNumbering';
+import { uniqueInternalNumber } from './fixtureNumbering';
 import type { NormalizedInboundEmail } from './types';
+
+// Lets one test make message-link bookkeeping fail with an ORDINARY JavaScript
+// error after the ticket row was written (not a database error, so the
+// transaction is not poisoned). Every other call passes through to the real code.
+const linkFailure = vi.hoisted(() => ({ armed: false }));
+vi.mock('../ticketEmailLinks', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../ticketEmailLinks')>();
+  return {
+    ...actual,
+    claimMessageLink: async (...args: Parameters<typeof actual.claimMessageLink>) => {
+      if (linkFailure.armed) {
+        linkFailure.armed = false;
+        throw new Error('link bookkeeping failed');
+      }
+      return actual.claimMessageLink(...args);
+    },
+  };
+});
 
 const uniqueSuffix = () => `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
@@ -129,10 +147,10 @@ beforeEach(async () => {
   // Partner B's victim ticket. Known thread key + internal number so a forged
   // reference addressed to partner A could only match it if the guards failed.
   const bThreadKey = `<thread-b-${suffix}@b.test>`;
-  // Derived via fourDigitSuffix (never Number()) — see #4495: Number() on an
-  // arbitrary base36 slice can parse as scientific notation (e.g. "4e19") and
-  // overflow tickets.internal_number varchar(20).
-  const bInternalNumber = `T-2026-${fourDigitSuffix(suffix)}`;
+  // uniqueInternalNumber (#7868): collision-free per process and varchar(20)-safe
+  // (#4495 — never Number() an arbitrary base36 slice). 4-digit derivations
+  // collided at random with other fixture numbers under the same partner.
+  const bInternalNumber = uniqueInternalNumber();
   // Fixture-level guard against a regression of #4495: tickets.internal_number
   // is varchar(20) — assert here, not just rely on the formula, so a future
   // edit to this fixture fails fast instead of flaking on an insert.
@@ -153,7 +171,7 @@ beforeEach(async () => {
 
   // A resolved partner-A ticket for the reopen case (distinct thread key).
   const aResolvedThreadKey = `<thread-a-${suffix}@a.test>`;
-  const aInternalNumber = `T-2026-${fourDigitSuffix(suffix, 1)}`;
+  const aInternalNumber = uniqueInternalNumber();
   expect(aInternalNumber.length).toBeLessThanOrEqual(20);
   const [aTicket] = await db
     .insert(tickets)
@@ -319,6 +337,36 @@ describe('processInboundEmail — cross-partner isolation (real driver, system c
     expect(created.submitterEmail).toBe(fx.janeEmail);
   });
 
+  it('CASE 2b: an ordinary JS error AFTER the ticket write rolls the ticket back and leaves only the failed row', async () => {
+    const providerMessageId = `<rollback-${uniqueSuffix()}@known.test>`;
+    const subject = `Rollback probe ${uniqueSuffix()}`;
+    const email = buildEmail({
+      to: `support@${fx.domainA}`,
+      from: fx.janeEmail,
+      fromName: 'Jane Known',
+      subject,
+      text: 'This ticket must not survive the failure.',
+      providerMessageId
+    });
+    // The Message-ID link is claimed only when the email carries one.
+    email.messageId = providerMessageId;
+
+    linkFailure.armed = true;
+    await expect(withSystemDbAccessContext(() => processInboundEmail(email)))
+      .rejects.toBeInstanceOf(InboundEmailProcessingRecorded);
+    expect(linkFailure.armed).toBe(false); // the failure really fired, after createTicket
+
+    // The half-done ticket was rolled back...
+    const leftover = await admin().select().from(tickets)
+      .where(and(eq(tickets.partnerId, fx.partnerA.id), eq(tickets.subject, subject)));
+    expect(leftover).toHaveLength(0);
+    // ...and the durable failed row is the only record, under the resolved partner.
+    const rows = await inboundRowsFor(fx.partnerA.id, providerMessageId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].parseStatus).toBe('failed');
+    expect(rows[0].ticketId).toBeNull();
+  });
+
   it('CASE 3: quarantine path — unmatched email from an unknown sender creates no ticket', async () => {
     const providerMessageId = `<quarantine-${uniqueSuffix()}@nowhere.test>`;
     const email = buildEmail({
@@ -435,7 +483,7 @@ describe('processInboundEmail — cross-partner isolation (real driver, system c
       eq(ticketOutbox.eventType, 'ticket.status_changed')
     ));
     expect(outboxRows).toHaveLength(1);
-    expect(outboxRows[0]!.payload).toEqual({ from: 'resolved', to: 'open' });
+    expect(outboxRows[0]!.payload).toEqual({ from: 'resolved', to: 'open', statusId: null });
 
     // A public inbound comment row AND the status-change feed row were
     // appended. The feed row's user_id is NULL: the synthetic system actor is
@@ -453,6 +501,23 @@ describe('processInboundEmail — cross-partner isolation (real driver, system c
     expect(inboundComment.isPublic).toBe(true);
     expect(inboundComment.commentType).toBe('comment');
 
+    // #8326: the reply itself writes a `ticket.commented` outbox row in the same
+    // ingest transaction as the reopen's `ticket.status_changed`, so webhooks
+    // and automations see the customer's reply. Same payload as every other
+    // comment writer; the origin is the stored row's (`user`, no principal).
+    const commentedRows = await admin().select().from(ticketOutbox).where(and(
+      eq(ticketOutbox.ticketId, fx.aResolvedTicketId),
+      eq(ticketOutbox.eventType, 'ticket.commented')
+    ));
+    expect(commentedRows).toHaveLength(1);
+    expect(commentedRows[0]!.orgId).toBe(fx.orgA.id);
+    expect(commentedRows[0]!.payload).toEqual({
+      commentId: inboundComment.id,
+      isPublic: true,
+      originPrincipalKind: 'user',
+      originPrincipalId: null,
+    });
+
     // Logged as `matched` under partner A.
     const aRows = await inboundRowsFor(fx.partnerA.id, providerMessageId);
     expect(aRows.length).toBe(1);
@@ -462,7 +527,7 @@ describe('processInboundEmail — cross-partner isolation (real driver, system c
 
   it('CASE 7: an enumerable subject token is bound to the exact requester, not another portal user in the same org', async () => {
     const suffix = uniqueSuffix();
-    const victimNumber = `T-2026-${fourDigitSuffix(suffix, 2)}`;
+    const victimNumber = uniqueInternalNumber();
     const [victim] = await admin()
       .insert(tickets)
       .values({
@@ -527,7 +592,7 @@ describe('processInboundEmail — cross-partner isolation (real driver, system c
 
   it('CASE 8: requester reassignment that wins the row lock invalidates the former requester before append', async () => {
     const suffix = uniqueSuffix();
-    const victimNumber = `T-2026-${fourDigitSuffix(suffix, 3)}`;
+    const victimNumber = uniqueInternalNumber();
     const [newRequester] = await admin()
       .insert(portalUsers)
       .values({
@@ -611,7 +676,7 @@ describe('processInboundEmail — cross-partner isolation (real driver, system c
       const targetOrg = await createOrganization({ partnerId: fx.partnerA.id });
       seeded.orgIds.push(targetOrg.id);
       const actor = await createUser({ partnerId: fx.partnerA.id });
-      const number = `T-2026-${fourDigitSuffix(suffix, status === 'closed' ? 5 : 4)}`;
+      const number = uniqueInternalNumber();
       const [ticket] = await admin().insert(tickets).values({
         orgId: fx.orgA.id,
         partnerId: fx.partnerA.id,
@@ -625,7 +690,7 @@ describe('processInboundEmail — cross-partner isolation (real driver, system c
         ...(status === 'resolved' ? { resolvedAt: new Date() } : { closedAt: new Date() }),
       }).returning({ id: tickets.id });
 
-      await withSystemDbAccessContext(() => moveTicketOrg(ticket.id, targetOrg.id, { userId: actor.id }));
+      await withSystemDbAccessContext(() => moveTicketOrg(ticket.id, targetOrg.id, { kind: 'user' as const, userId: actor.id }));
       const providerMessageId = `<move-wins-${status}-${suffix}@known.test>`;
       await withSystemDbAccessContext(() => processInboundEmail(buildEmail({
         to: `support@${fx.domainA}`,
@@ -648,7 +713,7 @@ describe('processInboundEmail — cross-partner isolation (real driver, system c
     const targetOrg = await createOrganization({ partnerId: fx.partnerA.id });
     seeded.orgIds.push(targetOrg.id);
     const actor = await createUser({ partnerId: fx.partnerA.id });
-    const number = `T-2026-${fourDigitSuffix(suffix, 6)}`;
+    const number = uniqueInternalNumber();
     const [ticket] = await admin().insert(tickets).values({
       orgId: fx.orgA.id,
       partnerId: fx.partnerA.id,
@@ -676,7 +741,7 @@ describe('processInboundEmail — cross-partner isolation (real driver, system c
       afterTicketMatchLock: async () => { locked(); await held; },
     }));
     await hasLock;
-    const move = withSystemDbAccessContext(() => moveTicketOrg(ticket.id, targetOrg.id, { userId: actor.id }));
+    const move = withSystemDbAccessContext(() => moveTicketOrg(ticket.id, targetOrg.id, { kind: 'user' as const, userId: actor.id }));
     try {
       await expect.poll(async () => {
         const rows = await admin().execute(sql`
@@ -704,7 +769,7 @@ describe('processInboundEmail — cross-partner isolation (real driver, system c
     const targetOrg = await createOrganization({ partnerId: fx.partnerA.id });
     seeded.orgIds.push(targetOrg.id);
     const actor = await createUser({ partnerId: fx.partnerA.id });
-    const number = `T-2026-${fourDigitSuffix(suffix, 7)}`;
+    const number = uniqueInternalNumber();
     const [ticket] = await admin().insert(tickets).values({
       orgId: fx.orgA.id,
       partnerId: fx.partnerA.id,
@@ -732,7 +797,7 @@ describe('processInboundEmail — cross-partner isolation (real driver, system c
       afterTicketMatchLock: async () => { locked(); await held; },
     }));
     await hasLock;
-    const move = withSystemDbAccessContext(() => moveTicketOrg(ticket.id, targetOrg.id, { userId: actor.id }));
+    const move = withSystemDbAccessContext(() => moveTicketOrg(ticket.id, targetOrg.id, { kind: 'user' as const, userId: actor.id }));
     try {
       await expect.poll(async () => {
         const rows = await admin().execute(sql`

@@ -39,6 +39,8 @@ import type {
   SweepProposalReason,
 } from '@breeze/shared';
 import { TicketProposalCard } from './TicketProposalCard';
+import { useStableT } from '@/lib/i18n/useStableT';
+import { readWispProvenance, wispGrantorLabel } from '../wisp/wispProvenance';
 
 interface RunDetailPageProps {
   runId: string;
@@ -47,7 +49,7 @@ interface RunDetailPageProps {
 /** Every status NOT in this set is "live" — mirrors RunsListPage's
  * TERMINAL_RUN_STATUSES so both surfaces agree on when a run stops updating. */
 const TERMINAL_RUN_STATUSES = new Set<AiAgentRunStatus>([
-  'completed', 'failed', 'cancelled', 'expired', 'skipped',
+  'completed', 'failed', 'cancelled', 'expired', 'skipped', 'blocked',
 ]);
 function isLiveRunStatus(status: AiAgentRunStatus): boolean {
   return !TERMINAL_RUN_STATUSES.has(status);
@@ -119,6 +121,8 @@ function statusLabel(t: (key: string) => string, value: string): string {
       return t('aiAgentsPage.runs.statuses.expired');
     case 'skipped':
       return t('aiAgentsPage.runs.statuses.skipped');
+    case 'blocked':
+      return t('aiAgentsPage.runs.statuses.blocked');
     default:
       return value;
   }
@@ -157,6 +161,8 @@ function ledgerStatusLabel(t: (key: string) => string, value: AiAgentRunLedgerEn
       return t('aiAgentsRuns.detail.ledger.statuses.failed');
     case 'rejected':
       return t('aiAgentsRuns.detail.ledger.statuses.rejected');
+    case 'refused':
+      return t('aiAgentsRuns.detail.ledger.statuses.stopped');
     default:
       return value;
   }
@@ -516,7 +522,7 @@ function TraceEntryRow({
           {entry.intentError && <span className="text-destructive">{entry.intentError}</span>}
           {entry.intentId && (
             <a
-              href="/approvals"
+              href={`/approvals#intent-${entry.intentId}`}
               data-testid={`run-detail-intent-link-${entry.intentId}`}
               className="text-primary hover:underline"
             >
@@ -1135,7 +1141,11 @@ function SweepProposalContent({
       : undefined;
     return (
       <>
-        <a href="/approvals" data-testid={ids.proposalLink(index)} className="text-primary hover:underline">
+        <a
+          href={proposal.intentId ? `/approvals#intent-${proposal.intentId}` : '/approvals'}
+          data-testid={ids.proposalLink(index)}
+          className="text-primary hover:underline"
+        >
           {t('aiAgentsPage.runs.sweep.proposalCreated')}
         </a>
         {stoppedByKey && (
@@ -1452,6 +1462,7 @@ function ExposureBudgetCard({ orgId, kind, t }: { orgId: string; kind: string; t
  */
 export default function RunDetailPage({ runId }: RunDetailPageProps) {
   const { t } = useTranslation('settings');
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   const [run, setRun] = useState<AiAgentRunDetailDto | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
@@ -1491,23 +1502,23 @@ export default function RunDetailPage({ runId }: RunDetailPageProps) {
         return;
       }
       if (!response.ok) {
-        setError(t('aiAgentsPage.runs.detail.errors.load'));
+        setError(stableT('aiAgentsPage.runs.detail.errors.load'));
         return;
       }
       const body = (await response.json()) as { data?: AiAgentRunDetailDto };
       if (!mountedRef.current || requestId !== requestIdRef.current) return;
       if (!body.data) {
-        setError(t('aiAgentsPage.runs.detail.errors.load'));
+        setError(stableT('aiAgentsPage.runs.detail.errors.load'));
         return;
       }
       setRun(body.data);
     } catch {
       if (!mountedRef.current || requestId !== requestIdRef.current) return;
-      setError(t('aiAgentsPage.runs.detail.errors.load'));
+      setError(stableT('aiAgentsPage.runs.detail.errors.load'));
     } finally {
       if (mountedRef.current && requestId === requestIdRef.current) setLoading(false);
     }
-  }, [runId, t]);
+  }, [runId, stableT]);
 
   useEffect(() => {
     void load();
@@ -1734,6 +1745,10 @@ export default function RunDetailPage({ runId }: RunDetailPageProps) {
   const runTouchedDevices = run.deviceId !== null
     || (run.sweep?.findings.some((finding) => finding.deviceId !== null) ?? false);
 
+  // Wisp W07 (#9920, spec §13) — a run admitted under a Wisp grant names the
+  // person whose authority it ran under. Null for every other run.
+  const wispProvenance = readWispProvenance(run);
+
   return (
     <div className="space-y-6" data-testid="run-detail-page">
       <a href="/ai-agents/runs" className="inline-flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground">
@@ -1849,6 +1864,14 @@ export default function RunDetailPage({ runId }: RunDetailPageProps) {
               <dt className="text-xs text-muted-foreground">{t('aiAgentsPage.runs.detail.labels.trigger')}</dt>
               <dd>{triggerLabel(t, run.triggerKind)}</dd>
             </div>
+            {wispProvenance && (
+              <div>
+                <dt className="text-xs text-muted-foreground">{t('aiAgentsPage.runs.detail.labels.requestedBy')}</dt>
+                <dd data-testid="run-detail-wisp">
+                  {t('aiAgentsPage.runs.detail.labels.wispFor', { name: wispGrantorLabel(wispProvenance) })}
+                </dd>
+              </div>
+            )}
             <div>
               <dt className="text-xs text-muted-foreground">{t('aiAgentsPage.runs.detail.labels.cost')}</dt>
               <dd>{formatCurrency(run.costCents / 100)}</dd>
@@ -2338,7 +2361,7 @@ export default function RunDetailPage({ runId }: RunDetailPageProps) {
               <li key={intent.id} className="flex flex-wrap items-center gap-2">
                 <span className="font-medium">{intent.actionName}</span>
                 <span className="text-xs text-muted-foreground">{intentStatusLabel(t, intent.status)}</span>
-                <a href="/approvals" className="text-primary hover:underline">
+                <a href={`/approvals#intent-${intent.id}`} className="text-primary hover:underline">
                   {t('aiAgentsPage.runs.detail.intents.viewAll')}
                 </a>
               </li>

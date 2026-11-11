@@ -31,6 +31,8 @@
     "confidenceValue": "{{confidence}}% di affidabilità"
   },
   "alertDetailPage": {
+    "externalTickets": "Ticket esterni",
+    "externalTicketsFailedToLoad": "Impossibile caricare i ticket esterni.",
     "loadingAlert": "Caricamento avviso...",
     "backToAlerts": "Torna agli avvisi",
     "goBack": "Indietro",
@@ -66,8 +68,8 @@
     "alertAcknowledged": "Avviso confermato",
     "failedToResolveAlert": "Impossibile risolvere l'avviso",
     "alertResolved": "Avviso risolto",
-    "alertsBreadcrumb": "Breadcrumb avvisi",
-    "alertFallback": "Avviso di fallback",
+    "alertsBreadcrumb": "Avvisi",
+    "alertFallback": "Avviso",
     "unknownMetric": "Metrica sconosciuta",
     "severity": {
       "critical": "Critica",
@@ -82,6 +84,21 @@
       "resolved": "Risolto",
       "suppressed": "Soppresso",
       "dismissed": "Ignorato"
+    },
+    "createPsaTicket": "Crea ticket PSA",
+    "psaTicketRequested": "Ticket PSA richiesto",
+    "failedToCreatePsaTicket": "Impossibile richiedere il ticket PSA",
+    "lifecycleLine": {
+      "text": "{{rearm}} · raffreddamento {{minutes}} min ({{source}})",
+      "rearmNewEvidence": "Si riattiva con nuove evidenze",
+      "rearmAfterDelay": "Si riattiva dopo {{minutes}} min",
+      "sources": {
+        "monitor": "questo monitor",
+        "org": "predefinito dell'organizzazione",
+        "partner": "predefinito del partner",
+        "builtin": "predefinito integrato",
+        "legacy": "regola di avviso"
+      }
     }
   },
   "alertDetails": {
@@ -112,6 +129,7 @@
     "close": "Chiudi",
     "createALinkedTicketPreFilledFrom": "Crea un ticket collegato precompilato da questo avviso",
     "createTicket": "Crea ticket",
+    "viewTicket": "Visualizza ticket {{ticket}}",
     "silenceThisAlertStopsNotificationsWithoutResolving": "Metti in silenzio questo avviso - interrompe le notifiche senza risolverlo",
     "suppress": "Sopprimi",
     "dismissPermanentlyHidesThisAlertForGood": "Ignora definitivamente - nasconde questo avviso in modo permanente (la scadenza della garanzia non genererà un nuovo avviso per la stessa data di fine; altre condizioni possono comunque aprire un nuovo avviso se si ripresentano)",
@@ -124,7 +142,7 @@
     "unknownMetric": "Metrica sconosciuta",
     "statusChange": "{{from}} → {{to}}",
     "resolveAlert": "Risolvi avviso",
-    "ticketCreationFailedRetry": "Creazione ticket non riuscita. Riprova",
+    "ticketCreationFailedRetry": "Impossibile creare il ticket. Riprova",
     "ticketCreated": "Ticket {{ticket}} creato",
     "severity": {
       "critical": "Critica",
@@ -221,7 +239,11 @@
       "resolved": "Risolto",
       "suppressed": "Soppresso",
       "dismissed": "Ignorato"
-    }
+    },
+    "filterStatusLabel": "Filtro stato",
+    "filterSeverityLabel": "Filtro gravità",
+    "filterDeviceLabel": "Filtro dispositivo",
+    "filterDateRangeLabel": "Filtro intervallo di date"
   },
   "alertRuleEditPage": {
     "loadingAlertRule": "Caricamento regola avviso...",
@@ -430,98 +452,6 @@
     "evaluatedAgainst": "Valutato rispetto a {{hostname}}",
     "fireSuppressionNote": "Una finestra di manutenzione attiva, il cooldown, un avviso già aperto o la soppressione per flapping potrebbero comunque impedire che venga creato un avviso quando la regola viene eseguita."
   },
-  "alertTemplateEditor": {
-    "loadingAlertTemplate": "Caricamento modello avviso...",
-    "tryAgain": "Riprova",
-    "templateMetadata": "Metadati modello",
-    "name": "Nome",
-    "availableTo": "Disponibile per",
-    "allMyOrganizations": "Tutte le mie organizzazioni",
-    "partnerWide": "(a livello di partner)",
-    "aSpecificOrganization": "Un'organizzazione specifica",
-    "organization": "Organizzazione",
-    "selectAnOrganization": "Seleziona un'organizzazione",
-    "severity": "Gravità",
-    "category": "Categoria",
-    "description": "Descrizione",
-    "conditionBuilder": "Generatore condizioni",
-    "combineMetricThresholdsWithEventPatternsTo": "Combina soglie delle metriche e pattern di eventi per attivare avvisi.",
-    "addMetric": "Aggiungi metrica",
-    "addEvent": "Aggiungi evento",
-    "trigger": "Trigger",
-    "remove": "Rimuovi",
-    "type": "Tipo",
-    "metricThreshold": "Soglia metrica",
-    "eventPattern": "Pattern evento",
-    "metric": "Metrica",
-    "operator": "Operatore",
-    "thresholdValue": "Valore soglia",
-    "durationMin": "Durata (min)",
-    "frequencyCount": "Conteggio frequenza",
-    "eventSource": "Origine evento",
-    "pattern": "Pattern",
-    "thresholdConfiguration": "Configurazione soglia",
-    "defaultsUsedWhenAddingNewMetricTriggers": "Valori predefiniti usati quando si aggiungono nuovi trigger metrici. Modificali per ogni trigger secondo necessità.",
-    "defaultValue": "Valore predefinito",
-    "defaultDurationMin": "Durata predefinita (min)",
-    "defaultFrequencyCount": "Conteggio frequenza predefinito",
-    "escalationRules": "Regole di escalation",
-    "routeAlertsBasedOnTimeAndSeverity": "Instrada gli avvisi in base a orario e gravità.",
-    "addEscalation": "Aggiungi escalation",
-    "step": "Passaggio",
-    "afterMin": "Dopo (min)",
-    "route": "Instradamento",
-    "suppressionRules": "Regole di soppressione",
-    "avoidNoiseDuringMaintenanceAndDuplicates": "Evita rumore durante la manutenzione e avvisi duplicati.",
-    "addWindow": "Aggiungi finestra",
-    "suppressDuplicateAlerts": "Sopprimi avvisi duplicati",
-    "cooldownMinutes": "Minuti di cooldown",
-    "noMaintenanceWindowsConfiguredAddOneTo": "Nessuna finestra di manutenzione configurata. Aggiungine una per silenziare gli avvisi durante interventi pianificati.",
-    "timezone": "Fuso orario",
-    "starts": "Inizio",
-    "ends": "Fine",
-    "notificationRouting": "Instradamento notifiche",
-    "autoRemediation": "Correzione automatica",
-    "linkAnAutomationPlaybookToRunWhen": "Collega un playbook di automazione da eseguire quando questo avviso si attiva.",
-    "enableAutoRemediation": "Abilita correzione automatica",
-    "automation": "Automazione",
-    "selectAutomation": "Seleziona automazione",
-    "noAutomationsAvailableCreateOneInAutomations": "Nessuna automazione disponibile. Creane una in Automazioni per abilitare la correzione.",
-    "targetScope": "Ambito target",
-    "applyThisTemplateToOrganizationsSitesOr": "Applica questo modello a organizzazioni, siti o gruppi.",
-    "scopeType": "Tipo ambito",
-    "organizations": "Organizzazioni",
-    "sites": "Siti",
-    "groups": "Gruppi",
-    "no": "Nessuna",
-    "optionsAvailableThisTemplateWillApplyBroadly": "opzione disponibile. Questo modello verrà applicato in modo ampio."
-  },
-  "alertTemplateList": {
-    "tryAgain": "Riprova",
-    "alertTemplates": "Modelli avviso",
-    "of": "di",
-    "templates": "modelli",
-    "addTemplate": "Aggiungi modello",
-    "allSeverity": "Tutte le gravità",
-    "critical": "Critica",
-    "high": "Alta",
-    "medium": "Media",
-    "low": "Bassa",
-    "info": "Info",
-    "allScopes": "Tutti gli ambiti",
-    "partnerWide": "A livello di partner",
-    "organization": "Organizzazione",
-    "builtIn": "Integrato",
-    "name": "Nome",
-    "scope": "Ambito",
-    "severity": "Gravità",
-    "category": "Categoria",
-    "actions": "Azioni",
-    "noTemplatesMatchYourFilters": "Nessun modello corrisponde ai filtri.",
-    "deleteConfirm": "Eliminare il modello \"{{name}}\"? Questa azione non può essere annullata.",
-    "deleteFailed": "Impossibile eliminare il modello.",
-    "deleted": "Modello eliminato"
-  },
   "alertVerdict": {
     "label": {
       "actionable": "Richiede azione",
@@ -545,8 +475,6 @@
     "loadingAlerts": "Caricamento avvisi...",
     "tryAgain": "Riprova",
     "alerts": "Avvisi",
-    "monitorAlertsAcrossYourDevicesRulesAre": "Monitora gli avvisi su tutti i dispositivi. Le regole sono gestite in",
-    "configurationPolicies": "Criteri di configurazione",
     "alert": "avviso",
     "dismissedAlertsAreHiddenForGoodWarranty": "Gli avvisi ignorati vengono nascosti definitivamente. La scadenza della garanzia non genererà un nuovo avviso per la stessa data di fine; altri avvisi possono comunque attivarsi di nuovo se la relativa condizione si ripresenta.",
     "cancel": "Annulla",
@@ -567,6 +495,7 @@
     "alertResolved": "Avviso risolto",
     "alertSuppressed": "\"{{title}}\" soppresso",
     "failedToSuppressAlert": "Impossibile sopprimere l'avviso",
+    "failedToRestoreAlert": "Impossibile ripristinare l'avviso. È ancora silenziato.",
     "failedBulkAction": "Impossibile {{action}} gli avvisi",
     "skippedCount": "{{count}} ignorati",
     "failedCount": "{{count}} non riusciti",
@@ -591,7 +520,8 @@
     },
     "bulkConfirmQuestion": "{{action}} {{count}} avviso?",
     "bulkConfirmQuestion_one": "{{action}} {{count}} avviso?",
-    "bulkConfirmQuestion_other": "{{action}} {{count}} avvisi?"
+    "bulkConfirmQuestion_other": "{{action}} {{count}} avvisi?",
+    "subtitle": "Monitora gli avvisi su tutti i dispositivi. Le soglie si definiscono in <monitors>Monitor</monitors>; distribuiscile ai clienti con <policies>Criteri di configurazione</policies>."
   },
   "alertsSummary": {
     "activeAlerts": "Avvisi attivi",
@@ -619,7 +549,6 @@
       "alerts": "Avvisi",
       "correlations": "Correlazioni",
       "monitors": "Monitor",
-      "rules": "Regole",
       "delivery": "Consegna"
     }
   },
@@ -632,7 +561,8 @@
     "sections": {
       "channels": "Canali",
       "routing": "Instradamento",
-      "escalation": "Criteri di escalation"
+      "escalation": "Criteri di escalation",
+      "inheritedChannels": "Condivisi dal tuo partner"
     },
     "routing": {
       "everythingElse": "Tutto il resto",
@@ -739,6 +669,7 @@
       "info": "Info"
     },
     "status": {
+      "open": "Aperto",
       "active": "Attivo",
       "acknowledged": "Confermato",
       "resolved": "Risolto",
@@ -961,7 +892,8 @@
       "webhook": "Webhook",
       "sms": "SMS",
       "pushover": "Pushover"
-    }
+    },
+    "typeLabel": "Tipo"
   },
   "notificationChannelsPage": {
     "loadingNotificationChannels": "Caricamento canali di notifica...",
@@ -1051,5 +983,10 @@
       "body": "I modelli esistenti restano modificabili qui e verranno convertiti nella prossima versione.",
       "link": "Apri Monitor"
     }
+  },
+  "subject": {
+    "label": "Elemento interessato",
+    "backupWorkload": "Carico di backup",
+    "topologySite": "Sito topologico"
   }
 }

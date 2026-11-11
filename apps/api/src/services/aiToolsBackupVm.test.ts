@@ -1,5 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { z } from 'zod';
 
+const actorGate = vi.hoisted(() => ({ refusal: vi.fn(async (): Promise<unknown> => null) }));
+vi.mock('./backupRestoreActorGate', () => ({
+  restoreIntegrityRefusalForActor: (...args: unknown[]) => actorGate.refusal(...(args as [])),
+}));
 vi.mock('../db', () => ({
   runOutsideDbContext: vi.fn((fn) => fn()),
   withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn()),
@@ -16,9 +21,16 @@ vi.mock('./commandQueue', () => ({
   CommandTypes: {
     VM_RESTORE_FROM_BACKUP: 'vm_restore_from_backup',
     VM_INSTANT_BOOT: 'vm_instant_boot',
+    BARE_METAL_REBUILD: 'bare_metal_rebuild',
   },
 }));
 
+// The org/cross-site restore authorization is covered by
+// aiToolsRestoreAuthorization.test.ts and aiToolsRestoreScope.integration.test.ts;
+// here it is stubbed so the select sequences below stay the handler's own.
+vi.mock('./aiToolsRestoreAuthorization', () => ({
+  authorizeAiRestore: vi.fn(async () => ({ ok: true })),
+}));
 vi.mock('./aiDispatch', () => ({
   aiQueueCommandForExecution: vi.fn(),
 }));
@@ -31,6 +43,7 @@ import { db } from '../db';
 import type { AuthContext } from '../middleware/auth';
 import type { AiTool } from './aiTools';
 import { validateToolInput } from './aiToolSchemas';
+import { TOOL_SDK_INPUT_SHAPES } from './aiToolSchemasBackup';
 import { aiQueueCommandForExecution } from './aiDispatch';
 import { registerBackupVmTools } from './aiToolsBackupVm';
 import { startRebuildEngineVmRestore } from './vmRestoreRebuildEngine';
@@ -263,6 +276,43 @@ describe('restore_as_vm — rebuild engine (W05a)', () => {
     expect(toolMap.get('restore_as_vm')!.deviceArgs).toEqual(expect.arrayContaining(['targetDeviceId', 'rebuildHostDeviceId']));
   });
 
+  // W03-D4 (#6757): the Agent SDK's `tool()` takes a ZodRawShape and strips
+  // keys absent from it, so the chat/agent surface needs a flat envelope of
+  // both engine arms. It must carry exactly the registry's keys; the full pipe
+  // (validateToolInput) still enforces each arm.
+  it('exposes an SDK envelope whose keys are exactly the registry properties (W03-D4)', () => {
+    const registryKeys = Object.keys(
+      (toolMap.get('restore_as_vm')!.definition.input_schema as { properties: Record<string, unknown> }).properties,
+    ).sort();
+    expect(Object.keys(TOOL_SDK_INPUT_SHAPES.restore_as_vm!).sort()).toEqual(registryKeys);
+  });
+
+  // PR review (#10117): keys alone do not prove the SDK keeps valid input —
+  // parse each arm through the envelope exactly as the SDK's z.object does.
+  it('the SDK envelope keeps every valid input of both arms intact, and the pipe still owns the rules (W03-D4)', () => {
+    const envelope = z.object(TOOL_SDK_INPUT_SHAPES.restore_as_vm!);
+    const hyperv = {
+      snapshotId: SNAPSHOT_ID, targetDeviceId: DEVICE_ID, hypervisor: 'hyperv', vmName: 'VM', switchName: 'LAN',
+      vmSpecs: { memoryMb: 2048, cpuCount: 2, diskSizeGb: 40 },
+    };
+    for (const input of [hyperv, { ...hyperv, engine: 'hyperv' }, rebuildInput]) {
+      const parsed = envelope.safeParse(input);
+      expect(parsed.success).toBe(true);
+      expect(parsed.data).toEqual(input);
+    }
+    // The envelope is permissive by design (all optional); validateToolInput
+    // still rejects what an arm forbids.
+    expect(envelope.safeParse({ snapshotId: SNAPSHOT_ID }).success).toBe(true);
+    expect(validateToolInput('restore_as_vm', { snapshotId: SNAPSHOT_ID }).success).toBe(false);
+    expect(validateToolInput('restore_as_vm', { ...rebuildInput, switchName: 'x' }).success).toBe(false);
+  });
+
+  it('accepts the registry-advertised switchName and refuses a hypervisor the handler refuses (W03-D4 drift)', () => {
+    const hyperv = { snapshotId: SNAPSHOT_ID, targetDeviceId: DEVICE_ID, hypervisor: 'hyperv', vmName: 'VM' };
+    expect(validateToolInput('restore_as_vm', { ...hyperv, switchName: 'LAN' })).toEqual({ success: true });
+    expect(validateToolInput('restore_as_vm', { ...hyperv, hypervisor: 'vmware' }).success).toBe(false);
+  });
+
   it('validates the rebuild variant and rejects an identity override', () => {
     expect(validateToolInput('restore_as_vm', rebuildInput)).toEqual({ success: true });
     expect(validateToolInput('restore_as_vm', { ...rebuildInput, identity: 'original' }).success).toBe(false);
@@ -306,6 +356,27 @@ describe('restore_as_vm — rebuild engine (W05a)', () => {
     expect(db.insert).not.toHaveBeenCalled();
   });
 
+  it('hands the rebuild service an integrity decision that refuses an unattested snapshot for an AI agent', async () => {
+    prepareHandlerMocks('restore_as_vm');
+    vi.mocked(startRebuildEngineVmRestore).mockImplementation(async (input: any) => {
+      const decision = await input.integrity({ id: SNAPSHOT_ID, deviceId: DEVICE_ID });
+      return decision.ok
+        ? { ok: true, jobId: RESTORE_JOB_ID, recoveryId: RECOVERY_ID, commandId: COMMAND_ID, status: 'queued' }
+        : { ok: false, status: decision.status, error: decision.body.code, body: decision.body };
+    });
+    actorGate.refusal.mockResolvedValueOnce({ code: 'snapshot_integrity_unavailable', message: 'no attestation' });
+
+    const result = JSON.parse(await toolMap.get('restore_as_vm')!.handler(rebuildInput as Record<string, unknown>, makeAuth()));
+
+    expect(result).toEqual({ error: 'no attestation', code: 'snapshot_integrity_unavailable' });
+    expect(actorGate.refusal).toHaveBeenCalledWith({
+      snapshotDbId: SNAPSHOT_ID,
+      targetDeviceId: DEVICE_ID,
+      commandType: 'bare_metal_rebuild',
+      actor: 'ai_agent',
+    });
+  });
+
   it('returns the service error verbatim when the snapshot is not rebuildable', async () => {
     prepareHandlerMocks('restore_as_vm');
     vi.mocked(startRebuildEngineVmRestore).mockResolvedValue({
@@ -316,6 +387,73 @@ describe('restore_as_vm — rebuild engine (W05a)', () => {
 
     const result = JSON.parse(await toolMap.get('restore_as_vm')!.handler(rebuildInput as Record<string, unknown>, makeAuth()));
     expect(result).toEqual({ error: 'snapshot_not_bare_metal_restorable' });
+  });
+
+  // W06d (Task 20): the rebuild engine runs on Linux AND Windows hosts
+  // (platform-matched server-side), and a Windows host can create the VM.
+  it('validates a Windows drive-letter output path and an optional hyperv block on the rebuild variant', () => {
+    const windowsInput = { ...rebuildInput, outputPath: 'C:\\ProgramData\\Breeze\\rebuild\\out\\dev-1.vhdx' };
+    expect(validateToolInput('restore_as_vm', windowsInput)).toEqual({ success: true });
+    expect(validateToolInput('restore_as_vm', { ...windowsInput, hyperv: { vmName: 'w06-proof', switchName: 'lab-switch', memoryMb: 4096, cpuCount: 2 } })).toEqual({ success: true });
+    expect(validateToolInput('restore_as_vm', { ...windowsInput, hyperv: { vmName: '' } }).success).toBe(false);
+    expect(validateToolInput('restore_as_vm', { ...windowsInput, hyperv: { vmName: 'x', diskSizeGb: 40 } }).success).toBe(false);
+    expect(validateToolInput('restore_as_vm', { ...rebuildInput, outputPath: '\\\\server\\share\\dev-1.vhdx' }).success).toBe(false);
+    expect(validateToolInput('restore_as_vm', { ...rebuildInput, outputPath: 'C:\\out\\..\\dev-1.vhdx' }).success).toBe(false);
+  });
+
+  it('describes the rebuild engine platform-neutrally and exposes the hyperv block', () => {
+    const definition = toolMap.get('restore_as_vm')!.definition;
+    expect(definition.description).not.toMatch(/Linux whole-machine snapshot/);
+    expect(definition.description).toMatch(/Windows/);
+    const properties = (definition.input_schema as any).properties;
+    expect(properties.hyperv).toMatchObject({ type: 'object' });
+    expect(Object.keys(properties.hyperv.properties)).toEqual(['vmName', 'switchName', 'memoryMb', 'cpuCount']);
+    expect(properties.rebuildHostDeviceId.description).not.toMatch(/^Linux/);
+  });
+
+  it('forwards the hyperv block to the rebuild service and says the VM will be created', async () => {
+    prepareHandlerMocks('restore_as_vm');
+    vi.mocked(startRebuildEngineVmRestore).mockResolvedValue({
+      ok: true, jobId: RESTORE_JOB_ID, recoveryId: RECOVERY_ID, commandId: COMMAND_ID, status: 'queued',
+    });
+    const hyperv = { vmName: 'w06-proof', switchName: 'lab-switch' };
+
+    const result = JSON.parse(await toolMap.get('restore_as_vm')!.handler(
+      { ...rebuildInput, outputPath: 'C:\\out\\dev-1.vhdx', hyperv } as Record<string, unknown>,
+      makeAuth(),
+    ));
+
+    expect(startRebuildEngineVmRestore).toHaveBeenCalledWith(expect.objectContaining({ outputPath: 'C:\\out\\dev-1.vhdx', hyperv }));
+    expect(result).toMatchObject({ success: true, engine: 'rebuild', hyperv });
+    expect(result.note).toMatch(/w06-proof/);
+    expect(result.note).not.toMatch(/arrives with the Windows engine/);
+  });
+
+  it('does not pass hyperv when the input carries none', async () => {
+    prepareHandlerMocks('restore_as_vm');
+    vi.mocked(startRebuildEngineVmRestore).mockResolvedValue({
+      ok: true, jobId: RESTORE_JOB_ID, recoveryId: RECOVERY_ID, commandId: COMMAND_ID, status: 'queued',
+    });
+
+    const result = JSON.parse(await toolMap.get('restore_as_vm')!.handler(rebuildInput as Record<string, unknown>, makeAuth()));
+
+    expect(vi.mocked(startRebuildEngineVmRestore).mock.calls[0]![0]).not.toHaveProperty('hyperv');
+    expect(result.note).toMatch(/manually/);
+    expect(result.note).not.toMatch(/arrives with the Windows engine/);
+  });
+
+  it('returns the service refusal message for a hyperv block on a non-Windows host', async () => {
+    prepareHandlerMocks('restore_as_vm');
+    vi.mocked(startRebuildEngineVmRestore).mockResolvedValue({
+      ok: false, status: 400, error: 'hyperv_requires_windows_host', message: 'hyperv is only valid for Windows rebuild hosts',
+    });
+
+    const result = JSON.parse(await toolMap.get('restore_as_vm')!.handler(
+      { ...rebuildInput, hyperv: { vmName: 'x' } } as Record<string, unknown>,
+      makeAuth(),
+    ));
+
+    expect(result).toEqual({ error: 'hyperv_requires_windows_host', message: 'hyperv is only valid for Windows rebuild hosts' });
   });
 
   it('denies a cross-site snapshot before touching the rebuild service', async () => {

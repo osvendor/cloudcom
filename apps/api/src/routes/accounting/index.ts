@@ -1,36 +1,34 @@
-import { Hono, type Env, type MiddlewareHandler } from 'hono';
+import { abandonAccountingFees } from '../../services/accounting/accountingFeeAbandonment';
+import { isAutopayEnabledForPartner } from '../../services/autopay/autopayGate';
+import { Hono, type Context, type Env, type MiddlewareHandler } from 'hono';
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie';
 import { zValidator } from '../../lib/validation';
 import { z } from 'zod';
-import { createHmac, randomBytes, timingSafeEqual } from 'crypto';
 import { and, asc, eq, inArray, isNotNull, sql } from 'drizzle-orm';
 import { alias } from 'drizzle-orm/pg-core';
 import { db, runOutsideDbContext, withSystemDbAccessContext } from '../../db';
-import { accountingConnections, accountingEntityMappings, invoicePayments, invoices } from '../../db/schema';
+import { accountingConnections, accountingEntityMappings, invoicePayments, invoiceStripePayments, invoices } from '../../db/schema';
 import {
   authMiddleware, requireMfa, requirePermission, requireScope, withAuthDbAccessContext, type AuthContext,
 } from '../../middleware/auth';
+import { markPermissionGate, permissionGateLabel } from '../../middleware/permissionGate';
 import { PERMISSIONS } from '../../services/permissions';
-import { QBO_CLIENT_ID, QBO_CLIENT_SECRET, QBO_ENVIRONMENT, QBO_REDIRECT_URI } from '../../config/env';
 import {
   AccountingConnectionError,
-  deleteConnection,
-  getConnection,
-  isHomeCurrencyCasAbort,
+  AccountingProviderConflictError,
+  deleteConnection, getConnection,
+  PENDING_TENANT_STATUS,
+  type AccountingConnection,
+  getPartnerConnectionRef,
   refreshRealmSettings,
-  updateHomeCurrency,
-  updateMultiCurrencyEnabled,
   upsertConnection,
-  resetConnectionForRealmChange,
+  resolveActiveConnectionRef,
 } from '../../services/accounting/accountingConnectionService';
-import type { AccountingConnection } from '../../services/accounting/accountingConnectionService';
 import {
-  importQuickbooksCustomers,
-  listQuickbooksCustomersAnnotated,
-  QbImportError,
-} from '../../services/accounting/quickbooksCustomerImport';
+  importAccountingCustomers,
+  listAccountingCustomersAnnotated,
+} from '../../services/accounting/accountingCustomerImport';
 import {
-  AccountingMappingError,
   listMappingProposals,
   listRemoteIncomeAccountsForPartner,
   resolveConnectionAndToken,
@@ -43,9 +41,22 @@ import { AccountingInvoicePushError, pushInvoiceToAccounting } from '../../servi
 import { enqueueAccountingInvoicePush, enqueueAccountingMappingSync } from '../../jobs/accountingSyncWorker';
 import { enqueueAccountingReconcile } from '../../jobs/accountingReconcileWorker';
 import { writeRouteAudit } from '../../services/auditEvents';
-import { getAccountingProvider } from '../../services/accounting/providerRegistry';
-import { captureException, captureMessage } from '../../services/sentry';
-import type { AccountingProviderId } from '../../services/accounting/types';
+import {
+  findAccountingProvider, getAccountingProvider, LEGACY_UNTARGETED_JOB_PROVIDER, providerSupports,
+} from '../../services/accounting/providerRegistry';
+import { captureException } from '../../services/sentry';
+import { ACCOUNTING_PROVIDER_IDS } from '../../services/accounting/types';
+import { discardPendingTenantSelection } from '../../services/accounting/accountingTenantSelection';
+import { auditOwedDeletesDiscarded } from './owedDeletesAudit';
+import { rateLimitRetryAfterMs } from '../../services/accounting/accountingProviderError';
+import { releaseProviderConnection } from '../../services/accounting/accountingProviderRelease';
+import type { DbContextRunner } from '../../services/accounting/dbContextGuard';
+import { listProvidersHandler, providerGateResponse } from './providerGate';
+import { handleImportError, handleMappingError, setRetryAfter } from './routeErrors';
+import { registerConnectionSetupRoutes } from './connectionSetupRoutes';
+import { connectRedirectPath, finalizeConnection, homeCurrencyField, readPriorRealm } from './connectFinalize';
+import { completeTenantSelectingCallback } from './tenantConnect';
+import { constantTimeEqual, createState, STATE_TTL_MS, stateCookieValue, verifyState } from './oauthState';
 import {
   canManagePartnerWidePolicies,
   PARTNER_WIDE_WRITE_DENIED_MESSAGE,
@@ -88,7 +99,7 @@ const requireSiteWrite = requirePermission(PERMISSIONS.SITES_WRITE.resource, PER
  * separate route-contract/availability residual rather than an authz bypass.
  */
 function partnerScopedPermission(...guards: MiddlewareHandler[]): MiddlewareHandler {
-  return async (c, next) => {
+  const composed: MiddlewareHandler = async (c, next) => {
     if (c.get('auth')?.scope === 'system') return next();
     // Run the guards in order, propagating whatever a denying guard returns
     // (its 403 Response) instead of falling through to the handler.
@@ -99,6 +110,10 @@ function partnerScopedPermission(...guards: MiddlewareHandler[]): MiddlewareHand
     };
     return run(0);
   };
+  // The composition enforces the wrapped permission grants, so it is itself a
+  // permission gate for the write-route contract test.
+  const labels = guards.map(permissionGateLabel).filter((label): label is string => label !== undefined);
+  return labels.length > 0 ? markPermissionGate(composed, labels.join('+')) : composed;
 }
 
 // NOTE: the accounting:read guard is folded INTO this composition rather than
@@ -114,7 +129,7 @@ const requireImportPermissions = partnerScopedPermission(
 );
 
 /**
- * Dedicated accounting capabilities (SEC-2026-09-05-057). Before these, every
+ * Dedicated accounting capabilities. Before these, every
  * interactive QuickBooks route gated on partner authority alone, so any
  * full-partner member — however low their role — could read the shared
  * provider realm and, with MFA, drive realm lifecycle and settings mutations.
@@ -143,14 +158,20 @@ const requireAccountingRead = partnerScopedPermission(
 const requireAccountingManage = partnerScopedPermission(
   requirePermission(PERMISSIONS.ACCOUNTING_MANAGE.resource, PERMISSIONS.ACCOUNTING_MANAGE.action),
 );
-const providerParamSchema = z.object({ provider: z.enum(['quickbooks']) });
+const providerParamSchema = z.object({ provider: z.enum(ACCOUNTING_PROVIDER_IDS) });
 const partnerQuerySchema = z.object({ partnerId: z.string().guid().optional() });
 const callbackQuerySchema = z.object({
-  code: z.string().min(1),
-  realmId: z.string().min(1),
-  state: z.string().min(1),
+  code: z.string().min(1).optional(),
+  // QuickBooks sends realmId; Xero does not (its tenant is chosen after the exchange).
+  realmId: z.string().min(1).optional(),
+  state: z.string().min(1).optional(),
+  // The provider's own OAuth error (e.g. access_denied when the user cancels consent).
+  // Truncated, never refused: any value redirects consent_denied and is never reflected.
+  error: z.string().transform((v) => v.slice(0, 100)).optional(),
 });
 const settingsSchema = z.object({
+  feeIncomeItemRef: z.string().trim().min(1).max(64).nullable().optional(),
+  feeIncomeAccountRef: z.string().trim().min(1).max(64).nullable().optional(),
   pushMode: z.enum(['auto', 'manual']).optional(),
   defaultIncomeAccountRef: z.string().max(64).nullable().optional(),
   defaultTaxCodeRef: z.string().max(64).nullable().optional(),
@@ -163,6 +184,11 @@ const settingsSchema = z.object({
   // connection. Same tier as pushMode/pullPayments: a plain connection setting,
   // not a captured external fact.
   pushPayments: z.boolean().optional(),
+  // Xero W02 — defaults the push applies when a line is tax-exempt / when a
+  // payment is recorded (a Xero TaxType and a bank AccountID). Plain connection
+  // settings, same tier as the income-account / tax-code refs above.
+  defaultExemptTaxCodeRef: z.string().max(64).nullable().optional(),
+  defaultPaymentAccountRef: z.string().max(64).nullable().optional(),
 }).refine((value) => Object.keys(value).length > 0, {
   message: 'At least one setting is required',
 });
@@ -192,7 +218,7 @@ const mappingSyncSchema = z.object({
 });
 
 // Phase C, Task 5 — invoice push routes.
-const invoicePushParamSchema = z.object({ provider: z.enum(['quickbooks']), invoiceId: z.string().guid() });
+const invoicePushParamSchema = z.object({ provider: z.enum(ACCOUNTING_PROVIDER_IDS), invoiceId: z.string().guid() });
 const invoicePushBulkSchema = z.object({
   invoiceIds: z.array(z.string().guid()).min(1).max(100),
 });
@@ -201,30 +227,19 @@ const remoteCandidatesQuerySchema = partnerQuerySchema.extend({
   q: z.string().max(255).optional(),
 });
 
-function handleImportError(c: { json: (b: unknown, s: number) => Response }, err: unknown): Response {
-  // QbImportError.status is a narrowed literal union (400|404|409|502), so no cast.
-  if (err instanceof QbImportError) return c.json({ error: err.message, code: err.code }, err.status);
-  throw err;
-}
-
-function handleMappingError(c: { json: (b: unknown, s: number) => Response }, err: unknown): Response {
-  // AccountingMappingError.status is a narrowed literal union (404|409|502), so
-  // no cast, and every current/future code (including item_price_required)
-  // flows through generically — the route never re-enumerates codes.
-  if (err instanceof AccountingMappingError) return c.json({ error: err.message, code: err.code }, err.status);
-  throw err;
-}
-
 /**
- * Deliberately a DIFFERENT body shape from `handleMappingError` above
+ * Deliberately a DIFFERENT body shape from `handleMappingError` (./routeErrors)
  * (`{ error: code, message }`, not `{ error: message, code }`) — the invoice
  * push coordinator's error taxonomy (Phase C, Task 3) is a separate typed
  * class from the mapping workbench's, and this shape is what Task 5's spec
  * calls for.
  */
-function handleInvoicePushError(c: { json: (b: unknown, s: number) => Response }, err: unknown): Response {
-  // AccountingInvoicePushError.status is a narrowed literal union (404|409|502), so no cast.
-  if (err instanceof AccountingInvoicePushError) return c.json({ error: err.code, message: err.message }, err.status);
+function handleInvoicePushError(c: Context, err: unknown): Response {
+  // AccountingInvoicePushError.status is a narrowed literal union (404|409|429|502), so no cast.
+  if (err instanceof AccountingInvoicePushError) {
+    setRetryAfter(c, err);
+    return c.json({ error: err.code, message: err.message }, err.status);
+  }
   throw err;
 }
 
@@ -338,65 +353,7 @@ const requireMappingWrite: MiddlewareHandler<
 // authMiddleware — a browser redirect from Intuit carries no Bearer token —
 // so the signed `state` + this cookie are the authentication.
 const ACCOUNTING_STATE_COOKIE = 'breeze_accounting_oauth_state';
-const STATE_TTL_MS = 10 * 60 * 1000;
-
-interface AccountingStatePayload {
-  partnerId: string;
-  userId: string | null;
-  nonce: string;
-  exp: number;
-}
-
-function signingSecret(): string | null {
-  return process.env.APP_ENCRYPTION_KEY?.trim()
-    || process.env.SECRET_ENCRYPTION_KEY?.trim()
-    || process.env.SESSION_SECRET?.trim()
-    || process.env.JWT_SECRET?.trim()
-    || (process.env.NODE_ENV === 'production' ? null : 'test-only-accounting-oauth-state-secret');
-}
-
-function hmac(label: string, value: string): string | null {
-  const secret = signingSecret();
-  if (!secret) return null;
-  return createHmac('sha256', secret).update(`${label}:${value}`).digest('base64url');
-}
-
-function createState(partnerId: string, userId: string | null): string | null {
-  const payload: AccountingStatePayload = {
-    partnerId,
-    userId,
-    nonce: randomBytes(16).toString('hex'),
-    exp: Date.now() + STATE_TTL_MS,
-  };
-  const encoded = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
-  const sig = hmac('accounting-oauth', encoded);
-  return sig ? `${encoded}.${sig}` : null;
-}
-
-function verifyState(state: string): AccountingStatePayload | null {
-  const [encoded, sig] = state.split('.');
-  if (!encoded || !sig) return null;
-  const expected = hmac('accounting-oauth', encoded);
-  if (!expected) return null;
-  if (!constantTimeEqual(sig, expected)) return null;
-  try {
-    const parsed = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8')) as AccountingStatePayload;
-    if (!parsed.partnerId || !parsed.nonce || !parsed.exp || parsed.exp < Date.now()) return null;
-    return parsed;
-  } catch {
-    return null;
-  }
-}
-
-function stateCookieValue(state: string): string | null {
-  return hmac('accounting-oauth-cookie', state);
-}
-
-function constantTimeEqual(a: string, b: string): boolean {
-  const left = Buffer.from(a, 'utf8');
-  const right = Buffer.from(b, 'utf8');
-  return left.length === right.length && timingSafeEqual(left, right);
-}
+// Signing, TTL and verification live in ./oauthState.
 
 function resolvePartnerId(auth: Pick<AuthContext, 'scope' | 'partnerId'>, requested?: string): { partnerId: string } | { error: string; status: 400 | 403 } {
   if (auth.scope === 'partner') {
@@ -430,28 +387,24 @@ const requireAccountingPartnerAuthority: MiddlewareHandler = async (c, next) => 
   return next();
 };
 
-function validateProviderConfig(provider: AccountingProviderId): string | null {
-  if (provider !== 'quickbooks') return null;
-  if (!QBO_CLIENT_ID || !QBO_CLIENT_SECRET || !QBO_REDIRECT_URI || !QBO_ENVIRONMENT) {
-    return 'QuickBooks OAuth is not configured on this instance';
-  }
-  if (QBO_ENVIRONMENT !== 'sandbox' && QBO_ENVIRONMENT !== 'production') {
-    return 'QBO_ENVIRONMENT must be sandbox or production';
-  }
-  return null;
-}
-
 // Initiate the OAuth flow. Authenticated + MFA-gated: this is the privileged
 // action that decides which partner an external accounting realm links to.
 accountingRoutes.get('/:provider/connect', authMiddleware, partnerScopes, requireAccountingPartnerAuthority, requireAccountingManage, requireMfa(), zValidator('param', providerParamSchema), zValidator('query', partnerQuerySchema), async (c) => {
   const { provider } = c.req.valid('param');
-  const configError = validateProviderConfig(provider);
-  if (configError) return c.json({ error: configError }, 400);
+  const gate = providerGateResponse(c, provider, 'connect');
+  if (gate) return gate;
   const auth = c.get('auth');
   const partner = resolvePartnerId(auth, c.req.valid('query').partnerId);
   if ('error' in partner) return c.json({ error: partner.error }, partner.status);
+  // One connection per partner (spec D2): refuse a cross-provider connect before OAuth
+  // starts. Non-decrypting, any-status read: a pending_tenant row still holds the slot (W02).
+  const existing = await getPartnerConnectionRef(db, partner.partnerId);
+  if (existing && existing.provider !== provider) {
+    const conflict = new AccountingProviderConflictError(existing.provider, provider, existing.status);
+    return c.json({ error: conflict.message, code: conflict.code }, 409);
+  }
 
-  const state = createState(partner.partnerId, auth.user?.id ?? null);
+  const state = createState(partner.partnerId, auth.user?.id ?? null, provider);
   const cookieValue = state ? stateCookieValue(state) : null;
   if (!state || !cookieValue) return c.json({ error: 'OAuth state signing secret is not configured' }, 500);
 
@@ -472,258 +425,209 @@ accountingRoutes.get('/:provider/connect', authMiddleware, partnerScopes, requir
 accountingRoutes.get('/:provider/callback', zValidator('param', providerParamSchema), zValidator('query', callbackQuerySchema), async (c) => {
   const { provider } = c.req.valid('param');
   const query = c.req.valid('query');
-  const configError = validateProviderConfig(provider);
-  if (configError) return c.json({ error: configError }, 400);
+  const gate = providerGateResponse(c, provider, 'connect');
+  if (gate) return gate;
+
+  // The signed state + binding cookie authenticate the callback; null = not this browser's flow.
+  const bindingValid = (stateParam: string): boolean => {
+    const expectedCookie = stateCookieValue(stateParam);
+    const presentedCookie = getCookie(c, ACCOUNTING_STATE_COOKIE);
+    return Boolean(expectedCookie && presentedCookie && constantTimeEqual(presentedCookie, expectedCookie));
+  };
+
+  if (query.error) {
+    // Consent cancelled or refused at the provider: no grant exists, nothing to
+    // exchange or clean up. Only this browser's own verified flow FOR THIS
+    // provider clears the binding cookie, so a crafted link cannot cancel an
+    // in-flight connect.
+    const denied = query.state ? verifyState(query.state) : null;
+    if (denied && (denied.provider ?? LEGACY_UNTARGETED_JOB_PROVIDER) === provider && bindingValid(query.state!)) {
+      deleteCookie(c, ACCOUNTING_STATE_COOKIE, { path: '/' });
+    }
+    return c.redirect(connectRedirectPath(provider, { kind: 'error', error: 'consent_denied' }));
+  }
+  if (!query.code || !query.state) return c.json({ error: 'Missing code or state' }, 400);
+  const code = query.code;
 
   const state = verifyState(query.state);
   if (!state) return c.json({ error: 'Invalid or expired OAuth state' }, 400);
-
-  const expectedCookie = stateCookieValue(query.state);
-  const presentedCookie = getCookie(c, ACCOUNTING_STATE_COOKIE);
-  if (!expectedCookie || !presentedCookie || !constantTimeEqual(presentedCookie, expectedCookie)) {
-    return c.json({ error: 'OAuth state binding mismatch' }, 400);
+  // Pre-W01 states carry no provider; they were QuickBooks flows (10-minute TTL spans at most one deploy).
+  if ((state.provider ?? LEGACY_UNTARGETED_JOB_PROVIDER) !== provider) {
+    return c.json({ error: 'OAuth state was issued for a different provider' }, 400);
   }
+  if (!bindingValid(query.state)) return c.json({ error: 'OAuth state binding mismatch' }, 400);
 
   const providerClient = getAccountingProvider(provider);
+  // A provider without tenant selection names its realm in the callback (QuickBooks).
+  if (!providerClient.tenantSelection && !query.realmId) return c.json({ error: 'Missing realmId' }, 400);
+
   let tokens;
   try {
-    tokens = await runOutsideDbContext(() => providerClient.exchangeCode(query.code, query.realmId));
+    tokens = await runOutsideDbContext(() => providerClient.exchangeCode(code, query.realmId ?? ''));
   } catch (err) {
     // Never log query.code / realmId / token bodies — only partner + provider.
-    captureException(err instanceof Error ? err : new Error(String(err)), c);
-    console.error('[accounting] QuickBooks code exchange failed', { partnerId: state.partnerId, provider });
+    // A provider/local throttle is not an incident (matches connectFinalize's
+    // F7 guard) — warn only; anything else still goes to Sentry.
+    if (rateLimitRetryAfterMs(err) === null) {
+      captureException(err instanceof Error ? err : new Error(String(err)), c);
+      console.error(`[accounting] ${providerClient.displayName} code exchange failed`, { partnerId: state.partnerId, provider });
+    } else {
+      console.warn(`[accounting] ${providerClient.displayName} code exchange throttled`, { partnerId: state.partnerId, provider });
+    }
     deleteCookie(c, ACCOUNTING_STATE_COOKIE, { path: '/' });
-    return c.redirect('/integrations?accounting=quickbooks&error=exchange_failed#accounting');
+    return c.redirect(connectRedirectPath(provider, { kind: 'error', error: 'exchange_failed' }));
   }
 
-  // No request auth context here, so the write would match 0 rows under
-  // breeze_app RLS (silent failure). Run it in system context with the
-  // partnerId taken from the verified state. Guard the persist: a failure
-  // after a successful exchange leaves a live-but-unrecorded grant, so surface
-  // it rather than 500-ing on a raw page.
-  // Does this reconnect change realms? A DIFFERENT realm's home currency must
-  // never persist, but blanking it on a SAME-realm reconnect degrades a healthy
-  // connection: capture below is non-fatal and there is no retry, no refresh
-  // route and no job, so a transient Preferences failure would strand the row at
-  // NULL until someone completes another full OAuth round-trip that succeeds.
-  // Read failure falls back to the fail-closed answer (null) rather than losing
-  // the freshly-exchanged grant.
-  let priorRealmId: string | null = null;
-  let priorRealmKnown = false;
-  try {
-    const existing = await withSystemDbAccessContext(() => getConnection(db, state.partnerId, provider));
-    priorRealmId = existing?.realmId ?? null;
-    priorRealmKnown = true;
-  } catch (err) {
-    captureException(err instanceof Error ? err : new Error(String(err)), c);
-    console.warn('[accounting] QuickBooks pre-reconnect realm read failed; clearing home currency', { partnerId: state.partnerId, provider });
+  if (providerClient.tenantSelection) {
+    const outcome = await completeTenantSelectingCallback(c, { provider, tokens, partnerId: state.partnerId, userId: state.userId });
+    deleteCookie(c, ACCOUNTING_STATE_COOKIE, { path: '/' });
+    return c.redirect(connectRedirectPath(provider, outcome));
   }
-  const sameRealm = priorRealmKnown && priorRealmId !== null && priorRealmId === tokens.realmId;
 
-  let connection: AccountingConnection;
-  try {
-    connection = await withSystemDbAccessContext(() => upsertConnection(db, state.partnerId, provider, {
-      realmId: tokens.realmId,
+  // Persist, realm-change reset and settings capture: connectFinalize.ts (moved, Xero W02).
+  const realmId = tokens.realmId;
+  const prior = await readPriorRealm(c, state.partnerId, provider);
+  const result = await finalizeConnection(c, {
+    provider, partnerId: state.partnerId, realmId, prior,
+    persist: () => withSystemDbAccessContext(() => upsertConnection(db, state.partnerId, provider, {
+      realmId,
       accessToken: tokens.accessToken,
       refreshToken: tokens.refreshToken,
       accessTokenExpiresAt: tokens.accessTokenExpiresAt,
       refreshTokenExpiresAt: tokens.refreshTokenExpiresAt,
-      environment: QBO_ENVIRONMENT as 'sandbox' | 'production',
-      // Explicit null on a realm CHANGE, not omission: upsertConnection's
-      // conflict set strips undefined, so omitting it would carry a PREVIOUS
-      // realm's home currency across a reconnect. Unknown must fail closed at
-      // push time instead (multi-currency §11). On a same-realm reconnect the
-      // undefined is deliberate — it leaves an already-captured currency intact.
-      homeCurrency: sameRealm ? undefined : null,
+      environment: providerClient.connectEnvironment(),
+      homeCurrency: homeCurrencyField(prior, realmId),
       status: 'connected',
       lastError: null,
       connectedBy: state.userId,
-    }));
-  } catch (err) {
-    captureException(err instanceof Error ? err : new Error(String(err)), c);
-    console.error('[accounting] QuickBooks connection persist failed', { partnerId: state.partnerId, provider });
-    deleteCookie(c, ACCOUNTING_STATE_COOKIE, { path: '/' });
-    return c.redirect('/integrations?accounting=quickbooks&error=persist_failed#accounting');
-  }
-
-  // A reconnect that landed on a DIFFERENT QuickBooks company gets DISCONNECT
-  // SEMANTICS (finding C): every `accounting_entity_mappings` row under this
-  // connection still names the OLD realm's Customer/Item/Invoice/Payment ids,
-  // and `cdc_cursor` is a watermark in the old realm's change stream. Left
-  // alone, the next push would "update" a stranger's invoice and the next pull
-  // would skip the new realm's first window as already read.
-  //
-  // Only fires on a POSITIVELY KNOWN change: `priorRealmKnown` false means the
-  // pre-upsert read failed, and destroying a healthy connection's entire
-  // mapping set on a guess is far worse than the divergence it would prevent.
-  // Non-fatal for the same reason the currency capture is: the grant is already
-  // live, and a reconcile job that arrives before this lands is caught by the
-  // worker's own compare-and-set on the fingerprint.
-  const realmChanged = priorRealmKnown && priorRealmId !== null && priorRealmId !== tokens.realmId;
-  if (realmChanged) {
-    try {
-      const { mappingsDeleted, owedPaymentDeletes } = await withSystemDbAccessContext(
-        () => resetConnectionForRealmChange(db, connection.id, state.partnerId),
-      );
-      // Same rule as the disconnect route below: the reset cannot be blocked
-      // (the new grant is already live), and the remote ids of the payment
-      // deletes it discards are all a human has left to reconcile with. They
-      // name Payments in the OLD company file, which is exactly why they cannot
-      // simply be retained.
-      if (owedPaymentDeletes.count > 0) {
-        writeRouteAudit(c, {
-          orgId: null,
-          action: 'accounting.connection.owed_deletes_discarded',
-          resourceType: 'accounting_connection',
-          resourceId: connection.id,
-          result: 'failure',
-          details: {
-            provider,
-            reason: 'realm_changed',
-            count: owedPaymentDeletes.count,
-            remoteEntityIds: owedPaymentDeletes.remoteEntityIds,
-          },
-        });
-      }
-      console.warn('[accounting] QuickBooks realm changed on reconnect; mappings and CDC cursor cleared', {
-        partnerId: state.partnerId, provider, mappingsDeleted,
-      });
-      writeRouteAudit(c, {
-        orgId: null,
-        action: 'accounting.connection.realm_changed',
-        resourceType: 'accounting_connection',
-        resourceId: connection.id,
-        details: { provider, mappingsDeleted },
-      });
-    } catch (err) {
-      captureException(err instanceof Error ? err : new Error(String(err)), c);
-      console.error('[accounting] QuickBooks realm-change cleanup failed', { partnerId: state.partnerId, provider });
-    }
-  }
-
-  // Capture the realm's home currency (multi-currency §11). NON-FATAL by design:
-  // the connection is already live and usable for customer import, and the
-  // invoice-push guard fails closed on a NULL home currency, so a Preferences
-  // outage must never turn a successful OAuth grant into a connect error.
-  // The QBO call runs with no ambient DB context; the write is a short
-  // compare-and-set on the row we just persisted.
-  let capturedSettings: { homeCurrency: string | null; multiCurrencyEnabled: boolean | null } | null = null;
-  // The generation both realm-derived writes below stake their compare-and-set
-  // on. `updateHomeCurrency` BUMPS it, so it hands back the new one for the
-  // multi-currency write to chain onto; a lost CAS clears it, which skips the
-  // second write rather than issuing it against a claim we know has expired.
-  let generation: Date | null = connection.updatedAt;
-  try {
-    capturedSettings = await runOutsideDbContext(() => providerClient.fetchRealmSettings(connection));
-    const { homeCurrency } = capturedSettings;
-    if (homeCurrency && generation) {
-      // The generation this capture belongs to: the row as we just wrote it
-      // (updatedAt) AND the realm we just exchanged for. A reconnect to another
-      // realm in between — even inside the same millisecond — aborts the write.
-      generation = await withSystemDbAccessContext(() => updateHomeCurrency(
-        db,
-        connection.id,
-        state.partnerId,
-        { updatedAt: generation as Date, realmId: tokens.realmId },
-        homeCurrency,
-      ));
-    } else if (!homeCurrency) {
-      // The realm reported nothing — an ordinary external condition. Push-time
-      // fails closed on NULL, so a warning is the whole response.
-      console.warn('[accounting] QuickBooks home currency unavailable', { partnerId: state.partnerId, provider });
-    } else {
-      // A GOOD capture we cannot anchor: the row we just upserted came back with
-      // no updatedAt, so the compare-and-set has no generation to target. That is
-      // an unexpected row shape, not an external outage — report it instead of
-      // discarding the value under an "unavailable" warning.
-      captureException(new Error('Accounting home currency captured but the persisted connection carried no updatedAt to compare-and-set against'), c);
-      console.error('[accounting] QuickBooks home currency captured but the persisted row has no updatedAt', { partnerId: state.partnerId, provider });
-    }
-  } catch (err) {
-    // A lost compare-and-set is an EXPECTED race (double connect, concurrent
-    // reconnect), not a defect: the winning capture already wrote a currency for
-    // the generation that survived. Report it as a warning so it stops filing
-    // Sentry issues on a normal user action; genuine failures stay exceptions.
-    if (isHomeCurrencyCasAbort(err)) {
-      generation = null;
-      captureMessage('[accounting] QuickBooks home currency capture lost the compare-and-set', {
-        eventCode: 'accounting_home_currency_cas_lost',
-      });
-      console.warn('[accounting] QuickBooks home currency capture lost the compare-and-set', { partnerId: state.partnerId, provider });
-    } else {
-      captureException(err instanceof Error ? err : new Error(String(err)), c);
-      console.warn('[accounting] QuickBooks home currency capture failed', { partnerId: state.partnerId, provider });
-    }
-  }
-
-  // Persist the realm's multi-currency flag, under the SAME realm+generation
-  // compare-and-set as the home currency (a reconnect to a different realm
-  // must not be stamped with the old realm's flag). It runs AFTER the block
-  // above and chains onto the generation that write returned — both writes
-  // bump updated_at, so ordering and chaining are both load-bearing.
-  // A null flag is left untouched (unknown must never blank a previously
-  // captured true/false), matching the home-currency "never blank" rule above.
-  if (typeof capturedSettings?.multiCurrencyEnabled === 'boolean' && generation) {
-    try {
-      await withSystemDbAccessContext(() => updateMultiCurrencyEnabled(
-        db,
-        connection.id,
-        state.partnerId,
-        { updatedAt: generation as Date, realmId: tokens.realmId },
-        capturedSettings!.multiCurrencyEnabled,
-      ));
-    } catch (err) {
-      if (isHomeCurrencyCasAbort(err)) {
-        console.warn('[accounting] QuickBooks multi-currency flag capture lost the compare-and-set', { partnerId: state.partnerId, provider });
-      } else {
-        captureException(err instanceof Error ? err : new Error(String(err)), c);
-        console.warn('[accounting] QuickBooks multi-currency flag capture failed', { partnerId: state.partnerId, provider });
-      }
-    }
-  }
-
+    })),
+  });
   deleteCookie(c, ACCOUNTING_STATE_COOKIE, { path: '/' });
-  return c.redirect('/integrations?accounting=quickbooks&connected=1#accounting');
+  return c.redirect(connectRedirectPath(provider, result.ok ? { kind: 'connected' } : { kind: 'error', error: result.error }));
 });
 
 accountingRoutes.post('/:provider/disconnect', authMiddleware, partnerScopes, requireAccountingPartnerAuthority, requireAccountingManage, requireMfa(), zValidator('param', providerParamSchema), zValidator('query', partnerQuerySchema), async (c) => {
   const { provider } = c.req.valid('param');
-  const partner = resolvePartnerId(c.get('auth'), c.req.valid('query').partnerId);
+  const gate = providerGateResponse(c, provider, 'connect', { requireConfigured: false });
+  if (gate) return gate;
+  const auth = c.get('auth');
+  const partner = resolvePartnerId(auth, c.req.valid('query').partnerId);
   if ('error' in partner) return c.json({ error: partner.error }, partner.status);
-  const { removed, connectionId, owedPaymentDeletes } = await deleteConnection(db, partner.partnerId, provider);
+  // Self-managed (SELF_MANAGED_DB_CONTEXT_ROUTES): the provider-side release is
+  // an outbound call, so every DB step is its own short context, none held across it.
+  const runInDb: DbContextRunner = (fn) => withAuthDbAccessContext(auth, fn);
+  const ref = await runInDb(() => getPartnerConnectionRef(db, partner.partnerId));
+  if (!ref || ref.provider !== provider) return c.json({ error: 'Accounting connection not found' }, 404);
+  // `status` is the latest pre-delete read (the decrypting re-read when one ran,
+  // otherwise the first read) (review I), not the first read's.
+  const audit = (resourceId: string, status: string, details: Record<string, unknown>) => writeRouteAudit(c, {
+    orgId: null, action: 'accounting.connection.disconnected', resourceType: 'accounting_connection', resourceId,
+    details: { provider, status, ...details },
+  });
+  // A row waiting for an organisation is a cancel: no chosen link to release,
+  // and this flow's links go through the held-checked cleanup. False = it was
+  // claimed (or removed) in the meantime.
+  // A RE-PARKED former connected row can still carry mappings (#7289): the
+  // payment deletes they owed are discarded with it and audited like any
+  // disconnect's.
+  const discardPending = async () => {
+    const result = await discardPendingTenantSelection({
+      partnerId: partner.partnerId, provider, reason: 'cancel',
+      // Authorization and the scoped read above also cover this pending path.
+      // Commit deletion, fee abandonment and user-scoped fanout together.
+      runInDbContext: (fn) => runOutsideDbContext(() =>
+        withSystemDbAccessContext(fn, 'accounting.disconnect')),
+      onDeleted: (connectionId) => abandonAccountingFees(db, partner.partnerId, connectionId),
+    });
+    if (!result.discarded) return false;
+    auditOwedDeletesDiscarded(c, { provider, connectionId: result.connectionId, reason: 'disconnect', owed: result.owedPaymentDeletes });
+    return true;
+  };
+  if (ref.status === PENDING_TENANT_STATUS && await discardPending()) {
+    audit(ref.id, PENDING_TENANT_STATUS, {});
+    return c.json({ disconnected: true });
+  }
+  // Best-effort provider-side release BEFORE the row and its tokens are gone
+  // (spec W02 "Disconnect"; never token revocation). Only a provider with a
+  // release hook needs the decrypting read (review K). A row whose tokens
+  // cannot be decrypted skips the release but still disconnects.
+  let full: AccountingConnection | null = null;
+  if (findAccountingProvider(provider)?.releaseConnection) {
+    try {
+      full = await runInDb(() => getConnection(db, partner.partnerId, provider));
+    } catch (err) {
+      captureException(err instanceof Error ? err : new Error(String(err)), c, { service: 'accounting' });
+      console.warn('[accounting] disconnect could not read the connection; skipping the provider-side release', {
+        partnerId: partner.partnerId, provider, error: err instanceof Error ? err.message : String(err),
+      });
+    }
+    // A concurrent reconnect re-parked the row (review H): its new grant's links
+    // need the held-checked cleanup, and a pending row is never refreshed. If
+    // it was claimed yet again, disconnect it without a release (best-effort).
+    if (full?.status === PENDING_TENANT_STATUS) {
+      if (await discardPending()) {
+        audit(full.id, PENDING_TENANT_STATUS, {});
+        return c.json({ disconnected: true });
+      }
+      full = null;
+    }
+  }
+  const providerRelease = full ? await releaseProviderConnection(full) : 'skipped';
+  // Partner-wide authority and the scoped connection were checked above. The
+  // atomic disconnect also fans out user-scoped staff notifications, which
+  // cannot be inserted for other MSP staff in the caller's user context.
+  const { removed, connectionId, owedPaymentDeletes } = await runOutsideDbContext(()=>
+    withSystemDbAccessContext(()=>deleteConnection(db,partner.partnerId,provider),'accounting.disconnect'));
   if (!removed) return c.json({ error: 'Accounting connection not found' }, 404);
+  audit(connectionId ?? ref.id, full?.status ?? ref.status, { providerRelease });
   // The disconnect is never blocked, but a QuickBooks payment deletion Breeze
   // still owed dies with the mapping (ON DELETE CASCADE). Record the remote ids
   // — the only thing that lets a human find those Payments afterwards (review
   // wave 2, finding 3). The service already warned and raised Sentry.
-  if (owedPaymentDeletes.count > 0) {
-    writeRouteAudit(c, {
-      orgId: null,
-      action: 'accounting.connection.owed_deletes_discarded',
-      resourceType: 'accounting_connection',
-      // The CONNECTION id, matching the realm-change twin above: an audit trail
-      // that identifies the same subject two different ways cannot be joined.
-      // Non-null whenever `removed` is true, which the 404 above has established.
-      resourceId: connectionId ?? partner.partnerId,
-      result: 'failure',
-      details: {
-        provider,
-        reason: 'disconnect',
-        count: owedPaymentDeletes.count,
-        remoteEntityIds: owedPaymentDeletes.remoteEntityIds,
-      },
-    });
-  }
+  // `connectionId` is non-null whenever `removed` is true (the 404 above).
+  auditOwedDeletesDiscarded(c, {
+    provider, connectionId: connectionId ?? partner.partnerId, reason: 'disconnect', owed: owedPaymentDeletes,
+  });
   return c.json({ disconnected: true });
+});
+
+// Organisation picker, cancel and settings pickers (Xero W02): connect chain, manage-gated.
+registerConnectionSetupRoutes(accountingRoutes, {
+  auth: [authMiddleware, partnerScopes, requireAccountingPartnerAuthority, requireAccountingManage],
+  mfa: requireMfa(),
+  resolvePartnerId,
+});
+
+// Registered BEFORE GET /:provider, which would otherwise capture it (and the enum 400 it).
+accountingRoutes.get('/providers', authMiddleware, partnerScopes, requireAccountingPartnerAuthority, requireAccountingRead, zValidator('query', partnerQuerySchema), async (c) => {
+  const partner = resolvePartnerId(c.get('auth'), c.req.valid('query').partnerId);
+  if ('error' in partner) return c.json({ error: partner.error }, partner.status);
+  return listProvidersHandler(c, partner.partnerId);
 });
 
 accountingRoutes.get('/:provider', authMiddleware, partnerScopes, requireAccountingPartnerAuthority, requireAccountingRead, zValidator('param', providerParamSchema), zValidator('query', partnerQuerySchema), async (c) => {
   const { provider } = c.req.valid('param');
+  const gate = providerGateResponse(c, provider, 'connect', { requireConfigured: false });
+  if (gate) return gate;
   const partner = resolvePartnerId(c.get('auth'), c.req.valid('query').partnerId);
   if ('error' in partner) return c.json({ error: partner.error }, partner.status);
+  const autopayEnabled = await isAutopayEnabledForPartner(db, partner.partnerId);
+  const feeErrors = await db.select({ n: sql<number>`count(*)::int` }).from(invoiceStripePayments)
+    .innerJoin(invoices, eq(invoices.id, invoiceStripePayments.invoiceId))
+    .where(and(eq(invoices.partnerId, partner.partnerId), sql`${invoiceStripePayments.feeAccountingError} IS NOT NULL`));
   const connection = await getConnection(db, partner.partnerId, provider);
+  // What the provider can do and which setup steps it has (Xero W02). DB-only:
+  // the organisation name / demo badge come from GET /:provider/settings/options.
+  const impl = getAccountingProvider(provider);
+  const providerShape = {
+    capabilities: impl.capabilities,
+    features: { tenantSelection: !!impl.tenantSelection, settingsOptions: typeof impl.listSettingsOptions === 'function' },
+  };
   if (!connection) {
     return c.json({
+      ...providerShape,
+      autopayEnabled,
+      feeAccountingErrorCount: feeErrors[0]?.n ?? 0,
       status: 'disconnected',
       environment: null,
       pushMode: 'auto',
@@ -742,13 +646,20 @@ accountingRoutes.get('/:provider', authMiddleware, partnerScopes, requireAccount
     });
   }
   return c.json({
+    ...providerShape,
+    autopayEnabled,
+    feeAccountingErrorCount: feeErrors[0]?.n ?? 0,
     status: connection.status,
     environment: connection.environment,
     pushMode: connection.pushMode,
     connectedAt: connection.createdAt,
     lastError: connection.lastError,
+    feeIncomeItemRef: connection.feeIncomeItemRef ?? null,
+    feeIncomeAccountRef: connection.feeIncomeAccountRef ?? null,
     defaultIncomeAccountRef: connection.defaultIncomeAccountRef,
     defaultTaxCodeRef: connection.defaultTaxCodeRef,
+    defaultExemptTaxCodeRef: connection.defaultExemptTaxCodeRef,
+    defaultPaymentAccountRef: connection.defaultPaymentAccountRef,
     // A captured external fact, exposed so an operator can see whether connect-time
     // capture succeeded. Deliberately absent from settingsSchema — PATCH must never
     // accept it.
@@ -768,6 +679,8 @@ accountingRoutes.get('/:provider', authMiddleware, partnerScopes, requireAccount
 // visible after voidPayment removes its invoice_payments row.
 accountingRoutes.get('/:provider/owed-operations', authMiddleware, partnerScopes, requireAccountingPartnerAuthority, requireAccountingRead, zValidator('param', providerParamSchema), zValidator('query', partnerQuerySchema), async (c) => {
   const { provider } = c.req.valid('param');
+  const gate = providerGateResponse(c, provider, 'paymentPush', { requireConfigured: false });
+  if (gate) return gate;
   const partner = resolvePartnerId(c.get('auth'), c.req.valid('query').partnerId);
   if ('error' in partner) return c.json({ error: partner.error }, partner.status);
   const invoiceMapping = alias(accountingEntityMappings, 'owed_invoice_mapping');
@@ -819,12 +732,12 @@ accountingRoutes.get('/:provider/owed-operations', authMiddleware, partnerScopes
 // partner and therefore requires full-partner org access.
 accountingRoutes.get('/:provider/customers', authMiddleware, partnerScopes, requireFullPartnerOrgImportAccess, requireAccountingPartnerAuthority, requireAccountingRead, zValidator('param', providerParamSchema), zValidator('query', partnerQuerySchema), async (c) => {
   const { provider } = c.req.valid('param');
-  const configError = validateProviderConfig(provider);
-  if (configError) return c.json({ error: configError }, 400);
+  const gate = providerGateResponse(c, provider, 'customerImport');
+  if (gate) return gate;
   const partner = resolvePartnerId(c.get('auth'), c.req.valid('query').partnerId);
   if ('error' in partner) return c.json({ error: partner.error }, partner.status);
   try {
-    const data = await listQuickbooksCustomersAnnotated(partner.partnerId);
+    const data = await listAccountingCustomersAnnotated(partner.partnerId, provider);
     return c.json({ data });
   } catch (err) {
     return handleImportError(c, err);
@@ -838,16 +751,17 @@ accountingRoutes.get('/:provider/customers', authMiddleware, partnerScopes, requ
 // guard lives inside `requireImportPermissions` — see its comment.
 accountingRoutes.post('/:provider/customers/import', authMiddleware, partnerScopes, requireFullPartnerOrgImportAccess, requireAccountingPartnerAuthority, requireImportPermissions, requireMfa(), zValidator('param', providerParamSchema), zValidator('query', partnerQuerySchema), zValidator('json', importCustomersSchema), async (c) => {
   const { provider } = c.req.valid('param');
-  const configError = validateProviderConfig(provider);
-  if (configError) return c.json({ error: configError }, 400);
+  const gate = providerGateResponse(c, provider, 'customerImport');
+  if (gate) return gate;
   const auth = c.get('auth');
   const partner = resolvePartnerId(auth, c.req.valid('query').partnerId);
   if ('error' in partner) return c.json({ error: partner.error }, partner.status);
 
   let summary;
   try {
-    summary = await importQuickbooksCustomers({
+    summary = await importAccountingCustomers({
       partnerId: partner.partnerId,
+      provider,
       customerIds: c.req.valid('json').customerIds,
       // Stamped onto organization_external_links.created_by by the seam.
       actor: { userId: auth.user?.id ?? null },
@@ -865,7 +779,7 @@ accountingRoutes.post('/:provider/customers/import', authMiddleware, partnerScop
       resourceType: 'organization',
       resourceId: item.organizationId,
       resourceName: item.displayName,
-      details: { source: 'quickbooks_import', quickbooksCustomerId: item.customerId, siteId: item.siteId },
+      details: { source: `${provider}_import`, [`${provider}CustomerId`]: item.customerId, siteId: item.siteId },
     });
   }
 
@@ -874,16 +788,31 @@ accountingRoutes.post('/:provider/customers/import', authMiddleware, partnerScop
 
 accountingRoutes.patch('/:provider/settings', authMiddleware, partnerScopes, requireAccountingPartnerAuthority, requireAccountingManage, requireMfa(), zValidator('param', providerParamSchema), zValidator('query', partnerQuerySchema), zValidator('json', settingsSchema), requireInvoicePushForSyncSwitches, async (c) => {
   const { provider } = c.req.valid('param');
+  const gate = providerGateResponse(c, provider, 'connect', { requireConfigured: false });
+  if (gate) return gate;
   const body = c.req.valid('json');
   const partner = resolvePartnerId(c.get('auth'), c.req.valid('query').partnerId);
   if ('error' in partner) return c.json({ error: partner.error }, partner.status);
 
+  if (('feeIncomeItemRef' in body || 'feeIncomeAccountRef' in body)
+    && !await isAutopayEnabledForPartner(db, partner.partnerId)) {
+    return c.json({ error: 'Automatic payments are not enabled', code: 'autopay_not_enabled' }, 404);
+  }
+  if ((provider === 'xero' && body.feeIncomeItemRef != null)
+    || (provider !== 'xero' && body.feeIncomeAccountRef != null)) {
+    return c.json({ error: 'Use the processing fee mapping for this accounting provider' }, 400);
+  }
+
   const [updated] = await db
     .update(accountingConnections)
     .set({
+      ...('feeIncomeItemRef' in body ? { feeIncomeItemRef: body.feeIncomeItemRef } : {}),
+      ...('feeIncomeAccountRef' in body ? { feeIncomeAccountRef: body.feeIncomeAccountRef } : {}),
       ...('pushMode' in body ? { pushMode: body.pushMode } : {}),
       ...('defaultIncomeAccountRef' in body ? { defaultIncomeAccountRef: body.defaultIncomeAccountRef } : {}),
       ...('defaultTaxCodeRef' in body ? { defaultTaxCodeRef: body.defaultTaxCodeRef } : {}),
+      ...('defaultExemptTaxCodeRef' in body ? { defaultExemptTaxCodeRef: body.defaultExemptTaxCodeRef } : {}),
+      ...('defaultPaymentAccountRef' in body ? { defaultPaymentAccountRef: body.defaultPaymentAccountRef } : {}),
       ...('pullPayments' in body ? { pullPayments: body.pullPayments } : {}),
       ...('pushPayments' in body ? { pushPayments: body.pushPayments } : {}),
       // Turning the switch back ON restarts the horizon, so a deliberate pause
@@ -904,11 +833,15 @@ accountingRoutes.patch('/:provider/settings', authMiddleware, partnerScopes, req
       eq(accountingConnections.provider, provider)
     ))
     .returning({
+      feeIncomeItemRef: accountingConnections.feeIncomeItemRef,
+      feeIncomeAccountRef: accountingConnections.feeIncomeAccountRef,
       status: accountingConnections.status,
       environment: accountingConnections.environment,
       pushMode: accountingConnections.pushMode,
       defaultIncomeAccountRef: accountingConnections.defaultIncomeAccountRef,
       defaultTaxCodeRef: accountingConnections.defaultTaxCodeRef,
+      defaultExemptTaxCodeRef: accountingConnections.defaultExemptTaxCodeRef,
+      defaultPaymentAccountRef: accountingConnections.defaultPaymentAccountRef,
       lastError: accountingConnections.lastError,
       pullPayments: accountingConnections.pullPayments,
       pushPayments: accountingConnections.pushPayments,
@@ -931,8 +864,8 @@ accountingRoutes.patch('/:provider/settings', authMiddleware, partnerScopes, req
 // The same applies to the four mapping-workbench routes below.
 accountingRoutes.post('/:provider/settings/refresh', authMiddleware, partnerScopes, requireAccountingPartnerAuthority, requireAccountingManage, requireMfa(), zValidator('param', providerParamSchema), zValidator('query', partnerQuerySchema), async (c) => {
   const { provider } = c.req.valid('param');
-  const configError = validateProviderConfig(provider);
-  if (configError) return c.json({ error: configError }, 400);
+  const gate = providerGateResponse(c, provider, 'connect');
+  if (gate) return gate;
   const auth = c.get('auth');
   const partner = resolvePartnerId(auth, c.req.valid('query').partnerId);
   if ('error' in partner) return c.json({ error: partner.error }, partner.status);
@@ -978,6 +911,8 @@ accountingRoutes.post('/:provider/settings/refresh', authMiddleware, partnerScop
 // rather than assume the job landed — see the push-bulk route's comment above).
 accountingRoutes.post('/:provider/reconcile', authMiddleware, partnerScopes, requireAccountingPartnerAuthority, requireAccountingManage, requireMfa(), requireInvoicePush, zValidator('param', providerParamSchema), zValidator('query', partnerQuerySchema), async (c) => {
   const { provider } = c.req.valid('param');
+  const gate = providerGateResponse(c, provider, 'paymentPull', { requireConfigured: false });
+  if (gate) return gate;
   const partner = resolvePartnerId(c.get('auth'), c.req.valid('query').partnerId);
   if ('error' in partner) return c.json({ error: partner.error }, partner.status);
 
@@ -1022,8 +957,8 @@ accountingRoutes.post('/:provider/reconcile', authMiddleware, partnerScopes, req
 // explicit context (Task 5 review fix — see the settings/refresh comment above).
 accountingRoutes.get('/:provider/mappings', authMiddleware, partnerScopes, requireAccountingPartnerAuthority, requireAccountingRead, zValidator('param', providerParamSchema), zValidator('query', mappingEntityQuerySchema), async (c) => {
   const { provider } = c.req.valid('param');
-  const configError = validateProviderConfig(provider);
-  if (configError) return c.json({ error: configError }, 400);
+  const gate = providerGateResponse(c, provider, 'mapping');
+  if (gate) return gate;
   const auth = c.get('auth');
   const partner = resolvePartnerId(auth, c.req.valid('query').partnerId);
   if ('error' in partner) return c.json({ error: partner.error }, partner.status);
@@ -1045,8 +980,8 @@ accountingRoutes.get('/:provider/mappings', authMiddleware, partnerScopes, requi
 // (and the same explicit-context requirement — Task 5 review fix).
 accountingRoutes.get('/:provider/income-accounts', authMiddleware, partnerScopes, requireAccountingPartnerAuthority, requireAccountingRead, zValidator('param', providerParamSchema), zValidator('query', partnerQuerySchema), async (c) => {
   const { provider } = c.req.valid('param');
-  const configError = validateProviderConfig(provider);
-  if (configError) return c.json({ error: configError }, 400);
+  const gate = providerGateResponse(c, provider, 'mapping');
+  if (gate) return gate;
   const auth = c.get('auth');
   const partner = resolvePartnerId(auth, c.req.valid('query').partnerId);
   if ('error' in partner) return c.json({ error: partner.error }, partner.status);
@@ -1069,8 +1004,8 @@ accountingRoutes.get('/:provider/income-accounts', authMiddleware, partnerScopes
 // (and the same explicit-context requirement — Task 5 review fix).
 accountingRoutes.put('/:provider/mappings', authMiddleware, partnerScopes, requireAccountingPartnerAuthority, requireAccountingManage, requireMfa(), zValidator('param', providerParamSchema), zValidator('query', partnerQuerySchema), zValidator('json', mappingDecisionSchema), requireMappingWrite, async (c) => {
   const { provider } = c.req.valid('param');
-  const configError = validateProviderConfig(provider);
-  if (configError) return c.json({ error: configError }, 400);
+  const gate = providerGateResponse(c, provider, 'mapping');
+  if (gate) return gate;
   const auth = c.get('auth');
   const partner = resolvePartnerId(auth, c.req.valid('query').partnerId);
   if ('error' in partner) return c.json({ error: partner.error }, partner.status);
@@ -1094,7 +1029,7 @@ accountingRoutes.put('/:provider/mappings', authMiddleware, partnerScopes, requi
   // runs outside that context; the stale-row sweep recovers a missed enqueue.
   if (body.decision === 'confirmed' || body.decision === 'create_new') {
     await runOutsideDbContext(() => enqueueAccountingMappingSync(
-      body.breezeEntityType, body.breezeEntityId, partner.partnerId,
+      body.breezeEntityType, body.breezeEntityId, partner.partnerId, mapping.integrationId,
     ));
   }
 
@@ -1122,8 +1057,8 @@ accountingRoutes.put('/:provider/mappings', authMiddleware, partnerScopes, requi
 // review fix).
 accountingRoutes.post('/:provider/mappings/sync', authMiddleware, partnerScopes, requireAccountingPartnerAuthority, requireAccountingManage, requireMfa(), zValidator('param', providerParamSchema), zValidator('query', partnerQuerySchema), zValidator('json', mappingSyncSchema), requireMappingWrite, async (c) => {
   const { provider } = c.req.valid('param');
-  const configError = validateProviderConfig(provider);
-  if (configError) return c.json({ error: configError }, 400);
+  const gate = providerGateResponse(c, provider, 'mapping');
+  if (gate) return gate;
   const auth = c.get('auth');
   const partner = resolvePartnerId(auth, c.req.valid('query').partnerId);
   if ('error' in partner) return c.json({ error: partner.error }, partner.status);
@@ -1186,15 +1121,15 @@ accountingRoutes.post(
   zValidator('query', partnerQuerySchema),
   async (c) => {
     const { provider, invoiceId } = c.req.valid('param');
-    const configError = validateProviderConfig(provider);
-    if (configError) return c.json({ error: configError }, 400);
+    const gate = providerGateResponse(c, provider, 'invoicePush');
+    if (gate) return gate;
     const auth = c.get('auth');
     const partner = resolvePartnerId(auth, c.req.valid('query').partnerId);
     if ('error' in partner) return c.json({ error: partner.error }, partner.status);
 
     let outcome;
     try {
-      outcome = await pushInvoiceToAccounting(invoiceId, partner.partnerId, (fn) => withAuthDbAccessContext(auth, fn));
+      outcome = await pushInvoiceToAccounting(invoiceId, partner.partnerId, (fn) => withAuthDbAccessContext(auth, fn), { provider });
     } catch (err) {
       return handleInvoicePushError(c, err);
     }
@@ -1211,18 +1146,23 @@ accountingRoutes.post(
         docNumber: outcome.docNumber,
         syncStatus: outcome.syncStatus,
         taxVarianceCents: outcome.taxVarianceCents,
+        totalVarianceCents: outcome.totalVarianceCents,
       },
     });
 
-    return c.json({ syncStatus: outcome.syncStatus, docNumber: outcome.docNumber, taxVarianceCents: outcome.taxVarianceCents });
+    return c.json({
+      syncStatus: outcome.syncStatus,
+      docNumber: outcome.docNumber,
+      taxVarianceCents: outcome.taxVarianceCents,
+      totalVarianceCents: outcome.totalVarianceCents,
+    });
   },
 );
 
 // Bulk enqueue. Same gates as the manual push route above, but this one only
-// ever touches Redis (`enqueueAccountingInvoicePush` is fire-and-forget and
-// never calls QuickBooks itself — the actual push happens later on the
-// accounting-sync worker), so it keeps the normal ambient request
-// transaction and carries NO SELF_MANAGED_DB_CONTEXT_ROUTES entry.
+// ever touches Redis (the push happens later on the accounting-sync worker), so
+// it keeps the ambient request transaction and has NO SELF_MANAGED_DB_CONTEXT_ROUTES
+// entry. Every job carries the partner's ONE connection id, resolved once (Xero W01).
 accountingRoutes.post(
   '/:provider/invoices/push-bulk',
   authMiddleware,
@@ -1236,33 +1176,34 @@ accountingRoutes.post(
   zValidator('json', invoicePushBulkSchema),
   async (c) => {
     const { provider } = c.req.valid('param');
-    const configError = validateProviderConfig(provider);
-    if (configError) return c.json({ error: configError }, 400);
+    const gate = providerGateResponse(c, provider, 'invoicePush');
+    if (gate) return gate;
     const partner = resolvePartnerId(c.get('auth'), c.req.valid('query').partnerId);
     if ('error' in partner) return c.json({ error: partner.error }, partner.status);
     const { invoiceIds } = c.req.valid('json');
+    const conn = await resolveActiveConnectionRef(db, partner.partnerId); // non-decrypting: only .id/.provider used below
+    if (conn && (conn.provider !== provider || !providerSupports(conn.provider, 'invoicePush'))) {
+      return c.json({ error: 'Invoice push is not available for this accounting connection', code: 'capability_unavailable' }, 409);
+    }
 
-    // Ownership filter: one `inArray` select rather than N per-id lookups. An
-    // id that isn't this partner's (wrong partner, or doesn't exist at all)
-    // is silently counted into `skipped` — this is a bulk convenience action,
-    // not a per-id validation surface.
+    // Ownership filter: one `inArray` select, not N lookups. A foreign or
+    // unknown id lands in `skipped` (a bulk convenience, not a validation surface).
     const owned = await db
       .select({ id: invoices.id })
       .from(invoices)
       .where(and(inArray(invoices.id, invoiceIds), eq(invoices.partnerId, partner.partnerId)));
     const ownedIds = new Set(owned.map((row) => row.id));
 
-    // `enqueued` counts jobs the queue actually ACCEPTED. It used to count
-    // every owned id regardless — `enqueueAccountingInvoicePush` swallows a
-    // Redis outage by design, so a total queue failure still reported "all
-    // enqueued" and the operator had no signal at all. Failures now get their
-    // own count and their own line in the audit record.
+    // `enqueued` counts jobs the queue ACCEPTED (the enqueue swallows a Redis
+    // outage; counting every owned id hid a total queue failure). No connection
+    // at all: nothing is enqueued, every id is `skipped` (it would only no-op).
     let enqueued = 0;
     let failed = 0;
     let skipped = 0;
     for (const invoiceId of invoiceIds) {
-      if (!ownedIds.has(invoiceId)) { skipped++; continue; }
-      if (await enqueueAccountingInvoicePush(invoiceId, partner.partnerId)) enqueued++;
+      if (!ownedIds.has(invoiceId) || !conn) { skipped++; continue; }
+      // Operator-initiated: runs even in pushMode 'manual' (#7251).
+      if (await enqueueAccountingInvoicePush(invoiceId, partner.partnerId, conn.id, { requestedBy: 'operator' })) enqueued++;
       else failed++;
     }
 
@@ -1300,22 +1241,22 @@ accountingRoutes.get(
   zValidator('query', remoteCandidatesQuerySchema),
   async (c) => {
     const { provider } = c.req.valid('param');
-    const configError = validateProviderConfig(provider);
-    if (configError) return c.json({ error: configError }, 400);
+    const gate = providerGateResponse(c, provider, 'mapping');
+    if (gate) return gate;
     const auth = c.get('auth');
     const partner = resolvePartnerId(auth, c.req.valid('query').partnerId);
     if ('error' in partner) return c.json({ error: partner.error }, partner.status);
     const { entityType, q } = c.req.valid('query');
 
     try {
-      const { liveConn } = await resolveConnectionAndToken(partner.partnerId, provider, (fn) => withAuthDbAccessContext(auth, fn));
+      const { liveConn } = await resolveConnectionAndToken(partner.partnerId, { provider }, (fn) => withAuthDbAccessContext(auth, fn));
       const providerImpl = getAccountingProvider(provider);
       const data = entityType === 'org'
         ? (await runOutsideDbContext(() => providerImpl.listRemoteCustomers(liveConn, q))).map((r) => ({
-          id: r.id, displayName: r.displayName, email: r.email ?? null, currencyCode: r.currencyCode ?? null,
+          id: r.id, displayName: r.displayName, email: r.email ?? null, currencyCode: r.currencyCode ?? null, archived: r.active === false,
         }))
         : (await runOutsideDbContext(() => providerImpl.listRemoteItems(liveConn, q))).map((r) => ({
-          id: r.id, displayName: r.displayName, sku: r.sku ?? null,
+          id: r.id, displayName: r.displayName, sku: r.sku ?? null, archived: r.active === false,
         }));
       return c.json({ data });
     } catch (err) {

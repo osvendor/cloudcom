@@ -100,6 +100,39 @@ describe('QuoteEditor — cover page panel', () => {
     expect(screen.getByTestId('quote-cover-page-title')).toBeInTheDocument();
   });
 
+  it('offers a PDF contents list, off by default, independent of the cover page', async () => {
+    updateQuoteMock.mockResolvedValue(okRes({}));
+    await renderEditor();
+    const box = screen.getByTestId('quote-contents-enabled');
+    expect(box).not.toBeChecked();
+    fireEvent.click(box);
+    await waitFor(() => expect(updateQuoteMock).toHaveBeenCalledWith('q-1', {
+      coverPage: { enabled: false, showPreparedBy: true, showContents: true },
+    }));
+  });
+
+  it('shows the contents box checked when the quote already has it on', async () => {
+    await renderEditor({
+      ...detail,
+      quote: { ...detail.quote, coverPage: { enabled: true, showPreparedBy: true, showContents: true } },
+    });
+    expect(screen.getByTestId('quote-contents-enabled')).toBeChecked();
+  });
+
+  it('keeps the contents list on when another cover field is edited', async () => {
+    updateQuoteMock.mockResolvedValue(okRes({}));
+    await renderEditor({
+      ...detail,
+      quote: { ...detail.quote, coverPage: { enabled: true, showPreparedBy: true, showContents: true } },
+    });
+    const title = screen.getByTestId('quote-cover-page-title');
+    fireEvent.change(title, { target: { value: 'Managed IT Proposal' } });
+    fireEvent.blur(title);
+    await waitFor(() => expect(updateQuoteMock).toHaveBeenCalledWith('q-1', {
+      coverPage: { enabled: true, showPreparedBy: true, title: 'Managed IT Proposal', showContents: true },
+    }));
+  });
+
   it('editing the cover title persists it on blur, carrying enabled forward', async () => {
     updateQuoteMock.mockResolvedValue(okRes({}));
     await renderEditor({
@@ -171,5 +204,16 @@ describe('QuoteEditor — cover page panel', () => {
     await waitFor(() => expect(updateQuoteMock).toHaveBeenCalledWith('q-1', {
       coverPage: { enabled: true, showPreparedBy: true, coverImageId: 'img-cov' },
     }));
+  });
+  it('previews the cover image in the same page-aspect crop as the PDF and the document (OD-5)', async () => {
+    const withImage = { ...detail.quote, coverPage: { enabled: true, showPreparedBy: true, coverImageId: 'img-1' } };
+    const { unmount } = await renderEditor({ ...detail, quote: withImage, presentation: { theme: 'classic', pageSize: 'letter' } });
+    const letter = screen.getByTestId('quote-cover-page-image-crop');
+    expect(letter.className).toContain('doc-cover-frame');
+    expect(letter.className).toContain('doc-cover-letter');
+    unmount();
+    // No presentation on the payload reads as the default page: A4.
+    await renderEditor({ ...detail, quote: withImage });
+    expect(screen.getByTestId('quote-cover-page-image-crop').className).toContain('doc-cover-a4');
   });
 });

@@ -8,7 +8,7 @@
 import { Queue, Worker, Job } from 'bullmq';
 import * as dbModule from '../db';
 import { networkMonitors, networkMonitorResults, devices, networkMonitorAlertRules, alerts, organizations } from '../db/schema';
-import { eq, and, sql, inArray } from 'drizzle-orm';
+import { eq, and, sql, inArray, isNull } from 'drizzle-orm';
 import { getBullMQConnection } from '../services/redis';
 import { createInstrumentedQueue } from '../services/bullmqQueue';
 import { isReusableState } from '../services/bullmqUtils';
@@ -17,6 +17,7 @@ import { buildMonitorCommand } from '../services/monitorCommands';
 import { isCooldownActive, setCooldown } from '../services/alertCooldown';
 import { resolveAlert, createSourcedAlert } from '../services/alertService';
 import { assertQueueJobName, parseQueueJobData } from '../services/bullmqValidation';
+import { excludeQuickSupportOrgs } from '../services/quickSupportOrg';
 import {
   monitorQueueJobDataSchema,
   type MonitorQueueJobData,
@@ -25,9 +26,12 @@ import {
 } from './queueSchemas';
 import { attachWorkerObservability } from './workerObservability';
 import { redactOptionalSecretText, redactSecretsDeep } from '../services/secretRedaction';
+import { presentEndpointTarget, scrubUrlsInText, scrubUrlsInValue } from '../utils/endpointDisplay';
 import { monitorRequestUrl, readTlsObservation, tlsObservationUpdate } from '../services/monitors/tlsObservation';
 import { selectMonitorExecutor } from '../services/networkExecutorSelection';
 import { resolveNetworkCheckAlertDevice } from '../services/monitors/networkCheckAlertDevice';
+import { notHoldingOrgCondition } from '../services/unassignedPool/selectorPredicate';
+import { readMonitorConcurrency, runMonitorWork } from './monitorWorkAdmission';
 
 const { db } = dbModule;
 const runWithSystemDbAccess = async <T>(fn: () => Promise<T>): Promise<T> => {
@@ -112,36 +116,39 @@ const MONITOR_REPEATABLE_META: QueueActorMeta = {
 function createMonitorWorker(): Worker<MonitorJobData> {
   return new Worker<MonitorJobData>(
     MONITOR_QUEUE,
-    async (job: Job<MonitorJobData>) => {
+    async (job: Job<MonitorJobData>, token?: string) => {
       const data = parseQueueJobData(MONITOR_QUEUE, job, monitorQueueJobDataSchema);
-      switch (data.type) {
-        case 'monitor-scheduler':
-          assertQueueJobName(MONITOR_QUEUE, job, 'monitor-scheduler');
-          // Self-manages its DB context: reads due monitors in a SHORT context,
-          // then runs the Redis enqueue loop OUTSIDE any transaction. A blanket
-          // wrap here would pin a pooled connection idle-in-transaction for the
-          // whole enqueue loop (~20s on the EU fleet), starving the pool (#1105).
-          return await processScheduler();
-        case 'check-monitor':
-          // NOT wrapped in runWithSystemDbAccess here (final-review fix,
-          // #4084/#1105): processCheckMonitor calls the agentCommandRelay
-          // facade (isAgentConnectedAnywhere, dispatchCommandToAgent — Redis/WS
-          // I/O), and manages its own short-lived system DB context around
-          // just its reads, closing it before that I/O runs.
-          assertQueueJobName(MONITOR_QUEUE, job, 'check-monitor');
-          return await processCheckMonitor(data);
-        case 'process-check-result':
-          return await runWithSystemDbAccess(() => {
-            assertQueueJobName(MONITOR_QUEUE, job, 'process-check-result');
-            return processCheckResult(data);
-          });
-        default:
-          throw new Error(`Unknown job type: ${(data as { type: string }).type}`);
-      }
+      assertQueueJobName(MONITOR_QUEUE, job, data.type);
+      return runMonitorWork(job, token, data.type, async () => {
+        switch (data.type) {
+          case 'monitor-scheduler':
+            assertQueueJobName(MONITOR_QUEUE, job, 'monitor-scheduler');
+            // Self-manages its DB context: reads due monitors in a SHORT context,
+            // then runs the Redis enqueue loop OUTSIDE any transaction. A blanket
+            // wrap here would pin a pooled connection idle-in-transaction for the
+            // whole enqueue loop (~20s on the EU fleet), starving the pool (#1105).
+            return await processScheduler();
+          case 'check-monitor':
+            // NOT wrapped in runWithSystemDbAccess here (final-review fix,
+            // #4084/#1105): processCheckMonitor calls the agentCommandRelay
+            // facade (isAgentConnectedAnywhere, dispatchCommandToAgent — Redis/WS
+            // I/O), and manages its own short-lived system DB context around
+            // just its reads, closing it before that I/O runs.
+            assertQueueJobName(MONITOR_QUEUE, job, 'check-monitor');
+            return await processCheckMonitor(data);
+          case 'process-check-result':
+            return await runWithSystemDbAccess(() => {
+              assertQueueJobName(MONITOR_QUEUE, job, 'process-check-result');
+              return processCheckResult(data);
+            });
+          default:
+            throw new Error(`Unknown job type: ${(data as { type: string }).type}`);
+        }
+      });
     },
     {
       connection: getBullMQConnection(),
-      concurrency: 10,
+      concurrency: readMonitorConcurrency(),
       lockDuration: 300_000,
       stalledInterval: 60_000,
       maxStalledCount: 2,
@@ -343,7 +350,8 @@ async function evaluateMonitorAlertRules(
     .from(networkMonitorAlertRules)
     .where(and(
       eq(networkMonitorAlertRules.monitorId, monitor.id),
-      eq(networkMonitorAlertRules.isActive, true)
+      eq(networkMonitorAlertRules.isActive, true),
+      isNull(networkMonitorAlertRules.retiredAt)
     ));
 
   if (rules.length === 0) return;
@@ -378,7 +386,10 @@ async function evaluateMonitorAlertRules(
       for (const existingAlert of matchingAlerts) {
         await resolveAlert(
           existingAlert.id,
-          `Auto-resolved after monitor ${monitor.name} recovered from ${rule.condition}`
+          `Auto-resolved after monitor ${monitor.name} recovered from ${rule.condition}`,
+          undefined,
+          false,
+          'condition_cleared',
         );
       }
       continue;
@@ -389,8 +400,11 @@ async function evaluateMonitorAlertRules(
     }
 
     const title = `${monitor.name} ${rule.condition.replace(/_/g, ' ')}`;
+    // Alert rows, their event payload and every channel they reach show the
+    // target as scheme + host: an HTTP check URL can carry credentials.
+    const displayTarget = presentEndpointTarget(monitor.target).target;
     const message = rule.message
-      ?? `${condition.detail}. Target: ${monitor.target}. Status: ${result.status}.`;
+      ?? `${condition.detail}. Target: ${displayTarget}. Status: ${result.status}.`;
 
     // #5241: route through the shared create+publish path. A raw
     // `db.insert(alerts)` here left the alert visible only in the inbox —
@@ -410,9 +424,10 @@ async function evaluateMonitorAlertRules(
       context: {
         source: 'network_monitor',
         monitorId: monitor.id,
+        legacyNetworkMonitorId: monitor.id,
         alertRuleId: rule.id,
         monitorType: monitor.monitorType,
-        target: monitor.target,
+        target: displayTarget,
         status: result.status,
         responseMs: result.responseMs,
         statusCode: result.statusCode ?? null,
@@ -422,10 +437,10 @@ async function evaluateMonitorAlertRules(
       publisher: 'monitor-worker',
       // `source` is supplied by createSourcedAlert from `context.source`.
       eventPayload: {
-        monitorId: monitor.id,
+        legacyNetworkMonitorId: monitor.id,
         alertRuleId: rule.id,
         monitorType: monitor.monitorType,
-        target: monitor.target
+        target: displayTarget
       }
     });
 
@@ -462,9 +477,13 @@ export async function recordMonitorCheckResult(
   // alert details and surfaced in the web UI — redact secrets once at entry
   // so every write below (results insert, monitor state, alert evaluation)
   // is covered.
+  //
+  // URLs in the error text are reduced to scheme + host: Go's HTTP client
+  // renders failures as `Get "<full url>": <cause>`, and a monitor URL can
+  // carry credentials in its userinfo, query or path.
   result = {
     ...result,
-    error: redactOptionalSecretText(result.error),
+    error: scrubUrlsInText(redactOptionalSecretText(result.error)),
     details: result.details != null
       ? redactSecretsDeep(result.details) as Record<string, unknown>
       : result.details,
@@ -504,7 +523,9 @@ export async function recordMonitorCheckResult(
       responseMs: result.responseMs ?? null,
       statusCode: result.statusCode ?? null,
       error: result.error ?? null,
-      details: result.details ?? null,
+      // Stored copy only: the in-memory `result.details` keeps the full
+      // `sslRequestedUrl` for the TLS provenance guard below.
+      details: result.details != null ? scrubUrlsInValue(result.details) as Record<string, unknown> : null,
       timestamp: now
     });
 
@@ -655,7 +676,11 @@ export async function selectDueMonitorJobs(
       db
         .select({ id: organizations.id, partnerId: organizations.partnerId })
         .from(organizations)
-        .where(inArray(organizations.partnerId, partnerIds))
+        // Exclude the hidden per-partner 'quick_support' org: its devices are
+        // a stranger's own machine mid support session, not fleet the
+        // partner authored partner-wide network monitors against. Same
+        // exclusion as monitorScriptWorker.ts's partner-wide fan-out.
+        .where(and(inArray(organizations.partnerId, partnerIds), excludeQuickSupportOrgs(), notHoldingOrgCondition()))
     );
     for (const row of rows) {
       if (!row.partnerId) continue;

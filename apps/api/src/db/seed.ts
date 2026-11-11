@@ -126,10 +126,16 @@ export const DEFAULT_PERMISSIONS = [
   { resource: 'backup', action: 'cross_site_restore', description: 'Restore backup data across sites' },
 
   // Devices
+  // No implicit credential grants for technician or customer roles.
+  { resource: 'credentials', action: 'read', description: 'Search client credential metadata' },
+  { resource: 'credentials', action: 'reveal', description: 'Reveal client passwords' },
+  { resource: 'credentials', action: 'otp', description: 'Generate client one-time codes' },
+  { resource: 'credentials', action: 'import', description: 'Import client credentials' },
   { resource: 'devices', action: 'read', description: 'View devices and their details' },
   { resource: 'devices', action: 'write', description: 'Create and update devices' },
   { resource: 'devices', action: 'delete', description: 'Delete/decommission devices' },
   { resource: 'devices', action: 'execute', description: 'Execute commands on devices' },
+  { resource: 'devices', action: 'recover_agent', description: 'Restart or start the agent through the watchdog' },
 
   { resource: 'agent_rollback', action: 'create', description: 'Authorize a signed agent rollback' },
 
@@ -144,6 +150,7 @@ export const DEFAULT_PERMISSIONS = [
   // Network topology (discovery topology view + saved layout)
   { resource: 'topology', action: 'read', description: 'View network topology and saved layout' },
   { resource: 'topology', action: 'write', description: 'Persist topology node layout (drag-to-save)' },
+  { resource: 'topology', action: 'execute', description: 'Run topology diagnostics and arm scheduled topology checks' },
 
   // Scripts
   { resource: 'scripts', action: 'read', description: 'View scripts' },
@@ -164,6 +171,8 @@ export const DEFAULT_PERMISSIONS = [
   { resource: 'tickets', action: 'read', description: 'View tickets, comments, and categories' },
   { resource: 'tickets', action: 'write', description: 'Create and update tickets, comments, and categories' },
   { resource: 'tickets', action: 'manage', description: 'Edit or delete any comment and reassign ticket organization' },
+  { resource: 'tickets', action: 'record_approval', description: 'Record a customer approval or denial of held ticket work on their behalf' },
+  { resource: 'tickets', action: 'email_review', description: 'Review the inbound email queue: list, convert to a ticket, and dismiss quarantined or failed emails' },
 
   // Time entries (#4251). Seeded because Partner Technician grants them: the
   // mobile start/stop timer (#3206 W05) calls routes gated on
@@ -175,9 +184,9 @@ export const DEFAULT_PERMISSIONS = [
   { resource: 'billing_profiles', action: 'read', description: 'View work types and billing profiles (rate cards)' },
   { resource: 'billing_profiles', action: 'write', description: 'Create and manage work types and billing profiles' },
 
-  // Microsoft 365 partner-global ticket mailbox administration
-  { resource: 'ticket_mailbox', action: 'read', description: 'View Microsoft 365 ticket mailbox connection status' },
-  { resource: 'ticket_mailbox', action: 'admin', description: 'Connect, verify, retest, and disable Microsoft 365 ticket mailboxes' },
+  // Partner-global ticket mailbox administration (Microsoft 365 and Google Workspace)
+  { resource: 'ticket_mailbox', action: 'read', description: 'View Microsoft 365 and Google Workspace ticket mailbox connection status' },
+  { resource: 'ticket_mailbox', action: 'admin', description: 'Connect, verify, retest, and disconnect Microsoft 365 and Google Workspace ticket mailboxes' },
 
   // Catalog (billing/invoicing program)
   { resource: 'catalog', action: 'read', description: 'View product catalog items and pricing' },
@@ -202,6 +211,9 @@ export const DEFAULT_PERMISSIONS = [
   // Agreement templates + signed agreements (agreements vocabulary & IA split, W02).
   { resource: 'agreements', action: 'read', description: 'View agreement templates and signed agreements' },
   { resource: 'agreements', action: 'write', description: 'Create, edit, publish and archive agreement templates; link signed agreements' },
+  // #9075 W2a (OD7 B): send / copy link / void / remind / record-signed. Byte-identical
+  // to 2027-01-05-110000-agreements-send-permission.sql (seed.test.ts asserts it).
+  { resource: 'agreements', action: 'send', description: 'Send agreements for signature, copy signing links, void requests, and record agreements signed elsewhere' },
 
   // Quotes / Proposals (billing program)
   { resource: 'quotes', action: 'read', description: 'View quotes and proposals' },
@@ -220,6 +232,9 @@ export const DEFAULT_PERMISSIONS = [
   { resource: 'organizations', action: 'write', description: 'Create and edit organizations' },
   { resource: 'organizations', action: 'delete', description: 'Delete organizations' },
 
+  // Outbound webhooks. Managing them stays on organizations:write.
+  { resource: 'webhooks', action: 'read', description: 'View webhook configuration and delivery history' },
+
   // Partner-wide OAuth/MCP connected applications. Partner Admin satisfies
   // these through its wildcard; custom roles must be granted them explicitly.
   { resource: 'connected_apps', action: 'read', description: 'View partner connected OAuth applications' },
@@ -229,6 +244,11 @@ export const DEFAULT_PERMISSIONS = [
   { resource: 'sites', action: 'read', description: 'View sites' },
   { resource: 'sites', action: 'write', description: 'Create and edit sites' },
   { resource: 'sites', action: 'delete', description: 'Delete sites' },
+  { resource: 'sites', action: 'set_location', description: "Pin a site's map location from the field" },
+
+  // Endpoint messaging (#8741)
+  { resource: 'endpoint_messages', action: 'send', description: "Send messages to end users' desktops" },
+  { resource: 'endpoint_messages', action: 'read', description: 'View sent endpoint messages and delivery receipts' },
 
   // Remote access
   { resource: 'remote', action: 'access', description: 'Remote access to devices' },
@@ -263,6 +283,15 @@ export const DEFAULT_PERMISSIONS = [
   { resource: 'ai_agents', action: 'write',
     description: 'Create, edit and disable AI agent policies' },
 
+  // AI model registry (#7598 W03): offerings whose required_permission names
+  // it. Granted to no system role; partners grant it deliberately.
+  { resource: 'ai_models', action: 'premium',
+    description: 'Use AI model offerings that require the premium-model permission' },
+  // Wisp W02 (spec §4.6): execute-class gate on the sandbox workspace tools.
+  // Granted to no system role by name; Partner Admin matches it via `*:*`.
+  { resource: 'ai_workspace', action: 'execute',
+    description: 'Stage, run and collect code in AI sandbox workspaces' },
+
   // Tool sources (BYO MCP/OpenAPI tool catalog, #5215/#5216, spec 2026-09-07 §5):
   // managing the registrations is an admin task; calling the tools they expose
   // is gated separately so a technician can use read-only external tools
@@ -276,6 +305,12 @@ export const DEFAULT_PERMISSIONS = [
   { resource: 'external_tools', action: 'write',
     description: 'Call Tier 2/3 (mutating) external tools from AI' },
 
+  // AI for Office prompt-template manager
+  { resource: 'client_ai_templates', action: 'read',
+    description: 'View AI for Office prompt templates' },
+  { resource: 'client_ai_templates', action: 'write',
+    description: 'Create, edit, and delete AI for Office prompt templates' },
+
   // Action intents / durable approvals
   { resource: 'approvals', action: 'decide',
     description: 'Decide (approve/deny) pending action-intent approvals' },
@@ -288,8 +323,7 @@ export const DEFAULT_PERMISSIONS = [
     description: 'Create, update, and delete PAM rules, signer groups, and org config' },
 
   // Accounting / QuickBooks integration — dedicated capabilities, distinct
-  // from the partner-authority-only gate the routes previously carried
-  // (SEC-2026-09-05-057).
+  // from the partner-authority-only gate the routes previously carried.
   { resource: 'accounting', action: 'read',
     description: 'Read accounting provider status, customers, mappings, and income accounts' },
   { resource: 'accounting', action: 'manage',
@@ -333,7 +367,8 @@ export const SYSTEM_ROLES: readonly SystemRoleDefinition[] = [
     forceMfa: false,
     permissions: [
       'backup:read', 'backup:write',
-      'devices:read', 'devices:execute',
+      'devices:read', 'devices:execute', 'devices:recover_agent',
+      'endpoint_messages:send', 'endpoint_messages:read',
       'scripts:read', 'scripts:execute',
       'alerts:read', 'alerts:acknowledge',
       // #4251: a technician works tickets — comments, status, assignment — and
@@ -345,9 +380,12 @@ export const SYSTEM_ROLES: readonly SystemRoleDefinition[] = [
       'billing_profiles:read',
       'ticket_mailbox:read',
       'reports:read', 'reports:write',
-      'sites:read',
+      'sites:read', 'sites:set_location',
       'topology:read',
       'organizations:read',
+      // AI for Office prompt templates: view only; authoring is an admin action.
+      'client_ai_templates:read',
+      'webhooks:read',
       // AI chat (#6396): same reasoning as Org Technician.
       'ai_sessions:use',
       // Tier 1 (read-only) external tools only (#5216).
@@ -369,7 +407,8 @@ export const SYSTEM_ROLES: readonly SystemRoleDefinition[] = [
       'ticket_mailbox:read',
       'reports:read',
       'sites:read',
-      'organizations:read'
+      'organizations:read',
+      'client_ai_templates:read'
     ]
   },
   {
@@ -382,7 +421,7 @@ export const SYSTEM_ROLES: readonly SystemRoleDefinition[] = [
       'quotes:read', 'quotes:write', 'quotes:send', 'quotes:accept',
       'invoices:read', 'invoices:write', 'invoices:send', 'invoices:export',
       'contracts:read', 'contracts:write', 'contracts:manage',
-      'agreements:read', 'agreements:write'
+      'agreements:read', 'agreements:write', 'agreements:send'
     ]
   },
   {
@@ -405,14 +444,15 @@ export const SYSTEM_ROLES: readonly SystemRoleDefinition[] = [
     forceMfa: false,
     permissions: [
       'backup:read', 'backup:write', 'backup:cross_site_restore',
-      'devices:read', 'devices:write', 'devices:delete', 'devices:execute',
+      'devices:read', 'devices:write', 'devices:delete', 'devices:execute', 'devices:recover_agent',
+      'endpoint_messages:send', 'endpoint_messages:read',
       'scripts:read', 'scripts:write', 'scripts:delete', 'scripts:execute',
       'alerts:read', 'alerts:write', 'alerts:acknowledge',
-      'tickets:read', 'tickets:write', 'tickets:manage',
+      'tickets:read', 'tickets:write', 'tickets:manage', 'tickets:record_approval',
       'reports:read', 'reports:write', 'reports:delete', 'reports:export',
       'users:read', 'users:write', 'users:delete', 'users:invite',
-      'sites:read', 'sites:write', 'sites:delete',
-      'topology:read', 'topology:write',
+      'sites:read', 'sites:write', 'sites:delete', 'sites:set_location',
+      'topology:read', 'topology:write', 'topology:execute',
       'remote:access',
       'audit:read',
       'audit:manage',
@@ -439,7 +479,7 @@ export const SYSTEM_ROLES: readonly SystemRoleDefinition[] = [
       // devices:execute/devices:write above — an Org Technician holds those
       // for ordinary device work but must not thereby gain PAM authority.
       'pam:approve', 'pam:manage_policy',
-      // Accounting (SEC-2026-09-05-057): dedicated, NOT implied by partner
+      // Accounting: dedicated, NOT implied by partner
       // authority — a full-partner low-role member must not thereby reach the
       // shared QuickBooks realm.
       'accounting:read', 'accounting:manage',
@@ -453,7 +493,14 @@ export const SYSTEM_ROLES: readonly SystemRoleDefinition[] = [
       'workspace:read', 'workspace:write', 'workspace:credentials', 'workspace:execute',
       'connected_apps:read', 'connected_apps:manage',
       // Org document library (service deliverables W03).
-      'documents:read', 'documents:write'
+      'documents:read', 'documents:write',
+      // AI for Office prompt templates. A PARTNER-WIDE template additionally
+      // requires partner scope with org_access='all'
+      // (canManagePartnerWidePolicies), so this grant reaches the caller's own
+      // org's templates only.
+      'client_ai_templates:read', 'client_ai_templates:write',
+      // Webhook configuration and delivery history (managing them is organizations:write).
+      'webhooks:read'
     ]
   },
   {
@@ -462,13 +509,14 @@ export const SYSTEM_ROLES: readonly SystemRoleDefinition[] = [
     description: 'Execute scripts and manage devices',
     forceMfa: false,
     permissions: [
-      'devices:read', 'devices:write', 'devices:execute',
+      'devices:read', 'devices:write', 'devices:execute', 'devices:recover_agent',
+      'endpoint_messages:send', 'endpoint_messages:read',
       'scripts:read', 'scripts:execute',
       'alerts:read', 'alerts:acknowledge',
       'tickets:read',
       'reports:read', 'reports:write',
-      'sites:read',
-      'topology:read', 'topology:write',
+      'sites:read', 'sites:set_location',
+      'topology:read', 'topology:write', 'topology:execute',
       'remote:access',
       // AI chat (#6396): a technician can run scripts and manage devices over
       // HTTP; the per-tool map bounds chat to exactly the same permissions.
@@ -480,7 +528,9 @@ export const SYSTEM_ROLES: readonly SystemRoleDefinition[] = [
       // and calling mutating external tools stay admin actions.
       'external_tools:use',
       // Org document library (service deliverables W03).
-      'documents:read', 'documents:write'
+      'documents:read', 'documents:write',
+      // Webhook configuration and delivery history (managing them is organizations:write).
+      'webhooks:read'
     ]
   },
   {
@@ -516,6 +566,7 @@ export const SYSTEM_ROLES: readonly SystemRoleDefinition[] = [
     permissions: [
       'devices:read',
       'organizations:read',
+      'client_ai_templates:read',
       'vulnerabilities:accept_risk'
     ]
   }

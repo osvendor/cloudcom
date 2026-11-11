@@ -81,6 +81,35 @@ describe('monitorKindFields (#5289, #5291)', () => {
       expect(expectStatus?.showWhen).toEqual({ key: 'checkType', equals: 'http_check' });
     });
 
+    it.each([
+      ['count', 'icmp_ping'],
+      ['expectBanner', 'tcp_port'],
+      ['method', 'http_check'],
+      ['expectedBody', 'http_check'],
+      ['followRedirects', 'http_check'],
+      ['verifySsl', 'http_check'],
+      ['recordType', 'dns_check'],
+      ['expectedValue', 'dns_check'],
+      ['nameserver', 'dns_check'],
+    ])('network_check %s is optional and limited to %s', (key, checkType) => {
+      expect(MONITOR_KIND_FIELDS.network_check.find((field) => field.key === key)).toMatchObject({
+        optional: true,
+        showWhen: { key: 'checkType', equals: checkType },
+      });
+    });
+
+    it('network_check preserves legacy ranges and exposes verdict controls', () => {
+      const fields = MONITOR_KIND_FIELDS.network_check;
+      expect(fields.find((field) => field.key === 'pollingIntervalSeconds')).toMatchObject({ min: 10, max: 86400 });
+      expect(fields.find((field) => field.key === 'timeoutSeconds')).toMatchObject({ min: 1, max: 300 });
+      expect(fields.find((field) => field.key === 'count')).toMatchObject({ min: 1, max: 20 });
+      expect(fields.find((field) => field.key === 'maxResponseMs')).toMatchObject({ min: 1, max: 600000, optional: true });
+      expect(fields.find((field) => field.key === 'degradedIsFailure')).toMatchObject({ kind: 'boolean' });
+      expect(defaultConditionFor('network_check')).toMatchObject({ degradedIsFailure: false });
+      expect(fields.map((field) => field.key)).not.toContain('packetSize');
+      expect(fields.map((field) => field.key)).not.toContain('headers');
+    });
+
     it('software_presence version field carries the expected showWhen', () => {
       const version = MONITOR_KIND_FIELDS.software_presence.find((f) => f.key === 'version');
       expect(version?.showWhen).toEqual({ key: 'presence', equals: 'version_below' });
@@ -96,6 +125,15 @@ describe('monitorKindFields (#5289, #5291)', () => {
 
     it('script omits the free-form parameters field', () => {
       expect(MONITOR_KIND_FIELDS.script.some((f) => f.key === 'parameters')).toBe(false);
+    });
+  });
+
+  describe('composite children (Task 12)', () => {
+    it.each(['service', 'process', 'network_check'] as const)('%s allows 100 consecutive failures', (kind) => {
+      expect(MONITOR_KIND_FIELDS[kind].find((field) => field.key === 'consecutiveFailures')).toMatchObject({
+        min: 1,
+        max: 100,
+      });
     });
   });
 });
@@ -122,7 +160,7 @@ describe('monitorKindFields locale coverage (sweep pass-3 G1-2)', () => {
     const missing: string[] = [];
     for (const kind of MONITOR_KINDS) {
       for (const field of MONITOR_KIND_FIELDS[kind as MonitorKind]) {
-        if (field.kind !== 'select') continue;
+        if (field.kind !== 'select' && field.kind !== 'multiselect') continue;
         const ns = SELECT_OPTION_NAMESPACE[`${kind}:${field.key}`] ?? SELECT_OPTION_NAMESPACE[field.key];
         for (const opt of field.options ?? []) {
           if (!ns || typeof resolve(`${ns}.${opt}`) !== 'string') missing.push(`${kind}.${field.key}=${opt} (ns=${ns ?? 'none'})`);

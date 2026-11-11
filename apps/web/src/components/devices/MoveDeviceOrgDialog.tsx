@@ -11,6 +11,7 @@ import { usePermissions } from '@/lib/permissions';
 import { canonicalMoveOrgResource, moveOrgRequestBody } from '../../lib/moveOrgResource';
 import { moveDeviceOrg } from '../../services/deviceActions';
 import '../../lib/i18n';
+import { useStableT } from '@/lib/i18n/useStableT';
 
 export interface MoveDeviceOrgDialogProps {
   open: boolean;
@@ -58,6 +59,7 @@ export default function MoveDeviceOrgDialog({
   onCompleted,
 }: MoveDeviceOrgDialogProps) {
   const { t } = useTranslation('devices');
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   const { can } = usePermissions();
   const organizations = useOrgStore((s) => s.organizations);
   const fetchOrganizations = useOrgStore((s) => s.fetchOrganizations);
@@ -123,10 +125,10 @@ export default function MoveDeviceOrgDialog({
         if (cancelled) return;
         setSites(list);
       })
-      .catch(() => { if (!cancelled) { setSites([]); setError(t('moveDeviceOrgDialog.genericError')); } })
+      .catch(() => { if (!cancelled) { setSites([]); setError(stableT('moveDeviceOrgDialog.genericError')); } })
       .finally(() => { if (!cancelled) setSitesLoading(false); });
     return () => { cancelled = true; };
-  }, [open, targetOrgId, t]);
+  }, [open, targetOrgId, stableT]);
 
   const tier: ReauthTier | null = useMemo(
     () =>
@@ -171,7 +173,18 @@ export default function MoveDeviceOrgDialog({
       onCompleted({ targetOrgId, targetOrgName });
       onClose();
     } catch (err) {
+      // The client gave up waiting, but the server keeps running the move
+      // transaction and may still commit it (#7988). Don't report a plain
+      // failure that invites an immediate retry. A proxy in front of the API
+      // giving up first (502/504, Cloudflare 524) means the same thing.
       const status = (err as { status?: number } | null)?.status;
+      if (
+        (err instanceof DOMException && (err.name === 'TimeoutError' || err.name === 'AbortError')) ||
+        status === 502 || status === 504 || status === 524
+      ) {
+        setError(t('moveDeviceOrgDialog.timeout'));
+        return;
+      }
       const errCode = (err as { code?: string } | null)?.code;
       if (status === 403 && errCode === 'STEP_UP_REQUIRED') {
         if (stepUpGrant) {
@@ -230,6 +243,14 @@ export default function MoveDeviceOrgDialog({
         setPhase('form');
         setCode('');
         setError(null);
+        return;
+      }
+      if (status === 409 && errCode === 'PAM_DEVICE_MOVE_ACTIVE') {
+        setError(t('moveDeviceOrgDialog.pamMoveActive'));
+        return;
+      }
+      if (status === 409 && errCode === 'PAM_DEVICE_MOVE_BLOCKED') {
+        setError(t('moveDeviceOrgDialog.pamMoveBlocked'));
         return;
       }
       setError((err as { message?: string } | null)?.message ?? t('moveDeviceOrgDialog.genericError'));

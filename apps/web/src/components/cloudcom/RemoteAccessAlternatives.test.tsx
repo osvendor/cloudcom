@@ -13,7 +13,7 @@ function response(body: unknown, status = 200) {
 
 describe('RemoteAccessAlternatives', () => {
   beforeEach(() => {
-    mocks.fetchWithAuth.mockReset();
+    mocks.fetchWithAuth.mockReset(); mocks.fetchWithAuth.mockResolvedValue(response({}, 404));
     mocks.showToast.mockReset();
   });
 
@@ -146,6 +146,7 @@ describe('RemoteAccessAlternatives', () => {
     mocks.fetchWithAuth
       .mockResolvedValueOnce(response(providers))
       .mockImplementationOnce(() => new Promise<Response>((resolve) => { resolveLaunch = resolve; }))
+      .mockResolvedValueOnce(response({}, 404))
       .mockResolvedValueOnce(response(providers));
     const popup = { close: vi.fn(), opener: null, document: { createElement: () => ({}), head: { appendChild: vi.fn() } }, location: { href: '' } };
     const open = vi.spyOn(window, 'open').mockReturnValue(popup as unknown as Window);
@@ -174,4 +175,24 @@ describe('RemoteAccessAlternatives', () => {
     await waitFor(() => expect(screen.queryByText('Old device tool')).toBeNull());
     expect(screen.queryByTestId('remote-access-alternatives')).toBeNull();
   });
+});
+
+it.each([200, 403])('managed RustDesk handoff uses staff authorization and never falls back on denial (%s)', async status => {
+  const id = '11111111-1111-4111-8111-111111111111';
+  mocks.fetchWithAuth.mockReset();
+  mocks.fetchWithAuth
+    .mockResolvedValueOnce(response({ providers: [{ id: 'rustdesk', name: 'RustDesk', available: true, skipReason: null }] }))
+    .mockResolvedValueOnce(response({ launchUrl: 'rustdesk://503234560', providerId: 'rustdesk', scheme: 'rustdesk' }))
+    .mockResolvedValueOnce(response(status === 200 ? { launchUrl: `cloudcom-remote://staff/connect/${id}` } : { error: 'denied' }, status));
+  const popup = { close: vi.fn(), opener: null, document: { createElement: () => ({}), head: { appendChild: vi.fn() } }, location: { href: '' } };
+  const open = vi.spyOn(window, 'open').mockReturnValue(popup as unknown as Window);
+  const destinations: string[] = [];
+  const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function(this: HTMLAnchorElement) { destinations.push(this.href); });
+  render(<RemoteAccessAlternatives deviceId={id} />);
+  fireEvent.click(screen.getByTestId('other-remote-tools-button'));
+  fireEvent.click(await screen.findByTestId('remote-access-option-rustdesk'));
+  await waitFor(() => expect(mocks.fetchWithAuth).toHaveBeenCalledWith(`/staff-native/launch/${id}`, { method: 'POST' }));
+  await waitFor(() => expect(mocks.showToast).toHaveBeenCalled());
+  expect(destinations).toEqual(status === 200 ? [`cloudcom-remote://staff/connect/${id}`] : []);
+  open.mockRestore(); click.mockRestore();
 });

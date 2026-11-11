@@ -5,7 +5,6 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const selectMock = vi.fn();
 const insertMock = vi.fn();
 const updateMock = vi.fn();
-const resolveLlmConfigForOrgMock = vi.fn();
 
 vi.mock('../db', () => ({
   db: {
@@ -16,6 +15,12 @@ vi.mock('../db', () => ({
   withSystemDbAccessContext: (fn: () => unknown) => fn(),
 }));
 
+// W01 #7599: session model validation reads the platform model registry.
+// This suite is about device binding, so the registry offers W00's list.
+vi.mock('./aiModels/platformModels', () => ({
+  isOfferablePlatformModel: async (model: string) =>
+    ['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-fable-5-1', 'claude-opus-4-8', 'claude-sonnet-4-6', 'claude-haiku-4-5', 'claude-fable-5'].includes(model),
+}));
 vi.mock('./effectiveSettings', () => ({
   getEffectiveAiBudget: vi.fn().mockResolvedValue({ maxTurnsPerSession: 50 }),
 }));
@@ -33,7 +38,7 @@ vi.mock('../db/schema', () => ({
 }));
 
 vi.mock('./aiAgentSystemPrompt', () => ({ AI_SYSTEM_PROMPT_BASE: 'base', AI_SYSTEM_PROMPT_TAIL: 'tail' }));
-vi.mock('./aiToolIndex', () => ({ composeStaticSystemPrompt: () => 'base\nindex\ntail' }));
+vi.mock('./aiToolIndex', () => ({ composeStaticSystemPrompt: () => 'base\nindex\ntail', renderPageContextToolBlocks: () => '', resolveToolIndexMode: () => 'lazy' }));
 vi.mock('./aiAgentSdkTools', () => ({ listChatSurfaceToolNames: () => [] }));
 vi.mock('./brainDeviceContext', () => ({ getActiveDeviceContext: vi.fn().mockResolvedValue(null) }));
 vi.mock('./llm/llmConfigResolver', () => ({
@@ -45,10 +50,21 @@ vi.mock('./llm/llmConfigResolver', () => ({
       this.name = 'LlmUnavailableError';
     }
   },
-  resolveLlmConfigForOrg: (...args: unknown[]) => resolveLlmConfigForOrgMock(...args),
+}));
+
+// W03 Task 9 (#7601): createSession picks its model through the registry.
+vi.mock('./aiModels/candidateLoader', () => ({ readOrgPartnerId: vi.fn(async () => 'partner-1') }));
+vi.mock('./aiModels/sessionModel', () => ({
+  chooseSessionModel: vi.fn(async () => ({
+    offeringId: 'off-1', offeringPartnerId: 'partner-1', options: null,
+    model: 'claude-sonnet-4-6', billingSource: 'platform',
+  })),
 }));
 
 import { createSession, handleApproval } from './aiAgent';
+import { chooseSessionModel } from './aiModels/sessionModel';
+import { readOrgPartnerId } from './aiModels/candidateLoader';
+import { LlmUnavailableError } from './llm/llmConfigResolver';
 
 const DEVICE_ID = '44444444-4444-4444-4444-444444444444';
 
@@ -71,44 +87,34 @@ const auth: any = {
 describe('createSession device binding', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    resolveLlmConfigForOrgMock.mockResolvedValue({
-      source: 'partner',
-      partnerId: 'partner-1',
-      apiKey: 'partner-key',
-      model: 'claude-opus-4-6',
-      configId: 'config-1',
-      configVersion: 2,
-    });
   });
 
-  it('resolves the provider before insert and stores the partner default model', async () => {
+  it('resolves the session model through the registry before insert (W03 #7601)', async () => {
     const valuesSpy = vi.fn().mockReturnValue({ returning: vi.fn().mockResolvedValue([{ id: 'sess-1' }]) });
     insertMock.mockReturnValueOnce({ values: valuesSpy });
 
     await createSession(auth, {});
 
-    expect(resolveLlmConfigForOrgMock).toHaveBeenCalledWith('org-111');
+    expect(vi.mocked(readOrgPartnerId)).toHaveBeenCalledWith('org-111');
+    expect(vi.mocked(chooseSessionModel)).toHaveBeenCalledWith({
+      partnerId: 'partner-1', orgId: 'org-111', userId: auth.user.id, surface: 'chat',
+    });
     expect(valuesSpy).toHaveBeenCalledWith(expect.objectContaining({
-      model: 'claude-opus-4-6',
-      billingSource: 'partner_key',
+      model: 'claude-sonnet-4-6', offeringId: 'off-1', offeringPartnerId: 'partner-1', billingSource: 'platform',
     }));
   });
 
-  it('preserves an explicit model over the resolved partner default', async () => {
+  it('passes no legacyModel to chooseSessionModel (W05)', async () => {
     const valuesSpy = vi.fn().mockReturnValue({ returning: vi.fn().mockResolvedValue([{ id: 'sess-1' }]) });
     insertMock.mockReturnValueOnce({ values: valuesSpy });
 
-    await createSession(auth, { model: 'claude-haiku-4-5' });
+    await createSession(auth, {});
 
-    expect(valuesSpy).toHaveBeenCalledWith(expect.objectContaining({ model: 'claude-haiku-4-5' }));
+    expect(vi.mocked(chooseSessionModel)).toHaveBeenCalledWith(expect.not.objectContaining({ legacyModel: expect.anything() }));
   });
 
-  it('throws ai_unavailable before insert when the org partner key is broken', async () => {
-    resolveLlmConfigForOrgMock.mockResolvedValueOnce({
-      source: 'unavailable',
-      partnerId: 'partner-1',
-      reason: 'key_error',
-    });
+  it('throws ai_unavailable before insert when the registry has no usable model', async () => {
+    vi.mocked(chooseSessionModel).mockRejectedValueOnce(new LlmUnavailableError());
 
     await expect(createSession(auth, {})).rejects.toMatchObject({
       name: 'LlmUnavailableError',

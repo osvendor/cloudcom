@@ -1,5 +1,11 @@
 import { useTranslation } from 'react-i18next';
 import { httpUrlErrorMessage } from '@breeze/shared';
+import InheritedField from '../shared/InheritedField';
+
+interface InheritedAddress {
+  line1: string | null; line2: string | null; city: string | null;
+  region: string | null; postalCode: string | null; country: string | null;
+}
 
 interface BillingDocumentsTabProps {
   autoEmailInvoice: boolean;
@@ -8,6 +14,14 @@ interface BillingDocumentsTabProps {
   setNotifyOnBehalfAcceptance: (v: boolean) => void;
   deviceAppendix: boolean;
   setDeviceAppendix: (v: boolean) => void;
+  lineShowDate: boolean;
+  setLineShowDate: (v: boolean) => void;
+  lineShowNote: boolean;
+  setLineShowNote: (v: boolean) => void;
+  lineShowWorkedTime: boolean;
+  setLineShowWorkedTime: (v: boolean) => void;
+  lineGrouping: 'entry' | 'day';
+  setLineGrouping: (v: 'entry' | 'day') => void;
   footer: string;
   setFooter: (v: string) => void;
   documentTheme: 'classic' | 'condensed';
@@ -35,6 +49,13 @@ interface BillingDocumentsTabProps {
   setCountry: (v: string) => void;
   terms: string;
   setTerms: (v: string) => void;
+  /** Resolved "company details" values (partners.name / settings.contact / settings.address)
+   *  — shown as the InheritedField placeholder/source when the corresponding letterhead
+   *  override is blank (#6228). Undefined/null when no company-details value is set either. */
+  inheritedCompanyName?: string | null;
+  inheritedPhone?: string | null;
+  inheritedWebsite?: string | null;
+  inheritedAddress?: InheritedAddress | null;
 }
 
 /**
@@ -44,12 +65,19 @@ interface BillingDocumentsTabProps {
  */
 export default function BillingDocumentsTab({
   autoEmailInvoice, setAutoEmailInvoice, notifyOnBehalfAcceptance, setNotifyOnBehalfAcceptance, deviceAppendix, setDeviceAppendix, footer, setFooter,
+  lineShowDate, setLineShowDate, lineShowNote, setLineShowNote, lineShowWorkedTime, setLineShowWorkedTime, lineGrouping, setLineGrouping,
   documentTheme, setDocumentTheme, documentPageSize, setDocumentPageSize,
   companyName, setCompanyName, phone, setPhone, website, setWebsite, websiteInvalid,
   addr1, setAddr1, addr2, setAddr2, city, setCity, region, setRegion, postal, setPostal,
   country, setCountry, terms, setTerms,
+  inheritedCompanyName = null, inheritedPhone = null, inheritedWebsite = null, inheritedAddress = null,
 }: BillingDocumentsTabProps) {
   const { t } = useTranslation('billing');
+  const inheritedSource = t('partnerBillingSettings.company.inheritedFromCompanyDetails');
+  const addressOverridden = [addr1, addr2, city, region, postal, country].some((f) => f.trim() !== '');
+  const useCompanyAddress = () => {
+    setAddr1(''); setAddr2(''); setCity(''); setRegion(''); setPostal(''); setCountry('');
+  };
   return (
     <>
       <section className="rounded-lg border bg-card p-6 shadow-xs">
@@ -101,6 +129,54 @@ export default function BillingDocumentsTab({
             {t('partnerBillingSettings.defaults.deviceAppendixHelp')}
           </p>
         </div>
+        {/* #8604: how time-entry lines print on customer invoices. One home for
+            the partner default; a draft invoice can override each field. */}
+        <fieldset className="mt-4">
+          <legend className="text-sm font-medium">{t('partnerBillingSettings.defaults.lineDetailTitle')}</legend>
+          <p className="mt-1 text-xs text-muted-foreground">{t('partnerBillingSettings.defaults.lineDetailHelp')}</p>
+          <div className="mt-2 space-y-2">
+            <label className="flex cursor-pointer items-center gap-2">
+              <input
+                type="checkbox" checked={lineShowDate}
+                onChange={(e) => setLineShowDate(e.target.checked)}
+                data-testid="partner-billing-line-show-date"
+                className="h-4 w-4 rounded border"
+              />
+              <span className="text-sm">{t('partnerBillingSettings.defaults.lineShowDate')}</span>
+            </label>
+            <label className="flex cursor-pointer items-center gap-2">
+              <input
+                type="checkbox" checked={lineShowNote}
+                onChange={(e) => setLineShowNote(e.target.checked)}
+                data-testid="partner-billing-line-show-note"
+                className="h-4 w-4 rounded border"
+              />
+              <span className="text-sm">{t('partnerBillingSettings.defaults.lineShowNote')}</span>
+            </label>
+            <label className="flex cursor-pointer items-center gap-2">
+              <input
+                type="checkbox" checked={lineShowWorkedTime}
+                onChange={(e) => setLineShowWorkedTime(e.target.checked)}
+                data-testid="partner-billing-line-show-worked-time"
+                className="h-4 w-4 rounded border"
+              />
+              <span className="text-sm">{t('partnerBillingSettings.defaults.lineShowWorkedTime')}</span>
+            </label>
+            <div className="sm:max-w-xs">
+              <label className="text-sm font-medium" htmlFor="pb-line-grouping">{t('partnerBillingSettings.defaults.lineGrouping')}</label>
+              <select
+                id="pb-line-grouping" value={lineGrouping}
+                disabled={!lineShowDate}
+                onChange={(e) => setLineGrouping(e.target.value === 'day' ? 'day' : 'entry')}
+                data-testid="partner-billing-line-grouping"
+                className="mt-1 w-full rounded-md border bg-background px-3 py-1.5 text-sm disabled:opacity-60"
+              >
+                <option value="entry">{t('partnerBillingSettings.defaults.lineGroupingEntry')}</option>
+                <option value="day">{t('partnerBillingSettings.defaults.lineGroupingDay')}</option>
+              </select>
+            </div>
+          </div>
+        </fieldset>
         <div className="mt-4 grid gap-4 sm:grid-cols-2">
           <div>
             <label className="text-sm font-medium" htmlFor="pb-document-theme">{t('partnerBillingSettings.defaults.documentTheme')}</label>
@@ -133,8 +209,14 @@ export default function BillingDocumentsTab({
             id="pb-footer" rows={3} value={footer}
             onChange={(e) => setFooter(e.target.value)} placeholder={t('partnerBillingSettings.defaults.invoiceFooterPlaceholder')}
             data-testid="partner-billing-footer"
+            aria-describedby="pb-footer-help"
             className="mt-1 w-full rounded-md border bg-background px-3 py-2 text-sm"
           />
+          {/* #7510: the PARTNER level of the one document-footer chain
+              (resolveDocumentFooter): document line → org footer → this. */}
+          <p id="pb-footer-help" data-testid="partner-billing-footer-help" className="mt-1 text-xs text-muted-foreground">
+            {t('partnerBillingSettings.defaults.invoiceFooterHelp')}
+          </p>
         </div>
       </section>
 
@@ -144,33 +226,37 @@ export default function BillingDocumentsTab({
           {t('partnerBillingSettings.company.description')}
         </p>
         <div className="mt-4">
-          <label className="text-sm font-medium" htmlFor="pb-company">{t('partnerBillingSettings.company.name')}</label>
-          <input
-            id="pb-company" type="text" value={companyName}
-            onChange={(e) => setCompanyName(e.target.value)}
+          <InheritedField
+            id="pb-company"
+            label={t('partnerBillingSettings.company.name')}
+            value={companyName}
+            onChange={setCompanyName}
+            inheritedValue={inheritedCompanyName}
+            inheritedSource={inheritedSource}
             data-testid="partner-billing-company-name"
-            className="mt-1 w-full rounded-md border bg-background px-3 py-2 text-sm"
           />
         </div>
         <div className="mt-4 grid gap-4 sm:grid-cols-2">
+          <InheritedField
+            id="pb-phone"
+            label={t('partnerBillingSettings.company.phone')}
+            value={phone}
+            onChange={setPhone}
+            inheritedValue={inheritedPhone}
+            inheritedSource={inheritedSource}
+            data-testid="partner-billing-phone"
+          />
           <div>
-            <label className="text-sm font-medium" htmlFor="pb-phone">{t('partnerBillingSettings.company.phone')}</label>
-            <input
-              id="pb-phone" type="text" value={phone}
-              onChange={(e) => setPhone(e.target.value)}
-              data-testid="partner-billing-phone"
-              className="mt-1 w-full rounded-md border bg-background px-3 py-2 text-sm"
-            />
-          </div>
-          <div>
-            <label className="text-sm font-medium" htmlFor="pb-website">{t('partnerBillingSettings.company.website')}</label>
-            <input
-              id="pb-website" type="text" value={website}
-              onChange={(e) => setWebsite(e.target.value)}
+            <InheritedField
+              id="pb-website"
+              label={t('partnerBillingSettings.company.website')}
+              value={website}
+              onChange={setWebsite}
+              inheritedValue={inheritedWebsite}
+              inheritedSource={inheritedSource}
               data-testid="partner-billing-website"
-              aria-invalid={websiteInvalid || undefined}
-              aria-describedby={websiteInvalid ? 'pb-website-error' : undefined}
-              className="mt-1 w-full rounded-md border bg-background px-3 py-2 text-sm"
+              ariaInvalid={websiteInvalid}
+              ariaDescribedBy={websiteInvalid ? 'pb-website-error' : undefined}
             />
             {websiteInvalid && (
               <p id="pb-website-error" data-testid="partner-billing-website-error" className="mt-1 text-sm text-destructive">
@@ -179,10 +265,28 @@ export default function BillingDocumentsTab({
             )}
           </div>
         </div>
-        <div className="mt-4">
+        <div className="mt-4 flex items-center justify-between gap-2">
+          <p className="text-sm font-medium">{t('partnerBillingSettings.company.addressTitle')}</p>
+          {addressOverridden ? (
+            <button
+              type="button"
+              onClick={useCompanyAddress}
+              data-testid="partner-billing-use-company-address"
+              className="text-xs font-medium text-primary underline hover:no-underline"
+            >
+              {t('partnerBillingSettings.company.useCompanyAddress')}
+            </button>
+          ) : inheritedAddress ? (
+            <p className="text-xs text-muted-foreground" data-testid="partner-billing-address-inherited-note">
+              {t('partnerBillingSettings.company.addressInherited')}
+            </p>
+          ) : null}
+        </div>
+        <div className="mt-2">
           <label className="text-sm font-medium" htmlFor="pb-addr1">{t('partnerBillingSettings.company.addressLine1')}</label>
           <input
             id="pb-addr1" type="text" value={addr1}
+            placeholder={inheritedAddress?.line1 ?? undefined}
             onChange={(e) => setAddr1(e.target.value)}
             data-testid="partner-billing-addr1"
             className="mt-1 w-full rounded-md border bg-background px-3 py-2 text-sm"
@@ -192,6 +296,7 @@ export default function BillingDocumentsTab({
           <label className="text-sm font-medium" htmlFor="pb-addr2">{t('partnerBillingSettings.company.addressLine2')}</label>
           <input
             id="pb-addr2" type="text" value={addr2}
+            placeholder={inheritedAddress?.line2 ?? undefined}
             onChange={(e) => setAddr2(e.target.value)}
             data-testid="partner-billing-addr2"
             className="mt-1 w-full rounded-md border bg-background px-3 py-2 text-sm"
@@ -202,6 +307,7 @@ export default function BillingDocumentsTab({
             <label className="text-sm font-medium" htmlFor="pb-city">{t('partnerBillingSettings.company.city')}</label>
             <input
               id="pb-city" type="text" value={city}
+              placeholder={inheritedAddress?.city ?? undefined}
               onChange={(e) => setCity(e.target.value)}
               data-testid="partner-billing-city"
               className="mt-1 w-full rounded-md border bg-background px-3 py-2 text-sm"
@@ -211,6 +317,7 @@ export default function BillingDocumentsTab({
             <label className="text-sm font-medium" htmlFor="pb-region">{t('partnerBillingSettings.company.region')}</label>
             <input
               id="pb-region" type="text" value={region}
+              placeholder={inheritedAddress?.region ?? undefined}
               onChange={(e) => setRegion(e.target.value)}
               data-testid="partner-billing-region"
               className="mt-1 w-full rounded-md border bg-background px-3 py-2 text-sm"
@@ -220,6 +327,7 @@ export default function BillingDocumentsTab({
             <label className="text-sm font-medium" htmlFor="pb-postal">{t('partnerBillingSettings.company.postal')}</label>
             <input
               id="pb-postal" type="text" value={postal}
+              placeholder={inheritedAddress?.postalCode ?? undefined}
               onChange={(e) => setPostal(e.target.value)}
               data-testid="partner-billing-postal"
               className="mt-1 w-full rounded-md border bg-background px-3 py-2 text-sm"
@@ -230,6 +338,7 @@ export default function BillingDocumentsTab({
           <label className="text-sm font-medium" htmlFor="pb-country">{t('partnerBillingSettings.company.country')}</label>
           <input
             id="pb-country" type="text" maxLength={2} value={country}
+            placeholder={inheritedAddress?.country ?? undefined}
             onChange={(e) => setCountry(e.target.value.toUpperCase())}
             data-testid="partner-billing-country"
             className="mt-1 w-full rounded-md border bg-background px-3 py-2 text-sm uppercase"

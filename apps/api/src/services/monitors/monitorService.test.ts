@@ -1,4 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { PgDialect } from 'drizzle-orm/pg-core';
+import { monitorConversions, monitorDefinitions, networkMonitors } from '../../db/schema';
 
 // Every assertion below fails BEFORE any DB work (ownership and shape checks
 // run first, deliberately), so the db module only needs to exist.
@@ -32,6 +34,8 @@ import {
   updateMonitorDefinition,
   deleteMonitorDefinition,
   getMonitorDefinition,
+  listMonitorDefinitions,
+  listMonitorDefinitionsPage,
   MonitorHasDependentsError,
   MonitorOwnershipError,
   MonitorValidationError,
@@ -427,7 +431,7 @@ it('creates a system monitor with a null actor using the supplied executor throu
     expect(executor.select).toHaveBeenCalledTimes(2);
     expect(executor.transaction).toHaveBeenCalledTimes(1);
     expect(tx.insert).toHaveBeenCalledTimes(1);
-    expect(compile).toHaveBeenCalledWith(tx, created);
+    expect(compile).toHaveBeenCalledWith(tx, created, {});
     expect(result).toMatchObject({ createdBy: null, compiledAlertRuleId: 'rule-1' });
     expect(dbMock.select).not.toHaveBeenCalled();
     expect(dbMock.transaction).not.toHaveBeenCalled();
@@ -439,17 +443,25 @@ it('creates a system monitor with a null actor using the supplied executor throu
 
 
 describe('conversion executor propagation', () => {
-  it('reads and deletes only through the caller executor', async () => {
-    const row = existingRow();
+  it.each(['cpu', 'network_check'])('deletes an unadopted %s monitor only through the caller executor', async (kind) => {
+    const row = existingRow({ kind });
     const where = vi.fn(async () => undefined);
+    const tx = {
+      select: vi.fn(() => ({ from: (table: unknown) => ({ where: () => {
+        const query = { orderBy: () => query, for: async () => table === monitorDefinitions ? [row] : [] };
+        return query;
+      } }) })),
+      delete: vi.fn(() => ({ where })),
+    };
     const executor = {
       select: vi.fn(() => ({ from: () => ({ where: () => ({ limit: async () => [row] }) }) })),
-      delete: vi.fn(() => ({ where })),
+      transaction: vi.fn(async (work: (value: typeof tx) => Promise<void>) => work(tx)),
     };
     expect(await getMonitorDefinition('monitor-1', auth(), executor as never)).toEqual(row);
     await deleteMonitorDefinition('monitor-1', auth(), executor as never);
     expect(executor.select).toHaveBeenCalledTimes(2);
-    expect(executor.delete).toHaveBeenCalledTimes(1);
+    expect(tx.delete).toHaveBeenCalledTimes(1);
+    expect(executor.transaction).toHaveBeenCalledOnce();
     expect(dbMock.select).not.toHaveBeenCalled();
     expect(dbMock.delete).not.toHaveBeenCalled();
   });
@@ -475,9 +487,16 @@ describe('deleteMonitorDefinition: dependent-row FK violation (#6509)', () => {
     const where = vi.fn(async () => {
       throw pgForeignKeyError;
     });
+    const tx = {
+      select: vi.fn(() => ({ from: (table: unknown) => ({ where: () => {
+        const query = { orderBy: () => query, for: async () => table === monitorDefinitions ? [row] : [] };
+        return query;
+      } }) })),
+      delete: vi.fn(() => ({ where })),
+    };
     const executor = {
       select: vi.fn(() => ({ from: () => ({ where: () => ({ limit: async () => [row] }) }) })),
-      delete: vi.fn(() => ({ where })),
+      transaction: vi.fn(async (work: (value: typeof tx) => Promise<void>) => work(tx)),
     };
 
     await expect(
@@ -491,13 +510,662 @@ describe('deleteMonitorDefinition: dependent-row FK violation (#6509)', () => {
     const where = vi.fn(async () => {
       throw otherError;
     });
+    const tx = {
+      select: vi.fn(() => ({ from: (table: unknown) => ({ where: () => {
+        const query = { orderBy: () => query, for: async () => table === monitorDefinitions ? [row] : [] };
+        return query;
+      } }) })),
+      delete: vi.fn(() => ({ where })),
+    };
     const executor = {
       select: vi.fn(() => ({ from: () => ({ where: () => ({ limit: async () => [row] }) }) })),
-      delete: vi.fn(() => ({ where })),
+      transaction: vi.fn(async (work: (value: typeof tx) => Promise<void>) => work(tx)),
     };
 
     await expect(
       deleteMonitorDefinition('monitor-1', auth(), executor as never),
     ).rejects.toBe(otherError);
+  });
+});
+
+describe('Fleet Design savepoint executor propagation (W05c2 Task 16)', () => {
+  it('forwards the exact compile options through the extracted create helper', async () => {
+    const row = existingRow();
+    const values = vi.fn(() => ({ returning: async () => [row] }));
+    const tx = { insert: vi.fn(() => ({ values })) };
+    const executor = { transaction: vi.fn(async (work: (value: typeof tx) => Promise<unknown>) => work(tx)) };
+    const options: monitorCompiler.CompileOptions = {};
+    const compile = vi.spyOn(monitorCompiler, 'compileMonitorInTx').mockResolvedValue({
+      alertTemplateId: 'template', alertRuleId: 'rule', automationId: 'automation', hash: 'hash',
+    } as Awaited<ReturnType<typeof monitorCompiler.compileMonitorInTx>>);
+    try {
+      await createMonitorDefinition(input(), auth(), options,
+        executor as unknown as Parameters<typeof createMonitorDefinition>[3]);
+      expect(executor.transaction).toHaveBeenCalledOnce();
+      expect(compile).toHaveBeenCalledWith(tx, row, options);
+      expect(compile.mock.calls[0]![2]).toBe(options);
+      expect(dbMock.select).not.toHaveBeenCalled();
+      expect(dbMock.transaction).not.toHaveBeenCalled();
+    } finally { compile.mockRestore(); }
+  });
+
+  it('uses the supplied executor for update reads, reference validation and compilation', async () => {
+    const row = existingRow({ escalationPolicyId: ESCALATION_POLICY });
+    const query = (result: unknown[]) => ({ from: () => ({ where: () => ({ limit: async () => result }) }) });
+    const select = vi.fn().mockReturnValueOnce(query([row]))
+      .mockReturnValueOnce(query([{ orgId: null, partnerId: PARTNER }]))
+      .mockReturnValueOnce(query([{ partnerId: PARTNER }]));
+    const updated = { ...row, description: 'Fleet provenance' };
+    const set = vi.fn(() => ({ where: () => ({ returning: async () => [updated] }) }));
+    const tx = { update: vi.fn(() => ({ set })) };
+    const executor = { select, transaction: vi.fn(async (work: (value: typeof tx) => Promise<unknown>) => work(tx)) };
+    const compile = vi.spyOn(monitorCompiler, 'compileMonitorInTx').mockResolvedValue({
+      alertTemplateId: 'template', alertRuleId: 'rule', automationId: 'automation', hash: 'updated-hash',
+    } as Awaited<ReturnType<typeof monitorCompiler.compileMonitorInTx>>);
+    try {
+      await expect(updateMonitorDefinition(row.id as string, { description: 'Fleet provenance' }, auth(),
+        executor as unknown as Parameters<typeof updateMonitorDefinition>[3]))
+        .resolves.toMatchObject({ description: 'Fleet provenance', compiledHash: 'updated-hash' });
+      expect(select).toHaveBeenCalledTimes(3);
+      expect(executor.transaction).toHaveBeenCalledOnce();
+      expect(compile).toHaveBeenCalledWith(tx, updated);
+      expect(dbMock.select).not.toHaveBeenCalled();
+      expect(dbMock.transaction).not.toHaveBeenCalled();
+    } finally { compile.mockRestore(); }
+  });
+});
+
+describe('monitor lifecycle overrides (alert re-arm W2, #10765)', () => {
+  function createExecutor(created: Record<string, unknown>) {
+    const values = vi.fn().mockReturnValue({ returning: async () => [created] });
+    const tx = { insert: vi.fn().mockReturnValue({ values }) };
+    const executor = {
+      select: vi.fn(),
+      transaction: vi.fn(async (callback: (transaction: typeof tx) => unknown) => callback(tx)),
+    };
+    return { values, executor };
+  }
+
+  function updateExecutor(row: Record<string, unknown>) {
+    const query = (result: unknown[]) => ({ from: () => ({ where: () => ({ limit: async () => result }) }) });
+    const select = vi.fn().mockReturnValue(query([row]));
+    const set = vi.fn((_values: Record<string, unknown>) => ({ where: () => ({ returning: async () => [row] }) }));
+    const tx = { update: vi.fn(() => ({ set })) };
+    return { set, executor: { select, transaction: vi.fn(async (work: (value: typeof tx) => Promise<unknown>) => work(tx)) } };
+  }
+
+  async function withCompileStub<T>(work: () => Promise<T>): Promise<T> {
+    const compile = vi.spyOn(monitorCompiler, 'compileMonitorInTx').mockResolvedValue({
+      alertTemplateId: 'template', alertRuleId: 'rule', automationId: 'automation', hash: 'hash',
+    } as Awaited<ReturnType<typeof monitorCompiler.compileMonitorInTx>>);
+    try { return await work(); } finally { compile.mockRestore(); }
+  }
+
+  it('create without cooldownMinutes stores null (inherit)', async () => {
+    const { values, executor } = createExecutor(existingRow());
+    await withCompileStub(() => createMonitorDefinition(
+      input({ cooldownMinutes: undefined, autoResolve: undefined }), auth(), {},
+      executor as unknown as monitorCompiler.DbExecutor,
+    ));
+    expect(values).toHaveBeenCalledWith(expect.objectContaining({
+      cooldownMinutes: null, autoResolve: null, rearmMode: null, rearmDelayMinutes: null,
+    }));
+  });
+
+  it('create stores explicit overrides, including 0 and false', async () => {
+    const { values, executor } = createExecutor(existingRow());
+    await withCompileStub(() => createMonitorDefinition(
+      input({ cooldownMinutes: 0, autoResolve: false, rearmMode: 'after_delay', rearmDelayMinutes: 30 }), auth(), {},
+      executor as unknown as monitorCompiler.DbExecutor,
+    ));
+    expect(values).toHaveBeenCalledWith(expect.objectContaining({
+      cooldownMinutes: 0, autoResolve: false, rearmMode: 'after_delay', rearmDelayMinutes: 30,
+    }));
+  });
+
+  const patch = async (row: Record<string, unknown>, update: Record<string, unknown>) => {
+    const { set, executor } = updateExecutor(row);
+    await withCompileStub(() => updateMonitorDefinition(row.id as string, update,
+      auth(), executor as unknown as Parameters<typeof updateMonitorDefinition>[3]));
+    return set.mock.calls[0]![0];
+  };
+
+  it('update omitting cooldownMinutes leaves it unchanged', async () => {
+    const row = existingRow({ cooldownMinutes: 10, autoResolve: true, rearmMode: 'after_delay', rearmDelayMinutes: 30 });
+    expect(await patch(row, { description: 'x' })).toMatchObject({
+      cooldownMinutes: 10, autoResolve: true, rearmMode: 'after_delay', rearmDelayMinutes: 30,
+    });
+  });
+
+  it('update with null saves inherit, where it used to keep the stored value', async () => {
+    const row = existingRow({ cooldownMinutes: 10, autoResolve: true });
+    expect(await patch(row, { cooldownMinutes: null, autoResolve: null })).toMatchObject({
+      cooldownMinutes: null, autoResolve: null,
+    });
+  });
+
+  it('clearing the re-arm mode clears its delay too, so the pair CHECK holds', async () => {
+    const row = existingRow({ rearmMode: 'after_delay', rearmDelayMinutes: 30 });
+    expect(await patch(row, { rearmMode: null })).toMatchObject({ rearmMode: null, rearmDelayMinutes: null });
+    expect(await patch(row, { rearmMode: 'new_evidence' })).toMatchObject({ rearmMode: 'new_evidence', rearmDelayMinutes: null });
+  });
+
+  it('a delay-only patch adjusts an after_delay monitor', async () => {
+    const row = existingRow({ rearmMode: 'after_delay', rearmDelayMinutes: 30 });
+    expect(await patch(row, { rearmDelayMinutes: 45 })).toMatchObject({ rearmMode: 'after_delay', rearmDelayMinutes: 45 });
+  });
+
+  it('a delay-only patch on a monitor that is not after_delay is rejected on the merged row', async () => {
+    const row = existingRow({ rearmMode: null, rearmDelayMinutes: null });
+    await expect(patch(row, { rearmDelayMinutes: 45 })).rejects.toBeInstanceOf(MonitorValidationError);
+  });
+});
+
+describe('listMonitorDefinitions / listMonitorDefinitionsPage paging (#6735)', () => {
+  /** A select chain that records every builder call and resolves to `rows`. */
+  function recordingChain(rows: unknown[]) {
+    type Method = 'from' | 'where' | 'orderBy' | 'limit' | 'offset' | 'leftJoin';
+    const calls: Record<Method, unknown[][]> = { from: [], where: [], orderBy: [], limit: [], offset: [], leftJoin: [] };
+    const chain: Record<string, unknown> = {};
+    for (const method of Object.keys(calls) as Method[]) {
+      chain[method] = vi.fn((...args: unknown[]) => { calls[method].push(args); return chain; });
+    }
+    // A subquery alias: exposes a `total` field for the outer projection.
+    chain.as = vi.fn(() => ({ total: 'counted.total' }));
+    const executed = { count: 0 };
+    chain.then = (resolve: (v: unknown) => unknown, reject: (e: unknown) => unknown) => {
+      executed.count++;
+      return Promise.resolve(rows).then(resolve, reject);
+    };
+    return { chain, calls, executed };
+  }
+
+  /** The three builders listMonitorDefinitionsPage makes: count, page ids, outer statement. */
+  function pageChains(outerRows: unknown[]) {
+    const counted = recordingChain([]);
+    const pageIds = recordingChain([]);
+    const outer = recordingChain(outerRows);
+    dbMock.select
+      .mockReturnValueOnce(counted.chain)
+      .mockReturnValueOnce(pageIds.chain)
+      .mockReturnValueOnce(outer.chain);
+    return { counted, pageIds, outer };
+  }
+
+  it('without a page argument issues no LIMIT/OFFSET and keeps the name-only ordering', async () => {
+    const { chain, calls } = recordingChain([{ id: 'a' }]);
+    dbMock.select.mockReturnValue(chain);
+
+    const rows = await listMonitorDefinitions(auth(), { kind: 'cpu' });
+
+    expect(rows).toEqual([{ id: 'a' }]);
+    expect(calls.limit).toHaveLength(0);
+    expect(calls.offset).toHaveLength(0);
+    expect(calls.orderBy).toHaveLength(1);
+    expect(calls.orderBy[0]).toHaveLength(1);
+  });
+
+  it('executes ONE statement: a count LEFT JOINed to the LIMIT/OFFSET page, over the same WHERE, with an id tiebreaker', async () => {
+    const { counted, pageIds, outer } = pageChains([
+      { total: 60, row: { id: 'a' } },
+      { total: 60, row: { id: 'b' } },
+    ]);
+
+    const out = await listMonitorDefinitionsPage(auth(), { kind: 'cpu', enabled: true }, { limit: 25, offset: 50 });
+
+    expect(out).toEqual({ rows: [{ id: 'a' }, { id: 'b' }], total: 60 });
+    // Only the outer builder is executed; the other two are embedded in it,
+    // so the page and its total come from one snapshot.
+    expect(outer.executed.count).toBe(1);
+    expect(counted.executed.count).toBe(0);
+    expect(pageIds.executed.count).toBe(0);
+    expect(dbMock.select).toHaveBeenCalledTimes(3);
+    expect(outer.calls.leftJoin).toHaveLength(1);
+    expect(pageIds.calls.limit).toEqual([[25]]);
+    expect(pageIds.calls.offset).toEqual([[50]]);
+    expect(pageIds.calls.orderBy[0]).toHaveLength(2);
+    expect(outer.calls.orderBy[0]).toHaveLength(2);
+    // The count is never paged, and it counts over exactly the page's WHERE.
+    expect(counted.calls.limit).toHaveLength(0);
+    expect(counted.calls.offset).toHaveLength(0);
+    expect(counted.calls.where[0]).toEqual(pageIds.calls.where[0]);
+    expect(counted.calls.where[0]![0]).toBeDefined();
+  });
+
+  it('an empty page past the end still carries the total from the same statement', async () => {
+    const { outer } = pageChains([{ total: 42, row: null }]);
+    const out = await listMonitorDefinitionsPage(auth(), { kind: 'cpu', enabled: false }, { limit: 10, offset: 500 });
+    expect(out).toEqual({ rows: [], total: 42 });
+    expect(outer.executed.count).toBe(1);
+    expect(dbMock.select).toHaveBeenCalledTimes(3);
+  });
+
+  it('nothing visible is an empty page with total 0, not NaN', async () => {
+    pageChains([{ total: 0, row: null }]);
+    expect(await listMonitorDefinitionsPage(auth(), undefined, { limit: 25, offset: 0 })).toEqual({ rows: [], total: 0 });
+  });
+
+  it('pages get the same display-safe projection as the unpaged list for an org-scope caller', async () => {
+    const partnerWide = {
+      id: 'pw', orgId: null, partnerId: PARTNER,
+      responses: [{ type: 'run_script', scriptId: 's1' }],
+      recurrenceActions: [{ type: 'run_script', scriptId: 's2' }],
+      deliveryChannelIds: ['c1'], escalationPolicyId: 'e1', aiAgentId: 'a1',
+    };
+    const ownOrg = { ...partnerWide, id: 'own', orgId: ORG, partnerId: null };
+    pageChains([{ total: 2, row: partnerWide }, { total: 2, row: ownOrg }]);
+
+    const out = await listMonitorDefinitionsPage(auth(), undefined, { limit: 25, offset: 0 });
+
+    expect(out.rows[0]).toMatchObject({
+      id: 'pw', responses: [], recurrenceActions: [], deliveryChannelIds: [], escalationPolicyId: null, aiAgentId: null,
+    });
+    // The caller's own org row is returned as stored.
+    expect(out.rows[1]).toEqual(ownOrg);
+  });
+});
+
+describe('network check asset ownership', () => {
+  const assetId = '33333333-3333-4333-8333-333333333333';
+  const condition = { checkType: 'icmp_ping', target: 'example.com', assetId };
+
+  it('create rejects an asset outside the definition org before writing', async () => {
+    mockSelectQueue([undefined]);
+    await expect(createMonitorDefinition(input({ kind: 'network_check', condition }), auth()))
+      .rejects.toThrow('asset_not_owned');
+    expect(dbMock.transaction).not.toHaveBeenCalled();
+    expect(dbMock.insert).not.toHaveBeenCalled();
+  });
+
+  it('create rejects partner-owned asset bindings without a lookup', async () => {
+    await expect(createMonitorDefinition(input({ ownerScope: 'partner', kind: 'network_check', condition }),
+      auth({ scope: 'partner', partnerOrgAccess: 'all' })))
+      .rejects.toThrow('asset_requires_org_owner');
+    expect(dbMock.select).not.toHaveBeenCalled();
+    expect(dbMock.transaction).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])('validates the merged update against its persisted owner (replacement=%s)', async (replacement) => {
+    mockSelectQueue([existingRow({ kind: 'network_check', condition }), undefined]);
+    await expect(updateMonitorDefinition('monitor-1', replacement ? { condition: { ...condition, assetId: OTHER_PARTNER } } : { name: 'Renamed' }, auth()))
+      .rejects.toThrow('asset_not_owned');
+    expect(dbMock.update).not.toHaveBeenCalled();
+    expect(dbMock.transaction).not.toHaveBeenCalled();
+  });
+
+  it('uses the supplied executor for asset validation and preserves validation errors', async () => {
+    const executor = {
+      select: vi.fn(() => ({ from: () => ({ where: () => ({ limit: async () => [] }) }) })),
+    };
+    await expect(createMonitorDefinition(input({ kind: 'network_check', condition }), auth(), {}, executor as never))
+      .rejects.toBeInstanceOf(MonitorValidationError);
+    expect(executor.select).toHaveBeenCalledTimes(1);
+    expect(dbMock.select).not.toHaveBeenCalled();
+  });
+});
+
+describe('deleteMonitorDefinition: adopted network history', () => {
+  it('locks the definition, then probes, then conversion ledgers before release', async () => {
+    const lockedTables: unknown[] = [];
+    const tx = {
+      select: vi.fn(() => ({ from: (table: unknown) => {
+        const tables = [table];
+        const query = {
+          innerJoin: (joined: unknown) => { tables.push(joined); return query; },
+          where: () => query,
+          orderBy: () => query,
+          for: async () => {
+            lockedTables.push(...tables);
+            if (table === monitorDefinitions) return [existingRow({ kind: 'network_check' })];
+            if (table === networkMonitors) return [{ id: 'legacy', orgId: ORG, conversionId: 'conversion', sourceState: {} }];
+            return [{ id: 'legacy', conversionId: 'conversion', sourceState: {} }];
+          },
+        };
+        return query;
+      } })),
+      update: vi.fn(() => ({ set: () => ({ where: async () => undefined }) })),
+      delete: vi.fn(() => ({ where: async () => undefined })),
+    };
+    const executor = {
+      select: vi.fn(() => ({ from: () => ({ where: () => ({ limit: async () => [existingRow({ kind: 'network_check' })] }) }) })),
+      transaction: vi.fn(async (work: (value: typeof tx) => Promise<void>) => work(tx)),
+    };
+    await deleteMonitorDefinition('monitor-1', auth(), executor as never);
+    expect(lockedTables.map((table) => table === monitorDefinitions ? 'definition' : table === networkMonitors ? 'probe' : 'ledger'))
+      .toEqual(['definition', 'probe', 'ledger']);
+  });
+
+  it('releases only live adoption sources and marks their ledger before deleting in the same transaction', async () => {
+    const writes: Array<{ table: unknown; values: Record<string, unknown> }> = [];
+    const predicates: unknown[] = [];
+    const tx = {
+      select: vi.fn(() => ({ from: (table: unknown) => ({ where: (predicate: unknown) => {
+        predicates.push(predicate);
+        const query = {
+          orderBy: () => query,
+          for: async () => table === monitorDefinitions ? [existingRow({ kind: 'network_check' })]
+            : table === networkMonitors ? [{ id: 'legacy', orgId: ORG }]
+              : [{ id: 'legacy', conversionId: 'conversion', sourceState: { name: 'Gateway' } }],
+        };
+        return query;
+      } }) })),
+      update: vi.fn((table: unknown) => ({ set: (values: Record<string, unknown>) => ({ where: async () => { writes.push({ table, values }); } }) })),
+      delete: vi.fn(() => ({ where: async () => {
+        expect(writes).toEqual([
+          { table: networkMonitors, values: { managedByMonitorId: null, isActive: false,
+            retiredAt: expect.any(Date), retiredReason: 'monitor_deleted', updatedAt: expect.any(Date) } },
+          { table: monitorConversions, values: { sourceState: { name: 'Gateway', sourceReleased: true } } },
+        ]);
+      } })),
+    };
+    const executor = {
+      select: vi.fn(() => ({ from: () => ({ where: () => ({ limit: async () => [existingRow({ kind: 'network_check' })] }) }) })),
+      delete: vi.fn(() => ({ where: async () => undefined })),
+      transaction: vi.fn(async (work: (value: typeof tx) => Promise<void>) => work(tx)),
+    };
+    await deleteMonitorDefinition('monitor-1', auth(), executor as never);
+    expect(executor.transaction).toHaveBeenCalledOnce();
+    expect(executor.delete).not.toHaveBeenCalled();
+    expect(tx.delete).toHaveBeenCalledWith(monitorDefinitions);
+    const probePredicate = new PgDialect().sqlToQuery(predicates[1] as never);
+    expect(probePredicate.sql).toContain('"managed_by_monitor_id" =');
+    expect(probePredicate.params).toContain('monitor-1');
+    const predicate = new PgDialect().sqlToQuery(predicates[2] as never);
+    expect(predicate.sql).toContain('"source_table" =');
+    expect(predicate.sql).toContain('"reverted_at" is null');
+    expect(predicate.params).toContain('legacy');
+    expect(predicate.params).toContain(ORG);
+    expect(predicate.params).toContain('network_monitors');
+  });
+});
+
+/**
+ * Display-safe projection of a partner-wide monitor for an org-scope reader.
+ * Action payloads, delivery routing and escalation/AI-agent wiring are
+ * stripped; everything else (id, name, condition, severity, ownership) stays
+ * intact so the org technician can still tell what the monitor does and that
+ * it exists.
+ */
+describe('monitor read projection for org-scope callers', () => {
+  function partnerWideRow(overrides: Record<string, unknown> = {}) {
+    return existingRow({
+      orgId: null,
+      partnerId: PARTNER,
+      responses: [{ type: 'execute_command', command: 'rm -rf /secret' }],
+      recurrenceActions: [{ type: 'run_script', parameters: { token: 'shh' } }],
+      deliveryChannelIds: ['channel-1'],
+      escalationPolicyId: ESCALATION_POLICY,
+      aiAgentId: 'agent-1',
+      ...overrides,
+    });
+  }
+
+  it('getMonitorDefinition strips action/delivery/escalation fields for an org-scope caller', async () => {
+    mockExisting(partnerWideRow());
+
+    const monitor = await getMonitorDefinition('monitor-1', auth());
+
+    expect(monitor).toMatchObject({
+      id: 'monitor-1',
+      orgId: null,
+      partnerId: PARTNER,
+      responses: [],
+      recurrenceActions: [],
+      deliveryChannelIds: [],
+      escalationPolicyId: null,
+      aiAgentId: null,
+    });
+  });
+
+  it('getMonitorDefinition returns the row unredacted for a partner-scope caller', async () => {
+    mockExisting(partnerWideRow());
+
+    const monitor = await getMonitorDefinition(
+      'monitor-1',
+      auth({ scope: 'partner', orgId: null, canAccessOrg: () => true }),
+    );
+
+    expect(monitor).toMatchObject({
+      responses: [{ type: 'execute_command', command: 'rm -rf /secret' }],
+      deliveryChannelIds: ['channel-1'],
+      escalationPolicyId: ESCALATION_POLICY,
+      aiAgentId: 'agent-1',
+    });
+  });
+
+  it('getMonitorDefinition leaves an org-owned row untouched for an org-scope caller', async () => {
+    mockExisting(existingRow({
+      orgId: ORG,
+      partnerId: null,
+      responses: [{ type: 'execute_command', command: 'echo hi' }],
+    }));
+
+    const monitor = await getMonitorDefinition('monitor-1', auth());
+
+    expect(monitor).toMatchObject({ responses: [{ type: 'execute_command', command: 'echo hi' }] });
+  });
+
+  it('listMonitorDefinitions strips action/delivery/escalation fields on partner-wide rows for an org-scope caller', async () => {
+    dbMock.select.mockReturnValue({
+      from: () => ({
+        where: () => ({
+          orderBy: () => Promise.resolve([partnerWideRow(), existingRow({ orgId: ORG, partnerId: null })]),
+        }),
+      }),
+    });
+
+    const rows = await listMonitorDefinitions(auth());
+
+    expect(rows[0]).toMatchObject({ orgId: null, responses: [], deliveryChannelIds: [], aiAgentId: null });
+    // The org-owned row (unaffected by the projection) keeps its own
+    // (empty-by-default) responses array untouched, confirming the
+    // redaction is keyed on `orgId === null`, not applied blanket to every
+    // row in the list.
+    expect(rows[1]).toMatchObject({ orgId: ORG, responses: [] });
+  });
+});
+
+describe('per-monitor PSA board override (#10528, W2-A)', () => {
+  const fullPartner = () => auth({ scope: 'partner', partnerId: PARTNER, partnerOrgAccess: 'all', orgId: null });
+  const stubCompile = () => vi.spyOn(monitorCompiler, 'compileMonitorInTx').mockResolvedValue({
+    alertTemplateId: 't', alertRuleId: 'r', automationId: 'a', hash: 'h',
+  } as Awaited<ReturnType<typeof monitorCompiler.compileMonitorInTx>>);
+
+  function captureUpdate(row: Record<string, unknown>) {
+    const query = (result: unknown[]) => ({ from: () => ({ where: () => ({ limit: async () => result }) }) });
+    const select = vi.fn().mockReturnValue(query([row]));
+    const set = vi.fn((values: Record<string, unknown>) => ({ where: () => ({ returning: async () => [{ ...row, ...values }] }) }));
+    const tx = { update: vi.fn(() => ({ set })) };
+    const executor = { select, transaction: vi.fn(async (work: (value: typeof tx) => Promise<unknown>) => work(tx)) };
+    return { executor: executor as unknown as Parameters<typeof updateMonitorDefinition>[3], set };
+  }
+
+  it('an org-scope caller cannot set a board on create', async () => {
+    await expect(createMonitorDefinition(input({ psaBoardId: 12 }), auth()))
+      .rejects.toBeInstanceOf(MonitorOwnershipError);
+    expect(dbMock.transaction).not.toHaveBeenCalled();
+  });
+
+  it('a partner user without full org access cannot set a board on an org monitor', async () => {
+    await expect(createMonitorDefinition(
+      input({ psaBoardId: 12 }),
+      auth({ scope: 'partner', partnerId: PARTNER, partnerOrgAccess: 'selected', accessibleOrgIds: [ORG] }),
+    )).rejects.toBeInstanceOf(MonitorOwnershipError);
+  });
+
+  it('a partner admin may set a board on an org-owned monitor (reaches the write)', async () => {
+    await expect(createMonitorDefinition(input({ orgId: ORG, psaBoardId: 12 }), fullPartner()))
+      .rejects.toThrow('transaction should not be reached in these cases');
+  });
+
+  it('a partner admin\'s board reaches the insert; an omitted board inserts null', async () => {
+    const compile = stubCompile();
+    try {
+      for (const [psaBoardId, expected] of [[12, 12], [undefined, null]] as const) {
+        const values = vi.fn((row: Record<string, unknown>) => ({ returning: async () => [{ ...existingRow(), ...row }] }));
+        const tx = { insert: vi.fn(() => ({ values })) };
+        const executor = { select: vi.fn(), transaction: vi.fn(async (work: (value: typeof tx) => Promise<unknown>) => work(tx)) };
+        await createMonitorDefinition(
+          input({ orgId: ORG, ...(psaBoardId !== undefined ? { psaBoardId } : {}) }),
+          fullPartner(),
+          {},
+          executor as unknown as Parameters<typeof createMonitorDefinition>[3],
+        );
+        expect(values).toHaveBeenCalledWith(expect.objectContaining({ psaBoardId: expected }));
+      }
+    } finally { compile.mockRestore(); }
+  });
+
+  it('an explicit null board is allowed for anyone (it sets nothing)', async () => {
+    await expect(createMonitorDefinition(input({ psaBoardId: null }), auth()))
+      .rejects.toThrow('transaction should not be reached in these cases');
+  });
+
+  it('an org-scope caller editing other fields keeps the stored board', async () => {
+    const row = existingRow({ psaBoardId: 12 });
+    const { executor, set } = captureUpdate(row);
+    const compile = stubCompile();
+    try {
+      await updateMonitorDefinition(row.id as string, { description: 'x' }, auth(), executor);
+      expect(set).toHaveBeenCalledWith(expect.objectContaining({ psaBoardId: 12 }));
+      // Re-sending the unchanged value is not a change either.
+      set.mockClear();
+      await updateMonitorDefinition(row.id as string, { psaBoardId: 12 } as UpdateMonitorDefinitionInput, auth(), executor);
+      expect(set).toHaveBeenCalledWith(expect.objectContaining({ psaBoardId: 12 }));
+    } finally { compile.mockRestore(); }
+  });
+
+  it('an org-scope caller cannot change or clear the board', async () => {
+    for (const psaBoardId of [14, null]) {
+      const { executor, set } = captureUpdate(existingRow({ psaBoardId: 12 }));
+      await expect(updateMonitorDefinition('monitor-1', { psaBoardId } as UpdateMonitorDefinitionInput, auth(), executor))
+        .rejects.toBeInstanceOf(MonitorOwnershipError);
+      expect(set).not.toHaveBeenCalled();
+    }
+  });
+
+  it('a partner admin can change and clear the board', async () => {
+    const compile = stubCompile();
+    try {
+      for (const psaBoardId of [14, null]) {
+        const { executor, set } = captureUpdate(existingRow({ psaBoardId: 12 }));
+        await updateMonitorDefinition('monitor-1', { psaBoardId } as UpdateMonitorDefinitionInput, fullPartner(), executor);
+        expect(set).toHaveBeenCalledWith(expect.objectContaining({ psaBoardId }));
+      }
+    } finally { compile.mockRestore(); }
+  });
+
+  it('is hidden from an org-scope viewer of a partner-wide monitor', async () => {
+    mockExisting(existingRow({ orgId: null, partnerId: PARTNER, psaBoardId: 12 }));
+    expect(await getMonitorDefinition('monitor-1', auth())).toMatchObject({ psaBoardId: null });
+  });
+});
+
+describe('recovery condition is checked against the MERGED kind (alert re-arm W3, #10935)', () => {
+  const EVENT_LOG_CONDITION = { category: 'application', level: 'warning', countThreshold: 1, windowMinutes: 60 };
+  const RECOVERY = { category: 'application', level: 'info', countThreshold: 1, windowMinutes: 60 };
+  const RAW_LEAF = { type: 'event_log', category: 'application', level: 'info', countThreshold: 1, windowMinutes: 60 };
+  const eventLogRow = (overrides: Record<string, unknown> = {}) =>
+    existingRow({ kind: 'event_log', condition: EVENT_LOG_CONDITION, ...overrides });
+  const patch = (body: Record<string, unknown>) =>
+    updateMonitorDefinition('monitor-1', body as UpdateMonitorDefinitionInput, auth());
+
+  // No real transaction body is needed: reaching the transaction is what proves validation passed.
+  beforeEach(() => {
+    dbMock.transaction.mockReset();
+    dbMock.transaction.mockImplementation((async () => ({ id: 'monitor-1' })) as never);
+  });
+
+  it('create refuses #10935\'s shape even when a caller skipped the schema', async () => {
+    await expect(createMonitorDefinition(
+      input({ kind: 'event_log', condition: EVENT_LOG_CONDITION, autoResolveConditions: { conditions: [RAW_LEAF] } }),
+      auth(),
+    )).rejects.toBeInstanceOf(MonitorValidationError);
+    expect(dbMock.transaction).not.toHaveBeenCalled();
+  });
+
+  it('create refuses a raw blob the update path would accept', async () => {
+    await expect(createMonitorDefinition(
+      input({ kind: 'event_log', condition: EVENT_LOG_CONDITION, autoResolveConditions: RAW_LEAF }),
+      auth(),
+    )).rejects.toBeInstanceOf(MonitorValidationError);
+    expect(dbMock.transaction).not.toHaveBeenCalled();
+  });
+
+  describe('what gets written', () => {
+    function captureWrite() {
+      const set = vi.fn((values: Record<string, unknown>) => ({
+        where: () => ({ returning: async () => [{ ...eventLogRow(), ...values }] }),
+      }));
+      const tx = { update: vi.fn(() => ({ set })) };
+      dbMock.transaction.mockImplementation((async (work: (value: typeof tx) => Promise<unknown>) => work(tx)) as never);
+      return set;
+    }
+    const compiled = { alertTemplateId: 't', alertRuleId: 'r', automationId: 'a', hash: 'h' };
+
+    it.each([
+      ['omitted keeps a stored raw blob', { name: 'Renamed' }, RAW_LEAF, RAW_LEAF],
+      ['omitted keeps a stored kind-shaped value', { name: 'Renamed' }, RECOVERY, RECOVERY],
+      ['null clears it', { autoResolveConditions: null }, RAW_LEAF, null],
+      ['a new value replaces it', { autoResolveConditions: RECOVERY }, RAW_LEAF, RECOVERY],
+    ])('%s', async (_name, body, stored, expected) => {
+      mockExisting(eventLogRow({ autoResolveConditions: stored }));
+      const set = captureWrite();
+      const compile = vi.spyOn(monitorCompiler, 'compileMonitorInTx').mockResolvedValue(compiled);
+      try {
+        await patch(body);
+        expect(set).toHaveBeenCalledWith(expect.objectContaining({ autoResolveConditions: expected }));
+      } finally {
+        compile.mockRestore();
+      }
+    });
+  });
+
+  it('a recovery-only patch on a cpu monitor is refused, though the schema cannot see the kind', async () => {
+    mockExisting(existingRow());
+    await expect(patch({ autoResolveConditions: RECOVERY })).rejects.toThrow(/autoResolveConditions/);
+    expect(dbMock.transaction).not.toHaveBeenCalled();
+  });
+
+  it('a recovery-only patch on an event_log monitor is accepted', async () => {
+    mockExisting(eventLogRow());
+    await patch({ autoResolveConditions: RECOVERY });
+    expect(dbMock.transaction).toHaveBeenCalledTimes(1);
+  });
+
+  it('changing the kind away from event_log re-checks the stored kind-shaped value', async () => {
+    mockExisting(eventLogRow({ autoResolveConditions: RECOVERY }));
+    await expect(patch({ kind: 'cpu', condition: { operator: 'gt', value: 90 } })).rejects.toThrow(/autoResolveConditions/);
+    expect(dbMock.transaction).not.toHaveBeenCalled();
+  });
+
+  it('changing the kind and clearing the recovery condition in one patch is accepted', async () => {
+    mockExisting(eventLogRow({ autoResolveConditions: RECOVERY }));
+    await patch({ kind: 'cpu', condition: { operator: 'gt', value: 90 }, autoResolveConditions: null });
+    expect(dbMock.transaction).toHaveBeenCalledTimes(1);
+  });
+
+  it('a stored raw blob survives a kind change: it was never kind-shaped', async () => {
+    mockExisting(eventLogRow({ autoResolveConditions: RAW_LEAF }));
+    await patch({ kind: 'cpu', condition: { operator: 'gt', value: 90 } });
+    expect(dbMock.transaction).toHaveBeenCalledTimes(1);
+  });
+
+  it('an unrelated edit never re-judges a stored value, even one that could not be saved today', async () => {
+    mockExisting(eventLogRow({ autoResolveConditions: { conditions: [RAW_LEAF] } }));
+    await patch({ name: 'Renamed', kind: 'event_log' });
+    expect(dbMock.transaction).toHaveBeenCalledTimes(1);
+  });
+
+  it('a raw blob sent in a patch must be one the condition handlers accept', async () => {
+    mockExisting(eventLogRow());
+    await expect(patch({ autoResolveConditions: { type: 'no_such_handler' } })).rejects.toThrow(/autoResolveConditions/);
+    expect(dbMock.transaction).not.toHaveBeenCalled();
+  });
+
+  it('an unchanged raw blob sent back in a patch is accepted', async () => {
+    mockExisting(eventLogRow({ autoResolveConditions: RAW_LEAF }));
+    await patch({ autoResolveConditions: RAW_LEAF });
+    expect(dbMock.transaction).toHaveBeenCalledTimes(1);
   });
 });

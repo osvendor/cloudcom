@@ -2,7 +2,9 @@ import { useState, useEffect, useCallback } from "react";
 import { Layers, Plus, RefreshCw, Globe } from "lucide-react";
 import { fetchWithAuth } from "../../stores/auth";
 import PeripheralPolicyForm from "./PeripheralPolicyForm";
+import { FilterSelect } from "../shared/FilterSelect";
 import { useTranslation } from "react-i18next";
+import { useStableT } from '@/lib/i18n/useStableT';
 
 type PeripheralPolicy = {
   id: string;
@@ -13,6 +15,12 @@ type PeripheralPolicy = {
   action: string;
   isActive: boolean;
   exceptions?: Array<Record<string, unknown>>;
+  targetType?: string;
+  targetIds?: {
+    siteIds?: string[];
+    groupIds?: string[];
+    deviceIds?: string[];
+  } | null;
   createdAt?: string;
 };
 
@@ -32,6 +40,7 @@ const actionBadge: Record<string, string> = {
 
 export default function PeripheralPoliciesList() {
   const { t } = useTranslation("peripherals");
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   const [policies, setPolicies] = useState<PeripheralPolicy[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
@@ -57,7 +66,7 @@ export default function PeripheralPoliciesList() {
         `/peripherals/policies${qs ? `?${qs}` : ""}`,
       );
       if (!response.ok)
-        throw new Error(t("peripheralPoliciesList.errors.fetch"));
+        throw new Error(stableT("peripheralPoliciesList.errors.fetch"));
       const json = await response.json();
       setPolicies(
         Array.isArray(json.data) ? json.data : Array.isArray(json) ? json : [],
@@ -66,12 +75,12 @@ export default function PeripheralPoliciesList() {
       setError(
         err instanceof Error
           ? err.message
-          : t("peripheralPoliciesList.errors.generic"),
+          : stableT("peripheralPoliciesList.errors.generic"),
       );
     } finally {
       setLoading(false);
     }
-  }, [filterClass, filterAction, filterActive, t]);
+  }, [filterClass, filterAction, filterActive, stableT]);
 
   useEffect(() => {
     fetchPolicies();
@@ -92,10 +101,11 @@ export default function PeripheralPoliciesList() {
     <div className="space-y-4">
       {/* Filter bar */}
       <div className="flex flex-wrap items-center gap-3">
-        <select
+        <FilterSelect
+          label={t("peripheralPoliciesList.classFilterLabel")}
           value={filterClass}
           onChange={(e) => setFilterClass(e.target.value)}
-          className="h-9 rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
+          className="h-9"
         >
           <option value="">{t("peripheralPoliciesList.allClasses")}</option>
           <option value="storage">
@@ -110,11 +120,12 @@ export default function PeripheralPoliciesList() {
           <option value="thunderbolt">
             {t("peripheralPoliciesList.classes.thunderbolt")}
           </option>
-        </select>
-        <select
+        </FilterSelect>
+        <FilterSelect
+          label={t("peripheralPoliciesList.actionFilterLabel")}
           value={filterAction}
           onChange={(e) => setFilterAction(e.target.value)}
-          className="h-9 rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
+          className="h-9"
         >
           <option value="">{t("peripheralPoliciesList.allActions")}</option>
           <option value="allow">
@@ -129,16 +140,17 @@ export default function PeripheralPoliciesList() {
           <option value="alert">
             {t("peripheralPoliciesList.actions.alert")}
           </option>
-        </select>
-        <select
+        </FilterSelect>
+        <FilterSelect
+          label={t("peripheralPoliciesList.statusFilterLabel")}
           value={filterActive}
           onChange={(e) => setFilterActive(e.target.value)}
-          className="h-9 rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
+          className="h-9"
         >
           <option value="">{t("peripheralPoliciesList.allStatus")}</option>
           <option value="true">{t("common:states.active")}</option>
           <option value="false">{t("common:states.inactive")}</option>
-        </select>
+        </FilterSelect>
         <div className="ml-auto flex gap-2">
           <button
             type="button"

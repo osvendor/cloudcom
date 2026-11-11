@@ -231,3 +231,49 @@ func TestTryCreateRecoveryConsoleLock_NeverObservablyEmpty(t *testing.T) {
 		t.Errorf("leftover file in lock directory: %s", e.Name())
 	}
 }
+
+func TestReadBakedRecoveryConfig_MissingFileReturnsEmpty(t *testing.T) {
+	got := readBakedRecoveryConfig(filepath.Join(t.TempDir(), "does-not-exist"))
+	if got != "" {
+		t.Fatalf("expected empty string for a missing file, got %q", got)
+	}
+}
+
+func TestReadBakedRecoveryConfig_TrimsWhitespace(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "server")
+	if err := os.WriteFile(path, []byte("https://baked.example\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	got := readBakedRecoveryConfig(path)
+	if got != "https://baked.example" {
+		t.Fatalf("expected trimmed baked value, got %q", got)
+	}
+}
+
+func TestLoadRecoveryMediaRoots_MalformedFailsClosed(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "roots.pem")
+	if err := os.WriteFile(p, []byte("not a pem"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	err := loadRecoveryMediaRoots(consoleHost{BakedRoots: p}, &buf)
+	if err == nil {
+		t.Fatal("expected error for malformed roots")
+	}
+	if !strings.Contains(buf.String(), "recovery media root store is unreadable; rebuild the media") {
+		t.Fatalf("stderr = %q", buf.String())
+	}
+}
+
+func TestLoadRecoveryMediaRoots_NoRootsIsNoop(t *testing.T) {
+	var buf bytes.Buffer
+	if err := loadRecoveryMediaRoots(consoleHost{}, &buf); err != nil {
+		t.Fatal(err)
+	}
+	if err := loadRecoveryMediaRoots(consoleHost{BakedRoots: filepath.Join(t.TempDir(), "absent.pem")}, &buf); err != nil {
+		t.Fatal(err)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("unexpected output %q", buf.String())
+	}
+}

@@ -10,6 +10,12 @@
  * `startTimer` on confirm. Starting with nothing running, or a timer already
  * running on this same ticket, proceeds directly.
  *
+ * Work type (#4628 W04): one "Work type" select, shared by Start and the
+ * manual log. Its blank "Default" option OMITS `workTypeId` from the request,
+ * so the server applies the ticket category's default work type at stamp time
+ * (§3.1). The select is hidden when the partner has no work types or the list
+ * failed to load — logging time never depends on it.
+ *
  * `isBillable` is a tri-state checkbox: the field is omitted from the
  * `logTime` request entirely unless the technician actually clicks it, so the
  * server's own default applies untouched (schema: `isBillable?: boolean`).
@@ -26,14 +32,18 @@
  * id + display number, same reasoning `LinkEmailAction` used.
  */
 import { useCallback, useEffect, useState } from 'react';
+import { ApiError, AuthBlockedError } from '@breeze/office-addin-core';
 import {
   fetchRunningTimer,
+  fetchWorkTypes,
   startTimer,
   stopTimer,
   logTime,
   TechApiError,
+  type AddinWorkType,
   type LogTimeRequest,
   type RunningTimerEntry,
+  type StartTimerRequest,
 } from './api';
 import type { LinkableTicket } from './LinkEmailAction';
 
@@ -46,9 +56,39 @@ export interface TimeWidgetProps {
 
 const POLL_INTERVAL_MS = 30_000;
 
+/**
+ * Customer work approval (#8196) 409 codes → plain-language text. The add-in
+ * only ever receives APPROVAL_REQUIRED on a timer start (handled with the
+ * non-billable retry below); the rest are mapped defensively so a shared error
+ * path can never show a raw code. Unknown codes (including ENTRY_CHANGED, which
+ * callers retry) keep the "(CODE)" suffix.
+ */
+const APPROVAL_MESSAGES: Record<string, string> = {
+  APPROVAL_REQUIRED: 'Approval required. Ask a human to request customer approval, or log this as non-billable.',
+  APPROVAL_REQUEST_PENDING: 'This ticket is waiting on customer approval, so that change is blocked for now.',
+  SOURCE_AWAITING_APPROVAL: 'Some time on this ticket is awaiting customer approval and cannot be invoiced yet.',
+  REQUEST_NOT_PENDING: 'That approval request was already decided.',
+  REQUEST_CHANGED: 'The approval request was updated. Refresh and review it again.',
+  REQUEST_EXPIRED: 'The approval request expired.',
+  // The server requires billing permission for ANY billable-flag change, including
+  // the non-billable retry. Say what to do instead of a raw code.
+  MANAGE_BILLING_REQUIRED:
+    'You do not have permission to log this as non-billable. Ask someone with billing permission, or have customer approval requested.',
+};
+
 function errorMessage(err: unknown, fallback: string): string {
-  return err instanceof TechApiError ? `${fallback} (${err.code}).` : `${fallback}.`;
+  if (err instanceof TechApiError) {
+    const friendly =
+      err.status === 409 || (err.status === 403 && err.code === 'MANAGE_BILLING_REQUIRED')
+        ? APPROVAL_MESSAGES[err.code]
+        : undefined;
+    if (friendly) return friendly;
+    return `${fallback} (${err.code}).`;
+  }
+  return `${fallback}.`;
 }
+
+const HELD_NOTICE = 'Recorded; held pending customer approval. It will not be billed until the customer approves.';
 
 export function TimeWidget({ linkedTicket, suggestedDurationMinutes, onBanner }: TimeWidgetProps) {
   const [running, setRunning] = useState<RunningTimerEntry | null>(null);
@@ -60,6 +100,10 @@ export function TimeWidget({ linkedTicket, suggestedDurationMinutes, onBanner }:
   const [starting, setStarting] = useState(false);
   const [stopping, setStopping] = useState(false);
   const [pendingStart, setPendingStart] = useState(false);
+  // 409 APPROVAL_REQUIRED on a start: offer the non-billable retry (#8196).
+  const [approvalBlocked, setApprovalBlocked] = useState(false);
+  // An entry the server recorded but is holding for customer approval (#8196).
+  const [heldNotice, setHeldNotice] = useState(false);
 
   const [logMode, setLogMode] = useState<'duration' | 'range'>('duration');
   const [durationMinutes, setDurationMinutes] = useState('');
@@ -70,6 +114,42 @@ export function TimeWidget({ linkedTicket, suggestedDurationMinutes, onBanner }:
   const [isBillable, setIsBillable] = useState(false);
   const [isBillableTouched, setIsBillableTouched] = useState(false);
   const [logSubmitting, setLogSubmitting] = useState(false);
+  const [workTypes, setWorkTypes] = useState<AddinWorkType[]>([]);
+  // '' = Default: the field is omitted and the server applies the category default.
+  const [workTypeId, setWorkTypeId] = useState('');
+
+  // The non-billable prompt and held notice describe ONE ticket. Switching the
+  // linked ticket must not let "Log as non-billable" start a timer on a ticket
+  // the gate never refused.
+  const linkedTicketId = linkedTicket?.id ?? null;
+  useEffect(() => {
+    setApprovalBlocked(false);
+    setHeldNotice(false);
+  }, [linkedTicketId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchWorkTypes()
+      .then((res) => {
+        if (!cancelled) setWorkTypes(res.workTypes);
+      })
+      .catch((err: unknown) => {
+        // Fail soft: the picker disappears and time is still logged at the
+        // category default. A 403 (no billing_profiles:read) and a session
+        // ending (apiFetch's 401 ApiError / AuthBlockedError — the shell
+        // handles those) are expected; anything else is logged for support.
+        if (cancelled) return;
+        setWorkTypes([]);
+        const expected =
+          (err instanceof TechApiError && err.status === 403) ||
+          (err instanceof ApiError && err.status === 401) ||
+          err instanceof AuthBlockedError;
+        if (!expected) console.error('[TimeWidget] work type list failed to load', err);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const refresh = useCallback(async () => {
     try {
@@ -102,12 +182,18 @@ export function TimeWidget({ linkedTicket, suggestedDurationMinutes, onBanner }:
     }
   }, [suggestedDurationMinutes, durationTouched]);
 
-  async function doStart(): Promise<void> {
+  async function doStart(nonBillable = false): Promise<void> {
     if (!linkedTicket) return;
     setStarting(true);
     onBanner(null);
+    setHeldNotice(false);
     try {
-      const res = await startTimer({ ticketId: linkedTicket.id });
+      const body: StartTimerRequest = { ticketId: linkedTicket.id };
+      if (workTypeId) body.workTypeId = workTypeId;
+      if (nonBillable) body.isBillable = false;
+      const res = await startTimer(body);
+      setApprovalBlocked(false);
+      if (res.entry.approvalHold) setHeldNotice(true);
       setRunning({
         id: res.entry.id,
         ticketId: res.entry.ticketId,
@@ -117,7 +203,14 @@ export function TimeWidget({ linkedTicket, suggestedDurationMinutes, onBanner }:
       });
       setPendingStart(false);
     } catch (err) {
-      onBanner(errorMessage(err, 'Failed to start timer'));
+      if (err instanceof TechApiError && err.status === 409 && err.code === 'APPROVAL_REQUIRED' && !nonBillable) {
+        setPendingStart(false);
+        setApprovalBlocked(true);
+      } else {
+        // Also the non-billable retry being refused: say so instead of re-asking.
+        if (nonBillable) setApprovalBlocked(false);
+        onBanner(errorMessage(err, 'Failed to start timer'));
+      }
     } finally {
       setStarting(false);
     }
@@ -135,9 +228,11 @@ export function TimeWidget({ linkedTicket, suggestedDurationMinutes, onBanner }:
   async function handleStop(): Promise<void> {
     setStopping(true);
     onBanner(null);
+    setHeldNotice(false);
     try {
-      await stopTimer({});
+      const res = await stopTimer({});
       setRunning(null);
+      if (res.entry?.approvalHold) setHeldNotice(true);
     } catch (err) {
       onBanner(errorMessage(err, 'Failed to stop timer'));
     } finally {
@@ -167,6 +262,7 @@ export function TimeWidget({ linkedTicket, suggestedDurationMinutes, onBanner }:
     if (!linkedTicket || !logWindow || !description.trim()) return;
     setLogSubmitting(true);
     onBanner(null);
+    setHeldNotice(false);
     try {
       const body: LogTimeRequest = {
         ticketId: linkedTicket.id,
@@ -175,7 +271,9 @@ export function TimeWidget({ linkedTicket, suggestedDurationMinutes, onBanner }:
         description: description.trim(),
       };
       if (isBillableTouched) body.isBillable = isBillable;
-      await logTime(body);
+      if (workTypeId) body.workTypeId = workTypeId;
+      const res = await logTime(body);
+      if (res.entry?.approvalHold) setHeldNotice(true);
       setDescription('');
       setDurationMinutes('');
       setDurationTouched(false);
@@ -216,6 +314,56 @@ export function TimeWidget({ linkedTicket, suggestedDurationMinutes, onBanner }:
       {loaded && !running && (
         <div data-testid="time-idle" className="text-xs text-gray-400">
           No timer running.
+        </div>
+      )}
+
+      {workTypes.length > 0 && (
+        <label className="flex items-center gap-2 text-xs text-gray-600">
+          Work type
+          <select
+            data-testid="time-work-type"
+            value={workTypeId}
+            onChange={(e) => setWorkTypeId(e.target.value)}
+            className="rounded-md border border-gray-300 px-2 py-1 text-xs"
+          >
+            <option value="">Default</option>
+            {workTypes.map((w) => (
+              <option key={w.id} value={w.id}>
+                {w.name}
+              </option>
+            ))}
+          </select>
+        </label>
+      )}
+
+      {heldNotice && (
+        <div data-testid="time-held-notice" className="rounded-md border border-amber-300 bg-amber-50 p-2 text-xs text-amber-800">
+          {HELD_NOTICE}
+        </div>
+      )}
+
+      {approvalBlocked && (
+        <div data-testid="time-approval-required" className="flex flex-col gap-1 rounded-md border border-amber-300 bg-amber-50 p-2 text-xs text-amber-800">
+          <span>Approval required. Log as non-billable?</span>
+          <div className="flex gap-2">
+            <button
+              type="button"
+              data-testid="time-approval-nonbillable"
+              onClick={() => void doStart(true)}
+              disabled={starting}
+              className="rounded-md border border-amber-400 bg-amber-100 px-2 py-1 hover:bg-amber-200 disabled:opacity-50"
+            >
+              Log as non-billable
+            </button>
+            <button
+              type="button"
+              data-testid="time-approval-dismiss"
+              onClick={() => setApprovalBlocked(false)}
+              className="rounded-md border border-gray-300 px-2 py-1 hover:bg-gray-50"
+            >
+              Cancel
+            </button>
+          </div>
         </div>
       )}
 

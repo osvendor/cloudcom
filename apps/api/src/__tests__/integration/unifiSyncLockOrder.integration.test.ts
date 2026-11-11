@@ -172,38 +172,23 @@ describe('UniFi sync export lock ordering', () => {
     expect(assets.every((asset: { hostname: string | null }) => asset.hostname === DEVICE.name)).toBe(true);
   });
 
-  it('without the pre-lock, descending mapping writes fail and roll back the sync transaction', async () => {
+  it('without the pre-lock, a site savepoint rolls back and the run is partial', async () => {
     const fixture = await seedFixture();
-
-    let thrown: unknown;
-    try {
-      await runOutsideDbContext(() => withSystemDbAccessContext(() =>
-        applySyncData(
-          db,
-          { id: fixture.integrationId, partnerId: fixture.partnerId },
-          'scheduled',
-          fixture.mappingsDescending,
-          collectedFor(fixture.mappingsDescending),
-        )
-      ));
-    } catch (error) {
-      thrown = error;
-    }
-    // applySyncData catches the original P0001 site write, then its stale sweep
-    // / ledger update hits PostgreSQL's already-aborted transaction. The
-    // visible worker boundary is therefore 25P02, which is the production
-    // signature and proves the entire transaction rolled back.
-    const postgresError = (thrown as { cause?: { code?: string }; code?: string } | undefined)?.cause
-      ?? (thrown as { code?: string } | undefined);
-    expect(postgresError?.code).toBe('25P02');
-
+    const result = await runOutsideDbContext(() => withSystemDbAccessContext(() =>
+      applySyncData(db, { id: fixture.integrationId, partnerId: fixture.partnerId },
+        'scheduled', fixture.mappingsDescending, collectedFor(fixture.mappingsDescending))));
+    // Upstream #11225 isolates failed sites with SAVEPOINTs. The fork pre-lock
+    // still prevents this partial result and its lost update (positive test above).
+    expect(result.status).toBe('partial');
+    expect(result.error).toContain('P0001');
+    expect(result.error).toContain('ascending UUID order');
+    expect(result.devicesCreated).toBe(1);
     const assets = await assetsFor();
     expect(assets).toHaveLength(2);
-    expect(assets.every((asset: { hostname: string | null }) => asset.hostname === 'before sync')).toBe(true);
-    const runs = await (getTestDb() as any)
-      .select({ id: unifiSyncRuns.id })
-      .from(unifiSyncRuns)
-      .where(eq(unifiSyncRuns.integrationId, fixture.integrationId));
-    expect(runs).toHaveLength(0);
+    expect(assets.filter((asset: {hostname: string | null}) => asset.hostname === 'before sync')).toHaveLength(1);
+    expect(assets.filter((asset: {hostname: string | null}) => asset.hostname === DEVICE.name)).toHaveLength(1);
+    const runs = await getTestDb().select({status:unifiSyncRuns.status}).from(unifiSyncRuns)
+      .where(eq(unifiSyncRuns.integrationId,fixture.integrationId));
+    expect(runs).toEqual([{status:'partial'}]);
   });
 });

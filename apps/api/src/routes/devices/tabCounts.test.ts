@@ -18,11 +18,16 @@ vi.mock('drizzle-orm', () => ({
   }),
 }));
 
+// Real monitoringActiveWatches; only the agent-config resolver is faked.
+const { resolveMonitoringConfigForDisplay } = vi.hoisted(() => ({ resolveMonitoringConfigForDisplay: vi.fn() }));
+vi.mock('../agents/helpers', () => ({ resolveMonitoringConfigForDisplay }));
+
 vi.mock('../../db', () => ({ db: { select: selectMock, selectDistinctOn: selectDistinctOnMock } }));
 
 vi.mock('../../db/schema', () => ({
   alerts: { deviceId: 'alerts.deviceId', status: 'alerts.status' },
   metricAnomalies: { deviceId: 'metricAnomalies.deviceId', status: 'metricAnomalies.status' },
+  metricAnomalyEpisodes: { deviceId: 'metricAnomalyEpisodes.deviceId', status: 'metricAnomalyEpisodes.status' },
   tickets: { deviceId: 'tickets.deviceId', status: 'tickets.status', deletedAt: 'tickets.deletedAt' },
   aiOperatorTasks: { deviceId: 'aiOperatorTasks.deviceId', state: 'aiOperatorTasks.state' },
   AI_OPERATOR_TASK_LIVE_STATES: ['queued', 'running', 'waiting', 'paused'],
@@ -81,6 +86,7 @@ describe('GET /devices/:id/tab-counts', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    resolveMonitoringConfigForDisplay.mockResolvedValue(null); // unknown → unfiltered
     getDeviceWithOrgAndSiteCheckMock.mockResolvedValue(device);
     app = new Hono();
     app.route('/devices', tabCountsRoutes);
@@ -106,6 +112,45 @@ describe('GET /devices/:id/tab-counts', () => {
     });
     expect(selectMock).toHaveBeenCalledTimes(5);
     expect(selectDistinctOnMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not count a failing result for a watch removed from the policy (#8287)', async () => {
+    resolveMonitoringConfigForDisplay.mockResolvedValue({
+      check_interval_seconds: 60,
+      watches: [{ watch_type: 'process', name: 'Agent' }],
+    });
+    queueSelects([[{ count: '0' }], [{ count: '0' }], [{ count: '0' }], [{ count: '0' }], [{ count: '0' }]], [
+      { watchType: 'service', name: 'removed-svc', status: 'not_found' },
+      // positive control: still-configured watch (case differs) that is failing
+      { watchType: 'process', name: 'agent', status: 'not_found' },
+    ]);
+
+    const res = await app.request(`/devices/${device.id}/tab-counts`);
+    expect((await res.json()).data.monitoring).toBe(1);
+    expect(resolveMonitoringConfigForDisplay).toHaveBeenCalledWith(device.id, device.orgId);
+  });
+
+  it('counts OPEN anomaly episodes, not raw metric_anomalies rows (#6650)', async () => {
+    queueSelects([[{ count: '0' }], [{ count: '2' }], [{ count: '0' }], [{ count: '0' }], [{ count: '0' }]], []);
+
+    const res = await app.request(`/devices/${device.id}/tab-counts`);
+    expect(res.status).toBe(200);
+    expect((await res.json()).data.anomalies).toBe(2);
+
+    // Second db.select() is the anomalies count.
+    const anomalyChain = selectMock.mock.results[1]!.value;
+    const [from] = anomalyChain.from.mock.calls[0]!;
+    expect(from).toEqual({ deviceId: 'metricAnomalyEpisodes.deviceId', status: 'metricAnomalyEpisodes.status' });
+    const [where] = anomalyChain.where.mock.calls[0]!;
+    expect(where).toEqual({
+      type: 'and',
+      conditions: [
+        { type: 'eq', left: 'metricAnomalyEpisodes.deviceId', right: device.id },
+        // Snoozed episodes are status 'dismissed' (close_reason 'snoozed'), so
+        // status = 'open' alone excludes both snoozed and resolved episodes.
+        { type: 'eq', left: 'metricAnomalyEpisodes.status', right: 'open' },
+      ],
+    });
   });
 
   it('404s when the device is not visible to the caller', async () => {

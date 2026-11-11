@@ -1,26 +1,40 @@
-import { useCallback, useEffect, useMemo, useState, type ElementType } from 'react';
+import { useCallback, useEffect, useMemo, useState, type ElementType, type ReactNode } from 'react';
 import {
   Activity,
+  Banknote,
   BarChart3,
   Bell,
   CalendarClock,
   FileText,
+  Gauge,
+  HardDriveDownload,
   KeyRound,
   Laptop,
   Loader2,
+  PiggyBank,
   Plus,
+  Repeat,
   ShieldAlert,
   ShieldCheck,
+  Sparkles,
+  Timer,
+  Trophy,
   X
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import ReportBuilder, { reportTypeSurvivesBuilder, type ReportBuilderFormValues } from './ReportBuilder';
 import { PostureReportOptionsForm } from './PostureReportOptionsForm';
+import { ReportOwnerScopeField, useDefaultReportOwnerScope, type ReportOwnerScope } from './ReportOwnerScopeField';
 import {
   DEFAULT_HARDWARE_LIFECYCLE_OPTIONS,
   HardwareLifecycleOptionsForm,
   type HardwareLifecycleOptions,
 } from './HardwareLifecycleOptionsForm';
+import {
+  DEFAULT_BACKUP_STATUS_OPTIONS,
+  BackupStatusOptionsForm,
+  type BackupStatusOptions,
+} from './BackupStatusOptionsForm';
 import {
   DEFAULT_THREAT_DETECTION_OPTIONS,
   ThreatDetectionOptionsForm,
@@ -41,22 +55,99 @@ import {
   IdentityAccessOptionsForm,
   type IdentityAccessOptions,
 } from './IdentityAccessOptionsForm';
+import {
+  DEFAULT_TICKET_SLA_PERFORMANCE_OPTIONS,
+  ticketSlaPerformanceConfigFromOptions,
+  TicketSlaPerformanceOptionsForm,
+  type TicketSlaPerformanceOptions,
+} from './TicketSlaPerformanceOptionsForm';
+import {
+  DEFAULT_TICKET_SLA_OPTIONS,
+  TicketSlaOptionsForm,
+  ticketSlaConfigFromOptions,
+  ticketSlaOptionsFromConfig,
+  type TicketSlaOptions,
+} from './TicketSlaOptionsForm';
+import {
+  DEFAULT_TECHNICIAN_TIME_OPTIONS,
+  TechnicianTimeOptionsForm,
+  technicianTimeConfigFromOptions,
+  technicianTimeOptionsFromConfig,
+  type TechnicianTimeOptions,
+} from './TechnicianTimeOptionsForm';
+import {
+  DEFAULT_AR_AGING_OPTIONS,
+  ArAgingOptionsForm,
+  arAgingConfigFromOptions,
+  arAgingOptionsFromConfig,
+  type ArAgingOptions,
+} from './ArAgingOptionsForm';
+import {
+  DEFAULT_AI_USAGE_BY_CLIENT_OPTIONS,
+  AiUsageByClientOptionsForm,
+  aiUsageByClientConfigFromOptions,
+  aiUsageByClientOptionsFromConfig,
+  type AiUsageByClientOptions,
+} from './AiUsageByClientOptionsForm';
+import {
+  DEFAULT_MRR_RENEWALS_OPTIONS,
+  MrrRenewalsOptionsForm,
+  mrrRenewalsConfigFromOptions,
+  mrrRenewalsOptionsFromConfig,
+  type MrrRenewalsOptions,
+} from './MrrRenewalsOptionsForm';
+import {
+  DEFAULT_QUOTE_WIN_RATE_OPTIONS,
+  QuoteWinRateOptionsForm,
+  quoteWinRateConfigFromOptions,
+  quoteWinRateOptionsFromConfig,
+  type QuoteWinRateOptions,
+} from './QuoteWinRateOptionsForm';
+import {
+  DEFAULT_CLIENT_PROFITABILITY_OPTIONS,
+  ClientProfitabilityOptionsForm,
+  clientProfitabilityConfigFromOptions,
+  clientProfitabilityOptionsFromConfig,
+  type ClientProfitabilityOptions,
+} from './ClientProfitabilityOptionsForm';
 import type { ReportFormat, ReportSchedule } from './ReportsList';
 import { fetchWithAuth } from '../../stores/auth';
-import { useOrgStore } from '../../stores/orgStore';
-import { runAction } from '@/lib/runAction';
+import { OrgPickerField, useReportTargetOrg } from './OrgPickerField';
+import { createSeries } from './series/seriesApi';
+import { isSeriesEligibleReportType, stripSeriesConfig } from './series/seriesConfig';
+import {
+  TemplateDeliveryFields,
+  initialTemplateDelivery,
+  singleOrgDeliveryOf,
+  type TemplateDeliveryValue,
+} from './TemplateDeliveryFields';
+import { hasTemplateOptionsForm } from './templateReportTypes';
+import { isSelectorlessOrgReportType } from './businessReportConfig';
+import { showToast } from '../shared/Toast';
+import { ActionError, runAction } from '@/lib/runAction';
 import { navigateTo } from '@/lib/navigation';
 import { asList } from '@/lib/asList';
 import { useTranslation } from 'react-i18next';
+import { useJwtClaims } from '@/lib/authScope';
+import { isBusinessReportType, useCanUseBusinessReportType } from './businessReportAccess';
 // Initializes the shared i18next singleton. Islands hydrate independently, so
 // an island that hydrates before whichever other island happens to pull i18n in
 // would otherwise render raw keys (and mismatch the SSR markup).
 import '../../lib/i18n';
+import { useStableT } from '@/lib/i18n/useStableT';
 
 type TemplateTone = {
   iconBg: string;
   iconColor: string;
 };
+
+/** Which labelled section of the gallery a card sits in. Curated business
+ *  reports (#3198) are the MSP's own numbers — SLA, utilisation, money — and
+ *  read differently from the customer-facing evidence artifacts, so they get
+ *  their own section rather than a fourteenth card in one flat grid. A saved
+ *  report inherits its curated fallback's group; an unmatched saved report is
+ *  'general'. */
+type TemplateGroup = 'business' | 'general';
 
 type ReportTemplate = {
   id: string;
@@ -65,7 +156,12 @@ type ReportTemplate = {
   defaults: Partial<ReportBuilderFormValues>;
   icon: ElementType;
   tone: TemplateTone;
+  group: TemplateGroup;
   previewImage?: string;
+  /** A saved report's stored business config (#3198): the options it will
+   *  actually run with. The Default range tile reports its period / as-of, and
+   *  the options modal opens seeded with it. */
+  savedBusinessConfig?: Record<string, unknown>;
 };
 
 type TemplateApiItem = Partial<ReportTemplate> & {
@@ -75,6 +171,8 @@ type TemplateApiItem = Partial<ReportTemplate> & {
   config?: {
     dateRange?: ReportBuilderFormValues['dateRange'];
     filters?: ReportBuilderFormValues['filters'];
+    period?: { kind?: unknown };
+    asOf?: unknown;
   };
   schedule?: ReportSchedule;
   format?: ReportFormat;
@@ -91,10 +189,19 @@ const reportTypeValues: TemplateReportType[] = [
   'executive_summary',
   'security_compliance_posture',
   'hardware_lifecycle',
+  'backup_status',
   'threat_detection_review',
   'endpoint_management_review',
   'vulnerability_management',
   'identity_access_review',
+  'ticket_sla_attainment',
+  'technician_time_billability',
+  'ar_aging',
+  'ai_usage_by_client',
+  'mrr_renewals',
+  'quote_win_rate',
+  'client_profitability',
+  'ticket_sla_performance',
   'devices',
   'alerts',
   'patches',
@@ -105,6 +212,111 @@ const scheduleValues: ReportSchedule[] = ['one_time', 'daily', 'weekly', 'monthl
 const formatValues: ReportFormat[] = ['csv', 'pdf', 'excel'];
 
 const defaultTemplates: ReportTemplate[] = [
+  {
+    id: 'ticket_sla_attainment',
+    name: 'Ticket SLA attainment',
+    description:
+      'Response and resolution attainment for the period, recomputed from the ticket timestamps rather than read off the breach stamps — so a ticket answered late but eventually answered still counts as a miss. Grouped by organization, priority, technician or category.',
+    defaults: {
+      name: 'Ticket SLA attainment',
+      type: 'ticket_sla_attainment',
+      schedule: 'monthly',
+      format: 'pdf'
+    },
+    icon: Gauge,
+    tone: { iconBg: 'bg-indigo-500/15', iconColor: 'text-indigo-600' },
+    group: 'business'
+  },
+  {
+    id: 'technician_time_billability',
+    name: 'Technician time & billability',
+    description:
+      'Logged time against an assumed weekly capacity, the billable / included / non-billable split, and how much of the billable time has actually been approved and billed. Technicians with no time in the period are listed at zero rather than dropped.',
+    defaults: {
+      name: 'Technician time & billability',
+      type: 'technician_time_billability',
+      schedule: 'monthly',
+      format: 'pdf'
+    },
+    icon: Timer,
+    tone: { iconBg: 'bg-emerald-500/15', iconColor: 'text-emerald-600' },
+    group: 'business'
+  },
+  {
+    id: 'ar_aging',
+    name: 'AR aging',
+    description:
+      'Unpaid invoice balances bucketed current / 1–30 / 31–60 / 61–90 / 90+ days past due, one set of totals per currency with no conversion. Invoices with no due date get their own bucket, never "current".',
+    defaults: {
+      name: 'AR aging',
+      type: 'ar_aging',
+      schedule: 'monthly',
+      format: 'pdf'
+    },
+    icon: Banknote,
+    tone: { iconBg: 'bg-cyan-500/15', iconColor: 'text-cyan-600' },
+    group: 'business'
+  },
+  {
+    id: 'ai_usage_by_client',
+    name: 'AI usage by client',
+    description:
+      'Platform AI usage per client for the period: requests, tokens, Breeze cost, the amount to charge from the client\'s billing profile, and what has already been invoiced. Included usage and unpriced models are shown separately, never blended in.',
+    defaults: {
+      name: 'AI usage by client',
+      type: 'ai_usage_by_client',
+      schedule: 'monthly',
+      format: 'pdf'
+    },
+    icon: Sparkles,
+    tone: { iconBg: 'bg-violet-500/15', iconColor: 'text-violet-600' },
+    group: 'business'
+  },
+  {
+    id: 'mrr_renewals',
+    name: 'MRR & renewals',
+    description:
+      'Monthly and annual recurring revenue from active contracts, measured on the day the report runs, with the contracts renewing inside the chosen horizon and what has actually been billed as recurring. One set of totals per currency, never converted.',
+    defaults: {
+      name: 'MRR & renewals',
+      type: 'mrr_renewals',
+      schedule: 'monthly',
+      format: 'pdf'
+    },
+    icon: Repeat,
+    tone: { iconBg: 'bg-teal-500/15', iconColor: 'text-teal-600' },
+    group: 'business'
+  },
+  {
+    id: 'quote_win_rate',
+    name: 'Quote win rate',
+    description:
+      'The share of sent quotes that were won, counted per opportunity so a revised and re-sent quote counts once. The headline rate covers decided opportunities only, with the still-open count beside it. Values are pre-tax, one set per currency, never converted.',
+    defaults: {
+      name: 'Quote win rate',
+      type: 'quote_win_rate',
+      schedule: 'monthly',
+      format: 'pdf'
+    },
+    icon: Trophy,
+    tone: { iconBg: 'bg-amber-500/15', iconColor: 'text-amber-600' },
+    group: 'business'
+  },
+  {
+    id: 'client_profitability',
+    name: 'Client profitability',
+    description:
+      'Billed revenue per client for the period by source (recurring, labor, product, AI, other), with the hours logged against it and an optional labor-cost estimate from one blended hourly rate. Figures using that rate are labelled as estimates. One set of totals per currency, never converted.',
+    defaults: {
+      name: 'Client profitability',
+      type: 'client_profitability',
+      schedule: 'monthly',
+      format: 'pdf'
+    },
+    icon: PiggyBank,
+    tone: { iconBg: 'bg-lime-500/15', iconColor: 'text-lime-600' },
+    group: 'business'
+  },
   {
     id: 'security_compliance_posture',
     name: 'Security & Compliance Posture (Insurance)',
@@ -121,7 +333,8 @@ const defaultTemplates: ReportTemplate[] = [
     tone: {
       iconBg: 'bg-indigo-500/15',
       iconColor: 'text-indigo-600'
-    }
+    },
+    group: 'general'
   },
   {
     id: 'hardware_lifecycle',
@@ -139,7 +352,29 @@ const defaultTemplates: ReportTemplate[] = [
     tone: {
       iconBg: 'bg-emerald-500/15',
       iconColor: 'text-emerald-600'
-    }
+    },
+    group: 'general'
+  },
+  {
+    id: 'backup_status',
+    name: 'Backup Status Report',
+    description:
+      "Every device's backup status across Breeze and connected backup providers, in one snapshot: coverage buckets, last successful backup, and a 28-day history per device.",
+    defaults: {
+      name: 'Backup Status Report',
+      type: 'backup_status',
+      dateRange: { preset: 'last_30_days' },
+      // One-time by default: the report is an as-of snapshot. A recurring
+      // cadence is set afterwards from the report's edit page.
+      schedule: 'one_time',
+      format: 'pdf'
+    },
+    icon: HardDriveDownload,
+    tone: {
+      iconBg: 'bg-sky-500/15',
+      iconColor: 'text-sky-600'
+    },
+    group: 'general'
   },
   {
     id: 'threat_detection_review',
@@ -157,7 +392,8 @@ const defaultTemplates: ReportTemplate[] = [
     tone: {
       iconBg: 'bg-rose-500/15',
       iconColor: 'text-rose-600'
-    }
+    },
+    group: 'general'
   },
   {
     id: 'endpoint_management_review',
@@ -175,7 +411,8 @@ const defaultTemplates: ReportTemplate[] = [
     tone: {
       iconBg: 'bg-cyan-500/15',
       iconColor: 'text-cyan-600'
-    }
+    },
+    group: 'general'
   },
   {
     id: 'vulnerability_management',
@@ -193,7 +430,8 @@ const defaultTemplates: ReportTemplate[] = [
     tone: {
       iconBg: 'bg-rose-500/15',
       iconColor: 'text-rose-600'
-    }
+    },
+    group: 'general'
   },
   {
     id: 'identity_access_review',
@@ -211,7 +449,22 @@ const defaultTemplates: ReportTemplate[] = [
     tone: {
       iconBg: 'bg-sky-500/15',
       iconColor: 'text-sky-600'
-    }
+    },
+    group: 'general'
+  },
+  {
+    id: 'ticket_sla_performance',
+    name: 'SLA performance',
+    description: 'Customer-ready response and resolution times against SLA, by priority, with breaches.',
+    defaults: {
+      name: 'SLA performance',
+      type: 'ticket_sla_performance',
+      schedule: 'monthly',
+      format: 'pdf'
+    },
+    icon: Timer,
+    tone: { iconBg: 'bg-teal-500/15', iconColor: 'text-teal-600' },
+    group: 'general'
   },
   {
     id: 'executive_summary',
@@ -228,7 +481,8 @@ const defaultTemplates: ReportTemplate[] = [
     tone: {
       iconBg: 'bg-sky-500/15',
       iconColor: 'text-sky-600'
-    }
+    },
+    group: 'general'
   },
   {
     id: 'device_health',
@@ -245,7 +499,8 @@ const defaultTemplates: ReportTemplate[] = [
     tone: {
       iconBg: 'bg-emerald-500/15',
       iconColor: 'text-emerald-600'
-    }
+    },
+    group: 'general'
   },
   {
     id: 'alert_summary',
@@ -263,9 +518,19 @@ const defaultTemplates: ReportTemplate[] = [
     tone: {
       iconBg: 'bg-rose-500/15',
       iconColor: 'text-rose-600'
-    }
+    },
+    group: 'general'
   },
 ];
+
+// `reports.reportTemplates.templates.<id>.{name,description}` only exists for
+// these curated ids. A server-synced template (a saved report, `extras` in
+// `mergeTemplates`, or one that matched a curated card by name but kept its
+// own saved-report id) has no such key, so looking it up unconditionally
+// fires i18next's `missingKeyHandler` on every render — console noise
+// locally, a Sentry warning in prod (sweep B2). Gate the lookup on the id
+// actually being curated.
+const defaultTemplateIds = new Set(defaultTemplates.map(template => template.id));
 
 const typeAliases: Record<string, TemplateReportType> = {
   device_health: 'performance',
@@ -343,7 +608,15 @@ const normalizeTemplate = (item: TemplateApiItem, fallback?: ReportTemplate): Re
       iconBg: 'bg-slate-500/15',
       iconColor: 'text-slate-600'
     },
-    previewImage
+    // The section follows the report TYPE: a business report the user renamed
+    // (so it matches no curated card by id or name) is still a business report
+    // and must not drift into General. Otherwise a saved report that matched a
+    // curated card sits in that card's section; an unmatched one is General.
+    group: isBusinessReportType(resolvedType) ? 'business' : (fallback?.group ?? 'general'),
+    previewImage,
+    ...(isBusinessReportType(resolvedType) && item.config
+      ? { savedBusinessConfig: { ...item.config } }
+      : {})
   };
 };
 
@@ -397,6 +670,36 @@ const TemplatePreviewImage = ({ template, alt }: { template: ReportTemplate; alt
 };
 
 /** Honest definition list of what the template actually produces. */
+/**
+ * The Default range tile for a business report type (#3198). Those types have
+ * no ad-hoc date range — the server refuses one — but they do have a real
+ * period: the one a saved report stored, else the config schema's own default
+ * (a full calendar month for ticket_sla_attainment / technician_time_billability / ai_usage_by_client).
+ * ar_aging has no period at all — it is a running balance as of the run date,
+ * or as of the fixed date a saved report pinned.
+ */
+function businessDefaultRange(template: ReportTemplate, t: (key: string) => string): string | null {
+  const type = template.defaults.type;
+  const saved = template.savedBusinessConfig;
+  const periodKind = (saved?.period as { kind?: unknown } | undefined)?.kind;
+  if (type === 'mrr_renewals') return t('reports.reportTemplates.spec.asOfRunDate');
+  if (type === 'ar_aging') {
+    return typeof saved?.asOf === 'string' && saved.asOf
+      ? saved.asOf
+      : t('reports.reportTemplates.spec.asOfRunDate');
+  }
+  if (type === 'ticket_sla_attainment' || type === 'technician_time_billability' || type === 'ai_usage_by_client' || type === 'quote_win_rate' || type === 'client_profitability' || type === 'ticket_sla_performance') {
+    switch (periodKind) {
+      case 'last_full_month': return t('reports.reportPeriod.kinds.last_full_month');
+      case 'last_30_days': return t('reports.reportPeriod.kinds.last_30_days');
+      case 'last_quarter': return t('reports.reportPeriod.kinds.last_quarter');
+      case 'custom': return t('reports.reportPeriod.kinds.custom');
+      default: return t('reports.reportTemplates.spec.lastFullMonth');
+    }
+  }
+  return null;
+}
+
 const TemplateSpec = ({ items }: { items: { label: string; value: string }[] }) => (
   <dl className="mt-4 grid grid-cols-3 divide-x divide-border rounded-md border bg-muted/30">
     {items.map(item => (
@@ -408,9 +711,37 @@ const TemplateSpec = ({ items }: { items: { label: string; value: string }[] }) 
   </dl>
 );
 
+/** One labelled section of the gallery. The grid classes are lifted verbatim
+ *  from the previous flat grid so card layout is unchanged. */
+const TemplateSection = ({
+  group,
+  title,
+  description,
+  children,
+}: {
+  group: TemplateGroup;
+  title: string;
+  description?: string;
+  children: ReactNode;
+}) => (
+  <section data-testid={`report-template-group-${group}`} className="space-y-4">
+    <div>
+      <h2 className="text-sm font-semibold tracking-tight">{title}</h2>
+      {description && <p className="text-xs text-muted-foreground">{description}</p>}
+    </div>
+    <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">{children}</div>
+  </section>
+);
+
 export default function ReportTemplates() {
   const { t } = useTranslation('reports');
-  const { currentOrgId } = useOrgStore();
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
+  // Multi-org series W01 (spec §3.7): the org a template creates for — the
+  // switcher's org, else the one picked on this page. "Choosing a template
+  // no longer posts the ambient currentOrgId blindly."
+  const orgTarget = useReportTargetOrg();
+  const jwtClaims = useJwtClaims();
+  const canUseBusinessReportType = useCanUseBusinessReportType();
   const [templates, setTemplates] = useState<ReportTemplate[]>(defaultTemplates);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string>();
@@ -418,6 +749,12 @@ export default function ReportTemplates() {
   const [postureTemplate, setPostureTemplate] = useState<ReportTemplate | null>(null);
   const [backupRequired, setBackupRequired] = useState(false);
   const [lifecycleTemplate, setLifecycleTemplate] = useState<ReportTemplate | null>(null);
+  // #8796: who a curated template's report is for and where it is sent —
+  // Covers (W03), the single-org schedule, contacts and addresses. One value
+  // for whichever curated modal is open; reset on every modal open. The
+  // single-org target stays W01's page-level orgTarget.
+  const [templateDelivery, setTemplateDelivery] = useState<TemplateDeliveryValue>(() => initialTemplateDelivery(undefined));
+  const [seriesScheduleMissing, setSeriesScheduleMissing] = useState(false);
   const [lifecycleOptions, setLifecycleOptions] = useState<HardwareLifecycleOptions>(DEFAULT_HARDWARE_LIFECYCLE_OPTIONS);
   const [threatTemplate, setThreatTemplate] = useState<ReportTemplate | null>(null);
   const [threatOptions, setThreatOptions] = useState<ThreatDetectionOptions>(DEFAULT_THREAT_DETECTION_OPTIONS);
@@ -425,8 +762,36 @@ export default function ReportTemplates() {
   const [endpointManagementOptions, setEndpointManagementOptions] = useState<EndpointManagementOptions>(DEFAULT_ENDPOINT_MANAGEMENT_OPTIONS);
   const [vulnerabilityTemplate, setVulnerabilityTemplate] = useState<ReportTemplate | null>(null);
   const [vulnerabilityOptions, setVulnerabilityOptions] = useState<VulnerabilityManagementOptions>(DEFAULT_VULNERABILITY_MANAGEMENT_OPTIONS);
+  const [backupStatusTemplate, setBackupStatusTemplate] = useState<ReportTemplate | null>(null);
+  const [backupStatusOptions, setBackupStatusOptions] = useState<BackupStatusOptions>(DEFAULT_BACKUP_STATUS_OPTIONS);
   const [identityTemplate, setIdentityTemplate] = useState<ReportTemplate | null>(null);
   const [identityOptions, setIdentityOptions] = useState<IdentityAccessOptions>(DEFAULT_IDENTITY_ACCESS_OPTIONS);
+  const [slaPerformanceTemplate, setSlaPerformanceTemplate] = useState<ReportTemplate | null>(null);
+  const [slaPerformanceOptions, setSlaPerformanceOptions] = useState<TicketSlaPerformanceOptions>(DEFAULT_TICKET_SLA_PERFORMANCE_OPTIONS);
+  // One options modal for the three business report types (#3198 W03); the
+  // template's type picks which form it renders.
+  const [businessTemplate, setBusinessTemplate] = useState<ReportTemplate | null>(null);
+  const [ticketSlaOptions, setTicketSlaOptions] = useState<TicketSlaOptions>(DEFAULT_TICKET_SLA_OPTIONS);
+  const [technicianTimeOptions, setTechnicianTimeOptions] = useState<TechnicianTimeOptions>(DEFAULT_TECHNICIAN_TIME_OPTIONS);
+  const [arAgingOptions, setArAgingOptions] = useState<ArAgingOptions>(DEFAULT_AR_AGING_OPTIONS);
+  const [aiUsageOptions, setAiUsageOptions] = useState<AiUsageByClientOptions>(DEFAULT_AI_USAGE_BY_CLIENT_OPTIONS);
+  const [mrrRenewalsOptions, setMrrRenewalsOptions] = useState<MrrRenewalsOptions>(DEFAULT_MRR_RENEWALS_OPTIONS);
+  const [quoteWinRateOptions, setQuoteWinRateOptions] = useState<QuoteWinRateOptions>(DEFAULT_QUOTE_WIN_RATE_OPTIONS);
+  const [clientProfitabilityOptions, setClientProfitabilityOptions] = useState<ClientProfitabilityOptions>(DEFAULT_CLIENT_PROFITABILITY_OPTIONS);
+  // Create-only ownership for the business modal. The selector renders only
+  // for a resolved partner-scope token; everyone else creates org-owned.
+  const {
+    canChoose: canChooseOwnerScope,
+    defaultScope: defaultOwnerScope,
+    needsOrganization: ownerNeedsOrganization,
+  } = useDefaultReportOwnerScope();
+  const [ownerScope, setOwnerScope] = useState<ReportOwnerScope>('organization');
+  // A token can go from partner-scope to org-scope mid-session (e.g. a
+  // refresh while the modal is open) without the `ownerScope` state — set
+  // when the modal opened, or by the now-hidden radio — ever changing. Never
+  // trust that state once canChoose has gone false; a de-privileged token
+  // can no longer legally submit 'partner'.
+  const effectiveOwnerScope: ReportOwnerScope = canChooseOwnerScope ? ownerScope : 'organization';
   const [builderOpen, setBuilderOpen] = useState(false);
   const [creatingId, setCreatingId] = useState<string | null>(null);
 
@@ -436,7 +801,7 @@ export default function ReportTemplates() {
     try {
       const response = await fetchWithAuth('/reports/templates');
       if (!response.ok) {
-        throw new Error(t('reports.reportTemplates.errors.fetchTemplates'));
+        throw new Error(stableT('reports.reportTemplates.errors.fetchTemplates'));
       }
       const data = await response.json();
       const items = asList<TemplateApiItem>(data, 'templates');
@@ -444,11 +809,11 @@ export default function ReportTemplates() {
         setTemplates(mergeTemplates(items));
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('reports.reportTemplates.errors.loadTemplates'));
+      setError(err instanceof Error ? err.message : stableT('reports.reportTemplates.errors.loadTemplates'));
     } finally {
       setLoading(false);
     }
-  }, [t]);
+  }, [stableT]);
 
   useEffect(() => {
     fetchTemplates();
@@ -459,34 +824,164 @@ export default function ReportTemplates() {
     setBuilderOpen(true);
   }, []);
 
+  /**
+   * Attach org contacts to a just-created report. Every contact is tried (one
+   * refused contact must not cost the others); false when any failed. API
+   * refusals are reported once by the caller rather than per contact — a
+   * network failure still gets runAction's own toast. An expired session
+   * (401) is not a recipient failure: it redirects and rethrows.
+   */
+  const attachContactRecipients = useCallback(
+    async (reportId: string, contactIds: string[]): Promise<boolean> => {
+      let allAttached = true;
+      for (const contactId of contactIds) {
+        try {
+          await runAction({
+            request: () =>
+              fetchWithAuth(`/reports/${reportId}/recipients`, {
+                method: 'POST',
+                body: JSON.stringify({ contactId })
+              }),
+            errorFallback: t('reports.reportBuilder.recipients.updateFailed'),
+            suppressErrorToast: () => true,
+            onUnauthorized: () => {
+              void navigateTo('/login', { replace: true });
+            }
+          });
+        } catch (err) {
+          if (err instanceof ActionError && err.status === 401) throw err;
+          console.warn('[ReportTemplates] could not attach a report recipient', { reportId, contactId, err });
+          allAttached = false;
+        }
+      }
+      return allAttached;
+    },
+    [t]
+  );
+
   // Reports whose type the freeform builder would downgrade are saved directly
   // with their true type instead of being routed through it.
   const handleCreateDirect = useCallback(
-    async (template: ReportTemplate, postureConfig: Record<string, unknown> = {}) => {
+    async (
+      template: ReportTemplate,
+      postureConfig: Record<string, unknown> = {},
+      owner: ReportOwnerScope = 'organization',
+      delivery?: TemplateDeliveryValue,
+    ) => {
+      const covers = delivery?.covers;
+      // Defense in depth — handleUseTemplate already refuses to open a
+      // template without an org; nothing that would 400 is ever sent.
+      if (owner === 'organization' && covers?.mode !== 'series' && orgTarget.missing) {
+        setError(t('reports.orgPicker.chooseFirst'));
+        return;
+      }
       setCreatingId(template.id);
+      const isBusiness = isBusinessReportType(template.defaults.type);
       try {
-        await runAction({
+        if (covers?.mode === 'series') {
+          if (covers.targetMode === 'selected' && covers.orgIds.length === 0) {
+            showToast({ type: 'error', message: t('reports.series.targeting.noneSelected') });
+            return;
+          }
+          // Recurring-only: the user must have picked a schedule (never defaulted
+          // from a one-time template). The field shows the required message.
+          const seriesSchedule = delivery?.seriesSchedule;
+          if (!seriesSchedule) {
+            setSeriesScheduleMissing(true);
+            return;
+          }
+          const name = template.defaults.name ?? template.name;
+          const created = await createSeries(
+            {
+              name,
+              type: template.defaults.type as string,
+              format: template.defaults.format ?? 'pdf',
+              schedule: seriesSchedule,
+              config: stripSeriesConfig({ dateRange: template.defaults.dateRange ?? { preset: 'last_30_days' }, ...postureConfig }),
+              targetMode: covers.targetMode,
+              orgIds: covers.orgIds,
+              recipientRule: covers.recipientRule,
+              internalCc: covers.internalCc,
+            },
+            {
+              errorFallback: t('reports.series.builder.saveFailed'),
+              successMessage: t('reports.series.builder.created', { name }),
+            },
+          );
+          void navigateTo(created?.series?.id ? `/reports#series/${created.series.id}` : '/reports');
+          return;
+        }
+        // #8796: a curated dialog says when the report runs and who receives
+        // it; a template without one (executive summary, business) keeps its
+        // own cadence and no recipients.
+        const singleOrg = delivery ? singleOrgDeliveryOf(delivery) : null;
+        const name = template.defaults.name ?? template.name;
+        const created = await runAction<{ id?: string } | null>({
           request: () =>
             fetchWithAuth('/reports', {
               method: 'POST',
               body: JSON.stringify({
-                name: template.defaults.name ?? template.name,
+                name,
                 type: template.defaults.type,
-                schedule: template.defaults.schedule ?? 'one_time',
+                schedule: singleOrg?.schedule ?? template.defaults.schedule ?? 'one_time',
                 format: template.defaults.format ?? 'pdf',
-                ...(currentOrgId ? { orgId: currentOrgId } : {}),
-                config: {
-                  dateRange: template.defaults.dateRange ?? { preset: 'last_30_days' },
-                  ...postureConfig
-                }
+                // Ownership. A business create states it explicitly: `ownerScope`
+                // is the only ownership input — the partner id is derived
+                // server-side from auth.partnerId, and a partner-owned report
+                // has no orgId by construction (the API's partner arm is
+                // `orgId: z.never()`, so an orgId beside it is a 400). Every
+                // other type keeps its original org-owned body.
+                ...(isBusiness && owner === 'partner'
+                  ? { ownerScope: 'partner' as const }
+                  : {
+                      ...(isBusiness ? { ownerScope: 'organization' as const } : {}),
+                      ...(orgTarget.orgId ? { orgId: orgTarget.orgId } : {})
+                    }),
+                // Business report config schemas (#3198) REFUSE a dateRange
+                // (and filters/sites/orgId/orgIds/siteIds/deviceIds) that
+                // "selects something" — the server 400s. Those types have no
+                // ad-hoc selection at all, so the config is exactly what the
+                // type's options form mapped (`*ConfigFromOptions`), never a
+                // dateRange.
+                config: isBusiness
+                  ? { ...postureConfig }
+                  : {
+                      // The same refusal, on an org-owned type that keeps its delivery keys.
+                      ...(isSelectorlessOrgReportType(template.defaults.type)
+                        ? {}
+                        : { dateRange: template.defaults.dateRange ?? { preset: 'last_30_days' } }),
+                      ...postureConfig,
+                      ...(singleOrg && singleOrg.emailRecipients.length > 0
+                        ? { emailRecipients: singleOrg.emailRecipients }
+                        : {})
+                    }
               })
           }),
           errorFallback: t('reports.reportTemplates.errors.createReport'),
-          successMessage: t('reports.reportTemplates.success.created', { name: template.defaults.name ?? template.name }),
+          successMessage: t('reports.reportTemplates.success.created', { name }),
           onUnauthorized: () => {
             void navigateTo('/login', { replace: true });
           }
         });
+        // Contact recipients hang off the saved report (POST
+        // /reports/:id/recipients), so they attach once it exists. A failure
+        // there leaves a report without the recipients the user asked for:
+        // say so and open that report, where its delivery section can finish
+        // the job, instead of landing on the list as if all went well.
+        if (singleOrg && singleOrg.contactIds.length > 0) {
+          const reportId = created?.id;
+          if (!reportId) {
+            // The create succeeded but named no report to attach to (never
+            // expected from POST /reports, which returns the row).
+            console.error('[ReportTemplates] report created without an id; recipients not attached', { name, created });
+          }
+          const attached = reportId ? await attachContactRecipients(reportId, singleOrg.contactIds) : false;
+          if (!attached) {
+            showToast({ type: 'error', message: t('reports.reportTemplates.delivery.recipientsFailed', { name }) });
+            void navigateTo(reportId ? `/reports/${reportId}/edit` : '/reports');
+            return;
+          }
+        }
         void navigateTo('/reports');
       } catch {
         // runAction already surfaced the failure (toast, or redirect on 401).
@@ -494,7 +989,7 @@ export default function ReportTemplates() {
         setCreatingId(null);
       }
     },
-    [currentOrgId, t]
+    [attachContactRecipients, orgTarget.orgId, orgTarget.missing, t]
   );
 
   const handleUseTemplate = useCallback(
@@ -503,6 +998,27 @@ export default function ReportTemplates() {
       // would silently downgrade them) are created directly; everything the
       // builder round-trips losslessly goes through the builder for tailoring.
       const type = template.defaults.type;
+      // A business template carries its own ownership control (partner-owned
+      // by default under All organizations); every other template needs an org.
+      // W03: a partner-wide user may open a series-eligible template with no
+      // org picked — it can be sent as one report per organization. The org
+      // is still required (handleCreateDirect, and the builder's own guard)
+      // if they keep it to one organization.
+      // Only templates whose modal shows the Covers control can fan out: the
+      // curated template modals (#8796) and the builder (builder-representable
+      // types). Business types have their own ownership control.
+      const showsCovers =
+        hasTemplateOptionsForm(type)
+        || (type !== undefined && reportTypeSurvivesBuilder(type));
+      const mayFanOut = canChooseOwnerScope && isSeriesEligibleReportType(type) && showsCovers;
+      if (!isBusinessReportType(type) && orgTarget.missing && !mayFanOut) {
+        setError(t('reports.orgPicker.chooseFirst'));
+        return;
+      }
+      if (hasTemplateOptionsForm(type)) {
+        setTemplateDelivery(initialTemplateDelivery(template.defaults.schedule));
+        setSeriesScheduleMissing(false);
+      }
       if (type === 'security_compliance_posture') {
         setBackupRequired(false);
         setPostureTemplate(template);
@@ -511,6 +1027,11 @@ export default function ReportTemplates() {
       if (type === 'hardware_lifecycle') {
         setLifecycleOptions(DEFAULT_HARDWARE_LIFECYCLE_OPTIONS);
         setLifecycleTemplate(template);
+        return;
+      }
+      if (type === 'backup_status') {
+        setBackupStatusOptions(DEFAULT_BACKUP_STATUS_OPTIONS);
+        setBackupStatusTemplate(template);
         return;
       }
       if (type === 'threat_detection_review') {
@@ -533,13 +1054,161 @@ export default function ReportTemplates() {
         setIdentityTemplate(template);
         return;
       }
+      if (type === 'ticket_sla_performance') {
+        setSlaPerformanceOptions(DEFAULT_TICKET_SLA_PERFORMANCE_OPTIONS);
+        setSlaPerformanceTemplate(template);
+        return;
+      }
+      if (isBusinessReportType(type)) {
+        // Seeded on every open — never the last submission's values: a saved
+        // report opens with the options it stored (the ones its card's Default
+        // range tile describes), a curated card with the form defaults.
+        const saved = template.savedBusinessConfig;
+        setTicketSlaOptions(saved ? ticketSlaOptionsFromConfig(saved) : DEFAULT_TICKET_SLA_OPTIONS);
+        setTechnicianTimeOptions(saved ? technicianTimeOptionsFromConfig(saved) : DEFAULT_TECHNICIAN_TIME_OPTIONS);
+        setArAgingOptions(saved ? arAgingOptionsFromConfig(saved) : DEFAULT_AR_AGING_OPTIONS);
+        setAiUsageOptions(saved ? aiUsageByClientOptionsFromConfig(saved) : DEFAULT_AI_USAGE_BY_CLIENT_OPTIONS);
+        setMrrRenewalsOptions(saved ? mrrRenewalsOptionsFromConfig(saved) : DEFAULT_MRR_RENEWALS_OPTIONS);
+        setQuoteWinRateOptions(saved ? quoteWinRateOptionsFromConfig(saved) : DEFAULT_QUOTE_WIN_RATE_OPTIONS);
+        setClientProfitabilityOptions(saved ? clientProfitabilityOptionsFromConfig(saved) : DEFAULT_CLIENT_PROFITABILITY_OPTIONS);
+        setOwnerScope(defaultOwnerScope);
+        setBusinessTemplate(template);
+        return;
+      }
       if (type && !reportTypeSurvivesBuilder(type)) {
         void handleCreateDirect(template);
         return;
       }
       handleOpenBuilder(template);
     },
-    [handleCreateDirect, handleOpenBuilder]
+    [defaultOwnerScope, handleCreateDirect, handleOpenBuilder, orgTarget.missing, t, canChooseOwnerScope]
+  );
+
+  const renderBusinessOptionsForm = (template: ReportTemplate) => {
+    const shared = {
+      busy: creatingId === template.id,
+      onCancel: () => setBusinessTemplate(null),
+    };
+    switch (template.defaults.type) {
+      case 'ticket_sla_attainment':
+        return (
+          <TicketSlaOptionsForm
+            {...shared}
+            value={ticketSlaOptions}
+            onChange={setTicketSlaOptions}
+            submitLabel={t('reports.ticketSlaOptions.createReport')}
+            onSubmit={() => {
+              void handleCreateDirect(template, ticketSlaConfigFromOptions(ticketSlaOptions), effectiveOwnerScope);
+            }}
+          />
+        );
+      case 'technician_time_billability':
+        return (
+          <TechnicianTimeOptionsForm
+            {...shared}
+            value={technicianTimeOptions}
+            onChange={setTechnicianTimeOptions}
+            submitLabel={t('reports.technicianTimeOptions.createReport')}
+            onSubmit={() => {
+              void handleCreateDirect(template, technicianTimeConfigFromOptions(technicianTimeOptions), effectiveOwnerScope);
+            }}
+          />
+        );
+      case 'ar_aging':
+        return (
+          <ArAgingOptionsForm
+            {...shared}
+            value={arAgingOptions}
+            onChange={setArAgingOptions}
+            submitLabel={t('reports.arAgingOptions.createReport')}
+            onSubmit={() => {
+              void handleCreateDirect(template, arAgingConfigFromOptions(arAgingOptions), effectiveOwnerScope);
+            }}
+          />
+        );
+      case 'ai_usage_by_client':
+        return (
+          <AiUsageByClientOptionsForm
+            {...shared}
+            value={aiUsageOptions}
+            onChange={setAiUsageOptions}
+            submitLabel={t('reports.aiUsageByClientOptions.createReport')}
+            onSubmit={() => {
+              void handleCreateDirect(template, aiUsageByClientConfigFromOptions(aiUsageOptions), effectiveOwnerScope);
+            }}
+          />
+        );
+      case 'mrr_renewals':
+        return (
+          <MrrRenewalsOptionsForm
+            {...shared}
+            value={mrrRenewalsOptions}
+            onChange={setMrrRenewalsOptions}
+            submitLabel={t('reports.mrrRenewalsOptions.createReport')}
+            onSubmit={() => {
+              void handleCreateDirect(template, mrrRenewalsConfigFromOptions(mrrRenewalsOptions), effectiveOwnerScope);
+            }}
+          />
+        );
+      case 'quote_win_rate':
+        return (
+          <QuoteWinRateOptionsForm
+            {...shared}
+            value={quoteWinRateOptions}
+            onChange={setQuoteWinRateOptions}
+            submitLabel={t('reports.quoteWinRateOptions.createReport')}
+            onSubmit={() => {
+              void handleCreateDirect(template, quoteWinRateConfigFromOptions(quoteWinRateOptions), effectiveOwnerScope);
+            }}
+          />
+        );
+      case 'client_profitability':
+        return (
+          <ClientProfitabilityOptionsForm
+            {...shared}
+            value={clientProfitabilityOptions}
+            onChange={setClientProfitabilityOptions}
+            submitLabel={t('reports.clientProfitabilityOptions.createReport')}
+            onSubmit={() => {
+              void handleCreateDirect(template, clientProfitabilityConfigFromOptions(clientProfitabilityOptions), effectiveOwnerScope);
+            }}
+          />
+        );
+      default:
+        return null;
+    }
+  };
+
+  /**
+   * The modal shell every curated template shares (#8796): the template's name,
+   * who the report is for and where it is sent (TemplateDeliveryFields), then
+   * the template's own options form with its Create / Cancel buttons. It
+   * scrolls, because Covers + recipients outgrow a laptop viewport.
+   */
+  const renderTemplateModal = (template: ReportTemplate, optionsForm: ReactNode) => (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
+      <div
+        data-testid={`template-modal-${template.defaults.type}`}
+        className="w-full max-w-lg max-h-[90vh] overflow-y-auto rounded-lg border bg-card p-6 shadow-lg"
+      >
+        <h2 className="text-lg font-semibold">
+          {t('reports.reportTemplates.useTemplateTitle', { name: getTemplateDisplayName(template) })}
+        </h2>
+        <div className="mt-5 space-y-4">
+          <TemplateDeliveryFields
+            reportType={template.defaults.type ?? ''}
+            value={templateDelivery}
+            onChange={(next) => {
+              setTemplateDelivery(next);
+              if (next.seriesSchedule) setSeriesScheduleMissing(false);
+            }}
+            orgTarget={orgTarget}
+            seriesScheduleMissing={seriesScheduleMissing}
+          />
+          {optionsForm}
+        </div>
+      </div>
+    </div>
   );
 
   const handleCloseBuilder = useCallback(() => {
@@ -572,15 +1241,110 @@ export default function ReportTemplates() {
   const getScheduleLabel = (schedule: ReportSchedule) => t(/* i18n-dynamic */ `reports.reportTemplates.schedules.${schedule}`);
   const getFormatLabel = (format: ReportFormat) => t(/* i18n-dynamic */ `reports.reportTemplates.formats.${format}`);
   const getTemplateDisplayName = (template: ReportTemplate) =>
-    t(/* i18n-dynamic */ `reports.reportTemplates.templates.${template.id}.name`, { defaultValue: template.name });
+    defaultTemplateIds.has(template.id)
+      ? t(/* i18n-dynamic */ `reports.reportTemplates.templates.${template.id}.name`, { defaultValue: template.name })
+      : template.name;
   const getTemplateDescription = (template: ReportTemplate) =>
-    t(/* i18n-dynamic */ `reports.reportTemplates.templates.${template.id}.description`, { defaultValue: template.description });
+    defaultTemplateIds.has(template.id)
+      ? t(/* i18n-dynamic */ `reports.reportTemplates.templates.${template.id}.description`, { defaultValue: template.description })
+      : template.description;
+
+  // The Business group is MSP-internal (audience: msp_staff) and every type in
+  // it 403s for an org-scope caller — so hide the section entirely unless the
+  // JWT claims are resolved to partner scope (never on 'unresolved', which is
+  // "unknown", not "denied"), and hide any card the user individually lacks
+  // the required permission for.
+  const isPartnerScope = jwtClaims.status === 'resolved' && jwtClaims.claims.scope === 'partner';
+  const businessTemplates = useMemo(
+    () =>
+      !isPartnerScope
+        ? []
+        : templates.filter(t => t.group === 'business' && canUseBusinessReportType(t.defaults.type)),
+    [templates, isPartnerScope, canUseBusinessReportType]
+  );
+  const generalTemplates = useMemo(
+    () => templates.filter(t => t.group !== 'business' && canUseBusinessReportType(t.defaults.type)),
+    [templates, canUseBusinessReportType]
+  );
+
+  const renderCard = (template: ReportTemplate) => {
+    const Icon = template.icon;
+    const scheduleLabel = template.defaults.schedule
+      ? getScheduleLabel(template.defaults.schedule)
+      : t('reports.reportTemplates.custom');
+    const formatLabel = template.defaults.format ? getFormatLabel(template.defaults.format) : t('reports.reportTemplates.custom');
+    const reportTypeLabel = template.defaults.type ? getReportTypeLabel(template.defaults.type) : t('reports.reportTemplates.template');
+    const displayName = getTemplateDisplayName(template);
+    const description = getTemplateDescription(template);
+
+    return (
+      <div
+        key={template.id}
+        data-testid={`report-template-card-${template.id}`}
+        className="group flex h-full flex-col rounded-lg border bg-card p-5 shadow-xs transition hover:-translate-y-1 hover:shadow-md"
+      >
+        <div className="flex items-start justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <div className={cn('flex h-10 w-10 items-center justify-center rounded-md', template.tone.iconBg)}>
+              <Icon className={cn('h-5 w-5', template.tone.iconColor)} />
+            </div>
+            <div>
+              <p className="text-sm font-semibold">{displayName}</p>
+              <p
+                data-testid={`report-template-type-${template.defaults.type ?? 'unknown'}`}
+                className="text-xs text-muted-foreground"
+              >
+                {reportTypeLabel}
+              </p>
+            </div>
+          </div>
+        </div>
+
+        <p className="mt-3 text-sm text-muted-foreground">{description}</p>
+
+        <TemplatePreviewImage
+          template={template}
+          alt={t('reports.reportTemplates.previewAlt', { name: displayName })}
+        />
+
+        <TemplateSpec
+          items={[
+            { label: t('reports.reportTemplates.spec.cadence'), value: scheduleLabel },
+            { label: t('reports.reportTemplates.spec.format'), value: formatLabel },
+            {
+              label: t('reports.reportTemplates.spec.defaultRange'),
+              // Business types derive it from their period / asOf, never the
+              // dateRange they cannot carry (see businessDefaultRange).
+              value:
+                businessDefaultRange(template, t)
+                  ?? (template.defaults.dateRange?.preset
+                      ? template.defaults.dateRange.preset.replace(/_/g, ' ')
+                      : t('reports.reportTemplates.custom')),
+            },
+          ]}
+        />
+
+        <div className="mt-auto pt-4">
+          <button
+            type="button"
+            data-testid={`report-template-use-${template.id}`}
+            onClick={() => handleUseTemplate(template)}
+            disabled={creatingId === template.id}
+            className="inline-flex h-9 w-full items-center justify-center gap-2 rounded-md bg-primary px-4 text-xs font-semibold text-primary-foreground transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {creatingId === template.id && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+            {t('reports.reportTemplates.useTemplate')}
+          </button>
+        </div>
+      </div>
+    );
+  };
 
   return (
     <div className="space-y-6">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
-          <h1 className="text-xl font-semibold tracking-tight">{t('reports.reportTemplates.title')}</h1>
+          <h1 data-testid="reports-templates-heading" className="text-xl font-semibold tracking-tight">{t('reports.reportTemplates.title')}</h1>
           <p className="text-sm text-muted-foreground">
             {t('reports.reportTemplates.description')}
           </p>
@@ -603,72 +1367,40 @@ export default function ReportTemplates() {
         </div>
       </div>
 
+      {orgTarget.pickerVisible && (
+        <div className="max-w-sm">
+          <OrgPickerField
+            testId="report-templates-org-picker"
+            id="report-templates-target-org"
+            value={orgTarget.pickedOrgId}
+            onChange={(orgId) => {
+              orgTarget.setPickedOrgId(orgId);
+              setError(undefined);
+            }}
+            options={orgTarget.options}
+          />
+        </div>
+      )}
+
       {error && (
         <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
           {error}
         </div>
       )}
 
-      <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
-        {templates.map(template => {
-          const Icon = template.icon;
-          const scheduleLabel = template.defaults.schedule
-            ? getScheduleLabel(template.defaults.schedule)
-            : t('reports.reportTemplates.custom');
-          const formatLabel = template.defaults.format ? getFormatLabel(template.defaults.format) : t('reports.reportTemplates.custom');
-          const reportTypeLabel = template.defaults.type ? getReportTypeLabel(template.defaults.type) : t('reports.reportTemplates.template');
-          const displayName = getTemplateDisplayName(template);
-          const description = getTemplateDescription(template);
-
-          return (
-            <div
-              key={template.id}
-              className="group flex h-full flex-col rounded-lg border bg-card p-5 shadow-xs transition hover:-translate-y-1 hover:shadow-md"
-            >
-              <div className="flex items-start justify-between gap-3">
-                <div className="flex items-center gap-3">
-                  <div className={cn('flex h-10 w-10 items-center justify-center rounded-md', template.tone.iconBg)}>
-                    <Icon className={cn('h-5 w-5', template.tone.iconColor)} />
-                  </div>
-                  <div>
-                    <p className="text-sm font-semibold">{displayName}</p>
-                    <p className="text-xs text-muted-foreground">{reportTypeLabel}</p>
-                  </div>
-                </div>
-              </div>
-
-              <p className="mt-3 text-sm text-muted-foreground">{description}</p>
-
-              <TemplatePreviewImage
-                template={template}
-                alt={t('reports.reportTemplates.previewAlt', { name: displayName })}
-              />
-
-              <TemplateSpec
-                items={[
-                  { label: t('reports.reportTemplates.spec.cadence'), value: scheduleLabel },
-                  { label: t('reports.reportTemplates.spec.format'), value: formatLabel },
-                  {
-                    label: t('reports.reportTemplates.spec.defaultRange'),
-                    value: template.defaults.dateRange?.preset?.replace(/_/g, ' ') ?? t('reports.reportTemplates.last30Days'),
-                  },
-                ]}
-              />
-
-              <div className="mt-auto pt-4">
-                <button
-                  type="button"
-                  onClick={() => handleUseTemplate(template)}
-                  disabled={creatingId === template.id}
-                  className="inline-flex h-9 w-full items-center justify-center gap-2 rounded-md bg-primary px-4 text-xs font-semibold text-primary-foreground transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
-                >
-                  {creatingId === template.id && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-                  {t('reports.reportTemplates.useTemplate')}
-                </button>
-              </div>
-            </div>
-          );
-        })}
+      <div className="space-y-8">
+        {businessTemplates.length > 0 && (
+          <TemplateSection
+            group="business"
+            title={t('reports.reportTemplates.groups.business')}
+            description={t('reports.reportTemplates.groups.businessDescription')}
+          >
+            {businessTemplates.map(renderCard)}
+          </TemplateSection>
+        )}
+        <TemplateSection group="general" title={t('reports.reportTemplates.groups.general')}>
+          {generalTemplates.map(renderCard)}
+        </TemplateSection>
       </div>
 
       {builderOpen && (
@@ -701,6 +1433,7 @@ export default function ReportTemplates() {
                 key={activeTemplate?.id ?? 'custom-template'}
                 mode="create"
                 defaultValues={builderDefaults}
+                defaultOrgId={orgTarget.orgId}
                 onSubmit={handleSubmit}
                 onCancel={handleCloseBuilder}
               />
@@ -709,148 +1442,155 @@ export default function ReportTemplates() {
         </div>
       )}
 
-      {lifecycleTemplate && (
+      {lifecycleTemplate && renderTemplateModal(
+        lifecycleTemplate,
+        <HardwareLifecycleOptionsForm
+          value={lifecycleOptions}
+          onChange={setLifecycleOptions}
+          busy={creatingId === lifecycleTemplate.id}
+          submitLabel={t('reports.lifecycleOptions.createReport')}
+          onCancel={() => setLifecycleTemplate(null)}
+          onSubmit={() => {
+            void handleCreateDirect(lifecycleTemplate, { ...lifecycleOptions }, 'organization', templateDelivery);
+          }}
+        />
+      )}
+
+      {threatTemplate && renderTemplateModal(
+        threatTemplate,
+        <ThreatDetectionOptionsForm
+          value={threatOptions}
+          onChange={setThreatOptions}
+          busy={creatingId === threatTemplate.id}
+          submitLabel={t('reports.threatDetectionOptions.createReport')}
+          onCancel={() => setThreatTemplate(null)}
+          onSubmit={() => {
+            void handleCreateDirect(threatTemplate, { ...threatOptions }, 'organization', templateDelivery);
+          }}
+        />
+      )}
+
+      {endpointManagementTemplate && renderTemplateModal(
+        endpointManagementTemplate,
+        <EndpointManagementOptionsForm
+          value={endpointManagementOptions}
+          onChange={setEndpointManagementOptions}
+          busy={creatingId === endpointManagementTemplate.id}
+          submitLabel={t('reports.endpointManagementOptions.createReport')}
+          onCancel={() => setEndpointManagementTemplate(null)}
+          onSubmit={() => {
+            void handleCreateDirect(endpointManagementTemplate, { ...endpointManagementOptions }, 'organization', templateDelivery);
+          }}
+        />
+      )}
+
+      {vulnerabilityTemplate && renderTemplateModal(
+        vulnerabilityTemplate,
+        <VulnerabilityManagementOptionsForm
+          value={vulnerabilityOptions}
+          onChange={setVulnerabilityOptions}
+          busy={creatingId === vulnerabilityTemplate.id}
+          submitLabel={t('reports.vulnerabilityManagementOptions.createReport')}
+          onCancel={() => setVulnerabilityTemplate(null)}
+          onSubmit={() => {
+            void handleCreateDirect(vulnerabilityTemplate, { ...vulnerabilityOptions }, 'organization', templateDelivery);
+          }}
+        />
+      )}
+
+      {backupStatusTemplate && renderTemplateModal(
+        backupStatusTemplate,
+        <BackupStatusOptionsForm
+          value={backupStatusOptions}
+          onChange={setBackupStatusOptions}
+          busy={creatingId === backupStatusTemplate.id}
+          submitLabel={t('reports.backupStatusOptions.createReport')}
+          onCancel={() => setBackupStatusTemplate(null)}
+          onSubmit={() => {
+            void handleCreateDirect(backupStatusTemplate, { ...backupStatusOptions }, 'organization', templateDelivery);
+          }}
+        />
+      )}
+
+      {identityTemplate && renderTemplateModal(
+        identityTemplate,
+        <IdentityAccessOptionsForm
+          value={identityOptions}
+          onChange={setIdentityOptions}
+          busy={creatingId === identityTemplate.id}
+          submitLabel={t('reports.identityAccessOptions.createReport')}
+          onCancel={() => setIdentityTemplate(null)}
+          onSubmit={() => {
+            void handleCreateDirect(identityTemplate, { ...identityOptions }, 'organization', templateDelivery);
+          }}
+        />
+      )}
+
+      {slaPerformanceTemplate && renderTemplateModal(
+        slaPerformanceTemplate,
+        <TicketSlaPerformanceOptionsForm
+          value={slaPerformanceOptions}
+          onChange={setSlaPerformanceOptions}
+          busy={creatingId === slaPerformanceTemplate.id}
+          submitLabel={t('reports.ticketSlaPerformanceOptions.createReport')}
+          onCancel={() => setSlaPerformanceTemplate(null)}
+          onSubmit={() => {
+            void handleCreateDirect(slaPerformanceTemplate, ticketSlaPerformanceConfigFromOptions(slaPerformanceOptions), 'organization', templateDelivery);
+          }}
+        />
+      )}
+
+      {businessTemplate && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
-          <div className="w-full max-w-lg rounded-lg border bg-card p-6 shadow-lg">
+          <div
+            data-testid="business-report-options-modal"
+            className="max-h-[90vh] w-full max-w-lg overflow-y-auto rounded-lg border bg-card p-6 shadow-lg"
+          >
             <h2 className="text-lg font-semibold">
               {t('reports.reportTemplates.useTemplateTitle', {
-                name: getTemplateDisplayName(lifecycleTemplate),
+                name: getTemplateDisplayName(businessTemplate),
               })}
             </h2>
-            <div className="mt-5">
-              <HardwareLifecycleOptionsForm
-                value={lifecycleOptions}
-                onChange={setLifecycleOptions}
-                busy={creatingId === lifecycleTemplate.id}
-                submitLabel={t('reports.lifecycleOptions.createReport')}
-                onCancel={() => setLifecycleTemplate(null)}
-                onSubmit={() => {
-                  void handleCreateDirect(lifecycleTemplate, { ...lifecycleOptions });
-                }}
-              />
+            {/* Ownership (the create-only ownerScope selector) is common to all
+                three business types, so it belongs here in the shared shell,
+                above the type-specific form, and its value joins the POST
+                body in handleCreateDirect beside `config`. */}
+            <div className="mt-5 space-y-4">
+              <ReportOwnerScopeField value={ownerScope} onChange={setOwnerScope} />
+              {/* A user who may only create single-organization reports, with
+                  no organization focused: nothing could own the report, so the
+                  field shows a pick-an-organization hint and there is no form
+                  to submit — only a way out. */}
+              {ownerNeedsOrganization ? (
+                <div className="flex justify-end">
+                  <button
+                    type="button"
+                    className="rounded-md border px-4 py-2 text-sm"
+                    onClick={() => setBusinessTemplate(null)}
+                  >
+                    {t('common:actions.cancel')}
+                  </button>
+                </div>
+              ) : (
+                renderBusinessOptionsForm(businessTemplate)
+              )}
             </div>
           </div>
         </div>
       )}
 
-      {threatTemplate && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
-          <div className="w-full max-w-lg rounded-lg border bg-card p-6 shadow-lg">
-            <h2 className="text-lg font-semibold">
-              {t('reports.reportTemplates.useTemplateTitle', {
-                name: getTemplateDisplayName(threatTemplate),
-              })}
-            </h2>
-            <div className="mt-5">
-              <ThreatDetectionOptionsForm
-                value={threatOptions}
-                onChange={setThreatOptions}
-                busy={creatingId === threatTemplate.id}
-                submitLabel={t('reports.threatDetectionOptions.createReport')}
-                onCancel={() => setThreatTemplate(null)}
-                onSubmit={() => {
-                  void handleCreateDirect(threatTemplate, { ...threatOptions });
-                }}
-              />
-            </div>
-          </div>
-        </div>
-      )}
-
-      {endpointManagementTemplate && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
-          <div className="w-full max-w-lg rounded-lg border bg-card p-6 shadow-lg">
-            <h2 className="text-lg font-semibold">
-              {t('reports.reportTemplates.useTemplateTitle', {
-                name: getTemplateDisplayName(endpointManagementTemplate),
-              })}
-            </h2>
-            <div className="mt-5">
-              <EndpointManagementOptionsForm
-                value={endpointManagementOptions}
-                onChange={setEndpointManagementOptions}
-                busy={creatingId === endpointManagementTemplate.id}
-                submitLabel={t('reports.endpointManagementOptions.createReport')}
-                onCancel={() => setEndpointManagementTemplate(null)}
-                onSubmit={() => {
-                  void handleCreateDirect(endpointManagementTemplate, { ...endpointManagementOptions });
-                }}
-              />
-            </div>
-          </div>
-        </div>
-      )}
-
-      {vulnerabilityTemplate && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
-          <div className="w-full max-w-lg rounded-lg border bg-card p-6 shadow-lg">
-            <h2 className="text-lg font-semibold">
-              {t('reports.reportTemplates.useTemplateTitle', {
-                name: getTemplateDisplayName(vulnerabilityTemplate),
-              })}
-            </h2>
-            <div className="mt-5">
-              <VulnerabilityManagementOptionsForm
-                value={vulnerabilityOptions}
-                onChange={setVulnerabilityOptions}
-                busy={creatingId === vulnerabilityTemplate.id}
-                submitLabel={t('reports.vulnerabilityManagementOptions.createReport')}
-                onCancel={() => setVulnerabilityTemplate(null)}
-                onSubmit={() => {
-                  void handleCreateDirect(vulnerabilityTemplate, { ...vulnerabilityOptions });
-                }}
-              />
-            </div>
-          </div>
-        </div>
-      )}
-
-      {identityTemplate && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
-          <div className="w-full max-w-lg rounded-lg border bg-card p-6 shadow-lg">
-            <h2 className="text-lg font-semibold">
-              {t('reports.reportTemplates.useTemplateTitle', {
-                name: getTemplateDisplayName(identityTemplate),
-              })}
-            </h2>
-            <div className="mt-5">
-              <IdentityAccessOptionsForm
-                value={identityOptions}
-                onChange={setIdentityOptions}
-                busy={creatingId === identityTemplate.id}
-                submitLabel={t('reports.identityAccessOptions.createReport')}
-                onCancel={() => setIdentityTemplate(null)}
-                onSubmit={() => {
-                  void handleCreateDirect(identityTemplate, { ...identityOptions });
-                }}
-              />
-            </div>
-          </div>
-        </div>
-      )}
-
-      {postureTemplate && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
-          <div className="w-full max-w-lg rounded-lg border bg-card p-6 shadow-lg">
-            <h2 className="text-lg font-semibold">
-              {t('reports.reportTemplates.useTemplateTitle', {
-                name: getTemplateDisplayName(postureTemplate),
-              })}
-            </h2>
-            <div className="mt-5">
-              <PostureReportOptionsForm
-                backupRequired={backupRequired}
-                busy={creatingId === postureTemplate.id}
-                submitLabel={t('reports.postureOptions.createReport')}
-                onBackupRequiredChange={setBackupRequired}
-                onCancel={() => setPostureTemplate(null)}
-                onSubmit={() => {
-                  void handleCreateDirect(postureTemplate, { backupRequired });
-                }}
-              />
-            </div>
-          </div>
-        </div>
+      {postureTemplate && renderTemplateModal(
+        postureTemplate,
+        <PostureReportOptionsForm
+          backupRequired={backupRequired}
+          busy={creatingId === postureTemplate.id}
+          submitLabel={t('reports.postureOptions.createReport')}
+          onBackupRequiredChange={setBackupRequired}
+          onCancel={() => setPostureTemplate(null)}
+          onSubmit={() => {
+            void handleCreateDirect(postureTemplate, { backupRequired }, 'organization', templateDelivery);
+          }}
+        />
       )}
     </div>
   );

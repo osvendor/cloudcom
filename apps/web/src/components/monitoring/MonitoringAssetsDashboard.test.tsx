@@ -79,13 +79,26 @@ describe.each(['responsive-table-desktop', 'responsive-table-cards'])('%s', (sur
       expect(cell).toHaveAttribute('aria-label', 'unknown');
     });
 
-    it('reports a collecting device with its poll age', async () => {
+    it('states each timestamp once per row: SNMP reachability already carries the poll age', async () => {
+      // The row used to read "Last seen 21h ago", "Responding · SNMP Just
+      // now", "Last polled Just now" and "Last polled Just now" — four ages,
+      // three of them the same fact, one of them a discovery-scan time that
+      // read like the device had gone quiet.
       wire();
       render(<MonitoringAssetsDashboard />);
 
       const cell = await (await row()).findByTestId('monitoring-asset-collection-asset-1');
       expect(cell.textContent).toMatch(/Collecting/);
+      expect((await screen.findByTestId(surface)).textContent).not.toMatch(/Last polled|Last seen/);
+    });
+
+    it('keeps the poll age on the collection cell when reachability came from another source', async () => {
+      wire([{ ...baseAsset, reachability: { state: 'responding', source: 'network_check', observedAt: minutesAgo(1), lastKnown: null } }]);
+      render(<MonitoringAssetsDashboard />);
+
+      const cell = await (await row()).findByTestId('monitoring-asset-collection-asset-1');
       expect(cell.textContent).toMatch(/Last polled \d+m ago/);
+      expect((await screen.findByTestId(surface)).textContent?.match(/Last polled/g)).toHaveLength(1);
     });
 
     it('reports W01\'s no_template status as its own state, not as a failure', async () => {
@@ -141,15 +154,32 @@ describe.each(['responsive-table-desktop', 'responsive-table-cards'])('%s', (sur
       expect(JSON.parse((writes()[0]![1] as RequestInit).body as string)).toEqual({ isActive: true });
     });
 
-    it('disables all monitoring through the mutation hook', async () => {
+    it('disables only SNMP through the mutation hook', async () => {
       wire();
       render(<MonitoringAssetsDashboard />);
 
-      fireEvent.click(await (await row()).findByTestId('monitoring-asset-disable-asset-1'));
+      const disable = await (await row()).findByTestId('monitoring-asset-disable-asset-1');
+      expect(disable).toHaveAttribute('title', 'Disable SNMP monitoring');
+      fireEvent.click(disable);
 
       await waitFor(() => expect(writes()).toHaveLength(1));
-      expect(writes()[0]![0]).toBe('/monitoring/assets/asset-1');
-      expect((writes()[0]![1] as RequestInit).method).toBe('DELETE');
+      expect(writes()[0]![0]).toBe('/monitoring/assets/asset-1/snmp');
+      expect((writes()[0]![1] as RequestInit).method).toBe('PATCH');
+      expect(JSON.parse((writes()[0]![1] as RequestInit).body as string)).toEqual({ isActive: false });
+    });
+
+    it.each([
+      { configured: false, isActive: false },
+      { configured: false, isActive: true },
+      { configured: true, isActive: false },
+    ])('hides SNMP disable when SNMP is $configured configured and $isActive active', async (snmp) => {
+      wire([{ ...baseAsset, snmp: { ...baseAsset.snmp, ...snmp } }]);
+      render(<MonitoringAssetsDashboard />);
+
+      const surfaceRow = await row();
+      await surfaceRow.findByTestId('monitoring-asset-settings-asset-1');
+      expect(surfaceRow.queryByTestId('monitoring-asset-disable-asset-1')).not.toBeInTheDocument();
+      expect(writes()).toHaveLength(0);
     });
   });
 
@@ -169,6 +199,17 @@ describe.each(['responsive-table-desktop', 'responsive-table-cards'])('%s', (sur
       await (await row()).findByTestId('monitoring-asset-reachability-asset-1');
 
       expect(fetchMock.mock.calls.some(([url]) => url === '/monitoring/assets/asset-1')).toBe(false);
+    });
+  });
+
+  describe('MonitoringAssetsDashboard — asset type label (#9646)', () => {
+    it('shows the translated type label, not the raw enum', async () => {
+      wire([{ ...baseAsset, assetType: 'access_point' }]);
+      render(<MonitoringAssetsDashboard />);
+
+      const scope = await row();
+      expect(await scope.findByText('Access Point')).toBeInTheDocument();
+      expect(scope.queryByText(/access_point/i)).not.toBeInTheDocument();
     });
   });
 

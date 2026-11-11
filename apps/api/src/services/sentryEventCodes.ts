@@ -29,6 +29,7 @@
  *     ceiling `isBoundedTagValue` enforces.
  */
 export const SENTRY_EVENT_CODES = [
+  'pax8_order_execution_result',
   // --- middleware -------------------------------------------------------
   /** A request was refused by a body-size limit (global gate or route rule). */
   'body_limit_rejected',
@@ -52,6 +53,14 @@ export const SENTRY_EVENT_CODES = [
    * silent, indefinite gap in offline detection for that one device (#5867).
    */
   'offline_detector_invalid_device_row',
+  /**
+   * The maintenance-reboot sweep decided a device should reboot inside its
+   * maintenance window and the dispatch was refused. Not a throw: the sweep
+   * logs it and moves on, and the device is re-evaluated on a later sweep. The
+   * refusal class (`CommandDispatchRefusal`, services/commandQueue.ts) rides
+   * as the `command_dispatch_refusal` tag (#8022).
+   */
+  'maintenance_reboot_dispatch_refused',
 
   // --- database / pool --------------------------------------------------
   /** Pool-health watchdog published a non-healthy verdict. */
@@ -71,6 +80,12 @@ export const SENTRY_EVENT_CODES = [
   'db_contextless_write',
   /** Slow work ran INSIDE a held DB access context (#1105 tripwire). */
   'db_operation_inside_held_context',
+  // #6452 — Redis memory watchdog. Redis runs `noeviction` by contract, so a
+  // full instance fails writes loudly; these give advance warning instead.
+  /** Redis used_memory crossed the configured warn ratio of maxmemory. */
+  'redis_memory_high',
+  /** Redis memory watchdog itself threw while evaluating (e.g. Redis down). */
+  'redis_memory_check_failed',
   /** A compare-and-set write that expected rows affected zero (BREEZE-X). */
   'db_write_expecting_rows_zero',
 
@@ -88,7 +103,7 @@ export const SENTRY_EVENT_CODES = [
   /** The FX provider returned rows the sync could not use. */
   'exchange_rate_rows_rejected',
   /**
-   * One or more durable AI budget reservations (SEC-142/143) reached their TTL
+   * One or more durable AI budget reservations reached their TTL
    * without settling, so the expiry sweep reclaimed the capacity they were
    * holding. A reservation takes the organization's ENTIRE remaining cap, so
    * each of these is a window in which that tenant could not use AI at all —
@@ -154,6 +169,8 @@ export const SENTRY_EVENT_CODES = [
   'accounting_home_currency_cas_lost',
   /** The Intuit webhook route was reached with QBO_WEBHOOK_VERIFIER_TOKEN unset. */
   'accounting_webhook_verifier_token_missing',
+  /** The Xero webhook route was reached with XERO_WEBHOOK_KEY unset. */
+  'accounting_webhook_signing_key_missing',
   /** Inbound mail arrived with no usable provider sender-auth verdict. */
   'inbound_email_sender_auth_unverified',
   /** Inbound mail lost the message-id claim race and duplicated a ticket. */
@@ -165,6 +182,7 @@ export const SENTRY_EVENT_CODES = [
    * the mapping is added.
    */
   'sending_domain_provider_state_unknown',
+  'sending_domain_adoption_refused',
   /** No usable platform LLM key is configured on this deployment. */
   'llm_platform_key_missing',
   /** The LLM egress audit queue shed rows — the audit trail has gaps (#3922). */
@@ -173,10 +191,69 @@ export const SENTRY_EVENT_CODES = [
   // --- ai spend / billing -----------------------------------------------
   /** The billing service's AI-credit check failed; the gate fell open. */
   'ai_billing_credits_check_failed',
-  /** A platform-funded AI deduction did not land — that spend went unbilled. */
+  /**
+   * A platform-funded AI deduction did not land — that spend went unbilled.
+   * Emitted only by the legacy UNKEYED deduct, deleted in #9451 (compute now
+   * debits keyed: `ai_credit_debit_rejected` / `_retries_exhausted`). Kept
+   * registered so historical events and alert rules keep resolving.
+   */
   'ai_billing_credits_deduct_failed',
+  /**
+   * #7717 item 3: the sweep found platform credit debits stamped failed
+   * (terminal 4xx incl. auth after a billing-key rotation, or retries
+   * exhausted) and/or dead pending settlements. Neither is retried on its own;
+   * an operator re-drives / replays them at /api/v1/admin/ai-billing. At most
+   * hourly per process; tags carry the two counts.
+   */
+  'ai_billing_operator_backlog',
   /** An org reached the AI billing path with no partner row to bill. */
   'ai_billing_org_partner_missing',
+  /**
+   * AI model registry W03 (#7601): the billing service refused a KEYED credit
+   * debit with a 4xx (bad input, key reused with another amount, auth). The
+   * reservation is stamped credits_debit_failed_at for an operator; the sweep
+   * does not retry it (listFailedCreditDebits / clearCreditDebitFailure).
+   */
+  'ai_credit_debit_rejected',
+  /** W03 (#7601): a keyed credit debit stayed unconfirmed (5xx / transport) through every retry. */
+  'ai_credit_debit_retries_exhausted',
+  /**
+   * AI model registry W11 (#7609): a settlement's prompt variant did not match
+   * its row's surface / prompt profile, so it was recorded as the base prompt
+   * (the settlement itself never fails on provenance). Any occurrence skews the
+   * prompt-variant comparison; post-deploy gate G3 expects zero.
+   */
+  'ai_prompt_variant_mismatch',
+  /**
+   * W03 (#7601, PR #7700 finding 5): a deferred (pending) AI settlement failed
+   * every replay attempt and was stamped pending_settlement_dead_at. Its spend
+   * is unrecorded until an operator acts (listDeadPendingSettlements).
+   */
+  'ai_settlement_replay_dead',
+  /**
+   * W03 (#7601, PR #7700 review S1): a settlement blocked twice on the org lock
+   * AND its pending_settlement write failed (or another one already held the
+   * slot). The spend is recorded nowhere; the reservation is left
+   * indeterminate. Tags carry org_id + ai_reservation_id for reconciliation.
+   */
+  'ai_settlement_unrecorded',
+  /**
+   * W03 (#7601, W05 spike): an Agent SDK cumulative modelUsage component went
+   * DOWN against the session's snapshot (the CLI's counters restarted, or a
+   * glitch). The snapshot is re-baselined to the current reading and the turn
+   * bills its own result.usage capped by modelUsage, unconfirmed (#7700
+   * review finding 3).
+   */
+  'ai_usage_snapshot_regressed',
+  /**
+   * #7773: the pricing decision for an unbound BYOK refusal-fallback key could
+   * not be read or attested while SETTLING against a reservation (lock
+   * timeout, connection error). The key billed the bound rate instead; if the
+   * turn had already attested an offering rate, the ledger now disagrees with
+   * that attestation (or a retry hits a fingerprint conflict). Tags carry
+   * org_id + ai_reservation_id.
+   */
+  'ai_unbound_byok_rate_lookup_failed',
   /**
    * Execution plane W04 (#5715): the sandbox backend's create circuit opened
    * after 5 consecutive failures — no analysis run can start in this region
@@ -186,11 +263,30 @@ export const SENTRY_EVENT_CODES = [
   /** A rejected partner AI key could not be stamped (config moved under us). */
   'ai_partner_key_error_stamp_stale',
   /**
+   * AI model registry W08 (#7606): a partner without a registry row was
+   * bootstrapped onto the one Anthropic connection it already owned (only a
+   * deployment that skipped the W03 cutover release); its legacy model
+   * settings were never migrated.
+   */
+  'ai_registry_bootstrap_existing_connection',
+  /**
    * Every in-memory AI session was mid-turn when the LRU cap was reached, so
    * nothing could be evicted and MAX_ACTIVE_SESSIONS was exceeded. Throttled by
    * the caller; a sustained stream means real capacity exhaustion.
    */
   'ai_session_cap_all_in_flight',
+  /**
+   * AI chargeback (#7608): one or more orgs' monthly close threw during the
+   * daily sweep. Each failure is also a captureException tagged org_id +
+   * ai_charge_period_start; the next daily sweep retries the month.
+   */
+  'ai_chargeback_close_failed',
+  /**
+   * AI chargeback (#7608): an org's close found chargeable usage that aged
+   * past the 92-day lookback without ever being closed. It will never be
+   * billed; tags carry org_id + ai_charge_period_start.
+   */
+  'ai_chargeback_usage_expired',
   /** A crossed AI budget rung (#4388) resolved to zero notifiable recipients. */
   'ai_budget_alert_no_recipients',
   /** An AI budget alert event never became visible before its retries ran out. */
@@ -206,6 +302,14 @@ export const SENTRY_EVENT_CODES = [
    * failing, so this is the only signal an operator gets.
    */
   'ai_agent_onlytools_unknown_name',
+  /**
+   * An AI chat tool call reached our handler without the SDK's tool_use id
+   * (`_meta['claudecode/toolUseId']`), so its result was paired by tool name
+   * instead (#7931). Reported once per session. Expected never to fire; if it
+   * does, the SDK/CLI stopped sending the id and same-name parallel calls can
+   * be mis-paired again.
+   */
+  'ai_tool_use_id_missing',
 
   // --- backup -----------------------------------------------------------
   /** A backup result matched no job row (deleted, or invisible under RLS). */
@@ -214,6 +318,57 @@ export const SENTRY_EVENT_CODES = [
   'backup_result_org_divergence',
   /** Snapshots are unattributable because two orgs share a destination. */
   'backup_snapshot_ambiguous_destination',
+
+  // --- filesystem analysis results (#8024) ------------------------------
+  /** A `filesystem_analysis` result reported `completed` but its stdout was
+   *  empty or not a JSON object, so no snapshot was written and the Disk
+   *  Cleanup tab shows nothing. The agent always marshals an object on success,
+   *  so a run of these is a producer or transport defect. */
+  'filesystem_analysis_result_unparseable',
+  /** A `filesystem_analysis` result arrived for a device id with no `devices`
+   *  row (deleted mid-scan, or invisible under RLS); the result was dropped. */
+  'filesystem_analysis_result_unknown_device',
+  /** A `filesystem_analysis` result whose command id is already the volume's
+   *  applied receipt reached the snapshot write again. The terminal
+   *  compare-and-set runs first in the same transaction and should stop a
+   *  replay, so an occurrence is unexpected: a bypassed guard or a stale
+   *  receipt. */
+  'filesystem_analysis_result_duplicate',
+
+  // --- tenant erasure -----------------------------------------------------
+  /**
+   * An org-erasure attempt was refused because a backup snapshot for that org
+   * still carries an active legal hold — either at the erasure's initial
+   * precondition check or at a later re-check immediately before the
+   * `backup_snapshots` delete step itself. Nothing was deleted; the requester
+   * (or the recovery sweep, for a sweep-driven attempt) has to be told
+   * explicitly, since a BullMQ "skipped" result is not a job failure and
+   * would otherwise raise no alert on its own.
+   */
+  'tenant_erasure_refused_legal_hold',
+  /** An unresolved isolation prevents erasing its recovery records. */
+  'tenant_erasure_refused_isolation',
+  /** Forced credential suspension leaves isolation recovery to expiry and the offline code. */
+  'network_isolation_forced_token_suspension',
+  /**
+   * #10919: an isolate or release command reached delivery that is not the row
+   * the isolation service issued (the episode's command_id / release_command_id).
+   * Cancelled at claim; nothing a running service produces, so each one is worth a look.
+   */
+  'network_isolation_command_unbound',
+  /**
+   * Helper screenshot files could not be removed after their rows were
+   * deleted (org erasure, device purge, site delete) or by the orphan sweep
+   * (#8117). The rows are already gone, so the bytes are customer data with no
+   * owner left on disk until the next orphan sweep succeeds.
+   */
+  'screenshot_file_removal_failed',
+  /**
+   * Patch compliance report files could not be removed after their rows were
+   * deleted (org erasure) or by the retention job's orphan sweep. The bytes
+   * stay on disk with no row until a later sweep succeeds.
+   */
+  'patch_report_file_removal_failed',
 
   // --- agent binary serving ---------------------------------------------
   /** No promoted `agent_versions` row, so downloads fall back to the
@@ -227,12 +382,26 @@ export const SENTRY_EVENT_CODES = [
   'device_deletion_parent_lock_missing',
   /** Auto edition migration (#4072) dispatched its script to at least one stranded device this process lifetime. */
   'agent_edition_auto_migration_dispatched',
+  /** Auto edition migration (#5016): an org's canary device was dispatched and has not come back on the target edition, so the rest of the org is held. */
+  'agent_edition_auto_migration_canary_unresolved',
+
+  // --- restore checkpoint ledger (#4757) --------------------------------
+  /** An agent reported a restore-point status this API does not know (agent/API version skew); the ledger row stays `requested`. */
+  'restore_point_outcome_unknown_status',
+  /** An agent reported a restore-point outcome (other than skipped_disabled) for a request id the ledger has no row for. */
+  'restore_point_outcome_unrequested',
 
   // --- mcp transport ----------------------------------------------------
   /** A principal presented an `Mcp-Session-Id` owned by someone else (MED-1). */
   'mcp_session_principal_mismatch',
   /** Unknown/expired `Mcp-Session-Id` rate spiked — suspect session-store loss (#3744). */
   'mcp_session_unknown_rate_high',
+  /** SEP-2243 header/body mismatch rate spiked on stateless MCP — suspect a body-rewriting gateway or request smuggling (B-W03 #6157). */
+  'mcp_header_mismatch_rate_high',
+  /** A legacy MCP session's negotiated-extension side key could not be written; that session gets no MCP Apps for its lifetime (B-W05 #6159). */
+  'mcp_session_ext_write_failed',
+  /** A Tasks-declaring tools/call filed an intent but the owned reload returned nothing; the client got pending_approval (B-W06 #6160). */
+  'mcp_task_reload_missing',
 
   // --- retention --------------------------------------------------------
   /**
@@ -241,6 +410,24 @@ export const SENTRY_EVENT_CODES = [
    * job can prune it — raise the job's batch-size / max-batches knobs.
    */
   'retention_backlog_remaining',
+  /**
+   * #8208: PAM_EVIDENCE_RETENTION_DAYS is not a positive integer (the job
+   * falls back to the 400-day default) or is below the 30-day floor (clamped
+   * to 30). Fix the env value; evidence is never deleted sooner than the floor.
+   */
+  'pam_evidence_retention_config',
+  /**
+   * #8855: a nightly AI tool output retention run finished with orgs that
+   * failed or were skipped, or transcript deletes that failed, so expired tool
+   * outputs (or SDK transcripts) remain. Per-org errors are in the worker log
+   * (`[AiToolOutputRetention]`).
+   */
+  'ai_tool_output_retention_incomplete',
+  /**
+   * #9050: the nightly SDK transcript sweep found orphaned transcripts it could
+   * not delete on this container's disk (`[AiTranscriptSweeper]` log has ids).
+   */
+  'ai_transcript_sweep_incomplete',
 
   // --- server-side i18n (#3860) -----------------------------------------
   /** `tApi` was asked for a key no bundle defines — the raw key string is
@@ -264,7 +451,7 @@ export const SENTRY_EVENT_CODES = [
    *  but should be rare), or a caller is threading the wrong org. */
   'command_dispatch_cross_tenant_refused',
 
-  // --- remote desktop teardown (SEC-2026-09-05-038) ----------------------
+  // --- remote desktop teardown ----------------------
   /** `POST /remote/sessions/:id/end` marked the session terminal and revoked
    *  the viewer token, but the `stop_desktop` never reached the agent (the
    *  relay reported `offline`/`expired`/`owner_mismatch`/`indeterminate`).
@@ -278,6 +465,31 @@ export const SENTRY_EVENT_CODES = [
    *  `remote_desktop_stop_undelivered` because the actionable target is the
    *  relay (Redis/BullMQ), not the device. */
   'remote_desktop_stop_dispatch_failed',
+
+  // --- quotes / payments --------------------------------------------------
+  /** A public quote accept gave up waiting on the Stripe Checkout mint
+   *  (ACCEPT_CHECKOUT_TIMEOUT_MS) and sent the customer to the invoice page.
+   *  A run of these means Stripe (or the partner's account) is slow. */
+  'quote_accept_checkout_timeout',
+  /** #8603: a partner's stored `timezone` is not a zone Intl knows, so invoice
+   *  line work dates were computed in UTC instead (assembly never blocks on
+   *  it). Fix the partner's timezone setting; near-midnight lines may be a day off. */
+  'invoice_work_date_invalid_timezone',
+
+  // --- legacy automation → flow conversion (#5221 W06) -------------------
+  /** `publishEvent` got a publisher-supplied `occurredAt` more than 60 s in the
+   *  future. Reported only (Decision 6 residual (b)): such an instant can land
+   *  after a conversion's `switch_at` and be attempted by both engines, where
+   *  the occurrence claim then dedupes it. A run of these is a publisher clock
+   *  or a bug in the publisher's timestamp. */
+  'event_occurred_at_future',
+  /** A converted automation's event had no usable `metadata.timestamp`; both
+   *  engines fall back to "legacy prefers it" (claims dedupe). */
+  'flow_conversion_event_instant_missing',
+  /** A converted automation's event id cannot be an occurrence key (not a
+   *  uuid): legacy admits it without a claim and a switched flow does not
+   *  attempt it, so exactly one engine runs it. */
+  'flow_conversion_event_key_unbuildable',
 ] as const;
 
 /**

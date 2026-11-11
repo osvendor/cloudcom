@@ -75,7 +75,7 @@ export function paymentMappingRemoteId(remotePaymentId: string, remoteInvoiceId:
 
 /**
  * The ONE divergence string both refund paths write into `last_error` — the
- * Stripe webhook (`stripeReconcile.reflectStripeRefund`, partial-refund arm) and
+ * Stripe webhook (`stripeReversalState.applyStripeFinancialEvent`, partial-refund arm) and
  * this module's own mid-flight `diverged` branch. Sharing it is not tidiness:
  * two texts quoting two different quantities is how a bookkeeper enters the
  * wrong refund.
@@ -91,9 +91,11 @@ export function paymentMappingRemoteId(remotePaymentId: string, remoteInvoiceId:
  */
 const PARTIAL_REFUND_DIVERGENCE_PREFIX = 'Refunded in Stripe, total ';
 
-export function partialRefundDivergenceMessage(totalRefunded: string): string {
-  return `${PARTIAL_REFUND_DIVERGENCE_PREFIX}${totalRefunded}; record the refund in QuickBooks `
-    + '(this QuickBooks payment still shows the full amount)';
+/** `label` is the provider's display name (`accountingProviderDisplayName`); the
+ *  QuickBooks text is byte-identical to what production rows already hold. */
+export function partialRefundDivergenceMessage(totalRefunded: string, label: string): string {
+  return `${PARTIAL_REFUND_DIVERGENCE_PREFIX}${totalRefunded}; record the refund in ${label} `
+    + `(this ${label} payment still shows the full amount)`;
 }
 
 /**

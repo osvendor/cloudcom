@@ -1,13 +1,20 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+// routes/ai.ts reaches the model registry (ticket-draft) -> candidateLoader,
+// which this file's partial schema mock does not cover. Not under test here.
+vi.mock('../services/aiModels/sessionModel', () => ({
+  resolveSessionTurn: vi.fn(),
+}));
+// W05 (#7603): the messages route runs the model-transition gate before it
+// reserves. Not under test here: a session with no previous chat turn.
+vi.mock('../services/aiModels/modelTransition', async (orig) => ({
+  ...(await orig<typeof import('../services/aiModels/modelTransition')>()),
+  readPreviousTurn: vi.fn(async () => null),
+  planModelTransition: vi.fn(async () => ({ kind: 'fresh' })),
+  readSessionOfferingId: vi.fn(async () => undefined),
+}));
+import { makeResolvedModel } from '../services/aiModels/__fixtures__/resolvedModel';
 import { Hono } from 'hono';
-
-const configRef = vi.hoisted(() => ({
-  provider: 'anthropic' as 'anthropic' | 'openai-compatible',
-}));
-
-vi.mock('../config/validate', () => ({
-  getConfig: vi.fn(() => ({ MCP_LLM_PROVIDER: configRef.provider })),
-}));
 
 vi.mock('../services/llm/llmConfigResolver', () => ({
   LlmUnavailableError: class LlmUnavailableError extends Error {
@@ -18,13 +25,18 @@ vi.mock('../services/llm/llmConfigResolver', () => ({
       this.name = 'LlmUnavailableError';
     }
   },
-  resolveLlmConfigForOrg: vi.fn(),
 }));
 
+// #11430: the session read finalizes the Wisp thread summary of a session it expires.
+const finalizeMock = vi.hoisted(() => vi.fn(async (_id: string) => ({ updated: false })));
+vi.mock('../services/wisp/threadSummary', () => ({ finalizeWispSessionSummary: finalizeMock }));
+
 vi.mock('../db', () => ({
+  runAfterDbContextCommit: vi.fn((_label: string, work: () => unknown) => { void work(); }),
   runOutsideDbContext: vi.fn((fn) => fn()),
   withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn()),
   withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+  withDbTransaction: vi.fn(async (fn: () => Promise<unknown>) => fn()),
   db: {
     select: vi.fn(),
     insert: vi.fn(),
@@ -36,6 +48,7 @@ vi.mock('../db/schema', () => ({
   aiSessions: {
     id: 'aiSessions.id',
     orgId: 'aiSessions.orgId',
+    status: 'aiSessions.status',
     flaggedAt: 'aiSessions.flaggedAt',
     flaggedBy: 'aiSessions.flaggedBy',
     flagReason: 'aiSessions.flagReason',
@@ -43,6 +56,14 @@ vi.mock('../db/schema', () => ({
   aiMessages: {
     id: 'aiMessages.id',
     sessionId: 'aiMessages.sessionId',
+  },
+  aiBudgetReservations: {
+    orgId: 'aiBudgetReservations.orgId',
+    sessionId: 'aiBudgetReservations.sessionId',
+    status: 'aiBudgetReservations.status',
+    createdAt: 'aiBudgetReservations.createdAt',
+    pendingSettlement: 'aiBudgetReservations.pendingSettlement',
+    expiryReason: 'aiBudgetReservations.expiryReason',
   },
   aiToolExecutions: {
     id: 'aiToolExecutions.id',
@@ -94,6 +115,7 @@ vi.mock('../middleware/auth', () => ({
   requireScope: vi.fn(() => async (_c: any, next: any) => next()),
   requirePermission: vi.fn(() => async (_c: any, next: any) => next()),
   requireMfa: vi.fn(() => async (_c: any, next: any) => next()),
+  withAuthDbAccessContext: vi.fn(async (_auth: unknown, fn: () => Promise<unknown>) => fn()),
 }));
 
 vi.mock('../services/aiAgent', () => ({
@@ -126,6 +148,7 @@ vi.mock('../services/aiBudgetReservations', () => ({
   markAiBudgetReservationIndeterminate: vi.fn(async () => ({
     kind: 'indeterminate', reservationId: '66666666-6666-4666-8666-666666666666',
   })),
+  AiBudgetSessionBusyError: class AiBudgetSessionBusyError extends Error {},
 }));
 
 vi.mock('../services/streamingSessionManager', () => ({
@@ -154,7 +177,8 @@ vi.mock('../services/sentry', () => ({
 }));
 
 import { aiRoutes } from './ai';
-import { db } from '../db';
+import { db, withDbTransaction } from '../db';
+import { captureException } from '../services/sentry';
 import {
   createSession,
   getSession,
@@ -167,9 +191,18 @@ import {
 import { getUsageSummary, updateBudget, getSessionHistory } from '../services/aiCostTracker';
 import { streamingSessionManager } from '../services/streamingSessionManager';
 import { runPreFlightChecks, abortActivePlan } from '../services/aiAgentSdk';
+import { InvalidSessionModelError } from '../services/aiModels/invalidSessionModelError';
 import { LlmUnavailableError } from '../services/llm/llmConfigResolver';
+import { LlmNotConfiguredError } from '../services/llm/llmAvailability';
 
 const ORG_ID = 'org-111';
+
+/** #11430: the read's guarded stamp — UPDATE … RETURNING the rows it flipped. */
+function mockStampReturning(rows: Array<{ id: string }>) {
+  const set = vi.fn().mockReturnValue({ where: vi.fn().mockReturnValue({ returning: vi.fn().mockResolvedValue(rows) }) });
+  vi.mocked(db.update).mockReturnValue({ set } as any);
+  return set;
+}
 const SESSION_ID = '11111111-1111-1111-1111-111111111111';
 
 
@@ -178,7 +211,6 @@ describe('AI routes', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    configRef.provider = 'anthropic';
     app = new Hono();
     app.route('/ai', aiRoutes);
   });
@@ -242,6 +274,109 @@ describe('AI routes', () => {
 
       expect(res.status).toBe(503);
       expect(await res.json()).toEqual({ error: 'ai_unavailable' });
+    });
+
+    it('#7793: a resolver refusal returns its user-facing reason and code, not the raw ai_unavailable', async () => {
+      vi.mocked(createSession).mockRejectedValueOnce(Object.assign(new LlmUnavailableError(), {
+        message: 'This AI model cannot use tools, which this feature needs.',
+        reason: 'tools_unsupported',
+      }));
+
+      const res = await app.request('/ai/sessions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ title: 'Test' }),
+      });
+
+      expect(res.status).toBe(503);
+      expect(await res.json()).toEqual({
+        error: 'This AI model cannot use tools, which this feature needs.',
+        code: 'tools_unsupported',
+      });
+    });
+
+    it('returns 400 invalid_model when the requested model is not allowed (#7587)', async () => {
+      vi.mocked(createSession).mockRejectedValueOnce(
+        new InvalidSessionModelError('Model "claude-made-up-9" is not available for AI sessions.', 'invalid_model'),
+      );
+
+      const res = await app.request('/ai/sessions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ title: 'Test', model: 'claude-made-up-9' }),
+      });
+
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({
+        error: 'Model "claude-made-up-9" is not available for AI sessions.',
+        code: 'invalid_model',
+      });
+    });
+
+    it('returns 400 not_permitted for a foreign / not-permitted offering id, with no detail about it (W03 #7601)', async () => {
+      const foreign = 'cccccccc-1111-4222-8333-444455556666';
+      vi.mocked(createSession).mockRejectedValueOnce(
+        new InvalidSessionModelError('This AI model is not available here. Choose another model.', 'not_permitted'),
+      );
+
+      const res = await app.request('/ai/sessions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ title: 'Test', offeringId: foreign, options: { effort: 'high' } }),
+      });
+
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({
+        error: 'This AI model is not available here. Choose another model.',
+        code: 'not_permitted',
+      });
+      expect(vi.mocked(createSession)).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ offeringId: foreign, options: { effort: 'high' } }),
+      );
+    });
+
+    it('returns 400 permission_required for a premium offering without the permission (W03 #7601)', async () => {
+      vi.mocked(createSession).mockRejectedValueOnce(
+        new InvalidSessionModelError('Your role does not allow this AI model. Choose another model.', 'permission_required'),
+      );
+
+      const res = await app.request('/ai/sessions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ offeringId: 'cccccccc-1111-4222-8333-444455556666' }),
+      });
+
+      expect(res.status).toBe(400);
+      expect(await res.json()).toMatchObject({ code: 'permission_required' });
+    });
+
+    it.each([
+      [{ offeringId: 'not-a-uuid' }],
+      [{ options: { effort: 'ludicrous' } }],
+      [{ options: { inferenceGeo: 'eu' } }],
+    ])('rejects a malformed model choice %j before createSession', async (body) => {
+      const res = await app.request('/ai/sessions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify(body),
+      });
+
+      expect(res.status).toBe(400);
+      expect(vi.mocked(createSession)).not.toHaveBeenCalled();
+    });
+
+    it('returns ai_not_configured as 503 when no model provider is configured', async () => {
+      vi.mocked(createSession).mockRejectedValueOnce(new LlmNotConfiguredError());
+
+      const res = await app.request('/ai/sessions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ title: 'Test' }),
+      });
+
+      expect(res.status).toBe(503);
+      expect(await res.json()).toEqual({ error: expect.stringMatching(/not configured/i), code: 'ai_not_configured' });
     });
 
     it('returns 500 on unexpected creation error', async () => {
@@ -374,6 +509,127 @@ describe('AI routes', () => {
       const body = await res.json();
       expect(body.error).toBe('Session not found');
     });
+
+    // #11430: the Wisp column resumed a 3-day-old session the read still called
+    // 'active', and the first two sends were refused with 410. The read applies
+    // the send's own expiry rule, persists it and finalizes the thread summary.
+    it('#11430: reports — and persists — a chat session idle for 3 days as expired, finalizing its summary', async () => {
+      const threeDaysAgo = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000);
+      vi.mocked(getSessionMessages).mockResolvedValueOnce({
+        session: { id: SESSION_ID, type: 'general', userId: 'user-1', status: 'active', createdAt: threeDaysAgo, lastActivityAt: threeDaysAgo },
+        messages: [],
+      } as any);
+      const set = mockStampReturning([{ id: SESSION_ID }]);
+
+      const res = await app.request(`/ai/sessions/${SESSION_ID}`, {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.session.status).toBe('expired');
+      expect(db.update).toHaveBeenCalledTimes(1);
+      expect(set).toHaveBeenCalledWith(expect.objectContaining({ status: 'expired' }));
+      await vi.waitFor(() => expect(finalizeMock).toHaveBeenCalledWith(SESSION_ID));
+    });
+
+    it('#11430: a stale session with a turn still running (the guarded stamp matched no row) reads as active, unfinalized', async () => {
+      const threeHoursAgo = new Date(Date.now() - 3 * 60 * 60 * 1000);
+      vi.mocked(getSessionMessages).mockResolvedValueOnce({
+        session: { id: SESSION_ID, type: 'general', userId: 'user-1', status: 'active', createdAt: threeHoursAgo, lastActivityAt: threeHoursAgo },
+        messages: [],
+      } as any);
+      mockStampReturning([]);
+
+      const res = await app.request(`/ai/sessions/${SESSION_ID}`, {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect((await res.json()).session.status).toBe('active');
+      expect(db.update).toHaveBeenCalledTimes(1);
+      expect(finalizeMock).not.toHaveBeenCalled();
+    });
+
+    it('#11430: a failed stamp never fails the read: 200 with the stored status, reported to Sentry', async () => {
+      const errSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+      const threeDaysAgo = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000);
+      vi.mocked(getSessionMessages).mockResolvedValueOnce({
+        session: { id: SESSION_ID, type: 'general', userId: 'user-1', status: 'active', createdAt: threeDaysAgo, lastActivityAt: threeDaysAgo },
+        messages: [{ role: 'user', content: 'hello' }],
+      } as any);
+      const boom = new Error('lock timeout');
+      vi.mocked(db.update).mockReturnValue({
+        set: () => ({ where: () => ({ returning: () => Promise.reject(boom) }) }),
+      } as any);
+
+      const res = await app.request(`/ai/sessions/${SESSION_ID}`, {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.session.status).toBe('active');
+      expect(body.messages).toHaveLength(1);
+      expect(vi.mocked(withDbTransaction)).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(captureException)).toHaveBeenCalledWith(boom);
+      expect(finalizeMock).not.toHaveBeenCalled();
+      errSpy.mockRestore();
+    });
+
+    it('#11430: a closed session keeps its status however old', async () => {
+      const threeDaysAgo = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000);
+      vi.mocked(getSessionMessages).mockResolvedValueOnce({
+        session: { id: SESSION_ID, type: 'general', userId: 'user-1', status: 'closed', createdAt: threeDaysAgo, lastActivityAt: threeDaysAgo },
+        messages: [],
+      } as any);
+
+      const res = await app.request(`/ai/sessions/${SESSION_ID}`, {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect((await res.json()).session.status).toBe('closed');
+      expect(db.update).not.toHaveBeenCalled();
+    });
+
+    it('#11430: leaves a recently active chat session alone', async () => {
+      const now = new Date();
+      vi.mocked(getSessionMessages).mockResolvedValueOnce({
+        session: { id: SESSION_ID, type: 'general', userId: 'user-1', status: 'active', createdAt: now, lastActivityAt: now },
+        messages: [],
+      } as any);
+
+      const res = await app.request(`/ai/sessions/${SESSION_ID}`, {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect((await res.json()).session.status).toBe('active');
+      expect(db.update).not.toHaveBeenCalled();
+      expect(finalizeMock).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['an MCP ledger row', 'mcp', 'user-1'],
+      ['a Helper session (no user, its own lifecycle)', 'general', null],
+    ])('#11430: never re-stamps %s from the read', async (_label, type, userId) => {
+      const threeDaysAgo = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000);
+      vi.mocked(getSessionMessages).mockResolvedValueOnce({
+        session: { id: SESSION_ID, type, userId, status: 'active', createdAt: threeDaysAgo, lastActivityAt: threeDaysAgo },
+        messages: [],
+      } as any);
+
+      const res = await app.request(`/ai/sessions/${SESSION_ID}`, {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect((await res.json()).session.status).toBe('active');
+      expect(db.update).not.toHaveBeenCalled();
+    });
   });
 
   // ============================================
@@ -428,6 +684,34 @@ describe('AI routes', () => {
       expect(streamingSessionManager.getOrCreate).not.toHaveBeenCalled();
     });
 
+    it('returns ai_not_configured as 503 before touching the SDK manager', async () => {
+      vi.mocked(runPreFlightChecks).mockResolvedValueOnce({ ok: false, error: 'ai_not_configured', status: 503 });
+
+      const res = await app.request(`/ai/sessions/${SESSION_ID}/messages`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ content: 'hello there' }),
+      });
+
+      expect(res.status).toBe(503);
+      expect(await res.json()).toEqual({ error: expect.stringMatching(/not configured/i), code: 'ai_not_configured' });
+      expect(streamingSessionManager.getOrCreate).not.toHaveBeenCalled();
+    });
+
+    it('#11430: an expired session is a coded 410 (session_expired) the client can roll on, before touching the SDK manager', async () => {
+      vi.mocked(runPreFlightChecks).mockResolvedValueOnce({ ok: false, error: 'Session has expired due to inactivity. Please start a new session.' });
+
+      const res = await app.request(`/ai/sessions/${SESSION_ID}/messages`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ content: 'hello there' }),
+      });
+
+      expect(res.status).toBe(410);
+      expect(await res.json()).toEqual({ error: expect.stringContaining('expired'), code: 'session_expired' });
+      expect(streamingSessionManager.getOrCreate).not.toHaveBeenCalled();
+    });
+
     it('preserves the structured retryable 503 from resolver preflight failures', async () => {
       vi.mocked(runPreFlightChecks).mockResolvedValueOnce({
         ok: false,
@@ -446,33 +730,8 @@ describe('AI routes', () => {
       expect(streamingSessionManager.getOrCreate).not.toHaveBeenCalled();
     });
 
-    it('refuses partner-key traffic before entering the instance OpenAI-compatible path', async () => {
-      configRef.provider = 'openai-compatible';
-      vi.mocked(runPreFlightChecks).mockResolvedValueOnce({
-        ok: true,
-        session: {
-          id: SESSION_ID,
-          orgId: ORG_ID,
-          sdkSessionId: null,
-          model: 'claude-opus-4-6',
-          maxTurns: 50,
-          turnCount: 0,
-          systemPrompt: null,
-          title: 'Existing title',
-        } as any,
-        sanitizedContent: 'hello',
-        systemPrompt: 'SYSTEM PROMPT',
-        maxBudgetUsd: undefined,
-        resolved: {
-          source: 'partner',
-          partnerId: 'partner-1',
-          apiKey: 'partner-key',
-          model: 'claude-opus-4-6',
-          configId: 'config-1',
-          configVersion: 3,
-          endpoint: { kind: 'anthropic' as const },
-        },
-      });
+    it('a preflight ai_unavailable refusal is a 503 before any session or message write', async () => {
+      vi.mocked(runPreFlightChecks).mockResolvedValueOnce({ ok: false, error: 'ai_unavailable', status: 503 });
 
       const res = await app.request(`/ai/sessions/${SESSION_ID}/messages`, {
         method: 'POST',
@@ -487,6 +746,7 @@ describe('AI routes', () => {
     });
 
     it('passes the bound device id from the DB session into streamingSessionManager.getOrCreate (#3087 route wiring)', async () => {
+      const BYOK_MODEL = makeResolvedModel('anthropic_byok');
       // This is the seam that arms the #3087 fix: getOrCreate uses `deviceId`
       // to decide whether to narrow tool execution to the device's org. If
       // this route ever stops forwarding it, the whole narrowing mechanism in
@@ -507,15 +767,7 @@ describe('AI routes', () => {
         sanitizedContent: 'hello there',
         systemPrompt: 'SYSTEM PROMPT',
         maxBudgetUsd: undefined,
-        resolved: {
-          source: 'partner',
-          partnerId: 'partner-1',
-          apiKey: 'partner-key',
-          model: 'claude-sonnet-4-6',
-          configId: 'config-1',
-          configVersion: 3,
-          endpoint: { kind: 'anthropic' as const },
-        },
+        model: BYOK_MODEL,
       });
 
       const fakeActiveSession = {
@@ -545,10 +797,10 @@ describe('AI routes', () => {
         expect.anything(),
         'SYSTEM PROMPT',
         undefined,
-        expect.objectContaining({ source: 'partner', configId: 'config-1', configVersion: 3 }),
+        BYOK_MODEL,
         undefined,
         undefined,
-        expect.objectContaining({ budgetReservationId: expect.any(String) }),
+        expect.objectContaining({ budgetReservationId: expect.any(String), toolSearch: true, ledgerUserId: expect.any(String) }),
       );
     });
   });

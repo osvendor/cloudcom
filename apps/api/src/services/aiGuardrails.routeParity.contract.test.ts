@@ -86,10 +86,22 @@ describe('seeded Org Technician is not the ceiling for backup/vault/report tools
     expect(allows(parseGrants(['organizations:write']), 'configure_vault')).toBe(true);
   });
 
+  // query_backups is a per-action map — list_jobs mirrors
+  // routes/backup/jobs.ts:61 (organizations:read), list_configs mirrors
+  // routes/backup/configs.ts:232 (backup:read, a permission Org Technician
+  // also lacks).
+  it('query_backups list_jobs is denied to Org Technician and allowed only with organizations:read', () => {
+    expect(allows(ORG_TECHNICIAN, 'query_backups', { action: 'list_jobs' })).toBe(false);
+    expect(allows(parseGrants(['organizations:read']), 'query_backups', { action: 'list_jobs' })).toBe(true);
+  });
+  it('query_backups list_configs is denied to Org Technician and allowed only with backup:read', () => {
+    expect(allows(ORG_TECHNICIAN, 'query_backups', { action: 'list_configs' })).toBe(false);
+    expect(allows(parseGrants(['backup:read']), 'query_backups', { action: 'list_configs' })).toBe(true);
+  });
+
   // §2.5 — backup / hyperv / mssql reads.
   it.each([
     // tool, the route's permission, route evidence
-    ['query_backups', 'organizations:read'], // routes/backup/jobs.ts:61
     ['browse_snapshots', 'backup:read'], // routes/backup/snapshots.ts:273
     ['get_vm_restore_estimate', 'backup:read'], // routes/backup/vmrestore.ts:501
     ['query_hyperv_vms', 'organizations:read'], // routes/backup/hyperv.ts:52
@@ -135,7 +147,7 @@ describe('manage_tickets move_org requires BOTH permissions its route requires',
   });
 });
 
-describe('registry_operations reads are agent executions, not device reads (§2.4, SR5-01 precedent)', () => {
+describe('registry_operations reads are agent executions, not device reads (§2.4, privileged-read precedent)', () => {
   // routes/devices/commands.ts:49 — DEVICES_EXECUTE + requireMfa(); the handler
   // dispatches a real agent command via aiExecuteCommand.
   it.each(['read_key', 'get_value'])('%s is denied to a devices:read-only role', (action) => {
@@ -145,10 +157,203 @@ describe('registry_operations reads are agent executions, not device reads (§2.
   it.each(['read_key', 'get_value'])('%s is allowed with devices:execute', (action) => {
     expect(allows(parseGrants(['devices:execute']), 'registry_operations', { action })).toBe(true);
   });
-  it('matches the SR5-01 treatment of file_operations list/read exactly', () => {
+  it('matches the privileged-read treatment of file_operations list/read exactly', () => {
     const readOnly = parseGrants(['devices:read', 'devices:write']);
     expect(allows(readOnly, 'file_operations', { action: 'list' })).toBe(false);
     expect(allows(readOnly, 'file_operations', { action: 'read' })).toBe(false);
     expect(allows(readOnly, 'registry_operations', { action: 'read_key' })).toBe(false);
+  });
+});
+
+describe('file_operations write/rename/mkdir require scripts:execute, like file upload/move/mkdir', () => {
+  // routes/systemTools/fileBrowser.ts requireScriptsExecute.
+  it.each(['write', 'rename', 'mkdir'])('%s is denied to devices:execute without scripts:execute', (action) => {
+    expect(allows(parseGrants(['devices:read', 'devices:execute']), 'file_operations', { action })).toBe(false);
+  });
+  it.each(['write', 'rename', 'mkdir'])('%s is allowed with devices:execute + scripts:execute', (action) => {
+    expect(allows(parseGrants(['devices:execute', 'scripts:execute']), 'file_operations', { action })).toBe(true);
+  });
+  it.each(['write', 'rename', 'mkdir'])('%s stays allowed to every seeded role that already held it', (action) => {
+    expect(allows(ORG_TECHNICIAN, 'file_operations', { action })).toBe(true);
+    expect(allows(grantsOf('Partner Technician'), 'file_operations', { action })).toBe(true);
+    expect(allows(grantsOf('Org Admin'), 'file_operations', { action })).toBe(true);
+  });
+  it.each(['list', 'read', 'delete'])('%s is not raised to scripts:execute', (action) => {
+    expect(allows(parseGrants(['devices:execute']), 'file_operations', { action })).toBe(true);
+  });
+});
+
+describe('live device inspection requires devices:execute, like every /system-tools route', () => {
+  // routes/systemTools/index.ts gates every method on DEVICES_EXECUTE: each of
+  // these actions dispatches a live command to the agent. Cached inventory
+  // reads stay on devices:read.
+  const LIVE_READS: ReadonlyArray<readonly [string, string]> = [
+    ['manage_processes', 'list'],
+    ['manage_scheduled_tasks', 'list'],
+    ['manage_services', 'list'],
+    ['file_operations', 'list'],
+    ['file_operations', 'read'],
+    ['registry_operations', 'read_key'],
+    ['registry_operations', 'get_value'],
+  ];
+
+  it.each(LIVE_READS)('%s.%s is denied to the seeded viewer roles', (tool, action) => {
+    expect(allows(grantsOf('Org Viewer'), tool, { action })).toBe(false);
+    expect(allows(grantsOf('Partner Viewer'), tool, { action })).toBe(false);
+    expect(allows(parseGrants(['devices:read', 'devices:write']), tool, { action })).toBe(false);
+  });
+
+  it.each(LIVE_READS)('%s.%s is allowed to the seeded technician roles', (tool, action) => {
+    expect(allows(ORG_TECHNICIAN, tool, { action })).toBe(true);
+    expect(allows(grantsOf('Partner Technician'), tool, { action })).toBe(true);
+    expect(allows(parseGrants(['devices:execute']), tool, { action })).toBe(true);
+  });
+
+  it('the viewer roles keep cached device reads', () => {
+    for (const role of ['Org Viewer', 'Partner Viewer']) {
+      expect(allows(grantsOf(role), 'query_devices')).toBe(true);
+      expect(allows(grantsOf(role), 'get_device_details')).toBe(true);
+    }
+  });
+});
+
+describe('live device reads outside /system-tools require devices:execute, like their routes', () => {
+  // Each input below dispatches a live command to the agent, the same command
+  // its REST route sends, and each of those routes requires DEVICES_EXECUTE:
+  //   system_cleanup list          → POST /devices/:id/filesystem/system-cleanup/list
+  //   analyze_disk_usage refresh   → POST /devices/:id/filesystem/scan
+  //   analyze_boot_performance
+  //     triggerCollection          → POST /devices/:id/collect-boot-metrics
+  const LIVE: ReadonlyArray<readonly [string, Record<string, unknown>]> = [
+    ['system_cleanup', { action: 'list' }],
+    ['analyze_disk_usage', { refresh: true }],
+    ['analyze_boot_performance', { triggerCollection: true }],
+  ];
+  // The same tools reading stored data: the matching GET routes are devices:read.
+  const STORED: ReadonlyArray<readonly [string, Record<string, unknown>]> = [
+    ['system_cleanup', { action: 'status' }],
+    ['analyze_disk_usage', {}],
+    ['analyze_disk_usage', { refresh: false }],
+    ['analyze_boot_performance', {}],
+    ['analyze_boot_performance', { triggerCollection: false }],
+  ];
+
+  it.each(LIVE)('%s %j is denied to the seeded viewer roles', (tool, input) => {
+    expect(allows(grantsOf('Org Viewer'), tool, input)).toBe(false);
+    expect(allows(grantsOf('Partner Viewer'), tool, input)).toBe(false);
+    expect(allows(parseGrants(['devices:read', 'devices:write']), tool, input)).toBe(false);
+  });
+
+  it.each(LIVE)('%s %j is allowed to the seeded technician roles', (tool, input) => {
+    expect(allows(ORG_TECHNICIAN, tool, input)).toBe(true);
+    expect(allows(grantsOf('Partner Technician'), tool, input)).toBe(true);
+    expect(allows(parseGrants(['devices:execute']), tool, input)).toBe(true);
+  });
+
+  it.each(STORED)('%s %j stays readable by the seeded viewer roles', (tool, input) => {
+    expect(allows(grantsOf('Org Viewer'), tool, input)).toBe(true);
+    expect(allows(grantsOf('Partner Viewer'), tool, input)).toBe(true);
+  });
+});
+
+// These four tools require the same permission as the HTTP route they mirror.
+// Each pair below is asserted in BOTH directions: the previous tool grant
+// alone is refused, and the route's grant is allowed.
+describe('manage_quotes decline requires quotes:accept, like routes/quotes/lifecycle.ts decline-on-behalf', () => {
+  it('a role with quotes:write but not quotes:accept loses AI decline', () => {
+    expect(allows(parseGrants(['quotes:write']), 'manage_quotes', { action: 'decline' })).toBe(false);
+  });
+  it('a role with quotes:accept is allowed', () => {
+    expect(allows(parseGrants(['quotes:accept']), 'manage_quotes', { action: 'decline' })).toBe(true);
+  });
+});
+
+describe('manage_quotes create_pay_link requires invoices:send (+ quotes:read), like POST /invoices/:id/pay-link', () => {
+  it('quotes:write without invoices:send loses AI quote pay links', () => {
+    expect(allows(parseGrants(['quotes:write']), 'manage_quotes', { action: 'create_pay_link' })).toBe(false);
+  });
+  it('invoices:send alone is not enough — quotes:read is also required (an extra, not the route grant itself)', () => {
+    expect(allows(parseGrants(['invoices:send']), 'manage_quotes', { action: 'create_pay_link' })).toBe(false);
+  });
+  it('invoices:send + quotes:read is allowed', () => {
+    expect(allows(parseGrants(['invoices:send', 'quotes:read']), 'manage_quotes', { action: 'create_pay_link' })).toBe(true);
+  });
+});
+
+describe('manage_billing_catalog archive_item requires catalog:delete, like POST /catalog/items/:id/archive', () => {
+  it('catalog:write without catalog:delete loses AI archive', () => {
+    expect(allows(parseGrants(['catalog:write']), 'manage_billing_catalog', { action: 'archive_item' })).toBe(false);
+  });
+  it('catalog:delete is allowed', () => {
+    expect(allows(parseGrants(['catalog:delete']), 'manage_billing_catalog', { action: 'archive_item' })).toBe(true);
+  });
+});
+
+describe('manage_billing_catalog set_price/remove_price require catalog:write, like PUT/DELETE /catalog/items/:id/prices/:currencyCode (W02-D5, #6756)', () => {
+  it.each(['set_price', 'remove_price'])('%s: catalog:read alone is refused', (action) => {
+    expect(allows(parseGrants(['catalog:read']), 'manage_billing_catalog', { action })).toBe(false);
+  });
+  it.each(['set_price', 'remove_price'])('%s: catalog:write is allowed (was unmapped: nobody could call it)', (action) => {
+    expect(allows(parseGrants(['catalog:write']), 'manage_billing_catalog', { action })).toBe(true);
+  });
+});
+
+describe('query_webhooks requires webhooks:read, like GET /webhooks', () => {
+  it('organizations:read without webhooks:read loses the AI webhook read', () => {
+    expect(allows(parseGrants(['organizations:read']), 'query_webhooks')).toBe(false);
+    expect(allows(parseGrants(['organizations:read']), 'query_webhooks', { includeDeliveries: true })).toBe(false);
+  });
+  it('webhooks:read is allowed', () => {
+    expect(allows(parseGrants(['webhooks:read']), 'query_webhooks', { includeDeliveries: true })).toBe(true);
+  });
+});
+
+describe('test_webhook requires organizations:write, like POST /webhooks/:id/test', () => {
+  it('devices:write without organizations:write loses the AI webhook test', () => {
+    expect(allows(parseGrants(['devices:write']), 'test_webhook')).toBe(false);
+  });
+  it('organizations:write is allowed', () => {
+    expect(allows(parseGrants(['organizations:write']), 'test_webhook')).toBe(true);
+  });
+});
+
+// Full-control W04 (#6758): four permission corrections, each asserted in both
+// directions (the previous tool grant alone is refused; the route's grant works).
+describe('create_incident requires alerts:write, like POST /incidents (routes/incidents.ts requireIncidentWrite)', () => {
+  it('organizations:write without alerts:write loses AI incident creation', () => {
+    expect(allows(parseGrants(['organizations:write']), 'create_incident')).toBe(false);
+  });
+  it('alerts:write is allowed', () => {
+    expect(allows(parseGrants(['alerts:write']), 'create_incident')).toBe(true);
+  });
+});
+
+describe('trigger_agent_restart requires devices:recover_agent, like POST /devices/:id/agent-recovery', () => {
+  it('devices:execute without devices:recover_agent loses the AI agent restart', () => {
+    expect(allows(parseGrants(['devices:execute']), 'trigger_agent_restart')).toBe(false);
+  });
+  it('devices:recover_agent is allowed', () => {
+    expect(allows(parseGrants(['devices:recover_agent']), 'trigger_agent_restart')).toBe(true);
+  });
+});
+
+describe('remediate_sensitive_data accept_risk/false_positive/mark_remediated require devices:execute, like POST /sensitive-data/remediate', () => {
+  it.each(['accept_risk', 'false_positive', 'mark_remediated'])('%s: devices:write alone is refused', (action) => {
+    expect(allows(parseGrants(['devices:write']), 'remediate_sensitive_data', { action })).toBe(false);
+  });
+  it.each(['accept_risk', 'false_positive', 'mark_remediated'])('%s: devices:execute is allowed', (action) => {
+    expect(allows(parseGrants(['devices:execute']), 'remediate_sensitive_data', { action })).toBe(true);
+  });
+});
+
+describe('execute_containment requires devices:execute AND alerts:write (tool-only extra: it also mutates incident state)', () => {
+  it('devices:execute alone is refused', () => {
+    expect(allows(parseGrants(['devices:execute']), 'execute_containment')).toBe(false);
+  });
+  it('alerts:write alone is refused', () => {
+    expect(allows(parseGrants(['alerts:write']), 'execute_containment')).toBe(false);
+  });
+  it('both together are allowed', () => {
+    expect(allows(parseGrants(['devices:execute', 'alerts:write']), 'execute_containment')).toBe(true);
   });
 });

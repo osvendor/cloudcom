@@ -1,10 +1,9 @@
-import { formatMoney } from '@breeze/shared';
+import { formatCalendarDate, formatMoney } from '@breeze/shared';
 import { portalLocale } from '@/lib/money';
 /**
  * Shared customer-facing formatters. These were duplicated verbatim in four
  * list/detail components; one definition keeps the register's figures in one
- * voice. (quoteBlocks.tsx keeps its own exported `money` for the paper world's
- * per-line rendering — it re-exports this one.)
+ * voice.
  */
 
 // Formatting itself is the multi-currency formatter in lib/money.ts (shared
@@ -24,10 +23,23 @@ export function money(value: string | number, currencyCode: string): string {
 }
 
 /** Date-only strings render calendar-true (no timezone shift); anything else
- *  falls back to the raw value rather than "Invalid Date". */
-export function shortDate(value: string | null | undefined): string {
+ *  falls back to the raw value rather than "Invalid Date".
+ *
+ *  A timestamp is an instant, and the day it falls on depends on the zone. On
+ *  an SSR-only component the runtime zone is the server's (UTC in the
+ *  container), on a hydrated one it is the customer's browser, so the same
+ *  instant can print as two different days (#10291). Pass the org zone the API
+ *  hands back (`timezone`, org → partner → UTC) and every surface agrees. */
+export function shortDate(value: string | null | undefined, timeZone?: string): string {
   if (!value) return '—';
-  const d = new Date(value.length === 10 ? `${value}T00:00:00` : value);
+  const dateOnly = /^\d{4}-\d{2}-\d{2}$/.test(value);
+  const d = new Date(dateOnly ? `${value}T00:00:00Z` : value);
   if (Number.isNaN(d.getTime())) return value;
-  return d.toLocaleDateString();
+  return d.toLocaleDateString(undefined, { timeZone: dateOnly ? 'UTC' : timeZone });
+}
+
+/** "November 4, 2026" in the customer's locale. Date-only values are calendar
+ *  days (no timezone shift); timestamps render in the viewer's zone. */
+export function longDate(value: string | null | undefined): string {
+  return formatCalendarDate(value, portalLocale());
 }

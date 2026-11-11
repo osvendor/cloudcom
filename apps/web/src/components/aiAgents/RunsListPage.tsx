@@ -12,6 +12,8 @@ import { EmptyState } from '../shared/EmptyState';
 import { PageHeader } from '../shared/PageHeader';
 import type { AiAgentRunListItemDto, AiAgentRunStatus } from '@breeze/shared';
 import { AI_AGENT_RUN_STATUSES } from '@breeze/shared';
+import { useStableT } from '@/lib/i18n/useStableT';
+import { replaceUrl } from '../../lib/replaceUrl';
 
 // SSR-safe: reading `window` inside an effect (not a `useState` initializer)
 // avoids the hydration-mismatch class useHashState.ts documents — this page
@@ -109,7 +111,7 @@ const PAGE_LIMIT = 25;
  * status as live too, so a run never silently stops updating just because
  * this list predates it. */
 const TERMINAL_RUN_STATUSES = new Set<AiAgentRunStatus>([
-  'completed', 'failed', 'cancelled', 'expired', 'skipped',
+  'completed', 'failed', 'cancelled', 'expired', 'skipped', 'blocked',
 ]);
 function isLiveRunStatus(status: AiAgentRunStatus): boolean {
   return !TERMINAL_RUN_STATUSES.has(status);
@@ -166,6 +168,8 @@ function statusLabel(t: (key: string) => string, value: AiAgentRunStatus): strin
       return t('aiAgentsPage.runs.statuses.expired');
     case 'skipped':
       return t('aiAgentsPage.runs.statuses.skipped');
+    case 'blocked':
+      return t('aiAgentsPage.runs.statuses.blocked');
     default:
       return value;
   }
@@ -436,6 +440,7 @@ function RunCard({
  */
 export default function RunsListPage() {
   const { t } = useTranslation('settings');
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   // Honor the global Current/All-orgs scope toggle, same as AlertsPage:
   // `fetchWithAuth` auto-injects `?orgId=<currentOrgId>` whenever one org is
   // selected, so a scope change must trigger a refetch or the list keeps
@@ -443,6 +448,8 @@ export default function RunsListPage() {
   const currentOrgId = useOrgStore((s) => s.currentOrgId);
   const [runs, setRuns] = useState<AiAgentRunListItemDto[]>([]);
   const [agents, setAgents] = useState<AgentOption[]>([]);
+  // #10135: kinds present on the partner, for the report links in the header.
+  const [agentKinds, setAgentKinds] = useState<ReadonlySet<string>>(new Set());
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string>();
@@ -541,6 +548,7 @@ export default function RunsListPage() {
         setAgents(
           (body.data as Array<{ id: string; name: string }>).map((a) => ({ id: a.id, name: a.name })),
         );
+        setAgentKinds(new Set((body.data as Array<{ kind?: string }>).map((a) => a.kind ?? '')));
         setAgentsLoaded(true);
       } catch {
         // The agent filter is a convenience; a failed load just leaves it at
@@ -565,7 +573,7 @@ export default function RunsListPage() {
     if (agents.some((agent) => agent.id === agentFilter)) return;
     setAgentFilter('');
     if (window.location.hash) {
-      window.history.replaceState(null, '', window.location.pathname + window.location.search);
+      replaceUrl(window.location.pathname + window.location.search);
     }
   }, [agentsLoaded, agents, agentFilter]);
 
@@ -594,8 +602,8 @@ export default function RunsListPage() {
           // UI critique finding #6 — a "Load more" failure gets its own
           // copy, distinct from the page-1 load error it used to reuse.
           const message = append
-            ? t('aiAgentsPage.runs.errors.loadMore')
-            : t('aiAgentsPage.runs.errors.load', { status: response.status });
+            ? stableT('aiAgentsPage.runs.errors.loadMore')
+            : stableT('aiAgentsPage.runs.errors.load', { status: response.status });
           if (append) setLoadMoreError(message);
           else setError(message);
           return;
@@ -606,8 +614,8 @@ export default function RunsListPage() {
           // A body we cannot read is an error, not zero runs — same lesson as
           // AiAgentsPage's `?? []` regression.
           const message = append
-            ? t('aiAgentsPage.runs.errors.loadMore')
-            : t('aiAgentsPage.runs.errors.load', { status: response.status });
+            ? stableT('aiAgentsPage.runs.errors.loadMore')
+            : stableT('aiAgentsPage.runs.errors.load', { status: response.status });
           if (append) setLoadMoreError(message);
           else setError(message);
           return;
@@ -618,10 +626,10 @@ export default function RunsListPage() {
       } catch (err) {
         if (requestId !== requestIdRef.current) return;
         const message = append
-          ? t('aiAgentsPage.runs.errors.loadMore')
+          ? stableT('aiAgentsPage.runs.errors.loadMore')
           : err instanceof Error
             ? err.message
-            : t('aiAgentsPage.runs.errors.load', { status: 0 });
+            : stableT('aiAgentsPage.runs.errors.load', { status: 0 });
         if (append) setLoadMoreError(message);
         else setError(message);
       } finally {
@@ -632,7 +640,7 @@ export default function RunsListPage() {
         }
       }
     },
-    [agentFilter, statusFilter, currentOrgId, t],
+    [agentFilter, statusFilter, currentOrgId, stableT],
   );
 
   useEffect(() => {
@@ -730,7 +738,27 @@ export default function RunsListPage() {
         title={t('aiAgentsPage.runs.title')}
         description={t('aiAgentsPage.runs.description')}
         actions={
-          showFilterChrome ? (
+          showFilterChrome || agentKinds.has('research') || agentKinds.has('designer') ? (
+            <>
+              {agentKinds.has('research') && (
+                <a
+                  href="/ai-agents/fix-memory"
+                  className="text-sm text-primary hover:underline"
+                  data-testid="runs-link-fix-memory"
+                >
+                  {t('aiAgentsRuns.headerLinks.fixMemoryReport')}
+                </a>
+              )}
+              {agentKinds.has('designer') && (
+                <a
+                  href="/ai-agents/fleet-design"
+                  className="text-sm text-primary hover:underline"
+                  data-testid="runs-link-fleet-design"
+                >
+                  {t('aiAgentsRuns.headerLinks.fleetDesignReport')}
+                </a>
+              )}
+              {showFilterChrome && (
             <>
               <select
                 data-testid="runs-list-filter-agent"
@@ -789,6 +817,8 @@ export default function RunsListPage() {
               >
                 {showCost ? t('aiAgentsRuns.list.hideCost') : t('aiAgentsRuns.list.showCost')}
               </button>
+            </>
+              )}
             </>
           ) : undefined
         }

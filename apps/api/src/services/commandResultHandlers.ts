@@ -13,6 +13,8 @@
  */
 
 import { z } from 'zod';
+import { CommandTypes } from './commandTypes';
+import { applyWakeRelayResult } from './wakeAttempts';
 import { requestLikeFromSnapshot, writeAuditEvent } from './auditEvents';
 import {
   AGENT_UPDATE_REQUIRED_ERROR,
@@ -22,7 +24,7 @@ import {
 } from './systemCleanup';
 
 import { eq, ne, and, inArray, isNull, sql } from 'drizzle-orm';
-import { db, runOutsideDbContext } from '../db';
+import { db, runOutsideDbContext, withDbTransaction } from '../db';
 import {
   deviceCommands,
   deviceFilesystemCleanupRuns,
@@ -38,12 +40,13 @@ import { isRedisAvailable } from './redis';
 import { processBackupVerificationResult } from '../routes/backup/verificationService';
 import { applyBackupCommandResultToJob } from './backupResultPersistence';
 import { applyVaultSyncCommandResult } from './vaultSyncPersistence';
+import { applyVaultConfigureCommandResult } from './vaultDeviceCommands';
 import { backupCommandResultSchema } from '../routes/backup/resultSchemas';
 import { describeZodIssues } from '../lib/zodIssues';
 import { redactSecretsFromOutput, redactOptionalSecretText } from './secretRedaction';
 import { updateRestoreJobByCommandId } from './restoreResultPersistence';
 import { applyRebuildCommandResult } from './bareMetalRecoveryService';
-import { captureException } from './sentry';
+import { captureException, captureMessage } from './sentry';
 import { applyScriptCustomFieldWrites } from './customFields/scriptWriteBack';
 import type { ScriptCustomFieldWriteSummary } from '../db/schema/scripts';
 import { PG_UUID_REGEX, UUID_REGEX } from '../utils/uuid';
@@ -54,6 +57,9 @@ import { PG_UUID_REGEX, UUID_REGEX } from '../utils/uuid';
 // while the REST path rejected at 1 MB. The byte-accurate one wins.
 import { commandResultSchema } from '../routes/agents/schemas';
 import { applyAutomationActionTerminal } from './automationActionResults';
+import { evaluateScriptExitCodeAlert, type ScriptTriggerType } from './scriptExitCodeAlerts';
+import { advanceOutcomesForTerminalExecution } from './fixMemory/scriptTerminalHook';
+import { emitScriptTerminalEvent } from './scriptTerminalEvents';
 import { enqueueScriptVerify } from './scriptProposals/verify';
 import { handlePeripheralPolicyResultV2 } from './peripheralPolicyState';
 import {
@@ -65,6 +71,14 @@ import {
 // task exited, so the agent's result must close the device out here rather than
 // through the executor's poll.
 import { handleInstallPatchesResult } from './patchJobFinalizer';
+// #6354 W02: caller verification's workstation tier. Both transports reach
+// this one leaf handler; it decides nothing itself (W01 applyDecision does).
+import { handleCallerVerifyResult } from './callerVerification/workstationResult';
+import { handleNotifyUserResult, handleRetractMessageResult } from './endpointMessaging/commandResults';
+import { handleChatMessageResult, handleChatOpenResult } from './endpointMessaging/chatResults';
+// #9662: AI/incident containment actions follow their command's real outcome.
+import { handleExecuteContainmentResult } from './incidentContainmentResults';
+import { applyOemUpdateRelease, applyOemUpdateResult } from './oemUpdates/results';
 
 export type CommandResultHandlerOutcome =
   | { kind: 'pam'; classification: PamActuationResultClassification }
@@ -187,37 +201,41 @@ async function handleDiscoveryResult({ agentId, command, result, commandId }: Pa
           })
           .where(eq(discoveryJobs.id, expectedJobId));
       } catch (dbErr) {
+        // #3530: the job would stay 'running' with nothing recorded — neither
+        // the results nor the failure. Propagate so the transport rolls the
+        // command's terminal transition back and parks it as
+        // result_processing_failed instead of reporting it completed.
         console.error(`[AgentWs] Additionally failed to mark discovery job ${expectedJobId} as failed:`, dbErr);
+        throw dbErr;
       }
     }
   }
 }
 
-async function handleBackupVerificationResult({ agentId, result, stdout, commandId }: Parameters<CommandResultHandler>[0]): Promise<void> {
-  try {
-    await processBackupVerificationResult(commandId, {
-      status: result.status,
-      stdout,
-      error: result.error,
-    });
-  } catch (err) {
-    console.error(`[AgentWs] Failed to process backup verification result for ${agentId}:`, err);
-    captureException(err);
-  }
+// #3530: every persistence handler below PROPAGATES its failure. Both
+// transports run it inside the transaction that also holds the command's
+// terminal compare-and-set, so a throw rolls that transition back and the
+// transport parks the row as `result_processing_failed` (reopenable) — the
+// command history never claims "completed" for a result that was not
+// recorded. Logging + Sentry capture happen once, at the transport, tagged
+// with the command type and id. Only genuinely best-effort side effects
+// (custom-field write-back, exit-code alerts, verification enqueues) keep a
+// local catch.
+async function handleBackupVerificationResult({ result, stdout, commandId }: Parameters<CommandResultHandler>[0]): Promise<void> {
+  await processBackupVerificationResult(commandId, {
+    status: result.status,
+    stdout,
+    error: result.error,
+  });
 }
 
-async function handleVmRestoreResult({ agentId, command, result, resolvedDeviceId, commandId }: Parameters<CommandResultHandler>[0]): Promise<void> {
-  try {
-    await updateRestoreJobByCommandId({
-      commandId: commandId,
-      deviceId: resolvedDeviceId,
-      commandType: command.type,
-      result,
-    });
-  } catch (err) {
-    console.error(`[AgentWs] Failed to process queued restore result for ${agentId}:`, err);
-    captureException(err);
-  }
+async function handleVmRestoreResult({ command, result, resolvedDeviceId, commandId }: Parameters<CommandResultHandler>[0]): Promise<void> {
+  await updateRestoreJobByCommandId({
+    commandId: commandId,
+    deviceId: resolvedDeviceId,
+    commandType: command.type,
+    result,
+  });
 }
 
 /**
@@ -228,18 +246,13 @@ async function handleVmRestoreResult({ agentId, command, result, resolvedDeviceI
  * stays the primary path — applyRebuildCommandResult is idempotent on a row
  * it already terminalised.
  */
-async function handleBareMetalRebuildResult({ agentId, command, result, resolvedDeviceId, commandId }: Parameters<CommandResultHandler>[0]): Promise<void> {
-  try {
-    await updateRestoreJobByCommandId({
-      commandId,
-      deviceId: resolvedDeviceId,
-      commandType: command.type,
-      result,
-    });
-  } catch (err) {
-    console.error(`[AgentWs] Failed to process bare-metal rebuild restore job for ${agentId}:`, err);
-    captureException(err);
-  }
+async function handleBareMetalRebuildResult({ command, result, resolvedDeviceId, commandId }: Parameters<CommandResultHandler>[0]): Promise<void> {
+  await updateRestoreJobByCommandId({
+    commandId,
+    deviceId: resolvedDeviceId,
+    commandType: command.type,
+    result,
+  });
 
   const payload =
     command.payload && typeof command.payload === 'object' && !Array.isArray(command.payload)
@@ -251,93 +264,93 @@ async function handleBareMetalRebuildResult({ agentId, command, result, resolved
   const orgId = typeof command.submittedOrgId === 'string' ? command.submittedOrgId : null;
   if (!recoveryId || !orgId) return;
 
-  try {
-    await applyRebuildCommandResult({ recoveryId, orgId, result: result as unknown as Record<string, unknown> });
-  } catch (err) {
-    console.error(`[AgentWs] Failed to apply bare-metal rebuild result to recovery ${recoveryId} for ${agentId}:`, err);
-    captureException(err);
-  }
+  // Idempotent on a row the progress route already terminalised, so a
+  // resubmission after a rolled-back attempt is safe.
+  await applyRebuildCommandResult({ recoveryId, orgId, result: result as unknown as Record<string, unknown> });
 }
 
-async function handleProviderBackedBackupResult({ agentId, command, result, resolvedDeviceId }: Parameters<CommandResultHandler>[0]): Promise<void> {
-  try {
-    const payload =
-      command.payload && typeof command.payload === 'object' && !Array.isArray(command.payload)
-        ? command.payload as Record<string, unknown>
-        : {};
-    const backupJobId =
-      typeof payload.backupJobId === 'string'
-        ? payload.backupJobId
-        : typeof payload.jobId === 'string' && UUID_REGEX.test(payload.jobId)
-          ? payload.jobId
-          : null;
+async function handleProviderBackedBackupResult({ command, result, resolvedDeviceId }: Parameters<CommandResultHandler>[0]): Promise<void> {
+  const payload =
+    command.payload && typeof command.payload === 'object' && !Array.isArray(command.payload)
+      ? command.payload as Record<string, unknown>
+      : {};
+  const backupJobId =
+    typeof payload.backupJobId === 'string'
+      ? payload.backupJobId
+      : typeof payload.jobId === 'string' && UUID_REGEX.test(payload.jobId)
+        ? payload.jobId
+        : null;
 
-    if (backupJobId) {
-      const [backupJob] = await db
-        .select({
-          id: backupJobs.id,
-          orgId: backupJobs.orgId,
-          deviceId: backupJobs.deviceId,
-        })
-        .from(backupJobs)
-        .where(
-          and(
-            eq(backupJobs.id, backupJobId),
-            eq(backupJobs.deviceId, resolvedDeviceId)
-          )
+  if (backupJobId) {
+    const [backupJob] = await db
+      .select({
+        id: backupJobs.id,
+        orgId: backupJobs.orgId,
+        deviceId: backupJobs.deviceId,
+      })
+      .from(backupJobs)
+      .where(
+        and(
+          eq(backupJobs.id, backupJobId),
+          eq(backupJobs.deviceId, resolvedDeviceId)
         )
-        .limit(1);
+      )
+      .limit(1);
 
-      if (backupJob) {
-        const parsedBackup = backupCommandResultSchema.safeParse(result.result ?? {});
-        if (!parsedBackup.success) {
-          await applyBackupCommandResultToJob({
-            jobId: backupJob.id,
-            orgId: backupJob.orgId,
-            deviceId: backupJob.deviceId,
-            resultStatus: 'failed',
-            result: {
-              error: `Malformed backup result payload: ${describeZodIssues(parsedBackup.error)}`,
-            },
-          });
-        } else {
-          await applyBackupCommandResultToJob({
-            jobId: backupJob.id,
-            orgId: backupJob.orgId,
-            deviceId: backupJob.deviceId,
-            resultStatus: result.status,
-            // Provider-backed backups do not report `partial` today, but this
-            // path parses the agent's status and must not be the one place
-            // that silently discards it.
-            agentStatus: parsedBackup.data.status,
-            result: {
-              ...parsedBackup.data,
-              error: result.error || result.stderr,
-            },
-          });
-        }
+    if (backupJob) {
+      const parsedBackup = backupCommandResultSchema.safeParse(result.result ?? {});
+      if (!parsedBackup.success) {
+        await applyBackupCommandResultToJob({
+          jobId: backupJob.id,
+          orgId: backupJob.orgId,
+          deviceId: backupJob.deviceId,
+          resultStatus: 'failed',
+          result: {
+            error: `Malformed backup result payload: ${describeZodIssues(parsedBackup.error)}`,
+          },
+        });
+      } else {
+        await applyBackupCommandResultToJob({
+          jobId: backupJob.id,
+          orgId: backupJob.orgId,
+          deviceId: backupJob.deviceId,
+          resultStatus: result.status,
+          // Provider-backed backups do not report `partial` today, but this
+          // path parses the agent's status and must not be the one place
+          // that silently discards it.
+          agentStatus: parsedBackup.data.status,
+          result: {
+            ...parsedBackup.data,
+            error: result.error || result.stderr,
+          },
+          // Reached only after the terminal compare-and-set on this
+          // device's own dispatched command row.
+          dispatchExpectationVerified: true,
+        });
       }
     }
-  } catch (err) {
-    console.error(`[AgentWs] Failed to process ${command.type} backup result for ${agentId}:`, err);
-    captureException(err);
   }
 }
 
-async function handleVaultSyncResult({ agentId, command, result, resolvedDeviceId, stdout }: Parameters<CommandResultHandler>[0]): Promise<void> {
-  try {
-    await applyVaultSyncCommandResult({
-      deviceId: resolvedDeviceId,
-      command,
-      resultStatus: result.status,
-      stdout,
-      stderr: result.stderr,
-      error: result.error,
-    });
-  } catch (err) {
-    console.error(`[AgentWs] Failed to process vault sync result for ${agentId}:`, err);
-    captureException(err);
-  }
+async function handleVaultConfigureResult({ command, result, resolvedDeviceId }: Parameters<CommandResultHandler>[0]): Promise<void> {
+  await applyVaultConfigureCommandResult({
+    deviceId: resolvedDeviceId,
+    command,
+    resultStatus: result.status,
+    stderr: result.stderr,
+    error: result.error,
+  });
+}
+
+async function handleVaultSyncResult({ command, result, resolvedDeviceId, stdout }: Parameters<CommandResultHandler>[0]): Promise<void> {
+  await applyVaultSyncCommandResult({
+    deviceId: resolvedDeviceId,
+    command,
+    resultStatus: result.status,
+    stdout,
+    stderr: result.stderr,
+    error: result.error,
+  });
 }
 
 /** Called only after the transport has bound the result to its dispatched target.
@@ -357,61 +370,56 @@ export async function recordSnmpPollFailure(snmpDeviceId: string, deviceId: stri
 }
 
 async function handleSnmpPollResult({ agentId, command, result, commandId, resolvedDeviceId }: Parameters<CommandResultHandler>[0]): Promise<void> {
-  try {
-    const payload = command.payload as Record<string, unknown> | null;
-    const expectedDeviceId = typeof payload?.deviceId === 'string' ? payload.deviceId : null;
-    const snmpData = result.result as {
-      deviceId?: string;
-      metrics?: SnmpMetricResult[];
-      protocol?: number;
-      success?: boolean;
-    } | undefined;
+  const payload = command.payload as Record<string, unknown> | null;
+  const expectedDeviceId = typeof payload?.deviceId === 'string' ? payload.deviceId : null;
+  const snmpData = result.result as {
+    deviceId?: string;
+    metrics?: SnmpMetricResult[];
+    protocol?: number;
+    success?: boolean;
+  } | undefined;
 
-    if (!expectedDeviceId || (snmpData?.deviceId && snmpData.deviceId !== expectedDeviceId)) {
-      console.warn(
-        `[AgentWs] Rejecting mismatched SNMP result ${commandId} from agent ${agentId}: ` +
-        `sentDevice=${snmpData?.deviceId ?? 'none'} expected=${expectedDeviceId ?? 'none'}`
-      );
-      return;
+  if (!expectedDeviceId || (snmpData?.deviceId && snmpData.deviceId !== expectedDeviceId)) {
+    console.warn(
+      `[AgentWs] Rejecting mismatched SNMP result ${commandId} from agent ${agentId}: ` +
+      `sentDevice=${snmpData?.deviceId ?? 'none'} expected=${expectedDeviceId ?? 'none'}`
+    );
+    return;
+  }
+  if (result.status !== 'completed' || snmpData?.success === false) {
+    await recordSnmpPollFailure(expectedDeviceId, resolvedDeviceId, result.error || 'SNMP poll failed');
+    return;
+  }
+  if (snmpData?.deviceId && Array.isArray(snmpData.metrics)) {
+    if (isRedisAvailable() || snmpData.metrics.length === 0) {
+      const { snmpDevices } = await import('../db/schema');
+      await db.update(snmpDevices)
+        .set({ lastError: null, lastErrorAt: null })
+        .where(eq(snmpDevices.id, expectedDeviceId));
+      if (snmpData.metrics.length === 0) return;
+      const metrics = snmpData.metrics;
+      // Exit the held org-scoped transaction context for the Redis
+      // round-trips (#1105) — see the note on the monitor-result branch.
+      await runOutsideDbContext(() => enqueueSnmpPollResults(expectedDeviceId, metrics, undefined, snmpData.protocol));
+    } else {
+      // Redis not available — log warning about dropped metrics and mark status
+      console.warn(`[AgentWs] Redis unavailable, dropping ${snmpData.metrics.length} SNMP metrics for device ${expectedDeviceId}`);
+      const { snmpDevices } = await import('../db/schema');
+      await db
+        .update(snmpDevices)
+        .set({
+          lastPolled: new Date(),
+          // The device answered; only our own pipeline failed. Clear the
+          // failure backoff (#3217) so a Redis outage doesn't march every
+          // healthy SNMP target to 'offline' and a one-hour interval.
+          lastPollAttemptedAt: new Date(),
+          consecutiveFailures: 0,
+          lastStatus: 'warning',
+          lastError: null,
+          lastErrorAt: null
+        })
+        .where(eq(snmpDevices.id, expectedDeviceId));
     }
-    if (result.status !== 'completed' || snmpData?.success === false) {
-      await recordSnmpPollFailure(expectedDeviceId, resolvedDeviceId, result.error || 'SNMP poll failed');
-      return;
-    }
-    if (snmpData?.deviceId && Array.isArray(snmpData.metrics)) {
-      if (isRedisAvailable() || snmpData.metrics.length === 0) {
-        const { snmpDevices } = await import('../db/schema');
-        await db.update(snmpDevices)
-          .set({ lastError: null, lastErrorAt: null })
-          .where(eq(snmpDevices.id, expectedDeviceId));
-        if (snmpData.metrics.length === 0) return;
-        const metrics = snmpData.metrics;
-        // Exit the held org-scoped transaction context for the Redis
-        // round-trips (#1105) — see the note on the monitor-result branch.
-        await runOutsideDbContext(() => enqueueSnmpPollResults(expectedDeviceId, metrics, undefined, snmpData.protocol));
-      } else {
-        // Redis not available — log warning about dropped metrics and mark status
-        console.warn(`[AgentWs] Redis unavailable, dropping ${snmpData.metrics.length} SNMP metrics for device ${expectedDeviceId}`);
-        const { snmpDevices } = await import('../db/schema');
-        await db
-          .update(snmpDevices)
-          .set({
-            lastPolled: new Date(),
-            // The device answered; only our own pipeline failed. Clear the
-            // failure backoff (#3217) so a Redis outage doesn't march every
-            // healthy SNMP target to 'offline' and a one-hour interval.
-            lastPollAttemptedAt: new Date(),
-            consecutiveFailures: 0,
-            lastStatus: 'warning',
-            lastError: null,
-            lastErrorAt: null
-          })
-          .where(eq(snmpDevices.id, expectedDeviceId));
-      }
-    }
-  } catch (err) {
-    console.error(`[AgentWs] Failed to process SNMP poll results for ${agentId}:`, err);
-    captureException(err);
   }
 }
 
@@ -425,10 +433,42 @@ function terminalExecutionProjection() {
     id: scriptExecutions.id,
     scriptId: scriptExecutions.scriptId,
     proposalId: scriptExecutions.proposalId,
+    // #6690: the exit-code alert needs the execution's own org and trigger lane.
+    orgId: scriptExecutions.orgId,
+    triggerType: scriptExecutions.triggerType,
+    // #7277: identifies the automation run that queued the execution, so the
+    // public terminal event carries what the fan-out's loop guard needs.
+    automationRunId: scriptExecutions.automationRunId,
   } as const;
 }
 
-async function handleScriptResult({ agentId, command, result, resolvedDeviceId, stdout }: Parameters<CommandResultHandler>[0]): Promise<void> {
+type TerminalExecution = {
+  id: string;
+  scriptId: string | null;
+  proposalId: string | null;
+  orgId: string;
+  triggerType: ScriptTriggerType;
+  automationRunId: string | null;
+};
+
+function isCustomFieldWritesEnvelope(value: unknown): boolean {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    && 'customFieldWrites' in value;
+}
+
+async function handleScriptResult({ agentId, command, result, resolvedDeviceId, stdout: transportStdout }: Parameters<CommandResultHandler>[0]): Promise<void> {
+  // #6537 — both ingest transports fall back to `JSON.stringify(result.result)`
+  // when the agent sent no stdout (generic handlers deliver their structured
+  // output that way). The agent sends no stdout at all when every line a script
+  // printed was a `::breeze:custom-fields::` marker it stripped, so the
+  // transport synthesized the #2698 customFieldWrites envelope as "output".
+  // Persisting that showed the operator `{"customFieldWrites":…}` as what the
+  // script printed — which reads as proof the write landed even when every
+  // field was rejected. Narrowed to exactly that envelope so no other caller's
+  // stdout changes meaning.
+  const stdout = result.stdout === undefined && isCustomFieldWritesEnvelope(result.result)
+    ? undefined
+    : transportStdout;
   // Which write we are on, for the shared catch below. This function now runs a
   // five-step compare-and-swap ladder inside ONE try; without a phase tag every
   // failure reaches Sentry with the same three context fields and the same
@@ -451,13 +491,19 @@ async function handleScriptResult({ agentId, command, result, resolvedDeviceId, 
     // regression class documented at length below (#3162, #3607).
     let customFieldResult: ScriptCustomFieldWriteSummary | null = null;
     try {
-      customFieldResult = await applyScriptCustomFieldWrites({
+      // #3530: a SAVEPOINT, because both transports now run this handler in
+      // the transaction that also holds the command's terminal CAS. Without
+      // it a Postgres error in the write-back would be caught here but leave
+      // that transaction aborted — the stdout write below would then fail
+      // too and the whole result would be parked, the exact loss this catch
+      // exists to prevent. Same pattern as evaluateScriptExitCodeAlert.
+      customFieldResult = await withDbTransaction(() => applyScriptCustomFieldWrites({
         deviceId: resolvedDeviceId,
         agentId,
         commandId: command.id,
         stdout,
         resultEnvelope: result.result,
-      });
+      }));
       if (customFieldResult && customFieldResult.rejected.length > 0) {
         console.warn('[AgentWs] script custom-field write-back rejected entries', {
           commandId: command.id,
@@ -540,12 +586,15 @@ async function handleScriptResult({ agentId, command, result, resolvedDeviceId, 
       //     process reached a real outcome, so keep it (OD9-C) and record the
       //     losing cancel request in `cancel_state` alone. `status` is never
       //     `cancelled` here: we cannot prove the stop.
-      const cancelledMarker = (result as Record<string, unknown> | null)?.cancelled === true;
-      const rawMarkerCommandId = (result as Record<string, unknown> | null)?.cancelledByCommandId;
-      const markerCommandId = typeof rawMarkerCommandId === 'string' ? rawMarkerCommandId : null;
+      //
+      // Both fields are declared on `commandResultSchema` (#10377). Until they
+      // were, the transport parse stripped them and the PROVEN write below was
+      // unreachable from a real agent.
+      const cancelledMarker = result.cancelled === true;
+      const markerCommandId = result.cancelledByCommandId ?? null;
 
       phase = 'cancel-confirm-cas';
-      let cancelClosed: Array<{ id: string; scriptId: string | null; proposalId: string | null }> = [];
+      let cancelClosed: TerminalExecution[] = [];
       let cancelConfirmed = false;
       if (cancelledMarker && markerCommandId) {
         cancelClosed = await db
@@ -573,7 +622,10 @@ async function handleScriptResult({ agentId, command, result, resolvedDeviceId, 
           .returning(terminalExecutionProjection());
       }
 
-      let updatedExecutions: Array<{ id: string; scriptId: string | null; proposalId: string | null }> = [];
+      let updatedExecutions: TerminalExecution[] = [];
+      // #7279: set when the #3607 recovery below records this result onto an
+      // execution a server sweep already terminalised.
+      let recoveredLateResult = false;
       let effectiveExecution = cancelClosed[0] ?? null;
 
       if (cancelClosed.length === 0) {
@@ -636,6 +688,7 @@ async function handleScriptResult({ agentId, command, result, resolvedDeviceId, 
 
           if (recovered.length > 0) {
             effectiveExecution = recovered[0] ?? null;
+            recoveredLateResult = true;
             console.warn(
               `[AgentWs] #3607 recovered late script result onto swept execution ${executionId} (command ${command.id})`
             );
@@ -755,6 +808,33 @@ async function handleScriptResult({ agentId, command, result, resolvedDeviceId, 
           completedAt: executionValues.completedAt,
         });
 
+        // #6690 — the script's opt-in exit-code → alert mapping. Runs after the
+        // execution row above is written; never throws (own savepoint + catch).
+        // Only a real exit code is a verdict: a proven cancel, a timeout or a
+        // failure to run neither raises nor clears the alert.
+        if (!cancelConfirmed && result.status === 'completed' && typeof result.exitCode === 'number') {
+          await evaluateScriptExitCodeAlert({
+            executionId: effectiveExecution.id,
+            scriptId: effectiveExecution.scriptId,
+            orgId: effectiveExecution.orgId,
+            deviceId: resolvedDeviceId,
+            triggerType: effectiveExecution.triggerType,
+            exitCode: result.exitCode,
+            stderr: executionValues.stderr,
+          });
+        }
+
+        // AI Suggested Fixes W1 (D-a) — advance any fix attempt riding on this
+        // execution. Inline, own savepoint, never throws; NOT a public event.
+        // A late result also reconciles an attempt the sweep's verdict already
+        // closed (#7279, scriptTerminalHook lateResultWrites).
+        await advanceOutcomesForTerminalExecution({
+          executionId: effectiveExecution.id,
+          status: cancelConfirmed ? 'cancelled' : scriptStatus,
+          completedAt: executionValues.completedAt,
+          lateResult: recoveredLateResult,
+        });
+
         if (effectiveExecution.proposalId) {
           // W03 (#5612, spec §4.9): the proposal's verification claim is
           // evaluated AFTER the execution reaches a terminal state, by an
@@ -815,53 +895,90 @@ async function handleScriptResult({ agentId, command, result, resolvedDeviceId, 
             eq(scriptExecutionBatches.scriptId, countedExecution.scriptId)
           ));
       }
+
+      // #7277 — public script.completed / script.failed. Keyed on the same fence
+      // as the batch counter: only the writer that TERMINALISED the row emits,
+      // so the #3607 recovery and #3525 late-output paths (rows a sweep already
+      // closed, and already announced) never double-fire automations. A proven
+      // cancel emits nothing. Deferred until the surrounding transaction
+      // commits. Registered LAST on purpose: the REST ingest path runs this
+      // handler in a SAVEPOINT of a request transaction that still commits
+      // after the savepoint rolls back (it parks the command), and a task
+      // registered inside a rolled-back savepoint is not dropped. Nothing after
+      // this point can throw, so the event is only queued for a final state.
+      if (countedExecution && !cancelConfirmed) {
+        emitScriptTerminalEvent({
+          executionId: countedExecution.id,
+          orgId: countedExecution.orgId,
+          deviceId: resolvedDeviceId,
+          scriptId: countedExecution.scriptId,
+          triggerType: countedExecution.triggerType,
+          automationRunId: countedExecution.automationRunId ?? null,
+          exitCode: executionValues.exitCode,
+          status: scriptStatus,
+        });
+      }
     }
   } catch (err) {
     // #3162 lived undetected because this catch logged to the container and
     // nothing else — a swallowed 22P02 silently discarded every automation's
-    // script output. Report it like the SNMP handler does so the next failure
-    // in here (schema drift, a redaction throw, a batch-counter FK violation)
-    // surfaces instead of quietly eating results.
-    console.error(`[AgentWs] Failed to process script result for ${agentId}:`, err);
-    captureException(err, undefined, {
-      commandId: command.id,
-      agentId,
-      executionId: String((command.payload as Record<string, unknown> | null)?.executionId ?? ''),
-      phase,
-    });
+    // script output. #3530 goes further: the failure PROPAGATES, so the
+    // transport rolls back the command's terminal transition and parks it as
+    // result_processing_failed rather than reporting a completed run with no
+    // recorded output. The phase is logged here because the transport's
+    // Sentry capture cannot see it.
+    console.error(
+      `[AgentWs] Failed to process script result for ${agentId} ` +
+      `(command ${command.id}, execution ${String((command.payload as Record<string, unknown> | null)?.executionId ?? '')}, phase ${phase}):`,
+      err,
+    );
+    throw err;
   }
 }
 
-async function handleSensitiveDataResult({ agentId, command, result, stdout }: Parameters<CommandResultHandler>[0]): Promise<void> {
-  try {
-    const { handleSensitiveDataCommandResult } = await import('../routes/agents/helpers');
-    await handleSensitiveDataCommandResult(command, {
-      status: result.status,
-      exitCode: result.exitCode,
-      stdout,
-      stderr: result.stderr,
-      durationMs: result.durationMs,
-      error: result.error,
-    } as any);
-  } catch (err) {
-    console.error(`[AgentWs] Failed to process sensitive data result for ${agentId}:`, err);
-  }
+async function handleSensitiveDataResult({ command, result, stdout }: Parameters<CommandResultHandler>[0]): Promise<void> {
+  const { handleSensitiveDataCommandResult } = await import('../routes/agents/helpers');
+  await handleSensitiveDataCommandResult(command, {
+    status: result.status,
+    exitCode: result.exitCode,
+    stdout,
+    stderr: result.stderr,
+    durationMs: result.durationMs,
+    error: result.error,
+  } as any);
 }
 
-async function handleCisResult({ agentId, command, result, stdout }: Parameters<CommandResultHandler>[0]): Promise<void> {
-  try {
-    const { handleCisCommandResult } = await import('../routes/agents/helpers');
-    await handleCisCommandResult(command, {
-      status: result.status,
-      exitCode: result.exitCode,
-      stdout,
-      stderr: result.stderr,
-      durationMs: result.durationMs,
-      error: result.error,
-    } as any);
-  } catch (err) {
-    console.error(`[AgentWs] Failed to process CIS result for ${agentId}:`, err);
-  }
+async function handleCisResult({ command, result, stdout }: Parameters<CommandResultHandler>[0]): Promise<void> {
+  const { handleCisCommandResult } = await import('../routes/agents/helpers');
+  await handleCisCommandResult(command, {
+    status: result.status,
+    exitCode: result.exitCode,
+    stdout,
+    stderr: result.stderr,
+    durationMs: result.durationMs,
+    error: result.error,
+  } as any);
+}
+
+/**
+ * #10376: the websocket transport dispatches ONLY through this registry, so
+ * until the security types were listed here every WS-delivered security
+ * result was dropped — a `security_scans` row stayed `running` (and an IOC
+ * sweep never finished), no threat was ingested, and quarantine/remove/restore
+ * never moved the threat row. The REST route keeps its inline call (these
+ * types are deliberately absent from its REGISTRY_DISPATCHED_COMMAND_TYPES),
+ * so each transport runs the same leaf exactly once.
+ */
+async function handleSecurityResult({ command, result, stdout }: Parameters<CommandResultHandler>[0]): Promise<void> {
+  const { handleSecurityCommandResult } = await import('../routes/agents/helpers');
+  await handleSecurityCommandResult(command, {
+    status: result.status,
+    exitCode: result.exitCode,
+    stdout,
+    stderr: result.stderr,
+    durationMs: result.durationMs,
+    error: result.error,
+  });
 }
 
 const peripheralPolicyResultV2Schema = z.object({
@@ -923,25 +1040,18 @@ async function handlePamActuationV2Result({
  * schema module into the graph, and several suites here partially mock
  * `db/schema`.
  */
-async function handleScriptCancelResult({ agentId, commandId, result }: Parameters<CommandResultHandler>[0]): Promise<void> {
-  try {
-    const { applyScriptCancelAck } = await import('./scriptCancellation');
-    await applyScriptCancelAck({
-      // The transport-authorized id, never one read off the payload — same
-      // invariant as every other handler in this file.
-      cancelCommandId: commandId,
-      result: (result ?? null) as Record<string, unknown> | null,
-    });
-  } catch (err) {
-    // Both transports CAS the device_commands row to a terminal status BEFORE
-    // dispatching here, so the agent will never resend this ack — losing it
-    // leaves the execution in `cancelling` until the sweep (closer 5) gives up
-    // and records `unconfirmed`. Degraded but not stranded, so this is
-    // reported rather than rethrown; the tags are what let an on-call engineer
-    // find the affected row from the alert. Matches handleScriptResult.
-    console.error(`[AgentWs] Failed to apply script cancel ack for ${agentId}:`, err);
-    captureException(err, undefined, { commandId, agentId });
-  }
+async function handleScriptCancelResult({ commandId, result }: Parameters<CommandResultHandler>[0]): Promise<void> {
+  // #3530: propagates like every persistence handler. A lost ack still leaves
+  // the execution in `cancelling` until the sweep (closer 5) records
+  // `unconfirmed` — but the cancel command itself is now parked as
+  // result_processing_failed (reopenable) instead of reading "completed".
+  const { applyScriptCancelAck } = await import('./scriptCancellation');
+  await applyScriptCancelAck({
+    // The transport-authorized id, never one read off the payload — same
+    // invariant as every other handler in this file.
+    cancelCommandId: commandId,
+    result: (result ?? null) as Record<string, unknown> | null,
+  });
 }
 
 /**
@@ -971,11 +1081,16 @@ async function handleFilesystemAnalysisResult({
     .where(eq(devices.id, resolvedDeviceId))
     .limit(1);
   if (!device) {
-    const message = `[commandResultHandlers] filesystem_analysis result for unknown device ${resolvedDeviceId}`;
-    console.warn(message);
+    console.warn(
+      `[commandResultHandlers] filesystem_analysis result ${commandId} for unknown device ${resolvedDeviceId}; dropped`
+    );
     // A dropped scan result is silent data loss otherwise: nothing but this
-    // console line (which most deployments don't ship) ever showed it.
-    captureException(new Error(message), undefined, { commandId, resolvedDeviceId });
+    // console line (which most deployments don't ship) ever showed it. An event
+    // code, not captureException: scrubEvent redacts an exception's value and
+    // drops the unallowlisted id tags, so that report arrived contentless (#8024).
+    captureMessage('filesystem_analysis result dropped: unknown device', {
+      eventCode: 'filesystem_analysis_result_unknown_device',
+    });
     return;
   }
   await handleFilesystemAnalysisCommandResult(command, result, device.orgId);
@@ -1146,7 +1261,47 @@ export async function handleSystemCleanupRunResult(
   });
 }
 
+async function handleWakeOnLanResult({ command, result, stdout }: Parameters<CommandResultHandler>[0]): Promise<void> {
+  const payload = command.payload as Record<string, unknown> | null;
+  const attemptId = payload?.wakeAttemptId;
+  if (typeof attemptId !== 'string' || !PG_UUID_REGEX.test(attemptId)) return;
+  const parsed = parseAgentJson(z.object({ packetsSent: z.number().int().nonnegative() }), stdout);
+  if (result.status === 'completed' && parsed === null) {
+    console.warn('[wakeAttempts] relay reported completed with unreadable output; recording send_failed', { commandId: command.id, attemptId });
+  }
+  await applyWakeRelayResult(attemptId, result.status === 'completed' && parsed !== null && parsed.packetsSent > 0);
+}
+
+/**
+ * Vendor updates (#11065). The agent reports its normalized result as JSON on
+ * stdout; anything else reaches the strict parser as-is and is recorded as
+ * `result_unparseable`.
+ */
+async function handleOemUpdateRunResult({ commandId, resolvedDeviceId, stdout }: Parameters<CommandResultHandler>[0]): Promise<void> {
+  let result: unknown = stdout;
+  try {
+    result = JSON.parse(stdout ?? '');
+  } catch {
+    // Left as the raw text: the parser refuses it.
+  }
+  await applyOemUpdateResult({ commandId, deviceId: resolvedDeviceId, result });
+}
+
+/** The agent's answer to a vendor schedule release, the same way: JSON on stdout. */
+async function handleOemUpdateReleaseResult({ commandId, resolvedDeviceId, stdout }: Parameters<CommandResultHandler>[0]): Promise<void> {
+  let result: unknown = stdout;
+  try {
+    result = JSON.parse(stdout ?? '');
+  } catch {
+    // Left as the raw text: the parser refuses it.
+  }
+  await applyOemUpdateRelease({ commandId, deviceId: resolvedDeviceId, result });
+}
+
 export const commandResultHandlers: Record<string, CommandResultHandler> = {
+  [CommandTypes.OEM_UPDATE_RUN]: handleOemUpdateRunResult,
+  [CommandTypes.OEM_UPDATE_RELEASE]: handleOemUpdateReleaseResult,
+  [CommandTypes.WAKE_ON_LAN]: handleWakeOnLanResult,
   network_discovery: handleDiscoveryResult,
   backup_verify: handleBackupVerificationResult,
   backup_test_restore: handleBackupVerificationResult,
@@ -1154,10 +1309,15 @@ export const commandResultHandlers: Record<string, CommandResultHandler> = {
   vm_restore_from_backup: handleVmRestoreResult,
   vm_instant_boot: handleVmRestoreResult,
   bmr_recover: handleVmRestoreResult,
+  // #6974: async-dispatched (#6437); the restore_jobs row is linked by command id.
+  mssql_restore: handleVmRestoreResult,
+  hyperv_restore: handleVmRestoreResult,
   bare_metal_rebuild: handleBareMetalRebuildResult,
   hyperv_backup: handleProviderBackedBackupResult,
   mssql_backup: handleProviderBackedBackupResult,
   vault_sync: handleVaultSyncResult,
+  // #8385: a configuration the helper could not apply shows on the vault.
+  vault_configure: handleVaultConfigureResult,
   snmp_poll: handleSnmpPollResult,
   script: handleScriptResult,
   script_cancel: handleScriptCancelResult,
@@ -1167,6 +1327,12 @@ export const commandResultHandlers: Record<string, CommandResultHandler> = {
   quarantine_file: handleSensitiveDataResult,
   cis_benchmark: handleCisResult,
   apply_cis_remediation: handleCisResult,
+  // #10376: security results over the websocket (REST calls the same leaf inline).
+  security_collect_status: handleSecurityResult,
+  security_scan: handleSecurityResult,
+  security_threat_quarantine: handleSecurityResult,
+  security_threat_remove: handleSecurityResult,
+  security_threat_restore: handleSecurityResult,
   peripheral_policy_sync_v2: handlePeripheralPolicyV2Result,
   pam_apply_v2: handlePamActuationV2Result,
   pam_cleanup_v2: handlePamActuationV2Result,
@@ -1174,4 +1340,18 @@ export const commandResultHandlers: Record<string, CommandResultHandler> = {
   system_cleanup_run: handleSystemCleanupRunResult,
   filesystem_analysis: handleFilesystemAnalysisResult,
   file_delete: handleFileDeleteResult,
+  caller_verify: handleCallerVerifyResult,
+  // #8742 W02: endpoint-message deliveries follow their notify_user result.
+  notify_user: handleNotifyUserResult,
+  retract_message: handleRetractMessageResult,
+  // #8743 W03: endpoint live chat. chat_close carries no state to record.
+  chat_open: handleChatOpenResult,
+  chat_message: handleChatMessageResult,
+  // #9662: the incident action (and, on success, the incident) follows the
+  // agent's containment result.
+  execute_containment: handleExecuteContainmentResult,
+  release_containment: async args => {
+    const { handleReleaseContainmentResult } = await import('./networkIsolation/finalizer');
+    return handleReleaseContainmentResult(args);
+  },
 };

@@ -1,4 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+// #5221 B2 — no automation here has a conversion: today's admission path.
+vi.mock('../services/flows/conversion/claims', async () =>
+  (await import('../__tests__/helpers/noConversionClaims')).noConversionClaims());
 
 const {
   addMock,
@@ -75,6 +78,16 @@ vi.mock('./workerObservability', () => ({
   attachWorkerObservability: vi.fn(),
 }));
 
+const { getUserPermissionsMock, canAccessSiteMock } = vi.hoisted(() => ({
+  getUserPermissionsMock: vi.fn(),
+  canAccessSiteMock: vi.fn(),
+}));
+
+vi.mock('../services/permissions', () => ({
+  getUserPermissions: getUserPermissionsMock,
+  canAccessSite: canAccessSiteMock,
+}));
+
 import { automationQueueJobDataSchema } from './queueSchemas';
 import { __testOnly, shutdownAutomationWorker } from './automationWorker';
 
@@ -106,8 +119,9 @@ function mockAutomation(row: Record<string, unknown>) {
   });
 }
 
-function mockUnmanagedAutomation(row: Record<string, unknown>) {
-  for (const rows of [[row], [{ orgId: row.orgId, partnerId: row.partnerId }]]) {
+function mockUnmanagedAutomation(row: Record<string, unknown>, deviceSiteId?: string) {
+  const deviceRow = { orgId: row.orgId, partnerId: row.partnerId, siteId: deviceSiteId ?? null };
+  for (const rows of [[row], [deviceRow]]) {
     selectMock.mockReturnValueOnce({
       from: vi.fn().mockReturnThis(),
       innerJoin: vi.fn().mockReturnThis(),
@@ -175,7 +189,7 @@ describe('managed automation event-target binding (#3824)', () => {
       eventPayload: { alertId: 'alert-1', severity: 'high' },
     });
 
-    expect(result).toEqual({ skipped: 'managed_automation_event_has_no_device' });
+    expect(result).toEqual({ skipped: 'alert_has_no_device' });
     expect(createAutomationRunRecordMock).not.toHaveBeenCalled();
   });
 
@@ -224,12 +238,62 @@ describe('managed automation event-target binding (#3824)', () => {
         eventType: 'alert.triggered',
         eventTimestamp: '2026-08-24T12:00:00.000Z',
       },
+      // #3189 — one run per (automation, event): a replayed trigger job gets
+      // the existing run back instead of minting a second one.
+      occurrenceKey: 'event:evt-1',
     });
     expect(createOptions.boundDeviceIds).toEqual(['dev-1']);
     expect(selectMock).toHaveBeenCalledTimes(2);
     const jobData = addMock.mock.calls[0]?.[1];
     expect(jobData.targetDeviceIds).toEqual(['dev-1']);
     expect('triggerContext' in jobData).toBe(false);
+  });
+
+  it('skips an event-triggered run when the device sits outside the creator\'s current site ceiling', async () => {
+    const automation = { ...BASE_AUTOMATION, managedByAgentId: null, createdBy: 'user-1' };
+    mockUnmanagedAutomation(automation, 'site-hidden');
+    getUserPermissionsMock.mockResolvedValue({ allowedSiteIds: ['site-visible'] });
+    canAccessSiteMock.mockReturnValue(false);
+
+    const result = await __testOnly.processTriggerEvent({
+      ...BASE_EVENT,
+      eventPayload: { alertId: 'alert-1', deviceId: 'dev-1', severity: 'high' },
+    });
+
+    expect(result).toEqual({ skipped: 'event_device_outside_automation_site_ceiling' });
+    expect(createAutomationRunRecordMock).not.toHaveBeenCalled();
+  });
+
+  it('binds an event-triggered run when the device is inside the creator\'s current site ceiling', async () => {
+    const automation = { ...BASE_AUTOMATION, managedByAgentId: null, createdBy: 'user-1' };
+    mockUnmanagedAutomation(automation, 'site-visible');
+    getUserPermissionsMock.mockResolvedValue({ allowedSiteIds: ['site-visible'] });
+    canAccessSiteMock.mockReturnValue(true);
+    createAutomationRunRecordMock.mockResolvedValue({ run: { id: 'run-1' }, targetDeviceIds: ['dev-1'] });
+
+    await __testOnly.processTriggerEvent({
+      ...BASE_EVENT,
+      eventPayload: { alertId: 'alert-1', deviceId: 'dev-1', severity: 'high' },
+    });
+
+    const createOptions = createAutomationRunRecordMock.mock.calls[0]?.[0];
+    expect(createOptions.boundDeviceIds).toEqual(['dev-1']);
+  });
+
+  it('does not re-check site scope for an unrestricted creator (allowedSiteIds unset)', async () => {
+    const automation = { ...BASE_AUTOMATION, managedByAgentId: null, createdBy: 'user-1' };
+    mockUnmanagedAutomation(automation, 'site-any');
+    getUserPermissionsMock.mockResolvedValue({ allowedSiteIds: undefined });
+    createAutomationRunRecordMock.mockResolvedValue({ run: { id: 'run-1' }, targetDeviceIds: ['dev-1'] });
+
+    await __testOnly.processTriggerEvent({
+      ...BASE_EVENT,
+      eventPayload: { alertId: 'alert-1', deviceId: 'dev-1', severity: 'high' },
+    });
+
+    expect(canAccessSiteMock).not.toHaveBeenCalled();
+    const createOptions = createAutomationRunRecordMock.mock.calls[0]?.[0];
+    expect(createOptions.boundDeviceIds).toEqual(['dev-1']);
   });
 
   it('a row whose managedByAgentId is absent is treated as UNMANAGED: bound to the event device, no triggerContext', async () => {

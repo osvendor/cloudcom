@@ -32,9 +32,32 @@ describe('BillingDefaultsTab', () => {
     expect(screen.queryByTestId('partner-billing-ai-style')).not.toBeInTheDocument();
   });
 
+  // #7510: partner currency is not inherited by existing organizations (each org
+  // stores its own NOT NULL currency, stamped at creation). The label must say
+  // what it does — the default for NEW organizations — not "across customers".
+  it('labels the currency as the default for new organizations', () => {
+    renderTab();
+    expect(screen.getByLabelText(/default currency for new organizations/i)).toBe(screen.getByTestId('partner-billing-currency'));
+    expect(screen.getByTestId('partner-billing-currency-help')).toHaveTextContent(/existing organizations keep their own/i);
+  });
+
   it('calls the setter when the prefix input changes', () => {
     const props = renderTab();
     fireEvent.change(screen.getByTestId('partner-billing-prefix'), { target: { value: 'ACME' } });
     expect(props.setPrefix).toHaveBeenCalledWith('ACME');
+  });
+
+  it('shows inline errors for out-of-range tax, fractional terms, and a blank prefix', () => {
+    renderTab({ taxPercent: '150', termsDays: '2.5', prefix: '' });
+    expect(screen.getByTestId('partner-billing-tax-error')).toBeInTheDocument();
+    expect(screen.getByTestId('partner-billing-terms-days-error')).toBeInTheDocument();
+    expect(screen.getByTestId('partner-billing-prefix-error')).toBeInTheDocument();
+  });
+
+  it('shows no errors for valid values, including blank tax', () => {
+    renderTab({ taxPercent: '', termsDays: '30', prefix: 'INV' });
+    expect(screen.queryByTestId('partner-billing-tax-error')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('partner-billing-terms-days-error')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('partner-billing-prefix-error')).not.toBeInTheDocument();
   });
 });

@@ -13,7 +13,7 @@
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-// SEC-2026-09-05-146: these suites cover route/tool behaviour, not the authority
+// These suites cover route/tool behaviour, not the authority
 // envelope. Arming is asserted directly in networkBaselineAuthority.arming.test.ts.
 vi.mock('./networkBaselineAuthority', () => ({
   BaselineAuthorityUnsupportedError: class extends Error {},
@@ -188,5 +188,18 @@ describe('configure_network_baseline (create path)', () => {
 
     expect(JSON.parse(output)).toEqual({ error: 'Site not found for this organization' });
     expect(db.insert).not.toHaveBeenCalled();
+  });
+});
+
+describe('get_network_changes — limit description matches the handler clamp (#6755)', () => {
+  it('description states the actual clamp (default 50, max 200), not a stale "default 100, max 500"', () => {
+    const reg = new Map();
+    registerNetworkTools(reg);
+    const tool = reg.get('get_network_changes')!;
+    const description = (tool.definition.input_schema as { properties: Record<string, { description?: string }> })
+      .properties.limit?.description;
+
+    // Math.min(Math.max(1, Number(input.limit) || 50), 200) in the handler.
+    expect(description).toMatch(/default 50, max 200/);
   });
 });

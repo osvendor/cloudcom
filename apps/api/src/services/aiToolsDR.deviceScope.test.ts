@@ -67,9 +67,17 @@ function mockReads(opts: { orgDevices: Array<{ id: string; siteId: string | null
     if ('devices' in cols && Object.keys(cols).length === 1) {
       return { from: () => ({ where: () => Promise.resolve(opts.storedGroups) }) };
     }
+    // W03-D10: the active-execution check (`select({ id })` on dr_executions) — none running.
+    if ('id' in cols && Object.keys(cols).length === 1) {
+      return { from: () => ({ where: () => ({ limit: () => Promise.resolve([]) }) }) };
+    }
     return { from: () => ({ where: () => ({ orderBy: () => Promise.resolve(opts.storedGroups) }) }) };
   });
   mockDb.insert.mockReturnValue({ values: () => ({ returning: () => Promise.resolve([{ id: 'group-1' }]) }) });
+  // W03-D10: group writes bump dr_plans.updated_at first.
+  (db as unknown as { update: ReturnType<typeof vi.fn> }).update.mockReturnValue({
+    set: () => ({ where: () => ({ returning: () => Promise.resolve([{ id: PLAN.id }]) }) }),
+  });
 }
 
 describe('execute_dr_plan — stored-device scope', () => {
@@ -133,8 +141,11 @@ describe('manage_dr_plan add_group — stored-device scope', () => {
   });
 
   it('attaches when the plan only reaches the run\'s own device', async () => {
+    // The {id, siteId} device read serves both the org partition scan and
+    // add_group's proposed-device check, which expects exactly the
+    // submitted ids back — so the org holds only the run's own device here.
     mockReads({
-      orgDevices: [{ id: 'dev-1', siteId: 'site-1' }, { id: 'dev-2', siteId: 'site-1' }],
+      orgDevices: [{ id: 'dev-1', siteId: 'site-1' }],
       storedGroups: [{ devices: ['dev-1'] }],
     });
     const out = JSON.parse(await handlerFor('manage_dr_plan')(

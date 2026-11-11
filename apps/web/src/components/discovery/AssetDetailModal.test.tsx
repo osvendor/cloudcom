@@ -97,6 +97,17 @@ describe('AssetDetailModal — read-only link state (#3261)', () => {
       fetchMock.mock.calls.some(([url]) => typeof url === 'string' && url.endsWith('/link'))
     ).toBe(false);
   });
+
+  it('keeps the discovery preview BMC association distinct from a same-device link', () => {
+    render(<AssetDetailModal open asset={{ ...asset, linkedDeviceId: 'dev-1',
+      linkedDeviceName: 'agent-host', linkSource: 'agent_report' }} onClose={() => {}} />);
+    const link = screen.getByTestId('asset-modal-same-device-link');
+    expect(link).toHaveAttribute('href', '/devices/dev-1');
+    expect(link).toHaveTextContent('Management controller for agent-host');
+    expect(link).not.toHaveTextContent('Same device as');
+    expect(screen.getByTestId('asset-modal-link-provenance')).toHaveTextContent('reported by host agent');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
 });
 
 describe('AssetDetailModal — SNMP data card', () => {
@@ -219,5 +230,17 @@ describe('AssetDetailModal — reachability line never says a bare "Online"', ()
     const line = screen.getByTestId('asset-modal-reachability');
     expect(line).toHaveTextContent('—');
     expect(line).toHaveAttribute('aria-label', 'unknown');
+  });
+});
+
+// #9645: the API historically returned the jsonb `{ os }` object; rendering it
+// as a React child threw "Objects are not valid as a React child".
+describe('AssetDetailModal — object os fingerprint (#9645)', () => {
+  it('renders the os name when osFingerprint arrives as { os }', () => {
+    const fingerprinted = { ...asset, osFingerprint: { os: 'Cisco IOS' } } as unknown as AssetDetail;
+
+    render(<AssetDetailModal open asset={fingerprinted} onClose={() => {}} />);
+
+    expect(screen.getByText('Cisco IOS')).toBeInTheDocument();
   });
 });

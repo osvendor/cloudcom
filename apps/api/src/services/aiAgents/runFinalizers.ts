@@ -32,6 +32,8 @@ import { isNarrativeProfile } from './narrativeProfile';
 import { patchEvidenceRefs } from './patchEvidence';
 import { persistPatchPlan } from './patchPlan';
 import { isPatchProfile } from './patchProfile';
+import { isResearchProfile } from './researchProfile';
+import { persistResearchSuggestions } from '../fixMemory/researchPersist';
 import { NarrativePersistConflictError, persistNarrativeReport } from './narrativeReport';
 import { resolveRecipientUserIds } from './recipients';
 import { indexEvidenceSubjects, type SweepEvidenceSubject } from './sweepEvidence';
@@ -41,6 +43,10 @@ import { persistTicketTriage } from './ticketTriageFindings';
 import { isTriageProfile } from './triageProfile';
 import { isVerdictProfile } from './verdictProfile';
 import type { LoopResult, RunContext } from './runLoopTypes';
+
+// Wisp W05b — the assessment finalizer lives in its own file (this one is
+// already > 600 lines); re-exported so `executeAgentRun` keeps one import path.
+export { ASSESSMENT_MAX_RAISES_PER_RUN, finalizeAssessment } from './assessmentFinalizer';
 
 /**
  * Same skip-if-already-system shape as `runLoop.inSystemDbContext` (and
@@ -627,4 +633,34 @@ async function isRunStillRunning(runId: string, orgId: string): Promise<boolean>
       .limit(1);
     return row?.status === 'running';
   });
+}
+
+/**
+ * AI Suggested Fixes W2 — seventh finalizer. Persists ACCEPTED research items
+ * as suggestions (rejected items live only in the run outcome/trace and are
+ * never persisted). A research run that never called submit_suggestions is a
+ * runner failure a human must see ('research_missing'); an empty accepted set
+ * is a legitimate "no safe fix" completion, not an error. Inserts are
+ * idempotent on (agent_run_id, research_ordinal), so a retry never duplicates.
+ */
+export async function finalizeResearch(ctx: RunContext, result: LoopResult): Promise<string | null> {
+  if (!isResearchProfile(ctx.run)) return null;
+  // A loop that threw after spending fails the run; the spec writes NO rows on failure.
+  if (result.failure) return null;
+  const research = result.outcome.research;
+  if (!research || !ctx.research) {
+    result.outcome.runVerdict = 'needs_attention';
+    return 'research_missing';
+  }
+  if (!(await isRunStillRunning(ctx.run.id, ctx.run.orgId))) return null;
+  try {
+    await inSystemDbContext(() => persistResearchSuggestions({
+      runId: ctx.run.id, orgId: ctx.run.orgId, research: ctx.research!, outcome: research,
+    }));
+    return null;
+  } catch (error) {
+    console.error('[aiAgentRunLoop] failed to persist research suggestions', { runId: ctx.run.id, error });
+    captureException(error, undefined, { service: 'aiAgents', operation: 'finalizeResearch', runId: ctx.run.id });
+    return 'research_persist_failed';
+  }
 }

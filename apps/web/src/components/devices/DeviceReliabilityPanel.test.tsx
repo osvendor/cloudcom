@@ -1,6 +1,6 @@
 import '@/lib/i18n';
 
-import { fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import DeviceReliabilityPanel from './DeviceReliabilityPanel';
@@ -42,9 +42,42 @@ const makeJsonResponse = (payload: unknown, ok = true, status = ok ? 200 : 500):
     json: vi.fn().mockResolvedValue(payload),
   }) as unknown as Response;
 
+// #8429: answer each request by URL, never by call order. The snapshot is
+// fetched on mount, the baseline marker list (#5876) from a passive effect
+// once the snapshot renders, and /offenders straight from the drill-down
+// click handler — so under CI load the click can fire before the marker-list
+// effect flushes, and a positional mockResolvedValueOnce queue hands each
+// request the other's response. `offenders` responses are consumed in order;
+// an unexpected extra offenders request is rejected, not served a stale
+// canned response.
+const routeFetch = ({
+  snapshot,
+  offenders = [],
+}: {
+  snapshot: unknown;
+  offenders?: Array<Response | Promise<Response>>;
+}) => {
+  const offenderQueue = [...offenders];
+  fetchWithAuthMock.mockImplementation(async (url: string) => {
+    if (url.endsWith('/offenders')) {
+      const next = offenderQueue.shift();
+      if (!next) throw new Error(`unexpected extra request: ${url}`);
+      return next;
+    }
+    if (url.endsWith('/baselines')) return makeJsonResponse({ baselines: [] });
+    if (url === '/reliability/dev-1') return makeJsonResponse(snapshot);
+    throw new Error(`unexpected request: ${url}`);
+  });
+};
+
+const callsTo = (url: string) => fetchWithAuthMock.mock.calls.filter(([calledUrl]) => calledUrl === url);
+
 describe('DeviceReliabilityPanel', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // clearAllMocks keeps queued mock*Once responses and implementations; a
+    // test that times out mid-queue would leak them into every later test.
+    fetchWithAuthMock.mockReset();
     showToast.mockReset();
     useMlFeatureFlagsMock.mockReturnValue({
       flags: {},
@@ -96,7 +129,7 @@ describe('DeviceReliabilityPanel', () => {
     expect(screen.getByText(/4 in 30d/)).toBeTruthy();
     // Points earned/available make the score arithmetic checkable: 20 × 25% = 5.
     expect(screen.getByText('5 / 25 pts')).toBeTruthy();
-    expect(fetchWithAuthMock).toHaveBeenCalledWith('/reliability/dev-1');
+    expect(fetchWithAuthMock).toHaveBeenCalledWith('/reliability/dev-1', expect.objectContaining({ signal: expect.any(AbortSignal) }));
   });
 
   // Outcome-feedback UI removed: the labels only fed an evaluation endpoint no
@@ -117,22 +150,29 @@ describe('DeviceReliabilityPanel', () => {
   it('renders an error state with a working Retry when the load fails', async () => {
     fetchWithAuthMock
       .mockResolvedValueOnce(makeJsonResponse({ error: 'down' }, false, 500))
-      .mockResolvedValueOnce(makeJsonResponse({ error: 'No snapshot' }, false, 404));
+      .mockResolvedValueOnce(makeJsonResponse({ snapshot: null, history: [] }));
 
     render(<DeviceReliabilityPanel deviceId="dev-1" />);
 
     expect(await screen.findByText('Failed to load reliability score')).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: /retry/i }));
 
-    await screen.findByText('No reliability snapshot available yet.');
+    await screen.findByText('No reliability data yet');
   });
 
-  it('renders an empty state when no snapshot exists yet', async () => {
-    fetchWithAuthMock.mockResolvedValue(makeJsonResponse({ error: 'No snapshot' }, false, 404));
+  // sweep D15: no snapshot yet is an expected empty state, so the API now
+  // answers 200 with snapshot: null instead of 404 — a 404 on every load of
+  // a device without enough history logged as a console error for nothing
+  // broken.
+  it('renders an empty state when no snapshot exists yet (200, snapshot: null)', async () => {
+    fetchWithAuthMock.mockResolvedValue(makeJsonResponse({ snapshot: null, history: [] }));
 
     render(<DeviceReliabilityPanel deviceId="dev-1" />);
 
-    await screen.findByText('No reliability snapshot available yet.');
+    // #9029: one muted line, not an empty card body with a heading.
+    const row = await screen.findByTestId('device-reliability-empty');
+    expect(row).toHaveTextContent('No reliability data yet');
+    expect(screen.queryByRole('heading')).toBeNull();
   });
 
   it('Ask AI button starts a device task seeded with the snapshot', async () => {
@@ -228,7 +268,7 @@ describe('DeviceReliabilityPanel', () => {
     render(<DeviceReliabilityPanel deviceId="dev-1" />);
 
     expect(await screen.findByText('Reliability scoring is disabled for this organization.')).toBeTruthy();
-    expect(fetchWithAuthMock).not.toHaveBeenCalledWith('/reliability/dev-1');
+    expect(fetchWithAuthMock).not.toHaveBeenCalledWith('/reliability/dev-1', expect.objectContaining({ signal: expect.any(AbortSignal) }));
     expect(screen.queryByTestId('reliability-outcome-trigger')).toBeNull();
   });
 
@@ -585,18 +625,16 @@ describe('DeviceReliabilityPanel', () => {
   });
 
   it('expands the offenders drill-down from a problem row details link', async () => {
-    fetchWithAuthMock
-      .mockResolvedValueOnce(
-        makeJsonResponse({
-          snapshot: baseSnapshot({
-            reliabilityScore: 63,
-            serviceFailureCount30d: 24,
-            drivers: workstationDrivers(),
-          }),
-          history: [],
+    routeFetch({
+      snapshot: {
+        snapshot: baseSnapshot({
+          reliabilityScore: 63,
+          serviceFailureCount30d: 24,
+          drivers: workstationDrivers(),
         }),
-      )
-      .mockResolvedValueOnce(
+        history: [],
+      },
+      offenders: [
         makeJsonResponse({
           deviceId: 'dev-1',
           days: 30,
@@ -606,14 +644,15 @@ describe('DeviceReliabilityPanel', () => {
             hangs: [],
           },
         }),
-      );
+      ],
+    });
 
     render(<DeviceReliabilityPanel deviceId="dev-1" />);
 
     fireEvent.click(await screen.findByTestId('reliability-factor-details-serviceFailures'));
 
     expect(await screen.findByText('cplspcon')).toBeInTheDocument();
-    expect(fetchWithAuthMock).toHaveBeenCalledWith('/reliability/dev-1/offenders');
+    expect(fetchWithAuthMock).toHaveBeenCalledWith('/reliability/dev-1/offenders', expect.objectContaining({ signal: expect.any(AbortSignal) }));
     // The link disappears once the drill-down is open (it can only open, not toggle).
     expect(screen.queryByTestId('reliability-factor-details-serviceFailures')).toBeNull();
   });
@@ -630,11 +669,9 @@ describe('DeviceReliabilityPanel', () => {
   });
 
   it('lazily loads and renders top offenders when the drill-down is expanded (issue #1907)', async () => {
-    fetchWithAuthMock
-      .mockResolvedValueOnce(
-        makeJsonResponse({ snapshot: baseSnapshot({ serviceFailureCount30d: 3 }), history: [] }),
-      )
-      .mockResolvedValueOnce(
+    routeFetch({
+      snapshot: { snapshot: baseSnapshot({ serviceFailureCount30d: 3 }), history: [] },
+      offenders: [
         makeJsonResponse({
           deviceId: 'dev-1',
           days: 30,
@@ -646,34 +683,36 @@ describe('DeviceReliabilityPanel', () => {
             hangs: [],
           },
         }),
-      );
+      ],
+    });
 
     render(<DeviceReliabilityPanel deviceId="dev-1" />);
 
-    // Offenders are NOT fetched on mount — only the snapshot request fires.
+    // Offenders are NOT fetched on mount — only the snapshot (and the
+    // baseline marker list) requests fire.
     await screen.findByText('Reliability');
-    expect(fetchWithAuthMock).toHaveBeenCalledTimes(1);
+    expect(callsTo('/reliability/dev-1/offenders')).toHaveLength(0);
 
     fireEvent.click(await screen.findByTestId('reliability-offenders-toggle'));
 
     expect(await screen.findByText('Spooler')).toBeInTheDocument();
     expect(screen.getByText('1/3 recovered')).toBeInTheDocument();
-    expect(fetchWithAuthMock).toHaveBeenCalledWith('/reliability/dev-1/offenders');
+    expect(fetchWithAuthMock).toHaveBeenCalledWith('/reliability/dev-1/offenders', expect.objectContaining({ signal: expect.any(AbortSignal) }));
 
     // Caching contract: collapsing and re-expanding must NOT refetch.
     fireEvent.click(screen.getByTestId('reliability-offenders-toggle'));
     fireEvent.click(screen.getByTestId('reliability-offenders-toggle'));
     expect(await screen.findByText('Spooler')).toBeInTheDocument();
-    expect(fetchWithAuthMock).toHaveBeenCalledTimes(2); // snapshot + one offenders fetch
+    expect(callsTo('/reliability/dev-1/offenders')).toHaveLength(1);
+    // Toggling the drill-down must not refetch the score either.
+    expect(callsTo('/reliability/dev-1')).toHaveLength(1);
   });
 
   it('surfaces an offenders load failure with a working Retry (issue #1907)', async () => {
-    fetchWithAuthMock
-      .mockResolvedValueOnce(
-        makeJsonResponse({ snapshot: baseSnapshot({ serviceFailureCount30d: 3 }), history: [] }),
-      )
-      .mockResolvedValueOnce(makeJsonResponse({ error: 'boom' }, false, 500))
-      .mockResolvedValueOnce(
+    routeFetch({
+      snapshot: { snapshot: baseSnapshot({ serviceFailureCount30d: 3 }), history: [] },
+      offenders: [
+        makeJsonResponse({ error: 'boom' }, false, 500),
         makeJsonResponse({
           deviceId: 'dev-1',
           days: 30,
@@ -683,7 +722,8 @@ describe('DeviceReliabilityPanel', () => {
             hangs: [],
           },
         }),
-      );
+      ],
+    });
 
     render(<DeviceReliabilityPanel deviceId="dev-1" />);
 
@@ -698,11 +738,10 @@ describe('DeviceReliabilityPanel', () => {
   });
 
   it('treats a 200 with a malformed offenders body as a failure, not a blank panel (issue #1907)', async () => {
-    fetchWithAuthMock
-      .mockResolvedValueOnce(
-        makeJsonResponse({ snapshot: baseSnapshot({ serviceFailureCount30d: 3 }), history: [] }),
-      )
-      .mockResolvedValueOnce(makeJsonResponse({ deviceId: 'dev-1', days: 30 })); // no `offenders` field
+    routeFetch({
+      snapshot: { snapshot: baseSnapshot({ serviceFailureCount30d: 3 }), history: [] },
+      offenders: [makeJsonResponse({ deviceId: 'dev-1', days: 30 })], // no `offenders` field
+    });
 
     render(<DeviceReliabilityPanel deviceId="dev-1" />);
 
@@ -713,19 +752,105 @@ describe('DeviceReliabilityPanel', () => {
   });
 
   it('shows the empty state when the drill-down returns no offenders (issue #1907)', async () => {
-    fetchWithAuthMock
-      .mockResolvedValueOnce(
-        makeJsonResponse({ snapshot: baseSnapshot({ serviceFailureCount30d: 3 }), history: [] }),
-      )
-      .mockResolvedValueOnce(
+    routeFetch({
+      snapshot: { snapshot: baseSnapshot({ serviceFailureCount30d: 3 }), history: [] },
+      offenders: [
         makeJsonResponse({ deviceId: 'dev-1', days: 30, offenders: { services: [], hardware: [], hangs: [] } }),
-      );
+      ],
+    });
 
     render(<DeviceReliabilityPanel deviceId="dev-1" />);
 
     fireEvent.click(await screen.findByTestId('reliability-offenders-toggle'));
 
     expect(await screen.findByText(/No offending services or components recorded/)).toBeInTheDocument();
+  });
+
+  // Issue #4513: the snapshot/offender fetches kept running after the page
+  // island unmounted (org switch / soft navigation) and a late response for a
+  // previous device could overwrite the current one.
+  describe('request lifecycle (#4513)', () => {
+    const deferred = () => {
+      let resolve!: (r: Response) => void;
+      let reject!: (e: unknown) => void;
+      const promise = new Promise<Response>((res, rej) => { resolve = res; reject = rej; });
+      return { promise, resolve, reject };
+    };
+    const signalOf = (callIndex: number) =>
+      (fetchWithAuthMock.mock.calls[callIndex]?.[1] as RequestInit | undefined)?.signal;
+
+    it('aborts the in-flight snapshot request on unmount', async () => {
+      const pending = deferred();
+      fetchWithAuthMock.mockReturnValueOnce(pending.promise);
+
+      const { unmount } = render(<DeviceReliabilityPanel deviceId="dev-1" />);
+      await waitFor(() => expect(fetchWithAuthMock).toHaveBeenCalledTimes(1));
+      expect(signalOf(0)).toBeInstanceOf(AbortSignal);
+      expect(signalOf(0)?.aborted).toBe(false);
+
+      unmount();
+      expect(signalOf(0)?.aborted).toBe(true);
+    });
+
+    it('drops a late snapshot for the previous device', async () => {
+      const first = deferred();
+      const second = deferred();
+      fetchWithAuthMock.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
+
+      const { rerender } = render(<DeviceReliabilityPanel deviceId="dev-1" />);
+      await waitFor(() => expect(fetchWithAuthMock).toHaveBeenCalledTimes(1));
+      rerender(<DeviceReliabilityPanel deviceId="dev-2" />);
+      await waitFor(() => expect(fetchWithAuthMock).toHaveBeenCalledTimes(2));
+      expect(signalOf(0)?.aborted).toBe(true);
+      expect(fetchWithAuthMock.mock.calls[1][0]).toBe('/reliability/dev-2');
+
+      await act(async () => {
+        second.resolve(makeJsonResponse({ snapshot: null, history: [] }));
+      });
+      await screen.findByText('No reliability data yet');
+
+      await act(async () => {
+        first.resolve(makeJsonResponse({ snapshot: baseSnapshot({ reliabilityScore: 44 }), history: [] }));
+      });
+      expect(screen.queryByText('44')).toBeNull();
+      expect(screen.getByText('No reliability data yet')).toBeTruthy();
+    });
+
+    it('does not surface an aborted snapshot request as a load error', async () => {
+      const first = deferred();
+      const second = deferred();
+      fetchWithAuthMock.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
+
+      const { rerender, container } = render(<DeviceReliabilityPanel deviceId="dev-1" />);
+      await waitFor(() => expect(fetchWithAuthMock).toHaveBeenCalledTimes(1));
+      rerender(<DeviceReliabilityPanel deviceId="dev-2" />);
+      await waitFor(() => expect(fetchWithAuthMock).toHaveBeenCalledTimes(2));
+
+      await act(async () => {
+        first.reject(new DOMException('Aborted', 'AbortError'));
+      });
+      expect(screen.queryByText('Failed to load reliability score')).toBeNull();
+      expect(container.querySelector('.animate-spin')).not.toBeNull();
+    });
+
+    it('aborts an in-flight offenders request on unmount', async () => {
+      const offenders = deferred();
+      routeFetch({
+        snapshot: { snapshot: baseSnapshot({ serviceFailureCount30d: 3 }), history: [] },
+        offenders: [offenders.promise],
+      });
+      const offendersSignal = () =>
+        (callsTo('/reliability/dev-1/offenders')[0]?.[1] as RequestInit | undefined)?.signal;
+
+      const { unmount } = render(<DeviceReliabilityPanel deviceId="dev-1" />);
+      fireEvent.click(await screen.findByTestId('reliability-offenders-toggle'));
+      await waitFor(() => expect(callsTo('/reliability/dev-1/offenders')).toHaveLength(1));
+      expect(offendersSignal()).toBeInstanceOf(AbortSignal);
+      expect(offendersSignal()?.aborted).toBe(false);
+
+      unmount();
+      expect(offendersSignal()?.aborted).toBe(true);
+    });
   });
 });
 
@@ -743,6 +868,7 @@ describe('DeviceReliabilityPanel Ask AI gating (#6396)', () => {
   };
   beforeEach(() => {
     vi.clearAllMocks();
+    fetchWithAuthMock.mockReset(); // drop any leaked mock*Once queue (#8429)
     useMlFeatureFlagsMock.mockReturnValue({ flags: {}, loaded: true, error: null, isDisabled: () => false, reload: vi.fn() });
     fetchWithAuthMock.mockResolvedValue(makeJsonResponse(healthySnapshot));
   });
@@ -759,5 +885,427 @@ describe('DeviceReliabilityPanel Ask AI gating (#6396)', () => {
     render(<DeviceReliabilityPanel deviceId="dev-1" />);
     await screen.findAllByText(/98/);
     expect(screen.queryByTestId('reliability-ask-ai')).toBeNull();
+  });
+});
+
+describe('DeviceReliabilityPanel baselines (#5876)', () => {
+  const baseSnapshot = {
+    deviceId: 'dev-1', reliabilityScore: 92, trendDirection: 'stable', trendConfidence: 0, uptime30d: 100,
+    crashCount30d: 0, hangCount30d: 0, serviceFailureCount30d: 0, hardwareErrorCount30d: 0, mtbfHours: null,
+    topIssues: [], drivers: [], computedAt: '2026-10-09T00:00:00.000Z', provisional: true,
+    baseline: { id: 'b1', baselineAt: '2026-10-05T00:00:00.000Z', reason: 'remediated', source: 'manual', reportedDaysSinceBaseline: 4, provisional: true },
+  };
+  const marker = {
+    id: 'b1', baselineAt: '2026-10-05T00:00:00.000Z', reason: 'remediated', source: 'manual', note: 'Replaced RAM',
+    createdBy: { id: 'u1', name: 'Alex Tech' }, createdAt: '2026-10-05T00:00:00.000Z', clearedAt: null, clearedBy: null, active: true,
+    beforeSnapshot: { version: 1, scorerVersion: 'x', asOf: '2026-10-05T00:00:00.000Z', coverageDays: 40, reliabilityScore: 41,
+      weightProfile: 'workstation', factors: { uptime: { score: 100 }, crashes: { score: 10 }, hangs: { score: 100 }, serviceFailures: { score: 100 }, hardwareErrors: { score: 100 } },
+      counts30d: { crashes: 7, hangs: 0, serviceFailures: 0, hardwareErrors: 0 } },
+  };
+  const route = (url: string) => url.endsWith('/baselines')
+    ? makeJsonResponse({ baselines: [marker] })
+    : makeJsonResponse({ snapshot: baseSnapshot, history: [] });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    fetchWithAuthMock.mockReset(); // drop any leaked mock*Once queue (#8429)
+    useMlFeatureFlagsMock.mockReturnValue({ flags: {}, loaded: true, error: null, isDisabled: () => false, reload: vi.fn() });
+  });
+
+  it('shows the provisional banner with reason, author, days and the note', async () => {
+    fetchWithAuthMock.mockImplementation(async (url: string) => route(url));
+    render(<DeviceReliabilityPanel deviceId="dev-1" />);
+    const banner = await screen.findByTestId('reliability-baseline-banner');
+    expect(banner).toHaveTextContent('Alex Tech');
+    expect(banner).toHaveTextContent('4 of 14 days reported');
+    expect(banner).toHaveTextContent('Replaced RAM');
+    expect(screen.getByTestId('reliability-provisional-pill')).toBeInTheDocument();
+  });
+
+  it('shows before → since for the score and the 30-day crash count', async () => {
+    fetchWithAuthMock.mockImplementation(async (url: string) => route(url));
+    render(<DeviceReliabilityPanel deviceId="dev-1" />);
+    const row = await screen.findByTestId('reliability-before-after');
+    expect(row).toHaveTextContent('41');
+    expect(row).toHaveTextContent('92');
+    expect(row).toHaveTextContent('7');
+  });
+
+  it('renders trend and MTBF as a dash while provisional', async () => {
+    fetchWithAuthMock.mockImplementation(async (url: string) => route(url));
+    render(<DeviceReliabilityPanel deviceId="dev-1" />);
+    expect(await screen.findByTestId('reliability-trend-value')).toHaveTextContent('—');
+  });
+
+  it('shows no banner when there is no active marker', async () => {
+    fetchWithAuthMock.mockImplementation(async (url: string) => url.endsWith('/baselines')
+      ? makeJsonResponse({ baselines: [] })
+      : makeJsonResponse({ snapshot: { ...baseSnapshot, provisional: false, baseline: null }, history: [] }));
+    render(<DeviceReliabilityPanel deviceId="dev-1" />);
+    // drivers: [] means no factor rows, so wait on the score area and for the
+    // marker list request to settle — otherwise the absence check is vacuous.
+    await screen.findByTestId('reliability-trend-value');
+    await waitFor(() => expect(fetchWithAuthMock).toHaveBeenCalledWith('/reliability/dev-1/baselines', expect.anything()));
+    await act(async () => {});
+    expect(screen.queryByTestId('reliability-baseline-banner')).toBeNull();
+    expect(screen.queryByTestId('reliability-baseline-history')).toBeNull();
+    expect(screen.queryByTestId('reliability-provisional-pill')).toBeNull();
+    expect(screen.getByTestId('reliability-trend-value')).toHaveTextContent('Stable');
+  });
+
+  it('renders MTBF as a dash while provisional even when the payload carries one', async () => {
+    fetchWithAuthMock.mockImplementation(async (url: string) => url.endsWith('/baselines')
+      ? makeJsonResponse({ baselines: [marker] })
+      : makeJsonResponse({ snapshot: { ...baseSnapshot, trendDirection: 'degrading', mtbfHours: 48 }, history: [] }));
+    render(<DeviceReliabilityPanel deviceId="dev-1" />);
+    expect(await screen.findByTestId('reliability-mtbf-value')).toHaveTextContent('—');
+    expect(screen.getByTestId('reliability-trend-value')).toHaveTextContent('—');
+  });
+
+  it('keeps the panel working when the marker list fails to load', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    fetchWithAuthMock.mockImplementation(async (url: string) => url.endsWith('/baselines')
+      ? makeJsonResponse({ error: 'boom' }, false, 500)
+      : makeJsonResponse({ snapshot: { ...baseSnapshot, provisional: false, baseline: null }, history: [] }));
+    render(<DeviceReliabilityPanel deviceId="dev-1" />);
+    await screen.findByTestId('reliability-trend-value');
+    await waitFor(() => expect(consoleError).toHaveBeenCalled());
+    expect(screen.getByText('92')).toBeInTheDocument();
+    expect(screen.queryByTestId('reliability-baseline-banner')).toBeNull();
+    expect(screen.queryByTestId('reliability-baseline-history')).toBeNull();
+    consoleError.mockRestore();
+  });
+
+  it('falls back to the snapshot banner when the marker list fails to load', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    fetchWithAuthMock.mockImplementation(async (url: string) => url.endsWith('/baselines')
+      ? makeJsonResponse({ error: 'boom' }, false, 500)
+      : makeJsonResponse({ snapshot: baseSnapshot, history: [] }));
+    render(<DeviceReliabilityPanel deviceId="dev-1" />);
+    const banner = await screen.findByTestId('reliability-baseline-banner');
+    await waitFor(() => expect(consoleError).toHaveBeenCalled());
+    expect(banner).toHaveTextContent('Remediated');
+    expect(banner).toHaveTextContent('4 of 14 days reported');
+    // No author row without the list: a manual marker reads "a technician".
+    expect(banner).toHaveTextContent('a technician');
+    expect(banner).not.toHaveTextContent('Replaced RAM');
+    expect(screen.queryByTestId('reliability-before-after')).toBeNull();
+    expect(screen.queryByTestId('reliability-baseline-history')).toBeNull();
+    consoleError.mockRestore();
+  });
+
+  it('says the marker history failed to load and retries it on request', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    let listFails = true;
+    fetchWithAuthMock.mockImplementation(async (url: string) => url.endsWith('/baselines')
+      ? (listFails
+        ? makeJsonResponse({ error: 'boom' }, false, 500)
+        : makeJsonResponse({ baselines: [{
+          id: 'b1', baselineAt: baseSnapshot.baseline.baselineAt, reason: 'remediated', source: 'manual',
+          note: 'Replaced RAM', beforeSnapshot: null, createdBy: { id: 'u1', name: 'Pat' },
+          createdAt: baseSnapshot.baseline.baselineAt, clearedAt: null, clearedBy: null, active: true,
+        }] }))
+      : makeJsonResponse({ snapshot: baseSnapshot, history: [] }));
+    render(<DeviceReliabilityPanel deviceId="dev-1" />);
+    const notice = await screen.findByTestId('reliability-baseline-list-error');
+    expect(notice).toHaveTextContent("Couldn't load marker history");
+    expect(screen.queryByTestId('reliability-baseline-history-toggle')).toBeNull();
+    listFails = false;
+    fireEvent.click(screen.getByTestId('reliability-baseline-list-retry'));
+    expect(await screen.findByTestId('reliability-baseline-history-toggle')).toBeInTheDocument();
+    expect(screen.queryByTestId('reliability-baseline-list-error')).toBeNull();
+    consoleError.mockRestore();
+  });
+
+  it('names an automatic snapshot-only marker as Breeze when the list fails', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    fetchWithAuthMock.mockImplementation(async (url: string) => url.endsWith('/baselines')
+      ? makeJsonResponse({ error: 'boom' }, false, 500)
+      : makeJsonResponse({ snapshot: { ...baseSnapshot, baseline: { ...baseSnapshot.baseline, reason: 'reimaged', source: 'bare_metal_recovery' } }, history: [] }));
+    render(<DeviceReliabilityPanel deviceId="dev-1" />);
+    const banner = await screen.findByTestId('reliability-baseline-banner');
+    expect(banner).toHaveTextContent('Reimaged');
+    expect(banner).toHaveTextContent('Breeze (automatic)');
+    consoleError.mockRestore();
+  });
+
+  it('suppresses the at-risk pill while the score is provisional', async () => {
+    fetchWithAuthMock.mockImplementation(async (url: string) => url.endsWith('/baselines')
+      ? makeJsonResponse({ baselines: [marker] })
+      : makeJsonResponse({ snapshot: { ...baseSnapshot, reliabilityScore: 55 }, history: [] }));
+    render(<DeviceReliabilityPanel deviceId="dev-1" />);
+    await screen.findByTestId('reliability-provisional-pill');
+    expect(screen.queryByTestId('reliability-atrisk-help')).toBeNull();
+  });
+
+  it('shows the at-risk pill for the same score once mature (control)', async () => {
+    fetchWithAuthMock.mockImplementation(async (url: string) => url.endsWith('/baselines')
+      ? makeJsonResponse({ baselines: [marker] })
+      : makeJsonResponse({
+          snapshot: { ...baseSnapshot, reliabilityScore: 55, provisional: false, baseline: { ...baseSnapshot.baseline, provisional: false } },
+          history: [],
+        }));
+    render(<DeviceReliabilityPanel deviceId="dev-1" />);
+    expect(await screen.findByTestId('reliability-atrisk-help')).toBeInTheDocument();
+  });
+
+  it('pluralises a one-day mature banner and a one-day before window', async () => {
+    const baselineAt = new Date(Date.now() - 36 * 60 * 60 * 1000).toISOString();
+    fetchWithAuthMock.mockImplementation(async (url: string) => url.endsWith('/baselines')
+      ? makeJsonResponse({ baselines: [{ ...marker, baselineAt, beforeSnapshot: { ...marker.beforeSnapshot, coverageDays: 1 } }] })
+      : makeJsonResponse({
+          snapshot: { ...baseSnapshot, provisional: false, baseline: { ...baseSnapshot.baseline, baselineAt, provisional: false } },
+          history: [],
+        }));
+    render(<DeviceReliabilityPanel deviceId="dev-1" />);
+    const banner = await screen.findByTestId('reliability-baseline-banner');
+    expect(banner).toHaveTextContent('(1 day)');
+    expect(banner).not.toHaveTextContent('1 days');
+    const beforeAfter = await screen.findByTestId('reliability-before-after');
+    expect(beforeAfter).toHaveTextContent('Before based on 1 day of history');
+  });
+
+  it('pluralises a multi-day mature banner', async () => {
+    const baselineAt = new Date(Date.now() - (20 * 24 + 2) * 60 * 60 * 1000).toISOString();
+    fetchWithAuthMock.mockImplementation(async (url: string) => url.endsWith('/baselines')
+      ? makeJsonResponse({ baselines: [{ ...marker, baselineAt }] })
+      : makeJsonResponse({
+          snapshot: { ...baseSnapshot, provisional: false, baseline: { ...baseSnapshot.baseline, baselineAt, provisional: false } },
+          history: [],
+        }));
+    render(<DeviceReliabilityPanel deviceId="dev-1" />);
+    expect(await screen.findByTestId('reliability-baseline-banner')).toHaveTextContent('(20 days)');
+  });
+
+  describe('write actions', () => {
+    afterEach(() => { permState.permissions = [{ resource: '*', action: '*' }]; });
+
+    it('hides Mark work done without devices:write', async () => {
+      permState.permissions = [{ resource: 'devices', action: 'read' }];
+      fetchWithAuthMock.mockImplementation(async (url: string) => route(url));
+      render(<DeviceReliabilityPanel deviceId="dev-1" />);
+      await screen.findByTestId('reliability-baseline-banner');
+      expect(screen.queryByTestId('reliability-mark-work-done')).toBeNull();
+      fireEvent.click(screen.getByTestId('reliability-baseline-history-toggle'));
+      await screen.findByTestId('reliability-baseline-history-item-b1');
+      expect(screen.queryByTestId('reliability-baseline-clear-b1')).toBeNull();
+    });
+
+    it('shows Mark work done with the wildcard permission, even with no markers yet', async () => {
+      fetchWithAuthMock.mockImplementation(async (url: string) => url.endsWith('/baselines')
+        ? makeJsonResponse({ baselines: [] })
+        : makeJsonResponse({ snapshot: { ...baseSnapshot, provisional: false, baseline: null }, history: [] }));
+      render(<DeviceReliabilityPanel deviceId="dev-1" />);
+      fireEvent.click(await screen.findByTestId('reliability-mark-work-done'));
+      expect(await screen.findByTestId('baseline-reason')).toBeInTheDocument();
+    });
+
+    it('clears the active marker through a confirm and DELETE', async () => {
+      fetchWithAuthMock.mockImplementation(async (url: string, init?: RequestInit) => {
+        if (init?.method === 'DELETE') return makeJsonResponse({ reliability: null });
+        return route(url);
+      });
+      render(<DeviceReliabilityPanel deviceId="dev-1" />);
+      fireEvent.click(await screen.findByTestId('reliability-baseline-history-toggle'));
+      fireEvent.click(await screen.findByTestId('reliability-baseline-clear-b1'));
+      fireEvent.click(await screen.findByTestId('reliability-baseline-clear-confirm'));
+      await waitFor(() => expect(fetchWithAuthMock).toHaveBeenCalledWith(
+        '/reliability/dev-1/baselines/b1',
+        expect.objectContaining({ method: 'DELETE' }),
+      ));
+      await waitFor(() => expect(showToast).toHaveBeenCalledWith(expect.objectContaining({ type: 'success' })));
+      await waitFor(() => expect(screen.queryByTestId('reliability-baseline-clear-confirm')).toBeNull());
+    });
+
+    it('offers no Clear on a cleared marker', async () => {
+      const cleared = { ...marker, id: 'b0', active: false, clearedAt: '2026-10-06T00:00:00.000Z', clearedBy: { id: 'u2', name: 'Sam' } };
+      fetchWithAuthMock.mockImplementation(async (url: string) => url.endsWith('/baselines')
+        ? makeJsonResponse({ baselines: [cleared] })
+        : makeJsonResponse({ snapshot: { ...baseSnapshot, provisional: false, baseline: null }, history: [] }));
+      render(<DeviceReliabilityPanel deviceId="dev-1" />);
+      fireEvent.click(await screen.findByTestId('reliability-baseline-history-toggle'));
+      await screen.findByTestId('reliability-baseline-history-item-b0');
+      expect(screen.queryByTestId('reliability-baseline-clear-b0')).toBeNull();
+    });
+
+    it('closes the confirm when the clear fails so the error toast is visible', async () => {
+      fetchWithAuthMock.mockImplementation(async (url: string, init?: RequestInit) => {
+        if (init?.method === 'DELETE') return makeJsonResponse({ error: 'gone', code: 'baseline_already_cleared' }, false, 409);
+        return route(url);
+      });
+      render(<DeviceReliabilityPanel deviceId="dev-1" />);
+      fireEvent.click(await screen.findByTestId('reliability-baseline-history-toggle'));
+      fireEvent.click(await screen.findByTestId('reliability-baseline-clear-b1'));
+      fireEvent.click(await screen.findByTestId('reliability-baseline-clear-confirm'));
+      await waitFor(() => expect(showToast).toHaveBeenCalledWith(expect.objectContaining({ type: 'error' })));
+      await waitFor(() => expect(screen.queryByTestId('reliability-baseline-clear-confirm')).toBeNull());
+    });
+    const snapshotGets = () =>
+      fetchWithAuthMock.mock.calls.filter(([url, init]) => url === '/reliability/dev-1' && !(init as RequestInit | undefined)?.method).length;
+    const clearedMarker = { ...marker, active: false, clearedAt: '2026-10-09T00:00:00.000Z', clearedBy: { id: 'u2', name: 'Sam' } };
+    // Holds the post-write score refetch open so the test can look at the
+    // panel mid-refresh — a resolved mock would batch the loading flip away.
+    const deferredResponse = () => {
+      let resolve!: (r: Response) => void;
+      const promise = new Promise<Response>((res) => { resolve = res; });
+      return { promise, resolve };
+    };
+
+    it('refetches the score after a save without collapsing the marker history', async () => {
+      let saved = false;
+      const refetch = deferredResponse();
+      const newMarker = { ...marker, id: 'b2', baselineAt: '2026-10-08T00:00:00.000Z', reason: 'reimaged', note: null, beforeSnapshot: null };
+      fetchWithAuthMock.mockImplementation(async (url: string, init?: RequestInit) => {
+        if (init?.method === 'POST') {
+          saved = true;
+          return makeJsonResponse({ baseline: newMarker, reliability: { baseline: { id: 'b2' } } }, true, 201);
+        }
+        if (url.endsWith('/baselines')) {
+          return makeJsonResponse({ baselines: saved ? [newMarker, { ...marker, active: false }] : [marker] });
+        }
+        if (saved) return refetch.promise;
+        return makeJsonResponse({ snapshot: baseSnapshot, history: [] });
+      });
+      render(<DeviceReliabilityPanel deviceId="dev-1" />);
+      fireEvent.click(await screen.findByTestId('reliability-baseline-history-toggle'));
+      await screen.findByTestId('reliability-baseline-history-item-b1');
+      fireEvent.click(screen.getByTestId('reliability-mark-work-done'));
+      fireEvent.change(await screen.findByTestId('baseline-reason'), { target: { value: 'reimaged' } });
+      fireEvent.click(screen.getByTestId('baseline-save'));
+
+      await waitFor(() => expect(snapshotGets()).toBe(2));
+      // Mid-refresh the section stays mounted (no spinner swap): its own list
+      // refresh runs and the history stays open.
+      expect(await screen.findByTestId('reliability-baseline-history-item-b2')).toBeInTheDocument();
+      expect(screen.getByTestId('reliability-baseline-history-toggle')).toHaveAttribute('aria-expanded', 'true');
+
+      await act(async () => {
+        refetch.resolve(makeJsonResponse({
+          snapshot: { ...baseSnapshot, reliabilityScore: 97, baseline: { ...baseSnapshot.baseline, id: 'b2', reason: 'reimaged', reportedDaysSinceBaseline: 1 } },
+          history: [],
+        }));
+      });
+      await waitFor(() => expect(screen.getAllByText('97').length).toBeGreaterThan(0));
+      expect(screen.getByTestId('reliability-baseline-history-toggle')).toHaveAttribute('aria-expanded', 'true');
+    });
+
+    it('refetches the score after a clear and keeps the history open on the cleared row', async () => {
+      let cleared = false;
+      const refetch = deferredResponse();
+      fetchWithAuthMock.mockImplementation(async (url: string, init?: RequestInit) => {
+        if (init?.method === 'DELETE') {
+          cleared = true;
+          return makeJsonResponse({ reliability: null });
+        }
+        if (url.endsWith('/baselines')) return makeJsonResponse({ baselines: [cleared ? clearedMarker : marker] });
+        if (cleared) return refetch.promise;
+        return makeJsonResponse({ snapshot: baseSnapshot, history: [] });
+      });
+      render(<DeviceReliabilityPanel deviceId="dev-1" />);
+      fireEvent.click(await screen.findByTestId('reliability-baseline-history-toggle'));
+      fireEvent.click(await screen.findByTestId('reliability-baseline-clear-b1'));
+      fireEvent.click(await screen.findByTestId('reliability-baseline-clear-confirm'));
+
+      await waitFor(() => expect(snapshotGets()).toBe(2));
+      // Mid-refresh: the section is still mounted and the history still open on the cleared row.
+      await waitFor(() => expect(screen.getByTestId('reliability-baseline-history-item-b1')).toHaveTextContent('Cleared'));
+      expect(screen.getByTestId('reliability-baseline-history-toggle')).toHaveAttribute('aria-expanded', 'true');
+
+      await act(async () => {
+        refetch.resolve(makeJsonResponse({
+          snapshot: { ...baseSnapshot, reliabilityScore: 61, provisional: false, baseline: null },
+          history: [],
+        }));
+      });
+      expect(await screen.findByText('61')).toBeInTheDocument();
+      expect(screen.getByTestId('reliability-baseline-history-item-b1')).toHaveTextContent('Cleared');
+    });
+
+    it('drops stale offenders after a clear and refetches the open drill-down', async () => {
+      let cleared = false;
+      const offender = (label: string) => ({ key: label, label, count: 3, lastOccurrence: '2026-10-08T10:00:00.000Z' });
+      fetchWithAuthMock.mockImplementation(async (url: string, init?: RequestInit) => {
+        if (init?.method === 'DELETE') {
+          cleared = true;
+          return makeJsonResponse({ reliability: null });
+        }
+        if (url.endsWith('/offenders')) {
+          return makeJsonResponse({
+            deviceId: 'dev-1', days: 30,
+            offenders: { services: [offender(cleared ? 'WSearch' : 'Spooler')], hardware: [], hangs: [] },
+          });
+        }
+        if (url.endsWith('/baselines')) return makeJsonResponse({ baselines: [cleared ? clearedMarker : marker] });
+        return makeJsonResponse({ snapshot: { ...baseSnapshot, serviceFailureCount30d: 3 }, history: [] });
+      });
+      render(<DeviceReliabilityPanel deviceId="dev-1" />);
+      fireEvent.click(await screen.findByTestId('reliability-offenders-toggle'));
+      expect(await screen.findByText('Spooler')).toBeInTheDocument();
+
+      fireEvent.click(await screen.findByTestId('reliability-baseline-history-toggle'));
+      fireEvent.click(await screen.findByTestId('reliability-baseline-clear-b1'));
+      fireEvent.click(await screen.findByTestId('reliability-baseline-clear-confirm'));
+
+      expect(await screen.findByText('WSearch')).toBeInTheDocument();
+      expect(screen.queryByText('Spooler')).toBeNull();
+      expect(fetchWithAuthMock.mock.calls.filter(([url]) => url === '/reliability/dev-1/offenders')).toHaveLength(2);
+    });
+
+    it('explains an already-cleared marker instead of a generic failure', async () => {
+      fetchWithAuthMock.mockImplementation(async (url: string, init?: RequestInit) => {
+        if (init?.method === 'DELETE') return makeJsonResponse({ error: 'gone', code: 'baseline_already_cleared' }, false, 409);
+        return route(url);
+      });
+      render(<DeviceReliabilityPanel deviceId="dev-1" />);
+      fireEvent.click(await screen.findByTestId('reliability-baseline-history-toggle'));
+      fireEvent.click(await screen.findByTestId('reliability-baseline-clear-b1'));
+      fireEvent.click(await screen.findByTestId('reliability-baseline-clear-confirm'));
+      await waitFor(() => expect(showToast).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'error',
+        message: 'This marker was already cleared.',
+      })));
+    });
+  });
+
+  it('badges the active marker in the history and dates markers with the year', async () => {
+    const cleared = { ...marker, id: 'b0', baselineAt: '2026-09-20T00:00:00.000Z', active: false, clearedAt: '2026-09-25T00:00:00.000Z', clearedBy: { id: 'u2', name: 'Sam' } };
+    fetchWithAuthMock.mockImplementation(async (url: string) => url.endsWith('/baselines')
+      ? makeJsonResponse({ baselines: [marker, cleared] })
+      : makeJsonResponse({ snapshot: baseSnapshot, history: [] }));
+    render(<DeviceReliabilityPanel deviceId="dev-1" />);
+    expect(await screen.findByTestId('reliability-baseline-banner')).toHaveTextContent('2026');
+    fireEvent.click(screen.getByTestId('reliability-baseline-history-toggle'));
+    const active = await screen.findByTestId('reliability-baseline-history-item-b1');
+    expect(active).toHaveTextContent('Active');
+    expect(active).toHaveTextContent('2026');
+    expect(screen.getByTestId('reliability-baseline-history-item-b0')).not.toHaveTextContent('Active');
+  });
+
+  it('lists cleared markers in the collapsible history and names automatic markers', async () => {
+    const recovery = {
+      ...marker, id: 'b0', baselineAt: '2026-09-20T00:00:00.000Z', reason: 'reimaged', source: 'bare_metal_recovery',
+      note: null, createdBy: null, active: false, clearedAt: '2026-09-25T00:00:00.000Z', clearedBy: { id: 'u2', name: 'Sam Admin' },
+    };
+    fetchWithAuthMock.mockImplementation(async (url: string) => url.endsWith('/baselines')
+      ? makeJsonResponse({ baselines: [recovery] })
+      : makeJsonResponse({ snapshot: { ...baseSnapshot, provisional: false, baseline: null }, history: [] }));
+    render(<DeviceReliabilityPanel deviceId="dev-1" />);
+    const history = await screen.findByTestId('reliability-baseline-history');
+    expect(screen.queryByTestId('reliability-baseline-banner')).toBeNull();
+    expect(screen.queryByTestId('reliability-baseline-history-item-b0')).toBeNull();
+    fireEvent.click(screen.getByTestId('reliability-baseline-history-toggle'));
+    const item = await screen.findByTestId('reliability-baseline-history-item-b0');
+    expect(history).toContainElement(item);
+    expect(item).toHaveTextContent('Reimaged');
+    expect(item).toHaveTextContent('Breeze (automatic)');
+    expect(item).toHaveTextContent('Cleared');
+  });
+
+  it('names a technician when the marker author is not visible', async () => {
+    fetchWithAuthMock.mockImplementation(async (url: string) => url.endsWith('/baselines')
+      ? makeJsonResponse({ baselines: [{ ...marker, createdBy: { id: 'u9', name: null } }] })
+      : makeJsonResponse({ snapshot: baseSnapshot, history: [] }));
+    render(<DeviceReliabilityPanel deviceId="dev-1" />);
+    expect(await screen.findByTestId('reliability-baseline-banner')).toHaveTextContent('a technician');
   });
 });

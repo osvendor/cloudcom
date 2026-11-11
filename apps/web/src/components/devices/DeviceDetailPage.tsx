@@ -3,10 +3,16 @@ import { useEventStream } from "../../hooks/useEventStream";
 import { ArrowLeft } from "lucide-react";
 import { showToast } from "../shared/Toast";
 import DeviceDetails from "./DeviceDetails";
+import ActiveSessionsBanner from "../remote/ActiveSessionsBanner";
 import DeviceSettingsModal from "./DeviceSettingsModal";
 import ChangeSiteModal from "./ChangeSiteModal";
 import RemoveDeviceDialog from "./RemoveDeviceDialog";
 import { ConfirmDialog } from "../shared/ConfirmDialog";
+import ForcePermanentDeleteDialog, {
+  permanentDeleteRequest,
+  uninstallNotConfirmedState,
+  type UninstallState,
+} from "./ForcePermanentDeleteDialog";
 import ScriptPickerModal, {
   type Script,
   type ScriptRunAsSelection,
@@ -24,8 +30,6 @@ import {
   exitMaintenanceMode,
   decommissionDevice,
   clearDeviceSessions,
-  restoreDevice,
-  permanentDeleteDevice,
   sendWakeCommand,
   watchWakeOutcome,
   WakeCommandError,
@@ -33,20 +37,54 @@ import {
 } from "../../services/deviceActions";
 import { useAiStore } from "@/stores/aiStore";
 import { navigateTo } from "@/lib/navigation";
+import { useOrgStore } from "@/stores/orgStore";
+import { deviceListCrumbHref } from "./deviceListCrumbHref";
+import { applyOrgSwitch } from "@/lib/orgSwitch";
 import { deviceScriptsHash } from "@/lib/deviceScriptsLink";
 import { runAction, ActionError } from "@/lib/runAction";
 import { formatDateTime } from "@/lib/dateTimeFormat";
 import Breadcrumbs from "../layout/Breadcrumbs";
 import { useTranslation } from "react-i18next";
 import "../../lib/i18n";
+import IslandErrorBoundary from "../shared/IslandErrorBoundary";
 
 type DeviceDetailPageProps = {
   deviceId: string;
 };
 
-export default function DeviceDetailPage({ deviceId }: DeviceDetailPageProps) {
+// #8982: the island used to go fully blank ~1 s after first paint — React 18
+// unmounting the root on an uncaught render error from one of the overview
+// cards, with nothing on screen and nothing reported. The boundary must sit
+// INSIDE the island's React tree (wrapping in the .astro page would make the
+// child a separate island passed as static slot HTML, outside the boundary).
+export default function DeviceDetailPage(props: DeviceDetailPageProps) {
+  return (
+    <IslandErrorBoundary island="device-detail">
+      <DeviceDetailPageInner {...props} />
+    </IslandErrorBoundary>
+  );
+}
+
+// True when history.back() is known to stay inside Breeze: either Astro's
+// ClientRouter pushed an entry in this tab (history.state.index > 0 — the
+// referrer is frozen at the last hard load, so it can't see soft navigations),
+// or this document was hard-loaded from a same-origin page.
+function cameFromSameOrigin(): boolean {
+  const index = (window.history.state as { index?: unknown } | null)?.index;
+  if (typeof index === "number" && index > 0) return true;
+  try {
+    return !!document.referrer && new URL(document.referrer).origin === window.location.origin;
+  } catch {
+    return false;
+  }
+}
+
+function DeviceDetailPageInner({ deviceId }: DeviceDetailPageProps) {
   const { t } = useTranslation("devices");
   const [device, setDevice] = useState<Device | null>(null);
+  // When the newest CPU/RAM sample was taken (null = none in the last 24h), so
+  // the header shows "—" instead of a stale or defaulted 0.0% (#9026).
+  const [metricsSampledAt, setMetricsSampledAt] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
   const [actionInProgress, setActionInProgress] = useState(false);
@@ -63,6 +101,12 @@ export default function DeviceDetailPage({ deviceId }: DeviceDetailPageProps) {
   // count. Nothing is restorable afterwards, so it gets asked about first.
   const [pendingPermanentDelete, setPendingPermanentDelete] =
     useState<Device | null>(null);
+  // #11153: the API refused a permanent delete because the agent never
+  // confirmed its uninstall; confirming this dialog re-sends with force.
+  const [forceDelete, setForceDelete] = useState<{
+    device: Device;
+    state: UninstallState;
+  } | null>(null);
   const [changeSiteOpen, setChangeSiteOpen] = useState(false);
   const [scriptPickerOpen, setScriptPickerOpen] = useState(false);
   const [maintenanceDialogOpen, setMaintenanceDialogOpen] = useState(false);
@@ -136,6 +180,8 @@ export default function DeviceDetailPage({ deviceId }: DeviceDetailPageProps) {
         hostname: data.hostname ?? data.displayName ?? "Unknown",
         os: (data.osType ?? data.os ?? "windows") as OSType,
         osVersion: data.osVersion ?? "",
+        // #9026: the header's "Windows 11 Pro (build 22631)" label.
+        osBuild: typeof data.osBuild === "string" ? data.osBuild : undefined,
         status: (data.status ?? "offline") as DeviceStatus,
         cpuPercent: latestMetrics?.cpuPercent ?? 0,
         ramPercent: latestMetrics?.ramPercent ?? 0,
@@ -145,6 +191,11 @@ export default function DeviceDetailPage({ deviceId }: DeviceDetailPageProps) {
         siteId: data.siteId ?? "",
         siteName: data.siteName ?? "Unknown Site",
         agentVersion: data.agentVersion ?? "",
+        // Watchdog state for the "Restart agent" confirm (#9234). Same
+        // whitelist hazard as the fields below: omit them and the confirm
+        // silently says the watchdog has never reported.
+        watchdogStatus: data.watchdogStatus ?? null,
+        watchdogLastSeen: typeof data.watchdogLastSeen === "string" ? data.watchdogLastSeen : null,
         tags: data.tags ?? [],
         lastUser: data.lastUser ?? undefined,
         uptimeSeconds:
@@ -172,12 +223,21 @@ export default function DeviceDetailPage({ deviceId }: DeviceDetailPageProps) {
             : null,
         desktopAccess: data.desktopAccess ?? undefined,
         remoteAccessPolicy: data.remoteAccessPolicy ?? undefined,
+        // #10922 — the Connect button's tool menu. Dropped here, the menu
+        // silently never appears (this transform is an explicit whitelist).
+        remoteAccessProviders: Array.isArray(data.remoteAccessProviders) ? data.remoteAccessProviders : [],
+        remoteAccessDefaultProviderId:
+          typeof data.remoteAccessDefaultProviderId === "string" ? data.remoteAccessDefaultProviderId : null,
         // Link-group membership (#2138/#2308). Carried through so the detail
         // page can hide the Linked Profiles tab on an unlinked device (#2865)
         // without a second fetch — the detail endpoint already returns both
         // columns (neither is in SENSITIVE_DEVICE_FIELDS).
         linkGroupId: data.linkGroupId ?? null,
         linkGroupRole: data.linkGroupRole ?? null,
+        // Workload host axis (#8193) — the ONLY input to the Workloads tab's
+        // visibility. Same dropped-field hazard as the link-group fields: this
+        // transform is a whitelist, so omitting it silently hides the tab.
+        hostsWorkloads: data.hostsWorkloads === true,
         // What became of the agent-uninstall a Remove queued (#3987 item 7) —
         // the ONLY input to UninstallStateBadge, and the same dropped-field
         // mode as the three fields above: the badge's `undefined` guard means
@@ -211,6 +271,9 @@ export default function DeviceDetailPage({ deviceId }: DeviceDetailPageProps) {
             : null,
       };
 
+      setMetricsSampledAt(
+        typeof latestMetrics?.timestamp === "string" ? latestMetrics.timestamp : null,
+      );
       setDevice(transformedDevice);
     } catch (err) {
       setError(
@@ -277,11 +340,9 @@ export default function DeviceDetailPage({ deviceId }: DeviceDetailPageProps) {
             return next !== undefined ? { ...prev, desktopAccess: next } : prev;
           });
         }
-      } else if (type === "device.decommissioned") {
-        fetchDevice();
       }
     },
-    [deviceId, fetchDevice],
+    [deviceId],
   );
 
   const { subscribe } = useEventStream({ onEvent: handleDeviceEvent });
@@ -291,7 +352,6 @@ export default function DeviceDetailPage({ deviceId }: DeviceDetailPageProps) {
       "device.online",
       "device.offline",
       "device.updated",
-      "device.decommissioned",
     ]);
   }, [subscribe]);
 
@@ -320,14 +380,89 @@ export default function DeviceDetailPage({ deviceId }: DeviceDetailPageProps) {
   // the signed-in user (recordDevice no-ops until then), so re-run once it has.
   const recordRecentDevice = useRecentsStore((s) => s.recordDevice);
   const recentsUserId = useRecentsStore((s) => s.userId);
+  // Working org decides where the "Devices" crumb and Back land (A4).
+  const currentOrgId = useOrgStore((s) => s.currentOrgId);
   const recentName = device ? device.displayName || device.hostname : null;
   useEffect(() => {
     if (!device || !recentName || !recentsUserId) return;
     recordRecentDevice({ id: device.id, name: recentName, orgId: device.orgId });
   }, [device?.id, device?.orgId, recentName, recentsUserId, recordRecentDevice]);
 
+  const devicesHref = device ? deviceListCrumbHref(currentOrgId, device.orgId) : "/devices";
+  // #9027: when the crumb leaves the working org (it opens the device org's
+  // Devices tab), say so — the working org itself does not change.
+  const workingOrgName = useOrgStore(
+    (s) => s.organizations.find((o) => o.id === s.currentOrgId)?.name ?? null,
+  );
+  const crossOrgCrumb = devicesHref !== "/devices" && device != null;
+  const devicesCrumbHint = crossOrgCrumb
+    ? workingOrgName
+      ? t("deviceDetailPage.devicesCrumbOtherOrg", { deviceOrg: device.orgName, workingOrg: workingOrgName })
+      : t("deviceDetailPage.devicesCrumbOtherOrgUnnamed", { deviceOrg: device.orgName })
+    : undefined;
+  // Switch the working org to the device's org and stay on this record. No
+  // hash: a same-path navigation carrying one is a scroll-to-anchor for the
+  // router, so the switch (and its toast) would never settle.
+  const switchingOrgRef = useRef(false);
+  const handleSwitchToDeviceOrg = () => {
+    if (!device?.orgId || switchingOrgRef.current) return;
+    switchingOrgRef.current = true;
+    applyOrgSwitch(
+      device.orgId,
+      t("common:layout.org.toast.switched", { name: device.orgName }),
+      `/devices/${device.id}`,
+    )
+      .catch((err) => {
+        console.error("[DeviceDetailPage] switching to the device org failed", err);
+        showToast({ type: "error", message: t("deviceDetailPage.switchOrgFailed") });
+      })
+      .finally(() => {
+        switchingOrgRef.current = false;
+      });
+  };
+  // Used by the error-state Back buttons only; the Devices crumb no longer
+  // pops history (#10959). Back returns to wherever the tech came from (list filters, scroll, org);
+  // a fresh tab / deep link has no history to pop, so fall to the org-aware
+  // Devices crumb instead. history.length alone can't tell an in-app entry
+  // from about:blank / another site (#9259), so only pop when the page was
+  // reached from a same-origin document.
   const handleBack = () => {
-    void navigateTo("/devices");
+    if (typeof window !== "undefined" && window.history.length > 1 && cameFromSameOrigin()) {
+      window.history.back();
+      return;
+    }
+    void navigateTo(devicesHref);
+  };
+
+  // `force` is only ever true when the operator chose "Delete anyway" in the
+  // force dialog after the API refused with UNINSTALL_NOT_CONFIRMED.
+  const runPermanentDelete = async (device: Device, force: boolean) => {
+    try {
+      await permanentDeleteRequest(device.id, {
+        force,
+        errorFallback: `Failed to delete ${device.hostname}`,
+      });
+      // No warning branch: the API returns `{ success: true }` and nothing
+      // else since #2787.
+      showToast({
+        type: "success",
+        message: `${device.hostname} has been permanently deleted`,
+      });
+      void navigateTo("/devices");
+    } catch (err) {
+      if (err instanceof ActionError && err.status === 401) return; // auth redirect handles it
+      const state = uninstallNotConfirmedState(err);
+      if (state) {
+        setForceDelete({ device, state });
+        return;
+      }
+      if (!(err instanceof ActionError)) {
+        showToast({
+          type: "error",
+          message: `Failed to delete ${device.hostname}`,
+        });
+      }
+    }
   };
 
   const handleAction = async (
@@ -375,6 +510,19 @@ export default function DeviceDetailPage({ deviceId }: DeviceDetailPageProps) {
           // 'queued_live' means the device IS online — only the immediate
           // socket push missed, and the next heartbeat (seconds away) claims
           // it. Only 'queued_offline' means "wait for it to reconnect".
+          // 'cancelled' — the server refused it before delivery (e.g. the
+          // requester's access changed); it will never run, so never "sent".
+          if (result.delivery === "cancelled") {
+            showToast({
+              type: "error",
+              message: t("devicesPage.toasts.commandCancelled", {
+                action: label,
+                hostname: device.hostname,
+                reason: result.cancelReason ?? "unknown",
+              }),
+            });
+            break;
+          }
           showToast({
             type: "success",
             message: result.delivery !== "queued_offline"
@@ -514,6 +662,35 @@ export default function DeviceDetailPage({ deviceId }: DeviceDetailPageProps) {
           break;
         }
 
+        case "restart-agent": {
+          // #9234 step 1: the watchdog restarts the agent. 202 means queued —
+          // the watchdog claims it on its next failover poll — so the copy
+          // says "requested", never "restarted". Refusals (one already
+          // waiting, watchdog not reporting, partner trust) come back as the
+          // API's own message via runAction.
+          try {
+            await runAction({
+              request: () =>
+                fetchWithAuth(`/devices/${device.id}/agent-recovery`, {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ action: "restart_agent" }),
+                }),
+              errorFallback: t("deviceDetailPage.restartAgent.failed", { hostname: device.hostname }),
+              friendly: (code) =>
+                code === "ALREADY_PENDING"
+                  ? t("deviceDetailPage.restartAgent.alreadyPending", { hostname: device.hostname })
+                  : undefined,
+              successMessage: t("deviceDetailPage.restartAgent.queued", { hostname: device.hostname }),
+            });
+          } catch (err) {
+            // 401 → the auth redirect is the feedback; any other ActionError was
+            // already toasted by runAction.
+            if (!(err instanceof ActionError)) throw err;
+          }
+          break;
+        }
+
         case "clear-sessions": {
           const result = await clearDeviceSessions(device.id);
           showToast({
@@ -561,14 +738,26 @@ export default function DeviceDetailPage({ deviceId }: DeviceDetailPageProps) {
           return;
         }
 
-        case "restore":
-          await restoreDevice(device.id);
-          showToast({
-            type: "success",
-            message: `${device.hostname} has been restored`,
-          });
-          await fetchDevice();
+        case "restore": {
+          // runAction surfaces the API's own refusal — e.g. "Device limit
+          // reached" when the partner is at its device limit.
+          try {
+            await runAction({
+              request: () =>
+                fetchWithAuth(`/devices/${device.id}/restore`, {
+                  method: "POST",
+                }),
+              errorFallback: `Failed to restore ${device.hostname}`,
+              successMessage: `${device.hostname} has been restored`,
+            });
+            await fetchDevice();
+          } catch (err) {
+            // 401 → the auth redirect is the feedback; any other ActionError was
+            // already toasted by runAction.
+            if (!(err instanceof ActionError)) throw err;
+          }
           break;
+        }
 
         case "permanent-delete": {
           // Deferred execution with undo — gives the user 5 seconds to cancel
@@ -588,24 +777,7 @@ export default function DeviceDetailPage({ deviceId }: DeviceDetailPageProps) {
           });
           setTimeout(async () => {
             if (pdCancelled) return;
-            try {
-              await permanentDeleteDevice(device.id);
-              // No warning branch: the API returns `{ success: true }` and
-              // nothing else since #2787 (see permanentDeleteDevice).
-              showToast({
-                type: "success",
-                message: `${device.hostname} has been permanently deleted`,
-              });
-              void navigateTo("/devices");
-            } catch (err) {
-              showToast({
-                type: "error",
-                message:
-                  err instanceof Error
-                    ? err.message
-                    : `Failed to delete ${device.hostname}`,
-              });
-            }
+            await runPermanentDelete(device, false);
           }, 5000);
           return;
         }
@@ -719,13 +891,29 @@ export default function DeviceDetailPage({ deviceId }: DeviceDetailPageProps) {
           ...(device.orgId
             ? [{ label: device.orgName, href: `/organizations/${device.orgId}` }]
             : []),
-          { label: t("deviceDetailPage.devices"), href: "/devices" },
-          { label: device.hostname || "Device" },
+          // #10959: a plain click goes to the (org-aware) Devices list, like
+          // the link it shows. It must not pop history: "back" landed on the
+          // Dashboard or on another #hash tab entry of this same device.
+          {
+            label: t("deviceDetailPage.devices"),
+            href: devicesHref,
+            title: devicesCrumbHint,
+            description: devicesCrumbHint,
+            onClick: () => void navigateTo(devicesHref),
+          },
+          // #9026: one name — the leaf matches the h1; hostname on hover.
+          {
+            label: device.displayName || device.hostname || "Device",
+            title: device.hostname || undefined,
+          },
         ]}
       />
+      <ActiveSessionsBanner key={device.id} deviceId={device.id} deviceStatus={device.status} />
       <DeviceDetails
         device={device}
-        onBack={handleBack}
+        metricsSampledAt={metricsSampledAt}
+        workingOrgId={currentOrgId}
+        onSwitchToDeviceOrg={handleSwitchToDeviceOrg}
         onAction={handleAction}
       />
       <DeviceSettingsModal
@@ -746,6 +934,19 @@ export default function DeviceDetailPage({ deviceId }: DeviceDetailPageProps) {
             void handleAction("decommission", target, choice);
           }}
           confirmTestId="detail-remove-confirm"
+        />
+      )}
+      {forceDelete && (
+        <ForcePermanentDeleteDialog
+          hostname={forceDelete.device.hostname}
+          state={forceDelete.state}
+          onClose={() => setForceDelete(null)}
+          onConfirm={() => {
+            const target = forceDelete.device;
+            setForceDelete(null);
+            void runPermanentDelete(target, true);
+          }}
+          confirmTestId="detail-permanent-delete-force-confirm"
         />
       )}
       {/* #5023 — the purge-framed confirm, reusing the SAME

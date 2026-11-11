@@ -63,8 +63,12 @@ type RawAlert = {
   message: string;
   severity: string;
   status: string;
-  deviceId: string;
+  deviceId: string | null;
   deviceName: string;
+  ownerKind?: 'device' | 'topology_site' | 'backup_workload';
+  subjectName?: string;
+  topologySiteId?: string;
+  context?: Record<string, unknown>;
   orgId: string;
   triggeredAt: string;
 };
@@ -151,5 +155,30 @@ describe('AlertDetailPage — Delegate to Operator wiring (#5246, spec §5.1)', 
     await waitFor(() => {
       expect(screen.queryByTestId('delegate-stub')).toBeNull();
     });
+  });
+});
+
+// #7215: write actions are now gated on the caller's permissions. These suites
+// exercise the actions themselves, so grant everything; the role-aware
+// behaviour is covered in the *.permissions.test.tsx suites.
+vi.mock('../../lib/permissions', () => ({
+  usePermissions: () => ({ permissions: [], can: () => true }),
+  hasPermission: () => true,
+}));
+
+
+describe('AlertDetailPage org-subject actions', () => {
+  it('renders a workload subject without delegation or any device link', async () => {
+    const { container } = renderPage({ ...baseAlert, deviceId: null, deviceName: '', ownerKind: 'backup_workload', subjectName: 'Microsoft 365 mail backup · Example organization', context: { source: 'metric_anomaly', metricName: 'cpu' } });
+    expect(await screen.findByTestId('alert-subject-chip')).toHaveAttribute('href', '/backup');
+    expect(screen.queryByTestId('delegate-stub')).toBeNull();
+    expect(container.querySelector('a[href*="/devices/"]')).toBeNull();
+  });
+
+  it('never delegates a site alert to its provenance device', async () => {
+    const { container } = renderPage({ ...baseAlert, ownerKind: 'topology_site', subjectName: 'Branch', topologySiteId: 'site-1' });
+    expect(await screen.findByTestId('alert-subject-chip')).toHaveAttribute('href', '/discovery#topology/site/site-1');
+    expect(screen.queryByTestId('delegate-stub')).toBeNull();
+    expect(container.querySelector('a[href*="/devices/"]')).toBeNull();
   });
 });

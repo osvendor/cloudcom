@@ -2,6 +2,7 @@ package helper
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -18,6 +19,14 @@ type mockEnumerator struct {
 
 func (m *mockEnumerator) ActiveSessions() []SessionInfo {
 	return append([]SessionInfo(nil), m.sessions...)
+}
+
+// isolateFromHostHelper points mgr at a binary path under dir that does not
+// exist, so tests never read a Breeze Helper installed on the developer's
+// machine (CI runners have none, which hid this).
+func isolateFromHostHelper(mgr *Manager, dir string) {
+	mgr.binaryPath = filepath.Join(dir, "no-such-helper", "breeze-helper")
+	mgr.binaryVersionFunc = func(string) (string, error) { return "", errBinaryVersionUnsupported }
 }
 
 func TestApplyDisabledStopsRunningHelperAfterRestart(t *testing.T) {
@@ -40,8 +49,9 @@ func TestApplyDisabledStopsRunningHelperAfterRestart(t *testing.T) {
 	removeAutoStartFunc = func() error { return nil }
 	stopHelperLegacyFunc = func() {}
 
-	mgr := New(context.Background(), nil, nil, "")
+	mgr := New(context.Background(), nil, nil, "", WithMachineInstallOwner(true))
 	mgr.baseDir = tmpDir
+	isolateFromHostHelper(mgr, tmpDir)
 	mgr.sessionEnumerator = &mockEnumerator{
 		sessions: []SessionInfo{{Key: "501", Username: "alice", UID: 501}},
 	}
@@ -89,7 +99,8 @@ func TestApplyRestartsHelperOnConfigChangeWhenIdle(t *testing.T) {
 
 	stopped := 0
 	spawned := 0
-	mgr := New(context.Background(), nil, nil, "")
+	mgr := New(context.Background(), nil, nil, "", WithMachineInstallOwner(true))
+	t.Cleanup(mgr.Shutdown) // stop the watcher this test spawns (#6872: avoid leaking it into later tests)
 	mgr.baseDir = tmpDir
 	mgr.sessionEnumerator = &mockEnumerator{
 		sessions: []SessionInfo{{Key: "501", Username: "alice", UID: 501}},
@@ -149,7 +160,8 @@ func TestApplyDefersRestartWhileChatActive(t *testing.T) {
 
 	stopped := 0
 	spawned := 0
-	mgr := New(context.Background(), nil, nil, "")
+	mgr := New(context.Background(), nil, nil, "", WithMachineInstallOwner(true))
+	t.Cleanup(mgr.Shutdown) // the already-running session still gets a watcher (#6872: avoid leaking it into later tests)
 	mgr.baseDir = tmpDir
 	mgr.sessionEnumerator = &mockEnumerator{
 		sessions: []SessionInfo{{Key: "501", Username: "alice", UID: 501}},
@@ -196,7 +208,8 @@ func TestApplyEnabledSpawnsPerSession(t *testing.T) {
 	removeAutoStartFunc = func() error { return nil }
 	stopHelperLegacyFunc = func() {}
 
-	mgr := New(context.Background(), nil, nil, "")
+	mgr := New(context.Background(), nil, nil, "", WithMachineInstallOwner(true))
+	t.Cleanup(mgr.Shutdown) // stop the watchers this test spawns (#6872: avoid leaking them into later tests)
 	mgr.baseDir = tmpDir
 	mgr.sessionEnumerator = &mockEnumerator{
 		sessions: []SessionInfo{
@@ -248,7 +261,7 @@ func TestApplyDisabledUninstalledIsStableNoOp(t *testing.T) {
 	uninstallPackageFunc = func() error { uninstallCalls++; return nil }
 	stopHelperLegacyFunc = func() { stopLegacyCalls++ }
 
-	mgr := New(context.Background(), nil, nil, "")
+	mgr := New(context.Background(), nil, nil, "", WithMachineInstallOwner(true))
 	mgr.baseDir = tmpDir
 	mgr.binaryPath = filepath.Join(tmpDir, "breeze-helper") // absent → not installed
 	mgr.sessionEnumerator = &mockEnumerator{}
@@ -260,9 +273,15 @@ func TestApplyDisabledUninstalledIsStableNoOp(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(tmpDir, "sessions")); !os.IsNotExist(err) {
 		t.Fatalf("sessions dir should never be created when disabled+uninstalled; err=%v", err)
 	}
-	if removeCalls != 0 || uninstallCalls != 0 || stopLegacyCalls != 0 {
-		t.Fatalf("expected zero cleanup churn, got remove=%d uninstall=%d stopLegacy=%d",
-			removeCalls, uninstallCalls, stopLegacyCalls)
+	// Windows performs one intentional legacy HKLM Run sweep, even with
+	// no install. A second disabled tick must not repeat that cleanup.
+	wantRemoveCalls := 0
+	if sweepLegacyAutoStart {
+		wantRemoveCalls = 1
+	}
+	if removeCalls != wantRemoveCalls || uninstallCalls != 0 || stopLegacyCalls != 0 {
+		t.Fatalf("expected %d one-time removals and no uninstall/stop churn, got remove=%d uninstall=%d stopLegacy=%d",
+			wantRemoveCalls, removeCalls, uninstallCalls, stopLegacyCalls)
 	}
 	if mgr.pendingHelperVersion != "1.2.3" {
 		t.Fatalf("pendingHelperVersion should survive disabled ticks, got %q", mgr.pendingHelperVersion)
@@ -295,10 +314,11 @@ func TestApplyDisabledInstalledCleansUpOnce(t *testing.T) {
 	migrationTargetsFunc = func() ([]string, error) { return nil, nil }
 	prepareSessionDirFunc = func(path, sessionKey string) error { return nil }
 
-	mgr := New(context.Background(), nil, nil, "")
+	mgr := New(context.Background(), nil, nil, "", WithMachineInstallOwner(true))
 	mgr.baseDir = tmpDir
 	mgr.binaryPath = binPath
 	mgr.sessionEnumerator = &mockEnumerator{}
+	markAgentInstalled(t, mgr) // only the agent's own install is removed (#10185)
 
 	mgr.Apply(&Settings{Enabled: false}) // installed → migrate once, then uninstall
 	if uninstallCalls != 1 {
@@ -326,7 +346,7 @@ func TestApplySweepsLegacyAutoStartOncePerProcess(t *testing.T) {
 	stopHelperLegacyFunc = func() {}
 	sweepLegacyAutoStart = true // simulate Windows on any test platform
 
-	mgr := New(context.Background(), nil, nil, "")
+	mgr := New(context.Background(), nil, nil, "", WithMachineInstallOwner(true))
 	mgr.baseDir = tmpDir
 	// Pin to a non-existent path inside tmpDir so wasInstalled is deterministic
 	// (false) regardless of whether the platform-default helper binary path
@@ -361,7 +381,7 @@ func TestApplySkipsLegacyAutoStartSweepOffWindows(t *testing.T) {
 	stopHelperLegacyFunc = func() {}
 	sweepLegacyAutoStart = false
 
-	mgr := New(context.Background(), nil, nil, "")
+	mgr := New(context.Background(), nil, nil, "", WithMachineInstallOwner(true))
 	mgr.baseDir = tmpDir
 	// Pin to a non-existent path inside tmpDir so wasInstalled is deterministic
 	// (false) regardless of whether the platform-default helper binary path
@@ -403,7 +423,8 @@ func TestApplyReapsOnDiskSessionNotSurfacedByEnumerator(t *testing.T) {
 	stopHelperLegacyFunc = func() {}
 
 	var stoppedPIDs []int
-	mgr := New(context.Background(), nil, nil, "")
+	mgr := New(context.Background(), nil, nil, "", WithMachineInstallOwner(true))
+	t.Cleanup(mgr.Shutdown) // stop the watcher this test spawns (#6872: avoid leaking it into later tests)
 	mgr.baseDir = tmpDir
 	// Console-only enumerator: only the interactive console session surfaces,
 	// never the RDP session 999 that owns the stale on-disk state.
@@ -447,45 +468,17 @@ func TestApplyReapsOnDiskSessionNotSurfacedByEnumerator(t *testing.T) {
 	}
 }
 
-// #3202: the tray-icon visibility flag must reach the per-session YAML the
-// Tauri helper reads (`show_tray_icon`), otherwise the policy is a no-op.
-func TestSettingsToConfigCarriesShowTrayIcon(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		want bool
-	}{
-		{"visible", true},
-		{"hidden", false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			cfg := settingsToConfig(&Settings{Enabled: true, ShowTrayIcon: tc.want})
-			if cfg.ShowTrayIcon != tc.want {
-				t.Fatalf("ShowTrayIcon = %v, want %v", cfg.ShowTrayIcon, tc.want)
-			}
-			data, err := yaml.Marshal(cfg)
-			if err != nil {
-				t.Fatal(err)
-			}
-			want := fmt.Sprintf("show_tray_icon: %v", tc.want)
-			if !strings.Contains(string(data), want) {
-				t.Fatalf("marshalled config %q missing %q", string(data), want)
-			}
-		})
+// #8138: the tray icon is no longer a policy setting — the helper always
+// draws it. The agent must stop writing `show_tray_icon`: an explicit false in
+// the YAML would still hide the tray on a pre-#8138 helper binary, and an
+// absent key decodes as true there (#[serde(default = "default_true")]).
+func TestSettingsToConfigOmitsShowTrayIcon(t *testing.T) {
+	data, err := yaml.Marshal(settingsToConfig(&Settings{Enabled: true, ShowOpenPortal: true}))
+	if err != nil {
+		t.Fatal(err)
 	}
-}
-
-// A tray-icon-only change must count as a config change; otherwise
-// configUnchanged short-circuits Apply and the helper is never restarted with
-// the new YAML (the #1382 restart path).
-func TestConfigUnchangedDetectsTrayIconFlip(t *testing.T) {
-	state := newSessionState("501", t.TempDir())
-	state.lastConfig = &Config{ShowTrayIcon: true, ShowOpenPortal: true}
-
-	if !state.configUnchanged(&Config{ShowTrayIcon: true, ShowOpenPortal: true}) {
-		t.Fatal("identical config reported as changed")
-	}
-	if state.configUnchanged(&Config{ShowTrayIcon: false, ShowOpenPortal: true}) {
-		t.Fatal("tray-icon flip reported as unchanged — helper would never restart")
+	if strings.Contains(string(data), "show_tray_icon") {
+		t.Fatalf("marshalled config %q still carries show_tray_icon", string(data))
 	}
 }
 
@@ -500,8 +493,9 @@ func TestInstalledVersionSessionStatus(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	mgr := New(context.Background(), nil, nil, "")
+	mgr := New(context.Background(), nil, nil, "", WithMachineInstallOwner(true))
 	mgr.baseDir = tmpDir
+	isolateFromHostHelper(mgr, tmpDir)
 	mgr.sessions["100"] = newSessionState("100", tmpDir)
 
 	if got := mgr.InstalledVersion(); got != "0.113.0" {
@@ -517,8 +511,9 @@ func TestInstalledVersionLegacyFallback(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	mgr := New(context.Background(), nil, nil, "")
+	mgr := New(context.Background(), nil, nil, "", WithMachineInstallOwner(true))
 	mgr.baseDir = tmpDir
+	isolateFromHostHelper(mgr, tmpDir)
 
 	if got := mgr.InstalledVersion(); got != "0.111.1" {
 		t.Fatalf("InstalledVersion() fallback = %q, want %q", got, "0.111.1")
@@ -537,8 +532,9 @@ func TestInstalledVersionLegacyFallbackIgnoredWhenSessionsDirExists(t *testing.T
 		t.Fatal(err)
 	}
 
-	mgr := New(context.Background(), nil, nil, "")
+	mgr := New(context.Background(), nil, nil, "", WithMachineInstallOwner(true))
 	mgr.baseDir = tmpDir
+	isolateFromHostHelper(mgr, tmpDir)
 
 	// With sessions dir present, legacy root status must not be read to prevent stale update loops
 	if got := mgr.InstalledVersion(); got != "" {
@@ -548,11 +544,338 @@ func TestInstalledVersionLegacyFallbackIgnoredWhenSessionsDirExists(t *testing.T
 
 func TestInstalledVersionEmptyWhenNoStatus(t *testing.T) {
 	tmpDir := t.TempDir()
-	mgr := New(context.Background(), nil, nil, "")
+	mgr := New(context.Background(), nil, nil, "", WithMachineInstallOwner(true))
 	mgr.baseDir = tmpDir
+	isolateFromHostHelper(mgr, tmpDir)
 	mgr.sessions["100"] = newSessionState("100", tmpDir)
 
 	if got := mgr.InstalledVersion(); got != "" {
 		t.Fatalf("InstalledVersion() = %q, want empty string", got)
+	}
+}
+
+// #6252: the on-disk binary version is authoritative. A helper session whose
+// status file has not been written yet (e.g. a fresh Windows session id after
+// logoff/logon) used to make InstalledVersion() return "" while the binary was
+// on disk — the heartbeat downgrade guard then refused every server-directed
+// update as invalid_current, forever.
+func TestInstalledVersionPrefersOnDiskBinaryVersion(t *testing.T) {
+	tmpDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmpDir, "sessions", "2"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	mgr := New(context.Background(), nil, nil, "", WithMachineInstallOwner(true))
+	mgr.baseDir = tmpDir
+	mgr.binaryPath = filepath.Join(tmpDir, "breeze-helper.exe")
+	mgr.sessions["2"] = newSessionState("2", tmpDir) // no status file
+	mgr.binaryVersionFunc = func(path string) (string, error) {
+		if path != mgr.binaryPath {
+			t.Fatalf("binaryVersionFunc got %q, want %q", path, mgr.binaryPath)
+		}
+		return "0.108.0", nil
+	}
+
+	if got := mgr.InstalledVersion(); got != "0.108.0" {
+		t.Fatalf("InstalledVersion() = %q, want on-disk 0.108.0", got)
+	}
+}
+
+// The running helper's status can lag the installed binary (the new binary is
+// on disk but the old process has not been restarted yet). Decisions about
+// what is INSTALLED must use the binary, not the stale process.
+func TestInstalledVersionOnDiskWinsOverSessionStatus(t *testing.T) {
+	tmpDir := t.TempDir()
+	statusPath := filepath.Join(tmpDir, "sessions", "1", "helper_status.yaml")
+	if err := os.MkdirAll(filepath.Dir(statusPath), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(statusPath, []byte("version: 0.108.0\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	mgr := New(context.Background(), nil, nil, "", WithMachineInstallOwner(true))
+	mgr.baseDir = tmpDir
+	mgr.sessions["1"] = newSessionState("1", tmpDir)
+	mgr.binaryVersionFunc = func(string) (string, error) { return "0.114.0", nil }
+
+	if got := mgr.InstalledVersion(); got != "0.114.0" {
+		t.Fatalf("InstalledVersion() = %q, want on-disk 0.114.0", got)
+	}
+}
+
+func TestInstalledVersionFallsBackToStatusWhenBinaryVersionUnreadable(t *testing.T) {
+	tmpDir := t.TempDir()
+	statusPath := filepath.Join(tmpDir, "sessions", "1", "helper_status.yaml")
+	if err := os.MkdirAll(filepath.Dir(statusPath), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(statusPath, []byte("version: 0.113.0\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	for name, readErr := range map[string]error{
+		"unsupported": errBinaryVersionUnsupported,
+		"read error":  fmt.Errorf("no version resource"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			mgr := New(context.Background(), nil, nil, "", WithMachineInstallOwner(true))
+			mgr.baseDir = tmpDir
+			mgr.sessions["1"] = newSessionState("1", tmpDir)
+			mgr.binaryVersionFunc = func(string) (string, error) { return "", readErr }
+			if got := mgr.InstalledVersion(); got != "0.113.0" {
+				t.Fatalf("InstalledVersion() = %q, want status fallback 0.113.0", got)
+			}
+		})
+	}
+}
+
+// #6252 chicken-and-egg: with no readable status, helperSupportsConfigFlag
+// was false, so the helper was spawned WITHOUT --config and wrote its status
+// to the legacy root file — which the agent ignores once sessions/ exists —
+// so the version stayed unknown forever. With the on-disk version known, the
+// spawn must carry --config for the per-session path.
+func TestApplySpawnsWithConfigWhenOnlyOnDiskVersionKnown(t *testing.T) {
+	tmpDir := t.TempDir()
+	origRemove := removeAutoStartFunc
+	origStopLegacy := stopHelperLegacyFunc
+	t.Cleanup(func() {
+		removeAutoStartFunc = origRemove
+		stopHelperLegacyFunc = origStopLegacy
+	})
+	removeAutoStartFunc = func() error { return nil }
+	stopHelperLegacyFunc = func() {}
+
+	helperBinary := filepath.Join(tmpDir, "breeze-helper")
+	if err := os.WriteFile(helperBinary, []byte("bin"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(tmpDir, "sessions"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	var spawnArgs [][]string
+	mgr := New(context.Background(), nil, nil, "", WithMachineInstallOwner(true))
+	mgr.baseDir = tmpDir
+	mgr.binaryPath = helperBinary
+	mgr.sessionEnumerator = &mockEnumerator{sessions: []SessionInfo{{Key: "3", Username: "bob", UID: 503}}}
+	mgr.isOurProcessFunc = func(int, string) bool { return false }
+	mgr.stopIfOursFunc = func(int, string) (bool, error) { return false, nil }
+	mgr.spawnFunc = func(sessionKey, binaryPath string, args ...string) (int, error) {
+		spawnArgs = append(spawnArgs, append([]string(nil), args...))
+		return 7001, nil
+	}
+	mgr.binaryVersionFunc = func(string) (string, error) { return "0.108.0", nil }
+
+	mgr.Apply(&Settings{Enabled: true, ShowOpenPortal: true})
+	mgr.Shutdown()
+
+	if len(spawnArgs) == 0 {
+		t.Fatal("expected the helper to be spawned")
+	}
+	if len(spawnArgs[0]) < 2 || spawnArgs[0][0] != "--config" {
+		t.Fatalf("spawn args = %v, want --config <session path>", spawnArgs[0])
+	}
+}
+
+// newNotInstalledManager builds a manager whose binaryPath does not exist
+// and whose spawnFunc records every call — the #6872 fixture.
+func newNotInstalledManager(t *testing.T) (*Manager, *int) {
+	t.Helper()
+	tmpDir := t.TempDir()
+	origRemove := removeAutoStartFunc
+	origStopLegacy := stopHelperLegacyFunc
+	t.Cleanup(func() {
+		removeAutoStartFunc = origRemove
+		stopHelperLegacyFunc = origStopLegacy
+	})
+	removeAutoStartFunc = func() error { return nil }
+	stopHelperLegacyFunc = func() {}
+
+	spawns := 0
+	mgr := New(context.Background(), nil, nil, "", WithMachineInstallOwner(true))
+	mgr.baseDir = tmpDir
+	mgr.binaryPath = filepath.Join(tmpDir, "breeze-helper") // never written
+	mgr.sessionEnumerator = &mockEnumerator{sessions: []SessionInfo{{Key: "1", Username: "kit", UID: 1}}}
+	mgr.isOurProcessFunc = func(pid int, binaryPath string) bool { return false }
+	mgr.spawnFunc = func(sessionKey, binaryPath string, args ...string) (int, error) {
+		spawns++
+		return 4242, nil
+	}
+	return mgr, &spawns
+}
+
+func TestEnsureRunningSessionReturnsErrNotInstalled(t *testing.T) {
+	mgr, spawns := newNotInstalledManager(t)
+	state := newSessionState("1", mgr.baseDir)
+
+	mgr.mu.Lock()
+	err := mgr.ensureRunningSession(state)
+	mgr.mu.Unlock()
+
+	if !errors.Is(err, ErrNotInstalled) {
+		t.Fatalf("err = %v, want ErrNotInstalled", err)
+	}
+	if *spawns != 0 {
+		t.Fatalf("spawnFunc called %d times for a missing binary", *spawns)
+	}
+}
+
+// A device that hit the watcher's give-up state must still refuse to spawn
+// while the binary is missing: the not-installed check comes BEFORE
+// watcherGaveUp, so ErrNotInstalled — not the "keeps crashing" error — is
+// what a not-installed session reports even with a stale give-up flag.
+func TestEnsureRunningSessionNotInstalledBeatsWatcherGaveUp(t *testing.T) {
+	mgr, spawns := newNotInstalledManager(t)
+	state := newSessionState("1", mgr.baseDir)
+	state.watcherGaveUp = true
+
+	mgr.mu.Lock()
+	err := mgr.ensureRunningSession(state)
+	mgr.mu.Unlock()
+	if !errors.Is(err, ErrNotInstalled) {
+		t.Fatalf("err = %v, want ErrNotInstalled while missing", err)
+	}
+	if *spawns != 0 {
+		t.Fatalf("spawnFunc called %d times for a missing binary", *spawns)
+	}
+}
+
+// #6872 final-review F1: a session whose watcher gave up before the helper
+// binary vanished must recover once Apply's bootstrap-install path
+// (downloadAndInstall, not applyPendingUpdate's "new binary" reset) lands a
+// fresh binary — not keep reporting "helper keeps crashing" forever. Drives
+// the real flow through Apply/CheckUpdate rather than hand-clearing the
+// flag, so the assertion cannot pass vacuously.
+func TestApplyResetsWatcherGaveUpAfterBootstrapInstall(t *testing.T) {
+	tmpDir := t.TempDir()
+	rec := withInstallRecorder(t)
+
+	origRemove := removeAutoStartFunc
+	origStopLegacy := stopHelperLegacyFunc
+	t.Cleanup(func() {
+		removeAutoStartFunc = origRemove
+		stopHelperLegacyFunc = origStopLegacy
+	})
+	removeAutoStartFunc = func() error { return nil }
+	stopHelperLegacyFunc = func() {}
+
+	mgr := newInstallTestManager(t, tmpDir)
+	// Report the on-disk version as already matching the pending target so
+	// applyPendingUpdate's installed==pending short-circuit (manager.go
+	// ~line 886) clears pendingHelperVersion without a second install —
+	// otherwise that second (unrelated) "new binary" reset would mask
+	// whether the bootstrap-install path under test resets watcherGaveUp.
+	mgr.binaryVersionFunc = func(string) (string, error) { return "0.99.0", nil }
+	mgr.sessionEnumerator = &mockEnumerator{sessions: []SessionInfo{{Key: "1", Username: "kit", UID: 1}}}
+	mgr.isOurProcessFunc = func(int, string) bool { return false }
+	mgr.stopIfOursFunc = func(int, string) (bool, error) { return false, nil }
+
+	spawns := 0
+	mgr.spawnFunc = func(sessionKey, binaryPath string, args ...string) (int, error) {
+		spawns++
+		return 4242, nil
+	}
+
+	// A session that hit the watcher's give-up state before the binary went
+	// missing — the exact #6872 starting condition.
+	state := newSessionState("1", mgr.baseDir)
+	state.watcherGaveUp = true
+	mgr.sessions["1"] = state
+
+	verifiedPkg := filepath.Join(tmpDir, "verified"+packageExtension())
+	if err := os.WriteFile(verifiedPkg, []byte("VERIFIED"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	mgr.downloadFunc = func(version string) (string, error) {
+		// Simulate the install landing the binary, same as
+		// TestApplyEnabledInstallUsesPendingVersion.
+		if err := os.WriteFile(mgr.binaryPath, []byte("bin"), 0755); err != nil {
+			return "", err
+		}
+		return verifiedPkg, nil
+	}
+
+	mgr.CheckUpdate("0.99.0")
+	mgr.Apply(&Settings{Enabled: true})
+	mgr.Shutdown()
+
+	if rec.called < 1 {
+		t.Fatalf("installPackage called %d times, want >= 1", rec.called)
+	}
+	if spawns != 1 {
+		t.Fatalf("spawnFunc called %d times after bootstrap install, want 1", spawns)
+	}
+	if mgr.sessions["1"].watcherGaveUp {
+		t.Fatal("watcherGaveUp still true after a successful bootstrap install (#6872)")
+	}
+}
+
+func TestApplyEnabledNotInstalledNoPendingDoesNotSpawn(t *testing.T) {
+	mgr, spawns := newNotInstalledManager(t)
+
+	mgr.Apply(&Settings{Enabled: true})
+	mgr.Apply(&Settings{Enabled: true})
+
+	if *spawns != 0 {
+		t.Fatalf("spawnFunc called %d times with no helper installed", *spawns)
+	}
+	for key, st := range mgr.sessions {
+		if st.watcher != nil {
+			t.Fatalf("session %s has a watcher with no helper installed", key)
+		}
+	}
+	if !mgr.notInstalledWarned {
+		t.Fatal("expected the not-installed warning to have fired once")
+	}
+}
+
+func TestApplyNotInstalledWarnResetsWhenInstalledOrDisabled(t *testing.T) {
+	mgr, _ := newNotInstalledManager(t)
+	t.Cleanup(mgr.Shutdown) // installing the binary mid-test starts a watcher (#6872: avoid leaking it into later tests)
+	mgr.Apply(&Settings{Enabled: true})
+	if !mgr.notInstalledWarned {
+		t.Fatal("warn flag not set")
+	}
+
+	mgr.Apply(&Settings{Enabled: false})
+	if mgr.notInstalledWarned {
+		t.Fatal("warn flag must reset when the policy turns off")
+	}
+
+	mgr.Apply(&Settings{Enabled: true})
+	if !mgr.notInstalledWarned {
+		t.Fatal("warn flag not set on re-enable")
+	}
+	if err := os.WriteFile(mgr.binaryPath, []byte("bin"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	mgr.Apply(&Settings{Enabled: true})
+	if mgr.notInstalledWarned {
+		t.Fatal("warn flag must reset once the binary is installed")
+	}
+}
+
+// Binary removed while a session watcher is running: the next Apply must stop
+// that watcher and spawn nothing.
+func TestApplyNotInstalledStopsExistingWatcher(t *testing.T) {
+	mgr, spawns := newNotInstalledManager(t)
+	if err := os.WriteFile(mgr.binaryPath, []byte("bin"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	mgr.Apply(&Settings{Enabled: true})
+	if *spawns != 1 {
+		t.Fatalf("installed: spawnFunc called %d times, want 1", *spawns)
+	}
+	if mgr.sessions["1"] == nil || mgr.sessions["1"].watcher == nil {
+		t.Fatal("expected a watcher for session 1 while installed")
+	}
+
+	if err := os.Remove(mgr.binaryPath); err != nil {
+		t.Fatal(err)
+	}
+	mgr.Apply(&Settings{Enabled: true})
+	if mgr.sessions["1"].watcher != nil {
+		t.Fatal("watcher still running after the binary vanished")
+	}
+	if *spawns != 1 {
+		t.Fatalf("spawnFunc called %d times after the binary vanished, want still 1", *spawns)
 	}
 }

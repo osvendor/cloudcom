@@ -1,39 +1,52 @@
+import { planAutopayForInvoice } from './autopay/scheduler';
 import { and, eq, inArray, sql } from 'drizzle-orm';
 import { db, runOutsideDbContext, withSystemDbAccessContext } from '../db';
 import { quotes, quoteBlocks, quoteLines, quoteAcceptances, quoteRecipients } from '../db/schema/quotes';
 import { invoices, invoiceLines } from '../db/schema/invoices';
-import { partners, sites } from '../db/schema/orgs';
+import { organizations, partners, sites } from '../db/schema/orgs';
 import { deviceGroups } from '../db/schema/devices';
+import { contracts } from '../db/schema/contracts';
 import { resolvePartnerDocumentLocale } from './documentLocale';
 import { QuoteServiceError } from './quoteTypes';
 import { computeQuoteSha256 } from './quoteContentHash';
 import { getAcceptanceProvider } from './acceptanceProvider';
 import { computeLineTotal, computeInvoiceTotals } from './invoiceMath';
+import { snapshotCost } from './catalogPricing';
+import { computeDueDate, resolveInvoiceTermsDays } from './invoiceTerms';
 import { formatInvoiceNumber } from './invoiceNumbers';
 import { isQuoteExpired } from './quoteExpiry';
 import { emitInvoiceEvent } from './invoiceEvents';
 import { enqueueInvoicePdfRender } from '../jobs/invoiceWorker';
+import { enqueueAccountingInvoicePush } from '../jobs/accountingSyncWorker';
+import { resolveActiveConnectionFor } from './accounting/accountingConnectionService';
 import { buildContractSpecsFromQuote, type QuoteLineForContract } from './quoteToContract';
 import { createContractWithLinesDetailed } from './contractService';
 import { stagePax8OrderFromQuote } from './quoteToPax8Order';
 import { captureException } from './sentry';
-import { isQuoteLineSiteDeleted } from '@breeze/shared';
+import {
+  isQuoteLineSiteDeleted, stampInvoiceLineDetail,
+  RELATED_CONTRACT_STATUSES, contractsOverlapCadence, type RelatedContractStatus,
+} from '@breeze/shared';
 import type { ContractBlockRenderData } from './contractTemplateRender';
 import { getOrMintInvoiceLink, buildPublicInvoiceUrl } from './invoiceLinkToken';
+import { stampedPresentation, quotePresentationAsInvoiceSource } from './invoicePresentation';
 import {
   assertContractRenderDataComplete,
   buildContractHashParts,
   createExecutedDocuments,
+  type SignedAgreementEvidence,
 } from './contractDocumentService';
 // One-way import: quoteLifecycle does NOT import this module, so there is no
 // cycle (verify with `grep -n quoteAcceptService services/quoteLifecycle.ts`).
 import {
+  assertQuoteHasCustomerVisibleLine,
   assertQuoteSendGates,
   claimQuoteSent,
   resolveParentToSupersede,
   type QuoteSupersedeResult,
 } from './quoteLifecycle';
 import type { QuoteLineForMath } from './quoteMath';
+import { syncDraftQuoteTaxRate } from './quoteService';
 
 export interface AcceptQuoteParams {
   quoteId: string;
@@ -67,6 +80,13 @@ export interface AcceptQuoteParams {
 
 type QuoteRow = typeof quotes.$inferSelect;
 
+export interface OverlappingExistingContract {
+  id: string;
+  name: string;
+  status: RelatedContractStatus;
+  intervalMonths: number;
+}
+
 export interface AcceptQuoteResult {
   quote: QuoteRow;
   acceptanceId: string;
@@ -81,6 +101,11 @@ export interface AcceptQuoteResult {
   // Executed contract_documents snapshot ids created for this accept (one per
   // contract block); empty when the quote embeds no contract blocks.
   contractDocumentIds: string[];
+  /** #9303: the org's contracts that ALREADY existed (draft/active/paused) on
+   *  the same cadence with an overlapping term as a contract this accept
+   *  created. Activating both would bill the customer twice, so the on-behalf
+   *  UI names them after the accept. Empty when there are none. */
+  overlappingContracts: OverlappingExistingContract[];
   /** Set when an on-behalf accept claimed a DRAFT revision and so retired its
    *  parent, so the route can audit it exactly as `/send` does. */
   superseded?: QuoteSupersedeResult;
@@ -250,6 +275,22 @@ export async function acceptQuote(
     .where(eq(quoteLines.quoteId, quote.id))
     .orderBy(quoteLines.sortOrder);
 
+  // Empty-quote gate (#9963), for EVERY status and origin, before anything is
+  // written: an item-less quote used to convert into a $0 draft invoice. A
+  // draft refuses through the shared send gate's wording; a quote that already
+  // went out empty (sent before the send gate existed) cannot be edited, so the
+  // copy names the way forward for whoever is looking at it.
+  if (!lines.some((l) => l.customerVisible)) {
+    if (quote.status === 'draft') assertQuoteHasCustomerVisibleLine(lines, 'accept');
+    throw new QuoteServiceError(
+      origin === 'on_behalf'
+        ? 'This quote has no items, so there is nothing to accept — use Revise to issue a version with items.'
+        : 'This quote has no items to accept. Please contact your provider for an updated quote.',
+      422,
+      'QUOTE_EMPTY',
+    );
+  }
+
   // Draft claim (spec §5). Inside the caller's transaction, so a later failure
   // rolls the claim back with everything else.
   let supersededByClaim: QuoteSupersedeResult | undefined;
@@ -260,6 +301,15 @@ export async function acceptQuote(
     // contract document whose declared variables are unresolved (the renderer
     // substitutes '' and reports an "unreachable" Sentry capture), or convert a
     // quote whose deposit terms became unsatisfiable while it was drafted.
+    //
+    // Tax snapshot moment first (#7507), exactly as sendQuote does: this claim
+    // is when the draft becomes customer-bound, so the deposit gate, the content
+    // hash and the issued invoice must all use the rate current NOW. The row is
+    // already held FOR UPDATE; overlay the refreshed row onto the in-memory one.
+    if (await syncDraftQuoteTaxRate(quote.id)) {
+      const [refreshed] = await db.select().from(quotes).where(eq(quotes.id, quote.id)).limit(1);
+      Object.assign(quote, refreshed);
+    }
     assertQuoteSendGates(quote, blocks, lines as QuoteLineForMath[], params.contractRenderData ?? [], 'accept');
     // Same helper, same lock order as sendQuote. On a revision the parent is
     // retired, so a customer still holding the PARENT's link cannot accept it
@@ -341,8 +391,23 @@ export async function acceptQuote(
       // #3205 W07: read alongside the other issue-time partner defaults so the
       // appendix stamp below costs no extra query.
       invoiceDeviceAppendix: partners.invoiceDeviceAppendix,
+      // #8604: line itemization defaults, frozen below beside the appendix.
+      invoiceLineGrouping: partners.invoiceLineGrouping, invoiceLineShowDate: partners.invoiceLineShowDate,
+      invoiceLineShowNote: partners.invoiceLineShowNote, invoiceLineShowWorkedTime: partners.invoiceLineShowWorkedTime,
+      // #6227: fallback for the invoice presentation stamp when the quote
+      // carries no presentation snapshot (legacy pre-snapshot quotes).
+      documentTheme: partners.documentTheme, documentPageSize: partners.documentPageSize,
+      // #6229: the quote org's payment-terms override rides on this read (NULL
+      // = inherit the partner's), resolved below by resolveInvoiceTermsDays.
+      // The join is pinned to the same partner, so a mismatched org can only
+      // yield NULL (inherit), never another tenant's value.
+      orgTermsDays: organizations.invoiceTermsDays,
+      // #9778: client name for the auto-created contract's name.
+      orgName: organizations.name,
     })
-    .from(partners).where(eq(partners.id, quote.partnerId)).limit(1);
+    .from(partners)
+    .leftJoin(organizations, and(eq(organizations.id, quote.orgId), eq(organizations.partnerId, partners.id)))
+    .where(eq(partners.id, quote.partnerId)).limit(1);
   // Render locale for the contract parts + executed PDF: the quote's send-time
   // snapshot (every non-draft quote carries one since 2026-09-01-b), falling
   // back to the PARTNER's language for an unstamped row — the same fallback the
@@ -393,29 +458,49 @@ export async function acceptQuote(
   }
 
   // 1. Record the acceptance.
+  const acceptanceValues = {
+    quoteId: quote.id,
+    orgId: quote.orgId,
+    signerName: captured.signerName,
+    signerEmail: captured.signerEmail,
+    // Defense-in-depth: routes already resolve a single validated client IP,
+    // but ip_address is varchar(64) — clamp so a stray long value can never
+    // overflow and roll back the whole accept (C1). On the on-behalf path
+    // this is the TECH's IP and user agent, not the customer's.
+    ipAddress: params.ipAddress ? params.ipAddress.slice(0, 64) : null,
+    userAgent: params.userAgent ?? null,
+    quoteSha256,
+    hashVersion: 2,
+    acceptanceTokenJti: params.acceptanceTokenJti ?? null,
+    renderLocale,
+    origin,
+    method: captured.method,
+    reference: origin === 'on_behalf' ? (params.reference ?? null) : null,
+    recordedByUserId: origin === 'on_behalf' ? (params.actorUserId ?? null) : null,
+  };
   const [acceptance] = await db
     .insert(quoteAcceptances)
-    .values({
-      quoteId: quote.id,
-      orgId: quote.orgId,
-      signerName: captured.signerName,
-      signerEmail: captured.signerEmail,
-      // Defense-in-depth: routes already resolve a single validated client IP,
-      // but ip_address is varchar(64) — clamp so a stray long value can never
-      // overflow and roll back the whole accept (C1). On the on-behalf path
-      // this is the TECH's IP and user agent, not the customer's.
-      ipAddress: params.ipAddress ? params.ipAddress.slice(0, 64) : null,
-      userAgent: params.userAgent ?? null,
-      quoteSha256,
-      hashVersion: 2,
-      acceptanceTokenJti: params.acceptanceTokenJti ?? null,
-      renderLocale,
-      origin,
-      method: captured.method,
-      reference: origin === 'on_behalf' ? (params.reference ?? null) : null,
-      recordedByUserId: origin === 'on_behalf' ? (params.actorUserId ?? null) : null,
-    })
-    .returning({ id: quoteAcceptances.id });
+    .values(acceptanceValues)
+    .returning({ id: quoteAcceptances.id, signedAt: quoteAcceptances.signedAt });
+
+  // #8865 W1b: the signer-evidence snapshot every executed contract document
+  // carries, so it outlives the quote. Built from the SAME values just
+  // inserted, with signed_at taken from the DB default as returned — exactly
+  // what the 2026-12-31-210000 back-fill copied onto legacy rows.
+  const signedAgreementEvidence: SignedAgreementEvidence = {
+    signerName: acceptanceValues.signerName,
+    signerEmail: acceptanceValues.signerEmail,
+    signedAt: acceptance!.signedAt,
+    signerIp: acceptanceValues.ipAddress,
+    signerUserAgent: acceptanceValues.userAgent,
+    acceptanceOrigin: origin,
+    acceptanceMethod: acceptanceValues.method,
+    acceptanceReference: acceptanceValues.reference,
+    recordedByUserId: acceptanceValues.recordedByUserId,
+    contentSha256: acceptanceValues.quoteSha256,
+    contentHashVersion: acceptanceValues.hashVersion,
+    acceptanceRenderLocale: acceptanceValues.renderLocale,
+  };
 
   // 2. Convert ONE-TIME lines to a draft invoice (Phase 2: recurring lines deferred to the Phase 4 Contract).
   //    document_locale is NOT copied onto the draft here: it is an issue-time
@@ -464,7 +549,13 @@ export async function acceptQuote(
       description: l.description,
       quantity: l.quantity,
       unitPrice: l.unitPrice,
-      costBasis: null,
+      // Per-unit cost snapshot for margin reporting (#9221). The quote line's
+      // unit_cost is stored in the quote currency, which is the invoice
+      // currency here; snapshotCost keeps it only when exact at the currency's
+      // minor unit, else NULL (unknown cost — never coerced to zero). Internal
+      // cost is not part of the acceptance hash (computeQuoteSha256 allowlists
+      // its line fields), so this cannot move a recorded quote_sha256.
+      costBasis: snapshotCost(l.unitCost, quote.currencyCode, quote.currencyCode),
       taxable: l.taxable,
       customerVisible: true,
       lineTotal,
@@ -509,11 +600,11 @@ export async function acceptQuote(
     if (!Number.isFinite(counter) || counter < 1) {
       throw new QuoteServiceError('Failed to allocate invoice number', 500, 'INVALID_STATE');
     }
-    const dueDate = new Date(now.getTime() + (partner?.termsDays ?? 30) * 86400000);
+    const dueDate = computeDueDate(now, resolveInvoiceTermsDays(partner?.orgTermsDays, partner?.termsDays));
     issueFields.status = 'sent';
     issueFields.invoiceNumber = formatInvoiceNumber(partner?.prefix ?? 'INV', year, counter);
     issueFields.issueDate = now.toISOString().slice(0, 10);
-    issueFields.dueDate = dueDate.toISOString().slice(0, 10);
+    issueFields.dueDate = dueDate;
     issueFields.billToName = quote.billToName ?? null;
     issueFields.billToAddress = quote.billToAddress ?? null;
     issueFields.billToTaxId = quote.billToTaxId ?? null;
@@ -529,6 +620,18 @@ export async function acceptQuote(
     // through issueInvoice), so the appendix choice is frozen here too — the
     // same reason documentLocale is stamped on this line.
     issueFields.deviceAppendix = invoice!.deviceAppendix ?? partner?.invoiceDeviceAppendix ?? false;
+    // #8604: same issue moment, same freeze for the line itemization.
+    Object.assign(issueFields, stampInvoiceLineDetail(invoice!, partner));
+    // #6227 presentation snapshot: this IS the issue moment, so freeze the
+    // theme / page size here too — from the accepted quote's own send-time
+    // presentationSnapshot (the proposal the customer signed), the same rule
+    // sellerSnapshot and documentLocale follow, with the partner's current
+    // values only as the fallback for a pre-snapshot quote. Same precedence
+    // as quoteBranding, resolved through the invoice resolver.
+    Object.assign(issueFields, stampedPresentation(
+      quotePresentationAsInvoiceSource(quote.presentationSnapshot),
+      partner,
+    ));
     issueFields.termsAndConditions = quote.termsAndConditions ?? null;
     issueFields.terms = quote.terms ?? null;
     // Deposit terms travel from the signed quote onto the issued invoice.
@@ -544,6 +647,7 @@ export async function acceptQuote(
     }
   }
   await db.update(invoices).set(issueFields).where(eq(invoices.id, invoice!.id));
+  if (oneTime.length > 0) await planAutopayForInvoice(db, invoice!.id);
 
   // 3. Transition the quote to converted.
   await db
@@ -582,9 +686,12 @@ export async function acceptQuote(
   const startDate = effectiveDate; // accept date, date-only UTC (shared with the snapshot)
   const contractSpecs = buildContractSpecsFromQuote(
     {
+      quoteId: quote.id,
       orgId: quote.orgId,
       partnerId: quote.partnerId,
       quoteNumber: quote.quoteNumber ?? quote.id,
+      title: quote.title ?? null,
+      orgName: partner?.orgName ?? null,
       currencyCode: quote.currencyCode,
       terms: quote.terms ?? null,
     },
@@ -616,6 +723,13 @@ export async function acceptQuote(
     params.actorUserId ?? null,
   );
 
+  // #9303: read the org's existing live contracts BEFORE creating the new ones,
+  // so the on-behalf UI can say "this org already has a contract on the same
+  // cadence" — the double-billing trap when a hand-built draft already exists.
+  // A read only: the accept still creates its own draft(s) exactly as before.
+  // Explicit org filter: this transaction runs in SYSTEM scope.
+  const overlappingContracts = await findOverlappingExistingContracts(quote.orgId, contractSpecs);
+
   const contractIds: string[] = [];
   const contractLineLinks: Array<{ quoteLineId: string; contractLineId: string }> = [];
   for (const spec of contractSpecs) {
@@ -645,6 +759,7 @@ export async function acceptQuote(
     blocks,
     effectiveDate,
     renderLocale,
+    signedAgreementEvidence,
   );
 
   // Phase 5: stage any Pax8-backed fulfillment in this exact transaction,
@@ -680,13 +795,35 @@ export async function acceptQuote(
     contractIds,
     pax8OrderId: pax8Staged.orderId,
     contractDocumentIds,
+    overlappingContracts,
     superseded: supersededByClaim,
   };
 }
 
+/** The org's draft/active/paused contracts that bill on the same cadence over
+ *  an overlapping term as any contract this accept is about to create (#9303).
+ *  Empty when the quote has no recurring lines. */
+async function findOverlappingExistingContracts(
+  orgId: string,
+  specs: ReadonlyArray<{ intervalMonths: number; startDate: string; endDate?: string | null }>,
+): Promise<OverlappingExistingContract[]> {
+  if (specs.length === 0) return [];
+  const existing = await db.select({
+    id: contracts.id, name: contracts.name, status: contracts.status,
+    intervalMonths: contracts.intervalMonths, startDate: contracts.startDate, endDate: contracts.endDate,
+  }).from(contracts)
+    .where(and(eq(contracts.orgId, orgId), inArray(contracts.status, [...RELATED_CONTRACT_STATUSES])))
+    .orderBy(contracts.createdAt, contracts.id);
+  return existing
+    .filter((c) => specs.some((spec) => contractsOverlapCadence(c, { ...spec, endDate: spec.endDate ?? null })))
+    .map((c) => ({
+      id: c.id, name: c.name, status: c.status as RelatedContractStatus, intervalMonths: c.intervalMonths,
+    }));
+}
+
 /**
  * Fire-and-forget lifecycle side effects for an accept that issued an invoice:
- * the `invoice.issued` event + the async PDF render. MUST be called AFTER the
+ * the `invoice.issued` event, the async PDF render and the QuickBooks auto-push. MUST be called AFTER the
  * accept transaction commits — both are Redis/BullMQ ops, and emitting inside the
  * transaction would fire even on a later rollback (the same reason the public
  * token's jti revoke is deferred to the caller). No-op when no invoice was issued.
@@ -709,6 +846,16 @@ export async function emitAcceptInvoiceIssued(
     await enqueueInvoicePdfRender(res.invoiceId);
   } catch (err) {
     console.error('[quoteAccept] enqueueInvoicePdfRender failed (accept already committed)', `invoiceId=${res.invoiceId}`, err instanceof Error ? err.message : err);
+    captureException(err instanceof Error ? err : new Error(String(err)));
+  }
+  // Accounting auto-push, as issueInvoice does (#7135): enqueued only when the
+  // partner has an invoice-push-capable connection, carrying its id (Xero W01
+  // producer gate). The worker applies the connected / pushMode gates.
+  try {
+    const conn = await resolveActiveConnectionFor(res.quote.partnerId, 'invoicePush');
+    if (conn) await enqueueAccountingInvoicePush(res.invoiceId, res.quote.partnerId, conn.id);
+  } catch (err) {
+    console.error('[quoteAccept] enqueueAccountingInvoicePush failed (accept already committed)', `invoiceId=${res.invoiceId}`, err instanceof Error ? err.message : err);
     captureException(err instanceof Error ? err : new Error(String(err)));
   }
 }

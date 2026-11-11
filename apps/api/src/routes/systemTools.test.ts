@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { Hono } from 'hono';
 import { systemToolsRoutes } from './systemTools';
+import { ERROR_CODES } from '@breeze/shared';
 
 const mockExecuteCommand = vi.fn();
 
@@ -113,6 +114,22 @@ vi.mock('../middleware/auth', () => ({
   }),
   requireScope: vi.fn(() => async (_c: unknown, next: () => Promise<unknown>) => next()),
   requireMfa: vi.fn(() => async (_c: unknown, next: () => Promise<unknown>) => next()),
+  // Mirrors the real requirePermission: resolve the caller's permissions once
+  // (through the mocked module below, so per-test mockResolvedValueOnce grants
+  // such as allowedSiteIds reach the router) and keep them in context.
+  requirePermission: vi.fn((resource: string, action: string) => async (c: any, next: () => Promise<unknown>) => {
+    const perms = await import('../services/permissions');
+    const auth = c.get('auth');
+    const userPerms = await perms.getUserPermissions(auth.user.id, {
+      partnerId: auth.partnerId || undefined,
+      orgId: auth.orgId || undefined,
+    });
+    if (!userPerms || !perms.hasPermission(userPerms, resource, action)) {
+      return c.json({ error: 'Permission denied' }, 403);
+    }
+    c.set('permissions', userPerms);
+    return next();
+  }),
 }));
 
 vi.mock('../services/permissions', () => ({
@@ -130,6 +147,7 @@ vi.mock('../services/permissions', () => ({
   PERMISSIONS: {
     DEVICES_READ: { resource: 'devices', action: 'read' },
     DEVICES_EXECUTE: { resource: 'devices', action: 'execute' },
+    SCRIPTS_EXECUTE: { resource: 'scripts', action: 'execute' },
   }
 }));
 
@@ -180,6 +198,22 @@ describe('system tools routes', () => {
     const body = await res.json();
     expect(body.data).toHaveLength(1);
     expect(body.meta.total).toBe(1);
+  });
+
+  it('answers a device parked in a holding org with 403 DEVICE_PENDING_ASSIGNMENT and sends nothing', async () => {
+    mockDeviceSelect();
+    const { checkRemoteAccess } = await import('../services/remoteAccessPolicy');
+    vi.mocked(checkRemoteAccess).mockResolvedValueOnce({
+      allowed: false,
+      code: 'DEVICE_PENDING_ASSIGNMENT',
+      reason: 'This device is waiting to be assigned to an organization; remote access is unavailable until then',
+    });
+
+    const res = await app.request(`/system-tools/devices/${deviceId}/processes`);
+
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual(expect.objectContaining({ code: 'DEVICE_PENDING_ASSIGNMENT' }));
+    expect(mockExecuteCommand).not.toHaveBeenCalled();
   });
 
   it('denies system tool commands when site scope excludes the device', async () => {
@@ -962,7 +996,7 @@ describe('system tools routes', () => {
       expect(body.results).toHaveLength(1);
       expect(body.results[0].status).toBe('failure');
       expect(body.results[0].error).toBe('Permission denied');
-      expect(body.results[0].code).toBe('agent_execution_failed');
+      expect(body.results[0].code).toBe(ERROR_CODES.AGENT_EXECUTION_FAILED);
     });
   });
 
@@ -1279,7 +1313,7 @@ describe('system tools routes', () => {
       // at the first failure, so they are never reached in a red run.
       expect(res.status).toBe(503);
       const body = await res.json();
-      expect(body.code).toBe('agent_timeout');
+      expect(body.code).toBe(ERROR_CODES.AGENT_TIMEOUT);
       expect(body.error).toContain("didn't respond in time");
       expect(body.success).toBeUndefined();
       expect(body.data).toBeUndefined();
@@ -1359,7 +1393,7 @@ describe('system tools routes', () => {
 
       expect(res.status).toBe(503);
       const body = await res.json();
-      expect(body.code).toBe('agent_timeout');
+      expect(body.code).toBe(ERROR_CODES.AGENT_TIMEOUT);
       expect(body.unverified).toBe(true);
     });
 
@@ -1372,7 +1406,7 @@ describe('system tools routes', () => {
       expect(res.status).toBe(500);
       const body = await res.json();
       expect(body.error).toBe('access is denied');
-      expect(body.code).toBe('agent_execution_failed');
+      expect(body.code).toBe(ERROR_CODES.AGENT_EXECUTION_FAILED);
       expect(body.unverified).toBeUndefined();
     });
 
@@ -1384,7 +1418,7 @@ describe('system tools routes', () => {
 
       expect(res.status).toBe(404);
       const body = await res.json();
-      expect(body.code).toBe('path_not_found');
+      expect(body.code).toBe(ERROR_CODES.PATH_NOT_FOUND);
     });
 
     // Verbatim from commandQueue.ts:832,1013 — `Device is ${device.status},
@@ -1402,7 +1436,7 @@ describe('system tools routes', () => {
 
       expect(res.status).toBe(503);
       const body = await res.json();
-      expect(body.code).toBe('device_offline');
+      expect(body.code).toBe(ERROR_CODES.DEVICE_OFFLINE);
       expect(body.error).toBe('The device is offline.');
       expect(body.unverified).toBeUndefined();
     });
@@ -1427,7 +1461,7 @@ describe('system tools routes', () => {
 
         expect(res.status).toBe(503);
         const body = await res.json();
-        expect(body.code).toBe('device_offline');
+        expect(body.code).toBe(ERROR_CODES.DEVICE_OFFLINE);
         expect(body.error).toBe(`The device is ${deviceState} and cannot run commands.`);
         expect(body.error).not.toContain('offline');
       },

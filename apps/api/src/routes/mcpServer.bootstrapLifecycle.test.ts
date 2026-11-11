@@ -109,6 +109,7 @@ vi.mock('../middleware/apiKeyAuth', () => ({
       partnerId: 'partner-1',
       name: 'test',
       keyPrefix: 'brz_test',
+      mcpDomains: null,
       scopes: testState.scopes,
       rateLimit: 1000,
       createdBy: 'user-1',
@@ -338,6 +339,7 @@ async function dispatchBootstrap(
     partnerId: 'partner-1',
     name: 'test',
     keyPrefix: 'brz_test',
+    mcpDomains: null,
     scopes: testState.scopes,
     rateLimit: 1000,
     createdBy: 'user-1',
@@ -365,7 +367,16 @@ async function dispatchBootstrap(
     testState.scopes,
     apiKey as any,
     await makeContext(),
-    'sess-1',
+    {
+      requestId: '00000000-0000-4000-8000-0000000000a1',
+      era: 'legacy',
+      protocolVersion: '2025-11-25',
+      transport: 'streamable_http',
+      sessionId: 'sess-1',
+      principalKey: 'key-1',
+      tokenJti: null,
+      clientInfo: null,
+    },
   ) as Promise<any>;
 }
 
@@ -386,6 +397,25 @@ describe('bootstrap Tier 3 interactive-approval boundary', () => {
     expect(mocks.writeAuditEvent).toHaveBeenCalledTimes(1); // transport call audit only
     expect(mocks.sendHandler).not.toHaveBeenCalled();
     expect(mocks.configureHandler).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['send_deployment_invites', { emails: ['a@b.com'] }],
+    ['configure_defaults', {}],
+  ])('%s stays approval-only even with MCP_UNATTENDED_TIER3_PRINCIPALS=true (onboarding tools, never listed)', async (toolName, args) => {
+    vi.stubEnv('MCP_UNATTENDED_TIER3_PRINCIPALS', 'api_key:key-1');
+    try {
+      const body = await callBootstrap(toolName, {
+        perms: [{ resource: '*', action: '*' }],
+        args,
+      });
+      expect(JSON.parse(body.result.content[0].text).code).toBe('MCP_APPROVAL_REQUIRED');
+      expect(mocks.ledgerBegin).not.toHaveBeenCalled();
+      expect(mocks.sendHandler).not.toHaveBeenCalled();
+      expect(mocks.configureHandler).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it('denies malformed bootstrap input at the approval boundary before schema parsing', async () => {

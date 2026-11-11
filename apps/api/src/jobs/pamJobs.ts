@@ -24,8 +24,9 @@ import { getBullMQConnection } from '../services/redis';
 import { captureException } from '../services/sentry';
 import { publishEvent } from '../services/eventBus';
 import { writeAuditEvent, requestLikeFromSnapshot } from '../services/auditEvents';
-import { requestPamCleanup } from '../services/pamActuationLifecycle';
-import { envInt } from '../utils/envInt';
+import { PamActuationNotFoundError, requestPamCleanup } from '../services/pamActuationLifecycle';
+import { enqueuePamRequestNotify } from '../services/pamRequestNotify';
+import { pamPendingTtlMinutes } from './pamPendingTtl';
 import { attachWorkerObservability } from './workerObservability';
 
 const ENFORCER_QUEUE = 'pam-elevation-expiry-enforcer';
@@ -34,8 +35,6 @@ const STALE_QUEUE = 'pam-stale-request-expirer';
 const STALE_INTERVAL_MS = 5 * 60 * 1000; // every 5 min
 const MAX_PER_RUN = 500;
 
-// Pending requests older than this are expired. Overridable for ops via env.
-const STALE_PENDING_TTL_MINUTES = envInt('PAM_PENDING_REQUEST_TTL_MINUTES', 15);
 
 type PamJobData = { type: 'enforce-elevation-expiry' | 'expire-stale-requests'; queuedAt: string };
 
@@ -103,52 +102,90 @@ async function emitExpiryEffects(rows: TransitionedRow[], cause: 'window' | 'sta
   }
 }
 
+type ExpiredRow = TransitionedRow & { cleanup: 'queued' | 'no_actuation' };
+
 /**
  * Flip active elevations whose window has passed to `expired`.
  * Returns the number of rows transitioned. Exported for tests.
+ *
+ * Per-row isolation: the due set is locked in one transaction, but each
+ * row's status flip + device cleanup runs in its OWN savepoint, so a row
+ * whose cleanup throws does not roll back the rest of the batch.
+ *
+ *   - No pam_actuations row (`PamActuationNotFoundError`): nothing was ever
+ *     dispatched to the device, so the row still expires; the audit entry
+ *     records `cleanup: 'no_actuation'`.
+ *   - Any other cleanup failure: that row's savepoint rolls back (it stays
+ *     active and is retried next run), it is reported to Sentry, and the rest
+ *     of the batch proceeds. It must NOT expire without its cleanup queued,
+ *     or the privilege would outlive its window on the device.
  */
 export async function enforceElevationExpiry(): Promise<number> {
   const rows = await db.transaction(async (tx) => {
-    const transitioned = await tx.execute<TransitionedRow>(sql`
-      WITH due AS (
-        SELECT id
-        FROM ${elevationRequests}
-        WHERE ${elevationRequests.status} IN ('approved', 'auto_approved', 'actuating')
-          AND ${elevationRequests.expiresAt} IS NOT NULL
-          AND ${elevationRequests.expiresAt} < now()
-        ORDER BY ${elevationRequests.expiresAt} ASC
-        LIMIT ${MAX_PER_RUN}
-        FOR UPDATE SKIP LOCKED
-      )
-      UPDATE ${elevationRequests} AS e
-      SET status = 'expired',
-          expired_at = now(),
-          updated_at = now()
-      FROM due
-      WHERE e.id = due.id
-        AND e.status IN ('approved', 'auto_approved', 'actuating')
-      RETURNING
-        e.id,
-        e.org_id,
-        e.device_id,
-        e.flow_type,
-        e.metadata,
-        'active'::text AS prior_status;
-    `);
-    const expired = extractRows(transitioned);
-    for (const row of expired) {
-      if (row.metadata?.local_decision_required !== true
-          || row.metadata.local_decision === 'approved') {
-        await requestPamCleanup(tx, { elevationRequestId: row.id, cause: 'expired' });
+    const due = extractRows(await tx.execute<TransitionedRow>(sql`
+      SELECT id
+      FROM ${elevationRequests}
+      WHERE ${elevationRequests.status} IN ('approved', 'auto_approved', 'actuating')
+        AND ${elevationRequests.expiresAt} IS NOT NULL
+        AND ${elevationRequests.expiresAt} < now()
+      ORDER BY ${elevationRequests.expiresAt} ASC
+      LIMIT ${MAX_PER_RUN}
+      FOR UPDATE SKIP LOCKED
+    `));
+
+    const expired: ExpiredRow[] = [];
+    for (const { id } of due) {
+      try {
+        const row = await tx.transaction(async (sp) => {
+          const [transitioned] = extractRows(await sp.execute<TransitionedRow>(sql`
+            UPDATE ${elevationRequests} AS e
+            SET status = 'expired',
+                expired_at = now(),
+                updated_at = now()
+            WHERE e.id = ${id}
+              AND e.status IN ('approved', 'auto_approved', 'actuating')
+            RETURNING
+              e.id,
+              e.org_id,
+              e.device_id,
+              e.flow_type,
+              e.metadata,
+              'active'::text AS prior_status;
+          `));
+          if (!transitioned) return null;
+          if (transitioned.metadata?.local_decision_required === true
+              && transitioned.metadata.local_decision !== 'approved') {
+            return { ...transitioned, cleanup: 'no_actuation' as const };
+          }
+          try {
+            await requestPamCleanup(sp, { elevationRequestId: transitioned.id, cause: 'expired' });
+            return { ...transitioned, cleanup: 'queued' as const };
+          } catch (err) {
+            if (!(err instanceof PamActuationNotFoundError)) throw err;
+            console.warn(
+              `[PamJobs] elevation ${transitioned.id} expired with no PAM actuation — nothing to clean up on the device`,
+            );
+            return { ...transitioned, cleanup: 'no_actuation' as const };
+          }
+        });
+        if (row) expired.push(row);
+      } catch (err) {
+        console.error(`[PamJobs] expiry of elevation ${id} failed; left active for retry:`, err);
+        captureException(err);
       }
     }
+
     if (expired.length > 0) {
       await tx.insert(elevationAudit).values(expired.map((row) => ({
         orgId: row.org_id,
         elevationRequestId: row.id,
         eventType: 'expired' as const,
         actor: 'system' as const,
-        details: { cause: 'window', prior_status: row.prior_status },
+        details: {
+          cause: 'window',
+          prior_status: row.prior_status,
+          ...(row.cleanup === 'no_actuation' ? { cleanup: 'no_actuation' } : {}),
+        },
         occurredAt: new Date(),
       })));
     }
@@ -167,9 +204,9 @@ export async function enforceElevationExpiry(): Promise<number> {
  * Exported for tests.
  */
 export async function expireStaleRequests(): Promise<number> {
-  const ttlMinutes = Number.isFinite(STALE_PENDING_TTL_MINUTES) && STALE_PENDING_TTL_MINUTES > 0
-    ? STALE_PENDING_TTL_MINUTES
-    : 15;
+  // Pending requests older than this are expired (PAM_PENDING_REQUEST_TTL_MINUTES).
+  // The ingest 201's pendingExpiresAt is computed from the same function.
+  const ttlMinutes = pamPendingTtlMinutes();
   const rows = await db.transaction(async (tx) => {
     const transitioned = await tx.execute<TransitionedRow>(sql`
     WITH due AS (
@@ -205,6 +242,13 @@ export async function expireStaleRequests(): Promise<number> {
         details: { cause: 'stale', prior_status: row.prior_status },
         occurredAt: new Date(),
       })));
+      // #8928: tell each end user still waiting on IT that the request
+      // expired. Only uac_intercept rows have a user on the device; each
+      // enqueue is savepointed and best-effort, so it never undoes the expiry.
+      for (const row of expired) {
+        if (row.flow_type !== 'uac_intercept') continue;
+        await enqueuePamRequestNotify(tx, { id: row.id, deviceId: row.device_id }, 'expired');
+      }
     }
     return expired;
   });

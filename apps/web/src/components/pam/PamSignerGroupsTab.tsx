@@ -1,5 +1,5 @@
 import '@/lib/i18n';
-import { useCallback, useEffect, useId, useState } from 'react';
+import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import { Plus, ShieldCheck, Trash2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { fetchWithAuth } from '../../stores/auth';
@@ -29,6 +29,7 @@ import {
   theadRowClass,
   rowClass,
 } from './ui';
+import { useStableT } from '@/lib/i18n/useStableT';
 
 /**
  * Manage reusable signer groups (trusted-publisher catalog). A group is a named
@@ -37,6 +38,7 @@ import {
  */
 export default function PamSignerGroupsTab({ liveTick = 0 }: { liveTick?: number }) {
   const { t } = useTranslation('security');
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   const { can } = usePermissions();
   const canManage = can('pam', 'manage_policy');
   const [groups, setGroups] = useState<PamSignerGroup[]>([]);
@@ -47,8 +49,8 @@ export default function PamSignerGroupsTab({ liveTick = 0 }: { liveTick?: number
   const [deleteTarget, setDeleteTarget] = useState<PamSignerGroup | null>(null);
   const [deleting, setDeleting] = useState(false);
 
-  const fetchGroups = useCallback(async (signal?: AbortSignal) => {
-    setLoading(true);
+  const fetchGroups = useCallback(async (signal?: AbortSignal, { silent = false }: { silent?: boolean } = {}) => {
+    if (!silent) setLoading(true);
     setError(null);
     try {
       const res = await fetchWithAuth('/pam/signer-groups', { signal });
@@ -58,7 +60,7 @@ export default function PamSignerGroupsTab({ liveTick = 0 }: { liveTick?: number
           return;
         }
         throw new Error(
-          t('pamPamSignerGroupsTab.errors.loadWithStatus', {
+          stableT('pamPamSignerGroupsTab.errors.loadWithStatus', {
             defaultValue: 'Failed to load signer groups (HTTP {{status}})',
             status: res.status,
           }),
@@ -73,16 +75,19 @@ export default function PamSignerGroupsTab({ liveTick = 0 }: { liveTick?: number
       setError(
         err instanceof Error
           ? err.message
-          : t('pamPamSignerGroupsTab.errors.load', { defaultValue: 'Failed to load signer groups' }),
+          : stableT('pamPamSignerGroupsTab.errors.load', { defaultValue: 'Failed to load signer groups' }),
       );
     } finally {
       if (!signal?.aborted) setLoading(false);
     }
-  }, [t]);
+  }, [stableT]);
 
+  const lastTickRef = useRef(liveTick);
   useEffect(() => {
+    const silent = liveTick !== lastTickRef.current;
+    lastTickRef.current = liveTick;
     const controller = new AbortController();
-    void fetchGroups(controller.signal);
+    void fetchGroups(controller.signal, { silent });
     return () => controller.abort();
   }, [fetchGroups, liveTick]);
 

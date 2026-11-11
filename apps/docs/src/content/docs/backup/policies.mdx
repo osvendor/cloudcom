@@ -32,7 +32,7 @@ Backup scheduling is managed through [Configuration Policies](/features/configur
    | **MSSQL** | SQL Server databases |
    | **System Image** | Full system state capture |
 
-   **Storage Configuration** — select which storage target to use (created in [Storage Configuration](/backup/storage/)).
+   **Storage Configuration** — select which storage target to use (created in [Storage Configuration](/backup/storage/)). The list shows the destinations of the organization that owns the policy. If there are none yet, the tab shows **Backups need a destination first** with a **New destination** button, so you can create one without leaving the policy.
 
    **Schedule** — frequency (daily, weekly, monthly), time of day, timezone, and optionally day-of-week or day-of-month.
 
@@ -118,6 +118,16 @@ Policies support additional controls for managing backup impact:
 | **Backup window** | Time range during which backups are allowed to run |
 | **Bandwidth limit** | Maximum throughput in Mbps to avoid saturating the network |
 | **Priority** | Controls ordering when multiple devices are scheduled simultaneously |
+
+### Devices that are off at the scheduled time
+
+A scheduled backup whose device is offline does not fail straight away. The job stays pending and runs when the agent next connects, for up to 20 hours after the scheduled time or until the policy's next run, whichever comes first.
+
+If the device stays offline for that whole window, the job fails with `Missed: device was offline for the whole catch-up window`. If the device came back but the backup could not be started, the job fails with a message starting `Catch-up did not start:` instead. A backup that ran and went wrong reports its own error, so you can tell the three apart.
+
+A waiting job is cancelled when it comes to run if the policy no longer applies to the device, or if its destination was edited in the meantime.
+
+To fail the job immediately instead, set `runMissedBackupsOnConnect` to `false` in the policy's schedule. This setting is API-only for now. Manual backups are not affected: they fail at once with `Agent not connected` if the device is offline.
 
 ---
 

@@ -11,15 +11,16 @@ import type { createCrosswalkService } from '../services/crosswalkService';
 import type { createEnrichmentService } from '../services/enrichmentService';
 import type { createIngestJobsService } from '../services/ingestJobsService';
 import type { createIngestJobRunner } from '../services/ingestJobRunner';
-import { getOrgSettings, putOrgSettings, type DlpConfig } from '../services/orgSettingsService';
+import { DEFAULT_DLP_CONFIG, getOrgSettings, putOrgSettings, type DetectorId, type DlpConfig } from '../services/orgSettingsService';
 import { isTransientIngestError } from '../services/ingestErrors';
-import { adminGate, type WorkspaceRouteEnv } from './adminGate';
+import { adminGate, contentSubpath, WORKSPACE_RESOURCE, type WorkspaceRouteEnv } from './adminGate';
+import { DLP_MAX_CUSTOM_RULES, validateDlpPattern } from '@breeze/shared/validators';
 
 // Paths exempt from the content-enabled 404 gate below: the settings switch
 // itself, and (W3) the admin job API — job visibility (and the ability to
 // trigger/advance a job) must survive content-off, same rationale as
 // /content/settings.
-const CONTENT_FLAG_GATE_EXEMPT_SUFFIXES = ['/content/settings', '/content/jobs', '/content/jobs/advance'];
+const CONTENT_FLAG_GATE_EXEMPT_PATHS: ReadonlySet<string> = new Set(['settings', 'jobs', 'jobs/advance']);
 
 export interface ContentRouteDeps {
   contentIngestService: Pick<ReturnType<typeof createContentIngestService>, 'run' | 'status'>;
@@ -44,10 +45,14 @@ const ingestRunSchema = z.strictObject({
 // them against the known DlpAction set and collapses anything unrecognized
 // (e.g. a typo'd action) to the safe per-detector default. This schema only
 // enforces shape and rejects unknown keys.
+const DETECTOR_IDS = Object.keys(DEFAULT_DLP_CONFIG.detectors) as [DetectorId, ...DetectorId[]];
+
 const putSettingsSchema = z.strictObject({
   contentEnabled: z.boolean().optional(),
   dlpConfig: z.strictObject({
-    detectors: z.record(z.string(), z.string()).optional(),
+    // Keys are checked strictly (a typo'd detector id is a 400, not a silent
+    // drop); values stay plain strings for normalizeDlp, per the note above.
+    detectors: z.partialRecord(z.enum(DETECTOR_IDS), z.string()).optional(),
     customPatterns: z.array(z.strictObject({
       name: z.string(),
       pattern: z.string(),
@@ -76,9 +81,10 @@ export function createContentRoutes(deps: ContentRouteDeps): Hono<WorkspaceRoute
     // /content/settings is the switch that flips contentEnabled, and (W3) the
     // admin job endpoints must stay reachable so job visibility/triggering
     // survives content-off — both are exempt from this gate.
-    if (CONTENT_FLAG_GATE_EXEMPT_SUFFIXES.some((suffix) => c.req.path.endsWith(suffix))) return next();
+    const subpath = contentSubpath(c.req.path);
+    if (subpath !== null && CONTENT_FLAG_GATE_EXEMPT_PATHS.has(subpath)) return next();
     const s = await getOrgSettings(deps.db, c.get('workspaceOrgId'));
-    if (!s.contentEnabled) return c.json({ error: 'not_found' }, 404);
+    if (!s.contentEnabled) return c.json({ error: 'not found' }, 404);
     await next();
   });
 
@@ -217,6 +223,41 @@ export function createContentRoutes(deps: ContentRouteDeps): Hono<WorkspaceRoute
     if (!parsed.success) {
       return c.json({ error: 'invalid request', details: parsed.error.issues }, 400);
     }
+    // Turning content extraction on, or touching the DLP config that gates
+    // what it exposes, is an execute-tier action — matching every other
+    // /content/* route — not a plain configuration write. workspace:write
+    // alone may still disable content (contentEnabled: false / omitted) or
+    // send a no-op PUT.
+    const changesContentGuardrails = parsed.data.contentEnabled === true || parsed.data.dlpConfig !== undefined;
+    if (changesContentGuardrails) {
+      const authorization = c.get('extensionAuthorization');
+      if (!authorization?.hasPermission(WORKSPACE_RESOURCE, 'execute') || !authorization.hasPermission('devices', 'execute')) {
+        return c.json({ error: 'Permission denied' }, 403);
+      }
+    }
+
+    // Reject at write time (not just the cheap re-check normalizeDlp applies
+    // on every read): a custom pattern is rejected outright if it exceeds the
+    // shared length cap, uses a backreference, matches the nested-quantifier
+    // heuristic, or fails the timed-probe check for catastrophic backtracking
+    // (packages/shared/src/validators/clientAiDlp.ts). This full check is
+    // write-only — it is not safe to run per-request on the ingest read path.
+    const customPatterns = parsed.data.dlpConfig?.customPatterns;
+    if (customPatterns) {
+      if (customPatterns.length > DLP_MAX_CUSTOM_RULES) {
+        return c.json({ error: `at most ${DLP_MAX_CUSTOM_RULES} custom DLP patterns are allowed` }, 400);
+      }
+      const invalid: Array<{ name: string; reason: string }> = [];
+      for (const p of customPatterns) {
+        const result = validateDlpPattern(p.pattern);
+        if (!result.ok) invalid.push({ name: p.name, reason: result.reason });
+      }
+      if (invalid.length > 0) {
+        return c.json({ error: 'one or more custom DLP patterns are unsafe or invalid', details: invalid }, 400);
+      }
+    }
+
+    const previousSettings = await getOrgSettings(deps.db, orgId);
     const settings = await putOrgSettings(deps.db, orgId, {
       ...(parsed.data.contentEnabled !== undefined ? { contentEnabled: parsed.data.contentEnabled } : {}),
       // Cast: the schema above validates shape only, not detector/action
@@ -233,7 +274,12 @@ export function createContentRoutes(deps: ContentRouteDeps): Hono<WorkspaceRoute
       action: 'workspace.content.settings_update',
       resourceType: 'workspace_org_settings',
       result: 'success',
-      details: { contentEnabled: settings.contentEnabled },
+      details: {
+        contentEnabled: settings.contentEnabled,
+        ...(parsed.data.dlpConfig !== undefined
+          ? { dlpConfigBefore: previousSettings.dlpConfig, dlpConfigAfter: settings.dlpConfig }
+          : {}),
+      },
     });
     return c.json(settings);
   });

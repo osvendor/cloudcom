@@ -1,6 +1,7 @@
 import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { makePolicyView } from './portalAccess/viewFixture';
 
 import OrgSettingsPage, { runOrgNameSave } from './OrgSettingsPage';
 import { fetchWithAuth } from '../../stores/auth';
@@ -9,11 +10,14 @@ import { showToast } from '../shared/Toast';
 import { navigateTo } from '@/lib/navigation';
 
 vi.mock('../../stores/auth', () => ({
-  fetchWithAuth: vi.fn()
+  fetchWithAuth: vi.fn(),
+  waitForPendingRefresh: vi.fn().mockResolvedValue(undefined)
 }));
 
+const storeFetchOrganizations = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+const storeSelectOrganization = vi.hoisted(() => vi.fn());
 vi.mock('../../stores/orgStore', () => ({
-  useOrgStore: vi.fn()
+  useOrgStore: Object.assign(vi.fn(), { getState: () => ({ fetchOrganizations: storeFetchOrganizations, selectOrganization: storeSelectOrganization, recordRecentOrg: vi.fn() }) })
 }));
 
 vi.mock('../shared/Toast', () => ({
@@ -26,19 +30,36 @@ vi.mock('@/lib/navigation', () => ({
 
 // Stub the heavy child editors — they're unrelated to name editing, and several
 // pull in their own fetches/effects; stubbing keeps these tests focused and fast.
-const brandingProps: Array<{ onSave: (data: Record<string, unknown>) => unknown }> = [];
-vi.mock('./OrgBrandingEditor', () => ({ default: (props: { onSave: (data: Record<string, unknown>) => unknown }) => {
+type BrandingEditorProps = { onSave: () => unknown; legacyLogoUrl?: string; saveBlockedMessage?: string };
+const brandingProps: BrandingEditorProps[] = [];
+vi.mock('./OrgBrandingEditor', () => ({ default: (props: BrandingEditorProps) => {
   brandingProps.push(props);
   return <div data-testid="branding-editor" />;
 } }));
-vi.mock('./OrgDefaultsEditor', () => ({ default: () => <div data-testid="defaults-editor" /> }));
+const defaultsEditorProps: Array<Record<string, unknown>> = [];
+vi.mock('./OrgDefaultsEditor', () => ({ default: (props: Record<string, unknown>) => {
+  defaultsEditorProps.push(props);
+  return <div data-testid="defaults-editor" />;
+} }));
 vi.mock('./OrgNotificationSettings', () => ({ default: () => <div data-testid="notifications" /> }));
-vi.mock('./OrgSecuritySettings', () => ({ default: ({ onDirty, onSave }: {
+// Capture the props the Security and Event Logs tabs get: both issue their own
+// org-scoped requests, so each must be handed the PAGE's org rather than fall
+// back to the header switcher's (pre-release sweep, v0.118.2 → main).
+const securityProps: Array<Record<string, unknown>> = [];
+vi.mock('./OrgSecuritySettings', () => ({ default: (props: {
   onDirty: () => void; onSave: (value: unknown) => void;
-}) => <button data-testid="security" onClick={() => {
-  onDirty(); onSave({ allowedMethods: { totp: false, sms: false } });
-}}>Save security</button> }));
-vi.mock('./OrgEventLogSettings', () => ({ default: () => <div data-testid="event-logs" /> }));
+} & Record<string, unknown>) => {
+  securityProps.push(props);
+  const { onDirty, onSave } = props;
+  return <button data-testid="security" onClick={() => {
+    onDirty(); onSave({ allowedMethods: { totp: false, sms: false } });
+  }}>Save security</button>;
+} }));
+const eventLogProps: Array<Record<string, unknown>> = [];
+vi.mock('./OrgEventLogSettings', () => ({ default: (props: Record<string, unknown>) => {
+  eventLogProps.push(props);
+  return <div data-testid="event-logs" />;
+} }));
 // #6004: the AI budget editor. Capture its props — the tab is worthless if it
 // is not handed the org it is meant to edit.
 const aiBudgetProps: Array<Record<string, unknown>> = [];
@@ -46,6 +67,32 @@ vi.mock('./OrgAiBudgetSettings', () => ({
   default: (props: Record<string, unknown>) => {
     aiBudgetProps.push(props);
     return <div data-testid="org-ai-budget" />;
+  },
+}));
+// AI model registry W04 (#7602): the org model-defaults override card self-fetches; stub it and
+// capture the org it is handed.
+const modelDefaultsProps: Array<Record<string, unknown>> = [];
+vi.mock('./aiModels/OrgModelDefaultsCard', () => ({
+  default: (props: Record<string, unknown>) => {
+    modelDefaultsProps.push(props);
+    return <div data-testid="org-model-defaults-card" />;
+  },
+}));
+// #6475: the interactive AI-approval timeout card. Capture its props (the
+// resolved `effective` value it's handed) and expose a button that fires
+// onSave with a fixed payload, mirroring the 'security' stub above.
+const aiApprovalTimeoutProps: Array<Record<string, unknown>> = [];
+vi.mock('./OrgAiApprovalTimeoutCard', () => ({
+  default: (props: { onSave: (value: unknown) => void }) => {
+    aiApprovalTimeoutProps.push(props);
+    return (
+      <button
+        data-testid="ai-approval-timeout"
+        onClick={() => props.onSave({ interactiveTimeoutMinutes: 30 })}
+      >
+        Save AI approval timeout
+      </button>
+    );
   },
 }));
 // Capture the props the Remote Access tab is mounted with. #3432: the parent
@@ -68,6 +115,18 @@ vi.mock('../extensions/ExtensionSlotHost', () => ({
   default: (props: Record<string, unknown>) => (
     <div data-testid="extension-slot-host-stub" data-props={JSON.stringify(props)} />
   ),
+}));
+
+// Organization › Domains (portal registration W5): shown to partner/system callers only.
+const jwtState = vi.hoisted(() => ({
+  current: { status: 'resolved', claims: { scope: 'partner', orgId: null, partnerId: 'p-1' } } as unknown,
+}));
+vi.mock('@/lib/authScope', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/authScope')>()),
+  useJwtClaims: () => jwtState.current,
+}));
+vi.mock('./orgDomains/OrgDomainsTab', () => ({
+  default: ({ orgId }: { orgId: string }) => <div data-testid="org-domains-tab-stub">{orgId}</div>,
 }));
 
 const fetchWithAuthMock = vi.mocked(fetchWithAuth);
@@ -161,6 +220,23 @@ describe('OrgSettingsPage general tab — name editing', () => {
 
     const input = await screen.findByTestId('org-name-input');
     expect((input as HTMLInputElement).value).toBe('Acme Systems');
+  });
+
+  it('shrinks the name input and type select so their Save buttons stay inside the tile (#7152)', async () => {
+    fetchWithAuthMock.mockImplementation((url: string) => {
+      if (url.endsWith('/effective-settings')) return Promise.resolve(makeJsonResponse({ locked: [] }));
+      return Promise.resolve(makeJsonResponse(orgDetails));
+    });
+
+    render(<OrgSettingsPage orgId="org-1" />);
+
+    const input = await screen.findByTestId('org-name-input');
+    const select = await screen.findByTestId('org-type-select');
+
+    // flex-1 items must be allowed to shrink below their intrinsic width
+    // (min-w-0) or they push the sibling Save button out of the tile.
+    expect(input.className).toContain('min-w-0');
+    expect(select.className).toContain('min-w-0');
   });
 
   it('PATCHes the new name when the user edits and saves', async () => {
@@ -260,6 +336,35 @@ describe('OrgSettingsPage general tab — name editing', () => {
         expect.objectContaining({ method: 'PATCH', body: JSON.stringify({ name: 'Acme IT' }) })
       );
     });
+  });
+
+  it('refreshes the global org store (header switcher) after a successful rename (#8371)', async () => {
+    fetchWithAuthMock.mockImplementation((url: string, init?: RequestInit) => {
+      if (url.endsWith('/effective-settings')) return Promise.resolve(makeJsonResponse({ locked: [] }));
+      if (init?.method === 'PATCH') return Promise.resolve(makeJsonResponse({ ...orgDetails, name: 'Acme IT' }));
+      return Promise.resolve(makeJsonResponse(orgDetails));
+    });
+    render(<OrgSettingsPage orgId="org-1" />);
+    const input = (await screen.findByTestId('org-name-input')) as HTMLInputElement;
+    await userEvent.clear(input);
+    await userEvent.type(input, 'Acme IT');
+    await userEvent.click(screen.getByTestId('org-name-save'));
+    await waitFor(() => expect(storeFetchOrganizations).toHaveBeenCalledTimes(1));
+  });
+
+  it('does not refresh the org store when the rename fails (#8371)', async () => {
+    fetchWithAuthMock.mockImplementation((url: string, init?: RequestInit) => {
+      if (url.endsWith('/effective-settings')) return Promise.resolve(makeJsonResponse({ locked: [] }));
+      if (init?.method === 'PATCH') return Promise.resolve(makeJsonResponse({ error: 'nope' }, false, 500));
+      return Promise.resolve(makeJsonResponse(orgDetails));
+    });
+    render(<OrgSettingsPage orgId="org-1" />);
+    const input = (await screen.findByTestId('org-name-input')) as HTMLInputElement;
+    await userEvent.clear(input);
+    await userEvent.type(input, 'Acme IT');
+    await userEvent.click(screen.getByTestId('org-name-save'));
+    await waitFor(() => expect(fetchWithAuthMock.mock.calls.some(([, i]) => i?.method === 'PATCH')).toBe(true));
+    expect(storeFetchOrganizations).not.toHaveBeenCalled();
   });
 
   it('re-fetches and reflects the server-returned name after a successful save', async () => {
@@ -370,6 +475,18 @@ describe('OrgSettingsPage sidebar nav & save-state honesty', () => {
     expect(screen.queryByText(/unsaved changes/i)).toBeNull();
   });
 
+  it('uses the full content width, not a centred max-width column (matches Partner Settings, #9400)', async () => {
+    render(<OrgSettingsPage orgId="org-1" />);
+
+    await screen.findByTestId('org-name-input');
+    const heading = screen.getByRole('heading', { name: /Organization Settings/i });
+    const root = heading.closest('header')!.parentElement!;
+    expect(root.className).not.toMatch(/\bmax-w-/);
+    expect(root.className).not.toMatch(/\bmx-auto\b/);
+    expect(heading.className).toMatch(/\btext-2xl\b/);
+    expect(screen.getByTestId('org-settings-tab-general')).not.toBeNull();
+  });
+
   it('renders the sections as grouped links and marks the active one with aria-current', async () => {
     render(<OrgSettingsPage orgId="org-1" />);
 
@@ -385,20 +502,73 @@ describe('OrgSettingsPage sidebar nav & save-state honesty', () => {
     expect(screen.getByTestId('branding-editor')).not.toBeNull();
   });
 
-  it.each([true, false])('returns branding save success (%s) without an independent success toast', async (ok) => {
-    window.location.hash = '#branding';
-    fetchWithAuthMock.mockImplementation(async (url, init) => {
-      if (url.endsWith('/effective-settings')) return makeJsonResponse({ locked: [] });
-      if (init?.method === 'PATCH') return makeJsonResponse(ok ? {} : { error: 'Branding rejected' }, ok);
-      return makeJsonResponse(orgDetails);
+  // #9673: the Branding tab saves through portal-settings. All the page does is
+  // retire a legacy organizations.settings.branding blob, once.
+  describe('retiring the legacy branding settings', () => {
+    const LEGACY_LOGO = 'data:image/png;base64,T0xETE9HTw==';
+    const withLegacy = {
+      ...orgDetails,
+      settings: { ...orgDetails.settings, branding: { logoUrl: LEGACY_LOGO, theme: 'dark', portalSubdomain: 'acme' } },
+    };
+    const orgPatches = () => fetchWithAuthMock.mock.calls.filter(([, init]) => init?.method === 'PATCH');
+
+    function mockOrg(details: unknown, patchOk = true) {
+      fetchWithAuthMock.mockImplementation(async (url, init) => {
+        if (url.endsWith('/effective-settings')) return makeJsonResponse({ locked: [] });
+        if (init?.method === 'PATCH') return makeJsonResponse(patchOk ? {} : { error: 'Branding rejected' }, patchOk);
+        return makeJsonResponse(details);
+      });
+    }
+
+    it('passes the legacy logo to the editor', async () => {
+      window.location.hash = '#branding';
+      mockOrg(withLegacy);
+      render(<OrgSettingsPage orgId="org-1" />);
+      await screen.findByTestId('branding-editor');
+      expect(brandingProps.at(-1)!.legacyLogoUrl).toBe(LEGACY_LOGO);
     });
-    render(<OrgSettingsPage orgId="org-1" />);
-    await screen.findByTestId('branding-editor');
-    let result: unknown;
-    await act(async () => { result = await brandingProps.at(-1)!.onSave({ primaryColor: '#123456' }); });
-    expect(result).toBe(ok);
-    expect(showToastMock).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'success' }));
-    if (!ok) expect(showToastMock).toHaveBeenCalledWith(expect.objectContaining({ type: 'error' }));
+
+    it('clears the blob when one exists, keeping the other settings categories', async () => {
+      window.location.hash = '#branding';
+      mockOrg(withLegacy);
+      render(<OrgSettingsPage orgId="org-1" />);
+      await screen.findByTestId('branding-editor');
+      let result: unknown;
+      await act(async () => { result = await brandingProps.at(-1)!.onSave(); });
+      expect(result).toBe(true);
+      const patches = orgPatches();
+      expect(patches).toHaveLength(1);
+      const body = JSON.parse(String(patches[0]![1]!.body));
+      expect(body.settings.branding).toEqual({});
+      expect(Object.keys(body.settings).sort()).toEqual(Object.keys(withLegacy.settings).sort());
+      expect(showToastMock).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'success' }));
+    });
+
+    it('reports a failed clear without an independent success toast', async () => {
+      window.location.hash = '#branding';
+      mockOrg(withLegacy, false);
+      render(<OrgSettingsPage orgId="org-1" />);
+      await screen.findByTestId('branding-editor');
+      let result: unknown;
+      await act(async () => { result = await brandingProps.at(-1)!.onSave(); });
+      expect(result).toBe(false);
+      expect(showToastMock).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'success' }));
+      expect(showToastMock).toHaveBeenCalledWith(expect.objectContaining({ type: 'error' }));
+    });
+
+    it.each([
+      ['no branding key', {}],
+      ['an already-empty blob', { branding: {} }],
+    ])('writes nothing to the org when there is %s', async (_label, settings) => {
+      window.location.hash = '#branding';
+      mockOrg({ ...orgDetails, settings });
+      render(<OrgSettingsPage orgId="org-1" />);
+      await screen.findByTestId('branding-editor');
+      let result: unknown;
+      await act(async () => { result = await brandingProps.at(-1)!.onSave(); });
+      expect(result).toBe(true);
+      expect(orgPatches()).toHaveLength(0);
+    });
   });
 
   it('deep-links the hash to the right section on mount', async () => {
@@ -435,9 +605,80 @@ describe('OrgSettingsPage sidebar nav & save-state honesty', () => {
 
     const link = await screen.findByRole('link', { name: /^ai$/i });
     expect(link.getAttribute('aria-current')).toBe('page');
-    expect(screen.getByTestId('org-ai-budget')).not.toBeNull();
-    expect(aiBudgetProps.at(-1)).toMatchObject({ orgId: 'org-1' });
+    // Two cards from one editor: the budget card, and approval mode on its own
+    // beside the approval timeout (it is not a budget).
+    expect(screen.getAllByTestId('org-ai-budget')).toHaveLength(2);
+    expect(aiBudgetProps.some((p) => p.orgId === 'org-1' && p.section === undefined)).toBe(true);
+    expect(aiBudgetProps.some((p) => p.orgId === 'org-1' && p.section === 'approvals')).toBe(true);
+    // W04 (#7602): the model-defaults override card mounts first on this tab, for this org.
+    expect(screen.getByTestId('org-model-defaults-card')).not.toBeNull();
+    expect(modelDefaultsProps.at(-1)).toMatchObject({ orgId: 'org-1' });
   });
+
+  it.each([
+    ['#event-logs', 'event-logs', eventLogProps],
+    ['#security', 'security', securityProps],
+  ] as const)(
+    'hands the %s tab the org in the URL, not the header switcher org',
+    async (hash, testId, captured) => {
+      captured.length = 0;
+      window.location.hash = hash;
+      // Switcher on org-1, page on org-2.
+      useOrgStoreMock.mockReturnValue({ currentOrgId: 'org-1', organizations: [] } as never);
+      fetchWithAuthMock.mockImplementation((url: string) => {
+        if (url.endsWith('/effective-settings')) return Promise.resolve(makeJsonResponse({ locked: [] }));
+        return Promise.resolve(makeJsonResponse({ ...orgDetails, id: 'org-2', name: 'Other Customer' }));
+      });
+
+      render(<OrgSettingsPage orgId="org-2" />);
+
+      await screen.findByTestId(testId);
+      expect(captured.length).toBeGreaterThan(0);
+      for (const props of captured) {
+        expect(props.orgId).toBe('org-2');
+      }
+    },
+  );
+
+  // The mTLS card and the Event Logs tab write organizations.settings.<key>
+  // through their own routes, while every page-level section save re-posts the
+  // WHOLE settings blob from the page's loaded copy (the org PATCH replaces
+  // `settings` wholesale). Without a refresh after those writes, the next
+  // section save silently reverted them.
+  it.each([
+    ['#security', 'mtls', 'onMtlsSaved', securityProps, { certLifetimeDays: 90 }, { certLifetimeDays: 30 }],
+    ['#event-logs', 'logForwarding', 'onSaved', eventLogProps, { enabled: false }, { enabled: true, elasticsearchUrl: 'https://es.new:9200' }],
+  ] as const)(
+    'after a %s self-save, the next section save carries the fresh %s value, not the stale one',
+    async (hash, key, callback, captured, before, after) => {
+      captured.length = 0;
+      window.location.hash = hash;
+      let current: Record<string, unknown> = before;
+      fetchWithAuthMock.mockImplementation((url: string, init?: RequestInit) => {
+        if (url.endsWith('/effective-settings')) return Promise.resolve(makeJsonResponse({ locked: [] }));
+        if (init?.method === 'PATCH') return Promise.resolve(makeJsonResponse({}));
+        return Promise.resolve(makeJsonResponse({ ...orgDetails, settings: { [key]: current } }));
+      });
+
+      render(<OrgSettingsPage orgId="org-1" />);
+      await screen.findByTestId(hash === '#security' ? 'security' : 'event-logs');
+
+      // The child saved `after` through its own route, then reported it.
+      current = after;
+      const onSelfSaved = captured.at(-1)![callback] as (() => void) | undefined;
+      await act(async () => { onSelfSaved?.(); });
+
+      if (hash !== '#security') await userEvent.click(screen.getByRole('link', { name: /^security$/i }));
+      await userEvent.click(await screen.findByTestId('security'));
+
+      await waitFor(() =>
+        expect(fetchWithAuthMock.mock.calls.some(([, i]) => (i as RequestInit | undefined)?.method === 'PATCH')).toBe(true),
+      );
+      const patch = fetchWithAuthMock.mock.calls.find(([, i]) => (i as RequestInit | undefined)?.method === 'PATCH')!;
+      const sent = JSON.parse(String((patch[1] as RequestInit).body)) as { settings: Record<string, unknown> };
+      expect(sent.settings[key]).toEqual(after);
+    },
+  );
 
   it('places the AI tab beside Approval Security in the nav (#6004)', async () => {
     render(<OrgSettingsPage orgId="org-1" />);
@@ -529,12 +770,163 @@ describe('OrgSettingsPage sidebar nav & save-state honesty', () => {
     expect(screen.queryByTestId('contacts-card')).not.toBeInTheDocument();
   });
 
+  it('offers a Cloud tenants entry that switches the workspace to THIS org, then opens the integrations hash (#9318)', async () => {
+    render(<OrgSettingsPage orgId="org-9" />);
+
+    await screen.findByTestId('org-name-input');
+    await userEvent.click(screen.getByRole('link', { name: /cloud tenants/i }));
+
+    await waitFor(() => expect(navigateToMock).toHaveBeenCalledWith('/integrations#cloud-tenants', { replace: true }));
+    expect(storeSelectOrganization).toHaveBeenCalledWith('org-9');
+    expect(storeSelectOrganization.mock.invocationCallOrder[0]).toBeLessThan(navigateToMock.mock.invocationCallOrder[0]!);
+  });
+
   it('offers the compact section select for narrow viewports', async () => {
     render(<OrgSettingsPage orgId="org-1" />);
 
     await screen.findByTestId('org-name-input');
     const select = screen.getByLabelText('Settings section') as HTMLSelectElement;
     expect(select.value).toBe('general');
+  });
+});
+
+// #9762: `locked` no longer carries `defaults.agentVersionPins` (pins are a
+// partner DEFAULT the org may override). The "partner has a pin" signal is
+// `partnerDefaults`; the inherited pins are the merged effective value.
+describe('OrgSettingsPage — partner agent version pins (#9762)', () => {
+  const orgDetails = {
+    id: 'org-1',
+    name: 'Acme Systems',
+    slug: 'acme',
+    status: 'active',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    settings: {},
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    defaultsEditorProps.length = 0;
+    window.location.hash = '#general';
+    useOrgStoreMock.mockReturnValue({ currentOrgId: 'org-1', organizations: [] } as never);
+  });
+
+  function serveEffective(body: Record<string, unknown>) {
+    fetchWithAuthMock.mockImplementation((url: string) => {
+      if (url.endsWith('/effective-settings')) return Promise.resolve(makeJsonResponse(body));
+      return Promise.resolve(makeJsonResponse(orgDetails));
+    });
+  }
+
+  it('passes the partner pins when partnerDefaults lists defaults.agentVersionPins', async () => {
+    serveEffective({
+      locked: [],
+      partnerDefaults: ['defaults.agentVersionPins'],
+      effective: { defaults: { agentVersionPins: { agent: '0.120.0' } } },
+    });
+
+    render(<OrgSettingsPage orgId="org-1" />);
+    await screen.findByTestId('defaults-editor');
+
+    await waitFor(() => expect(defaultsEditorProps.at(-1)?.partnerPins).toEqual({ agent: '0.120.0' }));
+  });
+
+  it("does not present the org's own pins as inherited when the partner has none", async () => {
+    serveEffective({
+      locked: [],
+      partnerDefaults: [],
+      effective: { defaults: { agentVersionPins: { agent: '0.121.0' } } },
+    });
+
+    render(<OrgSettingsPage orgId="org-1" />);
+    await screen.findByTestId('defaults-editor');
+
+    // Wait for the effective-settings response to have been applied.
+    await waitFor(() => expect(defaultsEditorProps.at(-1)?.effectiveDefaults).toBeDefined());
+    expect(defaultsEditorProps.at(-1)?.partnerPins).toBeUndefined();
+  });
+});
+
+// #6475: the interactive AI-approval timeout card saves through the same
+// wholesale settings PATCH every other 'ai' tab uses — so a save that only
+// touches aiApprovals must preserve whatever else is already in
+// orgDetails.settings, and a failed save must surface an error the same way
+// the security tab's does above.
+describe('OrgSettingsPage — AI approval timeout (#6475)', () => {
+  const orgDetails = {
+    id: 'org-1',
+    name: 'Acme Systems',
+    slug: 'acme',
+    status: 'active',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    settings: {
+      // A pre-existing, unrelated settings key — must survive the PATCH.
+      notifications: { fromAddress: 'alerts@acme.example' },
+    },
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    aiApprovalTimeoutProps.length = 0;
+    window.location.hash = '#ai';
+    useOrgStoreMock.mockReturnValue({ currentOrgId: 'org-1', organizations: [] } as never);
+  });
+
+  it('passes the resolved aiApprovalTimeout through to the card', async () => {
+    fetchWithAuthMock.mockImplementation((url: string) => {
+      if (url.endsWith('/effective-settings')) {
+        return Promise.resolve(makeJsonResponse({
+          locked: [],
+          aiApprovalTimeout: { minutes: 30, source: 'partner', inheritedMinutes: 30, inheritedSource: 'partner' },
+        }));
+      }
+      return Promise.resolve(makeJsonResponse(orgDetails));
+    });
+
+    render(<OrgSettingsPage orgId="org-1" />);
+    await screen.findByTestId('ai-approval-timeout');
+
+    expect(aiApprovalTimeoutProps.at(-1)).toMatchObject({
+      effective: { minutes: 30, source: 'partner', inheritedMinutes: 30, inheritedSource: 'partner' },
+      initialData: undefined,
+    });
+  });
+
+  it('saving 30 minutes PATCHes the full settings object with aiApprovals set and notifications preserved', async () => {
+    fetchWithAuthMock.mockImplementation((url: string, init?: RequestInit) => {
+      if (url.endsWith('/effective-settings')) return Promise.resolve(makeJsonResponse({ locked: [] }));
+      if (init?.method === 'PATCH') return Promise.resolve(makeJsonResponse(orgDetails));
+      return Promise.resolve(makeJsonResponse(orgDetails));
+    });
+
+    render(<OrgSettingsPage orgId="org-1" />);
+    await userEvent.click(await screen.findByTestId('ai-approval-timeout'));
+
+    await waitFor(() => expect(fetchWithAuthMock).toHaveBeenCalledWith(
+      '/orgs/organizations/org-1',
+      expect.objectContaining({
+        method: 'PATCH',
+        body: JSON.stringify({
+          settings: {
+            notifications: { fromAddress: 'alerts@acme.example' },
+            aiApprovals: { interactiveTimeoutMinutes: 30 },
+          },
+        }),
+      }),
+    ));
+  });
+
+  it('a failed save surfaces an error toast rather than failing silently', async () => {
+    fetchWithAuthMock.mockImplementation((url: string, init?: RequestInit) => {
+      if (url.endsWith('/effective-settings')) return Promise.resolve(makeJsonResponse({ locked: [] }));
+      if (init?.method === 'PATCH') return Promise.resolve(makeJsonResponse({ error: 'save failed' }, false, 500));
+      return Promise.resolve(makeJsonResponse(orgDetails));
+    });
+
+    render(<OrgSettingsPage orgId="org-1" />);
+    await userEvent.click(await screen.findByTestId('ai-approval-timeout'));
+
+    await waitFor(() => expect(showToastMock).toHaveBeenCalledWith(expect.objectContaining({ type: 'error' })));
+    expect(showToastMock).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'success' }));
   });
 });
 
@@ -576,6 +968,13 @@ describe('OrgSettingsPage — archived organization (2026-08-28 pre-release swee
 
     const restoreLink = screen.getByTestId('org-archived-restore-link') as HTMLAnchorElement;
     expect(restoreLink.getAttribute('href')).toBe('/organizations#filter=archived');
+  });
+
+  it('blocks the Branding save before the editor writes anything (#9673)', async () => {
+    window.location.hash = '#branding';
+    render(<OrgSettingsPage orgId="org-1" />);
+    await screen.findByTestId('branding-editor');
+    expect(brandingProps.at(-1)!.saveBlockedMessage).toMatch(/archived/i);
   });
 
   it('disables the name and type Save controls so the page cannot 404 on save', async () => {
@@ -642,5 +1041,97 @@ describe('OrgSettingsPage — archived organization (2026-08-28 pre-release swee
       expect(banner.textContent).toMatch(/2026/);
       expect(screen.getByTestId('org-archived-restore-link')).toBeInTheDocument();
     });
+  });
+});
+
+describe('OrgSettingsPage portal tab layout', () => {
+  const orgDetails = {
+    id: 'org-1', name: 'Acme Systems', slug: 'acme', status: 'active',
+    createdAt: '2026-01-01T00:00:00.000Z', settings: {}
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    window.location.hash = '#portal';
+    useOrgStoreMock.mockReturnValue({ currentOrgId: 'org-1', organizations: [] } as never);
+    fetchWithAuthMock.mockImplementation((url: string) => {
+      if (url.endsWith('/effective-settings')) return Promise.resolve(makeJsonResponse({ locked: [] }));
+      if (url === '/orgs/organizations/org-1/portal-settings') return Promise.resolve(makeJsonResponse({ data: {} }));
+      if (url === '/orgs/organizations/org-1/portal-access-policy') return Promise.resolve(makeJsonResponse({ data: makePolicyView() }));
+      if (url === '/orgs/organizations/org-1/portal-access-requests?status=pending') return Promise.resolve(makeJsonResponse({ data: [], hasMore: false }));
+      if (url === '/orgs/organizations/org-1/portal-users') return Promise.resolve(makeJsonResponse({ data: [] }));
+      return Promise.resolve(makeJsonResponse(orgDetails));
+    });
+  });
+
+  afterEach(() => { window.location.hash = ''; });
+
+  it('renders the Sign-in & registration card between the portal settings and the portal users list', async () => {
+    render(<OrgSettingsPage orgId="org-1" />);
+    const settings = await screen.findByTestId('org-portal-settings');
+    const card = await screen.findByTestId('org-sign-in-card');
+    const users = await screen.findByTestId('portal-users-editor');
+    expect(settings.compareDocumentPosition(card) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(card.compareDocumentPosition(users) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+});
+
+describe('OrgSettingsPage — Domains tab (portal registration W5)', () => {
+  const orgDetails = {
+    id: 'org-1', name: 'Acme Systems', slug: 'acme', status: 'active',
+    createdAt: '2026-01-01T00:00:00.000Z', settings: {}
+  };
+  const partnerClaims = { status: 'resolved', claims: { scope: 'partner', orgId: null, partnerId: 'p-1' } };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    window.location.hash = '';
+    jwtState.current = partnerClaims;
+    useOrgStoreMock.mockReturnValue({ currentOrgId: 'org-1', organizations: [] } as never);
+    fetchWithAuthMock.mockImplementation((url: string) => {
+      if (url.endsWith('/effective-settings')) return Promise.resolve(makeJsonResponse({ locked: [] }));
+      return Promise.resolve(makeJsonResponse(orgDetails));
+    });
+  });
+
+  afterEach(() => {
+    window.location.hash = '';
+    jwtState.current = partnerClaims;
+  });
+
+  it('#domains selects the tab and mounts the Domains tab for this org', async () => {
+    window.location.hash = '#domains';
+    render(<OrgSettingsPage orgId="org-1" />);
+    const link = await screen.findByRole('link', { name: /^domains$/i });
+    expect(link.getAttribute('aria-current')).toBe('page');
+    expect(await screen.findByTestId('org-domains-tab-stub')).toHaveTextContent('org-1');
+  });
+
+  it('lists Domains in the Organization group after Contacts for a system caller too', async () => {
+    jwtState.current = { status: 'resolved', claims: { scope: 'system', orgId: null, partnerId: null } };
+    render(<OrgSettingsPage orgId="org-1" />);
+    await screen.findByTestId('org-name-input');
+    const contacts = screen.getByTestId('org-settings-tab-contacts');
+    const domains = screen.getByTestId('org-settings-tab-domains');
+    expect(contacts.compareDocumentPosition(domains) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it('the tab is hidden for callers without domain governance (organization scope)', async () => {
+    jwtState.current = { status: 'resolved', claims: { scope: 'organization', orgId: 'org-1', partnerId: null } };
+    window.location.hash = '#domains';
+    render(<OrgSettingsPage orgId="org-1" />);
+    // An old #domains link lands on a notice, never a blank pane or the tab itself.
+    expect(await screen.findByTestId('org-domains-partner-only')).toBeInTheDocument();
+    expect(screen.queryByTestId('org-settings-tab-domains')).toBeNull();
+    expect(screen.queryByTestId('org-domains-tab-stub')).toBeNull();
+  });
+
+  it('does not mount the Domains tab while the scope is still unresolved', async () => {
+    jwtState.current = { status: 'unresolved' };
+    window.location.hash = '#domains';
+    render(<OrgSettingsPage orgId="org-1" />);
+    expect(await screen.findByTestId('org-domains-pending')).toBeInTheDocument();
+    expect(screen.queryByTestId('org-domains-tab-stub')).toBeNull();
+    expect(screen.queryByTestId('org-settings-tab-domains')).toBeNull();
   });
 });

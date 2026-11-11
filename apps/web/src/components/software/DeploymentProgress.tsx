@@ -18,6 +18,9 @@ import type {
   SoftwareDeploymentAggregateStatus,
   SoftwareDeploymentCounts,
 } from "./DeploymentList";
+import { SOFTWARE_INSTALL_SERVER_TIMEOUT_MS, commandOutputExcerpt } from "@breeze/shared";
+import { describeInFlight, type InFlightStage } from "./deploymentInFlight";
+import RestorePointBadge, { type RestorePointBadgeOutcome } from "../restorePoints/RestorePointBadge";
 
 export const DEPLOYMENT_POLL_INTERVAL_MS = 5000;
 const RESULTS_LIMIT = 200;
@@ -47,6 +50,13 @@ type DeploymentResultRow = {
   deviceCommandId?: string | null;
   hostname?: string | null;
   queuedOffline?: boolean;
+  /** #3578: when the server handed the command to the agent (null until then). */
+  sentAt?: string | null;
+  /** #3578: last in-flight stage the agent reported, and when (newer agents only). */
+  agentStage?: string | null;
+  agentStageAt?: string | null;
+  /** #4759 W08: newest System Restore ledger row for this device's install (null when Breeze never asked). */
+  restorePoint?: RestorePointBadgeOutcome | null;
 };
 
 export interface DeploymentProgressProps {
@@ -91,10 +101,51 @@ const resultStatusStyles: Record<
   },
 };
 
+/** Header caption under the percentage: one label per real aggregate status. */
+function headerStatusLabel(d: DeploymentDetail): string {
+  switch (d.status) {
+    case "completed":
+      return i18n.t("policies:software.deploymentProgress.deploymentComplete");
+    case "completed_with_errors":
+      return i18n.t("policies:software.deploymentProgress.completedWithErrors");
+    case "failed":
+      return i18n.t("policies:software.deploymentProgress.failed");
+    case "cancelled":
+      return i18n.t("policies:software.deploymentProgress.cancelled");
+    case "pending": {
+      const at = d.scheduledAt ? Date.parse(d.scheduledAt) : NaN;
+      if (Number.isFinite(at) && at > Date.now()) {
+        return i18n.t("policies:software.deploymentProgress.scheduledFor", {
+          time: formatDateTimeCentral(d.scheduledAt),
+        });
+      }
+      return i18n.t("policies:software.deploymentProgress.inProgress");
+    }
+    default:
+      return i18n.t("policies:software.deploymentProgress.inProgress");
+  }
+}
+
 const queuedOfflineStyle = {
   labelKey: "policies:software.deploymentProgress.queuedOffline",
   color: "bg-amber-500/20 text-amber-700 border-amber-500/40",
 };
+
+/**
+ * #3578: a pending row the agent is working on reads as its stage, not as a
+ * bare "Pending" (see deploymentInFlight.ts for what each stage means).
+ */
+const inFlightStyles: Record<InFlightStage, { labelKey: string; color: string }> = {
+  sent: {
+    labelKey: "policies:software.deploymentProgress.sentToAgent",
+    color: "bg-blue-500/20 text-blue-700 border-blue-500/40",
+  },
+  downloading: resultStatusStyles.downloading,
+  installing: resultStatusStyles.installing,
+  running: resultStatusStyles.running,
+};
+
+const SERVER_TIMEOUT_MINUTES = Math.round(SOFTWARE_INSTALL_SERVER_TIMEOUT_MS / 60_000);
 
 const managerUnavailableStyle = {
   labelKey: "policies:software.deploymentProgress.setupNeeded",
@@ -367,11 +418,7 @@ export default function DeploymentProgress({
               {percent}%
             </p>
             <p className="text-xs text-muted-foreground">
-              {deployment.status === "completed"
-                ? i18n.t(
-                    "policies:software.deploymentProgress.deploymentComplete",
-                  )
-                : i18n.t("policies:software.deploymentProgress.inProgress")}
+              {headerStatusLabel(deployment)}
             </p>
           </div>
         </div>
@@ -508,11 +555,21 @@ export default function DeploymentProgress({
                 const managerUnavailable = isManagerUnavailable(
                   result.errorMessage,
                 );
+                const inFlight = describeInFlight(result);
+                // #10307: the vendor's reason (e.g. ctrld "Invalid provisioning
+                // code") is often only in the output, never in the exit code.
+                // ANSI-stripped, bounded tail; rendered as a text node only.
+                const outputExcerpt =
+                  result.status === "failed"
+                    ? commandOutputExcerpt(result.output)
+                    : null;
                 const style = result.queuedOffline
                   ? queuedOfflineStyle
                   : managerUnavailable
                     ? managerUnavailableStyle
-                    : resultStatusStyles[result.status];
+                    : inFlight
+                      ? inFlightStyles[inFlight.stage]
+                      : resultStatusStyles[result.status];
                 return (
                   <tr
                     key={result.id}
@@ -534,6 +591,37 @@ export default function DeploymentProgress({
                           ? t(/* i18n-dynamic */ style.labelKey)
                           : result.status}
                       </span>
+                      {result.restorePoint && (
+                        <div className="mt-1">
+                          <RestorePointBadge outcome={result.restorePoint} />
+                        </div>
+                      )}
+                      {inFlight && (
+                        <p
+                          className="mt-1 text-xs text-muted-foreground"
+                          data-testid={`deployment-result-elapsed-${result.id}`}
+                        >
+                          {inFlight.elapsedMinutes === 0
+                            ? t("policies:software.deploymentProgress.stageElapsedJustNow")
+                            : t("policies:software.deploymentProgress.stageElapsed", {
+                                count: inFlight.elapsedMinutes,
+                              })}
+                        </p>
+                      )}
+                      {inFlight?.silent && (
+                        <p
+                          className="mt-1 flex max-w-xs items-start gap-1 text-xs text-amber-700"
+                          data-testid={`deployment-result-silent-${result.id}`}
+                        >
+                          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                          <span>
+                            {t("policies:software.deploymentProgress.noAgentUpdate", {
+                              count: inFlight.elapsedMinutes,
+                              timeoutMinutes: SERVER_TIMEOUT_MINUTES,
+                            })}
+                          </span>
+                        </p>
+                      )}
                     </td>
                     <td className="px-4 py-3 text-muted-foreground">
                       {formatDateTime(result.startedAt)}
@@ -567,7 +655,20 @@ export default function DeploymentProgress({
                           {result.errorMessage}
                         </span>
                       ) : (
-                        "—"
+                        !outputExcerpt && "—"
+                      )}
+                      {outputExcerpt && (
+                        <div
+                          className="mt-1 max-w-md"
+                          data-testid={`deployment-result-output-${result.id}`}
+                        >
+                          <p className="text-xs font-medium text-muted-foreground">
+                            {t("policies:software.deploymentProgress.deviceOutputTail")}
+                          </p>
+                          <pre className="mt-0.5 max-h-40 overflow-auto whitespace-pre-wrap break-words rounded border bg-muted/40 px-2 py-1 font-mono text-xs text-foreground">
+                            {outputExcerpt.text}
+                          </pre>
+                        </div>
                       )}
                     </td>
                   </tr>

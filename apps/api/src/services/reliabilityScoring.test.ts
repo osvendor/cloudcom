@@ -429,6 +429,69 @@ describe('mergeRowsIntoDailyBuckets event dedup (#1904)', () => {
     expect(totalCount(map, (b) => b.hardwareErrorCount)).toBe(1);
   });
 
+  it('#7132: isGenuineHardwareError rejects FilterManager disk stamps regardless of event ID', () => {
+    const { isGenuineHardwareError } = reliabilityScoringInternals;
+    // Pre-#6696 agents matched the bare word "disk" in the raw message
+    // ("...failed to attach to volume \Device\HarddiskVolume1...") and stamped
+    // type="disk" no matter the event ID. FilterManager's event 3 is not in the
+    // bare-ID collision set {7,11,13,15,50,51}, so the existing bare-ID gate
+    // never catches it — this is the exact shape from issue #7132.
+    expect(isGenuineHardwareError({
+      source: 'Microsoft-Windows-FilterManager', type: 'disk', eventId: '3:98765',
+    } as any)).toBe(false);
+    // Same provider, a different (still non-bare) event ID — still denied.
+    expect(isGenuineHardwareError({
+      source: 'Microsoft-Windows-FilterManager', type: 'memory', eventId: '9:1',
+    } as any)).toBe(false);
+    // Other named software providers from the issue's suggested fix are denied too.
+    expect(isGenuineHardwareError({
+      source: 'Volume Shadow Copy', type: 'disk', eventId: '8224:1',
+    } as any)).toBe(false);
+    expect(isGenuineHardwareError({
+      source: 'Microsoft-Windows-DistributedCOM', type: 'memory', eventId: '10010:1',
+    } as any)).toBe(false);
+  });
+
+  it('#7132: a FilterManager event-3 burst no longer pins hardwareErrorCount', () => {
+    // 50 identical FilterManager event-3 rows in a ~1s burst, exactly the
+    // pre-#6696-shaped stamp from device_reliability_history in the issue.
+    const hardwareErrors = Array.from({ length: 50 }, (_, i) => ({
+      type: 'disk',
+      severity: 'error',
+      source: 'Microsoft-Windows-FilterManager',
+      eventId: `3:${1000 + i}`,
+      timestamp: `2026-09-10T01:26:${String(i % 60).padStart(2, '0')}.000Z`,
+    }));
+    const rows = [makeHistoryRow({ hardwareErrors })] as any[];
+
+    const map = new Map<string, any>();
+    mergeRowsIntoDailyBuckets(map, rows as any);
+
+    expect(totalCount(map, (b) => b.hardwareErrorCount)).toBe(0);
+  });
+
+  it('#7132: every denylisted software provider is zeroed out at the aggregation chokepoint, not just at the predicate', () => {
+    // The bug was about STORED/aggregated stamps, not just the isolated
+    // predicate — prove each denylisted provider is excluded all the way
+    // through mergeRowsIntoDailyBuckets, the actual scoring path.
+    const rows = [
+      makeHistoryRow({
+        hardwareErrors: [
+          { type: 'disk', severity: 'error', source: 'Volume Shadow Copy', eventId: '8224:1', timestamp: '2026-09-10T01:26:00.000Z' },
+          { type: 'memory', severity: 'error', source: 'Microsoft-Windows-DistributedCOM', eventId: '10010:1', timestamp: '2026-09-10T01:27:00.000Z' },
+          { type: 'disk', severity: 'error', source: 'Service Control Manager', eventId: '7000:1', timestamp: '2026-09-10T01:28:00.000Z' },
+          // One genuine hardware fault must still survive the same batch.
+          { type: 'disk', severity: 'critical', source: 'nvme', eventId: '11:1', timestamp: '2026-09-10T01:29:00.000Z' },
+        ],
+      }),
+    ] as any[];
+
+    const map = new Map<string, any>();
+    mergeRowsIntoDailyBuckets(map, rows as any);
+
+    expect(totalCount(map, (b) => b.hardwareErrorCount)).toBe(1);
+  });
+
   it('tracks Breeze self service failures as a subset of serviceFailureCount', () => {
     const rows = [
       makeHistoryRow({
@@ -459,6 +522,20 @@ describe('mergeRowsIntoDailyBuckets event dedup (#1904)', () => {
     expect(isBreezeSelfServiceFailure('BreezeWorks Sync')).toBe(false);
     expect(isBreezeSelfServiceFailure(undefined)).toBe(false);
     expect(isBreezeSelfServiceFailure('')).toBe(false);
+  });
+
+  it('isBreezeSelfServiceFailure keys on the fixed service names, independent of any display name', () => {
+    const { isBreezeSelfServiceFailure, BREEZE_FIXED_SERVICE_NAMES } = reliabilityScoringInternals;
+    // The collector reports these fixed names for a branded agent/watchdog (an
+    // MSP's display name never reaches the API), so they must always match.
+    expect(BREEZE_FIXED_SERVICE_NAMES).toEqual(['BreezeAgent', 'BreezeWatchdog']);
+    for (const name of BREEZE_FIXED_SERVICE_NAMES) {
+      expect(isBreezeSelfServiceFailure(name)).toBe(true);
+      expect(isBreezeSelfServiceFailure(name.toLowerCase())).toBe(true);
+    }
+    // A branded display name that does not carry the fixed name is not
+    // recognised here; that is why the collector normalises it first.
+    expect(isBreezeSelfServiceFailure('Example MSP Agent')).toBe(false);
   });
 
   it('tracks app_crash as a downweighted subset of crashCount', () => {
@@ -1605,5 +1682,44 @@ describe('aggregateReliabilityOffenders', () => {
     // Without a window the old re-report is still counted (pure aggregation).
     const unfiltered = aggregateReliabilityOffenders(rows);
     expect(unfiltered.services.map((offender) => offender.label).sort()).toEqual(['InWindow', 'OldReReport']);
+  });
+});
+
+describe('applyBaselineToRows (#5876)', () => {
+  const baselineAt = new Date('2026-02-20T12:00:00.000Z');
+  it('drops rows collected before the marker entirely', () => {
+    const rows = [
+      makeHistoryRow({ collectedAt: new Date('2026-02-20T11:59:59.000Z'), crashEvents: [{ type: 'bsod', timestamp: '2026-02-20T11:00:00.000Z' }] }),
+      makeHistoryRow({ collectedAt: new Date('2026-02-21T10:00:00.000Z') }),
+    ];
+    const out = reliabilityScoringInternals.applyBaselineToRows(rows as any, baselineAt);
+    expect(out).toHaveLength(1);
+    expect(out[0]!.collectedAt.toISOString()).toBe('2026-02-21T10:00:00.000Z');
+  });
+  it('drops pre-marker events carried in a post-marker row and keeps post-marker events', () => {
+    const rows = [makeHistoryRow({
+      collectedAt: new Date('2026-02-21T10:00:00.000Z'),
+      crashEvents: [
+        { type: 'bsod', timestamp: '2026-02-20T09:00:00.000Z' },
+        { type: 'bsod', timestamp: '2026-02-21T09:00:00.000Z' },
+      ],
+      appHangs: [{ processName: 'a', timestamp: '2026-02-20T11:00:00.000Z', duration: 5, resolved: true }],
+      serviceFailures: [{ serviceName: 's', timestamp: '2026-02-20T13:00:00.000Z', recovered: false }],
+      hardwareErrors: [{ type: 'disk', severity: 'error', source: 'disk', timestamp: '2026-02-19T00:00:00.000Z' }],
+    })];
+    const [row] = reliabilityScoringInternals.applyBaselineToRows(rows as any, baselineAt);
+    expect(row!.crashEvents.map((e: any) => e.timestamp)).toEqual(['2026-02-21T09:00:00.000Z']);
+    expect(row!.appHangs).toEqual([]);
+    expect(row!.serviceFailures).toHaveLength(1);
+    expect(row!.hardwareErrors).toEqual([]);
+  });
+  it('falls back to collectedAt for events with a missing or unparseable timestamp', () => {
+    const rows = [makeHistoryRow({ collectedAt: new Date('2026-02-21T10:00:00.000Z'), crashEvents: [{ type: 'bsod' }, { type: 'bsod', timestamp: 'garbage' }] })];
+    const [row] = reliabilityScoringInternals.applyBaselineToRows(rows as any, baselineAt);
+    expect(row!.crashEvents).toHaveLength(2);
+  });
+  it('is the identity when there is no marker', () => {
+    const rows = [makeHistoryRow({})];
+    expect(reliabilityScoringInternals.applyBaselineToRows(rows as any, null)).toBe(rows);
   });
 });

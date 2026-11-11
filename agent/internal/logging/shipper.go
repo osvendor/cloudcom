@@ -5,7 +5,6 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -73,14 +72,50 @@ type Shipper struct {
 	stopChan     chan struct{}
 	wg           sync.WaitGroup
 	stopOnce     sync.Once
-	minLevel     slog.Level
-	mu           sync.RWMutex // protects minLevel
+	minLevel     slog.Level   // configured base level; see SetMinLevel
+	mu           sync.RWMutex // protects minLevel, override*
+	// overrideLevel/overrideExpiresAt hold a temporary set_log_level override
+	// (#7416). It wins over minLevel until overrideExpiresAt, after which
+	// ShouldShip falls back to minLevel with no timer involved. A zero
+	// overrideExpiresAt means no override.
+	overrideLevel     slog.Level
+	overrideExpiresAt time.Time
+	// overrideSetAt is when the command that produced the override ran. A
+	// persisted override replaces the in-memory one only if it is at least
+	// as new, so a stale file cannot displace a newer override whose write
+	// failed.
+	overrideSetAt time.Time
+	// overridePath is the persisted override file (LevelOverrideFileName);
+	// empty disables persistence and polling.
+	overridePath string
+	// overrideReadErrLogged rate-limits the "cannot read override file"
+	// warning to once per shipper.
+	overrideReadErrLogged atomic.Bool
+	// now is the clock; nil means time.Now (tests inject a fixed clock).
+	now          func() time.Time
 	droppedCount atomic.Int64
 	// urlErrCount rate-limits the unresolvable-server-URL report. That state
 	// never self-heals, so an unguarded stderr write would emit a line on every
 	// flush for the process lifetime.
 	urlErrCount atomic.Int64
 	authMon     AuthSkipper
+	// lastAttempt is the last terminal chunk outcome (shipper_health.go):
+	// one immutable record behind one pointer, so snapshots never tear.
+	lastAttempt atomic.Pointer[attemptRecord]
+	// pendingBatch is the size of the batch shipLoop holds in hand while
+	// shipBatch runs; 0 otherwise. Counted in QueueDepth.
+	pendingBatch atomic.Int32
+	// retryMu guards notBefore and deferLogged. shipChunk (sets) and shipLoop
+	// (reads) run on one goroutine today, but Stop-path drains and tests call
+	// shipBatch from others, so the carried hint is mutex-guarded.
+	retryMu sync.Mutex
+	// notBefore is the earliest time the next batch may be posted: the
+	// server's (jittered, capped) Retry-After from a chunk we gave up on.
+	// Zero means nothing is carried. See carryRetryAfter / shipDeferred.
+	notBefore time.Time
+	// deferLogged is true once the current deferral has been announced on
+	// stderr, so the line is emitted once per deferral, not once per tick.
+	deferLogged bool
 }
 
 // ShipperConfig configures the log shipper.
@@ -104,6 +139,12 @@ type ShipperConfig struct {
 	HTTPClient   *http.Client
 	MinLevel     string // "debug", "info", "warn", "error"
 	AuthMonitor  AuthSkipper
+	// LevelOverridePath is the persisted set_log_level override file
+	// (filepath.Join(config.ConfigDir(), LevelOverrideFileName)). When set,
+	// the shipper applies an active override at Start and re-reads the file
+	// every levelOverridePollInterval, so an override outlives a restart and
+	// reaches helper processes (#7416). Empty disables both.
+	LevelOverridePath string
 }
 
 // NewShipper creates a new log shipper.
@@ -122,6 +163,7 @@ func NewShipper(cfg ShipperConfig) *Shipper {
 		stopChan:     make(chan struct{}),
 		minLevel:     parseLevel(cfg.MinLevel),
 		authMon:      cfg.AuthMonitor,
+		overridePath: cfg.LevelOverridePath,
 	}
 }
 
@@ -135,17 +177,24 @@ func NewShipper(cfg ShipperConfig) *Shipper {
 // relative URL that fails forever as a cryptic transport error.
 func (s *Shipper) resolveServerURL() (string, error) {
 	if s.serverURL == nil {
-		return "", errors.New("log shipper: ServerURL provider not set")
+		return "", fmt.Errorf("%w: ServerURL provider not set", errShipURLUnresolved)
 	}
 	serverURL := s.serverURL()
 	if serverURL == "" {
-		return "", errors.New("log shipper: ServerURL provider returned an empty server URL")
+		return "", fmt.Errorf("%w: ServerURL provider returned an empty server URL", errShipURLUnresolved)
 	}
 	return serverURL, nil
 }
 
 // Start begins the background shipping loop.
 func (s *Shipper) Start() {
+	if s.overridePath != "" {
+		// Synchronously, so a restarted process ships at the override level
+		// from its first log line rather than one poll interval later.
+		s.refreshLevelOverride()
+		s.wg.Add(1)
+		go s.overrideLoop()
+	}
 	s.wg.Add(1)
 	go s.shipLoop()
 }
@@ -255,32 +304,147 @@ func (s *Shipper) SetMinLevel(level string) {
 	s.minLevel = parseLevel(level)
 }
 
-// ShouldShip returns true if the given level meets the minimum threshold.
+// ShouldShip returns true if the given level meets the effective threshold:
+// an active override when there is one, otherwise the base level.
 func (s *Shipper) ShouldShip(level slog.Level) bool {
 	s.mu.RLock()
+	floor := s.minLevel
+	if !s.overrideExpiresAt.IsZero() && s.clock().Before(s.overrideExpiresAt) {
+		floor = s.overrideLevel
+	}
+	s.mu.RUnlock()
+	return level >= floor
+}
+
+func (s *Shipper) clock() time.Time {
+	if s.now != nil {
+		return s.now()
+	}
+	return time.Now()
+}
+
+// setLevelOverride installs an override that expires at expiresAt, set by a
+// command that ran at setAt.
+func (s *Shipper) setLevelOverride(level slog.Level, expiresAt, setAt time.Time) {
+	s.mu.Lock()
+	s.overrideLevel = level
+	s.overrideExpiresAt = expiresAt
+	s.overrideSetAt = setAt
+	s.mu.Unlock()
+}
+
+func (s *Shipper) baseLevelName() string {
+	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return level >= s.minLevel
+	return levelName(s.minLevel)
+}
+
+// refreshLevelOverride applies the persisted override when it is active, at
+// least as new as the one in memory, and different from it. An absent or
+// expired file changes nothing (see leveloverride.go); an untrustworthy one
+// is reported once per bad spell and ignored.
+//
+// Never call this while holding shipperMu: it logs, and the log record goes
+// through shippingHandler.Handle, which read-locks shipperMu.
+func (s *Shipper) refreshLevelOverride() {
+	o, ok, err := ReadLevelOverride(s.overridePath, s.clock())
+	if err != nil {
+		if s.overrideReadErrLogged.CompareAndSwap(false, true) {
+			slog.Warn("ignoring log shipping level override file",
+				"path", s.overridePath, "error", err.Error())
+		}
+		return
+	}
+	// A good read (including "no file" and "expired") re-arms the warning,
+	// so a later bad file is reported again.
+	s.overrideReadErrLogged.Store(false)
+	if !ok {
+		return
+	}
+	level := parseLevel(o.Level)
+	s.mu.Lock()
+	changed := !o.SetAt.Before(s.overrideSetAt) &&
+		(s.overrideLevel != level || !s.overrideExpiresAt.Equal(o.ExpiresAt))
+	if changed {
+		s.overrideLevel = level
+		s.overrideExpiresAt = o.ExpiresAt
+		s.overrideSetAt = o.SetAt
+	}
+	base := s.minLevel
+	s.mu.Unlock()
+	if changed {
+		// Logged outside s.mu: the record re-enters ShouldShip.
+		slog.Info("log shipping level override applied",
+			"level", o.Level, "baseLevel", levelName(base),
+			"expiresAt", o.ExpiresAt.Format(time.RFC3339))
+	}
+}
+
+// overrideLoop re-reads the override file until Stop, and announces the
+// moment an active override lapses back to the base level.
+func (s *Shipper) overrideLoop() {
+	defer s.wg.Done()
+	ticker := time.NewTicker(levelOverridePollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.stopChan:
+			return
+		case <-ticker.C:
+			s.expireLevelOverride()
+			s.refreshLevelOverride()
+		}
+	}
+}
+
+// expireLevelOverride clears an override whose expiry has passed so the
+// reversion is logged exactly once.
+func (s *Shipper) expireLevelOverride() {
+	s.mu.Lock()
+	expired := !s.overrideExpiresAt.IsZero() && !s.clock().Before(s.overrideExpiresAt)
+	var level, base slog.Level
+	if expired {
+		level, base = s.overrideLevel, s.minLevel
+		s.overrideExpiresAt = time.Time{}
+	}
+	s.mu.Unlock()
+	if expired {
+		slog.Info("log shipping level override expired; reverted to base level",
+			"overrideLevel", levelName(level), "baseLevel", levelName(base))
+	}
 }
 
 func (s *Shipper) shipLoop() {
 	defer s.wg.Done()
 
-	ticker := time.NewTicker(defaultBatchInterval)
-	defer ticker.Stop()
+	tick, stopTick := shipperTick(defaultBatchInterval)
+	defer stopTick()
 
 	batch := make([]LogEntry, 0, defaultMaxBatchSize)
 
 	for {
+		// While a Retry-After hold keeps a full batch unshipped, stop pulling
+		// from the buffer (nil channel never selects) instead of growing the
+		// batch: the 500-entry buffer then fills and Enqueue drops-when-full
+		// with its existing accounting, so memory stays bounded.
+		in := s.buffer
+		if len(batch) >= defaultMaxBatchSize {
+			in = nil
+		}
+
 		select {
 		case <-s.stopChan:
-			// Drain remaining buffered entries
+			// Drain remaining buffered entries. Deliberately ignores any
+			// Retry-After hold: shutdown ships what it can, retrying a
+			// transient failure with the short fixed backoff but never
+			// waiting out a long server Retry-After (see sleep).
 		drain:
 			for {
 				select {
 				case entry := <-s.buffer:
 					batch = append(batch, entry)
 					if len(batch) >= defaultMaxBatchSize {
-						s.shipBatch(batch)
+						s.shipHeld(batch)
 						clear(batch)
 						batch = batch[:0]
 					}
@@ -289,23 +453,23 @@ func (s *Shipper) shipLoop() {
 				}
 			}
 			if len(batch) > 0 {
-				s.shipBatch(batch)
+				s.shipHeld(batch)
 			}
 			return
 
-		case entry := <-s.buffer:
+		case entry := <-in:
 			batch = append(batch, entry)
-			if len(batch) >= defaultMaxBatchSize {
-				s.shipBatch(batch)
+			if len(batch) >= defaultMaxBatchSize && !s.shipDeferred() {
+				s.shipHeld(batch)
 				// Release strings and field maps before reusing the backing array.
 				// shipBatch has finished; any re-buffered entries are value copies.
 				clear(batch)
 				batch = batch[:0]
 			}
 
-		case <-ticker.C:
-			if len(batch) > 0 {
-				s.shipBatch(batch)
+		case <-tick:
+			if len(batch) > 0 && !s.shipDeferred() {
+				s.shipHeld(batch)
 				clear(batch)
 				batch = batch[:0]
 			}
@@ -316,7 +480,105 @@ func (s *Shipper) shipLoop() {
 const (
 	shipRetryCount   = 2
 	shipRetryBackoff = 1 * time.Second
+	// retryAfterJitterFrac stretches a server Retry-After by up to +30% so a
+	// fleet told "wait 40 s" does not return in lockstep.
+	retryAfterJitterFrac = 0.3
 )
+
+// Test seams (W09, #8148). Tests swap these and must not run in parallel.
+var (
+	shipperNow   = time.Now
+	shipperAfter = time.After
+	shipperRand  = rand.Float64
+	// shipperTick supplies the flush tick channel and its stop func.
+	shipperTick = func(d time.Duration) (<-chan time.Time, func()) {
+		t := time.NewTicker(d)
+		return t.C, t.Stop
+	}
+)
+
+// loopRetryAfterDisabled is the D10 escape hatch, inverted so the zero value
+// means the feature is ON.
+var loopRetryAfterDisabled atomic.Bool
+
+// SetLoopRetryAfter enables (default) or disables carrying a server
+// Retry-After across batches. When disabled, a chunk given up on forgets the
+// hint, as before W09; in-loop retry waits stay cancellable either way.
+func SetLoopRetryAfter(enabled bool) {
+	loopRetryAfterDisabled.Store(!enabled)
+}
+
+// shipDrainMaxRetryWait is the longest retry wait the shutdown drain still
+// sits through: the fixed backoff plus its jitter. A longer server
+// Retry-After is not waited out once Stop has run.
+const shipDrainMaxRetryWait = shipRetryBackoff + shipRetryBackoff/2
+
+// sleep waits d or until the shipper is stopped. It returns false if stopped.
+// Once stopped (the shutdown drain), a wait no longer than the fixed backoff
+// still runs, so the final flush rides out a transient failure as it did
+// before the waits became cancellable (W09, #8148).
+func (s *Shipper) sleep(d time.Duration) bool {
+	if d <= shipDrainMaxRetryWait {
+		<-shipperAfter(d) // short: bounded, and the same with or without Stop
+		return true
+	}
+	select {
+	case <-s.stopChan:
+		return false
+	default:
+	}
+	select {
+	case <-s.stopChan:
+		return false
+	case <-shipperAfter(d):
+		return true
+	}
+}
+
+// jitterRetryAfter returns ra x (1 + 0.3 x rand) clamped to retryAfterMaxCap.
+// Computed once per hint and reused for the in-loop wait and the carried hold.
+func jitterRetryAfter(ra time.Duration) time.Duration {
+	d := time.Duration(float64(ra) * (1 + retryAfterJitterFrac*shipperRand()))
+	if d > retryAfterMaxCap {
+		d = retryAfterMaxCap
+	}
+	return d
+}
+
+// carryRetryAfter records that no batch should be posted for d, keeping the
+// later of any existing hold. No-op when the loop hint is disabled.
+func (s *Shipper) carryRetryAfter(d time.Duration) {
+	if d <= 0 || loopRetryAfterDisabled.Load() {
+		return
+	}
+	nb := shipperNow().Add(d)
+	s.retryMu.Lock()
+	if nb.After(s.notBefore) {
+		s.notBefore = nb
+		s.deferLogged = false
+	}
+	s.retryMu.Unlock()
+}
+
+// shipDeferred reports whether the ship loop must hold its batch because the
+// server asked us to back off. Logs once per deferral. Only the ticker and
+// batch-full paths consult it; the shutdown drain deliberately does not.
+func (s *Shipper) shipDeferred() bool {
+	now := shipperNow()
+	s.retryMu.Lock()
+	defer s.retryMu.Unlock()
+	if !now.Before(s.notBefore) {
+		s.notBefore = time.Time{}
+		s.deferLogged = false
+		return false
+	}
+	if !s.deferLogged {
+		s.deferLogged = true
+		fmt.Fprintf(os.Stderr, "[log-shipper] deferring log shipping for %v (server Retry-After)\n",
+			s.notBefore.Sub(now).Round(time.Second))
+	}
+	return true
+}
 
 // shipBatch ships a flushed batch, splitting it into chunks of at most
 // maxEntriesPerShipRequest entries per HTTP request — the API rejects any
@@ -399,6 +661,7 @@ func (s *Shipper) shipChunk(entries []LogEntry) bool {
 		if s.urlErrCount.Add(1)%10 == 1 {
 			fmt.Fprintf(os.Stderr, "[log-shipper] %v — dropped %d entries (%d total)\n", err, len(entries), dropped)
 		}
+		s.recordShipFailure(sanitizeShipError(err, 0))
 		return false
 	}
 	url := fmt.Sprintf("%s/api/v1/agents/%s/logs", baseURL, s.agentID)
@@ -409,6 +672,7 @@ func (s *Shipper) shipChunk(entries []LogEntry) bool {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[log-shipper] marshal error: %v\n", err)
 		s.droppedCount.Add(int64(len(entries)))
+		s.recordShipFailure(sanitizeShipError(err, 0))
 		return true
 	}
 
@@ -418,11 +682,13 @@ func (s *Shipper) shipChunk(entries []LogEntry) bool {
 	if _, err := gw.Write(payload); err != nil {
 		fmt.Fprintf(os.Stderr, "[log-shipper] gzip write error: %v\n", err)
 		s.droppedCount.Add(int64(len(entries)))
+		s.recordShipFailure(sanitizeShipError(err, 0))
 		return true
 	}
 	if err := gw.Close(); err != nil {
 		fmt.Fprintf(os.Stderr, "[log-shipper] gzip close error: %v\n", err)
 		s.droppedCount.Add(int64(len(entries)))
+		s.recordShipFailure(sanitizeShipError(err, 0))
 		return true
 	}
 	compressedBytes := compressed.Bytes()
@@ -430,15 +696,24 @@ func (s *Shipper) shipChunk(entries []LogEntry) bool {
 	// nextSleepOverride, if non-zero, replaces the default fixed-jitter sleep
 	// for the next retry. Set when the server sends Retry-After on 429/503.
 	var nextSleepOverride time.Duration
+	// lastStatus is the most recent retryable HTTP status, for the failure
+	// record when a wait is cut short by shutdown.
+	lastStatus := 0
 
 	for attempt := 0; attempt <= shipRetryCount; attempt++ {
 		if attempt > 0 {
+			wait := shipRetryBackoff + time.Duration(rand.Intn(int(shipRetryBackoff/2)))
 			if nextSleepOverride > 0 {
-				time.Sleep(nextSleepOverride)
+				wait = nextSleepOverride
 				nextSleepOverride = 0
-			} else {
-				jitter := time.Duration(rand.Intn(int(shipRetryBackoff / 2)))
-				time.Sleep(shipRetryBackoff + jitter)
+			}
+			if !s.sleep(wait) {
+				// Shutdown mid-retry: this chunk is lost like any other
+				// terminal drop; the caller drops the remaining chunks.
+				fmt.Fprintf(os.Stderr, "[log-shipper] shutdown during retry wait; dropping %d entries\n", len(entries))
+				s.droppedCount.Add(int64(len(entries)))
+				s.recordShipFailure(sanitizeShipError(nil, lastStatus))
+				return false
 			}
 		}
 
@@ -448,6 +723,7 @@ func (s *Shipper) shipChunk(entries []LogEntry) bool {
 			cancel()
 			fmt.Fprintf(os.Stderr, "[log-shipper] request build error: %v\n", err)
 			s.droppedCount.Add(int64(len(entries)))
+			s.recordShipFailure(sanitizeShipError(err, 0))
 			return true
 		}
 
@@ -465,14 +741,16 @@ func (s *Shipper) shipChunk(entries []LogEntry) bool {
 			}
 			fmt.Fprintf(os.Stderr, "[log-shipper] HTTP error (giving up after %d attempts): %v\n", shipRetryCount+1, err)
 			s.droppedCount.Add(int64(len(entries)))
+			s.recordShipFailure(sanitizeShipError(err, 0))
 			return false
 		}
 
 		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable {
 			// 429/503: retryable, and may carry Retry-After.
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-			if ra := parseRetryAfter(resp.Header, time.Now()); ra > 0 {
-				nextSleepOverride = ra
+			lastStatus = resp.StatusCode
+			if ra := parseRetryAfter(resp.Header, shipperNow()); ra > 0 {
+				nextSleepOverride = jitterRetryAfter(ra)
 			}
 			resp.Body.Close()
 			cancel()
@@ -484,6 +762,10 @@ func (s *Shipper) shipChunk(entries []LogEntry) bool {
 			fmt.Fprintf(os.Stderr, "[log-shipper] server returned %d (giving up after %d attempts): %s\n",
 				resp.StatusCode, shipRetryCount+1, string(body))
 			s.droppedCount.Add(int64(len(entries)))
+			s.recordShipFailure(sanitizeShipError(nil, resp.StatusCode))
+			// The chunk is lost but the server's ask stands: hold the next
+			// batch until it has passed (jittered once, capped at 300 s).
+			s.carryRetryAfter(nextSleepOverride)
 			return false
 		}
 
@@ -500,6 +782,7 @@ func (s *Shipper) shipChunk(entries []LogEntry) bool {
 			fmt.Fprintf(os.Stderr, "[log-shipper] server returned %d (giving up after %d attempts): %s\n",
 				resp.StatusCode, shipRetryCount+1, string(body))
 			s.droppedCount.Add(int64(len(entries)))
+			s.recordShipFailure(sanitizeShipError(nil, resp.StatusCode))
 			return false
 		}
 
@@ -511,6 +794,7 @@ func (s *Shipper) shipChunk(entries []LogEntry) bool {
 			fmt.Fprintf(os.Stderr, "[log-shipper] server returned %d for %d entries: %s\n",
 				resp.StatusCode, len(entries), string(body))
 			s.droppedCount.Add(int64(len(entries)))
+			s.recordShipFailure(sanitizeShipError(nil, resp.StatusCode))
 			if resp.StatusCode == http.StatusUnauthorized {
 				// Auth is request-independent: the token won't get healthier
 				// between chunks, so shipping the batch's remaining chunks
@@ -534,6 +818,7 @@ func (s *Shipper) shipChunk(entries []LogEntry) bool {
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 		cancel()
+		s.recordShipSuccess()
 		if s.authMon != nil {
 			s.authMon.RecordSuccess()
 		}

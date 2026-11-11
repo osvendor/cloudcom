@@ -89,19 +89,6 @@ vi.mock('../services/sso', () => ({
     }
     return { ok: true };
   }),
-  // Real logic (not a stub), same reasoning as above: this is the conversion
-  // that puts the session's created_at on the same clock as the id_token's
-  // auth_time. A stub returning `undefined` would make the freshness bound
-  // NaN-ish and the timezone test below meaningless.
-  //
-  // Wrapped in vi.fn() so the CALL ITSELF is observable. Every value-based
-  // assertion about this conversion is vacuous under TZ=UTC — the offset is 0,
-  // so the converted bound and a naive `.getTime()` are the SAME number and a
-  // reverted call site still passes. That is exactly how the missing conversion
-  // shipped past a green (UTC) CI run. Asserting that the route CALLED this,
-  // with the session's own createdAt, has teeth in every host timezone.
-  utcMsFromOffsetlessTimestamp: vi.fn((value: Date) =>
-    value.getTime() - value.getTimezoneOffset() * 60_000),
   mapUserAttributes: vi.fn(),
   discoverOIDCConfig: vi.fn(),
   // Real logic (not a stub) — getOIDCConfig (defined in sso.ts, not mocked)
@@ -226,18 +213,18 @@ import {
   exchangeCodeForTokens,
   getUserInfo,
   mapUserAttributes,
-  utcMsFromOffsetlessTimestamp,
   verifyIdTokenSignature,
 } from '../services/sso';
 import { mintStepUpGrant } from '../services/mfaStepUpGrant';
-import { writeRouteAudit } from '../services/auditEvents';
+import { derivePartnerAttribution, writeRouteAudit } from '../services/auditEvents';
 import { authMiddleware } from '../middleware/auth';
-import { pgOffsetlessTimestamp } from '../testUtils/pgOffsetlessTimestamp';
+import { withHostTimeZone } from '../testUtils/hostTimeZone';
 
 const USER_ID = '00000000-0000-4000-8000-000000000020';
 const OTHER_USER_ID = '00000000-0000-4000-8000-0000000000aa';
 const PROVIDER_ID = '00000000-0000-4000-8000-000000000001';
 const ORG_ID = '00000000-0000-4000-8000-000000000010';
+const PARTNER_ID = '00000000-0000-4000-8000-0000000000b0';
 const SID = '00000000-0000-4000-8000-0000000000fa';
 
 const ACTIVE_OIDC_PROVIDER = {
@@ -259,6 +246,21 @@ const ACTIVE_OIDC_PROVIDER = {
   attributeMapping: { email: 'email', name: 'name' },
   defaultRoleId: null
 };
+
+// A partner-axis provider (DB CHECK: org_id XOR partner_id).
+const PARTNER_OIDC_PROVIDER = { ...ACTIVE_OIDC_PROVIDER, orgId: null, partnerId: PARTNER_ID };
+
+// #9377: the partner_id the audit row would PERSIST for this writeRouteAudit
+// call. writeRouteAudit is mocked here, so feed its argument to the real
+// derivation with a no-auth, no-ambient-scope context — exactly the state of
+// the unauthenticated /callback, where the only attribution source left is an
+// explicit top-level `partnerId` (a `details.partnerId` is not one).
+const persistedPartnerIdFor = (action: string, reason?: string): Array<string | null> =>
+  vi.mocked(writeRouteAudit).mock.calls
+    .map(([, event]) => event)
+    .filter((event) => event.action === action
+      && (reason === undefined || (event.details as { reason?: unknown } | undefined)?.reason === reason))
+    .map((event) => derivePartnerAttribution({ req: { header: () => undefined } } as any, event));
 
 describe('POST /sso/reauth/start', () => {
   let app: Hono;
@@ -397,6 +399,26 @@ describe('POST /sso/reauth/start', () => {
     expect(withSystemDbAccessContext).toHaveBeenCalled();
   });
 
+  // #9377: symmetric with the callback rows below — the started row names the
+  // provider's partner explicitly instead of relying on the caller's scope.
+  it('attributes sso.reauth.started to the partner for a partner-level provider', async () => {
+    mockUserRow({ id: USER_ID, passwordHash: null });
+    mockSsoIdentityRows([{ providerId: PROVIDER_ID }]);
+    mockProviderRow(PARTNER_OIDC_PROVIDER);
+    captureInsert();
+
+    const res = await app.request('/sso/reauth/start', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer token' }
+    });
+
+    expect(res.status).toBe(200);
+    expect(writeRouteAudit).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ action: 'sso.reauth.started', orgId: null, partnerId: PARTNER_ID })
+    );
+  });
+
   // #4018 Finding 1: the entire plan hinges on this route NOT being gated by
   // requireMfa() — a passwordless SSO user cannot satisfy it, which is why
   // this route exists. The requireMfa mock above (module-level) is wired to
@@ -508,14 +530,13 @@ describe('GET /sso/callback — reauth mode (#4018)', () => {
   //   2. users                  (validateSessionBinding: the bound user)
   //   3. organizationUsers      (validateSessionBinding: org-axis membership)
   //   4. userSsoIdentities      (reauth branch: (provider, sub) ownership)
+  //   5. users + user_passkeys  (#4045: userIsMfaProtected picks the purpose)
   // Every test funnels through here so that ordering lives in one place.
   const primeReauthCallback = (opts: {
-    // A TRUE epoch. It is deliberately not a Date: the row's created_at is
-    // built from it via pgOffsetlessTimestamp so that every test in this suite
-    // sees the session exactly as postgres.js delivers it from a `timestamp
-    // without time zone` column, rather than the true-instant Date a hand-rolled
-    // `new Date(...)` would produce. Handing in a Date here is what let the
-    // freshness bound be compared on the wrong clock with the suite still green.
+    // Epoch ms of the /reauth/start click. The row's created_at is
+    // `new Date(sessionCreatedAtMs)`: Drizzle decodes the offsetless
+    // `sso_sessions.created_at` column as UTC, so that is the Date the route
+    // receives on any host.
     sessionCreatedAtMs?: number;
     idClaims?: Record<string, unknown>;
     sessionOverrides?: Record<string, unknown>;
@@ -526,6 +547,9 @@ describe('GET /sso/callback — reauth mode (#4018)', () => {
     // undefined = the identity belongs to the reauth user; [] = no identity.
     identityRows?: Array<{ userId: string }>;
     provider?: Record<string, unknown>;
+    // #4045: the userIsMfaProtected probe that picks the grant's purpose.
+    // undefined = no factor (enroll_first_factor).
+    protection?: { mfaEnabled: boolean; passkeyCount: number };
   } = {}) => {
     const {
       sessionCreatedAtMs = Date.now(),
@@ -534,6 +558,7 @@ describe('GET /sso/callback — reauth mode (#4018)', () => {
       membership = [{ userId: USER_ID }],
       identityRows = [{ userId: USER_ID }],
       provider = ACTIVE_OIDC_PROVIDER,
+      protection = { mfaEnabled: false, passkeyCount: 0 },
     } = opts;
     const idClaims = opts.idClaims ?? {
       sub: EXTERNAL_ID,
@@ -565,7 +590,7 @@ describe('GET /sso/callback — reauth mode (#4018)', () => {
       initiatingAuthEpoch: 3,
       initiatingMfaEpoch: 1,
       initiatingSessionId: SID,
-      createdAt: pgOffsetlessTimestamp(sessionCreatedAtMs),
+      createdAt: new Date(sessionCreatedAtMs),
       expiresAt: new Date(Date.now() + 10 * 60 * 1000),
       ...sessionOverrides,
     };
@@ -580,7 +605,8 @@ describe('GET /sso/callback — reauth mode (#4018)', () => {
       .mockReturnValueOnce(sel([provider]))
       .mockReturnValueOnce(sel(reauthUser ? [reauthUser] : []))
       .mockReturnValueOnce(sel(membership))
-      .mockReturnValueOnce(sel(identityRows));
+      .mockReturnValueOnce(sel(identityRows))
+      .mockReturnValueOnce(sel([protection]));
 
     return { session, idClaims };
   };
@@ -649,8 +675,7 @@ describe('GET /sso/callback — reauth mode (#4018)', () => {
 
     const res = await doCallback();
 
-    // The TRUE epoch of the click — not `createdAt.getTime()`, which is that
-    // epoch plus the host's UTC offset (see the timezone test below).
+    // The epoch of the click itself (see the host-zone tests below).
     expect(assertFreshIdpAuthentication).toHaveBeenCalledWith(idClaims, sessionCreatedAtMs);
     expect(res.headers.get('location')).toBe('/settings/profile#ssoReauthGrant=grant-abc');
   });
@@ -674,54 +699,49 @@ describe('GET /sso/callback — reauth mode (#4018)', () => {
     expect(mintStepUpGrant).not.toHaveBeenCalled();
   });
 
-  // sso_sessions.created_at is `timestamp without time zone`, and postgres.js
-  // parses an offsetless value as LOCAL time — so `createdAt.getTime()` is the
-  // true epoch plus the HOST's UTC offset, while the id_token's auth_time is a
-  // true UTC epoch. Comparing the two directly is dead on arrival west of UTC
-  // (bound lands in the future, every attempt reads stale) and silently
-  // permissive east of it (window widens by the offset, so a cached IdP session
-  // that old is accepted as fresh).
-  //
-  // This test is the reason the fixture takes an epoch rather than a Date: it
-  // only has teeth when the session row is built the way the driver builds it.
-  //
-  // It is deliberately NOT written as an arithmetic comparison of the bound
-  // against `createdAt.getTime()`. Under TZ=UTC the host offset is zero, so
-  // those two numbers are identical and every such assertion passes with or
-  // without the conversion — which is exactly how this shipped past a green CI
-  // run on UTC runners. The load-bearing assertions here are therefore about
-  // the CALL: the route must hand the raw `createdAt` Date to
-  // utcMsFromOffsetlessTimestamp and use that function's return value as the
-  // bound. Deleting the conversion at the call site fails this in every
-  // timezone, UTC included.
-  it('compares auth_time against the click on the SAME clock, whatever the host timezone', async () => {
-    const sessionCreatedAtMs = Date.now() - 60_000;
-    const { session } = primeReauthCallback({
-      sessionCreatedAtMs,
-      // 30s after the click: unambiguously fresh on a correct clock.
-      idClaims: { sub: EXTERNAL_ID, email: 'tech@acme.example', auth_time: Math.floor(sessionCreatedAtMs / 1000) + 30 }
+  // The freshness bound is `created_at`, compared with the id_token's
+  // `auth_time` epoch. Neither may move with the API host's zone: west of UTC
+  // a moved bound would admit an IdP session cached before the click, east of
+  // UTC it would refuse a genuine re-authentication.
+  const HOSTS = ['America/Denver', 'Asia/Tokyo'] as const;
+
+  it.each(HOSTS)('refuses an IdP auth_time an hour older than the click on a %s host', async (zone) => {
+    await withHostTimeZone(zone, async () => {
+      const sessionCreatedAtMs = Date.now() - 60_000;
+      primeReauthCallback({
+        sessionCreatedAtMs,
+        idClaims: {
+          sub: EXTERNAL_ID,
+          email: 'tech@acme.example',
+          auth_time: Math.floor(sessionCreatedAtMs / 1000) - 3600,
+        },
+      });
+
+      const res = await doCallback();
+
+      expect(vi.mocked(assertFreshIdpAuthentication).mock.calls.at(-1)?.[1]).toBe(sessionCreatedAtMs);
+      expect(res.headers.get('location')).toContain('ssoReauthError=reauth_not_fresh');
+      expect(mintStepUpGrant).not.toHaveBeenCalled();
     });
+  });
 
-    const res = await doCallback();
+  it.each(HOSTS)('accepts an IdP auth_time from after the click on a %s host', async (zone) => {
+    await withHostTimeZone(zone, async () => {
+      const sessionCreatedAtMs = Date.now() - 60_000;
+      primeReauthCallback({
+        sessionCreatedAtMs,
+        idClaims: {
+          sub: EXTERNAL_ID,
+          email: 'tech@acme.example',
+          auth_time: Math.floor(sessionCreatedAtMs / 1000) + 30,
+        },
+      });
 
-    // TZ-independent teeth #1: the conversion ran, on the session's OWN
-    // created_at Date (not on `Date.now()`, not on a pre-converted number).
-    expect(utcMsFromOffsetlessTimestamp).toHaveBeenCalledWith(session.createdAt);
+      const res = await doCallback();
 
-    const [, boundMs] = vi.mocked(assertFreshIdpAuthentication).mock.calls.at(-1)!;
-    // TZ-independent teeth #2: the bound the freshness check received is the
-    // value that conversion RETURNED — so the two calls are wired together
-    // rather than coincidentally agreeing on a UTC host.
-    const converted = vi.mocked(utcMsFromOffsetlessTimestamp).mock.results.at(-1)!;
-    expect(converted.type).toBe('return');
-    expect(boundMs).toBe(converted.value);
-
-    // And, on a correct clock, that bound is the true epoch of the click.
-    expect(boundMs).toBe(sessionCreatedAtMs);
-    expect(session.createdAt.getTime() - boundMs).toBe(session.createdAt.getTimezoneOffset() * 60_000);
-
-    expect(assertFreshIdpAuthentication).toHaveLastReturnedWith({ ok: true });
-    expect(res.headers.get('location')).toBe('/settings/profile#ssoReauthGrant=grant-abc');
+      expect(vi.mocked(assertFreshIdpAuthentication).mock.calls.at(-1)?.[1]).toBe(sessionCreatedAtMs);
+      expect(res.headers.get('location')).toBe('/settings/profile#ssoReauthGrant=grant-abc');
+    });
   });
 
   // ── Identity: stricter than link mode's email comparison ─────────────────
@@ -924,24 +944,146 @@ describe('GET /sso/callback — reauth mode (#4018)', () => {
     expect(mintStepUpGrant).not.toHaveBeenCalled();
   });
 
-  // Pins the CURRENT mint-site contract, deliberately without changing it.
-  // Neither /sso/reauth/start nor this callback consults userIsMfaProtected, so
-  // a passwordless account that already holds TOTP still gets a live grant; only
-  // resolveEnrollmentStepUp refuses to spend it. That is safe today because
-  // there is exactly one redemption site. A SECOND redemption site added later
-  // would inherit a grant that should never have existed — this test is here so
-  // that change has to be deliberate.
-  it('mints even for an already-protected account: the refusal lives at redemption, not here', async () => {
-    primeReauthCallback({
-      reauthUser: { ...ACTIVE_REAUTH_USER, mfaEnabled: true },
-    });
+  // #8862: Entra answers max_age=0 with an id_token that is already expired on
+  // arrival. The verify failure used to fall into the shared catch and dump a
+  // signed-in user on /login?error=sso_error, abandoning enrollment.
+  it('keeps an id_token verification failure on the profile page, namespaced and audited', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    primeReauthCallback();
+    vi.mocked(verifyIdTokenSignature).mockRejectedValue(
+      new Error('ID token signature verification failed: "exp" claim timestamp check failed')
+    );
 
     const res = await doCallback();
+
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toBe('/settings/profile?ssoReauthError=idp_verify_failed');
+    expect(mintStepUpGrant).not.toHaveBeenCalled();
+    expect(getUserInfo).not.toHaveBeenCalled();
+    expect(writeRouteAudit).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: 'sso.reauth.rejected',
+        result: 'denied',
+        details: expect.objectContaining({ mode: 'reauth', reason: 'idp_verify_failed', userId: USER_ID }),
+      })
+    );
+    expect(writeRouteAudit).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ action: 'sso.reauth.completed' })
+    );
+  });
+
+  // A nonce mismatch is a replay/injection signal, not an IdP clock quirk: the
+  // audit row must say which, even though the user-facing code stays coarse.
+  it.each([
+    ['nonce', 'nonce'],
+    ['claims', 'claims'],
+    ['timing', 'timing'],
+    ['evil', 'unknown'],
+    [undefined, 'unknown'],
+  ] as const)('records failureKind=%s on the audit row (as %s)', async (thrownKind, auditedKind) => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    primeReauthCallback();
+    vi.mocked(verifyIdTokenSignature).mockRejectedValue(
+      Object.assign(new Error('Invalid nonce'), thrownKind ? { failureKind: thrownKind } : {})
+    );
+
+    const res = await doCallback();
+
+    expect(res.headers.get('location')).toBe('/settings/profile?ssoReauthError=idp_verify_failed');
+    expect(writeRouteAudit).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: 'sso.reauth.rejected',
+        details: expect.objectContaining({ reason: 'idp_verify_failed', failureKind: auditedKind }),
+      })
+    );
+  });
+
+  it('verifies the re-auth id_token with the bounded clock tolerance', async () => {
+    primeReauthCallback();
+
+    await doCallback();
+
+    expect(verifyIdTokenSignature).toHaveBeenCalledWith(
+      'h.p.s',
+      expect.anything(),
+      'nonce',
+      { clockToleranceSeconds: 300, mode: 'reauth' }
+    );
+  });
+
+  // #4045: the mint site now picks the grant's PURPOSE from the account's
+  // factor state (via the same userIsMfaProtected predicate both redemption
+  // sites use). An unprotected account gets enroll_first_factor — the only
+  // thing it can do is enroll. A protected account gets sso_reauth_manage_factor
+  // — it may stand in for the PASSWORD leg of recovery-code rotation, passkey
+  // deletion and MFA disable, and can never enroll. The grant stays bound to the
+  // INITIATING epochs, so a factor added between /reauth/start and here makes
+  // it dead on arrival whichever purpose was chosen.
+  it('mints sso_reauth_manage_factor (never enroll_first_factor) for a TOTP-protected account', async () => {
+    primeReauthCallback({ protection: { mfaEnabled: true, passkeyCount: 0 } });
+
+    const res = await doCallback();
+
+    expect(mintStepUpGrant).toHaveBeenCalledTimes(1);
+    expect(mintStepUpGrant).toHaveBeenCalledWith({
+      userId: USER_ID,
+      operation: 'sso_reauth_manage_factor',
+      authEpoch: 3,
+      mfaEpoch: 1,
+      sid: SID,
+    });
+    expect(res.headers.get('location')).toBe('/settings/profile#ssoReauthGrant=grant-abc');
+  });
+
+  it('mints sso_reauth_manage_factor for a passkey-only account', async () => {
+    primeReauthCallback({ protection: { mfaEnabled: false, passkeyCount: 2 } });
+
+    await doCallback();
+
+    expect(mintStepUpGrant).toHaveBeenCalledWith(
+      expect.objectContaining({ userId: USER_ID, operation: 'sso_reauth_manage_factor' })
+    );
+  });
+
+  // PR #7371 review: userIsMfaProtected THROWS on a missing row (it refuses to
+  // report "unprotected" when it could not look). Unhandled, that reached the
+  // callback's generic catch, which redirects to /login with the raw
+  // error.message — an internal diagnostic carrying the user's UUID — and
+  // dropped an already-signed-in user off the profile page.
+  it('fails closed on the profile page, without leaking the probe error, when the protection probe throws', async () => {
+    primeReauthCallback();
+    // Replace the queued protection row with "no row", so the probe throws.
+    vi.mocked(db.select).mockReset()
+      .mockReturnValueOnce(sel([ACTIVE_OIDC_PROVIDER]))
+      .mockReturnValueOnce(sel([ACTIVE_REAUTH_USER]))
+      .mockReturnValueOnce(sel([{ userId: USER_ID }]))
+      .mockReturnValueOnce(sel([{ userId: USER_ID }]))
+      .mockReturnValue(sel([]));
+
+    const res = await doCallback();
+
+    expect(mintStepUpGrant).not.toHaveBeenCalled();
+    expect(res.headers.get('location')).toBe('/settings/profile?ssoReauthError=reauth_unavailable');
+    expect(writeRouteAudit).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: 'sso.reauth.rejected',
+        details: expect.objectContaining({ reason: 'protection_probe_failed' }),
+      })
+    );
+  });
+
+  it('still mints enroll_first_factor for an account with no factor', async () => {
+    primeReauthCallback({ protection: { mfaEnabled: false, passkeyCount: 0 } });
+
+    await doCallback();
 
     expect(mintStepUpGrant).toHaveBeenCalledWith(
       expect.objectContaining({ userId: USER_ID, operation: 'enroll_first_factor' })
     );
-    expect(res.headers.get('location')).toBe('/settings/profile#ssoReauthGrant=grant-abc');
   });
 
   it('never mints login tokens, creates users, or links identities in reauth mode', async () => {
@@ -952,5 +1094,100 @@ describe('GET /sso/callback — reauth mode (#4018)', () => {
     expect(res.headers.get('location')).toBe('/settings/profile#ssoReauthGrant=grant-abc');
     expect(createTokenPair).not.toHaveBeenCalled();
     expect(db.insert).not.toHaveBeenCalled();
+  });
+
+  // ── #9377: partner-level provider rows reach the partner's audit trail ──
+  //
+  // /callback is unauthenticated: no request auth and no ambient partner
+  // scope. For a partner provider orgId is NULL, so unless partnerId is passed
+  // top-level the row persists partner_id NULL and the partner audit view
+  // (org_id IS NULL AND partner_id = caller) never shows it.
+  describe('partner-level provider audit attribution (#9377)', () => {
+    it('sso.reauth.completed', async () => {
+      primeReauthCallback({ provider: PARTNER_OIDC_PROVIDER });
+
+      const res = await doCallback();
+
+      expect(res.headers.get('location')).toBe('/settings/profile#ssoReauthGrant=grant-abc');
+      expect(persistedPartnerIdFor('sso.reauth.completed')).toEqual([PARTNER_ID]);
+    });
+
+    it('sso.reauth.rejected — idp_verify_failed (the failureKind replay/nonce row)', async () => {
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      primeReauthCallback({ provider: PARTNER_OIDC_PROVIDER });
+      vi.mocked(verifyIdTokenSignature).mockRejectedValue(
+        Object.assign(new Error('Invalid nonce'), { failureKind: 'nonce' })
+      );
+
+      await doCallback();
+
+      expect(persistedPartnerIdFor('sso.reauth.rejected', 'idp_verify_failed')).toEqual([PARTNER_ID]);
+    });
+
+    it('sso.reauth.rejected — not fresh', async () => {
+      primeReauthCallback({
+        provider: PARTNER_OIDC_PROVIDER,
+        idClaims: { sub: EXTERNAL_ID, email: 'tech@acme.example', auth_time: secondsAgo(3600) },
+      });
+
+      const res = await doCallback();
+
+      expect(res.headers.get('location')).toContain('ssoReauthError=reauth_not_fresh');
+      expect(persistedPartnerIdFor('sso.reauth.rejected')).toEqual([PARTNER_ID]);
+    });
+
+    it('sso.reauth.rejected — binding failure', async () => {
+      primeReauthCallback({
+        provider: PARTNER_OIDC_PROVIDER,
+        reauthUser: { ...ACTIVE_REAUTH_USER, status: 'suspended' },
+      });
+
+      const res = await doCallback();
+
+      expect(res.headers.get('location')).toContain('ssoReauthError=session_invalid');
+      expect(persistedPartnerIdFor('sso.reauth.rejected')).toEqual([PARTNER_ID]);
+    });
+
+    it('sso.reauth.rejected — grant_mint_failed', async () => {
+      primeReauthCallback({ provider: PARTNER_OIDC_PROVIDER });
+      vi.mocked(mintStepUpGrant).mockResolvedValueOnce(null);
+
+      await doCallback();
+
+      expect(persistedPartnerIdFor('sso.reauth.rejected', 'grant_mint_failed')).toEqual([PARTNER_ID]);
+    });
+
+    it('sso.callback.rejected — provider generation changed mid-flight', async () => {
+      primeReauthCallback({ provider: { ...PARTNER_OIDC_PROVIDER, configVersion: 8 } });
+
+      await doCallback();
+
+      expect(persistedPartnerIdFor('sso.callback.rejected')).toEqual([PARTNER_ID]);
+    });
+
+    it('sso.callback.rejected — email_verified=false', async () => {
+      primeReauthCallback({
+        provider: PARTNER_OIDC_PROVIDER,
+        idClaims: { sub: EXTERNAL_ID, email: 'tech@acme.example', email_verified: false, auth_time: secondsAgo(5) },
+      });
+
+      await doCallback();
+
+      expect(persistedPartnerIdFor('sso.callback.rejected')).toEqual([PARTNER_ID]);
+    });
+
+    // Control: an org-level provider's rows stay org rows (partner_id NULL is
+    // the DB CHECK audit_logs_partner_only_without_org_chk invariant).
+    it('keeps an org-level provider row org-attributed with no partner_id', async () => {
+      primeReauthCallback();
+
+      await doCallback();
+
+      expect(writeRouteAudit).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: 'sso.reauth.completed', orgId: ORG_ID })
+      );
+      expect(persistedPartnerIdFor('sso.reauth.completed')).toEqual([null]);
+    });
   });
 });

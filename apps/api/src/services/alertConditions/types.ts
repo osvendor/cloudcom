@@ -4,6 +4,16 @@
  * All interfaces for condition evaluation, shared across handlers.
  */
 
+import type { EvidenceCursor } from '@breeze/shared';
+
+export interface ConditionEvalContext {
+  /** Evidence handlers additionally require >= 1 matching row ordered after this cursor. */
+  evidenceAfter?: EvidenceCursor;
+  side?: 'trigger' | 'resolve';
+  /** Legacy closed alert: rows ingested at or before this instant are consumed. */
+  legacyIngestedBefore?: Date;
+}
+
 // Supported comparison operators
 export type ComparisonOperator = 'gt' | 'gte' | 'lt' | 'lte' | 'eq' | 'neq';
 
@@ -29,7 +39,7 @@ export interface OfflineCondition {
 export interface EventLogCondition {
   type: 'event_log';
   category: 'security' | 'hardware' | 'application' | 'system';
-  level: 'warning' | 'error' | 'critical';
+  level: 'info' | 'warning' | 'error' | 'critical';
   sourcePattern?: string;
   messagePattern?: string;
   countThreshold: number;
@@ -64,7 +74,7 @@ export interface BandwidthHighCondition {
   type: 'bandwidth_high';
   direction: 'in' | 'out' | 'total';
   operator: ComparisonOperator;
-  value: number; // Mbps (converted to bps internally)
+  value: number; // megaBITS/sec; agent samples are bytes/sec, handler converts (x8)
   durationMinutes?: number;
 }
 
@@ -73,7 +83,7 @@ export interface DiskIoHighCondition {
   type: 'disk_io_high';
   direction: 'read' | 'write' | 'total';
   operator: ComparisonOperator;
-  value: number; // MB/s (converted to Bps internally)
+  value: number; // MB/s (10^6 bytes/sec); agent samples are bytes/sec
   durationMinutes?: number;
 }
 
@@ -126,7 +136,7 @@ export interface SoftwarePresenceCondition {
 // SLA worker's own state, which runs on its own cadence).
 export interface BackupContinuityCondition {
   type: 'backup_continuity';
-  check: 'no_successful_backup' | 'consecutive_failures';
+  check: 'no_successful_backup' | 'consecutive_failures' | 'completed_with_errors';
   maxAgeHours?: number;
   failureCount?: number;
 }
@@ -148,6 +158,53 @@ export interface NetworkCheckCondition {
   type: 'network_check';
   monitorId: string;
   consecutiveFailures?: number;
+  /** A degraded result counts as a failure (legacy degraded rule). */
+  degradedIsFailure?: boolean;
+  /** A response slower than this counts as a failure (legacy response_time_gt). */
+  maxResponseMs?: number;
+}
+
+// --- W03 (hardware & RAID monitoring) -------------------------------------
+
+// `HardwareComponentType` from `@breeze/shared` minus 'bmc' — BMC health is a
+// separate, future, out-of-band spec (see the design doc).
+import type { HardwareComponentType, TimeSyncFindingCode } from '@breeze/shared';
+export type HardwareHealthComponentFilter = Exclude<HardwareComponentType, 'bmc'>;
+
+// Per-subject (per-component) evidence a leaf handler can report, alongside
+// or instead of a single scalar `ConditionResult`. `unknown` means observed
+// but not yet resolvable to breaching/recovered (e.g. missing prior snapshot).
+export type SubjectStatus = 'breaching' | 'recovered' | 'unknown';
+export interface SubjectEvidence {
+  subjectKey: string;
+  status: SubjectStatus;
+  description: string;
+  actualValue?: number;
+  context?: Record<string, unknown>;
+}
+
+// Hardware health condition. Root-only (see `compositeChildSchema` in
+// `@breeze/shared` monitors.ts) — evaluates fresh component evidence rather
+// than a single device-level scalar.
+export interface HardwareHealthCondition {
+  type: 'hardware_health';
+  componentTypes: HardwareHealthComponentFilter[];
+  minHealth: 'warning' | 'critical';
+  includePredictiveFailure: boolean;
+  consecutiveSnapshots: number;
+}
+
+export interface TimeSyncCondition {
+  type: 'time_sync';
+  findings: TimeSyncFindingCode[];
+  consecutiveSnapshots: number;
+}
+
+// Workload inventory W06 (#8195). Root-only subject monitor: one subject per
+// container image repository:tag on the device.
+export interface ContainerImageCurrencyCondition {
+  type: 'container_image_currency';
+  minDaysBehind: number;
 }
 
 // Union of all condition types
@@ -167,7 +224,10 @@ export type AlertCondition =
   | SoftwarePresenceCondition
   | BackupContinuityCondition
   | ScriptMonitorCondition
-  | NetworkCheckCondition;
+  | NetworkCheckCondition
+  | HardwareHealthCondition
+  | TimeSyncCondition
+  | ContainerImageCurrencyCondition;
 
 // Compound condition with AND/OR logic
 export interface ConditionGroup {
@@ -180,27 +240,51 @@ export type RootCondition = AlertCondition | ConditionGroup;
 
 // Evaluation result with context
 export interface EvaluationResult {
+  evidenceWatermarks: Record<string, EvidenceCursor>;
   triggered: boolean;
   conditionsMet: string[];
   conditionsNotMet: string[];
   /** #5290 — 'unknown' when ANY evaluated leaf reported dataAvailable === false. */
   dataState: 'ok' | 'unknown';
+  /** W03 — present when the leaf handler reported per-subject evidence. */
+  subjects?: SubjectEvidence[];
   context: {
     metric?: string;
     actualValue?: number;
     threshold?: number;
     operator?: string;
     durationMinutes?: number;
+    /** #7966 — from the first service_stopped leaf, for {{serviceName}}. */
+    serviceName?: string;
+    /** #7966 — from the first leaf carrying a processName, for {{processName}}. */
+    processName?: string;
+    /** From the event_log leaf: matching events in the window, for {{count}}. */
+    count?: number;
+    /** From the event_log leaf, for {{category}}. */
+    category?: string;
+    /** From the event_log leaf, for {{windowMinutes}}. */
+    windowMinutes?: number;
+    /** From the event_log leaf: its description, not event text, for {{message}}. */
+    message?: string;
     deviceId: string;
     evaluatedAt: string;
   };
 }
 
+/** Values a handler supplies for its own template tokens. */
+export type ConditionTemplateValues = Pick<
+  EvaluationResult['context'],
+  'count' | 'category' | 'windowMinutes' | 'message'
+>;
+
 // Result from a single condition handler
 export interface ConditionResult {
+  evidenceWatermark?: EvidenceCursor;
   passed: boolean;
   description: string;
   actualValue?: number;
+  /** Copied onto EvaluationResult.context; see pickLeafTemplateValues. */
+  templateValues?: ConditionTemplateValues;
   /**
    * #5290 — false when the handler could not observe the device at all (no
    * samples in the window, no inventory row, agent never reported). ABSENT
@@ -208,4 +292,6 @@ export interface ConditionResult {
    * Never conflate this with `passed: false`, which means "observed, healthy".
    */
   dataAvailable?: boolean;
+  /** W03 — present when the handler reports per-subject (per-component) evidence. */
+  subjects?: SubjectEvidence[];
 }

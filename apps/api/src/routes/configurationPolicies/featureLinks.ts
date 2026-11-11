@@ -1,28 +1,54 @@
-import { Hono } from 'hono';
+import { brandingWriteError } from '../../services/helperBranding';
+import { listAssignments } from '../../services/configurationPolicy';
+import { Hono, type Context, type Next } from 'hono';
 import { zValidator } from '../../lib/validation';
 import { zodValidationErrorBody } from '../../lib/zodIssues';
 import type { AuthContext } from '../../middleware/auth';
-import { requireMfa, requirePermission, requireScope } from '../../middleware/auth';
+import { hasSatisfiedMfa, requireMfa, requirePermission, requireScope } from '../../middleware/auth';
 import {
-  alertRuleInlineSettingsSchema,
   backupInlineSettingsSchema,
   backupProfileLinkedInlineSettingsSchema,
   clientSuppliedWarrantyHpCmslConsent,
+  duplicateComplianceItemNameMessage,
+  duplicateComplianceItemNames,
+  overlongComplianceItemNameMessage,
+  overlongComplianceItemNames,
+  hardwareMonitoringInlineSettingsSchema,
   maintenanceInlineSettingsSchema,
-  monitoringInlineSettingsSchema,
   monitorsInlineSettingsSchema,
   onedriveHelperInlineSettingsSchema,
   patchInlineSettingsSchema,
+  timeSyncInlineSettingsSchema,
+  workloadInventoryInlineSettingsSchema,
+  systemProtectionInlineSettingsSchema,
+  containmentInlineSettingsSchema,
   warrantyHpCmslRequested,
   warrantyInlineSettingsSchema,
 } from '@breeze/shared/validators';
-import { ORG_SCOPED_ONLY_FEATURE_TYPES } from '@breeze/shared/constants';
+import { ORG_SCOPED_ONLY_FEATURE_TYPES, isRetiredConfigFeatureType } from '@breeze/shared/constants';
 import { writeRouteAudit } from '../../services/auditEvents';
+import { invalidateRemoteAccessCache } from '../../services/remoteAccessPolicy';
 import { canMutateOrgWideGovernance, SITE_CEILING_WRITE_DENIED_MESSAGE } from '../../services/siteCeilingAccess';
-import { PERMISSIONS, type UserPermissions } from '../../services/permissions';
-import { findOfflineDurationViolation } from '../../services/alertConditions/offlineDuration';
+import { PERMISSIONS, hasPermission, type UserPermissions } from '../../services/permissions';
+import {
+  checkSecurityAgentsLinkWrite,
+  SecurityAgentsLinkWriteError,
+} from '../../services/securityAgents/securityAgentsLinkWrite';
+import {
+  checkOemUpdatesLinkWrite,
+  OemUpdatesLinkWriteError,
+} from '../../services/oemUpdates/oemUpdatesLinkWrite';
+import { isCategoryOpen, SHIPPED_OEM_LANES } from '../../services/oemUpdates/toolManifest';
+import { OEM_CATEGORIES, OEM_LANES, type OemCategory, type OemUpdatesGateSnapshot } from '@breeze/shared';
+import {
+  checkOemUpdatesArmAllowed,
+  mayArmOemUpdates,
+  oemUpdatesPreviousForWrite,
+  overrideDeleteArmsOemUpdates,
+} from './oemUpdatesGate';
 import {
   getConfigPolicy,
+  getRetiredFeatureLink,
   addFeatureLink,
   updateFeatureLink,
   removeFeatureLink,
@@ -36,6 +62,7 @@ import {
   PARTNER_LINKABLE_FEATURE_TYPES,
   isBackupProfileReference,
   WarrantyConsentError,
+  BackupDestinationNotInOrgError,
 } from '../../services/configurationPolicy';
 import { isMonitorAttachableToPolicy } from '../../services/monitors/monitorAttachability';
 import { getMonitorDefinition } from '../../services/monitors/monitorService';
@@ -52,6 +79,45 @@ import {
 } from './schemas';
 import { AutomationReferenceAuthorizationError } from '../../services/automationReferenceAuthorization';
 import { checkHpCmslWriteAllowed, warrantyLinkEnablesCollection } from './hpCmslGate';
+import { checkSecurityQuarantineWrite } from './securityQuarantineGate';
+import { checkSecurityRuleSetsWrite } from './securityRuleSetGate';
+import { withoutFeatureLinkAuthority } from '../../services/securityScanQuarantineAuthority';
+import type { SensitiveDataAuthorityValues } from '../../services/sensitiveDataPolicyAuthority';
+
+/**
+ * 400 body when two compliance rule sets in the link share a name, or a name
+ * is longer than 200 characters, else null.
+ * A rule set is identified by (feature link, name) across saves: the
+ * evaluator's persisted state, the due check and the compliance alert all key
+ * on it, so two with one name would share a state row and an alert. The rest
+ * of the compliance shape is not validated here (the web tab's saved shape
+ * predates complianceInlineSettingsSchema); the service refuses duplicates
+ * again for callers that bypass this route.
+ */
+function complianceNamesRefusal(settings: unknown) {
+  const items = settings && typeof settings === 'object' ? (settings as { items?: unknown }).items : undefined;
+  if (!Array.isArray(items)) return null;
+  const objects = items.filter((item): item is { name?: unknown } => !!item && typeof item === 'object');
+  const names = duplicateComplianceItemNames(objects);
+  if (names.length > 0) {
+    return {
+      error: duplicateComplianceItemNameMessage(names[0]!),
+      code: 'DUPLICATE_COMPLIANCE_RULE_SET_NAME' as const,
+      names,
+    };
+  }
+  // The name is copied into 200-character state, alert and automation-run
+  // columns; rows saved before this cap keep loading.
+  const overlong = overlongComplianceItemNames(objects);
+  if (overlong.length > 0) {
+    return {
+      error: overlongComplianceItemNameMessage(overlong[0]!),
+      code: 'COMPLIANCE_RULE_SET_NAME_TOO_LONG' as const,
+      names: overlong,
+    };
+  }
+  return null;
+}
 
 // The `config_policy_monitors_compat` deferred constraint trigger
 // (2026-10-16-160300-monitor-definitions.sql) is the owner-compatibility
@@ -84,6 +150,28 @@ const requireConfigPolicyWrite = requirePermission(PERMISSIONS.DEVICES_WRITE.res
 const ORG_SCOPED_ONLY_FEATURES: ReadonlySet<string> = ORG_SCOPED_ONLY_FEATURE_TYPES;
 
 // GET /:id/features — list feature links for a policy
+// GET /oem-updates/gates — which vendor update categories the Vendor updates
+// tab may offer (#11070). Code-manifest state only, no tenant data; a category
+// closed here cannot be stored true (oem_updates_category_gate_closed).
+// Registered before the /:id routes so the literal path is never read as an id.
+featureLinkRoutes.get(
+  '/oem-updates/gates',
+  requireScope('organization', 'partner', 'system'),
+  requireConfigPolicyRead,
+  (c) => {
+    const data: OemUpdatesGateSnapshot = {
+      lanes: OEM_LANES.map((lane) => ({
+        lane,
+        shipped: SHIPPED_OEM_LANES.includes(lane),
+        categories: Object.fromEntries(
+          OEM_CATEGORIES.map((category) => [category, isCategoryOpen(lane, category)]),
+        ) as Record<OemCategory, boolean>,
+      })),
+    };
+    return c.json({ data });
+  }
+);
+
 featureLinkRoutes.get(
   '/:id/features',
   requireScope('organization', 'partner', 'system'),
@@ -111,12 +199,41 @@ const WARRANTY_CONSENT_REFUSAL = {
   code: 'WARRANTY_CONSENT_NOT_CLIENT_SETTABLE',
 } as const;
 
+export const RETIRED_FEATURE_TYPE_GONE = (featureType: string) => ({
+  error: `Feature type "${featureType}" was retired by the alerting consolidation.`,
+  hint: 'Author the condition as a monitor (POST /monitor-definitions) and attach it to the policy through the "monitors" feature link.',
+  retiredFeatureType: featureType,
+});
+const rejectRetiredFeatureType = async (c: Context, next: Next) => {
+  const body = await c.req.raw.clone().json().catch(() => null);
+  const ft = (body as { featureType?: unknown } | null)?.featureType;
+  if (isRetiredConfigFeatureType(ft)) return c.json(RETIRED_FEATURE_TYPE_GONE(ft), 410);
+  await next();
+};
+
+// #6960: enabling a security agent arms installs, so the link write needs the
+// software-deployment grant (devices.execute + MFA), mirroring the HP CMSL gate.
+// Fail closed when permissions were not resolved.
+function mayArmSecurityAgents(auth: AuthContext, perms: UserPermissions | undefined): boolean {
+  return !!perms
+    && hasPermission(perms, PERMISSIONS.DEVICES_EXECUTE.resource, PERMISSIONS.DEVICES_EXECUTE.action)
+    && hasSatisfiedMfa(auth);
+}
+
+// A remote_access link write changes what resolveRemoteAccessForDevice returns;
+// its cache (served to the heartbeat for up to HEARTBEAT_REMOTE_ACCESS_MAX_AGE_MS,
+// #8053) must drop, as the policy CRUD and assignment routes already do.
+function invalidateRemoteAccessCacheFor(featureType: string): void {
+  if (featureType === 'remote_access') invalidateRemoteAccessCache();
+}
+
 featureLinkRoutes.post(
   '/:id/features',
   requireScope('organization', 'partner', 'system'),
   requireConfigPolicyWrite,
   requireMfa(),
   zValidator('param', idParamSchema),
+  rejectRetiredFeatureType,
   zValidator('json', addFeatureLinkSchema),
   async (c) => {
     const auth = c.get('auth') as AuthContext;
@@ -145,6 +262,11 @@ featureLinkRoutes.post(
       );
     }
 
+    if (data.featureType === 'helper' && data.inlineSettings && 'branding' in data.inlineSettings) {
+      const brandingErr = brandingWriteError(data.inlineSettings, (await listAssignments(id)).map((a) => a.level));
+      if (brandingErr) return c.json({ error: brandingErr.error, details: brandingErr.details }, brandingErr.status);
+    }
+
     // #5511 W02 (contract D4): enabling device-side HP warranty collection
     // installs HP software on every HP endpoint this policy reaches, so it
     // carries the deployment gate — devices.execute (and MFA, already enforced
@@ -154,6 +276,60 @@ featureLinkRoutes.post(
     if (data.featureType === 'warranty' && warrantyHpCmslRequested(data.inlineSettings)) {
       const gate = checkHpCmslWriteAllowed(auth, c.get('permissions') as UserPermissions | undefined);
       if (!gate.allowed) return c.json(gate.body, 403);
+    }
+
+    // IOC auto-quarantine is a device-execution grant: devices:execute + MFA,
+    // and the write stamps the stored authority scheduled scans dispatch under.
+    let securityAuthority: SensitiveDataAuthorityValues | null = null;
+    if (data.featureType === 'security') {
+      const gate = checkSecurityQuarantineWrite(
+        auth,
+        c.get('permissions') as UserPermissions | undefined,
+        { orgId: policy.orgId, partnerId: policy.partnerId },
+        data.inlineSettings,
+      );
+      if (!gate.allowed) return c.json(gate.body, 403);
+      securityAuthority = gate.executionAuthority;
+      // #6263 W03: only rule sets every device the policy reaches can fetch.
+      const ruleSets = await checkSecurityRuleSetsWrite(
+        { orgId: policy.orgId, partnerId: policy.partnerId },
+        data.inlineSettings,
+      );
+      if (!ruleSets.ok) return c.json(ruleSets.body, ruleSets.status);
+    }
+
+    // #6960: authorization (arming), NULL featurePolicyId, strict settings and
+    // the enableable gate, in that order — see securityAgentsLinkWrite.ts.
+    let securityAgentsArmAuthorized = false;
+    if (data.featureType === 'security_agents') {
+      securityAgentsArmAuthorized = mayArmSecurityAgents(auth, c.get('permissions') as UserPermissions | undefined);
+      const check = checkSecurityAgentsLinkWrite({
+        featurePolicyId: data.featurePolicyId ?? null,
+        inlineSettings: data.inlineSettings ?? null,
+        armAuthorized: securityAgentsArmAuthorized,
+      });
+      if (!check.ok) return c.json(check.refusal.body, check.refusal.status);
+      data.inlineSettings = check.inlineSettings;
+    }
+
+    if (data.featureType === 'containment' && data.featurePolicyId) {
+      return c.json({ error: 'containment is inline-only; featurePolicyId must not be set' }, 400);
+    }
+
+    // #11070: arming (against the link in effect: the parent's, for a new
+    // override), NULL featurePolicyId, strict settings and closed category
+    // gates, in that order — see oemUpdatesLinkWrite.ts.
+    let oemUpdatesArmAuthorized = false;
+    if (data.featureType === 'oem_updates') {
+      oemUpdatesArmAuthorized = mayArmOemUpdates(auth, c.get('permissions') as UserPermissions | undefined);
+      const check = checkOemUpdatesLinkWrite({
+        featurePolicyId: data.featurePolicyId ?? null,
+        previous: oemUpdatesPreviousForWrite(policy),
+        next: data.inlineSettings ?? null,
+        armAuthorized: oemUpdatesArmAuthorized,
+      });
+      if (!check.ok) return c.json(check.refusal.body, check.refusal.status);
+      data.inlineSettings = check.inlineSettings;
     }
 
     // Validate the referenced feature policy exists (only when a policy ID is provided)
@@ -283,40 +459,6 @@ featureLinkRoutes.post(
       data.inlineSettings = parsed.data;
     }
 
-    // Reject offline alert rules whose duration exceeds the re-eval horizon —
-    // such a rule could never fire (issue #1982). Runs BEFORE the schema parse
-    // below so an oversized-but-well-formed duration gets this specific message
-    // rather than the enum/range message.
-    if (data.featureType === 'alert_rule' && data.inlineSettings) {
-      const violation = findOfflineDurationViolation(data.inlineSettings);
-      if (violation) return c.json({ error: violation }, 400);
-    }
-
-    if (data.featureType === 'alert_rule' && data.inlineSettings) {
-      const parsed = alertRuleInlineSettingsSchema.safeParse(data.inlineSettings);
-      if (!parsed.success) {
-        return c.json(
-          zodValidationErrorBody('Invalid alert_rule settings', parsed.error),
-          400
-        );
-      }
-      data.inlineSettings = parsed.data;
-    }
-
-    if (data.featureType === 'monitoring' && data.inlineSettings) {
-      const parsed = monitoringInlineSettingsSchema.safeParse(data.inlineSettings);
-      if (!parsed.success) {
-        return c.json(
-          zodValidationErrorBody('Invalid monitoring settings', parsed.error),
-          400
-        );
-      }
-      // Validate only — deliberately NOT `data.inlineSettings = parsed.data`.
-      // The schema defaults the deprecated `alertRules`/`eventLogAlerts` write
-      // barrier keys to `[]`, and normalizing would write those dead keys back
-      // into the stored JSONB mirror on every save.
-    }
-
     if (data.featureType === 'monitors' && data.inlineSettings) {
       const parsed = monitorsInlineSettingsSchema.safeParse(data.inlineSettings);
       if (!parsed.success) {
@@ -345,25 +487,121 @@ featureLinkRoutes.post(
       data.inlineSettings = parsed.data;
     }
 
+    if (data.featureType === 'hardware_monitoring' && data.inlineSettings) {
+      const parsed = hardwareMonitoringInlineSettingsSchema.safeParse(data.inlineSettings);
+      if (!parsed.success) {
+        return c.json(
+          zodValidationErrorBody('Invalid hardware monitoring settings', parsed.error),
+          400
+        );
+      }
+      data.inlineSettings = parsed.data;
+    }
+
+    if (data.featureType === 'time_sync' && data.inlineSettings) {
+      const parsed = timeSyncInlineSettingsSchema.safeParse(data.inlineSettings);
+      if (!parsed.success) {
+        return c.json(
+          zodValidationErrorBody('Invalid time sync settings', parsed.error),
+          400
+        );
+      }
+      data.inlineSettings = parsed.data;
+    }
+
+    if (data.featureType === 'workload_inventory' && data.inlineSettings) {
+      const parsed = workloadInventoryInlineSettingsSchema.safeParse(data.inlineSettings);
+      if (!parsed.success) {
+        return c.json(
+          zodValidationErrorBody('Invalid workload inventory settings', parsed.error),
+          400
+        );
+      }
+      data.inlineSettings = parsed.data;
+    }
+
+    if (data.featureType === 'containment') {
+      const parsed = containmentInlineSettingsSchema.safeParse(data.inlineSettings);
+      if (!parsed.success) {
+        return c.json(zodValidationErrorBody('Invalid containment settings', parsed.error), 400);
+      }
+      data.inlineSettings = parsed.data;
+    }
+
+    if (data.featureType === 'system_protection' && data.inlineSettings) {
+      const parsed = systemProtectionInlineSettingsSchema.safeParse(data.inlineSettings);
+      if (!parsed.success) {
+        return c.json(
+          zodValidationErrorBody('Invalid system protection settings', parsed.error),
+          400
+        );
+      }
+      data.inlineSettings = parsed.data;
+    }
+
+    if (data.featureType === 'compliance') {
+      const refusal = complianceNamesRefusal(data.inlineSettings);
+      if (refusal) return c.json(refusal, 400);
+    }
+
     // addFeatureLink returns null (instead of throwing) on a duplicate — see the
     // comment on its onConflictDoNothing insert in configurationPolicy.ts for
     // why the raised-violation catch pattern doesn't work inside this route's
     // withDbAccessContext transaction.
     let link;
     try {
-      link = await addFeatureLink(
-        id,
-        data.featureType,
-        data.featurePolicyId,
-        data.inlineSettings,
-        { userId: auth.user.id }
-      );
+      link = data.featureType === 'security'
+        ? await addFeatureLink(
+            id,
+            data.featureType,
+            data.featurePolicyId,
+            data.inlineSettings,
+            { userId: auth.user.id },
+            undefined,
+            { executionAuthority: securityAuthority },
+          )
+        : data.featureType === 'security_agents'
+        ? await addFeatureLink(
+            id,
+            data.featureType,
+            data.featurePolicyId,
+            data.inlineSettings,
+            { userId: auth.user.id },
+            undefined,
+            { securityAgentsArmAuthorized },
+          )
+        : data.featureType === 'oem_updates'
+        ? await addFeatureLink(
+            id,
+            data.featureType,
+            data.featurePolicyId,
+            data.inlineSettings,
+            { userId: auth.user.id },
+            undefined,
+            { oemUpdatesArmAuthorized },
+          )
+        : await addFeatureLink(
+            id,
+            data.featureType,
+            data.featurePolicyId,
+            data.inlineSettings,
+            { userId: auth.user.id }
+          );
     } catch (error) {
       if (error instanceof AutomationReferenceAuthorizationError) {
         return c.json({ error: 'Unknown or unauthorized automation reference' }, 400);
       }
       if (error instanceof WarrantyConsentError) {
         return c.json({ error: error.message, code: WARRANTY_CONSENT_REFUSAL.code }, 400);
+      }
+      if (error instanceof SecurityAgentsLinkWriteError) {
+        return c.json(error.body, error.status);
+      }
+      if (error instanceof OemUpdatesLinkWriteError) {
+        return c.json(error.body, error.status);
+      }
+      if (error instanceof BackupDestinationNotInOrgError) {
+        return c.json({ error: error.message, code: error.code }, 400);
       }
       if (isMonitorNotAttachableDbError(error)) {
         return c.json({ error: 'MONITOR_NOT_ATTACHABLE' }, 400);
@@ -383,8 +621,9 @@ featureLinkRoutes.post(
       resourceName: policy.name,
       details: { featureType: data.featureType, featurePolicyId: data.featurePolicyId },
     });
+    invalidateRemoteAccessCacheFor(data.featureType);
 
-    return c.json(link, 201);
+    return c.json(withoutFeatureLinkAuthority(link), 201);
   }
 );
 
@@ -415,7 +654,21 @@ featureLinkRoutes.patch(
     const existingLink = policy.featureLinks.find((l: any) => l.id === linkId);
 
     if (!existingLink) {
+      // Public listings omit retired links; look up only their identity after
+      // policy authorization so stale clients receive the retirement pointer.
+      const retiredLink = await getRetiredFeatureLink(id, linkId);
+      if (retiredLink) return c.json(RETIRED_FEATURE_TYPE_GONE(retiredLink.featureType), 410);
       return c.json({ error: 'Feature link not found' }, 404);
+    }
+
+    if (isRetiredConfigFeatureType(existingLink.featureType)) {
+      return c.json(RETIRED_FEATURE_TYPE_GONE(existingLink.featureType), 410);
+    }
+
+    // Helper branding (Phase 2): replacement blob, validated and partner/org-only.
+    if (existingLink.featureType === 'helper' && data.inlineSettings !== undefined) {
+      const brandingErr = brandingWriteError(data.inlineSettings, (await listAssignments(id)).map((a) => a.level));
+      if (brandingErr) return c.json({ error: brandingErr.error, details: brandingErr.details }, brandingErr.status);
     }
 
     // Same gate as the POST route (#5511 W02, D4). `data.inlineSettings` is the
@@ -424,6 +677,68 @@ featureLinkRoutes.patch(
     if (existingLink.featureType === 'warranty' && warrantyHpCmslRequested(data.inlineSettings)) {
       const gate = checkHpCmslWriteAllowed(auth, c.get('permissions') as UserPermissions | undefined);
       if (!gate.allowed) return c.json(gate.body, 403);
+    }
+
+    // Same auto-quarantine gate as POST. Only a settings write re-stamps (or
+    // clears) the stored authority; a featurePolicyId-only edit leaves it.
+    const securitySettingsWrite = existingLink.featureType === 'security' && data.inlineSettings !== undefined;
+    let securityAuthority: SensitiveDataAuthorityValues | null = null;
+    if (securitySettingsWrite) {
+      const gate = checkSecurityQuarantineWrite(
+        auth,
+        c.get('permissions') as UserPermissions | undefined,
+        { orgId: policy.orgId, partnerId: policy.partnerId },
+        data.inlineSettings,
+      );
+      if (!gate.allowed) return c.json(gate.body, 403);
+      securityAuthority = gate.executionAuthority;
+      const ruleSets = await checkSecurityRuleSetsWrite(
+        { orgId: policy.orgId, partnerId: policy.partnerId },
+        data.inlineSettings,
+      );
+      if (!ruleSets.ok) return c.json(ruleSets.body, ruleSets.status);
+    }
+
+    // #6960: same checks as POST, applied to whichever fields this PATCH sends.
+    const securityAgentsWrite = existingLink.featureType === 'security_agents';
+    let securityAgentsArmAuthorized = false;
+    if (securityAgentsWrite) {
+      securityAgentsArmAuthorized = mayArmSecurityAgents(auth, c.get('permissions') as UserPermissions | undefined);
+      const check = checkSecurityAgentsLinkWrite({
+        featurePolicyId: data.featurePolicyId,
+        inlineSettings: data.inlineSettings,
+        armAuthorized: securityAgentsArmAuthorized,
+      });
+      if (!check.ok) return c.json(check.refusal.body, check.refusal.status);
+      if (data.inlineSettings !== undefined) data.inlineSettings = check.inlineSettings;
+    }
+
+    // #11070: same checks as POST, compared with the stored link.
+    const oemUpdatesWrite = existingLink.featureType === 'oem_updates';
+    let oemUpdatesArmAuthorized = false;
+    if (oemUpdatesWrite) {
+      oemUpdatesArmAuthorized = mayArmOemUpdates(auth, c.get('permissions') as UserPermissions | undefined);
+      const check = checkOemUpdatesLinkWrite({
+        featurePolicyId: data.featurePolicyId,
+        previous: existingLink.inlineSettings ?? null,
+        next: data.inlineSettings,
+        armAuthorized: oemUpdatesArmAuthorized,
+      });
+      if (!check.ok) return c.json(check.refusal.body, check.refusal.status);
+      if (data.inlineSettings !== undefined) data.inlineSettings = check.inlineSettings;
+    }
+
+    if (existingLink.featureType === 'containment') {
+      if (data.featurePolicyId) {
+        return c.json({ error: 'containment is inline-only; featurePolicyId must not be set' }, 400);
+      }
+      if (data.inlineSettings !== undefined) {
+        const parsed = containmentInlineSettingsSchema.safeParse(data.inlineSettings);
+        if (!parsed.success) {
+          return c.json(zodValidationErrorBody('Invalid containment settings', parsed.error), 400);
+        }
+        data.inlineSettings = parsed.data;
+      }
     }
 
     if (data.featurePolicyId !== undefined && data.featurePolicyId !== null) {
@@ -450,7 +765,6 @@ featureLinkRoutes.patch(
             400
           );
         }
-        data.inlineSettings = parsed.data;
       }
       if (existingLink.featureType === 'backup') {
         // PATCH may keep the existing profile reference (featurePolicyId
@@ -539,32 +853,6 @@ featureLinkRoutes.patch(
         }
         data.inlineSettings = parsed.data;
       }
-      // Reject offline alert rules whose duration exceeds the re-eval horizon —
-      // such a rule could never fire (issue #1982). Runs before the schema parse
-      // so the specific message wins (same ordering as the POST route).
-      if (existingLink.featureType === 'alert_rule') {
-        const violation = findOfflineDurationViolation(data.inlineSettings);
-        if (violation) return c.json({ error: violation }, 400);
-
-        const parsed = alertRuleInlineSettingsSchema.safeParse(data.inlineSettings);
-        if (!parsed.success) {
-          return c.json(
-            zodValidationErrorBody('Invalid alert_rule settings', parsed.error),
-            400
-          );
-        }
-        data.inlineSettings = parsed.data;
-      }
-      if (existingLink.featureType === 'monitoring') {
-        const parsed = monitoringInlineSettingsSchema.safeParse(data.inlineSettings);
-        if (!parsed.success) {
-          return c.json(
-            zodValidationErrorBody('Invalid monitoring settings', parsed.error),
-            400
-          );
-        }
-        // Validate only — see the POST route for why parsed.data isn't written back.
-      }
       if (existingLink.featureType === 'monitors') {
         const parsed = monitorsInlineSettingsSchema.safeParse(data.inlineSettings);
         if (!parsed.success) {
@@ -586,17 +874,82 @@ featureLinkRoutes.patch(
         }
         data.inlineSettings = parsed.data;
       }
+      if (existingLink.featureType === 'hardware_monitoring') {
+        const parsed = hardwareMonitoringInlineSettingsSchema.safeParse(data.inlineSettings);
+        if (!parsed.success) {
+          return c.json(
+            zodValidationErrorBody('Invalid hardware monitoring settings', parsed.error),
+            400
+          );
+        }
+        data.inlineSettings = parsed.data;
+      }
+      if (existingLink.featureType === 'time_sync') {
+        const parsed = timeSyncInlineSettingsSchema.safeParse(data.inlineSettings);
+        if (!parsed.success) {
+          return c.json(
+            zodValidationErrorBody('Invalid time sync settings', parsed.error),
+            400
+          );
+        }
+        data.inlineSettings = parsed.data;
+      }
+      if (existingLink.featureType === 'workload_inventory') {
+        const parsed = workloadInventoryInlineSettingsSchema.safeParse(data.inlineSettings);
+        if (!parsed.success) {
+          return c.json(
+            zodValidationErrorBody('Invalid workload inventory settings', parsed.error),
+            400
+          );
+        }
+        data.inlineSettings = parsed.data;
+      }
+      if (existingLink.featureType === 'system_protection') {
+        const parsed = systemProtectionInlineSettingsSchema.safeParse(data.inlineSettings);
+        if (!parsed.success) {
+          return c.json(
+            zodValidationErrorBody('Invalid system protection settings', parsed.error),
+            400
+          );
+        }
+        data.inlineSettings = parsed.data;
+      }
+      if (existingLink.featureType === 'compliance') {
+        const refusal = complianceNamesRefusal(data.inlineSettings);
+        if (refusal) return c.json(refusal, 400);
+      }
     }
 
     let updated;
     try {
-      updated = await updateFeatureLink(linkId, data, id, { userId: auth.user.id });
+      updated = securitySettingsWrite
+        ? await updateFeatureLink(linkId, data, id, { userId: auth.user.id }, undefined, {
+            executionAuthority: securityAuthority,
+          })
+        : securityAgentsWrite
+        ? await updateFeatureLink(linkId, data, id, { userId: auth.user.id }, undefined, {
+            securityAgentsArmAuthorized,
+          })
+        : oemUpdatesWrite
+        ? await updateFeatureLink(linkId, data, id, { userId: auth.user.id }, undefined, {
+            oemUpdatesArmAuthorized,
+          })
+        : await updateFeatureLink(linkId, data, id, { userId: auth.user.id });
     } catch (error) {
       if (error instanceof AutomationReferenceAuthorizationError) {
         return c.json({ error: 'Unknown or unauthorized automation reference' }, 400);
       }
       if (error instanceof WarrantyConsentError) {
         return c.json({ error: error.message, code: WARRANTY_CONSENT_REFUSAL.code }, 400);
+      }
+      if (error instanceof SecurityAgentsLinkWriteError) {
+        return c.json(error.body, error.status);
+      }
+      if (error instanceof OemUpdatesLinkWriteError) {
+        return c.json(error.body, error.status);
+      }
+      if (error instanceof BackupDestinationNotInOrgError) {
+        return c.json({ error: error.message, code: error.code }, 400);
       }
       if (isMonitorNotAttachableDbError(error)) {
         return c.json({ error: 'MONITOR_NOT_ATTACHABLE' }, 400);
@@ -613,8 +966,9 @@ featureLinkRoutes.patch(
       resourceName: policy.name,
       details: { linkId, changedFields: Object.keys(data) },
     });
+    invalidateRemoteAccessCacheFor(existingLink.featureType);
 
-    return c.json(updated);
+    return c.json(withoutFeatureLinkAuthority(updated));
   }
 );
 
@@ -656,6 +1010,14 @@ featureLinkRoutes.delete(
       if (!gate.allowed) return c.json(gate.body, 403);
     }
 
+    // #11070: deleting an override reverts the policy to its parent's vendor
+    // updates link. When that revert arms beyond the override, it is arming
+    // through a second door. Fails CLOSED on an unresolved parent.
+    if (existingLink.featureType === 'oem_updates' && overrideDeleteArmsOemUpdates(policy)) {
+      const gate = checkOemUpdatesArmAllowed(auth, c.get('permissions') as UserPermissions | undefined);
+      if (!gate.allowed) return c.json(gate.body, 403);
+    }
+
     const deleted = await removeFeatureLink(linkId, id);
     if (!deleted) return c.json({ error: 'Feature link not found' }, 404);
 
@@ -667,6 +1029,7 @@ featureLinkRoutes.delete(
       resourceName: policy.name,
       details: { linkId, featureType: deleted.featureType },
     });
+    invalidateRemoteAccessCacheFor(deleted.featureType);
 
     return c.json(deleted.kept ? { success: true, kept: true, reason: deleted.reason } : { success: true });
   }

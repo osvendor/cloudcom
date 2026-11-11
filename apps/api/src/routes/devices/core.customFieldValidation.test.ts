@@ -1,11 +1,16 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
+import { ERROR_CODES } from '@breeze/shared';
 
 // #3257 W04: PATCH /devices/:id validates a `customFields` payload against
 // its definition too, sharing services/customFields/validateValueMap.ts with
 // PATCH /devices/:id/custom-fields (customFieldValues.ts). Isolated from
 // core.permissions.test.ts's larger gate suite so this wave's tests don't
 // collide with unrelated work on that file.
+
+// PATCH /devices/:id requests a dynamic-group re-evaluation after commit (#8832);
+// the db mock has no runAfterDbContextCommit, so stub the producer.
+vi.mock('../../jobs/deviceGroupJobs', () => ({ requestDeviceGroupReevaluationAfterCommit: vi.fn() }));
 
 vi.mock('../../db', () => ({
   runOutsideDbContext: vi.fn((fn: () => unknown) => fn()),
@@ -177,7 +182,7 @@ describe('PATCH /devices/:id — custom field value validation (#3257 W04)', () 
 
     expect(res.status).toBe(400);
     const body = await res.json();
-    expect(body.code).toBe('invalid-custom-field-value');
+    expect(body.code).toBe(ERROR_CODES.INVALID_CUSTOM_FIELD_VALUE);
     expect(body.fields).toEqual([{ fieldKey: 'purchase_date', reason: 'invalid_date' }]);
     expect(updateSpy.set).not.toHaveBeenCalled();
     expect(vi.mocked(persistDeviceCustomFieldValues)).not.toHaveBeenCalled();

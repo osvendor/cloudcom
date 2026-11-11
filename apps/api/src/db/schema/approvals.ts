@@ -4,6 +4,7 @@ import { users } from './users';
 import { oauthClients, oauthSessions } from './oauth';
 import { aiToolExecutions } from './ai';
 import { actionIntents } from './actionIntents';
+import { diagnosticAccessGrants } from './diagnosticAccess';
 
 export const approvalRiskTierEnum = pgEnum('approval_risk_tier', [
   'low',
@@ -32,7 +33,7 @@ export const approvalRequests = pgTable(
     id: uuid('id').primaryKey().defaultRandom(),
     userId: uuid('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
     requestingClientId: text('requesting_client_id').references(() => oauthClients.id),
-    requestingSessionId: text('requesting_session_id').references(() => oauthSessions.id),
+    requestingSessionId: text('requesting_session_id').references(() => oauthSessions.id, { onDelete: 'set null' }),
     requestingClientLabel: varchar('requesting_client_label', { length: 255 }).notNull(),
     requestingMachineLabel: varchar('requesting_machine_label', { length: 255 }),
     actionLabel: text('action_label').notNull(),
@@ -44,6 +45,19 @@ export const approvalRequests = pgTable(
     expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
     decidedAt: timestamp('decided_at', { withTimezone: true }),
     decisionReason: text('decision_reason'),
+    /**
+     * Set when the approver approved but the server refused to apply the
+     * approve in the same decide transaction: a PAM elevation whose target
+     * identity could not be verified (`createPamDecisionIntent`). The row is
+     * then `denied`, because `status` records what took effect. The
+     * approver's approve is still on the row: `user_id`, `decided_at`,
+     * `decided_via` and `decided_assurance_level` describe it, and
+     * `decision_reason` stays the approver's own reason. A non-null value is
+     * what tells "approved, then refused" apart from "the approver denied".
+     * `approval_requests_refusal_reason_status_chk` allows it only on a
+     * denied row.
+     */
+    refusalReason: text('refusal_reason'),
     /**
      * For AI-agent-initiated approvals, links back to the
      * `ai_tool_executions` row that the SDK is blocked on via
@@ -79,6 +93,19 @@ export const approvalRequests = pgTable(
      * approval_requests_one_source_chk.
      */
     intentId: uuid('intent_id').references(() => actionIntents.id, { onDelete: 'cascade' }),
+
+    /**
+     * Diagnostic read grants (migration 2026-12-13-130000): links this
+     * fanned-out approval row to the `diagnostic_access_grants` request it
+     * decides. Same first-wins shape as elevation_request_id. ON DELETE SET
+     * NULL so a purged grant leaves the decision row readable for audit.
+     * Mutually exclusive with the other three links
+     * (approval_requests_one_source_chk).
+     */
+    diagnosticAccessGrantId: uuid('diagnostic_access_grant_id').references(
+      () => diagnosticAccessGrants.id,
+      { onDelete: 'set null' },
+    ),
 
     /**
      * What content this decision approved: SHA-256 hex digest bound at

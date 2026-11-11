@@ -7,9 +7,10 @@ import { getBullMQConnection } from '../services/redis';
 import { createInstrumentedQueue } from '../services/bullmqQueue';
 import { computeAndPersistDeviceReliability, computeAndPersistOrgReliability } from '../services/reliabilityScoring';
 import { captureException } from '../services/sentry';
-import { isReusableState } from '../services/bullmqUtils';
+import { bullmqJobId, isReusableState } from '../services/bullmqUtils';
 import { jobSchedule } from './scheduleRegistry';
 import { attachWorkerObservability } from './workerObservability';
+import { notParkedDeviceCondition } from '../services/unassignedPool/selectorPredicate';
 
 const { db } = dbModule;
 // #1105 (duration variant): withSystemDbAccessContext holds a DB transaction
@@ -82,7 +83,7 @@ async function processScanOrgs(data: ScanOrgsJobData): Promise<{ queued: number 
     db
       .select({ orgId: devices.orgId })
       .from(devices)
-      .where(sql`${devices.status} <> 'decommissioned' AND ${devices.isEphemeral} = false`)
+      .where(sql`${devices.status} <> 'decommissioned' AND ${devices.isEphemeral} = false AND ${notParkedDeviceCondition()}`)
       .groupBy(devices.orgId)
   );
 
@@ -204,10 +205,20 @@ export async function shutdownReliabilityWorker(): Promise<void> {
   }
 }
 
-export async function enqueueDeviceReliabilityComputation(deviceId: string): Promise<string> {
+export async function enqueueDeviceReliabilityComputation(
+  deviceId: string,
+  opts: { dedupeKey?: string } = {},
+): Promise<string> {
   const queue = getReliabilityQueue();
-  const slot = Math.floor(Date.now() / ON_DEMAND_RELIABILITY_DEDUPE_WINDOW_MS).toString(36);
-  const jobId = `reliability-device:${deviceId}:${slot}`;
+  // #5876: a baseline change must recompute even if a routine on-demand run
+  // already claimed this 10-minute slot, so callers can key the job themselves.
+  const jobId = opts.dedupeKey
+    ? bullmqJobId('reliability-device', deviceId, 'k', opts.dedupeKey)
+    : bullmqJobId(
+      'reliability-device',
+      deviceId,
+      Math.floor(Date.now() / ON_DEMAND_RELIABILITY_DEDUPE_WINDOW_MS).toString(36),
+    );
   const existing = await queue.getJob(jobId);
   if (existing) {
     const state = await existing.getState();

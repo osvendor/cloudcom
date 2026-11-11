@@ -184,12 +184,24 @@ vi.mock('./ticketService', async () => {
   return { ...actual, createTicket: createTicketMock };
 });
 
+// The domain views are built by the verification service (its own suite covers
+// them); here they are a marker so the tests prove WHICH columns the CRUD paths
+// select and that every returned row passes through the view builder.
+const { viewSpy } = vi.hoisted(() => ({ viewSpy: vi.fn() }));
+vi.mock('./portalDomainVerification', () => ({
+  customerDomainRowColumns: () => ({ id: 'id', domain: 'domain', orgId: 'orgId' }),
+  buildCustomerDomainViews: async (rows: Array<Record<string, unknown>>) => {
+    viewSpy(rows);
+    return rows.map((r) => ({ ...r, viewed: true }));
+  },
+}));
+
 import {
   getTicketConfig, createTicketStatus, updateTicketStatus, reorderTicketStatuses,
   upsertPrioritySettings, upsertOrgTicketSettings, getOrgTicketSettings,
   TicketConfigServiceError, findStatusByName, listActiveStatusNames,
   listEmailInboundQueue, convertEmailInbound, dismissEmailInbound,
-  createCustomerEmailDomain,
+  createCustomerEmailDomain, updateCustomerEmailDomain, listCustomerEmailDomains,
 } from './ticketConfigService';
 
 const PARTNER = 'p-1';
@@ -350,7 +362,20 @@ describe('getTicketConfig inbound block', () => {
     const cfg = await getTicketConfig('p-1');
     expect(cfg.inbound.unknownSenderMode).toBe('quarantine');
     expect(cfg.inbound.dropUnverifiedSenders).toBe(false);
+    expect(cfg.inbound.staffForwardRouting).toBe(false);
     expect(cfg.inbound.triageUnknownSenders).toBe(false);
+  });
+  it('surfaces staffForwardRouting=true so the card can read it back and preserve it', async () => {
+    enqueueForInbound({ slug: 'acme', settings: { ticketing: { inbound: { staffForwardRouting: true } } } });
+    const cfg = await getTicketConfig(PARTNER);
+    expect(cfg.inbound.staffForwardRouting).toBe(true);
+  });
+  it('surfaces defaultAssigneeUserId (null when unset) so the card can show and preserve it', async () => {
+    enqueueForInbound({ slug: 'acme', settings: {} });
+    expect((await getTicketConfig(PARTNER)).inbound.defaultAssigneeUserId).toBeNull();
+    const user = '55555555-5555-4555-8555-555555555555';
+    enqueueForInbound({ slug: 'acme', settings: { ticketing: { inbound: { defaultAssigneeUserId: user } } } });
+    expect((await getTicketConfig(PARTNER)).inbound.defaultAssigneeUserId).toBe(user);
   });
   it('surfaces an explicit unknownSenderMode=drop and dropUnverifiedSenders=true', async () => {
     enqueueForInbound({ slug: 'acme', settings: { ticketing: { inbound: { unknownSenderMode: 'drop', dropUnverifiedSenders: true } } } });
@@ -655,7 +680,7 @@ describe('listEmailInboundQueue', () => {
 
 // ── convertEmailInbound / dismissEmailInbound ─────────────────────────────
 
-const ACTOR = { userId: 'admin-u-1', name: 'Ada Admin' };
+const ACTOR = { kind: 'user' as const, userId: 'admin-u-1', name: 'Ada Admin' };
 
 describe('convertEmailInbound', () => {
   beforeEach(() => createTicketMock.mockReset());
@@ -675,6 +700,41 @@ describe('convertEmailInbound', () => {
     );
     expect(row.ticketId).toBe('t-9');
     expect(row.parseStatus).toBe('created');
+  });
+  it('converts a MICROSOFT 365 row with its body and sender name (#8299)', async () => {
+    // Build `raw` with the real Graph normalizer, so the Convert path and the
+    // normalizer cannot drift apart again: Convert must read what Graph writes.
+    const { normalizeGraphMessage } = await import('./ticketMailbox/normalizeGraphMessage');
+    const raw = normalizeGraphMessage({
+      id: 'graph-1',
+      subject: 'printer down',
+      from: { emailAddress: { address: 'cust@client.example', name: 'Chris Customer' } },
+      body: { contentType: 'html', content: '<p>the printer is on fire</p>' },
+    }, 'p-1', 'help@client.example').raw;
+    dbMocks.selectResults.push([{ id: 'm-1', partnerId: 'p-1', parseStatus: 'quarantined', fromAddress: 'cust@client.example', subject: 'printer down', toAddress: 'help@client.example', raw }]);
+    dbMocks.selectResults.push([{ id: 'o-1' }]);
+    dbMocks.updateResult = [{ id: 'm-1', fromAddress: 'cust@client.example', toAddress: 'help@client.example', subject: 'printer down', parseStatus: 'created', error: null, ticketId: 't-9', createdAt: new Date() }];
+    createTicketMock.mockResolvedValue({ id: 't-9' });
+    await convertEmailInbound('p-1', 'm-1', 'o-1', ACTOR);
+    expect(createTicketMock).toHaveBeenCalledWith(
+      expect.objectContaining({ description: 'the printer is on fire', submitterName: 'Chris Customer', submitterEmail: 'cust@client.example' }),
+      ACTOR,
+    );
+  });
+
+  it('converts a GMAIL row from its neutral raw keys (bodyText/fromName), not the Mailgun keys', async () => {
+    // A Gmail row's raw has no stripped-text/body-plain/from; it carries neutral
+    // bodyText + fromName (normalizeGmailMessage). Reading only the Mailgun keys
+    // produced an empty description and no submitter name for every Gmail convert.
+    dbMocks.selectResults.push([{ id: 'g-1', partnerId: 'p-1', parseStatus: 'quarantined', fromAddress: 'cust@client.example', subject: 'printer down', toAddress: 'help@client.example', raw: { gmailMessageId: 'gm-1', bodyText: 'the printer is on fire', fromName: 'Chris Customer' } }]);
+    dbMocks.selectResults.push([{ id: 'o-1' }]);
+    dbMocks.updateResult = [{ id: 'g-1', fromAddress: 'cust@client.example', toAddress: 'help@client.example', subject: 'printer down', parseStatus: 'created', error: null, ticketId: 't-9', createdAt: new Date() }];
+    createTicketMock.mockResolvedValue({ id: 't-9' });
+    await convertEmailInbound('p-1', 'g-1', 'o-1', ACTOR);
+    expect(createTicketMock).toHaveBeenCalledWith(
+      expect.objectContaining({ description: 'the printer is on fire', submitterName: 'Chris Customer', submitterEmail: 'cust@client.example' }),
+      ACTOR,
+    );
   });
   it('falls back to body-plain when stripped-text is absent', async () => {
     dbMocks.selectResults.push([{ id: 'r-1', partnerId: 'p-1', parseStatus: 'quarantined', fromAddress: 'jane@x.com', subject: 'printer', toAddress: 'acme@tickets.example.com', raw: { 'body-plain': 'plain body only', from: 'jane@x.com' } }]);
@@ -791,7 +851,9 @@ describe('createCustomerEmailDomain', () => {
       { orgId: 'o-1', domain: 'acme.com', autoCreateContact: true },
       DOMAIN_ACTOR,
     );
-    expect(row).toEqual({ id: 'd-1', domain: 'acme.com', orgId: 'o-1' });
+    // returned through the explicit projection + view builder, never the raw row
+    expect(row).toEqual({ id: 'd-1', domain: 'acme.com', orgId: 'o-1', viewed: true });
+    expect(viewSpy).toHaveBeenCalledTimes(1);
   });
 
   it('throws ORG_NOT_ACCESSIBLE when the org is not under the partner', async () => {
@@ -810,5 +872,48 @@ describe('createCustomerEmailDomain', () => {
     await expect(
       createCustomerEmailDomain(PARTNER, { orgId: 'o-1', domain: 'acme.com', autoCreateContact: true }, DOMAIN_ACTOR),
     ).rejects.toMatchObject({ status: 409, code: 'DOMAIN_ALREADY_MAPPED' });
+  });
+});
+
+// ── updateCustomerEmailDomain / listCustomerEmailDomains ──────────────────
+
+describe('updateCustomerEmailDomain', () => {
+  it('writes only orgId / autoCreateContact / isActive, even if the input carries verification columns', async () => {
+    dbMocks.updateResult = [{ id: 'd-1', domain: 'acme.com', orgId: 'o-1' }];
+    const hostile = {
+      isActive: false,
+      verifiedAt: new Date(), verifiedMethod: 'dns_txt', verificationToken: 'x', verifiedEvidence: { via: 'x' },
+    } as unknown as Parameters<typeof updateCustomerEmailDomain>[2];
+    const row = await updateCustomerEmailDomain(PARTNER, 'd-1', hostile);
+    expect(Object.keys(dbMocks.updateSetArgs[0]!).sort()).toEqual(['isActive', 'updatedAt']);
+    expect(row).toMatchObject({ id: 'd-1', viewed: true });
+  });
+
+  it('picks orgId (the repoint) and autoCreateContact when given', async () => {
+    dbMocks.selectResults.push([{ id: 'o-2' }]); // org guard
+    dbMocks.updateResult = [{ id: 'd-1', domain: 'acme.com', orgId: 'o-2' }];
+    await updateCustomerEmailDomain(PARTNER, 'd-1', { orgId: 'o-2', autoCreateContact: false });
+    expect(Object.keys(dbMocks.updateSetArgs[0]!).sort()).toEqual(['autoCreateContact', 'orgId', 'updatedAt']);
+  });
+
+  it('still throws DOMAIN_MAPPING_NOT_FOUND 404 when no row matches', async () => {
+    dbMocks.updateResult = [];
+    await expect(updateCustomerEmailDomain(PARTNER, 'd-x', { isActive: true })).rejects.toMatchObject({ status: 404, code: 'DOMAIN_MAPPING_NOT_FOUND' });
+  });
+});
+
+describe('listCustomerEmailDomains', () => {
+  it('returns viewed rows carrying the org name (additive over the old list shape)', async () => {
+    dbMocks.selectResults.push([{ id: 'd-1', domain: 'acme.com', orgId: 'o-1', orgName: 'ACME' }]);
+    const rows = await listCustomerEmailDomains(PARTNER);
+    expect(rows).toEqual([{ id: 'd-1', domain: 'acme.com', orgId: 'o-1', orgName: 'ACME', viewed: true }]);
+  });
+
+  it('adds an org filter for the org-scoped list', async () => {
+    dbMocks.selectResults.push([]);
+    await listCustomerEmailDomains(PARTNER, { orgId: 'o-1' });
+    const predicate = JSON.stringify(dbMocks.whereArgs.at(-1));
+    expect(predicate).toContain('o-1');
+    expect(predicate).toContain(PARTNER);
   });
 });

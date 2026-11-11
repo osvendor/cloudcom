@@ -6,6 +6,7 @@ import { fetchWithAuth } from '../../stores/auth';
 
 vi.mock('../../stores/auth', () => ({
   fetchWithAuth: vi.fn(),
+  restoreAccessTokenFromCookie: vi.fn(async () => true),
 }));
 
 const fetchMock = vi.mocked(fetchWithAuth);
@@ -282,7 +283,8 @@ describe('RecoveryBootstrapTab', () => {
         '/backup/bmr/recover/authenticate',
         expect.objectContaining({
           method: 'POST',
-          body: JSON.stringify({ token: 'brz_rec_123' }),
+          // The preview reports an enforcing client: it only reads the bootstrap.
+          body: JSON.stringify({ token: 'brz_rec_123', integrityProtocolVersion: 2 }),
         })
       );
     });
@@ -298,6 +300,280 @@ describe('RecoveryBootstrapTab', () => {
     // rows carry a sha256 (rendered directly), not the old per-artifact
     // bootTemplate* trust metadata.
     expect(screen.getByText('breeze-recovery-linux-amd64.iso')).toBeTruthy();
+  });
+
+  it('asks for confirmation before creating a token for a backup without an integrity attestation, then resubmits', async () => {
+    const base = fetchMock.getMockImplementation()!;
+    let tokenPosts = 0;
+    fetchMock.mockImplementation(async (input, init) => {
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      if (String(input) === '/backup/bmr/tokens' && method === 'POST') {
+        tokenPosts += 1;
+        if (tokenPosts === 1) return makeJsonResponse({
+          error: 'Confirm the restore.',
+          code: 'STEP_UP_REQUIRED',
+          stepUp: {
+            operation: 'backup_unattested_restore',
+            method: 'confirm',
+            reason: 'unattested_legacy',
+            resource: { snapshotId: 'snapshot-1', targetDeviceId: 'device-1', commandType: 'bmr_recover' },
+          },
+        }, false, 403);
+      }
+      return base(input, init);
+    });
+
+    render(<RecoveryBootstrapTab />);
+    await screen.findByText('Nightly Snapshot');
+    fireEvent.click(screen.getByRole('button', { name: /Create token/i }));
+
+    await screen.findByTestId('unattested-restore-stepup');
+    fireEvent.click(screen.getByTestId('unattested-restore-stepup-confirm'));
+
+    const expectedCommand = `breeze-backup bmr-recover --token brz_rec_123 --server ${window.location.origin}`;
+    expect(await screen.findByText(expectedCommand)).toBeTruthy();
+    const bodies = fetchMock.mock.calls
+      .filter(([url, init]) => url === '/backup/bmr/tokens' && (init as RequestInit | undefined)?.method === 'POST')
+      .map(([, init]) => JSON.parse(String((init as RequestInit).body)));
+    expect(bodies[1]).toMatchObject({ snapshotId: 'snapshot-1', confirmUnattestedRestore: true });
+    expect(bodies[0]).not.toHaveProperty('confirmUnattestedRestore');
+  });
+
+  it('sends a user without a second factor to set one up before creating a token, and Retry resubmits it', async () => {
+    const base = fetchMock.getMockImplementation()!;
+    let tokenPosts = 0;
+    fetchMock.mockImplementation(async (input, init) => {
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      if (String(input) === '/backup/bmr/tokens' && method === 'POST') {
+        tokenPosts += 1;
+        if (tokenPosts === 1) return makeJsonResponse({
+          error: 'Enroll a second factor to confirm this restore.',
+          code: 'MFA_ENROLLMENT_REQUIRED',
+          stepUp: {
+            operation: 'backup_unattested_restore',
+            method: 'enroll',
+            reason: 'unattested_legacy',
+            resource: { snapshotId: 'snapshot-1', targetDeviceId: 'device-1', commandType: 'bmr_recover' },
+          },
+        }, false, 403);
+      }
+      return base(input, init);
+    });
+
+    render(<RecoveryBootstrapTab />);
+    await screen.findByText('Nightly Snapshot');
+    fireEvent.click(screen.getByRole('button', { name: /Create token/i }));
+
+    expect((await screen.findByTestId('unattested-restore-stepup-enroll')).getAttribute('href')).toBe('/settings/profile');
+    expect(screen.queryByTestId('unattested-restore-stepup-confirm')).toBeNull();
+    fireEvent.click(screen.getByTestId('unattested-restore-stepup-retry'));
+
+    const expectedCommand = `breeze-backup bmr-recover --token brz_rec_123 --server ${window.location.origin}`;
+    expect(await screen.findByText(expectedCommand)).toBeTruthy();
+    const bodies = fetchMock.mock.calls
+      .filter(([url, init]) => url === '/backup/bmr/tokens' && (init as RequestInit | undefined)?.method === 'POST')
+      .map(([, init]) => JSON.parse(String((init as RequestInit).body)));
+    expect(bodies).toHaveLength(2);
+    expect(bodies[1]).toEqual(bodies[0]);
+    expect(bodies[1]).not.toHaveProperty('stepUpGrant');
+  });
+
+  it('a Retry that fails keeps the set-up link and Retry visible; no token is created', async () => {
+    const base = fetchMock.getMockImplementation()!;
+    let tokenPosts = 0;
+    fetchMock.mockImplementation(async (input, init) => {
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      if (String(input) === '/backup/bmr/tokens' && method === 'POST') {
+        tokenPosts += 1;
+        if (tokenPosts === 1) return makeJsonResponse({
+          error: 'Enroll a second factor to confirm this restore.',
+          code: 'MFA_ENROLLMENT_REQUIRED',
+          stepUp: {
+            operation: 'backup_unattested_restore',
+            method: 'enroll',
+            reason: 'unattested_legacy',
+            resource: { snapshotId: 'snapshot-1', targetDeviceId: 'device-1', commandType: 'bmr_recover' },
+          },
+        }, false, 403);
+        return makeJsonResponse({ error: 'Recovery token service unavailable' }, false, 500);
+      }
+      return base(input, init);
+    });
+
+    render(<RecoveryBootstrapTab />);
+    await screen.findByText('Nightly Snapshot');
+    fireEvent.click(screen.getByRole('button', { name: /Create token/i }));
+    await screen.findByTestId('unattested-restore-stepup-enroll');
+    fireEvent.click(screen.getByTestId('unattested-restore-stepup-retry'));
+
+    await waitFor(() => expect(tokenPosts).toBe(2));
+    await waitFor(() => expect(screen.getByTestId('unattested-restore-stepup-retry')).not.toBeDisabled());
+    expect(screen.getByTestId('unattested-restore-stepup-enroll').getAttribute('href')).toBe('/settings/profile');
+    expect(await screen.findByText('Recovery token service unavailable')).toBeTruthy();
+    expect(screen.queryByText(/brz_rec_123/)).toBeNull();
+    expect(screen.queryByText(/Recovery token created/)).toBeNull();
+  });
+
+  it('shows the snapshot label instead of the bare UUID in the bootstrap detail panel (#6496)', async () => {
+    render(<RecoveryBootstrapTab />);
+
+    await screen.findByText('Manual recovery environment');
+    fireEvent.click(screen.getByRole('button', { name: /Create token/i }));
+
+    const expectedCommand = `breeze-backup bmr-recover --token brz_rec_123 --server ${window.location.origin}`;
+    await screen.findByText(expectedCommand);
+
+    expect(screen.getAllByText('Nightly Snapshot').length).toBeGreaterThan(0);
+    expect(screen.queryByText('snapshot-1')).toBeNull();
+  });
+
+  it('formats a linked restore job\'s restored size instead of printing raw bytes (#6496)', async () => {
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+
+      if (url === '/backup/snapshots') {
+        return makeJsonResponse({
+          data: [{ id: 'snapshot-1', label: 'Nightly Snapshot', timestamp: '2026-03-28T10:00:00Z', size: 2147483648 }],
+        });
+      }
+      if (url === '/backup/bmr/tokens?limit=100' && method === 'GET') return makeJsonResponse({ data: [] });
+      if (url === '/backup/bmr/media?limit=100' && method === 'GET') return makeJsonResponse({ data: [] });
+      if (url === '/backup/bmr/boot-media?limit=100' && method === 'GET') return makeJsonResponse({ data: [] });
+
+      if (url === '/backup/bmr/tokens' && method === 'POST') {
+        return makeJsonResponse({
+          id: 'token-1',
+          token: 'brz_rec_123',
+          deviceId: 'device-1',
+          snapshotId: 'snapshot-1',
+          restoreType: 'bare_metal',
+          status: 'active',
+          sessionStatus: 'pending',
+          createdAt: '2026-03-31T10:00:00Z',
+          expiresAt: '2026-04-01T10:00:00Z',
+          restoreJobId: 'restore-9',
+          linkedRestoreJob: {
+            id: 'restore-9',
+            status: 'completed',
+            completedAt: '2026-03-31T10:20:00Z',
+            restoredFiles: 12,
+            restoredSize: 402653184,
+          },
+          bootstrap: {
+            version: 1,
+            minHelperVersion: '0.5.0',
+            serverUrl: window.location.origin,
+            releaseUrl: 'https://github.com/lanternops/breeze/releases/latest',
+            commandTemplate: `breeze-backup bmr-recover --token <recovery-token> --server "${window.location.origin}"`,
+            prerequisites: ['Boot into a recovery environment.'],
+          },
+        }, true, 201);
+      }
+
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<RecoveryBootstrapTab />);
+    await screen.findByText('Manual recovery environment');
+    fireEvent.click(screen.getByRole('button', { name: /Create token/i }));
+
+    await screen.findByText('384 MB');
+    expect(screen.queryByText('402653184')).toBeNull();
+  });
+
+  const renderWithLinkedResult = async (result: Record<string, unknown>, status = 'completed') => {
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      if (url === '/backup/snapshots') {
+        return makeJsonResponse({
+          data: [{ id: 'snapshot-1', label: 'Nightly Snapshot', timestamp: '2026-03-28T10:00:00Z', size: 2147483648 }],
+        });
+      }
+      if (url === '/backup/bmr/tokens?limit=100' && method === 'GET') return makeJsonResponse({ data: [] });
+      if (url === '/backup/bmr/media?limit=100' && method === 'GET') return makeJsonResponse({ data: [] });
+      if (url === '/backup/bmr/boot-media?limit=100' && method === 'GET') return makeJsonResponse({ data: [] });
+      if (url === '/backup/bmr/tokens' && method === 'POST') {
+        return makeJsonResponse({
+          id: 'token-1',
+          token: 'brz_rec_123',
+          deviceId: 'device-1',
+          snapshotId: 'snapshot-1',
+          restoreType: 'bare_metal',
+          status: 'used',
+          sessionStatus: 'completed',
+          createdAt: '2026-03-31T10:00:00Z',
+          expiresAt: '2026-04-01T10:00:00Z',
+          restoreJobId: 'restore-9',
+          linkedRestoreJob: {
+            id: 'restore-9',
+            status,
+            completedAt: '2026-03-31T10:20:00Z',
+            restoredFiles: 12,
+            restoredSize: 1024,
+            result,
+          },
+          bootstrap: {
+            version: 1,
+            minHelperVersion: '0.5.0',
+            serverUrl: window.location.origin,
+            releaseUrl: 'https://github.com/lanternops/breeze/releases/latest',
+            commandTemplate: `breeze-backup bmr-recover --token <recovery-token> --server "${window.location.origin}"`,
+            prerequisites: ['Boot into a recovery environment.'],
+          },
+        }, true, 201);
+      }
+      return makeJsonResponse({}, false, 404);
+    });
+    render(<RecoveryBootstrapTab />);
+    await screen.findByText('Manual recovery environment');
+    fireEvent.click(screen.getByRole('button', { name: /Create token/i }));
+    await screen.findByText('Linked restore job / result');
+  };
+
+  it('shows files-only Windows recovery as an informational note, not a failure', async () => {
+    await renderWithLinkedResult({
+      status: 'completed',
+      code: 'system_state_requires_rebuild',
+      warnings: ['system_state_requires_rebuild: system state is applied by a bare-metal rebuild; this recovery restored files only'],
+    });
+
+    const note = await screen.findByTestId('restore-result-system-state-note');
+    expect(note.textContent).toContain('System state is applied by a bare-metal rebuild');
+    expect(screen.queryByTestId('recovery-restore-failure-reason')).toBeNull();
+  });
+
+  it('shows an unattested-snapshot warning as a warning, not a failure', async () => {
+    await renderWithLinkedResult({
+      status: 'completed',
+      warnings: ['restored from an unattested snapshot: files were not checked against a snapshot attestation'],
+    });
+
+    const warning = await screen.findByTestId('restore-result-unattested-warning');
+    expect(warning.textContent).toMatch(/not checked against a snapshot attestation/i);
+    expect(screen.queryByTestId('recovery-restore-failure-reason')).toBeNull();
+  });
+
+  it('shows an integrity result code on a failed recovery', async () => {
+    await renderWithLinkedResult(
+      { status: 'failed', code: 'integrity_mismatch', error: 'snapshot manifest failed its integrity check' },
+      'failed',
+    );
+
+    expect((await screen.findByTestId('recovery-restore-failure-reason')).textContent).toContain(
+      'snapshot manifest failed its integrity check',
+    );
+    expect(screen.getByTestId('restore-result-code').textContent).toContain('integrity_mismatch');
+    expect(screen.queryByTestId('restore-result-system-state-note')).toBeNull();
+  });
+
+  it('renders none of the result notes for a result without the new fields', async () => {
+    await renderWithLinkedResult({ status: 'completed', filesRestored: 12 });
+    expect(screen.queryByTestId('restore-result-system-state-note')).toBeNull();
+    expect(screen.queryByTestId('restore-result-unattested-warning')).toBeNull();
+    expect(screen.queryByTestId('restore-result-code')).toBeNull();
+    expect(screen.queryByTestId('recovery-restore-failure-reason')).toBeNull();
   });
 
   // DBT-7: the API refuses `POST /backup/bmr/tokens` with 409

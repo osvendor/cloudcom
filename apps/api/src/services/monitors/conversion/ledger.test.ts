@@ -29,7 +29,7 @@ beforeEach(() => { vi.clearAllMocks(); m.rows = []; m.predicates = []; });
 it.each([true, false])('projects response Undo against target liveness outside this page (%s)', async (live) => {
   m.rows = [[entry], live ? [{ id: TARGET }] : [], []];
   const result = await listConversionLedger({ limit: 1 }, auth);
-  expect(result.items[0]).toMatchObject({ id: RESPONSE, sourceName: 'CPU response', revertable: !live });
+  expect(result.items[0]).toMatchObject({ id: RESPONSE, sourceName: 'CPU response', revertable: false });
   const dependency = new PgDialect().sqlToQuery(m.predicates[1]);
   expect(dependency.sql).toContain('"reverted_at" is null');
   expect(dependency.params).toEqual([TARGET]);
@@ -39,9 +39,9 @@ it('retirement has no dependency and network history preserves its stored name',
   expect((await listConversionLedger({}, auth)).items[0]).toMatchObject({ sourceName: 'Branch gateway', revertable: true, outputs: [] });
 });
 it.each([
-  { row: { ...entry, revertedAt: new Date(1), sourceState: {} }, caller: auth },
-  { row: { ...entry, sourceState: {} }, caller: { ...auth, allowedSiteIds: [] } },
-  { row: { ...entry, orgId: null, partnerId: TARGET, sourceState: {} }, caller: auth },
+  { row: { ...entry, sourceTable: 'network_monitors', revertedAt: new Date(1), sourceState: {} }, caller: auth },
+  { row: { ...entry, sourceTable: 'network_monitors', sourceState: {} }, caller: { ...auth, allowedSiteIds: [] } },
+  { row: { ...entry, sourceTable: 'network_monitors', orgId: null, partnerId: TARGET, sourceState: {} }, caller: auth },
 ])('retains lifecycle, governance and owner restrictions', async ({ row, caller }) => {
   m.rows = [[row], []];
   expect((await listConversionLedger({}, caller)).items[0]!.revertable).toBe(false);
@@ -80,8 +80,8 @@ it('filters by source policy or output association and uses the last visible row
   const result = await listConversionLedger({ orgId: ORG, policyId: TARGET, cursor: TARGET, limit: 1 }, auth);
   expect(result).toEqual({ items: [{
     id: RESPONSE, sourceTable: 'automations', sourceId: RESPONSE, sourceName: 'Template CPU',
-    policyId: null, convertedBy: null, convertedAt: new Date(0).toISOString(), revertedAt: null,
-    revertable: true, outputs: [{ monitorId: TARGET, role: 'primary', reused: true }],
+    policyId: null, convertedBy: null, convertedByName: null, convertedAt: new Date(0).toISOString(), revertedAt: null,
+    revertable: false, outputs: [{ monitorId: TARGET, monitorName: null, role: 'primary', reused: true }],
   }], nextCursor: RESPONSE });
   const predicate = new PgDialect().sqlToQuery(m.predicates[0]);
   expect(predicate.sql).toContain('"monitor_conversions"."policy_id" =');
@@ -93,7 +93,57 @@ it('filters by source policy or output association and uses the last visible row
   expect(new PgDialect().sqlToQuery(m.predicates[1]).params).toEqual([RESPONSE]);
 });
 
+it('resolves the converter and output monitor names for display', async () => {
+  m.rows = [
+    [{ ...entry, convertedBy: RESPONSE, sourceState: {} }],
+    [{ conversionId: RESPONSE, monitorId: TARGET, role: 'primary', reusedMonitor: false }],
+    [{ id: RESPONSE, name: 'Jamie Lee' }],
+    [{ id: TARGET, name: 'High CPU' }],
+  ];
+  const result = await listConversionLedger({}, auth);
+  expect(result.items[0]).toMatchObject({ convertedBy: RESPONSE, convertedByName: 'Jamie Lee',
+    outputs: [{ monitorId: TARGET, monitorName: 'High CPU' }] });
+});
 it('returns an empty terminal page without reading outputs', async () => {
   expect(await listConversionLedger({}, auth)).toEqual({ items: [], nextCursor: null });
   expect(m.predicates).toHaveLength(1);
+});
+// The writers store the converted row under `source` (convert.ts, equivalence.ts),
+// so the ledger must read the name from there, not from a top-level `name`.
+it.each([
+  { sourceState: { source: { id: RESPONSE, name: 'High CPU rule' }, monitorsLink: null }, name: 'High CPU rule' },
+  { sourceState: { source: { id: RESPONSE, watchType: 'service', name: 'Spooler' }, rules: [] }, name: 'Spooler' },
+  { sourceState: { template: { name: 'Template CPU' }, rules: [] }, name: 'Template CPU' },
+])('names history entries from the stored source row ($name)', async ({ sourceState, name }) => {
+  m.rows = [[{ ...entry, sourceState }], []];
+  expect((await listConversionLedger({}, auth)).items[0]).toMatchObject({ sourceName: name });
+});
+
+it.each([
+  'config_policy_alert_rules', 'config_policy_monitoring_watches', 'alert_templates',
+  'automations', 'config_policy_automations',
+])('keeps retired %s history readable with Undo unavailable', sourceTable => {
+  m.rows = [[{ ...entry, sourceTable, sourceState: {} }], []];
+  return expect(listConversionLedger({}, auth)).resolves.toMatchObject({
+    items: [{ id: RESPONSE, sourceTable, revertable: false }],
+  });
+});
+it.each([true, false])('retains the live-target gate for an available runtime (%s)', async live => {
+  m.rows = [[{ ...entry, sourceTable: 'network_monitors' }], live ? [{ id: TARGET }] : [], []];
+  expect((await listConversionLedger({ limit: 1 }, auth)).items[0]!.revertable).toBe(!live);
+});
+
+it('scopes the ledger to one source table when asked (#7212)', async () => {
+  await listConversionLedger({ sourceTable: 'network_monitors' }, auth);
+  const predicate = new PgDialect().sqlToQuery(m.predicates[0]);
+  expect(predicate.sql).toContain('"source_table" =');
+  expect(predicate.params).toContain('network_monitors');
+  m.predicates = [];
+  await listConversionLedger({}, auth);
+  expect(new PgDialect().sqlToQuery(m.predicates[0]).sql).not.toContain('"source_table"');
+});
+
+it('disables Undo for a source released by monitor deletion', async () => {
+  m.rows = [[{ ...entry, sourceTable: 'network_monitors', sourceState: { name: 'Gateway', sourceReleased: true } }], []];
+  expect((await listConversionLedger({}, auth)).items[0]).toMatchObject({ sourceName: 'Gateway', revertable: false });
 });

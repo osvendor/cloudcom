@@ -20,7 +20,7 @@ class FakeConnection:
     def getsockopt(self, *_args): return struct.pack('3i', 99, self.uid, 99)
 class FakeProcess:
     def __init__(self, line):
-        self.stdin = self; self.stdout = self; self.line = line; self.killed = False
+        self.stdin = self; self.stdout = self; self.line = line; self.killed = False; self.pid = 99999999
     def write(self, _value): pass
     def flush(self): pass
     def fileno(self): return 0
@@ -29,6 +29,237 @@ class FakeProcess:
     def wait(self, timeout=None): pass
 
 class ExchangeBrokerTests(unittest.TestCase):
+    def setUp(self):
+        # FakeProcess uses descriptor 0 only as an opaque identifier. Never
+        # change real stdin flags, write to it, or signal real process groups
+        # when these same contracts run under Linux.
+        for name, options in [('set_blocking', {}),
+                              ('write', {'side_effect': lambda _fd, data: len(data)}),
+                              ('killpg', {})]:
+            mocked = patch.object(worker.os, name, create=True, **options)
+            mocked.start(); self.addCleanup(mocked.stop)
+
+    def test_quarantine_request_binding_and_write_classification(self):
+        params = {'messageTraceId': REQUEST['organizationId'], 'recipient': 'qa@example.test', 'received': worker.datetime.datetime.now(worker.datetime.timezone.utc).isoformat()}
+        identity = REQUEST['organizationId'] + '\\' + REQUEST['tenantId']
+        for operation, data in [('quarantine.lookup', params), ('quarantine.release.set', {**params, 'identity': identity})]:
+            request = {**REQUEST, 'operation': operation, 'parameters': data}
+            self.assertEqual(worker.validate_request(request, {REQUEST['tenantId']: DESCRIPTOR})[1], DESCRIPTOR)
+            self.assertEqual(worker.is_write(operation), operation.endswith('.set'))
+            with self.assertRaises(ValueError):
+                worker.validate_request({**request, 'parameters': {**data, 'releaseToAll': True}}, {REQUEST['tenantId']: DESCRIPTOR})
+        with self.assertRaises(ValueError):
+            worker.validate_request({**REQUEST, 'operation': 'quarantine.release.set', 'parameters': {**params, 'identity': params['messageTraceId']}}, {REQUEST['tenantId']: DESCRIPTOR})
+
+
+    def test_group_alias_validation(self):
+        for action in ('group.alias.add', 'group.alias.remove'):
+            request = {**REQUEST, 'operation': action, 'parameters': {'groupId': REQUEST['organizationId'], 'address': 'alias@example.test'}}
+            self.assertEqual(worker.validate_request(request, {REQUEST['tenantId']: DESCRIPTOR})[1], DESCRIPTOR)
+            self.assertTrue(worker.is_write(action))
+            with self.assertRaises(ValueError):
+                worker.validate_request({**request, 'parameters': {**request['parameters'], 'command': 'anything'}}, {REQUEST['tenantId']: DESCRIPTOR})
+
+    def test_distinct_external_autoreply_fields_and_legacy_payload(self):
+        params = {'mailboxId': REQUEST['organizationId'], 'state': 'Enabled', 'message': 'Internal', 'start': None, 'end': None}
+        for extra in ({}, {'externalMessage': 'External', 'externalAudience': 'Known'}):
+            request = {**REQUEST, 'operation': 'mailbox.autoreply.set', 'parameters': {**params, **extra}}
+            self.assertEqual(worker.validate_request(request, {REQUEST['tenantId']: DESCRIPTOR})[1], DESCRIPTOR)
+        for extra in ({'externalAudience': 'Everyone'}, {'externalMessage': None}, {'externalMessage': 'x' * 8193}, {'command': 'anything'}):
+            with self.assertRaises(ValueError):
+                worker.validate_request({**REQUEST, 'operation': 'mailbox.autoreply.set', 'parameters': {**params, **extra}}, {REQUEST['tenantId']: DESCRIPTOR})
+
+    def test_process_owns_and_cleans_exchange_temporary_modules(self):
+        process = FakeProcess(b'')
+        with patch.object(worker.subprocess, 'Popen', return_value=process) as launch:
+            persistent = worker.PersistentPowerShell(REQUEST, DESCRIPTOR, '/unused.ps1')
+        directory = pathlib.Path(persistent.temp_directory.name)
+        (directory / 'tmpEXO_test').mkdir()
+        (directory / 'tmpEXO_test' / 'generated.psm1').write_text('module')
+        self.assertEqual(launch.call_args.kwargs['env']['TMPDIR'], str(directory))
+        persistent.close()
+        self.assertTrue(process.killed)
+        self.assertFalse(directory.exists())
+
+    def test_failed_session_is_retired_without_replaying_request(self):
+        result = {'requestId': REQUEST['requestId'], 'ok': False, 'code': 'provider_rejected'}
+        process = FakeProcess(json.dumps(result).encode() + b'\n')
+        with patch.object(worker.subprocess, 'Popen', return_value=process), patch.object(worker.select, 'select', return_value=([0], [0], [])), patch.object(worker.os, 'read', return_value=process.line):
+            persistent = worker.PersistentPowerShell(REQUEST, DESCRIPTOR, '/unused.ps1')
+            directory = pathlib.Path(persistent.temp_directory.name)
+            self.assertEqual(persistent.run(REQUEST)['code'], 'provider_rejected')
+        self.assertTrue(process.killed)
+        self.assertFalse(directory.exists())
+
+    def test_group_external_write_rejects_injected_fields_and_wrong_readback(self):
+        group_id = '55555555-5555-4555-8555-555555555555'
+        request = {**REQUEST, 'operation': 'group.external.set', 'parameters': {'groupId': group_id, 'allowExternalSenders': True}}
+        self.assertEqual(worker.validate_request(request, {REQUEST['tenantId']: DESCRIPTOR})[1], DESCRIPTOR)
+        with self.assertRaises(ValueError):
+            worker.validate_request({**request, 'parameters': {**request['parameters'], 'command': 'Set-UnifiedGroup'}},
+                                    {REQUEST['tenantId']: DESCRIPTOR})
+        data = {'groupId': group_id, 'allowExternalSenders': True, 'accepted': True, 'verified': True, 'changed': True}
+        self.assertIsNone(worker.valid_success_response({'requestId': request['requestId'], 'ok': True, 'data': data},
+                                                         request['requestId'], 'group.external.set'))
+        self.assertEqual(worker.valid_success_response({'requestId': request['requestId'], 'ok': True,
+                                                         'data': {**data, 'allowExternalSenders': 'true'}},
+                                                        request['requestId'], 'group.external.set'), 'provider_unreachable')
+
+    def test_group_settings_read_is_typed_and_rejects_injected_fields(self):
+        group_id = '55555555-5555-4555-8555-555555555555'
+        request = {**REQUEST, 'operation': 'group.settings.get', 'parameters': {'groupId': group_id}}
+        self.assertEqual(worker.validate_request(request, {REQUEST['tenantId']: DESCRIPTOR})[1], DESCRIPTOR)
+        with self.assertRaises(ValueError):
+            worker.validate_request({**request, 'parameters': {'groupId': group_id, 'command': 'Remove-DistributionGroup'}},
+                                    {REQUEST['tenantId']: DESCRIPTOR})
+        data = {'groupId': group_id, 'kind': 'distribution', 'displayName': 'QA',
+                'primarySmtpAddress': 'qa@example.com', 'requireSenderAuthenticationEnabled': True,
+                'emailAddressPolicyEnabled': False, 'aliases': ['old@example.com']}
+        self.assertIsNone(worker.valid_success_response({'requestId': request['requestId'], 'ok': True, 'data': data},
+                                                         request['requestId'], 'group.settings.get'))
+        self.assertEqual(worker.valid_success_response({'requestId': request['requestId'], 'ok': True,
+                                                         'data': {**data, 'requireSenderAuthenticationEnabled': 'true'}},
+                                                        request['requestId'], 'group.settings.get'), 'provider_unreachable')
+
+    def test_distribution_name_write_is_exact_and_typed(self):
+        group_id = '55555555-5555-4555-8555-555555555555'
+        request = {**REQUEST, 'operation': 'distribution.name.set', 'parameters': {'groupId': group_id, 'displayName': 'QA Renamed'}}
+        self.assertEqual(worker.validate_request(request, {REQUEST['tenantId']: DESCRIPTOR})[1], DESCRIPTOR)
+        with self.assertRaises(ValueError):
+            worker.validate_request({**request, 'parameters': {**request['parameters'], 'command': 'Remove-DistributionGroup'}},
+                                    {REQUEST['tenantId']: DESCRIPTOR})
+        data = {'groupId': group_id, 'displayName': 'QA Renamed', 'accepted': True, 'verified': True, 'changed': True}
+        self.assertIsNone(worker.valid_success_response({'requestId': request['requestId'], 'ok': True, 'data': data},
+                                                         request['requestId'], 'distribution.name.set'))
+        self.assertEqual(worker.valid_success_response({'requestId': request['requestId'], 'ok': True,
+                                                         'data': {**data, 'verified': 'true'}},
+                                                        request['requestId'], 'distribution.name.set'), 'provider_unreachable')
+
+    def test_group_primary_write_is_exact_and_typed(self):
+        group_id = '55555555-5555-4555-8555-555555555555'
+        request = {**REQUEST, 'operation': 'group.primary.set', 'parameters': {'groupId': group_id, 'address': 'new@example.com'}}
+        self.assertEqual(worker.validate_request(request, {REQUEST['tenantId']: DESCRIPTOR})[1], DESCRIPTOR)
+        with self.assertRaises(ValueError):
+            worker.validate_request({**request, 'parameters': {**request['parameters'], 'command': 'Remove-DistributionGroup'}},
+                                    {REQUEST['tenantId']: DESCRIPTOR})
+        data = {'groupId': group_id, 'primarySmtpAddress': 'new@example.com', 'accepted': True, 'verified': True, 'changed': True}
+        self.assertIsNone(worker.valid_success_response({'requestId': request['requestId'], 'ok': True, 'data': data},
+                                                         request['requestId'], 'group.primary.set'))
+        self.assertEqual(worker.valid_success_response({'requestId': request['requestId'], 'ok': True,
+                                                         'data': {**data, 'verified': 'true'}},
+                                                        request['requestId'], 'group.primary.set'), 'provider_unreachable')
+
+    def test_distribution_members_read_is_bounded_and_typed(self):
+        group_id = '55555555-5555-4555-8555-555555555555'
+        request = {**REQUEST, 'operation': 'distribution.members.get', 'parameters': {'groupId': group_id}}
+        self.assertEqual(worker.validate_request(request, {REQUEST['tenantId']: DESCRIPTOR})[1], DESCRIPTOR)
+        with self.assertRaises(ValueError):
+            worker.validate_request({**request, 'parameters': {'groupId': group_id, 'command': 'Remove-Mailbox'}},
+                                    {REQUEST['tenantId']: DESCRIPTOR})
+        data = {'groupId': group_id, 'members': [{'id': '66666666-6666-4666-8666-666666666666',
+                 'displayName': 'QA', 'primarySmtpAddress': 'qa@example.com'}], 'complete': True}
+        self.assertIsNone(worker.valid_success_response({'requestId': request['requestId'], 'ok': True, 'data': data},
+                                                         request['requestId'], 'distribution.members.get'))
+        self.assertEqual(worker.valid_success_response({'requestId': request['requestId'], 'ok': True,
+                                                         'data': {**data, 'members': [{**data['members'][0], 'command': 'x'}]}},
+                                                        request['requestId'], 'distribution.members.get'), 'provider_unreachable')
+
+    def test_distribution_create_is_typed_and_lost_write_is_uncertain(self):
+        request = {**REQUEST, 'operation': 'distribution.create', 'parameters': {
+            'name': 'QA Distribution', 'primarySmtpAddress': 'qa@example.com'}}
+        self.assertEqual(worker.validate_request(request, {REQUEST['tenantId']: DESCRIPTOR})[1], DESCRIPTOR)
+        with self.assertRaises(ValueError):
+            worker.validate_request({**request, 'parameters': {**request['parameters'], 'command': 'Remove-DistributionGroup'}},
+                                    {REQUEST['tenantId']: DESCRIPTOR})
+        data = {'accepted': True, 'verified': True, 'id': None, 'primarySmtpAddress': 'qa@example.com'}
+        self.assertIsNone(worker.valid_success_response({'requestId': request['requestId'], 'ok': True, 'data': data},
+                                                         request['requestId'], 'distribution.create'))
+        self.assertEqual(worker.valid_success_response({'requestId': request['requestId'], 'ok': True,
+                                                         'data': {**data, 'verified': 'true'}}, request['requestId'],
+                                                        'distribution.create'), 'provider_unreachable')
+        process = FakeProcess('')
+        with patch.object(worker.subprocess, 'Popen', return_value=process), patch.object(worker.select, 'select', return_value=([], [], [])):
+            result = worker.PersistentPowerShell(request, DESCRIPTOR, '/unused.ps1').run(request)
+        self.assertEqual(result['code'], 'unknown_write_outcome')
+
+    def test_shared_create_requires_fixed_fields_and_validated_readback(self):
+        request = {**REQUEST, 'operation': 'shared.create', 'parameters': {
+            'name': 'QA Shared', 'primarySmtpAddress': 'shared@example.com'}}
+        self.assertEqual(worker.validate_request(request, {REQUEST['tenantId']: DESCRIPTOR})[1], DESCRIPTOR)
+        with self.assertRaises(ValueError):
+            worker.validate_request({**request, 'parameters': {**request['parameters'], 'command': 'Remove-Mailbox'}},
+                                    {REQUEST['tenantId']: DESCRIPTOR})
+        data = {'accepted': True, 'verified': True, 'id': '55555555-5555-4555-8555-555555555555',
+                'primarySmtpAddress': 'shared@example.com'}
+        self.assertIsNone(worker.valid_success_response({'requestId': request['requestId'], 'ok': True, 'data': data},
+                                                         request['requestId'], 'shared.create'))
+        self.assertEqual(worker.valid_success_response({'requestId': request['requestId'], 'ok': True,
+                                                         'data': {**data, 'id': 'not-a-uuid'}}, request['requestId'],
+                                                        'shared.create'), 'provider_unreachable')
+
+    def test_distribution_membership_requires_exact_ids_and_typed_readback(self):
+        group_id = '55555555-5555-4555-8555-555555555555'
+        member_id = '66666666-6666-4666-8666-666666666666'
+        request = {**REQUEST, 'operation': 'distribution.member.set', 'parameters': {
+            'groupId': group_id, 'memberId': member_id, 'enabled': True}}
+        self.assertEqual(worker.validate_request(request, {REQUEST['tenantId']: DESCRIPTOR})[1], DESCRIPTOR)
+        with self.assertRaises(ValueError):
+            worker.validate_request({**request, 'parameters': {**request['parameters'], 'command': 'Remove-Mailbox'}},
+                                    {REQUEST['tenantId']: DESCRIPTOR})
+        data = {**request['parameters'], 'accepted': True, 'verified': True, 'changed': True}
+        self.assertIsNone(worker.valid_success_response({'requestId': request['requestId'], 'ok': True, 'data': data},
+                                                         request['requestId'], 'distribution.member.set'))
+        self.assertEqual(worker.valid_success_response({'requestId': request['requestId'], 'ok': True,
+                                                         'data': {**data, 'enabled': 'true'}}, request['requestId'],
+                                                        'distribution.member.set'), 'provider_unreachable')
+
+    def test_single_mailbox_statistics_request_and_response_are_bounded(self):
+        mailbox_id = '55555555-5555-4555-8555-555555555555'
+        request = {**REQUEST, 'operation': 'mailbox.statistics.get', 'parameters': {'mailboxId': mailbox_id}}
+        self.assertEqual(worker.validate_request(request, {REQUEST['tenantId']: DESCRIPTOR})[1], DESCRIPTOR)
+        with self.assertRaises(ValueError):
+            worker.validate_request({**request, 'parameters': {'mailboxId': mailbox_id, 'command': 'Remove-Mailbox'}}, {REQUEST['tenantId']: DESCRIPTOR})
+        row = {'id': mailbox_id, 'primarySmtpAddress': 'shared@example.com', 'recipientType': 'SharedMailbox',
+               'archiveEnabled': False, 'mailboxBytes': 123, 'archiveBytes': None,
+               'collectedAt': '2026-09-25T00:00:00Z', 'statisticsUnavailable': False}
+        response = {'requestId': request['requestId'], 'ok': True, 'data': row}
+        self.assertIsNone(worker.valid_success_response(response, request['requestId'], 'mailbox.statistics.get'))
+        self.assertEqual(worker.valid_success_response({**response, 'data': {**row, 'mailboxBytes': -1}}, request['requestId'], 'mailbox.statistics.get'), 'provider_unreachable')
+    def test_preservation_preflight_cannot_claim_safe_license_removal_with_a_hold(self):
+        mailbox_id = '55555555-5555-4555-8555-555555555555'
+        request = {**REQUEST, 'operation': 'mailbox.preservation.get', 'parameters': {'mailboxId': mailbox_id}}
+        self.assertEqual(worker.validate_request(request, {REQUEST['tenantId']: DESCRIPTOR})[1], DESCRIPTOR)
+        with self.assertRaises(ValueError):
+            worker.validate_request({**request, 'parameters': {'mailboxId': mailbox_id, 'command': 'Set-Mailbox'}},
+                                    {REQUEST['tenantId']: DESCRIPTOR})
+        state = {'mailboxId': mailbox_id, 'primarySmtpAddress': 'shared@example.com', 'recipientType': 'SharedMailbox',
+                 'mailboxBytes': 123, 'archiveEnabled': False, 'directorySynced': False, 'litigationHoldEnabled': False,
+                 'inPlaceHolds': [], 'licenseRemovalEligible': True, 'checkedAt': '2026-09-25T00:00:00Z'}
+        response = {'requestId': request['requestId'], 'ok': True, 'data': state}
+        self.assertIsNone(worker.valid_success_response(response, request['requestId'], 'mailbox.preservation.get'))
+        self.assertEqual(worker.valid_success_response({**response, 'data': {**state, 'inPlaceHolds': ['hold-1']}},
+                                                         request['requestId'], 'mailbox.preservation.get'), 'provider_unreachable')
+        self.assertEqual(worker.valid_success_response({**response, 'data': {**state, 'directorySynced': True}},
+                                                         request['requestId'], 'mailbox.preservation.get'), 'provider_unreachable')
+    def test_shared_conversion_accepts_only_fixed_target_and_verified_readback(self):
+        mailbox_id = '55555555-5555-4555-8555-555555555555'
+        request = {**REQUEST, 'operation': 'mailbox.convert.shared', 'parameters': {'mailboxId': mailbox_id}}
+        self.assertEqual(worker.validate_request(request, {REQUEST['tenantId']: DESCRIPTOR})[1], DESCRIPTOR)
+        with self.assertRaises(ValueError):
+            worker.validate_request({**request, 'parameters': {'mailboxId': mailbox_id, 'command': 'Remove-Mailbox'}},
+                                    {REQUEST['tenantId']: DESCRIPTOR})
+        state = {'mailboxId': mailbox_id, 'primarySmtpAddress': 'qa@example.test', 'recipientType': 'SharedMailbox',
+                 'accepted': True, 'verified': True, 'changed': True}
+        response = {'requestId': request['requestId'], 'ok': True, 'data': state}
+        self.assertIsNone(worker.valid_success_response(response, request['requestId'], 'mailbox.convert.shared'))
+        self.assertEqual(worker.valid_success_response({**response, 'data': {**state, 'recipientType': 'UserMailbox'}},
+                                                        request['requestId'], 'mailbox.convert.shared'), 'provider_unreachable')
+        self.assertEqual(worker.valid_success_response({**response, 'data': {**state, 'verified': False}},
+                                                        request['requestId'], 'mailbox.convert.shared'), 'provider_unreachable')
+        process = FakeProcess('')
+        with patch.object(worker.subprocess, 'Popen', return_value=process), patch.object(worker.select, 'select', return_value=([], [], [])):
+            result = worker.PersistentPowerShell(request, DESCRIPTOR, '/unused.ps1').run(request)
+        self.assertEqual(result['code'], 'unknown_write_outcome'); self.assertTrue(process.killed)
     def test_peer_identity_requires_api_uid(self):
         self.assertTrue(worker.peer_allowed(FakeConnection(123), 123))
         self.assertFalse(worker.peer_allowed(FakeConnection(124), 123))
@@ -98,23 +329,48 @@ class ExchangeBrokerTests(unittest.TestCase):
             self_delegate = broker.execute({**delegated, 'parameters': {**delegated['parameters'], 'delegateId': delegated['parameters']['mailboxId']}})
             injected = broker.execute({**delegated, 'parameters': {**delegated['parameters'], 'command': 'Remove-Mailbox'}})
         self.assertEqual(self_delegate['code'], 'invalid_request'); self.assertEqual(injected['code'], 'invalid_request'); process.assert_not_called()
+    def test_delegation_inventory_accepts_only_a_mailbox_id(self):
+        mailbox_id = '55555555-5555-4555-8555-555555555555'
+        request = {**REQUEST, 'operation': 'mailbox.delegation.list', 'parameters': {'mailboxId': mailbox_id}}
+        self.assertEqual(worker.validate_request(request, {REQUEST['tenantId']: DESCRIPTOR})[1], DESCRIPTOR)
+        with self.assertRaises(ValueError):
+            worker.validate_request({**request, 'parameters': {'mailboxId': mailbox_id, 'command': 'Remove-Mailbox'}},
+                                    {REQUEST['tenantId']: DESCRIPTOR})
+        data = {'mailboxId': mailbox_id, 'entries': [{'delegateAddress': 'qa@example.test',
+                'fullAccess': True, 'sendAs': False, 'sendOnBehalf': False}], 'partial': False,
+                'checkedAt': '2026-09-25T00:00:00Z'}
+        result = {'requestId': REQUEST['requestId'], 'ok': True, 'data': data}
+        self.assertIsNone(worker.valid_success_response(result, REQUEST['requestId'], 'mailbox.delegation.list'))
+        self.assertEqual(worker.valid_success_response({**result, 'data': {**data, 'entries': [
+            {**data['entries'][0], 'sendAs': 'true'}]}}, REQUEST['requestId'], 'mailbox.delegation.list'),
+            'provider_unreachable')
     def test_mailbox_response_cannot_exceed_contract_bound(self):
         oversized = {'requestId': REQUEST['requestId'], 'ok': True, 'data': {'records': [{}] * 201, 'partial': True, 'collectedAt': '2026-09-22T00:00:00Z'}}
         process = FakeProcess(json.dumps(oversized).encode('utf-8') + b'\n')
-        with patch.object(worker.subprocess, 'Popen', return_value=process), patch.object(worker.select, 'select', return_value=([0], [], [])), patch.object(worker.os, 'read', return_value=process.line):
+        with patch.object(worker.subprocess, 'Popen', return_value=process), patch.object(worker.select, 'select', return_value=([0], [0], [])), patch.object(worker.os, 'read', return_value=process.line):
             result = worker.PersistentPowerShell(REQUEST, DESCRIPTOR, '/unused.ps1').run(REQUEST)
         self.assertEqual(result['code'], 'response_too_large')
+    def test_mailbox_continuation_is_bound_to_a_valid_snapshot_cursor(self):
+        cursor = '55555555-5555-4555-8555-555555555555:200'
+        continuation = {**REQUEST, 'parameters': {'pageSize': 200, 'cursor': cursor}}
+        self.assertEqual(worker.validate_request(continuation, {REQUEST['tenantId']: DESCRIPTOR})[1], DESCRIPTOR)
+        with self.assertRaises(ValueError):
+            worker.validate_request({**continuation, 'parameters': {'pageSize': 200, 'cursor': 'bad:200'}}, {REQUEST['tenantId']: DESCRIPTOR})
+        data = {'records': [{'id': 'x'}], 'partial': True, 'collectedAt': '2026-09-22T00:00:00Z', 'next': cursor}
+        result = {'requestId': REQUEST['requestId'], 'ok': True, 'data': data}
+        self.assertIsNone(worker.valid_success_response(result, REQUEST['requestId'], 'mailbox.inventory'))
+        self.assertEqual(worker.valid_success_response({**result, 'data': {**data, 'partial': False}}, REQUEST['requestId'], 'mailbox.inventory'), 'provider_unreachable')
     def test_sequential_requests_keep_a_buffered_second_response(self):
         first = {'requestId': REQUEST['requestId'], 'ok': True, 'data': {'records': [], 'partial': True, 'collectedAt': '2026-09-22T00:00:00Z'}}
         second_request = {**REQUEST, 'requestId': '55555555-5555-4555-8555-555555555555'}
         second = {'requestId': second_request['requestId'], 'ok': True, 'data': {'records': [], 'partial': True, 'collectedAt': '2026-09-22T00:00:00Z'}}
         process = FakeProcess(b'')
         combined = (json.dumps(first) + '\n' + json.dumps(second) + '\n').encode('utf-8')
-        with patch.object(worker.subprocess, 'Popen', return_value=process), patch.object(worker.select, 'select', return_value=([0], [], [])), patch.object(worker.os, 'read', return_value=combined):
+        with patch.object(worker.subprocess, 'Popen', return_value=process), patch.object(worker.select, 'select', return_value=([0], [0], [])), patch.object(worker.os, 'read', return_value=combined):
             persistent = worker.PersistentPowerShell(REQUEST, DESCRIPTOR, '/unused.ps1')
             self.assertTrue(persistent.run(REQUEST)['ok'])
             self.assertTrue(persistent.run(second_request)['ok'])
-    def test_descriptor_rotation_waits_for_the_in_flight_worker(self):
+    def test_descriptor_rotation_rejects_excess_work_without_interrupting_active_request(self):
         entered, release, second_done = threading.Event(), threading.Event(), threading.Event()
         active = {REQUEST['tenantId']: DESCRIPTOR}
         class BlockingWorker:
@@ -131,9 +387,122 @@ class ExchangeBrokerTests(unittest.TestCase):
             first = threading.Thread(target=lambda: broker.execute(REQUEST)); first.start(); self.assertTrue(entered.wait(1))
             active[REQUEST['tenantId']] = rotated
             second = threading.Thread(target=lambda: (broker.execute(second_request), second_done.set())); second.start()
-            time.sleep(0.05); self.assertFalse(second_done.is_set())
+            self.assertTrue(second_done.wait(1))
+            self.assertFalse(broker.pool[REQUEST['tenantId']].closed)
             release.set(); first.join(1); second.join(1)
         self.assertTrue(second_done.is_set())
+    def test_global_admission_rejects_requests_before_launch(self):
+        broker = worker.Broker('/unused', '/unused.ps1')
+        broker.admission.acquire()
+        with patch.object(worker, 'PersistentPowerShell') as launch:
+            self.assertEqual(broker.execute(REQUEST)['code'], 'worker_busy')
+            launch.assert_not_called()
+        broker.admission.release()
+
+    def test_invalid_health_probe_stays_healthy_when_busy_or_stopping(self):
+        broker = worker.Broker('/unused', '/unused.ps1')
+        broker.admission.acquire()
+        with patch.object(worker, 'PersistentPowerShell') as launch, patch.object(worker, 'read_config') as config:
+            self.assertEqual(broker.execute({})['code'], 'invalid_request')
+            broker.stopping.set()
+            self.assertEqual(broker.execute({})['code'], 'invalid_request')
+            self.assertEqual(broker.execute({'requestId': 'invalid'})['code'], 'invalid_request')
+            launch.assert_not_called(); config.assert_not_called()
+        broker.admission.release()
+
+    def test_shutdown_refuses_new_requests_and_waits_for_active_session(self):
+        class Session:
+            def __init__(self): self.lock = threading.Lock(); self.closed = False
+            def close(self): self.closed = True
+        broker = worker.Broker('/unused', '/unused.ps1')
+        session = Session(); session.lock.acquire(); broker.pool['tenant'] = session
+        completed = threading.Event()
+        closer = threading.Thread(target=lambda: (broker.close(), completed.set()))
+        closer.start()
+        self.assertTrue(broker.stopping.wait(1))
+        self.assertEqual(broker.execute(REQUEST)['code'], 'worker_busy')
+        self.assertFalse(session.closed)
+        session.lock.release()
+        self.assertTrue(completed.wait(1)); closer.join(1)
+        self.assertTrue(session.closed)
+
+    def test_full_pool_preserves_recent_cursors_and_recycles_only_idle_sessions(self):
+        class Session:
+            def __init__(self, request, descriptor, script):
+                self.descriptor = descriptor; self.used = time.monotonic()
+                self.process = FakeProcess(b''); self.lock = threading.RLock(); self.closed = False
+            def close(self): self.closed = True
+            def run(self, request): return {'requestId': request['requestId'], 'ok': True}
+        broker = worker.Broker('/unused', '/unused.ps1')
+        other = {**REQUEST, 'tenantId': '55555555-5555-4555-8555-555555555555'}
+        other_descriptor = {**DESCRIPTOR, 'tenantId': other['tenantId']}
+        with patch.object(worker, 'read_config', return_value={REQUEST['tenantId']: DESCRIPTOR, other['tenantId']: other_descriptor}), patch.object(worker, 'PersistentPowerShell', Session):
+            self.assertTrue(broker.execute(REQUEST)['ok'])
+            previous = broker.pool[REQUEST['tenantId']]
+            broker.pool['second'] = Session(REQUEST, DESCRIPTOR, '')
+            broker.pool['third'] = Session(REQUEST, DESCRIPTOR, '')
+            self.assertEqual(broker.execute(other)['code'], 'worker_busy')
+            self.assertFalse(previous.closed)
+            self.assertEqual(len(broker.pool), worker.MAX_PERSISTENT_SESSIONS)
+            previous.used -= worker.IDLE_TIMEOUT_SECONDS + 1
+            self.assertTrue(broker.execute(other)['ok'])
+        self.assertTrue(previous.closed)
+        self.assertNotIn(REQUEST['tenantId'], broker.pool)
+        self.assertIn(other['tenantId'], broker.pool)
+        self.assertEqual(len(broker.pool), worker.MAX_PERSISTENT_SESSIONS)
+
+    def test_close_terminates_process_group_on_linux(self):
+        process = FakeProcess(b'')
+        with patch.object(worker.subprocess, 'Popen', return_value=process) as launch:
+            persistent = worker.PersistentPowerShell(REQUEST, DESCRIPTOR, '/unused.ps1')
+        self.assertTrue(launch.call_args.kwargs['start_new_session'])
+        with patch.object(worker.os, 'name', 'posix'), patch.object(worker.signal, 'SIGKILL', 9, create=True), patch.object(worker.os, 'killpg', create=True) as kill_group:
+            persistent.close()
+        kill_group.assert_called_once_with(process.pid, 9)
+
+    def test_idle_sweep_closes_sessions_without_a_followup_request(self):
+        class IdleWorker:
+            used = 0
+            process = FakeProcess(b'')
+            def __init__(self): self.lock = threading.RLock(); self.closed = False
+            def close(self): self.closed = True
+        broker = worker.Broker('/unused', '/unused.ps1')
+        idle = IdleWorker(); broker.pool['tenant'] = idle
+        with patch.object(worker.time, 'monotonic', return_value=worker.IDLE_TIMEOUT_SECONDS + 1): broker.reap_idle()
+        self.assertTrue(idle.closed)
+        self.assertEqual(broker.pool, {})
+
+    def test_idle_sweep_does_not_interrupt_an_active_request(self):
+        class BusyWorker:
+            used = 0
+            process = FakeProcess(b'')
+            def __init__(self): self.lock = threading.Lock(); self.closed = False
+            def close(self): self.closed = True
+        broker = worker.Broker('/unused', '/unused.ps1')
+        busy = BusyWorker(); broker.pool['tenant'] = busy; busy.lock.acquire()
+        try: broker.reap_idle()
+        finally: busy.lock.release()
+        self.assertFalse(busy.closed)
+        broker.close()
+        self.assertTrue(busy.closed)
+
+    def test_continuous_stdout_cannot_extend_command_deadline(self):
+        process = FakeProcess(b'')
+        with patch.object(worker.subprocess, 'Popen', return_value=process):
+            persistent = worker.PersistentPowerShell(REQUEST, DESCRIPTOR, '/unused.ps1')
+        with patch.object(worker.time, 'monotonic', side_effect=[0, worker.COMMAND_TIMEOUT_SECONDS + 1]):
+            self.assertEqual(persistent.run(REQUEST)['code'], 'provider_unreachable')
+        self.assertTrue(process.killed)
+
+    def test_pipe_backpressure_uses_command_deadline_and_preserves_unknown_write(self):
+        for operation, expected in [('mailbox.inventory', 'provider_unreachable'), ('mailbox.alias.add', 'unknown_write_outcome')]:
+            process = FakeProcess(b'')
+            with patch.object(worker.subprocess, 'Popen', return_value=process):
+                persistent = worker.PersistentPowerShell(REQUEST, DESCRIPTOR, '/unused.ps1')
+            with patch.object(worker.os, 'name', 'posix'), patch.object(worker.os, 'set_blocking', create=True), patch.object(worker.os, 'killpg', create=True), patch.object(worker.signal, 'SIGKILL', 9, create=True), patch.object(worker.select, 'select', return_value=([], [], [])), patch.object(worker.os, 'write') as write:
+                self.assertEqual(persistent.run({**REQUEST, 'operation': operation})['code'], expected)
+                write.assert_not_called()
+            self.assertTrue(process.killed)
     def test_trace_rejects_out_of_window_or_injected_continuation_before_powershell(self):
         now = worker.datetime.datetime.now(worker.datetime.timezone.utc)
         start = (now - worker.datetime.timedelta(days=2)).isoformat()

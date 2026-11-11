@@ -71,6 +71,7 @@ export const invoices = pgTable('invoices', {
   taxTotal: numeric('tax_total', { precision: 12, scale: 2 }).notNull().default('0'),
   total: numeric('total', { precision: 12, scale: 2 }).notNull().default('0'),
   amountPaid: numeric('amount_paid', { precision: 12, scale: 2 }).notNull().default('0'),
+  autopayExcluded: boolean('autopay_excluded').notNull().default(false),
   balance: numeric('balance', { precision: 12, scale: 2 }).notNull().default('0'),
   // Deposit due at acceptance, snapshotted from the quote. NULL = ordinary invoice.
   depositDue: numeric('deposit_due', { precision: 12, scale: 2 }),
@@ -88,6 +89,23 @@ export const invoices = pgTable('invoices', {
   // reads ONLY this column afterwards, so a later partner-default change cannot
   // alter what a sanctioned re-render produces.
   deviceAppendix: boolean('device_appendix'),
+  // #8604 line itemization override. NULL on a draft = inherit the partner's
+  // invoice_line_* default; both issue writers stamp the RESOLVED values and
+  // renderers read only these afterwards (resolveInvoiceLineDetail). NULL on an
+  // issued row = issued before #8604 → the default (= pre-#8604) document.
+  // line_grouping is CHECK (NULL | 'entry' | 'day') in SQL.
+  lineGrouping: varchar('line_grouping', { length: 8 }),
+  lineShowDate: boolean('line_show_date'),
+  lineShowNote: boolean('line_show_note'),
+  lineShowWorkedTime: boolean('line_show_worked_time'),
+  // #6227 presentation snapshot. NULL on a draft = preview the partner's live
+  // document_theme / document_page_size; both issue writers (issueInvoice and
+  // the quote-accept direct issue) freeze the RESOLVED values here, and every
+  // renderer reads them through resolveInvoicePresentation afterwards.
+  // CHECK-constrained to the documentThemes vocabulary (migration
+  // 2026-10-29-100100-invoice-presentation-snapshot).
+  documentTheme: varchar('document_theme', { length: 16 }),
+  documentPageSize: varchar('document_page_size', { length: 8 }),
   // #3205 W07: 1 = billing evidence captured at generation or interactive
   // contract-line materialization. NULL = no evidence capture recorded. Invoice-level `recorded` flag — never
   // derived from an evidence row count.
@@ -148,6 +166,16 @@ export const invoiceLines = pgTable('invoice_lines', {
   catalogItemId: uuid('catalog_item_id'),
   parentLineId: uuid('parent_line_id').references((): AnyPgColumn => invoiceLines.id, { onDelete: 'cascade' }),
   ticketId: uuid('ticket_id'),
+  // The "Ticket #…" label frozen at issue (settings audit rule 6, sweep C4).
+  // NULL on a draft — renderers read the ticket's live number instead
+  // (invoiceTicketNumberSql). Stamped once by issueInvoice; never restamped.
+  ticketLabel: varchar('ticket_label', { length: 50 }),
+  // The ticket subject + category name the line's group header prints, frozen
+  // at issue beside ticket_label (#6955 / #6674, same rule 6). NULL on a draft —
+  // renderers read tickets / ticket_categories live instead. Stamped once by
+  // issueInvoice; never restamped.
+  ticketSubject: varchar('ticket_subject', { length: 255 }),
+  ticketCategory: varchar('ticket_category', { length: 100 }),
   // Title (mirrors catalog name). Nullable for legacy lines created before the
   // split, where `description` holds the title and the renderer falls back to it.
   name: varchar('name', { length: 255 }),
@@ -165,6 +193,15 @@ export const invoiceLines = pgTable('invoice_lines', {
   // worked-vs-billed disclosure note only — never for money. NULL for
   // non-time-entry lines and for legacy rows predating this column.
   workedMinutes: integer('worked_minutes'),
+  // #8603: the day a time_entry line was worked, from the entry's started_at
+  // in the partner timezone, captured at assembly and copied on reissue. NULL
+  // for non-time-entry lines (incl. block-hours overage) and pre-column rows.
+  workDate: date('work_date'),
+  // #8606: true once an operator hand-edits the description (updateLine, only
+  // on an actual change); "Refresh from time entries" then never overwrites
+  // it. Copied verbatim on reissue. Backfilled true for draft time_entry
+  // lines that predate the column (migration 2026-12-27-070000).
+  descriptionEdited: boolean('description_edited').notNull().default(false),
   sortOrder: integer('sort_order').notNull().default(0),
   createdAt: timestamp('created_at').defaultNow().notNull()
 }, (t) => [
@@ -227,10 +264,17 @@ export const invoicePayments = pgTable('invoice_payments', {
   receivedAt: date('received_at').notNull(),
   recordedBy: uuid('recorded_by').references(() => users.id),
   note: text('note'),
+  // #3803: caller-supplied key for a manual payment; a retry carrying the same
+  // key answers with this row instead of recording again (recordPayment).
+  // NULL for every payment recorded without one (Stripe, accounting pull, older rows).
+  idempotencyKey: varchar('idempotency_key', { length: 255 }),
   createdAt: timestamp('created_at').defaultNow().notNull()
 }, (t) => [
   index('invoice_payments_invoice_idx').on(t.invoiceId),
-  index('invoice_payments_org_idx').on(t.orgId)
+  index('invoice_payments_org_idx').on(t.orgId),
+  uniqueIndex('invoice_payments_invoice_idempotency_key_uq')
+    .on(t.invoiceId, t.idempotencyKey)
+    .where(sql`${t.idempotencyKey} IS NOT NULL`)
 ]);
 
 export const partnerInvoiceSequences = pgTable('partner_invoice_sequences', {

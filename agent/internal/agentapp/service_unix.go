@@ -90,7 +90,7 @@ func redirectStderr(f *os.File) {
 // Unlike Windows, there is no SCM handshake. We load config, wait for
 // enrollment if needed, then start components and block on SIGTERM.
 // cfgFile is the path to the agent config file (same as the global cfgFile var).
-func runAsService(cfgFile string) error {
+func runAsService(cfgFile string, _ ProcessStartup) error {
 	cfg, err := config.Load(cfgFile)
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
@@ -124,3 +124,15 @@ func runAsService(cfgFile string) error {
 
 // ensureSASPolicy is a no-op on non-Windows platforms.
 func ensureSASPolicy() {}
+
+// runningUnderServiceManager reports whether the OS service manager started
+// this process: a LaunchDaemon on macOS (cfg.IsService, root with no console)
+// or, on Linux, a systemd unit running as root (systemd sets INVOCATION_ID for
+// every unit it starts; reconcileServiceUnitIfNeeded keys on the same signal).
+// Linux never sets cfg.IsService, so it cannot be used there.
+func runningUnderServiceManager(cfg *config.Config) bool {
+	if runtime.GOOS == "darwin" {
+		return cfg.IsService
+	}
+	return os.Geteuid() == 0 && os.Getenv("INVOCATION_ID") != ""
+}

@@ -4,17 +4,17 @@ import type { SQL } from 'drizzle-orm';
 
 const { dbMock, queries, reset } = vi.hoisted(() => {
   let queue: unknown[][] = [];
-  const queries: Array<{ predicates: unknown[] }> = [];
+  const queries: Array<{ predicates: unknown[]; orderBys: unknown[][] }> = [];
   const dbMock = {
     select: vi.fn(() => {
       const result = queue.shift() ?? [];
-      const query = { predicates: [] as unknown[] };
+      const query = { predicates: [] as unknown[], orderBys: [] as unknown[][] };
       queries.push(query);
       const chain: any = {
         from: vi.fn(() => chain), innerJoin: vi.fn((_table, predicate) => { query.predicates.push(predicate); return chain; }),
         leftJoin: vi.fn((_table, predicate) => { query.predicates.push(predicate); return chain; }),
         where: vi.fn((predicate) => { query.predicates.push(predicate); return chain; }),
-        orderBy: vi.fn(() => chain), groupBy: vi.fn(() => chain), limit: vi.fn(() => chain),
+        orderBy: vi.fn((...cols: unknown[]) => { query.orderBys.push(cols); return chain; }), groupBy: vi.fn(() => chain), limit: vi.fn(() => chain),
         then: (resolve: any, reject: any) => Promise.resolve(result).then(resolve, reject),
       };
       return chain;
@@ -28,6 +28,8 @@ vi.mock('../../../db', () => ({
   withSystemDbAccessContext: vi.fn(() => { throw new Error('conversion must not elevate scope'); }),
 }));
 import { countPendingConversions, loadPolicySources, OPEN_ALERT_STATUSES } from './loadSources';
+import { automations } from '../../../db/schema/automations';
+import { configPolicyAlertRules, configPolicyAutomations, configPolicyFeatureLinks, configPolicyMonitoringSettings, configPolicyMonitoringWatches } from '../../../db/schema/configurationPolicies';
 
 const dialect = new PgDialect();
 function predicates(index: number) {
@@ -59,6 +61,40 @@ describe('loadPolicySources', () => {
     expect(predicates(7)[0]!.params).toEqual(['r1', ...OPEN_ALERT_STATUSES]);
     expect(predicates(8).map((p) => p.sql).join(' ')).toContain('"retired_at" is null');
   });
+  // #6888 item 3: the preview hash is built from these lists in load order, so
+  // every query must have a total order or equal sort_order rows can swap
+  // between the preview and the confirm and surface as a spurious preview_stale.
+  it('orders every source query totally (sort_order ties broken by id)', async () => {
+    reset([[policy], [
+      { id: 'lr', featureType: 'alert_rule' }, { id: 'lw', featureType: 'monitoring' }, { id: 'la', featureType: 'automation' },
+    ], [{ id: 'r1' }], [{ id: 'settings1' }], [], [], [], [{ n: 0 }]]);
+    await loadPolicySources('policy1');
+    const orderOf = (i: number) => queries[i]!.orderBys.flat();
+    expect(orderOf(1)).toEqual([configPolicyFeatureLinks.id]);
+    expect(orderOf(2)).toEqual([configPolicyAlertRules.sortOrder, configPolicyAlertRules.id]);
+    expect(orderOf(3)).toEqual([configPolicyMonitoringSettings.id]);
+    expect(orderOf(4)).toEqual([configPolicyMonitoringWatches.sortOrder, configPolicyMonitoringWatches.id]);
+    expect(orderOf(5)).toEqual([configPolicyAutomations.id]);
+    expect(orderOf(6)).toEqual([automations.id]);
+  });
+  it.each(['monitoring', 'monitors'])('loads normalized watches from a %s settings link', async (featureType) => {
+    reset([[{ ...policy, parentPolicyId: null }], [{ id: 'watch-link', featureType }],
+      [{ id: 'settings1' }], [{ id: 'watch1', settingsId: 'settings1' }]]);
+    const result = await loadPolicySources('policy1');
+    expect(result?.watches).toEqual([{ id: 'watch1', settingsId: 'settings1' }]);
+    expect(predicates(2)[0]!.params).toEqual(['watch-link']);
+    expect(predicates(3)[0]!.params).toEqual(['settings1']);
+    expect(predicates(3)[0]!.sql).toContain('"retired_at" is null');
+  });
+  it('loads watches from both settings rows when an old-link duplicate survived re-keying', async () => {
+    const watches = [{ id: 'old-watch', settingsId: 'old-settings' }, { id: 'new-watch', settingsId: 'new-settings' }];
+    reset([[{ ...policy, parentPolicyId: null }], [
+      { id: 'old-link', featureType: 'monitoring' }, { id: 'new-link', featureType: 'monitors' },
+    ], [{ id: 'old-settings' }, { id: 'new-settings' }], watches]);
+    expect((await loadPolicySources('policy1'))?.watches).toEqual(watches);
+    expect(predicates(2)[0]!.params).toEqual(['old-link', 'new-link']);
+    expect(predicates(3)[0]!.params).toEqual(['old-settings', 'new-settings']);
+  });
   it('returns null for missing or RLS-invisible policies without reading sources', async () => {
     reset([[]]);
     expect(await loadPolicySources('foreign')).toBeNull();
@@ -84,8 +120,12 @@ describe('loadPolicySources', () => {
 
 describe('countPendingConversions', () => {
   it('deduplicates policies and sums the three grouped row counts and standalone rules', async () => {
-    reset([[{ policyId: 'p1', count: 2 }], [{ policyId: 'p1', count: 3 }, { policyId: 'p2', count: 1 }], [{ policyId: 'p2', count: 4 }], [{ count: 5 }]]);
-    expect(await countPendingConversions({ orgId: 'o1', partnerId: 'p1', includePartnerWide: true })).toEqual({ policies: 2, rows: 10, standaloneRules: 5 });
+    reset([[{ policyId: 'p1', policyName: 'Zulu', count: 2 }], [{ policyId: 'p1', policyName: 'Zulu', count: 3 }, { policyId: 'p2', policyName: 'Alpha', count: 1 }], [{ policyId: 'p2', policyName: 'Alpha', count: 4 }], [{ count: 5 }]]);
+    expect(await countPendingConversions({ orgId: 'o1', partnerId: 'p1', includePartnerWide: true })).toEqual({
+      policies: 2, rows: 10, standaloneRules: 5, networkChecks: 0,
+      // Same rows as the count, deduplicated and sorted by name (#6644 review 5).
+      pendingPolicies: [{ id: 'p2', name: 'Alpha' }, { id: 'p1', name: 'Zulu' }],
+    });
     for (const index of [0, 1, 2, 3]) {
       const predicate = predicates(index).at(-1)!;
       expect(predicate.sql).toContain('"retired_at" is null');
@@ -98,7 +138,7 @@ describe('countPendingConversions', () => {
   });
   it('does not include partner-wide rows for org scope without opt-in', async () => {
     reset([[], [], [], []]);
-    expect(await countPendingConversions({ orgId: 'o1', partnerId: 'p1', includePartnerWide: false })).toEqual({ policies: 0, rows: 0, standaloneRules: 0 });
+    expect(await countPendingConversions({ orgId: 'o1', partnerId: 'p1', includePartnerWide: false })).toEqual({ policies: 0, rows: 0, standaloneRules: 0, networkChecks: 0, pendingPolicies: [] });
     for (const query of queries) {
       const compiled = dialect.sqlToQuery(query.predicates.at(-1) as SQL);
       expect(compiled.params).not.toContain('p1');
@@ -108,16 +148,29 @@ describe('countPendingConversions', () => {
   it.each([false, true])('counts all partner orgs with partner-wide opt-in %s', async (includePartnerWide) => {
     reset([[], [], [], []]);
     await countPendingConversions({ orgId: null, partnerId: 'partner1', includePartnerWide });
-    for (const query of queries) {
+    for (const query of queries.slice(0, 4)) {
       const compiled = dialect.sqlToQuery(query.predicates.at(-1) as SQL);
       expect(compiled.sql).toContain('in (select "organizations"."id" from "organizations" where "organizations"."partner_id" =');
       expect(compiled.params.filter((p) => p === 'partner1')).toHaveLength(includePartnerWide ? 2 : 1);
       expect(compiled.sql.includes('"org_id" is null')).toBe(includePartnerWide);
     }
   });
+  it.each([
+    [{ orgId: 'o1', partnerId: 'p1', includePartnerWide: true }, ['o1']],
+    [{ orgId: null, partnerId: 'p1', includePartnerWide: true }, ['p1']],
+  ])('counts pending network checks separately using only the org axis: %j', async (scope, params) => {
+    reset([[], [], [], [], [{ count: 7 }]]);
+    expect(await countPendingConversions(scope)).toMatchObject({ rows: 0, policies: 0, networkChecks: 7 });
+    const query = predicates(4).at(-1)!;
+    expect(query.params).toEqual(params);
+    expect(query.sql).toContain('"network_monitors"."managed_by_monitor_id" is null');
+    expect(query.sql).toContain('"network_monitors"."retired_at" is null');
+    expect(query.sql).not.toContain('"network_monitors"."org_id" is null');
+    expect(query.sql).not.toContain('"network_monitors"."partner_id"');
+  });
   it('fails closed when neither owner axis is provided', async () => {
     reset([[], [], [], []]);
-    expect(await countPendingConversions({ orgId: null, partnerId: null, includePartnerWide: true })).toEqual({ policies: 0, rows: 0, standaloneRules: 0 });
+    expect(await countPendingConversions({ orgId: null, partnerId: null, includePartnerWide: true })).toEqual({ policies: 0, rows: 0, standaloneRules: 0, networkChecks: 0, pendingPolicies: [] });
     for (const query of queries) expect(dialect.sqlToQuery(query.predicates.at(-1) as SQL).sql).toContain('false');
   });
 });

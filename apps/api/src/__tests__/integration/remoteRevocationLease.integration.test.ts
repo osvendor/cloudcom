@@ -213,7 +213,7 @@ describe('revocation lease against live Postgres', () => {
     expect(row!.errorMessage).toBe('revoked:permissions_changed');
     expect(row!.endedAt).not.toBeNull();
 
-    // The revocation goes through the terminal-intent contract (SEC-038 W03):
+    // The revocation goes through the terminal-intent contract:
     // the row handed to the teardown names the terminal generation the stop
     // must carry, and the phase is 'pending' until the agent acknowledges it.
     expect(teardownDisconnectedSessions).toHaveBeenCalledWith([
@@ -467,7 +467,7 @@ describe('revocation lease against live Postgres', () => {
     });
   });
 
-  // SEC-038 W06 (#5537): the desktop-fence gate against the real column.
+  // #5537 — the desktop-fence gate against the real column.
   describe('desktop fence capability gate (REMOTE_DESKTOP_FENCE_REQUIRED)', () => {
     const original = process.env.REMOTE_DESKTOP_FENCE_REQUIRED;
     afterEach(() => {
@@ -475,8 +475,17 @@ describe('revocation lease against live Postgres', () => {
       else process.env.REMOTE_DESKTOP_FENCE_REQUIRED = original;
     });
 
-    it('gate off: admits an unfenced agent', async () => {
+    it('default (unset): refuses an agent without the start fence with agent_upgrade_required', async () => {
       delete process.env.REMOTE_DESKTOP_FENCE_REQUIRED;
+      const f = await buildFixture({ fenceCapable: false });
+      await expect(prepareRevocationLeaseForStart(f.session.id)).resolves.toEqual({
+        ok: false,
+        reason: 'agent_upgrade_required',
+      });
+    });
+
+    it('explicit opt-out (false): admits an agent without the start fence', async () => {
+      process.env.REMOTE_DESKTOP_FENCE_REQUIRED = 'false';
       const f = await buildFixture({ fenceCapable: false });
       const result = await prepareRevocationLeaseForStart(f.session.id);
       expect(result.ok).toBe(true);
@@ -504,12 +513,12 @@ describe('revocation lease against live Postgres', () => {
       const unfenced = await buildFixture({ fenceCapable: false });
       const noLease = await buildFixture({ leaseCapable: false });
 
-      delete process.env.REMOTE_DESKTOP_FENCE_REQUIRED;
+      process.env.REMOTE_DESKTOP_FENCE_REQUIRED = 'false';
       await expect(isDesktopStartCapable(fenced.device.id)).resolves.toBe(true);
       await expect(isDesktopStartCapable(unfenced.device.id)).resolves.toBe(true);
       await expect(isDesktopStartCapable(noLease.device.id)).resolves.toBe(false);
 
-      process.env.REMOTE_DESKTOP_FENCE_REQUIRED = 'true';
+      delete process.env.REMOTE_DESKTOP_FENCE_REQUIRED;
       await expect(isDesktopStartCapable(fenced.device.id)).resolves.toBe(true);
       await expect(isDesktopStartCapable(unfenced.device.id)).resolves.toBe(false);
       await expect(isDesktopStartCapable('00000000-0000-0000-0000-000000000000')).resolves.toBe(false);

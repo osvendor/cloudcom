@@ -3,7 +3,8 @@
     "errors": {
       "fetch": "Die Automatisierung konnte nicht abgerufen werden",
       "generic": "Es ist ein Fehler aufgetreten",
-      "save": "Die Automatisierung konnte nicht gespeichert werden"
+      "save": "Die Automatisierung konnte nicht gespeichert werden",
+      "invalidTarget": "Das Geräteziel ist ungültig: {{detail}}"
     },
     "loading": "Automatisierung wird geladen...",
     "breadcrumb": {
@@ -25,7 +26,8 @@
     },
     "actions": {
       "create": "Erstellen Sie Automatisierung",
-      "saveChanges": "Änderungen speichern"
+      "saveChanges": "Änderungen speichern",
+      "backToAutomations": "Zurück zu Jobs"
     }
   },
   "automationForm": {
@@ -51,6 +53,11 @@
         "weekdaysNine": "Wochentags 9 Uhr",
         "weeklySunday": "Wöchentlicher Sonntag"
       }
+    },
+    "alertWorkflow": {
+      "severity": "Schweregrade",
+      "kind": "Monitorarten",
+      "hint": "Eine leere Gruppe passt auf jeden Wert. Bestehende erweiterte Filter bleiben erhalten."
     },
     "validation": {
       "valueRequired": "Wert ist erforderlich",
@@ -158,7 +165,8 @@
       "command": "Befehl",
       "whenOffline": "Wenn das Gerät offline ist",
       "software": "Software",
-      "failureNotificationChannel": "Fehlerbenachrichtigungskanal"
+      "failureNotificationChannel": "Fehlerbenachrichtigungskanal",
+      "actionType": "Aktionstyp"
     },
     "options": {
       "whenOffline": {
@@ -203,7 +211,9 @@
     },
     "empty": {
       "noActions": "Keine Aktionen definiert. Klicken Sie auf „Aktion hinzufügen“, um eine zu erstellen."
-    }
+    },
+    "partnerGroupsNote": "Partnerweite Automatisierungen können keine bestimmten Gerätegruppen oder Geräte als Ziel haben, da jedes zu genau einer Organisation gehört. Verwenden Sie Alle Geräte oder einen erweiterten Filter.",
+    "partnerTargetBlocked": "Diese partnerweite Automatisierung zielt auf bestimmte Gerätegruppen oder Geräte, was nicht unterstützt wird. Ändern Sie das Ziel vor dem Speichern auf Alle Geräte oder einen erweiterten Filter."
   },
   "automationList": {
     "elevated": "Erhöhte Rechte",
@@ -218,7 +228,9 @@
     "searchPlaceholder": "Automatisierungen suchen...",
     "filters": {
       "allTriggers": "Alle Auslöser",
-      "allStatus": "Alle Status"
+      "allStatus": "Alle Status",
+      "triggerLabel": "Auslöser",
+      "statusLabel": "Aktivierungsstatus"
     },
     "trigger": {
       "schedule": "Zeitplan",
@@ -327,6 +339,14 @@
       "awaiting": "Warten auf Rückmeldung des Agenten…",
       "truncated": "Ausgabe gekürzt — vollständiger Text im Skriptverlauf des Geräts."
     },
+    "commandOutput": {
+      "show_one": "Befehlsausgabe anzeigen",
+      "show_other": "Befehlsausgabe anzeigen ({{count}})",
+      "hide_one": "Befehlsausgabe ausblenden",
+      "hide_other": "Befehlsausgabe ausblenden ({{count}})",
+      "label": "Befehl (Aktion {{index}})",
+      "truncated": "Ausgabe gekürzt — der vollständige Text wird in dieser Ansicht nicht angezeigt."
+    },
     "errors": {
       "cancelRun": "Die Ausführung konnte nicht abgebrochen werden."
     }
@@ -361,7 +381,7 @@
       "scheduled": "Geplant",
       "on-demand": "Manuell",
       "webhooks": "Webhooks",
-      "event-rules": "Ereignisregeln"
+      "event-rules": "Alarmabläufe"
     }
   },
   "complianceDashboard": {
@@ -403,12 +423,17 @@
     "empty": {
       "noPolicies": "Keine Richtlinien konfiguriert",
       "allCompliant": "Alle Geräte sind konform!",
+      "notEvaluated": "Es wurden noch keine Geräte ausgewertet.",
+      "noViolationsPending_one": "Keine Verstöße gefunden; {{count}} Gerät wird noch ausgewertet.",
+      "noViolationsPending_other": "Keine Verstöße gefunden; {{count}} Geräte werden noch ausgewertet.",
       "noMatchingDevices": "Keine passenden Geräte gefunden."
     },
     "policyComplianceRatio": "{{compliant}} / {{total}} konform",
     "searchDevices": "Geräte suchen...",
-    "violationCount": "{{count}} Verstoß",
-    "moreViolations": "+{{count}} weitere Verstöße",
+    "violationCount_one": "{{count}} Verstoß",
+    "violationCount_other": "{{count}} Verstöße",
+    "moreViolations_one": "+{{count}} weiterer Verstoß",
+    "moreViolations_other": "+{{count}} weitere Verstöße",
     "lastChecked": "Zuletzt geprüft: {{date}}",
     "pagination": {
       "showing": "Zeigt {{start}} bis {{end}} von {{total}}",
@@ -421,6 +446,7 @@
       "generic": "Es ist ein Fehler aufgetreten"
     },
     "loading": "Compliance-Daten werden geladen...",
+    "backToPolicies": "Zurück zu Richtlinien",
     "policyTitle": "Compliance: {{policy}}",
     "policyFallback": "Richtlinie",
     "title": "Compliance-Dashboard",
@@ -478,7 +504,8 @@
     },
     "actions": {
       "create": "Richtlinie erstellen",
-      "saveChanges": "Änderungen speichern"
+      "saveChanges": "Änderungen speichern",
+      "backToPolicies": "Zurück zu Richtlinien"
     }
   },
   "policyForm": {
@@ -537,7 +564,8 @@
     },
     "actions": {
       "savePolicy": "Richtlinie speichern",
-      "addRule": "Regel hinzufügen"
+      "addRule": "Regel hinzufügen",
+      "removeRule": "Regel entfernen"
     },
     "fields": {
       "name": "Richtlinienname",
@@ -555,7 +583,8 @@
       "configFilePath": "Konfigurationsdateipfad",
       "configKey": "Konfigurationsschlüssel",
       "remediationScript": "Korrekturskript",
-      "evaluateEvery": "Bewerten Sie alle"
+      "evaluateEvery": "Bewerten Sie alle",
+      "ruleType": "Regeltyp"
     },
     "placeholders": {
       "name": "Sicherheitsgrundrichtlinie",
@@ -612,7 +641,9 @@
     "searchPlaceholder": "Richtlinien suchen...",
     "filters": {
       "allEnforcement": "Alle Durchsetzung",
-      "allStatus": "Alle Status"
+      "allStatus": "Alle Status",
+      "enforcementLabel": "Durchsetzung",
+      "statusLabel": "Aktivierungsstatus"
     },
     "enforcement": {
       "monitor": {
@@ -689,6 +720,8 @@
       "timeout": "Zeitüberschreitung bei der Skriptausführung",
       "pending": "Das Skript wartet darauf, ausgeführt zu werden",
       "queued": "Das Skript wartet auf die Übermittlung an das Gerät",
+      "queuedAwaitingPickup": "Noch keine aktive Agent-Sitzung hat dies abgeholt. Das Skript wird zugestellt, sobald sich der Agent des Geräts das nächste Mal meldet.",
+      "deviceOffline": "Das Gerät ist offline. Das Skript wird zugestellt, sobald es wieder verbunden ist.",
       "cancelling": "Abbruch angefordert – warte auf Bestätigung durch das Gerät.",
       "cancelled": "Das Skript wurde auf dem Gerät gestoppt"
     },
@@ -712,7 +745,8 @@
       "failedCancelTooLate": "Fehlgeschlagen — Ihre Abbruchanfrage kam zu spät",
       "timeoutCancelTooLate": "Zeitüberschreitung — Ihre Abbruchanfrage kam zu spät",
       "cancelFailed": "Abbruch fehlgeschlagen — das Gerät konnte den Prozess nicht stoppen",
-      "queuedOffline": "In Warteschlange — Gerät offline"
+      "queuedOffline": "In Warteschlange — Gerät offline",
+      "queuedAwaitingPickup": "In Warteschlange — wartet auf Abholung durch das Gerät"
     }
   },
   "executionHistory": {
@@ -726,7 +760,9 @@
       "lastHour": "Letzte Stunde",
       "lastDay": "Letzte 24 Stunden",
       "lastWeek": "Letzte 7 Tage",
-      "lastMonth": "Letzte 30 Tage"
+      "lastMonth": "Letzte 30 Tage",
+      "statusLabel": "Ausführungsstatus",
+      "dateLabel": "Zeitraum"
     },
     "status": {
       "pending": "Ausstehend",
@@ -741,7 +777,8 @@
       "failedCancelTooLate": "Fehlgeschlagen — Ihre Abbruchanfrage kam zu spät",
       "timeoutCancelTooLate": "Zeitüberschreitung — Ihre Abbruchanfrage kam zu spät",
       "cancelFailed": "Abbruch fehlgeschlagen — das Gerät konnte den Prozess nicht stoppen",
-      "queuedOffline": "In Warteschlange — Gerät offline"
+      "queuedOffline": "In Warteschlange — Gerät offline",
+      "queuedAwaitingPickup": "In Warteschlange — wartet auf Abholung"
     },
     "summary": "{{shown}} von {{total}}",
     "headers": {
@@ -770,7 +807,7 @@
   "scriptAiInput": {
     "placeholder": {
       "ready": "Beschreiben Sie das Skript, das Sie benötigen ...",
-      "opening": "KI-Assistent wird geöffnet..."
+      "opening": "Breeze AI wird geöffnet..."
     },
     "actions": {
       "stopGenerating": "Hören Sie auf zu generieren",
@@ -789,12 +826,12 @@
       "reject": "Ablehnen"
     },
     "empty": {
-      "title": "Skript-KI-Assistent",
-      "description": "Beschreiben Sie, was Sie brauchen und ich schreibe das Skript für Sie."
+      "title": "Breeze AI",
+      "description": "Bitten Sie Breeze AI, dieses Skript zu schreiben oder zu prüfen."
     }
   },
   "scriptAiPanel": {
-    "title": "AI-Skriptassistent",
+    "title": "Breeze AI",
     "actions": {
       "redoTitle": "KI-Änderung erneut anwenden",
       "redo": "Wiederholen",
@@ -933,13 +970,23 @@
       "allAdmitted": "Alle ausgewählten Geräte wurden zugelassen und in die Warteschlange gestellt.",
       "partiallyAdmitted": "Einige Geräte wurden zugelassen und in die Warteschlange gestellt. Prüfen Sie die übrigen Ziele.",
       "rejected": "Keine Geräte wurden zugelassen. Prüfen Sie die Gründe unten.",
-      "queued": "In Warteschlange"
+      "queued": "In Warteschlange",
+      "reasons": {
+        "not_found_or_inaccessible": "Gerät nicht gefunden oder nicht zugänglich",
+        "site_access_denied": "Sie haben keinen Zugriff auf den Standort dieses Geräts",
+        "script_org_mismatch": "Das Skript gehört zu einer anderen Organisation als das Gerät",
+        "os_incompatible": "Das Skript ist mit dem Betriebssystem dieses Geräts nicht kompatibel",
+        "device_decommissioned": "Das Gerät wurde außer Betrieb genommen",
+        "maintenance_suppressed": "Übersprungen: Das Gerät befindet sich in einem Wartungsfenster"
+      }
     },
     "confirm": {
       "title": "Bestätigen Sie die Ausführung",
-      "description": "Führen Sie „{{name}}“ auf {{count}} Geräten als {{runAs}} aus. Skripte werden in die Warteschlange gestellt und beginnen sofort mit der Ausführung."
+      "description": "Führen Sie „{{name}}“ auf {{count}} Geräten als {{runAs}} aus. Skripte werden in die Warteschlange gestellt und beginnen sofort mit der Ausführung.",
+      "descriptionOffline": "„{{name}}“ auf {{count}} Gerät(en) als {{runAs}} ausführen. Skripte werden jetzt in die Warteschlange gestellt: Online-Geräte starten sofort, {{offline}} Offline-Gerät(e) laufen, sobald sie wieder online sind."
     },
     "selectedCount": "{{count}} Gerät(e) ausgewählt",
+    "executeBlocked": "Ausführen ist nicht verfügbar: Ein ausgewähltes Gerät kann dieses Skript hier nicht ausführen (es gehört möglicherweise zu einer anderen als der angezeigten Organisation oder ist nicht mehr zugänglich).",
     "languages": {
       "powershell": "PowerShell",
       "bash": "Bash",
@@ -953,6 +1000,44 @@
     },
     "toasts": {
       "runsWhenOnline": "Wird ausgeführt, sobald das Gerät online ist"
+    },
+    "targetMode": {
+      "label": "Ausführen auf",
+      "devices": "Geräte",
+      "groups": "Gerätegruppen"
+    },
+    "groups": {
+      "title": "Gerätegruppen auswählen",
+      "searchPlaceholder": "Gruppen suchen",
+      "selectedCount": "{{count}} Gruppe(n) ausgewählt",
+      "dynamic": "Dynamisch",
+      "deviceCount": "{{count}} Gerät(e)",
+      "refusedReason": "Als Ausführungsziel nicht verfügbar: Die Regeln dieser Gruppe beruhen auf Feldern, die ein Gerät selbst meldet ({{fields}}).",
+      "loading": "Gerätegruppen werden geladen...",
+      "loadFailed": "Gerätegruppen konnten nicht geladen werden.",
+      "retry": "Erneut versuchen",
+      "empty": "Keine Gerätegruppen gefunden.",
+      "tooManyGroups": "Ein Lauf kann höchstens {{max}} Gruppen als Ziel haben.",
+      "countingMembers": "Mitglieder werden gezählt...",
+      "countFailed": "Die Mitglieder der ausgewählten Gruppen konnten nicht gezählt werden. Der Server prüft das Limit beim Ausführen.",
+      "summaryUnique": "{{count}} eindeutige(s) Gerät(e) in den ausgewählten Gruppen",
+      "summaryCompatible": "{{count}} können dieses Skript ausführen (passendes Betriebssystem)",
+      "summaryOffline": "{{count}} davon sind offline und laufen, sobald das Gerät online ist",
+      "membershipNote": "Die Mitgliedschaft dynamischer Gruppen entspricht der letzten Auswertung und wird beim Start des Laufs erneut gelesen.",
+      "overCap": "Diese Gruppen enthalten {{count}} eindeutige Geräte und überschreiten das Limit von {{max}} pro Lauf. Entfernen Sie eine Gruppe oder teilen Sie den Lauf auf.",
+      "submitting": "Wird an {{count}} Gruppe(n) gesendet...",
+      "warningsTitle": "Hinweise vom Server",
+      "confirmDescription": "„{{name}}“ auf {{groups}} Gerätegruppe(n) als {{runAs}} ausführen. Skripte werden in die Warteschlange gestellt und sofort ausgeführt.",
+      "confirmDescriptionOffline": "„{{name}}“ auf {{groups}} Gerätegruppe(n) als {{runAs}} ausführen. Skripte werden jetzt in die Warteschlange gestellt: Online-Geräte starten sofort, {{offline}} Offline-Gerät(e) laufen, sobald sie wieder online sind.",
+      "confirmMembers": "Derzeit gehören {{count}} eindeutige Geräte zu diesen Gruppen; die Mitgliedschaft wird beim Bestätigen erneut gelesen.",
+      "confirmMembersUnknown": "Die Anzahl der Geräte ist noch nicht bekannt; die Mitgliedschaft wird beim Bestätigen gelesen.",
+      "errors": {
+        "selectGroup": "Bitte wählen Sie mindestens eine Gerätegruppe aus",
+        "tooManyTargets": "Diese Gruppen ergeben {{count}} Geräte und überschreiten das Limit von {{max}} pro Lauf. Entfernen Sie eine Gruppe oder teilen Sie den Lauf auf.",
+        "perGroup": "Geräte pro Gruppe: {{groups}}.",
+        "groupNotFound": "{{count}} ausgewählte Gruppe(n) existieren nicht mehr oder sind nicht zugänglich. Laden Sie die Liste neu und versuchen Sie es erneut.",
+        "noTargets": "Die ausgewählten Gruppen enthalten keine Geräte, auf die dieser Lauf zielen kann; es wurde nichts ausgeführt."
+      }
     }
   },
   "secretParameters": {
@@ -968,6 +1053,7 @@
     "loading": "Ausführungen werden geladen...",
     "actions": {
       "backToScripts": "Zurück zu Skripten",
+      "backToScript": "Zurück zum Skript",
       "runScript": "Skript ausführen"
     },
     "breadcrumb": {
@@ -1050,8 +1136,8 @@
       "exitCodeSeverity": "Schweregrad des Exit-Codes"
     },
     "ai": {
-      "toggleTitle": "KI-Skriptassistent umschalten (⌘⇧I)",
-      "button": "KI-Assistent"
+      "toggleTitle": "Breeze AI umschalten (⌘⇧I)",
+      "button": "Breeze AI"
     },
     "parameters": {
       "emptyPrefix": "Noch keine Parameter. Mit Parametern können Benutzer zur Laufzeit Werte angeben – verweisen Sie sie in Ihrem Skript als",
@@ -1064,9 +1150,9 @@
       "elevatedHint": "Verwendet sudo unter macOS/Linux, runas unter Windows."
     },
     "exitCodeSeverity": {
-      "emptyPrefix": "Ordnen Sie spezifische Exit-Codes den Schweregraden von Warnungen zu. Wenn das Skript einen dieser Codes zurückgibt, wird eine Warnung mit dem konfigurierten Schweregrad ausgelöst. Wählen Sie",
+      "emptyPrefix": "Ordnen Sie spezifische Exit-Codes den Schweregraden von Warnungen zu. Wenn ein unbeaufsichtigter Lauf (geplant, Automatisierung, Richtlinie oder durch eine Warnung ausgelöst) einen dieser Codes zurückgibt, wird eine Warnung mit dem konfigurierten Schweregrad ausgelöst; manuelle Läufe lösen nie eine aus. Ein späterer Lauf, der sauber endet, löst sie auf. Wählen Sie",
       "suppressAlert": "Alarm unterdrücken",
-      "emptySuffix": "um einen Code als informativ zu markieren (kein Vorfall gemeldet). Exit-Codes, die Sie hier nicht auflisten, verwenden die Standard-Ergebnisbehandlung.",
+      "emptySuffix": "um einen Code als informativ zu markieren (keine Warnung). Ein nicht aufgeführter Exit-Code ungleich null verwendet den nächstniedrigeren aufgeführten Schweregrad oder „Mittel“.",
       "suppressHint": "Warnung unterdrücken – Der Exit-Code wird als Information behandelt, es wird kein Vorfall ausgelöst."
     },
     "keyboardSave": "{{shortcut}} zum Speichern",
@@ -1437,7 +1523,8 @@
       "notStarted": "Der Lauf wurde nicht gestartet (das Gerät befindet sich möglicherweise in Wartung).",
       "pollDeadline": "Noch kein Ergebnis — prüfen Sie den Ausführungsverlauf.",
       "pollFailed": "Ergebnis konnte nicht gelesen werden — der Lauf wurde möglicherweise gelöscht oder Ihr Zugriff hat sich geändert."
-    }
+    },
+    "deviceSelectLabel": "Testgerät"
   },
   "provenance": {
     "origin": "Herkunft",
@@ -1465,6 +1552,22 @@
     "riskLow": "Niedrig",
     "riskMedium": "Mittel",
     "riskHigh": "Hoch",
-    "riskCritical": "Kritisch"
+    "riskCritical": "Kritisch",
+    "reviewInApprovals": "In Genehmigungen prüfen",
+    "status": {
+      "proposed": "Wartet auf Prüfung",
+      "scan_rejected": "Vom Sicherheitsscan abgelehnt",
+      "review_failed": "KI-Prüfung fehlgeschlagen",
+      "reviewed": "Geprüft",
+      "approved": "Genehmigt",
+      "rejected": "Abgelehnt",
+      "changes_requested": "Änderungen angefordert",
+      "expired": "Abgelaufen",
+      "superseded": "Ersetzt",
+      "executed": "Ausgeführt",
+      "verified": "Verifiziert",
+      "verification_failed": "Verifizierung fehlgeschlagen",
+      "promoted": "In der Bibliothek gespeichert"
+    }
   }
 }

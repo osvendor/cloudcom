@@ -6,12 +6,16 @@
  * - manage_notification_channels (Tier 1 base): List, test, create, update, or delete notification channels
  */
 
+import { keysetEnvelope, keysetParamSchema, keysetWhereCondition, readKeysetArgs } from './aiToolPagination';
+import { orgNameOf, readReachSpansOrgs, splitOrgLegend } from './aiToolOrgLegend';
 import { db } from '../db';
 import { canManagePartnerWidePolicies } from './partnerWideAccess';
 import { alerts, devices, notificationChannels } from '../db/schema';
+import { selectNotificationChannelsWithConfig, writeNotificationChannelConfig } from './notificationChannelConfig';
 import { eq, and, desc, sql, inArray, ne, SQL } from 'drizzle-orm';
 import type { AuthContext } from '../middleware/auth';
 import type { AiTool } from './aiTools';
+import type { ToolExecutionContext } from './toolExecutionContext';
 import { canMutateOrgWideGovernance, SITE_CEILING_WRITE_DENIED_MESSAGE } from './siteCeilingAccess';
 import { publishEvent } from './eventBus';
 import {
@@ -21,8 +25,9 @@ import {
   buildAcknowledgeAlertCas,
   buildResolveAlertCas,
   buildSuppressAlertCas,
+  publishAlertSuppressed,
 } from './alertService';
-import { deviceIdSiteDenied, resolveSiteAllowedDeviceIds } from './aiToolsSiteScope';
+import { deviceIdSiteDenied, resolveSiteAllowedDeviceIds, siteAllowlistOf } from './aiToolsSiteScope';
 import { emitAlertStateFeedback } from './mlFeedbackEmitters';
 import {
   encryptNotificationChannelConfig,
@@ -30,10 +35,41 @@ import {
   isMaskedIntegrationSecret,
 } from './notificationChannelSecrets';
 import { webhookOriginChangeWouldRetainAuthorization } from './credentialOriginBinding';
-import { validateNotificationChannelConfig } from '../routes/alerts/helpers';
+import { alertSiteScopeByDeviceIds, validateNotificationChannelConfig } from '../routes/alerts/helpers';
 import { sanitizeThrownToolError } from './aiToolErrors';
+import { resolveWritableToolOrgId } from './aiToolWriteOrg';
+import { presentEndpointTarget, scrubUrlsInText, scrubUrlsInValue } from '../utils/endpointDisplay';
+
+// Network-monitor alerts embed the check target in their message and context,
+// and rows created before the monitor worker reduced it still hold the full
+// HTTP check URL (which can carry credentials). Show those as scheme + host.
+const NETWORK_MONITOR_ALERT_SOURCE = 'network_monitor';
+
+function presentNetworkMonitorAlert<T extends { message?: string | null; context?: unknown }>(alert: T): T {
+  const context = alert.context as Record<string, unknown> | null | undefined;
+  if (!context || context.source !== NETWORK_MONITOR_ALERT_SOURCE) return alert;
+  const scrubbed = scrubUrlsInValue(context) as Record<string, unknown>;
+  if (typeof context.target === 'string') scrubbed.target = presentEndpointTarget(context.target).target;
+  return { ...alert, message: scrubUrlsInText(alert.message), context: scrubbed };
+}
 
 type AiToolTier = 1 | 2 | 3 | 4;
+
+/**
+ * #6907: `manage_alerts:{acknowledge,resolve,suppress}` are user-owned on
+ * release (`USER_OWNED_RELEASE_ACTIONS` in `jobs/intentReleaseWorker.ts`).
+ * Each writes `auth.user.id` into a `users` FK — `alerts.acknowledged_by` /
+ * `alerts.resolved_by`, and `ml_feedback_events.actor_user_id` through
+ * `emitAlertStateFeedback` — so an agent-originated intent is released as its
+ * APPROVER, never the agent. When the worker names that approver, the auth
+ * this handler runs under must be them: refuse rather than write a row whose
+ * owner the two disagree about. Mirrors `aiToolsFleet.ts`'s
+ * `approverReleaseMismatch` and `aiToolsTicketing.ts`'s `log_time_entry`
+ * guard.
+ */
+function approverReleaseMismatch(auth: AuthContext, context: ToolExecutionContext | undefined): boolean {
+  return !!context?.approverRelease && context.approverRelease.approverUserId !== auth.user.id;
+}
 
 function getOrgId(auth: AuthContext): string | null {
   return auth.orgId ?? auth.accessibleOrgIds?.[0] ?? null;
@@ -53,11 +89,40 @@ function getOrgId(auth: AuthContext): string | null {
 // `aiTools.findAlertWithAccess.test.ts`; do not reintroduce a local copy in
 // either module.
 export async function findAlertWithAccess(alertId: string, auth: AuthContext) {
+  const [alert] = await db.select().from(alerts).where(alertByIdInOrgScope(alertId, auth)).limit(1);
+  if (!alert) return null;
+  return (await alertAccessDenied(alert, auth)) ? null : alert;
+}
+
+/**
+ * The same lookup and access axes as `findAlertWithAccess`, returning only the
+ * columns those axes read. For a tool that checks an alert is reachable and
+ * never shows it (create_operator_task): `alerts.message`/`context` can hold
+ * credentials under names the output chokepoint cannot mask, so a caller that
+ * does not need them must not load them (aiToolOutput.encryptedColumns.test.ts).
+ */
+export async function findAlertRefWithAccess(alertId: string, auth: AuthContext) {
+  const [alert] = await db
+    .select({ id: alerts.id, orgId: alerts.orgId, deviceId: alerts.deviceId, topologySiteId: alerts.topologySiteId })
+    .from(alerts)
+    .where(alertByIdInOrgScope(alertId, auth))
+    .limit(1);
+  if (!alert) return null;
+  return (await alertAccessDenied(alert, auth)) ? null : alert;
+}
+
+function alertByIdInOrgScope(alertId: string, auth: AuthContext): SQL | undefined {
   const conditions: SQL[] = [eq(alerts.id, alertId)];
   const orgCond = auth.orgCondition(alerts.orgId);
   if (orgCond) conditions.push(orgCond);
-  const [alert] = await db.select().from(alerts).where(and(...conditions)).limit(1);
-  if (!alert) return null;
+  return and(...conditions);
+}
+
+/** The access axes beyond org scope, shared by both alert lookups above. */
+async function alertAccessDenied(
+  alert: { deviceId: string | null; topologySiteId: string | null },
+  auth: AuthContext,
+): Promise<boolean> {
   // Exact-device axis (#6096), independent of the site axis. A device-bound
   // run (`allowedDeviceIds`) may only touch alerts attributable to a device in
   // its allowlist — a device-LESS org-wide alert is attributable to none of
@@ -65,9 +130,24 @@ export async function findAlertWithAccess(alertId: string, auth: AuthContext) {
   // short-circuit below. A device-LESS ANALYSIS run carries no site axis at
   // all, so this check cannot be folded into the site one.
   if (auth.allowedDeviceIds
-    && (!alert.deviceId || !auth.allowedDeviceIds.includes(alert.deviceId))) return null;
-  if (alert.deviceId && (await deviceIdSiteDenied(auth, alert.deviceId))) return null;
-  return alert;
+    && (!alert.deviceId || !auth.allowedDeviceIds.includes(alert.deviceId))) return true;
+  // Helper device axis: a Helper-authenticated caller (routes/helper/*, the
+  // tray app) is pinned to its OWN device the same way an exact-device AI run
+  // is pinned to `allowedDeviceIds` above. The site-axis check below is not
+  // enough on its own — a Helper session carries no `allowedSiteIds`
+  // restriction, so without this it could read (Tier 1 `get`) any org-wide or
+  // sibling-device alert by UUID.
+  if (auth.helperDeviceId
+    && (!alert.deviceId || alert.deviceId !== auth.helperDeviceId)) return true;
+  // A topology policy alert is owned by its topology site (M3-D6): the site
+  // axis follows that site, never the origin device's current one.
+  if (alert.topologySiteId) {
+    const allowedSites = siteAllowlistOf(auth);
+    return allowedSites !== undefined && !allowedSites.includes(alert.topologySiteId);
+  }
+  if (!alert.deviceId && siteAllowlistOf(auth) !== undefined) return true;
+  if (alert.deviceId && (await deviceIdSiteDenied(auth, alert.deviceId))) return true;
+  return false;
 }
 
 export function registerAlertTools(aiTools: Map<string, AiTool>): void {
@@ -84,6 +164,7 @@ export function registerAlertTools(aiTools: Map<string, AiTool>): void {
     deviceArgs: ['deviceId'],
     domain: 'monitoring',
     searchHint: 'alerts: list, get, acknowledge, resolve, suppress',
+    alwaysLoad: true,
     definition: {
       name: 'manage_alerts',
       description: 'Query, view, acknowledge, resolve, or suppress alerts. Use action "list" to search alerts, "get" for details, "acknowledge" to mark as seen, "resolve" to close, or "suppress" to temporarily silence an alert.',
@@ -95,17 +176,31 @@ export function registerAlertTools(aiTools: Map<string, AiTool>): void {
           status: { type: 'string', enum: ['active', 'acknowledged', 'resolved', 'suppressed', 'dismissed'], description: 'Filter by status (for list)' },
           severity: { type: 'string', enum: ['critical', 'high', 'medium', 'low', 'info'], description: 'Filter by severity (for list)' },
           deviceId: { type: 'string', description: 'Filter by device UUID (for list)' },
-          limit: { type: 'number', description: 'Max results (for list, default 25)' },
+          // Default 12 (was 15): leaves room in the chat budget for the org
+          // fields a multi-org caller gets (#10408).
+          ...keysetParamSchema(12, 100),
           resolutionNote: { type: 'string', description: 'Note when resolving or suppressing an alert' },
           suppressDuration: { type: 'number', description: 'Hours to suppress the alert (default: 24, max: 720). Use 0 to suppress forever (indefinitely).' }
         },
         required: ['action']
       }
     },
-    handler: async (input, auth) => {
+    handler: async (input, auth, context?: ToolExecutionContext) => {
       const action = input.action as string;
 
       if (action === 'list') {
+        const page = readKeysetArgs('manage_alerts', input, { defaultLimit: 12, maxLimit: 100 });
+        if (!page.ok) return JSON.stringify({ error: page.error, code: page.code });
+        const { limit, after, fingerprint } = page;
+        const emptyKeysetPage = (extra: Record<string, unknown> = {}) =>
+          JSON.stringify({
+            ...keysetEnvelope<{ triggeredAtText: string; id: string }>({
+              key: 'alerts', items: [], limit, fingerprint, after, total: 0,
+              keyOf: (r) => ({ t: r.triggeredAtText, i: r.id }),
+            }),
+            ...extra,
+          });
+
         const conditions: SQL[] = [];
         const orgCondition = auth.orgCondition(alerts.orgId);
         if (orgCondition) conditions.push(orgCondition);
@@ -126,42 +221,95 @@ export function registerAlertTools(aiTools: Map<string, AiTool>): void {
         // `allowedDeviceIds` and no site axis at all (#6096).
         const listOrgId = getOrgId(auth);
         if ((auth.allowedSiteIds || auth.allowedDeviceIds) && listOrgId) {
-          const allowed = await resolveSiteAllowedDeviceIds(listOrgId, auth);
-          if (!allowed || allowed.length === 0) {
-            return JSON.stringify({ alerts: [], total: 0, showing: 0 });
+          const allowed = (await resolveSiteAllowedDeviceIds(listOrgId, auth)) ?? [];
+          const allowedSites = siteAllowlistOf(auth);
+          // Empty only when NOTHING is in scope: a site with no devices can
+          // still own topology policy alerts (M3-D6).
+          if (allowed.length === 0 && (auth.allowedDeviceIds || !allowedSites || allowedSites.length === 0)) {
+            return emptyKeysetPage();
           }
           if (input.deviceId && !allowed.includes(input.deviceId as string)) {
-            return JSON.stringify({ alerts: [], total: 0, showing: 0 });
+            return emptyKeysetPage();
           }
-          conditions.push(inArray(alerts.deviceId, allowed));
+          // A topology policy alert follows its owning topology site (M3-D6),
+          // not the origin device's current site; the device axis still binds a
+          // device-bound run.
+          conditions.push(alertSiteScopeByDeviceIds({
+            allowedSiteIds: allowedSites, allowedDeviceIds: allowed, deviceAxis: auth.allowedDeviceIds !== undefined,
+          })!);
         }
 
-        const limit = Math.min(Math.max(1, Number(input.limit) || 25), 100);
+        // `total` reflects the whole filtered set, so it must be computed
+        // BEFORE the keyset predicate (which narrows to "rows after the
+        // cursor") is added to `conditions` below.
+        const countResult = await db
+          .select({ count: sql<number>`count(*)` })
+          .from(alerts)
+          .where(conditions.length > 0 ? and(...conditions) : undefined);
+        const total = Number(countResult[0]?.count ?? 0);
 
-        const results = await db
+        if (after) {
+          conditions.push(keysetWhereCondition(alerts.triggeredAt, alerts.id, after)!);
+        }
+
+        // #10408: a caller reaching several orgs gets each row's org, or a
+        // partner-wide triage cannot group alerts by customer.
+        const spansOrgs = readReachSpansOrgs(auth);
+        const rows = await db
           .select({
+            ...(spansOrgs ? { orgId: alerts.orgId, orgName: orgNameOf(alerts.orgId) } : {}),
             id: alerts.id,
             status: alerts.status,
             severity: alerts.severity,
             title: alerts.title,
             message: alerts.message,
+            contextSource: sql<string | null>`${alerts.context}->>'source'`,
             deviceId: alerts.deviceId,
             triggeredAt: alerts.triggeredAt,
+            // Q1: full microsecond-precision text for the keyset cursor —
+            // NEVER derive the cursor key from the Date-typed `triggeredAt`
+            // above (JS Date rounds to milliseconds).
+            triggeredAtText: sql<string>`${alerts.triggeredAt}::text`,
             acknowledgedAt: alerts.acknowledgedAt,
             resolvedAt: alerts.resolvedAt,
             suppressedUntil: alerts.suppressedUntil
           })
           .from(alerts)
           .where(conditions.length > 0 ? and(...conditions) : undefined)
-          .orderBy(desc(alerts.triggeredAt))
-          .limit(limit);
+          .orderBy(desc(alerts.triggeredAt), desc(alerts.id))
+          .limit(limit + 1);
 
-        const countResult = await db
-          .select({ count: sql<number>`count(*)` })
-          .from(alerts)
-          .where(conditions.length > 0 ? and(...conditions) : undefined);
+        const items = rows.map((rawRow) => {
+          const { contextSource, ...row } = rawRow;
+          if (contextSource === NETWORK_MONITOR_ALERT_SOURCE) row.message = scrubUrlsInText(row.message);
+          const truncated = !!row.message && row.message.length > 500;
+          return {
+            id: row.id,
+            status: row.status,
+            severity: row.severity,
+            title: row.title,
+            message: truncated ? row.message!.slice(0, 500) : row.message,
+            messageTruncated: truncated,
+            deviceId: row.deviceId,
+            ...(spansOrgs ? { orgId: row.orgId!, orgName: row.orgName ?? null } : {}),
+            triggeredAt: row.triggeredAt instanceof Date ? row.triggeredAt.toISOString() : row.triggeredAt ?? null,
+            triggeredAtText: row.triggeredAtText,
+            acknowledgedAt: row.acknowledgedAt instanceof Date ? row.acknowledgedAt.toISOString() : row.acknowledgedAt ?? null,
+            resolvedAt: row.resolvedAt instanceof Date ? row.resolvedAt.toISOString() : row.resolvedAt ?? null,
+            suppressedUntil: row.suppressedUntil instanceof Date ? row.suppressedUntil.toISOString() : row.suppressedUntil ?? null,
+          };
+        });
 
-        return JSON.stringify({ alerts: results, total: Number(countResult[0]?.count ?? 0), showing: results.length });
+        const envelope = keysetEnvelope({
+          key: 'alerts', items, limit, fingerprint, after, total,
+          keyOf: (r) => ({ t: r.triggeredAtText, i: r.id }),
+        });
+        const outAlerts = (envelope.alerts as Array<Record<string, unknown>>).map(
+          ({ triggeredAtText: _triggeredAtText, ...rest }) => rest
+        );
+        if (!spansOrgs) return JSON.stringify({ ...envelope, alerts: outAlerts });
+        const legend = splitOrgLegend(outAlerts as Array<Record<string, unknown> & { orgId: string; orgName: string | null }>);
+        return JSON.stringify({ ...envelope, alerts: legend.rows, organizations: legend.organizations });
       }
 
       if (action === 'get') {
@@ -171,16 +319,20 @@ export function registerAlertTools(aiTools: Map<string, AiTool>): void {
         if (!alert) return JSON.stringify({ error: 'Alert not found or access denied' });
 
         // Get device info
-        const [device] = await db
+        const [device] = alert.deviceId === null ? [] : await db
           .select({ hostname: devices.hostname, osType: devices.osType, status: devices.status })
           .from(devices)
           .where(eq(devices.id, alert.deviceId))
           .limit(1);
 
-        return JSON.stringify({ alert, device });
+        return JSON.stringify({ alert: presentNetworkMonitorAlert(alert), device: device ?? null });
       }
 
       if (action === 'acknowledge') {
+        // #6907: user-owned on release — see approverReleaseMismatch.
+        if (approverReleaseMismatch(auth, context)) {
+          return JSON.stringify({ error: 'approver_auth_mismatch', action });
+        }
         if (!input.alertId) return JSON.stringify({ error: 'alertId is required' });
 
         const alert = await findAlertWithAccess(input.alertId as string, auth);
@@ -251,6 +403,10 @@ export function registerAlertTools(aiTools: Map<string, AiTool>): void {
       }
 
       if (action === 'resolve') {
+        // #6907: user-owned on release — see approverReleaseMismatch.
+        if (approverReleaseMismatch(auth, context)) {
+          return JSON.stringify({ error: 'approver_auth_mismatch', action });
+        }
         if (!input.alertId) return JSON.stringify({ error: 'alertId is required' });
 
         const alert = await findAlertWithAccess(input.alertId as string, auth);
@@ -282,6 +438,7 @@ export function registerAlertTools(aiTools: Map<string, AiTool>): void {
             status: 'resolved',
             resolvedAt,
             resolvedBy: auth.user.id,
+            resolutionReason: 'manual',
             resolutionNote
           })
           .where(buildResolveAlertCas(input.alertId as string))
@@ -331,6 +488,10 @@ export function registerAlertTools(aiTools: Map<string, AiTool>): void {
       }
 
       if (action === 'suppress') {
+        // #6907: user-owned on release — see approverReleaseMismatch.
+        if (approverReleaseMismatch(auth, context)) {
+          return JSON.stringify({ error: 'approver_auth_mismatch', action });
+        }
         if (!input.alertId) return JSON.stringify({ error: 'alertId is required' });
 
         const alert = await findAlertWithAccess(input.alertId as string, auth);
@@ -372,26 +533,12 @@ export function registerAlertTools(aiTools: Map<string, AiTool>): void {
           return JSON.stringify({ error: ALERT_SUPPRESS_CAS_LOST_MESSAGE });
         }
 
-        let suppressEventWarning: string | undefined;
-        try {
-          await publishEvent(
-            'alert.suppressed',
-            alert.orgId,
-            {
-              alertId: alert.id,
-              ruleId: alert.ruleId,
-              deviceId: alert.deviceId,
-              suppressedBy: auth.user.id,
-              suppressedUntil: suppressedUntil ? suppressedUntil.toISOString() : null,
-              durationHours
-            },
-            'ai-tools',
-            { userId: auth.user.id }
-          );
-        } catch (error) {
-          console.error('[AiTools] Failed to publish alert.suppressed event:', error);
-          suppressEventWarning = 'Alert was suppressed but event notification may be delayed';
-        }
+        const suppressEventPublished = await publishAlertSuppressed({
+          alert, suppressedBy: auth.user.id, suppressedUntil, durationHours, source: 'ai-tools',
+        });
+        const suppressEventWarning = suppressEventPublished
+          ? undefined
+          : 'Alert was suppressed but event notification may be delayed';
 
         await emitAlertStateFeedback({
           orgId: alert.orgId,
@@ -463,6 +610,10 @@ export function registerAlertTools(aiTools: Map<string, AiTool>): void {
           enabled: {
             type: 'boolean',
             description: 'Whether channel is active (default: true)',
+          },
+          orgId: {
+            type: 'string',
+            description: 'Organization UUID that will own the new channel (create only). Required unless you can access exactly one organization.',
           },
           limit: {
             type: 'number',
@@ -555,8 +706,9 @@ export function registerAlertTools(aiTools: Map<string, AiTool>): void {
       }
 
       if (action === 'create') {
-        const orgId = auth.orgId ?? auth.accessibleOrgIds?.[0];
-        if (!orgId) return JSON.stringify({ error: 'Organization context required' });
+        const resolvedOrg = resolveWritableToolOrgId(auth, typeof input.orgId === 'string' && input.orgId ? input.orgId : undefined);
+        if (!resolvedOrg.orgId) return JSON.stringify({ error: resolvedOrg.error ?? 'Organization context required' });
+        const orgId = resolvedOrg.orgId;
         if (!input.name) return JSON.stringify({ error: 'name is required' });
         if (!input.type) return JSON.stringify({ error: 'type is required (email, slack, teams, webhook, pagerduty, sms)' });
         if (!input.config) return JSON.stringify({ error: 'config is required (channel-specific settings)' });
@@ -568,13 +720,18 @@ export function registerAlertTools(aiTools: Map<string, AiTool>): void {
         }
 
         try {
-          const [channel] = await db.insert(notificationChannels).values({
-            orgId,
-            name: input.name as string,
-            type: channelType,
-            config: encryptNotificationChannelConfig(channelType, input.config) as Record<string, unknown>,
-            enabled: input.enabled !== false,
-          }).returning();
+          // Channel row and its config row (#6379) commit together.
+          const channel = await db.transaction(async (tx) => {
+            const [row] = await tx.insert(notificationChannels).values({
+              orgId,
+              name: input.name as string,
+              type: channelType,
+              enabled: input.enabled !== false,
+            }).returning();
+            if (!row) return null;
+            await writeNotificationChannelConfig(row.id, encryptNotificationChannelConfig(channelType, input.config), tx);
+            return row;
+          });
           if (!channel) return JSON.stringify({ error: 'Failed to create notification channel' });
 
           return JSON.stringify({ success: true, channelId: channel.id, name: channel.name, type: channel.type });
@@ -598,7 +755,7 @@ export function registerAlertTools(aiTools: Map<string, AiTool>): void {
           );
         }
 
-        const [existing] = await db.select().from(notificationChannels).where(and(...conditions)).limit(1);
+        const [existing] = await selectNotificationChannelsWithConfig(and(...conditions), { limit: 1 });
         if (!existing) return JSON.stringify({ error: 'Notification channel not found or access denied' });
 
         // Partner-wide channels are administrable only with the partner-wide
@@ -617,8 +774,16 @@ export function registerAlertTools(aiTools: Map<string, AiTool>): void {
         }
 
         const updates: Record<string, unknown> = { updatedAt: new Date() };
+        let nextConfig: unknown;
         if (typeof input.name === 'string') updates.name = input.name;
         if (input.config !== undefined && input.config !== null) {
+          // Merging needs the stored config (masked secrets resolve against
+          // it); a missing notification_channel_configs row (#6379) would
+          // silently drop them.
+          if (existing.config === null || existing.config === undefined) {
+            console.error(`[aiToolsAlerts] Channel ${existing.id} has no config row (notification_channel_configs) — config update refused`);
+            return JSON.stringify({ error: 'Notification channel has no stored configuration' });
+          }
           if (
             existing.type === 'webhook'
             && webhookOriginChangeWouldRetainAuthorization(
@@ -640,11 +805,14 @@ export function registerAlertTools(aiTools: Map<string, AiTool>): void {
           if (configErrors.length > 0) {
             return JSON.stringify({ error: `Invalid ${existing.type} channel configuration`, details: configErrors });
           }
-          updates.config = mergedEncrypted;
+          nextConfig = mergedEncrypted;
         }
         if (typeof input.enabled === 'boolean') updates.enabled = input.enabled;
 
-        await db.update(notificationChannels).set(updates).where(eq(notificationChannels.id, existing.id));
+        await db.transaction(async (tx) => {
+          await tx.update(notificationChannels).set(updates).where(eq(notificationChannels.id, existing.id));
+          if (nextConfig !== undefined) await writeNotificationChannelConfig(existing.id, nextConfig, tx);
+        });
         return JSON.stringify({ success: true, message: `Channel "${existing.name}" updated` });
       }
 

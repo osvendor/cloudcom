@@ -26,7 +26,12 @@ vi.mock('../../stores/auth', () => ({
   fetchWithAuth: vi.fn(),
   useAuthStore: Object.assign(
     (selector: (state: { updateUser: () => void }) => unknown) => selector({ updateUser: vi.fn() }),
-    { getState: () => ({ updateUser: vi.fn(), sessionGeneration: 0, commitReissuedSessionIfCurrent: vi.fn(() => true) }) }
+    { getState: () => ({
+      updateUser: vi.fn(),
+      sessionGeneration: 0,
+      commitMfaEnrollmentIfCurrent: vi.fn(() => true),
+      commitReissuedSessionIfCurrent: vi.fn(() => true), commitMfaStateIfCurrent: vi.fn(() => true),
+    }) }
   )
 }));
 
@@ -38,6 +43,19 @@ vi.mock('@/lib/avatarBlobCache', () => ({
 }));
 
 vi.mock('./ApproverDevicesSection', () => ({
+  default: () => null,
+}));
+
+// TicketPushoverSettings fetches /users/me/ticket-pushover on mount; stub it so
+// it doesn't consume from this file's fetchWithAuth mocks. Its own behavior is
+// covered by TicketPushoverSettings.test.tsx.
+vi.mock('./TicketPushoverSettings', () => ({
+  default: () => null,
+}));
+
+// EmailNotificationSettings fetches /users/me/email-preferences on mount; stub it so
+// it doesn't consume from this file's fetchWithAuth mocks (covered by its own test).
+vi.mock('./EmailNotificationSettings', () => ({
   default: () => null,
 }));
 
@@ -217,7 +235,7 @@ describe('ProfilePage — MFA enrollment rejects a wrong TOTP (#4413)', () => {
     expect(await screen.findByText('NEW-0001')).toBeTruthy();
 
     // Disable: a wrong code is a rejected proof, not a dead session.
-    fireEvent.click(screen.getByRole('button', { name: /^Back$/i }));
+    fireEvent.click(screen.getByTestId('mfa-recovery-done'));
     fireEvent.click(await screen.findByRole('button', { name: /^Disable$/i }));
     const digits = document.querySelectorAll<HTMLInputElement>('input[inputmode="numeric"]');
     digits.forEach((input, index) => {
@@ -246,7 +264,10 @@ describe('ProfilePage — MFA enrollment rejects a wrong TOTP (#4413)', () => {
         return makeJsonResponse({ qrCodeDataUrl: 'data:image/png;base64,abc' });
       }
       if (String(url) === '/auth/mfa/enable') {
-        return makeJsonResponse({ recoveryCodes: ['AAAA-BBBB'] });
+        return makeJsonResponse({
+          recoveryCodes: ['AAAA-BBBB'],
+          tokens: { accessToken: 'replacement-totp', expiresInSeconds: 900 },
+        });
       }
       return undefined as unknown as Response;
     });
@@ -273,7 +294,10 @@ describe('ProfilePage — MFA enrollment rejects a wrong TOTP (#4413)', () => {
         return makeJsonResponse({ qrCodeDataUrl: 'data:image/png;base64,abc' });
       }
       if (String(url) === '/auth/mfa/enable') {
-        return makeJsonResponse({ recoveryCodes: ['AAAA-BBBB', 'CCCC-DDDD'] });
+        return makeJsonResponse({
+          recoveryCodes: ['AAAA-BBBB', 'CCCC-DDDD'],
+          tokens: { accessToken: 'replacement-totp', expiresInSeconds: 900 },
+        });
       }
       return undefined as unknown as Response;
     });

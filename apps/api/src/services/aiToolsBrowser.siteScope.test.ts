@@ -245,6 +245,27 @@ describe('get_browser_security — read site narrowing', () => {
       expect(extensionQueryRan).toBe(false);
     });
   });
+
+  it('fails closed (empty, no query) for a site-restricted caller whose org never resolves', () => {
+    // auth.orgId is null (e.g. a partner/system-scoped token) and no input.orgId
+    // is supplied, so siteScopeOrgId is null and the site-narrowing branch used
+    // to be skipped entirely — falling through to an unfiltered query. Assert
+    // it now short-circuits to empty without running any select at all.
+    let anyQueryRan = false;
+    mockDb.select.mockImplementation(() => {
+      anyQueryRan = true;
+      return { from: () => ({ innerJoin: () => ({ where: () => ({ orderBy: () => ({ limit: () => Promise.resolve([]) }) }) }), where: () => ({ orderBy: () => ({ limit: () => Promise.resolve([]) }) }) }) };
+    });
+
+    const auth = { ...makeAuth(['site-A']), orgId: null };
+    const handler = handlerFor('get_browser_security');
+    return handler({}, auth).then((result) => {
+      const parsed = JSON.parse(result);
+      expect(parsed.summary.total).toBe(0);
+      expect(parsed.extensions).toEqual([]);
+      expect(anyQueryRan).toBe(false);
+    });
+  });
 });
 
 describe('manage_browser_policy list — site read scope (audit §1.1)', () => {
@@ -354,5 +375,40 @@ describe('manage_browser_policy list — page completeness (review #6110)', () =
     const parsed = JSON.parse(raw);
     expect(requestedLimit).toBe(200);
     expect(parsed.scopeNote).toBeUndefined();
+  });
+});
+
+describe('manage_browser_policy apply — resolved target cap (W04)', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  const orgPolicy = {
+    id: 'p1', orgId: 'org-1', name: 'Policy', targetType: 'org', targetIds: null, isActive: true,
+    allowedExtensions: [], blockedExtensions: [], requiredExtensions: [], settings: {},
+  };
+  const rows = (n: number) => Array.from({ length: n }, (_, i) => ({ id: `d${i}`, hostname: `h${i}` }));
+  function mockResolved(n: number) {
+    mockDb.select
+      .mockReturnValueOnce({ from: () => ({ where: () => ({ limit: () => Promise.resolve([orgPolicy]) }) }) })
+      .mockReturnValueOnce({ from: () => ({ where: () => Promise.resolve(rows(n)) }) });
+  }
+
+  it('refuses an implicit org-wide target set over the cap before dispatching anything', async () => {
+    mockResolved(1001);
+    const result = JSON.parse(await handlerFor('manage_browser_policy')(
+      { action: 'apply', policyId: 'p1' }, makeAuth(undefined),
+    ));
+    expect(result.error).toMatch(/1000/);
+    expect(result.error).toMatch(/deviceIds/);
+    expect(assertDeviceExecuteAllowedMock).not.toHaveBeenCalled();
+    expect(aiDispatchDeviceCommandMock).not.toHaveBeenCalled();
+  });
+
+  it('dispatches when the resolved set is exactly at the cap', async () => {
+    mockResolved(1000);
+    const result = JSON.parse(await handlerFor('manage_browser_policy')(
+      { action: 'apply', policyId: 'p1' }, makeAuth(undefined),
+    ));
+    expect(result.success).toBe(true);
+    expect(aiDispatchDeviceCommandMock).toHaveBeenCalledTimes(1000);
   });
 });

@@ -8,7 +8,15 @@ import PartnerBillingSettingsPage from './PartnerBillingSettingsPage';
 import { fetchWithAuth } from '../../stores/auth';
 import { partnerCurrencyCache } from '@/lib/partnerCurrencyCache';
 
-vi.mock('../../stores/auth', () => ({ fetchWithAuth: vi.fn() }));
+// canManagePartnerWide mirrors /users/me (API's canManagePartnerWidePolicies); undefined = not yet known.
+let canManagePartnerWide: boolean | undefined = true;
+vi.mock('../../stores/auth', () => ({
+  fetchWithAuth: vi.fn(),
+  useAuthStore: (sel: (s: { user: { canManagePartnerWide?: boolean } }) => unknown) => sel({ user: { canManagePartnerWide } }),
+}));
+// Grants for the billing-write gate (invoices:write, same as the PATCH route).
+let canWrite = true;
+vi.mock('../../lib/permissions', () => ({ usePermissions: () => ({ can: () => canWrite }) }));
 vi.mock('@/lib/navigation', () => ({ navigateTo: vi.fn() }));
 const showToast = vi.fn();
 vi.mock('../shared/Toast', () => ({ showToast: (a: unknown) => showToast(a) }));
@@ -21,29 +29,160 @@ function renderPage() {
   return render(<I18nextProvider i18n={i18n}><PartnerBillingSettingsPage /></I18nextProvider>);
 }
 
+// OverflowTabs measures button widths via `offsetWidth`, which jsdom always
+// reports as 0 — against a `clientWidth` of 0 that collapses to "fits 1 tab"
+// (see computeVisible in OverflowTabs.tsx), so every tab past Defaults ends
+// up inside the "More" dropdown in tests. Open it before selecting any tab
+// other than the first.
+async function selectTab(id: string) {
+  const testId = id === 'payments' ? 'autopay-payments-tab' : `billing-settings-tab-${id}`;
+  const visible = screen.queryByTestId(testId);
+  if (visible?.getAttribute('role') === 'tab') {
+    await userEvent.click(visible);
+    return;
+  }
+  await userEvent.click(await screen.findByTestId('billing-settings-tab-more'));
+  await userEvent.click(await screen.findByTestId(testId));
+}
+
 async function gotoDocumentsTab() {
-  await userEvent.click(await screen.findByTestId('billing-settings-tab-documents'));
+  await selectTab('documents');
 }
 
 describe('PartnerBillingSettingsPage', () => {
+it('mounts fee settings in the real Payments tab',async()=>{
+  fetchMock.mockImplementation(async path=>json(String(path).endsWith('/payment-settings')?feeView():
+    {currencyCode:'USD',invoiceNumberPrefix:'INV',invoiceTermsDays:30}));
+  renderPage();await selectTab('payments');
+  expect(await screen.findByTestId('autopay-fee-settings-page')).toBeInTheDocument();
+  expect(await screen.findByTestId('autopay-fees')).toBeInTheDocument();
+  expect(screen.getByTestId('autopay-attest-notified')).toBeInTheDocument();
+});
+it('keeps the Payments tab but hides fees when rollout is off',async()=>{
+  fetchMock.mockImplementation(async path=>json(String(path).endsWith('/payment-settings')?feeView(false):
+    {currencyCode:'USD',invoiceNumberPrefix:'INV',invoiceTermsDays:30}));
+  renderPage();await selectTab('payments');
+  await screen.findByTestId('autopay-settings-save');
+  expect(screen.queryByTestId('autopay-fees')).toBeNull();
+});
+
+it.each([false, true])('mounts Payments when autopayEnabled=%s', async autopayEnabled => {
+  const fields = {
+    autopayOffsetDays: { value: 0, source: 'default' }, autopayOffsetRule: { value: 'later', source: 'default' },
+    autopayCap: { value: { enabled: false }, source: 'default' }, achMode: { value: 'ach_preferred', source: 'default' },
+    cardFeeBps: { value: 0, source: 'default' }, achFeeAmount: { value: '0.00', source: 'default' }, feeAttested: false,
+    remindersEnabled: { value: false, source: 'default' },
+    reminderBeforeDueDays: { value: 3, source: 'default' },
+    reminderRepeatDays: { value: null, source: 'default' },
+    overdueReminderEveryDays: { value: 7, source: 'default' },
+  };
+  fetchMock.mockImplementation(async url => {
+    if (String(url).endsWith('/billing/payment-settings')) return json({
+      effective: fields, inherited: fields, autopayEnabled,
+      values: { autopayOffsetDays: null, autopayOffsetRule: null, autopayCapEnabled: null, autopayCapAmount: null, autopayCapCurrency: null, achMode: null },
+    });
+    return json({ currencyCode: 'USD', invoiceNumberPrefix: 'INV', invoiceTermsDays: 30 });
+  });
+  window.location.hash = '#payments';
+  renderPage();
+  expect(await screen.findByTestId('autopay-payments-shell')).toBeInTheDocument();
+  expect(await screen.findByTestId('autopay-reminders-section')).toBeInTheDocument();
+  expect(screen.queryByTestId('autopay-settings-section') !== null).toBe(autopayEnabled);
+  expect(window.location.hash).toBe('#payments');
+  await selectTab('defaults');
+  await selectTab('payments');
+  expect(await screen.findByTestId('autopay-reminders-section')).toBeInTheDocument();
+});
+
   beforeEach(() => {
     vi.clearAllMocks();
+    canWrite = true;
+    canManagePartnerWide = true;
     window.location.hash = '';
   });
 
-  it('has four visible tabs in order: Defaults, Documents, Rates, Connections', async () => {
+  it('has six tabs in order: Defaults, Documents, Agreements, Rates, Payments, Connections (Documents onward behind "More" under jsdom)', async () => {
     fetchMock.mockResolvedValue(json({ currencyCode: 'USD', invoiceNumberPrefix: 'INV', invoiceTermsDays: 30 }));
     renderPage();
     expect(await screen.findByTestId('billing-settings-tab-defaults')).toBeInTheDocument();
+    await userEvent.click(await screen.findByTestId('billing-settings-tab-more'));
     expect(screen.getByTestId('billing-settings-tab-documents')).toBeInTheDocument();
     expect(screen.getByTestId('billing-settings-tab-connections')).toBeInTheDocument();
-    expect(screen.getAllByRole('tab').map(tab => tab.getAttribute('data-testid'))).toEqual(['billing-settings-tab-defaults', 'billing-settings-tab-documents', 'billing-settings-tab-rates', 'billing-settings-tab-connections']);
+    const order = ['billing-settings-tab-defaults', ...['documents', 'agreements', 'rates'].map(id => `billing-settings-tab-${id}`), 'autopay-payments-tab', 'billing-settings-tab-connections'];
+    expect(screen.getAllByRole('tab').map(tab => tab.getAttribute('data-testid'))).toEqual([order[0]]);
+    expect(screen.getAllByRole('menuitem').map(item => item.getAttribute('data-testid'))).toEqual(order.slice(1));
+  });
+
+  it('the active tab\'s aria-controls resolves to a tabpanel labelled by that tab', async () => {
+    fetchMock.mockResolvedValue(json({ currencyCode: 'USD', invoiceNumberPrefix: 'INV', invoiceTermsDays: 30 }));
+    renderPage();
+    const tab = await screen.findByTestId('billing-settings-tab-defaults');
+    const controls = tab.getAttribute('aria-controls');
+    expect(controls).toBeTruthy();
+    const panel = document.getElementById(controls!);
+    expect(panel).not.toBeNull();
+    expect(panel).toHaveAttribute('role', 'tabpanel');
+    expect(panel).toHaveAttribute('aria-labelledby', tab.id);
+    expect(panel).toContainElement(screen.getByTestId('partner-billing-currency'));
+  });
+
+  it('renders AccessDenied (no Retry) when GET /orgs/partners/me is 403', async () => {
+    fetchMock.mockResolvedValue(json({ error: 'forbidden' }, false, 403));
+    renderPage();
+    expect(await screen.findByTestId('partner-billing-denied')).toBeInTheDocument();
+    expect(screen.queryByTestId('partner-billing-load-error')).not.toBeInTheDocument();
+  });
+
+  it('is read-only without invoices:write: inputs disabled, no Save, notice shown', async () => {
+    canWrite = false;
+    fetchMock.mockResolvedValue(json({ currencyCode: 'USD', invoiceNumberPrefix: 'INV', invoiceTermsDays: 30 }));
+    renderPage();
+    const currency = await screen.findByTestId('partner-billing-currency');
+    expect(currency).toBeDisabled();
+    expect(screen.getByTestId('partner-billing-prefix')).toBeDisabled();
+    expect(screen.queryByTestId('partner-billing-save')).not.toBeInTheDocument();
+    expect(screen.getByTestId('partner-billing-readonly')).toBeInTheDocument();
+    expect(screen.getByTestId('partner-billing-readonly')).not.toHaveTextContent(/all organizations/i);
+  });
+
+  it('shows the plain notice (not the partner-wide one) when both the grant and partner-wide access are missing', async () => {
+    canWrite = false;
+    canManagePartnerWide = false;
+    fetchMock.mockResolvedValue(json({ currencyCode: 'USD', invoiceNumberPrefix: 'INV', invoiceTermsDays: 30 }));
+    renderPage();
+    expect(await screen.findByTestId('partner-billing-readonly')).not.toHaveTextContent(/all organizations/i);
+    expect(screen.getByTestId('partner-billing-currency')).toBeDisabled();
+  });
+
+  it('is read-only with a partner-wide-specific notice when invoices:write is held but partner-wide access is not (#7517)', async () => {
+    canManagePartnerWide = false;
+    fetchMock.mockResolvedValue(json({ currencyCode: 'USD', invoiceNumberPrefix: 'INV', invoiceTermsDays: 30 }));
+    renderPage();
+    expect(await screen.findByTestId('partner-billing-currency')).toBeDisabled();
+    expect(screen.queryByTestId('partner-billing-save')).not.toBeInTheDocument();
+    expect(screen.getByTestId('partner-billing-readonly')).toHaveTextContent(/all organizations/i);
+  });
+
+  it('stays editable when partner-wide capability is not yet known (server still enforces)', async () => {
+    canManagePartnerWide = undefined;
+    fetchMock.mockResolvedValue(json({ currencyCode: 'USD', invoiceNumberPrefix: 'INV', invoiceTermsDays: 30 }));
+    renderPage();
+    expect(await screen.findByTestId('partner-billing-currency')).toBeEnabled();
+    expect(screen.getByTestId('partner-billing-save')).toBeEnabled();
+  });
+
+  it('keeps the form editable with a Save button when invoices:write is held', async () => {
+    fetchMock.mockResolvedValue(json({ currencyCode: 'USD', invoiceNumberPrefix: 'INV', invoiceTermsDays: 30 }));
+    renderPage();
+    expect(await screen.findByTestId('partner-billing-currency')).toBeEnabled();
+    expect(screen.getByTestId('partner-billing-save')).toBeEnabled();
+    expect(screen.queryByTestId('partner-billing-readonly')).not.toBeInTheDocument();
   });
 
   it('mounts Rates and its work types manager when selected, with row saves only', async () => {
     fetchMock.mockImplementation(async (url: string) => json(url === '/billing-profiles' ? { profiles: [] } : url.includes('work-types') ? { workTypes: [] } : { currencyCode: 'USD' }));
     renderPage();
-    await userEvent.click(await screen.findByTestId('billing-settings-tab-rates'));
+    await selectTab('rates');
     expect(await screen.findByTestId('billing-rates-tab')).toBeInTheDocument();
     expect(await screen.findByTestId('work-types-card')).toBeInTheDocument();
     expect(screen.queryByTestId('partner-billing-save')).not.toBeInTheDocument();
@@ -55,7 +194,9 @@ describe('PartnerBillingSettingsPage', () => {
     fetchMock.mockImplementation(async (url: string) => json(url === '/billing-profiles' ? { profiles: [] } : url.includes('work-types') ? { workTypes: [] } : { currencyCode: 'USD' }));
     renderPage();
     expect(await screen.findByTestId('billing-rates-tab')).toBeInTheDocument();
-    expect(screen.getByTestId('billing-settings-tab-rates')).toHaveAttribute('aria-selected', 'true');
+    // Rates is the active tab but collapsed behind "More" under jsdom; the
+    // trigger relabels itself to the active overflow tab (see OverflowTabs).
+    expect(await screen.findByTestId('billing-settings-tab-more')).toHaveTextContent('Rates');
   });
 
   it('one Save button submits the full payload regardless of which tab is active; markup moved to Catalog', async () => {
@@ -71,9 +212,30 @@ describe('PartnerBillingSettingsPage', () => {
   it('the Connections tab renders the real BillingConnectionsTab, not a placeholder (M6)', async () => {
     fetchMock.mockResolvedValue(json({ currencyCode: 'USD', invoiceNumberPrefix: 'INV', invoiceTermsDays: 30 }));
     renderPage();
-    await userEvent.click(await screen.findByTestId('billing-settings-tab-connections'));
+    await selectTab('connections');
     expect(await screen.findByTestId('billing-connections-tab')).toBeInTheDocument();
     expect(screen.queryByTestId('billing-connections-tab-placeholder')).not.toBeInTheDocument();
+  });
+
+  it('the Connections tab has no editable fields, so it must not render the Save button either (G2-3)', async () => {
+    fetchMock.mockResolvedValue(json({ currencyCode: 'USD', invoiceNumberPrefix: 'INV', invoiceTermsDays: 30 }));
+    renderPage();
+    await selectTab('connections');
+    expect(await screen.findByTestId('billing-connections-tab')).toBeInTheDocument();
+    expect(screen.queryByTestId('partner-billing-save')).not.toBeInTheDocument();
+  });
+
+  it('blank company name shows the partner name it falls back to on documents (sweep C3)', async () => {
+    fetchMock.mockResolvedValue(json({
+      currencyCode: 'USD', invoiceNumberPrefix: 'INV', invoiceTermsDays: 30,
+      name: 'Default Partner', billingCompanyName: null,
+    }));
+    renderPage();
+    await gotoDocumentsTab();
+    await waitFor(() =>
+      expect(screen.getByTestId('partner-billing-company-name')).toHaveAttribute('placeholder', 'Default Partner'),
+    );
+    expect((screen.getByTestId('partner-billing-company-name') as HTMLInputElement).value).toBe('');
   });
 
   it('loads and shows the seller company name', async () => {
@@ -176,6 +338,41 @@ describe('PartnerBillingSettingsPage', () => {
       const patch = fetchMock.mock.calls.find((c) => c[0] === '/partner/billing-settings' && (c[1] as RequestInit)?.method === 'PATCH');
       expect(JSON.parse((patch![1] as RequestInit).body as string)).toMatchObject({ invoiceDeviceAppendix: false });
     });
+  });
+
+  it('#8604: time entry line settings load from the partner payload and ride the save body', async () => {
+    fetchMock.mockImplementation(async (_input: string, opts?: RequestInit) => {
+      if (opts?.method === 'PATCH') return json({ data: {} });
+      return json({
+        currencyCode: 'USD', defaultTaxRate: null, invoiceNumberPrefix: 'INV', invoiceTermsDays: 30, invoiceFooter: null,
+        invoiceLineGrouping: 'day', invoiceLineShowDate: true, invoiceLineShowNote: false, invoiceLineShowWorkedTime: true,
+      });
+    });
+    renderPage();
+    await gotoDocumentsTab();
+    expect(((await screen.findByTestId('partner-billing-line-show-date')) as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByTestId('partner-billing-line-show-note') as HTMLInputElement).checked).toBe(false);
+    expect((screen.getByTestId('partner-billing-line-grouping') as HTMLSelectElement).value).toBe('day');
+    fireEvent.click(screen.getByTestId('partner-billing-line-show-worked-time'));
+    fireEvent.click(screen.getByTestId('partner-billing-save'));
+    await waitFor(() => {
+      const patch = fetchMock.mock.calls.find((c) => c[0] === '/partner/billing-settings' && (c[1] as RequestInit)?.method === 'PATCH');
+      expect(JSON.parse((patch![1] as RequestInit).body as string)).toMatchObject({
+        invoiceLineGrouping: 'day', invoiceLineShowDate: true, invoiceLineShowNote: false, invoiceLineShowWorkedTime: false,
+      });
+    });
+  });
+
+  it('#8604: an older payload without the fields reads as the defaults', async () => {
+    fetchMock.mockImplementation(async () => json({
+      currencyCode: 'USD', defaultTaxRate: null, invoiceNumberPrefix: 'INV', invoiceTermsDays: 30, invoiceFooter: null,
+    }));
+    renderPage();
+    await gotoDocumentsTab();
+    expect(((await screen.findByTestId('partner-billing-line-show-date')) as HTMLInputElement).checked).toBe(false);
+    expect((screen.getByTestId('partner-billing-line-show-note') as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByTestId('partner-billing-line-show-worked-time') as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByTestId('partner-billing-line-grouping') as HTMLSelectElement).value).toBe('entry');
   });
 
   it('#6635: the on-behalf acceptance notice toggle loads off by default and round-trips', async () => {
@@ -345,5 +542,71 @@ describe('PartnerBillingSettingsPage', () => {
       expect(screen.queryByTestId('partner-billing-website-error')).toBeNull();
       expect((screen.getByTestId('partner-billing-save') as HTMLButtonElement).disabled).toBe(false);
     });
+  });
+});
+
+function feeView(enabled=true){
+  const effective={autopayOffsetDays:{value:0,source:'default'},autopayOffsetRule:{value:'later',source:'default'},
+    autopayCap:{value:{enabled:false},source:'default'},achMode:{value:'ach_preferred',source:'default'},
+    cardFeeBps:{value:300,source:'partner'},achFeeAmount:{value:'2.50',source:'partner'},feeAttested:true,
+    remindersEnabled:{value:false,source:'default'},reminderBeforeDueDays:{value:3,source:'default'},
+    reminderRepeatDays:{value:null,source:'default'},overdueReminderEveryDays:{value:7,source:'default'}};
+  return {autopayEnabled:enabled,effective,inherited:effective,values:{autopayOffsetDays:null,autopayOffsetRule:null,
+    autopayCapEnabled:null,autopayCapAmount:null,autopayCapCurrency:null,achMode:null,cardFeeBps:null,achFeeAmount:null}};
+}
+
+describe('PartnerBillingSettingsPage billing defaults validation', () => {
+  const profile = { currencyCode: 'USD', invoiceNumberPrefix: 'INV', invoiceTermsDays: 30 };
+  const patchCalls = () => fetchMock.mock.calls.filter(([, init]) => (init as RequestInit | undefined)?.method === 'PATCH');
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    canWrite = true;
+    canManagePartnerWide = true;
+    window.location.hash = '';
+  });
+
+  it.each(['150', '-5'])('shows an inline error and sends nothing for tax rate %s', async (bad) => {
+    fetchMock.mockResolvedValue(json(profile));
+    renderPage();
+    fireEvent.change(await screen.findByTestId('partner-billing-tax'), { target: { value: bad } });
+    await userEvent.click(screen.getByTestId('partner-billing-save'));
+    expect(await screen.findByTestId('partner-billing-tax-error')).toBeInTheDocument();
+    expect(screen.getByTestId('partner-billing-tax')).toHaveAttribute('aria-invalid', 'true');
+    expect(patchCalls()).toHaveLength(0);
+  });
+
+  it.each(['2.5', '400', '-1', ''])('shows an inline error and sends nothing for payment terms %j', async (bad) => {
+    fetchMock.mockResolvedValue(json(profile));
+    renderPage();
+    fireEvent.change(await screen.findByTestId('partner-billing-terms-days'), { target: { value: bad } });
+    await userEvent.click(screen.getByTestId('partner-billing-save'));
+    expect(await screen.findByTestId('partner-billing-terms-days-error')).toBeInTheDocument();
+    expect(patchCalls()).toHaveLength(0);
+  });
+
+  it('sends the request, converting percent to a fraction, when values are valid', async () => {
+    fetchMock.mockResolvedValue(json(profile));
+    renderPage();
+    fireEvent.change(await screen.findByTestId('partner-billing-tax'), { target: { value: '8.5' } });
+    fireEvent.change(screen.getByTestId('partner-billing-terms-days'), { target: { value: '45' } });
+    await userEvent.click(screen.getByTestId('partner-billing-save'));
+    await waitFor(() => expect(patchCalls()).toHaveLength(1));
+    const body = JSON.parse((patchCalls()[0][1] as RequestInit).body as string);
+    expect(body.defaultTaxRate).toBeCloseTo(0.085);
+    expect(body.invoiceTermsDays).toBe(45);
+    expect(screen.queryByTestId('partner-billing-tax-error')).not.toBeInTheDocument();
+  });
+
+  it('maps a server field-level 400 onto the matching input instead of raw zod text', async () => {
+    fetchMock.mockImplementation(async (_url, init) =>
+      (init as RequestInit | undefined)?.method === 'PATCH'
+        ? json({ error: 'defaultTaxRate: Too big: expected number to be <=1', details: { formErrors: [], fieldErrors: { defaultTaxRate: ['Too big: expected number to be <=1'] } } }, false, 400)
+        : json(profile));
+    renderPage();
+    await screen.findByTestId('partner-billing-tax');
+    await userEvent.click(screen.getByTestId('partner-billing-save'));
+    expect(await screen.findByTestId('partner-billing-tax-error')).toBeInTheDocument();
+    expect(JSON.stringify(showToast.mock.calls)).not.toContain('Too big');
   });
 });

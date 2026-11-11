@@ -30,6 +30,11 @@ import {
 } from '../db/schema';
 import type { AuthContext } from '../middleware/auth';
 import { escapeLike } from '../utils/sql';
+import { createSourcedAlert } from './alertService';
+import {
+  resolveVisibleCategories,
+  SENSITIVE_EVENT_LOG_CATEGORY,
+} from './eventLogSensitivity';
 
 export type EventLogLevel = 'info' | 'warning' | 'error' | 'critical';
 export type EventLogCategory = 'security' | 'hardware' | 'application' | 'system';
@@ -54,6 +59,12 @@ export interface LogSearchInput {
   allowedDeviceIds?: string[] | null;
   /** Current site ceiling used by the statement-local device authorization predicate. */
   allowedSiteIds?: string[] | null;
+  /**
+   * Whether the caller holds `devices:execute` and may read `category:
+   * 'security'` rows. Resolved by the caller (route/tool) once per request;
+   * defaults to false (no sensitive rows) when omitted.
+   */
+  canReadSensitiveCategory?: boolean;
   limit?: number;
   offset?: number;
   cursor?: string;
@@ -75,6 +86,8 @@ export interface LogAggregationInput {
   /** Site-axis app-layer authz narrowing (see LogSearchInput.allowedDeviceIds). */
   allowedDeviceIds?: string[] | null;
   allowedSiteIds?: string[] | null;
+  /** See LogSearchInput.canReadSensitiveCategory. */
+  canReadSensitiveCategory?: boolean;
   limit?: number;
 }
 
@@ -88,6 +101,8 @@ export interface LogTrendsInput {
   /** Site-axis app-layer authz narrowing (see LogSearchInput.allowedDeviceIds). */
   allowedDeviceIds?: string[] | null;
   allowedSiteIds?: string[] | null;
+  /** See LogSearchInput.canReadSensitiveCategory. */
+  canReadSensitiveCategory?: boolean;
   limit?: number;
 }
 
@@ -314,8 +329,11 @@ export function buildSearchConditions(
     conditions.push(inArray(deviceEventLogs.level, filters.level));
   }
 
-  if (filters.category && filters.category.length > 0) {
-    conditions.push(inArray(deviceEventLogs.category, filters.category));
+  const visibleCategories = resolveVisibleCategories(filters.category, filters.canReadSensitiveCategory === true);
+  if (visibleCategories && visibleCategories.length > 0) {
+    conditions.push(inArray(deviceEventLogs.category, visibleCategories));
+  } else if (!visibleCategories && filters.canReadSensitiveCategory !== true) {
+    conditions.push(sql`${deviceEventLogs.category}::text != ${SENSITIVE_EVENT_LOG_CATEGORY}`);
   }
 
   if (filters.source && filters.source.trim().length > 0) {
@@ -565,8 +583,11 @@ export async function getLogAggregation(auth: AuthContext, input: LogAggregation
   if (input.level && input.level.length > 0) {
     conditions.push(inArray(deviceEventLogs.level, input.level));
   }
-  if (input.category && input.category.length > 0) {
-    conditions.push(inArray(deviceEventLogs.category, input.category));
+  const visibleAggCategories = resolveVisibleCategories(input.category, input.canReadSensitiveCategory === true);
+  if (visibleAggCategories && visibleAggCategories.length > 0) {
+    conditions.push(inArray(deviceEventLogs.category, visibleAggCategories));
+  } else if (!visibleAggCategories && input.canReadSensitiveCategory !== true) {
+    conditions.push(sql`${deviceEventLogs.category}::text != ${SENSITIVE_EVENT_LOG_CATEGORY}`);
   }
   if (input.source && input.source.trim().length > 0) {
     conditions.push(ilike(deviceEventLogs.source, `%${escapeLike(input.source.trim())}%`));
@@ -677,6 +698,10 @@ export async function getLogTrends(auth: AuthContext, input: LogTrendsInput) {
     conditions.push(inArray(deviceEventLogs.level, levelsAtOrAbove(input.minLevel)));
   }
 
+  if (input.canReadSensitiveCategory !== true) {
+    conditions.push(sql`${deviceEventLogs.category}::text != ${SENSITIVE_EVENT_LOG_CATEGORY}`);
+  }
+
   if (input.source && input.source.trim().length > 0) {
     conditions.push(ilike(deviceEventLogs.source, `%${escapeLike(input.source.trim())}%`));
   }
@@ -725,8 +750,9 @@ export async function getLogTrends(auth: AuthContext, input: LogTrendsInput) {
       .leftJoin(devices, eq(deviceEventLogs.deviceId, devices.id))
       .where(whereCondition)
       .groupBy(deviceEventLogs.source)
-      .orderBy(desc(sql`count(*)`))
-      .limit(limit),
+      .orderBy(desc(sql`count(*)`), asc(deviceEventLogs.source))
+      // One extra row tells the caller whether the top-N list was cut.
+      .limit(limit + 1),
     db
       .select({
         deviceId: deviceEventLogs.deviceId,
@@ -739,8 +765,8 @@ export async function getLogTrends(auth: AuthContext, input: LogTrendsInput) {
       .leftJoin(devices, eq(deviceEventLogs.deviceId, devices.id))
       .where(whereCondition)
       .groupBy(deviceEventLogs.deviceId, devices.hostname)
-      .orderBy(desc(sql`count(*)`))
-      .limit(limit),
+      .orderBy(desc(sql`count(*)`), asc(deviceEventLogs.deviceId))
+      .limit(limit + 1),
     db
       .select({
         bucket: sql<string>`date_trunc('hour', ${deviceEventLogs.timestamp})::text`,
@@ -780,19 +806,21 @@ export async function getLogTrends(auth: AuthContext, input: LogTrendsInput) {
       level: row.level,
       count: Number(row.count ?? 0),
     })),
-    topSources: topSources.map((row) => ({
+    topSources: topSources.slice(0, limit).map((row) => ({
       source: row.source,
       count: Number(row.count ?? 0),
       errorCount: Number(row.errorCount ?? 0),
       criticalCount: Number(row.criticalCount ?? 0),
     })),
-    topDevices: topDevices.map((row) => ({
+    topDevices: topDevices.slice(0, limit).map((row) => ({
       deviceId: row.deviceId,
       hostname: row.hostname,
       count: Number(row.count ?? 0),
       errorCount: Number(row.errorCount ?? 0),
       criticalCount: Number(row.criticalCount ?? 0),
     })),
+    topSourcesHasMore: topSources.length > limit,
+    topDevicesHasMore: topDevices.length > limit,
     errorTimeline: errorTimeline.map((point) => ({
       timestamp: toBucketIso(point.bucket),
       count: Number(point.count ?? 0),
@@ -1123,26 +1151,37 @@ export async function persistCorrelationForRule(
     alertId = inserted.alertId;
   }
 
+  // The active correlation's `alertId` is this producer's dedupe: once linked,
+  // later runs of the same correlation never raise (or publish) again.
   if (rule.alertOnMatch && !alertId) {
     const primaryDevice = detection.affectedDevices[0];
     if (primaryDevice?.deviceId) {
-      const [createdAlert] = await db
-        .insert(alerts)
-        .values({
-          orgId: rule.orgId,
-          deviceId: primaryDevice.deviceId,
-          severity: mapCorrelationSeverityToAlertSeverity(rule.severity),
-          status: 'active',
-          title: `Log correlation detected: ${rule.name}`,
-          message: `Pattern "${detection.pattern}" found on ${detection.affectedDevices.length} devices (${detection.occurrences} occurrences).`
-        })
-        .returning({ id: alerts.id });
+      // #11328 — through the shared create path so `alert.triggered` publishes
+      // (after COMMIT). The raw insert this replaced never reached
+      // notification channels, routing rules or escalation.
+      const createdAlertId = await createSourcedAlert({
+        deviceId: primaryDevice.deviceId,
+        orgId: rule.orgId,
+        severity: mapCorrelationSeverityToAlertSeverity(rule.severity),
+        title: `Log correlation detected: ${rule.name}`,
+        message: `Pattern "${detection.pattern}" found on ${detection.affectedDevices.length} devices (${detection.occurrences} occurrences).`,
+        context: {
+          source: 'log_correlation',
+          correlationRuleId: rule.id,
+          correlationId,
+          pattern: detection.pattern,
+          occurrences: detection.occurrences,
+          affectedDeviceCount: detection.affectedDevices.length,
+        },
+        publisher: 'log-correlation',
+        eventPayload: { correlationRuleId: rule.id, correlationId },
+      });
 
-      if (createdAlert?.id) {
-        alertId = createdAlert.id;
+      if (createdAlertId) {
+        alertId = createdAlertId;
         await db
           .update(logCorrelations)
-          .set({ alertId: createdAlert.id })
+          .set({ alertId: createdAlertId })
           .where(eq(logCorrelations.id, correlationId));
       }
     }

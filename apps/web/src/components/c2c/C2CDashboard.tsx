@@ -15,13 +15,15 @@ import {
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { OrgRequiredGate } from '../shared/OrgRequiredGate';
-import { cn } from '@/lib/utils';
+import { OverflowTabs, type OverflowTab } from '../shared/OverflowTabs';
 import { formatDateTime } from '@/lib/dateTimeFormat';
 import { fetchWithAuth } from '../../stores/auth';
 import { formatNumber } from '@/lib/i18n/format';
 import C2CConnectionWizard from './C2CConnectionWizard';
 import C2CRestoreDialog from './C2CRestoreDialog';
 import AlphaBadge from '../shared/AlphaBadge';
+import { useStableT } from '@/lib/i18n/useStableT';
+import { replaceUrl } from '../../lib/replaceUrl';
 
 type C2CTab = 'connections' | 'configs' | 'jobs' | 'items';
 
@@ -119,6 +121,7 @@ function formatDate(d: string | null): string {
 
 function C2CDashboardInner() {
   const { t } = useTranslation('common');
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   const [activeTab, setActiveTab] = useState<C2CTab>('connections');
   const [connections, setConnections] = useState<C2CConnection[]>([]);
   const [configs, setConfigs] = useState<C2CConfig[]>([]);
@@ -138,54 +141,54 @@ function C2CDashboardInner() {
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     if (params.get('c2c_connected') === 'true') {
-      setConsentSuccess(t('longTail.c2c.C2CDashboard.consentSuccess'));
+      setConsentSuccess(stableT('longTail.c2c.C2CDashboard.consentSuccess'));
       // Clean URL params
       const url = new URL(window.location.href);
       url.searchParams.delete('c2c_connected');
       url.searchParams.delete('connectionId');
-      window.history.replaceState({}, '', url.pathname);
+      replaceUrl(url.pathname);
     }
     const c2cError = params.get('c2c_error');
     if (c2cError) {
       setConsentError(decodeURIComponent(c2cError));
       const url = new URL(window.location.href);
       url.searchParams.delete('c2c_error');
-      window.history.replaceState({}, '', url.pathname);
+      replaceUrl(url.pathname);
     }
-  }, [t]);
+  }, [stableT]);
 
   const fetchConnections = useCallback(async () => {
     try {
       const res = await fetchWithAuth('/c2c/connections');
-      if (!res.ok) throw new Error(t('longTail.c2c.C2CDashboard.errors.fetchConnections'));
+      if (!res.ok) throw new Error(stableT('longTail.c2c.C2CDashboard.errors.fetchConnections'));
       const data = await res.json();
       setConnections(data?.data ?? data?.connections ?? []);
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('longTail.c2c.C2CDashboard.errors.loadConnections'));
+      setError(err instanceof Error ? err.message : stableT('longTail.c2c.C2CDashboard.errors.loadConnections'));
     }
-  }, [t]);
+  }, [stableT]);
 
   const fetchConfigs = useCallback(async () => {
     try {
       const res = await fetchWithAuth('/c2c/configs');
-      if (!res.ok) throw new Error(t('longTail.c2c.C2CDashboard.errors.fetchConfigs'));
+      if (!res.ok) throw new Error(stableT('longTail.c2c.C2CDashboard.errors.fetchConfigs'));
       const data = await res.json();
       setConfigs(data?.data ?? data?.configs ?? []);
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('longTail.c2c.C2CDashboard.errors.loadConfigs'));
+      setError(err instanceof Error ? err.message : stableT('longTail.c2c.C2CDashboard.errors.loadConfigs'));
     }
-  }, [t]);
+  }, [stableT]);
 
   const fetchJobs = useCallback(async () => {
     try {
       const res = await fetchWithAuth('/c2c/jobs');
-      if (!res.ok) throw new Error(t('longTail.c2c.C2CDashboard.errors.fetchJobs'));
+      if (!res.ok) throw new Error(stableT('longTail.c2c.C2CDashboard.errors.fetchJobs'));
       const data = await res.json();
       setJobs(data?.data ?? data?.jobs ?? []);
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('longTail.c2c.C2CDashboard.errors.loadJobs'));
+      setError(err instanceof Error ? err.message : stableT('longTail.c2c.C2CDashboard.errors.loadJobs'));
     }
-  }, [t]);
+  }, [stableT]);
 
   const fetchItems = useCallback(async () => {
     try {
@@ -195,13 +198,13 @@ function C2CDashboardInner() {
       if (itemUserFilter) params.set('userEmail', itemUserFilter);
       const qs = params.toString();
       const res = await fetchWithAuth(`/c2c/items${qs ? `?${qs}` : ''}`);
-      if (!res.ok) throw new Error(t('longTail.c2c.C2CDashboard.errors.fetchItems'));
+      if (!res.ok) throw new Error(stableT('longTail.c2c.C2CDashboard.errors.fetchItems'));
       const data = await res.json();
       setItems(data?.data ?? data?.items ?? []);
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('longTail.c2c.C2CDashboard.errors.loadItems'));
+      setError(err instanceof Error ? err.message : stableT('longTail.c2c.C2CDashboard.errors.loadItems'));
     }
-  }, [itemSearch, itemTypeFilter, itemUserFilter, t]);
+  }, [itemSearch, itemTypeFilter, itemUserFilter, stableT]);
 
   useEffect(() => {
     setLoading(true);
@@ -285,26 +288,19 @@ function C2CDashboardInner() {
         </div>
       )}
 
-      <div className="flex gap-1 border-b">
-        {tabs.map((tab) => (
-          <button
-            key={tab.id}
-            type="button"
-            onClick={() => setActiveTab(tab.id)}
-            className={cn(
-              'inline-flex items-center gap-2 border-b-2 px-4 py-2 text-sm font-medium transition-colors',
-              activeTab === tab.id
-                ? 'border-primary text-primary'
-                : 'border-transparent text-muted-foreground hover:text-foreground'
-            )}
-          >
-            <tab.icon className="h-4 w-4" /> {tab.label}
-          </button>
-        ))}
-      </div>
+      <OverflowTabs
+        tabs={tabs.map((tab): OverflowTab => ({
+          id: tab.id,
+          label: tab.label,
+          icon: <tab.icon className="h-4 w-4" />,
+        }))}
+        activeTab={activeTab}
+        onTabChange={(id) => setActiveTab(id as C2CTab)}
+        testIdPrefix="c2c-tab-"
+      />
 
       {activeTab === 'connections' && (
-        <div className="rounded-lg border">
+        <div className="overflow-x-auto rounded-lg border">
           <table className="w-full text-sm">
             <thead>
               <tr className="border-b bg-muted/50">
@@ -352,7 +348,7 @@ function C2CDashboardInner() {
       )}
 
       {activeTab === 'configs' && (
-        <div className="rounded-lg border">
+        <div className="overflow-x-auto rounded-lg border">
           <table className="w-full text-sm">
             <thead>
               <tr className="border-b bg-muted/50">
@@ -393,7 +389,7 @@ function C2CDashboardInner() {
       )}
 
       {activeTab === 'jobs' && (
-        <div className="rounded-lg border">
+        <div className="overflow-x-auto rounded-lg border">
           <table className="w-full text-sm">
             <thead>
               <tr className="border-b bg-muted/50">
@@ -477,7 +473,7 @@ function C2CDashboardInner() {
             </button>
           </div>
 
-          <div className="rounded-lg border">
+          <div className="overflow-x-auto rounded-lg border">
             <table className="w-full text-sm">
               <thead>
                 <tr className="border-b bg-muted/50">

@@ -5,7 +5,7 @@ import path from 'path';
 export default defineConfig({
   resolve: {
     alias: {
-      '@breeze/shared': path.resolve(__dirname, '../../packages/shared/src'),
+      '@breeze/shared': path.resolve(import.meta.dirname, '../../packages/shared/src'),
     },
   },
   test: {
@@ -16,13 +16,27 @@ export default defineConfig({
     maxWorkers: Math.max(1, Math.min(4, Math.floor(availableParallelism() / 2))),
     include: ['src/**/*.test.ts', 'scripts/**/*.test.ts'],
     exclude: [
+      'src/services/accounting/accountingFeePush.integration.test.ts',
+      'src/index.autopay.integration.test.ts',
+      'src/db/schema/autopaySetupAttempts.integration.test.ts',
+      'src/services/autopay/enrollmentService.integration.test.ts',
+      'src/services/autopay/cardExpiryCheck.integration.test.ts',
+      // Charging locks/replay require real PostgreSQL (never the unit DB mocks).
+      'src/services/autopay/charging.integration.test.ts',
+      'src/services/autopay/**/*.integration.test.ts',
       'src/jobs/scriptVerifyReconciliation.integration.test.ts',
+      'src/services/scriptProposals/reviewConcurrency.integration.test.ts',
       'src/__tests__/integration/**',
       // Real bearer + PostgreSQL integration connection authority checks.
       'src/routes/integrationConnectionScope.integration.test.ts',
       // Real-PostgreSQL exact request-pool role checks have a dedicated runner.
       'src/db/requestDatabaseRole.integration.test.ts',
       'src/db/auditRetentionDefault.integration.test.ts',
+      // #9344: real-DB contract-renewal tests, run by vitest.integration.config.ts.
+      // In the unit runner they ran whenever DATABASE_URL was set, which (with the
+      // root .env loaded) meant against the developer's own database.
+      'src/services/contractRenewal.integration.test.ts',
+      'src/jobs/contractWorker.renewal.integration.test.ts',
       // Real-driver integration test for the inbound email pipeline. It needs the
       // integration setup (real postgres pool + autoMigrate seed) and is run by
       // vitest.integration.config.ts — not the unit runner, which has no DB.
@@ -39,6 +53,9 @@ export default defineConfig({
       // Real-DB backup queue lifecycle proof (#4923); runs under the
       // integration config's setup (truncating), never the unit runner.
       'src/services/backupProgress.integration.test.ts',
+      // Discovered-asset site move real-DB proof: imports `__tests__/integration/setup`
+      // (real postgres pool); belongs to vitest.integration.config.ts.
+      'src/services/discoveredAssetSiteMove.integration.test.ts',
       'src/services/cpeMap.integration.test.ts',
       'src/services/cpeResolution.integration.test.ts',
       'src/services/exploitFeeds.integration.test.ts',
@@ -47,6 +64,21 @@ export default defineConfig({
       // (real postgres + autoMigrate). Belongs to vitest.integration.config.ts;
       // the no-DB unit runner would fail it on connect.
       'src/services/warrantyAlertEvaluator.integration.test.ts',
+      // Hardware & RAID monitoring real-DB migration/RLS proof (W01 #6856):
+      // imports `__tests__/integration/setup` (real postgres pool + autoMigrate).
+      // Belongs to vitest.integration.config.ts.
+      'src/services/hardwareHealth/**/*.integration.test.ts',
+      'src/services/timeSync/**/*.integration.test.ts',
+      'src/services/workloads/**/*.integration.test.ts',
+      // Workload image currency W05 (#8194): real-DB pass + system-only cache proof.
+      'src/services/imageCurrency/**/*.integration.test.ts',
+      // Hardware & RAID monitoring (W05 BMC in-band): use real PostgreSQL and
+      // the integration setup.
+      'src/services/discovery/agentReportedBmcLink.integration.test.ts',
+      'src/jobs/discoveryWorker.bmc.integration.test.ts',
+      'src/jobs/discoveryWorker.dispatchAfterCommit.integration.test.ts',
+      'src/jobs/discoveryWorker.autoLinkMac.integration.test.ts',
+      'src/services/topology/bmc.integration.test.ts',
       // Suppression-expiry reaper real-DB test: imports `__tests__/integration/setup`
       // (real postgres pool + autoMigrate in its beforeAll), so the unit runner's
       // no-DB environment fails the suite on connect. Belongs to vitest.integration.config.ts.
@@ -72,6 +104,9 @@ export default defineConfig({
       // glob above — so the no-DB unit runner would fail it on connect. Belongs
       // to vitest.integration.config.ts (already in its include list).
       'src/routes/agents/enrollmentCollision.integration.test.ts',
+      // Enrollment deadlock real-DB test (#9521): same shape (real pool + real
+      // triggers); belongs to vitest.integration.config.ts.
+      'src/routes/agents/enrollmentDeadlock.integration.test.ts',
       // Software-report re-link real-DB test (BREEZE-3): imports
       // `__tests__/integration/setup` (real postgres pool + autoMigrate), so the
       // no-DB unit runner would fail it on connect. Belongs to
@@ -181,6 +216,15 @@ export default defineConfig({
       'src/routes/installerRotationRevocation.integration.test.ts',
       // Disposable-database credential cutover proof uses the integration runner.
       'src/db/installerBootstrapCredentialGeneration.migration.integration.test.ts',
+      // Disposable-database proof for the quarantine execution-authority migration.
+      'src/db/securityQuarantineExecutionAuthorityMigration.integration.test.ts',
+      // Hardware & RAID monitoring (W03): disposable-database replay proof for
+      // the monitor-kind enum and alert subject-identity migrations. Belongs to
+      // vitest.integration.config.ts (registered in its include list).
+      'src/db/hardwareAlertMigrations.integration.test.ts',
+      // Hardware & RAID monitoring (W03 Task 10/11): real-Postgres subject
+      // outbox/response-owner suite. Belongs to vitest.integration.config.ts.
+      'src/services/alertSubjects.integration.test.ts',
       // Enrollment-key list-filter real-DB test (#3191 live-installer-token
       // carve-out on ?expired=): same story as the two above — imports
       // `__tests__/integration/setup` and lives outside the
@@ -188,9 +232,13 @@ export default defineConfig({
       // fail it on connect. Belongs to vitest.integration.config.ts.
       'src/routes/enrollmentKeysExpiredFilter.integration.test.ts',
       'src/routes/enrollmentKeysSiteScope.integration.test.ts',
+      'src/routes/enrollmentKeysFailureCleanup.integration.test.ts',
+      'src/routes/enrollmentKeysAddDeviceParent.integration.test.ts',
       // Real-DB suites owned by vitest.integration.config.ts (#3778).
       'src/services/invoiceService.issue.integration.test.ts',
       'src/services/invoicePdf.integration.test.ts',
+      'src/services/customerDocument.integration.test.ts',
+      'src/services/customerDocument.quote.integration.test.ts',
       // #5861 Customer Portal Network Visibility: real-Postgres proof of org
       // isolation and partner-wide monitor result scoping. Imports
       // `__tests__/integration/setup` (real postgres pool + autoMigrate) and
@@ -201,6 +249,12 @@ export default defineConfig({
       // not export it). Belongs to vitest.integration.config.ts (already in
       // its include list).
       'src/services/portal/networkVisibilityReadModel.integration.test.ts',
+      // #7731 portal hardware health: real-DB test, belongs to vitest.integration.config.ts.
+      'src/services/portal/hardwareHealthReadModel.integration.test.ts',
+      // #7732 portal hardware inventory: real-DB test, belongs to vitest.integration.config.ts.
+      'src/services/portal/hardwareInventoryReadModel.integration.test.ts',
+      // #7733 portal performance metrics: real-DB test, belongs to vitest.integration.config.ts.
+      'src/services/portal/performanceReadModel.integration.test.ts',
       // Canary for issue #4046: asserts the process observes a non-UTC
       // offset. It must ONLY run under the pinned non-UTC pass
       // (vitest.config.tz.ts, TZ=America/Denver), where it belongs — it is

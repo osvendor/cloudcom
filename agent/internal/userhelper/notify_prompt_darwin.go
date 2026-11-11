@@ -4,10 +4,10 @@ package userhelper
 
 import (
 	"fmt"
-	"os/exec"
 	"strings"
 
 	"github.com/breeze-rmm/agent/internal/ipc"
+	"github.com/breeze-rmm/agent/internal/procspawn"
 )
 
 // showNotifyPromptOS renders the interactive notification with osascript, the
@@ -51,7 +51,7 @@ func showNotifyPromptOS(req ipc.NotifyRequest) (clicked string, shown bool) {
 
 	// CombinedOutput, as in consent_dialog_darwin.go: stderr carries the -128
 	// cancel marker that distinguishes a user dismissal from an infra failure.
-	out, err := exec.Command("osascript", "-e", script).CombinedOutput()
+	out, err := procspawn.Command("osascript", "-e", script).CombinedOutput()
 	result := string(out)
 	if err != nil {
 		if strings.Contains(result, "-128") {
@@ -66,4 +66,33 @@ func showNotifyPromptOS(req ipc.NotifyRequest) (clicked string, shown bool) {
 		return "", true
 	}
 	return notifyPromptClickedButton(result, buttons), true
+}
+
+// noticeDialogTimeoutMs bounds how long the fallback dialog stays up. It is an
+// announcement, so it goes away on its own rather than waiting for a click.
+const noticeDialogTimeoutMs = 60_000
+
+// showNoticeDialogOS is the #6864 fallback for a notice whose toast failed: an
+// OK-only osascript dialog that gives up after noticeDialogTimeoutMs. A user
+// dismissal (-128) still counts as shown.
+func showNoticeDialogOS(req ipc.NotifyRequest) bool {
+	title := req.Title
+	if title == "" {
+		title = "Breeze Agent"
+	}
+	script := fmt.Sprintf(
+		`display dialog "%s" with title "%s" buttons {"OK"} default button "OK" with icon note giving up after %d`,
+		escapeAppleScript(req.Body),
+		escapeAppleScript(title),
+		(noticeDialogTimeoutMs+999)/1000,
+	)
+	out, err := procspawn.Command("osascript", "-e", script).CombinedOutput()
+	if err != nil {
+		if strings.Contains(string(out), "-128") {
+			return true
+		}
+		log.Warn("notice dialog failed", "error", err.Error(), "output", strings.TrimSpace(string(out)))
+		return false
+	}
+	return true
 }

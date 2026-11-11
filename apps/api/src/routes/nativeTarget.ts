@@ -8,6 +8,7 @@ import { consumeNativeAdmission, renewNativeAdmission, closeNativeAdmission } fr
 import { NativeAdmissionError, nativeAdmissionEnabled, nativeUuid, nativeConsumeSchema, nativeRenewSchema,
   nativePresenceSchema, type NativeTarget } from '../services/portalNativeAdmissionSchemas';
 import { getRedis } from '../services/redis';
+import { isStaffNativeSession, consumeStaffNativeAdmission, renewStaffNativeAdmission, closeStaffNativeAdmission } from '../services/staffNativeAdmission';
 import { rateLimiter } from '../services/rate-limit';
 import { getTrustedClientIp, rateLimitIpKey } from '../services/clientIp';
 declare module 'hono' { interface ContextVariableMap { nativeTarget: NativeTarget } }
@@ -26,16 +27,28 @@ nativeTargetRoutes.use('*', async (c, next) => {
     const deviceLimit = await rateLimiter(redis, `native_target_device:${target.id}`, 240, 60);
     if (!deviceLimit.allowed) { c.header('Retry-After', '60'); return c.json({ error: 'Rate limit exceeded' }, 429); }
     c.set('nativeTarget', target);
-    await withDbAccessContext({ scope: 'organization', orgId: target.orgId, accessibleOrgIds: [target.orgId], userId: null }, next);
+    // Own-partner SELECT visibility is needed for inherited remote-access policy.
+    // This identity comes only from the authenticated target's active tenant;
+    // organization scope and partner-wide write access remain unchanged.
+    await withDbAccessContext({ scope: 'organization', orgId: target.orgId, accessibleOrgIds: [target.orgId], currentPartnerId: target.partnerId, userId: null }, next);
   } catch (error) {
     return c.json({ error: 'Native admission unavailable' }, error instanceof NativeAdmissionError ? error.status : 503);
   }
 });
-nativeTargetRoutes.post('/admissions', zValidator('json', nativeConsumeSchema), async c =>
-  c.json(await consumeNativeAdmission(c.get('nativeTarget'), c.req.valid('json'))));
+nativeTargetRoutes.post('/admissions', zValidator('json', nativeConsumeSchema), async c => {
+  const target = c.get('nativeTarget'); const input = c.req.valid('json');
+  return c.json(await (await isStaffNativeSession(target, input.sessionId)
+    ? consumeStaffNativeAdmission(target, input) : consumeNativeAdmission(target, input)));
+});
 nativeTargetRoutes.post('/sessions/:id/renew', zValidator('param', z.object({ id: nativeUuid })), zValidator('json', nativeRenewSchema), async c => {
   const input = c.req.valid('json');
-  return c.json(await renewNativeAdmission(c.get('nativeTarget'), c.req.valid('param').id, input.connectionId, input.leaseToken));
+  const target = c.get('nativeTarget'); const id = c.req.valid('param').id;
+  return c.json(await (await isStaffNativeSession(target, id)
+    ? renewStaffNativeAdmission(target, id, input.connectionId, input.leaseToken)
+    : renewNativeAdmission(target, id, input.connectionId, input.leaseToken)));
 });
-nativeTargetRoutes.post('/sessions/:id/closed', zValidator('param', z.object({ id: nativeUuid })), zValidator('json', nativePresenceSchema), async c =>
-  c.json(await closeNativeAdmission(c.get('nativeTarget'), c.req.valid('param').id, c.req.valid('json').connectionId)));
+nativeTargetRoutes.post('/sessions/:id/closed', zValidator('param', z.object({ id: nativeUuid })), zValidator('json', nativePresenceSchema), async c => {
+  const target = c.get('nativeTarget'); const id = c.req.valid('param').id; const input = c.req.valid('json');
+  return c.json(await (await isStaffNativeSession(target, id)
+    ? closeStaffNativeAdmission(target, id, input.connectionId) : closeNativeAdmission(target, id, input.connectionId)));
+});

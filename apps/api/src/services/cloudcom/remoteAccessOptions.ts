@@ -1,7 +1,7 @@
 import type { InheritableRemoteAccessSettings } from '@breeze/shared';
 import { checkRemoteAccessLaunchAvailability, resolveRemoteAccessLaunch } from '../remoteAccessLauncher';
 
-type Device = { customFields?: Record<string, unknown> | null };
+type Device = { customFields?: Record<string, unknown> | null; enrolledRustDeskId?: string | null };
 
 // Explicit choices must never fall back to a preference or tenant default.
 // Reuse upstream template validation/decryption, but supply only the selected

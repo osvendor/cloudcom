@@ -46,6 +46,24 @@ function config(over: Record<string, unknown> = {}) {
 }
 
 describe('Cloud Command 3CX routes', () => {
+  it('lets a directory reader request a background refresh without opening configuration writes', async () => {
+    const h = harness();
+    const res = await request(h.app, `/microsoft/directory/refresh?orgId=${ORG}`, { method: 'POST' });
+    expect(res.status).toBe(503); // Service is intentionally absent in this authorization harness.
+    const denied = await request(h.app, `/threecx/connection?orgId=${ORG}`, { method: 'PUT' });
+    expect(denied.status).toBe(403);
+  });
+  it('saves a personal Microsoft table layout with read access but still denies tenant configuration writes', async () => {
+    const h = harness({ results: [[{ partner_id: PARTNER }], [{ layout: {} }]] });
+    const saved = await request(h.app, `/microsoft/directory/layout/users?orgId=${ORG}`, {
+      method: 'PUT', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ columns: ['displayName'], widths: {}, sortKey: null, sortDirection: 'asc' }),
+    });
+    expect(saved.status).toBe(200);
+    expect((await saved.json()).layout.columns).toEqual(['displayName']);
+    const config = await request(h.app, `/threecx/connection?orgId=${ORG}`, { method: 'PUT' });
+    expect(config.status).toBe(403);
+  });
   it('canonicalizes organization UUIDs before binding encrypted credentials', async () => {
     const org = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
     const h = harness({ write: true, mfa: true, results: [[{ partner_id: PARTNER }], [row({ org_id: org })], [row({ org_id: org, enabled: false })]] });

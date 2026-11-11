@@ -42,6 +42,7 @@
   },
   "denyPrompt": "Bu isteği neden reddediyorsunuz? Gerekçe isteğe bağlıdır.",
   "denyReasonPlaceholder": "İsteğe bağlı — isteği yapan kişiyle paylaşılır",
+  "denyReasonShownToUserHint": "Son kullanıcı bunu bildiriminde görür (ilk 500 karakter).",
   "confirmDeny": "Reddi onayla",
   "cancel": "Vazgeç",
   "deny": "Reddet",
@@ -67,6 +68,7 @@
     "noApproverDevice": "Profilinizde bir onay cihazı kaydedip yeniden deneyin.",
     "notSoleApprover": "Bu isteğe başka bir yetkili onaylayıcı karar vermelidir.",
     "siteCeiling": "Bu onay, organizasyon genelinde yetki verir. Erişiminiz belirli sitelerle sınırlı olduğundan, bu isteğe başka bir yetkili onaylayıcı karar vermelidir.",
+    "approverScopeRequired": "Bu onay, iş ortağının tüm organizasyonlarını etkiler; bu nedenle tüm organizasyonlara erişimi olan iş ortağı düzeyinde bir onaylayan gerekir.",
     "verificationFailed": "Doğrulama iptal edildi veya başarısız oldu. Yeniden deneyin.",
     "alreadyDecided": "Bu isteğe zaten karar verildi.",
     "expired": "Bu istek, karar verilmeden önce sona erdi.",
@@ -98,6 +100,7 @@
     "loading": "Son onaylar yükleniyor…",
     "error": "Son onaylar yüklenemedi.",
     "retry": "Yeniden dene",
+    "decisionReasonLabel": "Onaylayanın gerekçesi",
     "empty": "Son zamanlarda tamamlanan bir şey yok.",
     "status": {
       "failed": "Başarısız",
@@ -106,10 +109,73 @@
       "cancelled": "İptal edildi",
       "completed": "Tamamlandı",
       "denied": "Reddedildi",
+      "refused": "Onaylandı, sonra engellendi",
       "approved": "Onaylandı",
       "reported": "Bildirildi",
       "unknown": "Bilinmiyor"
     }
   },
-  "proposedByAgentExecuteNotice": "Bunu onaylamak şimdi çalıştırır — gölge modunda bile bu bir deneme çalıştırması değildir."
+  "proposedByAgentExecuteNotice": "Bunu onaylamak şimdi çalıştırır — gölge modunda bile bu bir deneme çalıştırması değildir.",
+  "assuranceDefaultNotice": {
+    "upcomingTitle": "Onay cihazları {{date}} tarihinden itibaren gerekecek",
+    "upcomingBody": "İş ortağı hesabınız için bir onay güvenliği seçimi kaydedilmedi, bu nedenle platform varsayılanı geçerlidir: {{date}} tarihinden itibaren yüksek veya kritik riskli bir isteği onaylamak tek bir tıklama yerine kayıtlı bir onay cihazı gerektirir. Onayların gecikmemesi için bu tarihten önce bir cihaz kaydedin.",
+    "activeTitle": "Yüksek riskli onaylar bir onay cihazı gerektirir",
+    "activeBody": "{{date}} tarihinden bu yana platform varsayılanı, yüksek ve kritik riskli istekleri onaylamak için kayıtlı bir onay cihazı gerektiriyor, çünkü iş ortağı hesabınız için bir onay güvenliği seçimi kaydedilmedi. Bu onayların cihazınızı istemesinin nedeni budur.",
+    "settingsLink": "Onay güvenliğini gözden geçir",
+    "registerLink": "Bir onay cihazı kaydet"
+  },
+  "diagnosticAccess": {
+    "title": "Salt okunur tanılama erişimi",
+    "organization": "Kuruluş",
+    "device": "Cihaz",
+    "access": "Erişim",
+    "readOnlyOps": "Salt okunur: {{operations}}. Yazma, silme, yeniden adlandırma, betik veya kayıt defteri değişikliği yok.",
+    "duration": "Süre",
+    "durationValue": "Onaydan itibaren {{minutes}} dakika",
+    "purpose": "Amaç",
+    "requestedBy": "Talep eden",
+    "principalUser": "Breeze AI",
+    "principalApiKey": "MCP API anahtarı",
+    "principalOauth": "MCP OAuth bağlantısı",
+    "paths": "Yollar",
+    "recursive": "Tüm alt ağaç",
+    "thisFolderOnly": "Bu klasör ve doğrudan içindeki dosyalar",
+    "sensitiveHeading": "Açıkça istenen hassas depolar",
+    "noSensitive": "Tarayıcı parolaları ve çerezleri, kimlik bilgisi depoları, özel anahtarlar ve kayıtlı belirteçlerin bilinen konumları bu yolların içinde bile hariç tutulur. Bu sabit bir listedir; bu yollardaki diğer her şey okunabilir.",
+    "opList": "listeleme",
+    "opRead": "okuma",
+    "classes": {
+      "browser_secrets": "Tarayıcı parolaları, çerezleri ve anahtarları",
+      "credential_store": "İşletim sistemi kimlik bilgisi depoları",
+      "private_keys": "Özel anahtarlar (SSH, GnuPG, TLS)",
+      "session_tokens": "Kayıtlı oturum belirteçleri ve bulut kimlik bilgileri"
+    }
+  },
+  "operatorPlan": {
+    "title": "Yapay zekâ görevi için plan",
+    "summary_one": "{{count}} etki, plan revizyonu {{revision}}",
+    "summary_other": "{{count}} etki, plan revizyonu {{revision}}",
+    "groupBreeze": "Breeze cihazları",
+    "groupM365": "Microsoft 365",
+    "groupGoogle": "Google Workspace",
+    "effectOrdinal": "Adım {{ordinal}}",
+    "targetLine": "{{targetLabel}} ({{principalLabel}})",
+    "orderNote": "Etkiler bu sırayla çalışır. Oturum açma en son devre dışı bırakılır; böylece erken durdurma e-postaları asla yönlendirmesiz bırakmaz.",
+    "empty": "Bu plan hiçbir etki içermiyor.",
+    "invalid": "Bu planın tamamı görüntülenemedi. Onaylamayın."
+  },
+  "intentStatus": {
+    "title": "Onay durumu",
+    "waitingForApprovers": "Onaylayıcılar bekleniyor",
+    "notFound": "Bu onay bulunamadı.",
+    "status": {
+      "pending_approval": "Onay bekliyor",
+      "in_progress": "Devam ediyor",
+      "completed": "Tamamlandı",
+      "failed": "Başarısız",
+      "rejected": "Reddedildi",
+      "expired": "Süresi doldu",
+      "cancelled": "İptal edildi"
+    }
+  }
 }

@@ -6,6 +6,15 @@ import { DATASET_ADAPTERS, EXPORT_DATASETS } from './aiToolsExportDatasets';
 const searchFleetLogs = vi.fn();
 vi.mock('./logSearch', () => ({ searchFleetLogs: (...a: unknown[]) => searchFleetLogs(...a) }));
 
+const canReadSensitiveEventLogCategory = vi.fn(async () => false);
+vi.mock('./eventLogSensitivity', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./eventLogSensitivity')>();
+  return {
+    ...actual,
+    canReadSensitiveEventLogCategory: (...a: unknown[]) => canReadSensitiveEventLogCategory(...(a as [])),
+  };
+});
+
 // Only the agent_logs adapter (and metrics, untested here) issues a raw
 // db.select(); every other adapter delegates entirely to a mocked builder
 // above. Mocked with the same chain shape aiToolsAgentLogs.test.ts already
@@ -56,9 +65,11 @@ vi.mock('./aiTools', () => ({ verifyDeviceAccess: (id: string) => verifyDeviceAc
 
 const readDeviceFindings = vi.fn(async (..._a: unknown[]) => [] as Array<Record<string, unknown>>);
 const readCatalog = vi.fn(async (..._a: unknown[]) => [] as Array<Record<string, unknown>>);
+const readFindingSoftware = vi.fn(async (..._a: unknown[]) => new Map<string, unknown>());
 vi.mock('./aiToolsVulnerability', () => ({
   readDeviceFindings: (...a: unknown[]) => readDeviceFindings(...a),
   readCatalog: (...a: unknown[]) => readCatalog(...a),
+  readFindingSoftware: (...a: unknown[]) => readFindingSoftware(...a),
   normStatus: (v: unknown) => (typeof v === 'string' ? v : 'open'),
 }));
 
@@ -68,6 +79,8 @@ const siteAuth = { orgId: 'org-1', accessibleOrgIds: ['org-1'], allowedSiteIds: 
 describe('dataset adapters', () => {
   beforeEach(() => {
     searchFleetLogs.mockReset();
+    canReadSensitiveEventLogCategory.mockReset();
+    canReadSensitiveEventLogCategory.mockResolvedValue(false);
     resolveSiteAllowedDeviceIds.mockReset();
     resolveSiteAllowedDeviceIds.mockResolvedValue(null);
     generateDeviceInventoryReport.mockReset();
@@ -81,6 +94,8 @@ describe('dataset adapters', () => {
     readDeviceFindings.mockResolvedValue([]);
     readCatalog.mockReset();
     readCatalog.mockResolvedValue([]);
+    readFindingSoftware.mockReset();
+    readFindingSoftware.mockResolvedValue(new Map());
   });
 
   it('covers every dataset named in the spec', () => {
@@ -177,6 +192,27 @@ describe('dataset adapters', () => {
     });
     await pager(null);
     expect(searchFleetLogs.mock.calls[0]![1]).toMatchObject({ deviceIds: ['d1', 'd2'], level: ['error'] });
+  });
+
+  it('event_logs resolves and passes canReadSensitiveCategory through to the builder', async () => {
+    canReadSensitiveEventLogCategory.mockResolvedValue(true);
+    searchFleetLogs.mockResolvedValue({ results: [], nextCursor: null, hasMore: false });
+    const pager = await DATASET_ADAPTERS.event_logs.createPager({
+      auth, orgId: 'org-1', filters: { category: ['security'] }, deviceIds: null, runTargets: null, siteId: null, pageSize: 500,
+    });
+    await pager(null);
+    expect(canReadSensitiveEventLogCategory).toHaveBeenCalledWith(auth);
+    expect(searchFleetLogs.mock.calls[0]![1]).toMatchObject({ canReadSensitiveCategory: true });
+  });
+
+  it('event_logs surfaces a clean pager error instead of an uncaught throw when a caller without the permission requests only the sensitive category', async () => {
+    canReadSensitiveEventLogCategory.mockResolvedValue(false);
+    const { SensitiveEventLogAccessError } = await import('./eventLogSensitivity');
+    searchFleetLogs.mockImplementation(() => { throw new SensitiveEventLogAccessError(); });
+    const pager = await DATASET_ADAPTERS.event_logs.createPager({
+      auth, orgId: 'org-1', filters: { category: ['security'] }, deviceIds: null, runTargets: null, siteId: null, pageSize: 500,
+    });
+    await expect(pager(null)).rejects.toThrow(SensitiveEventLogAccessError);
   });
 
   // --- site axis: the narrowing `search_logs` performs at aiToolsEventLogs.ts:84 ---
@@ -503,6 +539,31 @@ describe('dataset adapters', () => {
     ]);
   });
 
+  // #9532 — an exported finding names the affected software, flat (one column
+  // each) so an analysis script can group by product without unpacking.
+  it('vulnerabilities rows carry the linked software, null when unlinked', async () => {
+    readDeviceFindings.mockResolvedValue([
+      { id: 'f1', deviceId: 'd1', vulnerabilityId: 'v1', status: 'open', riskScore: '80' },
+      { id: 'f2', deviceId: 'd1', vulnerabilityId: 'v1', status: 'open', riskScore: '70' },
+    ]);
+    readCatalog.mockResolvedValue([
+      { id: 'v1', cveId: 'CVE-2026-1', severity: 'high', cvssScore: '8.8', knownExploited: false, epssScore: null, patchAvailable: true },
+    ]);
+    readFindingSoftware.mockResolvedValue(new Map([
+      ['f1', { vulnerabilityId: 'v1', software: { name: 'Google Chrome', version: '129.0', vendor: 'Google LLC' } }],
+      ['f2', { vulnerabilityId: 'v1', software: null }],
+    ]));
+    const pager = await DATASET_ADAPTERS.vulnerabilities.createPager({
+      auth, orgId: 'org-1', filters: {}, deviceIds: ['d1'], runTargets: null, siteId: null, pageSize: 500,
+    });
+    const page = await pager(null);
+    expect(readFindingSoftware).toHaveBeenCalledWith('org-1', ['f1', 'f2'], auth);
+    expect(page.rows).toEqual([
+      expect.objectContaining({ id: 'f1', softwareName: 'Google Chrome', softwareVersion: '129.0', softwareVendor: 'Google LLC' }),
+      expect.objectContaining({ id: 'f2', softwareName: null, softwareVersion: null, softwareVendor: null }),
+    ]);
+  });
+
   it('vulnerabilities drops findings whose CVE is not in the catalog rather than exporting a partial row', async () => {
     readDeviceFindings.mockResolvedValue([{ id: 'f1', deviceId: 'd1', vulnerabilityId: 'v-missing', status: 'open', riskScore: null }]);
     readCatalog.mockResolvedValue([]); // catalog lookup came back empty
@@ -523,6 +584,8 @@ describe('dataset adapters', () => {
 describe('dataset adapters — analysis run frame', () => {
   beforeEach(() => {
     searchFleetLogs.mockReset();
+    canReadSensitiveEventLogCategory.mockReset();
+    canReadSensitiveEventLogCategory.mockResolvedValue(false);
     resolveSiteAllowedDeviceIds.mockReset();
     resolveSiteAllowedDeviceIds.mockResolvedValue(null);
   });

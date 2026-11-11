@@ -1,3 +1,4 @@
+import { PgDialect } from 'drizzle-orm/pg-core';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 const { resolveOwnedAutomationReferencesMock } = vi.hoisted(() => ({
@@ -28,6 +29,16 @@ vi.mock('./automationRuntime', () => ({
   ),
 }));
 
+const { resolvePatchPolicyReferenceMock, loadConfigPolicyPartnerIdMock } = vi.hoisted(() => ({
+  resolvePatchPolicyReferenceMock: vi.fn(),
+  loadConfigPolicyPartnerIdMock: vi.fn(),
+}));
+vi.mock('./configPolicyPatching', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./configPolicyPatching')>()),
+  resolvePatchPolicyReference: resolvePatchPolicyReferenceMock,
+  loadConfigPolicyPartnerId: loadConfigPolicyPartnerIdMock,
+}));
+
 vi.mock('../db', () => ({
   db: {
     select: vi.fn(),
@@ -39,6 +50,7 @@ vi.mock('../db', () => ({
   runOutsideDbContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
   withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn()),
   withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+  getCurrentDbAccessContext: vi.fn(() => undefined),
 }));
 
 import {
@@ -56,29 +68,8 @@ import {
 } from './configurationPolicy';
 import { db } from '../db';
 import {
-  configPolicyAlertRules,
   configPolicyFeatureLinks,
-  configPolicyMonitoringSettings,
-  configPolicyMonitoringWatches,
 } from '../db/schema';
-
-// Monitoring keeps the settings id stable so retired watches retain their FK.
-function monitoringSettingsUpsert() {
-  const returning = vi.fn(async () => [{ id: 'settings-1', checkIntervalSeconds: 60 }]);
-  const onConflictDoUpdate = vi.fn((_options: unknown) => ({ returning }));
-  return { onConflictDoUpdate };
-}
-
-function expectMonitoringSettingsUpsert(
-  upsert: ReturnType<typeof monitoringSettingsUpsert>,
-  checkIntervalSeconds: number,
-) {
-  expect(upsert.onConflictDoUpdate).toHaveBeenCalledExactlyOnceWith({
-    target: configPolicyMonitoringSettings.featureLinkId,
-    // Exact keys: never reset retiredAt or convertedToMonitorId on re-save.
-    set: { checkIntervalSeconds, updatedAt: expect.any(Date) },
-  });
-}
 
 // Chain for `db.select().from(...).where(...)` awaited directly (links query)
 function selectWhereRows(rows: unknown[]) {
@@ -99,6 +90,18 @@ function selectLimitRows(rows: unknown[]) {
 
 const PATCH_INPUT = {
   sources: ['os', 'third_party'],
+  scheduleFrequency: 'daily',
+  scheduleTime: '03:30',
+  scheduleDayOfWeek: 'tue',
+  scheduleDayOfMonth: 5,
+  rebootPolicy: 'never',
+};
+
+// #8188: policy-level auto-approve and app rules are retired (the Update Ring
+// owns them). A payload from a tab loaded before the cutover still carries them.
+const RETIRED_APPROVAL_KEYS = ['autoApprove', 'autoApproveSeverities', 'autoApproveDeferralDays', 'apps'] as const;
+const STALE_PATCH_INPUT = {
+  ...PATCH_INPUT,
   autoApprove: true,
   autoApproveSeverities: ['critical'],
   autoApproveDeferralDays: 7,
@@ -106,12 +109,8 @@ const PATCH_INPUT = {
     { source: 'third_party', packageId: 'Mozilla.Firefox', action: 'block' },
     { source: 'third_party', packageId: '7zip.7zip', action: 'pin', pinnedVersion: '23.01' },
   ],
-  scheduleFrequency: 'daily',
-  scheduleTime: '03:30',
-  scheduleDayOfWeek: 'tue',
-  scheduleDayOfMonth: 5,
-  rebootPolicy: 'never',
 };
+
 
 describe('feature link reserved export marker service backstop', () => {
   beforeEach(() => {
@@ -186,133 +185,126 @@ describe('automation feature link reference authorization', () => {
   });
 });
 
-describe('patch feature link round-trip (apps + autoApproveDeferralDays)', () => {
+describe('patch feature link writes strip retired approval keys (#8188)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
 
-  it('persists apps and autoApproveDeferralDays in JSONB on save and returns them from listFeatureLinks', async () => {
-    // --- Save path: addFeatureLink ---
-    let storedJsonb: any;
-    let normalizedRowValues: any;
-    let insertCall = 0;
+  function txWithStoredPatchLink(storedInline: unknown, featurePolicyId: string | null = null) {
+    const set = vi.fn((_values: Record<string, unknown>) => ({
+      where: vi.fn(() => ({ returning: vi.fn(() => Promise.resolve([{ id: 'link-1' }])) })),
+    }));
+    const update = vi.fn(() => ({ set }));
+    const insertValues = vi.fn((_values: Record<string, unknown>) => Promise.resolve([]));
+    const tx: any = {
+      select: vi.fn(() => selectLimitRows([
+        { id: 'link-1', configPolicyId: 'policy-1', featureType: 'patch', featurePolicyId, inlineSettings: storedInline },
+      ])),
+      update,
+      delete: vi.fn(() => ({ where: vi.fn(() => Promise.resolve([])) })),
+      insert: vi.fn(() => ({ values: insertValues })),
+      set,
+      insertValues,
+    };
+    vi.mocked(db.transaction).mockImplementation(async (fn: any) => fn(tx));
+    return tx;
+  }
 
+  /** The link JSONB the update wrote (the first `set` call carrying inlineSettings). */
+  function writtenInline(tx: any): Record<string, unknown> | undefined {
+    const call = tx.set.mock.calls.find((args: any[]) => args[0] && 'inlineSettings' in args[0]);
+    return call?.[0].inlineSettings;
+  }
+
+  it('saves an update that re-sends the retired keys and strips them from the JSONB and the relational insert', async () => {
+    const tx = txWithStoredPatchLink(STALE_PATCH_INPUT);
+    const updated = await updateFeatureLink('link-1', {
+      inlineSettings: { ...STALE_PATCH_INPUT, scheduleTime: '04:00' },
+    }, 'policy-1');
+
+    expect(updated).not.toBeNull();
+    const inline = writtenInline(tx);
+    expect(inline).toMatchObject({ scheduleTime: '04:00', sources: ['os', 'third_party'] });
+    for (const key of RETIRED_APPROVAL_KEYS) expect(inline).not.toHaveProperty(key);
+    const rowValues = tx.insertValues.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect(rowValues).toMatchObject({ featureLinkId: 'link-1', scheduleTime: '04:00' });
+    for (const key of RETIRED_APPROVAL_KEYS) expect(rowValues).not.toHaveProperty(key);
+  });
+
+  it('does not write retired keys when an update omits them', async () => {
+    const tx = txWithStoredPatchLink(STALE_PATCH_INPUT);
+    await updateFeatureLink('link-1', { inlineSettings: { ...PATCH_INPUT, scheduleTime: '05:00' } }, 'policy-1');
+    const inline = writtenInline(tx);
+    expect(inline).toMatchObject({ scheduleTime: '05:00' });
+    for (const key of RETIRED_APPROVAL_KEYS) expect(inline).not.toHaveProperty(key);
+  });
+
+  it('a ring change no longer runs any app-rule check, whatever the stored link carries', async () => {
+    const tx = txWithStoredPatchLink(STALE_PATCH_INPUT, 'ring-1');
+    await expect(updateFeatureLink('link-1', { featurePolicyId: 'ring-2', inlineSettings: STALE_PATCH_INPUT }, 'policy-1'))
+      .resolves.not.toBeNull();
+    expect(resolvePatchPolicyReferenceMock).not.toHaveBeenCalled();
+    expect(tx.set.mock.calls[0]?.[0]).toMatchObject({ featurePolicyId: 'ring-2' });
+    const inline = writtenInline(tx);
+    for (const key of RETIRED_APPROVAL_KEYS) expect(inline).not.toHaveProperty(key);
+  });
+
+  it('addFeatureLink saves a payload with the retired keys and strips them', async () => {
+    let storedJsonb: any;
+    let rowValues: any;
+    let insertCall = 0;
     const tx = {
       insert: vi.fn(() => ({
         values: vi.fn((v: any) => {
           insertCall += 1;
           if (insertCall === 1) {
-            // feature link insert — captures what lands in the inline_settings JSONB
             storedJsonb = v.inlineSettings;
             return {
               onConflictDoNothing: vi.fn(() => ({
-                returning: vi.fn(() =>
-                  Promise.resolve([
-                    {
-                      id: 'link-1',
-                      configPolicyId: 'policy-1',
-                      featureType: 'patch',
-                      featurePolicyId: null,
-                      inlineSettings: v.inlineSettings,
-                    },
-                  ])
-                ),
+                returning: vi.fn(() => Promise.resolve([{ id: 'link-1', configPolicyId: 'policy-1', featureType: 'patch', featurePolicyId: null, inlineSettings: v.inlineSettings }])),
               })),
             };
           }
-          // config_policy_patch_settings insert (decomposeInlineSettings)
-          normalizedRowValues = v;
+          rowValues = v;
           return Promise.resolve([]);
         }),
       })),
     };
     vi.mocked(db.transaction).mockImplementation(async (fn: any) => fn(tx));
 
-    const link = await addFeatureLink('policy-1', 'patch', null, PATCH_INPUT);
+    const link = await addFeatureLink('policy-1', 'patch', null, STALE_PATCH_INPUT);
 
-    // The JSONB mirror must keep the JSON-only fields...
-    expect(storedJsonb.apps).toEqual(PATCH_INPUT.apps);
-    expect(storedJsonb.autoApproveDeferralDays).toBe(7);
-    // ...while the normalized table (which has no columns for them) does not get them
-    expect(normalizedRowValues.featureLinkId).toBe('link-1');
-    expect(normalizedRowValues.apps).toBeUndefined();
-    expect(normalizedRowValues.autoApproveDeferralDays).toBeUndefined();
-
-    // --- Read path: listFeatureLinks, fed exactly what the save wrote ---
-    vi.mocked(db.select)
-      .mockReturnValueOnce(selectWhereRows([link]) as any) // links query
-      .mockReturnValueOnce(
-        selectLimitRows([
-          {
-            id: 'ps-1',
-            featureLinkId: 'link-1',
-            sources: normalizedRowValues.sources,
-            autoApprove: normalizedRowValues.autoApprove,
-            autoApproveSeverities: normalizedRowValues.autoApproveSeverities,
-            scheduleFrequency: normalizedRowValues.scheduleFrequency,
-            scheduleTime: normalizedRowValues.scheduleTime,
-            scheduleDayOfWeek: normalizedRowValues.scheduleDayOfWeek,
-            scheduleDayOfMonth: normalizedRowValues.scheduleDayOfMonth,
-            rebootPolicy: normalizedRowValues.rebootPolicy,
-          },
-        ]) as any
-      ); // assembleInlineSettings patch query
-
-    const result = await listFeatureLinks('policy-1');
-    expect(result).toHaveLength(1);
-    const settings = result[0]!.inlineSettings as any;
-
-    // THE BUG: these two came back as [] / 0 before the merge fix
-    expect(settings.apps).toEqual(PATCH_INPUT.apps);
-    expect(settings.autoApproveDeferralDays).toBe(7);
-
-    // Relational fields still come from the normalized row
-    expect(settings.sources).toEqual(['os', 'third_party']);
-    expect(settings.autoApprove).toBe(true);
-    expect(settings.autoApproveSeverities).toEqual(['critical']);
-    expect(settings.scheduleFrequency).toBe('daily');
-    expect(settings.scheduleTime).toBe('03:30');
-    expect(settings.rebootPolicy).toBe('never');
+    expect(link).not.toBeNull();
+    expect(resolvePatchPolicyReferenceMock).not.toHaveBeenCalled();
+    expect(storedJsonb).toMatchObject({ scheduleTime: '03:30', rebootPolicy: 'never' });
+    expect(rowValues).toMatchObject({ featureLinkId: 'link-1', scheduleTime: '03:30' });
+    for (const key of RETIRED_APPROVAL_KEYS) {
+      expect(storedJsonb).not.toHaveProperty(key);
+      expect(rowValues).not.toHaveProperty(key);
+    }
   });
 
-  it('updateFeatureLink keeps apps and autoApproveDeferralDays in the JSONB write', async () => {
-    let setValues: any;
-    const tx = {
-      select: vi.fn(() =>
-        selectLimitRows([
-          {
-            id: 'link-1',
-            configPolicyId: 'policy-1',
-            featureType: 'patch',
-            featurePolicyId: null,
-            inlineSettings: {},
-          },
-        ])
-      ),
-      update: vi.fn(() => ({
-        set: vi.fn((v: any) => {
-          setValues = v;
-          return {
-            where: vi.fn(() => ({
-              returning: vi.fn(() => Promise.resolve([{ id: 'link-1' }])),
-            })),
-          };
-        }),
-      })),
+  it('does not apply to other feature types', async () => {
+    const tx: any = {
+      select: vi.fn(() => selectLimitRows([
+        { id: 'link-pam', configPolicyId: 'policy-1', featureType: 'pam', featurePolicyId: null, inlineSettings: {} },
+      ])),
+      update: vi.fn(() => ({ set: vi.fn(() => ({ where: vi.fn(() => ({ returning: vi.fn(() => Promise.resolve([{ id: 'link-pam' }])) })) })) })),
       delete: vi.fn(() => ({ where: vi.fn(() => Promise.resolve([])) })),
       insert: vi.fn(() => ({ values: vi.fn(() => Promise.resolve([])) })),
     };
     vi.mocked(db.transaction).mockImplementation(async (fn: any) => fn(tx));
+    await expect(updateFeatureLink('link-pam', { inlineSettings: { uacInterceptionEnabled: false } }, 'policy-1'))
+      .resolves.not.toBeNull();
+  });
+});
 
-    const updated = await updateFeatureLink('link-1', { inlineSettings: PATCH_INPUT }, 'policy-1');
-
-    expect(updated).not.toBeNull();
-    expect(setValues.inlineSettings.apps).toEqual(PATCH_INPUT.apps);
-    expect(setValues.inlineSettings.autoApproveDeferralDays).toBe(7);
+describe('patch feature link read path', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
   });
 
-  it('merges JSON-only fields from stored JSONB even when the normalized row wins', async () => {
-    // Mirrors loadPolicyLocalPatchConfig behavior in configPolicyPatching.ts
+  it('serves relational settings from listFeatureLinks and ignores retired keys in the stored JSONB', async () => {
     vi.mocked(db.select)
       .mockReturnValueOnce(
         selectWhereRows([
@@ -321,13 +313,7 @@ describe('patch feature link round-trip (apps + autoApproveDeferralDays)', () =>
             configPolicyId: 'policy-1',
             featureType: 'patch',
             featurePolicyId: null,
-            inlineSettings: {
-              sources: ['third_party'],
-              autoApprove: true,
-              autoApproveSeverities: ['critical'],
-              autoApproveDeferralDays: 5,
-              apps: [{ source: 'third_party', packageId: 'Mozilla.Firefox', action: 'block' }],
-            },
+            inlineSettings: STALE_PATCH_INPUT,
           },
         ]) as any
       )
@@ -337,8 +323,6 @@ describe('patch feature link round-trip (apps + autoApproveDeferralDays)', () =>
             id: 'ps-1',
             featureLinkId: 'link-1',
             sources: ['os'],
-            autoApprove: false,
-            autoApproveSeverities: [],
             scheduleFrequency: 'daily',
             scheduleTime: '03:00',
             scheduleDayOfWeek: 'mon',
@@ -351,18 +335,12 @@ describe('patch feature link round-trip (apps + autoApproveDeferralDays)', () =>
     const result = await listFeatureLinks('policy-1');
     const settings = result[0]!.inlineSettings as any;
 
-    // Normalized row wins for relational fields
     expect(settings.sources).toEqual(['os']);
-    expect(settings.autoApprove).toBe(false);
     expect(settings.scheduleDayOfMonth).toBe(10);
-    // JSON-only fields survive from the stored JSONB
-    expect(settings.autoApproveDeferralDays).toBe(5);
-    expect(settings.apps).toEqual([
-      { source: 'third_party', packageId: 'Mozilla.Firefox', action: 'block' },
-    ]);
+    for (const key of RETIRED_APPROVAL_KEYS) expect(settings).not.toHaveProperty(key);
   });
 
-  it('falls back to defaults for JSON-only fields when stored JSONB is malformed (no throw)', async () => {
+  it('falls back to the stored JSONB (retired keys stripped) when no normalized row exists', async () => {
     vi.mocked(db.select)
       .mockReturnValueOnce(
         selectWhereRows([
@@ -371,53 +349,7 @@ describe('patch feature link round-trip (apps + autoApproveDeferralDays)', () =>
             configPolicyId: 'policy-1',
             featureType: 'patch',
             featurePolicyId: null,
-            inlineSettings: {
-              sources: [], // violates min(1)
-              scheduleTime: 'not-a-time',
-              apps: 'garbage-not-an-array',
-              autoApproveDeferralDays: 999, // out of range
-            },
-          },
-        ]) as any
-      )
-      .mockReturnValueOnce(
-        selectLimitRows([
-          {
-            id: 'ps-1',
-            featureLinkId: 'link-1',
-            sources: ['os'],
-            autoApprove: false,
-            autoApproveSeverities: [],
-            scheduleFrequency: 'weekly',
-            scheduleTime: '02:00',
-            scheduleDayOfWeek: 'sun',
-            scheduleDayOfMonth: 1,
-            rebootPolicy: 'if_required',
-          },
-        ]) as any
-      );
-
-    const result = await listFeatureLinks('policy-1');
-    const settings = result[0]!.inlineSettings as any;
-
-    // Merged fields fall back to schema defaults without throwing
-    expect(settings.apps).toEqual([]);
-    expect(settings.autoApproveDeferralDays).toBe(0);
-    // Normalized row still supplies the relational fields
-    expect(settings.sources).toEqual(['os']);
-    expect(settings.scheduleTime).toBe('02:00');
-  });
-
-  it('falls back to the stored JSONB (including apps) when no normalized row exists', async () => {
-    vi.mocked(db.select)
-      .mockReturnValueOnce(
-        selectWhereRows([
-          {
-            id: 'link-1',
-            configPolicyId: 'policy-1',
-            featureType: 'patch',
-            featurePolicyId: null,
-            inlineSettings: PATCH_INPUT,
+            inlineSettings: STALE_PATCH_INPUT,
           },
         ]) as any
       )
@@ -426,9 +358,9 @@ describe('patch feature link round-trip (apps + autoApproveDeferralDays)', () =>
     const result = await listFeatureLinks('policy-1');
     const settings = result[0]!.inlineSettings as any;
 
-    expect(settings.apps).toEqual(PATCH_INPUT.apps);
-    expect(settings.autoApproveDeferralDays).toBe(7);
     expect(settings.sources).toEqual(['os', 'third_party']);
+    expect(settings.scheduleTime).toBe('03:30');
+    for (const key of RETIRED_APPROVAL_KEYS) expect(settings).not.toHaveProperty(key);
   });
 
   it('does not throw when no normalized row exists and stored JSONB is malformed', async () => {
@@ -450,8 +382,7 @@ describe('patch feature link round-trip (apps + autoApproveDeferralDays)', () =>
     const settings = result[0]!.inlineSettings as any;
 
     expect(settings.sources).toEqual(['os']); // schema defaults
-    expect(settings.apps).toEqual([]);
-    expect(settings.autoApproveDeferralDays).toBe(0);
+    expect(settings.scheduleTime).toBe('02:00');
   });
 
   it('leaves non-patch feature links untouched (raw JSONB passthrough)', async () => {
@@ -473,719 +404,6 @@ describe('patch feature link round-trip (apps + autoApproveDeferralDays)', () =>
   });
 });
 
-// ============================================================
-// alert_rule decompose — service-layer validation via alertRuleInlineSettingsSchema
-// ============================================================
-describe('addFeatureLink — alert_rule inlineSettings service-layer validation', () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-  });
-
-  // tx mock that only satisfies the first (feature link) insert — decompose's
-  // schema.parse() throws before a second insert is ever attempted for invalid input.
-  function txForFeatureLinkInsertOnly() {
-    return {
-      insert: vi.fn(() => ({
-        values: vi.fn((v: any) => ({
-          onConflictDoNothing: vi.fn(() => ({
-            returning: vi.fn(() =>
-              Promise.resolve([
-                {
-                  id: 'link-ar',
-                  configPolicyId: 'policy-1',
-                  featureType: 'alert_rule',
-                  featurePolicyId: null,
-                  inlineSettings: v.inlineSettings,
-                },
-              ])
-            ),
-          })),
-        })),
-      })),
-    };
-  }
-
-  it('rejects alert_rule inlineSettings with an unknown condition type', async () => {
-    vi.mocked(db.transaction).mockImplementation(async (fn: any) => fn(txForFeatureLinkInsertOnly()));
-
-    await expect(
-      addFeatureLink('policy-1', 'alert_rule', null, {
-        items: [{ name: 'bad', conditions: [{ type: 'custom', customCondition: 'x' }] }],
-      })
-    ).rejects.toThrow();
-  });
-
-  it('applies schema defaults when storing alert_rule rows', async () => {
-    let normalizedRowValues: any;
-    let insertCall = 0;
-    const tx = {
-      insert: vi.fn(() => ({
-        values: vi.fn((v: any) => {
-          insertCall += 1;
-          if (insertCall === 1) {
-            return {
-              onConflictDoNothing: vi.fn(() => ({
-                returning: vi.fn(() =>
-                  Promise.resolve([
-                    {
-                      id: 'link-ar',
-                      configPolicyId: 'policy-1',
-                      featureType: 'alert_rule',
-                      featurePolicyId: null,
-                      inlineSettings: v.inlineSettings,
-                    },
-                  ])
-                ),
-              })),
-            };
-          }
-          // config_policy_alert_rules insert (decomposeInlineSettings) — an
-          // array of row values, one per item.
-          normalizedRowValues = v;
-          return Promise.resolve([]);
-        }),
-      })),
-    };
-    vi.mocked(db.transaction).mockImplementation(async (fn: any) => fn(tx));
-
-    const link = await addFeatureLink('policy-1', 'alert_rule', null, {
-      items: [
-        {
-          name: 'High CPU',
-          conditions: [{ type: 'metric', metric: 'cpu', operator: 'gt', value: 85 }],
-        },
-      ],
-    });
-
-    expect(link).not.toBeNull();
-    expect(normalizedRowValues).toHaveLength(1);
-    expect(normalizedRowValues[0].name).toBe('High CPU');
-    expect(normalizedRowValues[0].severity).toBe('medium');
-    expect(normalizedRowValues[0].cooldownMinutes).toBe(5);
-    expect(normalizedRowValues[0].conditions).toEqual([
-      { type: 'metric', metric: 'cpu', operator: 'gt', value: 85 },
-    ]);
-  });
-
-  it('rejects the legacy custom condition type', async () => {
-    vi.mocked(db.transaction).mockImplementation(async (fn: any) => fn(txForFeatureLinkInsertOnly()));
-
-    await expect(
-      addFeatureLink('policy-1', 'alert_rule', null, {
-        items: [{ name: 'bad', conditions: [{ type: 'custom', customCondition: 'x' }] }],
-      })
-    ).rejects.toThrow(/custom|invalid/i);
-  });
-
-  it('canonicalizes legacy {type: "status"} conditions to offline in the stored row', async () => {
-    let normalizedRowValues: any;
-    let insertCall = 0;
-    const tx = {
-      insert: vi.fn(() => ({
-        values: vi.fn((v: any) => {
-          insertCall += 1;
-          if (insertCall === 1) {
-            return {
-              onConflictDoNothing: vi.fn(() => ({
-                returning: vi.fn(() =>
-                  Promise.resolve([
-                    {
-                      id: 'link-ar',
-                      configPolicyId: 'policy-1',
-                      featureType: 'alert_rule',
-                      featurePolicyId: null,
-                      inlineSettings: v.inlineSettings,
-                    },
-                  ])
-                ),
-              })),
-            };
-          }
-          normalizedRowValues = v;
-          return Promise.resolve([]);
-        }),
-      })),
-    };
-    vi.mocked(db.transaction).mockImplementation(async (fn: any) => fn(tx));
-
-    await addFeatureLink('policy-1', 'alert_rule', null, {
-      items: [{ name: 'Offline', conditions: [{ type: 'status', durationMinutes: 10 }] }],
-    });
-
-    expect(normalizedRowValues[0].conditions).toEqual([{ type: 'offline', durationMinutes: 10 }]);
-  });
-
-  // #5650 W03: rationale threads from the item payload into the
-  // config_policy_alert_rules insert row (decomposeInlineSettings), and back
-  // out again via assembleInlineSettings — see listFeatureLinks coverage below.
-  it('persists rationale on the config_policy_alert_rules insert row', async () => {
-    let normalizedRowValues: any;
-    let insertCall = 0;
-    const tx = {
-      insert: vi.fn(() => ({
-        values: vi.fn((v: any) => {
-          insertCall += 1;
-          if (insertCall === 1) {
-            return {
-              onConflictDoNothing: vi.fn(() => ({
-                returning: vi.fn(() =>
-                  Promise.resolve([
-                    {
-                      id: 'link-ar',
-                      configPolicyId: 'policy-1',
-                      featureType: 'alert_rule',
-                      featurePolicyId: null,
-                      inlineSettings: v.inlineSettings,
-                    },
-                  ])
-                ),
-              })),
-            };
-          }
-          normalizedRowValues = v;
-          return Promise.resolve([]);
-        }),
-      })),
-    };
-    vi.mocked(db.transaction).mockImplementation(async (fn: any) => fn(tx));
-
-    await addFeatureLink('policy-1', 'alert_rule', null, {
-      items: [
-        {
-          name: 'High CPU',
-          conditions: [{ type: 'metric', metric: 'cpu', operator: 'gt', value: 85 }],
-          rationale: 'because sustained CPU pressure predicts device slowdown tickets',
-        },
-      ],
-    });
-
-    expect(normalizedRowValues[0].rationale).toBe(
-      'because sustained CPU pressure predicts device slowdown tickets'
-    );
-  });
-
-  it('stores a null rationale when the item omits it', async () => {
-    let normalizedRowValues: any;
-    let insertCall = 0;
-    const tx = {
-      insert: vi.fn(() => ({
-        values: vi.fn((v: any) => {
-          insertCall += 1;
-          if (insertCall === 1) {
-            return {
-              onConflictDoNothing: vi.fn(() => ({
-                returning: vi.fn(() =>
-                  Promise.resolve([
-                    {
-                      id: 'link-ar',
-                      configPolicyId: 'policy-1',
-                      featureType: 'alert_rule',
-                      featurePolicyId: null,
-                      inlineSettings: v.inlineSettings,
-                    },
-                  ])
-                ),
-              })),
-            };
-          }
-          normalizedRowValues = v;
-          return Promise.resolve([]);
-        }),
-      })),
-    };
-    vi.mocked(db.transaction).mockImplementation(async (fn: any) => fn(tx));
-
-    await addFeatureLink('policy-1', 'alert_rule', null, {
-      items: [
-        {
-          name: 'High CPU',
-          conditions: [{ type: 'metric', metric: 'cpu', operator: 'gt', value: 85 }],
-        },
-      ],
-    });
-
-    expect(normalizedRowValues[0].rationale).toBeNull();
-  });
-});
-
-// #5650 W03: assembleInlineSettings round-trip coverage for rationale on both
-// alert_rule items and monitoring watches.
-describe('assembleInlineSettings — rationale round-trip (#5650 W03)', () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-  });
-
-  it('alert_rule: returns the stored rationale on each item', async () => {
-    const link = {
-      id: 'link-ar',
-      configPolicyId: 'policy-1',
-      featureType: 'alert_rule',
-      featurePolicyId: null,
-      inlineSettings: { items: [] },
-    };
-
-    function selectOrderByRows(rows: unknown[]) {
-      const chain: any = {};
-      chain.from = vi.fn(() => chain);
-      chain.where = vi.fn(() => chain);
-      chain.orderBy = vi.fn(() => Promise.resolve(rows));
-      return chain;
-    }
-
-    vi.mocked(db.select)
-      .mockReturnValueOnce(selectWhereRows([link]) as any) // links query
-      .mockReturnValueOnce(
-        selectOrderByRows([
-          {
-            name: 'High CPU',
-            severity: 'medium',
-            conditions: [{ type: 'metric', metric: 'cpu', operator: 'gt', value: 85 }],
-            cooldownMinutes: 5,
-            autoResolve: false,
-            autoResolveConditions: null,
-            titleTemplate: '{{ruleName}} triggered on {{deviceName}}',
-            messageTemplate: '{{ruleName}} condition met',
-            escalationPolicyId: null,
-            notificationChannelIds: null,
-            sortOrder: 0,
-            rationale: 'because sustained CPU pressure predicts device slowdown tickets',
-          },
-        ]) as any
-      );
-
-    const result = await listFeatureLinks('policy-1');
-    const settings = result[0]!.inlineSettings as Record<string, unknown>;
-    const items = settings.items as Array<Record<string, unknown>>;
-
-    expect(items[0]?.rationale).toBe(
-      'because sustained CPU pressure predicts device slowdown tickets'
-    );
-  });
-
-  it('monitoring: returns the stored rationale on each watch', async () => {
-    const link = {
-      id: 'link-mon',
-      configPolicyId: 'policy-1',
-      featureType: 'monitoring',
-      featurePolicyId: null,
-      inlineSettings: { checkIntervalSeconds: 60, watches: [] },
-    };
-
-    function selectOrderByRows(rows: unknown[]) {
-      const chain: any = {};
-      chain.from = vi.fn(() => chain);
-      chain.where = vi.fn(() => chain);
-      chain.orderBy = vi.fn(() => Promise.resolve(rows));
-      return chain;
-    }
-
-    vi.mocked(db.select)
-      .mockReturnValueOnce(selectWhereRows([link]) as any) // links query
-      .mockReturnValueOnce(
-        selectLimitRows([{ id: 'settings-1', featureLinkId: 'link-mon', checkIntervalSeconds: 60 }]) as any
-      ) // config_policy_monitoring_settings
-      .mockReturnValueOnce(
-        selectOrderByRows([
-          {
-            watchType: 'service',
-            name: 'MSSQLSERVER',
-            displayName: null,
-            enabled: true,
-            alertOnStop: true,
-            alertAfterConsecutiveFailures: 2,
-            alertSeverity: 'high',
-            cpuThresholdPercent: null,
-            memoryThresholdMb: null,
-            thresholdDurationSeconds: 60,
-            autoRestart: false,
-            maxRestartAttempts: 3,
-            restartCooldownSeconds: 300,
-            sortOrder: 0,
-            rationale: 'why this service is watched',
-          },
-        ]) as any
-      );
-
-    const result = await listFeatureLinks('policy-1');
-    const settings = result[0]!.inlineSettings as Record<string, unknown>;
-    const watches = settings.watches as Array<Record<string, unknown>>;
-
-    expect(watches[0]?.rationale).toBe('why this service is watched');
-  });
-});
-
-// ============================================================
-// updateFeatureLink PATCH decompose — the replace half of the write path.
-// addFeatureLink only ever inserts; the UPDATE route replaces normalized rows
-// with delete-then-decompose, which is where both a data-loss bug (deleting
-// rows a feature no longer owns) and a torn-state bug (deleting before the
-// payload is known to be valid) can hide.
-// ============================================================
-describe('updateFeatureLink — normalized row replacement', () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-  });
-
-  /**
-   * tx mock for updateFeatureLink: select→existing link, update→returning,
-   * plus recording every `delete(table)` and `insert(table).values(rows)` in
-   * call order so ordering assertions are possible.
-   */
-  function updateTx(existing: Record<string, unknown>) {
-    const calls: Array<{ op: 'delete' | 'insert'; table: unknown; values?: any }> = [];
-    const settingsUpsert = monitoringSettingsUpsert();
-    const tx: any = {
-      select: vi.fn(() => ({
-        from: vi.fn(() => ({
-          where: vi.fn(() => ({ limit: vi.fn(() => Promise.resolve([existing])) })),
-        })),
-      })),
-      update: vi.fn(() => ({
-        set: vi.fn(() => ({
-          where: vi.fn(() => ({
-            returning: vi.fn(() => Promise.resolve([{ ...existing }])),
-          })),
-        })),
-      })),
-      delete: vi.fn((table: unknown) => {
-        calls.push({ op: 'delete', table });
-        return { where: vi.fn(() => Promise.resolve([])) };
-      }),
-      insert: vi.fn((table: unknown) => ({
-        values: vi.fn((values: any) => {
-          calls.push({ op: 'insert', table, values });
-          if (table === configPolicyMonitoringSettings) return settingsUpsert;
-          // Other normalized inserts are directly awaitable.
-          const result: any = Promise.resolve([{ id: 'settings-1' }]);
-          result.returning = vi.fn(() => Promise.resolve([{ id: 'settings-1' }]));
-          return result;
-        }),
-      })),
-    };
-    return { tx, calls, settingsUpsert };
-  }
-
-  it('deletes the old alert_rule rows, then reinserts them with schema defaults', async () => {
-    const { tx, calls } = updateTx({
-      id: 'link-ar', configPolicyId: 'policy-1', featureType: 'alert_rule',
-      featurePolicyId: null, inlineSettings: { items: [] },
-    });
-    vi.mocked(db.transaction).mockImplementation(async (fn: any) => fn(tx));
-
-    await updateFeatureLink('link-ar', {
-      inlineSettings: {
-        items: [{ name: 'High CPU', conditions: [{ type: 'metric', metric: 'cpu', operator: 'gt', value: 85 }] }],
-      },
-    }, 'policy-1');
-
-    expect(calls.map((c) => c.op)).toEqual(['delete', 'insert']);
-    expect(calls[0]!.table).toBe(configPolicyAlertRules);
-    expect(calls[1]!.table).toBe(configPolicyAlertRules);
-
-    const [row] = calls[1]!.values;
-    expect(row).toMatchObject({
-      featureLinkId: 'link-ar',
-      name: 'High CPU',
-      severity: 'medium',
-      cooldownMinutes: 5,
-      autoResolve: false,
-      autoResolveConditions: null,
-      titleTemplate: '{{ruleName}} triggered on {{deviceName}}',
-      messageTemplate: '{{ruleName}} condition met',
-      sortOrder: 0,
-    });
-  });
-
-  it('throws on an invalid alert_rule payload BEFORE deleting or updating anything', async () => {
-    // Regression guard for torn state: decompose is what enforces the
-    // per-feature schema, and it runs AFTER deleteNormalizedRows. Only the
-    // surrounding transaction saved the existing rows; validation must not
-    // depend on every caller remembering to open one.
-    const { tx, calls } = updateTx({
-      id: 'link-ar', configPolicyId: 'policy-1', featureType: 'alert_rule',
-      featurePolicyId: null, inlineSettings: { items: [] },
-    });
-    vi.mocked(db.transaction).mockImplementation(async (fn: any) => fn(tx));
-
-    await expect(updateFeatureLink('link-ar', {
-      inlineSettings: { items: [{ name: 'bad', conditions: [{ type: 'metric', metric: 'network', operator: 'gt', value: 85 }] }] },
-    }, 'policy-1')).rejects.toThrow();
-
-    expect(calls).toEqual([]);
-    expect(tx.update).not.toHaveBeenCalled();
-  });
-
-  it('does NOT delete config_policy_alert_rules when a monitoring link is updated', async () => {
-    // The monitoring decompose path used to WRITE alert rules keyed by the
-    // monitoring link; this branch was its replace-half. With the insert half
-    // gone (2026-07-30 consolidation) a delete here is pure data loss for any
-    // policy the ownership migration has not yet touched — one unrelated save
-    // on the Monitoring tab and the legacy rules are unrecoverable.
-    const { tx, calls, settingsUpsert } = updateTx({
-      id: 'link-mon', configPolicyId: 'policy-1', featureType: 'monitoring',
-      featurePolicyId: null, inlineSettings: { checkIntervalSeconds: 60, watches: [] },
-    });
-    vi.mocked(db.transaction).mockImplementation(async (fn: any) => fn(tx));
-
-    await updateFeatureLink('link-mon', {
-      inlineSettings: { checkIntervalSeconds: 120, watches: [] },
-    }, 'policy-1');
-
-    const deletedTables = calls.filter((c) => c.op === 'delete').map((c) => c.table);
-    expect(deletedTables).toContain(configPolicyMonitoringWatches);
-    expect(deletedTables).not.toContain(configPolicyMonitoringSettings);
-    expectMonitoringSettingsUpsert(settingsUpsert, 120);
-    expect(deletedTables).not.toContain(configPolicyAlertRules);
-  });
-});
-
-// ============================================================
-// monitoring decompose/assemble — owns only agent-side watches (Task 3,
-// alerts/monitoring consolidation). Non-empty alertRules/eventLogAlerts are
-// rejected at the schema barrier (Task 1); this describe block asserts the
-// decompose/assemble code itself no longer touches config_policy_alert_rules.
-// ============================================================
-describe('monitoring decompose/assemble — no longer owns alert rules', () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-  });
-
-  // tx mock for a successful monitoring addFeatureLink: insert #1 is the
-  // feature link, insert #2 is config_policy_monitoring_settings (needs a
-  // `.returning()` for the settings row id), insert #3 (only when watches
-  // are non-empty) is config_policy_monitoring_watches.
-  function txForMonitoringInsert() {
-    let insertCall = 0;
-    const settingsUpsert = monitoringSettingsUpsert();
-    const insertedTables: unknown[] = [];
-    const tx = {
-      insert: vi.fn((table: unknown) => {
-        insertCall += 1;
-        insertedTables.push(table);
-        if (insertCall === 1) {
-          return {
-            values: vi.fn((v: any) => ({
-              onConflictDoNothing: vi.fn(() => ({
-                returning: vi.fn(() =>
-                  Promise.resolve([
-                    {
-                      id: 'link-mon',
-                      configPolicyId: 'policy-1',
-                      featureType: 'monitoring',
-                      featurePolicyId: null,
-                      inlineSettings: v.inlineSettings,
-                    },
-                  ])
-                ),
-              })),
-            })),
-          };
-        }
-        if (insertCall === 2) {
-          // config_policy_monitoring_settings insert (decomposeInlineSettings)
-          return {
-            values: vi.fn(() => settingsUpsert),
-          };
-        }
-        // config_policy_monitoring_watches insert
-        return { values: vi.fn(() => Promise.resolve([])) };
-      }),
-    };
-    return { tx, insertedTables, settingsUpsert, insertCallCount: () => insertCall };
-  }
-
-  it('monitoring decompose no longer inserts config_policy_alert_rules rows', async () => {
-    const { tx, insertedTables, settingsUpsert, insertCallCount } = txForMonitoringInsert();
-    vi.mocked(db.transaction).mockImplementation(async (fn: any) => fn(tx));
-
-    const link = await addFeatureLink('policy-1', 'monitoring', null, {
-      checkIntervalSeconds: 60,
-      watches: [{ watchType: 'service', name: 'MSSQLSERVER' }],
-    });
-
-    expect(link).not.toBeNull();
-    // Exactly 3 inserts: feature link, monitoring settings, monitoring watches.
-    expect(insertCallCount()).toBe(3);
-    expect(insertedTables).not.toContain(configPolicyAlertRules);
-    expectMonitoringSettingsUpsert(settingsUpsert, 60);
-  });
-
-  it('monitoring decompose persists rationale on the config_policy_monitoring_watches insert row', async () => {
-    let watchRowValues: any;
-    const settingsUpsert = monitoringSettingsUpsert();
-    let insertCall = 0;
-    const tx = {
-      insert: vi.fn(() => {
-        insertCall += 1;
-        if (insertCall === 1) {
-          return {
-            values: vi.fn((v: any) => ({
-              onConflictDoNothing: vi.fn(() => ({
-                returning: vi.fn(() =>
-                  Promise.resolve([
-                    {
-                      id: 'link-mon',
-                      configPolicyId: 'policy-1',
-                      featureType: 'monitoring',
-                      featurePolicyId: null,
-                      inlineSettings: v.inlineSettings,
-                    },
-                  ])
-                ),
-              })),
-            })),
-          };
-        }
-        if (insertCall === 2) {
-          return {
-            values: vi.fn(() => settingsUpsert),
-          };
-        }
-        return {
-          values: vi.fn((v: any) => {
-            watchRowValues = v;
-            return Promise.resolve([]);
-          }),
-        };
-      }),
-    };
-    vi.mocked(db.transaction).mockImplementation(async (fn: any) => fn(tx));
-
-    await addFeatureLink('policy-1', 'monitoring', null, {
-      checkIntervalSeconds: 60,
-      watches: [{ watchType: 'service', name: 'MSSQLSERVER', rationale: 'why this service is watched' }],
-    });
-
-    expect(watchRowValues[0].rationale).toBe('why this service is watched');
-    expectMonitoringSettingsUpsert(settingsUpsert, 60);
-  });
-
-  it('monitoring decompose stores a null rationale when the watch omits it', async () => {
-    let watchRowValues: any;
-    const settingsUpsert = monitoringSettingsUpsert();
-    let insertCall = 0;
-    const tx = {
-      insert: vi.fn(() => {
-        insertCall += 1;
-        if (insertCall === 1) {
-          return {
-            values: vi.fn((v: any) => ({
-              onConflictDoNothing: vi.fn(() => ({
-                returning: vi.fn(() =>
-                  Promise.resolve([
-                    {
-                      id: 'link-mon',
-                      configPolicyId: 'policy-1',
-                      featureType: 'monitoring',
-                      featurePolicyId: null,
-                      inlineSettings: v.inlineSettings,
-                    },
-                  ])
-                ),
-              })),
-            })),
-          };
-        }
-        if (insertCall === 2) {
-          return {
-            values: vi.fn(() => settingsUpsert),
-          };
-        }
-        return {
-          values: vi.fn((v: any) => {
-            watchRowValues = v;
-            return Promise.resolve([]);
-          }),
-        };
-      }),
-    };
-    vi.mocked(db.transaction).mockImplementation(async (fn: any) => fn(tx));
-
-    await addFeatureLink('policy-1', 'monitoring', null, {
-      checkIntervalSeconds: 60,
-      watches: [{ watchType: 'service', name: 'MSSQLSERVER' }],
-    });
-
-    expect(watchRowValues[0].rationale).toBeNull();
-    expectMonitoringSettingsUpsert(settingsUpsert, 60);
-  });
-
-  it('monitoring decompose rejects legacy non-empty alertRules payloads', async () => {
-    const { tx } = txForMonitoringInsert();
-    vi.mocked(db.transaction).mockImplementation(async (fn: any) => fn(tx));
-
-    await expect(
-      addFeatureLink('policy-1', 'monitoring', null, {
-        alertRules: [{ name: 'x', conditions: [{ type: 'metric', metric: 'cpu', operator: 'gt', value: 80 }] }],
-      })
-    ).rejects.toThrow(/moved to the Alerts feature/);
-  });
-
-  it('monitoring decompose rejects legacy non-empty eventLogAlerts payloads', async () => {
-    const { tx } = txForMonitoringInsert();
-    vi.mocked(db.transaction).mockImplementation(async (fn: any) => fn(tx));
-
-    await expect(
-      addFeatureLink('policy-1', 'monitoring', null, {
-        eventLogAlerts: [{ name: 'x', category: 'system', level: 'error' }],
-      })
-    ).rejects.toThrow(/moved to the Alerts feature/);
-  });
-
-  it('monitoring assemble returns only checkIntervalSeconds and watches', async () => {
-    const link = {
-      id: 'link-mon',
-      configPolicyId: 'policy-1',
-      featureType: 'monitoring',
-      featurePolicyId: null,
-      inlineSettings: { checkIntervalSeconds: 60, watches: [] },
-    };
-
-    // Chain for `db.select().from(...).where(...).orderBy(...)` (watches query)
-    function selectOrderByRows(rows: unknown[]) {
-      const chain: any = {};
-      chain.from = vi.fn(() => chain);
-      chain.where = vi.fn(() => chain);
-      chain.orderBy = vi.fn(() => Promise.resolve(rows));
-      return chain;
-    }
-
-    vi.mocked(db.select)
-      .mockReturnValueOnce(selectWhereRows([link]) as any) // links query
-      .mockReturnValueOnce(
-        selectLimitRows([{ id: 'settings-1', featureLinkId: 'link-mon', checkIntervalSeconds: 60 }]) as any
-      ) // config_policy_monitoring_settings
-      .mockReturnValueOnce(
-        selectOrderByRows([
-          {
-            watchType: 'service',
-            name: 'MSSQLSERVER',
-            displayName: null,
-            enabled: true,
-            alertOnStop: true,
-            alertAfterConsecutiveFailures: 2,
-            alertSeverity: 'high',
-            cpuThresholdPercent: null,
-            memoryThresholdMb: null,
-            thresholdDurationSeconds: 60,
-            autoRestart: false,
-            maxRestartAttempts: 3,
-            restartCooldownSeconds: 300,
-            sortOrder: 0,
-          },
-        ]) as any
-      ); // config_policy_monitoring_watches — if assemble still read
-      // config_policy_alert_rules here, this mock queue would be exhausted
-      // and the next db.select() call would return undefined, throwing.
-
-    const result = await listFeatureLinks('policy-1');
-    const settings = result[0]!.inlineSettings as Record<string, unknown>;
-
-    expect(Object.keys(settings).sort()).toEqual(['checkIntervalSeconds', 'watches']);
-    expect(settings.checkIntervalSeconds).toBe(60);
-    expect((settings.watches as unknown[]).length).toBe(1);
-  });
-});
 
 // ============================================================
 // pamInlineSettingsSchema — unit tests for the exported schema
@@ -1576,6 +794,32 @@ describe('updateConfigPolicy / deleteConfigPolicy — partner-wide administratio
 // validateFeaturePolicyExists — software_policy dual-axis (#2126)
 // ============================================================
 
+describe('validateFeaturePolicyExists — patch ring must be enabled (#8678)', () => {
+  beforeEach(() => {
+    vi.mocked(db.select).mockReset();
+  });
+
+  it('rejects linking a deleted (enabled = false) ring', async () => {
+    vi.mocked(db.select).mockReturnValue(selectLimitRows([{ id: 'ring-1', enabled: false }]) as never);
+    const result = await validateFeaturePolicyExists('patch', 'ring-1', { orgId: null, partnerId: 'partner-1' });
+    expect(result.valid).toBe(false);
+    expect(result.error).toMatch(/deleted or disabled/i);
+  });
+
+  it('accepts an enabled ring', async () => {
+    vi.mocked(db.select).mockReturnValue(selectLimitRows([{ id: 'ring-1', enabled: true }]) as never);
+    const result = await validateFeaturePolicyExists('patch', 'ring-1', { orgId: null, partnerId: 'partner-1' });
+    expect(result).toEqual({ valid: true });
+  });
+
+  it('still rejects a ring that does not exist for the partner', async () => {
+    vi.mocked(db.select).mockReturnValue(selectLimitRows([]) as never);
+    const result = await validateFeaturePolicyExists('patch', 'ring-1', { orgId: null, partnerId: 'partner-1' });
+    expect(result.valid).toBe(false);
+    expect(result.error).toMatch(/not found for this partner/i);
+  });
+});
+
 describe('validateFeaturePolicyExists — software_policy dual-axis linking (#2126)', () => {
   beforeEach(() => {
     vi.mocked(db.select).mockReset();
@@ -1613,6 +857,24 @@ describe('validateFeaturePolicyExists — software_policy dual-axis linking (#21
     mockLookupReturns([{ id: 'sec-1' }]);
     const result = await validateFeaturePolicyExists('security', 'sec-1', { orgId: null, partnerId: 'partner-1' });
     expect(result.valid).toBe(true);
+  });
+
+  it('never resolves a software policy GENERATED from a security_agents link (#6960 carry-forward)', async () => {
+    const chain = selectLimitRows([{ id: 'sw-1' }]);
+    vi.mocked(db.select).mockReturnValue(chain as never);
+    await validateFeaturePolicyExists('software_policy', 'sw-1', { orgId: 'org-1', partnerId: null });
+    const { PgDialect } = await import('drizzle-orm/pg-core');
+    const rendered = new PgDialect().sqlToQuery(chain.where.mock.calls.at(-1)[0]).sql;
+    expect(rendered).toMatch(/"managed_by_link_id" is null/i);
+  });
+
+  it('does not add the managed predicate to other dual-axis types', async () => {
+    const chain = selectLimitRows([{ id: 'sec-1' }]);
+    vi.mocked(db.select).mockReturnValue(chain as never);
+    await validateFeaturePolicyExists('security', 'sec-1', { orgId: 'org-1', partnerId: null });
+    const { PgDialect } = await import('drizzle-orm/pg-core');
+    const rendered = new PgDialect().sqlToQuery(chain.where.mock.calls.at(-1)[0]).sql;
+    expect(rendered).not.toMatch(/managed_by_link_id/i);
   });
 
   it('rejects a security policy id that resolves to neither axis', async () => {
@@ -1738,6 +1000,7 @@ describe('remote_access feature link — legacy capability JSONB (#2320)', () =>
             notifyOnSessionEnd: true,
             showActiveIndicator: true,
             technicianIdentityLevel: 'name',
+            allowUserEndSession: false,
           },
         ]) as any
       );
@@ -1753,6 +1016,8 @@ describe('remote_access feature link — legacy capability JSONB (#2320)', () =>
     expect(settings.sessionPromptMode).toBe('consent');
     expect(settings.consentUnavailableBehavior).toBe('block');
     expect(settings.technicianIdentityLevel).toBe('name');
+    // #10190 W06: round-trips from the normalized row.
+    expect(settings.allowUserEndSession).toBe(false);
   });
 
   it('addFeatureLink stores the full blob in JSONB and only consent fields in the normalized row', async () => {
@@ -1851,6 +1116,7 @@ describe('remote_access updateFeatureLink — merge semantics (partial updates c
     notifyOnSessionEnd: true,
     showActiveIndicator: true,
     technicianIdentityLevel: 'generic',
+    allowUserEndSession: false,
   };
 
   function buildUpdateTx(existingInlineSettings: unknown) {
@@ -1915,6 +1181,8 @@ describe('remote_access updateFeatureLink — merge semantics (partial updates c
     expect(captured.normalizedRowValues.sessionPromptMode).toBe('consent');
     expect(captured.normalizedRowValues.consentUnavailableBehavior).toBe('block');
     expect(captured.normalizedRowValues.technicianIdentityLevel).toBe('generic');
+    // #10190 W06: an explicit OFF survives an unrelated update (merge semantics).
+    expect(captured.normalizedRowValues.allowUserEndSession).toBe(false);
   });
 
   it('a consent-only update preserves the stored capability settings (no fail-open re-enable)', async () => {
@@ -2063,6 +1331,14 @@ describe('listConfigPolicies feature links', () => {
     return chain;
   }
 
+  // db.select({configPolicyId}).from(assignments).where() — awaited off .where()
+  function assignmentsChain(rows: unknown[]) {
+    const chain: any = {};
+    chain.from = vi.fn(() => chain);
+    chain.where = vi.fn(() => Promise.resolve(rows));
+    return chain;
+  }
+
   // db.select({partnerId}).from(organizations).where().limit(1) — the extra
   // statement the orgId-filter branch issues BEFORE the count query.
   function orgPartnerChain(rows: unknown[]) {
@@ -2083,7 +1359,7 @@ describe('listConfigPolicies feature links', () => {
       { id: 'policy-b', name: 'Servers', orgId: ORG_ID, orgName: 'OliveTech' },
     ];
     const links = linksChain([
-      { id: 'link-1', configPolicyId: 'policy-a', featureType: 'alert_rule' },
+      { id: 'link-1', configPolicyId: 'policy-a', featureType: 'patch' },
       { id: 'link-2', configPolicyId: 'policy-a', featureType: 'patch' },
     ]);
 
@@ -2098,7 +1374,7 @@ describe('listConfigPolicies feature links', () => {
     expect(result.data[0]).toMatchObject({
       id: 'policy-a',
       featureLinks: [
-        { id: 'link-1', featureType: 'alert_rule' },
+        { id: 'link-1', featureType: 'patch' },
         { id: 'link-2', featureType: 'patch' },
       ],
     });
@@ -2133,7 +1409,7 @@ describe('listConfigPolicies feature links', () => {
     const rows = [{ id: 'policy-a', name: 'A', orgId: ORG_ID }];
     const links = linksChain([
       { id: 'link-2', configPolicyId: 'policy-a', featureType: 'patch' },
-      { id: 'link-1', configPolicyId: 'policy-a', featureType: 'alert_rule' },
+      { id: 'link-1', configPolicyId: 'policy-a', featureType: 'patch' },
     ]);
 
     vi.mocked(db.select)
@@ -2148,8 +1424,11 @@ describe('listConfigPolicies feature links', () => {
     // Compare against the Column object itself: the SQL wrapper is circular,
     // so it cannot be serialized.
     const whereArg: any = links.where.mock.calls[0][0];
-    expect(whereArg.queryChunks).toContain(configPolicyFeatureLinks.configPolicyId);
-    expect(whereArg.queryChunks).not.toContain(configPolicyFeatureLinks.id);
+    const where = new PgDialect().sqlToQuery(whereArg).sql;
+    expect(where).toContain('"config_policy_feature_links"."config_policy_id" in');
+    expect(where).not.toContain('"config_policy_feature_links"."id" in');
+    // Retired alert_rule/monitoring links never reach a policy listing.
+    expect(where).toContain('"config_policy_feature_links"."feature_type" not in');
     // Ordering is delegated to the query, so the service must NOT re-sort:
     // rows come back in whatever order the DB produced them.
     expect(links.orderBy).toHaveBeenCalledTimes(1);
@@ -2177,7 +1456,8 @@ describe('listConfigPolicies feature links', () => {
           { id: 'link-pw', configPolicyId: 'policy-partnerwide', featureType: 'patch' },
           { id: 'link-org', configPolicyId: 'policy-org', featureType: 'security' },
         ]) as any,
-      );
+      )
+      .mockReturnValueOnce(assignmentsChain([]) as any);
 
     const result = await listConfigPolicies(
       orgAuth(),
@@ -2193,8 +1473,56 @@ describe('listConfigPolicies feature links', () => {
       id: 'policy-org',
       featureLinks: [{ id: 'link-org', featureType: 'security' }],
     });
-    // partnerId lookup + count + page + links — still ONE links statement.
-    expect(vi.mocked(db.select)).toHaveBeenCalledTimes(4);
+    // partnerId lookup + count + page + links + partner-wide assignments —
+    // still ONE links statement and ONE assignment statement per page.
+    expect(vi.mocked(db.select)).toHaveBeenCalledTimes(5);
+  });
+
+  // #9565: the list's "Partner-wide" badge claimed every partner-owned policy
+  // applied to all organizations, even with zero assignments. The flag comes
+  // from a real partner-level assignment, read in ONE statement per page and
+  // only when the page holds a partner-owned row.
+  it('flags only partner-owned policies that have a partner-level assignment', async () => {
+    const rows = [
+      { id: 'policy-assigned', name: 'Assigned to all orgs', orgId: null, partnerId: 'partner-1' },
+      { id: 'policy-unassigned', name: 'Not assigned yet', orgId: null, partnerId: 'partner-1' },
+      { id: 'policy-org', name: 'OliveTech only', orgId: ORG_ID },
+    ];
+    const assignments = assignmentsChain([{ configPolicyId: 'policy-assigned' }]);
+
+    vi.mocked(db.select)
+      .mockReturnValueOnce(countChain(3) as any)
+      .mockReturnValueOnce(pageChain(rows) as any)
+      .mockReturnValueOnce(linksChain([]) as any)
+      .mockReturnValueOnce(assignments as any);
+
+    const result = await listConfigPolicies(orgAuth(), {}, { page: 1, limit: 25 });
+
+    expect(result.data.map((r) => [r.id, r.hasPartnerWideAssignment])).toEqual([
+      ['policy-assigned', true],
+      ['policy-unassigned', false],
+      ['policy-org', false],
+    ]);
+    const where = new PgDialect().sqlToQuery(assignments.where.mock.calls[0][0]);
+    expect(where.sql).toContain('"config_policy_assignments"."config_policy_id" in');
+    expect(where.sql).toContain('"config_policy_assignments"."level" =');
+    expect(where.params).toEqual(expect.arrayContaining(['policy-assigned', 'policy-unassigned', 'partner']));
+    // Org-owned rows can never be partner-wide, so they are not queried.
+    expect(where.params).not.toContain('policy-org');
+  });
+
+  it('skips the assignment read when the page has no partner-owned policy', async () => {
+    const rows = [{ id: 'policy-a', name: 'A', orgId: ORG_ID }];
+
+    vi.mocked(db.select)
+      .mockReturnValueOnce(countChain(1) as any)
+      .mockReturnValueOnce(pageChain(rows) as any)
+      .mockReturnValueOnce(linksChain([]) as any);
+
+    const result = await listConfigPolicies(orgAuth(), {}, { page: 1, limit: 25 });
+
+    expect(result.data[0]).toMatchObject({ id: 'policy-a', hasPartnerWideAssignment: false });
+    expect(vi.mocked(db.select)).toHaveBeenCalledTimes(3);
   });
 
   it('skips the feature-link query entirely when the page is empty', async () => {
@@ -2347,5 +1675,35 @@ describe('addFeatureLink — maintenance inlineSettings service-layer validation
     await addFeatureLink('policy-1', 'maintenance', null, { recurrence: 'weekly', windowStart: '' });
 
     expect(normalizedRowValues.windowStart).toBeNull();
+  });
+});
+
+describe('containment service write backstops', () => {
+  beforeEach(() => { vi.clearAllMocks(); });
+
+  it.each([
+    ['reference', 'other-policy', { version: 1 }, /featurePolicyId/],
+    ['invalid settings', null, { version: 1, defaultTtlHours: 0 }, /defaultTtlHours/],
+    ['missing version', null, {}, /version/],
+    ['null settings', null, null, /object/],
+  ])('add refuses %s before a transaction', async (_name, featurePolicyId, inlineSettings, error) => {
+    vi.mocked(db.transaction).mockResolvedValue({ id: 'unexpected' });
+    await expect(addFeatureLink('policy-1', 'containment', featurePolicyId as string | null, inlineSettings))
+      .rejects.toThrow(error as RegExp);
+    expect(db.transaction).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['reference', { featurePolicyId: 'other-policy' }, /featurePolicyId/],
+    ['invalid settings', { inlineSettings: { version: 1, defaultTtlHours: 0 } }, /defaultTtlHours/],
+    ['null settings', { inlineSettings: null }, /object/],
+  ])('update refuses %s before writing', async (_name, updates, error) => {
+    const tx = {
+      select: vi.fn(() => selectLimitRows([{ id: 'link-1', featureType: 'containment', inlineSettings: { version: 1 } }])),
+      update: vi.fn(() => ({ set: () => ({ where: () => ({ returning: async () => [{ id: 'link-1' }] }) }) })),
+    };
+    vi.mocked(db.transaction).mockImplementation(async (fn: any) => fn(tx));
+    await expect(updateFeatureLink('link-1', updates, 'policy-1')).rejects.toThrow(error);
+    expect(tx.update).not.toHaveBeenCalled();
   });
 });

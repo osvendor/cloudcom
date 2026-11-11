@@ -6,10 +6,15 @@
  * reject missing auth. Removing a redundant gate may still satisfy the contract.
  * Only the normal unit setup's Redis mock applies; auth and handlers stay real.
  */
-import { readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
 import { Hono } from 'hono';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import {
+  chargingMounts,
+  indexCallsChargingMount,
+  indexMounts,
+  indexRouteCallCount,
+  loadMountedRouter,
+} from './helpers/indexMounts';
 
 // Key by router expression, not mount path: public and protected routers often
 // share a prefix. Auth-equivalent gates (MCP, helper, tunnel, etc.) are tested.
@@ -21,15 +26,24 @@ const EXEMPT: Record<string, string> = {
   automationWebhookRoutes: 'Inbound automation webhooks authenticate with webhook secrets.',
   invoicesPublicRoutes: 'Public invoice links authenticate via share tokens.',
   quotesPublicRoutes: 'Public quote links authenticate via share tokens.',
+  agreementsPublicRoutes: 'Public agreement signing links authenticate via signed request tokens.',
+  trustPagePublicRoutes: 'Public trust pages are unauthenticated by design; non-serving cases are a generic 404 (spec trust-center §7, §13).',
+  trustPageAttestationRoutes: 'Public, unauthenticated attestation of an already-public payload; generic 404 (Trust Center W3b).',
+  trustAccessPublicRoutes: 'Trust Center gated-document requests are unauthenticated by design: anonymous requesters, hashed fragment tokens, generic failures (spec trust-center §12).',
   publicEnrollmentRoutes: 'Public enrollment installer download uses enrollment keys.',
   publicShortLinkRoutes: 'Public short links resolve enrollment downloads.',
   installerRoutes: 'Installer bootstrap/download flow uses bootstrap tokens.',
   supportPublicRoutes: 'Public support-code check/download bootstraps unattended support.',
+  callerVerifyPublicRoutes: 'Public caller-verification card authenticates via the SMS/email link token.',
   docsRoutes: 'Public API documentation and OpenAPI documents.',
+  emailUnsubscribeRoutes: 'RFC 8058 one-click unsubscribe authenticates via the HMAC-signed link token; GET never writes; per-IP rate limited (connection health W3, #8847).',
   emailWebhookRoutes: 'Inbound email webhook authenticates provider signatures.',
   stripeWebhookRoutes: 'Stripe webhook authenticates provider signatures.',
   quickbooksWebhookRoutes: 'QuickBooks webhook authenticates provider signatures.',
+  xeroWebhookRoutes: 'Xero webhook authenticates provider signatures.',
   resendWebhookRoutes: 'Resend delivery webhook authenticates provider signatures (Svix).',
+  flowWebhookRoutes: 'Public flow webhook ingress: HMAC/token authenticated in services/flows/webhook/ingest.ts, uniform 401.',
+  edrWebhookRoutes: 'EDR vendor push hint authenticates the per-connection shared secret (hint only: schedules a read sync).',
   backupRoutes: 'Public bare-metal recovery code exchange precedes JWT-protected backup routes.',
   clientAiRoutes: 'First endpoint exchanges an Entra token before client AI login.',
   officeAddinRoutes: 'First endpoint exchanges an Entra token before Office add-in login.',
@@ -49,18 +63,7 @@ const EXEMPT: Record<string, string> = {
   'createEventWsRoutes(upgradeWebSocket)': 'Event WebSocket handshake authenticates tickets; requires upgrade adapter.',
 };
 
-const indexSource = readFileSync(new URL('../index.ts', import.meta.url), 'utf8');
-const imports = new Map<string, { module: string; exported: string }>();
-for (const match of indexSource.matchAll(/import\s*\{([^}]+)\}\s*from\s*['"]([^'"]+)['"]/g)) {
-  for (const binding of match[1]!.split(',')) {
-    const [exported, local = exported] = binding.trim().split(/\s+as\s+/);
-    if (exported && local) imports.set(local, { module: match[2]!, exported });
-  }
-}
-
-// Capture the complete expression (including factory calls), not only names.
-const mounts = [...indexSource.matchAll(/^\s*(api|app)\.route\(\s*['"]([^'"]+)['"]\s*,\s*(.*?)\s*\);/gm)]
-  .map((match) => ({ owner: match[1]!, path: match[2]!, expression: match[3]! }));
+const mounts = indexMounts;
 const protectedMounts = mounts.filter(({ expression }) => !Object.hasOwn(EXEMPT, expression));
 
 beforeAll(() => {
@@ -74,7 +77,11 @@ describe('index.ts router auth gate contract', () => {
   it('discovers every mount and keeps exemptions explicit and current', () => {
     expect(mounts.length).toBeGreaterThan(0);
     expect(protectedMounts.length).toBeGreaterThan(0);
-    expect(mounts).toHaveLength([...indexSource.matchAll(/\b(?:api|app)\.route\s*\(/g)].length);
+    // Keep the autopay helper call pinned so removing it cannot leave an
+    // apparently covered but unreachable router.
+    expect(indexCallsChargingMount).toBe(true);
+    expect(chargingMounts).toHaveLength(1);
+    expect(mounts).toHaveLength(indexRouteCallCount + chargingMounts.length);
     for (const [expression, reason] of Object.entries(EXEMPT)) {
       expect(mounts.some((mount) => mount.expression === expression), expression).toBe(true);
       expect(reason.trim().length, expression).toBeGreaterThan(0);
@@ -84,13 +91,7 @@ describe('index.ts router auth gate contract', () => {
   it.each(protectedMounts)('$owner: $path ($expression) rejects a bare request', async ({ path, expression }) => {
     // No arbitrary eval: ordinary imports and zero-argument router factories
     // are supported. New composition syntax fails loudly instead of escaping.
-    const parsed = /^(\w+)(\(\))?$/.exec(expression);
-    expect(parsed, `Unsupported router expression: ${expression}`).not.toBeNull();
-    const binding = imports.get(parsed![1]!);
-    expect(binding, `No import found for ${expression}`).toBeDefined();
-    const modulePath = fileURLToPath(new URL(binding!.module, new URL('../index.ts', import.meta.url)));
-    const exports = await import(modulePath);
-    const router: Hono = parsed![2] ? exports[binding!.exported]() : exports[binding!.exported];
+    const router = await loadMountedRouter(expression);
     expect(router, expression).toBeInstanceOf(Hono);
 
     // Hono records use() middleware as ALL entries too. Prefer an endpoint

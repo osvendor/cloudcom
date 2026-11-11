@@ -15,6 +15,7 @@ import {
   Loader2
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { FilterSelect } from '../shared/FilterSelect';
 import { fetchWithAuth } from '@/stores/auth';
 import { formatDateTime as formatUserDateTime, formatTime as formatUserTime } from '@/lib/dateTimeFormat';
 import { formatNumber } from '@/lib/i18n/format';
@@ -29,7 +30,7 @@ export type SessionType = 'terminal' | 'desktop' | 'file_transfer';
 export type SessionStatus = 'pending' | 'connecting' | 'active' | 'disconnected' | 'failed';
 
 /**
- * SEC-038 teardown phase. 'pending' = the server ended the session but the
+ * Teardown phase. 'pending' = the server ended the session but the
  * device has not yet acknowledged the stop; 'confirmed' = the device has.
  * Absent/'none' on live rows and on rows written before the fence shipped.
  */
@@ -51,6 +52,7 @@ export type RemoteSession = {
   durationSeconds?: number;
   bytesTransferred?: number;
   recordingUrl?: string;
+  endReason?: 'ended_by_user' | null;
   createdAt: string;
 };
 
@@ -92,7 +94,7 @@ const sessionStatusConfig: Record<SessionStatus, { labelKey: string; color: stri
   failed: { labelKey: 'sessionHistory.status.failed', color: 'bg-destructive/15 text-destructive border-destructive/30' }
 };
 
-// SEC-038 W06: a terminal row the device has not yet acknowledged is labelled
+// A terminal row the device has not yet acknowledged is labelled
 // distinctly from a confirmed end — the stream may still be tearing down.
 const teardownPendingStatusConfig = {
   labelKey: 'sessionHistory.status.teardownPending',
@@ -189,6 +191,7 @@ export function normalizeRemoteSession(session: RemoteSessionApi): RemoteSession
     durationSeconds: session.durationSeconds ?? undefined,
     bytesTransferred: session.bytesTransferred ?? undefined,
     recordingUrl: session.recordingUrl ?? undefined,
+    endReason: session.endReason ?? null,
     createdAt: session.createdAt
   };
 }
@@ -399,48 +402,51 @@ export default function SessionHistory({
             />
           </div>
 
-          <select
+          <FilterSelect
+            label={t('sessionHistory.filters.typeFilterLabel')}
             value={typeFilter}
             onChange={event => {
               setTypeFilter(event.target.value);
               setCurrentPage(1);
             }}
-            className="h-10 rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
+            className="h-10"
           >
             <option value="all">{t('sessionHistory.filters.allTypes')}</option>
             <option value="terminal">{t('sessionHistory.types.terminal')}</option>
             <option value="desktop">{t('sessionHistory.types.desktop')}</option>
             <option value="file_transfer">{t('sessionHistory.types.fileTransfer')}</option>
-          </select>
+          </FilterSelect>
 
-          <select
+          <FilterSelect
+            label={t('sessionHistory.filters.userFilterLabel')}
             value={userFilter}
             onChange={event => {
               setUserFilter(event.target.value);
               setCurrentPage(1);
             }}
-            className="h-10 rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
+            className="h-10"
           >
             <option value="all">{t('sessionHistory.filters.allUsers')}</option>
             {uniqueUsers.map(user => (
               <option key={user.id} value={user.id}>{user.name}</option>
             ))}
-          </select>
+          </FilterSelect>
 
-          <select
+          <FilterSelect
+            label={t('sessionHistory.filters.dateFilterLabel')}
             value={dateFilter}
             onChange={event => {
               setDateFilter(event.target.value);
               setCurrentPage(1);
             }}
-            className="h-10 rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
+            className="h-10"
           >
             <option value="all">{t('sessionHistory.filters.allTime')}</option>
             <option value="today">{t('sessionHistory.filters.today')}</option>
             <option value="yesterday">{t('sessionHistory.filters.yesterday')}</option>
             <option value="week">{t('sessionHistory.filters.lastSevenDays')}</option>
             <option value="month">{t('sessionHistory.filters.lastThirtyDays')}</option>
-          </select>
+          </FilterSelect>
         </div>
       </div>
 
@@ -519,6 +525,9 @@ export default function SessionHistory({
                       )}>
                         {t(/* i18n-dynamic */ sessionStatusBadge(session).labelKey)}
                       </span>
+                      {session.endReason === 'ended_by_user' && (
+                        <p className="mt-1 text-xs text-muted-foreground">{t('sessionHistory.status.endedByUser')}</p>
+                      )}
                     </td>
                     <td className="px-4 py-3">
                       <div className="flex items-center justify-end">

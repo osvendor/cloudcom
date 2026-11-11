@@ -13,14 +13,22 @@ vi.mock('../db', () => ({
 }));
 
 import { db } from '../db';
+import { drPlans } from '../db/schema';
 import type { AuthContext } from '../middleware/auth';
 import type { AiTool } from './aiTools';
 import { validateToolInput } from './aiToolSchemas';
 import { registerDRTools } from './aiToolsDR';
 import { createDrExecutionAndEnqueue } from './drExecutionService';
+import { resolveAiCallerPermissions } from './aiToolsRestoreAuthorization';
+import { requiredPermissionsForTool } from './aiGuardrails';
+import { ResilienceAuthorizationError } from './resilienceSiteAuthorization';
 
-vi.mock('./drExecutionService', () => ({
+vi.mock('./drExecutionService', async (importOriginal) => ({
+  classifyDrExecutionAuthorizationError: (await importOriginal<typeof import('./drExecutionService')>()).classifyDrExecutionAuthorizationError,
   createDrExecutionAndEnqueue: vi.fn(),
+}));
+vi.mock('./aiToolsRestoreAuthorization', () => ({
+  resolveAiCallerPermissions: vi.fn(),
 }));
 
 const ORG_ID = '11111111-1111-1111-1111-111111111111';
@@ -80,6 +88,7 @@ function createUpdateChain(rows: any[] = []) {
 function createDeleteChain(rows: any[] = []) {
   const chain: any = {};
   chain.where = vi.fn(() => chain);
+  chain.returning = vi.fn(() => Promise.resolve(rows));
   chain.then = (resolve: (value: any[]) => unknown, reject?: (error: unknown) => unknown) =>
     Promise.resolve(rows).then(resolve, reject);
   return chain;
@@ -297,8 +306,14 @@ describe('aiToolsDR handlers', () => {
     });
 
     it('stores the normalised config (defaults applied) when the host is reachable', async () => {
-      mockSelectSequence([[planRow], [{ id: HOST_ID, orgId: ORG_ID, siteId: null, status: 'online', osType: 'linux' }]]);
+      mockSelectSequence([
+        [planRow],
+        [{ id: HOST_ID, orgId: ORG_ID, siteId: null, status: 'online', osType: 'linux' }],
+        [{ id: DEVICE_ID, siteId: null }], // group devices are all in the plan's org
+      ]);
       mockInsertSequence([[{ id: GROUP_ID }]]);
+      // W03-D10: the plan revision bump must match the plan row.
+      vi.mocked(db.update).mockImplementation(() => createUpdateChain([{ id: PLAN_ID }]) as any);
       const result = JSON.parse(await toolMap.get('manage_dr_plan')!.handler({
         action: 'add_group', planId: PLAN_ID, name: 'Tier 1', devices: [DEVICE_ID],
         restoreConfig: { commandType: 'BARE_METAL_REBUILD', rebuildHostDeviceId: HOST_ID },
@@ -310,7 +325,7 @@ describe('aiToolsDR handlers', () => {
         snapshotSelection: 'latest_restorable',
         rebuildHostDeviceId: HOST_ID,
         outputDir: '/var/lib/breeze/rebuild/out',
-        waitTimeoutMinutes: 240,
+        waitTimeoutMinutes: 1440,
       });
     });
 
@@ -343,5 +358,230 @@ describe('aiToolsDR handlers', () => {
     const parsed = JSON.parse(result);
 
     expect(parsed).toEqual({ error: 'Operation failed. Check server logs for details.' });
+  });
+});
+
+describe('manage_dr_plan:create_plan write-org resolution (#6667)', () => {
+  let toolMap: Map<string, AiTool>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    setDefaultDbMocks();
+    toolMap = buildToolMap();
+  });
+
+  // A partner tech reachable to TWO orgs with no anchored auth.orgId — the
+  // shape that silently picked accessibleOrgIds[0] before the fix.
+  function multiOrgAuth(): AuthContext {
+    return {
+      user: { id: 'user-1', email: 'test@example.com', name: 'Test User' },
+      token: {} as any,
+      partnerId: 'partner-1',
+      orgId: null,
+      scope: 'partner',
+      principal: { kind: 'user_session' },
+      accessibleOrgIds: [ORG_ID, 'org-2'],
+      canAccessOrg: (orgId: string) => orgId === ORG_ID || orgId === 'org-2',
+      orgCondition: vi.fn(() => undefined),
+    } as any;
+  }
+
+  const CREATE_INPUT = { action: 'create_plan', name: 'Primary DR Plan', rpoTargetMinutes: 15, rtoTargetMinutes: 60 };
+
+  it('refuses with the ambiguous-org error and inserts nothing when orgId is omitted', async () => {
+    const result = JSON.parse(await toolMap.get('manage_dr_plan')!.handler(CREATE_INPUT, multiOrgAuth()));
+    expect(result.error).toBe('orgId is required: you have access to multiple organizations');
+    expect(db.insert).not.toHaveBeenCalled();
+  });
+
+  it('uses the explicit accessible orgId for the insert', async () => {
+    mockInsertSequence([[{ id: PLAN_ID, orgId: 'org-2', name: 'Primary DR Plan' }]]);
+
+    const result = JSON.parse(await toolMap.get('manage_dr_plan')!.handler(
+      { ...CREATE_INPUT, orgId: 'org-2' },
+      multiOrgAuth(),
+    ));
+
+    expect(result.success).toBe(true);
+    expect(result.plan.orgId).toBe('org-2');
+  });
+});
+
+describe('DR plan tools match the route', () => {
+  let toolMap: Map<string, AiTool>;
+  const OTHER_PLAN_GROUP = '66666666-6666-6666-6666-666666666666';
+  const planRow = { id: PLAN_ID, orgId: ORG_ID, name: 'Primary DR Plan', status: 'active' };
+  const bareMetalGroup = {
+    id: GROUP_ID, name: 'Rebuild', sequence: 1, devices: [DEVICE_ID],
+    restoreConfig: { commandType: 'BARE_METAL_REBUILD', snapshotSelection: 'latest_restorable' },
+    estimatedDurationMinutes: null,
+  };
+  const grant = (...perms: Array<[string, string]>) => ({
+    permissions: perms.map(([resource, action]) => ({ resource, action })),
+    partnerId: null, orgId: ORG_ID, roleId: 'r', scope: 'organization' as const,
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    setDefaultDbMocks();
+    toolMap = buildToolMap();
+  });
+
+  it.each(['create_plan', 'update_plan', 'add_group', 'update_group', 'delete_group'])(
+    'manage_dr_plan:%s requires devices:write like routes/dr.ts',
+    (action) => {
+      expect(requiredPermissionsForTool('manage_dr_plan', { action })).toEqual([{ resource: 'devices', action: 'write' }]);
+    },
+  );
+
+  it('execute_dr_plan refuses a BARE_METAL_REBUILD plan without backup:write', async () => {
+    mockSelectSequence([[planRow], [bareMetalGroup]]);
+    vi.mocked(resolveAiCallerPermissions).mockResolvedValue(grant(['devices', 'execute']) as any);
+
+    const result = JSON.parse(await toolMap.get('execute_dr_plan')!.handler(
+      { planId: PLAN_ID, executionType: 'rehearsal' }, makeAuth(),
+    ));
+
+    expect(result.error).toBe('backup_write_required');
+    expect(createDrExecutionAndEnqueue).not.toHaveBeenCalled();
+  });
+
+  it('execute_dr_plan runs a BARE_METAL_REBUILD plan with backup:write', async () => {
+    mockSelectSequence([[planRow], [bareMetalGroup]]);
+    vi.mocked(resolveAiCallerPermissions).mockResolvedValue(grant(['devices', 'execute'], ['backup', 'write']) as any);
+
+    const result = JSON.parse(await toolMap.get('execute_dr_plan')!.handler(
+      { planId: PLAN_ID, executionType: 'rehearsal' }, makeAuth(),
+    ));
+
+    expect(result.success).toBe(true);
+    expect(createDrExecutionAndEnqueue).toHaveBeenCalledOnce();
+  });
+
+  it('execute_dr_plan does not need backup:write for a plan without bare-metal groups', async () => {
+    prepareHandlerMocks('execute_dr_plan');
+    const result = JSON.parse(await toolMap.get('execute_dr_plan')!.handler(
+      { planId: PLAN_ID, executionType: 'rehearsal' }, makeAuth(),
+    ));
+    expect(result.success).toBe(true);
+    expect(resolveAiCallerPermissions).not.toHaveBeenCalled();
+  });
+
+  it('execute_dr_plan reports the service authorization denial like the route', async () => {
+    prepareHandlerMocks('execute_dr_plan');
+    vi.mocked(createDrExecutionAndEnqueue).mockReset();
+    vi.mocked(createDrExecutionAndEnqueue).mockRejectedValue(new ResilienceAuthorizationError(403, 'site_access_denied'));
+
+    const result = JSON.parse(await toolMap.get('execute_dr_plan')!.handler(
+      { planId: PLAN_ID, executionType: 'failover' }, makeAuth(),
+    ));
+
+    expect(result.error).toBe('site_access_denied');
+  });
+
+  it('add_group refuses a device outside the plan org', async () => {
+    // plan, then the plan-org device lookup finds only one of the two.
+    mockSelectSequence([[planRow], [{ id: DEVICE_ID }]]);
+    const result = JSON.parse(await toolMap.get('manage_dr_plan')!.handler({
+      action: 'add_group', planId: PLAN_ID, name: 'g', devices: [DEVICE_ID, OTHER_PLAN_GROUP],
+    }, makeAuth()));
+
+    expect(result.error).toBe('One or more devices do not belong to this organization');
+    expect(db.insert).not.toHaveBeenCalled();
+  });
+
+  it('add_group refuses a dependsOnGroupId that is not a group of the same plan', async () => {
+    mockSelectSequence([[planRow], [{ id: DEVICE_ID }], []]);
+    const result = JSON.parse(await toolMap.get('manage_dr_plan')!.handler({
+      action: 'add_group', planId: PLAN_ID, name: 'g', devices: [DEVICE_ID], dependsOnGroupId: OTHER_PLAN_GROUP,
+    }, makeAuth()));
+
+    expect(result.error).toBe('dependsOnGroupId must reference another group in the same DR plan');
+    expect(db.insert).not.toHaveBeenCalled();
+  });
+
+  // W03-D10 (#6757, quorum QW3): an approved or running execution re-reads the
+  // plan's groups, and the execute_dr_plan effect digest pins only the plan
+  // row. So a plan write must not land while an execution is pending/running,
+  // and every group write bumps the plan row (fail-safe: BEFORE the group write).
+  describe('a plan cannot change under an approved or running execution (W03-D10)', () => {
+    const group = { id: GROUP_ID, orgId: ORG_ID, devices: [DEVICE_ID] };
+    const running = [{ id: EXECUTION_ID }];
+    it.each([
+      ['update_plan', { action: 'update_plan', planId: PLAN_ID, name: 'x' }, [[planRow], running]],
+      ['add_group', { action: 'add_group', planId: PLAN_ID, name: 'g' }, [[planRow], running]],
+      ['update_group', { action: 'update_group', planId: PLAN_ID, groupId: GROUP_ID, name: 'x' }, [[group], running]],
+      ['delete_group', { action: 'delete_group', planId: PLAN_ID, groupId: GROUP_ID }, [[group], running]],
+    ] as const)('%s is refused while an execution is pending or running', async (_name, input, selects) => {
+      mockSelectSequence(selects as unknown as any[][]);
+      const result = JSON.parse(await toolMap.get('manage_dr_plan')!.handler({ ...input }, makeAuth()));
+      expect(result.error).toBe('dr_plan_execution_in_progress');
+      expect(db.update).not.toHaveBeenCalled();
+      expect(db.insert).not.toHaveBeenCalled();
+      expect(db.delete).not.toHaveBeenCalled();
+    });
+
+    // PR review (#10117): a zero-row write under forced RLS is a silent no-op,
+    // so neither the revision bump nor the group/plan write may report success
+    // when it matched nothing — a skipped bump would leave the digest unmoved.
+    it.each([
+      ['add_group', { action: 'add_group', planId: PLAN_ID, name: 'g' }, [[planRow], []]],
+      ['update_group', { action: 'update_group', planId: PLAN_ID, groupId: GROUP_ID, name: 'x' }, [[group], []]],
+      ['delete_group', { action: 'delete_group', planId: PLAN_ID, groupId: GROUP_ID }, [[group], []]],
+    ] as const)('%s refuses, writing no group, when the plan revision bump matches no row', async (_name, input, selects) => {
+      mockSelectSequence(selects as unknown as any[][]);
+      vi.mocked(db.update).mockImplementation(((table: unknown) => createUpdateChain(table === drPlans ? [] : [{ id: GROUP_ID }])) as any);
+      const result = JSON.parse(await toolMap.get('manage_dr_plan')!.handler({ ...input }, makeAuth()));
+      expect(result.error).toBe('Plan not found or access denied');
+      expect(db.insert).not.toHaveBeenCalled();
+      expect(db.delete).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['update_group', { action: 'update_group', planId: PLAN_ID, groupId: GROUP_ID, name: 'x' }, 'Group not found or access denied'],
+      ['delete_group', { action: 'delete_group', planId: PLAN_ID, groupId: GROUP_ID }, 'Group not found or access denied'],
+      ['update_plan', { action: 'update_plan', planId: PLAN_ID, name: 'x' }, 'Plan not found or access denied'],
+    ] as const)('%s reports an error when its write matches no row', async (name, input, error) => {
+      mockSelectSequence(name === 'update_plan' ? [[planRow], []] : [[group], []]);
+      vi.mocked(db.update).mockImplementation(((table: unknown) => createUpdateChain(table === drPlans && name !== 'update_plan' ? [{ id: PLAN_ID }] : [])) as any);
+      vi.mocked(db.delete).mockImplementation((() => createDeleteChain([])) as any);
+      const result = JSON.parse(await toolMap.get('manage_dr_plan')!.handler({ ...input }, makeAuth()));
+      expect(result.error).toBe(error);
+    });
+
+    it.each([
+      ['add_group', { action: 'add_group', planId: PLAN_ID, name: 'g' }, [[planRow], []]],
+      ['update_group', { action: 'update_group', planId: PLAN_ID, groupId: GROUP_ID, name: 'x' }, [[group], []]],
+      ['delete_group', { action: 'delete_group', planId: PLAN_ID, groupId: GROUP_ID }, [[group], []]],
+    ] as const)('%s bumps dr_plans.updated_at before writing the group', async (_name, input, selects) => {
+      mockSelectSequence(selects as unknown as any[][]);
+      mockInsertSequence([[{ id: GROUP_ID }]]);
+      const order: string[] = [];
+      vi.mocked(db.update).mockImplementation(((table: unknown) => {
+        order.push(table === drPlans ? 'plan' : 'other-update');
+        return createUpdateChain([{ id: GROUP_ID }]);
+      }) as any);
+      vi.mocked(db.insert).mockImplementation((() => { order.push('group-write'); return createInsertChain([{ id: GROUP_ID }]); }) as any);
+      vi.mocked(db.delete).mockImplementation((() => { order.push('group-write'); return createDeleteChain([{ id: GROUP_ID }]); }) as any);
+      const result = JSON.parse(await toolMap.get('manage_dr_plan')!.handler({ ...input }, makeAuth()));
+      expect(result.error).toBeUndefined();
+      expect(order[0]).toBe('plan');
+      expect(order.length).toBeGreaterThan(1);
+    });
+  });
+
+  it('update_group refuses a group depending on itself and a device outside the plan org', async () => {
+    mockSelectSequence([[{ id: GROUP_ID, orgId: ORG_ID, devices: [DEVICE_ID] }]]);
+    const self = JSON.parse(await toolMap.get('manage_dr_plan')!.handler({
+      action: 'update_group', planId: PLAN_ID, groupId: GROUP_ID, dependsOnGroupId: GROUP_ID,
+    }, makeAuth()));
+    expect(self.error).toBe('dependsOnGroupId must reference another group in the same DR plan');
+
+    mockSelectSequence([[{ id: GROUP_ID, orgId: ORG_ID, devices: [DEVICE_ID] }], []]);
+    const foreign = JSON.parse(await toolMap.get('manage_dr_plan')!.handler({
+      action: 'update_group', planId: PLAN_ID, groupId: GROUP_ID, devices: [OTHER_PLAN_GROUP],
+    }, makeAuth()));
+    expect(foreign.error).toBe('One or more devices do not belong to this organization');
+    expect(db.update).not.toHaveBeenCalled();
   });
 });

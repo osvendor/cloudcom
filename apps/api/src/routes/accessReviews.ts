@@ -15,12 +15,18 @@ import {
   organizationUsers
 } from '../db/schema';
 import { authMiddleware, requireMfa, requirePermission } from '../middleware/auth';
+import { getEmailService } from '../services/email';
+import { buildAccessReviewNotifyEmail } from '../services/accessReviewNotifyEmail';
 import { PERMISSIONS } from '../services/permissions';
 import { writeRouteAudit } from '../services/auditEvents';
 import { advanceUserEpochs, revokeAllRefreshFamilies, runPostCommitCleanup } from '../services/authLifecycle';
 import { canManagePartnerWidePolicies } from '../services/partnerWideAccess';
 import { neutralizeUserIfOrphaned } from '../services/userNeutralization';
 import { sweepPendingFactorArtifacts } from '../services/mfaFactorReset';
+import { assertCanManageTarget } from '../services/roleAssignment';
+import { canSelfDecideAccessReviewItem } from '../services/accessReviewSelfDecision';
+import { jsonError } from '../lib/jsonError';
+import { ERROR_CODES } from '@breeze/shared';
 
 export const accessReviewRoutes = new Hono();
 
@@ -249,7 +255,8 @@ accessReviewRoutes.get(
         roleName: roles.name,
         decision: accessReviewItems.decision,
         notes: accessReviewItems.notes,
-        reviewedAt: accessReviewItems.reviewedAt
+        reviewedAt: accessReviewItems.reviewedAt,
+        selfDecided: accessReviewItems.selfDecided
       })
       .from(accessReviewItems)
       .innerJoin(users, eq(accessReviewItems.userId, users.id))
@@ -282,10 +289,92 @@ accessReviewRoutes.get(
       permissions: permissionsByRole.get(item.roleId) ?? []
     }));
 
+    // How the caller's OWN item (if any) may be decided, so the UI can disable
+    // or warn before the PATCH refuses. Advisory only — PATCH re-evaluates.
+    // null: no own item in an open review, nothing to gate.
+    let selfDecision: 'blocked' | 'single_admin_exception' | null = null;
+    if (review.status !== 'completed' && items.some((item) => item.userId === auth.user.id)) {
+      selfDecision = (await canSelfDecideAccessReviewItem(scopeContext, auth.user.id))
+        ? 'single_admin_exception'
+        : 'blocked';
+    }
+
     return c.json({
       ...review,
-      items: itemsWithPermissions
+      items: itemsWithPermissions,
+      viewer: { userId: auth.user.id, selfDecision }
     });
+  }
+);
+
+// POST /access-reviews/:id/notify - Email the assigned reviewer.
+// Always 200 for a found review: `emailed:false` carries a machine-readable
+// `reason` so the UI can fall back to mailto: with a visible explanation.
+accessReviewRoutes.post(
+  '/:id/notify',
+  requirePermission(PERMISSIONS.USERS_WRITE.resource, PERMISSIONS.USERS_WRITE.action),
+  async (c) => {
+    const auth = c.get('auth');
+    const scopeContext = getScopeContext(auth);
+    const reviewId = c.req.param('id')!;
+
+    const whereClause =
+      scopeContext.scope === 'partner'
+        ? and(eq(accessReviews.id, reviewId), eq(accessReviews.partnerId, scopeContext.partnerId))
+        : and(eq(accessReviews.id, reviewId), eq(accessReviews.orgId, scopeContext.orgId));
+
+    const [review] = await db
+      .select({
+        id: accessReviews.id,
+        name: accessReviews.name,
+        status: accessReviews.status,
+        dueDate: accessReviews.dueDate,
+        reviewerId: accessReviews.reviewerId
+      })
+      .from(accessReviews)
+      .where(whereClause)
+      .limit(1);
+
+    if (!review) {
+      return c.json({ error: 'Access review not found' }, 404);
+    }
+    if (review.status === 'completed') {
+      return c.json({ error: 'Review is already completed' }, 400);
+    }
+
+    const [reviewer] = review.reviewerId
+      ? await db.select({ email: users.email }).from(users).where(eq(users.id, review.reviewerId)).limit(1)
+      : [];
+    if (!reviewer?.email) {
+      return c.json({ emailed: false, reason: 'no_reviewer_email' });
+    }
+
+    const emailService = getEmailService();
+    if (!emailService) {
+      return c.json({ emailed: false, reason: 'email_not_configured' });
+    }
+
+    const appBaseUrl = process.env.DASHBOARD_URL || process.env.PUBLIC_APP_URL || 'http://localhost:4321';
+    const template = buildAccessReviewNotifyEmail({
+      reviewName: review.name,
+      dueDate: review.dueDate,
+      appBaseUrl
+    });
+
+    try {
+      await emailService.sendEmail({
+        to: reviewer.email,
+        subject: template.subject,
+        html: template.html,
+        text: template.text,
+        purpose: 'staff.access_review_notice'
+      });
+    } catch (error) {
+      console.error(`[AccessReviews] Failed to email reviewer for review ${review.id}:`, error);
+      return c.json({ emailed: false, reason: 'send_failed' });
+    }
+
+    return c.json({ emailed: true, recipients: 1 });
   }
 );
 
@@ -330,6 +419,38 @@ accessReviewRoutes.patch(
       return c.json({ error: 'Cannot modify completed review' }, 400);
     }
 
+    const [item] = await db
+      .select({ id: accessReviewItems.id, userId: accessReviewItems.userId })
+      .from(accessReviewItems)
+      .where(
+        and(
+          eq(accessReviewItems.id, itemId),
+          eq(accessReviewItems.reviewId, reviewId)
+        )
+      )
+      .limit(1);
+
+    if (!item) {
+      return c.json({ error: 'Review item not found' }, 404);
+    }
+
+    // Separation of duties: nobody decides the item about their own access,
+    // unless no one else in this review's scope could decide it (single-admin
+    // exception) — then it is allowed and flagged on the item. Any write to
+    // your own item counts, including a reset to 'pending'.
+    const isOwnItem = item.userId === auth.user.id;
+    if (isOwnItem && !(await canSelfDecideAccessReviewItem(scopeContext, auth.user.id))) {
+      return jsonError(
+        c,
+        403,
+        ERROR_CODES.ACCESS_REVIEW_SELF_DECISION,
+        'You cannot decide on your own access. Another administrator must review this item.'
+      );
+    }
+    // Only a standing decision is flagged; a reset to 'pending' clears it, and
+    // a decision by someone else replaces (and clears) an earlier self-decision.
+    const selfDecided = isOwnItem && data.decision !== 'pending';
+
     // Update the item
     const [updated] = await db
       .update(accessReviewItems)
@@ -337,7 +458,8 @@ accessReviewRoutes.patch(
         decision: data.decision,
         notes: data.notes,
         reviewedAt: new Date(),
-        reviewedBy: auth.user.id
+        reviewedBy: auth.user.id,
+        selfDecided
       })
       .where(
         and(
@@ -349,7 +471,8 @@ accessReviewRoutes.patch(
         id: accessReviewItems.id,
         decision: accessReviewItems.decision,
         notes: accessReviewItems.notes,
-        reviewedAt: accessReviewItems.reviewedAt
+        reviewedAt: accessReviewItems.reviewedAt,
+        selfDecided: accessReviewItems.selfDecided
       });
 
     if (!updated) {
@@ -371,7 +494,9 @@ accessReviewRoutes.patch(
       resourceId: updated.id,
       details: {
         reviewId,
-        decision: data.decision
+        decision: data.decision,
+        subjectUserId: item.userId,
+        selfDecided
       }
     });
 
@@ -454,6 +579,82 @@ accessReviewRoutes.post(
     // this from RLS-filtered organization rows (including an empty set).
     if (scopeContext.scope === 'partner' && !canManagePartnerWidePolicies(auth)) {
       return c.json({ error: 'Full partner organization access required' }, 403);
+    }
+
+    // Same rank + scope gate every other cross-user mutation in routes/users.ts
+    // applies (DELETE /:id, POST /:id/mfa/reset, POST /:id/role):
+    // `PATCH /:id/items/:itemId` lets any USERS_WRITE holder mark an item
+    // 'revoked' with no rank/site check of its own, so this completion step
+    // is the only place left to stop a lower-ranked or site-restricted
+    // reviewer from revoking a higher-ranked or out-of-reach admin's access.
+    // Checked against each target's CURRENT membership (not the roleId
+    // captured on the review item at creation time, which can be stale) and
+    // BEFORE the apply transaction, so one unauthorized item fails the whole
+    // completion — never a partial apply.
+    if (uniqueRevokedUserIds.length > 0) {
+      const targetsById = new Map<
+        string,
+        { roleId: string; roleIsSystem: boolean; siteIds?: string[] | null }
+      >();
+
+      if (scopeContext.scope === 'partner') {
+        const rows = await db
+          .select({
+            userId: partnerUsers.userId,
+            roleId: roles.id,
+            roleIsSystem: roles.isSystem
+          })
+          .from(partnerUsers)
+          .innerJoin(roles, eq(partnerUsers.roleId, roles.id))
+          .where(
+            and(
+              eq(partnerUsers.partnerId, scopeContext.partnerId),
+              inArray(partnerUsers.userId, uniqueRevokedUserIds)
+            )
+          );
+        for (const row of rows) {
+          targetsById.set(row.userId, { roleId: row.roleId, roleIsSystem: row.roleIsSystem });
+        }
+      } else {
+        const rows = await db
+          .select({
+            userId: organizationUsers.userId,
+            roleId: roles.id,
+            roleIsSystem: roles.isSystem,
+            siteIds: organizationUsers.siteIds
+          })
+          .from(organizationUsers)
+          .innerJoin(roles, eq(organizationUsers.roleId, roles.id))
+          .where(
+            and(
+              eq(organizationUsers.orgId, scopeContext.orgId),
+              inArray(organizationUsers.userId, uniqueRevokedUserIds)
+            )
+          );
+        for (const row of rows) {
+          targetsById.set(row.userId, {
+            roleId: row.roleId,
+            roleIsSystem: row.roleIsSystem,
+            siteIds: row.siteIds
+          });
+        }
+      }
+
+      for (const userId of uniqueRevokedUserIds) {
+        const target = targetsById.get(userId);
+        // Membership already gone (e.g. removed by a concurrent request) —
+        // the delete below is a no-op for this id, nothing to authorize.
+        if (!target) continue;
+
+        const manageError = await assertCanManageTarget(c, auth, scopeContext, {
+          roleId: target.roleId,
+          isSystem: target.roleIsSystem,
+          siteIds: target.siteIds
+        });
+        if (manageError) {
+          return c.json({ error: `Cannot complete review: ${manageError}` }, 403);
+        }
+      }
     }
 
     // Task 9: this is a MULTI-user mutation revoking OTHER users' access.

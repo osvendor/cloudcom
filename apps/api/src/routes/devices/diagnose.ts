@@ -1,4 +1,6 @@
 import { Hono } from 'hono';
+import { ERROR_CODES } from '@breeze/shared';
+import { jsonError } from '../../lib/jsonError';
 import { db } from '../../db';
 import { deviceHardware, deviceMetrics, alerts } from '../../db/schema';
 import { eq, and, desc } from 'drizzle-orm';
@@ -6,6 +8,8 @@ import { authMiddleware, requireMfa, requireScope, requirePermission } from '../
 import { PERMISSIONS } from '../../services/permissions';
 import { executeCommand } from '../../services/commandQueue';
 import { getDeviceWithOrgAndSiteCheck, SITE_ACCESS_DENIED } from './helpers';
+import { alertTopologySiteGate } from '../alerts/helpers';
+import { checkScreenAccessConsentGate } from '../remote/screenAccessConsentGate';
 
 const diagnoseRoutes = new Hono();
 
@@ -33,6 +37,20 @@ diagnoseRoutes.post(
         return c.json({ error: `Device is ${device.status}, cannot capture screenshot` }, 400);
       }
 
+      // Screen capture honours the device's remote access consent policy: a
+      // consent-mode device refuses here, before anything reaches the agent.
+      const consent = await checkScreenAccessConsentGate({
+        deviceId: device.id,
+        orgId: device.orgId,
+        hostname: device.hostname,
+        surface: 'device_diagnose',
+        actor: auth,
+        isEphemeral: device.isEphemeral === true,
+      });
+      if (!consent.ok) {
+        return c.json(consent.body, consent.status);
+      }
+
       // Capture screenshot
       const screenshotResult = await executeCommand(deviceId, 'take_screenshot', {
         monitor: 0
@@ -41,7 +59,7 @@ diagnoseRoutes.post(
       if (screenshotResult.status !== 'completed') {
         // 500, not 502: Cloudflare replaces an origin 502 body with its own
         // branded page, which would blank the agent's reason on hosted deployments.
-        return c.json({ error: screenshotResult.error || 'Screenshot capture failed', code: 'agent_execution_failed' }, 500);
+        return jsonError(c, 500, ERROR_CODES.AGENT_EXECUTION_FAILED, screenshotResult.error || 'Screenshot capture failed');
       }
 
       let screenshotData: { imageBase64?: string; width?: number; height?: number; capturedAt?: string };
@@ -95,7 +113,8 @@ diagnoseRoutes.post(
         }).from(alerts)
           .where(and(
             eq(alerts.deviceId, deviceId),
-            eq(alerts.status, 'active')
+            eq(alerts.status, 'active'),
+            alertTopologySiteGate(auth.allowedSiteIds),
           ))
           .orderBy(desc(alerts.triggeredAt))
           .limit(5),

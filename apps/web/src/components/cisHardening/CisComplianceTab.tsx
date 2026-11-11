@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import '@/lib/i18n';
 import { Loader2, Search } from 'lucide-react';
 import { friendlyFetchError } from '@/lib/utils';
+import { FilterSelect } from '../shared/FilterSelect';
 import { fetchWithAuth } from '@/stores/auth';
 import { useOrgStore } from '../../stores/orgStore';
 import CisComplianceRow from './CisComplianceRow';
@@ -63,12 +64,13 @@ export default function CisComplianceTab({ refreshKey }: CisComplianceTabProps) 
     ? entries.filter(
         (e) =>
           e.device.hostname.toLowerCase().includes(search.toLowerCase()) ||
+          (e.device.displayName ?? '').toLowerCase().includes(search.toLowerCase()) ||
           e.baseline.name.toLowerCase().includes(search.toLowerCase())
       )
     : entries;
 
   return (
-    <div className="rounded-lg border bg-card p-6 shadow-xs">
+    <div className="rounded-lg border bg-card p-6 shadow-xs" data-testid="cis-compliance-tab">
       {error && (
         <div className="mb-4 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
           {error}
@@ -86,16 +88,17 @@ export default function CisComplianceTab({ refreshKey }: CisComplianceTabProps) 
             className="h-10 w-full rounded-md border bg-background pl-9 pr-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
           />
         </div>
-        <select
+        <FilterSelect
+          label={t('cisHardeningCisComplianceTab.osFilterLabel')}
           value={osFilter}
           onChange={(e) => setOsFilter(e.target.value)}
-          className="h-10 rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
+          className="h-10"
         >
           <option value="all">{t('cisHardeningCisComplianceTab.os.all')}</option>
           <option value="windows">{t('cisHardeningCisComplianceTab.os.windows')}</option>
           <option value="macos">{t('cisHardeningCisComplianceTab.os.macos')}</option>
           <option value="linux">{t('cisHardeningCisComplianceTab.os.linux')}</option>
-        </select>
+        </FilterSelect>
       </div>
 
       <div className="mt-4 overflow-x-auto rounded-md border">

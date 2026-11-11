@@ -2,7 +2,13 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, waitFor, within } from '@testing-library/react';
 
 const fetchWithAuth = vi.fn();
-vi.mock('../../stores/auth', () => ({ fetchWithAuth: (...a: unknown[]) => fetchWithAuth(...a) }));
+vi.mock('../../stores/auth', () => ({
+  fetchWithAuth: (...a: unknown[]) => fetchWithAuth(...a),
+  useAuthStore: (selector: (s: { user: null }) => unknown) => selector({ user: null }),
+}));
+// ReportsList reads the focused org and the JWT scope for the all-organizations hint.
+vi.mock('../../stores/orgStore', () => ({ useOrgStore: () => ({ currentOrgId: null }) }));
+vi.mock('@/lib/authScope', () => ({ useJwtClaims: () => ({ status: 'unresolved' }) }));
 
 vi.mock('./reportExport', () => ({
   exportReport: vi.fn(),
@@ -72,6 +78,7 @@ describe('ReportsList schedule cell', () => {
     mountWith([{
       ...monthlyReport,
       portalSelfService: true,
+      lastGeneratedAt: '2026-09-01T09:00:00Z',
     }]);
 
     render(<ReportsList />);
@@ -92,5 +99,20 @@ describe('ReportsList schedule cell', () => {
     expect(
       screen.queryByTestId(`report-edit-${monthlyReport.id}`),
     ).not.toBeInTheDocument();
+  });
+
+  // Pre-release sweep: "Open latest" on a report that never ran answered
+  // "No completed narrative to open yet" (narrative copy on a posture /
+  // executive-summary row). A never-generated row says so instead.
+  it('says "Not generated yet" instead of offering open-latest on a never-generated read-only row', async () => {
+    mountWith([{ ...monthlyReport, portalSelfService: true }]);
+
+    render(<ReportsList />);
+
+    expect(
+      await screen.findByTestId(`report-open-latest-empty-${monthlyReport.id}`),
+    ).toHaveTextContent('Not generated yet');
+    expect(screen.queryByTestId(`report-open-latest-${monthlyReport.id}`)).not.toBeInTheDocument();
+    expect(screen.queryByTestId(`report-generate-${monthlyReport.id}`)).not.toBeInTheDocument();
   });
 });

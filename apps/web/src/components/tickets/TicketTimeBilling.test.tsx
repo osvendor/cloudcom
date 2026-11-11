@@ -2,15 +2,20 @@ import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { render, screen, waitFor, fireEvent, act } from '@testing-library/react';
 
 let canManageBilling = true;
-vi.mock('../../lib/permissions', () => ({ usePermissions: () => ({ can: () => canManageBilling }) }));
-beforeEach(() => { canManageBilling = true; });
+// #8133: time_entries:write gates the Delete action separately from billing.
+let canWriteTime = true;
+vi.mock('../../lib/permissions', () => ({
+  usePermissions: () => ({ can: (_r: string, action: string) => (action === 'write' ? canWriteTime : canManageBilling) }),
+}));
+beforeEach(() => { canManageBilling = true; canWriteTime = true; });
 const fetchWithAuth = vi.fn();
 vi.mock('../../stores/auth', () => ({ fetchWithAuth: (...a: unknown[]) => fetchWithAuth(...a) }));
-vi.mock('../shared/Toast', () => ({ showToast: vi.fn() }));
+const showToast = vi.fn();
+vi.mock('../shared/Toast', () => ({ showToast: (...a: unknown[]) => showToast(...a) }));
 
 import TicketTimeBilling from './TicketTimeBilling';
 import { resetWorkTypeCache } from '../shared/WorkTypeSelect';
-import { BILLING_CHANGED_EVENT } from '../../lib/timerActions';
+import { BILLING_CHANGED_EVENT, TIMER_CHANGED_EVENT } from '../../lib/timerActions';
 
 const summary = {
   time: { totalMinutes: 90, billableMinutes: 60, billableAmounts: [{ currencyCode: 'EUR', amount: '150.00' }] },
@@ -146,6 +151,12 @@ describe('TicketTimeBilling', () => {
     await waitFor(() => expect(fetchWithAuth).toHaveBeenCalledWith('/time-entries/start', expect.objectContaining({
       method: 'POST', body: JSON.stringify({ ticketId: 'tk-1' })
     })));
+  });
+
+  it('#8604: quick-add tells the tech the note prints on the invoice', async () => {
+    render(<TicketTimeBilling ticketId="tk-1" />);
+    fireEvent.click(await screen.findByTestId('ticket-billing-quick-add-toggle'));
+    expect(screen.getByTestId('time-entry-note-invoice-cue')).toHaveTextContent(/on their invoice/i);
   });
 
   it('quick-add posts a manual entry with computed start/end', async () => {
@@ -534,5 +545,335 @@ describe('worked vs billed hours (#4628 W03)', () => {
     render(<TicketTimeBilling ticketId="tk-1" />);
     await screen.findByTestId('ticket-billing-time-total');
     expect(screen.queryByText(/included in contract/)).toBeNull();
+  });
+});
+
+// #8133: delete an entry from the ticket's Time & Billing rail.
+describe('TicketTimeBilling — delete entry (#8133)', () => {
+  beforeEach(() => { showToast.mockReset(); });
+  const routeWith = (rows: unknown[], onDelete: () => Response) => {
+    fetchWithAuth.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (init?.method === 'DELETE') return onDelete();
+      if (url.startsWith('/tickets/tk-1/time-entries')) {
+        return { ok: true, status: 200, json: async () => ({ data: rows, total: rows.length }) } as Response;
+      }
+      return route(url);
+    });
+  };
+
+  it('deletes after the confirm dialog, fires one billing event and reloads the rail once', async () => {
+    routeWith(entries, () => ({ ok: true, status: 200, json: async () => ({ data: { deleted: true } }) }) as Response);
+    const timer = vi.fn();
+    const billing = vi.fn();
+    window.addEventListener(TIMER_CHANGED_EVENT, timer);
+    window.addEventListener(BILLING_CHANGED_EVENT, billing);
+    try {
+      render(<TicketTimeBilling ticketId="tk-1" />);
+      fireEvent.click(await screen.findByTestId('ticket-billing-delete-te-1'));
+      expect(fetchWithAuth).not.toHaveBeenCalledWith('/time-entries/te-1', expect.anything());
+      expect((await screen.findByTestId('ticket-billing-delete-dialog')).textContent).toContain('45m');
+      const listsBefore = fetchWithAuth.mock.calls.filter(([u]) => String(u).startsWith('/tickets/tk-1/time-entries')).length;
+      fireEvent.click(screen.getByTestId('ticket-billing-delete-confirm'));
+      await waitFor(() => expect(fetchWithAuth).toHaveBeenCalledWith('/time-entries/te-1', expect.objectContaining({ method: 'DELETE' })));
+      await waitFor(() => expect(billing).toHaveBeenCalledTimes(1));
+      expect(timer).not.toHaveBeenCalled();
+      const listCount = () => fetchWithAuth.mock.calls.filter(([u]) => String(u).startsWith('/tickets/tk-1/time-entries')).length;
+      await waitFor(() => expect(listCount()).toBe(listsBefore + 1));
+      // Settle: a second broadcast would trigger a second reload.
+      await new Promise((r) => setTimeout(r, 50));
+      expect(listCount()).toBe(listsBefore + 1);
+    } finally {
+      window.removeEventListener(TIMER_CHANGED_EVENT, timer);
+      window.removeEventListener(BILLING_CHANGED_EVENT, billing);
+    }
+  });
+
+  it('names a running timer as running and fires only the timer event on delete', async () => {
+    routeWith([{ ...entries[0], id: 'run-1', endedAt: null, durationMinutes: null }], () => ({ ok: true, status: 200, json: async () => ({ data: { deleted: true } }) }) as Response);
+    const timer = vi.fn();
+    const billing = vi.fn();
+    window.addEventListener(TIMER_CHANGED_EVENT, timer);
+    window.addEventListener(BILLING_CHANGED_EVENT, billing);
+    try {
+      render(<TicketTimeBilling ticketId="tk-1" />);
+      fireEvent.click(await screen.findByTestId('ticket-billing-delete-run-1'));
+      expect((await screen.findByTestId('ticket-billing-delete-dialog')).textContent).toContain('running');
+      fireEvent.click(screen.getByTestId('ticket-billing-delete-confirm'));
+      await waitFor(() => expect(timer).toHaveBeenCalledTimes(1));
+      expect(billing).not.toHaveBeenCalled();
+    } finally {
+      window.removeEventListener(TIMER_CHANGED_EVENT, timer);
+      window.removeEventListener(BILLING_CHANGED_EVENT, billing);
+    }
+  });
+
+  it('closes an open confirm when the workbench switches tickets, deleting nothing', async () => {
+    routeWith(entries, () => ({ ok: true, status: 200, json: async () => ({ data: { deleted: true } }) }) as Response);
+    // tk-2 must render normally: an errored render would also unmount the
+    // dialog and make this test pass without the fix.
+    fetchWithAuth.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (init?.method === 'DELETE') return { ok: true, status: 200, json: async () => ({ data: { deleted: true } }) } as Response;
+      if (url.startsWith('/tickets/tk-2/billing-summary')) return { ok: true, status: 200, json: async () => ({ data: summary }) } as Response;
+      if (url.startsWith('/tickets/tk-2/time-entries')) return { ok: true, status: 200, json: async () => ({ data: [], total: 0 }) } as Response;
+      if (url.startsWith('/tickets/tk-1/time-entries')) return { ok: true, status: 200, json: async () => ({ data: entries, total: 1 }) } as Response;
+      return route(url);
+    });
+    const { rerender } = render(<TicketTimeBilling ticketId="tk-1" />);
+    fireEvent.click(await screen.findByTestId('ticket-billing-delete-te-1'));
+    expect(await screen.findByTestId('ticket-billing-delete-dialog')).toBeInTheDocument();
+    rerender(<TicketTimeBilling ticketId="tk-2" />);
+    await waitFor(() => expect(fetchWithAuth).toHaveBeenCalledWith(expect.stringContaining('/tickets/tk-2/billing-summary')));
+    await waitFor(() => expect(screen.queryByTestId('ticket-billing-delete-dialog')).toBeNull());
+    // The panel itself is still rendered for the new ticket.
+    expect(screen.getByTestId('ticket-time-billing')).toBeInTheDocument();
+    expect(fetchWithAuth).not.toHaveBeenCalledWith('/time-entries/te-1', expect.objectContaining({ method: 'DELETE' }));
+  });
+
+  it('a delete that settles after a ticket switch leaves the new ticket\'s confirm open and usable', async () => {
+    let resolveDelete: (r: Response) => void = () => {};
+    const other = { ...entries[0], id: 'te-9', description: 'other ticket' };
+    fetchWithAuth.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (init?.method === 'DELETE') return new Promise<Response>((r) => { resolveDelete = r; });
+      if (url.startsWith('/tickets/tk-2/billing-summary')) return { ok: true, status: 200, json: async () => ({ data: summary }) } as Response;
+      if (url.startsWith('/tickets/tk-2/time-entries')) return { ok: true, status: 200, json: async () => ({ data: [other], total: 1 }) } as Response;
+      return route(url);
+    });
+    const { rerender } = render(<TicketTimeBilling ticketId="tk-1" />);
+    fireEvent.click(await screen.findByTestId('ticket-billing-delete-te-1'));
+    fireEvent.click(await screen.findByTestId('ticket-billing-delete-confirm'));
+    await waitFor(() => expect(fetchWithAuth).toHaveBeenCalledWith('/time-entries/te-1', expect.objectContaining({ method: 'DELETE' })));
+    rerender(<TicketTimeBilling ticketId="tk-2" />);
+    fireEvent.click(await screen.findByTestId('ticket-billing-delete-te-9'));
+    expect(await screen.findByTestId('ticket-billing-delete-dialog')).toBeInTheDocument();
+    expect((screen.getByTestId('ticket-billing-delete-confirm') as HTMLButtonElement).disabled).toBe(false);
+    await act(async () => { resolveDelete({ ok: true, status: 200, json: async () => ({ data: { deleted: true } }) } as Response); });
+    await new Promise((r) => setTimeout(r, 50));
+    expect(screen.getByTestId('ticket-billing-delete-dialog')).toBeInTheDocument();
+    expect((screen.getByTestId('ticket-billing-delete-confirm') as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('gives each Delete button a distinct accessible name', async () => {
+    routeWith([
+      { ...entries[0], id: 'a1', description: 'printer' },
+      { ...entries[0], id: 'a2', description: 'email' },
+      { ...entries[0], id: 'a3', description: null, durationMinutes: 30, endedAt: '2026-06-12T10:30:00Z' },
+    ], () => ({ ok: true, status: 200, json: async () => ({}) }) as Response);
+    render(<TicketTimeBilling ticketId="tk-1" />);
+    expect(await screen.findByRole('button', { name: 'Delete 45m time entry by Todd: printer' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Delete 45m time entry by Todd: email' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Delete 30m time entry by Todd' })).toBeInTheDocument();
+  });
+
+  it('localizes the not-found refusal', async () => {
+    routeWith(entries, () => ({ ok: false, status: 404, json: async () => ({ error: 'Time entry not found', code: 'ENTRY_NOT_FOUND' }) }) as Response);
+    render(<TicketTimeBilling ticketId="tk-1" />);
+    fireEvent.click(await screen.findByTestId('ticket-billing-delete-te-1'));
+    fireEvent.click(await screen.findByTestId('ticket-billing-delete-confirm'));
+    await waitFor(() => expect(showToast).toHaveBeenCalledWith(expect.objectContaining({ type: 'error', message: 'This entry no longer exists.' })));
+  });
+
+  it('shows a localized refusal when the entry is not the caller\'s', async () => {
+    routeWith(entries, () => ({ ok: false, status: 403, json: async () => ({ error: 'You can only manage your own time entries', code: 'NOT_OWN_ENTRY' }) }) as Response);
+    render(<TicketTimeBilling ticketId="tk-1" />);
+    fireEvent.click(await screen.findByTestId('ticket-billing-delete-te-1'));
+    fireEvent.click(await screen.findByTestId('ticket-billing-delete-confirm'));
+    await waitFor(() => expect(showToast).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'error',
+      message: 'You can only delete your own time entries.',
+    })));
+  });
+
+  it('offers no Delete on an invoiced entry', async () => {
+    routeWith([{ ...entries[0], id: 'billed-1', billingStatus: 'billed' }, { ...entries[0], id: 'open-1', billingStatus: 'not_billed' }], () => ({ ok: true, status: 200, json: async () => ({}) }) as Response);
+    render(<TicketTimeBilling ticketId="tk-1" />);
+    expect(await screen.findByTestId('ticket-billing-delete-open-1')).toBeInTheDocument();
+    expect(screen.queryByTestId('ticket-billing-delete-billed-1')).toBeNull();
+  });
+
+  it('offers no Delete without time-entry write permission', async () => {
+    canWriteTime = false;
+    routeWith(entries, () => ({ ok: true, status: 200, json: async () => ({}) }) as Response);
+    render(<TicketTimeBilling ticketId="tk-1" />);
+    await screen.findByTestId('ticket-billing-entries');
+    expect(screen.queryByTestId('ticket-billing-delete-te-1')).toBeNull();
+  });
+
+  it('broadcasts nothing when the server refuses the delete', async () => {
+    routeWith(entries, () => ({ ok: false, status: 403, json: async () => ({ error: 'You can only manage your own time entries', code: 'NOT_OWN_ENTRY' }) }) as Response);
+    const billing = vi.fn();
+    window.addEventListener(BILLING_CHANGED_EVENT, billing);
+    try {
+      render(<TicketTimeBilling ticketId="tk-1" />);
+      fireEvent.click(await screen.findByTestId('ticket-billing-delete-te-1'));
+      fireEvent.click(await screen.findByTestId('ticket-billing-delete-confirm'));
+      await waitFor(() => expect(fetchWithAuth).toHaveBeenCalledWith('/time-entries/te-1', expect.objectContaining({ method: 'DELETE' })));
+      await waitFor(() => expect(screen.queryByTestId('ticket-billing-delete-dialog')).toBeNull());
+      expect(billing).not.toHaveBeenCalled();
+    } finally {
+      window.removeEventListener(BILLING_CHANGED_EVENT, billing);
+    }
+  });
+});
+
+// Customer work approval (#8196).
+describe('TicketTimeBilling customer approval', () => {
+  const held = { ...entries[0], id: 'held-1', billingStatus: 'awaiting_approval' };
+  const rows = (list: unknown[]) => fetchWithAuth.mockImplementation(async (url: string, init?: RequestInit) => {
+    if (url === '/time-entries/start' && init?.method === 'POST') {
+      return { ok: false, status: 409, json: async () => ({ error: 'Approval required', code: 'APPROVAL_REQUIRED' }) } as Response;
+    }
+    if (url.startsWith('/tickets/tk-1/time-entries')) {
+      return { ok: true, status: 200, json: async () => ({ data: list, total: list.length }) } as Response;
+    }
+    return route(url);
+  });
+
+  it('marks a held entry with the awaiting-approval chip and offers Write off to billing managers', async () => {
+    rows([held, { ...entries[0], id: 'plain-1', billingStatus: 'not_billed' }]);
+    render(<TicketTimeBilling ticketId="tk-1" />);
+    expect(await screen.findByTestId('time-entry-awaiting-approval-held-1')).toBeInTheDocument();
+    expect(screen.queryByTestId('time-entry-awaiting-approval-plain-1')).toBeNull();
+    expect(screen.getByTestId('time-entry-write-off-held-1')).toBeInTheDocument();
+    expect(screen.queryByTestId('time-entry-write-off-plain-1')).toBeNull();
+  });
+
+  it('hides Write off without time_entries:manage_billing', async () => {
+    canManageBilling = false;
+    rows([held]);
+    render(<TicketTimeBilling ticketId="tk-1" />);
+    await screen.findByTestId('time-entry-awaiting-approval-held-1');
+    expect(screen.queryByTestId('time-entry-write-off-held-1')).toBeNull();
+  });
+
+  it('writes off after a confirm step and then refreshes', async () => {
+    rows([held]);
+    render(<TicketTimeBilling ticketId="tk-1" />);
+    fireEvent.click(await screen.findByTestId('time-entry-write-off-held-1'));
+    expect(fetchWithAuth.mock.calls.some((c) => String(c[0]).endsWith('/write-off-held'))).toBe(false);
+    fireEvent.click(await screen.findByTestId('time-entry-write-off-confirm-held-1'));
+    await waitFor(() => expect(fetchWithAuth).toHaveBeenCalledWith('/time-entries/held-1/write-off-held', expect.objectContaining({ method: 'POST' })));
+  });
+
+  // DECISION: the server demands manage_billing to start non-billable, so a tech
+  // without it is shown guidance only, never an escape button that would 403.
+  it('on APPROVAL_REQUIRED offers "Start as non-billable" to billing managers and retries with isBillable:false', async () => {
+    rows([]);
+    render(<TicketTimeBilling ticketId="tk-1" />);
+    fireEvent.click(await screen.findByTestId('ticket-billing-start-timer'));
+    const notice = await screen.findByTestId('ticket-billing-approval-required');
+    expect(notice.textContent).toMatch(/Approvals panel/);
+    fetchWithAuth.mockClear();
+    fireEvent.click(screen.getByTestId('ticket-billing-start-non-billable'));
+    await waitFor(() => expect(fetchWithAuth).toHaveBeenCalledWith('/time-entries/start', expect.anything()));
+    const call = fetchWithAuth.mock.calls.find((c) => c[0] === '/time-entries/start')!;
+    expect(JSON.parse((call[1] as RequestInit).body as string)).toMatchObject({ ticketId: 'tk-1', isBillable: false });
+  });
+
+  it('on APPROVAL_REQUIRED offers NO non-billable retry without time_entries:manage_billing', async () => {
+    canManageBilling = false;
+    rows([]);
+    render(<TicketTimeBilling ticketId="tk-1" />);
+    fireEvent.click(await screen.findByTestId('ticket-billing-start-timer'));
+    expect((await screen.findByTestId('ticket-billing-approval-required')).textContent).toMatch(/Approvals panel/);
+    expect(screen.queryByTestId('ticket-billing-start-non-billable')).toBeNull();
+  });
+
+});
+
+// #9561: the 2-decimal-hours labour rule is by design; the rail makes every
+// labour figure explainable — rounded hours × rate = amount per entry, and
+// the rule itself under the ticket's time amount.
+describe('labour rule visibility (#9561)', () => {
+  const rated = (over: Record<string, unknown>) => ({ ...entries[0], hourlyRate: '135.00', currencyCode: 'USD', ...over });
+  const withEntries = (rows: unknown[]) => fetchWithAuth.mockImplementation(async (url: string) => {
+    if (url.startsWith('/tickets/tk-1/time-entries')) return { ok: true, status: 200, json: async () => ({ data: rows, total: rows.length }) } as Response;
+    return route(url);
+  });
+
+  it('shows rounded hours × rate = amount for a rated billable entry (25 min at $135.00 → 0.42 h, $56.70)', async () => {
+    withEntries([rated({ id: 'e25', durationMinutes: 25 })]);
+    render(<TicketTimeBilling ticketId="tk-1" />);
+    expect((await screen.findByTestId('ticket-billing-entry-labor-e25')).textContent).toBe('0.42 h × $135.00 = $56.70');
+  });
+
+  it('prices the billed quantity (billable_minutes), not the worked duration', async () => {
+    withEntries([rated({ id: 'emin', durationMinutes: 5, billableMinutes: 15, hourlyRate: '100.00' })]);
+    render(<TicketTimeBilling ticketId="tk-1" />);
+    expect((await screen.findByTestId('ticket-billing-entry-labor-emin')).textContent).toBe('0.25 h × $100.00 = $25.00');
+  });
+
+  it('shows no breakdown for a non-billable, unrated or running entry', async () => {
+    withEntries([
+      rated({ id: 'nb', isBillable: false }),
+      rated({ id: 'nr', hourlyRate: null, currencyCode: null }),
+      rated({ id: 'run', endedAt: null, durationMinutes: null }),
+    ]);
+    render(<TicketTimeBilling ticketId="tk-1" />);
+    await screen.findByTestId('ticket-billing-entries');
+    expect(screen.queryByTestId('ticket-billing-entry-labor-nb')).toBeNull();
+    expect(screen.queryByTestId('ticket-billing-entry-labor-nr')).toBeNull();
+    expect(screen.queryByTestId('ticket-billing-entry-labor-run')).toBeNull();
+  });
+
+  it('states the rule under the time amount when there is one, and not otherwise', async () => {
+    render(<TicketTimeBilling ticketId="tk-1" />);
+    expect((await screen.findByTestId('ticket-billing-labor-rule')).textContent).toMatch(/rounded to hours \(2 decimals\) × its rate/);
+  });
+
+  it('omits the rule when the ticket has no time amount', async () => {
+    fetchWithAuth.mockImplementation(async (url: string) => {
+      if (url.startsWith('/tickets/tk-1/billing-summary')) {
+        return { ok: true, status: 200, json: async () => ({ data: { ...summary, time: { ...summary.time, billableAmounts: [] } } }) } as Response;
+      }
+      return route(url);
+    });
+    render(<TicketTimeBilling ticketId="tk-1" />);
+    await screen.findByTestId('ticket-billing-amount');
+    expect(screen.queryByTestId('ticket-billing-labor-rule')).toBeNull();
+  });
+});
+
+// #10073: a merged tombstone answers every time write with 409 TICKET_MERGED,
+// so the rail keeps its totals and entries but offers no write that would fail.
+describe('read-only (merged tombstone)', () => {
+  it('keeps totals and entries visible but disables or hides every write', async () => {
+    fetchWithAuth.mockImplementation(async (url: string) => {
+      if (url.startsWith('/tickets/tk-1/time-entries')) {
+        return { ok: true, status: 200, json: async () => ({ data: [
+          entries[0],
+          { ...entries[0], id: 'te-held', billingStatus: 'awaiting_approval' },
+        ], total: 2 }) } as Response;
+      }
+      return route(url);
+    });
+    render(<TicketTimeBilling ticketId="tk-1" readOnly />);
+    expect((await screen.findByTestId('ticket-billing-time-total')).textContent).toContain('1h 30m');
+    expect(await screen.findByTestId('ticket-billing-entries')).toHaveTextContent('diag');
+    expect(screen.getByTestId('ticket-billing-start-timer')).toBeDisabled();
+    expect(screen.getByTestId('ticket-billing-quick-add-toggle')).toBeDisabled();
+    expect(screen.getByTestId('timer-work-type')).toBeDisabled();
+    expect(screen.queryByTestId('ticket-billing-delete-te-1')).toBeNull();
+    expect(screen.queryByTestId('time-entry-write-off-te-held')).toBeNull();
+    fireEvent.click(screen.getByTestId('ticket-billing-start-timer'));
+    fireEvent.click(screen.getByTestId('ticket-billing-quick-add-toggle'));
+    expect(screen.queryByTestId('ticket-billing-quick-add')).toBeNull();
+    expect(fetchWithAuth.mock.calls.some(([, init]) => (init as RequestInit | undefined)?.method === 'POST')).toBe(false);
+  });
+
+  it('closes an open quick-add form when the ticket becomes read-only', async () => {
+    const { rerender } = render(<TicketTimeBilling ticketId="tk-1" />);
+    fireEvent.click(await screen.findByTestId('ticket-billing-quick-add-toggle'));
+    expect(screen.getByTestId('ticket-billing-quick-add')).toBeInTheDocument();
+    rerender(<TicketTimeBilling ticketId="tk-1" readOnly />);
+    expect(screen.queryByTestId('ticket-billing-quick-add')).toBeNull();
+  });
+
+  it('drops an open delete confirm when the ticket becomes read-only', async () => {
+    const { rerender } = render(<TicketTimeBilling ticketId="tk-1" />);
+    fireEvent.click(await screen.findByTestId('ticket-billing-delete-te-1'));
+    expect(await screen.findByTestId('ticket-billing-delete-confirm')).toBeInTheDocument();
+    rerender(<TicketTimeBilling ticketId="tk-1" readOnly />);
+    await waitFor(() => expect(screen.queryByTestId('ticket-billing-delete-confirm')).toBeNull());
+    expect(fetchWithAuth.mock.calls.some(([, init]) => (init as RequestInit | undefined)?.method === 'DELETE')).toBe(false);
   });
 });

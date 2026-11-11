@@ -100,6 +100,8 @@ For self-hosted operators, environment variables provide an emergency off-switch
 
 Anomaly Detection watches each device's metric history and flags behavior that deviates from the device's own recent baseline — a CPU spike, a sudden drop, a steady upward trend, runaway memory or disk growth, or unusual network egress. It catches developing problems that a fixed alert threshold would miss.
 
+To keep routine work out of the list, a run of unusual readings has to last at least 15 minutes (three consecutive 5-minute readings) before it shows up. Self-hosters can change the count with `METRIC_ANOMALY_EPISODE_MIN_BUCKETS` (default `3`; it was `2` before v0.122.1). On v0.122.1 the stock Compose files don't pass it to the api container, so add it to the `api` service's `environment:` block; later releases map it. A burst shorter than that, such as a Defender scan or an indexer run, closes on its own and is never shown. Memory growth also has to reach a new high for the device: a climb back to a level the device already reached in the past 7 days, such as a nightly job, is treated as normal for that device. Disk growth is always reported, because a disk filling back up after a cleanup still matters.
+
 ### Where to find it
 
 Open any device, then select the **Anomalies** tab. Each open anomaly is shown as a card with:
@@ -123,6 +125,15 @@ If Remediation Suggestions is enabled, each open anomaly also shows a **Suggeste
 </Aside>
 
 A newly opened anomaly incident can also wake an AI triage agent. This is off unless that organization's triage agent is explicitly opted in. Anomaly-triggered runs are forced into Shadow mode, so they only observe and report. See [AI Agents](/features/ai-agents/#anomaly-lane) for the opt-in procedure and agent requirements.
+
+### Measuring anomaly detection quality
+
+Before enabling Anomaly Detection more widely, you can check how it is performing with `GET /analytics/anomalies/evaluation` (requires analytics read access). It accepts `range` (`7d`, `30d` — the default — or `90d`) and optional `orgId` or `deviceId` filters, and returns:
+
+- **Per-anomaly counts and rates** — how many anomalies are open, dismissed, promoted, or resolved, with dismiss, promote, and resolve rates. Anomalies that Breeze **cleared** automatically because the metric returned to normal are reported as their own `cleared` count and are left out of the total and every rate: an automatic close is not a technician's verdict, so it can't inflate or dilute the dismiss rate.
+- **An `episodes` block** — Breeze groups a continuous run of anomalous readings on one device into a single episode, so a CPU spike that lasts an hour counts once here rather than once per reading. The block reports the number of episodes, a breakdown by status (`open`, `resolved`, `dismissed`) and by how each closed (`cleared`, `expired_offline`, `expired_no_data`, `detection_off`, `user`, `snoozed`), the median time to close, the share of episodes that are repeats of one that closed in the previous week, and the share of closed episodes a technician actually acted on (resolved, dismissed, or promoted to an alert).
+
+A high share of episodes closing as `cleared` with a low hands-on share means most detections resolve on their own without anyone needing to look — the expected steady state, not a problem. A high repeat share on one device usually points at a scheduled task or a real unfixed issue re-triggering detection rather than detector noise.
 
 ---
 

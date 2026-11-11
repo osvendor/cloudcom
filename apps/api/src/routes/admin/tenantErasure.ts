@@ -29,6 +29,12 @@ import { requireMfa } from '../../middleware/auth';
 import { enqueueTenantErasure } from '../../jobs/tenantErasure';
 import { createAuditLog } from '../../services/auditService';
 import { getTrustedClientIpOrUndefined } from '../../services/clientIp';
+import {
+  hasActiveBackupLegalHold,
+  hasUnresolvedNetworkIsolations,
+  LEGAL_HOLD_ACTIVE_MESSAGE,
+} from '../../services/tenantCascade';
+import { EVIDENCE_HOLD_DEFERRED_ACTION, findEvidenceHold } from '../../services/orgEvidenceHold';
 
 export const tenantErasureRoutes = new Hono();
 
@@ -75,12 +81,80 @@ tenantErasureRoutes.post(
       return c.json({ error: 'org not found' }, 404);
     }
 
+    if (await hasUnresolvedNetworkIsolations(orgId)) {
+      await createAuditLog({
+        orgId: null, actorType: 'user', actorId: auth.user.id, actorEmail: auth.user.email,
+        action: 'tenant.erasure.refused_isolation', resourceType: 'organization', resourceId: orgId,
+        resourceName: org.name, details: { reason: 'isolation_unresolved' }, result: 'failure',
+        errorMessage: 'Release network isolation first',
+      });
+      return c.json({ error: 'isolation_unresolved', message: 'Release network isolation first' }, 409);
+    }
+
+    // Fast-path precondition check so the admin gets an immediate, actionable
+    // refusal instead of discovering it minutes later when the queued job
+    // (which re-checks this itself, see cascadeDeleteOrg) skips silently.
+    // This is a convenience check, not the enforcement point — the worker's
+    // own check is what actually protects every erasure entry point.
+    if (await hasActiveBackupLegalHold(orgId)) {
+      await createAuditLog({
+        orgId: null,
+        actorType: 'user',
+        actorId: auth.user.id,
+        actorEmail: auth.user.email,
+        action: 'tenant.erasure.refused_legal_hold',
+        resourceType: 'organization',
+        resourceId: orgId,
+        resourceName: org.name,
+        details: { reason: 'LEGAL_HOLD_ACTIVE' },
+        ipAddress: getTrustedClientIpOrUndefined(c),
+        userAgent: c.req.header('user-agent'),
+        result: 'failure',
+        errorMessage: LEGAL_HOLD_ACTIVE_MESSAGE,
+      });
+      return c.json(
+        { error: LEGAL_HOLD_ACTIVE_MESSAGE, code: 'LEGAL_HOLD_ACTIVE' as const },
+        409,
+      );
+    }
+
+    // A merged-away org kept under an evidence hold (PAM ownership epochs) is
+    // erased like any other, but SCOPED (#8746): cascadeDeleteOrg keeps its
+    // PAM evidence and its organizations row until the hold is released.
+    // Recorded here so the admin's request shows what was deferred, and
+    // returned so the caller is not told the org is gone.
+    const evidenceHold = await withSystemDbAccessContext(() => findEvidenceHold(orgId));
+
     const enqueued = await enqueueTenantErasure({
       orgId,
       performedBy: auth.user.id,
       performedByEmail: auth.user.email,
       source: 'platform_admin',
     });
+
+    // Written after the enqueue so it never claims an erasure that failed to queue.
+    if (evidenceHold) {
+      await createAuditLog({
+        orgId: null,
+        actorType: 'user',
+        actorId: auth.user.id,
+        actorEmail: auth.user.email,
+        action: EVIDENCE_HOLD_DEFERRED_ACTION,
+        resourceType: 'organization',
+        resourceId: orgId,
+        resourceName: org.name,
+        details: {
+          stage: 'admin_request',
+          survivorOrgId: evidenceHold.survivorOrgId,
+          mergeEventId: evidenceHold.mergeEventId,
+          holdReason: evidenceHold.reason,
+          note: 'erasure proceeds for everything except the privileged-access evidence and the organization row the hold retains',
+        },
+        ipAddress: getTrustedClientIpOrUndefined(c),
+        userAgent: c.req.header('user-agent'),
+        result: 'success',
+      });
+    }
 
     // Audit the enqueue event explicitly. The cascade worker will write
     // its own `tenant.erasure.started` + `tenant.erasure.completed`
@@ -97,6 +171,7 @@ tenantErasureRoutes.post(
       details: {
         jobId: enqueued.id,
         partnerId: org.partnerId,
+        ...(evidenceHold ? { evidenceHoldScoped: true } : {}),
       },
       ipAddress: getTrustedClientIpOrUndefined(c),
       userAgent: c.req.header('user-agent'),
@@ -110,6 +185,9 @@ tenantErasureRoutes.post(
         orgId,
         orgName: org.name,
         partnerId: org.partnerId,
+        ...(evidenceHold
+          ? { evidenceHold: { retained: true as const, survivorOrgId: evidenceHold.survivorOrgId } }
+          : {}),
       },
       202,
     );

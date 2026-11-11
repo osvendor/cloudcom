@@ -1,7 +1,8 @@
-import { and, eq, isNull, ne } from 'drizzle-orm';
-import { db } from '../db';
+import { and, eq, isNull } from 'drizzle-orm';
+import { db, withDbTransactionIfHeld } from '../db';
 import { organizations } from '../db/schema';
 
+import { notHiddenOrgType } from './unassignedPool/visibility';
 /** Exported so other partner-wide write routes (e.g. invoices/settings.ts's
  *  PATCH /partner/billing-settings) can write the same semantic audit shape
  *  this file uses for `partner.settings.update` — a partner-wide action has
@@ -15,18 +16,18 @@ export async function resolveAuditOrgIdForPartner(partnerId: string | null): Pro
   }
 
   try {
-    const [org] = await db
+    const [org] = await withDbTransactionIfHeld(() => db
       .select({ id: organizations.id })
       .from(organizations)
-      // The hidden 'quick_support' org is a real row under the partner and could
-      // easily be the oldest — never let it become the audit fallback org.
+      // The hidden Quick Support and holding orgs are real rows under the
+      // partner and could easily be the oldest — never the audit fallback org.
       .where(and(
         eq(organizations.partnerId, partnerId),
-        ne(organizations.type, 'quick_support'),
+        notHiddenOrgType(),
         isNull(organizations.deletedAt),
       ))
       .orderBy(organizations.createdAt)
-      .limit(1);
+      .limit(1));
 
     return org?.id ?? null;
   } catch (err) {

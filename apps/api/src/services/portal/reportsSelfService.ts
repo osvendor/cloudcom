@@ -1,13 +1,15 @@
 import { randomUUID } from 'node:crypto';
-import { and, count, desc, eq, ne, sql } from 'drizzle-orm';
+import { safeErrorMessage } from '../aiModels/safeDbError';
+import { reportRunOwnerColumns } from '../reportRunOwner';
+import { and, count, desc, eq, ne, notInArray, sql } from 'drizzle-orm';
 import { buildReportPdf, type BuildOpts } from '@breeze/shared/reportPdf';
 import {
-  rowsToCsv,
+  reportRunRowsToCsv,
   type HardwareLifecycleSummary,
   type PortalRunDto,
   type PortalRunsDto,
 } from '@breeze/shared';
-import { db } from '../../db';
+import { db, withDbTransaction } from '../../db';
 import { tightenStatementTimeout } from '../../db/lockTimeout';
 import { portalBranding, reportRuns, reports } from '../../db/schema';
 import { checkRateLimit, PORTAL_USE_REDIS } from './rateLimit';
@@ -19,6 +21,11 @@ import {
 } from '../reportGenerationService';
 import { organizationScope } from '../reportScope';
 import { getReportBranding } from '../reportBranding';
+import { MANAGED_EVIDENCE_REGISTRY, type ManagedEvidenceType } from '../managedEvidenceRegistry';
+import {
+  reportAudienceCondition,
+  reportTypePermissionCondition,
+} from '../reportTypePermissions';
 import {
   persistedSiteScopeValues,
   portalUserReportAuthority,
@@ -127,6 +134,18 @@ const PORTAL_DEFINITIONS = [
       dormantDays: 45,
       homeCountries: [],
       adminDetail: true,
+    },
+  },
+  // #11018 W2 — MANAGED EVIDENCE, not self-service: absent from PORTAL_REPORT_TYPES
+  // and from both allowlist literals in reportGenerationService.ts, so a customer
+  // can read a DELIVERED artifact but can never generate one on demand. Subjects
+  // stay off: a delivered run reaches every portal user of the org, while a portal
+  // user may only read their own tickets. Spelled identically to the registry entry.
+  {
+    type: 'ticket_sla_performance',
+    name: 'Service evidence — SLA performance',
+    config: {
+      includeSubjects: false,
     },
   },
 ] as const;
@@ -368,13 +387,47 @@ function lifecycleExclusion(lifecycleEnabled: boolean) {
  *
  * Runs no deliverable references (ordinary portal self-service) are unaffected.
  * Fail-closed: a run referenced only by non-delivered occurrences is hidden.
+ *
+ * A managed evidence type has no self-service path, so delivery is its only route
+ * to the customer (#11018). Removing the evidence from an undelivered occurrence
+ * leaves the completed run with no evidence row; the first arm below must not read
+ * that as an ordinary self-service run.
  * `sd_evidence_report_run_idx` (report_run_id) serves both sub-queries.
  */
+/**
+ * #6941 (defense in depth): `portal_self_service` alone must not admit a run
+ * into the portal. Portal users are customers — the same audience as an
+ * organization-scope caller — so msp_staff-audience types (AR aging, margin,
+ * SLA attainment) are excluded here with the very predicate the staff report
+ * routes use for org-scope callers. Neither writer of the marker can set it on
+ * an msp_staff type today; this keeps a hand edit or a future writer from
+ * turning into a portal disclosure.
+ *
+ * Ruling P8b: every scope applying `reportAudienceCondition` must also apply
+ * the per-type permission filter. A portal customer never has a resolved
+ * report-permission set (`granted: null`), so `reportTypePermissionCondition`
+ * excludes every permission-gated (business) report type here too.
+ *
+ * #11018: a permission-gated MANAGED EVIDENCE type (`ticket_sla_performance`,
+ * tickets:read for staff) is exempt. Its gate is about which staff may read it;
+ * the customer's grant is the MSP delivering the occurrence, which
+ * `deliveredEvidenceOnly` enforces beside this predicate.
+ */
+function customerAudienceOnly() {
+  return and(
+    reportAudienceCondition({ scope: 'organization' }, reports.type),
+    reportTypePermissionCondition(null, reports.type, { exceptManagedEvidence: true }),
+  );
+}
+
 export function deliveredEvidenceOnly() {
   return sql`(
-    NOT EXISTS (
-      SELECT 1 FROM service_deliverable_evidence e
-      WHERE e.report_run_id = ${reportRuns.id}
+    (
+      ${notInArray(reports.type, Object.keys(MANAGED_EVIDENCE_REGISTRY) as ManagedEvidenceType[])}
+      AND NOT EXISTS (
+        SELECT 1 FROM service_deliverable_evidence e
+        WHERE e.report_run_id = ${reportRuns.id}
+      )
     )
     OR EXISTS (
       SELECT 1 FROM service_deliverable_evidence e
@@ -394,6 +447,7 @@ export function portalRunPredicate(
     eq(reportRuns.id, runId),
     eq(reports.orgId, orgId),
     eq(reports.portalSelfService, true),
+    customerAudienceOnly(),
     lifecycleExclusion(lifecycleEnabled),
     deliveredEvidenceOnly(),
   )!;
@@ -407,6 +461,7 @@ export function portalRunListPredicate(
     eq(reports.orgId, orgId),
     eq(reports.portalSelfService, true),
     eq(reportRuns.status, 'completed'),
+    customerAudienceOnly(),
     lifecycleExclusion(lifecycleEnabled),
     deliveredEvidenceOnly(),
   )!;
@@ -417,7 +472,8 @@ function toDto(row: {
   reportId: string;
   name: string;
   // The DTO's own union, NOT PortalReportType: portalRunListPredicate has no
-  // type filter, so a managed-evidence run of a type outside the three
+  // portal-type filter (only the msp_staff audience exclusion, #6941), so a
+  // managed-evidence run of a type outside the three
   // self-service ones legitimately flows through here. Typing it as
   // PortalReportType was a lie the compiler could not see, because the value
   // comes from the database (#5784 W02, W03, W04).
@@ -426,6 +482,8 @@ function toDto(row: {
   startedAt: Date | null;
   completedAt: Date | null;
   rowCount: number | null;
+  // Mirrors renderRunCsv's gate: CSV renders only from an array `rows`.
+  csvAvailable?: boolean;
   createdAt: Date;
 }): PortalRunDto {
   return {
@@ -437,6 +495,7 @@ function toDto(row: {
     startedAt: row.startedAt?.toISOString() ?? null,
     completedAt: row.completedAt?.toISOString() ?? null,
     rowCount: row.rowCount,
+    csvAvailable: row.csvAvailable === true,
     createdAt: row.createdAt.toISOString(),
   };
 }
@@ -501,6 +560,8 @@ export async function listPortalRuns(
     startedAt: reportRuns.startedAt,
     completedAt: reportRuns.completedAt,
     rowCount: reportRuns.rowCount,
+    // Computed in SQL so the (large) result blob is not shipped to list runs.
+    csvAvailable: sql<boolean>`coalesce(jsonb_typeof(${reportRuns.result} -> 'rows') = 'array', false)`,
     createdAt: reportRuns.createdAt,
   }).from(reportRuns)
     .innerJoin(reports, eq(reportRuns.reportId, reports.id))
@@ -530,6 +591,7 @@ export async function generatePortalReport(args: {
   const [definition] = await db.select({
     id: reports.id,
     orgId: reports.orgId,
+    partnerId: reports.partnerId,
     name: reports.name,
     type: reports.type,
     config: reports.config,
@@ -576,6 +638,7 @@ export async function generatePortalReport(args: {
     const authority = portalUserReportAuthority(args.orgId, startedAt);
     const [run] = await db.insert(reportRuns).values({
       reportId: definition.id,
+      ...reportRunOwnerColumns(definition),
       status: 'running',
       startedAt,
       requestedByKind: 'portal_user',
@@ -587,43 +650,49 @@ export async function generatePortalReport(args: {
     if (!run) throw new Error('Failed to create portal report run');
 
     try {
-      const result = await generateReport(
-        definition.type,
-        organizationScope(args.orgId),
-        effectiveConfig,
-        authority,
-      );
-      const previous = await previousBaselineFor(
-        definition.id,
-        authority.fingerprint,
-      );
-      if (previous) result.previous = previous;
+      // One savepoint: the catch below stamps the run failed on this same
+      // transaction, so a SQL failure in here must stop at the savepoint (#11225).
+      return await withDbTransaction(async () => {
+        const result = await generateReport(
+          definition.type,
+          organizationScope(args.orgId),
+          effectiveConfig,
+          authority,
+        );
+        const previous = await previousBaselineFor(
+          definition.id,
+          authority.fingerprint,
+        );
+        if (previous) result.previous = previous;
 
-      const completedAt = new Date();
-      const rowCount = result.rowCount
-        ?? (Array.isArray(result.rows) ? result.rows.length : null);
-      const [completed] = await db.update(reportRuns).set({
-        status: 'completed',
-        completedAt,
-        rowCount,
-        result,
-        outputUrl: `/api/v1/portal/reports/runs/${run.id}/pdf`,
-      }).where(eq(reportRuns.id, run.id)).returning();
+        const completedAt = new Date();
+        const rowCount = result.rowCount
+          ?? (Array.isArray(result.rows) ? result.rows.length : null);
+        const [completed] = await db.update(reportRuns).set({
+          status: 'completed',
+          completedAt,
+          rowCount,
+          result,
+          outputUrl: `/api/v1/portal/reports/runs/${run.id}/pdf`,
+        }).where(eq(reportRuns.id, run.id)).returning();
 
-      // The MSP Reports list reads this column; the MSP generate path and the
-      // scheduler stamp it, so a portal run must too or the MSP sees "Never".
-      await db.update(reports)
-        .set({ lastGeneratedAt: completedAt, updatedAt: completedAt })
-        .where(eq(reports.id, definition.id));
+        // The MSP Reports list reads this column; the MSP generate path and the
+        // scheduler stamp it, so a portal run must too or the MSP sees "Never".
+        await db.update(reports)
+          .set({ lastGeneratedAt: completedAt, updatedAt: completedAt })
+          .where(eq(reports.id, definition.id));
 
-      return toDto({
-        ...completed!,
-        name: definition.name,
-        type: definition.type as PortalReportType,
+        return toDto({
+          ...completed!,
+          csvAvailable: Array.isArray(result.rows),
+          name: definition.name,
+          type: definition.type as PortalReportType,
+        });
       });
     } catch (error) {
+      // Stored on the run: never the failed query's values.
       const errorMessage = error instanceof Error
-        ? error.message
+        ? safeErrorMessage(error)
         : 'Report generation failed';
       console.error('[portal-reports] Report generation failed', {
         runId: run.id,
@@ -781,5 +850,5 @@ export async function renderRunCsv(
   if (!result || !Array.isArray(result.rows)) {
     throw new PortalReportNoTabularDataError();
   }
-  return rowsToCsv(result.rows);
+  return reportRunRowsToCsv(row.type, result.rows);
 }

@@ -61,6 +61,15 @@ describe('Cloud Command Microsoft administration runtime', () => {
     await expect(subject.configuration()).resolves.toEqual({ clientId, credentialVersion: 'cert-1', redirectUri: 'https://breeze.example.test/extensions/cloudcommand/connect' });
     expect(readFile).toHaveBeenCalledWith(configPath, 'utf8');
   });
+  it('creates mailbox client assertions only for the current app and credential binding', async () => {
+    const { runtime: subject } = runtime();
+    const assertion = await subject.createClientAssertion({ tenantId, clientId, credentialVersion: 'cert-1' });
+    const payload = JSON.parse(Buffer.from(assertion.split('.')[1]!, 'base64url').toString());
+    expect(payload).toMatchObject({ iss: clientId, sub: clientId, aud: `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token` });
+    await expect(subject.createClientAssertion({ tenantId, clientId, credentialVersion: 'old-cert' })).rejects.toThrow('microsoft_administration_unavailable');
+    await expect(subject.createClientAssertion({ tenantId, clientId: administratorObjectId, credentialVersion: 'cert-1' })).rejects.toThrow('microsoft_administration_unavailable');
+  });
+
   it('creates and revokes local Exchange descriptors from the same protected application credential', async () => {
     const h = runtime({ exchange: true });
     const exchange = await h.runtime.exchange();
@@ -145,6 +154,7 @@ describe('Cloud Command Microsoft administration runtime', () => {
     ['wrong nonce', { nonce: 'other' }],
     ['wrong tenant', { tid: '44444444-4444-4444-8444-444444444444' }],
     ['non-administrator', { wids: [] }],
+    ['privileged-role-administrator without Global Administrator', { wids: ['e8611ab8-c189-46e8-94e1-60213ab1f814'] }],
   ])('rejects a %s identity token', async (_label, overrides) => {
     const fetch = vi.fn(async () => Response.json({ id_token: await identity(overrides) }));
     const { runtime: subject } = runtime({ fetch });

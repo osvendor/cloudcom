@@ -22,11 +22,19 @@ import {
 const GUID = '11111111-2222-3333-4444-555555555555';
 
 describe('m365 read action contracts', () => {
-  it('defines exactly the 12 interactive catalog actions with non-empty field allowlists', () => {
+  it('accepts mailbox reads only for an object id, with exactly four projected fields (#6354 W03)', () => {
+    expect(m365ReadActionSchema.parse({ type: 'm365.user.mailboxes', userId: GUID })).toEqual({ type: 'm365.user.mailboxes', userId: GUID });
+    expect(M365_READ_ACTION_FIELDS['m365.user.mailboxes']).toEqual(['id', 'userPrincipalName', 'mail', 'proxyAddresses']);
+    expect(m365ReadActionSchema.safeParse({ type: 'm365.user.mailboxes', userId: 'alex@example.com' }).success).toBe(false);
+    expect(m365ReadActionSchema.safeParse({ type: 'm365.user.mailboxes', userId: GUID, select: ['passwordProfile'] }).success).toBe(false);
+    expect(M365_READ_ACTION_FIELDS['m365.user.get']).not.toContain('proxyAddresses');
+  });
+
+  it('defines exactly the 14 interactive catalog actions with non-empty field allowlists', () => {
     expect(M365_INTERACTIVE_READ_ACTION_IDS).toEqual([
-      'm365.user.list', 'm365.user.get', 'm365.signins.list',
+      'm365.user.list', 'm365.user.get', 'm365.user.mailboxes', 'm365.signins.list',
       'm365.intune.device.list', 'm365.intune.device.get',
-      'm365.group.list', 'm365.group.get', 'm365.group.members.list',
+      'm365.group.list', 'm365.group.get', 'm365.group.members.list', 'm365.group.member.get',
       'm365.org.get', 'm365.org.skus.list',
       'm365.report.onedrive.usage.list',
       'm365.sites.list', 'm365.site.get',
@@ -37,10 +45,25 @@ describe('m365 read action contracts', () => {
     }
   });
 
+  it('m365.group.member.get: field map, projection evidence field, and strict GUID-only schema', () => {
+    expect(M365_READ_ACTION_FIELDS['m365.group.member.get']).toEqual(['id', 'displayName', 'userPrincipalName', 'mail']);
+    expect(M365_READ_ACTION_FIELDS['m365.user.get']).toContain('signInSessionsValidFromDateTime');
+    // The Intune retire probe's evidence: retirePending/retireIssued once a retire is accepted.
+    expect(M365_READ_ACTION_FIELDS['m365.intune.device.get']).toContain('managementState');
+    const ids = [...M365_INTERACTIVE_READ_ACTION_IDS];
+    expect(ids.indexOf('m365.group.member.get')).toBe(ids.indexOf('m365.group.members.list') + 1);
+    const ok = { type: 'm365.group.member.get', groupId: GUID, userId: GUID };
+    expect(m365ReadActionSchema.parse(ok)).toEqual(ok);
+    expect(m365ReadActionSchema.safeParse({ ...ok, userId: 'ada@contoso.com' }).success).toBe(false);
+    expect(m365ReadActionSchema.safeParse({ ...ok, extra: 1 }).success).toBe(false);
+    expect(m365ReadActionSchema.safeParse({ type: 'm365.group.member.get', groupId: GUID }).success).toBe(false);
+  });
+
   it('accepts every action variant at its bounds', () => {
     const variants = [
       { type: 'm365.user.list', search: 'ada', accountEnabled: true, pageSize: 50 },
       { type: 'm365.user.get', userIdOrUpn: 'ada@contoso.com' },
+      { type: 'm365.user.mailboxes', userId: GUID },
       { type: 'm365.signins.list', userPrincipalName: 'ada@contoso.com', sinceHours: 168, pageSize: 50 },
       { type: 'm365.intune.device.list', complianceState: 'noncompliant', pageSize: 50 },
       { type: 'm365.intune.device.get', deviceId: GUID },
@@ -193,7 +216,7 @@ describe('m365 sync action contracts', () => {
     }).success).toBe(true);
   });
 
-  it('keeps all thirteen interactive branches, each still .strict()', () => {
+  it('keeps all fifteen interactive branches, each still .strict()', () => {
     // The interactive branches move wholesale from m365ReadActionSchema into
     // INTERACTIVE_BRANCHES. A branch dropped in that cut, or a `.strict()` lost
     // to a retype, is invisible to every other assertion here: the id arrays are
@@ -203,9 +226,9 @@ describe('m365 sync action contracts', () => {
       shape: { type: { value: string } };
     }[]).map((branch) => branch.shape.type.value);
 
-    expect(branchIds).toHaveLength(20);
+    expect(branchIds).toHaveLength(22);
     expect(branchIds.filter((id) => !isM365SyncActionId(id)))
-      .toEqual([...M365_INTERACTIVE_READ_ACTION_IDS]);   // all thirteen, in order
+      .toEqual([...M365_INTERACTIVE_READ_ACTION_IDS]);   // all fifteen, including the fork mailbox read, in order
     expect(branchIds.filter((id) => isM365SyncActionId(id)))
       .toEqual([...M365_SYNC_ACTION_IDS]);
 
@@ -215,12 +238,14 @@ describe('m365 sync action contracts', () => {
     const MINIMAL: Record<M365InteractiveReadActionId, Record<string, unknown>> = {
       'm365.user.list': {},
       'm365.user.get': { userIdOrUpn: 'ada@contoso.com' },
+      'm365.user.mailboxes': { userId: GUID },
       'm365.signins.list': {},
       'm365.intune.device.list': {},
       'm365.intune.device.get': { deviceId: GUID },
       'm365.group.list': {},
       'm365.group.get': { groupId: GUID },
       'm365.group.members.list': { groupId: GUID },
+      'm365.group.member.get': { groupId: GUID, userId: GUID },
       'm365.org.get': {},
       'm365.org.skus.list': {},
       'm365.report.onedrive.usage.list': {},
@@ -279,10 +304,17 @@ describe('m365 sync action contracts', () => {
     expect(m365SyncFailureCodeSchema.safeParse('continuation_invalid').success).toBe(true);
     expect(readActionFailureCodeSchema.safeParse('continuation_invalid').success).toBe(false);
     expect(m365SyncFailureCodeSchema.safeParse('sync_capacity').success).toBe(false);
-    // The sync enum is exactly the read enum plus one code — asserted by
-    // derivation so a future read-enum addition cannot silently skip sync.
+    // #9393: graph_provider_rejected (Graph refused the request, e.g. a 400 on a
+    // bad $filter) is sync-only too — the interactive read path still folds it.
+    expect(m365SyncFailureCodeSchema.safeParse('graph_provider_rejected').success).toBe(true);
+    expect(readActionFailureCodeSchema.safeParse('graph_provider_rejected').success).toBe(false);
+    expect(m365SyncActionResponseSchema.safeParse({
+      success: false, code: 'graph_provider_rejected',
+    }).success).toBe(true);
+    // The sync enum is exactly the read enum plus the sync-only codes — asserted
+    // by derivation so a future read-enum addition cannot silently skip sync.
     expect(m365SyncFailureCodeSchema.options).toEqual([
-      ...readActionFailureCodeSchema.options, 'continuation_invalid',
+      ...readActionFailureCodeSchema.options, 'continuation_invalid', 'graph_provider_rejected',
     ]);
   });
 });

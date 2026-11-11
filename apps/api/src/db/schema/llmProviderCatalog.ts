@@ -2,7 +2,7 @@
 import { boolean, integer, jsonb, pgTable, text, timestamp, uniqueIndex, uuid, index } from 'drizzle-orm/pg-core';
 import { users } from './users';
 
-/** Prices are integer cents per million tokens, matching MODEL_PRICING units. */
+/** Prices are integer cents per million tokens, matching the platform model registry's rate units. */
 export interface LlmProviderModelMapEntry {
   providerModel: string;          // the id sent to the endpoint (e.g. 'anthropic/claude-sonnet-4-6' on OpenRouter)
   inputCentsPerM: number;
@@ -10,7 +10,7 @@ export interface LlmProviderModelMapEntry {
   cacheReadCentsPerM: number;
   cacheWriteCentsPerM: number;
 }
-/** Keyed by OFFERABLE_AI_MODELS logical ids. Only mapped models are selectable. */
+/** Keyed by ai_platform_models.model_id (any non-retired registry model; W01 #7599). Only mapped models are selectable. */
 export type LlmProviderModelMap = Record<string, LlmProviderModelMapEntry>;
 
 export const llmProviderCatalog = pgTable('llm_provider_catalog', {

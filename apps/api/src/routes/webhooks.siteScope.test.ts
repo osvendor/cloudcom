@@ -1,4 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+// The holding-org refusal reads the org; the db mocks below do not model it.
+vi.mock('../services/unassignedPool/protectedOrg', () => ({ isHoldingOrg: vi.fn(async () => false) }));
 import { Hono } from 'hono';
 
 const { authRef, queueDeliveryMock, validateWebhookUrlSafetyWithDnsMock } = vi.hoisted(() => ({
@@ -7,8 +10,8 @@ const { authRef, queueDeliveryMock, validateWebhookUrlSafetyWithDnsMock } = vi.h
   validateWebhookUrlSafetyWithDnsMock: vi.fn(),
 }));
 
-vi.mock('../workers/webhookDelivery', () => ({
-  getWebhookWorker: vi.fn(() => ({ queueDelivery: queueDeliveryMock })),
+vi.mock('../jobs/webhookDeliveryQueue', () => ({
+  enqueueWebhookAttempt: queueDeliveryMock,
 }));
 
 vi.mock('../services/auditEvents', () => ({ writeRouteAudit: vi.fn() }));
@@ -18,7 +21,7 @@ vi.mock('../services/notificationSenders/webhookSender', () => ({
   redactUrlForLogs: (rawUrl: string) => rawUrl,
 }));
 
-vi.mock('../db', () => ({
+vi.mock('../db', () => ({ runAfterDbContextCommit: vi.fn((_label, work) => work()),
   runOutsideDbContext: vi.fn((fn: () => unknown) => fn()),
   withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn()),
   withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),

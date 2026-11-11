@@ -38,6 +38,7 @@ const fakeWs = { send: () => {} } as unknown as Parameters<
 interface Fixture {
   orgId: string;
   partnerId: string;
+  siteId: string;
   deviceId: string;
   agentId: string;
 }
@@ -67,6 +68,7 @@ async function makeFixture(): Promise<Fixture> {
   return {
     orgId: env.organization.id,
     partnerId: env.partner.id,
+    siteId: env.site.id,
     deviceId: device.id,
     agentId,
   };
@@ -93,7 +95,9 @@ async function seedTimedOutRestartService(
       payload: { name: opts.serviceName ?? 'spooler' },
       status: 'failed',
       completedAt: new Date(),
-      result: { status: 'timeout', error: 'Command timed out after 30000ms' },
+      // What waitForCommandResult writes at its deadline, including the
+      // server-only `timedOutBy` marker the reopen predicate requires.
+      result: { status: 'timeout', error: 'Command timed out after 30000ms', timedOutBy: 'server' },
     })
     .returning({ id: deviceCommands.id });
   if (!command) throw new Error('seedTimedOutRestartService: no command');
@@ -128,6 +132,9 @@ async function sendWsResult(
   body: Record<string, unknown>,
 ): Promise<void> {
   const handlers = createAgentWsHandlers(fx.agentId, {
+    agentId: fx.agentId,
+    siteId: fx.siteId,
+    installIncarnation: 1,
     deviceId: fx.deviceId,
     orgId: fx.orgId,
     partnerId: fx.partnerId,

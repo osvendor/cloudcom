@@ -66,6 +66,21 @@ describe('EmailTemplateEditor', () => {
     expect((screen.getByTestId('email-template-html') as HTMLTextAreaElement).value).toBe(defaults.html);
   });
 
+  it('pairs the preview prose class with dark:prose-invert so text stays readable in dark mode (#7177)', () => {
+    render(
+      <EmailTemplateEditor
+        templateId="ticket_comment_notification"
+        value={{ subject: null, heading: null, buttonLabel: null, html: '<p>Preview</p>' }}
+        onBack={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    const preview = screen.getByTestId('email-template-preview');
+    expect(preview).toHaveClass('prose');
+    expect(preview).toHaveClass('dark:prose-invert');
+  });
+
   it('keeps a saved override instead of the default', () => {
     render(
       <EmailTemplateEditor
@@ -232,7 +247,9 @@ describe('EmailTemplateEditor', () => {
     );
 
     for (const key of varsForEmailTemplate(id)) {
-      expect(screen.getByTestId(`email-template-var-${key}`)).toBeTruthy();
+      const chip = screen.getByTestId(`email-template-var-${key}`);
+      expect(chip).toBeTruthy();
+      expect(chip.textContent).not.toBe(`emailTemplates.variables.${key}`);
     }
     if (emailTemplateHasCta(id)) {
       expect(screen.getByTestId('email-template-button-label')).toBeTruthy();

@@ -3,7 +3,10 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // The module pulls in the command queue and the policy resolver; both drag DB /
 // websocket import chains into a DB-less unit run, so they are mocked and the
 // behaviour under test is the delay resolution and the dispatch shape.
-vi.mock('./commandQueue', () => ({ queueCommandForExecution: vi.fn() }));
+vi.mock('./commandQueue', () => ({
+  queueCommandForExecution: vi.fn(),
+  queueCommandForExecutionWithSystemPrecheck: vi.fn(),
+}));
 vi.mock('./featureConfigResolver', () => ({
   checkDeviceMaintenanceWindow: vi.fn(),
   resolvePatchConfigForDevice: vi.fn(),
@@ -24,8 +27,9 @@ import {
   computeRebootDeadline,
   rebootDeferralSettingsFrom,
   resolveRebootDeferralSettings,
+  rebootPromptTextFrom,
 } from './patchRebootHandler';
-import { queueCommandForExecution } from './commandQueue';
+import { queueCommandForExecution, queueCommandForExecutionWithSystemPrecheck } from './commandQueue';
 import { checkDeviceMaintenanceWindow, resolvePatchConfigForDevice } from './featureConfigResolver';
 import { captureException } from './sentry';
 
@@ -167,10 +171,11 @@ describe('executeReboot', () => {
     expect(resolvePatchConfigForDevice).toHaveBeenCalledTimes(1);
   });
 
-  it('skips the policy lookup entirely when the caller supplies delay AND deferral', async () => {
+  it('skips the policy lookup entirely when the caller supplies delay, deferral AND prompt text', async () => {
     await executeReboot('dev-1', 'reason', {
       delayMinutes: 15,
       deferral: { allowDeferral: false, maxDeferrals: 0, deferralMinutes: 0 },
+      promptText: {},
     });
     expect(resolvePatchConfigForDevice).not.toHaveBeenCalled();
   });
@@ -190,11 +195,104 @@ describe('executeReboot', () => {
     const res = await executeReboot('dev-1', 'reason', { delayMinutes: 15 });
     expect(res).toEqual({ success: false, error: 'Device is offline, cannot execute command' });
   });
+
+  // #11065 W04: a vendor update run's reboot says where it came from, and is
+  // queued from outside any DB context, committed before the socket push.
+  it('carries the caller\'s source and commits before delivery when asked', async () => {
+    vi.mocked(queueCommandForExecutionWithSystemPrecheck).mockResolvedValue({ command: { id: 'c-1' } } as never);
+    const res = await executeReboot('dev-1', 'Vendor updates need a restart', {
+      delayMinutes: 15,
+      deferral: DEFERRAL_OFF,
+      promptText: {},
+      expectedOrgId: 'org-9',
+      source: 'oem_updates',
+      commitBeforeDelivery: true,
+    });
+    expect(res).toEqual({ success: true, delayMinutes: 15 });
+    expect(queueCommandForExecution).not.toHaveBeenCalled();
+    expect(queueCommandForExecutionWithSystemPrecheck).toHaveBeenCalledWith(
+      'dev-1',
+      'schedule_reboot',
+      expect.objectContaining({ source: 'oem_updates', delayMinutes: 15, reason: 'Vendor updates need a restart' }),
+      { expectedOrgId: 'org-9' },
+    );
+  });
+
+  it('refuses to commit before delivery without the org it is for', async () => {
+    const res = await executeReboot('dev-1', 'reason', {
+      delayMinutes: 15,
+      deferral: DEFERRAL_OFF,
+      promptText: {},
+      commitBeforeDelivery: true,
+    } as never);
+    expect(res.success).toBe(false);
+    expect(queueCommandForExecutionWithSystemPrecheck).not.toHaveBeenCalled();
+    expect(queueCommandForExecution).not.toHaveBeenCalled();
+  });
 });
 
 // ============================================================================
 // #3207 — end-user reboot deferral
 // ============================================================================
+
+// #11065 W06 — deadlineAction: 'hold' (overnight vendor-update reboot)
+describe('executeReboot deadlineAction (#11065)', () => {
+  const windowEndsAt = new Date(Date.now() + 3 * 60 * 60_000);
+
+  it('sends no deadlineAction key when the caller did not ask for one', async () => {
+    vi.mocked(resolvePatchConfigForDevice).mockResolvedValue({ rebootDelayMinutes: 15 } as never);
+    await executeReboot('dev-1', 'reason', { windowEndsAt });
+    expect(payloadOf()).not.toHaveProperty('deadlineAction');
+  });
+
+  it('hold sends the action and makes the deadline the window close', async () => {
+    const res = await executeReboot('dev-1', 'Vendor updates', {
+      delayMinutes: 15,
+      deferral: DEFERRAL_OFF,
+      promptText: {},
+      windowEndsAt,
+      deadlineAction: 'hold',
+    });
+    expect(res).toEqual({ success: true, delayMinutes: 15 });
+    const payload = payloadOf();
+    expect(payload.deadlineAction).toBe('hold');
+    // With deferral off a forced reboot's deadline is the scheduled time; a held
+    // one's is the close, so a late timer inside the window still restarts.
+    expect(payload.deadline).toBe(windowEndsAt.toISOString());
+  });
+
+  it('hold keeps the policy deferral budget and the deadline stays the window close', async () => {
+    // A budget far smaller than the window: computeRebootDeadline alone would put
+    // the deadline at now + 15 + 5 minutes. Hold must use the close itself.
+    const deferral = { allowDeferral: true, maxDeferrals: 1, deferralMinutes: 5 };
+    await executeReboot('dev-1', 'Vendor updates', {
+      delayMinutes: 15, deferral, promptText: {}, windowEndsAt, deadlineAction: 'hold',
+    });
+    const payload = payloadOf();
+    expect(payload).toMatchObject({ allowDeferral: true, maxDeferrals: 1, deferralMinutes: 5 });
+    expect(payload.deadline).toBe(windowEndsAt.toISOString());
+  });
+
+  it('refuses a hold without a window close, and queues nothing', async () => {
+    const res = await executeReboot('dev-1', 'Vendor updates', {
+      delayMinutes: 15, deferral: DEFERRAL_OFF, promptText: {}, deadlineAction: 'hold',
+    });
+    expect(res.success).toBe(false);
+    expect(queueCommandForExecution).not.toHaveBeenCalled();
+  });
+
+  it('refuses a hold whose restart would begin after the window closes', async () => {
+    const res = await executeReboot('dev-1', 'Vendor updates', {
+      delayMinutes: 60,
+      deferral: DEFERRAL_OFF,
+      promptText: {},
+      windowEndsAt: new Date(Date.now() + 10 * 60_000),
+      deadlineAction: 'hold',
+    });
+    expect(res.success).toBe(false);
+    expect(queueCommandForExecution).not.toHaveBeenCalled();
+  });
+});
 
 function payloadOf(): Record<string, unknown> {
   const call = vi.mocked(queueCommandForExecution).mock.calls[0];
@@ -402,6 +500,104 @@ describe('executeReboot deferral payload (#3207)', () => {
     const payload = payloadOf();
     expect(payload.maxDeferrals).toBe(1);
     expect(payload.deferralMinutes).toBe(10);
+  });
+});
+
+describe('restart-prompt text (#8030)', () => {
+  const policy = {
+    rebootDelayMinutes: 15, rebootAllowDeferral: false,
+    rebootMaxDeferrals: 3, rebootDeferralMinutes: 60,
+  };
+
+  it('omits every prompt key when the policy sets no text, so the agent keeps its built-in copy', async () => {
+    vi.mocked(resolvePatchConfigForDevice).mockResolvedValue({
+      ...policy, rebootPromptTitle: null, rebootPromptBody: null, rebootPromptButton: null,
+    } as never);
+
+    await executeReboot('dev-1', 'Patch install');
+
+    const payload = payloadOf();
+    expect(payload).not.toHaveProperty('promptTitle');
+    expect(payload).not.toHaveProperty('promptBody');
+    expect(payload).not.toHaveProperty('promptButton');
+  });
+
+  it('sends the text the device policy resolves to', async () => {
+    vi.mocked(resolvePatchConfigForDevice).mockResolvedValue({
+      ...policy,
+      rebootPromptTitle: 'Neustart geplant',
+      rebootPromptBody: 'Neustart in {{countdown}}.',
+      rebootPromptButton: 'Jetzt neu starten',
+    } as never);
+
+    await executeReboot('dev-1', 'Patch install');
+
+    expect(payloadOf()).toMatchObject({
+      promptTitle: 'Neustart geplant',
+      promptBody: 'Neustart in {{countdown}}.',
+      promptButton: 'Jetzt neu starten',
+    });
+  });
+
+  it('sends only the fields that are set', async () => {
+    vi.mocked(resolvePatchConfigForDevice).mockResolvedValue({
+      ...policy, rebootPromptTitle: null, rebootPromptBody: 'Body {{countdown}}', rebootPromptButton: '',
+    } as never);
+
+    await executeReboot('dev-1', 'Patch install');
+
+    const payload = payloadOf();
+    expect(payload.promptBody).toBe('Body {{countdown}}');
+    expect(payload).not.toHaveProperty('promptTitle');
+    expect(payload).not.toHaveProperty('promptButton');
+  });
+
+  it('drops a stored value that fails validation and reports it, rather than shipping it', async () => {
+    vi.mocked(resolvePatchConfigForDevice).mockResolvedValue({
+      ...policy,
+      rebootPromptTitle: '<b>Restart</b>',
+      rebootPromptBody: 'x'.repeat(501),
+      rebootPromptButton: 'OK',
+    } as never);
+
+    await executeReboot('dev-1', 'Patch install');
+
+    const payload = payloadOf();
+    expect(payload).not.toHaveProperty('promptTitle');
+    expect(payload).not.toHaveProperty('promptBody');
+    expect(payload.promptButton).toBe('OK');
+    expect(captureException).toHaveBeenCalled();
+  });
+
+  it('sends no text when the policy lookup fails', async () => {
+    vi.mocked(resolvePatchConfigForDevice).mockRejectedValue(new Error('db down'));
+
+    await executeReboot('dev-1', 'Patch install');
+
+    expect(payloadOf()).not.toHaveProperty('promptBody');
+  });
+
+  it('resolves the text from the policy even when the caller supplies delay and deferral', async () => {
+    vi.mocked(resolvePatchConfigForDevice).mockResolvedValue({
+      ...policy, rebootPromptTitle: 'Titel', rebootPromptBody: null, rebootPromptButton: null,
+    } as never);
+
+    await executeReboot('dev-1', 'reason', { delayMinutes: 20, deferral: DEFERRAL_OFF });
+
+    expect(payloadOf().promptTitle).toBe('Titel');
+  });
+
+  it('skips the policy walk only when the caller supplies delay, deferral and prompt text', async () => {
+    await executeReboot('dev-1', 'reason', {
+      delayMinutes: 20, deferral: DEFERRAL_OFF, promptText: { body: 'Hi {{countdown}}' },
+    });
+
+    expect(resolvePatchConfigForDevice).not.toHaveBeenCalled();
+    expect(payloadOf().promptBody).toBe('Hi {{countdown}}');
+  });
+
+  it('rebootPromptTextFrom returns an empty object for no settings', () => {
+    expect(rebootPromptTextFrom(null, 'dev-1')).toEqual({});
   });
 });
 

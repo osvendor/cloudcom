@@ -10,7 +10,9 @@
 
 import { hasSatisfiedMfa, type AuthContext } from '../middleware/auth';
 import type { AiTool } from './aiTools';
-import { listReliabilityDevices } from './reliabilityScoring';
+import { FLEET_HEALTH_ACTIONS } from './aiToolSchemasAlertTriage';
+import { listReliabilityDevices, summarizeReliabilityDevices, type ReliabilityListItem } from './reliabilityScoring';
+import { pageEnvelope, pageParamSchema, readPageArgs } from './aiToolPagination';
 import {
   assignSecurityTraining,
   getUserRiskDetail,
@@ -19,37 +21,36 @@ import {
 } from './userRiskScoring';
 import { sanitizeThrownToolError } from './aiToolErrors';
 import { filterToDeviceScope, runFrozenDeviceIds } from './aiToolsSiteScope';
+import { resolveWritableToolOrgId } from './aiToolWriteOrg';
+import { runFleetHealthAction } from './aiToolsReliabilityTriage';
 
 type AiToolTier = 1 | 2 | 3 | 4;
 
-function resolveWritableToolOrgId(
-  auth: AuthContext,
-  inputOrgId?: string
-): { orgId?: string; error?: string } {
-  if (auth.scope === 'organization') {
-    if (!auth.orgId) return { error: 'Organization context required' };
-    if (inputOrgId && inputOrgId !== auth.orgId) {
-      return { error: 'Cannot access another organization' };
-    }
-    return { orgId: auth.orgId };
-  }
+// #6745 (A-W05 follow-up): the largest page of realistic reliability rows that
+// fits the chat budget uncompacted (aiToolsUserRisk.outputShape.test.ts).
+const FLEET_HEALTH_DEFAULT_LIMIT = 15;
+const FLEET_HEALTH_MAX_LIMIT = 100;
 
-  if (inputOrgId) {
-    if (!auth.canAccessOrg(inputOrgId)) {
-      return { error: 'Access denied to this organization' };
-    }
-    return { orgId: inputOrgId };
-  }
-
-  if (auth.orgId) {
-    return { orgId: auth.orgId };
-  }
-
-  if (Array.isArray(auth.accessibleOrgIds) && auth.accessibleOrgIds.length === 1) {
-    return { orgId: auth.accessibleOrgIds[0] };
-  }
-
-  return { error: 'orgId is required for this operation' };
+/**
+ * topIssues (a jsonb list per device) is opt-in; its size is always reported.
+ *
+ * #7131: `topIssueCount`/`topIssues` lead, ahead of the `rest` spread. The
+ * chat compactor's tightest tier caps an object at a fixed number of keys
+ * (`Object.entries(...).slice(0, maxObjectKeys)`), keeping only the first N
+ * in insertion order — with these appended last (as before), an 18-field
+ * device row silently lost both to that cap under the tightest tier's 15-key
+ * limit, dropping exactly the "what's wrong" data this tool exists to
+ * answer. Leading with them means a lower-priority reliability stat (e.g.
+ * `mtbfHours`) gets dropped instead.
+ */
+function shapeReliabilityRow(row: ReliabilityListItem, includeTopIssues: boolean): Record<string, unknown> {
+  const { topIssues, drivers: _drivers, enrolledAt: _enrolledAt, ...rest } = row;
+  return {
+    topIssueCount: Array.isArray(topIssues) ? topIssues.length : 0,
+    ...(includeTopIssues ? { topIssues } : {}),
+    ...rest,
+    provisional: row.provisional,
+  };
 }
 
 export function registerUserRiskTools(aiTools: Map<string, AiTool>): void {
@@ -65,23 +66,36 @@ export function registerUserRiskTools(aiTools: Map<string, AiTool>): void {
     tier: 1 as AiToolTier,
     domain: 'devices',
     searchHint: 'fleet device reliability, uptime, crashes, hangs, hardware and service failures',
+    alwaysLoad: true,
+    deviceArgs: ['deviceId'],
     definition: {
       name: 'get_fleet_health',
-      description: 'Query device reliability scores across the fleet. Returns devices ranked by reliability (worst first) with uptime, crash history, and failure metrics.',
+      description: 'Device reliability scores, worst first, with uptime, crash and failure metrics; the summary covers every matching device. topIssues are opt-in. Actions: list (default),history,offenders (deviceId),evaluation,org_summary (orgId).',
       input_schema: {
         type: 'object' as const,
         properties: {
-          orgId: { type: 'string', description: 'Optional org UUID (must be accessible)' },
+          action: { type: 'string', enum: [...FLEET_HEALTH_ACTIONS], description: 'list (default) | history | offenders | evaluation | org_summary' },
+          deviceId: { type: 'string', description: 'history/offenders: device UUID' },
+          days: { type: 'number', description: 'history (default 90) / offenders (default 30): lookback days, 1-365' },
+          topN: { type: 'number', description: 'offenders: rows per category (default 5, max 20)' },
+          atRiskMaxScore: { type: 'number', description: 'evaluation: at-risk score ceiling (default 70)' },
+          labelWindowDays: { type: 'number', description: 'evaluation: feedback window in days (default 90)' },
+          orgId: { type: 'string', description: 'Optional org UUID (must be accessible); required for org_summary' },
           siteId: { type: 'string', description: 'Optional site UUID' },
           scoreRange: { type: 'string', enum: ['critical', 'poor', 'fair', 'good'], description: 'Score range filter' },
           trendDirection: { type: 'string', enum: ['improving', 'stable', 'degrading'], description: 'Trend direction filter' },
           issueType: { type: 'string', enum: ['crashes', 'hangs', 'hardware', 'services', 'uptime'], description: 'Issue-type filter' },
-          limit: { type: 'number', description: 'Maximum results (default 25, max 100)' },
+          includeTopIssues: { type: 'boolean', description: 'Include each device\'s topIssues list (default false; topIssueCount is always returned)' },
+          ...pageParamSchema(FLEET_HEALTH_DEFAULT_LIMIT, FLEET_HEALTH_MAX_LIMIT),
         }
       }
     },
     handler: async (input, auth) => {
       try {
+        // W07 (#6777): history / offenders / evaluation / org_summary; the default list falls through.
+        const triage = await runFleetHealthAction(input, auth);
+        if (triage !== null) return triage;
+
         if (typeof input.orgId === 'string' && input.orgId && !auth.canAccessOrg(input.orgId)) {
           return JSON.stringify({ error: 'Access denied to this organization' });
         }
@@ -104,7 +118,8 @@ export function registerUserRiskTools(aiTools: Map<string, AiTool>): void {
           ? auth.allowedSiteIds
           : undefined;
 
-        const limit = Math.min(Math.max(1, Number(input.limit) || 25), 100);
+        const page = readPageArgs('get_fleet_health', input, { defaultLimit: FLEET_HEALTH_DEFAULT_LIMIT, maxLimit: FLEET_HEALTH_MAX_LIMIT });
+        if (!page.ok) return JSON.stringify({ error: page.error, code: page.code });
         const scoreRange = (typeof input.scoreRange === 'string' && ['critical', 'poor', 'fair', 'good'].includes(input.scoreRange))
           ? input.scoreRange as 'critical' | 'poor' | 'fair' | 'good'
           : undefined;
@@ -115,45 +130,44 @@ export function registerUserRiskTools(aiTools: Map<string, AiTool>): void {
           ? input.issueType as 'crashes' | 'hangs' | 'hardware' | 'services' | 'uptime'
           : undefined;
 
-        const { total: fleetTotal, rows: fleetRows } = await listReliabilityDevices({
+        // Exact-device axis: pushed INTO the query (#6745), so `total`, the
+        // summary and the page are all computed over the caller's own device
+        // set. Before, the page was fetched fleet-wide and narrowed after the
+        // LIMIT, which made paging impossible and the counts page-sized. The
+        // site axis is NOT a substitute — a device-less analysis run carries
+        // `allowedDeviceIds` with no `allowedSiteIds` (#6086 finding 8).
+        const frozenDeviceIds = runFrozenDeviceIds(auth) ?? undefined;
+        const filter = {
           orgIds,
           siteId: requestedSiteId,
           siteIds,
           scoreRange,
           trendDirection,
           issueType,
-          limit,
-          offset: 0,
-        });
+          deviceIds: frozenDeviceIds,
+        };
+        const [{ total, rows: fleetRows }, summary] = await Promise.all([
+          listReliabilityDevices({ ...filter, limit: page.limit, offset: page.offset }),
+          summarizeReliabilityDevices(filter),
+        ]);
 
-        // Exact-device axis: `listReliabilityDevices` takes no device filter and
-        // lives outside this module, so narrow its result here. The site axis
-        // above is NOT a substitute — a device-less analysis run carries
-        // `allowedDeviceIds` with no `allowedSiteIds`, so `siteIds` stays
-        // undefined and the read is fleet-wide (#6086 finding 8). `total` is the
-        // pre-narrowing org count, which would itself disclose sibling devices,
-        // so a restricted caller gets the narrowed count instead.
-        const frozenDeviceIds = runFrozenDeviceIds(auth);
+        // Defense in depth: the SQL filter above already narrows; never let a
+        // sibling row through even if it did not.
         const rows = frozenDeviceIds
           ? filterToDeviceScope(auth, fleetRows, (row) => row.deviceId)
           : fleetRows;
-        const total = frozenDeviceIds ? rows.length : fleetTotal;
 
-        const avgScore = rows.length > 0
-          ? Math.round(rows.reduce((sum, row) => sum + row.reliabilityScore, 0) / rows.length)
-          : 0;
-
+        const { total: _summaryTotal, ...summaryCounts } = summary;
         return JSON.stringify({
-          devices: rows,
-          total,
-          summary: {
-            averageScore: avgScore,
-            criticalDevices: rows.filter((row) => row.reliabilityScore <= 50).length,
-            poorDevices: rows.filter((row) => row.reliabilityScore >= 51 && row.reliabilityScore <= 70).length,
-            fairDevices: rows.filter((row) => row.reliabilityScore >= 71 && row.reliabilityScore <= 85).length,
-            goodDevices: rows.filter((row) => row.reliabilityScore >= 86).length,
-            degradingDevices: rows.filter((row) => row.trendDirection === 'degrading').length,
-          },
+          ...pageEnvelope({
+            key: 'devices',
+            items: rows.map((row) => shapeReliabilityRow(row, input.includeTopIssues === true)),
+            limit: page.limit,
+            offset: page.offset,
+            fingerprint: page.fingerprint,
+            total,
+          }),
+          summary: summaryCounts,
         });
       } catch (err) {
         const message = sanitizeThrownToolError('user-risk', err);
@@ -264,9 +278,11 @@ export function registerUserRiskTools(aiTools: Map<string, AiTool>): void {
         return JSON.stringify({ error: 'userId is required' });
       }
 
+      // A read: never answered from the device-page write default (#6675).
       const resolved = resolveWritableToolOrgId(
         auth,
-        typeof input.orgId === 'string' ? input.orgId : undefined
+        typeof input.orgId === 'string' ? input.orgId : undefined,
+        { useWriteDefault: false },
       );
       if (resolved.error || !resolved.orgId) {
         return JSON.stringify({ error: resolved.error ?? 'orgId is required for this operation' });

@@ -9,7 +9,8 @@ import { CommandTypes } from './commandTypes';
 export type OfflinePolicy = { kind: 'reject' } | { kind: 'queue'; deliverWithinMs: number };
 
 /** TTL class = how long a queued row may wait for the device (OD-1). */
-export type DeliveryTtlClass = 'live' | 'live_only' | 'standard' | 'short' | 'power_state';
+export type DeliveryTtlClass =
+  'live' | 'live_only' | 'standard' | 'short' | 'power_state' | 'time_sync';
 
 /**
  * The `live` TTL class's nominal window. It is NOT stamped on `reject` rows —
@@ -69,6 +70,10 @@ export function deliveryTtlMs(cls: DeliveryTtlClass): number {
       return envHours('DEVICE_COMMAND_QUEUE_SHORT_TTL_HOURS', 24) * HOUR_MS;
     case 'power_state':
       return envHours('DEVICE_COMMAND_QUEUE_POWER_STATE_TTL_HOURS', 24) * HOUR_MS;
+    case 'time_sync':
+      // Time management (#7452 W03a, index §F.4): a resync or timezone fix
+      // that lands a day late acts on stale intent. Fixed, not env-tunable.
+      return HOUR_MS;
   }
 }
 
@@ -79,6 +84,15 @@ const C = CommandTypes;
  * synchronous answer, so an offline device is a hard `device_offline`.
  */
 const LIVE: readonly string[] = [
+  // Endpoint live chat (#8743): a chat line delivered hours later, to whoever
+  // is signed in by then, is worse than a refused send. The route refuses an
+  // offline device instead (`device_offline`).
+  C.CHAT_OPEN,
+  C.CHAT_MESSAGE,
+  C.CHAT_CLOSE,
+  // Caller verification (#6354 W02): a challenge with its own short deadline;
+  // delivering it after the caller hung up would prompt a user out of context.
+  C.CALLER_VERIFY,
   C.LIST_PROCESSES,
   C.GET_PROCESS,
   C.KILL_PROCESS,
@@ -105,6 +119,8 @@ const LIVE: readonly string[] = [
   C.REGISTRY_KEY_DELETE,
   C.FILE_LIST,
   C.FILE_READ,
+  C.DIAG_FILE_LIST,
+  C.DIAG_FILE_READ,
   C.FILE_WRITE,
   C.FILE_DELETE,
   C.FILE_MKDIR,
@@ -141,6 +157,16 @@ const LIVE: readonly string[] = [
   // Cancels work the agent is running RIGHT NOW; a queued one would arrive
   // long after the run it names has expired.
   C.NETWORK_DIAGNOSTIC_CANCEL,
+  // A standing interface poll (M3-D2) is minted per arm interval, carries its
+  // own absolute expiry and is revalidated against the arm's current authority
+  // at delivery. A queued one would deliver a poll for a window that has
+  // already passed; the arm simply mints the next one when the collector is
+  // back, so an offline collector is a rejection, never a queued row.
+  C.TOPOLOGY_INTERFACE_POLL,
+  // Vendor updates (#11065): refused for an offline device. The seam
+  // (services/oemUpdates/dispatch.ts) stamps deliver_by from the run's notAfter,
+  // so a device that drops offline after dispatch cannot start past its window.
+  C.OEM_UPDATE_RUN,
   // Non-CommandTypes literals whose only dispatch path is `executeCommand`,
   // which waits for the result synchronously (`waitForCommandResult`) — the one
   // combination the design forbids pairing with `queue` (#5128 §A). The two
@@ -191,6 +217,13 @@ const BACKUP_AND_RESTORE: readonly string[] = [
 const LIVE_ONLY: readonly string[] = [
   C.SYSTEM_CLEANUP_LIST,
   C.SYSTEM_CLEANUP_RUN,
+  // #8729: "Force reboot now" means now. Plain `reboot` waits up to a day for
+  // an offline device; a force-close of unsaved work landing on a laptop hours
+  // later, while someone is using it, is exactly the wrong outcome. The route
+  // also refuses an offline device up front. Still behind the power-state
+  // barrier (commandClaimEligibility.ts), so a reboot held by in-flight work
+  // expires visibly instead of firing late.
+  C.FORCE_REBOOT,
 ];
 
 /**
@@ -217,6 +250,10 @@ const SHORT: readonly string[] = [
   'set_auto_update',
   // Policy push that converges: the next sync supersedes a stale one.
   'apply_browser_policy',
+  // #8928 PAM outcome notice. The enqueue stamps its own 60-minute deliverBy
+  // (insertQueuedCommandInTransaction does not consult this policy); `short`
+  // is the classification for any other caller.
+  C.PAM_REQUEST_NOTIFY,
 ];
 
 /**
@@ -265,6 +302,7 @@ const STANDARD_REVIEWED: readonly string[] = [
   C.SOFTWARE_UNINSTALL,
   C.SOFTWARE_UPDATE,
   C.HOMEBREW_BOOTSTRAP,
+  C.PAM_RECONCILE_V2,
   C.CIS_BENCHMARK,
   C.APPLY_CIS_REMEDIATION,
   C.PATCH_SCAN,
@@ -282,11 +320,27 @@ const STANDARD_REVIEWED: readonly string[] = [
   C.APPLY_AUDIT_POLICY_BASELINE,
   C.FILESYSTEM_ANALYSIS,
   C.SELF_UNINSTALL,
+  // Endpoint messages queue for an offline device; the send route caps each
+  // one at min(expiresAt, standard TTL) via an explicit deliverBy (#8293).
+  C.NOTIFY_USER,
+  // Its retraction lives as long as the message can: the retract route caps
+  // deliverBy at min(message expiresAt, standard TTL) (#8742).
+  C.RETRACT_MESSAGE,
   C.VAULT_SYNC,
   C.VAULT_CONFIGURE,
   C.COLLECT_EVIDENCE,
   C.EXECUTE_CONTAINMENT,
+  C.RELEASE_CONTAINMENT,
   C.SYSTEM_STATE_COLLECT,
+  // Vendor updates (#11065): a policy removal must hand the vendor tool's
+  // schedule back even if the device is offline right now, so it queues.
+  C.OEM_UPDATE_RELEASE,
+];
+
+const TIME_SYNC: readonly string[] = [
+  C.TIME_RESYNC,
+  C.TIME_SET_TIMEZONE,
+  C.TIME_APPLY_POLICY,
 ];
 
 // Build the registry from CommandTypes so a NEW type cannot be added without
@@ -301,6 +355,7 @@ for (const type of BACKUP_AND_RESTORE) registry[type] = 'live';
 for (const type of LIVE_ONLY) registry[type] = 'live_only';
 for (const type of SHORT) registry[type] = 'short';
 for (const type of POWER_STATE_TTL_TYPES) registry[type] = 'power_state';
+for (const type of TIME_SYNC) registry[type] = 'time_sync';
 registry.wake = 'live';
 
 export const COMMAND_OFFLINE_POLICY_REGISTRY: Readonly<Record<string, DeliveryTtlClass>> = Object.freeze(registry);
@@ -314,7 +369,15 @@ export const COMMAND_OFFLINE_POLICY_REGISTRY: Readonly<Record<string, DeliveryTt
  * an oversight.
  */
 export const EXPLICITLY_CLASSIFIED_COMMAND_TYPES: ReadonlySet<string> = Object.freeze(
-  new Set<string>([...LIVE, ...LIVE_ONLY, ...BACKUP_AND_RESTORE, ...SHORT, ...POWER_STATE_TTL_TYPES, ...STANDARD_REVIEWED]),
+  new Set<string>([
+    ...LIVE,
+    ...LIVE_ONLY,
+    ...BACKUP_AND_RESTORE,
+    ...SHORT,
+    ...POWER_STATE_TTL_TYPES,
+    ...STANDARD_REVIEWED,
+    ...TIME_SYNC,
+  ]),
 ) as ReadonlySet<string>;
 
 export function defaultOfflinePolicy(type: string): OfflinePolicy {

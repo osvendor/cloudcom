@@ -29,6 +29,11 @@ const { evaluateCapability, partnerTrustMode, requireCapability } = vi.hoisted((
   };
 });
 
+// services/aiAgent.ts (reached transitively) resolves session models through
+// the registry (W03 #7601); stub its DB adapters under this partial schema mock.
+vi.mock('../services/aiModels/sessionModel', () => ({ chooseSessionModel: vi.fn() }));
+vi.mock('../services/aiModels/candidateLoader', () => ({ readOrgPartnerId: vi.fn() }));
+
 vi.mock('../services/partnerTrust', () => ({ evaluateCapability, requireCapability }));
 vi.mock('../config/partnerTrustMode', () => ({ partnerTrustMode }));
 
@@ -92,7 +97,10 @@ vi.mock('../services/permissions', () => ({
       const parts = prop.toLowerCase().split('_');
       return { resource: parts[0], action: parts.slice(1).join('_') };
     }
-  })
+  }),
+  // GET /devices/:id lists the Connect menu's tools only for a remote:access
+  // holder (#10922). Not the subject of this suite, so the menu stays empty.
+  hasPermission: vi.fn(() => false),
 }));
 
 vi.mock('drizzle-orm', () => {
@@ -111,8 +119,10 @@ vi.mock('drizzle-orm', () => {
     and: vi.fn((...args: unknown[]) => ({ and: args })),
     gte: vi.fn((...args: unknown[]) => ({ gte: args })),
     like: vi.fn((...args: unknown[]) => ({ like: args })),
+    ilike: vi.fn((...args: unknown[]) => ({ ilike: args })),
     sql: sqlTag,
     desc: vi.fn((col: unknown) => ({ desc: col })),
+    asc: vi.fn((col: unknown) => ({ asc: col })),
     inArray: vi.fn((...args: unknown[]) => ({ inArray: args })),
     // #5128: the decommission transaction cancels the device's pending
     // commands EXCEPT self_uninstall, so it needs `ne`.
@@ -149,6 +159,10 @@ vi.mock('../services/dispatchDeviceCommand', () => ({
 // calls are hoisted above top-level variable initializers, so a `dbMock`
 // declared outside this factory and merely referenced inside it would throw
 // "Cannot access 'dbMock' before initialization" at import time.
+// PATCH /devices/:id requests a dynamic-group re-evaluation after commit (#8832);
+// stub the producer (covered in jobs/deviceGroupJobs.test.ts).
+vi.mock('../jobs/deviceGroupJobs', () => ({ requestDeviceGroupReevaluationAfterCommit: vi.fn() }));
+
 vi.mock('../db', () => {
   const dbMock: Record<string, ReturnType<typeof vi.fn>> = {
     select: vi.fn(() => ({
@@ -209,6 +223,10 @@ vi.mock('../services/deviceUninstallDrain', () => ({
 }));
 
 vi.mock('../db/schema', async (importOriginal) => ({
+  deviceReliabilityBaselines: { id: 'id', deviceId: 'deviceId', baselineAt: 'baselineAt', createdAt: 'createdAt', clearedAt: 'clearedAt', reason: 'reason', source: 'source' },
+  // services/patchSeverityOverlay.ts builds module-level SQL fragments from these at import time.
+  patches: { severity: 'patches.severity', category: 'patches.category' },
+  devicePatches: { reportedSeverity: 'device_patches.reported_severity', reportedCategory: 'device_patches.reported_category' },
   // routes/devices/actuateElevation.ts calls drizzle's alias(users, …) at
   // import time (#4913), which needs a real table, not a plain-object stub.
   users: (await importOriginal<typeof import('../db/schema')>()).users,
@@ -216,7 +234,8 @@ vi.mock('../db/schema', async (importOriginal) => ({
   auditLogs: { actorType: 'actorType', details: 'details', timestamp: 'timestamp', action: 'action' },
   devices: { id: 'id', orgId: 'orgId', siteId: 'siteId', status: 'status', hostname: 'hostname', displayName: 'displayName', osType: 'osType', lastSeenAt: 'lastSeenAt', createdAt: 'createdAt', updatedAt: 'updatedAt', tags: 'tags', agentVersion: 'agentVersion' },
   deviceHardware: { deviceId: 'deviceId' },
-  deviceReliability: { deviceId: 'deviceId', reliabilityScore: 'reliabilityScore', trendDirection: 'trendDirection' },
+  deviceReliability: { deviceId: 'deviceId', details: 'details', reliabilityScore: 'reliabilityScore', trendDirection: 'trendDirection' },
+  deviceHardwareHealth: { deviceId: 'hardwareDeviceId', health: 'hardwareHealth', summary: 'hardwareHealthSummary' },
   deviceNetwork: { deviceId: 'deviceId' },
   deviceMetrics: { deviceId: 'deviceId', timestamp: 'timestamp' },
   deviceSoftware: { deviceId: 'deviceId' },
@@ -230,7 +249,7 @@ vi.mock('../db/schema', async (importOriginal) => ({
     requestedAt: 'requestedAt', approvedAt: 'approvedAt', bytesReclaimed: 'bytesReclaimed',
     error: 'error', plan: 'plan', executedActions: 'executedActions',
   },
-  sites: { id: 'id', orgId: 'orgId' },
+  sites: { id: 'id', orgId: 'orgId', createdAt: 'createdAt' },
   organizations: { id: 'id' },
   enrollmentKeys: { id: 'id', key: 'key', orgId: 'orgId' },
   deviceStatusEnum: { enumValues: ['online', 'offline', 'maintenance', 'decommissioned', 'quarantined', 'updating', 'pending'] },
@@ -261,6 +280,7 @@ vi.mock('../middleware/auth', () => ({
     return next();
   }),
   requireScope: vi.fn(() => async (_c: any, next: any) => next()),
+  withAuthDbAccessContext: vi.fn(async (_auth: unknown, fn: () => Promise<unknown>) => fn()),
   requirePermission: vi.fn((resource: string, action: string) => async (c: any, next: any) => {
     // Populate the `permissions` context value so getDeviceWithOrgAndSiteCheck
     // doesn't trip its "called without requirePermission" 500 safety throw.
@@ -284,6 +304,14 @@ vi.mock('../middleware/auth', () => ({
 
 import { db } from '../db';
 import { queueDeviceUninstall } from '../services/deviceUninstallDrain';
+
+// Site lookup chain for POST /devices/onboarding-token: the explicit-siteId
+// path ends in `.where().limit()`, the default path in
+// `.where().orderBy().limit()` (#7035), so expose both.
+function siteRows(rows: Array<{ id: string }>) {
+  const limit = vi.fn().mockResolvedValue(rows);
+  return { limit, orderBy: vi.fn(() => ({ limit })) };
+}
 
 describe('device routes', () => {
   let app: Hono;
@@ -378,9 +406,7 @@ describe('device routes', () => {
     it('limits automatic site selection to the caller site allowlist', async () => {
       const allowedSiteId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
       permissionSiteScope.allowedSiteIds = [allowedSiteId];
-      const where = vi.fn().mockReturnValue({
-        limit: vi.fn().mockResolvedValue([{ id: allowedSiteId }]),
-      });
+      const where = vi.fn().mockReturnValue(siteRows([{ id: allowedSiteId }]));
       vi.mocked(db.select).mockReturnValueOnce({
         from: vi.fn().mockReturnValue({ where }),
       } as any);
@@ -395,6 +421,147 @@ describe('device routes', () => {
       expect(res.status).toBe(200);
       expect(JSON.stringify(where.mock.calls[0]![0])).toContain(allowedSiteId);
       expect(values).toHaveBeenCalledWith(expect.objectContaining({ siteId: allowedSiteId }));
+    });
+
+    // #11116: the web modal needs the minted key's id to run GET
+    // /enrollment-keys/:id on a remembered CLI token. The row id is chosen by
+    // the route and written in the insert, so the response id is the stored id.
+    it('returns the minted key id alongside the token (#11116)', async () => {
+      const siteId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({ where: vi.fn().mockReturnValue(siteRows([{ id: siteId }])) }),
+      } as any);
+      const values = vi.fn().mockResolvedValue(undefined);
+      vi.mocked(db.insert).mockReturnValueOnce({ values } as any);
+
+      const res = await app.request('/devices/onboarding-token', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.token).toMatch(/^enroll_/);
+      expect(body.childKeyId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+      expect(values).toHaveBeenCalledWith(expect.objectContaining({ id: body.childKeyId }));
+    });
+
+    // #7035: the automatic pick used to be `WHERE org_id = ? LIMIT 1` with no
+    // ORDER BY, so a multi-site org's CLI key landed on whatever row Postgres
+    // returned first. The documented default is the org's oldest site
+    // (created_at, then id as a tiebreak) — the same rule mintChildEnrollmentKey uses.
+    it('picks the oldest site deterministically when no siteId is sent (#7035)', async () => {
+      const limit = vi.fn().mockResolvedValue([{ id: 'site-oldest' }]);
+      const orderBy = vi.fn().mockReturnValue({ limit });
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({ orderBy, limit }),
+        }),
+      } as any);
+      const values = vi.fn().mockResolvedValue(undefined);
+      vi.mocked(db.insert).mockReturnValueOnce({ values } as any);
+
+      const res = await app.request('/devices/onboarding-token', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(200);
+      expect(orderBy).toHaveBeenCalledTimes(1);
+      expect(orderBy.mock.calls[0]).toHaveLength(2);
+      expect(values).toHaveBeenCalledWith(expect.objectContaining({ siteId: 'site-oldest' }));
+    });
+
+    it('mints into the caller-selected siteId after checking it belongs to the org (#7035)', async () => {
+      const chosenSiteId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+      const limit = vi.fn().mockResolvedValue([{ id: chosenSiteId }]);
+      const where = vi.fn().mockReturnValue({ limit, orderBy: vi.fn(() => ({ limit })) });
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({ where }),
+      } as any);
+      const values = vi.fn().mockResolvedValue(undefined);
+      vi.mocked(db.insert).mockReturnValueOnce({ values } as any);
+
+      const res = await app.request('/devices/onboarding-token', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ count: 3, siteId: chosenSiteId }),
+      });
+
+      expect(res.status).toBe(200);
+      const predicate = JSON.stringify(where.mock.calls[0]![0]);
+      expect(predicate).toContain(chosenSiteId);
+      expect(predicate).toContain('org-123');
+      expect(values).toHaveBeenCalledWith(expect.objectContaining({ siteId: chosenSiteId, maxUsage: 3 }));
+    });
+
+    it('rejects a siteId that is not in the target organization (#7035)', async () => {
+      const limit = vi.fn().mockResolvedValue([]);
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({ limit, orderBy: vi.fn(() => ({ limit })) }),
+        }),
+      } as any);
+
+      const res = await app.request('/devices/onboarding-token', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ siteId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc' }),
+      });
+
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toBe('siteId does not belong to the specified org');
+      expect(limit).toHaveBeenCalledTimes(1);
+      expect(db.insert).not.toHaveBeenCalled();
+    });
+
+    it('denies a siteId outside the caller site allowlist before any lookup (#7035)', async () => {
+      permissionSiteScope.allowedSiteIds = ['aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'];
+
+      const res = await app.request('/devices/onboarding-token', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ siteId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' }),
+      });
+
+      expect(res.status).toBe(403);
+      expect(db.select).not.toHaveBeenCalled();
+      expect(db.insert).not.toHaveBeenCalled();
+    });
+
+    // A restricted caller whose allowlist names a site that is not in the
+    // resolved org gets the same opaque 403, never the informative 400.
+    it('returns an opaque 403 when an allowlisted siteId is not in the org (#7035)', async () => {
+      const staleSiteId = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+      permissionSiteScope.allowedSiteIds = [staleSiteId];
+      const limit = vi.fn().mockResolvedValue([]);
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({ limit, orderBy: vi.fn(() => ({ limit })) }),
+        }),
+      } as any);
+
+      const res = await app.request('/devices/onboarding-token', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ siteId: staleSiteId }),
+      });
+
+      expect(res.status).toBe(403);
+      expect((await res.json()).error).toBe('Access to this site denied');
+      expect(limit).toHaveBeenCalledTimes(1);
+      expect(db.insert).not.toHaveBeenCalled();
+    });
+
+    it('rejects a malformed siteId (#7035)', async () => {
+      const res = await app.request('/devices/onboarding-token', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ siteId: 'not-a-uuid' }),
+      });
+
+      expect(res.status).toBe(400);
+      expect(db.insert).not.toHaveBeenCalled();
     });
 
     it('returns 403 for probation before minting an onboarding token', async () => {
@@ -480,7 +647,7 @@ describe('device routes', () => {
       vi.mocked(db.select).mockReturnValueOnce({
         from: vi.fn().mockReturnValue({
           where: vi.fn().mockReturnValue({
-            limit: vi.fn().mockResolvedValue([{ id: 'site-1' }])
+            ...siteRows([{ id: 'site-1' }])
           })
         })
       } as any);
@@ -503,13 +670,87 @@ describe('device routes', () => {
       expect(vi.mocked(db.insert)).toHaveBeenCalled();
     });
 
+    // #8120: the web's copy/paste install command needs the server URL the
+    // API sees at runtime; the web bundle's PUBLIC_API_URL is build-time only.
+    describe('serverUrl (#8120)', () => {
+      const mintWith = async (env: Record<string, string>) => {
+        for (const [k, v] of Object.entries(env)) vi.stubEnv(k, v);
+        vi.mocked(db.select).mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              ...siteRows([{ id: 'site-1' }])
+            })
+          })
+        } as any);
+        vi.mocked(db.insert).mockReturnValueOnce({
+          values: vi.fn().mockResolvedValue(undefined)
+        } as any);
+        const res = await app.request('/devices/onboarding-token', {
+          method: 'POST',
+          headers: { Authorization: 'Bearer token', Host: 'control.example.test' }
+        });
+        expect(res.status).toBe(200);
+        return res.json();
+      };
+
+      it('returns PUBLIC_API_URL without a trailing slash', async () => {
+        const body = await mintWith({ PUBLIC_API_URL: 'https://agents.example.test/', API_URL: 'https://other.example.test' });
+        expect(body.serverUrl).toBe('https://agents.example.test');
+      });
+
+      it('falls back to API_URL like the server-built installers', async () => {
+        const body = await mintWith({ PUBLIC_API_URL: '', API_URL: 'https://api-only.example.test' });
+        expect(body.serverUrl).toBe('https://api-only.example.test');
+      });
+
+      it('omits serverUrl when neither is set, never using the request Host', async () => {
+        const body = await mintWith({ PUBLIC_API_URL: '', API_URL: '' });
+        expect(body).not.toHaveProperty('serverUrl');
+        expect(body.token).toContain('enroll_');
+      });
+
+      it.each([
+        ['a plain path prefix, host normalized', 'https://Agents.Example.test/breeze/', 'https://agents.example.test/breeze'],
+        ['a percent-encoded path prefix', 'https://agents.example.test/breeze%20rmm', 'https://agents.example.test/breeze%20rmm'],
+        ['a colon in the path prefix', 'https://agents.example.test/tenant:one', 'https://agents.example.test/tenant:one'],
+        ['an explicit port', 'http://10.0.0.5:3001', 'http://10.0.0.5:3001'],
+        // The URL parser percent-encodes these, so the shell sees plain text.
+        ['a backtick in the path', 'https://agents.example.test/a`id`', 'https://agents.example.test/a%60id%60'],
+        ['a double quote in the path', 'https://agents.example.test/a"b', 'https://agents.example.test/a%22b'],
+      ])('returns serverUrl for %s', async (_label, value, expected) => {
+        const body = await mintWith({ PUBLIC_API_URL: value, API_URL: '' });
+        expect(body.serverUrl).toBe(expected);
+      });
+
+      // The value is pasted inside double quotes into bash and PowerShell
+      // commands; FORCE_HTTPS-only startup checks do not cover it.
+      it.each([
+        ['a query string', 'https://agents.example.test?tenant=one'],
+        ['a fragment', 'https://agents.example.test/#frag'],
+        ['userinfo', 'https://user:pw@agents.example.test'],
+        ['command substitution in the path', 'https://agents.example.test/$(id)'],
+        ['a variable in the path', 'https://agents.example.test/$HOME'],
+        ['a history-expansion ! in the path', 'https://agents.example.test/a!b'],
+      ])('omits serverUrl when the configured value has %s', async (_label, value) => {
+        const body = await mintWith({ PUBLIC_API_URL: value, API_URL: '' });
+        expect(body).not.toHaveProperty('serverUrl');
+      });
+
+      it('omits serverUrl when the configured value is not an http(s) URL', async () => {
+        const body = await mintWith({ PUBLIC_API_URL: 'agents.example.test', API_URL: '' });
+        expect(body).not.toHaveProperty('serverUrl');
+        const ftp = await mintWith({ PUBLIC_API_URL: 'ftp://agents.example.test', API_URL: '' });
+        expect(ftp).not.toHaveProperty('serverUrl');
+      });
+    });
+
     it('returns the configured global enrollment secret when one is active', async () => {
       vi.stubEnv('AGENT_ENROLLMENT_SECRET', 'global-secret');
 
       vi.mocked(db.select).mockReturnValueOnce({
         from: vi.fn().mockReturnValue({
           where: vi.fn().mockReturnValue({
-            limit: vi.fn().mockResolvedValue([{ id: 'site-1' }])
+            ...siteRows([{ id: 'site-1' }])
           })
         })
       } as any);
@@ -535,7 +776,7 @@ describe('device routes', () => {
       vi.mocked(db.select).mockReturnValueOnce({
         from: vi.fn().mockReturnValue({
           where: vi.fn().mockReturnValue({
-            limit: vi.fn().mockResolvedValue([{ id: 'site-1' }])
+            ...siteRows([{ id: 'site-1' }])
           })
         })
       } as any);
@@ -558,7 +799,7 @@ describe('device routes', () => {
       vi.mocked(db.select).mockReturnValueOnce({
         from: vi.fn().mockReturnValue({
           where: vi.fn().mockReturnValue({
-            limit: vi.fn().mockResolvedValue([{ id: 'site-1' }])
+            ...siteRows([{ id: 'site-1' }])
           })
         })
       } as any);
@@ -582,7 +823,7 @@ describe('device routes', () => {
       vi.mocked(db.select).mockReturnValueOnce({
         from: vi.fn().mockReturnValue({
           where: vi.fn().mockReturnValue({
-            limit: vi.fn().mockResolvedValue([{ id: 'site-1' }])
+            ...siteRows([{ id: 'site-1' }])
           })
         })
       } as any);
@@ -607,7 +848,7 @@ describe('device routes', () => {
         vi.mocked(db.select).mockReturnValueOnce({
           from: vi.fn().mockReturnValue({
             where: vi.fn().mockReturnValue({
-              limit: vi.fn().mockResolvedValue([{ id: 'site-1' }])
+              ...siteRows([{ id: 'site-1' }])
             })
           })
         } as any);
@@ -634,7 +875,7 @@ describe('device routes', () => {
         vi.mocked(db.select).mockReturnValueOnce({
           from: vi.fn().mockReturnValue({
             where: vi.fn().mockReturnValue({
-              limit: vi.fn().mockResolvedValue([{ id: 'site-1' }])
+              ...siteRows([{ id: 'site-1' }])
             })
           })
         } as any);
@@ -722,7 +963,7 @@ describe('device routes', () => {
       vi.mocked(db.select).mockReturnValueOnce({
         from: vi.fn().mockReturnValue({
           where: vi.fn().mockReturnValue({
-            limit: vi.fn().mockResolvedValue([{ id: 'site-1' }])
+            ...siteRows([{ id: 'site-1' }])
           })
         })
       } as any);
@@ -744,7 +985,7 @@ describe('device routes', () => {
       vi.mocked(db.select).mockReturnValueOnce({
         from: vi.fn().mockReturnValue({
           where: vi.fn().mockReturnValue({
-            limit: vi.fn().mockResolvedValue([{ id: 'site-1' }])
+            ...siteRows([{ id: 'site-1' }])
           })
         })
       } as any);
@@ -795,7 +1036,7 @@ describe('device routes', () => {
       vi.mocked(db.select).mockReturnValueOnce({
         from: vi.fn().mockReturnValue({
           where: vi.fn().mockReturnValue({
-            limit: vi.fn().mockResolvedValue([{ id: 'site-1' }])
+            ...siteRows([{ id: 'site-1' }])
           })
         })
       } as any);
@@ -826,7 +1067,7 @@ describe('device routes', () => {
       vi.mocked(db.select).mockReturnValueOnce({
         from: vi.fn().mockReturnValue({
           where: vi.fn().mockReturnValue({
-            limit: vi.fn().mockResolvedValue([{ id: 'site-1' }])
+            ...siteRows([{ id: 'site-1' }])
           })
         })
       } as any);
@@ -918,9 +1159,9 @@ describe('device routes', () => {
             where: vi.fn().mockResolvedValue([{ count: 2 }])
           })
         } as any)
-        // 2nd: device list query — two chained leftJoins now (deviceHardware,
-        // then deviceReliability #1720), so the leftJoin mock returns itself
-        // before resolving to the terminal where().
+        // 2nd: device list query — three chained leftJoins (deviceHardware,
+        // deviceReliability #1720, deviceHardwareHealth #6854), so the leftJoin
+        // mock returns itself before resolving to the terminal where().
         .mockReturnValueOnce({
           from: vi.fn().mockReturnValue({
             leftJoin: vi.fn(function leftJoinMock(): any {

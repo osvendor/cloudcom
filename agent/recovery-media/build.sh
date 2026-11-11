@@ -7,15 +7,39 @@
 # Task 2.
 #
 # Usage: build.sh --arch amd64|arm64 --breeze-backup <path> --version <v> --out <dir>
+#          [--server-url <https://...>] [--trust-pin <base64-sha256-spki>[,<pin2>,...]]
 # Requires root (live-build's `lb build` does actual mounting/chrooting)
 # and the live-build/debootstrap/squashfs-tools/xorriso/grub-efi toolchain
 # on PATH. Produces <out>/breeze-recovery-linux-<arch>.iso and .sha256.
+#
+# --server-url and --trust-pin are optional. When supplied, they are baked
+# into the image (/etc/breeze-recovery-server, /etc/breeze-recovery-trust-pin)
+# and become the recovery console's TRUSTED server default and TLS
+# certificate pin — see agent/internal/recoveryconsole/console.go's
+# promptServer and agent/internal/backup/bmr/certpin.go. Without them, the
+# built media behaves exactly as before: no baked default, no pinning, and
+# the operator is prompted (a boot-cmdline breeze.server= value is offered
+# only as an unverified, must-confirm suggestion). A self-hosted deployment
+# building its own media should pass its own --server-url; a hosted build
+# pipeline should pass the region's URL and, once the recovery signing
+# infrastructure exists, its pin.
+#
+# --trust-pin should be the SPKI pin of the ISSUING (intermediate or root)
+# CA certificate, not the leaf: certpin.go checks every certificate the
+# server presents (leaf and any intermediates) against every configured
+# pin, so an intermediate/root pin survives the server's next leaf
+# rotation (a leaf-only pin breaks on every renewal, typically every
+# 60-90 days on a Let's Encrypt-style setup). --trust-pin also accepts a
+# comma-separated SET of pins, so a planned CA rotation can be covered by
+# pinning both the outgoing and incoming intermediate at once.
 set -euo pipefail
 
 arch=""
 breeze_backup=""
 version=""
 out=""
+server_url=""
+trust_pin=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -23,16 +47,47 @@ while [ $# -gt 0 ]; do
     --breeze-backup) breeze_backup="$2"; shift 2 ;;
     --version) version="$2"; shift 2 ;;
     --out) out="$2"; shift 2 ;;
+    --server-url) server_url="$2"; shift 2 ;;
+    --trust-pin) trust_pin="$2"; shift 2 ;;
     *) echo "unknown argument: $1" >&2; exit 1 ;;
   esac
 done
+
+if [ -n "$server_url" ] && [ "${server_url#https://}" = "$server_url" ]; then
+  echo "--server-url must start with https://: $server_url" >&2
+  exit 1
+fi
 
 if [ -z "$arch" ] || [ -z "$breeze_backup" ] || [ -z "$version" ] || [ -z "$out" ]; then
   echo "usage: build.sh --arch amd64|arm64 --breeze-backup <path> --version <v> --out <dir>" >&2
   exit 1
 fi
+case "$arch" in
+  amd64|arm64) ;;
+  *) echo "--arch must be amd64 or arm64: $arch" >&2; exit 1 ;;
+esac
 if [ ! -s "$breeze_backup" ]; then
   echo "breeze-backup binary not found or empty: $breeze_backup" >&2
+  exit 1
+fi
+
+# The media must be built on a host whose dpkg architecture matches
+# --arch. live-build's bootstrap stage calls Check_crossarchitectures,
+# which on an amd64 host only accepts amd64/i386 targets unless
+# --bootstrap-qemu-arch/--bootstrap-qemu-static are configured. For an
+# arm64 target it therefore prints "skipping ... foreign architecture(s)",
+# exits 0 without bootstrapping, and the next stage dies with the
+# misleading "the following stage is required to be done first:
+# bootstrap" (issue #6731: every arm64 release build failed this way).
+# Fail up front with the real reason instead; build arm64 media on an
+# arm64 host (the release workflow uses a native arm64 runner). If dpkg
+# cannot report the host architecture the guard is skipped with a warning
+# (live-build itself needs a dpkg host, so the build fails later anyway).
+host_arch="$(dpkg --print-architecture 2>/dev/null || true)"
+if [ -z "$host_arch" ]; then
+  echo "warning: could not determine host architecture via dpkg; skipping the host/target architecture check" >&2
+elif [ "$host_arch" != "$arch" ]; then
+  echo "cannot build $arch recovery media on an $host_arch host: live-build skips its bootstrap stage for a foreign architecture. Build on a native $arch host." >&2
   exit 1
 fi
 
@@ -47,6 +102,13 @@ mkdir -p "$work/config/config/includes.chroot/usr/local/bin"
 cp "$breeze_backup" "$work/config/config/includes.chroot/usr/local/bin/breeze-backup"
 chmod 0755 "$work/config/config/includes.chroot/usr/local/bin/breeze-backup"
 echo "$version" > "$work/config/config/includes.chroot/etc/breeze-recovery-version"
+
+if [ -n "$server_url" ]; then
+  printf '%s' "$server_url" > "$work/config/config/includes.chroot/etc/breeze-recovery-server"
+fi
+if [ -n "$trust_pin" ]; then
+  printf '%s' "$trust_pin" > "$work/config/config/includes.chroot/etc/breeze-recovery-trust-pin"
+fi
 
 # The package list and --linux-flavours option are amd64-oriented by
 # default (matches the base image); swap in the arm64 kernel/bootloader

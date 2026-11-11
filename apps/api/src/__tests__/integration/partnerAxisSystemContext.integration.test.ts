@@ -192,7 +192,7 @@ afterEach(async () => {
 });
 
 describe('#2822 premise — partner-axis rows really are invisible to an org-scoped context', () => {
-  runDb('raw SELECTs on partners / authenticator_policies / patch_policies return ZERO rows, without raising', async () => {
+  runDb('raw SELECTs on partners / authenticator_policies return ZERO rows, without raising (patch_policies: own partner visible, #7647)', async () => {
     await withDbAccessContext(orgContext(fx.orgId, fx.partnerId), async () => {
       // Sanity: the org row itself IS visible, so a zero result below is RLS on
       // the partner axis and not a broken fixture or a dead connection.
@@ -213,12 +213,18 @@ describe('#2822 premise — partner-axis rows really are invisible to an org-sco
           .where(eq(authenticatorPolicies.partnerId, fx.partnerId)),
       ).toHaveLength(0);
 
+      // patch_policies is the exception since #7647: it (and patch_approvals)
+      // carries an additive SELECT-only own-partner branch
+      // (2026-11-13-140000-patch-partner-axis-own-partner-select.sql), so the
+      // org session's OWN partner's ring IS legible in place. The
+      // resolvePatchPolicyReference tests below therefore no longer depend on
+      // an escape; the cross-partner one still proves reach did not widen.
       expect(
         await db
           .select({ id: patchPolicies.id })
           .from(patchPolicies)
           .where(eq(patchPolicies.id, fx.ringId)),
-      ).toHaveLength(0);
+      ).toHaveLength(1);
     });
   });
 });
@@ -234,7 +240,10 @@ describe('#2822 — loadPartnerPolicy (step-up MFA fail-open, highest severity)'
     // session tap while a partner-scoped technician on the same row got 403.
     expect(policy).not.toBeNull();
     expect(policy!.requireEnrollment).toBe(true);
-    expect(isEnforcing(policy, new Date())).toBe(true);
+    // 'medium': only the partner's explicit Required choice enforces this
+    // tier (the platform default covers high/critical only), so a null policy
+    // could not make this pass.
+    expect(isEnforcing(policy, new Date(), 'medium')).toBe(true);
   });
 
   runDb('still resolves under a system context (the skip-the-escape branch is not a regression)', async () => {
@@ -331,9 +340,34 @@ describe('#2822 — resolvePatchPolicyReference', () => {
     expect(resolution.classification).toBe('valid_ring');
     expect(resolution.valid).toBe(true);
     expect(resolution.ringId).toBe(fx.ringId);
+    // #8184: a freshly created ring carries the column default.
+    expect(resolution.appRules).toEqual([]);
   });
 
-  runDb('a ring belonging to ANOTHER partner is still rejected — the escape did not widen reach', async () => {
+  runDb('#8184: an org-scoped caller reads the ring app_rules column, normalised for the evaluator', async () => {
+    await withSystemDbAccessContext(() =>
+      db.update(patchPolicies)
+        .set({
+          appRules: [
+            { source: 'third_party', packageId: 'Mozilla.Firefox', displayName: 'Firefox', action: 'block' },
+            { source: 'custom', packageId: 'acme.tool', action: 'pin', pinnedVersion: '1.2.3' },
+          ],
+        })
+        .where(eq(patchPolicies.id, fx.ringId)),
+    );
+
+    const resolution = await withDbAccessContext(orgContext(fx.orgId, fx.partnerId), () =>
+      resolvePatchPolicyReference(fx.partnerId, fx.ringId),
+    );
+
+    expect(resolution.classification).toBe('valid_ring');
+    expect(resolution.appRules).toEqual([
+      { source: 'third_party', packageId: 'Mozilla.Firefox', action: 'block' },
+      { source: 'custom', packageId: 'acme.tool', action: 'pin', pinnedVersion: '1.2.3' },
+    ]);
+  });
+
+  runDb('a ring belonging to ANOTHER partner is still rejected — neither the escape nor the own-partner branch widened reach', async () => {
     const unique = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const other = await withSystemDbAccessContext(async () => {
       const [p] = await db

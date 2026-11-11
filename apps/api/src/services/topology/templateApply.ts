@@ -53,6 +53,7 @@ import {
   PREVIEW_TTL_MS,
   type TemplateApplicationRecord,
 } from './templateApplicationTypes';
+import { markRequestAuditWritten } from '../auditRequestTracking';
 
 export function capabilityUnavailable(capability: string): never {
   throw new TopologyOperationError(
@@ -115,17 +116,20 @@ export async function previewTopologyTemplateApplication(
   // or binding revisions are changed by this POST.
   await withDbTransaction(async () => {
     for (const selected of request.sites) {
+      // Preview is the admission gate for an intent to write site config (it
+      // journals an outbox row and, on apply, audit rows) — it must require
+      // the same `write` tier as the change it is previewing, not `read`.
       await requireTopologySiteAccess(
         auth,
         permissions,
         selected.siteId,
-        'read',
+        'write',
       );
       const ctx = await requireTopologySiteAccess(
         live.auth,
         live.permissions,
         selected.siteId,
-        'read',
+        'write',
       );
       const preview: TopologyTemplatePreview['sites'][number] = {
         siteId: selected.siteId,
@@ -269,20 +273,30 @@ export async function applyTopologyTemplatePreview(
                 })
             )
               throw new TopologyOperationError('preview_invalidated', 409);
+            // The preview recorded the requester's session epochs as they were when the person read the preview in
+            // their own session. A release (or any later apply) that carries different epochs means the session was
+            // revoked or its MFA changed since: the approval no longer stands (W08 quorum QW4).
+            if (
+              record.actor.authEpoch !== actor.authEpoch ||
+              record.actor.mfaEpoch !== actor.mfaEpoch
+            )
+              throw new TopologyOperationError('permission_changed', 403, 'Your session changed since the preview was read; run preview again and re-approve.');
             let code = record.preview.errors[0]?.code ?? null;
             if (!code && record.effect) {
               try {
+                // Same admission-tier fix as preview: apply must re-check
+                // `write`, not `read`, before it journals an intent.
                 await requireTopologySiteAccess(
                   auth,
                   permissions,
                   row.siteId,
-                  'read',
+                  'write',
                 );
                 const ctx = await requireTopologySiteAccess(
                   live.auth,
                   live.permissions,
                   row.siteId,
-                  'read',
+                  'write',
                 );
                 if (ctx.scope.orgId !== record.originalOrgId)
                   throw new TopologyOperationError('preview_invalidated', 409);
@@ -349,9 +363,10 @@ export async function applyTopologyTemplatePreview(
               result: 'success',
               details: { siteId: row.siteId, previewId },
             });
+            markRequestAuditWritten();
             // A site refused at admission is never seen by the worker, so this
             // is the only place its conflict can reach the audit trail.
-            if (code)
+            if (code) {
               await db.insert(auditLogs).values({
                 actorType: 'user',
                 orgId: row.orgId,
@@ -363,6 +378,8 @@ export async function applyTopologyTemplatePreview(
                 result: 'failure',
                 details: { siteId: row.siteId, previewId, code },
               });
+              markRequestAuditWritten();
+            }
           }
         }),
       'topology template application admission',

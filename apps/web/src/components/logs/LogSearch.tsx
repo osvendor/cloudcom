@@ -9,6 +9,7 @@ import { toCsv } from '@/lib/csvExport';
 // an island that hydrates before whichever other island happens to pull i18n in
 // would otherwise render raw keys (and mismatch the SSR markup).
 import '../../lib/i18n';
+import { useStableT } from '@/lib/i18n/useStableT';
 
 type EventLogRow = {
   log: {
@@ -52,6 +53,7 @@ function toDatetimeLocalInput(date: Date): string {
 
 export default function LogSearch() {
   const { t } = useTranslation('common');
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   const [query, setQuery] = useState('');
   const [source, setSource] = useState('');
   const [selectedLevels, setSelectedLevels] = useState<Array<EventLogRow['log']['level']>>([]);
@@ -78,7 +80,7 @@ export default function LogSearch() {
 
   const fetchLogs = useCallback(async (nextOffset = 0) => {
     if (!canSearch) {
-      setError(t('longTail.logs.LogSearch.errors.invalidTimeRange'));
+      setError(stableT('longTail.logs.LogSearch.errors.invalidTimeRange'));
       return;
     }
 
@@ -108,7 +110,7 @@ export default function LogSearch() {
 
       if (!response.ok) {
         const body = await response.json().catch(() => ({}));
-        throw new Error(typeof body.error === 'string' ? body.error : t('longTail.logs.LogSearch.errors.searchFailed'));
+        throw new Error(typeof body.error === 'string' ? body.error : stableT('longTail.logs.LogSearch.errors.searchFailed'));
       }
 
       const data: SearchResponse = await response.json();
@@ -116,11 +118,11 @@ export default function LogSearch() {
       setTotal(Number(data.total ?? 0));
       setOffset(nextOffset);
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('longTail.logs.LogSearch.errors.searchFailed'));
+      setError(err instanceof Error ? err.message : stableT('longTail.logs.LogSearch.errors.searchFailed'));
     } finally {
       setLoading(false);
     }
-  }, [canSearch, query, source, selectedLevels, startTime, endTime, limit, t]);
+  }, [canSearch, query, source, selectedLevels, startTime, endTime, limit, stableT]);
 
   useEffect(() => {
     fetchLogs(0);
@@ -225,8 +227,9 @@ export default function LogSearch() {
       <div className="rounded-lg border bg-card p-4 shadow-xs">
         <div className="grid gap-3 lg:grid-cols-6">
           <div className="lg:col-span-2">
-            <label className="mb-1 block text-xs font-medium text-muted-foreground">{t('common:actions.search')}</label>
+            <label htmlFor="log-search-query" className="mb-1 block text-xs font-medium text-muted-foreground">{t('common:actions.search')}</label>
             <input
+              id="log-search-query"
               value={query}
               onChange={(event) => setQuery(event.target.value)}
               placeholder={t('longTail.logs.LogSearch.searchPlaceholder')}
@@ -235,8 +238,9 @@ export default function LogSearch() {
           </div>
 
           <div>
-            <label className="mb-1 block text-xs font-medium text-muted-foreground">{t('longTail.logs.LogSearch.source')}</label>
+            <label htmlFor="log-search-source" className="mb-1 block text-xs font-medium text-muted-foreground">{t('longTail.logs.LogSearch.source')}</label>
             <input
+              id="log-search-source"
               value={source}
               onChange={(event) => setSource(event.target.value)}
               placeholder={t('longTail.logs.LogSearch.sourcePlaceholder')}
@@ -245,8 +249,9 @@ export default function LogSearch() {
           </div>
 
           <div>
-            <label className="mb-1 block text-xs font-medium text-muted-foreground">{t('longTail.logs.LogSearch.start')}</label>
+            <label htmlFor="log-search-start" className="mb-1 block text-xs font-medium text-muted-foreground">{t('longTail.logs.LogSearch.start')}</label>
             <input
+              id="log-search-start"
               type="datetime-local"
               value={startTime}
               onChange={(event) => setStartTime(event.target.value)}
@@ -255,8 +260,9 @@ export default function LogSearch() {
           </div>
 
           <div>
-            <label className="mb-1 block text-xs font-medium text-muted-foreground">{t('longTail.logs.LogSearch.end')}</label>
+            <label htmlFor="log-search-end" className="mb-1 block text-xs font-medium text-muted-foreground">{t('longTail.logs.LogSearch.end')}</label>
             <input
+              id="log-search-end"
               type="datetime-local"
               value={endTime}
               onChange={(event) => setEndTime(event.target.value)}
@@ -265,8 +271,9 @@ export default function LogSearch() {
           </div>
 
           <div>
-            <label className="mb-1 block text-xs font-medium text-muted-foreground">{t('longTail.logs.LogSearch.rows')}</label>
+            <label htmlFor="log-search-rows" className="mb-1 block text-xs font-medium text-muted-foreground">{t('longTail.logs.LogSearch.rows')}</label>
             <select
+              id="log-search-rows"
               value={limit}
               onChange={(event) => setLimit(Number(event.target.value))}
               className="w-full rounded-md border px-3 py-2 text-sm"

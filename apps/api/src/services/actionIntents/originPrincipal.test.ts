@@ -19,7 +19,10 @@ describe('action_intents origin principal', () => {
     // Wave 3: 'ai_agent' is now a first-class origin. The CHECK constraint
     // (2026-09-05-a-agent-originated-intents.sql) admits it, and an agent
     // intent records it alongside a NULL requester and a requesting_agent_run_id.
-    const everyRuntimeKind: ReadonlyArray<PrincipalKind['kind']> = [
+    // 'partner_service_principal' is deliberately absent: createActionIntent
+    // refuses that principal before insert (intentService.ts), so it is never
+    // a stored origin. See the dedicated test below.
+    const everyRuntimeKind: ReadonlyArray<Exclude<PrincipalKind['kind'], 'partner_service_principal'>> = [
       'user_session',
       'client_user',
       'api_key',
@@ -41,12 +44,16 @@ describe('action_intents origin principal', () => {
   });
 
   it('enumerates exactly the runtime kinds plus unknown — no extras', () => {
+    // 'flow' (tool catalog W04, #5219): the stored origin of a parked Tier-3
+    // flow step. PrincipalKind gains { kind: 'flow' } in Task A4; the SQL
+    // CHECK admits it from 2027-01-06-130000-flow-runs.sql.
     expect([...actionIntentOriginPrincipalKindEnum].sort()).toEqual(
       [
         'agent',
         'ai_agent',
         'api_key',
         'client_user',
+        'flow',
         'helper',
         'oauth_grant',
         'system',

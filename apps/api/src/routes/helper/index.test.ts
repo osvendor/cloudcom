@@ -1,20 +1,29 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
 
 const {
   captureExceptionMock,
-  resolveLlmConfigMock,
-  checkBudgetMock,
+  checkBudgetDetailedMock,
+  checkSystemAiRateLimitMock,
   reserveAiBudgetMock,
   releaseUnusedAiBudgetMock,
   getEffectiveAiBudgetMock,
 } = vi.hoisted(() => ({
   captureExceptionMock: vi.fn(),
-  resolveLlmConfigMock: vi.fn(),
-  checkBudgetMock: vi.fn(),
+  checkBudgetDetailedMock: vi.fn(),
+  checkSystemAiRateLimitMock: vi.fn(),
   reserveAiBudgetMock: vi.fn(),
   releaseUnusedAiBudgetMock: vi.fn(),
   getEffectiveAiBudgetMock: vi.fn().mockResolvedValue({ maxTurnsPerSession: 50 }),
+}));
+const { resolveSessionTurnMock, chooseSessionModelMock } = vi.hoisted(() => ({
+  resolveSessionTurnMock: vi.fn(),
+  chooseSessionModelMock: vi.fn(),
+}));
+// W03: helper turns (Task 7) and session create (Task 9) resolve through the registry.
+vi.mock('../../services/aiModels/sessionModel', () => ({
+  resolveSessionTurn: (...args: unknown[]) => resolveSessionTurnMock(...args),
+  chooseSessionModel: (...args: unknown[]) => chooseSessionModelMock(...args),
 }));
 
 vi.mock('../../db', () => ({
@@ -26,6 +35,7 @@ vi.mock('../../db', () => ({
   withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
   withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn()),
   runOutsideDbContext: vi.fn((fn: () => unknown) => fn()),
+  withDbTransaction: vi.fn(async (fn: () => Promise<unknown>) => fn()),
 }));
 
 vi.mock('../../db/schema', () => ({
@@ -33,6 +43,14 @@ vi.mock('../../db/schema', () => ({
   aiSessions: {
     id: 'aiSessions.id',
     deviceId: 'aiSessions.deviceId',
+    userId: 'aiSessions.userId',
+    clientUserId: 'aiSessions.clientUserId',
+    agentId: 'aiSessions.agentId',
+    status: 'aiSessions.status',
+    title: 'aiSessions.title',
+    turnCount: 'aiSessions.turnCount',
+    contextSnapshot: 'aiSessions.contextSnapshot',
+    createdAt: 'aiSessions.createdAt',
     updatedAt: 'aiSessions.updatedAt',
   },
   aiToolExecutions: {},
@@ -65,6 +83,7 @@ vi.mock('drizzle-orm', () => ({
   or: vi.fn((...args: unknown[]) => ({ or: args })),
   desc: vi.fn((...args: unknown[]) => ({ desc: args })),
   asc: vi.fn((...args: unknown[]) => ({ asc: args })),
+  isNull: vi.fn((...args: unknown[]) => ({ isNull: args })),
   sql: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) => ({ sql: strings, values })),
 }));
 
@@ -84,6 +103,10 @@ vi.mock('../../services/helperPermissions', () => ({
   resolveHelperPermissionLevelForDevice: vi.fn(),
 }));
 
+vi.mock('../../services/helperSettings', () => ({
+  buildHelperConfigUpdate: vi.fn(async () => ({ enabled: true })),
+}));
+
 vi.mock('../../services/helperAiAgent', () => ({
   buildHelperSystemPrompt: vi.fn(() => 'helper system prompt'),
 }));
@@ -98,16 +121,28 @@ vi.mock('../../services/streamingSessionManager', () => ({
   },
 }));
 
-vi.mock('../../services/aiInputSanitizer', () => ({
+vi.mock('../../services/aiAgentSdkTools', () => ({
+  createBreezeMcpServer: vi.fn(() => ({ type: 'sdk', name: 'breeze' })),
+}));
+
+vi.mock('../../services/aiInputSanitizer', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../services/aiInputSanitizer')>()),
   sanitizeUserMessage: vi.fn(() => ({ sanitized: 'hello', flags: [] })),
 }));
 
-vi.mock('../../services/screenshotStorage', () => ({
-  storeScreenshot: vi.fn(),
-}));
+vi.mock('../../services/screenshotStorage', () => {
+  class ScreenshotTooLargeError extends Error {}
+  class ScreenshotQuotaExceededError extends Error {}
+  return {
+    storeScreenshot: vi.fn(),
+    ScreenshotTooLargeError,
+    ScreenshotQuotaExceededError,
+  };
+});
 
 vi.mock('../../services/aiCostTracker', () => ({
-  checkBudget: (...args: unknown[]) => checkBudgetMock(...args),
+  checkBudgetDetailed: (...args: unknown[]) => checkBudgetDetailedMock(...args),
+  checkSystemAiRateLimit: (...args: unknown[]) => checkSystemAiRateLimitMock(...args),
   getRemainingBudgetUsd: vi.fn(),
 }));
 
@@ -132,7 +167,6 @@ vi.mock('../../services/aiAgentSdk', () => ({
 }));
 
 vi.mock('../../services/llm/llmConfigResolver', () => ({
-  resolveLlmConfig: (...args: unknown[]) => resolveLlmConfigMock(...args),
   LlmUnavailableError: class LlmUnavailableError extends Error {
     readonly status = 503;
     readonly code = 'ai_unavailable';
@@ -141,6 +175,15 @@ vi.mock('../../services/llm/llmConfigResolver', () => ({
       this.name = 'LlmUnavailableError';
     }
   },
+}));
+
+const { callerHelperBrandingMock, callerHelperLogoMock } = vi.hoisted(() => ({
+  callerHelperBrandingMock: vi.fn(),
+  callerHelperLogoMock: vi.fn(),
+}));
+vi.mock('../../services/callerVerification/helperBranding', () => ({
+  callerHelperBranding: callerHelperBrandingMock,
+  callerHelperLogo: callerHelperLogoMock,
 }));
 
 vi.mock('../../services/sentry', () => ({
@@ -161,20 +204,38 @@ vi.mock('../../services/clientSessionTools', async (importOriginal) => {
   };
 });
 
+import { makeResolvedModel } from '../../services/aiModels/__fixtures__/resolvedModel';
+import { turnBindingFrom } from '../../services/aiModels/turnBinding';
 import { helperRoutes } from './index';
-import { db } from '../../db';
+import { db, withDbAccessContext } from '../../db';
+import { settleBlockedTurnForNewMessage } from '../../services/aiAgentSdk';
 import { matchAgentTokenHash } from '../../middleware/agentAuth';
 import { resolveHelperPermissionLevelForDevice } from '../../services/helperPermissions';
 import { buildHelperSystemPrompt } from '../../services/helperAiAgent';
+import { buildHelperConfigUpdate } from '../../services/helperSettings';
 import { streamingSessionManager } from '../../services/streamingSessionManager';
 import { LlmUnavailableError } from '../../services/llm/llmConfigResolver';
 import { resolveClientDeclaredTool } from '../../services/clientSessionTools';
+import { storeScreenshot } from '../../services/screenshotStorage';
+import { createBreezeMcpServer } from '../../services/aiAgentSdkTools';
+import { getHelperAllowedTools } from '../../services/helperToolFilter';
 
 const VALID_TOOL_DECL = {
   name: 'search_files',
   description: 'search the estate for files',
   inputSchema: { type: 'object', properties: { q: { type: 'string' } }, required: ['q'] },
 };
+
+function helperChoice() {
+  return {
+    resolved: makeResolvedModel('anthropic_byok', { surface: 'helper' }),
+    offeringId: 'off-1',
+    offeringPartnerId: 'partner-1',
+    options: null,
+    model: 'claude-sonnet-5-5',
+    billingSource: 'partner_key' as const,
+  };
+}
 
 function mockHelperAuthDevice() {
   vi.mocked(db.select).mockReturnValueOnce({
@@ -214,14 +275,8 @@ describe('helper routes permission derivation', () => {
       monthlyPeriodKey: '2026-09-01',
       status: 'active',
     });
-    resolveLlmConfigMock.mockResolvedValue({
-      source: 'partner',
-      partnerId: 'partner-1',
-      apiKey: 'partner-key',
-      model: 'claude-opus-4-6',
-      configId: 'config-1',
-      configVersion: 5,
-    });
+    chooseSessionModelMock.mockResolvedValue(helperChoice());
+    resolveSessionTurnMock.mockResolvedValue(makeResolvedModel('anthropic_byok', { surface: 'helper' }));
     app = new Hono();
     app.route('/helper', helperRoutes);
   });
@@ -254,8 +309,14 @@ describe('helper routes permission derivation', () => {
     }));
     expect(resolveHelperPermissionLevelForDevice).toHaveBeenCalledWith('device-1', 'basic');
     expect((insertedValues?.contextSnapshot as Record<string, unknown>).permissionLevel).toBe('standard');
-    expect(insertedValues?.model).toBe('claude-opus-4-6');
-    expect(resolveLlmConfigMock).toHaveBeenCalledWith('partner-1');
+    // W03 Task 9: the session is created on the registry's helper offering.
+    expect(insertedValues).toMatchObject({
+      offeringId: 'off-1', offeringPartnerId: 'partner-1', options: null,
+      model: 'claude-sonnet-5-5', billingSource: 'partner_key',
+    });
+    expect(chooseSessionModelMock).toHaveBeenCalledWith({
+      partnerId: 'partner-1', orgId: 'org-1', userId: null, surface: 'helper',
+    });
   });
 
   // #6473 — Helper-originated sessions were the third createSession-shaped
@@ -287,11 +348,7 @@ describe('helper routes permission derivation', () => {
 
   it('returns ai_unavailable as 503 before inserting a helper session', async () => {
     mockHelperAuthDevice();
-    resolveLlmConfigMock.mockResolvedValue({
-      source: 'unavailable',
-      partnerId: 'partner-1',
-      reason: 'key_error',
-    });
+    chooseSessionModelMock.mockRejectedValue(new LlmUnavailableError());
 
     const res = await app.request('/helper/chat/sessions', {
       method: 'POST',
@@ -302,13 +359,14 @@ describe('helper routes permission derivation', () => {
     expect(res.status).toBe(503);
     expect(await res.json()).toEqual({ error: 'ai_unavailable' });
     expect(db.insert).not.toHaveBeenCalled();
-    expect(resolveLlmConfigMock).toHaveBeenCalledWith('partner-1');
+    // The body's partnerId is ignored: the device's own partner is resolved.
+    expect(chooseSessionModelMock).toHaveBeenCalledWith(expect.objectContaining({ partnerId: 'partner-1' }));
   });
 
   it('captures resolver throws and returns a generic retryable 503 when creating a session', async () => {
     mockHelperAuthDevice();
     const resolverError = new Error('database driver detail');
-    resolveLlmConfigMock.mockRejectedValueOnce(resolverError);
+    chooseSessionModelMock.mockRejectedValueOnce(resolverError);
 
     const res = await app.request('/helper/chat/sessions', {
       method: 'POST',
@@ -337,6 +395,202 @@ describe('helper routes permission derivation', () => {
     const body = await res.json();
     expect(body.permissionLevel).toBe('extended');
     expect(resolveHelperPermissionLevelForDevice).toHaveBeenCalledWith('device-1', 'basic');
+  });
+
+  describe('caller verification branding (#6354 W02)', () => {
+    beforeEach(() => callerHelperLogoMock.mockResolvedValue(null));
+    afterEach(() => vi.unstubAllEnvs());
+
+    it('adds partner branding for the authenticated device org while the feature is live', async () => {
+      vi.stubEnv('CALLER_VERIFICATION_ENABLED', 'true');
+      mockHelperAuthDevice();
+      callerHelperBrandingMock.mockResolvedValueOnce({ partnerName: 'Northwind', logoUrl: null });
+      const res = await app.request('/helper/config', { headers: { Authorization: 'Bearer brz_agent_token' } });
+      expect(res.status).toBe(200);
+      expect((await res.json()).branding).toEqual({ partnerName: 'Northwind', logoUrl: null, logo: null });
+      expect(callerHelperBrandingMock).toHaveBeenCalledWith('org-1');
+    });
+
+    describe('caller-verify logo bytes path (#10190 W04, decision 1)', () => {
+      const LOGO = { sha256: 'a'.repeat(64), mime: 'image/png' as const };
+
+      it('adds branding.logo {sha256, mime} next to the unchanged partnerName and logoUrl', async () => {
+        vi.stubEnv('CALLER_VERIFICATION_ENABLED', 'true');
+        mockHelperAuthDevice();
+        callerHelperBrandingMock.mockResolvedValueOnce({ partnerName: 'Northwind', logoUrl: 'https://cdn.example.com/brand.png' });
+        callerHelperLogoMock.mockResolvedValueOnce(LOGO);
+        const res = await app.request('/helper/config', { headers: { Authorization: 'Bearer brz_agent_token' } });
+        expect(res.status).toBe(200);
+        expect((await res.json()).branding).toEqual({
+          partnerName: 'Northwind',
+          logoUrl: 'https://cdn.example.com/brand.png',
+          logo: { sha256: 'a'.repeat(64), mime: 'image/png' },
+        });
+      });
+
+      it('every id comes from the helper-authenticated device (device → org → partner), never the client', async () => {
+        vi.stubEnv('CALLER_VERIFICATION_ENABLED', 'true');
+        mockHelperAuthDevice();
+        callerHelperBrandingMock.mockResolvedValueOnce({ partnerName: 'Northwind', logoUrl: null });
+        callerHelperLogoMock.mockResolvedValueOnce(LOGO);
+        await app.request('/helper/config?deviceId=device-9&orgId=org-9&partnerId=partner-9', {
+          headers: { Authorization: 'Bearer brz_agent_token', 'X-Partner-Id': 'partner-9' },
+        });
+        expect(callerHelperLogoMock).toHaveBeenCalledTimes(1);
+        expect(callerHelperLogoMock).toHaveBeenCalledWith({ deviceId: 'device-1', orgId: 'org-1', partnerId: 'partner-1' });
+      });
+
+      it('logo is null when the resolver has none (cold https cache, invalid logo, no logo)', async () => {
+        vi.stubEnv('CALLER_VERIFICATION_ENABLED', 'true');
+        mockHelperAuthDevice();
+        callerHelperBrandingMock.mockResolvedValueOnce({ partnerName: 'Northwind', logoUrl: null });
+        callerHelperLogoMock.mockResolvedValueOnce(null);
+        const res = await app.request('/helper/config', { headers: { Authorization: 'Bearer brz_agent_token' } });
+        expect((await res.json()).branding).toEqual({ partnerName: 'Northwind', logoUrl: null, logo: null });
+      });
+
+      it('a logo failure never fails the config response or drops the name', async () => {
+        vi.stubEnv('CALLER_VERIFICATION_ENABLED', 'true');
+        mockHelperAuthDevice();
+        callerHelperBrandingMock.mockResolvedValueOnce({ partnerName: 'Northwind', logoUrl: null });
+        callerHelperLogoMock.mockRejectedValueOnce(new Error('redis down'));
+        const res = await app.request('/helper/config', { headers: { Authorization: 'Bearer brz_agent_token' } });
+        expect(res.status).toBe(200);
+        expect((await res.json()).branding).toEqual({ partnerName: 'Northwind', logoUrl: null, logo: null });
+      });
+
+      it('no logo lookup without branding (no partner / unusable name) or while the feature is dark', async () => {
+        vi.stubEnv('CALLER_VERIFICATION_ENABLED', 'true');
+        mockHelperAuthDevice();
+        callerHelperBrandingMock.mockResolvedValueOnce(null);
+        const res = await app.request('/helper/config', { headers: { Authorization: 'Bearer brz_agent_token' } });
+        expect((await res.json()).branding).toBeNull();
+        vi.stubEnv('CALLER_VERIFICATION_ENABLED', 'false');
+        mockHelperAuthDevice();
+        await app.request('/helper/config', { headers: { Authorization: 'Bearer brz_agent_token' } });
+        expect(callerHelperLogoMock).not.toHaveBeenCalled();
+      });
+
+      it('under its real /api/v1 mount: reads run in one short helper context; the logo lookup runs with none held (#1105)', async () => {
+        vi.stubEnv('CALLER_VERIFICATION_ENABLED', 'true');
+        let depth = 0;
+        const contexts: unknown[] = [];
+        vi.mocked(withDbAccessContext).mockImplementation(async (ctx: unknown, fn: () => Promise<unknown>) => {
+          depth += 1;
+          contexts.push(ctx);
+          try {
+            return await fn();
+          } finally {
+            depth -= 1;
+          }
+        });
+        const depths: Record<string, number> = {};
+        mockHelperAuthDevice();
+        vi.mocked(resolveHelperPermissionLevelForDevice).mockImplementationOnce(async () => {
+          depths.permission = depth;
+          return 'standard';
+        });
+        callerHelperBrandingMock.mockImplementationOnce(async () => {
+          depths.branding = depth;
+          return { partnerName: 'Northwind', logoUrl: null };
+        });
+        callerHelperLogoMock.mockImplementationOnce(async () => {
+          depths.logo = depth;
+          return LOGO;
+        });
+
+        const apiApp = new Hono();
+        apiApp.route('/api/v1/helper', helperRoutes);
+        const res = await apiApp.request('/api/v1/helper/config', { headers: { Authorization: 'Bearer brz_agent_token' } });
+
+        expect(res.status).toBe(200);
+        expect((await res.json()).branding.logo).toEqual(LOGO);
+        expect(depths).toEqual({ permission: 1, branding: 1, logo: 0 });
+        // The one context is the device's own org-scoped helper context.
+        expect(contexts).toHaveLength(1);
+        expect(contexts[0]).toMatchObject({ scope: 'organization', orgId: 'org-1', accessibleOrgIds: ['org-1'] });
+        expect(depth).toBe(0);
+      });
+    });
+
+    it('sends null branding and does no lookup while the feature is dark', async () => {
+      vi.stubEnv('CALLER_VERIFICATION_ENABLED', 'false');
+      mockHelperAuthDevice();
+      callerHelperBrandingMock.mockClear();
+      const res = await app.request('/helper/config', { headers: { Authorization: 'Bearer brz_agent_token' } });
+      expect(res.status).toBe(200);
+      expect((await res.json()).branding).toBeNull();
+      expect(callerHelperBrandingMock).not.toHaveBeenCalled();
+    });
+
+    it('never fails the config response over branding', async () => {
+      vi.stubEnv('CALLER_VERIFICATION_ENABLED', 'true');
+      mockHelperAuthDevice();
+      callerHelperBrandingMock.mockRejectedValueOnce(new Error('db down'));
+      const res = await app.request('/helper/config', { headers: { Authorization: 'Bearer brz_agent_token' } });
+      expect(res.status).toBe(200);
+      expect((await res.json()).branding).toBeNull();
+    });
+
+    it('a branding failure is logged with the org and the error message and sent to Sentry, not swallowed (#10340 review)', async () => {
+      vi.stubEnv('CALLER_VERIFICATION_ENABLED', 'true');
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      mockHelperAuthDevice();
+      const err = new Error('connection terminated');
+      callerHelperBrandingMock.mockRejectedValueOnce(err);
+      const res = await app.request('/helper/config', { headers: { Authorization: 'Bearer brz_agent_token' } });
+      expect(res.status).toBe(200);
+      expect(warn).toHaveBeenCalledWith('[helper] caller verification branding unavailable', {
+        deviceId: 'device-1',
+        orgId: 'org-1',
+        error: 'connection terminated',
+      });
+      expect(captureExceptionMock).toHaveBeenCalledWith(err, expect.anything(), { service: 'helperRoutes', orgId: 'org-1' });
+      warn.mockRestore();
+    });
+
+    it('a logo failure is logged the same way and sent to Sentry (#10340 review)', async () => {
+      vi.stubEnv('CALLER_VERIFICATION_ENABLED', 'true');
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      mockHelperAuthDevice();
+      callerHelperBrandingMock.mockResolvedValueOnce({ partnerName: 'Northwind', logoUrl: null });
+      const err = new Error('redis down');
+      callerHelperLogoMock.mockRejectedValueOnce(err);
+      await app.request('/helper/config', { headers: { Authorization: 'Bearer brz_agent_token' } });
+      expect(warn).toHaveBeenCalledWith('[helper] caller verification logo unavailable', {
+        deviceId: 'device-1',
+        orgId: 'org-1',
+        error: 'redis down',
+      });
+      expect(captureExceptionMock).toHaveBeenCalledWith(err, expect.anything(), { service: 'helperRoutes', orgId: 'org-1' });
+      warn.mockRestore();
+    });
+  });
+
+  it('refuses /helper/config with helper_disabled when the effective setting is off', async () => {
+    mockHelperAuthDevice();
+    vi.mocked(buildHelperConfigUpdate).mockResolvedValueOnce({ enabled: false } as never);
+
+    const res = await app.request('/helper/config', {
+      headers: { Authorization: 'Bearer brz_agent_token' },
+    });
+
+    expect(res.status).toBe(403);
+    expect((await res.json()).code).toBe('helper_disabled');
+    expect(buildHelperConfigUpdate).toHaveBeenCalledWith('device-1', 'org-1');
+  });
+
+  it('reports enabled:true when the effective setting is enabled', async () => {
+    mockHelperAuthDevice();
+    vi.mocked(resolveHelperPermissionLevelForDevice).mockResolvedValue('standard');
+    vi.mocked(buildHelperConfigUpdate).mockResolvedValueOnce({ enabled: true } as never);
+
+    const res = await app.request('/helper/config', {
+      headers: { Authorization: 'Bearer brz_agent_token' },
+    });
+
+    expect(res.status).toBe(200);
+    expect((await res.json()).enabled).toBe(true);
   });
 
   it('uses server-derived permissionLevel and allowlist when sending messages', async () => {
@@ -401,25 +655,384 @@ describe('helper routes permission derivation', () => {
     expect(systemPrompt).toBe('helper system prompt');
     expect(allowedTools).toContain('mcp__breeze__file_operations');
     expect(allowedTools).not.toContain('mcp__breeze__execute_command');
-    // Isolation: sessions without client tools pass NO mcpServerFactory — the
-    // default breeze MCP path is byte-identical to today.
     expect(getOrCreateCall?.[6]).toEqual(expect.objectContaining({
-      source: 'partner',
-      configId: 'config-1',
-      configVersion: 5,
+      funding: 'partner_key',
+      connection: expect.objectContaining({ id: 'conn-1', kind: 'anthropic_byok' }),
+      configVersion: 2,
     }));
-    expect(getOrCreateCall?.[8]).toBeUndefined();
-    expect(resolveLlmConfigMock).toHaveBeenCalledWith('partner-1');
-    expect(checkBudgetMock).toHaveBeenCalledWith('org-1', 'partner_key');
+    // A-W04: Helper REGISTERS only its permission level's tools (onlyTools),
+    // not the whole registry behind a permission-only allowlist, and resolves
+    // no tenant tools (none are in its allowlist).
+    const factory = getOrCreateCall?.[8] as ((...args: unknown[]) => { server: unknown; name: string }) | undefined;
+    expect(typeof factory).toBe('function');
+    const built = factory!(vi.fn(), vi.fn(), vi.fn(), vi.fn());
+    expect(built.name).toBe('breeze');
+    const serverCall = vi.mocked(createBreezeMcpServer).mock.calls.at(-1)!;
+    expect(serverCall[4]).toEqual([]);
+    const onlyTools = (serverCall[5] as { onlyTools: Set<string> }).onlyTools;
+    expect([...onlyTools].sort()).toEqual(getHelperAllowedTools('standard').sort());
+    expect(allowedTools!.map((n) => n.replace('mcp__breeze__', '')).sort()).toEqual([...onlyTools].sort());
+    expect(resolveSessionTurnMock).toHaveBeenCalledWith({ sessionId: 'session-1', surface: 'helper', userId: null });
+    expect(chooseSessionModelMock).not.toHaveBeenCalled();
+    expect(checkBudgetDetailedMock).toHaveBeenCalledWith('org-1', 'partner_key');
+    // Org-axis AI rate limiter — the same ceiling technician chat enforces
+    // via checkAiRateLimit. Helper sessions are device-scoped with no acting
+    // user id, so this must be the org-only (no per-user bucket) form.
+    expect(checkSystemAiRateLimitMock).toHaveBeenCalledWith('org-1');
     expect(resolveHelperPermissionLevelForDevice).toHaveBeenCalledWith('device-1', 'basic');
   });
 
-  it('returns ai_unavailable as 503 before touching the SDK manager on a turn', async () => {
+  function mockHelperMessageSession() {
+    vi.mocked(db.select).mockReturnValueOnce({
+      from: vi.fn().mockReturnValue({
+        where: vi.fn().mockReturnValue({
+          limit: vi.fn().mockResolvedValue([{
+            id: 'session-1',
+            orgId: 'org-1',
+            deviceId: 'device-1',
+            sdkSessionId: null,
+            model: 'claude-sonnet-4-5-20250929',
+            maxTurns: 50,
+            turnCount: 0,
+            status: 'active',
+            title: 'Existing title',
+            systemPrompt: 'stale extended helper prompt',
+            createdAt: new Date(),
+          }]),
+        }),
+      }),
+    } as never);
+  }
+
+  // #6354 W05: a typed caller-verification refusal rides the helper stream as
+  // the tool_result `output` string and must not be rewritten on the way out.
+  it('passes a typed caller-verification refusal tool_result through the SSE stream verbatim', async () => {
     mockHelperAuthDevice();
-    resolveLlmConfigMock.mockResolvedValue({
-      source: 'unavailable',
-      partnerId: 'partner-1',
-      reason: 'key_error',
+    vi.mocked(resolveHelperPermissionLevelForDevice).mockResolvedValue('standard');
+    mockHelperMessageSession();
+    vi.mocked(db.insert).mockReturnValueOnce({ values: vi.fn().mockResolvedValue(undefined) } as never);
+    const payload = {
+      orgId: 'org-1', contactId: null, action: 'disable_user',
+      requiredTier: 2, reason: 'contact_fenced', latest: null,
+    };
+    const refusal = JSON.stringify({ error: 'Caller verification required', requiresCallerVerification: payload });
+    const activeSession = {
+      inputController: { pushMessage: vi.fn() },
+      eventBus: {
+        subscribe: vi.fn(async function* () {
+          yield { type: 'tool_result', toolUseId: 'call-caller', output: refusal, isError: true };
+          yield { type: 'done' };
+        }),
+        unsubscribe: vi.fn(),
+        publish: vi.fn(),
+      },
+      state: 'idle',
+    };
+    vi.mocked(streamingSessionManager.getOrCreate).mockResolvedValue(activeSession as never);
+    vi.mocked(streamingSessionManager.tryTransitionToProcessing).mockReturnValue(true);
+
+    const res = await app.request('/helper/chat/sessions/session-1/messages', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer brz_agent_token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: 'hello' }),
+    });
+    const stream = await res.text();
+
+    expect(res.status).toBe(200);
+    expect(stream).toContain(JSON.stringify(refusal));
+    const dataLine = stream.split('\n').find((l) => l.startsWith('data:') && l.includes('call-caller'))!;
+    expect(JSON.parse(JSON.parse(dataLine.slice(5)).output)).toEqual({
+      error: 'Caller verification required',
+      requiresCallerVerification: payload,
+    });
+  });
+
+  it('dispatches and reserves exactly the model resolved for the helper surface (finding 13)', async () => {
+    mockHelperAuthDevice();
+    vi.mocked(resolveHelperPermissionLevelForDevice).mockResolvedValue('standard');
+    const model = makeResolvedModel('anthropic_byok', { surface: 'helper' });
+    resolveSessionTurnMock.mockResolvedValue(model);
+    mockHelperMessageSession();
+    vi.mocked(db.insert).mockReturnValueOnce({ values: vi.fn().mockResolvedValue(undefined) } as never);
+    const activeSession = {
+      inputController: { pushMessage: vi.fn() },
+      eventBus: {
+        subscribe: vi.fn(async function* () { yield { type: 'done' }; }),
+        unsubscribe: vi.fn(),
+        publish: vi.fn(),
+      },
+      state: 'idle',
+    };
+    vi.mocked(streamingSessionManager.getOrCreate).mockResolvedValue(activeSession as never);
+    vi.mocked(streamingSessionManager.tryTransitionToProcessing).mockReturnValue(true);
+
+    const res = await app.request('/helper/chat/sessions/session-1/messages', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer brz_agent_token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: 'hello' }),
+    });
+    await res.text();
+
+    expect(res.status).toBe(200);
+    expect(resolveSessionTurnMock).toHaveBeenCalledWith({ sessionId: 'session-1', surface: 'helper', userId: null });
+    const call = vi.mocked(streamingSessionManager.getOrCreate).mock.calls[0]!;
+    expect(call[6]).toBe(model);
+    expect(call[1]).not.toHaveProperty('model');
+    expect(call[9]).toEqual(expect.objectContaining({ ledgerUserId: null }));
+    expect(reserveAiBudgetMock).toHaveBeenCalledWith(expect.objectContaining({
+      billingSource: 'partner_key', binding: turnBindingFrom(model),
+    }));
+    expect(streamingSessionManager.tryTransitionToProcessing).toHaveBeenCalledWith(
+      activeSession, expect.any(String), expect.objectContaining({ turnBinding: turnBindingFrom(model) }),
+    );
+  });
+
+  it.each([
+    ['credits_exhausted', { error: 'gate message', code: 'credits_exhausted' }],
+    ['plan_gate', { error: 'gate message', code: 'plan_not_eligible' }],
+    ['daily_budget', { error: 'gate message' }],
+  ] as const)('a %s denial is a 402 with its code (if any) and takes no reservation (#9450)', async (reason, expected) => {
+    mockHelperAuthDevice();
+    vi.mocked(resolveHelperPermissionLevelForDevice).mockResolvedValue('standard');
+    resolveSessionTurnMock.mockResolvedValue(makeResolvedModel('platform', { surface: 'helper' }));
+    checkBudgetDetailedMock.mockResolvedValueOnce({
+      message: 'gate message', reason, permanent: reason === 'plan_gate',
+    });
+    mockHelperMessageSession();
+
+    const res = await app.request('/helper/chat/sessions/session-1/messages', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer brz_agent_token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: 'hello' }),
+    });
+
+    expect(res.status).toBe(402);
+    expect(await res.json()).toEqual(expected);
+    expect(reserveAiBudgetMock).not.toHaveBeenCalled();
+  });
+
+  it('an ineligible stored model is a recoverable 409 and takes no reservation', async () => {
+    mockHelperAuthDevice();
+    vi.mocked(resolveHelperPermissionLevelForDevice).mockResolvedValue('standard');
+    resolveSessionTurnMock.mockResolvedValue({
+      ok: false, reason: 'model_unavailable', recoverable: true, offeringId: 'off-1',
+      message: 'Model Opus 5.5 is no longer available — choose another.',
+    });
+    mockHelperMessageSession();
+
+    const res = await app.request('/helper/chat/sessions/session-1/messages', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer brz_agent_token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: 'hello' }),
+    });
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({
+      error: 'Model Opus 5.5 is no longer available — choose another.', code: 'model_unavailable', recoverable: true,
+    });
+    expect(reserveAiBudgetMock).not.toHaveBeenCalled();
+    expect(checkBudgetDetailedMock).not.toHaveBeenCalled();
+    expect(streamingSessionManager.getOrCreate).not.toHaveBeenCalled();
+  });
+
+  it('429s a turn when the org-wide AI rate limit is exceeded', async () => {
+    mockHelperAuthDevice();
+    vi.mocked(resolveHelperPermissionLevelForDevice).mockResolvedValue('standard');
+    checkSystemAiRateLimitMock.mockResolvedValueOnce('Organization rate limit exceeded. Try again at 2026-01-01T00:00:00.000Z');
+
+    vi.mocked(db.select).mockReturnValueOnce({
+      from: vi.fn().mockReturnValue({
+        where: vi.fn().mockReturnValue({
+          limit: vi.fn().mockResolvedValue([{
+            id: 'session-1',
+            orgId: 'org-1',
+            deviceId: 'device-1',
+            sdkSessionId: null,
+            model: 'claude-sonnet-4-5-20250929',
+            maxTurns: 50,
+            turnCount: 0,
+            status: 'active',
+            title: 'Existing title',
+            systemPrompt: 'stale extended helper prompt',
+            createdAt: new Date(),
+          }]),
+        }),
+      }),
+    } as never);
+
+    const res = await app.request('/helper/chat/sessions/session-1/messages', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer brz_agent_token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: 'hello' }),
+    });
+
+    expect(res.status).toBe(429);
+    expect(db.insert).not.toHaveBeenCalled();
+    expect(reserveAiBudgetMock).not.toHaveBeenCalled();
+  });
+
+  // #3127: under its real /api/v1 mount the message-send route is registered in
+  // selfManagedDbContextRoutes, so helperAuth opens no request transaction and
+  // the settle wait runs with no DB context held, between two short ones.
+  it('#3127: settles an approval-blocked turn with no DB context held, between two short ones', async () => {
+    let depth = 0;
+    vi.mocked(withDbAccessContext).mockImplementation(async (_ctx: unknown, fn: () => Promise<unknown>) => {
+      depth += 1;
+      try {
+        return await fn();
+      } finally {
+        depth -= 1;
+      }
+    });
+    const depths: Record<string, number> = {};
+    mockHelperAuthDevice();
+    vi.mocked(resolveHelperPermissionLevelForDevice).mockImplementation(async () => {
+      depths.preflight = depth;
+      return 'standard';
+    });
+    vi.mocked(db.select).mockReturnValueOnce({
+      from: vi.fn().mockReturnValue({
+        where: vi.fn().mockReturnValue({
+          limit: vi.fn().mockResolvedValue([{
+            id: 'session-1',
+            orgId: 'org-1',
+            deviceId: 'device-1',
+            sdkSessionId: null,
+            model: 'claude-sonnet-4-5-20250929',
+            maxTurns: 50,
+            turnCount: 0,
+            status: 'active',
+            title: 'Existing title',
+            systemPrompt: 'prompt',
+            createdAt: new Date(),
+          }]),
+        }),
+      }),
+    } as never);
+    vi.mocked(db.insert).mockImplementationOnce(() => {
+      depths.insert = depth;
+      return { values: vi.fn().mockResolvedValue(undefined) } as never;
+    });
+    const activeSession = {
+      inputController: { pushMessage: vi.fn() },
+      eventBus: {
+        subscribe: vi.fn(async function* () {
+          yield { type: 'done' };
+        }),
+        unsubscribe: vi.fn(),
+        publish: vi.fn(),
+      },
+      state: 'processing',
+    };
+    vi.mocked(streamingSessionManager.get)
+      .mockReturnValueOnce(activeSession as never)
+      .mockReturnValueOnce(undefined);
+    vi.mocked(settleBlockedTurnForNewMessage).mockImplementationOnce(async () => {
+      depths.settle = depth;
+      return 'concluded';
+    });
+    reserveAiBudgetMock.mockImplementationOnce(async () => {
+      depths.reserve = depth;
+      return {
+        kind: 'unlimited',
+        reservationId: '11111111-1111-4111-8111-111111111111',
+        dailyPeriodKey: '2026-09-06',
+        monthlyPeriodKey: '2026-09-01',
+        status: 'active',
+      };
+    });
+    vi.mocked(streamingSessionManager.getOrCreate).mockImplementation(async () => {
+      depths.getOrCreate = depth;
+      return activeSession as never;
+    });
+    vi.mocked(streamingSessionManager.tryTransitionToProcessing).mockReturnValue(true);
+
+    const apiApp = new Hono();
+    apiApp.route('/api/v1/helper', helperRoutes);
+    const res = await apiApp.request('/api/v1/helper/chat/sessions/session-1/messages', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer brz_agent_token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: 'hello' }),
+    });
+    await res.text();
+
+    expect(res.status).toBe(200);
+    expect(depths).toEqual({ preflight: 1, settle: 0, reserve: 0, getOrCreate: 1, insert: 1 });
+    expect(activeSession.inputController.pushMessage).toHaveBeenCalledWith('hello');
+    expect(depth).toBe(0);
+  });
+
+  it('#7783: subscribes to the session events BEFORE the turn is pushed: a transport that answers at once still reaches the helper', async () => {
+    // The real SessionEventBus has no replay: an event published while nobody
+    // is subscribed is gone. Model a transport fast enough to publish the
+    // whole turn synchronously when the message is pushed.
+    const subscribers = new Map<string, Array<{ type: string; message?: string }>>();
+    const waiters = new Map<string, () => void>();
+    const bus = {
+      subscribe: vi.fn((id: string) => {
+        subscribers.set(id, []);
+        return (async function* () {
+          for (;;) {
+            const queue = subscribers.get(id)!;
+            while (queue.length) {
+              const event = queue.shift()!;
+              yield event;
+              if (event.type === 'done') return;
+            }
+            await new Promise<void>((resolve) => { waiters.set(id, resolve); });
+          }
+        })();
+      }),
+      unsubscribe: vi.fn((id: string) => { subscribers.delete(id); }),
+      publish: vi.fn((event: { type: string; message?: string }) => {
+        for (const [id, queue] of subscribers) { queue.push(event); waiters.get(id)?.(); }
+      }),
+    };
+    mockHelperAuthDevice();
+    vi.mocked(db.select).mockReturnValueOnce({
+      from: vi.fn().mockReturnValue({
+        where: vi.fn().mockReturnValue({
+          limit: vi.fn().mockResolvedValue([{
+            id: 'session-1', orgId: 'org-1', deviceId: 'device-1', sdkSessionId: null,
+            model: 'claude-sonnet-4-5-20250929', maxTurns: 50, turnCount: 0, status: 'active',
+            title: 'Existing title', systemPrompt: 'prompt', createdAt: new Date(),
+          }]),
+        }),
+      }),
+    } as never);
+    vi.mocked(db.insert).mockImplementationOnce(() => ({ values: vi.fn().mockResolvedValue(undefined) }) as never);
+    const activeSession = {
+      inputController: {
+        pushMessage: vi.fn(() => {
+          bus.publish({ type: 'error', message: 'helper turn failed fast' });
+          bus.publish({ type: 'done' });
+        }),
+      },
+      eventBus: bus,
+      state: 'processing',
+    };
+    vi.mocked(streamingSessionManager.get).mockReturnValue(undefined as never);
+    vi.mocked(streamingSessionManager.getOrCreate).mockResolvedValue(activeSession as never);
+    vi.mocked(streamingSessionManager.tryTransitionToProcessing).mockReturnValue(true);
+
+    const apiApp = new Hono();
+    apiApp.route('/api/v1/helper', helperRoutes);
+    const res = await apiApp.request('/api/v1/helper/chat/sessions/session-1/messages', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer brz_agent_token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: 'hello' }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain('helper turn failed fast');
+    expect(bus.unsubscribe).toHaveBeenCalled();
+  });
+
+  it('an unusable connection on a turn is a recoverable 409 before touching the SDK manager; a client partnerId is ignored', async () => {
+    mockHelperAuthDevice();
+    resolveSessionTurnMock.mockResolvedValue({
+      ok: false, reason: 'connection_unavailable', recoverable: true, offeringId: 'off-1',
+      message: 'The AI provider connection for this model is unavailable. Reconnect it under AI Providers & Models.',
     });
     vi.mocked(db.select).mockReturnValueOnce({
       from: vi.fn().mockReturnValue({
@@ -443,18 +1056,21 @@ describe('helper routes permission derivation', () => {
       body: JSON.stringify({ content: 'hello', partnerId: 'attacker-partner' }),
     });
 
-    expect(res.status).toBe(503);
-    expect(await res.json()).toEqual({ error: 'ai_unavailable' });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({
+      error: 'The AI provider connection for this model is unavailable. Reconnect it under AI Providers & Models.',
+      code: 'connection_unavailable',
+      recoverable: true,
+    });
     expect(streamingSessionManager.getOrCreate).not.toHaveBeenCalled();
-    expect(resolveLlmConfigMock).toHaveBeenCalledWith('partner-1');
+    expect(reserveAiBudgetMock).not.toHaveBeenCalled();
+    expect(resolveSessionTurnMock).toHaveBeenCalledWith({ sessionId: 'session-1', surface: 'helper', userId: null });
   });
 
   /**
-   * The resolver-level check above cannot see this one: `getOrCreate` resolves
-   * the WIRE model inside the manager, so a pinned revision with no verified
-   * mapping for this session's model throws only once the manager is already
-   * running (#3922 W3 review round 2). Unmapped, it reached Hono's onError as a
-   * 500 — telling the helper "we broke" instead of "reconnect your provider".
+   * Last-resort guard (#3922 W3 review round 2): the model is resolved in
+   * preflight now, but an LlmUnavailableError from the manager must still map
+   * to 503 ai_unavailable rather than reach Hono's onError as a 500.
    */
   it('maps a wire-model fail-close from the SDK manager to 503 ai_unavailable', async () => {
     mockHelperAuthDevice();
@@ -495,7 +1111,7 @@ describe('helper routes permission derivation', () => {
 
   it('captures resolver throws and returns a generic retryable 503 on a turn', async () => {
     mockHelperAuthDevice();
-    resolveLlmConfigMock.mockRejectedValueOnce(new Error('decrypt subsystem failed'));
+    resolveSessionTurnMock.mockRejectedValueOnce(new Error('decrypt subsystem failed'));
     vi.mocked(db.select).mockReturnValueOnce({
       from: vi.fn().mockReturnValue({
         where: vi.fn().mockReturnValue({
@@ -537,14 +1153,8 @@ describe('helper client-declared session tools', () => {
       monthlyPeriodKey: '2026-09-01',
       status: 'active',
     });
-    resolveLlmConfigMock.mockResolvedValue({
-      source: 'partner',
-      partnerId: 'partner-1',
-      apiKey: 'partner-key',
-      model: 'claude-opus-4-6',
-      configId: 'config-1',
-      configVersion: 5,
-    });
+    chooseSessionModelMock.mockResolvedValue(helperChoice());
+    resolveSessionTurnMock.mockResolvedValue(makeResolvedModel('anthropic_byok', { surface: 'helper' }));
     app = new Hono();
     app.route('/helper', helperRoutes);
   });
@@ -730,5 +1340,367 @@ describe('helper client-declared session tools', () => {
 
     expect(res.status).toBe(404);
     expect(resolveClientDeclaredTool).not.toHaveBeenCalled();
+  });
+});
+
+// ============================================
+// Helper session ownership scoping
+//
+// ai_sessions is org-axis RLS only: a technician's device-bound session (userId
+// set) and a helper-created session (userId null, contextSnapshot.source =
+// 'helper') share the same org_id/device_id. Every helper session route must
+// add an app-layer predicate restricting reads/writes to sessions the helper
+// itself created, or a helper token for device A can reach a technician's
+// device-task session for the same device. These tests build the actual
+// `where(...)` predicate tree from the mocked eq/and/isNull/sql and evaluate
+// it against fixture rows, so they fail red on the pre-fix query (which never
+// added the extra predicate, so every row matched) and pass once the route
+// filters on it.
+// ============================================
+
+function conditionColumnKey(col: unknown): string {
+  return String(col).split('.').pop() ?? String(col);
+}
+
+type MockedCond =
+  | { eq: [unknown, unknown] }
+  | { and: MockedCond[] }
+  | { isNull: [unknown] }
+  | { sql: unknown; values: unknown[] }
+  | Record<string, unknown>;
+
+function conditionMatchesRow(cond: MockedCond, row: Record<string, unknown>): boolean {
+  if ('eq' in cond && Array.isArray((cond as { eq: unknown }).eq)) {
+    const [col, val] = (cond as { eq: [unknown, unknown] }).eq;
+    return row[conditionColumnKey(col)] === val;
+  }
+  if ('and' in cond && Array.isArray((cond as { and: unknown }).and)) {
+    return (cond as { and: MockedCond[] }).and.every((c) => conditionMatchesRow(c, row));
+  }
+  if ('isNull' in cond && Array.isArray((cond as { isNull: unknown }).isNull)) {
+    const [col] = (cond as { isNull: [unknown] }).isNull;
+    return row[conditionColumnKey(col)] == null;
+  }
+  if ('sql' in cond) {
+    // helperOwnedSessionConditions' contextSnapshot->>'source' = 'helper' check.
+    const snapshot = row.contextSnapshot as Record<string, unknown> | null | undefined;
+    return snapshot?.source === 'helper';
+  }
+  return true;
+}
+
+/** Session select that actually filters fixture rows against the route's built WHERE tree. */
+function mockFilteredSessionSelect(rows: Record<string, unknown>[]) {
+  vi.mocked(db.select).mockReturnValueOnce({
+    from: vi.fn().mockReturnValue({
+      where: vi.fn((cond: MockedCond) => ({
+        limit: vi.fn().mockResolvedValue(rows.filter((r) => conditionMatchesRow(cond, r))),
+        orderBy: vi.fn().mockReturnValue({
+          limit: vi.fn().mockResolvedValue(rows.filter((r) => conditionMatchesRow(cond, r))),
+        }),
+      })),
+    }),
+  } as never);
+}
+
+const HELPER_OWNED_SESSION = {
+  id: 'session-helper',
+  orgId: 'org-1',
+  deviceId: 'device-1',
+  userId: null,
+  status: 'active',
+  title: null,
+  turnCount: 0,
+  maxTurns: 50,
+  model: 'claude-sonnet-4-5-20250929',
+  sdkSessionId: null,
+  systemPrompt: 'helper prompt',
+  createdAt: new Date(),
+  updatedAt: new Date(),
+  contextSnapshot: { source: 'helper', deviceId: 'device-1' },
+};
+
+// Same device, but created by a technician (device-task "Ask AI" session) —
+// this must stay unreachable through any helper-token route.
+const TECHNICIAN_SESSION_SAME_DEVICE = {
+  id: 'session-tech',
+  orgId: 'org-1',
+  deviceId: 'device-1',
+  userId: 'tech-user-1',
+  status: 'active',
+  title: 'Reliability panel session',
+  turnCount: 1,
+  maxTurns: 50,
+  model: 'claude-sonnet-4-5-20250929',
+  sdkSessionId: 'sdk-session-abc',
+  systemPrompt: 'technician prompt',
+  createdAt: new Date(),
+  updatedAt: new Date(),
+  contextSnapshot: { pageContext: 'device-details' },
+};
+
+describe('helper session ownership scoping (cross-principal isolation)', () => {
+  let app: Hono;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    chooseSessionModelMock.mockResolvedValue(helperChoice());
+    resolveSessionTurnMock.mockResolvedValue(makeResolvedModel('anthropic_byok', { surface: 'helper' }));
+    app = new Hono();
+    app.route('/helper', helperRoutes);
+  });
+
+  it('reads messages for a session the helper itself created (same device, allowed)', async () => {
+    mockHelperAuthDevice();
+    mockFilteredSessionSelect([HELPER_OWNED_SESSION, TECHNICIAN_SESSION_SAME_DEVICE]);
+    vi.mocked(db.select).mockReturnValueOnce({
+      from: vi.fn().mockReturnValue({
+        where: vi.fn().mockReturnValue({
+          orderBy: vi.fn().mockResolvedValue([{ id: 'm1', role: 'user', content: 'hi', toolName: null, toolOutput: null, createdAt: new Date() }]),
+        }),
+      }),
+    } as never);
+
+    const res = await app.request('/helper/chat/sessions/session-helper/messages', {
+      headers: { Authorization: 'Bearer brz_agent_token' },
+    });
+
+    expect(res.status).toBe(200);
+  });
+
+  it('returns a stored caller-verification refusal toolOutput verbatim in history', async () => {
+    const payload = {
+      orgId: 'org-1', contactId: null, action: 'disable_user',
+      requiredTier: 2, reason: 'contact_fenced', latest: null,
+    };
+    const refusal = JSON.stringify({ error: 'Caller verification required', requiresCallerVerification: payload });
+    mockHelperAuthDevice();
+    mockFilteredSessionSelect([HELPER_OWNED_SESSION, TECHNICIAN_SESSION_SAME_DEVICE]);
+    vi.mocked(db.select).mockReturnValueOnce({
+      from: vi.fn().mockReturnValue({
+        where: vi.fn().mockReturnValue({
+          orderBy: vi.fn().mockResolvedValue([
+            { id: 'm2', role: 'tool_result', content: null, toolName: 'm365_disable_user', toolOutput: refusal, createdAt: new Date() },
+          ]),
+        }),
+      }),
+    } as never);
+
+    const res = await app.request('/helper/chat/sessions/session-helper/messages', {
+      headers: { Authorization: 'Bearer brz_agent_token' },
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body[0].toolOutput).toBe(refusal);
+  });
+
+  it('denies reading a technician device-task session transcript for the same device', async () => {
+    mockHelperAuthDevice();
+    mockFilteredSessionSelect([HELPER_OWNED_SESSION, TECHNICIAN_SESSION_SAME_DEVICE]);
+
+    const res = await app.request('/helper/chat/sessions/session-tech/messages', {
+      headers: { Authorization: 'Bearer brz_agent_token' },
+    });
+
+    expect(res.status).toBe(404);
+  });
+
+  it('excludes the technician device-task session from the helper session list', async () => {
+    mockHelperAuthDevice();
+    mockFilteredSessionSelect([HELPER_OWNED_SESSION, TECHNICIAN_SESSION_SAME_DEVICE]);
+
+    const res = await app.request('/helper/chat/sessions', {
+      headers: { Authorization: 'Bearer brz_agent_token' },
+    });
+    const body = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(body.map((s: { id: string }) => s.id)).toEqual(['session-helper']);
+  });
+
+  it('denies posting into a technician device-task session (turn resume by the helper)', async () => {
+    mockHelperAuthDevice();
+    mockFilteredSessionSelect([HELPER_OWNED_SESSION, TECHNICIAN_SESSION_SAME_DEVICE]);
+
+    const res = await app.request('/helper/chat/sessions/session-tech/messages', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer brz_agent_token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: 'planted instruction' }),
+    });
+
+    expect(res.status).toBe(404);
+    expect(streamingSessionManager.getOrCreate).not.toHaveBeenCalled();
+  });
+
+  it('denies closing a technician device-task session', async () => {
+    mockHelperAuthDevice();
+    mockFilteredSessionSelect([HELPER_OWNED_SESSION, TECHNICIAN_SESSION_SAME_DEVICE]);
+
+    const res = await app.request('/helper/chat/sessions/session-tech', {
+      method: 'DELETE',
+      headers: { Authorization: 'Bearer brz_agent_token' },
+    });
+
+    expect(res.status).toBe(404);
+  });
+
+  it('denies flagging a technician device-task session', async () => {
+    mockHelperAuthDevice();
+    mockFilteredSessionSelect([HELPER_OWNED_SESSION, TECHNICIAN_SESSION_SAME_DEVICE]);
+
+    const res = await app.request('/helper/chat/sessions/session-tech/flag', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer brz_agent_token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reason: 'suspicious' }),
+    });
+
+    expect(res.status).toBe(404);
+  });
+
+  it('denies posting a tool-result into a technician device-task session', async () => {
+    mockHelperAuthDevice();
+    mockFilteredSessionSelect([HELPER_OWNED_SESSION, TECHNICIAN_SESSION_SAME_DEVICE]);
+
+    const res = await app.request('/helper/chat/sessions/session-tech/tool-results', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer brz_agent_token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ toolUseId: 'tu-1', output: {} }),
+    });
+
+    expect(res.status).toBe(404);
+    expect(resolveClientDeclaredTool).not.toHaveBeenCalled();
+  });
+
+  // Defense in depth: a session carrying ANY principal (agent run, portal
+  // client user) is never helper-owned, even if its snapshot claims
+  // source='helper'. The single-principal check constraint keeps userId null
+  // on these rows, so the userId predicate alone would not exclude them.
+  it.each([
+    ['AI-agent run session', { agentId: 'ai-agent-1' }],
+    ['portal client-user session', { clientUserId: 'portal-user-1' }],
+  ])('denies reading a %s bound to the same device even with a helper source stamp', async (_label, principal) => {
+    mockHelperAuthDevice();
+    mockFilteredSessionSelect([
+      { ...HELPER_OWNED_SESSION, id: 'session-principal', ...principal },
+    ]);
+
+    const res = await app.request('/helper/chat/sessions/session-principal/messages', {
+      headers: { Authorization: 'Bearer brz_agent_token' },
+    });
+
+    expect(res.status).toBe(404);
+  });
+
+  it('refuses to attach a screenshot to a technician device-task session', async () => {
+    mockHelperAuthDevice();
+    mockFilteredSessionSelect([HELPER_OWNED_SESSION, TECHNICIAN_SESSION_SAME_DEVICE]);
+
+    const res = await app.request('/helper/screenshots', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer brz_agent_token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        imageBase64: 'aGVsbG8=', width: 10, height: 10,
+        sessionId: '00000000-0000-4000-8000-000000000002',
+      }),
+    });
+
+    expect(res.status).toBe(404);
+    expect(storeScreenshot).not.toHaveBeenCalled();
+  });
+
+  it('attaches a screenshot to a session the helper itself created', async () => {
+    const helperSessionId = '00000000-0000-4000-8000-000000000001';
+    mockHelperAuthDevice();
+    mockFilteredSessionSelect([{ ...HELPER_OWNED_SESSION, id: helperSessionId }]);
+    vi.mocked(storeScreenshot).mockResolvedValueOnce({
+      id: 'shot-1', storageKey: 'k', sizeBytes: 5, expiresAt: new Date(),
+    } as never);
+
+    const res = await app.request('/helper/screenshots', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer brz_agent_token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ imageBase64: 'aGVsbG8=', width: 10, height: 10, sessionId: helperSessionId }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(storeScreenshot).toHaveBeenCalledWith(expect.objectContaining({ sessionId: helperSessionId }));
+  });
+});
+
+describe('POST /helper/screenshots', () => {
+  let app: Hono;
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    app = new Hono();
+    app.route('/helper', helperRoutes);
+    const { getRedis } = await import('../../services');
+    vi.mocked(getRedis).mockReturnValue(null);
+  });
+
+  function postScreenshot(body: Record<string, unknown> = {}) {
+    return app.request('/helper/screenshots', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer brz_agent_token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        imageBase64: 'dGVzdGltYWdl',
+        width: 100,
+        height: 100,
+        ...body,
+      }),
+    });
+  }
+
+  it('stores the screenshot and returns its metadata on success', async () => {
+    mockHelperAuthDevice();
+    const { storeScreenshot } = await import('../../services/screenshotStorage');
+    vi.mocked(storeScreenshot).mockResolvedValue({
+      id: 'shot-1',
+      storageKey: 'screenshots/org-1/device-1/shot-1.jpg',
+      width: 100,
+      height: 100,
+      sizeBytes: 9,
+      expiresAt: new Date('2026-01-02T00:00:00Z'),
+    });
+
+    const res = await postScreenshot();
+
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(json).toEqual(expect.objectContaining({ id: 'shot-1', sizeBytes: 9 }));
+  });
+
+  it('rejects with 429 once the per-device rate limit is hit', async () => {
+    mockHelperAuthDevice();
+    const { getRedis, rateLimiter } = await import('../../services');
+    vi.mocked(getRedis).mockReturnValue({} as never);
+    vi.mocked(rateLimiter).mockResolvedValue({ allowed: false, remaining: 0, resetAt: new Date() });
+    const { storeScreenshot } = await import('../../services/screenshotStorage');
+
+    const res = await postScreenshot();
+
+    expect(res.status).toBe(429);
+    expect(storeScreenshot).not.toHaveBeenCalled();
+  });
+
+  it('rejects with 413 when storeScreenshot reports an oversized image', async () => {
+    mockHelperAuthDevice();
+    const { storeScreenshot, ScreenshotTooLargeError } = await import('../../services/screenshotStorage');
+    vi.mocked(storeScreenshot).mockRejectedValue(new ScreenshotTooLargeError(2_000_000, 1_600_000));
+
+    const res = await postScreenshot();
+
+    expect(res.status).toBe(413);
+  });
+
+  it('rejects with 429 when storeScreenshot reports the device quota is exceeded', async () => {
+    mockHelperAuthDevice();
+    const { storeScreenshot, ScreenshotQuotaExceededError } = await import('../../services/screenshotStorage');
+    vi.mocked(storeScreenshot).mockRejectedValue(new ScreenshotQuotaExceededError('device-1', 'count'));
+
+    const res = await postScreenshot();
+
+    expect(res.status).toBe(429);
   });
 });

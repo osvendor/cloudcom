@@ -57,6 +57,26 @@ export const reportTypeEnum = pgEnum('report_type', [
   'ticket_sla_attainment',
   'technician_time_billability',
   'ar_aging',
+  // Backup Provider Integration W05 (#6013): Cove-email-style snapshot over
+  // both first-party backups and connected provider devices; see
+  // services/backupStatusReport.ts.
+  'backup_status',
+  // AI chargeback W10 (#7608): per-client AI usage by org / model with
+  // chargeable amounts; see services/businessReports/aiUsageByClientReport.ts.
+  'ai_usage_by_client',
+  // Business reports phase 2 W1 (#9828): contract MRR & renewals as of run
+  // time; see services/businessReports/mrrRenewalsReport.ts.
+  'mrr_renewals',
+  // Business reports phase 2 W2 (#9828): quote win rate over revision
+  // lineages; see services/businessReports/quoteWinRateReport.ts.
+  'quote_win_rate',
+  // Business reports phase 2 W3 (#9828): per-client billed revenue, cost
+  // snapshot coverage, hours and an optional labor estimate; see
+  // services/businessReports/clientProfitabilityReport.ts.
+  'client_profitability',
+  // Customer SLA performance (#11018): org-only, audience any; see
+  // services/businessReports/ticketSlaPerformanceReport.ts.
+  'ticket_sla_performance',
 ]);
 
 export const reportScheduleEnum = pgEnum('report_schedule', [
@@ -74,6 +94,57 @@ export const reportRunStatusEnum = pgEnum('report_run_status', [
   'completed',
   'failed'
 ]);
+
+/**
+ * Multi-org report series W02 (spec 2026-09-28 §3.2). ONE partner-owned
+ * definition that fans out into one ordinary org-owned `reports` child per
+ * targeted organization. Partner-axis (shape 3, partner_id NOT NULL — the D6
+ * Partner-Wide-First exception). It never executes: the reconciler
+ * (services/reportSeries/reconcile.ts) materializes the children. CHECKs and
+ * the constraint triggers live in SQL only
+ * (migrations/2026-11-09-110000-report-series.sql).
+ */
+export const reportSeries = pgTable('report_series', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  partnerId: uuid('partner_id').notNull().references(() => partners.id, { onDelete: 'cascade' }),
+  name: varchar('name', { length: 255 }).notNull(),
+  type: reportTypeEnum('type').notNull(),
+  format: reportFormatEnum('format').notNull().default('pdf'),
+  schedule: reportScheduleEnum('schedule').notNull(),
+  config: jsonb('config').$type<Record<string, unknown>>().notNull().default({}),
+  targetMode: text('target_mode').$type<'all' | 'selected'>().notNull().default('all'),
+  recipientRule: jsonb('recipient_rule')
+    .$type<{ primaryContact: boolean; roles: string[] }>()
+    .notNull()
+    .default({ primaryContact: true, roles: [] }),
+  internalCc: text('internal_cc').array().notNull().default(sql`'{}'::text[]`),
+  revision: integer('revision').notNull().default(1),
+  enabled: boolean('enabled').notNull().default(true),
+  // ON DELETE SET NULL (users is in the org cascade set). NULL = every child
+  // blocked_no_authority; never a system fallback.
+  ownerUserId: uuid('owner_user_id').references(() => users.id, { onDelete: 'set null' }),
+  createdBy: uuid('created_by').references(() => users.id, { onDelete: 'set null' }),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => ({
+  partnerIdx: index('report_series_partner_idx').on(table.partnerId),
+  ownerIdx: index('report_series_owner_user_idx').on(table.ownerUserId),
+}));
+
+/**
+ * Multi-org report series W02. Shape 1 (direct org_id). In target_mode 'all'
+ * a row is an EXCLUSION; in 'selected' an INCLUSION. Same-partner is enforced
+ * by the report_series_org_targets_same_partner constraint trigger.
+ */
+export const reportSeriesOrgTargets = pgTable('report_series_org_targets', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  seriesId: uuid('series_id').notNull().references(() => reportSeries.id, { onDelete: 'cascade' }),
+  orgId: uuid('org_id').notNull().references(() => organizations.id),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => ({
+  seriesOrgUniq: uniqueIndex('report_series_org_targets_series_org_uniq').on(table.seriesId, table.orgId),
+  orgIdx: index('report_series_org_targets_org_idx').on(table.orgId),
+}));
 
 export const reports = pgTable('reports', {
   id: uuid('id').primaryKey().defaultRandom(),
@@ -113,12 +184,30 @@ export const reports = pgTable('reports', {
   // contract reads it from pg_constraint at runtime anyway.
   sourceAiAgentScheduleId: uuid('source_ai_agent_schedule_id'),
   portalSelfService: boolean('portal_self_service').notNull().default(false),
+  // Multi-org report series W02: set only on ORG-owned children
+  // (reports_series_child_shape_chk). ON DELETE SET NULL — a deleted series
+  // leaves its children archived (the BEFORE DELETE trigger archives them).
+  seriesId: uuid('series_id').references(() => reportSeries.id, { onDelete: 'set null' }),
+  // 0 = created/adopted, never reconciled (INDEX revision sentinel);
+  // report_series.revision starts at 1, so 0 is always stale.
+  seriesRevision: integer('series_revision'),
+  archivedAt: timestamp('archived_at', { withTimezone: true }),
+  // Set on a STANDALONE report detached from that series (series_id NULL,
+  // reports_detached_from_series_chk). While it is live, its org is not
+  // targeted by that series (services/reportSeries/targets.ts), so a later
+  // targets change cannot mint a second child next to it.
+  detachedFromSeriesId: uuid('detached_from_series_id')
+    .references(() => reportSeries.id, { onDelete: 'set null' }),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull()
 }, (table) => ({
   reportsIdOrgIdUniq: uniqueIndex('reports_id_org_id_uniq')
     .on(table.id, table.orgId),
   reportsPartnerIdIdx: index('reports_partner_id_idx').on(table.partnerId),
+  // #4247: target of report_runs_report_partner_fk. NON-partial for the same
+  // reason as reports_id_org_id_uniq — a partial index cannot back an FK.
+  reportsIdPartnerIdUniq: uniqueIndex('reports_id_partner_id_uniq')
+    .on(table.id, table.partnerId),
   reportsPortalSelfServiceOrgTypeUniq: uniqueIndex(
     'reports_portal_self_service_org_type_uniq',
   ).on(table.orgId, table.type)
@@ -128,12 +217,51 @@ export const reports = pgTable('reports', {
   aiFleetDesignOrgUniq: uniqueIndex('reports_ai_fleet_design_org_uniq')
     .on(table.orgId)
     .where(sql`${table.type} = 'ai_fleet_design'`),
+  // Multi-org report series W02: one ACTIVE child per (org, series).
+  seriesActiveChildUniq: uniqueIndex('reports_series_active_child_uniq')
+    .on(table.orgId, table.seriesId)
+    .where(sql`${table.seriesId} IS NOT NULL AND ${table.archivedAt} IS NULL`),
+  seriesIdx: index('reports_series_id_idx')
+    .on(table.seriesId)
+    .where(sql`${table.seriesId} IS NOT NULL`),
+  detachedFromSeriesIdx: index('reports_detached_from_series_id_idx')
+    .on(table.detachedFromSeriesId)
+    .where(sql`${table.detachedFromSeriesId} IS NOT NULL`),
 }));
+
+/**
+ * `report_runs.delivery_status` (multi-org report series W01, spec §3.2):
+ * what a scheduled run's email did. NULL for ad-hoc and pre-W01 runs;
+ * 'not_scheduled' for a manual run of a scheduled definition. Pinned by
+ * `report_runs_delivery_status_chk`. Re-exported from
+ * `services/reportDelivery.ts`, the cross-wave contract path — declared here
+ * because the column below needs it and the schema layer never imports
+ * services.
+ */
+export const REPORT_DELIVERY_STATUSES = [
+  'sent',
+  'partial',
+  'no_recipients',
+  'failed',
+  'not_scheduled',
+] as const;
+export type ReportDeliveryStatus = (typeof REPORT_DELIVERY_STATUSES)[number];
 
 export const reportRuns = pgTable('report_runs', {
   id: uuid('id').primaryKey().defaultRandom(),
   // #3198 W01: ON DELETE CASCADE since migration 2026-10-27-130100.
   reportId: uuid('report_id').notNull().references(() => reports.id, { onDelete: 'cascade' }),
+  /**
+   * #4247: the run's owner is ALWAYS its parent report's current owner —
+   * org_id XOR partner_id (`report_runs_one_owner_chk`), pinned to the parent
+   * by the composite FKs below. Every insert site copies both from the loaded
+   * parent (`reportRunOwnerColumns`, services/reportRunOwner.ts); a BEFORE INSERT trigger
+   * (`report_runs_fill_owner`, migration 2026-12-17-160000) fills them from
+   * the parent when a writer omits both. Direct dual-axis RLS keys on these
+   * columns; there is NO org-readable partner-wide SELECT branch.
+   */
+  orgId: uuid('org_id').references(() => organizations.id),
+  partnerId: uuid('partner_id').references(() => partners.id),
   status: reportRunStatusEnum('status').notNull().default('pending'),
   startedAt: timestamp('started_at'),
   completedAt: timestamp('completed_at'),
@@ -172,10 +300,18 @@ export const reportRuns = pgTable('report_runs', {
    * technique as `contracts.ts`'s catalog_item_id / site_id.
    */
   artifactId: uuid('artifact_id'),
+  /** Multi-org report series W01 — see REPORT_DELIVERY_STATUSES. */
+  deliveryStatus: text('delivery_status').$type<ReportDeliveryStatus>(),
+  /**
+   * Multi-org report series W01 (spec §3.5): customer recipients the scheduled
+   * run resolved — for a non-series report, contacts plus valid
+   * `config.emailRecipients`; a W02 series child excludes its internal CC.
+   */
+  recipientCount: integer('recipient_count'),
   createdAt: timestamp('created_at').defaultNow().notNull()
 }, (table) => ({
   // (id, report_id) key so service_deliverable_evidence can prove a run belongs to
-  // a report of the same org (report_runs has no org_id of its own). Spec #5573 §4.3.
+  // a report of the same org (it predates report_runs.org_id, #4247). Spec #5573 §4.3.
   reportRunsIdReportIdUniq: uniqueIndex('report_runs_id_report_id_uniq').on(table.id, table.reportId),
   requestedByShape: check(
     'report_runs_requested_by_shape_chk',
@@ -200,6 +336,40 @@ export const reportRuns = pgTable('report_runs', {
       )
     ) IS TRUE`,
   ),
+  deliveryStatusShape: check(
+    'report_runs_delivery_status_chk',
+    sql`(
+      ${table.deliveryStatus} IS NULL
+      OR ${table.deliveryStatus} IN ('sent', 'partial', 'no_recipients', 'failed', 'not_scheduled')
+    )`,
+  ),
+  recipientCountShape: check(
+    'report_runs_recipient_count_chk',
+    sql`(${table.recipientCount} IS NULL OR ${table.recipientCount} >= 0)`,
+  ),
+  reportIdCreatedAtIdx: index('report_runs_report_id_created_at_idx')
+    .on(table.reportId, table.createdAt.desc(), table.id.desc()),
+  // #4247 owner binding. Both FKs are also ON DELETE CASCADE and DEFERRABLE
+  // INITIALLY IMMEDIATE in migration 2026-12-17-160200 (org merge re-points
+  // reports.org_id and report_runs.org_id in separate statements under
+  // SET CONSTRAINTS ALL DEFERRED); drizzle-orm's foreignKey() builder has no
+  // deferrable option, so the migration is the source of truth.
+  reportOrgFk: foreignKey({
+    name: 'report_runs_report_org_fk',
+    columns: [table.reportId, table.orgId],
+    foreignColumns: [reports.id, reports.orgId],
+  }).onDelete('cascade'),
+  reportPartnerFk: foreignKey({
+    name: 'report_runs_report_partner_fk',
+    columns: [table.reportId, table.partnerId],
+    foreignColumns: [reports.id, reports.partnerId],
+  }).onDelete('cascade'),
+  oneOwner: check(
+    'report_runs_one_owner_chk',
+    sql`((${table.orgId} IS NULL) <> (${table.partnerId} IS NULL))`,
+  ),
+  orgIdIdx: index('report_runs_org_id_idx').on(table.orgId),
+  partnerIdIdx: index('report_runs_partner_id_idx').on(table.partnerId),
 }));
 
 export const REPORT_RUN_DELIVERY_STATES = ['pending', 'claimed', 'sent', 'failed', 'unknown'] as const;
@@ -257,6 +427,9 @@ export const reportScheduleRecipients = pgTable(
     reportId: uuid('report_id').notNull(),
     orgId: uuid('org_id').notNull(),
     contactId: uuid('contact_id').notNull(),
+    // Multi-org report series W02: 'remove' exists only on series children
+    // (the route refuses it elsewhere); every legacy row is 'add'.
+    mode: text('mode').$type<'add' | 'remove'>().notNull().default('add'),
     createdAt: timestamp('created_at', { withTimezone: true })
       .notNull()
       .defaultNow(),

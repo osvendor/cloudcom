@@ -17,6 +17,32 @@ vi.mock('./recoveryMediaService', () => ({
   })),
 }));
 
+// #6843: the local GC walk must read each directory's entries via
+// fs.opendir's async-iterable Dir (entries pulled from the OS incrementally)
+// rather than fs.readdir({ withFileTypes: true }) (the whole directory
+// materialized into one array before any entry is yielded) — the same
+// memory-shape gap #6834 removed from the S3 listing path. Spies delegate to
+// the real implementation so every other test in this file (real-filesystem
+// fixtures) is unaffected; only the two dedicated tests below assert on them.
+const { readdirSpy, opendirSpy } = vi.hoisted(() => ({
+  readdirSpy: vi.fn(),
+  opendirSpy: vi.fn(),
+}));
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  return {
+    ...actual,
+    readdir: (...args: Parameters<typeof actual.readdir>) => {
+      readdirSpy(...args);
+      return actual.readdir(...args);
+    },
+    opendir: (...args: Parameters<typeof actual.opendir>) => {
+      opendirSpy(...args);
+      return actual.opendir(...args);
+    },
+  };
+});
+
 import {
   applyBackupSnapshotImmutability,
   backupLayoutManifestKey,
@@ -26,6 +52,7 @@ import {
   deleteBackupObjectKeys,
   fetchBackupObjectBytes,
   fetchBackupObjectText,
+  iterateBackupObjectsUnderPrefix,
   listBackupObjectsUnderPrefix,
 } from './backupSnapshotStorage';
 
@@ -158,6 +185,8 @@ describe('backup snapshot storage', () => {
         secretKey: 'secret',
       },
       snapshotId: 'provider-snap-1',
+      keyLayout: 'legacy_flat',
+      keyPrefix: null,
       metadata: {},
       retainUntil: new Date('2026-04-30T00:00:00.000Z'),
     });
@@ -198,6 +227,8 @@ describe('backup snapshot storage', () => {
         secretKey: 'secret',
       },
       snapshotId: 'provider-snap-1',
+      keyLayout: 'legacy_flat',
+      keyPrefix: null,
       metadata: {},
       retainUntil: new Date('2026-04-30T00:00:00.000Z'),
     });
@@ -237,10 +268,168 @@ describe('backup snapshot storage', () => {
         secretKey: 'secret',
       },
       snapshotId: 'provider-snap-1',
+      keyLayout: 'legacy_flat',
+      keyPrefix: null,
       metadata: {},
     });
 
     expect(deletedKeys).toEqual(['snapshots/provider-snap-1/manifest.json']);
+  });
+
+  // #6398: the agent never applies the destination `prefix` — snapshot
+  // objects live at `snapshots/<id>/...`. Immutability and deletion must target
+  // that physical layout, not `<prefix>/snapshots/<id>`.
+  it('applies retention under the agent layout, ignoring the configured destination prefix (#6398)', async () => {
+    sendMock
+      .mockImplementationOnce(async (command) => {
+        expect(command).toBeInstanceOf(ListObjectsV2Command);
+        expect(command.input.Prefix).toBe('snapshots/provider-snap-1');
+        return { Contents: [{ Key: 'snapshots/provider-snap-1/manifest.json' }], IsTruncated: false };
+      })
+      .mockImplementationOnce(async () => ({}));
+
+    const result = await applyBackupSnapshotImmutability({
+      provider: 's3',
+      providerConfig: {
+        bucket: 'backups',
+        region: 'us-east-1',
+        accessKey: 'key',
+        secretKey: 'secret',
+        prefix: 'w05',
+      },
+      snapshotId: 'provider-snap-1',
+      keyLayout: 'legacy_flat',
+      keyPrefix: null,
+      metadata: {},
+      retainUntil: new Date('2026-04-30T00:00:00.000Z'),
+    });
+
+    expect(result.objectCount).toBe(1);
+  });
+
+  it('deletes under the agent layout, ignoring the configured destination prefix (#6398)', async () => {
+    const deletedKeys: string[] = [];
+    sendMock
+      .mockImplementationOnce(async (command) => {
+        expect(command).toBeInstanceOf(ListObjectsV2Command);
+        expect(command.input.Prefix).toBe('snapshots/provider-snap-1');
+        return { Contents: [{ Key: 'snapshots/provider-snap-1/manifest.json' }], IsTruncated: false };
+      })
+      .mockImplementationOnce(async (command) => {
+        deletedKeys.push(
+          ...(command.input.Delete?.Objects ?? []).map((object: { Key?: string }) => object.Key ?? '')
+        );
+        return {};
+      });
+
+    await deleteBackupSnapshotArtifacts({
+      provider: 's3',
+      providerConfig: {
+        bucket: 'backups',
+        region: 'us-east-1',
+        accessKey: 'key',
+        secretKey: 'secret',
+        prefix: 'w05',
+      },
+      snapshotId: 'provider-snap-1',
+      keyLayout: 'legacy_flat',
+      keyPrefix: null,
+      metadata: {},
+    });
+
+    expect(deletedKeys).toEqual(['snapshots/provider-snap-1/manifest.json']);
+  });
+
+  // #8364: S3 reports per-key delete failures (object lock, permissions) inside
+  // a 200 response; a prefix delete must not report success while objects remain.
+  it('throws when DeleteObjects reports per-key errors for a prefix delete (#8364)', async () => {
+    sendMock
+      .mockImplementationOnce(async () => ({
+        Contents: [
+          { Key: 'snapshots/provider-snap-1/manifest.json' },
+          { Key: 'snapshots/provider-snap-1/data.bin' },
+        ],
+        IsTruncated: false,
+      }))
+      .mockImplementationOnce(async () => ({
+        Errors: [
+          { Key: 'snapshots/provider-snap-1/data.bin', Code: 'AccessDenied', Message: 'Object is locked' },
+        ],
+      }));
+
+    await expect(deleteBackupSnapshotArtifacts({
+      provider: 's3',
+      providerConfig: { bucket: 'backups', region: 'us-east-1', accessKey: 'key', secretKey: 'secret' },
+      snapshotId: 'provider-snap-1',
+      keyLayout: 'legacy_flat',
+      keyPrefix: null,
+      metadata: {},
+    })).rejects.toThrow(/1 object.*snapshots\/provider-snap-1\/data\.bin.*Object is locked/s);
+  });
+
+  it('caps the error sample and tolerates key-less / code-only errors (#8364)', async () => {
+    const keys = Array.from({ length: 7 }, (_, i) => `snapshots/provider-snap-1/k${i}`);
+    sendMock
+      .mockImplementationOnce(async () => ({
+        Contents: keys.map((Key) => ({ Key })),
+        IsTruncated: false,
+      }))
+      .mockImplementationOnce(async () => ({
+        Errors: [
+          ...keys.slice(0, 5).map((Key) => ({ Key, Code: 'AccessDenied', Message: 'locked' })),
+          { Code: 'InternalError' },
+          {},
+        ],
+      }));
+
+    const error = await deleteBackupSnapshotArtifacts({
+      provider: 's3',
+      providerConfig: { bucket: 'backups', region: 'us-east-1', accessKey: 'key', secretKey: 'secret' },
+      snapshotId: 'provider-snap-1',
+      keyLayout: 'legacy_flat',
+      keyPrefix: null,
+      metadata: {},
+    }).catch((e: Error) => e);
+
+    expect(error).toBeInstanceOf(Error);
+    const message = (error as Error).message;
+    expect(message).toContain('7 object(s)');
+    expect(message).toContain('+2 more');
+    expect(message).toContain('AccessDenied: locked');
+    expect(message).not.toContain('undefined');
+    expect(message).not.toContain('k5');
+  });
+
+  it('still deletes later pages before throwing on per-key errors (#8364)', async () => {
+    let deleteCalls = 0;
+    sendMock
+      .mockImplementationOnce(async () => ({
+        Contents: [{ Key: 'snapshots/provider-snap-1/a' }],
+        IsTruncated: true,
+        NextContinuationToken: 'p2',
+      }))
+      .mockImplementationOnce(async () => {
+        deleteCalls += 1;
+        return { Errors: [{ Key: 'snapshots/provider-snap-1/a', Code: 'AccessDenied' }] };
+      })
+      .mockImplementationOnce(async () => ({
+        Contents: [{ Key: 'snapshots/provider-snap-1/b' }],
+        IsTruncated: false,
+      }))
+      .mockImplementationOnce(async () => {
+        deleteCalls += 1;
+        return {};
+      });
+
+    await expect(deleteBackupSnapshotArtifacts({
+      provider: 's3',
+      providerConfig: { bucket: 'backups', region: 'us-east-1', accessKey: 'key', secretKey: 'secret' },
+      snapshotId: 'provider-snap-1',
+      keyLayout: 'legacy_flat',
+      keyPrefix: null,
+      metadata: {},
+    })).rejects.toThrow(/snapshots\/provider-snap-1\/a.*AccessDenied/s);
+    expect(deleteCalls).toBe(2);
   });
 
   it('fails when no objects are found for provider immutability', async () => {
@@ -258,6 +447,8 @@ describe('backup snapshot storage', () => {
         secretKey: 'secret',
       },
       snapshotId: 'provider-snap-1',
+      keyLayout: 'legacy_flat',
+      keyPrefix: null,
       metadata: {},
       retainUntil: new Date('2026-04-30T00:00:00.000Z'),
     })).rejects.toThrow('No snapshot objects found for provider-enforced immutability');
@@ -313,6 +504,75 @@ describe('backup snapshot storage', () => {
       ]);
       expect(result.map((r) => r.key)).not.toContain('snapshots-old/db.dump');
       expect(result.map((r) => r.key)).not.toContain('snapshotsummary.txt');
+    });
+  });
+
+  // #6834: the GC sweep streams listings instead of materialising a whole
+  // bucket, so the iterator must fetch a page only when the consumer asks.
+  describe('iterateBackupObjectsUnderPrefix — streamed S3 paging (#6834)', () => {
+    it('yields one page per ListObjectsV2 call and requests the next page only after the previous one is consumed', async () => {
+      sendMock
+        .mockImplementationOnce(async (command) => {
+          expect(command.input.ContinuationToken).toBeUndefined();
+          return {
+            Contents: [{ Key: 'snapshots/a/manifest.json', LastModified: new Date('2026-01-01') }],
+            IsTruncated: true,
+            NextContinuationToken: 'tok-2',
+          };
+        })
+        .mockImplementationOnce(async (command) => {
+          expect(command.input.ContinuationToken).toBe('tok-2');
+          return {
+            Contents: [
+              { Key: 'snapshots/b/files/x', LastModified: new Date('2026-01-02') },
+              { Key: 'snapshots-old/lookalike', LastModified: new Date('2020-01-01') },
+            ],
+            IsTruncated: false,
+          };
+        });
+
+      const iterator = iterateBackupObjectsUnderPrefix({
+        provider: 's3',
+        providerConfig: { bucket: 'backups', region: 'us-east-1' },
+        prefix: 'snapshots',
+      });
+
+      const first = await iterator.next();
+      expect(first.value).toEqual([{ key: 'snapshots/a/manifest.json', lastModified: new Date('2026-01-01') }]);
+      expect(sendMock).toHaveBeenCalledTimes(1); // page 2 not fetched yet
+
+      const second = await iterator.next();
+      expect(second.value).toEqual([{ key: 'snapshots/b/files/x', lastModified: new Date('2026-01-02') }]);
+      expect(sendMock).toHaveBeenCalledTimes(2);
+
+      expect((await iterator.next()).done).toBe(true);
+    });
+
+    it('scopes a per-snapshot re-list to exactly `snapshots/<id>/`', async () => {
+      sendMock.mockImplementationOnce(async (command) => {
+        expect(command.input.Prefix).toBe('snapshots/abc/');
+        return {
+          Contents: [
+            { Key: 'snapshots/abc/files/1', LastModified: new Date('2026-01-01') },
+            { Key: 'snapshots/abc-2/files/1', LastModified: new Date('2026-01-01') }, // sibling id — filtered
+          ],
+          IsTruncated: false,
+        };
+      });
+
+      const pages = [];
+      for await (const page of iterateBackupObjectsUnderPrefix({
+        provider: 's3',
+        providerConfig: { bucket: 'backups', region: 'us-east-1' },
+        prefix: 'snapshots/abc',
+      })) pages.push(page);
+
+      expect(pages).toEqual([[{ key: 'snapshots/abc/files/1', lastModified: new Date('2026-01-01') }]]);
+    });
+
+    it('rejects an unsupported provider on first iteration (fail-closed)', async () => {
+      const iterator = iterateBackupObjectsUnderPrefix({ provider: 'azure', providerConfig: {}, prefix: 'snapshots' });
+      await expect(iterator.next()).rejects.toThrow('does not support object listing for GC');
     });
   });
 
@@ -389,6 +649,92 @@ describe('backup snapshot storage', () => {
         fetchBackupObjectBytes({ provider: 'unknown', providerConfig: {}, key: 'x' }),
       ).rejects.toThrow(/does not support object fetch/);
     });
+
+    it('rejects an S3 object whose declared ContentLength exceeds maxBytes, without reading the body', async () => {
+      const transformToByteArray = vi.fn();
+      sendMock.mockResolvedValueOnce({ ContentLength: 1000, Body: { transformToByteArray } });
+
+      await expect(
+        fetchBackupObjectBytes({
+          provider: 's3',
+          providerConfig: { bucket: 'backups', region: 'us-east-1' },
+          key: 'snapshots/a/manifest.json',
+          maxBytes: 500,
+        }),
+      ).rejects.toMatchObject({ name: 'BackupObjectTooLargeError', sizeBytes: 1000, maxBytes: 500 });
+      expect(transformToByteArray).not.toHaveBeenCalled();
+    });
+
+    it('rejects an S3 object whose actual bytes exceed maxBytes when ContentLength was not reported', async () => {
+      const bytes = new Uint8Array(1000);
+      sendMock.mockResolvedValueOnce({ Body: { transformToByteArray: async () => bytes } });
+
+      await expect(
+        fetchBackupObjectBytes({
+          provider: 's3',
+          providerConfig: { bucket: 'backups', region: 'us-east-1' },
+          key: 'snapshots/a/manifest.json',
+          maxBytes: 500,
+        }),
+      ).rejects.toMatchObject({ name: 'BackupObjectTooLargeError' });
+    });
+
+    it('allows an S3 object at or under maxBytes', async () => {
+      const bytes = new Uint8Array(500);
+      sendMock.mockResolvedValueOnce({ ContentLength: 500, Body: { transformToByteArray: async () => bytes } });
+
+      const result = await fetchBackupObjectBytes({
+        provider: 's3',
+        providerConfig: { bucket: 'backups', region: 'us-east-1' },
+        key: 'snapshots/a/manifest.json',
+        maxBytes: 500,
+      });
+      expect(result).toEqual(bytes);
+    });
+  });
+
+  describe('fetchBackupObjectText maxBytes cap', () => {
+    it('rejects an S3 object whose declared ContentLength exceeds maxBytes, without reading the body', async () => {
+      const transformToString = vi.fn();
+      sendMock.mockResolvedValueOnce({ ContentLength: 1000, Body: { transformToString } });
+
+      await expect(
+        fetchBackupObjectText({
+          provider: 's3',
+          providerConfig: { bucket: 'backups', region: 'us-east-1' },
+          key: 'snapshots/a/manifest.json',
+          maxBytes: 500,
+        }),
+      ).rejects.toMatchObject({ name: 'BackupObjectTooLargeError', sizeBytes: 1000, maxBytes: 500 });
+      expect(transformToString).not.toHaveBeenCalled();
+    });
+
+    it('rejects an S3 object whose actual decoded bytes exceed maxBytes when ContentLength was not reported', async () => {
+      const text = 'x'.repeat(1000);
+      sendMock.mockResolvedValueOnce({ Body: { transformToString: async () => text } });
+
+      await expect(
+        fetchBackupObjectText({
+          provider: 's3',
+          providerConfig: { bucket: 'backups', region: 'us-east-1' },
+          key: 'snapshots/a/manifest.json',
+          maxBytes: 500,
+        }),
+      ).rejects.toMatchObject({ name: 'BackupObjectTooLargeError' });
+    });
+
+    it('allows an S3 text object at or under maxBytes', async () => {
+      const text = '{"files":[]}';
+      sendMock.mockResolvedValueOnce({ ContentLength: text.length, Body: { transformToString: async () => text } });
+
+      const result = await fetchBackupObjectText({
+        provider: 's3',
+        providerConfig: { bucket: 'backups', region: 'us-east-1' },
+        key: 'snapshots/a/manifest.json',
+        maxBytes: text.length,
+      });
+      expect(result).toBe(text);
+    });
   });
 });
 
@@ -413,6 +759,20 @@ describe('local-provider GC I/O (real filesystem)', () => {
     await rm(root, { recursive: true, force: true });
   });
 
+  it('deletes a local snapshot under the agent layout, ignoring the configured destination prefix (#6398)', async () => {
+    await deleteBackupSnapshotArtifacts({
+      provider: 'local',
+      providerConfig: { path: root, prefix: 'w05' },
+      snapshotId: 'snapA',
+      keyLayout: 'legacy_flat',
+      keyPrefix: null,
+      metadata: {},
+    });
+
+    expect(await readdir(join(root, 'snapshots'))).toEqual([]);
+    expect(await readdir(join(root, 'other'))).toEqual(['unrelated.dat']);
+  });
+
   it('walks the snapshot root and reports every file key with a real mtime', async () => {
     const listing = await listBackupObjectsUnderPrefix({
       provider: 'local',
@@ -435,6 +795,43 @@ describe('local-provider GC I/O (real filesystem)', () => {
     }
   });
 
+  it('streams the local walk in pages of at most 1000 keys, covering every file exactly once (#6834)', async () => {
+    const bulkDir = join(root, 'snapshots', 'snapB', 'files');
+    await mkdir(bulkDir, { recursive: true });
+    await Promise.all(Array.from({ length: 2100 }, (_, i) => writeFile(join(bulkDir, `f${i}.dat`), '')));
+
+    const pageSizes: number[] = [];
+    const keys: string[] = [];
+    for await (const page of iterateBackupObjectsUnderPrefix({
+      provider: 'local',
+      providerConfig: { path: root },
+      prefix: 'snapshots/snapB',
+    })) {
+      pageSizes.push(page.length);
+      for (const item of page) keys.push(item.key);
+    }
+
+    expect(Math.max(...pageSizes)).toBeLessThanOrEqual(1000);
+    expect(keys.length).toBe(2100);
+    expect(new Set(keys).size).toBe(2100);
+    expect(keys.every((k) => k.startsWith('snapshots/snapB/files/'))).toBe(true);
+  });
+
+  it('streams local directory entries via opendir, never materializing a whole directory via readdir (#6843)', async () => {
+    readdirSpy.mockClear();
+    opendirSpy.mockClear();
+
+    const listing = await listBackupObjectsUnderPrefix({
+      provider: 'local',
+      providerConfig: { path: root },
+      prefix: 'snapshots',
+    });
+
+    expect(listing.length).toBeGreaterThan(0);
+    expect(readdirSpy).not.toHaveBeenCalled();
+    expect(opendirSpy).toHaveBeenCalled();
+  });
+
   it('fetches a local object as text', async () => {
     const text = await fetchBackupObjectText({
       provider: 'local',
@@ -451,6 +848,48 @@ describe('local-provider GC I/O (real filesystem)', () => {
       key: 'snapshots/snapA/manifest.json',
     });
     expect(Buffer.from(result).toString('utf8')).toBe('{"files":[]}');
+  });
+
+  it('rejects a local object over maxBytes via a stat check, without reading its content', async () => {
+    await expect(
+      fetchBackupObjectBytes({
+        provider: 'local',
+        providerConfig: { path: root },
+        key: 'snapshots/snapA/manifest.json',
+        maxBytes: 1,
+      }),
+    ).rejects.toMatchObject({ name: 'BackupObjectTooLargeError' });
+  });
+
+  it('allows a local object at or under maxBytes', async () => {
+    const result = await fetchBackupObjectBytes({
+      provider: 'local',
+      providerConfig: { path: root },
+      key: 'snapshots/snapA/manifest.json',
+      maxBytes: '{"files":[]}'.length,
+    });
+    expect(Buffer.from(result).toString('utf8')).toBe('{"files":[]}');
+  });
+
+  it('rejects a local text object over maxBytes via a stat check, without reading its content', async () => {
+    await expect(
+      fetchBackupObjectText({
+        provider: 'local',
+        providerConfig: { path: root },
+        key: 'snapshots/snapA/manifest.json',
+        maxBytes: 1,
+      }),
+    ).rejects.toMatchObject({ name: 'BackupObjectTooLargeError' });
+  });
+
+  it('allows a local text object at or under maxBytes', async () => {
+    const result = await fetchBackupObjectText({
+      provider: 'local',
+      providerConfig: { path: root },
+      key: 'snapshots/snapA/manifest.json',
+      maxBytes: '{"files":[]}'.length,
+    });
+    expect(result).toBe('{"files":[]}');
   });
 
   it('deletes only the intended keys, leaving siblings intact', async () => {
@@ -487,5 +926,91 @@ describe('local-provider GC I/O (real filesystem)', () => {
     expect(result.deletedKeys).toEqual([]);
     expect(result.failedKeys).toHaveLength(1);
     expect(result.failedKeys[0]!.error).toContain('path traversal detected');
+  });
+});
+
+// #7081: immutability and deletion address a snapshot's objects under its
+// recorded key root. A prefixed_flat snapshot never honours helper-reported
+// metadata.storagePrefix; an unreadable root is refused before any storage call.
+describe('snapshot storage key root (#7081)', () => {
+  const config = { bucket: 'backups', region: 'us-east-1', accessKey: 'key', secretKey: 'secret' };
+
+  beforeEach(() => sendMock.mockReset());
+
+  it('lists and retains a prefixed snapshot under its root, ignoring metadata.storagePrefix', async () => {
+    const retained: string[] = [];
+    sendMock
+      .mockImplementationOnce(async (command) => {
+        expect(command).toBeInstanceOf(ListObjectsV2Command);
+        expect(command.input.Prefix).toBe('msp/acme/snapshots/provider-snap-1');
+        return {
+          Contents: [
+            { Key: 'msp/acme/snapshots/provider-snap-1/manifest.json' },
+            { Key: 'msp/acme/snapshots/provider-snap-10/manifest.json' },
+          ],
+          IsTruncated: false,
+        };
+      })
+      .mockImplementationOnce(async (command) => {
+        expect(command).toBeInstanceOf(PutObjectRetentionCommand);
+        retained.push(command.input.Key);
+        return {};
+      });
+
+    const result = await applyBackupSnapshotImmutability({
+      provider: 's3',
+      providerConfig: config,
+      snapshotId: 'provider-snap-1',
+      keyLayout: 'prefixed_flat',
+      keyPrefix: 'msp/acme',
+      metadata: { storagePrefix: 'evil/snapshots/provider-snap-1' },
+      retainUntil: new Date('2026-04-30T00:00:00.000Z'),
+    });
+
+    expect(result.objectCount).toBe(1);
+    expect(retained).toEqual(['msp/acme/snapshots/provider-snap-1/manifest.json']);
+  });
+
+  it('keeps honouring metadata.storagePrefix for a legacy_flat snapshot', async () => {
+    sendMock.mockImplementationOnce(async (command) => {
+      expect(command.input.Prefix).toBe('legacy/snapshots/provider-snap-1');
+      return { Contents: [], IsTruncated: false };
+    });
+    await expect(applyBackupSnapshotImmutability({
+      provider: 's3',
+      providerConfig: config,
+      snapshotId: 'provider-snap-1',
+      keyLayout: 'legacy_flat',
+      keyPrefix: null,
+      metadata: { storagePrefix: 's3://backups/legacy/snapshots/provider-snap-1' },
+      retainUntil: new Date('2026-04-30T00:00:00.000Z'),
+    })).rejects.toThrow();
+    expect(sendMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['prefixed_flat', null],
+    ['prefixed_flat', 'x/snapshots'],
+    ['device_scoped', null],
+    [undefined, null],
+  ])('refuses %s/%s before any storage call', async (keyLayout, keyPrefix) => {
+    await expect(applyBackupSnapshotImmutability({
+      provider: 's3',
+      providerConfig: config,
+      snapshotId: 'provider-snap-1',
+      keyLayout,
+      keyPrefix,
+      metadata: {},
+      retainUntil: new Date('2026-04-30T00:00:00.000Z'),
+    })).rejects.toThrow(/key root/);
+    await expect(deleteBackupSnapshotArtifacts({
+      provider: 's3',
+      providerConfig: config,
+      snapshotId: 'provider-snap-1',
+      keyLayout,
+      keyPrefix,
+      metadata: {},
+    })).rejects.toThrow(/key root/);
+    expect(sendMock).not.toHaveBeenCalled();
   });
 });

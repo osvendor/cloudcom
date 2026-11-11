@@ -4,8 +4,16 @@ import {
   invitePortalUserSchema,
   bulkInvitePortalUsersSchema,
   updatePortalUserSchema,
+  inviteContactsToPortalSchema,
+  INVITE_CONTACTS_MAX,
+  CONTACT_PORTAL_INVITE_OUTCOMES,
+  PORTAL_INVITE_ERROR_CODES,
   findUnsafePortalCssPattern,
-  PORTAL_CUSTOM_CSS_MAX_LENGTH
+  PORTAL_CUSTOM_CSS_MAX_LENGTH,
+  PORTAL_LOGO_MAX_LENGTH,
+  isPortalLogoUrl,
+  PORTAL_SENSITIVE_FLAG_KEYS,
+  PORTAL_PERMISSION_FLAG_KEYS
 } from './portal';
 
 describe('updatePortalSettingsSchema', () => {
@@ -46,10 +54,72 @@ describe('updatePortalSettingsSchema', () => {
     expect(result.success).toBe(true);
   });
 
-  it('rejects unknown keys (visual branding fields are not writable here)', () => {
+  it('rejects unknown keys (custom domain and favicon are not writable here)', () => {
     expect(updatePortalSettingsSchema.safeParse({ customDomain: 'evil.example' }).success).toBe(false);
-    expect(updatePortalSettingsSchema.safeParse({ logoUrl: 'https://x/y.png' }).success).toBe(false);
+    expect(updatePortalSettingsSchema.safeParse({ faviconUrl: 'https://x/y.png' }).success).toBe(false);
     expect(updatePortalSettingsSchema.safeParse({ domainVerified: true }).success).toBe(false);
+  });
+
+  // #9962: portal_branding.primary_color is the org level of the one
+  // document-accent chain (partner Branding → org override), written by the
+  // org Branding tab. It reaches a <style> element on customer documents, so
+  // only a strict #rgb / #rrggbb hex is accepted.
+  it('accepts a hex primaryColor and null (inherit the partner colour)', () => {
+    expect(updatePortalSettingsSchema.parse({ primaryColor: '#c2410c' })).toEqual({ primaryColor: '#c2410c' });
+    expect(updatePortalSettingsSchema.parse({ primaryColor: '#ABC' })).toEqual({ primaryColor: '#ABC' });
+    expect(updatePortalSettingsSchema.parse({ primaryColor: null })).toEqual({ primaryColor: null });
+  });
+
+  it('rejects a primaryColor that is not a #rgb / #rrggbb hex', () => {
+    for (const bad of ['red', '#12345', 'c2410c', '#c2410c;}', 'url(x)', '', '#gggggg']) {
+      expect(updatePortalSettingsSchema.safeParse({ primaryColor: bad }).success, bad).toBe(false);
+    }
+  });
+
+  // #9673: the org logo and secondary colour reach the same customer surfaces
+  // as primaryColor, through the same resolver.
+  it('accepts a hex secondaryColor and null (inherit the partner colour)', () => {
+    expect(updatePortalSettingsSchema.parse({ secondaryColor: '#0b1b2d' })).toEqual({ secondaryColor: '#0b1b2d' });
+    expect(updatePortalSettingsSchema.parse({ secondaryColor: null })).toEqual({ secondaryColor: null });
+  });
+
+  it('rejects a secondaryColor that is not a #rgb / #rrggbb hex', () => {
+    for (const bad of ['red', '#12345', '#0b1b2d;}', 'url(x)', '']) {
+      expect(updatePortalSettingsSchema.safeParse({ secondaryColor: bad }).success, bad).toBe(false);
+    }
+  });
+
+  it('accepts an uploaded PNG data URI, an https URL and null as logoUrl', () => {
+    for (const good of ['data:image/png;base64,iVBORw0KGgo=', 'https://cdn.example.com/logo.png']) {
+      expect(updatePortalSettingsSchema.parse({ logoUrl: good }), good).toEqual({ logoUrl: good });
+    }
+    expect(updatePortalSettingsSchema.parse({ logoUrl: null })).toEqual({ logoUrl: null });
+  });
+
+  it('rejects a logoUrl a customer browser or PDF must not load', () => {
+    for (const bad of [
+      '',
+      'javascript:alert(1)',
+      'http://cdn.example.com/logo.png',
+      'blob:https://app.example.com/abc',
+      'data:image/svg+xml;base64,PHN2Zz4=',
+      // Report PDFs embed only PNG; the editor always encodes PNG.
+      'data:image/jpeg;base64,/9j/4AAQ',
+      'data:image/webp;base64,UklGRg==',
+      'data:text/html;base64,PGI+',
+      'data:image/png;base64,not base64!',
+      'https://cdn.example.com/a"onerror="x',
+      'https://',
+    ]) {
+      expect(updatePortalSettingsSchema.safeParse({ logoUrl: bad }).success, bad).toBe(false);
+    }
+  });
+
+  it('rejects a logoUrl over the 400 KB cap', () => {
+    const atCap = 'data:image/png;base64,' + 'A'.repeat(PORTAL_LOGO_MAX_LENGTH - 'data:image/png;base64,'.length);
+    expect(updatePortalSettingsSchema.safeParse({ logoUrl: atCap }).success).toBe(true);
+    expect(updatePortalSettingsSchema.safeParse({ logoUrl: `${atCap}A` }).success).toBe(false);
+    expect(isPortalLogoUrl(`${atCap}A`)).toBe(false);
   });
 
   it('rejects an invalid support email', () => {
@@ -96,6 +166,19 @@ describe('updatePortalSettingsSchema', () => {
   it.each([true, false])('accepts the Network Visibility flag=%s', (enableNetworkVisibility) => {
     expect(updatePortalSettingsSchema.parse({ enableNetworkVisibility }))
       .toEqual({ enableNetworkVisibility });
+  });
+
+  it.each([true, false])('accepts the Network Alerts flag=%s', (enableNetworkAlerts) => {
+    expect(updatePortalSettingsSchema.parse({ enableNetworkAlerts }))
+      .toEqual({ enableNetworkAlerts });
+  });
+
+  it.each([true, false])('accepts the Support hours flag=%s', (enableHourBlock) => {
+    expect(updatePortalSettingsSchema.parse({ enableHourBlock })).toEqual({ enableHourBlock });
+  });
+
+  it.each([null, 'true', 1])('rejects a non-boolean Support hours flag=%s', (enableHourBlock) => {
+    expect(updatePortalSettingsSchema.safeParse({ enableHourBlock }).success).toBe(false);
   });
 
   it('rejects non-boolean portal visibility flags', () => {
@@ -238,6 +321,61 @@ describe('invitePortalUserSchema', () => {
   });
 });
 
+describe('invitePortalUserSchema contactId (portal registration W1)', () => {
+  const contactId = '7c0a1f7e-1111-4222-8333-444455556666';
+  it('accepts an optional uuid contactId', () => {
+    expect(invitePortalUserSchema.safeParse({ email: 'a@b.co', contactId }).success).toBe(true);
+    expect(invitePortalUserSchema.safeParse({ email: 'a@b.co' }).success).toBe(true);
+  });
+  it('rejects a non-uuid contactId', () => {
+    expect(invitePortalUserSchema.safeParse({ email: 'a@b.co', contactId: 'nope' }).success).toBe(false);
+  });
+  it('stays strict', () => {
+    expect(invitePortalUserSchema.safeParse({ email: 'a@b.co', contactIds: [contactId] }).success).toBe(false);
+  });
+});
+
+describe('inviteContactsToPortalSchema', () => {
+  const uuid = (i: number) => `7c0a1f7e-1111-4222-8333-${i.toString(16).padStart(12, '0')}`;
+  it('caps the batch at 100', () => {
+    expect(INVITE_CONTACTS_MAX).toBe(100);
+    const hundred = Array.from({ length: 100 }, (_, i) => uuid(i));
+    expect(inviteContactsToPortalSchema.safeParse({ contactIds: hundred }).success).toBe(true);
+    expect(inviteContactsToPortalSchema.safeParse({ contactIds: [...hundred, uuid(100)] }).success).toBe(false);
+  });
+  it('rejects an empty batch, non-uuid ids and unknown keys', () => {
+    expect(inviteContactsToPortalSchema.safeParse({ contactIds: [] }).success).toBe(false);
+    expect(inviteContactsToPortalSchema.safeParse({ contactIds: ['nope'] }).success).toBe(false);
+    expect(inviteContactsToPortalSchema.safeParse({ contactIds: [uuid(1)], message: 'hi' }).success).toBe(false);
+    expect(inviteContactsToPortalSchema.safeParse({}).success).toBe(false);
+  });
+});
+
+describe('contact portal invite contract', () => {
+  it('outcome list is exactly the five spec outcomes', () => {
+    expect([...CONTACT_PORTAL_INVITE_OUTCOMES]).toEqual([
+      'invited',
+      'already_has_access',
+      'no_email',
+      'email_bound_to_other_contact',
+      'duplicate_email_in_batch',
+    ]);
+  });
+  it('error codes are the eight stable codes, key equal to value', () => {
+    expect(Object.keys(PORTAL_INVITE_ERROR_CODES).sort()).toEqual([
+      'PORTAL_INVITE_ALREADY_ACTIVE',
+      'PORTAL_INVITE_CONTACT_CONFLICT',
+      'PORTAL_INVITE_CONTACT_NOT_FOUND',
+      'PORTAL_INVITE_CONTACT_NO_EMAIL',
+      'PORTAL_INVITE_EMAIL_MISMATCH',
+      'PORTAL_INVITE_EXTERNAL_IDENTITY',
+      'PORTAL_INVITE_LOGIN_EMAIL_DIFFERS',
+      'PORTAL_INVITE_USER_DISABLED',
+    ]);
+    for (const [k, v] of Object.entries(PORTAL_INVITE_ERROR_CODES)) expect(v).toBe(k);
+  });
+});
+
 describe('updatePortalUserSchema', () => {
   it('accepts active/disabled status', () => {
     expect(updatePortalUserSchema.safeParse({ status: 'disabled' }).success).toBe(true);
@@ -261,6 +399,25 @@ describe('updatePortalSettingsSchema W04 flags', () => {
   it('accepts the W04 service and documents flags', () => {
     expect(updatePortalSettingsSchema.safeParse({ enableService: true, enableDocuments: false }).success).toBe(true);
     expect(updatePortalSettingsSchema.safeParse({ enableLifecycle: true }).success).toBe(true);
+    expect(updatePortalSettingsSchema.safeParse({ enableHardwareHealth: true }).success).toBe(true);
+    expect(updatePortalSettingsSchema.safeParse({ enableHardwareInventory: true }).success).toBe(true);
+    expect(updatePortalSettingsSchema.safeParse({ enablePerformanceMetrics: true }).success).toBe(true);
+    expect(updatePortalSettingsSchema.safeParse({ enableSoftwareInventory: true }).success).toBe(true);
+    expect(updatePortalSettingsSchema.safeParse({ enablePatchDetail: true }).success).toBe(true);
+    expect(PORTAL_SENSITIVE_FLAG_KEYS).toContain('enablePatchDetail');
+    expect(updatePortalSettingsSchema.safeParse({ enableVulnerabilityDetail: true }).success).toBe(true);
+    expect(PORTAL_SENSITIVE_FLAG_KEYS).toContain('enableVulnerabilityDetail');
+    expect(updatePortalSettingsSchema.safeParse({ enablePhysicalPlacement: true }).success).toBe(true);
+    expect(PORTAL_SENSITIVE_FLAG_KEYS).toContain('enablePhysicalPlacement');
+  });
+  it.each([true, false])('accepts the strict EDR visibility flag=%s and keeps it in "Enable all"', (enableEdrVisibility) => {
+    expect(updatePortalSettingsSchema.parse({ enableEdrVisibility })).toEqual({ enableEdrVisibility });
+    expect(PORTAL_SENSITIVE_FLAG_KEYS).not.toContain('enableEdrVisibility');
+  });
+  it.each([true, false])('accepts the trust-page editing permission flag=%s, outside "Enable all" (Trust Center W3d)', (enableTrustPageEditing) => {
+    expect(updatePortalSettingsSchema.parse({ enableTrustPageEditing })).toEqual({ enableTrustPageEditing });
+    expect(PORTAL_PERMISSION_FLAG_KEYS).toEqual(['enableTrustPageEditing']);
+    expect(PORTAL_SENSITIVE_FLAG_KEYS).not.toContain('enableTrustPageEditing');
   });
   it('still rejects an unknown flag', () => {
     expect(updatePortalSettingsSchema.safeParse({ enableProjects: true }).success).toBe(false);

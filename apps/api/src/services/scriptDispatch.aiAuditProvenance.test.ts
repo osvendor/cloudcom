@@ -3,6 +3,15 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // Mocks mirror scriptDispatch.acknowledgement.test.ts exactly, plus a mock
 // of auditService so this file can assert on the new audit write without a
 // real DB.
+// Holding-org delivery eligibility (a live device/org read) is out of this
+// suite's scope; scriptDispatch.test.ts covers the refusal and
+// parkedCommandDelivery.integration.test.ts the query.
+vi.mock('./unassignedPool/deliveryEligibility', async () => ({
+  ...(await vi.importActual<typeof import('./unassignedPool/deliveryEligibility')>(
+    './unassignedPool/deliveryEligibility',
+  )),
+  isParkedDevice: vi.fn(async () => false),
+}));
 vi.mock('../db', () => ({
   db: { select: vi.fn(), insert: vi.fn(), update: vi.fn(), delete: vi.fn() },
   runOutsideDbContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
@@ -13,7 +22,7 @@ vi.mock('./commandQueue', async () => {
   return { CommandTypes, queueCommand: vi.fn() };
 });
 vi.mock('./commandDispatch', () => ({
-  claimPendingCommandForDelivery: vi.fn().mockResolvedValue(null),
+  claimPendingCommandForDelivery: vi.fn().mockResolvedValue({ status: 'not_claimable', id: 'cmd-1' }),
   releaseClaimedCommandDelivery: vi.fn().mockResolvedValue(undefined),
 }));
 vi.mock('./sensitiveCommandPayload', () => ({
@@ -25,7 +34,27 @@ vi.mock('./sensitiveCommandPayload', () => ({
     payload: c.payload,
   })),
 }));
-vi.mock('../routes/agentWs', () => ({ sendCommandToAgent: vi.fn().mockReturnValue(false) }));
+vi.mock('../routes/agentWs', () => ({ sendCommandToAgent: vi.fn().mockReturnValue(false), isAgentConnected: vi.fn().mockReturnValue(false) }));
+// #4142: scriptDispatch reaches agents through the relay facade. This mock
+// bridges over the agentWs mock above (a local socket send); the facade-outcome
+// tests drive dispatchCommandToAgent directly. The real mapping is pinned in
+// agentCommandRelay.test.ts.
+vi.mock('./agentCommandRelay', async () => {
+  const ws = await import('../routes/agentWs');
+  return {
+    dispatchCommandToAgent: vi.fn(async (agentId: string, frame: unknown) => (
+      vi.mocked(ws.sendCommandToAgent)(agentId, frame as never)
+        ? { status: 'sent', via: 'local' }
+        : { status: 'offline' }
+    )),
+    agentReachability: vi.fn(async (agentId: string) => (
+      vi.mocked(ws.isAgentConnected)(agentId) ? 'connected' : 'absent'
+    )),
+    dispatchDisposition: (o: { status: string }) => (
+      o.status === 'sent' ? 'delivered' : o.status === 'indeterminate' ? 'uncertain' : 'not_delivered'
+    ),
+  };
+});
 vi.mock('./scriptSecretDelivery', () => ({
   AGENT_UPGRADE_REQUIRED_MESSAGE: 'Agent upgrade required: mocked message',
   SECRET_GATE_UNAVAILABLE_MESSAGE: 'Secret gate unavailable: mocked message',

@@ -2,11 +2,12 @@ import { randomUUID } from 'crypto';
 import { Queue } from 'bullmq';
 import { getBullMQConnection } from './redis';
 import { captureException } from './sentry';
-import { ticketStatusEnum, ticketSourceEnum } from '../db/schema';
+import { ticketStatusEnum, ticketSourceEnum, ticketLinkTypeEnum } from '../db/schema';
 
 // Derived locally to avoid an import cycle (ticketService imports ticketEvents).
 type TicketStatus = (typeof ticketStatusEnum.enumValues)[number];
 type TicketSource = (typeof ticketSourceEnum.enumValues)[number];
+type TicketLinkType = (typeof ticketLinkTypeEnum.enumValues)[number];
 
 export const TICKET_EVENTS_QUEUE = 'ticket-events';
 
@@ -15,6 +16,12 @@ interface TicketEventEnvelope {
   orgId: string;
   partnerId: string | null;
   actorUserId?: string | null;
+  /**
+   * The partner service principal behind the write, when the actor is one
+   * (`kind: 'service_principal'`); null/absent for every other actor. Lets a
+   * consumer attribute machine writes without a users row.
+   */
+  actorPrincipalId?: string | null;
   /**
    * W07 (#3901): unique per emitted event; the notify worker uses it in the
    * user_notifications dedupe key so a BullMQ retry never re-pushes while a
@@ -49,6 +56,28 @@ export type TicketEvent = TicketEventEnvelope & (
   // ticketNotifyWorker — the single outbound code path.
   // Payload-only: ticketId/orgId/partnerId come from TicketEventEnvelope.
   | { type: 'ticket.autoresponse'; payload: { to: string; internalNumber: string | null; subject: string } }
+  // Customer work approval (#4617 spec §6.4). Ids and enum labels only; the
+  // notify worker (jobs/ticketApprovalNotify.ts) loads the request in system
+  // context and re-validates it against the committed row, because some
+  // emitters queue these inside their transaction (the portal decide route
+  // queues after commit). `revision` is the request revision the emitter wrote:
+  // the worker retries while the committed row is behind it and drops the
+  // event once a newer revision exists. `created` = a new request (else an
+  // existing pending one was re-asked or bumped at `revision`).
+  | { type: 'ticket.approval_requested'; payload: { requestId: string; trigger: 'budget' | 'after_hours'; revision: number; created: boolean } }
+  | { type: 'ticket.approval_decided'; payload: { requestId: string; trigger: 'budget' | 'after_hours'; status: 'approved' | 'denied' | 'expired' | 'cancelled' } }
+  // Ticket-to-ticket links (#7900 W02). Emitted once for EACH of the two
+  // tickets, so either ticket's consumers see the change. Ids and enum labels
+  // only. `direction` is how the link reads from THIS event's ticket
+  // ('outgoing': this ticket is the stored source). `reason: 'org_move'` marks
+  // a link an org move deleted (emitted only for the noted tickets, after the
+  // move commits). No notification fan-out today (ticketNotifyWorker no-op).
+  | { type: 'ticket.link_added'; payload: { linkId: string; linkType: TicketLinkType; otherTicketId: string; direction: 'outgoing' | 'incoming' } }
+  | { type: 'ticket.link_removed'; payload: { linkType: TicketLinkType; otherTicketId: string; reason: 'user' | 'org_move' } }
+  // Ticket merge (#8972, spec §3.7). The envelope's ticketId is the SURVIVOR.
+  // The notify worker tells the survivor's assignee (unless they merged it)
+  // and, when `notifyRequester`, emails the source's requester once.
+  | { type: 'ticket.merged'; payload: { sourceTicketId: string; targetTicketId: string; notifyRequester: boolean } }
 );
 
 export type TicketEventType = TicketEvent['type'];
@@ -67,21 +96,37 @@ export function getTicketEventsQueue(): Queue {
   return queue;
 }
 
+/**
+ * Queue a ticket event, throwing when it cannot be queued. For a caller that
+ * owns a retry of its own — ticketOutboxPublisher leaves its outbox row
+ * unpublished on a throw, so the next pass queues it again (#7963).
+ * Request-path emitters use emitTicketEvent instead.
+ */
+export async function enqueueTicketEvent(input: TicketEventInput): Promise<void> {
+  const event = { ...input, eventId: input.eventId ?? randomUUID() } as TicketEvent;
+  await getTicketEventsQueue().add(event.type, event, {
+    removeOnComplete: { count: 100 },
+    removeOnFail: { count: 500 },
+    // Retry with back-off: request-path emitters (emitTicketEvent) queue while
+    // the request transaction is still open, so the worker may dequeue before
+    // the ticket row is visible.
+    attempts: 3,
+    backoff: { type: 'exponential', delay: 2000 }
+  });
+}
+
 // Fire-and-forget by design: a Redis outage must never fail the user-facing
 // mutation that emitted the event. Consumers (notifications) are best-effort.
+//
+// Not for `ticket.assigned` (#7963): an emit from inside the request
+// transaction can reach the worker before the assignment commits, and the
+// worker reads the old assignee as "reassigned since" and drops it. That event
+// is queued by ticketOutboxPublisher from the committed outbox row instead.
 export async function emitTicketEvent(input: TicketEventInput): Promise<void> {
-  const event = { ...input, eventId: input.eventId ?? randomUUID() } as TicketEvent;
   try {
-    await getTicketEventsQueue().add(event.type, event, {
-      removeOnComplete: { count: 100 },
-      removeOnFail: { count: 500 },
-      // Retry with back-off: the service emits events while the request transaction
-      // is still open, so the worker may dequeue before the ticket row is visible.
-      attempts: 3,
-      backoff: { type: 'exponential', delay: 2000 }
-    });
+    await enqueueTicketEvent(input);
   } catch (err) {
-    console.error('[TicketEvents] failed to enqueue', event.type, `ticketId=${event.ticketId}`, `orgId=${event.orgId}`, err instanceof Error ? err.message : err);
+    console.error('[TicketEvents] failed to enqueue', input.type, `ticketId=${input.ticketId}`, `orgId=${input.orgId}`, err instanceof Error ? err.message : err);
     captureException(err instanceof Error ? err : new Error(String(err)));
   }
 }

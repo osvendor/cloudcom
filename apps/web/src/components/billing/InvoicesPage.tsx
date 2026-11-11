@@ -34,6 +34,10 @@ import { StatCard } from './shared/StatCard';
 import { ROW_LINK_CLASS, writeHashFilters } from './shared/listChrome';
 import { INVOICE_STATUSES, BULK_ID_LIMIT } from '@breeze/shared';
 import { currencyLabel, currencyOptions } from '../../lib/currencies';
+import { useStableT } from '@/lib/i18n/useStableT';
+import { ACCOUNTING_PROVIDER_NAMES, accountingPath, useActivePushProvider } from '../../lib/accountingProviders';
+import { useCreateIntent } from '../../lib/keyboard/createIntent';
+import { localDateInputValue } from '../../lib/localDate';
 
 interface Organization {
   id: string;
@@ -48,8 +52,9 @@ const STATUS_OPTION_VALUES: ('' | InvoiceStatus)[] = ['', ...INVOICE_STATUSES];
 
 /** Mirrors the API's BlockedCurrencySummary (invoiceService.ts, #3776). */
 interface BlockedCurrencyGroup { currencyCode: string; count: number; amount: string }
+interface HeldForHourBlock { count: number; hours: number }
 interface AssembleResult {
-  data: { id?: string; invoice?: { id?: string }; blockedByCurrency?: BlockedCurrencyGroup[] };
+  data: { id?: string; invoice?: { id?: string }; blockedByCurrency?: BlockedCurrencyGroup[]; heldForHourBlock?: HeldForHourBlock };
 }
 
 type SortKey = 'issued' | 'due' | 'total' | 'balance';
@@ -111,8 +116,9 @@ export interface InvoicesPageProps {
 
 export function InvoicesPage({ lockedOrgId }: InvoicesPageProps = {}) {
   const { t, i18n } = useTranslation('billing');
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   const { can } = usePermissions();
-  // POST /accounting/quickbooks/invoices/push-bulk is `requireScope('partner',
+  // POST /accounting/:provider/invoices/push-bulk is `requireScope('partner',
   // 'system')`, so an organization-scoped session can only ever get a 403 —
   // hide the action rather than offer a guaranteed failure. The reactive hook
   // (not the one-shot `getJwtClaims()`) because this decision is rendered:
@@ -121,6 +127,12 @@ export function InvoicesPage({ lockedOrgId }: InvoicesPageProps = {}) {
   // denied, and falling through to the server is the correct default there.
   const claims = useJwtClaims();
   const isOrgScoped = claims.status === 'resolved' && claims.claims.scope === 'organization';
+  // The bulk push also needs somewhere to go: the partner's active accounting
+  // connection, iff its provider can push invoices (Xero W01). With none the
+  // action used to enqueue jobs the worker then dropped, so it is hidden. The
+  // route requires accounting:manage too, so without it there is no point asking.
+  const canOfferBulkPush = can('invoices', 'write') && can('accounting', 'manage') && !isOrgScoped;
+  const pushProvider = useActivePushProvider(canOfferBulkPush);
   const bulk = useBulkSelection();
   const [invoices, setInvoices] = useState<InvoiceSummary[]>([]);
   const [orgs, setOrgs] = useState<Organization[]>([]);
@@ -184,7 +196,7 @@ export function InvoicesPage({ lockedOrgId }: InvoicesPageProps = {}) {
       list = await fetchAllOrganizationsFrom<Organization>('/orgs/organizations');
     } catch (err) {
       if (err instanceof ListFetchError && err.status === 401) return UNAUTHORIZED();
-      handleActionError(err, t('invoicesPage.errors.loadOrganizations'));
+      handleActionError(err, stableT('invoicesPage.errors.loadOrganizations'));
       return;
     }
     // Now pages through every organization the caller can see, but a
@@ -200,7 +212,7 @@ export function InvoicesPage({ lockedOrgId }: InvoicesPageProps = {}) {
       if (lockedOrg?.id) list.unshift(lockedOrg);
     }
     setOrgs(list);
-  }, [t, lockedOrgId]);
+  }, [stableT, lockedOrgId]);
 
   const loadInvoices = useCallback(async (f: Filters) => {
     // Latest-request-wins. A deep-linked load (`/invoices#status=paid`) fires
@@ -222,17 +234,17 @@ export function InvoicesPage({ lockedOrgId }: InvoicesPageProps = {}) {
       if (seq !== fetchSeq.current) return;
       if (res.status === 401) return UNAUTHORIZED();
       if (res.status === 403) { setForbidden(true); return; }
-      if (!res.ok) throw new Error(t('invoicesPage.errors.loadInvoices'));
+      if (!res.ok) throw new Error(stableT('invoicesPage.errors.loadInvoices'));
       const body = (await res.json()) as { data: InvoiceSummary[] };
       if (seq !== fetchSeq.current) return;
       setInvoices(body.data ?? []);
     } catch (err) {
       if (seq !== fetchSeq.current) return;
-      setError(err instanceof Error ? err.message : t('invoicesPage.errors.loadInvoices'));
+      setError(err instanceof Error ? err.message : stableT('invoicesPage.errors.loadInvoices'));
     } finally {
       if (seq === fetchSeq.current) setLoading(false);
     }
-  }, [t, lockedOrgId]);
+  }, [stableT, lockedOrgId]);
 
   useEffect(() => { void loadOrgs(); }, [loadOrgs]);
   useEffect(() => { void loadInvoices(filters); }, [loadInvoices, filters]);
@@ -282,13 +294,17 @@ export function InvoicesPage({ lockedOrgId }: InvoicesPageProps = {}) {
     setAssembleSites([]);
     const today = new Date();
     const monthAgo = new Date(today.getTime() - 30 * 86400000);
-    setAssembleFrom(monthAgo.toISOString().slice(0, 10));
-    setAssembleTo(today.toISOString().slice(0, 10));
+    setAssembleFrom(localDateInputValue(monthAgo));
+    setAssembleTo(localDateInputValue(today));
     setAssembleCurrency('');
     setBlockedGroups([]);
     setAssembleOpen(true);
     if (contextOrgId) void loadAssembleSites(contextOrgId);
   }, [loadAssembleSites, lockedOrgId]);
+
+  // "c then i" from anywhere lands here with a create intent. Only the
+  // standalone list answers it, not an org-record embed.
+  useCreateIntent('invoice', openAssemble, can('invoices', 'write') && !lockedOrgId);
 
   // `currencyOverride` lets the blocked-group shortcut re-submit in the same
   // tick it sets the select — the state write alone would not be visible to
@@ -323,6 +339,11 @@ export function InvoicesPage({ lockedOrgId }: InvoicesPageProps = {}) {
       for (const g of result?.data?.blockedByCurrency ?? []) {
         showToast({ type: 'warning', message: t('invoicesPage.dialog.blockedByCurrency', { count: g.count, code: g.currencyCode }) });
       }
+      // Entries inside a block-hours window are held until the block period closes (#4547).
+      const held = result?.data?.heldForHourBlock;
+      if (held && held.count > 0) {
+        showToast({ type: 'warning', message: t('invoicesPage.dialog.heldForHourBlock', { count: held.count, hours: Number(Number(held.hours).toFixed(2)) }) });
+      }
       // assemble nests under data.invoice.id; blank create returns the row at data.id.
       const newId = result?.data?.invoice?.id ?? result?.data?.id;
       if (newId) void navigateTo(`/billing/invoices/${newId}`);
@@ -335,6 +356,14 @@ export function InvoicesPage({ lockedOrgId }: InvoicesPageProps = {}) {
           ?.details?.blockedByCurrency ?? [];
         setBlockedGroups(groups);
         return;
+      }
+      if (err instanceof ActionError && err.code === 'NOTHING_TO_INVOICE') {
+        // runAction already toasted the server's message; say WHY when the work is merely held for a block.
+        const held = (err.body as { details?: { heldForHourBlock?: HeldForHourBlock } } | undefined)?.details?.heldForHourBlock;
+        if (held && held.count > 0) {
+          showToast({ type: 'warning', message: t('invoicesPage.dialog.heldForHourBlock', { count: held.count, hours: Number(Number(held.hours).toFixed(2)) }) });
+          return;
+        }
       }
       handleActionError(err, t('invoicesPage.dialog.createGenericError'));
     } finally {
@@ -379,7 +408,7 @@ export function InvoicesPage({ lockedOrgId }: InvoicesPageProps = {}) {
     [bulk, loadInvoices, filters, t],
   );
 
-  // Bulk QuickBooks push (Phase C, Task 7). Deliberately NOT routed through
+  // Bulk accounting push (Phase C, Task 7). Deliberately NOT routed through
   // `runBulkInvoices`: the accounting route answers a bare
   // `{ enqueued, skipped, failed }` (no `data` envelope, no `succeeded`) and
   // only enqueues — the push itself happens later on the accounting-sync
@@ -390,9 +419,10 @@ export function InvoicesPage({ lockedOrgId }: InvoicesPageProps = {}) {
   // a push that never happens — the failure branch therefore takes precedence
   // over the skipped-only one. It defaults to 0 so an older or unexpected body
   // degrades to the previous two-number wording instead of printing `undefined`.
-  const pushSelectedToQuickbooks = useCallback(async () => {
+  const pushSelectedToAccounting = useCallback(async () => {
     const invoiceIds = Array.from(bulk.selectedIds);
-    if (invoiceIds.length === 0) return;
+    if (invoiceIds.length === 0 || !pushProvider) return;
+    const providerName = ACCOUNTING_PROVIDER_NAMES[pushProvider];
     if (invoiceIds.length > BULK_ID_LIMIT) {
       showToast({ type: 'warning', message: t('invoicesPage.bulk.limit', { limit: BULK_ID_LIMIT }) });
       return;
@@ -405,32 +435,32 @@ export function InvoicesPage({ lockedOrgId }: InvoicesPageProps = {}) {
         failed?: number;
       }>({
         request: () =>
-          fetchWithAuth('/accounting/quickbooks/invoices/push-bulk', {
+          fetchWithAuth(accountingPath(pushProvider, '/invoices/push-bulk'), {
             method: 'POST',
             body: JSON.stringify({ invoiceIds }),
           }),
-        errorFallback: t('invoicesPage.bulk.quickbooksFailed'),
+        errorFallback: t('invoicesPage.bulk.providerFailed', { provider: providerName }),
         onUnauthorized: UNAUTHORIZED,
       });
       if (failed > 0) {
         showToast({
           type: 'warning',
-          message: t('invoicesPage.bulk.quickbooksQueuedFailed', { enqueued, skipped, failed }),
+          message: t('invoicesPage.bulk.providerQueuedFailed', { enqueued, skipped, failed, provider: providerName }),
         });
       } else {
         showToast(
           skipped > 0
-            ? { type: 'warning', message: t('invoicesPage.bulk.quickbooksQueuedPartial', { enqueued, skipped }) }
-            : { type: 'success', message: t('invoicesPage.bulk.quickbooksQueued', { enqueued }) },
+            ? { type: 'warning', message: t('invoicesPage.bulk.providerQueuedPartial', { enqueued, skipped, provider: providerName }) }
+            : { type: 'success', message: t('invoicesPage.bulk.providerQueued', { enqueued, provider: providerName }) },
         );
       }
       bulk.clear();
     } catch (err) {
-      handleActionError(err, t('invoicesPage.bulk.quickbooksFailed'));
+      handleActionError(err, t('invoicesPage.bulk.providerFailed', { provider: providerName }));
     } finally {
       setBulkBusy(false);
     }
-  }, [bulk, t]);
+  }, [bulk, t, pushProvider]);
 
   // ---- derived rows: search filter (client) then optional sort ------------
   const rows = useMemo(() => {
@@ -457,7 +487,7 @@ export function InvoicesPage({ lockedOrgId }: InvoicesPageProps = {}) {
 
   // ---- outstanding summary (open balance + overdue count) -----------------
   const summary = useMemo(() => {
-    const open = invoices.filter((i) => i.status !== 'void' && num(i.balance) > 0);
+    const open = invoices.filter((i) => i.status !== 'void' && i.status !== 'draft' && num(i.balance) > 0);
     const outstanding = open.reduce((sum, i) => sum + num(i.balance), 0);
     const overdue = invoices.filter((i) => i.status === 'overdue').length;
     const draftCount = invoices.filter((i) => i.status === 'draft').length;
@@ -845,7 +875,7 @@ export function InvoicesPage({ lockedOrgId }: InvoicesPageProps = {}) {
               actions={[
                 ...(can('invoices', 'send') ? [{ key: 'issue', label: t('invoicesPage.bulk.issue'), disabled: bulkBusy, onClick: () => void runBulkInvoices('/invoices/bulk-issue', t('invoicesPage.bulk.issuedVerb')) }] : []),
                 ...(can('invoices', 'send') ? [{ key: 'void', label: t('invoicesPage.bulk.void'), variant: 'destructive' as const, disabled: bulkBusy, onClick: () => { setVoidReason(''); setVoidOpen(true); } }] : []),
-                ...(can('invoices', 'write') && !isOrgScoped ? [{ key: 'quickbooks', label: t('invoicesPage.bulk.quickbooks'), disabled: bulkBusy, onClick: () => void pushSelectedToQuickbooks() }] : []),
+                ...(canOfferBulkPush && pushProvider ? [{ key: pushProvider, label: t('invoicesPage.bulk.pushToProvider', { provider: ACCOUNTING_PROVIDER_NAMES[pushProvider] }), disabled: bulkBusy, onClick: () => void pushSelectedToAccounting() }] : []),
                 ...(can('invoices', 'write') ? [{ key: 'delete', label: t('invoicesPage.bulk.deleteDrafts'), variant: 'destructive' as const, disabled: bulkBusy, onClick: () => setDeleteOpen(true) }] : []),
               ]}
             />

@@ -1,5 +1,5 @@
 import '@/lib/i18n';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { AlertTriangle, ListChecks, Plus } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { fetchWithAuth } from '../../stores/auth';
@@ -30,6 +30,7 @@ import {
   rowClass,
 } from './ui';
 import { asList } from '@/lib/asList';
+import { useStableT } from '@/lib/i18n/useStableT';
 
 function ruleCriteriaSummary(rule: PamRule, signerGroupNames: Record<string, string> = {}): string {
   const parts: string[] = [];
@@ -51,6 +52,7 @@ function ruleCriteriaSummary(rule: PamRule, signerGroupNames: Record<string, str
 
 export default function PamRulesTab({ liveTick = 0 }: { liveTick?: number }) {
   const { t } = useTranslation('security');
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   const { can } = usePermissions();
   const canManage = can('pam', 'manage_policy');
   const [rules, setRules] = useState<PamRule[]>([]);
@@ -138,8 +140,8 @@ export default function PamRulesTab({ liveTick = 0 }: { liveTick?: number }) {
     }
   };
 
-  const fetchRules = useCallback(async (signal?: AbortSignal) => {
-    setLoading(true);
+  const fetchRules = useCallback(async (signal?: AbortSignal, { silent = false }: { silent?: boolean } = {}) => {
+    if (!silent) setLoading(true);
     setError(null);
     try {
       const res = await fetchWithAuth('/pam/rules', { signal });
@@ -149,7 +151,7 @@ export default function PamRulesTab({ liveTick = 0 }: { liveTick?: number }) {
           return;
         }
           throw new Error(
-            t('pamPamRulesTab.errors.loadWithStatus', {
+            stableT('pamPamRulesTab.errors.loadWithStatus', {
               defaultValue: 'Failed to load rules (HTTP {{status}})',
               status: res.status,
             }),
@@ -164,16 +166,19 @@ export default function PamRulesTab({ liveTick = 0 }: { liveTick?: number }) {
       setError(
         err instanceof Error
           ? err.message
-          : t('pamPamRulesTab.errors.load', { defaultValue: 'Failed to load rules' }),
+          : stableT('pamPamRulesTab.errors.load', { defaultValue: 'Failed to load rules' }),
       );
     } finally {
       if (!signal?.aborted) setLoading(false);
     }
-  }, [t]);
+  }, [stableT]);
 
+  const lastTickRef = useRef(liveTick);
   useEffect(() => {
+    const silent = liveTick !== lastTickRef.current;
+    lastTickRef.current = liveTick;
     const controller = new AbortController();
-    void fetchRules(controller.signal);
+    void fetchRules(controller.signal, { silent });
     return () => controller.abort();
   }, [fetchRules, liveTick]);
 

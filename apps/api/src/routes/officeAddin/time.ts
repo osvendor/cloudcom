@@ -11,6 +11,8 @@ import {
   TimeEntryServiceError,
   type TimeEntryActor,
 } from '../../services/timeEntryService';
+import { listWorkTypes } from '../../services/workTypeService';
+import { hasPermission, PERMISSIONS } from '../../services/permissions';
 import { addinLogTimeSchema, addinStartTimerSchema, addinStopTimerSchema } from './schemas';
 import type { AddinRunningTimerEntry } from '@breeze/shared';
 
@@ -43,12 +45,14 @@ function addinTimeActorFrom(auth: OfficeAddinTechAuth): TimeEntryActor {
     // Add-in tokens are a separate principal, not a web session or OAuth grant.
     manageBilling: canManageTimeEntryBilling({ user: { isPlatformAdmin: false } }, auth.permissions),
     accessibleOrgIds: auth.accessibleOrgIds,
+    // #4186: a site-confined caller may not stamp a site outside its allowlist.
+    allowedSiteIds: auth.permissions.allowedSiteIds,
   };
 }
 
 function handleServiceError(c: { json: (b: unknown, s: number) => Response }, err: unknown): Response {
   if (err instanceof TimeEntryServiceError) {
-    return c.json({ error: err.code ?? err.message }, err.status);
+    return c.json({ error: err.code ?? err.message, ...(err.details ? { details: err.details } : {}) }, err.status);
   }
   throw err;
 }
@@ -80,6 +84,27 @@ officeAddinTimeRoutes.get('/running', requireAddinCapability('time-read'), async
   const auth = c.get('officeAddinAuth');
   const running = await getRunningTimer(auth.userId);
   return c.json({ running: running ? toRunningTimerResponse(running) : null });
+});
+
+/**
+ * Labels for the TimeWidget work-type picker (#4628 W04). Registered here, not
+ * as its own router, so it shares this router's single `use('*')` auth mount
+ * under '/time' (see ./index.ts on why sub-routers are never double-mounted).
+ *
+ * Two gates: the `time-read` capability (the widget is useless without it) AND
+ * the technician's live `billing_profiles:read` — the same permission the web
+ * picker's `GET /billing-profiles/work-types` requires, so the add-in never
+ * shows a label the web would not. Projected to id + name: the add-in needs a
+ * label, not the card. Active types only, of the principal's own partner.
+ */
+officeAddinTimeRoutes.get('/work-types', requireAddinCapability('time-read'), async (c) => {
+  const auth = c.get('officeAddinAuth');
+  const read = PERMISSIONS.BILLING_PROFILES_READ;
+  if (!hasPermission(auth.permissions, read.resource, read.action)) {
+    return c.json({ error: 'Forbidden' }, 403);
+  }
+  const rows = await listWorkTypes(auth.partnerId);
+  return c.json({ workTypes: rows.map((w) => ({ id: w.id, name: w.name })) });
 });
 
 officeAddinTimeRoutes.post(

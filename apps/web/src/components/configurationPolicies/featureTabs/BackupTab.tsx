@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useMemo } from "react";
 import {
   HardDrive,
   Plus,
@@ -14,9 +14,11 @@ import type { FeatureTabProps } from "./types";
 import { FEATURE_META } from "./types";
 import { useFeatureLink } from "./useFeatureLink";
 import FeatureTabShell from "./FeatureTabShell";
+import StorageKeyRevocationCard from "./StorageKeyRevocationCard";
 import BackupDestinationSection, {
   emptyConfigForm,
   capabilitySummary,
+  destinationPrefixError,
   supportsProviderImmutability,
 } from "./BackupDestinationSection";
 import type {
@@ -45,16 +47,30 @@ type BackupScheduleSettings = {
   scheduleTime: string;
   scheduleDayOfWeek: number;
   scheduleDayOfMonth: number;
+  // #11013: API-only for now. Not editable here, but it has to survive a save:
+  // the schedule is rebuilt from these fields, which would turn it back on.
+  runMissedBackupsOnConnect?: boolean;
+  // The card shown as selected. On load it is derived from the stored numbers,
+  // so a retention that matches no preset reads as Custom (#11278).
   retentionPreset: RetentionPreset;
-  retentionDays: number;
-  retentionVersions: number;
+  // The `preset` label written on save; null leaves it out. Retention
+  // enforcement ignores the label (only the numbers count), so an untouched
+  // retention keeps its stored label, or the lack of one (#11278).
+  retentionPresetLabel: RetentionPreset | null;
+  // For the retention numbers below, null means the field is absent from the
+  // stored retention. In the API, an absent field (or 0) means no constraint:
+  // no retentionDays floor, no maxVersions cap, no GFS tier
+  // (apps/api/src/jobs/backupRetention.ts). It shows as "Not set" and is left
+  // out on save, never replaced with a preset default (#11278).
+  retentionDays: number | null;
+  retentionVersions: number | null;
   paths: string[];
   excludePatterns: string[];
-  gfsDailyRetention: number;
-  gfsWeeklyRetention: number;
-  gfsMonthlyRetention: number;
-  gfsYearlyRetention: number;
-  gfsWeeklyDayOfWeek: number;
+  gfsDailyRetention: number | null;
+  gfsWeeklyRetention: number | null;
+  gfsMonthlyRetention: number | null;
+  gfsYearlyRetention: number | null;
+  gfsWeeklyDayOfWeek: number | null;
   legalHoldEnabled: boolean;
   legalHoldReason: string;
   immutabilityMode: ImmutabilityMode;
@@ -74,14 +90,14 @@ type BackupInlineSettingsPayload = {
     windowEnd?: string;
   };
   retention: {
-    preset: RetentionPreset;
-    retentionDays: number;
-    maxVersions: number;
-    keepDaily: number;
-    keepWeekly: number;
-    keepMonthly: number;
-    keepYearly: number;
-    weeklyDay: number;
+    preset?: RetentionPreset;
+    retentionDays?: number;
+    maxVersions?: number;
+    keepDaily?: number;
+    keepWeekly?: number;
+    keepMonthly?: number;
+    keepYearly?: number;
+    weeklyDay?: number;
     legalHold?: boolean;
     legalHoldReason?: string;
     immutabilityMode?: ImmutabilityMode;
@@ -111,6 +127,7 @@ const scheduleDefaults: BackupScheduleSettings = {
   scheduleDayOfWeek: 0,
   scheduleDayOfMonth: 1,
   retentionPreset: "standard",
+  retentionPresetLabel: "standard",
   retentionDays: 30,
   retentionVersions: 5,
   paths: [],
@@ -150,6 +167,15 @@ const createScheduleOptions = (): {
   },
 ];
 
+const RETENTION_PRESET_LIMITS: Record<
+  Exclude<RetentionPreset, "custom">,
+  { days: number; versions: number }
+> = {
+  standard: { days: 30, versions: 5 },
+  extended: { days: 90, versions: 10 },
+  compliance: { days: 365, versions: 20 },
+};
+
 const createRetentionPresets = (): {
   value: RetentionPreset;
   label: string;
@@ -161,24 +187,21 @@ const createRetentionPresets = (): {
     label: i18n.t(
       "policies:configurationPolicies.featureTabs.backupTab.standard",
     ),
-    days: 30,
-    versions: 5,
+    ...RETENTION_PRESET_LIMITS.standard,
   },
   {
     value: "extended",
     label: i18n.t(
       "policies:configurationPolicies.featureTabs.backupTab.extended",
     ),
-    days: 90,
-    versions: 10,
+    ...RETENTION_PRESET_LIMITS.extended,
   },
   {
     value: "compliance",
     label: i18n.t(
       "policies:configurationPolicies.featureTabs.backupTab.compliance",
     ),
-    days: 365,
-    versions: 20,
+    ...RETENTION_PRESET_LIMITS.compliance,
   },
   {
     value: "custom",
@@ -320,7 +343,56 @@ function scheduleDescription(s: BackupScheduleSettings): string {
   }
 }
 
-function inflateSettings(
+const storedNumber = (value: unknown): number | null =>
+  typeof value === "number" && Number.isFinite(value) ? value : null;
+
+const isRetentionPreset = (value: unknown): value is RetentionPreset =>
+  value === "standard" ||
+  value === "extended" ||
+  value === "compliance" ||
+  value === "custom";
+
+// Reads an existing link's retention as stored, gaps included (#11278). The
+// card shown is the labelled preset only while the stored numbers still match
+// it. Anything else, an unlabelled retention included, shows as Custom with
+// the stored values.
+function inflateRetention(
+  retention: Record<string, unknown>,
+): Pick<
+  BackupScheduleSettings,
+  | "retentionPreset"
+  | "retentionPresetLabel"
+  | "retentionDays"
+  | "retentionVersions"
+  | "gfsDailyRetention"
+  | "gfsWeeklyRetention"
+  | "gfsMonthlyRetention"
+  | "gfsYearlyRetention"
+  | "gfsWeeklyDayOfWeek"
+> {
+  const label = isRetentionPreset(retention.preset) ? retention.preset : null;
+  const retentionDays = storedNumber(retention.retentionDays);
+  const retentionVersions = storedNumber(retention.maxVersions);
+  const limits =
+    label && label !== "custom" ? RETENTION_PRESET_LIMITS[label] : null;
+  const matchesLabel =
+    limits !== null &&
+    retentionDays === limits.days &&
+    retentionVersions === limits.versions;
+  return {
+    retentionPreset: matchesLabel && label ? label : "custom",
+    retentionPresetLabel: label,
+    retentionDays,
+    retentionVersions,
+    gfsDailyRetention: storedNumber(retention.keepDaily),
+    gfsWeeklyRetention: storedNumber(retention.keepWeekly),
+    gfsMonthlyRetention: storedNumber(retention.keepMonthly),
+    gfsYearlyRetention: storedNumber(retention.keepYearly),
+    gfsWeeklyDayOfWeek: storedNumber(retention.weeklyDay),
+  };
+}
+
+export function inflateSettings(
   stored?: Record<string, unknown> | null,
 ): BackupScheduleSettings {
   const schedule = (stored?.schedule ?? {}) as Record<string, unknown>;
@@ -345,24 +417,15 @@ function inflateSettings(
       (schedule.dayOfWeek as number) ?? scheduleDefaults.scheduleDayOfWeek,
     scheduleDayOfMonth:
       (schedule.dayOfMonth as number) ?? scheduleDefaults.scheduleDayOfMonth,
-    retentionPreset:
-      (retention.preset as RetentionPreset) ?? scheduleDefaults.retentionPreset,
-    retentionDays:
-      (retention.retentionDays as number) ?? scheduleDefaults.retentionDays,
-    retentionVersions:
-      (retention.maxVersions as number) ?? scheduleDefaults.retentionVersions,
+    ...(typeof schedule.runMissedBackupsOnConnect === "boolean"
+      ? { runMissedBackupsOnConnect: schedule.runMissedBackupsOnConnect }
+      : {}),
+    // No inline settings means a link not yet saved from this form, which
+    // starts on the Standard preset (scheduleDefaults). An existing link's
+    // retention is read as stored; the API returns `{}` when it holds none.
+    ...(stored ? inflateRetention(retention) : {}),
     paths: persistedPaths.length > 0 ? persistedPaths : targetPaths,
     excludePatterns: excludes,
-    gfsDailyRetention:
-      (retention.keepDaily as number) ?? scheduleDefaults.gfsDailyRetention,
-    gfsWeeklyRetention:
-      (retention.keepWeekly as number) ?? scheduleDefaults.gfsWeeklyRetention,
-    gfsMonthlyRetention:
-      (retention.keepMonthly as number) ?? scheduleDefaults.gfsMonthlyRetention,
-    gfsYearlyRetention:
-      (retention.keepYearly as number) ?? scheduleDefaults.gfsYearlyRetention,
-    gfsWeeklyDayOfWeek:
-      (retention.weeklyDay as number) ?? scheduleDefaults.gfsWeeklyDayOfWeek,
     legalHoldEnabled: retention.legalHold === true,
     legalHoldReason:
       (retention.legalHoldReason as string) ?? scheduleDefaults.legalHoldReason,
@@ -380,6 +443,8 @@ function inflateSettings(
 
 // True when settings deviate from defaults in the advanced (GFS / window)
 // controls — used to auto-open the disclosure so saved values are never hidden.
+// An unset GFS tier (null) counts: it differs from what a new link gets and
+// the operator should see it as "Not set" (#11278).
 function hasAdvancedValues(s: BackupScheduleSettings): boolean {
   return (
     s.gfsDailyRetention !== scheduleDefaults.gfsDailyRetention ||
@@ -392,7 +457,18 @@ function hasAdvancedValues(s: BackupScheduleSettings): boolean {
   );
 }
 
-function buildInlineSettings(
+function presentNumbers<K extends string>(
+  values: Record<K, number | null>,
+): Partial<Record<K, number>> {
+  const out: Partial<Record<K, number>> = {};
+  for (const key of Object.keys(values) as K[]) {
+    const value = values[key];
+    if (value !== null) out[key] = value;
+  }
+  return out;
+}
+
+export function buildInlineSettings(
   settings: BackupScheduleSettings,
   backupMode: string,
   targets: Record<string, unknown>,
@@ -420,16 +496,25 @@ function buildInlineSettings(
       ...(settings.backupWindowEnd
         ? { windowEnd: settings.backupWindowEnd }
         : {}),
+      ...(settings.runMissedBackupsOnConnect !== undefined
+        ? { runMissedBackupsOnConnect: settings.runMissedBackupsOnConnect }
+        : {}),
     },
     retention: {
-      preset: settings.retentionPreset,
-      retentionDays: settings.retentionDays,
-      maxVersions: settings.retentionVersions,
-      keepDaily: settings.gfsDailyRetention,
-      keepWeekly: settings.gfsWeeklyRetention,
-      keepMonthly: settings.gfsMonthlyRetention,
-      keepYearly: settings.gfsYearlyRetention,
-      weeklyDay: settings.gfsWeeklyDayOfWeek,
+      ...(settings.retentionPresetLabel
+        ? { preset: settings.retentionPresetLabel }
+        : {}),
+      // A null number was absent from the stored retention: leave it absent
+      // rather than adding a limit nobody set (#11278).
+      ...presentNumbers({
+        retentionDays: settings.retentionDays,
+        maxVersions: settings.retentionVersions,
+        keepDaily: settings.gfsDailyRetention,
+        keepWeekly: settings.gfsWeeklyRetention,
+        keepMonthly: settings.gfsMonthlyRetention,
+        keepYearly: settings.gfsYearlyRetention,
+        weeklyDay: settings.gfsWeeklyDayOfWeek,
+      }),
       ...(settings.legalHoldEnabled
         ? {
             legalHold: true,
@@ -512,6 +597,13 @@ export default function BackupTab({
   // Partner-wide ("all organizations") policy: destinations are per-org, so
   // the link always resolves each device org's default at job time.
   const isPartnerWide = orgId === null;
+  // Destinations/profiles belong to the org that OWNS the policy, which is not
+  // necessarily the org selected in the header. Pin every backup request to it
+  // (a partner-wide policy has no owner org, so it keeps the ambient scope).
+  const ownerOrg = useMemo(
+    () => (typeof orgId === "string" ? { orgIdOverride: orgId } : {}),
+    [orgId],
+  );
 
   // Source mode: profile-linked (backup_profiles selection) vs custom
   // (legacy per-policy backupMode/paths/targets).
@@ -602,7 +694,7 @@ export default function BackupTab({
     setConfigsLoading(true);
     setConfigsError("none");
     try {
-      const response = await fetchWithAuth(meta.fetchUrl);
+      const response = await fetchWithAuth(meta.fetchUrl, ownerOrg);
       // Terminal for this user — not something a Retry can clear. Kept out of
       // the throw path so the status is not flattened into a message. (#2429)
       if (response.status === 403) {
@@ -629,7 +721,7 @@ export default function BackupTab({
     } finally {
       setConfigsLoading(false);
     }
-  }, [meta.fetchUrl]);
+  }, [meta.fetchUrl, ownerOrg]);
 
   useEffect(() => {
     fetchConfigs();
@@ -640,7 +732,7 @@ export default function BackupTab({
     (async () => {
       setProfilesLoading(true);
       try {
-        const response = await fetchWithAuth("/backup/profiles");
+        const response = await fetchWithAuth("/backup/profiles", ownerOrg);
         if (!response.ok) {
           throw new Error(`Failed to load backup profiles (${response.status})`);
         }
@@ -666,7 +758,7 @@ export default function BackupTab({
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [ownerOrg]);
 
   useEffect(() => {
     const link = existingLink ?? parentLink;
@@ -729,13 +821,30 @@ export default function BackupTab({
   };
 
   const handleRetentionPreset = (preset: RetentionPreset) => {
-    update("retentionPreset", preset);
-    const p = retentionPresets.find((r) => r.value === preset);
-    if (p && preset !== "custom") {
-      update("retentionDays", p.days);
-      update("retentionVersions", p.versions);
-    }
+    setSettings((prev) => ({
+      ...prev,
+      retentionPreset: preset,
+      retentionPresetLabel: preset,
+      ...(preset !== "custom"
+        ? {
+            retentionDays: RETENTION_PRESET_LIMITS[preset].days,
+            retentionVersions: RETENTION_PRESET_LIMITS[preset].versions,
+          }
+        : {}),
+    }));
   };
+
+  // These inputs only render on the Custom card, so any edit saves
+  // preset: "custom".
+  const updateCustomRetention = (
+    key: "retentionDays" | "retentionVersions",
+    value: number,
+  ) =>
+    setSettings((prev) => ({
+      ...prev,
+      [key]: value,
+      retentionPresetLabel: "custom",
+    }));
 
   const applyOsPreset = (preset: BackupOsPreset) => {
     clearFieldError("paths");
@@ -787,6 +896,7 @@ export default function BackupTab({
         `/backup/configs/${selectedConfigId}/test`,
         {
           method: "POST",
+          ...ownerOrg,
         },
       );
       const data = await response.json().catch(() => ({}));
@@ -849,6 +959,7 @@ export default function BackupTab({
       const details = buildProviderDetails();
       const response = await fetchWithAuth("/backup/configs", {
         method: "POST",
+        ...ownerOrg,
         body: JSON.stringify({
           name: configForm.name,
           provider: configForm.provider,
@@ -936,6 +1047,7 @@ export default function BackupTab({
         `/backup/configs/${editingConfigId}`,
         {
           method: "PATCH",
+          ...ownerOrg,
           body: JSON.stringify({
             name: configForm.name,
             encryption: configForm.encryption,
@@ -984,6 +1096,10 @@ export default function BackupTab({
           "policies:configurationPolicies.featureTabs.backupTab.s3BucketNameIsRequired",
         );
       }
+      // Rendered inline by BackupDestinationSection; recorded here so a save
+      // that slips past the disabled button still stops.
+      const prefixError = destinationPrefixError(configForm);
+      if (prefixError) errors.prefix = prefixError;
       if (
         !configForm.region.trim() &&
         !deriveS3RegionFromEndpoint(configForm.endpoint)
@@ -1224,6 +1340,12 @@ export default function BackupTab({
       ? defaultConfig
       : configs.find((c) => c.id === selectedConfigId);
   const isSaving = saving || configSaving;
+  // #7081: the destination form shows the key-prefix error inline; Save waits
+  // until it is fixed (the API would refuse the destination anyway).
+  const destinationPrefixInvalid =
+    !isPartnerWide &&
+    (mode === "create" || mode === "edit") &&
+    destinationPrefixError(configForm) !== null;
   const combinedError = configError || error;
   const retentionInfo = retentionPresets.find(
     (p) => p.value === settings.retentionPreset,
@@ -1237,8 +1359,15 @@ export default function BackupTab({
     settings.retentionPreset === "custom"
       ? settings.retentionDays
       : (retentionInfo?.days ?? settings.retentionDays);
+  // An unset retentionDays has no floor, and an unset keepDaily has no daily
+  // tier to fall below it.
   const gfsDailyBelowRetentionFloor =
+    settings.gfsDailyRetention !== null &&
+    effectiveRetentionDays !== null &&
     settings.gfsDailyRetention < effectiveRetentionDays;
+  const retentionNotSet = i18n.t(
+    "policies:configurationPolicies.featureTabs.backupTab.retentionNotSet",
+  );
   const selectedConfigSupportsProvider =
     supportsProviderImmutability(selectedConfig);
   const invalidSavedProviderMode =
@@ -1289,6 +1418,7 @@ export default function BackupTab({
       icon={<HardDrive className="h-5 w-5" />}
       isConfigured={!!existingLink || isInherited}
       saving={isSaving}
+      saveDisabled={destinationPrefixInvalid}
       error={combinedError}
       onSave={handleSave}
       onRemove={existingLink && !linkedPolicyId ? handleRemove : undefined}
@@ -1929,6 +2059,7 @@ export default function BackupTab({
             </div>
           ) : (
             <>
+              <StorageKeyRevocationCard orgId={orgId ?? null} />
               <BackupDestinationSection
                 configs={configs}
                 configsLoading={configsLoading}
@@ -2115,9 +2246,13 @@ export default function BackupTab({
                     type="number"
                     min={1}
                     max={3650}
-                    value={settings.retentionDays}
+                    value={settings.retentionDays ?? ""}
+                    placeholder={retentionNotSet}
                     onChange={(e) =>
-                      update("retentionDays", Number(e.target.value) || 30)
+                      updateCustomRetention(
+                        "retentionDays",
+                        Number(e.target.value) || 30,
+                      )
                     }
                     className="mt-1 h-10 w-full rounded-md border bg-background px-3 text-sm"
                   />
@@ -2132,9 +2267,13 @@ export default function BackupTab({
                     type="number"
                     min={1}
                     max={100}
-                    value={settings.retentionVersions}
+                    value={settings.retentionVersions ?? ""}
+                    placeholder={retentionNotSet}
                     onChange={(e) =>
-                      update("retentionVersions", Number(e.target.value) || 5)
+                      updateCustomRetention(
+                        "retentionVersions",
+                        Number(e.target.value) || 5,
+                      )
                     }
                     className="mt-1 h-10 w-full rounded-md border bg-background px-3 text-sm"
                   />
@@ -2203,7 +2342,8 @@ export default function BackupTab({
                         type="number"
                         min={1}
                         max={365}
-                        value={settings.gfsDailyRetention}
+                        value={settings.gfsDailyRetention ?? ""}
+                        placeholder={retentionNotSet}
                         onChange={(e) =>
                           update(
                             "gfsDailyRetention",
@@ -2223,7 +2363,8 @@ export default function BackupTab({
                         type="number"
                         min={1}
                         max={260}
-                        value={settings.gfsWeeklyRetention}
+                        value={settings.gfsWeeklyRetention ?? ""}
+                        placeholder={retentionNotSet}
                         onChange={(e) =>
                           update(
                             "gfsWeeklyRetention",
@@ -2243,7 +2384,8 @@ export default function BackupTab({
                         type="number"
                         min={1}
                         max={120}
-                        value={settings.gfsMonthlyRetention}
+                        value={settings.gfsMonthlyRetention ?? ""}
+                        placeholder={retentionNotSet}
                         onChange={(e) =>
                           update(
                             "gfsMonthlyRetention",
@@ -2263,7 +2405,8 @@ export default function BackupTab({
                         type="number"
                         min={1}
                         max={25}
-                        value={settings.gfsYearlyRetention}
+                        value={settings.gfsYearlyRetention ?? ""}
+                        placeholder={retentionNotSet}
                         onChange={(e) =>
                           update(
                             "gfsYearlyRetention",
@@ -2280,7 +2423,10 @@ export default function BackupTab({
                         )}
                       </label>
                       <select
-                        value={settings.gfsWeeklyDayOfWeek}
+                        // Unset shows Sunday, which is what computeGfsTags in
+                        // apps/api/src/jobs/backupRetention.ts uses. The
+                        // display is all: it stays unset on save until changed.
+                        value={settings.gfsWeeklyDayOfWeek ?? 0}
                         onChange={(e) =>
                           update("gfsWeeklyDayOfWeek", Number(e.target.value))
                         }

@@ -1,5 +1,5 @@
 import type { z } from 'zod';
-import { PERMISSION_GRANTS, type ReportType } from '@breeze/shared';
+import { BUSINESS_REPORT_REQUIRED_PERMISSIONS, REPORT_TYPE_REQUIRED_PERMISSIONS, type ReportType } from '@breeze/shared';
 // TYPE-ONLY imports below must stay type-only. `./permissions` and
 // `./reportGenerationService` both import `db`; a value import of either would
 // put the pool in this module's graph (and, for the service, reinstate the
@@ -21,16 +21,22 @@ import {
   UnexecutableReportScopeError,
 } from './reportErrors';
 import {
+  aiUsageByClientConfigSchema,
   arAgingConfigSchema,
+  backupStatusReportConfigSchema,
   endpointManagementConfigSchema,
   hardwareLifecycleConfigSchema,
   identityAccessConfigSchema,
+  clientProfitabilityConfigSchema,
   legacyReportConfigSchema,
+  mrrRenewalsConfigSchema,
+  quoteWinRateConfigSchema,
   securityCompliancePostureConfigSchema,
   storedArtifactConfigSchema,
   technicianTimeConfigSchema,
   threatDetectionConfigSchema,
   ticketSlaConfigSchema,
+  ticketSlaPerformanceConfigSchema,
   vulnerabilityManagementConfigSchema,
 } from './reportConfigSchemas';
 
@@ -244,6 +250,21 @@ const generators = {
       return generateHardwareLifecycleReport(orgId, config, orgAuthority);
     },
   },
+  // Backup Provider Integration W05 (#6013): on-demand snapshot over the W03
+  // unified backup health read model. Org-only, user execution, never
+  // portal-visible (absent from the portal-user allowlists in
+  // reportGenerationService.ts and from PORTAL_DEFINITIONS).
+  backup_status: {
+    type: 'backup_status', label: 'Backup status',
+    configSchema: backupStatusReportConfigSchema, supportedScopes: ORG_ONLY,
+    execution: 'user', audience: 'any', requiredPermissions: NO_EXTRA_PERMISSIONS, detailRowCap: UNCAPPED,
+    generate: async (scope, config, authority) => {
+      const orgId = orgOf(scope);
+      const orgAuthority = requestAuthority(authority, 'backup_status');
+      const { generateBackupStatusReport } = await import('./backupStatusReport');
+      return generateBackupStatusReport(orgId, config, orgAuthority);
+    },
+  },
   // #5784 W02/W03/W04/W06 — managed evidence. `authority` is narrowed to the
   // org axis only, never requestAuthority(): a system authority (org-wide
   // unrestricted) legitimately reaches these.
@@ -301,7 +322,7 @@ const generators = {
   ticket_sla_attainment: {
     type: 'ticket_sla_attainment', label: 'Ticket SLA attainment',
     configSchema: ticketSlaConfigSchema, supportedScopes: ORG_OR_PARTNER,
-    execution: 'user', audience: 'msp_staff', requiredPermissions: [PERMISSION_GRANTS.TICKETS_READ],
+    execution: 'user', audience: 'msp_staff', requiredPermissions: BUSINESS_REPORT_REQUIRED_PERMISSIONS.ticket_sla_attainment,
     detailRowCap: BUSINESS_DETAIL_ROW_CAP,
     generate: async (scope, config, authority) => {
       const { generateTicketSlaAttainmentReport } = await import('./businessReports/ticketSlaReport');
@@ -312,7 +333,7 @@ const generators = {
     type: 'technician_time_billability', label: 'Technician time & billability',
     configSchema: technicianTimeConfigSchema, supportedScopes: ORG_OR_PARTNER,
     execution: 'user', audience: 'msp_staff',
-    requiredPermissions: [PERMISSION_GRANTS.TIME_ENTRIES_READ, PERMISSION_GRANTS.TICKETS_READ],
+    requiredPermissions: BUSINESS_REPORT_REQUIRED_PERMISSIONS.technician_time_billability,
     detailRowCap: BUSINESS_DETAIL_ROW_CAP,
     generate: async (scope, config, authority) => {
       const { generateTechnicianTimeBillabilityReport } = await import('./businessReports/technicianTimeReport');
@@ -322,11 +343,79 @@ const generators = {
   ar_aging: {
     type: 'ar_aging', label: 'AR aging',
     configSchema: arAgingConfigSchema, supportedScopes: ORG_OR_PARTNER,
-    execution: 'user', audience: 'msp_staff', requiredPermissions: [PERMISSION_GRANTS.INVOICES_READ],
+    execution: 'user', audience: 'msp_staff', requiredPermissions: BUSINESS_REPORT_REQUIRED_PERMISSIONS.ar_aging,
     detailRowCap: BUSINESS_DETAIL_ROW_CAP,
     generate: async (scope, config, authority) => {
       const { generateArAgingReport } = await import('./businessReports/arAgingReport');
       return generateArAgingReport(scope, config, authority);
+    },
+  },
+  // AI chargeback W10 (#7608). Same shape as the #3198 business types: the
+  // generator takes the ReportScope and runs its own `runInReportScope`.
+  ai_usage_by_client: {
+    type: 'ai_usage_by_client', label: 'AI usage by client',
+    configSchema: aiUsageByClientConfigSchema, supportedScopes: ORG_OR_PARTNER,
+    execution: 'user', audience: 'msp_staff',
+    requiredPermissions: BUSINESS_REPORT_REQUIRED_PERMISSIONS.ai_usage_by_client,
+    detailRowCap: BUSINESS_DETAIL_ROW_CAP,
+    generate: async (scope, config, authority) => {
+      const { generateAiUsageByClientReport } = await import('./businessReports/aiUsageByClientReport');
+      return generateAiUsageByClientReport(scope, config, authority);
+    },
+  },
+  // Business reports phase 2 W1 (#9828). Same shape as the other business
+  // types; measured at run time (no period).
+  mrr_renewals: {
+    type: 'mrr_renewals', label: 'MRR & renewals',
+    configSchema: mrrRenewalsConfigSchema, supportedScopes: ORG_OR_PARTNER,
+    execution: 'user', audience: 'msp_staff',
+    requiredPermissions: BUSINESS_REPORT_REQUIRED_PERMISSIONS.mrr_renewals,
+    detailRowCap: BUSINESS_DETAIL_ROW_CAP,
+    generate: async (scope, config, authority) => {
+      const { generateMrrRenewalsReport } = await import('./businessReports/mrrRenewalsReport');
+      return generateMrrRenewalsReport(scope, config, authority);
+    },
+  },
+  // Business reports phase 2 W2 (#9828). Same shape as the other business
+  // types; the period applies to each lineage's first send date.
+  quote_win_rate: {
+    type: 'quote_win_rate', label: 'Quote win rate',
+    configSchema: quoteWinRateConfigSchema, supportedScopes: ORG_OR_PARTNER,
+    execution: 'user', audience: 'msp_staff',
+    requiredPermissions: BUSINESS_REPORT_REQUIRED_PERMISSIONS.quote_win_rate,
+    detailRowCap: BUSINESS_DETAIL_ROW_CAP,
+    generate: async (scope, config, authority) => {
+      const { generateQuoteWinRateReport } = await import('./businessReports/quoteWinRateReport');
+      return generateQuoteWinRateReport(scope, config, authority);
+    },
+  },
+  // Business reports phase 2 W3 (#9828). Same shape as the other business
+  // types; needs invoices:read AND time_entries:read.
+  client_profitability: {
+    type: 'client_profitability', label: 'Client profitability',
+    configSchema: clientProfitabilityConfigSchema, supportedScopes: ORG_OR_PARTNER,
+    execution: 'user', audience: 'msp_staff',
+    requiredPermissions: BUSINESS_REPORT_REQUIRED_PERMISSIONS.client_profitability,
+    detailRowCap: BUSINESS_DETAIL_ROW_CAP,
+    generate: async (scope, config, authority) => {
+      const { generateClientProfitabilityReport } = await import('./businessReports/clientProfitabilityReport');
+      return generateClientProfitabilityReport(scope, config, authority);
+    },
+  },
+  // #11018: the customer-facing sibling of ticket_sla_attainment. Org-only and
+  // audience 'any', with the same ticket read gate. It takes the authority
+  // untouched and refuses a restricted one itself: tickets have no site axis.
+  ticket_sla_performance: {
+    type: 'ticket_sla_performance', label: 'SLA performance',
+    configSchema: ticketSlaPerformanceConfigSchema, supportedScopes: ORG_ONLY,
+    execution: 'managed_evidence', audience: 'any',
+    requiredPermissions: REPORT_TYPE_REQUIRED_PERMISSIONS.ticket_sla_performance!,
+    detailRowCap: UNCAPPED,
+    generate: async (scope, config, authority, evidence) => {
+      orgOf(scope);
+      const orgAuthority = orgAxisAuthority(authority, 'ticket_sla_performance');
+      const { generateTicketSlaPerformanceReport } = await import('./businessReports/ticketSlaPerformanceReport');
+      return generateTicketSlaPerformanceReport(scope, config, orgAuthority, evidence);
     },
   },
 } satisfies { readonly [K in ReportType]: ReportTypeDef & { type: K } };

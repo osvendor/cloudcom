@@ -12,6 +12,8 @@
  *   - `emitRebootPendingAlert` — one alert per device whose reboot has been
  *     pending longer than `REBOOT_PENDING_ALERT_THRESHOLD_DAYS`, raised from
  *     the 10-minute maintenance-reboot sweep (`maintenanceRebootWorker.ts`).
+ *     The same sweep clears it (`resolveClearedRebootPendingAlerts`) once the
+ *     device stops reporting a pending reboot.
  *
  * Both templates are GLOBAL rows (org_id IS NULL AND partner_id IS NULL —
  * legal per `alert_templates_one_owner_chk`, see `db/schema/alerts.ts`), and
@@ -20,12 +22,14 @@
  * copies that shape.
  */
 
-import { and, asc, eq, isNull, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, isNotNull, isNull, ne, or, sql } from 'drizzle-orm';
 import * as dbModule from '../db';
-import { alertRules, alertTemplates, devices, patchJobResults, patchJobs } from '../db/schema';
-import { createAlert } from './alertService';
+import { alertRules, alertTemplates, alerts, devices, patchJobResults, patchJobs } from '../db/schema';
+import { createAlert, resolveAlert, RESOLVABLE_ALERT_STATUSES } from './alertService';
+import { insertBuiltInAlertRule, type BuiltInAlertRuleSource } from './builtInAlertRules';
 import { checkDeviceMaintenanceWindow } from './featureConfigResolver';
 import { captureException } from './sentry';
+import { sqlTimestamp } from './portal/sqlTimestamp';
 import { PATCH_ALERT_CATEGORY } from '@breeze/shared';
 
 export { PATCH_ALERT_CATEGORY };
@@ -61,6 +65,12 @@ async function runWithSystemDbAccess<T>(fn: () => Promise<T>): Promise<T> {
 
 const PATCH_JOB_FAILURE_TEMPLATE_NAME = 'Patch job failure';
 const REBOOT_PENDING_TEMPLATE_NAME = 'Reboot pending too long';
+/**
+ * `alerts.context.source` on a reboot-pending alert. The mobile inbox returns
+ * it so the app can offer "Reboot now" on exactly these alerts; changing it
+ * silently removes that button.
+ */
+export const REBOOT_PENDING_ALERT_SOURCE = 'maintenance-reboot-sweep';
 
 const PATCH_JOB_FAILURE_RULE_NAME = 'Patch job failures';
 const REBOOT_PENDING_RULE_NAME = 'Reboot pending too long';
@@ -73,7 +83,7 @@ type PatchAlertTemplateConfig = {
   name: string;
   severity: AlertSeverity;
   cooldownMinutes: number;
-  conditions: { source: string };
+  conditions: { source: BuiltInAlertRuleSource };
   titleTemplate: string;
   messageTemplate: string;
 };
@@ -91,7 +101,7 @@ const REBOOT_PENDING_TEMPLATE: PatchAlertTemplateConfig = {
   name: REBOOT_PENDING_TEMPLATE_NAME,
   severity: 'medium',
   cooldownMinutes: 1440,
-  conditions: { source: 'maintenance-reboot-sweep' },
+  conditions: { source: REBOOT_PENDING_ALERT_SOURCE },
   titleTemplate: 'Reboot pending on {{hostname}}',
   messageTemplate: '{{hostname}} has needed a restart for {{days}} day(s).',
 };
@@ -167,24 +177,14 @@ async function ensurePatchAlertRule(
 
   const templateId = await ensureGlobalTemplate(config);
 
-  const [created] = await db
-    .insert(alertRules)
-    .values({
-      orgId,
-      templateId,
-      name: ruleName,
-      targetType: 'org',
-      targetId: orgId,
-      isActive: true,
-      overrideSettings: { source: config.conditions.source },
-    })
-    .returning({ id: alertRules.id });
-
-  if (!created) {
-    throw new Error(`[patchAlerts] failed to create rule "${ruleName}" for org ${orgId}`);
-  }
-
-  return created.id;
+  // Concurrent first fire in an org: the unique index makes the loser of the
+  // race return the winner's row instead of inserting a second one (#7650).
+  return insertBuiltInAlertRule({
+    orgId,
+    templateId,
+    name: ruleName,
+    overrideSettings: { source: config.conditions.source },
+  });
 }
 
 /** Exported for testing / reuse; the emitters call this themselves. */
@@ -330,7 +330,7 @@ export async function loadOldestRebootRequiredSince(
   orgId: string,
 ): Promise<Date | null> {
   const [row] = await db
-    .select({ oldest: sql<Date | null>`MIN(${patchJobResults.completedAt})` })
+    .select({ oldest: sql<Date | string | null>`MIN(${patchJobResults.completedAt})` })
     .from(patchJobResults)
     .innerJoin(patchJobs, and(eq(patchJobs.id, patchJobResults.jobId), eq(patchJobs.orgId, orgId)))
     .where(
@@ -341,7 +341,11 @@ export async function loadOldestRebootRequiredSince(
       ),
     );
 
-  return row?.oldest ?? null;
+  // `sql<Date | null>` is a type annotation only: postgres-js hands a raw
+  // aggregate back as text (#6835), and `completed_at` is `timestamp` WITHOUT
+  // time zone, so the text carries no offset. `sqlTimestamp` reads it as UTC
+  // and throws on junk (the sweep catches and reports per device).
+  return sqlTimestamp(row?.oldest);
 }
 
 export type EmitRebootPendingAlertInput = {
@@ -395,7 +399,7 @@ export async function emitRebootPendingAlert(
         title: `Reboot pending on ${label}`,
         message: `${label} has needed a restart for ${days} day(s).`,
         context: {
-          source: 'maintenance-reboot-sweep',
+          source: REBOOT_PENDING_ALERT_SOURCE,
           pendingSince: since.toISOString(),
           pendingDays: days,
           category: PATCH_ALERT_CATEGORY,
@@ -411,4 +415,59 @@ export async function emitRebootPendingAlert(
     });
     return null;
   }
+}
+
+/** Per-tick cap; the rest are picked up on the next sweep. */
+const REBOOT_PENDING_RESOLVE_BATCH = 500;
+
+/**
+ * Resolves every open reboot-pending alert whose device no longer reports a
+ * pending reboot. The emitter's sweep only visits `pending_reboot = true`
+ * devices, so without this a device that restarted dropped out of the sweep
+ * and its alert stayed open for good (the template is `autoResolve: false`, so
+ * nothing else clears it).
+ *
+ * Same status rule as the warranty and script-exit-code resolvers: `active`,
+ * `acknowledged` and TIMED suppressions resolve; `dismissed` is terminal and an
+ * indefinite ("Forever") suppression survives. The status filter
+ * matches the predicate of the partial `alerts_open_rule_device_subject_uidx`
+ * index, so the planner can scan open alerts rather than the whole table.
+ *
+ * Returns how many alerts this call resolved (a concurrent manual resolve
+ * loses nothing: `resolveAlert`'s status CAS picks one winner).
+ */
+export async function resolveClearedRebootPendingAlerts(): Promise<number> {
+  const rows = await db
+    .select({ id: alerts.id })
+    .from(alerts)
+    .innerJoin(alertRules, eq(alertRules.id, alerts.ruleId))
+    .innerJoin(devices, eq(devices.id, alerts.deviceId))
+    .where(
+      and(
+        eq(alertRules.name, REBOOT_PENDING_RULE_NAME),
+        sql`${alerts.context}->>'source' = ${REBOOT_PENDING_ALERT_SOURCE}`,
+        inArray(alerts.status, [...RESOLVABLE_ALERT_STATUSES]),
+        or(ne(alerts.status, 'suppressed'), isNotNull(alerts.suppressedUntil)),
+        eq(devices.pendingReboot, false),
+      ),
+    )
+    .orderBy(alerts.createdAt)
+    .limit(REBOOT_PENDING_RESOLVE_BATCH);
+
+  let resolved = 0;
+  for (const row of rows) {
+    // Isolate each row: one bad alert must not strand the rest of the batch.
+    try {
+      if (await resolveAlert(row.id, 'Auto-resolved: the device no longer needs a restart', undefined, false, 'condition_cleared')) {
+        resolved++;
+      }
+    } catch (error) {
+      console.error(`[patchAlerts] failed to resolve cleared reboot pending alert (alert=${row.id}):`, error);
+      captureException(error instanceof Error ? error : new Error(String(error)), undefined, {
+        errorId: 'reboot-pending-alert-resolve-failed',
+        alertId: row.id,
+      });
+    }
+  }
+  return resolved;
 }

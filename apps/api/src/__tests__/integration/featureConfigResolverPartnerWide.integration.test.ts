@@ -12,16 +12,15 @@
  * reads the `breeze.current_partner_id` GUC set from
  * `DbAccessContext.currentPartnerId`.
  *
- * Eight of those resolvers had NO real-database test under a non-system
+ * These active resolvers had NO real-database test under a non-system
  * context, so nothing proved they still return partner-wide rows after the
  * escape was removed. Their only tests mock Drizzle and evaluate no RLS at
  * all. This file closes that gap for:
  *
- *   resolveAlertRulesForDevice, resolveGoverningAlertRulePolicyForDevice,
  *   resolveAutomationsForDevice, resolveComplianceRulesForDevice,
  *   resolveMaintenanceConfigForDevice, resolveSoftwarePolicyForDevice,
  *   resolveVulnerabilityEnabledForDevice, resolveBackupConfigForDevice,
- *   resolveBackupProtectionForDevice
+ *   resolveBackupProtectionForDevice, resolveSystemProtectionForDevice (#4754)
  *
  * Model: agentPolicyResolversPartnerWide.integration.test.ts (same pattern,
  * for the four agent-facing resolvers in routes/agents/helpers.ts).
@@ -45,7 +44,6 @@ import {
   configurationPolicies,
   configPolicyFeatureLinks,
   configPolicyAssignments,
-  configPolicyAlertRules,
   configPolicyAutomations,
   configPolicyComplianceRules,
   configPolicyMaintenanceSettings,
@@ -54,8 +52,6 @@ import {
   devices,
 } from '../../db/schema';
 import {
-  resolveAlertRulesForDevice,
-  resolveGoverningAlertRulePolicyForDevice,
   resolveAutomationsForDevice,
   resolveComplianceRulesForDevice,
   resolveMaintenanceConfigForDevice,
@@ -63,6 +59,8 @@ import {
   resolveVulnerabilityEnabledForDevice,
   resolveBackupConfigForDevice,
   resolveBackupProtectionForDevice,
+  resolveSystemProtectionForDevice,
+  resolveContainmentPolicy,
 } from '../../services/featureConfigResolver';
 import { createPartner, createOrganization, createSite } from './db-utils';
 
@@ -162,32 +160,21 @@ async function assign(configPolicyId: string, level: 'partner' | 'organization',
 
 type Owner = { orgId: string | null; partnerId: string | null };
 
-async function createPolicy(owner: Owner, namePrefix: string): Promise<string> {
+async function createPolicy(owner: Owner, namePrefix: string, parentPolicyId?: string): Promise<string> {
   const [policy] = await db
     .insert(configurationPolicies)
-    .values({ orgId: owner.orgId, partnerId: owner.partnerId, name: `${namePrefix} ${randomUUID()}`, status: 'active' })
+    .values({
+      orgId: owner.orgId,
+      partnerId: owner.partnerId,
+      name: `${namePrefix} ${randomUUID()}`,
+      status: 'active',
+      ...(parentPolicyId ? { parentPolicyId } : {}),
+    })
     .returning();
-  createdPolicies.push(policy!.id);
+  // Children first so the afterEach delete never trips the parent FK.
+  if (parentPolicyId) createdPolicies.unshift(policy!.id);
+  else createdPolicies.push(policy!.id);
   return policy!.id;
-}
-
-// alert rule condition/severity are arbitrary but valid; `name` is the field
-// each test asserts on to prove THIS row resolved.
-async function seedAlertRulePolicy(owner: Owner, ruleName: string): Promise<string> {
-  return withDbAccessContext(SYSTEM_CTX, async () => {
-    const policyId = await createPolicy(owner, 'alert rule policy');
-    const [link] = await db
-      .insert(configPolicyFeatureLinks)
-      .values({ configPolicyId: policyId, featureType: 'alert_rule' })
-      .returning();
-    await db.insert(configPolicyAlertRules).values({
-      featureLinkId: link!.id,
-      name: ruleName,
-      severity: 'critical',
-      conditions: { metric: 'cpu_percent', operator: 'gt', value: 90 },
-    });
-    return policyId;
-  });
 }
 
 async function seedAutomationPolicy(owner: Owner, automationName: string): Promise<string> {
@@ -285,6 +272,51 @@ async function seedVulnerabilityPolicy(owner: Owner, enabled: boolean): Promise<
   });
 }
 
+// No settings child for system_protection (#4754) — the toggles live in the
+// feature link's inlineSettings JSONB.
+async function seedSystemProtectionPolicy(
+  owner: Owner,
+  inlineSettings: Record<string, unknown> | null,
+  parentPolicyId?: string,
+): Promise<string> {
+  return withDbAccessContext(SYSTEM_CTX, async () => {
+    const policyId = await createPolicy(owner, 'system protection policy', parentPolicyId);
+    // null = a child policy with NO own system_protection link (inherits it).
+    if (inlineSettings) {
+      await db.insert(configPolicyFeatureLinks).values({
+        configPolicyId: policyId,
+        featureType: 'system_protection',
+        inlineSettings,
+      });
+    }
+    return policyId;
+  });
+}
+
+// containment (#10100): inline-only like system_protection; the enum value
+// comes from 2027-01-19-120000-config-feature-containment.sql.
+async function seedContainmentPolicy(owner: Owner, inlineSettings: Record<string, unknown>): Promise<string> {
+  return withDbAccessContext(SYSTEM_CTX, async () => {
+    const policyId = await createPolicy(owner, 'containment policy');
+    await db.insert(configPolicyFeatureLinks).values({
+      configPolicyId: policyId,
+      featureType: 'containment',
+      inlineSettings,
+    });
+    return policyId;
+  });
+}
+
+async function linkUpdatedAt(policyId: string): Promise<string> {
+  return withDbAccessContext(SYSTEM_CTX, async () => {
+    const [row] = await db
+      .select({ updatedAt: configPolicyFeatureLinks.updatedAt })
+      .from(configPolicyFeatureLinks)
+      .where(eq(configPolicyFeatureLinks.configPolicyId, policyId));
+    return row!.updatedAt.toISOString();
+  });
+}
+
 // config_policy_backup_settings carries a DB-trigger-enforced
 // `config_policy_backup_settings_owner_match` constraint
 // (migration 2026-07-26-a): its org_id/partner_id must match the PARENT
@@ -314,98 +346,6 @@ async function seedBackupSettingsPolicy(
 }
 
 describe('per-device config-policy resolvers honour partner-wide policies (#2930, #4673 W03)', () => {
-  describe('resolveAlertRulesForDevice', () => {
-    // Default (no visible policy) is []. Any resolved row is non-empty and
-    // named — the seeded name proves it is THIS row, not a coincidence.
-    it('resolves a partner-wide alert rule under an org-scoped context', async () => {
-      const partner = await createPartner();
-      const org = await createOrganization({ partnerId: partner.id });
-      const site = await createSite({ orgId: org!.id });
-      const device = await seedDevice(org!.id, site!.id);
-
-      const ruleName = `Partner-Wide High CPU ${randomUUID()}`;
-      const policyId = await seedAlertRulePolicy({ orgId: null, partnerId: partner.id }, ruleName);
-      await assign(policyId, 'partner', partner.id);
-
-      const result = await withDbAccessContext(orgContext(org!.id, partner.id), () =>
-        resolveAlertRulesForDevice(device.id),
-      );
-
-      expect(result).toHaveLength(1);
-      expect(result[0]?.name).toBe(ruleName);
-    });
-
-    it('a partner-wide alert rule is INVISIBLE without breeze.current_partner_id', async () => {
-      const partner = await createPartner();
-      const org = await createOrganization({ partnerId: partner.id });
-      const site = await createSite({ orgId: org!.id });
-      const device = await seedDevice(org!.id, site!.id);
-
-      const ruleName = `Partner-Wide High CPU ${randomUUID()}`;
-      const policyId = await seedAlertRulePolicy({ orgId: null, partnerId: partner.id }, ruleName);
-      await assign(policyId, 'partner', partner.id);
-
-      const blind = await withDbAccessContext(partnerWideBlindContext(org!.id), () =>
-        resolveAlertRulesForDevice(device.id),
-      );
-      expect(blind).toEqual([]); // default: no visible assignment -> []
-
-      const sighted = await withDbAccessContext(orgContext(org!.id, partner.id), () =>
-        resolveAlertRulesForDevice(device.id),
-      );
-      expect(sighted).toHaveLength(1);
-    });
-  });
-
-  describe('resolveGoverningAlertRulePolicyForDevice', () => {
-    // Default (device has hierarchy but the candidate policy is not among the
-    // visible assigned policies) is {outcome:'unassigned'}. 'governs' requires
-    // the row to be BOTH assigned AND resolvable -> proves visibility.
-    it("a partner-wide policy 'governs' when it is the candidate under an org-scoped context", async () => {
-      const partner = await createPartner();
-      const org = await createOrganization({ partnerId: partner.id });
-      const site = await createSite({ orgId: org!.id });
-      const device = await seedDevice(org!.id, site!.id);
-
-      const policyId = await seedAlertRulePolicy(
-        { orgId: null, partnerId: partner.id },
-        `governs-candidate-${randomUUID()}`,
-      );
-      await assign(policyId, 'partner', partner.id);
-
-      const result = await withDbAccessContext(orgContext(org!.id, partner.id), () =>
-        resolveGoverningAlertRulePolicyForDevice(device.id, policyId),
-      );
-
-      expect(result).toEqual({ outcome: 'governs' });
-    });
-
-    it("a partner-wide policy is 'unassigned' without breeze.current_partner_id", async () => {
-      const partner = await createPartner();
-      const org = await createOrganization({ partnerId: partner.id });
-      const site = await createSite({ orgId: org!.id });
-      const device = await seedDevice(org!.id, site!.id);
-
-      const policyId = await seedAlertRulePolicy(
-        { orgId: null, partnerId: partner.id },
-        `governs-candidate-${randomUUID()}`,
-      );
-      await assign(policyId, 'partner', partner.id);
-
-      const blind = await withDbAccessContext(partnerWideBlindContext(org!.id), () =>
-        resolveGoverningAlertRulePolicyForDevice(device.id, policyId),
-      );
-      // Default: the candidate is invisible under RLS, so it never lands in
-      // the `assigned` set -> unassigned, NOT governs.
-      expect(blind).toEqual({ outcome: 'unassigned' });
-
-      const sighted = await withDbAccessContext(orgContext(org!.id, partner.id), () =>
-        resolveGoverningAlertRulePolicyForDevice(device.id, policyId),
-      );
-      expect(sighted).toEqual({ outcome: 'governs' });
-    });
-  });
-
   describe('resolveAutomationsForDevice', () => {
     // Default (no visible policy) is [].
     it('resolves a partner-wide automation under an org-scoped context', async () => {
@@ -615,6 +555,213 @@ describe('per-device config-policy resolvers honour partner-wide policies (#2930
         resolveVulnerabilityEnabledForDevice(device.id),
       );
       expect(sighted).toBe(true);
+    });
+  });
+
+  describe('resolveSystemProtectionForDevice (#4754)', () => {
+    // Default (no visible policy) is the platform default: beforeScripts false,
+    // isPlatformDefault true. The seed opts INTO beforeScripts so a resolved
+    // partner-wide row is unmistakable from the default.
+    const SEED = { beforePatching: true, beforeScripts: true, beforeSoftwareInstall: false, labelPrefix: 'Partner MSP' };
+
+    it('resolves a partner-wide policy for a device in a child org under an org-scoped context', async () => {
+      const partner = await createPartner();
+      const org = await createOrganization({ partnerId: partner.id });
+      const site = await createSite({ orgId: org!.id });
+      const device = await seedDevice(org!.id, site!.id);
+
+      const policyId = await seedSystemProtectionPolicy({ orgId: null, partnerId: partner.id }, SEED);
+      await assign(policyId, 'partner', partner.id);
+
+      const result = await withDbAccessContext(orgContext(org!.id, partner.id), () =>
+        resolveSystemProtectionForDevice(device.id),
+      );
+
+      expect(result.isPlatformDefault).toBe(false);
+      expect(result.invalidStoredSettings).toBe(false);
+      expect(result.settings).toEqual(SEED);
+      expect(result.policyRevision).not.toBeNull();
+    });
+
+    it('a partner-wide policy is INVISIBLE without breeze.current_partner_id', async () => {
+      const partner = await createPartner();
+      const org = await createOrganization({ partnerId: partner.id });
+      const site = await createSite({ orgId: org!.id });
+      const device = await seedDevice(org!.id, site!.id);
+
+      const policyId = await seedSystemProtectionPolicy({ orgId: null, partnerId: partner.id }, SEED);
+      await assign(policyId, 'partner', partner.id);
+
+      const blind = await withDbAccessContext(partnerWideBlindContext(org!.id), () =>
+        resolveSystemProtectionForDevice(device.id),
+      );
+      expect(blind.isPlatformDefault).toBe(true);
+      expect(blind.settings.beforeScripts).toBe(false);
+
+      const sighted = await withDbAccessContext(orgContext(org!.id, partner.id), () =>
+        resolveSystemProtectionForDevice(device.id),
+      );
+      expect(sighted.settings.beforeScripts).toBe(true);
+    });
+
+    it('an org child policy INHERITS the partner-wide parent link; policyRevision is the parent link', async () => {
+      const partner = await createPartner();
+      const org = await createOrganization({ partnerId: partner.id });
+      const site = await createSite({ orgId: org!.id });
+      const device = await seedDevice(org!.id, site!.id);
+
+      const parent = await seedSystemProtectionPolicy({ orgId: null, partnerId: partner.id }, SEED);
+      const child = await seedSystemProtectionPolicy({ orgId: org!.id, partnerId: null }, null, parent);
+      // Only the CHILD is assigned: the settings can reach the device solely
+      // through the effective-links view's inheritance.
+      await assign(child, 'organization', org!.id);
+
+      const result = await withDbAccessContext(orgContext(org!.id, partner.id), () =>
+        resolveSystemProtectionForDevice(device.id),
+      );
+      expect(result.isPlatformDefault).toBe(false);
+      expect(result.settings).toEqual(SEED);
+      expect(result.policyRevision).toBe(await linkUpdatedAt(parent));
+    });
+
+    it("a child's own link beats the inherited parent link", async () => {
+      const partner = await createPartner();
+      const org = await createOrganization({ partnerId: partner.id });
+      const site = await createSite({ orgId: org!.id });
+      const device = await seedDevice(org!.id, site!.id);
+
+      const parent = await seedSystemProtectionPolicy({ orgId: null, partnerId: partner.id }, SEED);
+      const child = await seedSystemProtectionPolicy({ orgId: org!.id, partnerId: null }, { beforeScripts: false }, parent);
+      await assign(child, 'organization', org!.id);
+
+      const result = await withDbAccessContext(orgContext(org!.id, partner.id), () =>
+        resolveSystemProtectionForDevice(device.id),
+      );
+      expect(result.settings.beforeScripts).toBe(false);
+      expect(result.settings.labelPrefix).toBe('Breeze');
+      expect(result.policyRevision).toBe(await linkUpdatedAt(child));
+    });
+
+    it('an org-level policy overrides the partner-wide one (closest wins)', async () => {
+      const partner = await createPartner();
+      const org = await createOrganization({ partnerId: partner.id });
+      const site = await createSite({ orgId: org!.id });
+      const device = await seedDevice(org!.id, site!.id);
+
+      const partnerPolicy = await seedSystemProtectionPolicy({ orgId: null, partnerId: partner.id }, SEED);
+      await assign(partnerPolicy, 'partner', partner.id);
+      const orgPolicy = await seedSystemProtectionPolicy({ orgId: org!.id, partnerId: null }, { beforeScripts: false });
+      await assign(orgPolicy, 'organization', org!.id);
+
+      const result = await withDbAccessContext(orgContext(org!.id, partner.id), () =>
+        resolveSystemProtectionForDevice(device.id),
+      );
+      expect(result.settings.beforeScripts).toBe(false);
+      expect(result.settings.labelPrefix).toBe('Breeze');
+    });
+  });
+
+  describe('resolveContainmentPolicy (#10100)', () => {
+    const PARTNER_SEED = {
+      version: 1,
+      extraAllow: [{ cidr: '192.0.2.0/24', proto: 'tcp', ports: [443], label: 'EDR console' }],
+      defaultTtlHours: 24,
+    };
+
+    it('resolves a partner-wide containment policy for a device in a child org', async () => {
+      const partner = await createPartner();
+      const org = await createOrganization({ partnerId: partner.id });
+      const site = await createSite({ orgId: org!.id });
+      const device = await seedDevice(org!.id, site!.id);
+
+      const policyId = await seedContainmentPolicy({ orgId: null, partnerId: partner.id }, PARTNER_SEED);
+      await assign(policyId, 'partner', partner.id);
+
+      const result = await withDbAccessContext(orgContext(org!.id, partner.id), () =>
+        resolveContainmentPolicy(device.id),
+      );
+      expect(result.isPlatformDefault).toBe(false);
+      expect(result.invalidStoredSettings).toBe(false);
+      expect(result.defaultTtlHours).toBe(24);
+      expect(result.extraAllow).toEqual(PARTNER_SEED.extraAllow);
+      expect(result.remoteRelay).toBe(true);
+      expect(result.revision).toMatch(/^c1:[0-9a-f]{32}$/);
+    });
+
+    it('a partner-wide containment policy is INVISIBLE without breeze.current_partner_id', async () => {
+      const partner = await createPartner();
+      const org = await createOrganization({ partnerId: partner.id });
+      const site = await createSite({ orgId: org!.id });
+      const device = await seedDevice(org!.id, site!.id);
+
+      const policyId = await seedContainmentPolicy({ orgId: null, partnerId: partner.id }, PARTNER_SEED);
+      await assign(policyId, 'partner', partner.id);
+
+      const blind = await withDbAccessContext(partnerWideBlindContext(org!.id), () =>
+        resolveContainmentPolicy(device.id),
+      );
+      expect(blind.isPlatformDefault).toBe(true);
+      expect(blind.extraAllow).toEqual([]);
+      expect(blind.defaultTtlHours).toBe(72);
+    });
+
+    it("another partner's partner-wide containment policy never reaches the device, even under system context", async () => {
+      const partnerA = await createPartner();
+      const partnerB = await createPartner();
+      const org = await createOrganization({ partnerId: partnerA.id });
+      const site = await createSite({ orgId: org!.id });
+      const device = await seedDevice(org!.id, site!.id);
+
+      const foreign = await seedContainmentPolicy({ orgId: null, partnerId: partnerB.id }, PARTNER_SEED);
+      await assign(foreign, 'partner', partnerB.id);
+
+      // System context bypasses RLS: policyOwnershipCondition is the only guard.
+      const result = await withDbAccessContext(SYSTEM_CTX, () => resolveContainmentPolicy(device.id));
+      expect(result.isPlatformDefault).toBe(true);
+      expect(result.extraAllow).toEqual([]);
+    });
+
+    it('an inactive partner-wide containment policy grants nothing', async () => {
+      const partner = await createPartner();
+      const org = await createOrganization({ partnerId: partner.id });
+      const site = await createSite({ orgId: org!.id });
+      const device = await seedDevice(org!.id, site!.id);
+
+      const policyId = await seedContainmentPolicy({ orgId: null, partnerId: partner.id }, PARTNER_SEED);
+      await assign(policyId, 'partner', partner.id);
+      await withDbAccessContext(SYSTEM_CTX, () =>
+        db.update(configurationPolicies).set({ status: 'inactive' }).where(eq(configurationPolicies.id, policyId)),
+      );
+
+      const result = await withDbAccessContext(orgContext(org!.id, partner.id), () =>
+        resolveContainmentPolicy(device.id),
+      );
+      expect(result.isPlatformDefault).toBe(true);
+      expect(result.extraAllow).toEqual([]);
+    });
+
+    it('an org-level containment policy overrides the partner default (closest wins)', async () => {
+      const partner = await createPartner();
+      const org = await createOrganization({ partnerId: partner.id });
+      const site = await createSite({ orgId: org!.id });
+      const device = await seedDevice(org!.id, site!.id);
+
+      const partnerPolicy = await seedContainmentPolicy({ orgId: null, partnerId: partner.id }, PARTNER_SEED);
+      await assign(partnerPolicy, 'partner', partner.id);
+      const partnerOnly = await withDbAccessContext(orgContext(org!.id, partner.id), () =>
+        resolveContainmentPolicy(device.id),
+      );
+
+      const orgPolicy = await seedContainmentPolicy({ orgId: org!.id, partnerId: null }, { version: 1, remoteRelay: false });
+      await assign(orgPolicy, 'organization', org!.id);
+
+      const result = await withDbAccessContext(orgContext(org!.id, partner.id), () =>
+        resolveContainmentPolicy(device.id),
+      );
+      expect(result.remoteRelay).toBe(false);
+      expect(result.extraAllow).toEqual([]);
+      expect(result.defaultTtlHours).toBe(72);
+      expect(result.revision).not.toBe(partnerOnly.revision);
     });
   });
 

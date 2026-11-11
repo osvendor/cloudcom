@@ -43,7 +43,7 @@ import { readWithPartnerAxisVisibility } from '../../db/partnerAxisRead';
 import { aiAgentSchedules, aiAgents, organizations, partners, type AiAgentRow, type AiAgentScheduleRow } from '../../db/schema';
 import type { AuthContext } from '../../middleware/auth';
 import { AgentAccessDeniedError, assertAgentWriteAllowed } from './access';
-import { effectiveSchedule } from './scheduleMerge';
+import { effectiveSchedule, scheduleWriteWidens } from './scheduleMerge';
 
 // Re-exported so every existing importer (`aiAgentSweepScheduler.ts`, the
 // tests) keeps its path; the function itself moved to `scheduleMerge.ts` so
@@ -85,7 +85,14 @@ export type ScheduleValidationCode =
   // schedule's kind. Distinct from `invalid_cron` so a client can tell "not a
   // cron" from "not a WEEKLY cron" without parsing the message.
   | 'invalid_cron_for_kind'
-  | 'invalid_timezone';
+  | 'invalid_timezone'
+  // Full-control W16 (#6786, Decision 3): the AI tool's write would widen what an
+  // armed schedule runs unattended, or change its cadence. Only a caller passing
+  // `refuseArmedWidening` can see it; REST passes none.
+  | 'armed_widening_refused'
+  // Full-control W16 PR B (#6786): only a caller passing `refuseExistingOverride` sees it. REST answers a raised
+  // ai_agent_schedules_org_baseline_uq violation with a 409 instead.
+  | 'override_exists';
 
 /**
  * Which `ai_agents.kind` each schedule kind runs. `Record<AiAgentScheduleKind,
@@ -108,6 +115,10 @@ const AGENT_KIND_MISMATCH: Readonly<Record<AiAgentKind, { code: ScheduleValidati
   // helpdesk has no schedule kind, so it is never the REQUIRED kind; the
   // entry exists only because the Record is keyed on every AiAgentKind.
   helpdesk: { code: 'agent_kind_not_triage', message: 'Only a triage agent can be scheduled' },
+  // research has no schedule kind; the entry exists only because the Record is keyed on every AiAgentKind.
+  research: { code: 'agent_kind_not_triage', message: 'Only a triage agent can be scheduled' },
+  // troubleshoot (#11084) has no schedule kind either; same reason.
+  troubleshoot: { code: 'agent_kind_not_triage', message: 'Only a triage agent can be scheduled' },
 };
 
 /**
@@ -311,6 +322,14 @@ async function requireOrgPartnerId(orgId: string): Promise<string> {
  * the subsequent insert. That is acceptable because the durable guarantee is
  * `effectiveSchedule`'s intersection at evaluation time: a stored superset can
  * never widen what an org actually sweeps, it only becomes inert.
+ *
+ * WHY THIS ONE STILL ESCAPES (#5199 retired every other baseline escape in
+ * this file): the `ai_agent_schedules_partner_wide_select` branch is SELECT-
+ * only, and a row-locking `SELECT … FOR SHARE` must ALSO pass the table's
+ * UPDATE policy, which an org session never does for a partner-wide row. Read
+ * in the caller's context, this lookup would silently return nothing and every
+ * org override would fail `baseline_wrong_partner`. Pinned by
+ * aiPartnerWideReadsRequestContext.integration.test.ts.
  */
 async function loadBaselineForOverride(
   orgId: string,
@@ -447,14 +466,12 @@ async function loadScheduleForWrite(auth: AuthContext, id: string): Promise<AiAg
     .where(and(eq(aiAgentSchedules.id, id), accessibleScheduleCondition(auth)))
     .limit(1);
 
-  // The escape is taken ONLY when it is actually needed (partnerAxisRead.ts,
-  // AVAILABILITY): a partner-scoped caller already passes
-  // breeze_has_partner_access for its own partner and sees BOTH axes natively,
-  // so escaping would open a second pooled connection while the request's own
-  // transaction is still held, for zero visibility gain.
-  const [row] = auth.scope === 'partner'
-    ? await read()
-    : await readWithPartnerAxisVisibility(read);
+  // Caller context for every scope (#5199): a partner session passes
+  // breeze_has_partner_access for its own partner, and an org session sees its
+  // own partner's partner-wide rows through the SELECT-only
+  // `ai_agent_schedules_partner_wide_select` branch. It used to escape through
+  // readWithPartnerAxisVisibility for non-partner scopes.
+  const [row] = await read();
   if (!row) throw new AgentAccessDeniedError('Schedule not found');
   return row;
 }
@@ -476,6 +493,14 @@ function assertOrgActModeNotArming(actMode: boolean | null | undefined): void {
 export async function createSchedule(
   auth: AuthContext,
   input: CreateAiAgentScheduleInput,
+  options: {
+    /**
+     * Full-control W16 PR B (#6786): a second override of one baseline is a coded refusal rather than a raised unique
+     * violation. postgres-js rethrows a failed statement when the enclosing transaction ends even if the caller caught
+     * it, which would turn the AI tool's refusal into a thrown release. So the conflict never raises (as in ledger.ts).
+     */
+    refuseExistingOverride?: boolean;
+  } = {},
 ): Promise<AiAgentScheduleRow> {
   if (input.ownerScope === 'partner') {
     const partnerId = auth.partnerId;
@@ -528,7 +553,7 @@ export async function createSchedule(
   assertBaselineUsable(baseline, { orgPartnerId });
   assertKindsSubset(baseline, input.sweepKinds);
 
-  const [row] = await db
+  const insert = db
     .insert(aiAgentSchedules)
     .values({
       orgId: input.orgId,
@@ -553,20 +578,149 @@ export async function createSchedule(
       actMode: input.actMode ?? null,
       createdBy: auth.user.id,
       updatedAt: new Date(),
-    })
-    .returning();
+    });
+  if (options.refuseExistingOverride) {
+    const [created] = await insert.onConflictDoNothing().returning();
+    if (!created) {
+      throw new ScheduleValidationError('override_exists', 'This organization already has an override of that baseline; update it instead');
+    }
+    return created;
+  }
+  const [row] = await insert.returning();
   if (!row) throw new AgentAccessDeniedError('Schedule not created');
   return row;
+}
+
+/**
+ * Full-control W16 (#6786, Decision 3). The AI tool passes `refuseArmedWidening`:
+ * while the baseline is armed, a write may only narrow. REST passes nothing and
+ * behaves exactly as before: arming and widening stay a person's call on the AI
+ * Agents page.
+ */
+export interface ScheduleWriteGuard {
+  refuseArmedWidening?: boolean;
+}
+
+/** The target row, locked: a concurrent REST disarm or arm is seen, not raced. */
+async function lockScheduleForGuard(auth: AuthContext, id: string): Promise<AiAgentScheduleRow> {
+  const [row] = await db
+    .select()
+    .from(aiAgentSchedules)
+    .where(and(eq(aiAgentSchedules.id, id), accessibleScheduleCondition(auth)))
+    .limit(1)
+    .for('update');
+  if (!row) throw new AgentAccessDeniedError('Schedule not found');
+  return row;
+}
+
+/**
+ * The baseline an override inherits arming from, read from PERSISTED rows: the
+ * flag-gated `resolveEffectiveScheduleActMode` reports false while the deployment
+ * flag is off, and an armed row must stay guarded through a flag flip.
+ *
+ * A partner or system caller holds `FOR SHARE` in this transaction. An org session
+ * cannot lock a partner row (the partner-wide branch is SELECT-only, see
+ * `loadBaselineForOverride`), so its read stays plain. That is safe for the arming
+ * race: reading "unarmed" just before a concurrent arm commits is the same as this
+ * write landing first, which the arming person then acts on.
+ */
+async function readGuardBaseline(auth: AuthContext, override: AiAgentScheduleRow): Promise<AiAgentScheduleRow> {
+  const query = db
+    .select()
+    .from(aiAgentSchedules)
+    .where(eq(aiAgentSchedules.id, override.baselineScheduleId as string))
+    .limit(1);
+  const [baseline] = auth.scope === 'organization' ? await query : await query.for('share');
+  // The FK is ON DELETE CASCADE, so this means the row is unreadable, not gone.
+  if (!baseline) {
+    throw new ScheduleValidationError('baseline_wrong_partner', 'Baseline schedule could not be read');
+  }
+  return baseline;
+}
+
+/**
+ * What an override's write is compared against. A disabled baseline reads as
+ * disabled through the merge whatever its overrides say, which would hide the loss of
+ * an override's own disable, and that loss takes effect the moment someone re-enables
+ * the baseline.
+ */
+function baselineAsIfEnabled(baseline: AiAgentScheduleRow): AiAgentScheduleRow {
+  return { ...baseline, enabled: true };
+}
+
+function refuseArmedWidening(detail: string): never {
+  throw new ScheduleValidationError(
+    'armed_widening_refused',
+    `This schedule's act mode is armed, so it runs actions unattended; this change could widen them (${detail}). `
+      + 'Disarm it on the AI Agents page first, or make a change that only narrows it.',
+  );
+}
+
+async function assertUpdateOnlyNarrows(
+  auth: AuthContext,
+  locked: AiAgentScheduleRow,
+  input: UpdateAiAgentScheduleInput,
+): Promise<void> {
+  const isBaseline = locked.partnerId !== null;
+  const baseline = isBaseline ? locked : await readGuardBaseline(auth, locked);
+  if (baseline.actMode !== true) return;
+
+  const merged = {
+    enabled: input.enabled ?? locked.enabled,
+    sweepKinds: input.sweepKinds ?? locked.sweepKinds,
+    actMode: input.actMode === undefined ? locked.actMode : input.actMode,
+  };
+  const inherited = baselineAsIfEnabled(baseline);
+  const [before, after] = isBaseline
+    ? [effectiveSchedule(locked, null), effectiveSchedule(merged, null)]
+    : [effectiveSchedule(inherited, locked), effectiveSchedule(inherited, merged)];
+  if (scheduleWriteWidens(before, after)) refuseArmedWidening('enabled, kinds or act mode');
+
+  if (isBaseline) {
+    if (input.cron !== undefined && input.cron !== locked.cron) refuseArmedWidening('cron');
+    // A non-IANA value falls through to the update's own invalid_timezone.
+    const timezone = input.timezone === undefined ? null : canonicalizeTimezone(input.timezone);
+    if (timezone !== null && timezone !== locked.timezone) refuseArmedWidening('timezone');
+  }
+}
+
+async function assertDeleteOnlyNarrows(auth: AuthContext, locked: AiAgentScheduleRow): Promise<void> {
+  // Deleting a baseline is exempt: it stops every run, and its digest is what binds
+  // the approval to the overrides it cascades.
+  if (locked.partnerId !== null) return;
+  const baseline = await readGuardBaseline(auth, locked);
+  if (baseline.actMode !== true) return;
+  const inherited = baselineAsIfEnabled(baseline);
+  if (scheduleWriteWidens(effectiveSchedule(inherited, locked), effectiveSchedule(inherited, null))) {
+    refuseArmedWidening('this override narrows it');
+  }
 }
 
 export async function updateSchedule(
   auth: AuthContext,
   id: string,
   input: UpdateAiAgentScheduleInput,
+  guard: ScheduleWriteGuard = {},
 ): Promise<AiAgentScheduleRow> {
-  const existing = await loadScheduleForWrite(auth, id);
-  assertAgentWriteAllowed(auth, { orgId: existing.orgId, partnerId: existing.partnerId });
+  const unlocked = await loadScheduleForWrite(auth, id);
+  assertAgentWriteAllowed(auth, { orgId: unlocked.orgId, partnerId: unlocked.partnerId });
+  if (!guard.refuseArmedWidening) return applyScheduleUpdate(auth, id, unlocked, input);
 
+  // After the write gate on purpose: an org session cannot lock a partner row, so
+  // it must get the gate's denial rather than a locked read that finds nothing.
+  return db.transaction(async () => {
+    const locked = await lockScheduleForGuard(auth, id);
+    await assertUpdateOnlyNarrows(auth, locked, input);
+    return applyScheduleUpdate(auth, id, locked, input);
+  });
+}
+
+async function applyScheduleUpdate(
+  auth: AuthContext,
+  id: string,
+  existing: AiAgentScheduleRow,
+  input: UpdateAiAgentScheduleInput,
+): Promise<AiAgentScheduleRow> {
   const patch: Partial<typeof aiAgentSchedules.$inferInsert> = {};
 
   if (existing.partnerId !== null) {
@@ -692,9 +846,27 @@ export async function updateSchedule(
   return row;
 }
 
-export async function deleteSchedule(auth: AuthContext, id: string): Promise<void> {
+export async function deleteSchedule(
+  auth: AuthContext,
+  id: string,
+  guard: ScheduleWriteGuard = {},
+): Promise<AiAgentScheduleRow> {
   const existing = await loadScheduleForWrite(auth, id);
   assertAgentWriteAllowed(auth, { orgId: existing.orgId, partnerId: existing.partnerId });
+  if (!guard.refuseArmedWidening) return applyScheduleDelete(auth, id, existing);
+
+  return db.transaction(async () => {
+    const locked = await lockScheduleForGuard(auth, id);
+    await assertDeleteOnlyNarrows(auth, locked);
+    return applyScheduleDelete(auth, id, locked);
+  });
+}
+
+async function applyScheduleDelete(
+  auth: AuthContext,
+  id: string,
+  existing: AiAgentScheduleRow,
+): Promise<AiAgentScheduleRow> {
   // Deleting a baseline cascades its org overrides in the DB
   // (baseline_schedule_id ... ON DELETE CASCADE) — no fan-out needed here.
   //
@@ -709,6 +881,7 @@ export async function deleteSchedule(auth: AuthContext, id: string): Promise<voi
     .where(and(eq(aiAgentSchedules.id, id), accessibleScheduleCondition(auth)))
     .returning({ id: aiAgentSchedules.id });
   if (deleted.length === 0) throw new AgentAccessDeniedError('Schedule not found');
+  return existing;
 }
 
 async function overridesFor(orgId: string, baselineIds: string[]): Promise<AiAgentScheduleRow[]> {
@@ -757,15 +930,17 @@ export async function listSchedules(
   }
   const orgPartnerId = await requireOrgPartnerId(orgId);
 
-  // Org-scoped callers cannot see partner-axis rows at all (#2822), so the
-  // baselines are read through the escape — where the app predicate is the ONLY
-  // filter and therefore has to be maximally narrow: this partner's rows, for
-  // this partner's own partner-wide SCHEDULABLE agents, and nothing else.
+  // Read in the caller's own context (#5199): an org session sees its own
+  // partner's partner-wide agents and baselines through the SELECT-only
+  // `*_partner_wide_select` branches (#4942/#4943). It used to escape to a
+  // system context, where this app predicate was the ONLY filter; it stays
+  // maximally narrow anyway: this partner's rows, for this partner's own
+  // partner-wide SCHEDULABLE agents, and nothing else.
   // `SCHEDULABLE_AGENT_KINDS` is a closed list derived from the create gate
   // (triage/designer/patch); before AI patch agent W01 it was `'triage'`
   // alone, which hid every design and patch baseline from an org token.
   // `helpdesk` has no schedule kind and is excluded.
-  const baselines = await readWithPartnerAxisVisibility(async () => {
+  const baselines = await (async () => {
     const agentIds = await db
       .select({ id: aiAgents.id })
       .from(aiAgents)
@@ -787,7 +962,7 @@ export async function listSchedules(
         inArray(aiAgentSchedules.agentId, agentIds.map((a) => a.id)),
         filter.agentId ? eq(aiAgentSchedules.agentId, filter.agentId) : undefined,
       ));
-  });
+  })();
 
   // The org's OWN override rows are visible under its own RLS — no escape.
   const overrides = await overridesFor(orgId, baselines.map((b) => b.id));
@@ -815,11 +990,12 @@ export interface BaselineCadence {
  *
  * Tenancy is `listSchedules`'s, restated for a read that returns no row
  * contents: a PARTNER caller reads its own baselines under its own RLS
- * (`breeze_has_partner_access` passes), while an ORG caller is blind to the
- * partner axis (#2822) and reads them through `readWithPartnerAxisVisibility`
- * with a maximally narrow app predicate — this partner's rows, for this
- * partner's own partner-wide schedulable agents. A caller with neither axis
- * (no partnerId) gets nothing rather than an unpinned read.
+ * (`breeze_has_partner_access` passes), while an ORG caller reads them in its
+ * own context through the SELECT-only partner-wide branches (#5199; it used to
+ * escape via `readWithPartnerAxisVisibility`), still with a maximally narrow
+ * app predicate — this partner's rows, for this partner's own partner-wide
+ * schedulable agents. A caller with neither axis (no partnerId) gets nothing
+ * rather than an unpinned read.
  *
  * Overrides are deliberately ignored: an org override carries no cadence of
  * its own (it may only disable or tighten), so the BASELINE's cron is when the
@@ -851,28 +1027,26 @@ export async function loadEnabledBaselineCadences(
   if (!auth.partnerId) return [];
   const partnerId = auth.partnerId;
 
-  return readWithPartnerAxisVisibility(async () => {
-    const partnerWideAgentIds = await db
-      .select({ id: aiAgents.id })
-      .from(aiAgents)
-      .where(and(
-        isNull(aiAgents.orgId),
-        eq(aiAgents.partnerId, partnerId),
-        inArray(aiAgents.kind, [...SCHEDULABLE_AGENT_KINDS]),
-        isNull(aiAgents.disabledAt),
-        inArray(aiAgents.id, agentIds),
-      ));
-    if (partnerWideAgentIds.length === 0) return [];
-    return db
-      .select(columns)
-      .from(aiAgentSchedules)
-      .where(and(
-        isNull(aiAgentSchedules.orgId),
-        eq(aiAgentSchedules.partnerId, partnerId),
-        eq(aiAgentSchedules.enabled, true),
-        inArray(aiAgentSchedules.agentId, partnerWideAgentIds.map((a) => a.id)),
-      ));
-  });
+  const partnerWideAgentIds = await db
+    .select({ id: aiAgents.id })
+    .from(aiAgents)
+    .where(and(
+      isNull(aiAgents.orgId),
+      eq(aiAgents.partnerId, partnerId),
+      inArray(aiAgents.kind, [...SCHEDULABLE_AGENT_KINDS]),
+      isNull(aiAgents.disabledAt),
+      inArray(aiAgents.id, agentIds),
+    ));
+  if (partnerWideAgentIds.length === 0) return [];
+  return db
+    .select(columns)
+    .from(aiAgentSchedules)
+    .where(and(
+      isNull(aiAgentSchedules.orgId),
+      eq(aiAgentSchedules.partnerId, partnerId),
+      eq(aiAgentSchedules.enabled, true),
+      inArray(aiAgentSchedules.agentId, partnerWideAgentIds.map((a) => a.id)),
+    ));
 }
 
 /**

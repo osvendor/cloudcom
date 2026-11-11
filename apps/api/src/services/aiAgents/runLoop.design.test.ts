@@ -91,6 +91,14 @@ function nextRows(table: string): unknown[] {
   throw new Error(`No queued rows for table ${table}`);
 }
 
+// AI Suggested Fixes W3 — loadRunContext's proven-fix lookup. Mocked so it never
+// consumes this file's queued db rows; returns null (no memory) by default.
+const loadProvenFixesForRun = vi.hoisted(() => vi.fn(async (): Promise<unknown> => null));
+vi.mock('../fixMemory/runMemory', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../fixMemory/runMemory')>()),
+  loadProvenFixesForRun,
+}));
+
 vi.mock('../../db', () => {
   const makeSelect = () => ({
     from: vi.fn((table: unknown) => {
@@ -191,6 +199,13 @@ const createBreezeMcpServer = vi.hoisted(() =>
 vi.mock('../aiAgentSdkTools', () => ({
   createBreezeMcpServer,
   BREEZE_MCP_TOOL_NAMES: ['mcp__breeze__query_devices'],
+  // runLoop.ts's full-profile exposure (WQ3, #6755) derives from
+  // Object.keys(TOOL_TIERS); this suite never exercises a full-profile run,
+  // but the module-level computation still runs, so this must exist.
+  TOOL_TIERS: { query_devices: 1 },
+  // A full-profile run intersects its exposure with the declared set (#7427);
+  // mirrors TOOL_TIERS above.
+  listChatSurfaceToolNames: () => ['query_devices'],
   POST_TOOL_USE_TIMEOUT_MS: 10_000,
 }));
 
@@ -262,22 +277,29 @@ vi.mock('../../jobs/agentNotifyRetryWorker', () => ({ enqueueAgentNotifyRetry })
 const scheduleFixWatch = vi.hoisted(() => vi.fn<(...args: unknown[]) => Promise<void>>(async () => undefined));
 vi.mock('../../jobs/fixWatchWorker', () => ({ scheduleFixWatch }));
 
-const resolveLlmConfigForOrg = vi.hoisted(() =>
-  vi.fn<(orgId: string) => Promise<{ source: string; apiKey?: string; model: string }>>());
-vi.mock('../llm/llmConfigResolver', () => ({ resolveLlmConfigForOrg }));
+// AI model registry W03 (Task 12): the run loop resolves `ai_agents` through
+// the registry and settles through the single billing path.
+const resolveModel = vi.hoisted(() => vi.fn());
+vi.mock('../aiModels/resolveModel', () => ({ resolveModel }));
+const settleInvocation = vi.hoisted(() =>
+  vi.fn<(input: Record<string, unknown>) => Promise<{ costCents: number; invocationIds: string[]; deferred: boolean }>>(
+    async () => ({ costCents: 0, invocationIds: [], deferred: false })));
+vi.mock('../aiModels/settleInvocation', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../aiModels/settleInvocation')>()),
+  settleInvocation,
+}));
 
 const buildClaudeSdkChildEnv = vi.hoisted(() =>
   vi.fn<(resolved: { source: string }) => Record<string, string>>(() => ({ CI: 'true' })));
 vi.mock('../streamingSessionManager', () => ({ buildClaudeSdkChildEnv }));
 
-const recordSessionlessSdkUsage = vi.hoisted(() => vi.fn<(...args: unknown[]) => Promise<void>>(async () => undefined));
-const calculateCostCents = vi.hoisted(() => vi.fn<(...args: unknown[]) => number>(() => 0));
-vi.mock('../aiCostTracker', () => ({ recordSessionlessSdkUsage, calculateCostCents }));
+vi.mock('../aiCostTracker', () => ({}));
 const reserveAiBudget = vi.hoisted(() => vi.fn());
 const markAiBudgetReservationIndeterminate = vi.hoisted(() => vi.fn());
 vi.mock('../aiBudgetReservations', () => ({ reserveAiBudget, markAiBudgetReservationIndeterminate }));
 
-import { AgentRunError, createAgentRunPostToolUse, createAgentRunPreToolUse, executeAgentRun } from './runLoop';
+import { AgentRunError, createAgentRunCallPairing, createAgentRunPostToolUse, createAgentRunPreToolUse, executeAgentRun } from './runLoop';
+import { makeResolvedModel } from '../aiModels/__fixtures__/resolvedModel';
 import type { AgentRunOutcome } from './runLoop';
 import { FleetDesignPersistConflictError } from './fleetDesignReport';
 import { assembleDesignEvidence, designBaselineNumbers, type RawDesignEvidence } from './designEvidence';
@@ -290,7 +312,6 @@ function policy(overrides: Partial<AiAgentPolicy> = {}): AiAgentPolicy {
   return {
     enabled: true,
     mode: 'shadow',
-    model: 'claude-test-model',
     toolAllowlist: [],
     protectedResources: { services: [], paths: [], registryKeys: [], deviceTags: [] },
     limits: { ...AI_AGENT_LIMIT_DEFAULTS },
@@ -366,7 +387,7 @@ const VALID_FLEET_DESIGN_SUBMISSION = {
       watches: [{ watchType: 'service', name: 'LanmanServer', alertOnStop: true, autoRestart: true, rationale: 'SMB is the function.' }],
       alertRules: [{
         name: 'File server disk over 85%', severity: 'high',
-        conditions: [{ type: 'metric', metric: 'disk', operator: 'gt', value: 85, durationMinutes: 15 }],
+        kind: 'disk', condition: { operator: 'gt', value: 85, durationMinutes: 15 }, responses: [], deliveryMode: 'inherit', deliveryChannelIds: [],
         cooldownMinutes: 60, rationale: 'Data volume growth is the failure mode.', action: 'none', paging: 'business_hours',
       }],
     },
@@ -492,7 +513,7 @@ beforeEach(() => {
   completeToolExecution.mockResolvedValue(undefined);
   reconcileHungExecutions.mockResolvedValue(0);
   closeAgentRunSession.mockResolvedValue(undefined);
-  resolveLlmConfigForOrg.mockResolvedValue({ source: 'platform', apiKey: 'sk-test', model: 'claude-fallback' });
+  resolveModel.mockResolvedValue(makeResolvedModel('platform', { surface: 'ai_agents' }));
   resolveRecipientUserIds.mockResolvedValue([]);
   enqueueAgentNotifyRetry.mockResolvedValue(undefined);
   createActionIntent.mockResolvedValue({ id: 'intent-1', status: 'pending_approval' });
@@ -678,10 +699,8 @@ describe('design run read-only backstop', () => {
       },
       outcome,
       intentIds: [],
-      allowedPending: new Map<string, number>(),
       sessionId: null,
-      executionIdPending: new Map<string, Array<string | null>>(),
-      actPinPending: new Map<string, Array<unknown>>(),
+      pairing: createAgentRunCallPairing(),
       actReservation: { count: 0 },
       deadlineMs: Date.now() + 60_000,
     } as never);
@@ -703,9 +722,8 @@ describe('design run read-only backstop', () => {
         protectedResources: { services: [], paths: [], registryKeys: [], deviceTags: [] },
         deviceId: null, deviceSiteId: null,
       },
-      outcome, intentIds: [], allowedPending: new Map<string, number>(), sessionId: null,
-      executionIdPending: new Map<string, Array<string | null>>(),
-      actPinPending: new Map<string, Array<unknown>>(),
+      outcome, intentIds: [], sessionId: null,
+      pairing: createAgentRunCallPairing(),
       actReservation: { count: 0 }, deadlineMs: Date.now() + 60_000,
       // The pre-hook's own validate-only check needs the SAME refs the SDK
       // tool handler gets (see `createAgentRunPreToolUse`'s `design` param
@@ -729,9 +747,8 @@ describe('design run read-only backstop', () => {
           protectedResources: { services: [], paths: [], registryKeys: [], deviceTags: [] },
           deviceId: null, deviceSiteId: null,
         },
-        outcome: otherOutcome, intentIds: [], allowedPending: new Map<string, number>(), sessionId: null,
-        executionIdPending: new Map<string, Array<string | null>>(),
-        actPinPending: new Map<string, Array<unknown>>(),
+        outcome: otherOutcome, intentIds: [], sessionId: null,
+        pairing: createAgentRunCallPairing(),
         actReservation: { count: 0 }, deadlineMs: Date.now() + 60_000,
       } as never);
       const result = await denied('submit_fleet_design', VALID_FLEET_DESIGN_SUBMISSION);

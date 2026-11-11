@@ -12,6 +12,7 @@ import (
 	"unsafe"
 
 	"github.com/breeze-rmm/agent/internal/config"
+	"github.com/breeze-rmm/agent/internal/powerevent"
 	"github.com/breeze-rmm/agent/internal/remote/desktop"
 	"github.com/breeze-rmm/agent/internal/sessionbroker"
 	"golang.org/x/sys/windows"
@@ -93,15 +94,17 @@ func ensureSASPolicy() {
 // breezeService implements svc.Handler for the Windows SCM.
 type breezeService struct {
 	cfgFile string
+	startup ProcessStartup
 }
 
 // runAsService runs the agent under the Windows Service Control Manager.
 // It takes the cfgFile path instead of a startFn closure so Execute can
 // load config synchronously and decide whether to use the enrolled
 // (synchronous) or unenrolled (async-after-Running) start path.
-func runAsService(cfgFile string) error {
+func runAsService(cfgFile string, startup ProcessStartup) error {
 	h := &breezeService{
 		cfgFile: cfgFile,
+		startup: startup,
 	}
 	return svc.Run("BreezeAgent", h)
 }
@@ -122,9 +125,26 @@ func runAsService(cfgFile string) error {
 // control loop. runServiceLoopFn is a test seam — production assigns
 // it to runServiceLoop at package init.
 func (s *breezeService) Execute(args []string, r <-chan svc.ChangeRequest, changes chan<- svc.Status) (bool, uint32) {
-	const accepted = svc.AcceptStop | svc.AcceptShutdown | svc.AcceptSessionChange
+	// AcceptPowerEvent (#6762) so suspend/resume boundaries land in the agent
+	// log next to the heartbeat gap they explain. The staleness decision
+	// itself belongs to the BreezeWatchdog service, which accepts power
+	// events too and restarts its stale-heartbeat clock on resume.
+	const accepted = svc.AcceptStop | svc.AcceptShutdown | svc.AcceptSessionChange | svc.AcceptPowerEvent
 
 	changes <- svc.Status{State: svc.StartPending}
+
+	// Take the config folder back and the instance guard, staying
+	// registered and answering the service manager while that waits.
+	guard, code, ok := s.prepare(r, changes, accepted)
+	if !ok {
+		if code != 0 {
+			changes <- svc.Status{State: svc.StopPending}
+			return true, code
+		}
+		changes <- svc.Status{State: svc.StopPending}
+		return false, 0
+	}
+	defer func() { _ = guard.Close() }()
 
 	cfg, err := config.Load(s.cfgFile)
 	if err != nil {
@@ -247,11 +267,27 @@ func runServiceLoop(comps *agentComponents, r <-chan svc.ChangeRequest, changes 
 					// on the next reconcile tick.
 				}
 			}
+		case svc.PowerEvent:
+			servicePowerEventFn(cr.EventType)
 		default:
 			log.Warn(fmt.Sprintf("unexpected SCM control request #%d", cr.Cmd))
 		}
 	}
 	return false, 0
+}
+
+// logServicePowerEvent records a suspend or resume in the agent log (#6762).
+// A heartbeat gap that starts at a suspend and ends at a resume is sleep, not
+// an agent fault; without these lines the log cannot tell the two apart.
+// AC/battery status and power-setting changes are frequent and irrelevant,
+// so they are not logged.
+func logServicePowerEvent(eventType uint32) {
+	switch powerevent.Classify(eventType) {
+	case powerevent.Suspend:
+		log.Info("system suspending", "event", powerevent.Name(eventType))
+	case powerevent.Resume:
+		log.Info("system resumed", "event", powerevent.Name(eventType))
+	}
 }
 
 // extractSessionID reads the session ID from the WTSSESSION_NOTIFICATION
@@ -262,4 +298,49 @@ func extractSessionID(eventData uintptr) uint32 {
 	}
 	notif := (*windows.WTSSESSION_NOTIFICATION)(unsafe.Pointer(eventData))
 	return notif.SessionID
+}
+
+// runningUnderServiceManager reports whether the Service Control Manager
+// started this process (cfg.IsService, from svc.IsWindowsService). A console
+// run or a scheduled task is not the service, even as SYSTEM.
+func runningUnderServiceManager(cfg *config.Config) bool {
+	return cfg.IsService
+}
+
+// prepare runs prepareServiceStart while answering the service manager: it
+// reports Running (with accepted) if prepareServiceStart starts waiting, and
+// a Stop or Shutdown request ends the wait.
+func (s *breezeService) prepare(r <-chan svc.ChangeRequest, changes chan<- svc.Status, accepted svc.Accepted) (mainAgentGuard, uint32, bool) {
+	type result struct {
+		guard mainAgentGuard
+		code  uint32
+		ok    bool
+	}
+	stop := make(chan struct{})
+	done := make(chan result, 1)
+	go func() {
+		g, c, ok := prepareServiceStart(s.startup, stop, func() {
+			changes <- svc.Status{State: svc.Running, Accepts: accepted}
+		})
+		done <- result{g, c, ok}
+	}()
+	for {
+		select {
+		case res := <-done:
+			return res.guard, res.code, res.ok
+		case cr := <-r:
+			switch cr.Cmd {
+			case svc.Interrogate:
+				changes <- cr.CurrentStatus
+			case svc.Stop, svc.Shutdown:
+				log.Info("SCM stop while waiting for the config folder")
+				close(stop)
+				res := <-done
+				if res.guard != nil {
+					_ = res.guard.Close()
+				}
+				return nil, 0, false
+			}
+		}
+	}
 }

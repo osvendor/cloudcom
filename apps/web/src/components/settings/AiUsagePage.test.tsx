@@ -7,6 +7,7 @@ const orgState: { currentOrgId: string | null } = { currentOrgId: null };
 vi.mock('../../stores/orgStore', () => ({ useOrgStore: () => ({ currentOrgId: orgState.currentOrgId }) }));
 
 import AiUsagePage from './AiUsagePage';
+import { useFeaturesStore } from '../../stores/featuresStore';
 
 // Every test below scopes its queries to its OWN render's container via
 // `within(container)` instead of the shared `screen` (which binds to
@@ -50,6 +51,24 @@ function mockUsage(billedTo?: 'platform' | 'partner_key', catalogEndpointName?: 
 
 beforeEach(() => {
   fetchWithAuth.mockReset();
+});
+
+describe('AiUsagePage model breakdown', () => {
+  it('mounts the usage breakdown scoped to the selected org, above Recent Sessions', async () => {
+    orgState.currentOrgId = 'org-9';
+    mockUsage();
+    const { getByTestId, getByText } = renderPage();
+    await waitFor(() => expect(getByText('Recent Sessions')).toBeInTheDocument());
+    const card = getByTestId('ai-usage-breakdown');
+    expect(card.compareDocumentPosition(getByText('Recent Sessions')) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // The card mounts in the same async commit that renders Recent Sessions, and
+    // fetches from a passive effect React may flush a task later — so wait for the
+    // request rather than asserting it synchronously (CI flake on PR #7701).
+    await waitFor(() => expect(
+      fetchWithAuth.mock.calls.some(([u]) => /^\/ai\/models\/usage\?groupBy=model.*orgId=org-9/.test(String(u))),
+    ).toBe(true));
+    orgState.currentOrgId = null;
+  });
 });
 
 describe('AiUsagePage billedTo indicator', () => {
@@ -320,4 +339,97 @@ describe('AiUsagePage when effective settings cannot be read (#6004)', () => {
     expect(queryByTestId('ai-usage-select-org-prompt')).toBeNull();
     expect(queryByTestId('ai-effective-budget')).toBeNull();
   });
+});
+
+describe('AiUsagePage fired-alert badge vs the current effective budget (sweep E8)', () => {
+  const EFFECTIVE_DEFAULTS = {
+    enabled: true,
+    monthlyBudgetCents: null,
+    dailyBudgetCents: null,
+    maxTurnsPerSession: 50,
+    messagesPerMinutePerUser: 20,
+    messagesPerHourPerOrg: 200,
+    approvalMode: 'per_step',
+    alertThresholdPercents: [50, 80, 95],
+  };
+
+  function usageWithFired(fired: Array<{ period: string; periodKey: string; thresholdPct: number; createdAt: string; deliveredAt: string | null }>) {
+    return { ...usageBody('platform'), alerts: { fired } };
+  }
+
+  function mockOrg(aiBudgets: Record<string, unknown>, fired: Array<{ period: string; periodKey: string; thresholdPct: number; createdAt: string; deliveredAt: string | null }>) {
+    fetchWithAuth.mockImplementation((url: string) => {
+      if (url === '/ai/usage') return Promise.resolve(jsonRes(usageWithFired(fired)));
+      if (url.startsWith('/ai/admin/sessions')) return Promise.resolve(jsonRes({ data: [] }));
+      if (url === '/orgs/organizations/org-1/effective-settings') {
+        return Promise.resolve(jsonRes({ effective: { aiBudgets }, locked: [] }));
+      }
+      return Promise.resolve(jsonRes({}));
+    });
+  }
+
+  const MONTHLY_80 = { period: 'monthly', periodKey: '2026-09', thresholdPct: 80, createdAt: '2026-09-24T00:00:00.000Z', deliveredAt: null };
+
+  beforeEach(() => { orgState.currentOrgId = 'org-1'; });
+  afterEach(() => { orgState.currentOrgId = null; });
+
+  it('hides a fired monthly badge once the effective monthly budget reads "No limit"', async () => {
+    mockOrg(EFFECTIVE_DEFAULTS, [MONTHLY_80]);
+    const { findByTestId, queryByTestId } = renderPage();
+
+    // Wait for the effective-budget panel (confirms the "No limit" fetch
+    // resolved) before asserting the badge is gone — otherwise this could
+    // pass on the pre-fix render before effectiveBudget ever loads.
+    await findByTestId('ai-effective-budget-value-monthlyBudgetCents');
+    expect(queryByTestId('ai-budget-fired-rungs')).toBeNull();
+  });
+
+  it('still shows a fired monthly badge when the effective monthly budget is set', async () => {
+    mockOrg({ ...EFFECTIVE_DEFAULTS, monthlyBudgetCents: 9900 }, [MONTHLY_80]);
+    const { findByTestId } = renderPage();
+
+    const badge = await findByTestId('ai-budget-fired-rungs');
+    expect(badge.textContent).toContain('80% monthly alert sent');
+  });
+});
+
+// #9450: Buy credits next to the balance, hosted billing only.
+describe('AiUsagePage Buy credits link (#9450)', () => {
+  const setHosted = (billing: boolean) =>
+    useFeaturesStore.setState({ features: { ...useFeaturesStore.getState().features, billing }, loaded: true });
+
+  function mockCredits() {
+    fetchWithAuth.mockImplementation((url: string) => {
+      if (url === '/ai/usage') {
+        return Promise.resolve(jsonRes({ ...usageBody(), credits: { remaining: 0, includedBalance: 0, purchasedBalance: 0, fetchedAt: '2026-09-01T00:00:00.000Z' } }));
+      }
+      return Promise.resolve(jsonRes({ data: [] }));
+    });
+  }
+
+  it('links to the billing credits page when hosted billing is configured', async () => {
+    setHosted(true);
+    mockCredits();
+    const { getByText, getByRole } = renderPage();
+    await waitFor(() => expect(getByText('Breeze AI credits remaining')).toBeInTheDocument());
+    expect(getByRole('link', { name: 'Buy credits' })).toHaveAttribute('href', '/billing/credits');
+  });
+
+  it('shows no link when billing is not configured (self-hosted)', async () => {
+    setHosted(false);
+    mockCredits();
+    const { getByText, queryByRole } = renderPage();
+    await waitFor(() => expect(getByText('Breeze AI credits remaining')).toBeInTheDocument());
+    expect(queryByRole('link', { name: 'Buy credits' })).toBeNull();
+  });
+
+  it('renders the four stat-card labels from translation keys', async () => {
+    mockUsage();
+    const r = renderPage();
+    await waitFor(() => expect(r.getByText('Today\'s cost')).toBeTruthy());
+    expect(r.getByText('Monthly cost')).toBeTruthy();
+    expect(r.getByText('Messages today')).toBeTruthy();
+    expect(r.getByText('Tokens this month')).toBeTruthy();
+  });
+
 });

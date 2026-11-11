@@ -20,7 +20,7 @@ vi.mock('../db/schema', () => ({
 
 // patchEligibility.ts (W02) composes the live path from these; the suites
 // below only exercise the config-injected adapter.
-vi.mock('./featureConfigResolver', () => ({ resolvePatchConfigDetailsForDevice: vi.fn() }));
+vi.mock('./featureConfigResolver', () => ({ resolvePatchConfigPolicyForDevice: vi.fn() }));
 vi.mock('./configPolicyPatching', () => ({ loadPolicyLocalPatchConfig: vi.fn() }));
 
 import { db } from '../db';
@@ -29,14 +29,19 @@ import {
   buildAppRuleMap,
   buildAllowedPatchSources,
   comparePatchVersions,
+  compareLinuxPackageVersions,
   evaluateAppRule,
+  evaluateAppRuleSets,
   isCategoryAllowed,
   parseRingAutoApprove,
+  decidePatchApproval,
+  deferralHold,
   THIRD_PARTY_PATCH_SOURCES,
   type ApprovalEvaluationConfig,
   type RingConfig,
 } from './patchApprovalEvaluator';
 import { resolveApprovedPatchesForDevice } from './patchEligibility';
+import { canonicalAppRuleKey } from '@breeze/shared';
 
 // Compile-time checks: deprecated alias and exported source list stay usable.
 const _aliasCheck: RingConfig = { ringId: null, categoryRules: [], autoApprove: {}, deferralDays: 0 };
@@ -71,6 +76,41 @@ describe('appRuleKey', () => {
 
   it('keeps non-third-party sources as their own bucket', () => {
     expect(appRuleKey('microsoft', 'SomeId')).toBe('microsoft|someid');
+  });
+});
+
+describe('appRuleKey parity with the shared validator (#8184)', () => {
+  it.each([...THIRD_PARTY_PATCH_SOURCES, 'microsoft', 'apple', 'linux'])('%s keys identically', (source) => {
+    expect(appRuleKey(source, 'Mixed.Case.Id')).toBe(canonicalAppRuleKey(source, 'Mixed.Case.Id'));
+  });
+});
+
+describe('evaluateAppRuleSets (#8184 W01 dual read)', () => {
+  const p = { source: 'third_party', packageId: 'Mozilla.Firefox', version: '130.0' };
+
+  it('blocked in either set wins, regardless of order', () => {
+    const ring = buildAppRuleMap([{ source: 'third_party', packageId: 'mozilla.firefox', action: 'block' }]);
+    const policy = buildAppRuleMap([]);
+    expect(evaluateAppRuleSets(p, [ring, policy])).toBe('blocked');
+    expect(evaluateAppRuleSets(p, [policy, ring])).toBe('blocked');
+  });
+
+  it('blocked beats held, regardless of order', () => {
+    const pin = buildAppRuleMap([{ source: 'third_party', packageId: 'mozilla.firefox', action: 'pin', pinnedVersion: '120' }]);
+    const block = buildAppRuleMap([{ source: 'custom', packageId: 'MOZILLA.FIREFOX', action: 'block' }]);
+    expect(evaluateAppRuleSets(p, [pin, block])).toBe('blocked');
+    expect(evaluateAppRuleSets(p, [block, pin])).toBe('blocked');
+  });
+
+  it('held beats allowed', () => {
+    const pin = buildAppRuleMap([{ source: 'third_party', packageId: 'mozilla.firefox', action: 'pin', pinnedVersion: '120' }]);
+    const roomyPin = buildAppRuleMap([{ source: 'third_party', packageId: 'mozilla.firefox', action: 'pin', pinnedVersion: '200' }]);
+    expect(evaluateAppRuleSets(p, [roomyPin, pin])).toBe('held');
+  });
+
+  it('allowed only when every set allows (and for no sets at all)', () => {
+    expect(evaluateAppRuleSets(p, [buildAppRuleMap([]), buildAppRuleMap([])])).toBe('allowed');
+    expect(evaluateAppRuleSets(p, [])).toBe('allowed');
   });
 });
 
@@ -419,6 +459,139 @@ describe('app rules in resolveApprovedPatchesForDevice', () => {
 
     expect(result.map((r) => r.patchId)).toEqual([P2]);
     expect(result[0]?.approvalReason).toBe('category_rule');
+  });
+});
+
+describe('compareLinuxPackageVersions — dpkg/rpm ordering for linux pins (#9370)', () => {
+  it.each([
+    ['5:24.0.7-1~ubuntu.22.04~jammy', '5:24.0.9-1~ubuntu.22.04~jammy', -1],
+    ['5:24.0.7-1~ubuntu.22.04~jammy', '5:24.0.7-1~ubuntu.22.04~jammy', 0],
+    // numeric runs compare as numbers, not codepoints
+    ['5:10.0.0', '5:9.0.0', 1],
+    ['1.10', '1.9', 1],
+    // a higher epoch is newer regardless of the upstream version
+    ['1:1.0', '9.9', 1],
+    ['9.9', '0:9.9', 0],
+    // '~' sorts before everything, including the end of the string
+    ['1.0~rc1', '1.0', -1],
+    ['1.0~rc1', '1.0~rc2', -1],
+    // revision compares only after the upstream version ties
+    ['2.0-1', '2.0-2', -1],
+    ['2.0-10', '2.0-9', 1],
+    // rpm-style release strings
+    ['24.0.7-1.el9', '24.0.9-1.el9', -1],
+    ['3.0.7-27.el9_4', '3.0.7-27.el9', 1],
+    // shapes distro packages hit constantly
+    ['3.0.2-0ubuntu1.10', '3.0.2-0ubuntu1.20', -1],
+    ['2.0-1ubuntu1', '2.0-1', 1],
+    ['1.0-1~bpo11+1', '1.0-1', -1],
+    // symbols sort above the end of the string; letters below other symbols
+    ['1.0+dfsg', '1.0', 1],
+    ['1.0a', '1.0', 1],
+    ['1.0a', '1.0+', -1],
+    // leading zeros are ignored; an extra component is newer (dpkg: 1.0.0 > 1.0)
+    ['1.01', '1.1', 0],
+    ['1.0.0', '1.0', 1],
+    // a candidate revision against a revision-less pin is newer (held)
+    ['5:24.0.7-1', '5:24.0.7', 1],
+  ])('%s vs %s → %i', (a, b, expected) => {
+    expect(compareLinuxPackageVersions(a, b)).toBe(expected);
+  });
+
+  it('returns null when either side is blank or the epoch is not numeric', () => {
+    expect(compareLinuxPackageVersions(null, '1.0')).toBeNull();
+    expect(compareLinuxPackageVersions('1.0', '  ')).toBeNull();
+    expect(compareLinuxPackageVersions('x:1.0', '1.0')).toBeNull();
+  });
+});
+
+describe('linux package app rules (#9370)', () => {
+  beforeEach(() => {
+    vi.mocked(db.select).mockReset();
+  });
+
+  it('a linux rule matches the provider-prefixed packageId the agent reports (apt and yum)', () => {
+    const rules = buildAppRuleMap([{ source: 'linux', packageId: 'docker-ce', action: 'block' }]);
+    expect(evaluateAppRule({ source: 'linux', packageId: 'apt:docker-ce', version: '5:24.0.9-1' }, rules)).toBe('blocked');
+    expect(evaluateAppRule({ source: 'linux', packageId: 'yum:docker-ce', version: '24.0.9-1.el9' }, rules)).toBe('blocked');
+    expect(evaluateAppRule({ source: 'linux', packageId: 'apt:docker-ce-cli', version: '5:24.0.9-1' }, rules)).toBe('allowed');
+  });
+
+  it('a linux rule never matches a third-party app of the same name, and vice versa', () => {
+    const linuxRules = buildAppRuleMap([{ source: 'linux', packageId: 'docker-ce', action: 'block' }]);
+    const tpRules = buildAppRuleMap([{ source: 'third_party', packageId: 'docker-ce', action: 'block' }]);
+    expect(evaluateAppRule({ source: 'third_party', packageId: 'docker-ce', version: '1' }, linuxRules)).toBe('allowed');
+    expect(evaluateAppRule({ source: 'linux', packageId: 'apt:docker-ce', version: '1' }, tpRules)).toBe('allowed');
+  });
+
+  it('a linux pin uses package-manager version ordering (epoch, numeric runs, tilde)', () => {
+    const rules = buildAppRuleMap([{ source: 'linux', packageId: 'docker-ce', action: 'pin', pinnedVersion: '5:9.0.0-1' }]);
+    // The tolerant winget comparator reads "5:10" < "5:9" by codepoint and would let this through.
+    expect(evaluateAppRule({ source: 'linux', packageId: 'apt:docker-ce', version: '5:10.0.0-1' }, rules)).toBe('held');
+    expect(evaluateAppRule({ source: 'linux', packageId: 'apt:docker-ce', version: '5:9.0.0-1' }, rules)).toBe('allowed');
+    // A pre-release below the pin is within it.
+    expect(evaluateAppRule({ source: 'linux', packageId: 'apt:docker-ce', version: '5:9.0.0~rc1-1' }, rules)).toBe('allowed');
+    // Unknown candidate version cannot be proven within the pin.
+    expect(evaluateAppRule({ source: 'linux', packageId: 'apt:docker-ce', version: null }, rules)).toBe('held');
+  });
+
+  it('an unparseable linux pin holds every candidate (fail-closed)', () => {
+    const rules = buildAppRuleMap([{ source: 'linux', packageId: 'x', action: 'pin', pinnedVersion: 'x:1' }]);
+    expect(evaluateAppRule({ source: 'linux', packageId: 'apt:x', version: '0.1' }, rules)).toBe('held');
+    expect(evaluateAppRule({ source: 'linux', packageId: 'apt:x', version: '1' }, rules)).toBe('held');
+  });
+
+  it('a ring linux pin drops a candidate above the pin, keeps one at the pin, and beats a manual approval', async () => {
+    mockPendingAndApprovals(
+      [
+        pendingRow({ patchId: P1, devicePatchId: 'dp-1', source: 'linux', packageId: 'apt:docker-ce', version: '5:24.0.9-1' }),
+        pendingRow({ patchId: P2, devicePatchId: 'dp-2', source: 'linux', packageId: 'apt:docker-ce', version: '5:24.0.7-1' }),
+      ],
+      [{ patchId: P1, status: 'approved', ringId: null }]
+    );
+
+    const result = await resolveApprovedPatchesForDevice(DEVICE_ID, ORG_ID, {
+      ...baseRing,
+      sources: ['os'],
+      ringAppRules: [{ source: 'linux', packageId: 'docker-ce', action: 'pin', pinnedVersion: '5:24.0.7-1' }],
+    });
+
+    expect(result.map((r) => r.patchId)).toEqual([P2]);
+    expect(result[0]?.approvalReason).toBe('ring_auto_approve');
+  });
+
+  it('a ring linux block rule keeps the package out even though ring auto-approve would approve it', async () => {
+    mockPendingAndApprovals(
+      [
+        pendingRow({ patchId: P1, devicePatchId: 'dp-1', source: 'linux', packageId: 'apt:docker-ce', version: '5:24.0.9-1~ubuntu.22.04~jammy' }),
+        pendingRow({ patchId: P2, devicePatchId: 'dp-2', source: 'linux', packageId: 'apt:openssl', version: '3.0.2-0ubuntu1.20' }),
+      ],
+      []
+    );
+
+    const result = await resolveApprovedPatchesForDevice(DEVICE_ID, ORG_ID, {
+      ...baseRing,
+      sources: ['os'],
+      ringAppRules: [{ source: 'linux', packageId: 'docker-ce', action: 'block' }],
+    });
+
+    expect(result.map((r) => r.patchId)).toEqual([P2]);
+    expect(result[0]?.approvalReason).toBe('ring_auto_approve');
+  });
+
+  it('a ring linux block rule overrides an explicit manual approval', async () => {
+    mockPendingAndApprovals(
+      [pendingRow({ patchId: P1, source: 'linux', packageId: 'yum:docker-ce', version: '24.0.9-1.el9' })],
+      [{ patchId: P1, status: 'approved', ringId: null }]
+    );
+
+    const result = await resolveApprovedPatchesForDevice(DEVICE_ID, ORG_ID, {
+      ...baseRing,
+      sources: ['os'],
+      ringAppRules: [{ source: 'linux', packageId: 'docker-ce', action: 'block' }],
+    });
+
+    expect(result).toEqual([]);
   });
 });
 
@@ -2081,5 +2254,210 @@ describe('parseRingAutoApprove — thirdPartyApps compatibility (#spec 2026-08-0
     } finally {
       warnSpy.mockRestore();
     }
+  });
+});
+
+// #7625: the deferral denial carries WHEN the window ends, from the window
+// that call site actually applied — a swapped override would show the wrong date.
+describe('decidePatchApproval — held_by_deferral reports holdUntil per call site (#7625)', () => {
+  const NOW = new Date('2026-09-30T00:00:00.000Z');
+  const DAY = 86_400_000;
+  const released = new Date(NOW.getTime() - 2 * DAY);
+  const candidate = (o: Record<string, unknown> = {}) => ({
+    patchId: 'p-1', category: 'security', severity: 'critical', releaseDate: released.toISOString(),
+    source: 'microsoft', packageId: null, version: null, firstSeenAt: null, ...o,
+  });
+  const ring = (o: Record<string, unknown> = {}) => ({ ringId: 'ring-1', categoryRules: [], autoApprove: {}, deferralDays: 3, ...o });
+
+  it('category rule: uses deferralDaysOverride, not the ring deferralDays', () => {
+    const rule = { category: 'security', autoApprove: true, deferralDaysOverride: 10 };
+    const d = decidePatchApproval(candidate(), ring() as never, new Set(), new Map([['security', rule]]), parseRingAutoApprove({}), NOW);
+    expect(d).toEqual({ denied: 'held_by_deferral', holdUntil: new Date(released.getTime() + 10 * DAY) });
+  });
+
+  it('ring third-party path: uses thirdPartyDeferralDays over deferralDays', () => {
+    const auto = parseRingAutoApprove({ enabled: true, severities: ['critical'], deferralDays: 7, thirdPartyApps: true, thirdPartyDeferralDays: 14 });
+    const d = decidePatchApproval(
+      candidate({ source: 'third_party', category: 'application', packageId: 'X.Y' }),
+      ring({ sources: ['third_party'] }) as never, new Set(), new Map(), auto, NOW,
+    );
+    expect(d).toEqual({ denied: 'held_by_deferral', holdUntil: new Date(released.getTime() + 14 * DAY) });
+  });
+
+  it('ring OS path: uses the ring auto-approve deferralDays', () => {
+    const auto = parseRingAutoApprove({ enabled: true, severities: ['critical'], deferralDays: 7 });
+    const d = decidePatchApproval(candidate(), ring() as never, new Set(), new Map(), auto, NOW);
+    expect(d).toEqual({ denied: 'held_by_deferral', holdUntil: new Date(released.getTime() + 7 * DAY) });
+  });
+});
+
+// #7800: APT never supplies a release date, so the fail-closed OS rule held
+// every Linux patch forever under any deferral > 0. Linux now anchors on
+// first-seen like third-party; Windows/macOS keep the fail-closed hold.
+describe('deferral first-seen fallback for Linux OS patches (#7800)', () => {
+  const NOW = new Date('2026-10-03T12:00:00.000Z');
+  const DAY = 86_400_000;
+  const candidate = (o: Record<string, unknown> = {}) => ({
+    patchId: 'p-apt', category: null, severity: 'unknown', releaseDate: null,
+    source: 'linux', packageId: null, version: null, firstSeenAt: null, ...o,
+  });
+  const ring = (o: Record<string, unknown> = {}) => ({ ringId: 'ring-1', categoryRules: [], autoApprove: {}, deferralDays: 0, sources: ['os'], ...o });
+  // The reporter's Pilot ring: unrated auto-approve on, one-day deferral.
+  const pilot = parseRingAutoApprove({ enabled: true, severities: ['critical'], deferralDays: 1, autoApproveUnrated: true });
+
+  it('approves an unrated linux patch with no release date once first-seen is past the window', () => {
+    const d = decidePatchApproval(
+      candidate({ firstSeenAt: new Date(NOW.getTime() - 2 * DAY) }) as never,
+      ring() as never, new Set(), new Map(), pilot, NOW,
+    );
+    expect(d).toEqual({ approved: 'ring_auto_approve' });
+  });
+
+  it('holds a linux patch first seen inside the window, until first-seen + deferral', () => {
+    const firstSeen = new Date(NOW.getTime() - 12 * 3600 * 1000);
+    const d = decidePatchApproval(candidate({ firstSeenAt: firstSeen }) as never, ring() as never, new Set(), new Map(), pilot, NOW);
+    expect(d).toEqual({ denied: 'held_by_deferral', holdUntil: new Date(firstSeen.getTime() + DAY) });
+  });
+
+  it('accepts first-seen as an ISO string (the shape a JSON round-trip produces)', () => {
+    const firstSeen = new Date(NOW.getTime() - 3 * DAY);
+    expect(deferralHold(candidate({ firstSeenAt: firstSeen.toISOString() }) as never, 7, NOW, 'ring'))
+      .toEqual({ held: true, until: new Date(firstSeen.getTime() + 7 * DAY) });
+    expect(deferralHold(candidate({ firstSeenAt: firstSeen.toISOString() }) as never, 2, NOW, 'ring'))
+      .toEqual({ held: false });
+  });
+
+  it('prefers a linux releaseDate over first-seen when one is present', () => {
+    const released = new Date(NOW.getTime() - DAY);
+    expect(deferralHold(
+      candidate({ releaseDate: released.toISOString(), firstSeenAt: new Date(NOW.getTime() - 10 * DAY) }) as never,
+      7, NOW, 'ring',
+    )).toEqual({ held: true, until: new Date(released.getTime() + 7 * DAY) });
+  });
+
+  it('applies the fallback on a category-rule deferral too', () => {
+    const rule = { category: 'security', autoApprove: true, deferralDaysOverride: 5 };
+    const firstSeen = new Date(NOW.getTime() - 2 * DAY);
+    const d = decidePatchApproval(
+      candidate({ category: 'security', firstSeenAt: firstSeen }) as never,
+      ring() as never, new Set(), new Map([['security', rule]]), parseRingAutoApprove({}), NOW,
+    );
+    expect(d).toEqual({ denied: 'held_by_deferral', holdUntil: new Date(firstSeen.getTime() + 5 * DAY) });
+  });
+
+  it('still fails closed for a linux patch with neither releaseDate nor firstSeenAt', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      expect(deferralHold(candidate() as never, 1, NOW, 'ring')).toEqual({ held: true, until: null });
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('it has no releaseDate and no first-seen fallback timestamp'));
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it('fails closed for a linux patch with an unparseable releaseDate (no fall-through to first-seen)', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      expect(deferralHold(
+        candidate({ releaseDate: 'not-a-date', firstSeenAt: new Date(NOW.getTime() - 10 * DAY) }) as never,
+        1, NOW, 'ring',
+      )).toEqual({ held: true, until: null });
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('its releaseDate value is unparseable'));
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it.each(['microsoft', 'apple'])(
+    'keeps the fail-closed hold (no expiry) for a %s patch with no release date, however long ago it was first seen',
+    (source) => {
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        const d = decidePatchApproval(
+          candidate({ source, firstSeenAt: new Date(NOW.getTime() - 365 * DAY) }) as never,
+          ring() as never, new Set(), new Map(), pilot, NOW,
+        );
+        expect(d).toEqual({ denied: 'held_by_deferral', holdUntil: null });
+        expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('but it has no releaseDate, so it cannot prove its age'));
+      } finally {
+        warnSpy.mockRestore();
+      }
+    },
+  );
+
+  it.each(['third_party', 'custom'])('leaves the existing %s first-seen fallback unchanged', (source) => {
+    const firstSeen = new Date(NOW.getTime() - 2 * DAY);
+    expect(deferralHold(candidate({ source, firstSeenAt: firstSeen }) as never, 7, NOW, 'ring'))
+      .toEqual({ held: true, until: new Date(firstSeen.getTime() + 7 * DAY) });
+    expect(deferralHold(candidate({ source, firstSeenAt: firstSeen }) as never, 1, NOW, 'ring'))
+      .toEqual({ held: false });
+  });
+
+  describe('through resolveApprovedPatchesForDevice (first-seen plumbed from device_patches.createdAt)', () => {
+    beforeEach(() => {
+      vi.mocked(db.select).mockReset();
+    });
+    const linuxRing: RingConfig = {
+      ringId: RING_ID,
+      categoryRules: [],
+      autoApprove: { enabled: true, severities: ['critical'], deferralDays: 1, autoApproveUnrated: true },
+      deferralDays: 0,
+      sources: ['os'],
+    };
+
+    it('approves an APT patch first seen two days ago on a one-day deferral ring', async () => {
+      mockPendingAndApprovals(
+        [pendingRow({ patchId: P1, source: 'linux', severity: 'unknown', category: null, releaseDate: null, firstSeenAt: new Date(Date.now() - 2 * DAY) })],
+        []
+      );
+      const result = await resolveApprovedPatchesForDevice(DEVICE_ID, ORG_ID, linuxRing);
+      expect(result).toHaveLength(1);
+      expect(result[0]?.approvalReason).toBe('ring_auto_approve');
+    });
+
+    it('holds an APT patch first seen an hour ago', async () => {
+      mockPendingAndApprovals(
+        [pendingRow({ patchId: P1, source: 'linux', severity: 'unknown', category: null, releaseDate: null, firstSeenAt: new Date(Date.now() - 3600 * 1000) })],
+        []
+      );
+      const result = await resolveApprovedPatchesForDevice(DEVICE_ID, ORG_ID, linuxRing);
+      expect(result).toEqual([]);
+    });
+  });
+});
+
+// #9369: an explicit decline is a terminal deny — ring auto-approve must not re-approve it.
+describe('decidePatchApproval — explicit decline is terminal (#9369)', () => {
+  const NOW = new Date('2026-09-30T00:00:00.000Z');
+  const unrated = {
+    patchId: 'p-1', category: null, severity: null, releaseDate: null,
+    source: 'linux', packageId: 'docker-ce', version: '1', firstSeenAt: null,
+  };
+  const ring = { ringId: 'ring-1', categoryRules: [], autoApprove: {}, deferralDays: 0 };
+  const auto = () => parseRingAutoApprove({ enabled: true, severities: ['critical'], autoApproveUnrated: true });
+
+  it('control: without a decline, ring auto-approve admits the unrated patch', () => {
+    const d = decidePatchApproval(unrated, ring as never, new Set(), new Map(), auto(), NOW, new Set());
+    expect(d).toEqual({ approved: 'ring_auto_approve' });
+  });
+
+  it('a declined unrated patch is denied despite autoApproveUnrated', () => {
+    const d = decidePatchApproval(unrated, ring as never, new Set(), new Map(), auto(), NOW, new Set(['p-1']));
+    expect(d).toEqual({ denied: 'explicitly_declined' });
+  });
+
+  it('a declined patch is denied even when a category rule would auto-approve it', () => {
+    const rule = { category: 'security', autoApprove: true };
+    const d = decidePatchApproval({ ...unrated, category: 'security' }, ring as never, new Set(), new Map([['security', rule]]), auto(), NOW, new Set(['p-1']));
+    expect(d).toEqual({ denied: 'explicitly_declined' });
+  });
+});
+
+describe('decidePatchApproval — decline beats manual approval when both sets hold the patch (#9369)', () => {
+  it('denies explicitly_declined', () => {
+    const cand = { patchId: 'p-1', category: null, severity: null, releaseDate: null, source: 'linux', packageId: null, version: null, firstSeenAt: null };
+    const ring = { ringId: 'ring-1', categoryRules: [], autoApprove: {}, deferralDays: 0 };
+    const d = decidePatchApproval(cand, ring as never, new Set(['p-1']), new Map(), parseRingAutoApprove({}), new Date(), new Set(['p-1']));
+    expect(d).toEqual({ denied: 'explicitly_declined' });
   });
 });

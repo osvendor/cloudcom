@@ -5,6 +5,10 @@ import DeviceCard from './DeviceCard';
 import type { Device } from './DeviceList';
 import { fetchWithAuth } from '../../stores/auth';
 
+vi.mock('../../lib/permissions', () => ({
+  usePermissions: () => ({ permissions: [], can: () => true }),
+}));
+
 vi.mock('../../stores/auth', () => ({
   fetchWithAuth: vi.fn()
 }));
@@ -170,8 +174,8 @@ describe('DeviceCard network-class guard (#4014)', () => {
     render(<DeviceCard device={agentDevice} />);
 
     expect(screen.queryByTestId(`device-${agentDevice.id}-class-badge`)).toBeNull();
-    // The agent card keeps the OS version line the badge replaces.
-    expect(screen.getByText('11')).toBeInTheDocument();
+    // The agent card keeps the OS line the badge replaces (named since #9037).
+    expect(screen.getByText('Windows 11')).toBeInTheDocument();
   });
 
   // The metrics effect gained `isNetwork` in its dependency array. Cards are

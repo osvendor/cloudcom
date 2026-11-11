@@ -21,6 +21,7 @@ const {
   fireEscalationLatchMock,
   isCooldownActiveMock,
   isFlappingMock,
+  scheduleStagedAlertDispatchMock,
   callOrder,
 } = vi.hoisted(() => {
   const resultsQueue: unknown[][] = [];
@@ -54,6 +55,16 @@ const {
           };
         },
       })),
+      execute: vi.fn(async (statement: { values: unknown[] }) => {
+        callOrder.push('createAlert.insert');
+        const [ruleId, deviceId, orgId, severity, title, message, context, monitorId, episodeId, requiresHuman, subjectKey] = statement.values;
+        insertedAlerts.push({
+          ruleId, deviceId, orgId, severity, title, message,
+          context: JSON.parse(context as string), monitorId, episodeId, requiresHuman, subjectKey,
+        });
+        return [{ id: 'alert-1' }];
+      }),
+      update: vi.fn(() => ({ set: () => ({ where: () => Promise.resolve(undefined) }) })),
       delete: vi.fn(() => ({ where: () => Promise.resolve([]) })),
     },
     captureExceptionMock: vi.fn(),
@@ -65,9 +76,12 @@ const {
     fireEscalationLatchMock: vi.fn(),
     isCooldownActiveMock: vi.fn(),
     isFlappingMock: vi.fn(),
+    scheduleStagedAlertDispatchMock: vi.fn(),
   };
 });
 
+vi.mock('./alertLifecycle/resolve', async (importOriginal) =>
+  (await import('../testUtils/alertLifecycleMock')).legacyLifecycleModule(await importOriginal()));
 vi.mock('drizzle-orm', () => ({
   eq: (col: unknown, val: unknown) => ({ op: 'eq', col, val }),
   and: (...args: unknown[]) => ({ op: 'and', args }),
@@ -83,7 +97,12 @@ vi.mock('drizzle-orm', () => ({
   desc: (col: unknown) => ({ op: 'desc', col }),
 }));
 
-vi.mock('../db', () => ({ db: dbMock }));
+vi.mock('../db', () => ({
+  db: dbMock,
+  // #10859 — the evaluator scopes its own contexts; their boundaries are
+  // asserted in alertService.contextScoping.test.ts.
+  withSystemDbAccessContext: async (fn: () => Promise<unknown>) => fn(),
+}));
 
 vi.mock('../db/schema', () => ({
   alerts: { id: 'alerts.id', ruleId: 'alerts.ruleId', deviceId: 'alerts.deviceId', status: 'alerts.status' },
@@ -130,22 +149,21 @@ vi.mock('./monitors/escalationLatch', () => ({
 }));
 
 vi.mock('./alertConditions', () => ({
+  evidenceLeafPaths: vi.fn(() => []),
   evaluateConditions: evaluateConditionsMock,
   evaluateAutoResolveConditions: vi.fn(),
   interpolateTemplate: vi.fn((template: string) => template),
+  withMetConditionDescriptions: vi.fn((context: Record<string, unknown>) => context),
 }));
 
 vi.mock('./alertCooldown', () => ({
   isCooldownActive: isCooldownActiveMock,
   setCooldown: vi.fn(() => Promise.resolve()),
-  isConfigPolicyRuleCooling: vi.fn(),
-  markConfigPolicyRuleCooldown: vi.fn(),
   recordStateTransition: vi.fn(() => Promise.resolve()),
   isFlapping: isFlappingMock,
 }));
 
 vi.mock('./featureConfigResolver', () => ({
-  resolveAlertRulesForDevice: vi.fn(),
   resolveMaintenanceConfigForDevice: vi.fn(),
   isInMaintenanceWindow: vi.fn(),
 }));
@@ -154,6 +172,13 @@ vi.mock('./eventBus', () => ({ publishEvent: vi.fn(() => Promise.resolve()) }));
 vi.mock('./sentry', () => ({ captureException: captureExceptionMock }));
 vi.mock('./deviceSiteResolver', () => ({ resolveDeviceSiteId: vi.fn(() => Promise.resolve('site-1')) }));
 vi.mock('../jobs/alertCorrelation', () => ({ enqueueAlertCorrelation: vi.fn(() => Promise.resolve('job-1')) }));
+// #10926 — create stages `alert.triggered` on the row and hands the id to the
+// outbox; the after-commit publish and its follow-ups are covered by
+// alertPublishAfterCommit.integration.test.ts.
+vi.mock('./subjectAlertOutbox', () => ({ scheduleStagedAlertDispatch: scheduleStagedAlertDispatchMock }));
+
+import { resolveMaintenanceConfigForDevice, isInMaintenanceWindow } from './featureConfigResolver';
+import { getAlertWorkTelemetrySnapshot, getActiveAlertWorkSpan } from './alertWorkTelemetry';
 
 import { evaluateDeviceAlerts, evaluateNetworkCheckAlertsForDevice } from './alertService';
 
@@ -238,6 +263,7 @@ beforeEach(() => {
   callOrder.length = 0;
   insertedAlerts.length = 0;
   vi.clearAllMocks();
+  vi.mocked(resolveMaintenanceConfigForDevice).mockResolvedValue(null);
   resolveMonitorsForDeviceMock.mockResolvedValue({
     kind: 'resolved',
     monitors: [
@@ -256,7 +282,7 @@ beforeEach(() => {
     needsEscalationAlert: false,
     responsesPaused: false,
   });
-  linkEpisodeAlertMock.mockResolvedValue(undefined);
+  linkEpisodeAlertMock.mockResolvedValue({ owner: true });
   detachMonitorFromDeviceMock.mockResolvedValue(undefined);
   // The handler would breach for whichever device it is asked about — that is
   // exactly the shape of the #6353 bug, so the split under test must not lean
@@ -272,6 +298,7 @@ beforeEach(() => {
 
 describe('#6353 — network_check rules are evaluated once per check, not once per device', () => {
   it('the per-device sweep raises NO alert for a network_check rule on any of N online devices', async () => {
+    const before = getAlertWorkTelemetrySnapshot().groups.find(row => row.group === 'network')!.evaluations;
     const online = ['device-a', 'device-b', 'device-c'];
     for (const id of online) pushSweepQueue({ deviceId: id, createsAlert: false, detachScan: true });
 
@@ -280,6 +307,7 @@ describe('#6353 — network_check rules are evaluated once per check, not once p
     expect(insertedAlerts).toHaveLength(0);
     expect(evaluateConditionsMock).not.toHaveBeenCalled();
     expect(recordMonitorEvaluationMock).not.toHaveBeenCalled();
+    expect(getAlertWorkTelemetrySnapshot().groups.find(row => row.group === 'network')!.evaluations).toBe(before);
   });
 
   it('the per-device sweep still counts the network_check monitor as evaluated, so its open episode on the alert device is not detached', async () => {
@@ -291,6 +319,15 @@ describe('#6353 — network_check rules are evaluated once per check, not once p
   });
 
   it('the device-independent path raises exactly one alert on the resolved alert device even when it is OFFLINE', async () => {
+    const before = getAlertWorkTelemetrySnapshot().groups.find(row => row.group === 'network')!;
+    evaluateConditionsMock.mockImplementationOnce(async () => {
+      getActiveAlertWorkSpan()!.queryCount += 2;
+      return { triggered: true, conditionsMet: [], conditionsNotMet: [], dataState: 'ok', context: {} };
+    });
+    recordMonitorEvaluationMock.mockImplementationOnce(async () => {
+      getActiveAlertWorkSpan()!.queryCount += 3;
+      return { episodeId: null, episodeOpened: false, episodeClosed: false, episodesInWindow: 0, latched: false, needsEscalationAlert: false, responsesPaused: false };
+    });
     pushSweepQueue({ deviceId: 'device-offline', deviceStatus: 'offline', createsAlert: true, detachScan: false });
 
     const created = await evaluateNetworkCheckAlertsForDevice('device-offline', new Set([MONITOR_ID]));
@@ -298,6 +335,11 @@ describe('#6353 — network_check rules are evaluated once per check, not once p
     expect(created).toHaveLength(1);
     expect(insertedAlerts).toHaveLength(1);
     expect(insertedAlerts[0]).toMatchObject({ deviceId: 'device-offline', orgId: DEVICE_ORG, monitorId: MONITOR_ID });
+    // The alert is announced through the outbox, once, from the one row.
+    expect(insertedAlerts[0]!.context).toMatchObject({
+      _subjectDispatch: { eventType: 'alert.triggered', retryOnPublishFailure: true },
+    });
+    expect(scheduleStagedAlertDispatchMock).toHaveBeenCalledExactlyOnceWith('alert-1');
     expect(evaluateConditionsMock).toHaveBeenCalledTimes(1);
     expect(evaluateConditionsMock).toHaveBeenCalledWith(NETWORK_CONDITIONS, 'device-offline');
     expect(recordMonitorEvaluationMock).toHaveBeenCalledWith(
@@ -307,6 +349,9 @@ describe('#6353 — network_check rules are evaluated once per check, not once p
     // close every OTHER monitor's episode on this device.
     expect(detachMonitorFromDeviceMock).not.toHaveBeenCalled();
     expect(resultsQueue).toHaveLength(0);
+    const after = getAlertWorkTelemetrySnapshot().groups.find(row => row.group === 'network')!;
+    expect(after.evaluations - before.evaluations).toBe(1);
+    expect(after.queryCount - before.queryCount).toBe(5); // condition AND bookkeeping share the span
   });
 
   it('the device-independent path skips a network_check rule whose monitor is not one this device is the alert device for', async () => {
@@ -320,3 +365,12 @@ describe('#6353 — network_check rules are evaluated once per check, not once p
   });
 });
 
+
+it('suppresses the device-independent network-check evaluation during maintenance', async () => {
+  vi.mocked(resolveMaintenanceConfigForDevice).mockResolvedValue({ suppressAlerts: true } as never);
+  vi.mocked(isInMaintenanceWindow).mockReturnValue({ active: true, suppressAlerts: true } as never);
+  pushSweepQueue({ deviceId: 'device-offline', createsAlert: true, detachScan: false });
+  expect(await evaluateNetworkCheckAlertsForDevice('device-offline', new Set([MONITOR_ID]))).toEqual([]);
+  expect(evaluateConditionsMock).not.toHaveBeenCalled();
+  expect(insertedAlerts).toHaveLength(0);
+});

@@ -1,46 +1,81 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
-import { Plus, Send } from 'lucide-react';
-import WebhookList, { type Webhook } from './WebhookList';
+import { usePermissions } from '../../lib/permissions';
+import AccessDenied from '../shared/AccessDenied';
+import { Plus, Send, Webhook as WebhookIcon } from 'lucide-react';
+import WebhookList, { type Webhook, type WebhookOwnerFilter, isWebhookActive } from './WebhookList';
 import WebhookForm, { type WebhookFormValues, webhookEventOptions } from './WebhookForm';
-import WebhookDeliveryHistory, { type WebhookDelivery } from './WebhookDeliveryHistory';
-import { fetchWithAuth } from '../../stores/auth';
+import WebhookDeliveryHistory, { normalizeDelivery, type WebhookDelivery } from './WebhookDeliveryHistory';
+import { fetchWithAuth, handleSessionExpired } from '../../stores/auth';
 import { useOrgStore } from '../../stores/orgStore';
-import { extractApiError } from '@/lib/apiError';
+import { ActionError, handleActionError, runAction } from '@/lib/runAction';
+import { formSecretValue, isMaskedSecret, MASKED_SECRET } from '@/lib/redactedSecret';
 import { Trans, useTranslation } from 'react-i18next';
+import { Dialog } from '../shared/Dialog';
+import { IntegrationPanelHeader } from '../integrations/IntegrationPanelHeader';
 // Initializes the shared i18next singleton. Islands hydrate independently, so
 // an island that hydrates before whichever other island happens to pull i18n in
 // would otherwise render raw keys (and mismatch the SSR markup).
 import '../../lib/i18n';
+import { useStableT } from '@/lib/i18n/useStableT';
 
 type ModalMode = 'closed' | 'create' | 'edit' | 'delete';
 
-type PayloadPreview = {
-  preview: string;
-  error: string;
-};
+const FORM_TITLE_ID = 'webhook-form-dialog-title';
+const DELETE_TITLE_ID = 'webhook-delete-dialog-title';
+
+export interface WebhooksPageProps {
+  /** Rendered as a panel inside the Integrations page, which owns the page h1:
+   *  the title drops to an h2 panel header. Standalone routes keep the h1. */
+  embedded?: boolean;
+}
 
 const defaultEventType = webhookEventOptions[0]?.value ?? 'device.online';
 
-const formatPayloadPreview = (payload: string | null | undefined, t: (key: string) => string): PayloadPreview => {
-  if (!payload?.trim()) {
-    return { preview: '', error: '' };
+// #9652: the API stores bearer auth as an encrypted `Authorization: Bearer
+// <token>` custom header. The form shows it as the Bearer option instead of
+// a custom header row, and writes it back as that header.
+const isAuthorizationHeader = (key: string) => key.trim().toLowerCase() === 'authorization';
+const webhookFormAuthType = (webhook: Webhook): 'hmac' | 'bearer' =>
+  webhook.authType === 'bearer' ? 'bearer' : 'hmac';
+
+// Reading webhooks requires webhooks:read (GET /webhooks and the delivery
+// history). Without it the page shows the permission-denied state and makes no
+// request. UX only — every route re-checks server-side.
+export default function WebhooksPage({ embedded = false }: WebhooksPageProps = {}) {
+  const { permissions, can } = usePermissions();
+  if (!can('webhooks', 'read')) {
+    // Grants still loading: render nothing rather than flash the denied state.
+    if (!permissions) return null;
+    return <AccessDenied testId="webhooks-access-denied" />;
   }
+  return <WebhooksPageContent embedded={embedded} />;
+}
 
-  try {
-    return { preview: JSON.stringify(JSON.parse(payload), null, 2), error: '' };
-  } catch {
-    return { preview: payload, error: t('longTail.webhooks.WebhooksPage.errors.invalidPayloadTemplate') };
-  }
-};
-
-const getWebhookEnabled = (webhook: Webhook) => {
-  if (typeof webhook.enabled === 'boolean') return webhook.enabled;
-  return webhook.status !== 'disabled';
-};
-
-export default function WebhooksPage() {
+function WebhooksPageContent({ embedded }: { embedded: boolean }) {
   const { t } = useTranslation('common');
+  const { can } = usePermissions();
+  // UX gate: every webhook write (create, edit, delete, pause/resume, test,
+  // retry) requires organizations:write. A webhooks:read-only caller sees the
+  // list, details and delivery history with no write controls.
+  const canManage = can('organizations', 'write');
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   const { currentOrgId } = useOrgStore();
+  const [ownerScope, setOwnerScope] = useState<WebhookOwnerFilter>('all');
+
+  useEffect(() => {
+    const readOwnerScope = () => {
+      const value = new URLSearchParams(window.location.hash.split('?')[1] ?? '').get('ownerScope');
+      setOwnerScope(value === 'partner' || value === 'organization' ? value : 'all');
+    };
+    readOwnerScope();
+    window.addEventListener('hashchange', readOwnerScope);
+    return () => window.removeEventListener('hashchange', readOwnerScope);
+  }, []);
+
+  const changeOwnerScope = (value: WebhookOwnerFilter) => {
+    window.location.hash = value === 'all' ? 'webhooks' : `webhooks?ownerScope=${value}`;
+    setOwnerScope(value);
+  };
   const [webhooks, setWebhooks] = useState<Webhook[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
@@ -57,18 +92,19 @@ export default function WebhooksPage() {
     try {
       setLoading(true);
       setError(undefined);
-      const response = await fetchWithAuth('/webhooks');
+      const url = ownerScope === 'all' ? '/webhooks' : `/webhooks?ownerScope=${ownerScope}`;
+      const response = await fetchWithAuth(url);
       if (!response.ok) {
-        throw new Error(t('longTail.webhooks.WebhooksPage.errors.fetchWebhooks'));
+        throw new Error(stableT('longTail.webhooks.WebhooksPage.errors.fetchWebhooks'));
       }
       const data = await response.json();
       setWebhooks(data.data ?? data.webhooks ?? []);
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('longTail.webhooks.WebhooksPage.errors.generic'));
+      setError(err instanceof Error ? err.message : stableT('longTail.webhooks.WebhooksPage.errors.generic'));
     } finally {
       setLoading(false);
     }
-  }, [t]);
+  }, [stableT, ownerScope]);
 
   const fetchDeliveries = useCallback(async (webhookId: string) => {
     try {
@@ -76,17 +112,18 @@ export default function WebhooksPage() {
       setDeliveriesError(undefined);
       const response = await fetchWithAuth(`/webhooks/${webhookId}/deliveries`);
       if (!response.ok) {
-        throw new Error(t('longTail.webhooks.WebhooksPage.errors.fetchDeliveries'));
+        throw new Error(stableT('longTail.webhooks.WebhooksPage.errors.fetchDeliveries'));
       }
       const data = await response.json();
-      setDeliveries(data.data ?? data.deliveries ?? []);
+      const rows: Record<string, unknown>[] = data.data ?? data.deliveries ?? [];
+      setDeliveries(rows.map(normalizeDelivery));
     } catch (err) {
-      setDeliveriesError(err instanceof Error ? err.message : t('longTail.webhooks.WebhooksPage.errors.loadDeliveries'));
+      setDeliveriesError(err instanceof Error ? err.message : stableT('longTail.webhooks.WebhooksPage.errors.loadDeliveries'));
       setDeliveries([]);
     } finally {
       setDeliveriesLoading(false);
     }
-  }, [t]);
+  }, [stableT]);
 
   useEffect(() => {
     fetchWebhooks();
@@ -120,11 +157,6 @@ export default function WebhooksPage() {
     [webhooks, activeWebhookId]
   );
 
-  const payloadPreview = useMemo(
-    () => formatPayloadPreview(activeWebhook?.payloadTemplate, t),
-    [activeWebhook?.payloadTemplate, t]
-  );
-
   const labelMap = useMemo(() => {
     const map = new Map<string, string>();
     webhookEventOptions.forEach(option => map.set(option.value, t(/* i18n-dynamic */ option.labelKey)));
@@ -154,47 +186,57 @@ export default function WebhooksPage() {
 
   const handleTest = async (webhook: Webhook, eventType?: string) => {
     try {
-      const response = await fetchWithAuth(`/webhooks/${webhook.id}/test`, {
-        method: 'POST',
-        body: JSON.stringify({
-          event: eventType ?? webhook.events?.[0] ?? defaultEventType,
-          payloadTemplate: webhook.payloadTemplate
-        })
+      await runAction({
+        request: () =>
+          fetchWithAuth(`/webhooks/${webhook.id}/test`, {
+            method: 'POST',
+            body: JSON.stringify({
+              event: eventType ?? webhook.events?.[0] ?? defaultEventType
+            })
+          }),
+        errorFallback: t('longTail.webhooks.WebhooksPage.errors.testFailed'),
+        successMessage: t('longTail.webhooks.WebhooksPage.success.testQueued'),
+        onUnauthorized: handleSessionExpired,
       });
-
-      if (!response.ok) {
-        throw new Error(t('longTail.webhooks.WebhooksPage.errors.testFailed'));
-      }
 
       await fetchWebhooks();
       if (activeWebhookId === webhook.id) {
         await fetchDeliveries(webhook.id);
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('longTail.webhooks.WebhooksPage.errors.testFailed'));
+      handleActionError(err, t('longTail.webhooks.WebhooksPage.errors.testFailed'));
     }
   };
 
   const handleToggle = async (webhook: Webhook, enabled: boolean) => {
+    const errorFallback = enabled
+      ? t('longTail.webhooks.WebhooksPage.errors.enableWebhook')
+      : t('longTail.webhooks.WebhooksPage.errors.disableWebhook');
     try {
-      const response = await fetchWithAuth(`/webhooks/${webhook.id}`, {
-        method: 'PATCH',
-        body: JSON.stringify({ enabled })
+      // PATCH speaks `status`; an `enabled` key is stripped by the API's
+      // schema, which made this toggle a silent no-op (#6767).
+      const updated = await runAction<Partial<Webhook>>({
+        request: () => fetchWithAuth(`/webhooks/${webhook.id}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ status: enabled ? 'active' : 'paused' })
+        }),
+        errorFallback,
+        successMessage: enabled
+          ? t('longTail.webhooks.WebhooksPage.success.enabled')
+          : t('longTail.webhooks.WebhooksPage.success.disabled'),
+        onUnauthorized: handleSessionExpired,
       });
 
-      if (!response.ok) {
-        throw new Error(enabled ? t('longTail.webhooks.WebhooksPage.errors.enableWebhook') : t('longTail.webhooks.WebhooksPage.errors.disableWebhook'));
-      }
-
+      // Render what the server saved, not what we asked for.
       setWebhooks(prev =>
         prev.map(item =>
           item.id === webhook.id
-            ? { ...item, enabled, status: enabled ? 'active' : 'disabled' }
+            ? { ...item, status: updated?.status ?? (enabled ? 'active' : 'paused') }
             : item
         )
       );
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('longTail.webhooks.WebhooksPage.errors.generic'));
+      handleActionError(err, errorFallback);
     }
   };
 
@@ -203,37 +245,70 @@ export default function WebhooksPage() {
     setSelectedWebhook(null);
   };
 
-  const transformFormToPayload = (values: WebhookFormValues) => {
-    const auth =
-      values.authType === 'bearer'
-        ? { type: 'bearer', token: values.bearerToken }
-        : { type: 'hmac', secret: values.secret };
+  const transformFormToPayload = (values: WebhookFormValues, current: Webhook | null) => {
+    const enabled = values.enabled ?? true;
+    // The API has no `enabled` field. On edit, only send `status` when the
+    // switch actually changed, so saving an untouched `failed` webhook does not
+    // quietly re-activate it (#6767).
+    const status = current && enabled === isWebhookActive(current)
+      ? undefined
+      : enabled ? 'active' : 'paused';
+    const headers = values.headers?.filter(header => header.key) ?? [];
+    let secret: { secret?: string | null } = { secret: values.secret };
+    if (values.authType === 'bearer') {
+      // A masked token means "keep the stored one": the API resolves a masked
+      // value by exact key, then by position, so send the stored header's own
+      // key spelling back or it may resolve to a different header.
+      const storedKey = current && webhookFormAuthType(current) === 'bearer'
+        ? current.headers?.find(header => isAuthorizationHeader(header.key))?.key
+        : undefined;
+      const token = (values.bearerToken ?? '').trim().replace(/^bearer\s+/i, '');
+      headers.push({
+        key: storedKey ?? 'Authorization',
+        value: isMaskedSecret(token) ? MASKED_SECRET : `Bearer ${token}`,
+      });
+      // Switching an HMAC webhook to bearer clears its signing secret.
+      secret = current && webhookFormAuthType(current) !== 'bearer' ? { secret: null } : {};
+    }
 
     return {
       name: values.name,
       url: values.url,
       events: values.events,
-      enabled: values.enabled ?? true,
-      auth,
-      secret: values.authType === 'hmac' ? values.secret : undefined,
-      bearerToken: values.authType === 'bearer' ? values.bearerToken : undefined,
-      payloadTemplate: values.payloadTemplate?.trim() || undefined,
-      headers: values.headers?.filter(header => header.key) ?? []
+      payloadVersion: values.payloadVersion,
+      ...(status ? { status } : {}),
+      ...secret,
+      headers
     };
   };
 
   const transformWebhookToForm = (webhook: Webhook): Partial<WebhookFormValues> => {
-    const authType = webhook.auth?.type ?? (webhook.bearerToken ? 'bearer' : 'hmac');
+    const authType = webhookFormAuthType(webhook);
+    // The API never returns the stored secret, only `hasSecret`, and returns
+    // each header value as a redaction marker. Pre-fill the masked string the
+    // API reads as "keep what is stored"; a blank secret would fail HMAC
+    // validation and block every edit until it was re-typed (#4983).
+    const headers = webhook.headers ?? [];
+    const bearerHeader = authType === 'bearer'
+      ? headers.find(header => isAuthorizationHeader(header.key))
+      : undefined;
     return {
       name: webhook.name,
       url: webhook.url,
       authType,
-      secret: webhook.auth?.secret ?? webhook.secret ?? '',
-      bearerToken: webhook.auth?.token ?? webhook.bearerToken ?? '',
+      secret: webhook.hasSecret ? MASKED_SECRET : '',
+      bearerToken: bearerHeader ? formSecretValue(bearerHeader.value) : '',
       events: webhook.events ?? [],
-      headers: webhook.headers ?? [],
-      enabled: getWebhookEnabled(webhook),
-      payloadTemplate: webhook.payloadTemplate ?? ''
+      payloadVersion: webhook.payloadVersion ?? 1,
+      // The bearer Authorization header is edited through the Bearer option,
+      // not as a custom header row.
+      headers: headers
+        .filter(header => header !== bearerHeader)
+        .map(header => ({
+          key: header.key,
+          value: formSecretValue(header.value),
+        })),
+      enabled: isWebhookActive(webhook)
     };
   };
 
@@ -242,30 +317,40 @@ export default function WebhooksPage() {
     setError(undefined);
 
     try {
-      const payload = transformFormToPayload(values);
+      const payload = transformFormToPayload(values, modalMode === 'create' ? null : selectedWebhook);
       const url =
         modalMode === 'create' ? '/webhooks' : `/webhooks/${selectedWebhook?.id}`;
       const method = modalMode === 'create' ? 'POST' : 'PATCH';
 
-      // Include orgId when creating a new webhook
-      const requestPayload = modalMode === 'create' && currentOrgId
-        ? { ...payload, orgId: currentOrgId }
+      const requestPayload = modalMode === 'create'
+        ? values.ownerScope === 'partner'
+          ? { ...payload, ownerScope: 'partner' }
+          : currentOrgId ? { ...payload, orgId: currentOrgId } : payload
         : payload;
 
-      const response = await fetchWithAuth(url, {
-        method,
-        body: JSON.stringify(requestPayload)
+      await runAction({
+        request: () =>
+          fetchWithAuth(url, {
+            method,
+            body: JSON.stringify(requestPayload)
+          }),
+        errorFallback: t('longTail.webhooks.WebhooksPage.errors.saveWebhook'),
+        successMessage: modalMode === 'create'
+          ? t('longTail.webhooks.WebhooksPage.success.created')
+          : t('longTail.webhooks.WebhooksPage.success.updated'),
+        onUnauthorized: handleSessionExpired,
       });
-
-      if (!response.ok) {
-        const data = await response.json();
-        throw new Error(extractApiError(data, t('longTail.webhooks.WebhooksPage.errors.saveWebhook')));
-      }
 
       await fetchWebhooks();
       handleCloseModal();
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('longTail.webhooks.WebhooksPage.errors.generic'));
+      // runAction toasted the failure; also keep the inline message inside the
+      // still-open form modal so it sits next to the fields being edited.
+      if (err instanceof ActionError) {
+        if (err.status !== 401) setError(err.message);
+      } else {
+        handleActionError(err, t('longTail.webhooks.WebhooksPage.errors.saveWebhook'));
+      }
     } finally {
       setSubmitting(false);
     }
@@ -276,18 +361,30 @@ export default function WebhooksPage() {
 
     setSubmitting(true);
     try {
-      const response = await fetchWithAuth(`/webhooks/${selectedWebhook.id}`, {
-        method: 'DELETE'
+      await runAction({
+        request: () =>
+          fetchWithAuth(`/webhooks/${selectedWebhook.id}`, {
+            method: 'DELETE'
+          }),
+        successMessage: t('longTail.webhooks.WebhooksPage.success.deleted', { name: selectedWebhook.name }),
+        errorFallback: t('longTail.webhooks.WebhooksPage.errors.deleteWebhook'),
+        onUnauthorized: handleSessionExpired,
       });
-
-      if (!response.ok) {
-        throw new Error(t('longTail.webhooks.WebhooksPage.errors.deleteWebhook'));
-      }
 
       await fetchWebhooks();
       handleCloseModal();
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('longTail.webhooks.WebhooksPage.errors.generic'));
+      // The page error banner is hidden while any modal is open (#3531), so
+      // runAction's toast is the feedback; the delete modal stays open on a
+      // real failure so the operator can retry or cancel. A 404 means the row
+      // is already gone (deleted elsewhere) — retrying can't help, so close
+      // the modal and refetch instead of leaving a stale row on screen (sweep A2).
+      if (err instanceof ActionError && err.status === 404) {
+        await fetchWebhooks();
+        handleCloseModal();
+        return;
+      }
+      handleActionError(err, t('longTail.webhooks.WebhooksPage.errors.deleteWebhook'));
     } finally {
       setSubmitting(false);
     }
@@ -297,18 +394,22 @@ export default function WebhooksPage() {
     if (!activeWebhookId) return;
 
     try {
-      const response = await fetchWithAuth(
-        `/webhooks/${activeWebhookId}/deliveries/${delivery.id}/retry`,
-        { method: 'POST' }
-      );
-
-      if (!response.ok) {
-        throw new Error(t('longTail.webhooks.WebhooksPage.errors.retryDelivery'));
-      }
+      await runAction({
+        request: () =>
+          fetchWithAuth(
+            `/webhooks/${activeWebhookId}/retry/${delivery.id}`,
+            { method: 'POST' }
+          ),
+        errorFallback: t('longTail.webhooks.WebhooksPage.errors.retryDelivery'),
+        successMessage: t('longTail.webhooks.WebhooksPage.success.retryQueued'),
+        onUnauthorized: handleSessionExpired,
+      });
 
       await fetchDeliveries(activeWebhookId);
     } catch (err) {
+      if (err instanceof ActionError && err.status === 401) return;
       setDeliveriesError(err instanceof Error ? err.message : t('longTail.webhooks.WebhooksPage.errors.retryDelivery'));
+      handleActionError(err, t('longTail.webhooks.WebhooksPage.errors.retryDelivery'));
     }
   };
 
@@ -338,33 +439,45 @@ export default function WebhooksPage() {
     );
   }
 
-  const authSummary = activeWebhook
-    ? activeWebhook.auth?.type ?? (activeWebhook.bearerToken ? 'bearer' : 'hmac')
-    : 'hmac';
+  const authSummary = activeWebhook ? webhookFormAuthType(activeWebhook) : 'hmac';
 
   const authLabel = authSummary === 'bearer' ? t('longTail.webhooks.WebhooksPage.auth.bearerToken') : t('longTail.webhooks.WebhooksPage.auth.hmacSignature');
-  const authHeader = authSummary === 'bearer' ? 'Authorization: Bearer ***' : 'X-Signature: sha256=***';
+  const authHeader = authSummary === 'bearer' ? 'Authorization: Bearer ***' : 'X-Breeze-Signature: sha256=***, X-Breeze-Signature-Timestamp';
 
   const testEventOptions = activeWebhook?.events?.length
     ? activeWebhook.events
     : webhookEventOptions.map(option => option.value);
 
+  const newWebhookButton = canManage ? (
+    <button
+      type="button"
+      onClick={handleCreate}
+      className="inline-flex h-10 items-center justify-center gap-2 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground transition hover:opacity-90"
+    >
+      <Plus className="h-4 w-4" />
+      {t('longTail.webhooks.WebhooksPage.actions.newWebhook')}
+    </button>
+  ) : null;
+
   return (
     <div className="space-y-6">
-      <div className="flex flex-wrap items-center justify-between gap-4">
-        <div>
-          <h1 className="text-xl font-semibold tracking-tight">{t('longTail.webhooks.WebhooksPage.title')}</h1>
-          <p className="text-muted-foreground">{t('longTail.webhooks.WebhooksPage.subtitle')}</p>
+      {embedded ? (
+        <IntegrationPanelHeader
+          icon={<WebhookIcon className="h-4 w-4" />}
+          title={t('longTail.webhooks.WebhooksPage.title')}
+          description={t('longTail.webhooks.WebhooksPage.subtitle')}
+          actions={newWebhookButton}
+          headingTestId="webhooks-panel-heading"
+        />
+      ) : (
+        <div className="flex flex-wrap items-center justify-between gap-4">
+          <div>
+            <h1 className="text-xl font-semibold tracking-tight">{t('longTail.webhooks.WebhooksPage.title')}</h1>
+            <p className="text-muted-foreground">{t('longTail.webhooks.WebhooksPage.subtitle')}</p>
+          </div>
+          {newWebhookButton}
         </div>
-        <button
-          type="button"
-          onClick={handleCreate}
-          className="inline-flex h-10 items-center justify-center gap-2 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground transition hover:opacity-90"
-        >
-          <Plus className="h-4 w-4" />
-          {t('longTail.webhooks.WebhooksPage.actions.newWebhook')}
-        </button>
-      </div>
+      )}
 
       {error && modalMode === 'closed' && (
         <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
@@ -374,10 +487,13 @@ export default function WebhooksPage() {
 
       <WebhookList
         webhooks={webhooks}
-        onEdit={handleEdit}
-        onDelete={handleDelete}
-        onTest={handleTest}
-        onToggle={handleToggle}
+        showTitle={!embedded}
+        ownerScope={ownerScope}
+        onOwnerScopeChange={changeOwnerScope}
+        onEdit={canManage ? handleEdit : undefined}
+        onDelete={canManage ? handleDelete : undefined}
+        onTest={canManage ? handleTest : undefined}
+        onToggle={canManage ? handleToggle : undefined}
         onSelect={webhook => setActiveWebhookId(webhook.id)}
         selectedWebhookId={activeWebhookId}
       />
@@ -390,6 +506,7 @@ export default function WebhooksPage() {
                 <h2 className="text-lg font-semibold">{t('longTail.webhooks.WebhooksPage.details.title')}</h2>
                 <p className="text-sm text-muted-foreground">{activeWebhook.name}</p>
               </div>
+              {canManage && (
               <div className="flex flex-wrap items-center gap-2">
                 <button
                   type="button"
@@ -407,9 +524,10 @@ export default function WebhooksPage() {
                   {t('longTail.webhooks.WebhooksPage.actions.testWebhook')}
                 </button>
               </div>
+              )}
             </div>
 
-            <div className="mt-6 grid gap-6 lg:grid-cols-2">
+            <div className="mt-6">
               <div className="space-y-4">
                 <div>
                   <label className="text-sm font-medium">{t('longTail.webhooks.WebhooksPage.details.endpoint')}</label>
@@ -417,9 +535,11 @@ export default function WebhooksPage() {
                     {activeWebhook.url}
                   </div>
                 </div>
+                {canManage && (
                 <div>
-                  <label className="text-sm font-medium">{t('longTail.webhooks.WebhooksPage.details.testEvent')}</label>
+                  <label htmlFor="webhook-test-event" className="text-sm font-medium">{t('longTail.webhooks.WebhooksPage.details.testEvent')}</label>
                   <select
+                    id="webhook-test-event"
                     value={testEvent}
                     onChange={event => setTestEvent(event.target.value)}
                     className="mt-2 h-10 w-full rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
@@ -434,6 +554,7 @@ export default function WebhooksPage() {
                     {t('longTail.webhooks.WebhooksPage.details.testEventHelp')}
                   </p>
                 </div>
+                )}
                 <div>
                   <label className="text-sm font-medium">{t('longTail.webhooks.WebhooksPage.details.authentication')}</label>
                   <div className="mt-2 space-y-1 rounded-md border bg-muted/20 px-3 py-2 text-sm">
@@ -443,19 +564,6 @@ export default function WebhooksPage() {
                     </p>
                   </div>
                 </div>
-              </div>
-              <div className="space-y-2">
-                <label className="text-sm font-medium">{t('longTail.webhooks.WebhooksPage.details.payloadPreview')}</label>
-                <div className="rounded-md border bg-background p-3 text-xs text-muted-foreground">
-                  {payloadPreview.preview ? (
-                    <pre className="max-h-64 overflow-auto">{payloadPreview.preview}</pre>
-                  ) : (
-                    <p className="text-xs text-muted-foreground">{t('longTail.webhooks.WebhooksPage.details.noPayloadTemplate')}</p>
-                  )}
-                </div>
-                {payloadPreview.error && (
-                  <p className="text-xs text-destructive">{payloadPreview.error}</p>
-                )}
               </div>
             </div>
           </div>
@@ -480,7 +588,7 @@ export default function WebhooksPage() {
                 </button>
               </div>
             ) : (
-              <WebhookDeliveryHistory deliveries={deliveries} onRetry={handleRetryDelivery} />
+              <WebhookDeliveryHistory showOrganization={Boolean(activeWebhook.partnerId)} deliveries={deliveries} onRetry={canManage ? handleRetryDelivery : undefined} />
             )}
           </div>
         </div>
@@ -491,64 +599,80 @@ export default function WebhooksPage() {
       )}
 
       {(modalMode === 'create' || modalMode === 'edit') && (
-        <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-background/80 px-4 py-8">
-          <div className="w-full max-w-3xl">
-            <div className="mb-4 flex items-center justify-between">
-              <h2 className="text-xl font-bold">
-                {modalMode === 'create' ? t('longTail.webhooks.WebhooksPage.modal.createTitle') : t('longTail.webhooks.WebhooksPage.modal.editTitle')}
-              </h2>
-            </div>
-            {error && (
-              <div className="mb-4 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
-                {error}
-              </div>
-            )}
-            <WebhookForm
-              onSubmit={handleSubmit}
-              onCancel={handleCloseModal}
-              defaultValues={
-                modalMode === 'edit' && selectedWebhook
-                  ? transformWebhookToForm(selectedWebhook)
-                  : undefined
-              }
-              submitLabel={modalMode === 'create' ? t('longTail.webhooks.WebhooksPage.actions.createWebhook') : t('longTail.webhooks.WebhooksPage.actions.saveChanges')}
-              loading={submitting}
-            />
+        // WebhookForm draws its own card, so the dialog panel stays transparent
+        // rather than nesting a card in a card.
+        <Dialog
+          open
+          onClose={handleCloseModal}
+          title={modalMode === 'create' ? t('longTail.webhooks.WebhooksPage.modal.createTitle') : t('longTail.webhooks.WebhooksPage.modal.editTitle')}
+          labelledBy={FORM_TITLE_ID}
+          maxWidth="3xl"
+          alignTop
+          className="!border-0 !bg-transparent !shadow-none"
+        >
+          <div className="mb-4 flex items-center justify-between">
+            <h2 id={FORM_TITLE_ID} className="text-xl font-bold">
+              {modalMode === 'create' ? t('longTail.webhooks.WebhooksPage.modal.createTitle') : t('longTail.webhooks.WebhooksPage.modal.editTitle')}
+            </h2>
           </div>
-        </div>
+          {error && (
+            <div className="mb-4 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+              {error}
+            </div>
+          )}
+          <WebhookForm
+            isEditing={modalMode === 'edit'}
+            onSubmit={handleSubmit}
+            onCancel={handleCloseModal}
+            defaultValues={
+              modalMode === 'edit' && selectedWebhook
+                ? transformWebhookToForm(selectedWebhook)
+                : undefined
+            }
+            submitLabel={modalMode === 'create' ? t('longTail.webhooks.WebhooksPage.actions.createWebhook') : t('longTail.webhooks.WebhooksPage.actions.saveChanges')}
+            loading={submitting}
+          />
+        </Dialog>
       )}
 
       {modalMode === 'delete' && selectedWebhook && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/80 px-4 py-8">
-          <div className="w-full max-w-md rounded-lg border bg-card p-6 shadow-xs">
-            <h2 className="text-lg font-semibold">{t('longTail.webhooks.WebhooksPage.delete.title')}</h2>
-            <p className="mt-2 text-sm text-muted-foreground">
-              <Trans
-                i18nKey="longTail.webhooks.WebhooksPage.delete.confirm"
-                ns="common"
-                values={{ name: selectedWebhook.name }}
-                components={{ strong: <span className="font-medium" /> }}
-              />
-            </p>
-            <div className="mt-6 flex justify-end gap-3">
-              <button
-                type="button"
-                onClick={handleCloseModal}
-                className="h-10 rounded-md border px-4 text-sm font-medium text-muted-foreground transition hover:text-foreground"
-              >
-                {t('common:actions.cancel')}
-              </button>
-              <button
-                type="button"
-                onClick={handleConfirmDelete}
-                disabled={submitting}
-                className="inline-flex h-10 items-center justify-center rounded-md bg-destructive px-4 text-sm font-medium text-destructive-foreground transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
-              >
-                {submitting ? t('longTail.webhooks.WebhooksPage.actions.deleting') : t('common:actions.delete')}
-              </button>
-            </div>
+        // Dialog rather than ConfirmDialog: the confirm copy bolds the webhook
+        // name through <Trans>, and ConfirmDialog's message is plain text.
+        <Dialog
+          open
+          onClose={handleCloseModal}
+          title={t('longTail.webhooks.WebhooksPage.delete.title')}
+          labelledBy={DELETE_TITLE_ID}
+          maxWidth="md"
+          className="p-6"
+        >
+          <h2 id={DELETE_TITLE_ID} className="text-lg font-semibold">{t('longTail.webhooks.WebhooksPage.delete.title')}</h2>
+          <p className="mt-2 text-sm text-muted-foreground">
+            <Trans
+              i18nKey="longTail.webhooks.WebhooksPage.delete.confirm"
+              ns="common"
+              values={{ name: selectedWebhook.name }}
+              components={{ strong: <span className="font-medium" /> }}
+            />
+          </p>
+          <div className="mt-6 flex justify-end gap-3">
+            <button
+              type="button"
+              onClick={handleCloseModal}
+              className="h-10 rounded-md border px-4 text-sm font-medium text-muted-foreground transition hover:text-foreground"
+            >
+              {t('common:actions.cancel')}
+            </button>
+            <button
+              type="button"
+              onClick={handleConfirmDelete}
+              disabled={submitting}
+              className="inline-flex h-10 items-center justify-center rounded-md bg-destructive px-4 text-sm font-medium text-destructive-foreground transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {submitting ? t('longTail.webhooks.WebhooksPage.actions.deleting') : t('common:actions.delete')}
+            </button>
           </div>
-        </div>
+        </Dialog>
       )}
     </div>
   );

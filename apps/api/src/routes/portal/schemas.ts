@@ -2,6 +2,7 @@ import { PORTAL_TICKET_COMMENT_MAX_CHARS } from '@breeze/shared';
 import { z } from 'zod';
 import { PORTAL_REPORT_TYPES } from '../../services/portal/reportsSelfService';
 import { PORTAL_RATE_LIMIT_REDIS_KEYS } from '../../services/portal/rateLimit';
+import type { PortalSessionMethod } from './browserSession';
 
 // ============================================
 // Types
@@ -12,6 +13,18 @@ export type PortalSession = {
   portalUserId: string;
   orgId: string;
   authEpoch: number;
+  /**
+   * The sign-in method that minted the session (W3, plan D6). Every mint site
+   * writes it; absent means a pre-W3 session, which `parseStoredPortalSession`
+   * reads as `'password'`, exactly like a Redis payload without the field.
+   */
+  method?: PortalSessionMethod;
+  /**
+   * The org's proven Entra tenant at mint (W4, plan D9). Set for, and only
+   * for, an `entra` session; `parseStoredPortalSession` refuses an entra
+   * session without it.
+   */
+  entraTenantId?: string;
   createdAt: Date;
   expiresAt: Date;
 };
@@ -106,6 +119,10 @@ export const PORTAL_REDIS_KEYS = {
   userSessions: (userId: string) => `portal:user-sessions:${userId}`,
   resetToken: (hash: string) => `portal:reset:${hash}`,
   inviteToken: (hash: string) => `portal:invite:${hash}`,
+  /** Portal OIDC flow state (W4), keyed by sha256(state); TTL 600 s. */
+  oidcState: (hash: string) => `portal:oidc:state:${hash}`,
+  /** Entra tenant proof-run link (W4), keyed by sha256(run token); TTL 72 h. */
+  entraProofRun: (hash: string) => `portal:entra:proof-run:${hash}`,
   rlAttempts: PORTAL_RATE_LIMIT_REDIS_KEYS.attempts,
   rlBlock: PORTAL_RATE_LIMIT_REDIS_KEYS.block,
 };
@@ -150,7 +167,8 @@ export const brandingParamSchema = z.object({
 export const loginSchema = z.object({
   email: z.string().email(),
   password: z.string().min(1),
-  orgId: z.string().guid().optional()
+  orgId: z.string().guid().optional(),
+  unifiedNative: z.boolean().optional()
 });
 
 export const forgotPasswordSchema = z.object({
@@ -212,16 +230,15 @@ export const ticketPrioritySchema = z.enum(['low', 'normal', 'high', 'urgent']);
 // formId is supplied — createTicket composes them from the form (title
 // template + rendered responses). Portal keeps its OWN schema (does not
 // import the shared createTicketSchema) per the Phase 2 plan's global
-// constraints. `priority.default('normal')` is intentionally kept even though
-// a form may carry its own defaultPriority: the portal UI has no per-form
-// priority prefill yet, so the portal's explicit 'normal' wins over the
-// form's default in Phase 2 — acceptable per the design brief; revisit if/when
-// the portal form UI grows a priority prefill.
+// constraints. `priority` has NO schema default (#8883 W5, explicit-choice
+// provenance): the portal form sends it only when the customer chose one, an
+// absent priority lets an intake form's default or a routing rule apply, and
+// createTicket still falls back to 'normal'.
 export const createTicketSchema = z
   .object({
     subject: z.string().min(1).max(255).optional(),
     description: z.string().min(1).optional(),
-    priority: ticketPrioritySchema.optional().default('normal'),
+    priority: ticketPrioritySchema.optional(),
     formId: z.string().guid().optional(),
     formResponses: z.record(z.string(), z.unknown()).optional()
   })
@@ -283,4 +300,31 @@ export const updateProfileSchema = z.object({
 export const changePasswordSchema = z.object({
   currentPassword: z.string().min(1),
   newPassword: z.string().min(8)
+});
+
+// Network Visibility -- GET /network/assets query params (#5861, PR 2 review).
+// assetType espelha os valores do discoveredAssetTypeEnum do pg; mantido como
+// lista literal aqui (schemas.ts nao importa db/schema em nenhum outro lugar)
+// para seguir o estilo auto-contido ja usado neste arquivo.
+export const networkAssetsQuerySchema = z.object({
+  siteId: z.string().guid().optional(),
+  assetType: z.enum([
+    'workstation',
+    'server',
+    'printer',
+    'router',
+    'switch',
+    'firewall',
+    'access_point',
+    'phone',
+    'iot',
+    'camera',
+    'nas',
+    'unknown',
+    'website',
+    'service',
+  ]).optional(),
+  status: z.enum(['online', 'offline', 'unverified']).optional(),
+  page: z.coerce.number().int().min(1).optional(),
+  limit: z.coerce.number().int().min(1).max(500).optional(),
 });

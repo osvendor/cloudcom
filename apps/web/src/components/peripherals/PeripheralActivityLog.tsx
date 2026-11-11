@@ -2,7 +2,9 @@ import { useState, useEffect, useCallback } from "react";
 import { RefreshCw, ChevronLeft, ChevronRight } from "lucide-react";
 import { fetchWithAuth } from "../../stores/auth";
 import { formatDateTime as formatUserDateTime } from "@/lib/dateTimeFormat";
+import { FilterSelect } from "../shared/FilterSelect";
 import { useTranslation } from "react-i18next";
+import { useStableT } from '@/lib/i18n/useStableT';
 
 type PeripheralEvent = {
   id: string;
@@ -12,7 +14,9 @@ type PeripheralEvent = {
   product?: string;
   serialNumber?: string;
   deviceId: string;
+  deviceName?: string | null;
   policyId?: string;
+  policyName?: string | null;
   occurredAt: string;
   details?: Record<string, unknown>;
 };
@@ -41,6 +45,7 @@ export default function PeripheralActivityLog({
   limit: propLimit,
 }: PeripheralActivityLogProps) {
   const { t } = useTranslation("peripherals");
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   const [events, setEvents] = useState<PeripheralEvent[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
@@ -74,7 +79,7 @@ export default function PeripheralActivityLog({
         `/peripherals/activity?${params.toString()}`,
       );
       if (!response.ok)
-        throw new Error(t("peripheralActivityLog.errors.fetch"));
+        throw new Error(stableT("peripheralActivityLog.errors.fetch"));
       const json = await response.json();
       const data = Array.isArray(json.data)
         ? json.data
@@ -87,7 +92,7 @@ export default function PeripheralActivityLog({
       setError(
         err instanceof Error
           ? err.message
-          : t("peripheralActivityLog.errors.generic"),
+          : stableT("peripheralActivityLog.errors.generic"),
       );
     } finally {
       setLoading(false);
@@ -101,7 +106,7 @@ export default function PeripheralActivityLog({
     filterTo,
     limit,
     offset,
-    t,
+    stableT,
   ]);
 
   useEffect(() => {
@@ -117,13 +122,14 @@ export default function PeripheralActivityLog({
     <div className="space-y-4">
       {/* Filter bar */}
       <div className="flex flex-wrap items-center gap-3">
-        <select
+        <FilterSelect
+          label={t("peripheralActivityLog.eventFilterLabel")}
           value={filterEventType}
           onChange={(e) => {
             setFilterEventType(e.target.value);
             setOffset(0);
           }}
-          className="h-9 rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
+          className="h-9"
         >
           <option value="">{t("peripheralActivityLog.allEvents")}</option>
           <option value="connected">
@@ -141,7 +147,7 @@ export default function PeripheralActivityLog({
           <option value="policy_override">
             {t("peripheralActivityLog.events.policy_override")}
           </option>
-        </select>
+        </FilterSelect>
         <input
           value={filterPeripheralType}
           onChange={(e) => {
@@ -252,7 +258,9 @@ export default function PeripheralActivityLog({
                       </span>
                     </td>
                     <td className="px-4 py-3 text-muted-foreground">
-                      {event.peripheralType}
+                      {t(/* i18n-dynamic */ `peripheralPoliciesList.classes.${event.peripheralType}`, {
+                        defaultValue: event.peripheralType,
+                      })}
                     </td>
                     <td className="px-4 py-3 text-muted-foreground">
                       {event.vendor ?? "—"}
@@ -264,14 +272,34 @@ export default function PeripheralActivityLog({
                       {event.serialNumber ?? "—"}
                     </td>
                     {!deviceId && (
-                      <td className="px-4 py-3 font-mono text-xs text-muted-foreground">
-                        {event.deviceId.slice(0, 8)}...
+                      <td className="px-4 py-3 text-xs">
+                        {event.deviceName ? (
+                          <a
+                            href={`/devices/${event.deviceId}`}
+                            className="text-primary hover:underline"
+                            data-testid="peripheral-activity-device-link"
+                          >
+                            {event.deviceName}
+                          </a>
+                        ) : (
+                          <span className="font-mono text-muted-foreground">
+                            {event.deviceId.slice(0, 8)}...
+                          </span>
+                        )}
                       </td>
                     )}
-                    <td className="px-4 py-3 font-mono text-xs text-muted-foreground">
-                      {event.policyId
-                        ? `${event.policyId.slice(0, 8)}...`
-                        : "—"}
+                    <td className="px-4 py-3 text-xs text-muted-foreground">
+                      {event.policyName ? (
+                        <span data-testid="peripheral-activity-policy-name">
+                          {event.policyName}
+                        </span>
+                      ) : event.policyId ? (
+                        <span className="font-mono">
+                          {event.policyId.slice(0, 8)}...
+                        </span>
+                      ) : (
+                        "—"
+                      )}
                     </td>
                   </tr>
                 ))}

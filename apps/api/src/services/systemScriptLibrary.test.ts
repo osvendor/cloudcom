@@ -1,4 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
+import { spawnSync } from 'node:child_process';
 
 const h = vi.hoisted(() => ({
   cuts: [] as Array<{ scriptId: string; provenance: Record<string, unknown> }>,
@@ -139,6 +140,208 @@ describe('SYSTEM_LIBRARY_SCRIPTS definitions', () => {
   });
 });
 
+
+const deleteByName = SYSTEM_LIBRARY_SCRIPTS.find((s) => s.name === 'Delete Printer by Name (Windows)');
+const deleteExcept = SYSTEM_LIBRARY_SCRIPTS.find((s) => s.name === 'Delete All Printers Except Listed (Windows)');
+
+// #8290 - printer cleanup scripts.
+describe('printer cleanup scripts (#8290)', () => {
+  const entries = [
+    ['Delete Printer by Name (Windows)', deleteByName, 'printer_name', 'BREEZE_PARAM_PRINTER_NAME'],
+    ['Delete All Printers Except Listed (Windows)', deleteExcept, 'keep_printers', 'BREEZE_PARAM_KEEP_PRINTERS'],
+  ] as const;
+
+  it('keeps the edition migration first (fixMemory integration test indexes [0])', () => {
+    expect(SYSTEM_LIBRARY_SCRIPTS[0]!.name).toBe('Migrate Agent Edition (Windows)');
+  });
+
+  for (const [name, def, param, env] of entries) {
+    describe(name, () => {
+      it('has the expected dispatch shape and declares its runtime parameter', () => {
+        expect(def).toBeDefined();
+        expect(def!.language).toBe('powershell');
+        expect(def!.osTypes).toEqual(['windows']);
+        expect(def!.runAs).toBe('system');
+        expect(def!.timeoutSeconds).toBe(300);
+        const p = def!.parameters!.find((x) => x.name === param);
+        expect(p).toMatchObject({ type: 'string', required: true, source: 'runtime' });
+        const dry = def!.parameters!.find((x) => x.name === 'dry_run');
+        expect(dry).toMatchObject({ type: 'select', options: 'no,yes', defaultValue: 'no' });
+        expect(def!.parameters).toHaveLength(2);
+      });
+
+      it('reads its parameters from the environment', () => {
+        expect(def).toBeDefined();
+        expect(def!.content).toContain(`$env:${env}`);
+        expect(def!.content).toContain('$env:BREEZE_PARAM_DRY_RUN');
+        expect(scriptParameterEnvName(param)).toBe(env);
+      });
+
+      it('only removes printers - never ports or drivers', () => {
+        expect(def).toBeDefined();
+        expect(def!.content).toContain('Remove-Printer ');
+        expect(def!.content).toContain('Get-Printer');
+        expect(def!.content).not.toMatch(/Remove-PrinterPort/i);
+        expect(def!.content).not.toMatch(/Remove-PrinterDriver/i);
+        expect(def!.content).not.toMatch(/Remove-Item/i);
+        expect(def!.content).toContain("$ErrorActionPreference = 'Stop'");
+        expect(def!.content).toContain('-like');
+      });
+
+      it('exits 1 on a blank parameter, an unavailable spooler, and failed removals', () => {
+        expect(def).toBeDefined();
+        expect(def!.content).toMatch(/exit 1/);
+        expect(def!.content).toMatch(/spooler/i);
+        expect(def!.content).toMatch(/\$failed/);
+      });
+
+      it('documents the SYSTEM-context per-user printer limitation', () => {
+        expect(def).toBeDefined();
+        expect(def!.description).toMatch(/per-user/i);
+      });
+    });
+  }
+
+  it('matches names literally before falling back to wildcards (names may contain [ ])', () => {
+    expect(deleteByName!.content).toContain('($_.Name -ieq $pattern) -or ($_.Name -like $pattern)');
+    expect(deleteExcept!.content).toContain('($p.Name -ieq $k) -or ($p.Name -like $k)');
+  });
+
+  it('by-name: reports no match and exits 0', () => {
+    expect(deleteByName).toBeDefined();
+    expect(deleteByName!.content).toMatch(/no printers matched/i);
+  });
+
+  it('except-listed: refuses an empty keep-list before enumerating or removing anything', () => {
+    expect(deleteExcept).toBeDefined();
+    const c = deleteExcept!.content;
+    const empty = c.search(/Count -eq 0/);
+    expect(empty).toBeGreaterThan(-1);
+    expect(c.indexOf('exit 1', empty)).toBeGreaterThan(empty);
+    expect(empty).toBeLessThan(c.indexOf('Get-Printer'));
+    expect(empty).toBeLessThan(c.indexOf('Remove-Printer '));
+    expect(deleteExcept!.description).toMatch(/Microsoft Print to PDF/);
+  });
+
+  const hasPwsh = spawnSync('pwsh', ['-NoProfile', '-Command', 'exit 0']).status === 0;
+  it.runIf(hasPwsh)('both printer scripts parse without PowerShell syntax errors', () => {
+    expect(deleteByName).toBeDefined();
+    expect(deleteExcept).toBeDefined();
+    for (const def of [deleteByName!, deleteExcept!]) {
+      const r = spawnSync(
+        'pwsh',
+        ['-NoProfile', '-Command', '$e=$null; [void][System.Management.Automation.Language.Parser]::ParseInput([Console]::In.ReadToEnd(), [ref]$null, [ref]$e); if ($e.Count) { $e | ForEach-Object { $_.ToString() }; exit 1 }'],
+        { input: def.content, encoding: 'utf8' },
+      );
+      expect(r.status, `${def.name}: ${r.stdout}${r.stderr}`).toBe(0);
+    }
+  });
+});
+
+// #5016 — the script used to run the whole uninstall -> restore -> install
+// dance inside the agent's own script process. The uninstall stops that agent,
+// and a script cannot outlive its agent: current agents contain every script in
+// a KILL_ON_JOB_CLOSE Job Object (agent/internal/executor/job.go), which the
+// kernel fires the moment the agent process exits — killing the script between
+// the uninstall and the install and leaving the device agent-less. Only a
+// script that EXITS NORMALLY gets its containment released (releaseContainment)
+// so detached descendants survive. So the destructive leg must run in a
+// detached stage 2 that starts only after stage 1 has exited.
+describe('edition migration hand-off to a detached stage 2 (#5016)', () => {
+  const content = () => editionMigration!.content;
+  const stage2 = () => {
+    const c = content();
+    const start = c.indexOf("$stage2Script = @'");
+    const end = c.indexOf("\n'@", start);
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    return c.slice(start, end);
+  };
+  const stage1 = () => content().replace(stage2(), '');
+
+  it('stage 1 (the agent-hosted process) never runs msiexec itself', () => {
+    expect(stage1()).not.toMatch(/msiexec/i);
+    expect(stage2()).toMatch(/'\/x \{0\}/);
+    expect(stage2()).toMatch(/'\/i "\{0\}"/);
+  });
+
+  it('stage 1 launches stage 2 as a separate hidden powershell and exits 0 only after a go marker', () => {
+    const s1 = stage1();
+    expect(s1).toMatch(/Start-Process -FilePath \$psExe/);
+    expect(s1).toContain('-ParentPid');
+    const go = s1.indexOf('Set-Content -LiteralPath $go');
+    expect(go).toBeGreaterThan(-1);
+    // The go marker is the LAST thing stage 1 does before exit 0: stage 2 aborts
+    // (nothing touched) unless stage 1 got all the way through.
+    expect(s1.slice(go)).toMatch(/^Set-Content -LiteralPath \$go[^\n]*\n\s*exit 0/);
+  });
+
+  it('stage 2 waits for stage 1 to exit and checks the go marker before uninstalling', () => {
+    const s2 = stage2();
+    const wait = s2.indexOf('Wait-Process -Id $ParentPid');
+    const goCheck = s2.indexOf('Test-Path -LiteralPath $go');
+    const uninstall = s2.indexOf("'/x {0}");
+    expect(wait).toBeGreaterThan(-1);
+    expect(goCheck).toBeGreaterThan(wait);
+    expect(uninstall).toBeGreaterThan(goCheck);
+  });
+
+  it('stage 2 never writes to stdout/stderr (nothing reads them once the agent is gone)', () => {
+    expect(stage2()).not.toMatch(/Write-(Output|Host|Error|Warning)/);
+  });
+
+  it('stage 2 retries msiexec on 1618 (another installation in progress)', () => {
+    expect(stage2()).toContain('1618');
+  });
+
+  it('stage 2 keeps the identity backup unless the agent is confirmed running', () => {
+    const s2 = stage2();
+    const cleanup = s2.indexOf('Remove-Item -LiteralPath $bak');
+    const running = s2.indexOf("BreezeAgent running'");
+    expect(running).toBeGreaterThan(-1);
+    expect(cleanup).toBeGreaterThan(running);
+  });
+
+  it('stage 1 refuses a work dir owned by anyone but SYSTEM/Administrators (stage 2 runs from it as SYSTEM)', () => {
+    const s1 = stage1();
+    expect(s1).toContain('GetOwner([System.Security.Principal.SecurityIdentifier])');
+    expect(s1).toContain("'S-1-5-18'");
+    expect(s1).toContain("'S-1-5-32-544'");
+  });
+
+  it('stage 1 never re-uses a work dir it did not create or verify, and re-checks it after locking the ACL', () => {
+    const s1 = stage1();
+    // Created without -Force: if something appeared at the path after the
+    // checks (a planted junction), creation fails and the script aborts.
+    expect(s1).toContain('New-Item -ItemType Directory -Path $work -ErrorAction Stop');
+    expect(s1).not.toMatch(/New-Item -ItemType Directory -Force -Path \$work/);
+    // After icacls, the dir and every top-level entry must be a non-link owned
+    // by SYSTEM/Administrators — a child planted before the ACL landed aborts.
+    const lock = s1.indexOf('& icacls $work');
+    const recheck = s1.indexOf('Get-ChildItem -LiteralPath $work -Force');
+    expect(lock).toBeGreaterThan(-1);
+    expect(recheck).toBeGreaterThan(lock);
+  });
+
+  // Parses both stages with the real PowerShell parser when pwsh is on PATH
+  // (developer machines); CI images without pwsh skip it.
+  const hasPwsh = spawnSync('pwsh', ['-NoProfile', '-Command', 'exit 0']).status === 0;
+  it.runIf(hasPwsh)('both stages parse without PowerShell syntax errors', () => {
+    for (const [label, src] of [['stage1', content()], ['stage2', stage2().replace("$stage2Script = @'\n", '')]] as const) {
+      const r = spawnSync(
+        'pwsh',
+        [
+          '-NoProfile',
+          '-Command',
+          '$e=$null; [void][System.Management.Automation.Language.Parser]::ParseInput([Console]::In.ReadToEnd(), [ref]$null, [ref]$e); if ($e.Count) { $e | ForEach-Object { $_.ToString() }; exit 1 }',
+        ],
+        { input: src, encoding: 'utf8' },
+      );
+      expect(r.status, `${label}: ${r.stdout}${r.stderr}`).toBe(0);
+    }
+  });
+});
+
 describe('ensureSystemLibraryScripts', () => {
   beforeEach(() => {
     vi.mocked(db.select).mockReset();
@@ -149,6 +352,18 @@ describe('ensureSystemLibraryScripts', () => {
 
   function mockExisting(rows: Array<Record<string, unknown>>) {
     const limit = vi.fn().mockResolvedValue(rows);
+    const where = vi.fn(() => ({ limit }));
+    const from = vi.fn(() => ({ where }));
+    vi.mocked(db.select).mockReturnValue({ from } as never);
+  }
+
+  // One matching stored row per shipped definition, in sync order (the sync
+  // selects once per definition).
+  function mockExistingAll(first?: Record<string, unknown>) {
+    const limit = vi.fn();
+    SYSTEM_LIBRARY_SCRIPTS.forEach((def, i) => {
+      limit.mockResolvedValueOnce([i === 0 && first ? first : existingRowFor(def)]);
+    });
     const where = vi.fn(() => ({ limit }));
     const from = vi.fn(() => ({ where }));
     vi.mocked(db.select).mockReturnValue({ from } as never);
@@ -169,7 +384,7 @@ describe('ensureSystemLibraryScripts', () => {
     return { set, where };
   }
 
-  function existingRowFor(def: NonNullable<typeof editionMigration>): Record<string, unknown> {
+  function existingRowFor(def: (typeof SYSTEM_LIBRARY_SCRIPTS)[number]): Record<string, unknown> {
     return {
       id: '3f6f0a4e-8c7e-4a6a-9a53-0d1e51f9a001',
       description: def.description,
@@ -206,13 +421,13 @@ describe('ensureSystemLibraryScripts', () => {
   });
 
   it('no-ops when the stored row already matches the definition', async () => {
-    mockExisting([existingRowFor(editionMigration!)]);
+    mockExistingAll();
     const values = mockInsert();
     const { set } = mockUpdate();
 
     const result = await ensureSystemLibraryScripts();
 
-    expect(result.unchanged).toBeGreaterThan(0);
+    expect(result.unchanged).toBe(SYSTEM_LIBRARY_SCRIPTS.length);
     expect(result.created).toBe(0);
     expect(result.updated).toBe(0);
     expect(values).not.toHaveBeenCalled();
@@ -223,7 +438,7 @@ describe('ensureSystemLibraryScripts', () => {
     const stale = existingRowFor(editionMigration!);
     stale.content = '# stale content';
     stale.version = 3;
-    mockExisting([stale]);
+    mockExistingAll(stale);
     const { set } = mockUpdate();
 
     const result = await ensureSystemLibraryScripts();
@@ -256,7 +471,7 @@ describe('ensureSystemLibraryScripts', () => {
   });
 
   it('cuts nothing when every shipped definition is unchanged', async () => {
-    mockExisting([existingRowFor(editionMigration!)]);
+    mockExistingAll();
     mockInsert();
     mockUpdate();
 
@@ -276,7 +491,7 @@ describe('ensureSystemLibraryScripts', () => {
     stale.acknowledgedSecurityPatterns = ['PowerShell HKLM modification'];
     stale.securityAcknowledgedBy = 'someone-who-approved-the-old-body';
     stale.securityAcknowledgedAt = new Date('2026-01-01T00:00:00.000Z');
-    mockExisting([stale]);
+    mockExistingAll(stale);
     const { set } = mockUpdate();
 
     await ensureSystemLibraryScripts();
@@ -299,7 +514,7 @@ describe('ensureSystemLibraryScripts', () => {
     metadataOnly.timeoutSeconds = (editionMigration!.timeoutSeconds ?? 300) + 60;
     metadataOnly.acknowledgedSecurityPatterns = ['PowerShell HKLM modification'];
     metadataOnly.securityAcknowledgedBy = 'admin-who-approved-this-body';
-    mockExisting([metadataOnly]);
+    mockExistingAll(metadataOnly);
     const { set } = mockUpdate();
 
     await ensureSystemLibraryScripts();
@@ -323,7 +538,7 @@ describe('ensureSystemLibraryScripts', () => {
     // sync (that would skip a number and break UNIQUE-backed history).
     const stale = existingRowFor(editionMigration!);
     stale.origin = 'human';
-    mockExisting([stale]);
+    mockExistingAll(stale);
     const values = mockInsert();
     const { set } = mockUpdate();
 
@@ -338,14 +553,14 @@ describe('ensureSystemLibraryScripts', () => {
     expect(values).not.toHaveBeenCalled();
     expect(h.cuts).toEqual([]);
     expect(result.updated).toBeGreaterThan(0);
-    expect(result.unchanged).toBe(0);
+    expect(result.unchanged).toBe(SYSTEM_LIBRARY_SCRIPTS.length - 1);
   });
 
   it('#5948: corrects a stale origin="human" row AND cuts a version when the definition also changed', async () => {
     const stale = existingRowFor(editionMigration!);
     stale.origin = 'human';
     stale.content = '# stale content';
-    mockExisting([stale]);
+    mockExistingAll(stale);
     const { set } = mockUpdate();
 
     await ensureSystemLibraryScripts();
@@ -361,7 +576,7 @@ describe('ensureSystemLibraryScripts', () => {
     const deleted = existingRowFor(editionMigration!);
     deleted.deletedAt = new Date('2026-08-01T00:00:00Z');
     deleted.content = '# stale content';
-    mockExisting([deleted]);
+    mockExistingAll(deleted);
     const values = mockInsert();
     const { set } = mockUpdate();
 

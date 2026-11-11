@@ -97,3 +97,304 @@ func TestAppSearchRunsBeforeLaunchConditionsInBothSequences(t *testing.T) {
 		}
 	}
 }
+
+// HardenProgramDataAcl must set an explicit, trusted owner (SYSTEM) on the
+// Breeze/data/logs ProgramData directories, not just their DACL. A user who
+// pre-creates one of these directories before the MSI runs stays its owner
+// (implicit WRITE_DAC) even after the DACL is replaced, since /inheritance:r
+// /grant:r alone never touches ownership.
+func TestHardenProgramDataAclSetsExplicitOwner(t *testing.T) {
+	wxs := readWxs(t)
+	cmd := quietExecCmd(t, wxs, "HardenProgramDataAcl")
+	// One /setowner per hardened directory (root, data, logs), each ahead of
+	// that directory's /inheritance:r /grant:r in the && chain, so a
+	// pre-created directory's owner is fixed before its DACL is trusted.
+	setOwnerCount := strings.Count(cmd, "/setowner *S-1-5-18")
+	if setOwnerCount < 3 {
+		t.Errorf("expected /setowner *S-1-5-18 (LocalSystem) on all 3 ProgramData directories, found %d occurrences in: %s", setOwnerCount, cmd)
+	}
+	for _, dirToken := range []string{"[ProgramDataBreezeDir]", "[ProgramDataBreezeDataDir]", "[ProgramDataBreezeLogsDir]"} {
+		setOwnerIdx := strings.Index(cmd, "icacls &quot;"+dirToken+".&quot; /setowner")
+		grantIdx := strings.Index(cmd, "icacls &quot;"+dirToken+".&quot; /inheritance:r")
+		if setOwnerIdx == -1 {
+			t.Errorf("%s: no /setowner icacls invocation found", dirToken)
+			continue
+		}
+		if grantIdx == -1 {
+			t.Errorf("%s: no /inheritance:r /grant:r icacls invocation found", dirToken)
+			continue
+		}
+		if setOwnerIdx > grantIdx {
+			t.Errorf("%s: /setowner must run before /inheritance:r /grant:r", dirToken)
+		}
+	}
+}
+
+// customConditions maps each <Custom Action="..."> in InstallExecuteSequence
+// to its Condition attribute ("" when unconditioned).
+func customConditions(t *testing.T, wxs string) map[string]string {
+	t.Helper()
+	tagRe := regexp.MustCompile(`<Custom\s+Action="([^"]+)"[^>]*/>`)
+	condRe := regexp.MustCompile(`\sCondition="([^"]*)"`)
+	out := map[string]string{}
+	for _, m := range tagRe.FindAllStringSubmatch(wxs, -1) {
+		cond := ""
+		if cm := condRe.FindStringSubmatch(m[0]); cm != nil {
+			cond = cm[1]
+		}
+		out[m[1]] = cond
+	}
+	return out
+}
+
+// #4127: re-running the SAME MSI file (same ProductCode) enters Windows
+// Installer maintenance mode, where Installed is true. A `NOT Installed` gate on
+// the enrollment CAs made that retry a silent no-op on a box whose agent never
+// enrolled. The agent itself is idempotent (both `enroll` and `bootstrap` exit 0
+// without contacting the server when agent_id is already set), so the CAs must
+// run on every non-uninstall path.
+func TestEnrollmentActionsRunInMaintenanceMode(t *testing.T) {
+	conds := customConditions(t, readWxs(t))
+	for _, ca := range []string{"EnrollAgent", "BootstrapEnroll"} {
+		c, ok := conds[ca]
+		if !ok {
+			t.Fatalf("no <Custom Action=%q> scheduled", ca)
+		}
+		if strings.Contains(c, "NOT Installed") {
+			t.Errorf("%s condition %q skips maintenance-mode reruns (same-file retry can never enroll)", ca, c)
+		}
+		if !strings.Contains(c, "NOT REMOVE") {
+			t.Errorf("%s condition %q must exclude uninstall (NOT REMOVE)", ca, c)
+		}
+	}
+}
+
+// KillBreezeProcesses stops both services on every non-uninstall run, but in
+// maintenance mode no component changes state, so ServiceControl never starts
+// them again. Without a restart a maintenance rerun (including one that just
+// enrolled the agent) leaves the device offline until reboot.
+func TestMaintenanceRunRestartsServices(t *testing.T) {
+	conds := customConditions(t, readWxs(t))
+	c, ok := conds["RecoverBreezeAfterUpgrade"]
+	if !ok {
+		t.Fatal("no <Custom Action=\"RecoverBreezeAfterUpgrade\"> scheduled")
+	}
+	if !strings.Contains(c, "WIX_UPGRADE_DETECTED") || !strings.Contains(c, "Installed AND NOT REMOVE") {
+		t.Errorf("RecoverBreezeAfterUpgrade condition %q must cover both upgrades and maintenance runs", c)
+	}
+}
+
+// The "already installed" blocks are the dead end an operator hits on retry;
+// the messages must say what to do next, not just what is wrong.
+func TestAlreadyInstalledMessagesGiveNextStep(t *testing.T) {
+	wxs := readWxs(t)
+	dm := regexp.MustCompile(`DowngradeErrorMessage="([^"]*)"`).FindStringSubmatch(wxs)
+	if dm == nil {
+		t.Fatal("no DowngradeErrorMessage")
+	}
+	em := regexp.MustCompile(`<Launch\s+Condition="NOT OTHEREDITIONFOUND"\s+Message="([^"]*)"`).FindStringSubmatch(wxs)
+	if em == nil {
+		t.Fatal("no cross-edition launch condition")
+	}
+	for name, msg := range map[string]string{"downgrade": dm[1], "cross-edition": em[1]} {
+		if !strings.Contains(msg, "Uninstall") || !strings.Contains(msg, "installer") {
+			t.Errorf("%s message %q must tell the operator to uninstall first or get the right installer", name, msg)
+		}
+	}
+	if !strings.Contains(dm[1], "current installer") {
+		t.Errorf("downgrade message %q must point at the current installer", dm[1])
+	}
+}
+
+// customActionAttrs returns the attributes of the <CustomAction Id="id" .../>
+// element as a map, or nil when no such element exists.
+func customActionAttrs(wxs, id string) map[string]string {
+	elRe := regexp.MustCompile(`(?s)<CustomAction\s+Id="` + regexp.QuoteMeta(id) + `"(.*?)/>`)
+	m := elRe.FindStringSubmatch(wxs)
+	if m == nil {
+		return nil
+	}
+	out := map[string]string{"Id": id}
+	for _, a := range regexp.MustCompile(`(\w+)="([^"]*)"`).FindAllStringSubmatch(m[1], -1) {
+		out[a[1]] = a[2]
+	}
+	return out
+}
+
+// #3624: an immediate EXE custom action runs impersonated on the installing
+// user's desktop, and Windows Installer launches it with no CREATE_NO_WINDOW,
+// so a console-subsystem cmd.exe got a visible black window. KillBreezeProcesses
+// includes a conditional ~3s wait for the graceful `sc stop`, so the window sat
+// on screen through every upgrade over a running agent. It must stay immediate
+// and before InstallValidate (files-in-use check, #944), so the fix is to launch
+// the same command through WixQuietExec, which spawns it with no window.
+func TestKillBreezeProcessesRunsWithoutConsoleWindow(t *testing.T) {
+	wxs := readWxs(t)
+	ca := customActionAttrs(wxs, "KillBreezeProcesses")
+	if ca == nil {
+		t.Fatal("no <CustomAction Id=\"KillBreezeProcesses\">")
+	}
+	if _, ok := ca["ExeCommand"]; ok {
+		t.Errorf("KillBreezeProcesses is an EXE custom action (ExeCommand); an immediate EXE CA flashes a console window on the user's desktop")
+	}
+	if ca["DllEntry"] != "WixQuietExec" {
+		t.Errorf("KillBreezeProcesses DllEntry = %q, want WixQuietExec (runs the command with no console window)", ca["DllEntry"])
+	}
+	if !strings.HasPrefix(ca["BinaryRef"], "Wix4UtilCA_") {
+		t.Errorf("KillBreezeProcesses BinaryRef = %q, want the WiX Util extension CA DLL (Wix4UtilCA_*)", ca["BinaryRef"])
+	}
+	// Timing is load-bearing: the processes must be dead before
+	// InstallValidate's files-in-use check, which a deferred CA cannot do.
+	if ca["Execute"] != "immediate" {
+		t.Errorf("KillBreezeProcesses Execute = %q, want immediate (a deferred CA runs after InstallValidate, reintroducing #944)", ca["Execute"])
+	}
+	if ca["Return"] != "ignore" {
+		t.Errorf("KillBreezeProcesses Return = %q, want ignore (best-effort; a fresh box has nothing to stop)", ca["Return"])
+	}
+	if !regexp.MustCompile(`<Custom\s+Action="KillBreezeProcesses"\s+Before="InstallValidate"\s+Condition="NOT REMOVE"\s*/>`).MatchString(wxs) {
+		t.Error(`KillBreezeProcesses must stay scheduled Before="InstallValidate" with Condition="NOT REMOVE"`)
+	}
+
+	// Immediate-mode WixQuietExec reads its command line from the
+	// WixQuietExecCmdLine property, which must be set before the CA runs.
+	setRe := regexp.MustCompile(`(?s)<SetProperty\s+Id="WixQuietExecCmdLine"\s+Value="([^"]*)"\s+Before="KillBreezeProcesses"\s+Sequence="execute"\s*/>`)
+	sm := setRe.FindStringSubmatch(wxs)
+	if sm == nil {
+		t.Fatal(`expected <SetProperty Id="WixQuietExecCmdLine" Value="..." Before="KillBreezeProcesses" Sequence="execute" />`)
+	}
+	cmd := sm[1]
+	for _, want := range []string{
+		`[System64Folder]cmd.exe`,
+		// disarm SCM recovery before anything dies (no resurrection race)
+		`sc failure BreezeWatchdog reset= 0 actions=`,
+		`sc failure BreezeAgent reset= 0 actions=`,
+		// graceful stops, watchdog first
+		`sc stop BreezeWatchdog`,
+		`sc stop BreezeAgent`,
+		// the conditional wait must survive: dropping it force-kills a live agent
+		`findstr &quot;PENDING RUNNING&quot;`,
+		`ping -n 4 127.0.0.1`,
+		`taskkill /F /IM breeze-agent.exe`,
+		`exit /b 0`,
+	} {
+		if !strings.Contains(cmd, want) {
+			t.Errorf("WixQuietExecCmdLine lost %q; got %q", want, cmd)
+		}
+	}
+	if strings.Contains(cmd, "taskkill /F /T") || strings.Contains(cmd, " /T ") {
+		t.Errorf("taskkill must not use /T (kills the msiexec performing the install when deployed via Breeze scripts); got %q", cmd)
+	}
+	if strings.Contains(wxs, "BREEZE_KILL_CMD") {
+		t.Error("BREEZE_KILL_CMD is dead once KillBreezeProcesses runs through WixQuietExec; remove it")
+	}
+}
+
+// The Util extension supplies the WixQuietExec CA DLL (Wix4UtilCA_*). Every
+// MSI build (this repo's release.yml, the hosted and self-host signing repos)
+// goes through build-msi.ps1, so that script must load the extension or the
+// link fails with an unresolved BinaryRef.
+func TestBuildScriptLoadsUtilExtension(t *testing.T) {
+	b, err := os.ReadFile("build-msi.ps1")
+	if err != nil {
+		t.Fatalf("read build-msi.ps1: %v", err)
+	}
+	s := string(b)
+	if !strings.Contains(s, `"-ext"`) || !strings.Contains(s, "WixToolset.Util.wixext") {
+		t.Error("build-msi.ps1 must pass -ext WixToolset.Util.wixext to wix build")
+	}
+	if !strings.Contains(s, "extension add") {
+		t.Error("build-msi.ps1 must install WixToolset.Util.wixext (wix extension add) so callers need no extra setup step")
+	}
+}
+
+// A standard user can create C:\ProgramData\Breeze (and, inside it, data or
+// logs) before the MSI runs, including as a junction or symbolic link to a
+// folder the user owns. icacls on such a path changes only the link object,
+// so HardenProgramDataAcl must remove a pre-existing link (the link itself,
+// never its target) and create a real directory before setting the owner
+// and DACL. The root must be settled first so no child link can be
+// re-created under a root the user still controls.
+func TestHardenProgramDataAclReplacesPreexistingLinks(t *testing.T) {
+	wxs := readWxs(t)
+	cmd := quietExecCmd(t, wxs, "HardenProgramDataAcl")
+	q := func(tok string) string { return "&quot;" + tok + ".&quot;" }
+
+	prevGrant := -1
+	for _, dirToken := range []string{"[ProgramDataBreezeDir]", "[ProgramDataBreezeDataDir]", "[ProgramDataBreezeLogsDir]"} {
+		query := strings.Index(cmd, "fsutil reparsepoint query "+q(dirToken))
+		remove := strings.Index(cmd, "rmdir "+q(dirToken))
+		mkdir := strings.Index(cmd, "mkdir "+q(dirToken))
+		setOwner := strings.Index(cmd, "icacls "+q(dirToken)+" /setowner")
+		grant := strings.Index(cmd, "icacls "+q(dirToken)+" /inheritance:r")
+		if query == -1 || remove == -1 || mkdir == -1 || setOwner == -1 || grant == -1 {
+			t.Errorf("%s: expected a reparse-point query, rmdir, mkdir, /setowner and /grant:r, got query=%d rmdir=%d mkdir=%d setowner=%d grant=%d", dirToken, query, remove, mkdir, setOwner, grant)
+			continue
+		}
+		if query >= remove || remove >= mkdir || mkdir >= setOwner || setOwner >= grant {
+			t.Errorf("%s: order must be query -> rmdir -> mkdir -> /setowner -> /grant:r, got %d %d %d %d %d", dirToken, query, remove, mkdir, setOwner, grant)
+		}
+		if query < prevGrant {
+			t.Errorf("%s: must be handled after the previous directory is fully hardened", dirToken)
+		}
+		prevGrant = grant
+	}
+	// Removing a link must never recurse into, or delete files in, its target.
+	for _, banned := range []string{"rmdir /s", "rd /s", "del "} {
+		if strings.Contains(strings.ToLower(cmd), banned) {
+			t.Errorf("HardenProgramDataAcl must not use %q: it would act on the link target", banned)
+		}
+	}
+}
+
+// TestRecoveryActionsAlsoCoverNonCrashFailures: every custom action that
+// arms the services' restart-on-failure actions also sets the failure-actions
+// flag, so a service that stops with an error exit code (not only one that
+// crashes) is restarted too.
+func TestRecoveryActionsAlsoCoverNonCrashFailures(t *testing.T) {
+	wxs := readWxs(t)
+	for _, id := range []string{"ConfigureBreezeFailureActions", "RollbackServiceRecovery", "RecoverBreezeAfterUpgrade"} {
+		ca := customActionAttrs(wxs, id)
+		if ca == nil {
+			t.Fatalf("no <CustomAction Id=%q>", id)
+		}
+		cmd := quietExecCmd(t, wxs, id)
+		for _, svc := range []string{"BreezeAgent", "BreezeWatchdog"} {
+			if !strings.Contains(cmd, "sc failure "+svc+" reset= 86400 actions= restart/") {
+				t.Errorf("%s does not arm %s's restart actions: %s", id, svc, cmd)
+			}
+			if !strings.Contains(cmd, "sc failureflag "+svc+" 1") {
+				t.Errorf("%s arms %s's restart actions without `sc failureflag %s 1`", id, svc, svc)
+			}
+		}
+	}
+}
+
+func TestIsolationReleaseOnUninstall(t *testing.T) {
+	wxs := readWxs(t)
+	const id = "IsolationReleaseOnUninstall"
+	// A never-isolated device has no isolation journal (the agent writes one
+	// only once an episode or recovery exists), so uninstall proceeds without
+	// running the agent at all; this also covers a binary raw-swapped to a
+	// build that predates release-all. When a journal (or a set-aside corrupt
+	// one) exists, release-all must succeed: a crashing, blocked or outdated
+	// binary fails the uninstall instead of removing the agent while
+	// Breeze-owned filters may remain.
+	const want = "&quot;[System64Folder]cmd.exe&quot; /c (if not exist &quot;[ProgramDataBreezeDataDir]isolation.json&quot; if not exist &quot;[ProgramDataBreezeDataDir]isolation.json.corrupt&quot; exit /b 0) &amp; &quot;[#filBreezeAgentExe]&quot; containment release-all --reason uninstall"
+	if got := quietExecCmd(t, wxs, id); got != want {
+		t.Fatalf("release command = %q\nwant            %q", got, want)
+	}
+	attrs := customActionAttrs(wxs, id)
+	for key, want := range map[string]string{"DllEntry": "WixQuietExec", "Execute": "deferred", "Impersonate": "no", "Return": "check"} {
+		if attrs[key] != want {
+			t.Errorf("%s = %q, want %q", key, attrs[key], want)
+		}
+	}
+	if !regexp.MustCompile(`<Custom\s+Action="IsolationReleaseOnUninstall"\s+Before="RemoveFiles"\s+Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE"\s*/>`).MatchString(wxs) {
+		t.Error("release must run before RemoveFiles only on full uninstall, never nested upgrade removal")
+	}
+	// The server must not be told "uninstalled" by a run whose release then
+	// fails and rolls the uninstall back.
+	if !regexp.MustCompile(`<Custom\s+Action="UninstallNotify"\s+After="IsolationReleaseOnUninstall"\s+Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE"\s*/>`).MatchString(wxs) {
+		t.Error("UninstallNotify must run after IsolationReleaseOnUninstall")
+	}
+}

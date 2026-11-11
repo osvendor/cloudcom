@@ -62,7 +62,7 @@ func TestProcessCommandSecurityThreatRemoveSubmitsCompletedResult(t *testing.T) 
 	}))
 	defer ts.Close()
 
-	h := NewWithVersion(&config.Config{
+	h := newTestHeartbeatWithVersion(&config.Config{
 		AgentID:   "agent-1",
 		ServerURL: ts.URL,
 		AuthToken: "token",
@@ -124,7 +124,7 @@ func TestProcessCommandSecurityThreatRestoreSubmitsFailedResult(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	h := NewWithVersion(&config.Config{
+	h := newTestHeartbeatWithVersion(&config.Config{
 		AgentID:   "agent-1",
 		ServerURL: ts.URL,
 		AuthToken: "token",

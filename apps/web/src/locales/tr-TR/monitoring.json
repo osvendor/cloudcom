@@ -8,6 +8,11 @@
     "monitorLabel": "Monitör"
   },
   "list": {
+    "views": {
+      "ariaLabel": "Monitör görünümleri",
+      "all": "Tüm monitörler",
+      "needsConversion": "Dönüştürme gerekiyor"
+    },
     "title": "Monitörler",
     "description": "Bir koşulu izleyin, cihazda yanıt verin, bildirin ve tekrarlamaya devam ederse yükseltin.",
     "new": "Yeni monitör",
@@ -32,7 +37,48 @@
     },
     "deleteConfirm": "{{name}} monitörü silinsin mi? Uyarı kuralı ve yanıt otomasyonu da kaldırılır.",
     "builtIn": "Yerleşik",
-    "builtInHint": "Breeze tarafından sağlandı. Eşikleri düzenleyin, devre dışı bırakın veya silin; geri gelmez."
+    "builtInHint": "Breeze tarafından sağlandı. Eşikleri düzenleyin, devre dışı bırakın veya silin; geri gelmez.",
+    "recommended": {
+      "title": "Önerilenler",
+      "description": "Yerleşik monitörleri bir ilkeye ekleyin."
+    }
+  },
+  "lifecycle": {
+    "autoResolveOn": "Açık",
+    "autoResolveOff": "Kapalı",
+    "rearmLabel": "Yeniden etkinleştirme",
+    "rearmNewEvidence": "Yeni kanıt",
+    "rearmAfterDelay": "N dakika sonra",
+    "rearmAfterMinutes_one": "{{count}} dakika sonra",
+    "rearmAfterMinutes_other": "{{count}} dakika sonra",
+    "rearmDelayLabel": "Şu süre sonra yeniden etkinleştir (dakika)",
+    "rearmHelp": "Yeni kanıt: kapatılmış uyarıyı yalnızca onun henüz görmediği bir olay yeniden açar. N dakika sonra: kapanmasından itibaren N dakika geçtikten sonra daha eski olaylar da onu yeniden açabilir.",
+    "inheritOption": "Devral ({{value}}, {{source}})",
+    "inheritOptionPlain": "Devral",
+    "sources": {
+      "org": "Kuruluş varsayılanı",
+      "partner": "İş ortağı varsayılanı",
+      "builtin": "Yerleşik varsayılan"
+    },
+    "errors": {
+      "cooldown": "0 ile 1440 arasında bir tam sayı girin.",
+      "cooldownOrInherit": "0 ile 1440 arasında bir tam sayı girin veya devralmak için boş bırakın.",
+      "rearmDelay": "1 ile 1440 arasında tam sayı olarak dakika girin."
+    }
+  },
+  "lifecycleDefaults": {
+    "title": "Yaşam döngüsü varsayılanları",
+    "descriptionPartner": "Tüm kuruluşların monitörleri için varsayılan. Bir kuruluş bunu geçersiz kılabilir; bir monitörün kendi ayarı her ikisinden de önceliklidir.",
+    "descriptionOrg": "Bu kuruluş için iş ortağı varsayılanını geçersiz kılar. Devralmak için bir alanı boş bırakın. Bir monitörün kendi ayarı bundan önceliklidir.",
+    "readOnly": "İş ortağı varsayılanını değiştirme izniniz yok.",
+    "saved": "Yaşam döngüsü varsayılanları kaydedildi",
+    "saveAction": "Varsayılanları kaydet",
+    "overrideCount_one": "{{count}} monitör bunu geçersiz kılıyor",
+    "overrideCount_other": "{{count}} monitör bunu geçersiz kılıyor",
+    "errors": {
+      "load": "Yaşam döngüsü varsayılanları yüklenemedi.",
+      "save": "Yaşam döngüsü varsayılanları kaydedilemedi."
+    }
   },
   "editor": {
     "attachedToPolicy": "Monitör oluşturuldu ve ilkeye bağlandı",
@@ -44,11 +90,22 @@
     },
     "sections": {
       "watch": "Ne izlenecek",
-      "noise": "Önem ve gürültü",
+      "lifecycle": "Uyarı yaşam döngüsü",
       "respond": "Yanıtla",
       "notify": "Bildir",
       "escalate": "Bir kişiye yükselt",
       "deployed": "Dağıtıldığı yer"
+    },
+    "lifecycle": {
+      "overrides": {
+        "org": "Bu monitör, kuruluş varsayılanını ({{value}}) geçersiz kılıyor",
+        "partner": "Bu monitör, iş ortağı varsayılanını ({{value}}) geçersiz kılıyor",
+        "builtin": "Bu monitör, yerleşik varsayılanı ({{value}}) geçersiz kılıyor",
+        "unknown": "Bu monitör, devralınan varsayılanı geçersiz kılıyor."
+      },
+      "partnerWideHint": "Kendi varsayılanı olan bir kuruluş, burada gösterilen devralınan değer yerine onu kullanır.",
+      "inheritedUnavailable": "Devralınan değerler yüklenemedi. Yine de kaydedebilirsiniz.",
+      "windowWarning": "Olay penceresi ({{window}} dk), bekleme süresinden ({{cooldown}} dk) kısa. Bekleme süresi sırasında gelen yeni bir olay, uyarı yeniden açılmadan önce pencereden çıkabilir."
     },
     "tabs": {
       "settings": "Ayarlar",
@@ -68,7 +125,8 @@
       "recurrenceThreshold": "Şu kadar sonra yükselt",
       "recurrenceWindowDays": "olay, şu gün içinde (gün)",
       "pauseResponses": "Bir kişi sıfırlayana kadar otomatik yanıtları duraklat",
-      "aiAgent": "Yapay zeka aracısı (yapay zeka triyaj yanıtlarını etkinleştirir)"
+      "aiAgent": "Yapay zeka aracısı (yapay zeka triyaj yanıtlarını etkinleştirir)",
+      "psaBoard": "Uyarı ticket’ları için PSA panosu"
     },
     "deliveryModes": {
       "inherit": "Yönlendirme kurallarını kullan",
@@ -88,14 +146,18 @@
       "create": "Monitör oluştur",
       "test": "Bir cihazda test et",
       "deploy": "Şuraya dağıt…",
-      "delete": "Sil"
+      "delete": "Sil",
+      "backToMonitors": "Monitörlere Dön"
     },
     "errors": {
       "load": "Monitör yüklenemedi",
       "save": "Monitör kaydedilemedi",
       "delete": "Monitör silinemedi",
       "test": "Test başarısız oldu",
-      "generic": "Bir şeyler ters gitti"
+      "generic": "Bir şeyler ters gitti",
+      "invalidCondition": "Bazı koşul değerleri eksik veya aralık dışında. Hiçbir şey kaydedilmedi.",
+      "invalidResponses": "Bazı yanıt ayarları eksik veya aralık dışında. Hiçbir şey kaydedilmedi.",
+      "restartServiceRequiresName": "Hizmeti yeniden başlatmak bir hizmet adı gerektirir."
     },
     "saved": "Monitör kaydedildi",
     "deleted": "Monitör silindi",
@@ -109,7 +171,8 @@
     "testDialog": {
       "title": "Bir cihazda test et",
       "selectDevice": "Cihaz",
-      "run": "Testi çalıştır"
+      "run": "Testi çalıştır",
+      "saveToTest": "Değişikliklerinizi test etmek için kaydedin"
     },
     "deliveryPreview": {
       "selectOrg": "Teslimatı önizlemek için bir kuruluş seçin.",
@@ -139,6 +202,40 @@
         "disabled": "devre dışı",
         "unavailable": "kullanılamıyor"
       }
+    },
+    "composite": {
+      "children": "Alt koşullar",
+      "add": "Koşul ekle",
+      "matchLabel": "Eşleşme"
+    },
+    "restart": {
+      "label": "Cihazdaki hizmeti yeniden başlat",
+      "maxAttempts": "En fazla yeniden başlatma denemesi",
+      "cooldownSeconds": "Yeniden başlatma bekleme süresi (saniye)"
+    },
+    "networkCheckAsset": {
+      "label": "Varlık",
+      "unbound": "Bağlı varlık yok",
+      "failed": "Varlıklar yüklenemedi",
+      "orgRequired": "Varlık bağlamak için kuruluş sahipliğini seçin.",
+      "pingName": "{{label}} için ping"
+    },
+    "psaBoardDefault": "Bağlantının varsayılan panosunu kullan",
+    "psaBoardHelp": "Bu monitörün uyarı ticket’ları, bağlantının varsayılan panosu yerine bu panoda oluşturulur.",
+    "psaBoardReadOnly": "Uyarı ticket’ları PSA panosu #{{id}} içine gider",
+    "psaBoardUnavailable": "PSA panoları yüklenemedi, bu nedenle pano geçersiz kılma şu anda kullanılamıyor.",
+    "clearsWhen": {
+      "title": "Şu durumda temizlenir",
+      "hint": "Yalnızca uyarıyı tetikleyen olaydan sonra kaydedilen bir olayla temizlenir.",
+      "noneHint": "Kurtarma koşulu ayarlanmadı; tetikleyici eşleşmeyi bıraktığında uyarı temizlenir.",
+      "add": "Kurtarma koşulu ekle",
+      "removeCondition": "Kaldır",
+      "keepCustom": "Özel koşulu koru",
+      "customTitle": "Özel kurtarma koşulu (API)",
+      "customHint": "Bu koşul API üzerinden ayarlandı ve burada düzenlenemez. Kaydetmek onu olduğu gibi korur.",
+      "replaceCustom": "Değiştir",
+      "invalid": "Kurtarma koşulunun değerlerinden biri geçerli değil.",
+      "customUnusable": "Bu koşul değerlendirilemiyor, bu nedenle bu monitörün uyarıları otomatik olarak çözülmeyecek. Düzeltmek için koşulu değiştirin."
     }
   },
   "kinds": {
@@ -160,7 +257,10 @@
     "software_presence": "Yazılım varlığı",
     "backup_continuity": "Yedekleme sürekliliği",
     "script": "Betik denetimi",
-    "network_check": "Ağ denetimi"
+    "network_check": "Ağ denetimi",
+    "hardware_health": "Donanım sağlığı",
+    "time_sync": "Saat eşitleme",
+    "container_image_currency": "Kapsayıcı imajı güncelliği"
   },
   "fields": {
     "operator": "Karşılaştırma",
@@ -201,7 +301,20 @@
     "port": "Bağlantı noktası",
     "expectStatus": "Beklenen durum kodu",
     "pollingIntervalSeconds": "Şu sıklıkta sorgula (saniye)",
-    "match": "Eşleşme"
+    "match": "Eşleşme",
+    "pingCount": "Yankı istekleri",
+    "expectBanner": "Beklenen banner",
+    "httpMethod": "HTTP yöntemi",
+    "expectedBody": "Yanıt şunu içermeli",
+    "followRedirects": "Yönlendirmeleri izle",
+    "verifySsl": "TLS sertifikasını doğrula",
+    "recordType": "Kayıt türü",
+    "expectedValue": "Beklenen değer",
+    "nameserver": "Ad sunucusu",
+    "degradedIsFailure": "Bozulmuşu hata say",
+    "maxResponseMs": "Şundan yavaşsa başarısız (ms)",
+    "eventLogCollectionNoSource": "Bilgi ve Uyarı düzeyindeki Uygulama olayları yalnızca {{providers}} sağlayıcılarından toplanır. Diğer kaynakların olayları, kaynak bir Olay Günlükleri yapılandırma ilkesinde listelenmedikçe yalnızca Hata veya Kritik düzeyinde bu kuralla eşleşir (Yapılandırma ilkesi → Olay Günlükleri → Uygulama sağlayıcıları).",
+    "eventLogCollectionSourceNotCollected": "Aracı, \"{{source}}\" kaynağından Bilgi veya Uyarı düzeyindeki Uygulama olaylarını, kaynak bir Olay Günlükleri yapılandırma ilkesinde listelenmedikçe toplamaz (Yapılandırma ilkesi → Olay Günlükleri → Uygulama sağlayıcıları). Aksi takdirde bu kural yalnızca kaynağın Hata veya Kritik olaylarıyla eşleşir. Yerleşik sağlayıcılar: {{providers}}."
   },
   "operators": {
     "gt": "büyüktür",
@@ -225,6 +338,7 @@
     "system": "Sistem"
   },
   "eventLevels": {
+    "info": "Bilgi",
     "warning": "Uyarı",
     "error": "Hata",
     "critical": "Kritik"
@@ -257,7 +371,8 @@
   },
   "backupChecks": {
     "no_successful_backup": "Başarılı yedekleme yok",
-    "consecutive_failures": "Ardışık hatalar"
+    "consecutive_failures": "Ardışık hatalar",
+    "completed_with_errors": "Dosya hatalarıyla tamamlandı"
   },
   "checkTypes": {
     "icmp_ping": "ICMP ping testi",
@@ -275,6 +390,7 @@
       "device_group": "bir cihaz grubu"
     },
     "selectPolicy": "Yapılandırma politikası",
+    "attachToPolicy": "Politikaya ekle…",
     "selectTarget": "Hedef",
     "noOrgSelected": "Dağıtılacak bir kuruluş seçin.",
     "policyName": "Politika adı",
@@ -283,9 +399,13 @@
     "cancel": "İptal",
     "detachConfirm": "{{policy}} politikasından kaldırılsın mı?",
     "errors": {
+      "loadGroups": "Cihaz grupları yüklenemedi.",
       "attach": "Monitör eklenemedi",
-      "detach": "Monitör kaldırılamadı"
-    }
+      "detach": "Monitör kaldırılamadı",
+      "linkedFeature": "Bu ilkenin monitörleri paylaşılan bir özellik ilkesinden geliyor. O ilkeyi düzenleyin veya başka bir ilke seçin."
+    },
+    "partnerWideGroups": "Tüm kuruluşlar (iş ortağı genelinde)",
+    "organizationGroups": "Kuruluş grupları"
   },
   "policyTab": {
     "title": "Monitörler",
@@ -313,7 +433,7 @@
   "legacy": {
     "title": "Eski uyarı kuralları",
     "description": "Bir monitör tarafından yönetilmeyen bağımsız uyarı kuralları. Yanıtları, teslimatı ve yükseltmeyi bir arada almak için bunları dönüştürün.",
-    "empty": "Eski kural yok.",
+    "empty": "Dönüştürülmesi gereken bağımsız uyarı kuralı yok.",
     "columns": {
       "name": "Ad",
       "template": "Şablon",
@@ -324,9 +444,30 @@
     "convert": "Monitöre dönüştür",
     "converted": "Dönüştürüldü",
     "notConvertible": "Bu kuralın koşulları tek bir monitör olarak ifade edilemez.",
+    "systemManaged": "Sistem tarafından yönetilen kural. Breeze bu uyarıyı kendisi oluşturur, bu nedenle dönüştürülecek bir şey yoktur.",
     "errors": {
       "fetch": "Uyarı kuralları yüklenemedi",
       "convert": "Kural dönüştürülemedi"
+    }
+  },
+  "builtInRules": {
+    "title": "Yerleşik uyarılar",
+    "description": "Breeze'in kendisinin oluşturduğu uyarılar. Bir uyarıyı kendi kuruluşu için durdurmak üzere kapatın; zaten açık olan uyarılar siz çözene kadar açık kalır.",
+    "columns": {
+      "name": "Ad",
+      "organization": "Kuruluş",
+      "active": "Etkin"
+    },
+    "kinds": {
+      "policyViolation": "İlke ihlalleri: {{subject}}",
+      "configCompliance": "Yapılandırma uyumluluğu: {{subject}}"
+    },
+    "toggle": "{{name}} uyarısını aç veya kapat",
+    "switchedOn": "{{name}} açıldı",
+    "switchedOff": "{{name}} kapatıldı",
+    "errors": {
+      "fetch": "Yerleşik uyarılar yüklenemedi",
+      "toggle": "Yerleşik uyarı güncellenemedi"
     }
   },
   "devices": {
@@ -385,5 +526,218 @@
         "skippedNoResponse": "Atlandı (yanıt yapılandırılmadı)"
       }
     }
+  },
+  "conversion": {
+    "banner": {
+      "rowsCount_one": "{{count}} eski kural",
+      "rowsCount_other": "{{count}} eski kural",
+      "policiesCount_one": "{{count}} ilke",
+      "policiesCount_other": "{{count}} ilke",
+      "text": "{{policies}}deki {{rows}} henüz monitöre dönüştürülmedi.",
+      "review": "İncele",
+      "convertEverything": "Tümünü dönüştür…",
+      "confirmTitle": "Tüm ilkelerinizdeki her eski kural, izleme ve uyarıyla tetiklenen otomasyon dönüştürülsün mü?",
+      "confirmBody": "İş ortağının tümünde {{policies}}de {{rows}}. Dönüştürülen satırlar yerinde emekliye ayrılır. Diğerleri şimdi inceleme veya elle emekliye ayırma için kalır; gelecekteki bir sürüm kalanları dönüştürür ve dönüştürülemeyenleri emekliye ayırır.",
+      "confirmRun": "Tümünü dönüştür",
+      "convertedAll": "{{policies}}de {{rows}} dönüştürüldü; {{unconvertible}} dönüştürülemedi.",
+      "errors": {
+        "convertAll": "Tümü dönüştürülemedi"
+      }
+    },
+    "pendingPolicies": {
+      "title": "Eski kuralları olan ilkeler",
+      "loading": "İlkeler yükleniyor…",
+      "empty": "Hiçbir ilke satır içi uyarı kuralı, izleme veya uyarıyla tetiklenen otomasyon taşımıyor.",
+      "error": "Eski kurallara sahip ilkeler yüklenemedi. Yeniden denemek için yenileyin."
+    },
+    "title": "Dönüştürme gerekiyor",
+    "description": "Bu ilkedeki satır içi uyarı kuralları, hizmet/süreç izlemeleri ve uyarıyla tetiklenen otomasyonlar henüz monitöre dönüştürülmedi. Dönüştürme, kaynak satırı yerinde emekliye ayırır; hiçbir şey silinmez.",
+    "checking": "Cihazlar kontrol ediliyor…",
+    "devicesChecked_one": "{{count}} cihaz aynı davranış için kontrol edildi.",
+    "devicesChecked_other": "{{count}} cihaz aynı davranış için kontrol edildi.",
+    "blocked": {
+      "parent_unconverted": "Önce üst ilkeyi dönüştürün — satır içi kuralları bu ilkenin neyi devralacağını belirler.",
+      "prerequisite_missing": "Ön koşul olan bir düzeltme bu sunucuda henüz dağıtılmadı. Dönüştürme o zamana kadar devre dışı."
+    },
+    "refusedTitle_one": "Dönüştürme reddedildi: {{count}} cihazın davranışı değişirdi.",
+    "refusedTitle_other": "Dönüştürme reddedildi: {{count}} cihazın davranışı değişirdi.",
+    "convert": "Dönüştür",
+    "convertAll_one": "{{count}} dönüştürülebiliri dönüştür",
+    "convertAll_other": "{{count}} dönüştürülebilirin tümünü dönüştür",
+    "retire": "Emekliye ayır",
+    "converted": "{{rows}} eski satır {{monitors}} monitöre dönüştürüldü.",
+    "retired": "{{name}} emekliye ayrıldı.",
+    "undone_one": "{{count}} dönüştürme geri alındı.",
+    "undone_other": "{{count}} dönüştürme geri alındı.",
+    "openAlerts_one": "{{count}} açık uyarı monitöre taşınıyor",
+    "openAlerts_other": "{{count}} açık uyarı monitöre taşınıyor",
+    "sourceTables": {
+      "config_policy_alert_rules": "Satır içi uyarı kuralı",
+      "config_policy_monitoring_watches": "Hizmet/süreç izleme",
+      "alert_templates": "Uyarı şablonu",
+      "automations": "Uyarıyla tetiklenen otomasyon",
+      "config_policy_automations": "İlke otomasyonu",
+      "network_monitors": "Ağ denetimi"
+    },
+    "outcomes": {
+      "convertible": "Dönüştürülebilir",
+      "unconvertible": "Dönüştürülemez"
+    },
+    "roles": {
+      "primary": "Monitör",
+      "resource_cpu": "CPU monitörü",
+      "resource_memory": "Bellek monitörü",
+      "response": "Yanıt"
+    },
+    "reasons": {
+      "unknown": "Dönüştürülemez ({{code}}).",
+      "nested_group": "Kural, koşul gruplarını iç içe kullanıyor; bileşik bir monitör tek bir düz gruptur.",
+      "no_condition": "Şablonun değerlendirilebilir bir koşulu yok ve hiç tetiklenmedi.",
+      "escalation_policy_axis": "Yükseltme ilkesi bir kuruluşa ait ancak ilke iş ortağı genelinde.",
+      "custom": "Özel koşulların monitör türü yok.",
+      "process_count": "Süreç sayısı koşullarının monitör türü yok."
+    },
+    "errors": {
+      "preview": "Dönüştürme ön izlemesi yüklenemedi",
+      "convert": "Dönüştürme başarısız",
+      "retire": "Emekliye ayırma başarısız",
+      "revert": "Dönüştürme geri alınamadı"
+    },
+    "ledger": {
+      "title": "Dönüştürme geçmişi",
+      "undo": "Geri al",
+      "more": "Daha fazla yükle",
+      "empty": "Dönüştürme geçmişi yok.",
+      "system": "Sistem",
+      "unknownUser": "Bilinmeyen kullanıcı",
+      "reverted": "Geri alındı",
+      "deadline": "Eski uyarıların emekliye ayrılması kaynak değerlendiriciyi kaldırdıktan sonra geri alma kullanılamaz."
+    },
+    "errorCodes": {
+      "preview_stale": "İlke bu önizlemeden sonra değişti. Dönüştürmeden önce yeniden önizleyin.",
+      "conversion_contended": "Eş zamanlı değişiklikler dönüştürmeyi kesintiye uğrattı. Hiçbir şey değiştirilmedi. Tekrar deneyin.",
+      "preview_failed": "Önizleme oluşturulamadı. Daha sonra yeniden deneyin.",
+      "equivalence_delta": "Dönüştürülen izleyiciler her cihazda eski kurallar gibi davranmayacak. Dönüştürmeden önce önizlemeyi inceleyin.",
+      "CONVERSION_PREREQUISITE_MISSING": "Gerekli bir platform güncellemesi henüz dağıtılmadığı için dönüştürme yapılamıyor.",
+      "blocked": "Bu dönüştürme engellendi. Önce üst ilkeyi dönüştürün, ardından yeniden deneyin.",
+      "already_converted": "Bu kurallar zaten dönüştürüldü. Güncel durumu görmek için yenileyin.",
+      "partner_wide_denied": "İş ortağı genelindeki ilkeleri dönüştürmek için tam iş ortağı erişimi gerekir.",
+      "policy_not_found": "İlke bulunamadı. Silinmiş olabilir.",
+      "source_not_found": "Eski kural bulunamadı. Zaten dönüştürülmüş veya silinmiş olabilir.",
+      "conversion_not_found": "Bu dönüştürme bulunamadı.",
+      "conversion_revert_unavailable": "Bu dönüştürme artık geri alınamaz.",
+      "invalid_reason": "Bu kullanımdan kaldırma nedeni geçerli değil.",
+      "unknown": "Dönüştürme başarısız oldu. Yeniden deneyin."
+    },
+    "retirement": {
+      "summary_one": "{{count}} eski kural bir monitöre dönüştürülemedi — inceleyin.",
+      "summary_other": "{{count}} eski kural monitörlere dönüştürülemedi — inceleyin.",
+      "review": "İncele",
+      "dismiss": "Kapat",
+      "openAlertsNote": "Bu kurallar artık tetiklenmiyor. Açık uyarıları biri çözene kadar açık kalır; hâlâ gerekiyorsa koşulu bir monitör olarak yeniden oluşturun.",
+      "reasons": {
+        "custom_condition": "özel koşul",
+        "nested_group": "iç içe koşul grubu",
+        "no_condition": "değerlendirilebilir koşul yok",
+        "equivalence_delta": "dönüştürme bazı cihazlarda neyin tetikleneceğini değiştirirdi",
+        "escalation_policy_axis": "yükseltme politikası tek bir kuruluşa ait",
+        "parent_unconverted": "üst politika dönüştürülmedi",
+        "policy_inactive": "politika etkin değil veya arşivlenmiş",
+        "prerequisite_missing": "bu sunucuda ön koşul düzeltmesi eksik",
+        "metric_without_kind": "metriğin monitör türü yok",
+        "child_kind_not_composable": "koşul bileşik monitörde kullanılamaz",
+        "too_many_conditions": "çok fazla koşul",
+        "too_many_responses": "ondan fazla yanıt gerekir",
+        "auto_resolve_conditions": "özel çözüm koşulları korunamıyor",
+        "target_unconvertible": "yanıt hedefi dönüştürülemiyor",
+        "already_managed": "zaten bir monitör tarafından yönetiliyor",
+        "no_org": "denetim hiçbir kuruluşa ait değil",
+        "asset_missing": "bağlı keşfedilen varlık artık mevcut değil",
+        "condition_invalid": "denetim ayarları geçerli bir monitör koşulu oluşturmuyor",
+        "no_active_rules": "denetimin etkin bir uyarı kuralı yok",
+        "multiple_network_rules": "denetimin birden fazla etkin uyarı kuralı var",
+        "network_predicate_unsupported": "uyarı koşulunun monitörlerde karşılığı yok",
+        "network_threshold_out_of_range": "hata eşiği aralık dışında (en fazla 100 ardışık hata)",
+        "site_binding_unrepresentable": "konuma bağlı denetim hiçbir keşfedilen varlığa bağlı değil",
+        "config_override_unrepresentable": "özel hedef veya zaman aşımı korunamıyor",
+        "built_in": "yerleşik sistem kuralı; kendi başına uyarı vermeye devam eder",
+        "no_rules": "şablonda dönüştürülecek kural yok",
+        "target_or_owner": "bir kuralın hedefi veya sahibi şablonundan farklı",
+        "blocked": "dönüştürme engellendi",
+        "disabled_response_automation": "yanıt otomasyonu devre dışı",
+        "alert_workflow_kept": "uyarı iş akışı olduğu gibi korunuyor",
+        "unknown": "dönüştürme reddedildi; kaynağı inceleyin"
+      }
+    }
+  },
+  "device": {
+    "title": "Etkin monitörler",
+    "empty": "Bu cihaza uygulanan monitör yok.",
+    "error": "Etkin monitörler yüklenemedi.",
+    "monitor": "Monitör",
+    "kind": "Tür",
+    "policy": "Kaynak ilke",
+    "state": "Durum",
+    "episode": "Açık olay",
+    "escalation": "Yükseltme"
+  },
+  "monitors": {
+    "fields": {
+      "hardware_health": {
+        "componentTypes": "Bileşenler",
+        "minHealth": "En düşük sağlık düzeyi",
+        "includePredictiveFailure": "Öngörülen arızaları dahil et",
+        "consecutiveSnapshots": "Ardışık anlık görüntüler",
+        "componentTypeOptions": {
+          "controller": "Denetleyiciler",
+          "virtual_disk": "Sanal diskler",
+          "physical_disk": "Fiziksel diskler",
+          "cache_battery": "Önbellek pilleri",
+          "enclosure": "Kasalar",
+          "collector": "İzleme araçları"
+        },
+        "minHealthOptions": {
+          "warning": "Uyarı",
+          "critical": "Kritik"
+        }
+      },
+      "time_sync": {
+        "findings": "Bulgular",
+        "consecutiveSnapshots": "Ardışık anlık görüntüler",
+        "findingOptions": {
+          "pdc_no_external_source": "Orman kökü PDC’sinin dış kaynağı yok",
+          "source_local_clock": "Yerel saat kullanılıyor",
+          "dc_vm_host_sync": "Etki alanı denetleyicisi VM ana bilgisayarıyla eşitleniyor",
+          "ntp_server_unresolvable": "NTP sunucusu adı geçersiz veya çözümlenemiyor",
+          "ntp_peer_unreachable": "NTP eşine ulaşılamıyor",
+          "domain_source_unavailable": "Etki alanı saat kaynağı kullanılamıyor",
+          "member_not_on_hierarchy": "Etki alanı hiyerarşisi kullanılmıyor",
+          "sync_disabled": "Saat eşitleme devre dışı",
+          "sync_stale": "Yakın zamanda başarılı eşitleme yok",
+          "correction_refused": "Saat düzeltmesi reddedildi",
+          "timezone_mismatch": "Saat dilimi beklenenden farklı",
+          "policy_not_applied": "Saat ilkesi uygulanmadı",
+          "policy_conflict_gpo": "Grup İlkesi saat ayarlarını denetliyor"
+        }
+      },
+      "container_image_currency": {
+        "minDaysBehind": "En az gecikme günü"
+      }
+    }
+  },
+  "httpMethods": {
+    "GET": "GET (al)",
+    "HEAD": "HEAD (yalnızca başlıklar)",
+    "POST": "POST (gönder)",
+    "PUT": "PUT (değiştir)",
+    "OPTIONS": "OPTIONS (yetenekler)"
+  },
+  "dnsRecordTypes": {
+    "A": "A (IPv4 adresi)",
+    "AAAA": "AAAA (IPv6 adresi)",
+    "MX": "MX (posta sunucusu)",
+    "CNAME": "CNAME (takma ad)",
+    "TXT": "TXT (metin)",
+    "NS": "NS (ad sunucusu)"
   }
 }

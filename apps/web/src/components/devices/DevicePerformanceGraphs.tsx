@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Activity, ArrowDown, ArrowUp, HardDrive } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import {
@@ -14,7 +14,9 @@ import {
   Legend
 } from 'recharts';
 import { formatDate, formatDateTime, formatTime } from '@/lib/dateTimeFormat';
+import { formatTimeAgo } from '@/lib/formatTime';
 import { fetchWithAuth } from '../../stores/auth';
+import { createCancellableRequest, type CancellableRequest } from '../../lib/cancellableRequest';
 import ProcessDrilldownPanel from './ProcessDrilldownPanel';
 import { formatNumber } from '@/lib/i18n/format';
 
@@ -51,6 +53,8 @@ function formatBytesPerSec(bps: number): string {
 type DevicePerformanceGraphsProps = {
   deviceId: string;
   compact?: boolean;
+  /** Last-seen time of an OFFLINE device; the empty state says so (#9029). */
+  offlineSince?: string;
 };
 
 // Resolve the drilldown timestamp from a recharts click state. Exported (and
@@ -70,6 +74,24 @@ const rangeLabels: Record<TimeRange, string> = {
   '30d': '30d'
 };
 
+// #7214 (paper cut #25): kept as a module-level export so nearby tick values
+// can be exercised directly, without rendering the full chart.
+export function formatBandwidthTick(value: number): string {
+  // Below 10 units, keep one decimal — otherwise nearby-but-distinct raw
+  // values (e.g. 1.4M and 1.6M) round to the same integer label and the axis
+  // prints a duplicate ("… 1M 2M 2M"). At 10+ units the extra precision adds
+  // clutter without disambiguating anything, so it drops back to whole numbers.
+  const scale = (divisor: number, suffix: string) => {
+    const scaled = value / divisor;
+    const digits = scaled < 10 ? 1 : 0;
+    return `${formatNumber(scaled, { maximumFractionDigits: digits })}${suffix}`;
+  };
+  if (value >= 1_000_000_000) return scale(1_000_000_000, 'G');
+  if (value >= 1_000_000) return scale(1_000_000, 'M');
+  if (value >= 1_000) return scale(1_000, 'K');
+  return `${value}`;
+}
+
 const rangeIntervals: Record<TimeRange, string> = {
   '24h': '5m',
   '7d': '1h',
@@ -88,7 +110,7 @@ function formatTimestamp(value: string, range: TimeRange) {
   return formatDate(date, { month: 'short', day: 'numeric' });
 }
 
-export default function DevicePerformanceGraphs({ deviceId, compact = false }: DevicePerformanceGraphsProps) {
+export default function DevicePerformanceGraphs({ deviceId, compact = false, offlineSince }: DevicePerformanceGraphsProps) {
   const { t } = useTranslation('devices');
   const [timeRange, setTimeRange] = useState<TimeRange>('24h');
   const [data, setData] = useState<MetricPoint[]>([]);
@@ -96,7 +118,17 @@ export default function DevicePerformanceGraphs({ deviceId, compact = false }: D
   const [error, setError] = useState<string>();
   const [drilldownAt, setDrilldownAt] = useState<string | null>(null);
 
+  // The one in-flight metrics request. A new load (range change, device
+  // change, retry) cancels the previous one, and unmount cancels whatever is
+  // left, so a soft navigation / org switch away from the device page does
+  // not leave this fetch holding a connection for a response nobody renders
+  // — nor let a late response overwrite the newer view (#4513).
+  const requestRef = useRef<CancellableRequest | null>(null);
+
   const fetchMetrics = useCallback(async () => {
+    requestRef.current?.cancel();
+    const request = createCancellableRequest();
+    requestRef.current = request;
     setLoading(true);
     setError(undefined);
     try {
@@ -113,7 +145,7 @@ export default function DevicePerformanceGraphs({ deviceId, compact = false }: D
         interval: rangeIntervals[timeRange]
       });
 
-      const response = await fetchWithAuth(`/devices/${deviceId}/metrics?${params}`);
+      const response = await fetchWithAuth(`/devices/${deviceId}/metrics?${params}`, { signal: request.signal });
       if (!response.ok) throw new Error('Failed to fetch performance metrics');
       const json = await response.json();
       const payload = json?.data ?? json;
@@ -132,16 +164,20 @@ export default function DevicePerformanceGraphs({ deviceId, compact = false }: D
             bandwidthOutBps: Number(point.bandwidthOutBps ?? 0)
           }))
         : [];
+      if (request.cancelled) return;
       setData(normalized);
     } catch (err) {
+      if (request.cancelled) return;
       setError(err instanceof Error ? err.message : 'Failed to fetch performance metrics');
     } finally {
-      setLoading(false);
+      request.settle();
+      if (!request.cancelled) setLoading(false);
     }
   }, [deviceId, timeRange]);
 
   useEffect(() => {
-    fetchMetrics();
+    void fetchMetrics();
+    return () => requestRef.current?.cancel();
   }, [fetchMetrics]);
 
   // Process drilldown is time-keyed, not metric-specific: clicking any chart
@@ -176,31 +212,13 @@ export default function DevicePerformanceGraphs({ deviceId, compact = false }: D
     return [0, Math.ceil(maxVal * 1.1)];
   }, [data, hasDiskActivity]);
 
-  function formatBandwidthTick(value: number): string {
-    if (value >= 1_000_000_000) return `${formatNumber(value / 1_000_000_000, { maximumFractionDigits: 0 })}G`;
-    if (value >= 1_000_000) return `${formatNumber(value / 1_000_000, { maximumFractionDigits: 0 })}M`;
-    if (value >= 1_000) return `${formatNumber(value / 1_000, { maximumFractionDigits: 0 })}K`;
-    return `${value}`;
-  }
-
-  if (loading) {
-    return (
-      <div className="flex items-center justify-center rounded-lg border bg-card py-12 shadow-xs">
-        <div className="text-center">
-          <div className="mx-auto h-8 w-8 animate-spin rounded-full border-4 border-primary border-t-transparent" />
-          <p className="mt-3 text-sm text-muted-foreground">{t('devicePerformanceGraphs.loading')}</p>
-        </div>
-      </div>
-    );
-  }
-
   if (error) {
     return (
       <div className="rounded-lg border border-destructive/40 bg-destructive/10 p-6 text-center">
         <p className="text-sm text-destructive">{error}</p>
         <button
           type="button"
-          onClick={fetchMetrics}
+          onClick={() => void fetchMetrics()}
           className="mt-4 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:opacity-90"
         >
           {t('common:actions.retry')}
@@ -215,7 +233,7 @@ export default function DevicePerformanceGraphs({ deviceId, compact = false }: D
         <div className="flex items-center gap-2">
           <Activity className="h-4 w-4 text-muted-foreground" />
           <div>
-            <h3 className="text-lg font-semibold">{t('devicePerformanceGraphs.title')}</h3>
+            <h2 className="text-lg font-semibold">{t('devicePerformanceGraphs.title')}</h2>
             {!compact && (
               <p className="text-sm text-muted-foreground">{t('devicePerformanceGraphs.description')}</p>
             )}
@@ -239,6 +257,36 @@ export default function DevicePerformanceGraphs({ deviceId, compact = false }: D
         </div>
       </div>
 
+      {/* #7214 (paper cut #25): the range buttons above stay mounted and
+          clickable during a load — only the chart/stat area below swaps to a
+          spinner, so switching ranges mid-load is always possible. */}
+      {loading ? (
+        <div className="flex items-center justify-center py-12">
+          <div className="text-center">
+            <div className="mx-auto h-8 w-8 animate-spin rounded-full border-4 border-primary border-t-transparent" />
+            <p className="mt-3 text-sm text-muted-foreground">{t('devicePerformanceGraphs.loading')}</p>
+          </div>
+        </div>
+      ) : data.length === 0 ? (
+        // #9029: say there is nothing to plot instead of drawing blank axes and
+        // a legend. The full tab keeps the chart height so the layout does not
+        // jump; the compact Overview card reserves less — an offline device's
+        // overview is otherwise mostly a dashed rectangle.
+        <div
+          data-testid="device-performance-empty"
+          className={`flex flex-col items-center justify-center gap-1 rounded-md border border-dashed text-center text-sm text-muted-foreground ${
+            compact ? 'mt-4 h-36' : 'mt-6 h-80'
+          }`}
+        >
+          <p className="font-medium text-foreground">
+            {t('devicePerformanceGraphs.noSamples', { range: rangeLabels[timeRange] })}
+          </p>
+          {offlineSince && !Number.isNaN(new Date(offlineSince).getTime()) && (
+            <p>{t('devicePerformanceGraphs.offlineSince', { ago: formatTimeAgo(offlineSince) })}</p>
+          )}
+        </div>
+      ) : (
+        <>
       <div className={compact ? 'mt-4 h-56' : 'mt-6 h-80'}>
         <ResponsiveContainer width="100%" height="100%">
           <LineChart data={data} onClick={handleChartClick}>
@@ -291,7 +339,7 @@ export default function DevicePerformanceGraphs({ deviceId, compact = false }: D
       {hasBandwidth && (
         <>
           <div className={compact ? 'mt-4' : 'mt-8'}>
-            <h4 className="text-sm font-semibold text-muted-foreground uppercase tracking-wide">{t('devicePerformanceGraphs.networkBandwidth')}</h4>
+            <h3 className="text-sm font-semibold text-muted-foreground uppercase tracking-wide">{t('devicePerformanceGraphs.networkBandwidth')}</h3>
           </div>
           <div className={compact ? 'mt-2 h-40' : 'mt-3 h-64'}>
             <ResponsiveContainer width="100%" height="100%">
@@ -372,7 +420,7 @@ export default function DevicePerformanceGraphs({ deviceId, compact = false }: D
       {hasDiskActivity && (
         <>
           <div className={compact ? 'mt-4' : 'mt-8'}>
-            <h4 className="text-sm font-semibold text-muted-foreground uppercase tracking-wide">{t('devicePerformanceGraphs.diskActivity')}</h4>
+            <h3 className="text-sm font-semibold text-muted-foreground uppercase tracking-wide">{t('devicePerformanceGraphs.diskActivity')}</h3>
           </div>
           <div className={compact ? 'mt-2 h-40' : 'mt-3 h-64'}>
             <ResponsiveContainer width="100%" height="100%">
@@ -454,6 +502,8 @@ export default function DevicePerformanceGraphs({ deviceId, compact = false }: D
               </div>
             </div>
           )}
+        </>
+      )}
         </>
       )}
 

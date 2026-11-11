@@ -28,27 +28,37 @@ import { Counter, Gauge, Histogram, type Registry } from 'prom-client';
 export const RETENTION_JOB_NAMES = [
   'agent_log_retention',
   'ai_agent_op_evidence_retention',
+  'ai_invocation_retention',
+  'ai_tool_output_retention',
   'ai_unattended_exposure_retention',
   'audit_retention',
   'change_log_retention',
   'device_metrics_retention',
+  'dns_security_retention',
+  'edr_detection_retention',
   'event_log_retention',
   'filesystem_cleanup_run_retention',
+  'flow_run_retention',
   'intent_outbox_retention',
   'ip_history_retention',
+  'llm_egress_retention',
   'm365_sync_retention',
   'metric_anomaly_incident_retention',
   'metric_rollup_maintenance',
   'ml_output_retention',
   'monitor_episode_retention',
+  'pam_evidence_retention',
   'playbook_retention',
   'process_sample_retention',
   'reliability_retention',
   'removed_device_purge',
+  'restore_point_attempt_retention',
   'service_process_check_retention',
   'snmp_retention',
   'ticket_outbox_retention',
   'user_risk_retention',
+  'wake_attempt_retention',
+  'webhook_delivery_retention',
 ] as const;
 
 export type RetentionJobName = (typeof RETENTION_JOB_NAMES)[number];
@@ -86,11 +96,21 @@ export interface RetentionRunOutcome {
    * Omit entirely for jobs with no completeness signal at all.
    */
   incomplete?: boolean;
+  /**
+   * Rows a REPORT-ONLY run found eligible (#4342 W0, `jobs/retentionTarget.ts`):
+   * what an enforcing run would remove, capped at one run's capacity
+   * (`batchSize * maxBatches`). Sets `breeze_retention_rows_eligible{job_name}`
+   * — the evidence an operator reads before setting `<NAME>_RETENTION_ENFORCE`.
+   * A report run passes this and OMITS `rowsDeleted`/`incomplete`: it deleted
+   * nothing, and a 0 on the counter would claim it had measured a delete.
+   */
+  rowsEligible?: number;
 }
 
 interface RetentionMetricsRecorder {
   onRetentionRun: (jobName: RetentionJobName, outcome: RetentionRunOutcome) => void;
   onRollupRun: (status: RollupRunStatus, durationSeconds: number) => void;
+  onCompactionStalled: (stalledMonths: number) => void;
 }
 
 const noop = () => {};
@@ -98,6 +118,7 @@ const noop = () => {};
 let recorder: RetentionMetricsRecorder = {
   onRetentionRun: noop,
   onRollupRun: noop,
+  onCompactionStalled: noop,
 };
 
 export function setRetentionMetricsRecorder(
@@ -106,6 +127,7 @@ export function setRetentionMetricsRecorder(
   recorder = {
     onRetentionRun: next?.onRetentionRun ?? noop,
     onRollupRun: next?.onRollupRun ?? noop,
+    onCompactionStalled: next?.onCompactionStalled ?? noop,
   };
 }
 
@@ -151,11 +173,21 @@ export function recordRollupRun(status: RollupRunStatus, durationSeconds: number
   safelyRecord(`rollup run (${status})`, () => recorder.onRollupRun(status, durationSeconds));
 }
 
+/**
+ * Record how many legacy months the last metric-rollup-maintenance run left
+ * stalled on lock contention (#10960). 0 clears it.
+ */
+export function recordMetricRollupCompactionStalled(stalledMonths: number): void {
+  safelyRecord('compaction stall', () => recorder.onCompactionStalled(stalledMonths));
+}
+
 const ROWS_DELETED_METRIC = 'breeze_retention_rows_deleted_total';
 const LAST_RUN_METRIC = 'breeze_retention_last_run_timestamp_seconds';
 const BACKLOG_METRIC = 'breeze_retention_backlog_incomplete';
+const ROWS_ELIGIBLE_METRIC = 'breeze_retention_rows_eligible';
 const ROLLUP_RUNS_METRIC = 'breeze_rollup_runs_total';
 const ROLLUP_DURATION_METRIC = 'breeze_rollup_duration_seconds';
+const COMPACTION_STALLED_METRIC = 'breeze_metric_rollup_compaction_stalled_months';
 
 function safeCount(value: number): number {
   return Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
@@ -166,7 +198,7 @@ function safeSeconds(value: number): number {
 }
 
 /**
- * Registers (or reuses, if this Registry already carries them) the five series
+ * Registers (or reuses, if this Registry already carries them) the seven series
  * and binds them as the live recorder. Called once from `routes/metrics.ts`.
  *
  * NOTHING is seeded here — deliberately. The retention workers are `global` /
@@ -206,6 +238,18 @@ export function registerRetentionPrometheusMetrics(registry: Registry): void {
       registers: [registry],
     });
 
+  // A gauge, not a counter: each report run replaces the last run's count. It
+  // is capped at one enforce run's capacity, so a value equal to
+  // batchSize * maxBatches reads as "at least this many".
+  const rowsEligible =
+    (registry.getSingleMetric(ROWS_ELIGIBLE_METRIC) as Gauge<'job_name'> | undefined) ??
+    new Gauge({
+      name: ROWS_ELIGIBLE_METRIC,
+      help: 'Rows the last report-only run of each retention job found eligible for deletion (capped at one enforcing run\'s batch capacity)',
+      labelNames: ['job_name'] as const,
+      registers: [registry],
+    });
+
   const rollupRunsTotal =
     (registry.getSingleMetric(ROLLUP_RUNS_METRIC) as Counter<'status'> | undefined) ??
     new Counter({
@@ -227,6 +271,18 @@ export function registerRetentionPrometheusMetrics(registry: Registry): void {
       registers: [registry],
     });
 
+  // Labelled like its siblings even with one value: prom-client publishes an
+  // unlabelled gauge as 0 from registration, which would seed this on every
+  // replica that never runs the job.
+  const compactionStalledMonths =
+    (registry.getSingleMetric(COMPACTION_STALLED_METRIC) as Gauge<'job_name'> | undefined) ??
+    new Gauge({
+      name: COMPACTION_STALLED_METRIC,
+      help: 'Legacy metric_rollups months the last maintenance run left stalled on lock contention, past their stall threshold',
+      labelNames: ['job_name'] as const,
+      registers: [registry],
+    });
+
   setRetentionMetricsRecorder({
     onRetentionRun: (jobName, outcome) => {
       lastRunTimestampSeconds.labels(jobName).set(Date.now() / 1000);
@@ -236,10 +292,22 @@ export function registerRetentionPrometheusMetrics(registry: Registry): void {
       if (outcome.incomplete !== undefined) {
         backlogIncomplete.labels(jobName).set(outcome.incomplete ? 1 : 0);
       }
+      if (outcome.rowsEligible !== undefined) {
+        rowsEligible.labels(jobName).set(safeCount(outcome.rowsEligible));
+        // A report run deleted nothing, so a backlog flag left by an earlier
+        // enforce run (before the flag was turned off) is stale; clear it.
+        backlogIncomplete.remove(jobName);
+      } else if (outcome.rowsDeleted !== undefined) {
+        // An enforcing run: the last report count no longer describes anything.
+        rowsEligible.remove(jobName);
+      }
     },
     onRollupRun: (status, durationSeconds) => {
       rollupRunsTotal.labels(status).inc();
       rollupDurationSeconds.labels(status).observe(safeSeconds(durationSeconds));
+    },
+    onCompactionStalled: (stalledMonths) => {
+      compactionStalledMonths.labels('metric_rollup_maintenance').set(safeCount(stalledMonths));
     },
   });
 }

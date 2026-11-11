@@ -39,8 +39,14 @@ export type PostureProduct = {
 };
 
 export type PostureControls = {
+  /** Managed EDR coverage over ASSESSED devices (status row, agent row, or recent check-in). */
   edrCoveragePct?: number | null;
+  /** In-scope devices Breeze has no endpoint evidence for (excluded from edrCoveragePct). */
+  edrUnknownCount?: number;
+  /** AV/real-time protection coverage over ASSESSED devices (same rule as edrCoveragePct). */
   anyAvCoveragePct?: number | null;
+  /** In-scope devices Breeze has no endpoint evidence for (excluded from anyAvCoveragePct). */
+  anyAvUnknownCount?: number;
   unprotectedCount?: number;
   avDefinitionsCurrentPct?: number | null;
   encryptionPct?: number | null;
@@ -88,3 +94,34 @@ export type PostureSummary = {
   securityProducts?: PostureProduct[];
   postureScore?: number | null;
 };
+
+/**
+ * Header label for each column of the posture report's per-device rows
+ * (`ReportResult.rows`), used where the rows are exported as a customer-facing
+ * CSV (#9964). The keys are the row's keys: the API generator builds each row
+ * with `satisfies Record<PostureDeviceRowKey, unknown>`, so adding, renaming or
+ * dropping a column without updating this map is a compile error. Wording
+ * follows the PDF device table, flattened: the PDF's "Patches" and
+ * "Vulnerabilities" group headers become part of each count's label.
+ */
+export const POSTURE_DEVICE_ROW_CSV_LABELS = {
+  hostname: 'Hostname',
+  site: 'Site',
+  os: 'OS',
+  protection: 'Protection',
+  protectionManaged: 'Managed protection',
+  realTimeProtection: 'Real-time protection',
+  avDefinitionsAgeDays: 'AV definitions age (days)',
+  encryption: 'Encryption',
+  firewall: 'Firewall',
+  localAdmins: 'Local admins',
+  patchAssessed: 'Patches assessed',
+  pendingPatches: 'Pending patches',
+  criticalPatches: 'Critical patches',
+  openVulnCritical: 'Critical vulnerabilities',
+  openVulnHigh: 'High vulnerabilities',
+  cisPassRate: 'CIS pass rate (%)',
+  posture: 'Posture',
+} as const;
+
+export type PostureDeviceRowKey = keyof typeof POSTURE_DEVICE_ROW_CSV_LABELS;

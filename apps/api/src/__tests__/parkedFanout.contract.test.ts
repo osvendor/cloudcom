@@ -1,0 +1,589 @@
+/**
+ * CONTRACT TEST — background selectors leave parked devices out.
+ *
+ * A device parked in its partner's holding org (`organizations.type =
+ * 'unassigned_pool'`) is not managed yet: no scheduled job, worker, partner-wide
+ * fan-out or AI device lookup may select it, and nothing may raise offline
+ * alerts, notifications or tickets for it. Command delivery refuses it anyway
+ * (parkedCommandDelivery.contract.test.ts); this contract is the layer in
+ * front of that, so a parked device never becomes a failed job, a Sentry event
+ * or a vendor/LLM call either.
+ *
+ * Discovery (comments stripped first), over non-test files:
+ *   - every file under jobs/ that reads the devices table
+ *     (`.from(devices)`, `innerJoin(devices`, `leftJoin(devices`, `FROM devices`);
+ *   - every file under jobs/ or services/ that carries a Quick Support or
+ *     ephemeral-device exclusion (`eq(devices.isEphemeral, false)`,
+ *     `'quick_support'`, `excludeQuickSupportOrgs(`, `excludeEphemeralDevices(`,
+ *     `isQuickSupportOrgType(`, `isQuickSupportOrg(`, and the hidden-org
+ *     visibility helpers `notHiddenOrgType(` / `notInHiddenOrgCondition(` /
+ *     `isHiddenOrgType(`) — those mark the places
+ *     that already pick targets and exclude "not really our fleet" devices.
+ *
+ * Each discovered file must be in exactly one of:
+ *   - FANOUT_MODULES — must reference a parked-device predicate
+ *     (services/unassignedPool/selectorPredicate.ts, `isParkedDevice`,
+ *     `isUnassignedPoolOrgType`, or `UNASSIGNED_POOL_ORG_TYPE`);
+ *   - VISIBILITY_MODULES — listings, reports, read models and billing counts:
+ *     what a human sees, not what runs. The holding org is kept out of every
+ *     human org list; these are revisited with the visibility and billing work;
+ *   - EXEMPT — with the reason the file cannot reach a parked device, or must
+ *     (lifecycle removal and retention).
+ * An unclassified file fails; a stale entry (file gone, or no longer
+ * discovered and not a listed extra) fails.
+ *
+ * Plain unit test — reads the source tree only. The behavioural proof lives in
+ * integration/parkedDeviceZeroDelivery.integration.test.ts.
+ */
+import { describe, expect, it } from 'vitest';
+import { existsSync, readdirSync, readFileSync, statSync } from 'fs';
+import { join, relative, resolve } from 'path';
+import { FANOUT_MODULES } from './parkedFanoutModules';
+
+const SRC = resolve(import.meta.dirname, '..');
+const EE = resolve(import.meta.dirname, '../../../../ee');
+
+function walk(dir: string, out: string[] = []): string[] {
+  for (const name of readdirSync(dir)) {
+    if (name === 'node_modules' || name === '__tests__' || name === '__snapshots__') continue;
+    const full = join(dir, name);
+    if (statSync(full).isDirectory()) walk(full, out);
+    else if (full.endsWith('.ts') && !full.endsWith('.test.ts') && !full.endsWith('.d.ts')) out.push(full);
+  }
+  return out;
+}
+
+function stripComments(text: string): string {
+  return text
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .split('\n')
+    .filter((line) => !line.trim().startsWith('//'))
+    .join('\n');
+}
+
+/** `ee/...` paths resolve under the repo's ee/ tree; everything else under apps/api/src. */
+function abs(file: string): string {
+  return file.startsWith('ee/') ? join(EE, file.slice(3)) : join(SRC, file);
+}
+
+function read(file: string): string {
+  return stripComments(readFileSync(abs(file), 'utf8'));
+}
+
+/**
+ * A read of the devices table, through the Drizzle builder or raw SQL:
+ * `.from(devices)`, `innerJoin(devices` (any join), `JOIN devices`,
+ * `FROM devices`, and `${devices}` interpolations (with or without `schema.`).
+ */
+const DEVICE_READ = new RegExp([
+  String.raw`\.from\(\s*(?:schema\.)?devices\s*\)`,
+  String.raw`(?:inner|left|right|full)Join\(\s*(?:schema\.)?devices\b`,
+  String.raw`\bJOIN\s+(?:public\.)?"?devices"?(?!\w)`,
+  String.raw`\bFROM\s+(?:public\.)?"?devices"?(?!\w)`,
+  String.raw`\$\{\s*(?:schema\.)?devices\s*\}`,
+].join('|'), 'i');
+const EXCLUSION_MARKERS = /eq\(\s*devices\.isEphemeral,\s*false\s*\)|'quick_support'|excludeQuickSupportOrgs\(|excludeEphemeralDevices\(|isQuickSupportOrgType\(|isQuickSupportOrg\(|notHiddenOrgType\(|notInHiddenOrgCondition\(|isHiddenOrgType\(/;
+/**
+ * One guard site: a call of a parked-device predicate or helper, or a use of
+ * the org-type constant. Import lines are removed before counting.
+ */
+const GUARD_SITE = /\b(?:notParkedDeviceCondition|notInHoldingOrgCondition|notHoldingOrgCondition|isParkedDevice|isUnassignedPoolOrgType)\(|\bUNASSIGNED_POOL_ORG_TYPE\b/g;
+
+function guardSites(file: string): number {
+  const code = read(file).replace(/^import[\s\S]*?;\s*$/gm, '');
+  return (code.match(GUARD_SITE) ?? []).length;
+}
+
+const rel = (f: string) => relative(SRC, f).replace(/\\/g, '/');
+const JOB_FILES = walk(join(SRC, 'jobs')).map(rel);
+const SERVICE_FILES = walk(join(SRC, 'services')).map(rel);
+const EE_FILES = existsSync(EE) ? walk(EE).map((f) => `ee/${relative(EE, f).replace(/\\/g, '/')}`) : [];
+
+/** Every background/service module that reads devices or carries a Quick Support/ephemeral exclusion. */
+function discovered(): string[] {
+  // This wrapper delegates device reads to filterEngine, so SQL discovery cannot see it.
+  const hits = new Set<string>([
+    'services/partnerGroupPreview.ts',
+    // W15 (#6785): explicitly classify this billing-only service as required by the wave contract.
+    'services/pax8OrderPreview.ts',
+    'services/actionIntents/pax8OrderDigest.ts',
+  ]);
+  for (const file of [...JOB_FILES, ...SERVICE_FILES, ...EE_FILES]) {
+    const code = read(file);
+    if (DEVICE_READ.test(code) || EXCLUSION_MARKERS.test(code)) hits.add(file);
+  }
+  return [...hits].sort();
+}
+
+
+/** What a human sees (listings, reports, read models, billing counts). */
+const VISIBILITY_MODULES: Record<string, string> = {
+  'services/partnerGroupPreview.ts': 'read-only partner-group preview; eligible org discovery excludes Quick Support/holding orgs and evaluation intersects the caller accessible orgs',
+  'services/accounting/accountingMappingService.ts': 'billing: accounting device counts',
+  'services/archivedOrgReads.ts': 'listing: archived org reads',
+  'services/siteLocation.ts': 'listing: sites a technician may match an arrival against (#4186); excludes hidden orgs, never reads devices',
+  'services/mappableOrgs.ts': 'listing: orgs an external tenant/customer may be mapped onto (EDR, backup and Pax8 mapping and name suggestions); excludes hidden and unassigned-pool orgs, never reads devices',
+  'services/partnerVisibleOrgs.ts': 'listing: the partner org-list population, shared with the partner settings inheritance counts (#9170); excludes hidden orgs, never reads devices',
+  'services/aiToolsBackupRecoveryReads.ts': 'caller read: joins devices only to apply the site ceiling to a recovery row',
+  'services/backupHealthReadModel.ts': 'read model: backup health',
+  'services/contractQuantities.ts': 'billing: contract quantities',
+  'services/endpointMessaging/history.ts': 'read model: endpoint message send history and per-device delivery detail (#8742); lists existing deliveries, selects no targets',
+  'services/deviceStats.ts': 'read model: fleet device counts by status (GET /devices/stats and the AI tool); excludes parked devices',
+  'services/hardwareLifecycleReport.ts': 'report: hardware lifecycle',
+  'services/partnerDeviceCapacity.ts': 'billing: partner device capacity',
+  'services/portal/backupReadModel.ts': 'read model: portal backups',
+  'services/portal/deviceReadModel.ts': 'read model: portal devices',
+  'services/portal/hardwareHealthReadModel.ts': 'read model: portal hardware health',
+  'services/portal/hardwareInventoryReadModel.ts': 'read model: portal hardware inventory',
+  'services/portal/performanceReadModel.ts': 'read model: portal performance metrics',
+  'services/portal/softwareInventoryReadModel.ts': 'read model: portal software inventory',
+  'services/softwareInventoryReads.ts': 'read model: technician software inventory list / name search / per-title devices (lifted from routes/softwareInventory.ts); excludes ephemeral and parked devices',
+  'services/aiToolsSupportSessions.ts': 'W13 PR B (#6783) AI read of the caller partner\'s Quick Support sessions (ephemeral devices in the hidden Quick Support org, never a parked device); end goes through endSupportSession; selects no fan-out targets',
+  'services/aiToolsDeviceInventory.ts': 'W13 (#6783) AI reads: management-posture aggregates and the expiring-warranty list, both under the caller\'s org + site + exact-device scope and notParkedDeviceCondition; per-device reads go through the central device gate; selects no targets',
+  'services/deviceLinkGroupOps.ts': 'read model: device link groups (#2138) list / get / per-device lookup plus link-group membership writes, all by explicit device id (lifted from routes/devices/links.ts); no background selection',
+  'services/portal/patchDetailReadModel.ts': 'read model: portal patch detail',
+  'services/portal/vulnerabilityDetailReadModel.ts': 'read model: portal vulnerability detail',
+  'services/portal/securityReadModel.ts': 'read model: portal security',
+  'services/reportGenerationService.ts': 'report: per-org report builders',
+  'services/reportScope.ts': 'report: scope (already excludes the holding org)',
+  'services/reportSeries/combine.ts': 'report: multi-org series Combine candidates, series-eligible orgs only (hidden org types excluded)',
+  'services/reportSeries/reconcile.ts': 'report: multi-org series repair sweep, mirrors the targets.ts eligibility rule in SQL',
+  'services/reportSeries/targets.ts': 'report: multi-org series target orgs (org-level report definitions, not devices; hidden org types excluded)',
+  'services/securityScanSweepHits.ts': 'read model: top detection-rule hits of one IOC sweep for the AI ioc_hunt sweep_status read (#6268); joins devices only to apply the caller site ceiling (sweepScanVisibility). Selects no targets',
+  'services/securityScanSweeps.ts': 'read model: IOC sweep progress (#6263 W05); joins devices only to apply the caller site ceiling to the aggregates. Sweep targets come from services/securityScanSweepTargets.ts, a FANOUT_MODULES entry',
+  'services/scriptLastRun.ts': 'read model: Script Library LAST RUN column (#9563); a max(created_at) over existing script_executions, joining devices only to apply the caller site restriction; selects no targets and dispatches nothing',
+  'services/flows/ownedReferences.ts': 'validation: checks that device ids named literally in a flow draft belong to the flow owner org (#5218); selects no targets and dispatches nothing',
+  'services/flows/builtins/fleetTargets.ts': "org-pinned (#5221 W06): target selection goes through automationRuntime's resolveAutomationTargetsDetailed (a FANOUT_MODULES entry) with the run org as the only owner org; its own query only re-reads those ids, or an explicit/earlier-step list, inside the RUN org — a flow run never runs in the holding org (partnerFanoutOrgs), so a parked device never matches",
+  'services/flows/conversion/context.ts': "conversion preview (#5221 W06): counts a Job's CURRENT target set and its OS types through automationRuntime's resolveAutomationTargetsDetailed (a FANOUT_MODULES entry, parked/holding-org guarded); reads only the OS of those ids and dispatches nothing",
+  'services/flows/builtins/createAlert.ts': "org-pinned (#5221 W06): one existence check (id, org_id = run org) for the device a create_alert step names; selects no targets, and a flow run never runs in the holding org",
+  'services/scriptFleetDispatchStore.ts': "org-pinned (#5221 W06): locks ONE device of the already-checked fleet set by (id, org_id = run org) before dispatch; selects no targets, and dispatchScriptToDevice refuses a parked device (device_pending_assignment)",
+  'services/timeSuggestionService.ts': 'billing: time suggestions',
+  'jobs/patchComplianceReportWorker.ts': 'report: patch compliance summary for the requesting org',
+  'services/patchOutstandingDevices.ts': 'listing: devices that still need a patch, shown on the approval list (#8728); excludes parked and Quick Support devices like the compliance view',
+  'services/workloads/imageCompliance.ts': 'report: container image term of patch compliance (W06); the org-scope form excludes parked and Quick Support devices like the report it feeds',
+  // --- examined device readers (jobs, services, ee) ---
+  'services/aiAgentRunSiteScope.ts': 'site-allowlist filter for AI run listings shown to a person',
+  'services/aiOriginSummary.ts': 'label for one command/execution a person is already viewing',
+  'services/aiToolsAiAgentGovernance.ts': 'joins devices only to show hostnames on an AI run listing',
+  'services/aiToolsCompliance.ts': 'compliance report joins; device-targeted actions go through the central device gate',
+  'services/aiToolsDns.ts': 'joins devices only to show hostname on org-scoped DNS event/policy listings',
+  'services/dnsSecurityEventsPage.ts': 'joins devices only to show hostname on the org-scoped DNS Events tab listing (#10054)',
+  'services/aiToolsHuntress.ts': 'joins devices only for hostname display on org-scoped incident/agent listings',
+  'services/aiToolsVulnerability.ts': 'joins devices only to apply the caller\'s site axis to the CVE/software labels of finding ids the caller named or a device-gated read returned (#9532); selects no targets',
+  'services/alertCorrelationRca.ts': 'human-facing root-cause read model for the alert correlation route',
+  'services/automationReadProjection.ts': 'projects automation run history to a viewer\'s allowed sites',
+  'services/drReadAuthorization.ts': 'request-path read filtering of DR plans/executions by site/device authority for a human caller',
+  'services/endpointManagementReport.ts': 'org-scoped endpoint management report generation for a human reader',
+  'services/fleetFindings/query.ts': 'list/detail query layer for the fleet findings feed shown to a human or read-only AI tool',
+  'services/identityAccessReport.ts': 'per-org identity/sign-in evidence report for a single orgId supplied by caller',
+  'services/managementPostureReport.ts': 'fleet management-posture report/drill-down; org narrowing supplied by the calling route',
+  'services/metricAnomalyEpisodeQueries.ts': 'request-scoped episode reads keyed by caller\'s (orgId, deviceId); no fan-out',
+  'services/monitors/episodeQueries.ts': 'read models scoped by auth.orgCondition/site/device axes for a human caller',
+  'services/monitors/listServiceMonitors.ts': 'scopes candidates via auth.orgCondition/site/device axes, re-checks org access per row',
+  'services/partnerTrustEvidenceCard.ts': 'review card for one partner, emailed to human admins; not an action selector',
+  'services/patchInstallFailures.ts': 'per-patch failure counts for patch dashboards; RLS-scoped read, no action selection',
+  'services/patchSeverityOverlay.ts': 'effective per-device severity/category SQL fragments + aggregate for the patch catalog list (#9387 gap 1); read model only, applied inside a device_patches query the caller already scoped via resolveOutstandingDeviceScope, selects no targets',
+  'services/patchSeveritySource.ts': 'provenance (vendor/derived) of device-reported severities for the patch catalog read path (#9387 gap 2); RLS + resolveOutstandingDeviceScope-scoped read, selects no targets',
+  'services/scriptProposals/queries.ts': 'Proposal detail read model for the UI; device ids derived from an org-scoped proposal row',
+  'services/scriptProposals/reviewOverride.ts': 'A person signing one proposal (#10954): reads only its own targetDeviceIds, pinned to its org, each re-checked as parked by dispatchScriptToDevice',
+  'services/softwarePolicyInstallPreview.ts': 'Dry-run device count shown to the operator before confirming a fleet install',
+  'services/softwarePolicyCoverage.ts': 'request path (#9635): counts which devices a software policy governs for the coverage indicator, and checks an org default list would govern any of the (already holding-org-refused) write org\'s devices; selects nothing to act on',
+  'services/ticketTriage.ts': 'Site-scoped read model/aggregate for ticket-triage quality stats',
+  'services/topology/monitorOverlays.ts': 'Topology map health overlays for a human-scoped graph read',
+  'services/topology/presentationGroups.ts': 'Grouped-overview read model for a human-scoped topology graph read: reads device status only to hide decommissioned agents; selects nothing to act on',
+  'services/callerVerification/deviceSuggestions.ts': 'request path: suggests devices to the technician running a caller verification, inside that verification\'s org and the actor\'s site reach; selects nothing to act on (the technician picks, and the caller_verify insert refuses a parked device)',
+  'services/topology/presenceRead.ts': 'Site-gated presence read model for a human-scoped topology read (site location W2): device labels/sites for display only; selects nothing to act on',
+  'services/vulnerabilityFleetQueries.ts': 'Fleet triage UI fetch layer, RLS-scoped request read',
+  'services/vulnerabilityFleetSql.ts': 'Fleet work-queue aggregation for the triage UI, RLS-scoped',
+};
+
+/**
+ * Pattern classifications, for families of modules that share one reason.
+ * Each pattern must match at least one discovered file.
+ */
+const EXEMPT_PATTERNS: ReadonlyArray<{ pattern: RegExp; reason: string }> = [
+  {
+    pattern: /^services\/[A-Za-z]+Correlation\.ts$/,
+    reason: 'per-org correlation passes over inventory; their org lists come from feature resolution, '
+      + 'which leaves the holding org out, and a parked agent cannot submit inventory',
+  },
+];
+
+function exemptByPattern(file: string): boolean {
+  return EXEMPT_PATTERNS.some(({ pattern }) => pattern.test(file));
+}
+
+/** Cannot reach a parked device, or must (removal and retention). */
+const EXEMPT: Record<string, string> = {
+  'services/oemUpdates/revalidation.ts': 'vendor update claim recheck (#11065): reads the partner of the one device being claimed; selects no targets. A parked device is cancelled by partitionClaimable first',
+  'services/oemUpdates/alerts.ts': 'vendor update alerts (#11065): reads the hostname of one device the monitor, a sweep or a result already named; selects no targets',
+  'services/oemUpdates/results.ts': 'vendor update results (#11065): applies an agent report to the one device that sent it; selects no targets',
+  'services/remoteToolAlerts/alerts.ts': 'new remote tool alerts (#11306): reads the hostname of the one device whose posture submit found the tool; selects no targets. The posture route denies parked devices (parkedRouteClassification.test.ts)',
+  'services/networkIsolation/lifecycle.ts': 'lifecycle: locks explicitly scoped devices to block destructive operations while isolation is unresolved; no background target selection',
+  'jobs/networkIsolationSweeper.ts': 'lifecycle: recovery and expiry warnings for existing isolation episodes must survive parked/disabled devices; device lookup only resolves the episode notification site, never selects new isolation targets',
+  'services/networkIsolation/service.ts': 'Single-device service under caller RLS and site access; selects no fan-out targets. dispatchDeviceCommand refuses parked devices; heartbeat tombstones retain recovery intent.',
+  'services/actionIntents/pax8OrderDigest.ts': 'W15 (#6785): one Pax8 order approval digest; billing evidence with no device access or fan-out',
+  'services/pax8OrderPreview.ts': 'W15 (#6785): read-only Pax8 order billing evidence; no device access or fan-out',
+  'services/webhookPayload/alertEnrichment.ts': 'enriches the webhook payload of one already-raised alert by that alert\'s own device_id; selects no targets',
+  'services/manualAssetOps.ts': 'manual (non-networked) inventory CRUD (#4622, lifted from routes/devices/manual.ts): reads agent devices only to resolve the ONE device id a link request names (same-org + same-site check); selects no fan-out targets and runs nothing',
+  'services/aiToolsCustomFields.ts': 'manage_custom_fields set_values (W12, #6782): re-reads the custom-field projection of the ONE device the central deviceArgs gate and verifyDeviceAccess already resolved (verifyDeviceAccess excludes parked devices); selects no targets',
+  'services/localVaultUpdate.ts': 'site-locked vault update (W03-D12, #6757; lifted from routes/backup/vault.ts): row-locks the ONE device that owns a vault the caller already resolved, inside the caller\'s sites, then updates that vault; selects no targets, and the follow-up vault_configure to a parked device is refused by command delivery',
+  'services/securityScanStart.ts': 'single-device Scan now (#6263 W05-11, lifted from routes/security/scans.ts): reads the ONE device id the caller named under its own RLS; selects no targets. queueCommand refuses a parked device',
+  'jobs/securityScanClaim.ts': 'IOC scan claim (#6263 W05-3): re-reads ONE already-queued scan and its device under the partner lock; selects no targets. The command goes through dispatchDeviceCommand, which refuses a parked device (device_pending_assignment); sweep targets come from services/securityScanSweepTargets.ts and the pump, both FANOUT_MODULES entries',
+  'services/wisp/assessment.ts': 'Wisp assessment digest (#11425): the Metric anomalies section left-joins devices only to read the display name of each open metric_anomaly_incidents row, org-pinned to the assessed org (a GrantCeiling org, hidden orgs already out), capped at 25 rows; read-only context for the model, selects no targets and runs nothing',
+  'services/wisp/concernRollup.ts': 'Wisp same-org device-concern rollup (#11426): left-joins devices (org-pinned) only to read the hostname and display name of each live device concern\'s own subject, to strip them from its summary when grouping; selects concerns, never devices, and dispatches nothing to any device',
+  'services/wisp/activity.ts': 'Wisp activity timeline (#11084): left-joins devices only to read the hostname of the one device a specialist run is already pinned to, for its title; a read model filtered to the ceiling orgs (hidden orgs already out), selects no targets and runs nothing',
+  'services/wisp/checkInTriggers.ts': 'Wisp event check-ins W04 (#11493): reads the ONE device / script execution / device command / agent run a check-in names, by id, to evaluate its trigger; the subject must pass assertWithinCeiling (org in GrantCeiling.orgIds, which already excludes hidden orgs) before it can fire, so a parked device never matches; selects no targets and runs nothing',
+  'services/wisp/instructionCaptures.ts': 'Wisp W05 instruction chip (#10428): reads the org of the devices one of the caller\'s own captured instructions already names, under the caller\'s RLS context, to decide whether Keep for everyone may be offered; a read model, selects no targets and runs nothing',
+  'services/wisp/instructionExtractor.ts': 'Wisp W05 instruction capture (#10428): resolves the device names a technician wrote to device ids, an exact hostname/display-name match restricted to GrantCeiling.orgIds (hidden orgs already out, so a parked device never matches) and re-checked against the ceiling site terms; the ids are stored on a memory block as context, selects no targets and runs nothing',
+  'services/wisp/concernTools.ts': 'Wisp W05a raise_concern (#9911): one existence check (id, org_id) for a device the user named, AFTER assertWithinCeiling — the org must be in GrantCeiling.orgIds, which already excludes hidden orgs (notHiddenOrgType in grantAuthority), so a parked device never matches; selects no targets and runs nothing',
+  'services/wisp/readiness.ts': 'Wisp readiness inventory (#9917): per-org "can Wisp watch X here" booleans for the orgs of a grant ceiling (hidden orgs already out); joins devices only to map a device-level patch-policy assignment to its org; selects no targets',
+  'services/wisp/specialistLaunchers.ts': 'Wisp W07 coordinator launchers (#9913): one existence check (id, org_id) for the device a remediation_research or device_troubleshooting request names, AFTER the coordinator\'s assertWithinCeiling — the org must be in GrantCeiling.orgIds, which already excludes hidden orgs, so a parked device never matches; selects no targets',
+  'services/wisp/specialistResult.ts': 'Wisp delegation W2 (#11085) post-back: left-joins devices (org-pinned) only to read the hostname of the one device a settled specialist run was pinned to, for its thread post title; the reconciler re-sweep selects RUNS (ai_agent_runs) missing a post, never devices; dispatches nothing to any device',
+  'services/wisp/specialists/bulkTicketReply.ts': 'Wisp W07 bulk_ticket_reply (#9906, w00 A30): left-joins devices only to read the site of a pinned ticket\'s device for the ceiling site check, under the acting human\'s RLS context; selects no devices or targets — the ticket set is pinned by the approved digest',
+  'services/wisp/entityRelations.ts': 'Wisp working-set relations: identifier-only reads of one named entity, pinned to partner and live visible org; no targets or dispatch',
+  'services/wisp/entityLoaders.ts': 'Wisp W08 entity links (#9914): one existence + title read by id for a linked object, inner-joined to organizations with notHiddenOrgType() and the grant partner pinned, so a parked or Quick Support device never resolves; selects no targets and runs nothing',
+  'services/wisp/grantAuthority.ts': 'Wisp delegation ceiling (#9908): computes which orgs a grant may reach and only NARROWS it (hidden orgs out of the live reach); selects no devices or targets',
+  'services/backupRestoreIntegrity.ts': 'reinstall reattach (#8318 §5.4): reads the ONE device that took a snapshot, to date the snapshot against its install incarnation; selects no targets',
+  'services/deviceInstallBoundary/index.ts': 'reinstall reattach (#8318 §5): locks the ONE device row a reattach confirm names (a reattach target is never parked); selects no targets',
+  'services/commandDelivery.ts': 'claim-time install-script gate (#6958): reads the agent version of the ONE device an already-claimed software_install belongs to; selects no targets, and a command to a parked device is refused by command delivery',
+  'services/yaraScanRefs.ts':'YARA rule-set refs (#6263 W03a): looks up the ONE device (by id) of a scan the caller already created; selects no targets, and a security_scan to a parked device is refused by command delivery',
+  'services/endpointMessaging/chat.ts': 'request path (#8743): opens/messages ONE device the caller named and reached under RLS + the site axis; selects no targets, and chat_open/chat_message to a parked device is refused by command delivery',
+  'services/endpointMessaging/chatReads.ts': 'read model (#8743): conversations and messages of one device or one conversation the caller already reaches; selects no targets',
+  'services/endpointMessaging/retract.ts': 'request path (#8742): retracts the live deliveries of ONE existing message by id in the caller\'s RLS context; selects no new targets, and a retract_message queued to a parked device is refused by command delivery',
+  'services/migrationWindows.ts': 'ticket migration windows (#8313): validates the orgs an admin names for a window (hidden orgs are refused); never reads devices or dispatches device work',
+  'services/deviceReattach/rebindDirective.ts': 'reinstall reattach (#8318 §6.2): reads the ONE target device of the open intent whose source is the beating agent itself; selects no targets',
+  'services/ticketImport/sourceStore.ts': 'ticket import mappings (#8313 W4): validates the orgs an admin maps source orgs to (notHiddenOrgType: hidden orgs are refused); never reads devices or dispatches device work',
+  'services/automationTargetValidation.ts': 'write-time validation of an automation target config: reads device_groups/devices ids only to check they sit in the owner org; selects no targets and dispatches nothing',
+  'services/scriptRunTargets.ts': 'resolves saved device groups (org-owned; the holding org has none) via the shared resolver, which keeps eq(devices.orgId, groupOrgId) on every query; the resulting run goes through executeScriptOnDevices admission, and command delivery refuses parked devices',
+  'services/assetPlacement.ts': 'resolves placement authority by joining the ONE device already linked to a discovered asset (by id, within the asset org); selects no targets',
+  'services/autopay/enrollmentLifecycle.ts': 'org payment lifecycle rejects hidden orgs; never reads devices or dispatches device work',
+  'services/timeEntryService.ts': 'request path: rejects a hidden org a caller names on a time entry (#4186); never reads devices or dispatches device work',
+  'jobs/alertCorrelation.ts': 'acts only on alerts that already exist; alert creation leaves parked devices out',
+  'jobs/backupRetention.ts': 'retention of existing snapshots, not target selection',
+  'jobs/wakeAttemptSweep.ts': 'ledger maintenance: reads heartbeat only to resolve an existing dispatched wake attempt; selects no targets and sends nothing',
+  'jobs/backupSlaWorker.ts': 'evaluates org-owned SLA configurations; the holding org owns none',
+  'jobs/deviceBulkPurge.ts': 'lifecycle removal must reach every device',
+  'jobs/decommissionedGroupMembershipReconcile.ts': 'selects only decommissioned devices that still hold a dynamic group row (#9933) and hands each to the device-group re-evaluation, which removes rows; a parked device is not decommissioned and the holding org owns no groups',
+  'jobs/deviceGroupJobs.ts': 'device groups are org-owned; the holding org has none',
+  'jobs/dnsSyncJob.ts': 'syncs org-owned DNS integrations; the holding org owns none',
+  'jobs/hardwareHealthRetention.ts': 'retention, not target selection',
+  'jobs/huntressSync.ts': 'partner-scoped integration; devices are matched only inside orgs named by huntress_org_mappings, which only a person sets (PATCH /huntress/mappings, gated on canAccessOrg, never true for the holding org outside system scope)',
+  'jobs/offlineDetector.ts': 'status transition only; its event and alert effects are gated in services/offlineEffectsStore.ts',
+  'jobs/patchJobExecutor.ts': 'executes patch jobs already created for selected devices; command delivery refuses parked devices',
+  'jobs/patchSchedulerWorker.ts': 'selects no targets itself: assignment devices come from services/configPolicyAssignmentDevices.ts (a FANOUT module, #8442); its only devices read loads scheduling context for those resolved ids',
+  'jobs/parkedDeviceExpiry.ts': 'lifecycle removal: expires parked devices past the parking window; must reach them',
+  'jobs/parkedDevicePurge.ts': 'lifecycle removal: hard-purges expired parked devices; must reach them',
+  'jobs/quickSupportReaper.ts': 'Quick Support session lifecycle',
+  'jobs/removedDevicePurge.ts': 'lifecycle removal must reach every device',
+  'jobs/s1Sync.ts': 'partner-scoped integration; devices are matched only inside orgs named by s1_org_mappings, which only a person sets through the SentinelOne mapping route',
+  'jobs/staleCommandReaper.ts': 'lifecycle: reaps stale command rows',
+  'jobs/ticketNotifyWorker.ts': 'reads the name of the one device already linked to an existing ticket (by id, within the ticket org) for the assignee email; selects no targets',
+  'jobs/topologyCollectionRetentionWorker.ts': 'retention, not target selection',
+  'jobs/userRiskJobs.ts': 'scores users, not devices; the holding org has no users',
+  'services/aiToolsTicketing.ts': 'identity match pinned to the ticket\'s own org',
+  'services/auditFallbackOrg.ts': 'request path: reads the org of the one device the request URL named, to file its audit row; not a selector',
+  'services/restorePointRequest.ts': 'reads the org/OS of the ONE device a claimed command already targets (by id) to re-stamp its restore-point snapshot at delivery; selects no targets',
+  'services/filesystemScanGenerationRelease.ts': 'reads the osType of the ONE device a timed-out/failed filesystem_analysis command already names (by id) to release that command\'s own scan-generation registration; selects no targets and never queues work',
+  'services/securityAgents/coverageRead.ts': 'request-path coverage read model (#6960 W03): joins only the device a visible status row already names, inside the caller\'s RLS/org/site scope; selects no targets and dispatches no work',
+  'services/securityAgents/vendorEndpointSources.ts': 'derived (#6960 W03): reads devices only inside the org the coverage fan-out chose (plus that partner\'s device hostnames) to match vendor agents; selects no targets and dispatches no work',
+  'services/edrProviders/read.ts': 'request-path EDR read model (#8166): joins only the device already linked to a visible EDR row, and resolves the caller\'s allowed-site device ids; selects no targets and dispatches no work',
+  'services/auditOrgResolver.ts': 'resolves the org an audit row belongs to',
+  'services/callerVerification/deliverers/workstation.ts': 'request path + derived: prepare re-reads the one device the technician selected (within the verification org); delivery reads the device a pending caller_verify command already names. The insert chokepoint and the delivery claim both refuse parked devices',
+  'services/callerVerification/workstationResult.ts': 'derived: share-locks the device an existing caller_verify command already names, to apply the agent result; selects no targets',
+  'services/diagnosticAccess/delivery.ts': 'derived: looks up the device a queued diag_file_* command already names, at delivery; command delivery refuses parked devices',
+  'services/diagnosticAccess/grants.ts': 'derived: device lookup by an existing grant\'s own device, to re-check approver site access',
+  'services/deviceOrgMove/moveDeviceOrgInTransaction.ts': 'request path: moves the one device its caller named, after that caller\'s own checks; not a selector',
+  'services/monitors/networkCheckAlertDevice.ts': 'resolves a device inside the org chosen by networkCheckAlertSweep',
+  'services/orgAccountReadiness.ts': 'org administration (holding org already guarded)',
+  // Full-control W18 (#6789): lifted verbatim from their routes; request-path aggregates over the ONE org (or the
+  // accepted org list) the caller named, after the route's / tool's own access check.
+  'services/orgAccountReadinessResponse.ts': 'org administration (holding org already guarded): the default org set uses notHiddenOrgType(), the same filter as resolveAcceptedOrgs',
+  'services/orgSummary.ts': 'request path: counts the devices of the ONE org the caller named and may access (decommissioned excluded, as the record page); selects no targets and dispatches no work',
+  'services/roleDirectory.ts': 'role administration: isHiddenOrgType() keeps the holding org out of a focused-org role read; reads no devices',
+  'services/orgArchive.ts': 'org administration (holding org already guarded)',
+  'services/orgMerge.ts': 'org administration (holding org already guarded)',
+  'services/quickSupportOrg.ts': 'defines the Quick Support helpers',
+  'services/securityPosture.ts': 'per-org computation; the org list comes from securityPostureWorker',
+  'services/filterEngine.ts': 'evaluates within one caller-supplied org; the holding org is never a caller org, and the holding-area listing will use it',
+  'services/topology/originEligibility.ts': 'pinned to the calling technician\'s org and site',
+  // --- examined device readers (jobs, services, ee) ---
+  'services/abuseSignals/heuristics.ts': 'abuse scoring must count every device of a partner, parked devices included',
+  'services/abuseSignals/invariants.ts': 'abuse signals must count every device of a partner, parked devices included',
+  'services/abuseSignals/recidivistEndpoint.ts': 'abuse fingerprinting must see every device, parked devices included',
+  'services/actionIntents/actorContext.ts': 'derived: single device lookup by id already fixed as the intent\'s own target',
+  'services/actionIntents/agentReleaseAuthority.ts': 'derived: single device lookup by id already fixed as the intent\'s own target',
+  'services/actionIntents/approvalDeviceName.ts': 'derived: single device lookup by id and org for an approval display name',
+  'services/actionIntents/effectDigest.ts': 'derived: single device lookup by id already fixed as the action\'s target',
+  'services/actionIntents/intentApprovers.ts': 'derived: resolves tool-call-cited device ids with an org-pinned equality lookup',
+  'services/actionIntents/intentService.ts': 'derived: device lookups keyed off the intent/run\'s own target',
+  'services/actionIntents/laneQueries.ts': 'derived: device lookup by id and org for lane admission',
+  'services/actionIntents/policyDecide.ts': 'derived: single device lookup by id to enrich an existing run\'s policy scope',
+  'services/actionIntents/runScriptSnapshot.ts': 'derived: resolves devices from ids passed as tool-call arguments, already through the central device gate',
+  'services/agentCertificateBinding.ts': 'agent self-service: certificate lookup for the connecting agent\'s own device (rotation stays allowed for parked devices)',
+  'services/agentHealthObservations.ts': 'agent self-service: agent records a health observation for its own device',
+  'services/agentOrgRateLimit.ts': 'counts one org\'s devices for rate-limit sizing, not a target selector',
+  'services/agentRollback.ts': 'agent self-service: version snapshot for the connecting agent\'s own rollback',
+  'services/agentRollbackResult.ts': 'agent self-service: agent reports its own rollback observation',
+  'services/aiAgent.ts': 'request path: device lookups gated on canAccessOrg/canAccessSite on the session-creation request path',
+  'services/aiAgentSdk.ts': 'request path: device lookup in the caller\'s own db access context',
+  'services/aiAgents/alertVerdictSubscriber.ts': 'derived: device lookup by id and org from an existing alert row',
+  'services/aiAgents/designEvidence.ts': 'org-pinned: evidence queries pinned to the run\'s org, which the guarded sweep scheduler chose',
+  'services/aiAgents/metricAnomalySubscriber.ts': 'derived: device lookup by id and org from an existing metric anomaly row',
+  'services/aiAgents/narrativeContext.ts': 'org-pinned: evidence queries pinned to the run\'s org',
+  'services/aiAgents/patchEvidence.ts': 'org-pinned: evidence queries pinned to the run\'s org',
+  'services/aiAgents/runLoop.ts': 'derived: device lookup by the run\'s own device and org',
+  'services/aiAgents/runResourceScope.ts': 'derived: device lookup by id and org for run scope tagging',
+  'services/aiAgents/runService.ts': 'org-pinned: device sets resolved from proposed ids, pinned to the run\'s org',
+  'services/aiAgents/researchContext.ts': 'derived: single device lookup by id and org for a run that already targets that device',
+  'services/aiAgents/runnerPrompt.ts': 'formats already-fetched evidence into a prompt',
+  'services/aiAgents/sweepEvidence.ts': 'org-pinned: sweep evidence loaders pinned to one org chosen by the guarded sweep scheduler',
+  'services/aiAgents/sweepSubjectProbe.ts': 'derived: re-probes one device already named by an existing sweep finding',
+  'services/aiAgents/ticketContext.ts': 'org-pinned: linked-device lookup pinned to the ticket\'s org',
+  'services/aiOperator/deviceCommandEvidence.ts': 'derived: device lookup by id and org from a task\'s own row',
+  'services/aiOperator/identityDiscovery.ts': 'org-pinned: start-form device SUGGESTIONS by last_user, pinned to the task\'s own org; never an effect target',
+  'services/aiOperator/requesterAccessGate.ts': 'request path: rechecks a human requester\'s live org/site access to a task\'s device',
+  'services/fleetDesign/applyTargets.ts': 'request path: reads the devices a named Fleet Design report and its approval name, pinned to the report org, for an approval digest; selects no device as a target',
+  'services/aiOperator/serviceRecoveryLaunch.ts': 'request path: reads the one device named on a launch request, pinned to the request org and checked against the caller\'s sites',
+  'services/aiOperator/taskReadQueries.ts': 'request path: read-only operator task list/detail/plan queries (moved from routes/ai/operator); devices is joined only to apply the caller\'s site restriction, no device is selected as a target',
+  'services/aiOperator/taskService.ts': 'request path: creates a task for a device named on the request, scoped to the request org',
+  'services/aiOperator/verification.ts': 'derived: re-validates a task\'s own device is still in the task\'s org',
+  'services/aiTimeEntryProposal.ts': 'derived: loads device site from an existing run row',
+  'services/aiToolsAgentLogs.ts': 'request path: single device resolved via the caller\'s own org',
+  'services/aiToolsAlerts.ts': 'derived: device info keyed by an access-checked alert\'s device',
+  'services/aiToolsBackupShared.ts': 'derived: site lookup by an already-resolved snapshot\'s device',
+  'services/aiToolsBrowser.ts': 'org-pinned: device fan-out pinned to a policy row\'s own org',
+  'services/aiToolsDR.ts': 'derived: acts on device ids stored in org-owned DR plan rows',
+  'services/aiToolsFleet.ts': 'request path: device/alert/rule queries gated by orgWhere/deviceScopeCondition from the chat auth context',
+  'services/aiToolsFleetStatus.ts': 'request path: device rows fetched by id from a prior scoped query plus deviceScopeCondition',
+  'services/aiToolsHyperv.ts': 'request path: device ids pass the central deviceArgs gate, which never resolves a parked device',
+  'services/aiToolsIncident.ts': 'request path: device reach scoped by incidents.orgId join plus site/device scope conditions',
+  'services/aiToolsMssql.ts': 'request path: device ids pass the central deviceArgs gate, which never resolves a parked device',
+  'services/aiToolsRestoreAuthorization.ts': 'org-pinned: target device must match the snapshot\'s org, always a real org',
+  'services/aiToolsSLABackup.ts': 'org-pinned: writes require an explicit real org id; reads are org-scoped compliance views',
+  'services/aiToolsSentinelOne.ts': 'org-pinned: actions require an active integration row for the org, which a person configures for real orgs only',
+  'services/aiToolsSiteScope.ts': 'derived: shared helper queries devices by a caller-supplied, already-scoped org id',
+  'services/alertConditions/handlers/networkCheck.ts': 'derived: evaluates only the device the guarded alert sweep selected',
+  'services/alertConditions/utils.ts': 'derived: per-device lookups keyed on a device handed in by a guarded sweep',
+  'services/alertService.ts': 'derived: alert creation keyed on a device from guarded worker fan-out; auto-resolve only closes existing rows',
+  'services/approvals/decideApprovalRequest.ts': 'request path: human approve/deny handler; device resolved from the approval\'s own intent/org scope',
+  'services/automationActionResults.ts': 'derived: ledger keyed on devices seeded by the guarded automation dispatch',
+  'services/backupCommandCredentials.ts': 'agent self-service: delivery-time refresh for a command the device fetches from its own queue; backup commands are never queued for a parked device',
+  'services/backupJobCreation.ts': 'derived: job creation keyed on devices from the guarded backup scheduler',
+  'services/backupProgress.ts': 'agent self-service: agent-reported progress applied only for the calling agent\'s own device/job',
+  'services/backupRecoveryCommandIntegrity.ts': 'agent self-service: delivery-time refresh reads the org of the device fetching its own queued command',
+  'services/backupStorageSessionStore.ts': 'derived: loads one device already resolved by the command/session caller',
+  'services/restoreTargetReadiness.ts': 'derived: reads the one device a restore route already resolved as its target, to refuse it before a step-up grant is consumed',
+  'services/brainDeviceContext.ts': 'request path: all queries gated by auth.orgCondition from the request\'s auth context',
+  'services/callerVerification/gate.ts': 'request path: single id+orgId device check inside a per-request gate flow',
+  'services/callerVerification/service.ts': 'request path: device/contact reads scoped via actor and reachable contacts on request paths',
+  'services/circuits.ts': 'request path: site-gated circuit writes and reads; devices and discovered assets are read by id only to label a termination, nothing is selected to act on',
+  'services/commandResultHandlers.ts': 'agent self-service: result handlers keyed to the device resolved by the agent transport',
+  'services/customFields/import/resolveDevice.ts': 'request path: system-scope read bounded by the caller\'s request-time accessibleOrgIds/site reach',
+  'services/customFields/queries.ts': 'request path: per-device reads and writes with the device supplied by the request route',
+  'services/deploymentEngine.ts': 'org-pinned: targets resolved via deployment.orgId, a row a person creates for a real org',
+  'services/deploymentTargetResolver.ts': 'org-pinned: every target branch filters on the deployment row\'s org',
+  'services/deviceConsentPromptCapability.ts': 'request path: reads one capability column of the one device a desktop start names, no enumeration',
+  'services/deviceCoverage.ts': 'request path: single-device read enforcing actor.accessibleOrgIds from the request',
+  'services/deviceDeletion.ts': 'lifecycle: removes one device and its referencing rows',
+  'services/deviceFunction.ts': 'org-pinned: membership check scoped to an explicit org and device pair',
+  'services/deviceHierarchy.ts': 'single-device request read keyed on the authenticated device id (scoped.deviceId); loads raw facts only and decides nothing. Parked (pre-assignment) devices never reach its heartbeat caller: heartbeat.ts returns the minimal parked beat at the agent.isPreAssignment early return (routes/agents/heartbeat.ts:492) before any hierarchy consumer runs; resolvers that receive it apply exactly the org rules they applied to their own reads.',
+  'services/deviceLifecycle.ts': 'lifecycle: restore/purge of one locked removed device',
+  'services/devicePurgeUninstallGate.ts': 'derived: an SQL expression for the uninstall state of the device row its caller already selects or has locked; selects no work of its own',
+  'services/deviceOwnershipEpoch.ts': 'derived: an SQL expression for the epoch of the one device its caller is inserting a row for; selects no work',
+  'services/deviceLinkGroups.ts': 'request path: mutations scoped to a link group or caller-supplied devices from link routes and the deletion cascade',
+  'services/deviceMtlsCertificateIssuance.ts': 'org-pinned: locks and activates a certificate for one caller-supplied (device, org) pair; not a selector',
+  'services/deviceMaintenanceLease.ts': 'request path: locks one device at a time, ids from the maintenance route\'s request',
+  'services/deviceRecovery/restoreCheckpoint.ts': 'derived: single deviceId param from AI script lane caller already targeting one chosen device',
+  'services/deviceSiteMove.ts': 'request path: same-org site move of the one device its caller (PATCH /devices/:id, POST /devices/bulk/site) already authorized and named; locks that row only, selects no targets',
+  'services/deviceSiteResolver.ts':'derived: single-device cache lookup keyed on deviceId supplied by an event publisher',
+  'services/deviceUninstallDrain.ts': 'lifecycle: device-remove uninstall queue/release/drain-check, all keyed on one deviceId from removal route',
+  'services/discoveredAssetSiteMove.ts': 'lifecycle: site move of caller-supplied asset ids inside caller transaction, org-scoped',
+  'services/discovery/agentReportedBmcLink.ts': 'agent self-service: agent\'s own in-band report links its own device/org\'s discovered assets',
+  'services/fleetDesign/apply.ts': 'request path: request-path apply of a previously approved, org-pinned report-run proposal',
+  'services/fleetDesign/preview.ts': 'request path: request-path preview resolving an org-pinned report run under caller auth',
+  'services/fleetFindings/dispatch.ts': 'derived: remediation targets re-validated against finding.orgId, then dispatched from stored target rows',
+  'services/groupMembership.ts': 'org-pinned: group membership evaluation scoped to group.orgId, from org-owned device-group rows',
+  'services/hardwareHealth/ingest.ts': 'agent self-service: ownership-checks device.id+orgId; mounted only under the agent\'s own hardware-health route',
+  'services/hardwareHealth/view.ts': 'derived: keyed on a single deviceId from already-authorized callers',
+  'services/timeSync/ingest.ts': 'agent self-service: ownership-checks device.id+orgId; mounted only under the agent\'s own time-status route',
+  'services/timeSync/view.ts': 'derived: keyed on a single deviceId from already-authorized callers',
+  'services/timeSync/settings.ts': 'derived: resolves policy settings for a single deviceId supplied by already-authorized callers (the calling agent\'s heartbeat/ingest, device view, fleet rows already filtered by notParkedDeviceCondition); selects no work',
+  'services/timeSync/configUpdate.ts': 'agent self-service: builds the heartbeat time_sync_settings payload for the calling agent\'s own device id',
+  'services/agentOwnDeviceRow.ts': 'stale callers (#8318 §6.4): reads (bound, locked) and updates, and after a 0-row read or update re-reads, the ONE device row the agent-authenticated caller owns (by id + agent_id); selects no targets. Its callers include the workloads ingest (services/workloads/ingest.ts), which reads its device row only through it',
+  'services/workloads/view.ts': 'derived: keyed on a single deviceId from already-authorized callers',
+  'services/workloads/settings.ts': 'derived: resolves policy settings for a single deviceId supplied by already-authorized callers (the calling agent\'s heartbeat/ingest, the device view); selects no work',
+  'services/timeSync/exports.ts':'derived: daily rows only for the device ids iterateFleetTimeRows already selected with notParkedDeviceCondition',
+  'services/agentEditionAutoMigrate.ts': 'agent self-service: runs only from the calling device\'s own heartbeat, after the parked early return (routes/agents/heartbeat.ts isPreAssignment, so a parked device never reaches it); the sibling query only looks for an already-dispatched canary in the same org and selects no work',
+  'services/helperPermissions.ts': 'agent self-service: runs on the helper route for the calling device\'s own id',
+  'services/logReadAuthority.ts': 'request path: log-read authority derived from auth.canAccessOrg/allowedSiteIds on the request path only',
+  'services/logSearch.ts': 'org-pinned: background correlation loop pinned per-rule to rule.orgId, an org-owned config row',
+  'services/m365Sync/links.ts': 'org-pinned: reconcileDeviceLinks(orgId) called only from post-sync hooks with orgId from a real M365 connection',
+  'services/maintenanceService.ts': 'derived: isDeviceInMaintenance keyed on a single deviceId already authorized by the calling route',
+  'services/maintenanceSiteScope.ts': 'request path: site-scope gate for maintenance-window read/write, driven by the caller\'s permissions object',
+  'services/maintenanceWindowProjection.ts': 'org-pinned: always carries WHERE org_id = orgId, orgId from a per-org report',
+  'services/metricAnomalyEpisodes.ts': 'derived: episode assembly operates on orgId handed in by the guarded anomaly worker',
+  'services/metricRollups.ts': 'org-pinned: rollupDeviceMetricsRange takes options.orgId from the guarded rollup worker',
+  'services/monitors/conversion/equivalence.ts': 'derived: acts on a single deviceId already resolved upstream; no independent selection',
+  'services/monitors/conversion/previewScope.ts': 'derived: consumes resolveDeviceIdsForPolicy\'s device/org set; no independent selection here',
+  'services/monitors/escalationLatch.ts': 'derived: raises an alert for a single deviceId passed in from the guarded per-device evaluation upstream',
+  'services/networkBaseline.ts': 'org-pinned: runs per (orgId, siteId, baselineId) from a config row created only for real orgs',
+  'services/notificationDispatcher.ts': 'derived: reads alert.orgId/alert.deviceId off an already-created alerts row; no selection of its own',
+  'services/officeAddin/emailContext.ts': 'request path: human tech-auth path; every org lookup filtered by tech.canAccessOrg/accessibleOrgIds',
+  'services/offlineAlertEffects.ts': 'derived: acts on an alert-plan effect, which offlineEffectsStore never writes for a parked device',
+  'services/pamActuationLifecycle.ts': 'derived: locks the one device named by an elevation request the caller already holds; selects no work',
+  'services/pamRequestNotify.ts': 'derived: reads the capability of the one device named by an elevation request the caller just denied or expired; selects no work (#8928)',
+  'services/pamActuationResult.ts': 'agent self-service: agent posts result for its own deviceId/agentId/commandId only',
+  'services/pamToolActionGovernance.ts': 'agent self-service: helper on one device drives its own tool-action elevation request',
+  'services/partnerTrust.repo.ts': 'derived: single id lookups (partnerId/orgId/deviceId) supplied by caller, no enumeration',
+  'services/partnerTrustPromotion.ts': 'reads one partner\'s device IP classes for a trust decision; no per-device action',
+  'services/patchAlerts.ts': 'derived: emitters take deviceId/orgId chosen by upstream job-finalizer/reboot-worker callers',
+  'services/patchEligibility.ts': 'derived: takes deviceId/orgId from job executor, AI patch plan, or release effect digest callers',
+  'services/updateRingQueuedWork.ts': 'derived: only CANCELS work already queued from a deleted ring; its device read is an existence check on the cancelled jobs\' own targets, and nothing is dispatched (#8909)',
+  'services/peripheralEffectivePolicy.ts': 'derived: resolves policy for one caller-supplied deviceId; not an enumerator',
+  'services/psa/ticketScope.ts': 'request path: SQL condition restricts ticket-mapping rows to the request\'s accessibleOrgIds',
+  'services/quickSupportEnd.ts': 'lifecycle: Decommissions the one device tied to a caller-given session id; not fan-out',
+  'services/recoveryAuthorizationSubject.ts': 'derived: Single id lookups (user/apiKey/grant/run) scoped by orgId; device via aiAgentRuns.deviceId, one row',
+  'services/recoveryBootstrap.ts': 'request path: Single device+token lookup keyed on caller-supplied orgId+tokenId from a recovery request',
+  'services/remediationSuggestions.ts': 'request path: checks that the one caller-supplied RCA deviceId is on an alert of the named correlation group (POST /remediation-suggestions/generate); selects no devices to act on',
+  'services/reliabilityScoring.ts':'org-pinned: computeAndPersistOrgReliability scans org devices unfiltered; sole caller already excludes holding org',
+  'services/fixMemory/catalog.ts': 'derived: resolveDeviceOs looks up one device by id from an already-resolved alert/anomaly/rca context (moved here from remediationSuggestions.ts by #7275)',
+  'services/fixMemory/outcomeWatcher.ts': 'derived: reads the org of the one device named on an existing fix-outcome row; selects outcome rows, never devices',
+  'services/fixMemory/signatureLoader.ts': 'derived: looks up the OS of the one device named on the source alert/anomaly row being signed',
+  'services/outcomeProbes.ts': 'derived: probes status/lastSeen of the one device named on an existing watch row; reads and decides, never selects work',
+  'services/remoteRevocationLease.ts': 'request path: All queries keyed to one sessionId/deviceId from live session/start-capability checks, no enumeration',
+  'services/remoteSessionTeardown.ts': 'lifecycle: Resolves agentId for device ids of sessions already marked disconnected; teardown, not selection',
+  'services/remoteWsAuthorization.ts': 'request path: Single session lookup by consumed ticket\'s sessionId for WS connect authorization',
+  'services/resilienceSiteAuthorization.ts': 'request path: resolveLineage checks one resource id + caller-given orgId; authorization only, no enumeration',
+  'services/scriptCancellation.ts': 'derived: deviceId/executionIds derived from scriptExecutions rows created by the guarded scriptDispatch path',
+  'services/scriptCommandRevalidation.ts': 'derived: row.deviceId is from a queued device_commands row already created by guarded scriptDispatch',
+  'services/scriptExecution.ts': 'request path: Route callers only; device gated by auth.canAccessOrg',
+  'services/scriptExitCodeAlerts.ts': 'derived: Acts on the single device tied to the execution row being ingested; no device-set selection',
+  'services/scriptProposals/reviewer.ts': 'derived: Reads only proposal.targetDeviceIds, re-filtered by the proposal\'s own orgId',
+  'services/securityScanQuarantineAuthority.ts': 'derived: reads the one device a queued security scan already targets, to check it against the stored auto-quarantine authority; selects nothing',
+  'services/scriptSecretDelivery.ts': 'derived: Operates only on already-claimed commands for the calling agent\'s own device',
+  'services/sentinelOne/actions.ts': 'request path: orgId/deviceIds from request/AI-chat callers; devices filtered by eq(devices.orgId, params.orgId)',
+  'services/softwareDeployment.ts': 'org-pinned: Fan-out always filters eq(devices.orgId, deployment.orgId), an org-owned row from request-created deployments',
+  'services/softwareDeploymentOps.ts': 'request path (lifted from routes/software.ts POST /deployments for the REST route and AI tools): targets come from deploymentTargetResolver pinned to the caller\'s resolved org; the devices reads only re-check those ids\' site and OS inside the same org; selects no other work, and command delivery refuses a parked device',
+  'services/softwareDeploymentLifecycle.ts': 'request path (lifted from routes/software.ts cancel/retry): devices read only to apply the caller\'s site restriction inside the deployment\'s own org; retry re-dispatches only result rows of an existing org-owned deployment',
+  'services/softwareDeploymentQueries.ts': 'request path: read-only deployment list/summary/detail/results queries (lifted from routes/software.ts); devices is joined only for hostnames and the caller\'s site restriction, no device is selected as a target',
+  'services/softwareInventoryObservations.ts': 'agent self-service: Agent\'s own inventory-ingest route; acts only on the calling device\'s own row',
+  'services/softwarePolicyExecutableRulesAuthorization.ts': 'Pure permission/authorization helper; never reads the devices table',
+  'services/softwarePolicyRemediationPreview.ts': 'request path: Preview scoped by the caller\'s own orgCondition/site allowlist from the request path',
+  'services/systemCleanup.ts': 'request path: Per-device lock scoped by device.id+orgId passed in from route/AI tool call',
+  'services/erasureBackupLegalHold.ts': 'lifecycle: erasure legal-hold precheck; reads the devices of the one org being erased (org_id = the erasure subject) to resolve effective backup holds; dispatches nothing',
+  'services/tenantCascade.ts': 'lifecycle: Org/partner erasure cascade; deletes all rows for the org(s) being erased, including holding org',
+  'services/tenantLifecycle.ts': 'lifecycle: Suspend/restore agent credentials tied to org/partner status change (suspend/archive/offboard)',
+  'services/tenantOffboarding.ts': 'lifecycle: Queues/cancels self_uninstall drain for all orgs under an offboarding partner',
+  'services/threatDetectionReport.ts': 'org-pinned: orgId comes from a report occurrence/config row created only for real customer orgs',
+  'services/ticketPush.ts': 'org-pinned: Device lookup keyed by ticket-linked deviceId+orgId for push-recipient site authorization',
+  'services/ticketService.ts': 'request path: Device lookups validate deviceId against ticket orgId during human-initiated create/update',
+  'services/topology/collectionAuthority.ts': 'agent self-service: Heartbeat/negotiation handshake resolves only the calling agent\'s own device',
+  'services/topology/collectionRetention.ts': 'lifecycle: Retention purge of orphaned topology evidence; only checks device absence, never selects a live device',
+  'services/topology/discoveryDispatch.ts': 'derived: resolves the one agent discoveryWorker already selected with notParkedDeviceCondition, pinned to the job orgId',
+  'services/topology/diagnosticDispatch.ts': 'derived: Dispatches/validates a command bound to a run row created by an upstream diagnostic-run request',
+  'services/topology/presenceEvaluator.ts': 'derived: classifies presence for devices already bound in a site graph of one org; writes only presence read-model rows, never acts on or moves a device',
+  'services/topology/presenceInputs.ts': 'derived: reads device site/status within one site graph scope to classify presence; selects nothing to act on',
+  'services/topology/legacyReplay.ts': 'derived: Reads device existence within a scope already fixed by an upstream per-site topology state row',
+  'services/topology/unifiAdapter.ts': 'derived: read-only MAC binding inside a scope fixed by a UniFi site mapping to a real org site; no per-device action',
+  'services/topology/unifiAuthority.ts': 'agent self-service: resolves the reporting collector device; advertisement is reached only via listCollectorsForDevice, which refuses parked devices',
+  'services/backupAttestation.ts': 'derived: reads the one device a terminal backup result belongs to; backup dispatch already leaves parked devices out',
+  'services/backupStorageWriteSessions.ts': 'derived: the device of a backup job being dispatched; backup dispatch already leaves parked devices out',
+  'services/topology/aiDiagnosticApproval.ts': "request path: the origin device of one proposal, pinned to the proposing technician's org",
+  'services/topology/aiInvestigation.ts': "request path: evidence for one investigation turn in the technician's own topology site",
+  'services/topology/monitoringScheduler.ts': 'org-pinned: the origin device of a site-owned topology policy; policy targets resolve through site access, never a holding-org site',
+  'services/topology/telemetryArmFence.ts': 'derived: re-reads the collector of an existing telemetry arm inside its claim or sink transaction',
+  'services/topology/telemetryArms.ts': "request path: collector picked inside the technician's own topology site; its dispatch persists through the gated command insert",
+  'services/drExecutionService.ts': 'org-pinned: the rebuild host of one DR execution, read within that execution\'s org; its commands persist through the gated command insert',
+  'services/unassignedPool/admission.ts': 'lifecycle: counts the holding org\'s devices to admit one more parked device; selects no work',
+  'services/unassignedPool/parkedExpiry.ts': 'lifecycle removal: expiry and purge of one parked device under the holding-area lock',
+  'services/unassignedPool/visibility.ts': 'the hidden-org visibility helpers themselves; select nothing',
+  'services/unassignedPool/assignParkedDevice.ts': 'lifecycle: the assignment operation itself; acts on the one parked device a full partner admin named',
+  'services/unassignedPool/assignParkedDeviceSteps.ts': 'lifecycle: locked reads of the one named parked device and of its destination identity rows, for the assignment operation',
+  'services/deviceReattach/intentStore.ts': 'reinstall reattach (#8318): locked reads of the TWO devices one intent names (source and target, by id); selects no targets and dispatches nothing',
+  'services/deviceReattach/requestIntent.ts': 'reinstall reattach (#8318): eligibility of the ONE target a human named (a hidden-org target is refused); selects no targets and dispatches nothing',
+  'services/unassignedPool/parkedDeviceReads.ts': 'the parked-device list itself, shown only to full partner admins through the pre-assignment routes; reads, never selects work',
+  'services/flows/triggerScope.ts': "org-pinned: enriches a flow trigger with the one device its event payload names, only when that device is in the run's own org (#5219); selects no targets and dispatches nothing",
+  'services/devicePolicySet.ts': 'derived: every candidate policy assignment of the one device a heartbeat already identified (loaded in its org-scoped context); selects no work',
+  'services/helperSettings.ts': 'derived: the effective Helper setting of the one device a heartbeat or Helper token already identified; selects no work',
+  'services/userRiskScoring.ts': 'org-pinned: Devices queried by orgId from job data; upstream org scan requires organizationUsers rows, which holding orgs never have',
+  'services/vmRestoreRebuildEngine.ts': 'request path: Human-initiated restore route/AI tool; orgId + rebuildHostDeviceId pre-authorized by caller',
+  'services/vulnerabilityManagementReport.ts': 'org-pinned: Report scoped to one real org via service-deliverable occurrence; holding org has no deliverables',
+  'services/vulnerabilityRemediation.ts': 'request path: Operator/AI tool remediates explicit device-finding ids under caller\'s auth org condition',
+  'services/warrantyPolicyResolution.ts': 'derived: Caller-supplied deviceId; upstream selector already applies notParkedDeviceCondition',
+  'ee/workspace/src/services/deviceSummaryService.ts': 'request path: summarize(orgId, deviceId) takes both ids from the calling route, RLS-backed',
+  'services/wisp/checkInRuns.ts': "Wisp run check-ins W07 (#11496): reads the ONE device a check-in's context names, by id, only to learn whether it was deleted; admits one org-level assessment run through enqueueAssessment (org in the live GrantCeiling, which excludes hidden orgs); selects no device targets and dispatches nothing to a device",
+};
+
+describe('contract: background selectors leave parked devices out', () => {
+  const found = discovered();
+
+  it('W15 classifies the new Pax8 preview service as billing evidence with no device fan-out', () => {
+    expect(found).toContain('services/pax8OrderPreview.ts');
+    expect(EXEMPT['services/pax8OrderPreview.ts']).toContain('no device');
+    expect(DEVICE_READ.test(read('services/pax8OrderPreview.ts'))).toBe(false);
+  });
+
+  it('W15 classifies the Pax8 order digest as billing evidence with no device fan-out', () => {
+    expect(found).toContain('services/actionIntents/pax8OrderDigest.ts');
+    expect(EXEMPT['services/actionIntents/pax8OrderDigest.ts']).toContain('no device');
+    expect(DEVICE_READ.test(read('services/actionIntents/pax8OrderDigest.ts'))).toBe(false);
+  });
+
+  it('discovers the expected shape of the tree (not vacuous)', () => {
+    expect(found.length).toBeGreaterThan(60);
+    expect(found).toContain('jobs/cisJobs.ts');
+    expect(found).toContain('services/featureConfigResolver.ts');
+  });
+
+  it('classifies every discovered file exactly once', () => {
+    const sets = [FANOUT_MODULES, VISIBILITY_MODULES, EXEMPT];
+    const unclassified = found.filter((f) => !sets.some((s) => f in s) && !exemptByPattern(f));
+    expect(unclassified, 'classify these in parkedFanout.contract.test.ts').toEqual([]);
+    const doubled = found.filter((f) => sets.filter((s) => f in s).length + (exemptByPattern(f) ? 1 : 0) > 1);
+    expect(doubled).toEqual([]);
+  });
+
+  it('every FANOUT module carries exactly its pinned number of guard sites', () => {
+    // Pinned per file so that removing one of several guards (e.g. the org
+    // enumeration guard but not the device guard) fails, and a new guarded
+    // query updates the pin on purpose.
+    const drift = Object.entries(FANOUT_MODULES)
+      .filter(([f]) => existsSync(abs(f)))
+      .map(([f, { guards }]) => ({ file: f, pinned: guards, found: guardSites(f) }))
+      .filter(({ pinned, found }) => pinned !== found);
+    expect(drift, 'a guard was added or removed: update the pin, or restore the guard').toEqual([]);
+  });
+
+  it('every FANOUT module has at least one guard', () => {
+    const zero = Object.entries(FANOUT_MODULES).filter(([, { guards }]) => guards < 1).map(([f]) => f);
+    expect(zero).toEqual([]);
+  });
+
+  it('has no stale entries', () => {
+    const all = { ...FANOUT_MODULES, ...VISIBILITY_MODULES, ...EXEMPT };
+    const gone = Object.keys(all).filter((f) => !existsSync(abs(f)));
+    expect(gone).toEqual([]);
+    // Explicit extras are selectors the discovery patterns do not catch.
+    const extras = new Set([
+      'services/configurationPolicy.ts',
+      'services/offlineEffectsStore.ts',
+      'services/warrantyAlertEvaluator.ts',
+      'services/dnsThreatAlerts.ts',
+    ]);
+    const stale = Object.keys({ ...VISIBILITY_MODULES, ...EXEMPT }).filter((f) => !found.includes(f));
+    const staleFanout = Object.keys(FANOUT_MODULES).filter((f) => !found.includes(f) && !extras.has(f));
+    const unusedPatterns = EXEMPT_PATTERNS.filter(({ pattern }) => !found.some((f) => pattern.test(f)));
+    expect([...stale, ...staleFanout]).toEqual([]);
+    expect(unusedPatterns).toEqual([]);
+  });
+
+  it('never decides execution with a hidden-org-type list', () => {
+    // Quick Support is hidden AND remote-capable; the holding org is hidden
+    // AND execution-denied. A shared list would couple the two.
+    const offenders = [...JOB_FILES, ...SERVICE_FILES, ...EE_FILES].filter((f) =>
+      /HIDDEN_ORG_TYPES/.test(read(f)) && f in FANOUT_MODULES,
+    );
+    expect(offenders).toEqual([]);
+  });
+});

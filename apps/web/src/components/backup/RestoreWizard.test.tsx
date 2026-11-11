@@ -1,11 +1,15 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import RestoreWizard from './RestoreWizard';
+import { formatDateTime } from '@/lib/dateTimeFormat';
 import { fetchWithAuth } from '../../stores/auth';
 
+const authState = vi.hoisted(() => ({ user: { mfaEnabled: true } as { mfaEnabled?: boolean } | null }));
 vi.mock('../../stores/auth', () => ({
   fetchWithAuth: vi.fn(),
+  restoreAccessTokenFromCookie: vi.fn(async () => true),
+  useAuthStore: (selector: (state: typeof authState) => unknown) => selector(authState),
 }));
 const showToastMock = vi.fn();
 vi.mock('../shared/Toast', () => ({ showToast: (input: unknown) => showToastMock(input) }));
@@ -23,6 +27,7 @@ const makeJsonResponse = (payload: unknown, ok = true, status = ok ? 200 : 500):
 describe('RestoreWizard', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    authState.user = { mfaEnabled: true };
   });
 
   it('shows restore history and renders the latest restore job after creation', async () => {
@@ -36,6 +41,7 @@ describe('RestoreWizard', () => {
             {
               id: 'snap-1',
               label: 'Server snapshot',
+              deviceName: 'RECEPTION-PC',
               status: 'Ready',
               size: '4 GB',
             },
@@ -54,6 +60,7 @@ describe('RestoreWizard', () => {
               id: 'restore-1',
               snapshotId: 'snap-1',
               deviceId: 'device-1',
+              deviceName: 'FRONT-DESK-01',
               restoreType: 'full',
               status: 'completed',
               targetPath: null,
@@ -97,7 +104,8 @@ describe('RestoreWizard', () => {
 
     await screen.findByText('Restore Wizard');
     expect(await screen.findByText('Recent restore history')).toBeTruthy();
-    expect(screen.getByText('restore-1')).toBeTruthy();
+    expect(screen.getByText('FRONT-DESK-01')).toBeTruthy();
+    expect(screen.queryByText('restore-1')).toBeNull();
 
     for (let index = 0; index < 4; index += 1) {
       fireEvent.click(screen.getByRole('button', { name: /Continue/i }));
@@ -105,11 +113,409 @@ describe('RestoreWizard', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /Start restore/i }));
 
-    await waitFor(() => {
-      expect(screen.getByText(/Restore job restore-2 queued successfully/i)).toBeTruthy();
-    });
+    // A readable confirmation naming the device, never the raw job UUID.
+    const banner = await screen.findByTestId('restore-success-banner');
+    expect(banner.textContent).toContain('Restore queued on RECEPTION-PC.');
+    expect(banner.textContent).not.toContain('restore-2');
     expect(screen.getByText('Latest restore job')).toBeTruthy();
     expect(screen.getByText(/pending/i)).toBeTruthy();
+
+    // "View progress" takes the operator to the Latest restore job panel.
+    const scrollIntoView = vi.fn();
+    Element.prototype.scrollIntoView = scrollIntoView;
+    fireEvent.click(screen.getByRole('button', { name: /View progress/i }));
+    expect(scrollIntoView).toHaveBeenCalledTimes(1);
+    expect(scrollIntoView.mock.contexts[0]).toBe(screen.getByTestId('restore-latest-job'));
+  });
+
+  it('asks for confirmation before restoring a backup without an integrity attestation, then resubmits', async () => {
+    let posts = 0;
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url === '/backup/snapshots') return makeJsonResponse({ data: [{ id: 'snap-1', label: 'Server snapshot', deviceName: 'RECEPTION-PC' }] });
+      if (url === '/backup/snapshots/snap-1/browse') return makeJsonResponse({ data: [] });
+      if (url === '/backup/restore?limit=6') return makeJsonResponse({ data: [] });
+      if (url === '/backup/restore' && method === 'POST') {
+        posts += 1;
+        if (posts === 1) return makeJsonResponse({
+          error: 'Confirm the restore.',
+          code: 'STEP_UP_REQUIRED',
+          stepUp: {
+            operation: 'backup_unattested_restore',
+            method: 'confirm',
+            reason: 'unattested_legacy',
+            resource: { snapshotId: 'snapshot-1', targetDeviceId: 'device-1', commandType: 'bmr_recover' },
+          },
+        }, false, 403);
+        return makeJsonResponse({ id: 'restore-2', snapshotId: 'snap-1', status: 'pending', restoreType: 'full' });
+      }
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<RestoreWizard />);
+    await screen.findByText('Restore Wizard');
+    for (let index = 0; index < 4; index += 1) {
+      fireEvent.click(screen.getByRole('button', { name: /Continue/i }));
+    }
+    fireEvent.click(screen.getByRole('button', { name: /Start restore/i }));
+
+    const prompt = await screen.findByTestId('unattested-restore-stepup');
+    expect(prompt.textContent).toMatch(/no integrity attestation/i);
+    expect(showToastMock).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'error' }));
+    expect(screen.queryByTestId('restore-success-banner')).toBeNull();
+
+    fireEvent.click(screen.getByTestId('unattested-restore-stepup-confirm'));
+    await screen.findByTestId('restore-success-banner');
+    const bodies = fetchMock.mock.calls
+      .filter(([url, init]) => url === '/backup/restore' && init?.method === 'POST')
+      .map(([, init]) => JSON.parse(String(init!.body)));
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0]).not.toHaveProperty('confirmUnattestedRestore');
+    expect(bodies[1]).toMatchObject({ snapshotId: 'snap-1', confirmUnattestedRestore: true });
+  });
+
+  it('sends a user without a second factor to set one up, and Retry resubmits the restore', async () => {
+    let posts = 0;
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url === '/backup/snapshots') return makeJsonResponse({ data: [{ id: 'snap-1', label: 'Server snapshot', deviceName: 'RECEPTION-PC' }] });
+      if (url === '/backup/snapshots/snap-1/browse') return makeJsonResponse({ data: [] });
+      if (url === '/backup/restore?limit=6') return makeJsonResponse({ data: [] });
+      if (url === '/backup/restore' && method === 'POST') {
+        posts += 1;
+        if (posts === 1) return makeJsonResponse({
+          error: 'Enroll a second factor to confirm this restore.',
+          code: 'MFA_ENROLLMENT_REQUIRED',
+          stepUp: {
+            operation: 'backup_unattested_restore',
+            method: 'enroll',
+            reason: 'unattested_legacy',
+            resource: { snapshotId: 'snap-1', targetDeviceId: 'device-1', commandType: 'backup_restore' },
+          },
+        }, false, 403);
+        return makeJsonResponse({ id: 'restore-2', snapshotId: 'snap-1', status: 'pending', restoreType: 'full' });
+      }
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<RestoreWizard />);
+    await screen.findByText('Restore Wizard');
+    for (let index = 0; index < 4; index += 1) {
+      fireEvent.click(screen.getByRole('button', { name: /Continue/i }));
+    }
+    fireEvent.click(screen.getByRole('button', { name: /Start restore/i }));
+
+    await screen.findByTestId('unattested-restore-stepup');
+    expect(screen.getByTestId('unattested-restore-stepup-enroll').getAttribute('href')).toBe('/settings/profile');
+    expect(screen.queryByTestId('unattested-restore-stepup-confirm')).toBeNull();
+    expect(showToastMock).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'error' }));
+    expect(screen.queryByTestId('restore-success-banner')).toBeNull();
+
+    fireEvent.click(screen.getByTestId('unattested-restore-stepup-retry'));
+    await screen.findByTestId('restore-success-banner');
+    const bodies = fetchMock.mock.calls
+      .filter(([url, init]) => url === '/backup/restore' && init?.method === 'POST')
+      .map(([, init]) => JSON.parse(String(init!.body)));
+    expect(bodies).toHaveLength(2);
+    expect(bodies[1]).toEqual(bodies[0]);
+    expect(bodies[1]).not.toHaveProperty('stepUpGrant');
+    expect(bodies[1]).not.toHaveProperty('confirmUnattestedRestore');
+  });
+
+  it('a Retry that fails keeps the set-up link and Retry visible; nothing was restored', async () => {
+    let posts = 0;
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url === '/backup/snapshots') return makeJsonResponse({ data: [{ id: 'snap-1', label: 'Server snapshot', deviceName: 'RECEPTION-PC' }] });
+      if (url === '/backup/snapshots/snap-1/browse') return makeJsonResponse({ data: [] });
+      if (url === '/backup/restore?limit=6') return makeJsonResponse({ data: [] });
+      if (url === '/backup/restore' && method === 'POST') {
+        posts += 1;
+        if (posts === 1) return makeJsonResponse({
+          error: 'Enroll a second factor to confirm this restore.',
+          code: 'MFA_ENROLLMENT_REQUIRED',
+          stepUp: {
+            operation: 'backup_unattested_restore',
+            method: 'enroll',
+            reason: 'unattested_legacy',
+            resource: { snapshotId: 'snap-1', targetDeviceId: 'device-1', commandType: 'backup_restore' },
+          },
+        }, false, 403);
+        return makeJsonResponse({ error: 'Restore service unavailable' }, false, 500);
+      }
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<RestoreWizard />);
+    await screen.findByText('Restore Wizard');
+    for (let index = 0; index < 4; index += 1) {
+      fireEvent.click(screen.getByRole('button', { name: /Continue/i }));
+    }
+    fireEvent.click(screen.getByRole('button', { name: /Start restore/i }));
+    await screen.findByTestId('unattested-restore-stepup-enroll');
+
+    fireEvent.click(screen.getByTestId('unattested-restore-stepup-retry'));
+    await waitFor(() => expect(posts).toBe(2));
+    await waitFor(() => expect(screen.getByTestId('unattested-restore-stepup-retry')).not.toBeDisabled());
+    expect(screen.getByTestId('unattested-restore-stepup-enroll')).toBeTruthy();
+    expect(screen.queryByTestId('restore-success-banner')).toBeNull();
+    expect(await screen.findByText('Restore service unavailable')).toBeTruthy();
+  });
+
+  it('shows each snapshot\'s integrity status on its card and in the review', async () => {
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === '/backup/snapshots') {
+        return makeJsonResponse({ data: [
+          { id: 'snap-1', label: 'Server snapshot', integrityStatus: 'unattested_legacy' },
+          { id: 'snap-2', label: 'Newer snapshot', integrityStatus: 'attested' },
+          { id: 'snap-3', label: 'Old API snapshot' },
+        ] });
+      }
+      if (url === '/backup/restore?limit=6') return makeJsonResponse({ data: [] });
+      return makeJsonResponse({ data: [] });
+    });
+
+    render(<RestoreWizard />);
+    await screen.findByText('Server snapshot');
+    const labels = screen.getAllByTestId('snapshot-integrity-badge').map((el) => el.textContent);
+    expect(labels).toEqual(['Not verified', 'Verified']);
+
+    for (let index = 0; index < 4; index += 1) {
+      fireEvent.click(screen.getByRole('button', { name: /Continue/i }));
+    }
+    expect(screen.getByTestId('restore-review-snapshot').textContent).toContain('Not verified');
+  });
+
+  const goToReview = async (integrityStatus?: string) => {
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === '/backup/snapshots') {
+        return makeJsonResponse({ data: [{ id: 'snap-1', label: 'Server snapshot', integrityStatus }] });
+      }
+      return makeJsonResponse({ data: [] });
+    });
+    render(<RestoreWizard />);
+    await screen.findByText('Server snapshot');
+    for (let index = 0; index < 4; index += 1) {
+      fireEvent.click(screen.getByRole('button', { name: /Continue/i }));
+    }
+  };
+
+  it('tells a user with a second factor, on the Review step, that an unverified restore will ask for it (#9629)', async () => {
+    await goToReview('unattested');
+    const note = screen.getByTestId('restore-review-second-factor-note');
+    expect(note.textContent).toContain('This restore point is not verified');
+    expect(note.textContent).toContain('confirm with your second factor');
+    expect(note.getAttribute('data-tone')).toBe('info');
+    expect(screen.queryByRole('link', { name: /set up/i })).toBeNull();
+  });
+
+  it('warns a user without a second factor, with a set-up link, before Start (#9629)', async () => {
+    authState.user = { mfaEnabled: false };
+    await goToReview('unattested_legacy');
+    const note = screen.getByTestId('restore-review-second-factor-note');
+    expect(note.getAttribute('data-tone')).toBe('warning');
+    const link = within(note).getByRole('link');
+    expect(link.getAttribute('href')).toBe('/settings/profile');
+  });
+
+  it.each(['attested', 'producer_only', 'pending', 'attestation_failed', 'something_new', undefined])('shows no second-factor note for a %s snapshot (#9629)', async (status) => {
+    authState.user = { mfaEnabled: false };
+    await goToReview(status);
+    expect(screen.queryByTestId('restore-review-second-factor-note')).toBeNull();
+  });
+
+  it('puts a short "needs second factor" hint on an unverified snapshot card only when none is enrolled (#9629)', async () => {
+    authState.user = { mfaEnabled: false };
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === '/backup/snapshots') {
+        return makeJsonResponse({ data: [
+          { id: 'snap-1', label: 'Server snapshot', integrityStatus: 'unattested' },
+          { id: 'snap-2', label: 'Newer snapshot', integrityStatus: 'attested' },
+        ] });
+      }
+      return makeJsonResponse({ data: [] });
+    });
+    render(<RestoreWizard />);
+    await screen.findByText('Server snapshot');
+    const hints = screen.getAllByTestId('snapshot-second-factor-hint');
+    expect(hints).toHaveLength(1);
+    expect(hints[0].textContent).toBe('Needs second factor');
+  });
+
+  it('leads the Latest restore job panel with device and restore type; the command id is behind a copy control (#9626)', async () => {
+    const writeText = vi.fn(async () => undefined);
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true });
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === '/backup/snapshots') return makeJsonResponse({ data: [{ id: 'snap-1', label: 'Server snapshot' }] });
+      if (url === '/backup/restore?limit=6') {
+        return makeJsonResponse({ data: [{
+          id: 'restore-1', snapshotId: 'snap-1', deviceId: 'device-1', deviceName: 'DC01',
+          restoreType: 'selective', status: 'completed', targetPath: null,
+          createdAt: '2026-03-31T11:00:00.000Z', updatedAt: '2026-03-31T11:05:00.000Z',
+          completedAt: '2026-03-31T11:05:00.000Z', commandId: 'cmd-9f3a', errorSummary: null,
+        }] });
+      }
+      return makeJsonResponse({ data: [] });
+    });
+    render(<RestoreWizard />);
+    await screen.findByText('Latest restore job');
+    const summary = screen.getByTestId('restore-job-summary');
+    expect(summary.textContent).toContain('DC01');
+    expect(summary.textContent).toContain('Selective');
+    expect(summary.textContent).not.toContain('cmd-9f3a');
+    fireEvent.click(screen.getByRole('button', { name: /copy command id/i }));
+    expect(writeText).toHaveBeenCalledWith('cmd-9f3a');
+    await waitFor(() => expect(showToastMock).toHaveBeenCalledWith({ type: 'success', message: 'Command ID copied' }));
+  });
+
+  it('toasts an error when the command id cannot be copied (#9626)', async () => {
+    const writeText = vi.fn(async () => { throw new Error('denied'); });
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true });
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === '/backup/snapshots') return makeJsonResponse({ data: [{ id: 'snap-1', label: 'Server snapshot' }] });
+      if (url === '/backup/restore?limit=6') {
+        return makeJsonResponse({ data: [{
+          id: 'restore-1', snapshotId: 'snap-1', deviceId: 'device-1', restoreType: 'full', status: 'completed',
+          createdAt: '2026-03-31T11:00:00.000Z', updatedAt: '2026-03-31T11:05:00.000Z', commandId: 'cmd-9f3a',
+        }] });
+      }
+      return makeJsonResponse({ data: [] });
+    });
+    render(<RestoreWizard />);
+    await screen.findByText('Latest restore job');
+    fireEvent.click(screen.getByRole('button', { name: /copy command id/i }));
+    await waitFor(() => expect(showToastMock).toHaveBeenCalledWith({ type: 'error', message: 'Could not copy the command ID' }));
+  });
+
+  it.each([null, {}])('treats an unknown second-factor state (%j) as informational, not a set-up warning (#9629)', async (user) => {
+    authState.user = user as { mfaEnabled?: boolean } | null;
+    await goToReview('unattested');
+    expect(screen.getByTestId('restore-review-second-factor-note').getAttribute('data-tone')).toBe('info');
+    expect(screen.queryByTestId('snapshot-second-factor-hint')).toBeNull();
+  });
+
+  it('cancels a queued restore from the Latest restore job panel', async () => {
+    const pendingJob = {
+      id: 'restore-2',
+      snapshotId: 'snap-1',
+      deviceId: 'device-1',
+      deviceName: 'FRONT-DESK-01',
+      restoreType: 'full',
+      status: 'pending',
+      targetPath: null,
+      createdAt: '2026-03-31T11:00:00.000Z',
+      updatedAt: '2026-03-31T11:00:00.000Z',
+      restoredSize: null,
+      restoredFiles: null,
+      commandId: 'cmd-1',
+      errorSummary: null,
+      resultDetails: null,
+    };
+    let history: unknown[] = [pendingJob];
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url === '/backup/snapshots') return makeJsonResponse({ data: [{ id: 'snap-1', label: 'Server snapshot' }] });
+      if (url === '/backup/snapshots/snap-1/browse') return makeJsonResponse({ data: [] });
+      if (url === '/backup/restore?limit=6') return makeJsonResponse({ data: history });
+      if (url === '/backup/restore/restore-2/cancel' && method === 'POST') {
+        const cancelled = { ...pendingJob, status: 'cancelled', errorSummary: 'Cancelled by user' };
+        history = [cancelled];
+        return makeJsonResponse({ data: cancelled });
+      }
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<RestoreWizard />);
+
+    const cancel = await screen.findByRole('button', { name: /Cancel restore/i });
+    fireEvent.click(cancel);
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith('/backup/restore/restore-2/cancel', expect.objectContaining({ method: 'POST' }))
+    );
+    await waitFor(() => expect(showToastMock).toHaveBeenCalledWith(expect.objectContaining({ type: 'success', message: 'Restore cancelled.' })));
+    await waitFor(() => expect(screen.queryByRole('button', { name: /Cancel restore/i })).toBeNull());
+  });
+
+  it('surfaces the stop-signal warning when a running restore is cancelled but the agent was not reached', async () => {
+    const runningJob = {
+      id: 'restore-3',
+      snapshotId: 'snap-1',
+      deviceId: 'device-1',
+      restoreType: 'full',
+      status: 'running',
+      createdAt: '2026-03-31T11:00:00.000Z',
+      updatedAt: '2026-03-31T11:00:00.000Z',
+    };
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url === '/backup/snapshots') return makeJsonResponse({ data: [{ id: 'snap-1', label: 'Server snapshot' }] });
+      if (url === '/backup/snapshots/snap-1/browse') return makeJsonResponse({ data: [] });
+      if (url === '/backup/restore?limit=6') return makeJsonResponse({ data: [runningJob] });
+      if (url === '/backup/restore/restore-3/cancel' && method === 'POST') {
+        return makeJsonResponse({
+          data: { ...runningJob, status: 'cancelled' },
+          warning: 'Restore marked as cancelled but the stop signal could not be delivered to the agent.',
+        });
+      }
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<RestoreWizard />);
+    fireEvent.click(await screen.findByRole('button', { name: /Cancel restore/i }));
+
+    await waitFor(() => expect(showToastMock).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'warning',
+      message: 'Restore marked as cancelled but the stop signal could not be delivered to the agent.',
+    })));
+    // Partial success: the warning replaces the clean "Restore cancelled." toast.
+    expect(showToastMock).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'success' }));
+  });
+
+  it.each([
+    { restoreMode: 'rebuild', label: 'Rebuild to VHDX' },
+    { restoreMode: 'vm', label: 'Restore as VM' },
+    { restoreMode: 'instant_boot', label: 'Instant boot' },
+  ])('offers no Cancel for a queued $restoreMode job (it has its own lifecycle)', async ({ restoreMode, label }) => {
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === '/backup/snapshots') return makeJsonResponse({ data: [{ id: 'snap-1', label: 'Server snapshot' }] });
+      if (url === '/backup/snapshots/snap-1/browse') return makeJsonResponse({ data: [] });
+      if (url === '/backup/restore?limit=6') {
+        return makeJsonResponse({ data: [{ id: 'restore-9', snapshotId: 'snap-1', deviceId: 'device-1', deviceName: 'HV-HOST', restoreType: 'full', restoreMode, status: 'pending', createdAt: '2026-03-31T10:00:00.000Z', updatedAt: '2026-03-31T10:00:00.000Z' }] });
+      }
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<RestoreWizard />);
+    expect(await screen.findByText(new RegExp(`^${label} ·`))).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /Cancel restore/i })).toBeNull();
+  });
+
+  it('offers no Cancel for a restore that already finished', async () => {
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === '/backup/snapshots') return makeJsonResponse({ data: [{ id: 'snap-1', label: 'Server snapshot' }] });
+      if (url === '/backup/snapshots/snap-1/browse') return makeJsonResponse({ data: [] });
+      if (url === '/backup/restore?limit=6') {
+        return makeJsonResponse({ data: [{ id: 'restore-1', snapshotId: 'snap-1', deviceId: 'device-1', restoreType: 'full', status: 'completed', createdAt: '2026-03-31T10:00:00.000Z', updatedAt: '2026-03-31T10:10:00.000Z' }] });
+      }
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<RestoreWizard />);
+    await screen.findByText('Latest restore job');
+    expect(screen.queryByRole('button', { name: /Cancel restore/i })).toBeNull();
   });
 
   it('surfaces the restore API error when restore startup fails', async () => {
@@ -214,8 +620,70 @@ describe('RestoreWizard', () => {
 
     await screen.findByText('Latest restore job');
     expect(screen.getAllByText('running').length).toBeGreaterThan(0);
-    expect(screen.getByText(/Command: cmd-history-1/i)).toBeTruthy();
+    expect(screen.getByText('cmd-history-1')).toBeTruthy();
     expect(screen.getByText(/Target path: \/restore-target/i)).toBeTruthy();
+  });
+
+  const renderWithLatestResult = async (resultDetails: Record<string, unknown>, status = 'completed') => {
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === '/backup/snapshots') {
+        return makeJsonResponse({ data: [{ id: 'snap-1', label: 'Server snapshot', size: '4 GB' }] });
+      }
+      if (url === '/backup/snapshots/snap-1/browse') return makeJsonResponse({ data: [] });
+      if (url === '/backup/restore?limit=6') {
+        return makeJsonResponse({
+          data: [{
+            id: 'restore-q',
+            snapshotId: 'snap-1',
+            deviceId: 'device-1',
+            restoreType: 'full',
+            status,
+            targetPath: null,
+            createdAt: '2026-03-31T11:00:00.000Z',
+            updatedAt: '2026-03-31T11:05:00.000Z',
+            completedAt: '2026-03-31T11:05:00.000Z',
+            restoredSize: 1024,
+            restoredFiles: 3,
+            commandId: 'cmd-q',
+            errorSummary: null,
+            resultDetails,
+          }],
+        });
+      }
+      return makeJsonResponse({}, false, 404);
+    });
+    render(<RestoreWizard />);
+    await screen.findByText('Latest restore job');
+  };
+
+  it('shows the restricted-descriptor count and a collapsible path list', async () => {
+    await renderWithLatestResult({
+      status: 'completed',
+      securityDescriptorQuarantined: 3,
+      securityDescriptorQuarantinedPaths: ['C:\\Data\\a.txt', 'C:\\Data\\b.txt'],
+    });
+
+    const notice = await screen.findByTestId('restore-result-restricted-descriptors');
+    expect(notice.textContent).toContain('3');
+    const list = screen.getByTestId('restore-result-restricted-descriptors-paths');
+    expect(list.tagName).toBe('DETAILS');
+    expect(list.textContent).toContain('C:\\Data\\a.txt');
+    expect(list.textContent).toContain('C:\\Data\\b.txt');
+    // The count exceeds the listed paths — say so rather than implying the list is complete.
+    expect(screen.getByTestId('restore-result-restricted-descriptors-unlisted').textContent).toContain('1');
+  });
+
+  it('shows the restricted-descriptor count without a list when the helper sent none', async () => {
+    await renderWithLatestResult({ status: 'completed', securityDescriptorQuarantined: 4 });
+    expect((await screen.findByTestId('restore-result-restricted-descriptors')).textContent).toContain('4');
+    expect(screen.queryByTestId('restore-result-restricted-descriptors-paths')).toBeNull();
+  });
+
+  it('renders no restricted-descriptor notice for a result without the fields', async () => {
+    await renderWithLatestResult({ status: 'completed' });
+    expect(screen.queryByTestId('restore-result-restricted-descriptors')).toBeNull();
+    expect(screen.queryByTestId('restore-result-restricted-descriptors')).toBeNull();
   });
 
   it('blocks the restore until an alternate destination path is typed (#6349)', async () => {
@@ -285,6 +753,201 @@ describe('RestoreWizard', () => {
     });
   });
 
+  it('pre-populates the snapshot + selective-file selection carried from SnapshotBrowser (#6456)', async () => {
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === '/backup/snapshots') {
+        return makeJsonResponse({
+          data: [
+            { id: 'snap-1', label: 'Server snapshot', status: 'Ready', size: '4 GB' },
+            { id: 'snap-2', label: 'Other snapshot', status: 'Ready', size: '2 GB' },
+          ],
+        });
+      }
+      if (url === '/backup/snapshots/snap-2/browse') {
+        return makeJsonResponse({
+          data: [
+            { name: 'report.txt', path: '/Documents/report.txt', type: 'file', sizeBytes: 10 },
+            { name: 'notes.txt', path: '/Documents/notes.txt', type: 'file', sizeBytes: 20 },
+          ],
+        });
+      }
+      if (url === '/backup/restore?limit=6') return makeJsonResponse({ data: [] });
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(
+      <RestoreWizard
+        initialSnapshotId="snap-2"
+        initialSelectedPaths={['/Documents/report.txt']}
+      />
+    );
+
+    await screen.findByText('Restore Wizard');
+
+    // Step 0: the carried snapshot is selected, not the first one in the list.
+    expect(screen.getByRole('button', { name: /Other snapshot/i }).className).toContain('border-primary');
+
+    fireEvent.click(screen.getByRole('button', { name: /Continue/i }));
+    // Step 1: restore type defaults to selective because paths were carried.
+    expect(screen.getByRole('button', { name: /Selective Restore/i }).className).toContain('border-primary');
+
+    fireEvent.click(screen.getByRole('button', { name: /Continue/i }));
+    // Step 2: the carried file is pre-checked without the operator re-selecting it.
+    const checkbox = await screen.findByRole('checkbox', { name: /report\.txt/i });
+    expect((checkbox as HTMLInputElement).checked).toBe(true);
+  });
+
+  it('formats the snapshot size from the real API field (sizeBytes) instead of showing "--" (#6496)', async () => {
+    // The real /backup/snapshots response carries `sizeBytes` (a number), never
+    // a pre-formatted `size` string — reading `snapshot.size` always fell back
+    // to '--' in production.
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === '/backup/snapshots') {
+        return makeJsonResponse({
+          data: [{ id: 'snap-1', label: 'Server snapshot', sizeBytes: 1181116006 }],
+        });
+      }
+      if (url === '/backup/snapshots/snap-1/browse') return makeJsonResponse({ data: [] });
+      if (url === '/backup/restore?limit=6') return makeJsonResponse({ data: [] });
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<RestoreWizard />);
+    await screen.findByText('Restore Wizard');
+
+    expect(await screen.findByText('1.10 GB')).toBeTruthy();
+    expect(screen.queryByText('--')).toBeNull();
+  });
+
+  it('shows the snapshot capture time instead of a hard-coded "Ready" status (#6496)', async () => {
+    // /backup/snapshots carries no status field; the card used to print a
+    // fabricated "Ready" for every row. It now shows the real createdAt.
+    const createdAt = '2026-09-20T14:08:00.000Z';
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === '/backup/snapshots') {
+        return makeJsonResponse({
+          data: [{ id: 'snap-1', label: 'Server snapshot', sizeBytes: 1024, createdAt }],
+        });
+      }
+      if (url === '/backup/snapshots/snap-1/browse') return makeJsonResponse({ data: [] });
+      if (url === '/backup/restore?limit=6') return makeJsonResponse({ data: [] });
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<RestoreWizard />);
+    await screen.findByText('Server snapshot');
+
+    expect(screen.queryByText('Ready')).toBeNull();
+    expect(screen.getByText(formatDateTime(createdAt))).toBeTruthy();
+  });
+
+  it('renders no status text when the snapshot has no createdAt (#6496)', async () => {
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === '/backup/snapshots') {
+        return makeJsonResponse({
+          data: [{ id: 'snap-1', label: 'Server snapshot', sizeBytes: 1024, createdAt: null }],
+        });
+      }
+      if (url === '/backup/snapshots/snap-1/browse') return makeJsonResponse({ data: [] });
+      if (url === '/backup/restore?limit=6') return makeJsonResponse({ data: [] });
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<RestoreWizard />);
+    const label = await screen.findByText('Server snapshot');
+
+    const meta = label.previousElementSibling as HTMLElement;
+    expect(meta.children).toHaveLength(1);
+    expect(meta.textContent).toBe('1.00 KB');
+    expect(screen.queryByText('Ready')).toBeNull();
+  });
+
+  it('formats snapshot file sizes as bytes/KB/MB instead of raw byte counts (#6496)', async () => {
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === '/backup/snapshots') {
+        return makeJsonResponse({
+          data: [{ id: 'snap-1', label: 'Server snapshot', sizeBytes: 2097152 }],
+        });
+      }
+      if (url === '/backup/snapshots/snap-1/browse') {
+        return makeJsonResponse({
+          data: [{ name: 'db.bak', path: '/db.bak', type: 'file', sizeBytes: 2097152 }],
+        });
+      }
+      if (url === '/backup/restore?limit=6') return makeJsonResponse({ data: [] });
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<RestoreWizard />);
+    await screen.findByText('Restore Wizard');
+
+    fireEvent.click(screen.getByRole('button', { name: /Continue/i }));
+    fireEvent.click(screen.getByRole('button', { name: /Selective restore/i }));
+    fireEvent.click(screen.getByRole('button', { name: /Continue/i }));
+
+    expect(await screen.findByText('2.00 MB')).toBeTruthy();
+    expect(screen.queryByText('2097152 B')).toBeNull();
+  });
+
+  it('does not claim the default destination restores in place (#2562)', async () => {
+    // With no targetPath the agent writes under <temp>/breeze-restore/<source
+    // path> and never touches the originals. The card used to be labelled
+    // "Original location — Restore files in place", which is the opposite.
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === '/backup/snapshots') {
+        return makeJsonResponse({ data: [{ id: 'snap-1', label: 'Server snapshot', sizeBytes: 1024 }] });
+      }
+      if (url === '/backup/snapshots/snap-1/browse') return makeJsonResponse({ data: [] });
+      if (url === '/backup/restore?limit=6') return makeJsonResponse({ data: [] });
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<RestoreWizard />);
+    await screen.findByText('Restore Wizard');
+    for (let index = 0; index < 3; index += 1) {
+      fireEvent.click(screen.getByRole('button', { name: /Continue/i }));
+    }
+
+    expect(screen.queryByText(/Restore files in place/i)).toBeNull();
+    expect(screen.queryByText(/^Original location$/i)).toBeNull();
+    expect(screen.getByRole('button', { name: /Staging folder on the device/i })).toBeTruthy();
+    expect(screen.getByText(/originals are never overwritten/i)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole('button', { name: /Continue/i }));
+    expect(screen.queryByText(/^Original path$/)).toBeNull();
+    expect(screen.getAllByText(/Staging folder on the device/i).length).toBeGreaterThan(0);
+  });
+
+  it('echoes the typed alternate destination path on the Review step (#6496)', async () => {
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === '/backup/snapshots') {
+        return makeJsonResponse({ data: [{ id: 'snap-1', label: 'Server snapshot', sizeBytes: 4 * 1024 ** 3 }] });
+      }
+      if (url === '/backup/snapshots/snap-1/browse') return makeJsonResponse({ data: [] });
+      if (url === '/backup/restore?limit=6') return makeJsonResponse({ data: [] });
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<RestoreWizard />);
+    await screen.findByText('Restore Wizard');
+
+    for (let index = 0; index < 3; index += 1) {
+      fireEvent.click(screen.getByRole('button', { name: /Continue/i }));
+    }
+    fireEvent.click(screen.getByRole('button', { name: /Alternate path/i }));
+    fireEvent.change(screen.getByLabelText('Alternate path'), { target: { value: '/var/restore/target' } });
+    fireEvent.click(screen.getByRole('button', { name: /Continue/i }));
+
+    expect(await screen.findByText(/\/var\/restore\/target/)).toBeTruthy();
+  });
+
   it('leaves a 401 to the auth redirect instead of banner-ing "Unauthorized" (#6349)', async () => {
     // fetchWithAuth has already kicked off the session-expired redirect by the
     // time runAction sees a 401, so the wizard must stay quiet rather than
@@ -317,5 +980,460 @@ describe('RestoreWizard', () => {
     await waitFor(() => expect(start.disabled).toBe(false));
     expect(showToastMock).not.toHaveBeenCalled();
     expect(screen.queryByText('Unauthorized')).toBeNull();
+  });
+
+  describe('names the device and drops raw internals (#7213)', () => {
+    const historyRow = (over: Record<string, unknown>) => ({
+      id: '6f1c2b1e-0000-4000-8000-00000000abcd',
+      snapshotId: 'snap-1',
+      deviceId: 'device-1',
+      deviceName: 'FRONT-DESK-01',
+      restoreType: 'full',
+      restoreMode: null,
+      status: 'completed',
+      targetPath: null,
+      createdAt: '2026-03-31T10:00:00.000Z',
+      updatedAt: '2026-03-31T10:10:00.000Z',
+      startedAt: null,
+      completedAt: null,
+      restoredSize: 2048,
+      restoredFiles: 3,
+      errorSummary: null,
+      resultDetails: { status: 'completed', secretInternalKey: 'raw-json-marker' },
+      ...over,
+    });
+
+    const mockApi = (history: unknown[], browse: unknown[] = []) => {
+      fetchMock.mockImplementation(async (input) => {
+        const url = String(input);
+        if (url === '/backup/snapshots') {
+          return makeJsonResponse({
+            data: [
+              { id: 'snap-1', label: 'Nightly', deviceId: 'device-1', deviceName: 'FRONT-DESK-01', sizeBytes: 1024 },
+              { id: 'snap-2', label: 'Nightly', deviceId: 'device-2', deviceName: 'ACCOUNTING-02', sizeBytes: 1024 },
+            ],
+          });
+        }
+        if (url.startsWith('/backup/snapshots/') && url.endsWith('/browse')) return makeJsonResponse({ data: browse });
+        if (url === '/backup/restore?limit=6') return makeJsonResponse({ data: history });
+        return makeJsonResponse({}, false, 404);
+      });
+    };
+
+    it('names each device in the picker and on the chosen device\'s snapshot card', async () => {
+      mockApi([]);
+      render(<RestoreWizard />);
+      const select = await screen.findByTestId('restore-device-select');
+      // #9627: devices are picked first; the cards list one device at a time.
+      expect(screen.getByRole('option', { name: 'FRONT-DESK-01 (1 snapshot)' })).toBeTruthy();
+      expect(screen.getByRole('option', { name: 'ACCOUNTING-02 (1 snapshot)' })).toBeTruthy();
+      fireEvent.change(select, { target: { value: 'device-1' } });
+      expect(screen.getByRole('button', { name: /Nightly/i }).textContent).toContain('FRONT-DESK-01');
+    });
+
+    it('titles history rows with the device, not the restore job UUID', async () => {
+      const row = historyRow({});
+      mockApi([row]);
+      render(<RestoreWizard />);
+      await screen.findByText('Restore Wizard');
+      await waitFor(() => expect(screen.getAllByText(/FRONT-DESK-01/).length).toBeGreaterThan(0));
+      expect(screen.queryByText(row.id)).toBeNull();
+    });
+
+    it('labels VM restores and instant boots by what they are, not "full restore"', async () => {
+      mockApi([
+        historyRow({ id: 'r-vm', restoreMode: 'vm' }),
+        historyRow({ id: 'r-ib', restoreMode: 'instant_boot' }),
+      ]);
+      render(<RestoreWizard />);
+      await screen.findByText('Restore Wizard');
+      expect((await screen.findAllByText(/Restore as VM/i)).length).toBeGreaterThan(0);
+      expect(screen.getAllByText(/Instant boot/i).length).toBeGreaterThan(0);
+    });
+
+    it('does not dump the raw result payload JSON', async () => {
+      mockApi([historyRow({})]);
+      render(<RestoreWizard />);
+      await screen.findByText('Restore Wizard');
+      await waitFor(() => expect(screen.getAllByText(/FRONT-DESK-01/).length).toBeGreaterThan(0));
+      expect(screen.queryByText('Result payload')).toBeNull();
+      expect(screen.queryByText(/raw-json-marker/)).toBeNull();
+    });
+
+    it('uses the singular for a single selected file on Review', async () => {
+      mockApi([], [{ name: 'a.txt', path: '/a.txt', type: 'file', sizeBytes: 1 }]);
+      render(<RestoreWizard />);
+      fireEvent.change(await screen.findByTestId('restore-device-select'), { target: { value: 'device-1' } });
+      fireEvent.click(screen.getByRole('button', { name: /Continue/i }));
+      fireEvent.click(screen.getByRole('button', { name: /Selective Restore/i }));
+      fireEvent.click(screen.getByRole('button', { name: /Continue/i }));
+      fireEvent.click(await screen.findByRole('checkbox', { name: /a\.txt/i }));
+      fireEvent.click(screen.getByRole('button', { name: /Continue/i }));
+      fireEvent.click(screen.getByRole('button', { name: /Continue/i }));
+      expect(await screen.findByText('1 file selected')).toBeTruthy();
+      expect(screen.queryByText('1 files selected')).toBeNull();
+    });
+  });
+
+  describe('#11026 file list states on the select step', () => {
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    const arrange = (browse: (url: string) => unknown) => {
+      fetchMock.mockImplementation(async (input) => {
+        const url = String(input);
+        if (url === '/backup/snapshots') {
+          return makeJsonResponse({ data: [{ id: 'snap-1', label: 'Server snapshot', status: 'Ready', size: '4 GB' }] });
+        }
+        if (url.startsWith('/backup/snapshots/snap-1/browse') || url.endsWith('/file-index/rebuild')) {
+          const body = browse(url);
+          return body instanceof Response ? body : makeJsonResponse(body);
+        }
+        if (url === '/backup/restore?limit=6') return makeJsonResponse({ data: [] });
+        return makeJsonResponse({}, false, 404);
+      });
+    };
+    const openSelectStep = async () => {
+      render(<RestoreWizard initialSnapshotId="snap-1" />);
+      await screen.findByText('Restore Wizard');
+      fireEvent.click(screen.getByRole('button', { name: /Continue/i }));
+      fireEvent.click(screen.getByRole('button', { name: /Selective Restore/i }));
+      fireEvent.click(screen.getByRole('button', { name: /Continue/i }));
+    };
+
+    it('shows building instead of "no files", polls, and lists the folders once ready', async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      let ready = false;
+      arrange(() => (ready
+        ? { index: { state: 'ready' }, data: [{ name: 'C:', path: '/C:', type: 'directory' }], nextCursor: null }
+        : { index: { state: 'building' }, manifestUnavailable: true, data: [], nextCursor: null }));
+      await openSelectStep();
+
+      expect((await screen.findByTestId('snapshot-index-building')).textContent).toMatch(/Preparing this snapshot's file list/);
+      expect(screen.queryByText('No files available for this snapshot.')).toBeNull();
+
+      ready = true;
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+
+      expect(await screen.findByRole('checkbox', { name: /Select folder C:/i })).toBeTruthy();
+      expect(screen.queryByTestId('snapshot-index-building')).toBeNull();
+    });
+
+    it('an integrity failure says so and offers no retry', async () => {
+      arrange(() => ({ index: { state: 'unavailable', failure: 'manifest_differs_from_attestation', retryable: false, deviceLocal: false }, data: [] }));
+      await openSelectStep();
+      expect((await screen.findByTestId('snapshot-index-unavailable')).textContent).toMatch(/failed its integrity check/);
+      expect(screen.queryByTestId('snapshot-index-retry')).toBeNull();
+    });
+
+    it('a device-local snapshot says the list cannot be read from there', async () => {
+      arrange(() => ({ index: { state: 'unavailable', failure: 'manifest_missing', retryable: true, deviceLocal: true }, data: [] }));
+      await openSelectStep();
+      expect((await screen.findByTestId('snapshot-index-unavailable')).textContent).toMatch(/stored on the device/);
+    });
+
+    it('a retryable failure retries through runAction and shows building', async () => {
+      arrange((url) => (url.endsWith('/file-index/rebuild')
+        ? makeJsonResponse({ index: { state: 'building' } }, true, 202)
+        : { index: { state: 'unavailable', failure: 'provider_error', retryable: true, deviceLocal: false }, data: [] }));
+      await openSelectStep();
+      fireEvent.click(await screen.findByTestId('snapshot-index-retry'));
+      expect(await screen.findByTestId('snapshot-index-building')).toBeTruthy();
+      expect(fetchMock).toHaveBeenCalledWith('/backup/snapshots/snap-1/file-index/rebuild', { method: 'POST' });
+    });
+
+    it('a truly empty snapshot keeps the existing empty message', async () => {
+      arrange(() => ({ index: { state: 'ready' }, data: [], nextCursor: null }));
+      await openSelectStep();
+      expect(await screen.findByText('No files available for this snapshot.')).toBeTruthy();
+    });
+  });
+
+  it('browses selective-restore files one directory at a time and keeps selections across directories (#8230)', async () => {
+    const browseCalls: string[] = [];
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === '/backup/snapshots') {
+        return makeJsonResponse({ data: [{ id: 'snap-1', label: 'Server snapshot', status: 'Ready', size: '4 GB' }] });
+      }
+      if (url.startsWith('/backup/snapshots/snap-1/browse')) {
+        browseCalls.push(url);
+        if (url === '/backup/snapshots/snap-1/browse') {
+          return makeJsonResponse({
+            data: [
+              { name: 'C:', path: '/C:', type: 'directory' },
+              { name: 'root.txt', path: 'root.txt', type: 'file', sizeBytes: 1 },
+            ],
+            nextCursor: null,
+          });
+        }
+        if (url === '/backup/snapshots/snap-1/browse?dir=%2FC%3A') {
+          return makeJsonResponse({
+            data: [{ name: 'a.txt', path: 'C:/a.txt', type: 'file', sizeBytes: 2 }],
+            nextCursor: null,
+          });
+        }
+      }
+      if (url === '/backup/restore?limit=6') return makeJsonResponse({ data: [] });
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<RestoreWizard initialSnapshotId="snap-1" initialSelectedPaths={['root.txt']} />);
+    await screen.findByText('Restore Wizard');
+    fireEvent.click(screen.getByRole('button', { name: /Continue/i }));
+    fireEvent.click(screen.getByRole('button', { name: /Continue/i }));
+
+    expect(((await screen.findByRole('checkbox', { name: /root\.txt/i })) as HTMLInputElement).checked).toBe(true);
+    expect(browseCalls).toEqual(['/backup/snapshots/snap-1/browse']);
+
+    fireEvent.click(screen.getByRole('button', { name: 'C:/' }));
+    fireEvent.click(await screen.findByRole('checkbox', { name: /a\.txt/i }));
+    expect(browseCalls).toEqual([
+      '/backup/snapshots/snap-1/browse',
+      '/backup/snapshots/snap-1/browse?dir=%2FC%3A',
+    ]);
+
+    // Back at the root, the earlier selection is still checked.
+    fireEvent.click(screen.getByRole('button', { name: 'Up' }));
+    expect(((await screen.findByRole('checkbox', { name: /root\.txt/i })) as HTMLInputElement).checked).toBe(true);
+    expect(screen.getByText(/2 files? selected|2/)).toBeTruthy();
+  });
+  describe('scopes step 1 to one device (#9627)', () => {
+    // Newest-first, as GET /backup/snapshots returns them: the org's newest
+    // snapshot belongs to FILESERVER, not the device the operator came for.
+    const multiDeviceSnapshots = [
+      { id: 'snap-b2', deviceId: 'dev-b', deviceName: 'FILESERVER', label: 'FS newest', createdAt: '2026-10-20T10:00:00.000Z' },
+      { id: 'snap-a1', deviceId: 'dev-a', deviceName: 'DC01', label: 'DC nightly', createdAt: '2026-10-19T10:00:00.000Z' },
+      { id: 'snap-b1', deviceId: 'dev-b', deviceName: 'FILESERVER', label: 'FS older', createdAt: '2026-10-18T10:00:00.000Z' },
+    ];
+
+    beforeEach(() => {
+      fetchMock.mockImplementation(async (input) => {
+        const url = String(input);
+        if (url === '/backup/snapshots') return makeJsonResponse({ data: multiDeviceSnapshots });
+        if (url === '/backup/restore?limit=6') return makeJsonResponse({ data: [] });
+        return makeJsonResponse({ data: [] });
+      });
+    });
+
+    it('preselects no snapshot and lists none until a device is chosen', async () => {
+      render(<RestoreWizard />);
+      const select = await screen.findByTestId('restore-device-select');
+
+      expect((select as HTMLSelectElement).value).toBe('');
+      expect(screen.queryByRole('button', { name: /FS newest/i })).toBeNull();
+      expect(screen.queryByRole('button', { name: /DC nightly/i })).toBeNull();
+      expect((screen.getByRole('button', { name: /Continue/i }) as HTMLButtonElement).disabled).toBe(true);
+      // Nothing reached the browse endpoint: no snapshot is selected.
+      expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/browse'))).toBe(false);
+    });
+
+    it('lists only the chosen device\'s snapshots and names the device on Review', async () => {
+      render(<RestoreWizard />);
+      fireEvent.change(await screen.findByTestId('restore-device-select'), { target: { value: 'dev-a' } });
+
+      const dcCard = screen.getByRole('button', { name: /DC nightly/i });
+      expect(dcCard.className).toContain('border-primary');
+      expect(screen.queryByRole('button', { name: /FS newest/i })).toBeNull();
+      expect(screen.queryByRole('button', { name: /FS older/i })).toBeNull();
+
+      for (let index = 0; index < 4; index += 1) {
+        fireEvent.click(screen.getByRole('button', { name: /Continue/i }));
+      }
+      expect(screen.getByTestId('restore-review-device').textContent).toContain('DC01');
+      expect(screen.getByTestId('restore-review-snapshot').textContent).toContain('DC nightly');
+    });
+
+    it('switching device drops the previous device\'s snapshot', async () => {
+      render(<RestoreWizard />);
+      const select = await screen.findByTestId('restore-device-select');
+      fireEvent.change(select, { target: { value: 'dev-a' } });
+      expect(screen.getByRole('button', { name: /DC nightly/i }).className).toContain('border-primary');
+
+      fireEvent.change(select, { target: { value: 'dev-b' } });
+      expect(screen.queryByRole('button', { name: /DC nightly/i })).toBeNull();
+      // The newest snapshot of the newly chosen device, never the old pick.
+      expect(screen.getByRole('button', { name: /FS newest/i }).className).toContain('border-primary');
+      expect(screen.getByRole('button', { name: /FS older/i }).className).not.toContain('border-primary');
+    });
+
+    it('does not swap a carried snapshot that is no longer listed for another one', async () => {
+      // Single-device org: without the guard, the device would be implied and
+      // its newest snapshot silently substituted for the one the link named.
+      fetchMock.mockImplementation(async (input) => {
+        const url = String(input);
+        if (url === '/backup/snapshots') return makeJsonResponse({ data: multiDeviceSnapshots.filter((snap) => snap.deviceId === 'dev-b') });
+        if (url === '/backup/restore?limit=6') return makeJsonResponse({ data: [] });
+        return makeJsonResponse({ data: [] });
+      });
+      render(<RestoreWizard initialSnapshotId="snap-gone" initialSelectedPaths={['/a.txt']} />);
+      const select = await screen.findByTestId('restore-device-select');
+
+      expect((select as HTMLSelectElement).value).toBe('');
+      expect(screen.getByTestId('restore-carried-snapshot-missing')).toBeTruthy();
+      expect(screen.queryByRole('button', { name: /FS newest/i })).toBeNull();
+      expect((screen.getByRole('button', { name: /Continue/i }) as HTMLButtonElement).disabled).toBe(true);
+
+      // An explicit device choice then works as usual.
+      fireEvent.change(select, { target: { value: 'dev-b' } });
+      expect(screen.getByRole('button', { name: /FS newest/i }).className).toContain('border-primary');
+    });
+
+    it('restores the chosen device\'s snapshot after a switch, not the earlier pick', async () => {
+      fetchMock.mockImplementation(async (input, init) => {
+        const url = String(input);
+        if (url === '/backup/snapshots') return makeJsonResponse({ data: multiDeviceSnapshots });
+        if (url === '/backup/restore?limit=6') return makeJsonResponse({ data: [] });
+        if (url === '/backup/restore' && init?.method === 'POST') {
+          return makeJsonResponse({ data: { id: 'restore-1', snapshotId: 'snap-a1', deviceId: 'dev-a', restoreType: 'full', status: 'pending', createdAt: '2026-10-21T10:00:00.000Z', updatedAt: '2026-10-21T10:00:00.000Z' } });
+        }
+        return makeJsonResponse({ data: [] });
+      });
+      render(<RestoreWizard />);
+      const select = await screen.findByTestId('restore-device-select');
+      fireEvent.change(select, { target: { value: 'dev-b' } });
+      fireEvent.click(screen.getByRole('button', { name: /FS older/i }));
+      fireEvent.change(select, { target: { value: 'dev-a' } });
+
+      for (let index = 0; index < 4; index += 1) {
+        fireEvent.click(screen.getByRole('button', { name: /Continue/i }));
+      }
+      expect(screen.getByTestId('restore-review-device').textContent).toContain('DC01');
+      fireEvent.click(screen.getByRole('button', { name: /Start restore/i }));
+
+      await waitFor(() => {
+        const post = fetchMock.mock.calls.find(([url, init]) => String(url) === '/backup/restore' && init?.method === 'POST');
+        expect(post).toBeTruthy();
+        expect(JSON.parse(String(post![1]!.body)).snapshotId).toBe('snap-a1');
+      });
+    });
+
+    it('selects nothing for a carried snapshot no longer listed in a multi-device org', async () => {
+      render(<RestoreWizard initialSnapshotId="snap-gone" />);
+      const select = await screen.findByTestId('restore-device-select');
+
+      expect((select as HTMLSelectElement).value).toBe('');
+      expect(screen.getByTestId('restore-carried-snapshot-missing')).toBeTruthy();
+      expect((screen.getByRole('button', { name: /Continue/i }) as HTMLButtonElement).disabled).toBe(true);
+    });
+
+    it('scopes a single-device org to that device and its newest snapshot without a click', async () => {
+      fetchMock.mockImplementation(async (input) => {
+        const url = String(input);
+        if (url === '/backup/snapshots') return makeJsonResponse({ data: multiDeviceSnapshots.filter((snap) => snap.deviceId === 'dev-b') });
+        if (url === '/backup/restore?limit=6') return makeJsonResponse({ data: [] });
+        return makeJsonResponse({ data: [] });
+      });
+      render(<RestoreWizard />);
+      const select = await screen.findByTestId('restore-device-select');
+
+      expect((select as HTMLSelectElement).value).toBe('dev-b');
+      expect(screen.getByRole('button', { name: /FS newest/i }).className).toContain('border-primary');
+      expect(screen.queryByTestId('restore-carried-snapshot-missing')).toBeNull();
+    });
+
+    it('clears carried selective paths when the operator switches to another device', async () => {
+      render(<RestoreWizard initialSnapshotId="snap-b1" initialSelectedPaths={['/Documents/report.txt']} />);
+      const select = await screen.findByTestId('restore-device-select');
+      fireEvent.change(select, { target: { value: 'dev-a' } });
+
+      for (let index = 0; index < 4; index += 1) {
+        fireEvent.click(screen.getByRole('button', { name: /Continue/i }));
+      }
+      expect(screen.getByText('0 files selected')).toBeTruthy();
+      expect((screen.getByRole('button', { name: /Start restore/i }) as HTMLButtonElement).disabled).toBe(true);
+    });
+
+    it('scopes to the device of a snapshot carried in from SnapshotBrowser', async () => {
+      render(<RestoreWizard initialSnapshotId="snap-b1" />);
+      const select = await screen.findByTestId('restore-device-select');
+
+      expect((select as HTMLSelectElement).value).toBe('dev-b');
+      expect(screen.getByRole('button', { name: /FS older/i }).className).toContain('border-primary');
+      expect(screen.getByRole('button', { name: /FS newest/i }).className).not.toContain('border-primary');
+      expect(screen.queryByRole('button', { name: /DC nightly/i })).toBeNull();
+    });
+  });
+});
+
+describe('RestoreWizard folder selection (#9628)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  const mockTree = (fileCount: number) => {
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === '/backup/snapshots') {
+        return makeJsonResponse({ data: [{ id: 'snap-1', label: 'Server snapshot', status: 'Ready', size: '4 GB' }] });
+      }
+      if (url === '/backup/snapshots/snap-1/browse') {
+        return makeJsonResponse({
+          data: [{ name: 'Finance', path: '/Finance', type: 'directory', fileCount }],
+        });
+      }
+      if (url === '/backup/restore?limit=6') return makeJsonResponse({ data: [] });
+      return makeJsonResponse({}, false, 404);
+    });
+  };
+
+  const openSelectStep = async (initialSelectedPaths?: string[]) => {
+    render(<RestoreWizard initialSnapshotId="snap-1" initialSelectedPaths={initialSelectedPaths} />);
+    await screen.findByText('Restore Wizard');
+    fireEvent.click(screen.getByRole('button', { name: /Continue/i }));
+    if (!initialSelectedPaths) fireEvent.click(screen.getByRole('button', { name: /Selective Restore/i }));
+    fireEvent.click(screen.getByRole('button', { name: /Continue/i }));
+    return screen.findByRole('checkbox', { name: /Select folder Finance/i });
+  };
+
+  it('renders a checkbox with the file count on a directory row and selects it', async () => {
+    mockTree(12);
+    const checkbox = (await openSelectStep()) as HTMLInputElement;
+    expect(screen.getByText('12 files')).toBeTruthy();
+    expect(checkbox.checked).toBe(false);
+    fireEvent.click(checkbox);
+    expect(checkbox.checked).toBe(true);
+    fireEvent.click(checkbox);
+    expect(checkbox.checked).toBe(false);
+  });
+
+  it('shows the folder as indeterminate when only some of its files are selected', async () => {
+    mockTree(12);
+    const checkbox = (await openSelectStep(['/Finance/q3.xlsx'])) as HTMLInputElement;
+    expect(checkbox.checked).toBe(false);
+    expect(checkbox.indeterminate).toBe(true);
+  });
+
+  it('asks (in-app dialog, not window.confirm) before selecting a folder past 1,000 files, and respects a refusal', async () => {
+    mockTree(5000);
+    const nativeConfirm = vi.spyOn(window, 'confirm');
+    const checkbox = (await openSelectStep()) as HTMLInputElement;
+    fireEvent.click(checkbox);
+    expect(screen.getByTestId('restore-large-folder-dialog').textContent).toContain('5,000');
+    expect(checkbox.checked).toBe(false);
+    fireEvent.click(screen.getByRole('button', { name: /Cancel/i }));
+    expect(screen.queryByTestId('restore-large-folder-dialog')).toBeNull();
+    expect(checkbox.checked).toBe(false);
+
+    fireEvent.click(checkbox);
+    fireEvent.click(screen.getByTestId('restore-large-folder-confirm'));
+    expect(checkbox.checked).toBe(true);
+    expect(nativeConfirm).not.toHaveBeenCalled();
+    nativeConfirm.mockRestore();
+  });
+
+  it('summarises a selected folder as a folder, not "1 file", and formats large counts', async () => {
+    mockTree(10001);
+    const checkbox = (await openSelectStep(['/Finance/q3.xlsx'])) as HTMLInputElement;
+    expect(screen.getByText((10001).toLocaleString() + ' files')).toBeTruthy();
+    fireEvent.click(checkbox);
+    expect(screen.getByTestId('restore-large-folder-dialog').textContent).toContain((10001).toLocaleString());
+    fireEvent.click(screen.getByTestId('restore-large-folder-confirm'));
+    for (let index = 0; index < 2; index += 1) {
+      fireEvent.click(screen.getByRole('button', { name: /Continue/i }));
+    }
+    expect(screen.getByText('1 file, 1 folder')).toBeTruthy();
+    expect(screen.queryByText('2 files selected')).toBeNull();
   });
 });

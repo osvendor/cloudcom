@@ -5,15 +5,16 @@ package main
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
+	"github.com/breeze-rmm/agent/internal/procspawn"
+	"github.com/breeze-rmm/agent/internal/securefs"
 	"github.com/spf13/cobra"
 )
 
 const (
-	watchdogBinaryPath = "/usr/local/bin/breeze-watchdog"
+	watchdogBinaryPath = securefs.TrustedExecutableDir + "/breeze-watchdog"
 	watchdogPlistDst   = "/Library/LaunchDaemons/com.breeze.watchdog.plist"
 	watchdogLabel      = "com.breeze.watchdog"
 )
@@ -27,7 +28,7 @@ const watchdogPlist = `<?xml version="1.0" encoding="UTF-8"?>
 
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/breeze-watchdog</string>
+        <string>/Library/Breeze/bin/breeze-watchdog</string>
         <string>run</string>
     </array>
 
@@ -79,16 +80,28 @@ func serviceInstallCmd() *cobra.Command {
 				return fmt.Errorf("failed to create %s: %w", logDir, err)
 			}
 
+			// The binary directory must be root-owned and not group/other
+			// writable — see securefs.VerifyTrustedExecutableOwner, run at
+			// every privileged startup. EnsureTrustedDirChain walks every
+			// component under /Library with a symlink-refusing check instead
+			// of blindly creating/chowning through whatever is already
+			// there — /Library itself is admin-group-writable, so a
+			// pre-planted symlink or a foreign-owned directory must be
+			// refused, not followed.
+			if err := securefs.EnsureTrustedDirChain(securefs.TrustedExecutableDirRoot, securefs.TrustedExecutableDir, 0, 0, 0755); err != nil {
+				return fmt.Errorf("failed to secure %s: %w", securefs.TrustedExecutableDir, err)
+			}
+
 			// Stop existing service before replacing binary.
 			if _, err := os.Stat(watchdogPlistDst); err == nil {
-				if stopErr := exec.Command("launchctl", "unload", watchdogPlistDst).Run(); stopErr != nil {
+				if stopErr := procspawn.Command("launchctl", "unload", watchdogPlistDst).Run(); stopErr != nil {
 					fmt.Fprintf(os.Stderr, "Warning: failed to stop existing service: %v\n", stopErr)
 				} else {
 					fmt.Println("Stopped existing Breeze Watchdog service.")
 				}
 			}
 
-			// Copy current binary to /usr/local/bin/.
+			// Copy current binary to the trusted binary directory.
 			exePath, err := os.Executable()
 			if err != nil {
 				return fmt.Errorf("failed to determine executable path: %w", err)
@@ -99,27 +112,23 @@ func serviceInstallCmd() *cobra.Command {
 			}
 
 			if exePath != watchdogBinaryPath {
-				data, err := os.ReadFile(exePath)
-				if err != nil {
-					return fmt.Errorf("failed to read binary: %w", err)
-				}
-				if err := os.WriteFile(watchdogBinaryPath, data, 0755); err != nil {
+				if err := installBinaryAtomically(exePath, watchdogBinaryPath); err != nil {
 					return fmt.Errorf("failed to copy binary to %s: %w", watchdogBinaryPath, err)
 				}
 				fmt.Printf("Binary installed to %s\n", watchdogBinaryPath)
 			}
 
 			// Write launchd plist.
-			if err := os.WriteFile(watchdogPlistDst, []byte(watchdogPlist), 0644); err != nil {
+			if err := writeFileAtomically(watchdogPlistDst, []byte(watchdogPlist), 0o644); err != nil {
 				return fmt.Errorf("failed to write plist: %w", err)
 			}
 			fmt.Printf("LaunchDaemon plist installed to %s\n", watchdogPlistDst)
 
 			// Bootstrap the service.
-			out, err := exec.Command("launchctl", "bootstrap", "system", watchdogPlistDst).CombinedOutput()
+			out, err := procspawn.Command("launchctl", "bootstrap", "system", watchdogPlistDst).CombinedOutput()
 			if err != nil {
 				// Fallback to legacy load.
-				out2, err2 := exec.Command("launchctl", "load", watchdogPlistDst).CombinedOutput()
+				out2, err2 := procspawn.Command("launchctl", "load", watchdogPlistDst).CombinedOutput()
 				if err2 != nil {
 					return fmt.Errorf("failed to load service: %s / %s",
 						strings.TrimSpace(string(out)), strings.TrimSpace(string(out2)))
@@ -143,9 +152,9 @@ func serviceUninstallCmd() *cobra.Command {
 
 			// Stop and unload.
 			if isWatchdogLoaded() {
-				out, err := exec.Command("launchctl", "bootout", "system/"+watchdogLabel).CombinedOutput()
+				out, err := procspawn.Command("launchctl", "bootout", "system/"+watchdogLabel).CombinedOutput()
 				if err != nil {
-					out2, err2 := exec.Command("launchctl", "unload", watchdogPlistDst).CombinedOutput()
+					out2, err2 := procspawn.Command("launchctl", "unload", watchdogPlistDst).CombinedOutput()
 					if err2 != nil {
 						fmt.Fprintf(os.Stderr, "Warning: failed to stop service: %s / %s\n",
 							strings.TrimSpace(string(out)), strings.TrimSpace(string(out2)))
@@ -184,14 +193,14 @@ func serviceStartCmd() *cobra.Command {
 			}
 
 			if isWatchdogLoaded() {
-				out, err := exec.Command("launchctl", "kickstart", "system/"+watchdogLabel).CombinedOutput()
+				out, err := procspawn.Command("launchctl", "kickstart", "system/"+watchdogLabel).CombinedOutput()
 				if err != nil {
 					return fmt.Errorf("failed to start service: %s", strings.TrimSpace(string(out)))
 				}
 			} else {
-				out, err := exec.Command("launchctl", "bootstrap", "system", watchdogPlistDst).CombinedOutput()
+				out, err := procspawn.Command("launchctl", "bootstrap", "system", watchdogPlistDst).CombinedOutput()
 				if err != nil {
-					out2, err2 := exec.Command("launchctl", "load", watchdogPlistDst).CombinedOutput()
+					out2, err2 := procspawn.Command("launchctl", "load", watchdogPlistDst).CombinedOutput()
 					if err2 != nil {
 						return fmt.Errorf("failed to load service: %s / %s",
 							strings.TrimSpace(string(out)), strings.TrimSpace(string(out2)))
@@ -219,9 +228,9 @@ func serviceStopCmd() *cobra.Command {
 				return nil
 			}
 
-			out, err := exec.Command("launchctl", "bootout", "system/"+watchdogLabel).CombinedOutput()
+			out, err := procspawn.Command("launchctl", "bootout", "system/"+watchdogLabel).CombinedOutput()
 			if err != nil {
-				out2, err2 := exec.Command("launchctl", "unload", watchdogPlistDst).CombinedOutput()
+				out2, err2 := procspawn.Command("launchctl", "unload", watchdogPlistDst).CombinedOutput()
 				if err2 != nil {
 					return fmt.Errorf("failed to stop service: %s / %s",
 						strings.TrimSpace(string(out)), strings.TrimSpace(string(out2)))
@@ -236,20 +245,21 @@ func serviceStopCmd() *cobra.Command {
 
 // restartWatchdogService restarts the watchdog via launchctl kickstart.
 func restartWatchdogService() error {
-	out, err := exec.Command("launchctl", "kickstart", "-k", "system/"+watchdogLabel).CombinedOutput()
+	out, err := procspawn.Command("launchctl", "kickstart", "-k", "system/"+watchdogLabel).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("launchctl kickstart failed: %s: %w", strings.TrimSpace(string(out)), err)
 	}
 	return nil
 }
 
-// agentBinaryPath returns the platform-specific agent binary path.
+// agentBinaryPath returns the agent binary the .pkg installed:
+// /Library/Breeze/bin when it holds the agent, else /usr/local/bin (#8778).
 func agentBinaryPath() string {
-	return "/usr/local/bin/breeze-agent"
+	return installedAgentPath(securefs.TrustedExecutableDir, "/usr/local/bin")
 }
 
 func isWatchdogLoaded() bool {
-	err := exec.Command("launchctl", "print", "system/"+watchdogLabel).Run()
+	err := procspawn.Command("launchctl", "print", "system/"+watchdogLabel).Run()
 	return err == nil
 }
 

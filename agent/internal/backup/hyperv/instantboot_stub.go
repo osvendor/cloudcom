@@ -5,6 +5,7 @@ package hyperv
 import (
 	"context"
 
+	"github.com/breeze-rmm/agent/internal/backup/integrity"
 	"github.com/breeze-rmm/agent/internal/backup/providers"
 )
 
@@ -16,16 +17,9 @@ type InstantBootConfig struct {
 	CPUCount   int    `json:"cpuCount,omitempty"`
 	DiskSizeGB int64  `json:"diskSizeGb,omitempty"`
 	WorkDir    string `json:"workDir,omitempty"`
-}
-
-// InstantBootResult holds the outcome of an instant boot operation.
-type InstantBootResult struct {
-	VMName               string `json:"vmName"`
-	NewVMID              string `json:"newVmId"`
-	Status               string `json:"status"`
-	BootTimeMs           int64  `json:"bootTimeMs"`
-	BackgroundSyncActive bool   `json:"backgroundSyncActive"`
-	Error                string `json:"error,omitempty"`
+	// Integrity is the command's integrity expectation (nil when the
+	// payload carried none). Not part of the JSON form.
+	Integrity *integrity.Expectation `json:"-"`
 }
 
 // InstantBoot is a stub for non-Windows platforms.

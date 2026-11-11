@@ -3,18 +3,23 @@ import { db } from '../db';
 import { devices, organizationUsers, users } from '../db/schema';
 import type { DeviceRole } from '@breeze/shared';
 import { ContractServiceError } from './contractTypes';
-import { resolveEffectiveGroupMembers, type GroupForResolution } from './groupMembership';
+import { GroupEvaluationError, resolveEffectiveGroupMembers, type GroupForResolution } from './groupMembership';
 import type { GroupMembers } from './contractCoverage';
+import { notParkedDeviceCondition } from './unassignedPool/selectorPredicate';
 
 /** The one set of "is this device billable" predicates. Every device count and
- *  the snapshot below MUST use it — never fork these conditions. */
-function billableDeviceConds(orgId: string) {
+ *  the snapshot below MUST use it — never fork these conditions. Exported for
+ *  its unit test only. */
+export function billableDeviceConds(orgId: string) {
   return [
     eq(devices.orgId, orgId),
     ne(devices.status, 'decommissioned' as never),
     // Quick Support ephemeral devices: an ad-hoc support session must never
     // bill a customer for a machine that existed for twenty minutes.
     eq(devices.isEphemeral, false),
+    // A device parked in its partner's holding org is not under management
+    // yet and never bills; it starts counting when it is assigned.
+    notParkedDeviceCondition(),
   ];
 }
 
@@ -82,7 +87,8 @@ export async function billableDeviceById(deviceId: string, orgId: string): Promi
  *  or moved-out device never counts whatever table or filter produced it.
  *  Throws GroupEvaluationError; the service maps it to GROUP_EVALUATION_FAILED. */
 export async function groupMembersForBilling(group: GroupForResolution): Promise<GroupMembers> {
-  const { matched, pinned } = await resolveEffectiveGroupMembers(group);
+  if (group.orgId === null) throw new GroupEvaluationError(group.id, 'unsupported_owner');
+  const { matched, pinned } = await resolveEffectiveGroupMembers(group, group.orgId);
   return { siteId: group.siteId, memberIds: new Set([...matched, ...pinned]) };
 }
 

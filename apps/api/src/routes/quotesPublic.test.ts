@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Hono } from 'hono';
+import { secureHeaders } from 'hono/secure-headers';
 import type { SQL } from 'drizzle-orm';
 import { PgDialect } from 'drizzle-orm/pg-core';
 
@@ -56,6 +57,9 @@ vi.mock('../services/publicLinkOrgGate', async (importActual) => {
 });
 
 import { quotesPublicRoutes } from './quotesPublic';
+import { bySameOriginFramePath, isSameOriginFramePath } from '../middleware/sameOriginFrame';
+import { routeReferrerPolicyWins } from '../middleware/routeReferrerPolicy';
+import { securityMiddleware } from '../middleware/security';
 import { resolveQuoteLinkOrgGate, PUBLIC_LINK_ORG_UNAVAILABLE } from '../services/publicLinkOrgGate';
 import { db } from '../db';
 import { verifyQuoteAcceptToken, isQuoteAcceptJtiRevoked, revokeQuoteAcceptJti } from '../services/quoteAcceptToken';
@@ -199,7 +203,10 @@ describe('quotesPublic GET /:token', () => {
       'sellerSnapshot',
       'coverPage',
       'termsAndConditions',
+      // #9418: the customer document's one additive header key (the pill).
+      'displayStatus',
     ]);
+    expect(header.displayStatus).toBe('viewed');
     expect(JSON.stringify(header)).not.toContain('internal-');
     expect(JSON.stringify(header)).not.toContain('do-not-serialize');
     // Sibling `presentation` field (Task 12) — no partner theme row preset, so
@@ -510,6 +517,54 @@ describe('quotesPublic GET /:token/contract-file/:blockId', () => {
     const res = await app().request(`/quotes/public/${TOKEN}/contract-file/${BLOCK_ID}`, { method: 'GET' });
     expect(res.status).toBe(401);
   });
+
+  describe('framing under the app-wide header stack (#10192)', () => {
+    // index.ts wraps every router in secureHeaders (X-Frame-Options) + securityMiddleware (CSP), both path-selected.
+    // Mount this router at its real /api/v1 path so a drift between the route and the frame list fails here.
+    function appWithHeaders() {
+      const OPTIONS = { strictTransportSecurity: 'max-age=31536000; includeSubDomains; preload', xFrameOptions: 'DENY', referrerPolicy: 'strict-origin-when-cross-origin' } as const;
+      const a = new Hono();
+      a.use('*', routeReferrerPolicyWins(bySameOriginFramePath(
+        secureHeaders({ ...OPTIONS }),
+        secureHeaders({ ...OPTIONS, xFrameOptions: 'SAMEORIGIN' }),
+      )));
+      a.use('*', securityMiddleware({ nodeEnv: 'production', sameOriginFrameWhen: isSameOriginFramePath }));
+      a.route('/api/v1/quotes/public', quotesPublicRoutes);
+      return a;
+    }
+
+    it('the contract PDF can be framed by the quote page (same origin) and keeps its own headers', async () => {
+      dbResults.push([{ id: QUOTE_ID }]); // quotes SELECT
+      dbResults.push([
+        { id: BLOCK_ID, quoteId: QUOTE_ID, orgId: ORG_ID, blockType: 'contract', content: { templateId: TEMPLATE_ID, templateVersionId: VERSION_ID, variableValues: {} } },
+      ]); // quoteBlocks SELECT
+      dbResults.push([{
+        id: VERSION_ID, templateId: TEMPLATE_ID, orgId: null, partnerId: PARTNER_ID, versionNumber: 1, status: 'published',
+        sourceType: 'uploaded', bodyHtml: null, fileData: Buffer.from('%PDF-1.4'), mime: 'application/pdf', byteSize: 8,
+        sha256: 'sha3', declaredVariables: [], publishedAt: new Date('2026-07-01T00:00:00Z'), createdBy: 'user-1', createdAt: new Date('2026-07-01T00:00:00Z'),
+      }]); // contractTemplateVersions SELECT
+      dbResults.push([{
+        id: TEMPLATE_ID, orgId: null, partnerId: PARTNER_ID, name: 'MSA', description: null, status: 'active',
+        createdBy: 'user-1', createdAt: new Date('2026-07-01T00:00:00Z'), updatedAt: new Date('2026-07-01T00:00:00Z'),
+      }]); // contractTemplates SELECT
+      const res = await appWithHeaders().request(`/api/v1/quotes/public/${TOKEN}/contract-file/${BLOCK_ID}`);
+      expect(res.status).toBe(200);
+      expect(res.headers.get('content-type')).toBe('application/pdf');
+      expect(res.headers.get('x-frame-options')).toBe('SAMEORIGIN');
+      const csp = res.headers.get('content-security-policy') ?? '';
+      expect(csp).toContain("frame-ancestors 'self'");
+      expect(csp).not.toContain("frame-ancestors 'none'");
+      expect(res.headers.get('cache-control')).toBe('private, max-age=300');
+    });
+
+    it('the JSON view on the same token stays unframeable', async () => {
+      (verifyQuoteAcceptToken as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      const res = await appWithHeaders().request(`/api/v1/quotes/public/${TOKEN}`);
+      expect(res.status).toBe(401);
+      expect(res.headers.get('x-frame-options')).toBe('DENY');
+      expect(res.headers.get('content-security-policy')).toContain("frame-ancestors 'none'");
+    });
+  });
 });
 
 describe('quotesPublic GET /:token/line-image/:lineId', () => {
@@ -592,12 +647,12 @@ describe('quotesPublic org-lifecycle gate', () => {
     (isQuoteAcceptJtiRevoked as ReturnType<typeof vi.fn>).mockResolvedValue(false);
     // clearAllMocks clears CALLS, not implementations — reset the gate to open
     // so a blocked case cannot leak forward and make a later case vacuous.
-    vi.mocked(resolveQuoteLinkOrgGate).mockResolvedValue({ orgId: null, status: null, blocked: false });
+    vi.mocked(resolveQuoteLinkOrgGate).mockResolvedValue({ orgId: null, status: null, partnerStatus: null, blocked: false });
   });
 
   it.each(ROUTES)('%s returns 410 when the quote resolves to an archived org', async (_name, path, init) => {
     vi.mocked(resolveQuoteLinkOrgGate).mockResolvedValue({
-      orgId: ORG_ID, status: 'archived', blocked: true,
+      orgId: ORG_ID, status: 'archived', partnerStatus: 'active', blocked: true,
     });
 
     const res = await app().request(path, init);
@@ -612,7 +667,7 @@ describe('quotesPublic org-lifecycle gate', () => {
   it('keeps a merged-away quote working when the SURVIVOR org is live (Wave 2 continuity)', async () => {
     const SURVIVOR = '99999999-9999-4999-8999-999999999999';
     vi.mocked(resolveQuoteLinkOrgGate).mockResolvedValue({
-      orgId: SURVIVOR, status: 'active', blocked: false,
+      orgId: SURVIVOR, status: 'active', partnerStatus: 'active', blocked: false,
     });
     dbResults.push([{
       id: QUOTE_ID, orgId: SURVIVOR, partnerId: PARTNER_ID, status: 'sent',
@@ -631,7 +686,7 @@ describe('quotesPublic org-lifecycle gate', () => {
 
   it('gates on the RESOLVED org set, not the token claim (survivor ids are passed through)', async () => {
     vi.mocked(resolveQuoteLinkOrgGate).mockResolvedValue({
-      orgId: ORG_ID, status: 'archived', blocked: true,
+      orgId: ORG_ID, status: 'archived', partnerStatus: 'active', blocked: true,
     });
     await app().request(`/quotes/public/${TOKEN}`, { method: 'GET' });
     expect(resolveQuoteLinkOrgGate).toHaveBeenCalledWith(QUOTE_ID, [ORG_ID]);

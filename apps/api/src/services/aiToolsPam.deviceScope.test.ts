@@ -16,6 +16,11 @@ vi.mock('../db', () => ({
 }));
 vi.mock('./eventBus', () => ({ publishEvent: vi.fn() }));
 vi.mock('./pamRuleEngine', () => ({ evaluatePamRules: vi.fn() }));
+// W04-D10: revoke requests device cleanup (asserted in aiToolsPam.revokeCleanup.test.ts).
+vi.mock('./pamActuationLifecycle', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./pamActuationLifecycle')>()),
+  requestPamCleanup: vi.fn(async () => ({})),
+}));
 
 import { db } from '../db';
 import { registerPamTools } from './aiToolsPam';
@@ -32,7 +37,10 @@ function handlerFor(name: string): AiTool['handler'] {
 
 function auth(allowedDeviceIds?: string[], allowedSiteIds?: string[]): AuthContext {
   return {
-    principal: { kind: 'ai_agent' },
+    // #6911: revoke_elevation now refuses any ai_agent-principal caller
+    // outright (no approver to substitute at Tier 2). These tests exercise
+    // exact-device/site scoping for a real user session, not that refusal.
+    principal: { kind: 'user_session' },
     user: { id: 'u1', email: 'a@b.c', name: 'A', isPlatformAdmin: false },
     token: {} as any,
     partnerId: null,

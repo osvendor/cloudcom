@@ -6,6 +6,10 @@ const shared = vi.hoisted(() => ({
   closeMock: vi.fn(),
   processorRef: undefined as any,
   processorRefs: {} as Record<string, any>,
+  // #6632: depth of open system DB contexts (each is one Postgres transaction
+  // in production). Tracked by a plain function, NOT vi.fn, so the suites that
+  // call vi.resetAllMocks() cannot wipe its passthrough implementation.
+  txDepth: 0,
 }));
 
 vi.mock('bullmq', () => ({
@@ -24,6 +28,12 @@ vi.mock('bullmq', () => ({
     }
   },
   Job: class {},
+  DelayedError: class DelayedError extends Error {
+    constructor(message?: string) {
+      super(message);
+      this.name = 'DelayedError';
+    }
+  },
 }));
 
 vi.mock('../db', () => {
@@ -35,7 +45,25 @@ vi.mock('../db', () => {
   // Both `recordDeviceQueued` and the shared finalizer wrap their writes in a
   // transaction; run the callback against the same doubles.
   db.transaction = vi.fn((fn: (tx: unknown) => unknown) => fn(db));
-  return { db, withSystemDbAccessContext: undefined };
+  // Each system context is one transaction in production. Tracked so #6632's
+  // tests can prove no BullMQ add runs while the claim transaction is open.
+  const withSystemDbAccessContext = async (fn: () => Promise<unknown>) => {
+    shared.txDepth += 1;
+    try {
+      return await fn();
+    } finally {
+      shared.txDepth -= 1;
+    }
+  };
+  const withDbTransaction = (fn: () => unknown) => fn();
+  const withDbTransactionIfHeld = (fn: () => unknown) => fn();
+  return {
+    db,
+    withSystemDbAccessContext,
+    withSystemDbAccessContextIsolated: withSystemDbAccessContext,
+    withDbTransaction,
+    withDbTransactionIfHeld,
+  };
 });
 
 vi.mock('../db/schema', () => ({
@@ -77,6 +105,7 @@ vi.mock('../services/redis', () => ({
 
 vi.mock('../services/patchEligibility', () => ({
   resolveApprovedPatchesForDevice: vi.fn(),
+  areAllPendingPatchesManagedByVendorLane: vi.fn(async () => false),
 }));
 
 vi.mock('../services/patchRebootHandler', () => ({
@@ -117,7 +146,7 @@ import {
   PatchCompletionCheckError,
   __testOnly,
 } from './patchJobExecutor';
-import { resolveApprovedPatchesForDevice } from '../services/patchEligibility';
+import { resolveApprovedPatchesForDevice, areAllPendingPatchesManagedByVendorLane } from '../services/patchEligibility';
 import { queueCommandForExecution } from '../services/commandQueue';
 import { dispatchDeviceCommand } from '../services/dispatchDeviceCommand';
 import { evaluateRebootPolicy, executeReboot } from '../services/patchRebootHandler';
@@ -417,7 +446,46 @@ describe('patch job executor queueing', () => {
     expect(result).toEqual({ kind: 'skipped', skipped: true, reason: 'No approved patches' });
   });
 
-  it('threads well-formed policyAutoApprove and apps to the evaluator', async () => {
+  // #11243: a device whose only pending updates are left to a vendor lane must
+  // not read as "nothing approved" — a tech would go hunting for an approval.
+  it.each([
+    [true, 'all_managed_by_vendor_updates'],
+    [false, 'no_approved_patches'],
+    ['throws', 'no_approved_patches'],
+  ])('records the skip reason when nothing is approved (all lane-managed=%s → %s)', async (allManaged, expectedReason) => {
+    vi.mocked(db.select)
+      .mockImplementationOnce(() => createSelectChain([{
+        id: 'job-1', orgId: 'org-1', status: 'running',
+        patches: { ringId: null, autoApprove: {} },
+        targets: { deviceIds: ['device-1'] },
+      }]) as any)
+      .mockImplementationOnce(() => createSelectChain([{ id: 'device-1' }]) as any)
+      .mockImplementationOnce(() => createSelectChain([]) as any);
+    const values = vi.fn(() => Promise.resolve());
+    vi.mocked(db.insert).mockImplementationOnce(() => ({ values }) as any);
+    vi.mocked(db.update).mockImplementationOnce(() => ({
+      set: vi.fn(() => ({ where: vi.fn(() => Promise.resolve()) })),
+    }) as any);
+    vi.mocked(resolveApprovedPatchesForDevice).mockResolvedValueOnce([]);
+    if (typeof allManaged === 'boolean') {
+      vi.mocked(areAllPendingPatchesManagedByVendorLane).mockResolvedValueOnce(allManaged);
+    } else {
+      vi.mocked(areAllPendingPatchesManagedByVendorLane).mockRejectedValueOnce(new Error('db down'));
+    }
+
+    createPatchJobDeviceWorker();
+    const result = await shared.processorRefs['patch-job-devices']({
+      data: { type: 'execute-patch-job-device', patchJobId: 'job-1', deviceId: 'device-1', orgId: 'org-1' },
+    });
+
+    expect(values).toHaveBeenCalledWith(expect.objectContaining({ status: 'skipped', errorMessage: expectedReason }));
+    expect(result).toMatchObject({ kind: 'skipped', skipped: true });
+  });
+
+  // #8188 W04: snapshots stopped carrying `apps`, but jobs frozen before
+  // that still do. Their rules must keep reaching the evaluator unchanged,
+  // with no `ringAppRules` key present.
+  it('threads an old snapshot apps list (no ringAppRules) to the evaluator', async () => {
     vi.mocked(db.select)
       .mockImplementationOnce(() => createSelectChain([{
         id: 'job-1',
@@ -427,7 +495,6 @@ describe('patch job executor queueing', () => {
           ringId: null,
           autoApprove: {},
           categoryRules: [],
-          policyAutoApprove: { enabled: true, severities: ['critical'], deferralDays: 3 },
           apps: [{ source: 'third_party', packageId: 'A.B', action: 'block' }],
         },
         targets: { deviceIds: ['device-1'] },
@@ -457,13 +524,19 @@ describe('patch job executor queueing', () => {
       'device-1',
       'org-1',
       expect.objectContaining({
-        policyAutoApprove: { enabled: true, severities: ['critical'], deferralDays: 3 },
         apps: [{ source: 'third_party', packageId: 'A.B', action: 'block' }],
+        ringAppRules: undefined,
       }),
     );
   });
 
-  it('treats malformed policyAutoApprove as disabled and warns', async () => {
+  // #8188 W04: policy-level auto-approve was never consulted by the
+  // evaluator; the executor no longer parses or threads a frozen
+  // `policyAutoApprove` block, valid or malformed, and does not warn on it.
+  it.each([
+    ['valid', { enabled: true, severities: ['critical'], deferralDays: 3 }],
+    ['malformed', { enabled: 'yes', severities: 'critical' }],
+  ])('ignores a frozen %s policyAutoApprove block without warning', async (_label, policyAutoApprove) => {
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
     vi.mocked(db.select)
@@ -471,11 +544,7 @@ describe('patch job executor queueing', () => {
         id: 'job-1',
         orgId: 'org-1',
         status: 'running',
-        patches: {
-          ringId: null,
-          autoApprove: {},
-          policyAutoApprove: { enabled: 'yes', severities: 'critical' },
-        },
+        patches: { ringId: null, autoApprove: {}, policyAutoApprove },
         targets: { deviceIds: ['device-1'] },
       }]) as any)
       .mockImplementationOnce(() => createSelectChain([{ id: 'device-1' }]) as any)
@@ -499,113 +568,8 @@ describe('patch job executor queueing', () => {
       },
     });
 
-    expect(resolveApprovedPatchesForDevice).toHaveBeenCalledWith(
-      'device-1',
-      'org-1',
-      expect.objectContaining({ policyAutoApprove: undefined }),
-    );
-    expect(warnSpy).toHaveBeenCalledWith(
-      expect.stringContaining('malformed patches.policyAutoApprove'),
-      expect.any(String),
-    );
-    expect(captureException).toHaveBeenCalledWith(expect.any(Error));
-    warnSpy.mockRestore();
-  });
-
-  it('disables the whole policyAutoApprove config when deferralDays is malformed', async () => {
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-
-    vi.mocked(db.select)
-      .mockImplementationOnce(() => createSelectChain([{
-        id: 'job-1',
-        orgId: 'org-1',
-        status: 'running',
-        patches: {
-          ringId: null,
-          autoApprove: {},
-          // enabled/severities are valid, but deferralDays is negative — the
-          // deferral safety window must NOT be silently coerced to 0.
-          policyAutoApprove: { enabled: true, severities: ['critical'], deferralDays: -1 },
-        },
-        targets: { deviceIds: ['device-1'] },
-      }]) as any)
-      .mockImplementationOnce(() => createSelectChain([{ id: 'device-1' }]) as any)
-      .mockImplementationOnce(() => createSelectChain([]) as any);
-
-    vi.mocked(db.insert).mockImplementationOnce(() => ({
-      values: vi.fn(() => Promise.resolve()),
-    }) as any);
-    vi.mocked(db.update).mockImplementationOnce(() => ({
-      set: vi.fn(() => ({ where: vi.fn(() => Promise.resolve()) })),
-    }) as any);
-    vi.mocked(resolveApprovedPatchesForDevice).mockResolvedValueOnce([]);
-
-    createPatchJobDeviceWorker();
-    await shared.processorRefs['patch-job-devices']({
-      data: {
-        type: 'execute-patch-job-device',
-        patchJobId: 'job-1',
-        deviceId: 'device-1',
-        orgId: 'org-1',
-      },
-    });
-
-    expect(resolveApprovedPatchesForDevice).toHaveBeenCalledWith(
-      'device-1',
-      'org-1',
-      expect.objectContaining({ policyAutoApprove: undefined }),
-    );
-    expect(warnSpy).toHaveBeenCalledWith(
-      expect.stringContaining('malformed patches.policyAutoApprove'),
-      expect.any(String),
-    );
-    expect(captureException).toHaveBeenCalledWith(expect.any(Error));
-    warnSpy.mockRestore();
-  });
-
-  it('defaults deferralDays to 0 when absent from an otherwise valid policyAutoApprove', async () => {
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-
-    vi.mocked(db.select)
-      .mockImplementationOnce(() => createSelectChain([{
-        id: 'job-1',
-        orgId: 'org-1',
-        status: 'running',
-        patches: {
-          ringId: null,
-          autoApprove: {},
-          policyAutoApprove: { enabled: true, severities: ['critical'] },
-        },
-        targets: { deviceIds: ['device-1'] },
-      }]) as any)
-      .mockImplementationOnce(() => createSelectChain([{ id: 'device-1' }]) as any)
-      .mockImplementationOnce(() => createSelectChain([]) as any);
-
-    vi.mocked(db.insert).mockImplementationOnce(() => ({
-      values: vi.fn(() => Promise.resolve()),
-    }) as any);
-    vi.mocked(db.update).mockImplementationOnce(() => ({
-      set: vi.fn(() => ({ where: vi.fn(() => Promise.resolve()) })),
-    }) as any);
-    vi.mocked(resolveApprovedPatchesForDevice).mockResolvedValueOnce([]);
-
-    createPatchJobDeviceWorker();
-    await shared.processorRefs['patch-job-devices']({
-      data: {
-        type: 'execute-patch-job-device',
-        patchJobId: 'job-1',
-        deviceId: 'device-1',
-        orgId: 'org-1',
-      },
-    });
-
-    expect(resolveApprovedPatchesForDevice).toHaveBeenCalledWith(
-      'device-1',
-      'org-1',
-      expect.objectContaining({
-        policyAutoApprove: { enabled: true, severities: ['critical'], deferralDays: 0 },
-      }),
-    );
+    const config = vi.mocked(resolveApprovedPatchesForDevice).mock.calls[0]![2] as unknown as Record<string, unknown>;
+    expect(config).not.toHaveProperty('policyAutoApprove');
     expect(warnSpy).not.toHaveBeenCalled();
     expect(captureException).not.toHaveBeenCalled();
     warnSpy.mockRestore();
@@ -728,7 +692,7 @@ describe('patch job executor queueing', () => {
     warnSpy.mockRestore();
   });
 
-  it('leaves policyAutoApprove and apps undefined for legacy jobs', async () => {
+  it('leaves apps undefined for legacy jobs', async () => {
     vi.mocked(db.select)
       .mockImplementationOnce(() => createSelectChain([{
         id: 'job-1',
@@ -761,8 +725,159 @@ describe('patch job executor queueing', () => {
     expect(resolveApprovedPatchesForDevice).toHaveBeenCalledWith(
       'device-1',
       'org-1',
-      expect.objectContaining({ policyAutoApprove: undefined, apps: undefined }),
+      expect.objectContaining({ apps: undefined }),
     );
+  });
+
+  // #8184 W01: ring app rules ride in patches.ringAppRules, parsed with the
+  // same fail-closed coercion as patches.apps and threaded separately.
+  async function runDeviceJobWithPatches(patches: Record<string, unknown>) {
+    vi.mocked(db.select)
+      .mockImplementationOnce(() => createSelectChain([{
+        id: 'job-1',
+        orgId: 'org-1',
+        status: 'running',
+        patches,
+        targets: { deviceIds: ['device-1'] },
+      }]) as any)
+      .mockImplementationOnce(() => createSelectChain([{ id: 'device-1' }]) as any)
+      .mockImplementationOnce(() => createSelectChain([]) as any);
+    vi.mocked(db.insert).mockImplementationOnce(() => ({
+      values: vi.fn(() => Promise.resolve()),
+    }) as any);
+    vi.mocked(db.update).mockImplementationOnce(() => ({
+      set: vi.fn(() => ({ where: vi.fn(() => Promise.resolve()) })),
+    }) as any);
+    vi.mocked(resolveApprovedPatchesForDevice).mockResolvedValueOnce([]);
+
+    createPatchJobDeviceWorker();
+    await shared.processorRefs['patch-job-devices']({
+      data: { type: 'execute-patch-job-device', patchJobId: 'job-1', deviceId: 'device-1', orgId: 'org-1' },
+    });
+  }
+
+  it('threads ringAppRules to the evaluator alongside apps (#8184)', async () => {
+    await runDeviceJobWithPatches({
+      ringId: null,
+      autoApprove: {},
+      apps: [{ source: 'custom', packageId: 'corp-tool', action: 'block' }],
+      ringAppRules: [
+        { source: 'third_party', packageId: 'Mozilla.Firefox', displayName: 'Firefox', action: 'block' },
+        { source: 'third_party', packageId: 'Zoom.Zoom', action: 'pin', pinnedVersion: '6.0' },
+      ],
+    });
+
+    expect(resolveApprovedPatchesForDevice).toHaveBeenCalledWith(
+      'device-1',
+      'org-1',
+      expect.objectContaining({
+        apps: [{ source: 'custom', packageId: 'corp-tool', action: 'block' }],
+        ringAppRules: [
+          { source: 'third_party', packageId: 'Mozilla.Firefox', action: 'block' },
+          { source: 'third_party', packageId: 'Zoom.Zoom', action: 'pin', pinnedVersion: '6.0' },
+        ],
+      }),
+    );
+  });
+
+  it('threads ringFeatureUpdates to the evaluator; absent or malformed resolves to block', async () => {
+    await runDeviceJobWithPatches({
+      ringId: null, autoApprove: {}, apps: [],
+      ringFeatureUpdates: { mode: 'pin', product: 'windows-11', targetVersion: '25H2' },
+    });
+    expect(resolveApprovedPatchesForDevice).toHaveBeenLastCalledWith(
+      'device-1', 'org-1',
+      expect.objectContaining({ featureUpdates: { mode: 'pin', product: 'windows-11', targetVersion: '25H2' } }),
+    );
+
+    await runDeviceJobWithPatches({ ringId: null, autoApprove: {}, apps: [] });
+    expect(resolveApprovedPatchesForDevice).toHaveBeenLastCalledWith(
+      'device-1', 'org-1', expect.objectContaining({ featureUpdates: { mode: 'block' } }),
+    );
+
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await runDeviceJobWithPatches({ ringId: null, autoApprove: {}, apps: [], ringFeatureUpdates: { mode: 'latest' } });
+    expect(resolveApprovedPatchesForDevice).toHaveBeenLastCalledWith(
+      'device-1', 'org-1', expect.objectContaining({ featureUpdates: { mode: 'block' } }),
+    );
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('ringFeatureUpdates'), expect.any(String));
+    expect(captureException).toHaveBeenCalled();
+    warnSpy.mockRestore();
+  });
+
+  it('leaves ringAppRules undefined without a warning when the key is absent (pre-#8184 job)', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await runDeviceJobWithPatches({ ringId: null, autoApprove: {}, apps: [] });
+
+    expect(resolveApprovedPatchesForDevice).toHaveBeenCalledWith(
+      'device-1',
+      'org-1',
+      expect.objectContaining({ ringAppRules: undefined, apps: [] }),
+    );
+    expect(warnSpy).not.toHaveBeenCalled();
+    expect(captureException).not.toHaveBeenCalled();
+    warnSpy.mockRestore();
+  });
+
+  it('skips the device on a present-but-non-array ringAppRules (fail closed — no legacy snapshot carries a bad one)', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.mocked(db.select)
+      .mockImplementationOnce(() => createSelectChain([{
+        id: 'job-1',
+        orgId: 'org-1',
+        status: 'running',
+        patches: {
+          ringId: null,
+          autoApprove: {},
+          apps: [{ source: 'custom', packageId: 'corp-tool', action: 'block' }],
+          ringAppRules: 'nope',
+        },
+        targets: { deviceIds: ['device-1'] },
+      }]) as any)
+      .mockImplementationOnce(() => createSelectChain([{ id: 'device-1' }]) as any)
+      // checkAndFinalizeJob select (called by markDeviceSkipped)
+      .mockImplementationOnce(() => createSelectChain([]) as any);
+    const valuesMock = vi.fn(() => Promise.resolve());
+    vi.mocked(db.insert).mockImplementationOnce(() => ({ values: valuesMock }) as any);
+    vi.mocked(db.update).mockImplementationOnce(() => ({
+      set: vi.fn(() => ({ where: vi.fn(() => Promise.resolve()) })),
+    }) as any);
+
+    createPatchJobDeviceWorker();
+    const result = await shared.processorRefs['patch-job-devices']({
+      data: { type: 'execute-patch-job-device', patchJobId: 'job-1', deviceId: 'device-1', orgId: 'org-1' },
+    });
+
+    expect(resolveApprovedPatchesForDevice).not.toHaveBeenCalled();
+    expect(result).toEqual({ kind: 'skipped', skipped: true, reason: 'Invalid ring app rules' });
+    expect(valuesMock).toHaveBeenCalledWith(expect.objectContaining({ status: 'skipped', deviceId: 'device-1' }));
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('malformed patches.ringAppRules'),
+      expect.any(String),
+    );
+    expect(captureException).toHaveBeenCalledWith(expect.any(Error));
+    warnSpy.mockRestore();
+  });
+
+  it('coerces an identifiable malformed ringAppRules entry to block', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await runDeviceJobWithPatches({
+      ringId: null,
+      autoApprove: {},
+      ringAppRules: [{ source: 'third_party', packageId: 'C.D', action: 'pin' }],
+    });
+
+    expect(resolveApprovedPatchesForDevice).toHaveBeenCalledWith(
+      'device-1',
+      'org-1',
+      expect.objectContaining({ ringAppRules: [{ source: 'third_party', packageId: 'C.D', action: 'block' }] }),
+    );
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('coercing malformed app rule to block (fail-closed)'),
+      expect.any(String),
+    );
+    expect(captureException).not.toHaveBeenCalled();
+    warnSpy.mockRestore();
   });
 
   it('skips malformed sources with a warning instead of widening the filter', async () => {
@@ -1756,6 +1871,23 @@ describe('per-patch patch_job_results status is not collapsed to the batch statu
     vi.restoreAllMocks();
   });
 
+  it('stops polling when the command is cancelled mid-poll and records the device skipped with the reason', async () => {
+    const insertedRows: any[] = [];
+
+    const result: any = await runDeviceExecution({
+      approvedPatches: THREE_PATCHES,
+      command: {
+        status: 'cancelled',
+        result: { status: 'cancelled', reason: 'device_moved_org', cancelledBy: 'claim_eligibility' },
+      },
+      insertedRows,
+    });
+
+    expect(insertedRows).toHaveLength(3);
+    expect(insertedRows.every((r: any) => r.status === 'skipped' && r.errorMessage === 'device_moved_org')).toBe(true);
+    expect(result).toMatchObject({ success: false, applied: true });
+  });
+
   it('records a mixed batch (one failed, two installed) with per-patch status, not all-failed', async () => {
     const insertedRows: any[] = [];
 
@@ -2077,6 +2209,33 @@ describe('offline devices are queued instead of skipped (#5128 W3)', () => {
     expect(Object.keys(updateSets[0]).sort()).toEqual(['devicesPending', 'devicesQueued']);
   });
 
+  it('a push the claim cancels closes the device as skipped with the reason, without the 30-minute poll', async () => {
+    vi.useFakeTimers();
+    try {
+      primeDeviceExecution({ offlineBehavior: 'queue', scheduleNextOccurrenceAt: null });
+      // The finalizer's idempotency read (no rows yet on the synchronous path).
+      vi.mocked(db.select).mockImplementationOnce(() => createWhereSelectChain([]) as any);
+      vi.mocked(dispatchDeviceCommand).mockResolvedValueOnce({
+        ok: true,
+        command: { id: 'cmd-cancelled', status: 'cancelled' },
+        delivery: 'cancelled',
+        cancelReason: 'requester_inactive',
+        deliverBy: null,
+      } as any);
+
+      // No timer is advanced: a task that polled would never settle here.
+      const result: any = await runPrepared();
+
+      expect(result).toMatchObject({ kind: 'cancelled', commandId: 'cmd-cancelled', reason: 'requester_inactive' });
+      expect(insertedRows).toHaveLength(2);
+      expect(insertedRows.every((r) => r.status === 'skipped' && r.errorMessage === 'requester_inactive')).toBe(true);
+      // The device leaves devices_pending (skips count toward completed).
+      expect(updateSets.some((s) => 'devicesPending' in s && 'devicesCompleted' in s)).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('does not poll for a result — the BullMQ task ends immediately', async () => {
     vi.useFakeTimers();
     try {
@@ -2274,5 +2433,417 @@ describe('completion checker keeps a job open while devices are queued (#5128 W3
     expect(result).toEqual({ finalStatus: 'failed' });
     expect(updateSets).toHaveLength(1);
     expect(updateSets[0].status).toBe('failed');
+  });
+});
+
+// ============================================================================
+// #6632 — the per-device worker must never read the parent before the claim
+// that flipped it to `running` has committed.
+// ============================================================================
+
+describe('claim commits before device fan-out (#6632)', () => {
+  function thenableChain(result: unknown = undefined) {
+    const c: any = {};
+    c.set = vi.fn(() => c);
+    c.values = vi.fn(() => Promise.resolve(result));
+    c.where = vi.fn(() => Promise.resolve(result));
+    return c;
+  }
+
+  let addDepths: number[];
+  let writeDepths: { op: string; depth: number }[];
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    shared.processorRef = undefined;
+    shared.processorRefs = {};
+    shared.txDepth = 0;
+    shared.getJobMock.mockResolvedValue(null);
+    addDepths = [];
+    writeDepths = [];
+    shared.addMock.mockImplementation(async () => {
+      addDepths.push(shared.txDepth);
+      return { id: 'queue-job-1' };
+    });
+    __testOnly.resetWedgedJobReporting();
+  });
+
+  afterEach(() => {
+    shared.addMock.mockReset();
+  });
+
+  function primeScheduledJob(deviceIds: string[]) {
+    vi.mocked(db.select)
+      .mockImplementationOnce(() => createSelectChain([{
+        id: 'job-1',
+        orgId: 'org-1',
+        status: 'scheduled',
+        targets: { deviceIds },
+      }]) as any)
+      .mockImplementation(() => createSelectChain([
+        { status: 'running', devicesPending: deviceIds.length, devicesFailed: 1 },
+      ]) as any);
+    vi.mocked(db.update)
+      .mockImplementationOnce(() => {
+        writeDepths.push({ op: 'claim', depth: shared.txDepth });
+        return createUpdateChain([{ id: 'job-1' }]) as any;
+      })
+      .mockImplementation(() => {
+        writeDepths.push({ op: 'update', depth: shared.txDepth });
+        return thenableChain() as any;
+      });
+    vi.mocked(db.insert).mockImplementation(() => {
+      writeDepths.push({ op: 'insert', depth: shared.txDepth });
+      return thenableChain() as any;
+    });
+  }
+
+  it('enqueues no device job or completion check while the claim transaction is open', async () => {
+    primeScheduledJob(['device-1', 'device-2']);
+
+    createPatchJobWorker();
+    const result = await shared.processorRefs['patch-jobs']({
+      data: { type: 'execute-patch-job', patchJobId: 'job-1' },
+    });
+
+    expect(result).toEqual({ dispatched: 2, dispatchFailed: 0 });
+    // The claim itself ran inside a system DB context (i.e. a transaction)...
+    expect(writeDepths).toContainEqual({ op: 'claim', depth: 1 });
+    // ...and every BullMQ add (2 device jobs + the completion check) happened
+    // only after it had closed. Before the fix every add ran at depth 1, so a
+    // device worker could read the parent as still `scheduled` and skip.
+    const names = shared.addMock.mock.calls.map(([name]: any[]) => name);
+    expect(names).toEqual([
+      'execute-patch-job-device',
+      'execute-patch-job-device',
+      'check-completion',
+    ]);
+    expect(addDepths).toEqual([0, 0, 0]);
+  });
+
+  it('records a device dispatch failure in its own short transaction, after the claim committed', async () => {
+    primeScheduledJob(['device-1', 'device-2']);
+    shared.addMock.mockImplementation(async (name: string, data: any) => {
+      addDepths.push(shared.txDepth);
+      if (name === 'execute-patch-job-device' && data.deviceId === 'device-1') {
+        throw new Error('redis down');
+      }
+      return { id: 'queue-job-1' };
+    });
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    createPatchJobWorker();
+    const result = await shared.processorRefs['patch-jobs']({
+      data: { type: 'execute-patch-job', patchJobId: 'job-1' },
+    });
+
+    expect(result).toEqual({ dispatched: 1, dispatchFailed: 1 });
+    expect(addDepths.length).toBe(3);
+    expect(addDepths.every((d) => d === 0)).toBe(true);
+    // The failure bookkeeping (result row + counter update) is DB work, so it
+    // runs inside a context — one per device, never spanning a Redis call.
+    const bookkeeping = writeDepths.filter((w) => w.op !== 'claim');
+    expect(bookkeeping.map((w) => w.op)).toEqual(['insert', 'update']);
+    expect(bookkeeping.every((w) => w.depth === 1)).toBe(true);
+    consoleSpy.mockRestore();
+  });
+
+  // The claim now commits BEFORE fan-out, so a worker that dies in between
+  // leaves a `running` row with no device jobs. BullMQ's stall detection
+  // re-runs this job; that re-run must at least guarantee the completion
+  // check, or nothing ever settles the row (the #1733 sweep only scans
+  // `scheduled`). Device jobs are NOT re-added: one may already have run.
+  it('re-entry on an already-running parent ensures the completion check and dispatches no device', async () => {
+    vi.mocked(db.select).mockImplementationOnce(() => createSelectChain([{
+      id: 'job-1',
+      orgId: 'org-1',
+      status: 'running',
+      targets: { deviceIds: ['device-1'] },
+    }]) as any);
+
+    createPatchJobWorker();
+    const result = await shared.processorRefs['patch-jobs']({
+      data: { type: 'execute-patch-job', patchJobId: 'job-1' },
+    });
+
+    expect(result).toEqual({ skipped: true, reason: 'Job status is running' });
+    expect(db.update).not.toHaveBeenCalled();
+    expect(shared.addMock).toHaveBeenCalledTimes(1);
+    expect(shared.addMock).toHaveBeenCalledWith(
+      'check-completion',
+      { type: 'check-completion', patchJobId: 'job-1' },
+      expect.objectContaining({ jobId: 'patch-job-completion-job-1' }),
+    );
+    expect(addDepths).toEqual([0]);
+  });
+
+  it.each(['scheduled-but-lost-race', 'completed', 'cancelled'])(
+    'a %s parent enqueues nothing',
+    async (variant) => {
+      if (variant === 'scheduled-but-lost-race') {
+        vi.mocked(db.select).mockImplementationOnce(() => createSelectChain([{
+          id: 'job-1', orgId: 'org-1', status: 'scheduled', targets: { deviceIds: ['device-1'] },
+        }]) as any);
+        vi.mocked(db.update).mockImplementationOnce(() => createUpdateChain([]) as any);
+      } else {
+        vi.mocked(db.select).mockImplementationOnce(() => createSelectChain([{
+          id: 'job-1', orgId: 'org-1', status: variant, targets: { deviceIds: ['device-1'] },
+        }]) as any);
+      }
+
+      createPatchJobWorker();
+      await shared.processorRefs['patch-jobs']({
+        data: { type: 'execute-patch-job', patchJobId: 'job-1' },
+      });
+
+      expect(shared.addMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it('completes an empty-target job inside the claim transaction and enqueues nothing', async () => {
+    primeScheduledJob([]);
+
+    createPatchJobWorker();
+    const result = await shared.processorRefs['patch-jobs']({
+      data: { type: 'execute-patch-job', patchJobId: 'job-1' },
+    });
+
+    expect(result).toEqual({ completed: true, reason: 'No target devices' });
+    expect(shared.addMock).not.toHaveBeenCalled();
+    expect(writeDepths).toEqual([
+      { op: 'claim', depth: 1 },
+      { op: 'update', depth: 1 },
+    ]);
+  });
+});
+
+describe('device worker re-delays while the parent is still scheduled (#6632)', () => {
+  function deviceJob(extra: Record<string, unknown> = {}) {
+    return {
+      data: {
+        type: 'execute-patch-job-device',
+        patchJobId: 'job-1',
+        deviceId: 'device-1',
+        orgId: 'org-1',
+        ...extra,
+      },
+      moveToDelayed: vi.fn().mockResolvedValue(undefined),
+      updateData: vi.fn().mockResolvedValue(undefined),
+    };
+  }
+
+  function primeParent(status: string) {
+    vi.mocked(db.select).mockImplementationOnce(() => createSelectChain([{
+      id: 'job-1',
+      orgId: 'org-1',
+      status,
+      patches: {},
+      targets: { deviceIds: ['device-1'] },
+    }]) as any);
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    shared.processorRef = undefined;
+    shared.processorRefs = {};
+    shared.txDepth = 0;
+  });
+
+  it('re-delays itself (no attempt consumed) instead of a terminal skip', async () => {
+    primeParent('scheduled');
+    const job = deviceJob();
+    let depthAtDelay = -1;
+    job.moveToDelayed.mockImplementation(async () => {
+      depthAtDelay = shared.txDepth;
+    });
+
+    createPatchJobDeviceWorker();
+    const run = shared.processorRefs['patch-job-devices'](job, 'lock-token');
+
+    await expect(run).rejects.toMatchObject({ name: 'DelayedError' });
+    expect(job.updateData).toHaveBeenCalledWith(
+      expect.objectContaining({ parentNotRunningRechecks: 1 }),
+    );
+    expect(job.moveToDelayed).toHaveBeenCalledTimes(1);
+    const [when, token] = job.moveToDelayed.mock.calls[0]! as [number, string];
+    expect(token).toBe('lock-token');
+    expect(when).toBeGreaterThan(Date.now());
+    // Re-delayed OUTSIDE the DB context: no pooled connection held across Redis.
+    expect(depthAtDelay).toBe(0);
+    expect(dispatchDeviceCommand).not.toHaveBeenCalled();
+    expect(resolveApprovedPatchesForDevice).not.toHaveBeenCalled();
+  });
+
+  it('backs off further on each recheck', async () => {
+    primeParent('scheduled');
+    const first = deviceJob();
+    createPatchJobDeviceWorker();
+    await expect(shared.processorRefs['patch-job-devices'](first, 't')).rejects.toBeDefined();
+
+    primeParent('scheduled');
+    const third = deviceJob({ parentNotRunningRechecks: 2 });
+    await expect(shared.processorRefs['patch-job-devices'](third, 't')).rejects.toBeDefined();
+
+    const firstDelay = (first.moveToDelayed.mock.calls[0]![0] as number) - Date.now();
+    const thirdDelay = (third.moveToDelayed.mock.calls[0]![0] as number) - Date.now();
+    expect(thirdDelay).toBeGreaterThan(firstDelay);
+    expect(third.updateData).toHaveBeenCalledWith(
+      expect.objectContaining({ parentNotRunningRechecks: 3 }),
+    );
+  });
+
+  it('gives up with a terminal skip and a report once the recheck budget is spent', async () => {
+    primeParent('scheduled');
+    const job = deviceJob({ parentNotRunningRechecks: __testOnly.MAX_PARENT_NOT_RUNNING_RECHECKS });
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    createPatchJobDeviceWorker();
+    const result = await shared.processorRefs['patch-job-devices'](job, 'lock-token');
+
+    expect(result).toEqual({ kind: 'skipped', skipped: true, reason: 'Job not running' });
+    expect(job.moveToDelayed).not.toHaveBeenCalled();
+    expect(captureException).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'PatchParentNotRunningError' }),
+      undefined,
+      expect.anything(),
+    );
+    errorSpy.mockRestore();
+  });
+
+  it('reports and falls back to a terminal skip when the re-delay itself fails', async () => {
+    primeParent('scheduled');
+    const job = deviceJob();
+    job.moveToDelayed.mockRejectedValueOnce(new Error('redis down'));
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    createPatchJobDeviceWorker();
+    const result = await shared.processorRefs['patch-job-devices'](job, 'lock-token');
+
+    expect(result).toEqual({ kind: 'skipped', skipped: true, reason: 'Job not running' });
+    expect(captureException).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: 'PatchParentNotRunningError',
+        message: expect.stringContaining('could not re-delay'),
+      }),
+      undefined,
+      expect.anything(),
+    );
+    errorSpy.mockRestore();
+  });
+
+  it('falls back to a reported terminal skip when no lock token is available to re-delay with', async () => {
+    primeParent('scheduled');
+    const job = deviceJob();
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    createPatchJobDeviceWorker();
+    const result = await shared.processorRefs['patch-job-devices'](job, undefined);
+
+    expect(result).toEqual({ kind: 'skipped', skipped: true, reason: 'Job not running' });
+    expect(job.updateData).not.toHaveBeenCalled();
+    expect(job.moveToDelayed).not.toHaveBeenCalled();
+    expect(captureException).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: 'PatchParentNotRunningError',
+        message: expect.stringContaining('no lock token'),
+      }),
+      undefined,
+      expect.anything(),
+    );
+    errorSpy.mockRestore();
+  });
+
+  it.each(['cancelled', 'completed', 'failed'])(
+    'keeps the terminal skip for a %s parent',
+    async (status) => {
+      primeParent(status);
+      const job = deviceJob();
+
+      createPatchJobDeviceWorker();
+      const result = await shared.processorRefs['patch-job-devices'](job, 'lock-token');
+
+      expect(result).toEqual({ kind: 'skipped', skipped: true, reason: 'Job not running' });
+      expect(job.moveToDelayed).not.toHaveBeenCalled();
+    },
+  );
+
+  it('keeps the terminal skip for a missing parent', async () => {
+    vi.mocked(db.select).mockImplementationOnce(() => createSelectChain([]) as any);
+    const job = deviceJob();
+
+    createPatchJobDeviceWorker();
+    const result = await shared.processorRefs['patch-job-devices'](job, 'lock-token');
+
+    expect(result).toEqual({ kind: 'skipped', skipped: true, reason: 'Job not running' });
+    expect(job.moveToDelayed).not.toHaveBeenCalled();
+  });
+});
+
+// #11073, spec 4.6: what a vendor lane delivers is decided when the job runs, by the
+// evaluator (patchEligibility.test.ts), and is never part of the frozen snapshot.
+describe('a vendor lane is read at execution, not frozen in the job snapshot (#11073)', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    vi.useFakeTimers();
+    shared.processorRef = undefined;
+    shared.processorRefs = {};
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.mocked(evaluateRebootPolicy).mockResolvedValue({
+      shouldReboot: false,
+      reason: 'No reboot required',
+      deferred: false,
+      windowEndsAt: null,
+    });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it('the same snapshot installs again on the next run once the lane stops delivering', async () => {
+    vi.mocked(db.select)
+      .mockImplementationOnce(() => createSelectChain([{
+        id: 'job-1',
+        orgId: 'org-1',
+        status: 'running',
+        patches: { ringId: null, autoApprove: {} },
+        targets: { deviceIds: ['device-1'], deployment: { rebootPolicy: 'never' } },
+      }]) as any)
+      .mockImplementationOnce(() => createSelectChain([{ id: 'device-1' }]) as any)
+      .mockImplementationOnce(() => createSelectChain([]) as any);
+    vi.mocked(db.insert).mockImplementationOnce(() => ({ values: vi.fn(() => Promise.resolve()) }) as any);
+    vi.mocked(db.update).mockImplementationOnce(() => ({
+      set: vi.fn(() => ({ where: vi.fn(() => Promise.resolve()) })),
+    }) as any);
+    // The lane is delivering the only candidate, so nothing is approved.
+    vi.mocked(resolveApprovedPatchesForDevice).mockResolvedValueOnce([]);
+
+    createPatchJobDeviceWorker();
+    const first = await shared.processorRefs['patch-job-devices']({
+      data: { type: 'execute-patch-job-device', patchJobId: 'job-1', deviceId: 'device-1', orgId: 'org-1' },
+    });
+    expect(first).toEqual({ kind: 'skipped', skipped: true, reason: 'No approved patches' });
+
+    // The lane has gone Overdue: the evaluator now hands the driver back.
+    await runDeviceExecution({
+      approvedPatches: [{ patchId: 'patch-1', externalId: 'wu-driver-1', requiresReboot: false }],
+      rebootPolicy: 'never',
+      command: agentCommandRow({
+        success: true,
+        installedCount: 1,
+        failedCount: 0,
+        rebootRequired: false,
+        results: [{ id: 'patch-1', externalId: 'wu-driver-1', status: 'installed', rebootRequired: false }],
+      }),
+    });
+
+    expect(resolveApprovedPatchesForDevice).toHaveBeenCalledTimes(2);
+    expect(dispatchDeviceCommand).toHaveBeenCalledTimes(1);
+    const [, , firstConfig] = vi.mocked(resolveApprovedPatchesForDevice).mock.calls[0]!;
+    const [, , secondConfig] = vi.mocked(resolveApprovedPatchesForDevice).mock.calls[1]!;
+    expect(secondConfig).toEqual(firstConfig);
+    expect(JSON.stringify(firstConfig)).not.toMatch(/vendor|managed|oem/i);
   });
 });

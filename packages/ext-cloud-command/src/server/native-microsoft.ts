@@ -4,7 +4,7 @@ export const microsoftResources = {
   // The user row composes displayName and userPrincipalName into the User cell;
   // do not expose generic Graph profile fields as MSP directory columns.
   users: { displayName: 'User', userPrincipalName: 'Sign-in name', userType: 'Type', licenseSummary: 'License', oneDrive: 'OneDrive', accountEnabled: 'Account state' },
-  groups: { displayName: 'Name', mail: 'Email', securityEnabled: 'Security group', membershipRule: 'Membership rule' },
+  groups: { displayName: 'Name', mail: 'Email', groupKind: 'Type', mailEnabled: 'Mail enabled', securityEnabled: 'Security group', membershipRule: 'Membership rule' },
   licenses: { skuPartNumber: 'SKU', consumedUnits: 'Assigned', capabilityStatus: 'Status' },
   sites: { displayName: 'Name', name: 'Site name', webUrl: 'Site URL', lastModifiedDateTime: 'Last modified' },
 } as const;

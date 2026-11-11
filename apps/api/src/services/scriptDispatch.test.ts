@@ -1,10 +1,22 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { SQL, Param } from 'drizzle-orm';
 
+// Devices parked in a holding org, by id. The helper's query is proven against
+// Postgres in parkedCommandDelivery.integration.test.ts.
+const parkedDeviceIds = vi.hoisted(() => new Set<string>());
+vi.mock('./unassignedPool/deliveryEligibility', async () => ({
+  ...(await vi.importActual<typeof import('./unassignedPool/deliveryEligibility')>(
+    './unassignedPool/deliveryEligibility',
+  )),
+  isParkedDevice: vi.fn(async (_reader: unknown, deviceId: string) => parkedDeviceIds.has(deviceId)),
+}));
+
 vi.mock('../db', () => ({
   db: { select: vi.fn(), insert: vi.fn(), update: vi.fn(), delete: vi.fn() },
   runOutsideDbContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
   withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+  withDbTransaction: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+  withDbTransactionIfHeld: vi.fn(async (fn: () => Promise<unknown>) => fn()),
 }));
 // #5128: scriptDispatch.ts now imports `CommandTypes` from './commandQueue'
 // (a re-export of the leaf module './commandTypes') to look up the script
@@ -16,7 +28,7 @@ vi.mock('./commandQueue', async () => {
   return { CommandTypes, queueCommand: vi.fn() };
 });
 vi.mock('./commandDispatch', () => ({
-  claimPendingCommandForDelivery: vi.fn().mockResolvedValue(null),
+  claimPendingCommandForDelivery: vi.fn().mockResolvedValue({ status: 'not_claimable', id: 'cmd-1' }),
   releaseClaimedCommandDelivery: vi.fn().mockResolvedValue(undefined),
 }));
 vi.mock('./sensitiveCommandPayload', () => ({
@@ -28,7 +40,27 @@ vi.mock('./sensitiveCommandPayload', () => ({
     payload: c.payload,
   })),
 }));
-vi.mock('../routes/agentWs', () => ({ sendCommandToAgent: vi.fn().mockReturnValue(false) }));
+vi.mock('../routes/agentWs', () => ({ sendCommandToAgent: vi.fn().mockReturnValue(false), isAgentConnected: vi.fn().mockReturnValue(false) }));
+// #4142: scriptDispatch reaches agents through the relay facade. This mock
+// bridges over the agentWs mock above (a local socket send); the facade-outcome
+// tests drive dispatchCommandToAgent directly. The real mapping is pinned in
+// agentCommandRelay.test.ts.
+vi.mock('./agentCommandRelay', async () => {
+  const ws = await import('../routes/agentWs');
+  return {
+    dispatchCommandToAgent: vi.fn(async (agentId: string, frame: unknown) => (
+      vi.mocked(ws.sendCommandToAgent)(agentId, frame as never)
+        ? { status: 'sent', via: 'local' }
+        : { status: 'offline' }
+    )),
+    agentReachability: vi.fn(async (agentId: string) => (
+      vi.mocked(ws.isAgentConnected)(agentId) ? 'connected' : 'absent'
+    )),
+    dispatchDisposition: (o: { status: string }) => (
+      o.status === 'sent' ? 'delivered' : o.status === 'indeterminate' ? 'uncertain' : 'not_delivered'
+    ),
+  };
+});
 // #3409 PR4c-2: the secret-delivery gates are unit-tested against their own
 // drizzle mocks in scriptSecretDelivery.test.ts. Here they are mocked so this
 // file tests the WIRING — that dispatch calls them at the right two points,
@@ -54,9 +86,11 @@ vi.mock('./scriptMaintenanceGate', () => ({
 
 import { db } from '../db';
 import { queueCommand } from './commandQueue';
-import { claimPendingCommandForDelivery } from './commandDispatch';
+import { claimPendingCommandForDelivery, releaseClaimedCommandDelivery } from './commandDispatch';
+import { cancelledCommandError } from './commandCancelMessage';
 import { decryptCommandForDelivery, encryptSensitivePayloadFields } from './sensitiveCommandPayload';
 import { sendCommandToAgent } from '../routes/agentWs';
+import { dispatchCommandToAgent } from './agentCommandRelay';
 import { captureException } from './sentry';
 import {
   AGENT_UPGRADE_REQUIRED_MESSAGE,
@@ -222,6 +256,21 @@ describe('dispatchScriptToDevice — invariants', () => {
     // Decommission is permanent — checked against the caller's snapshot with
     // no live re-read.
     expect(db.select).not.toHaveBeenCalled();
+  });
+
+  it('refuses a parked device before any row is written or payload sealed', async () => {
+    const parked = device();
+    parkedDeviceIds.add(parked.id);
+    try {
+      const r = await dispatchScriptToDevice({ device: parked, source: { kind: 'saved', script: savedScript() } });
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.code).toBe('device_pending_assignment');
+      expect(db.insert).not.toHaveBeenCalled();
+      expect(encryptSensitivePayloadFields).not.toHaveBeenCalled();
+      expect(queueCommand).not.toHaveBeenCalled();
+    } finally {
+      parkedDeviceIds.clear();
+    }
   });
 
   it('rejects offline device under a reject policy (snapshot and live read agree)', async () => {
@@ -654,7 +703,7 @@ describe('dispatchScriptToDevice — delivery', () => {
       },
     } as any);
     const executedAt = new Date('2026-08-11T00:00:00Z');
-    vi.mocked(claimPendingCommandForDelivery).mockResolvedValue({ executedAt } as any);
+    vi.mocked(claimPendingCommandForDelivery).mockResolvedValue({ status: 'claimed', id: 'cmd-1', executedAt, agentId: 'agent-1' } as any);
     vi.mocked(sendCommandToAgent).mockReturnValue(true);
     const r = await dispatchScriptToDevice({ device: device({ agentId: 'agent-1' }), source: { kind: 'saved', script: savedScript() } });
     expect(decryptCommandForDelivery).toHaveBeenCalled();
@@ -684,9 +733,23 @@ describe('dispatchScriptToDevice — delivery', () => {
     );
   });
 
+  it('pushes to the agent id read in the claim, not the device row read before it (#8318 §6.4)', async () => {
+    vi.mocked(db.update).mockReturnValue({ set: () => ({ where: () => Promise.resolve(undefined) }) } as any);
+    // `device.agentId` was read before the claim; a reattach / re-enroll
+    // committed in between and the claim read the new owner.
+    vi.mocked(claimPendingCommandForDelivery).mockResolvedValue({
+      status: 'claimed', id: 'cmd-1', executedAt: new Date(), agentId: 'agent-after-reattach',
+    } as any);
+    vi.mocked(sendCommandToAgent).mockReturnValue(true);
+    const r = await dispatchScriptToDevice({ device: device({ agentId: 'agent-1' }), source: { kind: 'saved', script: savedScript() } });
+    expect(sendCommandToAgent).toHaveBeenCalledTimes(1);
+    expect(sendCommandToAgent).toHaveBeenCalledWith('agent-after-reattach', expect.objectContaining({ id: 'cmd-1', type: 'script' }));
+    expect(r.ok && r.deliveryOutcome).toBe('sent');
+  });
+
   it('reports claim_lost when claimPendingCommandForDelivery loses the race (no throw)', async () => {
     const consoleWarnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
-    vi.mocked(claimPendingCommandForDelivery).mockResolvedValue(null);
+    vi.mocked(claimPendingCommandForDelivery).mockResolvedValue({ status: 'not_claimable', id: 'cmd-1' });
     const r = await dispatchScriptToDevice({ device: device({ agentId: 'agent-1' }), source: { kind: 'saved', script: savedScript() } });
     expect(sendCommandToAgent).not.toHaveBeenCalled();
     expect(db.update).not.toHaveBeenCalled();
@@ -702,9 +765,35 @@ describe('dispatchScriptToDevice — delivery', () => {
     consoleWarnSpy.mockRestore();
   });
 
+  it('a push the claim cancels is an ok:false recorded refusal carrying the reason, never claim_lost', async () => {
+    vi.mocked(claimPendingCommandForDelivery).mockResolvedValue({
+      status: 'cancelled', id: 'cmd-1', reason: 'requester_inactive',
+    });
+    const r = await dispatchScriptToDevice({ device: device({ agentId: 'agent-1' }), source: { kind: 'saved', script: savedScript() } });
+    expect(sendCommandToAgent).not.toHaveBeenCalled();
+    expect(releaseClaimedCommandDelivery).not.toHaveBeenCalled();
+    // The claim already terminalised the command AND its execution row (and
+    // advanced the batch counters), so the fan-out must not write its own.
+    expect(db.update).not.toHaveBeenCalled();
+    expect(r).toEqual({
+      ok: false,
+      code: 'delivery_cancelled_recorded',
+      error: cancelledCommandError('requester_inactive'),
+    });
+  });
+
+  it('a push the claim holds stays queued (claim_lost) for the heartbeat', async () => {
+    vi.mocked(claimPendingCommandForDelivery).mockResolvedValue({
+      status: 'held', id: 'cmd-1', reason: 'claim_lock_conflict',
+    });
+    const r = await dispatchScriptToDevice({ device: device({ agentId: 'agent-1' }), source: { kind: 'saved', script: savedScript() } });
+    expect(sendCommandToAgent).not.toHaveBeenCalled();
+    expect(r.ok && r.deliveryOutcome).toBe('claim_lost');
+  });
+
   it('releases the claim when decrypt returns null (does NOT send raw payload)', async () => {
     const consoleWarnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
-    vi.mocked(claimPendingCommandForDelivery).mockResolvedValue({ executedAt: new Date() } as any);
+    vi.mocked(claimPendingCommandForDelivery).mockResolvedValue({ status: 'claimed', id: 'cmd-1', executedAt: new Date(), agentId: 'agent-1' } as any);
     // Once-only override: the default mock implementation just echoes the
     // command back, and other tests in this suite rely on that default —
     // `mockReturnValueOnce` avoids leaking `null` into later tests (plain
@@ -727,7 +816,7 @@ describe('dispatchScriptToDevice — delivery', () => {
 
   it('releases the claim when the WS send fails', async () => {
     const consoleWarnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
-    vi.mocked(claimPendingCommandForDelivery).mockResolvedValue({ executedAt: new Date() } as any);
+    vi.mocked(claimPendingCommandForDelivery).mockResolvedValue({ status: 'claimed', id: 'cmd-1', executedAt: new Date(), agentId: 'agent-1' } as any);
     vi.mocked(sendCommandToAgent).mockReturnValue(false);
     const { releaseClaimedCommandDelivery } = await import('./commandDispatch');
     const r = await dispatchScriptToDevice({ device: device({ agentId: 'agent-1' }), source: { kind: 'saved', script: savedScript() } });
@@ -751,6 +840,180 @@ describe('dispatchScriptToDevice — delivery', () => {
     }
     expect(consoleWarnSpy).not.toHaveBeenCalled();
     consoleWarnSpy.mockRestore();
+  });
+});
+
+// #3445: a caller that dispatches inside a transaction (the automation
+// runtime's per-device lock) must not put the command on the wire before that
+// transaction commits, or a fast agent's result reaches rows it cannot see.
+describe('dispatchScriptToDevice — deferDelivery (#3445)', () => {
+  function mockRunningUpdate() {
+    const setSpy = vi.fn();
+    vi.mocked(db.update).mockReturnValue({
+      set: (vals: Record<string, unknown>) => {
+        setSpy(vals);
+        return { where: () => Promise.resolve(undefined) };
+      },
+    } as any);
+    return setSpy;
+  }
+
+  it('creates the rows but neither claims nor sends until deliver() is called', async () => {
+    const setSpy = mockRunningUpdate();
+    const executedAt = new Date('2026-09-26T00:00:00Z');
+    vi.mocked(claimPendingCommandForDelivery).mockResolvedValue({ status: 'claimed', id: 'cmd-1', executedAt, agentId: 'agent-1' } as any);
+    vi.mocked(sendCommandToAgent).mockReturnValue(true);
+
+    const r = await dispatchScriptToDevice({
+      device: device({ agentId: 'agent-1' }),
+      source: { kind: 'saved', script: savedScript() },
+      deferDelivery: true,
+    });
+
+    expect(queueCommand).toHaveBeenCalledTimes(1);
+    expect(claimPendingCommandForDelivery).not.toHaveBeenCalled();
+    expect(sendCommandToAgent).not.toHaveBeenCalled();
+    expect(setSpy).not.toHaveBeenCalled();
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.delivered).toBe(false);
+    expect(r.deliveryOutcome).toBe('deferred');
+    expect(r.deliver).toBeTypeOf('function');
+
+    const delivered = await r.deliver!();
+    expect(claimPendingCommandForDelivery).toHaveBeenCalledWith('cmd-1');
+    expect(sendCommandToAgent).toHaveBeenCalledWith('agent-1', expect.objectContaining({ id: 'cmd-1', type: 'script' }));
+    expect(setSpy).toHaveBeenCalledWith({ status: 'running', startedAt: executedAt });
+    expect(delivered).toEqual(expect.objectContaining({
+      ok: true,
+      commandId: 'cmd-1',
+      executionId: 'exec-1',
+      delivered: true,
+      deliveryOutcome: 'sent',
+      executedAt,
+    }));
+  });
+
+  it('deliver() writes the running flip in its own system context (it runs with no ambient transaction)', async () => {
+    mockRunningUpdate();
+    vi.mocked(claimPendingCommandForDelivery).mockResolvedValue({ status: 'claimed', id: 'cmd-1', executedAt: new Date(), agentId: 'agent-1' } as any);
+    vi.mocked(sendCommandToAgent).mockReturnValue(true);
+    const { withSystemDbAccessContext } = await import('../db');
+
+    const r = await dispatchScriptToDevice({
+      device: device({ agentId: 'agent-1' }),
+      source: { kind: 'saved', script: savedScript() },
+      deferDelivery: true,
+    });
+    if (!r.ok) throw new Error('expected ok');
+    vi.mocked(withSystemDbAccessContext).mockClear();
+    await r.deliver!();
+    expect(withSystemDbAccessContext).toHaveBeenCalled();
+  });
+
+  it('deliver() reports no_agent without claiming when the device has no agent', async () => {
+    const r = await dispatchScriptToDevice({
+      device: device({ agentId: null }),
+      source: { kind: 'saved', script: savedScript() },
+      deferDelivery: true,
+    });
+    if (!r.ok) throw new Error('expected ok');
+    const delivered = await r.deliver!();
+    expect(claimPendingCommandForDelivery).not.toHaveBeenCalled();
+    expect(delivered).toEqual(expect.objectContaining({ ok: true, delivered: false, deliveryOutcome: 'no_agent' }));
+  });
+
+  // #4142: scriptDispatch sends through the relay facade. A rejected promise is
+  // a contract violation: the frame may already be out, so the claim is KEPT
+  // (releasing would let a second delivery race the first) and the error propagates.
+  it('a facade promise that rejects keeps the claim and propagates (uncertain: the frame may be out)', async () => {
+    const executedAt = new Date('2026-09-26T00:00:00Z');
+    vi.mocked(claimPendingCommandForDelivery).mockResolvedValue({ status: 'claimed', id: 'cmd-1', executedAt, agentId: 'agent-1' } as any);
+    vi.mocked(dispatchCommandToAgent).mockRejectedValueOnce(new Error('relay contract violation'));
+    const { releaseClaimedCommandDelivery } = await import('./commandDispatch');
+
+    const r = await dispatchScriptToDevice({
+      device: device({ agentId: 'agent-1' }),
+      source: { kind: 'saved', script: savedScript() },
+      deferDelivery: true,
+    });
+    if (!r.ok) throw new Error('expected ok');
+    await expect(r.deliver!()).rejects.toThrow('relay contract violation');
+    expect(releaseClaimedCommandDelivery).not.toHaveBeenCalled();
+    expect(db.update).not.toHaveBeenCalled();
+  });
+
+  it('an indeterminate facade outcome keeps the claim and does not stamp the execution running', async () => {
+    const executedAt = new Date('2026-09-26T00:00:00Z');
+    vi.mocked(claimPendingCommandForDelivery).mockResolvedValue({ status: 'claimed', id: 'cmd-1', executedAt, agentId: 'agent-1' } as any);
+    vi.mocked(dispatchCommandToAgent).mockResolvedValueOnce({ status: 'indeterminate', reason: 'ack_timeout' } as any);
+    const { releaseClaimedCommandDelivery } = await import('./commandDispatch');
+
+    const r = await dispatchScriptToDevice({ device: device({ agentId: 'agent-1' }), source: { kind: 'saved', script: savedScript() } });
+    if (!r.ok) throw new Error('expected ok');
+    expect(r.delivered).toBe(false);
+    expect(r.deliveryOutcome).toBe('indeterminate');
+    expect(releaseClaimedCommandDelivery).not.toHaveBeenCalled();
+    expect(db.update).not.toHaveBeenCalled();
+  });
+
+  it('a relayed delivery (via relay) counts as delivered: stamps running', async () => {
+    const executedAt = new Date('2026-09-26T00:00:00Z');
+    vi.mocked(claimPendingCommandForDelivery).mockResolvedValue({ status: 'claimed', id: 'cmd-1', executedAt, agentId: 'agent-1' } as any);
+    vi.mocked(dispatchCommandToAgent).mockResolvedValueOnce({ status: 'sent', via: 'relay' } as any);
+    vi.mocked(db.update).mockReturnValue({ set: () => ({ where: () => Promise.resolve(undefined) }) } as any);
+
+    const r = await dispatchScriptToDevice({ device: device({ agentId: 'agent-1' }), source: { kind: 'saved', script: savedScript() } });
+    if (!r.ok) throw new Error('expected ok');
+    expect(r.delivered).toBe(true);
+    expect(r.deliveryOutcome).toBe('sent');
+    expect(db.update).toHaveBeenCalled();
+  });
+
+  it.each(['offline', 'expired', 'owner_mismatch', 'infrastructure_error'])(
+    'a %s facade outcome releases the claim and reports send_failed',
+    async (status) => {
+      const consoleWarnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      const executedAt = new Date('2026-09-26T00:00:00Z');
+      vi.mocked(claimPendingCommandForDelivery).mockResolvedValue({ status: 'claimed', id: 'cmd-1', executedAt, agentId: 'agent-1' } as any);
+      vi.mocked(dispatchCommandToAgent).mockResolvedValueOnce({ status } as any);
+      const { releaseClaimedCommandDelivery } = await import('./commandDispatch');
+
+      const r = await dispatchScriptToDevice({ device: device({ agentId: 'agent-1' }), source: { kind: 'saved', script: savedScript() } });
+      if (!r.ok) throw new Error('expected ok');
+      expect(r.delivered).toBe(false);
+      expect(r.deliveryOutcome).toBe('send_failed');
+      expect(releaseClaimedCommandDelivery).toHaveBeenCalledWith('cmd-1', executedAt);
+      expect(db.update).not.toHaveBeenCalled();
+      consoleWarnSpy.mockRestore();
+    },
+  );
+
+  it('a failed running flip after a successful send still reports delivered (the agent has it)', async () => {
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    vi.mocked(db.update).mockReturnValue({
+      set: () => ({ where: () => Promise.reject(new Error('connection reset')) }),
+    } as any);
+    vi.mocked(claimPendingCommandForDelivery).mockResolvedValue({ status: 'claimed', id: 'cmd-1', executedAt: new Date(), agentId: 'agent-1' } as any);
+    vi.mocked(sendCommandToAgent).mockReturnValue(true);
+
+    const r = await dispatchScriptToDevice({
+      device: device({ agentId: 'agent-1' }),
+      source: { kind: 'saved', script: savedScript() },
+      deferDelivery: true,
+    });
+    if (!r.ok) throw new Error('expected ok');
+    const delivered = await r.deliver!();
+    expect(delivered).toEqual(expect.objectContaining({ ok: true, delivered: true, deliveryOutcome: 'sent' }));
+    expect(captureException).toHaveBeenCalled();
+    consoleErrorSpy.mockRestore();
+  });
+
+  it('without deferDelivery the result carries no deliver() (immediate path unchanged)', async () => {
+    const r = await dispatchScriptToDevice({ device: device({ agentId: null }), source: { kind: 'saved', script: savedScript() } });
+    if (!r.ok) throw new Error('expected ok');
+    expect(r.deliver).toBeUndefined();
+    expect(r.deliveryOutcome).toBe('no_agent');
   });
 });
 
@@ -1378,7 +1641,7 @@ describe('dispatchScriptToDevice — tenantSecret parameters', () => {
   });
 
   it('never calls the claim gate on the immediate-send path for a secret-free script', async () => {
-    vi.mocked(claimPendingCommandForDelivery).mockResolvedValue({ executedAt: new Date() } as any);
+    vi.mocked(claimPendingCommandForDelivery).mockResolvedValue({ status: 'claimed', id: 'cmd-1', executedAt: new Date(), agentId: 'agent-1' } as any);
     vi.mocked(sendCommandToAgent).mockReturnValue(true);
     vi.mocked(db.update).mockReturnValue({
       set: vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue(undefined) }),
@@ -1396,7 +1659,7 @@ describe('dispatchScriptToDevice — tenantSecret parameters', () => {
   it('immediate send: re-checks the claimed command through the claim gate, then sends', async () => {
     mockSealOnce();
     const executedAt = new Date('2026-08-22T00:00:00Z');
-    vi.mocked(claimPendingCommandForDelivery).mockResolvedValue({ executedAt } as any);
+    vi.mocked(claimPendingCommandForDelivery).mockResolvedValue({ status: 'claimed', id: 'cmd-1', executedAt, agentId: 'agent-1' } as any);
     vi.mocked(sendCommandToAgent).mockReturnValue(true);
     vi.mocked(db.update).mockReturnValue({
       set: vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue(undefined) }),
@@ -1443,7 +1706,7 @@ describe('dispatchScriptToDevice — tenantSecret parameters', () => {
   it('immediate send: refuses with agent_upgrade_required_recorded when the claim gate fails the command', async () => {
     mockSealOnce();
     const executedAt = new Date('2026-08-22T00:00:00Z');
-    vi.mocked(claimPendingCommandForDelivery).mockResolvedValue({ executedAt } as any);
+    vi.mocked(claimPendingCommandForDelivery).mockResolvedValue({ status: 'claimed', id: 'cmd-1', executedAt, agentId: 'agent-1' } as any);
     vi.mocked(sendCommandToAgent).mockReturnValue(true);
     vi.mocked(failClaimedSecretCommandsForUnsupportedAgent).mockResolvedValue([]);
     const { releaseClaimedCommandDelivery } = await import('./commandDispatch');
@@ -1466,6 +1729,33 @@ describe('dispatchScriptToDevice — tenantSecret parameters', () => {
     }
   });
 
+  // #3445: a deferred dispatch runs the same gate, later, from deliver() — with
+  // no ambient transaction, so the gate needs its own system context.
+  it('deferred: deliver() runs the claim gate in its own system context and surfaces its refusal', async () => {
+    mockSealOnce();
+    vi.mocked(claimPendingCommandForDelivery).mockResolvedValue({ status: 'claimed', id: 'cmd-1', executedAt: new Date(), agentId: 'agent-1' } as any);
+    vi.mocked(sendCommandToAgent).mockReturnValue(true);
+    vi.mocked(failClaimedSecretCommandsForUnsupportedAgent).mockResolvedValue([]);
+    const { withSystemDbAccessContext } = await import('../db');
+
+    const r = await dispatchSecret({ device: device({ agentId: 'agent-1' }), deferDelivery: true });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(failClaimedSecretCommandsForUnsupportedAgent).not.toHaveBeenCalled();
+
+    vi.mocked(withSystemDbAccessContext).mockClear();
+    const delivered = await r.deliver!();
+
+    expect(failClaimedSecretCommandsForUnsupportedAgent).toHaveBeenCalledTimes(1);
+    expect(withSystemDbAccessContext).toHaveBeenCalled();
+    expect(sendCommandToAgent).not.toHaveBeenCalled();
+    expect(delivered).toEqual({
+      ok: false,
+      code: 'agent_upgrade_required_recorded',
+      error: AGENT_UPGRADE_REQUIRED_MESSAGE,
+    });
+  });
+
   // The gate's own try/catch covers only its writes: the capability SELECT
   // (and its multi-device contract-violation throw) can propagate out AFTER
   // `claimPendingCommandForDelivery` already flipped the row to 'sent'. Left
@@ -1473,7 +1763,7 @@ describe('dispatchScriptToDevice — tenantSecret parameters', () => {
   it('immediate send: a gate throw becomes the same refusal, reported to Sentry, nothing sent', async () => {
     mockSealOnce();
     const executedAt = new Date('2026-08-22T00:00:00Z');
-    vi.mocked(claimPendingCommandForDelivery).mockResolvedValue({ executedAt } as any);
+    vi.mocked(claimPendingCommandForDelivery).mockResolvedValue({ status: 'claimed', id: 'cmd-1', executedAt, agentId: 'agent-1' } as any);
     vi.mocked(sendCommandToAgent).mockReturnValue(true);
     const boom = new Error('capability select exploded');
     vi.mocked(failClaimedSecretCommandsForUnsupportedAgent).mockRejectedValue(boom);

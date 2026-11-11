@@ -31,6 +31,14 @@ export const EPISODE_RECURRENCE_DAYS = parseEpisodeEnvInt('METRIC_ANOMALY_EPISOD
 export const EPISODE_SNOOZE_DAYS = parseEpisodeEnvInt('METRIC_ANOMALY_EPISODE_SNOOZE_DAYS', 7);
 /** How far back the assembly scan looks for unassigned rows. */
 export const EPISODE_ASSEMBLY_LOOKBACK_HOURS = parseEpisodeEnvInt('METRIC_ANOMALY_EPISODE_ASSEMBLY_LOOKBACK_HOURS', 24);
+/**
+ * Distinct buckets a new episode needs. Shorter settled islands close
+ * `cleared` with no episode (planner persistence gate). 3, not 2: after the
+ * gate shipped at 2, half of the remaining episodes were exactly two buckets
+ * (10 minutes) — mostly process CPU and disk/network bursts (2026-10-02 prod
+ * review).
+ */
+export const EPISODE_MIN_BUCKETS = parseEpisodeEnvInt('METRIC_ANOMALY_EPISODE_MIN_BUCKETS', 3);
 /** Raw rollup grain the detectors and the clean-data check read. Not tunable. */
 export const EPISODE_BUCKET_SECONDS = 300;
 
@@ -42,8 +50,12 @@ interface FamilyEntry {
 }
 
 /**
- * source_table -> metric_name -> family. Only the process cpu and ram
- * `_sum`/`_max` pairs collapse. `source_table` stays part of the key because
+ * source_table -> metric_name -> family. The process cpu and ram `_sum`/`_max`
+ * pairs collapse, and so do the device ram/disk percent + absolute pairs: the
+ * growth detector emits `ram_percent` and `ram_used_mb` (resp. `disk_percent`
+ * and `disk_used_gb`) for the same growth, which opened two episodes per event
+ * (2026-09-26 prod review). Episodes opened before that keep their old
+ * `ram_used`/`disk_used` family and close normally. `source_table` stays part of the key because
  * `network_egress` and `process_runaway` are each emitted for a device series
  * AND a process-sample series, which must not merge.
  */
@@ -51,9 +63,9 @@ export const EPISODE_METRIC_FAMILIES: Readonly<Record<string, Readonly<Record<st
   device_metrics: {
     cpu_percent: { family: 'cpu', dimension: 'cpu' },
     ram_percent: { family: 'ram', dimension: 'ramMb' },
-    ram_used_mb: { family: 'ram_used', dimension: 'ramMb' },
+    ram_used_mb: { family: 'ram', dimension: 'ramMb' },
     disk_percent: { family: 'disk', dimension: null },
-    disk_used_gb: { family: 'disk_used', dimension: null },
+    disk_used_gb: { family: 'disk', dimension: null },
     disk_read_bps: { family: 'disk_read', dimension: 'diskBps' },
     disk_write_bps: { family: 'disk_write', dimension: 'diskBps' },
     bandwidth_in_bps: { family: 'net_in', dimension: 'netBps' },
@@ -71,6 +83,17 @@ export const EPISODE_METRIC_FAMILIES: Readonly<Record<string, Readonly<Record<st
   },
 };
 
+/**
+ * Peak representative rule, shared by the planner, the SQL recompute and the
+ * episode DTO's peak member: a member of one of these metrics wins over a
+ * higher-scoring member of another, then score DESC, window_start ASC. The ram
+ * and disk families mix a percent and an absolute metric; without this the
+ * same device's episodes flip between "67% to 84%" and "8774 MB to 11657 MB"
+ * depending on which rule scored higher. The growth scores of the pair are on
+ * the same gate-multiple scale, so either is a fair peak score.
+ */
+export const EPISODE_PEAK_PREFERRED_METRICS: readonly string[] = ['ram_percent', 'disk_percent'];
+
 export function episodeKeyFor(
   sourceTable: string,
   anomalyType: string,
@@ -86,4 +109,33 @@ export function episodeKeyFor(
     metricFamily,
     attributionDimension: entry?.dimension ?? null,
   };
+}
+
+/**
+ * Human label for a metric family, for server-rendered text (fleet finding
+ * titles). Mirrors FAMILY_LABELS in the web's anomalyEpisodeSentence.ts; an
+ * unknown family (see episodeKeyFor) falls back to its title-cased name.
+ */
+const METRIC_FAMILY_LABELS: Readonly<Record<string, string>> = {
+  cpu: 'CPU',
+  ram: 'RAM',
+  ram_used: 'RAM used',
+  disk: 'Disk',
+  disk_used: 'Disk used',
+  disk_read: 'Disk read',
+  disk_write: 'Disk write',
+  net_in: 'Network in',
+  net_out: 'Network out',
+  process_count: 'Process count',
+  process_cpu: 'Process CPU',
+  process_ram: 'Process RAM',
+  process_disk: 'Process disk I/O',
+  process_net: 'Process network I/O',
+  process_count_top: 'Top process count',
+};
+
+export function metricFamilyLabel(metricFamily: string): string {
+  if (Object.hasOwn(METRIC_FAMILY_LABELS, metricFamily)) return METRIC_FAMILY_LABELS[metricFamily]!;
+  const spaced = metricFamily.replace(/_/g, ' ');
+  return spaced.length === 0 ? spaced : spaced[0]!.toUpperCase() + spaced.slice(1);
 }

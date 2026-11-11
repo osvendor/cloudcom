@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
 import { PgDialect } from 'drizzle-orm/pg-core';
@@ -11,8 +12,9 @@ import type { SQL } from 'drizzle-orm';
  * publish. See alerts.resolveCas.test.ts for the full rationale and for why the
  * predicate is asserted as COMPILED SQL rather than by column name.
  */
-const { dbMock, updateWheres, updateReturns, selectReturns, alertRow } = vi.hoisted(() => {
+const { dbMock, updateWheres, updateSets, updateReturns, selectReturns, alertRow } = vi.hoisted(() => {
   const updateWheres: unknown[] = [];
+  const updateSets: Record<string, unknown>[] = [];
   const updateReturns: unknown[][] = [];
   const selectReturns: unknown[][] = [];
   const alertRow = {
@@ -25,6 +27,7 @@ const { dbMock, updateWheres, updateReturns, selectReturns, alertRow } = vi.hois
     status: 'active',
     title: 'Agent offline',
     triggeredAt: new Date('2026-08-29T10:00:00.000Z'),
+    subjectKey: null as string | null,
   };
   const dbMock = {
     // mobile.ts keeps its OWN `getAlertWithOrgCheck` (it is not the shared
@@ -36,22 +39,24 @@ const { dbMock, updateWheres, updateReturns, selectReturns, alertRow } = vi.hois
       }),
     }),
     update: () => ({
-      set: () => ({
-        where: (predicate: unknown) => {
-          updateWheres.push(predicate);
-          return { returning: () => Promise.resolve(updateReturns.shift() ?? []) };
-        },
-      }),
+      set: (values: Record<string, unknown>) => {
+        updateSets.push(values);
+        return {
+          where: (predicate: unknown) => {
+            updateWheres.push(predicate);
+            return { returning: () => Promise.resolve(updateReturns.shift() ?? []) };
+          },
+        };
+      },
     }),
   };
-  return { dbMock, updateWheres, updateReturns, selectReturns, alertRow };
+  return { dbMock, updateWheres, updateSets, updateReturns, selectReturns, alertRow };
 });
 
 const publishEvent = vi.fn((..._args: unknown[]) => Promise.resolve('evt'));
 const emitAlertStateFeedback = vi.fn((..._args: unknown[]) => Promise.resolve());
 const writeRouteAudit = vi.fn();
 const setCooldown = vi.fn((..._args: unknown[]) => Promise.resolve());
-const markConfigPolicyRuleCooldown = vi.fn((..._args: unknown[]) => Promise.resolve());
 vi.mock('../db', () => ({
   db: dbMock,
   runOutsideDbContext: (fn: () => unknown) => fn(),
@@ -79,7 +84,6 @@ vi.mock('../middleware/auth', () => ({
 vi.mock('../middleware/userRateLimit', () => ({ userRateLimit: () => async (_c: unknown, next: () => Promise<void>) => next() }));
 vi.mock('../services/alertCooldown', () => ({
   setCooldown: (...args: unknown[]) => setCooldown(...args),
-  markConfigPolicyRuleCooldown: (...args: unknown[]) => markConfigPolicyRuleCooldown(...args),
 }));
 vi.mock('../services/auditEvents', () => ({ writeRouteAudit: (...a: unknown[]) => writeRouteAudit(...a) }));
 vi.mock('../services/eventBus', () => ({ publishEvent: (...a: unknown[]) => publishEvent(...a) }));
@@ -103,13 +107,13 @@ const resolveRequest = () =>
 
 beforeEach(() => {
   updateWheres.length = 0;
+  updateSets.length = 0;
   updateReturns.length = 0;
   selectReturns.length = 0;
   vi.clearAllMocks();
   publishEvent.mockResolvedValue('evt');
   emitAlertStateFeedback.mockResolvedValue(undefined);
   setCooldown.mockResolvedValue(undefined);
-  markConfigPolicyRuleCooldown.mockResolvedValue(undefined);
   // The pre-read always sees a resolvable alert; the race happens after it.
   selectReturns.push([{ ...alertRow, status: 'active' }]);
 });
@@ -126,7 +130,6 @@ describe('POST /mobile/alerts/:id/resolve — the losing caller', () => {
     });
     expect(publishEvent).not.toHaveBeenCalled();
     expect(setCooldown).not.toHaveBeenCalled();
-    expect(markConfigPolicyRuleCooldown).not.toHaveBeenCalled();
     expect(emitAlertStateFeedback).not.toHaveBeenCalled();
     expect(writeRouteAudit).not.toHaveBeenCalled();
   });
@@ -142,6 +145,15 @@ describe('POST /mobile/alerts/:id/resolve — the winning caller', () => {
     expect(publishEvent).toHaveBeenCalledTimes(1);
     expect(publishEvent.mock.calls[0]?.[0]).toBe('alert.resolved');
     expect(writeRouteAudit).toHaveBeenCalledTimes(1);
+  });
+
+  it("stamps resolution_reason 'manual' on the human resolve (#7281)", async () => {
+    updateReturns.push([{ ...alertRow, status: 'resolved' }]);
+
+    await resolveRequest();
+
+    expect(updateSets).toHaveLength(1);
+    expect(updateSets[0]).toMatchObject({ status: 'resolved', resolutionReason: 'manual' });
   });
 
   it('returns the same 409 the CAS loser gets when the pre-read already sees resolved', async () => {
@@ -174,4 +186,71 @@ describe('POST /mobile/alerts/:id/resolve — the shipped predicate (compiled SQ
     expect(sql).toBe('("alerts"."id" = $1 and "alerts"."status" in ($2, $3, $4))');
     expect(params).toEqual([alertRow.id, 'active', 'acknowledged', 'suppressed']);
   });
+});
+
+it.each([null, 'disk:3'])('manual mobile resolution isolates subject %s', async subjectKey => {
+  const row = { ...alertRow, ruleId: 'rule-1', subjectKey, status: 'active' };
+  selectReturns[0] = [row];
+  selectReturns.push([{ id: 'rule-1', templateId: 'tpl-1', overrideSettings: { cooldownMinutes: 42 } }]);
+  selectReturns.push([{ id: 'tpl-1', cooldownMinutes: 15 }]);
+  updateReturns.push([{ ...row, status: 'resolved' }]);
+  expect((await resolveRequest()).status).toBe(200);
+  expect(setCooldown).toHaveBeenCalledExactlyOnceWith('rule-1', 'device-1', 42, subjectKey ?? undefined);
+});
+
+it('resolves history-only policy alerts without writing cooldown', async () => {
+  const row = { ...alertRow, configPolicyId: 'cp-1', context: { cooldownMinutes: 7 }, status: 'active' };
+  selectReturns[0] = [row];
+  updateReturns.push([{ ...row, status: 'resolved' }]);
+  expect((await resolveRequest()).status).toBe(200);
+  expect(setCooldown).not.toHaveBeenCalled();
+});
+
+it('has no legacy policy cooldown import or branch', () => {
+  expect(readFileSync(new URL('./mobile.ts', import.meta.url), 'utf8'))
+    .not.toMatch(/markConfigPolicyRuleCooldown|else if \(alert\.configPolicyId\)/);
+});
+
+// Device-less ownership must not interrupt a successful resolve after its CAS.
+it.each(['backup_workload', 'topology_site'])('resolves a %s alert while skipping device cooldown', async (ownerKind) => {
+  const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+  try {
+    const row = { ...alertRow, ownerKind, ownerRef: 'workload-1', deviceId: null, ruleId: 'rule-1' };
+    selectReturns[0] = [row];
+    updateReturns.push([{ ...row, status: 'resolved' }]);
+    const res = await resolveRequest();
+    expect(res.status).toBe(200);
+    expect(setCooldown).not.toHaveBeenCalled();
+    expect(publishEvent).toHaveBeenCalledExactlyOnceWith('alert.resolved', row.orgId,
+      expect.objectContaining({ alertId: row.id, deviceId: null }),
+      expect.any(String), { userId: 'user-1' });
+    expect(emitAlertStateFeedback).toHaveBeenCalledTimes(1);
+    expect(writeRouteAudit).toHaveBeenCalledExactlyOnceWith(expect.anything(), expect.objectContaining({
+      action: 'mobile.alert.resolve', orgId: row.orgId, resourceId: row.id,
+    }));
+    expect(warn).toHaveBeenCalledWith(expect.any(String), {
+      alertId: row.id, orgId: row.orgId, ownerKind, reason: 'alert_has_no_device',
+    });
+    expect(error).not.toHaveBeenCalled();
+  } finally {
+    warn.mockRestore();
+    error.mockRestore();
+  }
+});
+
+it('finishes resolution and audit when the device cooldown write fails', async () => {
+  const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+  try {
+    const row = { ...alertRow, ruleId: 'rule-1' };
+    selectReturns[0] = [row];
+    selectReturns.push([{ id: 'rule-1', templateId: 'template-1' }], [{ cooldownMinutes: 15 }]);
+    updateReturns.push([{ ...row, status: 'resolved' }]);
+    setCooldown.mockRejectedValueOnce(new Error('cooldown unavailable'));
+    expect((await resolveRequest()).status).toBe(200);
+    expect(publishEvent).toHaveBeenCalledTimes(1);
+    expect(emitAlertStateFeedback).toHaveBeenCalledTimes(1);
+    expect(writeRouteAudit).toHaveBeenCalledTimes(1);
+    expect(error).toHaveBeenCalledWith(expect.stringContaining('cooldown'), expect.any(Error));
+  } finally { error.mockRestore(); }
 });

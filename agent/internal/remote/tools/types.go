@@ -2,12 +2,16 @@ package tools
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/breeze-rmm/agent/internal/systemrestore"
+	"github.com/breeze-rmm/agent/internal/wire"
 )
 
 // Command types
@@ -51,7 +55,19 @@ const (
 	CmdShutdown       = "shutdown"
 	CmdLock           = "lock"
 	CmdRebootSafeMode = "reboot_safe_mode"
-	CmdWakeOnLan      = "wake_on_lan"
+	// CmdForceReboot (#8729) is an immediate reboot that force-closes running
+	// apps (`/f` on Windows). A separate type, not a flag on `reboot`: older
+	// agents keep reading `reboot`'s wire shape, and an agent that predates this
+	// type fails it visibly as "unknown command type" instead of rebooting unforced.
+	CmdForceReboot = "force_reboot"
+	CmdWakeOnLan   = "wake_on_lan"
+	// CmdOemUpdateRun (#11065) runs one hardware vendor's own update tool
+	// (Dell Command Update first). The API is its only sender, through one gated
+	// dispatch seam; the agent decides alone which tools and hosts it trusts.
+	CmdOemUpdateRun = "oem_update_run"
+	// CmdOemUpdateRelease (#11065 W06) hands a vendor tool's own update
+	// schedule back: the agent restores only what its takeover changed.
+	CmdOemUpdateRelease = "oem_update_release"
 	// On-demand re-run of all inventory collectors. Triggers the same set of
 	// send*Inventory submissions the heartbeat fires periodically, so the API
 	// sees fresh hardware/software/network/etc. without waiting for the next
@@ -69,6 +85,11 @@ const (
 	// active console user. Never implicit: only an explicit operator action
 	// sends this.
 	CmdHomebrewBootstrap = "homebrew_bootstrap"
+
+	// Time synchronization management (Windows).
+	CmdTimeResync      = "time_resync"
+	CmdTimeSetTimezone = "time_set_timezone"
+	CmdTimeApplyPolicy = "time_apply_policy"
 
 	// Boot performance
 	CmdCollectBootPerformance    = "collect_boot_performance"
@@ -139,6 +160,13 @@ const (
 	CmdFilesystemAnalysis = "filesystem_analysis"
 	CmdFileListDrives     = "file_list_drives"
 
+	// Administrator-approved diagnostic reads (diagaccess_*.go). Separate
+	// command types so an authorization can never be dropped silently into the
+	// legacy file_list/file_read path, and so an agent that predates them
+	// refuses the command as unknown instead of reading without one.
+	CmdDiagFileList = "diag_file_list"
+	CmdDiagFileRead = "diag_file_read"
+
 	// OS-native disk cleanup (Disk Cleanup v2 §7). A SECOND cleanup engine
 	// beside filesystem_analysis / file_delete: opaque, non-itemised platform
 	// maintenance (cleanmgr handlers, DISM component cleanup, Time Machine
@@ -153,6 +181,9 @@ const (
 
 	// SNMP polling
 	CmdSnmpPoll = "snmp_poll"
+	// Server-armed IF-MIB interface state/counter poll (topology M3). The payload
+	// names the exact ifIndex→interface bindings; the result is an if_metrics envelope.
+	CmdTopologyInterfacePoll = "topology_interface_poll"
 
 	// Network monitoring
 	CmdNetworkDiagnostic       = "network_diagnostic"
@@ -175,6 +206,11 @@ const (
 	CmdBackupTestRestore = "backup_test_restore"
 	CmdBackupCleanup     = "backup_cleanup"
 
+	// Local vault (backup helper)
+	CmdVaultSync      = "vault_sync"
+	CmdVaultStatus    = "vault_status"
+	CmdVaultConfigure = "vault_configure"
+
 	// VSS backup management
 	CmdVSSStatus     = "vss_status"
 	CmdVSSWriterList = "vss_writer_list"
@@ -190,6 +226,7 @@ const (
 	CmdHardwareProfile     = "hardware_profile"
 	CmdVMRestoreFromBackup = "vm_restore_from_backup"
 	CmdVMRestoreEstimate   = "vm_restore_estimate"
+	CmdVMInstantBoot       = "vm_instant_boot"
 	CmdBMRRecover          = "bmr_recover"
 	// CmdBareMetalRebuild (W05a) runs the rebuild engine on a Linux host
 	// against a server-minted recovery token (payload: recoveryId, token,
@@ -245,6 +282,7 @@ const (
 	// Incident response
 	CmdCollectEvidence    = "collect_evidence"
 	CmdExecuteContainment = "execute_containment"
+	CmdReleaseContainment = "release_containment"
 
 	// TCP tunnel relay (VNC + network proxy)
 	CmdTunnelOpen  = "tunnel_open"
@@ -261,6 +299,12 @@ const (
 	CmdActuateElevation = "actuate_elevation"
 	CmdPamApplyV2       = "pam_apply_v2"
 	CmdPamCleanupV2     = "pam_cleanup_v2"
+	CmdPamReconcileV2   = "pam_reconcile_v2"
+
+	// #8928: fire-and-forget outcome notice (denied / expired) for an
+	// elevation request the user handed to IT. Claimable only by agents that
+	// report pamUserNotifyProtocolVersion 1.
+	CmdPamRequestNotify = "pam_request_notify"
 )
 
 // CommandResult represents the result of a command execution
@@ -276,6 +320,13 @@ type CommandResult struct {
 	Stdout   string `json:"stdout,omitempty"`
 	Stderr   string `json:"stderr,omitempty"`
 	Error    string `json:"error,omitempty"`
+	// ErrorCode is the typed reason for a deterministic refusal (#4026), set
+	// by NewErrorResult from an error tagged with withErrorCode. The server
+	// classifies on it in preference to matching Error's prose; empty means
+	// "unclassified" and the server falls back to the prose. Must also be
+	// copied by toWSCommandResult (heartbeat.go) — the WebSocket leg builds
+	// its frame field-by-field.
+	ErrorCode wire.CommandErrorCode `json:"errorCode,omitempty"`
 	// Result carries structured output for the HTTP command-result transport.
 	// Most handlers leave it nil, in which case WebSocket conversion
 	// (toWSCommandResult, agent/internal/heartbeat/heartbeat.go) independently
@@ -300,6 +351,13 @@ type CommandResult struct {
 	// primary work began. Set by command handlers that care about the server-
 	// side reconstruction (e.g. software_install). Empty when not applicable.
 	StartedAt string `json:"startedAt,omitempty"`
+	// RestorePoint is the Windows System Restore checkpoint outcome for this
+	// command, when the server asked for one (#4609). A DEDICATED top-level
+	// field rather than a key inside Result/Stdout: script and software-install
+	// results already use Stdout for their own payloads with type-specific
+	// server-side parsers. The REST transport marshals this struct directly;
+	// toWSCommandResult (heartbeat.go) must copy it onto the WebSocket frame.
+	RestorePoint *systemrestore.Outcome `json:"restorePoint,omitempty"`
 }
 
 // NewSuccessResult creates a successful command result with data
@@ -321,14 +379,46 @@ func NewSuccessResult(data any, durationMs int64) CommandResult {
 	}
 }
 
-// NewErrorResult creates a failed command result
+// NewErrorResult creates a failed command result. When err (or anything it
+// wraps) carries a typed code from withErrorCode, the code rides on the result
+// as ErrorCode (#4026); the outermost code in the chain wins.
 func NewErrorResult(err error, durationMs int64) CommandResult {
 	return CommandResult{
 		Status:     "failed",
 		ExitCode:   1,
 		Error:      err.Error(),
+		ErrorCode:  errorCodeOf(err),
 		DurationMs: durationMs,
 	}
+}
+
+// codedError attaches a wire.CommandErrorCode to an error without changing its
+// message — the prose is what pre-#4026 servers still classify on, so it must
+// stay byte-identical.
+type codedError struct {
+	code wire.CommandErrorCode
+	err  error
+}
+
+func (e *codedError) Error() string { return e.err.Error() }
+func (e *codedError) Unwrap() error { return e.err }
+
+// withErrorCode tags err with a typed code for NewErrorResult to carry.
+func withErrorCode(code wire.CommandErrorCode, err error) error {
+	return &codedError{code: code, err: err}
+}
+
+// errorCodef is fmt.Errorf plus a typed code.
+func errorCodef(code wire.CommandErrorCode, format string, args ...any) error {
+	return withErrorCode(code, fmt.Errorf(format, args...))
+}
+
+func errorCodeOf(err error) wire.CommandErrorCode {
+	var coded *codedError
+	if errors.As(err, &coded) {
+		return coded.code
+	}
+	return ""
 }
 
 // Process information types

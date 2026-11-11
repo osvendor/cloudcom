@@ -28,8 +28,12 @@ vi.mock('../db', () => ({
 vi.mock('./aiAgent', () => ({ waitForPlanApproval: vi.fn() }));
 
 // Identity compaction so the assertions read against the raw handler output.
+// setToolPaginationHintResolver is a no-op here: aiTools.ts calls it at
+// import time (A-W05 D12) and this mock replaces the whole module, so the
+// real export must be stubbed too or the top-level call throws.
 vi.mock('./aiToolOutput', () => ({
   compactToolResultForChat: vi.fn((_tool: string, raw: string) => raw),
+  setToolPaginationHintResolver: vi.fn(),
 }));
 
 vi.mock('./aiToolsM365', () => ({
@@ -49,7 +53,7 @@ vi.mock('./aiTools', async (importOriginal) => ({
   executeTool: (...args: unknown[]) => mockExecuteTool(...(args as [])),
 }));
 
-import { __test__ } from './aiAgentSdkTools';
+import { __test__, WISP_UNGATED_CALL_MESSAGE, wrapExtraToolWithHooks } from './aiAgentSdkTools';
 import { buildScriptBuilderTools } from './scriptBuilderTools';
 import type { PreToolUseCallback } from './aiAgentSdkTools';
 import type { ToolExecutionContext } from './toolExecutionContext';
@@ -72,6 +76,46 @@ const verifiedContext = {
     scope: { orgIds: new Set(['org-1']) },
   },
 } as unknown as ToolExecutionContext;
+
+describe('#10973: a classified unattended read dispatches its pinned call', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockExecuteTool.mockResolvedValue(JSON.stringify({ ok: true }));
+  });
+
+  const pinned = Object.freeze({ action: 'read_key', deviceId: 'device-1', keyPath: 'HKLM\\SOFTWARE' });
+  const context = { pinnedWispUnattendedRead: { kind: 'registry_read', tool: 'registry_operations', pinned } } as unknown as ToolExecutionContext;
+
+  it('the handler receives the pinned payload, not the raw input', async () => {
+    const onPreToolUse = vi.fn(async () => ({ allowed: true as const, context }));
+    const handler = makeHandler('registry_operations', () => fakeAuth, onPreToolUse);
+
+    await handler({ action: 'read_key', deviceId: 'device-2', keyPath: 'HKLM\\OTHER', valueData: 'smuggled' });
+
+    expect(mockExecuteTool).toHaveBeenCalledTimes(1);
+    const call = mockExecuteTool.mock.calls[0]! as unknown as unknown[];
+    expect(call[1]).toEqual(pinned);
+    expect((call[3] as { context?: unknown }).context).toBe(context);
+  });
+
+  it('a pin for another tool refuses the call instead of running either payload', async () => {
+    const onPreToolUse = vi.fn(async () => ({ allowed: true as const, context }));
+    const handler = makeHandler('set_device_context', () => fakeAuth, onPreToolUse);
+
+    const result = await handler({ deviceId: 'device-1', contextType: 'issue', summary: 'x' });
+
+    expect(mockExecuteTool).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ isError: true });
+  });
+
+  it('with no pin the raw input is dispatched as always', async () => {
+    const onPreToolUse = vi.fn(async () => ({ allowed: true as const }));
+    const handler = makeHandler('registry_operations', () => fakeAuth, onPreToolUse);
+    const input = { action: 'read_key', deviceId: 'device-1', keyPath: 'HKLM\\A' };
+    await handler(input);
+    expect((mockExecuteTool.mock.calls[0]! as unknown as unknown[])[1]).toBe(input);
+  });
+});
 
 describe.each([
   { name: 'Fleet AI', makeHandler },
@@ -164,5 +208,233 @@ describe.each([
     await handler({ scriptId: 'script-1', deviceIds: ['device-1'] });
 
     expect(mockExecuteTool).not.toHaveBeenCalled();
+  });
+});
+
+// #7931: the result is paired with its tool_use by the id the SDK sends with
+// the MCP call (`extra._meta['claudecode/toolUseId']`), so every handler
+// factory must hand that id to onPostToolUse — never leave pairing to queue
+// position.
+describe('the SDK tool_use id reaches onPostToolUse (#7931)', () => {
+  const extra = { _meta: { 'claudecode/toolUseId': 'toolu_own_call' } };
+  type Post = NonNullable<Parameters<typeof makeHandler>[3]>;
+  const sdkTool = (name: string, post: Post) => {
+    const registered = buildScriptBuilderTools(() => fakeAuth, undefined, post).find(t => t.name === name);
+    if (!registered) throw new Error(`Missing tool: ${name}`);
+    return registered;
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockExecuteTool.mockResolvedValue(JSON.stringify({ ok: true }));
+  });
+
+  it.each([
+    {
+      name: 'Fleet AI handler',
+      call: (post: Post) => makeHandler('list_scripts', () => fakeAuth, undefined, post)({}, extra),
+    },
+    {
+      name: 'Script Builder existing-tool handler',
+      call: (post: Post) => sdkTool('list_scripts', post).handler({} as never, extra as never),
+    },
+    {
+      name: 'Script Builder apply handler',
+      call: (post: Post) =>
+        sdkTool('apply_script_code', post).handler({ code: 'Get-Date', language: 'powershell' } as never, extra as never),
+    },
+  ])('$name', async ({ call }) => {
+    const post = vi.fn(async () => undefined);
+    await call(post);
+    expect(post).toHaveBeenCalledTimes(1);
+    expect((post.mock.calls[0] as unknown[])[7]).toBe('toolu_own_call');
+  });
+
+  it('passes undefined when the SDK sent no id', async () => {
+    const post = vi.fn(async () => undefined);
+    await makeHandler('list_scripts', () => fakeAuth, undefined, post)({}, {});
+    expect((post.mock.calls[0] as unknown[])[7]).toBeUndefined();
+  });
+});
+
+// #8163: an agent run keeps per-call state (ledger row, act pin) between its
+// pre and post hooks, keyed by the SDK tool_use id. So every handler factory
+// must hand onPreToolUse the SAME id it binds into that call's onPostToolUse.
+describe('the SDK tool_use id reaches onPreToolUse, matching onPostToolUse (#8163)', () => {
+  const extra = { _meta: { 'claudecode/toolUseId': 'toolu_own_call' } };
+  type Post = NonNullable<Parameters<typeof makeHandler>[3]>;
+  const extraTool = {
+    name: 'submit_test_outcome',
+    description: 'test',
+    inputSchema: {},
+    handler: async () => ({ content: [{ type: 'text' as const, text: '{"ok":true}' }] }),
+  } as unknown as Parameters<typeof wrapExtraToolWithHooks>[0];
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockExecuteTool.mockResolvedValue(JSON.stringify({ ok: true }));
+  });
+
+  it.each([
+    {
+      name: 'Fleet AI handler',
+      call: (pre: PreToolUseCallback, post: Post, ex: unknown) =>
+        makeHandler('list_scripts', () => fakeAuth, pre, post)({}, ex),
+    },
+    {
+      name: 'Script Builder existing-tool handler',
+      call: (pre: PreToolUseCallback, post: Post, ex: unknown) => {
+        const registered = buildScriptBuilderTools(() => fakeAuth, pre, post).find(t => t.name === 'list_scripts');
+        if (!registered) throw new Error('Missing tool: list_scripts');
+        return registered.handler({} as never, ex as never);
+      },
+    },
+    {
+      name: 'extra (outcome) tool wrapper',
+      call: (pre: PreToolUseCallback, post: Post, ex: unknown) =>
+        wrapExtraToolWithHooks(extraTool, pre, post).handler({}, ex),
+    },
+  ])('$name', async ({ call }) => {
+    const pre = vi.fn<PreToolUseCallback>(async () => ({ allowed: true }));
+    const post = vi.fn(async () => undefined);
+    await call(pre, post, extra);
+    expect(pre).toHaveBeenCalledTimes(1);
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(pre.mock.calls[0]![3]).toBe('toolu_own_call');
+    expect((post.mock.calls[0] as unknown[])[7]).toBe('toolu_own_call');
+
+    // No id from the SDK: both hooks see undefined (the agent run then falls
+    // back to per-name pairing and reports it).
+    pre.mockClear();
+    post.mockClear();
+    await call(pre, post, {});
+    expect(pre.mock.calls[0]![3]).toBeUndefined();
+    expect((post.mock.calls[0] as unknown[])[7]).toBeUndefined();
+  });
+});
+
+describe('plain tool handler: typed caller-verification refusal (#6354 W05)', () => {
+  it('emits the refusal JSON intact (isError, no sanitised message) and posts the same text', async () => {
+    const { CallerVerificationRequiredError } = await import('./callerVerification/errors');
+    const payload = {
+      orgId: 'org-1', contactId: null, action: 'disable_user' as const,
+      requiredTier: 2, reason: 'no_fresh_verification' as const, latest: null,
+    };
+    mockExecuteTool.mockRejectedValueOnce(new CallerVerificationRequiredError(payload));
+    const post = vi.fn(async () => undefined);
+    const handler = makeHandler('query_devices', () => fakeAuth, undefined, post);
+
+    const res = (await handler({}, undefined)) as { content: Array<{ text: string }>; isError?: boolean };
+
+    expect(res.isError).toBe(true);
+    expect(JSON.parse(res.content[0]!.text)).toEqual({
+      error: 'Caller verification required',
+      requiresCallerVerification: payload,
+    });
+    expect((post.mock.calls[0] as unknown[])[2]).toBe(res.content[0]!.text);
+    expect((post.mock.calls[0] as unknown[])[3]).toBe(true);
+  });
+});
+
+// Wisp W04 Task 4: the gate returns the per-call ceiling-narrowed auth on the
+// check result, and the handler runs the tool under IT, not the session's
+// shared getAuth(). W04 T6b reach: a Wisp session's capture scope names its
+// thread; an ordinary session's capture scope gains no key.
+describe('Wisp per-call auth and thread capture scope (W04 Task 4)', () => {
+  const { makeToolHandler, makeSessionAwareHandler } = __test__;
+  const narrowedAuth = { ...fakeAuth, accessibleOrgIds: ['org-1'], wispGrant: { grantId: 'g-1', grantRevisionId: 'r-1', sessionId: 's-1' } };
+  const session = (wispGrant: unknown) => ({ orgId: 'org-1', breezeSessionId: 's-1', wispGrant }) as never;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockExecuteTool.mockResolvedValue(JSON.stringify({ ok: true }));
+  });
+
+  it('executes under check.toolAuth when the gate returns one, and names the thread in the capture scope', async () => {
+    const getAuth = vi.fn(() => fakeAuth);
+    const onPreToolUse = vi.fn(async () => ({ allowed: true as const, toolAuth: narrowedAuth as never }));
+    const handler = makeToolHandler('list_scripts', getAuth, () => session({ grantId: 'g-1', revisionId: 'r-1', threadId: 't-1' }), onPreToolUse);
+
+    await handler({});
+
+    const call = mockExecuteTool.mock.calls[0]! as unknown as unknown[];
+    expect(call[2]).toBe(narrowedAuth);
+    expect(getAuth).not.toHaveBeenCalled();
+    expect((call[3] as { capture: unknown }).capture).toEqual({ orgId: 'org-1', sessionId: 's-1', wispThreadId: 't-1' });
+  });
+
+  it('an ordinary session keeps getAuth() and its capture scope gains no wispThreadId key', async () => {
+    const onPreToolUse = vi.fn(async () => ({ allowed: true as const }));
+    const handler = makeToolHandler('list_scripts', () => fakeAuth, () => session(null), onPreToolUse);
+
+    await handler({});
+
+    const call = mockExecuteTool.mock.calls[0]! as unknown as unknown[];
+    expect(call[2]).toBe(fakeAuth);
+    expect(Object.keys((call[3] as { capture: object }).capture)).toEqual(['orgId', 'sessionId']);
+  });
+
+  it('a Wisp session whose gate allowed a call WITHOUT toolAuth is denied, never run under getAuth() (makeToolHandler)', async () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const getAuth = vi.fn(() => fakeAuth);
+    const post = vi.fn(async () => undefined);
+    const onPreToolUse = vi.fn(async () => ({ allowed: true as const }));
+    const handler = makeToolHandler('list_scripts', getAuth, () => session({ grantId: 'g-1', revisionId: 'r-1', threadId: 't-1' }), onPreToolUse, post);
+
+    const res = (await handler({})) as { content: Array<{ text: string }>; isError?: boolean };
+
+    expect(mockExecuteTool).not.toHaveBeenCalled();
+    expect(getAuth).not.toHaveBeenCalled();
+    expect(res.isError).toBe(true);
+    expect(JSON.parse(res.content[0]!.text)).toEqual({ error: WISP_UNGATED_CALL_MESSAGE });
+    expect((post.mock.calls[0] as unknown[])[3]).toBe(true);
+    errSpy.mockRestore();
+  });
+
+  it('a Wisp session whose gate allowed a call WITHOUT toolAuth is denied (makeSessionAwareHandler)', async () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const getAuth = vi.fn(() => fakeAuth);
+    const sessionHandler = vi.fn(async () => JSON.stringify({ ok: true }));
+    const onPreToolUse = vi.fn(async () => ({ allowed: true as const }));
+    const handler = makeSessionAwareHandler('m365_lookup_user', getAuth, () => session({ threadId: 't-1' }), sessionHandler, onPreToolUse);
+
+    const res = (await handler({ userPrincipalName: 'a@b.test' })) as { content: Array<{ text: string }>; isError?: boolean };
+
+    expect(sessionHandler).not.toHaveBeenCalled();
+    expect(getAuth).not.toHaveBeenCalled();
+    expect(res.isError).toBe(true);
+    expect(JSON.parse(res.content[0]!.text)).toEqual({ error: WISP_UNGATED_CALL_MESSAGE });
+    errSpy.mockRestore();
+  });
+
+  it('the session-aware (M365/Google) handler also runs under check.toolAuth', async () => {
+    const sessionHandler = vi.fn(async () => JSON.stringify({ ok: true }));
+    const onPreToolUse = vi.fn(async () => ({ allowed: true as const, toolAuth: narrowedAuth as never }));
+    const handler = makeSessionAwareHandler('m365_lookup_user', () => fakeAuth, () => session({ threadId: 't-1' }), sessionHandler, onPreToolUse);
+
+    await handler({ userPrincipalName: 'a@b.test' });
+
+    expect((sessionHandler.mock.calls[0] as unknown[])[1]).toBe(narrowedAuth);
+  });
+});
+
+describe('extra tools: the gate context reaches the handler (W5 PR C, #5220)', () => {
+  it('the context returned by onPreToolUse is readable by the extra tool handler for that call only', async () => {
+    const { extraToolCallContext } = await import('./aiAgentSdkTools');
+    const seen: Array<ToolExecutionContext | undefined> = [];
+    const extra = { name: 'flow__disk', description: 'x', inputSchema: {}, handler: vi.fn(async (_args: unknown, ex: unknown) => {
+      seen.push(extraToolCallContext(ex));
+      return { content: [{ type: 'text' as const, text: 'ok' }] };
+    }) };
+    const ctx = { flowToolGate: { descriptor: { name: 'flow__disk' }, call: { inputs: {}, orgId: null, idempotencyKey: null } } } as unknown as ToolExecutionContext;
+    const wrapped = wrapExtraToolWithHooks(extra as never, vi.fn(async () => ({ allowed: true as const, context: ctx })));
+    await wrapped.handler({}, { requestId: 'r-1' });
+    expect(seen[0]).toBe(ctx);
+    // No gate context ⇒ nothing (a handler must refuse rather than guess).
+    const bare = wrapExtraToolWithHooks(extra as never, vi.fn(async () => ({ allowed: true as const })));
+    await bare.handler({}, { requestId: 'r-2' });
+    expect(seen[1]).toBeUndefined();
+    // A call without an `extra` object cannot carry one either.
+    expect(extraToolCallContext(undefined)).toBeUndefined();
   });
 });

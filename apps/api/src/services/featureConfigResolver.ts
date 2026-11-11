@@ -1,11 +1,19 @@
+import { createHash } from 'node:crypto';
 import { db } from '../db';
+import { hierarchyFor, type DeviceHierarchy as PassedDeviceHierarchy, type DeviceHierarchyOpts } from './deviceHierarchy';
 import { readWithPartnerAxisVisibility } from '../db/partnerAxisRead';
 import { policyOwnershipCondition } from './configPolicyOwnership';
+import { reportInvalidStoredSettings } from './invalidStoredSettingsReport';
+import {
+  candidatesWithLink,
+  type ApplicabilityRule,
+  type DevicePolicySet,
+  type PolicyCandidate,
+} from './devicePolicySet';
 import {
   configurationPolicies,
   configPolicyEffectiveFeatureLinks,
   configPolicyAssignments,
-  configPolicyAlertRules,
   configPolicyAutomations,
   monitorConversions,
   configPolicyComplianceRules,
@@ -21,17 +29,34 @@ import {
   sites,
   softwarePolicies,
 } from '../db/schema';
-import { and, eq, ne, sql, inArray, asc, SQL, or, isNull } from 'drizzle-orm';
-import { resolveEffectiveTimezone, canonicalizeTimezone, parseSecurityScanSettings, type SecurityScanSettings } from '@breeze/shared';
+import { and, eq, ne, sql, inArray, asc, SQL, or, isNull, isNotNull } from 'drizzle-orm';
+import {
+  resolveEffectiveTimezone,
+  canonicalizeTimezone,
+  parseSecurityScanSettings,
+  type SecurityScanSettings,
+  systemProtectionInlineSettingsSchema,
+  SYSTEM_PROTECTION_DEFAULTS,
+  containmentInlineSettingsSchema,
+  CONTAINMENT_POLICY_DEFAULTS,
+  type ContainmentInlineSettings,
+  type SystemProtectionInlineSettings,
+} from '@breeze/shared';
 import {
   MAINTENANCE_DATETIME_TIME_PATTERN,
   MAINTENANCE_EXPLICIT_UTC_OFFSET_PATTERN,
   MAINTENANCE_TIME_OF_DAY_PATTERN,
+  securityAgentsInlineSettingsSchema,
+  type SecurityAgentsInlineSettings,
 } from '@breeze/shared/validators';
+import { DEFAULT_RING_FEATURE_UPDATES, ringFeatureUpdatesSchema, type RingFeatureUpdates } from '@breeze/shared/validators';
 import type { AuthContext } from '../middleware/auth';
 import type { TokenPayload } from './jwt';
 import type { DbExecutor } from './monitors/monitorCompiler';
 import type { AutomationAssignmentLevel } from '../jobs/queueSchemas';
+import { isUnassignedPoolOrgType } from './unassignedPool/orgType';
+import { resolveExecutionSafeGroupIds, type RefusedExecutionGroup } from './executionTargetGating';
+import { notHoldingOrgCondition, notParkedDeviceCondition } from './unassignedPool/selectorPredicate';
 
 // ============================================
 // Types
@@ -90,7 +115,7 @@ export function createSystemAuthContext(): AuthContext {
 // Internal: Build hierarchy target conditions
 // ============================================
 
-interface DeviceHierarchy {
+export interface DeviceHierarchy {
   deviceId: string;
   orgId: string;
   siteId: string;
@@ -100,7 +125,7 @@ interface DeviceHierarchy {
   osType: string;
 }
 
-async function loadDeviceHierarchy(deviceId: string, executor: DbExecutor = db): Promise<DeviceHierarchy | null> {
+export async function loadDeviceHierarchy(deviceId: string, executor: DbExecutor = db): Promise<DeviceHierarchy | null> {
   // 1. Load device
   const [device] = await executor
     .select({ id: devices.id, orgId: devices.orgId, siteId: devices.siteId, deviceRole: devices.deviceRole, osType: devices.osType })
@@ -112,7 +137,7 @@ async function loadDeviceHierarchy(deviceId: string, executor: DbExecutor = db):
 
   // 2. Load org for partnerId
   const [org] = await executor
-    .select({ partnerId: organizations.partnerId })
+    .select({ partnerId: organizations.partnerId, type: organizations.type })
     .from(organizations)
     .where(eq(organizations.id, device.orgId))
     .limit(1);
@@ -127,16 +152,35 @@ async function loadDeviceHierarchy(deviceId: string, executor: DbExecutor = db):
     deviceId: device.id,
     orgId: device.orgId,
     siteId: device.siteId,
-    partnerId: org?.partnerId ?? null,
+    // A device parked in its partner's holding org gets no partner-level
+    // assignment: nothing partner-wide applies to it until it is assigned.
+    partnerId: isUnassignedPoolOrgType(org?.type) ? null : org?.partnerId ?? null,
     groupIds: groupRows.map((r) => r.groupId),
     deviceRole: device.deviceRole,
     osType: device.osType,
   };
 }
 
+/**
+ * The same value loadDeviceHierarchy above builds, from a hierarchy the caller
+ * already loaded (#8053 W1a-1). Same parked-device rule: an `unassigned_pool`
+ * org gets no partner-level assignment.
+ */
+function fromPassedHierarchy(h: PassedDeviceHierarchy): DeviceHierarchy {
+  return {
+    deviceId: h.deviceId,
+    orgId: h.orgId,
+    siteId: h.siteId,
+    partnerId: isUnassignedPoolOrgType(h.org?.type) ? null : h.org?.partnerId ?? null,
+    groupIds: [...h.groupIds],
+    deviceRole: h.deviceRole,
+    osType: h.osType,
+  };
+}
+
 export type RoleOsFilterable = {
-  roleFilter?: string[] | null;
-  osFilter?: string[] | null;
+  roleFilter?: readonly string[] | null;
+  osFilter?: readonly string[] | null;
 };
 
 export type DeviceRoleOs = {
@@ -178,7 +222,7 @@ export function buildRoleOsFilterConditions(device: DeviceRoleOs): SQL[] {
   ];
 }
 
-function buildTargetConditions(hierarchy: DeviceHierarchy): SQL[] {
+export function buildTargetConditions(hierarchy: DeviceHierarchy): SQL[] {
   const conditions: SQL[] = [];
 
   // Device level
@@ -232,220 +276,30 @@ function buildTargetConditions(hierarchy: DeviceHierarchy): SQL[] {
  * Sort rows by hierarchy level (device=5 wins first), then assignment priority ASC,
  * then createdAt ASC (earliest first as tiebreaker).
  */
-function sortByHierarchy<T extends { assignmentLevel: string; assignmentPriority: number; assignmentCreatedAt: Date }>(
-  rows: T[]
-): T[] {
-  return rows.sort((a, b) => {
-    const levelDiff =
-      (LEVEL_PRIORITY[b.assignmentLevel as ConfigAssignmentLevel] ?? 0) -
-      (LEVEL_PRIORITY[a.assignmentLevel as ConfigAssignmentLevel] ?? 0);
-    if (levelDiff !== 0) return levelDiff;
-    const priDiff = a.assignmentPriority - b.assignmentPriority;
-    if (priDiff !== 0) return priDiff;
-    return a.assignmentCreatedAt.getTime() - b.assignmentCreatedAt.getTime();
-  });
+export type HierarchyRanked = { assignmentLevel: string; assignmentPriority: number; assignmentCreatedAt: Date };
+
+/**
+ * The comparator {@link sortByHierarchy} sorts with: negative when `a` wins
+ * over `b`. Exported so a caller can ask whether an assignment that does not
+ * exist yet would outrank a device's current winner (#9635).
+ */
+export function compareByHierarchy(a: HierarchyRanked, b: HierarchyRanked): number {
+  const levelDiff =
+    (LEVEL_PRIORITY[b.assignmentLevel as ConfigAssignmentLevel] ?? 0) -
+    (LEVEL_PRIORITY[a.assignmentLevel as ConfigAssignmentLevel] ?? 0);
+  if (levelDiff !== 0) return levelDiff;
+  const priDiff = a.assignmentPriority - b.assignmentPriority;
+  if (priDiff !== 0) return priDiff;
+  return a.assignmentCreatedAt.getTime() - b.assignmentCreatedAt.getTime();
+}
+
+export function sortByHierarchy<T extends HierarchyRanked>(rows: T[]): T[] {
+  return rows.sort(compareByHierarchy);
 }
 
 // ============================================
 // Feature-Specific Resolvers
 // ============================================
-
-/**
- * Outcome of {@link resolveGoverningAlertRulePolicyForDevice}: exactly three
- * states, each with its own remedy for the tech.
- *
- * A union rather than `{ winningPolicyId: string | null; candidateAssigned: boolean }`
- * — that pair spells four combinations, and the fourth
- * (`candidateAssigned` with no winner) is unreachable but would render as
- * "another configuration policy takes precedence" naming a policy that does not
- * exist. A fabricated verdict reason is precisely the failure class this
- * endpoint exists to close (#3752/#3923/#3988), so the type refuses to spell it.
- */
-export type GoverningAlertRulePolicy =
-  /** The candidate policy's alert rules are the ones that run on this device. */
-  | { outcome: 'governs' }
-  /**
-   * The candidate is assigned, but another policy wins the hierarchy.
-   * `winningPolicyId` is for diagnostics only — it may name a policy in another
-   * org under the partner, so it must never be surfaced to an API client.
-   */
-  | { outcome: 'outranked'; winningPolicyId: string }
-  /** The candidate policy is not assigned to this device at all. */
-  | { outcome: 'unassigned' };
-
-/**
- * Would `candidatePolicyId`'s alert rules be the ones that run on this device,
- * if the draft currently open in the editor were saved?
- *
- * This is the targeting half of the config-policy rule Test verdict (#3988), and
- * it deliberately does NOT reuse {@link resolveAlertRulesForDevice}. That
- * resolver inner-joins the persisted rule rows, which makes it answer the wrong
- * question in both directions for an editor:
- *
- *  - A policy whose alert rules are not saved yet (the tech is authoring the
- *    very first one, so there is no feature link and no row) cannot appear in
- *    that join at all, so the draft's own policy would always be reported as
- *    not governing the device.
- *  - Conversely, resolving on the feature LINK alone would let a policy holding
- *    an EMPTY alert_rule link outrank one that actually has rules — which is not
- *    what happens at runtime, where a policy contributing no rows simply does
- *    not win.
- *
- * So the candidate is overlaid onto real runtime behaviour: the candidate policy
- * competes as though it already held a rule, every OTHER policy competes only if
- * it currently holds at least one persisted alert rule, and the ordinary
- * hierarchy sort (level, then assignment priority, then age) picks the winner.
- * Assignment status, ownership, and the role/OS filters are unchanged.
- *
- * Runs in the CALLER'S OWN RLS context like every sibling resolver (#4673 W03 —
- * the former system-context escape is gone). It is NOT a tenancy boundary: it is
- * self-tenanted by the device's own hierarchy, and the caller must have already
- * authorized both the device and the candidate policy.
- */
-export async function resolveGoverningAlertRulePolicyForDevice(
-  deviceId: string,
-  candidatePolicyId: string
-): Promise<GoverningAlertRulePolicy> {
-  const hierarchy = await loadDeviceHierarchy(deviceId);
-  if (!hierarchy) return { outcome: 'unassigned' };
-
-  const targetConditions = buildTargetConditions(hierarchy);
-  const roleOsConditions = buildRoleOsFilterConditions(hierarchy);
-
-  // Both reads run in the CALLER'S OWN context (#4673 W03). Partner-wide rows
-  // are legible there through the `*_partner_wide_select` RLS branch, so the
-  // former system-context escape is gone — no second pooled connection, no RLS
-  // bypass. Self-tenanted by this device's own hierarchy either way.
-  const assigned = await db
-    .select({
-      configPolicyId: configurationPolicies.id,
-      assignmentLevel: configPolicyAssignments.level,
-      assignmentPriority: configPolicyAssignments.priority,
-      assignmentCreatedAt: configPolicyAssignments.createdAt,
-    })
-    .from(configPolicyAssignments)
-    .innerJoin(
-      configurationPolicies,
-      and(
-        eq(configPolicyAssignments.configPolicyId, configurationPolicies.id),
-        eq(configurationPolicies.status, 'active'),
-        policyOwnershipCondition(hierarchy)
-      )
-    )
-    .where(and(sql`(${sql.join(targetConditions, sql` OR `)})`, ...roleOsConditions))
-    // sortByHierarchy re-sorts in JS, but ordering here too pins the outcome
-    // of a genuine three-way tie (same level, priority AND createdAt), which
-    // unordered Postgres output would otherwise decide arbitrarily. Matches
-    // resolveAlertRulesForDevice.
-    .orderBy(
-      configPolicyAssignments.level,
-      configPolicyAssignments.priority,
-      configPolicyAssignments.createdAt
-    );
-
-  if (!assigned.some((row) => row.configPolicyId === candidatePolicyId)) {
-    return { outcome: 'unassigned' };
-  }
-
-  // Which of the assigned policies actually hold alert rules today. The
-  // candidate is exempt: its rules are the draft being tested.
-  const policyIdsWithRules = await db
-    .select({ configPolicyId: configPolicyEffectiveFeatureLinks.configPolicyId })
-    .from(configPolicyEffectiveFeatureLinks)
-    .innerJoin(
-      configPolicyAlertRules,
-      and(eq(configPolicyAlertRules.featureLinkId, configPolicyEffectiveFeatureLinks.id), isNull(configPolicyAlertRules.retiredAt))
-    )
-    .where(
-      and(
-        eq(configPolicyEffectiveFeatureLinks.featureType, 'alert_rule'),
-        inArray(
-          configPolicyEffectiveFeatureLinks.configPolicyId,
-          [...new Set(assigned.map((row) => row.configPolicyId))]
-        )
-      )
-    );
-  const haveRules = new Set(policyIdsWithRules.map((row) => row.configPolicyId));
-
-  // The candidate is always a contender here — it is assigned, and its draft
-  // counts as a rule — so `contenders` can never be empty at this point.
-  const contenders = assigned.filter(
-    (row) => row.configPolicyId === candidatePolicyId || haveRules.has(row.configPolicyId)
-  );
-  const winningPolicyId = sortByHierarchy(contenders)[0]!.configPolicyId;
-
-  return winningPolicyId === candidatePolicyId
-    ? { outcome: 'governs' }
-    : { outcome: 'outranked', winningPolicyId };
-}
-
-/**
- * Resolves alert rules for a device via the hierarchy.
- * Returns all alert rule rows from the WINNING assignment (closest level wins).
- */
-export async function resolveAlertRulesForDevice(
-  deviceId: string
-): Promise<(typeof configPolicyAlertRules.$inferSelect)[]> {
-  const hierarchy = await loadDeviceHierarchy(deviceId);
-  if (!hierarchy) return [];
-
-  const targetConditions = buildTargetConditions(hierarchy);
-  const roleOsConditions = buildRoleOsFilterConditions(hierarchy);
-
-  // #2930 — the ownership predicate below admits partner-owned rows; #4673 W01
-  // makes RLS agree, via the SELECT-only `*_partner_wide_select` branch keyed on
-  // breeze_current_partner_id(). So this runs in the CALLER'S OWN context (W03
-  // deleted the system-context escape). Self-tenanted by this device's own
-  // hierarchy on top of RLS.
-  const rows = await db
-    .select({
-      alertRule: configPolicyAlertRules,
-      assignmentLevel: configPolicyAssignments.level,
-      assignmentPriority: configPolicyAssignments.priority,
-      assignmentCreatedAt: configPolicyAssignments.createdAt,
-      assignmentId: configPolicyAssignments.id,
-    })
-    .from(configPolicyAssignments)
-    .innerJoin(
-      configurationPolicies,
-      and(
-        eq(configPolicyAssignments.configPolicyId, configurationPolicies.id),
-        eq(configurationPolicies.status, 'active'),
-        policyOwnershipCondition(hierarchy)
-      )
-    )
-    .innerJoin(
-      configPolicyEffectiveFeatureLinks,
-      and(
-        eq(configPolicyEffectiveFeatureLinks.configPolicyId, configurationPolicies.id),
-        // Server-evaluated rules live exclusively under alert_rule links since the
-        // 2026-07-30 ownership consolidation migration.
-        eq(configPolicyEffectiveFeatureLinks.featureType, 'alert_rule')
-      )
-    )
-    .innerJoin(
-      configPolicyAlertRules,
-      and(eq(configPolicyAlertRules.featureLinkId, configPolicyEffectiveFeatureLinks.id), isNull(configPolicyAlertRules.retiredAt))
-    )
-    .where(and(sql`(${sql.join(targetConditions, sql` OR `)})`, ...roleOsConditions))
-    .orderBy(
-      configPolicyAssignments.level,
-      configPolicyAssignments.priority,
-      configPolicyAssignments.createdAt,
-      asc(configPolicyAlertRules.sortOrder)
-    );
-
-  if (rows.length === 0) return [];
-
-  // Sort by hierarchy and pick the winning assignment
-  const sorted = sortByHierarchy(rows);
-  const winningAssignmentId = sorted[0]!.assignmentId;
-
-  // Return all alert rules from the winning assignment
-  return sorted
-    .filter((r) => r.assignmentId === winningAssignmentId)
-    .map((r) => r.alertRule);
-}
 
 export interface ResolvedDeviceAutomations {
   /**
@@ -576,7 +430,7 @@ export interface ResolvedPatchConfigDetails {
 // legacy `settings.timezone` JSONB key as a non-destructive fallback (the column
 // is backfilled from that key but the UI still writes the key today — see
 // issue #1318 / migration 2026-06-13-c).
-function partnerTimezoneFrom(
+export function partnerTimezoneFrom(
   column: string | null | undefined,
   settings: unknown,
 ): string | null {
@@ -716,7 +570,26 @@ async function resolvePartnerTimezoneForDeviceRow(partnerId: string | null): Pro
 export async function resolvePatchConfigDetailsForDevice(
   deviceId: string
 ): Promise<ResolvedPatchConfigDetails | null> {
-  const hierarchy = await loadDeviceHierarchy(deviceId);
+  const resolved = await resolvePatchConfigPolicyForDevice(deviceId);
+  if (!resolved) return null;
+  return { ...resolved, resolvedTimezone: await resolveDeviceTimezone(deviceId) };
+}
+
+/**
+ * `resolvePatchConfigDetailsForDevice` without `resolvedTimezone` (#7647).
+ * The timezone half reads the partner-axis `partners` row through
+ * `readWithPartnerAxisVisibility` — a SECOND pooled connection under any
+ * non-system request context. Callers that only need WHICH config policy won
+ * (the ring-aware approval evaluator behind the device Patches tab) use this
+ * so they stay on the caller's one connection. Runs entirely in the caller's
+ * context: every read here has an RLS read branch for the caller's own partner.
+ */
+export async function resolvePatchConfigPolicyForDevice(
+  deviceId: string,
+  opts?: DeviceHierarchyOpts,
+): Promise<Omit<ResolvedPatchConfigDetails, 'resolvedTimezone'> | null> {
+  const passed = hierarchyFor(deviceId, opts);
+  const hierarchy = passed ? fromPassedHierarchy(passed) : await loadDeviceHierarchy(deviceId);
   if (!hierarchy) return null;
 
   const targetConditions = buildTargetConditions(hierarchy);
@@ -765,7 +638,8 @@ export async function resolvePatchConfigDetailsForDevice(
     .orderBy(
       configPolicyAssignments.level,
       configPolicyAssignments.priority,
-      configPolicyAssignments.createdAt
+      configPolicyAssignments.createdAt,
+      configPolicyAssignments.id
     );
 
   if (rows.length === 0) return null;
@@ -782,8 +656,273 @@ export async function resolvePatchConfigDetailsForDevice(
     assignmentLevel: winner.assignmentLevel,
     assignmentTargetId: winner.assignmentTargetId,
     assignmentPriority: winner.assignmentPriority,
-    resolvedTimezone: await resolveDeviceTimezone(deviceId),
   };
+}
+
+/** #8142: patch's own rules — the device's partner is dropped (ownership AND target) for an unassigned_pool org. */
+const PATCH_APPLICABILITY: ApplicabilityRule = {
+  ownership: 'orgOrPartnerUnlessUnassignedPool', partnerTarget: 'partnerUnlessUnassignedPool', roleOs: 'sql',
+};
+
+/**
+ * The heartbeat's patch_source flag from a loaded policy set: the
+ * `settings.exclusiveWindowsUpdate` of the same winner
+ * resolvePatchConfigPolicyForDevice picks (sortByHierarchy over candidates
+ * with a patch settings row), false when none applies. A projection, not a
+ * substitute for the full resolver: it carries only the one column the
+ * heartbeat delivers.
+ */
+export function patchExclusiveWindowsUpdateFromPolicySet(set: DevicePolicySet): boolean {
+  const rows = candidatesWithLink(set, 'patch', PATCH_APPLICABILITY).flatMap(({ candidate, link }) =>
+    link.patch
+      ? [{
+        assignmentLevel: candidate.level, assignmentPriority: candidate.priority,
+        assignmentCreatedAt: candidate.assignmentCreatedAt, exclusiveWindowsUpdate: link.patch.exclusiveWindowsUpdate,
+      }]
+      : []);
+  if (rows.length === 0) return false;
+  return sortByHierarchy(rows)[0]!.exclusiveWindowsUpdate;
+}
+
+/**
+ * The heartbeat's feature_update_settings block from a loaded policy set: the
+ * `feature_updates` of the update ring the same patch winner links
+ * (patchExclusiveWindowsUpdateFromPolicySet picks it), read off the set's
+ * joined `ring` row so a steady beat costs no extra statement. Fails closed to
+ * block when no patch policy applies, the winner links no ring, the ring is
+ * not an enabled `ring` row of the device's own partner, or the stored value
+ * does not validate.
+ */
+export function patchFeatureUpdatesFromPolicySet(set: DevicePolicySet): RingFeatureUpdates {
+  const rows = candidatesWithLink(set, 'patch', PATCH_APPLICABILITY).flatMap(({ candidate, link }) =>
+    link.patch
+      ? [{
+        assignmentLevel: candidate.level, assignmentPriority: candidate.priority,
+        assignmentCreatedAt: candidate.assignmentCreatedAt, ring: link.ring ?? null,
+      }]
+      : []);
+  if (rows.length === 0) return DEFAULT_RING_FEATURE_UPDATES;
+  const ring = sortByHierarchy(rows)[0]!.ring;
+  if (!ring || ring.kind !== 'ring' || ring.enabled !== true) return DEFAULT_RING_FEATURE_UPDATES;
+  // A config policy's featurePolicyId is an unconstrained uuid: never honour
+  // another partner's ring (the evaluator denies with ring_reference_invalid).
+  const partnerId = set.hierarchy.org?.partnerId ?? null;
+  if (!partnerId || ring.partnerId !== partnerId) return DEFAULT_RING_FEATURE_UPDATES;
+  const parsed = ringFeatureUpdatesSchema.safeParse(ring.featureUpdates);
+  if (!parsed.success) {
+    console.warn(`[featureConfigResolver] ring ${ring.id} has malformed feature_updates; sending block to device ${set.deviceId}`);
+    return DEFAULT_RING_FEATURE_UPDATES;
+  }
+  return parsed.data;
+}
+
+/** The policy that wins a device's patch hierarchy, as the batch resolver below reports it. */
+export interface PatchPolicyWinner {
+  /** The ASSIGNED policy whose assignment won (a child, never the parent it inherits from). */
+  configPolicyId: string;
+  /** The winning effective link's ring (`patch_policies.id`), or null when the link names none. */
+  featurePolicyId: string | null;
+  assignmentLevel: ConfigAssignmentLevel;
+}
+
+/**
+ * #9632: the winner {@link resolvePatchConfigPolicyForDevice} picks, for many
+ * devices at once. The patch scheduler and the update-ring count use it so a
+ * device reached by two patch policies is scheduled (and counted) only by the
+ * one its Configuration tab shows, closest level wins.
+ *
+ * Same rules as the per-device resolver, by construction:
+ *  - candidates: active policies with an EFFECTIVE patch link and a
+ *    `config_policy_patch_settings` row (the per-device query inner-joins it);
+ *  - ownership, targets and the role / OS filter via {@link candidatesWithLink}
+ *    with {@link PATCH_APPLICABILITY} (the heartbeat's twin of the same query,
+ *    itself parity-tested), over EVERY group membership (no execution-safety
+ *    filter: the per-device resolver has none, and the scheduler resolves
+ *    refused groups for patching);
+ *  - ranking via {@link sortByHierarchy} over rows ordered by assignment
+ *    created_at, id, which breaks a full tie the way the per-device ORDER BY does.
+ * patchSchedulerClosestWins.integration.test.ts pins it against the per-device
+ * resolver on real Postgres. Runs in the caller's context (RLS applies); a
+ * device that does not exist, or that no patch policy reaches, maps to null.
+ */
+export async function resolvePatchPolicyWinnersForDevices(
+  deviceIds: readonly string[],
+): Promise<Map<string, PatchPolicyWinner | null>> {
+  const winners = new Map<string, PatchPolicyWinner | null>();
+  const unique = Array.from(new Set(deviceIds));
+  const CHUNK = 500;
+  for (let i = 0; i < unique.length; i += CHUNK) {
+    const chunk = unique.slice(i, i + CHUNK);
+    for (const [deviceId, winner] of await resolvePatchPolicyWinnerChunk(chunk)) winners.set(deviceId, winner);
+  }
+  return winners;
+}
+
+async function resolvePatchPolicyWinnerChunk(deviceIds: string[]): Promise<Map<string, PatchPolicyWinner | null>> {
+  const result = new Map<string, PatchPolicyWinner | null>(deviceIds.map((id) => [id, null] as const));
+  if (deviceIds.length === 0) return result;
+
+  // The hierarchy loadDeviceHierarchy builds, for the whole chunk: the org is
+  // LEFT joined so an org the caller cannot see reads as "no partner", exactly
+  // as the per-device resolver's separate org read does.
+  const deviceRows = await db
+    .select({
+      id: devices.id,
+      orgId: devices.orgId,
+      siteId: devices.siteId,
+      deviceRole: devices.deviceRole,
+      osType: devices.osType,
+      orgPartnerId: organizations.partnerId,
+      orgType: organizations.type,
+    })
+    .from(devices)
+    .leftJoin(organizations, eq(organizations.id, devices.orgId))
+    .where(inArray(devices.id, deviceIds));
+  if (deviceRows.length === 0) return result;
+
+  const membershipRows = await db
+    .select({ deviceId: deviceGroupMemberships.deviceId, groupId: deviceGroupMemberships.groupId })
+    .from(deviceGroupMemberships)
+    .where(inArray(deviceGroupMemberships.deviceId, deviceIds));
+  const groupsByDevice = new Map<string, string[]>();
+  for (const m of membershipRows) {
+    const list = groupsByDevice.get(m.deviceId) ?? [];
+    list.push(m.groupId);
+    groupsByDevice.set(m.deviceId, list);
+  }
+
+  const orgIds = Array.from(new Set(deviceRows.map((d) => d.orgId)));
+  const siteIds = Array.from(new Set(deviceRows.map((d) => d.siteId)));
+  const groupIds = Array.from(new Set(membershipRows.map((m) => m.groupId)));
+  // Raw partners: a superset. applicableCandidates drops the partner of an
+  // unassigned_pool org per device, as the per-device resolver does.
+  const partnerIds = Array.from(new Set(deviceRows.flatMap((d) => (d.orgPartnerId ? [d.orgPartnerId] : []))));
+
+  const ownership = partnerIds.length > 0
+    ? or(
+      inArray(configurationPolicies.orgId, orgIds),
+      and(isNull(configurationPolicies.orgId), inArray(configurationPolicies.partnerId, partnerIds)),
+    )!
+    : inArray(configurationPolicies.orgId, orgIds);
+  const targets: SQL[] = [
+    and(eq(configPolicyAssignments.level, 'device'), inArray(configPolicyAssignments.targetId, deviceIds))!,
+    and(eq(configPolicyAssignments.level, 'site'), inArray(configPolicyAssignments.targetId, siteIds))!,
+    and(eq(configPolicyAssignments.level, 'organization'), inArray(configPolicyAssignments.targetId, orgIds))!,
+  ];
+  if (groupIds.length > 0) {
+    targets.push(and(eq(configPolicyAssignments.level, 'device_group'), inArray(configPolicyAssignments.targetId, groupIds))!);
+  }
+  if (partnerIds.length > 0) {
+    targets.push(and(eq(configPolicyAssignments.level, 'partner'), inArray(configPolicyAssignments.targetId, partnerIds))!);
+  }
+
+  const rows = await db
+    .select({
+      assignmentId: configPolicyAssignments.id,
+      level: configPolicyAssignments.level,
+      targetId: configPolicyAssignments.targetId,
+      priority: configPolicyAssignments.priority,
+      roleFilter: configPolicyAssignments.roleFilter,
+      osFilter: configPolicyAssignments.osFilter,
+      assignmentCreatedAt: configPolicyAssignments.createdAt,
+      policyId: configurationPolicies.id,
+      policyName: configurationPolicies.name,
+      policyOrgId: configurationPolicies.orgId,
+      policyPartnerId: configurationPolicies.partnerId,
+      parentPolicyId: configurationPolicies.parentPolicyId,
+      linkId: configPolicyEffectiveFeatureLinks.id,
+      featurePolicyId: configPolicyEffectiveFeatureLinks.featurePolicyId,
+      inlineSettings: configPolicyEffectiveFeatureLinks.inlineSettings,
+      patchSettingsId: configPolicyPatchSettings.id,
+      exclusiveWindowsUpdate: configPolicyPatchSettings.exclusiveWindowsUpdate,
+    })
+    .from(configPolicyAssignments)
+    .innerJoin(
+      configurationPolicies,
+      and(
+        eq(configPolicyAssignments.configPolicyId, configurationPolicies.id),
+        eq(configurationPolicies.status, 'active'),
+        ownership,
+      ),
+    )
+    .innerJoin(
+      configPolicyEffectiveFeatureLinks,
+      and(
+        eq(configPolicyEffectiveFeatureLinks.configPolicyId, configurationPolicies.id),
+        eq(configPolicyEffectiveFeatureLinks.featureType, 'patch'),
+      ),
+    )
+    .innerJoin(
+      configPolicyPatchSettings,
+      eq(configPolicyPatchSettings.featureLinkId, configPolicyEffectiveFeatureLinks.id),
+    )
+    .where(or(...targets))
+    .orderBy(asc(configPolicyAssignments.createdAt), asc(configPolicyAssignments.id));
+  if (rows.length === 0) return result;
+
+  const candidates: PolicyCandidate[] = rows.map((row) => ({
+    assignmentId: row.assignmentId,
+    level: row.level,
+    targetId: row.targetId,
+    priority: row.priority,
+    roleFilter: row.roleFilter,
+    osFilter: row.osFilter,
+    assignmentCreatedAt: row.assignmentCreatedAt,
+    policyId: row.policyId,
+    policyName: row.policyName,
+    policyOrgId: row.policyOrgId,
+    policyPartnerId: row.policyPartnerId,
+    parentPolicyId: row.parentPolicyId,
+    links: {
+      patch: {
+        id: row.linkId,
+        featureType: 'patch',
+        featurePolicyId: row.featurePolicyId,
+        inlineSettings: row.inlineSettings,
+        eventLog: null,
+        hardwareMonitoring: null,
+        patch: { id: row.patchSettingsId, exclusiveWindowsUpdate: row.exclusiveWindowsUpdate },
+        timeSync: null,
+        onedrive: null,
+      },
+    },
+  }));
+
+  for (const device of deviceRows) {
+    const set: DevicePolicySet = {
+      deviceId: device.id,
+      hierarchy: {
+        deviceId: device.id,
+        orgId: device.orgId,
+        siteId: device.siteId,
+        deviceRole: device.deviceRole,
+        osType: device.osType,
+        org: device.orgPartnerId !== null && device.orgType !== null
+          ? { partnerId: device.orgPartnerId, type: device.orgType }
+          : null,
+        site: null,
+        groupIds: groupsByDevice.get(device.id) ?? [],
+      },
+      candidates,
+    };
+    const ranked = sortByHierarchy(
+      candidatesWithLink(set, 'patch', PATCH_APPLICABILITY).map(({ candidate, link }) => ({
+        assignmentLevel: candidate.level,
+        assignmentPriority: candidate.priority,
+        assignmentCreatedAt: candidate.assignmentCreatedAt,
+        configPolicyId: candidate.policyId,
+        featurePolicyId: link.featurePolicyId,
+      })),
+    );
+    const winner = ranked[0];
+    if (!winner) continue;
+    result.set(device.id, {
+      configPolicyId: winner.configPolicyId,
+      featurePolicyId: winner.featurePolicyId,
+      assignmentLevel: winner.assignmentLevel,
+    });
+  }
+  return result;
 }
 
 /**
@@ -906,11 +1045,26 @@ export async function resolveBackupConfigForDevice(
 /**
  * Resolves maintenance settings for a device via the hierarchy.
  * Returns the single maintenance settings row from the WINNING assignment, or null.
+ *
+ * Field-provenance tiering — KNOWN RESIDUAL, not gated by field
+ * provenance in this pass. `buildTargetConditions(hierarchy)` folds the
+ * device's raw group memberships into a device_group-level match, same as
+ * every other resolver sharing that helper (13+ call sites across this
+ * file). A device_group-level maintenance policy can suppress alerts/
+ * patching/automations/scripts — capability-granting, same as the standalone
+ * `maintenance_windows` path gated in `maintenanceService.ts`. Gating it
+ * properly means threading a per-feature-type classification through
+ * `buildTargetConditions`'s shared call sites (the same shape as
+ * `configurationPolicy.ts`'s CONFIG_POLICY_FEATURE_TRUST_TIER gate), which
+ * is a broader change than this round's scope — tracked as an explicit
+ * follow-up rather than guessed at here.
  */
 export async function resolveMaintenanceConfigForDevice(
-  deviceId: string
+  deviceId: string,
+  opts?: DeviceHierarchyOpts,
 ): Promise<typeof configPolicyMaintenanceSettings.$inferSelect | null> {
-  const hierarchy = await loadDeviceHierarchy(deviceId);
+  const passed = hierarchyFor(deviceId, opts);
+  const hierarchy = passed ? fromPassedHierarchy(passed) : await loadDeviceHierarchy(deviceId);
   if (!hierarchy) return null;
 
   const targetConditions = buildTargetConditions(hierarchy);
@@ -962,6 +1116,13 @@ export async function resolveMaintenanceConfigForDevice(
   return sorted[0]!.maintenanceSettings;
 }
 
+export interface ResolvedDeviceComplianceRules {
+  /** The ASSIGNED policy whose assignment won the `compliance` feature for this device. */
+  configPolicyId: string;
+  configPolicyName: string;
+  rules: (typeof configPolicyComplianceRules.$inferSelect)[];
+}
+
 /**
  * Resolves compliance rules for a device via the hierarchy.
  * Returns all compliance rule rows from the WINNING assignment.
@@ -969,8 +1130,19 @@ export async function resolveMaintenanceConfigForDevice(
 export async function resolveComplianceRulesForDevice(
   deviceId: string
 ): Promise<(typeof configPolicyComplianceRules.$inferSelect)[]> {
+  return (await resolveComplianceAssignmentForDevice(deviceId))?.rules ?? [];
+}
+
+/**
+ * `resolveComplianceRulesForDevice`, naming the policy whose assignment won.
+ * `null` when the device is unknown or no compliance rules reach it. The
+ * compliance-alert reconcile uses it to say which policy took over.
+ */
+export async function resolveComplianceAssignmentForDevice(
+  deviceId: string
+): Promise<ResolvedDeviceComplianceRules | null> {
   const hierarchy = await loadDeviceHierarchy(deviceId);
-  if (!hierarchy) return [];
+  if (!hierarchy) return null;
 
   const targetConditions = buildTargetConditions(hierarchy);
   const roleOsConditions = buildRoleOsFilterConditions(hierarchy);
@@ -987,6 +1159,8 @@ export async function resolveComplianceRulesForDevice(
       assignmentPriority: configPolicyAssignments.priority,
       assignmentCreatedAt: configPolicyAssignments.createdAt,
       assignmentId: configPolicyAssignments.id,
+      policyId: configurationPolicies.id,
+      policyName: configurationPolicies.name,
     })
     .from(configPolicyAssignments)
     .innerJoin(
@@ -1016,14 +1190,18 @@ export async function resolveComplianceRulesForDevice(
       asc(configPolicyComplianceRules.sortOrder)
     );
 
-  if (rows.length === 0) return [];
+  if (rows.length === 0) return null;
 
   const sorted = sortByHierarchy(rows);
-  const winningAssignmentId = sorted[0]!.assignmentId;
+  const winner = sorted[0]!;
 
-  return sorted
-    .filter((r) => r.assignmentId === winningAssignmentId)
-    .map((r) => r.complianceRule);
+  return {
+    configPolicyId: winner.policyId,
+    configPolicyName: winner.policyName,
+    rules: sorted
+      .filter((r) => r.assignmentId === winner.assignmentId)
+      .map((r) => r.complianceRule),
+  };
 }
 
 /**
@@ -1033,6 +1211,31 @@ export async function resolveComplianceRulesForDevice(
 export async function resolveSoftwarePolicyForDevice(
   deviceId: string
 ): Promise<string | null> {
+  const winner = await resolveSoftwarePolicyWinnerForDevice(deviceId);
+  return winner?.featurePolicyId ?? null;
+}
+
+/** The assignment that wins a device's `software_policy` hierarchy (#9635). */
+export interface SoftwarePolicyWinner {
+  featurePolicyId: string | null;
+  /** The ASSIGNED config policy whose assignment won. */
+  configPolicyId: string;
+  assignmentId: string;
+  assignmentLevel: ConfigAssignmentLevel;
+  assignmentPriority: number;
+  assignmentCreatedAt: Date;
+}
+
+/**
+ * The whole winning assignment behind {@link resolveSoftwarePolicyForDevice}
+ * (same query, same ranking — that function is this one's projection), or
+ * null when no software policy reaches the device. #9635 uses it to say which
+ * policy and config policy win a device, and whether a new assignment would
+ * outrank them ({@link compareByHierarchy}).
+ */
+export async function resolveSoftwarePolicyWinnerForDevice(
+  deviceId: string
+): Promise<SoftwarePolicyWinner | null> {
   const hierarchy = await loadDeviceHierarchy(deviceId);
   if (!hierarchy) return null;
 
@@ -1052,6 +1255,7 @@ export async function resolveSoftwarePolicyForDevice(
       assignmentPriority: configPolicyAssignments.priority,
       assignmentCreatedAt: configPolicyAssignments.createdAt,
       assignmentId: configPolicyAssignments.id,
+      configPolicyId: configurationPolicies.id,
     })
     .from(configPolicyAssignments)
     .innerJoin(
@@ -1078,21 +1282,102 @@ export async function resolveSoftwarePolicyForDevice(
 
   if (rows.length === 0) return null;
 
-  const sorted = sortByHierarchy(rows);
-  return sorted[0]!.featurePolicyId;
+  const winner = sortByHierarchy(rows)[0]!;
+  return {
+    featurePolicyId: winner.featurePolicyId,
+    configPolicyId: winner.configPolicyId,
+    assignmentId: winner.assignmentId,
+    assignmentLevel: winner.assignmentLevel,
+    assignmentPriority: winner.assignmentPriority,
+    assignmentCreatedAt: winner.assignmentCreatedAt,
+  };
 }
 
 /**
- * Batch resolver: finds all device IDs that should be governed by a given software policy
- * via config policy assignments. Used by the compliance worker.
- *
- * Steps:
- * 1. Find all config policies that link to this software policy
- * 2. Get all assignments for those config policies
- * 3. Resolve each assignment to device IDs based on level/targetId
- * 4. For each device, verify this software policy is the "winning" one
- *    (closest wins — if a device has a closer assignment linking to a different policy, exclude it)
+ * Resolves the winning peripheral policy ID for a device via the config-policy
+ * hierarchy (closest level wins, then assignment priority, then createdAt), or
+ * null when no active config policy assigned to the device carries a
+ * `peripheral_control` link. Partner-wide config policies resolve through the
+ * device org's partner (policyOwnershipCondition). #9619.
  */
+export async function resolvePeripheralControlPolicyForDevice(
+  deviceId: string
+): Promise<string | null> {
+  const hierarchy = await loadDeviceHierarchy(deviceId);
+  if (!hierarchy) return null;
+
+  const rows = await db
+    .select({
+      featurePolicyId: configPolicyEffectiveFeatureLinks.featurePolicyId,
+      assignmentLevel: configPolicyAssignments.level,
+      assignmentPriority: configPolicyAssignments.priority,
+      assignmentCreatedAt: configPolicyAssignments.createdAt,
+    })
+    .from(configPolicyAssignments)
+    .innerJoin(
+      configurationPolicies,
+      and(
+        eq(configPolicyAssignments.configPolicyId, configurationPolicies.id),
+        eq(configurationPolicies.status, 'active'),
+        policyOwnershipCondition(hierarchy)
+      )
+    )
+    .innerJoin(
+      configPolicyEffectiveFeatureLinks,
+      and(
+        eq(configPolicyEffectiveFeatureLinks.configPolicyId, configurationPolicies.id),
+        eq(configPolicyEffectiveFeatureLinks.featureType, 'peripheral_control'),
+        isNotNull(configPolicyEffectiveFeatureLinks.featurePolicyId)
+      )
+    )
+    .where(and(
+      sql`(${sql.join(buildTargetConditions(hierarchy), sql` OR `)})`,
+      ...buildRoleOsFilterConditions(hierarchy)
+    ))
+    .orderBy(
+      configPolicyAssignments.level,
+      configPolicyAssignments.priority,
+      configPolicyAssignments.createdAt
+    );
+
+  if (rows.length === 0) return null;
+  return sortByHierarchy(rows)[0]!.featurePolicyId;
+}
+
+/**
+ * Of `policyIds`, the peripheral policies linked (`peripheral_control`) from at
+ * least one ACTIVE configuration policy. A linked policy is governed by its
+ * link rather than its own targeting (see PeripheralConfigLinkResolution). #9619.
+ */
+export async function loadLinkedPeripheralPolicyIds(
+  deviceId: string,
+  policyIds: readonly string[]
+): Promise<Set<string>> {
+  if (policyIds.length === 0) return new Set();
+  const hierarchy = await loadDeviceHierarchy(deviceId);
+  if (!hierarchy) return new Set();
+  // Tenancy: only config policies the device's own org (or its partner, for
+  // partner-wide ones) owns can govern a peripheral policy for this device. A
+  // partner-owned peripheral policy linked from ANOTHER org's config policy
+  // must keep its standalone targeting here.
+  const rows = await db
+    .selectDistinct({ featurePolicyId: configPolicyEffectiveFeatureLinks.featurePolicyId })
+    .from(configPolicyEffectiveFeatureLinks)
+    .innerJoin(
+      configurationPolicies,
+      and(
+        eq(configPolicyEffectiveFeatureLinks.configPolicyId, configurationPolicies.id),
+        eq(configurationPolicies.status, 'active'),
+        policyOwnershipCondition(hierarchy)
+      )
+    )
+    .where(and(
+      eq(configPolicyEffectiveFeatureLinks.featureType, 'peripheral_control'),
+      inArray(configPolicyEffectiveFeatureLinks.featurePolicyId, [...policyIds])
+    ));
+  return new Set(rows.flatMap((r) => (r.featurePolicyId ? [r.featurePolicyId] : [])));
+}
+
 /**
  * Resolve the candidate device IDs for one config-policy assignment row, by
  * level. Extracted from {@link resolveDeviceIdsForSoftwarePolicy}'s switch so
@@ -1102,7 +1387,7 @@ export async function resolveSoftwarePolicyForDevice(
  * session is never a policy target. Explicit `device`-level targets are left
  * as-is.
  */
-async function resolveAssignmentDeviceIds(level: string, targetId: string): Promise<string[]> {
+export async function resolveAssignmentDeviceIds(level: string, targetId: string): Promise<string[]> {
   switch (level) {
     case 'device': {
       return [targetId];
@@ -1132,7 +1417,7 @@ async function resolveAssignmentDeviceIds(level: string, targetId: string): Prom
       const orgs = await db
         .select({ id: organizations.id })
         .from(organizations)
-        .where(and(eq(organizations.partnerId, targetId), ne(organizations.type, 'quick_support')));
+        .where(and(eq(organizations.partnerId, targetId), ne(organizations.type, 'quick_support'), notHoldingOrgCondition()));
       if (orgs.length === 0) return [];
       const rows = await db
         .select({ id: devices.id })
@@ -1145,9 +1430,348 @@ async function resolveAssignmentDeviceIds(level: string, targetId: string): Prom
   }
 }
 
+export type ResolvedSecurityAgentsLink = {
+  /** The winning link's id. For an inherited link this is the PARENT's link id. */
+  linkId: string;
+  /** The policy that owns the link (the authoring parent for an inherited link). */
+  configPolicyId: string;
+  /** The assigned policy whose assignment won the hierarchy walk. */
+  assignedPolicyId: string;
+  inlineSettings: SecurityAgentsInlineSettings;
+};
+
+/** Links already logged as unparseable; see resolveSecurityAgentsLinkForDevice. */
+const warnedUnparseableSecurityAgentsLinks = new Set<string>();
+
+/**
+ * #6960: the winning `security_agents` link for a device. Closest wins WITHIN
+ * this feature type, using the same hierarchy walk and effective-links view as
+ * every other feature, and the whole link replaces any broader one (a closer
+ * link with `agents: []` opts the device out).
+ *
+ * A stored blob that no longer parses resolves as `agents: []`: install nothing
+ * rather than guess at a link the write path would have refused.
+ *
+ * `security_agents` is execution_gated, so a device_group whose rules key on a
+ * field the device reports about itself is not a valid target here: the same
+ * field-provenance rule resolveEffectiveConfig applies to its display.
+ */
+export async function resolveSecurityAgentsLinkForDevice(
+  deviceId: string
+): Promise<ResolvedSecurityAgentsLink | null> {
+  const loaded = await loadDeviceHierarchy(deviceId);
+  if (!loaded) return null;
+  const { allowedGroupIds } = await resolveExecutionSafeGroupIds(loaded.groupIds);
+  const hierarchy: DeviceHierarchy = { ...loaded, groupIds: allowedGroupIds };
+
+  const targetConditions = buildTargetConditions(hierarchy);
+  const roleOsConditions = buildRoleOsFilterConditions(hierarchy);
+
+  const rows = await db
+    .select({
+      linkId: configPolicyEffectiveFeatureLinks.id,
+      sourcePolicyId: configPolicyEffectiveFeatureLinks.sourcePolicyId,
+      inlineSettings: configPolicyEffectiveFeatureLinks.inlineSettings,
+      assignedPolicyId: configurationPolicies.id,
+      assignmentLevel: configPolicyAssignments.level,
+      assignmentPriority: configPolicyAssignments.priority,
+      assignmentCreatedAt: configPolicyAssignments.createdAt,
+      assignmentId: configPolicyAssignments.id,
+    })
+    .from(configPolicyAssignments)
+    .innerJoin(
+      configurationPolicies,
+      and(
+        eq(configPolicyAssignments.configPolicyId, configurationPolicies.id),
+        eq(configurationPolicies.status, 'active'),
+        policyOwnershipCondition(hierarchy)
+      )
+    )
+    .innerJoin(
+      configPolicyEffectiveFeatureLinks,
+      and(
+        eq(configPolicyEffectiveFeatureLinks.configPolicyId, configurationPolicies.id),
+        eq(configPolicyEffectiveFeatureLinks.featureType, 'security_agents')
+      )
+    )
+    .where(and(sql`(${sql.join(targetConditions, sql` OR `)})`, ...roleOsConditions))
+    .orderBy(
+      configPolicyAssignments.level,
+      configPolicyAssignments.priority,
+      configPolicyAssignments.createdAt
+    );
+
+  if (rows.length === 0) return null;
+
+  const winner = sortByHierarchy(rows)[0]!;
+  const parsed = securityAgentsInlineSettingsSchema.safeParse(winner.inlineSettings);
+  if (!parsed.success && !warnedUnparseableSecurityAgentsLinks.has(winner.linkId)) {
+    // Once per link per process: a bad partner-wide link would otherwise log
+    // for every device it reaches. The write path refuses such blobs, so this
+    // means a direct DB edit or a schema change; the policy id lets an operator
+    // find and re-save it.
+    warnedUnparseableSecurityAgentsLinks.add(winner.linkId);
+    console.error('[featureConfigResolver] security_agents link has unparseable settings; resolving as no agents', {
+      linkId: winner.linkId,
+      configPolicyId: winner.sourcePolicyId,
+      issue: parsed.error.issues[0]?.message,
+    });
+  }
+  return {
+    linkId: winner.linkId,
+    configPolicyId: winner.sourcePolicyId,
+    assignedPolicyId: winner.assignedPolicyId,
+    inlineSettings: parsed.success ? parsed.data : { version: 1, agents: [] },
+  };
+}
+
+/**
+ * #6960 W02: the winning `security_agents` link id for MANY devices, with a
+ * fixed number of queries per chunk of 500 devices (devices, their orgs, their
+ * group memberships, every candidate assignment, plus one execution-safe group
+ * lookup when the chunk has group memberships) instead of the per-device
+ * walk {@link resolveSecurityAgentsLinkForDevice} does. A partner-wide policy
+ * can reach thousands of devices and the compliance worker resolves its device
+ * set every pass, so the per-device form (3+ queries per device) does not
+ * scale.
+ *
+ * It is the same decision evaluated in memory, rule for rule:
+ *  - ownership: the policy is owned by the device's org, or is partner-wide
+ *    for the device's partner (none for a device parked in the holding pool,
+ *    exactly as loadDeviceHierarchy drops its partner);
+ *  - targets: device, execution-safe device groups only, site, org, partner;
+ *  - role / OS filters via {@link matchesRoleOsFilter} (the SQL predicate's
+ *    twin);
+ *  - closest wins via {@link sortByHierarchy}.
+ * The integration suite pins it against the per-device resolver on real
+ * Postgres. A device no link reaches (or that does not exist) maps to null.
+ */
+export async function resolveSecurityAgentsLinksForDevices(
+  deviceIds: readonly string[],
+): Promise<Map<string, string | null>> {
+  const winners = new Map<string, string | null>();
+  const unique = Array.from(new Set(deviceIds));
+  const CHUNK = 500;
+  for (let i = 0; i < unique.length; i += CHUNK) {
+    const chunk = unique.slice(i, i + CHUNK);
+    for (const [deviceId, linkId] of await resolveSecurityAgentsLinkChunk(chunk)) winners.set(deviceId, linkId);
+  }
+  return winners;
+}
+
+async function resolveSecurityAgentsLinkChunk(deviceIds: string[]): Promise<Map<string, string | null>> {
+  const result = new Map<string, string | null>(deviceIds.map((id) => [id, null] as const));
+  if (deviceIds.length === 0) return result;
+
+  const deviceRows = await db
+    .select({ id: devices.id, orgId: devices.orgId, siteId: devices.siteId, deviceRole: devices.deviceRole, osType: devices.osType })
+    .from(devices)
+    .where(inArray(devices.id, deviceIds));
+  if (deviceRows.length === 0) return result;
+
+  const orgIds = Array.from(new Set(deviceRows.map((d) => d.orgId)));
+  const orgRows = await db
+    .select({ id: organizations.id, partnerId: organizations.partnerId, type: organizations.type })
+    .from(organizations)
+    .where(inArray(organizations.id, orgIds));
+  const partnerByOrg = new Map<string, string | null>(
+    orgRows.map((org) => [org.id, isUnassignedPoolOrgType(org.type) ? null : org.partnerId ?? null] as const),
+  );
+
+  const membershipRows = await db
+    .select({ deviceId: deviceGroupMemberships.deviceId, groupId: deviceGroupMemberships.groupId })
+    .from(deviceGroupMemberships)
+    .where(inArray(deviceGroupMemberships.deviceId, deviceIds));
+  const allGroupIds = Array.from(new Set(membershipRows.map((m) => m.groupId)));
+  const safeGroups = new Set(
+    allGroupIds.length > 0 ? (await resolveExecutionSafeGroupIds(allGroupIds)).allowedGroupIds : [],
+  );
+  const groupsByDevice = new Map<string, string[]>();
+  for (const m of membershipRows) {
+    if (!safeGroups.has(m.groupId)) continue;
+    const list = groupsByDevice.get(m.deviceId) ?? [];
+    list.push(m.groupId);
+    groupsByDevice.set(m.deviceId, list);
+  }
+
+  const partnerIds = Array.from(new Set(Array.from(partnerByOrg.values()).filter((p): p is string => !!p)));
+  const ownership = partnerIds.length > 0
+    ? or(
+      inArray(configurationPolicies.orgId, orgIds),
+      and(isNull(configurationPolicies.orgId), inArray(configurationPolicies.partnerId, partnerIds)),
+    )
+    : inArray(configurationPolicies.orgId, orgIds);
+
+  const candidates = await db
+    .select({
+      linkId: configPolicyEffectiveFeatureLinks.id,
+      policyOrgId: configurationPolicies.orgId,
+      policyPartnerId: configurationPolicies.partnerId,
+      assignmentLevel: configPolicyAssignments.level,
+      assignmentTargetId: configPolicyAssignments.targetId,
+      assignmentPriority: configPolicyAssignments.priority,
+      assignmentCreatedAt: configPolicyAssignments.createdAt,
+      roleFilter: configPolicyAssignments.roleFilter,
+      osFilter: configPolicyAssignments.osFilter,
+    })
+    .from(configPolicyAssignments)
+    .innerJoin(
+      configurationPolicies,
+      and(
+        eq(configPolicyAssignments.configPolicyId, configurationPolicies.id),
+        eq(configurationPolicies.status, 'active'),
+        ownership,
+      ),
+    )
+    .innerJoin(
+      configPolicyEffectiveFeatureLinks,
+      and(
+        eq(configPolicyEffectiveFeatureLinks.configPolicyId, configurationPolicies.id),
+        eq(configPolicyEffectiveFeatureLinks.featureType, 'security_agents'),
+      ),
+    )
+    // Same ORDER BY as the per-device walk, so sortByHierarchy breaks a full
+    // tie the same way in both.
+    .orderBy(configPolicyAssignments.level, configPolicyAssignments.priority, configPolicyAssignments.createdAt);
+
+  for (const device of deviceRows) {
+    const partnerId = partnerByOrg.get(device.orgId) ?? null;
+    const groups = groupsByDevice.get(device.id) ?? [];
+    const applicable = candidates.filter((row) => {
+      const owned = row.policyOrgId === device.orgId
+        || (row.policyOrgId === null && partnerId !== null && row.policyPartnerId === partnerId);
+      if (!owned) return false;
+      const targeted =
+        (row.assignmentLevel === 'device' && row.assignmentTargetId === device.id)
+        || (row.assignmentLevel === 'device_group' && groups.includes(row.assignmentTargetId))
+        || (row.assignmentLevel === 'site' && row.assignmentTargetId === device.siteId)
+        || (row.assignmentLevel === 'organization' && row.assignmentTargetId === device.orgId)
+        || (row.assignmentLevel === 'partner' && partnerId !== null && row.assignmentTargetId === partnerId);
+      return targeted && matchesRoleOsFilter(row, device);
+    });
+    if (applicable.length === 0) continue;
+    result.set(device.id, sortByHierarchy([...applicable])[0]!.linkId);
+  }
+  return result;
+}
+
+/**
+ * Device ids of every candidate device that holds one of these config-policy
+ * assignments. Used by the managed (security_agents) dimension below; the
+ * customer software_policy path still inlines the same steps.
+ */
+async function resolveCandidateDeviceIdsForConfigPolicies(configPolicyIds: string[]): Promise<string[]> {
+  if (configPolicyIds.length === 0) return [];
+  const assignments = await db
+    .select({
+      level: configPolicyAssignments.level,
+      targetId: configPolicyAssignments.targetId,
+    })
+    .from(configPolicyAssignments)
+    .where(inArray(configPolicyAssignments.configPolicyId, configPolicyIds));
+
+  const candidateDeviceIds = new Set<string>();
+  for (const assignment of assignments) {
+    for (const id of await resolveAssignmentDeviceIds(assignment.level, assignment.targetId)) {
+      candidateDeviceIds.add(id);
+    }
+  }
+  return Array.from(candidateDeviceIds);
+}
+
+/**
+ * #6960: device set of a software policy GENERATED from a `security_agents`
+ * link. It does not compete with customer `software_policy` links (neither
+ * shadows the other): candidates are the effective assignments of the managed
+ * link (the owning policy plus every child that inherits it), kept only where
+ * that link wins the `security_agents` hierarchy walk for the device.
+ */
+async function resolveDeviceIdsForManagedSoftwarePolicy(managedByLinkId: string): Promise<string[]> {
+  const holders = await db
+    .select({ configPolicyId: configPolicyEffectiveFeatureLinks.configPolicyId })
+    .from(configPolicyEffectiveFeatureLinks)
+    .innerJoin(
+      configurationPolicies,
+      and(
+        eq(configPolicyEffectiveFeatureLinks.configPolicyId, configurationPolicies.id),
+        eq(configurationPolicies.status, 'active')
+      )
+    )
+    .where(
+      and(
+        eq(configPolicyEffectiveFeatureLinks.featureType, 'security_agents'),
+        eq(configPolicyEffectiveFeatureLinks.id, managedByLinkId)
+      )
+    );
+
+  const candidates = await resolveCandidateDeviceIdsForConfigPolicies(holders.map((h) => h.configPolicyId));
+  // Batched winner walk: a fixed number of queries per 500 candidates.
+  const winners = await resolveSecurityAgentsLinksForDevices(candidates);
+  return candidates.filter((deviceId) => winners.get(deviceId) === managedByLinkId);
+}
+
+/**
+ * Batch resolver: finds all device IDs that should be governed by a given software policy
+ * via config policy assignments. Used by the compliance worker.
+ *
+ * Steps:
+ * 1. Find all config policies that link to this software policy
+ * 2. Get all assignments for those config policies
+ * 3. Resolve each assignment to device IDs based on level/targetId
+ * 4. For each device, verify this software policy is the "winning" one
+ *    (closest wins — if a device has a closer assignment linking to a different policy, exclude it)
+ */
 export async function resolveDeviceIdsForSoftwarePolicy(
   softwarePolicyId: string
 ): Promise<string[]> {
+  return (await resolveSoftwarePolicyCoverage(softwarePolicyId)).appliesToDeviceIds;
+}
+
+/** Candidate devices of a software policy that another software policy wins. */
+export interface SoftwarePolicyOverride {
+  /** The winning software policy (null when the winning link names none). */
+  softwarePolicyId: string | null;
+  /** The config policy whose assignment won (the first seen for this winner). */
+  configPolicyId: string;
+  deviceCount: number;
+}
+
+export interface SoftwarePolicyCoverage {
+  /** Devices that hold an assignment of a config policy linking this software policy. */
+  candidateDeviceIds: string[];
+  /** The subset this policy actually governs (what the compliance worker evaluates). */
+  appliesToDeviceIds: string[];
+  /** Candidates lost to another software policy, most devices first. */
+  overriddenBy: SoftwarePolicyOverride[];
+}
+
+/**
+ * #9635: {@link resolveDeviceIdsForSoftwarePolicy} plus WHY a candidate device
+ * is not governed — the per-device winner from
+ * {@link resolveSoftwarePolicyWinnerForDevice}, the same resolver the compliance
+ * worker relies on. Powers the "applies to 0 devices / overridden by X"
+ * indicator. `restrictToDeviceIds` narrows candidates (site-ceiling callers).
+ */
+export async function resolveSoftwarePolicyCoverage(
+  softwarePolicyId: string,
+  opts: { restrictToDeviceIds?: readonly string[] } = {},
+): Promise<SoftwarePolicyCoverage> {
+  const restrict = opts.restrictToDeviceIds ? new Set(opts.restrictToDeviceIds) : null;
+  const narrow = (ids: string[]) => (restrict ? ids.filter((id) => restrict.has(id)) : ids);
+  const empty: SoftwarePolicyCoverage = { candidateDeviceIds: [], appliesToDeviceIds: [], overriddenBy: [] };
+
+  // #6960: a generated (managed) policy resolves through its own dimension and
+  // ignores the software_policy winner entirely.
+  const [owner] = await db
+    .select({ managedByLinkId: softwarePolicies.managedByLinkId })
+    .from(softwarePolicies)
+    .where(eq(softwarePolicies.id, softwarePolicyId))
+    .limit(1);
+  if (owner?.managedByLinkId) {
+    const ids = narrow(await resolveDeviceIdsForManagedSoftwarePolicy(owner.managedByLinkId));
+    return { candidateDeviceIds: ids, appliesToDeviceIds: ids, overriddenBy: [] };
+  }
+
   // 1. Find config policies linking to this software policy
   const links = await db
     .select({
@@ -1168,7 +1792,7 @@ export async function resolveDeviceIdsForSoftwarePolicy(
       )
     );
 
-  if (links.length === 0) return [];
+  if (links.length === 0) return empty;
 
   const configPolicyIds = links.map((l) => l.configPolicyId);
 
@@ -1181,7 +1805,7 @@ export async function resolveDeviceIdsForSoftwarePolicy(
     .from(configPolicyAssignments)
     .where(inArray(configPolicyAssignments.configPolicyId, configPolicyIds));
 
-  if (assignments.length === 0) return [];
+  if (assignments.length === 0) return empty;
 
   // 3. Resolve each assignment to device IDs
   const candidateDeviceIds = new Set<string>();
@@ -1193,13 +1817,14 @@ export async function resolveDeviceIdsForSoftwarePolicy(
     }
   }
 
-  if (candidateDeviceIds.size === 0) return [];
+  const candidates = narrow(Array.from(candidateDeviceIds));
+  if (candidates.length === 0) return empty;
 
   // 4. Verify each candidate — the winning software policy must be this one.
-  // For efficiency, batch-check: resolve the winning policy for each candidate device.
-  // A device is included only if its closest config policy points to this software policy.
+  // A device is included only if its closest config policy points to this
+  // software policy; otherwise record which policy won it.
   const verifiedDeviceIds: string[] = [];
-  const candidates = Array.from(candidateDeviceIds);
+  const overrides = new Map<string | null, SoftwarePolicyOverride>();
 
   // Process in batches to avoid excessive parallel DB queries
   const BATCH_SIZE = 50;
@@ -1207,18 +1832,26 @@ export async function resolveDeviceIdsForSoftwarePolicy(
     const batch = candidates.slice(i, i + BATCH_SIZE);
     const results = await Promise.all(
       batch.map(async (deviceId) => {
-        const winningPolicyId = await resolveSoftwarePolicyForDevice(deviceId);
-        return { deviceId, winningPolicyId };
+        const winner = await resolveSoftwarePolicyWinnerForDevice(deviceId);
+        return { deviceId, winner };
       })
     );
-    for (const { deviceId, winningPolicyId } of results) {
-      if (winningPolicyId === softwarePolicyId) {
+    for (const { deviceId, winner } of results) {
+      if (winner?.featurePolicyId === softwarePolicyId) {
         verifiedDeviceIds.push(deviceId);
+      } else if (winner) {
+        const entry = overrides.get(winner.featurePolicyId);
+        if (entry) entry.deviceCount += 1;
+        else overrides.set(winner.featurePolicyId, { softwarePolicyId: winner.featurePolicyId, configPolicyId: winner.configPolicyId, deviceCount: 1 });
       }
     }
   }
 
-  return verifiedDeviceIds;
+  return {
+    candidateDeviceIds: candidates,
+    appliesToDeviceIds: verifiedDeviceIds,
+    overriddenBy: Array.from(overrides.values()).sort((a, b) => b.deviceCount - a.deviceCount),
+  };
 }
 
 // ============================================
@@ -1353,7 +1986,7 @@ export async function resolveAllVulnerabilityEnabledDevices(): Promise<Map<strin
         const orgs = await db
           .select({ id: organizations.id })
           .from(organizations)
-          .where(and(eq(organizations.partnerId, assignment.targetId), ne(organizations.type, 'quick_support')));
+          .where(and(eq(organizations.partnerId, assignment.targetId), ne(organizations.type, 'quick_support'), notHoldingOrgCondition()));
         if (orgs.length === 0) {
           ids = [];
           break;
@@ -1708,7 +2341,8 @@ function getRetentionImmutableDays(retention: Record<string, unknown> | null): n
  * `drizzle-orm` at import.
  */
 function backupTargetableDeviceCondition(): SQL {
-  return sql`${devices.status} <> 'decommissioned' AND ${devices.isEphemeral} = false`;
+  // Never a device parked in its partner's holding org.
+  return sql`${devices.status} <> 'decommissioned' AND ${devices.isEphemeral} = false AND ${notParkedDeviceCondition()}`;
 }
 
 /**
@@ -2121,7 +2755,7 @@ const MIDNIGHT_ANCHOR = { hours: 0, minutes: 0 } as const;
  * warns and falls back to midnight rather than treating the window as never
  * open.
  */
-function parseRecurringWindowAnchor(
+export function parseRecurringWindowAnchor(
   rawWindowStart: string | null
 ): { hours: number; minutes: number } | 'invalid' {
   const value = (rawWindowStart ?? '').trim();
@@ -2391,6 +3025,17 @@ export async function checkDeviceMaintenanceWindow(deviceId: string, now?: Date)
 export async function resolveSecurityScanSettingsForDevice(
   deviceId: string,
 ): Promise<SecurityScanSettings | null> {
+  return (await resolveSecurityScanPolicyForDevice(deviceId))?.settings ?? null;
+}
+
+/**
+ * {@link resolveSecurityScanSettingsForDevice} plus the id of the winning
+ * `security` feature link (for an inherited link, the PARENT's link id — the
+ * row that carries the auto-quarantine authority stamp).
+ */
+export async function resolveSecurityScanPolicyForDevice(
+  deviceId: string,
+): Promise<{ settings: SecurityScanSettings; featureLinkId: string } | null> {
   const hierarchy = await loadDeviceHierarchy(deviceId);
   if (!hierarchy) return null;
 
@@ -2399,6 +3044,7 @@ export async function resolveSecurityScanSettingsForDevice(
 
   const rows = await db
     .select({
+      featureLinkId: configPolicyEffectiveFeatureLinks.id,
       inlineSettings: configPolicyEffectiveFeatureLinks.inlineSettings,
       assignmentLevel: configPolicyAssignments.level,
       assignmentPriority: configPolicyAssignments.priority,
@@ -2428,7 +3074,8 @@ export async function resolveSecurityScanSettingsForDevice(
     );
 
   if (rows.length === 0) return null;
-  return parseSecurityScanSettings(sortByHierarchy(rows)[0]!.inlineSettings);
+  const winner = sortByHierarchy(rows)[0]!;
+  return { settings: parseSecurityScanSettings(winner.inlineSettings), featureLinkId: winner.featureLinkId };
 }
 
 /**
@@ -2569,4 +3216,270 @@ export async function resolveAllSecurityScanScheduledDevices(): Promise<Security
     });
   }
   return out;
+}
+
+// ============================================
+// System Restore checkpoint policy (#4609)
+// ============================================
+
+export interface ResolvedSystemProtection {
+  settings: SystemProtectionInlineSettings;
+  /**
+   * The winning effective feature link's updatedAt as an ISO string (for an
+   * inherited link, the PARENT link that actually carries the settings); null
+   * when nothing is assigned.
+   */
+  policyRevision: string | null;
+  /** True when no policy exists anywhere in the hierarchy -- the UI must say so. */
+  isPlatformDefault: boolean;
+  /**
+   * True when a policy WON but its stored settings failed the strict schema, so
+   * `settings` fell back to the platform defaults. Callers should surface this
+   * rather than present the defaults as the policy's choice.
+   */
+  invalidStoredSettings: boolean;
+}
+
+/**
+ * Resolve the `system_protection` toggles for a device via the config-policy
+ * hierarchy ("closest wins"). Inline settings only -- there is no normalized
+ * table; the toggles live in the feature link's JSONB.
+ *
+ * Same join as {@link resolveSecurityScanPolicyForDevice}: runs in the CALLER'S
+ * OWN RLS context, self-tenanted by the device's hierarchy;
+ * `policyOwnershipCondition` admits partner-owned (org_id NULL) policies for the
+ * device's partner, so a partner-wide policy reaches devices in every child org
+ * through its assignments.
+ *
+ * PARSES rather than casts. Writes are strictly validated, so a stored blob that
+ * fails the schema can only come from a bypass (direct DB edit, a downgrade).
+ * It NEVER throws into the caller: it falls back to the platform defaults --
+ * which are legacy parity (beforePatching true), never "everything off" -- logs
+ * a warning, and sets `invalidStoredSettings` so the fallback is reportable.
+ */
+export async function resolveSystemProtectionForDevice(
+  deviceId: string,
+): Promise<ResolvedSystemProtection> {
+  const hierarchy = await loadDeviceHierarchy(deviceId);
+  if (!hierarchy) return systemProtectionPlatformDefault();
+
+  const targetConditions = buildTargetConditions(hierarchy);
+  const roleOsConditions = buildRoleOsFilterConditions(hierarchy);
+
+  const rows = await db
+    .select({
+      featureLinkId: configPolicyEffectiveFeatureLinks.id,
+      sourcePolicyId: configPolicyEffectiveFeatureLinks.sourcePolicyId,
+      inlineSettings: configPolicyEffectiveFeatureLinks.inlineSettings,
+      linkUpdatedAt: configPolicyEffectiveFeatureLinks.updatedAt,
+      assignmentLevel: configPolicyAssignments.level,
+      assignmentPriority: configPolicyAssignments.priority,
+      assignmentCreatedAt: configPolicyAssignments.createdAt,
+    })
+    .from(configPolicyAssignments)
+    .innerJoin(
+      configurationPolicies,
+      and(
+        eq(configPolicyAssignments.configPolicyId, configurationPolicies.id),
+        eq(configurationPolicies.status, 'active'),
+        policyOwnershipCondition(hierarchy),
+      ),
+    )
+    .innerJoin(
+      configPolicyEffectiveFeatureLinks,
+      and(
+        eq(configPolicyEffectiveFeatureLinks.configPolicyId, configurationPolicies.id),
+        eq(configPolicyEffectiveFeatureLinks.featureType, 'system_protection'),
+      ),
+    )
+    .where(and(sql`(${sql.join(targetConditions, sql` OR `)})`, ...roleOsConditions))
+    .orderBy(
+      configPolicyAssignments.level,
+      configPolicyAssignments.priority,
+      configPolicyAssignments.createdAt,
+    );
+
+  if (rows.length === 0) return systemProtectionPlatformDefault();
+
+  const winner = sortByHierarchy(rows)[0]!;
+  const policyRevision = winner.linkUpdatedAt ? new Date(winner.linkUpdatedAt).toISOString() : null;
+  const parsed = systemProtectionInlineSettingsSchema.safeParse(winner.inlineSettings ?? {});
+  if (!parsed.success) {
+    reportInvalidStoredSettings({
+      feature: 'system_protection',
+      orgId: hierarchy.orgId,
+      deviceId,
+      featureLinkId: winner.featureLinkId,
+      sourcePolicyId: winner.sourcePolicyId,
+      issues: parsed.error.issues.map((i) => i.path.join('.') || '(root)'),
+    });
+    return { settings: { ...SYSTEM_PROTECTION_DEFAULTS }, policyRevision, isPlatformDefault: false, invalidStoredSettings: true };
+  }
+
+  return { settings: parsed.data, policyRevision, isPlatformDefault: false, invalidStoredSettings: false };
+}
+
+function systemProtectionPlatformDefault(): ResolvedSystemProtection {
+  return {
+    settings: { ...SYSTEM_PROTECTION_DEFAULTS },
+    policyRevision: null,
+    isPlatformDefault: true,
+    invalidStoredSettings: false,
+  };
+}
+
+// ============================================
+// Containment configuration (#10100, config-only)
+// ============================================
+
+export type ContainmentPolicy = ContainmentInlineSettings & {
+  isPlatformDefault: boolean;
+  invalidStoredSettings: boolean;
+  sourcePolicyId: string | null;
+  featureLinkId: string | null;
+  /** The device's groups whose containment policy was not applied because they are execution-unsafe. */
+  refusedGroups: RefusedExecutionGroup[];
+};
+
+/**
+ * Closest assignment wins, in the caller's own RLS context. The effective-link
+ * view preserves inherited settings and their source. Extra permits grant a
+ * capability, so self-selected execution-unsafe groups cannot supply this policy;
+ * the ones that tried are named in `refusedGroups` for the caller to audit.
+ * Malformed stored settings fail closed to the fixed W1 defaults.
+ */
+export async function resolveContainmentPolicy(
+  deviceId: string,
+): Promise<ContainmentPolicy & { revision: string }> {
+  const loaded = await loadDeviceHierarchy(deviceId);
+  if (!loaded) return containmentPlatformDefault();
+  const { allowedGroupIds, refusedGroups: refusedMemberships } = await resolveExecutionSafeGroupIds(loaded.groupIds);
+  const hierarchy: DeviceHierarchy = { ...loaded, groupIds: allowedGroupIds };
+  const targetConditions = buildTargetConditions(hierarchy);
+  const roleOsConditions = buildRoleOsFilterConditions(hierarchy);
+
+  const rows = await db
+    .select({
+      featureLinkId: configPolicyEffectiveFeatureLinks.id,
+      sourcePolicyId: configPolicyEffectiveFeatureLinks.sourcePolicyId,
+      inlineSettings: configPolicyEffectiveFeatureLinks.inlineSettings,
+      assignmentLevel: configPolicyAssignments.level,
+      assignmentPriority: configPolicyAssignments.priority,
+      assignmentCreatedAt: configPolicyAssignments.createdAt,
+    })
+    .from(configPolicyAssignments)
+    .innerJoin(
+      configurationPolicies,
+      and(
+        eq(configPolicyAssignments.configPolicyId, configurationPolicies.id),
+        eq(configurationPolicies.status, 'active'),
+        policyOwnershipCondition(hierarchy),
+      ),
+    )
+    .innerJoin(
+      configPolicyEffectiveFeatureLinks,
+      and(
+        eq(configPolicyEffectiveFeatureLinks.configPolicyId, configurationPolicies.id),
+        eq(configPolicyEffectiveFeatureLinks.featureType, 'containment'),
+      ),
+    )
+    .where(and(sql`(${sql.join(targetConditions, sql` OR `)})`, ...roleOsConditions))
+    .orderBy(
+      configPolicyAssignments.level,
+      configPolicyAssignments.priority,
+      configPolicyAssignments.createdAt,
+    );
+
+  // A separate query, not a filter on the one above: a refused group must never reach that candidate set.
+  const refusedGroups = await refusedGroupsWithContainmentPolicy(hierarchy, refusedMemberships, roleOsConditions);
+
+  if (rows.length === 0) return { ...containmentPlatformDefault(), refusedGroups };
+
+  const winner = sortByHierarchy(rows)[0]!;
+  const parsed = containmentInlineSettingsSchema.safeParse(winner.inlineSettings);
+  if (!parsed.success) {
+    reportInvalidStoredSettings({
+      feature: 'containment',
+      orgId: hierarchy.orgId,
+      deviceId,
+      featureLinkId: winner.featureLinkId,
+      sourcePolicyId: winner.sourcePolicyId,
+      // Paths only: messages can contain rejected values or unknown key names.
+      issues: parsed.error.issues.map((issue) => issue.path.join('.') || '(root)'),
+    });
+    return {
+      ...containmentPlatformDefault(),
+      // Distinct from the no-policy revision, so a policy going invalid (or being
+      // repaired) is itself a revision change a consumer can detect.
+      revision: 'c1i:' + createHash('sha256').update(`invalid|${winner.featureLinkId}`).digest('hex').slice(0, 32),
+      isPlatformDefault: false,
+      invalidStoredSettings: true,
+      sourcePolicyId: winner.sourcePolicyId,
+      featureLinkId: winner.featureLinkId,
+      refusedGroups,
+    };
+  }
+  return {
+    ...parsed.data,
+    revision: containmentRevision(parsed.data),
+    isPlatformDefault: false,
+    invalidStoredSettings: false,
+    sourcePolicyId: winner.sourcePolicyId,
+    featureLinkId: winner.featureLinkId,
+    refusedGroups,
+  };
+}
+
+/** Of the groups refused for this device, those a containment policy is actually assigned to. */
+async function refusedGroupsWithContainmentPolicy(
+  hierarchy: DeviceHierarchy,
+  refused: RefusedExecutionGroup[],
+  roleOsConditions: SQL[],
+): Promise<RefusedExecutionGroup[]> {
+  if (refused.length === 0) return [];
+  const assigned = await db
+    .select({ targetId: configPolicyAssignments.targetId })
+    .from(configPolicyAssignments)
+    .innerJoin(
+      configurationPolicies,
+      and(
+        eq(configPolicyAssignments.configPolicyId, configurationPolicies.id),
+        eq(configurationPolicies.status, 'active'),
+        policyOwnershipCondition(hierarchy),
+      ),
+    )
+    .innerJoin(
+      configPolicyEffectiveFeatureLinks,
+      and(
+        eq(configPolicyEffectiveFeatureLinks.configPolicyId, configurationPolicies.id),
+        eq(configPolicyEffectiveFeatureLinks.featureType, 'containment'),
+      ),
+    )
+    .where(and(
+      eq(configPolicyAssignments.level, 'device_group'),
+      inArray(configPolicyAssignments.targetId, refused.map((group) => group.id)),
+      ...roleOsConditions,
+    ));
+  const targets = new Set(assigned.map((row) => row.targetId));
+  return refused.filter((group) => targets.has(group.id));
+}
+
+function containmentRevision(settings: ContainmentInlineSettings): string {
+  // Strict Zod objects emit keys in schema order, including every extraAllow
+  // item. Hash only that parsed, default-filled JSON, never source metadata.
+  const stableJson = JSON.stringify(containmentInlineSettingsSchema.parse(settings));
+  return 'c1:' + createHash('sha256').update(stableJson).digest('hex').slice(0, 32);
+}
+
+function containmentPlatformDefault(): ContainmentPolicy & { revision: string } {
+  const settings = containmentInlineSettingsSchema.parse(CONTAINMENT_POLICY_DEFAULTS);
+  return {
+    ...settings,
+    revision: containmentRevision(settings),
+    isPlatformDefault: true,
+    invalidStoredSettings: false,
+    sourcePolicyId: null,
+    featureLinkId: null,
+    refusedGroups: [],
+  };
 }

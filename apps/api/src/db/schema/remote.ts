@@ -1,4 +1,4 @@
-import { sql } from 'drizzle-orm';
+import { sql, type AnyColumn, type SQL } from 'drizzle-orm';
 import { pgTable, uuid, text, timestamp, jsonb, pgEnum, integer, bigint, index, check } from 'drizzle-orm/pg-core';
 import { devices } from './devices';
 import { users } from './users';
@@ -6,6 +6,20 @@ import { organizations } from './orgs';
 
 export const remoteSessionTypeEnum = pgEnum('remote_session_type', ['terminal', 'desktop', 'file_transfer']);
 export const remoteSessionStatusEnum = pgEnum('remote_session_status', ['pending', 'connecting', 'active', 'disconnected', 'failed', 'denied']);
+
+// A remote session that is still live (or coming up). Rendered as an inline
+// literal on purpose: the planner only proves a partial index usable when the
+// predicate is a constant in the query text (a bound parameter falls back to a
+// sequential scan under generic plans; see routes/devices/events.ts
+// NON_AGENT_ACTOR). It MUST match the predicate of remote_sessions_device_live_idx
+// as created by its migration, which is what actually defines the index (the
+// Drizzle declaration below creates nothing and db:check-drift does not compare
+// them). Changing this list is schema drift: it needs a new migration that
+// rebuilds the index. Same set as ACTIVE_REMOTE_SESSION_STATUSES
+// (services/remoteSessionTeardown.ts).
+export const REMOTE_SESSION_LIVE_STATUSES = ['pending', 'connecting', 'active'] as const;
+export const remoteSessionIsLive = (status: AnyColumn | SQL) =>
+  sql`${status} IN (${sql.raw(REMOTE_SESSION_LIVE_STATUSES.map((v) => `'${v}'`).join(', '))})`;
 
 export const remoteSessions = pgTable('remote_sessions', {
   id: uuid('id').primaryKey().defaultRandom(),
@@ -21,7 +35,12 @@ export const remoteSessions = pgTable('remote_sessions', {
   // delayed result from the superseded start command.
   desktopStartCommandId: text('desktop_start_command_id'),
   desktopPromptMode: text('desktop_prompt_mode').$type<'off' | 'notify' | 'consent'>(),
-  // SEC-038 start/terminal fence (#5533). Monotonic generation bumped by BOTH
+  // consentUnavailableBehavior the same start shipped to the agent (#6819).
+  // A consent-mode answer reporting consentReason helper_absent/timeout may
+  // activate the session only when this is 'proceed'. NULL (pre-#6819 rows, or
+  // a start with no prompt block) is treated as not-proceed.
+  desktopConsentUnavailableBehavior: text('desktop_consent_unavailable_behavior').$type<'proceed' | 'block'>(),
+  // Start/terminal fence (#5533). Monotonic generation bumped by BOTH
   // the start-intent commit and (W03) the terminal-intent commit, so every
   // start decision is linearized against every terminal decision. Carried to
   // the agent as a canonical decimal STRING and compared as bigint/int64 on
@@ -34,7 +53,15 @@ export const remoteSessions = pgTable('remote_sessions', {
   // stop result lands. A start is refused unless this is 'none'.
   terminationPhase: text('termination_phase').$type<'none' | 'pending' | 'confirmed'>().notNull().default('none'),
   iceCandidates: jsonb('ice_candidates').default([]),
+  // The session's original start: the first agent answer, or the first
+  // WebSocket-fallback start. Never moved by a reconnect; the lease hard
+  // deadline (max duration) is measured from it (#11113).
   startedAt: timestamp('started_at'),
+  // The latest start attempt: every committed offer or WebSocket-fallback start,
+  // and every agent answer. Creation time until the first attempt. Stale cleanup
+  // and the pending/connecting reaper are measured from it, so a session that is
+  // renegotiating is not ended as stale (#11149).
+  lastStartAttemptAt: timestamp('last_start_attempt_at', { withTimezone: true }).defaultNow().notNull(),
   endedAt: timestamp('ended_at'),
   durationSeconds: integer('duration_seconds'),
   bytesTransferred: bigint('bytes_transferred', { mode: 'bigint' }),
@@ -45,6 +72,11 @@ export const remoteSessions = pgTable('remote_sessions', {
   // Redis holds only the lease TTL, so a renew after a Redis flush re-derives
   // the baseline from here. NULL on rows predating the revocation lease.
   permissionsEpochSnapshot: bigint('permissions_epoch_snapshot', { mode: 'number' }),
+  // #10190 W06: why the session ended when status / errorMessage do not say.
+  // 'ended_by_user' = the person at the keyboard ended it from the on-screen
+  // indicator (agent desk-userend result). NULL = not known / not a user end.
+  // CHECK-constrained (2027-01-09-120100-remote-sessions-end-reason.sql).
+  endReason: text('end_reason').$type<'ended_by_user'>(),
   createdAt: timestamp('created_at').defaultNow().notNull()
 }, (t) => [
   // W06 (#3900): one user's ended sessions for a day window; partial so the
@@ -53,9 +85,22 @@ export const remoteSessions = pgTable('remote_sessions', {
   // declaration does not create it (same situation as the note on
   // notifications.ts:57-64).
   index('remote_sessions_user_ended_idx').on(t.userId, t.endedAt).where(sql`${t.endedAt} IS NOT NULL`),
+  // GET /remote/devices/:deviceId/active-sessions reads a device's live rows.
+  // Created CONCURRENTLY by 2026-12-05-100000-device-live-session-indexes.sql.
+  index('remote_sessions_device_live_idx')
+    .on(t.deviceId)
+    .where(remoteSessionIsLive(t.status)),
   check(
     'remote_sessions_desktop_prompt_mode_check',
     sql`${t.desktopPromptMode} IS NULL OR ${t.desktopPromptMode} IN ('off', 'notify', 'consent')`,
+  ),
+  check(
+    'remote_sessions_desktop_consent_unavailable_behavior_check',
+    sql`${t.desktopConsentUnavailableBehavior} IS NULL OR ${t.desktopConsentUnavailableBehavior} IN ('proceed', 'block')`,
+  ),
+  check(
+    'remote_sessions_end_reason_check',
+    sql`${t.endReason} IS NULL OR ${t.endReason} IN ('ended_by_user')`,
   ),
   check(
     'remote_sessions_termination_phase_check',

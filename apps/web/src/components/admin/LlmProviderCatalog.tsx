@@ -18,16 +18,7 @@ import { showToast } from '../shared/Toast';
 // Initializes the shared i18next singleton — see ThirdPartyCatalog.tsx for why
 // this import must run before any island renders translated text.
 import '../../lib/i18n';
-
-// Selectable models for the catalog's per-revision model map. Mirrors
-// OFFERABLE_AI_MODELS in apps/api/src/services/aiCostTracker.ts — the API
-// rejects any mapped model id not on that list, so keep this in sync with it.
-const OFFERABLE_AI_MODELS = [
-  'claude-opus-4-8',
-  'claude-sonnet-4-6',
-  'claude-haiku-4-5',
-  'claude-fable-5',
-] as const;
+import { useStableT } from '@/lib/i18n/useStableT';
 
 type CatalogStatus = 'draft' | 'listed' | 'delisted';
 type AuthMode = 'x-api-key' | 'bearer';
@@ -109,9 +100,9 @@ function activeRevisionOf(entry: CatalogEntry): CatalogRevision | undefined {
   return entry.revisions.find((revision) => revision.revisionId === entry.activeRevisionId);
 }
 
-function emptyModelMapDraft(): Record<string, ModelMapDraftRow> {
+function emptyModelMapDraft(modelIds: readonly string[]): Record<string, ModelMapDraftRow> {
   return Object.fromEntries(
-    OFFERABLE_AI_MODELS.map((modelId) => [
+    modelIds.map((modelId) => [
       modelId,
       {
         included: false,
@@ -127,6 +118,7 @@ function emptyModelMapDraft(): Record<string, ModelMapDraftRow> {
 
 export default function LlmProviderCatalog() {
   const { t } = useTranslation('admin');
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   const [entries, setEntries] = useState<CatalogEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [requiresPlatformAdmin, setRequiresPlatformAdmin] = useState(false);
@@ -143,7 +135,8 @@ export default function LlmProviderCatalog() {
   const [revisionBaseUrl, setRevisionBaseUrl] = useState('');
   const [revisionAuthMode, setRevisionAuthMode] = useState<AuthMode>('x-api-key');
   const [revisionDataNote, setRevisionDataNote] = useState('');
-  const [modelMapDraft, setModelMapDraft] = useState<Record<string, ModelMapDraftRow>>(emptyModelMapDraft());
+  const [mappableModelIds, setMappableModelIds] = useState<string[]>([]);
+  const [modelMapDraft, setModelMapDraft] = useState<Record<string, ModelMapDraftRow>>({});
   const [savingRevision, setSavingRevision] = useState(false);
   const [revisionFormError, setRevisionFormError] = useState<string>();
 
@@ -169,17 +162,30 @@ export default function LlmProviderCatalog() {
           setEntries([]);
           return;
         }
-        throw new Error(t('admin.llmProviderCatalog.errors.load'));
+        throw new Error(stableT('admin.llmProviderCatalog.errors.load'));
       }
       setRequiresPlatformAdmin(false);
       const data = await response.json();
       setEntries(Array.isArray(data) ? data : []);
+      // Mappable logical ids come from the platform model registry (W01 #7599,
+      // spec §6/§11): any model it holds that is not retired. The API checks
+      // the same rule on save.
+      const modelsResponse = await fetchWithAuth('/admin/ai-models');
+      if (modelsResponse.ok) {
+        const modelsData = (await modelsResponse.json()) as { models?: Array<{ modelId: string; lifecycle: string }> };
+        setMappableModelIds(
+          (Array.isArray(modelsData.models) ? modelsData.models : [])
+            .filter((model) => model.lifecycle !== 'retired')
+            .map((model) => model.modelId)
+            .sort(),
+        );
+      }
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('admin.llmProviderCatalog.errors.generic'));
+      setError(err instanceof Error ? err.message : stableT('admin.llmProviderCatalog.errors.generic'));
     } finally {
       setLoading(false);
     }
-  }, [t]);
+  }, [stableT]);
 
   useEffect(() => {
     void fetchCatalog();
@@ -224,7 +230,7 @@ export default function LlmProviderCatalog() {
     setRevisionBaseUrl('');
     setRevisionAuthMode('x-api-key');
     setRevisionDataNote('');
-    setModelMapDraft(emptyModelMapDraft());
+    setModelMapDraft(emptyModelMapDraft(mappableModelIds));
     setRevisionFormError(undefined);
   };
 
@@ -585,7 +591,7 @@ export default function LlmProviderCatalog() {
                         <td colSpan={6} className="px-4 py-3 bg-gray-50 border-b">
                           <div data-testid={`llm-catalog-revisions-${entry.entryId}`} className="space-y-3">
                             {entry.revisions.length === 0 ? (
-                              <div className="text-xs text-gray-500">{t('admin.llmProviderCatalog.empty')}</div>
+                              <div className="text-xs text-gray-500">{t('admin.llmProviderCatalog.noRevisions')}</div>
                             ) : (
                               entry.revisions.map((revision) => {
                                 const modelIds = Object.keys(revision.modelMap);
@@ -722,8 +728,8 @@ export default function LlmProviderCatalog() {
                   <div className="font-medium text-sm mb-1">{t('admin.llmProviderCatalog.revisionForm.modelMap.title')}</div>
                   <p className="text-xs text-gray-500 mb-2">{t('admin.llmProviderCatalog.revisionForm.modelMap.description')}</p>
                   <div className="space-y-2">
-                    {OFFERABLE_AI_MODELS.map((modelId) => {
-                      const row = modelMapDraft[modelId];
+                    {mappableModelIds.map((modelId) => {
+                      const row = modelMapDraft[modelId] ?? emptyModelMapDraft([modelId])[modelId]!;
                       return (
                         <div key={modelId} data-testid={`llm-catalog-modelmap-${modelId}`} className="border rounded p-2">
                           <label className="flex items-center gap-2 text-xs font-mono mb-2">

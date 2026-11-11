@@ -1,0 +1,147 @@
+/**
+ * Exemption lists for envReadComposeCoverage.test.ts (#7470). Read that file's
+ * docblock first; in short, every env name the API reads that is operator-facing
+ * (on the System → Connections registry, or documented in
+ * apps/docs/src/content/docs/deploy/environment.mdx) must reach the api
+ * container in BOTH compose files, or be listed here.
+ */
+
+export type ComposeFileKey = 'root' | 'prod';
+
+/** Unmapped on purpose. Each needs a reason that would survive review. */
+export const COMPOSE_INTENTIONALLY_UNMAPPED: Readonly<Record<ComposeFileKey, Readonly<Record<string, string>>>> = {
+  root: {
+    REDIS_PASSWORD:
+      'sources the redis_password secret file; the api container authenticates via REDIS_PASSWORD_FILE, never the plaintext var',
+    REDIS_URL: 'the api container builds its Redis connection from REDIS_HOST/REDIS_PORT + REDIS_PASSWORD_FILE',
+    BREEZE_ALLOW_UNAUTH_REDIS:
+      'escape hatch for a password-less Redis; the bundled Redis always runs with requirepass from the redis_password secret',
+    BREEZE_ALLOW_UNSAFE_DB_ROLE:
+      'local-development escape hatch that is ignored when NODE_ENV=production, which the x-api-env anchor pins',
+    DEV_PUSH_WORK_DIR:
+      'dev-push staging dir; dev-push is off on a compose stack (NODE_ENV=production pinned, DEV_PUSH_ENABLED not mapped)',
+  },
+  prod: {
+    REDIS_PASSWORD:
+      'sources the redis_password secret file; the api container authenticates via REDIS_PASSWORD_FILE, never the plaintext var',
+    REDIS_URL: 'the api container builds its Redis connection from REDIS_HOST/REDIS_PORT + REDIS_PASSWORD_FILE',
+    BREEZE_ALLOW_UNSAFE_DB_ROLE:
+      'local-development escape hatch that is ignored when NODE_ENV=production, which the x-api-env anchor pins',
+    DEV_PUSH_WORK_DIR:
+      'dev-push staging dir; dev-push is off on a compose stack (NODE_ENV=production pinned, DEV_PUSH_ENABLED not mapped)',
+  },
+};
+
+/**
+ * FROZEN baseline: operator-facing reads that were already unmapped when the
+ * guard landed (#7470). They have not been triaged one by one — most are
+ * documented tuning knobs or optional integrations whose consumer still has to
+ * be checked for empty-string handling before a `${VAR:-}` mapping is safe.
+ * Burn-down: #7640.
+ *
+ * NEVER add a name here. A new unmapped operator-facing read gets mapped, or
+ * goes in COMPOSE_INTENTIONALLY_UNMAPPED with a reason. Mapping one of these
+ * makes the guard's "stale" test fail until the entry is deleted, so the list
+ * only shrinks.
+ *
+ * `prod` (deploy/docker-compose.prod.yml) is longer than `root` mostly because
+ * it never picked up vars that docker-compose.yml maps; copying those lines
+ * across is the cheap first step of the burn-down.
+ */
+export const COMPOSE_BASELINE_UNMAPPED: Readonly<Record<ComposeFileKey, readonly string[]>> = {
+  root: [
+    'AGENT_ROLLBACK_DENYLISTED_VERSIONS',
+    'AGENT_ROLLBACK_MIN_VERSION',
+    'AGENT_UPDATE_MANIFEST_PUBLIC_KEYS',
+    'APP_ENCRYPTION_KEYRING',
+    'BINARY_VERSION',
+    'BREEZE_AUTHENTICATOR_ATTESTATION_ENFORCED',
+    'BREEZE_BINARIES_VERSION',
+    'BREEZE_LEGACY_ALERTING_SWEEP',
+    'BREEZE_RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS',
+    'BREEZE_SERVER',
+    'BREEZE_UPDATE_MANIFEST_PUBLIC_KEYS',
+    'DELEGANT_ACTING_USER_ID',
+    'DELEGANT_AGENT_ID',
+    'DELEGANT_BASE_URL',
+    'DELEGANT_PRINCIPAL_KID',
+    'DELEGANT_PRINCIPAL_SIGNING_KEY',
+    'DELEGANT_SERVICE_TOKEN',
+    'ENROLLMENT_SECRET_ENFORCEMENT_MODE',
+    'FIREBASE_SERVICE_ACCOUNT',
+    'GH_TOKEN',
+    'GITHUB_REPO',
+    'GITHUB_TOKEN',
+    'PARTNER_HOOKS_SECRET',
+    'PLAY_INTEGRITY_SERVICE_ACCOUNT',
+    'PORTAL_BASE_PATH',
+    'PUBLIC_URL',
+    'PUBLIC_WEB_URL',
+    'RECOVERY_MINISIGN_BIN',
+    'RECOVERY_SIGNING_KEYS_JSON',
+    'RECOVERY_SIGNING_KEY_ID',
+    'RECOVERY_SIGNING_PRIVATE_KEY',
+    'RECOVERY_SIGNING_PUBLIC_KEY',
+    'RELEASE_ARTIFACT_MANIFEST_VERIFICATION',
+    'SECRET_ENCRYPTION_KEY',
+    'SECRET_ENCRYPTION_KEYRING',
+    'SECRET_ENCRYPTION_KEY_ID',
+    'SENSITIVE_DATA_ENCRYPTION_KEY_B64',
+    'SENSITIVE_DATA_ENCRYPTION_KEY_REF',
+    'SENSITIVE_DATA_ENCRYPTION_KEY_VERSION',
+    'SENSITIVE_DATA_KEYRING_JSON',
+    'SSO_ENCRYPTION_KEY',
+    'STRIPE_SECRET_KEY',
+    'STRIPE_WEBHOOK_SECRET',
+    'TRUST_ACTION_TOKEN_SECRET',
+    'TURN_TLS_DIR',
+  ],
+  prod: [
+    'AGENT_ROLLBACK_DENYLISTED_VERSIONS',
+    'AGENT_ROLLBACK_MIN_VERSION',
+    'AGENT_UPDATE_MANIFEST_PUBLIC_KEYS',
+    'APP_ENCRYPTION_KEYRING',
+    'BINARY_VERSION',
+    'BREEZE_AUTHENTICATOR_ATTESTATION_ENFORCED',
+    'BREEZE_BINARIES_VERSION',
+    'BREEZE_LEGACY_ALERTING_SWEEP',
+    'BREEZE_RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS',
+    'BREEZE_SERVER',
+    'BREEZE_UPDATE_MANIFEST_PUBLIC_KEYS',
+    'DELEGANT_ACTING_USER_ID',
+    'DELEGANT_AGENT_ID',
+    'DELEGANT_BASE_URL',
+    'DELEGANT_PRINCIPAL_KID',
+    'DELEGANT_PRINCIPAL_SIGNING_KEY',
+    'DELEGANT_SERVICE_TOKEN',
+    'ENROLLMENT_SECRET_ENFORCEMENT_MODE',
+    'FIREBASE_SERVICE_ACCOUNT',
+    'GH_TOKEN',
+    'GITHUB_REPO',
+    'GITHUB_TOKEN',
+    'M365_COMMS_EXECUTOR_SIGNING_PRIVATE_JWK_FILE',
+    'PARTNER_HOOKS_SECRET',
+    'PLAY_INTEGRITY_SERVICE_ACCOUNT',
+    'PORTAL_BASE_PATH',
+    'PUBLIC_URL',
+    'PUBLIC_WEB_URL',
+    'RECOVERY_MINISIGN_BIN',
+    'RECOVERY_SIGNING_KEYS_JSON',
+    'RECOVERY_SIGNING_KEY_ID',
+    'RECOVERY_SIGNING_PRIVATE_KEY',
+    'RECOVERY_SIGNING_PUBLIC_KEY',
+    'RELEASE_ARTIFACT_MANIFEST_VERIFICATION',
+    'SECRET_ENCRYPTION_KEY',
+    'SECRET_ENCRYPTION_KEYRING',
+    'SECRET_ENCRYPTION_KEY_ID',
+    'SENSITIVE_DATA_ENCRYPTION_KEY_B64',
+    'SENSITIVE_DATA_ENCRYPTION_KEY_REF',
+    'SENSITIVE_DATA_ENCRYPTION_KEY_VERSION',
+    'SENSITIVE_DATA_KEYRING_JSON',
+    'SSO_ENCRYPTION_KEY',
+    'STRIPE_SECRET_KEY',
+    'STRIPE_WEBHOOK_SECRET',
+    'TRUST_ACTION_TOKEN_SECRET',
+    'TURN_TLS_DIR',
+  ],
+};

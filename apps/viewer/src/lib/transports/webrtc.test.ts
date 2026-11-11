@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { connectWebRTC, type WebRTCDeps } from './webrtc';
+import { connectWebRTC, openReliableInputChannel, type WebRTCDeps } from './webrtc';
 import { AgentSessionError, type AuthenticatedConnectionParams } from '../webrtc';
 
 const globalScope = globalThis as Record<string, unknown>;
@@ -157,5 +157,77 @@ describe('connectWebRTC — capture failure diagnostics (#4162)', () => {
     expect(error).toBeInstanceOf(AgentSessionError);
     expect(error.message).toBe(message);
     expect(polls).toBe(1);
+  });
+});
+
+// #6818: the consent-wait notice only reaches DesktopViewer if connectWebRTC
+// forwards the hook to createWebRTCSession.
+describe('connectWebRTC — consent wait (#6818)', () => {
+  class FakePeer {
+    iceGatheringState = 'complete';
+    localDescription = { sdp: 'v=0 fake-sdp', type: 'offer' };
+    ontrack: unknown = null;
+    onicegatheringstatechange: unknown = null;
+    onconnectionstatechange: unknown = null;
+    ondatachannel: unknown = null;
+    addTransceiver() {}
+    createDataChannel() {
+      return { bufferedAmountLowThreshold: 0, close() {} };
+    }
+    async createOffer() {
+      return { sdp: 'v=0 fake-sdp', type: 'offer' };
+    }
+    async setLocalDescription() {}
+    async setRemoteDescription() {}
+    close() {}
+  }
+
+  it('forwards onAwaitingUserApproval while the agent waits on the consent dialog', async () => {
+    vi.stubGlobal('RTCPeerConnection', FakePeer);
+    vi.stubGlobal('RTCSessionDescription', class { constructor(public init: unknown) {} });
+    let polls = 0;
+    const json = (body: unknown) => ({
+      ok: true, status: 200, headers: new Headers(), json: async () => body, text: async () => JSON.stringify(body),
+    });
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/ice-servers')) return json({ iceServers: [] });
+      if (url.includes('/viewer/offer')) return json({ ok: true });
+      polls += 1;
+      return json({
+        status: 'connecting',
+        promptMode: 'consent',
+        answerTimeoutMs: 77_000,
+        webrtcAnswer: polls < 2 ? null : 'v=0 answer-sdp',
+      });
+    }));
+
+    const deps = makeDeps();
+    deps.onAwaitingUserApproval = vi.fn();
+    await expect(connectWebRTC(auth, deps)).resolves.not.toBeNull();
+    expect(deps.onAwaitingUserApproval).toHaveBeenCalledOnce();
+  });
+});
+
+describe('openReliableInputChannel — input-r (W03, #8239)', () => {
+  it('opens input-r ordered and fully reliable: no maxRetransmits, no maxPacketLifeTime', () => {
+    const channel = { label: 'input-r' } as unknown as RTCDataChannel;
+    const createDataChannel = vi.fn(() => channel);
+    const pc = { createDataChannel, signalingState: 'stable' } as unknown as RTCPeerConnection;
+    expect(openReliableInputChannel(pc)).toBe(channel);
+    expect(createDataChannel).toHaveBeenCalledWith('input-r', { ordered: true });
+  });
+
+  it('returns null on a closed peer connection or when createDataChannel throws', () => {
+    const closedCreate = vi.fn();
+    const closed = { createDataChannel: closedCreate, signalingState: 'closed' } as unknown as RTCPeerConnection;
+    expect(openReliableInputChannel(closed)).toBeNull();
+    expect(closedCreate).not.toHaveBeenCalled();
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const throwing = {
+      createDataChannel: vi.fn(() => { throw new Error('InvalidStateError'); }),
+      signalingState: 'stable',
+    } as unknown as RTCPeerConnection;
+    expect(openReliableInputChannel(throwing)).toBeNull();
   });
 });

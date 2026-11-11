@@ -2,6 +2,8 @@ import { i18n } from '@/lib/i18n';
 import { useTranslation } from 'react-i18next';
 import { useMemo, useState } from 'react';
 import { cn } from '@/lib/utils';
+import type { McpGrantableDomain } from '@breeze/shared';
+import { FilterSelect } from '../shared/FilterSelect';
 
 export type ApiKeyStatus = 'active' | 'revoked' | 'expired';
 
@@ -18,6 +20,8 @@ export type ApiKey = {
   expiresAt: string | null;
   rateLimit: number | null;
   source?: ApiKeySource;
+  /** B-W02 #6156: null/absent = every MCP tool area. Only meaningful with an `ai:*` scope. */
+  mcpDomains?: McpGrantableDomain[] | null;
 };
 
 type ApiKeyListProps = {
@@ -52,6 +56,7 @@ export default function ApiKeyList({
   onPageChange
 }: ApiKeyListProps) {
   const { t } = useTranslation('settings');
+  const { t: tc } = useTranslation('common');
   const [query, setQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState<ApiKeyStatus | 'all'>('all');
 
@@ -110,17 +115,18 @@ export default function ApiKeyList({
             onChange={event => setQuery(event.target.value)}
             className="h-10 w-full rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring sm:w-56"
           />
-          <select
+          <FilterSelect
+            label={t('apiKeyList.statusFilterLabel')}
             value={statusFilter}
             onChange={event => setStatusFilter(event.target.value as ApiKeyStatus | 'all')}
-            className="h-10 w-full rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring sm:w-40"
+            className="w-full sm:w-40"
           >
             {statusOptions.map(status => (
               <option key={status} value={status}>
                 {status === 'all' ? t('apiKeyList.allStatuses') : t(/* i18n-dynamic */ statusLabelKeys[status as ApiKeyStatus])}
               </option>
             ))}
-          </select>
+          </FilterSelect>
         </div>
       </div>
 
@@ -133,6 +139,7 @@ export default function ApiKeyList({
               <th className="px-4 py-3">{t('apiKeyList.scopes')}</th>
               <th className="px-4 py-3">{t('apiKeyList.created')}</th>
               <th className="px-4 py-3">{t('apiKeyList.lastUsed')}</th>
+              <th className="px-4 py-3">{t('apiKeyList.expires')}</th>
               <th className="px-4 py-3">{t('apiKeyList.status')}</th>
               <th className="px-4 py-3 text-right">{t('apiKeyList.actions')}</th>
             </tr>
@@ -140,7 +147,7 @@ export default function ApiKeyList({
           <tbody className="divide-y">
             {filteredApiKeys.length === 0 ? (
               <tr>
-                <td colSpan={7} className="px-4 py-12 text-center">
+                <td colSpan={8} className="px-4 py-12 text-center">
                   <div className="flex flex-col items-center gap-2">
                     <svg
                       className="h-12 w-12 text-muted-foreground/50"
@@ -184,9 +191,22 @@ export default function ApiKeyList({
                   </td>
                   <td className="px-4 py-3 text-sm text-muted-foreground" title={apiKey.scopes.join(', ')}>
                     {formatScopes(apiKey.scopes)}
+                    {apiKey.scopes.some(s => s.startsWith('ai:')) && (
+                      <span
+                        data-testid={`api-key-mcp-domains-${apiKey.id}`}
+                        className="ml-2 inline-flex items-center rounded-full bg-sky-500/10 px-2 py-0.5 text-[10px] font-medium text-sky-700"
+                      >
+                        {apiKey.mcpDomains
+                          ? tc('longTail.mcpDomains.areaCount', { count: apiKey.mcpDomains.length })
+                          : tc('longTail.mcpDomains.allTools')}
+                      </span>
+                    )}
                   </td>
                   <td className="px-4 py-3 text-sm text-muted-foreground">{formatDate(apiKey.createdAt)}</td>
                   <td className="px-4 py-3 text-sm text-muted-foreground">{formatDate(apiKey.lastUsedAt)}</td>
+                  <td className="px-4 py-3 text-sm text-muted-foreground" data-testid={`api-key-expires-${apiKey.id}`}>
+                    {apiKey.expiresAt ? formatDate(apiKey.expiresAt) : t('apiKeyList.neverExpires')}
+                  </td>
                   <td className="px-4 py-3 text-sm">
                     <span
                       className={cn(

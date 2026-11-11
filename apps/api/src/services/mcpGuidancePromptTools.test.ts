@@ -65,6 +65,24 @@ describe('prompt guidance references only real tools', () => {
   it('the advertised approximate tool count stays within tolerance of the registry', () => {
     expect(Math.abs(registered.size - MCP_TOOL_COUNT_APPROX)).toBeLessThanOrEqual(10);
   });
+
+  // W5 PR C (#5220, orchestrator amendment 6): flow tools (`flow__<slug>`) are
+  // per-caller dynamic descriptors, never registry entries, so the advertised
+  // count is the registry's alone — enabling any number of flows moves
+  // neither the registry nor MCP_TOOL_COUNT_APPROX.
+  it('dynamic flow tools are excluded from the registry count', () => {
+    // No flow tool is ever a registry entry, so the advertised count (bounded
+    // against the registry above) can never move with the number of flows.
+    expect([...registered].some((name) => name.startsWith('flow__'))).toBe(false);
+    expect(MCP_SERVER_INSTRUCTIONS).toContain(`~${MCP_TOOL_COUNT_APPROX} tools`);
+    expect(MCP_SERVER_INSTRUCTIONS).not.toMatch(/flow__/);
+  });
+
+  it('tells the model how to continue a paged result and how to read a handle (A-W05)', () => {
+    expect(MCP_SERVER_INSTRUCTIONS).toContain('hasMore');
+    expect(MCP_SERVER_INSTRUCTIONS).toContain('nextCursor');
+    expect(MCP_SERVER_INSTRUCTIONS).toContain('read_artifact');
+  });
 });
 
 
@@ -81,6 +99,13 @@ describe('moved workflow guidance (A-W03)', () => {
     expect(text).toContain('manage_backup_profiles');
     expect(text).toContain('inlineSettings.destinationConfigId');
     expect(text).toMatch(/create the standalone policy[\s\S]*then link/);
+  });
+
+  it('documents the monitor check interval in the live feature reference', () => {
+    expect(POLICY_FEATURE_INLINE_SETTINGS_REFERENCE.monitors).toContain('checkIntervalSeconds: 60');
+    expect(POLICY_FEATURE_INLINE_SETTINGS_REFERENCE.monitors).toContain('10–3600');
+    expect(POLICY_FEATURE_INLINE_SETTINGS_REFERENCE).not.toHaveProperty('alert_rule');
+    expect(POLICY_FEATURE_INLINE_SETTINGS_REFERENCE).not.toHaveProperty('monitoring');
   });
 
   it('publishes every domain and the full per-feature settings reference', () => {

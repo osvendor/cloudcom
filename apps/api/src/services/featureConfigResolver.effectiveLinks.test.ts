@@ -12,13 +12,12 @@ vi.mock('../db', () => ({
 }));
 
 import {
+  resolvePatchConfigPolicyForDevice,
   scanScheduledAutomations,
   scanDueComplianceChecks,
-  resolveAlertRulesForDevice,
   resolveAutomationsForDeviceWithPolicy,
   resolveAutomationAssignmentForDevice,
   resolveAllVulnerabilityEnabledDevices,
-  resolveGoverningAlertRulePolicyForDevice,
   resolvePatchConfigDetailsForDevice,
   resolveBackupConfigForDevice,
   resolveMaintenanceConfigForDevice,
@@ -29,10 +28,12 @@ import {
   resolveBackupProtectionForDevice,
   resolveAllBackupAssignedDevices,
 } from './featureConfigResolver';
-import { db } from '../db';
+import { db, getCurrentDbAccessContext, runOutsideDbContext, withSystemDbAccessContext } from '../db';
+import type { DeviceHierarchy } from './deviceHierarchy';
 import {
   configPolicyEffectiveFeatureLinks,
   configPolicyFeatureLinks,
+  partners,
 } from '../db/schema';
 
 // Records the first argument of every join so a test can ask "which tables did
@@ -90,6 +91,33 @@ function queueHierarchy(...rowSets: unknown[][]) {
   queue([DEVICE], [{ partnerId: 'ptr-1' }], [], ...rowSets);
 }
 
+describe('maintenance uses evaluation-scoped hierarchy', () => {
+  const hierarchy: DeviceHierarchy = {
+    deviceId: 'dev-1', orgId: 'org-1', siteId: 'site-1', deviceRole: 'workstation',
+    osType: 'windows', org: { partnerId: 'ptr-1', type: 'customer' }, site: null,
+    groupIds: ['group-1'],
+  };
+
+  it('preserves settings and effective-link lookup with one read instead of four', async () => {
+    const settings = { id: 'maint-1', timezone: 'UTC', suppressAlerts: true };
+    const rows = [{ maintenanceSettings: settings, assignmentLevel: 'organization', assignmentPriority: 0,
+      assignmentCreatedAt: new Date('2026-01-01'), assignmentId: 'assign-1' }];
+    queueHierarchy(rows);
+    const legacy = await resolveMaintenanceConfigForDevice('dev-1');
+    expect(db.select).toHaveBeenCalledTimes(4);
+    vi.mocked(db.select).mockClear();
+    queue(rows);
+    expect(await resolveMaintenanceConfigForDevice('dev-1', { hierarchy })).toEqual(legacy);
+    expect(db.select).toHaveBeenCalledTimes(1);
+    expect(rec.joined).toContain(configPolicyEffectiveFeatureLinks);
+  });
+
+  it('rejects a hierarchy for another device without querying', async () => {
+    await expect(resolveMaintenanceConfigForDevice('dev-2', { hierarchy })).rejects.toThrow('was passed to a resolver');
+    expect(db.select).not.toHaveBeenCalled();
+  });
+});
+
 // Some resolvers issue follow-up queries (timezone lookups, settings joins)
 // after the one under test. Queue spare empty chains so an extra call cannot
 // throw on an undefined builder and turn a real assertion into an error.
@@ -128,12 +156,6 @@ describe('featureConfigResolver reads effective feature links', () => {
     expectReadsEffectiveLinks();
   });
 
-  it('resolveAlertRulesForDevice joins the effective view', async () => {
-    queueHierarchy([], []);
-    await resolveAlertRulesForDevice('dev-1');
-    expectReadsEffectiveLinks();
-  });
-
   it('resolveAllVulnerabilityEnabledDevices joins the effective view', async () => {
     queue([]);
     await resolveAllVulnerabilityEnabledDevices();
@@ -146,6 +168,7 @@ describe('featureConfigResolver reads effective feature links', () => {
   // in lockstep with the source. These assert against the REAL schema exports.
   const deviceResolvers: Array<[string, (id: string) => Promise<unknown>, number]> = [
     ['resolvePatchConfigDetailsForDevice', resolvePatchConfigDetailsForDevice, 3],
+    ['resolvePatchConfigPolicyForDevice', resolvePatchConfigPolicyForDevice, 3],
     ['resolveBackupConfigForDevice', resolveBackupConfigForDevice, 3],
     ['resolveMaintenanceConfigForDevice', resolveMaintenanceConfigForDevice, 3],
     ['resolveComplianceRulesForDevice', resolveComplianceRulesForDevice, 3],
@@ -162,27 +185,6 @@ describe('featureConfigResolver reads effective feature links', () => {
       expectReadsEffectiveLinks();
     });
   }
-
-  it('resolveGoverningAlertRulePolicyForDevice joins the effective view', async () => {
-    // This one short-circuits with `unassigned` before its view query unless the
-    // candidate policy is actually among the assignments — feeding [] here would
-    // make the assertion pass for the wrong reason on the OTHER branch, so the
-    // seed has to reach the second query.
-    queueHierarchy([
-      {
-        configPolicyId: 'p-1',
-        assignmentLevel: 'organization',
-        assignmentPriority: 0,
-        assignmentCreatedAt: new Date('2026-01-01T00:00:00Z'),
-      },
-    ]);
-    queueSpares(3);
-
-    const outcome = await resolveGoverningAlertRulePolicyForDevice('dev-1', 'p-1');
-
-    expect(outcome).toEqual({ outcome: 'governs' });
-    expectReadsEffectiveLinks();
-  });
 
   it('resolveDeviceIdsForSoftwarePolicy joins the effective view (it feeds the compliance worker)', async () => {
     queue([]);
@@ -252,4 +254,36 @@ it('a converted child still wins; only its legacy executable rows disappear', as
   expect(await resolveAutomationsForDeviceWithPolicy('dev-1')).toEqual({ configPolicyId: 'child', automations: [] });
   queueHierarchy(rows.slice(0, 1));
   expect((await resolveAutomationsForDeviceWithPolicy('dev-1'))?.automations.map((a) => a.id)).toEqual(['parent-auto']);
+});
+
+// #7647: the ring-aware approval evaluator only needs WHICH config policy won.
+// The timezone half of resolvePatchConfigDetailsForDevice reads the
+// partner-axis `partners` row through a system escape (a second pooled
+// connection under a request context), so the evaluator's resolver must not
+// pay it.
+describe('resolvePatchConfigPolicyForDevice (#7647)', () => {
+  it('resolves the winning policy without the partner timezone read or any system escape', async () => {
+    vi.mocked(runOutsideDbContext).mockClear();
+    vi.mocked(withSystemDbAccessContext).mockClear();
+    vi.mocked(getCurrentDbAccessContext).mockReturnValue({
+      scope: 'organization', orgId: 'org-1', accessibleOrgIds: ['org-1'],
+      accessiblePartnerIds: [], currentPartnerId: 'ptr-1',
+    } as any);
+    queueHierarchy([{
+      patchSettings: { id: 'ps-1' }, featureLinkId: 'fl-1', configPolicyId: 'cp-1', configPolicyName: 'P',
+      featurePolicyId: 'ring-1', assignmentTargetId: 'org-1', assignmentLevel: 'organization',
+      assignmentPriority: 0, assignmentCreatedAt: new Date(), assignmentId: 'a-1',
+    }]);
+    queueSpares(3);
+    try {
+      const resolved = await resolvePatchConfigPolicyForDevice('dev-1');
+      expect(resolved).toMatchObject({ configPolicyId: 'cp-1', featurePolicyId: 'ring-1' });
+      expect(resolved).not.toHaveProperty('resolvedTimezone');
+      expect(rec.joined).not.toContain(partners);
+      expect(runOutsideDbContext).not.toHaveBeenCalled();
+      expect(withSystemDbAccessContext).not.toHaveBeenCalled();
+    } finally {
+      vi.mocked(getCurrentDbAccessContext).mockReturnValue({ scope: 'system' } as any);
+    }
+  });
 });

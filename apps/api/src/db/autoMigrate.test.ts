@@ -15,7 +15,11 @@ const { postgresFactory, clientMock, callLog, lockState } = vi.hoisted(() => {
 
   const clientMock = Object.assign(
     vi.fn(async (strings: TemplateStringsArray, ...values: unknown[]) => {
-      callLog.push(`${strings.join('?')} | values=${JSON.stringify(values)}`);
+      const text = strings.join('?');
+      callLog.push(`${text} | values=${JSON.stringify(values)}`);
+      // The bounded acquire (#4144) reads `locked` off the try result; an
+      // uncontended lock answers true on the first attempt.
+      if (text.includes('pg_try_advisory_lock(')) return [{ locked: true }];
       return [];
     }),
     {
@@ -64,6 +68,7 @@ import {
   CHECKSUM_RECONCILIATIONS,
   planMigrations,
   partitionLedgerRows,
+  classifyExtensionLedgerRows,
   autoMigrate,
   CORE_MIGRATION_LOCK_KEY,
 } from './autoMigrate';
@@ -557,7 +562,7 @@ describe('core migration advisory lock (#4086)', () => {
   });
 
   function acquireIndex(): number {
-    return callLog.findIndex((c) => c.includes('pg_advisory_lock(') && c.includes(CORE_MIGRATION_LOCK_KEY));
+    return callLog.findIndex((c) => c.includes('pg_try_advisory_lock(') && c.includes(CORE_MIGRATION_LOCK_KEY));
   }
   function releaseIndex(): number {
     return callLog.findIndex((c) => c.includes('pg_advisory_unlock(') && c.includes(CORE_MIGRATION_LOCK_KEY));
@@ -575,6 +580,12 @@ describe('core migration advisory lock (#4086)', () => {
     // after it except closing the connection.
     expect(releaseIndex()).toBe(callLog.length - 1);
     expect(clientMock.end).toHaveBeenCalledTimes(1);
+  });
+
+  it('never issues the blocking pg_advisory_lock — a wedged holder must not stall boot forever (#4144)', async () => {
+    await autoMigrate();
+
+    expect(callLog.some((c) => /\bpg_advisory_lock\(/.test(c))).toBe(false);
   });
 
   it('still releases the lock (and closes the connection) when a migration step throws', async () => {
@@ -672,6 +683,42 @@ describe('migration filename conventions', () => {
     // B and C are ordinary transactional files.
     expect(hasNoTransactionDirective(readFileSync(path.join(dir, files[b]!), 'utf8'))).toBe(false);
     expect(hasNoTransactionDirective(readFileSync(path.join(dir, files[c]!), 'utf8'))).toBe(false);
+  });
+
+  it('#4547 W01: the block-hours migrations sort 100000 < 100100 < 100200 < 100300; the enum file is one statement; only the time_entries file is no-transaction and validates its constraints', () => {
+    const dir = path.join(__dirname, '../../migrations');
+    const names = [
+      '2026-12-17-100000-contract-line-type-hour-block.sql',
+      '2026-12-17-100100-contract-lines-hour-block.sql',
+      '2026-12-17-100200-contract-hour-periods.sql',
+      '2026-12-17-100300-time-entries-contract-line.sql',
+    ];
+    const sorted = readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort((a, b) => a.localeCompare(b));
+    const at = names.map((n) => sorted.indexOf(n));
+    expect(at.every((i) => i > -1)).toBe(true);
+    expect([...at].sort((a, b) => a - b)).toEqual(at);
+    // The block-hours files sit after the ceiling they were implemented against.
+    expect(names[0]!.localeCompare('2026-12-15-100000-portal-hardware-inventory-flag.sql')).toBeGreaterThan(0);
+    const body = (n: string) => readFileSync(path.join(dir, n), 'utf8');
+    // A value added by ADD VALUE cannot be used in the same transaction, so this file holds nothing else.
+    expect(splitSqlStatements(body(names[0]!))).toEqual([
+      "ALTER TYPE public.contract_line_type ADD VALUE IF NOT EXISTS 'hour_block'",
+    ]);
+    expect(names.map((n) => hasNoTransactionDirective(body(n)))).toEqual([false, false, false, true]);
+    // The hot-table file adds NOT VALID and validates as separate statements.
+    const entries = splitSqlStatements(body(names[3]!));
+    expect(entries.filter((s) => /VALIDATE CONSTRAINT/.test(s))).toHaveLength(3);
+    expect(entries.some((s) => /\bNOT VALID\b/.test(s))).toBe(true);
+    expect(entries.some((s) => /^SET lock_timeout/i.test(s))).toBe(true);
+    // The CONCURRENTLY build runs without the timeout (RESET first), and an
+    // INVALID leftover makes the file fail instead of being recorded as applied.
+    const reset = entries.findIndex((s) => /^RESET lock_timeout/i.test(s));
+    const cic = entries.findIndex((s) => /CREATE INDEX CONCURRENTLY/i.test(s));
+    expect(reset).toBeGreaterThan(-1);
+    expect(cic).toBeGreaterThan(reset);
+    expect(entries.slice(cic + 1).some((s) => /NOT i\.indisvalid/.test(s) && /RAISE EXCEPTION/.test(s))).toBe(true);
+    // No file writes a row (no scope election needed).
+    for (const n of names) expect(body(n)).not.toMatch(/^\s*(INSERT\s+INTO|UPDATE\s+\w|DELETE\s+FROM)\b/im);
   });
 
   it('adds no new migration to the closed 2026-08-06 reserved block', () => {
@@ -977,6 +1024,19 @@ describe('migration ordering vs a remote ref (--against-ref, pre-push guard)', (
 });
 
 describe('core migration ordering', () => {
+  it('defers the immutable CloudCom index until its upstream column exists', () => {
+    const index = '2026-10-14-223000-cloudcom-monitor-lookup-indexes.sql';
+    const dependency = '2026-10-16-181300-monitor-coverage-kinds.sql';
+    const files = ['0001-baseline.sql', index, '2026-10-15-other.sql', dependency, '2026-10-17-other.sql'];
+    const original = [...files];
+    const names = planMigrations(files).map((entry) => entry.ledgerName);
+    expect(files).toEqual(original);
+    expect(names).toEqual([files[0], files[2], dependency, index, files[4]]);
+    expect(planMigrations(names).map((entry) => entry.ledgerName)).toEqual(names);
+    expect(() => planMigrations([index])).toThrow('Missing migration prerequisite');
+    expect(planMigrations(['0001-baseline.sql'])).toHaveLength(1);
+  });
+
   it('discovers the report site-scope migration exactly once in lexical order', () => {
     const ledgerNames = planMigrations(listMigrationFilenames()).map(
       (migration) => migration.ledgerName,
@@ -984,7 +1044,12 @@ describe('core migration ordering', () => {
     const reserved = '2026-08-06-a-report-site-scope.sql';
 
     expect(ledgerNames.filter((filename) => filename === reserved)).toHaveLength(1);
-    expect(ledgerNames).toEqual([...ledgerNames].sort((a, b) => a.localeCompare(b)));
+    const indexMigration = '2026-10-14-223000-cloudcom-monitor-lookup-indexes.sql';
+    const lexical = ledgerNames.filter((name) => name !== indexMigration);
+    expect(lexical).toEqual([...lexical].sort((a, b) => a.localeCompare(b)));
+    expect(ledgerNames.indexOf(indexMigration)).toBe(
+      ledgerNames.indexOf('2026-10-16-181300-monitor-coverage-kinds.sql') + 1,
+    );
     // This file opens the reserved block. The block's membership is guarded by
     // 'migration filename conventions' above — deliberately NOT here, so a
     // squatter reds a test whose name says what is wrong instead of this one.
@@ -1389,6 +1454,47 @@ describe('extension-owned ledger rows', () => {
     expect(verify).toEqual(['0001-core.sql']);
     expect(skip).toEqual(['workspace/2026-07-10-a.sql', 'ghost/2026-01-01-x.sql']);
   });
+
+  // #10357: check-drift reported every `workspace/*` row as "belongs to an
+  // extension not present on disk" even with ee/workspace/migrations/ present,
+  // because it never looked for the file. Only a genuinely missing file is absent.
+  it('classifies extension ledger rows by whether the extension file exists on disk', () => {
+    const onDisk = new Set(['workspace/2026-07-10-a.sql']);
+    const seen: Array<[string, string]> = [];
+    const { present, absent } = classifyExtensionLedgerRows(
+      ['workspace/2026-07-10-a.sql', 'workspace/2026-07-11-removed.sql', 'ghost/2026-01-01-x.sql'],
+      (extension, filename) => {
+        seen.push([extension, filename]);
+        return onDisk.has(`${extension}/${filename}`);
+      },
+    );
+
+    expect(present).toEqual(['workspace/2026-07-10-a.sql']);
+    expect(absent).toEqual(['workspace/2026-07-11-removed.sql', 'ghost/2026-01-01-x.sql']);
+    expect(seen).toEqual([
+      ['workspace', '2026-07-10-a.sql'],
+      ['workspace', '2026-07-11-removed.sql'],
+      ['ghost', '2026-01-01-x.sql'],
+    ]);
+  });
+
+  it('treats a malformed or path-escaping extension ledger row as absent without probing disk', () => {
+    const probe = vi.fn(() => true);
+    const { present, absent } = classifyExtensionLedgerRows(
+      ['/2026-07-10-a.sql', 'workspace/', 'workspace/../../etc/passwd', 'a/b/c.sql', '0001-core.sql'],
+      probe,
+    );
+
+    expect(present).toEqual([]);
+    expect(absent).toEqual([
+      '/2026-07-10-a.sql',
+      'workspace/',
+      'workspace/../../etc/passwd',
+      'a/b/c.sql',
+      '0001-core.sql',
+    ]);
+    expect(probe).not.toHaveBeenCalled();
+  });
 });
 
 // #2787 wave 04 — the device_lifecycle retention feature needs a config-policy
@@ -1509,4 +1615,89 @@ describe('filesystem scan_path contraction (Disk Cleanup v2 W03)', () => {
 it('keeps the retirement migration scoped to legacy source columns', () => {
   const sql = readFileSync(new URL('../../migrations/2026-10-23-120000-legacy-source-retirement-columns.sql', import.meta.url), 'utf8');
   expect(sql).not.toMatch(/ALTER\s+TABLE\s+(?:public\.)?monitor_definitions\b/i);
+});
+
+describe('webhook payload version migration', () => {
+  it('preserves legacy versions before changing the new-webhook default, without row writes', () => {
+    const migration = readFileSync(new URL('../../migrations/2027-01-12-100000-webhook-payload-version.sql', import.meta.url), 'utf8');
+    expect(migration).toContain('ALTER TABLE public.webhooks ADD COLUMN IF NOT EXISTS payload_version smallint NOT NULL DEFAULT 1;');
+    expect(migration).toContain("conrelid = 'public.webhooks'::regclass");
+    expect(migration).toContain("conname = 'webhooks_payload_version_chk'");
+    expect(migration).toContain('CHECK (payload_version IN (1, 2))');
+    expect(migration.indexOf('DEFAULT 1')).toBeLessThan(migration.indexOf('SET DEFAULT 2'));
+    expect(migration).toContain('ALTER TABLE public.webhook_deliveries ADD COLUMN IF NOT EXISTS payload_version smallint NOT NULL DEFAULT 1;');
+    expect(migration).toContain('ADD COLUMN IF NOT EXISTS event_timestamp timestamptz NULL;');
+    expect(migration).toContain('ADD COLUMN IF NOT EXISTS replay_root_event_id varchar(100) NULL;');
+    const statements = migration.replace(/--[^\n]*/g, '');
+    expect(statements).not.toMatch(/\b(?:UPDATE|INSERT|DELETE|COMMIT)\b|BEGIN;/i);
+    expect(statements).toContain("conname = 'webhook_deliveries_payload_version_chk'");
+    expect(statements).toContain("conrelid = 'public.webhook_deliveries'::regclass");
+    expect(statements).toMatch(/ADD CONSTRAINT webhook_deliveries_payload_version_chk CHECK \(payload_version IN \(1, 2\)\) NOT VALID;/);
+    expect(statements).not.toMatch(/VALIDATE CONSTRAINT/i);
+  });
+  it('models defaults, the webhook check, and nullable persisted wire identity in Drizzle', async () => {
+    const { webhooks, webhookDeliveries } = await import('./schema/integrations');
+    expect(webhooks.payloadVersion.default).toBe(2);
+    expect(webhooks.payloadVersion.notNull).toBe(true);
+    expect(getTableConfig(webhooks).checks.map(check => check.name)).toContain('webhooks_payload_version_chk');
+    expect(webhookDeliveries.payloadVersion.default).toBe(1);
+    expect(getTableConfig(webhookDeliveries).checks.map(check => check.name)).toContain('webhook_deliveries_payload_version_chk');
+    expect(webhookDeliveries.eventTimestamp.notNull).toBe(false);
+    expect(webhookDeliveries.replayRootEventId.notNull).toBe(false);
+  });
+});
+
+describe('webhook scheduled delivery migrations', () => {
+  const enumName = '2027-01-12-300000-webhook-delivery-scheduled-enum.sql';
+  const indexName = '2027-01-12-300100-webhook-delivery-scheduled-indexes.sql';
+  const evidenceName = '2027-01-12-300200-webhook-delivery-failed-at-generation.sql';
+  it('adds terminal time and recorded generation without backfilling rows', () => {
+    const content = readFileSync(path.resolve(__dirname, '../../migrations', evidenceName), 'utf8');
+    expect(content.startsWith('-- @no-transaction\n')).toBe(true);
+    const statements = content.replace(/--[^\n]*/g, '');
+    expect(statements).toContain('ALTER TABLE public.webhook_deliveries ADD COLUMN IF NOT EXISTS failed_at timestamp NULL;');
+    expect(statements).toContain('ALTER TABLE public.webhook_deliveries ADD COLUMN IF NOT EXISTS webhook_generation integer NULL;');
+    expect(statements).toMatch(/CREATE INDEX CONCURRENTLY IF NOT EXISTS webhook_deliveries_failed_at_recent_idx\s+ON public.webhook_deliveries \(failed_at\)\s+WHERE status = 'failed';/);
+    expect(statements).toContain('DROP INDEX CONCURRENTLY IF EXISTS public.webhook_deliveries_failed_recent_idx;');
+    expect(statements).toContain("('public.webhook_deliveries'::regclass, 'webhook_deliveries_failed_at_recent_idx')");
+    expect(statements).toContain('WHERE NOT i.indisvalid');
+    expect(statements).toContain('RAISE EXCEPTION');
+    expect(statements).not.toMatch(/\b(?:UPDATE|INSERT|DELETE|COMMIT)\b|BEGIN;/i);
+    expect([evidenceName, indexName].sort((a, b) => a.localeCompare(b))).toEqual([indexName, evidenceName]);
+  });
+  it('models nullable terminal time and generation and the replacement index in Drizzle', async () => {
+    const { webhookDeliveries } = await import('./schema/integrations');
+    expect(webhookDeliveries.failedAt?.name).toBe('failed_at');
+    expect(webhookDeliveries.failedAt?.getSQLType()).toBe('timestamp');
+    expect(webhookDeliveries.failedAt?.notNull).toBe(false);
+    expect(webhookDeliveries.webhookGeneration?.name).toBe('webhook_generation');
+    expect(webhookDeliveries.webhookGeneration?.getSQLType()).toBe('integer');
+    expect(webhookDeliveries.webhookGeneration?.notNull).toBe(false);
+    const indexes = getTableConfig(webhookDeliveries).indexes.map(index => index.config.name);
+    expect(indexes).toContain('webhook_deliveries_failed_at_recent_idx');
+    expect(indexes).not.toContain('webhook_deliveries_failed_recent_idx');
+  });
+  it('adds the guarded enum value without using it in the same transaction', () => {
+    const content = readFileSync(path.resolve(__dirname, '../../migrations', enumName), 'utf8');
+    const statements = content.replace(/--[^\n]*/g, '');
+    expect(statements).toContain("IF EXISTS (SELECT 1 FROM pg_type WHERE typname = 'webhook_delivery_status') THEN");
+    expect(statements).toContain("ALTER TYPE webhook_delivery_status ADD VALUE IF NOT EXISTS 'scheduled';");
+    expect(statements.match(/'scheduled'/g)).toHaveLength(1);
+    expect(statements).not.toMatch(/CREATE INDEX|\b(?:UPDATE|INSERT|DELETE|COMMIT)\b|BEGIN;/i);
+  });
+  it('builds the partial due index concurrently and rejects an invalid build', () => {
+    const content = readFileSync(path.resolve(__dirname, '../../migrations', indexName), 'utf8');
+    expect(content.startsWith('-- @no-transaction\n')).toBe(true);
+    const statements = content.replace(/--[^\n]*/g, '');
+    expect(statements).toMatch(/CREATE INDEX CONCURRENTLY IF NOT EXISTS webhook_deliveries_scheduled_due_idx\s+ON public.webhook_deliveries \(next_retry_at\)\s+WHERE status = 'scheduled';/);
+    expect(statements).toContain('WHERE NOT i.indisvalid');
+    expect(statements).toContain('RAISE EXCEPTION');
+    expect(statements).not.toMatch(/\b(?:UPDATE|INSERT|DELETE|COMMIT)\b|BEGIN;/i);
+  });
+  it('orders the enum before the index and models scheduled in Drizzle', async () => {
+    expect([indexName, enumName].sort((a, b) => a.localeCompare(b))).toEqual([enumName, indexName]);
+    const { webhookDeliveryStatusEnum, webhookDeliveries } = await import('./schema/integrations');
+    expect(webhookDeliveryStatusEnum.enumValues).toEqual(['pending', 'delivered', 'failed', 'retrying', 'scheduled']);
+    expect(getTableConfig(webhookDeliveries).indexes.map(index => index.config.name)).toContain('webhook_deliveries_scheduled_due_idx');
+  });
 });

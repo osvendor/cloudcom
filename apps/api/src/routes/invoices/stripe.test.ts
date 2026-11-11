@@ -15,12 +15,14 @@ vi.mock('../../services/stripeSessionRevocation', () => ({
 vi.mock('../../services/auditEvents', () => ({ writeRouteAudit: vi.fn() }));
 vi.mock('../../services/clientIp', () => ({ getTrustedClientIpOrUndefined: () => '203.0.113.9' }));
 vi.mock('../../db', () => ({
+  withSystemDbAccessContext: (fn: () => unknown) => fn(),
   db: {
-    select: () => ({ from: () => ({ where: () => ({ limit: async () => selectRows.value }) }) }),
+    select: (...args: unknown[]) => { selectSpy(...args); return { from: () => ({ where: () => ({ limit: async () => selectRows.value }) }) }; },
   },
 }));
 
 const selectRows: { value: unknown[] } = { value: [] };
+const selectSpy = vi.hoisted(() => vi.fn());
 vi.mock('../../services/invoiceTypes', () => ({
   InvoiceServiceError: class InvoiceServiceError extends Error {
     constructor(msg: string, public status = 400, public code?: string) { super(msg); }
@@ -58,6 +60,23 @@ describe('POST /invoices/:id/pay-link', () => {
     expect(payLink).toHaveBeenCalledWith(ID, expect.objectContaining({ partnerId: 'p1' }));
   });
 
+  it('maps BILLING_DISABLED from the service to the unified 404 body', async () => {
+    payLink.mockRejectedValueOnce(new InvoiceServiceError('Not found', 404, 'BILLING_DISABLED'));
+    const res = await app().request(`/${ID}/pay-link`, { method: 'POST' });
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ error: 'Not found', code: 'BILLING_DISABLED' });
+  });
+
+  it('does not read the invoice itself before the service checks access (no billing-state oracle)', async () => {
+    selectRows.value = [{ orgId: 'org-1' }];
+    payLink.mockResolvedValue({ url: 'https://checkout.stripe.com/c/pay/on' });
+    const res = await app().request(`/${ID}/pay-link`, { method: 'POST' });
+    expect(res.status).toBe(200);
+    expect(selectSpy).not.toHaveBeenCalled();
+    expect(payLink).toHaveBeenCalledTimes(1);
+    selectRows.value = [];
+  });
+
   it('surfaces the currency-mismatch warning verbatim to the partner (warn-don\'t-block)', async () => {
     const warning = {
       code: 'CURRENCY_DIFFERS_FROM_STRIPE_ACCOUNT' as const, documentCurrency: 'EUR', accountCurrency: 'USD',
@@ -91,7 +110,7 @@ describe('POST /invoices/:id/pay-link', () => {
 });
 
 /**
- * SEC-150 operator override. Accepting that a Checkout session may still be
+ * Operator override. Accepting that a Checkout session may still be
  * payable on Stripe while Breeze proceeds as if it were not is a BILLING
  * decision, not a send action — so it carries billing:manage, a required reason,
  * and an audit row. The abandon semantics themselves (what the blocked row does

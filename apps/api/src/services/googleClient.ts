@@ -22,47 +22,30 @@ import { admin, auth as adminAuth, type admin_directory_v1 } from '@googleapis/a
 import { gmail, auth as gmailAuth, type gmail_v1 } from '@googleapis/gmail';
 import { calendar, auth as calendarAuth, type calendar_v3 } from '@googleapis/calendar';
 import { licensing, auth as licensingAuth, type licensing_v1 } from '@googleapis/licensing';
+import {
+  DIRECTORY_SCOPES,
+  DIRECTORY_DOMAIN_SCOPES,
+  GMAIL_USER_SCOPES,
+  GMAIL_INBOUND_SCOPES,
+  GMAIL_INBOUND_MODIFY_SCOPES,
+  CALENDAR_SCOPES,
+  LICENSING_SCOPES,
+  REPORTS_SCOPES,
+  AUDIT_REPORTS_SCOPES,
+  GOOGLE_DWD_SCOPES_CSV,
+} from '@breeze/shared';
 
-// Least-privilege scope sets. Keep these minimal; the DWD grant authorizes
-// exactly this union, so widening here widens the god-key.
-export const DIRECTORY_SCOPES = [
-  'https://www.googleapis.com/auth/admin.directory.user', // read + update user (password, suspend, profile)
-  'https://www.googleapis.com/auth/admin.directory.user.security', // signOut, 2SV state, OAuth token revoke
-  'https://www.googleapis.com/auth/admin.directory.user.alias', // aliases
-  'https://www.googleapis.com/auth/admin.directory.group', // list a user's groups (offboard)
-  'https://www.googleapis.com/auth/admin.directory.group.member', // remove from groups (offboard)
-  'https://www.googleapis.com/auth/admin.directory.device.mobile.action', // selective account-wipe / stolen-device wipe
-] as const;
+// Least-privilege DWD scope sets live in @breeze/shared (one list shared with the
+// web integration page). Re-exported here for existing API callers.
+export { DIRECTORY_SCOPES, DIRECTORY_DOMAIN_SCOPES, GMAIL_USER_SCOPES, GMAIL_INBOUND_SCOPES, GMAIL_INBOUND_MODIFY_SCOPES, CALENDAR_SCOPES, LICENSING_SCOPES, REPORTS_SCOPES, AUDIT_REPORTS_SCOPES };
+export const ALL_DWD_SCOPES_CSV = GOOGLE_DWD_SCOPES_CSV;
 
-export const GMAIL_USER_SCOPES = [
-  'https://www.googleapis.com/auth/gmail.settings.basic', // vacation responder
-  'https://www.googleapis.com/auth/gmail.settings.sharing', // forwarding addresses + auto-forwarding
-] as const;
-
-export const CALENDAR_SCOPES = [
-  'https://www.googleapis.com/auth/calendar.acls', // share a calendar (ACL insert), nothing more
-] as const;
-
-export const LICENSING_SCOPES = [
-  'https://www.googleapis.com/auth/apps.licensing', // assign / list / remove Workspace license assignments
-] as const;
-
-export const REPORTS_SCOPES = [
-  'https://www.googleapis.com/auth/admin.reports.usage.readonly',
-] as const;
-export const AUDIT_REPORTS_SCOPES = [
-  'https://www.googleapis.com/auth/admin.reports.audit.readonly',
-] as const;
-
-/** Comma-separated scope list for the operator's DWD setup instructions. */
-export const ALL_DWD_SCOPES_CSV = [
-  ...DIRECTORY_SCOPES,
-  ...GMAIL_USER_SCOPES,
-  ...CALENDAR_SCOPES,
-  ...LICENSING_SCOPES,
-  ...REPORTS_SCOPES,
-  ...AUDIT_REPORTS_SCOPES,
-].join(',');
+// Explicit per-request deadline for every Gmail/UserInfo call. gaxios has no
+// finite default, so a hung Google connection would never settle — and the ticket
+// mailbox poll worker sweeps mailboxes serially, so one hung request would stall
+// every later mailbox. With a timeout the request rejects, the per-mailbox catch in
+// runMailboxSweep records it, and the sweep moves on.
+export const GMAIL_REQUEST_TIMEOUT_MS = 30_000;
 
 /** Separate read-only token for the Admin Reports activity API. */
 export function getAuditReportsClient(decryptedKeyJson: string, adminEmail: string) {
@@ -131,6 +114,25 @@ export function getDirectoryClient(
 }
 
 /**
+ * Admin SDK Directory client for the domains list ONLY (portal domain
+ * verification). Requests just admin.directory.domain.readonly, so the broad
+ * getDirectoryClient scope set is unchanged. Impersonates the super-admin.
+ */
+export function getDirectoryDomainsClient(
+  decryptedKeyJson: string,
+  adminEmail: string,
+): admin_directory_v1.Admin {
+  const key = parseServiceAccountKey(decryptedKeyJson);
+  const auth = new adminAuth.JWT({
+    email: key.client_email,
+    key: key.private_key,
+    scopes: [...DIRECTORY_DOMAIN_SCOPES],
+    subject: adminEmail, // DWD: impersonate the super-admin
+  });
+  return admin({ version: 'directory_v1', auth });
+}
+
+/**
  * Gmail client impersonating the TARGET end user (not the admin). Used for
  * per-mailbox settings: forwarding, vacation responder.
  */
@@ -145,7 +147,110 @@ export function getGmailClient(
     scopes: [...GMAIL_USER_SCOPES],
     subject: targetUserEmail, // DWD: impersonate the end user
   });
-  return gmail({ version: 'v1', auth });
+  return gmail({ version: 'v1', auth, timeout: GMAIL_REQUEST_TIMEOUT_MS });
+}
+
+/**
+ * Gmail client for the inbound ticket connector, impersonating the target
+ * mailbox via DWD. Requests only GMAIL_INBOUND_SCOPES (gmail.readonly plus the
+ * identity scopes) — not the settings scopes getGmailClient uses.
+ */
+export interface MailboxIdentity {
+  /** The impersonated account's immutable Google `sub` (opaque string; NEVER a
+   *  number). Stable across email/alias changes and never reused. */
+  sub: string;
+  /** The account's primary email as Google reports it (cross-check only). */
+  email: string | null;
+}
+
+/**
+ * ONE inbound DWD session for a mailbox: a single JWT (one impersonation subject,
+ * one token) that serves BOTH the Gmail client and the OpenID identity read. Using
+ * one session is the point — the history cursor and the immutable `sub` are then
+ * bound to the SAME credential/token and cannot straddle an address reassignment
+ * between two separately-minted requests.
+ */
+export interface InboundMailboxSession {
+  gmail: gmail_v1.Gmail;
+  /** Read the impersonated account's immutable identity via this session's token. */
+  identity(): Promise<MailboxIdentity>;
+}
+
+/**
+ * DWD session used ONLY to mark an ingested message handled (label + optional
+ * archive). Requests gmail.modify plus the identity scopes the read session
+ * already uses (openid, userinfo.email) and never gmail.readonly, and is separate
+ * from the read session so a missing modify grant fails only the best-effort
+ * label call, never ingestion. Its identity() reads the account sub through the
+ * SAME token that performs the modify, so the caller can prove the mailbox is
+ * still the account the message was ingested from. Only built for a mailbox
+ * connection that has a handled label set.
+ */
+export function getInboundModifyGmailClient(
+  decryptedKeyJson: string,
+  targetMailboxEmail: string,
+  signal?: AbortSignal,
+): InboundMailboxSession {
+  return buildInboundSession(decryptedKeyJson, targetMailboxEmail, [
+    ...GMAIL_INBOUND_MODIFY_SCOPES,
+    ...GMAIL_INBOUND_SCOPES.filter((sc) => sc !== 'https://www.googleapis.com/auth/gmail.readonly'),
+  ], GMAIL_MODIFY_REQUEST_TIMEOUT_MS, signal);
+}
+
+export function getInboundMailboxSession(
+  decryptedKeyJson: string,
+  targetMailboxEmail: string,
+): InboundMailboxSession {
+  return buildInboundSession(decryptedKeyJson, targetMailboxEmail, [...GMAIL_INBOUND_SCOPES]);
+}
+
+/** Per-request timeout for the best-effort mark-handled session: short, because
+ *  a slow request holds the (concurrency-1) mark-handled worker. */
+export const GMAIL_MODIFY_REQUEST_TIMEOUT_MS = 8_000;
+
+function buildInboundSession(
+  decryptedKeyJson: string,
+  targetMailboxEmail: string,
+  scopes: string[],
+  timeoutMs: number = GMAIL_REQUEST_TIMEOUT_MS,
+  signal?: AbortSignal,
+): InboundMailboxSession {
+  const key = parseServiceAccountKey(decryptedKeyJson);
+  const auth = new gmailAuth.JWT({
+    email: key.client_email,
+    key: key.private_key,
+    scopes,
+    subject: targetMailboxEmail, // DWD: impersonate the mailbox
+  });
+  return {
+    // `signal` (optional) aborts every request of this session at once, so a
+    // caller can bound the whole operation, not just each request.
+    gmail: gmail({ version: 'v1', auth, timeout: timeoutMs, ...(signal ? { signal } : {}) }),
+    async identity(): Promise<MailboxIdentity> {
+      // `openid` makes the DWD token carry the impersonated user's identity; the
+      // OpenID UserInfo endpoint returns that account's immutable `sub`. Uses the
+      // JWT auth client's own authenticated request (it extends OAuth2Client) so no
+      // extra @googleapis package is pulled in.
+      const res = await auth.request<{ sub?: unknown; email?: unknown }>({
+        url: 'https://openidconnect.googleapis.com/v1/userinfo',
+        timeout: timeoutMs,
+        ...(signal ? { signal } : {}),
+      });
+      const sub = res.data?.sub;
+      if (typeof sub !== 'string' || sub.length === 0) {
+        throw new Error('Google UserInfo returned no immutable account sub');
+      }
+      const email = typeof res.data?.email === 'string' ? res.data.email : null;
+      return { sub, email };
+    },
+  };
+}
+
+export function getInboundGmailClient(
+  decryptedKeyJson: string,
+  targetMailboxEmail: string,
+): gmail_v1.Gmail {
+  return getInboundMailboxSession(decryptedKeyJson, targetMailboxEmail).gmail;
 }
 
 /**

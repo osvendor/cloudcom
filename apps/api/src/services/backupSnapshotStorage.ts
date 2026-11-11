@@ -1,5 +1,7 @@
-import { readFile, readdir, rm, stat } from 'node:fs/promises';
+import { createReadStream } from 'node:fs';
+import { opendir, readFile, rm, stat } from 'node:fs/promises';
 import { join as joinLocalPath, posix as pathPosix, resolve as resolvePath } from 'node:path';
+import { pipeline, Transform, type Readable } from 'node:stream';
 import {
   DeleteObjectsCommand,
   GetObjectCommand,
@@ -9,13 +11,17 @@ import {
   type S3Client,
 } from '@aws-sdk/client-s3';
 import { deriveS3RegionFromEndpoint } from '@breeze/shared';
-import { buildS3Client } from './recoveryMediaService';
+import { buildS3Client, type S3ClientOverrides } from './recoveryMediaService';
 import { asRecord, getStringValue } from './recoveryBootstrap';
+import { physicalKeyFor, snapshotKeyRootOf } from './backupKeyLayout';
 
 type SnapshotStorageInput = {
   provider: string | null | undefined;
   providerConfig: unknown;
   snapshotId: string;
+  /** The snapshot row's recorded key root (#7081); see snapshotStoragePrefixFor. */
+  keyLayout: unknown;
+  keyPrefix: unknown;
   metadata: unknown;
 };
 
@@ -24,6 +30,20 @@ type SnapshotStorageInput = {
 // the same keys the agent wrote, independently of any per-snapshot metadata.
 export const BACKUP_SNAPSHOT_ROOT_DIR = 'snapshots';
 export const BACKUP_SNAPSHOT_MANIFEST_KEY = 'manifest.json';
+
+// Largest manifest-shaped object read WHOLE into memory. Every such object is
+// written directly by the reporting agent at a predictable key, so its size is
+// not otherwise bounded. The snapshot manifest itself is no longer read this
+// way anywhere (file-index hydration, GC marking and orphan reconcile all
+// stream it, under MANIFEST_STREAM_MAX_BYTES); the GC still reads the much
+// smaller system-state manifest whole, under this cap.
+export const MANIFEST_FETCH_MAX_BYTES = 200 * 1024 * 1024;
+
+// Largest snapshot manifest read as a stream (#11026, #11232, #11233): about
+// 4M entries. Bounds the spool's disk use in file-index hydration; GC marking
+// and orphan reconcile read it straight from storage. Nothing holds these
+// bytes in memory.
+export const MANIFEST_STREAM_MAX_BYTES = 2 * 1024 * 1024 * 1024;
 
 export type BackupObjectListing = { key: string; lastModified: Date | null };
 export type BackupObjectDeleteResult = {
@@ -47,13 +67,29 @@ export type ProviderCapabilityStatus = {
   };
 };
 
-function buildS3StorageClient(providerConfig: Record<string, unknown>) {
+type BackupS3ClientFactory = (providerConfig: Record<string, unknown>) => Pick<S3Client, 'send'>;
+let s3ClientFactoryForTests: BackupS3ClientFactory | null = null;
+
+/**
+ * Test seam: routes this module's S3 calls (list / get / delete) to a fake
+ * client, so integration tests exercise the real key handling against an
+ * in-memory bucket (src/__tests__/helpers/inMemoryS3.ts). Never set in
+ * production code; null restores the real client.
+ */
+export function __setBackupS3ClientFactoryForTests(factory: BackupS3ClientFactory | null): void {
+  s3ClientFactoryForTests = factory;
+}
+
+export function buildS3StorageClient(providerConfig: Record<string, unknown>, overrides: S3ClientOverrides = {}) {
   const bucket = getStringValue(providerConfig, 'bucket') || getStringValue(providerConfig, 'bucketName');
   const region =
     getStringValue(providerConfig, 'region')?.trim() ||
     deriveS3RegionFromEndpoint(getStringValue(providerConfig, 'endpoint'));
   if (!bucket || !region) {
     throw new Error('S3 backup storage is misconfigured');
+  }
+  if (s3ClientFactoryForTests) {
+    return { bucket, client: s3ClientFactoryForTests(providerConfig) as S3Client };
   }
 
   return {
@@ -72,7 +108,7 @@ function buildS3StorageClient(providerConfig: Record<string, unknown>) {
         getStringValue(providerConfig, 'secretAccessKey') ||
         '',
       sessionToken: getStringValue(providerConfig, 'sessionToken') ?? undefined,
-    } as any),
+    } as any, overrides),
   };
 }
 
@@ -104,7 +140,6 @@ function ensureContainedLocalPath(rootPath: string, relativePath: string): strin
 
 function normalizeStoragePrefix(
   provider: string | null | undefined,
-  providerConfig: Record<string, unknown>,
   snapshotMetadata: Record<string, unknown>,
   snapshotId: string,
 ): string {
@@ -119,11 +154,30 @@ function normalizeStoragePrefix(
     }
   }
 
-  const configuredPrefix = getStringValue(providerConfig, 'prefix');
-  const snapshotPrefix = `snapshots/${snapshotId}`;
-  return configuredPrefix
-    ? `${configuredPrefix.replace(/^\/+|\/+$/g, '')}/${snapshotPrefix}`
-    : snapshotPrefix;
+  // #6398: deliberately NOT `providerConfig.prefix`. This function serves
+  // legacy_flat snapshots only, whose objects are at `snapshots/<id>/...`
+  // whatever the destination's prefix is now; applying the prefix here once
+  // pointed immutability and deletion at a region that held nothing. A
+  // snapshot written under a destination prefix records `prefixed_flat` and
+  // is resolved by snapshotStoragePrefixFor from its own recorded root
+  // (#7081, backupKeyLayout.ts). Only a per-snapshot recorded `storagePrefix`
+  // (above) may relocate a legacy snapshot.
+  return `${BACKUP_SNAPSHOT_ROOT_DIR}/${snapshotId}`;
+}
+
+/**
+ * The storage prefix a snapshot's objects live under, from its RECORDED key
+ * root (#7081 I1): `<prefix>/snapshots/<id>` for prefixed_flat, which never
+ * consults helper-reported metadata; for legacy_flat, exactly what it has
+ * always been (normalizeStoragePrefix). A root this server cannot read is
+ * refused before any storage call (I5).
+ */
+function snapshotStoragePrefixFor(input: SnapshotStorageInput, provider: string | null): string {
+  const root = snapshotKeyRootOf({ keyLayout: input.keyLayout, keyPrefix: input.keyPrefix });
+  if (!root) throw new Error(`Snapshot ${input.snapshotId} has a storage key root this server cannot read`);
+  if (root.layout === 'legacy_flat') return normalizeStoragePrefix(provider, asRecord(input.metadata), input.snapshotId);
+  if (provider !== 's3') throw new Error(`Snapshot ${input.snapshotId} has a prefixed storage key root on a non-S3 destination`);
+  return physicalKeyFor(root, `${BACKUP_SNAPSHOT_ROOT_DIR}/${input.snapshotId}`);
 }
 
 function normalizeObjectPrefix(storagePrefix: string): string {
@@ -141,18 +195,15 @@ function keyMatchesSnapshotPrefix(key: string, normalizedPrefix: string): boolea
 // "snapshot root" GC lists once per storage identity, and the manifest key
 // GC expects every retained snapshot to have.
 //
-// KNOWN GAP: these deliberately IGNORE `providerConfig.prefix` entirely — the agent
-// (agent/internal/backup/snapshot.go's snapshotRootDir) writes every object
-// under `snapshots/<id>/...` VERBATIM regardless of any configured prefix,
-// so applying a prefix here made GC 404 on manifest fetches for any
-// destination with a configured prefix. If/when the agent gains real prefix
-// support, this function and the agent's snapshotRootDir usage must change
-// TOGETHER — applying a prefix on only one side either 404s manifest fetches
-// (GC prefixed, agent didn't) or sweeps/lists the wrong bucket region
-// (agent prefixed, GC didn't). This is also why GC groups destinations by
-// storage identity EXCLUDING prefix (see backupRetention.ts) — two configs
-// that only differ by a cosmetically-configured prefix are, in reality, the
-// exact same physical object namespace as far as the agent is concerned.
+// These return LOGICAL keys (`snapshots/...`), the keys the helper writes
+// and manifests reference. Callers compose physical keys through the
+// snapshot's recorded key root (#7081: backupKeyLayout.ts, and
+// backupRootedStorage.ts for GC and reconcile, which list and sweep one root
+// at a time). The destination's `providerConfig.prefix` is never read here;
+// it is read once, when a new snapshot id is reserved (keyRootForNewSnapshot).
+// GC groups destinations by storage identity EXCLUDING the prefix: the
+// prefix selects a key root inside the identity, never another identity.
+// Do not re-introduce a config-level prefix on any one reader.
 
 export function backupSnapshotRootPrefix(): string {
   return BACKUP_SNAPSHOT_ROOT_DIR;
@@ -188,11 +239,18 @@ export function backupLayoutManifestKey(snapshotId: string): string {
 }
 
 // ── GC support: list objects with last-modified ──────────────────────────────
+//
+// #6834: listing is STREAMED page by page. A single customer bucket can hold
+// millions of keys under `snapshots/`; materialising them into one array (the
+// pre-#6834 shape) drove US prod API RSS from ~0.85 GB to 2.7 GB on every GC
+// run and got the process OOM-killed. Callers that genuinely need the whole
+// listing at once use listBackupObjectsUnderPrefix (a thin collector over the
+// iterator) and must only do so for bounded namespaces.
 
-async function listS3ObjectsWithLastModified(
+async function* iterateS3ObjectsWithLastModified(
   providerConfig: Record<string, unknown>,
   prefix: string,
-): Promise<BackupObjectListing[]> {
+): AsyncGenerator<BackupObjectListing[]> {
   const { bucket, client } = buildS3StorageClient(providerConfig);
   // A bare "snapshots" Prefix string-matches
   // ANY key that merely starts with those characters — e.g. "snapshots-old/db.dump"
@@ -202,7 +260,6 @@ async function listS3ObjectsWithLastModified(
   // namespace, same guard `keyMatchesSnapshotPrefix` (above) applies for
   // per-snapshot prefixes elsewhere in this file.
   const normalizedPrefix = `${normalizeObjectPrefix(prefix)}/`;
-  const results: BackupObjectListing[] = [];
 
   let continuationToken: string | undefined;
   do {
@@ -212,6 +269,7 @@ async function listS3ObjectsWithLastModified(
       ContinuationToken: continuationToken,
     }));
 
+    const page: BackupObjectListing[] = [];
     for (const item of listed.Contents ?? []) {
       // Defense-in-depth: AWS's own Prefix filtering is authoritative, but
       // don't rely on it exclusively — a misbehaving or (in tests) mocked
@@ -222,7 +280,7 @@ async function listS3ObjectsWithLastModified(
         item.Key.length > 0 &&
         item.Key.startsWith(normalizedPrefix)
       ) {
-        results.push({
+        page.push({
           key: item.Key,
           lastModified: item.LastModified instanceof Date ? item.LastModified : null,
         });
@@ -230,15 +288,17 @@ async function listS3ObjectsWithLastModified(
     }
 
     continuationToken = listed.IsTruncated ? listed.NextContinuationToken : undefined;
+    if (page.length > 0) yield page;
   } while (continuationToken);
-
-  return results;
 }
 
-async function listLocalObjectsWithLastModified(
+// Matches S3 ListObjectsV2's default MaxKeys so both providers page alike.
+const LOCAL_LISTING_PAGE_SIZE = 1000;
+
+async function* iterateLocalObjectsWithLastModified(
   providerConfig: Record<string, unknown>,
   prefix: string,
-): Promise<BackupObjectListing[]> {
+): AsyncGenerator<BackupObjectListing[]> {
   const rootPath = getStringValue(providerConfig, 'path') || getStringValue(providerConfig, 'basePath');
   if (!rootPath) {
     throw new Error('Local backup storage is misconfigured');
@@ -246,88 +306,171 @@ async function listLocalObjectsWithLastModified(
 
   const normalizedPrefix = pathPosix.normalize(prefix).replace(/^\/+/, '');
   const targetPath = ensureContainedLocalPath(rootPath, normalizedPrefix);
-  const results: BackupObjectListing[] = [];
 
-  async function walk(dirPath: string, keyPrefix: string): Promise<void> {
-    let entries;
+  // #6843: entries are pulled one at a time from fs.opendir's async-iterable
+  // Dir handle, not from fs.readdir({ withFileTypes: true }) — readdir
+  // materializes the ENTIRE directory's entries into one array before
+  // returning, so a single snapshot prefix with millions of files would hold
+  // all of them in memory at once even though this walk only ever needs
+  // LOCAL_LISTING_PAGE_SIZE at a time. Depth-first, in directory-iteration
+  // order (the same key order the pre-#6834 array walk produced): consecutive
+  // files are batched into one page, flushed before descending into a
+  // subdirectory.
+  async function* walk(dirPath: string, keyPrefix: string): AsyncGenerator<BackupObjectListing[]> {
+    let dir;
     try {
-      entries = await readdir(dirPath, { withFileTypes: true });
+      dir = await opendir(dirPath);
     } catch (error) {
       if ((error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') return;
       throw error;
     }
 
-    for (const entry of entries) {
+    let files: BackupObjectListing[] = [];
+    for await (const entry of dir) {
       const childKey = keyPrefix ? `${keyPrefix}/${entry.name}` : entry.name;
       const childPath = joinLocalPath(dirPath, entry.name);
       if (entry.isDirectory()) {
-        await walk(childPath, childKey);
+        if (files.length > 0) { yield files; files = []; }
+        yield* walk(childPath, childKey);
       } else if (entry.isFile()) {
         const info = await stat(childPath);
-        results.push({ key: childKey, lastModified: info.mtime });
+        files.push({ key: childKey, lastModified: info.mtime });
+        if (files.length >= LOCAL_LISTING_PAGE_SIZE) { yield files; files = []; }
       }
     }
+    if (files.length > 0) yield files;
   }
 
-  await walk(targetPath, normalizedPrefix);
-  return results;
+  yield* walk(targetPath, normalizedPrefix);
 }
 
 /**
- * Lists every object under a destination's snapshot root, including
- * last-modified so GC can enforce the grace window. Throws for providers
- * this GC path doesn't support — callers must treat that as "skip this
- * destination" (fail-closed: no age data means no safe sweep decision).
+ * Streams every object under a destination prefix, one page at a time,
+ * including last-modified so GC can enforce the grace window. Page
+ * boundaries and ordering are provider-defined — callers must not assume
+ * all keys of one snapshot arrive contiguously. Throws (on first iteration)
+ * for providers this GC path doesn't support — callers must treat that as
+ * "skip this destination" (fail-closed: no age data means no safe sweep
+ * decision).
+ */
+export async function* iterateBackupObjectsUnderPrefix(input: {
+  provider: string | null | undefined;
+  providerConfig: unknown;
+  prefix: string;
+}): AsyncGenerator<BackupObjectListing[]> {
+  const provider = input.provider ?? null;
+  const providerConfig = asRecord(input.providerConfig);
+  if (provider === 's3') {
+    yield* iterateS3ObjectsWithLastModified(providerConfig, input.prefix);
+    return;
+  }
+  if (provider === 'local') {
+    yield* iterateLocalObjectsWithLastModified(providerConfig, input.prefix);
+    return;
+  }
+  throw new Error(`Provider ${provider ?? 'unknown'} does not support object listing for GC`);
+}
+
+/**
+ * Collects iterateBackupObjectsUnderPrefix into one array. Holds the whole
+ * listing in memory — use the iterator for anything that can be large (the
+ * GC sweep over a destination's `snapshots/` root streams it, #6834).
  */
 export async function listBackupObjectsUnderPrefix(input: {
   provider: string | null | undefined;
   providerConfig: unknown;
   prefix: string;
 }): Promise<BackupObjectListing[]> {
-  const provider = input.provider ?? null;
-  const providerConfig = asRecord(input.providerConfig);
-  if (provider === 's3') return listS3ObjectsWithLastModified(providerConfig, input.prefix);
-  if (provider === 'local') return listLocalObjectsWithLastModified(providerConfig, input.prefix);
-  throw new Error(`Provider ${provider ?? 'unknown'} does not support object listing for GC`);
+  const results: BackupObjectListing[] = [];
+  for await (const page of iterateBackupObjectsUnderPrefix(input)) {
+    for (const item of page) results.push(item);
+  }
+  return results;
 }
 
 // ── GC support: fetch a single object's text (manifest fetch) ────────────────
 
-async function fetchS3ObjectText(providerConfig: Record<string, unknown>, key: string): Promise<string> {
+async function fetchS3ObjectText(providerConfig: Record<string, unknown>, key: string, maxBytes?: number): Promise<string> {
   const { bucket, client } = buildS3StorageClient(providerConfig);
   const response = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+  // Same declared-size-before-buffering check as fetchS3ObjectBytes below.
+  if (maxBytes !== undefined && typeof response.ContentLength === 'number' && response.ContentLength > maxBytes) {
+    throw new BackupObjectTooLargeError(key, response.ContentLength, maxBytes);
+  }
   if (!response.Body) {
     throw new Error(`Empty response body for ${key}`);
   }
-  return response.Body.transformToString('utf-8');
+  const text = await response.Body.transformToString('utf-8');
+  // ContentLength can be absent; re-check the actual decoded size as a
+  // backstop, same as the bytes variant.
+  if (maxBytes !== undefined) {
+    const actualBytes = Buffer.byteLength(text, 'utf8');
+    if (actualBytes > maxBytes) {
+      throw new BackupObjectTooLargeError(key, actualBytes, maxBytes);
+    }
+  }
+  return text;
 }
 
-async function fetchLocalObjectText(providerConfig: Record<string, unknown>, key: string): Promise<string> {
+async function fetchLocalObjectText(providerConfig: Record<string, unknown>, key: string, maxBytes?: number): Promise<string> {
   const rootPath = getStringValue(providerConfig, 'path') || getStringValue(providerConfig, 'basePath');
   if (!rootPath) {
     throw new Error('Local backup storage is misconfigured');
   }
   const normalizedKey = pathPosix.normalize(key).replace(/^\/+/, '');
   const targetPath = ensureContainedLocalPath(rootPath, normalizedKey);
+  if (maxBytes !== undefined) {
+    const stats = await stat(targetPath);
+    if (stats.size > maxBytes) {
+      throw new BackupObjectTooLargeError(key, stats.size, maxBytes);
+    }
+  }
   return readFile(targetPath, 'utf8');
 }
 
-async function fetchS3ObjectBytes(providerConfig: Record<string, unknown>, key: string): Promise<Uint8Array> {
+/** Thrown by fetchBackupObjectBytes when an object's declared/actual size exceeds `maxBytes`. */
+export class BackupObjectTooLargeError extends Error {
+  constructor(public readonly key: string, public readonly sizeBytes: number, public readonly maxBytes: number) {
+    super(`Object ${key} is ${sizeBytes} bytes, exceeding the ${maxBytes}-byte fetch cap`);
+    this.name = 'BackupObjectTooLargeError';
+  }
+}
+
+async function fetchS3ObjectBytes(providerConfig: Record<string, unknown>, key: string, maxBytes?: number): Promise<Uint8Array> {
   const { bucket, client } = buildS3StorageClient(providerConfig);
   const response = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+  // ContentLength arrives with the response headers, before the body stream is
+  // read — checking it here rejects an oversized object without buffering it
+  // into process memory first.
+  if (maxBytes !== undefined && typeof response.ContentLength === 'number' && response.ContentLength > maxBytes) {
+    throw new BackupObjectTooLargeError(key, response.ContentLength, maxBytes);
+  }
   if (!response.Body) {
     throw new Error(`Empty response body for ${key}`);
   }
-  return response.Body.transformToByteArray();
+  const bytes = await response.Body.transformToByteArray();
+  // ContentLength can be absent (some S3-compatible sinks omit it, or a
+  // chunked/compressed transfer); re-check the actual size as a backstop so
+  // the cap still applies to a sink that just doesn't report it.
+  if (maxBytes !== undefined && bytes.byteLength > maxBytes) {
+    throw new BackupObjectTooLargeError(key, bytes.byteLength, maxBytes);
+  }
+  return bytes;
 }
 
-async function fetchLocalObjectBytes(providerConfig: Record<string, unknown>, key: string): Promise<Uint8Array> {
+async function fetchLocalObjectBytes(providerConfig: Record<string, unknown>, key: string, maxBytes?: number): Promise<Uint8Array> {
   const rootPath = getStringValue(providerConfig, 'path') || getStringValue(providerConfig, 'basePath');
   if (!rootPath) {
     throw new Error('Local backup storage is misconfigured');
   }
   const normalizedKey = pathPosix.normalize(key).replace(/^\/+/, '');
   const targetPath = ensureContainedLocalPath(rootPath, normalizedKey);
+  if (maxBytes !== undefined) {
+    const stats = await stat(targetPath);
+    if (stats.size > maxBytes) {
+      throw new BackupObjectTooLargeError(key, stats.size, maxBytes);
+    }
+  }
   const buffer = await readFile(targetPath); // no encoding argument — raw bytes
   return new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
 }
@@ -339,33 +482,132 @@ async function fetchLocalObjectBytes(providerConfig: Record<string, unknown>, ke
  * byte-identical for every input). Same not-found/error semantics as
  * `fetchBackupObjectText`: throws on any failure, callers classify via
  * `isBackupObjectNotFound`.
+ *
+ * `maxBytes`, when passed, rejects (via `BackupObjectTooLargeError`, checked
+ * with `isBackupObjectTooLarge`) an object whose declared or actual size
+ * exceeds it, before the whole object is buffered into memory — an
+ * agent-controlled result can otherwise point this fetch at an arbitrarily
+ * large object.
  */
 export async function fetchBackupObjectBytes(input: {
   provider: string | null | undefined;
   providerConfig: unknown;
   key: string;
+  maxBytes?: number;
 }): Promise<Uint8Array> {
   const provider = input.provider ?? null;
   const providerConfig = asRecord(input.providerConfig);
-  if (provider === 's3') return fetchS3ObjectBytes(providerConfig, input.key);
-  if (provider === 'local') return fetchLocalObjectBytes(providerConfig, input.key);
+  if (provider === 's3') return fetchS3ObjectBytes(providerConfig, input.key, input.maxBytes);
+  if (provider === 'local') return fetchLocalObjectBytes(providerConfig, input.key, input.maxBytes);
+  throw new Error(`Provider ${provider ?? 'unknown'} does not support object fetch for GC`);
+}
+
+export function isBackupObjectTooLarge(err: unknown): err is BackupObjectTooLargeError {
+  return err instanceof BackupObjectTooLargeError;
+}
+
+/**
+ * Passes bytes through while enforcing the cap on what actually arrives, and,
+ * when a length was declared, that all of it did: a connection dropped between
+ * chunks must read as an error, never as the end of the object.
+ */
+function boundedObjectStream(source: Readable, key: string, maxBytes: number, declared?: number): Readable {
+  let received = 0;
+  const guard = new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      received += chunk.length;
+      if (received > maxBytes) {
+        callback(new BackupObjectTooLargeError(key, received, maxBytes));
+        return;
+      }
+      callback(null, chunk);
+    },
+    flush(callback) {
+      if (declared !== undefined && received !== declared) {
+        callback(new Error(`Object ${key} ended early: received ${received} of ${declared} bytes`));
+        return;
+      }
+      callback();
+    },
+  });
+  // pipeline carries an error from either side to the reader and destroys both.
+  // Its callback has nothing left to do: the reader sees the error on `guard`.
+  pipeline(source, guard, () => {});
+  return guard;
+}
+
+async function openS3ObjectStream(providerConfig: Record<string, unknown>, key: string, maxBytes: number): Promise<Readable> {
+  const { bucket, client } = buildS3StorageClient(providerConfig);
+  const response = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+  const body = response.Body as Readable | undefined;
+  if (!body) {
+    throw new Error(`Empty response body for ${key}`);
+  }
+  const declared = typeof response.ContentLength === 'number' ? response.ContentLength : undefined;
+  if (declared !== undefined && declared > maxBytes) {
+    // Otherwise the unread response holds its connection until it is collected.
+    body.destroy();
+    throw new BackupObjectTooLargeError(key, declared, maxBytes);
+  }
+  return boundedObjectStream(body, key, maxBytes, declared);
+}
+
+async function openLocalObjectStream(providerConfig: Record<string, unknown>, key: string, maxBytes: number): Promise<Readable> {
+  const rootPath = getStringValue(providerConfig, 'path') || getStringValue(providerConfig, 'basePath');
+  if (!rootPath) {
+    throw new Error('Local backup storage is misconfigured');
+  }
+  const normalizedKey = pathPosix.normalize(key).replace(/^\/+/, '');
+  const targetPath = ensureContainedLocalPath(rootPath, normalizedKey);
+  const stats = await stat(targetPath);
+  if (stats.size > maxBytes) {
+    throw new BackupObjectTooLargeError(key, stats.size, maxBytes);
+  }
+  return boundedObjectStream(createReadStream(targetPath), key, maxBytes);
+}
+
+/**
+ * One object as a stream, for a manifest too large to hold in memory (#11026).
+ * Rejects with BackupObjectTooLargeError from the declared length or file size
+ * before anything is read. When no length is declared, the stream itself errors
+ * with it once `maxBytes` have passed. Not-found and other failures follow
+ * fetchBackupObjectBytes: classify them with isBackupObjectNotFound.
+ */
+export async function openBackupObjectStream(input: {
+  provider: string | null | undefined;
+  providerConfig: unknown;
+  key: string;
+  maxBytes: number;
+}): Promise<NodeJS.ReadableStream> {
+  const provider = input.provider ?? null;
+  const providerConfig = asRecord(input.providerConfig);
+  if (provider === 's3') return openS3ObjectStream(providerConfig, input.key, input.maxBytes);
+  if (provider === 'local') return openLocalObjectStream(providerConfig, input.key, input.maxBytes);
   throw new Error(`Provider ${provider ?? 'unknown'} does not support object fetch for GC`);
 }
 
 /**
- * Fetches one object's contents as text (used by GC to fetch/parse retained
- * snapshot manifests). Throws on any failure — callers must treat a throw as
- * "mark phase failed, no sweep this run" per the fail-closed GC contract.
+ * Fetches one object's contents as text (used by GC to fetch/parse a retained
+ * snapshot's system-state manifest; snapshot manifests themselves are
+ * streamed, see openBackupObjectStream). Throws on any failure — callers must treat a throw
+ * as "mark phase failed, no sweep this run" per the fail-closed GC contract.
+ *
+ * `maxBytes`, when passed, rejects (via `BackupObjectTooLargeError`, checked
+ * with `isBackupObjectTooLarge`) an object whose declared or actual size
+ * exceeds it, same as `fetchBackupObjectBytes` — the manifest key these
+ * callers read is written directly by the reporting agent, so its size is
+ * not otherwise bounded.
  */
 export async function fetchBackupObjectText(input: {
   provider: string | null | undefined;
   providerConfig: unknown;
   key: string;
+  maxBytes?: number;
 }): Promise<string> {
   const provider = input.provider ?? null;
   const providerConfig = asRecord(input.providerConfig);
-  if (provider === 's3') return fetchS3ObjectText(providerConfig, input.key);
-  if (provider === 'local') return fetchLocalObjectText(providerConfig, input.key);
+  if (provider === 's3') return fetchS3ObjectText(providerConfig, input.key, input.maxBytes);
+  if (provider === 'local') return fetchLocalObjectText(providerConfig, input.key, input.maxBytes);
   throw new Error(`Provider ${provider ?? 'unknown'} does not support object fetch for GC`);
 }
 
@@ -498,6 +740,13 @@ async function deleteS3Prefix(
   const { bucket, client } = buildS3StorageClient(providerConfig);
   const normalizedPrefix = normalizeObjectPrefix(storagePrefix);
 
+  // S3 reports per-key failures (object lock, permissions, provider quirks)
+  // inside a 200 response, and still does so with Quiet: true. Collect those
+  // per-key failures across all pages (delete as much as possible; a
+  // whole-request transport/auth error still aborts immediately), then throw so the caller
+  // never treats a prefix with surviving objects as deleted (#8364).
+  const failures: { key: string; error: string }[] = [];
+
   let continuationToken: string | undefined;
   do {
     const listed = await client.send(new ListObjectsV2Command({
@@ -514,17 +763,35 @@ async function deleteS3Prefix(
       );
 
     if (objects.length > 0) {
-      await client.send(new DeleteObjectsCommand({
+      const response = await client.send(new DeleteObjectsCommand({
         Bucket: bucket,
         Delete: {
           Objects: objects.map((Key) => ({ Key })),
           Quiet: true,
         },
       }));
+      for (const err of response?.Errors ?? []) {
+        failures.push({
+          key: typeof err.Key === 'string' ? err.Key : '(unknown key)',
+          // Code distinguishes object-lock from IAM denials; keep both.
+          error: [err.Code, err.Message].filter(Boolean).join(': ') || 'unknown S3 delete error',
+        });
+      }
     }
 
     continuationToken = listed.IsTruncated ? listed.NextContinuationToken : undefined;
   } while (continuationToken);
+
+  if (failures.length > 0) {
+    const sample = failures
+      .slice(0, 5)
+      .map((f) => `${f.key} (${f.error})`)
+      .join('; ');
+    const more = failures.length > 5 ? `; +${failures.length - 5} more` : '';
+    throw new Error(
+      `Failed to delete ${failures.length} object(s) under S3 prefix ${normalizedPrefix}: ${sample}${more}`,
+    );
+  }
 }
 
 async function deleteLocalPrefix(
@@ -607,8 +874,7 @@ export async function deleteBackupSnapshotArtifacts(input: SnapshotStorageInput)
   }
 
   const providerConfig = asRecord(input.providerConfig);
-  const snapshotMetadata = asRecord(input.metadata);
-  const storagePrefix = normalizeStoragePrefix(provider, providerConfig, snapshotMetadata, input.snapshotId);
+  const storagePrefix = snapshotStoragePrefixFor(input, provider);
 
   if (provider === 's3') {
     await deleteS3Prefix(providerConfig, storagePrefix);
@@ -623,8 +889,7 @@ export async function applyBackupSnapshotImmutability(
 ): Promise<SnapshotImmutabilityResult> {
   const provider = input.provider ?? null;
   const providerConfig = asRecord(input.providerConfig);
-  const snapshotMetadata = asRecord(input.metadata);
-  const storagePrefix = normalizeStoragePrefix(provider, providerConfig, snapshotMetadata, input.snapshotId);
+  const storagePrefix = snapshotStoragePrefixFor(input, provider);
 
   if (provider === 's3') {
     return applyS3PrefixRetention(providerConfig, storagePrefix, input.retainUntil);

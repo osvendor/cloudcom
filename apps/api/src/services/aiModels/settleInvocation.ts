@@ -1,0 +1,649 @@
+/**
+ * THE billing path (spec §8, quorum #5). Every surface ends here:
+ * priceInvocation over the bound rate snapshot → ai_invocations rows → the
+ * reservation settlement derives session totals and ai_cost_usage from those
+ * rows in ONE transaction (and advances the SDK usage snapshot in it) → the
+ * platform credit balance is debited by the same cents, once, under a stable
+ * idempotency key. The provider's own cost is copied onto the ledger as
+ * telemetry, never billed.
+ */
+import type { AiSurface, PromptProfile } from '@breeze/shared';
+import { runOutsideDbContext, withSystemDbAccessContext } from '../../db';
+import {
+  attestUnboundRate,
+  readUnboundRateAttestation,
+  creditDebitIdempotencyKey,
+  markCreditsDebited,
+  recordCreditDebitFailure,
+  recordCreditDebitRetry,
+  recordUnreservedInvocations,
+  settleAiBudgetReservationDurably,
+} from '../aiBudgetReservations';
+import { checkCostAnomalies, debitBillingCredits } from '../aiCostTracker';
+import { captureException, captureMessage } from '../sentry';
+import { deliverCreditDebit, type CreditDebitOutcome } from '../aiCreditDebitOutbox';
+import { readConnectionOfferingRate } from './connectionOfferingRate';
+import type { BilledUsage, SdkUsageNote, SdkUsageSnapshot, SpeedServed, TurnOutcome } from './invocationUsage';
+import type { NewInvocation } from './invocationLedgerWrite';
+import type { AiInvocationModelRole } from '../../db/schema/aiInvocations';
+import { getPlatformModelByModelId } from './platformModels';
+import { platformRateSnapshot, priceInvocation, type RateSnapshot } from './pricing';
+import type { PromptProvenance } from './promptProfiles';
+import { parsePromptVariantId } from './promptVariants';
+import type { ResolvedModel } from './resolveModel';
+import { safeErrorMessage } from './safeDbError';
+import type { TurnBinding } from './turnBinding';
+
+/** Server-side web search fee per request (same value as catalogEnrichmentService.ts; Task 13 points it here). */
+export const WEB_SEARCH_COST_CENTS = 1;
+
+export interface PricedUsage extends BilledUsage {
+  rate: RateSnapshot;
+  costCents: number;
+  /** The speed actually billed: 'fast' only when served fast AND the snapshot prices fast. */
+  appliedSpeed: SpeedServed;
+  /** The usage key is neither the bound model nor its refusal fallback (the CLI switched on its own). */
+  unboundModel: boolean;
+}
+
+const ZERO = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+const REPORT_WINDOW_MS = 60_000;
+
+function round6(n: number): number {
+  return Math.round(n * 1e6) / 1e6;
+}
+
+export function sumCostCents(priced: ReadonlyArray<{ costCents: number | null }>): number {
+  return round6(priced.reduce((sum, p) => sum + (p.costCents ?? 0), 0));
+}
+
+function boundModels(binding: TurnBinding): Set<string> {
+  return new Set([binding.wireModel, ...(binding.refusalFallback ? [binding.refusalFallback.wireModel] : [])]);
+}
+
+/**
+ * Price each usage row by the model its tokens are attributed to:
+ * - the bound model → the bound snapshot; its refusal fallback → that snapshot;
+ * - a model this session switched away from (W05 `carriedRates`) → its carried snapshot;
+ * - any other key (the CLI's own refusal switch, W05 spike) → on a
+ *   platform-funded turn, that model's current platform rate when the registry
+ *   prices it (`platformRates`); on a BYOK turn (#7773), the rate of that
+ *   model's enabled, priced offering on the binding's OWN connection
+ *   (`connectionRates`). Both are pre-fetched by settleInvocation and re-checked
+ *   inside the settlement transaction. No such rate → the bound rate. Never a
+ *   guess, and flagged `unboundModel` so the ledger marks it fallbackUsed —
+ *   or, for the CLI's own helper call, model_role 'background' (#10413).
+ * Fast is billed only when the provider CONFIRMED it (`speedServed`); the
+ * Agent SDK never can, so SDK usage is always standard.
+ */
+export function priceUsage(
+  binding: TurnBinding,
+  usage: BilledUsage[],
+  opts: { platformRates?: ReadonlyMap<string, RateSnapshot>; connectionRates?: ReadonlyMap<string, RateSnapshot> } = {},
+): PricedUsage[] {
+  const rows: BilledUsage[] = usage.length > 0
+    ? usage
+    : [{ model: binding.wireModel, tokens: ZERO, webSearchRequests: 0, speedServed: 'standard', providerModel: null }];
+  return rows.map((u) => {
+    let rate: RateSnapshot = binding.rateSnapshot;
+    let unboundModel = false;
+    if (u.model === binding.wireModel) {
+      rate = binding.rateSnapshot;
+    } else if (binding.refusalFallback && u.model === binding.refusalFallback.wireModel) {
+      rate = binding.refusalFallback.rateSnapshot;
+    } else if (binding.carriedRates?.some((c) => c.wireModel === u.model)) {
+      // W05: a model this session switched away from on the SAME connection
+      // (funding is unchanged by construction): its late deltas bill at its
+      // own bound rate. Not a fallback, so not `unboundModel`.
+      rate = binding.carriedRates.find((c) => c.wireModel === u.model)!.rateSnapshot;
+    } else {
+      unboundModel = true;
+      const platform = binding.funding === 'platform' ? opts.platformRates?.get(u.model) : undefined;
+      const connection = binding.funding === 'partner_key' ? opts.connectionRates?.get(u.model) : undefined;
+      rate = platform ?? connection ?? binding.rateSnapshot;
+      console.warn('[settleInvocation] usage for a model the turn did not bind', {
+        bound: binding.wireModel, billed: u.model,
+        rateSource: platform ? 'platform_row' : connection ? 'connection_offering' : 'bound_rate',
+      });
+    }
+    let appliedSpeed: SpeedServed = 'standard';
+    if (u.speedServed === 'fast') {
+      if (rate.option?.key === 'speed:fast') {
+        appliedSpeed = 'fast';
+      } else {
+        // Served fast with no fast rate bound: resolveModel never binds that,
+        // so this is a provider surprise. Bill standard (under, not over) and
+        // make it visible rather than fail the whole settlement.
+        console.warn('[settleInvocation] fast served without a bound fast rate; billed standard', { model: u.model });
+      }
+    }
+    const applied = appliedSpeed === 'fast' ? { speed: 'fast' as const } : {};
+    const costCents = round6(priceInvocation(rate, u.tokens, applied) + u.webSearchRequests * WEB_SEARCH_COST_CENTS);
+    return { ...u, rate, costCents, appliedSpeed, unboundModel };
+  });
+}
+
+export function costEstimator(
+  resolved: Pick<ResolvedModel, 'rateSnapshot' | 'options'>,
+): (inputTokens: number, outputTokens: number) => number {
+  return (inputTokens, outputTokens) =>
+    priceInvocation(resolved.rateSnapshot, { input: inputTokens, output: outputTokens, cacheRead: 0, cacheWrite: 0 }, resolved.options);
+}
+
+export interface SettleInvocationInput {
+  binding: TurnBinding;
+  orgId: string;
+  userId: string | null;
+  sessionId: string | null;
+  agentRunId: string | null;
+  /** W5 (#5220): the flow run an `ai` step call belongs to (ai_invocations.flow_run_id). */
+  flowRunId?: string | null;
+  sourceRef: string | null;
+  usage: BilledUsage[];
+  outcome: TurnOutcome;
+  reservationId?: string;
+  messageCount?: number;
+  toolExecutionCount?: number;
+  turnCount?: number;
+  /**
+   * Agent SDK surfaces (W05 spike): sdkTurnUsage()'s next snapshot for the
+   * BREEZE session, advanced in the settlement transaction (so a rolled-back
+   * or deferred settlement does not advance it), plus its confidence flags.
+   */
+  sdkUsage?: {
+    sessionId: string;
+    nextSnapshot: SdkUsageSnapshot | null;
+    usageConfirmed?: boolean;
+    usageNote?: SdkUsageNote;
+    /**
+     * The snapshot this turn's usage was computed against (what
+     * readSdkUsageSnapshot returned). Sent only with a re-baseline: a deferred
+     * re-baseline replayed after a newer turn moved the stored snapshot must
+     * not overwrite it (review S10).
+     */
+    baseSnapshot?: SdkUsageSnapshot | null;
+  };
+  /**
+   * W11 (#7609): the prompt the turn's system prompt was built with. The
+   * Agent SDK surfaces pass the LIVE QUERY's provenance (a reused query keeps
+   * the prompt it was created with, even if the binding's profile has since
+   * changed). Absent: the binding's profile, no variant.
+   */
+  prompt?: PromptProvenance | null;
+  /**
+   * W11: when the turn happened. Omitted in production (stamped once in
+   * toNewInvocations); the built rows carry it through a deferred
+   * settlement's JSON, so a late replay keeps turn order.
+   */
+  occurredAt?: Date;
+}
+
+export interface SettledInvocation {
+  costCents: number;
+  invocationIds: string[];
+  deferred: boolean;
+  /**
+   * Review S1: the settlement was deferred AND could not be persisted for the
+   * sweep — the spend is recorded nowhere. The reservation was left
+   * indeterminate; a caller must keep treating it as unsettled (never clear
+   * or release it) and must not report the turn as billed.
+   */
+  unrecorded?: boolean;
+}
+
+/**
+ * The cents settleInvocation will bill for this usage (same rate selection,
+ * including the platform-rate lookup for unbound models). For consumers that
+ * must quote the turn BEFORE settling it — the Office per-user ledger (#5557
+ * ordering) and the `done` event — so every consumer reads one number. Pass
+ * the turn's reservation: an unbound BYOK key's rate is then the attested
+ * decision settleInvocation will bill (#7773), not a second live read.
+ */
+export async function quoteInvocationCents(
+  binding: TurnBinding,
+  usage: BilledUsage[],
+  reservation?: { orgId: string; reservationId: string },
+): Promise<number> {
+  return sumCostCents(priceUsage(binding, usage, await loadUnboundRates(binding, usage, reservation)));
+}
+
+/**
+ * ai_invocations_prompt_provenance_chk rejects a variant whose surface or
+ * profile disagrees with its row. A settlement must never fail on
+ * provenance (the turn already ran and is owed), so a mismatch is recorded
+ * as the base prompt and logged.
+ */
+export function consistentPromptVariant(variant: string | null, surface: AiSurface, profile: PromptProfile | null): string | null {
+  if (variant === null) return null;
+  const parsed = parsePromptVariantId(variant);
+  if (parsed && profile !== null && profile !== 'generic' && parsed.surface === surface && parsed.profile === profile) return variant;
+  console.warn('[settleInvocation] prompt variant does not match the bound surface/profile; recorded as the base prompt', { variant, surface, profile });
+  return null;
+}
+
+/**
+ * #10413: a usage key is the Agent SDK CLI's background call (a small model it
+ * runs once per query, e.g. for a title) when it is none of the models that
+ * can carry the turn: not the bound model, not its bound refusal fallback,
+ * not a model this session switched away from (carried), and not the model
+ * that served the turn. One exception keeps the old label: a turn that fell
+ * back but could not name the model that served it (the outcome still reads
+ * the bound model) cannot tell the fallback key from the helper key, so every
+ * unbound key stays a fallback there.
+ */
+export function isBackgroundCall(b: TurnBinding, outcome: TurnOutcome, p: Pick<BilledUsage, 'model' | 'providerModel'>): boolean {
+  // Only the Agent SDK reports no provider model, and only its CLI makes a
+  // helper call: a Messages API row (which names the model that served it) is
+  // never background, so an alias/dated-id mismatch cannot hide a fallback.
+  if (p.providerModel !== null) return false;
+  const model = p.model;
+  if (model === b.wireModel || model === outcome.servedModel) return false;
+  if (b.refusalFallback && model === b.refusalFallback.wireModel) return false;
+  if (b.carriedRates?.some((c) => c.wireModel === model)) return false;
+  if (outcome.fallbackUsed && outcome.servedModel === b.wireModel) return false;
+  return true;
+}
+
+export function toNewInvocations(input: SettleInvocationInput, priced: PricedUsage[]): NewInvocation[] {
+  const b = input.binding;
+  const promptProfile = input.prompt?.profile ?? b.promptProfile ?? null;
+  const promptVariant = consistentPromptVariant(input.prompt?.variant ?? null, b.surface as AiSurface, promptProfile);
+  // A dropped variant mislabels a treated call as the base prompt in the
+  // variant comparison; post-deploy gate G3 watches Sentry for it.
+  if (input.prompt?.variant && promptVariant === null && shouldReport('ai_prompt_variant_mismatch', input.orgId)) {
+    captureMessage('AI prompt variant did not match the settled surface/profile; recorded as the base prompt', {
+      eventCode: 'ai_prompt_variant_mismatch',
+    });
+  }
+  // One instant per settlement, taken when the turn is first settled. A
+  // deferred settlement persists these rows and replays them later; the
+  // replay's INSERT gets a late created_at, but occurredAt keeps turn order.
+  const occurredAt = input.occurredAt ?? new Date();
+  return priced.map((p, index): NewInvocation => {
+    // Refusal / fallback labels belong to ONE createMessage call's attempts: a
+    // row from a multi-call settlement (a retry loop) is labelled from its own
+    // call's outcome and sibling rows, never from the merged turn outcome.
+    const outcome = p.callOutcome ?? input.outcome;
+    const callRows = p.call === undefined ? priced : priced.filter((x) => x.call === p.call);
+    const multi = callRows.length > 1;
+    // #10413: the CLI's own helper call is billed (at its own rate, via the
+    // unbound-model path) but is not a fallback: nothing served the turn in
+    // its place.
+    const background = isBackgroundCall(b, outcome, p);
+    const servedByFallback = !background && (p.unboundModel || (outcome.fallbackUsed && p.model !== b.wireModel));
+    const modelRole: AiInvocationModelRole = background ? 'background' : servedByFallback ? 'fallback' : 'primary';
+    const refusedLeg = outcome.fallbackUsed && multi && p.model === b.wireModel;
+    // The speed the row was BILLED at: a requested 'fast' the provider served
+    // as standard is recorded as standard (not applied).
+    const optionsSent = b.options.speed !== undefined || p.appliedSpeed === 'fast'
+      ? { ...b.options, speed: p.appliedSpeed }
+      : b.options;
+    return {
+      orgId: input.orgId,
+      surface: b.surface as AiSurface,
+      role: b.role,
+      userId: input.userId,
+      sessionId: input.sessionId,
+      agentRunId: input.agentRunId,
+      flowRunId: input.flowRunId ?? null,
+      sourceRef: input.sourceRef,
+      offeringId: b.offeringId,
+      connectionId: b.connectionId,
+      fundingSource: b.funding,
+      // requested = the id the tokens are billed under; served = what the
+      // provider says it ran (Messages API), so a mismatch stays visible.
+      requestedModel: p.model,
+      servedModel: p.providerModel ?? p.model,
+      optionsSent,
+      thinkingModeSent: b.thinkingMode,
+      inferenceGeoSent: b.inferenceGeo,
+      stopReason: refusedLeg ? 'refusal' : outcome.stopReason,
+      refusalCategory: refusedLeg || servedByFallback || outcome.refused ? outcome.refusalCategory : null,
+      fallbackUsed: servedByFallback,
+      modelRole,
+      // W09 (F5): this row is the SERVED hop's (offering/connection/funding
+      // above come from its own binding); these record where it failed over from.
+      failoverFromOfferingId: b.failover?.fromOfferingId ?? null,
+      failoverHop: b.failover?.hop ?? 0,
+      failoverCause: b.failover?.cause ?? null,
+      catalogRevisionId: b.catalogRevisionId,
+      connectionConfigVersion: b.configVersion,
+      tokens: p.tokens,
+      rateSnapshot: (p.webSearchRequests > 0
+        ? { ...p.rate, serverToolFees: { webSearchRequests: p.webSearchRequests, centsEach: WEB_SEARCH_COST_CENTS } }
+        : p.rate) as RateSnapshot,
+      costCents: p.costCents,
+      // No `charge` here: the settlement transaction stamps it (stampChargeback,
+      // W10 #7608), so the snapshot moment is the ledger write, never this call.
+      sdkReportedCostUsd: index === 0 ? input.outcome.sdkReportedCostUsd : null,
+      // W02 wrote 'shadow' rows beside the legacy path; from W03 the ledger is the
+      // billing record, and rollups are derived from these rows only.
+      ledgerMode: 'authoritative',
+      legacyCostCents: null,
+      promptProfile,
+      promptVariant,
+      occurredAt,
+    };
+  });
+}
+
+/** Platform rates for usage keys the binding did not name (see priceUsage). Best effort: a miss bills the bound rate. */
+async function loadUnboundPlatformRates(binding: TurnBinding, usage: readonly BilledUsage[]): Promise<Map<string, RateSnapshot>> {
+  const rates = new Map<string, RateSnapshot>();
+  if (binding.funding !== 'platform') return rates;
+  const bound = boundModels(binding);
+  for (const model of new Set(usage.map((u) => u.model).filter((m) => !bound.has(m)))) {
+    try {
+      const row = await runOutsideDbContext(() => getPlatformModelByModelId(model));
+      const snapshot = row ? platformRateSnapshot(row) : null;
+      if (snapshot) rates.set(model, snapshot);
+    } catch (error) {
+      console.error('[settleInvocation] platform rate lookup failed; billing the bound rate', {
+        model, error: safeErrorMessage(error),
+      });
+    }
+  }
+  return rates;
+}
+
+type ReservationRef = { orgId: string; reservationId: string };
+type ConnectionRateDecision = { rate: RateSnapshot } | { rate: null; reason: string };
+
+/**
+ * #7773: one unbound BYOK key's rate on the binding's own connection, read in
+ * the CALLER's short system context. With a reservation it is a get-or-create
+ * of the turn's pricing decision on that reservation:
+ *   1. an attestation already there (any status: a retry, a quote that ran
+ *      first, or a settled/pending reservation) is the answer, live row unread;
+ *   2. else the live offering is read and the outcome attested — a hit as its
+ *      rate, a miss as null (= the bound rate) — first write wins, and the
+ *      STORED entry is returned (a concurrent writer may have got there first).
+ * The settlement transaction verifies the row against that entry
+ * (assertInvocationsMatchBinding), so the turn-time rate survives a deferred
+ * replay, a reprice/disable/delete after the read, and a repeated settle.
+ */
+async function decideConnectionRate(binding: TurnBinding, model: string, reservation?: ReservationRef): Promise<ConnectionRateDecision> {
+  const connectionId = binding.connectionId;
+  const at = reservation && connectionId ? { ...reservation, connectionId, model } : null;
+  if (at) {
+    const existing = await readUnboundRateAttestation(at);
+    if (existing) return existing.rate ? { rate: existing.rate } : { rate: null, reason: 'attested_bound_rate' };
+  }
+  const read = await readConnectionOfferingRate({
+    partnerId: binding.partnerId, connectionId, connectionKind: binding.connectionKind, model,
+  });
+  if (!at) return read;
+  const stored = await attestUnboundRate({
+    orgId: at.orgId, reservationId: at.reservationId, model,
+    attestation: { connectionId: at.connectionId, offeringId: read.rate ? read.offeringId : null, rate: read.rate },
+  });
+  if (!stored) return read.rate ? { rate: null, reason: 'reservation_not_settleable' } : read;
+  if (stored.rate) return { rate: stored.rate };
+  return read.rate ? { rate: null, reason: 'attested_bound_rate' } : read;
+}
+
+/**
+ * #7773: for a BYOK turn, the rate of each unbound key's enabled, priced
+ * offering on the binding's own connection (decideConnectionRate). Best
+ * effort, like the platform lookup: a miss (or a failed read) bills the bound
+ * rate and is logged with its reason, so a fallback billed at the primary rate
+ * is explainable later. Each key runs in its own short system context, outside
+ * any request transaction. quoteInvocationCents and settleInvocation pass the
+ * same reservation, so the quote and the ledger read one decision.
+ */
+async function loadUnboundConnectionRates(
+  binding: TurnBinding,
+  usage: readonly BilledUsage[],
+  reservation?: ReservationRef,
+): Promise<Map<string, RateSnapshot>> {
+  const rates = new Map<string, RateSnapshot>();
+  if (binding.funding !== 'partner_key') return rates;
+  const bound = boundModels(binding);
+  const carried = new Set((binding.carriedRates ?? []).map((c) => c.wireModel));
+  for (const model of new Set(usage.map((u) => u.model).filter((m) => !bound.has(m) && !carried.has(m)))) {
+    const detail = {
+      eventCode: 'ai_unbound_byok_rate_bound_fallback', model, bound: binding.wireModel,
+      connectionId: binding.connectionId, offeringId: binding.offeringId,
+    };
+    try {
+      const found = await runOutsideDbContext(() => withSystemDbAccessContext(
+        () => decideConnectionRate(binding, model, reservation), 'settleInvocation.connectionRate',
+      ));
+      if (found.rate) rates.set(model, found.rate);
+      else console.warn('[settleInvocation] unbound BYOK model has no enabled priced offering on the connection; billing the bound rate', { ...detail, reason: found.reason });
+    } catch (error) {
+      // Not rethrown: failing here would lose the settlement, which is worse
+      // than the pre-#7773 bound rate. Against a reservation it is reported,
+      // since it may contradict an attestation the quote already wrote.
+      console.error('[settleInvocation] connection rate lookup failed; billing the bound rate', {
+        ...detail, reason: 'lookup_failed', error: safeErrorMessage(error),
+        ...(reservation ? { reservationId: reservation.reservationId } : {}),
+      });
+      if (reservation && shouldReport('ai_unbound_byok_rate_lookup_failed', reservation.orgId)) {
+        captureMessage('AI unbound BYOK rate could not be read or attested; billed the bound rate', {
+          eventCode: 'ai_unbound_byok_rate_lookup_failed',
+          level: 'warning',
+          tags: { org_id: reservation.orgId, ai_reservation_id: reservation.reservationId },
+        });
+      }
+    }
+  }
+  return rates;
+}
+
+async function loadUnboundRates(
+  binding: TurnBinding,
+  usage: readonly BilledUsage[],
+  reservation?: ReservationRef,
+): Promise<{
+  platformRates: Map<string, RateSnapshot>; connectionRates: Map<string, RateSnapshot>;
+}> {
+  return {
+    platformRates: await loadUnboundPlatformRates(binding, usage),
+    connectionRates: await loadUnboundConnectionRates(binding, usage, reservation),
+  };
+}
+
+type ReportedEventCode = 'ai_usage_snapshot_regressed' | 'ai_credit_debit_rejected' | 'ai_credit_debit_retries_exhausted'
+  | 'ai_prompt_variant_mismatch' | 'ai_unbound_byok_rate_lookup_failed';
+const lastReportedAt = new Map<string, number>();
+const MAX_THROTTLE_KEYS = 10_000;
+
+/**
+ * These conditions can arrive in storms (a rotated billing key rejects every
+ * debit), so Sentry gets at most one event per code PER ORGANIZATION per window
+ * per process (review S4: a global throttle let one noisy org hide every other
+ * org's rejections). Every occurrence still reaches the server log with its ids.
+ */
+function shouldReport(eventCode: ReportedEventCode, orgId: string): boolean {
+  const now = Date.now();
+  const key = `${eventCode}:${orgId}`;
+  const last = lastReportedAt.get(key);
+  if (last !== undefined && now - last < REPORT_WINDOW_MS) return false;
+  if (lastReportedAt.size >= MAX_THROTTLE_KEYS) {
+    for (const [k, at] of lastReportedAt) if (now - at >= REPORT_WINDOW_MS) lastReportedAt.delete(k);
+    if (lastReportedAt.size >= MAX_THROTTLE_KEYS) lastReportedAt.clear();
+  }
+  lastReportedAt.set(key, now);
+  return true;
+}
+
+export function __resetSettleInvocationReportsForTests(): void {
+  lastReportedAt.clear();
+}
+
+function reportUsageConfidence(input: SettleInvocationInput): void {
+  const s = input.sdkUsage;
+  if (!s || s.usageConfirmed !== false) return;
+  const detail = {
+    eventCode: s.usageNote === 'snapshot_regressed' ? 'ai_usage_snapshot_regressed' : 'ai_usage_unconfirmed',
+    usageNote: s.usageNote ?? null,
+    surface: input.binding.surface,
+    orgId: input.orgId,
+    sessionId: s.sessionId,
+    reservationId: input.reservationId ?? null,
+  };
+  console.warn(`[settleInvocation] ${detail.eventCode} ${JSON.stringify(detail)}`);
+  if (s.usageNote === 'snapshot_regressed') {
+    if (shouldReport('ai_usage_snapshot_regressed', input.orgId)) {
+      captureMessage('AI SDK usage snapshot regressed; re-baselined and billed the turn\'s own usage (unconfirmed)', { eventCode: 'ai_usage_snapshot_regressed' });
+    }
+  }
+}
+
+/**
+ * Budget threshold rungs + the per-session anomaly warning, after spend landed
+ * (moved here from the deleted legacy recorders, W03 Task 17). Fire-and-forget:
+ * the turn already happened and settled, so a failing check never fails it.
+ */
+function checkSpendThresholds(orgId: string, sessionId: string | null, costCents: number): void {
+  if (!(costCents > 0)) return;
+  // Outside any ambient (request) context: the check opens its own short
+  // system context instead of riding a transaction that may already be closing.
+  runOutsideDbContext(() => checkCostAnomalies(sessionId, orgId, costCents)).catch((err: unknown) => {
+    console.error('[settleInvocation] cost threshold check failed:', safeErrorMessage(err));
+  });
+}
+
+export async function settleInvocation(input: SettleInvocationInput): Promise<SettledInvocation> {
+  reportUsageConfidence(input);
+  const priced = priceUsage(input.binding, input.usage, await loadUnboundRates(
+    input.binding, input.usage, input.reservationId ? { orgId: input.orgId, reservationId: input.reservationId } : undefined,
+  ));
+  const rows = toNewInvocations(input, priced);
+  const costCents = sumCostCents(priced);
+  const sdkUsage = input.sdkUsage
+    ? {
+      sessionId: input.sdkUsage.sessionId,
+      nextSnapshot: input.sdkUsage.nextSnapshot,
+      ...(input.sdkUsage.usageNote === 'snapshot_regressed'
+        ? { rebaseline: true, ...(input.sdkUsage.baseSnapshot !== undefined ? { baseSnapshot: input.sdkUsage.baseSnapshot } : {}) }
+        : {}),
+    }
+    : undefined;
+
+  if (input.reservationId) {
+    const result = await settleAiBudgetReservationDurably({
+      orgId: input.orgId,
+      reservationId: input.reservationId,
+      invocations: rows,
+      messageCount: input.messageCount ?? 1,
+      toolExecutionCount: input.toolExecutionCount ?? 0,
+      ...(input.sessionId ? { session: { id: input.sessionId, turnCount: input.turnCount ?? 1 } } : {}),
+      ...(sdkUsage ? { sdkUsage } : {}),
+    });
+    if (result.kind === 'deferred_indeterminate') {
+      // Persisted for the sweep, which replays it and then debits.
+      if (result.persisted) return { costCents, invocationIds: [], deferred: true };
+      // Review S1: blocked twice AND the pending write failed (or another
+      // pending settlement held the slot). Nothing recorded this spend; say so
+      // instead of passing it off as a clean deferral.
+      reportUnrecordedSettlement(input, costCents);
+      return { costCents, invocationIds: [], deferred: true, unrecorded: true };
+    }
+    // Review finding 1: only the call that moved the reservation to `settled`
+    // debits; 'already_settled' means another call did (and debited).
+    if (result.kind === 'settled' && result.creditsDebitDue) {
+      await debitSettledCredits({ orgId: input.orgId, reservationId: input.reservationId, costCents: result.actualCostCents });
+    }
+    if (result.kind === 'settled') checkSpendThresholds(input.orgId, input.sessionId, result.actualCostCents);
+    return { costCents, invocationIds: result.invocationIds, deferred: false };
+  }
+
+  // #7717 item 2: the debit intent (platform spend only) commits with the
+  // ledger rows; delivery never throws, and a failure stays on the outbox row
+  // for the sweep (retryable) or an operator re-drive (terminal).
+  const { invocationIds, debit } = await recordUnreservedInvocations({
+    orgId: input.orgId,
+    invocations: rows,
+    sessionId: input.sessionId,
+    messageCount: input.messageCount ?? 1,
+    toolExecutionCount: input.toolExecutionCount ?? 0,
+    turnCount: input.turnCount ?? 1,
+    ...(sdkUsage ? { sdkUsage } : {}),
+  });
+  if (debit) await deliverCreditDebit(debit);
+  checkSpendThresholds(input.orgId, input.sessionId, costCents);
+  return { costCents, invocationIds, deferred: false };
+}
+
+/**
+ * Debit a settled reservation's platform spend exactly once (review finding 1),
+ * keyed `ai-settlement:<reservation id>`, and record the outcome durably:
+ * debited → stamped; 4xx → stamped FAILED (terminal, Sentry
+ * `ai_credit_debit_rejected`, operator-visible, never retried); 5xx / 408 /
+ * 429 / transport → counted and left for the sweep to retry under the SAME
+ * key, until MAX_CREDIT_DEBIT_ATTEMPTS. `costCents` must be the amount the
+ * reservation stored (the sweep re-sends exactly that; the billing service
+ * 409s a key reused with another amount). Never throws: the AI turn already
+ * happened and settled.
+ */
+export async function debitSettledCredits(input: { orgId: string; reservationId: string; costCents: number }): Promise<CreditDebitOutcome> {
+  try {
+    const result = await debitBillingCredits(input.orgId, input.costCents, {
+      idempotencyKey: creditDebitIdempotencyKey(input.reservationId),
+    });
+    switch (result.kind) {
+      case 'debited':
+        await markCreditsDebited(input.reservationId);
+        return 'debited';
+      case 'not_configured':
+        return 'not_configured';
+      case 'rejected': {
+        await recordCreditDebitFailure(input.reservationId, result.code);
+        console.error('[AI] platform credit debit REJECTED; stamped failed for an operator', {
+          orgId: input.orgId, reservationId: input.reservationId, costCents: input.costCents, code: result.code,
+        });
+        if (shouldReport('ai_credit_debit_rejected', input.orgId)) {
+          captureMessage('AI platform credit debit rejected; spend not debited', {
+            eventCode: 'ai_credit_debit_rejected', tags: billingTags(input.orgId, result.status),
+          });
+        }
+        return 'rejected';
+      }
+      case 'retryable': {
+        const { attempts, exhausted } = await recordCreditDebitRetry(input.reservationId, result.code);
+        console.warn('[AI] platform credit debit not confirmed; the sweep retries it under the same key', {
+          orgId: input.orgId, reservationId: input.reservationId, code: result.code, attempts, exhausted,
+        });
+        if (exhausted) {
+          if (shouldReport('ai_credit_debit_retries_exhausted', input.orgId)) {
+            captureMessage('AI platform credit debit never confirmed; retries exhausted', {
+              eventCode: 'ai_credit_debit_retries_exhausted', tags: billingTags(input.orgId, result.status),
+            });
+          }
+        }
+        return exhausted ? 'retries_exhausted' : 'retry_scheduled';
+      }
+    }
+  } catch (error) {
+    const message = safeErrorMessage(error);
+    console.error('[AI] platform credit debit bookkeeping failed; the sweep retries it', {
+      orgId: input.orgId, reservationId: input.reservationId, error: message,
+    });
+    captureException(new Error(`AI credit debit bookkeeping failed: ${message}`));
+    return 'bookkeeping_failed';
+  }
+}
+
+function billingTags(orgId: string, status: number | null): Record<string, string> {
+  return { org_id: orgId, ai_billing_http_status: status === null ? 'none' : String(status) };
+}
+
+function reportUnrecordedSettlement(input: SettleInvocationInput, costCents: number): void {
+  console.error('[AI] settlement deferred but NOT persisted; spend is unrecorded and the reservation stays indeterminate', {
+    eventCode: 'ai_settlement_unrecorded',
+    orgId: input.orgId,
+    reservationId: input.reservationId ?? null,
+    sessionId: input.sessionId,
+    agentRunId: input.agentRunId,
+    surface: input.binding.surface,
+    costCents,
+  });
+  // Never throttled: each one is a distinct reservation an operator has to reconcile.
+  captureMessage('AI settlement deferred but not persisted; spend is unrecorded', {
+    eventCode: 'ai_settlement_unrecorded',
+    level: 'error',
+    tags: { org_id: input.orgId, ...(input.reservationId ? { ai_reservation_id: input.reservationId } : {}) },
+  });
+}

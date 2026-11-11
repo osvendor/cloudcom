@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { MONITOR_KINDS } from '@breeze/shared';
+import { MONITOR_KINDS, RECOVERY_CONDITION_KINDS } from '@breeze/shared';
 import { validateConditions } from '../../alertConditions';
 import { MONITOR_KIND_SPECS, applyOverrides, getMonitorKindSpec } from './index';
 
@@ -32,11 +32,16 @@ const SAMPLES: Record<string, Record<string, unknown>> = {
       { kind: 'offline', condition: { durationMinutes: 10 } },
     ],
   },
+  // W03 (hardware & RAID monitoring).
+  hardware_health: { componentTypes: ['physical_disk'], minHealth: 'critical', includePredictiveFailure: true, consecutiveSnapshots: 2 },
+  time_sync: { findings: ['sync_stale'], consecutiveSnapshots: 2 },
+  // W06 (workload inventory image currency).
+  container_image_currency: { minDaysBehind: 7 },
 };
 
 describe('monitor kind registry (#5289)', () => {
-  it('ships nineteen kinds after W05c1', () => {
-    expect(MONITOR_KINDS).toHaveLength(19);
+  it('ships twenty-two kinds with hardware health, time sync and container image currency', () => {
+    expect(MONITOR_KINDS).toHaveLength(22);
   });
 
   it('has a spec for every kind and every compiled condition validates against alertConditions', () => {
@@ -47,6 +52,11 @@ describe('monitor kind registry (#5289)', () => {
       const compiled = spec.toAlertCondition(condition, { monitorId: 'm0000000-0000-4000-8000-000000000001' });
       expect(validateConditions(compiled), `${kind}: ${JSON.stringify(compiled)}`).toEqual([]);
     }
+  });
+
+  it('recoverySupported is set on exactly the kinds the shared validator accepts a recovery condition for', () => {
+    const supported = MONITOR_KINDS.filter((kind) => MONITOR_KIND_SPECS[kind].recoverySupported === true);
+    expect(supported).toEqual([...RECOVERY_CONDITION_KINDS]);
   });
 
   it('cpu compiles to a threshold on cpuPercent', () => {

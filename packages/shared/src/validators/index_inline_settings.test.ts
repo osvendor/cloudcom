@@ -1,12 +1,14 @@
 import { describe, it, expect } from 'vitest';
+import * as validators from './index';
 import {
   patchInlineSettingsSchema,
   policyAppRuleSchema,
   ringAutoApproveSchema,
+  ringAppRulesSchema,
+  canonicalAppRuleKey,
   mergeRingAutoApproveWrite,
   eventLogInlineSettingsSchema,
   sensitiveDataInlineSettingsSchema,
-  monitoringInlineSettingsSchema,
   deviceLifecycleInlineSettingsSchema,
 } from './index';
 
@@ -149,7 +151,6 @@ describe('patchInlineSettingsSchema', () => {
     expect(result.success).toBe(true);
     if (result.success) {
       expect(result.data.sources).toEqual(['os']);
-      expect(result.data.autoApprove).toBe(false);
       expect(result.data.scheduleFrequency).toBe('weekly');
       expect(result.data.scheduleTime).toBe('02:00');
       expect(result.data.scheduleDayOfWeek).toBe('sun');
@@ -160,10 +161,6 @@ describe('patchInlineSettingsSchema', () => {
 
   it('should reject invalid scheduleTime', () => {
     expect(patchInlineSettingsSchema.safeParse({ scheduleTime: '25:00' }).success).toBe(false);
-  });
-
-  it('should reject autoApprove without severities', () => {
-    expect(patchInlineSettingsSchema.safeParse({ autoApprove: true, autoApproveSeverities: [] }).success).toBe(false);
   });
 
   it('should accept legacy source values', () => {
@@ -207,72 +204,46 @@ describe('patchInlineSettingsSchema offlineBehavior (#5128 W3)', () => {
   });
 });
 
-describe('patchInlineSettingsSchema app rules + deferral', () => {
-  it('defaults autoApproveDeferralDays to 0 and apps to []', () => {
-    const result = patchInlineSettingsSchema.safeParse({});
-    expect(result.success).toBe(true);
-    if (!result.success) return;
-    expect(result.data.autoApproveDeferralDays).toBe(0);
-    expect(result.data.apps).toEqual([]);
+describe('patchInlineSettingsSchema retired policy-level approval keys (#8188)', () => {
+  // Auto-approval and per-app block/pin rules live on the Update Ring
+  // (patch_policies.auto_approve / app_rules). The policy schema no longer
+  // defines them, so zod strips them: a stale client's write is ignored rather
+  // than validated, defaulted or stored.
+  const RETIRED = ['apps', 'autoApprove', 'autoApproveSeverities', 'autoApproveDeferralDays'] as const;
+
+  it('does not default any retired key', () => {
+    const parsed = patchInlineSettingsSchema.parse({});
+    for (const key of RETIRED) expect(parsed).not.toHaveProperty(key);
   });
 
-  it('accepts a valid block rule and a valid pin rule', () => {
-    const result = patchInlineSettingsSchema.safeParse({
-      apps: [
-        { source: 'third_party', packageId: 'Mozilla.Firefox', action: 'block' },
-        { source: 'third_party', packageId: 'VideoLAN.VLC', displayName: 'VLC', action: 'pin', pinnedVersion: '3.0.20' },
-      ],
+  it('strips valid retired keys from a payload', () => {
+    const parsed = patchInlineSettingsSchema.parse({
+      sources: ['os'],
+      autoApprove: true,
+      autoApproveSeverities: ['critical'],
+      autoApproveDeferralDays: 7,
+      apps: [{ source: 'third_party', packageId: 'Mozilla.Firefox', action: 'block' }],
     });
-    expect(result.success).toBe(true);
+    for (const key of RETIRED) expect(parsed).not.toHaveProperty(key);
+    expect(parsed.sources).toEqual(['os']);
   });
 
-  it('rejects a pin rule without pinnedVersion', () => {
-    const result = patchInlineSettingsSchema.safeParse({
-      apps: [{ source: 'third_party', packageId: 'VideoLAN.VLC', action: 'pin' }],
-    });
-    expect(result.success).toBe(false);
-  });
-
-  it('rejects duplicate (source, packageId) entries case-insensitively', () => {
-    const result = patchInlineSettingsSchema.safeParse({
-      apps: [
-        { source: 'third_party', packageId: 'Mozilla.Firefox', action: 'block' },
-        { source: 'third_party', packageId: 'mozilla.firefox', action: 'pin', pinnedVersion: '120.0' },
-      ],
-    });
-    expect(result.success).toBe(false);
-  });
-
-  it('rejects negative or >60 deferral days', () => {
-    expect(patchInlineSettingsSchema.safeParse({ autoApproveDeferralDays: -1 }).success).toBe(false);
-    expect(patchInlineSettingsSchema.safeParse({ autoApproveDeferralDays: 61 }).success).toBe(false);
-  });
-
-  it('still rejects autoApprove without severities (existing refinement intact)', () => {
-    expect(patchInlineSettingsSchema.safeParse({ autoApprove: true, autoApproveSeverities: [] }).success).toBe(false);
-  });
-
-  it('rejects duplicates across the third_party/custom bucket (same packageId, different source)', () => {
-    const result = patchInlineSettingsSchema.safeParse({
-      apps: [
-        { source: 'third_party', packageId: 'Mozilla.Firefox', action: 'block' },
-        { source: 'custom', packageId: 'mozilla.firefox', action: 'pin', pinnedVersion: '120.0' },
-      ],
-    });
-    expect(result.success).toBe(false);
-  });
-
-  it('rejects apps arrays longer than 200 entries', () => {
-    const apps = Array.from({ length: 201 }, (_, i) => ({
-      source: 'third_party' as const,
-      packageId: `Vendor.App${i}`,
-      action: 'block' as const,
-    }));
-    expect(patchInlineSettingsSchema.safeParse({ apps }).success).toBe(false);
-  });
-
-  it('rejects non-integer autoApproveDeferralDays', () => {
-    expect(patchInlineSettingsSchema.safeParse({ autoApproveDeferralDays: 2.5 }).success).toBe(false);
+  it('no longer rejects shapes only the retired keys made invalid (they are stripped, not checked)', () => {
+    for (const payload of [
+      { autoApprove: true, autoApproveSeverities: [] },
+      { autoApproveDeferralDays: 61 },
+      { apps: [{ source: 'third_party', packageId: 'VideoLAN.VLC', action: 'pin' }] },
+      {
+        apps: [
+          { source: 'third_party', packageId: 'Mozilla.Firefox', action: 'block' },
+          { source: 'custom', packageId: 'mozilla.firefox', action: 'block' },
+        ],
+      },
+    ]) {
+      const result = patchInlineSettingsSchema.safeParse(payload);
+      expect(result.success).toBe(true);
+      if (result.success) for (const key of RETIRED) expect(result.data).not.toHaveProperty(key);
+    }
   });
 });
 
@@ -367,6 +338,69 @@ describe('patchInlineSettingsSchema reboot deferral (#3207)', () => {
       rebootDeferralMinutes: 1440,
     });
     expect(parsed.rebootDelayMinutes).toBe(1440);
+  });
+});
+
+describe('patchInlineSettingsSchema restart-prompt text (#8030)', () => {
+  it('defaults every prompt field to null so existing policies keep the built-in text', () => {
+    const parsed = patchInlineSettingsSchema.parse({});
+    expect(parsed.rebootPromptTitle).toBeNull();
+    expect(parsed.rebootPromptBody).toBeNull();
+    expect(parsed.rebootPromptButton).toBeNull();
+  });
+
+  it('canonicalizes blank, whitespace-only, null and absent to the same null', () => {
+    for (const value of ['', '   ', null, undefined]) {
+      const parsed = patchInlineSettingsSchema.parse({
+        rebootPromptTitle: value,
+        rebootPromptBody: value,
+        rebootPromptButton: value,
+      });
+      expect(parsed.rebootPromptTitle).toBeNull();
+      expect(parsed.rebootPromptBody).toBeNull();
+      expect(parsed.rebootPromptButton).toBeNull();
+    }
+  });
+
+  it('trims and keeps custom text, including the countdown placeholder and newlines in the body', () => {
+    const parsed = patchInlineSettingsSchema.parse({
+      rebootPromptTitle: '  Neustart geplant ',
+      rebootPromptBody: 'Neustart in {{countdown}}.\nBitte speichern Sie Ihre Arbeit.',
+      rebootPromptButton: 'Jetzt neu starten',
+    });
+    expect(parsed.rebootPromptTitle).toBe('Neustart geplant');
+    expect(parsed.rebootPromptBody).toBe('Neustart in {{countdown}}.\nBitte speichern Sie Ihre Arbeit.');
+    expect(parsed.rebootPromptButton).toBe('Jetzt neu starten');
+  });
+
+  it('enforces the length limits', () => {
+    expect(() => patchInlineSettingsSchema.parse({ rebootPromptTitle: 'a'.repeat(100) })).not.toThrow();
+    expect(() => patchInlineSettingsSchema.parse({ rebootPromptTitle: 'a'.repeat(101) })).toThrow();
+    expect(() => patchInlineSettingsSchema.parse({ rebootPromptBody: 'a'.repeat(500) })).not.toThrow();
+    expect(() => patchInlineSettingsSchema.parse({ rebootPromptBody: 'a'.repeat(501) })).toThrow();
+    expect(() => patchInlineSettingsSchema.parse({ rebootPromptButton: 'a'.repeat(40) })).not.toThrow();
+    expect(() => patchInlineSettingsSchema.parse({ rebootPromptButton: 'a'.repeat(41) })).toThrow();
+  });
+
+  it('rejects markup characters in every field', () => {
+    for (const field of ['rebootPromptTitle', 'rebootPromptBody', 'rebootPromptButton']) {
+      expect(() => patchInlineSettingsSchema.parse({ [field]: '<b>Restart</b>' })).toThrow();
+      expect(() => patchInlineSettingsSchema.parse({ [field]: 'a > b' })).toThrow();
+    }
+  });
+
+  it('rejects control characters, allowing newline and tab only in the body', () => {
+    expect(() => patchInlineSettingsSchema.parse({ rebootPromptTitle: 'a\nb' })).toThrow();
+    expect(() => patchInlineSettingsSchema.parse({ rebootPromptButton: 'a\tb' })).toThrow();
+    expect(() => patchInlineSettingsSchema.parse({ rebootPromptBody: 'a\u0000b' })).toThrow();
+    expect(() => patchInlineSettingsSchema.parse({ rebootPromptBody: 'a\u001b[31mb' })).toThrow();
+    expect(() => patchInlineSettingsSchema.parse({ rebootPromptBody: 'a\tb\nc' })).not.toThrow();
+  });
+
+  it('rejects placeholders other than {{countdown}} so a typo cannot reach a user verbatim', () => {
+    expect(() => patchInlineSettingsSchema.parse({ rebootPromptBody: 'in {{countdwon}}' })).toThrow();
+    expect(() => patchInlineSettingsSchema.parse({ rebootPromptTitle: 'in {{ countdown }}' })).toThrow();
+    expect(() => patchInlineSettingsSchema.parse({ rebootPromptButton: 'Now {{countdown}}' })).not.toThrow();
   });
 });
 
@@ -511,182 +545,6 @@ describe('sensitiveDataInlineSettingsSchema', () => {
 });
 
 // ============================================
-// Monitoring Inline Settings
-// ============================================
-
-describe('monitoringInlineSettingsSchema', () => {
-  it('should accept defaults', () => {
-    const result = monitoringInlineSettingsSchema.safeParse({});
-    expect(result.success).toBe(true);
-    if (result.success) {
-      expect(result.data.checkIntervalSeconds).toBe(60);
-      expect(result.data.watches).toEqual([]);
-      expect(result.data.eventLogAlerts).toEqual([]);
-      expect(result.data.alertRules).toEqual([]);
-    }
-  });
-
-  it('should accept watch entry', () => {
-    const result = monitoringInlineSettingsSchema.safeParse({
-      watches: [
-        {
-          watchType: 'service',
-          name: 'wuauserv',
-        },
-      ],
-    });
-    expect(result.success).toBe(true);
-  });
-
-  it('should accept process watch with thresholds', () => {
-    const result = monitoringInlineSettingsSchema.safeParse({
-      watches: [
-        {
-          watchType: 'process',
-          name: 'nginx',
-          cpuThresholdPercent: 80,
-          memoryThresholdMb: 512,
-          autoRestart: true,
-          maxRestartAttempts: 5,
-        },
-      ],
-    });
-    expect(result.success).toBe(true);
-  });
-
-  // #3491/#3492: a saved watch loads back from the DB with nulls in the three
-  // nullable columns, and the editor posts them straight back. Rejecting null
-  // made an existing policy impossible to re-save once any watch had an unset
-  // field — the reported error named exactly these three paths.
-  it('should accept a saved watch round-tripped with null optional fields', () => {
-    const result = monitoringInlineSettingsSchema.safeParse({
-      watches: [
-        {
-          watchType: 'service',
-          name: 'wuauserv',
-          displayName: null,
-          cpuThresholdPercent: null,
-          memoryThresholdMb: null,
-        },
-      ],
-    });
-    expect(result.success).toBe(true);
-    if (result.success) {
-      // Preserved as null rather than coerced: the write path stores `?? null`
-      // and the agent delivery check is `!= null`, so both spellings behave
-      // identically downstream.
-      const watch = result.data.watches[0];
-      expect(watch?.displayName).toBeNull();
-      expect(watch?.cpuThresholdPercent).toBeNull();
-      expect(watch?.memoryThresholdMb).toBeNull();
-    }
-  });
-
-  // Covers all three widened fields, not just one: nullable must not become
-  // "accepts anything". Type and range checks have to survive the change.
-  it.each([
-    ['displayName wrong type', { displayName: 42 }],
-    ['displayName too long', { displayName: 'x'.repeat(256) }],
-    ['cpuThresholdPercent wrong type', { cpuThresholdPercent: 'high' }],
-    ['cpuThresholdPercent above max', { cpuThresholdPercent: 101 }],
-    ['cpuThresholdPercent below min', { cpuThresholdPercent: -1 }],
-    ['memoryThresholdMb wrong type', { memoryThresholdMb: 'lots' }],
-    ['memoryThresholdMb below min', { memoryThresholdMb: -1 }],
-  ])('still rejects %s after the nullable widening', (_label, patch) => {
-    expect(
-      monitoringInlineSettingsSchema.safeParse({
-        watches: [{ watchType: 'process', name: 'nginx', ...patch }],
-      }).success
-    ).toBe(false);
-  });
-
-  it('should reject checkIntervalSeconds below 10', () => {
-    expect(
-      monitoringInlineSettingsSchema.safeParse({ checkIntervalSeconds: 9 }).success
-    ).toBe(false);
-  });
-
-  it('should reject checkIntervalSeconds above 3600', () => {
-    expect(
-      monitoringInlineSettingsSchema.safeParse({ checkIntervalSeconds: 3601 }).success
-    ).toBe(false);
-  });
-
-  it('should reject watches over 200', () => {
-    const watches = Array.from({ length: 201 }, (_, i) => ({
-      watchType: 'service' as const,
-      name: `svc${i}`,
-    }));
-    expect(
-      monitoringInlineSettingsSchema.safeParse({ watches }).success
-    ).toBe(false);
-  });
-
-  it('should reject non-empty eventLogAlerts (moved to the Alerts feature)', () => {
-    const result = monitoringInlineSettingsSchema.safeParse({
-      eventLogAlerts: [
-        {
-          name: 'Security Alert',
-          category: 'security',
-          level: 'critical',
-        },
-      ],
-    });
-    expect(result.success).toBe(false);
-    if (!result.success) expect(JSON.stringify(result.error.issues)).toContain('Alerts feature');
-  });
-
-  // Pre-consolidation this exercised a 50-item cap; now any non-empty
-  // eventLogAlerts is write-blocked (see write-barrier tests above), so a
-  // large payload is rejected for that reason rather than a size limit.
-  it('should reject a large eventLogAlerts payload (write-blocked, not size-limited)', () => {
-    const alerts = Array.from({ length: 51 }, (_, i) => ({
-      name: `alert${i}`,
-      category: 'security' as const,
-      level: 'error' as const,
-    }));
-    expect(
-      monitoringInlineSettingsSchema.safeParse({ eventLogAlerts: alerts }).success
-    ).toBe(false);
-  });
-
-  it('should reject non-empty alertRules (moved to the Alerts feature)', () => {
-    const result = monitoringInlineSettingsSchema.safeParse({
-      alertRules: [
-        {
-          name: 'CPU Alert',
-          conditions: [{ type: 'metric', metric: 'cpu', operator: 'gt', value: 90 }],
-        },
-      ],
-    });
-    expect(result.success).toBe(false);
-    if (!result.success) expect(JSON.stringify(result.error.issues)).toContain('Alerts feature');
-  });
-
-  // Pre-consolidation these exercised shape/size validation on individual
-  // rule entries; now any non-empty alertRules is write-blocked outright
-  // (see write-barrier tests above), so these payloads are rejected for
-  // that reason rather than the entry-level rules they used to test.
-  it('should reject a non-empty alertRules payload regardless of entry shape', () => {
-    const result = monitoringInlineSettingsSchema.safeParse({
-      alertRules: [{ name: 'Test', conditions: [] }],
-    });
-    expect(result.success).toBe(false);
-  });
-
-  it('should reject a large alertRules payload (write-blocked, not size-limited)', () => {
-    const rules = Array.from({ length: 101 }, (_, i) => ({
-      name: `rule${i}`,
-      conditions: [{ type: 'metric' as const }],
-    }));
-    expect(
-      monitoringInlineSettingsSchema.safeParse({ alertRules: rules }).success
-    ).toBe(false);
-  });
-});
-
-
-// ============================================
 // device_lifecycle (#2787 item 4) — purge removed devices after N days
 // ============================================
 
@@ -728,5 +586,63 @@ describe('deviceLifecycleInlineSettingsSchema', () => {
     expect(
       deviceLifecycleInlineSettingsSchema.safeParse({ purgeRemovedAfterDays: 30, purgeEverything: true }).success,
     ).toBe(false);
+  });
+});
+
+describe('retired inline settings validators', () => {
+  it.each(['alertRuleInlineSettingsSchema', 'monitoringInlineSettingsSchema'])('does not export %s', (name) => {
+    expect(validators).not.toHaveProperty(name);
+  });
+});
+
+// ============================================
+// Ring App Rules (#8184 W01)
+// ============================================
+
+describe('ringAppRulesSchema', () => {
+  it('accepts block and pin rules', () => {
+    const r = ringAppRulesSchema.safeParse([
+      { source: 'third_party', packageId: 'Mozilla.Firefox', action: 'block' },
+      { source: 'custom', packageId: 'acme.tool', action: 'pin', pinnedVersion: '1.2.3' },
+    ]);
+    expect(r.success).toBe(true);
+  });
+
+  it('accepts an empty list', () => {
+    expect(ringAppRulesSchema.safeParse([]).success).toBe(true);
+  });
+
+  it('rejects a pin without a version', () => {
+    expect(ringAppRulesSchema.safeParse([{ source: 'third_party', packageId: 'x', action: 'pin' }]).success).toBe(false);
+  });
+
+  it('rejects duplicates by canonical key (custom/third_party bucket, case-insensitive id)', () => {
+    const r = ringAppRulesSchema.safeParse([
+      { source: 'third_party', packageId: 'Mozilla.Firefox', action: 'block' },
+      { source: 'custom', packageId: 'mozilla.firefox', action: 'block' },
+    ]);
+    expect(r.success).toBe(false);
+    if (!r.success) expect(r.error.issues[0]?.path).toEqual([1, 'packageId']);
+  });
+
+  it('accepts 200 rules and rejects 201', () => {
+    const rules = (n: number) => Array.from({ length: n }, (_, i) => ({ source: 'third_party', packageId: `p${i}`, action: 'block' }));
+    expect(ringAppRulesSchema.safeParse(rules(200)).success).toBe(true);
+    expect(ringAppRulesSchema.safeParse(rules(201)).success).toBe(false);
+  });
+
+  it('rejects a non-array', () => {
+    expect(ringAppRulesSchema.safeParse({ source: 'third_party', packageId: 'x', action: 'block' }).success).toBe(false);
+  });
+});
+
+describe('canonicalAppRuleKey', () => {
+  it('collapses custom into third_party and lowercases', () => {
+    expect(canonicalAppRuleKey('custom', 'A.B')).toBe('third_party|a.b');
+    expect(canonicalAppRuleKey('third_party', 'A.B')).toBe('third_party|a.b');
+  });
+
+  it('keeps other sources in their own bucket', () => {
+    expect(canonicalAppRuleKey('microsoft', 'KB123')).toBe('microsoft|kb123');
   });
 });

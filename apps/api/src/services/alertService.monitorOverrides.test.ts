@@ -42,6 +42,8 @@ const { dbMock, resultsQueue, captureExceptionMock, resolveMonitorsForDeviceMock
   };
 });
 
+vi.mock('./alertLifecycle/resolve', async (importOriginal) =>
+  (await import('../testUtils/alertLifecycleMock')).legacyLifecycleModule(await importOriginal()));
 vi.mock('drizzle-orm', () => ({
   eq: (col: unknown, val: unknown) => ({ op: 'eq', col, val }),
   and: (...args: unknown[]) => ({ op: 'and', args }),
@@ -57,7 +59,7 @@ vi.mock('drizzle-orm', () => ({
   desc: (col: unknown) => ({ op: 'desc', col }),
 }));
 
-vi.mock('../db', () => ({ db: dbMock }));
+vi.mock('../db', () => ({ db: dbMock, withSystemDbAccessContext: (fn: () => unknown) => fn() }));
 
 vi.mock('../db/schema', () => ({
   alerts: { id: 'alerts.id' },
@@ -97,14 +99,11 @@ vi.mock('./alertConditions', () => ({
 vi.mock('./alertCooldown', () => ({
   isCooldownActive: vi.fn(() => Promise.resolve(false)),
   setCooldown: vi.fn(() => Promise.resolve()),
-  isConfigPolicyRuleCooling: vi.fn(),
-  markConfigPolicyRuleCooldown: vi.fn(),
   recordStateTransition: vi.fn(() => Promise.resolve()),
   isFlapping: vi.fn(() => Promise.resolve(false)),
 }));
 
 vi.mock('./featureConfigResolver', () => ({
-  resolveAlertRulesForDevice: vi.fn(),
   resolveMaintenanceConfigForDevice: vi.fn(),
   isInMaintenanceWindow: vi.fn(),
 }));
@@ -117,9 +116,17 @@ vi.mock('../jobs/alertCorrelation', () => ({ enqueueAlertCorrelation: vi.fn(() =
 // Deliberately NOT mocked: './monitors/kinds' (applyOverrides + getMonitorKindSpec)
 // is the real implementation under test here.
 
-import { getApplicableRules } from './alertService';
+import { getApplicableRules, evaluateDeviceAlerts } from './alertService';
+import type { DeviceHierarchy } from './deviceHierarchy';
+import { resolveMaintenanceConfigForDevice } from './featureConfigResolver';
 
 const DEVICE_ID = 'device-1';
+
+const HIERARCHY: DeviceHierarchy = {
+  deviceId: DEVICE_ID, orgId: 'org-1', siteId: 'site-1', deviceRole: 'workstation',
+  osType: 'windows', org: { partnerId: 'partner-1', type: 'customer' }, site: null,
+  groupIds: ['group-1'],
+};
 
 const TEMPLATE_CONDITIONS = { type: 'threshold', metric: 'cpuPercent', operator: 'gt', value: 80 };
 
@@ -229,5 +236,40 @@ describe('getApplicableRules — invalid monitor override fallback (#5289)', () 
     const [applicable] = result;
     expect(applicable?.effectiveConditions).toEqual(TEMPLATE_CONDITIONS);
     expect(captureExceptionMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('alert evaluation hierarchy reuse', () => {
+  it('returns the same rules and overrides using three fewer reads', async () => {
+    resolveMonitorsForDeviceMock.mockResolvedValue({ kind: 'resolved', monitors: [] });
+    pushHappyPathQueue();
+    const legacy = await getApplicableRules(DEVICE_ID);
+    const legacyReads = dbMock.select.mock.calls.length;
+    dbMock.select.mockClear();
+    pushHappyPathQueue();
+    resultsQueue.splice(0, 3); // hierarchy replaces device, groups and owner-org reads
+    const reused = await getApplicableRules(DEVICE_ID, { hierarchy: HIERARCHY });
+    expect(reused).toEqual(legacy);
+    expect(dbMock.select).toHaveBeenCalledTimes(legacyReads - 3);
+    expect(resolveMonitorsForDeviceMock).toHaveBeenLastCalledWith(DEVICE_ID, dbMock, { hierarchy: HIERARCHY });
+    expect(resultsQueue).toEqual([]);
+  });
+
+  it('passes the same current hierarchy to maintenance and monitor resolution', async () => {
+    resolveMonitorsForDeviceMock.mockResolvedValue({ kind: 'resolved', monitors: [] });
+    resultsQueue.push([]); // no rules; no further device/template lookup
+    expect(await evaluateDeviceAlerts(DEVICE_ID, { hierarchy: HIERARCHY })).toEqual([]);
+    expect(resolveMaintenanceConfigForDevice).toHaveBeenLastCalledWith(DEVICE_ID, { hierarchy: HIERARCHY });
+    expect(resolveMonitorsForDeviceMock).toHaveBeenLastCalledWith(DEVICE_ID, dbMock, { hierarchy: HIERARCHY });
+    expect(dbMock.select).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects another device hierarchy before database or resolver work', async () => {
+    const opts = { hierarchy: { ...HIERARCHY, deviceId: 'other-device', orgId: 'other-org' } };
+    await expect(getApplicableRules(DEVICE_ID, opts)).rejects.toThrow('was passed to a resolver');
+    await expect(evaluateDeviceAlerts(DEVICE_ID, opts)).rejects.toThrow('was passed to a resolver');
+    expect(dbMock.select).not.toHaveBeenCalled();
+    expect(resolveMonitorsForDeviceMock).not.toHaveBeenCalled();
+    expect(resolveMaintenanceConfigForDevice).not.toHaveBeenCalled();
   });
 });

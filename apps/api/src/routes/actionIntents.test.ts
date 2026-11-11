@@ -11,6 +11,7 @@ const {
   hasSealedMock,
   unsealMock,
   burnMock,
+  checkToolPermMock,
 } = vi.hoisted(() => ({
   selectMock: vi.fn(),
   getUserPermissionsMock: vi.fn(),
@@ -21,6 +22,7 @@ const {
   hasSealedMock: vi.fn(() => true),
   unsealMock: vi.fn(() => 'Tmp-Pass-1234!'),
   burnMock: vi.fn(async () => true),
+  checkToolPermMock: vi.fn((): string | null => null),
 }));
 
 vi.mock('../db', () => ({
@@ -31,6 +33,9 @@ vi.mock('../db', () => ({
 vi.mock('../db/schema/actionIntents', () => ({
   actionIntents: { id: 'action_intents.id' },
 }));
+vi.mock('../db/schema/approvals', () => ({
+  approvalRequests: { id: 'approval_requests.id', intentId: 'approval_requests.intent_id', userId: 'approval_requests.user_id' },
+}));
 vi.mock('../middleware/auth', () => ({
   authMiddleware: async (_c: unknown, next: () => Promise<void>) => next(),
 }));
@@ -38,6 +43,9 @@ vi.mock('../services/permissions', () => ({
   getUserPermissions: getUserPermissionsMock,
   canAccessOrg: canAccessOrgMock,
   userCanDecideApprovals: userCanDecideApprovalsMock,
+}));
+vi.mock('../services/aiGuardrails', () => ({
+  checkToolPermissionForResolvedUser: checkToolPermMock,
 }));
 vi.mock('../services/auditEvents', () => ({ writeRouteAudit: writeRouteAuditMock }));
 vi.mock('../services/actionIntents/metrics', () => ({
@@ -88,14 +96,19 @@ function mockIntentSelect(rows: unknown[]) {
   });
 }
 
-function buildApp(userId = 'user-1'): Hono {
+function buildApp(
+  userId = 'user-1',
+  scope: 'organization' | 'system' = 'organization',
+  principal: Record<string, unknown> = { kind: 'user_session' },
+): Hono {
   const app = new Hono();
   app.use('*', async (c, next) => {
     c.set('auth', {
-      scope: 'organization',
-      orgId: ORG_ID,
+      scope,
+      orgId: scope === 'system' ? null : ORG_ID,
       partnerId: null,
       accessibleOrgIds: [ORG_ID],
+      principal,
       user: { id: userId, email: 'tech@example.com', name: 'Tech' },
       canAccessOrg: () => true,
       orgCondition: () => undefined,
@@ -117,6 +130,8 @@ beforeEach(() => {
   burnMock.mockResolvedValue(true);
   canAccessOrgMock.mockReturnValue(true);
   userCanDecideApprovalsMock.mockReturnValue(true);
+  checkToolPermMock.mockReturnValue(null);
+  getUserPermissionsMock.mockResolvedValue({ some: 'perms' });
 });
 
 describe('POST /action-intents/:id/reveal-secret', () => {
@@ -142,6 +157,67 @@ describe('POST /action-intents/:id/reveal-secret', () => {
     const evt = recordActionIntentEventMock.mock.calls[0]![0] as Record<string, unknown>;
     expect(evt.outcome).toBe('revealed');
     expect(JSON.stringify(evt)).not.toContain(PLAINTEXT);
+  });
+
+  it('requester path re-resolves permissions live against the intent org and tool', async () => {
+    mockIntentSelect([baseIntent()]);
+    const res = await reveal(buildApp('user-1'));
+    expect(res.status).toBe(200);
+    expect(getUserPermissionsMock).toHaveBeenCalledWith('user-1', expect.objectContaining({ orgId: ORG_ID }));
+    expect(checkToolPermMock).toHaveBeenCalledWith('m365_reset_password', expect.any(Object), { some: 'perms' });
+  });
+
+  it('requester who no longer holds the permission to create the intent gets 403', async () => {
+    mockIntentSelect([baseIntent()]);
+    checkToolPermMock.mockReturnValue('Insufficient permissions: requires organizations.write');
+    const res = await reveal(buildApp('user-1'));
+    expect(res.status).toBe(403);
+    expect(burnMock).not.toHaveBeenCalled();
+    expect(unsealMock).not.toHaveBeenCalled();
+    const audit = writeRouteAuditMock.mock.calls[0]![1] as Record<string, unknown>;
+    expect(audit.result).toBe('denied');
+  });
+
+  it('requester who lost access to the intent org gets 403', async () => {
+    mockIntentSelect([baseIntent()]);
+    canAccessOrgMock.mockReturnValue(false);
+    const res = await reveal(buildApp('user-1'));
+    expect(res.status).toBe(403);
+    expect(burnMock).not.toHaveBeenCalled();
+  });
+
+  it('requester with no resolvable permissions gets 403', async () => {
+    mockIntentSelect([baseIntent()]);
+    getUserPermissionsMock.mockResolvedValue(null);
+    const res = await reveal(buildApp('user-1'));
+    expect(res.status).toBe(403);
+    expect(burnMock).not.toHaveBeenCalled();
+  });
+
+  it('platform-admin requester (system scope, no membership) resolves via the live system branch and may reveal', async () => {
+    mockIntentSelect([baseIntent()]);
+    getUserPermissionsMock.mockImplementation(async (_id: string, ctx: Record<string, unknown>) =>
+      ctx.scope === 'system' && !ctx.orgId && !ctx.partnerId ? { scope: 'system' } : null);
+    const res = await reveal(buildApp('user-1', 'system'));
+    expect(res.status).toBe(200);
+    expect(getUserPermissionsMock).toHaveBeenCalledWith('user-1', { scope: 'system' });
+  });
+
+  it('demoted ex-platform-admin (system scope, live grant gone) is denied', async () => {
+    mockIntentSelect([baseIntent()]);
+    getUserPermissionsMock.mockResolvedValue(null);
+    const res = await reveal(buildApp('user-1', 'system'));
+    expect(res.status).toBe(403);
+    expect(getUserPermissionsMock).toHaveBeenCalledWith('user-1', { scope: 'system' });
+    expect(burnMock).not.toHaveBeenCalled();
+  });
+
+  it('platform admin may reveal an API-key-requested intent via the admin fallback', async () => {
+    mockIntentSelect([baseIntent({ requestedByUserId: null, requestingApiKeyId: 'key-1' })]);
+    getUserPermissionsMock.mockImplementation(async (_id: string, ctx: Record<string, unknown>) =>
+      ctx.scope === 'system' && !ctx.orgId ? { scope: 'system' } : null);
+    const res = await reveal(buildApp('admin-1', 'system'));
+    expect(res.status).toBe(200);
   });
 
   it('a different user than the requester gets 403, burn never called, denial audited', async () => {
@@ -232,6 +308,87 @@ describe('POST /action-intents/:id/reveal-secret', () => {
   it('non-uuid id is rejected with 400 before any db access', async () => {
     const res = await reveal(buildApp(), 'not-a-uuid');
     expect(res.status).toBe(400);
+    expect(selectMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('GET /action-intents/:id/status', () => {
+  const statusReq = (app: Hono, id = INTENT_ID) => app.request(`/action-intents/${id}/status`);
+  const statusIntent = (o: Record<string, unknown> = {}) =>
+    baseIntent({
+      status: 'approved',
+      actionName: 'manage_patches',
+      targetSummary: 'Install patches on 3 devices',
+      approvalScope: 'four_eyes',
+      requestingClientLabel: 'MCP · Claude Code',
+      expiresAt: new Date('2026-10-23T00:00:00Z'),
+      createdAt: new Date('2026-10-22T00:00:00Z'),
+      ...o,
+    });
+  function mockApproverSelect(rows: unknown[]) {
+    selectMock.mockReturnValueOnce({
+      from: vi.fn().mockReturnValue({
+        where: vi.fn().mockReturnValue({ limit: vi.fn().mockResolvedValue(rows) }),
+      }),
+    });
+  }
+
+  it('requester sees the mapped status and display fields, no result/arguments', async () => {
+    mockIntentSelect([statusIntent()]);
+    const res = await statusReq(buildApp('user-1'));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body).toEqual({
+      id: INTENT_ID,
+      status: 'in_progress',
+      actionLabel: 'manage_patches',
+      targetSummary: 'Install patches on 3 devices',
+      approvalScope: 'four_eyes',
+      requestingClientLabel: 'MCP · Claude Code',
+      expiresAt: '2026-10-23T00:00:00.000Z',
+      createdAt: '2026-10-22T00:00:00.000Z',
+    });
+    expect(JSON.stringify(body)).not.toContain('enc:v3');
+    expect(selectMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('a fanned-out approver (approval_requests row) sees the status', async () => {
+    mockIntentSelect([statusIntent({ requestedByUserId: 'someone-else', status: 'pending_approval' })]);
+    mockApproverSelect([{ id: 'ar-1' }]);
+    const res = await statusReq(buildApp('approver-1'));
+    expect(res.status).toBe(200);
+    expect((await res.json()).status).toBe('pending_approval');
+  });
+
+  it('another org member who is neither requester nor approver gets the uniform 404', async () => {
+    mockIntentSelect([statusIntent({ requestedByUserId: 'someone-else' })]);
+    mockApproverSelect([]);
+    const res = await statusReq(buildApp('bystander'));
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ error: 'not_found' });
+  });
+
+  it('unknown id returns the identical 404 body', async () => {
+    mockIntentSelect([]);
+    const res = await statusReq(buildApp('user-1'));
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ error: 'not_found' });
+  });
+
+  it('malformed id returns the identical 404 body without touching the db', async () => {
+    const res = await statusReq(buildApp('user-1'), 'not-a-uuid');
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ error: 'not_found' });
+    expect(selectMock).not.toHaveBeenCalled();
+  });
+
+  it('an API-key / MCP principal is refused before any db read', async () => {
+    const res = await statusReq(buildApp('user-1', 'organization', { kind: 'api_key', apiKeyId: 'k1' }));
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ error: 'not_found' });
+    expect(selectMock).not.toHaveBeenCalled();
+    const oauth = await statusReq(buildApp('user-1', 'organization', { kind: 'oauth_grant' }));
+    expect(oauth.status).toBe(404);
     expect(selectMock).not.toHaveBeenCalled();
   });
 });

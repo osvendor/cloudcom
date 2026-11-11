@@ -1,7 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+// The holding-org refusal reads the org; the positional db mocks below do not model it.
+vi.mock('../services/unassignedPool/protectedOrg', () => ({ isHoldingOrg: vi.fn(async () => false) }));
 import { Hono } from 'hono';
 import { M365_PERMISSION_PROFILES } from '@breeze/shared/m365';
 
+const CURRENT_MANIFEST_VERSION = M365_PERMISSION_PROFILES['customer-graph-actions'].version;
 const ORG_ID = '11111111-1111-4111-8111-111111111111';
 const OTHER_ORG_ID = '22222222-2222-4222-8222-222222222222';
 const USER_ID = '33333333-3333-4333-8333-333333333333';
@@ -26,10 +30,13 @@ const { authRef, mocks } = vi.hoisted(() => ({
   authRef: { current: null as AuthState | null },
   mocks: {
     list: vi.fn(),
+    listStale: vi.fn(),
     initiate: vi.fn(),
+    upgrade: vi.fn(),
     retest: vi.fn(),
     disconnect: vi.fn(),
     onboardingEnabled: vi.fn(() => true),
+    onboardingAvailability: vi.fn((): string => 'enabled'),
     buildBindingCookie: vi.fn(() => 'binding-cookie=opaque; HttpOnly; SameSite=Lax'),
     buildActionsBindingCookie: vi.fn(() => 'breeze_m365_graph_actions_consent=opaque; Path=/api/v1/m365/actions-consent/callback; HttpOnly; SameSite=Lax'),
     audit: vi.fn(),
@@ -43,6 +50,9 @@ const { authRef, mocks } = vi.hoisted(() => ({
     readDisconnect: vi.fn(),
     readOnboardingEnabled: vi.fn(() => true),
     readAudit: vi.fn(),
+    pending: vi.fn(),
+    continueConsent: vi.fn(),
+    cancelConfirmation: vi.fn(),
   },
 }));
 
@@ -82,13 +92,19 @@ vi.mock('../services/permissions', () => ({
 vi.mock('../services/m365ControlPlane/writeActionConnectionService', async (importActual) => ({
   ...await importActual<typeof import('../services/m365ControlPlane/writeActionConnectionService')>(),
   listCustomerGraphActionsConnections: mocks.list,
+  listStaleManifestCustomerGraphActionsConnections: mocks.listStale,
   initiateCustomerGraphActionsConsent: mocks.initiate,
+  initiateCustomerGraphActionsUpgradeConsent: mocks.upgrade,
   retestCustomerGraphActionsConnection: mocks.retest,
   disconnectCustomerGraphActionsConnection: mocks.disconnect,
+  readPendingCustomerGraphActionsTenantConfirmation: mocks.pending,
+  continueCustomerGraphActionsConsent: mocks.continueConsent,
+  cancelCustomerGraphActionsTenantConfirmation: mocks.cancelConfirmation,
 }));
 
 vi.mock('../services/m365ControlPlane/writeActionRuntimeConfig', () => ({
   isM365CustomerGraphActionsOnboardingEnabledForOrg: mocks.onboardingEnabled,
+  m365CustomerGraphActionsOnboardingAvailability: mocks.onboardingAvailability,
 }));
 
 // Real read module, mocked only in its consent-lifecycle exports — needed so
@@ -104,6 +120,7 @@ vi.mock('../services/m365ControlPlane/connectionService', async (importActual) =
 
 vi.mock('../services/m365ControlPlane/runtimeConfig', () => ({
   isM365CustomerGraphReadOnboardingEnabledForOrg: mocks.readOnboardingEnabled,
+  m365CustomerGraphReadOnboardingAvailability: () => 'enabled',
 }));
 
 vi.mock('../services/m365ControlPlane/browserBinding', () => ({
@@ -130,7 +147,7 @@ import { m365CustomerGraphReadRoutes } from './m365CustomerGraphRead';
 
 const requiredGrant = {
   resourceApplicationId: '00000003-0000-0000-c000-000000000000',
-  appRoleId: '204e0828-b5ca-4ad8-b9f3-f32a958e7cc4',
+  appRoleId: '741f803b-c850-494e-b5df-cde7c675a1ca',
   value: 'User.ReadWrite.All',
 };
 
@@ -141,7 +158,7 @@ function connection(overrides: Record<string, unknown> = {}) {
     tenantId: TENANT_ID,
     clientId: '88888888-8888-4888-8888-888888888888',
     profile: 'customer-graph-actions',
-    permissionManifestVersion: 1,
+    permissionManifestVersion: CURRENT_MANIFEST_VERSION,
     observedGrants: [requiredGrant],
     consentAttemptId: ATTEMPT_ID,
     grantsVerifiedAt: new Date('2026-07-14T10:00:00.000Z'),
@@ -206,15 +223,27 @@ beforeEach(() => {
   authRef.current = auth();
   mocks.onboardingEnabled.mockReturnValue(true);
   mocks.list.mockResolvedValue([]);
+  mocks.listStale.mockResolvedValue([]);
   mocks.initiate.mockResolvedValue({
     connection: connection({ status: 'pending-consent', tenantId: null }),
-    rawState: 'one-time-state',
-    consentUrl: 'https://login.microsoftonline.com/common/adminconsent?server-built=true',
+    binding: {
+      phase: 'identity_verification', rawState: 'one-time-state', connectionId: CONNECTION_ID,
+      consentAttemptId: ATTEMPT_ID, tenantId: null,
+    },
+    authorizationUrl: 'https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize?server-built=true',
+  });
+  mocks.upgrade.mockResolvedValue({
+    connection: connection(),
+    binding: {
+      phase: 'identity_verification', rawState: 'upgrade-state', connectionId: CONNECTION_ID,
+      consentAttemptId: ATTEMPT_ID, tenantId: TENANT_ID,
+    },
+    authorizationUrl: `https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/authorize?state=upgrade-state`,
   });
   mocks.retest.mockResolvedValue(connection());
   mocks.disconnect.mockResolvedValue(connection({
     tenantId: null, clientId: '', displayName: null, status: 'revoked',
-    permissionManifestVersion: 1, observedGrants: [], grantsVerifiedAt: null,
+    permissionManifestVersion: CURRENT_MANIFEST_VERSION, observedGrants: [], grantsVerifiedAt: null,
     lastVerifiedAt: null, grantHealth: undefined,
   }));
   mocks.buildBindingCookie.mockReturnValue('binding-cookie=opaque; HttpOnly; SameSite=Lax');
@@ -230,8 +259,11 @@ beforeEach(() => {
   mocks.readList.mockResolvedValue([]);
   mocks.readInitiate.mockResolvedValue({
     connection: readConnection({ status: 'pending-consent', tenantId: null }),
-    rawState: 'read-one-time-state',
-    consentUrl: 'https://login.microsoftonline.com/common/adminconsent?read-built=true',
+    binding: {
+      phase: 'identity_verification', rawState: 'read-one-time-state', connectionId: CONNECTION_ID,
+      consentAttemptId: ATTEMPT_ID, tenantId: null,
+    },
+    authorizationUrl: 'https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize?read-built=true',
   });
   mocks.readRetest.mockResolvedValue(readConnection());
   mocks.readDisconnect.mockResolvedValue(readConnection({ status: 'revoked' }));
@@ -252,7 +284,7 @@ describe('GET /m365/customer-graph-actions/connections', () => {
     expect(response.status).toBe(200);
     expect(mocks.list).toHaveBeenCalledWith(ORG_ID);
     await expect(response.json()).resolves.toMatchObject({
-      profile: { id: 'customer-graph-actions', displayName: 'Customer Graph Actions', manifestVersion: 1 },
+      profile: { id: 'customer-graph-actions', displayName: 'Customer Graph Actions', manifestVersion: CURRENT_MANIFEST_VERSION },
       onboardingEnabled: true,
       connection: null,
     });
@@ -270,8 +302,8 @@ describe('GET /m365/customer-graph-actions/connections', () => {
       displayName: 'Contoso',
       status: 'active',
       grantHealth: 'active',
-      manifestVersion: 1,
-      currentManifestVersion: 1,
+      manifestVersion: CURRENT_MANIFEST_VERSION,
+      currentManifestVersion: CURRENT_MANIFEST_VERSION,
       observedGrants: [requiredGrant],
       missingGrants: [],
       unexpectedGrants: [],
@@ -284,6 +316,15 @@ describe('GET /m365/customer-graph-actions/connections', () => {
     for (const forbidden of ['clientSecret', 'vaultRef', 'credentialVersion', 'consentAttemptId', 'rawState', 'codeVerifier', 'administratorObjectId']) {
       expect(serialized).not.toContain(forbidden);
     }
+  });
+
+  it('reports which switch is off via onboardingAvailability (#9319)', async () => {
+    mocks.onboardingEnabled.mockReturnValue(false);
+    mocks.onboardingAvailability.mockReturnValueOnce('org_not_enabled');
+    const body = await (await app().request(`/m365/customer-graph-actions/connections?orgId=${ORG_ID}`)).json();
+    expect(body.onboardingEnabled).toBe(false);
+    expect(body.onboardingAvailability).toBe('org_not_enabled');
+    expect(mocks.onboardingAvailability).toHaveBeenCalledWith(ORG_ID);
   });
 
   it('reports onboarding disabled without hiding an existing connection', async () => {
@@ -319,7 +360,88 @@ const mutationRequests = [
   ['consent', (orgId = ORG_ID) => app().request(`/m365/customer-graph-actions/connections/consent?orgId=${orgId}`, { method: 'POST' })],
   ['retest', (orgId = ORG_ID) => app().request(`/m365/customer-graph-actions/connections/${CONNECTION_ID}/retest?orgId=${orgId}`, { method: 'POST' })],
   ['disconnect', (orgId = ORG_ID) => app().request(`/m365/customer-graph-actions/connections/${CONNECTION_ID}/disconnect?orgId=${orgId}`, { method: 'POST' })],
+  ['upgrade-consent', (orgId = ORG_ID) => app().request(`/m365/customer-graph-actions/connections/${CONNECTION_ID}/upgrade-consent?orgId=${orgId}`, { method: 'POST' })],
 ] as const;
+
+describe('GET /m365/customer-graph-actions/connections/stale-manifest', () => {
+  const URL_PATH = '/m365/customer-graph-actions/connections/stale-manifest';
+  const staleRow = {
+    id: CONNECTION_ID,
+    orgId: ORG_ID,
+    orgName: 'Acme',
+    displayName: 'Contoso',
+    tenantId: TENANT_ID,
+    manifestVersion: 2,
+    currentManifestVersion: M365_PERMISSION_PROFILES['customer-graph-actions'].version,
+    status: 'active',
+    lastVerifiedAt: '2026-07-14T10:00:00.000Z',
+  };
+
+  it('requires authentication and organizations:read', async () => {
+    authRef.current = null;
+    expect((await app().request(URL_PATH)).status).toBe(401);
+
+    authRef.current = auth({ scope: 'partner', orgId: null, permissions: new Set(['organizations:write']) });
+    expect((await app().request(URL_PATH)).status).toBe(403);
+    expect(mocks.listStale).not.toHaveBeenCalled();
+  });
+
+  it('returns the partner-scoped list with the current manifest version', async () => {
+    authRef.current = auth({ scope: 'partner', orgId: null, partnerOrgAccess: 'all', accessibleOrgIds: null });
+    mocks.listStale.mockResolvedValue([staleRow]);
+
+    const response = await app().request(URL_PATH);
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      currentManifestVersion: M365_PERMISSION_PROFILES['customer-graph-actions'].version,
+      connections: [staleRow],
+    });
+    expect(mocks.listStale).toHaveBeenCalledTimes(1);
+  });
+
+  it('is not shadowed by the /connections list route (no orgId required)', async () => {
+    authRef.current = auth({ scope: 'partner', orgId: null, partnerOrgAccess: 'all', accessibleOrgIds: null });
+    const response = await app().request(URL_PATH);
+    expect(response.status).toBe(200);
+    expect(mocks.list).not.toHaveBeenCalled();
+  });
+
+  it('refuses an organization-scoped token with a partner-scope message', async () => {
+    const response = await app().request(URL_PATH);
+
+    expect(response.status).toBe(403);
+    expect((await response.json()).error).toMatch(/partner/i);
+    expect(mocks.listStale).not.toHaveBeenCalled();
+  });
+
+  it.each(['?orgId=' + ORG_ID, '?foo=bar', '?limit=5'])('rejects any query parameter (%s) with 400', async (query) => {
+    authRef.current = auth({ scope: 'partner', orgId: null, partnerOrgAccess: 'all', accessibleOrgIds: null });
+
+    const response = await app().request(`${URL_PATH}${query}`);
+
+    expect(response.status).toBe(400);
+    expect(mocks.listStale).not.toHaveBeenCalled();
+  });
+
+  it('serialises exactly the nine safe keys and nothing else', async () => {
+    authRef.current = auth({ scope: 'partner', orgId: null, partnerOrgAccess: 'all', accessibleOrgIds: null });
+    mocks.listStale.mockResolvedValue([{
+      ...staleRow,
+      observedGrants: [requiredGrant], observed_grants: [requiredGrant],
+      vaultRef: 'akv://must-not-leak', credentialVersion: 'must-not-leak',
+      clientId: '88888888-8888-4888-8888-888888888888', client_id: 'must-not-leak',
+    }]);
+
+    const body = await (await app().request(URL_PATH)).json();
+
+    expect(Object.keys(body.connections[0]).sort()).toEqual([
+      'currentManifestVersion', 'displayName', 'id', 'lastVerifiedAt', 'manifestVersion',
+      'orgId', 'orgName', 'status', 'tenantId',
+    ]);
+    expect(JSON.stringify(body)).not.toContain('must-not-leak');
+  });
+});
 
 describe.each(mutationRequests)('%s authorization', (_name, request) => {
   it('requires ORGS_WRITE', async () => {
@@ -360,15 +482,15 @@ describe('POST /m365/customer-graph-actions/connections/consent', () => {
     // Must set the cookie via the ACTIONS-profile binding, never the read one —
     // the two carry distinct cookie names/paths/HMAC contexts (browserBinding.ts).
     expect(mocks.buildActionsBindingCookie).toHaveBeenCalledWith({
-      phase: 'admin_consent', rawState: 'one-time-state', connectionId: CONNECTION_ID,
-      consentAttemptId: ATTEMPT_ID, tenantHint: null,
+      phase: 'identity_verification', rawState: 'one-time-state', connectionId: CONNECTION_ID,
+      consentAttemptId: ATTEMPT_ID, tenantId: null,
     });
     expect(mocks.buildBindingCookie).not.toHaveBeenCalled();
     expect(response.headers.get('set-cookie')).toContain('HttpOnly');
     expect(response.headers.get('set-cookie')).toContain('breeze_m365_graph_actions_consent=');
     expect(response.headers.get('set-cookie')).toContain('Path=/api/v1/m365/actions-consent/callback');
     await expect(response.json()).resolves.toEqual({
-      adminConsentUrl: 'https://login.microsoftonline.com/common/adminconsent?server-built=true',
+      adminConsentUrl: 'https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize?server-built=true',
     });
     expect(mocks.audit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       orgId: ORG_ID,
@@ -376,7 +498,7 @@ describe('POST /m365/customer-graph-actions/connections/consent', () => {
       connectionId: CONNECTION_ID,
       profile: 'customer-graph-actions',
       consentAttemptId: ATTEMPT_ID,
-      manifestVersion: 1,
+      manifestVersion: CURRENT_MANIFEST_VERSION,
       outcome: 'initiated',
       actorId: USER_ID,
     }));
@@ -392,6 +514,73 @@ describe('POST /m365/customer-graph-actions/connections/consent', () => {
   });
 });
 
+describe('POST /m365/customer-graph-actions/connections/:id/upgrade-consent', () => {
+  const post = (orgId = ORG_ID) => app().request(
+    `/m365/customer-graph-actions/connections/${CONNECTION_ID}/upgrade-consent?orgId=${orgId}`,
+    { method: 'POST' },
+  );
+
+  it('passes the scoped id, sets the ACTIONS binding cookie, audits, and returns only the URL', async () => {
+    const response = await post();
+    expect(response.status).toBe(200);
+    expect(mocks.upgrade).toHaveBeenCalledWith({
+      connectionId: CONNECTION_ID,
+      orgId: ORG_ID,
+      auth: expect.objectContaining({ scope: 'organization' }),
+    });
+    await expect(response.json()).resolves.toEqual({
+      adminConsentUrl: `https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/authorize?state=upgrade-state`,
+    });
+    expect(mocks.buildActionsBindingCookie).toHaveBeenCalledWith({
+      phase: 'identity_verification', rawState: 'upgrade-state', connectionId: CONNECTION_ID,
+      consentAttemptId: ATTEMPT_ID, tenantId: TENANT_ID,
+    });
+    expect(mocks.buildBindingCookie).not.toHaveBeenCalled();
+    expect(response.headers.get('set-cookie')).toContain('breeze_m365_graph_actions_consent=');
+    expect(mocks.audit).toHaveBeenCalledTimes(1);
+    expect(mocks.audit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      event: 'm365.customer_graph_actions.upgrade_consent_initiated',
+      orgId: ORG_ID,
+      connectionId: CONNECTION_ID,
+      profile: 'customer-graph-actions',
+      consentAttemptId: ATTEMPT_ID,
+      outcome: 'initiated',
+      actorId: USER_ID,
+    }));
+    expect(JSON.stringify(mocks.audit.mock.calls)).not.toContain('upgrade-state');
+  });
+
+  it('404s an organization the caller cannot access without calling the service', async () => {
+    const response = await post(OTHER_ORG_ID);
+    expect(response.status).toBe(404);
+    expect(mocks.upgrade).not.toHaveBeenCalled();
+    expect(mocks.audit).not.toHaveBeenCalled();
+  });
+
+  it('maps connection_not_found to the non-oracular 404 with no cookie', async () => {
+    mocks.upgrade.mockRejectedValueOnce(Object.assign(new Error('connection_not_found'), { code: 'connection_not_found' }));
+    const response = await post();
+    expect(response.status).toBe(404);
+    await expect(response.json()).resolves.toEqual({ error: 'Connection not found' });
+    expect(response.headers.get('set-cookie')).toBeNull();
+    expect(mocks.audit).not.toHaveBeenCalled();
+  });
+
+  it('409s when the stored manifest is already current', async () => {
+    mocks.upgrade.mockRejectedValueOnce(Object.assign(new Error('manifest_current'), { code: 'manifest_current' }));
+    const response = await post();
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ error: 'Connection operation could not be completed' });
+    expect(response.headers.get('set-cookie')).toBeNull();
+    expect(mocks.audit).not.toHaveBeenCalled();
+  });
+
+  it('is not gated by onboarding enablement', async () => {
+    mocks.onboardingEnabled.mockReturnValue(false);
+    expect((await post()).status).toBe(200);
+  });
+});
+
 describe('scoped connection mutations', () => {
   it('passes only the scoped stored id to retest and returns a safe DTO', async () => {
     const response = await app().request(`/m365/customer-graph-actions/connections/${CONNECTION_ID}/retest?orgId=${ORG_ID}`, { method: 'POST' });
@@ -403,7 +592,7 @@ describe('scoped connection mutations', () => {
     expect(mocks.audit).toHaveBeenCalledTimes(1);
     expect(mocks.audit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       event: 'm365.customer_graph_actions.retested', connectionId: CONNECTION_ID,
-      outcome: 'active', consentAttemptId: ATTEMPT_ID, manifestVersion: 1,
+      outcome: 'active', consentAttemptId: ATTEMPT_ID, manifestVersion: CURRENT_MANIFEST_VERSION,
     }));
   });
 
@@ -441,7 +630,7 @@ describe('scoped connection mutations', () => {
         clientId: null,
         displayName: null,
         status: 'revoked',
-        manifestVersion: 1,
+        manifestVersion: CURRENT_MANIFEST_VERSION,
         observedGrants: [],
         missingGrants: [],
         unexpectedGrants: [],
@@ -475,6 +664,7 @@ const strictOrgQueryRoutes = [
   ['consent', 'POST', '/m365/customer-graph-actions/connections/consent'],
   ['retest', 'POST', `/m365/customer-graph-actions/connections/${CONNECTION_ID}/retest`],
   ['disconnect', 'POST', `/m365/customer-graph-actions/connections/${CONNECTION_ID}/disconnect`],
+  ['upgrade-consent', 'POST', `/m365/customer-graph-actions/connections/${CONNECTION_ID}/upgrade-consent`],
 ] as const;
 
 const invalidOrgQueries = [
@@ -496,6 +686,7 @@ describe.each(strictOrgQueryRoutes)('%s strict orgId query contract', (_name, me
     expect(mocks.initiate).not.toHaveBeenCalled();
     expect(mocks.retest).not.toHaveBeenCalled();
     expect(mocks.disconnect).not.toHaveBeenCalled();
+    expect(mocks.upgrade).not.toHaveBeenCalled();
   });
 
   it.each(invalidOrgQueries)('rejects %s before scope, service, or audit work', async (_case, query) => {
@@ -507,6 +698,7 @@ describe.each(strictOrgQueryRoutes)('%s strict orgId query contract', (_name, me
     expect(mocks.initiate).not.toHaveBeenCalled();
     expect(mocks.retest).not.toHaveBeenCalled();
     expect(mocks.disconnect).not.toHaveBeenCalled();
+    expect(mocks.upgrade).not.toHaveBeenCalled();
     expect(mocks.audit).not.toHaveBeenCalled();
   });
 });
@@ -553,6 +745,18 @@ describe('cross-mount route ownership (mounted exactly as index.ts)', () => {
     expect(mocks.readInitiate).toHaveBeenCalledTimes(1);
   });
 
+  it('routes upgrade-consent under the actions mount to the actions service', async () => {
+    const target = mountedLikeIndex();
+
+    const actionsUpgrade = await target.request(`/m365/customer-graph-actions/connections/${CONNECTION_ID}/upgrade-consent?orgId=${ORG_ID}`, { method: 'POST' });
+    expect(actionsUpgrade.status).toBe(200);
+    expect(mocks.upgrade).toHaveBeenCalledWith(expect.objectContaining({ connectionId: CONNECTION_ID, orgId: ORG_ID }));
+    expect(mocks.audit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      event: 'm365.customer_graph_actions.upgrade_consent_initiated',
+    }));
+    expect(mocks.readAudit).not.toHaveBeenCalled();
+  });
+
   it('routes retest to the profile-matched service for the same connection id shape', async () => {
     const target = mountedLikeIndex();
 
@@ -596,8 +800,8 @@ describe('connection DTO grant health', () => {
     )).json();
 
     expect(body.connection.grantHealth).toBe('active');
-    expect(body.connection.manifestVersion).toBe(1);
-    expect(body.connection.currentManifestVersion).toBe(1);
+    expect(body.connection.manifestVersion).toBe(CURRENT_MANIFEST_VERSION);
+    expect(body.connection.currentManifestVersion).toBe(CURRENT_MANIFEST_VERSION);
   });
 
   it('reports manifest-stale for a row behind the code manifest', async () => {
@@ -612,7 +816,7 @@ describe('connection DTO grant health', () => {
 
     expect(body.connection.grantHealth).toBe('manifest-stale');
     expect(body.connection.manifestVersion).toBe(0);
-    expect(body.connection.currentManifestVersion).toBe(1);
+    expect(body.connection.currentManifestVersion).toBe(CURRENT_MANIFEST_VERSION);
   });
 });
 
@@ -634,6 +838,7 @@ describe('customer-graph-actions mutations — org-wide governance site ceiling'
     expect(mocks.initiate).not.toHaveBeenCalled();
     expect(mocks.retest).not.toHaveBeenCalled();
     expect(mocks.disconnect).not.toHaveBeenCalled();
+    expect(mocks.upgrade).not.toHaveBeenCalled();
   });
 
   it.each(mutationRequests)('%s is 403 when the ceiling is the EMPTY site list', async (_name, request) => {
@@ -650,5 +855,103 @@ describe('customer-graph-actions mutations — org-wide governance site ceiling'
     authRef.current = auth({ allowedSiteIds: ['site-1'] });
     const response = await app().request(`/m365/customer-graph-actions/connections?orgId=${ORG_ID}`);
     expect(response.status).toBe(200);
+  });
+});
+
+describe('confirm-tenant interstitial (W03)', () => {
+  const BASE = '/m365/customer-graph-actions/connections/consent';
+  const HOME_TENANT = '99999999-9999-4999-8999-999999999999';
+  const EXPIRES = new Date('2026-10-03T12:10:00.000Z');
+  const CONSENT_URL = `https://login.microsoftonline.com/${HOME_TENANT}/oauth2/authorize?state=fresh`;
+
+  beforeEach(() => {
+    mocks.pending.mockResolvedValue({ tenantId: HOME_TENANT, administratorUsername: null, expiresAt: EXPIRES });
+    mocks.continueConsent.mockResolvedValue({
+      connection: connection({ status: 'pending-consent', tenantId: null }),
+      binding: {
+        phase: 'admin_consent', rawState: 'fresh', connectionId: CONNECTION_ID, consentAttemptId: ATTEMPT_ID, tenantId: HOME_TENANT,
+      },
+      consentUrl: CONSENT_URL,
+      verifiedTenantId: HOME_TENANT,
+      verifiedAdministratorObjectId: 'abababab-abab-4bab-8bab-abababababab',
+    });
+    mocks.cancelConfirmation.mockResolvedValue(connection({
+      status: 'pending-consent', tenantId: null, lastErrorCode: 'consent_cancelled', grantHealth: undefined,
+    }));
+  });
+
+  it('pending returns the verified tenant (username may be null) for the caller only', async () => {
+    const response = await app().request(`${BASE}/pending?orgId=${ORG_ID}`);
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({
+      tenantId: HOME_TENANT, administratorUsername: null, expiresAt: EXPIRES.toISOString(),
+    });
+    expect(mocks.pending).toHaveBeenCalledWith({ orgId: ORG_ID, actorId: USER_ID });
+    expect(mocks.readList).not.toHaveBeenCalled();
+  });
+
+  it('pending is a 404 when nothing is parked', async () => {
+    mocks.pending.mockResolvedValue(null);
+    expect((await app().request(`${BASE}/pending?orgId=${ORG_ID}`)).status).toBe(404);
+  });
+
+  it('continue sets the ACTIONS consent cookie (never the read one) and returns the server-built URL', async () => {
+    const response = await app().request(`${BASE}/continue?orgId=${ORG_ID}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ tenantId: TENANT_ID }),
+    });
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ adminConsentUrl: CONSENT_URL });
+    expect(mocks.continueConsent).toHaveBeenCalledWith({ orgId: ORG_ID, actorId: USER_ID });
+    expect(mocks.buildActionsBindingCookie).toHaveBeenCalledWith(expect.objectContaining({ phase: 'admin_consent', tenantId: HOME_TENANT }));
+    expect(mocks.buildBindingCookie).not.toHaveBeenCalled();
+    expect(response.headers.get('set-cookie')).toContain('Path=/api/v1/m365/actions-consent/callback');
+    expect(mocks.audit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      event: 'm365.customer_graph_actions.tenant_confirmed', outcome: 'tenant_confirmed', verifiedTenantId: HOME_TENANT,
+    }));
+  });
+
+  it('continue rejects a tenant in the query and 404s a replayed confirmation', async () => {
+    expect((await app().request(`${BASE}/continue?orgId=${ORG_ID}&tenantId=${TENANT_ID}`, { method: 'POST' })).status).toBe(400);
+    expect(mocks.continueConsent).not.toHaveBeenCalled();
+    mocks.continueConsent.mockRejectedValue(Object.assign(new Error('stale_attempt'), { code: 'stale_attempt' }));
+    const replay = await app().request(`${BASE}/continue?orgId=${ORG_ID}`, { method: 'POST' });
+    expect(replay.status).toBe(404);
+    expect(replay.headers.get('set-cookie')).toBeNull();
+  });
+
+  it('cancel records consent_cancelled', async () => {
+    const response = await app().request(`${BASE}/cancel?orgId=${ORG_ID}`, { method: 'POST' });
+    expect(response.status).toBe(200);
+    expect((await response.json()).connection).toMatchObject({ lastErrorCode: 'consent_cancelled', tenantId: null });
+    expect(mocks.audit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      event: 'm365.customer_graph_actions.verification_failed', outcome: 'consent_cancelled',
+    }));
+  });
+
+  it.each([
+    ['GET', 'pending'],
+    ['POST', 'continue'],
+    ['POST', 'cancel'],
+  ] as const)('%s %s requires organizations:write, MFA, the governance gate, and an accessible org', async (method, leaf) => {
+    const url = `${BASE}/${leaf}?orgId=${ORG_ID}`;
+    authRef.current = auth({ permissions: new Set(['organizations:read']) });
+    expect((await app().request(url, { method })).status).toBe(403);
+    authRef.current = auth({ mfa: false });
+    expect((await app().request(url, { method })).status).toBe(403);
+    authRef.current = auth({ allowedSiteIds: [] });
+    expect((await app().request(url, { method })).status).toBe(403);
+    authRef.current = auth();
+    expect((await app().request(`${BASE}/${leaf}?orgId=${OTHER_ORG_ID}`, { method })).status).toBe(404);
+    expect(mocks.pending).not.toHaveBeenCalled();
+    expect(mocks.continueConsent).not.toHaveBeenCalled();
+    expect(mocks.cancelConfirmation).not.toHaveBeenCalled();
+  });
+
+  it('mounted like index.ts, the actions confirm routes are not shadowed by the read router', async () => {
+    const response = await mountedLikeIndex().request(`${BASE}/continue?orgId=${ORG_ID}`, { method: 'POST' });
+    expect(response.status).toBe(200);
+    expect(mocks.continueConsent).toHaveBeenCalledOnce();
   });
 });

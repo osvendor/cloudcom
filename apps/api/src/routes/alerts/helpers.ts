@@ -1,8 +1,10 @@
+import { DEFAULT_ALERT_COOLDOWN_MINUTES } from '@breeze/shared';
 import { ensureOrgAccess } from '../../services/delivery/railContracts';
 export { ensureOrgAccess, resolveWriteOrgId, getEscalationPolicyWithOrgCheck } from '../../services/delivery/railContracts';
-import { and, eq, inArray, isNull, or } from 'drizzle-orm';
+import { and, eq, inArray, isNotNull, isNull, or, sql, type SQL } from 'drizzle-orm';
 import type { NotificationChannelType } from '@breeze/shared';
 import { db, runOutsideDbContext, withSystemDbAccessContext } from '../../db';
+import { legacyLifecycleValues } from '../../services/alertLifecycle/resolve';
 import {
   alertRules,
   alertTemplates,
@@ -23,6 +25,8 @@ import {
   validatePushoverConfig,
 } from '../../services/notificationSenders';
 import { canReadPartnerWideRows } from '../../services/partnerWideAccess';
+import { getNotificationChannelWithConfig } from '../../services/notificationChannelConfig';
+import { readPartnerPushoverDefaults, type PartnerPushoverDefaults } from '../../services/partnerPushoverDefaults';
 
 export type AlertRuleRow = typeof alertRules.$inferSelect;
 export type AlertTemplateRow = typeof alertTemplates.$inferSelect;
@@ -32,7 +36,6 @@ export type AlertRuleOverrides = {
   severity?: string;
   conditions?: unknown;
   cooldownMinutes?: number;
-  cooldown?: number;
   autoResolve?: boolean;
   notificationChannelIds?: string[];
   notificationChannels?: string[];
@@ -47,17 +50,81 @@ export type AlertRuleOverrides = {
   // #5289 — set by ruleConversionService when this rule is converted to a
   // monitor (the rule itself stays, deactivated, as a historical record).
   convertedToMonitorId?: string;
+  // #7626 — stamped by the built-in rule producers (patchAlerts,
+  // policyAlertBridge, configComplianceAlertBridge); read as `unknown`.
+  source?: unknown;
+  policyName?: unknown;
+  configPolicyComplianceRuleName?: unknown;
 };
 
 export { getPagination } from '../../utils/pagination';
 
-/** Device-bound alerts follow current device site; deviceless alerts are org-wide.
+/** Restricted callers see device alerts at the current device site and topology
+ * alerts at their owning site. Org-level alerts require unrestricted access.
  * Callers applying this predicate must left-join devices. */
 export function alertSiteScopeCondition(allowedSiteIds: string[] | undefined) {
   if (allowedSiteIds === undefined) return undefined;
+  if (allowedSiteIds.length === 0) return sql`false`;
+  return or(
+    and(isNotNull(alerts.topologySiteId), inArray(alerts.topologySiteId, allowedSiteIds)),
+    and(isNull(alerts.topologySiteId), isNotNull(alerts.deviceId), inArray(devices.siteId, allowedSiteIds)),
+  );
+}
+
+export { alertOwningSiteId } from '../../services/alertOwnership';
+
+/**
+ * SQL form of {@link alertOwningSiteId}. The query MUST left-join devices on
+ * alerts.device_id (never inner-join: a site-owned alert's origin device may
+ * have moved to another org and be RLS-invisible, yet the alert stays here).
+ */
+export function alertOwningSiteIdSql(): SQL<string | null> {
+  return sql<string | null>`coalesce(${alerts.topologySiteId}, ${devices.siteId})`;
+}
+
+/**
+ * Join-free site predicate for paths that pre-resolve the caller's in-scope
+ * device ids (mobile, AI tools, report generation). `allowedDeviceIds` null =
+ * resolve device sites in SQL when site-restricted; `allowedSiteIds` undefined = no site narrowing; both
+ * unrestricted returns undefined.
+ *
+ *  - device-bound alerts (topology_site_id NULL): device_id IN allowedDeviceIds;
+ *  - site-owned topology alerts: topology_site_id IN allowedSiteIds, and — only
+ *    for an exact-device caller (`deviceAxis`, #6096) — also bound to a device
+ *    in its allowlist. The origin device's site is NEVER the site gate.
+ */
+export function alertSiteScopeByDeviceIds(input: {
+  allowedSiteIds: readonly string[] | undefined;
+  allowedDeviceIds: readonly string[] | null;
+  deviceAxis?: boolean;
+}): SQL | undefined {
+  const { allowedSiteIds, allowedDeviceIds, deviceAxis = false } = input;
+  if (allowedSiteIds === undefined && allowedDeviceIds === null) return undefined;
+  // When sites are restricted but device IDs were not pre-resolved, resolve
+  // the site ceiling in SQL rather than admitting every non-topology alert.
+  const deviceIds = allowedDeviceIds === null
+    ? db.select({ id: devices.id }).from(devices).where(inArray(devices.siteId, [...(allowedSiteIds ?? [])]))
+    : [...allowedDeviceIds];
+  const deviceBound = and(isNull(alerts.topologySiteId), inArray(alerts.deviceId, deviceIds));
+  const siteOwned = and(
+    isNotNull(alerts.topologySiteId),
+    allowedSiteIds === undefined ? undefined : inArray(alerts.topologySiteId, [...allowedSiteIds]),
+    deviceAxis && allowedDeviceIds !== null ? inArray(alerts.deviceId, [...allowedDeviceIds]) : undefined,
+  );
+  return or(deviceBound, siteOwned);
+}
+
+/**
+ * Site gate for alerts already narrowed to ONE accessible device (device
+ * alerts tab, tab counts, device diagnose): a site-owned topology alert whose
+ * origin is this device is shown only when its OWNING topology site is
+ * allowed. Undefined for unrestricted callers.
+ */
+export function alertTopologySiteGate(allowedSiteIds: readonly string[] | undefined): SQL | undefined {
+  if (allowedSiteIds === undefined) return undefined;
   return allowedSiteIds.length === 0
-    ? isNull(alerts.deviceId)
-    : or(isNull(alerts.deviceId), inArray(devices.siteId, allowedSiteIds));
+    ? isNull(alerts.topologySiteId)
+    : or(isNull(alerts.topologySiteId), inArray(alerts.topologySiteId, [...allowedSiteIds]))!;
 }
 
 export async function getAlertRuleWithOrgCheck(
@@ -105,8 +172,8 @@ export async function getAlertRuleWithOrgCheck(
  *    device lives in a site outside their allowlist.
  *
  * The site axis mirrors the alert-list narrowing (`alerts.ts` GET /) and the
- * create-ticket gate (`deviceInSiteScope`): deviceless (org-wide) alerts stay
- * visible; out-of-site alerts return null so the caller surfaces a 404 (no
+ * create-ticket gate (`alertInSiteScope`): org-level and out-of-site alerts
+ * return null so the caller surfaces a 404 (no
  * oracle distinguishing "absent" from "forbidden"). Unrestricted callers
  * (partner/system scope, or org users with no site restriction — i.e.
  * `allowedSiteIds` undefined) are unaffected. Centralizing the site check here
@@ -133,8 +200,13 @@ export async function getAlertWithOrgCheck(
   }
 
   // Site-axis gate. Only restricted callers (allowedSiteIds set) are narrowed.
-  // Deviceless alerts are org-wide and not site-bound, so they pass.
-  if (auth.allowedSiteIds && alert.deviceId) {
+  // A topology policy alert follows its owning topology site (M3-D6), never
+  // its origin device's current site.
+  if (auth.allowedSiteIds && alert.topologySiteId) {
+    return siteAccessCheck(auth.allowedSiteIds)(alert.topologySiteId) ? alert : null;
+  }
+  if (auth.allowedSiteIds !== undefined) {
+    if (!alert.deviceId) return null;
     const [device] = await db
       .select({ siteId: devices.siteId })
       .from(devices)
@@ -152,11 +224,11 @@ export async function getNotificationChannelWithOrgCheck(
   channelId: string,
   auth: { canAccessOrg: (orgId: string) => boolean; scope?: string; partnerId?: string | null }
 ) {
-  const [channel] = await db
-    .select()
-    .from(notificationChannels)
-    .where(eq(notificationChannels.id, channelId))
-    .limit(1);
+  // Joined with its config row (#6379). `config` is null when the DB context
+  // does not OWN the channel (RLS on notification_channel_configs); the access
+  // check below also refuses those callers, so routes never see a null here in
+  // practice.
+  const channel = await getNotificationChannelWithConfig(channelId);
 
   if (!channel) {
     return null;
@@ -330,11 +402,20 @@ export async function validatePushoverChannelInheritance(
       .from(partners)
       .where(eq(partners.id, partnerId))
       .limit(1);
-    return (partner?.settings as { notifications?: Record<string, unknown> } | null)?.notifications ?? null;
+    return partner?.settings ?? null;
   }));
 
-  const partnerToken = typeof inherited?.pushoverAppToken === 'string' && inherited.pushoverAppToken.trim().length > 0;
-  const partnerUser = typeof inherited?.pushoverDefaultUser === 'string' && inherited.pushoverDefaultUser.trim().length > 0;
+  // Opened here too, so a stored default that can no longer be read is
+  // reported at save time rather than as a failed send.
+  let defaults: PartnerPushoverDefaults;
+  try {
+    defaults = readPartnerPushoverDefaults(inherited);
+  } catch (err) {
+    console.warn('[alerts] partner Pushover defaults could not be opened:', err instanceof Error ? err.message : String(err));
+    return 'The partner Pushover defaults could not be read; re-enter them in the partner notification settings';
+  }
+  const partnerToken = Boolean(defaults.appToken);
+  const partnerUser = Boolean(defaults.defaultUser);
 
   if (tokenBlank && !partnerToken) {
     return 'Pushover channel has no token and the partner has no pushoverAppToken configured for inheritance';
@@ -433,8 +514,10 @@ export function formatAlertRuleResponse(rule: AlertRuleRow, template?: AlertTemp
 
   const notificationChannelIds = getNotificationChannelIds(overrides);
   const severity = overrides.severity ?? template?.severity ?? 'medium';
-  const cooldownMinutes = overrides.cooldownMinutes ?? overrides.cooldown ?? template?.cooldownMinutes ?? 15;
-  const autoResolve = overrides.autoResolve ?? template?.autoResolve ?? false;
+  // The rule/template values the engine uses for a legacy rule (one reader:
+  // services/alertLifecycle/resolve.ts). A monitor-managed rule's effective
+  // values resolve per device org at evaluation and are shown on the monitor.
+  const { cooldownMinutes, autoResolve } = legacyLifecycleValues(rule, template);
 
   return {
     id: rule.id,
@@ -460,6 +543,18 @@ export function formatAlertRuleResponse(rule: AlertRuleRow, template?: AlertTemp
     templateName: template?.name,
     // #5289 — lets the web render a compiled rule read-only.
     managedByMonitorId: rule.managedByMonitorId ?? null,
+    // #7206 — built-in system anchor rule (services/monitors/systemManagedRules.ts):
+    // never offered for conversion.
+    systemManaged: template?.isBuiltIn === true,
+    // #7626 — what a built-in rule is about, so the Built-in alerts list can
+    // label `policy-violation:<uuid>` / `config-compliance:<id>:<hash>` rows
+    // by policy / compliance rule instead of their machine names.
+    systemSource: template?.isBuiltIn === true && typeof overrides.source === 'string' ? overrides.source : null,
+    systemSubject: template?.isBuiltIn === true
+      ? (typeof overrides.policyName === 'string' ? overrides.policyName
+        : typeof overrides.configPolicyComplianceRuleName === 'string' ? overrides.configPolicyComplianceRuleName
+          : null)
+      : null,
     // #5289 — lets the Legacy rules list show a "Converted" badge instead of
     // the Convert action for a rule that already went through conversion.
     convertedToMonitorId: overrides.convertedToMonitorId ?? null,
@@ -484,7 +579,7 @@ export async function resolveAlertTemplate(params: {
   const templateName = params.name?.trim() || 'Custom Alert Template';
   const templateSeverity = (params.severity ?? 'medium') as AlertTemplateRow['severity'];
   const templateConditions = params.conditions ?? {};
-  const templateCooldownMinutes = params.cooldownMinutes ?? 15;
+  const templateCooldownMinutes = params.cooldownMinutes ?? DEFAULT_ALERT_COOLDOWN_MINUTES;
   const templateAutoResolve = params.autoResolve ?? false;
 
   if (params.templateId) {

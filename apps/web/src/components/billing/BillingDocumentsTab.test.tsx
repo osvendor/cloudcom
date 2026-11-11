@@ -9,6 +9,10 @@ function renderTab(overrides: Partial<Parameters<typeof BillingDocumentsTab>[0]>
     autoEmailInvoice: true, setAutoEmailInvoice: vi.fn(),
     notifyOnBehalfAcceptance: false, setNotifyOnBehalfAcceptance: vi.fn(),
     deviceAppendix: false, setDeviceAppendix: vi.fn(),
+    lineShowDate: false, setLineShowDate: vi.fn(),
+    lineShowNote: true, setLineShowNote: vi.fn(),
+    lineShowWorkedTime: true, setLineShowWorkedTime: vi.fn(),
+    lineGrouping: 'entry' as const, setLineGrouping: vi.fn(),
     footer: '', setFooter: vi.fn(),
     documentTheme: 'classic' as const, setDocumentTheme: vi.fn(),
     documentPageSize: 'letter' as const, setDocumentPageSize: vi.fn(),
@@ -25,6 +29,27 @@ function renderTab(overrides: Partial<Parameters<typeof BillingDocumentsTab>[0]>
   return props;
 }
 
+describe('BillingDocumentsTab — time entry lines (#8604)', () => {
+  it('renders the loaded values and wires the setters', () => {
+    const props = renderTab({ lineShowDate: true, lineShowNote: false, lineShowWorkedTime: true, lineGrouping: 'day' });
+    expect((screen.getByTestId('partner-billing-line-show-date') as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByTestId('partner-billing-line-show-note') as HTMLInputElement).checked).toBe(false);
+    expect((screen.getByTestId('partner-billing-line-show-worked-time') as HTMLInputElement).checked).toBe(true);
+    const select = screen.getByTestId('partner-billing-line-grouping') as HTMLSelectElement;
+    expect(select.value).toBe('day');
+    expect(select.disabled).toBe(false);
+    fireEvent.click(screen.getByTestId('partner-billing-line-show-note'));
+    expect(props.setLineShowNote).toHaveBeenCalledWith(true);
+    fireEvent.change(select, { target: { value: 'entry' } });
+    expect(props.setLineGrouping).toHaveBeenCalledWith('entry');
+  });
+
+  it('disables the grouping select while show-date is off', () => {
+    renderTab({ lineShowDate: false });
+    expect((screen.getByTestId('partner-billing-line-grouping') as HTMLSelectElement).disabled).toBe(true);
+  });
+});
+
 describe('BillingDocumentsTab', () => {
   it('renders auto-email, device appendix, document theme/size, footer, and the Company card', () => {
     renderTab();
@@ -35,6 +60,23 @@ describe('BillingDocumentsTab', () => {
     expect(screen.getByTestId('partner-billing-footer')).toBeInTheDocument();
     expect(screen.getByTestId('partner-billing-company-name')).toBeInTheDocument();
     expect(screen.getByTestId('partner-billing-website')).toBeInTheDocument();
+  });
+
+  // #7510: one footer per level — this is the PARTNER default, printed on quotes
+  // and invoices; an organization's own footer text overrides it.
+  it('labels the footer as the partner default document footer and names the org override', () => {
+    renderTab();
+    expect(screen.getByLabelText(/document footer/i)).toBe(screen.getByTestId('partner-billing-footer'));
+    expect(screen.getByTestId('partner-billing-footer-help')).toHaveTextContent(/every quote and invoice page/i);
+    expect(screen.getByTestId('partner-billing-footer-help')).toHaveTextContent(/organization's own footer text/i);
+  });
+
+  it('names the document theme by its fonts — "Condensed" read as a layout change, not a font choice', () => {
+    renderTab();
+    expect(screen.getByLabelText('Document fonts')).toBe(screen.getByTestId('partner-billing-document-theme'));
+    const options = [...(screen.getByTestId('partner-billing-document-theme') as HTMLSelectElement).options].map((o) => [o.value, o.text]);
+    // Stored values are unchanged (partners.document_theme, quote presentation snapshots).
+    expect(options).toEqual([['classic', 'Helvetica'], ['condensed', 'Barlow Condensed + DM Sans']]);
   });
 
   it('#6635: renders the on-behalf acceptance notice toggle unchecked by default and wires its setter', () => {
@@ -55,5 +97,49 @@ describe('BillingDocumentsTab', () => {
     const props = renderTab();
     fireEvent.change(screen.getByTestId('partner-billing-company-name'), { target: { value: 'Acme MSP' } });
     expect(props.setCompanyName).toHaveBeenCalledWith('Acme MSP');
+  });
+
+  describe('company-details fallback (#6228)', () => {
+    it('shows the inherited company name (partner name) and its source when the override is blank (sweep C3)', () => {
+      renderTab({ inheritedCompanyName: 'Default Partner' });
+      expect(screen.getByTestId('partner-billing-company-name')).toHaveAttribute('placeholder', 'Default Partner');
+      expect(screen.getByTestId('partner-billing-company-name').parentElement?.textContent).toMatch(/company details/i);
+    });
+
+    it('shows the inherited phone/website as placeholders when the override is blank', () => {
+      renderTab({ inheritedPhone: '555-0100', inheritedWebsite: 'https://acme.test' });
+      expect(screen.getByTestId('partner-billing-phone')).toHaveAttribute('placeholder', '555-0100');
+      expect(screen.getByTestId('partner-billing-website')).toHaveAttribute('placeholder', 'https://acme.test');
+    });
+
+    it('shows "same as company details" when every address override field is blank and a company address exists', () => {
+      renderTab({
+        inheritedAddress: { line1: '1 Company Rd', line2: null, city: 'Company City', region: null, postalCode: null, country: 'CA' },
+      });
+      expect(screen.getByTestId('partner-billing-address-inherited-note')).toBeInTheDocument();
+      expect(screen.queryByTestId('partner-billing-use-company-address')).not.toBeInTheDocument();
+    });
+
+    it('shows a "Use company address" reset once any address override field is non-blank', () => {
+      renderTab({
+        addr1: '1 Override St',
+        inheritedAddress: { line1: '1 Company Rd', line2: null, city: 'Company City', region: null, postalCode: null, country: 'CA' },
+      });
+      expect(screen.getByTestId('partner-billing-use-company-address')).toBeInTheDocument();
+    });
+
+    it('"Use company address" clears every address override field', () => {
+      const props = renderTab({
+        addr1: '1 Override St', city: 'Override City',
+        inheritedAddress: { line1: '1 Company Rd', line2: null, city: 'Company City', region: null, postalCode: null, country: 'CA' },
+      });
+      fireEvent.click(screen.getByTestId('partner-billing-use-company-address'));
+      expect(props.setAddr1).toHaveBeenCalledWith('');
+      expect(props.setAddr2).toHaveBeenCalledWith('');
+      expect(props.setCity).toHaveBeenCalledWith('');
+      expect(props.setRegion).toHaveBeenCalledWith('');
+      expect(props.setPostal).toHaveBeenCalledWith('');
+      expect(props.setCountry).toHaveBeenCalledWith('');
+    });
   });
 });

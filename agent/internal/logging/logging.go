@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -161,17 +162,34 @@ func Init(format, level string, output io.Writer) {
 	slog.SetDefault(defaultLogger)
 }
 
+// DiscardOutput sends every later log line nowhere. Unlike Init it only swaps
+// the root handler (an atomic store), so it is safe while other goroutines
+// are logging. A support session calls it before closing its log file and
+// removing its folder (#7629).
+func DiscardOutput() {
+	// Same concrete type as Init stores: the root handler is an atomic.Value.
+	rootHandler.set(&shippingHandler{base: slog.NewTextHandler(io.Discard, nil)})
+}
+
 // InitShipper initializes the log shipper (call after enrollment).
+//
+// shipperMu is held only for the pointer swap. Stop and Start both run
+// outside it: Start logs when it applies a persisted set_log_level override,
+// and the old shipper's override loop may be logging while Stop waits for it.
+// Those records go through shippingHandler.Handle, which read-locks
+// shipperMu, so doing either under the write lock deadlocks (#7416).
 func InitShipper(cfg ShipperConfig) {
+	shipper := NewShipper(cfg)
+
 	shipperMu.Lock()
-	defer shipperMu.Unlock()
+	old := globalShipper
+	globalShipper = shipper
+	shipperMu.Unlock()
 
-	if globalShipper != nil {
-		globalShipper.Stop()
+	if old != nil {
+		old.Stop()
 	}
-
-	globalShipper = NewShipper(cfg)
-	globalShipper.Start()
+	shipper.Start()
 }
 
 // StopShipper gracefully stops the log shipper.
@@ -235,8 +253,22 @@ type shippingHandler struct {
 	groups []string
 }
 
+// Enabled admits a record if EITHER the local handler or the shipper wants
+// it. Consulting only the local handler (log_level, default info) meant slog
+// discarded Debug records before Handle ran, so a set_log_level=debug
+// override could never ship a debug line (#7416). Handle re-checks the local
+// level so such records do not leak into the local log.
 func (h *shippingHandler) Enabled(ctx context.Context, level slog.Level) bool {
-	return h.base.Enabled(ctx, level)
+	if h.base.Enabled(ctx, level) {
+		return true
+	}
+	if fwd := activeForwarder.Load(); fwd != nil && level >= fwd.minLevel {
+		return true
+	}
+	shipperMu.RLock()
+	shipper := globalShipper
+	shipperMu.RUnlock()
+	return shipper != nil && shipper.ShouldShip(level)
 }
 
 func (h *shippingHandler) Handle(ctx context.Context, record slog.Record) error {
@@ -246,33 +278,73 @@ func (h *shippingHandler) Handle(ctx context.Context, record slog.Record) error 
 	shipperMu.RUnlock()
 
 	if shipper != nil && (shipper.ShouldShip(record.Level) || h.shipAlways(record)) {
-		fields := make(map[string]any)
-		for _, attr := range h.attrs {
-			if attr.Key != KeyShipAlways {
-				addField(fields, h.groups, attr)
-			}
-		}
-		record.Attrs(func(a slog.Attr) bool {
-			if a.Key != KeyShipAlways {
-				addField(fields, h.groups, a)
-			}
-			return true
-		})
-
-		entry := LogEntry{
-			Timestamp:    record.Time,
-			Level:        strings.ToLower(record.Level.String()),
-			Component:    extractComponent(fields),
-			Message:      record.Message,
-			Fields:       fields,
-			AgentVersion: shipper.agentVersion,
-		}
-
-		shipper.Enqueue(entry)
+		shipper.Enqueue(h.entry(record, shipper.agentVersion))
 	}
 
-	// Still write to local handler, without the shipping marker.
-	return h.base.Handle(ctx, stripShipAlways(record))
+	// Hand warn+ records to the IPC forwarder of a helper that has no
+	// shipper of its own (#9266). The forwarder must not block or log.
+	if fwd := activeForwarder.Load(); fwd != nil && record.Level >= fwd.minLevel {
+		fwd.fn(h.entry(record, ""))
+	}
+
+	// Still write to local handler, without the shipping marker and with
+	// typed-nil errors defused (see localAttrs) — but only at the local level:
+	// Enabled also admits records that are here purely to be shipped.
+	if !h.base.Enabled(ctx, record.Level) {
+		return nil
+	}
+	return h.base.Handle(ctx, localRecord(record))
+}
+
+// entry builds the LogEntry for record: the logger's and the record's attrs,
+// minus the ShipAlways marker. A fresh map per call, so the shipper and the
+// forwarder never share one.
+func (h *shippingHandler) entry(record slog.Record, agentVersion string) LogEntry {
+	fields := make(map[string]any)
+	for _, attr := range h.attrs {
+		if attr.Key != KeyShipAlways {
+			addField(fields, h.groups, attr)
+		}
+	}
+	record.Attrs(func(a slog.Attr) bool {
+		if a.Key != KeyShipAlways {
+			addField(fields, h.groups, a)
+		}
+		return true
+	})
+	return LogEntry{
+		Timestamp:    record.Time,
+		Level:        strings.ToLower(record.Level.String()),
+		Component:    extractComponent(fields),
+		Message:      record.Message,
+		Fields:       fields,
+		AgentVersion: agentVersion,
+	}
+}
+
+// forwarder is the installed SetForwarder sink.
+type forwarder struct {
+	minLevel slog.Level
+	fn       func(LogEntry)
+}
+
+var activeForwarder atomic.Pointer[forwarder]
+
+// SetForwarder installs fn to receive every record at or above minLevel, in
+// addition to the local log and the shipper. A nil fn removes it.
+//
+// It exists for helper processes that have no shipping credentials of their
+// own — the Windows helpers, where no user-readable file carries the helper
+// token — so their warn+ lines can be relayed to the agent over IPC and reach
+// Agent Logs that way (#9266). fn runs synchronously on the logging
+// goroutine: it must not block, and it must not log at or above minLevel
+// itself, or it recurses.
+func SetForwarder(minLevel slog.Level, fn func(LogEntry)) {
+	if fn == nil {
+		activeForwarder.Store(nil)
+		return
+	}
+	activeForwarder.Store(&forwarder{minLevel: minLevel, fn: fn})
 }
 
 // shipAlways reports whether the record, or the logger it came from, carries
@@ -303,22 +375,30 @@ func (h *shippingHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	copy(groups, h.groups)
 
 	return &shippingHandler{
-		base:   h.base.WithAttrs(withoutShipAlways(attrs)),
+		base:   h.base.WithAttrs(localAttrs(attrs)),
 		attrs:  merged,
 		groups: groups,
 	}
 }
 
-// withoutShipAlways drops the ShipAlways marker so it never reaches the
-// local handler's output. Returns the input slice untouched when absent.
-func withoutShipAlways(attrs []slog.Attr) []slog.Attr {
+// localAttrs prepares attrs for the local (base) handler: it drops the
+// ShipAlways marker so it never reaches the local output, and rewrites nil and
+// typed-nil error values to "<nil>". Returns the input slice untouched when
+// neither applies.
+//
+// The rewrite matters because slog's text and JSON handlers format an error
+// through fmt, which calls Error on a typed-nil pointer and recovers the
+// resulting nil-pointer fault. On Windows hosts with AMX, recovering a hardware
+// fault writes past the goroutine stack and corrupts the Go heap
+// (golang/go#81238, #6943) — errorText already avoids that on the ship path.
+func localAttrs(attrs []slog.Attr) []slog.Attr {
 	for i, a := range attrs {
-		if a.Key == KeyShipAlways {
-			out := make([]slog.Attr, 0, len(attrs)-1)
+		if a.Key == KeyShipAlways || needsLocalRewrite(a.Value) {
+			out := make([]slog.Attr, 0, len(attrs))
 			out = append(out, attrs[:i]...)
-			for _, b := range attrs[i+1:] {
+			for _, b := range attrs[i:] {
 				if b.Key != KeyShipAlways {
-					out = append(out, b)
+					out = append(out, localAttr(b))
 				}
 			}
 			return out
@@ -327,24 +407,61 @@ func withoutShipAlways(attrs []slog.Attr) []slog.Attr {
 	return attrs
 }
 
-// stripShipAlways returns a copy of the record without the ShipAlways marker,
-// or the record itself when it carries none.
-func stripShipAlways(record slog.Record) slog.Record {
-	found := false
+// needsLocalRewrite reports whether v (or, for a group, any nested value)
+// holds a nil or typed-nil error. It does not resolve LogValuers: resolving
+// here would call LogValue a second time, and the base handler resolves them
+// itself.
+func needsLocalRewrite(v slog.Value) bool {
+	switch v.Kind() {
+	case slog.KindGroup:
+		for _, a := range v.Group() {
+			if needsLocalRewrite(a.Value) {
+				return true
+			}
+		}
+	case slog.KindAny:
+		if err, ok := v.Any().(error); ok {
+			return isNilError(err)
+		}
+	}
+	return false
+}
+
+// localAttr returns a with every nil or typed-nil error value (including those
+// nested in groups) replaced by the string "<nil>".
+func localAttr(a slog.Attr) slog.Attr {
+	if !needsLocalRewrite(a.Value) {
+		return a
+	}
+	if a.Value.Kind() == slog.KindGroup {
+		group := a.Value.Group()
+		out := make([]slog.Attr, len(group))
+		for i, g := range group {
+			out[i] = localAttr(g)
+		}
+		return slog.Attr{Key: a.Key, Value: slog.GroupValue(out...)}
+	}
+	return slog.String(a.Key, "<nil>")
+}
+
+// localRecord returns a copy of the record prepared for the local handler
+// (see localAttrs), or the record itself when no attr needs changing.
+func localRecord(record slog.Record) slog.Record {
+	changed := false
 	record.Attrs(func(a slog.Attr) bool {
-		if a.Key == KeyShipAlways {
-			found = true
+		if a.Key == KeyShipAlways || needsLocalRewrite(a.Value) {
+			changed = true
 			return false
 		}
 		return true
 	})
-	if !found {
+	if !changed {
 		return record
 	}
 	out := slog.NewRecord(record.Time, record.Level, record.Message, record.PC)
 	record.Attrs(func(a slog.Attr) bool {
 		if a.Key != KeyShipAlways {
-			out.AddAttrs(a)
+			out.AddAttrs(localAttr(a))
 		}
 		return true
 	})
@@ -373,8 +490,9 @@ func addField(fields map[string]any, groups []string, attr slog.Attr) {
 		keyParts = append(keyParts, attr.Key)
 	}
 
-	if attr.Value.Kind() == slog.KindGroup {
-		for _, nested := range attr.Value.Group() {
+	value := attr.Value.Resolve()
+	if value.Kind() == slog.KindGroup {
+		for _, nested := range value.Group() {
 			addField(fields, keyParts, nested)
 		}
 		return
@@ -383,7 +501,50 @@ func addField(fields map[string]any, groups []string, attr slog.Attr) {
 	if len(keyParts) == 0 {
 		return
 	}
-	fields[strings.Join(keyParts, ".")] = attr.Value.Any()
+	fields[strings.Join(keyParts, ".")] = shippableValue(value.Any())
+}
+
+// shippableValue converts values that encoding/json cannot represent into their
+// text. An error value (errors.New, fmt.Errorf, errors.Join, ...) has no exported
+// fields, so it marshals as {} and the message is lost from the shipped row.
+func shippableValue(v any) any {
+	if err, ok := v.(error); ok {
+		return errorText(err)
+	}
+	return v
+}
+
+// errorText returns err.Error(), or "<nil>" for a nil or typed-nil error.
+//
+// A typed-nil error is detected with reflect instead of calling Error and
+// recovering the nil-pointer fault. On Windows a recovered hardware fault can
+// corrupt the heap on AVX-512/AMX hosts (golang/go#81238), which crashed the
+// Windows agent tests (#6943). The recover stays only as a last resort for an
+// Error method that panics on its own.
+func errorText(err error) (text string) {
+	if isNilError(err) {
+		return "<nil>"
+	}
+	defer func() {
+		if recover() != nil {
+			text = "<nil>"
+		}
+	}()
+	return err.Error()
+}
+
+// isNilError reports whether err is nil or wraps a nil pointer, map, slice,
+// func, chan or interface value.
+func isNilError(err error) bool {
+	if err == nil {
+		return true
+	}
+	v := reflect.ValueOf(err)
+	switch v.Kind() {
+	case reflect.Pointer, reflect.Map, reflect.Slice, reflect.Func, reflect.Chan, reflect.Interface, reflect.UnsafePointer:
+		return v.IsNil()
+	}
+	return false
 }
 
 func extractComponent(fields map[string]any) string {

@@ -23,6 +23,18 @@ const {
   })),
 }));
 
+// Existing route cases exercise the non-isolated ICE plan.
+vi.mock('./remote/desktopRelayPolicy', async () => {
+  const { getIceServers } = await import('./remote/helpers');
+  return {
+    resolveDesktopIcePlan: async (_deviceId: string, scope: import('./remote/helpers').TurnCredentialScope) => ({
+      ok: true,
+      relayOnly: false,
+      iceServers: getIceServers(scope),
+    }),
+  };
+});
+
 vi.mock('../services/desktopSessionFinalization', () => ({
   persistDesktopFinalizationIntent: persistDesktopFinalizationIntentMock,
   finalizeDesktopSessionOnce: finalizeDesktopSessionOnceMock,
@@ -124,8 +136,10 @@ vi.mock('../services/rate-limit', () => ({
 }));
 
 vi.mock('./remote/helpers', () => ({
+  createDesktopStartCommandId: vi.fn((id: string) => `desk-start-${id}-${crypto.randomUUID()}`),
   logSessionAudit: vi.fn(async () => undefined),
   getIceServers: vi.fn(() => []),
+  buildRemoteSessionPromptPayload: vi.fn(async () => undefined),
 }));
 
 vi.mock('../services/clientIp', () => ({
@@ -174,7 +188,23 @@ import {
   __createDesktopSharedLeasesForTest,
   __resetDesktopWsForTest,
   closeDesktopSessionLifecycle,
+  settleDesktopStreamStart,
 } from './desktopWs';
+
+/**
+ * Play the agent accepting the relay's published desktop_stream_start (the
+ * relay forwards nothing and sends no "connected" before that). Throws when the
+ * open published no start: call it only where one is expected.
+ */
+function acceptPublishedStart(): void {
+  const calls = vi.mocked(sendCommandToAgent).mock.calls.filter(
+    ([, cmd]) => (cmd as { type?: string }).type === 'desktop_stream_start',
+  );
+  const last = calls.at(-1);
+  if (!last) throw new Error("acceptPublishedStart: the open published no desktop_stream_start");
+  const [agentId, cmd] = last as unknown as [string, { id: string; payload: { sessionId: string } }];
+  settleDesktopStreamStart(cmd.payload.sessionId, agentId, cmd.id, { outcome: 'accepted' });
+}
 
 // -------------------------------------------------------------------
 // Helpers
@@ -226,7 +256,7 @@ function mockUpdateNoReturn() {
 }
 
 // select().from().where().limit().for('update') — the row-locked read
-// commitDesktopStreamStartIntent issues (SEC-038 W02, real impl in
+// commitDesktopStreamStartIntent issues (real impl in
 // remoteDesktopStartIntent.ts, not mocked in this file).
 function mockSelectLimitForChain(result: unknown) {
   return {
@@ -311,7 +341,7 @@ function setupSuccessfulValidation() {
         })
       })
     } as any)
-    // commitDesktopStreamStartIntent: row-locked read (SEC-038 W02)
+    // commitDesktopStreamStartIntent: row-locked read
     .mockReturnValueOnce(mockSelectLimitForChain([{
       status: session.status,
       terminationPhase: 'none',
@@ -368,6 +398,7 @@ describe('desktopWs', () => {
       const handlers = captureWsHandlers(SESSION_ID, 'valid-ticket');
       const ws = wsMock();
       await handlers.onOpen({}, ws);
+      acceptPublishedStart();
 
       const options = {
         expectedWs: ws as never,
@@ -420,6 +451,7 @@ describe('desktopWs', () => {
       const handlers = captureWsHandlers(SESSION_ID, 'valid-ticket');
       const ws = wsMock();
       await handlers.onOpen({}, ws);
+      acceptPublishedStart();
       ws.close.mockClear();
 
       const cleanup = closeDesktopSessionLifecycle(SESSION_ID, {
@@ -459,6 +491,7 @@ describe('desktopWs', () => {
       const handlers = captureWsHandlers(SESSION_ID, 'valid-ticket');
       const ws = wsMock();
       await handlers.onOpen({}, ws);
+      acceptPublishedStart();
 
       await expect(closeDesktopSessionLifecycle(SESSION_ID, {
         expectedWs: ws as never,
@@ -492,6 +525,8 @@ describe('desktopWs', () => {
       const ws = wsMock();
 
       await handlers.onOpen({}, ws);
+
+      acceptPublishedStart();
       expect(isDesktopSessionOwnedByAgent(SESSION_ID, AGENT_ID)).toBe(true);
 
       vi.mocked(db.update).mockClear();
@@ -530,6 +565,8 @@ describe('desktopWs', () => {
 
       await handlers.onOpen({}, ws);
 
+      acceptPublishedStart();
+
       vi.mocked(db.update).mockClear();
       vi.mocked(db.update).mockReturnValue(mockUpdateNoReturn() as any);
       vi.mocked(sendCommandToAgent).mockClear();
@@ -557,6 +594,8 @@ describe('desktopWs', () => {
       const ws = wsMock();
 
       await handlers.onOpen({}, ws);
+
+      acceptPublishedStart();
 
       finalizeDesktopSessionOnceMock.mockRejectedValueOnce(new Error('DB down'));
 
@@ -612,6 +651,7 @@ describe('desktopWs', () => {
       const handlers = captureWsHandlers(SESSION_ID, 'valid-ticket');
       const ws = wsMock();
       await handlers.onOpen({}, ws);
+      acceptPublishedStart();
       expect(getActiveDesktopSessionCount()).toBe(1);
 
       // Now flip to revoked and let the ping interval fire.
@@ -637,6 +677,7 @@ describe('desktopWs', () => {
       const handlers = captureWsHandlers(SESSION_ID, 'valid-ticket');
       const ws = wsMock();
       await handlers.onOpen({}, ws);
+      acceptPublishedStart();
       expect(getActiveDesktopSessionCount()).toBe(1);
 
       vi.mocked(renewRevocationLease).mockResolvedValue({
@@ -667,6 +708,7 @@ describe('desktopWs', () => {
       const handlers = captureWsHandlers(SESSION_ID, 'valid-ticket');
       const ws = wsMock();
       await handlers.onOpen({}, ws);
+      acceptPublishedStart();
       ws.send.mockClear();
       vi.mocked(renewRevocationLease).mockClear();
 
@@ -702,6 +744,7 @@ describe('desktopWs', () => {
       const handlers = captureWsHandlers(SESSION_ID, 'valid-ticket');
       const ws = wsMock();
       await handlers.onOpen({}, ws);
+      acceptPublishedStart();
       ws.close.mockClear();
 
       vi.mocked(renewRevocationLease).mockResolvedValue({ status: 'unavailable' } as never);
@@ -726,6 +769,7 @@ describe('desktopWs', () => {
       const handlers = captureWsHandlers(SESSION_ID, 'valid-ticket');
       const ws = wsMock();
       await handlers.onOpen({}, ws);
+      acceptPublishedStart();
       expect(getActiveDesktopSessionCount()).toBe(1);
 
       ws.send.mockClear();
@@ -763,6 +807,7 @@ describe('desktopWs', () => {
       const handlers = captureWsHandlers(SESSION_ID, 'valid-ticket');
       const ws = wsMock();
       await handlers.onOpen({}, ws);
+      acceptPublishedStart();
       ws.send.mockClear();
 
       await vi.advanceTimersByTimeAsync(PING_INTERVAL_MS);
@@ -783,6 +828,7 @@ describe('desktopWs', () => {
       const handlers = captureWsHandlers(SESSION_ID, 'valid-ticket');
       const ws = wsMock();
       await handlers.onOpen({}, ws);
+      acceptPublishedStart();
       expect(getActiveDesktopSessionCount()).toBe(1);
 
       // A thrown rejection (distinct from the Redis-down fail-closed `true`
@@ -804,6 +850,7 @@ describe('desktopWs', () => {
       const handlers = captureWsHandlers(SESSION_ID, 'valid-ticket');
       const ws = wsMock();
       await handlers.onOpen({}, ws);
+      acceptPublishedStart();
       ws.close.mockClear();
 
       persistDesktopFinalizationIntentMock.mockRejectedValueOnce(

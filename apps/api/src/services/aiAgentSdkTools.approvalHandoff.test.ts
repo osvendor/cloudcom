@@ -25,7 +25,7 @@ import {
   handoffDenialForOutcome,
 } from './aiToolHandoff';
 
-const { makeHandler, makeSessionAwareHandler } = __test__;
+const { makeHandler, makeSessionAwareHandler, makeToolHandler } = __test__;
 
 const fakeAuth = {
   scope: 'organization',
@@ -96,6 +96,7 @@ describe('pre-tool-use approval handoff (#5107)', () => {
       // The TRUSTED channel: postToolUse stamps the audit row and the SSE
       // event from this argument, never by re-reading the output payload.
       'approved_executing',
+      undefined, // no SDK tool_use id in `extra` (#7931)
     );
   });
 
@@ -123,6 +124,7 @@ describe('pre-tool-use approval handoff (#5107)', () => {
       0,
       undefined,
       undefined,
+      undefined, // no SDK tool_use id in `extra` (#7931)
     );
   });
 
@@ -168,6 +170,52 @@ describe('pre-tool-use approval handoff (#5107)', () => {
 });
 
 /**
+ * #10144 — a pre-approval refusal's `detail` (e.g. which params key is wrong)
+ * must reach the model beside `error`, through every wrapper, or the model
+ * keeps re-sending the same bad call.
+ */
+describe('pre-tool-use denial detail (#10144)', () => {
+  const refusal = async () => ({ allowed: false as const, error: 'invalid_params', detail: 'Unrecognized key: "goal"' });
+  const bare = async () => ({ allowed: false as const, error: 'no_sweep_schedule' });
+  const mustNotRun = async () => {
+    throw new Error('[test] the tool handler must never run on a denial');
+  };
+
+  describe.each([
+    ['makeToolHandler', (pre: typeof refusal) => makeToolHandler('launch_specialist', () => fakeAuth, undefined, pre, vi.fn())],
+    ['makeSessionAwareHandler', (pre: typeof refusal) =>
+      makeSessionAwareHandler('launch_specialist', () => fakeAuth, () => fakeSession, mustNotRun, pre, vi.fn())],
+    ['wrapExtraToolWithHooks', (pre: typeof refusal) => {
+      const wrapped = wrapExtraToolWithHooks(toolThatMustNotRun({ called: false }), pre, vi.fn());
+      return (args: Record<string, unknown>) => wrapped.handler(args, {});
+    }],
+  ])('%s', (_name, build) => {
+    it('publishes { error, detail } as an error result', async () => {
+      const result = (await build(refusal)({ kind: 'sweep' })) as { content?: unknown[]; isError?: boolean };
+      expect(result.isError).toBe(true);
+      expect(JSON.parse(firstText(result))).toEqual({ error: 'invalid_params', detail: 'Unrecognized key: "goal"' });
+    });
+
+    it('omits detail when the denial has none', async () => {
+      const result = (await build(bare as typeof refusal)({ kind: 'sweep' })) as { content?: unknown[] };
+      expect(JSON.parse(firstText(result))).toEqual({ error: 'no_sweep_schedule' });
+    });
+
+    // #10193: the person-facing sentence travels with the code.
+    it('publishes { error, detail, message } when the denial carries a message', async () => {
+      const withMessage = async () => ({
+        allowed: false as const, error: 'agent_disabled', detail: 'disabled', message: 'The agent "QA Patching agent" is switched off.',
+      });
+      const result = (await build(withMessage as typeof refusal)({ kind: 'patch_plan' })) as { content?: unknown[]; isError?: boolean };
+      expect(result.isError).toBe(true);
+      expect(JSON.parse(firstText(result))).toEqual({
+        error: 'agent_disabled', detail: 'disabled', message: 'The agent "QA Patching agent" is switched off.',
+      });
+    });
+  });
+});
+
+/**
  * #6022 — the read-back outcomes ride the SAME channel, so `isError` must be
  * derived from the STATUS, not from "a handoff marker is present".
  *
@@ -204,6 +252,7 @@ describe('post-approval terminal outcomes (#6022)', () => {
       0,
       undefined,
       APPROVED_FAILED_STATUS,
+      undefined, // no SDK tool_use id in `extra` (#7931)
     );
   });
 

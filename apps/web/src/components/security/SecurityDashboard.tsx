@@ -1,6 +1,6 @@
 import { useTranslation } from "react-i18next";
 import "@/lib/i18n";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   ChevronRight,
@@ -26,6 +26,7 @@ import {
 } from "recharts";
 import { cn, formatNumber, widthPercentClass } from "@/lib/utils";
 import { fetchWithAuth } from "@/stores/auth";
+import { useOrgStore } from "@/stores/orgStore";
 import { errorKindOf, throwIfNotOk, type LoadErrorKind } from "@/lib/httpError";
 import AccessDenied from "../shared/AccessDenied";
 import { ENABLE_EDR_INTEGRATIONS } from "../../lib/featureFlags";
@@ -44,17 +45,23 @@ type AdminDevice = {
 };
 type SecurityOverview = {
   securityScore: number;
+  // `unknown` = devices whose agent collector failed or never reported (#8252);
+  // counted on their own, never folded into unprotected / disabled.
   antivirus: {
     protected: number;
     unprotected: number;
+    unknown: number;
   };
   firewall: {
     enabled: number;
     disabled: number;
+    unknown: number;
   };
   encryption: {
     bitlockerEnabled: number;
+    bitlockerPartial: number;
     filevaultEnabled: number;
+    filevaultPartial: number;
     total: number;
   };
   passwordCompliance: number;
@@ -103,9 +110,15 @@ const severityStyles: Record<Priority, string> = {
 };
 const defaultOverview: SecurityOverview = {
   securityScore: 0,
-  antivirus: { protected: 0, unprotected: 0 },
-  firewall: { enabled: 0, disabled: 0 },
-  encryption: { bitlockerEnabled: 0, filevaultEnabled: 0, total: 0 },
+  antivirus: { protected: 0, unprotected: 0, unknown: 0 },
+  firewall: { enabled: 0, disabled: 0, unknown: 0 },
+  encryption: {
+    bitlockerEnabled: 0,
+    bitlockerPartial: 0,
+    filevaultEnabled: 0,
+    filevaultPartial: 0,
+    total: 0,
+  },
   passwordCompliance: 0,
   adminAudit: {
     defaultAccounts: 0,
@@ -352,6 +365,7 @@ const normalizeOverview = (raw: unknown): SecurityOverview => {
     data.unprotectedDevices,
     data.unprotectedEndpoints,
   );
+  const antivirusUnknown = pickNumber(antivirusRecord.unknown);
   const firewallRecord = getRecord(data.firewall ?? data.firewallStatus);
   const firewallEnabled = pickNumber(
     firewallRecord.enabled,
@@ -365,6 +379,7 @@ const normalizeOverview = (raw: unknown): SecurityOverview => {
     firewallRecord.off,
     data.firewallDisabled,
   );
+  const firewallUnknown = pickNumber(firewallRecord.unknown);
   const encryptionRecord = getRecord(
     data.encryption ?? data.diskEncryption ?? data.encryptionStatus,
   );
@@ -380,6 +395,8 @@ const normalizeOverview = (raw: unknown): SecurityOverview => {
     encryptionRecord.macosEnabled,
     encryptionRecord.filevaultCount,
   );
+  const bitlockerPartial = pickNumber(encryptionRecord.bitlockerPartial);
+  const filevaultPartial = pickNumber(encryptionRecord.filevaultPartial);
   const encryptionTotal = pickOptionalNumber(
     encryptionRecord.total,
     encryptionRecord.devices,
@@ -420,11 +437,18 @@ const normalizeOverview = (raw: unknown): SecurityOverview => {
     antivirus: {
       protected: antivirusProtected,
       unprotected: antivirusUnprotected,
+      unknown: antivirusUnknown,
     },
-    firewall: { enabled: firewallEnabled, disabled: firewallDisabled },
+    firewall: {
+      enabled: firewallEnabled,
+      disabled: firewallDisabled,
+      unknown: firewallUnknown,
+    },
     encryption: {
       bitlockerEnabled,
+      bitlockerPartial,
       filevaultEnabled,
+      filevaultPartial,
       total: encryptionTotal ?? bitlockerEnabled + filevaultEnabled,
     },
     passwordCompliance,
@@ -433,49 +457,17 @@ const normalizeOverview = (raw: unknown): SecurityOverview => {
     trend,
   };
 };
+// GET /vulnerabilities/stats — open CVE findings by severity over ALL findings
+// in the selected org scope (the same data the linked Vulnerabilities page
+// uses). Not the AV threats feed (#9640).
 const normalizeVulnerabilities = (raw: unknown): VulnerabilitySummary => {
   const record = getRecord(raw);
-  const data = isRecord(record.data) ? record.data : record;
-  const summary = isRecord(data.summary) ? data.summary : data;
-  let critical = pickNumber(
-    summary.critical,
-    summary.criticalCount,
-    summary.criticalIssues,
-  );
-  let high = pickNumber(summary.high, summary.highCount, summary.highIssues);
-  let medium = pickNumber(
-    summary.medium,
-    summary.mediumCount,
-    summary.mediumIssues,
-  );
-  let low = pickNumber(summary.low, summary.lowCount, summary.lowIssues);
-  const list = Array.isArray(data.items)
-    ? data.items
-    : Array.isArray(data.vulnerabilities)
-      ? data.vulnerabilities
-      : Array.isArray(data.data)
-        ? data.data
-        : Array.isArray(raw)
-          ? raw
-          : [];
-  if (Array.isArray(list) && list.length > 0) {
-    const counts = { critical: 0, high: 0, medium: 0, low: 0 };
-    list.forEach((entry) => {
-      const item = getRecord(entry);
-      const severity = String(
-        item.severity ?? item.priority ?? "",
-      ).toLowerCase();
-      if (severity === "critical") counts.critical += 1;
-      else if (severity === "high") counts.high += 1;
-      else if (severity === "medium") counts.medium += 1;
-      else if (severity === "low") counts.low += 1;
-    });
-    if (critical === 0 && high === 0 && medium === 0 && low === 0) {
-      ({ critical, high, medium, low } = counts);
-    }
-  }
-  const total = critical + high + medium + low;
-  return { critical, high, medium, low, total };
+  const by = isRecord(record.openBySeverity) ? record.openBySeverity : {};
+  const critical = pickNumber(by.critical);
+  const high = pickNumber(by.high);
+  const medium = pickNumber(by.medium);
+  const low = pickNumber(by.low);
+  return { critical, high, medium, low, total: critical + high + medium + low };
 };
 const fetchJson = async (url: string) => {
   const response = await fetchWithAuth(url);
@@ -518,7 +510,12 @@ export default function SecurityDashboard({
     vulnerabilities: "none",
   });
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
+  // Monotonic request id: a slow response for the previous org must not
+  // overwrite the data for the org just switched to.
+  const requestSeq = useRef(0);
   const fetchSecurityData = useCallback(async () => {
+    const seq = ++requestSeq.current;
+    const isCurrent = () => seq === requestSeq.current;
     setLoading(true);
     const failures: { overview: LoadErrorKind; vulnerabilities: LoadErrorKind } =
       { overview: "none", vulnerabilities: "none" };
@@ -526,7 +523,7 @@ export default function SecurityDashboard({
       (async () => {
         try {
           const overviewData = await fetchJson("/security/dashboard");
-          setOverview(normalizeOverview(overviewData));
+          if (isCurrent()) setOverview(normalizeOverview(overviewData));
         } catch (err) {
           // Keep any previously loaded data on refresh failure rather than
           // clobbering the dashboard with fabricated zeros.
@@ -535,20 +532,25 @@ export default function SecurityDashboard({
       })(),
       (async () => {
         try {
-          const vulnerabilityData = await fetchJson("/security/threats");
-          setVulnerabilities(normalizeVulnerabilities(vulnerabilityData));
+          const vulnerabilityData = await fetchJson("/vulnerabilities/stats");
+          if (isCurrent())
+            setVulnerabilities(normalizeVulnerabilities(vulnerabilityData));
         } catch (err) {
           failures.vulnerabilities = errorKindOf(err);
         }
       })(),
     ]);
+    if (!isCurrent()) return;
     setLoadFailures(failures);
     setLastUpdated(new Date());
     setLoading(false);
   }, []);
+  // Refetch when the header switcher changes org (#9642). fetchWithAuth reads the
+  // selected org at call time, so currentOrgId only needs to drive the effect.
+  const currentOrgId = useOrgStore((s) => s.currentOrgId);
   useEffect(() => {
     fetchSecurityData();
-  }, [fetchSecurityData]);
+  }, [fetchSecurityData, currentOrgId]);
   const scoreMeta = useMemo(
     () => (overview ? getScoreMeta(overview.securityScore) : null),
     [overview],
@@ -556,19 +558,30 @@ export default function SecurityDashboard({
   const ovData = overview ?? defaultOverview;
   const vulnData = vulnerabilities ?? defaultVulnerabilities;
   const antivirusTotal =
-    ovData.antivirus.protected + ovData.antivirus.unprotected;
+    ovData.antivirus.protected +
+    ovData.antivirus.unprotected +
+    ovData.antivirus.unknown;
   const antivirusProtectedPercent = antivirusTotal
     ? Math.round((ovData.antivirus.protected / antivirusTotal) * 100)
     : 0;
   const antivirusUnprotectedPercent = antivirusTotal
     ? Math.round((ovData.antivirus.unprotected / antivirusTotal) * 100)
     : 0;
-  const firewallTotal = ovData.firewall.enabled + ovData.firewall.disabled;
+  const antivirusUnknownPercent = antivirusTotal
+    ? Math.round((ovData.antivirus.unknown / antivirusTotal) * 100)
+    : 0;
+  const firewallTotal =
+    ovData.firewall.enabled +
+    ovData.firewall.disabled +
+    ovData.firewall.unknown;
   const firewallEnabledPercent = firewallTotal
     ? Math.round((ovData.firewall.enabled / firewallTotal) * 100)
     : 0;
   const firewallDisabledPercent = firewallTotal
     ? Math.round((ovData.firewall.disabled / firewallTotal) * 100)
+    : 0;
+  const firewallUnknownPercent = firewallTotal
+    ? Math.round((ovData.firewall.unknown / firewallTotal) * 100)
     : 0;
   const encryptionEnabledTotal =
     ovData.encryption.bitlockerEnabled + ovData.encryption.filevaultEnabled;
@@ -656,6 +669,7 @@ export default function SecurityDashboard({
           <button
             type="button"
             onClick={fetchSecurityData}
+            title={t("securitySecurityDashboard.refreshTooltip")}
             className="inline-flex h-9 items-center gap-2 rounded-md border bg-background px-3 text-sm hover:bg-muted"
             disabled={loading}
           >
@@ -771,7 +785,7 @@ export default function SecurityDashboard({
           </div>
         ) : (
           <>
-            <div className="rounded-lg border bg-card p-6 shadow-xs lg:col-span-4">
+            <div data-testid="security-overview-score-card" className="rounded-lg border bg-card p-6 shadow-xs lg:col-span-4">
               <div className="flex items-start justify-between">
                 <div>
                   <p className="text-sm text-muted-foreground">
@@ -843,7 +857,7 @@ export default function SecurityDashboard({
               </div>
             </div>
 
-            <div className="rounded-lg border bg-card p-6 shadow-xs lg:col-span-8">
+            <div data-testid="security-overview-trend-card" className="rounded-lg border bg-card p-6 shadow-xs lg:col-span-8">
               <div className="flex items-start justify-between">
                 <div>
                   <p className="text-sm font-semibold">
@@ -908,7 +922,7 @@ export default function SecurityDashboard({
               </div>
             </div>
 
-            <div className="rounded-lg border bg-card p-6 shadow-xs lg:col-span-4">
+            <div data-testid="security-overview-vulnerabilities-card" className="rounded-lg border bg-card p-6 shadow-xs lg:col-span-4">
               <div className="flex items-start justify-between">
                 <div>
                   <p className="text-sm font-semibold">
@@ -917,7 +931,8 @@ export default function SecurityDashboard({
                   {vulnerabilities && (
                     <p className="text-xs text-muted-foreground">
                       {t("securitySecurityDashboard.openItems", {
-                        count: formatNumber(vulnerabilities.total),
+                        count: vulnerabilities.total,
+                        countLabel: formatNumber(vulnerabilities.total),
                       })}
                     </p>
                   )}
@@ -969,7 +984,7 @@ export default function SecurityDashboard({
               </div>
             </div>
 
-            <div className="rounded-lg border bg-card p-6 shadow-xs lg:col-span-4">
+            <div data-testid="security-overview-antivirus-card" className="rounded-lg border bg-card p-6 shadow-xs lg:col-span-4">
               <div className="flex items-start justify-between">
                 <div>
                   <p className="text-sm font-semibold">
@@ -1008,6 +1023,20 @@ export default function SecurityDashboard({
                         {antivirusUnprotectedPercent}%)
                       </span>
                     </div>
+                    {overview.antivirus.unknown > 0 && (
+                      <div
+                        className="flex items-center justify-between text-sm"
+                        data-testid="security-av-unknown"
+                      >
+                        <span className="text-muted-foreground">
+                          {t("securitySecurityDashboard.unknown")}
+                        </span>
+                        <span className="font-medium">
+                          {formatNumber(overview.antivirus.unknown)} (
+                          {antivirusUnknownPercent}%)
+                        </span>
+                      </div>
+                    )}
                     <div className="h-2 w-full rounded-full bg-muted">
                       <div
                         className={cn(
@@ -1037,7 +1066,7 @@ export default function SecurityDashboard({
               </div>
             </div>
 
-            <div className="rounded-lg border bg-card p-6 shadow-xs lg:col-span-4">
+            <div data-testid="security-overview-firewall-card" className="rounded-lg border bg-card p-6 shadow-xs lg:col-span-4">
               <div className="flex items-start justify-between">
                 <div>
                   <p className="text-sm font-semibold">
@@ -1076,6 +1105,20 @@ export default function SecurityDashboard({
                         {firewallDisabledPercent}%)
                       </span>
                     </div>
+                    {overview.firewall.unknown > 0 && (
+                      <div
+                        className="flex items-center justify-between text-sm"
+                        data-testid="security-firewall-unknown"
+                      >
+                        <span className="text-muted-foreground">
+                          {t("securitySecurityDashboard.unknown")}
+                        </span>
+                        <span className="font-medium">
+                          {formatNumber(overview.firewall.unknown)} (
+                          {firewallUnknownPercent}%)
+                        </span>
+                      </div>
+                    )}
                     <div className="h-2 w-full rounded-full bg-muted">
                       <div
                         className={cn(
@@ -1105,7 +1148,7 @@ export default function SecurityDashboard({
               </div>
             </div>
 
-            <div className="rounded-lg border bg-card p-6 shadow-xs lg:col-span-4">
+            <div data-testid="security-overview-encryption-card" className="rounded-lg border bg-card p-6 shadow-xs lg:col-span-4">
               <div className="flex items-start justify-between">
                 <div>
                   <p className="text-sm font-semibold">
@@ -1114,7 +1157,8 @@ export default function SecurityDashboard({
                   {overview && (
                     <p className="text-xs text-muted-foreground">
                       {t("securitySecurityDashboard.devicesReviewed", {
-                        count: formatNumber(encryptionTotal),
+                        count: encryptionTotal,
+                        countLabel: formatNumber(encryptionTotal),
                       })}
                     </p>
                   )}
@@ -1134,6 +1178,16 @@ export default function SecurityDashboard({
                         {formatNumber(overview.encryption.bitlockerEnabled)}
                       </span>
                     </div>
+                    {overview.encryption.bitlockerPartial > 0 && (
+                      <div className="flex items-center justify-between text-sm">
+                        <span className="text-muted-foreground">
+                          {t("securitySecurityDashboard.bitlockerPartial")}
+                        </span>
+                        <span className="font-medium">
+                          {formatNumber(overview.encryption.bitlockerPartial)}
+                        </span>
+                      </div>
+                    )}
                     <div className="flex items-center justify-between text-sm">
                       <span className="text-muted-foreground">
                         {t("securitySecurityDashboard.filevaultEnabled")}
@@ -1142,6 +1196,16 @@ export default function SecurityDashboard({
                         {formatNumber(overview.encryption.filevaultEnabled)}
                       </span>
                     </div>
+                    {overview.encryption.filevaultPartial > 0 && (
+                      <div className="flex items-center justify-between text-sm">
+                        <span className="text-muted-foreground">
+                          {t("securitySecurityDashboard.filevaultPartial")}
+                        </span>
+                        <span className="font-medium">
+                          {formatNumber(overview.encryption.filevaultPartial)}
+                        </span>
+                      </div>
+                    )}
                     <div className="h-2 w-full rounded-full bg-muted">
                       <div
                         className={cn(
@@ -1171,7 +1235,7 @@ export default function SecurityDashboard({
               </div>
             </div>
 
-            <div className="rounded-lg border bg-card p-6 shadow-xs lg:col-span-4">
+            <div data-testid="security-overview-password-card" className="rounded-lg border bg-card p-6 shadow-xs lg:col-span-4">
               <div className="flex items-start justify-between">
                 <div>
                   <p className="text-sm font-semibold">
@@ -1225,7 +1289,7 @@ export default function SecurityDashboard({
               </div>
             </div>
 
-            <div className="rounded-lg border bg-card p-6 shadow-xs lg:col-span-4">
+            <div data-testid="security-overview-admin-card" className="rounded-lg border bg-card p-6 shadow-xs lg:col-span-4">
               <div className="flex items-start justify-between">
                 <div>
                   <p className="text-sm font-semibold">
@@ -1325,7 +1389,7 @@ export default function SecurityDashboard({
               </div>
             </div>
 
-            <div className="rounded-lg border bg-card p-6 shadow-xs lg:col-span-12">
+            <div data-testid="security-overview-recommendations-card" className="rounded-lg border bg-card p-6 shadow-xs lg:col-span-12">
               <div className="flex items-start justify-between">
                 <div>
                   <p className="text-sm font-semibold">
@@ -1334,7 +1398,8 @@ export default function SecurityDashboard({
                   {overview && (
                     <p className="text-xs text-muted-foreground">
                       {t("securitySecurityDashboard.actionsPrioritized", {
-                        count: formatNumber(sortedRecommendations.length),
+                        count: sortedRecommendations.length,
+                        countLabel: formatNumber(sortedRecommendations.length),
                       })}
                     </p>
                   )}

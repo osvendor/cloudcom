@@ -1,9 +1,11 @@
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import { zValidator } from '../../lib/validation';
 import { z } from 'zod';
 import { and, desc, eq } from 'drizzle-orm';
 import { requireScope, requirePermission, type AuthContext } from '../../middleware/auth';
-import { PERMISSIONS } from '../../services/permissions';
+import { PERMISSIONS, hasPermission, type UserPermissions } from '../../services/permissions';
+import { listContracts } from '../../services/contractService';
+import { captureException } from '../../services/sentry';
 import {
   createQuoteSchema, cloneQuoteSchema, updateQuoteSchema, quoteLineInputSchema, catalogQuoteLineSchema,
   updateQuoteLineSchema, quoteBlockInputSchema, listQuotesQuerySchema,
@@ -12,14 +14,14 @@ import {
   changeCurrencySchema, buildStripeCurrencyWarning,
 } from '@breeze/shared';
 import {
-  createQuote, cloneQuote, reviseQuote, getQuote, listQuotes, updateQuote, deleteDraftQuote,
+  createQuote, cloneQuote, reviseQuote, getQuote, getAccessibleQuoteRow, refreshDraftQuoteTaxRate, listQuotes, updateQuote, deleteDraftQuote,
   addManualLine, addCatalogLine, updateLine, removeLine, addBlock, updateBlock, deleteBlock,
   reorderBlocks, reorderLines, moveLineToBlock, changeQuoteCurrency,
   refreshQuoteDeviceCounts, quoteDeviceSetEstimate,
 } from '../../services/quoteService';
 import { createQuoteOrder, updateQuoteOrder, updateQuoteOrderLine } from '../../services/quoteOrderService';
 import { QuoteServiceError, type QuoteActor } from '../../services/quoteTypes';
-import { db } from '../../db';
+import { db, withDbTransaction } from '../../db';
 import { quoteImages, quoteAcceptances } from '../../db/schema/quotes';
 import { users } from '../../db/schema/users';
 import { partners } from '../../db/schema/orgs';
@@ -28,16 +30,20 @@ import { safeContentDispositionFilename } from '../../utils/httpHeaders';
 import { resolveQuoteBranding } from '../../services/quoteBranding';
 import { getQuoteRecipients } from '../../services/quoteLifecycle';
 import { getConnection } from '../../services/stripeConnectService';
+import { getEmailService } from '../../services/email';
 import {
   renderContractBlocksForClient,
   loadContractPdfInputs,
   loadContractBlockAuthoring,
   attachContractAuthoring,
+  resolveQuoteEditorAutoVariables,
 } from '../../services/contractTemplateRender';
 import { ContractTemplateServiceError } from '../../services/contractTemplateService';
 import { PdfMergeError } from '../../services/pdfMerge';
 import { writeRouteAudit } from '../../services/auditEvents';
+import { auditBillingDocument } from '../../services/billingDocumentAudit';
 import { QUOTE_ACCEPTANCE_EVIDENCE_META, toAcceptanceEvidenceMeta } from '../../services/quoteAcceptanceEvidence';
+import { assembleCustomerQuoteDocument } from '../../services/customerQuoteDocument';
 
 export const quoteCrudRoutes = new Hono();
 const scopes = requireScope('partner', 'system');
@@ -74,8 +80,11 @@ quoteCrudRoutes.get('/', scopes, readPerm, zValidator('query', listQuotesQuerySc
   catch (err) { return handleServiceError(c, err); }
 });
 quoteCrudRoutes.post('/', scopes, writePerm, zValidator('json', createQuoteSchema), async (c) => {
-  try { return c.json({ data: await createQuote(c.req.valid('json'), quoteActorFrom(c)) }); }
-  catch (err) { return handleServiceError(c, err); }
+  try {
+    const quote = await createQuote(c.req.valid('json'), quoteActorFrom(c));
+    auditBillingDocument(c, 'quote', 'create', quote);
+    return c.json({ data: quote });
+  } catch (err) { return handleServiceError(c, err); }
 });
 quoteCrudRoutes.post('/:id/clone', scopes, writePerm, zValidator('param', idParam), async (c) => {
   // Optional retarget/rename body. Distinguish an ABSENT body (legacy callers
@@ -118,9 +127,57 @@ quoteCrudRoutes.post('/:id/revise', scopes, writePerm, zValidator('param', idPar
     return c.json({ data: revision });
   } catch (err) { return handleServiceError(c, err); }
 });
+/** One contract a quote's accept created, as the quote detail callout names it. */
+type GeneratedContractSummary = { id: string; name: string; status: string; intervalMonths: number };
+
+/**
+ * #10361: the contracts this quote's accept created (contracts.source_quote_id),
+ * so an accepted quote can point at the draft(s) waiting to be activated.
+ *
+ * Gated on contracts:read — quotes:read alone does not grant contract reads —
+ * and read through listContracts with the CALLER's actor, so the org axis
+ * (accessibleOrgIds) and the site axis (contract lines) apply exactly as on
+ * the contracts list. `contracts: null` = not shown: either no permission, or
+ * the lookup failed, which `contractsUnavailable` says so the page can tell the
+ * operator instead of implying no contract exists (display-only, so a failure
+ * degrades the callout rather than the page). `[]` without a query for a quote
+ * that was never accepted.
+ */
+async function loadGeneratedContracts(
+  c: Context,
+  quote: { id: string; orgId: string; status: string; acceptedAt?: Date | string | null },
+): Promise<{ contracts: GeneratedContractSummary[] | null; contractsUnavailable: boolean }> {
+  const perms = c.get('permissions') as UserPermissions | undefined;
+  if (!perms || !hasPermission(perms, PERMISSIONS.CONTRACTS_READ.resource, PERMISSIONS.CONTRACTS_READ.action)) {
+    return { contracts: null, contractsUnavailable: false };
+  }
+  const accepted = quote.status === 'accepted' || quote.status === 'converted' || !!quote.acceptedAt;
+  if (!accepted) return { contracts: [], contractsUnavailable: false };
+  try {
+    const qa = quoteActorFrom(c);
+    const rows = await listContracts(
+      { orgId: quote.orgId, sourceQuoteId: quote.id },
+      // Read-only: no permission evidence, so no write gate could ever pass on it.
+      { userId: qa.userId, partnerId: qa.partnerId, accessibleOrgIds: qa.accessibleOrgIds, allowedSiteIds: qa.allowedSiteIds },
+    );
+    return {
+      contracts: rows.map((r) => ({ id: r.id, name: r.name, status: r.status, intervalMonths: r.intervalMonths })),
+      contractsUnavailable: false,
+    };
+  } catch (err) {
+    console.error('GET /quotes/:id: generated-contract lookup failed', { quoteId: quote.id, err });
+    captureException(err instanceof Error ? err : new Error(String(err)));
+    return { contracts: null, contractsUnavailable: true };
+  }
+}
+
 quoteCrudRoutes.get('/:id', scopes, readPerm, zValidator('param', idParam), async (c) => {
   const id = c.req.valid('param').id;
   try {
+    // A draft opens at the rate that applies if it were sent now (#7507) — the
+    // org's tax settings may have changed since its last edit. No-op (and no
+    // write) for a sent quote or a draft that is already current.
+    await refreshDraftQuoteTaxRate(id, quoteActorFrom(c));
     const detail = await getQuote(id, quoteActorFrom(c));
     // Branding lets the in-app Preview render the customer-facing document
     // (logo, accent, seller, footer) without a second round-trip — same object
@@ -145,6 +202,22 @@ quoteCrudRoutes.get('/:id', scopes, readPerm, zValidator('param', idParam), asyn
     // carry `authoring`.
     const authoring = await loadContractBlockAuthoring(detail.blocks);
     const blocksForEditor = attachContractAuthoring(blocks, authoring);
+    // ADMIN-ONLY (#9867): each auto variable's value as the client will read it,
+    // so the editor's agreement block shows "Client name — Acme Co" instead of
+    // `{{client.name}}`. Quote-level (not per block) because the add-agreement
+    // form needs it before any contract block exists. Display-only: a failure
+    // degrades to null (the editor falls back to the token) rather than failing
+    // the whole quote load.
+    let contractAutoValues: Record<string, string> | null = null;
+    try {
+      contractAutoValues = resolveQuoteEditorAutoVariables(detail.quote, {
+        locale: branding.locale,
+        billTo: detail.billTo ?? null,
+        seller: branding.seller,
+      });
+    } catch (err) {
+      console.error('GET /quotes/:id: contract auto-variable resolution failed', { quoteId: id, err });
+    }
     // Who this quote actually went to. Written at send but, until now, only ever
     // read by the portal's signer-authorization check — so the tech who sent it
     // had no way to see the addresses. Empty on drafts and on legacy sends that
@@ -239,21 +312,47 @@ quoteCrudRoutes.get('/:id', scopes, readPerm, zValidator('param', idParam), asyn
     // quote-detail load.
     let partnerAutoEmailRow: { autoEmailInvoiceOnQuoteAccept: boolean } | undefined;
     try {
-      [partnerAutoEmailRow] = await db
+      // Savepoint so a failed read rolls back and the request transaction survives (#11203).
+      [partnerAutoEmailRow] = await withDbTransaction(async () => db
         .select({ autoEmailInvoiceOnQuoteAccept: partners.autoEmailInvoiceOnQuoteAccept })
         .from(partners)
         .where(eq(partners.id, detail.quote.partnerId))
-        .limit(1);
+        .limit(1));
     } catch (err) {
       console.error('GET /quotes/:id: partner auto-email lookup failed', { quoteId: id, partnerId: detail.quote.partnerId, err });
     }
     const autoEmailInvoiceOnAccept = partnerAutoEmailRow?.autoEmailInvoiceOnQuoteAccept ?? true;
+    const { contracts, contractsUnavailable } = await loadGeneratedContracts(c, detail.quote);
     return c.json({ data: {
       ...detail, quote: quoteForClient, blocks: blocksForEditor, branding, presentation, recipients,
-      acceptance,
+      acceptance, contractAutoValues, contracts, contractsUnavailable,
       stripeConnected, stripeAccountCurrency, currencyWarning,
       autoEmailInvoiceOnAccept,
+      // #9256: whether the server has an email transport at all, so the web can
+      // say "not emailed" instead of promising an email that cannot go out.
+      emailConfigured: !!getEmailService(),
     } });
+  } catch (err) { return handleServiceError(c, err); }
+});
+// GET /:id/customer-view (#9418, spec §3.4) — the customer quote document for
+// the staff Preview: the same assembler and allowlist the public link and the
+// portal serve, in `staff` mode (any status, drafts included). Access is
+// exactly the detail route's: same scopes + quotes:read, then the ownership
+// path getQuote opens with (raw select → 404, assertQuoteAccess → 403). Side-
+// effect free, unlike the detail route: no draft tax-rate refresh, no view
+// stamp, no accept token, no audit row (it reads what the caller can read).
+quoteCrudRoutes.get('/:id/customer-view', scopes, readPerm, zValidator('param', idParam), async (c) => {
+  const id = c.req.valid('param').id;
+  try {
+    const quote = await getAccessibleQuoteRow(id, quoteActorFrom(c));
+    const data = await assembleCustomerQuoteDocument(quote, 'staff', {
+      assets: {
+        // The staff app's authenticated image routes (fetched as object URLs).
+        lineImage: (l) => (l.imageId ? `/quotes/${id}/images/${l.imageId}` : `/catalog/${l.catalogItemId}/image`),
+        contractFile: (blockId) => `/quotes/${id}/contract-file/${blockId}`,
+      },
+    });
+    return c.json({ data });
   } catch (err) { return handleServiceError(c, err); }
 });
 quoteCrudRoutes.patch('/:id', scopes, writePerm, zValidator('param', idParam), zValidator('json', updateQuoteSchema), async (c) => {
@@ -261,7 +360,11 @@ quoteCrudRoutes.patch('/:id', scopes, writePerm, zValidator('param', idParam), z
   catch (err) { return handleServiceError(c, err); }
 });
 quoteCrudRoutes.delete('/:id', scopes, writePerm, zValidator('param', idParam), async (c) => {
-  try { await deleteDraftQuote(c.req.valid('param').id, quoteActorFrom(c)); return c.json({ data: { ok: true } }); }
+  try {
+    const deleted = await deleteDraftQuote(c.req.valid('param').id, quoteActorFrom(c));
+    auditBillingDocument(c, 'quote', 'delete', deleted);
+    return c.json({ data: { ok: true } });
+  }
   catch (err) { return handleServiceError(c, err); }
 });
 // Draft-only atomic change-currency op (#3774) — the ONLY mutation path for a
@@ -389,10 +492,12 @@ quoteCrudRoutes.patch('/:id/orders/:orderId/lines/:lineId', scopes, fulfillPerm,
 // the bare `db` is correct here — same pattern the service uses to read its
 // tables). Branding resolves like invoicePdf: partner name + portal logo/color +
 // partner invoice footer/currency. Footer precedence is
-// quote.terms ?? partner invoice footer ?? portal footer text.
+// quote.terms ?? org portal footer text ?? partner invoice footer (#7510).
 quoteCrudRoutes.get('/:id/pdf', scopes, readPerm, zValidator('param', idParam), async (c) => {
   const id = c.req.valid('param').id;
   try {
+    // A draft PDF prints the rate that applies now, same as GET /:id (#7507).
+    await refreshDraftQuoteTaxRate(id, quoteActorFrom(c));
     const { quote, blocks, lines, billTo } = await getQuote(id, quoteActorFrom(c));
 
     const branding = await resolveQuoteBranding(quote);

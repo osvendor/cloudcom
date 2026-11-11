@@ -16,7 +16,10 @@
  *
  * Purge additionally REFUSES while a `device_remove` self_uninstall is still
  * pending/sent and unexpired: device_commands is in the device cascade, so
- * purging would destroy the only thing that will ever clean the endpoint. The
+ * purging would destroy the only thing that will ever clean the endpoint. It
+ * also refuses (#11153) when the agent never confirmed it came off — a failed,
+ * expired or cancelled uninstall, or none at all — unless the caller passes
+ * `force` (`devicePurgeUninstallGate.ts` owns that predicate). The
  * legacy fire-and-forget WS uninstall the permanent-delete route used to send
  * is gone — it only ever reached a CONNECTED agent, which a removed device
  * usually is not, and it raced the cascade that deleted its own command row.
@@ -24,38 +27,73 @@
  * Callers own the initial authorization and the transaction. Purge callers
  * also pass the request-time site ceiling so an implicit group dissolve is
  * checked again under member locks; this service never accepts an AuthContext.
+ *
+ * Restore also admits the device against its partner's licensed device limit
+ * (partnerDeviceCapacity.ts, the admission enrollment and provisioning use),
+ * so it needs a SYSTEM-scoped transaction: the partner row and the
+ * partner-wide count are invisible under tenant RLS. Its callers therefore
+ * pass where their tenant-scoped read found the device, and restore refuses
+ * if the locked row is no longer there.
  */
 import { eq, sql } from 'drizzle-orm';
 import { devices } from '../db/schema';
 import { lockTimeoutWasChanged, tightenLockTimeout } from '../db/lockTimeout';
 import { deleteDeviceCascade } from './deviceDeletion';
+import { requestDeviceGroupReevaluationAfterCommit } from '../jobs/deviceGroupJobs';
+import { findPolicyBackupLegalHoldInContext } from './erasureBackupLegalHold';
+import {
+  admitPartnerDeviceCapacity,
+  deviceTakesLicensedSlot,
+  PartnerDeviceCapacityError,
+} from './partnerDeviceCapacity';
 import { dissolveLinkGroupIfBelowMinimum, LinkGroupSiteAccessError } from './deviceLinkGroups';
 import {
   releaseDeviceRemoveReason,
   UNINSTALL_REASON_DEVICE_REMOVE,
   type Tx,
 } from './deviceUninstallDrain';
+import {
+  isPurgeUninstallConfirmed,
+  readPurgeUninstallState,
+  type PurgeUninstallState,
+} from './devicePurgeUninstallGate';
 
 export type DeviceLifecycleCode =
   | 'NOT_FOUND'
   | 'NOT_REMOVED'
   | 'UNINSTALL_PENDING'
+  /** #11153 — the agent never confirmed it was uninstalled; `force` overrides. */
+  | 'UNINSTALL_NOT_CONFIRMED'
   | 'SITE_ACCESS_DENIED'
-  | 'STATE_CHANGED';
+  | 'STATE_CHANGED'
+  | 'BACKUP_PROTECTED'
+  | 'DEVICE_LIMIT_REACHED';
 
 export class DeviceLifecycleError extends Error {
   constructor(
     public readonly code: DeviceLifecycleCode,
     message: string,
+    /** Extra response fields. DEVICE_LIMIT_REACHED carries the partner's count
+     *  and limit, the same fields the enrollment refusal returns;
+     *  UNINSTALL_NOT_CONFIRMED carries the uninstall state it refused on. */
+    public readonly details?:
+      | { currentDevices: number; maxDevices: number }
+      | { uninstallState: PurgeUninstallState },
   ) {
     super(message);
     this.name = 'DeviceLifecycleError';
   }
 
   get status(): 403 | 404 | 409 {
-    if (this.code === 'SITE_ACCESS_DENIED') return 403;
+    if (this.code === 'SITE_ACCESS_DENIED' || this.code === 'DEVICE_LIMIT_REACHED') return 403;
     return this.code === 'NOT_FOUND' ? 404 : 409;
   }
+}
+
+/** Where the caller's own tenant-scoped read found the device it authorized. */
+export interface RestoreAuthorization {
+  orgId: string;
+  siteId: string | null;
 }
 
 export interface RestoreResult {
@@ -81,6 +119,15 @@ export interface PurgeResult {
    */
   linkGroupId: string | null;
   linkGroupDissolved: boolean;
+  /**
+   * Site-owned topology alerts this device originated that the cascade
+   * detached (possibly owned by another org after a move-org). Audited.
+   */
+  detachedTopologyAlerts: number;
+  /** #11153 — the uninstall state read under the lock. Audited by every caller. */
+  uninstallState: PurgeUninstallState;
+  /** True only when `force` was what let an unconfirmed device through. */
+  forced: boolean;
 }
 
 /**
@@ -95,7 +142,9 @@ export const DEVICE_LIFECYCLE_LOCK_TIMEOUT_MS = 3000;
 interface LockedRow {
   id: string;
   status: string;
+  org_id: string;
   site_id: string | null;
+  is_ephemeral: boolean;
   link_group_id: string | null;
 }
 
@@ -114,7 +163,7 @@ async function lockDevice(tx: Tx, deviceId: string): Promise<LockedRow> {
     : null;
 
   const rows = (await tx.execute(
-    sql`SELECT id, status, site_id, link_group_id FROM devices WHERE id = ${deviceId} FOR UPDATE`,
+    sql`SELECT id, status, org_id, site_id, is_ephemeral, link_group_id FROM devices WHERE id = ${deviceId} FOR UPDATE`,
   )) as unknown as LockedRow[];
 
   // Restored only on the success path, deliberately — see deviceDeletion.ts:
@@ -133,8 +182,23 @@ async function lockDevice(tx: Tx, deviceId: string): Promise<LockedRow> {
 }
 
 /**
- * Restore a removed device: cancel its pending agent uninstall and flip the
- * status back to `offline`.
+ * Restore a removed device: admit it against the partner device limit, cancel
+ * its pending agent uninstall and flip the status back to `offline`.
+ *
+ * Must run in a SYSTEM-scoped transaction (see the file header), after the
+ * caller authorized the device; `authorized` is where that read found it.
+ *
+ * Admission comes BEFORE the devices row lock. Enrollment takes the partner
+ * lock first and then renames a decommissioned row with the same hostname, so
+ * locking the device first here would be the opposite order: AB-BA, 40P01.
+ * Admitting first also serializes two restores racing for the last slot on
+ * the partner row, exactly as enrollment and provisioning are serialized.
+ * Parked-device assignment (holdingAreaLock.ts) takes the device before the
+ * partner, the other way round, but the two never meet on one device:
+ * assignment refuses a decommissioned device before it admits, and restore
+ * does not admit a parked device (it takes no licensed slot).
+ * Cost: while waiting up to 3s for a contended devices row, restore holds the
+ * partner row, so that partner's admissions wait with it.
  *
  * Release-then-flip inside the caller's transaction — the safety property is
  * the TRANSACTION (no session can observe "status flipped, uninstall still
@@ -143,8 +207,24 @@ async function lockDevice(tx: Tx, deviceId: string): Promise<LockedRow> {
  * secondary defense if a future refactor ever splits them apart. See the long
  * note this replaced in routes/devices/core.ts.
  */
-export async function restoreRemovedDevice(tx: Tx, deviceId: string): Promise<RestoreResult> {
-  await lockDevice(tx, deviceId);
+export async function restoreRemovedDevice(
+  tx: Tx,
+  deviceId: string,
+  authorized: RestoreAuthorization,
+): Promise<RestoreResult> {
+  const target = await admitRestore(tx, deviceId, authorized);
+
+  const locked = await lockDevice(tx, deviceId);
+  // The admission and the caller's authorization both describe the row as
+  // read before this lock. A device moved to another org or site, or whose
+  // licensed standing changed, in between is not the device they approved.
+  if (
+    locked.org_id !== authorized.orgId ||
+    locked.site_id !== authorized.siteId ||
+    locked.is_ephemeral !== target.is_ephemeral
+  ) {
+    throw new DeviceLifecycleError('STATE_CHANGED', 'Device changed before it could be restored; try again');
+  }
 
   const release = await releaseDeviceRemoveReason(tx, deviceId, 'device_restored');
 
@@ -158,7 +238,79 @@ export async function restoreRemovedDevice(tx: Tx, deviceId: string): Promise<Re
     .where(eq(devices.id, deviceId))
     .returning();
 
+  // #9933 — removed devices are left out of dynamic groups, and decommission
+  // re-evaluated them out (deviceDecommission.ts). Bring the device back into
+  // every dynamic group it matches once this commits. `authorized.orgId` is the
+  // locked row's org (checked above).
+  requestDeviceGroupReevaluationAfterCommit({
+    deviceId,
+    orgId: authorized.orgId,
+    eventType: 'device.created',
+    reason: 'device_restored',
+  });
+
   return { device, uninstallAlreadyDispatched: release.alreadyDispatched > 0 };
+}
+
+interface RestoreTarget {
+  org_id: string;
+  status: string;
+  is_ephemeral: boolean;
+  partner_id: string;
+}
+
+/**
+ * Unlocked pre-read, then partner-device-limit admission for a device that
+ * takes a licensed slot once active. Ephemeral and parked devices never take
+ * a slot and are not admitted.
+ */
+async function admitRestore(
+  tx: Tx,
+  deviceId: string,
+  authorized: RestoreAuthorization,
+): Promise<RestoreTarget> {
+  const rows = (await tx.execute(sql`
+    SELECT d.org_id, d.status, d.is_ephemeral, o.partner_id
+      FROM devices d
+      JOIN organizations o ON o.id = d.org_id
+     WHERE d.id = ${deviceId}
+  `)) as unknown as RestoreTarget[];
+  const target = Array.isArray(rows) ? rows[0] : undefined;
+  if (!target) throw new DeviceLifecycleError('NOT_FOUND', 'Device not found');
+  if (target.org_id !== authorized.orgId) {
+    throw new DeviceLifecycleError('STATE_CHANGED', 'Device changed before it could be restored; try again');
+  }
+  // An already-active device is answered here, not by admission.
+  if (target.status !== 'decommissioned') {
+    throw new DeviceLifecycleError('NOT_REMOVED', 'Device is not removed');
+  }
+
+  if (!(await deviceTakesLicensedSlot(tx, deviceId))) return target;
+
+  let admission;
+  try {
+    // The device is left out of the count so the answer is "may THIS device
+    // be active". A concurrent restore of the same device that commits while
+    // this one waits on the partner lock then surfaces as NOT_REMOVED under
+    // the device lock, not as a misleading "limit reached".
+    admission = await admitPartnerDeviceCapacity(tx, {
+      orgId: authorized.orgId,
+      expectedPartnerId: target.partner_id,
+      excludeDeviceId: deviceId,
+    });
+  } catch (err) {
+    if (err instanceof PartnerDeviceCapacityError) {
+      throw new DeviceLifecycleError('STATE_CHANGED', 'Device admission state changed; retry');
+    }
+    throw err;
+  }
+  if (!admission.allowed) {
+    throw new DeviceLifecycleError('DEVICE_LIMIT_REACHED', 'Device limit reached', {
+      currentDevices: admission.activeCount,
+      maxDevices: admission.maxDevices,
+    });
+  }
+  return target;
 }
 
 /**
@@ -186,6 +338,67 @@ async function hasPendingDeviceRemoveUninstall(tx: Tx, deviceId: string): Promis
 export const UNINSTALL_PENDING_MESSAGE =
   'An agent uninstall is still queued for this device. Wait for it to check in, or restore the device and remove it again choosing "Leave the agent installed".';
 
+export const UNINSTALL_NOT_CONFIRMED_MESSAGE =
+  'The agent on this device has not confirmed it was uninstalled. Deleting the record now can leave the agent installed and running with nobody managing it. Send force: true to delete it anyway.';
+
+/**
+ * Backup snapshots explicitly preserved — under legal hold, or inside their
+ * immutability window — must survive an ordinary device purge, the same way
+ * `deleteSnapshotRow` (jobs/backupRetention.ts) already refuses to delete
+ * them during normal retention cleanup. `deleteDeviceCascade`'s generic
+ * device-id cascade loop has no such check: it unconditionally deletes every
+ * `backup_snapshots`/`backup_snapshot_retirements` row for the device, so a
+ * hold placed for legal/compliance reasons on a device slated for removal was
+ * silently destroyed along with everything else. This predicate is the gate
+ * `purgeRemovedDevice` (and jobs/quickSupportReaper.ts) checks before entering
+ * that cascade.
+ *
+ * A hold is not only a flag on a snapshot row (#7982). It can also be set on
+ * the backup policy the device's jobs ran under, or come from a configuration
+ * policy in effect for the device — the sources org erasure refuses on
+ * (services/erasureBackupLegalHold.ts, #7980). Both are checked here through
+ * that same function, narrowed to this device, with the hold-bearing rows
+ * locked FOR SHARE so a hold set concurrently cannot commit between this
+ * check and the cascade.
+ *
+ * Must run inside a system DB context whose transaction `tx` belongs to
+ * (every caller: a `db.transaction` inside `withSystemDbAccessContext`): the
+ * policy check reads through the context's handle, so it sees and locks in
+ * the same transaction as the cascade.
+ */
+export const BACKUP_PROTECTED_MESSAGE =
+  'This device has backups under legal hold (on a snapshot, its backup policy or a configuration policy) or a snapshot inside its immutability window. Release the hold, or wait for the window to expire, before purging the device.';
+
+export async function hasProtectedBackupSnapshots(tx: Tx, deviceId: string): Promise<boolean> {
+  const rows = (await tx.execute(sql`
+    SELECT id FROM backup_snapshots
+     WHERE device_id = ${deviceId}
+       AND (
+         legal_hold = true
+         OR (is_immutable = true AND immutable_until IS NOT NULL AND immutable_until > now())
+       )
+     LIMIT 1
+  `)) as unknown as Array<{ id: string }>;
+  if (Array.isArray(rows) && rows.length > 0) return true;
+
+  const [device] = (await tx.execute(sql`
+    SELECT org_id FROM devices WHERE id = ${deviceId}
+  `)) as unknown as Array<{ org_id: string }>;
+  // No device row: the cascade has nothing to delete, so nothing to protect.
+  if (!device?.org_id) return false;
+  // The FOR SHARE locks wait behind any in-flight edit of a hold-bearing
+  // policy row while this transaction already holds the devices row lock and
+  // a pooled connection: bound that wait like lockDevice does (55P03 maps to
+  // a retryable 409), then put the caller's value back. Success path only —
+  // after a lock timeout the aborted (sub)transaction rejects any statement.
+  const priorMs = await tightenLockTimeout(tx, DEVICE_LIFECYCLE_LOCK_TIMEOUT_MS);
+  const policyHold = await findPolicyBackupLegalHoldInContext(device.org_id, { deviceId, lockForShare: true });
+  if (lockTimeoutWasChanged(priorMs, DEVICE_LIFECYCLE_LOCK_TIMEOUT_MS)) {
+    await tx.execute(sql`select set_config('lock_timeout', ${`${priorMs}ms`}, true)`);
+  }
+  return policyHold !== null;
+}
+
 /**
  * Permanently delete a removed device and everything referencing it.
  *
@@ -193,6 +406,14 @@ export const UNINSTALL_PENDING_MESSAGE =
  * collectable: `device_commands` is in the device cascade, so purging now
  * destroys the only thing that will ever remove the agent from the endpoint,
  * leaving a zombie agent nobody can see or reach.
+ *
+ * Refuses (`UNINSTALL_NOT_CONFIRMED`, #11153) when the agent never confirmed
+ * it came off — see `devicePurgeUninstallGate.ts` for the states — unless
+ * `options.force` is set. Only the human single-device route passes `force`,
+ * and only after the operator chose "delete anyway"; bulk and unattended
+ * purges never do. `force` does not override `UNINSTALL_PENDING` or a backup
+ * hold. The state is read under the devices row lock and returned, so every
+ * caller can write it to its audit row.
  *
  * A defined site ceiling is re-applied to any sibling devices an implicit
  * dissolve would unlink. The check happens in this transaction; denial throws
@@ -202,6 +423,7 @@ export async function purgeRemovedDevice(
   tx: Tx,
   deviceId: string,
   allowedSiteIds?: readonly string[],
+  options: { force?: boolean } = {},
 ): Promise<PurgeResult> {
   const row = await lockDevice(tx, deviceId);
 
@@ -224,7 +446,20 @@ export async function purgeRemovedDevice(
     throw new DeviceLifecycleError('UNINSTALL_PENDING', UNINSTALL_PENDING_MESSAGE);
   }
 
-  await deleteDeviceCascade(tx, deviceId);
+  const uninstallState = await readPurgeUninstallState(tx, deviceId);
+  const confirmed = isPurgeUninstallConfirmed(uninstallState);
+  if (!confirmed && options.force !== true) {
+    throw new DeviceLifecycleError('UNINSTALL_NOT_CONFIRMED', UNINSTALL_NOT_CONFIRMED_MESSAGE, {
+      uninstallState,
+    });
+  }
+  const forced = !confirmed;
+
+  if (await hasProtectedBackupSnapshots(tx, deviceId)) {
+    throw new DeviceLifecycleError('BACKUP_PROTECTED', BACKUP_PROTECTED_MESSAGE);
+  }
+
+  const { detachedTopologyAlerts } = await deleteDeviceCascade(tx, deviceId);
 
   // #2138/#2308 — the deleted device's link_group_id went with its row. If the
   // group now has a lone survivor, or a vm_host group was left headless,
@@ -258,5 +493,11 @@ export async function purgeRemovedDevice(
     }
   }
 
-  return { linkGroupId: row.link_group_id, linkGroupDissolved };
+  return {
+    linkGroupId: row.link_group_id,
+    linkGroupDissolved,
+    detachedTopologyAlerts,
+    uninstallState,
+    forced,
+  };
 }

@@ -4,7 +4,7 @@ import { Plus, X } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import type { TFunction } from 'i18next';
 import DiscoveryProfileList, { type DiscoveryProfile, type DiscoveryProfileStatus } from './DiscoveryProfileList';
-import DiscoveryProfileForm, { type DiscoveryProfileFormValues, type DiscoverySchedule, type SnmpSettings, type ProfileAlertSettings, defaultAlertSettings } from './DiscoveryProfileForm';
+import DiscoveryProfileForm, { type DiscoveryProfileFormValues, type DiscoverySchedule, type SnmpSettings, type ProfileAlertSettings, type ScanAgentOption, defaultAlertSettings } from './DiscoveryProfileForm';
 import DiscoveryJobList from './DiscoveryJobList';
 import DiscoveredAssetList, { mapAsset, toDetail } from './DiscoveredAssetList';
 import AssetDetailModal, { type AssetDetail } from './AssetDetailModal';
@@ -16,6 +16,7 @@ import { useOrgStore } from '../../stores/orgStore';
 import { useOrgScope } from '@/hooks/useOrgScope';
 import { ActionError, runAction } from '../../lib/runAction';
 import { navigateTo } from '../../lib/navigation';
+import { ConfirmDialog } from '../shared/ConfirmDialog';
 import { OrgRequiredState } from '../shared/OrgRequiredState';
 import { OrgLoadFailedState } from '../shared/OrgLoadFailedState';
 import { asList } from '@/lib/asList';
@@ -23,6 +24,7 @@ import { asList } from '@/lib/asList';
 // an island that hydrates before whichever other island happens to pull i18n in
 // would otherwise render raw keys (and mismatch the SSR markup).
 import '../../lib/i18n';
+import { useStableT } from '@/lib/i18n/useStableT';
 
 const DISCOVERY_TABS = ['assets', 'profiles', 'jobs', 'topology', 'changes', 'baselines'] as const;
 type DiscoveryTab = (typeof DISCOVERY_TABS)[number];
@@ -46,6 +48,44 @@ type ApiSnmpCredentials = {
   privacyPassphrase?: string;
 };
 
+type ProfileAssetMoveSummary = {
+  candidates: number;
+  moved: number;
+  unlinkedDevices: number;
+  monitorsReattached: number;
+  topologyPoliciesDisabled: number;
+};
+
+/** Success toast for a profile save. A site change leads with the new site and
+ *  appends only the non-zero move clauses. */
+function composeProfileSavedToast(
+  t: TFunction,
+  input: {
+    created: boolean;
+    name: string;
+    previousSiteId?: string;
+    siteId?: string;
+    siteName?: string;
+    assetMove?: ProfileAssetMoveSummary | null;
+  }
+): string {
+  if (input.created) return t('discoveryPage.toasts.profileCreated', { name: input.name });
+  const siteChanged = input.previousSiteId !== undefined && input.siteId !== undefined && input.siteId !== input.previousSiteId;
+  if (!siteChanged) return t('discoveryPage.toasts.profileUpdated', { name: input.name });
+
+  const parts = [t('discoveryPage.toasts.profileMoved', { site: input.siteName ?? input.siteId })];
+  const move = input.assetMove;
+  if (move) {
+    const clauses: string[] = [];
+    if (move.moved > 0) clauses.push(t('discoveryPage.toasts.assetsMoved', { count: move.moved }));
+    if (move.unlinkedDevices > 0) clauses.push(t('discoveryPage.toasts.agentLinksRemoved', { count: move.unlinkedDevices }));
+    if (move.monitorsReattached > 0) clauses.push(t('discoveryPage.toasts.monitorsReattached', { count: move.monitorsReattached }));
+    if (move.topologyPoliciesDisabled > 0) clauses.push(t('discoveryPage.toasts.topologyPoliciesDisabled', { count: move.topologyPoliciesDisabled }));
+    if (clauses.length > 0) parts.push(`${clauses.join('; ')}.`);
+  }
+  return parts.join(' ');
+}
+
 type ApiDiscoveryProfile = {
   id: string;
   name: string;
@@ -56,6 +96,8 @@ type ApiDiscoveryProfile = {
   snmpCommunities?: string[];
   snmpCredentials?: ApiSnmpCredentials | null;
   alertSettings?: ProfileAlertSettings | null;
+  /** #7969: pinned scan agent (devices.id); null = automatic selection. */
+  pinnedDeviceId?: string | null;
   lastRunAt?: string | null;
   createdAt?: string;
   updatedAt?: string;
@@ -257,7 +299,10 @@ function getTabFromHash(): DiscoveryTab {
 
 export default function DiscoveryPage() {
   const { t } = useTranslation('discovery');
-  const { currentOrgId, sites, fetchSites, allOrgs } = useOrgStore();
+  const [pendingDeleteProfile, setPendingDeleteProfile] = useState<DiscoveryProfile | null>(null);
+  const [deletingProfile, setDeletingProfile] = useState(false);
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
+  const { currentOrgId, sites, fetchSites, allOrgs, selectOrganization } = useOrgStore();
   // "All orgs" mode: a partner/multi-org user who has *explicitly* chosen the
   // All-orgs scope via the switcher. Network discovery is inherently
   // org/site/agent-scoped — the API deliberately refuses an unscoped list
@@ -377,16 +422,16 @@ export default function DiscoveryPage() {
       setProfilesError(undefined);
       const response = await fetchWithAuth('/discovery/profiles');
       if (!response.ok) {
-        throw new Error(t('discoveryPage.errors.fetchProfiles'));
+        throw new Error(stableT('discoveryPage.errors.fetchProfiles'));
       }
       const data = await response.json();
       setProfiles(asList(data, 'profiles'));
     } catch (err) {
-      setProfilesError(err instanceof Error ? err.message : t('discoveryPage.errors.generic'));
+      setProfilesError(err instanceof Error ? err.message : stableT('discoveryPage.errors.generic'));
     } finally {
       setProfilesLoading(false);
     }
-  }, [currentOrgId, allOrgsMode, t]);
+  }, [currentOrgId, allOrgsMode, stableT]);
 
   useEffect(() => {
     fetchProfiles();
@@ -437,7 +482,8 @@ export default function DiscoveryPage() {
       methods: editingProfile.methods ?? [],
       schedule: scheduleToForm(editingProfile.schedule),
       snmp,
-      alertSettings: editingProfile.alertSettings ?? defaultAlertSettings
+      alertSettings: editingProfile.alertSettings ?? defaultAlertSettings,
+      pinnedDeviceId: editingProfile.pinnedDeviceId ?? ''
     };
   }, [editingProfile]);
 
@@ -491,6 +537,11 @@ export default function DiscoveryPage() {
         snmpCommunities,
         snmpCredentials,
         alertSettings: values.alertSettings,
+        // #7969: '' (Automatic) clears the pin.
+        pinnedDeviceId: values.pinnedDeviceId || null,
+        // Edit only: the API moves the assets this profile discovered along
+        // with the site change when this is true (ignored if the site is unchanged).
+        ...(editingProfile ? { moveDiscoveredAssets: values.moveDiscoveredAssets === true } : {}),
         ...(currentOrgId ? { orgId: currentOrgId } : {})
       };
 
@@ -498,47 +549,98 @@ export default function DiscoveryPage() {
         ? `/discovery/profiles/${editingProfile.id}`
         : '/discovery/profiles';
       const method = editingProfile ? 'PATCH' : 'POST';
+      const previousSiteId = editingProfile?.siteId;
+      const created = !editingProfile;
 
-      const response = await fetchWithAuth(url, {
-        method,
-        body: JSON.stringify(payload)
+      await runAction<ApiDiscoveryProfile & { assetMove?: ProfileAssetMoveSummary | null }>({
+        request: () => fetchWithAuth(url, {
+          method,
+          body: JSON.stringify(payload)
+        }),
+        errorFallback: t('discoveryPage.errors.saveProfile'),
+        successMessage: (saved) => composeProfileSavedToast(t, {
+          created,
+          name: saved?.name ?? values.name,
+          previousSiteId,
+          siteId: saved?.siteId ?? values.siteId,
+          siteName: siteOptions.find(site => site.id === (saved?.siteId ?? values.siteId))?.name,
+          assetMove: saved?.assetMove ?? null
+        }),
+        onUnauthorized: () => void navigateTo('/login', { replace: true })
       });
-
-      if (!response.ok) {
-        const data = await response.json().catch(() => null);
-        throw new Error(data?.error ?? t('discoveryPage.errors.saveProfile'));
-      }
 
       await fetchProfiles();
       setEditingProfile(null);
       setIsProfileModalOpen(false);
       setProfileFormError(undefined);
     } catch (err) {
+      if (err instanceof ActionError && err.status === 401) return;
+      // runAction already toasted a non-401 ActionError; the modal stays open,
+      // so mirror the message inline where the user is looking.
       setProfileFormError(err instanceof Error ? err.message : t('discoveryPage.errors.generic'));
     } finally {
       setSavingProfile(false);
     }
   };
 
-  const handleDeleteProfile = async (profile: DiscoveryProfile) => {
-    if (!confirm(t('discoveryPage.confirmDeleteProfile', { name: profile.name }))) {
-      return;
-    }
+  const loadMovableAssetCount = useCallback(async () => {
+    if (!editingProfile) return 0;
+    const response = await fetchWithAuth(`/discovery/profiles/${editingProfile.id}/movable-assets`);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json() as { count?: number };
+    return typeof data.count === 'number' ? data.count : 0;
+  }, [editingProfile]);
+
+  // #7969: devices in the chosen site, for the profile's scan-agent picker.
+  // The API re-validates the pin (same org + site) on save.
+  const loadSiteAgents = useCallback(async (siteId: string): Promise<ScanAgentOption[]> => {
+    const params = new URLSearchParams({ siteId, limit: '500' });
+    if (currentOrgId) params.set('orgId', currentOrgId);
+    const response = await fetchWithAuth(`/devices?${params.toString()}`);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const raw = asList<{ id: string; displayName?: string | null; hostname?: string | null; status?: string }>(await response.json(), 'devices');
+    return raw
+      .map(device => ({
+        id: device.id,
+        name: device.displayName || device.hostname || device.id,
+        online: device.status === 'online',
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }, [currentOrgId]);
+
+  const handleDeleteProfile = (profile: DiscoveryProfile) => {
+    setPendingDeleteProfile(profile);
+  };
+
+  const confirmDeleteProfile = async () => {
+    const profile = pendingDeleteProfile;
+    if (!profile) return;
 
     setProfilesError(undefined);
+    setDeletingProfile(true);
 
     try {
-      const response = await fetchWithAuth(`/discovery/profiles/${profile.id}`, {
-        method: 'DELETE'
+      await runAction({
+        request: () => fetchWithAuth(`/discovery/profiles/${profile.id}`, {
+          method: 'DELETE'
+        }),
+        errorFallback: t('discoveryPage.errors.deleteProfile'),
+        successMessage: t('discoveryPage.toasts.profileDeleted', { name: profile.name }),
+        onUnauthorized: () => void navigateTo('/login', { replace: true })
       });
 
-      if (!response.ok) {
-        throw new Error(t('discoveryPage.errors.deleteProfile'));
-      }
-
+      setPendingDeleteProfile(null);
       await fetchProfiles();
     } catch (err) {
-      setProfilesError(err instanceof Error ? err.message : t('discoveryPage.errors.generic'));
+      setPendingDeleteProfile(null);
+      if (err instanceof ActionError) {
+        if (err.status === 401) return;
+        setProfilesError(err.message);
+      } else {
+        setProfilesError(err instanceof Error ? err.message : t('discoveryPage.errors.generic'));
+      }
+    } finally {
+      setDeletingProfile(false);
     }
   };
 
@@ -707,7 +809,7 @@ export default function DiscoveryPage() {
 
       {activeTab === 'topology' && (
         <>
-          <TopologyEntry sites={sites} legacy={<NetworkTopologyMap onNodeClick={(nodeId) => setTopologyAssetId(nodeId)} />} />
+          <TopologyEntry sites={sites} organization={{ currentOrgId, selectOrganization }} legacy={<NetworkTopologyMap onNodeClick={(nodeId) => setTopologyAssetId(nodeId)} />} />
           {topologyAssetId && (
             <AssetDetailModal
               open={!!topologyAssetId}
@@ -777,11 +879,27 @@ export default function DiscoveryPage() {
                   : (savingProfile ? t('discoveryPage.modal.creating') : t('discoveryPage.modal.createProfile'))}
                 disabled={savingProfile}
                 error={profileFormError}
+                loadMovableAssetCount={editingProfile ? loadMovableAssetCount : undefined}
+                loadSiteAgents={loadSiteAgents}
               />
             </div>
           </div>
         </div>
       )}
+
+      <ConfirmDialog
+        open={pendingDeleteProfile !== null}
+        onClose={() => { if (!deletingProfile) setPendingDeleteProfile(null); }}
+        onConfirm={() => void confirmDeleteProfile()}
+        title={t('discoveryProfileList.actions.deleteProfile')}
+        message={pendingDeleteProfile
+          ? t('discoveryPage.confirmDeleteProfile', { name: pendingDeleteProfile.name })
+          : ''}
+        confirmLabel={t('discoveryProfileList.actions.deleteProfile')}
+        variant="destructive"
+        isLoading={deletingProfile}
+        confirmTestId="discovery-profile-delete-confirm"
+      />
     </div>
   );
 }

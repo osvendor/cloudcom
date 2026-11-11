@@ -1,25 +1,35 @@
+import { captureException } from '../services/sentry';
+import {invoicePaySchema,getBankAutopayOffer,startInvoiceBankSetup,collectAfterBankSetup} from '../services/autopay/bankPayment';
+import { getTrustedClientIpOrUndefined } from '../services/clientIp';
+import { getInvoiceAutopayOffer } from '../services/autopay/payAndSave';
 import { Hono } from 'hono';
 import { z } from 'zod';
 import { zValidator } from '../lib/validation';
-import { and, eq, sql, isNull } from 'drizzle-orm';
-import { computeChargeNow } from '@breeze/shared';
+import { and, eq, sql } from 'drizzle-orm';
+import { computeChargeNow, computeCheckoutCharge, ERROR_CODES } from '@breeze/shared';
 import { db, runOutsideDbContext, withSystemDbAccessContext } from '../db';
-import { invoices, invoiceLines, invoiceStripePayments, tickets, ticketCategories } from '../db/schema';
+import { invoices, invoiceStripePayments } from '../db/schema';
 import { partners } from '../db/schema/orgs';
 import { portalBranding } from '../db/schema/portal';
+import { resolveDocumentBrand } from '../services/partnerDocumentBrand';
 import { resolveInvoiceByLinkToken, getOrMintInvoiceLink, buildPublicInvoiceUrl } from '../services/invoiceLinkToken';
-import { toCustomerInvoiceHeader, toCustomerInvoiceLine, markViewed } from '../services/invoiceService';
+import { markViewed } from '../services/invoiceService';
+import { assembleCustomerInvoiceDocument } from '../services/customerDocument';
 import { getInvoicePdf, renderInvoicePdf } from '../services/invoicePdf';
 import { createInvoicePayLink } from '../services/invoiceCheckout';
+import { publicInvoiceCheckoutUrls } from '../services/quoteAcceptCheckout';
+import { isPartnerOnlinePaymentAvailableOnCallerConnection } from '../services/partnerStripe';
 import { CUSTOMER_SAFE_CURRENCY_UNSUPPORTED_MESSAGE } from '../services/stripeCheckoutErrors';
-import { settleCheckoutSession } from '../services/stripeSettle';
+import { HeldDbContextForStripeError, settleCheckoutSession } from '../services/stripeSettle';
 import { InvoiceServiceError } from '../services/invoiceTypes';
 import { safeContentDispositionFilename } from '../utils/httpHeaders';
-import { resolveThemeId, resolvePageSize } from '../services/documentThemes';
-import { portalBase } from '../services/portalUrl';
+import { resolveInvoicePresentation } from '../services/invoicePresentation';
 import { getRedis } from '../services/redis';
 import { rateLimiter } from '../services/rate-limit';
 import { resolveOrgLinkGate, PUBLIC_LINK_ORG_UNAVAILABLE } from '../services/publicLinkOrgGate';
+import { readInFlightCollection } from '../services/autopay/reservation';
+import { releaseInvoiceConfirmation } from '../services/autopay/confirmPayment';
+import { getCustomerInvoiceAutopay } from '../services/autopay/customerInvoiceStatus';
 
 /**
  * Unauthenticated, token-gated PUBLIC INVOICE surface — the customer's durable
@@ -106,46 +116,30 @@ invoicesPublicRoutes.get('/:token', zValidator('param', tokenParam), async (c) =
   if (await orgLinkGone(inv)) return c.json(PUBLIC_LINK_ORG_UNAVAILABLE, 410);
 
   const data = await runOutsideDbContext(() => withSystemDbAccessContext(async () => {
-    const [partner] = await db.select({
-      name: partners.name, billingEmail: partners.billingEmail,
-      documentTheme: partners.documentTheme, documentPageSize: partners.documentPageSize,
-    }).from(partners).where(eq(partners.id, inv.partnerId)).limit(1);
-    const [brand] = await db.select({ logoUrl: portalBranding.logoUrl, primaryColor: portalBranding.primaryColor })
-      .from(portalBranding).where(eq(portalBranding.orgId, inv.orgId)).limit(1);
-
     // Void: the calm no-amounts state — status + who to contact, nothing else.
+    // It never reaches the customer-document assembler (no lines, no amounts).
     if (inv.status === 'void') {
+      const [partner] = await db.select({
+        name: partners.name, billingEmail: partners.billingEmail,
+        documentTheme: partners.documentTheme, documentPageSize: partners.documentPageSize,
+        settings: partners.settings,
+      }).from(partners).where(eq(partners.id, inv.partnerId)).limit(1);
+      const [brand] = await db.select({ logoUrl: portalBranding.logoUrl, primaryColor: portalBranding.primaryColor })
+        .from(portalBranding).where(eq(portalBranding.orgId, inv.orgId)).limit(1);
       return {
         invoice: {
           id: inv.id, invoiceNumber: inv.invoiceNumber, status: inv.status,
           replaced: inv.replacedByInvoiceId != null,
         },
         lines: [], chargeNow: null, payable: false,
-        branding: brandingBlock(partner, brand),
+        branding: brandingBlock(inv, partner, brand),
       };
     }
 
-    const rows = await db.select({
-      ticketId: invoiceLines.ticketId,
-      ticketNumber: sql<string | null>`COALESCE(${tickets.ticketNumber}, ${tickets.internalNumber})`,
-      ticketSubject: tickets.subject,
-      ticketCategory: sql<string | null>`COALESCE(${ticketCategories.name}, ${tickets.category})`,
-      name: invoiceLines.name,
-      description: invoiceLines.description,
-      quantity: invoiceLines.quantity,
-      unitPrice: invoiceLines.unitPrice,
-      taxable: invoiceLines.taxable,
-      lineTotal: invoiceLines.lineTotal,
-      workedMinutes: invoiceLines.workedMinutes,
-    }).from(invoiceLines)
-      .leftJoin(tickets, and(
-        eq(invoiceLines.ticketId, tickets.id),
-        eq(tickets.orgId, inv.orgId),
-        isNull(tickets.deletedAt),
-      ))
-      .leftJoin(ticketCategories, eq(tickets.categoryId, ticketCategories.id))
-      .where(and(eq(invoiceLines.invoiceId, inv.id), eq(invoiceLines.customerVisible, true)))
-      .orderBy(invoiceLines.sortOrder);
+    // #9402: the one customer projection — customer-visible lines of THIS org's
+    // invoice, #8604 toggles from the frozen columns, branding, document locale.
+    // `resolve` already refused drafts, so 'public' never sees one.
+    const doc = await assembleCustomerInvoiceDocument(inv, 'public');
 
     // "Link fetched" stamp — an email scanner can trigger this, so it is a
     // signal, not proof of human viewing. Best-effort; never fails the render.
@@ -153,31 +147,70 @@ invoicesPublicRoutes.get('/:token', zValidator('param', tokenParam), async (c) =
       console.error('[invoicesPublic] markViewed failed', { invoiceId: inv.id, err });
     }
 
-    const chargeNow = computeChargeNow({
-      depositDue: inv.depositDue, amountPaid: inv.amountPaid, balance: inv.balance,
-    });
+    // The Checkout rule the Pay button mints with (#3803 item 8), so the amount
+    // shown is the amount charged. A balance the currency cannot express gets no
+    // Pay CTA (the mint refuses it) and is displayed exactly, never rounded.
+    const depositInput = { depositDue: inv.depositDue, amountPaid: inv.amountPaid, balance: inv.balance };
+    const checkoutCharge = computeCheckoutCharge(depositInput, inv.currencyCode);
+    const chargeNow = checkoutCharge.kind === 'charge'
+      ? { amount: checkoutCharge.amount, isDeposit: checkoutCharge.isDeposit }
+      : computeChargeNow(depositInput);
+    // #7824: advisory in-flight autopay state (the pay route's 409 is the gate).
+    let collectionInProgress: { amount: string; actionRequired: boolean } | null = null;
+    try {
+      const inFlight = await readInFlightCollection(db, inv.id);
+      if (inFlight.inProgress) collectionInProgress = { amount: inFlight.amount, actionRequired: inFlight.actionRequired === true };
+    } catch (err) {
+      console.error('[invoicesPublic] in-flight collection lookup failed', { invoiceId: inv.id, err });
+    }
+    // D-4: how this invoice will be paid. An enrolled client is told, and is not
+    // offered automatic-payment setup again (the save-card offer is withheld).
+    // R9: unknown enrollment fails closed: no offer that saves a method.
+    let customerAutopay: Awaited<ReturnType<typeof getCustomerInvoiceAutopay>> = { enrolled: false, status: null };
+    let autopayKnown = true;
+    try {
+      customerAutopay = await getCustomerInvoiceAutopay(db, { invoiceId: inv.id, orgId: inv.orgId });
+    } catch (err) {
+      autopayKnown = false;
+      console.error('[invoicesPublic] autopay status lookup failed', { invoiceId: inv.id, err });
+      captureException(err, undefined, { autopay_phase: 'invoice_status' });
+    }
     return {
-      invoice: { ...toCustomerInvoiceHeader(inv), paidAt: inv.paidAt },
-      lines: rows.map(toCustomerInvoiceLine),
+      invoice: { ...doc.invoice, paidAt: inv.paidAt },
+      collectionInProgress,
+      autopayStatus: customerAutopay.status,
+      autopayEnrolled: customerAutopay.enrolled,
+      lines: doc.lines,
       chargeNow,
-      payable: PAYABLE.has(inv.status) && Number(inv.balance) > 0,
-      branding: brandingBlock(partner, brand),
+      // #7509: no Pay CTA unless the partner can actually take online payment.
+      // #9585: read on THIS handler's system-context connection — the default
+      // variant would open a second connection inside this open transaction.
+      payable: PAYABLE.has(inv.status) && checkoutCharge.kind === 'charge'
+        && await isPartnerOnlinePaymentAvailableOnCallerConnection(inv.partnerId),
+      autopay: customerAutopay.enrolled || !autopayKnown ? null : await getInvoiceAutopayOffer(inv.orgId, inv.id),
+      bankAutopay: autopayKnown ? await getBankAutopayOffer(inv.id,inv.orgId) : null,
+      branding: { ...doc.branding, partnerName: doc.branding.partnerName ?? 'Invoice' },
+      documentLocale: doc.documentLocale,
     };
   }));
   return c.json({ data });
 });
 
 function brandingBlock(
-  partner: { name: string; billingEmail: string | null; documentTheme: string | null; documentPageSize: string | null } | undefined,
+  inv: { documentTheme: string | null; documentPageSize: string | null },
+  partner: { name: string; billingEmail: string | null; documentTheme: string | null; documentPageSize: string | null; settings: unknown } | undefined,
   brand: { logoUrl: string | null; primaryColor: string | null } | undefined,
 ) {
+  // #9676: org portal_branding wins; the partner's Branding settings fill the rest.
+  const docBrand = resolveDocumentBrand(brand, partner?.settings);
   return {
     partnerName: partner?.name ?? 'Invoice',
     contactEmail: partner?.billingEmail ?? null,
-    logoUrl: brand?.logoUrl ?? null,
-    primaryColor: brand?.primaryColor ?? null,
-    theme: resolveThemeId(partner?.documentTheme),
-    pageSize: resolvePageSize(partner?.documentPageSize),
+    logoUrl: docBrand.logoUrl,
+    primaryColor: docBrand.primaryColor,
+    // #6227: the invoice's issue-time snapshot (every non-draft invoice carries
+    // one since 2026-10-29-100100), partner live values only as the fallback.
+    ...resolveInvoicePresentation(inv, partner),
   };
 }
 
@@ -187,8 +220,8 @@ invoicesPublicRoutes.get('/:token/pdf', zValidator('param', tokenParam), async (
   const inv = await resolve(c.req.valid('param').token);
   if (!inv) return c.json(invalidLink, 401);
   if (await orgLinkGone(inv)) return c.json(PUBLIC_LINK_ORG_UNAVAILABLE, 410);
-  if (inv.status === 'void') return c.json({ error: 'This invoice is no longer available' }, 409);
-  if (await overPublicOpLimit('pdf', inv.id, 10)) return c.json({ error: 'Too many requests' }, 429);
+  if (inv.status === 'void') return c.json({ error: 'This invoice is no longer available', code: ERROR_CODES.CONFLICT }, 409);
+  if (await overPublicOpLimit('pdf', inv.id, 10)) return c.json({ error: 'Too many requests', code: ERROR_CODES.RATE_LIMITED }, 429);
 
   // System context like every other handler here — these reads/renders run
   // with NO auth middleware, so a bare call would execute without a DB access
@@ -220,35 +253,47 @@ invoicesPublicRoutes.get('/:token/pdf', zValidator('param', tokenParam), async (
 // now (deposit-aware). Return URLs carry ONLY the session id — the durable
 // bearer token must never reach Stripe's logs (spec §5); the return page
 // exchanges the session id back into the public URL via /settle-return.
-invoicesPublicRoutes.post('/:token/pay', zValidator('param', tokenParam), async (c) => {
+invoicesPublicRoutes.post('/:token/pay', zValidator('param', tokenParam), zValidator('json',invoicePaySchema), async (c) => {
   applyPublicLinkHeaders(c);
   // Same-origin fetch shape: the page always POSTs JSON. A cross-site form
   // can't set this header, and there is no ambient credential to ride anyway.
   if (!(c.req.header('content-type') ?? '').includes('application/json')) {
     return c.json({ error: 'Invalid request' }, 400);
   }
+  const body=c.req.valid('json');
   const inv = await resolve(c.req.valid('param').token);
   if (!inv) return c.json(invalidLink, 401);
   if (await orgLinkGone(inv)) return c.json(PUBLIC_LINK_ORG_UNAVAILABLE, 410);
-  if (await overPublicOpLimit('pay', inv.id, 10)) return c.json({ error: 'Too many requests' }, 429);
+  if (await overPublicOpLimit('pay', inv.id, 10)) return c.json({ error: 'Too many requests', code: ERROR_CODES.RATE_LIMITED }, 429);
 
-  const returnBase = `${portalBase()}/invoice/return`;
   try {
-    // #1448 — NOT wrapped in withSystemDbAccessContext: createInvoicePayLink opens
-    // its own short system contexts around each DB step and runs
-    // checkout.sessions.create outside any transaction. An enclosing context here
-    // pinned a pooled connection idle-in-transaction across the Stripe
-    // round-trip (#3777 review F2). runOutsideDbContext is kept only so a
-    // stray ambient context can never be inherited.
-    const link = await runOutsideDbContext(() =>
-      createInvoicePayLink(inv.id, { userId: null, partnerId: null, accessibleOrgIds: [inv.orgId] }, {
-        successUrl: `${returnBase}?session_id={CHECKOUT_SESSION_ID}`,
-        cancelUrl: `${returnBase}?canceled=1&session_id={CHECKOUT_SESSION_ID}`,
-        idempotencySuffix: '_pub',
-      }));
+    if('methodType' in body && body.methodType==='us_bank_account'){
+      const result=body.phase==='setup'
+        ? await startInvoiceBankSetup({invoiceId:inv.id,orgId:inv.orgId,terms:body,returnTo:'public',
+          ip:getTrustedClientIpOrUndefined(c)??null,userAgent:c.req.header('user-agent')??null})
+        : await collectAfterBankSetup({invoiceId:inv.id,orgId:inv.orgId,setupSessionId:body.setupSessionId!});
+      if ('outcome' in result && result.outcome !== 'created') return c.json({error:'Payment has not started. Review the invoice payment status.',data:result,code:ERROR_CODES.CONFLICT},409);
+      return c.json({data:result});
+    }
+    // The producer owns short committed contexts. Do not hide a caller's held
+    // transaction with runOutsideDbContext: its Stripe guard must see it.
+    const link = await createInvoicePayLink(inv.id, { userId: null, partnerId: null, accessibleOrgIds: [inv.orgId] }, {
+      // Shared with the public quote accept's Sign & pay (#8231): one session
+      // family, so the two never mint competing sessions for the same charge.
+      ...publicInvoiceCheckoutUrls(),
+      ...body, ip: getTrustedClientIpOrUndefined(c) ?? null, userAgent: c.req.header('user-agent') ?? null,
+    }, { billingGate: false });
     return c.json({ data: { url: link.url } });
   } catch (err) {
     if (err instanceof InvoiceServiceError) {
+      // Local compatibility translation until the shared autopay error mapper lands.
+      if (('saveForAutopay' in body && body.saveForAutopay) && err.status === 404 && err.code === 'INVALID_STATE'
+        && err.message === 'Automatic payments unavailable') {
+        return c.json({ error: 'Automatic payments are not enabled', code: 'autopay_not_enabled' }, 404);
+      }
+      if (err.code === 'COLLECTION_IN_PROGRESS') {
+        return c.json({ error: 'A payment is already processing', code: err.code }, 409);
+      }
       // Customer-facing wording for the benign 409s.
       if (err.code === 'STRIPE_NOT_CONNECTED') {
         return c.json({ error: 'Online payment is not available for this invoice — please contact the sender', code: err.code }, 409);
@@ -264,6 +309,27 @@ invoicesPublicRoutes.post('/:token/pay', zValidator('param', tokenParam), async 
   }
 });
 
+// POST /:token/autopay-confirmation — the invoice page's way out of an
+// off-session payment waiting on bank authentication (3DS). Does what the
+// emailed confirm link does: cancels that PaymentIntent and releases the
+// reservation so the customer can pay on-session with the Pay button.
+invoicesPublicRoutes.post('/:token/autopay-confirmation', zValidator('param', tokenParam), async (c) => {
+  applyPublicLinkHeaders(c);
+  if (!(c.req.header('content-type') ?? '').includes('application/json')) {
+    return c.json({ error: 'Invalid request' }, 400);
+  }
+  const inv = await resolve(c.req.valid('param').token);
+  if (!inv) return c.json(invalidLink, 401);
+  if (await orgLinkGone(inv)) return c.json(PUBLIC_LINK_ORG_UNAVAILABLE, 410);
+  if (await overPublicOpLimit('autopay-confirmation', inv.id, 10)) return c.json({ error: 'Too many requests', code: ERROR_CODES.RATE_LIMITED }, 429);
+  try {
+    return c.json({ data: await releaseInvoiceConfirmation({ invoiceId: inv.id, orgId: inv.orgId }) });
+  } catch (err) {
+    if (err instanceof InvoiceServiceError && err.status < 500) return c.json({ error: err.message, code: err.code }, err.status);
+    throw err;
+  }
+});
+
 // POST /settle-return — verify-on-return WITHOUT the invoice token: the customer
 // lands on <portal>/invoice/return?session_id=cs_… after Checkout. The session
 // id (unguessable, ours, recent) is exchanged for settlement + the canonical
@@ -271,9 +337,14 @@ invoicesPublicRoutes.post('/:token/pay', zValidator('param', tokenParam), async 
 invoicesPublicRoutes.post('/settle-return', zValidator('json', settleReturnSchema), async (c) => {
   applyPublicLinkHeaders(c);
   const { sessionId } = c.req.valid('json');
-  if (await overPublicOpLimit('settle', sessionId, 20)) return c.json({ error: 'Too many requests' }, 429);
+  if (await overPublicOpLimit('settle', sessionId, 20)) return c.json({ error: 'Too many requests', code: ERROR_CODES.RATE_LIMITED }, 429);
 
-  const result = await runOutsideDbContext(() => withSystemDbAccessContext(async () => {
+  // #7065 — three phases so no transaction spans the Stripe call. This route
+  // is unauthenticated, so no ambient request transaction is held and
+  // runOutsideDbContext is a guard, not an escape from a held connection.
+  //
+  // Phase 1 (short system context): authorize the session and gate the org.
+  const pre = await runOutsideDbContext(() => withSystemDbAccessContext(async () => {
     // The session must be one WE created — the mapping row is the authority.
     const [mapping] = await db.select({
       invoiceId: invoiceStripePayments.invoiceId,
@@ -294,51 +365,64 @@ invoicesPublicRoutes.post('/settle-return', zValidator('json', settleReturnSchem
     // reuses THIS system transaction (resolveOrgLinkGate escalates only from a
     // narrower ambient context), so no second connection is pinned across it.
     if ((await resolveOrgLinkGate(inv.orgId)).blocked) return 'org_gone' as const;
-
-    // Only an actual SUCCESS is "settled" — a failed/refunded mapping is also
-    // not-pending, and reporting settled:true for those would paint a
-    // "Payment received" banner over a payment that failed or was refunded.
-    const alreadySettled = mapping.status === 'succeeded';
-    const terminalNonSuccess = mapping.status !== 'pending' && !alreadySettled;
-    let settled = alreadySettled;
-    let justSettled = false;
-    if (!alreadySettled && !terminalNonSuccess) {
-      try {
-        ({ settled } = await settleCheckoutSession(inv.partnerId, sessionId));
-        justSettled = settled;
-      } catch (err) {
-        // Never strand the customer — the reconcile sweep settles it within the
-        // minute; report unsettled so the page shows "confirming payment".
-        console.error('[invoicesPublic] settle-return failed', { invoiceId: inv.id, sessionId, err });
-        settled = false;
-      }
-    }
-
-    // Bound the session-id → url exchange: a customer mid-flow (pending
-    // mapping), a settlement completed just now, or one recorded within the
-    // window may recover the page URL. A stale long-settled session may NOT —
-    // otherwise any old session id would remain a permanent url oracle.
-    const recent = mapping.status === 'pending'
-      || justSettled
-      || (mapping.updatedAt != null && Date.now() - mapping.updatedAt.getTime() <= SETTLE_RETURN_URL_WINDOW_MS);
-    let publicUrl: string | null = null;
-    if (recent) {
-      try {
-        const link = await getOrMintInvoiceLink({
-          id: inv.id, dueDate: inv.dueDate,
-          publicLinkTokenHash: inv.publicLinkTokenHash,
-          publicLinkTokenCt: inv.publicLinkTokenCt,
-          publicLinkExpiresAt: inv.publicLinkExpiresAt,
-        });
-        publicUrl = buildPublicInvoiceUrl(link.token);
-      } catch (err) {
-        console.error('[invoicesPublic] could not resolve public url on return', { invoiceId: inv.id, err });
-      }
-    }
-    return { settled, publicUrl };
+    return { mapping, inv };
   }));
 
-  if (result === 'org_gone') return c.json(PUBLIC_LINK_ORG_UNAVAILABLE, 410);
-  if (!result) return c.json({ error: 'Unknown payment session' }, 404);
-  return c.json({ data: result });
+  if (pre === 'org_gone') return c.json(PUBLIC_LINK_ORG_UNAVAILABLE, 410);
+  if (!pre) return c.json({ error: 'Unknown payment session', code: ERROR_CODES.NOT_FOUND }, 404);
+  const { mapping, inv } = pre;
+
+  // Phase 2 (NO context): settle. settleCheckoutSession owns its own short
+  // transactions around the Stripe retrieve and commits the capture before it
+  // returns.
+  //
+  // Only an actual SUCCESS is "settled" — a failed/refunded mapping is also
+  // not-pending, and reporting settled:true for those would paint a
+  // "Payment received" banner over a payment that failed or was refunded.
+  const alreadySettled = mapping.status === 'succeeded';
+  const terminalNonSuccess = mapping.status !== 'pending' && !alreadySettled;
+  let settled = alreadySettled;
+  let justSettled = false;
+  if (!alreadySettled && !terminalNonSuccess) {
+    try {
+      // Called bare, NOT via runOutsideDbContext: if a context were ever held
+      // here, escaping would open a second pooled connection (#6671) and hide
+      // it; settleCheckoutSession's assertion is the tripwire instead.
+      ({ settled } = await settleCheckoutSession(inv.partnerId, sessionId));
+      justSettled = settled;
+    } catch (err) {
+      // A held-context assertion is a programming error — surface it (500 +
+      // Sentry via the error handler), never as "still confirming" (#7065).
+      if (err instanceof HeldDbContextForStripeError) throw err;
+      // Never strand the customer — the reconcile sweep settles it within the
+      // minute; report unsettled so the page shows "confirming payment".
+      console.error('[invoicesPublic] settle-return failed', { invoiceId: inv.id, sessionId, err });
+      settled = false;
+    }
+  }
+
+  // Phase 3 (short system context): the session-id → url exchange.
+  //
+  // Bound it: a customer mid-flow (pending mapping), a settlement completed
+  // just now, or one recorded within the window may recover the page URL. A
+  // stale long-settled session may NOT — otherwise any old session id would
+  // remain a permanent url oracle.
+  const recent = mapping.status === 'pending'
+    || justSettled
+    || (mapping.updatedAt != null && Date.now() - mapping.updatedAt.getTime() <= SETTLE_RETURN_URL_WINDOW_MS);
+  let publicUrl: string | null = null;
+  if (recent) {
+    try {
+      const link = await runOutsideDbContext(() => withSystemDbAccessContext(() => getOrMintInvoiceLink({
+        id: inv.id, dueDate: inv.dueDate,
+        publicLinkTokenHash: inv.publicLinkTokenHash,
+        publicLinkTokenCt: inv.publicLinkTokenCt,
+        publicLinkExpiresAt: inv.publicLinkExpiresAt,
+      })));
+      publicUrl = buildPublicInvoiceUrl(link.token);
+    } catch (err) {
+      console.error('[invoicesPublic] could not resolve public url on return', { invoiceId: inv.id, err });
+    }
+  }
+  return c.json({ data: { settled, publicUrl } });
 });

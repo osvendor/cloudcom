@@ -36,12 +36,13 @@ func (p *proxyProvider) GetContent() (Content, error) {
 	}
 
 	if resp.Error != "" {
-		return Content{}, fmt.Errorf("proxy: user helper error: %s", resp.Error)
+		return Content{}, proxyHelperError(resp.Error)
 	}
 
 	var data struct {
 		Type        string `json:"type"`
 		Text        string `json:"text,omitempty"`
+		RTF         []byte `json:"rtf,omitempty"`
 		Image       []byte `json:"image,omitempty"`
 		ImageFormat string `json:"imageFormat,omitempty"`
 	}
@@ -52,6 +53,7 @@ func (p *proxyProvider) GetContent() (Content, error) {
 	content := Content{
 		Type:        ContentType(data.Type),
 		Text:        data.Text,
+		RTF:         data.RTF,
 		Image:       data.Image,
 		ImageFormat: data.ImageFormat,
 	}
@@ -59,6 +61,16 @@ func (p *proxyProvider) GetContent() (Content, error) {
 		return Content{}, fmt.Errorf("proxy: clipboard get rejected oversized content: %w", err)
 	}
 	return content, nil
+}
+
+// proxyHelperError rebuilds a helper's error, which crosses IPC as a string.
+// ErrNoSupportedFormat survives the trip so the watcher can tell an empty
+// clipboard from one it failed to open.
+func proxyHelperError(msg string) error {
+	if msg == ErrNoSupportedFormat.Error() {
+		return fmt.Errorf("proxy: user helper error: %w", ErrNoSupportedFormat)
+	}
+	return fmt.Errorf("proxy: user helper error: %s", msg)
 }
 
 func (p *proxyProvider) SetContent(content Content) error {

@@ -63,6 +63,8 @@ import {
   configPolicyFeatureLinks,
   configPolicyAssignments,
   configPolicyEventLogSettings,
+  configPolicyMonitors,
+  monitorDefinitions,
   configPolicyMonitoringSettings,
   configPolicyMonitoringWatches,
   configPolicyPatchSettings,
@@ -78,6 +80,7 @@ import {
 } from '../../routes/agents/helpers';
 import { PAM_DEFAULTS } from '../../routes/agents/pamSettings';
 import { getRedis } from '../../services/redis';
+import { allDevicePolicyCacheKeys } from '../../services/devicePolicyCache';
 import { createPartner, createOrganization, createSite } from './db-utils';
 
 const SYSTEM_CTX: DbAccessContext = {
@@ -128,6 +131,7 @@ function partnerWideBlindContext(orgId: string): DbAccessContext {
 
 const createdPolicies: string[] = [];
 const createdDevices: string[] = [];
+const createdMonitors: string[] = [];
 
 afterEach(async () => {
   await withDbAccessContext(SYSTEM_CTX, async () => {
@@ -137,7 +141,11 @@ afterEach(async () => {
     for (const id of createdPolicies) {
       await db.delete(configurationPolicies).where(eq(configurationPolicies.id, id));
     }
+    for (const id of createdMonitors) {
+      await db.delete(monitorDefinitions).where(eq(monitorDefinitions.id, id));
+    }
   });
+  createdMonitors.length = 0;
   createdDevices.length = 0;
   createdPolicies.length = 0;
 });
@@ -206,6 +214,7 @@ async function seedEventLogPolicy(
 async function seedMonitoringPolicy(
   owner: { orgId: string | null; partnerId: string | null },
   checkIntervalSeconds: number,
+  attachMonitor = false,
 ) {
   return withDbAccessContext(SYSTEM_CTX, async () => {
     const [policy] = await db
@@ -215,7 +224,7 @@ async function seedMonitoringPolicy(
     createdPolicies.push(policy!.id);
     const [link] = await db
       .insert(configPolicyFeatureLinks)
-      .values({ configPolicyId: policy!.id, featureType: 'monitoring' })
+      .values({ configPolicyId: policy!.id, featureType: 'monitors' })
       .returning();
     const [settings] = await db
       .insert(configPolicyMonitoringSettings)
@@ -224,9 +233,27 @@ async function seedMonitoringPolicy(
     await db.insert(configPolicyMonitoringWatches).values({
       settingsId: settings!.id,
       watchType: 'service',
-      name: 'TestService',
+      name: 'HistoricalService',
       enabled: true,
+      retiredAt: new Date(),
+      retiredReason: 'unconvertible:equivalence_delta',
     });
+    if (attachMonitor) {
+      const [monitor] = await db.insert(monitorDefinitions).values({
+        orgId: owner.orgId,
+        partnerId: owner.partnerId,
+        name: `service-monitor-${randomUUID()}`,
+        kind: 'service',
+        condition: { serviceName: 'TestService', consecutiveFailures: 2 },
+        severity: 'high',
+      }).returning({ id: monitorDefinitions.id });
+      createdMonitors.push(monitor!.id);
+      await db.insert(configPolicyMonitors).values({
+        featureLinkId: link!.id,
+        monitorId: monitor!.id,
+        enabled: true,
+      });
+    }
     return policy!.id;
   });
 }
@@ -300,12 +327,7 @@ async function seedPatchPolicy(
 async function purgeCaches(deviceId: string) {
   const redis = getRedis();
   if (!redis) return;
-  await redis.del(
-    `eventlog:settings:device:${deviceId}`,
-    `monitoring:settings:device:${deviceId}`,
-    `pam:settings:device:${deviceId}`,
-    `helper:settings:device:${deviceId}`,
-  );
+  await redis.del(...allDevicePolicyCacheKeys(deviceId));
 }
 
 describe('agent-facing config-policy resolvers honour partner-wide policies (#2930)', () => {
@@ -342,8 +364,7 @@ describe('agent-facing config-policy resolvers honour partner-wide policies (#29
 
       expect(result).not.toBeNull();
       expect(result!.check_interval_seconds).toBe(999);
-      expect(result!.watches).toHaveLength(1);
-      expect(result!.watches[0]?.name).toBe('TestService');
+      expect(result!.watches).toEqual([]);
     });
 
     it('buildPamConfigUpdate resolves a partner-owned policy', async () => {
@@ -486,7 +507,9 @@ describe('agent-facing config-policy resolvers honour partner-wide policies (#29
       // No policy of Q's own partner matched -> defaults across the board,
       // NOT partner P1's values (555 / 999 / true / true).
       expect(eventLogQ.max_events_per_cycle).toBe(EVENT_LOG_DEFAULTS.maxEventsPerCycle);
-      expect(monitoringQ).toBeNull();
+      // "Nothing applies" is now the explicit #2949 clear, not null — still
+      // proves P1's policy (999 / TestService) did not leak.
+      expect(monitoringQ).toEqual({ check_interval_seconds: 60, watches: [] });
       expect(pamQ.uacInterceptionEnabled).toBe(PAM_DEFAULTS.uacInterceptionEnabled);
       expect(patchQ.exclusiveWindowsUpdate).toBe(false);
     });
@@ -592,21 +615,16 @@ describe('agent-facing config-policy resolvers honour partner-wide policies (#29
       const blind = await withDbAccessContext(partnerWideBlindContext(org!.id), () =>
         buildMonitoringConfigUpdate(device.id),
       );
-      expect(blind).toBeNull();
+      // Invisible → resolves as "nothing applies" (the #2949 empty clear).
+      expect(blind).toEqual({ check_interval_seconds: 60, watches: [] });
 
       await purgeCaches(device.id);
       const sighted = await withDbAccessContext(orgContext(org!.id, partner.id), () =>
         buildMonitoringConfigUpdate(device.id),
       );
-      // The watches read is a SEPARATE query, chained through settings_id ->
-      // feature link -> configuration_policies. It used to share one escape
-      // with the policy join; now it needs its own
-      // `config_policy_monitoring_watches_partner_wide_select` branch. A
-      // non-empty watches array is the proof that branch exists and matches —
-      // without it this resolves the settings row and then returns null.
-      expect(sighted).not.toBeNull();
-      expect(sighted!.check_interval_seconds).toBe(999);
-      expect(sighted!.watches).toHaveLength(1);
+      // The settings SELECT branch remains load-bearing after the link re-key.
+      // Historical watches beneath those settings are never delivered.
+      expect(sighted).toEqual({ check_interval_seconds: 999, watches: [] });
     });
 
     it('pam: a partner-wide policy is INVISIBLE without breeze.current_partner_id', async () => {
@@ -665,10 +683,10 @@ describe('agent-facing config-policy resolvers honour partner-wide policies (#29
 
       // Both fields differ from what the no-policy path produces: that path
       // returns HELPER_DEFAULTS with `enabled` from organizations.settings.helper
-      // (unset here, so false) and `showTrayIcon: true`.
+      // (unset here, so false) and `showOpenPortal: true`.
       const policyId = await seedHelperPolicy(
         { orgId: null, partnerId: partner.id },
-        { enabled: true, showTrayIcon: false },
+        { enabled: true, showOpenPortal: false },
       );
       await assign(policyId, 'partner', partner.id);
 
@@ -676,14 +694,14 @@ describe('agent-facing config-policy resolvers honour partner-wide policies (#29
         buildHelperConfigUpdate(device.id, org!.id),
       );
       expect(blind.enabled).toBe(false);
-      expect(blind.showTrayIcon).toBe(true);
+      expect(blind.showOpenPortal).toBe(true);
 
       await purgeCaches(device.id);
       const sighted = await withDbAccessContext(orgContext(org!.id, partner.id), () =>
         buildHelperConfigUpdate(device.id, org!.id),
       );
       expect(sighted.enabled).toBe(true);
-      expect(sighted.showTrayIcon).toBe(false);
+      expect(sighted.showOpenPortal).toBe(false);
     });
 
     it('writes stay locked: the org context still cannot UPDATE or DELETE the partner-wide policy', async () => {
@@ -717,6 +735,81 @@ describe('agent-facing config-policy resolvers honour partner-wide policies (#29
           .where(eq(configurationPolicies.id, policyId)),
       );
       expect(row?.name).not.toBe('hijacked');
+    });
+  });
+  describe('a monitoring policy that stops applying CLEARS the agent\'s watches (#2949 / #3493)', () => {
+    // The agent treats an absent `monitoring_settings` key as "no change", so
+    // when nothing resolves the server must send an explicit empty watch set
+    // or the last delivered watches keep running forever. Real Postgres + RLS
+    // under the agent's own org context: the "before" half proves the policy
+    // genuinely resolved, so the "after" empty set is the clear, not a blind
+    // read that never saw the policy in the first place.
+    async function seedAssignedOrgPolicy() {
+      const partner = await createPartner();
+      const org = await createOrganization({ partnerId: partner.id });
+      const site = await createSite({ orgId: org!.id });
+      const device = await seedDevice(org!.id, site!.id);
+      const policyId = await seedMonitoringPolicy({ orgId: org!.id, partnerId: null }, 321, true);
+      await assign(policyId, 'organization', org!.id);
+      await purgeCaches(device.id);
+
+      const before = await withDbAccessContext(orgContext(org!.id, partner.id), () =>
+        buildMonitoringConfigUpdate(device.id),
+      );
+      expect(before).toEqual({
+        check_interval_seconds: 321,
+        watches: [expect.objectContaining({ watch_type: 'service', name: 'TestService' })],
+      });
+      // The before-read cached the resolved set for 120s. Purge it, as a
+      // real deletion would otherwise be seen after the TTL.
+      await purgeCaches(device.id);
+      return { partner, org: org!, device, policyId };
+    }
+
+    it('deleted policy → explicit empty watch set', async () => {
+      const { partner, org, device, policyId } = await seedAssignedOrgPolicy();
+      await withDbAccessContext(SYSTEM_CTX, () =>
+        db.delete(configurationPolicies).where(eq(configurationPolicies.id, policyId)),
+      );
+
+      const after = await withDbAccessContext(orgContext(org.id, partner.id), () =>
+        buildMonitoringConfigUpdate(device.id),
+      );
+      expect(after).toEqual({ check_interval_seconds: 60, watches: [] });
+    });
+
+    it('unassigned policy → explicit empty watch set', async () => {
+      const { partner, org, device, policyId } = await seedAssignedOrgPolicy();
+      await withDbAccessContext(SYSTEM_CTX, () =>
+        db.delete(configPolicyAssignments).where(eq(configPolicyAssignments.configPolicyId, policyId)),
+      );
+
+      const after = await withDbAccessContext(orgContext(org.id, partner.id), () =>
+        buildMonitoringConfigUpdate(device.id),
+      );
+      expect(after).toEqual({ check_interval_seconds: 60, watches: [] });
+    });
+
+    it('deactivated policy → explicit empty watch set', async () => {
+      const { partner, org, device, policyId } = await seedAssignedOrgPolicy();
+      await withDbAccessContext(SYSTEM_CTX, () =>
+        db.update(configurationPolicies).set({ status: 'inactive' }).where(eq(configurationPolicies.id, policyId)),
+      );
+
+      const after = await withDbAccessContext(orgContext(org.id, partner.id), () =>
+        buildMonitoringConfigUpdate(device.id),
+      );
+      expect(after).toEqual({ check_interval_seconds: 60, watches: [] });
+    });
+
+    it('a device that no longer exists still omits the update (null), never the clear (#5677)', async () => {
+      const { partner, org, device } = await seedAssignedOrgPolicy();
+      await withDbAccessContext(SYSTEM_CTX, () => db.delete(devices).where(eq(devices.id, device.id)));
+
+      const after = await withDbAccessContext(orgContext(org.id, partner.id), () =>
+        buildMonitoringConfigUpdate(device.id),
+      );
+      expect(after).toBeNull();
     });
   });
 });

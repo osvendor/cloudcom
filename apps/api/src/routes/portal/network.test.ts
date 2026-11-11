@@ -3,7 +3,7 @@ import { Hono } from 'hono';
 import type { SQL } from 'drizzle-orm';
 import { PgDialect } from 'drizzle-orm/pg-core';
 
-const { dbState, dbAccessContexts, networkOverviewMock } = vi.hoisted(() => ({
+const { dbState, dbAccessContexts, networkOverviewMock, networkAssetsMock, networkSitesMock } = vi.hoisted(() => ({
   dbState: {
     rows: [] as unknown[],
     where: undefined as unknown,
@@ -11,6 +11,8 @@ const { dbState, dbAccessContexts, networkOverviewMock } = vi.hoisted(() => ({
   },
   dbAccessContexts: [] as unknown[],
   networkOverviewMock: vi.fn(),
+  networkAssetsMock: vi.fn(),
+  networkSitesMock: vi.fn(),
 }));
 
 vi.mock('../../db', () => {
@@ -58,6 +60,8 @@ vi.mock('../../db', () => {
 
 vi.mock('../../services/portal/networkVisibilityReadModel', () => ({
   networkOverview: networkOverviewMock,
+  networkAssets: networkAssetsMock,
+  networkSites: networkSitesMock,
 }));
 
 import { portalNetworkRoutes } from './network';
@@ -202,5 +206,205 @@ describe('GET /network/overview (#5861)', () => {
     expect(response.status).toBe(401);
     expect(dbState.where).toBeUndefined();
     expect(networkOverviewMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('GET /network/assets (#5861, PR 2)', () => {
+  const OK_ASSETS = {
+    dataStatus: 'ok' as const,
+    data: [
+      {
+        id: 'a1',
+        hostname: 'core-switch-01',
+        ipAddress: '10.0.0.1',
+        macAddress: 'AA:BB:CC:00:00:01',
+        assetType: 'switch',
+        onlineState: 'online' as const,
+        lastSeenAt: '2026-09-17T11:59:00.000Z',
+        firstSeenAt: '2026-09-01T09:00:00.000Z',
+        manufacturer: 'Cisco',
+        model: null,
+        siteName: 'HQ',
+      },
+    ],
+    pagination: { page: 1, limit: 50, total: 1 },
+  };
+
+  const NOT_ENABLED_ASSETS = {
+    dataStatus: 'not_enabled',
+    data: [],
+    pagination: { page: 1, limit: 50, total: 0 },
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    dbState.rows = [];
+    dbState.where = undefined;
+    dbState.contextDepth = 0;
+    dbAccessContexts.length = 0;
+    networkAssetsMock.mockResolvedValue(OK_ASSETS);
+  });
+
+  it('returns not_enabled with an empty list when the flag is false', async () => {
+    dbState.rows = [{ enableNetworkVisibility: false, partnerId: PARTNER_ID }];
+
+    const response = await makeApp().request('/network/assets');
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual(NOT_ENABLED_ASSETS);
+    expect(networkAssetsMock).not.toHaveBeenCalled();
+  });
+
+  it('returns the org-scoped asset list when the flag is true', async () => {
+    dbState.rows = [{ enableNetworkVisibility: true, partnerId: PARTNER_ID }];
+
+    const response = await makeApp().request('/network/assets');
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual(OK_ASSETS);
+    expect(networkAssetsMock).toHaveBeenCalledTimes(1);
+    expect(networkAssetsMock).toHaveBeenCalledWith(ORG_ID, {
+      siteId: undefined,
+      assetType: undefined,
+      status: undefined,
+      page: undefined,
+      limit: undefined,
+    }, undefined, false, false);
+  });
+
+  it('forwards enrichWithAlerts=true when enableNetworkAlerts is on', async () => {
+    dbState.rows = [{ enableNetworkVisibility: true, enableNetworkAlerts: true, partnerId: PARTNER_ID }];
+
+    const response = await makeApp().request('/network/assets');
+
+    expect(response.status).toBe(200);
+    expect(networkAssetsMock).toHaveBeenCalledWith(ORG_ID, {
+      siteId: undefined,
+      assetType: undefined,
+      status: undefined,
+      page: undefined,
+      limit: undefined,
+    }, undefined, true, false);
+  });
+
+  it.each([
+    ['absent', {}, false],
+    ['false', { enablePhysicalPlacement: false }, false],
+    ['true', { enablePhysicalPlacement: true }, true],
+  ])('forwards includePhysicalPlacement for enablePhysicalPlacement %s (CPEV-W1)', async (_label, flag, expected) => {
+    dbState.rows = [{ enableNetworkVisibility: true, ...flag, partnerId: PARTNER_ID }];
+
+    const response = await makeApp().request('/network/assets');
+
+    expect(response.status).toBe(200);
+    expect(networkAssetsMock.mock.calls[0]?.[4]).toBe(expected);
+  });
+
+  it('never reads placement when network visibility is off, even with enablePhysicalPlacement on (CPEV-W1)', async () => {
+    dbState.rows = [{ enableNetworkVisibility: false, enablePhysicalPlacement: true, partnerId: PARTNER_ID }];
+
+    const response = await makeApp().request('/network/assets');
+
+    expect((await response.json()).dataStatus).toBe('not_enabled');
+    expect(networkAssetsMock).not.toHaveBeenCalled();
+  });
+
+  it('forwards siteId, assetType, status, page and limit query params', async () => {
+    dbState.rows = [{ enableNetworkVisibility: true, partnerId: PARTNER_ID }];
+
+    const response = await makeApp().request(
+      '/network/assets?siteId=11111111-1111-1111-1111-111111111111&assetType=switch&status=online&page=2&limit=10',
+    );
+
+    expect(response.status).toBe(200);
+    expect(networkAssetsMock).toHaveBeenCalledWith(ORG_ID, {
+      siteId: '11111111-1111-1111-1111-111111111111',
+      assetType: 'switch',
+      status: 'online',
+      page: 2,
+      limit: 10,
+    }, undefined, false, false);
+  });
+
+  it('rejects an invalid status value with 400', async () => {
+    dbState.rows = [{ enableNetworkVisibility: true, partnerId: PARTNER_ID }];
+
+    const response = await makeApp().request('/network/assets?status=bogus');
+
+    expect(response.status).toBe(400);
+    expect(networkAssetsMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects a non-UUID siteId with 400', async () => {
+    dbState.rows = [{ enableNetworkVisibility: true, partnerId: PARTNER_ID }];
+
+    const response = await makeApp().request('/network/assets?siteId=not-a-uuid');
+
+    expect(response.status).toBe(400);
+    expect(networkAssetsMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects an invalid assetType with 400', async () => {
+    dbState.rows = [{ enableNetworkVisibility: true, partnerId: PARTNER_ID }];
+
+    const response = await makeApp().request('/network/assets?assetType=toaster');
+
+    expect(response.status).toBe(400);
+    expect(networkAssetsMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects a non-numeric page with 400', async () => {
+    dbState.rows = [{ enableNetworkVisibility: true, partnerId: PARTNER_ID }];
+
+    const response = await makeApp().request('/network/assets?page=abc');
+
+    expect(response.status).toBe(400);
+    expect(networkAssetsMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects an unauthenticated request before reading settings', async () => {
+    const response = await makeApp(false).request('/network/assets');
+
+    expect(response.status).toBe(401);
+    expect(dbState.where).toBeUndefined();
+    expect(networkAssetsMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('GET /network/sites (#7025)', () => {
+  const SITES = {
+    dataStatus: 'ok' as const,
+    data: [{ id: '11111111-1111-1111-1111-111111111111', name: 'HQ' }],
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    dbState.rows = [];
+    dbState.contextDepth = 0;
+    dbAccessContexts.length = 0;
+    networkSitesMock.mockResolvedValue(SITES);
+  });
+
+  it('returns not_enabled with an empty list when the flag is false', async () => {
+    dbState.rows = [{ enableNetworkVisibility: false }];
+    const response = await makeApp().request('/network/sites');
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ dataStatus: 'not_enabled', data: [] });
+    expect(networkSitesMock).not.toHaveBeenCalled();
+  });
+
+  it('returns the org-scoped site list when the flag is true', async () => {
+    dbState.rows = [{ enableNetworkVisibility: true }];
+    const response = await makeApp().request('/network/sites');
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual(SITES);
+    expect(networkSitesMock).toHaveBeenCalledWith(ORG_ID);
+    expect(dbAccessContexts).toHaveLength(1);
+  });
+
+  it('401s without portal auth', async () => {
+    const response = await makeApp(false).request('/network/sites');
+    expect(response.status).toBe(401);
+    expect(networkSitesMock).not.toHaveBeenCalled();
   });
 });

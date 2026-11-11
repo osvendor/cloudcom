@@ -114,11 +114,57 @@ Full miss tables for both runs are in the workflow run artifacts (`tool-eval-rep
 
 ## 4. Hot/cold (90 days, EU + US)
 
-`not run: no production database access in this environment.` The reporting endpoint (`GET /api/v1/admin/ai/tool-usage?days=90`, `apps/api/src/routes/admin/aiToolUsage.ts`) and the operator SQL this plan calls for (`docs/superpowers/specs/ai-mcp/sql/2026-09-17-ai-tool-usage-90d.sql`) exist in the codebase, but running either requires either a live deployed API with real `ai_tool_executions` history or Todd's direct psql access to the EU/US production databases — neither is available from this worktree/session. Top-20-by-executions, the cold list, and the Helper-vs-chat split are all `not run: <reason above>` and remain open for Todd to fill (per the plan's Step 2 instruction that a row of `not run` is acceptable, a row of invented numbers is not).
+**Measured 2026-09-23.** The operator ran the SQL from `toolUsageReportSqlText(90)` in `apps/api/src/services/aiToolUsageReport.ts`, a superset of `sql/2026-09-17-ai-tool-usage-90d.sql` that adds the delivered-size columns. It ran read-only (`SET TRANSACTION READ ONLY` plus a `breeze.scope=system` election) against both managed production databases. Ranking follows the `hotForShaping` rule: chat and Helper rows only, scored `executions × delivered_bytes_p50` and summed across regions.
+
+**Volume is low, so treat this ranking as a rough signal.** There were 1,069 tool executions in 90 days:
+
+| Surface | US | EU |
+|---|---|---|
+| chat | 671 | 10 |
+| helper | 84 | 250 |
+| agent | 32 | 0 |
+| script_builder | 22 | 0 |
+
+US used 57 distinct tools and EU used 33.
+
+| # | Tool | Calls (chat+helper) | Max-region p50 bytes | Max-region p95 bytes | Score | Shaped in A-W05 |
+|---|---|---|---|---|---|---|
+| 1 | `get_device_details` | 46 | 7468 | 7835 | 324114 | yes |
+| 2 | `query_change_log` | 45 | 6516 | 8109 | 235560 | yes |
+| 3 | `query_audit_log` | 8 | 7704 | 8145 | 61392 | yes |
+| 4 | `analyze_metrics` | 19 | 5140 | 5172 | 48857 | no |
+| 5 | `get_log_trends` | 8 | 5602 | 5798 | 43974 | no |
+| 6 | `disk_cleanup` | 6 | 7120 | 7485 | 40524 | no |
+| 7 | `search_logs` | 99 | 1997 | 7556 | 40371 | no |
+| 8 | `get_fleet_health` | 18 | 2005 | 7859 | 35770 | no |
+| 9 | `analyze_boot_performance` | 6 | 4237 | 4299 | 24922 | no |
+| 10 | `execute_command` | 234 | 464 | 2051 | 24133 | no |
+| 11 | `get_effective_configuration` | 11 | 2940 | 3222 | 20400 | no |
+| 12 | `get_security_posture` | 10 | 2227 | 5628 | 20066 | yes |
+| 13 | `list_playbooks` | 5 | 4293 | 4293 | 17201 | yes |
+| 14 | `manage_patches` | 88 | 2504 | 7259 | 13543 | yes |
+| 15 | `search_documentation` | 2 | 6110 | 6571 | 12220 | no |
+| 16 | `query_devices` | 23 | 485 | 2692 | 11025 | yes |
+| 17 | `get_configuration_policy` | 4 | 3332 | 5405 | 9797 | no |
+| 18 | `manage_alert_rules` | 6 | 2529 | 2529 | 7677 | no |
+| 19 | `manage_policy_feature_link` | 16 | 535 | 1187 | 6769 | no |
+| 20 | `manage_startup_items` | 1 | 5019 | 5019 | 5019 | no |
+
+The byte columns take the higher of the two regions' per-surface values.
+
+**What this says about the A-W05 20-tool list (§7.1):**
+- **Confirmed hot:** A-W05 shaped the top 3 (`get_device_details`, `query_change_log`, `query_audit_log`) and 7 of the top 20 overall.
+- **Hot but not shaped:** 7 tools: `analyze_metrics`, `get_log_trends`, `disk_cleanup`, `search_logs`, `get_fleet_health`, `analyze_boot_performance`, `get_effective_configuration`. Tracked in #6745.
+- **Deliberately skipped:** `execute_command` ranks 10th only on call volume. Its median output is under 500 bytes.
+- **Shaped but cold in production:** `list_scripts`, `get_device_vulnerabilities`, `manage_alerts`, `search_agent_logs`, `list_organizations`, `list_configuration_policies`, `get_script_execution`, `get_cis_compliance`. They stay shaped, since shaping them caused no regression, but they were a lower priority than the survey assumed.
+- **Never called, because chat can't call them:** `manage_tickets`, `list_monitors`, `list_ai_agents`, `get_incident_timeline`, `get_active_users`.
+  - The first four have no `TOOL_TIERS` entry. Either they sit in the frozen `KNOWN_MISSING_TOOL_TIERS` baseline, or they postdate this measurement window. Chat's pre-tool gate rejects them as unknown, so a zero count here shows a wiring gap, not a lack of demand.
+  - `get_active_users` does have a tier and was simply not called in the window.
+  - MCP usage can't be ranked: the MCP ledger keeps only a 500-char summary (Q10).
 
 ## 5. Inputs to A-W04
 
-`not run: blocked on §4.` The plan's Task 9 makes A-W04's `alwaysLoad` set, the Helper `onlyTools` recommendation, and the BYO fallback decision each derive from the hot/cold list intersected with the context-tool set — none of which exists without §4's data. What this session can contribute instead:
+§4 now has measured data, and the hot list for the `alwaysLoad` intersection is the §4 table. The Haiku and BYO rows below are still `not run`. The plan's Task 9 makes A-W04's `alwaysLoad` set, the Helper `onlyTools` recommendation, and the BYO fallback decision each derive from the hot/cold list intersected with the context-tool set — none of which exists without §4's data. What this session can contribute instead:
 
 - **Haiku decision (spec open decision 2):** `not run` — the plan calls for a `--model claude-haiku-4-5-20251001` eval row to decide this; out of scope for this task's instructed command set (chat/default only). Left for A-W04 alongside the full per-surface/per-mode eval matrix.
 - **BYO fallback decision:** `not run` — no BYO endpoint/credentials available to test whether `tool_reference` is rejected.
@@ -147,3 +193,472 @@ Full miss tables for both runs are in the workflow run artifacts (`tool-eval-rep
 | helper-basic | 1 | off | default | 4 | 0 | 111906 | 1476 | mcp__breeze__query_devices | success |
 | agent-full | 1 | off | default | 4 | 157 | 111738 | null | mcp__breeze__query_devices | success |
 | script-builder | 1 | off | default | 3 | 12804 | 0 | 1201 | (none) | success |
+
+## 7. Output efficiency (A-W05)
+
+**Date measured:** 2026-09-22 · **Branch:** `feature/6147-agent-tool-efficiency/wave-6152` · **Plan:** `2026-09-17-agent-tool-efficiency-a05-output-efficiency.md`
+
+### 7.1 The 20-tool before/after table
+
+"Today" is the plan's pre-wave survey (§"The 20 tools" of the A-W05 plan, `9b8189c1df`). "After (measured)" is each tool's own `*.outputShape.test.ts`/`aiToolsPerformance.test.ts`/`aiToolsScripts.getExecution.window.test.ts` fixture, printed by `expectDefaultPageFits`'s `[output-budget]` log line (`aiToolOutputBudget.testkit.ts:37`) via `cd apps/api && npx vitest run outputShape --reporter=verbose | grep '\[output-budget\]'` (console output is silent under the default reporter — `--reporter=verbose` is required to see it) plus a direct run of the two non-`outputShape`-named files. All 20 pass `expectDefaultPageFits` (default page < `MAX_TOOL_RESULT_CHARS` = 8000, uncompacted) against a **realistic** fixture; several tools additionally carry a worst-case fixture proving compaction degrades honestly (`hasMore`/`nextCursor` survive) rather than falling through to a full digest — see 5b's follow-up commit below.
+
+Several defaults were lowered below the plan's provisional table where a realistic fixture page still overflowed 8000 chars; those are called out in the "Default" column as `plan→final`.
+
+| # | Tool | Group | Today (pre-wave) | Mode | Default (plan→final) | Max | Measured default page (chars) |
+|---|---|---|---|---|---|---|---|
+| 1 | `query_devices` | 5a | `{devices, total, showing}`, limit 25/100 | offset | 25 (unchanged) | 100 | 7918 |
+| 2 | `manage_tickets` (list) | 5a | `{tickets, showing}`, 25/100, no total | offset | 25→20 | 100 | 7422 |
+| 3 | `manage_patches` (list) | 5a | `{patches, showing, scope}`, 25/100 | offset | 25 (unchanged) | 100 | 7932 |
+| 4 | `list_scripts` | 5a | `{scripts, count}`, 20/50 | offset | 20→15 | 50 | 7188 |
+| 5 | `get_security_posture` | 5a | `{summary, worstDevices, devices}`, 25/500 (worstDevices duplicates up to 10) | offset | 25→5 | 500 | 7141 (raw 7291) |
+| 6 | `list_monitors` | 5a | fetched ALL then `.slice(0, limit)`; `total = rows.length` (wrong) | offset | 25 (unchanged; `total` now the true row count) | 100 | 5501 |
+| 7 | `list_ai_agents` | 5a | `{agents, showing}`, **no limit** | offset | 25 (new) | 100 | 7043 |
+| 8 | `get_device_vulnerabilities` | 5a | `{deviceId, vulnerabilities, count}`, **no limit** | offset | 50→45 | 200 | 7597 |
+| 9 | `manage_alerts` (list) | 5b | `{alerts, total, showing}`, 25/100, unbounded `message` | keyset | 20→15 (5b follow-up; realistic-fixture worst-case 8 was too pessimistic) | 100 | 7192 |
+| 10 | `search_agent_logs` | 5b | `{logs, count}`, 100/500, unbounded `fields` jsonb | keyset | 50→18 (5b follow-up) | 500 | 7732 |
+| 11 | `query_audit_log` | 5b | `{entries, showing}`, 25/100, unbounded `details` jsonb | keyset | 25 (fits as-is) | 100 | 7932 |
+| 12 | `query_change_log` | 5b | `{changes, total, showing, filters}`, 100/500, unbounded jsonb ×3 | keyset | 50→25 (5b follow-up) | 500 | 7661 |
+| 13 | `list_organizations` | 5c | `{organizations, showing}`, 25/100, unbounded `sites[]`/org | offset | 25 (unchanged; `sites` capped 20/org + `siteCount`) | 100 | 4463 |
+| 14 | `list_configuration_policies` | 5c | whole-row spread incl. `settings` jsonb, 25/100 | offset | 25→20 (plan's 25 measured 9048 raw chars) | 100 | 7253 |
+| 15 | `get_device_details` | 5c | whole `deviceHardware`/`deviceNetwork`/`deviceDisks` rows, unbounded `networkInterfaces`/`disks` | n/a (single-object detail tool) | n/a — `networkInterfaces`/`disks` capped at 16 + counts | n/a | not budget-tested (no `outputShape` fixture; capped by row count, not paged) |
+| 16 | `get_script_execution` | 5c | full `stdout` + `stderr` | char window | `stdoutMaxChars`/`stderrMaxChars` 6000/2000→**5000/1500** (plan's 6000/2000 measured 8656 raw chars) | 16000/8000 | 7156 |
+| 17 | `get_incident_timeline` | 5c | unbounded `actions[]`/`evidence[]`, evidence whole rows + `metadata` jsonb | caps | `actions`/`evidence` capped 50 + count, `timeline` capped 100 + count | n/a | 893 |
+| 18 | `list_playbooks` | 5c | **no limit**; unbounded `steps` jsonb/row | offset | 25 (new) | 100 | 6847 |
+| 19 | `get_active_users` | 5c | `limit` capped session rows 100/200, unbounded `sessions[]`/device | offset (devices) | 50→**12** (plan's 50 measured 8501 raw chars at 15 devices) + `maxSessionsPerDevice` 10/50 | 200 | 6539 (raw 6827) |
+| 20 | `get_cis_compliance` | 5c | 25/500, per-row `summary` jsonb | offset | 25→**12** (plan's 25 measured 12568 raw chars) | 500 | 6132 |
+| — | `query_psa_status` | 5c (survey miss) | **no limit** (not in the plan's 20; flagged by the outputBudget contract test) | offset | new | — | 6162 |
+
+Notes:
+- `list_configuration_policies`, `get_script_execution` stdout/stderr, `get_active_users`, and `get_cis_compliance` defaults are lower than the plan's provisional table because the plan sized against the plan's own guessed row width, not a fixture built from realistic column widths; the actual default was set to whatever fits `MAX_TOOL_RESULT_CHARS` (8000) with a realistic row (commit messages `c5ad070f30`, `c8d579606d`).
+- `manage_alerts`/`search_agent_logs`/`query_change_log` defaults went through **two** passes: an initial worst-case-fixture sizing (commit `002b716656`) that came in too low (5–20), then a follow-up (`c8d579606d`) that resized against realistic rows and let a worst-case page degrade honestly under compaction instead. `query_audit_log` needed no correction — it fits the plan's original 25 once `details` is projected to `detailsKeys`.
+- `get_device_details` has no `outputShape` fixture; its shaping is caps on two per-row arrays (`networkInterfaces`, `disks` ≤ 16 + `*Count`), not a page budget, since it's a single-device detail tool, not a list.
+
+### 7.2 Golden eval delta
+
+`not run: AI_TOOL_EVAL_KEY absent in this environment` (same gate A-W03 Task 7 used). No numbers invented; the controller runs `pnpm ai:tool-eval` against a real key before merge and fills this row.
+
+### 7.3 Tool-capture row (prompt bytes, turn-1/turn-2 tokens)
+
+`not run: ANTHROPIC_API_KEY absent in this environment` (`ai:tool-capture` calls the real Anthropic API, same as `ai:tool-eval`). The controller runs `pnpm ai:tool-capture --surface chat --turns 2` before merge and appends the row here.
+
+As a proxy for prompt growth that doesn't need a live model call: `Buffer.byteLength(AI_SYSTEM_PROMPT_BASE + AI_SYSTEM_PROMPT_TAIL)` grew from 6106 to 6427 bytes (+321 bytes, under the plan's 400-byte budget) adding the "Paged and large results" sentences to the TAIL; `MCP_SERVER_INSTRUCTIONS` is 3502 bytes with the matching sentences added. Both stay under `aiAgentSystemPrompt.test.ts`'s 7 KB `BASE + TAIL` ceiling.
+
+Production output-size report: `not run` — needs `docs/superpowers/specs/ai-mcp/sql/2026-09-17-ai-tool-usage-90d.sql` on EU + US (Todd); the 20-tool list above is provisional until then, per D10/the plan's "The 20 tools" section. Per Q10, `manage_tickets`, `list_monitors`, and `get_incident_timeline` are MCP-only (absent from `TOOL_TIERS`), so `hotForShaping` (which ranks `chat`+`helper` rows only) cannot measure them even once the report runs on production — they were shaped anyway on the survey's likely-traffic ranking, and stay in the 20-tool table with that caveat.
+
+## Full-control W01 (#6755) delta
+
+**Date measured:** 2026-09-26 · **Branch:** `feature/6754-ai-full-control/wave-6755-public` against `origin/main` @ `5345f00202` · **Plan:** `2026-09-23-ai-full-control-w01-guard-and-reads.md`
+
+**`ANTHROPIC_API_KEY` was absent in this environment** — the real-API harness (`tool-capture.ts` against `query()`/the local proxy) could not run. Every turn-1-token cell below is `not measured: ANTHROPIC_API_KEY absent`; no token count was estimated. In its place, per the plan's offline-proxy fallback, this measures the wire-shaped bytes of the SDK tool declarations without calling the API: `Buffer.byteLength(JSON.stringify(name)) + Buffer.byteLength(JSON.stringify(description)) + Buffer.byteLength(JSON.stringify(z.toJSONSchema(z.object(inputSchema))))`, summed over `buildBreezeSdkTools(fakeAuth).map(attachRegistryMeta)` (`aiAgentSdkTools.ts`), on `origin/main` and on this branch. `fakeAuth` is the same throwing no-op `listChatSurfaceToolNames` uses; no DB or handler ever executes. Both runs used the same unset-env default (no `M365_ENABLED`/`GOOGLE_WORKSPACE_ENABLED`/`DELEGANT_BASE_URL`/`BREEZE_AI_SCRIPT_AUTHORING_ENABLED`), so the counts below are each environment's floor, consistent with §1's env-gating caveat — the delta between them is what this task records, not the absolute count.
+
+`chat`, `agent-full`, and `helper-standard` all register the same unfiltered `createBreezeMcpServer` output (`toolCapture/surfaces.ts`: none of the three sets `onlyTools`; only headless per-profile agent runs do), so all three surfaces share one registry-bytes number per ref — there is no per-surface split to report for this measurement.
+
+| Surface | Tools sent (main) | Tools sent (branch) | Δ tools | Registry bytes (main) | Registry bytes (branch) | Δ bytes | Turn-1 tokens (main/branch/Δ) |
+|---|---|---|---|---|---|---|---|
+| chat | 136 | 168 | +32 | 119280 | 140468 | +21188 | not measured: ANTHROPIC_API_KEY absent |
+| agent-full | 136 | 168 | +32 | 119280 | 140468 | +21188 | not measured: ANTHROPIC_API_KEY absent |
+| helper-standard | 136 | 168 | +32 | 119280 | 140468 | +21188 | not measured: ANTHROPIC_API_KEY absent |
+
+The +32 tool delta is this PR's wiring total: 28 newly tiered read-only tools plus the 4 script-library reads newly declared on the main server. The by-domain tool index (`renderToolIndexByDomain(listChatSurfaceToolNames())`) grows from 4943 to 5690 bytes. The registry counts are lower than the `TOOL_TIERS` counts because `TOOL_TIERS` also includes env-gated tool sets (M365, Google Workspace, script authoring) that are off by default and therefore absent from `buildBreezeSdkTools`'s output under this measurement's unset env — see §1's "Env-gating caveat" for the same floor-vs-ceiling distinction on the original A-W01 numbers.
+
+**W01 is recorded, not gated (spec D5); W02–W04 each carry +8k against the post-W01 main.**
+
+### 7.4 The 7 production-hot tools A-W05 missed (#6745)
+
+**Date measured:** 2026-09-23 · **Branch:** `feat/6745-shape-hot-ai-tools`. The tool list is the §4 90-day hot list (ranked by `executions × delivered_bytes_p50`). "Prod p50/p95" are the higher of EU and US from that pull. "Measured default page" is each tool's `*.outputShape.test.ts` realistic fixture through `expectDefaultPageFits`: under 8000 chars and not compacted.
+
+| Tool | Prod p50 / p95 bytes | What changed | Default | Max | Measured default page (chars) |
+|---|---|---|---|---|---|
+| `analyze_metrics` | 5140 / 5172 | Raw points projected to the requested `metric`'s columns. The jsonb `interfaceStats`/`customMetrics` and the byte/op counters are gone. New `limit` pages raw points and rollup buckets, newest first, with `pointsInWindow`/`hasMore`. The summary still covers the whole window. No cursor, because new samples arrive at the head. | 40 points (raw was 50 full rows; buckets were unbounded up to 500) | 500 | 7011 (24 h raw) · 3829 (168 h hourly) |
+| `get_log_trends` | 5602 / 5798 | The hourly `errorTimeline` and grouped `sampleSeries` are behind `includeTimeline`. By default the tool returns `errorTimelineBuckets`, the 10 largest `spikes` and `spikeCount`. `topSources`/`topDevices` now carry `*HasMore` from a one-row overfetch. | 20 (unchanged) | 100 | 5432 (7-day range) |
+| `disk_cleanup` (preview) | 7120 / 7485 | Candidates drop `safe` (always true after the preview filter). `reason` is behind `includeReasons`. Adds `hasMore` and a `note` naming `maxCandidates`/`categories`. | 100→35 | 200 | 7576 |
+| `search_logs` | 1997 / 7556 | Rows are flat: `hostname`, `displayName` (only when it differs), `siteId`, `siteName`. The `device`/`site` objects that duplicated them are gone. `message` is cut at 200 chars with `messageChars`; `includeFullMessage` lifts the cut. Paging is unchanged (its own keyset cursor). | 50→12 | 500 | 7495 |
+| `get_fleet_health` | 2005 / 7859 | Offset paging through `aiToolPagination.ts` (`offset`/`cursor`/`hasMore`/`nextCursor`). `topIssues` is behind `includeTopIssues`, with `topIssueCount` always present. `summary` is now a SQL aggregate over the filtered set (it was computed over the page). A frozen device set is pushed into the SQL. | 25→15 | 100 | 7424 |
+| `analyze_boot_performance` | 4237 / 4299 | Startup-item `path` is behind `includePaths`; `manage_startup_items` resolves by `itemId`. Adds `startupItemsNotShown`. | n/a (top 10 items, ≤5 recent boots) | n/a | 3202 (30 boots, 80 items) |
+| `get_effective_configuration` | 2940 / 3222 | Per-feature `inlineSettings` is behind `includeSettings`; without it each feature carries `hasInlineSettings` instead. New `featureType` narrows the features and the inheritance chain. The redundant `featureType` key and null `inheritedFrom*` pair are dropped. Stays in `UNBOUNDED_LIST_READS`: the feature map is bounded by `CONFIG_FEATURE_TYPES`, not paged. | n/a | n/a | 7111 (all 20 feature types) · 1556 (one type with settings) |
+
+## 8. Load policy (A-W04, #6151)
+
+**Date measured:** 2026-09-28 · **Branch:** `feature/6147-agent-tool-efficiency/wave-6151` · **SDK:** `@anthropic-ai/claude-agent-sdk` 0.3.282 · **Model:** `claude-sonnet-4-6` · **Doc:** `plans/ai-mcp/2026-09-17-agent-tool-efficiency-a04-load-policy.md`
+
+**§2 revisited.** Tool search never activated because every Breeze `query()` passed `tools: []`, which removes the `ToolSearch` built-in (`Tool search disabled: ToolSearchTool is not available` in the CLI). A proxy capture with `tools: ['ToolSearch']` sent 6 tools (`ToolSearch`, the alwaysLoad set and a placeholder) instead of 192.
+
+**Golden eval, chat, final code, three runs per arm** (`pnpm --filter @breeze/api ai:tool-eval` vs `--tool-search off`):
+
+| arm | hits / 67 | mean context tokens, first call | mean context tokens through first real tool call | mean TTFT ms | cases that searched |
+|---|---|---|---|---|---|
+| off | 25, 24, 25 | 82,707 | 82,707 | 2,254 | 0 |
+| on (policy default, 15 alwaysLoad) | 23, 23, 23 | 23,811 | 31,107 / 31,113 / 30,376 | 1,864 | 25 |
+
+Earlier probes on the same day, used to pick the set:
+- search on with only the 4 `core` tools always-loaded: 22 and 23 hits, 17,630 tokens, 44–45 cases searched;
+- 4 core + 10 hot: 24 hits, 23,716 tokens, 31 searched.
+
+The loss is concentrated in g59, g60 and g62. The model first calls an always-loaded context tool (`list_organizations`, `query_devices`) to resolve the named org or device, then the domain tool.
+
+**Per-surface capture** (`ai:tool-capture --surface all --turns 2`, default policy):
+
+| surface | turn-1 cache_create | turn-1 cache_read | turn-2 cache_read | vs §2 appendix (turn 1 total) |
+|---|---|---|---|---|
+| chat | 12,631 | 35,138 (2 responses) | 23,963 | 111,813 → ~24k per response |
+| helper-basic | 14,245 | 0 | 14,245 | 111,906 → 14,245 |
+| helper-standard | 16,051 | 0 | 16,051 | 111,906 → 16,051 |
+| helper-extended | 18,804 | 0 | 18,804 | — → 18,804 |
+| agent-full (read-only exposure) | 64,714 | 64,557 | 129,645 | unchanged by this wave |
+| script-builder | 15,754 | 15,596 | 15,754 | unchanged |
+
+**Not measured:**
+- BYO/catalog endpoints (no credentials here; policy keeps them on the full list);
+- Haiku;
+- second-turn cache behaviour across differing tenant tool sets (measured since, see §9.2);
+- a Helper resume after a level downgrade with an out-of-level `tool_use` in history. The probe could not make the model call `execute_command` (it declined); a resume under a narrower tool set did run cleanly.
+
+**Success measures:**
+- chat first-turn input −71% (target −60%): **met**;
+- turn-2 cache-read share: unchanged, high;
+- golden eval: **−1.5 cases, target +10 points not met**.
+
+
+## 9. Tenant tools, gateways and the endpoint capability (#7429)
+
+**Date measured:** 2026-09-28 · **Base:** `main` @ `c1618d2717` (A-W04 merged) · **SDK/CLI:** `@anthropic-ai/claude-agent-sdk` 0.3.282 (CLI 2.1.282) · **Model:** `claude-sonnet-4-6` · **Surface:** chat, deny mode. Everything here ran on a laptop against the first-party API, directly or through a local gateway. No partner catalog endpoint or BYO credential was used.
+
+### 9.1 Harness changes
+
+- `ai:tool-capture --tenant-tools none|a|b [--tenant-count N]` registers synthetic BYO MCP tools on the chat surface. They go through the production `buildTenantSdkTools` bridge and are appended to `allowedTools` as `streamingSessionManager` does. Set `a` is 12 Hudu-shaped tools and set `b` is 12 IT Glue-shaped tools, with no names in common (`toolCapture/tenantFixtures.ts`). Handlers are still denied in `onPreToolUse`, so nothing dispatches.
+- The capture proxy now reads usage from gzip, deflate and br responses. The API gzips its responses to the CLI, so every earlier real capture recorded `usage: null` per request. The per-turn numbers in §2–§8 came from the SDK stream and are unaffected.
+- The proxy records `prefixDigest` (hashes of `tools`, `system` and `messages[0]`, ignoring `cache_control`) and `firstMessageBytes`. Two sessions that share a digest share that part of the cache prefix. Only hashes are kept, never content.
+- **Correction to §8.** Capture children now run with `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`. `buildClaudeSdkChildEnv` forwards `HOME`, and `settingSources: []` does not turn off auto-memory, so the CLI was prepending the operator's own `~/.claude/projects/<repo>/memory/MEMORY.md` to every captured first message. On this machine that block was 25.6k characters. A body dump of the same chat request showed 23,941 context tokens with the block and 14,263 without it. Production containers should have no such file (not checked on a deployed container; follow-up #7444), so §8's absolute token numbers include roughly 9.5k tokens of harness-only context. Inferred from those paired dumps and §9.2, not from a re-run eval: §8's "first call" figure of 23,811 is about 14.3k in production, and the search-off figure of 82,707 is about 73.5k (§9.2 C4). That puts the first-turn reduction at about −80%, not −71%. The §8 accuracy numbers were measured with the memory block in context. Whether it changed any tool choice is **not checked**.
+- Found while dumping bodies: the CLI adds a `<system-reminder><total_tokens>…</total_tokens></system-reminder>` block to the first message on some sessions and not others (114 bytes). It has nothing to do with Breeze or tenant tools. When it toggles, the next session's first message is different, so that message-level cache entry misses (S6 and C3 below).
+
+### 9.2 Turn-1 and turn-2 cache with tenant tools
+
+`ai:tool-capture --surface chat --proxy --base-url <local dump proxy> --turns 2 --tool-search on|off --tenant-tools …`, run back to back in the order listed. S1 started cold: nothing had run for more than 5 minutes. Tokens are for the first tool-bearing request of each turn, from the proxy's per-request usage. "write" is `cache_creation_input_tokens` and "read" is `cache_read_input_tokens`.
+
+| run | search | tenant set | tools on wire | tools / system / msg[0] digest | turn-1 write | turn-1 read | turn-2 read share |
+|---|---|---|---|---|---|---|---|
+| S1 | on | none | 17 (1 deferred) | `8777c7` / `f493d9` / `695945` | 14,261 | 0 | 98.7% |
+| S2 | on | a (12) | 17 (1 deferred) | `8777c7` / `f493d9` / `6ac40c` | 3,083 | 11,338 | 98.5% |
+| S3 | on | b (12) | 17 (1 deferred) | `8777c7` / `f493d9` / `8ecac9` | 3,095 | 11,338 | 99.0% |
+| S4 | on | a (12), repeat of S2 | 17 (1 deferred) | `8777c7` / `f493d9` / `6ac40c` | 0 | 14,421 | 98.7% |
+| S5 | on | a (48) | 17 (1 deferred) | `8777c7` / `f493d9` / `0c3df9` | 3,623 | 11,338 | 98.7% |
+| S6 | on | b (12), repeat of S3 | 17 (1 deferred) | `8777c7` / `f493d9` / `185088` | 3,068 | 11,338 | 98.7% |
+| C1 | off | a (12) | 205 | `c79620` / `f493d9` / `033ca6` | 75,070 | 0 | 99.7% |
+| C2 | off | b (12) | 205 | `72b237` / `f493d9` / `033ca6` | 75,068 | 0 | 99.7% |
+| C3 | off | a (12), repeat of C1 | 205 | `c79620` / `f493d9` / `12c645` | 686 | 74,357 | 99.7% |
+| C4 | off | none | 193 | `aeebdf` / `f493d9` / `033ca6` | 73,450 | 0 | 99.7% |
+
+S6 and C3 repeated an earlier tenant set, but their first message differs from S3 and C1 because the CLI's `total_tokens` block toggled (§9.1). That, not the tenant set, is why S6 wrote 3,068 tokens.
+
+**What this shows (verified on these runs):**
+- **With search on, tenant tool definitions never reach the wire until they are searched.** `tools[]` holds `ToolSearch`, the 15 `alwaysLoad` tools and one `DeferredToolPlaceholder`, and its digest is identical for none, a:12, b:12 and a:48. The CLI lists deferred tool **names** in a `<system-reminder>` inside the first user message. That list is the only place a tenant set appears: +412 bytes for set a, +469 for set b, +1,672 for a:48.
+- **Cross-session:** the tools-plus-system prefix (11,338 tokens) was read from cache in every session, whatever its tenant set. A new tenant set costs only the first message, about 3.1k tokens written, or 3.6k at 48 tools. A session whose first message matches a recent one reads everything (S4).
+- **With search off, a different tenant set rewrites the whole prefix.** Tenant tools are appended to `tools[]`, which comes first in the cache order, so C2 wrote 75,068 tokens after C1. Search on reduces the per-session cost of tenant-set churn from about 75k written tokens to about 3k.
+- **Turn 2 is unaffected by tenant tools:** 98.5–99.0% read with search on, 99.7% with search off. The search-on share is a little lower only because the prefix is 5× smaller, so the same ~180-token per-turn delta is a bigger fraction.
+- **A searched tenant tool does not break the cache.** T1 used set a with the prompt "Pull up the Hudu asset record for the file server FS01." The model called `ToolSearch`, which returned `tool_reference`s for `hudu__get_asset` and `hudu__search_assets`. The CLI inserted both into `tools[]` with `defer_loading: true`, which changed the tools digest (`22a5d2`). The same request still read 14,426 cached tokens and wrote 430, and turn 2 read 98.7%. The API does not count deferred tools as part of the cached tools prefix. The model's next call was `mcp__breeze__hudu__search_assets`, which was denied as intended.
+
+### 9.3 Gateway compatibility (local only)
+
+All chains below ran with `--proxy --tool-search on` and the backup prompt "Which backup jobs failed in the last 24 hours?", which needs the deferred `query_backups`. Where a second capture proxy sat between the gateway and the API, it recorded what the gateway actually forwarded.
+
+| path | status | `defer_loading` forwarded | `tool_reference` forwarded | `anthropic-beta` | search worked | cache |
+|---|---|---|---|---|---|---|
+| capture proxy only (byte pass-through) | 200 | yes | yes | forwarded unchanged | yes, `query_backups` loaded | turn-1 read 11,338 on the first call |
+| LiteLLM 1.103.0 (`ghcr.io/berriai/litellm:main-stable`, `sha256:bd089afd…`), unified `/v1/messages`, `model: anthropic/*` | 200 | **yes**: `DeferredToolPlaceholder` and `query_backups` still `defer_loading: true` upstream | **yes**: 1 block upstream | rewritten: `advanced-tool-use-2025-11-20` kept, `claude-code-20250219` and a few others dropped | yes | turn-2 read 98.9% |
+| LiteLLM 1.103.0, `/anthropic` pass-through route | 200 | not observed upstream (the route goes straight to the API) | CLI side: 1 | not observed | yes | turn-1 fully read |
+| scratch proxy that strips `advanced-tool-use-*` from `anthropic-beta` | 200 | yes | yes | stripped | yes | unchanged |
+| scratch proxy that deletes `defer_loading` from every tool | 200 | **no** | yes | forwarded | the model still reached the tool, but the placeholder and every discovered tool became ordinary tools | turn-1 wrote 29,432 and read 0 (prefix changed) |
+
+So an Anthropic-native gateway like LiteLLM's Anthropic route forwards everything tool search needs. At this date the first-party API also accepts tool search without the beta header. The two stripping probes did not produce a hard error. A gateway that drops `defer_loading` loses the savings and the cache without anyone noticing, instead of breaking chat.
+
+**Not verified (needs credentials or backends not available here):**
+- Any real partner catalog endpoint.
+- OpenRouter.
+- LiteLLM or other gateways translating to a non-Anthropic backend (OpenAI-compatible, vLLM). `tool_reference` has no equivalent there, so this is expected to fail, but it was not observed.
+- Bedrock and Vertex (different tool-search wire support).
+- A proxy that rejects unknown content-block types outright.
+- Whether a small-context proxy still needs a `list_tool_domains`/`load_tool_domain` loader. The measured sizes that bear on it: 14.3k first-call context with search, 73.5k without.
+- `provider-fidelity-smoke.ts` could not be pointed at the local LiteLLM, because the catalog accepts only `https://` base URLs.
+
+### 9.4 Per-endpoint capability vs `AI_TOOL_SEARCH` (recommendation, needs Todd's decision)
+
+**Recommendation: make tool search a verified per-(catalog revision, model) capability, recorded by the existing provider-fidelity verification. Keep `AI_TOOL_SEARCH` only as the global kill switch (`off`) and as the opt-in for a self-host `ANTHROPIC_BASE_URL` that has no catalog entry.**
+
+Why:
+1. **Support depends on the endpoint's wire path, not on the install.** The same LiteLLM passes tool search through its Anthropic route and cannot express `tool_reference` on a translated backend. One install can list both kinds of endpoint, and a single env var can only be right for one of them.
+2. **Leaving it off on a capable endpoint is expensive.** First-call context is 73.5k vs 14.3k tokens (§9.2 C4 vs S1), and tenant-set churn rewrites about 75k tokens per session vs about 3k.
+3. **Turning it on for a degrading endpoint fails silently.** The stripping probes stayed at 200. A self-declared "supports tool search" flag could be wrong without anyone noticing, so the capability should come from a probe that checks the savings actually happen: `defer_loading` survives and a `tool_reference` loads a deferred tool.
+4. **The mechanism already exists.** `llm_provider_verifications` records an MFA-gated, harness-versioned result per `(revision_id, model_id)`, and a new revision (new base URL) needs a new verification. A `toolSearch` stage in `providerFidelityHarness` fits there: with `tools: ['ToolSearch']` and one deferred tool, the stage passes when the model loads that tool via `tool_reference` and the response is 200. `resolveToolSearchPolicy` would take `endpointToolSearchVerified` from the session's catalog endpoint and apply it after the surface, kill-switch and turn-budget rules and the first-party rule. The default stays off.
+
+The decision needed: where the verification result lives. It could go in the existing `detail` jsonb (no migration, but the policy reads jsonb) or in a new boolean column on `llm_provider_verifications` (one migration, cleaner query). A `FIDELITY_HARNESS_VERSION` bump would make existing verifications stale, so it needs a re-verify plan for listed entries. Nothing is implemented in this change.
+
+## 10. Tool search for headless agents (#7428)
+
+**Date measured:** 2026-09-28 · **SDK:** `@anthropic-ai/claude-agent-sdk` 0.3.282 · **Model:** `claude-sonnet-4-6` (the default an agent run resolves) · **Decision:** keep headless agents on their static subset (D21 stands). The harness and golden set ship; `runLoop.ts` does not change behaviour.
+
+**What was measured.** A new agent golden set (`toolEval/agentGoldenTasks.ts`, 19 tasks) runs through the production `buildAgentRunSystemPrompt` / `buildAgentRunTaskPrompt` for each task's run context:
+- 16 `full`-profile tasks: alert, anomaly, ticket and scheduled triggers;
+- 3 `analysis`-profile tasks.
+
+The two agent surfaces are derived from runLoop's own exports (`resolveRunToolExposure`, `resolveRunProfileLimits`, `outcomeToolsForRun`), so they register what a queued run registers. Since #7427, the `full` floor is the declared set (`declaredFullRunToolExposure`).
+
+| surface | registered tools | alwaysLoad among them | turn cap (policy default) |
+|---|---|---|---|
+| `agent-full-remediation` (`full` + a 7-entry remediation allowlist) | 154 | 13 | 25 |
+| `agent-analysis` | 18 (incl. `submit_analysis`) | 5 | 40 |
+
+The other profiles register 0–6 tools: verdict, sweep, design and patch register 5–6; narrative and triage register only their outcome tool. Search has nothing to defer there, so they were not measured.
+
+The search-on arm is `--surface-search on`, a hypothetical opt-in. Host, override and the real turn cap still go through `resolveToolSearchPolicy`. It enables search for every task: the host is first-party, and caps of 25 and 40 turns clear the 4-turn floor.
+
+```
+pnpm --filter @breeze/api ai:tool-eval --suite agent                       # search off (production today)
+pnpm --filter @breeze/api ai:tool-eval --suite agent --surface-search on   # search on
+```
+
+**Auto-memory correction (§9.1).** The first measurement of this section ran before #7446. That harness forwarded `HOME`, so the CLI prepended the operator's `~/.claude` auto-memory to every captured first message, about 9.5k tokens per request. These agent numbers were inflated the same way. The table below is the re-run with `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`, on the same code, tasks and model. The inflated first run is kept on the last two rows for comparison.
+
+**Results, three runs per arm (auto-memory off):**
+
+| arm | surface | hits | mean context tokens through the first real tool call | at that call (re-sent every later turn) | API calls to the first real tool | cost to it, cold / warm cache (cents) |
+|---|---|---|---|---|---|---|
+| off | full (16) | 7, 6, 6 / 16 | 55,978 | 55,978 | 1.00 | 5.56 / 1.68 |
+| on | full (16) | 6, 6, 6 / 16 | 10,518 | 10,518 | 1.00 | 1.75 / 0.32 |
+| off | analysis (3) | 3, 3, 3 / 3 | 9,718 | 9,718 | 1.00 | 2.64 / 0.29 |
+| on | analysis (3) | 3, 3, 3 / 3 | 7,067 | 5,508 | 1.33 | 1.28 / 0.46 |
+| **off** | **all (19)** | **10, 9, 9** (mean 9.33) | | | | |
+| **on** | **all (19)** | **9, 9, 9** (mean 9.0) | | | | |
+| off, with auto-memory (superseded) | all (19) | 9, 10, 11 (mean 10.0) | full 65,650 | | 1.00 | |
+| on, with auto-memory (superseded) | all (19) | 9, 9, 9 (mean 9.0) | full 20,185 | | 1.00 | |
+
+"Cold" is each arm's first run, when the tool prefix is written to the cache. "Warm" is runs 2–3, when the identical prefix is read from the cache. Production agent runs hit either case, depending on how close together an agent's runs land.
+
+**Why search still loses where it matters.** The aggregate gap is now small (−0.33 of 19, inside the off arm's run-to-run range). It hides a systematic shift:
+- **Deferred-only tasks.** On the six `full` tasks where every acceptable first call is deferred under search (a04, a06, a07, a09, a14, a15), search-off scored 4 of 18 attempts. Search-on scored 0 of 18. That is 9 of 36 vs 0 of 36 across both measurements.
+- **What the model does instead.** With search on, its first response pairs a `ToolSearch` call with a loaded generic tool (`get_device_details`, `manage_alerts`, `list_organizations`). It reaches the domain tool one response later. This was verified on raw captures for a07 (Huntress) and a15 (unknown network device): the first response was `[ToolSearch, get_device_details]` / `[ToolSearch, manage_alerts]`, and `get_huntress_incidents` / `list_network_assets` came in the second.
+- **What offsets it in the total.** The search-on gains are on a02 and a10, where a generic `get_device_details` is an acceptable first call. So search trades domain-first investigation for a generic read plus a search, and spends the extra turn the issue worried about. The search runs in parallel with the wasted read rather than on its own turn.
+- **Search usage.** Search ran in 32 of 48 `full` attempts and 9 of 9 `analysis` attempts.
+
+**Cost.** With the memory block gone, search is clearly cheaper on `full`:
+- the re-sent context drops from 56.0k to 10.5k tokens per turn (−81%);
+- the first call drops from 5.56 to 1.75 cents cold, and from 1.68 to 0.32 cents warm.
+
+For `analysis` (18 tools), search saves about 4k tokens per turn. It costs a second response on the staged-handle task, though, and is more expensive warm (0.46 vs 0.29 cents).
+
+**Decision (the #7428 rule: enable only if at least accuracy-neutral and cheaper).** Not enabled.
+- **`full`:** much cheaper, but not accuracy-neutral. Its loss is concentrated on the deferred-domain tasks search is supposed to serve, and it was reproduced in both measurements. The total is close only because it also gains on generic tasks.
+- **`analysis`:** neutral on accuracy but not cheaper warm.
+- **A second reason not to enable `analysis`:** outcome tools (`submit_analysis`, and `submit_task_step` on task-linked runs) are built by `buildOutcomeSdkTools` without `alwaysLoad`. Under search, the one tool a run must call would be deferred, and the first-call eval does not score that.
+
+The cost case for `full` is now strong enough that this is worth another attempt after tuning, rather than a closed question.
+
+**What a later attempt needs:**
+- an agent-specific `alwaysLoad` set, since the chat set is tuned to chat's 90-day hot list, not to alert triage;
+- or a prompt rule to search before a generic device read when the trigger names a product or domain;
+- outcome tools marked `alwaysLoad`;
+- a metric for the response that reaches the first *expected* tool, not just the first real one.
+
+Re-measure with this harness.
+
+**Bookkeeping check, from code, not a live run.** runLoop reads no `tool_use` blocks from the stream. Tool accounting happens only in the MCP pre/post hooks, which `ToolSearch` never reaches. So `ToolSearch` cannot be misattributed there the way it could in `streamingSessionManager`'s FIFO queue (D22). However, `turnCount` comes from the result's `num_turns`, so a search response would count against `maxTurnsPerRun`.
+
+**Not measured:**
+- whole-run completion, cost or budget exhaustion, because deny mode refuses every tool, so a run cannot proceed past its first calls;
+- TTFT, because agent surfaces do not stream partial messages;
+- Haiku, and BYO/catalog hosts;
+- the verdict, sweep, design, patch, narrative and triage profiles (0–6 registered tools each).
+
+## 11. Tool Catalog W3 delta (#5218)
+
+Prompt-size review for the four flow authoring tools (`draft_flow`, `validate_flow`, `get_flow`, `list_flows`, domain "Scripts & automation"), which are declared to chat only when `FLOWS_ENABLED=true`.
+
+| Index (`renderToolIndexByDomain(listChatSurfaceToolNames())`) | Bytes |
+|---|---|
+| Default (`FLOWS_ENABLED` unset) | 6576 — unchanged, byte-identical |
+| `FLOWS_ENABLED=true` | 6625 (+49) |
+
+Both fit under the existing 6.5 KB (6656 B) ceiling in `aiToolIndex.test.ts`, so the 6.75 KB raise approved for this wave (plan Decision 5, 2026-10-20) was not needed and was not taken. The test now also measures the flag-on index, so a later flag-gated addition cannot grow the prompt unmeasured.
+
+### Tool Catalog W4 delta (#5219, Task A11)
+
+Four more flow tools, all in the Scripts domain and declared to chat only when `FLOWS_ENABLED=true`: `run_flow` (Tier 3, supervised), `list_flow_runs` and `get_flow_run` (Tier 1), `cancel_flow_run` (Tier 2). The whole-index ceiling this section's table measured against is retired (W19, #10065); the bounds below are the W19 ones, measured on `listChatSurfaceToolNames()` with the flag off and on.
+
+| W19 bound | Limit | `FLOWS_ENABLED` unset | `FLOWS_ENABLED=true` | All flags on |
+|---|---|---|---|---|
+| B1 always-on index | < 2,560 B | 2,494 | 2,494 (unchanged) | 2,494 |
+| B2 Scripts block (all eight flow tools) | < 2,048 B | 363 | 469 (+106) | 469 |
+| B2 largest block (Security) | < 2,048 B | 1,268 | 1,268 | 1,268 (Integrations 1,472) |
+| B3 worst page turn (alert page) | < 7,040 B | 4,423 | 4,423 | 4,423 |
+| B3 device page (adds Scripts) | < 7,040 B | 3,999 | 4,105 (+106) | 4,105 |
+
+The four W4 names add roughly 57 B to the Scripts line (the W3 four were +49 B on the whole-index measure). Flag off is byte-identical: the tools are not declared, so no index text changes. Nothing was trimmed.
+
+## 12. Full-control W02 (#6756) delta
+
+**Date measured:** 2026-10-22 · **Branch:** `feature/6754-ai-full-control/wave-6756-r2` @ `13e5e61e59` against its base `origin/main` @ `27c9c043d8` · **Plan:** `2026-09-23-ai-full-control-w02-psa-billing-writes.md` (Task 14, gate W02-D10: ≤ +8,000 turn-1 tokens per surface)
+
+Harness: `tool-capture.ts --surface <chat|agent-full> --proxy --tool-search off`, model `claude-sonnet-5-5`, default prompt. Turn-1 tokens are read from the Sonnet `/v1/messages` proxy row that carries the tool list (not the console table) as `input_tokens + cache_creation_input_tokens + cache_read_input_tokens`.
+
+| Surface | Tools sent (main → branch) | Turn-1 tokens main | Turn-1 tokens branch | Δ tokens | Gate |
+|---|---|---|---|---|---|
+| chat | 210 → 217 (+7) | 105,086 | 112,723 | **+7,637** | pass (≤ 8,000; 363 left) |
+| agent-full | 155 → 159 (+4) | 72,103 | 77,562 | **+5,459** | pass |
+
+- **chat** gains all seven: `manage_tickets`, `manage_quotes`, `manage_billing_catalog`, `manage_saved_filters`, `manage_tags`, `manage_notification_channels`, `test_webhook`. The system prompt grows 18,341 → 18,447 bytes (the tool index).
+- **agent-full** gains four. With an empty agent allowlist, a full-profile run exposes only tools that have a read-only action (`fullRunToolExposure`, #6909). `manage_quotes`, `manage_billing_catalog` and `test_webhook` have no read action, so they reach an agent only when its allowlist names them.
+- **Chat tool index** (`renderToolIndexByDomain(listChatSurfaceToolNames())`), default / `FLOWS_ENABLED=true`:
+
+| State | Default | Flag on |
+|---|---|---|
+| main `27c9c043d8` | 6,576 | 6,625 |
+| + W02 wiring, `MAX_INLINE_ACTIONS` = 8 | 6,919 | 6,968 |
+| + `MAX_INLINE_ACTIONS` = 7 (Todd 2026-10-22, option 2; −245 B) | 6,674 | 6,723 |
+| + `manage_billing_catalog` rename (this branch) | 6,682 | 6,731 |
+
+  The 6,656 B ceiling did not fit after 8 → 7, so the 6.75 KB (6,912 B) raise signed off for Tool Catalog W3 was taken for W02 (Todd 2026-10-22, option 1). Headroom is about 230 B default and 181 B flag-on. At 7, the action lists of `generate_report`, `manage_deployments`, `manage_monitor_definitions` and `manage_billing_catalog` render as `(8 actions)`; the names stay in each tool's schema.
+- **Headroom is now thin on chat.** The next chat write wave cannot fit +8k on top of this without A-W04 tool search or a schema-size pass.
+
+
+## 13. Lazy chat tool index (W19 #10065)
+
+**Date measured:** 2026-10-24 · **Branch:** `feature/6754-ai-full-control/wave-10065` against `origin/main` `dd2556224f` · **SDK:** `@anthropic-ai/claude-agent-sdk` (repo pin) · **Model:** `claude-sonnet-5-5` (default) · **Plan:** `plans/ai-mcp/2026-10-25-ai-full-control-w19-lazy-chat-tool-index.md`
+
+**Wire fact behind the design** (verified 2026-10-24 with a request-dumping proxy, chat, search on):
+- `tools[]` holds `ToolSearch`, the 15 alwaysLoad tools and `DeferredToolPlaceholder`.
+- `messages[1]` (role `system`, 8.7 KB) lists every deferred tool by name, as §9.2 found for tenant tools.
+- So the system-prompt index is no longer the only way the model learns a deferred tool's name. On full-list hosts every schema is inline anyway.
+
+**What ships.** `AI_TOOL_INDEX=lazy`, the default:
+- one line per domain (label plus plain-word vocabulary), the existing domain notes, and one sentence on loading deferred tools;
+- a device page also adds the Devices and Scripts tool lines, and an alert page adds Monitoring and Devices;
+- `AI_TOOL_INDEX=full` is the previous index.
+
+**Main arm.** It is this branch with `AI_TOOL_INDEX=full`. Its static prompt is byte-identical to `origin/main`'s: a scratch test composed both from main's `aiToolIndex.ts` and this branch's. Default env: 18,299 B, sha256 `5138161a0739…` for both. All flags on: 19,335 B. The declared tool set is unchanged (no registry or declaration diff).
+
+**Bytes** (`aiToolIndex.test.ts` bounds; "fixture" = the 38 W03/W04 tools):
+
+| Measure | Today's catalog | With fixture | Bound |
+|---|---|---|---|
+| Whole index (`full`) | 6,917 (flags on 7,953) | 8,199 | none (kill switch) |
+| Always-on index (`lazy`) | 2,494 (flags on 2,494) | 2,494 (Δ 0) | < 2,560 |
+| Largest domain block | security 970 | security 1,268 | < 2,048 |
+| Device page: always-on + blocks | 3,822 | 3,999 | < 7,040 |
+| Alert page: always-on + blocks | 4,190 | 4,423 | < 7,040 |
+| Static chat prompt | 18,299 → 13,876 (−4,423) | — | — |
+
+**Golden eval, chat, 75 cases** (`ai:tool-eval`, first real call; search-on cap 3 turns, search-off 1):
+
+| arm | runs | hits main (full) | hits branch (lazy) | mean main → branch | cases searched | API calls to first tool | context at first tool | through first tool | priced to first tool / run |
+|---|---|---|---|---|---|---|---|---|---|
+| default (search on) | 3 | 23, 26, 25 | 24, 24, 26 | 24.7 → 24.7 | 66 → 65 | 1.27 → 1.28 | 21,540 → 19,910 | 27,190 → 25,340–25,590 | $1.22–1.25 → $1.22–1.25 |
+| off | 2 | 23, 24 | 25, 24 | 23.5 → 24.5 | 0 | 1 | 118,259 → 116,456 | same | $2.71 → $1.89 |
+
+Of the 75 cases, 39 are deferred-only: every acceptable first tool is deferred under search. Paired runs, main → lazy:
+- **Search on:** 12 → 13, 15 → 13, 14 → 15.
+- **Search off:** 14 → 15, 14 → 15.
+
+**Changed cases, search on:**
+- **g26 "Which customers are breaching their backup SLA?" — lost in all 3 lazy runs.**
+  - Lazy keyword-searches and calls `query_backup_sla`; main selects `get_sla_breaches`.
+  - `query_backup_sla`'s hint is "backup SLA configurations, active breaches and compliance state", so this is a defensible near-miss.
+  - The vocabulary was not tuned to it.
+- **Run-to-run swings, not systematic:**
+  - g40 (lost once: `search_catalog` instead of `lookup_distributor_product`);
+  - g70 (once each way: the `get` vs `comment` action on `manage_tickets`);
+  - g51 (gained twice);
+  - g71 (gained once).
+
+**Changed cases, search off:**
+- g06 gained in both runs (`manage_alert_rules` instead of `list_monitors`).
+- g07 flipped once each way. In both directions the observed tool and action matched the expectation. The scorer reports a hit on one side and a miss on the other; the cause was not checked.
+
+**Authored page-context set** (`--suite lazy-index`, 10 cases, search on, 2 runs each). Main arm: 7, 7. Lazy: 6, 6.
+- **Shared misses (both arms, both runs).** These are expectation strictness, not index text: the model opens with a loaded generic read.
+  - l01: `get_device_details` before `analyze_disk_usage`.
+  - l04 and l05: `manage_alerts get` before the alert-specific tool.
+- **The only difference: l09** ("Disable the OneDrive startup item on this machine", device page).
+  - Lazy first calls `query_devices` (loaded) and does not open with `manage_startup_items disable`. It does this in both runs, although that line, with its actions, is in the page block.
+  - Main opens with `manage_startup_items disable`.
+  - The fixture device id is not a UUID. That may prompt the lookup, but it is the same in both arms. Not checked further.
+
+**tool-capture** (`--surface chat --proxy`, one row each):
+
+| tool search | index | system bytes (wire) | tools sent | turn-1 tokens |
+|---|---|---|---|---|
+| on | full (main) | 18,682 | 17 | 21,152 |
+| on | lazy | 14,260 | 17 | 19,349 (−1,803) |
+| off | full (main) | 18,682 | 222 | 118,142 |
+| off | lazy | 14,260 | 222 | 116,362 (−1,780) |
+
+**Spend.** $17.60 priced by the harness (to the first tool, all eval runs), plus four capture runs (unpriced, one response each).
+
+**Not measured:**
+- BYO and catalog hosts;
+- Haiku;
+- a live sidebar session that navigates mid-conversation (the page block follows query creation, not navigation);
+- the cost delta search-off, which is larger than the ~1.8k-token prompt delta explains. Its cause was not investigated, so it is not claimed as a saving.
+
+**For W03/W04.** A wave that adds chat tools to an existing domain adds **0 bytes** to the always-on index. To land it:
+1. Run `aiToolIndex.test.ts`. B1 invariance, B2 (its domain block < 2,048 B) and B3 (worst page turn < 7,040 B) must stay green.
+2. Remove its tools from `FIXTURE_W03_W04`; the fixture test fails once they are chat-declared.
+3. Do not edit `DOMAIN_VOCABULARY` or the bounds to make room.
+
+A new `DOMAIN_NOTES` sentence costs always-on bytes, and 66 B of headroom are left.
+
+## 14. Full-control W03 (#6757) delta
+
+**Date measured:** 2026-10-25 · **Branch:** `feature/6754-ai-full-control/wave-6757` @ `0f03ba0693` against `origin/main` @ `30d2519965` (post-W19), the main tree measured from a `git archive` export with the branch's dependencies · **Plan:** `plans/ai-mcp/2026-10-25-ai-full-control-w03-backup-dr-writes.md` (spec D5, gate ≤ +8,000 turn-1 tokens per surface with tool search **on**, production since A-W04; the `off` delta is recorded alongside)
+
+Harness: `tool-capture.ts --surface <chat|agent-full> --proxy --tool-search <off|on>`, model `claude-sonnet-5-5`, default prompt. Turn-1 tokens are read from the first Sonnet `/v1/messages` proxy row that carries a tool list, as `inputTokens + cacheCreationInputTokens + cacheReadInputTokens`.
+
+| Surface | Tool search | Tools sent (main → branch) | Turn-1 main | Turn-1 branch | Δ tokens | Gate |
+|---|---|---|---|---|---|---|
+| chat | **on** | 17 → 17 (deferred: 222 → 241 registered) | 19,085 | 19,707 | **+622** | pass |
+| chat | off | 222 → 241 (+19) | 116,098 | 125,342 | +9,244 | recorded (not the gate) |
+| agent-full | **on** | 162 → 163 (+1) | 78,482 | 79,833 | **+1,351** | pass |
+| agent-full | off | 162 → 163 (+1) | 78,505 | 79,833 | +1,328 | recorded |
+
+- **chat** gains all 19 W03 tools. With tool search on they are deferred, so turn 1 pays only their names in the deferred-tool list (+622). The system prompt is 13,876 bytes on both: the W19 always-on index does not grow with tools.
+- **agent-full** gains one. With an empty agent allowlist a full-profile run exposes only tools with a read-only action (`fullRunToolExposure`, #6909), and `manage_backup_profiles` (`list`/`get`) is the only W03 tool that has one. The other 18 reach an agent only when its allowlist names them.
+- **The `off` delta (+9,244) is over +8,000.** It is the price of 19 inline schemas on a full-list host. It is not the gate, because tool search has been the production default since A-W04 (2026-09-28), which is the lever D5 told an over-budget wave to wait for.
+- **Chat tool index (W19 bounds):** the always-on index is 2,494 B on both. The backup block grows 433 → 959 B and the integrations block 562 → 599 B (B2 < 2,048 B). The worst page turn stays at 4,190 B (B3 < 7,040 B; backup is not a page-context domain). The legacy `AI_TOOL_INDEX=full` render is 6,917 → 7,480 B default and 6,966 → 7,529 B flag-on, informational only (no ceiling since W19).
+- None of the 19 is `alwaysLoad`.
+
+## 15. Full-control W04 (#6758) delta
+
+**Date measured:** 2026-10-25 · **Branch:** `feature/6754-ai-full-control/wave-6758` @ `64d3a5e7c7` (merged with main) against `origin/main` @ `8d1871dfe1` (post-W03), the main tree measured from a `git archive` export with the branch's dependencies · **Plan:** `plans/ai-mcp/2026-10-25-ai-full-control-w04-security-device-ops-writes.md` (spec D5, gate ≤ +8,000 turn-1 tokens per surface with tool search **on**; the `off` delta is recorded alongside)
+
+Harness and reading as §14 (`tool-capture.ts --proxy`, `claude-sonnet-5-5`, default prompt; first tool-bearing Sonnet `/v1/messages` row, `inputTokens + cacheCreationInputTokens + cacheReadInputTokens`).
+
+| Surface | Tool search | Tools sent (main → branch) | Turn-1 main | Turn-1 branch | Δ tokens | Gate |
+|---|---|---|---|---|---|---|
+| chat | **on** | 17 → 17 (deferred: +19) | 19,443 | 19,995 | **+552** | pass |
+| chat | off | 241 → 260 (+19) | 125,078 | 135,088 | +10,010 | recorded (not the gate) |
+| agent-full | **on** | 163 → 167 (+4) | 79,592 | 82,600 | **+3,008** | pass |
+| agent-full | off | 163 → 167 (+4) | 79,569 | 82,600 | +3,031 | recorded |
+
+- **chat** gains all 19 W04 tools, deferred behind tool search: turn 1 pays their names (+552). The turn-1 request's tools, system and first-message digests are identical on both trees; the system prompt is 13,876 bytes on both.
+- **agent-full** gains four: with an empty allowlist a full-profile run exposes only tools with a read-only action (`fullRunToolExposure`), and `manage_processes` (`list`), `manage_scheduled_tasks` (`list`), `manage_software_policy` (`list`/`get`) and `manage_browser_policy` (`list`) are the W04 tools that have one.
+- **The `off` delta (+10,010) is over +8,000** — 19 inline schemas on a full-list host. Not the gate, as in §14.
+- **Chat tool index (W19 bounds):** always-on 2,494 B on both. Domain blocks: devices 940 → 1,117, security 970 → 1,268, monitoring 731 → 787, network 452 → 508, patching 337 → 423, admin 260 → 306 B (B2 < 2,048). Worst page turn: alert 4,190 → 4,423 B, device 3,822 → 3,999 B (B3 < 7,040). Legacy `AI_TOOL_INDEX=full` (informational, W03 + W04 merged): 8,199 B default / 8,248 B flag-on.
+- None of the 19 is `alwaysLoad`.
+- **Golden eval (chat, first-call, real key, test-stack DB):** main 26/78, branch 25/81. On the 78 common cases one is a reproducible regression — **g70** (internal note on a ticket) now first calls `manage_tickets:get` instead of `comment` (3/3 runs; read-before-write) — and g51/g69 flip on single runs but match on re-runs (noise). The three new cases g79–g81 score 0/3 on first call: each first resolves its target (`query_devices` / `list_organizations`), the read-before-write pattern W02 and W03 also recorded.
+
+## 16. Full-control W11 (#6781) delta
+
+**Date measured:** 2026-10-26 · **Branch:** `feature/6754-ai-full-control/wave-6781` @ `2c877a8ca4` (based on `25fcb2e35b`, post-W10) against `origin/main` @ `cf78828c23` (one later commit, #10274, adds only `packages/shared/src/promptHost` — no AI tool, prompt or registry change), the main tree measured from a `git archive` export with the branch's dependencies · **Plan:** `plans/ai-mcp/2026-10-26-ai-full-control-w11-security-policy-tools.md` (spec D5, gate ≤ +8,000 turn-1 tokens per surface with tool search **on**; the `off` delta is recorded alongside)
+
+Harness and reading as §14 (`tool-capture.ts --proxy`, `claude-sonnet-5-5`, default prompt; first tool-bearing Sonnet `/v1/messages` row, `inputTokens + cacheCreationInputTokens + cacheReadInputTokens`).
+
+| Surface | Tool search | Tools sent (main → branch) | Turn-1 main | Turn-1 branch | Δ tokens | Gate |
+|---|---|---|---|---|---|---|
+| chat | **on** | 17 → 17 (deferred: +8) | 20,539 | 20,918 | **+379** | pass |
+| chat | off | 289 → 297 (+8) | 153,434 | 160,430 | +6,996 | recorded (not the gate) |
+| agent-full | **on** | 181 → 186 (+5) | 90,894 | 94,368 | **+3,474** | pass |
+| agent-full | off | 181 → 186 (+5) | 90,894 | 94,368 | +3,474 | recorded |
+
+- **chat** gains all eight W11 tools, deferred behind tool search: turn 1 pays their names (+379). The system prompt is 14,260 bytes on both trees: the W19 always-on index does not grow.
+- **agent-full** gains five: a full-profile run with an empty allowlist exposes only tools with a read-only action (`fullRunToolExposure`). `get_security_compliance`, `manage_security_recommendations`, `manage_audit_baselines`, `manage_security_policies` and `manage_recovery_keys` have one; `manage_compliance_policies` (deactivate only) does not, and `manage_access_reviews` / `manage_pam_rules` are `AGENT_HUMAN_ONLY_TOOLS`.
+- **Chat tool index (W19 bounds):** always-on 2,494 B on both. The security block grows 1,268 → 1,644 B (B2 < 2,048 B; still the largest block). The worst page turn stays at 4,731 B (alert; security is not a page-context domain; B3 < 7,040 B).
+- None of the eight is `alwaysLoad`.
+- **Golden eval:** not run (the three new cases g97–g99 are pinned by the count test; the live first-call eval is left for the release sweep).

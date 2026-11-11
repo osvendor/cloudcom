@@ -8,6 +8,7 @@ import { partners,organizations,sites,devices,users,portalUsers,portalRemoteSett
   portalRemoteSessions,portalNativeTargets,portalNativeAdmissions } from '../../db/schema';
 import { enrollNativeTarget,authenticateNativeTarget } from '../../services/portalNativeTarget';
 import { issueNativeAdmission,consumeNativeAdmission,renewNativeAdmission,touchNativePresence,endNativeAdmission,nativeSessionHash,expireStaleNativeSessionsForDevice } from '../../services/portalNativeAdmission';
+import { getDeviceCascadeDeleteTables } from '../../routes/devices/core';
 import { encodeNativeAdmissionV2,hashNativeTicket } from '../../services/portalNativeProof';
 import type { AgentAuthContext } from '../../middleware/agentAuth';
 import type { NativeTarget } from '../../services/portalNativeAdmissionSchemas';
@@ -15,7 +16,7 @@ const controls=vi.hoisted(()=>({prompt:'off',allowed:true}));
 vi.mock('../../services/portalRemoteFeature',()=>({isPortalRemoteFeatureEnabled:async()=>true}));
 vi.mock('../../services/tenantStatus',()=>({getActiveOrgTenant:async()=>({partnerId:'partner'})}));
 vi.mock('../../services/remoteAccessPolicy',()=>({checkRemoteAccess:async()=>({allowed:controls.allowed}),resolveDesktopSessionPolicy:async()=>({maxSessionDurationHours:1,idleTimeoutMinutes:5})}));
-vi.mock('../../routes/remote/helpers',()=>({resolveRemoteSessionPromptConfig:async()=>({mode:controls.prompt})}));
+vi.mock('../../routes/remote/helpers',async(importOriginal)=>({...await importOriginal<typeof import('../../routes/remote/helpers')>(),resolveRemoteSessionPromptConfig:async()=>({mode:controls.prompt})}));
 vi.mock('../../config/partnerTrustMode',()=>({partnerTrustMode:()=> 'off'}));
 const secret=()=>randomBytes(32).toString('base64url');
 beforeEach(()=>{vi.stubEnv('CLOUDCOM_NATIVE_ADMISSION_ENABLED','true');controls.prompt='off';controls.allowed=true;});
@@ -44,9 +45,23 @@ async function fixture() {
   const binding={orgId:a!.id,deviceId:da!.id,sessionId:issued.sessionId,connectionId,targetGeneration:issued.targetGeneration,ticketHash:hashNativeTicket(issued.ticket),targetChallenge,operatorPublicKey:publicKey,targetPublicKey:enrollment.targetPublicKey,channelBinding};
   return {version:2 as const,sessionId:issued.sessionId,ticket:issued.ticket,connectionId,targetChallenge,channelBinding,operatorSignature:sign(null,encodeNativeAdmissionV2(binding),pair.privateKey).toString('base64url')};
  };
- return {admin,a:a!,b:b!,da:da!,dbb:dbb!,alice:alice!,bob:bob!,grant:grant!,context,scoped,agent,enrollment,target,operator,issue,proof,publicKey};
+ return {staff:staff!,admin,a:a!,b:b!,da:da!,dbb:dbb!,alice:alice!,bob:bob!,grant:grant!,context,scoped,agent,enrollment,target,operator,issue,proof,publicKey};
 }
 describe('native admission real SQL boundaries',()=>{
+ it('keeps staff native history source-owned and purges its child before the target',async()=>{
+  const f=await fixture();
+  await f.admin.execute(sql`INSERT INTO staff_native_sessions
+    (org_id,device_id,staff_user_id,target_id,target_generation,target_public_key,operator_public_key,operator_session_hash,hard_deadline,ticket_hash,ticket_expires_at,presence_until)
+    VALUES (${f.a.id},${f.da.id},${f.staff.id},${f.target.id},1,${secret()},${secret()},${secret()},now()+interval '1 hour',${secret()},now()+interval '1 minute',now()+interval '1 minute')`);
+  await expect(f.admin.execute(sql`UPDATE devices SET org_id=${f.b.id},site_id=${f.dbb.siteId} WHERE id=${f.da.id}`)).rejects.toThrow();
+  const ownership=await f.admin.execute(sql`SELECT org_id FROM staff_native_sessions WHERE device_id=${f.da.id}`);
+  expect(ownership[0]?.org_id).toBe(f.a.id);
+  await expect(f.admin.execute(sql`DELETE FROM portal_native_targets WHERE id=${f.target.id}`)).rejects.toThrow();
+  const order=getDeviceCascadeDeleteTables().filter(name=>['staff_native_sessions','portal_native_admissions','portal_native_targets'].includes(name));
+  for(const name of order) await f.admin.execute(sql`DELETE FROM ${sql.identifier(name)} WHERE device_id=${f.da.id}`);
+  expect(await f.admin.execute(sql`SELECT id FROM staff_native_sessions WHERE device_id=${f.da.id}`)).toHaveLength(0);
+  expect(await f.admin.execute(sql`SELECT id FROM portal_native_targets WHERE id=${f.target.id}`)).toHaveLength(0);
+ });
  it('retires an expired native lease without disconnecting a live session on the same device',async()=>{
   const f=await fixture();
   const expired=await f.issue(),expiredInput=f.proof(expired);

@@ -126,25 +126,25 @@ describe('aiToolsMonitors registration (#5289)', () => {
 describe('list_monitors', () => {
   beforeEach(() => vi.clearAllMocks());
 
+  /** Any builder chain that resolves to `rows` when awaited (subqueries are never awaited). */
+  function chainResolving(rows: unknown[]) {
+    const chain: Record<string, unknown> = {};
+    for (const m of ['from', 'where', 'orderBy', 'limit', 'offset', 'leftJoin', 'groupBy']) chain[m] = () => chain;
+    chain.as = () => ({ total: 'counted.total' });
+    chain.then = (resolve: (v: unknown) => unknown, reject: (e: unknown) => unknown) =>
+      Promise.resolve(rows).then(resolve, reject);
+    return chain;
+  }
+
   it('returns the monitor definitions the caller can see, with attachment counts', async () => {
-    let selectCall = 0;
-    mockDb.select.mockImplementation(() => {
-      selectCall++;
-      if (selectCall === 1) {
-        return {
-          from: () => ({
-            where: () => ({
-              orderBy: () =>
-                Promise.resolve([
-                  { id: 'm1', name: 'CPU high', kind: 'cpu', severity: 'high', enabled: true, orgId: ORG, partnerId: null },
-                  { id: 'm2', name: 'Disk full', kind: 'disk', severity: 'critical', enabled: true, orgId: null, partnerId: PARTNER },
-                ]),
-            }),
-          }),
-        };
-      }
-      return { from: () => ({ where: () => ({ groupBy: () => Promise.resolve([{ monitorId: 'm1', count: 2 }]) }) }) };
-    });
+    mockDb.select
+      .mockReturnValueOnce(chainResolving([])) // count subquery
+      .mockReturnValueOnce(chainResolving([])) // page-id subquery
+      .mockReturnValueOnce(chainResolving([
+        { total: 2, row: { id: 'm1', name: 'CPU high', kind: 'cpu', severity: 'high', enabled: true, orgId: ORG, partnerId: null } },
+        { total: 2, row: { id: 'm2', name: 'Disk full', kind: 'disk', severity: 'critical', enabled: true, orgId: null, partnerId: PARTNER } },
+      ]))
+      .mockReturnValueOnce(chainResolving([{ monitorId: 'm1', count: 2 }])); // attachment counts
 
     const result = await call('list_monitors', {});
 
@@ -157,10 +157,17 @@ describe('list_monitors', () => {
   });
 
   it('returns an empty list without querying attachment counts', async () => {
-    mockDb.select.mockReturnValue({ from: () => ({ where: () => ({ orderBy: () => Promise.resolve([]) }) }) });
+    mockDb.select
+      .mockReturnValueOnce(chainResolving([]))
+      .mockReturnValueOnce(chainResolving([]))
+      .mockReturnValueOnce(chainResolving([{ total: 0, row: null }]));
     const result = await call('list_monitors', { kind: 'cpu' });
-    expect(result).toEqual({ monitors: [], total: 0, showing: 0 });
-    expect(mockDb.select).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({
+      monitors: [], total: 0, totalMode: 'exact', showing: 0,
+      limit: 25, offset: 0, hasMore: false, nextCursor: null,
+    });
+    // The three builders of the one page statement; no attachment-count query.
+    expect(mockDb.select).toHaveBeenCalledTimes(3);
   });
 });
 
@@ -224,6 +231,52 @@ describe('get_monitor', () => {
       { id: 'att1', configPolicyId: 'p1', policyName: 'Policy A', enabled: true, overrides: null },
     ]);
     expect(result.compiled).toEqual({ alertTemplateId: 't1', alertRuleId: 'r1', automationId: 'a1' });
+  });
+});
+
+describe('get_monitor network_check endpoint display', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('shows a URL target as scheme + host with a fingerprint, in the definition and overrides', async () => {
+    const secretUrl = 'https://ops:hunter2@status.example.com/hooks/T1/B1/abc123?token=xyz789';
+    let selectCall = 0;
+    mockDb.select.mockImplementation(() => {
+      selectCall++;
+      if (selectCall === 1) {
+        return {
+          from: () => ({
+            where: () => ({
+              limit: () => Promise.resolve([{
+                id: 'm1', name: 'Status page', kind: 'network_check', orgId: ORG, partnerId: null,
+                condition: { checkType: 'http_check', target: secretUrl, method: 'GET' },
+                compiledAlertTemplateId: null, compiledAlertRuleId: null, compiledAutomationId: null,
+              }]),
+            }),
+          }),
+        };
+      }
+      return {
+        from: () => ({
+          innerJoin: () => ({
+            innerJoin: () => ({
+              where: () => Promise.resolve([
+                { id: 'att1', configPolicyId: 'p1', policyName: 'Policy A', enabled: true, overrides: { target: secretUrl } },
+              ]),
+            }),
+          }),
+        }),
+      };
+    });
+
+    const result = await call('get_monitor', { monitorId: 'm1' });
+    const serialized = JSON.stringify(result);
+    for (const fragment of ['hunter2', '/hooks/', 'abc123', 'xyz789']) {
+      expect(serialized).not.toContain(fragment);
+    }
+    expect(result.monitor.condition.target).toBe('https://status.example.com');
+    expect(result.monitor.condition.targetFingerprint).toMatch(/^[0-9a-f]{6}$/);
+    expect(result.monitor.condition.method).toBe('GET');
+    expect(result.attachments[0].overrides.target).toBe('https://status.example.com');
   });
 });
 
@@ -367,5 +420,42 @@ describe('manage_monitor_definitions detach — partner-wide gate (#5289 review 
 
     expect(result.success).toBe(true);
     expect(removeFeatureLinkMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+// The link's `inheritance` lives in its inline settings, which attach/detach
+// rewrite. Dropping it silently turned a `replace` policy `cumulative`.
+describe('manage_monitor_definitions attach/detach — keeps the link inheritance', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    isMonitorAttachableToPolicyMock.mockImplementation(async () => true);
+  });
+
+  const replaceLink = { id: 'fl1', inlineSettings: { items: [], inheritance: 'replace' } };
+  const item = (monitorId: string, sortOrder: number) => ({ monitorId, enabled: true, overrides: null, sortOrder });
+
+  it('attach keeps a replace link replace', async () => {
+    queueSelects([monitorRow()], [replaceLink], [item('m0', 0)]);
+    getConfigPolicyMock.mockResolvedValue({ id: 'p1', orgId: ORG, partnerId: null });
+
+    const result = await call('manage_monitor_definitions', { action: 'attach', monitorId: 'm1', configPolicyId: 'p1' });
+
+    expect(result.success).toBe(true);
+    expect(updateFeatureLinkMock).toHaveBeenCalledWith(
+      'fl1',
+      { inlineSettings: { inheritance: 'replace', items: [item('m0', 0), item('m1', 1)] } },
+      'p1',
+    );
+  });
+
+  it('detaching the last monitor keeps an empty replace link instead of deleting it', async () => {
+    queueSelects([monitorRow()], [{ id: 'att1', featureLinkId: 'fl1', configPolicyId: 'p1' }], [replaceLink], [item('m1', 0)]);
+    getConfigPolicyMock.mockResolvedValue({ id: 'p1', orgId: ORG, partnerId: null });
+
+    const result = await call('manage_monitor_definitions', { action: 'detach', monitorId: 'm1', attachmentId: 'att1' });
+
+    expect(result.success).toBe(true);
+    expect(removeFeatureLinkMock).not.toHaveBeenCalled();
+    expect(updateFeatureLinkMock).toHaveBeenCalledWith('fl1', { inlineSettings: { inheritance: 'replace', items: [] } }, 'p1');
   });
 });

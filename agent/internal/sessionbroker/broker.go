@@ -257,6 +257,10 @@ type Broker struct {
 	rateLimiter *ipc.RateLimiter
 	startTime   time.Time // broker creation time, used for watchdog uptime
 
+	// broadcastNotifyUndelivered counts broadcast notifications a helper
+	// answered with Delivered=false (#9266). See BroadcastNotification.
+	broadcastNotifyUndelivered atomic.Uint64
+
 	mu                      timedRWMutex
 	sessions                map[string]*Session   // sessionID -> Session
 	byIdentity              map[string][]*Session // identity key -> Sessions (UID string on Unix, SID on Windows)
@@ -297,7 +301,22 @@ type Broker struct {
 	onMessage       MessageHandler
 	onSessionClosed SessionClosedHandler
 	onSessionAuthed SessionAuthenticatedHandler
-	selfHashes      map[string]struct{} // SHA-256 of allowed helper binaries
+	promptSink      PromptSink          // prompt host (#10190); guarded by mu
+	selfHashes      map[string]struct{} // SHA-256 of allowed helper binaries; guarded by mu
+
+	// TCC skew rule (#10190 W04, tcc_notice.go); both guarded by mu.
+	tccNoticeGate    func() bool
+	tccStatusHandler func(s *Session, status ipc.TCCStatus)
+
+	// helperPathsFn overrides allowedHelperPaths (test seam). Nil in
+	// production, where the allowlist is derived from os.Executable().
+	helperPathsFn func() []string
+
+	// hashRefreshMu serializes the on-miss allowlist refresh in
+	// verifyPeerBinaryHash; lastHashMissRefresh (guarded by hashRefreshMu)
+	// rate-limits it to one full rehash per hashMissRefreshInterval.
+	hashRefreshMu       sync.Mutex
+	lastHashMissRefresh time.Time
 
 	// consoleSessionIDFn returns the active console (physical-monitor) Windows
 	// session id. It is the injectable seam that makes the assist/user
@@ -334,6 +353,10 @@ type Broker struct {
 // while still guaranteeing the key is released even if the PID stays alive,
 // becomes unprobeable, or is reused.
 const helperKillRetentionTTL = 5 * time.Minute
+
+// hashMissRefreshInterval bounds how often a helper hash miss may trigger a
+// full rehash of the allowlisted binaries (see verifyPeerBinaryHash).
+const hashMissRefreshInterval = 30 * time.Second
 
 // retainedHelperKey is a bounded record that a failed kill left a helper PID
 // possibly alive, so a respawn for this key must be blocked until the PID is
@@ -508,6 +531,15 @@ func (b *Broker) SetConsoleUser(username string) {
 	if prev != username {
 		log.Debug("console user changed", "from", prev, "to", username)
 	}
+}
+
+// ConsoleAtLoginWindow reports whether the macOS console is at the login
+// window, as last set by SetConsoleUser. An unset console user (the darwin
+// console watcher has not run, or this is not macOS) reports false. Reads the
+// lock-free snapshot, so a start_desktop never queues behind a write-lock storm.
+func (b *Broker) ConsoleAtLoginWindow() bool {
+	_, consoleUser := b.snapshotSessions()
+	return consoleUser == "loginwindow"
 }
 
 // Listen starts the IPC listener. Blocks until stopChan is closed.
@@ -1125,6 +1157,36 @@ func (b *Broker) SessionInConsoleSession(s *Session) bool {
 	return s.WinSessionID == b.ConsoleSessionID()
 }
 
+// SessionMayDrawMessageCards reports whether s sits where an endpoint message
+// card (#8741) may be drawn: the active console session of a WINDOWS host.
+// Unlike SessionInConsoleSession it is false on every other OS — the card is a
+// Windows-only surface in W1, and macOS/Linux users get the native toast. An
+// unknown console ("" / the "0" sentinel) or helper session never matches.
+func (b *Broker) SessionMayDrawMessageCards(s *Session) bool {
+	if s == nil || b.effectiveGOOS() != "windows" {
+		return false
+	}
+	console := b.ConsoleSessionID()
+	return console != "" && s.WinSessionID == console
+}
+
+// PreferredSessionWithScopeMatching returns the best connected session that
+// holds scope AND satisfies keep, so a caller with a placement rule (e.g. the
+// console-only message card) never settles on a newer session that fails it.
+// keep runs outside the broker lock.
+func (b *Broker) PreferredSessionWithScopeMatching(scope string, keep func(*Session) bool) *Session {
+	var best *Session
+	for _, s := range b.SessionsWithScope(scope) {
+		if keep != nil && !keep(s) {
+			continue
+		}
+		if betterSession(s, best) {
+			best = s
+		}
+	}
+	return best
+}
+
 // PreferredRunAsUserSession returns the run_as_user helper to target for the
 // current host. On Windows it is constrained to the active console session so a
 // co-logged-in user's helper can never intercept a run_as_user script meant for
@@ -1361,19 +1423,82 @@ func (b *Broker) TCCStatus() *ipc.TCCStatus {
 // session (#4940): in always-on lifecycle mode the broker spawns a system-role
 // and a user-role helper into the same console session and both hold "notify", so
 // an unfiltered broadcast drew every toast twice. See notifyTargets.
+//
+// Fire-and-forget for the CALLER, not on the wire (#9266). The helper's
+// handleNotify always answers on the envelope id it was given — it has to,
+// RequestNotificationDecision depends on it. This used to send with an empty
+// id, so nothing was pending, and every toast's notify_result reached
+// dispatchHelperMessage and shipped "dropping unsolicited or unauthorized
+// helper message" at WARN. Each send now carries a real id with the reply
+// registered, so the answer is consumed by the pending-response path and used:
+// Debug when delivered, Info plus broadcastNotifyUndelivered when the helper
+// could not show it. The send itself still happens before this returns (only
+// the wait is on a goroutine), so callers that reboot shortly after keep the
+// ordering they had.
 func (b *Broker) BroadcastNotification(title, body, urgency string) {
 	sessions := b.notifyTargets()
 
+	req := &ipc.NotifyRequest{
+		Title:   title,
+		Body:    body,
+		Urgency: urgency,
+	}
+	// Read once, on the caller's goroutine: tests shorten it, and a waiter
+	// goroutine reading the package var could race that write.
+	timeout := broadcastNotifyResultTimeout
 	for _, s := range sessions {
-		if err := s.SendNotify("", ipc.TypeNotify, &ipc.NotifyRequest{
-			Title:   title,
-			Body:    body,
-			Urgency: urgency,
-		}); err != nil {
+		id := fmt.Sprintf("notify-bcast-%s-%d", s.SessionID, notifyDecisionSeq.Add(1))
+		wait, err := s.startCommand(id, ipc.TypeNotify, req)
+		if err != nil {
 			log.Debug("broadcast notification to session failed",
 				"sessionId", s.SessionID, "error", err.Error())
+			continue
+		}
+		go b.awaitBroadcastNotifyResult(s, wait, timeout)
+	}
+}
+
+// broadcastNotifyResultTimeout bounds how long a broadcast waits for the
+// helper's notify_result. Showing a toast is normally quick, but the helper
+// answers only after its PowerShell fallback returns, and that has no timeout
+// of its own. A reply arriving after the wait has given up is dropped as
+// unsolicited at WARN again — the noise #9266 removed — so this is generous:
+// it costs one parked goroutine per helper per broadcast, and broadcasts are
+// rare (the reboot-warning ladder). Session.SendNotification uses the same
+// bound for single-session notices (#10224): a notice that asks for the
+// fallback dialog is answered only when that dialog closes (60 s each, and the
+// helper queues them), so the generous wait covers it too. A var only so tests
+// can shorten it.
+var broadcastNotifyResultTimeout = 5 * time.Minute
+
+// awaitBroadcastNotifyResult consumes the reply a broadcast notification is
+// owed and records its outcome. A missing or unreadable reply is Info, not a
+// warn: the helper may simply have exited, and the reboot ladder never depends
+// on the answer.
+func (b *Broker) awaitBroadcastNotifyResult(s *Session, wait func(time.Duration) (*ipc.Envelope, error), timeout time.Duration) {
+	resp, err := wait(timeout)
+	if err != nil {
+		log.Info("no notify_result for broadcast notification",
+			"sessionId", s.SessionID, "role", s.HelperRole, "error", err.Error())
+		return
+	}
+	var res ipc.NotifyResult
+	if resp.Error == "" {
+		if err := json.Unmarshal(resp.Payload, &res); err != nil {
+			log.Info("undecodable notify_result for broadcast notification",
+				"sessionId", s.SessionID, "role", s.HelperRole, "error", err.Error())
+			return
 		}
 	}
+	if res.Delivered {
+		log.Debug("broadcast notification delivered",
+			"sessionId", s.SessionID, "role", s.HelperRole)
+		return
+	}
+	total := b.broadcastNotifyUndelivered.Add(1)
+	log.Info("broadcast notification not delivered",
+		"sessionId", s.SessionID, "role", s.HelperRole, "helperError", resp.Error,
+		"undeliveredTotal", total)
 }
 
 // notifyDecisionSeq numbers the envelope ids RequestNotificationDecision
@@ -1383,6 +1508,22 @@ func (b *Broker) BroadcastNotification(title, body, urgency string) {
 // — so two prompts raised inside the same millisecond, which two reminder rungs
 // or a rung and a retry easily are, would lose one answer.
 var notifyDecisionSeq atomic.Uint64
+
+// notifyDecisionReplyGrace is how long RequestNotificationDecision keeps
+// listening after the dialog's own countdown has run out (#10182).
+//
+// The helper is told to count down for the same window the broker waits, but
+// its countdown starts later: it has to receive the request, decode it and draw
+// the dialog first. So "the countdown expired with no click" always reached the
+// broker a little after a wait of exactly `timeout` had given up — the waiter
+// was gone and dispatchHelperMessage logged "dropping unsolicited or
+// unauthorized helper message type=notify_result" at WARN on every unanswered
+// prompt. A click in the dialog's last moments was discarded the same way, and
+// the reboot went ahead although the user had postponed it.
+//
+// The grace only costs time when the helper never answers at all (a wedged
+// helper on a live transport). A var only so tests can shorten it.
+var notifyDecisionReplyGrace = 10 * time.Second
 
 // RequestNotificationDecision sends an interactive notification to one
 // notify-scoped session per interactive Windows session and returns the first
@@ -1433,11 +1574,15 @@ func (b *Broker) RequestNotificationDecision(req ipc.NotifyRequest, timeout time
 		res ipc.NotifyResult
 		err error
 	}
+	// The dialog counts down `timeout` (req.TimeoutMs); the wait covers that plus
+	// the time its answer needs to get back. Read once, on the caller's
+	// goroutine, for the same reason BroadcastNotification reads its timeout.
+	wait := timeout + notifyDecisionReplyGrace
 	results := make(chan answer, len(sessions))
 	for _, s := range sessions {
 		go func(s *Session) {
 			id := fmt.Sprintf("notify-%s-%d", s.SessionID, notifyDecisionSeq.Add(1))
-			resp, err := s.SendCommand(id, ipc.TypeNotify, &req, timeout)
+			resp, err := s.SendCommand(id, ipc.TypeNotify, &req, wait)
 			if err != nil {
 				results <- answer{err: fmt.Errorf("session %s: %w", s.SessionID, err)}
 				return
@@ -1815,9 +1960,68 @@ func (b *Broker) RequestPamApproval(session *Session, id string, req ipc.PamRequ
 	return result, nil
 }
 
+// ErrPamDialogCloseUnsupported is returned, before anything is sent, when the
+// helper did not advertise pam_close_dialog.
+var ErrPamDialogCloseUnsupported = errors.New("PAM helper does not support closing its elevation dialog")
+
+// ClosePamDialog asks the SYSTEM PAM helper to take down its own elevation
+// dialog for dialogID (the envelope id of the pam_request_dialog) and waits
+// for it to report the window gone (#10370). id is this command's own IPC id
+// and must differ from dialogID.
+func (b *Broker) ClosePamDialog(session *Session, id, dialogID string, timeout time.Duration) (ipc.PamCloseDialogResult, error) {
+	var zero ipc.PamCloseDialogResult
+	if session == nil {
+		return zero, fmt.Errorf("nil PAM helper session")
+	}
+	if session.HelperRole != ipc.HelperRoleSystem || !session.HasScope(ipc.ScopePam) {
+		return zero, fmt.Errorf("closing the PAM dialog requires a SYSTEM helper with %q scope", ipc.ScopePam)
+	}
+	if !session.SupportsPamDialogClose {
+		return zero, ErrPamDialogCloseUnsupported
+	}
+	if dialogID == "" || id == dialogID {
+		return zero, fmt.Errorf("PAM dialog close needs a dialog id and its own command id")
+	}
+	resp, err := b.SendCommandAndWait(session, id, ipc.TypePamCloseDialog, ipc.PamCloseDialog{DialogID: dialogID}, timeout)
+	if err != nil {
+		return zero, err
+	}
+	if resp.Error != "" {
+		return zero, fmt.Errorf("PAM dialog close helper error: %s", resp.Error)
+	}
+	var result ipc.PamCloseDialogResult
+	if err := json.Unmarshal(resp.Payload, &result); err != nil {
+		return zero, fmt.Errorf("decode PAM dialog close result: %w", err)
+	}
+	return result, nil
+}
+
+// ErrPamTargetedDismissUnsupported is returned, before anything is sent, when
+// the helper did not advertise targeted consent dismissal. It is definite: no
+// helper input can be in flight.
+var ErrPamTargetedDismissUnsupported = errors.New("PAM helper does not support targeted consent dismissal")
+
 // DismissPamConsent asks the SYSTEM PAM helper to dismiss the active Windows
 // consent process and waits for the correlated result.
 func (b *Broker) DismissPamConsent(session *Session, id string, timeout time.Duration) (ipc.PamDismissConsentResult, error) {
+	return b.dismissPamConsent(session, id, nil, timeout)
+}
+
+// DismissPamConsentInstance asks the SYSTEM PAM helper to dismiss exactly one
+// consent.exe process and leave every other UAC prompt alone (#8995). It
+// refuses helpers that did not advertise support: an older helper would ignore
+// the target and dismiss whichever prompt it found first.
+func (b *Broker) DismissPamConsentInstance(session *Session, id string, instance ipc.PamConsentInstance, timeout time.Duration) (ipc.PamDismissConsentResult, error) {
+	if !instance.Valid() {
+		return ipc.PamDismissConsentResult{}, fmt.Errorf("PAM consent instance requires both a PID and a creation time")
+	}
+	if session != nil && !session.SupportsTargetedPamDismiss {
+		return ipc.PamDismissConsentResult{}, ErrPamTargetedDismissUnsupported
+	}
+	return b.dismissPamConsent(session, id, &instance, timeout)
+}
+
+func (b *Broker) dismissPamConsent(session *Session, id string, instance *ipc.PamConsentInstance, timeout time.Duration) (ipc.PamDismissConsentResult, error) {
 	var zero ipc.PamDismissConsentResult
 	if session == nil {
 		return zero, fmt.Errorf("nil PAM helper session")
@@ -1836,7 +2040,7 @@ func (b *Broker) DismissPamConsent(session *Session, id string, timeout time.Dur
 	resp, quiesced, err := session.sendCommandWithQuiescence(
 		id,
 		ipc.TypePamDismissConsent,
-		ipc.PamDismissConsentRequest{DeadlineUnixMs: deadline.UnixMilli()},
+		ipc.PamDismissConsentRequest{DeadlineUnixMs: deadline.UnixMilli(), Instance: instance},
 		timeout,
 	)
 	if err != nil {
@@ -2007,6 +2211,7 @@ func (b *Broker) admitOrEvict(identityKey string) bool {
 		if onClosed != nil {
 			onClosed(victim)
 		}
+		b.notifyPromptRendererDisconnected(victim)
 		for _, callback := range callbacks {
 			callback(victim)
 		}
@@ -2187,7 +2392,7 @@ func (b *Broker) handleConnection(rawConn net.Conn) {
 			"identity", identityKey,
 			"pid", creds.PID,
 			"path", creds.BinaryPath,
-			"allowed", b.allowedHelperPaths(),
+			"allowed", b.helperPaths(),
 		)
 		_ = conn.SendTyped(env.ID, ipc.TypeAuthResponse, ipc.AuthResponse{
 			Accepted:  false,
@@ -2199,7 +2404,7 @@ func (b *Broker) handleConnection(rawConn net.Conn) {
 	}
 
 	// Step 7: Verify binary hash — reject helpers if no allowed helper hash could be loaded.
-	if len(b.selfHashes) == 0 {
+	if b.allowedHashCount() == 0 {
 		log.Error("rejecting helper connection: helper binary hash allowlist unavailable",
 			"identity", identityKey,
 			"pid", creds.PID,
@@ -2212,7 +2417,7 @@ func (b *Broker) handleConnection(rawConn net.Conn) {
 		conn.Close()
 		return
 	}
-	peerHash, err := hashFileSHA256(creds.BinaryPath)
+	peerHash, hashVerified, err := b.verifyPeerBinaryHash(creds.BinaryPath)
 	if err != nil {
 		log.Warn("failed to hash peer binary",
 			"identity", identityKey,
@@ -2228,15 +2433,11 @@ func (b *Broker) handleConnection(rawConn net.Conn) {
 		conn.Close()
 		return
 	}
-	hashVerified := b.isAllowedBinaryHash(peerHash)
 	if !hashVerified {
-		allowed := make([]string, 0, len(b.selfHashes))
-		for h := range b.selfHashes {
-			allowed = append(allowed, h)
-		}
 		log.Warn("binary hash mismatch",
 			"identity", identityKey,
-			"expected", allowed,
+			"path", creds.BinaryPath,
+			"expected", b.allowedHashList(),
 			"got", peerHash,
 		)
 		_ = conn.SendTyped(env.ID, ipc.TypeAuthResponse, ipc.AuthResponse{
@@ -2372,10 +2573,12 @@ func (b *Broker) handleConnection(rawConn net.Conn) {
 	}
 
 	// Send auth response
+	handlesTCCNotice := b.agentHandlesTCCNoticeFor(helperRole, authReq, scopes)
 	authResp := ipc.AuthResponse{
-		Accepted:      true,
-		SessionKey:    hex.EncodeToString(sessionKey),
-		AllowedScopes: scopes,
+		Accepted:              true,
+		SessionKey:            hex.EncodeToString(sessionKey),
+		AllowedScopes:         scopes,
+		AgentHandlesTCCNotice: handlesTCCNotice,
 	}
 	if err := conn.SendTyped(env.ID, ipc.TypeAuthResponse, authResp); err != nil {
 		log.Warn("failed to send auth response", "error", err.Error())
@@ -2402,6 +2605,8 @@ func (b *Broker) handleConnection(rawConn net.Conn) {
 		session.BinaryKind = ipc.HelperBinaryUserHelper
 	}
 	session.DesktopContext = authReq.DesktopContext
+	applyAuthAdvertisements(session, helperRole, authReq)
+	session.agentHandlesTCCNotice.Store(handlesTCCNotice)
 	session.peerProcess = peerProcessRef
 
 	// Use the kernel-verified Windows session ID (computed above from the peer
@@ -2411,6 +2616,7 @@ func (b *Broker) handleConnection(rawConn net.Conn) {
 	// roles retain the legacy fallback when no kernel session is available.
 	if verifiedWinSession != "" {
 		session.WinSessionID = verifiedWinSession
+		session.WinSessionVerified = true
 		if verifiedWinSession != claimedWinSession {
 			log.Warn("WinSessionID mismatch — using kernel-verified value",
 				"reported", authReq.WinSessionID,
@@ -2462,6 +2668,7 @@ func (b *Broker) handleConnection(rawConn net.Conn) {
 	// handler remains asynchronous because it may perform slow IPC work.
 	b.fireLifecycleSessionAuthenticated(session)
 	go b.firePrimarySessionAuthenticated(session)
+	b.notifyPromptRendererConnected(session)
 
 	// Keepalive: send periodic pings and close the session if pongs stop
 	// arriving. Without this, a wedged helper (e.g. a capture process killed
@@ -2545,6 +2752,7 @@ func (b *Broker) closeSession(session *Session) error {
 		if onSessionClosed != nil {
 			onSessionClosed(session)
 		}
+		b.notifyPromptRendererDisconnected(session)
 		for _, callback := range callbacks {
 			callback(session)
 		}
@@ -2598,6 +2806,7 @@ func (b *Broker) TerminateHelperKey(key HelperKey) {
 		if onSessionClosed != nil {
 			onSessionClosed(session)
 		}
+		b.notifyPromptRendererDisconnected(session)
 		for _, callback := range callbacks {
 			callback(session)
 		}
@@ -2639,13 +2848,13 @@ func (b *Broker) CloseSessionsByDesktopContext(ctx string) int {
 // setupSocket is implemented in broker_windows.go and broker_unix.go.
 
 func (b *Broker) verifyBinaryPath(peerPath string) bool {
-	ok := binaryPathMatchesAllowed(peerPath, b.allowedHelperPaths())
+	ok := binaryPathMatchesAllowed(peerPath, b.helperPaths())
 	if ok {
 		return true
 	}
 	log.Debug("verifyBinaryPath: no match",
 		"peer", filepath.Clean(peerPath),
-		"allowed", b.allowedHelperPaths(),
+		"allowed", b.helperPaths(),
 	)
 	return false
 }
@@ -2720,8 +2929,12 @@ func roleIdentityRejection(role ipc.HelperRole, sid string, uid uint32, peerWinS
 	// Unix: watchdog and system-role helpers must run as root. The macOS
 	// desktop helper runs in the GUI user/loginwindow session, so it must
 	// authenticate as user-role and receives only desktop scope. The assist
-	// helper is Windows-only; on Unix it would receive only the inert "assist"
-	// scope, so no identity gate is required here.
+	// helper (Breeze Assist) also runs on macOS/Linux as the console user and
+	// receives assist + consent_ui there, which caller verification (#6354 W02)
+	// relies on. No role gate is needed for it here: it is unprivileged, and
+	// caller_verify binds the answer to the helper's kernel-verified peer UID
+	// against the console user at selection time (caller_verify.go), not to
+	// anything the helper claims.
 	switch {
 	case role == ipc.HelperRoleWatchdog && uid != 0:
 		return "watchdog role requires root identity", true
@@ -2761,16 +2974,75 @@ func (b *Broker) scopesForRole(role ipc.HelperRole, binaryKind, goos, peerPath s
 
 // grantScopes computes the final AllowedScopes for an authenticated helper:
 // the role's base scopes plus consent_ui_fallback when a user-role helper
-// advertised native consent support. Always returns a fresh slice — the
+// advertised native consent support, and messaging when an assist-role helper
+// advertised message-card support. Always returns a fresh slice — the
 // role-scope vars are shared package state and must not be appended to.
 func (b *Broker) grantScopes(role ipc.HelperRole, authReq ipc.AuthRequest, goos, peerPath string) []string {
 	base := b.scopesForRole(role, authReq.BinaryKind, goos, peerPath)
-	scopes := make([]string, len(base), len(base)+1)
+	scopes := make([]string, len(base), len(base)+3)
 	copy(scopes, base)
 	if role == ipc.HelperRoleUser && authReq.SupportsConsentUI {
 		scopes = append(scopes, ipc.ScopeConsentUIFallback)
 	}
+	// Endpoint messaging (#8293): per session, only for an Assist helper that
+	// advertised it — never part of the static assistHelperScopes.
+	if role == ipc.HelperRoleAssist && authReq.SupportsMessaging {
+		scopes = append(scopes, ipc.ScopeMessaging)
+	}
+	// Endpoint live chat (#8743): same shape, its own advertisement.
+	if role == ipc.HelperRoleAssist && authReq.SupportsChat {
+		scopes = append(scopes, ipc.ScopeChat)
+	}
+	// Prompt host (#10190): prompt / prompt_operator only for kinds this
+	// renderer advertised, filtered by role and copy class.
+	scopes = append(scopes, promptGrantFromAuth(role, authReq).scopes...)
 	return scopes
+}
+
+// consentProtocolFromAuth is the consent prompt exchange the agent will speak
+// with this helper. Only helpers that can be handed a consent prompt carry
+// one: the assist helper, and a user-role helper that advertised native
+// dialog support (the same condition grantScopes uses for
+// consent_ui_fallback). A future version clamps to the newest this agent
+// speaks — the helper replies in the form the request asks for.
+func consentProtocolFromAuth(role ipc.HelperRole, authReq ipc.AuthRequest) int {
+	switch {
+	case role == ipc.HelperRoleAssist:
+	case role == ipc.HelperRoleUser && authReq.SupportsConsentUI:
+	default:
+		return 0
+	}
+	v := authReq.ConsentProtocolVersion
+	if v < 2 {
+		return 0
+	}
+	if v > ipc.ConsentProtocolVersion {
+		return ipc.ConsentProtocolVersion
+	}
+	return v
+}
+
+// applyAuthAdvertisements records the optional protocol features a helper
+// advertised at auth onto its session. Set once, before the session is
+// registered, and never changed afterwards.
+func applyAuthAdvertisements(session *Session, role ipc.HelperRole, authReq ipc.AuthRequest) {
+	session.ConsentProtocolVersion = consentProtocolFromAuth(role, authReq)
+	session.SupportsTargetedPamDismiss = targetedPamDismissFromAuth(role, authReq)
+	session.SupportsPamDialogClose = pamDialogCloseFromAuth(role, authReq)
+	applyPromptGrant(session, promptGrantFromAuth(role, authReq))
+	session.uiLocale = uiLocaleFromAuth(authReq)
+}
+
+// targetedPamDismissFromAuth reports whether the agent may send this helper a
+// targeted consent dismissal. Only SYSTEM helpers dismiss consent.exe at all.
+func targetedPamDismissFromAuth(role ipc.HelperRole, authReq ipc.AuthRequest) bool {
+	return role == ipc.HelperRoleSystem && authReq.SupportsTargetedPamDismiss
+}
+
+// pamDialogCloseFromAuth reports whether the agent may send this helper
+// pam_close_dialog (#10370). Only SYSTEM helpers show the PAM dialog.
+func pamDialogCloseFromAuth(role ipc.HelperRole, authReq ipc.AuthRequest) bool {
+	return role == ipc.HelperRoleSystem && authReq.SupportsPamDialogClose
 }
 
 func (b *Broker) isDesktopHelperPeerPath(peerPath string) bool {
@@ -2779,7 +3051,7 @@ func (b *Broker) isDesktopHelperPeerPath(peerPath string) bool {
 		return false
 	}
 	peerResolved = normalizeBinaryPath(filepath.Clean(peerResolved))
-	for _, candidate := range b.allowedHelperPaths() {
+	for _, candidate := range b.helperPaths() {
 		if !strings.Contains(filepath.Base(candidate), "breeze-desktop-helper") {
 			continue
 		}
@@ -2792,6 +3064,15 @@ func (b *Broker) isDesktopHelperPeerPath(peerPath string) bool {
 		}
 	}
 	return false
+}
+
+// helperPaths returns the allowlisted helper binary paths, honouring the
+// helperPathsFn test seam.
+func (b *Broker) helperPaths() []string {
+	if b.helperPathsFn != nil {
+		return b.helperPathsFn()
+	}
+	return b.allowedHelperPaths()
 }
 
 func (b *Broker) allowedHelperPaths() []string {
@@ -2895,11 +3176,11 @@ func assistHelperBinaryPathsForOS(agentDir, goos, programFiles string) []string 
 }
 
 // RefreshAllowedHashes recomputes the helper binary hash allowlist from the
-// binaries currently present on disk. Call this after a dev push that
-// replaces a helper binary so the next connection from the newly spawned
-// helper (which will hash to a new value) is accepted.
-// RefreshAllowedHashes recomputes the helper binary hash allowlist from
-// disk and atomically swaps the broker's selfHashes map.
+// binaries currently present on disk. Call this after anything that installs
+// or replaces a binary at an allowlisted path (dev push, user-helper install,
+// Breeze Helper install/update) so the next connection from the new binary is
+// accepted. The recomputed set atomically replaces the broker's selfHashes
+// map.
 //
 // Returns the count of successfully-hashed binaries and a non-nil error if
 // the recompute produced zero hashes (every allowed path failed to hash,
@@ -2937,7 +3218,7 @@ func (b *Broker) HashAndVerifyAllowed(path string) (string, bool, error) {
 
 func (b *Broker) computeAllowedHashes() map[string]struct{} {
 	hashes := make(map[string]struct{})
-	for _, path := range b.allowedHelperPaths() {
+	for _, path := range b.helperPaths() {
 		sum, err := hashFileSHA256(path)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
@@ -2955,12 +3236,116 @@ func (b *Broker) computeAllowedHashes() map[string]struct{} {
 	return hashes
 }
 
+// helperBinaryInstallTrustedFn reports whether a helper binary's file and
+// directory can only be modified by administrators. It gates the on-miss
+// refresh in verifyPeerBinaryHash. Package-level so tests can substitute it.
+var helperBinaryInstallTrustedFn = helperBinaryInstallTrusted
+
 func (b *Broker) isAllowedBinaryHash(hash string) bool {
 	if hash == "" {
 		return false
 	}
+	b.mu.RLock()
 	_, ok := b.selfHashes[hash]
+	b.mu.RUnlock()
 	return ok
+}
+
+func (b *Broker) allowedHashCount() int {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return len(b.selfHashes)
+}
+
+func (b *Broker) allowedHashList() []string {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	out := make([]string, 0, len(b.selfHashes))
+	for h := range b.selfHashes {
+		out = append(out, h)
+	}
+	return out
+}
+
+// verifyPeerBinaryHash hashes the kernel-resolved peer binary and reports
+// whether that hash is in the allowlist. The returned hash is for logging.
+//
+// The allowlist is a snapshot of the files at the allowlisted paths, taken in
+// New() and on RefreshAllowedHashes. A binary installed or replaced after that
+// snapshot (the Breeze Helper MSI lands after the agent starts on a fresh
+// enrollment, and every helper update swaps the file) would otherwise be
+// rejected until the agent restarts (#7043). So on a miss from a peer whose
+// path is itself allowlisted, re-hash the allowlisted files once and re-check.
+//
+// This does not widen trust: the peer is accepted only if its bytes hash to
+// the current bytes of a file at an allowlisted (admin-owned) path, which is
+// exactly what the startup snapshot establishes. There is no path-only
+// acceptance. The refresh additionally requires the peer's binary and its
+// directory to be writable by administrators only (helperBinaryInstallTrustedFn).
+// The refresh is serialized and rate-limited so a peer that keeps failing
+// cannot force repeated full rehashing of the agent binaries.
+func (b *Broker) verifyPeerBinaryHash(peerPath string) (string, bool, error) {
+	peerHash, err := hashFileSHA256(peerPath)
+	if err != nil {
+		return "", false, err
+	}
+	if b.isAllowedBinaryHash(peerHash) {
+		return peerHash, true, nil
+	}
+	if !binaryPathMatchesAllowed(peerPath, b.helperPaths()) {
+		return peerHash, false, nil
+	}
+	// Refresh only when the binary and its directory can be changed by
+	// administrators alone (a per-machine install location). This is checked
+	// before the rate-limit slot is taken, so a peer in a looser location can
+	// neither trigger a rehash nor use up the window for a legitimate update.
+	resolved, err := filepath.EvalSymlinks(peerPath)
+	if err != nil {
+		return peerHash, false, nil
+	}
+	if err := helperBinaryInstallTrustedFn(resolved); err != nil {
+		log.Warn("helper binary changed since the allowlist was built, but its install location is not administrator-only; not refreshing",
+			"path", resolved,
+			"error", err.Error(),
+		)
+		return peerHash, false, nil
+	}
+	return peerHash, b.refreshAllowedHashesOnMiss(peerPath, peerHash), nil
+}
+
+// refreshAllowedHashesOnMiss re-hashes the allowlisted binaries at most once
+// per hashMissRefreshInterval and reports whether peerHash is allowed after.
+func (b *Broker) refreshAllowedHashesOnMiss(peerPath, peerHash string) bool {
+	b.hashRefreshMu.Lock()
+	defer b.hashRefreshMu.Unlock()
+	// Another connection may have refreshed while this one waited.
+	if b.isAllowedBinaryHash(peerHash) {
+		return true
+	}
+	now := b.now()
+	if !b.lastHashMissRefresh.IsZero() && now.Sub(b.lastHashMissRefresh) < hashMissRefreshInterval {
+		log.Info("helper hash miss at allowlisted path; allowlist refresh rate-limited, rejecting until the next window",
+			"path", peerPath,
+			"lastRefresh", b.lastHashMissRefresh,
+		)
+		return false
+	}
+	b.lastHashMissRefresh = now
+	count, err := b.RefreshAllowedHashes()
+	if err != nil {
+		log.Warn("helper hash miss at allowlisted path; allowlist refresh failed",
+			"path", peerPath,
+			"error", err.Error(),
+		)
+		return false
+	}
+	accepted := b.isAllowedBinaryHash(peerHash)
+	log.Info("helper hash miss at allowlisted path; refreshed allowlist from disk",
+		"path", peerPath,
+		"count", count,
+		"accepted", accepted,
+	)
+	return accepted
 }
 
 func hashFileSHA256(path string) (string, error) {
@@ -3016,6 +3401,7 @@ func (b *Broker) dispatchHelperMessage(s *Session, env *ipc.Envelope) {
 				"canCapture", sanitized.CanCapture,
 				"canClipboard", sanitized.CanClipboard,
 				"displayServer", sanitized.DisplayServer,
+				"callerVerify", sanitized.CallerVerify,
 			)
 		}
 	case ipc.TypeTCCStatus:
@@ -3033,10 +3419,13 @@ func (b *Broker) dispatchHelperMessage(s *Session, env *ipc.Envelope) {
 			log.Info("TCC permissions received",
 				"uid", s.UID,
 				"screenRecording", sanitized.ScreenRecording,
+				"screenRecordingState", sanitized.ScreenRecordingState,
 				"accessibility", sanitized.Accessibility,
 				"fullDiskAccess", sanitized.FullDiskAccess,
-				"remoteDesktop", sanitized.RemoteDesktop,
+				"remoteDesktop", boolPtrString(sanitized.RemoteDesktop),
+				"denialVerdict", sanitized.DenialVerdict,
 			)
+			b.forwardTCCStatus(s, *sanitized)
 		}
 	case ipc.TypeDisconnect:
 		log.Info("user helper disconnecting", "uid", s.UID, "sessionId", s.SessionID)
@@ -3089,7 +3478,8 @@ func (b *Broker) dispatchHelperMessage(s *Session, env *ipc.Envelope) {
 			b.onMessage(s, env)
 		}
 	case ipc.TypeTrayAction, ipc.TypeNotifyResult, ipc.TypeClipboardData, ipc.TypeCommandResult, ipc.TypeSASRequest, ipc.TypeDesktopPeerDisconnected,
-		ipc.TypeDesktopLeaseRenew, ipc.TypeDesktopStart, ipc.TypeDesktopStop, ipc.TypeLaunchResult:
+		ipc.TypeDesktopClipboardSummary, ipc.TypeDesktopLeaseRenew, ipc.TypeDesktopLocalICECandidate, ipc.TypeDesktopStart, ipc.TypeDesktopStop, ipc.TypeLaunchResult,
+		ipc.TypeDesktopClipboardRead:
 		if !shouldForwardUnsolicitedHelperMessage(s, env) {
 			log.Warn("dropping unsolicited or unauthorized helper message",
 				"type", env.Type, "sessionId", s.SessionID, "role", s.HelperRole)
@@ -3098,6 +3488,37 @@ func (b *Broker) dispatchHelperMessage(s *Session, env *ipc.Envelope) {
 		if b.onMessage != nil {
 			b.onMessage(s, env)
 		}
+	case ipc.TypeChatReply, ipc.TypeChatPresented:
+		// Endpoint live chat (#8743). A chat_presented answering a live
+		// chat_open/chat_message is matched to its waiter before dispatch;
+		// reaching here means a replay or a user reply.
+		if !shouldForwardUnsolicitedHelperMessage(s, env) {
+			log.Warn("dropping chat event from a session without chat scope",
+				"type", env.Type, "sessionId", s.SessionID, "role", s.HelperRole)
+			return
+		}
+		if b.onMessage != nil {
+			b.onMessage(s, env)
+		}
+	case ipc.TypeMessagePresented, ipc.TypeMessageAck, ipc.TypeMessageDismissed:
+		// Endpoint messaging (#8293). A message_presented that answers a live
+		// message_show is matched to its waiter before dispatch; reaching here
+		// means a replayed card or a later user action.
+		if !shouldForwardUnsolicitedHelperMessage(s, env) {
+			log.Warn("dropping message event from a session without messaging scope",
+				"type", env.Type, "sessionId", s.SessionID, "role", s.HelperRole)
+			return
+		}
+		if b.onMessage != nil {
+			b.onMessage(s, env)
+		}
+	case ipc.TypeHelperLog:
+		// Any authenticated helper may relay its own warn+ lines; the record
+		// is sanitized and rate-capped per session (#9266).
+		b.relayHelperLog(s, env)
+	case ipc.TypePromptPresented, ipc.TypePromptAction, ipc.TypePromptClosed:
+		// Prompt host (#10190): only from a session holding a prompt scope.
+		b.dispatchPromptMessage(s, env)
 	default:
 		log.Warn("unknown message type from helper, ignoring",
 			"type", env.Type, "identity", s.IdentityKey, "sessionId", s.SessionID)
@@ -3285,10 +3706,17 @@ func shouldForwardUnsolicitedHelperMessage(session *Session, env *ipc.Envelope) 
 		return session.HasScope("backup")
 	case ipc.TypeTrayAction:
 		return session.HasScope("tray")
-	case ipc.TypeSASRequest, ipc.TypeDesktopPeerDisconnected, ipc.TypeDesktopLeaseRenew:
+	case ipc.TypeSASRequest, ipc.TypeDesktopPeerDisconnected, ipc.TypeDesktopClipboardSummary, ipc.TypeDesktopLeaseRenew,
+		ipc.TypeDesktopLocalICECandidate, ipc.TypeDesktopClipboardRead:
 		return session.HasScope("desktop")
 	case ipc.TypeWatchdogCommandResult:
 		return session.HasScope("watchdog")
+	case ipc.TypeMessagePresented, ipc.TypeMessageAck, ipc.TypeMessageDismissed:
+		return session.HasScope(ipc.ScopeMessaging)
+	case ipc.TypeChatReply, ipc.TypeChatPresented:
+		return session.HasScope(ipc.ScopeChat)
+	case ipc.TypePromptPresented, ipc.TypePromptAction, ipc.TypePromptClosed:
+		return session.HasPromptScope()
 	case ipc.TypeNotifyResult, ipc.TypeClipboardData, ipc.TypeCommandResult:
 		return false
 	default:
@@ -3317,6 +3745,11 @@ func sanitizeCapabilitiesForSession(session *Session, caps *ipc.Capabilities) *i
 	if !session.HasScope("clipboard") {
 		sanitized.CanClipboard = false
 	}
+	// Caller verification (#6354 W02) is rendered only by the Assist helper
+	// that also owns the consent prompt; a native helper never qualifies.
+	if session.HelperRole != ipc.HelperRoleAssist || !session.HasScope(ipc.ScopeConsentUI) {
+		sanitized.CallerVerify = false
+	}
 	return &sanitized
 }
 
@@ -3337,4 +3770,10 @@ func truncateSessionString(value string, max int) string {
 		return value
 	}
 	return strings.TrimSpace(value[:max]) + "... [truncated]"
+}
+
+// BroadcastNotifyUndeliveredCount returns how many broadcast notifications a
+// helper answered with Delivered=false since the broker started.
+func (b *Broker) BroadcastNotifyUndeliveredCount() uint64 {
+	return b.broadcastNotifyUndelivered.Load()
 }

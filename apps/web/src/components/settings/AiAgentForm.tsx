@@ -23,6 +23,8 @@ import AiAgentSchedulesSection from './AiAgentSchedulesSection';
 import AiAgentGraduationPanel from './AiAgentGraduationPanel';
 import { useAgentToolCatalog } from './aiAgents/useAgentToolCatalog';
 import ModeChoice from './aiAgents/ModeChoice';
+import ResearchAgentFields from './aiAgents/ResearchAgentFields';
+import AgentModelSelect from './aiAgents/AgentModelSelect';
 import { useAgentFormLists } from './aiAgents/useAgentFormLists';
 import { AGENT_ERROR_COPY, agentSaveIssuesFromError } from './aiAgents/agentErrors';
 import WhatItDoesStep from './aiAgents/steps/WhatItDoesStep';
@@ -312,6 +314,9 @@ export default function AiAgentForm({
     ? 0
     : authorizedScriptCountFor(draft, ceiling);
 
+  const isResearch = draft.kind === 'research';
+  const isTroubleshoot = draft.kind === 'troubleshoot';
+
   return (
     <div className="flex min-h-0 flex-1 flex-col" data-testid="ai-agent-editor">
       <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-5">
@@ -327,7 +332,7 @@ export default function AiAgentForm({
         )}
 
         <div className="grid gap-3 md:grid-cols-2">
-          {modeChoice}
+          {!isResearch && !isTroubleshoot && modeChoice}
 
           {/* `kind` and `ownerScope` are create-only (see the module doc) —
               this form only ever edits, so both render as fixed rather than
@@ -402,10 +407,18 @@ export default function AiAgentForm({
               <span className="font-medium">{t('aiAgentsPage.fields.enabled')}</span>
             </label>
             <p className="pl-6 text-xs text-muted-foreground" data-testid="ai-agent-enabled-hint">
-              {t('aiAgentsPage.fields.enabledHint')}
+              {isResearch || isTroubleshoot
+                ? t('aiAgentsPage.fields.enabledHintNoMode')
+                : t('aiAgentsPage.fields.enabledHint')}
             </p>
           </div>
 
+          {/* AI Suggested Fixes W2: the built-in research agent is name, the
+              enabled switch and its spending caps — nothing else is editable
+              (server: assertResearchAgentEdit), so nothing else renders. */}
+          {isTroubleshoot ? null : isResearch ? (
+            <ResearchAgentFields draft={draft} patch={patch} />
+          ) : (<>
           {/* Graduation evidence (P2-5, #4192). NOT gated on `draft.mode ===
               'act'` — evidence an agent already earned is a fact about the
               past, so toggling the draft back to shadow must not make it
@@ -476,6 +489,12 @@ export default function AiAgentForm({
             />
           )}
 
+          <AgentModelSelect
+            orgId={draft.ownerScope === 'partner' ? null : (agent.orgId ?? orgScope.orgId)}
+            value={draft.offeringId}
+            onChange={(offeringId) => patch({ offeringId, offeringIdTouched: true })}
+          />
+
           <fieldset className="space-y-2 rounded-md border p-3 md:col-span-2">
             <legend className="px-1 text-xs font-medium uppercase text-muted-foreground">
               {t('aiAgentsPage.sections.instructions')}
@@ -493,6 +512,7 @@ export default function AiAgentForm({
               {t('aiAgentsPage.fields.charactersLeft', { count: INSTRUCTIONS_MAX - draft.instructions.length })}
             </p>
           </fieldset>
+          </>)}
         </div>
       </div>
 

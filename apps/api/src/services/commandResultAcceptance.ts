@@ -1,6 +1,10 @@
 import { and, eq, inArray, notInArray, or, sql, type SQL } from 'drizzle-orm';
 import { deviceCommands } from '../db/schema';
 import { CommandTypes, QUEUED_BACKUP_WORKLOAD_COMMAND_TYPES } from './commandTypes';
+import {
+  commandIncarnationAcceptedForCallerCondition,
+  type CommandCallerIncarnation,
+} from './commandIncarnation';
 
 /**
  * Types excluded from the #3607 provisional-timeout reopen below. A
@@ -76,30 +80,101 @@ export const SERVER_TIMEOUT_RESULT_STATUS = 'timeout';
 export const BACKUP_QUEUE_ACK_RESULT_STATUS = 'queue_ack';
 
 /**
+ * #3530 — marker written into `device_commands.result.status` when the agent's
+ * result reached the server but its per-type persistence (script_executions,
+ * backup verification, restore job, CIS/sensitive-data findings, …) failed.
+ *
+ * Both ingest transports now run the terminal compare-and-set in the SAME
+ * transaction as that persistence, so a failure rolls the CAS back; the row is
+ * then parked as top-level `status: 'failed'` (the history never claims
+ * "completed" for a result that was not recorded) with this marker, which
+ * keeps it reopenable exactly like {@link SERVER_TIMEOUT_RESULT_STATUS}: a
+ * resubmitted result is accepted and reprocessed instead of being
+ * short-circuited as a duplicate.
+ *
+ * `processingFailedAt` is the server-only stamp — the analogue of `timedOutBy`.
+ * `buildStoredCommandResult` never copies it from an agent payload, and the
+ * agent schema cannot report this status value, so an agent cannot mint a
+ * reopenable row on its own. Written only by
+ * `services/commandResultProcessingFailure.ts`.
+ */
+export const RESULT_PROCESSING_FAILED_RESULT_STATUS = 'result_processing_failed';
+
+/**
+ * Types a {@link RESULT_PROCESSING_FAILED_RESULT_STATUS} row is parked for but
+ * NOT reopened for — their command row must never be rewritten once terminal:
+ * - `network_diagnostic`: the same lapsed-plan-authority reason as
+ *   {@link TIMEOUT_REOPEN_EXCLUDED_COMMAND_TYPES}.
+ * - PAM v2 actuation: late evidence for a terminal PAM command enters only the
+ *   frozen PAM result transaction (routes/agents/commands.ts), never the
+ *   command-row CAS. Reopening would route a resubmission around it.
+ * The row still parks as `failed` (honest history); it just stays final.
+ */
+export const RESULT_PROCESSING_FAILED_REOPEN_EXCLUDED_COMMAND_TYPES = [
+  ...TIMEOUT_REOPEN_EXCLUDED_COMMAND_TYPES,
+  'pam_apply_v2',
+  'pam_cleanup_v2',
+] as const;
+
+/**
  * Drizzle predicate for "this row may still accept an agent result".
  *
  * Use it in BOTH the ingest lookup and the terminal compare-and-set. Applying
  * it only at the CAS does nothing: the lookup runs first and returns no row.
+ *
+ * #8318 §4.2/§5.2/§6.4: every branch, the three reopen paths included, also
+ * requires the row's stamp to equal BOTH the device's CURRENT install
+ * incarnation AND the incarnation the caller authenticated under, read in the
+ * same statement. A result for work queued to an earlier install (a server
+ * timeout, a backup queue-ack or a processing failure the old install could
+ * otherwise reopen, or a replayed outbox) is refused, and so is a result from
+ * a caller that authenticated before a reattach confirm for a row enqueued
+ * after it.
  */
-export function commandAcceptsAgentResultCondition(): SQL {
+export function commandAcceptsAgentResultCondition(caller: CommandCallerIncarnation): SQL {
+  return and(commandIncarnationAcceptedForCallerCondition(caller), commandAcceptsAgentResultStatusCondition())!;
+}
+
+/** The status half of {@link commandAcceptsAgentResultCondition}, without the incarnation check. */
+function commandAcceptsAgentResultStatusCondition(): SQL {
   return or(
     inArray(deviceCommands.status, [...ACCEPTED_COMMAND_RESULT_STATUSES]),
     and(
       eq(deviceCommands.status, 'failed'),
       notInArray(deviceCommands.type, [...TIMEOUT_REOPEN_EXCLUDED_COMMAND_TYPES]),
       sql`${deviceCommands.result}->>'status' = ${SERVER_TIMEOUT_RESULT_STATUS}`,
+      // `timedOutBy` is stamped ONLY by the server-side writers (the wait
+      // deadline, the stale reaper, the verification-timeout check) — never
+      // by buildStoredCommandResult, which copies just status/exitCode/
+      // stdout/stderr/durationMs/error from the agent's own payload. Without
+      // this an agent could report its OWN `status:'timeout'` (a value the
+      // commandResultSchema allows) and produce a row indistinguishable from
+      // a genuine server timeout, then send a second, later frame that this
+      // same predicate would accept as a "rescued" result — reopening a row
+      // the agent itself chose to leave reopenable.
+      sql`${deviceCommands.result}->>'timedOutBy' IS NOT NULL`,
     ),
     and(
       eq(deviceCommands.status, 'completed'),
       inArray(deviceCommands.type, [...QUEUED_BACKUP_WORKLOAD_COMMAND_TYPES]),
       sql`${deviceCommands.result}->>'status' = ${BACKUP_QUEUE_ACK_RESULT_STATUS}`,
     ),
+    and(
+      eq(deviceCommands.status, 'failed'),
+      notInArray(deviceCommands.type, [...RESULT_PROCESSING_FAILED_REOPEN_EXCLUDED_COMMAND_TYPES]),
+      sql`${deviceCommands.result}->>'status' = ${RESULT_PROCESSING_FAILED_RESULT_STATUS}`,
+      sql`${deviceCommands.result}->>'processingFailedAt' IS NOT NULL`,
+    ),
   )!;
 }
 
 /**
  * In-memory twin of {@link commandAcceptsAgentResultCondition}, for the REST
- * route's pre-read short-circuit which already holds the row.
+ * route's pre-read short-circuit which already holds the row. It covers the
+ * status half only: the incarnation half needs the device's current
+ * incarnation, which the callers read with the row
+ * (`commandIncarnationIsCurrentCondition`) and the caller's own
+ * (`commandStampMatchesCaller`), and check first.
  *
  * `type` is optional so every existing call keeps its old (pre-D20) meaning
  * when omitted — the queue-ack branch never fires without it, matching the
@@ -112,10 +187,13 @@ export function commandAcceptsAgentResult(
 ): boolean {
   if (!status) return true;
   if ((ACCEPTED_COMMAND_RESULT_STATUSES as readonly string[]).includes(status)) return true;
-  const resultStatus = (result as Record<string, unknown> | null | undefined)?.status;
+  const resultRecord = result as Record<string, unknown> | null | undefined;
+  const resultStatus = resultRecord?.status;
   if (
     status === 'failed' &&
     resultStatus === SERVER_TIMEOUT_RESULT_STATUS &&
+    // See the SQL twin: only a server-side writer ever sets this key.
+    resultRecord?.timedOutBy != null &&
     !(TIMEOUT_REOPEN_EXCLUDED_COMMAND_TYPES as readonly string[]).includes(type ?? '')
   ) {
     return true;
@@ -128,5 +206,36 @@ export function commandAcceptsAgentResult(
   ) {
     return true;
   }
+  if (
+    status === 'failed' &&
+    resultStatus === RESULT_PROCESSING_FAILED_RESULT_STATUS &&
+    // See the SQL twin: only markCommandResultProcessingFailed sets this key.
+    resultRecord?.processingFailedAt != null &&
+    !(RESULT_PROCESSING_FAILED_REOPEN_EXCLUDED_COMMAND_TYPES as readonly string[]).includes(type ?? '')
+  ) {
+    return true;
+  }
   return false;
+}
+
+/**
+ * `status: 'timeout'` is a value `commandResultSchema` lets the AGENT report
+ * for its own run's outcome — and it is also the literal string
+ * {@link SERVER_TIMEOUT_RESULT_STATUS} the server writes to mark a row
+ * reopenable after ITS OWN timeout. Storing the agent's value verbatim made
+ * the two indistinguishable by that string alone (the `timedOutBy` marker
+ * above closes that), and separately mislabels a definite agent-side failure
+ * as some other, ambiguous state — several readers already treat
+ * `result.status === 'timeout'` as "not really finished yet" for UX purposes
+ * that only make sense for the server's own provisional marker.
+ *
+ * Both `buildStoredCommandResult` implementations (agentWs.ts's WS ingest and
+ * agents/commands.ts's REST twin) call this before persisting the agent's
+ * reported status, so an agent can never itself produce the literal value the
+ * reopen predicate keys on.
+ */
+export function collapseAgentReportedTimeoutStatus(
+  status: 'completed' | 'failed' | 'timeout',
+): 'completed' | 'failed' {
+  return status === 'timeout' ? 'failed' : status;
 }

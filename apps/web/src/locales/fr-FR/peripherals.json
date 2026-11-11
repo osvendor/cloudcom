@@ -31,7 +31,8 @@
       "policy": "Politique"
     },
     "pagination": "Affichage de {{from}} à {{to}} sur {{total}}",
-    "prev": "Précédent"
+    "prev": "Précédent",
+    "eventFilterLabel": "Type d'événement"
   },
   "peripheralPoliciesList": {
     "errors": {
@@ -62,7 +63,10 @@
       "created": "Création"
     },
     "partnerWideTitle": "Politique à l’échelle des partenaires — appliquée sur les appareils de chaque organisation",
-    "allOrgs": "À l’échelle du partenaire"
+    "allOrgs": "À l’échelle du partenaire",
+    "classFilterLabel": "Classe d'appareil",
+    "actionFilterLabel": "Type d'action",
+    "statusFilterLabel": "État"
   },
   "peripheralPolicyForm": {
     "errors": {
@@ -75,6 +79,14 @@
     "allOrganizations": "Toutes les organisations",
     "partnerWide": "(politique à l’échelle des partenaires)",
     "thisOrganization": "Cette organisation uniquement",
+    "appliesTo": "S'applique à",
+    "targets": {
+      "organization": "Tous les dispositifs",
+      "site": "Sites spécifiques ({{total}})",
+      "group": "Groupes de dispositifs spécifiques ({{total}})",
+      "device": "Dispositifs spécifiques ({{total}})"
+    },
+    "targetReadOnlyHint": "Les cibles ne peuvent pas être modifiées dans ce formulaire. L'enregistrement conserve les cibles actuelles.",
     "deviceClass": "Classe de dispositifs",
     "classes": {
       "storage": "Stockage",
@@ -98,7 +110,12 @@
     "serialNumber": "Numéro de série",
     "allow": "Autoriser :",
     "reason": "Raison",
+    "expiresAt": "Expire (votre heure locale)",
     "updatePolicy": "Mise à jour de la politique",
-    "createPolicy": "Créer une politique"
+    "createPolicy": "Créer une politique",
+    "saved": {
+      "created": "Politique créée",
+      "updated": "Politique mise à jour"
+    }
   }
 }

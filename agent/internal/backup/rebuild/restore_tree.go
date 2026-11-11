@@ -11,6 +11,7 @@ import (
 
 	"github.com/breeze-rmm/agent/internal/backup"
 	"github.com/breeze-rmm/agent/internal/backup/bmr"
+	"github.com/breeze-rmm/agent/internal/backup/integrity"
 )
 
 // mountTree mounts every planned partition with a mount point under the
@@ -68,42 +69,20 @@ func restoreTree(ctx context.Context, r *run) error {
 	if err := os.MkdirAll(workRoot, 0o700); err != nil {
 		return fmt.Errorf("create restore work root: %w", err)
 	}
-	res, err := backup.RestoreFromSnapshotContext(ctx, r.opts.Provider, backup.RestoreConfig{SnapshotID: r.opts.SnapshotID, TargetPath: r.staging, WorkRoot: workRoot}, func(phase string, cur, total int64, msg string) {
+	res, err := restoreSnapshotFiles(ctx, r.opts.Provider, backup.RestoreConfig{SnapshotID: r.opts.SnapshotID, TargetPath: r.staging, WorkRoot: workRoot, Integrity: r.opts.Integrity}, func(phase string, cur, total int64, msg string) {
 		r.progress(PhaseRestore, msg, cur, total)
 	})
 	if err != nil {
 		return fmt.Errorf("restore files: %w", err)
 	}
-	r.result.FilesRestored, r.result.BytesRestored = res.FilesRestored, res.BytesRestored
-	r.warnings = append(r.warnings, res.Warnings...)
-	if res.FilesFailed > 0 {
-		// The internal failedFiles map is never truncated — validate.go
-		// (which consumes it) must see every failed source path even
-		// though the reported message/sample below is bounded.
-		r.failedFiles = make(map[string]bool, len(res.FailedFiles))
-		for _, f := range res.FailedFiles {
-			r.failedFiles[f] = true
-		}
-
-		const maxFailedFilesSample = 50
-		sample := make([]string, 0, len(r.failedFiles))
-		for f := range r.failedFiles {
-			sample = append(sample, f)
-		}
-		sort.Strings(sample) // deterministic "first N" — map iteration order is not
-		r.result.FilesFailed = len(sample)
-		if len(sample) > maxFailedFilesSample {
-			r.result.FailedFilesSample = sample[:maxFailedFilesSample]
-			r.result.FailedFilesOmitted = len(sample) - maxFailedFilesSample
-		} else {
-			r.result.FailedFilesSample = sample
-		}
-
-		msg := fmt.Sprintf("%d file(s) failed to restore (first %d shown): %s", len(sample), len(r.result.FailedFilesSample), strings.Join(r.result.FailedFilesSample, ", "))
-		r.warn("%s", msg)
-		if !r.opts.AllowPartialRestore {
-			return errors.New(msg)
-		}
+	// Record the counts first so an interrupted restore still reports how
+	// far it got; the interruption, when there is one, is the phase error.
+	recordErr := r.recordRestoreFailures(res)
+	if err := restoreInterrupted(ctx, res); err != nil {
+		return err
+	}
+	if recordErr != nil {
+		return recordErr
 	}
 	// Belt-and-braces (#5493): run this even when boot() will be skipped
 	// (Options.SkipBoot) — boot() is the phase that actually bind-mounts
@@ -136,6 +115,91 @@ func restoreTree(ctx context.Context, r *run) error {
 	return nil
 }
 
+// restoreInterrupted fails the restore phase when the file restore stopped
+// early because ctx ended: RestoreFromSnapshotContext then returns its
+// partial result with a nil error, and without this check the phase would
+// be recorded completed, so a resumed run would skip the files that were
+// never restored (#6664). A result the restore itself marked "completed"
+// is trusted: it checks ctx before declaring completion, so a ctx that
+// ends afterwards (during its staging cleanup) did not cut anything short.
+// Shared by restoreTree and winRestoreTree.
+func restoreInterrupted(ctx context.Context, res *backup.RestoreResult) error {
+	if ctx.Err() == nil || (res != nil && res.Status == "completed") {
+		return nil
+	}
+	restored := 0
+	if res != nil {
+		restored = res.FilesRestored
+	}
+	return fmt.Errorf("restore files interrupted after %d files: %w", restored, context.Cause(ctx))
+}
+
 // restoreWorkRoot is where the restore keeps its resume state and manifest
 // scratch between engine runs. Removed by Run once the rebuild completes.
 func restoreWorkRoot(stateDir string) string { return filepath.Join(stateDir, "work") }
+
+// recordRestoreFailures copies a file restore's counts and warnings into the
+// result and, when files failed, records them for validate and in the
+// result; without AllowPartialRestore any failure is the phase's error.
+// Shared by the Linux restoreTree and the Windows winRestoreTree.
+func (r *run) recordRestoreFailures(res *backup.RestoreResult) error {
+	r.result.FilesRestored, r.result.BytesRestored = res.FilesRestored, res.BytesRestored
+	r.appendRestoreWarnings(res.Warnings)
+	if res.FilesFailed == 0 {
+		return nil
+	}
+	// The internal failedFiles map is never truncated — validate.go
+	// (which consumes it) must see every failed source path even
+	// though the reported message/sample below is bounded.
+	r.failedFiles = make(map[string]bool, len(res.FailedFiles))
+	for _, f := range res.FailedFiles {
+		r.failedFiles[f] = true
+	}
+
+	const maxFailedFilesSample = 50
+	sample := make([]string, 0, len(r.failedFiles))
+	for f := range r.failedFiles {
+		sample = append(sample, f)
+	}
+	sort.Strings(sample) // deterministic "first N" — map iteration order is not
+	r.result.FilesFailed = len(sample)
+	if len(sample) > maxFailedFilesSample {
+		r.result.FailedFilesSample = sample[:maxFailedFilesSample]
+		r.result.FailedFilesOmitted = len(sample) - maxFailedFilesSample
+	} else {
+		r.result.FailedFilesSample = sample
+	}
+
+	msg := fmt.Sprintf("%d file(s) failed to restore (first %d shown): %s", len(sample), len(r.result.FailedFilesSample), strings.Join(r.result.FailedFilesSample, ", "))
+	r.warn("%s", msg)
+	if !r.opts.AllowPartialRestore {
+		return errors.New(msg)
+	}
+	return nil
+}
+
+// restoreSnapshotFiles is backup.RestoreFromSnapshotContext; a var so tests
+// can observe the RestoreConfig the engine hands the file restore.
+var restoreSnapshotFiles = backup.RestoreFromSnapshotContext
+
+// appendRestoreWarnings appends a file restore's warnings, dropping the
+// unattested-snapshot warning when the run already carries it, so a result
+// states it once.
+func (r *run) appendRestoreWarnings(ws []string) {
+	have := false
+	for _, w := range r.warnings {
+		if w == integrity.UnattestedRestoreWarning {
+			have = true
+			break
+		}
+	}
+	for _, w := range ws {
+		if w == integrity.UnattestedRestoreWarning {
+			if have {
+				continue
+			}
+			have = true
+		}
+		r.warnings = append(r.warnings, w)
+	}
+}

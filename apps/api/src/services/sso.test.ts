@@ -8,7 +8,6 @@ import {
   idpAssertedMfa,
   buildAuthorizationUrl,
   assertFreshIdpAuthentication,
-  utcMsFromOffsetlessTimestamp,
   discoverOIDCConfig,
   isInternalUrl,
   assertSafeOidcEndpoint,
@@ -25,7 +24,6 @@ import {
 import { createRemoteJWKSet, customFetch } from 'jose';
 import { safeFetch, SsrfBlockedError } from './urlSafety';
 import { assertOutsideHeldDbContext } from '../db';
-import { pgOffsetlessTimestamp } from '../testUtils/pgOffsetlessTimestamp';
 
 // SR2-13/14: mock the outbound-HTTP + jose transport so the SSRF-safe wiring
 // can be asserted without a network. `safeFetch` DEFAULTS to the real
@@ -58,6 +56,37 @@ describe('idpAssertedMfa (security review #2 H-1)', () => {
     expect(idpAssertedMfa({})).toBe(false);
     // A non-array amr (malformed) must not be trusted.
     expect(idpAssertedMfa({ amr: 'mfa' as unknown as string[] })).toBe(false);
+  });
+
+  // #6137: RFC 8176 `phr` (phishing-resistant, e.g. a passkey / WebAuthn
+  // login — what Pocket ID asserts) also satisfies trusted upstream MFA.
+  it('is true when amr contains the RFC 8176 "phr" reference (#6137)', () => {
+    expect(idpAssertedMfa({ amr: ['phr'] })).toBe(true);
+    expect(idpAssertedMfa({ amr: ['hwk', 'phr'] })).toBe(true);
+    expect(idpAssertedMfa({ amr: ['phr', 'mfa'] })).toBe(true);
+  });
+
+  // Only `mfa` and `phr` are accepted — no other relaxation. Single-factor
+  // method references (even hardware-bound ones), the distinct `phrh` value,
+  // case variants and near-misses all stay rejected.
+  it.each([
+    [['phrh']],
+    [['PHR']],
+    [['MFA']],
+    [[' phr']],
+    [['hwk']],
+    [['swk']],
+    [['otp']],
+    [['fido']],
+    [['user', 'pin']],
+    [['pwd', 'otp']],
+    [['phishing-resistant']],
+  ])('is false for amr %j (#6137 — no other relaxation)', (amr) => {
+    expect(idpAssertedMfa({ amr })).toBe(false);
+  });
+
+  it('is false for a non-array amr carrying "phr" (#6137)', () => {
+    expect(idpAssertedMfa({ amr: 'phr' as unknown as string[] })).toBe(false);
   });
 });
 
@@ -632,39 +661,6 @@ describe('buildAuthorizationUrl re-auth params', () => {
   });
 });
 
-/**
- * The Date postgres.js hands back for a `timestamp without time zone` column on
- * a host whose UTC offset is `offsetMinutes`, using Date's own sign convention
- * (positive = WEST of UTC, e.g. 360 for America/Denver in summer; negative =
- * east, e.g. -120 for Europe/Berlin in summer).
- *
- * This exists because {@link pgOffsetlessTimestamp} — faithful as it is — is
- * WORTHLESS as a regression guard on a UTC runner, and CI runners are UTC. With
- * offset 0, `utcMsFromOffsetlessTimestamp(d)` and `d.getTime()` are the same
- * number, so every arithmetic assertion about the conversion passes whether or
- * not the conversion exists. Overriding `getTimezoneOffset` simulates a non-UTC
- * host regardless of the real one, so these tests have identical teeth under
- * TZ=UTC and TZ=America/Denver.
- */
-function offsetlessTimestampFromHostAt(trueUtcMs: number, offsetMinutes: number): Date {
-  // Postgres emits the UTC wall clock; a host `offsetMinutes` west of UTC reads
-  // that wall clock as a local time that is `offsetMinutes` later in real terms.
-  const naive = new Date(trueUtcMs + offsetMinutes * 60_000);
-  Object.defineProperty(naive, 'getTimezoneOffset', {
-    value: () => offsetMinutes,
-    configurable: true,
-  });
-  return naive;
-}
-
-const SIMULATED_HOSTS = [
-  { label: 'UTC', offsetMinutes: 0 },
-  { label: 'America/Denver (west of UTC, MDT)', offsetMinutes: 360 },
-  { label: 'America/Los_Angeles (west of UTC, PDT)', offsetMinutes: 420 },
-  { label: 'Europe/Berlin (east of UTC, CEST)', offsetMinutes: -120 },
-  { label: 'Asia/Kathmandu (east of UTC, :45 offset)', offsetMinutes: -345 },
-];
-
 describe('assertFreshIdpAuthentication', () => {
   const NOW = 1_800_000_000_000;        // fixed clock, ms
   const STARTED = NOW - 30_000;         // transaction began 30s ago
@@ -704,85 +700,271 @@ describe('assertFreshIdpAuthentication', () => {
     expect(assertFreshIdpAuthentication({ iat: Math.floor(NOW / 1000) } as any, STARTED, NOW))
       .toEqual({ ok: false, reason: 'auth_time_missing' });
   });
-
-  // The bound above is only meaningful if `startedAtMs` is a TRUE epoch. Every
-  // test in this describe hands one in as a plain number, which is exactly how
-  // the timezone defect below stayed invisible: the route derives that number
-  // from a `timestamp without time zone` column, and these tests never exercise
-  // that derivation.
-  describe('the startedAtMs bound, as the route actually derives it', () => {
-    // sso_sessions.created_at as postgres.js really returns it.
-    const sessionStartedAt = pgOffsetlessTimestamp(STARTED);
-
-    it('accepts an auth_time from during the round trip, in ANY host timezone', () => {
-      const during = Math.floor(STARTED / 1000) + 5;
-      expect(assertFreshIdpAuthentication(
-        { auth_time: during },
-        utcMsFromOffsetlessTimestamp(sessionStartedAt),
-        NOW,
-      )).toEqual({ ok: true });
-    });
-
-    it('still rejects a cached-session auth_time from before the click, in ANY host timezone', () => {
-      const beforeStart = Math.floor(STARTED / 1000) - 121;
-      expect(assertFreshIdpAuthentication(
-        { auth_time: beforeStart },
-        utcMsFromOffsetlessTimestamp(sessionStartedAt),
-        NOW,
-      )).toEqual({ ok: false, reason: 'auth_time_stale' });
-    });
-
-    // Pins the two failure modes a bare `.getTime()` produces, so a revert
-    // cannot pass by loosening one direction. West of UTC the naive bound lands
-    // in the FUTURE and every attempt is stale (feature dead on arrival); east
-    // of UTC it slides into the PAST and a cached IdP session that old is
-    // accepted as fresh — a real weakening of the only control this feature has.
-    //
-    // Written against SIMULATED host offsets, not the runner's own: on a UTC
-    // runner the real offset is 0 and this whole contract collapses to `x === x`.
-    it('a bare .getTime() bound is dead on arrival west of UTC and permissive east of it', () => {
-      const during = Math.floor(STARTED / 1000) + 5;
-      const cachedAnHourBeforeTheClick = Math.floor(STARTED / 1000) - 3600;
-
-      // West (UTC-6): naive bound is 6h in the future, so a genuine
-      // during-the-round-trip auth_time reads stale — 100% of attempts fail.
-      const west = offsetlessTimestampFromHostAt(STARTED, 360);
-      expect(assertFreshIdpAuthentication({ auth_time: during }, west.getTime(), NOW))
-        .toEqual({ ok: false, reason: 'auth_time_stale' });
-      expect(assertFreshIdpAuthentication({ auth_time: during }, utcMsFromOffsetlessTimestamp(west), NOW))
-        .toEqual({ ok: true });
-
-      // East (UTC+2): naive bound is 2h in the past, so an IdP session cached an
-      // hour BEFORE the click is waved through as a fresh re-authentication.
-      const east = offsetlessTimestampFromHostAt(STARTED, -120);
-      expect(assertFreshIdpAuthentication({ auth_time: cachedAnHourBeforeTheClick }, east.getTime(), NOW))
-        .toEqual({ ok: true });
-      expect(assertFreshIdpAuthentication({ auth_time: cachedAnHourBeforeTheClick }, utcMsFromOffsetlessTimestamp(east), NOW))
-        .toEqual({ ok: false, reason: 'auth_time_stale' });
-    });
-  });
 });
 
-describe('utcMsFromOffsetlessTimestamp', () => {
-  it('round-trips an offsetless DB timestamp back to its true epoch', () => {
-    const instant = Date.UTC(2026, 7, 25, 18, 34, 15, 123);
-    expect(utcMsFromOffsetlessTimestamp(pgOffsetlessTimestamp(instant))).toBe(instant);
+// #8862: Microsoft Entra answers a `max_age=0` re-auth with an id_token whose
+// `iat` is backdated ~5 minutes and whose `exp` lands a few seconds after
+// `auth_time`, so it arrives already expired. Re-auth verification therefore
+// takes a bounded clock tolerance; login and link verification stay strict.
+// These run against REAL signatures from a locally generated key pair.
+describe('verifyIdTokenSignature clock tolerance + diagnostics (#8862)', () => {
+  const config: OIDCConfig = {
+    issuer: 'https://login.example.com/tenant/v2.0',
+    clientId: 'client-8862',
+    clientSecret: 'secret',
+    authorizationUrl: 'https://login.example.com/authorize',
+    tokenUrl: 'https://login.example.com/token',
+    userInfoUrl: 'https://login.example.com/userinfo',
+    jwksUrl: 'https://login.example.com/keys',
+    scopes: 'openid profile email'
+  };
+  const NONCE = 'nonce-8862';
+  let privateKey: CryptoKey;
+  let publicKey: CryptoKey;
+
+  const nowSec = () => Math.floor(Date.now() / 1000);
+
+  async function sign(claims: Record<string, unknown>, key: CryptoKey = privateKey): Promise<string> {
+    const { SignJWT } = await vi.importActual<typeof import('jose')>('jose');
+    return new SignJWT({ nonce: NONCE, email: 'tech@acme.example', ...claims })
+      .setProtectedHeader({ alg: 'RS256', kid: 'k1' })
+      .setIssuer(config.issuer)
+      .setAudience(config.clientId)
+      .setSubject('external-sub-8862')
+      .sign(key);
+  }
+
+  // Entra's max_age=0 shape: iat backdated 5 minutes, exp `expAgo` seconds in
+  // the past, auth_time a second ago.
+  const entraReauthClaims = (expAgo: number) => {
+    const now = nowSec();
+    return { iat: now - 300, nbf: now - 300, exp: now - expAgo, auth_time: now - 1 };
+  };
+
+  beforeEach(async () => {
+    const { generateKeyPair } = await vi.importActual<typeof import('jose')>('jose');
+    ({ privateKey, publicKey } = await generateKeyPair('RS256'));
+    _resetIdTokenJwksCacheForTests();
+    vi.mocked(createRemoteJWKSet).mockImplementation((() => async () => publicKey) as any);
   });
 
-  // The row that actually guards the conversion. The UTC row documents WHY this
-  // defect reached production green (the conversion is a no-op there); every
-  // other row fails if the offset subtraction is removed, so the suite has teeth
-  // on a UTC CI runner and on a US developer's machine alike.
-  it.each(SIMULATED_HOSTS)(
-    'recovers the true epoch on a host at $label',
-    ({ offsetMinutes }) => {
-      const instant = Date.UTC(2026, 7, 25, 18, 34, 15, 123);
-      const fromDb = offsetlessTimestampFromHostAt(instant, offsetMinutes);
+  afterEach(() => {
+    vi.mocked(createRemoteJWKSet).mockImplementation((() => async () => ({})) as any);
+    vi.restoreAllMocks();
+  });
 
-      expect(utcMsFromOffsetlessTimestamp(fromDb)).toBe(instant);
-      // And the naive read really is wrong by exactly the host offset — the
-      // reason the conversion has to exist at all.
-      expect(fromDb.getTime()).toBe(instant + offsetMinutes * 60_000);
-    }
-  );
+  it('accepts a fresh, correctly signed token with no options (sanity)', async () => {
+    const now = nowSec();
+    const token = await sign({ iat: now, exp: now + 3600 });
+    await expect(verifyIdTokenSignature(token, config, NONCE)).resolves.toMatchObject({
+      sub: 'external-sub-8862',
+      nonce: NONCE,
+    });
+  });
+
+  it('re-auth tolerance accepts a token that expired 200s ago (the Entra max_age=0 shape)', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const token = await sign(entraReauthClaims(200));
+    await expect(
+      verifyIdTokenSignature(token, config, NONCE, { clockToleranceSeconds: 300, mode: 'reauth' })
+    ).resolves.toMatchObject({ sub: 'external-sub-8862' });
+  });
+
+  it('re-auth tolerance is bounded: a token that expired 400s ago is still rejected', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const token = await sign(entraReauthClaims(400));
+    await expect(
+      verifyIdTokenSignature(token, config, NONCE, { clockToleranceSeconds: 300, mode: 'reauth' })
+    ).rejects.toThrow('ID token signature verification failed: "exp" claim timestamp check failed');
+  });
+
+  it('login verification stays strict: a token that expired 10s ago is rejected', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const now = nowSec();
+    const token = await sign({ iat: now - 60, exp: now - 10 });
+    await expect(verifyIdTokenSignature(token, config, NONCE)).rejects.toThrow(
+      'ID token signature verification failed: "exp" claim timestamp check failed'
+    );
+    await expect(verifyIdTokenSignature(token, config, NONCE, { mode: 'login' })).rejects.toThrow(
+      '"exp" claim timestamp check failed'
+    );
+  });
+
+  it('tolerance never relaxes the nonce check', async () => {
+    const token = await sign(entraReauthClaims(200));
+    await expect(
+      verifyIdTokenSignature(token, config, 'some-other-nonce', { clockToleranceSeconds: 300, mode: 'reauth' })
+    ).rejects.toThrow('Invalid nonce');
+  });
+
+  it('tolerance never relaxes the signature check', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { generateKeyPair } = await vi.importActual<typeof import('jose')>('jose');
+    const attacker = await generateKeyPair('RS256');
+    const now = nowSec();
+    const forged = await sign({ iat: now, exp: now + 3600, auth_time: now }, attacker.privateKey);
+    await expect(
+      verifyIdTokenSignature(forged, config, NONCE, { clockToleranceSeconds: 300, mode: 'reauth' })
+    ).rejects.toThrow('ID token signature verification failed');
+  });
+
+  it('a tolerated token is still subject to the auth_time freshness gate', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const now = nowSec();
+    // exp inside tolerance, but the IdP replayed a sign-in from an hour ago.
+    const token = await sign({ iat: now - 300, exp: now - 200, auth_time: now - 3600 });
+    const claims = await verifyIdTokenSignature(token, config, NONCE, {
+      clockToleranceSeconds: 300,
+      mode: 'reauth',
+    });
+    expect(assertFreshIdpAuthentication(claims, Date.now() - 10_000)).toEqual({
+      ok: false,
+      reason: 'auth_time_stale',
+    });
+  });
+
+  it('logs the timing claims, reason, server time and mode on a claim failure, never the token', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const claims = entraReauthClaims(400);
+    const token = await sign(claims);
+
+    await verifyIdTokenSignature(token, config, NONCE, { clockToleranceSeconds: 300, mode: 'reauth' })
+      .catch(() => {});
+
+    expect(warn).toHaveBeenCalledTimes(1);
+    const [message, details] = warn.mock.calls[0]!;
+    expect(String(message)).toContain('id_token verification failed');
+    expect(details).toMatchObject({
+      mode: 'reauth',
+      code: 'ERR_JWT_EXPIRED',
+      claim: 'exp',
+      reason: 'check_failed',
+      iat: claims.iat,
+      nbf: claims.nbf,
+      exp: claims.exp,
+      auth_time: claims.auth_time,
+      clockToleranceSeconds: 300,
+    });
+    const loggedNow = (details as { now: unknown }).now;
+    expect(typeof loggedNow).toBe('number');
+    expect(Math.abs((loggedNow as number) - nowSec())).toBeLessThanOrEqual(2);
+
+    // Nothing that identifies the token or the person leaves the box.
+    const logged = JSON.stringify(warn.mock.calls);
+    const [, payloadSegment, signature] = token.split('.');
+    expect(logged).not.toContain(token);
+    expect(logged).not.toContain(payloadSegment!);
+    expect(logged).not.toContain(signature!);
+    expect(logged).not.toContain('tech@acme.example');
+    expect(logged).not.toContain('external-sub-8862');
+    expect(logged).not.toContain(NONCE);
+  });
+
+  it('logs mode and error code without claims when the signature itself fails', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { generateKeyPair } = await vi.importActual<typeof import('jose')>('jose');
+    const attacker = await generateKeyPair('RS256');
+    const now = nowSec();
+    const forged = await sign({ iat: now, exp: now + 3600 }, attacker.privateKey);
+
+    await verifyIdTokenSignature(forged, config, NONCE, { mode: 'login' }).catch(() => {});
+
+    expect(warn).toHaveBeenCalledTimes(1);
+    const details = warn.mock.calls[0]![1] as Record<string, unknown>;
+    expect(details).toMatchObject({ mode: 'login', code: 'ERR_JWS_SIGNATURE_VERIFICATION_FAILED' });
+    expect(details.exp).toBeUndefined();
+    expect(JSON.stringify(warn.mock.calls)).not.toContain(forged);
+    expect(JSON.stringify(warn.mock.calls)).not.toContain('tech@acme.example');
+  });
+
+  // Review round: the callback audits every verify failure as idp_verify_failed,
+  // so the error carries a non-PII `failureKind` the audit row can record. A
+  // nonce mismatch on a validly-signed token is a replay/injection signal and
+  // must not look like Entra's clock quirk.
+  it.each([
+    ['timing', async () => sign(entraReauthClaims(400)), NONCE],
+    ['nonce', async () => sign(entraReauthClaims(200)), 'some-other-nonce'],
+  ] as const)('tags a %s failure with failureKind', async (kind, makeToken, nonce) => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const token = await makeToken();
+    const err = await verifyIdTokenSignature(token, config, nonce, { clockToleranceSeconds: 300, mode: 'reauth' })
+      .catch((e: unknown) => e as Error & { failureKind?: string });
+    expect(err).toBeInstanceOf(Error);
+    expect(err!.failureKind).toBe(kind);
+  });
+
+  // Review round 2: a validly-signed token for another tenant or app (wrong
+  // aud/iss) must not be audited like Entra's expiry quirk.
+  it.each([
+    ['aud', { aud: 'some-other-client' }],
+    ['iss', { iss: 'https://login.example/other-tenant/v2.0' }],
+  ] as const)('tags a wrong-%s token with failureKind=claims, not timing', async (_claim, override) => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { SignJWT } = await vi.importActual<typeof import('jose')>('jose');
+    const now = nowSec();
+    const token = await new SignJWT({ nonce: NONCE, iat: now, exp: now + 3600 })
+      .setProtectedHeader({ alg: 'RS256', kid: 'k1' })
+      .setIssuer('iss' in override ? override.iss : config.issuer)
+      .setAudience('aud' in override ? override.aud : config.clientId)
+      .setSubject('external-sub-8862')
+      .sign(privateKey);
+    const err = await verifyIdTokenSignature(token, config, NONCE, { clockToleranceSeconds: 300, mode: 'reauth' })
+      .catch((e: unknown) => e as Error & { failureKind?: string });
+    expect(err).toBeInstanceOf(Error);
+    expect(err!.failureKind).toBe('claims');
+  });
+
+  it('tags a bad signature with failureKind=signature', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { generateKeyPair } = await vi.importActual<typeof import('jose')>('jose');
+    const attacker = await generateKeyPair('RS256');
+    const now = nowSec();
+    const forged = await sign({ iat: now, exp: now + 3600 }, attacker.privateKey);
+    const err = await verifyIdTokenSignature(forged, config, NONCE, { mode: 'login' })
+      .catch((e: unknown) => e as Error & { failureKind?: string });
+    expect(err!.failureKind).toBe('signature');
+  });
+
+  it('tags a missing JWKS URL with failureKind=config', async () => {
+    const err = await verifyIdTokenSignature('a.b.c', { ...config, jwksUrl: undefined }, NONCE, { mode: 'reauth' })
+      .catch((e: unknown) => e as Error & { failureKind?: string });
+    expect(err!.message).toContain('no JWKS URL configured');
+    expect(err!.failureKind).toBe('config');
+  });
+
+  it('tags a key-resolution failure with failureKind=jwks and logs the cause code', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.mocked(createRemoteJWKSet).mockImplementation((() => async () => {
+      throw Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' });
+    }) as any);
+    const now = nowSec();
+    const token = await sign({ iat: now, exp: now + 3600 });
+    const err = await verifyIdTokenSignature(token, config, NONCE, { mode: 'reauth' })
+      .catch((e: unknown) => e as Error & { failureKind?: string });
+    expect(err!.failureKind).toBe('jwks');
+    expect(warn.mock.calls[0]![1]).toMatchObject({ mode: 'reauth', code: 'ECONNREFUSED' });
+  });
+
+  it('logs a nonce mismatch with the mode, never either nonce value', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const token = await sign(entraReauthClaims(200));
+    await verifyIdTokenSignature(token, config, 'expected-nonce-xyz', { clockToleranceSeconds: 300, mode: 'reauth' })
+      .catch(() => {});
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0]![1]).toMatchObject({ mode: 'reauth', failureKind: 'nonce' });
+    const logged = JSON.stringify(warn.mock.calls);
+    expect(logged).not.toContain('expected-nonce-xyz');
+    expect(logged).not.toContain(NONCE);
+    expect(logged).not.toContain('tech@acme.example');
+  });
+
+  it('the thrown error carries no jose cause (keeps claims out of Sentry)', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const token = await sign(entraReauthClaims(400));
+    const err = await verifyIdTokenSignature(token, config, NONCE, { clockToleranceSeconds: 300, mode: 'reauth' })
+      .catch((e: unknown) => e as Error);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error & { cause?: unknown }).cause).toBeUndefined();
+    expect(JSON.stringify(err)).not.toContain('tech@acme.example');
+  });
 });

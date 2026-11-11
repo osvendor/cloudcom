@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
+import { ERROR_CODES } from '@breeze/shared';
 
 const {
   authMiddlewareMock,
@@ -26,6 +27,23 @@ const {
   requireMfaMock: vi.fn(() => async (_c: any, next: any) => next()),
   assertDeviceExecuteAllowedMock: vi.fn(),
 }));
+
+// Devices parked in a holding org, by id. The helper's query is proven against
+// Postgres in parkedCommandDelivery.integration.test.ts.
+const parkedDeviceIds = vi.hoisted(() => new Set<string>());
+vi.mock('../../services/unassignedPool/deliveryEligibility', async () => {
+  const actual = await vi.importActual<typeof import('../../services/unassignedPool/deliveryEligibility')>(
+    '../../services/unassignedPool/deliveryEligibility',
+  );
+  return {
+    ...actual,
+    assertCommandDeliverable: vi.fn(async (_reader: unknown, input: { deviceId: string; commandType: string }) => {
+      if (!actual.isParkedDeliverableCommandType(input.commandType) && parkedDeviceIds.has(input.deviceId)) {
+        throw new actual.ParkedDeviceCommandRefusedError(input.deviceId, input.commandType);
+      }
+    }),
+  };
+});
 
 vi.mock('../../db', () => ({
   runOutsideDbContext: vi.fn((fn: any) => fn()),
@@ -390,6 +408,25 @@ describe('POST /devices/:id/actuate-elevation', () => {
       vi.mocked(getDeviceWithOrgCheck).mockResolvedValue(SAMPLE_DEVICE as never);
     });
 
+    it('returns 409 DEVICE_PENDING_ASSIGNMENT for a parked device and queues nothing', async () => {
+      const { commandValues, updateSetCalls } = rigTransaction({ elevationRow: SAMPLE_ELEVATION });
+      parkedDeviceIds.add(DEVICE_ID);
+      try {
+        const res = await app.request(`/devices/${DEVICE_ID}/actuate-elevation`, {
+          method: 'POST',
+          headers: { Authorization: 'Bearer t', 'Content-Type': 'application/json' },
+          body: JSON.stringify({ elevationRequestId: ELEVATION_ID, username: 'u', password: 'p' }),
+        });
+        expect(res.status).toBe(409);
+        await expect(res.json()).resolves.toMatchObject({ code: 'DEVICE_PENDING_ASSIGNMENT' });
+      } finally {
+        parkedDeviceIds.clear();
+      }
+      expect(commandValues).not.toHaveBeenCalled();
+      // Refused first in the transaction: the approved -> actuating flip never runs.
+      expect(updateSetCalls).toEqual([]);
+    });
+
     it('returns 404 when elevation row is missing', async () => {
       rigTransaction({ elevationRow: null });
 
@@ -475,7 +512,7 @@ describe('POST /devices/:id/actuate-elevation', () => {
       });
       expect(res.status).toBe(409);
       const body = await res.json();
-      expect(body.code).toBe('race_lost');
+      expect(body.code).toBe(ERROR_CODES.RACE_LOST);
 
       // No command was queued
       expect(commandValues).not.toHaveBeenCalled();

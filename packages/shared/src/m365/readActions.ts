@@ -11,9 +11,10 @@ const siteIdSchema = z.string().min(1).max(300).regex(/^[A-Za-z0-9.,_-]+$/);
 const pageSize = (max: number) => z.number().int().min(1).max(max).optional();
 
 export const M365_INTERACTIVE_READ_ACTION_IDS = [
-  'm365.user.list', 'm365.user.get', 'm365.signins.list',
+  'm365.user.list', 'm365.user.get', 'm365.user.mailboxes', 'm365.signins.list',
   'm365.intune.device.list', 'm365.intune.device.get',
   'm365.group.list', 'm365.group.get', 'm365.group.members.list',
+  'm365.group.member.get',
   'm365.org.get', 'm365.org.skus.list',
   'm365.report.onedrive.usage.list',
   'm365.sites.list', 'm365.site.get',
@@ -55,13 +56,19 @@ export const M365_SYNC_CONTINUATION_MAX_CHARS = 4096;
  *  object through these; they are the only fields that ever leave it. */
 export const M365_READ_ACTION_FIELDS: Record<M365ReadActionId, readonly string[]> = {
   'm365.user.list': ['id', 'userPrincipalName', 'displayName', 'mail', 'accountEnabled', 'userType', 'assignedLicenses', 'jobTitle', 'department', 'createdDateTime'],
-  'm365.user.get': ['id', 'userPrincipalName', 'displayName', 'mail', 'accountEnabled', 'userType', 'jobTitle', 'department', 'createdDateTime', 'assignedLicenses', 'usageLocation', 'onPremisesSyncEnabled'],
+  'm365.user.get': ['id', 'userPrincipalName', 'displayName', 'mail', 'accountEnabled', 'userType', 'jobTitle', 'department', 'createdDateTime', 'assignedLicenses', 'usageLocation', 'onPremisesSyncEnabled', 'signInSessionsValidFromDateTime'],
+  // Caller verification (#6354 W03): the target's canonical mailbox set, by
+  // object id only. Not exposed as an AI tool; read by the release gate.
+  'm365.user.mailboxes': ['id', 'userPrincipalName', 'mail', 'proxyAddresses'],
   'm365.signins.list': ['id', 'createdDateTime', 'userPrincipalName', 'userId', 'appDisplayName', 'ipAddress', 'clientAppUsed', 'conditionalAccessStatus', 'isInteractive', 'status', 'location', 'deviceDetail'],
   'm365.intune.device.list': ['id', 'deviceName', 'operatingSystem', 'osVersion', 'complianceState', 'lastSyncDateTime', 'userPrincipalName', 'managedDeviceOwnerType', 'enrolledDateTime'],
-  'm365.intune.device.get': ['id', 'deviceName', 'operatingSystem', 'osVersion', 'complianceState', 'lastSyncDateTime', 'userPrincipalName', 'managedDeviceOwnerType', 'enrolledDateTime', 'model', 'manufacturer', 'serialNumber', 'azureADDeviceId', 'jailBroken', 'managementAgent'],
+  'm365.intune.device.get': ['id', 'deviceName', 'operatingSystem', 'osVersion', 'complianceState', 'lastSyncDateTime', 'userPrincipalName', 'managedDeviceOwnerType', 'enrolledDateTime', 'model', 'manufacturer', 'serialNumber', 'azureADDeviceId', 'jailBroken', 'managementAgent',
+    // Evidence for the Intune retire effect probe (retirePending / retireIssued).
+    'managementState'],
   'm365.group.list': ['id', 'displayName', 'mail', 'groupTypes', 'securityEnabled', 'membershipRule', 'createdDateTime'],
   'm365.group.get': ['id', 'displayName', 'mail', 'groupTypes', 'securityEnabled', 'membershipRule', 'createdDateTime', 'description'],
   'm365.group.members.list': ['id', 'displayName', 'userPrincipalName', 'mail'],
+  'm365.group.member.get': ['id', 'displayName', 'userPrincipalName', 'mail'],
   'm365.org.get': ['id', 'displayName', 'verifiedDomains', 'countryLetterCode', 'createdDateTime'],
   'm365.org.skus.list': ['id', 'skuId', 'skuPartNumber', 'consumedUnits', 'prepaidUnits', 'appliesTo', 'capabilityStatus'],
   // The executor parses the fixed OneDrive usage CSV and emits only these
@@ -142,6 +149,10 @@ const INTERACTIVE_BRANCHES = [
     userIdOrUpn: userIdOrUpnSchema,
   }).strict(),
   z.object({
+    type: z.literal('m365.user.mailboxes'),
+    userId: guidSchema,
+  }).strict(),
+  z.object({
     type: z.literal('m365.signins.list'),
     userPrincipalName: userIdOrUpnSchema.optional(),
     sinceHours: z.number().int().min(1).max(168).optional(),
@@ -170,6 +181,13 @@ const INTERACTIVE_BRANCHES = [
     type: z.literal('m365.group.members.list'),
     groupId: guidSchema,
     pageSize: pageSize(100),
+  }).strict(),
+  z.object({
+    type: z.literal('m365.group.member.get'),
+    groupId: guidSchema,
+    // Always a canonical object id (never a UPN): a probe addresses the
+    // immutable id the effect was dispatched against.
+    userId: guidSchema,
   }).strict(),
   z.object({ type: z.literal('m365.org.get') }).strict(),
   z.object({ type: z.literal('m365.org.skus.list') }).strict(),
@@ -217,11 +235,15 @@ const SYNC_BRANCHES = [
 ] as const;
 
 /**
- * Cold start for an org with no events yet. Graph retains ~30 days, but a first
- * run pulling a month in one go would blow the per-run item cap; the next runs
- * catch up through the overlapping delta window.
+ * Cold start for an org whose sign-in walk has never completed. One day, not
+ * the original seven (#9394): on a reported tenant of ~335 accounts a weekday
+ * was ~1,500 interactive sign-ins and a week ~8,000, and a first walk that long
+ * is the one most likely to be cut off before it can complete (a cut-off walk
+ * restarts from the same cold start). A weekday is ~15 pages of 100 and
+ * completes in a few runs; later runs walk forward from what it proved.
+ * Breeze accumulates forward from the first sync.
  */
-export const SIGNIN_EVENTS_DEFAULT_WINDOW_DAYS = 7;
+export const SIGNIN_EVENTS_DEFAULT_WINDOW_DAYS = 1;
 
 export const m365SyncActionSchema = z.discriminatedUnion('type', SYNC_BRANCHES);
 export type M365SyncAction = z.infer<typeof m365SyncActionSchema>;
@@ -324,10 +346,15 @@ export const m365SyncActionResultSchema: z.ZodType<M365SyncActionResult> = z.obj
 }).strict();
 
 /**
- * The read failure codes plus `continuation_invalid`. Deliberately NOT folded
- * into readActionFailureCodeSchema: that enum keys the exhaustive
+ * The read failure codes plus two sync-only codes: `continuation_invalid`, and
+ * `graph_provider_rejected` — Graph refused the request itself (a 400 on a bad
+ * $filter, a 5xx), as opposed to answering with a body Breeze could not parse
+ * (`graph_response_invalid`). Folding the first into the second made a rejected
+ * query read like malformed JSON in connection health (#9393). Deliberately NOT
+ * folded into readActionFailureCodeSchema: that enum keys the exhaustive
  * FAILURE_MESSAGES record in the API's readActionService, which this contract
- * has no business widening.
+ * has no business widening, and the interactive read path still folds a
+ * rejection into `graph_response_invalid`.
  *
  * The member list is spelled out rather than spread from
  * `readActionFailureCodeSchema.options` because `z.enum` needs a literal tuple
@@ -335,7 +362,8 @@ export const m365SyncActionResultSchema: z.ZodType<M365SyncActionResult> = z.obj
  * honest two ways: the `_AssertSyncFailureCodeParity` line below fails `tsc` if
  * the schema and the exported type drift apart, and `readActions.test.ts`
  * asserts `m365SyncFailureCodeSchema.options` equals
- * `[...readActionFailureCodeSchema.options, 'continuation_invalid']`, so adding
+ * `[...readActionFailureCodeSchema.options, 'continuation_invalid',
+ * 'graph_provider_rejected']`, so adding
  * a read code without adding it here is a red test, not a silent gap.
  */
 export const m365SyncFailureCodeSchema = z.enum([
@@ -350,6 +378,7 @@ export const m365SyncFailureCodeSchema = z.enum([
   'graph_transport_failed',
   'graph_response_invalid',
   'continuation_invalid',
+  'graph_provider_rejected',
 ]);
 
 /**
@@ -363,7 +392,11 @@ export const m365SyncFailureCodeSchema = z.enum([
  * contract names it and because sync callers reason about throttling
  * explicitly.
  */
-export type M365SyncFailureCode = ReadActionFailureCode | 'continuation_invalid' | 'graph_throttled';
+export type M365SyncFailureCode =
+  | ReadActionFailureCode
+  | 'continuation_invalid'
+  | 'graph_provider_rejected'
+  | 'graph_throttled';
 
 /** Compile-time proof the hand-written enum and the contract type are one set. */
 type _Same<A, B> = [A] extends [B] ? ([B] extends [A] ? true : never) : never;

@@ -55,6 +55,10 @@ function setupDb(rowsByTable: Map<unknown, unknown[]>) {
               call.joins.push({ table: joined, on });
               return chain;
             },
+            leftJoin(joined: unknown, on: unknown) {
+              call.joins.push({ table: joined, on });
+              return chain;
+            },
             where(condition: unknown) {
               call.where = condition;
               return chain;
@@ -122,8 +126,8 @@ describe('resolveAcceptedOrgs', () => {
     expect(occurrences(where.sql, '"organizations"."id" in (')).toBe(1);
     expect(where.sql).toContain('"organizations"."partner_id" = ');
     expect(where.sql).toContain('"organizations"."deleted_at" is null');
-    expect(where.sql).toContain('"organizations"."type" <> ');
-    expect(where.params).toEqual([ORG_A, ORG_B, PARTNER_ID, 'quick_support']);
+    expect(where.sql).toContain('"organizations"."type" not in (');
+    expect(where.params).toEqual([ORG_A, ORG_B, PARTNER_ID, 'quick_support', 'unassigned_pool']);
   });
 
   it("partner scope also intersects with the token's accessible orgs", async () => {
@@ -132,7 +136,7 @@ describe('resolveAcceptedOrgs', () => {
 
     const where = compiledWhere(organizations);
     expect(occurrences(where.sql, '"organizations"."id" in (')).toBe(2);
-    expect(where.params).toEqual([ORG_A, ORG_B, PARTNER_ID, 'quick_support', ORG_A, ORG_C]);
+    expect(where.params).toEqual([ORG_A, ORG_B, PARTNER_ID, 'quick_support', 'unassigned_pool', ORG_A, ORG_C]);
   });
 
   it('keeps request order, omits ids the query did not return, and derives billingAddress', async () => {
@@ -326,6 +330,7 @@ describe('loadAccountReadiness', () => {
     const where = compiledWhere(tickets);
     expect(where.sql).toContain('"tickets"."org_id" in (');
     expect(where.sql).toContain('"tickets"."deleted_at" is null');
+    expect(where.sql).toContain('"tickets"."merged_into_ticket_id" is null');
     expect(where.sql).toContain('"tickets"."status" in (');
     expect(where.params).toEqual([ORG_A, ORG_B, 'new', 'open', 'pending', 'on_hold']);
     expect(result.get(ORG_A)?.tickets).toEqual({ open: 4, awaitingCustomer: 1, slaBreached: 2 });

@@ -68,6 +68,10 @@ vi.mock('./mobileDeviceBlocked', () => ({
   }, 403)
 }));
 
+const rateLimitMocks = vi.hoisted(() => ({ rateLimiter: vi.fn() }));
+vi.mock('../services/rate-limit', () => ({ rateLimiter: rateLimitMocks.rateLimiter }));
+vi.mock('../services/redis', () => ({ getRedis: () => ({}) }));
+
 vi.mock('../db', () => ({
   runOutsideDbContext: vi.fn((fn) => fn()),
   db: {
@@ -77,7 +81,25 @@ vi.mock('../db', () => ({
   withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn())
 }));
 
+// partnerGuard (composed with authMiddleware in the #6627 interplay tests)
+// imports the activation reconciler; its DB-writing internals are irrelevant
+// here — a pending partner with no payment method never reconciles.
+vi.mock('../services/partnerActivation', () => ({
+  shouldActivatePendingPartner: vi.fn(() => false),
+  activatePartnerRow: vi.fn()
+}));
+
 vi.mock('../db/schema', () => ({
+  partners: {
+    id: 'partners.id',
+    status: 'partners.status',
+    trustState: 'partners.trustState',
+    settings: 'partners.settings',
+    emailVerifiedAt: 'partners.emailVerifiedAt',
+    paymentMethodAttachedAt: 'partners.paymentMethodAttachedAt',
+    billingSubscriptionStatus: 'partners.billingSubscriptionStatus',
+    deletedAt: 'partners.deletedAt'
+  },
   users: {
     id: 'id',
     email: 'email',
@@ -113,13 +135,15 @@ vi.mock('../db/schema', () => ({
 }));
 
 import { Hono } from 'hono';
-import { authMiddleware, requireScope, requirePermission, requireMfa, requireInteractiveSession, requireOrg, requirePartner, requireOrgAccess, requireSiteAccess, resolveOrgAccess, isMfaEnrollmentExemptPath, AuthContext, hasSatisfiedMfa } from './auth';
+import { authMiddleware, computeAccessibleOrgIds, requireScope, requirePermission, requireMfa, requireInteractiveSession, requireOrg, requirePartner, requireOrgAccess, requireSiteAccess, resolveOrgAccess, isMfaEnrollmentExemptPath, AuthContext, hasSatisfiedMfa } from './auth';
 import { verifyToken } from '../services/jwt';
 import { isTokenIssuedBeforePasswordChange, isUserTokenRevoked } from '../services/tokenRevocation';
 import { db, withDbAccessContext } from '../db';
+import { userRateLimit } from './userRateLimit';
 import { getUserPermissions, hasPermission, canAccessOrg, canAccessSite } from '../services/permissions';
 import { assertActiveTenantContext, TenantInactiveError } from '../services/tenantStatus';
 import { getEffectiveMfaPolicy } from '../services/mfaPolicy';
+import { partnerGuard, isPartnerGuardExemptPath } from './partnerGuard';
 
 const basePayload = {
   sub: 'user-123',
@@ -366,6 +390,68 @@ describe('authMiddleware', () => {
     expect(ipGuardMocks.ipAllowlistGuard.mock.invocationCallOrder[0]).toBeLessThan(
       vi.mocked(withDbAccessContext).mock.invocationCallOrder[0]!,
     );
+  });
+
+  // #8334 / #1105 — a per-user Redis limiter registered as route middleware must
+  // be evaluated BEFORE authMiddleware takes a pooled connection (opens the
+  // request transaction). `runOutsideDbContext` could not do this: it leaves the
+  // outer transaction held. These assert on the real transaction opener.
+  describe('pre-context rate limiters (#8334)', () => {
+    function limitedApp() {
+      let handlerRuns = 0;
+      const app = new Hono();
+      app.use(authMiddleware);
+      app.post('/limited', userRateLimit('enroll-write', 10, 60), (c) => {
+        handlerRuns++;
+        return c.json({ ok: true });
+      });
+      return { app, runs: () => handlerRuns };
+    }
+
+    it('runs the limiter before the request transaction is opened, and only once', async () => {
+      const { app, runs } = limitedApp();
+      vi.mocked(verifyToken).mockResolvedValue(basePayload);
+      mockUserSelect([activeUser]);
+      let contextOpenAtLimiter: boolean | undefined;
+      let contextOpen = false;
+      vi.mocked(withDbAccessContext).mockImplementationOnce(async (_context, fn) => {
+        contextOpen = true;
+        try {
+          return await fn();
+        } finally {
+          contextOpen = false;
+        }
+      });
+      rateLimitMocks.rateLimiter.mockImplementation(async () => {
+        contextOpenAtLimiter = contextOpen;
+        return { allowed: true, remaining: 9, resetAt: new Date() };
+      });
+
+      const res = await app.request('/limited', { method: 'POST', headers: { Authorization: 'Bearer token' } });
+
+      expect(res.status).toBe(200);
+      expect(runs()).toBe(1);
+      expect(contextOpenAtLimiter).toBe(false);
+      expect(rateLimitMocks.rateLimiter).toHaveBeenCalledTimes(1);
+      expect(rateLimitMocks.rateLimiter).toHaveBeenCalledWith(expect.anything(), `rl:enroll-write:${activeUser.id}`, 10, 60);
+      expect(rateLimitMocks.rateLimiter.mock.invocationCallOrder[0]).toBeLessThan(
+        vi.mocked(withDbAccessContext).mock.invocationCallOrder[0]!,
+      );
+    });
+
+    it('a denied limiter answers 429 without ever opening the request transaction', async () => {
+      const { app, runs } = limitedApp();
+      vi.mocked(verifyToken).mockResolvedValue(basePayload);
+      mockUserSelect([activeUser]);
+      vi.mocked(withDbAccessContext).mockClear();
+      rateLimitMocks.rateLimiter.mockResolvedValue({ allowed: false, remaining: 0, resetAt: new Date() });
+
+      const res = await app.request('/limited', { method: 'POST', headers: { Authorization: 'Bearer token' } });
+
+      expect(res.status).toBe(429);
+      expect(runs()).toBe(0);
+      expect(vi.mocked(withDbAccessContext)).not.toHaveBeenCalled();
+    });
   });
 
   it('rejects a blocked signed mobile binding on an ordinary authenticated API path', async () => {
@@ -724,6 +810,110 @@ describe('authMiddleware', () => {
     expect(isMfaEnrollmentExemptPath('/api/v1/auth/cf-access-logout')).toBe(false);
     expect(isMfaEnrollmentExemptPath('/api/v1/auth/cf-access-logout/complete')).toBe(false);
     expect(isMfaEnrollmentExemptPath('/api/v1/auth/cf-access-logout/prepare/extra')).toBe(false);
+  });
+
+  // #6627: a pending hosted partner whose role requires MFA looped between
+  // /account/inactive and the dashboard. The inactive screen's only call,
+  // GET /partner/me, is exempt from partnerGuard but was NOT exempt from the
+  // forced-MFA gate, so it 428'd and the screen had no status to render.
+  // The exemption is method-scoped: only the read-only status lookup.
+  it('#6627: exempts only a READ of /partner/me from forced MFA enrollment', () => {
+    expect(isMfaEnrollmentExemptPath('/api/v1/partner/me', 'GET')).toBe(true);
+    expect(isMfaEnrollmentExemptPath('/partner/me', 'GET')).toBe(true);
+    expect(isMfaEnrollmentExemptPath('/api/v1/partner/me', 'HEAD')).toBe(true);
+    // Any write, sub-path, sibling route, or unknown method stays gated.
+    expect(isMfaEnrollmentExemptPath('/api/v1/partner/me', 'POST')).toBe(false);
+    expect(isMfaEnrollmentExemptPath('/api/v1/partner/me', 'PATCH')).toBe(false);
+    expect(isMfaEnrollmentExemptPath('/api/v1/partner/me')).toBe(false);
+    expect(isMfaEnrollmentExemptPath('/api/v1/partner/me/', 'GET')).toBe(false);
+    expect(isMfaEnrollmentExemptPath('/api/v1/partner/me/settings', 'GET')).toBe(false);
+    expect(isMfaEnrollmentExemptPath('/api/v1/partner/dashboard', 'GET')).toBe(false);
+  });
+
+  describe('#6627: pending partner + MFA-required role (partnerGuard → authMiddleware)', () => {
+    const pendingPartnerRow = {
+      status: 'pending',
+      trustState: 'unverified',
+      settings: { statusActionUrl: 'https://billing.example.com/plans' },
+      emailVerifiedAt: new Date(),
+      paymentMethodAttachedAt: null,
+      billingSubscriptionStatus: null,
+      deletedAt: null
+    };
+
+    // Mirrors the production chain in index.ts: the global partner-status
+    // guard (with its skip list) runs before the route-level authMiddleware.
+    function buildPendingPartnerApp() {
+      const app = new Hono();
+      app.use('*', async (c, next) => {
+        if (isPartnerGuardExemptPath(c.req.path)) return next();
+        return partnerGuard(c, next);
+      });
+      app.use('*', authMiddleware);
+      app.get('/api/v1/partner/me', (c) => c.json({ status: 'pending' }));
+      app.post('/api/v1/partner/me', (c) => c.json({ ok: true }));
+      app.get('/api/v1/devices', (c) => c.json({ data: [] }));
+      app.get('/api/v1/auth/mfa/enrollment-options', (c) => c.json({ allowedMethods: {} }));
+      return app;
+    }
+
+    beforeEach(() => {
+      vi.mocked(verifyToken).mockResolvedValue({ ...basePayload, scope: 'partner', orgId: null });
+      vi.mocked(getEffectiveMfaPolicy).mockResolvedValue(requirePolicy);
+    });
+
+    it('GET /partner/me reaches the handler (no 428, no 403) so the inactive screen can load status', async () => {
+      vi.mocked(db.select)
+        // partnerGuard is skipped for this path → first select is the user lookup
+        .mockReturnValueOnce(selectWithLimit([unenrolledUser]) as any)
+        .mockReturnValueOnce(selectWithLimit([{ orgAccess: 'none', orgIds: null }]) as any);
+
+      const res = await buildPendingPartnerApp().request('/api/v1/partner/me', {
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ status: 'pending' });
+      expect(vi.mocked(getEffectiveMfaPolicy)).not.toHaveBeenCalled();
+    });
+
+    it('a write to /partner/me is still 428 mfa_enrollment_required', async () => {
+      vi.mocked(db.select).mockReturnValueOnce(selectWithLimit([unenrolledUser]) as any);
+
+      const res = await buildPendingPartnerApp().request('/api/v1/partner/me', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(428);
+      expect((await res.json()).error).toBe('mfa_enrollment_required');
+    });
+
+    it('a protected route answers 403 PARTNER_INACTIVE before the MFA gate runs', async () => {
+      vi.mocked(db.select).mockReturnValueOnce(selectWithLimit([pendingPartnerRow]) as any);
+
+      const res = await buildPendingPartnerApp().request('/api/v1/devices', {
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(403);
+      const body = await res.json();
+      expect(body.code).toBe('PARTNER_INACTIVE');
+      expect(body.status).toBe('pending');
+      expect(vi.mocked(getEffectiveMfaPolicy)).not.toHaveBeenCalled();
+    });
+
+    it('the MFA enrollment endpoints pass both guards', async () => {
+      vi.mocked(db.select)
+        .mockReturnValueOnce(selectWithLimit([unenrolledUser]) as any)
+        .mockReturnValueOnce(selectWithLimit([{ orgAccess: 'none', orgIds: null }]) as any);
+
+      const res = await buildPendingPartnerApp().request('/api/v1/auth/mfa/enrollment-options', {
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(200);
+    });
   });
 
   it('permits an enrolled user without consulting the resolver at all', async () => {
@@ -1594,5 +1784,41 @@ describe('requireOrgAccess', () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body).toEqual({ ok: true });
+  });
+});
+
+// #9529: `accessibleOrgIds[0]` is the last-resort org for an AI session (and
+// the default of every `getOrgId` tool helper). The org query has no ORDER BY,
+// so that element used to be whatever the planner returned first.
+describe('computeAccessibleOrgIds ordering (#9529)', () => {
+  beforeEach(() => {
+    vi.mocked(db.select).mockReset();
+  });
+
+  const ROWS = [
+    { id: 'org-zulu', slug: 'zulu', type: 'customer' },
+    { id: 'org-qs', slug: 'quick-support-partner-123', type: 'quick_support' },
+    { id: 'org-acme', slug: 'Acme', type: 'customer' },
+    { id: 'org-beta', slug: 'beta', type: 'internal' },
+  ];
+
+  it('returns an orgAccess=all list in slug order, the hidden Quick Support org last', async () => {
+    vi.mocked(db.select)
+      .mockReturnValueOnce(selectWithLimit([{ orgAccess: 'all', orgIds: null }]) as any)
+      .mockReturnValueOnce(selectWithWhere(ROWS) as any);
+
+    const reach = await computeAccessibleOrgIds('partner', 'partner-123', null, 'user-123');
+
+    expect(reach).toEqual({ orgIds: ['org-acme', 'org-beta', 'org-zulu', 'org-qs'], partnerOrgAccess: 'all' });
+  });
+
+  it('orders an orgAccess=selected list the same way, regardless of row order', async () => {
+    vi.mocked(db.select)
+      .mockReturnValueOnce(selectWithLimit([{ orgAccess: 'selected', orgIds: ['org-zulu', 'org-acme'] }]) as any)
+      .mockReturnValueOnce(selectWithWhere([...ROWS].reverse()) as any);
+
+    const reach = await computeAccessibleOrgIds('partner', 'partner-123', null, 'user-123');
+
+    expect(reach.orgIds).toEqual(['org-acme', 'org-beta', 'org-zulu', 'org-qs']);
   });
 });

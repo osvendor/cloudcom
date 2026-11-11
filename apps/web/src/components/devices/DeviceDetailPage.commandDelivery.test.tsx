@@ -80,7 +80,7 @@ async function rebootFromDetailPage(commandResponse: unknown) {
   // The full (non-compact) action bar puts Reboot behind the "Power"
   // dropdown, not the "…" overflow menu.
   fireEvent.click(await screen.findByRole('button', { name: 'Power' }));
-  fireEvent.click(await screen.findByRole('button', { name: 'Reboot' }));
+  fireEvent.click(await screen.findByRole('menuitem', { name: 'Reboot' }));
   // The dropdown item closes on click; the ConfirmDialog's "Reboot" button
   // is the only one left once it does.
   fireEvent.click(await screen.findByRole('button', { name: 'Reboot' }));
@@ -159,5 +159,23 @@ describe('DeviceDetailPage single-command toast reads delivery, not device.statu
 
     const success = toasts.find((t) => t.type === 'success');
     expect(success?.message).toBe('Runs when the device is online');
+  });
+
+  it('reports an ERROR toast with the reason — never "sent" — when the server cancelled the command before delivery', async () => {
+    const toasts = await rebootFromDetailPage({
+      id: 'cmd-1',
+      deviceId: DEVICE_ID,
+      type: 'reboot',
+      status: 'cancelled',
+      createdAt: '2026-09-01T00:00:00.000Z',
+      delivery: 'cancelled',
+      cancelReason: 'requester_inactive',
+      deliverBy: null,
+    });
+
+    expect(toasts.find((t) => t.type === 'success')).toBeUndefined();
+    const error = toasts.find((t) => t.type === 'error');
+    expect(error?.message).toMatch(/not sent to ws-detail-01/i);
+    expect(error?.message).toContain('requester_inactive');
   });
 });

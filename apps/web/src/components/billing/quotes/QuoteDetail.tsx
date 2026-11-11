@@ -10,7 +10,8 @@ import { runAction, handleActionError, ActionError } from '../../../lib/runActio
 import { useAuthedImage } from './useQuoteImage';
 import QuoteActions, { QuoteSendOutcomeBanners } from './QuoteActions';
 import AcceptanceEvidenceControl from './AcceptanceEvidenceControl';
-import QuoteOrderBreakdown, { orderableLines } from './QuoteOrderBreakdown';
+import QuoteGeneratedContracts from './QuoteGeneratedContracts';
+import QuoteOrderBreakdown, { QuoteOrderExcludedNote, orderableLines, unorderableProductLines } from './QuoteOrderBreakdown';
 import { RecurringBillingNote, MarginPanel, MarginToggle, useShowMargin } from '../billingUi';
 import ChangeCurrencyDialog, { type CurrencyChangeMode } from '../ChangeCurrencyDialog';
 import { computeQuoteProfit, type QuoteProfit } from '@breeze/shared';
@@ -28,12 +29,14 @@ import {
   formatQuantity,
   resolveQuoteOrgName,
   lineTaxAmount,
-  lineTitle,
-  lineBlurb,
   pctFromFraction,
   sellerLines,
 } from './quoteTypes';
 import { StatusPill } from '../shared/StatusPill';
+import { LineItemsTable, type LineItemColumn } from '../shared/LineItemsTable';
+import { EntityLink } from '@/components/shared/EntityLink';
+import { DocumentLineDescription } from '@breeze/document-ui';
+import { lineDescriptionProps } from '@breeze/shared/documents';
 
 const UNAUTHORIZED = () => void navigateTo('/login', { replace: true });
 
@@ -170,6 +173,9 @@ export default function QuoteDetail({ detail, onChanged, actionsInHeader }: Prop
   // "completed"), the Detail tab grows a procurement view of the SKU-bearing
   // lines so the tech can order without re-deriving a PO from the pricing tables.
   const orderLines = useMemo(() => orderableLines(lines), [lines]);
+  // Product-like lines with no SKU/part number stay out of the order (#8232);
+  // they're named in a footer rather than dropped silently.
+  const excludedOrderLines = useMemo(() => unorderableProductLines(lines), [lines]);
   const quoteWon = quote.status === 'accepted' || quote.status === 'converted';
 
   const hasRecurring =
@@ -232,6 +238,7 @@ export default function QuoteDetail({ detail, onChanged, actionsInHeader }: Prop
           {quoteWon && orderLines.length > 0 && (
             <QuoteOrderBreakdown
               lines={orderLines}
+              excludedLines={excludedOrderLines}
               currency={currency}
               showCost={canSeeMargin && showMargin}
               quoteId={quote.id}
@@ -240,6 +247,13 @@ export default function QuoteDetail({ detail, onChanged, actionsInHeader }: Prop
               orders={detail.orders}
               onChanged={onChanged}
             />
+          )}
+          {/* Nothing made it into the order, but product lines exist: still say
+              why, or the "To be ordered" section just never appears. */}
+          {quoteWon && orderLines.length === 0 && excludedOrderLines.length > 0 && (
+            <div className="rounded-lg border bg-card shadow-xs">
+              <QuoteOrderExcludedNote lines={excludedOrderLines} />
+            </div>
           )}
         </div>
 
@@ -261,7 +275,7 @@ export default function QuoteDetail({ detail, onChanged, actionsInHeader }: Prop
               )}
             </div>
             <dl className="space-y-1 text-sm">
-              <div className="flex justify-between"><dt className="text-muted-foreground">{t('quotes.detail.customer')}</dt><dd className="text-right" data-testid="quote-detail-customer"><a href={`/organizations/${encodeURIComponent(quote.orgId)}`} data-testid="org-record-link" className="hover:underline">{orgName}</a></dd></div>
+              <div className="flex justify-between"><dt className="text-muted-foreground">{t('quotes.detail.customer')}</dt><dd className="text-right" data-testid="quote-detail-customer"><EntityLink kind="org" id={quote.orgId} name={orgName} /></dd></div>
               <div className="flex justify-between"><dt className="text-muted-foreground">{t('quotes.detail.issued')}</dt><dd>{formatDate(quote.issueDate)}</dd></div>
               {(!quote.issueDate || formatDate(quote.issueDate) !== formatDate(quote.createdAt)) && (
                 <div className="flex justify-between"><dt className="text-muted-foreground">{t('quotes.detail.created')}</dt><dd>{formatDate(quote.createdAt)}</dd></div>
@@ -346,6 +360,10 @@ export default function QuoteDetail({ detail, onChanged, actionsInHeader }: Prop
               </a>
             </aside>
           )}
+
+          {/* #10361: the draft contract(s) the accept created — the recurring
+              next step, as the invoice link above is the one-time one. */}
+          <QuoteGeneratedContracts contracts={detail.contracts} unavailable={detail.contractsUnavailable} />
 
           {/* Recurring + totals summary — the rail's anchor (shadow + large figure). */}
           <div className="rounded-lg border bg-card p-4 shadow-xs" data-testid="quote-detail-totals">
@@ -547,7 +565,7 @@ function BlockView({ block, lines, currency, taxRate, showTax }: { block: QuoteB
   }
   if (block.blockType === 'contract') {
     // Read-only summary — the Detail tab isn't the customer document, so skip
-    // the PDF preview/iframe (QuoteDocument's DocContractFile) and just show
+    // the PDF preview/iframe (the Preview tab's agreement viewer) and just show
     // what a staff member needs: which agreement this is and its body text.
     const content = (block.content ?? {}) as Partial<ContractBlockContent>;
     const templateName = content.templateName?.trim() || '';
@@ -615,57 +633,53 @@ function BlockView({ block, lines, currency, taxRate, showTax }: { block: QuoteB
 
 function LineTable({ lines, currency, label, testId, taxRate, showTax }: { lines: QuoteLine[]; currency: string; label: string; testId: string; taxRate: string | null; showTax: boolean }) {
   const { t } = useTranslation('billing');
-  const colSpan = showTax ? 6 : 5;
+  const columns: LineItemColumn<QuoteLine>[] = [
+    { key: 'qty', header: t('quotes.detail.table.qty'), align: 'right', cell: (l) => <span className="tabular-nums">{formatQuantity(l.quantity)}</span> },
+    { key: 'unitPrice', header: t('quotes.detail.table.unitPrice'), align: 'right', cell: (l) => <span className="tabular-nums">{formatMoney(l.unitPrice, currency)}</span> },
+    {
+      key: 'recurrence',
+      header: t('quotes.detail.table.recurrence'),
+      cell: (l) => (
+        <span className="inline-flex items-center rounded-full border border-border bg-muted px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-foreground/70 dark:text-muted-foreground">
+          {t(/* i18n-dynamic */ `quotes.recurrence.${l.recurrence}`)}
+        </span>
+      ),
+    },
+    ...(showTax ? [{
+      key: 'tax',
+      header: t('quotes.detail.table.tax'),
+      align: 'right' as const,
+      cellClassName: 'text-muted-foreground',
+      cell: (l: QuoteLine) => {
+        const tax = lineTaxAmount(l.lineTotal, l.taxable, taxRate);
+        return <span className="tabular-nums">{tax === null ? '—' : formatMoney(tax, currency)}</span>;
+      },
+    }] : []),
+    { key: 'total', header: t('quotes.detail.table.total'), align: 'right', cell: (l) => <span className="tabular-nums">{formatMoney(l.lineTotal, currency)}</span> },
+  ];
   return (
-    <div className="rounded-lg border bg-card shadow-xs">
-      {label && (
+    <LineItemsTable<QuoteLine>
+      header={label ? (
         <h3 className="border-b px-3 py-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">{label}</h3>
+      ) : undefined}
+      rows={lines}
+      keyFor={(l) => l.id}
+      rowTestId={(l) => `quote-detail-line-${l.id}`}
+      tableTestId={testId}
+      scrollAriaLabel={t('quotes.detail.tableScrollAria', { label: label || t('quotes.detail.pricing') })}
+      descriptionHeader={t('quotes.detail.table.item')}
+      emptyMessage={t('quotes.detail.table.noLines')}
+      renderDescription={(l) => (
+        // Shared description cell (#9414 W5): the title keeps its weight, the rest goes back to normal.
+        <div className="font-medium text-foreground [&>*]:font-normal">
+          <DocumentLineDescription
+            {...lineDescriptionProps(l, {})}
+            rowKey={l.id}
+          />
+        </div>
       )}
-      <div className="overflow-x-auto" role="region" aria-label={t('quotes.detail.tableScrollAria', { label: label || t('quotes.detail.pricing') })} tabIndex={0}>
-      <table className="w-full min-w-[30rem] text-sm" data-testid={testId}>
-        <thead>
-          <tr className="border-b text-left text-xs uppercase tracking-wide text-muted-foreground">
-            <th className="px-3 py-2 font-medium">{t('quotes.detail.table.item')}</th>
-            <th className="px-3 py-2 text-right font-medium">{t('quotes.detail.table.qty')}</th>
-            <th className="px-3 py-2 text-right font-medium">{t('quotes.detail.table.unitPrice')}</th>
-            <th className="px-3 py-2 font-medium">{t('quotes.detail.table.recurrence')}</th>
-            {showTax && <th className="px-3 py-2 text-right font-medium">{t('quotes.detail.table.tax')}</th>}
-            <th className="px-3 py-2 text-right font-medium">{t('quotes.detail.table.total')}</th>
-          </tr>
-        </thead>
-        <tbody>
-          {lines.length === 0 ? (
-            <tr>
-              <td colSpan={colSpan} className="px-3 py-6 text-center text-sm text-muted-foreground">{t('quotes.detail.table.noLines')}</td>
-            </tr>
-          ) : (
-            lines.map((l) => {
-              const tax = showTax ? lineTaxAmount(l.lineTotal, l.taxable, taxRate) : null;
-              return (
-                <tr key={l.id} className="border-t" data-testid={`quote-detail-line-${l.id}`}>
-                  <td className="px-3 py-2">
-                    <div className="font-medium text-foreground">{lineTitle(l)}</div>
-                    {lineBlurb(l) && <div className="whitespace-pre-line text-xs text-muted-foreground">{lineBlurb(l)}</div>}
-                  </td>
-                  <td className="px-3 py-2 text-right tabular-nums">{formatQuantity(l.quantity)}</td>
-                  <td className="px-3 py-2 text-right tabular-nums">{formatMoney(l.unitPrice, currency)}</td>
-                  <td className="px-3 py-2">
-                    <span className="inline-flex items-center rounded-full border border-border bg-muted px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-foreground/70 dark:text-muted-foreground">
-                      {t(/* i18n-dynamic */ `quotes.recurrence.${l.recurrence}`)}
-                    </span>
-                  </td>
-                  {showTax && (
-                    <td className="px-3 py-2 text-right tabular-nums text-muted-foreground">{tax === null ? '—' : formatMoney(tax, currency)}</td>
-                  )}
-                  <td className="px-3 py-2 text-right tabular-nums">{formatMoney(l.lineTotal, currency)}</td>
-                </tr>
-              );
-            })
-          )}
-        </tbody>
-      </table>
-      </div>
-    </div>
+      columns={columns}
+    />
   );
 }
 

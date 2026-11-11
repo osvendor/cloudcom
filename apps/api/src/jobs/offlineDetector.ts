@@ -10,12 +10,10 @@ import { createHash, randomUUID } from 'node:crypto';
 import { findDueOfflineEffects, persistOfflineTransition, pruneOfflineEffects } from '../services/offlineEffectsStore';
 import { processOfflineEffect } from '../services/offlineTransitionEffects';
 import * as dbModule from '../db';
-import { devices, alerts } from '../db/schema';
+import { devices } from '../db/schema';
 import { eq, and, lt, gt, asc, inArray, or, isNull, notInArray, sql } from 'drizzle-orm';
 import { getBullMQConnection } from '../services/redis';
-import { evaluateDeviceAlertsFromPolicy } from '../services/alertService';
-import { resolveReevalHorizonMinutes } from '../services/alertConditions/offlineDuration';
-import { isReusableState } from '../services/bullmqUtils';
+import { bullmqJobId, isReusableState } from '../services/bullmqUtils';
 import { attachWorkerObservability } from './workerObservability';
 import { envInt } from '../utils/envInt';
 import { createAuditLogAsync } from '../services/auditService';
@@ -23,6 +21,8 @@ import { ANONYMOUS_ACTOR_ID } from '../services/auditEvents';
 import { DEFAULT_OFFLINE_THRESHOLD_MINUTES } from '../services/deviceLiveness';
 import { captureMessage } from '../services/sentry';
 import { throttledReporter } from '../services/sentryThrottle';
+import { EDITION_MIGRATION_SETTLE_INTERVAL } from '../services/editionMigrationWindow';
+import { requestDeviceGroupReevaluation } from './deviceGroupJobs';
 
 const { db } = dbModule;
 const runWithSystemDbAccess = async <T>(fn: () => Promise<T>): Promise<T> => {
@@ -69,48 +69,13 @@ let offlineQueue: Queue | null = null;
 // retry, short enough that a genuinely-removed device drops off the active
 // fleet count within about a day.
 const DEFAULT_UNINSTALL_INTENT_DECOMMISSION_HOURS = 24;
-// How often the reaper sweep runs. Independent of the reeval gate — a stuck
-// uninstall-intent stamp is a fleet-count correctness issue, not an optional
-// alert, so this always runs. 15 minutes gives ample granularity against an
+// How often the reaper sweep runs. A stuck uninstall-intent stamp affects
+// fleet counts, so this always runs. 15 minutes gives ample granularity against an
 // hours-scale decommission window.
 const DEFAULT_UNINSTALL_INTENT_REAP_INTERVAL_MS = 15 * 60 * 1000;
 
 function getUninstallIntentDecommissionHours(): number {
   return envInt('UNINSTALL_INTENT_DECOMMISSION_HOURS', DEFAULT_UNINSTALL_INTENT_DECOMMISSION_HOURS);
-}
-
-// Re-evaluation sweep (issue #1982): how far back a device may have last been
-// seen and still be re-evaluated for longer-duration offline rules. Bounds the
-// per-run cost: a device offline longer than the horizon is dropped from the
-// sweep, so an offline rule whose duration exceeds the horizon would never fire.
-// Config-time validation caps offline-rule durations at this same horizon (see
-// services/alertConditions/offlineDuration.ts), so an unsatisfiable rule can't
-// be saved. The horizon (default 24h) is resolved from the shared helper so the
-// cap and the sweep always agree.
-
-// Extra slack added to the selection window so a rule whose duration equals the
-// horizon still fires before the device ages out of the sweep (the firing
-// instant is at lastSeenAt + duration; without slack the device would leave the
-// candidate set at that same instant).
-const REEVAL_HORIZON_GRACE_MINUTES = 5;
-
-// How often the re-evaluation sweep runs. A longer-duration rule fires within
-// roughly this interval of its configured duration. Default 60s.
-const DEFAULT_REEVAL_INTERVAL_MS = 60 * 1000;
-
-/** Whether the offline re-evaluation sweep is enabled (default true). */
-function isReevalEnabled(): boolean {
-  return (process.env.OFFLINE_DETECTOR_REEVAL_ENABLED ?? 'true') !== 'false';
-}
-
-let _configPolicyTableWarningLogged = false;
-
-/** Check if a Drizzle/Postgres error is "relation does not exist" (42P01). */
-function isRelationNotFoundError(error: unknown): boolean {
-  if (!error || typeof error !== 'object') return false;
-  const cause = (error as { cause?: { code?: string } }).cause;
-  // eslint-disable-next-line breeze/no-direct-sqlstate -- Existing guard explicitly reads the Drizzle driver cause.
-  return cause?.code === '42P01';
 }
 
 /**
@@ -162,8 +127,7 @@ function sha256(parts: readonly string[]): string {
 // Skipped-device-row reporting (#5867). A row with an invalid id/orgId/
 // lastSeenAt is re-selected and re-skipped every ~30s sweep until someone
 // fixes it by hand — permanent, not transient — so console.error alone (the
-// file's other benign-and-self-healing paths, e.g. the config-policy-tables
-// warning below) isn't durable signal on its own: no BullMQ job is ever
+// file's other benign-and-self-healing paths) isn't durable signal on its own: no BullMQ job is ever
 // created for the row, so it never reaches attachWorkerObservability's
 // 'failed' handler either. Throttled (like the filterPreviewTimeout /
 // softwareInventoryObservations call sites) so one permanently-bad row
@@ -209,14 +173,12 @@ export function resolveOfflineWorkerConcurrency(raw: string | undefined): number
   return Math.min(20, Math.max(1, parsed));
 }
 
-// Periodic fan-out: re-queue still-offline devices so config-policy offline
-// rules with durations longer than the global threshold fire when their
-// duration elapses (issue #1982).
+// Retain the retired job shapes so already-queued jobs can drain.
 interface ReevaluateOfflineSweepJobData {
   type: 'reevaluate-offline-sweep';
 }
 
-// Per-device: re-evaluate config-policy offline rules for one offline device.
+// Retired per-device evaluation job.
 interface ReevaluateOfflineJobData {
   type: 'reevaluate-offline';
   deviceId: string;
@@ -275,7 +237,7 @@ export function createOfflineWorker(): Worker<OfflineJobData> {
           return await processMarkOffline(job.data as MarkOfflineJobData);
 
         case 'reevaluate-offline':
-          return await runWithSystemDbAccess(() => processReevaluateOffline(job.data as ReevaluateOfflineJobData));
+          return await processReevaluateOffline(job.data as ReevaluateOfflineJobData);
 
         default:
           throw new Error(`Unknown job type: ${(job.data as { type: string }).type}`);
@@ -460,7 +422,8 @@ export async function processMarkOffline(data: MarkOfflineJobData): Promise<{
   const expectedTransitionId = offlineTransitionId(data.orgId, data.deviceId, observedLastSeenAt);
   if (data.transitionId !== expectedTransitionId) throw new Error('Invalid transitionId');
 
-  const effectIds = await runWithSystemDbAccess(async () => {
+  const outcome = await runWithSystemDbAccess(async () => {
+    // own-device-row-allowlisted: offline-sweep-mark-offline
     const [device] = await db.update(devices).set({ status: 'offline' }).where(and(
       eq(devices.id, data.deviceId), eq(devices.orgId, data.orgId),
       inArray(devices.status, ['online', 'updating']),
@@ -468,14 +431,19 @@ export async function processMarkOffline(data: MarkOfflineJobData): Promise<{
       // SQL-side writes (e.g. now()) can leave microseconds in last_seen_at.
       sql`date_trunc('milliseconds', ${devices.lastSeenAt}) = ${observedLastSeenAt}`,
     )).returning();
-    if (!device) return [];
-    return persistOfflineTransition(device, data.transitionId, observedLastSeenAt);
+    if (!device) return { transitioned: false, effectIds: [] as string[] };
+    // The status write IS the transition. A device parked in a holding org
+    // persists no effects (no event, no alert plan), so the effect list can be
+    // empty for a real transition.
+    return {
+      transitioned: true,
+      effectIds: await persistOfflineTransition(device, data.transitionId, observedLastSeenAt),
+    };
   });
-  if (!effectIds.length) return { transitioned: false, alertCreated: false };
   // The database has already admitted the work durably. Failed immediate fan-out
   // is retried by the independent periodic recovery scan, even after a restart.
-  await enqueueOfflineEffects(effectIds);
-  return { transitioned: true, alertCreated: false };
+  await enqueueOfflineEffects(outcome.effectIds);
+  return { transitioned: outcome.transitioned, alertCreated: false };
 
 }
 
@@ -532,35 +500,46 @@ export async function transitionDeviceOffline(
   // offline_transition_effects INSERT all share this one system-scoped
   // transaction — see the doc comment above for why a bare ambient (org-scoped)
   // context would deny the insert under RLS.
-  const effectIds = await runSystemDbAccessOutsideAmbientContext(async () => {
+  const outcome = await runSystemDbAccessOutsideAmbientContext(async () => {
     const [current] = await db
       .select()
       .from(devices)
       .where(and(eq(devices.agentId, agentId), inArray(devices.status, fromStatuses)))
       .limit(1);
-    if (!current) return [];
+    if (!current) return { transitioned: false, effectIds: [] as string[] };
 
     const observedLastSeenAt = canonicalTimestamp(current.lastSeenAt?.toISOString() || '', 'observedLastSeenAt');
     const transitionId = offlineTransitionId(current.orgId, current.id, observedLastSeenAt);
 
+    // #8318 §6.4: shared with the offline sweep and called from the WS
+    // close/error path with no auth context, so the identity predicate is
+    // carried here: `agent_id` = the id this row was just read by. A socket
+    // of a superseded install closing after a reattach confirm matches 0 rows.
+    // own-device-row-allowlisted: transition-device-offline-agent-id
     const [device] = await db.update(devices).set({ status: 'offline', updatedAt: new Date() }).where(and(
       eq(devices.id, current.id), eq(devices.orgId, current.orgId),
+      eq(devices.agentId, agentId),
       inArray(devices.status, fromStatuses),
       // Same ms-precision CAS guard as processMarkOffline (#6024): the write
       // must be against the exact heartbeat observation just read.
       sql`date_trunc('milliseconds', ${devices.lastSeenAt}) = ${observedLastSeenAt}`,
     )).returning();
-    if (!device) return [];
+    if (!device) return { transitioned: false, effectIds: [] as string[] };
 
-    return persistOfflineTransition(device, transitionId, observedLastSeenAt);
+    // Same as processMarkOffline: the status write is the transition, even
+    // when (for a parked device) no effect is persisted.
+    return {
+      transitioned: true,
+      effectIds: await persistOfflineTransition(device, transitionId, observedLastSeenAt),
+    };
   });
-  if (!effectIds.length) return { transitioned: false };
+  if (!outcome.transitioned) return { transitioned: false };
 
   // The database has already admitted the work durably (same as
   // processMarkOffline) — fan-out happens outside the DB context since
   // getOfflineQueue()/addBulk talks to Redis, not Postgres, and a failed
   // immediate enqueue is retried by the independent periodic recovery scan.
-  await enqueueOfflineEffects(effectIds);
+  await enqueueOfflineEffects(outcome.effectIds);
   return { transitioned: true };
 }
 
@@ -581,189 +560,21 @@ export async function processRecoverOfflineEffects(): Promise<{ queued: number }
   return { queued: ids.length };
 }
 
-/**
- * Evaluate configuration-policy alert rules for a freshly-offline device.
- *
- * Delegates to evaluateDeviceAlertsFromPolicy(), which resolves the device's
- * config-policy alert rules from the hierarchy, honours maintenance windows and
- * cooldowns, evaluates each rule's conditions (including offline conditions via
- * the registry's `offline` handler + `status` alias), and writes alerts. Any
- * non-offline rules are no-ops for an offline device since their metric/status
- * conditions won't trip.
- *
- * Errors are reported via the returned `fatalError` rather than thrown inline,
- * so the caller can still run the legacy standalone-rule path before surfacing
- * the failure. The `42P01` "tables not migrated yet" case is treated as a
- * benign warn-once-and-skip (matching alertWorker); any other error is a fatal
- * error the caller MUST re-throw so the BullMQ job is marked failed (logged +
- * sent to Sentry via attachWorkerObservability). Configuration-policy recovery
- * comes from the periodic re-evaluation sweep: a mark-offline retry cannot win
- * the already-committed CAS again. Legacy alert/event recovery after that CAS
- * still needs durable transition effects. Silently swallowing the error would
- * re-open the "offline alerts never fire" symptom of issue #1857 with no
- * failed-job signal.
- *
- * @returns `created` (true if ≥1 config-policy alert was created) and, on an
- *   unexpected error, `fatalError` for the caller to re-throw.
- */
-async function triggerConfigPolicyOfflineAlerts(
-  device: typeof devices.$inferSelect
-): Promise<{ created: boolean; fatalError?: unknown }> {
-  try {
-    const createdIds = await evaluateDeviceAlertsFromPolicy(device.id);
-    if (createdIds.length > 0) {
-      console.log(`[OfflineDetector] Created ${createdIds.length} config-policy alert(s) for device ${device.id}`);
-    }
-    return { created: createdIds.length > 0 };
-  } catch (error) {
-    if (isRelationNotFoundError(error)) {
-      if (!_configPolicyTableWarningLogged) {
-        _configPolicyTableWarningLogged = true;
-        console.warn('[OfflineDetector] Config policy tables not found — run "pnpm db:migrate" to create them. Skipping config policy offline alert evaluation.');
-      }
-      return { created: false };
-    }
-    // Unexpected error — log here for context, but return it so the caller can
-    // run the legacy path first and then re-throw (job fails + retries).
-    console.error(`[OfflineDetector] Error evaluating config policy offline alerts for device ${device.id}:`, error);
-    return { created: false, fatalError: error };
-  }
-}
-
-/**
- * Re-evaluate configuration-policy offline rules for a single still-offline
- * device (issue #1982).
- *
- * The detector only marks a device offline once (online→offline transition), so
- * a config-policy offline rule whose duration is longer than the global ~5-min
- * threshold (e.g. "offline for 60 min") would never fire — nothing re-evaluates
- * the device after it's marked offline. This per-device job, fanned out by
- * processReevaluateOfflineSweep(), re-runs the config-policy offline evaluation
- * so those longer rules fire once their duration elapses. The offline condition
- * handler honours each rule's own duration, and evaluateDeviceAlertsFromPolicy
- * dedups + cools down, so repeated re-evaluation never double-fires.
- *
- * Skips the (cheap) work if the device reconnected since the sweep queued it.
- * Re-throws unexpected errors so the BullMQ job is marked failed (logged + sent
- * to Sentry); these jobs have no `attempts`, so recovery is the next periodic
- * sweep re-queuing the device, not an in-place retry. The benign "tables not
- * migrated yet" (42P01) case is swallowed inside triggerConfigPolicyOfflineAlerts.
- */
+/** Drain jobs queued before retirement without evaluating historical sources. */
 export async function processReevaluateOffline(data: ReevaluateOfflineJobData): Promise<{
   deviceId: string;
   alertCreated: boolean;
   durationMs: number;
 }> {
-  const startTime = Date.now();
-
-  const [device] = await db
-    .select()
-    .from(devices)
-    .where(eq(devices.id, data.deviceId))
-    .limit(1);
-
-  // Device is gone or has reconnected — nothing to re-evaluate. (The offline
-  // handler keys off lastSeenAt and wouldn't fire for a reconnected device
-  // anyway, but skipping here avoids needless evaluation work.)
-  // Ephemeral Quick Support devices never alert (see processMarkOffline) — an
-  // ad-hoc session ending is not an incident. Checked here as well as at the
-  // sweep because jobs queued before this deploy may still be in flight.
-  if (!device || device.status !== 'offline' || device.isEphemeral) {
-    return { deviceId: data.deviceId, alertCreated: false, durationMs: Date.now() - startTime };
-  }
-
-  const result = await triggerConfigPolicyOfflineAlerts(device);
-  if (result.fatalError) throw result.fatalError;
-
-  return { deviceId: data.deviceId, alertCreated: result.created, durationMs: Date.now() - startTime };
+  return { deviceId: data.deviceId, alertCreated: false, durationMs: 0 };
 }
 
-/**
- * Periodic sweep that re-queues still-offline devices for config-policy offline
- * rule re-evaluation (issue #1982).
- *
- * Finds devices that are already `offline` and were last seen within the
- * re-evaluation horizon, and fans out one `reevaluate-offline` job per device.
- * Bounded by the same chunk/cap shape as the detect sweep, plus a recency
- * horizon, so the cost is capped even on large fleets. Disable entirely with
- * OFFLINE_DETECTOR_REEVAL_ENABLED=false.
- */
+/** Drain old sweep jobs without scheduling more retired evaluations. */
 export async function processReevaluateOfflineSweep(): Promise<{
   queued: number;
   durationMs: number;
 }> {
-  const startTime = Date.now();
-
-  if (!isReevalEnabled()) {
-    return { queued: 0, durationMs: Date.now() - startTime };
-  }
-
-  // Select devices last seen within the horizon (+ a small grace so a rule whose
-  // duration equals the horizon still fires before the device ages out).
-  const selectionMinutes = resolveReevalHorizonMinutes() + REEVAL_HORIZON_GRACE_MINUTES;
-  const horizonTime = new Date(Date.now() - selectionMinutes * 60 * 1000);
-
-  // Env tunables — same shape as the detect sweep. cap=0 means unlimited per run.
-  const cap = envInt('OFFLINE_DETECTOR_REEVAL_MAX_DEVICES_PER_RUN', 5000);
-  const chunkSize = Math.max(1, envInt('OFFLINE_DETECTOR_REEVAL_CHUNK_SIZE', 500));
-
-  const queue = getOfflineQueue();
-  let totalQueued = 0;
-  let cursor: string | null = null;
-
-  while (true) {
-    const remaining = cap > 0 ? Math.max(0, cap - totalQueued) : chunkSize;
-    if (cap > 0 && remaining === 0) {
-      console.warn(`[OfflineDetector] Hit OFFLINE_DETECTOR_REEVAL_MAX_DEVICES_PER_RUN=${cap}; remainder will be picked up next run`);
-      break;
-    }
-
-    const limit = Math.min(chunkSize, remaining || chunkSize);
-
-    const conditions = [
-      eq(devices.status, 'offline'),
-      gt(devices.lastSeenAt, horizonTime),
-      // Ephemeral Quick Support devices are alert-exempt, and this sweep only
-      // ever queues alert re-evaluation — filtering here avoids queueing jobs
-      // that would immediately no-op.
-      eq(devices.isEphemeral, false)
-    ];
-    if (cursor) conditions.push(gt(devices.id, cursor));
-
-    // Page read inside its own system context, which CLOSES before the addBulk
-    // below (#1105 / #3233).
-    const chunk = await runWithSystemDbAccess(async () =>
-      db
-        .select({ id: devices.id, orgId: devices.orgId })
-        .from(devices)
-        .where(and(...conditions))
-        .orderBy(asc(devices.id))
-        .limit(limit)
-    );
-
-    if (chunk.length === 0) break;
-
-    const jobs = chunk.map(device => ({
-      name: 'reevaluate-offline',
-      data: {
-        type: 'reevaluate-offline' as const,
-        deviceId: device.id,
-        orgId: device.orgId
-      }
-    }));
-
-    await queue.addBulk(jobs);
-    totalQueued += jobs.length;
-    cursor = chunk[chunk.length - 1]!.id;
-
-    if (chunk.length < limit) break;
-  }
-
-  if (totalQueued > 0) {
-    console.log(`[OfflineDetector] Re-queued ${totalQueued} offline device(s) for config-policy offline rule re-evaluation`);
-  }
-
-  return { queued: totalQueued, durationMs: Date.now() - startTime };
+  return { queued: 0, durationMs: 0 };
 }
 
 /**
@@ -856,7 +667,24 @@ export async function processReapUninstallIntent(): Promise<{
       // and is guarded on this same status list. Exclude them so a reaped
       // device isn't re-selected (and re-audited) forever. Same guard list as
       // heartbeat.ts's own device UPDATE.
-      notInArray(devices.status, ['decommissioned', 'quarantined'])
+      notInArray(devices.status, ['decommissioned', 'quarantined']),
+      // #5016 — the automatic edition migration uninstalls the agent itself,
+      // and that `msiexec /x` fires UninstallNotify. An intent stamped inside
+      // the migration window is the migration's, not a removal: if the
+      // reinstall then failed, reaping would hide an agentless device an
+      // operator has to go and fix, 403 its token so even a hand-restored
+      // identity could not come back, and silently release the org's canary
+      // hold (agentEditionAutoMigrate.ts). Such a device stays offline and
+      // visible instead. An intent outside the window (a real uninstall long
+      // after a migration) is reaped as usual.
+      or(
+        isNull(devices.editionMigrationDispatchedAt),
+        lt(devices.uninstallIntentAt, devices.editionMigrationDispatchedAt),
+        gt(
+          devices.uninstallIntentAt,
+          sql`${devices.editionMigrationDispatchedAt} + ${EDITION_MIGRATION_SETTLE_INTERVAL}::interval`
+        )
+      )
     ];
     const selectConditions = [...reapPredicate];
     if (cursor) selectConditions.push(gt(devices.id, cursor));
@@ -885,6 +713,7 @@ export async function processReapUninstallIntent(): Promise<{
       // the context closes between candidates rather than spanning the whole
       // chunk (#3233).
       const reaped = await runWithSystemDbAccess(async () => {
+        // own-device-row-allowlisted: uninstall-intent-reaper
         const [updated] = await db
           .update(devices)
           // decommissionedAt (#2787 item 4): a reaped device is a REMOVED
@@ -904,6 +733,7 @@ export async function processReapUninstallIntent(): Promise<{
         // banner/badge persists forever with nothing left to compare against.
         // Scoped to the reaped device's own org, matching the surrounding
         // per-candidate write pattern.
+        // own-device-row-allowlisted: uninstall-intent-reaper
         await db
           .update(devices)
           .set({ possibleReplacementOfDeviceId: null, updatedAt: new Date() })
@@ -920,6 +750,15 @@ export async function processReapUninstallIntent(): Promise<{
       if (!reaped) continue;
 
       totalDecommissioned++;
+
+      // #9933: dynamic groups leave out removed devices. The write above has
+      // committed (its context closed), so enqueue directly; never rejects.
+      void requestDeviceGroupReevaluation({
+        deviceId: candidate.id,
+        orgId: candidate.orgId,
+        eventType: 'device.created',
+        reason: 'device_decommissioned',
+      });
 
       createAuditLogAsync({
         orgId: candidate.orgId,
@@ -976,31 +815,7 @@ export async function scheduleOfflineJobs(): Promise<void> {
     }
   );
 
-  // Schedule the re-evaluation sweep so longer-duration config-policy offline
-  // rules fire when their duration elapses (issue #1982). Gated by env so it can
-  // be disabled independently of offline detection.
-  if (isReevalEnabled()) {
-    const reevalIntervalMs = Math.max(
-      5_000,
-      envInt('OFFLINE_DETECTOR_REEVAL_INTERVAL_MS', DEFAULT_REEVAL_INTERVAL_MS)
-    );
-    await queue.add(
-      'reevaluate-offline-sweep',
-      { type: 'reevaluate-offline-sweep' },
-      {
-        repeat: {
-          every: reevalIntervalMs
-        },
-        removeOnComplete: { count: 10 },
-        removeOnFail: { count: 50 }
-      }
-    );
-    console.log(`[OfflineDetector] Scheduled offline re-evaluation sweep every ${reevalIntervalMs}ms`);
-  }
-
-  // Task 5 (#2764) — always on (unlike the reeval sweep, this isn't an
-  // optional alerting feature: a stuck uninstall-intent stamp is a fleet-count
-  // correctness bug).
+  // Always reap stale uninstall intents; they affect fleet counts.
   const uninstallIntentReapIntervalMs = Math.max(
     60_000,
     envInt('UNINSTALL_INTENT_REAP_INTERVAL_MS', DEFAULT_UNINSTALL_INTENT_REAP_INTERVAL_MS)
@@ -1029,7 +844,7 @@ export async function triggerOfflineDetection(thresholdMinutes?: number): Promis
   const queue = getOfflineQueue();
   const normalizedThreshold = typeof thresholdMinutes === 'number' ? thresholdMinutes : 'default';
   const slot = Math.floor(Date.now() / ON_DEMAND_OFFLINE_DEDUPE_WINDOW_MS).toString(36);
-  const jobId = `offline-detect:${normalizedThreshold}:${slot}`;
+  const jobId = bullmqJobId('offline-detect', normalizedThreshold, slot);
   const existing = await queue.getJob(jobId);
   if (existing) {
     const state = await existing.getState();

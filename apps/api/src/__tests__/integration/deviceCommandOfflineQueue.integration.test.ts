@@ -16,6 +16,7 @@ import {
   patchJobResults,
   patchJobs,
   patches,
+  rolePermissions,
   scriptExecutionBatches,
   scriptExecutions,
   scripts,
@@ -36,7 +37,8 @@ import { claimPendingCommandsForDevice } from '../../services/commandDispatch';
 import { deliveryTtlMs } from '../../services/commandOfflinePolicy';
 import { dispatchDeviceCommand } from '../../services/dispatchDeviceCommand';
 import { createAccessToken } from '../../services/jwt';
-import { createOrganization, createPartner, createSite, setupTestEnvironment } from './db-utils';
+import { clearPermissionCache } from '../../services/permissions';
+import { createOrganization, createPartner, createSite, setupTestEnvironment, deviceAgentId } from './db-utils';
 import { getTestDb } from './setup';
 
 /**
@@ -69,7 +71,7 @@ function asSystem<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 function claim(deviceId: string) {
-  return asSystem(() => claimPendingCommandsForDevice(deviceId, 10, 'agent', undefined, { ...AGENT_CAPS }));
+  return asSystem(async () => claimPendingCommandsForDevice({ deviceId: deviceId, agentId: await deviceAgentId(deviceId), installIncarnation: 1 }, 10, 'agent', undefined, { ...AGENT_CAPS }));
 }
 
 type DeviceStatus = (typeof devices.$inferInsert)['status'];
@@ -541,6 +543,31 @@ describe('device command offline queue — real PostgreSQL (#5128 W1)', () => {
     const after = await commandRow(res.command.id);
     expect(after?.status).toBe('cancelled');
     expect(after?.result).toMatchObject({ reason: 'requester_inactive' });
+  });
+
+  it('a queued script is cancelled at claim once its requester loses scripts:execute, without being disabled', async () => {
+    const device = await makeDevice(env.organization.id, env.site.id, 'online');
+    const [command] = await getTestDb()
+      .insert(deviceCommands)
+      .values({
+        deviceId: device.id,
+        type: 'script',
+        payload: { timeoutSeconds: 300 },
+        status: 'pending',
+        submittedOrgId: env.organization.id,
+        createdBy: env.user.id,
+      })
+      .returning();
+
+    // Requester still active — this is a role downgrade, not an offboarding.
+    // Revoking the wildcard grant simulates demotion to a read-only role.
+    await getTestDb().delete(rolePermissions).where(eq(rolePermissions.roleId, env.role.id));
+    await clearPermissionCache(env.user.id);
+
+    expect(await claim(device.id)).toEqual([]);
+    const after = await commandRow(command!.id);
+    expect(after?.status).toBe('cancelled');
+    expect(after?.result).toMatchObject({ reason: 'scope_changed' });
   });
 
   it('the cancel-on-event predicate spares in-flight work', async () => {

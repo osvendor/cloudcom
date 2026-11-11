@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useId, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import '@/lib/i18n';
-import { Plus, Pencil, Trash2, ListChecks } from 'lucide-react';
+import { Plus, Pencil, Trash2, ListChecks, Copy } from 'lucide-react';
 import { fetchWithAuth, useAuthStore } from '../../stores/auth';
 import { useOrgStore } from '../../stores/orgStore';
 import { useDefaultOwnerScope, type OwnerScope } from '../../hooks/useDefaultOwnerScope';
@@ -9,6 +9,7 @@ import {
   addChecklistTemplateItem,
   createChecklistTemplate,
   deleteChecklistTemplate,
+  duplicateChecklistTemplate,
   listChecklistTemplates,
   removeChecklistTemplateItem,
   updateChecklistTemplate,
@@ -17,6 +18,7 @@ import {
 } from '../../lib/api/ticketChecklistTemplates';
 import { ActionError, handleActionError } from '../../lib/runAction';
 import { runClientAction } from '../../lib/runClientAction';
+import { useStableT } from '@/lib/i18n/useStableT';
 
 type ModalMode = 'closed' | 'create' | 'edit' | 'delete';
 
@@ -39,6 +41,7 @@ const labelClass = 'block text-xs font-medium text-muted-foreground';
  */
 export default function TicketChecklistTemplatesPage() {
   const { t } = useTranslation('checklists');
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   const uid = useId();
 
   const [templates, setTemplates] = useState<ChecklistTemplate[] | LoadFailure | null>(null);
@@ -60,6 +63,7 @@ export default function TicketChecklistTemplatesPage() {
   const [submitting, setSubmitting] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
 
+  const [duplicatingId, setDuplicatingId] = useState<string | null>(null);
   const [itemEditor, setItemEditor] = useState<{ templateId: string } | null>(null);
   const [itemLabel, setItemLabel] = useState('');
   const [itemSubmitting, setItemSubmitting] = useState(false);
@@ -73,10 +77,10 @@ export default function TicketChecklistTemplatesPage() {
     } catch (err) {
       console.error('[TicketChecklistTemplatesPage] failed to load templates', err);
       const message =
-        err instanceof ActionError && err.message ? err.message : t('templates.errors.loadFailed');
+        err instanceof ActionError && err.message ? err.message : stableT('templates.errors.loadFailed');
       setTemplates({ failed: true, message });
     }
-  }, [t]);
+  }, [stableT]);
 
   useEffect(() => {
     void load();
@@ -193,6 +197,26 @@ export default function TicketChecklistTemplatesPage() {
       handleActionError(err, t('templates.errors.saveFailed'));
     } finally {
       setSubmitting(false);
+    }
+  };
+
+  // #9180: the copy keeps the source's owner (the server enforces it), so no
+  // scope is asked for. The list is name-sorted, so the copy is slotted in place.
+  const handleDuplicate = async (tpl: ChecklistTemplate) => {
+    if (duplicatingId) return; // a double-click must not mint "Copy of X (2)"
+    setDuplicatingId(tpl.id);
+    try {
+      const copy = await runClientAction(() => duplicateChecklistTemplate(fetchWithAuth, tpl.id), {
+        errorFallback: t('templates.errors.duplicateFailed'),
+        successMessage: (c) => t('templates.duplicateSuccess', { name: c.name }),
+      });
+      setTemplates((prev) =>
+        Array.isArray(prev) ? [...prev, copy].sort((a, b) => a.name.localeCompare(b.name)) : prev,
+      );
+    } catch (err) {
+      handleActionError(err, t('templates.errors.duplicateFailed'));
+    } finally {
+      setDuplicatingId(null);
     }
   };
 
@@ -323,6 +347,17 @@ export default function TicketChecklistTemplatesPage() {
                       title={t('actions.edit')}
                     >
                       <Pencil className="h-4 w-4" />
+                    </button>
+                    <button
+                      type="button"
+                      data-testid={`checklist-template-duplicate-${tpl.id}`}
+                      onClick={() => void handleDuplicate(tpl)}
+                      disabled={duplicatingId !== null}
+                      className="inline-flex h-8 w-8 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
+                      title={t('templates.duplicate')}
+                      aria-label={t('templates.duplicate')}
+                    >
+                      <Copy className="h-4 w-4" />
                     </button>
                     <button
                       type="button"

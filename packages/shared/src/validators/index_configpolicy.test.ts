@@ -1,3 +1,4 @@
+import { CONFIG_FEATURE_TYPES, RETIRED_CONFIG_FEATURE_TYPES } from '../constants/configFeatureTypes';
 import { describe, it, expect } from 'vitest';
 import {
   // Config Policy
@@ -87,20 +88,14 @@ describe('addFeatureLinkSchema', () => {
 
   it('should accept with inlineSettings', () => {
     const result = addFeatureLinkSchema.safeParse({
-      featureType: 'monitoring',
-      inlineSettings: { interval: 60 },
+      featureType: 'monitors',
+      inlineSettings: { checkIntervalSeconds: 60 },
     });
     expect(result.success).toBe(true);
   });
 
   it('should accept all feature types', () => {
-    const featureTypes = [
-      'patch', 'alert_rule', 'backup', 'security', 'monitoring',
-      'maintenance', 'compliance', 'automation', 'event_log',
-      'software_policy', 'sensitive_data', 'peripheral_control',
-      'warranty', 'helper',
-    ] as const;
-    for (const featureType of featureTypes) {
+    for (const featureType of CONFIG_FEATURE_TYPES) {
       const result = addFeatureLinkSchema.safeParse({
         featureType,
         inlineSettings: {},
@@ -109,11 +104,36 @@ describe('addFeatureLinkSchema', () => {
     }
   });
 
+  // Create is deliberately stricter than update: "no linked feature policy"
+  // is expressed by omitting the key. Clients must not send null here
+  // (useFeatureLink strips it; RecommendedMonitors did not, #7627).
+  it('rejects a null featurePolicyId on create even with inlineSettings (#7627)', () => {
+    const result = addFeatureLinkSchema.safeParse({
+      featureType: 'monitors',
+      featurePolicyId: null,
+      inlineSettings: { items: [], inheritance: 'cumulative' },
+    });
+    expect(result.success).toBe(false);
+    expect(result.success ? [] : result.error.issues.map((i) => i.path.join('.'))).toContain('featurePolicyId');
+  });
+
+  it('accepts the same create body with featurePolicyId omitted (#7627)', () => {
+    const result = addFeatureLinkSchema.safeParse({
+      featureType: 'monitors',
+      inlineSettings: { items: [], inheritance: 'cumulative' },
+    });
+    expect(result.success).toBe(true);
+  });
+
   it('should reject without featurePolicyId and inlineSettings', () => {
     const result = addFeatureLinkSchema.safeParse({
       featureType: 'patch',
     });
     expect(result.success).toBe(false);
+  });
+
+  it.each(RETIRED_CONFIG_FEATURE_TYPES)('rejects retired feature type %s', (featureType) => {
+    expect(addFeatureLinkSchema.safeParse({ featureType, inlineSettings: {} }).success).toBe(false);
   });
 
   it('should reject invalid feature type', () => {

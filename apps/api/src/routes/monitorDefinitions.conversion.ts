@@ -2,6 +2,7 @@ import { Hono, type MiddlewareHandler } from 'hono';
 import { z } from 'zod';
 import { zValidator } from '../lib/validation';
 import { authMiddleware, requireMfa, requirePermission, requireScope, type AuthContext } from '../middleware/auth';
+import type { UserPermissions } from '../services/permissions';
 import { PERMISSIONS } from '../services/permissions';
 import { writeRouteAudit } from '../services/auditEvents';
 import { canManagePartnerWidePolicies, PARTNER_WIDE_WRITE_DENIED_MESSAGE } from '../services/partnerWideAccess';
@@ -13,7 +14,14 @@ import {
   ConversionError, ConversionPrerequisiteMissingError,
 } from '../services/monitors/conversion';
 
-type Env = { Variables: { auth: AuthContext } };
+import { readRetirementReport } from '../services/monitors/conversion/loadSources';
+import {
+  previewNetworkCheckConversion, convertNetworkChecks, NetworkCheckConversionError,
+} from '../services/monitors/conversion/networkChecks';
+import { NetworkHistoryError } from '../services/monitors/conversion/networkHistory';
+import { conversionRefusalResponse } from './monitorConversionErrors';
+
+type Env = { Variables: { auth: AuthContext; permissions?: UserPermissions } };
 export const monitorConversionRoutes = new Hono<Env>();
 // Also authenticated when mounted in isolation by tools/tests. The real auth
 // middleware already short-circuits an existing authenticated context.
@@ -40,18 +48,43 @@ const retireBody = z.object({
 }).strict();
 
 monitorConversionRoutes.onError((error, c) => {
+  if (error instanceof NetworkCheckConversionError) return c.json({ error: error.code }, error.status);
+  if (error instanceof NetworkHistoryError) return c.json({ error: error.code }, error.status);
   if (error instanceof ConversionPrerequisiteMissingError) {
     return c.json({ error: 'CONVERSION_PREREQUISITE_MISSING', missing: error.missing }, 409);
   }
   if (!(error instanceof ConversionError)) throw error;
-  if (error.code === 'prerequisite_missing') {
-    return c.json({ error: 'CONVERSION_PREREQUISITE_MISSING', missing: Array.isArray(error.details) ? error.details : [] }, 409);
-  }
-  const status = error.code === 'partner_wide_denied' ? 403
-    : ['policy_not_found', 'source_not_found', 'conversion_not_found'].includes(error.code) ? 404
-    : error.code === 'invalid_reason' ? 400 : 409;
-  return c.json({ error: error.code, message: error.message, details: error.details }, status);
+  const mapped = conversionRefusalResponse(error);
+  return c.json(mapped.body, mapped.status);
 });
+
+const networkGovernance: MiddlewareHandler<Env> = async (c, next) => {
+  if (!canMutateOrgWideGovernance(c.get('auth')) || Array.isArray(c.get('permissions')?.allowedSiteIds)) {
+    return c.json({ error: 'site_restricted_conversion' }, 403);
+  }
+  await next();
+};
+const networkOrg = z.object({ orgId: z.string().uuid() });
+monitorConversionRoutes.get('/network-checks', read, networkGovernance,
+  zValidator('query', networkOrg), async (c) => {
+    const { orgId } = c.req.valid('query');
+    const auth = c.get('auth');
+    if (!auth.canAccessOrg(orgId)) return c.json({ error: 'org_not_found' }, 404);
+    return c.json(await previewNetworkCheckConversion(orgId, auth));
+  });
+monitorConversionRoutes.post('/network-checks/convert', write, requireMfa(), networkGovernance,
+  zValidator('json', networkOrg.extend({
+    previewHash: z.string().regex(/^[a-f0-9]{64}$/),
+    sourceIds: z.array(z.string().uuid()).min(1).max(500).optional(),
+  }).strict()), async (c) => {
+    const { orgId, previewHash, sourceIds } = c.req.valid('json');
+    const auth = c.get('auth');
+    if (!auth.canAccessOrg(orgId)) return c.json({ error: 'org_not_found' }, 404);
+    const result = await convertNetworkChecks(orgId, previewHash, auth, { sourceIds });
+    writeRouteAudit(c, { orgId, action: 'network_check.convert_to_monitor', resourceType: 'configuration_policy',
+      resourceId: result.policyId ?? orgId, details: { monitorsCreated: result.monitorsCreated, sourceIds: sourceIds ?? null } });
+    return c.json(result);
+  });
 
 monitorConversionRoutes.post('/partner/preview', read, governance, async (c) => {
   const auth = c.get('auth');
@@ -61,6 +94,7 @@ monitorConversionRoutes.post('/partner/preview', read, governance, async (c) => 
 });
 monitorConversionRoutes.get('/ledger', read,
   zValidator('query', z.object({ orgId: z.string().uuid().optional(), policyId: z.string().uuid().optional(),
+    sourceTable: z.enum(MONITOR_CONVERSION_SOURCE_TABLES).optional(),
     cursor: z.string().uuid().optional(), limit: z.coerce.number().int().min(1).max(100).default(25) })), async (c) => {
     return c.json(await listConversionLedger(c.req.valid('query'), c.get('auth')));
   });
@@ -74,7 +108,10 @@ monitorConversionRoutes.get('/pending', read,
       orgId, partnerId: auth.partnerId,
       includePartnerWide: canManagePartnerWidePolicies(auth),
     });
-    return c.json({ data: { policies: counts.policies, rows: counts.rows } });
+    const report = await readRetirementReport(auth, orgId);
+    const networkChecks = canMutateOrgWideGovernance(auth) && !Array.isArray(c.get('permissions')?.allowedSiteIds)
+      ? counts.networkChecks : 0;
+    return c.json({ data: { policies: counts.policies, rows: counts.rows, pendingPolicies: counts.pendingPolicies, networkChecks, ...report } });
   });
 monitorConversionRoutes.get('/policies/:policyId/preview', read,
   zValidator('param', policyParam), async (c) => {

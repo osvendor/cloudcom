@@ -1,9 +1,24 @@
+import './topologyZod';
 import { z } from 'zod';
+import { AI_RECORD_KINDS } from '../types/ai';
 import { scriptParameterDefinitionsSchema } from './scriptParameterDefinitions';
+import { offeringOptionsSchema } from './aiModelOptions';
+import { aiModelChoiceSchema } from './aiModelChoice';
 
 // ============================================
 // Page Context Validators
 // ============================================
+
+export const aiTopologyPageContextSchema = z.object({
+  type: z.literal('topology'),
+  siteId: z.string().guid(),
+  subject: z.object({
+    kind: z.enum(['node', 'relationship']),
+    id: z.string().guid()
+  }).strict(),
+  view: z.enum(['overview', 'physical', 'logical']),
+  graphRevision: z.string().regex(/^(0|[1-9]\d{0,19})$/)
+}).strict();
 
 export const aiPageContextSchema = z.discriminatedUnion('type', [
   z.object({
@@ -34,7 +49,21 @@ export const aiPageContextSchema = z.discriminatedUnion('type', [
     type: z.literal('custom'),
     label: z.string(),
     data: z.record(z.string(), z.unknown())
-  })
+  }),
+  // Topology M4 (#6000): the selection an "Explain this" investigation starts
+  // from. Only IDs — never evidence bodies, labels, org ids or credentials. The
+  // server authorizes `siteId` at session creation and PINS the session to it
+  // (ai_sessions.topology_site_id, M4-D2); a later page context never moves it.
+  aiTopologyPageContextSchema,
+  z.object({
+    type: z.literal('record'),
+    kind: z.enum(AI_RECORD_KINDS),
+    id: z.string().guid(),
+    // Client hint only; the server resolves the record's organization.
+    orgId: z.string().guid().optional(),
+    // Web badge only; the server reads record details itself.
+    label: z.string().max(200).optional()
+  }).strict()
 ]);
 
 // ============================================
@@ -43,13 +72,22 @@ export const aiPageContextSchema = z.discriminatedUnion('type', [
 
 export const createAiSessionSchema = z.object({
   pageContext: aiPageContextSchema.optional(),
-  model: z.string().max(100).optional(),
+  /** Registry offering to run this session on (#7598 W03). */
+  offeringId: z.string().uuid().optional(),
+  /** Per-call options the user chose; absent keys follow the assignment. */
+  options: offeringOptionsSchema.partial().optional(),
   title: z.string().max(255).optional()
 });
 
 export const sendAiMessageSchema = z.object({
   content: z.string().min(1).max(10000),
-  pageContext: aiPageContextSchema.optional()
+  pageContext: aiPageContextSchema.optional(),
+  /**
+   * W05 (#7603): the composer's model choice for THIS turn. Resolved as a
+   * strict user choice; stamped on the session only by the turn claim.
+   * Absent = keep the session's stored offering.
+   */
+  model: aiModelChoiceSchema.optional(),
 });
 
 export const approveToolSchema = z.object({

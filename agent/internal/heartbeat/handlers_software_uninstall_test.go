@@ -33,7 +33,7 @@ func TestHandleSoftwareUninstallReReportsOnlyOnSuccess(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			orig := uninstallSoftware
 			t.Cleanup(func() { uninstallSoftware = orig })
-			uninstallSoftware = func(map[string]any) tools.CommandResult { return tc.result }
+			uninstallSoftware = func(map[string]any, tools.UserUninstallExec) tools.CommandResult { return tc.result }
 
 			fired := false
 			h := &Heartbeat{sendSoftwareInventoryFn: func() { fired = true }}
@@ -52,7 +52,7 @@ func TestHandleSoftwareUninstallReReportsOnlyOnSuccess(t *testing.T) {
 func TestHandleSoftwareUninstallNilHeartbeatDoesNotPanic(t *testing.T) {
 	orig := uninstallSoftware
 	t.Cleanup(func() { uninstallSoftware = orig })
-	uninstallSoftware = func(map[string]any) tools.CommandResult {
+	uninstallSoftware = func(map[string]any, tools.UserUninstallExec) tools.CommandResult {
 		return tools.NewSuccessResult(map[string]any{"action": "uninstall"}, 1)
 	}
 

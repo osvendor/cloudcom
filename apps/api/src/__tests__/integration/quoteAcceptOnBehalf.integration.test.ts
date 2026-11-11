@@ -2,7 +2,9 @@ import './setup';
 import { describe, expect, it } from 'vitest';
 import { eq } from 'drizzle-orm';
 import { db, withDbAccessContext, withSystemDbAccessContext, type DbAccessContext } from '../../db';
-import { quotes, quoteAcceptances, quoteRecipients } from '../../db/schema/quotes';
+import { quotes, quoteAcceptances, quoteBlocks, quoteRecipients } from '../../db/schema/quotes';
+import { contractDocuments, contractTemplates, contractTemplateVersions } from '../../db/schema/contractDocuments';
+import { loadContractBlockRenderData } from '../../services/contractTemplateRender';
 import { invoices } from '../../db/schema/invoices';
 import { contracts } from '../../db/schema/contracts';
 import { organizations } from '../../db/schema/orgs';
@@ -57,11 +59,14 @@ describe('accept on behalf — draft straight to issued invoice', () => {
       taxable: true, customerVisible: true, recurrence: 'monthly',
     } as never, actor));
 
-    // Pin the quote's tax snapshot at 10%, then move the ORG's live rate to
-    // 25% — the invoice must issue at the quote's frozen 10%, never the org's
-    // current rate (the whole point of "lock the quote total").
-    await withSystemDbAccessContext(() => db.update(quotes).set({ taxRate: '0.10000' }).where(eq(quotes.id, created.id)));
-    await withSystemDbAccessContext(() => db.update(organizations).set({ taxRate: '0.25000' }).where(eq(organizations.id, org.id)));
+    // The draft was created and last edited with NO rate; the org's rate becomes
+    // 10% only afterwards. Claiming the draft is its snapshot moment (#7507), so
+    // the quote must freeze at 10% and the invoice issue at the quote's frozen
+    // rate — never the stale draft value (0%).
+    await withSystemDbAccessContext(() => db.update(organizations).set({ taxRate: '0.10000' }).where(eq(organizations.id, org.id)));
+    const [stale] = await withSystemDbAccessContext(() =>
+      db.select({ taxRate: quotes.taxRate }).from(quotes).where(eq(quotes.id, created.id)));
+    expect(stale!.taxRate).toBeNull();
 
     // NOT sent. The tech closed it on the phone before it ever went out.
     const before = await withSystemDbAccessContext(() =>
@@ -95,7 +100,7 @@ describe('accept on behalf — draft straight to issued invoice', () => {
     expect(inv!.taxRate).toBe(q!.taxRate);
     expect(inv!.taxRate).toBe('0.10000');
     expect(inv!.subtotal).toBe('250.00');   // only the one-time line
-    expect(inv!.total).toBe('275.00');      // 250 + 10% (NOT 312.50, the 25% org rate)
+    expect(inv!.total).toBe('275.00');      // 250 + 10% (NOT 250.00, the stale draft's 0%)
 
     // The invoice's bill-to is the CLAIM's frozen snapshot of the org's
     // billing profile, not blank — the overlay→invoice linkage.
@@ -134,6 +139,66 @@ describe('accept on behalf — draft straight to issued invoice', () => {
     const foreignRead = await withDbAccessContext(otherCtx, () =>
       db.select().from(quoteAcceptances).where(eq(quoteAcceptances.id, res.acceptanceId)));
     expect(foreignRead).toHaveLength(0);
+  });
+
+  runDb('files the executed contract document with the on-behalf evidence snapshot (#8865 W1b)', async () => {
+    const { partner, org, actorUser } = await seed();
+    const ctx = ctxFor(org.id, partner.id);
+    const actor = actorFor(org.id, partner.id);
+    const created = await withDbAccessContext(ctx, () => createQuote({ orgId: org.id, currencyCode: 'USD' }, actor));
+    await withDbAccessContext(ctx, () => addManualLine(created.id, {
+      sourceType: 'manual', description: 'Onboarding', quantity: 1, unitPrice: 250,
+      taxable: false, customerVisible: true, recurrence: 'one_time',
+    } as never, actor));
+    await withSystemDbAccessContext(async () => {
+      const [template] = await db.insert(contractTemplates)
+        .values({ orgId: org.id, partnerId: null, name: 'On-behalf MSA' }).returning({ id: contractTemplates.id });
+      const [version] = await db.insert(contractTemplateVersions).values({
+        templateId: template!.id, orgId: org.id, partnerId: null, versionNumber: 1,
+        status: 'published', sourceType: 'authored', bodyHtml: '<p>MSA for {{client.name}}</p>',
+        sha256: 'b'.repeat(64), declaredVariables: [], publishedAt: new Date(),
+      }).returning({ id: contractTemplateVersions.id });
+      await db.insert(quoteBlocks).values({
+        quoteId: created.id, orgId: org.id, blockType: 'contract',
+        content: { templateId: template!.id, templateVersionId: version!.id, variableValues: {} }, sortOrder: 1,
+      });
+    });
+    const blocks = await withSystemDbAccessContext(() =>
+      db.select({ id: quoteBlocks.id, blockType: quoteBlocks.blockType, content: quoteBlocks.content })
+        .from(quoteBlocks).where(eq(quoteBlocks.quoteId, created.id)));
+    const contractRenderData = await loadContractBlockRenderData(blocks);
+
+    const res = await withSystemDbAccessContext(() => acceptQuote({
+      quoteId: created.id, signerName: 'Dana Buyer', signerEmail: 'dana@customer.example',
+      ipAddress: '10.0.0.7', userAgent: 'tech-browser',
+      origin: 'on_behalf', method: 'purchase_order', reference: 'PO 4471',
+      actorUserId: actorUser.id, contractRenderData,
+    }));
+    expect(res.contractDocumentIds).toHaveLength(1);
+
+    const [acc] = await withSystemDbAccessContext(() =>
+      db.select().from(quoteAcceptances).where(eq(quoteAcceptances.id, res.acceptanceId)));
+    const [doc] = await withSystemDbAccessContext(() =>
+      db.select().from(contractDocuments).where(eq(contractDocuments.id, res.contractDocumentIds[0]!)));
+    expect(doc).toMatchObject({
+      sourceKind: 'quote',
+      quoteId: created.id,
+      quoteAcceptanceId: res.acceptanceId,
+      agreementRequestId: null,
+      signerName: 'Dana Buyer',
+      signerEmail: 'dana@customer.example',
+      signerIp: '10.0.0.7',
+      signerUserAgent: 'tech-browser',
+      acceptanceOrigin: 'on_behalf',
+      acceptanceMethod: 'purchase_order',
+      acceptanceReference: 'PO 4471',
+      recordedByUserId: actorUser.id,
+      contentSha256: acc!.quoteSha256,
+      contentHashVersion: 2,
+      acceptanceRenderLocale: acc!.renderLocale,
+    });
+    // The snapshot's signed_at is the acceptance row's DB-default signed_at.
+    expect(doc!.signedAt!.getTime()).toBe(acc!.signedAt.getTime());
   });
 
   runDb('refuses a second accept on the same quote (one invoice, not two)', async () => {
@@ -197,6 +262,27 @@ describe('accept on behalf — draft straight to issued invoice', () => {
 
     const [q] = await withSystemDbAccessContext(() => db.select().from(quotes).where(eq(quotes.id, created.id)));
     expect(q!.status).toBe('draft'); // untouched by the rejected attempt
+  });
+
+  // #9963: accepting an item-less draft on behalf used to claim it and convert
+  // it into a $0 draft invoice. Refused before anything is written.
+  runDb('refuses an item-less draft (422 QUOTE_EMPTY): stays a draft, no invoice, no acceptance', async () => {
+    const { partner, org, actorUser } = await seed();
+    const ctx = ctxFor(org.id, partner.id);
+    const actor = actorFor(org.id, partner.id);
+    const created = await withDbAccessContext(ctx, () => createQuote({ orgId: org.id, currencyCode: 'USD' }, actor));
+
+    await expect(withSystemDbAccessContext(() => acceptQuote({
+      quoteId: created.id, signerName: 'Dana Buyer',
+      origin: 'on_behalf', method: 'verbal', reference: 'call', actorUserId: actorUser.id,
+    }))).rejects.toMatchObject({ status: 422, code: 'QUOTE_EMPTY' });
+
+    const [q] = await withSystemDbAccessContext(() => db.select().from(quotes).where(eq(quotes.id, created.id)));
+    expect(q!.status).toBe('draft');
+    expect(q!.convertedInvoiceId).toBeNull();
+    const acceptances = await withSystemDbAccessContext(() =>
+      db.select().from(quoteAcceptances).where(eq(quoteAcceptances.quoteId, created.id)));
+    expect(acceptances).toHaveLength(0);
   });
 
   runDb('rejects an on-behalf acceptance row with no reference at the database, not only at the API', async () => {

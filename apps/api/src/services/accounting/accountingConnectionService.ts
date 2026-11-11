@@ -1,17 +1,36 @@
-import { and, eq, isNotNull, isNull, like, or, type SQL } from 'drizzle-orm';
+import { and, eq, inArray, isNotNull, isNull, like, ne, or, sql, type SQL } from 'drizzle-orm';
 import { accountingConnections, accountingEntityMappings } from '../../db/schema';
 import { decryptSecret, encryptSecret, getActiveSecretEncryptionKeyId, hmacFingerprint } from '../secretCrypto';
 import { db, withSystemDbAccessContext } from '../../db';
+import { readWithPartnerAxisVisibility } from '../../db/partnerAxisRead';
 import { assertNoAmbientDbContext, type DbContextRunner } from './dbContextGuard';
-import { getAccountingProvider } from './providerRegistry';
+import { accountingProviderDisplayName, getAccountingProvider, providerSupports } from './providerRegistry';
 import { getValidAccessToken, ReauthRequiredError } from './accountingTokens';
-import type { AccountingProviderId } from './types';
+import type { AccountingCapability, AccountingProviderId } from './types';
 import { isPgUniqueViolation } from '../../utils/pgErrors';
+import { abandonAccountingFees } from './accountingFeeAbandonment';
 import { captureException } from '../sentry';
 
 export type AccountingEnvironment = 'sandbox' | 'production';
 export type AccountingPushMode = 'auto' | 'manual';
-export type AccountingConnectionStatus = 'connected' | 'disconnected' | 'reauth_required' | 'error';
+export type AccountingConnectionStatus = 'connected' | 'disconnected' | 'reauth_required' | 'error' | 'pending_tenant';
+
+/**
+ * Xero W02: a connect whose grant authorised several organisations, waiting for
+ * the user to pick one. It HOLDS the partner's one-connection slot (the unique
+ * partner index counts it, so a half-finished connect blocks a QuickBooks
+ * connect until cancelled or reaped) but is NOT an active connection: both
+ * resolvers below exclude it, so no worker, producer or route ever acts on it.
+ */
+export const PENDING_TENANT_STATUS = 'pending_tenant' as const;
+
+/** The resolvers' shared predicate. `resolveActiveConnection` and `resolveActiveConnectionRef` MUST stay in lockstep (PR #7182 "Deferred"). */
+function activeConnectionWhere(partnerId: string): SQL {
+  return and(
+    eq(accountingConnections.partnerId, partnerId),
+    ne(accountingConnections.status, PENDING_TENANT_STATUS),
+  ) as SQL;
+}
 
 export interface AccountingConnection {
   id: string;
@@ -27,7 +46,13 @@ export interface AccountingConnection {
   /** Nullable = unknown (never captured, or the capture failed). Multi-currency §11. */
   multiCurrencyEnabled: boolean | null;
   defaultIncomeAccountRef: string | null;
+  feeIncomeItemRef?: string | null;
+  feeIncomeAccountRef?: string | null;
   defaultTaxCodeRef: string | null;
+  defaultExemptTaxCodeRef: string | null;
+  defaultPaymentAccountRef: string | null;
+  /** Xero connection id (targeted DELETE /connections/{id}); null for QuickBooks and pending_tenant rows. */
+  providerConnectionRef: string | null;
   pushMode: AccountingPushMode;
   status: AccountingConnectionStatus;
   createdAt: Date | null;
@@ -54,7 +79,12 @@ export interface UpsertConnectionFields {
   environment?: AccountingEnvironment;
   homeCurrency?: string | null;
   defaultIncomeAccountRef?: string | null;
+  feeIncomeItemRef?: string | null;
+  feeIncomeAccountRef?: string | null;
   defaultTaxCodeRef?: string | null;
+  defaultExemptTaxCodeRef?: string | null;
+  defaultPaymentAccountRef?: string | null;
+  providerConnectionRef?: string | null;
   pushMode?: AccountingPushMode;
   webhookVerifierToken?: string | null;
   status?: AccountingConnectionStatus;
@@ -121,7 +151,7 @@ function stripUndefined<T extends Record<string, unknown>>(value: T): Partial<T>
   return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined)) as Partial<T>;
 }
 
-function mapConnection(row: AccountingConnectionRow): AccountingConnection {
+export function mapConnection(row: AccountingConnectionRow): AccountingConnection {
   return {
     id: row.id,
     partnerId: row.partnerId,
@@ -135,7 +165,12 @@ function mapConnection(row: AccountingConnectionRow): AccountingConnection {
     homeCurrency: row.homeCurrency ?? null,
     multiCurrencyEnabled: row.multiCurrencyEnabled ?? null,
     defaultIncomeAccountRef: row.defaultIncomeAccountRef ?? null,
+    feeIncomeItemRef: row.feeIncomeItemRef ?? null,
+    feeIncomeAccountRef: row.feeIncomeAccountRef ?? null,
     defaultTaxCodeRef: row.defaultTaxCodeRef ?? null,
+    defaultExemptTaxCodeRef: row.defaultExemptTaxCodeRef ?? null,
+    defaultPaymentAccountRef: row.defaultPaymentAccountRef ?? null,
+    providerConnectionRef: row.providerConnectionRef ?? null,
     pushMode: row.pushMode as AccountingPushMode,
     status: row.status as AccountingConnectionStatus,
     createdAt: row.createdAt ?? null,
@@ -149,6 +184,11 @@ function mapConnection(row: AccountingConnectionRow): AccountingConnection {
   };
 }
 
+/**
+ * Returns the partner's row for that provider in ANY status, `pending_tenant`
+ * included — check `.status` before treating it as active. Use
+ * `resolveActiveConnection*` for the active connection.
+ */
 export async function getConnection(
   db: DbExecutor,
   partnerId: string,
@@ -165,6 +205,231 @@ export async function getConnection(
 
   return row ? mapConnection(row) : null;
 }
+
+/**
+ * The partner's ONE accounting connection, any provider (Xero W01, spec D2 —
+ * enforced by accounting_connections_partner_idx). Null when none exists.
+ * Replaces every `getConnection(db, partnerId, 'quickbooks')` in the core.
+ * Excludes `pending_tenant` (Xero W02) via `activeConnectionWhere`, shared with `resolveActiveConnectionRef`.
+ */
+export async function resolveActiveConnection(
+  dbc: DbExecutor,
+  partnerId: string,
+): Promise<AccountingConnection | null> {
+  const [row] = await dbc
+    .select()
+    .from(accountingConnections)
+    .where(activeConnectionWhere(partnerId))
+    .limit(1);
+  return row ? mapConnection(row) : null;
+}
+
+/**
+ * The non-decrypting core of `resolveActiveConnection`'s WHERE/limit, shared by
+ * every caller that does not need the decrypted realm/token columns. Selects
+ * only `id` + `provider` + `status` — never the encrypted columns `mapConnection`
+ * decrypts. Both this and `resolveActiveConnection` build their WHERE from the
+ * SAME `activeConnectionWhere` predicate (W02's pending_tenant exclusion), so
+ * there is nothing left to keep in sync by hand.
+ *
+ * Exported as the public id+provider+status read for callers that never need
+ * tokens (e.g. a route that only stamps `.id`/`.provider`/`.status` on a
+ * response, or a conflict check that only compares providers) — using it instead of
+ * `resolveActiveConnection` means a rotated/retired encryption key can never
+ * abort a path that was going to ignore the decrypted columns anyway.
+ *
+ * Excludes `pending_tenant` (Xero W02) via `activeConnectionWhere`, shared with `resolveActiveConnection`.
+ */
+export async function resolveActiveConnectionRef(
+  dbc: DbExecutor,
+  partnerId: string,
+): Promise<{ id: string; provider: AccountingProviderId; status: AccountingConnectionStatus } | null> {
+  const [row] = await dbc
+    .select({ id: accountingConnections.id, provider: accountingConnections.provider, status: accountingConnections.status })
+    .from(accountingConnections)
+    .where(activeConnectionWhere(partnerId))
+    .limit(1);
+  return row ? { id: row.id, provider: row.provider as AccountingProviderId, status: row.status as AccountingConnectionStatus } : null;
+}
+
+/**
+ * The partner's row in ANY status (pending_tenant included), non-decrypting.
+ * For the one-provider CONFLICT checks only: upsertConnection's no-row branch,
+ * the /connect pre-check and GET /accounting/providers. Those must see a
+ * pending Xero row, or a QuickBooks connect over it fails as a generic persist
+ * error instead of 409 and the UI never greys the other card out.
+ */
+export async function getPartnerConnectionRef(
+  dbc: DbExecutor,
+  partnerId: string,
+): Promise<{ id: string; provider: AccountingProviderId; status: AccountingConnectionStatus } | null> {
+  const [row] = await dbc
+    .select({ id: accountingConnections.id, provider: accountingConnections.provider, status: accountingConnections.status })
+    .from(accountingConnections)
+    .where(eq(accountingConnections.partnerId, partnerId))
+    .limit(1);
+  return row
+    ? { id: row.id, provider: row.provider as AccountingProviderId, status: row.status as AccountingConnectionStatus }
+    : null;
+}
+
+/**
+ * The non-decrypting sibling of `resolveActiveConnection`, for callers that
+ * only need the id (money-path hardening: the Stripe refund reconcile runs
+ * inside the money transaction, and a rotated/retired encryption key must
+ * never abort it via `mapConnection`'s eager decrypt).
+ */
+export async function resolveActiveConnectionId(
+  dbc: DbExecutor,
+  partnerId: string,
+): Promise<string | null> {
+  const ref = await resolveActiveConnectionRef(dbc, partnerId);
+  return ref?.id ?? null;
+}
+
+/** Load one connection by id, partner-guarded. Jobs carry this id (spec: "a job's destination is never reinterpreted"). */
+export async function getConnectionById(
+  dbc: DbExecutor,
+  connectionId: string,
+  partnerId: string,
+): Promise<AccountingConnection | null> {
+  const [row] = await dbc
+    .select()
+    .from(accountingConnections)
+    .where(and(eq(accountingConnections.id, connectionId), eq(accountingConnections.partnerId, partnerId)))
+    .limit(1);
+  return row ? mapConnection(row) : null;
+}
+
+/**
+ * The connection a mapping row belongs to (its integration_id). Payment jobs
+ * bind to their connection THROUGH the outbox row (plan preamble item 4): the
+ * composite FK cascades on disconnect, so a job whose connection is gone finds
+ * no mapping at all rather than a different connection.
+ */
+export async function getConnectionForMapping(
+  dbc: DbExecutor,
+  mappingId: string,
+  partnerId: string,
+): Promise<AccountingConnection | null> {
+  const [row] = await dbc
+    .select({ connection: accountingConnections })
+    .from(accountingEntityMappings)
+    .innerJoin(accountingConnections, and(
+      eq(accountingConnections.id, accountingEntityMappings.integrationId),
+      eq(accountingConnections.partnerId, accountingEntityMappings.partnerId),
+    ))
+    .where(and(eq(accountingEntityMappings.id, mappingId), eq(accountingEntityMappings.partnerId, partnerId)))
+    .limit(1);
+  return row ? mapConnection(row.connection) : null;
+}
+
+/**
+ * Just the PROVIDER of the connection a mapping row belongs to — same
+ * partner-guarded join as `getConnectionForMapping`, but it selects only
+ * `provider`, so it never decrypts the realm/token columns. For audit labels on
+ * paths that must survive an undecryptable token (a payment void, an
+ * unresolved-delete drop): before W01 those paths never read the connection row
+ * at all, and a decrypt failure must not start aborting them.
+ */
+export async function getConnectionProviderForMapping(
+  dbc: DbExecutor,
+  mappingId: string,
+  partnerId: string,
+): Promise<AccountingProviderId | null> {
+  const [row] = await dbc
+    .select({ provider: accountingConnections.provider })
+    .from(accountingEntityMappings)
+    .innerJoin(accountingConnections, and(
+      eq(accountingConnections.id, accountingEntityMappings.integrationId),
+      eq(accountingConnections.partnerId, accountingEntityMappings.partnerId),
+    ))
+    .where(and(eq(accountingEntityMappings.id, mappingId), eq(accountingEntityMappings.partnerId, partnerId)))
+    .limit(1);
+  return row ? (row.provider as AccountingProviderId) : null;
+}
+
+/**
+ * Batched `getConnectionProviderForMapping` for the reconcile sweep's owed
+ * payment rows: mapping id -> its own connection's provider, one query. A
+ * mapping absent from the result was deleted since it was listed. Provider
+ * column only (no decrypt). System-context callers only: the rows come from a
+ * cross-partner sweep, so there is no partner id to guard on beyond the join.
+ */
+export async function getConnectionProvidersForMappings(
+  dbc: DbExecutor,
+  mappingIds: string[],
+): Promise<Map<string, AccountingProviderId>> {
+  if (mappingIds.length === 0) return new Map();
+  const rows = await dbc
+    .select({ mappingId: accountingEntityMappings.id, provider: accountingConnections.provider })
+    .from(accountingEntityMappings)
+    .innerJoin(accountingConnections, and(
+      eq(accountingConnections.id, accountingEntityMappings.integrationId),
+      eq(accountingConnections.partnerId, accountingEntityMappings.partnerId),
+    ))
+    .where(inArray(accountingEntityMappings.id, mappingIds));
+  return new Map((rows as Array<{ mappingId: string; provider: AccountingProviderId }>)
+    .map((r) => [r.mappingId, r.provider]));
+}
+
+/**
+ * Producer-side gate (spec "capabilities … producers don't enqueue"). Reads the
+ * partner-axis row through readWithPartnerAxisVisibility: producers run inside
+ * whatever request context issued the invoice, and an org-scoped RLS context
+ * sees ZERO accounting_connections rows, which would silently skip every
+ * enqueue for org-scoped users (#2822). partnerId comes from a row the caller
+ * already resolved under its own context, never from the client.
+ *
+ * Fix round (Task 5 minor): callers use only `.id` (to stamp a job's
+ * `connectionId`), never a decrypted field, so this reads through the
+ * non-decrypting `resolveActiveConnectionRef` instead of `resolveActiveConnection`
+ * + `mapConnection`. Before this, a decrypt failure (rotated/retired
+ * encryption key) threw inside these hooks' try/catch and silently skipped the
+ * auto-push, whereas pre-W01 the job was always enqueued and a failure
+ * surfaced in the worker instead.
+ */
+export async function resolveActiveConnectionFor(
+  partnerId: string,
+  capability: AccountingCapability,
+): Promise<{ id: string; provider: AccountingProviderId } | null> {
+  const ref = await readWithPartnerAxisVisibility(() => resolveActiveConnectionRef(db, partnerId));
+  return ref && providerSupports(ref.provider, capability) ? ref : null;
+}
+
+/** 409 — the partner already has a connection to a DIFFERENT provider (spec D2). */
+export class AccountingProviderConflictError extends Error {
+  readonly code = 'accounting_provider_conflict' as const;
+  readonly status = 409 as const;
+  constructor(
+    readonly existingProvider: AccountingProviderId,
+    readonly requestedProvider: AccountingProviderId,
+    readonly existingStatus?: AccountingConnectionStatus,
+  ) {
+    const existing = accountingProviderDisplayName(existingProvider);
+    const requested = accountingProviderDisplayName(requestedProvider);
+    super(existingStatus === PENDING_TENANT_STATUS
+      ? `Finish or cancel the ${existing} connection before connecting ${requested}`
+      : `Disconnect ${existing} before connecting ${requested}`);
+    this.name = 'AccountingProviderConflictError';
+  }
+}
+
+/**
+ * 409 — the realm/tenant is already connected to ANOTHER partner (spec W02).
+ * Raised from the `(provider, realm_id_fingerprint)` unique index, which Postgres
+ * enforces regardless of RLS, so two partners racing for one tenant cannot both win.
+ */
+export class AccountingTenantHeldError extends Error {
+  readonly code = 'accounting_tenant_held' as const;
+  readonly status = 409 as const;
+  constructor(readonly provider: AccountingProviderId) {
+    super(`This ${accountingProviderDisplayName(provider)} organisation is connected to another Breeze account`);
+    this.name = 'AccountingTenantHeldError';
+  }
+}
+
+export const REALM_FINGERPRINT_UNIQUE_INDEX = 'accounting_connections_provider_realm_fp_idx';
 
 export async function upsertConnection(
   db: DbExecutor,
@@ -184,7 +449,12 @@ export async function upsertConnection(
     environment: fields.environment ?? 'production',
     homeCurrency: fields.homeCurrency,
     defaultIncomeAccountRef: fields.defaultIncomeAccountRef,
+    feeIncomeItemRef: fields.feeIncomeItemRef,
+    feeIncomeAccountRef: fields.feeIncomeAccountRef,
     defaultTaxCodeRef: fields.defaultTaxCodeRef,
+    defaultExemptTaxCodeRef: fields.defaultExemptTaxCodeRef,
+    defaultPaymentAccountRef: fields.defaultPaymentAccountRef,
+    providerConnectionRef: fields.providerConnectionRef,
     pushMode: fields.pushMode ?? 'auto',
     webhookVerifierTokenEncrypted: encryptedField(fields.webhookVerifierToken),
     realmIdFingerprint: fingerprintField(fields.realmId),
@@ -198,7 +468,15 @@ export async function upsertConnection(
     // callback) must not move it — that would re-open the whole history the
     // horizon exists to exclude. The settings route re-stamps it when the
     // operator turns `push_payments` back on.
-    pushPaymentsSince: now,
+    //
+    // Stamped from the DATABASE clock, never Node's (#7293): the horizon is
+    // compared against `invoice_payments.created_at`, which Postgres stamps with
+    // `now()`. With `new Date()` here, an API host clock running even a few ms
+    // ahead of Postgres put a payment recorded right after connecting "before"
+    // the horizon, so it was silently never pushed. One clock on both sides
+    // matches the other two writers (the column's backfill migration and the
+    // settings route's re-enable), which already use `now()`.
+    pushPaymentsSince: sql`now()`,
     status: fields.status ?? 'connected',
     lastError: fields.lastError,
     connectedBy: fields.connectedBy,
@@ -220,7 +498,12 @@ export async function upsertConnection(
     environment: fields.environment,
     homeCurrency: fields.homeCurrency,
     defaultIncomeAccountRef: fields.defaultIncomeAccountRef,
+    feeIncomeItemRef: fields.feeIncomeItemRef,
+    feeIncomeAccountRef: fields.feeIncomeAccountRef,
     defaultTaxCodeRef: fields.defaultTaxCodeRef,
+    defaultExemptTaxCodeRef: fields.defaultExemptTaxCodeRef,
+    defaultPaymentAccountRef: fields.defaultPaymentAccountRef,
+    providerConnectionRef: fields.providerConnectionRef,
     pushMode: fields.pushMode,
     webhookVerifierTokenEncrypted: values.webhookVerifierTokenEncrypted,
     realmIdFingerprint: values.realmIdFingerprint,
@@ -234,16 +517,35 @@ export async function upsertConnection(
     updatedAt: now,
   });
 
-  const [row] = await db
-    .insert(accountingConnections)
-    .values(values)
-    .onConflictDoUpdate({
-      target: [accountingConnections.partnerId, accountingConnections.provider],
-      set: updateSet,
-    })
-    .returning();
+  let row: AccountingConnectionRow | undefined;
+  try {
+    [row] = await db
+      .insert(accountingConnections)
+      .values(values)
+      .onConflictDoUpdate({
+        // accounting_connections_partner_idx (Xero W01): one row per partner. The
+        // update fires ONLY for a same-provider reconnect; a different provider's
+        // row makes this a no-op that returns nothing (handled below), so a Xero
+        // connect can never overwrite a QuickBooks row's tokens or settings.
+        target: accountingConnections.partnerId,
+        set: updateSet,
+        setWhere: sql`${accountingConnections.provider} = excluded.provider`,
+      })
+      .returning();
+  } catch (err) {
+    if (isPgUniqueViolation(err, REALM_FINGERPRINT_UNIQUE_INDEX)) throw new AccountingTenantHeldError(provider);
+    throw err;
+  }
 
   if (!row) {
+    // Any status: a pending_tenant row of another provider must 409 too (W02).
+    // Non-decrypting read (Task 5 minor): this branch only compares providers,
+    // so a decrypt failure (rotated/retired encryption key) in
+    // `resolveActiveConnection` must never mask the real 409 conflict here.
+    const existing = await getPartnerConnectionRef(db, partnerId);
+    if (existing && existing.provider !== provider) {
+      throw new AccountingProviderConflictError(existing.provider, provider, existing.status);
+    }
     throw new Error('Failed to persist accounting connection');
   }
 
@@ -340,7 +642,7 @@ export async function backfillRealmFingerprints(): Promise<{ scanned: number; up
       // conflict an operator must see (a stolen/shared realm, or a bug in a
       // migration), not a crash that blocks boot for every other partner.
       // Its transaction is now its own, so the abort dies with it.
-      if (isPgUniqueViolation(err, 'accounting_connections_provider_realm_fp_idx')) {
+      if (isPgUniqueViolation(err, REALM_FINGERPRINT_UNIQUE_INDEX)) {
         skipped++;
         captureException(err instanceof Error ? err : new Error(String(err)), undefined, {
           // #5193: `module` and `op` have no allowlisted equivalent (no
@@ -373,19 +675,15 @@ export async function backfillRealmFingerprints(): Promise<{ scanned: number; up
  */
 export async function listReconcilableConnections(
   dbc: DbExecutor,
-  provider: AccountingProviderId,
-): Promise<Array<{ id: string; partnerId: string }>> {
-  return dbc
-    .select({ id: accountingConnections.id, partnerId: accountingConnections.partnerId })
+): Promise<Array<{ id: string; partnerId: string; provider: AccountingProviderId }>> {
+  const rows = await dbc
+    .select({ id: accountingConnections.id, partnerId: accountingConnections.partnerId, provider: accountingConnections.provider })
     .from(accountingConnections)
     .where(and(
-      eq(accountingConnections.provider, provider),
       eq(accountingConnections.status, 'connected'),
-      or(
-        eq(accountingConnections.pullPayments, true),
-        eq(accountingConnections.pushPayments, true),
-      ),
+      or(eq(accountingConnections.pullPayments, true), eq(accountingConnections.pushPayments, true)),
     ));
+  return rows as Array<{ id: string; partnerId: string; provider: AccountingProviderId }>;
 }
 
 /**
@@ -537,11 +835,18 @@ export interface OwedPaymentDeletes {
 
 const OWED_DELETE_REPORT_CAP = 50;
 
-async function collectOwedPaymentDeletes(
-  dbc: DbExecutor,
-  where: SQL | undefined,
-  context: Record<string, unknown>,
-): Promise<OwedPaymentDeletes> {
+/** The payment deletes one connection still owes (the predicate of every owed-delete read that is scoped to a connection). */
+export function owedPaymentDeletesOfConnection(connectionId: string, partnerId: string): SQL | undefined {
+  return and(
+    eq(accountingEntityMappings.integrationId, connectionId),
+    eq(accountingEntityMappings.partnerId, partnerId),
+    eq(accountingEntityMappings.breezeEntityType, 'payment'),
+    eq(accountingEntityMappings.pendingOp, 'delete'),
+  );
+}
+
+/** Read-only half of `collectOwedPaymentDeletes`: counts, never reports. For a caller that may KEEP the debt instead of discarding it (the pending-tenant reaper, #7289). */
+export async function readOwedPaymentDeletes(dbc: DbExecutor, where: SQL | undefined): Promise<OwedPaymentDeletes> {
   const rows = await dbc
     .select({
       id: accountingEntityMappings.id,
@@ -554,17 +859,34 @@ async function collectOwedPaymentDeletes(
     .map((r) => r.remoteEntityId)
     .filter((v): v is string => typeof v === 'string')
     .slice(0, OWED_DELETE_REPORT_CAP);
-  const owed: OwedPaymentDeletes = { count: rows.length, remoteEntityIds };
+  return { count: rows.length, remoteEntityIds };
+}
+
+/**
+ * Count-and-report, BEFORE the caller's delete: the warning and Sentry capture
+ * every owed-delete discard gets. The audit entry is the caller's route's job
+ * (`accounting.connection.owed_deletes_discarded`). Silent when nothing is owed.
+ */
+export async function collectOwedPaymentDeletes(
+  dbc: DbExecutor,
+  where: SQL | undefined,
+  context: { provider?: AccountingProviderId } & Record<string, unknown>,
+): Promise<OwedPaymentDeletes> {
+  const owed = await readOwedPaymentDeletes(dbc, where);
   if (owed.count === 0) return owed;
+  const { remoteEntityIds } = owed;
+  // Named for the provider when the caller knows it: the Xero pending-tenant
+  // path reaches here too (#7289), and "QuickBooks" would misdirect on-call.
+  const label = context.provider ? accountingProviderDisplayName(context.provider) : 'accounting';
 
   console.warn(
-    '[accountingConnectionService] discarding owed QuickBooks payment delete(s) — '
+    `[accountingConnectionService] discarding owed ${label} payment delete(s) — `
     + 'Breeze created these Payments and will no longer remove them',
     { ...context, count: owed.count, remoteEntityIds },
   );
   captureException(
     new Error(
-      `accountingConnectionService: discarded ${owed.count} owed QuickBooks payment delete(s) — `
+      `accountingConnectionService: discarded ${owed.count} owed ${label} payment delete(s) — `
       + 'the Payments Breeze created stay in the customer books and need manual reconciliation',
     ),
     undefined,
@@ -596,12 +918,9 @@ export async function resetConnectionForRealmChange(
   partnerId: string,
 ): Promise<{ mappingsDeleted: number; owedPaymentDeletes: OwedPaymentDeletes }> {
   // BEFORE the delete: after it there is nothing left to count.
-  const owedPaymentDeletes = await collectOwedPaymentDeletes(dbc, and(
-    eq(accountingEntityMappings.integrationId, connectionId),
-    eq(accountingEntityMappings.partnerId, partnerId),
-    eq(accountingEntityMappings.breezeEntityType, 'payment'),
-    eq(accountingEntityMappings.pendingOp, 'delete'),
-  ), { connectionId, partnerId, reason: 'realm_changed' });
+  const owedPaymentDeletes = await collectOwedPaymentDeletes(
+    dbc, owedPaymentDeletesOfConnection(connectionId, partnerId), { connectionId, partnerId, reason: 'realm_changed' },
+  );
 
   const deleted = await dbc
     .delete(accountingEntityMappings)
@@ -611,9 +930,25 @@ export async function resetConnectionForRealmChange(
     ))
     .returning({ id: accountingEntityMappings.id });
 
+  // The ONE place a tenant/realm change clears per-organisation state (Xero W02
+  // review J). Every path that changes it reaches here via finalizeConnection:
+  // the OAuth callback (QuickBooks, Xero single-org) and the Xero picker claim.
+  // The default refs name accounts / tax codes IN the old organisation (Xero
+  // AccountCodes like "200" repeat across orgs, so a kept ref would silently
+  // resolve to a different account); a same-realm reconnect never gets here.
   await dbc
     .update(accountingConnections)
-    .set({ cdcCursor: null, lastReconcileAt: null, updatedAt: new Date() })
+    .set({
+      cdcCursor: null,
+      lastReconcileAt: null,
+      defaultIncomeAccountRef: null,
+      feeIncomeItemRef: null,
+      feeIncomeAccountRef: null,
+      defaultTaxCodeRef: null,
+      defaultExemptTaxCodeRef: null,
+      defaultPaymentAccountRef: null,
+      updatedAt: new Date(),
+    })
     .where(and(
       eq(accountingConnections.id, connectionId),
       eq(accountingConnections.partnerId, partnerId),
@@ -886,17 +1221,18 @@ export async function refreshRealmSettings(
   runInDbContext: DbContextRunner,
 ): Promise<{ homeCurrency: string | null; multiCurrencyEnabled: boolean | null }> {
   assertNoAmbientDbContext('refreshRealmSettings');
+  const label = accountingProviderDisplayName(provider);
 
   const conn = await runInDbContext(async () => {
     const conn = await getConnection(db, partnerId, provider);
     if (!conn) {
-      throw new AccountingConnectionError('not_connected', 404, 'QuickBooks is not connected for this partner');
+      throw new AccountingConnectionError('not_connected', 404, `${label} is not connected for this partner`);
     }
     if (conn.status === 'reauth_required') {
-      throw new AccountingConnectionError('reauth_required', 409, 'QuickBooks needs to be reconnected');
+      throw new AccountingConnectionError('reauth_required', 409, `${label} needs to be reconnected`);
     }
     if (conn.status !== 'connected') {
-      throw new AccountingConnectionError('not_connected', 404, 'QuickBooks is not connected for this partner');
+      throw new AccountingConnectionError('not_connected', 404, `${label} is not connected for this partner`);
     }
     return conn;
   });
@@ -908,7 +1244,7 @@ export async function refreshRealmSettings(
     accessToken = await getValidAccessToken(db, conn);
   } catch (err) {
     if (err instanceof ReauthRequiredError) {
-      throw new AccountingConnectionError('reauth_required', 409, 'QuickBooks needs to be reconnected');
+      throw new AccountingConnectionError('reauth_required', 409, `${label} needs to be reconnected`);
     }
     throw err;
   }
@@ -918,7 +1254,7 @@ export async function refreshRealmSettings(
   const freshConn = await runInDbContext(async () => {
     const freshConn = await getConnection(db, partnerId, provider);
     if (!freshConn) {
-      throw new AccountingConnectionError('not_connected', 404, 'QuickBooks is not connected for this partner');
+      throw new AccountingConnectionError('not_connected', 404, `${label} is not connected for this partner`);
     }
     return freshConn;
   });
@@ -999,6 +1335,7 @@ export async function deleteConnection(
       eq(accountingConnections.provider, provider)
     ))
     .returning({ id: accountingConnections.id });
+  for(const connection of deleted)await abandonAccountingFees(db,partnerId,connection.id);
   // The id is returned so the caller can identify the connection in an audit
   // entry AFTER the row is gone — the disconnect's owed-delete record has to
   // name the same subject as its realm-change twin (review wave 3, finding D3).

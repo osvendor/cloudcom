@@ -4,10 +4,13 @@ import '../../lib/i18n';
 import { fetchWithAuth } from '../../stores/auth';
 import { navigateTo } from '@/lib/navigation';
 import { ActionError, runAction, handleActionError } from '../../lib/runAction';
-import { isValidEmail } from '@/lib/email';
 import { currencyLabel, currencyOptions } from '@/lib/currencies';
 import { useOrgBillingProfile } from './OrgBillingProfile';
 import { pctFromFraction } from './invoiceTypes';
+import { usePaymentSettings } from './PaymentsSettingsTab';
+import OrgPaymentsSettingsSection from './OrgPaymentsSettingsSection';
+import OrgAutopayCard from './OrgAutopayCard';
+import { usePermissions } from '../../lib/permissions';
 import InheritedField from '../shared/InheritedField';
 
 const UNAUTHORIZED = () => void navigateTo('/login', { replace: true });
@@ -64,7 +67,19 @@ interface OrgBilling {
    *  ambient request context. Used ONLY to label the blank-rate placeholder
    *  with the inherited value (settings rule 4); never sent back on save. */
   partnerDefaultTaxRate: string | null;
-  billingContact: { email?: string | null; name?: string | null } | null;
+  /** Org payment-terms override (#6229); null = inherit the partner default. */
+  invoiceTermsDays?: number | null;
+  /** Additive field from GET /orgs/organizations/:id (#6229) — the partner's
+   *  `invoiceTermsDays`, shown as the inherited value. Never sent back. */
+  partnerDefaultInvoiceTermsDays?: number | null;
+  /** Additive field from GET /orgs/organizations/:id (#7510) — the partner's
+   *  currency. NOT an inherited value: the org's own currency is NOT NULL and
+   *  was stamped at creation. Shown only to say the partner default applies to
+   *  new organizations. Never sent back. */
+  partnerDefaultCurrencyCode?: string | null;
+  /** Read-only projection of the org's billing contact — the org-level contact
+   *  holding the Billing role. Edited in the org record's Contacts tab only. */
+  billingContact: { email?: string | null; name?: string | null; phone?: string | null } | null;
   billingAddressLine1: string | null;
   billingAddressLine2: string | null;
   billingAddressCity: string | null;
@@ -78,6 +93,9 @@ interface Props {
 }
 
 export default function OrgBillingSettings({ orgId }: Props) {
+  const paymentSettings = usePaymentSettings(orgId);
+  const { can } = usePermissions();
+  const canManageAutopay = can('billing', 'manage');
   const { t, i18n } = useTranslation('billing');
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(false);
@@ -101,8 +119,10 @@ export default function OrgBillingSettings({ orgId }: Props) {
   const [taxExempt, setTaxExempt] = useState(false);
   const [taxPercent, setTaxPercent] = useState('');
   const [partnerDefaultTaxRate, setPartnerDefaultTaxRate] = useState<string | null>(null);
-  const [contactEmail, setContactEmail] = useState('');
-  const [contactName, setContactName] = useState('');
+  const [termsDays, setTermsDays] = useState('');
+  const [partnerDefaultTermsDays, setPartnerDefaultTermsDays] = useState<number | null>(null);
+  const [partnerDefaultCurrency, setPartnerDefaultCurrency] = useState<string | null>(null);
+  const [billingContact, setBillingContact] = useState<OrgBilling['billingContact']>(null);
   const [line1, setLine1] = useState('');
   const [line2, setLine2] = useState('');
   const [city, setCity] = useState('');
@@ -124,8 +144,11 @@ export default function OrgBillingSettings({ orgId }: Props) {
       setTaxExempt(Boolean(o.taxExempt));
       setTaxPercent(pctFromFraction(o.taxRate));
       setPartnerDefaultTaxRate(o.partnerDefaultTaxRate ?? null);
-      setContactEmail(o.billingContact?.email ?? '');
-      setContactName(o.billingContact?.name ?? '');
+      // `?? ''` not `|| ''`: an override of 0 (due on receipt) must load as "0".
+      setTermsDays(o.invoiceTermsDays === null || o.invoiceTermsDays === undefined ? '' : String(o.invoiceTermsDays));
+      setPartnerDefaultTermsDays(o.partnerDefaultInvoiceTermsDays ?? null);
+      setPartnerDefaultCurrency(o.partnerDefaultCurrencyCode ?? null);
+      setBillingContact(o.billingContact ?? null);
       setLine1(o.billingAddressLine1 ?? '');
       setLine2(o.billingAddressLine2 ?? '');
       setCity(o.billingAddressCity ?? '');
@@ -230,15 +253,22 @@ export default function OrgBillingSettings({ orgId }: Props) {
     }
   }, [changingCurrency, selectedCurrency, currencyCode, orgId, t, closeCurrencyPanel, load]);
 
-  // Contact email is optional (blank clears it), but a non-empty value must be a
-  // valid address. Guard client-side so the Save button reflects it pre-submit;
-  // the server still validates the format on PATCH.
-  const contactEmailInvalid = contactEmail.trim() !== '' && !isValidEmail(contactEmail);
+  // Same 0–365 whole-day bounds as the shared validator and the DB CHECK.
+  const termsTrimmed = termsDays.trim();
+  const termsDaysInvalid = termsTrimmed !== ''
+    && !(/^\d+$/.test(termsTrimmed) && Number(termsTrimmed) <= 365);
 
+  const paymentSettingsBlockSave = canManageAutopay && !!paymentSettings.view &&
+    (paymentSettings.invalid || paymentSettings.saving);
   const save = useCallback(async () => {
-    if (saving || contactEmailInvalid) return;
+    if (saving || termsDaysInvalid || paymentSettingsBlockSave) return;
     setSaving(true);
     try {
+      // Sends the payment-settings PUT only when one of them changed; changing
+      // one asks for a second-factor confirmation first. Closing that
+      // confirmation cancels the whole Save, so nothing is half-saved.
+      if (canManageAutopay && paymentSettings.view && paymentSettings.reminders
+        && await paymentSettings.save() === 'cancelled') return;
       const pct = taxPercent.trim();
       await runAction({
         request: () => fetchWithAuth(`/orgs/${orgId}/billing-settings`, {
@@ -248,10 +278,12 @@ export default function OrgBillingSettings({ orgId }: Props) {
             taxId: taxId.trim() === '' ? null : taxId.trim(),
             taxExempt,
             taxRate: pct === '' ? null : Number(pct) / 100,
-            // Send null (not '') when cleared — the schema validates email format
-            // and treats null as "no recipient" rather than rejecting a blank.
-            billingContactEmail: contactEmail.trim() === '' ? null : contactEmail.trim(),
-            billingContactName: contactName.trim() === '' ? null : contactName.trim(),
+            // Blank = inherit the partner default → null, never ''.
+            invoiceTermsDays: termsDays.trim() === '' ? null : Number(termsDays.trim()),
+            // No billingContact* fields: the billing contact is a contact, and
+            // contacts have one home (the org record's Contacts tab). Sending
+            // them from here re-wrote whichever contact the API resolved on
+            // every Save, including tax-only saves.
             billingAddressLine1: line1.trim() === '' ? null : line1,
             billingAddressLine2: line2.trim() === '' ? null : line2,
             billingAddressCity: city.trim() === '' ? null : city,
@@ -271,7 +303,7 @@ export default function OrgBillingSettings({ orgId }: Props) {
     } finally {
       setSaving(false);
     }
-  }, [saving, contactEmailInvalid, taxId, taxExempt, taxPercent, contactEmail, contactName, line1, line2, city, region, postal, country, orgId, load, billingProfile.billingProfileId, billingProfile.markSaved, t]);
+  }, [paymentSettings, paymentSettingsBlockSave, canManageAutopay, saving, termsDaysInvalid, termsDays, taxId, taxExempt, taxPercent, line1, line2, city, region, postal, country, orgId, load, billingProfile.billingProfileId, billingProfile.markSaved, t]);
 
   if (loading) return <p className="text-sm text-muted-foreground">{t('orgBillingSettings.loading')}</p>;
   if (loadError) {
@@ -308,12 +340,20 @@ export default function OrgBillingSettings({ orgId }: Props) {
             id="ob-currency" value={selectedCurrency}
             onChange={(e) => onSelectCurrency(e.target.value)}
             data-testid="org-billing-currency"
+            aria-describedby={partnerDefaultCurrency ? 'ob-currency-partner-default' : undefined}
             className={inputCls}
           >
             {currencyOptions(currencyCode).map((code) => (
               <option key={code} value={code}>{currencyLabel(code, i18n.language)}</option>
             ))}
           </select>
+          {/* #7510 (settings rule 3): currency is the stated exception to
+              partner → org inheritance — say so where it applies. */}
+          {partnerDefaultCurrency && (
+            <p id="ob-currency-partner-default" data-testid="org-billing-currency-partner-default" className="mt-1 text-xs text-muted-foreground">
+              {t('orgBillingSettings.currency.partnerDefault', { currency: partnerDefaultCurrency })}
+            </p>
+          )}
         </div>
 
         {billingProfile.panel}
@@ -472,26 +512,68 @@ export default function OrgBillingSettings({ orgId }: Props) {
         </label>
       </section>
 
+      {/* Settings consolidation W06 (#6229): org override of the partner's
+          payment terms. Blank = inherit; frozen as the due date at issue. */}
       <section className="rounded-lg border bg-card p-6 shadow-xs">
+        <h2 className="text-lg font-semibold">{t('orgBillingSettings.terms.title')}</h2>
+        <p className="mt-1 text-sm text-muted-foreground">{t('orgBillingSettings.terms.description')}</p>
+        <div className="mt-4 grid gap-4 sm:grid-cols-2">
+          <div>
+            <InheritedField
+              id="ob-terms-days"
+              label={t('orgBillingSettings.terms.paymentTermsDays')}
+              value={termsDays}
+              onChange={setTermsDays}
+              inheritedValue={partnerDefaultTermsDays !== null ? String(partnerDefaultTermsDays) : null}
+              inheritedSource={t('orgBillingSettings.terms.partnerDefault')}
+              type="number"
+              min={0}
+              max={365}
+              step="1"
+              data-testid="org-billing-terms-days"
+            />
+            {termsDaysInvalid && (
+              <p className="mt-1 text-xs text-destructive" data-testid="org-billing-terms-days-error">
+                {t('orgBillingSettings.terms.invalid')}
+              </p>
+            )}
+          </div>
+        </div>
+      </section>
+
+      <section className="rounded-lg border bg-card p-6 shadow-xs" data-testid="org-billing-contact">
         <h2 className="text-lg font-semibold">{t('orgBillingSettings.contact.title')}</h2>
         <p className="mt-1 text-sm text-muted-foreground">
           {t('orgBillingSettings.contact.description')}
         </p>
-        <div className="mt-4 grid gap-4 sm:grid-cols-2">
-          <div>
-            <label className="text-sm font-medium" htmlFor="ob-contact-email">{t('orgBillingSettings.contact.email')}</label>
-            <input id="ob-contact-email" type="email" maxLength={255} value={contactEmail} onChange={(e) => setContactEmail(e.target.value)} placeholder={t('orgBillingSettings.contact.emailPlaceholder')} data-testid="org-billing-contact-email" aria-invalid={contactEmailInvalid} className={`${inputCls} ${contactEmailInvalid ? 'border-destructive' : ''}`} />
-            {contactEmailInvalid && (
-              <p className="mt-1 text-xs text-destructive" data-testid="org-billing-contact-email-error">
-                {t('orgBillingSettings.contact.emailInvalid')}
-              </p>
-            )}
-          </div>
-          <div>
-            <label className="text-sm font-medium" htmlFor="ob-contact-name">{t('orgBillingSettings.contact.name')}</label>
-            <input id="ob-contact-name" type="text" maxLength={255} value={contactName} onChange={(e) => setContactName(e.target.value)} placeholder={t('common:labels.optional')} data-testid="org-billing-contact-name" className={inputCls} />
-          </div>
+        <div className="mt-4 text-sm">
+          {billingContact?.email ? (
+            <p data-testid="org-billing-contact-recipient">
+              <span className="text-muted-foreground">{t('orgBillingSettings.contact.recipientLabel')}</span>{' '}
+              {billingContact.name && <span className="font-medium">{billingContact.name} </span>}
+              <span className={billingContact.name ? 'text-muted-foreground' : 'font-medium'}>
+                {billingContact.name ? `<${billingContact.email}>` : billingContact.email}
+              </span>
+            </p>
+          ) : billingContact?.name || billingContact?.phone ? (
+            // A billing contact exists but invoices cannot be emailed to it —
+            // a different fix (add an address) from "nobody has the role".
+            <p className="text-destructive" data-testid="org-billing-contact-no-email">
+              {t('orgBillingSettings.contact.noEmail', { name: billingContact.name ?? billingContact.phone })}
+            </p>
+          ) : (
+            <p className="text-muted-foreground" data-testid="org-billing-contact-none">
+              {t('orgBillingSettings.contact.none')}
+            </p>
+          )}
         </div>
+        <a
+          href={`/organizations/${orgId}#contacts`}
+          className="mt-3 inline-block text-sm font-medium text-primary underline-offset-4 hover:underline"
+          data-testid="org-billing-contact-manage"
+        >
+          {t('orgBillingSettings.contact.manage')}
+        </a>
       </section>
 
       <section className="rounded-lg border bg-card p-6 shadow-xs">
@@ -524,9 +606,17 @@ export default function OrgBillingSettings({ orgId }: Props) {
         </div>
       </section>
 
+      {paymentSettings.view && paymentSettings.reminders && <div data-testid="autopay-org-fee-settings-page">
+        <OrgPaymentsSettingsSection view={paymentSettings.view} setValues={paymentSettings.setValues}
+          reminders={paymentSettings.reminders} setReminders={paymentSettings.setReminders}
+          disabled={saving || paymentSettings.saving || !canManageAutopay} />
+        {paymentSettings.view.autopayEnabled && canManageAutopay && <OrgAutopayCard orgId={orgId} />}
+      </div>}
+      {paymentSettings.stepUpPrompt}
+
       <div className="flex justify-end">
         <button
-          type="button" onClick={() => void save()} disabled={saving || contactEmailInvalid}
+          type="button" onClick={() => void save()} disabled={saving || termsDaysInvalid || paymentSettingsBlockSave}
           data-testid="org-billing-save"
           className="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:opacity-90 disabled:opacity-50"
         >

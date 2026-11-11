@@ -2,15 +2,22 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { zValidator } from '../../lib/validation';
 import { eq, and, inArray } from 'drizzle-orm';
-import { db } from '../../db';
+import { db, withDbTransaction } from '../../db';
+import { pgErrorCode } from '../../utils/pgErrors';
 import { backupJobs, backupSnapshots, devices } from '../../db/schema';
-import { requireMfa, requirePermission, requireScope } from '../../middleware/auth';
+import { requireMfa, requirePermission, requireScope, withAuthDbAccessContext } from '../../middleware/auth';
 import { sqlInstances, backupChains } from '../../db/schema/applicationBackup';
 import {
   executeCommand,
+  executeCommandWithSystemPrecheck,
   CommandTypes,
 } from '../../services/commandQueue';
 import { PERMISSIONS } from '../../services/permissions';
+import { dispatchTrackedDbRestore } from './dbRestoreJob';
+import { gateRestoreCommand, restoreIntegrityResponse } from './restoreIntegrityGate';
+import { isRestoreHelperUpdateRequiredError } from '../../services/backupRestoreGate';
+
+import { restoreIntegrityConfirmationFields } from './schemas';
 import { resolveScopedOrgId } from './helpers';
 import { resolveAllBackupAssignedDevices, resolveBackupConfigForDevice, effectiveBackupModes } from '../../services/featureConfigResolver';
 import { backupCommandResultSchema } from './resultSchemas';
@@ -23,13 +30,21 @@ import {
   resolveBackupWriteCommandDestination,
   resolveBackupProviderConfig,
   resolveBackupDestinationError,
+  type BackupWriteCommandDestination,
 } from '../../services/backupProviderConfig';
+import {
+  backupReadCredentialPayload,
+  backupWriteCredentialPayload,
+} from '../../services/backupCommandCredentials';
 import {
   authorizeRouteResilienceResources,
   resolveRouteAuthorizedDeviceIds,
 } from './resilienceAuthorization';
 import { parseAgentJsonStdout } from '../../services/agentCommandStdout';
 import { applyBackupStartedAck, isBackupQueuedAck, isBackupStartedAck } from '../../services/backupProgress';
+import { normalizeStorageIdentity } from '../../jobs/backupRetention';
+import { isBackupHelperUpdateRequiredError } from '../../services/backupReadHelperGate';
+import { isBackupWriteHelperUpdateRequiredError } from '../../services/backupWriteHelperGate';
 
 export const mssqlRoutes = new Hono();
 
@@ -55,6 +70,7 @@ const mssqlBackupSchema = z.object({
 });
 
 const mssqlRestoreSchema = z.object({
+  ...restoreIntegrityConfirmationFields,
   deviceId: z.string().guid(),
   snapshotId: z.string().guid(),
   instance: z.string().min(1).regex(sqlIdentifierRegex, 'Invalid instance name characters').optional(),
@@ -232,24 +248,16 @@ mssqlRoutes.post(
           ? data.instances
           : null;
       if (instances) {
-        for (const inst of instances) {
-          await db
-            .insert(sqlInstances)
-            .values({
-              orgId,
-              deviceId,
-              instanceName: inst.name,
-              version: inst.version || null,
-              edition: inst.edition || null,
-              port: inst.port || null,
-              authType: inst.authType || 'windows',
-              databases: inst.databases || [],
-              status: inst.status || 'unknown',
-              lastDiscoveredAt: new Date(),
-            })
-            .onConflictDoUpdate({
-              target: [sqlInstances.deviceId, sqlInstances.instanceName],
-              set: {
+        // One savepoint around the upserts: a failed statement rolls back and the
+        // request transaction survives the fallback below (#11203).
+        await withDbTransaction(async () => {
+          for (const inst of instances) {
+            await db
+              .insert(sqlInstances)
+              .values({
+                orgId,
+                deviceId,
+                instanceName: inst.name,
                 version: inst.version || null,
                 edition: inst.edition || null,
                 port: inst.port || null,
@@ -257,13 +265,29 @@ mssqlRoutes.post(
                 databases: inst.databases || [],
                 status: inst.status || 'unknown',
                 lastDiscoveredAt: new Date(),
-                updatedAt: new Date(),
-              },
-            });
-        }
+              })
+              .onConflictDoUpdate({
+                target: [sqlInstances.deviceId, sqlInstances.instanceName],
+                set: {
+                  version: inst.version || null,
+                  edition: inst.edition || null,
+                  port: inst.port || null,
+                  authType: inst.authType || 'windows',
+                  databases: inst.databases || [],
+                  status: inst.status || 'unknown',
+                  lastDiscoveredAt: new Date(),
+                  updatedAt: new Date(),
+                },
+              });
+          }
+        });
       }
       return c.json({ data });
-    } catch {
+    } catch (err) {
+      // Now reachable for a failed upsert too, so say so: the raw output below
+      // reads as a success with nothing persisted (#11203).
+      // The code, not the error: its message carries query params or raw stdout.
+      console.error('[backup:mssql] discovery result not parsed or not persisted', { deviceId, code: pgErrorCode(err) ?? (err instanceof Error ? err.name : 'unknown') });
       return c.json({ data: result.stdout });
     }
   }
@@ -271,6 +295,15 @@ mssqlRoutes.post(
 
 // ── POST /mssql/backup — trigger MSSQL backup ──
 
+// Registered in middleware/selfManagedDbContextRoutes.ts: this handler runs
+// with NO ambient request transaction. The backup job it creates must be
+// COMMITTED before the command is dispatched — the helper's storage access is
+// resolved when the command is delivered, on the delivery path's own
+// connection, and a helper that reports brokered writes is only given a write
+// session for a backup job that connection can see. Under the request
+// transaction the job was invisible there, so the helper was sent the storage
+// destination instead. The dispatch also waits on the device (up to 10 min)
+// and must not hold a pooled connection while it does (#1105).
 mssqlRoutes.post(
   '/mssql/backup',
   requireScope('organization', 'partner', 'system'),
@@ -285,52 +318,72 @@ mssqlRoutes.post(
     }
 
     const payload = c.req.valid('json');
-    const authorization = await authorizeRouteResilienceResources(c, orgId, [
-      { kind: 'device', id: payload.deviceId, role: 'source' },
-    ], 'verify');
-    if (!authorization.ok) return authorization.response;
 
-    const resolvedConfig = await resolveBackupConfigForDevice(payload.deviceId);
-    if (!resolvedConfig?.configId) {
-      return c.json({ error: 'A provider-backed backup configuration is required on this device' }, 400);
-    }
+    // Phase 1 — authorize, resolve the destination and create the job. This
+    // context commits when it returns, before anything is dispatched.
+    const phase1 = await withAuthDbAccessContext(auth, async (): Promise<
+      | { response: Response }
+      | { backupJob: { id: string }; configId: string; destination: BackupWriteCommandDestination }
+    > => {
+      const authorization = await authorizeRouteResilienceResources(c, orgId, [
+        { kind: 'device', id: payload.deviceId, role: 'source' },
+      ], 'verify');
+      if (!authorization.ok) return { response: authorization.response };
 
-    // D20b item A: the helper only builds a manager from the command payload
-    // when it has no agent.yaml backup config (mgr == nil — the normal state
-    // for every policy-managed device); without provider/providerConfig here
-    // the helper fails every on-demand mssql_backup with "backup not
-    // configured on this device", even though a provider-backed config
-    // resolved just above. Same builder backupWorker.ts's
-    // prepareBackupDispatchTargets uses for a profile-scheduled run.
-    const destinationResult = await resolveBackupWriteCommandDestination(resolvedConfig.configId, orgId);
-    if (!destinationResult.ok) {
-      return c.json(
-        { error: destinationResult.message, reason: destinationResult.reason },
-        destinationResult.reason === 'encryption_unsupported' ? 422 : 400
-      );
-    }
-    const { destination } = destinationResult;
+      const resolvedConfig = await resolveBackupConfigForDevice(payload.deviceId);
+      if (!resolvedConfig?.configId) {
+        return { response: c.json({ error: 'A provider-backed backup configuration is required on this device' }, 400) };
+      }
 
-    const [backupJob] = await db
-      .insert(backupJobs)
-      .values({
-        orgId,
-        configId: resolvedConfig.configId,
-        featureLinkId: resolvedConfig.featureLinkId,
-        deviceId: payload.deviceId,
-        status: 'pending',
-        type: 'manual',
-        backupType: 'database',
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      })
-      .returning();
+      // D20b item A: the helper only builds a manager from the command payload
+      // when it has no agent.yaml backup config (mgr == nil — the normal state
+      // for every policy-managed device); without provider/providerConfig here
+      // the helper fails every on-demand mssql_backup with "backup not
+      // configured on this device", even though a provider-backed config
+      // resolved just above. Same builder backupWorker.ts's
+      // prepareBackupDispatchTargets uses for a profile-scheduled run.
+      const destinationResult = await resolveBackupWriteCommandDestination(resolvedConfig.configId, orgId);
+      if (!destinationResult.ok) {
+        return {
+          response: c.json(
+            { error: destinationResult.message, reason: destinationResult.reason },
+            destinationResult.reason === 'encryption_unsupported' ? 422 : 400
+          ),
+        };
+      }
+      const { destination } = destinationResult;
 
-    if (!backupJob) {
-      return c.json({ error: 'Failed to create backup job' }, 500);
-    }
+      const [backupJob] = await db
+        .insert(backupJobs)
+        .values({
+          orgId,
+          configId: resolvedConfig.configId,
+          featureLinkId: resolvedConfig.featureLinkId,
+          deviceId: payload.deviceId,
+          status: 'pending',
+          type: 'manual',
+          backupType: 'database',
+          // Stamped at creation, as the backup worker does at dispatch: the snapshot
+          // persisted from this job copies it, and restores of that snapshot are
+          // only served through a storage session when it is present.
+          storageIdentity: normalizeStorageIdentity(destination.provider, destination.providerConfig),
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        })
+        .returning();
 
-    const result = await executeCommand(
+      if (!backupJob) {
+        return { response: c.json({ error: 'Failed to create backup job' }, 500) };
+      }
+      return { backupJob, configId: resolvedConfig.configId, destination };
+    });
+    if ('response' in phase1) return phase1.response;
+    const { backupJob, configId, destination } = phase1;
+
+    // Phase 2 — dispatch the now-committed job, holding no context. The
+    // precheck opens its own short one, so it is told which organization this
+    // request authorized the device under.
+    const result = await executeCommandWithSystemPrecheck(
       payload.deviceId,
       CommandTypes.MSSQL_BACKUP,
       {
@@ -339,17 +392,26 @@ mssqlRoutes.post(
         // result — which arrives as a second, unsolicited command_result
         // frame after a queue-admission ack — back to this backup_jobs row.
         jobId: backupJob.id,
-        configId: resolvedConfig.configId,
-        provider: destination.provider,
-        providerConfig: destination.providerConfig,
-        storageEncryption: destination.storageEncryption,
+        configId,
+        // Provider + encryption plan + a reference: the destination itself is
+        // resolved when the command is delivered, never stored on the row.
+        ...backupWriteCredentialPayload(configId, orgId, destination),
         instance: payload.instance,
         database: payload.database,
         backupType: payload.backupType,
       },
-      { userId: auth?.user?.id, timeoutMs: 600000 }
+      { userId: auth?.user?.id, timeoutMs: 600000, expectedOrgId: orgId }
     );
 
+    // Refused before a command row existed: the device's backup helper cannot
+    // write through a storage session. The job fails with the same message the
+    // operator sees, and the answer is a conflict the operator can act on.
+    if (result.status === 'failed' && isBackupWriteHelperUpdateRequiredError(result.error)) {
+      await withAuthDbAccessContext(auth, () => markBackupJobFailedIfInFlight(backupJob.id, result.error!));
+      return c.json({ error: result.error, reason: 'helper_update_required' }, 409);
+    }
+
+    // Phase 3 — record the reply, each write in a short context of its own.
     let parsedData: unknown = null;
     let snapshotDbId: string | null = null;
     let providerSnapshotId: string | null = null;
@@ -365,7 +427,8 @@ mssqlRoutes.post(
       // (agentWs.ts processCommandResult / handleProviderBackedBackupResult).
       if (isBackupQueuedAck(parsedData) || isBackupStartedAck(parsedData)) {
         const queued = isBackupQueuedAck(parsedData);
-        await applyBackupStartedAck({ jobId: backupJob.id, deviceId: payload.deviceId, queued });
+        await withAuthDbAccessContext(auth, () =>
+          applyBackupStartedAck({ jobId: backupJob.id, deviceId: payload.deviceId, queued }));
         return c.json({
           data: { backupJobId: backupJob.id, status: 'running', queued },
         }, 202);
@@ -376,7 +439,7 @@ mssqlRoutes.post(
         throw new Error(describeZodIssues(parsedBackup.error));
       }
 
-      const persisted = await applyBackupCommandResultToJob({
+      const persisted = await withAuthDbAccessContext(auth, () => applyBackupCommandResultToJob({
         jobId: backupJob.id,
         orgId,
         deviceId: payload.deviceId,
@@ -388,14 +451,16 @@ mssqlRoutes.post(
           ...parsedBackup.data,
           error: result.error,
         },
-      });
+        // The reply to the command this route dispatched to this device.
+        dispatchExpectationVerified: true,
+      }));
       snapshotDbId = persisted.snapshotDbId;
       providerSnapshotId = persisted.providerSnapshotId;
     } catch (error) {
-      await markBackupJobFailedIfInFlight(
+      await withAuthDbAccessContext(auth, () => markBackupJobFailedIfInFlight(
         backupJob.id,
         error instanceof Error ? error.message : 'Failed to persist MSSQL backup result',
-      );
+      ));
       if (result.status === 'completed') {
         return c.json(
           { error: error instanceof Error ? error.message : 'Failed to persist MSSQL backup result' },
@@ -443,6 +508,18 @@ mssqlRoutes.get('/mssql/chains', requirePermission(PERMISSIONS.ORGS_READ.resourc
 
   return c.json({ data: chains });
 });
+
+// Mirrors routes/backup/restore.ts and routes/backup/vmrestore.ts: a device
+// that is offline is a routine, expected dispatch outcome for a
+// reject-on-offline restore command, not an infra failure — surface it as
+// 409 so callers/monitoring can distinguish it from a genuine enqueue error.
+function mapDispatchErrorStatus(error: string): number {
+  // Both are states of the target device the operator can act on, not
+  // dispatch failures.
+  return error.startsWith('Device is ') || isBackupHelperUpdateRequiredError(error) || isRestoreHelperUpdateRequiredError(error)
+    ? 409
+    : 502;
+}
 
 // ── POST /mssql/restore — trigger MSSQL restore ──
 
@@ -518,39 +595,76 @@ mssqlRoutes.post(
       return c.json({ error: message, reason }, 422);
     }
 
-    const result = await executeCommand(
-      payload.deviceId,
-      CommandTypes.MSSQL_RESTORE,
-      {
-        instance:
-          payload.instance
-          ?? (
-            typeof metadata.instance === 'string'
-              ? metadata.instance
-              : typeof metadata.instanceName === 'string'
-                ? metadata.instanceName
-                : 'MSSQLSERVER'
-          ),
+    // #6437: a real MSSQL restore commonly runs well past 10 minutes — the
+    // same shape of long-running restore that #6415/PR #6434 gave a 24h
+    // ceiling to for whole-machine restores. `executeCommand` blocks the HTTP
+    // request on `waitForCommandResult(commandId, timeoutMs)` and terminalises
+    // the response as failed once `timeoutMs` elapses, independent of and much
+    // shorter than that ceiling — so a healthy restore was reported failed
+    // while the agent kept working. Dispatch async instead (the same D20
+    // queued-ack + job-correlation pattern PR #5461 established for
+    // MSSQL_BACKUP/HYPERV_BACKUP): return as soon as the command is queued and
+    // let the stale command reaper own the deadline. The agent already reports
+    // its terminal result asynchronously over the command-result WS path —
+    // nothing on the agent side needs to change.
+    const instance =
+      payload.instance
+      ?? (
+        typeof metadata.instance === 'string'
+          ? metadata.instance
+          : typeof metadata.instanceName === 'string'
+            ? metadata.instanceName
+            : 'MSSQLSERVER'
+      );
+    // #6974: track the restore in a restore_jobs row (linked by command id) so
+    // the terminal result is persisted by commandResultHandlers.mssql_restore.
+    // Integrity (routes/backup/restoreIntegrityGate.ts): decided before the
+    // restore job or command exists.
+    const integrity = await gateRestoreCommand(c, {
+      orgId,
+      snapshotDbId: snapshot.id,
+      targetDeviceId: payload.deviceId,
+      commandType: CommandTypes.MSSQL_RESTORE,
+      stepUpGrant: payload.stepUpGrant,
+      confirmUnattestedRestore: payload.confirmUnattestedRestore,
+      executingDeviceId: payload.deviceId,
+    });
+    if (!integrity.ok) return restoreIntegrityResponse(c, integrity);
+
+    const queued = await dispatchTrackedDbRestore({
+      ...(integrity.commandId ? { commandId: integrity.commandId } : {}),
+      orgId,
+      snapshotId: snapshot.id,
+      deviceId: payload.deviceId,
+      userId: auth?.user?.id,
+      commandType: CommandTypes.MSSQL_RESTORE,
+      engine: 'mssql',
+      targetConfig: { instance, targetDatabase: payload.targetDatabase, noRecovery: payload.noRecovery ?? false },
+      buildPayload: (restoreJobId) => ({
+        restoreJobId,
+        instance,
         snapshotId: snapshot.providerSnapshotId,
         backupFileName,
         targetDatabase: payload.targetDatabase,
         noRecovery: payload.noRecovery,
-        provider: backupProviderConfig.provider,
-        providerConfig: backupProviderConfig.providerConfig,
+        ...backupReadCredentialPayload(snapshot.configId!, orgId, backupProviderConfig.provider),
+      }),
+    });
+
+    if (!queued.ok) {
+      return c.json({ error: queued.error }, mapDispatchErrorStatus(queued.error) as any);
+    }
+
+    return c.json({
+      data: {
+        commandId: queued.command.id,
+        restoreJobId: queued.restoreJobId,
+        status: queued.command.status,
+        deviceId: payload.deviceId,
+        snapshotId: snapshot.id,
+        targetDatabase: payload.targetDatabase,
       },
-      { userId: auth?.user?.id, timeoutMs: 600000 }
-    );
-
-    if (result.status === 'failed') {
-      return c.json({ error: result.error || 'MSSQL restore failed' }, 500);
-    }
-
-    try {
-      const data = result.stdout ? parseAgentJsonStdout(result.stdout) : null;
-      return c.json({ data });
-    } catch {
-      return c.json({ data: result.stdout });
-    }
+    }, 202);
   }
 );
 
@@ -639,8 +753,7 @@ mssqlRoutes.post(
         instance,
         snapshotId: snapshot.providerSnapshotId,
         backupFileName,
-        provider: backupProviderConfig.provider,
-        providerConfig: backupProviderConfig.providerConfig,
+        ...backupReadCredentialPayload(snapshot.configId!, orgId, backupProviderConfig.provider),
       },
       { userId: auth?.user?.id, timeoutMs: 120000 }
     );
@@ -648,7 +761,7 @@ mssqlRoutes.post(
     if (result.status === 'failed') {
       return c.json(
         { error: result.error || 'MSSQL verify failed' },
-        500
+        isBackupHelperUpdateRequiredError(result.error) ? 409 : 500
       );
     }
 

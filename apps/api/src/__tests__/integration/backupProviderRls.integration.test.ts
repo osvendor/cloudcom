@@ -295,6 +295,32 @@ describe('backup provider — cross-tenant isolation as breeze_app', () => {
     expect(own).toHaveLength(1);
   });
 
+  runDb('isolates an axcient row and its verified_bootable columns across orgs', async () => {
+    const fx = await seedFixture();
+    const at = new Date('2026-11-05T03:12:00.000Z');
+    const inserted = await withSystemDbAccessContext(() => insertProviderDevice(fx.a, {
+      provider: 'axcient',
+      status: 'paused',
+      verifiedBootableAt: at,
+      verifiedBootable: true,
+      verifiedBootableFailedChecks: ['system_boot'],
+    }));
+    const select = () => db.select({
+      id: backupProviderDevices.id,
+      status: backupProviderDevices.status,
+      verifiedBootableAt: backupProviderDevices.verifiedBootableAt,
+      verifiedBootable: backupProviderDevices.verifiedBootable,
+      verifiedBootableFailedChecks: backupProviderDevices.verifiedBootableFailedChecks,
+    }).from(backupProviderDevices).where(sql`${backupProviderDevices.provider} = 'axcient'`);
+
+    const own = await withDbAccessContext(fx.a.orgContext, select);
+    expect(own).toEqual([{
+      id: inserted.id, status: 'paused', verifiedBootableAt: at, verifiedBootable: true, verifiedBootableFailedChecks: ['system_boot'],
+    }]);
+    const foreign = await withDbAccessContext(fx.b.orgContext, select);
+    expect(foreign).toEqual([]);
+  });
+
   runDb('refuses a device row whose customer belongs to another org with 23503', async () => {
     const fx = await seedFixture();
     await expect(withSystemDbAccessContext(() =>
@@ -539,6 +565,23 @@ describe('backup provider — lifecycle against real Postgres', () => {
     `)) as unknown as Array<{ org_id: string }>;
     expect(row!.org_id).toBe(fx.a.org.id);
   });
+  runDb('remapCustomer refuses the partner\'s holding org, writing nothing', async () => {
+    const { remapCustomer, RemapCustomerError } = await import('../../services/backupProviders/mapping');
+    const fx = await withSystemDbAccessContext(async () => {
+      const tenant = await seedTenant('remap-holding');
+      const holding = await createOrganization({
+        partnerId: tenant.partner.id, name: 'Unassigned devices', slug: `unassigned-pool-${tenant.partner.id}`, type: 'unassigned_pool',
+      });
+      return { tenant, holding };
+    });
+    await expect(withSystemDbAccessContext(() => remapCustomer(
+      fx.tenant.customer.id, fx.holding.id, { userId: fx.tenant.user.id, partnerId: fx.tenant.partner.id },
+    ))).rejects.toBeInstanceOf(RemapCustomerError);
+    const [row] = (await (getTestDb() as typeof db).execute(sql`
+      SELECT org_id FROM backup_provider_customers WHERE id = ${fx.tenant.customer.id}::uuid
+    `)) as unknown as Array<{ org_id: string }>;
+    expect(row!.org_id).toBe(fx.tenant.org.id);
+  });
 });
 
 describe('backup provider — HTTP-level FK mapping through the real router', () => {
@@ -583,10 +626,26 @@ describe('backup provider — HTTP-level FK mapping through the real router', ()
       return { otherDevice: otherDevice!, providerRow: providerRow! };
     });
 
-    const res = await client.put(
-      `/api/v1/backup/providers/devices/${fixture.providerRow.id}/link`,
-      { deviceId: fixture.otherDevice.id },
-    );
+    // The link route sits behind requireMfa(); the default client token is
+    // mfa:false, so mint the same partner-scope token with MFA satisfied.
+    const { createAccessToken } = await import('../../services/jwt');
+    const mfaToken = await createAccessToken({
+      sub: client.env.user.id,
+      email: client.env.user.email,
+      roleId: client.env.role.id,
+      orgId: null,
+      partnerId: client.env.partner.id,
+      scope: 'partner',
+      mfa: true,
+      aep: 1,
+      mep: 1,
+      sid: randomUUID(),
+    });
+    const res = await app.request(`/api/v1/backup/providers/devices/${fixture.providerRow.id}/link`, {
+      method: 'PUT',
+      headers: { Authorization: `Bearer ${mfaToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ deviceId: fixture.otherDevice.id }),
+    });
     expect(res.status).toBe(422);
     expect(await res.json()).toMatchObject({ code: 'DEVICE_ORG_MISMATCH' });
   });

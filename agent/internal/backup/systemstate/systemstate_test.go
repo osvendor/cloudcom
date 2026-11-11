@@ -1,6 +1,7 @@
 package systemstate
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -144,7 +146,9 @@ func TestArtifactJSON(t *testing.T) {
 }
 
 func TestCollectHardwareOnly(t *testing.T) {
-	profile, err := CollectHardwareOnly()
+	setCollectionDeadlines(t, time.Minute, time.Minute, 2*time.Second)
+
+	profile, err := CollectHardwareOnly(context.Background())
 	if err != nil {
 		t.Fatalf("CollectHardwareOnly: %v", err)
 	}
@@ -164,49 +168,129 @@ func TestCollectHardwareOnly(t *testing.T) {
 	}
 }
 
+// fakeCollector stands in for the platform collector, whose real run copies
+// the host's /etc: over 850 MB on the CI runner, which on a slow disk outlasted
+// the package's 10-minute test timeout (#11201).
+type fakeCollector struct {
+	collect func(ctx context.Context, stagingDir string) (*SystemStateManifest, error)
+}
+
+func (f *fakeCollector) CollectState(ctx context.Context, stagingDir string) (*SystemStateManifest, error) {
+	return f.collect(ctx, stagingDir)
+}
+
+func (f *fakeCollector) CollectHardwareProfile(context.Context) (*HardwareProfile, error) {
+	return &HardwareProfile{}, nil
+}
+
+func stubPlatformCollector(t *testing.T, collect func(ctx context.Context, stagingDir string) (*SystemStateManifest, error)) {
+	t.Helper()
+	orig := platformCollector
+	t.Cleanup(func() { platformCollector = orig })
+	platformCollector = func(CollectOptions) Collector { return &fakeCollector{collect: collect} }
+}
+
 func TestCollectSystemState(t *testing.T) {
-	// This test runs the real collector on the current platform.
-	// Some steps may fail due to permissions, but the overall call should succeed.
-	manifest, stagingDir, err := CollectSystemState()
+	stubPlatformCollector(t, func(_ context.Context, stagingDir string) (*SystemStateManifest, error) {
+		path := filepath.Join(stagingDir, "services.txt")
+		if err := os.WriteFile(path, []byte("svc"), 0o600); err != nil {
+			return nil, err
+		}
+		return &SystemStateManifest{
+			Platform:  "test",
+			Artifacts: []Artifact{artifactFromFile("services", "services", path, stagingDir)},
+		}, nil
+	})
+
+	manifest, stagingDir, err := CollectSystemState(context.Background())
 	if err != nil {
 		t.Fatalf("CollectSystemState: %v", err)
 	}
-	defer os.RemoveAll(stagingDir)
+	defer func() { _ = os.RemoveAll(stagingDir) }()
 
 	if manifest == nil {
 		t.Fatal("manifest is nil")
 	}
-	if manifest.Platform == "" {
-		t.Error("platform is empty")
+	if manifest.Platform != "test" {
+		t.Errorf("platform = %q, want the collector's %q", manifest.Platform, "test")
 	}
-	if manifest.Hostname == "" {
-		t.Error("hostname is empty")
-	}
-	if manifest.CollectedAt.IsZero() {
-		t.Error("collectedAt is zero")
-	}
-	if stagingDir == "" {
-		t.Error("stagingDir is empty")
+	if len(manifest.Artifacts) != 1 {
+		t.Fatalf("artifacts = %d, want the collector's 1", len(manifest.Artifacts))
 	}
 
-	// Should have collected at least one artifact on any platform.
-	if len(manifest.Artifacts) == 0 {
-		t.Error("no artifacts collected")
+	// The caller owns the staging dir: it must outlive this call with the
+	// collector's files still in it.
+	if _, err := os.Stat(filepath.Join(stagingDir, manifest.Artifacts[0].Path)); err != nil {
+		t.Errorf("collected artifact not in the returned staging dir: %v", err)
 	}
+}
 
-	// Verify staging directory exists and has files.
-	entries, err := os.ReadDir(stagingDir)
+func TestCollectSystemState_CollectorErrorRemovesStagingDir(t *testing.T) {
+	var staged string
+	stubPlatformCollector(t, func(_ context.Context, stagingDir string) (*SystemStateManifest, error) {
+		staged = stagingDir
+		return nil, errors.New("nothing collected")
+	})
+
+	if _, _, err := CollectSystemState(context.Background()); err == nil {
+		t.Fatal("expected the collector's error")
+	}
+	if _, err := os.Stat(staged); !os.IsNotExist(err) {
+		t.Errorf("staging dir %s not removed after a failed collection: %v", staged, err)
+	}
+}
+
+// TestCollectSystemState_RealCollectorStaysWithinItsDeadline is the one test
+// that still runs the real platform collector, on purpose with short deadlines:
+// it must hold however slow the host's disk is. A step that runs out of time
+// here is the behaviour under test, not a failure, so the only hard assertion
+// beyond returning is that a run nothing cut short captured something.
+func TestCollectSystemState_RealCollectorStaysWithinItsDeadline(t *testing.T) {
+	setCollectionDeadlines(t, 20*time.Second, time.Minute, 2*time.Second)
+
+	var manifest *SystemStateManifest
+	var stagingDir string
+	var err error
+	returnsWithin(t, 2*time.Minute, func() {
+		manifest, stagingDir, err = CollectSystemState(context.Background())
+	})
 	if err != nil {
-		t.Fatalf("read staging dir: %v", err)
+		// e.g. Windows' required registry step needs more than this budget.
+		t.Logf("collection failed within its deadline: %v", err)
+		return
 	}
-	if len(entries) == 0 {
-		t.Error("staging directory is empty")
-	}
+	defer func() { _ = os.RemoveAll(stagingDir) }()
 
-	t.Logf("collected %d artifacts on %s", len(manifest.Artifacts), manifest.Platform)
-	for _, a := range manifest.Artifacts {
-		t.Logf("  %s (%s) %d bytes", a.Name, a.Category, a.SizeBytes)
+	t.Logf("collected %d artifacts on %s, incomplete: %v", len(manifest.Artifacts), manifest.Platform, manifest.IncompleteSteps)
+	if len(manifest.IncompleteSteps) == 0 && len(manifest.Artifacts) == 0 {
+		t.Error("no step was cut short, yet no artifacts were collected")
 	}
+}
+
+// The real steps, wired to the real collector: with the context already over,
+// each one must stop and be named. The steps have no seam of their own, so this
+// is what catches a step added without passing ctx on. Not on Windows, whose
+// registry step takes its own VSS snapshot under its own 3-minute bound.
+func TestRealCollector_EndedContextCutsEveryStepShort(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the registry step's snapshot does not take the step context")
+	}
+	setCollectionDeadlines(t, time.Minute, time.Minute, 2*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	var manifest *SystemStateManifest
+	var err error
+	returnsWithin(t, 2*time.Minute, func() {
+		manifest, err = NewCollector().CollectState(ctx, t.TempDir())
+	})
+	if err == nil {
+		t.Fatal("expected no artifacts from a collection whose context had ended")
+	}
+	if manifest == nil || len(manifest.IncompleteSteps) == 0 {
+		t.Fatalf("manifest = %+v, want every step named as incomplete", manifest)
+	}
+	t.Logf("incomplete: %v", manifest.IncompleteSteps)
 }
 
 func TestNewCollectorImplementsInterface(t *testing.T) {
@@ -355,7 +439,7 @@ func TestHelperCollectArtifactsInDir_Checksums(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	artifacts, err := collectArtifactsInDir("test", dir, tmpDir)
+	artifacts, err := collectArtifactsInDir(context.Background(), "test", dir, tmpDir)
 	if err != nil {
 		t.Fatalf("collectArtifactsInDir: %v", err)
 	}
@@ -369,7 +453,11 @@ func TestHelperCollectArtifactsInDir_Checksums(t *testing.T) {
 }
 
 func TestCollectSystemState_SchemaVersionSet(t *testing.T) {
-	manifest, stagingDir, err := CollectSystemState()
+	stubPlatformCollector(t, func(context.Context, string) (*SystemStateManifest, error) {
+		return &SystemStateManifest{}, nil
+	})
+
+	manifest, stagingDir, err := CollectSystemState(context.Background())
 	if err != nil {
 		t.Fatalf("CollectSystemState: %v", err)
 	}
@@ -424,7 +512,7 @@ func TestHelperCopyFile(t *testing.T) {
 		t.Fatalf("write src: %v", err)
 	}
 
-	if err := copyFile(src, dst); err != nil {
+	if err := copyFile(context.Background(), src, dst); err != nil {
 		t.Fatalf("copyFile: %v", err)
 	}
 
@@ -446,7 +534,7 @@ func TestHelperCopyTree(t *testing.T) {
 	os.WriteFile(srcDir+"/a/file1.txt", []byte("one"), 0o600)
 	os.WriteFile(srcDir+"/a/b/file2.txt", []byte("two"), 0o600)
 
-	if err := copyTree(srcDir, dstDir); err != nil {
+	if err := copyTree(context.Background(), srcDir, dstDir); err != nil {
 		t.Fatalf("copyTree: %v", err)
 	}
 
@@ -478,7 +566,7 @@ func TestHelperCopyFile_PreservesModeAndMtime(t *testing.T) {
 		t.Fatalf("chtimes src: %v", err)
 	}
 
-	if err := copyFile(src, dst); err != nil {
+	if err := copyFile(context.Background(), src, dst); err != nil {
 		t.Fatalf("copyFile: %v", err)
 	}
 
@@ -513,7 +601,7 @@ func TestHelperCopyTree_PreservesDirModeAndMtime(t *testing.T) {
 		t.Fatalf("chtimes subDir: %v", err)
 	}
 
-	if err := copyTree(srcDir, dstDir); err != nil {
+	if err := copyTree(context.Background(), srcDir, dstDir); err != nil {
 		t.Fatalf("copyTree: %v", err)
 	}
 
@@ -567,7 +655,7 @@ func TestHelperCopyTree_NestedRestrictiveDirFixupOrder(t *testing.T) {
 	// block this test's own dstDir tempdir cleanup.
 	t.Cleanup(func() { _ = os.Chmod(stagedParent, 0o700) })
 
-	if err := copyTree(srcDir, dstDir); err != nil {
+	if err := copyTree(context.Background(), srcDir, dstDir); err != nil {
 		t.Fatalf("copyTree: %v", err)
 	}
 
@@ -614,7 +702,7 @@ func TestHelperCopyFile_RecreatesSymlink(t *testing.T) {
 	}
 
 	dstLink := filepath.Join(tmpDir, "staged", "link")
-	if err := copyFile(link, dstLink); err != nil {
+	if err := copyFile(context.Background(), link, dstLink); err != nil {
 		t.Fatalf("copyFile(symlink): %v", err)
 	}
 	gotTarget, err := os.Readlink(dstLink)
@@ -626,7 +714,7 @@ func TestHelperCopyFile_RecreatesSymlink(t *testing.T) {
 	}
 
 	dstDangling := filepath.Join(tmpDir, "staged", "dangling")
-	if err := copyFile(dangling, dstDangling); err != nil {
+	if err := copyFile(context.Background(), dangling, dstDangling); err != nil {
 		t.Fatalf("copyFile(dangling symlink) should succeed, got: %v", err)
 	}
 	gotDanglingTarget, err := os.Readlink(dstDangling)
@@ -671,7 +759,7 @@ func TestHelperCopyTree_RecreatesSymlinksAndSkipsSpecialFiles(t *testing.T) {
 		t.Fatalf("move socket into srcDir: %v", err)
 	}
 
-	if err := copyTree(srcDir, dstDir); err != nil {
+	if err := copyTree(context.Background(), srcDir, dstDir); err != nil {
 		t.Fatalf("copyTree: %v", err)
 	}
 
@@ -709,7 +797,7 @@ func TestHelperCollectArtifactsInDir_SymlinksEnumeratedWithLinkTarget(t *testing
 		t.Fatal(err)
 	}
 
-	artifacts, err := collectArtifactsInDir("test", dir, tmpDir)
+	artifacts, err := collectArtifactsInDir(context.Background(), "test", dir, tmpDir)
 	if err != nil {
 		t.Fatalf("collectArtifactsInDir: %v", err)
 	}
@@ -786,7 +874,7 @@ func TestCollectRegistryHivesPartialFailure(t *testing.T) {
 	orig := runRegSave
 	defer func() { runRegSave = orig }()
 
-	runRegSave = func(hive, outPath string) ([]byte, error) {
+	runRegSave = func(_ context.Context, hive, outPath string) ([]byte, error) {
 		if hive == "SECURITY" {
 			return []byte("access is denied"), fmt.Errorf("exit status 5")
 		}
@@ -797,7 +885,7 @@ func TestCollectRegistryHivesPartialFailure(t *testing.T) {
 	}
 
 	dir := t.TempDir()
-	artifacts, err := collectRegistryHives(dir, dir, []string{"SYSTEM", "SOFTWARE", "SAM", "SECURITY"})
+	artifacts, err := collectRegistryHives(context.Background(), dir, dir, []string{"SYSTEM", "SOFTWARE", "SAM", "SECURITY"})
 
 	if err == nil {
 		t.Fatal("collectRegistryHives: expected error, got nil")
@@ -821,7 +909,7 @@ func TestCollectRegistryHivesAllSucceed(t *testing.T) {
 	orig := runRegSave
 	defer func() { runRegSave = orig }()
 
-	runRegSave = func(hive, outPath string) ([]byte, error) {
+	runRegSave = func(_ context.Context, hive, outPath string) ([]byte, error) {
 		if err := os.WriteFile(outPath, []byte("hive-"+hive), 0o600); err != nil {
 			return nil, err
 		}
@@ -830,7 +918,7 @@ func TestCollectRegistryHivesAllSucceed(t *testing.T) {
 
 	dir := t.TempDir()
 	hives := []string{"SYSTEM", "SOFTWARE", "SAM", "SECURITY"}
-	artifacts, err := collectRegistryHives(dir, dir, hives)
+	artifacts, err := collectRegistryHives(context.Background(), dir, dir, hives)
 	if err != nil {
 		t.Fatalf("collectRegistryHives: unexpected error: %v", err)
 	}
@@ -843,13 +931,13 @@ func TestCollectRegistryHivesAllFail(t *testing.T) {
 	orig := runRegSave
 	defer func() { runRegSave = orig }()
 
-	runRegSave = func(hive, outPath string) ([]byte, error) {
+	runRegSave = func(_ context.Context, hive, outPath string) ([]byte, error) {
 		return []byte("boom"), fmt.Errorf("exit status 1")
 	}
 
 	dir := t.TempDir()
 	hives := []string{"SYSTEM", "SOFTWARE"}
-	artifacts, err := collectRegistryHives(dir, dir, hives)
+	artifacts, err := collectRegistryHives(context.Background(), dir, dir, hives)
 	if err == nil {
 		t.Fatal("collectRegistryHives: expected error when every hive fails, got nil")
 	}
@@ -880,5 +968,187 @@ func TestCertSvcInstalledChecksCertsrvExe(t *testing.T) {
 
 	if !certSvcInstalled() {
 		t.Error("certSvcInstalled() = false after certsrv.exe created, want true")
+	}
+}
+
+// #7001: a step that fails but still returns artifacts (collectRegistryHives
+// returns the hives that saved alongside a *registrySaveError) must have those
+// artifacts recorded in manifest.Artifacts, while the step is still listed in
+// IncompleteSteps and a required step's failure still fails the collection.
+func TestRunCollectionStepsKeepsPartialArtifactsFromFailedStep(t *testing.T) {
+	orig := runRegSave
+	defer func() { runRegSave = orig }()
+	runRegSave = func(_ context.Context, hive, outPath string) ([]byte, error) {
+		if hive == "SECURITY" {
+			return []byte("access is denied"), fmt.Errorf("exit status 5")
+		}
+		return []byte("ok"), os.WriteFile(outPath, []byte("hive-"+hive), 0o600)
+	}
+
+	staging := t.TempDir()
+	steps := []collectionStep{
+		{"registry", func(_ context.Context, stagingDir string) ([]Artifact, error) {
+			dir := filepath.Join(stagingDir, "registry")
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				return nil, err
+			}
+			return collectRegistryHives(context.Background(), dir, stagingDir, []string{"SYSTEM", "SOFTWARE", "SAM", "SECURITY"})
+		}},
+		{"boot", func(context.Context, string) ([]Artifact, error) {
+			return []Artifact{{Name: "bcd", Category: "boot"}}, nil
+		}},
+	}
+
+	manifest := &SystemStateManifest{}
+	err := runCollectionSteps(context.Background(), manifest, steps, staging, map[string]bool{"registry": true, "boot": true})
+
+	if err == nil {
+		t.Fatal("runCollectionSteps: expected required-step error for partial registry, got nil")
+	}
+	if !strings.Contains(err.Error(), "registry") {
+		t.Errorf("error %q does not name the registry step", err.Error())
+	}
+	if want := []string{"registry"}; !reflect.DeepEqual(manifest.IncompleteSteps, want) {
+		t.Errorf("IncompleteSteps = %v, want %v", manifest.IncompleteSteps, want)
+	}
+	var names []string
+	for _, a := range manifest.Artifacts {
+		names = append(names, a.Name)
+	}
+	want := []string{"registry_SYSTEM", "registry_SOFTWARE", "registry_SAM", "bcd"}
+	if !reflect.DeepEqual(names, want) {
+		t.Errorf("manifest.Artifacts = %v, want %v (saved hives kept alongside the step error)", names, want)
+	}
+}
+
+// A failed step that returns no artifacts contributes nothing, and a failed
+// best-effort (non-required) step does not fail the collection.
+func TestRunCollectionStepsBestEffortFailure(t *testing.T) {
+	steps := []collectionStep{
+		{"registry", func(context.Context, string) ([]Artifact, error) { return []Artifact{{Name: "registry_SYSTEM"}}, nil }},
+		{"iis", func(context.Context, string) ([]Artifact, error) { return nil, fmt.Errorf("iis not installed") }},
+	}
+	manifest := &SystemStateManifest{}
+	if err := runCollectionSteps(context.Background(), manifest, steps, t.TempDir(), map[string]bool{"registry": true}); err != nil {
+		t.Fatalf("runCollectionSteps: unexpected error: %v", err)
+	}
+	if want := []string{"iis"}; !reflect.DeepEqual(manifest.IncompleteSteps, want) {
+		t.Errorf("IncompleteSteps = %v, want %v", manifest.IncompleteSteps, want)
+	}
+	if len(manifest.Artifacts) != 1 {
+		t.Errorf("artifacts = %d, want 1", len(manifest.Artifacts))
+	}
+}
+
+// Every step failing with no artifacts is still the "produced no artifacts"
+// error.
+func TestRunCollectionStepsAllFail(t *testing.T) {
+	steps := []collectionStep{
+		{"registry", func(context.Context, string) ([]Artifact, error) { return nil, fmt.Errorf("denied") }},
+		{"boot", func(context.Context, string) ([]Artifact, error) { return nil, fmt.Errorf("denied") }},
+	}
+	err := runCollectionSteps(context.Background(), &SystemStateManifest{}, steps, t.TempDir(), map[string]bool{"registry": true})
+	if err == nil || !strings.Contains(err.Error(), "produced no artifacts") {
+		t.Fatalf("err = %v, want 'produced no artifacts'", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// runCollectionSteps — the step loop Windows CollectState delegates to. #6505:
+// the required-artifact error used to name only the failed STEP ("[registry]"),
+// discarding the step's own error (which names the hive), so
+// backup_jobs.error_log never said which hive failed.
+// ---------------------------------------------------------------------------
+
+func TestRunCollectionSteps_RequiredStepErrorCarriesStepReason(t *testing.T) {
+	hiveErr := &registrySaveError{
+		FailedHives: []string{"SAM", "SECURITY"},
+		Err:         errors.New(`fork/exec C:\Windows\system32\reg.exe: Access is denied.`),
+	}
+	manifest := &SystemStateManifest{}
+	steps := []collectionStep{
+		{"registry", func(context.Context, string) ([]Artifact, error) {
+			return []Artifact{{Name: "registry_SYSTEM"}}, hiveErr
+		}},
+		{"boot", func(context.Context, string) ([]Artifact, error) { return []Artifact{{Name: "bcd_export"}}, nil }},
+		{"iis", func(context.Context, string) ([]Artifact, error) { return nil, errors.New("appcmd blew up") }},
+	}
+
+	err := runCollectionSteps(context.Background(), manifest, steps, t.TempDir(), map[string]bool{"registry": true, "boot": true})
+	if err == nil {
+		t.Fatal("a failed required step must fail the collection")
+	}
+	msg := err.Error()
+	for _, want := range []string{
+		"missing required artifact(s) [registry]",
+		"image would not be restorable",
+		"reg save failed for hive(s) [SAM SECURITY]",
+		"Access is denied",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error must contain %q; got %q", want, msg)
+		}
+	}
+	if strings.Contains(msg, "appcmd") {
+		t.Errorf("a best-effort step's failure must not be reported as a required-step reason; got %q", msg)
+	}
+	var rsErr *registrySaveError
+	if !errors.As(err, &rsErr) || !reflect.DeepEqual(rsErr.FailedHives, []string{"SAM", "SECURITY"}) {
+		t.Errorf("the step error must stay reachable via errors.As; got %v", rsErr)
+	}
+	if !reflect.DeepEqual(manifest.IncompleteSteps, []string{"registry", "iis"}) {
+		t.Errorf("IncompleteSteps = %v, want [registry iis]", manifest.IncompleteSteps)
+	}
+}
+
+func TestRunCollectionSteps_OnlyOptionalFailuresSucceed(t *testing.T) {
+	manifest := &SystemStateManifest{}
+	steps := []collectionStep{
+		{"registry", func(context.Context, string) ([]Artifact, error) { return []Artifact{{Name: "registry_SYSTEM"}}, nil }},
+		{"iis", func(context.Context, string) ([]Artifact, error) { return nil, errors.New("appcmd blew up") }},
+	}
+	if err := runCollectionSteps(context.Background(), manifest, steps, t.TempDir(), map[string]bool{"registry": true}); err != nil {
+		t.Fatalf("optional-step failure must not fail the collection: %v", err)
+	}
+	if len(manifest.Artifacts) != 1 || !reflect.DeepEqual(manifest.IncompleteSteps, []string{"iis"}) {
+		t.Errorf("artifacts=%v incomplete=%v", manifest.Artifacts, manifest.IncompleteSteps)
+	}
+}
+
+// Every step failing (e.g. an unelevated agent) is the likeliest real-world
+// shape of #6505, so the required steps' reasons must survive the
+// no-artifacts short-circuit too.
+func TestRunCollectionSteps_AllFailNoArtifacts(t *testing.T) {
+	hiveErr := &registrySaveError{FailedHives: []string{"SAM"}, Err: errors.New("Access is denied.")}
+	steps := []collectionStep{
+		{"registry", func(context.Context, string) ([]Artifact, error) { return nil, hiveErr }},
+		{"drivers", func(context.Context, string) ([]Artifact, error) { return nil, errors.New("driverquery exploded") }},
+	}
+	err := runCollectionSteps(context.Background(), &SystemStateManifest{}, steps, t.TempDir(), map[string]bool{"registry": true})
+	if err == nil {
+		t.Fatal("all steps failing must fail the collection")
+	}
+	msg := err.Error()
+	for _, want := range []string{"produced no artifacts - all 2 steps failed", "reg save failed for hive(s) [SAM]"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error must contain %q; got %q", want, msg)
+		}
+	}
+	if strings.Contains(msg, "driverquery") {
+		t.Errorf("a best-effort step's failure must not be reported as a required-step reason; got %q", msg)
+	}
+	var rsErr *registrySaveError
+	if !errors.As(err, &rsErr) {
+		t.Errorf("the registry step error must stay reachable via errors.As; got %q", msg)
+	}
+}
+
+func TestRunCollectionSteps_AllOptionalFailNoArtifacts(t *testing.T) {
+	steps := []collectionStep{
+		{"drivers", func(context.Context, string) ([]Artifact, error) { return nil, errors.New("x") }},
+	}
+	err := runCollectionSteps(context.Background(), &SystemStateManifest{}, steps, t.TempDir(), map[string]bool{"registry": true})
+	if err == nil || err.Error() != "system state collection produced no artifacts - all 1 steps failed" {
+		t.Fatalf("got %v", err)
 	}
 }

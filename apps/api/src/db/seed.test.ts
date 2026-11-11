@@ -1,4 +1,7 @@
 import { describe, expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { PERMISSION_GRANTS } from '@breeze/shared';
 import { resolveBootstrapAdminConfig, DEFAULT_PERMISSIONS, SYSTEM_ROLES, DEV_SEED_DEFAULT_PARTNER_SETTINGS } from './seed';
 
@@ -149,6 +152,23 @@ describe('agent rollback RBAC', () => {
   });
 });
 
+describe('agent recovery RBAC (#9234)', () => {
+  const holdersOf = (perm: string) => SYSTEM_ROLES.filter((role) => role.permissions.includes(perm)).map((r) => r.name);
+
+  it('seeds devices:recover_agent', () => {
+    expect(DEFAULT_PERMISSIONS).toContainEqual(expect.objectContaining({ resource: 'devices', action: 'recover_agent' }));
+  });
+
+  it('grants it to exactly the built-in roles that hold devices:execute', () => {
+    // Restarting the agent through the watchdog is already reachable with
+    // devices:execute (the trigger_agent_restart AI tool), so the dedicated
+    // grant gives no built-in role new authority — it only lets an MSP
+    // separate the two.
+    expect(holdersOf('devices:recover_agent').sort()).toEqual(holdersOf('devices:execute').sort());
+    expect(holdersOf('devices:recover_agent').length).toBeGreaterThan(0);
+  });
+});
+
 describe('billing-role device isolation', () => {
   it.each(['Partner Billing', 'Partner Billing Viewer'])('%s does not grant devices:read', (roleName) => {
     const role = SYSTEM_ROLES.find((candidate) => candidate.name === roleName);
@@ -212,6 +232,7 @@ describe('vulnerability risk-acceptance RBAC', () => {
     expect(role?.permissions).toEqual([
       'devices:read',
       'organizations:read',
+      'client_ai_templates:read',
       'vulnerabilities:accept_risk',
     ]);
   });
@@ -474,7 +495,7 @@ describe('Accounting dedicated permissions (accounting:read / accounting:manage)
   });
 
   it('does NOT grant either accounting permission to any other built-in role', () => {
-    // SEC-2026-09-05-057: the finding is precisely that full-partner low-role
+    // The finding is precisely that full-partner low-role
     // members reached the shared QuickBooks realm. Partner Technician /
     // Partner Billing must NOT acquire that authority automatically.
     for (const role of SYSTEM_ROLES.filter((r) => !['Partner Admin', 'Org Admin'].includes(r.name))) {
@@ -597,6 +618,45 @@ describe('agreements RBAC (W02)', () => {
   });
 });
 
+describe('agreements:send RBAC (#9075 W2a, OD7 B)', () => {
+  const byName = (name: string) => SYSTEM_ROLES.find((role) => role.name === name)!;
+  const MIGRATION = join(
+    dirname(fileURLToPath(import.meta.url)),
+    '../../migrations/2027-01-05-110000-agreements-send-permission.sql',
+  );
+
+  it('seeds the agreements:send permission row', () => {
+    const keys = DEFAULT_PERMISSIONS.map((p) => `${p.resource}:${p.action}`);
+    expect(keys).toContain('agreements:send');
+  });
+
+  it('Partner Billing can send agreements', () => {
+    expect(byName('Partner Billing').permissions).toContain('agreements:send');
+  });
+
+  it('Partner Billing Viewer cannot send agreements', () => {
+    expect(byName('Partner Billing Viewer').permissions).not.toContain('agreements:send');
+  });
+
+  // Back-fill is action-for-action from agreements:write: every seeded role
+  // that can write agreements can send them, and no role gains send without it.
+  it('every seeded role holding agreements:write also holds agreements:send, and vice versa', () => {
+    for (const role of SYSTEM_ROLES) {
+      const perms = role.permissions as readonly string[];
+      expect(perms.includes('agreements:send'), role.name).toBe(perms.includes('agreements:write'));
+    }
+  });
+
+  // A fresh install seeds from DEFAULT_PERMISSIONS, an upgrade from the
+  // migration: the two descriptions must be byte-identical.
+  it('the seeded description is byte-identical to the migration', () => {
+    const seeded = DEFAULT_PERMISSIONS.find((p) => p.resource === 'agreements' && p.action === 'send');
+    expect(seeded).toBeDefined();
+    const sql = readFileSync(MIGRATION, 'utf8');
+    expect(sql).toContain(`VALUES ('agreements', 'send', '${seeded!.description}')`);
+  });
+});
+
 // Spec D2: docs/superpowers/specs/2026-09-18-mfa-required-default-new-partners-design.md
 // New partners default to security.requireMfa=true. The seeded dev/e2e partner
 // must OPT OUT: seeded admins log in without a factor, and a forced-enrolment
@@ -626,5 +686,33 @@ describe('ai_sessions:use (#6396)', () => {
     for (const name of ['Org Viewer', 'Partner Viewer', 'Partner Billing', 'Partner Billing Viewer']) {
       expect(byName(name).permissions).not.toContain('ai_sessions:use');
     }
+  });
+});
+
+describe('webhooks:read', () => {
+  const byName = (name: string) => SYSTEM_ROLES.find((r) => r.name === name)!;
+
+  it('is seeded in the permission catalog and registered in PERMISSION_GRANTS', () => {
+    expect(DEFAULT_PERMISSIONS.some((p) => p.resource === 'webhooks' && p.action === 'read')).toBe(true);
+    expect(PERMISSION_GRANTS.WEBHOOKS_READ).toEqual({ resource: 'webhooks', action: 'read' });
+  });
+
+  it('is granted to Org Admin, Org Technician and Partner Technician', () => {
+    for (const name of ['Org Admin', 'Org Technician', 'Partner Technician']) {
+      expect(byName(name).permissions, `${name} missing webhooks:read`).toContain('webhooks:read');
+    }
+  });
+
+  it('is NOT granted to viewer, billing or security-approver roles', () => {
+    for (const name of [
+      'Org Viewer', 'Partner Viewer', 'Partner Billing', 'Partner Billing Viewer',
+      'Security Approver', 'Partner Security Approver',
+    ]) {
+      expect(byName(name).permissions, `${name} unexpectedly received webhooks:read`).not.toContain('webhooks:read');
+    }
+  });
+
+  it('Partner Admin covers webhooks:read via the wildcard grant', () => {
+    expect(byName('Partner Admin').permissions).toEqual(['*:*']);
   });
 });

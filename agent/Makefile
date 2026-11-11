@@ -1,4 +1,4 @@
-.PHONY: build build-agent build-desktop-helper build-backup build-all build-all-agent build-all-desktop-helper build-all-backup build-windows-user-helper build-winres build-windows-msi clean test install install-service uninstall-service dev-push dev-push-helper build-watchdog build-watchdog-linux build-watchdog-darwin build-watchdog-windows dev-push-watchdog dev-push-both
+.PHONY: build-isolation-recovery build-isolation-recovery-linux build-isolation-recovery-windows build-isolation-recovery-darwin build build-agent build-yarac build-desktop-helper build-backup build-all build-all-agent build-all-desktop-helper build-all-backup build-windows-user-helper build-winres build-windows-msi clean test install install-service uninstall-service dev-push dev-push-helper build-watchdog build-watchdog-linux build-watchdog-darwin build-watchdog-windows dev-push-watchdog dev-push-both
 
 VERSION ?= 0.5.0
 # Local-dev targets intentionally keep plain LDFLAGS (self-host by
@@ -18,6 +18,27 @@ build-desktop-helper:
 
 build-backup:
 	go build $(LDFLAGS) -o bin/breeze-backup ./cmd/breeze-backup
+
+# breeze-yarac: YARA compile-policy CLI (validate/compile/scan/version) — the
+# W03 server pre-check and the lab benchmark harness. Not shipped to agents.
+build-yarac:
+	CGO_ENABLED=0 go build $(LDFLAGS) -o bin/breeze-yarac ./cmd/breeze-yarac
+
+# Local build targets only; distribution and signing remain activation gates.
+build-isolation-recovery:
+	go build $(LDFLAGS) -o bin/breeze-isolation-recovery ./cmd/breeze-isolation-recovery
+
+build-isolation-recovery-linux:
+	GOOS=linux GOARCH=amd64 go build $(LDFLAGS) -o bin/breeze-isolation-recovery-linux-amd64 ./cmd/breeze-isolation-recovery
+
+build-isolation-recovery-windows:
+	GOOS=windows GOARCH=amd64 go build $(LDFLAGS) -o bin/breeze-isolation-recovery-windows-amd64.exe ./cmd/breeze-isolation-recovery
+
+# Unsigned: the pkg bundles a recovery binary only once release.yml signs and
+# notarises one (activation gate).
+build-isolation-recovery-darwin:
+	GOOS=darwin GOARCH=amd64 go build $(LDFLAGS) -o bin/breeze-isolation-recovery-darwin-amd64 ./cmd/breeze-isolation-recovery
+	GOOS=darwin GOARCH=arm64 go build $(LDFLAGS) -o bin/breeze-isolation-recovery-darwin-arm64 ./cmd/breeze-isolation-recovery
 
 # Build for all platforms
 build-all: build-all-agent build-all-desktop-helper build-all-backup
@@ -61,7 +82,13 @@ build-windows: build-windows-user-helper
 # sessionbroker spawns it into the logged-in user's non-elevated session, where
 # a requireAdministrator manifest makes CreateProcessAsUser fail with
 # ERROR_ELEVATION_REQUIRED (#949 regression).
+#
+# The embedded manifest (rsrc_windows_amd64.syso from build-winres) also
+# activates comctl32 v6, which the native prompt renderer's TaskDialogIndirect
+# needs (#10190); without it every native prompt degrades to a message box.
+# Refuse to build a helper without it.
 build-windows-user-helper:
+	@test -f cmd/breeze-user-helper/rsrc_windows_amd64.syso || { echo "cmd/breeze-user-helper/rsrc_windows_amd64.syso is missing: run 'make build-winres' first (the manifest selects comctl32 v6 for TaskDialogIndirect and asInvoker for #949)"; exit 1; }
 	GOOS=windows GOARCH=amd64 go build -ldflags "-X main.version=$(VERSION) -H windowsgui" -o bin/breeze-user-helper-windows-amd64.exe ./cmd/breeze-user-helper
 
 build-winres:
@@ -82,6 +109,12 @@ build-winres:
 	# not in JSON-mode RT_GROUP_ICON entries, and (b) one Makefile line per
 	# binary keeps the source of truth here in the build file instead of
 	# scattered across resources/winres-*.json. The five binaries map to:
+	# breeze-agent.exe and breeze-user-helper.exe use `--manifest gui` for its
+	# per-monitor-v2 DPI awareness: both host remote-desktop capture/input, and a
+	# manifest fixes the process DPI mode before any code runs. The default
+	# `cli` manifest is <dpiAware>true</dpiAware> (system), which silently
+	# overrides internal/remote/desktop/dpi_windows.go and misplaces clicks on
+	# mixed-scale monitors.
 	#   breeze-agent.exe            - admin manifest (matches existing UAC)
 	#   breeze-user-helper.exe      - per-user session, asInvoker (NOT admin: it
 	#                                 is spawned with the user's filtered token,
@@ -89,7 +122,7 @@ build-winres:
 	#   breeze-watchdog.exe         - service, asInvoker
 	#   breeze-backup.exe           - launched by agent, asInvoker
 	#   breeze-desktop-helper.exe   - per-user session, asInvoker, GUI manifest
-	cd resources && go-winres simply --arch amd64 --no-suffix \
+	cd resources && go-winres simply --arch amd64 --no-suffix --manifest gui \
 		--icon icon.ico --admin \
 		--file-version $(VERSION) --product-version $(VERSION) \
 		--product-name "Breeze RMM Agent" \
@@ -97,7 +130,7 @@ build-winres:
 		--copyright "Copyright (c) Breeze RMM" \
 		--original-filename "breeze-agent.exe" \
 		--out ../cmd/breeze-agent/rsrc_windows_amd64.syso
-	cd resources && go-winres simply --arch amd64 --no-suffix \
+	cd resources && go-winres simply --arch amd64 --no-suffix --manifest gui \
 		--icon icon.ico \
 		--file-version $(VERSION) --product-version $(VERSION) \
 		--product-name "Breeze RMM User Helper" \

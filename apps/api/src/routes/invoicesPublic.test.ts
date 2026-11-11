@@ -1,9 +1,16 @@
+const sentryCapture=vi.hoisted(()=>vi.fn());
+vi.mock('../services/sentry',()=>({captureException:sentryCapture}));
+const bankRoutes=vi.hoisted(()=>({setup:vi.fn(),collect:vi.fn(),offer:vi.fn(async()=>null)}));
+vi.mock('../services/autopay/bankPayment',async original=>({
+ ...await original<typeof import('../services/autopay/bankPayment')>(),
+ startInvoiceBankSetup:bankRoutes.setup,collectAfterBankSetup:bankRoutes.collect,getBankAutopayOffer:bankRoutes.offer,
+}));
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Hono } from 'hono';
 
 // DB mock for the branding/lines/mapping reads (select chains resolve queued
 // row sets; orderBy joins the chain for the lines query).
-const { dbResults } = vi.hoisted(() => ({ dbResults: [] as unknown[][] }));
+const { dbResults, ctx } = vi.hoisted(() => ({ dbResults: [] as unknown[][], ctx: { depth: 0 } }));
 vi.mock('../db', () => {
   const makeChain = () => {
     const chain: Record<string, unknown> = {};
@@ -16,7 +23,11 @@ vi.mock('../db', () => {
     db: makeChain(),
     getCurrentDbAccessContext: () => undefined,
     runOutsideDbContext: (fn: () => unknown) => fn(),
-    withSystemDbAccessContext: (fn: () => unknown) => fn(),
+    // Tracks nesting so a test can prove the settle runs with NO context held (#7065).
+    withSystemDbAccessContext: async (fn: () => Promise<unknown>) => {
+      ctx.depth++;
+      try { return await fn(); } finally { ctx.depth--; }
+    },
   };
 });
 
@@ -25,6 +36,17 @@ vi.mock('../services/invoiceLinkToken', () => ({
   resolveInvoiceByLinkToken: resolveMock,
   getOrMintInvoiceLink: mintMock,
   buildPublicInvoiceUrl: (t: string) => `https://portal.example.test/portal/invoice/${t}`,
+}));
+
+// #9585: the view reads availability on its own system-context connection; the
+// second-connection variant must never run inside that open transaction.
+const { onlinePayMock, nestedOnlinePayMock, onlinePayDepths } = vi.hoisted(() => {
+  const depths: number[] = [];
+  return { onlinePayMock: vi.fn(), nestedOnlinePayMock: vi.fn(), onlinePayDepths: depths };
+});
+vi.mock('../services/partnerStripe', () => ({
+  isPartnerOnlinePaymentAvailable: nestedOnlinePayMock,
+  isPartnerOnlinePaymentAvailableOnCallerConnection: onlinePayMock,
 }));
 
 const { markViewedMock } = vi.hoisted(() => ({ markViewedMock: vi.fn() }));
@@ -36,14 +58,31 @@ vi.mock('../services/invoiceService', async (importActual) => {
   };
 });
 
+const { inFlightMock, releaseMock, customerAutopayMock, offerMock } = vi.hoisted(() => ({ inFlightMock: vi.fn(), releaseMock: vi.fn(),
+  customerAutopayMock: vi.fn(async () => ({ enrolled: false, status: null })), offerMock: vi.fn(async () => null) }));
+vi.mock('../services/autopay/customerInvoiceStatus', () => ({ getCustomerInvoiceAutopay: customerAutopayMock }));
+vi.mock('../services/autopay/confirmPayment', () => ({ releaseInvoiceConfirmation: releaseMock }));
+vi.mock('../services/autopay/reservation', () => ({ readInFlightCollection: inFlightMock }));
+
 const { payLinkMock } = vi.hoisted(() => ({ payLinkMock: vi.fn() }));
 vi.mock('../services/invoiceCheckout', () => ({ createInvoicePayLink: payLinkMock }));
 
-const { settleMock } = vi.hoisted(() => ({ settleMock: vi.fn() }));
-vi.mock('../services/stripeSettle', () => ({ settleCheckoutSession: settleMock }));
+const { settleMock, HeldCtxError } = vi.hoisted(() => ({
+  settleMock: vi.fn(),
+  HeldCtxError: class HeldDbContextForStripeError extends Error {},
+}));
+vi.mock('../services/stripeSettle', () => ({ settleCheckoutSession: settleMock, HeldDbContextForStripeError: HeldCtxError }));
 
 const { getPdfMock, renderPdfMock } = vi.hoisted(() => ({ getPdfMock: vi.fn(), renderPdfMock: vi.fn() }));
-vi.mock('../services/invoicePdf', () => ({ getInvoicePdf: getPdfMock, renderInvoicePdf: renderPdfMock }));
+vi.mock('../services/invoicePdf', () => ({
+  getInvoicePdf: getPdfMock, renderInvoicePdf: renderPdfMock,
+  // The db is mocked, so the ticket-label expression is never compiled here;
+  // the snapshot semantics are covered by invoiceTicketLabelSnapshot.integration
+  // and invoiceTicketHeaderSnapshot.integration.
+  invoiceLineTicketNumberSql: vi.fn(() => 'ticket_label_sql'),
+  invoiceLineTicketSubjectSql: vi.fn(() => 'ticket_subject_sql'),
+  invoiceLineTicketCategorySql: vi.fn(() => 'ticket_category_sql'),
+}));
 
 vi.mock('../services/portalUrl', () => ({ portalBase: () => 'https://portal.example.test/portal' }));
 vi.mock('../services/redis', () => ({ getRedis: () => null })); // limiter fails open
@@ -98,6 +137,10 @@ beforeEach(() => {
   vi.clearAllMocks();
   dbResults.length = 0;
   resolveMock.mockResolvedValue(null);
+  onlinePayDepths.length = 0;
+  onlinePayMock.mockImplementation(async () => { onlinePayDepths.push(ctx.depth); return true; });
+  nestedOnlinePayMock.mockResolvedValue(true);
+  inFlightMock.mockResolvedValue({ inProgress: false, amount: '0.00' });
   settleMock.mockResolvedValue({ settled: true, invoiceId: INV_ID });
   mintMock.mockResolvedValue({ token: TOKEN, expiresAt: new Date(), origin: 'reproduced' });
 });
@@ -109,9 +152,48 @@ describe('GET /invoices/public/:token', () => {
     expect(await res.json()).toEqual({ error: 'This link is invalid or has expired' });
   });
 
+  it('is NOT payable when the partner has no online payment set up (#7509)', async () => {
+    onlinePayMock.mockResolvedValue(false);
+    resolveMock.mockResolvedValue(invoice());
+    dbResults.push([{ id: 'l1', name: 'RMM seat', quantity: '5' }], PARTNER_ROW, BRAND_ROW);
+    const { data } = await (await app().request(`/invoices/public/${TOKEN}`)).json();
+    expect(data.payable).toBe(false);
+    expect(data.chargeNow).toMatchObject({ amount: '100.00' }); // amounts still shown
+  });
+
+  // #3803 item 8: the mint refuses a balance the currency cannot express, so the
+  // view must not offer a Pay CTA for it (the page shows "online payment
+  // unavailable" instead). The exact amount owed is still displayed.
+  it('is NOT payable for a legacy JPY balance the currency cannot express', async () => {
+    resolveMock.mockResolvedValue(invoice({ currencyCode: 'JPY', total: '1000.50', balance: '1000.50' }));
+    dbResults.push([{ id: 'l1', name: 'RMM seat', quantity: '5' }], PARTNER_ROW, BRAND_ROW);
+    const { data } = await (await app().request(`/invoices/public/${TOKEN}`)).json();
+    expect(data.payable).toBe(false);
+    expect(data.chargeNow).toMatchObject({ amount: '1000.50', isDeposit: false });
+  });
+
+  it('shows the amount the Checkout will charge for a zero-decimal invoice (currency-aware, not USD rounding)', async () => {
+    resolveMock.mockResolvedValue(invoice({ currencyCode: 'JPY', total: '2000.00', balance: '2000.00', depositDue: '1000.50' }));
+    dbResults.push([{ id: 'l1', name: 'RMM seat', quantity: '5' }], PARTNER_ROW, BRAND_ROW);
+    const { data } = await (await app().request(`/invoices/public/${TOKEN}`)).json();
+    expect(data.payable).toBe(true);
+    expect(data.chargeNow).toMatchObject({ amount: '1001.00', isDeposit: true });
+  });
+
+  it('reads online-payment availability on the view\'s own system-context connection, never a nested one (#9585)', async () => {
+    resolveMock.mockResolvedValue(invoice());
+    dbResults.push([{ id: 'l1', name: 'RMM seat', quantity: '5' }], PARTNER_ROW, BRAND_ROW);
+    const { data } = await (await app().request(`/invoices/public/${TOKEN}`)).json();
+    expect(data.payable).toBe(true);
+    expect(onlinePayMock).toHaveBeenCalledWith('p1');
+    // Exactly one system context is open around the read: the handler's own.
+    expect(onlinePayDepths).toEqual([1]);
+    expect(nestedOnlinePayMock).not.toHaveBeenCalled();
+  });
+
   it('returns the customer view with chargeNow + payable and stamps viewed', async () => {
     resolveMock.mockResolvedValue(invoice());
-    dbResults.push(PARTNER_ROW, BRAND_ROW, [{ name: 'RMM seat', quantity: '5' }]);
+    dbResults.push([{ id: 'l1', name: 'RMM seat', quantity: '5' }], PARTNER_ROW, BRAND_ROW);
     const res = await app().request(`/invoices/public/${TOKEN}`);
     expect(res.status).toBe(200);
     const { data } = await res.json();
@@ -122,21 +204,115 @@ describe('GET /invoices/public/:token', () => {
     expect(markViewedMock).toHaveBeenCalledWith(INV_ID, ORG_ID);
   });
 
+  it('reports an in-flight autopay collection from the server-side reservation (#7824)', async () => {
+    resolveMock.mockResolvedValue(invoice());
+    inFlightMock.mockResolvedValue({ inProgress: true, amount: '100.00' });
+    dbResults.push([{ id: 'l1', name: 'RMM seat', quantity: '5' }], PARTNER_ROW, BRAND_ROW);
+    const { data } = await (await app().request(`/invoices/public/${TOKEN}`)).json();
+    expect(data.collectionInProgress).toEqual({ amount: '100.00', actionRequired: false });
+    expect(inFlightMock).toHaveBeenCalledWith(expect.anything(), INV_ID);
+  });
+
+  it('tells the customer when the in-flight autopay payment is waiting on their bank', async () => {
+    resolveMock.mockResolvedValue(invoice());
+    inFlightMock.mockResolvedValue({ inProgress: true, amount: '100.00', actionRequired: true });
+    dbResults.push([{ id: 'l1', name: 'RMM seat', quantity: '5' }], PARTNER_ROW, BRAND_ROW);
+    const { data } = await (await app().request(`/invoices/public/${TOKEN}`)).json();
+    expect(data.collectionInProgress).toEqual({ amount: '100.00', actionRequired: true });
+  });
+
+  it('reports collectionInProgress=null when nothing is in flight (#7824)', async () => {
+    resolveMock.mockResolvedValue(invoice());
+    dbResults.push([], PARTNER_ROW, BRAND_ROW);
+    const { data } = await (await app().request(`/invoices/public/${TOKEN}`)).json();
+    expect(data.collectionInProgress).toBeNull();
+  });
+
+  it('a void invoice carries no collection state (#7824)', async () => {
+    resolveMock.mockResolvedValue(invoice({ status: 'void' }));
+    dbResults.push(PARTNER_ROW, BRAND_ROW);
+    const { data } = await (await app().request(`/invoices/public/${TOKEN}`)).json();
+    expect(data.collectionInProgress ?? null).toBeNull();
+    expect(inFlightMock).not.toHaveBeenCalled();
+  });
+
+  // #6227: an issued invoice renders the presentation frozen at issue, not the
+  // partner's live default (settings audit rule 6).
+  it("renders the invoice's frozen theme/page size, not the partner's current ones", async () => {
+    resolveMock.mockResolvedValue(invoice({ documentTheme: 'condensed', documentPageSize: 'letter' }));
+    dbResults.push(
+      [{ id: 'l1', name: 'RMM seat', quantity: '5' }],
+      [{ ...PARTNER_ROW[0], documentTheme: 'classic', documentPageSize: 'a4' }],
+      BRAND_ROW,
+    );
+    const res = await app().request(`/invoices/public/${TOKEN}`);
+    expect(res.status).toBe(200);
+    const { data } = await res.json();
+    expect(data.branding).toMatchObject({ theme: 'condensed', pageSize: 'letter' });
+  });
+
+  it('a void invoice also keeps its frozen presentation', async () => {
+    resolveMock.mockResolvedValue(invoice({ status: 'void', documentTheme: 'condensed', documentPageSize: 'letter' }));
+    dbResults.push([{ ...PARTNER_ROW[0], documentTheme: 'classic', documentPageSize: 'a4' }], BRAND_ROW);
+    const res = await app().request(`/invoices/public/${TOKEN}`);
+    expect(res.status).toBe(200);
+    const { data } = await res.json();
+    expect(data.branding).toMatchObject({ theme: 'condensed', pageSize: 'letter' });
+  });
+
+  it('a void invoice falls back to the partner Branding logo/colour (#9676)', async () => {
+    resolveMock.mockResolvedValue(invoice({ status: 'void' }));
+    dbResults.push(
+      [{ ...PARTNER_ROW[0], settings: { branding: { logoUrl: 'https://cdn.example.test/p.png', primaryColor: '#112233' } } }],
+      [{ logoUrl: null, primaryColor: null }],
+    );
+    const { data } = await (await app().request(`/invoices/public/${TOKEN}`)).json();
+    expect(data.branding).toMatchObject({ logoUrl: 'https://cdn.example.test/p.png', primaryColor: '#112233' });
+  });
+
   // #5856: the route selects ticketId/ticketSubject for grouping, but the wire
   // DTO is the customer projection — ticket number + category only.
   it('carries ticket number and category but never ticketId or subject', async () => {
     resolveMock.mockResolvedValue(invoice());
-    dbResults.push(PARTNER_ROW, BRAND_ROW, [{
-      ticketId: 'tk-internal-uuid', ticketNumber: 'T-9', ticketSubject: 'Internal subject', ticketCategory: 'Hardware',
+    dbResults.push([{
+      id: 'l1', ticketId: 'tk-internal-uuid', ticketNumber: 'T-9', ticketSubject: 'Internal subject', ticketCategory: 'Hardware',
       name: 'Repair', description: 'Replaced rollers', quantity: '1.00', unitPrice: '90.00',
       taxable: true, lineTotal: '90.00', workedMinutes: null,
-    }]);
+    }], PARTNER_ROW, BRAND_ROW);
     const res = await app().request(`/invoices/public/${TOKEN}`);
     expect(res.status).toBe(200);
     const { data } = await res.json();
     expect(data.lines[0]).toMatchObject({ ticketNumber: 'T-9', ticketCategory: 'Hardware', name: 'Repair' });
     expect(data.lines[0]).not.toHaveProperty('ticketId');
     expect(data.lines[0]).not.toHaveProperty('ticketSubject');
+  });
+
+  // #8604: the public link applies the invoice's FROZEN line-detail toggles
+  // server-side — a withheld note never reaches the customer payload.
+  it('applies the frozen line detail: date + per-day carried, note and worked time withheld', async () => {
+    resolveMock.mockResolvedValue(invoice({ lineGrouping: 'day', lineShowDate: true, lineShowNote: false, lineShowWorkedTime: false }));
+    dbResults.push([{
+      id: 'l1', ticketId: null, ticketNumber: null, ticketCategory: null, name: null, description: 'Diagnosed paper jam',
+      quantity: '1.50', unitPrice: '100.00', taxable: false, lineTotal: '150.00', workedMinutes: 110,
+      sourceType: 'time_entry', workDate: '2026-09-16',
+    }], PARTNER_ROW, BRAND_ROW);
+    const { data } = await (await app().request(`/invoices/public/${TOKEN}`)).json();
+    expect(data.invoice.lineGrouping).toBe('day');
+    expect(data.lines[0]).toMatchObject({ name: 'Labor', description: '', workedMinutes: null, workDate: '2026-09-16' });
+    expect(data.lines[0]).not.toHaveProperty('sourceType');
+    expect(JSON.stringify(data)).not.toContain('Diagnosed paper jam');
+  });
+
+  it('an invoice issued before #8604 (NULL columns) keeps the default customer view', async () => {
+    resolveMock.mockResolvedValue(invoice());
+    dbResults.push([{
+      id: 'l1', ticketId: null, ticketNumber: null, ticketCategory: null, name: null, description: 'Diagnosed paper jam',
+      quantity: '1.50', unitPrice: '100.00', taxable: false, lineTotal: '150.00', workedMinutes: 110,
+      sourceType: 'time_entry', workDate: '2026-09-16',
+    }], PARTNER_ROW, BRAND_ROW);
+    const { data } = await (await app().request(`/invoices/public/${TOKEN}`)).json();
+    expect(data.invoice.lineGrouping).toBe('entry');
+    expect(data.lines[0]).toMatchObject({ name: null, description: 'Diagnosed paper jam', workedMinutes: 110, workDate: null });
   });
 
   it('renders the calm no-amounts state for a void invoice', async () => {
@@ -153,7 +329,7 @@ describe('GET /invoices/public/:token', () => {
 
   it('a paid invoice resolves but is not payable', async () => {
     resolveMock.mockResolvedValue(invoice({ status: 'paid', balance: '0.00', paidAt: new Date() }));
-    dbResults.push(PARTNER_ROW, BRAND_ROW, []);
+    dbResults.push([], PARTNER_ROW, BRAND_ROW);
     const { data } = await (await app().request(`/invoices/public/${TOKEN}`)).json();
     expect(data.payable).toBe(false);
   });
@@ -167,6 +343,21 @@ describe('GET /invoices/public/:token', () => {
 });
 
 describe('POST /invoices/public/:token/pay', () => {
+  it.each([
+    ['stale disclosure', 409, 'The terms changed. Review them and try again.', 'INVALID_STATE'],
+    ['unavailable enrollment', 409, 'Request automatic payments first', 'INVALID_STATE'],
+    ['disabled rollout', 404, 'Automatic payments unavailable', 'autopay_not_enabled'],
+  ] as const)('pay preserves the customer response for %s', async (_case, status, message, code) => {
+    resolveMock.mockResolvedValue(invoice());
+    payLinkMock.mockRejectedValueOnce(new InvoiceServiceError(message, status, 'INVALID_STATE'));
+    const res = await app().request(`/invoices/public/${TOKEN}/pay`, { method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ saveForAutopay: true, consentAccepted: true, disclosureHash: 'a'.repeat(64) }) });
+    expect(res.status).toBe(status);
+    expect(await res.json()).toEqual({ error: code === 'autopay_not_enabled' ? 'Automatic payments are not enabled' : message, code });
+    expect(payLinkMock).toHaveBeenCalledTimes(1);
+  });
+
   const post = (token = TOKEN) => app().request(`/invoices/public/${token}/pay`, {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
   });
@@ -243,6 +434,40 @@ describe('POST /invoices/public/:token/pay', () => {
   });
 });
 
+describe('POST /invoices/public/:token/autopay-confirmation', () => {
+  const post = (init: RequestInit = { headers: { 'content-type': 'application/json' }, body: '{}' }) =>
+    app().request(`/invoices/public/${TOKEN}/autopay-confirmation`, { method: 'POST', ...init });
+
+  it('cancels the off-session payment for the token\'s own invoice with no DB context held', async () => {
+    resolveMock.mockResolvedValue(invoice());
+    releaseMock.mockImplementation(async () => { expect(ctx.depth).toBe(0); return { outcome: 'released' }; });
+    const res = await post();
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ data: { outcome: 'released' } });
+    expect(releaseMock).toHaveBeenCalledWith({ invoiceId: INV_ID, orgId: ORG_ID });
+    expect(res.headers.get('cache-control')).toBe('no-store');
+  });
+
+  it('401s for an unknown token and never reaches Stripe', async () => {
+    expect((await post()).status).toBe(401);
+    expect(releaseMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects a non-JSON request shape', async () => {
+    resolveMock.mockResolvedValue(invoice());
+    expect((await post({})).status).toBe(400);
+    expect(releaseMock).not.toHaveBeenCalled();
+  });
+
+  it('returns the customer-safe refusal when the cancellation has not landed', async () => {
+    resolveMock.mockResolvedValue(invoice());
+    releaseMock.mockRejectedValue(new InvoiceServiceError('Payment is still processing', 409, 'INVALID_STATE'));
+    const res = await post();
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ error: 'Payment is still processing', code: 'INVALID_STATE' });
+  });
+});
+
 describe('POST /invoices/public/settle-return', () => {
   const post = (sessionId = 'cs_test_123') => app().request('/invoices/public/settle-return', {
     method: 'POST', headers: { 'content-type': 'application/json' },
@@ -266,6 +491,16 @@ describe('POST /invoices/public/settle-return', () => {
     expect(settleMock).toHaveBeenCalledWith('p1', 'cs_test_123');
   });
 
+  it('settles with NO DB context held — the Stripe call must not span a transaction (#7065)', async () => {
+    dbResults.push([{ invoiceId: INV_ID, status: 'pending', updatedAt: new Date() }]);
+    dbResults.push([invoice()]);
+    let depthAtSettle = -1;
+    settleMock.mockImplementation(async () => { depthAtSettle = ctx.depth; return { settled: true, invoiceId: INV_ID }; });
+    const res = await post();
+    expect(res.status).toBe(200);
+    expect(depthAtSettle).toBe(0);
+  });
+
   it('reports unsettled (not an error) when instant settle hiccups', async () => {
     dbResults.push([{ invoiceId: INV_ID, status: 'pending', updatedAt: new Date() }]);
     dbResults.push([invoice()]);
@@ -273,6 +508,14 @@ describe('POST /invoices/public/settle-return', () => {
     const res = await post();
     expect(res.status).toBe(200);
     expect((await res.json()).data.settled).toBe(false);
+  });
+
+  it('does NOT swallow the held-DB-context assertion as "still confirming" (#7065)', async () => {
+    dbResults.push([{ invoiceId: INV_ID, status: 'pending', updatedAt: new Date() }]);
+    dbResults.push([invoice()]);
+    settleMock.mockRejectedValue(new HeldCtxError('held'));
+    const res = await post();
+    expect(res.status).toBe(500);
   });
 
   it('does not hand out the url for a stale, already-settled session', async () => {
@@ -302,13 +545,13 @@ describe('POST /invoices/public/settle-return', () => {
 // archive: without this gate an archived tenant keeps taking card payments for
 // the whole retention window and then has the payment rows erased under it.
 describe('invoicesPublic org-lifecycle gate', () => {
-  const blocked = { orgId: ORG_ID, status: 'archived', blocked: true };
+  const blocked = { orgId: ORG_ID, status: 'archived', partnerStatus: 'active', blocked: true };
 
   // vi.clearAllMocks() (global beforeEach) clears CALLS but not
   // implementations, so a mockResolvedValue set by one case would leak into
   // the next and quietly make the live-org case vacuous.
   beforeEach(() => {
-    vi.mocked(resolveOrgLinkGate).mockResolvedValue({ orgId: null, status: null, blocked: false });
+    vi.mocked(resolveOrgLinkGate).mockResolvedValue({ orgId: null, status: null, partnerStatus: null, blocked: false });
   });
 
   it('410s the customer view for an archived org', async () => {
@@ -354,9 +597,107 @@ describe('invoicesPublic org-lifecycle gate', () => {
 
   it('serves normally for a live org (the gate is not a blanket refusal)', async () => {
     resolveMock.mockResolvedValue(invoice());
-    dbResults.push(PARTNER_ROW, BRAND_ROW, []);
+    dbResults.push([], PARTNER_ROW, BRAND_ROW);
     const res = await app().request(`/invoices/public/${TOKEN}`);
     expect(res.status).toBe(200);
     expect(resolveOrgLinkGate).toHaveBeenCalledWith(ORG_ID);
   });
+});
+
+it('public pay returns the reservation conflict without exposing a payment URL', async () => {
+  resolveMock.mockResolvedValue(invoice());
+  payLinkMock.mockRejectedValueOnce(new InvoiceServiceError('A payment is already processing', 409, 'COLLECTION_IN_PROGRESS'));
+  const response = await app().request(`/invoices/public/${TOKEN}/pay`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+  expect(response.status).toBe(409);
+  expect(await response.json()).toEqual({ error: 'A payment is already processing', code: 'COLLECTION_IN_PROGRESS' });
+});
+
+vi.mock('../services/autopay/payAndSave', async importOriginal => {
+  const actual = await importOriginal<typeof import('../services/autopay/payAndSave')>();
+  return { ...actual, getInvoiceAutopayOffer: offerMock };
+});
+describe('the invoice page learns how this invoice will be paid (D-4)', () => {
+  const offer = { eligible: true, consentText: 'I authorize', consentVersion: 'v', disclosureHash: 'a'.repeat(64) };
+  const scheduled = { state: 'scheduled', chargeDate: '2026-11-04', amount: '50.00', fee: '1.50', currency: 'USD',
+    methodLabel: 'Visa credit card ending in 4242', methodType: 'card', reason: null, paidAt: null, canPayNow: true };
+  it('carries the automatic-payment status and stops offering setup to an enrolled client', async () => {
+    resolveMock.mockResolvedValue(invoice());
+    offerMock.mockResolvedValueOnce(offer as never);
+    customerAutopayMock.mockResolvedValueOnce({ enrolled: true, status: scheduled } as never);
+    dbResults.push([], PARTNER_ROW, BRAND_ROW);
+    const { data } = await (await app().request(`/invoices/public/${TOKEN}`)).json();
+    expect(data.autopayStatus).toEqual(scheduled);
+    expect(data.autopayEnrolled).toBe(true);
+    expect(data.autopay).toBeNull();
+    expect(customerAutopayMock).toHaveBeenCalledWith(expect.anything(), { invoiceId: INV_ID, orgId: ORG_ID });
+  });
+  it('keeps the save-card offer for a client who is not enrolled', async () => {
+    resolveMock.mockResolvedValue(invoice());
+    offerMock.mockResolvedValueOnce(offer as never);
+    dbResults.push([], PARTNER_ROW, BRAND_ROW);
+    const { data } = await (await app().request(`/invoices/public/${TOKEN}`)).json();
+    expect(data.autopay).toEqual(offer);
+    expect(data.autopayEnrolled).toBe(false);
+    expect(data.autopayStatus).toBeNull();
+  });
+  // R9: the page still renders, but without knowing whether the client is enrolled it must not
+  // offer setup or a bank payment that would replace their method: fail closed, and report it.
+  it('still renders when the status read fails, offering nothing that saves a method', async () => {
+    resolveMock.mockResolvedValue(invoice());
+    offerMock.mockResolvedValueOnce(offer as never);
+    bankRoutes.offer.mockResolvedValueOnce({ available: true } as never);
+    customerAutopayMock.mockRejectedValueOnce(new Error('db down'));
+    dbResults.push([], PARTNER_ROW, BRAND_ROW);
+    const res = await app().request(`/invoices/public/${TOKEN}`);
+    expect(res.status).toBe(200);
+    const { data } = await res.json();
+    expect(data.autopayStatus).toBeNull();
+    expect(data.autopay).toBeNull();
+    expect(data.bankAutopay).toBeNull();
+    expect(sentryCapture).toHaveBeenCalledWith(expect.objectContaining({ message: 'db down' }), undefined, expect.objectContaining({ autopay_phase: 'invoice_status' }));
+  });
+});
+it('public invoice pay forwards only explicit card authorization', async () => {
+  resolveMock.mockResolvedValue(invoice()); payLinkMock.mockResolvedValue({ url: 'https://checkout.stripe.com/c/cs_saved' });
+  const res = await app().request(`/invoices/public/${TOKEN}/pay`, { method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ saveForAutopay: true, consentAccepted: true, disclosureHash: 'a'.repeat(64) }) });
+  expect(res.status).toBe(200);
+  expect(payLinkMock).toHaveBeenCalledWith(INV_ID, expect.anything(), expect.objectContaining({
+    saveForAutopay: true, consentAccepted: true, disclosureHash: 'a'.repeat(64),
+  }), { billingGate: false });
+});
+it('public invoice pay refuses an unaccepted save request before Checkout', async () => {
+  resolveMock.mockResolvedValue(invoice());
+  const res = await app().request(`/invoices/public/${TOKEN}/pay`, { method: 'POST',
+    headers: { 'content-type': 'application/json' }, body: JSON.stringify({ saveForAutopay: true }) });
+  expect(res.status).toBe(400); expect(payLinkMock).not.toHaveBeenCalled();
+});
+
+it('bank pay validates strict consent and preserves the setup envelope',async()=>{
+ resolveMock.mockResolvedValue(invoice());
+ bankRoutes.setup.mockResolvedValue({url:'https://checkout.stripe.com/setup'});
+ const body={methodType:'us_bank_account',phase:'setup',consentAccepted:true,principal:'100.00',fee:'0.00',currency:'USD',disclosureHash:'a'.repeat(64)};
+ const response=await app().request(`/invoices/public/${TOKEN}/pay`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
+ expect(response.status).toBe(200);expect(await response.json()).toEqual({data:{url:'https://checkout.stripe.com/setup'}});
+ expect(bankRoutes.setup).toHaveBeenCalledWith(expect.objectContaining({invoiceId:INV_ID,orgId:ORG_ID,returnTo:'public'}));
+ const invalid=await app().request(`/invoices/public/${TOKEN}/pay`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({...body,consentAccepted:false})});
+ expect(invalid.status).toBe(400);
+});
+it('bank collect requires invoice admission and never treats the session ID as authority',async()=>{
+ bankRoutes.collect.mockClear();
+ resolveMock.mockResolvedValue(null);
+ const response=await app().request(`/invoices/public/${TOKEN}/pay`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({
+  methodType:'us_bank_account',phase:'collect',consentAccepted:true,principal:'100.00',fee:'0.00',currency:'USD',disclosureHash:'a'.repeat(64),setupSessionId:'cs_test',
+ })});
+ expect(response.status).toBe(401);expect(bankRoutes.collect).not.toHaveBeenCalled();
+});
+
+it.each(['refused','deferred','failed','canceled'])('bank %s is a conflict rather than a successful payment',async outcome=>{
+ resolveMock.mockResolvedValue(invoice());
+ bankRoutes.collect.mockResolvedValue({attemptId:null,outcome,reason:'unavailable'});
+ const response=await app().request(`/invoices/public/${TOKEN}/pay`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({
+ methodType:'us_bank_account',phase:'collect',consentAccepted:true,principal:'100.00',fee:'0.00',currency:'USD',disclosureHash:'a'.repeat(64),setupSessionId:'cs_test'
+ })});
+ expect(response.status).toBe(409);
 });

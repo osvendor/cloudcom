@@ -3,7 +3,13 @@ import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 
 const fetchWithAuth = vi.fn();
-vi.mock('../../stores/auth', () => ({ fetchWithAuth: (...a: unknown[]) => fetchWithAuth(...a) }));
+vi.mock('../../stores/auth', () => ({
+  fetchWithAuth: (...a: unknown[]) => fetchWithAuth(...a),
+  useAuthStore: (selector: (s: { user: null }) => unknown) => selector({ user: null }),
+}));
+// ReportsList reads the focused org and the JWT scope for the all-organizations hint.
+vi.mock('../../stores/orgStore', () => ({ useOrgStore: () => ({ currentOrgId: null }) }));
+vi.mock('@/lib/authScope', () => ({ useJwtClaims: () => ({ status: 'unresolved' }) }));
 
 const exportReport = vi.fn();
 const downloadBlob = vi.fn();
@@ -159,7 +165,7 @@ describe('ReportsList — system-managed AI narrative rows', () => {
     expect(fetchWithAuth).not.toHaveBeenCalledWith('/reports/rep-ai/generate', expect.anything());
   });
 
-  it('surfaces a message when no completed narrative run exists yet', async () => {
+  it('surfaces a report-neutral message when no completed run exists yet', async () => {
     mountWith([narrativeReport], (url) =>
       url === LATEST_RUN_URL
         ? Promise.resolve({ ok: true, json: () => Promise.resolve({ data: [] }) })
@@ -170,7 +176,7 @@ describe('ReportsList — system-managed AI narrative rows', () => {
     await userEvent.click(await screen.findByRole('button', { name: 'Open latest' }));
 
     expect(
-      await screen.findByText('No completed narrative to open yet'),
+      await screen.findByText('No completed run to open yet'),
     ).toBeInTheDocument();
     expect(exportReport).not.toHaveBeenCalled();
   });

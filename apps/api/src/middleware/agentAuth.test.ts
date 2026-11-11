@@ -1,5 +1,15 @@
 import { describe, expect, it, vi, afterEach, beforeEach } from 'vitest';
 
+vi.mock('../services/networkIsolation/lifecycle', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../services/networkIsolation/lifecycle')>()),
+  assertNoUnresolvedIsolation: vi.fn(async () => undefined),
+  findUnresolvedIsolations: vi.fn(async () => []),
+}));
+vi.mock('../services/sentry', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../services/sentry')>()),
+  captureMessage: vi.fn(),
+}));
+
 vi.mock('../db', () => ({
   db: {
     select: vi.fn(),
@@ -7,6 +17,7 @@ vi.mock('../db', () => ({
   },
   withDbAccessContext: vi.fn(async (_context: unknown, fn: () => Promise<unknown>) => fn()),
   withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+  withDbTransaction: vi.fn(async (fn: () => Promise<unknown>) => fn()),
 }));
 
 vi.mock('../db/schema', () => ({
@@ -32,6 +43,8 @@ vi.mock('../db/schema', () => ({
   organizations: {
     id: 'organizations.id',
     partnerId: 'organizations.partnerId',
+    // Pre-assignment admission reads the org type from the same join.
+    type: 'organizations.type',
   },
   // Security remediation Wave 5, Task 6 — services/agentCertificateBinding.ts
   // (imported transitively via agentAuthMiddleware) reads this table.
@@ -46,6 +59,14 @@ vi.mock('../db/schema', () => ({
 vi.mock('../services', () => ({
   getRedis: vi.fn(),
   rateLimiter: vi.fn(),
+}));
+
+// Storage-session calls are metered by their own limiter (its semantics are
+// proven against a sorted-set fake in agentStorageSessionRateLimit.test.ts and
+// end to end in agentAuth.storageSessionRateLimit.test.ts); here only the
+// middleware's routing of calls to it is under test.
+vi.mock('../services/agentStorageSessionRateLimit', () => ({
+  checkAgentStorageSessionRateLimit: vi.fn(async () => ({ allowed: true })),
 }));
 
 vi.mock('../services/auditService', () => ({
@@ -110,13 +131,17 @@ vi.mock('../services/agentOrgRateLimit', async (importOriginal) => {
 import type { Context } from 'hono';
 import { createHash } from 'crypto';
 
-import { db, withDbAccessContext, withSystemDbAccessContext } from '../db';
+import { db, withDbAccessContext, withDbTransaction, withSystemDbAccessContext } from '../db';
 import { getRedis, rateLimiter } from '../services';
 import { createAuditLogAsync } from '../services/auditService';
 import { getTrustedClientIp, trustsForwardedHeadersFrom } from '../services/clientIp';
 import { getAgentTenantState } from '../services/tenantStatus';
 import { isDeviceUninstallDraining } from '../services/deviceUninstallDrain';
 import { resolveOrgRateLimit } from '../services/agentOrgRateLimit';
+import { checkAgentStorageSessionRateLimit } from '../services/agentStorageSessionRateLimit';
+import { assertNoUnresolvedIsolation, findUnresolvedIsolations, NetworkIsolationUnresolvedError } from '../services/networkIsolation/lifecycle';
+import { captureMessage } from '../services/sentry';
+import type { AgentTokenSuspendReason } from '../services/agentTokenSuspension';
 import {
   agentAuthMiddleware,
   DRAIN_CLAIM_TYPE_ALLOWLIST,
@@ -470,6 +495,251 @@ describe('agentAuthMiddleware - tenant-status gate', () => {
     expect(vi.mocked(withDbAccessContext)).not.toHaveBeenCalled();
   });
 
+  // The service/process monitoring ingest runs a per-result Redis
+  // failure-counter loop. The handler opens its own short org-scoped context
+  // for the device read + insert (routes/agents/heartbeat.ts) and runs the
+  // Redis work after releasing it, so the middleware must NOT open a
+  // request-long one around it.
+  it('skips the request-long org wrap for the self-managed monitoring-results route', async () => {
+    buildSelectMock([makeDevice()]);
+    vi.mocked(getAgentTenantState).mockResolvedValue('active');
+
+    const c = createContext({ token: VALID_TOKEN, path: '/api/v1/agents/agent-1/monitoring-results' });
+    const next = vi.fn().mockResolvedValue(undefined);
+
+    await agentAuthMiddleware(c, next);
+
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(withDbAccessContext)).not.toHaveBeenCalled();
+    expect((c.get('agent') as unknown as { partnerId: string }).partnerId).toBe('partner-1');
+  });
+
+  it('a crafted monitoring-results TAIL under an extension mount keeps the request DB context', async () => {
+    buildSelectMock([makeDevice()]);
+    vi.mocked(getAgentTenantState).mockResolvedValue('active');
+
+    const c = createContext({
+      token: VALID_TOKEN,
+      path: '/api/v1/ext/acme/agent/agent-1/agents/agent-1/monitoring-results',
+    });
+
+    await agentAuthMiddleware(c, vi.fn().mockResolvedValue(undefined));
+
+    expect(vi.mocked(withDbAccessContext)).toHaveBeenCalledTimes(1);
+  });
+
+  // #6260 — the pam/reconciliation-bindings ingest route's per-device
+  // consumePamReconciliationRateLimit Redis round-trip ran inside the
+  // request-long wrap (same #1105 shape as elevation-requests above). The
+  // handler now opens its own org-scoped context after the limiter decides
+  // (routes/agents/pamReconciliation.ts), so the middleware must NOT open one
+  // for it. This is a TWO-segment action (`pam/reconciliation-bindings`),
+  // unlike the single-segment actions in SELF_MANAGED_DB_CONTEXT_ACTIONS.
+  it('skips the request-long org wrap for the self-managed pam-reconciliation-bindings route', async () => {
+    buildSelectMock([makeDevice()]);
+    vi.mocked(getAgentTenantState).mockResolvedValue('active');
+
+    const c = createContext({
+      token: VALID_TOKEN,
+      path: '/api/v1/agents/agent-1/pam/reconciliation-bindings',
+    });
+    const next = vi.fn().mockResolvedValue(undefined);
+
+    await agentAuthMiddleware(c, next);
+
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(withDbAccessContext)).not.toHaveBeenCalled();
+  });
+
+  // Brokered storage sessions call object storage over the network; the
+  // handlers open one short org-scoped context per database phase
+  // (routes/agents/storageSessions.ts), so no request-long wrap.
+  it('skips the request-long org wrap for storage-session operations, and only at the exact depth', async () => {
+    buildSelectMock([makeDevice()]);
+    vi.mocked(getAgentTenantState).mockResolvedValue('active');
+    for (const path of [
+      '/api/v1/agents/agent-1/storage-sessions/0b6f0c7e-3d2a-4f5b-9e1c-8a7d6c5b4a39/multipart:complete',
+      '/api/v1/agents/agent-1/storage-sessions/0b6f0c7e-3d2a-4f5b-9e1c-8a7d6c5b4a39/object',
+    ]) {
+      const c = createContext({ token: VALID_TOKEN, path });
+      const next = vi.fn().mockResolvedValue(undefined);
+      await agentAuthMiddleware(c, next);
+      expect(next).toHaveBeenCalledTimes(1);
+    }
+    expect(vi.mocked(withDbAccessContext)).not.toHaveBeenCalled();
+
+    buildSelectMock([makeDevice()]);
+    const deeper = createContext({ token: VALID_TOKEN, path: '/api/v1/agents/agent-1/storage-sessions/x/y/z' });
+    await agentAuthMiddleware(deeper, vi.fn().mockResolvedValue(undefined));
+    expect(vi.mocked(withDbAccessContext)).toHaveBeenCalledTimes(1);
+  });
+
+  it('meters storage-session operations on their own limiter, never the general agent buckets', async () => {
+    buildSelectMock([makeDevice()]);
+    vi.mocked(getTrustedClientIp).mockReturnValueOnce('203.0.113.5');
+    const sessionId = '0b6f0c7e-3d2a-4f5b-9e1c-8a7d6c5b4a39';
+    const c = createContext({ token: VALID_TOKEN, path: `/api/v1/agents/agent-1/storage-sessions/${sessionId}/objects:resolve` });
+    const next = vi.fn().mockResolvedValue(undefined);
+    await agentAuthMiddleware(c, next);
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(checkAgentStorageSessionRateLimit)).toHaveBeenCalledWith(expect.anything(), { orgId: 'org-1', deviceId: 'device-1', sessionId });
+    expect(vi.mocked(rateLimiter)).not.toHaveBeenCalled();
+  });
+
+  it('answers a refused storage-session call 429 with the limiter\'s Retry-After and does not reach the handler', async () => {
+    buildSelectMock([makeDevice()]);
+    vi.mocked(checkAgentStorageSessionRateLimit).mockResolvedValueOnce({ allowed: false, retryAfterSeconds: 37 });
+    const c = createContext({ token: VALID_TOKEN, path: '/api/v1/agents/agent-1/storage-sessions/0b6f0c7e-3d2a-4f5b-9e1c-8a7d6c5b4a39/renew' });
+    const next = vi.fn();
+    await agentAuthMiddleware(c, next);
+    expect(next).not.toHaveBeenCalled();
+    expect(c._getResponse()).toEqual({ status: 429, body: { error: 'storage_session_rate_limit_exceeded' } });
+    expect(c._getResponseHeaders()['Retry-After']).toBe('37');
+    expect(vi.mocked(rateLimiter)).not.toHaveBeenCalled();
+  });
+
+  // The storage-session path changes only rate accounting: every gate after
+  // the limiters still applies to it.
+  const STORAGE_PATH = '/api/v1/agents/agent-1/storage-sessions/0b6f0c7e-3d2a-4f5b-9e1c-8a7d6c5b4a39/objects:resolve';
+
+  it('still applies the tenant-status gate on a storage-session path', async () => {
+    buildSelectMock([makeDevice()]);
+    vi.mocked(getAgentTenantState).mockResolvedValue(null);
+    const next = vi.fn();
+    await expect(agentAuthMiddleware(createContext({ token: VALID_TOKEN, path: STORAGE_PATH }), next))
+      .rejects.toMatchObject({ status: 401, message: 'Invalid agent credentials' });
+    expect(next).not.toHaveBeenCalled();
+    expect(vi.mocked(checkAgentStorageSessionRateLimit)).toHaveBeenCalledTimes(1);
+  });
+
+  it('still applies the tenant drain gate on a storage-session path', async () => {
+    buildSelectMock([makeDevice()]);
+    vi.mocked(getAgentTenantState).mockResolvedValue('draining');
+    const c = createContext({ token: VALID_TOKEN, path: STORAGE_PATH });
+    const next = vi.fn();
+    const result = await agentAuthMiddleware(c, next);
+    expect(next).not.toHaveBeenCalled();
+    expect(result).toEqual({ status: 403, body: { error: 'tenant_offboarding' } });
+  });
+
+  it('still applies the device uninstall drain gate on a storage-session path', async () => {
+    buildSelectMock([makeDevice({ status: 'decommissioned' })]);
+    vi.mocked(isDeviceUninstallDraining).mockResolvedValueOnce(true);
+    const c = createContext({ token: VALID_TOKEN, path: STORAGE_PATH });
+    const next = vi.fn();
+    const result = await agentAuthMiddleware(c, next);
+    expect(next).not.toHaveBeenCalled();
+    expect(result).toEqual({ status: 403, body: { error: 'device_uninstall_draining' } });
+  });
+
+  it('keeps other agent routes on the general buckets and off the storage-session limiter', async () => {
+    buildSelectMock([makeDevice()]);
+    const c = createContext({ token: VALID_TOKEN, path: '/api/v1/agents/agent-1/heartbeat' });
+    await agentAuthMiddleware(c, vi.fn().mockResolvedValue(undefined));
+    expect(vi.mocked(checkAgentStorageSessionRateLimit)).not.toHaveBeenCalled();
+    expect(vi.mocked(rateLimiter)).toHaveBeenCalled();
+  });
+
+  it('keeps the request-long org wrap for a different action at the storage-session path depth', async () => {
+    buildSelectMock([makeDevice()]);
+    vi.mocked(getAgentTenantState).mockResolvedValue('active');
+    const c = createContext({ token: VALID_TOKEN, path: '/api/v1/agents/agent-1/other-action/x/multipart:complete' });
+    await agentAuthMiddleware(c, vi.fn().mockResolvedValue(undefined));
+    expect(vi.mocked(withDbAccessContext)).toHaveBeenCalledTimes(1);
+  });
+
+  // M2 #5998 D14 — the topology adjacency ingest route parses a 4 MiB body
+  // and resolves topology flags before its own short admission transaction.
+  it('skips the request-long org wrap for the self-managed topology/adjacency route', async () => {
+    buildSelectMock([makeDevice()]);
+    vi.mocked(getAgentTenantState).mockResolvedValue('active');
+    const c = createContext({ token: VALID_TOKEN, path: '/api/v1/agents/agent-1/topology/adjacency' });
+    const next = vi.fn().mockResolvedValue(undefined);
+    await agentAuthMiddleware(c, next);
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(withDbAccessContext)).not.toHaveBeenCalled();
+  });
+
+  // M2 #5998 review: the UniFi topology companion ingest and the collector
+  // advertisement resolve topology flags (a partner-axis read) before their own
+  // short transactions; a request-long org wrap would hold a pooled connection
+  // across both and re-open the #6671 two-connection shape.
+  it.each(['unifi-telemetry', 'unifi-collectors'])('skips the request-long org wrap for the self-managed %s route', async (action) => {
+    buildSelectMock([makeDevice()]);
+    vi.mocked(getAgentTenantState).mockResolvedValue('active');
+    const c = createContext({ token: VALID_TOKEN, path: `/api/v1/agents/agent-1/${action}` });
+    const next = vi.fn().mockResolvedValue(undefined);
+    await agentAuthMiddleware(c, next);
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(withDbAccessContext)).not.toHaveBeenCalled();
+  });
+
+  // #10190 W03 — the prompt logo route may fetch the MSP's https logo on a
+  // cache miss; that must never run inside the request-long org transaction.
+  it('skips the request-long org wrap for the self-managed prompt-identity/logo route', async () => {
+    buildSelectMock([makeDevice()]);
+    vi.mocked(getAgentTenantState).mockResolvedValue('active');
+    const c = createContext({ token: VALID_TOKEN, path: '/api/v1/agents/agent-1/prompt-identity/logo' });
+    const next = vi.fn().mockResolvedValue(undefined);
+    await agentAuthMiddleware(c, next);
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(withDbAccessContext)).not.toHaveBeenCalled();
+  });
+
+  it('keeps the request DB context for another prompt-identity/* path', async () => {
+    buildSelectMock([makeDevice()]);
+    vi.mocked(getAgentTenantState).mockResolvedValue('active');
+    const c = createContext({ token: VALID_TOKEN, path: '/api/v1/agents/agent-1/prompt-identity/other' });
+    const next = vi.fn().mockResolvedValue(undefined);
+    await agentAuthMiddleware(c, next);
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(withDbAccessContext)).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the request DB context for a deeper topology/adjacency/* path', async () => {
+    buildSelectMock([makeDevice()]);
+    vi.mocked(getAgentTenantState).mockResolvedValue('active');
+    const c = createContext({ token: VALID_TOKEN, path: '/api/v1/agents/agent-1/topology/adjacency/extra' });
+    const next = vi.fn().mockResolvedValue(undefined);
+    await agentAuthMiddleware(c, next);
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(withDbAccessContext)).toHaveBeenCalledTimes(1);
+  });
+
+  // Negative control for the anchoring: a same-named segment under an
+  // extension mount must still get the request-long wrap.
+  it('a crafted pam/reconciliation-bindings TAIL under an extension mount keeps the request DB context', async () => {
+    buildSelectMock([makeDevice()]);
+    vi.mocked(getAgentTenantState).mockResolvedValue('active');
+
+    const c = createContext({
+      token: VALID_TOKEN,
+      path: '/api/v1/ext/acme/agent/agent-1/agents/agent-1/pam/reconciliation-bindings',
+    });
+    const next = vi.fn().mockResolvedValue(undefined);
+
+    await agentAuthMiddleware(c, next);
+
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(withDbAccessContext)).toHaveBeenCalledTimes(1);
+  });
+
+  // A single-segment `pam` action (no second segment) must still get the
+  // request-long wrap — only the exact two-segment `pam/reconciliation-bindings`
+  // shape opts out.
+  it('keeps the request-long org wrap for a bare `pam` single-segment path', async () => {
+    buildSelectMock([makeDevice()]);
+    vi.mocked(getAgentTenantState).mockResolvedValue('active');
+
+    const c = createContext({ token: VALID_TOKEN, path: '/api/v1/agents/agent-1/pam' });
+    const next = vi.fn().mockResolvedValue(undefined);
+
+    await agentAuthMiddleware(c, next);
+
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(withDbAccessContext)).toHaveBeenCalledTimes(1);
+  });
+
   // Negative control for the anchoring: a same-named segment under an
   // extension mount must still get the request-long wrap.
   it('a crafted elevation-requests TAIL under an extension mount keeps the request DB context', async () => {
@@ -746,6 +1016,19 @@ describe('agentAuthMiddleware - certificate/device binding (Wave 5 Task 6)', () 
     expect(next).not.toHaveBeenCalled();
   });
 
+  it('mode enforce: still refuses a storage-session path without a matching certificate', async () => {
+    process.env.AGENT_MTLS_BINDING_MODE = 'enforce';
+    queueSelectOnce([makeDevice()]);
+    queueSelectOnce([{ serialNumber: ACTIVE_SERIAL, state: 'active' }]);
+    const c = createContext({
+      token: VALID_TOKEN,
+      path: '/api/v1/agents/agent-1/storage-sessions/0b6f0c7e-3d2a-4f5b-9e1c-8a7d6c5b4a39/multipart:complete',
+    });
+    const next = vi.fn().mockResolvedValue(undefined);
+    await expect(agentAuthMiddleware(c, next)).rejects.toMatchObject({ status: 401, message: 'Invalid agent credentials' });
+    expect(next).not.toHaveBeenCalled();
+  });
+
   it('mode enforce: ignores a verified claim from an untrusted source (spoofed header) and denies', async () => {
     process.env.AGENT_MTLS_BINDING_MODE = 'enforce';
     vi.mocked(trustsForwardedHeadersFrom).mockReturnValue(false); // untrusted source
@@ -890,6 +1173,152 @@ describe('agentAuthMiddleware - offboarding drain mode', () => {
 
     expect(next).toHaveBeenCalledTimes(1);
     expect((c.get('agent') as { tenantDraining?: boolean }).tenantDraining).toBe(false);
+  });
+});
+
+// Pre-assignment — a device whose org is its
+// partner's holding org is admitted to a positive allowlist only. Mirrors the
+// drain describes above; the gate is applied after the drain gate, so the two
+// compose by intersection.
+describe('agentAuthMiddleware - pre-assignment (holding org) admission', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.unstubAllEnvs();
+    vi.mocked(getRedis).mockReturnValue({} as any);
+    vi.mocked(getAgentTenantState).mockResolvedValue('active');
+    vi.mocked(isDeviceUninstallDraining).mockResolvedValue(false);
+    vi.mocked(rateLimiter).mockResolvedValue({
+      allowed: true,
+      remaining: 100,
+      resetAt: new Date(Date.now() + 60_000),
+    });
+  });
+
+  const parked = (overrides: Record<string, unknown> = {}) =>
+    makeDevice({ status: 'online', organizationType: 'unassigned_pool', ...overrides });
+
+  const allowedPaths = [
+    '/api/v1/agents/agent-1/heartbeat',
+    '/api/v1/agents/agent-1/rotate-token',
+    '/api/v1/agents/agent-1/rotate-token/confirm',
+    '/api/v1/agents/agent-1/commands',
+    '/api/v1/agents/agent-1/commands/cmd-1/result',
+    '/api/v1/agents/agent-1/uninstall-intent',
+  ];
+
+  for (const path of allowedPaths) {
+    it(`admits ${path} for a parked device, narrowed to self_uninstall claims`, async () => {
+      buildSelectMock([parked()]);
+
+      const c = createContext({ token: VALID_TOKEN, path });
+      const next = vi.fn().mockResolvedValue(undefined);
+
+      await agentAuthMiddleware(c, next);
+
+      expect(next).toHaveBeenCalledTimes(1);
+      const agent = c.get('agent') as { isPreAssignment?: boolean; claimTypeAllowlist?: readonly string[] };
+      expect(agent.isPreAssignment).toBe(true);
+      expect(agent.claimTypeAllowlist).toEqual(['self_uninstall']);
+      expect(agent.claimTypeAllowlist).toBe(DRAIN_CLAIM_TYPE_ALLOWLIST);
+    });
+  }
+
+  const blockedPaths = [
+    '/api/v1/agents/agent-1/logs',
+    '/api/v1/agents/agent-1/config',
+    '/api/v1/agents/agent-1/hardware',
+    '/api/v1/agents/agent-1/software',
+    '/api/v1/agents/agent-1/monitoring-results',
+    '/api/v1/agents/agent-1/security/recovery-keys',
+    '/api/v1/agents/agent-1/elevation-requests',
+    '/api/v1/agents/agent-1/unifi-collectors',
+    '/api/v1/agents/agent-1/eventlogs',
+    '/api/v1/agents/agent-1/reliability',
+    '/api/v1/agents/agent-1/pam/reconciliation-bindings',
+    '/api/v1/agents/agent-1/commands/cmd-1',
+    '/api/v1/agents/agent-1/commands/cmd-1/pam-observations',
+    '/api/v1/agents/agent-1/winget-bootstrap/file/heartbeat',
+    '/api/v1/ext/acme/agent/agent-1/heartbeat',
+    '/api/v1/ext/acme/agent/agent-1/anything',
+    '/api/v1/workspace/agent/agent-1/crawl-config',
+  ];
+
+  for (const path of blockedPaths) {
+    it(`refuses ${path} for a parked device with 403 device_pending_assignment`, async () => {
+      buildSelectMock([parked()]);
+
+      const c = createContext({ token: VALID_TOKEN, path });
+      const next = vi.fn();
+
+      const result = await agentAuthMiddleware(c, next);
+
+      expect(next).not.toHaveBeenCalled();
+      expect((result as any).status).toBe(403);
+      expect((result as any).body).toEqual({ error: 'device_pending_assignment' });
+    });
+  }
+
+  it('composes with the device drain by intersection: rotate-token refused, heartbeat admitted', async () => {
+    vi.mocked(isDeviceUninstallDraining).mockResolvedValue(true);
+
+    buildSelectMock([parked({ status: 'decommissioned' })]);
+    const mint = createContext({ token: VALID_TOKEN, path: '/api/v1/agents/agent-1/rotate-token' });
+    const mintNext = vi.fn();
+    const refused = await agentAuthMiddleware(mint, mintNext);
+    expect(mintNext).not.toHaveBeenCalled();
+    expect((refused as any).status).toBe(403);
+
+    buildSelectMock([parked({ status: 'decommissioned' })]);
+    const beat = createContext({ token: VALID_TOKEN, path: '/api/v1/agents/agent-1/heartbeat' });
+    const beatNext = vi.fn().mockResolvedValue(undefined);
+    await agentAuthMiddleware(beat, beatNext);
+    expect(beatNext).toHaveBeenCalledTimes(1);
+    expect((beat.get('agent') as { isPreAssignment?: boolean }).isPreAssignment).toBe(true);
+  });
+
+  it('composes with the tenant drain by intersection: logs (drain-allowed) is still refused', async () => {
+    vi.mocked(getAgentTenantState).mockResolvedValue('draining');
+    buildSelectMock([parked()]);
+
+    const c = createContext({ token: VALID_TOKEN, path: '/api/v1/agents/agent-1/logs' });
+    const next = vi.fn();
+
+    const result = await agentAuthMiddleware(c, next);
+
+    expect(next).not.toHaveBeenCalled();
+    expect((result as any).status).toBe(403);
+    expect((result as any).body).toEqual({ error: 'device_pending_assignment' });
+  });
+
+  it('opens the request-long context without the partner-wide read axis for a parked device', async () => {
+    buildSelectMock([parked()]);
+
+    const c = createContext({ token: VALID_TOKEN, path: '/api/v1/agents/agent-1/rotate-token' });
+    const next = vi.fn().mockResolvedValue(undefined);
+
+    await agentAuthMiddleware(c, next);
+
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(withDbAccessContext)).toHaveBeenCalledTimes(1);
+    const ctx = vi.mocked(withDbAccessContext).mock.calls[0]![0] as { currentPartnerId?: string | null; orgId: string };
+    expect(ctx.orgId).toBe('org-1');
+    expect(ctx.currentPartnerId).toBeNull();
+  });
+
+  it('leaves a device in a regular org unchanged: not pre-assignment, unrestricted claims, full surface', async () => {
+    buildSelectMock([makeDevice({ status: 'online', organizationType: 'customer' })]);
+
+    const c = createContext({ token: VALID_TOKEN, path: '/api/v1/agents/agent-1/hardware' });
+    const next = vi.fn().mockResolvedValue(undefined);
+
+    await agentAuthMiddleware(c, next);
+
+    expect(next).toHaveBeenCalledTimes(1);
+    const agent = c.get('agent') as { isPreAssignment?: boolean; claimTypeAllowlist?: readonly string[] };
+    expect(agent.isPreAssignment).toBe(false);
+    expect(agent.claimTypeAllowlist).toBeUndefined();
+    const ctx = vi.mocked(withDbAccessContext).mock.calls[0]![0] as { currentPartnerId?: string | null };
+    expect(ctx.currentPartnerId).toBe('partner-1');
   });
 });
 
@@ -1639,7 +2068,7 @@ describe('agentAuthMiddleware - per-org rate limit', () => {
 
     // Only the per-agent limiter should have been called
     expect(rateLimiter).toHaveBeenCalledTimes(1);
-    expect(rateLimiter).toHaveBeenCalledWith(expect.anything(), 'agent_rate:agent-1', 120, 60);
+    expect(rateLimiter).toHaveBeenCalledWith(expect.anything(), 'agent_rate:agent-1', 120, 60, 1, { refundOnReject: true });
     expect(next).not.toHaveBeenCalled();
   });
 
@@ -1943,25 +2372,128 @@ describe('Task 18 — agentAuthMiddleware rejects suspended tokens', () => {
 describe('Task 18 — suspendAgentToken helper', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(assertNoUnresolvedIsolation).mockResolvedValue(undefined);
+    vi.mocked(findUnresolvedIsolations).mockResolvedValue([]);
   });
 
-  it('writes agentTokenSuspendedAt + reason via UPDATE', async () => {
-    const setMock = vi.fn().mockReturnValue({
-      where: vi.fn().mockResolvedValue(undefined),
+  const identity = { deviceId: 'device-1', agentId: 'agent-1' };
+
+  it('refuses a future operator suspension while isolation is unresolved', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    vi.mocked(assertNoUnresolvedIsolation).mockRejectedValueOnce(new NetworkIsolationUnresolvedError(
+      'suspend_agent_token', [{ deviceId: identity.deviceId, isolationId: 'isolation-1' }],
+    ));
+    await expect(suspendAgentToken(identity, 'operator_requested' as AgentTokenSuspendReason))
+      .resolves.toBe('isolation_unresolved');
+    expect(assertNoUnresolvedIsolation).toHaveBeenCalledWith(db, { deviceId: identity.deviceId }, 'suspend_agent_token');
+    expect(db.update).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledWith('[agentAuth] Credential suspension refused: network isolation unresolved', {
+      deviceId: identity.deviceId, isolationIds: ['isolation-1'],
     });
+    warn.mockRestore();
+  });
+
+  it('keeps forced suspension when the warning lookup fails in its savepoint', async () => {
+    updateReturning([{ id: identity.deviceId }]);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    vi.mocked(findUnresolvedIsolations).mockImplementationOnce(async () => {
+      expect(withDbTransaction).toHaveBeenCalledTimes(1);
+      throw new Error('warning lookup failed');
+    });
+    try {
+      await expect(suspendAgentToken(identity, 'cross-tenant-probe')).resolves.toBe('suspended');
+      expect(withDbTransaction).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledWith('[agentAuth] Forced suspension isolation warning lookup failed', {
+        deviceId: identity.deviceId,
+      });
+      expect(captureMessage).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('forces security suspension and warns that isolation recovery is bounded by expiry and offline code', async () => {
+    updateReturning([{ id: identity.deviceId }]);
+    vi.mocked(findUnresolvedIsolations).mockResolvedValueOnce([{ deviceId: identity.deviceId, isolationId: 'isolation-1' }]);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      await expect(suspendAgentToken(identity, 'cross-tenant-probe')).resolves.toBe('suspended');
+      expect(assertNoUnresolvedIsolation).not.toHaveBeenCalled();
+      expect(findUnresolvedIsolations).toHaveBeenCalledWith(db, { deviceId: identity.deviceId });
+      expect(warn).toHaveBeenCalledWith(
+        '[agentAuth] Forced credential suspension: network isolation recovery is now bounded by expiry and the offline code',
+        { deviceId: identity.deviceId, isolationIds: ['isolation-1'] },
+      );
+      expect(captureMessage).toHaveBeenCalledWith(
+        'Forced credential suspension: network isolation recovery is now bounded by expiry and the offline code',
+        { eventCode: 'network_isolation_forced_token_suspension', level: 'warning', tags: { deviceId: identity.deviceId, isolationId: 'isolation-1' } },
+      );
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('allows a future operator suspension once isolation is resolved', async () => {
+    updateReturning([{ id: identity.deviceId }]);
+    await expect(suspendAgentToken(identity, 'operator_requested' as AgentTokenSuspendReason)).resolves.toBe('suspended');
+    expect(assertNoUnresolvedIsolation).toHaveBeenCalledWith(db, { deviceId: identity.deviceId }, 'suspend_agent_token');
+    expect(captureMessage).not.toHaveBeenCalled();
+  });
+
+  it('writes agentTokenSuspendedAt + reason via UPDATE, bound to the socket\'s id + agent_id (#8318 §6.4)', async () => {
+    const whereMock = vi.fn().mockReturnValue({ returning: vi.fn().mockResolvedValue([{ id: 'device-1' }]) });
+    const setMock = vi.fn().mockReturnValue({ where: whereMock });
     vi.mocked(db.update).mockReturnValue({ set: setMock } as any);
 
-    await suspendAgentToken('device-1', 'cross-tenant-probe');
+    await suspendAgentToken(identity, 'cross-tenant-probe');
 
     expect(setMock).toHaveBeenCalledTimes(1);
     const arg = setMock.mock.calls[0]?.[0];
     expect(arg).toMatchObject({ agentTokenSuspendedReason: 'cross-tenant-probe' });
     expect(arg.agentTokenSuspendedAt).toBeInstanceOf(Date);
+    // The identity predicate (updateOwnDeviceRow: id AND agent_id) ANDed with
+    // the not-yet-suspended guard. drizzle-orm is mocked above to plain
+    // objects, so the whole predicate tree is inspectable.
+    const where = JSON.stringify(whereMock.mock.calls[0]?.[0]);
+    expect(where).toContain('{"left":"id","right":"device-1"}');
+    expect(where).toContain('{"left":"agentId","right":"agent-1"}');
+    expect(where).toContain('{"isNull":"agentTokenSuspendedAt"}');
+  });
+
+  // #8318 §6.4 (review of wave 1b-1): the caller audits by outcome.
+  function updateReturning(rows: unknown[]) {
+    vi.mocked(db.update).mockReturnValue({
+      set: vi.fn().mockReturnValue({ where: vi.fn().mockReturnValue({ returning: vi.fn().mockResolvedValue(rows) }) }),
+    } as any);
+  }
+  function reReadReturning(rows: unknown[]) {
+    vi.mocked(db.select).mockReturnValueOnce({
+      from: vi.fn().mockReturnValue({ where: vi.fn().mockReturnValue({ limit: vi.fn().mockResolvedValue(rows) }) }),
+    } as any);
+  }
+
+  it('reports suspended when its write stamped the row, without re-reading it', async () => {
+    updateReturning([{ id: 'device-1' }]);
+    vi.mocked(db.select).mockClear();
+    await expect(suspendAgentToken(identity, 'cross-tenant-probe')).resolves.toBe('suspended');
+    expect(db.select).not.toHaveBeenCalled();
+  });
+
+  it('reports stale_caller when the 0-row write found the row in another install\'s hands', async () => {
+    updateReturning([]);
+    reReadReturning([{ agentId: 'agent-after-reattach' }]);
+    await expect(suspendAgentToken(identity, 'cross-tenant-probe')).resolves.toBe('stale_caller');
+  });
+
+  it('reports unchanged when the 0-row write met an already-suspended row of the same install', async () => {
+    updateReturning([]);
+    reReadReturning([{ agentId: 'agent-1' }]);
+    await expect(suspendAgentToken(identity, 'cross-tenant-probe')).resolves.toBe('unchanged');
   });
 
   it('truncates reasons longer than 100 chars to fit the column', async () => {
     const setMock = vi.fn().mockReturnValue({
-      where: vi.fn().mockResolvedValue(undefined),
+      where: vi.fn().mockReturnValue({ returning: vi.fn().mockResolvedValue([]) }),
     });
     vi.mocked(db.update).mockReturnValue({ set: setMock } as any);
 
@@ -1969,7 +2501,7 @@ describe('Task 18 — suspendAgentToken helper', () => {
     // Cast past the AgentTokenSuspendReason union: the canonical reasons are all
     // < 100 chars, but this exercises the defensive runtime .slice(0, 100) that
     // guards the varchar(100) column against any future non-canonical caller.
-    await suspendAgentToken('device-1', longReason as never);
+    await suspendAgentToken(identity, longReason as never);
 
     const arg = setMock.mock.calls[0]?.[0];
     expect(arg.agentTokenSuspendedReason.length).toBe(100);
@@ -1982,8 +2514,8 @@ describe('Task 18 — suspendAgentToken helper', () => {
     const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
     await expect(
-      suspendAgentToken('device-1', 'cross-tenant-probe')
-    ).resolves.toBeUndefined();
+      suspendAgentToken(identity, 'cross-tenant-probe')
+    ).resolves.toBe('failed');
     expect(errSpy).toHaveBeenCalledWith(
       '[agentAuth] suspendAgentToken failed',
       expect.objectContaining({ deviceId: 'device-1' })
@@ -2035,6 +2567,8 @@ describe('Task 19 — per-source-IP rate limit', () => {
       'agent_rate_ip:device-1:203.0.113.5',
       30,
       60,
+      1,
+      { refundOnReject: true },
     );
     expect(next).not.toHaveBeenCalled();
   });
@@ -2053,8 +2587,8 @@ describe('Task 19 — per-source-IP rate limit', () => {
 
     expect(next).toHaveBeenCalledTimes(1);
     expect(rateLimiter).toHaveBeenCalledTimes(3);
-    expect(rateLimiter).toHaveBeenNthCalledWith(1, expect.anything(), 'agent_rate_ip:device-1:203.0.113.5', 30, 60);
-    expect(rateLimiter).toHaveBeenNthCalledWith(2, expect.anything(), 'agent_rate:agent-1', 120, 60);
+    expect(rateLimiter).toHaveBeenNthCalledWith(1, expect.anything(), 'agent_rate_ip:device-1:203.0.113.5', 30, 60, 1, { refundOnReject: true });
+    expect(rateLimiter).toHaveBeenNthCalledWith(2, expect.anything(), 'agent_rate:agent-1', 120, 60, 1, { refundOnReject: true });
     expect(rateLimiter).toHaveBeenNthCalledWith(3, expect.anything(), 'agent_org_rate:org-1', 600, 60);
   });
 
@@ -2071,7 +2605,7 @@ describe('Task 19 — per-source-IP rate limit', () => {
     await agentAuthMiddleware(c, next);
 
     expect(rateLimiter).toHaveBeenCalledTimes(2);
-    expect(rateLimiter).toHaveBeenNthCalledWith(1, expect.anything(), 'agent_rate:agent-1', 120, 60);
+    expect(rateLimiter).toHaveBeenNthCalledWith(1, expect.anything(), 'agent_rate:agent-1', 120, 60, 1, { refundOnReject: true });
     expect(createAuditLogAsync).not.toHaveBeenCalled();
   });
 });

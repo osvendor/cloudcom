@@ -12,8 +12,10 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 
+	"github.com/breeze-rmm/agent/internal/backup/integrity"
 	"github.com/breeze-rmm/agent/internal/backup/providers"
 	"github.com/breeze-rmm/agent/internal/securefs"
 )
@@ -24,6 +26,26 @@ type RestoreConfig struct {
 	TargetPath    string   // where to restore files
 	SelectedPaths []string // if non-empty, only restore files matching these prefixes
 	WorkRoot      string   // privileged agent-data root for staging and default restores
+	// Integrity is the integrity expectation delivered with the command; nil
+	// when the server sent none (the earlier checks apply unchanged).
+	Integrity *integrity.Expectation
+
+	// SecurityDescriptorsAsCaptured applies every recorded Windows security
+	// descriptor as captured, without checking that the machine running the
+	// restore recognises the principals it names. Only for a whole-machine
+	// rebuild, where the restored tree becomes the machine those accounts
+	// belong to (the helper itself may be running in a recovery
+	// environment that recognises none of them). Never set from a command
+	// payload.
+	SecurityDescriptorsAsCaptured bool
+
+	// JunctionTargetsAsCaptured recreates every junction (#7325) pointing
+	// at its target exactly as recorded, never rewritten under TargetPath.
+	// Only for a whole-machine rebuild: the restore writes through a
+	// recovery-time drive letter or volume GUID path, but the junction must
+	// resolve on the machine the rebuilt volume becomes. Never set from a
+	// command payload — see junctionRestoreTarget.
+	JunctionTargetsAsCaptured bool
 }
 
 // RestoreResult tracks the outcome of a restore.
@@ -37,6 +59,18 @@ type RestoreResult struct {
 	Warnings      []string `json:"warnings,omitempty"`
 	StagingDir    string   `json:"stagingDir,omitempty"`
 	Error         string   `json:"error,omitempty"`
+	// Code is the stable code of the first integrity check that failed
+	// (integrity_mismatch, missing_checksum, …); set only when the command
+	// carried an integrity expectation.
+	Code string `json:"code,omitempty"`
+
+	// SecurityDescriptorQuarantined counts the Windows entries whose recorded
+	// security descriptor named principals the target does not recognise, so
+	// they were restored with the restrictive quarantine descriptor (owner
+	// Administrators; SYSTEM and Administrators only) instead; the paths are
+	// listed in SecurityDescriptorQuarantinedPaths.
+	SecurityDescriptorQuarantined      int      `json:"securityDescriptorQuarantined,omitempty"`
+	SecurityDescriptorQuarantinedPaths []string `json:"securityDescriptorQuarantinedPaths,omitempty"`
 }
 
 // ProgressFunc is called after each file is restored.
@@ -101,19 +135,31 @@ func RestoreFromSnapshotContext(ctx context.Context, provider providers.BackupPr
 		return result, nil
 	}
 
-	// 1. Download and parse manifest
-	snapshot, err := downloadManifest(provider, cfg.SnapshotID, workRoot)
+	// 1. Download and parse manifest. With an integrity expectation the
+	// manifest bytes are checked against the snapshot attestation before a
+	// byte of them is parsed.
+	if err := cfg.Integrity.CheckSnapshot(cfg.SnapshotID); err != nil {
+		result.Status = "failed"
+		return result, err
+	}
+	snapshot, manifestWarnings, err := downloadVerifiedManifest(ctx, provider, cfg.SnapshotID, workRoot, cfg.Integrity, cfg.SelectedPaths)
 	if err != nil {
 		result.Status = "failed"
+		result.Code = integrityResultCode(cfg.Integrity, err)
 		return result, fmt.Errorf("download manifest: %w", err)
 	}
+	if w := cfg.Integrity.UnattestedWarning(); w != "" {
+		result.Warnings = append(result.Warnings, w)
+	}
+	result.Warnings = append(result.Warnings, manifestWarnings...)
 
-	// 2. Filter files by selected paths, then split into the three restore
-	// passes: regular files (today's download loop), symlinks, and
-	// directories — directories go last so their modes/owners are applied
-	// AFTER every child has been written (see the two passes appended below
-	// the main loop).
-	files := filterFiles(snapshot.Files, cfg.SelectedPaths)
+	// 2. Split the selected files (downloadVerifiedManifest kept only the
+	// entries cfg.SelectedPaths selects) into the three restore passes:
+	// regular files (today's download loop), symlinks, and directories —
+	// directories go last so their modes/owners are applied AFTER every
+	// child has been written (see the two passes appended below the main
+	// loop).
+	files := snapshot.Files
 	var contentFiles, links, dirs []SnapshotFile
 	for _, f := range files {
 		switch f.Kind {
@@ -126,13 +172,26 @@ func RestoreFromSnapshotContext(ctx context.Context, provider providers.BackupPr
 		}
 	}
 	files = contentFiles
-	total := int64(len(contentFiles) + len(links) + len(dirs))
+	// Junctions (#7325) live in their own manifest array and get their own
+	// pass, after every other entry is in place.
+	junctions := filterJunctions(snapshot.Junctions, cfg.SelectedPaths)
+	total := int64(len(contentFiles) + len(links) + len(dirs) + len(junctions))
 	if total == 0 {
 		result.Status = "completed"
 		if len(cfg.SelectedPaths) > 0 {
 			result.Warnings = append(result.Warnings, "no files matched the selected paths")
 		}
 		return result, nil
+	}
+	// NTFS security descriptors (W06a): Windows only — see restore_sd.go.
+	// The restore privilege scope (SeRestore/SeTakeOwnership/SeSecurity) is
+	// held for this run only and released when it returns.
+	secDescs, secWarnings := newRestoreSecurity(snapshot.SecurityDescriptors, append(append(append([]SnapshotFile(nil), contentFiles...), links...), dirs...), restoreAppliesSecurityDescriptors)
+	result.Warnings = append(result.Warnings, secWarnings...)
+	secDescs.asCaptured = cfg.SecurityDescriptorsAsCaptured
+	if secDescs.active() {
+		release := enableRestoreSDPrivileges()
+		defer release()
 	}
 	applyOwnership := restoreCanApplyOwnership()
 	ownershipWarned := false
@@ -142,6 +201,22 @@ func RestoreFromSnapshotContext(ctx context.Context, provider providers.BackupPr
 		}
 		ownershipWarned = true
 		result.Warnings = append(result.Warnings, "ownership/special mode bits not applied: restore is not running as root")
+	}
+
+	// Directories whose recorded descriptor is to be restricted are created
+	// and restricted BEFORE anything is restored beneath them, so an entry
+	// restored there without a descriptor of its own inherits the
+	// restriction rather than the target's ACL. A directory that cannot be
+	// restricted blocks everything beneath it. Plans are computed once per
+	// directory here and reused by the directory pass below.
+	dirPlans, preRestricted, blockedDirs := restrictDirectoriesFirst(targetBase, dirs, secDescs, applyOwnership, result)
+	blockedBeneath := func(relative string) string {
+		for _, b := range blockedDirs {
+			if strings.HasPrefix(relative, b+string(filepath.Separator)) {
+				return b
+			}
+		}
+		return ""
 	}
 
 	// 3. Create or reuse a deterministic staging directory so partial restores
@@ -157,182 +232,84 @@ func RestoreFromSnapshotContext(ctx context.Context, provider providers.BackupPr
 	}
 	result.StagingDir = stagingDir
 
-	// 4. Load resume state if it exists
-	resumeState, err := LoadResumeState(stagingDir)
-	if err != nil {
-		slog.Warn("failed to load resume state, starting fresh", "error", err.Error())
-	}
-	if resumeState == nil {
-		resumeState = &ResumeState{
-			SnapshotID:     cfg.SnapshotID,
-			CompletedFiles: make(map[string]bool),
+	// 4. Load resume state (snapshot + journal) if it exists. Progress is
+	// journaled per file and compacted when the run ends without completing
+	// (restore_resume.go, #7333); a completed run discards it below.
+	resume := openResumeTracker(stagingDir, cfg.SnapshotID)
+	defer resume.close()
+
+	// Tell a batching provider which objects are coming, in order, so it
+	// can authorize them a window at a time rather than one per download.
+	pending := make([]SnapshotFile, 0, len(files))
+	for _, f := range files {
+		if !resume.completed(f.BackupPath) {
+			pending = append(pending, f)
 		}
 	}
+	providers.PrepareDownloads(provider, contentKeys(pending))
 
 	if progressFn != nil {
 		progressFn("starting", 0, total, fmt.Sprintf("restoring %d files", total))
 	}
 
-	// 5. Restore each file
-	for i, file := range files {
-		if checkCancelled() {
-			return result, nil
-		}
-
-		current := int64(i + 1)
-		displayPath := restoreSourcePath(file)
-		relativeTarget, relErr := restoreRelativePath(displayPath)
-		if relErr != nil {
-			result.Warnings = append(result.Warnings, fmt.Sprintf("invalid restore path %s: %v", displayPath, relErr))
-			result.FilesFailed++
-			result.FailedFiles = append(result.FailedFiles, displayPath)
-			continue
-		}
-		targetPath := filepath.Join(targetBase, relativeTarget)
-
-		// Skip already-completed files (resume)
-		if resumeState.CompletedFiles[file.BackupPath] {
-			if info, statErr := securefs.StatFile(targetBase, relativeTarget); statErr == nil && info.Size() == file.Size {
-				result.FilesRestored++
-				result.BytesRestored += file.Size
-				if progressFn != nil {
-					progressFn("restoring", current, total,
-						fmt.Sprintf("skipped (resumed): %s", displayPath))
-				}
-				continue
-			}
-			delete(resumeState.CompletedFiles, file.BackupPath)
-		}
-
-		// Download to staging
-		stagingFile := filepath.Join(stagingDir, stagingFileName(file.BackupPath))
-		dlErr := provider.Download(file.BackupPath, stagingFile)
-		if dlErr != nil {
-			result.FilesFailed++
-			result.FailedFiles = append(result.FailedFiles, displayPath)
-			slog.Warn("failed to download file",
-				"backupPath", file.BackupPath, "error", dlErr.Error())
-			continue
-		}
-		if checkCancelled() {
-			_ = os.Remove(stagingFile)
-			return result, nil
-		}
-
-		// No pathname containment check, MkdirAll or moveFile here: the
-		// publication below walks the target hierarchy with directory
-		// descriptors/handles and refuses a symlink or reparse point at every
-		// component. That subsumes both the lexical containment check and
-		// EnsureNoSymlinkAncestor (which only lstat's, and so is decided
-		// before the write rather than during it), including the RESUMED case
-		// where an earlier pass recreated an ancestor as a symlink.
-		// Verify the restored bytes against the manifest BEFORE declaring the
-		// file restored. This is the path that writes real user data, so a
-		// corrupt/truncated object must not be silently reported "restored"
-		// (VerifyIntegrity/TestRestore run this same fail-closed check, but only
-		// against throwaway dirs — the real restore needs it too). Size is
-		// always checked; the SHA-256 when the manifest carries one.
-		if info, statErr := os.Stat(stagingFile); statErr != nil || info == nil {
-			result.FilesFailed++
-			result.FailedFiles = append(result.FailedFiles, displayPath)
-			_ = os.Remove(stagingFile)
-			slog.Warn("failed to stat restored file", "target", targetPath, "error", fmt.Sprint(statErr))
-			continue
-		} else if info.Size() != file.Size {
-			if file.Volatile {
-				// The source kept changing while it was being backed up
-				// (#5581) — the manifest's Size/Checksum describe the last
-				// pre-upload measurement, not necessarily what a fresh
-				// read of the (still-live) object would show. A mismatch
-				// here is expected, not corruption: warn and restore the
-				// bytes anyway rather than failing the file.
-				result.Warnings = append(result.Warnings,
-					fmt.Sprintf("restored %s: size differs from manifest (manifest %d, restored %d) — file was volatile during backup", displayPath, file.Size, info.Size()))
-				slog.Warn("restored volatile file has a size mismatch (advisory, not a failure)",
-					"target", targetPath, "manifestSize", file.Size, "restoredSize", info.Size())
-			} else {
-				result.FilesFailed++
-				result.FailedFiles = append(result.FailedFiles, displayPath)
-				_ = os.Remove(stagingFile)
-				result.Warnings = append(result.Warnings,
-					fmt.Sprintf("restored %s failed size check: manifest %d, restored %d", displayPath, file.Size, info.Size()))
-				slog.Warn("restored file failed size check",
-					"target", targetPath, "manifestSize", file.Size, "restoredSize", info.Size())
-				continue
-			}
-		}
-		if file.Checksum != "" && !checksumMatches(stagingFile, file.Checksum) {
-			if file.Volatile {
-				result.Warnings = append(result.Warnings,
-					fmt.Sprintf("restored %s: checksum differs from manifest (manifest %s) — file was volatile during backup", displayPath, file.Checksum))
-				slog.Warn("restored volatile file has a checksum mismatch (advisory, not a failure)", "target", targetPath)
-			} else {
-				result.FilesFailed++
-				result.FailedFiles = append(result.FailedFiles, displayPath)
-				_ = os.Remove(stagingFile)
-				result.Warnings = append(result.Warnings,
-					fmt.Sprintf("restored %s failed checksum check (manifest %s)", displayPath, file.Checksum))
-				slog.Warn("restored file failed checksum check", "target", targetPath)
-				continue
-			}
-		}
-
-		// Publish only verified bytes. Linux, macOS and Windows pin the
-		// target hierarchy with directory descriptors/handles and never follow
-		// a destination symlink/reparse point. Mode (full ModeBits when the
-		// manifest carries them, else the perm-only Mode), owner and mtime are
-		// applied to the pinned temporary BEFORE the atomic replace, so #5520's
-		// fidelity is preserved without any post-publication pathname
-		// chmod/chown/chtimes — the exact operations this boundary exists to
-		// remove.
-		mode := os.FileMode(file.Mode).Perm()
-		if file.ModeBits != 0 {
-			mode = os.FileMode(file.ModeBits)
-		}
-		installWarnings, err := securefs.InstallFileWithAttrs(targetBase, relativeTarget, stagingFile, mode, file.ModTime, entryOwner(file, applyOwnership), file.WinAttrs)
-		if err != nil {
-			result.FilesFailed++
-			result.FailedFiles = append(result.FailedFiles, displayPath)
-			result.Warnings = append(result.Warnings, fmt.Sprintf("could not restore %s: %v", displayPath, err))
-			_ = os.Remove(stagingFile)
-			slog.Warn("failed to install restored file", "target", targetPath, "error", err.Error())
-			continue
-		}
-		for _, warning := range installWarnings {
-			result.Warnings = append(result.Warnings, fmt.Sprintf("restored %s with reduced fidelity: %v", displayPath, warning))
-		}
-		if !applyOwnership && (file.Owner != nil || file.ModeBits&uint32(os.ModeSetuid|os.ModeSetgid|os.ModeSticky) != 0) {
-			warnOwnership()
-		}
-
-		result.FilesRestored++
-		result.BytesRestored += file.Size
-		resumeState.CompletedFiles[file.BackupPath] = true
-		resumeState.BytesRestored += file.Size
-
-		// Save resume state after each successful file
-		if saveErr := SaveResumeState(stagingDir, resumeState); saveErr != nil {
-			slog.Warn("failed to save resume state", "error", saveErr.Error())
-		}
-
-		if progressFn != nil {
-			progressFn("restoring", current, total,
-				fmt.Sprintf("restored: %s", displayPath))
-		}
+	// 5. Restore each file: downloads and verification run concurrently;
+	// install, resume journaling, counters and progress stay in manifest
+	// order on this goroutine (restore_content.go, #5623).
+	content := &contentRestorer{
+		provider:       provider,
+		files:          files,
+		targetBase:     targetBase,
+		stagingDir:     stagingDir,
+		total:          total,
+		result:         result,
+		resume:         resume,
+		secDescs:       secDescs,
+		applyOwnership: applyOwnership,
+		warnOwnership:  warnOwnership,
+		progressFn:     progressFn,
+		checkCancelled: checkCancelled,
+		integrity:      cfg.Integrity,
+		blockedBeneath: blockedBeneath,
+	}
+	if content.run(ctx) {
+		return result, nil
 	}
 
 	// Pass 2: symlinks (parents exist now, from the file pass above). Pass
 	// 3: directories last so their modes/owners are applied after every
 	// child (file or symlink) has been written under them.
-	for _, entry := range append(links, dirs...) {
+	//
+	// Directory security descriptors are collected here and applied in a
+	// post-pass after this loop: a restrictive DACL applied as each
+	// directory is created could deny the restore the access it still needs
+	// for later entries beneath it. Symlinks/junctions never take one.
+	type dirSD struct {
+		relative, display string
+		plan              sdPlan
+	}
+	var dirSecurity []dirSD
+	var dirAttrs []pendingDirAttrs
+	for j, entry := range append(links, dirs...) {
 		if checkCancelled() {
 			return result, nil
 		}
+		dirIndex := j - len(links) // index into dirs; negative for a link
 		displayPath := restoreSourcePath(entry)
 		relativeEntry, relErr := restoreRelativePath(displayPath)
 		if relErr != nil {
-			result.Warnings = append(result.Warnings, fmt.Sprintf("path traversal blocked: %s", displayPath))
+			if errors.Is(relErr, securefs.ErrInvalidWindowsName) {
+				result.Warnings = append(result.Warnings, fmt.Sprintf("invalid restore path %s: %v", displayPath, relErr))
+			} else {
+				result.Warnings = append(result.Warnings, fmt.Sprintf("path traversal blocked: %s", displayPath))
+			}
 			result.FilesFailed++
+			result.FailedFiles = append(result.FailedFiles, displayPath)
+			continue
+		}
+		if blockErr, blocked := blockedDirErr(blockedDirs, relativeEntry, dirIndex, dirPlans); blocked {
+			result.FilesFailed++
+			result.FailedFiles = append(result.FailedFiles, displayPath)
+			result.Warnings = append(result.Warnings, fmt.Sprintf("not restored %s: %s", displayPath, blockErr))
 			continue
 		}
 		// securefs walks to the entry's parent with directory descriptors and
@@ -379,15 +356,14 @@ func RestoreFromSnapshotContext(ctx context.Context, provider providers.BackupPr
 				}
 				entryErr = securefs.InstallDir(targetBase, relativeEntry, mode, entry.ModeBits != 0, entryOwner(entry, applyOwnership), entry.ModTime)
 				if entryErr == nil {
-					// The walker records a Windows directory entry only when
-					// the directory is empty, but when it does, a Hidden or
-					// System folder must come back Hidden/System rather than
-					// plain (#5407, review finding). Applied last and
-					// best-effort: losing a directory attribute is a fidelity
-					// warning, never a failed restore.
-					if attrErr := applyWinAttrs(filepath.Join(targetBase, relativeEntry), entry.WinAttrs); attrErr != nil {
-						result.Warnings = append(result.Warnings,
-							fmt.Sprintf("recreated %s with reduced fidelity: could not reapply windows attributes: %v", displayPath, attrErr))
+					// A Hidden or System folder must come back Hidden/System
+					// rather than plain (#5407, #6506). Deferred to a
+					// post-pass below, after every entry is in place.
+					if entry.WinAttrs != 0 {
+						dirAttrs = append(dirAttrs, pendingDirAttrs{relative: relativeEntry, display: displayPath, attrs: entry.WinAttrs})
+					}
+					if plan := dirPlans[dirIndex]; plan.applier != nil && !preRestricted[dirIndex] {
+						dirSecurity = append(dirSecurity, dirSD{relative: relativeEntry, display: displayPath, plan: plan})
 					}
 				}
 			}
@@ -406,13 +382,56 @@ func RestoreFromSnapshotContext(ctx context.Context, provider providers.BackupPr
 		result.FilesRestored++
 	}
 
+	// Junctions last among the entries (#7325): every file, symlink and
+	// directory is already written, so nothing is ever routed through a
+	// junction this pass creates. Before the directory attribute and
+	// security post-passes, so a restrictive parent DACL or ReadOnly cannot
+	// stand between the restore and the junction it still has to create.
+	if checkCancelled() {
+		return result, nil
+	}
+	junctionsSkipped := restoreJunctions(targetBase, junctions, cfg.JunctionTargetsAsCaptured, blockedBeneath, result)
+
+	result.Warnings = append(result.Warnings, applyDirWinAttrs(targetBase, dirAttrs)...)
+
+	// Directory security descriptors, now that every file, symlink and
+	// directory is in place. Deepest first, so a parent's DACL can never
+	// stand between the restore and a child it has yet to update. Each
+	// directory is reached by securefs's pinned, reparse-refusing walk from
+	// the volume root and the descriptor is set on THAT handle — never on a
+	// joined pathname a swapped-in junction could redirect.
+	sort.SliceStable(dirSecurity, func(i, j int) bool {
+		return strings.Count(dirSecurity[i].relative, string(filepath.Separator)) > strings.Count(dirSecurity[j].relative, string(filepath.Separator))
+	})
+	for _, ds := range dirSecurity {
+		plan := ds.plan
+		secErr := securefs.ApplyDirSecurity(targetBase, ds.relative, *plan.applier)
+		switch {
+		case secErr == nil:
+			secDescs.record(result, ds.display, plan)
+		case plan.verdict == sdQuarantine:
+			// The directory could not be restricted, so it keeps the
+			// target's inherited ACL: report it failed, never restored.
+			result.FilesRestored--
+			result.FilesFailed++
+			result.FailedFiles = append(result.FailedFiles, ds.display)
+			result.Warnings = append(result.Warnings, fmt.Sprintf("could not restrict %s, whose recorded security descriptor names principals this machine does not recognise or cannot be read: %v", ds.display, secErr))
+		default:
+			result.Warnings = append(result.Warnings, fmt.Sprintf("recreated %s with reduced fidelity: could not reapply security descriptor: %v", ds.display, secErr))
+		}
+	}
+	result.Warnings = append(result.Warnings, secDescs.finish()...)
+
 	if checkCancelled() {
 		return result, nil
 	}
 
 	// 6. Determine status
 	switch {
-	case result.FilesFailed == 0 && result.FilesRestored > 0:
+	// A junction deliberately not recreated (refused target, a host with
+	// no junctions) is neither restored nor failed; a restore whose only
+	// entries were such skips completed, with the warnings saying why.
+	case result.FilesFailed == 0 && (result.FilesRestored > 0 || junctionsSkipped > 0):
 		result.Status = "completed"
 	case result.FilesRestored == 0:
 		result.Status = "failed"
@@ -422,6 +441,9 @@ func RestoreFromSnapshotContext(ctx context.Context, provider providers.BackupPr
 
 	// 7. Clean up staging on success
 	if result.Status == "completed" {
+		// Nothing left to resume. Release the journal handle first: an open
+		// handle would block removing the staging dir on Windows.
+		resume.discard()
 		if err := os.RemoveAll(stagingDir); err != nil {
 			slog.Warn("failed to clean up staging dir", "dir", stagingDir, "error", err.Error())
 		} else {
@@ -432,32 +454,123 @@ func RestoreFromSnapshotContext(ctx context.Context, provider providers.BackupPr
 	return result, nil
 }
 
-// downloadManifest fetches and parses the manifest for a snapshot.
+// contentKeys returns the object keys of the entries that carry content,
+// in manifest order, for providers.PrepareDownloads.
+func contentKeys(files []SnapshotFile) []string {
+	keys := make([]string, 0, len(files))
+	for _, f := range files {
+		if f.HasContent() && f.BackupPath != "" {
+			keys = append(keys, f.BackupPath)
+		}
+	}
+	return keys
+}
+
+// downloadManifest fetches and parses the manifest for a snapshot without
+// an integrity expectation.
 func downloadManifest(provider providers.BackupProvider, snapshotID, workRoot string) (*Snapshot, error) {
+	snapshot, _, err := downloadVerifiedManifest(context.Background(), provider, snapshotID, workRoot, nil, nil)
+	return snapshot, err
+}
+
+// plainDownload is the transfer restores have always used: the provider's
+// own Download, not cancelled mid-object (cancellation is checked between
+// files).
+func plainDownload(_ context.Context, p providers.BackupProvider, key, dest string) error {
+	return p.Download(key, dest)
+}
+
+// downloadVerifiedManifest fetches and parses the manifest for a snapshot.
+// In attested mode the bytes must match the attested manifest object before
+// they are decoded (a vault copy that does not is replaced by primary
+// storage's, with a warning); otherwise it is downloaded as before. Only the
+// file entries selectedPaths selects are kept (see filterFiles; empty keeps
+// all); junctions and every other manifest field are returned whole.
+func downloadVerifiedManifest(ctx context.Context, provider providers.BackupProvider, snapshotID, workRoot string, e *integrity.Expectation, selectedPaths []string) (*Snapshot, []string, error) {
 	manifestKey := path.Join(snapshotRootDir, snapshotID, snapshotManifestKey)
-
-	tmpFile, err := os.CreateTemp(workRoot, "restore-manifest-*.json")
+	if workRoot == "" {
+		workRoot = os.TempDir()
+	}
+	tmpPath, warnings, err := integrity.DownloadVerifiedControlObjectVia(ctx, plainDownload, provider, e, integrity.RoleManifest, manifestKey, workRoot)
 	if err != nil {
-		return nil, fmt.Errorf("create temp manifest: %w", err)
+		if e.Attested() {
+			return nil, nil, err
+		}
+		return nil, nil, fmt.Errorf("download manifest: %w", err)
 	}
-	tmpPath := tmpFile.Name()
-	_ = tmpFile.Close()
-	defer os.Remove(tmpPath)
+	defer func() { _ = os.Remove(tmpPath) }()
 
-	if err := provider.Download(manifestKey, tmpPath); err != nil {
-		return nil, fmt.Errorf("download manifest: %w", err)
-	}
-
-	data, err := os.ReadFile(tmpPath)
+	// Decoded only now, after the attested-mode check above (none outside
+	// attested mode), and streamed with the selection applied per entry:
+	// memory follows what the restore selected, not the size of the snapshot
+	// (#11234).
+	snapshot, err := decodeSnapshotManifestFile(tmpPath, restoreSelection(selectedPaths))
 	if err != nil {
-		return nil, fmt.Errorf("read manifest: %w", err)
+		return nil, nil, fmt.Errorf("decode manifest: %w", err)
 	}
+	return snapshot, warnings, nil
+}
 
-	var snapshot Snapshot
-	if err := json.Unmarshal(data, &snapshot); err != nil {
-		return nil, fmt.Errorf("decode manifest: %w", err)
+// integrityResultCode is the result code for err when the command carried an
+// integrity expectation and err is an integrity check failure, else "".
+func integrityResultCode(e *integrity.Expectation, err error) string {
+	if !e.Present() {
+		return ""
 	}
-	return &snapshot, nil
+	return integrity.FailureCode(err)
+}
+
+// storedBytes is what a manifest entry says about its stored object.
+func storedBytes(file SnapshotFile) integrity.Stored {
+	return integrity.Stored{Size: file.Size, SHA256: file.Checksum, Volatile: file.Volatile}
+}
+
+// downloadAndCheckStaged downloads one entry's object into stagingFile and
+// checks it against the entry: exactly in attested mode, with the earlier
+// rules otherwise (see integrity.CheckStoredBytes). With an expectation a
+// vault copy that fails the check is replaced by primary storage's copy.
+func downloadAndCheckStaged(ctx context.Context, provider providers.BackupProvider, file SnapshotFile, stagingFile string, e *integrity.Expectation) (integrity.CheckResult, []string, error) {
+	return integrity.DownloadCheckedVia(ctx, plainDownload, provider, file.BackupPath, stagingFile, storedBytes(file), e)
+}
+
+// storedBytesFailureWarning is the result warning for a file that failed its
+// download or content check ("" for a plain download failure, which is
+// reported through FailedFiles only, as before).
+func storedBytesFailureWarning(displayPath string, file SnapshotFile, err error, e *integrity.Expectation) string {
+	switch {
+	case e.Present() && integrity.FailureCode(err) != "":
+		return fmt.Sprintf("restored %s failed integrity check (%s): %v", displayPath, integrity.FailureCode(err), err)
+	case errors.Is(err, integrity.ErrSizeMismatch):
+		return fmt.Sprintf("restored %s failed size check: %v", displayPath, err)
+	case errors.Is(err, integrity.ErrChecksumMismatch):
+		return fmt.Sprintf("restored %s failed checksum check (manifest %s)", displayPath, file.Checksum)
+	default:
+		return ""
+	}
+}
+
+// resumedFileIntact reports whether a file an earlier run of this restore
+// completed can be skipped: the published file must still be there with the
+// manifest's size and, in attested mode, exactly the attested content.
+func resumedFileIntact(targetBase, relativeTarget string, file SnapshotFile, e *integrity.Expectation) bool {
+	info, err := securefs.StatFile(targetBase, relativeTarget)
+	if err != nil || info.Size() != file.Size {
+		return false
+	}
+	if !e.Attested() {
+		return true
+	}
+	if file.Checksum == "" {
+		return false
+	}
+	f, err := securefs.OpenFile(targetBase, relativeTarget)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = f.Close() }()
+	h := sha256.New()
+	n, err := io.Copy(h, f)
+	return err == nil && n == file.Size && strings.EqualFold(hex.EncodeToString(h.Sum(nil)), file.Checksum)
 }
 
 // filterFiles returns only the files whose restoreSourcePath (see that
@@ -476,15 +589,35 @@ func filterFiles(files []SnapshotFile, selectedPaths []string) []SnapshotFile {
 	}
 
 	var matched []SnapshotFile
-	for _, f := range files {
-		for _, selected := range selectedPaths {
-			if pathSelectionMatches(restoreSourcePath(f), selected) {
-				matched = append(matched, f)
-				break
-			}
+	for i := range files {
+		if restoreSelected(&files[i], selectedPaths) {
+			matched = append(matched, files[i])
 		}
 	}
 	return matched
+}
+
+// restoreSelected reports whether a restore with selectedPaths includes f:
+// its restoreSourcePath matches at least one selected path (see
+// pathSelectionMatches). Callers handle an empty selection (everything).
+func restoreSelected(f *SnapshotFile, selectedPaths []string) bool {
+	sourcePath := restoreSourcePath(*f)
+	for _, selected := range selectedPaths {
+		if pathSelectionMatches(sourcePath, selected) {
+			return true
+		}
+	}
+	return false
+}
+
+// restoreSelection is filterFiles as a per-entry predicate, for applying a
+// restore's selection while the manifest is decoded (#11234). An empty
+// selection restores everything and returns nil (keep every entry).
+func restoreSelection(selectedPaths []string) func(*SnapshotFile) bool {
+	if len(selectedPaths) == 0 {
+		return nil
+	}
+	return func(f *SnapshotFile) bool { return restoreSelected(f, selectedPaths) }
 }
 
 // pathSelectionMatches reports whether sourcePath was selected by selected:
@@ -536,6 +669,54 @@ var volumeName = filepath.VolumeName
 // MUST go through this, never f.SourcePath directly.
 func restoreSourcePath(f SnapshotFile) string {
 	return journalEntryKey(f)
+}
+
+// RestoreKey returns the path an entry restores under, relative to the
+// restore target: restoreSourcePath (OriginalPath when VSS rewrote
+// SourcePath) with the volume and leading separators stripped — exactly
+// what resolveTargetPath joins under the target base. Separators are left
+// as recorded (a Windows manifest's `\` stays `\`), so
+// filepath.Join(root, RestoreKey(f)) is the file the restore wrote on the
+// host that ran the restore. Callers outside this package (the rebuild
+// engine's validate/winValidate) must use this, never f.SourcePath.
+func RestoreKey(f SnapshotFile) string {
+	return stripVolumeAndLeadingSeparators(restoreSourcePath(f))
+}
+
+// RestoreSourceKey is restoreSourcePath exported: the exact string
+// RestoreResult.FailedFiles entries are written under (displayPath in the
+// download loop above — OriginalPath when VSS rewrote SourcePath, else
+// SourcePath itself; volume NOT stripped, separators as recorded). Use this,
+// never RestoreKey, to look an entry up in a FailedFiles-derived set (e.g.
+// the rebuild engine's r.failedFiles, populated unchanged from
+// RestoreResult.FailedFiles) — RestoreKey is the relative-to-target-base
+// path an entry restores under on disk, a different string for any Windows
+// entry (it additionally strips the drive volume and leading separators).
+func RestoreSourceKey(f SnapshotFile) string {
+	return restoreSourcePath(f)
+}
+
+// RestoreVolume is the volume (drive, e.g. "D:") RestoreKey strips from an
+// entry: restoreSourcePath's volume — OriginalPath's for a VSS entry, never
+// the shadow-copy device of SourcePath — or "" when the recorded path
+// carries none. A restore into one target base flattens every volume into
+// it, so the rebuild engine uses this to refuse a snapshot whose entries
+// span more than the root volume.
+func RestoreVolume(f SnapshotFile) string {
+	return volumeName(restoreSourcePath(f))
+}
+
+// SetVolumeNameForTest overrides the package-level volumeName hook restore.go
+// uses to strip a leading Windows drive volume, returning a restore func.
+// Exported (test-only by convention, never called from non-test code) so an
+// external package's test — rebuild/validate_test.go's
+// TestValidate_UsesRestoreKey — can exercise RestoreKey's Windows-path
+// branch on a non-Windows CI runner, exactly like restore_volume_test.go's
+// unexported withWindowsVolumeName does for this package's own tests.
+func SetVolumeNameForTest(f func(string) string) (restore func()) {
+	orig := volumeName
+	volumeName = f
+	return func() { volumeName = orig }
 }
 
 // stripVolumeAndLeadingSeparators removes the volume/drive (e.g. "C:") and any
@@ -735,7 +916,7 @@ func validateSnapshotID(snapshotID string) error {
 // hex chars + ".gz" = 67, comfortably under any filesystem limit) and
 // collision-resistant, so distinct BackupPaths never share a staging file.
 // The ".gz" suffix is cosmetic only — nothing parses this name back into a
-// BackupPath; resume state (ResumeState.CompletedFiles, restore_resume.go)
+// BackupPath; resume state (resumeTracker, restore_resume.go)
 // and every restore-loop lookup key off file.BackupPath directly, never off
 // the staging filename, so this stays consistent with resume behavior.
 func stagingFileName(backupPath string) string {
@@ -783,38 +964,6 @@ func EnsureNoSymlinkAncestor(base, target string) error {
 		}
 	}
 	return nil
-}
-
-// applyEntryMetadata reapplies mode bits (full ModeBits when known, else the
-// perm-only Mode), owner (root only) and mtime to a restored regular file.
-func applyEntryMetadata(targetPath string, entry SnapshotFile, applyOwnership bool) []string {
-	var warnings []string
-	switch {
-	case entry.ModeBits != 0:
-		if err := os.Chmod(targetPath, os.FileMode(entry.ModeBits)); err != nil {
-			warnings = append(warnings, fmt.Sprintf("could not reapply mode %o to %s: %v", entry.ModeBits, entry.SourcePath, err))
-		}
-	case entry.Mode != 0:
-		if err := os.Chmod(targetPath, os.FileMode(entry.Mode).Perm()); err != nil {
-			warnings = append(warnings, fmt.Sprintf("could not reapply mode %o to %s: %v", os.FileMode(entry.Mode).Perm(), entry.SourcePath, err))
-		}
-	}
-	if applyOwnership {
-		if err := applyOwner(targetPath, entry.Owner); err != nil {
-			warnings = append(warnings, fmt.Sprintf("could not reapply owner to %s: %v", entry.SourcePath, err))
-		}
-	}
-	if !entry.ModTime.IsZero() {
-		if err := os.Chtimes(targetPath, entry.ModTime, entry.ModTime); err != nil {
-			warnings = append(warnings, fmt.Sprintf("could not reapply mtime to %s: %v", entry.SourcePath, err))
-		}
-	}
-	// Windows attributes go LAST (#5407): FILE_ATTRIBUTE_READONLY makes the
-	// chmod/chtimes above fail, so they must already have run.
-	if err := applyWinAttrs(targetPath, entry.WinAttrs); err != nil {
-		warnings = append(warnings, fmt.Sprintf("could not reapply windows attributes to %s: %v", entry.SourcePath, err))
-	}
-	return warnings
 }
 
 // RestoreContentlessEntry recreates a symlink or directory entry at
@@ -883,7 +1032,7 @@ func RestoreContentlessEntry(targetPath string, entry SnapshotFile, applyOwnersh
 			return err
 		}
 	default:
-		return fmt.Errorf("entry %s has content; use the file path", entry.SourcePath)
+		return fmt.Errorf("entry %s has content; use the file path", restoreSourcePath(entry))
 	}
 	if applyOwnership {
 		if err := applyOwner(targetPath, entry.Owner); err != nil {
@@ -891,4 +1040,71 @@ func RestoreContentlessEntry(targetPath string, entry SnapshotFile, applyOwnersh
 		}
 	}
 	return nil
+}
+
+// restrictDirectoriesFirst computes every directory's descriptor plan once
+// and, for each directory to be restricted, creates it and applies the
+// restrictive descriptor now, shallowest first, before any entry beneath it
+// is restored. It returns the plans (by index into dirs), which directories
+// were restricted here, and the relative paths of directories that could not
+// be restricted (reported failed; nothing beneath them is restored).
+func restrictDirectoriesFirst(targetBase string, dirs []SnapshotFile, secDescs *restoreSecurity, applyOwnership bool, result *RestoreResult) (map[int]sdPlan, map[int]bool, []string) {
+	plans := make(map[int]sdPlan, len(dirs))
+	restricted := make(map[int]bool)
+	var blocked []string
+	var order []int
+	for i, d := range dirs {
+		plans[i] = secDescs.entryPlan(d)
+		if plans[i].verdict == sdQuarantine && plans[i].applier != nil {
+			order = append(order, i)
+		}
+	}
+	sort.SliceStable(order, func(a, b int) bool {
+		return strings.Count(restoreSourcePath(dirs[order[a]]), "/")+strings.Count(restoreSourcePath(dirs[order[a]]), `\`) <
+			strings.Count(restoreSourcePath(dirs[order[b]]), "/")+strings.Count(restoreSourcePath(dirs[order[b]]), `\`)
+	})
+	for _, i := range order {
+		d := dirs[i]
+		display := restoreSourcePath(d)
+		rel, err := restoreRelativePath(display)
+		if err != nil {
+			continue // the directory pass reports it
+		}
+		if d.Placeholder {
+			if info, statErr := securefs.StatFile(targetBase, rel); statErr == nil && info.IsDir() {
+				continue // an existing placeholder directory is left untouched
+			}
+		}
+		mode := os.FileMode(d.ModeBits)
+		if !applyOwnership {
+			mode &^= os.ModeSetuid
+		}
+		err = securefs.InstallDir(targetBase, rel, mode, d.ModeBits != 0, entryOwner(d, applyOwnership), d.ModTime)
+		if err == nil {
+			err = securefs.ApplyDirSecurity(targetBase, rel, *plans[i].applier)
+		}
+		if err != nil {
+			blocked = append(blocked, rel)
+			plans[i] = sdPlan{verdict: sdQuarantine, reason: fmt.Sprintf("its directory could not be restricted: %v", err)}
+			continue
+		}
+		restricted[i] = true
+		secDescs.record(result, display, plans[i])
+	}
+	return plans, restricted, blocked
+}
+
+// blockedDirErr reports whether an entry of the link/directory pass must not
+// be restored: it is itself a directory that could not be restricted, or it
+// lies beneath one.
+func blockedDirErr(blocked []string, relative string, dirIndex int, plans map[int]sdPlan) (string, bool) {
+	for _, b := range blocked {
+		if relative == b && dirIndex >= 0 {
+			return plans[dirIndex].reason, true
+		}
+		if strings.HasPrefix(relative, b+string(filepath.Separator)) {
+			return "its directory could not be restricted", true
+		}
+	}
+	return "", false
 }

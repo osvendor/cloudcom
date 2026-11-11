@@ -39,12 +39,14 @@ import { aiOperatorTasks } from '../../db/schema/aiOperatorTasks';
 import { aiOperatorTaskSteps, aiOperatorTaskTargets } from '../../db/schema/aiOperatorTaskGraph';
 import { ticketChecklistItems } from '../../db/schema/ticketChecklists';
 import { ticketComments } from '../../db/schema/portal';
-import { createTicket } from '../ticketService';
+import { createTicket, type TicketActor } from '../ticketService';
 import { createNotification } from '../userNotifications';
 import { createTaskTarget } from './targetService';
 import { appendTaskEvent } from './eventService';
 import { markStepWaiting, openStep } from './stepService';
 import { enqueueTaskOutbox } from './taskOutbox';
+import { lockTicketForWrite } from '../ticketRowLock';
+import { assertTicketNotMerged, isMergedTombstone } from '../ticketMerge/errors';
 
 /** Mirrors `ticket_checklist_items.label` varchar(500). */
 const MAX_ITEM_LABEL_CHARS = 500;
@@ -64,10 +66,11 @@ const HUMAN_WORK_REMINDER_SCAN_LIMIT = 50;
  * nullability is the documented system-provenance marker there;
  * `source = 'operator_task'` is what says where the row came from.
  */
-export const OPERATOR_TASK_ACTOR = {
-  userId: '00000000-0000-0000-0000-000000000000',
+export const OPERATOR_TASK_ACTOR: TicketActor = {
+  kind: 'system',
+  source: 'ai_operator',
   name: 'AI Operator',
-} as const;
+};
 
 /**
  * The `transitionSeq` for a `user_answer` wake.
@@ -230,6 +233,8 @@ export async function openHumanWorkStep(
 
   const now = input.now ?? new Date();
   const { ticketId } = await ensureTaskTicket(dbh, input.task);
+  // #8972 W0: ticket first, before the MAX(position) read and the item writes.
+  assertTicketNotMerged(await lockTicketForWrite(dbh, ticketId));
 
   // Append at the end of the ticket's list, same rule as addChecklistItem
   // (ticketChecklistService.ts). Duplicated rather than imported: the import
@@ -477,6 +482,35 @@ export async function assertChecklistItemDeletable(
 }
 
 /**
+ * The bulk twin of assertChecklistItemDeletable, for a delete that removes a
+ * ticket's UNTICKED items in one statement (a checklist template applied with
+ * `replace_unticked`). Same reason, same refusal: the FK is `ON DELETE SET
+ * NULL`, so the bulk delete would silently strand every waiting step on it.
+ */
+export async function assertTicketUntickedChecklistItemsDeletable(
+  ticketId: string,
+  dbh: HumanWorkDbHandle = db,
+): Promise<void> {
+  const [waiting] = await dbh
+    .select({ stepKey: aiOperatorTaskSteps.stepKey })
+    .from(aiOperatorTaskSteps)
+    .innerJoin(ticketChecklistItems, eq(ticketChecklistItems.id, aiOperatorTaskSteps.checklistItemId))
+    .where(and(
+      eq(ticketChecklistItems.ticketId, ticketId),
+      isNull(ticketChecklistItems.doneAt),
+      eq(aiOperatorTaskSteps.state, 'waiting'),
+    ))
+    .limit(1);
+
+  if (waiting) {
+    throw new HumanWorkStepWaitingError(
+      'An unticked step on this ticket belongs to a running AI Operator task, so it cannot be replaced while the task is waiting on it. '
+      + 'Apply the template with mode append, tick the step when the work is done, or stop the task first.',
+    );
+  }
+}
+
+/**
  * Detach every human-work link on a ticket and wake the tasks behind them.
  *
  * Called by `moveTicketOrg`. It nulls the STEP's pointer — not the item's
@@ -611,6 +645,11 @@ export async function sendHumanWorkReminders(now: Date = new Date()): Promise<nu
         .limit(HUMAN_WORK_REMINDER_SCAN_LIMIT);
 
       for (const row of overdue) {
+        // #8972 W0: ticket first. The reminder comment below reaches the ticket
+        // anyway (FK + feed trigger); taking it before the step stamp keeps
+        // this sweep in the order moveTicketOrg uses (ticket, then the step).
+        // #8972 W1: a merged tombstone is skipped (its checklist moved to the survivor).
+        if (isMergedTombstone(await lockTicketForWrite(db, row.ticketId))) continue;
         // The stamp is a guarded UPDATE: a concurrent reconciler tick that
         // selected the same row loses here and skips the side-effects, so two
         // ticks cannot both post the comment.

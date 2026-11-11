@@ -32,6 +32,7 @@ vi.mock('./BrandHeader', () => ({ default: () => null }));
 
 import Sidebar, { navSections, topLevelNav } from './Sidebar';
 import { GO_TO_SHORTCUTS } from '../../lib/keyboard/goToShortcuts';
+import { SETTINGS_CATALOG } from '../../lib/settingsCatalog';
 import { i18n, loadLocale } from '../../lib/i18n';
 import en from '../../locales/en/common.json';
 import ptBR from '../../locales/pt-BR/common.json';
@@ -83,7 +84,7 @@ describe('navSections structure (#1321, #1324)', () => {
     expect(names).toEqual(['Device Backup', 'Cloud Backup', 'Disaster Recovery']);
   });
 
-  it('keeps Network Monitor out of Security (lives under Fleet Management)', () => {
+  it('keeps Network out of Security (lives under Fleet Management)', () => {
     expect(hrefsOf('security')).not.toContain('/monitoring');
     // Security still leads with its own Security item.
     expect(section('security').items[0].href).toBe('/security');
@@ -94,6 +95,7 @@ describe('navSections structure (#1321, #1324)', () => {
     // time is service-desk work, not billing document work).
     expect(hrefsOf('billing')).toEqual([
       '/billing/quotes',
+      '/billing/autopay',
       '/billing/invoices',
       '/contracts',
       // W03 — the agreement library left /contracts for its own area.
@@ -103,20 +105,37 @@ describe('navSections structure (#1321, #1324)', () => {
       // nav entry under Billing.
       '/settings/deliverable-templates',
     ]);
-    expect(hrefsOf('service-desk')).toEqual(['/tickets', '/timesheet']);
+    expect(hrefsOf('service-desk')).toEqual([
+      '/tickets',
+      // #7900 W3 — one entry per ticket type (filtered via the hash).
+      '/tickets#type=incident',
+      '/tickets#type=service_request',
+      '/tickets#type=problem',
+      '/tickets#type=change',
+      '/timesheet',
+    ]);
     expect(hrefsOf('fleet-management')).toEqual([
       '/devices/groups',
+      // #9794 — Sites sits next to Device Groups (spec Decision 1).
+      '/settings/sites',
+      // Parked devices awaiting assignment (full partner admins only).
+      '/devices/unassigned',
       '/configuration-policies',
       '/software',
+      '/software-inventory',
+      '/software-policies',
       '/monitoring',
       '/discovery',
       '/onedrive',
+      '/endpoint-messages',
     ]);
   });
 
   it('keeps every AI surface together and every platform-admin surface in Administration', () => {
+    // #10135: Wisp · Breeze AI · Workers{…} · Breeze AI for Office (the Workers
+    // heading is not an item; see Sidebar.aiSection.test.tsx).
     expect(hrefsOf('ai')).toEqual([
-      '/fleet', '/workspace', '/settings/ai-agents', '/ai-agents/runs', '/ai-agents/impact', '/ai-agents/fleet-design', '/settings/ai-usage', '/settings/ai-script-authoring', '/settings/tool-sources', '/ai-for-office',
+      '/wisp', '/ai/chat', '/settings/ai-agents', '/ai-agents/runs', '/operator', '/fleet', '/ai-agents/impact', '/ai-for-office',
     ]);
     const admin = section('administration');
     expect(admin.items.length).toBeGreaterThan(0);
@@ -128,21 +147,15 @@ describe('navSections structure (#1321, #1324)', () => {
     expect(topLevelNav.map((i) => i.href)).not.toContain('/onedrive');
   });
 
-  it('labels the AI usage entry "AI Usage" — the budget editor moved to org settings (#6004)', () => {
-    const item = section('ai').items.find((i) => i.href === '/settings/ai-usage');
-    expect(item?.name).toBe('AI Usage');
-    expect(item?.labelKey).toBe('nav.aiUsage');
-  });
-
-  it('adds a Script authoring entry to the AI section, after AI Usage (#5612 W05)', () => {
-    const item = section('ai').items.find((i) => i.href === '/settings/ai-script-authoring');
-    expect(item).toBeDefined();
-    expect(item?.labelKey).toBe('nav.scriptAuthoring');
-    expect(item?.requiredPermission).toEqual({ resource: 'ai_agents', action: 'read' });
-    const hrefs = hrefsOf('ai');
-    const usageIdx = hrefs.indexOf('/settings/ai-usage');
-    const scriptIdx = hrefs.indexOf('/settings/ai-script-authoring');
-    expect(scriptIdx).toBe(usageIdx + 1);
+  it('moves AI Usage (#6004) and Script authoring (#5612 W05) to Settings → AI (#10135)', () => {
+    expect(hrefsOf('ai')).not.toContain('/settings/ai-usage');
+    expect(hrefsOf('ai')).not.toContain('/settings/ai-script-authoring');
+    expect(SETTINGS_CATALOG.find((e) => e.href === '/settings/ai-usage')).toMatchObject({
+      group: 'ai', name: 'AI Usage', labelKey: 'nav.aiUsage', partnerScopeOnly: true,
+    });
+    expect(SETTINGS_CATALOG.find((e) => e.href === '/settings/ai-script-authoring')).toMatchObject({
+      group: 'ai', labelKey: 'nav.scriptAuthoring', requiredPermission: { resource: 'ai_agents', action: 'read' },
+    });
   });
 
   it('each moved href appears in exactly one section (no duplicate membership)', () => {
@@ -176,11 +189,11 @@ describe('navSections structure (#1321, #1324)', () => {
     expect(jobs.requiredPermission).toEqual({ resource: 'automations', action: 'read' });
   });
 
-  it('labels /monitoring as Network Monitor again — monitor config moved under Alerts (2026-09-13)', () => {
+  it('labels /monitoring as Network — checks are authored under Alerts → Monitors (W05e)', () => {
     const item = navSections
       .find((s) => s.id === 'fleet-management')!
       .items.find((i) => i.href === '/monitoring')!;
-    expect(item.name).toBe('Network Monitor');
+    expect(item.name).toBe('Network');
     expect(item.labelKey).toBe('nav.networkMonitor');
   });
 
@@ -192,6 +205,23 @@ describe('navSections structure (#1321, #1324)', () => {
     expect(item?.partnerScopeOnly).toBe(true);
   });
 
+  it('lists one platform-admin-only System entry in Administration, replacing the Deprecations entry (system page W02)', () => {
+    const item = section('administration').items.find((i) => i.href === '/admin/system');
+    expect(item, 'Administration section should link to /admin/system').toBeDefined();
+    expect(item?.labelKey).toBe('nav.system');
+    expect(item?.platformAdminOnly).toBe(true);
+    const allHrefs = navSections.flatMap((s) => s.items.map((i) => i.href));
+    expect(allHrefs.filter((h) => h === '/admin/system')).toHaveLength(1);
+    expect(allHrefs).not.toContain('/settings/system/deprecations');
+  });
+
+  // D4 (v0.116.0 sweep): /admin/monitor-conversion existed with no nav entry.
+  it('lists a platform-admin-only Monitor Conversion entry in Administration', () => {
+    const item = section('administration').items.find((i) => i.href === '/admin/monitor-conversion');
+    expect(item, 'Administration section should link to /admin/monitor-conversion').toBeDefined();
+    expect(item?.platformAdminOnly).toBe(true);
+  });
+
   it('lists Deliverable Templates under the Billing section (M3, #6224)', () => {
     const item = section('billing').items.find((i) => i.href === '/settings/deliverable-templates');
     expect(item, 'Billing section should link to /settings/deliverable-templates').toBeDefined();
@@ -201,11 +231,37 @@ describe('navSections structure (#1321, #1324)', () => {
   });
 });
 
+describe('endpoint messages nav entry', () => {
+  it('lives in Fleet Management, once, gated on endpoint_messages:read', () => {
+    const hits = [...topLevelNav, ...navSections.flatMap((s) => s.items)].filter((i) => i.href === '/endpoint-messages');
+    expect(hits).toHaveLength(1);
+    expect(hits[0]!.labelKey).toBe('nav.endpointMessages');
+    expect(hits[0]!.requiredPermission).toEqual({ resource: 'endpoint_messages', action: 'read' });
+    expect(section('fleet-management').items).toContain(hits[0]);
+  });
+});
+
+describe('sites nav entry (#9794)', () => {
+  it('sits in Fleet Management right after Device Groups, gated only on sites:read (Decisions 1-2)', () => {
+    const hits = [...topLevelNav, ...navSections.flatMap((s) => s.items)].filter((i) => i.href === '/settings/sites');
+    expect(hits).toHaveLength(1);
+    const item = hits[0]!;
+    expect(item.labelKey).toBe('nav.sites');
+    expect(item.testId).toBe('nav-sites');
+    expect(item.requiredPermission).toEqual({ resource: 'sites', action: 'read' });
+    // Shown to org-scoped users and single-site orgs alike: no scope gate.
+    expect(item.partnerScopeOnly).toBeFalsy();
+    const fleet = section('fleet-management').items;
+    expect(fleet.indexOf(item)).toBe(fleet.findIndex((i) => i.href === '/devices/groups') + 1);
+  });
+});
+
 describe('go-to keyboard chords (g then key)', () => {
-  it('every chord targets a top-level nav item and reuses its label key', () => {
+  it('every chord targets a sidebar nav item and reuses its label key', () => {
+    const allNav = [...topLevelNav, ...navSections.flatMap((section) => section.items)];
     for (const shortcut of GO_TO_SHORTCUTS) {
-      const item = topLevelNav.find((nav) => nav.href === shortcut.href);
-      expect(item, `no top-level nav item for g ${shortcut.key} → ${shortcut.href}`).toBeDefined();
+      const item = allNav.find((nav) => nav.href === shortcut.href);
+      expect(item, `no sidebar nav item for g ${shortcut.key} → ${shortcut.href}`).toBeDefined();
       expect(shortcut.labelKey).toBe(item!.labelKey);
     }
   });
@@ -329,22 +385,41 @@ describe('sidebar i18n seed', () => {
     await i18n.changeLanguage('pt-BR');
     render(<Sidebar currentPath="/monitoring" />);
 
-    const nestedLink = await screen.findByText('Monitoramento de Rede');
+    const nestedLink = await screen.findByText('Rede');
     expect(nestedLink.closest('a')).toHaveAttribute('href', '/monitoring');
-    expect(screen.queryByText('Network Monitor')).not.toBeInTheDocument();
+    expect(screen.queryByText('Network')).not.toBeInTheDocument();
   });
 
-  it.each(['/software-inventory', '/software-policies'])(
-    'highlights the single Software item for alias path %s',
+  it('exposes Software, Software Inventory and Software Policies as separate nav links (#7123)', async () => {
+    const { container } = render(<Sidebar currentPath="/" />);
+    await waitFor(() => {
+      for (const href of ['/software', '/software-inventory', '/software-policies']) {
+        expect(container.querySelector(`a[href="${href}"]`), href).not.toBeNull();
+      }
+    });
+  });
+
+  it('gates and labels the new software items like Software (devices:read, own i18n keys)', () => {
+    const items = section('fleet-management').items;
+    for (const [href, labelKey] of [
+      ['/software-inventory', 'nav.softwareInventory'],
+      ['/software-policies', 'nav.softwarePolicies'],
+    ]) {
+      const item = items.find((i) => i.href === href);
+      expect(item?.labelKey, href).toBe(labelKey);
+      expect(item?.requiredPermission, href).toEqual({ resource: 'devices', action: 'read' });
+    }
+  });
+
+  it.each(['/software', '/software-inventory', '/software-policies'])(
+    'highlights only the matching Software item for path %s',
     async (path) => {
       const { container } = render(<Sidebar currentPath={path} />);
-      const link = await waitFor(() => {
-        const a = container.querySelector('a[href="/software"]');
-        expect(a).not.toBeNull();
-        return a as HTMLAnchorElement;
+      await waitFor(() => {
+        expect(container.querySelector(`a[href="${path}"]`)).not.toBeNull();
       });
-      expect(link.className).toContain('bg-primary');
-      expect(container.querySelector(`a[href="${path}"]`)).toBeNull();
+      const active = Array.from(container.querySelectorAll('a.bg-primary')).map((a) => a.getAttribute('href'));
+      expect(active).toEqual([path]);
     },
   );
 
@@ -367,5 +442,9 @@ describe('sidebar i18n seed', () => {
       await waitFor(() => expect(activeHrefIn(container)).toContain('/agreements/templates'));
       unmount();
     }
+  });
+
+  it('does not advertise the retired Alert Templates authoring surface', () => {
+    expect(JSON.stringify(navSections)).not.toContain('/settings/alert-templates');
   });
 });

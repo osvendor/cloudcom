@@ -165,7 +165,7 @@ Each session is stored in the `ai_sessions` table with a `contextSnapshot` that 
 | Rate limit | 30 messages per 60 seconds per device |
 | Maximum message length | 10,000 characters |
 | Turn limit | Configured per session (default from `ai_sessions.maxTurns`) |
-| Model | `claude-sonnet-4-5-20250929` |
+| Model | The partner's or platform's default AI model, resolved when the session is created (Claude Sonnet 5.5 by default from v0.120.0); an existing session keeps its model |
 | Budget | Org-level AI budget applies; sessions are rejected when budget is exhausted |
 
 ### Tool Permission Levels
@@ -303,11 +303,11 @@ All self-service actions are scoped to the single device where the Helper is run
 
 ## Organization Controls
 
-Organizations can enable or disable the Helper chat feature on a per-org basis. The toggle is delivered to agents through the heartbeat response, so changes take effect within 60 seconds without requiring an agent restart.
+Organizations can enable or disable the Helper on a per-org basis. The toggle is delivered to agents through the heartbeat response, so changes take effect within 60 seconds without requiring an agent restart.
 
 ### Enabling / Disabling Helper Chat
 
-The Helper chat toggle is managed through organization settings. When disabled, the Helper tray icon remains visible but the chat interface is hidden.
+The Helper toggle is managed through organization settings or the **Deploy Breeze Assist to devices** toggle on a configuration policy's **Breeze Helper** feature (the policy takes precedence when one applies). A newly created Breeze Helper policy feature starts with the toggle on. When a device's effective Helper setting is off, the agent stops and removes a Helper it installed on its next heartbeat, and the Helper API refuses every request from that device with `403` and code `helper_disabled` ("Breeze Helper is disabled for this device by policy"), so a client can tell it apart from a credential failure.
 
 ```bash
 # Check current helper settings (returned in heartbeat response)
@@ -317,21 +317,25 @@ The Helper chat toggle is managed through organization settings. When disabled, 
 }
 ```
 
-The agent reads `helperEnabled` from each heartbeat response and stores it as an atomic boolean. When the value changes, the Helper is notified to show or hide its chat UI.
+The agent reads `helperEnabled` from each heartbeat response. When the effective setting turns off, the agent stops the Helper in every user session and uninstalls it, provided the agent installed it.
 
-### Hiding the System Tray Icon
+The agent records each Helper install it makes. A Helper installed another way (Intune, a software policy, or by hand) is left alone while the setting is off: the agent does not start, update or remove it, and the device page reports it as not installed by Breeze (`helperInstallIssue: unmanaged_install`). Turning the setting on adopts that copy when the agent installs the next Helper version the server offers.
 
-Tray visibility is a separate setting from deployment. Set **System tray icon** to off in the **Breeze Assist** tab of a configuration policy (`showTrayIcon: false` in the feature link's inline settings) to run the Helper without any tray presence. This is intended for fleets where the MSP wants the Helper's capabilities -- AI chat, remote-access consent prompts, and PAM elevation dialogs -- without a visible icon on end-user machines. Those capabilities do not go through the tray and keep working with the icon hidden.
+On Windows the agent also checks the WebView2 Runtime before it starts the Helper. If the runtime is older than the installed Helper build needs, the agent does not start the Helper and the device reports `webview2_outdated`; update the WebView2 Runtime on the device to clear it. A Helper that keeps closing right after it starts is reported as `crash_loop`, with the exit codes in the agent log, and the agent tries it again after 6 hours or when a new Helper version is installed.
 
-The setting defaults to `true`. It is written to the per-session `helper_config.yaml` as `show_tray_icon` and applied by the Helper within 60 seconds (its config reload loop) -- no restart required.
+The device page's **Breeze Assist** row shows the last reported state: **Installed**, **Not deployed**, or **Unavailable** with the reason (`webview2_outdated`, `crash_loop` or `unmanaged_install`). In the device list these three show as **Assist unavailable**, with the reason in the tooltip, because Assist is on disk in each case. All of this needs agent 0.125.0; an older server shows the new reasons as unknown.
 
-Platform behavior:
+<Aside type="caution" title="Known issue in v0.125.0">
+  Crash-loop detection does not fire yet: a crash-looping Helper keeps restarting and is not reported as `crash_loop` ([#10302](https://github.com/LanternOps/breeze/issues/10302)).
+</Aside>
 
-| Platform | Behavior when `showTrayIcon: false` |
-| --- | --- |
-| Windows | Notification-area icon is hidden. |
-| macOS | Status-bar item is hidden. |
-| Linux | Best effort. The tray is a StatusNotifierItem exported via libappindicator, where hiding marks the item `Passive`. Most hosts (KDE Plasma, the GNOME AppIndicator extension) stop drawing passive items, but a host is free to keep rendering them, so the icon may persist on some desktops. |
+### Window and Tray Behavior
+
+The Helper always runs in the user's session and always shows its tray icon. Its main window starts **hidden**: the agent launches the Helper at logon, after agent or Helper updates, and whenever its session watcher restarts an exited Helper, and none of these put a window on screen. The user opens the window by clicking the tray icon or choosing **Open Breeze Assist** from the tray menu (always present, even when a policy turns off every other item). On macOS, re-opening the app from the Dock or Finder also shows it. Closing the window hides it back to the tray.
+
+The tray menu has no **Exit** item. The agent restarts an exited Helper within about 30 seconds, so Exit only made the window come back. Launching the Helper by hand (Start menu, Dock, double-click) opens the window. The agent always passes `--config`, and a launch without it counts as manual; `--show` forces the window open in either case. On Windows, launching it again while it already runs in the tray shows the running instance's window instead of starting a second copy.
+
+Policies saved before this change may still store `showTrayIcon` in the Breeze Assist inline settings. The key is ignored and dropped the next time the policy is saved.
 
 ### Configuration Endpoint
 
@@ -382,6 +386,30 @@ Authorization: Bearer brz_<helper-token>
 └─────────────────────────────────┘
 ```
 
+### Windows Helper Lifecycle (Always-On vs. On-Demand)
+
+On Windows the agent service starts the helper processes itself, one per interactive session, in two roles: a **SYSTEM helper** (screen capture, input, the PAM approval dialog and consent-prompt handling) and a **user helper** (tray, chat, notifications, user-context scripts). How many it keeps running depends on the lifecycle mode:
+
+| Mode | Behavior |
+|------|----------|
+| `always-on` | A SYSTEM helper and a user helper in every eligible session, all the time. Default on workstations and on Windows Server without the RD Session Host role. |
+| `on-demand` | No helpers at rest. A helper is started when an operation needs one (a remote desktop connection or a script targeted at a session) and stopped about two minutes after the operation ends. Default on RD Session Hosts, where one helper per session per user adds up. |
+
+**PAM on on-demand hosts.** While the device's effective PAM policy has UAC interception enabled, an on-demand host also keeps a SYSTEM helper in every session a user is signed into. The SYSTEM helper shows the elevation dialog and handles `consent.exe`, and a UAC prompt can appear at any time. Sessions at the logon screen and disconnected sessions get no PAM helper. User helpers stay on-demand. When the policy turns interception off, those SYSTEM helpers are stopped on the next reconcile. If an elevation request arrives before the helper for that session is up (for example, right after the user signs in), the agent starts one for that session and waits up to 30 seconds for it. If no helper comes up, the agent logs an error. When it gives up on the request (the session exists but is not active or connected, or the helper did not start: crash cooldown, repeated failures, or not ready within the 30-second wait, after which the user's UAC prompt is no longer being handled), it reports that to the server. When it cannot tell (the session could not be resolved, the session check itself failed or the session was not in the list, the session dropped out of the list while the agent waited, the helper lease was refused, the helper came up but the agent could not find it, or the agent is still starting and its helper manager is not up yet), it leaves the request pending for the stale-request expiry (`PAM_PENDING_REQUEST_TTL_MINUTES`, 15 minutes by default) rather than close a request it might still handle. A request still waiting for a technician is then closed as expired, so nobody can approve it, and the PAM requests list shows that the device could not act under its Expired or All filter, with the agent's reason as a tooltip. Agents older than this report leave the request pending until the stale-request expiry closes it.
+
+**Choosing the mode.** The agent resolves the mode in this order:
+
+1. **Local agent config.** `helper_lifecycle_mode` in `agent.yaml`, or the `BREEZE_HELPER_LIFECYCLE_MODE` environment variable. Values: `always-on`, `on-demand`, or `auto`. Use this when you need to override the mode on one machine. It always wins, so the policy setting below has no effect on that device. Restart the agent service after changing it.
+2. **Configuration policy.** The **Helper lifecycle on RD Session Hosts** setting on the policy's Breeze Helper feature (`auto`, `always-on`, `on-demand`). Applied live from the heartbeat.
+3. **Auto-detection.** With neither set (or both `auto`), RD Session Hosts run on-demand and every other machine runs always-on.
+
+```yaml
+# agent.yaml: force a helper in every session on this host
+helper_lifecycle_mode: always-on
+```
+
+The agent logs the resolved mode at startup (`helper lifecycle mode resolved`, with `mode`, `rdsHost`, and `override` fields) and reports it in its heartbeat.
+
 ### IPC Message Types
 
 The Helper communicates with the agent service over a local IPC connection (Unix domain socket on Linux/macOS, named pipe on Windows). Messages are typed envelopes with JSON payloads.
@@ -418,6 +446,19 @@ The Helper communicates with the agent service over a local IPC connection (Unix
 - **API authentication**: Chat requests to the API use a dedicated helper-scoped `brz_` bearer token -- issued at enrollment alongside, but distinct from, the agent's own token -- validated by SHA-256 hash lookup against the `devices.helperTokenHash` column (not `agentTokenHash`).
 - **Org isolation**: All API queries include an organization condition derived from the device's `orgId`, ensuring the Helper cannot access data from other organizations.
 
+### How the Helper receives its token
+
+The agent hands the helper-scoped token to the Helper over the authenticated local IPC channel, and the Helper prefers that copy (v0.119.0+). On disk the token is kept only in the agent's protected secrets file (`secrets.yaml`, readable by SYSTEM/Administrators on Windows and by root on Linux and macOS). It is no longer written to `agent.yaml` on any platform (v0.120.0+).
+
+- **Windows:** the IPC channel is the only way the Helper gets its token. When an upgraded agent first starts, it moves any token an older agent left in `agent.yaml` into `secrets.yaml` and then rotates the token once, on its next successful heartbeat. The Helper keeps working through the rotation: the agent keeps delivering the old token until the server confirms the new one, then pushes the new one.
+- **macOS and Linux:** unchanged. The Helper also receives the token over IPC, with the `breeze`-group `helper_token.yaml` file as its on-disk fallback.
+
+<Aside type="caution" title="Windows: Breeze Assist works only in the console session">
+  On Windows the agent delivers the token only to the Helper running in the **active console session**. A Helper running in an RDP or other non-console session does not receive it and shows a message that it has not received its credentials. This is a known limitation in v0.120.0.
+
+  A Helper older than v0.119.0 that starts after the agent upgrade reports that it is still setting up until the Helper update installs; one that was already running keeps working.
+</Aside>
+
 ---
 
 ## API Reference
@@ -445,7 +486,7 @@ Some tools run on the end-user's machine rather than the server -- for example, 
 | POST | `/helper/screenshots` | Upload a screenshot for AI analysis |
 
 <Aside>
-  All Helper endpoints require a valid helper bearer token (`Authorization: Bearer brz_...`) -- a separate credential from the agent's own token, issued to the device at enrollment time. The token is validated by hashing with SHA-256 and matching against the `helperTokenHash` column in the `devices` table. Decommissioned and quarantined devices are rejected with 403.
+  All Helper endpoints require a valid helper bearer token (`Authorization: Bearer brz_...`) -- a separate credential from the agent's own token, issued to the device at enrollment time. The token is validated by hashing with SHA-256 and matching against the `helperTokenHash` column in the `devices` table. Decommissioned and quarantined devices are rejected with 403, and so is a device whose effective Helper setting is off (`helper_disabled`).
 </Aside>
 
 ### Creating a Session
@@ -504,13 +545,13 @@ The end user does not approve tool calls from inside the Helper chat -- there is
 ## Troubleshooting
 
 **Helper tray icon does not appear.**
-First check whether it was hidden on purpose: a configuration policy with **System tray icon** off (`showTrayIcon: false`) suppresses it deliberately. Otherwise, the Helper requires a display server to show the tray icon. On Linux, verify that `DISPLAY` or `WAYLAND_DISPLAY` is set in the user session. On Windows, the Helper is spawned by the session broker -- check agent logs for "starting helper in session" messages. If the agent service is not running, the Helper cannot start.
-
-**Tray icon still visible on Linux after turning "System tray icon" off.**
-Expected on some desktops. Hiding an appindicator sets it to `Passive`; hosts that render passive items keep showing it. The Helper's other functions are unaffected. See the platform table under [Hiding the System Tray Icon](#hiding-the-system-tray-icon).
+The Helper requires a display server to show the tray icon. On Linux, verify that `DISPLAY` or `WAYLAND_DISPLAY` is set in the user session. On Windows, the Helper is spawned by the session broker -- check agent logs for "starting helper in session" messages. If the agent service is not running, the Helper cannot start.
 
 **"Invalid agent credentials" when Helper tries to chat.**
 The Helper authenticates to the API using its own helper-scoped `brz_` token, separate from the agent's own token. If the device was re-enrolled or the token was rotated, the Helper's cached token may be stale. Restart the agent service to pick up the new token. Also verify the device is not in `decommissioned` or `quarantined` status.
+
+**Breeze Assist says it has not received its credentials (Windows).**
+On Windows the Helper gets its token only over IPC from the agent, and only in the active console session. If the user is connected over RDP or another non-console session, Assist cannot get a token there (a known limitation). In a console session, confirm the agent service is running and the Helper is v0.119.0 or later; an older Helper reports that it is still setting up until its update installs.
 
 **AI chat returns "Rate limit exceeded."**
 The Helper enforces a rate limit of 30 messages per 60 seconds per device. Wait for the window to reset before sending another message. If multiple users share a device, they share the same rate limit.

@@ -86,9 +86,12 @@ export interface PackageVersionMetadata {
   releaseNotes?: string;
   silentInstallArgs?: string;
   silentUninstallArgs?: string;
+  preInstallScript?: string;
+  postInstallScript?: string;
   downloadUrl?: string;
   supportedOs?: string[];
   detectionRules?: DetectionRule[];
+  successExitCodes?: number[];
 }
 
 export interface UploadPackageVersionOptions {

@@ -10,6 +10,8 @@ describe('safeNextPath', () => {
     ['/profile', '/profile'],
     ['/remote', '/remote'],
     ['/remote/approved-session', '/remote/approved-session'],
+    ['/approvals', '/approvals'],
+    ['/approvals#3f2a', '/approvals#3f2a'],
     ['/invoices/abc?paid=1', '/invoices/abc?paid=1'],
   ])('accepts in-app route %j', (input, expected) => {
     expect(safeNextPath(input)).toBe(expected);

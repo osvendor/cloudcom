@@ -1,11 +1,13 @@
 import '@/lib/i18n';
 import { useTranslation } from 'react-i18next';
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import ApiKeyList, { type ApiKey } from './ApiKeyList';
 import ApiKeyForm, { CreatedKeyModal, type ApiKeyFormValues } from './ApiKeyForm';
-import { fetchWithAuth } from '../../stores/auth';
+import { fetchWithAuth, handleSessionExpired } from '../../stores/auth';
 import { useOrgStore } from '../../stores/orgStore';
 import { navigateTo } from '@/lib/navigation';
+import { ActionError, runAction, handleActionError } from '@/lib/runAction';
+import { showToast } from '../shared/Toast';
 
 type ModalMode = 'closed' | 'create' | 'view' | 'rotate' | 'revoke';
 
@@ -13,6 +15,10 @@ export default function ApiKeysPage() {
   const { t } = useTranslation('settings');
   const [apiKeys, setApiKeys] = useState<ApiKey[]>([]);
   const [loading, setLoading] = useState(true);
+  // Background refetches (after create/rotate/revoke/page change) keep the rows
+  // and open modals on screen; only the first load replaces the page (#9656).
+  const [refreshing, setRefreshing] = useState(false);
+  const hasLoadedRef = useRef(false);
   const [error, setError] = useState<string>();
   const [modalMode, setModalMode] = useState<ModalMode>('closed');
   const [selectedKey, setSelectedKey] = useState<ApiKey | null>(null);
@@ -29,7 +35,8 @@ export default function ApiKeysPage() {
 
   const fetchApiKeys = useCallback(async (page = 1) => {
     try {
-      setLoading(true);
+      if (hasLoadedRef.current) setRefreshing(true);
+      else setLoading(true);
       setError(undefined);
       const response = await fetchWithAuth(`/api-keys?page=${page}`);
       if (!response.ok) {
@@ -47,10 +54,12 @@ export default function ApiKeysPage() {
         setCurrentPage(pagination.page ?? page);
       }
       setIsAdmin(data.isAdmin ?? false);
+      hasLoadedRef.current = true;
     } catch (err) {
       setError(err instanceof Error ? err.message : t('apiKeysPage.anErrorOccurred'));
     } finally {
       setLoading(false);
+      setRefreshing(false);
     }
   }, []);
 
@@ -91,29 +100,33 @@ export default function ApiKeysPage() {
     fetchApiKeys(page);
   };
 
+  // Create / rotate / revoke all run inside a fixed z-50 modal, so the page's
+  // `error` banner renders behind the scrim and a failure there is invisible
+  // (#3531). Each mutation goes through runAction, which toasts the failure;
+  // the modal stays open so the operator can retry or cancel, and the list is
+  // only refetched after a confirmed success.
   const handleCreateSubmit = async (values: ApiKeyFormValues) => {
+    const targetOrgId = values.orgId ?? currentOrgId;
+    if (!targetOrgId) {
+      showToast({ type: 'error', message: t('apiKeysPage.noOrganizationSelected') });
+      return;
+    }
     setSubmitting(true);
     try {
-      const targetOrgId = values.orgId ?? currentOrgId;
-      if (!targetOrgId) {
-        throw new Error(t('apiKeysPage.noOrganizationSelected'));
-      }
-      const response = await fetchWithAuth('/api-keys', {
-        method: 'POST',
-        body: JSON.stringify({ ...values, orgId: targetOrgId })
+      const data = await runAction<{ key?: string }>({
+        request: () =>
+          fetchWithAuth('/api-keys', {
+            method: 'POST',
+            body: JSON.stringify({ ...values, orgId: targetOrgId })
+          }),
+        errorFallback: t('apiKeysPage.failedToCreateAPIKey'),
+        onUnauthorized: handleSessionExpired,
       });
-
-      if (!response.ok) {
-        const err = await response.json().catch(() => null);
-        throw new Error(err?.error || t('apiKeysPage.failedToCreateAPIKey'));
-      }
-
-      const data = await response.json();
-      setCreatedKey(data.key);
+      setCreatedKey(data?.key ?? null);
       await fetchApiKeys(currentPage);
       handleCloseModal();
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('apiKeysPage.anErrorOccurred'));
+      handleActionError(err, t('apiKeysPage.failedToCreateAPIKey'));
     } finally {
       setSubmitting(false);
     }
@@ -124,20 +137,19 @@ export default function ApiKeysPage() {
 
     setSubmitting(true);
     try {
-      const response = await fetchWithAuth(`/api-keys/${selectedKey.id}/rotate`, {
-        method: 'POST'
+      const data = await runAction<{ key?: string }>({
+        request: () =>
+          fetchWithAuth(`/api-keys/${selectedKey.id}/rotate`, {
+            method: 'POST'
+          }),
+        errorFallback: t('apiKeysPage.failedToRotateAPIKey'),
+        onUnauthorized: handleSessionExpired,
       });
-
-      if (!response.ok) {
-        throw new Error(t('apiKeysPage.failedToRotateAPIKey'));
-      }
-
-      const data = await response.json();
-      setCreatedKey(data.key);
+      setCreatedKey(data?.key ?? null);
       await fetchApiKeys(currentPage);
       handleCloseModal();
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('apiKeysPage.anErrorOccurred'));
+      handleActionError(err, t('apiKeysPage.failedToRotateAPIKey'));
     } finally {
       setSubmitting(false);
     }
@@ -148,18 +160,27 @@ export default function ApiKeysPage() {
 
     setSubmitting(true);
     try {
-      const response = await fetchWithAuth(`/api-keys/${selectedKey.id}`, {
-        method: 'DELETE'
+      await runAction({
+        request: () =>
+          fetchWithAuth(`/api-keys/${selectedKey.id}`, {
+            method: 'DELETE'
+          }),
+        successMessage: t('apiKeysPage.revokedToast', { name: selectedKey.name }),
+        errorFallback: t('apiKeysPage.failedToRevokeAPIKey'),
+        onUnauthorized: handleSessionExpired,
       });
-
-      if (!response.ok) {
-        throw new Error(t('apiKeysPage.failedToRevokeAPIKey'));
-      }
-
       await fetchApiKeys(currentPage);
       handleCloseModal();
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('apiKeysPage.anErrorOccurred'));
+      // A 404 means the key is already gone (revoked/deleted elsewhere) —
+      // retrying can't help, so close the modal and refetch instead of
+      // leaving a stale row and an open confirm on screen (sweep A2).
+      if (err instanceof ActionError && err.status === 404) {
+        await fetchApiKeys(currentPage);
+        handleCloseModal();
+        return;
+      }
+      handleActionError(err, t('apiKeysPage.failedToRevokeAPIKey'));
     } finally {
       setSubmitting(false);
     }
@@ -208,6 +229,13 @@ export default function ApiKeysPage() {
           </svg>
           {t('apiKeysPage.createKey')}</button>
       </div>
+
+      {refreshing && (
+        <div role="status" className="flex items-center gap-2 text-xs text-muted-foreground">
+          <div className="h-3 w-3 animate-spin rounded-full border-2 border-primary border-t-transparent" />
+          {t('apiKeysPage.loadingAPIKeys')}
+        </div>
+      )}
 
       {error && (
         <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">

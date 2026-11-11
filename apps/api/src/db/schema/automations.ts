@@ -26,6 +26,10 @@ export const automationDeviceResultStatusEnum = pgEnum('automation_device_result
 export const automationActionResultStatusEnum = pgEnum('automation_action_result_status', [
   'pending', 'queued', 'delivered', 'running',
   'succeeded', 'failed', 'skipped', 'timed_out', 'cancelled',
+  // #3189 — the per-action dispatch claim (pending -> dispatching CAS), taken
+  // in the same transaction that creates the action's effect. Appended last:
+  // the enum is order-sensitive for drift; its progress rank lives in code.
+  'dispatching',
 ]);
 export const automationActionTerminalSourceEnum = pgEnum('automation_action_terminal_source', [
   'command', 'script_execution', 'deployment_result', 'timeout', 'cancellation', 'reaper', 'dispatch',
@@ -69,6 +73,12 @@ export const automations = pgTable('automations', {
   retiredAt: timestamp('retired_at', { withTimezone: true }),
   retiredReason: text('retired_reason'),
   convertedToMonitorId: uuid('converted_to_monitor_id'),
+  /**
+   * Tool Catalog W06 (#5221): the flow a switched conversion handed this Job to.
+   * Set only with retired_reason = 'converted_to_flow' (automations_converted_flow_chk);
+   * FK → flows ON DELETE SET NULL in SQL (no .references(): keeps schema imports acyclic).
+   */
+  convertedToFlowId: uuid('converted_to_flow_id'),
   name: varchar('name', { length: 255 }).notNull(),
   description: text('description'),
   enabled: boolean('enabled').notNull().default(true),
@@ -84,6 +94,9 @@ export const automations = pgTable('automations', {
   updatedAt: timestamp('updated_at').defaultNow().notNull()
 }, (table) => ({
   partnerIdIdx: index('automations_partner_id_idx').on(table.partnerId),
+  convertedToFlowIdx: index('automations_converted_to_flow_idx')
+    .on(table.convertedToFlowId)
+    .where(sql`${table.convertedToFlowId} IS NOT NULL`),
 }));
 
 // Durable ownership snapshot for every resource referenced by a standalone
@@ -130,7 +143,7 @@ export const automationResourceBindings = pgTable('automation_resource_bindings'
 
 export const automationRuns = pgTable('automation_runs', {
   id: uuid('id').primaryKey().defaultRandom(),
-  automationId: uuid('automation_id').references(() => automations.id),
+  automationId: uuid('automation_id').references(() => automations.id, { onDelete: 'cascade' }),
   configPolicyId: uuid('config_policy_id'),
   configItemName: varchar('config_item_name', { length: 200 }),
   triggeredBy: varchar('triggered_by', { length: 255 }).notNull(),
@@ -145,8 +158,23 @@ export const automationRuns = pgTable('automation_runs', {
   startedAt: timestamp('started_at').defaultNow().notNull(),
   completedAt: timestamp('completed_at'),
   logs: jsonb('logs').default([]),
+  /**
+   * #3189 — the trigger occurrence this run was minted for (`schedule:<slot>`,
+   * `event:<eventId>`, or `<configPolicyAutomationId>:schedule:<slot>`). A
+   * replayed trigger job conflicts on the partial unique indexes below and
+   * reuses the existing run. NULL for manual, webhook and subject-response
+   * runs, which are never deduplicated this way.
+   */
+  occurrenceKey: varchar('occurrence_key', { length: 255 }),
   createdAt: timestamp('created_at').defaultNow().notNull()
-});
+}, (table) => ({
+  automationOccurrenceUnique: uniqueIndex('automation_runs_automation_occurrence_uq')
+    .on(table.automationId, table.occurrenceKey)
+    .where(sql`${table.automationId} IS NOT NULL AND ${table.occurrenceKey} IS NOT NULL`),
+  configPolicyOccurrenceUnique: uniqueIndex('automation_runs_config_policy_occurrence_uq')
+    .on(table.configPolicyId, table.occurrenceKey)
+    .where(sql`${table.automationId} IS NULL AND ${table.occurrenceKey} IS NOT NULL`),
+}));
 
 // Per-device execution result for a single automation run (#2023). A child of
 // automation_runs, one row per targeted device, giving the consolidated
@@ -212,6 +240,9 @@ export const automationActionResults = pgTable('automation_action_results', {
   output: text('output'),
   error: text('error'),
   completedAt: timestamp('completed_at', { withTimezone: true }),
+  /** #7188 — set by CAS when an attempt claims this failed action's
+   * on-failure notification; a replay sends only while it is NULL. */
+  failureNotifiedAt: timestamp('failure_notified_at', { withTimezone: true }),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
 }, (table) => [
@@ -265,10 +296,10 @@ export const automationPolicies = pgTable('automation_policies', {
 
 export const automationPolicyCompliance = pgTable('automation_policy_compliance', {
   id: uuid('id').primaryKey().defaultRandom(),
-  policyId: uuid('policy_id').references(() => automationPolicies.id),
+  policyId: uuid('policy_id').references(() => automationPolicies.id, { onDelete: 'cascade' }),
   configPolicyId: uuid('config_policy_id'),
   configItemName: varchar('config_item_name', { length: 200 }),
-  deviceId: uuid('device_id').notNull().references(() => devices.id),
+  deviceId: uuid('device_id').notNull().references(() => devices.id, { onDelete: 'cascade' }),
   status: complianceStatusEnum('status').notNull().default('pending'),
   details: jsonb('details'),
   lastCheckedAt: timestamp('last_checked_at'),

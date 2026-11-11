@@ -193,3 +193,56 @@ func TestInstalledPatchesToMaps_WingetVendorFromId(t *testing.T) {
 		t.Errorf("items[1].vendor = %v, want empty", got)
 	}
 }
+
+// #9387: the severity provenance travels with the patch so the API can show a
+// derived rating as derived. Omitted (not defaulted) when the provider has no
+// provenance to report, so the API can tell "no signal" from a real value.
+func TestAvailablePatchesToMaps_SeveritySource(t *testing.T) {
+	h := &Heartbeat{}
+	items := h.availablePatchesToMaps([]patching.AvailablePatch{
+		{ID: "a", Provider: "windows-update", Title: "Cumulative Update", KBNumber: "KB1", Severity: "important", SeveritySource: patching.SeveritySourceDerived},
+		{ID: "b", Provider: "windows-update", Title: "Security Update", KBNumber: "KB2", Severity: "critical", SeveritySource: patching.SeveritySourceVendor},
+		{ID: "c", Provider: "windows-update", Title: "Driver", KBNumber: "KB3", Severity: "unknown"},
+		// An unknown severity never carries provenance, even if a provider set one.
+		{ID: "d", Provider: "windows-update", Title: "Driver", KBNumber: "KB4", Severity: "unknown", SeveritySource: patching.SeveritySourceDerived},
+		{ID: "e", Provider: "windows-update", Title: "Driver", KBNumber: "KB5", SeveritySource: patching.SeveritySourceDerived},
+	})
+	if got := items[0]["severitySource"]; got != "derived" {
+		t.Errorf("derived item severitySource = %v, want derived", got)
+	}
+	if got := items[1]["severitySource"]; got != "vendor" {
+		t.Errorf("vendor item severitySource = %v, want vendor", got)
+	}
+	for _, i := range []int{2, 3, 4} {
+		if _, ok := items[i]["severitySource"]; ok {
+			t.Errorf("unrated item %d carries severitySource = %v, want key omitted", i, items[i]["severitySource"])
+		}
+	}
+}
+
+// #11073: the Windows Update type travels per device, and only from a provider
+// that has one. An API that predates the field ignores it; an absent field means
+// "not vendor managed", so nothing may be defaulted here.
+func TestPendingPatchIncludesUpdateType(t *testing.T) {
+	h := &Heartbeat{}
+	items := h.availablePatchesToMaps([]patching.AvailablePatch{
+		{ID: "a", Provider: "windows-update", Title: "Dell driver", ReportedUpdateType: patching.ReportedUpdateTypeDriver, ReportedUpdateOwner: "dell"},
+		{ID: "b", Provider: "windows-update", Title: "Surface firmware", ReportedUpdateType: patching.ReportedUpdateTypeFirmware},
+		{ID: "Mozilla.Firefox", Provider: "winget", Title: "Firefox"},
+	})
+	if got := items[0]["reportedUpdateType"]; got != "driver" {
+		t.Errorf("driver item reportedUpdateType = %v, want driver", got)
+	}
+	if got := items[0]["reportedUpdateOwner"]; got != "dell" {
+		t.Errorf("driver item reportedUpdateOwner = %v, want dell", got)
+	}
+	if got, ok := items[1]["reportedUpdateOwner"]; ok {
+		t.Errorf("an update no lane owns must omit the owner, got %v", got)
+	}
+	if got := items[1]["reportedUpdateType"]; got != "firmware" {
+		t.Errorf("firmware item reportedUpdateType = %v, want firmware", got)
+	}
+	if got, ok := items[2]["reportedUpdateType"]; ok {
+		t.Errorf("a provider with no update type must omit the field, got %v", got)
+	}
+}

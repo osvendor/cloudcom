@@ -27,11 +27,49 @@ vi.mock('./businessReports/technicianTimeReport', () => ({
 vi.mock('./businessReports/arAgingReport', () => ({
   generateArAgingReport: vi.fn(async () => ({ rows: [], rowCount: 0, summary: { generator: 'ar_aging' } })),
 }));
+vi.mock('./businessReports/aiUsageByClientReport', () => ({
+  generateAiUsageByClientReport: vi.fn(async () => ({ rows: [], rowCount: 0, summary: { generator: 'ai_usage_by_client' } })),
+}));
+vi.mock('./businessReports/mrrRenewalsReport', () => ({
+  generateMrrRenewalsReport: vi.fn(async () => ({ rows: [], rowCount: 0, summary: { generator: 'mrr_renewals' } })),
+}));
+vi.mock('./businessReports/quoteWinRateReport', () => ({
+  generateQuoteWinRateReport: vi.fn(async () => ({ rows: [], rowCount: 0, summary: { generator: 'quote_win_rate' } })),
+}));
+vi.mock('./businessReports/ticketSlaPerformanceReport', () => ({
+  generateTicketSlaPerformanceReport: vi.fn(async () => ({ rows: [], rowCount: 0, summary: { generator: 'ticket_sla_performance' } })),
+}));
+vi.mock('./businessReports/clientProfitabilityReport', () => ({
+  generateClientProfitabilityReport: vi.fn(async () => ({ rows: [], rowCount: 0, summary: { generator: 'client_profitability' } })),
+}));
+
+// #6013 W05: backup_status reads through the W03 unified read model, whose
+// SQL is built from Drizzle subqueries this file's flat `db.select` chain
+// cannot render. The read model's own site binding is proven in its own
+// tests; here the REAL generateBackupStatusReport runs against a spied read
+// model, so the assertion is on the exact scope it hands over (the tenancy
+// boundary this wave owns).
+vi.mock('./backupHealthReadModel', () => ({
+  listBackupHealthRows: vi.fn(async () => ({ rows: [], nextCursor: null })),
+  summarizeBackupHealth: vi.fn(async () => ({
+    endpoints: { total: 0, covered: 0, uncovered: 0 },
+    providerOnly: 0,
+    m365Accounts: 0,
+    byStatus: {},
+    byHealth: {},
+    byRecency: {},
+  })),
+}));
 
 import { db } from '../db';
+import { listBackupHealthRows, summarizeBackupHealth } from './backupHealthReadModel';
 import { generateTicketSlaAttainmentReport } from './businessReports/ticketSlaReport';
 import { generateTechnicianTimeBillabilityReport } from './businessReports/technicianTimeReport';
 import { generateArAgingReport } from './businessReports/arAgingReport';
+import { generateAiUsageByClientReport } from './businessReports/aiUsageByClientReport';
+import { generateMrrRenewalsReport } from './businessReports/mrrRenewalsReport';
+import { generateQuoteWinRateReport } from './businessReports/quoteWinRateReport';
+import { generateClientProfitabilityReport } from './businessReports/clientProfitabilityReport';
 import type { OrgReportExecutionAuthority, ReportExecutionAuthority } from './siteScope';
 import {
   assertReportExecutionPreflight,
@@ -65,6 +103,8 @@ const REPORT_TYPES: readonly ReportType[] = [
   'endpoint_management_review',
   'vulnerability_management',
   'identity_access_review',
+  'backup_status',
+  'ticket_sla_performance',
 ];
 /**
  * #5784 W06. `identity_access_review` is org-wide by construction: M365 identity
@@ -74,7 +114,7 @@ const REPORT_TYPES: readonly ReportType[] = [
  * dedicated assertion in its place, so the exclusion is proven, not assumed.
  */
 const SITE_SCOPED_REPORT_TYPES: readonly ReportType[] = REPORT_TYPES
-  .filter((type) => type !== 'identity_access_review');
+  .filter((type) => type !== 'identity_access_review' && type !== 'backup_status' && type !== 'ticket_sla_performance');
 /** Every `ReportType` that is NOT generated on demand. P2-3 added the first
  *  one: a weekly AI narrative's artifact is written once by the agent run and
  *  only ever read back — there is no query that could reproduce it. Fleet
@@ -86,6 +126,10 @@ const BUSINESS_TYPES: readonly ReportType[] = [
   'ticket_sla_attainment',
   'technician_time_billability',
   'ar_aging',
+  'ai_usage_by_client',
+  'mrr_renewals',
+  'quote_win_rate',
+  'client_profitability',
 ];
 /** The mocked generator each BUSINESS_TYPES entry must reach, and the marker
  *  summary it returns. */
@@ -93,6 +137,10 @@ const BUSINESS_GENERATORS: Record<string, { fn: () => unknown; marker: string }>
   ticket_sla_attainment: { fn: generateTicketSlaAttainmentReport as never, marker: 'ticket_sla' },
   technician_time_billability: { fn: generateTechnicianTimeBillabilityReport as never, marker: 'technician_time' },
   ar_aging: { fn: generateArAgingReport as never, marker: 'ar_aging' },
+  ai_usage_by_client: { fn: generateAiUsageByClientReport as never, marker: 'ai_usage_by_client' },
+  mrr_renewals: { fn: generateMrrRenewalsReport as never, marker: 'mrr_renewals' },
+  quote_win_rate: { fn: generateQuoteWinRateReport as never, marker: 'quote_win_rate' },
+  client_profitability: { fn: generateClientProfitabilityReport as never, marker: 'client_profitability' },
 };
 const PARTNER_ID = '44444444-4444-4444-8444-444444444444';
 
@@ -310,6 +358,43 @@ describe('generateReport mandatory execution authority', () => {
     },
   );
 
+  // #6013 W05. backup_status is site-scoped through the read model rather than
+  // a `where` predicate on this file's mocked db, so its binding is asserted on
+  // the scope the real generator hands the read model.
+  it('backup_status hands the read model exactly the restricted site scope and never Site B', async () => {
+    await generateReport(
+      'backup_status',
+      organizationScope(ORG_ID),
+      {},
+      authority('restricted', [SITE_A]),
+    );
+
+    for (const fn of [listBackupHealthRows, summarizeBackupHealth]) {
+      expect(fn).toHaveBeenCalledTimes(1);
+      const scope = vi.mocked(fn).mock.calls[0]![0];
+      expect(scope).toEqual({ orgIds: [ORG_ID], siteIds: [SITE_A] });
+      expect(JSON.stringify(scope)).not.toContain(SITE_B);
+    }
+  });
+
+  it('backup_status refuses a config.sites entry outside the restricted authority before reading', async () => {
+    await expect(
+      generateReport(
+        'backup_status',
+        organizationScope(ORG_ID),
+        { sites: [SITE_B] },
+        authority('restricted', [SITE_A]),
+      ),
+    ).rejects.toThrow();
+    expect(listBackupHealthRows).not.toHaveBeenCalled();
+    expect(summarizeBackupHealth).not.toHaveBeenCalled();
+  });
+
+  it('backup_status with an unrestricted authority passes no siteIds ceiling to the read model', async () => {
+    await generateReport('backup_status', organizationScope(ORG_ID), {}, authority('unrestricted'));
+    expect(vi.mocked(listBackupHealthRows).mock.calls[0]![0]).toEqual({ orgIds: [ORG_ID] });
+  });
+
   // #5784 W03. The generic `emptyRowsReport()` shape carries NO summary, and
   // buildReportPdf's endpoint-management arm is guarded on the summary being
   // present — so that shape degrades the artifact to renderGenericReport's
@@ -431,6 +516,32 @@ describe('managed evidence system execution path (#5784 OD-5 = B)', () => {
     expect(db.select).not.toHaveBeenCalled();
   });
 
+  // #11018 W2. The evidence context is what makes the run report the occurrence's
+  // period, so the registry arm dropping it would silently report last month.
+  it('system authority may generate ticket_sla_performance, and the evidence context reaches the generator', async () => {
+    const { generateManagedEvidenceReport } = await import('./reportGenerationService');
+    const { generateTicketSlaPerformanceReport } = await import('./businessReports/ticketSlaPerformanceReport');
+    const evidence = {
+      periodStart: '2026-10-01', periodEnd: '2026-10-31',
+      generatedAt: '2026-10-31T05:18:00.000Z', deliverableId: USER_ID,
+    };
+    const result = await generateManagedEvidenceReport('ticket_sla_performance' as never, ORG_ID, { includeSubjects: false }, evidence);
+    expect(result.summary).toEqual({ generator: 'ticket_sla_performance' });
+    expect(generateTicketSlaPerformanceReport).toHaveBeenCalledTimes(1);
+    const [scope, config, passedAuthority, passedEvidence] = vi.mocked(generateTicketSlaPerformanceReport).mock.calls[0]! as unknown[];
+    expect(scope).toEqual({ kind: 'organization', orgId: ORG_ID });
+    expect(config).toEqual({ includeSubjects: false });
+    expect(passedAuthority).toMatchObject({ principalKind: 'system', scope: { kind: 'unrestricted', orgId: ORG_ID } });
+    expect(passedEvidence).toEqual(evidence);
+  });
+
+  it('portal-user authority may not generate ticket_sla_performance', async () => {
+    const { generateTicketSlaPerformanceReport } = await import('./businessReports/ticketSlaPerformanceReport');
+    await expect(generateReport('ticket_sla_performance', organizationScope(ORG_ID), {}, portalAuthority()))
+      .rejects.toThrow(/portal|authority|report type/i);
+    expect(generateTicketSlaPerformanceReport).not.toHaveBeenCalled();
+  });
+
   it('refuses a system authority whose scope is not org-wide unrestricted', () => {
     expect(() => assertReportExecutionPreflight(ORG_ID, {}, {
       principalKind: 'system',
@@ -477,8 +588,8 @@ describe('business report types under a zero-site restricted authority (#3198 W0
       expect(result.rows).toEqual([]);
       expect(result.summary).toBeDefined();
       expect((result.summary as { notes: string[] }).notes).toEqual([
-        'This report ran under a site-restricted authority. Tickets, time entries and '
-        + 'invoices have no site dimension, so nothing was queried — the figures below '
+        'This report ran under a site-restricted authority. This report\'s records '
+        + 'have no site dimension, so nothing was queried — the figures below '
         + 'are not measured, and they are not zero.',
       ]);
       expect(db.select).not.toHaveBeenCalled();
@@ -594,8 +705,8 @@ describe('registry dispatch gate order (#3198 W02 Task 3)', () => {
       const result = await generateReport(type, organizationScope(ORG_ID), {}, authority('restricted', [SITE_A]));
       expect(result.rowCount).toBe(0);
       expect((result.summary as { notes: string[] }).notes).toEqual([
-        'This report ran under a site-restricted authority. Tickets, time entries and '
-        + 'invoices have no site dimension, so nothing was queried — the figures below '
+        'This report ran under a site-restricted authority. This report\'s records '
+        + 'have no site dimension, so nothing was queried — the figures below '
         + 'are not measured, and they are not zero.',
       ]);
       for (const generator of Object.values(BUSINESS_GENERATORS)) expect(generator.fn).not.toHaveBeenCalled();

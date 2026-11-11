@@ -75,7 +75,7 @@ func (g *GCSProvider) UploadContext(ctx context.Context, localPath, remotePath s
 
 	writer := client.Bucket(g.bucketName).Object(remotePath).NewWriter(ctx)
 
-	if _, err := io.Copy(writer, file); err != nil {
+	if _, err := io.Copy(writer, uploadProgressSource(ctx, file)); err != nil {
 		_ = writer.Close()
 		return fmt.Errorf("failed to upload file to gcs: %w", err)
 	}
@@ -87,6 +87,15 @@ func (g *GCSProvider) UploadContext(ctx context.Context, localPath, remotePath s
 
 // Download retrieves a file from Google Cloud Storage.
 func (g *GCSProvider) Download(remotePath, localPath string) error {
+	return g.DownloadContext(context.Background(), remotePath, localPath)
+}
+
+// DownloadContext retrieves a file from Google Cloud Storage. Cancelling ctx
+// aborts the in-progress read.
+func (g *GCSProvider) DownloadContext(ctx context.Context, remotePath, localPath string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if remotePath == "" {
 		return errors.New("remote path is required")
 	}
@@ -108,7 +117,6 @@ func (g *GCSProvider) Download(remotePath, localPath string) error {
 		"object", remotePath,
 	)
 
-	ctx := context.Background()
 	reader, err := client.Bucket(g.bucketName).Object(remotePath).NewReader(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to create gcs reader: %w", err)
@@ -120,7 +128,7 @@ func (g *GCSProvider) Download(remotePath, localPath string) error {
 		return fmt.Errorf("failed to create local destination file: %w", err)
 	}
 
-	if _, err := io.Copy(file, reader); err != nil {
+	if _, err := io.Copy(DownloadProgressWriter(ctx, file), reader); err != nil {
 		_ = file.Close()
 		return fmt.Errorf("failed to download file from gcs: %w", err)
 	}
@@ -173,6 +181,9 @@ func (g *GCSProvider) Delete(remotePath string) error {
 
 	ctx := context.Background()
 	if err := client.Bucket(g.bucketName).Object(remotePath).Delete(ctx); err != nil {
+		if gcsIsNotFound(err) {
+			return nil // already gone: the delete's goal holds
+		}
 		return fmt.Errorf("failed to delete gcs object: %w", err)
 	}
 	return nil
@@ -259,4 +270,9 @@ func (g *GCSProvider) getClient() (*gcs.Client, error) {
 
 	g.client = client
 	return g.client, nil
+}
+
+// gcsIsNotFound reports whether err says the object does not exist.
+func gcsIsNotFound(err error) bool {
+	return errors.Is(err, gcs.ErrObjectNotExist)
 }

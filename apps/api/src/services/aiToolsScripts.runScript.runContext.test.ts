@@ -56,6 +56,9 @@ vi.mock('./tenantVariableResolution', () => ({
   loadTenantVariableScope: vi.fn().mockResolvedValue({ orgIds: new Set() }),
 }));
 vi.mock('../db', () => ({
+  // These handlers run as under the per-call transaction: `inToolDbPhase`
+  // (#7918) joins it rather than opening a context of its own.
+  hasDbAccessContext: vi.fn(() => true),
   runOutsideDbContext: vi.fn((fn: () => unknown) => fn()),
   withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn()),
   withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
@@ -91,6 +94,18 @@ function makeAuth(): AuthContext {
     canAccessOrg: () => true,
     canAccessSite: () => true,
     aiOrigin: { kind: 'ai_assistant', sessionId: 'test-session' },
+  } as any;
+}
+
+// The ONLY way an `ai_agent` principal ever
+// reaches this handler branch (no `proposalId`) is act mode's
+// manifest-matched unattended dispatch — see the doc comment on
+// `isUnattendedAgentDispatch` in aiToolsScripts.ts.
+function makeAgentAuth(): AuthContext {
+  return {
+    ...makeAuth(),
+    principal: { kind: 'ai_agent', agentId: 'agent-1', runId: 'run-1' },
+    user: { id: 'agent-1', email: 'agent+agent-1@breeze.internal', name: 'Patch agent' },
   } as any;
 }
 
@@ -202,6 +217,39 @@ describe('run_script forwards an assistant-chosen run context to dispatchScriptT
   });
 });
 
+describe('an unattended act-mode agent dispatch ignores a model-chosen runAs/targetSessionId', () => {
+  it('ignores runAs: "user" from an ai_agent principal — dispatch is called with runAs: undefined, not the caller\'s value', async () => {
+    await runScriptTool().handler(
+      { scriptId: SCRIPT_ID, deviceIds: [DEVICE_A], runAs: 'user' },
+      makeAgentAuth(),
+    );
+
+    expect(dispatchScriptToDevice).toHaveBeenCalledTimes(1);
+    const call = dispatchScriptToDevice.mock.calls[0]![0];
+    expect(call).toHaveProperty('runAs', undefined);
+  });
+
+  it('ignores runAs: "user" + targetSessionId: 3 together from an ai_agent principal — the saved script\'s own runAs governs instead', async () => {
+    await runScriptTool().handler(
+      { scriptId: SCRIPT_ID, deviceIds: [DEVICE_A], runAs: 'user', targetSessionId: 3 },
+      makeAgentAuth(),
+    );
+
+    expect(dispatchScriptToDevice).toHaveBeenCalledTimes(1);
+    const call = dispatchScriptToDevice.mock.calls[0]![0];
+    expect(call).toMatchObject({ runAs: undefined, targetSessionId: undefined });
+  });
+
+  it('a human/chat caller (no ai_agent principal) is UNAFFECTED — its chosen runAs still forwards', async () => {
+    await runScriptTool().handler({ scriptId: SCRIPT_ID, deviceIds: [DEVICE_A], runAs: 'user' }, makeAuth());
+
+    expect(dispatchScriptToDevice).toHaveBeenCalledTimes(1);
+    expect(dispatchScriptToDevice).toHaveBeenCalledWith(
+      expect.objectContaining({ runAs: 'user' }),
+    );
+  });
+});
+
 describe('run_script echoes the RESOLVED run context from dispatch, not the caller\'s request', () => {
   it('echoes dispatch\'s resolved runAs on the per-device result when the caller asked for nothing', async () => {
     // The caller supplies no runAs at all; dispatch resolves it to 'system'
@@ -244,5 +292,56 @@ describe('run_script echoes the RESOLVED run context from dispatch, not the call
     );
 
     expect(out.results[DEVICE_A]).toMatchObject({ runAs: 'user', targetSessionId: 3 });
+  });
+});
+
+// Tool catalog W04 (#5219), A7 + Decision 16. A pre-approved flow step calls
+// run_script with the `verifiedRunScript` pin the step executor built from ONE
+// snapshot read. Two things are pinned here: the flow's attribution reaches the
+// AI dispatch door as kind 'flow' (never ai_agent, never a human), and what
+// executes is exactly what the pre-approval digest covers — the pinned row
+// (content + its saved runAs) plus the literal `parameters`; a step's literal
+// runAs / targetSessionId never reaches dispatch for an automation principal.
+describe('a pre-approved flow run_script (tool catalog W04)', () => {
+  function makeFlowAuth(): AuthContext {
+    return {
+      ...makeAuth(),
+      principal: { kind: 'flow', flowId: 'flow-1', runId: 'flow-run-1' },
+      user: { id: 'flow-1', email: 'flow+flow-1@breeze.internal', name: 'Nightly fix' },
+      aiOrigin: { kind: 'flow', flowRunId: 'flow-run-1' },
+    } as any;
+  }
+  const pinnedRow = { ...scriptRow, content: 'echo pinned', runAs: 'system', osTypes: ['windows'], parameters: [] };
+  const verifiedRunScript = {
+    snapshot: {
+      script: { id: SCRIPT_ID, orgId: ORG_A, language: 'powershell', content: 'echo pinned', timeoutSeconds: 60, runAs: 'system' },
+      parameterDefinitions: '[]',
+      deviceOrgIds: [ORG_A],
+      variableReferences: [],
+    },
+    scriptRow: pinnedRow,
+    scope: { orgIds: new Set([ORG_A]) },
+  } as any;
+
+  it('pre-approved run_script reaches aiDispatch with aiOrigin kind flow', async () => {
+    await runScriptTool().handler(
+      { scriptId: SCRIPT_ID, deviceIds: [DEVICE_A], parameters: { mode: 'quick' }, runAs: 'user', targetSessionId: 3 },
+      makeFlowAuth(),
+      { verifiedRunScript },
+    );
+
+    expect(dispatchScriptToDevice).toHaveBeenCalledTimes(1);
+    expect(dispatchScriptToDevice.mock.calls[0]![0]).toMatchObject({
+      aiOrigin: { kind: 'flow', flowRunId: 'flow-run-1' },
+      // Not an agent: no agent id is laundered into the audit actor.
+      principalActorId: null,
+      // The pinned row is what runs — no second read.
+      source: { kind: 'saved', script: pinnedRow },
+      variableScope: verifiedRunScript.scope,
+      parameters: { mode: 'quick' },
+      // The step's literal runAs / targetSessionId are NOT what executes.
+      runAs: undefined,
+      targetSessionId: undefined,
+    });
   });
 });

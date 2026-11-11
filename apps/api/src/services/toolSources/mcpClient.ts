@@ -19,10 +19,10 @@
  * there; `safeFetch` itself asserts it is not called inside a held DB
  * context (see `urlSafety.ts`).
  */
-import { createHash } from 'node:crypto';
 import { safeFetch } from '../urlSafety';
 import type { SafeFetchInit } from '../urlSafety';
 import type { ToolSourceAuthConfig } from './secrets';
+import { buildToolSourceAuthHeaders, ToolSourceAuthError } from './authHeaders';
 
 export interface McpClientOptions {
   endpointUrl: string;
@@ -64,6 +64,15 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_RESPONSE_BYTES = 1_048_576;
 const PROTOCOL_VERSION = '2025-06-18';
 const MAX_LIST_PAGES = 50;
+/**
+ * Aggregate caps across every page of `tools/list`, on top of the existing
+ * per-page `MAX_LIST_PAGES` and `maxResponseBytes`. Those two only bound a
+ * single page in isolation; without a running total, a peer can still
+ * return an unbounded number of small pages that together persist a huge
+ * catalog and inflate every chat turn's tool-list payload.
+ */
+const MAX_TOOLS_PER_SOURCE = 500;
+const MAX_AGGREGATE_TOOL_BYTES = 2_097_152;
 
 interface JsonRpcRequest {
   jsonrpc: '2.0';
@@ -79,80 +88,10 @@ interface JsonRpcResponse {
   error?: { code?: number; message?: string; data?: unknown };
 }
 
-/**
- * Module-level cache of OAuth2 client-credentials tokens.
- *
- * The key covers the WHOLE credential, not just (tokenUrl, clientId): two
- * tenants may legitimately register the same authorization server and the same
- * client id with DIFFERENT secrets or scopes (a shared SaaS vendor, separate
- * subscriptions). Keying on the identifier alone would hand tenant B an access
- * token minted from tenant A's secret — a cross-tenant credential leak with no
- * error anywhere. The secret is hashed so the cache key itself is not a place
- * a credential can be read out of (heap dumps, debugger, log of Map keys).
- */
-const oauthTokenCache = new Map<string, { accessToken: string; expiresAt: number }>();
-
-function oauthCacheKey(cfg: {
-  tokenUrl: string;
-  clientId: string;
-  clientSecret: string;
-  scope?: string;
-}): string {
-  return createHash('sha256')
-    .update(
-      JSON.stringify([cfg.tokenUrl, cfg.clientId, cfg.clientSecret, cfg.scope ?? '']),
-    )
-    .digest('hex');
-}
-
-/** 30s of slack so a token about to expire mid-request is refreshed instead of reused. */
-const OAUTH_EXPIRY_SKEW_MS = 30_000;
-
-export async function getOAuth2ClientCredentialsToken(
-  cfg: { tokenUrl: string; clientId: string; clientSecret: string; scope?: string },
-  fetchImpl: (url: string, init: SafeFetchInit) => Promise<Response>
-): Promise<{ accessToken: string; expiresAt: number }> {
-  const cacheKey = oauthCacheKey(cfg);
-  const cached = oauthTokenCache.get(cacheKey);
-  if (cached && cached.expiresAt > Date.now()) return cached;
-
-  const body = new URLSearchParams({
-    grant_type: 'client_credentials',
-    client_id: cfg.clientId,
-    client_secret: cfg.clientSecret,
-    ...(cfg.scope ? { scope: cfg.scope } : {}),
-  });
-
-  let res: Response;
-  try {
-    res = await fetchImpl(cfg.tokenUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
-      body: body.toString(),
-    });
-  } catch (err) {
-    throw new McpClientError(`oauth2 token request failed: ${err instanceof Error ? err.message : String(err)}`, 'auth');
-  }
-
-  if (!res.ok) {
-    throw new McpClientError(`oauth2 token request failed with status ${res.status}`, 'auth');
-  }
-
-  let json: { access_token?: string; expires_in?: number };
-  try {
-    json = (await res.json()) as { access_token?: string; expires_in?: number };
-  } catch {
-    throw new McpClientError('oauth2 token response was not valid JSON', 'auth');
-  }
-  if (!json.access_token) {
-    throw new McpClientError('oauth2 token response missing access_token', 'auth');
-  }
-
-  const ttlMs = typeof json.expires_in === 'number' && json.expires_in > 0 ? json.expires_in * 1000 : 3_600_000;
-  const token = { accessToken: json.access_token, expiresAt: Date.now() + ttlMs - OAUTH_EXPIRY_SKEW_MS };
-  oauthTokenCache.set(cacheKey, token);
-  return token;
-}
+// The OAuth2 client-credentials token cache and the credential header builder
+// live in `./authHeaders` (W2) so the MCP and OpenAPI transports pin
+// credentials identically. Re-exported for existing importers.
+export { getOAuth2ClientCredentialsToken } from './authHeaders';
 
 export class McpClient {
   private readonly opts: McpClientOptions;
@@ -183,6 +122,7 @@ export class McpClient {
     const tools: McpToolListing[] = [];
     let cursor: string | undefined;
     let pages = 0;
+    let aggregateBytes = 0;
     for (;;) {
       pages += 1;
       if (pages > MAX_LIST_PAGES) {
@@ -192,7 +132,19 @@ export class McpClient {
         tools?: McpToolListing[];
         nextCursor?: string;
       };
-      tools.push(...(result.tools ?? []));
+      for (const tool of result.tools ?? []) {
+        tools.push(tool);
+        aggregateBytes += Buffer.byteLength(JSON.stringify(tool), 'utf8');
+        if (tools.length > MAX_TOOLS_PER_SOURCE) {
+          throw new McpClientError(`tools/list exceeded the ${MAX_TOOLS_PER_SOURCE}-tool aggregate cap`, 'too_large');
+        }
+        if (aggregateBytes > MAX_AGGREGATE_TOOL_BYTES) {
+          throw new McpClientError(
+            `tools/list exceeded the ${MAX_AGGREGATE_TOOL_BYTES}-byte aggregate tool-definition cap`,
+            'too_large'
+          );
+        }
+      }
       if (!result.nextCursor) break;
       cursor = result.nextCursor;
     }
@@ -204,34 +156,19 @@ export class McpClient {
     return result as McpCallResult;
   }
 
-  /** Build the auth header for this request, enforcing origin pinning BEFORE any network call. */
+  /**
+   * Build the auth header for this request, enforcing origin pinning BEFORE any
+   * network call. Delegates to the shared builder; its typed failures are
+   * re-raised as `McpClientError` with the same code, which is what every
+   * MCP caller already branches on.
+   */
   private async buildAuthHeaders(): Promise<Record<string, string>> {
     const { auth, endpointUrl, credentialOrigin } = this.opts;
-    if (auth.authKind === 'none') return {};
-
-    if (new URL(endpointUrl).origin !== credentialOrigin) {
-      throw new McpClientError(
-        `refusing to attach credentials: endpoint origin does not match the credential's origin (${credentialOrigin})`,
-        'origin_mismatch'
-      );
-    }
-
-    switch (auth.authKind) {
-      case 'bearer':
-        return { Authorization: `Bearer ${auth.token}` };
-      case 'api_key_header':
-        return { [auth.headerName]: auth.value };
-      case 'basic':
-        return { Authorization: `Basic ${Buffer.from(`${auth.username}:${auth.password}`).toString('base64')}` };
-      case 'oauth2_client_credentials': {
-        const { accessToken } = await getOAuth2ClientCredentialsToken(
-          { tokenUrl: auth.tokenUrl, clientId: auth.clientId, clientSecret: auth.clientSecret, scope: auth.scope },
-          this.fetchImpl
-        );
-        return { Authorization: `Bearer ${accessToken}` };
-      }
-      default:
-        return {};
+    try {
+      return await buildToolSourceAuthHeaders(auth, endpointUrl, credentialOrigin, { fetchImpl: this.fetchImpl });
+    } catch (err) {
+      if (err instanceof ToolSourceAuthError) throw new McpClientError(err.message, err.code);
+      throw err;
     }
   }
 

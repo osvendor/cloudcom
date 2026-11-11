@@ -1,11 +1,16 @@
-import { topologyHeartbeat } from '../../services/topology/heartbeat';
-import { loadTopologyFlags, withResolvedTopologyFlags, type TopologyFlags } from '../../services/topology/flags';
+import { guardHeartbeatUpdates } from '../../services/agentRolloutAdmission';
+import { getWindowsReleaseCanaryVersion } from '../../services/releaseSource';
+import type { HeartbeatEpisodeContext } from '../../services/networkIsolation/reconcile';
+import { topologyHeartbeat, topologyHeartbeatWithoutMaterialization } from '../../services/topology/heartbeat';
+import { loadAgentTopologyFlags, withResolvedTopologyFlags, type TopologyFlags } from '../../services/topology/flags';
 import { Hono } from 'hono';
 import { timingSafeEqual } from 'node:crypto';
 import { bodyLimit } from 'hono/body-limit';
 import { zValidator } from '../../lib/validation';
-import { and, eq, notInArray } from 'drizzle-orm';
-import { db, runOutsideDbContext, withDbAccessContext, withSystemDbAccessContext } from '../../db';
+import { and, eq, inArray, notInArray } from 'drizzle-orm';
+import { loadDeviceHierarchy, type DeviceHierarchy } from '../../services/deviceHierarchy';
+import { loadDevicePolicySet, withPolicySet, type DevicePolicySet } from '../../services/devicePolicySet';
+import { db, runAfterDbContextExit, runOutsideDbContext, withDbAccessContext, withDbTransaction, withSystemDbAccessContext } from '../../db';
 import {
   maybeDispatchEditionMigration,
   shouldConsiderEditionMigration,
@@ -17,11 +22,28 @@ import {
   onedriveDeviceState,
   bareMetalRecoveries,
 } from '../../db/schema';
+import { ownDeviceRowChangedHands, selectOwnDeviceRowForUpdate, updateOwnDeviceRow } from '../../services/agentOwnDeviceRow';
 import { hashRecoveryNonce } from '../../services/bareMetalRecoveryCodes';
-import type { BatteryStatus, DesktopAccessState } from '@breeze/shared';
-import { promotePendingAgentCredentials } from '../../services/agentTokenPromotion';
+import type { BatteryStatus, ContainmentDesiredBlock, DesktopAccessState, TCCPermissions } from '@breeze/shared';
+import { ERROR_CODES, isResolvedTerminalIsolationState } from '@breeze/shared';
 import { writeAuditEvent } from '../../services/auditEvents';
+import { refreshReadinessAfterRecovery } from '../../services/bareMetalReadinessRefresh';
+import { recordBackupCapabilityRegressed, type BackupHelperCapability } from '../../services/backupMetrics';
+import {
+  BACKUP_HELPER_PROTOCOL_MIN_VERSION,
+  backupHelperProtocolColumnWrite,
+  backupHelperProtocolForDelivery,
+  backupHelperVersionPredates,
+  normalizeBackupIntegrityProtocolVersion,
+  normalizeBackupWriteProtocolVersion,
+} from '../../services/backupHelperProtocols';
 import { heartbeatSchema } from './schemas';
+import { recordWorkstationCapabilities } from '../../services/callerVerification/workstationCapabilities';
+import { notePromptHostReportDropped, recordPromptHostObservation } from '../../services/promptHostObservation';
+import { enabledPromptKinds } from '../../services/promptHostConfig';
+import { buildHeartbeatPromptIdentity } from '../../services/promptIdentity';
+import { noteRebootUserActionDropped, recordRebootUserAction } from '../../services/rebootUserActionAudit';
+import { callerVerificationEnabled } from '../../config/env';
 import type { PolicyProbeConfigUpdate } from './schemas';
 import {
   maybeQueueThresholdFilesystemAnalysis,
@@ -29,45 +51,88 @@ import {
   normalizeAgentArchitecture,
   compareAgentVersions,
   buildEventLogConfigUpdate,
+  buildHardwareMonitoringConfigUpdate,
+  buildTimeSyncConfigUpdate,
+  buildWorkloadInventoryConfigUpdate,
   buildMonitoringConfigUpdate,
   buildHelperConfigUpdate,
   buildPamConfigUpdate,
-  buildOnedriveHelperConfigUpdate,
+  getOrgHelperSettings,
+  readCachedHelperSettings,
+  resolveOrgPamFallback,
+  loadOnedriveHelperConfigPlan,
+  finishOnedriveHelperConfig,
   buildPatchSourceConfigUpdate,
   buildWarrantyConfigUpdate,
-  getOrgAgentUpdateConfig,
+  getOrgAgentUpdateConfigCached,
   resolvePinnedUpgradeTarget,
+  resolvePinnedUpgradeTargets,
   agentAcceptsServedEdition,
+  shouldAutoApplyAgentReportedDeviceRole,
   type AgentVersionPins,
+  type OnedriveConfigPlan,
   type OnedriveConfigUpdate,
   type HelperSettings,
 } from './helpers';
-import { shouldSendAgentUpgrade } from './agentUpdatePolicy';
+import { buildFeatureUpdateConfigUpdate, toFeatureUpdateSettingsWire } from './featureUpdateConfig';
+import type { RingFeatureUpdates } from '@breeze/shared/validators';
+import { isolationAgentUpgradeGate, shouldSendAgentUpgrade } from './agentUpdatePolicy';
+import { DeferredCacheFills } from '../../services/hotPathCache';
+import {
+  buildSettingsDecisionFields,
+  retainStateKillSwitchEnabled,
+  agentEchEnabled,
+  type RemoteManagementDecision,
+} from './heartbeatSettingsDecision';
+import { agentCollectorAbsenceCache, agentCollectorAbsenceKey, deviceHasAgentCollectors } from '../../services/unifi/unifiCollectorService';
+import { orgHelperSettingsCache, orgPamFallbackCache, orgPolicyProbeCache } from '../../services/agentOrgSettingsCache';
 import { processDeviceIPHistoryUpdate } from '../../services/deviceIpHistory';
 import { requestDeviceGroupReevaluation } from '../../jobs/deviceGroupJobs';
+import { enqueueDeviceReliabilityComputation } from '../../jobs/reliabilityWorker';
+import { createReliabilityBaseline } from '../../services/reliabilityBaselines';
 import { claimPendingCommandsForDevice } from '../../services/commandDispatch';
 import { publishEvent } from '../../services/eventBus';
-import { DRAIN_CLAIM_TYPE_ALLOWLIST, isAgentTokenRotationDue } from '../../middleware/agentAuth';
+import { DRAIN_CLAIM_TYPE_ALLOWLIST, staleAgentCredentialRejection } from '../../middleware/agentAuth';
+import { computeCredentialMaintenance } from './heartbeatCredentialMaintenance';
+import { respondParkedHeartbeat } from './heartbeatParked';
 import type { AgentAuthContext } from '../../middleware/agentAuth';
 import { captureException } from '../../services/sentry';
-import { resolveRemoteAccessForDevice } from '../../services/remoteAccessPolicy';
+import { HEARTBEAT_REMOTE_ACCESS_MAX_AGE_MS, resolveRemoteAccessForDevice } from '../../services/remoteAccessPolicy';
 import {
-  getActiveTrustKeyset,
-  getActiveManifestKeyDelegations,
+  getActiveTrustKeysetCached,
+  getActiveManifestKeyDelegationsCached,
   type ManifestTrustKey,
   type ManifestKeyDelegation,
 } from '../../services/manifestSigning';
 import { prepareClaimedCommandsForDelivery } from '../../services/commandDelivery';
 import { normalizeReportedScriptSecretEnvVersion } from '../../services/scriptSecretDelivery';
 import { redactSecretsDeep } from '../../services/secretRedaction';
-import { recordAgentHeartbeat, resolveResponseStatus } from '../metrics';
+import {
+  recordAgentHeartbeat,
+  recordAgentHeartbeatEch,
+  recordAgentFilterSignatureReport,
+  resolveResponseStatus,
+} from '../metrics';
 import { ingestRollbackObservation } from '../../services/agentRollbackResult';
 import {
   editionWithheldDetail,
+  effectiveWatchdogEdition,
   type EditionWithheldContext as SharedEditionWithheldContext,
 } from '../../services/agentEditionCompat';
 import { recordAgentHealthObservation } from '../../services/agentHealthObservations';
-import { getWindowsReleaseCanaryVersion } from '../../services/releaseSource';
+import { parseLogShipping, planLogShippingWrite } from '../../services/logShippingHealth';
+import { parseWatchdogInstall, planWatchdogInstallWrite } from '../../services/watchdogInstallHealth';
+import {
+  agentIdentityAssertionRefused,
+  agentIdentityAssertionVersionToSign,
+  agentIdentityEpochAckToRecord,
+  agentIdentityEpochAckUpdateSql,
+  normalizeIdentitySyncProtocolVersion,
+  signAgentIdentityAssertion,
+  type AgentIdentityAssertion,
+} from '../../services/agentIdentityAssertion';
+import { normalizeRebindProtocolVersion } from '../../services/deviceReattach/protocol';
+import { rebindDirectiveForBeat } from '../../services/deviceReattach/rebindDirective';
 
 /**
  * #1121 — pure collapse detector for the watchdogState tolerance gap.
@@ -101,6 +166,8 @@ export function detectWatchdogStateCollapse(
 // so a later regression to an incompatible build re-warns instead of being
 // permanently consumed by the first episode.
 const warnedEditionWithheldDevices = new Set<string>();
+// Persisted reason code (devices.update_offer_withheld_reason, #6449).
+const EDITION_OFFER_WITHHELD_REASON = 'edition_unconfirmed';
 // Separate dedupe for the far more severe failover-recovery withhold (device
 // stuck OFFLINE, not idling) — its error must not be suppressed by an earlier
 // routine offer-withhold warn for the same device.
@@ -229,6 +296,95 @@ export function resetWatchdogRestartLogCacheForTests(): void {
   watchdogRestartLogCache.clear();
 }
 
+// #8317 — bounded logging for the identity sync. A deployment with no signing
+// key would otherwise warn once per moved agent per beat, and a signing fault
+// (an APP_ENCRYPTION_KEY that no longer decrypts the key, say) would log and
+// send a Sentry event once per moved agent per beat.
+const IDENTITY_ASSERTION_FAILURE_REPORT_INTERVAL_MS = 10 * 60 * 1000;
+let identitySyncNoSigningKeyWarned = false;
+let identityAssertionFailureReportedAt = 0;
+// #8623 — device-id mismatches are rate-limited per device, not fleet-wide:
+// one noisy agent must not hide another's copied agent.yaml. In-memory per API
+// instance like watchdogRestartLogCache, and bounded the same way.
+const IDENTITY_DEVICE_MISMATCH_LOG_CACHE_MAX = 10_000;
+const identityDeviceMismatchReportedAt = new Map<string, number>();
+
+function warnIdentitySyncWithoutSigningKey(): void {
+  if (identitySyncNoSigningKeyWarned) return;
+  identitySyncNoSigningKeyWarned = true;
+  console.warn(
+    '[heartbeat] A moved device needs a signed identity assertion (#8317), but this deployment has no '
+    + 'deployment signing key and the heartbeat does not create one. Moved agents keep their enrolled '
+    + 'org/site until a key exists.',
+  );
+}
+
+function reportIdentityAssertionFailure(agentId: string, err: unknown): void {
+  const now = Date.now();
+  if (now - identityAssertionFailureReportedAt < IDENTITY_ASSERTION_FAILURE_REPORT_INTERVAL_MS) return;
+  identityAssertionFailureReportedAt = now;
+  console.error(`[heartbeat] Failed to sign identity assertion for agentId=${agentId}:`, err);
+  captureException(err);
+}
+
+/**
+ * #8623 — whether a device-id mismatch on this device may be logged now, and
+ * if so records that it was. Keyed by the row the credential belongs to (the
+ * authenticated device), not by the reported id, which the agent chooses.
+ *
+ * Bounded: the map is kept in the order devices were last logged, so a full
+ * map first drops the entries older than the interval (they no longer hold
+ * anything back) and, if every entry is recent, the one logged longest ago.
+ * Either way the cost of being full is an extra warning, never a hidden one.
+ * Exported for unit tests.
+ */
+export function claimIdentityDeviceMismatchWarning(rowDeviceId: string, nowMs: number): boolean {
+  const last = identityDeviceMismatchReportedAt.get(rowDeviceId);
+  // An entry from the future (the clock stepped back) counts as stale, so a
+  // clock step cannot mute a device until the clock catches up.
+  if (
+    last !== undefined
+    && last <= nowMs
+    && nowMs - last < IDENTITY_ASSERTION_FAILURE_REPORT_INTERVAL_MS
+  ) return false;
+  identityDeviceMismatchReportedAt.delete(rowDeviceId);
+  if (identityDeviceMismatchReportedAt.size >= IDENTITY_DEVICE_MISMATCH_LOG_CACHE_MAX) {
+    for (const [deviceId, loggedAt] of identityDeviceMismatchReportedAt) {
+      if (loggedAt <= nowMs && nowMs - loggedAt < IDENTITY_ASSERTION_FAILURE_REPORT_INTERVAL_MS) break;
+      identityDeviceMismatchReportedAt.delete(deviceId);
+    }
+    if (identityDeviceMismatchReportedAt.size >= IDENTITY_DEVICE_MISMATCH_LOG_CACHE_MAX) {
+      const oldest = identityDeviceMismatchReportedAt.keys().next().value;
+      if (oldest !== undefined) identityDeviceMismatchReportedAt.delete(oldest);
+    }
+  }
+  identityDeviceMismatchReportedAt.set(rowDeviceId, nowMs);
+  return true;
+}
+
+// #8382 — the agent reported a device id other than the row its credential
+// belongs to. Never synced (a device id does not change through this path),
+// but not silent either: it can mean an agent.yaml copied from another device.
+// Rate-limited per device (#8623).
+function warnIdentityDeviceMismatch(agentId: string, reportedDeviceId: string, rowDeviceId: string): void {
+  if (!claimIdentityDeviceMismatchWarning(rowDeviceId, Date.now())) return;
+  console.warn(
+    '[heartbeat] Agent reported a device id that is not the device its credential belongs to; no identity '
+    + 'assertion is sent. A copied agent.yaml can cause this (#8382).',
+    { agentId, reportedDeviceId, rowDeviceId },
+  );
+}
+
+export function resetIdentitySyncLogStateForTests(): void {
+  identitySyncNoSigningKeyWarned = false;
+  identityAssertionFailureReportedAt = 0;
+  identityDeviceMismatchReportedAt.clear();
+}
+
+export function identityDeviceMismatchLogSizeForTests(): number {
+  return identityDeviceMismatchReportedAt.size;
+}
+
 export function watchdogRestartLogCacheSizeForTests(): number {
   return watchdogRestartLogCache.size;
 }
@@ -249,6 +405,19 @@ export function normalizePamLifetimeProtocolVersion(value: unknown): 0 | 2 {
 }
 
 /**
+ * #8928 — normalize the PAM user-notify protocol (pam_request_notify outcome
+ * notices).
+ *   1 — the agent tracks a request handed to IT and shows outcome notices.
+ *   2 — #10190 W07: also decodes `decidedBy` on pam_apply_v2 (whose decoder
+ *       rejects unknown fields, so the apply worker adds it only at >= 2) and
+ *       draws the elevation prompt states.
+ * Anything else means "not capable" (0).
+ */
+export function normalizePamUserNotifyProtocolVersion(value: unknown): 0 | 1 | 2 {
+  return value === 1 || value === 2 ? value : 0;
+}
+
+/**
  * Normalize the only revocation-lease protocol version implemented here.
  * Anything other than exactly 1 — absent, malformed, or a future version this
  * server does not speak — is capability 0, and every desktop-start dispatch
@@ -259,7 +428,7 @@ export function normalizeRevocationLeaseProtocolVersion(value: unknown): 0 | 1 {
 }
 
 /**
- * SEC-038 W06: normalize the only desktop start/terminal fence protocol
+ * Normalize the only desktop start/terminal fence protocol
  * version implemented here. Same tolerance contract as the lease version —
  * absent, malformed, or a future version this server does not speak is 0, and
  * behind REMOTE_DESKTOP_FENCE_REQUIRED every desktop-start dispatch site
@@ -268,6 +437,69 @@ export function normalizeRevocationLeaseProtocolVersion(value: unknown): 0 | 1 {
 export function normalizeDesktopFenceProtocolVersion(value: unknown): 0 | 1 {
   return value === 1 ? 1 : 0;
 }
+
+/**
+ * Normalize the consent/notification prompt protocol versions implemented
+ * here. Same tolerance contract as the fence/lease versions: absent,
+ * malformed, or a future version this server does not speak is 0, and any
+ * dispatch site resolving a policy that requires consent or notification must
+ * refuse to start rather than send a `prompt` block a capability-0 agent will
+ * silently ignore. Version 2 gates capture exactly like version 1 and also
+ * reports whether the prompt was shown and answered, and whether anyone is
+ * signed in to the captured session (see consentGate.ts).
+ */
+export function normalizeConsentPromptProtocolVersion(value: unknown): 0 | 1 | 2 {
+  return value === 1 || value === 2 ? value : 0;
+}
+
+/**
+ * Normalize the retain-state protocol (#8616): whether THIS beat's agent
+ * honours the response's `retainState` list. Exactly 1 only; absent,
+ * malformed or a future version is 0 and gets the legacy payload. Parse-only,
+ * never persisted — each beat is answered from its own report.
+ */
+export function normalizeRetainStateProtocolVersion(value: unknown): 0 | 1 {
+  return value === 1 ? 1 : 0;
+}
+
+/**
+ * Normalize the prompt identity protocol (#10190 W03): whether THIS beat's
+ * agent caches the response's `promptIdentity` block. Exactly 1 only
+ * (PROMPT_IDENTITY_PROTOCOL_VERSION); absent, malformed or a future version is
+ * 0 and gets no block. Parse-only, never persisted.
+ */
+export function normalizePromptIdentityProtocolVersion(value: unknown): 0 | 1 {
+  return value === 1 ? 1 : 0;
+}
+
+/**
+ * Normalize the only workload-inventory protocol version implemented here
+ * (#3834). Absent, malformed, or a future version this server does not speak
+ * is 0; the device Workloads view then reports "agent too old" rather than
+ * treating a report it cannot interpret as data.
+ */
+export function normalizeWorkloadInventoryProtocolVersion(value: unknown): 0 | 1 {
+  return value === 1 ? 1 : 0;
+}
+
+/**
+ * Normalize the backup helper's brokered storage-read protocol. Only the
+ * version this server implements (1) is recorded; absent, malformed or a
+ * future version is 0, and restore-shaped commands are then delivered with
+ * the storage destination as before (services/backupStorageSessions.ts).
+ */
+export function normalizeBackupReadProtocolVersion(value: unknown): 0 | 1 {
+  return value === 1 ? 1 : 0;
+}
+
+/** Backup-helper protocols reported in the heartbeat, by device column. */
+const BACKUP_HELPER_CAPABILITY_FIELDS: ReadonlyArray<
+  readonly [BackupHelperCapability, 'backupReadProtocolVersion' | 'backupIntegrityProtocolVersion' | 'backupWriteProtocolVersion']
+> = [
+  ['read', 'backupReadProtocolVersion'],
+  ['integrity', 'backupIntegrityProtocolVersion'],
+  ['write', 'backupWriteProtocolVersion'],
+];
 
 // #5250 — the agent recomputes `checkedAt` (and, on macOS/Linux, the whole
 // DesktopAccessState) fresh on EVERY heartbeat regardless of whether access
@@ -290,6 +522,23 @@ export function desktopAccessMeaningfullyChanged(
     before.virtualDisplayReady !== after.virtualDisplayReady ||
     (before.reason ?? null) !== (after.reason ?? null) ||
     (before.remoteDesktopPermission ?? null) !== (after.remoteDesktopPermission ?? null)
+  );
+}
+
+// #4340 — same `checkedAt` trap as desktopAccess above: the agent stamps a
+// fresh `checkedAt` on its TCC snapshot, so a raw JSON diff reads as a change
+// on every macOS heartbeat. Compare only the permission bits.
+export function tccPermissionsMeaningfullyChanged(
+  before: TCCPermissions | null | undefined,
+  after: TCCPermissions | null | undefined,
+): boolean {
+  if (!before && !after) return false;
+  if (!before || !after) return true;
+  return (
+    before.screenRecording !== after.screenRecording ||
+    before.accessibility !== after.accessibility ||
+    before.fullDiskAccess !== after.fullDiskAccess ||
+    (before.remoteDesktop ?? null) !== (after.remoteDesktop ?? null)
   );
 }
 
@@ -386,7 +635,10 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
   //   - `helperEnabled`          -> handleHelperEnabled(false) turns the helper flag off
   //   - `manageRemoteManagement` -> SetManagedByPolicy(false) clears the tunnel policy flag
   // Both therefore flip off on every beat for the whole drain window.
-  // (`uacInterceptionEnabled` is a `*bool` and handles absence correctly.)
+  // `uacInterceptionEnabled` is absent too, and the agent reads that absence
+  // as "disable" (it switches PAM interception off and runs its disable
+  // cleanup) — benign on a machine being removed. This branch deliberately
+  // does not emit `retainState` (#8616, plan OD6): it stays minimal.
   // Bounded and self-correcting: these are in-memory flags on a machine that is
   // being uninstalled, and a restore ends the drain, after which the next
   // NORMAL heartbeat carries both fields again and restores them.
@@ -398,7 +650,7 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     const drainCommands = await runOutsideDbContext(() =>
       withSystemDbAccessContext(async () => {
         const claimed = await claimPendingCommandsForDevice(
-          agent.deviceId,
+          { deviceId: agent.deviceId, agentId: agent.agentId, installIncarnation: agent.installIncarnation },
           10,
           'agent',
           // Fail closed: the middleware always populates this while draining,
@@ -410,7 +662,18 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
       }),
     );
 
-    return c.json({ commands: drainCommands });
+    return c.json({ commands: drainCommands, containment: { networkIsolation: null } });
+  }
+
+  // Pre-assignment — a device parked in its partner's
+  // holding org gets the minimal parked beat: liveness, credential rotation and
+  // lifecycle removal only. Before the watchdog branch, so both credential roles
+  // take it. See ./heartbeatParked.ts.
+  if (agent.isPreAssignment) {
+    return respondParkedHeartbeat(c, agent, data, {
+      authenticatedWithPreviousToken: c.get('agentTokenRotationRequired') === true,
+      pendingTokenPresented: c.get('agentPendingTokenPresented') === true,
+    });
   }
 
   // #1121 — observability for the #1065 tolerance trade-off. watchdogState is
@@ -457,35 +720,22 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     // rather than inherited. Without it the `breeze.current_partner_id` GUC is
     // empty here and Wave 1's SELECT-only partner-wide branches can never match.
     //
-    // Scope note, so nobody over-reads this: the field is still INERT on THIS
-    // route, and W03 did not change that — read the paragraph below before
-    // "cleaning up" the hoisted system contexts further down.
-    //
-    // W03 deleted the NESTED escapes (`withPartnerWideVisibility` and the
-    // direct `runOutsideDbContext(() => withSystemDbAccessContext(...))`
-    // wraps), so on every OTHER caller of these resolvers — agents/eventlogs,
-    // agents/commands, the backup routes, alertService, policyEvaluationService,
-    // pamBridge, the feature-link routes — the read now happens in the caller's
-    // own context and this GUC is exactly what carries it. The heartbeat is the
-    // one path where it does not, because the reads below are HOISTED into
-    // their own top-level system contexts (this route opts out of the
-    // request-long wrap). Those are not nested and cost no second connection,
-    // so W03 had no reason to touch them.
-    //
-    // Converting them to org-scoped contexts is a real follow-up — it would
-    // close the last RLS-bypass surface on the hottest path — but it is NOT a
-    // drop-in swap, which is why it is not in this wave:
-    // `buildPatchSourceConfigUpdate` reaches `resolveDeviceTimezone`, whose
-    // `partners` read is partner-AXIS and escapes through
-    // `readWithPartnerAxisVisibility` (#2822). Under a system wrapper that
-    // escape short-circuits; under an org wrapper it fires, uncached, once per
-    // heartbeat — turning one hoisted context into a genuinely NESTED
-    // double-hold on the fleet's hottest path, which is the #1105 shape this
-    // whole epic exists to remove. The timezone read has to be hoisted or
-    // batched first. Track it separately; do not do it by analogy with W03.
+    // #8142 (scaling W03 / W1a-2): this field is LOAD-BEARING on this route
+    // too. The post-commit policy context further down REUSES this context —
+    // it used to be two hoisted system contexts — so every partner-wide policy
+    // the beat delivers (helper, event log, hardware monitoring, monitoring,
+    // PAM, patch source, warranty, time sync, the policy probe) is read
+    // through the SELECT-only *_partner_wide_select branches keyed on
+    // breeze.current_partner_id. Drop it and those policies silently stop
+    // reaching agents, with no error. The patch-source partner-axis timezone
+    // read that used to block this was removed in W01 (#8222).
     //
     // Read-only widening to the device's own MSP; see agentAuth.ts.
     currentPartnerId: agent.partnerId,
+    // #8142 — an agent is not a user. Explicitly null: a userId would enable
+    // the users self-read RLS branch, and DeferredCacheFills refuses to store
+    // any per-org fill read under a context that carries one.
+    userId: null,
   };
 
   // Org > General > Agent update policy — governs whether we may hand the agent
@@ -497,11 +747,16 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
   // RLS, so a partner-locked policy would be silently invisible there. This
   // short-lived context also opens and CLOSES before the org transaction below,
   // so we never hold two pooled connections at once (#1105 mass-reconnect
-  // deadlock — same pattern as the policy-probe/trust-keyset reads at the end).
+  // deadlock — same pattern as the trust-keyset/delegation reads at the end).
   // Fails CLOSED (#2125): the gate starts denied and is only opened by a
   // successful policy evaluation; a lookup failure withholds version-to-version
   // targets rather than bypass Manual mode / a maintenance window. Bootstrap
   // installs (a component not yet present) are NOT gated inside the block below.
+  //
+  // #8053: served from a per-org process cache (60 s, invalidated by the
+  // org/partner settings routes), so the system context below opens once per
+  // org per TTL instead of once per agent per beat. A failed lookup is never
+  // cached, so the fail-closed default below still re-resolves next beat.
   //
   // The SAME resolver also returns the effective per-component version pins
   // (issue #2124), so this one system-context round trip yields both the gate
@@ -516,9 +771,7 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
   let pinsResolved = false;
   let versionPins: AgentVersionPins = { agent: null, watchdog: null };
   try {
-    const updateConfig = await withSystemDbAccessContext(() =>
-      getOrgAgentUpdateConfig(agent.orgId),
-    );
+    const updateConfig = await getOrgAgentUpdateConfigCached(agent.orgId);
     versionPins = updateConfig.pins;
     pinsResolved = true;
     const gate = shouldSendAgentUpgrade(updateConfig.settings, new Date());
@@ -551,28 +804,50 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
   // holder never got its second connection — a pool deadlock broken only by
   // idle_in_transaction_session_timeout. Same #1105 ordering as the update
   // policy above. On failure topology is skipped for this beat, never
-  // re-resolved inside the transaction.
+  // re-resolved inside the transaction. Per-org process cache, same as the
+  // update policy (#8053).
   let topologyFlags: TopologyFlags | null = null;
   try {
-    topologyFlags = await withSystemDbAccessContext(() =>
-      loadTopologyFlags({ scope: { orgId: agent.orgId, siteId: agent.siteId } }),
-    );
+    topologyFlags = await loadAgentTopologyFlags(agent.orgId);
   } catch (err) {
     console.error(`[heartbeat] failed to resolve topology flags for ${agentId}; skipping topology collection:`, err);
     captureException(err);
   }
 
+  // #8318 §6.4: what the scoped block hands back when this beat turns out to
+  // be a stale caller (see `ownDeviceRowChangedHands` below). The rejection is
+  // thrown after the block, and agent auth's own error rendering answers it.
+  const STALE_CALLER = { staleCaller: true } as const;
+
   const scoped = await withDbAccessContext(
     dbContext,
-    async (): Promise<Response | { deviceOrgId: string; deviceId: string; mainResponse: Record<string, unknown> }> => {
+    async (): Promise<Response | typeof STALE_CALLER | { deviceOrgId: string; deviceSiteId: string; deviceOwnershipEpoch: number; deviceId: string; siteKey: string; watchdogOnly?: boolean; mainResponse: Record<string, unknown>; remoteManagement?: RemoteManagementDecision }> => {
 
-  const [device] = await db
-    .select()
-    .from(devices)
-    .where(eq(devices.id, agent.deviceId))
-    .limit(1);
+  // #8318 §6.4: the beat's FIRST statement reads its own row bound to the
+  // authenticated id + agent_id and locks it (FOR NO KEY UPDATE, see
+  // selectOwnDeviceRowForUpdate). Everything below works from this row — the
+  // bare-metal check-in, the readiness refresh, the role-flip audit, the
+  // watchdog silence event — so a beat that a reattach confirm or an in-place
+  // re-enroll overtook must stop HERE, before any of it, not at the device
+  // write near the end (which would commit those effects onto the new
+  // install's row). The lock makes the answer hold until commit: a confirm
+  // that starts after this read waits for the beat, and one that committed
+  // before it leaves 0 rows. It is also the beat's first row lock, so it
+  // keeps confirm's devices → other-tables order.
+  const device = await selectOwnDeviceRowForUpdate(db, agent);
 
   if (!device) {
+    // 0 rows: the row now carries another agent_id (stale caller, the
+    // stale-credential 401 below, nothing written) or it is gone (today's
+    // not-found answer). The re-read only runs on this path.
+    if (await ownDeviceRowChangedHands(db, agent)) {
+      console.warn('[heartbeat] stale beat: the device row changed hands after auth; refusing it', {
+        deviceId: agent.deviceId,
+        agentId,
+        role: agent.role,
+      });
+      return STALE_CALLER;
+    }
     return c.json({ error: 'Device not found' }, 404);
   }
 
@@ -589,7 +864,7 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     });
     return c.json({
       error: 'Agent credential role mismatch',
-      code: 're_enrollment_required',
+      code: ERROR_CODES.RE_ENROLLMENT_REQUIRED,
       expected: agent.role,
       declared: data.role,
     }, 401);
@@ -621,18 +896,38 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
       watchdogStatus: data.watchdogState === 'FAILOVER' ? 'failover' : 'connected',
       watchdogLastSeen: now,
       watchdogVersion: data.agentVersion,
+      // #4297 — the watchdog's own edition, written WITH its version so the
+      // pair always describes the same binary. Unconditional: a silent beat
+      // clears a value an earlier build reported (a rollback or reinstall to a
+      // pre-reporting build must not inherit it); readers then fall back to
+      // agentEdition (effectiveWatchdogEdition).
+      watchdogEdition: data.agentEdition ?? null,
       updatedAt: now,
     };
     if (transitioningIntoSilent) {
       watchdogUpdates.mainAgentSilentSince = now;
     }
 
+    let watchdogRowsUpdated: number | null = null;
     try {
-      await db.update(devices)
-        .set(watchdogUpdates)
-        .where(eq(devices.id, device.id));
+      // #8318 §6.4: bound to the authenticated id + agent_id, so a watchdog
+      // beat of a superseded install matches 0 rows after a reattach confirm.
+      watchdogRowsUpdated = (await withDbTransaction(() => updateOwnDeviceRow(db, agent, watchdogUpdates))).length;
     } catch (err) {
       console.error('Failed to update watchdog status:', err);
+    }
+    // #8318 §6.4: the row changed hands after this beat authenticated (the
+    // watchdog write has no status guard, so a 0-row write is that or a
+    // vanished row). Same as the main beat below: no silence event, log row,
+    // command claim or upgrade target for the retired install — the
+    // stale-credential 401. Defence in depth: the bound read at the top of
+    // the block already holds the row, so this should not fire.
+    if (watchdogRowsUpdated === 0 && (await ownDeviceRowChangedHands(db, agent))) {
+      console.warn('[heartbeat] stale watchdog beat: the device row changed hands after auth; refusing it', {
+        deviceId: agent.deviceId,
+        agentId,
+      });
+      return STALE_CALLER;
     }
 
     // Emit only on the silence→silent transition so subscribers (alerts,
@@ -665,7 +960,7 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
       shouldLogWatchdogRestartActivity(device.id, restartSignature, now.getTime())
     ) {
       try {
-        await db.insert(agentLogs).values({
+        await withDbTransaction(() => db.insert(agentLogs).values({
           deviceId: device.id,
           orgId: device.orgId,
           timestamp: new Date(),
@@ -681,7 +976,7 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
             watchdogState: data.watchdogState ?? null,
           },
           agentVersion: data.agentVersion,
-        });
+        }));
         // Commit to the dedupe cache only after the row landed — a failed
         // insert must stay retryable on the next heartbeat.
         markWatchdogRestartActivityLogged(device.id, restartSignature, now.getTime());
@@ -699,7 +994,7 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     // this line via a TENANT drain: a device-remove drain admits `role==='agent'`
     // only (middleware/agentAuth.ts Layer 1b).
     const watchdogCommands = await claimPendingCommandsForDevice(
-      device.id,
+      { deviceId: device.id, agentId: agent.agentId, installIncarnation: agent.installIncarnation },
       10,
       'watchdog',
       agent?.claimTypeAllowlist
@@ -714,25 +1009,34 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     // failover beat.
     //
     // A SILENT watchdog is NOT evidence of a self-host build the way a silent
-    // main agent is: watchdog edition reporting first ships alongside this
-    // gate, so every watchdog in the field today is silent — including the
-    // hosted fleet's, whose recovery path (#1104) must not be withheld. Fall
-    // back to the device row's agentEdition, written unconditionally from
-    // every MAIN-agent beat: agent and watchdog install and upgrade from the
-    // same lane, so the main agent's build edition identifies the watchdog's.
-    // If both are silent (the stranded pre-telemetry band), the version-band
-    // inference inside the predicate takes over. Known imprecision: a device
-    // whose main agent already reports 'self-host' (transition-capable) but
-    // whose watchdog is still an older self-host build gets a hosted offer
+    // main agent is: watchdog edition reporting first shipped alongside this
+    // gate, so every older watchdog build is silent — including the hosted
+    // fleet's, whose recovery path (#1104) must not be withheld.
+    //
+    // #4297 — this beat's payload IS the watchdog's own report, and it is what
+    // watchdogUpdates just wrote to devices.watchdog_edition, so it goes in as
+    // the watchdog edition. The stored column is deliberately NOT consulted
+    // for a silent beat: it describes an earlier build, and this beat
+    // supersedes it. effectiveWatchdogEdition then falls back to the device
+    // row's agentEdition, written unconditionally from every MAIN-agent beat
+    // — a stated degradation that assumes agent and watchdog install and
+    // upgrade from the same lane. If both are silent (the stranded
+    // pre-telemetry band), the version-band inference inside the predicate
+    // takes over. Known imprecision of the fallback: a device whose main
+    // agent already reports 'self-host' (transition-capable) but whose
+    // watchdog is still an older silent self-host build gets a hosted offer
     // its watchdog refuses — failover-only, self-heals once the watchdog
     // catches up via the main branch.
     // Hoisted so the warn calls below print the value that actually DECIDED
     // (the fallback included) — logging the silent payload as "none" when the
     // stored edition drove the withhold would steer the operator to the wrong
     // remediation.
-    const effectiveWatchdogEdition = data.agentEdition ?? device.agentEdition;
+    const watchdogEditionForGate = effectiveWatchdogEdition({
+      watchdogEdition: data.agentEdition,
+      agentEdition: device.agentEdition,
+    });
     const watchdogAcceptsServedEdition = agentAcceptsServedEdition({
-      reportedEdition: effectiveWatchdogEdition,
+      reportedEdition: watchdogEditionForGate,
       agentVersion: data.agentVersion,
     });
 
@@ -765,7 +1069,7 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
           warnEditionOfferWithheld({
             deviceId: device.id,
             role: 'watchdog',
-            reportedEdition: effectiveWatchdogEdition,
+            reportedEdition: watchdogEditionForGate,
             agentVersion: data.agentVersion,
           });
         }
@@ -798,7 +1102,7 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
       // when no watchdog target resolves).
       warnEditionRecoveryWithheld({
         deviceId: device.id,
-        reportedEdition: effectiveWatchdogEdition,
+        reportedEdition: watchdogEditionForGate,
         agentVersion: data.agentVersion,
       });
     } else if (watchdogAcceptsServedEdition) {
@@ -831,7 +1135,22 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
         });
 
         if (targetAgent && compareAgentVersions(targetAgent, device.agentVersion) > 0) {
-          agentUpgradeTo = targetAgent;
+          // Supported recovery targets need no episode read. Below-floor targets
+          // require absence of an unresolved episode; isolate lookup faults in a savepoint.
+          if (isolationAgentUpgradeGate(targetAgent, true).allow) {
+            agentUpgradeTo = targetAgent;
+          } else {
+            try {
+              const { findUnresolvedEpisode } = await import('../../services/networkIsolation/episodeStore');
+              const unresolved = await withDbTransaction(() => findUnresolvedEpisode(
+                db as unknown as import('../../services/networkIsolation/episodeStore').EpisodeTx, device.id,
+              ));
+              if (isolationAgentUpgradeGate(targetAgent, unresolved !== null).allow) agentUpgradeTo = targetAgent;
+            } catch (err) {
+              console.error('[heartbeat] watchdog recovery isolation lookup failed', { deviceId: device.id, orgId: device.orgId });
+              captureException(err, undefined, { phase: 'isolation_watchdog_upgrade_lookup', deviceId: device.id, orgId: device.orgId });
+            }
+          }
         }
       } catch (err) {
         console.error(`[agents] failed to evaluate watchdog-branch agent recovery target for ${agentId}:`, err);
@@ -846,15 +1165,24 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     // than letting it re-read the column: the watchdog branch returns before
     // the device update at all, so the stored value here is always from an
     // earlier beat.
-    return c.json({
+    return {
+      deviceOrgId: device.orgId,
+      deviceSiteId: device.siteId,
+      deviceOwnershipEpoch: device.ownershipEpoch,
+      deviceId: device.id,
+      siteKey: `${device.orgId}:${device.siteId ?? 'unassigned'}`,
+      watchdogOnly: true,
+      mainResponse: {
       commands: await prepareClaimedCommandsForDelivery(watchdogCommands, {
         reportedScriptSecretEnvVersion: normalizeReportedScriptSecretEnvVersion(
           data.securityCapabilities?.scriptSecretEnvVersion,
         ),
       }),
+      containment: { networkIsolation: null },
       watchdogUpgradeTo,
       upgradeTo: agentUpgradeTo,
-    });
+      },
+    };
   }
 
   const deviceUpdates: Record<string, unknown> = {
@@ -874,6 +1202,10 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     // a downgrade FROM a capable build back to an old one — correctly
     // reports back down to 0 rather than leaving a stale capability claim
     // that Task 5's dispatch gate would wrongly trust.
+    networkIsolationVersion: data.securityCapabilities?.networkIsolationVersion ?? 0,
+    networkIsolationMechanism: data.securityCapabilities?.networkIsolationMechanism ?? null,
+    networkIsolationUnsupportedReason: data.securityCapabilities?.networkIsolationUnsupportedReason ?? null,
+    networkIsolationReady: data.securityCapabilities?.networkIsolationReady ?? false,
     outboundNetworkPolicyVersion: data.securityCapabilities?.outboundNetworkPolicyVersion === 1 ? 1 : 0,
     // #3409 PR4 — same non-sticky contract as the line above: written every
     // beat so a downgrade is detected. PR4c re-checks this at CLAIM time too,
@@ -891,15 +1223,35 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     pamLifetimeProtocolVersion: normalizePamLifetimeProtocolVersion(
       data.securityCapabilities?.pamLifetimeProtocolVersion,
     ),
+    pamReconciliationResetProtocolVersion: data.securityCapabilities?.pamReconciliationResetProtocolVersion === 1 ? 1 : 0,
+    pamUserNotifyProtocolVersion: normalizePamUserNotifyProtocolVersion(
+      data.securityCapabilities?.pamUserNotifyProtocolVersion,
+    ),
     // Revocation-lease capability, same non-sticky contract: rewritten every
     // beat so an agent DOWNGRADE stops the dispatch gate trusting a stale claim
     // and desktop sessions are refused again until the agent is back.
     revocationLeaseProtocolVersion: normalizeRevocationLeaseProtocolVersion(
       data.securityCapabilities?.revocationLeaseProtocolVersion,
     ),
-    // SEC-038 W06 desktop fence capability, same non-sticky contract.
+    // Desktop fence capability, same non-sticky contract.
     desktopFenceProtocolVersion: normalizeDesktopFenceProtocolVersion(
       data.securityCapabilities?.desktopFenceProtocolVersion,
+    ),
+    // Consent/notification prompt capability, same non-sticky contract: an
+    // agent that stops reporting it self-heals back to 0 so a policy
+    // requiring consent is refused again rather than trusting a stale claim.
+    consentPromptProtocolVersion: normalizeConsentPromptProtocolVersion(
+      data.securityCapabilities?.consentPromptProtocolVersion,
+    ),
+    // Workload inventory capability (#3834), same non-sticky contract: an
+    // agent that stops reporting it self-heals back to 0.
+    workloadInventoryProtocolVersion: normalizeWorkloadInventoryProtocolVersion(
+      data.securityCapabilities?.workloadInventoryProtocolVersion,
+    ),
+    // #8318 §6.2 — rebind capability, same non-sticky contract: a downgrade
+    // reports back down to 0, which also stops the `rebind` directive.
+    rebindProtocolVersion: normalizeRebindProtocolVersion(
+      data.securityCapabilities?.rebindProtocolVersion,
     ),
     // Migration-banner Task 2 — self-reported install edition + migration
     // flag. Written UNCONDITIONALLY every heartbeat, mirroring
@@ -917,6 +1269,88 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     uninstallIntentAt: null,
     updatedAt: new Date()
   };
+  // Backup helper protocols (brokered read, snapshot integrity, brokered
+  // write), same non-sticky contract when the agent reports a value: a helper
+  // downgrade (or an agent that stops reporting them) reads as 0 on the next
+  // beat, so restore commands stop receiving storage sessions. An explicit
+  // null (the agent's probe of its helper got no answer) keeps a positive
+  // last-known value unless this beat's helper version predates that
+  // protocol, and otherwise leaves the device unreported; it is never written
+  // as 0 (services/backupHelperProtocols.ts).
+  for (const [field, normalize] of [
+    ['backupReadProtocolVersion', normalizeBackupReadProtocolVersion],
+    ['backupIntegrityProtocolVersion', normalizeBackupIntegrityProtocolVersion],
+    ['backupWriteProtocolVersion', normalizeBackupWriteProtocolVersion],
+  ] as const) {
+    const value = backupHelperProtocolColumnWrite(data[field], device[field], normalize, {
+      helperPredatesProtocol: backupHelperVersionPredates(data.backupVersion, BACKUP_HELPER_PROTOCOL_MIN_VERSION[field]),
+    });
+    if (value !== undefined) deviceUpdates[field] = value;
+  }
+
+  // #6449 — persist the edition-gate withhold on the device row so stranded
+  // devices are visible in the UI (the log/Sentry above are once per process
+  // for the whole fleet). Same predicate + same beat-payload inputs as the
+  // offer gate further down. Written ONLY on a state transition (compared to
+  // the row this beat already loaded), so a steady-state beat — withheld or
+  // healthy — adds no column write to the hot path; `since` therefore holds
+  // when the episode began, not the last beat.
+  const withholdReason =
+    normalizeAgentArchitecture(device.architecture) &&
+    !agentAcceptsServedEdition({ reportedEdition: data.agentEdition, agentVersion: data.agentVersion })
+      ? EDITION_OFFER_WITHHELD_REASON
+      : null;
+  if ((device.updateOfferWithheldReason ?? null) !== withholdReason) {
+    deviceUpdates.updateOfferWithheldReason = withholdReason;
+    deviceUpdates.updateOfferWithheldSince = withholdReason ? new Date() : null;
+  }
+
+  // #4073 — close the update-attempt record (stamped by the WS update_status
+  // message before every self-update attempt) once this beat reports the
+  // target version or newer. Written only when a record is open, so healthy
+  // devices add no column write. A record left open is the stuck-update
+  // signal (isAgentUpdateStuck); an unparseable version compares equal and
+  // closes it, so the signal never fires on a version we cannot judge.
+  if (
+    device.updateAttemptTargetVersion &&
+    compareAgentVersions(data.agentVersion, device.updateAttemptTargetVersion) >= 0
+  ) {
+    deviceUpdates.updateAttemptTargetVersion = null;
+    deviceUpdates.updateAttemptStartedAt = null;
+    deviceUpdates.updateAttemptLastAt = null;
+    deviceUpdates.updateAttemptCount = null;
+  }
+
+  // #8869 — ECH telemetry: counters only (no persistence). Absent = not counted.
+  if (data.echActive !== undefined) recordAgentHeartbeatEch(data.echActive);
+  if (data.filterSignatureSeenAt !== undefined) recordAgentFilterSignatureReport();
+
+  // #6925 — persist the agent's Breeze Assist install problem ("enabled but
+  // not installed, no server offer", or an abandoned install) so it shows on
+  // the device page and device list instead of one agent-side log line.
+  // Absent = no problem (the agent omits the field when healthy, and older
+  // agents never send it), so a stale value self-clears. Same state-change-only
+  // write as #6449 above: steady-state beats add no column write.
+  const helperInstallIssue = data.helperInstallIssue ?? null;
+  if ((device.helperInstallIssue ?? null) !== helperInstallIssue) {
+    deviceUpdates.helperInstallIssue = helperInstallIssue;
+    deviceUpdates.helperInstallIssueSince = helperInstallIssue ? new Date() : null;
+  }
+
+  // #8608 — log-shipping health (#8406). Classified per beat, persisted ONLY on
+  // a state change against the `device` row this beat already loaded, so
+  // steady-state beats add zero keys to this single UPDATE. Absent = the agent
+  // does not report it (old agent / downgrade) -> reset to unknown; a malformed
+  // object changes nothing (neither clears nor extends an episode).
+  Object.assign(deviceUpdates, planLogShippingWrite(device, parseLogShipping(data.logShipping), new Date()));
+
+  // #8620 — watchdog install health (#8618). Same contract as above: the plan
+  // is compared to the already-loaded `device` row, so a steady-state beat adds
+  // zero keys. Absent = healthy/unreported -> cleared; malformed = no change.
+  Object.assign(
+    deviceUpdates,
+    planWatchdogInstallWrite(device, parseWatchdogInstall(data.watchdogInstall), new Date()),
+  );
 
   // #800 Layer C — recovery side. If the asymmetry detector previously
   // set mainAgentSilentSince (watchdog kept reporting while we went
@@ -932,8 +1366,25 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
   // 'auto' is the fleet-wide default, so without the inequality check every
   // steady-state heartbeat would look like a filterable change and trigger a
   // dynamic-group re-evaluation (#4630 review).
+  //
+  // A flip INTO a privileged role (server/DC-style dynamic-group targeting)
+  // is agent-reported and server-unverified, so it is not auto-applied: the
+  // stored role is left as-is and the claim is audit-logged for review
+  // instead of silently granted the group memberships that role targets.
   if (data.deviceRole && device.deviceRoleSource === 'auto' && data.deviceRole !== device.deviceRole) {
-    deviceUpdates.deviceRole = data.deviceRole;
+    if (shouldAutoApplyAgentReportedDeviceRole(device.deviceRole, data.deviceRole)) {
+      deviceUpdates.deviceRole = data.deviceRole;
+    } else {
+      writeAuditEvent(c, {
+        orgId: agent.orgId,
+        action: 'device.role.self_reported_privileged_flip_blocked',
+        resourceType: 'device',
+        resourceId: device.id,
+        result: 'success',
+        actorType: 'agent',
+        details: { from: device.deviceRole, reported: data.deviceRole },
+      });
+    }
   }
 
   // Keep devices.watchdog_version fresh from the main agent's heartbeat (#1802).
@@ -943,6 +1394,18 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
   // — leave the stored value untouched in that case.
   if (data.watchdogVersion) {
     deviceUpdates.watchdogVersion = data.watchdogVersion;
+    // #4297 — devices.watchdog_edition is the watchdog's own report about the
+    // build at watchdog_version. A different installed version (an upgrade,
+    // rollback or reinstall through the main agent) means that report no
+    // longer describes the binary on disk, so drop it and let readers fall
+    // back to agentEdition until the watchdog next reports. No race with a
+    // concurrent watchdog beat: both beats take the row's FOR NO KEY UPDATE
+    // lock as their first statement (selectOwnDeviceRowForUpdate, above) and
+    // hold it to commit, so `device.watchdogVersion` here is the committed
+    // value this write replaces.
+    if (data.watchdogVersion !== device.watchdogVersion) {
+      deviceUpdates.watchdogEdition = null;
+    }
   }
 
   // Keep devices.backup_version fresh from the agent's heartbeat, mirroring
@@ -950,6 +1413,16 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
   // leaves the stored value untouched.
   if (data.backupVersion) {
     deviceUpdates.backupVersion = data.backupVersion;
+  }
+
+  // Persist the installed Breeze Assist helper version (#6751) — it was read
+  // for helperUpgradeTo below and then discarded, so a helper stuck behind the
+  // promoted release was invisible. Written only on change: helperVersion is a
+  // filter field, and an unconditional write would make every heartbeat look
+  // like a filterable change (dynamic-group re-evaluation below). Absent (old
+  // agent, or helper not installed) leaves the stored value untouched.
+  if (data.helperVersion && data.helperVersion !== device.helperVersion) {
+    deviceUpdates.helperVersion = data.helperVersion;
   }
 
   // Rollback protocol v1 agents must replace this as a complete snapshot on
@@ -1115,23 +1588,74 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
       recoveryMarkerAck = true;
     } else if (rec && nonceOk && rec.identity === 'original' && ['restoring', 'validated', 'rebooted'].includes(rec.status)) {
       const checkedInNow = new Date();
-      await db.update(bareMetalRecoveries).set({
+      // #5876: guarded transition — only the heartbeat that wins it records the
+      // recovery on the device and creates the reliability baseline marker.
+      // identity='original' stays in the predicate: a 'new'-identity recovery
+      // is a different machine. Losing the race still acks: the recovery IS
+      // checked in.
+      const [won] = await db.update(bareMetalRecoveries).set({
         status: 'checked_in',
         checkedInAt: checkedInNow,
         rebootedAt: rec.rebootedAt ?? checkedInNow,
         updatedAt: checkedInNow,
-      }).where(eq(bareMetalRecoveries.id, rec.id));
-      deviceUpdates.recoveredAt = checkedInNow;
-      deviceUpdates.recoveredFromSnapshotId = rec.snapshotId;
+      }).where(and(
+        eq(bareMetalRecoveries.id, rec.id),
+        eq(bareMetalRecoveries.identity, 'original'),
+        inArray(bareMetalRecoveries.status, ['restoring', 'validated', 'rebooted']),
+      )).returning({ id: bareMetalRecoveries.id });
       recoveryMarkerAck = true;
-      writeAuditEvent(c, {
-        orgId: agent.orgId,
-        action: 'bmr.recovery.checked_in',
-        resourceType: 'bare_metal_recovery',
-        resourceId: rec.id,
-        result: 'success',
-        details: { deviceId: device.id, snapshotId: rec.snapshotId, from: rec.status },
-      });
+      if (won) {
+        refreshReadinessAfterRecovery(agent.orgId, device.id);
+        deviceUpdates.recoveredAt = checkedInNow;
+        deviceUpdates.recoveredFromSnapshotId = rec.snapshotId;
+        writeAuditEvent(c, {
+          orgId: agent.orgId,
+          action: 'bmr.recovery.checked_in',
+          resourceType: 'bare_metal_recovery',
+          resourceId: rec.id,
+          result: 'success',
+          details: { deviceId: device.id, snapshotId: rec.snapshotId, from: rec.status },
+        });
+        // The marker is a side effect of the check-in, not part of it: it runs
+        // in its own savepoint so a scorer/SQL failure rolls back only the
+        // marker and can never 500 the heartbeat or undo the check-in (which
+        // would leave the agent resending its marker forever).
+        try {
+          const baseline = await withDbTransaction(() => createReliabilityBaseline({
+            device: { id: device.id, orgId: agent.orgId, deviceRole: device.deviceRole ?? null, enrolledAt: device.enrolledAt ?? null },
+            reason: 'reimaged',
+            baselineAt: checkedInNow,
+            note: null,
+            source: 'bare_metal_recovery',
+            sourceRef: rec.id,
+            createdBy: null,
+            recompute: false,
+          }));
+          if (baseline) {
+            // actorType 'system' (actorId resolves to the nil system actor) so
+            // the device activity feed, which hides agent-actor rows, shows it.
+            writeAuditEvent(c, {
+              orgId: agent.orgId,
+              actorType: 'system',
+              action: 'device.reliability.baseline_set',
+              resourceType: 'device',
+              resourceId: device.id,
+              details: { baselineId: baseline.id, reason: 'reimaged', source: 'bare_metal_recovery', recoveryId: rec.id },
+              result: 'success',
+            });
+            const deviceId = device.id;
+            runAfterDbContextExit('reliability-baseline-recompute', () =>
+              enqueueDeviceReliabilityComputation(deviceId, { dedupeKey: `bmr-${rec.id}` }).catch((err) => {
+                // The marker is committed but the score stays pre-marker until the next scan.
+                console.error('[heartbeat] reliability recompute enqueue failed', { deviceId, err });
+                captureException(err);
+              }));
+          }
+        } catch (err) {
+          console.error('[heartbeat] failed to place reliability baseline marker for recovery', { deviceId: device.id, recoveryId: rec.id, err });
+          captureException(err);
+        }
+      }
     } else {
       writeAuditEvent(c, {
         orgId: agent.orgId,
@@ -1145,6 +1669,22 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
         },
       });
     }
+  }
+
+  // #8206 — record which ownership epoch's identity the agent has loaded, so
+  // PAM dispatch (jobs/pamActuationWorker.ts) waits until the agent holds the
+  // identity of the row's current epoch. Rides this beat's existing guarded
+  // UPDATE (one write per beat at most, none when nothing advances). The SQL is
+  // monotonic and bounded by the row's epoch at write time, so a concurrent
+  // move or a stale snapshot can neither lower the ack nor push it past the row.
+  const identityEpochAck = agentIdentityEpochAckToRecord(data.reportedIdentity, {
+    id: device.id,
+    orgId: device.orgId,
+    ownershipEpoch: device.ownershipEpoch,
+    agentIdentityEpochAck: device.agentIdentityEpochAck ?? null,
+  });
+  if (identityEpochAck !== null) {
+    deviceUpdates.agentIdentityEpochAck = agentIdentityEpochAckUpdateSql(identityEpochAck);
   }
 
   // agentAuthMiddleware 403s quarantined devices and every decommissioned
@@ -1163,14 +1703,32 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
   // terminal-status device matches 0 rows, so `updatedRows` is empty and the
   // state-transition audit below is skipped (finding #10 — never audit a write
   // that the guard rejected).
-  const updatedRows = await db
-    .update(devices)
-    .set(deviceUpdates)
-    .where(and(
-      eq(devices.id, device.id),
-      notInArray(devices.status, ['decommissioned', 'quarantined'])
-    ))
-    .returning({ id: devices.id });
+  //
+  // #8318 §6.4: through updateOwnDeviceRow, so the write is also bound to the
+  // agent_id this beat authenticated as. A beat the previous install sent just
+  // before a reattach confirm matches 0 rows, exactly like a terminal-status
+  // row, and records no phantom transition.
+  const updatedRows = await updateOwnDeviceRow(db, agent, deviceUpdates, {
+    where: notInArray(devices.status, ['decommissioned', 'quarantined']),
+  });
+
+  // #8318 §6.4: a 0-row write is either the terminal-status guard (the row
+  // still carries this caller's agent_id: carry on exactly as before) or a
+  // stale caller — a reattach confirm or an in-place re-enroll gave the row to
+  // another install after this beat authenticated. Nothing after this point
+  // belongs to a stale caller: no metrics, IP history, child syncs or audit on
+  // the new install's row, and no configuration, upgrade or rotation
+  // instructions for the retired one. It gets the stale-credential 401 agent
+  // auth gives a token that no longer matches. Defence in depth: the bound
+  // read at the top of the block already refused a stale beat and holds the
+  // row until commit, so only the terminal-status half is expected here.
+  if (updatedRows.length === 0 && (await ownDeviceRowChangedHands(db, agent))) {
+    console.warn('[heartbeat] stale beat: the device row changed hands after auth; refusing it', {
+      deviceId: agent.deviceId,
+      agentId,
+    });
+    return STALE_CALLER;
+  }
 
   // Durable audit of security-relevant device state transitions (finding #10).
   // The heartbeat mutates several security-relevant fields but previously left
@@ -1196,19 +1754,21 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     }
     // agentServerUrl / tccPermissions / desktopAccess are written unconditionally
     // when reported, so compare against the pre-update snapshot to avoid auditing
-    // an unchanged re-report.
+    // an unchanged re-report. tcc/desktop MUST use the semantic comparators, not
+    // a JSON diff: their `checkedAt` moves on every beat, and a raw diff chained
+    // one audit row per macOS/Linux device per heartbeat (#4340).
     if (deviceUpdates.agentServerUrl !== undefined && deviceUpdates.agentServerUrl !== device.agentServerUrl) {
       changes.push({ field: 'agentServerUrl', before: device.agentServerUrl ?? null, after: deviceUpdates.agentServerUrl });
     }
     if (
       deviceUpdates.tccPermissions !== undefined &&
-      JSON.stringify(deviceUpdates.tccPermissions) !== JSON.stringify(device.tccPermissions ?? null)
+      tccPermissionsMeaningfullyChanged(device.tccPermissions, deviceUpdates.tccPermissions as TCCPermissions)
     ) {
       changes.push({ field: 'tccPermissions', before: device.tccPermissions ?? null, after: deviceUpdates.tccPermissions });
     }
     if (
       deviceUpdates.desktopAccess !== undefined &&
-      JSON.stringify(deviceUpdates.desktopAccess) !== JSON.stringify(device.desktopAccess ?? null)
+      desktopAccessMeaningfullyChanged(device.desktopAccess, deviceUpdates.desktopAccess as DesktopAccessState)
     ) {
       changes.push({ field: 'desktopAccess', before: device.desktopAccess ?? null, after: deviceUpdates.desktopAccess });
     }
@@ -1228,6 +1788,49 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
       const nowSet = (deviceUpdates.mainAgentSilentSince ?? null) !== null;
       if (wasSet !== nowSet) {
         changes.push({ field: 'mainAgentSilent', before: wasSet, after: nowSet });
+      }
+    }
+
+    // Backup helper protocols dropping below the stored value (a helper
+    // downgrade or reinstall, or an agent that stopped reporting them). Each
+    // drop is recorded per device (the metrics have no device dimension) as a
+    // state change AND a dedicated capability-regression audit event, so an
+    // unexpected downgrade can be found and followed. The stored value is
+    // rewritten by this same guarded write, so a steady report afterwards is
+    // not a drop and is not audited again.
+    for (const [capability, field] of BACKUP_HELPER_CAPABILITY_FIELDS) {
+      // An unknown report (explicit null) is never a drop: the column was
+      // kept, or a stored 0 moved to "not reported yet", which is recorded
+      // as a state change (backups for the device now wait for a report).
+      if (data[field] === null) {
+        const stored = device[field] ?? null;
+        if (field in deviceUpdates && deviceUpdates[field] === null && stored !== null) {
+          changes.push({ field, before: stored, after: null });
+        }
+        continue;
+      }
+      const before = Number(device[field] ?? 0);
+      const after = Number(deviceUpdates[field] ?? 0);
+      if (!(after < before)) continue;
+      changes.push({ field, before, after });
+      writeAuditEvent(c, {
+        orgId: device.orgId,
+        actorType: 'agent',
+        actorId: agentId,
+        action: 'device.backup_capability.regressed',
+        resourceType: 'device',
+        resourceId: device.id,
+        result: 'success',
+        details: { capability, before, after },
+      });
+      recordBackupCapabilityRegressed(capability);
+      if (capability === 'read') {
+        console.warn('[heartbeat] backup read protocol dropped; restore commands for this device are refused until its backup helper is updated', {
+          deviceId: device.id,
+          orgId: device.orgId,
+          before,
+          after,
+        });
       }
     }
 
@@ -1253,7 +1856,7 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     // group in the org, plus a peripheral-policy enqueue per membership flip),
     // so it belongs on the queue — see jobs/deviceGroupJobs.ts for the full
     // rationale. `requestDeviceGroupReevaluation` never rejects.
-    const filterableChangedFields = (['hostname', 'osVersion', 'osBuild', 'deviceRole'] as const)
+    const filterableChangedFields = (['hostname', 'osVersion', 'osBuild', 'deviceRole', 'helperVersion'] as const)
       .filter((field) => deviceUpdates[field] !== undefined);
     if (filterableChangedFields.length > 0) {
       void requestDeviceGroupReevaluation({
@@ -1283,8 +1886,8 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
   // recovery / drop without requiring a remount. Mirrors the agentVersion
   // publish above; guarded on deviceUpdates.desktopAccess (only set when the
   // agent actually reported the field) diffed against the pre-update
-  // snapshot with desktopAccessMeaningfullyChanged — a raw JSON.stringify
-  // diff (as the state-change audit above uses) would fire on every
+  // snapshot with desktopAccessMeaningfullyChanged (as the state-change audit
+  // above also does, #4340) — a raw JSON.stringify diff would fire on every
   // heartbeat because `checkedAt` is refreshed unconditionally by the agent.
   //
   // `deviceUpdates` is a loosely-typed `Record<string, unknown>`, so TS
@@ -1399,7 +2002,7 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
   if (data.onedriveDeviceState) {
     const s = data.onedriveDeviceState;
     try {
-      await db.insert(onedriveDeviceState).values({
+      await withDbTransaction(() => db.insert(onedriveDeviceState).values({
         deviceId: device.id,
         orgId: device.orgId,
         signedIn: s.signedIn,
@@ -1426,7 +2029,7 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
           lastReportedAt: new Date(),
           updatedAt: new Date(),
         },
-      });
+      }));
     } catch (err) {
       // Drizzle query errors serialize the bound params — including the
       // signedInUpns jsonb (end-user PII) — into their message. Log/report
@@ -1459,7 +2062,7 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
   // this handler and never reaches this line; the invariant is stated here
   // because that branch is what a future refactor is most likely to remove.
   const commands = await claimPendingCommandsForDevice(
-    device.id,
+    { deviceId: device.id, agentId: agent.agentId, installIncarnation: agent.installIncarnation },
     10,
     'agent',
     agent?.claimTypeAllowlist,
@@ -1473,14 +2076,18 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
       pamLifetimeProtocolVersion: normalizePamLifetimeProtocolVersion(
         data.securityCapabilities?.pamLifetimeProtocolVersion,
       ),
+      pamReconciliationResetProtocolVersion: data.securityCapabilities?.pamReconciliationResetProtocolVersion === 1 ? 1 : 0,
+      pamUserNotifyProtocolVersion: normalizePamUserNotifyProtocolVersion(
+        data.securityCapabilities?.pamUserNotifyProtocolVersion,
+      ),
     },
   );
 
   // Policy probe config (buildPolicyProbeConfigUpdate) is deliberately NOT
-  // built here: partner-wide compliance policies (org_id NULL, #2129) are
-  // invisible to this org-scoped RLS context, so it runs AFTER this block
-  // closes, under a system context — same #1105 pattern as the manifest
-  // trust keyset below.
+  // built here: it runs AFTER this block commits, in the post-commit policy
+  // context (#8142), where automation_policies' partner-wide SELECT branch makes
+  // partner-wide compliance policies (org_id NULL, #2129) visible, and where a
+  // miss can be cached per org once the context commits.
 
   // `updateGateAllows` was resolved above (effective partner+org update policy,
   // issue #2123) in a system context BEFORE this org-scoped block opened — see
@@ -1506,98 +2113,26 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
   // on) alerts again instead of being consumed by the first episode.
   warnedEditionRecoveryWithheldDevices.delete(device.id);
 
-  if (normalizedArch && !acceptsServedEdition) {
-    warnEditionOfferWithheld({
-      deviceId: device.id,
-      role: 'agent',
-      reportedEdition: data.agentEdition,
-      agentVersion: data.agentVersion,
-    });
-    // #4072 follow-up — automatic recovery for the stranded device behind the
-    // withhold above (default-off env flag; every precondition and the
-    // once-per-device claim live in the service). Fire-and-forget: the beat's
-    // response must not wait on script dispatch, and a dispatch failure must
-    // never fail the heartbeat. The service resolves the pin-honouring target
-    // with the SAME resolver as the offer path, so a holdback pin holds
-    // auto-migration too.
-    // The cheap non-DB gate runs FIRST so a flag-off deployment (or a
-    // non-candidate device) costs this hot path nothing beyond a few
-    // comparisons — no ALS exit, no system context, no second transaction.
-    if (
-      shouldConsiderEditionMigration({ device, normalizedArch, updateGateAllows })
-    ) {
-      // runOutsideDbContext + system context is load-bearing, not defensive:
-      // this promise is detached, and the surrounding org-scoped
-      // withDbAccessContext TRANSACTION commits when the handler returns — a
-      // detached query on the ambient context would run against the dead tx
-      // handle (same reason as the manifest-trust keyset at the top of this
-      // handler, #1105). System context is safe: everything dispatched was
-      // validated in the org-scoped block, the claim re-binds to the device's
-      // org and liveness, and dispatchScriptToDevice's org-equality invariant
-      // still applies.
-      runOutsideDbContext(() =>
-        withSystemDbAccessContext(() =>
-          maybeDispatchEditionMigration({
-            device,
-            reportedAgentVersion: data.agentVersion,
-            normalizedArch,
-            updateGateAllows,
-            pin: versionPins.agent,
-            resolveTarget: () =>
-              resolvePinnedUpgradeTarget({
-                component: 'agent',
-                platform: device.osType,
-                architecture: normalizedArch,
-                pin: versionPins.agent,
-                agentId,
-              }),
-          }),
-        ),
-        // The service catches everything itself; this catch only exists so a
-        // future regression there can never surface as an unhandled rejection
-        // on the heartbeat hot path.
-      ).catch((err) => {
-        console.error(`[agents] auto edition migration hook failed for ${agentId}:`, err);
-      });
-    }
-  } else if (acceptsServedEdition) {
-    // Re-arm THIS branch's withhold warn: if the device later regresses to an
-    // incompatible build (same process), that is a fresh episode and must log
-    // again. Only the agent-role key — the watchdog branch owns its own.
-    warnedEditionWithheldDevices.delete(`${device.id}:agent`);
-  }
-
+  // #8053 W1a-1 — the agent, helper and watchdog offers below share one guard,
+  // so their three agent_versions reads are one statement. A failure leaves
+  // every target null: no offer this beat, the same outcome each per-block
+  // catch gave (the first failed read aborted the transaction for the rest).
+  let upgradeTargets: Map<string, string | null> | null = null;
   if (normalizedArch && acceptsServedEdition) {
     try {
-      // Resolve the effective target: the tenant's agent pin (issue #2124) when
-      // set, else the globally promoted latest. Fails closed if the pinned
-      // version has no build for this platform/arch (returns null → no upgrade).
-      const targetVersion = await resolvePinnedUpgradeTarget({
-        component: 'agent',
+      upgradeTargets = await resolvePinnedUpgradeTargets({
         platform: device.osType,
         architecture: normalizedArch,
-        pin: getWindowsReleaseCanaryVersion(device.id, device.osType) ?? versionPins.agent,
         agentId,
+        requests: [
+          { component: 'agent', pin: getWindowsReleaseCanaryVersion(device.id, device.osType) ?? versionPins.agent },
+          { component: 'helper', pin: null },
+          { component: 'watchdog', pin: getWindowsReleaseCanaryVersion(device.id, device.osType) ?? versionPins.watchdog },
+        ],
       });
-
-      if (targetVersion) {
-        // Dev builds (dev-*) are local dev-push binaries — never auto-upgrade
-        // them back to a release version. The dev-push flow disables auto_update
-        // on the agent side; the server also refrains from sending upgradeTo.
-        if (data.agentVersion.startsWith('dev-')) {
-          // no-op: leave upgradeTo null so agent stays on the dev build
-        } else if (updateGateAllows) {
-          // Upgrade-only: a pin names the target but never triggers an auto
-          // DOWNGRADE through this channel (cmp > 0). Holdback works by keeping
-          // devices already on/below the pin from jumping to a newer latest.
-          const cmp = compareAgentVersions(targetVersion, data.agentVersion);
-          if (cmp > 0) {
-            upgradeTo = targetVersion;
-          }
-        }
-      }
     } catch (err) {
-      console.error(`[agents] failed to evaluate upgrade target for ${agentId}:`, err);
+      console.error(`[agents] failed to resolve upgrade targets for ${agentId}:`, err);
+      captureException(err);
     }
   }
 
@@ -1614,13 +2149,7 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
       // the agent/watchdog channels (#4072 — replaces an inline query that
       // was not edition-scoped). The helper channel is unpinnable, hence
       // pin: null — which is exactly the isLatest lookup the inline query did.
-      const latestHelperVersion = await resolvePinnedUpgradeTarget({
-        component: 'helper',
-        platform: device.osType,
-        architecture: normalizedArch,
-        pin: null,
-        agentId,
-      });
+      const latestHelperVersion = upgradeTargets?.get('helper') ?? null;
 
       if (latestHelperVersion) {
         // If agent reports no helper version, always upgrade (bootstraps first install
@@ -1644,13 +2173,7 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     try {
       // Effective watchdog target: the tenant's watchdog pin (issue #2124) when
       // set, else the globally promoted latest. Independent of the agent pin.
-      const targetWatchdog = await resolvePinnedUpgradeTarget({
-        component: 'watchdog',
-        platform: device.osType,
-        architecture: normalizedArch,
-        pin: getWindowsReleaseCanaryVersion(device.id, device.osType) ?? versionPins.watchdog,
-        agentId,
-      });
+      const targetWatchdog = upgradeTargets?.get('watchdog') ?? null;
 
       // Prefer the version the agent just reported over the stored column so a
       // successful swap stops the re-send on the VERY NEXT heartbeat (#1802),
@@ -1687,17 +2210,6 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     }
   }
 
-  let renewCert = false;
-  if (device.mtlsCertExpiresAt && device.mtlsCertIssuedAt) {
-    const now = Date.now();
-    const issuedMs = device.mtlsCertIssuedAt.getTime();
-    const expiresMs = device.mtlsCertExpiresAt.getTime();
-    const renewalThreshold = issuedMs + ((expiresMs - issuedMs) * 2) / 3;
-    if (now >= renewalThreshold) {
-      renewCert = true;
-    }
-  }
-
   // Helper settings are resolved AFTER this org-scoped block closes (#1105
   // pattern — see below): a partner-wide helper policy (org_id NULL) is
   // invisible under this context's RLS (accessiblePartnerIds: [] above), so
@@ -1727,6 +2239,12 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
   const mergedConfigUpdate: Record<string, unknown> = {
     backup_server_url: (process.env.AGENT_BACKUP_SERVER_URL ?? '').trim(),
   };
+
+  // #8869 — ECH kill switch, ALWAYS sent as true/false (an absent key means
+  // "no change" on the agent, so the explicit value is the only lever).
+  // Takes effect on the agent's next connection; never tears down live
+  // connections.
+  mergedConfigUpdate.ech_enabled = agentEchEnabled();
 
   // Security remediation Wave 6, Task 9 — ALWAYS sent, as true or false.
   //
@@ -1765,75 +2283,38 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
   mergedConfigUpdate.require_manifest_signing_key_id =
     (process.env.AGENT_REQUIRE_MANIFEST_SIGNING_KEY_ID ?? '').trim().toLowerCase() === 'true';
 
-  const authenticatedWithPreviousToken = c.get('agentTokenRotationRequired') === true;
+  // Certificate renewal, token rotation and staged-rotation confirmation —
+  // computed once, the same way the parked beat computes them
+  // (./heartbeatCredentialMaintenance.ts). Runs inside this org context
+  // because the implicit staged-rotation promotion writes the device row.
+  const credentialMaintenance = await computeCredentialMaintenance({
+    device,
+    tenantDraining: agent?.tenantDraining === true,
+    authenticatedWithPreviousToken: c.get('agentTokenRotationRequired') === true,
+    pendingTokenPresented: c.get('agentPendingTokenPresented') === true,
+    presentedTokenHash: agent.authTokenHash,
+  });
 
-  // Issue #2621 — a staged rotation is still outstanding. Don't ask for another
-  // one (that would churn the staged set and re-open the divergence window);
-  // ask the agent to finish the one it has. This is also the recovery path for
-  // an agent that persisted the new credentials and then crashed before
-  // confirming: it reconnects on the staged token and gets told to confirm.
-  let pendingRotationLive =
-    !!device.pendingTokenHash &&
-    !!device.pendingTokenExpiresAt &&
-    device.pendingTokenExpiresAt > new Date();
-
-  // Issue #2621 — IMPLICIT PROMOTION. The agent is authenticating with the
-  // staged credential, which is the same proof of durable possession that
-  // /rotate-token/confirm requires, so promote it here too.
-  //
-  // This is what keeps PRE-#2621 agents alive. An old agent overwrites its own
-  // token file on rotation and never calls confirm; without this it would run on
-  // the pending hash until the staging window closed and then be locked out
-  // permanently, with no way to self-heal (rotateToken is suppressed while a
-  // rotation is staged, and after expiry it can no longer authenticate at all).
-  // It also backstops a current agent whose confirm response was lost in flight.
-  if (pendingRotationLive && c.get('agentPendingTokenPresented') === true && device.agentTokenHash) {
-    try {
-      const promoted = await promotePendingAgentCredentials({
-        deviceId: device.id,
-        pendingTokenHash: device.pendingTokenHash!,
-        expectedAgentTokenHash: device.agentTokenHash,
-        pendingWatchdogTokenHash: device.pendingWatchdogTokenHash,
-        pendingHelperTokenHash: device.pendingHelperTokenHash,
-        watchdogTokenHash: device.watchdogTokenHash,
-        helperTokenHash: device.helperTokenHash,
-      });
-      if (promoted) {
-        pendingRotationLive = false;
-      }
-    } catch (err) {
-      // Best-effort: the staged credential still authenticates for the rest of
-      // its window, and confirm/the next heartbeat will retry the promotion.
-      console.error('[heartbeat] implicit pending-rotation promotion failed:', err);
-    }
-  }
-
-  // #3997 — do not ASK for a rotation the mint route will now refuse.
-  // `rotate-token` is off the tenant drain surface (agentAuth's
-  // TENANT_DRAIN_ALLOWED_ACTIONS) and the route itself fails closed on a
-  // drain, so signalling it here would have every agent in an offboarding
-  // tenant attempt a mint it cannot complete on EVERY heartbeat for the whole
-  // window (OFFBOARDING_DRAIN_WINDOW_HOURS, 72h by default), logging a rotation
-  // failure each time. Suppressing the signal changes nothing about safety —
-  // `handleTokenRotation` in agent/internal/heartbeat logs and returns, never
-  // gating the heartbeat or touching on-disk credentials — it only stops a
-  // guaranteed-useless round trip and its error noise.
-  //
-  // Only the TENANT drain is checked: `deviceUninstallDraining` returns from
-  // the minimal drain beat at the top of this handler and never reaches here,
-  // so testing it too would be unreachable code.
-  const rotateToken =
-    !agent?.tenantDraining &&
-    !authenticatedWithPreviousToken &&
-    !pendingRotationLive &&
-    (!device.watchdogTokenHash || isAgentTokenRotationDue(device.tokenIssuedAt));
-
-  let manageRemoteManagement = false;
+  // #8616: `resolved` is false when the resolver threw or found no effective
+  // config (its settings are then defaults, not a decision); a protocol-aware
+  // agent is then told to retain its remote-management state.
+  let remoteManagement: RemoteManagementDecision = { resolved: false, value: false };
   try {
-    const remoteAccess = await resolveRemoteAccessForDevice(device.id);
-    manageRemoteManagement = remoteAccess.settings.vncRelay === true;
+    // #8053: the heartbeat's own (longer) max age — the default 30 s is
+    // shorter than the 60 s beat, so it never hit and every beat re-ran the
+    // full effective-config resolution inside this org transaction.
+    // #8997: `savepoint` confines a failed policy read (e.g. a permission
+    // error) to a savepoint taken only on a cache miss. Otherwise the failure
+    // aborts the org transaction: this catch "recovers" but the commit
+    // re-throws and the whole heartbeat 500s. Cache hits add no statement.
+    const remoteAccess = await resolveRemoteAccessForDevice(device.id, {
+      maxAgeMs: HEARTBEAT_REMOTE_ACCESS_MAX_AGE_MS,
+      savepoint: true,
+    });
+    remoteManagement = { resolved: remoteAccess.resolved, value: remoteAccess.settings.vncRelay === true };
   } catch (err) {
     console.error('[heartbeat] Failed to resolve remote access policy:', err);
+    captureException(err);
   }
 
   // #2414 — decrypt just-in-time; a command whose payload fails decryption is
@@ -1849,6 +2330,13 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     reportedScriptSecretEnvVersion: normalizeReportedScriptSecretEnvVersion(
       data.securityCapabilities?.scriptSecretEnvVersion,
     ),
+    // Same reasoning for the backup helper's protocols: this beat's report
+    // is authoritative over the (guarded) device write.
+    // An unknown report (explicit null) leaves the decision to the stored
+    // column this beat kept or left unreported.
+    reportedBackupReadProtocolVersion: backupHelperProtocolForDelivery(data.backupReadProtocolVersion, normalizeBackupReadProtocolVersion),
+    reportedBackupIntegrityProtocolVersion: backupHelperProtocolForDelivery(data.backupIntegrityProtocolVersion, normalizeBackupIntegrityProtocolVersion),
+    reportedBackupWriteProtocolVersion: backupHelperProtocolForDelivery(data.backupWriteProtocolVersion, normalizeBackupWriteProtocolVersion),
   });
 
   let networkContextReceipt;
@@ -1859,10 +2347,19 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
   } else {
     try {
       const resolvedFlags = topologyFlags;
-      const topology = await withResolvedTopologyFlags(
-        { orgId: agent.orgId, flags: resolvedFlags },
-        () => db.transaction(() => topologyHeartbeat(device, data)),
-      );
+      // #8053 W1a-1 — with materialization off, negotiation can only answer
+      // "not accepted" and ingest nothing; computing that needs no DB and no
+      // savepoint. Its one refusal (an ephemeral, suspended or tokenless
+      // device) is re-derived from `device` and thrown the same way, so the
+      // catch below — collection_unavailable + Sentry — is unchanged.
+      // Note: this skip path does not take activeDevice()'s FOR KEY SHARE NOWAIT lock,
+      // so under lock contention it returns the real receipt instead of collection_unavailable.
+      const topology = resolvedFlags.materialization
+        ? await withResolvedTopologyFlags(
+          { orgId: agent.orgId, flags: resolvedFlags },
+          () => withDbTransaction(() => topologyHeartbeat(device, data)),
+        )
+        : topologyHeartbeatWithoutMaterialization(device, data);
       mergedConfigUpdate.networkContext = topology.config;
       networkContextReceipt = topology.receipt;
     } catch (error) {
@@ -1872,30 +2369,175 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     }
   }
 
+  const isolationContext: HeartbeatEpisodeContext = {};
+  let isolation: typeof import('../../services/networkIsolation/reconcile') | undefined;
+  let savepointFreeLookup = false;
+  try {
+    // Load inside the fault boundary: isolation must not prevent other heartbeat work.
+    isolation = await import('../../services/networkIsolation/reconcile');
+    const { reconcileContainmentReport, noteIsolationReportDropped } = isolation;
+    // Informational input may have collapsed under .catch(undefined); report paths, never values.
+    const rawBeat = await c.req.json();
+    const rawIsolation = rawBeat?.containment?.networkIsolation;
+    if (data.containment?.networkIsolation === undefined) noteIsolationReportDropped(device.id, rawIsolation);
+    const reconcile = () => reconcileContainmentReport(db as unknown as import('../../services/networkIsolation/episodeStore').EpisodeTx, device, data.containment?.networkIsolation, new Date(), isolationContext);
+    // #4618: without a report reconciliation only does the indexed episode SELECT.
+    // Keep that common path at one statement; real reconciliation retains its savepoint.
+    if (data.containment?.networkIsolation === undefined) { savepointFreeLookup = true; await reconcile(); savepointFreeLookup = false; }
+    else await withDbTransaction(reconcile);
+  } catch (err) {
+    console.error('[heartbeat] isolation reconcile failed', { deviceId: device.id, isolationId: isolationContext.row?.id, savepointFreeLookup });
+    captureException(err, undefined, { phase: 'isolation_heartbeat_block', deviceId: device.id, isolationId: isolationContext.row?.id ?? 'unknown' });
+    // A statement that failed outside a savepoint has aborted the org transaction: nothing after
+    // this point would commit, so fail the beat rather than return command claims that roll back.
+    // (Security review 2026-10-31.) The agent retries on its next beat.
+    if (savepointFreeLookup) throw err;
+  }
+  let containment: ContainmentDesiredBlock = { networkIsolation: null };
+  if (isolation) {
+    const { buildContainmentHeartbeatBlock, storedContainmentHeartbeatBlock } = isolation;
+    // `device` was read before this beat's capability write, and a capability claim is same-heartbeat
+    // truth: an agent that just dropped below level 3 would reject a block carrying policy permits.
+    const beatDevice = { ...device, networkIsolationVersion: data.securityCapabilities?.networkIsolationVersion ?? 0 };
+    try {
+      // A cached absence needs no block build (and no SAVEPOINT / RELEASE).
+      containment = isolationContext.row === null
+        ? storedContainmentHeartbeatBlock(null)
+        : await withDbTransaction(() => buildContainmentHeartbeatBlock(db as unknown as import('../../services/networkIsolation/episodeStore').EpisodeTx, beatDevice, isolationContext));
+    } catch (err) {
+      console.error('[heartbeat] isolation block failed', { deviceId: device.id, isolationId: isolationContext.row?.id });
+      captureException(err, undefined, { phase: 'isolation_heartbeat_block', deviceId: device.id, isolationId: isolationContext.row?.id ?? 'unknown' });
+      containment = storedContainmentHeartbeatBlock(isolationContext.row, beatDevice);
+    }
+  }
+
+  // Reuse reconciliation's indexed lookup rather than querying again for an upgrade.
+  // Unknown evidence withholds a below-floor target; it never changes release delivery.
+  const isolationEpisode = isolationContext.row;
+  const isolationLookupResolved = isolationEpisode !== undefined;
+  const hasUnresolvedIsolation = isolationEpisode === undefined
+    || (isolationEpisode !== null && !isResolvedTerminalIsolationState(isolationEpisode.state));
+
+  if (normalizedArch && !acceptsServedEdition) {
+    warnEditionOfferWithheld({
+      deviceId: device.id,
+      role: 'agent',
+      reportedEdition: data.agentEdition,
+      agentVersion: data.agentVersion,
+    });
+    // #4072 follow-up — automatic recovery for the stranded device behind the
+    // withhold above (default-off env flag; every precondition and the
+    // once-per-device claim live in the service). Fire-and-forget: the beat's
+    // response must not wait on script dispatch, and a dispatch failure must
+    // never fail the heartbeat. The service resolves the pin-honouring target
+    // with the SAME resolver as the offer path, so a holdback pin holds
+    // auto-migration too.
+    // The cheap non-DB gate runs FIRST so a flag-off deployment (or a
+    // non-candidate device) costs this hot path nothing beyond a few
+    // comparisons — no ALS exit, no system context, no second transaction.
+    if (
+      // A migration reinstalls the agent via MSI; defer it until isolation is resolved.
+      isolationLookupResolved && !hasUnresolvedIsolation
+      && shouldConsiderEditionMigration({ device, normalizedArch, updateGateAllows })
+    ) {
+      // runOutsideDbContext is load-bearing, not defensive: this promise is
+      // detached, and the surrounding org-scoped withDbAccessContext
+      // TRANSACTION commits when the handler returns — a detached query on the
+      // ambient context would run against the dead tx handle (same reason as
+      // the manifest-trust keyset at the top of this handler, #1105). The
+      // service opens its OWN system context for the claim and the command
+      // rows and sends only after it commits (#7103) — wrapping it in one here
+      // would make the send precede that commit again. System context is safe:
+      // everything dispatched was validated in the org-scoped block, the claim
+      // re-binds to the device's org and liveness, and dispatchScriptToDevice's
+      // org-equality invariant still applies.
+      runOutsideDbContext(() =>
+        maybeDispatchEditionMigration({
+          device,
+          reportedAgentVersion: data.agentVersion,
+          normalizedArch,
+          updateGateAllows,
+          pin: getWindowsReleaseCanaryVersion(device.id, device.osType) ?? versionPins.agent,
+          resolveTarget: () =>
+            resolvePinnedUpgradeTarget({
+              component: 'agent',
+              platform: device.osType,
+              architecture: normalizedArch,
+              pin: getWindowsReleaseCanaryVersion(device.id, device.osType) ?? versionPins.agent,
+              agentId,
+            }),
+        }),
+        // The service catches everything itself; this catch only exists so a
+        // future regression there can never surface as an unhandled rejection
+        // on the heartbeat hot path.
+      ).catch((err) => {
+        console.error(`[agents] auto edition migration hook failed for ${agentId}:`, err);
+      });
+    }
+  } else if (acceptsServedEdition) {
+    // Re-arm THIS branch's withhold warn: if the device later regresses to an
+    // incompatible build (same process), that is a fresh episode and must log
+    // again. Only the agent-role key — the watchdog branch owns its own.
+    warnedEditionWithheldDevices.delete(`${device.id}:agent`);
+  }
+
+  if (normalizedArch && acceptsServedEdition) {
+    try {
+      // Resolve the effective target: the tenant's agent pin (issue #2124) when
+      // set, else the globally promoted latest. Fails closed if the pinned
+      // version has no build for this platform/arch (returns null → no upgrade).
+      const targetVersion = upgradeTargets?.get('agent') ?? null;
+
+      if (targetVersion) {
+        // Dev builds (dev-*) are local dev-push binaries — never auto-upgrade
+        // them back to a release version. The dev-push flow disables auto_update
+        // on the agent side; the server also refrains from sending upgradeTo.
+        if (data.agentVersion.startsWith('dev-')) {
+          // no-op: leave upgradeTo null so agent stays on the dev build
+        } else if (updateGateAllows) {
+          // Upgrade-only: a pin names the target but never triggers an auto
+          // DOWNGRADE through this channel (cmp > 0). Holdback works by keeping
+          // devices already on/below the pin from jumping to a newer latest.
+          const cmp = compareAgentVersions(targetVersion, data.agentVersion);
+          if (cmp > 0 && isolationAgentUpgradeGate(targetVersion, hasUnresolvedIsolation).allow) {
+            upgradeTo = targetVersion;
+          }
+        }
+      }
+    } catch (err) {
+      console.error(`[agents] failed to evaluate upgrade target for ${agentId}:`, err);
+    }
+  }
+
   // Main-branch response payload — built inside the org context, but the
   // manifest-trust-keyset and policy probe config are fetched AFTER this
   // context closes (see below).
   return {
     deviceOrgId: device.orgId,
+    siteKey: `${device.orgId}:${device.siteId ?? 'unassigned'}`,
+    deviceSiteId: device.siteId,
+    deviceOwnershipEpoch: device.ownershipEpoch,
     deviceId: device.id,
+    remoteManagement,
     mainResponse: {
+      containment,
       commands: deliverableCommands,
       configUpdate: mergedConfigUpdate,
       networkContextReceipt,
       upgradeTo,
       helperUpgradeTo: helperUpgradeTo ?? undefined,
       watchdogUpgradeTo: watchdogUpgradeTo ?? undefined,
-      renewCert: renewCert || undefined,
-      rotateToken: rotateToken || undefined,
-      // Issue #2621 — set when the caller authenticated with the STAGED
-      // credential, i.e. it demonstrably holds the new token but never
-      // confirmed. Tells the agent to call /rotate-token/confirm and finish.
-      confirmTokenRotation:
-        (pendingRotationLive && c.get('agentPendingTokenPresented') === true) || undefined,
+      renewCert: credentialMaintenance.renewCert,
+      rotateToken: credentialMaintenance.rotateToken,
+      // Issue #2621 — see heartbeatCredentialMaintenance.ts.
+      confirmTokenRotation: credentialMaintenance.confirmTokenRotation,
       // helperEnabled/helperSettings are merged in AFTER this org-scoped block
       // closes — see the #1105 comment below. uacInterceptionEnabled likewise
       // (#2930): the pam resolver moved out with the other policy readers.
-      manageRemoteManagement: manageRemoteManagement || undefined,
+      // manageRemoteManagement: this slot only fixes the key's position in the
+      // response (unchanged since before #8616); its value is set at final
+      // assembly by buildSettingsDecisionFields.
+      manageRemoteManagement: undefined,
       // Bare-metal recovery W04a: only present (and only ever `true`) when a
       // recoveryMarker in this beat matched — its absence tells the agent
       // nothing (no ack yet, or no marker was sent), same shape as the other
@@ -1906,9 +2548,92 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     },
   );
 
-  // 404 / 401 / watchdog branches returned a Response directly from the scoped
+  // 404 / 401 branches returned a Response directly from the scoped
   // block — pass it through.
   if (scoped instanceof Response) return scoped;
+  if ('staleCaller' in scoped) throw staleAgentCredentialRejection();
+
+  // Fleet/site admission happens after the organization transaction commits.
+  // Withhold new update offers under pressure; check-ins and ordinary commands
+  // continue. A watchdog reports its own version, not the main agent's version.
+  const rolloutAdmission = {
+    deviceId: scoped.deviceId,
+    siteKey: scoped.siteKey,
+    versions: scoped.watchdogOnly ? { watchdog: data.agentVersion } : {
+      agent: data.agentVersion,
+      ...(data.helperVersion ? { helper: data.helperVersion } : {}),
+      ...(data.watchdogVersion ? { watchdog: data.watchdogVersion } : {}),
+      ...(data.backupVersion ? { backup: data.backupVersion } : {}),
+    },
+    response: scoped.mainResponse,
+  };
+  if (scoped.watchdogOnly) {
+    await guardHeartbeatUpdates(rolloutAdmission);
+    return c.json(scoped.mainResponse);
+  }
+
+
+  // Caller verification readiness (#6354 W02), keyed by the authenticated
+  // device's org — never a body-supplied identity. Replaced on every main
+  // agent beat (absent = cleared, so an old agent reads as unavailable);
+  // watchdog beats do not describe the user session and never touch it.
+  // Redis only, after the org transaction released; it never throws. Skipped
+  // entirely while the feature is dark, so a fleet-wide beat makes no Redis
+  // call for it; readiness written before a flag-off lapses on its TTL.
+  if (agent.role !== 'watchdog' && callerVerificationEnabled()) {
+    await recordWorkstationCapabilities(scoped.deviceOrgId, scoped.deviceId, data.helperCapabilities);
+  }
+
+  // #10190 W02 — the live prompt-renderer observation for the device page and
+  // the Assist-floor evidence (compatibility rule 8). Main-agent beats only,
+  // keyed by the authenticated device. Absent (old agent, no renderer, or a
+  // block the schema dropped) DELETES it, so what the page shows is always
+  // this beat's report. Redis only, after the org transaction released;
+  // bounded and never throws, so it cannot fail or stall the beat. A block the
+  // schema dropped would look like "no renderer", so that collapse is logged
+  // (throttled); Hono caches the parsed body, so the re-read is free (#1121).
+  if (agent.role !== 'watchdog') {
+    const promptHostReport = data.helperCapabilities?.promptHost;
+    if (promptHostReport === undefined) {
+      try {
+        notePromptHostReportDropped(scoped.deviceId, await c.req.json(), promptHostReport);
+      } catch {
+        // Raw body unavailable — nothing to report.
+      }
+    }
+    await recordPromptHostObservation(scoped.deviceId, promptHostReport);
+  }
+
+  // #10190 W05 — the restart decision the person at the keyboard made
+  // (Postpone / Restart now). The agent re-sends it on every beat while the
+  // restart is scheduled; the service writes one audit row per decision
+  // (Redis NX on device + decision time). Keyed by the authenticated device
+  // and its org (the row's, not the token's), after the org transaction
+  // released, and NOT awaited: the beat's answer never waits on Redis or the
+  // audit writer, and the service never throws (the catch is belt and braces
+  // for the floating promise). A schedule whose lastUserAction the schema
+  // dropped is logged (throttled); Hono caches the parsed body, so the
+  // re-read is free.
+  const rebootStatus = data.rebootStatus;
+  const lastUserAction = rebootStatus?.lastUserAction;
+  if (agent.role !== 'watchdog' && rebootStatus && !lastUserAction) {
+    try {
+      noteRebootUserActionDropped(scoped.deviceId, await c.req.json(), lastUserAction);
+    } catch {
+      // Raw body unavailable — nothing to report.
+    }
+  }
+  if (agent.role !== 'watchdog' && rebootStatus && lastUserAction) {
+    void recordRebootUserAction(scoped.deviceId, scoped.deviceOrgId, lastUserAction, {
+      c,
+      agentId,
+      scheduledAt: rebootStatus.scheduledAt,
+      deferralsUsed: rebootStatus.deferralsUsed,
+      maxDeferrals: rebootStatus.maxDeferrals,
+    }).catch((err) => {
+      console.error('[heartbeat] restart decision audit failed', { deviceId: scoped.deviceId, err });
+    });
+  }
 
   // Self-health is independent from reachability and is persisted only after
   // the request's org-scoped transaction has released. A failed observation
@@ -1967,9 +2692,88 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
   // acquires a second connection. (Returns the active signing keyset from
   // manifest_signing_keys; empty on hosted SaaS — see
   // docs/deploy/agent-update-trust-bootstrap.md, #625.)
+  //
+  // #8053: both this keyset and the delegations below are global, so they are
+  // served from a 60 s process cache — their system context opens once per
+  // process per TTL, not once per agent per beat. See MANIFEST_TRUST_CACHE_TTL_MS.
+  // #8317 — the device was moved to another org or site after enrollment; the
+  // agent still holds the old pair in agent.yaml and rejects every payload
+  // bound to the new one. Send a signed assertion of the row's identity that
+  // echoes this beat's nonce. Outside the org transaction for the same reason
+  // as the keyset (#1105). Never creates the deployment key: without one, no
+  // assertion is sent. Non-fatal: a missed assertion is retried next beat.
+  //
+  // #8382 — an agent that refused the assertion for this org/site says so on
+  // its next beat; the assertion is then held back for a while (Redis TTL)
+  // instead of being signed, and refused, on every beat.
+  //
+  // #8206 — a v2 agent gets a v2 assertion carrying the row's ownership epoch,
+  // also when only the epoch it holds is behind (see
+  // agentIdentityAssertionVersionToSign: an unreported epoch counts as 1, so a
+  // never-moved device is never signed for). A v1 agent is unchanged.
+  let identityAssertion: AgentIdentityAssertion | undefined;
+  const identitySyncVersion = normalizeIdentitySyncProtocolVersion(
+    data.securityCapabilities?.identitySyncProtocolVersion,
+  );
+  const reportedIdentity = identitySyncVersion !== 0 ? data.reportedIdentity : undefined;
+  const identityRow = {
+    id: scoped.deviceId,
+    orgId: scoped.deviceOrgId,
+    siteId: scoped.deviceSiteId,
+    ownershipEpoch: scoped.deviceOwnershipEpoch,
+  };
+  if (reportedIdentity && reportedIdentity.deviceId !== identityRow.id) {
+    warnIdentityDeviceMismatch(agentId, reportedIdentity.deviceId, identityRow.id);
+  }
+  const identityAssertionVersion = agentIdentityAssertionVersionToSign(reportedIdentity, identityRow, identitySyncVersion);
+  if (
+    reportedIdentity
+    && identityAssertionVersion !== 0
+    && !(await agentIdentityAssertionRefused({
+      agentId,
+      deviceId: identityRow.id,
+      target: { orgId: identityRow.orgId, siteId: identityRow.siteId },
+      rejection: data.identityAssertionRejection,
+    }))
+  ) {
+    try {
+      const identity = {
+        agentId,
+        deviceId: identityRow.id,
+        orgId: identityRow.orgId,
+        siteId: identityRow.siteId,
+      };
+      const signed = identityAssertionVersion === 2
+        ? await signAgentIdentityAssertion({
+          ...identity,
+          ownershipEpoch: identityRow.ownershipEpoch,
+          nonce: reportedIdentity.nonce,
+        })
+        : await signAgentIdentityAssertion({ ...identity, nonce: reportedIdentity.nonce });
+      if (signed) {
+        identityAssertion = signed;
+      } else {
+        warnIdentitySyncWithoutSigningKey();
+      }
+    } catch (err) {
+      reportIdentityAssertionFailure(agentId, err);
+    }
+  }
+
+  // #8318 §6.2 — the signed `rebind` directive, while this device is the
+  // source of an open reattach intent. Only a device that declared the rebind
+  // capability on THIS beat is looked up (one indexed system read, outside
+  // the org transaction like the assertion above, #1105); every other beat
+  // costs nothing. Non-fatal: a missed directive is re-sent next beat.
+  const rebind = await rebindDirectiveForBeat({
+    deviceId: scoped.deviceId,
+    agentId: agent.agentId,
+    rebindProtocolVersion: normalizeRebindProtocolVersion(data.securityCapabilities?.rebindProtocolVersion),
+  });
+
   let manifestTrustKeys: ManifestTrustKey[] = [];
   try {
-    manifestTrustKeys = await getActiveTrustKeyset();
+    manifestTrustKeys = await getActiveTrustKeysetCached();
   } catch (err) {
     console.error(`[heartbeat] Failed to load manifest trust keyset for agentId=${agentId}:`, err);
     captureException(err);
@@ -1990,185 +2794,423 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
   // The agent simply adopts on a later heartbeat.
   let manifestKeyDelegations: ManifestKeyDelegation[] = [];
   try {
-    manifestKeyDelegations = await getActiveManifestKeyDelegations();
+    manifestKeyDelegations = await getActiveManifestKeyDelegationsCached();
   } catch (err) {
     console.error(`[heartbeat] Failed to load manifest key delegations for agentId=${agentId}:`, err);
     captureException(err);
   }
 
-  // Policy probe config also runs OUTSIDE the org context (#1105 pattern
-  // above) — and MUST: partner-wide compliance policies (org_id NULL, #2129)
-  // are invisible to the org-scoped RLS context, and the agent has to collect
-  // registry/config state for them too. The system context here is anchored to
-  // the authenticated device's own org, so it cannot pivot tenants.
-  let policyProbeConfig: PolicyProbeConfigUpdate | null = null;
-  try {
-    policyProbeConfig = await withSystemDbAccessContext(() =>
-      buildPolicyProbeConfigUpdate(scoped.deviceOrgId)
-    );
-  } catch (err) {
-    console.error(`[agents] failed to build policy probe config update for ${agentId}:`, err);
-  }
+  // Policy probe config and helper settings are resolved in the policy context
+  // below, but declared here because the merge below reads them. (Initialised
+  // via `as` so TypeScript does not narrow them to `null`: it cannot see the
+  // assignments made inside that callback.)
+  let policyProbeConfig = null as PolicyProbeConfigUpdate | null;
+  let helperSettings = null as HelperSettings | null;
+  // #8616: read after the context below. Defaults to 'error', which also
+  // covers a context that failed before the hierarchy load assigned it.
+  let hierarchyOutcome = 'error' as 'loaded' | 'missing' | 'error';
 
-  // #1105 — onedrive_helper config is built OUTSIDE the org transaction too.
-  // Phase 4 added per-UPN Graph resolution inside resolveDeviceOnedriveSettings,
-  // where an uncached miss makes sequential external HTTP round-trips (token +
-  // Graph, each bounded by AbortSignal.timeout), per UPN — exactly the
-  // conn-hold class #1105 warns about. resolveDeviceOnedriveSettings filters
-  // every query explicitly (eq(configurationPolicies.orgId, device.orgId),
-  // deviceId-keyed state read, and the org-keyed m365_connections read inside
-  // the Graph token helper), so the system context here is org-safe and cannot
-  // pivot tenants (same guarantee as the policy-probe pattern above). The
-  // onedrive_device_state upsert happened inside scoped (ingest), and this
-  // build runs later, so the ingest-before-delivery ordering is preserved.
-  let onedriveSettings: OnedriveConfigUpdate | null = null;
-  try {
-    onedriveSettings = await withSystemDbAccessContext(() =>
-      buildOnedriveHelperConfigUpdate(scoped.deviceId)
-    );
-  } catch (err) {
-    console.error(`[agents] failed to build onedrive_helper config update for ${agentId}:`, err);
-    captureException(err);
-  }
-  const onedriveConfigUpdate = onedriveSettings
-    ? { onedrive_helper_settings: onedriveSettings }
-    : null;
-
-  // #2930 — event_log / monitoring / pam / patch_source policy readers. These
-  // used to run inside the org transaction, where a partner-wide policy
-  // (org_id NULL) is RLS-invisible, so a partner-authored policy for any of the
-  // four never reached an agent.
+  // #8142 (scaling W03 / W1a-2) — ONE post-commit context for every
+  // policy-derived field, ORG-SCOPED: the org block's own `dbContext`
+  // (accessibleOrgIds [org], accessiblePartnerIds [], currentPartnerId =
+  // the agent's partner). It replaces the OneDrive and shared-policy SYSTEM
+  // contexts, so RLS — not any WHERE clause — is the tenant boundary for every
+  // read here: rows of other orgs and of other partners are invisible, and a
+  // partner-wide policy is visible only through the SELECT-only
+  // *_partner_wide_select branches. Opened only after the org transaction has
+  // been released; it holds the only pooled connection (#1105), and nothing
+  // here makes an HTTP call (OneDrive's Graph phase runs after it commits).
   //
-  // #4673 W03 kept this hoist deliberately. The resolvers themselves no longer
-  // escape internally — they read partner-wide rows through the
-  // `*_partner_wide_select` branch in whatever context they are given — so an
-  // org-scoped wrapper here WOULD work for event_log / monitoring / pam. It is
-  // not applied because `buildPatchSourceConfigUpdate` shares this wrapper and
-  // reaches the partner-AXIS `partners` read in `resolveDeviceTimezone`, which
-  // would then take a nested `readWithPartnerAxisVisibility` escape once per
-  // heartbeat (see the long note at the `currentPartnerId` assignment above).
-  // Same treatment as policyProbeConfig /
-  // onedriveSettings / helperSettings above: resolved after the org tx is
-  // released, under a system context anchored to `scoped.deviceId` — an id
-  // derived from the device the agent already authenticated as, so this cannot
-  // pivot tenants.
-  //
-  // All of them (plus #5511's warranty reader) share ONE context on
-  // purpose. The first four previously shared the org
-  // transaction, so a DB error already poisoned the others; giving each its own
-  // system transaction would cost four connection acquisitions per heartbeat
-  // against the 25-connection production ceiling for no isolation gain. The
-  // per-resolver try/catch below keeps each feature's documented fallback.
-  //
-  // The whole block is ALSO wrapped in an outer catch. The per-resolver catches
-  // below cannot see a transaction setup or COMMIT failure, and a SQL error
-  // caught locally still leaves the shared transaction aborted — so its commit
-  // throws. By this point the org transaction has committed and the commands in
-  // `scoped.mainResponse` are already marked delivered, so letting that escape
-  // would 500 the heartbeat and lose the claimed commands. Degrading to "no
-  // config update this cycle" is the safe failure: every field here is
-  // re-resolved on the next heartbeat.
+  // 1. Hierarchy + policy set, in ONE savepoint. The hierarchy (W01) is read
+  //    by `scoped.deviceId`, the device the agent authenticated as. The set is
+  //    every candidate assignment for every heartbeat feature, in ONE statement
+  //    (devicePolicySet.ts); each resolver applies its own rules to it.
+  //    Outcomes:
+  //    - MISSING: the device is not visible to its own org's context, or its
+  //      org/partner is not the authenticated one (moved, deleted or
+  //      re-parented after the org transaction committed). Skip EVERY policy
+  //      builder: generating answers here would send defaults/reverts and cache
+  //      them. For a legacy beat helper and PAM read false for this one beat,
+  //      as they do whenever this context fails (the agent reads an absent
+  //      value as off); a retain-state beat is told to keep both (#8616).
+  //    - hierarchy ERROR: every resolver reads its own (W01's fallback). Their
+  //      values reach legacy beats as before; a retain-state beat retains PAM
+  //      and helper instead, and neither builder writes its device cache.
+  //    - set ERROR: the hierarchy is kept (it was read before the failure);
+  //      resolvers read their own assignments with it.
+  // 2. Every result is written to an outer variable as soon as it is produced.
+  //    The transaction is read-only, so a value read before a later statement
+  //    aborted it is still right; a context that fails only skips the per-org
+  //    cache fills.
+  // 3. Order: with the set, everything up to OneDrive is pure TypeScript except
+  //    the per-org cache misses (each in its own savepoint). OneDrive's DB phase
+  //    (own savepoint, only when the set holds a OneDrive settings row,
+  //    always when no set was loaded) runs before monitoring's secondary reads
+  //    and the workload-inventory read, which run last: a SQL error there can
+  //    then only lose monitoring and/or workload inventory, whose failure
+  //    answer (omit) is safe.
   type PolicyConfigUpdates = {
     eventLogSettings: Record<string, unknown> | null;
     monitoringSettings: Record<string, unknown> | null;
     pamSettings: { uacInterceptionEnabled: boolean } | null;
     patchSourceSettings: { exclusiveWindowsUpdate: boolean } | null;
+    featureUpdateSettings: RingFeatureUpdates | null;
     warrantySettings: { hpCmslEnabled: boolean } | null;
+    hardwareMonitoringSettings: Awaited<ReturnType<typeof buildHardwareMonitoringConfigUpdate>> | null;
+    timeSyncSettings: Awaited<ReturnType<typeof buildTimeSyncConfigUpdate>> | null;
+    workloadInventorySettings: Awaited<ReturnType<typeof buildWorkloadInventoryConfigUpdate>> | null;
   };
-  let policyConfigs: PolicyConfigUpdates = {
+  const policyConfigs: PolicyConfigUpdates = {
     eventLogSettings: null,
     monitoringSettings: null,
     pamSettings: null,
     patchSourceSettings: null,
+    featureUpdateSettings: null,
     warrantySettings: null,
+    hardwareMonitoringSettings: null,
+    timeSyncSettings: null,
+    workloadInventorySettings: null,
   };
+  let onedrivePlan = null as OnedriveConfigPlan | null;
+  // #7970 — whether this device is a UniFi collector; null = unknown this beat (key omitted).
+  let unifiCollectorsAssigned = null as boolean | null;
+  // #8053 W1a-1 per-org caches; under this org-scoped context a miss is stored
+  // only for the exact org + partner the context was built for (#8142).
+  const orgCacheFills = new DeferredCacheFills();
   try {
-    policyConfigs = await withSystemDbAccessContext(async (): Promise<PolicyConfigUpdates> => {
-      let eventLogSettings: Record<string, unknown> | null = null;
-      let monitoringSettings: Record<string, unknown> | null = null;
-      let pamSettings: { uacInterceptionEnabled: boolean } | null = null;
-      let patchSourceSettings: { exclusiveWindowsUpdate: boolean } | null = null;
-      let warrantySettings: { hpCmslEnabled: boolean } | null = null;
-
-      // Sentry on all four, not just pam/patch_source. Losing an event_log or
-      // monitoring policy is precisely the invisible failure #2930 is about:
-      // the agent keeps collecting on stale defaults and nothing surfaces it.
-      // A stdout line is not an alerting channel.
+    await withDbAccessContext(dbContext, async () => {
+      let beatHierarchy = null as DeviceHierarchy | null;
+      let beatPolicySet = null as DevicePolicySet | null;
+      let missingReason = 'absent' as 'absent' | 'org_mismatch' | 'partner_mismatch';
+      let missingLoadedOrgId = null as string | null;
+      let missingLoadedPartnerId = null as string | null;
       try {
-        eventLogSettings = await buildEventLogConfigUpdate(scoped.deviceId);
+        await withDbTransaction(async () => {
+          const loaded = await loadDeviceHierarchy(scoped.deviceId);
+          if (!loaded) {
+            hierarchyOutcome = 'missing';
+            missingReason = 'absent';
+            return;
+          }
+          if (loaded.orgId !== scoped.deviceOrgId || loaded.orgId !== agent.orgId) {
+            hierarchyOutcome = 'missing';
+            missingReason = 'org_mismatch';
+            missingLoadedOrgId = loaded.orgId;
+            missingLoadedPartnerId = loaded.org?.partnerId ?? null;
+            return;
+          }
+          if ((loaded.org?.partnerId ?? null) !== agent.partnerId) {
+            hierarchyOutcome = 'missing';
+            missingReason = 'partner_mismatch';
+            missingLoadedOrgId = loaded.orgId;
+            missingLoadedPartnerId = loaded.org?.partnerId ?? null;
+            return;
+          }
+          beatHierarchy = loaded;
+          hierarchyOutcome = 'loaded';
+          beatPolicySet = await loadDevicePolicySet(loaded);
+        });
+      } catch (err) {
+        console.error(`[agents] failed to load the device hierarchy or policy set for ${agentId}; resolvers read their own:`, err);
+        captureException(err);
+      }
+      if (hierarchyOutcome === 'missing') {
+        console.warn(`[agents] device ${scoped.deviceId} is not visible to its own org context (moved, deleted or re-parented mid-beat); omitting policy config this heartbeat`);
+        // Tags carry the ids (Sentry has no separate extra channel here) so the
+        // event says WHICH mismatch fired; ids are never used as a fingerprint.
+        captureException(new Error('heartbeat policy context: device hierarchy not visible to its own org'), undefined, {
+          reason: missingReason,
+          deviceId: scoped.deviceId,
+          agentOrgId: agent.orgId,
+          loadedOrgId: missingLoadedOrgId ?? 'none',
+          agentPartnerId: agent.partnerId ?? 'none',
+          loadedPartnerId: missingLoadedPartnerId ?? 'none',
+        });
+        return;
+      }
+
+      const policyOpts = withPolicySet(beatPolicySet, beatHierarchy);
+      const fillScope = beatHierarchy?.org
+        ? { orgId: beatHierarchy.orgId, partnerId: beatHierarchy.org.partnerId }
+        : undefined;
+      const probePartnerOpts = beatHierarchy?.org ? { partnerId: beatHierarchy.org.partnerId } : undefined;
+      // #8257: the device-keyed Redis policy caches are bound to the device's
+      // org. With a hierarchy it supplies the org (already checked equal to
+      // scoped.deviceOrgId above); without one this names it. No statement.
+      const cachedPolicyOpts = { ...policyOpts, orgId: scoped.deviceOrgId };
+
+      // Helper. Redis first (no statement on a hit). With the set the helper
+      // resolves in memory and only the legacy org flag can read (its own
+      // savepoint, on a per-org cache miss). Without it, the whole helper read
+      // keeps its own savepoint, as before: a null helper delivers
+      // helperEnabled:false to a legacy beat (a retain-state beat retains it),
+      // so its SQL error must not abort the context.
+      try {
+        const cachedHelper = await readCachedHelperSettings(scoped.deviceId, scoped.deviceOrgId);
+        if (cachedHelper) {
+          helperSettings = cachedHelper;
+        } else {
+          const helperOpts = {
+            ...policyOpts,
+            skipCacheRead: true,
+            // #8616 (decision 13, approved override of the plan's OD13): a
+            // value read without this beat's own hierarchy is never cached.
+            skipCacheWrite: hierarchyOutcome !== 'loaded',
+            loadOrgHelperSettings: (orgId: string) =>
+              orgCacheFills.through(orgHelperSettingsCache, orgId, () => withDbTransaction(() => getOrgHelperSettings(orgId)), fillScope),
+          };
+          helperSettings = beatPolicySet
+            ? await buildHelperConfigUpdate(scoped.deviceId, scoped.deviceOrgId, helperOpts)
+            : await withDbTransaction(() => buildHelperConfigUpdate(scoped.deviceId, scoped.deviceOrgId, helperOpts));
+        }
+      } catch (err) {
+        console.error(`[agents] failed to read helper settings for ${agentId}:`, err);
+        captureException(err);
+      }
+
+      // Policy probe (per-org cache; savepoint only on a miss). automation_policies
+      // carries its own partner-wide SELECT branch, so partner-wide compliance
+      // policies (#2129) are visible in this org-scoped context.
+      try {
+        const cachedProbe = orgPolicyProbeCache.peek(scoped.deviceOrgId);
+        policyProbeConfig = cachedProbe !== undefined
+          ? cachedProbe
+          : await withDbTransaction(() =>
+            orgCacheFills.through(orgPolicyProbeCache, scoped.deviceOrgId, () =>
+              buildPolicyProbeConfigUpdate(scoped.deviceOrgId, probePartnerOpts), fillScope),
+          );
+      } catch (err) {
+        console.error(`[agents] failed to build policy probe config update for ${agentId}:`, err);
+        captureException(err);
+      }
+
+      // Sentry on every feature: losing a policy silently is exactly #2930.
+      try {
+        policyConfigs.eventLogSettings = await buildEventLogConfigUpdate(scoped.deviceId, cachedPolicyOpts);
       } catch (err) {
         console.error(`[agents] failed to build event log config update for ${agentId}:`, err);
         captureException(err);
       }
 
       try {
-        monitoringSettings = await buildMonitoringConfigUpdate(scoped.deviceId) as Record<string, unknown> | null;
+        policyConfigs.hardwareMonitoringSettings = await buildHardwareMonitoringConfigUpdate(scoped.deviceId, cachedPolicyOpts);
       } catch (err) {
-        console.error(`[agents] failed to build monitoring config update for ${agentId}:`, err);
+        console.error(`[agents] failed to build hardware monitoring config update for ${agentId}:`, err);
         captureException(err);
       }
 
       try {
-        pamSettings = await buildPamConfigUpdate(scoped.deviceId);
+        policyConfigs.pamSettings = await buildPamConfigUpdate(scoped.deviceId, {
+          ...cachedPolicyOpts,
+          // #8616: see the helper read above.
+          skipCacheWrite: hierarchyOutcome !== 'loaded',
+          loadOrgPamFallback: (orgId) =>
+            orgCacheFills.through(orgPamFallbackCache, orgId, () => withDbTransaction(() => resolveOrgPamFallback(orgId)), fillScope),
+        });
       } catch (err) {
-        // Opt-in default means a resolver failure leaves pamSettings null and we
-        // send uacInterceptionEnabled:false below. For an org that *enforces* PAM
-        // (grandfather flag or an explicit enabling policy) this momentarily drops
-        // elevation gating until the next successful heartbeat — call it out so the
-        // Sentry event isn't mistaken for a benign config-build hiccup. Not cached,
-        // so it self-heals on the next heartbeat.
+        // Opt-in default: a resolver failure sends uacInterceptionEnabled:false
+        // to a legacy agent (for an org that ENFORCES PAM this momentarily
+        // drops elevation gating until the next successful heartbeat), and
+        // `retainState: ['pam']` to a protocol-aware one (#8616). Not cached.
         console.error(
-          `[agents] failed to build pam config update for ${agentId} — sending uacInterceptionEnabled:false this heartbeat:`,
+          `[agents] failed to build pam config update for ${agentId} — no PAM decision this heartbeat:`,
           err,
         );
         captureException(err);
       }
 
-      // #1872: sole-patch-source enforcement. Omit the block on a resolver error so
-      // a transient failure never reverts an endpoint already under enforcement;
-      // a successful resolve with no patch policy returns false → agent reverts.
+      // #1872 sole-patch-source enforcement: a resolver error omits the block
+      // (never a revert); a successful resolve with no policy returns false.
       try {
-        patchSourceSettings = await buildPatchSourceConfigUpdate(scoped.deviceId);
+        policyConfigs.patchSourceSettings = await buildPatchSourceConfigUpdate(scoped.deviceId, policyOpts);
       } catch (err) {
         console.error(`[agents] failed to build patch_source config update for ${agentId}:`, err);
         captureException(err);
       }
 
-      // #5511 W02: device-side HP CMSL warranty collection. Same shape and same
-      // reason as patch_source above — omit the block on a resolver error so a
-      // transient failure never stops collection on a consented fleet; a
-      // successful resolve with no warranty policy (or a nearer policy that
-      // replaced the link without an hpCmsl block, contract D5) returns false
-      // → the agent stops. Last in the shared context on purpose: an earlier
-      // resolver's SQL error aborts the transaction, which makes this one throw
-      // too — and throwing here only ever omits the block, never revokes.
+      // Windows feature-update policy from the device's update ring: same
+      // posture as patch_source — an error omits the block (the agent keeps
+      // its last policy), a successful resolve with no ring says block.
       try {
-        warrantySettings = await buildWarrantyConfigUpdate(scoped.deviceId);
+        policyConfigs.featureUpdateSettings = await buildFeatureUpdateConfigUpdate(scoped.deviceId, policyOpts);
+      } catch (err) {
+        console.error(`[agents] failed to build feature_update config update for ${agentId}:`, err);
+        captureException(err);
+      }
+
+      // #5511 W02 HP CMSL: same shape as patch_source — an error only omits.
+      try {
+        policyConfigs.warrantySettings = await buildWarrantyConfigUpdate(scoped.deviceId, policyOpts);
       } catch (err) {
         console.error(`[agents] failed to build warranty config update for ${agentId}:`, err);
         captureException(err);
       }
 
-      return { eventLogSettings, monitoringSettings, pamSettings, patchSourceSettings, warrantySettings };
+      // Time sync (index §F.2): an error only omits time_sync_settings.
+      try {
+        policyConfigs.timeSyncSettings = await buildTimeSyncConfigUpdate(scoped.deviceId, policyOpts);
+      } catch (err) {
+        console.error(`[agents] failed to build time sync config update for ${agentId}:`, err);
+        captureException(err);
+      }
+
+      // OneDrive DB phase (#1105: no Graph call here). Its own savepoint, and
+      // skipped outright when the set shows no OneDrive settings link at all.
+      // The onedrive_device_state upsert happened in the org block, so
+      // ingest-before-delivery ordering is preserved.
+      try {
+        const mayHaveOnedrive = !beatPolicySet
+          || beatPolicySet.candidates.some((c) => c.links.onedrive_helper?.onedrive);
+        if (mayHaveOnedrive) {
+          onedrivePlan = await withDbTransaction(() => loadOnedriveHelperConfigPlan(scoped.deviceId, policyOpts));
+        }
+      } catch (err) {
+        console.error(`[agents] failed to load onedrive_helper config for ${agentId}:`, err);
+        captureException(err);
+      }
+
+      // Monitoring, then workload inventory. null = unresolved → omit (agent keeps its watches);
+      // "no policy applies" arrives as { watches: [] } and must be sent (#2949).
+      // With the set, a device with no monitors link costs no statement.
+      try {
+        policyConfigs.monitoringSettings = await buildMonitoringConfigUpdate(scoped.deviceId, cachedPolicyOpts) as Record<string, unknown> | null;
+      } catch (err) {
+        console.error(`[agents] failed to build monitoring config update for ${agentId}:`, err);
+        captureException(err);
+      }
+
+      // Workload inventory (spec §7.2) after monitoring, in this context like
+      // the others: an error, including an earlier resolver's SQL error that
+      // aborted the context's transaction, only omits the key (the agent keeps
+      // its last applied settings). A settings-cache hit is a Redis read only.
+      try {
+        policyConfigs.workloadInventorySettings = await buildWorkloadInventoryConfigUpdate(scoped.deviceId, policyOpts);
+      } catch (err) {
+        console.error(`[agents] failed to build workload inventory config update for ${agentId}:`, err);
+        captureException(err);
+      }
+
+      // #7970 — UniFi collector presence hint (configUpdate.unifi_collectors_assigned).
+      // The agent backs its collector-config fetch off to a long idle interval
+      // while it has none; `true` here wakes it. Shares the unifi-collectors
+      // route's negative cache (same key, same predicate), so a collector-less
+      // device costs one savepoint per TTL, not one per beat. Last in this
+      // context: an earlier aborting statement only omits the key (the agent
+      // then keeps its idle re-check).
+      try {
+        unifiCollectorsAssigned = await orgCacheFills.through(
+          agentCollectorAbsenceCache,
+          agentCollectorAbsenceKey(scoped.deviceId, agent.orgId),
+          () => withDbTransaction(() => deviceHasAgentCollectors(db, scoped.deviceId, agent.orgId)),
+          fillScope,
+          { keyOrgId: agent.orgId, shouldCache: (present) => !present },
+        );
+      } catch (err) {
+        console.error(`[agents] failed to resolve UniFi collector presence for ${agentId}:`, err);
+        captureException(err);
+      }
     });
+    // Stored only now that the context has committed (fillIfCurrent refuses to
+    // run inside one). This line is reached ONLY on a real COMMIT: postgres.js
+    // remembers the first statement that failed in the context's own scope,
+    // even one the code above caught, and then sends ROLLBACK (never COMMIT)
+    // and rejects with that error, so the flush is skipped (verified against
+    // postgres 3.4.9, #8142). A failure inside a savepoint stays in the
+    // savepoint's scope; the context still commits and its fills are safe:
+    // every queued load ran in its own savepoint and returned, and a load
+    // attempted after an abort fails at SAVEPOINT and is never queued.
+    orgCacheFills.flush();
   } catch (err) {
-    // Transaction setup/commit failure — see the note above. Every resolver's
-    // documented "no policy this cycle" fallback already applies because
-    // policyConfigs keeps its all-null initial value.
-    console.error(`[agents] policy config context failed for ${agentId} — omitting config updates this heartbeat:`, err);
+    // Context setup failure, a statement that aborted the context (rejected
+    // after ROLLBACK, see above), or a COMMIT failure. Values already written above are kept
+    // (see 2.); anything not yet produced keeps its "no update this cycle"
+    // null. By now the org transaction has committed and the claimed commands
+    // are marked delivered, so this must never 500 the heartbeat.
+    console.error(`[agents] policy config context failed for ${agentId}; delivering what was read before the failure:`, err);
     captureException(err);
   }
-  const { eventLogSettings, monitoringSettings, pamSettings, patchSourceSettings, warrantySettings } = policyConfigs;
+
+  // OneDrive Graph phase: after the policy context is released, with no DB
+  // access (the plan carries every row it needs) — #1105.
+  let onedriveSettings: OnedriveConfigUpdate | null = null;
+  if (onedrivePlan) {
+    try {
+      onedriveSettings = await finishOnedriveHelperConfig(onedrivePlan);
+    } catch (err) {
+      console.error(`[agents] failed to build onedrive_helper config update for ${agentId}:`, err);
+      captureException(err);
+    }
+  }
+  const onedriveConfigUpdate = onedriveSettings
+    ? { onedrive_helper_settings: onedriveSettings }
+    : null;
+
+  // #10190 W03 — the MSP identity drawn on every device prompt. Only for an
+  // agent that speaks the block, and only when this beat's own hierarchy
+  // loaded (the device's org and partner were just checked against the
+  // authenticated ones). Otherwise, and on any resolution failure, the block
+  // is OMITTED, never `cleared`: an absent block keeps the agent's last-known
+  // identity, so a transient DB or Redis error never strips the MSP name from
+  // a prompt. `cleared` is sent only when the device's org resolves no partner
+  // row (services/promptIdentity.ts). Resolved here, after the policy context
+  // is released: it runs its own short system read and may fetch the logo
+  // (#1105). A sibling of helperSettings, not inside it: native prompts need
+  // the identity on a device with no helper policy.
+  let promptIdentity: Awaited<ReturnType<typeof buildHeartbeatPromptIdentity>>;
+  if (
+    normalizePromptIdentityProtocolVersion(data.securityCapabilities?.promptIdentityProtocolVersion) === 1
+    && hierarchyOutcome === 'loaded'
+  ) {
+    try {
+      promptIdentity = await buildHeartbeatPromptIdentity({
+        deviceId: scoped.deviceId,
+        orgId: scoped.deviceOrgId,
+        partnerId: agent.partnerId,
+      });
+    } catch (err) {
+      console.error(`[agents] failed to resolve the prompt identity for ${agentId}; block omitted:`, err);
+      captureException(err);
+    }
+  }
+
+  const {
+    eventLogSettings,
+    monitoringSettings,
+    pamSettings,
+    patchSourceSettings,
+    featureUpdateSettings,
+    warrantySettings,
+    hardwareMonitoringSettings,
+    timeSyncSettings,
+    workloadInventorySettings,
+  } = policyConfigs;
 
   const policyConfigUpdate: Record<string, unknown> = {};
   if (eventLogSettings) {
     policyConfigUpdate.event_log_settings = eventLogSettings;
   }
+  if (hardwareMonitoringSettings) {
+    policyConfigUpdate.hardware_monitoring_settings = hardwareMonitoringSettings;
+  }
+  if (timeSyncSettings) {
+    policyConfigUpdate.time_sync_settings = timeSyncSettings;
+  }
+  if (workloadInventorySettings) {
+    policyConfigUpdate.workload_inventory_settings = workloadInventorySettings;
+  }
+  // null = couldn't resolve this cycle (device vanished mid-resolution, #5677,
+  // or the resolver threw) → omit, and the agent keeps its watches. "No
+  // monitoring policy applies" is NOT null: it arrives as `{ watches: [] }`
+  // and must be sent, because the agent reads an absent key as "no change"
+  // and would otherwise keep a deleted policy's watches forever (#2949).
   if (monitoringSettings) {
     policyConfigUpdate.monitoring_settings = monitoringSettings;
   }
   if (patchSourceSettings) {
     policyConfigUpdate.patch_source_settings = patchSourceSettings;
+  }
+  if (featureUpdateSettings) {
+    policyConfigUpdate.feature_update_settings = toFeatureUpdateSettingsWire(featureUpdateSettings);
   }
   // Snake_case inside the block as well as outside (contract D6): this
   // assembly is where camelCase resolver output becomes wire keys, and the
@@ -2179,67 +3221,99 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
   const hasPolicyConfigUpdate = Object.keys(policyConfigUpdate).length > 0;
 
   const scopedConfigUpdate = scoped.mainResponse.configUpdate as Record<string, unknown> | null;
-  const configUpdate = policyProbeConfig || scopedConfigUpdate || hasPolicyConfigUpdate || onedriveConfigUpdate
+  const unifiHint = unifiCollectorsAssigned === null ? null : { unifi_collectors_assigned: unifiCollectorsAssigned };
+  const configUpdate = policyProbeConfig || scopedConfigUpdate || hasPolicyConfigUpdate || onedriveConfigUpdate || unifiHint
     ? {
       ...(policyProbeConfig ?? {}),
       ...(scopedConfigUpdate ?? {}),
       ...policyConfigUpdate,
       ...(onedriveConfigUpdate ?? {}),
+      ...(unifiHint ?? {}),
     }
     : null;
 
-  // #1105 — helper settings resolved OUTSIDE the org context too (same
-  // guarantee as policyProbeConfig/onedriveSettings above): a partner-wide
-  // helper policy (org_id NULL) was invisible under the org-scoped RLS context
-  // (accessiblePartnerIds: [] there), so it resolved under a system context
-  // anchored to this authenticated device's own org — cannot pivot tenants
-  // since both ids come from `scoped`, derived from the device the agent
-  // already authenticated as.
-  //
-  // #4673 W03: the invisibility half of that reason is gone —
-  // `config_policy_feature_links_partner_wide_select` covers the JSONB
-  // `inlineSettings` this resolves, and `buildHelperConfigUpdate` touches no
-  // partner-AXIS table, so this one IS a safe drop-in swap to an org-scoped
-  // context. It is left alone only so the heartbeat's five hoists are converted
-  // as ONE reviewable change with one integration proof each, rather than
-  // piecemeal. See the note at the `currentPartnerId` assignment above.
-  let helperSettings: HelperSettings | null = null;
-  try {
-    helperSettings = await withSystemDbAccessContext(() =>
-      buildHelperConfigUpdate(scoped.deviceId, scoped.deviceOrgId)
-    );
-  } catch (err) {
-    console.error(`[agents] failed to read helper settings for ${agentId}:`, err);
-    captureException(err);
+  // #8616 — PAM, helper and remote management: the legacy payload for every
+  // beat except one that advertised retainStateProtocolVersion 1 (kill switch
+  // HEARTBEAT_RETAIN_STATE_ENABLED=false forces legacy for all). Legacy keeps
+  // the opt-in default: no PAM decision sends false, so we never prompt users
+  // on a device that opted into nothing. Each key below sits at its pre-#8616
+  // position (manageRemoteManagement overwrites its mainResponse slot), so a
+  // legacy payload is byte-identical to before.
+  const settingsDecision = buildSettingsDecisionFields({
+    retainProtocol: normalizeRetainStateProtocolVersion(data.securityCapabilities?.retainStateProtocolVersion),
+    enabled: retainStateKillSwitchEnabled(),
+    policyHierarchyLoaded: hierarchyOutcome === 'loaded',
+    pamSettings,
+    helperSettings,
+    remoteManagement: scoped.remoteManagement,
+  });
+
+  // Breeze Assist only installs while enabled. A bootstrap offer for a
+  // policy-disabled app can never complete and must not reserve a fleet slot.
+  // Trust only a resolved policy; missing/error/retained state is not "off".
+  // This is the optional Tauri helper, not the native user-helper component.
+  if (hierarchyOutcome === 'loaded' && helperSettings?.enabled === false) {
+    scoped.mainResponse.helperUpgradeTo = undefined;
   }
+  // Policy discovery has closed its DB context; Redis admission still runs
+  // outside tenant transactions and observes actual component versions.
+  await guardHeartbeatUpdates(rolloutAdmission);
 
   return c.json({
     ...scoped.mainResponse,
+    manageRemoteManagement: settingsDecision.manageRemoteManagement,
     configUpdate,
     manifestTrustKeys,
     manifestKeyDelegations,
-    // Opt-in default: a null pamSettings (resolver error, logged above) sends
-    // false so we never prompt users on a device that opted into nothing.
-    uacInterceptionEnabled: pamSettings?.uacInterceptionEnabled ?? false,
-    helperEnabled: helperSettings?.enabled ?? false,
-    helperSettings: helperSettings ?? undefined,
+    uacInterceptionEnabled: settingsDecision.uacInterceptionEnabled,
+    helperEnabled: settingsDecision.helperEnabled,
+    helperSettings: settingsDecision.helperSettings,
+    // #10190 — the prompt host kill switch (spec §3.1 rule 2). ALWAYS sent,
+    // with or without a helper policy: the agent reads an absent block as an
+    // empty list, so omitting it would be indistinguishable from the kill
+    // switch. Server config only; the agent still needs the renderer's live
+    // advertisement and its own build to speak a kind before using it.
+    promptHost: { enabledKinds: enabledPromptKinds() },
+    ...(promptIdentity ? { promptIdentity } : {}),
     acknowledgedRollbackObservationId,
+    ...(identityAssertion ? { identityAssertion } : {}),
+    ...(rebind ? { rebind } : {}),
+    ...(settingsDecision.retainState ? { retainState: settingsDecision.retainState } : {}),
   });
 });
+
+/**
+ * Upper bound on check results accepted in one monitoring-results submit. The
+ * agent sends one result per configured watch per check cycle; a policy holds
+ * at most 200 watches (monitoringInlineSettingsSchema) and monitor-derived
+ * watches are unioned on top, so this leaves generous headroom while bounding
+ * the per-request insert and the per-result Redis/event work below.
+ */
+export const MAX_MONITORING_RESULTS_PER_REQUEST = 1000;
 
 // Receive service/process monitoring check results from agent
 heartbeatRoutes.put('/:id/monitoring-results', bodyLimit({ maxSize: 1024 * 1024, onError: (c) => c.json({ error: 'Request body too large' }, 413) }), async (c) => {
   const agentId = c.req.param('id');
+  const agent = c.get('agent') as { orgId?: string; partnerId?: string | null } | undefined;
 
-  const [device] = await db
-    .select()
-    .from(devices)
-    .where(eq(devices.agentId, agentId))
-    .limit(1);
-
-  if (!device) {
-    return c.json({ error: 'Device not found' }, 404);
+  // `monitoring-results` is in SELF_MANAGED_DB_CONTEXT_ACTIONS (agentAuth.ts):
+  // the middleware opens no request-long transaction here, so this handler
+  // builds its own org-scoped context from the authenticated agent. Fail fast
+  // rather than build a vacuous context that would RLS-deny every read.
+  if (!agent?.orgId) {
+    console.error(`[monitoring] monitoring-results submit with no org context agent=${agentId}`);
+    return c.json({ error: 'Agent context missing organization' }, 401);
   }
+  const dbContext = {
+    scope: 'organization' as const,
+    orgId: agent.orgId,
+    accessibleOrgIds: [agent.orgId],
+    // Partner-AXIS access (breeze_has_partner_access → writes) stays empty.
+    accessiblePartnerIds: [],
+    // Self-managed context: carry the partner id across explicitly, exactly
+    // as the heartbeat / eventlogs handlers do.
+    currentPartnerId: agent.partnerId ?? null,
+  };
 
   let body: { results: Array<Record<string, unknown>> };
   try {
@@ -2251,77 +3325,130 @@ heartbeatRoutes.put('/:id/monitoring-results', bodyLimit({ maxSize: 1024 * 1024,
   if (!Array.isArray(body?.results) || body.results.length === 0) {
     return c.json({ error: 'results array required' }, 400);
   }
+  if (body.results.length > MAX_MONITORING_RESULTS_PER_REQUEST) {
+    return c.json({
+      error: 'Too many results in one request',
+      maxResults: MAX_MONITORING_RESULTS_PER_REQUEST,
+    }, 413);
+  }
 
   const { serviceProcessCheckResults } = await import('../../db/schema');
   const { getRedis } = await import('../../services/redis');
   const { publishEvent } = await import('../../services/eventBus');
 
-  const insertValues = body.results.map((r) => ({
-    orgId: device.orgId,
-    deviceId: device.id,
-    watchType: (r.watchType === 'service' ? 'service' : 'process') as 'service' | 'process',
-    name: String(r.name ?? ''),
-    status: (['running', 'stopped', 'not_found', 'error'].includes(r.status as string) ? r.status : 'error') as 'running' | 'stopped' | 'not_found' | 'error',
-    cpuPercent: typeof r.cpuPercent === 'number' ? r.cpuPercent : null,
-    memoryMb: typeof r.memoryMb === 'number' ? r.memoryMb : null,
-    pid: typeof r.pid === 'number' ? r.pid : null,
-    // #2434: details is an agent-supplied free-form blob surfaced in the
-    // service-monitoring UI — redact secret-shaped strings before persistence.
-    details: (r.details && typeof r.details === 'object') ? redactSecretsDeep(r.details) : null,
-    autoRestartAttempted: r.autoRestartAttempted === true,
-    autoRestartSucceeded: typeof r.autoRestartSucceeded === 'boolean' ? r.autoRestartSucceeded : null,
-  }));
+  // Phase 1 (one short org-scoped context): resolve the device and persist
+  // the batch. Nothing but DB work runs while this transaction is open.
+  type StoreOutcome =
+    | { kind: 'not_found' }
+    | { kind: 'insert_failed' }
+    | {
+        kind: 'stored';
+        device: { id: string; orgId: string; siteId: typeof devices.$inferSelect['siteId'] };
+        insertValues: Array<{ name: string; watchType: 'service' | 'process'; status: 'running' | 'stopped' | 'not_found' | 'error' }>;
+      };
+  const outcome = await withDbAccessContext(dbContext, async (): Promise<StoreOutcome> => {
+    const [device] = await db
+      .select()
+      .from(devices)
+      .where(eq(devices.agentId, agentId))
+      .limit(1);
 
-  // Batch insert results
-  try {
-    await db.insert(serviceProcessCheckResults).values(insertValues);
-  } catch (err) {
-    console.error(`[monitoring] failed to insert check results for device ${device.id}:`, err);
+    if (!device) {
+      return { kind: 'not_found' };
+    }
+
+    const insertValues = body.results.map((r) => ({
+      orgId: device.orgId,
+      deviceId: device.id,
+      watchType: (r.watchType === 'service' ? 'service' : 'process') as 'service' | 'process',
+      name: String(r.name ?? ''),
+      status: (['running', 'stopped', 'not_found', 'error'].includes(r.status as string) ? r.status : 'error') as 'running' | 'stopped' | 'not_found' | 'error',
+      cpuPercent: typeof r.cpuPercent === 'number' ? r.cpuPercent : null,
+      memoryMb: typeof r.memoryMb === 'number' ? r.memoryMb : null,
+      pid: typeof r.pid === 'number' ? r.pid : null,
+      // #2434: details is an agent-supplied free-form blob surfaced in the
+      // service-monitoring UI — redact secret-shaped strings before persistence.
+      details: (r.details && typeof r.details === 'object') ? redactSecretsDeep(r.details) : null,
+      autoRestartAttempted: r.autoRestartAttempted === true,
+      autoRestartSucceeded: typeof r.autoRestartSucceeded === 'boolean' ? r.autoRestartSucceeded : null,
+    }));
+
+    // Batch insert results
+    try {
+      await db.insert(serviceProcessCheckResults).values(insertValues);
+    } catch (err) {
+      console.error(`[monitoring] failed to insert check results for device ${device.id}:`, err);
+      return { kind: 'insert_failed' };
+    }
+
+    return {
+      kind: 'stored',
+      device: { id: device.id, orgId: device.orgId, siteId: device.siteId },
+      insertValues: insertValues.map(({ name, watchType, status }) => ({ name, watchType, status })),
+    };
+  });
+
+  if (outcome.kind === 'not_found') {
+    return c.json({ error: 'Device not found' }, 404);
+  }
+  if (outcome.kind === 'insert_failed') {
     return c.json({ error: 'Failed to store results' }, 500);
   }
+  const { device, insertValues } = outcome;
 
-  // Track consecutive failures in Redis and manage alerts
+  // Phase 2 (no DB context held): track consecutive failures in Redis and
+  // publish the real-time events. One pipelined round trip for the whole
+  // batch instead of one-to-two sequential round trips per result.
   const redis = getRedis();
-  for (const result of insertValues) {
-    const failureKey = `svc-mon:${device.id}:${result.name}:failures`;
+  if (redis) {
+    const keyFor = (name: string) => `svc-mon:${device.id}:${name}:failures`;
+    const pipeline = redis.pipeline();
+    for (const result of insertValues) {
+      const failureKey = keyFor(result.name);
+      if (result.status !== 'running') {
+        pipeline.incr(failureKey);
+        pipeline.expire(failureKey, 3600); // TTL 1h
+      } else {
+        pipeline.get(failureKey);
+        pipeline.del(failureKey);
+      }
+    }
 
-    if (result.status !== 'running') {
-      // Increment consecutive failure counter
-      if (redis) {
-        try {
-          const count = await redis.incr(failureKey);
-          await redis.expire(failureKey, 3600); // TTL 1h
+    let replies: Array<[Error | null, unknown]> | null = null;
+    try {
+      replies = (await pipeline.exec()) as Array<[Error | null, unknown]> | null;
+    } catch (err) {
+      console.warn(`[monitoring] Redis failure counter pipeline error for ${device.id}:`, err);
+    }
+
+    if (replies) {
+      // Each result queued exactly two commands, in order; the first reply of
+      // each pair carries the value the event needs.
+      insertValues.forEach((result, i) => {
+        const [err, value] = replies![i * 2] ?? [new Error('missing reply'), null];
+        if (err) {
+          console.warn(`[monitoring] Redis failure counter error for ${device.id}/${result.name}:`, err);
+          return;
+        }
+        if (result.status !== 'running') {
           // Publish event for real-time UI updates
           publishEvent(
             'monitoring.check_failed',
             device.orgId,
-            { deviceId: device.id, name: result.name, watchType: result.watchType, status: result.status, consecutiveFailures: count },
+            { deviceId: device.id, name: result.name, watchType: result.watchType, status: result.status, consecutiveFailures: Number(value) },
             'agent-monitoring',
             { siteId: device.siteId }
           );
-        } catch (err) {
-          console.warn(`[monitoring] Redis failure counter error for ${device.id}/${result.name}:`, err);
+        } else if (value && Number(value) > 0) {
+          publishEvent(
+            'monitoring.check_recovered',
+            device.orgId,
+            { deviceId: device.id, name: result.name, watchType: result.watchType, previousFailures: Number(value) },
+            'agent-monitoring',
+            { siteId: device.siteId }
+          );
         }
-      }
-    } else {
-      // Reset failure counter on recovery
-      if (redis) {
-        try {
-          const prevCount = await redis.get(failureKey);
-          await redis.del(failureKey);
-          if (prevCount && Number(prevCount) > 0) {
-            publishEvent(
-              'monitoring.check_recovered',
-              device.orgId,
-              { deviceId: device.id, name: result.name, watchType: result.watchType, previousFailures: Number(prevCount) },
-              'agent-monitoring',
-              { siteId: device.siteId }
-            );
-          }
-        } catch (err) {
-          console.warn(`[monitoring] Redis failure reset error for ${device.id}/${result.name}:`, err);
-        }
-      }
+      });
     }
   }
 

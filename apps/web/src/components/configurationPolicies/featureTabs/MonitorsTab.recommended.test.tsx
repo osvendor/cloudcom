@@ -24,7 +24,11 @@ const base: FeatureTabProps = { policyId: POLICY, existingLink: link, linkedPoli
   onLinkChanged: vi.fn(), allLinks: [link] };
 
 function renderTab(existingLink = link) {
-  fetchMock.mockResolvedValue({ ok: true, json: async () => ({ data: catalog }) });
+  fetchMock.mockImplementation(async (url: string) => ({ ok: true, json: async () => ({
+    data: url.includes('/conversion/')
+      ? { policyId: POLICY, previewHash: 'hash', items: [], inheritanceMode: 'cumulative', equivalence: { devicesChecked: 0, deltas: [] } }
+      : catalog,
+  }) }));
   saveMock.mockResolvedValue(link);
   return render(<MonitorsTab {...base} existingLink={existingLink} />);
 }
@@ -45,7 +49,9 @@ describe('MonitorsTab policy affordances', () => {
     expect(saveMock).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole('button', { name: /^Save$/i }));
     await waitFor(() => expect(saveMock).toHaveBeenCalledWith('l', expect.objectContaining({
-      featureType: 'monitors', inlineSettings: { items: [
+      // W05c2 Task 4 added the inheritance switch, so the monitors link now
+      // carries its mode; 'cumulative' is the default (add to inherited).
+      featureType: 'monitors', inlineSettings: { inheritance: 'cumulative', items: [
         { monitorId: CPU, enabled: true, overrides: undefined, sortOrder: 0 },
         { monitorId: DISK, enabled: true, overrides: undefined, sortOrder: 1 },
       ] },

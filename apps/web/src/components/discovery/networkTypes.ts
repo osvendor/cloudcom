@@ -20,7 +20,7 @@ export type NetworkBaseline = {
   scanSchedule: NetworkBaselineScanSchedule;
   alertSettings: NetworkBaselineAlertSettings;
   /**
-   * SEC-2026-09-05-146: why the recurring scan was not dispatched. Non-null
+   * Why the recurring scan was not dispatched. Non-null
    * means the schedule is armed-but-blocked; re-saving it re-arms the authority.
    */
   scheduleBlockedReason: string | null;
@@ -57,11 +57,11 @@ export type DeviceOption = {
   label: string;
 };
 
-export type DiscoveredAssetLinkSource = 'manual' | 'auto';
+export type DiscoveredAssetLinkSource = 'manual' | 'auto' | 'agent_report';
 export type DiscoveredAssetTypeSource = 'manual' | 'auto';
 
 // A discovered asset can only be unlinked when it was linked manually. Auto
-// (MAC/IP-matched) and unknown (NULL, pre-dates link_source) links are not
+// (MAC-matched) and unknown (NULL, pre-dates link_source) links are not
 // unlinkable — the discovery worker would just recreate an auto link. The
 // server enforces this authoritatively; the UI uses this to gate the button.
 export function isManualLink(
@@ -90,7 +90,7 @@ function asBoolean(value: unknown): boolean | null {
 }
 
 export function parseDiscoveredAssetLinkSource(value: unknown): DiscoveredAssetLinkSource | null {
-  return value === 'manual' || value === 'auto' ? value : null;
+  return value === 'manual' || value === 'auto' || value === 'agent_report' ? value : null;
 }
 
 // Unlike linkSource (nullable), typeSource always resolves to a concrete value:

@@ -7,12 +7,13 @@ import {
   isReportOccurrenceDue,
   lastOccurrenceKey,
 } from './reportScheduleWorker';
-import { pgOffsetlessTimestamp } from '../testUtils/pgOffsetlessTimestamp';
+import { withHostTimeZone } from '../testUtils/hostTimeZone';
 
 // #3198 W01 — `findDueReports` owner-axis cases below. Only `db.select` is
 // faked (the chain records its projection, joins and WHERE); the schema and
 // drizzle-orm are REAL, so the recorded predicates compile to the exact SQL
-// Postgres would receive. The pure #4059 cases above never touch the db.
+// Postgres would receive. The pure `isReportOccurrenceDue` cases never touch
+// the db.
 const selectCalls = vi.hoisted(() => [] as Array<{
   fields: Record<string, unknown> | undefined;
   joins: Array<{ kind: string; on: unknown }>;
@@ -38,84 +39,69 @@ vi.mock('../db', () => ({
 }));
 
 /**
- * #4059 gap 2 — scheduled-report due detection on a non-UTC API host.
+ * Scheduled-report due detection must not depend on the API host's zone.
  *
- * `reports.last_generated_at` is `timestamp('last_generated_at')` with no
- * `withTimezone: true` (`db/schema/reports.ts:82`), so postgres.js hands
- * `findDueReports` a Date carrying the UTC wall clock re-read as the API
- * process's LOCAL time. `isDue` converts that Date to wall-clock parts in the
- * ORG's zone and compares it against the occurrence key, so without the
- * correction in `isReportOccurrenceDue` the comparison is wrong by the API
- * host's offset:
- *
- * - **East of UTC**: an occurrence that already ran reads as older than it is
- *   and re-fires → the same scheduled report is generated and emailed twice.
- * - **West of UTC**: an occurrence that has NOT run reads as newer than it is
- *   and is suppressed → a silently missed scheduled report.
- *
- * Same defect class as #4018 (gap 1 of this issue, PR #4878).
- *
- * **These assertions only have teeth under a non-UTC TZ**, which is the whole
- * point: `pgOffsetlessTimestamp` reproduces the driver's misparse using the
- * PROCESS's own zone, so under a UTC runner it is the identity function and
- * these cases collapse to trivially-true — exactly the vacuity #4046 exists to
- * prevent. That is why this file is registered in `vitest.config.tz.ts`
- * (`pnpm test:tz`, `TZ=America/Denver` in CI), guarded by
- * `__tests__/tzPinCanary.test.ts`. A fabricated arbitrary offset would NOT
- * work here: the production correction reads `getTimezoneOffset()` off the real
- * process, so only a real host offset can be recovered.
- *
- * Verified red against the pre-fix code under `TZ=America/Denver`.
+ * `reports.last_generated_at` is an offsetless `timestamp` column. Drizzle
+ * decodes it as UTC, so `findDueReports` receives the stored instant, which is
+ * what the fixtures below build with `new Date(iso)`. `isDue` reads wall-clock
+ * parts in the schedule's zone through Intl, so the verdict is the same on any
+ * host. Each case runs on a host west and east of UTC; moving the Date by the
+ * host offset would re-fire a report that already ran on one side and skip a
+ * due one on the other.
  */
 
 const TZ = 'UTC';
 /** A daily 09:00 schedule; 2026-06-10T09:00Z is the occurrence boundary. */
 const DAILY = { time: '09:00' } as const;
 const NOW = new Date('2026-06-10T09:30:00Z');
+const HOSTS = ['America/Denver', 'Asia/Tokyo'] as const;
 
 const keyForNow = () => lastOccurrenceKey(NOW, 'daily', DAILY, TZ);
+/** Saved well before every occurrence these fixtures consider. */
+const SAVED_LONG_AGO = new Date('2026-01-01T00:00:00Z');
 
-describe('isReportOccurrenceDue — offsetless last_generated_at (#4059)', () => {
-  it('does not re-fire an occurrence that already ran', () => {
-    // Genuinely ran at 09:05Z, five minutes AFTER the 09:00 occurrence.
-    const ranAt = pgOffsetlessTimestamp(Date.parse('2026-06-10T09:05:00Z'));
-    expect(isReportOccurrenceDue(ranAt, keyForNow(), TZ)).toBe(false);
+describe('isReportOccurrenceDue — last_generated_at on any API host', () => {
+  it.each(HOSTS)('does not re-fire an occurrence that already ran, on a %s host', (zone) => {
+    withHostTimeZone(zone, () => {
+      // Ran at 09:05Z, five minutes AFTER the 09:00 occurrence.
+      expect(isReportOccurrenceDue(new Date('2026-06-10T09:05:00Z'), keyForNow(), TZ, SAVED_LONG_AGO)).toBe(false);
+    });
   });
 
-  it('still fires an occurrence that has not run yet', () => {
-    // Genuinely ran at 08:55Z, five minutes BEFORE the 09:00 occurrence.
-    const ranAt = pgOffsetlessTimestamp(Date.parse('2026-06-10T08:55:00Z'));
-    expect(isReportOccurrenceDue(ranAt, keyForNow(), TZ)).toBe(true);
+  it.each(HOSTS)('still fires an occurrence that has not run yet, on a %s host', (zone) => {
+    withHostTimeZone(zone, () => {
+      // Ran at 08:55Z, five minutes BEFORE the 09:00 occurrence.
+      expect(isReportOccurrenceDue(new Date('2026-06-10T08:55:00Z'), keyForNow(), TZ, SAVED_LONG_AGO)).toBe(true);
+    });
   });
 
-  it('fires when the last run was the previous day', () => {
-    const ranAt = pgOffsetlessTimestamp(Date.parse('2026-06-09T09:05:00Z'));
-    expect(isReportOccurrenceDue(ranAt, keyForNow(), TZ)).toBe(true);
+  it.each(HOSTS)('fires when the last run was the previous day, on a %s host', (zone) => {
+    withHostTimeZone(zone, () => {
+      expect(isReportOccurrenceDue(new Date('2026-06-09T09:05:00Z'), keyForNow(), TZ, SAVED_LONG_AGO)).toBe(true);
+    });
   });
 
-  it('matches the verdict computed from the true instant, whatever the host zone', () => {
-    // The invariant the correction exists to restore: a Date that came off the
-    // wire must produce the same verdict as the true instant it represents.
+  it.each(HOSTS)('matches the verdict computed from the ISO text, on a %s host', (zone) => {
     // `expectedVerdict` is derived from the ISO text independently of the
-    // function under test, so this cannot be satisfied by the correction being
-    // skipped (or applied twice) on both sides of an equality.
-    for (const iso of [
-      '2026-06-09T00:00:00Z',
-      '2026-06-10T08:55:00Z',
-      '2026-06-10T09:00:00Z',
-      '2026-06-10T09:05:00Z',
-      '2026-06-10T23:59:00Z',
-    ]) {
-      const ms = Date.parse(iso);
-      expect(
-        isReportOccurrenceDue(pgOffsetlessTimestamp(ms), keyForNow(), TZ),
-        `offsetless parse of ${iso} must agree with its true instant`,
-      ).toBe(expectedVerdict(iso));
-    }
+    // function under test.
+    withHostTimeZone(zone, () => {
+      for (const iso of [
+        '2026-06-09T00:00:00Z',
+        '2026-06-10T08:55:00Z',
+        '2026-06-10T09:00:00Z',
+        '2026-06-10T09:05:00Z',
+        '2026-06-10T23:59:00Z',
+      ]) {
+        expect(
+          isReportOccurrenceDue(new Date(iso), keyForNow(), TZ, SAVED_LONG_AGO),
+          `last run at ${iso}`,
+        ).toBe(expectedVerdict(iso));
+      }
+    });
   });
 
-  it('never ran is always due', () => {
-    expect(isReportOccurrenceDue(null, keyForNow(), TZ)).toBe(true);
+  it('never ran, saved before the occurrence, is due', () => {
+    expect(isReportOccurrenceDue(null, keyForNow(), TZ, SAVED_LONG_AGO)).toBe(true);
   });
 });
 
@@ -164,6 +150,7 @@ describe('findDueReports — partner-owned definitions (#3198 W01)', () => {
         id: 'partner-report-1',
         schedule: 'monthly',
         lastGeneratedAt: null,
+        createdAt: new Date('2026-06-15T00:00:00Z'),
         config: { schedule: { time: '09:00', date: '1' } },
         orgSettings: null,
         partnerTimezone: 'Europe/Berlin',
@@ -213,5 +200,117 @@ describe('findDueReports — partner-owned definitions (#3198 W01)', () => {
     const disjunction = sql.indexOf(' and ((');
     expect(sql.indexOf('"reports"."execution_scope_user_id" is not null')).toBeLessThan(disjunction);
     expect(sql.slice(disjunction)).not.toContain('execution_scope_user_id');
+  });
+});
+
+describe('findDueReports — multi-org report series (W02)', () => {
+  beforeEach(() => {
+    selectCalls.length = 0;
+    selectResults.length = 0;
+  });
+
+  it('never polls an archived child or a child of a disabled series, in BOTH statements, with no new params', async () => {
+    selectResults.push([], [{ count: 0 }]);
+    await findDueReports(new Date('2026-07-01T07:30:00Z'));
+    const [dueQuery, skippedQuery] = selectCalls;
+    for (const call of [dueQuery!, skippedQuery!]) {
+      const where = compile(call.where);
+      expect(where.sql).toContain('"reports"."archived_at" is null');
+      expect(where.sql).toContain(
+        'NOT EXISTS (SELECT 1 FROM report_series rs WHERE rs.id = "reports"."series_id" AND rs.enabled = false)',
+      );
+    }
+    // The pollable prefix still binds exactly three params (one_time + the two
+    // worker-excluded types), so the existing complete-scope offsets hold.
+    expect(compile(dueQuery!.where).params.slice(0, 3)).toEqual(['one_time', 'ai_org_narrative', 'ai_fleet_design']);
+  });
+});
+
+// ─── #9562: a newly saved recurring report waits for its first occurrence ───
+
+describe('findDueReports — a never-run report waits for its first occurrence after creation (#9562)', () => {
+  beforeEach(() => {
+    selectCalls.length = 0;
+    selectResults.length = 0;
+  });
+
+  /** Monthly, day 1 at 08:00 UTC, saved on the 21st and never generated. */
+  const monthlyRow = (overrides: Record<string, unknown> = {}) => ({
+    id: 'monthly-day-1',
+    schedule: 'monthly',
+    lastGeneratedAt: null,
+    createdAt: new Date('2026-10-21T14:00:00Z'),
+    config: { schedule: { time: '08:00', date: '1' } },
+    orgSettings: null,
+    partnerTimezone: null,
+    partnerSettings: null,
+    ...overrides,
+  });
+
+  it('is NOT due on the next scheduler tick after it is saved', async () => {
+    selectResults.push([monthlyRow()], [{ count: 0 }]);
+    // Five minutes after the save. The most recent occurrence (Oct 1 08:00)
+    // predates the report itself, so it is not this report's to send.
+    expect(await findDueReports(new Date('2026-10-21T14:05:00Z'))).toEqual([]);
+  });
+
+  it('is still not due the minute before its first occurrence', async () => {
+    selectResults.push([monthlyRow()], [{ count: 0 }]);
+    expect(await findDueReports(new Date('2026-11-01T07:59:00Z'))).toEqual([]);
+  });
+
+  it('IS due at its first scheduled occurrence after creation', async () => {
+    selectResults.push([monthlyRow()], [{ count: 0 }]);
+    expect(await findDueReports(new Date('2026-11-01T08:00:00Z'))).toEqual([
+      // lastGeneratedAt stays the observed NULL: the occurrence claim CAS
+      // compares against what the due scan read.
+      { id: 'monthly-day-1', occurrenceKey: 202611010800, lastGeneratedAt: null },
+    ]);
+  });
+
+  it('judges creation in the schedule zone, like every other occurrence', async () => {
+    // Created 06:30Z on Nov 1 = 07:30 in Berlin, before the 08:00 Berlin
+    // occurrence; at 07:05Z (08:05 Berlin) that occurrence is due.
+    selectResults.push(
+      [monthlyRow({ createdAt: new Date('2026-11-01T06:30:00Z'), partnerTimezone: 'Europe/Berlin' })],
+      [{ count: 0 }],
+    );
+    expect(await findDueReports(new Date('2026-11-01T07:05:00Z'))).toEqual([
+      { id: 'monthly-day-1', occurrenceKey: 202611010800, lastGeneratedAt: null },
+    ]);
+  });
+
+  it('does not apply creation time once the report has run: lastGeneratedAt governs', async () => {
+    // A manual "Generate now" on Oct 25 stamps lastGeneratedAt; the Nov 1
+    // occurrence is still due on schedule.
+    selectResults.push(
+      [monthlyRow({ lastGeneratedAt: new Date('2026-10-25T10:00:00Z') })],
+      [{ count: 0 }],
+    );
+    const due = await findDueReports(new Date('2026-11-01T08:00:00Z'));
+    expect(due.map((d) => d.id)).toEqual(['monthly-day-1']);
+  });
+
+  it('reads created_at in the due query', async () => {
+    selectResults.push([], [{ count: 0 }]);
+    await findDueReports(new Date('2026-10-21T14:05:00Z'));
+    const [dueQuery] = selectCalls;
+    expect(compile(drizzleSql`${dueQuery!.fields!.createdAt}`).sql).toBe('"reports"."created_at"');
+  });
+});
+
+describe('isReportOccurrenceDue — creation time as the baseline for a never-run report (#9562)', () => {
+  it('a report created after the latest occurrence is not due', () => {
+    expect(isReportOccurrenceDue(null, keyForNow(), TZ, new Date('2026-06-10T09:10:00Z'))).toBe(false);
+  });
+
+  it('a report created before the latest occurrence is due', () => {
+    expect(isReportOccurrenceDue(null, keyForNow(), TZ, new Date('2026-06-10T08:50:00Z'))).toBe(true);
+  });
+
+  it('lastGeneratedAt wins over creation time when both are present', () => {
+    expect(
+      isReportOccurrenceDue(new Date('2026-06-09T09:05:00Z'), keyForNow(), TZ, new Date('2026-06-10T09:10:00Z')),
+    ).toBe(true);
   });
 });

@@ -300,7 +300,7 @@ func TestPendingPayloadCarriesUserScopeCoverage(t *testing.T) {
 			}))
 			defer ts.Close()
 
-			h := New(&config.Config{AgentID: "agent-1", ServerURL: ts.URL, AuthToken: "token"})
+			h := newTestHeartbeatWithoutCodec(&config.Config{AgentID: "agent-1", ServerURL: ts.URL, AuthToken: "token"})
 			h.retryCfg = httputil.RetryConfig{MaxRetries: 0}
 			if tt.name != "no winget provider at all" {
 				p := patching.NewSystemWingetProviderWithUserScan(`C:\wg\winget.exe`,
@@ -426,7 +426,7 @@ func TestPatchScanCommandResultCarriesUserScopeCoverage(t *testing.T) {
 			}))
 			defer ts.Close()
 
-			h := New(&config.Config{AgentID: "agent-1", ServerURL: ts.URL, AuthToken: "token"})
+			h := newTestHeartbeatWithoutCodec(&config.Config{AgentID: "agent-1", ServerURL: ts.URL, AuthToken: "token"})
 			h.retryCfg = httputil.RetryConfig{MaxRetries: 0}
 			h.patchMgr = patching.NewPatchManager(patching.NewSystemWingetProviderWithUserScan(
 				`C:\wg\winget.exe`,

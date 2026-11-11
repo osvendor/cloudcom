@@ -21,6 +21,14 @@ const dbSelectMock = vi.fn(() => ({
   })),
 }));
 
+// Wisp W04 Task 4: getOrCreate resolves the session's delegation grant itself
+// (lookupWispGrant); every session in this suite is an ordinary one.
+vi.mock('./wisp/chatCeiling', () => ({
+  lookupWispGrant: vi.fn(async () => null),
+  unreachableWispAuth: (auth: unknown) => auth,
+  WispSessionUnavailableError: class WispSessionUnavailableError extends Error {},
+}));
+
 vi.mock('../db', () => ({
   db: {
     select: (...args: unknown[]) => dbSelectMock(...(args as [])),
@@ -35,10 +43,6 @@ vi.mock('./effectiveSettings', () => ({
   getEffectiveAiBudget: (...args: unknown[]) => getEffectiveAiBudgetMock(...args),
 }));
 
-vi.mock('./aiCostTracker', () => ({
-  recordUsageFromSdkResult: vi.fn(() => Promise.resolve()),
-  sumInputTokens: () => 0,
-}));
 vi.mock('./aiAgent', () => ({ sanitizeErrorForClient: (e: unknown) => String(e) }));
 vi.mock('./sentry', () => ({ captureException: vi.fn(), captureMessage: vi.fn() }));
 vi.mock('./aiAgentSdkTools', () => ({
@@ -56,9 +60,13 @@ vi.mock('./aiToolOutput', () => ({
 }));
 vi.mock('./clientIp', () => ({ getTrustedClientIpOrUndefined: () => undefined }));
 
+// Keeps the lazy real ./flows/flowTools graph (~5 s cold) out of whichever test reaches it first (#11011).
+vi.mock('./flows/flowTools', () => ({ resolveFlowTools: async () => [] }));
+
 import { StreamingSessionManager } from './streamingSessionManager';
 import { buildOrgAccessClosures } from '../middleware/auth';
 import type { AuthContext } from '../middleware/auth';
+import { makeResolvedModel } from './aiModels/__fixtures__/resolvedModel';
 
 const ORG_ID = 'aaaaaaaa-1111-4222-8333-444455556666';
 const USER_ID = 'eeeeeeee-1111-4222-8333-444455556666';
@@ -66,18 +74,13 @@ const USER_ID = 'eeeeeeee-1111-4222-8333-444455556666';
 const DB_SESSION = {
   orgId: ORG_ID,
   sdkSessionId: null,
-  model: 'claude-sonnet-4-5-20250929',
   maxTurns: 50,
   turnCount: 0,
   systemPrompt: null,
   deviceId: null,
 };
 
-const PLATFORM_CONFIG = {
-  source: 'platform' as const,
-  apiKey: 'platform-key',
-  model: 'claude-sonnet-4-6',
-};
+const PLATFORM_MODEL = makeResolvedModel('platform');
 
 function makeAuth(): AuthContext {
   return {
@@ -115,7 +118,7 @@ function create(
     undefined,
     'PROMPT',
     undefined,
-    PLATFORM_CONFIG,
+    PLATFORM_MODEL,
     undefined,
     undefined,
     budgetReservationId ? { budgetReservationId } : undefined,

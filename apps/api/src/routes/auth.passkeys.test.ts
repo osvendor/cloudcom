@@ -89,7 +89,11 @@ vi.mock('../services', () => {
         set: vi.fn((values: Record<string, unknown>) => {
           dbState.updateSets.push(values);
           const whereResult: any = Promise.resolve(undefined);
-          whereResult.returning = vi.fn(() => Promise.resolve([{ id: 'user-123' }]));
+          whereResult.returning = vi.fn(() => Promise.resolve([{
+            id: 'user-123',
+            mfaEnabled: values.mfaEnabled ?? true,
+            mfaMethod: 'mfaMethod' in values ? values.mfaMethod : 'totp',
+          }]));
           return { where: vi.fn(() => whereResult) };
         }),
       })),
@@ -831,6 +835,11 @@ describe('passkey MFA auth routes', () => {
       });
 
       expect(res.status).toBe(200);
+      expect(await res.clone().json()).toMatchObject({
+        success: true,
+        mfaEnabled: true,
+        mfaMethod: 'passkey',
+      });
       expect(consumeStepUpGrant).toHaveBeenCalledWith(
         '11111111-1111-4111-8111-111111111111',
         expect.objectContaining({ userId: 'user-123', operation: 'enroll_first_factor' }),
@@ -1538,20 +1547,37 @@ describe('passkey MFA auth routes', () => {
     });
     dbState.selectQueue.push(
       [{ passwordHash: '$argon2id$hash' }],
-      [{ mfaEnabled: true, passkeyCount: 1 }],
       [{ id: 'credential-1', userId: 'user-123' }],
       [{ passkeyCount: 1, hasTotp: false, hasSms: false }],
+      [{ mfaEnabled: true, passkeyCount: 1 }],
     );
 
     const res = await app.request('/auth/passkeys/credential-1', {
       method: 'DELETE',
       headers: { 'Content-Type': 'application/json', Authorization: 'Bearer access-token' },
-      body: JSON.stringify({ currentPassword: 'correct-password', stepUpGrantId: '10000000-0000-4000-8000-000000000009' }),
+      body: JSON.stringify({ currentPassword: 'correct-password' }),
     });
 
     expect(res.status).toBe(403);
     expect(await res.json()).toMatchObject({ error: expect.stringMatching(/last.*factor|requires mfa/i) });
+    expect(validateStepUpGrant).not.toHaveBeenCalled();
     expect(consumeStepUpGrant).not.toHaveBeenCalled();
+  });
+
+  it('rejects an unowned passkey before requesting a current-factor grant', async () => {
+    dbState.selectQueue.push([{ passwordHash: '$argon2id$hash' }], []);
+
+    const res = await app.request('/auth/passkeys/credential-1', {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer access-token' },
+      body: JSON.stringify({ currentPassword: 'correct-password' }),
+    });
+
+    expect(res.status).toBe(404);
+    expect(await res.json()).toMatchObject({ error: 'Passkey not found' });
+    expect(validateStepUpGrant).not.toHaveBeenCalled();
+    expect(consumeStepUpGrant).not.toHaveBeenCalled();
+    expect(beginAuthIssuance).not.toHaveBeenCalled();
   });
 
   it('requires an MFA-satisfied session before deleting a passkey', async () => {
@@ -1571,6 +1597,8 @@ describe('passkey MFA auth routes', () => {
   it('rejects password plus a historical MFA claim without a fresh current-factor grant', async () => {
     dbState.selectQueue.push(
       [{ passwordHash: '$argon2id$hash' }],
+      [{ id: 'credential-1', userId: 'user-123' }],
+      [{ passkeyCount: 1, hasTotp: true, hasSms: false }],
       [{ mfaEnabled: true, passkeyCount: 1 }],
     );
 
@@ -1590,9 +1618,9 @@ describe('passkey MFA auth routes', () => {
     vi.mocked(verifyPassword).mockResolvedValueOnce(true);
     dbState.selectQueue.push(
       [{ passwordHash: '$argon2id$hash' }],
-      [{ mfaEnabled: true, passkeyCount: 1 }],
       [{ id: 'credential-1', userId: 'user-123' }],
       [{ passkeyCount: 1, hasTotp: true, hasSms: false, currentMfaMethod: 'passkey', forceMfa: false }],
+      [{ mfaEnabled: true, passkeyCount: 1 }],
       [{ mfaEnabled: true, passkeyCount: 1 }],
       [{ passkeyCount: 1, hasTotp: true, hasSms: false, currentMfaMethod: 'passkey' }],
     );
@@ -1932,6 +1960,25 @@ describe('passkey MFA auth routes', () => {
     expect(userUpdate).not.toHaveProperty('mfaMethod');
   });
 
+  // #10650 invariant: the first-passkey branch turns MFA ON with passkey as the
+  // primary. A dormant secret left from an earlier MFA-off transition must not
+  // come back as a "backup" authenticator the user never chose.
+  it('clears any dormant TOTP secret when the first passkey turns MFA on', async () => {
+    dbState.selectQueue.push([{ mfaEnabled: false, passkeyCount: 0 }]);
+    dbState.selectQueue.push([{ passwordHash: '$argon2id$hash' }]);
+    dbState.selectQueue.push([{ mfaEnabled: false, mfaSecret: 'enc-dormant-secret', mfaMethod: null }]);
+
+    const res = await app.request('/auth/passkeys/register/verify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer access-token' },
+      body: JSON.stringify({ credential: { id: 'credential-1', response: {} } }),
+    });
+
+    expect(res.status).toBe(200);
+    const userUpdate = dbState.updateSets.find((set) => 'mfaEnabled' in set);
+    expect(userUpdate).toMatchObject({ mfaEnabled: true, mfaMethod: 'passkey', mfaSecret: null });
+  });
+
   it('rejects registering a passkey on an already-protected account without a step-up grant', async () => {
     dbState.selectQueue.push([{ mfaEnabled: true, passkeyCount: 0 }]);
 
@@ -1986,9 +2033,9 @@ describe('passkey MFA auth routes', () => {
     vi.mocked(verifyPassword).mockResolvedValueOnce(true);
     dbState.selectQueue.push(
       [{ passwordHash: '$argon2id$hash' }],
-      [{ mfaEnabled: true, passkeyCount: 1 }],
       [{ id: 'credential-1', userId: 'user-123' }],
       [{ passkeyCount: 1, hasTotp: false, hasSms: true, currentMfaMethod: 'passkey', forceMfa: false, orgRequiresMfa: false }],
+      [{ mfaEnabled: true, passkeyCount: 1 }],
       [{ mfaEnabled: true, passkeyCount: 1 }],
       [{ passkeyCount: 1, hasTotp: false, hasSms: true, currentMfaMethod: 'passkey' }],
     );
@@ -2010,9 +2057,9 @@ describe('passkey MFA auth routes', () => {
     vi.mocked(verifyPassword).mockResolvedValueOnce(true);
     dbState.selectQueue.push(
       [{ passwordHash: '$argon2id$hash' }],
-      [{ mfaEnabled: true, passkeyCount: 1 }],
       [{ id: 'credential-1', userId: 'user-123' }],
       [{ passkeyCount: 1, hasTotp: false, hasSms: false, currentMfaMethod: 'passkey', forceMfa: false, orgRequiresMfa: false }],
+      [{ mfaEnabled: true, passkeyCount: 1 }],
       [{ mfaEnabled: true, passkeyCount: 1 }],
       [{ passkeyCount: 1, hasTotp: false, hasSms: false, currentMfaMethod: 'passkey' }],
     );
@@ -2029,6 +2076,322 @@ describe('passkey MFA auth routes', () => {
       mfaMethod: null,
       mfaRecoveryCodes: null,
     }));
+  });
+
+  // #10650 invariant: a TOTP secret survives only while MFA is on with a
+  // TOTP/passkey primary. Switching MFA off here must not leave a dormant
+  // secret that a later first-passkey enrollment would resurrect as a backup.
+  it('clears a policy-disallowed TOTP secret in the same UPDATE when deleting the last passkey switches MFA off', async () => {
+    vi.mocked(verifyPassword).mockResolvedValueOnce(true);
+    const totpDisallowed = {
+      required: false,
+      allowedMethods: { totp: false, sms: true, passkey: true },
+      pendingEnrollment: null,
+      source: { roleForceMfa: false, settingsRequireMfa: false, killSwitchOff: false, graceWindow: 'none' as const },
+    };
+    vi.mocked(getEffectiveMfaPolicy).mockResolvedValue(totpDisallowed);
+    dbState.selectQueue.push(
+      [{ passwordHash: '$argon2id$hash' }],
+      [{ id: 'credential-1', userId: 'user-123' }],
+      [{ passkeyCount: 1, hasTotp: true, hasSms: false, currentMfaMethod: 'passkey' }],
+      [{ mfaEnabled: true, passkeyCount: 1 }],
+      [{ mfaEnabled: true, passkeyCount: 1 }],
+      [{ passkeyCount: 1, hasTotp: true, hasSms: false, currentMfaMethod: 'passkey' }],
+    );
+
+    const res = await app.request('/auth/passkeys/credential-1', {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer access-token' },
+      body: JSON.stringify({ currentPassword: 'correct-password', stepUpGrantId: '10000000-0000-4000-8000-000000000009' }),
+    });
+
+    expect(res.status).toBe(200);
+    const userUpdate = dbState.updateSets.find((set) => 'mfaEnabled' in set);
+    expect(userUpdate).toMatchObject({
+      mfaEnabled: false,
+      mfaMethod: null,
+      mfaRecoveryCodes: null,
+      mfaSecret: null,
+    });
+  });
+
+  it('keeps an allowed backup TOTP secret and promotes it when the last passkey is deleted', async () => {
+    vi.mocked(verifyPassword).mockResolvedValueOnce(true);
+    dbState.selectQueue.push(
+      [{ passwordHash: '$argon2id$hash' }],
+      [{ id: 'credential-1', userId: 'user-123' }],
+      [{ passkeyCount: 1, hasTotp: true, hasSms: false, currentMfaMethod: 'passkey' }],
+      [{ mfaEnabled: true, passkeyCount: 1 }],
+      [{ mfaEnabled: true, passkeyCount: 1 }],
+      [{ passkeyCount: 1, hasTotp: true, hasSms: false, currentMfaMethod: 'passkey' }],
+    );
+
+    const res = await app.request('/auth/passkeys/credential-1', {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer access-token' },
+      body: JSON.stringify({ currentPassword: 'correct-password', stepUpGrantId: '10000000-0000-4000-8000-000000000009' }),
+    });
+
+    expect(res.status).toBe(200);
+    const userUpdate = dbState.updateSets.find((set) => 'mfaEnabled' in set);
+    expect(userUpdate).toMatchObject({ mfaEnabled: true, mfaMethod: 'totp' });
+    expect(userUpdate).not.toHaveProperty('mfaSecret');
+    expect(userUpdate).not.toHaveProperty('mfaRecoveryCodes');
+  });
+
+  // #4045: DELETE /passkeys/:id was password-only on its "user at the
+  // keyboard" leg, so a passwordless SSO account could register a passkey
+  // (#4041) but never remove one. It now also takes a fresh IdP re-auth grant
+  // minted for `sso_reauth_manage_factor` — NEVER the `enroll_first_factor`
+  // grant — and the existing-factor `delete_passkey` grant stays mandatory.
+  describe('#4045 SSO re-auth road on passkey deletion', () => {
+    const SSO_GRANT = '11111111-1111-4111-8111-111111111111';
+    const FACTOR_GRANT = '10000000-0000-4000-8000-000000000009';
+    const opOf = (call: unknown[]) => (call[1] as { operation: string }).operation;
+    const callsFor = (fn: typeof validateStepUpGrant, op: string) =>
+      vi.mocked(fn).mock.calls.filter((call) => opOf(call) === op);
+    const del = (body: Record<string, unknown>) => app.request('/auth/passkeys/credential-1', {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer access-token' },
+      body: JSON.stringify(body),
+    });
+
+    it('deletes with an SSO re-auth grant PLUS the delete_passkey factor grant, spending each once', async () => {
+      dbState.selectQueue.push(
+        [{ passwordHash: null }], // resolveFactorManagementStepUp road probe
+        [{ mfaEnabled: true, passkeyCount: 2 }], // its userIsMfaProtected
+        [{ mfaEnabled: true, passkeyCount: 2 }], // enforceExistingFactorStepUp (validate)
+        [{ id: 'credential-1', userId: 'user-123' }],
+        [{ passkeyCount: 2, hasTotp: true, hasSms: false, currentMfaMethod: 'totp' }],
+        [{ mfaEnabled: true, passkeyCount: 2 }], // enforceExistingFactorStepUp (consume)
+        [{ mfaEnabled: true, passkeyCount: 2 }], // consumeFactorManagementReauthGrant
+        [{ passkeyCount: 2, hasTotp: true, hasSms: false, currentMfaMethod: 'totp' }],
+      );
+
+      const res = await del({ ssoReauthGrantId: SSO_GRANT, stepUpGrantId: FACTOR_GRANT });
+
+      expect(res.status).toBe(200);
+      expect(verifyPassword).not.toHaveBeenCalled();
+      expect(callsFor(validateStepUpGrant, 'sso_reauth_manage_factor')).toEqual([
+        [SSO_GRANT, expect.objectContaining({ userId: 'user-123', sid: 'session-123' })],
+      ]);
+      expect(callsFor(consumeStepUpGrant, 'sso_reauth_manage_factor')).toHaveLength(1);
+      expect(callsFor(consumeStepUpGrant, 'delete_passkey')).toHaveLength(1);
+      expect(callsFor(validateStepUpGrant, 'enroll_first_factor')).toHaveLength(0);
+    });
+
+    it('answers a passwordless caller with no proof with an actionable sso_reauth_required', async () => {
+      dbState.selectQueue.push([{ passwordHash: null }]);
+
+      const res = await del({ stepUpGrantId: FACTOR_GRANT });
+
+      expect(res.status).toBe(400);
+      expect(await res.json()).toMatchObject({ code: 'sso_reauth_required', reauthUrl: '/sso/reauth/start' });
+      expect(beginAuthIssuance).not.toHaveBeenCalled();
+    });
+
+    it('still demands the delete_passkey factor grant — the SSO grant never stands in for it', async () => {
+      dbState.selectQueue.push(
+        [{ passwordHash: null }],
+        [{ mfaEnabled: true, passkeyCount: 2 }],
+        [{ id: 'credential-1', userId: 'user-123' }],
+        [{ passkeyCount: 2, hasTotp: true, hasSms: false }],
+        [{ mfaEnabled: true, passkeyCount: 2 }],
+      );
+
+      const res = await del({ ssoReauthGrantId: SSO_GRANT });
+
+      expect(res.status).toBe(403);
+      expect(await res.json()).toMatchObject({ error: 'existing_factor_step_up_required' });
+      expect(consumeStepUpGrant).not.toHaveBeenCalled();
+      expect(beginAuthIssuance).not.toHaveBeenCalled();
+    });
+
+    it('rejects a stale/reused/foreign SSO grant with sso_reauth_grant_expired', async () => {
+      dbState.selectQueue.push(
+        [{ passwordHash: null }],
+        [{ mfaEnabled: true, passkeyCount: 2 }],
+      );
+      vi.mocked(validateStepUpGrant).mockResolvedValue(false);
+
+      const res = await del({ ssoReauthGrantId: SSO_GRANT, stepUpGrantId: FACTOR_GRANT });
+
+      expect(res.status).toBe(400);
+      expect(await res.json()).toMatchObject({ code: 'sso_reauth_grant_expired', reauthUrl: '/sso/reauth/start' });
+      expect(consumeStepUpGrant).not.toHaveBeenCalled();
+      expect(dbState.updateSets).toHaveLength(0);
+    });
+
+    it('refuses an SSO grant from an account that HAS a password (opaque, grant untouched)', async () => {
+      dbState.selectQueue.push([{ passwordHash: '$argon2id$hash' }]);
+
+      const res = await del({ ssoReauthGrantId: SSO_GRANT, stepUpGrantId: FACTOR_GRANT });
+
+      expect(res.status).toBe(400);
+      expect(await res.json()).toMatchObject({ code: 'invalid_credentials' });
+      expect(validateStepUpGrant).not.toHaveBeenCalled();
+    });
+
+    it('writes nothing when the SSO grant was spent between gate and write (reuse race)', async () => {
+      dbState.selectQueue.push(
+        [{ passwordHash: null }],
+        [{ mfaEnabled: true, passkeyCount: 2 }],
+        [{ mfaEnabled: true, passkeyCount: 2 }],
+        [{ id: 'credential-1', userId: 'user-123' }],
+        [{ passkeyCount: 2, hasTotp: true, hasSms: false, currentMfaMethod: 'totp' }],
+        [{ mfaEnabled: true, passkeyCount: 2 }],
+        [{ mfaEnabled: true, passkeyCount: 2 }],
+      );
+      vi.mocked(consumeStepUpGrant).mockImplementation(async (_id, bind) => bind.operation !== 'sso_reauth_manage_factor');
+
+      const res = await del({ ssoReauthGrantId: SSO_GRANT, stepUpGrantId: FACTOR_GRANT });
+
+      expect(res.status).toBe(400);
+      expect(await res.json()).toMatchObject({ code: 'sso_reauth_grant_expired' });
+      expect(dbState.updateSets).toHaveLength(0);
+      expect(cancelAuthIssuance).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  // #7369: a passwordless SSO account that already holds a passkey could not
+  // add a second one. resolveEnrollmentStepUp refused its SSO grant outright
+  // once the account was protected, and it has no password for the other road,
+  // so the SR2-20 existing-factor proof was never even reached. The grant the
+  // callback mints for a protected account (`sso_reauth_manage_factor`) now
+  // stands in for the password leg; the `add_factor` existing-factor grant
+  // stays mandatory and must be fresh.
+  describe('#7369 passwordless account holding a passkey adds a second one', () => {
+    const SSO_GRANT = '11111111-1111-4111-8111-111111111111';
+    const FACTOR_GRANT = '10000000-0000-4000-8000-000000000009';
+    const opOf = (call: unknown[]) => (call[1] as { operation: string }).operation;
+    const callsFor = (fn: typeof validateStepUpGrant, op: string) =>
+      vi.mocked(fn).mock.calls.filter((call) => opOf(call) === op);
+
+    // Grant store keyed by id -> minted operation; mirrors bindsMatch, which
+    // fails closed on any operation mismatch.
+    function useGrants(grants: Record<string, string>) {
+      const store = new Map(Object.entries(grants));
+      vi.mocked(validateStepUpGrant).mockImplementation(async (id, bind) => store.get(id) === bind.operation);
+      vi.mocked(consumeStepUpGrant).mockImplementation(async (id, bind) => {
+        const op = store.get(id);
+        store.delete(id);
+        return op === bind.operation;
+      });
+      return store;
+    }
+
+    const PROTECTED = { mfaEnabled: true, passkeyCount: 1 };
+    const post = (path: string, body: Record<string, unknown>) => app.request(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer access-token' },
+      body: JSON.stringify(body),
+    });
+
+    function queueOptionsReads(factorState: Record<string, unknown> = PROTECTED) {
+      dbState.selectQueue.push(
+        [{ passwordHash: null }], // resolveEnrollmentStepUp road probe
+        [factorState], // its userIsMfaProtected
+        [factorState], // enforceExistingFactorStepUp's userIsMfaProtected
+        [], // listActivePasskeys
+      );
+    }
+
+    function queueVerifyReads() {
+      dbState.selectQueue.push(
+        [PROTECTED], // enforceExistingFactorStepUp's userIsMfaProtected (consume)
+        [{ passwordHash: null }], // resolveEnrollmentStepUp road probe
+        [PROTECTED], // its userIsMfaProtected
+        [{ mfaEnabled: true, mfaSecret: null, mfaMethod: 'passkey' }], // live enrollment state
+      );
+    }
+
+    it('register/options SUCCEEDS with the SSO manage grant PLUS a fresh add_factor grant (validates both, spends neither)', async () => {
+      queueOptionsReads();
+      useGrants({ [SSO_GRANT]: 'sso_reauth_manage_factor', [FACTOR_GRANT]: 'add_factor' });
+
+      const res = await post('/auth/passkeys/register/options', { ssoReauthGrantId: SSO_GRANT, stepUpGrantId: FACTOR_GRANT });
+
+      expect(res.status).toBe(200);
+      expect(verifyPassword).not.toHaveBeenCalled();
+      expect(callsFor(validateStepUpGrant, 'sso_reauth_manage_factor')).toEqual([
+        [SSO_GRANT, expect.objectContaining({ userId: 'user-123', sid: 'session-123' })],
+      ]);
+      expect(callsFor(validateStepUpGrant, 'add_factor')).toEqual([
+        [FACTOR_GRANT, expect.objectContaining({ userId: 'user-123', sid: 'session-123' })],
+      ]);
+      expect(callsFor(validateStepUpGrant, 'enroll_first_factor')).toHaveLength(0);
+      expect(consumeStepUpGrant).not.toHaveBeenCalled();
+      expect(passkeyMocks.generatePasskeyRegistrationOptions).toHaveBeenCalled();
+    });
+
+    it('register/options still demands the existing-factor proof — the SSO grant alone gets the SR2-20 step-up 403', async () => {
+      queueOptionsReads();
+      useGrants({ [SSO_GRANT]: 'sso_reauth_manage_factor' });
+
+      const res = await post('/auth/passkeys/register/options', { ssoReauthGrantId: SSO_GRANT });
+
+      expect(res.status).toBe(403);
+      expect(await res.json()).toMatchObject({ error: 'existing_factor_step_up_required' });
+      expect(passkeyMocks.generatePasskeyRegistrationOptions).not.toHaveBeenCalled();
+    });
+
+    it('register/options refuses a stale add_factor proof (expired, replayed, or minted before a factor change)', async () => {
+      queueOptionsReads();
+      useGrants({ [SSO_GRANT]: 'sso_reauth_manage_factor' }); // FACTOR_GRANT is no longer live
+
+      const res = await post('/auth/passkeys/register/options', { ssoReauthGrantId: SSO_GRANT, stepUpGrantId: FACTOR_GRANT });
+
+      expect(res.status).toBe(403);
+      expect(await res.json()).toMatchObject({ error: 'existing_factor_step_up_required' });
+      expect(passkeyMocks.generatePasskeyRegistrationOptions).not.toHaveBeenCalled();
+    });
+
+    it('register/verify writes the second passkey, spending each grant exactly once', async () => {
+      queueVerifyReads();
+      const grants = useGrants({ [SSO_GRANT]: 'sso_reauth_manage_factor', [FACTOR_GRANT]: 'add_factor' });
+
+      const res = await post('/auth/passkeys/register/verify', {
+        credential: { id: 'credential-1', response: {} },
+        ssoReauthGrantId: SSO_GRANT,
+        stepUpGrantId: FACTOR_GRANT,
+      });
+
+      expect(res.status).toBe(200);
+      expect(callsFor(consumeStepUpGrant, 'add_factor')).toHaveLength(1);
+      expect(callsFor(consumeStepUpGrant, 'sso_reauth_manage_factor')).toHaveLength(1);
+      expect(grants.size).toBe(0);
+      expect(completeAdditionalMfaFactorEnrollment).toHaveBeenCalledTimes(1);
+      expect(completeInitialMfaEnrollment).not.toHaveBeenCalled();
+    });
+
+    it('register/verify writes nothing when the add_factor proof went stale between options and verify', async () => {
+      dbState.selectQueue.push([PROTECTED]); // enforceExistingFactorStepUp's userIsMfaProtected (consume)
+      const grants = useGrants({ [SSO_GRANT]: 'sso_reauth_manage_factor' });
+
+      const res = await post('/auth/passkeys/register/verify', {
+        credential: { id: 'credential-1', response: {} },
+        ssoReauthGrantId: SSO_GRANT,
+        stepUpGrantId: FACTOR_GRANT,
+      });
+
+      expect(res.status).toBe(403);
+      expect(await res.json()).toMatchObject({ error: 'existing_factor_step_up_required' });
+      // The SSO grant is not burned by a request that never reached the write.
+      expect(grants.has(SSO_GRANT)).toBe(true);
+      expect(completeAdditionalMfaFactorEnrollment).not.toHaveBeenCalled();
+    });
+
+    it('a passwordless account with NO factor is unchanged: its manage grant is refused, only enroll_first_factor works', async () => {
+      queueOptionsReads({ mfaEnabled: false, passkeyCount: 0 });
+      useGrants({ [SSO_GRANT]: 'sso_reauth_manage_factor' });
+
+      const res = await post('/auth/passkeys/register/options', { ssoReauthGrantId: SSO_GRANT });
+
+      expect(res.status).toBe(400);
+      expect(await res.json()).toMatchObject({ code: 'enrollment_grant_expired' });
+      expect(callsFor(validateStepUpGrant, 'enroll_first_factor')).toHaveLength(1);
+      expect(passkeyMocks.generatePasskeyRegistrationOptions).not.toHaveBeenCalled();
+    });
   });
 
   // #5038: adding a passkey to an ALREADY-PROTECTED account and deleting a
@@ -2094,6 +2457,8 @@ describe('passkey MFA auth routes', () => {
       expect(body).toMatchObject({
         success: true,
         passkey: { id: 'passkey-credential-1' },
+        mfaEnabled: true,
+        mfaMethod: 'totp',
         // The replacement access token is what keeps the caller authenticated
         // past its own epoch bump.
         tokens: { accessToken: 'replacement-access-token', expiresInSeconds: 900 },
@@ -2186,6 +2551,7 @@ describe('passkey MFA auth routes', () => {
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.success).toBe(true);
+      expect(body).toMatchObject({ mfaEnabled: true, mfaMethod: 'totp' });
       // Discriminating even though a pre-fix route also answers 200 with no
       // tokens: the install has to have been ATTEMPTED for its failure to be
       // the reason they are missing.
@@ -2212,6 +2578,8 @@ describe('passkey MFA auth routes', () => {
 
       expect(res.status).toBe(200);
       expect(await res.json()).toMatchObject({
+        mfaEnabled: true,
+        mfaMethod: 'totp',
         success: true,
         tokens: { accessToken: 'replacement-access-token', expiresInSeconds: 900 },
       });
@@ -2254,6 +2622,8 @@ describe('passkey MFA auth routes', () => {
 
       expect(res.status).toBe(200);
       expect(await res.json()).toMatchObject({
+        mfaEnabled: false,
+        mfaMethod: null,
         success: true,
         tokens: { accessToken: 'replacement-access-token' },
       });
@@ -2272,6 +2642,7 @@ describe('passkey MFA auth routes', () => {
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.success).toBe(true);
+      expect(body).toMatchObject({ mfaEnabled: true, mfaMethod: 'totp' });
       expect(bindIssuedUserSession).toHaveBeenCalledTimes(1);
       expect(body.tokens).toBeUndefined();
     });

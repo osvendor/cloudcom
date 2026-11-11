@@ -303,6 +303,10 @@ func TestManagerFromBackupRunPayload(t *testing.T) {
 		wantExcludes    []string // expected manager excludes (nil unless set)
 		wantSystemImage bool     // expected SystemStateEnabled
 		wantVSS         bool     // expected VSSEnabled
+		// expected CaptureSecurityDescriptors: true ONLY for a wholeMachine
+		// system_image run (systemImage + paths) — never a plain file backup
+		// or a files-less system_image run.
+		wantCaptureSD bool
 
 		wantBaseSnapshotID        *string
 		wantPublishLeaseExpiresAt time.Time
@@ -386,6 +390,7 @@ func TestManagerFromBackupRunPayload(t *testing.T) {
 			wantExcludes:    []string{"/proc/**", "/sys/**"},
 			wantSystemImage: true,
 			wantVSS:         runtime.GOOS == "windows",
+			wantCaptureSD:   true,
 		},
 		{
 			// Without paths, system_image stays exactly as before: Paths nil,
@@ -510,6 +515,10 @@ func TestManagerFromBackupRunPayload(t *testing.T) {
 
 			if got := mgr.GetVSSEnabled(); got != tt.wantVSS {
 				t.Fatalf("VSSEnabled = %v, want %v", got, tt.wantVSS)
+			}
+
+			if got := mgr.GetCaptureSecurityDescriptors(); got != tt.wantCaptureSD {
+				t.Fatalf("CaptureSecurityDescriptors = %v, want %v", got, tt.wantCaptureSD)
 			}
 
 			gotBase := mgr.GetBaseSnapshotID()
@@ -913,5 +922,34 @@ func TestManagerFromBackupRunPayload_S3CredentialsAWSSpelling(t *testing.T) {
 	}
 	if s3p.Bucket != "my-bucket" {
 		t.Errorf("bucket = %q, want %q", s3p.Bucket, "my-bucket")
+	}
+}
+
+// The dispatched job id and the server's attestation of the base manifest
+// reach the manager for both run shapes; a run can only attest for the job it
+// was dispatched as, and only reuse a base it can match to the attestation.
+func TestManagerFromBackupRunPayload_CarriesJobIDAndBaseAttestation(t *testing.T) {
+	const lease = `"publishLeaseExpiresAt":"2099-01-01T00:00:00Z"`
+	const att = `"baseAttestation":{"manifestKey":"snapshots/snap-base/manifest.json","manifestSha256":"` +
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" + `","manifestSize":123}`
+	for name, payload := range map[string]string{
+		"file":         `{"jobId":"job-1","provider":"local","providerConfig":{"path":"/var/backups"},"paths":["/srv/data"],"baseSnapshotId":"snap-base",` + lease + `,` + att + `}`,
+		"system_image": `{"jobId":"job-1","provider":"local","providerConfig":{"path":"/var/backups"},"systemImage":true,"baseSnapshotId":"snap-base",` + lease + `,` + att + `}`,
+	} {
+		mgr, err := managerFromBackupRunPayload(json.RawMessage(payload))
+		if err != nil || mgr == nil {
+			t.Fatalf("%s: mgr=%v err=%v", name, mgr, err)
+		}
+		if got := mgr.GetJobID(); got != "job-1" {
+			t.Fatalf("%s: JobID = %q, want job-1", name, got)
+		}
+		got := mgr.GetBaseAttestation()
+		if got == nil || got.ManifestKey != "snapshots/snap-base/manifest.json" || got.ManifestSize != 123 || len(got.ManifestSHA256) != 64 {
+			t.Fatalf("%s: BaseAttestation = %+v", name, got)
+		}
+	}
+	mgr, err := managerFromBackupRunPayload(json.RawMessage(`{"provider":"local","providerConfig":{"path":"/var/backups"},"paths":["/srv/data"]}`))
+	if err != nil || mgr.GetJobID() != "" || mgr.GetBaseAttestation() != nil {
+		t.Fatalf("absent fields must stay empty: mgr=%v err=%v", mgr, err)
 	}
 }

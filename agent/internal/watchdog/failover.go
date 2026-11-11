@@ -4,14 +4,17 @@ import (
 	"bytes"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"sync"
 	"time"
 
+	"github.com/breeze-rmm/agent/internal/authstate"
+	"github.com/breeze-rmm/agent/internal/ech"
 	"github.com/breeze-rmm/agent/internal/hostpolicy"
-	"github.com/breeze-rmm/agent/internal/netcache"
 )
 
 // FailoverCommand is a command returned by the API during failover polling.
@@ -37,6 +40,59 @@ type RestartStats struct {
 	FlapDetected  bool
 }
 
+// Failover auth backoff (#2796). A watchdog in FAILOVER for a device whose
+// credentials the server rejects used to POST /heartbeat every
+// FailoverPollInterval (30s → 2880 requests/day) forever — ~50x the agent's
+// own auth-dead rate. Rejections now back the client off exponentially with
+// jitter: ~1m, 2m, 4m ... capped at 30m (the agent's own ceiling), i.e.
+// roughly 48 attempts/day at steady state. It keeps retrying rather than
+// giving up so a device that is re-approved or re-credentialed recovers on
+// its own within one ceiling.
+const (
+	// failoverAuthThreshold consecutive rejections arm the backoff, so a
+	// single transient 401 (deploy/restore blip) costs nothing extra.
+	failoverAuthThreshold      = 2
+	failoverAuthInitialBackoff = 1 * time.Minute
+	failoverAuthMaxBackoff     = 30 * time.Minute
+	failoverAuthJitter         = 0.2
+)
+
+// ErrAuthBackoff is returned WITHOUT sending a request while the server has
+// been rejecting the watchdog's credentials and the backoff window has not
+// elapsed. Callers treat it as a skipped tick, not a failure.
+var ErrAuthBackoff = errors.New("failover: skipped, server rejected watchdog credentials; backing off")
+
+// AuthRejectedError is a 401/403 response from the API.
+type AuthRejectedError struct {
+	Op         string
+	StatusCode int
+	Body       string
+}
+
+func (e *AuthRejectedError) Error() string {
+	return fmt.Sprintf("failover: %s returned %d: %s", e.Op, e.StatusCode, e.Body)
+}
+
+// IsAuthRejected reports whether err is (or wraps) an AuthRejectedError.
+func IsAuthRejected(err error) bool {
+	var ae *AuthRejectedError
+	return errors.As(err, &ae)
+}
+
+// NewFailoverAuthMonitor returns the auth monitor schedule the failover
+// client uses. Extra options (tests) are applied after the defaults.
+func NewFailoverAuthMonitor(opts ...authstate.Option) *authstate.Monitor {
+	base := []authstate.Option{
+		authstate.WithBackoff(failoverAuthInitialBackoff, failoverAuthMaxBackoff),
+		authstate.WithJitter(failoverAuthJitter),
+	}
+	return authstate.NewMonitor(failoverAuthThreshold, append(base, opts...)...)
+}
+
+func isAuthStatus(code int) bool {
+	return code == http.StatusUnauthorized || code == http.StatusForbidden
+}
+
 // FailoverClient is an HTTP client for API communication during failover mode.
 type FailoverClient struct {
 	mu      sync.RWMutex
@@ -56,6 +112,68 @@ type FailoverClient struct {
 	// IPC buffer absorbs the window), and a bounded stall beats a
 	// permanently dead revive channel.
 	pollClient *http.Client
+
+	// auth gates SendHeartbeat/PollCommands on repeated 401/403s — see
+	// ErrAuthBackoff. Replaceable via SetAuthMonitor so the backoff can
+	// outlive one failover window.
+	auth *authstate.Monitor
+
+	// resultResendDelay is the backoff before resubmission #attempt of a
+	// command result the server could not record (#7365). A test seam;
+	// defaults to failoverResultResendDelay.
+	resultResendDelay func(attempt int) time.Duration
+}
+
+// Command-result resubmission (#7365). Since #3530 the server answers a result
+// it received but could not record with HTTP 500
+// {"error":"result_processing_failed"} and parks the row as reopenable; a
+// resubmission is reprocessed, and one after a successful record is a 0-row
+// CAS no-op. Only that exact answer is resubmitted: any other 5xx in FAILOVER
+// means the server itself is unhealthy, and a 4xx will not change.
+//
+// Bounded tightly because the watchdog runs failover commands synchronously in
+// its main loop: worst case ~2+4+8s (±25%) of added stall on a path that only
+// fires when the server has already failed to persist a result.
+const (
+	failoverResultResendMaxAttempts = 3
+	failoverResultResendBaseDelay   = 2 * time.Second
+	failoverResultResendJitter      = 0.25
+	resultProcessingFailedError     = "result_processing_failed"
+)
+
+// failoverResultResendDelay is 2s, 4s, 8s … for attempt 1, 2, 3 …, ±25%.
+func failoverResultResendDelay(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	if attempt > 3 {
+		attempt = 3
+	}
+	nominal := failoverResultResendBaseDelay << (attempt - 1)
+	return time.Duration(float64(nominal) * (1 + failoverResultResendJitter*(rand.Float64()*2-1)))
+}
+
+// isResultProcessingFailed reports whether a result submission's response is
+// the server's reopenable "could not record" answer.
+func isResultProcessingFailed(code int, body []byte) bool {
+	if code != http.StatusInternalServerError {
+		return false
+	}
+	var parsed struct {
+		Error string `json:"error"`
+	}
+	return json.Unmarshal(body, &parsed) == nil && parsed.Error == resultProcessingFailedError
+}
+
+// newFailoverTransport is the ECH-capable control-plane transport (netcache
+// DNS fallback, #2288) pinned to HTTP/1.1 as the failover client always was,
+// and, via the DefaultTransport clone, it now honours HTTP(S)_PROXY like the
+// heartbeat (the old bare transport had no Proxy).
+func newFailoverTransport(tlsConfig *tls.Config) *http.Transport {
+	t := ech.NewTransport(tlsConfig)
+	t.ForceAttemptHTTP2 = false
+	t.DialTLSContext = ech.Shared().DialTLS(tlsConfig, []string{"http/1.1"})
+	return t
 }
 
 // NewFailoverClient creates a FailoverClient with a 30-second timeout. If
@@ -63,10 +181,7 @@ type FailoverClient struct {
 func NewFailoverClient(baseURL, agentID, token string, tlsConfig *tls.Config) *FailoverClient {
 	// Dials go through the last-known-good DNS cache (#2288) so a pure DNS
 	// outage doesn't blind the watchdog; TLS hostname verification unchanged.
-	transport := &http.Transport{DialContext: netcache.Shared().DialContext}
-	if tlsConfig != nil {
-		transport.TLSClientConfig = tlsConfig
-	}
+	transport := newFailoverTransport(tlsConfig)
 	return &FailoverClient{
 		baseURL: baseURL,
 		agentID: agentID,
@@ -79,14 +194,61 @@ func NewFailoverClient(baseURL, agentID, token string, tlsConfig *tls.Config) *F
 			Timeout:   90 * time.Second,
 			Transport: transport,
 		},
+		auth:              NewFailoverAuthMonitor(),
+		resultResendDelay: failoverResultResendDelay,
 	}
 }
 
-// UpdateToken replaces the auth token used for subsequent requests.
+// SetAuthMonitor replaces the auth backoff monitor. The watchdog run loop
+// passes one monitor for the life of the process: failoverClient is rebuilt
+// on every FAILOVER entry, and a per-client monitor would restart the
+// backoff from scratch each time.
+func (c *FailoverClient) SetAuthMonitor(m *authstate.Monitor) {
+	if m == nil {
+		return
+	}
+	c.mu.Lock()
+	c.auth = m
+	c.mu.Unlock()
+}
+
+func (c *FailoverClient) authMonitor() *authstate.Monitor {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.auth
+}
+
+// AuthRetryIn reports how long until the next request is allowed through
+// the auth backoff; zero when not backing off.
+func (c *FailoverClient) AuthRetryIn() time.Duration {
+	return c.authMonitor().RetryIn()
+}
+
+// noteAuthStatus feeds a response status into the auth monitor and returns
+// the error to surface for a non-200 (nil for 200).
+func (c *FailoverClient) noteAuthStatus(op string, code int, body []byte) error {
+	m := c.authMonitor()
+	switch {
+	case code == http.StatusOK:
+		m.RecordSuccess()
+		return nil
+	case isAuthStatus(code):
+		m.RecordAuthFailure()
+		return &AuthRejectedError{Op: op, StatusCode: code, Body: string(body)}
+	default:
+		return fmt.Errorf("failover: %s returned %d: %s", op, code, string(body))
+	}
+}
+
+// UpdateToken replaces the auth token used for subsequent requests and
+// clears the auth backoff: that backoff was earned by the old credential and
+// must not delay the first attempt with the new one (#2796).
 func (c *FailoverClient) UpdateToken(token string) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.token = token
+	auth := c.auth
+	c.mu.Unlock()
+	auth.Reset()
 }
 
 // BaseURL returns the base URL used for subsequent requests.
@@ -123,6 +285,9 @@ func (c *FailoverClient) setHeaders(req *http.Request) {
 // and silently strips it, so shipping it was dead wire data. Diagnostic
 // journal entries reach the server via ShipLogs / the /logs endpoint instead.
 func (c *FailoverClient) SendHeartbeat(watchdogVersion, currentState string, restartStats RestartStats) (*HeartbeatResponse, error) {
+	if c.authMonitor().ShouldSkip() {
+		return nil, ErrAuthBackoff
+	}
 	// Build-edition capability signal (#4072): a reported edition tells the
 	// server this binary carries the one-way self-host → hosted allowance in
 	// updater.editionAllowed (both ship in the same build), so it may be
@@ -165,8 +330,8 @@ func (c *FailoverClient) SendHeartbeat(watchdogVersion, currentState string, res
 	defer resp.Body.Close()
 
 	respBody, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("failover: heartbeat returned %d: %s", resp.StatusCode, string(respBody))
+	if err := c.noteAuthStatus("heartbeat", resp.StatusCode, respBody); err != nil {
+		return nil, err
 	}
 
 	var result HeartbeatResponse
@@ -178,6 +343,9 @@ func (c *FailoverClient) SendHeartbeat(watchdogVersion, currentState string, res
 
 // PollCommands GETs pending commands from the API with role=watchdog.
 func (c *FailoverClient) PollCommands() ([]FailoverCommand, error) {
+	if c.authMonitor().ShouldSkip() {
+		return nil, ErrAuthBackoff
+	}
 	url := fmt.Sprintf("%s/api/v1/agents/%s/commands?role=watchdog", c.BaseURL(), c.agentID)
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
@@ -192,8 +360,8 @@ func (c *FailoverClient) PollCommands() ([]FailoverCommand, error) {
 	defer resp.Body.Close()
 
 	respBody, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("failover: poll returned %d: %s", resp.StatusCode, string(respBody))
+	if err := c.noteAuthStatus("poll", resp.StatusCode, respBody); err != nil {
+		return nil, err
 	}
 
 	var result struct {
@@ -220,24 +388,47 @@ func (c *FailoverClient) SubmitCommandResult(commandID, status string, result an
 		return fmt.Errorf("failover: marshal command result: %w", err)
 	}
 
+	delay := c.resultResendDelay
+	if delay == nil {
+		delay = failoverResultResendDelay
+	}
+	for resends := 0; ; resends++ {
+		code, respBody, err := c.postCommandResult(commandID, data)
+		if err != nil {
+			return err
+		}
+		if code == http.StatusOK {
+			return nil
+		}
+		if !isResultProcessingFailed(code, respBody) {
+			return fmt.Errorf("failover: submit result returned %d: %s", code, string(respBody))
+		}
+		if resends >= failoverResultResendMaxAttempts {
+			return fmt.Errorf("failover: server could not record command result (%s) after %d resubmissions; giving up",
+				resultProcessingFailedError, resends)
+		}
+		time.Sleep(delay(resends + 1))
+	}
+}
+
+// postCommandResult sends one command-result POST and returns its status and
+// body. A transport error is returned as err.
+func (c *FailoverClient) postCommandResult(commandID string, data []byte) (int, []byte, error) {
 	url := fmt.Sprintf("%s/api/v1/agents/%s/commands/%s/result", c.BaseURL(), c.agentID, commandID)
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(data))
 	if err != nil {
-		return fmt.Errorf("failover: build result request: %w", err)
+		return 0, nil, fmt.Errorf("failover: build result request: %w", err)
 	}
 	c.setHeaders(req)
 
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("failover: result request: %w", err)
+		return 0, nil, fmt.Errorf("failover: result request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	respBody, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("failover: submit result returned %d: %s", resp.StatusCode, string(respBody))
-	}
-	return nil
+	return resp.StatusCode, respBody, nil
 }
 
 // apiLogEntry mirrors the API's agent diagnostic-log ingest contract

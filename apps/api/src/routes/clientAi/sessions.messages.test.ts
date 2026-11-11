@@ -1,5 +1,11 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Hono } from 'hono';
+import { settleBlockedTurnForNewMessage } from '../../services/aiAgentSdk';
+
+// #3127: depth of the (mocked) short per-phase DB contexts the message-send
+// handler opens now that clientAiAuth no longer wraps it in a request transaction.
+const dbCtx = vi.hoisted(() => ({ depth: 0, savepointDepth: 0 }));
+const captureExceptionMock = vi.hoisted(() => vi.fn());
 
 const {
   CLIENT_USER_ID, ORG_ID, SESSION_ID,
@@ -11,7 +17,6 @@ const {
   checkBillingCreditsMock, rateLimiterMock,
   resolveToolResultMock, failPendingMock,
   applyDlpMock,
-  resolveClientLlmConfigMock,
   reserveAiBudgetMock, releaseUnusedAiBudgetReservationMock, FakeAiBudgetLockTimeoutError,
 } = vi.hoisted(() => ({
   CLIENT_USER_ID: 'beefbeef-1111-4222-8333-444455556666',
@@ -37,7 +42,6 @@ const {
   resolveToolResultMock: vi.fn(() => true),
   failPendingMock: vi.fn(() => 0),
   applyDlpMock: vi.fn(),
-  resolveClientLlmConfigMock: vi.fn(),
   reserveAiBudgetMock: vi.fn(),
   releaseUnusedAiBudgetReservationMock: vi.fn(
     (_input: { orgId: string; reservationId: string }) => Promise.resolve({ kind: 'released' }),
@@ -58,6 +62,9 @@ vi.mock('../../services/aiAgentSdk', () => ({
 }));
 
 vi.mock('../../middleware/clientAiAuth', () => ({
+  clientAiDbAccessContext: (orgId: string) => ({
+    scope: 'organization', orgId, accessibleOrgIds: [orgId], accessiblePartnerIds: [], userId: null,
+  }),
   clientAiAuthMiddleware: (c: any, next: any) => {
     if (!c.req.header('authorization')) return c.json({ error: 'Unauthorized' }, 401);
     c.set('clientAiAuth', {
@@ -73,8 +80,30 @@ vi.mock('../../middleware/clientAiAuth', () => ({
 }));
 
 vi.mock('../../db', () => ({
+  runOutsideDbContext: vi.fn((fn: () => unknown) => fn()),
   db: { select: dbSelectMock, insert: dbInsertMock, update: dbUpdateMock },
-  withDbAccessContext: vi.fn((_ctx: unknown, fn: () => unknown) => fn()),
+  withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => unknown) => {
+    dbCtx.depth += 1;
+    try {
+      return await fn();
+    } finally {
+      dbCtx.depth -= 1;
+    }
+  }),
+  // #7074: the auto-title UPDATE runs in a savepoint so its failure cannot
+  // roll back the user-message insert in the same phase transaction.
+  withDbTransaction: vi.fn(async (fn: () => unknown) => {
+    dbCtx.savepointDepth += 1;
+    try {
+      return await fn();
+    } finally {
+      dbCtx.savepointDepth -= 1;
+    }
+  }),
+}));
+vi.mock('../../services/sentry', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../services/sentry')>()),
+  captureException: captureExceptionMock,
 }));
 vi.mock('../../services/streamingSessionManager', () => ({ streamingSessionManager: managerMock }));
 vi.mock('../../services/auditEvents', () => ({ writeAuditEvent: writeAuditEventMock }));
@@ -91,12 +120,14 @@ vi.mock('../../services/clientAiToolBridge', () => ({
   failPendingForSession: failPendingMock,
 }));
 vi.mock('../../services/clientAiDlp', () => ({ applyDlp: applyDlpMock }));
-vi.mock('../../services/clientAiSessions', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('../../services/clientAiSessions')>()),
-  resolveClientLlmConfig: (...args: unknown[]) => resolveClientLlmConfigMock(...args),
+const { resolveSessionTurnMock } = vi.hoisted(() => ({ resolveSessionTurnMock: vi.fn() }));
+// W03 Task 7: an office_chat turn resolves through the registry (session create stays legacy until Task 9).
+vi.mock('../../services/aiModels/sessionModel', () => ({
+  resolveSessionTurn: (...args: unknown[]) => resolveSessionTurnMock(...args),
 }));
-
 import { clientAiSessionRoutes } from './sessions';
+import { makeResolvedModel } from '../../services/aiModels/__fixtures__/resolvedModel';
+import { turnBindingFrom } from '../../services/aiModels/turnBinding';
 import { defaultClientAiPolicy } from '../../services/clientAiPolicy';
 
 const SESSION_ROW = {
@@ -128,14 +159,7 @@ beforeEach(() => {
   checkClientBudgetMock.mockResolvedValue(null);
   checkBillingCreditsMock.mockResolvedValue(null);
   rateLimiterMock.mockResolvedValue({ allowed: true, remaining: 9, resetAt: new Date() });
-  resolveClientLlmConfigMock.mockResolvedValue({
-    source: 'partner',
-    partnerId: 'partner-from-org',
-    apiKey: 'partner-key',
-    model: 'claude-opus-4-6',
-    configId: 'config-1',
-    configVersion: 2,
-  });
+  resolveSessionTurnMock.mockResolvedValue(makeResolvedModel('anthropic_byok', { surface: 'office_chat' }));
   policyState.policy = { ...defaultClientAiPolicy(ORG_ID), enabled: true };
   reserveAiBudgetMock.mockResolvedValue({
     kind: 'reserved',
@@ -199,18 +223,52 @@ describe('POST /client-ai/sessions/:id/messages', () => {
     expect((await postMessage({ content: 'hi' })).status).toBe(410);
   });
 
-  it('returns ai_unavailable as 503 before touching the SDK manager', async () => {
-    resolveClientLlmConfigMock.mockResolvedValue({
-      source: 'unavailable',
-      partnerId: 'partner-from-org',
-      reason: 'key_error',
+  it('an ineligible stored model is a recoverable 409 before touching the SDK manager, and takes no reservation', async () => {
+    resolveSessionTurnMock.mockResolvedValue({
+      ok: false, reason: 'model_unavailable', recoverable: true, offeringId: 'off-1',
+      message: 'Model Opus 5.5 is no longer available — choose another.',
     });
 
     const res = await postMessage({ content: 'hi' });
 
-    expect(res.status).toBe(503);
-    expect(await res.json()).toEqual({ error: 'ai_unavailable' });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({
+      error: 'Model Opus 5.5 is no longer available — choose another.', code: 'model_unavailable', recoverable: true,
+    });
     expect(managerMock.getOrCreate).not.toHaveBeenCalled();
+    expect(reserveAiBudgetMock).not.toHaveBeenCalled();
+    expect(checkBillingCreditsMock).not.toHaveBeenCalled();
+  });
+
+  it('a failed turn resolution is a generic retryable 503 (captured), never a 500', async () => {
+    resolveSessionTurnMock.mockRejectedValueOnce(new Error('loader failure'));
+    const res = await postMessage({ content: 'hi' });
+    expect(res.status).toBe(503);
+    expect(await res.json()).toEqual({ error: 'AI configuration could not be loaded. Try again.' });
+    expect(captureExceptionMock).toHaveBeenCalled();
+    expect(reserveAiBudgetMock).not.toHaveBeenCalled();
+  });
+
+  it('dispatches and reserves exactly the model resolved for the office_chat surface (finding 13)', async () => {
+    const model = makeResolvedModel('anthropic_byok', { surface: 'office_chat' });
+    resolveSessionTurnMock.mockResolvedValue(model);
+    dbInsertMock.mockImplementation(() => ({ values: vi.fn(() => Promise.resolve()) }));
+
+    const res = await postMessage({ content: 'hi' });
+    expect(res.status).toBe(202);
+
+    expect(resolveSessionTurnMock).toHaveBeenCalledWith({ sessionId: SESSION_ID, surface: 'office_chat', userId: null });
+    expect(checkBillingCreditsMock).toHaveBeenCalledWith(ORG_ID, 'partner_key');
+    const call = managerMock.getOrCreate.mock.calls[0]!;
+    expect(call[6]).toBe(model);
+    expect(call[1]).not.toHaveProperty('model');
+    expect(call[9]).toEqual(expect.objectContaining({ ledgerUserId: null }));
+    expect(reserveAiBudgetMock).toHaveBeenCalledWith(expect.objectContaining({
+      billingSource: 'partner_key', binding: turnBindingFrom(model),
+    }));
+    expect(managerMock.tryTransitionToProcessing).toHaveBeenCalledWith(
+      activeSession, 'res-default', expect.objectContaining({ turnBinding: turnBindingFrom(model) }),
+    );
   });
 
   it('402s on budget exhaustion, 429s on rate limit (preflight per message)', async () => {
@@ -236,7 +294,6 @@ describe('POST /client-ai/sessions/:id/messages', () => {
     expect((activeSession.inputController as { pushMessage: ReturnType<typeof vi.fn> }).pushMessage)
       .toHaveBeenCalledWith('sum column B please');
     expect(managerMock.startTurnTimeout).toHaveBeenCalledWith(activeSession);
-    expect(resolveClientLlmConfigMock).toHaveBeenCalledWith(ORG_ID);
     expect(managerMock.getOrCreate).toHaveBeenCalledWith(
       SESSION_ID,
       expect.anything(),
@@ -244,7 +301,7 @@ describe('POST /client-ai/sessions/:id/messages', () => {
       expect.anything(),
       expect.anything(),
       2.5, // #5557: derived from the reservation's reservedCostCents (250 / 100)
-      expect.objectContaining({ source: 'partner', configId: 'config-1', configVersion: 2 }),
+      expect.objectContaining({ funding: 'partner_key', configVersion: 2, connection: expect.objectContaining({ id: 'conn-1' }) }),
       expect.anything(),
       expect.anything(),
       expect.objectContaining({ injectApprovalModeInstructions: false }),
@@ -422,6 +479,35 @@ describe('POST /client-ai/sessions/:id/messages', () => {
     await postMessage({ content: 'sum column B please' });
     expect(setSpy).toHaveBeenCalledWith(expect.objectContaining({ title: 'sum column B please' }));
   });
+
+  it('#7074: runs the auto-title UPDATE inside a savepoint within the dispatch context', async () => {
+    dbSelectMock.mockImplementation(() => selectChain([{ ...SESSION_ROW, title: null }]));
+    const seen: Array<{ depth: number; savepointDepth: number }> = [];
+    dbUpdateMock.mockImplementation(() => ({
+      set: vi.fn(() => ({
+        where: vi.fn(() => {
+          seen.push({ depth: dbCtx.depth, savepointDepth: dbCtx.savepointDepth });
+          return Promise.resolve();
+        }),
+      })),
+    }));
+
+    await postMessage({ content: 'sum column B please' });
+    expect(seen).toEqual([{ depth: 1, savepointDepth: 1 }]);
+  });
+
+  it('#7074: a failed auto-title still dispatches the turn and reports the error', async () => {
+    dbSelectMock.mockImplementation(() => selectChain([{ ...SESSION_ROW, title: null }]));
+    const titleError = new Error('deadlock detected');
+    dbUpdateMock.mockImplementation(() => ({
+      set: vi.fn(() => ({ where: vi.fn(() => Promise.reject(titleError)) })),
+    }));
+    captureExceptionMock.mockClear();
+
+    const res = await postMessage({ content: 'sum column B please' });
+    expect(res.status).toBe(202);
+    expect(captureExceptionMock).toHaveBeenCalledWith(titleError, expect.anything());
+  });
 });
 
 describe('#5557 — atomic budget reservation on POST /client-ai/sessions/:id/messages', () => {
@@ -489,6 +575,7 @@ describe('#5557 — atomic budget reservation on POST /client-ai/sessions/:id/me
     expect(managerMock.tryTransitionToProcessing).toHaveBeenCalledWith(
       expect.anything(),
       'res-thread-1',
+      expect.objectContaining({ turnBinding: expect.any(Object) }),
     );
   });
 
@@ -514,6 +601,81 @@ describe('#5557 — atomic budget reservation on POST /client-ai/sessions/:id/me
     expect(res.status).toBe(503);
     expect(await res.json()).toEqual({ error: 'ai_budget_lock_timeout' });
     expect(managerMock.getOrCreate).not.toHaveBeenCalled();
+  });
+
+  it('#3127: settles an approval-blocked turn with no DB context held, between two short ones', async () => {
+    const depths: { select: number[]; reserve: number[]; getOrCreate: number[]; settle: number[]; insert: number[] } = {
+      select: [], reserve: [], getOrCreate: [], settle: [], insert: [],
+    };
+    dbSelectMock.mockImplementation(() => {
+      depths.select.push(dbCtx.depth);
+      return selectChain([SESSION_ROW]);
+    });
+    reserveAiBudgetMock.mockImplementationOnce(async () => {
+      depths.reserve.push(dbCtx.depth);
+      return { kind: 'reserved', reservationId: 'res-settled', reservedCostCents: 100 };
+    });
+    managerMock.getOrCreate.mockImplementation(async () => {
+      depths.getOrCreate.push(dbCtx.depth);
+      return activeSession;
+    });
+    // Busy on the first claim; free once the blocked turn has been settled.
+    managerMock.tryTransitionToProcessing.mockReturnValueOnce(false).mockReturnValueOnce(true);
+    vi.mocked(settleBlockedTurnForNewMessage).mockImplementationOnce(async () => {
+      depths.settle.push(dbCtx.depth);
+      return 'concluded';
+    });
+    dbInsertMock.mockImplementation(() => {
+      depths.insert.push(dbCtx.depth);
+      return { values: vi.fn(() => Promise.resolve()) };
+    });
+
+    const res = await postMessage({ content: 'hi' });
+
+    expect(res.status).toBe(202);
+    expect(settleBlockedTurnForNewMessage).toHaveBeenCalledWith(activeSession);
+    expect(depths.select.length).toBeGreaterThan(0);
+    expect(depths.select.every((d) => d === 1)).toBe(true);
+    expect(depths).toMatchObject({ reserve: [0], getOrCreate: [1], settle: [0], insert: [1] });
+    expect(releaseUnusedAiBudgetReservationMock).not.toHaveBeenCalled();
+    expect(dbCtx.depth).toBe(0);
+  });
+
+  it('#3127: a settle that does not conclude releases the reservation with no DB context held', async () => {
+    managerMock.tryTransitionToProcessing.mockReturnValue(false);
+    vi.mocked(settleBlockedTurnForNewMessage).mockResolvedValueOnce('still_processing');
+    let releaseDepth = -1;
+    releaseUnusedAiBudgetReservationMock.mockImplementationOnce(async () => {
+      releaseDepth = dbCtx.depth;
+      return { kind: 'released' };
+    });
+
+    const res = await postMessage({ content: 'hi' });
+
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toMatch(/wrapping up the previous turn/);
+    expect(releaseDepth).toBe(0);
+  });
+
+  it('#3127: a session that fails to materialise releases its reservation with no DB context held', async () => {
+    let getOrCreateDepth = -1;
+    managerMock.getOrCreate.mockImplementation(async () => {
+      getOrCreateDepth = dbCtx.depth;
+      throw new Error('sdk bootstrap failed');
+    });
+    let releaseDepth = -1;
+    releaseUnusedAiBudgetReservationMock.mockImplementationOnce(async () => {
+      releaseDepth = dbCtx.depth;
+      return { kind: 'released' };
+    });
+
+    const res = await postMessage({ content: 'hi' });
+
+    expect(res.status).toBe(500);
+    expect(getOrCreateDepth).toBe(1);
+    expect(releaseUnusedAiBudgetReservationMock).toHaveBeenCalledTimes(1);
+    expect(releaseDepth).toBe(0);
+    expect(dbInsertMock).not.toHaveBeenCalled();
   });
 
   it('409 concurrency path releases the reservation taken for the losing turn', async () => {

@@ -1,7 +1,8 @@
 /**
- * Execution-plane W01, spec §12 "artifactCapture.test.ts": raw bytes persisted,
- * previews raw, threshold boundary, opt-out honoured — plus §9's rule that a
- * blob failure NEVER returns the raw result inline.
+ * Execution-plane W01, spec §12 "artifactCapture.test.ts": REDACTED bytes
+ * persisted (A-W05 D13b/Q5 — redact-then-capture), threshold boundary
+ * measured on the raw string, opt-out honoured — plus §9's rule that a blob
+ * failure NEVER returns the raw result inline.
  *
  * The capture path has NO database access of its own: `captureContextFrom` is
  * pure and `captureLargeToolResult` only calls `createArtifact`. There is
@@ -12,7 +13,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
   createArtifact: vi.fn(),
-  aiWorkspaceEnabled: vi.fn(() => true),
+  aiArtifactCaptureEnabled: vi.fn(() => true),
   breezeRegion: vi.fn(() => 'us' as const),
 }));
 
@@ -21,11 +22,12 @@ vi.mock('./artifactService', async (orig) => ({
   createArtifact: mocks.createArtifact,
 }));
 vi.mock('../../config/env', () => ({
-  aiWorkspaceEnabled: mocks.aiWorkspaceEnabled,
+  aiArtifactCaptureEnabled: mocks.aiArtifactCaptureEnabled,
   breezeRegion: mocks.breezeRegion,
 }));
 
 import { MAX_TOOL_RESULT_CHARS } from '../aiToolOutput';
+import { PAGE_RESUME_KEY } from '../aiToolPageResume';
 import { BlobStorageUnavailableError } from './blobStorage';
 import {
   captureContextFrom,
@@ -57,7 +59,7 @@ beforeEach(() => {
   mocks.createArtifact.mockReset().mockResolvedValue({
     id: HANDLE, bytes: 30_000, contentType: 'application/json',
   });
-  mocks.aiWorkspaceEnabled.mockReturnValue(true);
+  mocks.aiArtifactCaptureEnabled.mockReturnValue(true);
   mocks.breezeRegion.mockReturnValue('us');
 });
 afterEach(() => vi.clearAllMocks());
@@ -73,6 +75,14 @@ describe('captureContextFrom — run path attributes from the principal (reconci
   it('keeps the RUN anchor and stores no session even when a chat scope is also supplied', () => {
     const resolved = captureContextFrom(runAuth, { capture: { orgId: OTHER_ORG, sessionId: SESSION } }, 't');
     expect(resolved).toMatchObject({ runId: RUN, sessionId: null });
+  });
+});
+
+describe('captureContextFrom — flow principal (W04 #5219)', () => {
+  it('captures nothing for a flow run, even with a chat scope supplied: its run id is not an agent run', () => {
+    const flowAuth = { principal: { kind: 'flow', flowId: 'flow-1', runId: RUN }, orgId: ORG } as never;
+    expect(captureContextFrom(flowAuth, undefined, 't')).toBeNull();
+    expect(captureContextFrom(flowAuth, { capture: { orgId: ORG, sessionId: SESSION } }, 't')).toBeNull();
   });
 });
 
@@ -123,6 +133,34 @@ describe('captureLargeToolResult — threshold boundary (spec §5.2)', () => {
   });
 });
 
+// #10385: the page-resume descriptor is compaction input the envelope helpers
+// attach to every non-empty page. It must not push a page over the capture
+// threshold, and it is not part of the stored result — but the compactor still
+// needs it on the `compacted` copy to re-issue nextCursor.
+describe('captureLargeToolResult — page-resume descriptor (#10385)', () => {
+  const descriptor = { v: 1, key: 'rows', f: '0123456789abcdef', mode: 'offset', offset: 0, rows: 1 };
+  const withDescriptor = (rowChars: number) => JSON.stringify({ rows: ['r'.repeat(rowChars)], [PAGE_RESUME_KEY]: descriptor });
+  const plainLength = (rowChars: number) => JSON.stringify({ rows: ['r'.repeat(rowChars)] }).length;
+
+  it('does not count the descriptor toward the threshold', async () => {
+    const rowChars = MAX_TOOL_RESULT_CHARS - plainLength(0);
+    expect(plainLength(rowChars)).toBe(MAX_TOOL_RESULT_CHARS);
+    const raw = withDescriptor(rowChars);
+    expect(raw.length).toBeGreaterThan(MAX_TOOL_RESULT_CHARS);
+    expect(await captureLargeToolResult(raw, ctx())).toBe(raw);
+    expect(mocks.createArtifact).not.toHaveBeenCalled();
+  });
+
+  it('stores the result without the descriptor, and hands it to the compactor on the compacted copy', async () => {
+    const raw = withDescriptor(30_000);
+    const out = JSON.parse(await captureLargeToolResult(raw, ctx())) as { compacted: string };
+    const storedText = (mocks.createArtifact.mock.calls[0]![0] as { body: Buffer }).body.toString('utf8');
+    expect(storedText).not.toContain(PAGE_RESUME_KEY);
+    expect(JSON.parse(storedText)).toEqual({ rows: ['r'.repeat(30_000)] });
+    expect(JSON.parse(out.compacted)).toEqual({ rows: ['r'.repeat(30_000)], [PAGE_RESUME_KEY]: descriptor });
+  });
+});
+
 describe('captureLargeToolResult — passthrough cases', () => {
   it('returns raw for a NULL context — the path both an unattributable call and a captureExempt tool take', async () => {
     // The hook in executeTool (Task 9) passes null for a captureExempt tool and
@@ -133,8 +171,8 @@ describe('captureLargeToolResult — passthrough cases', () => {
     expect(mocks.createArtifact).not.toHaveBeenCalled();
   });
 
-  it("returns raw when the workspace flag is off — self-hosters see today's bytes exactly", async () => {
-    mocks.aiWorkspaceEnabled.mockReturnValue(false);
+  it("returns raw when the capture flag is off — self-hosters see today's bytes exactly", async () => {
+    mocks.aiArtifactCaptureEnabled.mockReturnValue(false);
     const raw = big(30_000);
     expect(await captureLargeToolResult(raw, ctx())).toBe(raw);
     expect(mocks.createArtifact).not.toHaveBeenCalled();
@@ -147,8 +185,23 @@ describe('captureLargeToolResult — passthrough cases', () => {
   });
 });
 
-describe('captureLargeToolResult — what is persisted (spec §5.2)', () => {
-  it('persists the RAW bytes as kind input_capture with the calling tool recorded', async () => {
+describe('captureLargeToolResult — what is persisted (spec §5.2, A-W05 D13b/Q5)', () => {
+  it('persists the REDACTED full payload as kind input_capture (never credential material), and compacted mirrors it', async () => {
+    const raw = JSON.stringify({
+      password: 'hunter2',
+      rows: Array.from({ length: 400 }, (_, i) => ({ i, apiKey: 'sk-live-1', note: 'n'.repeat(20) })),
+    });
+    const out = JSON.parse(await captureLargeToolResult(raw, ctx())) as { artifact: { handle: string }; compacted: string };
+    const stored = mocks.createArtifact.mock.calls[0]![0] as { body: Buffer; kind: string; createdByTool: string };
+    const storedText = stored.body.toString('utf8');
+    expect(stored.kind).toBe('input_capture');
+    expect(storedText).not.toContain('hunter2');
+    expect(storedText).not.toContain('sk-live-1');
+    expect((JSON.parse(storedText) as { rows: unknown[] }).rows).toHaveLength(400);
+    expect(out.compacted).toBe(storedText);
+  });
+
+  it('persists the calling tool, org and run/session attribution unchanged by redaction', async () => {
     const raw = big(30_000);
     await captureLargeToolResult(raw, ctx({ toolName: 'get_event_logs' }));
     const arg = mocks.createArtifact.mock.calls[0]![0] as Record<string, unknown>;
@@ -158,7 +211,15 @@ describe('captureLargeToolResult — what is persisted (spec §5.2)', () => {
     expect(arg.runId).toBe(RUN);
     expect(arg.sessionId).toBeNull();
     expect(arg.region).toBe('us');
-    expect((arg.body as Buffer).toString('utf8')).toBe(raw);   // RAW, not compacted
+    // No secrets in this fixture, so redaction is a byte-identical no-op.
+    expect((arg.body as Buffer).toString('utf8')).toBe(raw);
+  });
+
+  it('measures the capture threshold on the RAW string, not the redacted one — a payload that shrinks under redaction still captures if raw exceeded the cap', async () => {
+    const raw = JSON.stringify({ password: 'x'.repeat(MAX_TOOL_RESULT_CHARS + 1) });
+    expect(raw.length).toBeGreaterThan(MAX_TOOL_RESULT_CHARS);
+    await captureLargeToolResult(raw, ctx());
+    expect(mocks.createArtifact).toHaveBeenCalledTimes(1);
   });
 
   it('labels JSON as application/json and non-JSON as text/plain', async () => {
@@ -169,10 +230,10 @@ describe('captureLargeToolResult — what is persisted (spec §5.2)', () => {
     expect((mocks.createArtifact.mock.calls[0]![0] as Record<string, unknown>).contentType).toBe('text/plain; charset=utf-8');
   });
 
-  it('names the artifact after the tool, and the envelope carries raw head/tail previews', async () => {
+  it('names the artifact after the tool, and the envelope carries head/tail previews built from the redacted body', async () => {
     const raw = `HEAD${'m'.repeat(30_000)}TAIL`;
     const out = await captureLargeToolResult(raw, ctx({ toolName: 'search_logs' }));
-    expect((mocks.createArtifact.mock.calls[0]![0] as Record<string, unknown>).name).toBe('search_logs.txt');
+    expect((mocks.createArtifact.mock.calls[0]![0] as Record<string, unknown>).name).toBe('search_logs.redacted.txt');
     const parsed = JSON.parse(out) as { artifact: { head: string; tail: string; bytes: number; contentType: string } };
     expect(parsed.artifact.head.startsWith('HEAD')).toBe(true);
     expect(parsed.artifact.tail.endsWith('TAIL')).toBe(true);

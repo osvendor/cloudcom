@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { CONFIG_FEATURE_TYPES } from '@breeze/shared';
+import { CONFIG_FEATURE_TYPES, RETIRED_CONFIG_FEATURE_TYPES } from '@breeze/shared';
 
 import { ALL_FEATURE_TYPES, EFFECTIVE_CONFIG_EXCLUDED_FEATURE_TYPES } from './DeviceEffectiveConfigTab';
 
@@ -9,6 +9,9 @@ import { ALL_FEATURE_TYPES, EFFECTIVE_CONFIG_EXCLUDED_FEATURE_TYPES } from './De
 // can't represent (they apply a value even when unassigned — see the FeatureType
 // comment in DeviceEffectiveConfigTab.tsx). Mirrors the api-side enum parity test.
 describe('device Effective Config tab feature-type parity (#2004)', () => {
+  it('excludes only the two baselines that apply a value when unassigned', () => {
+    expect([...EFFECTIVE_CONFIG_EXCLUDED_FEATURE_TYPES]).toEqual(['remote_access', 'pam']);
+  });
   it('renders exactly the canonical feature types minus the documented exclusions', () => {
     const expected = CONFIG_FEATURE_TYPES.filter(
       (t) => !(EFFECTIVE_CONFIG_EXCLUDED_FEATURE_TYPES as readonly string[]).includes(t),
@@ -24,4 +27,8 @@ describe('device Effective Config tab feature-type parity (#2004)', () => {
       expect(CONFIG_FEATURE_TYPES).toContain(excluded);
     }
   });
+});
+
+it('renders no retired feature types', () => {
+  for (const retired of RETIRED_CONFIG_FEATURE_TYPES) expect(ALL_FEATURE_TYPES as readonly string[]).not.toContain(retired);
 });

@@ -1,13 +1,14 @@
 import '@/lib/i18n';
 
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 import DeviceGroupsPage from './DeviceGroupsPage';
 import { fetchWithAuth } from '../../stores/auth';
 import { useOrgStore, type Organization } from '../../stores/orgStore';
 
-vi.mock('../../stores/auth', () => ({
+vi.mock('../../stores/auth', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../../stores/auth')>(),
   fetchWithAuth: vi.fn(),
   // orgStore registers an orgId provider at module load; the component now
   // pulls in orgStore via useFleetOrgOwner, so this export must exist.
@@ -111,6 +112,18 @@ describe('DeviceGroupsPage list unwrapping', () => {
     // also proves `/devices` was unwrapped rather than stored as the envelope.
     expect(screen.getByText('web-01')).toBeInTheDocument();
     expect(screen.queryByText(/is not a function/i)).not.toBeInTheDocument();
+  });
+
+  it('gives the "select all groups" checkbox an accessible name via its wrapping label (#7158 a11y)', async () => {
+    render(<DeviceGroupsPage />);
+
+    expect(await screen.findByRole('checkbox', { name: /select all groups/i })).toBeInTheDocument();
+  });
+
+  it('gives each per-group checkbox an accessible name', async () => {
+    render(<DeviceGroupsPage />);
+
+    expect(await screen.findByRole('checkbox', { name: 'Select group Servers' })).toBeInTheDocument();
   });
 
   it('fetches sites from /orgs/sites, not the non-existent /sites', async () => {
@@ -224,5 +237,59 @@ describe('DeviceGroupsPage create in All-organizations (fleet) scope', () => {
     )!;
     const body = JSON.parse(String((post[1] as RequestInit).body));
     expect(body.orgId).toBe('org-2');
+  });
+});
+
+// The Devices page "Add filter → New group…" shortcut links here instead of
+// running its own create modal (#9865), so the deep link must land on the same
+// create dialog the "Create Group" button opens — org picker, device chooser and
+// all.
+describe('DeviceGroupsPage #create deep link (#9865)', () => {
+  beforeEach(() => {
+    window.history.replaceState(null, '', '/devices/groups#create');
+  });
+
+  afterEach(() => {
+    window.history.replaceState(null, '', '/');
+  });
+
+  it('opens the create dialog when the page loads with #create', async () => {
+    render(<DeviceGroupsPage />);
+
+    expect(await screen.findByText('Create Device Group')).toBeInTheDocument();
+  });
+
+  it('opens the fleet-scope create dialog with the Organization picker', async () => {
+    useOrgStore.setState({
+      currentOrgId: null,
+      allOrgs: true,
+      organizations: [orgA, orgB],
+      organizationsLoaded: true,
+      error: null,
+    });
+    render(<DeviceGroupsPage />);
+
+    expect(await screen.findByText('Create Device Group')).toBeInTheDocument();
+    expect(await screen.findByRole('option', { name: 'Beta Inc' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Create group' })).toBeDisabled();
+  });
+
+  it('clears the #create hash when the dialog is closed, so a reload does not reopen it', async () => {
+    render(<DeviceGroupsPage />);
+    await screen.findByText('Create Device Group');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+
+    await waitFor(() => expect(screen.queryByText('Create Device Group')).not.toBeInTheDocument());
+    expect(window.location.hash).toBe('');
+    expect(window.location.pathname).toBe('/devices/groups');
+  });
+
+  it('does not open the dialog without the hash', async () => {
+    window.history.replaceState(null, '', '/devices/groups');
+    render(<DeviceGroupsPage />);
+    await screen.findByText('Servers');
+
+    expect(screen.queryByText('Create Device Group')).not.toBeInTheDocument();
   });
 });

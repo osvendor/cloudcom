@@ -17,6 +17,7 @@ import {
   resolveSensitiveDataAuthorityInCurrentSystemContext,
   type PersistedSensitiveDataAuthority,
 } from '../services/sensitiveDataPolicyAuthority';
+import { notHoldingOrgCondition, notParkedDeviceCondition } from '../services/unassignedPool/selectorPredicate';
 
 const { db } = dbModule;
 const runWithSystemDbAccess = async <T>(fn: () => Promise<T>): Promise<T> => {
@@ -44,7 +45,6 @@ const SENSITIVE_DATA_THROTTLE_REQUEUE_SECONDS = parsePositiveIntEnv('SENSITIVE_D
 // Per-variant types are derived from the Zod union validated at the dequeue
 // boundary so they can never drift from the schema (see queueSchemas.ts).
 type DispatchScanJobData = Extract<SensitiveDataQueueJobData, { type: 'dispatch-scan' }>;
-type SchedulePoliciesJobData = Extract<SensitiveDataQueueJobData, { type: 'schedule-policies' }>;
 
 type SensitiveDataJobData = SensitiveDataQueueJobData;
 
@@ -616,7 +616,8 @@ export async function schedulePolicyScans(policy: SchedulablePolicy, now: Date):
       .from(organizations)
       .where(and(
         eq(organizations.partnerId, policy.partnerId),
-        ne(organizations.type, 'quick_support')
+        ne(organizations.type, 'quick_support'),
+        notHoldingOrgCondition()
       ));
     ownerOrgIds = orgRows.map((row) => row.id);
   } else {
@@ -648,6 +649,7 @@ export async function schedulePolicyScans(policy: SchedulablePolicy, now: Date):
   const conditions: SQL[] = [
     inArray(devices.orgId, admittedOrgIds),
     eq(devices.isEphemeral, false),
+    notParkedDeviceCondition(),
     ne(devices.status, 'decommissioned')
   ];
   if (schedule.deviceIds.length > 0) {
@@ -718,13 +720,10 @@ export async function schedulePolicyScans(policy: SchedulablePolicy, now: Date):
   return created.length;
 }
 
-async function processSchedulePolicies(data: SchedulePoliciesJobData): Promise<{
+async function processSchedulePolicies(now: Date): Promise<{
   scheduledPolicies: number;
   scansQueued: number;
 }> {
-  const parsedScanAt = new Date(data.scanAt);
-  const now = Number.isFinite(parsedScanAt.getTime()) ? parsedScanAt : new Date();
-
   const policies = await db
     .select({
       id: sensitiveDataPolicies.id,
@@ -775,7 +774,11 @@ export function createSensitiveDataWorker(): Worker<SensitiveDataJobData> {
           return processDispatchScan(data);
         }
         assertQueueJobName(SENSITIVE_DATA_QUEUE, job, 'schedule-policies');
-        return processSchedulePolicies(data);
+        // The wall clock, never `data.scanAt`: a repeatable job reuses the
+        // data it was registered with, so `scanAt` is boot time on every tick.
+        // Evaluating against it froze cron due-ness and stamped that same
+        // time as `lastRunAt`, so a policy ran at most once per boot (#10031).
+        return processSchedulePolicies(new Date());
       });
     },
     {

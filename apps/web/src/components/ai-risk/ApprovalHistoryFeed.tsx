@@ -31,6 +31,14 @@ const TIER3_TOOLS = new Set([
   "create_automation",
   "network_discovery",
   "m365_reset_password",
+  "m365_revoke_sessions",
+  "m365_remove_license",
+  "m365_assign_license",
+  "m365_remove_from_group",
+  "m365_add_to_group",
+  "m365_retire_intune_device",
+  "m365_create_user",
+  "m365_set_auto_reply",
 ]);
 const STATUS_BADGE: Record<
   string,
@@ -50,6 +58,11 @@ const STATUS_BADGE: Record<
   rejected: {
     icon: XCircle,
     className: "bg-red-500/15 text-red-700 border-red-500/30",
+  },
+  // #10411: the platform refused the call before it ran — never "pending".
+  refused: {
+    icon: XCircle,
+    className: "bg-slate-500/15 text-slate-700 border-slate-500/30",
   },
   pending: {
     icon: Clock,
@@ -152,7 +165,10 @@ export function ApprovalHistoryFeed({ executions, loading }: Props) {
                         className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs font-medium ${badge.className}`}
                       >
                         <BadgeIcon className="h-3 w-3" />
-                        {exec.status}
+                        {t(
+                          /* i18n-dynamic */ `aiRiskApprovalHistoryFeed.status.${exec.status}`,
+                          { defaultValue: exec.status },
+                        )}
                       </span>
                     </div>
                     <div className="mt-0.5 flex items-center gap-3 text-xs text-muted-foreground">

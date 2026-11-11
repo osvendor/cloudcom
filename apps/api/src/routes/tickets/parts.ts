@@ -6,7 +6,7 @@ import { db } from '../../db';
 import { ticketParts, timeEntries } from '../../db/schema';
 import { requireScope, requirePermission } from '../../middleware/auth';
 import { PERMISSIONS } from '../../services/permissions';
-import { ticketPartSchema, updateTicketPartSchema, listTimeEntriesQuerySchema } from '@breeze/shared';
+import { ticketPartSchema, updateTicketPartSchema, listTimeEntriesQuerySchema, ERROR_CODES } from '@breeze/shared';
 
 const idParam = z.object({ id: z.string().guid() });
 const partIdParam = z.object({ id: z.string().guid() });
@@ -16,6 +16,7 @@ import {
 } from '../../services/timeEntryService';
 import { getScopedTicketOr404 } from './tickets';
 import { timeActorFrom } from '../timeEntries/timeEntries';
+import { ticketMergedResponse } from '../../services/ticketMerge/errors';
 
 // Internal-only (spec D4): parts + per-ticket time data never reach org scope.
 export const ticketPartsRoutes = new Hono();
@@ -25,6 +26,9 @@ const readPerm = requirePermission(PERMISSIONS.TICKETS_READ.resource, PERMISSION
 const writePerm = requirePermission(PERMISSIONS.TICKETS_WRITE.resource, PERMISSIONS.TICKETS_WRITE.action);
 
 function handleServiceError(c: { json: (b: unknown, s: number) => Response }, err: unknown): Response {
+  // #8972 W1: a write reached a merged tombstone → 409 with the survivor id.
+  const merged = ticketMergedResponse(c, err);
+  if (merged) return merged;
   if (err instanceof TimeEntryServiceError) {
     return c.json({ error: err.message, code: err.code }, err.status);
   }
@@ -37,7 +41,7 @@ ticketPartsRoutes.patch('/parts/:id', scopes, writePerm, zValidator('param', par
   const rows = await db.select().from(ticketParts).where(eq(ticketParts.id, c.req.valid('param').id)).limit(1);
   const part = rows[0];
   if (!part || !(await getScopedTicketOr404(auth, part.ticketId))) {
-    return c.json({ error: 'Part not found' }, 404);
+    return c.json({ error: 'Part not found', code: ERROR_CODES.NOT_FOUND }, 404);
   }
   try {
     const updated = await updateTicketPart(part.id, c.req.valid('json'), timeActorFrom(c));
@@ -52,7 +56,7 @@ ticketPartsRoutes.delete('/parts/:id', scopes, writePerm, zValidator('param', pa
   const rows = await db.select().from(ticketParts).where(eq(ticketParts.id, c.req.valid('param').id)).limit(1);
   const part = rows[0];
   if (!part || !(await getScopedTicketOr404(auth, part.ticketId))) {
-    return c.json({ error: 'Part not found' }, 404);
+    return c.json({ error: 'Part not found', code: ERROR_CODES.NOT_FOUND }, 404);
   }
   try {
     await deleteTicketPart(part.id, timeActorFrom(c));
@@ -65,7 +69,7 @@ ticketPartsRoutes.delete('/parts/:id', scopes, writePerm, zValidator('param', pa
 ticketPartsRoutes.get('/:id/parts', scopes, readPerm, zValidator('param', idParam), async (c) => {
   const auth = c.get('auth');
   const ticket = await getScopedTicketOr404(auth, c.req.valid('param').id);
-  if (!ticket) return c.json({ error: 'Ticket not found' }, 404);
+  if (!ticket) return c.json({ error: 'Ticket not found', code: ERROR_CODES.NOT_FOUND }, 404);
   const parts = await db.select().from(ticketParts).where(eq(ticketParts.ticketId, ticket.id));
   return c.json({ data: parts });
 });
@@ -73,7 +77,7 @@ ticketPartsRoutes.get('/:id/parts', scopes, readPerm, zValidator('param', idPara
 ticketPartsRoutes.post('/:id/parts', scopes, writePerm, zValidator('param', idParam), zValidator('json', ticketPartSchema), async (c) => {
   const auth = c.get('auth');
   const ticket = await getScopedTicketOr404(auth, c.req.valid('param').id);
-  if (!ticket) return c.json({ error: 'Ticket not found' }, 404);
+  if (!ticket) return c.json({ error: 'Ticket not found', code: ERROR_CODES.NOT_FOUND }, 404);
   try {
     const part = await addTicketPart(ticket.id, c.req.valid('json'), timeActorFrom(c));
     return c.json({ data: part }, 201);
@@ -85,16 +89,22 @@ ticketPartsRoutes.post('/:id/parts', scopes, writePerm, zValidator('param', idPa
 ticketPartsRoutes.get('/:id/time-entries', scopes, readPerm, zValidator('param', idParam), zValidator('query', listTimeEntriesQuerySchema), async (c) => {
   const auth = c.get('auth');
   const ticket = await getScopedTicketOr404(auth, c.req.valid('param').id);
-  if (!ticket) return c.json({ error: 'Ticket not found' }, 404);
-  const q = c.req.valid('query');
-  const { entries, total } = await listTimeEntries({ ...q, ticketId: ticket.id });
+  if (!ticket) return c.json({ error: 'Ticket not found', code: ERROR_CODES.NOT_FOUND }, 404);
+  // Scope by the access-checked ticket, never by a caller-supplied `orgId`:
+  // the web client injects the header org selector as `?orgId=`, and when it
+  // differs from the ticket's org the list filtered every entry away while the
+  // ticket-scoped billing summary still counted them. A ticket-linked entry's
+  // org_id always equals its ticket's (time_entries_ticket_org_fk), so pinning
+  // the ticket's org is exact and cannot widen access past the ticket check.
+  const { orgId: _ignoredOrgId, ticketId: _ignoredTicketId, ...q } = c.req.valid('query');
+  const { entries, total } = await listTimeEntries({ ...q, ticketId: ticket.id, orgId: ticket.orgId });
   return c.json({ data: entries, total });
 });
 
 ticketPartsRoutes.get('/:id/billing-summary', scopes, readPerm, zValidator('param', idParam), async (c) => {
   const auth = c.get('auth');
   const ticket = await getScopedTicketOr404(auth, c.req.valid('param').id);
-  if (!ticket) return c.json({ error: 'Ticket not found' }, 404);
+  if (!ticket) return c.json({ error: 'Ticket not found', code: ERROR_CODES.NOT_FOUND }, 404);
   const summary = await getTicketBillingSummary(ticket.id);
   // #6466: getTicketBillingSummary's billableMinutes counts every billable row
   // (COALESCE(billable_minutes, duration_minutes) FILTER (WHERE is_billable)),

@@ -21,6 +21,7 @@ import { normalizeQueryEntities } from '../content/entities';
 import { toVectorLiteral, type Embedder } from '../content/embedder';
 import type { FinderFile, SearchFilters, VisibleSource } from './fileQueryService';
 import { SHARED_DEVICE_KEY } from './runScope';
+import { ownerRelPathPattern } from './ownerPath';
 import { visibleSourcePredicateSql } from './visibility';
 
 export interface ContentSearchResult extends FinderFile {
@@ -212,7 +213,15 @@ export function createContentSearchService(db: WorkspaceDatabase, deps: ContentS
           AND fi.source_id = ANY(${pgArrayLiteral(sourceIds)}::uuid[])
           AND (
             (s.kind = 'smb_share' AND fi.device_key = ${SHARED_DEVICE_KEY})
-            OR (s.kind = 'local_profile' AND fi.device_key = ${helperDeviceId})
+            -- local_profile: same caller-claimed-owner prefix rule as
+            -- fileQueryService (SearchFilters.ownerUsername). Binding NULL when
+            -- unclaimed makes the ILIKE always false, so an unclaimed caller
+            -- matches no local_profile row rather than every profile's rows.
+            OR (
+              s.kind = 'local_profile'
+              AND fi.device_key = ${helperDeviceId}
+              AND fi.rel_path ILIKE ${filters.ownerUsername ? ownerRelPathPattern(filters.ownerUsername) : null} ESCAPE '\\'
+            )
           )
           ${extras}
       `;
@@ -273,6 +282,10 @@ export function createContentSearchService(db: WorkspaceDatabase, deps: ContentS
                   WHERE e.org_id = ${orgId} AND e.file_index_id = fi.id
                     AND (e.entity_type || ':' || e.value_norm) = ANY(${pgArrayLiteral(entityKeys)}::text[])) AS hits
           ${scope}
+          -- Same status guard as the FTS arms: a file that later became
+          -- blocked_dlp keeps llm-origin entities (the blocked-branch purge
+          -- only deletes regex-origin), so require an 'extracted' content row.
+          AND c.id IS NOT NULL
           AND EXISTS (
             SELECT 1 FROM workspace_content_entities e
             WHERE e.org_id = ${orgId} AND e.file_index_id = fi.id
@@ -355,7 +368,7 @@ export function createContentSearchService(db: WorkspaceDatabase, deps: ContentS
                en.declared_project_key, en.declared_project_label,
                (SELECT jsonb_agg(jsonb_build_object('type', e.entity_type, 'value', e.value_norm))
                 FROM workspace_content_entities e
-                WHERE e.org_id = ${orgId} AND e.file_index_id = fi.id
+                WHERE c.id IS NOT NULL AND e.org_id = ${orgId} AND e.file_index_id = fi.id
                   AND (e.entity_type || ':' || e.value_norm) = ANY(${pgArrayLiteral(entityKeys)}::text[])) AS matched_entities
         FROM workspace_file_index fi
         LEFT JOIN workspace_file_content c
@@ -433,6 +446,11 @@ export function createContentSearchService(db: WorkspaceDatabase, deps: ContentS
           AND fi.source_id = ANY(${pgArrayLiteral(sourceIds)}::uuid[])
           AND (
             (s.kind = 'smb_share' AND fi.device_key = ${SHARED_DEVICE_KEY})
+            -- NOT scoped by ownerUsername (unlike search() above): passages()
+            -- backs the AI chat cited-RAG tool, which has no end-OS-user
+            -- identity to claim — it is a genuinely different actor model, not
+            -- an oversight. Owner scoping for this path is tracked as
+            -- follow-up work.
             OR (s.kind = 'local_profile' AND fi.device_key = ${opts.helperDeviceId})
           )
           ${fileFilter}

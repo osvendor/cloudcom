@@ -1,7 +1,8 @@
 import { z } from 'zod';
-import { dlpConfigSchema, DEFAULT_DLP_CONFIG } from '@breeze/shared/validators';
+import { dlpConfigSchema, DEFAULT_DLP_CONFIG, retiredAiModelField } from '@breeze/shared/validators';
 import type { ClientAiOrgPolicy } from '../../services/clientAiPolicy';
 import { CLIENT_HOSTS } from '../../services/clientAiHosts';
+import { compileRe2 } from '../../services/dlpRegexEngine';
 
 /**
  * Mirrors `DLP_MAX_TOTAL_CHARS` in services/clientAiDlp.ts — the engine's
@@ -19,6 +20,12 @@ const WB_TEXT_MAX_CHARS = 2_000_000;
 /** Add-in sessions are 24h Redis-backed bearer tokens, org-bound (spec §3). */
 export const CLIENT_AI_SESSION_TTL_MS = 1000 * 60 * 60 * 24;
 export const CLIENT_AI_SESSION_TTL_SECONDS = Math.floor(CLIENT_AI_SESSION_TTL_MS / 1000);
+/**
+ * Absolute add-in session lifetime from its stored `createdAt`, on top of the
+ * sliding 24 h (portal registration W4, plan D9 / OD1; spec §5.11). The add-in
+ * re-exchanges silently on a 401, so a leaver's Entra disable bites within 12 h.
+ */
+export const CLIENT_AI_SESSION_MAX_AGE_SECONDS = 12 * 3600;
 
 export const CLIENT_AI_REDIS_KEYS = {
   session: (token: string) => `clientai:session:${token}`,
@@ -47,18 +54,54 @@ export const putTenantMappingSchema = z.object({
     .regex(ENTRA_TENANT_GUID_REGEX, 'must be an Entra tenant GUID (Directory ID)'),
 });
 
+// ============================================
+// DLP config (spec §6) — THE cross-plan contract shape.
+// Plan 3 shipped the canonical schema in @breeze/shared/validators
+// (dlpConfigSchema, DEFAULT_DLP_CONFIG). That schema's pattern gate
+// (validateDlpPattern/validateRegexSafety) is a JS-only heuristic —
+// deliberately so, since it also runs in the browser-side policy editor's
+// live regex test box for instant feedback (see that module's header). It
+// cannot depend on `re2-wasm`.
+//
+// This layer adds the authoritative check on top, server-side only: every
+// custom rule pattern must also compile under RE2, the engine
+// services/clientAiDlp.ts actually scans messages with. RE2 rejects
+// backreferences and lookaround assertions — constructs the JS heuristic
+// doesn't ban — so a pattern using either is now surfaced as a validation
+// error at write time instead of silently being accepted and then skipped
+// (with a warning) the first time the scanner tries to use it.
+// ============================================
+export const clientAiDlpConfigSchema = dlpConfigSchema.superRefine((config, ctx) => {
+  config.customRules.forEach((rule, index) => {
+    const compiled = compileRe2(rule.pattern);
+    if (!compiled.ok) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `unsafe or invalid pattern: ${compiled.reason}`,
+        path: ['customRules', index, 'pattern'],
+      });
+    }
+  });
+});
+export type ClientAiDlpConfig = z.infer<typeof clientAiDlpConfigSchema>;
+
+/** Spec §6 defaults: redact for financial/credential types; email/phone off. */
+export const CLIENT_AI_DLP_DEFAULT_BUILTINS = DEFAULT_DLP_CONFIG.builtins;
+
 export const putPolicySchema = z
   .object({
     enabled: z.boolean().optional(),
     userAccess: z.enum(['all', 'selected']).optional(),
     selectedUserIds: z.array(z.string().guid()).max(1000).optional(),
     allowedProviders: z.array(z.string().min(1).max(50)).min(1).max(10).optional(),
-    allowedModels: z.array(z.string().min(1).max(100)).max(50).optional(),
+    /** Retired (W08, #7606): rejected with 400 naming its replacement, the office_chat model
+     * assignment under AI Providers & Models. Declared so the error names the field. */
+    allowedModels: retiredAiModelField('allowedModels'),
     writeMode: z.enum(['readwrite', 'readonly']).optional(),
     /** Org gate for pane auto-apply (spec §7). 'ask' is the default-deny value. */
     writeApproval: z.enum(['ask', 'allow_auto']).optional(),
-    /** Validated + normalized (defaults filled) — see packages/shared/src/validators/clientAiDlp.ts. */
-    dlpConfig: dlpConfigSchema.optional(),
+    /** Validated + normalized (defaults filled), plus the RE2 compile gate above. */
+    dlpConfig: clientAiDlpConfigSchema.optional(),
     dailyBudgetCents: z.number().int().min(0).nullable().optional(),
     monthlyBudgetCents: z.number().int().min(0).nullable().optional(),
     perUserMessagesPerMinute: z.number().int().min(1).max(600).optional(),
@@ -67,21 +110,6 @@ export const putPolicySchema = z
     branding: z.record(z.string(), z.unknown()).optional(),
   })
   .strict();
-
-// ============================================
-// DLP config (spec §6) — THE cross-plan contract shape.
-// Plan 3 already shipped the canonical schema in @breeze/shared/validators
-// (dlpConfigSchema, DEFAULT_DLP_CONFIG). We re-export aliases so Plan-4
-// route tasks/tests have stable client-ai-namespaced names without
-// duplicating (and diverging from) the shared definition. putPolicySchema
-// above already consumes dlpConfigSchema directly.
-// ============================================
-
-export const clientAiDlpConfigSchema = dlpConfigSchema;
-export type ClientAiDlpConfig = z.infer<typeof clientAiDlpConfigSchema>;
-
-/** Spec §6 defaults: redact for financial/credential types; email/phone off. */
-export const CLIENT_AI_DLP_DEFAULT_BUILTINS = DEFAULT_DLP_CONFIG.builtins;
 
 // ============================================
 // Plan-4 admin query/body schemas

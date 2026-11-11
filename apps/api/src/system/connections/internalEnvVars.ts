@@ -1,0 +1,649 @@
+/**
+ * Env vars the API reads that are NOT operator-facing connections (spec §1):
+ * tuning knobs, job toggles, rollout flags, test/dev hooks. One phrase each.
+ * Names only — nothing here is ever read or displayed by the report.
+ * The coverage ratchet (envInventory.test.ts) keeps this list honest: a name
+ * that stops appearing in apps/api/src fails the "stale" check.
+ */
+export const INTERNAL_ENV_VARS: Readonly<Record<string, string>> = {
+  // CloudCom host admission controls; status is shown in Operations health.
+  CLOUDCOM_CAPACITY_GUARD_ENABLED: 'background capacity admission switch',
+  CLOUDCOM_CAPACITY_GUARD_CPU_PAUSE_PERCENT: 'background CPU pause threshold',
+  CLOUDCOM_CAPACITY_GUARD_CPU_RESUME_PERCENT: 'background CPU recovery threshold',
+  CLOUDCOM_CAPACITY_GUARD_EVENT_LOOP_PAUSE_MS: 'background event-loop pause threshold',
+  CLOUDCOM_CAPACITY_GUARD_EVENT_LOOP_RESUME_MS: 'background event-loop recovery threshold',
+  CLOUDCOM_CAPACITY_GUARD_MEMORY_PAUSE_PERCENT: 'background memory pause threshold',
+  CLOUDCOM_CAPACITY_GUARD_MEMORY_RESUME_PERCENT: 'background memory recovery threshold',
+  CLOUDCOM_CAPACITY_GUARD_STEAL_PAUSE_PERCENT: 'hypervisor pressure pause threshold',
+  CLOUDCOM_CAPACITY_GUARD_STEAL_RESUME_PERCENT: 'hypervisor pressure recovery threshold',
+  CLOUDCOM_UPDATE_GUARD_ENABLED: 'fleet update admission switch',
+  CLOUDCOM_UPDATE_MAX_CONCURRENT: 'fleet concurrent update limit',
+  CLOUDCOM_UPDATE_STARTS_PER_WINDOW: 'fleet update start rate',
+  CLOUDCOM_UPDATE_WINDOW_SECONDS: 'fleet update start window',
+  // ABUSE_*
+  ABUSE_HOSTNAME_INDICATORS: 'abuse heuristic tuning list',
+  ABUSE_SCRIPT_INDICATORS: 'abuse heuristic tuning list',
+  ABUSE_SIGNAL_OVERRIDES: 'abuse heuristic weight overrides',
+  // AGENT_*
+  AGENT_BINARY_DIR: 'filesystem path',
+  AGENT_BODY_RECEIVE_TIMEOUT_MS: 'agent request body receive deadline',
+  AGENT_BODY_RECEIVE_TOTAL_TIMEOUT_MS: 'agent request body receive deadline',
+  AGENT_CHANGES_MAX_BYTES_PER_DEVICE_PER_DAY: 'agent ingest quota knob',
+  AGENT_CHANGES_MAX_BYTES_PER_ORG_PER_DAY: 'agent ingest quota knob',
+  AGENT_CHANGES_MAX_ROWS_PER_DEVICE_PER_DAY: 'agent ingest quota knob',
+  AGENT_CHANGES_MAX_ROWS_PER_ORG_PER_DAY: 'agent ingest quota knob',
+  AGENT_CONNECTIONS_MAX_PER_DEVICE: 'agent ingest cap (stored connections per device)',
+  AGENT_EDITION_AUTO_MIGRATE_ENABLED: 'agent edition migration toggle',
+  AGENT_ENROLL_RATE_LIMIT: 'rate limit knob',
+  AGENT_ENROLL_RATE_WINDOW_SECONDS: 'rate limit knob',
+  AGENT_EVENTLOG_MAX_BYTES_PER_DEVICE_PER_DAY: 'agent ingest quota knob',
+  AGENT_EVENTLOG_MAX_BYTES_PER_ORG_PER_DAY: 'agent ingest quota knob',
+  AGENT_EVENTLOG_MAX_ROWS_PER_ORG_PER_DAY: 'agent ingest quota knob',
+  AGENT_LOG_MAX_BYTES_PER_DEVICE_PER_DAY: 'agent ingest quota knob',
+  AGENT_LOG_MAX_BYTES_PER_ORG_PER_DAY: 'agent ingest quota knob',
+  AGENT_LOG_MAX_ROWS_PER_DEVICE_PER_DAY: 'agent ingest quota knob',
+  AGENT_LOG_MAX_ROWS_PER_ORG_PER_DAY: 'agent ingest quota knob',
+  AGENT_LOG_RETENTION_BATCH_SIZE: 'retention sweep batch knob',
+  AGENT_LOG_RETENTION_DAYS: 'data retention window',
+  AGENT_LOG_RETENTION_MAX_BATCHES: 'retention sweep batch knob',
+  AGENT_ORG_RATE_LIMIT_MAX: 'rate limit knob',
+  AGENT_ORG_RATE_LIMIT_PER_DEVICE: 'rate limit knob',
+  AGENT_ORG_RATE_LIMIT_PER_MIN: 'rate limit knob',
+  AGENT_ROLLBACK_DENYLISTED_VERSIONS: 'agent rollback safety list',
+  AGENT_ROLLBACK_MIN_VERSION: 'agent rollback safety floor',
+  AGENT_SERVER_URL: 'network isolation management-plane allowlist fallback URL',
+  AGENT_TOKEN_ROTATION_MAX_AGE_DAYS: 'agent token rotation window',
+  AGENT_WS_COMMAND_RESULT_MESSAGE_BUDGET_CAPACITY: 'agent WS message budget knob',
+  AGENT_WS_COMMAND_RESULT_MESSAGE_BUDGET_REFILL_PER_SECOND: 'agent WS message budget knob',
+  AGENT_WS_MESSAGE_BUDGET_CAPACITY: 'agent WS message budget knob',
+  AGENT_WS_MESSAGE_BUDGET_CLOSE_THRESHOLD: 'agent WS message budget knob',
+  AGENT_WS_MESSAGE_BUDGET_REFILL_PER_SECOND: 'agent WS message budget knob',
+  AGENT_WS_UPDATE_STATUS_MESSAGE_BUDGET_CAPACITY: 'agent WS message budget knob',
+  AGENT_WS_UPDATE_STATUS_MESSAGE_BUDGET_REFILL_PER_SECOND: 'agent WS message budget knob',
+  // AI_*
+  AI_COMPUTE_PRICE_MULTIPLIER: 'AI billing price multiplier',
+  AI_INVOCATIONS_RETENTION_BATCH_SIZE: 'retention sweep batch knob',
+  AI_INVOCATIONS_RETENTION_DAYS: 'data retention window',
+  AI_INVOCATIONS_RETENTION_MAX_BATCHES: 'retention sweep batch knob',
+  AI_TOOL_EVAL_KEY: 'dev script (services/llm/__scripts__)',
+  AI_TOOL_OUTPUT_RETENTION_BATCH_SIZE: 'retention sweep batch knob',
+  AI_TOOL_OUTPUT_RETENTION_CRON: 'job schedule override',
+  AI_TOOL_OUTPUT_RETENTION_MAX_BATCHES: 'retention sweep batch knob',
+  AI_TRANSCRIPT_SWEEPER_CRON: 'job schedule override',
+  AI_TRANSCRIPT_SWEEPER_ENABLED: 'job toggle',
+  AI_TRANSCRIPT_SWEEPER_GRACE_HOURS: 'transcript sweep grace window',
+  AI_TOOL_SEARCH: 'AI chat tool-search override (auto/on/off)',
+  AI_TOOL_INDEX: 'AI chat system-prompt tool index (lazy/full)',
+  // ALERT_*
+  ALERT_WORKER_CHUNK_SIZE: 'worker throughput knob',
+  ALERT_WORKER_CONCURRENCY: 'worker concurrency knob (default DB_POOL_MAX/4; DB_POOL_MAX/2 when BREEZE_ROLE=worker)',
+  ALERT_WORKER_MAX_DEVICES_PER_RUN: 'worker throughput knob',
+  ALERT_WORKER_STAGGER_WINDOW_MS: 'evaluate-device stagger window',
+  // API_*
+  API_KEY_PRELOOKUP_RATE_LIMIT: 'rate limit knob',
+  API_KEY_PRELOOKUP_RATE_WINDOW_SECONDS: 'rate limit knob',
+  API_PORT: 'listen port',
+  // APP_*
+  APP_VERSION: 'shown as report.version',
+  // APPROVER_*
+  APPROVER_ASSURANCE_DEFAULT_ENFORCE_FROM: 'approval security rollout date',
+  // AUDIT_*
+  AUDIT_CHAIN_ANCHOR_ENABLED: 'audit job kill switch',
+  AUDIT_CHAIN_VERIFY_ENABLED: 'audit job toggle',
+  AUDIT_CHAIN_VERIFY_MODE: 'audit job mode',
+  AUDIT_CHAIN_VERIFY_RESCAN_SLICES: 'audit job tuning',
+  AUDIT_RETENTION_BATCH_SIZE: 'retention sweep batch knob',
+  AUDIT_RETENTION_ENABLED: 'audit job toggle',
+  AUDIT_RETENTION_MAX_BATCHES: 'retention sweep batch knob',
+  // AUTH_*
+  AUTH_BROWSER_TERMINAL_PREPARATION_ENABLED: 'auth rollout switch',
+  AUTH_COOKIE_FORCE_SECURE: 'cookie policy override',
+  AUTH_COOKIE_SAME_SITE: 'cookie policy override',
+  AUTH_LEGACY_INVITE_PREVIEW_PATH: 'legacy route toggle',
+  AUTH_REFRESH_RATE_LIMIT: 'rate limit knob',
+  AUTH_REFRESH_RATE_WINDOW_SECONDS: 'rate limit knob',
+  USER_RATE_LIMIT_PER_MINUTE: 'rate limit knob',
+  AUTH_TRANSITION_TEST_CONTROL_SECRET: 'test-only barrier secret',
+  // AUTOMATION_*
+  AUTOMATION_WEBHOOK_ALLOW_LEGACY_SECRET: 'legacy compatibility toggle',
+  AUTOMATION_WEBHOOK_ALLOW_LOCAL_REPLAY_FALLBACK: 'legacy compatibility toggle',
+  // AUTO_*
+  AUTO_MIGRATE: 'boot migration toggle',
+  // BACKUP_*
+  BACKUP_BASE_LEASE_MS: 'timing knob',
+  BACKUP_BINARY_DIR: 'filesystem path',
+  BACKUP_CRITICAL_DEVICE_TAGS: 'backup criticality tuning',
+  BACKUP_GC_GRACE_MS: 'timing knob',
+  BACKUP_GC_LIVE_SET_MAX_BYTES: 'worker memory knob',
+  BACKUP_GC_MANIFESTLESS_PREFIX_MAX_AGE_MS: 'timing knob',
+  BACKUP_GC_MAX_DELETES_PER_RUN: 'worker throughput knob',
+  BACKUP_GC_ORPHAN_MANIFEST_MAX_AGE_MS: 'timing knob',
+  BACKUP_PUBLISH_MARGIN_MS: 'timing knob',
+  BACKUP_RESTORE_PIN_LINGER_MS: 'timing knob',
+  // BINARY_*
+  BINARY_CHECKSUM_MANIFEST: 'binary checksum manifest override',
+  BINARY_VERSION_FILE: 'build metadata path',
+  // BMR_*
+  BMR_RECOVERY_ADVERTISE_QUERY_TOKEN: 'recovery compatibility toggle',
+  BMR_RECOVERY_ALLOW_QUERY_TOKEN: 'recovery compatibility toggle',
+  // BREEZE_*
+  BREEZE_ADMISSION_BULK_MAX_IN_FLIGHT: 'agent admission control tuning',
+  BREEZE_ADMISSION_DB_WAIT_MS: 'agent admission control tuning',
+  BREEZE_ADMISSION_EMERGENCY_MS: 'agent admission control tuning',
+  BREEZE_ADMISSION_LAG_MS: 'agent admission control tuning',
+  BREEZE_ADMISSION_LEVEL1_HOLD_MS: 'agent admission control tuning',
+  BREEZE_ADMISSION_MODE: 'agent admission control mode / kill switch',
+  BREEZE_ADMISSION_RISE_TICKS: 'agent admission control tuning',
+  BREEZE_ADMISSION_WS_BURST: 'agent admission control tuning',
+  BREEZE_ADMISSION_WS_MAX_SETUPS: 'agent admission control tuning',
+  BREEZE_ADMISSION_WS_RATE_PER_SEC: 'agent admission control tuning',
+  BREEZE_ALLOW_UNSAFE_DB_ROLE: 'non-production safety opt-out',
+  BREEZE_BOOTSTRAP_ADMIN_EMAIL: 'one-time first-boot seed',
+  BREEZE_BOOTSTRAP_ADMIN_NAME: 'one-time first-boot seed',
+  BREEZE_BOOTSTRAP_ADMIN_PASSWORD: 'one-time first-boot seed',
+  BREEZE_BUILTIN_MONITORS_AUTOSEED: 'seed toggle',
+  BREEZE_EDR_ACTIONS_ENABLED: 'EDR response-action kill switch',
+  BREEZE_INTEGRATION_ALLOW_LEDGER_DRIFT: 'test harness (testUtils)',
+  BREEZE_INTEGRATION_LOCK_NOWAIT: 'test harness (testUtils)',
+  BREEZE_LEGACY_ALERTING_SWEEP: 'boot sweep opt-out (legacy alerting retirement)',
+  BREEZE_OEM_UPDATES_DISABLED_LANES: 'vendor update per-lane kill switch (#11065)',
+  BREEZE_OEM_UPDATES_ENABLED: 'vendor update rollout flag (#11065, dark by default)',
+  BREEZE_OEM_UPDATES_LAB_DEVICE_IDS: 'vendor update lab-device gate override (refused in production)',
+  BREEZE_OEM_UPDATES_PARTNER_ALLOWLIST: 'vendor update rollout allowlist (#11065)',
+  BREEZE_PLATFORM_ADMINS: 'platform-admin bootstrap list',
+  BREEZE_REGION: 'hosted topology label',
+  BREEZE_ROLE: 'process role (api/worker)',
+  BREEZE_SEED_E2E_FORCE: 'E2E seed toggle',
+  BREEZE_TEST_DB_URL: 'test harness (testUtils)',
+  BREEZE_TRUST_CIS_FRAMEWORK_VIEW: 'Trust Center CIS v8 framework view rollout gate; set only after CIS licensing confirmation (spec §18.13)',
+  BREEZE_UPGRADE_PREFLIGHT_STRICT: 'upgrade CLI flag',
+  BREEZE_YARAC_PATH: 'filesystem path (YARA pre-check binary; image default /usr/local/bin/breeze-yarac)',
+  BREEZE_YARA_BUILTIN_PACK_DISABLED: 'operator kill switch: disable the built-in YARA rule set at boot and load no pack (#6263 W03b)',
+  BREEZE_YARA_LINT_ONLY: 'dev/test-only escape hatch: publish YARA rules without the pre-check (ignored unless NODE_ENV is development/test)',
+  BREEZE_YARA_TEST_UNSANDBOXED: 'dev/test-only escape hatch: run the YARA rule test upload without the Landlock sandbox (ignored unless NODE_ENV is development/test)',
+  // CALLER_*
+  CALLER_VERIFICATION_ENABLED: 'feature flag',
+  CALLER_VERIFICATION_WORKSTATION_ENABLED: 'feature flag (workstation tier, dark by default)',
+  // CANCEL_*
+  CANCEL_GRACE_MS: 'timing knob',
+  // CHANGE_*
+  CHANGE_INGEST_MAX_BODY_BYTES: 'ingest size limit',
+  CHANGE_INGEST_MAX_DECOMPRESSED_BYTES: 'ingest size limit',
+  CHANGE_INGEST_MAX_ITEMS: 'ingest size limit',
+  CHANGE_LOG_RETENTION_BATCH_SIZE: 'retention sweep batch knob',
+  CHANGE_LOG_RETENTION_DAYS: 'data retention window',
+  CHANGE_LOG_RETENTION_MAX_BATCHES: 'retention sweep batch knob',
+  // CHILD_*
+  CHILD_ENROLLMENT_KEY_TTL_MINUTES: 'timing knob',
+  // CLAUDE_*
+  CLAUDE_CONFIG_DIR: 'SDK transcript directory (filesystem path)',
+  CLAUDE_AGENT_SDK_CLIENT_APP: 'SDK child-process label',
+  // COOKIE_*
+  COOKIE_FORCE_SECURE: 'cookie policy override',
+  COOKIE_SAME_SITE: 'cookie policy override',
+  // CSP_*
+  CSP_ALLOW_UNSAFE_INLINE: 'CSP tuning',
+  CSP_CONNECT_HOSTS: 'CSP tuning',
+  // DB_*
+  DB_ACCESS_CONTEXT_PROLOGUE_TIMEOUT_MS: 'database pool/watchdog tuning',
+  DB_CONTEXTLESS_WRITE_STRICT: 'database pool/watchdog tuning',
+  DB_CONTEXT_HELD_CAPTURE_THROTTLE_MS: 'database pool/watchdog tuning',
+  DB_CONTEXT_HELD_WARN_MS: 'database pool/watchdog tuning',
+  DB_CONTEXT_TRIPWIRE_STRICT: 'database pool/watchdog tuning',
+  DB_POOL_ACQUIRE_TIMEOUT_MS: 'database pool/watchdog tuning',
+  DB_POOL_HEALTH_CAPTURE_THROTTLE_MS: 'database pool/watchdog tuning',
+  DB_POOL_HEALTH_DISABLED: 'database pool/watchdog tuning',
+  DB_POOL_HEALTH_INTERVAL_MS: 'database pool/watchdog tuning',
+  DB_POOL_HEALTH_MIN_TIMEOUTS: 'database pool/watchdog tuning',
+  DB_POOL_HEALTH_PROBE_TIMEOUT_MS: 'database pool/watchdog tuning',
+  DB_POOL_HEALTH_WINDOW_MS: 'database pool/watchdog tuning',
+  DB_POOL_MAX: 'database pool/watchdog tuning',
+  DB_TIMER_LAG_GRACE_MS: 'database pool/watchdog tuning',
+  DB_WEDGED_BACKEND_CONFIRM_DELAY_MS: 'database pool/watchdog tuning',
+  DB_WEDGED_BACKEND_MIN_AGE_MS: 'database pool/watchdog tuning',
+  DB_WEDGED_BACKEND_RECLAIM_DISABLED: 'database pool/watchdog tuning',
+  DB_WEDGED_BACKEND_RECLAIM_MAX_PER_PASS: 'database pool/watchdog tuning',
+  DB_WEDGED_BACKEND_RECLAIM_MIN_INTERVAL_MS: 'database pool/watchdog tuning',
+  DB_WEDGED_BACKEND_RECLAIM_TIMEOUT_MS: 'database pool/watchdog tuning',
+  DB_WEDGED_BACKEND_SCANNER_RECLAIM_DISABLED: 'database pool/watchdog tuning',
+  DB_WEDGED_BACKEND_SCAN_DISABLED: 'database pool/watchdog tuning',
+  DB_WEDGED_BACKEND_SCAN_INTERVAL_MS: 'database pool/watchdog tuning',
+  // DEPLOYMENT_*
+  DEPLOYMENT_ENV: 'hosted topology label',
+  // DEVICE_*
+  DEVICE_COMMAND_QUEUE_LIVE_ONLY_TTL_MINUTES: 'timing knob',
+  DEVICE_COMMAND_QUEUE_POWER_STATE_TTL_HOURS: 'timing knob',
+  DEVICE_COMMAND_QUEUE_SHORT_TTL_HOURS: 'timing knob',
+  DEVICE_COMMAND_QUEUE_TTL_HOURS: 'timing knob',
+  DEVICE_METRICS_RETENTION_DAYS: 'data retention window',
+  DEVICE_UNINSTALL_DRAIN_WINDOW_HOURS: 'timing knob',
+  // DEV_*
+  DEV_PUSH_ENABLED: 'developer agent push toggle',
+  DEV_PUSH_WORK_DIR: 'filesystem path',
+  // E2E_*
+  E2E_MODE: 'E2E test mode',
+  // EDR_*
+  EDR_DETECTION_RETENTION_BATCH_SIZE: 'retention sweep batch knob',
+  EDR_DETECTION_RETENTION_MAX_BATCHES: 'retention sweep batch knob',
+  // EMAIL_*
+  EMAIL_DOMAINS_AUTOSUSPEND_BOUNCE_RATE: 'sending-domain policy knob',
+  EMAIL_DOMAINS_AUTOSUSPEND_COMPLAINTS: 'sending-domain policy knob',
+  EMAIL_DOMAINS_AUTOSUSPEND_MIN_MESSAGES: 'sending-domain policy knob',
+  EMAIL_DOMAINS_DAILY_SEND_CAP: 'sending-domain policy knob',
+  EMAIL_DOMAINS_DENYLIST: 'sending-domain policy knob',
+  EMAIL_DOMAINS_MAX_PER_PARTNER: 'sending-domain policy knob',
+  EMAIL_DOMAINS_PARTNER_ALLOWLIST: 'sending-domain policy knob',
+  // ENABLE_*
+  ENABLE_2FA: 'auth policy flag',
+  ENABLE_AAD_V3: 'crypto format rollout flag',
+  ENABLE_AI_PATCH_TESTING: 'feature flag',
+  ENABLE_API_DOCS_UI: 'feature flag',
+  ENABLE_REGISTRATION: 'signup policy flag',
+  ENABLE_TOOL_SEARCH: 'SDK child env, written per session by aiToolSearchPolicy',
+  // ENROLLMENT_*
+  ENROLLMENT_KEY_CLEANUP_ENABLED: 'cleanup job toggle',
+  ENROLLMENT_KEY_DEFAULT_TTL_MINUTES: 'timing knob',
+  ENROLLMENT_KEY_PURGE_AFTER_DAYS: 'data retention window',
+  // EVENT_*
+  EVENT_DISPATCH_MODE: 'event bus mode',
+  EVENT_DISPATCH_QUEUE_SUBSCRIBERS: 'event bus routing',
+  EVENT_LOG_RETENTION_BATCH_SIZE: 'retention sweep batch knob',
+  EVENT_LOG_RETENTION_MAX_BATCHES: 'retention sweep batch knob',
+  EVENT_LOOP_MONITOR_DISABLED: 'event-loop monitor toggle',
+  EVENT_LOOP_MONITOR_INTERVAL_MS: 'event-loop monitor tuning',
+  EVENT_LOOP_STARVATION_THROTTLE_MS: 'event-loop monitor tuning',
+  EVENT_LOOP_STARVATION_WARN_MS: 'event-loop monitor tuning',
+  EVENT_PERMISSION_EPOCH_MODE: 'event bus mode',
+  // EVIDENCE_*
+  EVIDENCE_STORAGE_ALLOWED_SCHEMES: 'validation allowlist',
+  // EXCHANGE_*
+  EXCHANGE_RATE_SYNC_ENABLED: 'job toggle',
+  // FILESYSTEM_*
+  FILESYSTEM_ANALYSIS_AUTO_RESUME_MAX_RUNS: 'agent analysis tuning',
+  FILESYSTEM_ANALYSIS_DISK_THRESHOLD: 'agent analysis tuning',
+  FILESYSTEM_ANALYSIS_THRESHOLD_COOLDOWN_MINUTES: 'timing knob',
+  FILESYSTEM_CLEANUP_PLAN_RETENTION_DAYS: 'data retention window',
+  FILESYSTEM_CLEANUP_PREVIEW_RETENTION_DAYS: 'data retention window',
+  FILESYSTEM_CLEANUP_RETENTION_BATCH_SIZE: 'retention sweep batch knob',
+  FILESYSTEM_CLEANUP_RETENTION_MAX_BATCHES: 'retention sweep batch knob',
+  // FLOW_*
+  FLOW_APPROVAL_TTL_HOURS: 'timing knob (parked flow step approval window)',
+  FLOW_MAX_RUNNING_PER_OWNER: 'flow run concurrency cap knob',
+  FLOW_RUN_RETENTION_DAYS: 'data retention window',
+  FLOW_WEBHOOK_RATE_PER_MINUTE: 'flow webhook intake rate-limit knob',
+  FLOW_WEBHOOK_DELIVERY_RETENTION_DAYS: 'data retention window',
+  FLOW_FOREACH_MAX_PARALLEL: 'flow for-each concurrency cap knob',
+  // FRANKFURTER_*
+  FRANKFURTER_BASE_URL: 'FX API base override',
+  // HEARTBEAT_*
+  HEARTBEAT_RETAIN_STATE_ENABLED: 'heartbeat retain-state rollout kill switch',
+  AGENT_ECH_ENABLED: 'agent ECH (encrypted client hello) kill switch',
+  // HELPER_*
+  HELPER_BINARY_DIR: 'filesystem path',
+  HELPER_SCREENSHOT_RATE_LIMIT: 'rate limit knob',
+  HELPER_SCREENSHOT_RATE_WINDOW_SECONDS: 'rate limit knob',
+  // HOME
+  HOME: 'OS env passed to the Agent SDK CLI by a dev spike script',
+  // HTTPS_*
+  HTTPS_PROXY: 'egress proxy passthrough',
+  // HTTP_*
+  HTTP_PROXY: 'egress proxy passthrough',
+  // INBOUND_*
+  INBOUND_QUEUE_MAX_PER_SEC: 'rate limit knob',
+  // INCIDENT_*
+  INCIDENT_CORRELATION_INTERVAL_MS: 'timing knob',
+  INCIDENT_SLA_MONITOR_INTERVAL_MS: 'timing knob',
+  INCIDENT_SLA_P1_MINUTES: 'incident SLA tuning',
+  INCIDENT_SLA_P2_MINUTES: 'incident SLA tuning',
+  INCIDENT_TIMELINE_ENRICH_INTERVAL_MS: 'timing knob',
+  // INSTALLER_*
+  INSTALLER_BOOTSTRAP_TOKEN_TTL_MINUTES: 'timing knob',
+  INSTALLER_PARENT_MIN_REMAINING_SECONDS: 'timing knob',
+  // INTENT_*
+  INTENT_OUTBOX_RETENTION_BATCH_SIZE: 'retention sweep batch knob',
+  INTENT_OUTBOX_RETENTION_DAYS: 'data retention window',
+  INTENT_OUTBOX_RETENTION_MAX_BATCHES: 'retention sweep batch knob',
+  // IOC_*
+  IOC_HUNT_FOUR_EYES_DEVICE_THRESHOLD: 'approval threshold knob (#6263 W05)',
+  // IP_*
+  IP_ALLOWLIST_ENFORCEMENT_MODE: 'enforcement mode',
+  IP_HISTORY_RETENTION_BATCH_SIZE: 'retention sweep batch knob',
+  IP_HISTORY_RETENTION_DAYS: 'data retention window',
+  IP_HISTORY_RETENTION_MAX_BATCHES: 'retention sweep batch knob',
+  // IS_*
+  IS_HOSTED: 'shown as report.deployMode',
+  // LLM_*
+  LLM_EGRESS_EVENTS_RETENTION_BATCH_SIZE: 'retention sweep batch knob',
+  LLM_EGRESS_EVENTS_RETENTION_DAYS: 'data retention window',
+  LLM_EGRESS_EVENTS_RETENTION_MAX_BATCHES: 'retention sweep batch knob',
+  LLM_FIDELITY_API_KEY: 'dev script (services/llm/__scripts__)',
+  LLM_FIDELITY_AUTH_MODE: 'dev script (services/llm/__scripts__)',
+  LLM_FIDELITY_BASE_URL: 'dev script (services/llm/__scripts__)',
+  LLM_FIDELITY_PROVIDER_MODEL: 'dev script (services/llm/__scripts__)',
+  // LOGIN_*
+  LOGIN_ACCOUNT_LOCKOUT_MAX: 'rate limit knob',
+  LOGIN_ACCOUNT_LOCKOUT_WINDOW_SECONDS: 'rate limit knob',
+  // LOG_*
+  LOG_FORWARDING_MAX_JOB_BYTES: 'log forwarding queue bound',
+  LOG_FORWARDING_MAX_PENDING_PER_ORG: 'log forwarding queue bound',
+  LOG_FORWARDING_MAX_WAITING_GLOBAL: 'log forwarding queue bound',
+  LOG_LEVEL: 'logging verbosity',
+  // M365_*
+  M365_SYNC_CONCURRENCY: 'worker throughput knob',
+  M365_SYNC_MAX_BACKLOG: 'worker throughput knob',
+  M365_SYNC_TICK_BATCH: 'worker throughput knob',
+  // MACOS_*
+  MACOS_INSTALLER_ALLOW_LEGACY_GET_BOOTSTRAP: 'legacy compatibility toggle',
+  // MAILGUN_*
+  // MANAGED_*
+  MANAGED_SOFTWARE_POLICY_MODE: 'enforcement mode',
+  // MAX_*
+  MAX_ACTIVE_REMOTE_SESSIONS_PER_ORG: 'rate limit knob',
+  MAX_ACTIVE_REMOTE_SESSIONS_PER_USER: 'rate limit knob',
+  // MCP_*
+  MCP_EXECUTE_TOOL_ALLOWLIST: 'MCP tool policy',
+  MCP_HEADER_MISMATCH_ALERT_THRESHOLD: 'alert threshold',
+  MCP_INSUFFICIENT_SCOPE_HTTP_403: 'MCP step-up challenge flag',
+  MCP_MAX_SSE_SESSIONS_PER_KEY: 'rate limit knob',
+  MCP_MESSAGE_MAX_BODY_BYTES: 'request size limit',
+  MCP_MESSAGE_RATE_LIMIT_PER_MINUTE: 'rate limit knob',
+  MCP_REQUIRE_EXECUTE_ADMIN: 'MCP tool policy',
+  MCP_SESSION_TTL_SECONDS: 'timing knob',
+  MCP_SSE_RATE_LIMIT_PER_MINUTE: 'rate limit knob',
+  MCP_STATELESS_ENABLED: 'MCP rollout flag',
+  MCP_UNATTENDED_TIER3_PRINCIPALS: 'MCP tool policy',
+  MCP_TIER3_INTENTS_ENABLED: 'MCP rollout flag',
+  MCP_INTENT_MAX_LIVE_PER_PRINCIPAL: 'rate limit knob',
+  MCP_INTENT_CREATES_PER_HOUR: 'rate limit knob',
+  MCP_INTENT_CREATES_PER_USER_PER_HOUR: 'rate limit knob',
+  MCP_APPROVAL_WAIT_MS: 'timing knob',
+  MCP_APPROVAL_WAITS_PER_PRINCIPAL: 'rate limit knob',
+  MCP_APPS_ENABLED: 'MCP rollout flag',
+  MCP_TASKS_ENABLED: 'MCP rollout flag',
+  MCP_TASK_PENDING_POLL_INTERVAL_MS: 'timing knob',
+  MCP_TASK_POLL_INTERVAL_MS: 'timing knob',
+  MCP_TASK_TTL_GRACE_MS: 'timing knob',
+  MCP_TOOLS_LIST_PAGE_SIZE: 'paging knob',
+  MCP_UNKNOWN_SESSION_ALERT_THRESHOLD: 'alert threshold',
+  // METRICS_*
+  METRICS_ACTIVE_DEVICE_WINDOW_SECONDS: 'timing knob',
+  METRICS_FLEET_GAUGE_TIMEOUT_SECONDS: 'timing knob',
+  METRICS_FLEET_GAUGE_TTL_SECONDS: 'timing knob',
+  METRICS_INCLUDE_ORG_ID: 'metrics label toggle',
+  // METRIC_*
+  METRIC_ANOMALY_EPISODE_ASSEMBLY_LOOKBACK_HOURS: 'timing knob',
+  METRIC_ANOMALY_EPISODE_CLEAN_BUCKETS: 'anomaly episode tuning',
+  METRIC_ANOMALY_EPISODE_EXPIRE_HOURS: 'timing knob',
+  METRIC_ANOMALY_EPISODE_GAP_MINUTES: 'timing knob',
+  METRIC_ANOMALY_EPISODE_MIN_BUCKETS: 'anomaly episode tuning',
+  METRIC_ANOMALY_EPISODE_RECURRENCE_DAYS: 'timing knob',
+  METRIC_ANOMALY_EPISODE_SNOOZE_DAYS: 'timing knob',
+  METRIC_ANOMALY_INCIDENT_RETENTION_BATCH_SIZE: 'retention sweep batch knob',
+  METRIC_ANOMALY_INCIDENT_RETENTION_DAYS: 'data retention window',
+  METRIC_ANOMALY_INCIDENT_RETENTION_MAX_BATCHES: 'retention sweep batch knob',
+  METRIC_ROLLUP_5M_RETENTION_DAYS: 'data retention window',
+  METRIC_ROLLUP_DAILY_RETENTION_DAYS: 'data retention window',
+  METRIC_ROLLUP_DELETE_BATCH_SIZE: 'retention sweep batch knob (default partition only)',
+  METRIC_ROLLUP_HOURLY_RETENTION_DAYS: 'data retention window',
+  METRIC_ROLLUP_MAINTENANCE_CRON: 'job schedule override',
+  METRIC_ROLLUP_MAINTENANCE_ENABLED: 'job toggle',
+  METRIC_ROLLUP_PARTITION_MONTHS_AHEAD: 'partition maintenance tuning',
+  METRIC_ROLLUP_PARTITION_MONTHS_BACK: 'partition maintenance tuning',
+  // MFA_*
+  MFA_FORCE_FOR_PARTNER_ADMIN: 'auth policy flag',
+  // MIGRATION_*
+  MIGRATION_LOCK_TIMEOUT_MS: 'boot migration lock wait deadline',
+  MIGRATION_WINDOW_DEFAULT_WRITES_PER_HOUR: 'rate limit knob',
+  MIGRATION_WINDOW_MAX_DAYS: 'timing knob',
+  MIGRATION_WINDOW_MAX_WRITES_PER_HOUR: 'rate limit knob',
+  // ML_*
+  ML_DISABLED_FLAGS: 'ML kill switch',
+  ML_FEATURES_DISABLED: 'ML kill switch',
+  ML_GLOBAL_KILL_SWITCH: 'ML kill switch',
+  ML_OUTPUTS_DISABLED: 'ML kill switch',
+  ML_OUTPUT_RETENTION_BATCH_SIZE: 'retention sweep batch knob',
+  ML_OUTPUT_RETENTION_CRON: 'job schedule override',
+  ML_OUTPUT_RETENTION_DAYS: 'data retention window',
+  ML_OUTPUT_RETENTION_MAX_BATCHES: 'retention sweep batch knob',
+  // MONITOR_*
+  MONITOR_EPISODE_RETENTION_BATCH_SIZE: 'retention sweep batch knob',
+  MONITOR_EPISODE_RETENTION_MAX_BATCHES: 'retention sweep batch knob',
+  // NETWORK_*
+  NETWORK_ISOLATION_ENABLED: 'network isolation rollout kill switch',
+  NETWORK_ISOLATION_ENABLED_PARTNER_IDS: 'network isolation partner canary allowlist',
+  // NODE_*
+  NODE_ENV: 'runtime mode',
+  // NO_*
+  NO_PROXY: 'egress proxy passthrough',
+  // OAUTH_*
+  OAUTH_AUTH_EPOCH_ENFORCE_AFTER: 'OAuth rollout cutoff',
+  OAUTH_CLEANUP_ENABLED: 'cleanup job toggle',
+  OAUTH_DEBUG: 'debug logging flag',
+  // OFFBOARDING_*
+  OFFBOARDING_DRAIN_WINDOW_HOURS: 'timing knob',
+  // OEM_UPDATES_*
+  OEM_UPDATES_MAX_DISPATCH_PER_TICK: 'worker throughput knob (vendor update dispatch cap per tick, default 200)',
+  // OFFLINE_*
+  OFFLINE_DETECTOR_CHUNK_SIZE: 'worker throughput knob',
+  OFFLINE_DETECTOR_MAX_DEVICES_PER_RUN: 'worker throughput knob',
+  OFFLINE_DETECTOR_REEVAL_HORIZON_MINUTES: 'timing knob',
+  OFFLINE_DETECTOR_WORKER_CONCURRENCY: 'worker throughput knob',
+  // ORG_*
+  ORG_ARCHIVE_DEFAULT_RETENTION_DAYS: 'data retention window',
+  ORG_MERGE_FENCE_DRAIN_MS: 'timing knob',
+  ORG_MERGE_MAX_ROWS: 'org merge safety limit',
+  // PAM_*
+  PAM_ACTUATOR_ENABLED: 'feature flag',
+  PAM_EVIDENCE_RETENTION_DAYS: 'retention TTL knob',
+  PAM_EVIDENCE_RETENTION_ENABLED: 'retention job kill switch',
+  PAM_OWNERSHIP_EPOCH_TRANSFER: 'feature flag (also needs the owner-only DB switch)',
+  PAM_PENDING_REQUEST_TTL_MINUTES: 'timing knob',
+  // PARTNER_*
+  PARTNER_API_ENROLLMENT_KEY_MAX_TTL_MINUTES: 'timing knob',
+  PARTNER_API_ENROLLMENT_KEY_WRITE_PARTNER_RATE_LIMIT: 'rate limit knob',
+  PARTNER_API_ENROLLMENT_KEY_WRITE_RATE_LIMIT: 'rate limit knob',
+  PARTNER_API_IDEMPOTENCY_RETENTION_DAYS: 'data retention window',
+  PARTNER_API_IDEMPOTENCY_RETENTION_ENABLED: 'cleanup job toggle',
+  PARTNER_API_TICKET_WRITE_PARTNER_RATE_LIMIT_PER_HOUR: 'rate limit knob',
+  PARTNER_API_TICKET_WRITE_RATE_LIMIT_PER_HOUR: 'rate limit knob',
+  PARTNER_MEETING_URL: 'partner onboarding copy link',
+  PARTNER_TRUST_MODE: 'hosted partner trust mode',
+  // PATH
+  PATH: 'OS env passed to the Agent SDK CLI by a dev spike script',
+  // PATCH_*
+  PATCH_REPORT_ORPHAN_MIN_AGE_MS: 'timing knob',
+  PATCH_REPORT_RETENTION_DAYS: 'data retention window',
+  PATCH_REPORT_STORAGE_PATH: 'filesystem path',
+  PATCH_TOMBSTONE_PRUNE_AFTER_HOURS: 'data retention window',
+  // PENDING_*
+  PENDING_ACCOUNT_MEETING_LABEL: 'partner onboarding copy',
+  PENDING_ACCOUNT_MEETING_URL: 'partner onboarding copy link',
+  // PERIPHERAL_*
+  PERIPHERAL_ANOMALY_BLOCKED_THRESHOLD: 'alert threshold',
+  // PORTAL_*
+  PORTAL_COOKIE_FORCE_SECURE: 'cookie policy override',
+  PORTAL_COOKIE_SAME_SITE: 'cookie policy override',
+  PORTAL_STATE_BACKEND: 'portal rate-limit store selector',
+  // PRE_*
+  PRE_ASSIGNMENT_ENROLLMENT_ENABLED: 'pre-assignment enrollment rollout flag',
+  // PROCESS_*
+  PROCESS_SAMPLE_RETENTION_DAYS: 'data retention window',
+  // PROMPT_*
+  PROMPT_HOST_ENABLED_KINDS: 'on-device prompt kinds rollout flag / kill switch (#10190)',
+  // PROVISION_*
+  PROVISION_HANDLE_TTL_MINUTES: 'timing knob',
+  // PUBLIC_*
+  PUBLIC_DOWNLOAD_KEY_MAX_TTL_MINUTES: 'public download key TTL cap',
+  // READINESS_*
+  READINESS_CACHE_TTL_MS: 'timing knob',
+  READINESS_PROBE_TIMEOUT_MS: 'timing knob',
+  // RECORDING_*
+  RECORDING_URL_ALLOWED_ORIGINS: 'validation allowlist',
+  // RECOVERY_*
+  RECOVERY_MEDIA_WORK_DIR: 'filesystem path',
+  RECOVERY_MINISIGN_BIN: 'filesystem path',
+  // REDIS_MEMORY_*
+  REDIS_MEMORY_CAPTURE_THROTTLE_MS: 'timing knob',
+  REDIS_MEMORY_MONITOR_DISABLED: 'worker job kill switch',
+  REDIS_MEMORY_MONITOR_INTERVAL_MS: 'timing knob',
+  REDIS_MEMORY_WARN_RATIO: 'alert threshold tuning',
+  // REFRESH_*
+  REFRESH_FAMILY_ABSOLUTE_TTL_DAYS: 'timing knob',
+  REFRESH_ROTATION_GRACE_SECONDS: 'timing knob',
+  // RELIABILITY_*
+  RELIABILITY_HISTORY_RETENTION_BATCH_SIZE: 'retention sweep batch knob',
+  RELIABILITY_HISTORY_RETENTION_DAYS: 'data retention window',
+  RELIABILITY_HISTORY_RETENTION_MAX_BATCHES: 'retention sweep batch knob',
+  // REMOTE_*
+  REMOTE_ACCESS_ADMISSION_MODE: 'remote access rollout mode',
+  REMOTE_DESKTOP_FENCE_REQUIRED: 'remote access rollout flag',
+  REMOTE_WS_AUTH_MODE: 'remote access rollout mode',
+  REMOTE_WS_LEGACY_TICKET_WRITER_DRAINED_AT: 'remote access rollout marker',
+  REMOTE_WS_LEGACY_VIEWER_ISSUER_DRAINED_AT: 'remote access rollout marker',
+  REMOTE_WS_REDIS_TOPOLOGY: 'remote access topology assertion',
+  // REMOVED_*
+  REMOVED_DEVICE_PURGE_MAX_PER_ORG_PER_RUN: 'worker throughput knob',
+  // RESEARCH_*
+  RESEARCH_EVAL_ALLOW_REMOTE_DB: 'dev script safety override (services/llm/__scripts__)',
+  RESEARCH_EVAL_ALLOW_WRITES: 'dev script safety gate (services/llm/__scripts__)',
+  // REQUIRE_*
+  REQUIRE_DB_ON_STARTUP: 'boot strictness flag',
+  REQUIRE_REDIS_ON_STARTUP: 'boot strictness flag',
+  // RESTORE_*
+  RESTORE_POINT_ATTEMPT_RETENTION_BATCH_SIZE: 'retention sweep batch knob',
+  RESTORE_POINT_ATTEMPT_RETENTION_DAYS: 'data retention window',
+  RESTORE_POINT_ATTEMPT_RETENTION_MAX_BATCHES: 'retention sweep batch knob',
+  WAKE_ATTEMPT_RETENTION_BATCH_SIZE: 'retention sweep batch knob',
+  WAKE_ATTEMPT_RETENTION_DAYS: 'data retention window',
+  WAKE_ATTEMPT_RETENTION_MAX_BATCHES: 'retention sweep batch knob',
+  WEBHOOK_DELIVERY_RETENTION_BATCH_SIZE: 'retention sweep batch knob',
+  WEBHOOK_DELIVERY_RETENTION_DAYS: 'data retention window',
+  WEBHOOK_DELIVERY_RETENTION_MAX_BATCHES: 'retention sweep batch knob',
+  DNS_SECURITY_RETENTION_BATCH_SIZE: 'retention sweep batch knob',
+  DNS_SECURITY_RETENTION_DAYS_DEFAULT: 'data retention window',
+  DNS_SECURITY_RETENTION_MAX_BATCHES: 'retention sweep batch knob',
+  // S1_*
+  S1_SYNC_MAX_PAGES: 'sync paging limit',
+  // S3_*
+  S3_PRESIGN_TTL: 'timing knob',
+  // SCREENSHOT_*
+  SCREENSHOT_MAX_BYTES: 'screenshot size cap',
+  SCREENSHOT_MAX_BYTES_PER_DEVICE: 'screenshot storage quota knob',
+  SCREENSHOT_MAX_PER_DEVICE: 'screenshot storage quota knob',
+  SCREENSHOT_ORPHAN_MIN_AGE_MS: 'timing knob',
+  SCREENSHOT_STORAGE_DIR: 'filesystem path',
+  // SCRIPT_*
+  SCRIPT_VERIFY_RECONCILE_MIN_AGE_MINUTES: 'timing knob',
+  // SECURITY_*
+  SECURITY_POSTURE_WORKER_CONCURRENCY: 'worker throughput knob',
+  SECURITY_SCAN_DEVICE_CONCURRENCY_CAP: 'worker throughput knob',
+  SECURITY_SCAN_MANUAL_QUEUE_TTL_MINUTES: 'timing knob',
+  SECURITY_SCAN_ORG_CONCURRENCY_CAP: 'worker throughput knob',
+  SECURITY_SCAN_ORG_QUEUE_BACKPRESSURE_LIMIT: 'worker throughput knob',
+  SECURITY_SCAN_THROTTLE_REQUEUE_SECONDS: 'timing knob',
+  SECURITY_SCAN_WORKER_CONCURRENCY: 'worker throughput knob',
+  SECURITY_SCORE_CHANGE_EVENT_LIMIT: 'worker throughput knob',
+  SECURITY_SCORE_CHANGE_PUBLISH_CONCURRENCY: 'worker throughput knob',
+  SECURITY_SWEEP_MAX_ACTIVE_PER_ORG: 'IOC sweep cap (#6263 W05)',
+  SECURITY_SWEEP_MAX_DEVICES: 'IOC sweep cap (#6263 W05)',
+  SECURITY_SWEEP_MFA_DEVICE_THRESHOLD: 'IOC sweep MFA threshold (#6263 W05)',
+  SECURITY_SWEEP_PARTNER_RUNNING_CAP: 'worker throughput knob',
+  SECURITY_SWEEP_PUMP_BATCH: 'worker throughput knob',
+  SECURITY_SWEEP_PUMP_INTERVAL_MS: 'timing knob',
+  SECURITY_SWEEP_RUNNING_GRACE_MINUTES: 'timing knob',
+  SECURITY_SWEEP_TTL_HOURS_DEFAULT: 'timing knob',
+  // SENSITIVE_*
+  SENSITIVE_DATA_DEVICE_CONCURRENCY_CAP: 'worker throughput knob',
+  SENSITIVE_DATA_ORG_CONCURRENCY_CAP: 'worker throughput knob',
+  SENSITIVE_DATA_ORG_QUEUE_BACKPRESSURE_LIMIT: 'worker throughput knob',
+  SENSITIVE_DATA_REQUIRE_SECOND_APPROVAL: 'approval policy flag',
+  SENSITIVE_DATA_SECOND_APPROVAL_TOKEN: 'approval policy secret (names only)',
+  SENSITIVE_DATA_THROTTLE_REQUEUE_SECONDS: 'timing knob',
+  SENSITIVE_DATA_WORKER_CONCURRENCY: 'worker throughput knob',
+  // SERVICE_*
+  SERVICE_PROCESS_CHECK_RESULTS_RETENTION_DAYS: 'data retention window',
+  // SHUTDOWN_*
+  SHUTDOWN_DRAIN_MS: 'timing knob',
+  // SIGNUP_*
+  SIGNUP_ALLOWED_EMAIL_DOMAINS: 'signup policy list',
+  SIGNUP_BUSINESS_EMAIL_CONTACT_URL: 'signup policy copy link',
+  SIGNUP_EXTRA_CONSUMER_EMAIL_DOMAINS: 'signup policy list',
+  SIGNUP_REQUIRE_BUSINESS_EMAIL: 'signup policy flag',
+  // SMTP_*
+  // SNMP_*
+  SNMP_METRICS_RETENTION_BATCH_SIZE: 'retention sweep batch knob',
+  SNMP_METRICS_RETENTION_DAYS: 'data retention window',
+  SNMP_METRICS_RETENTION_MAX_BATCHES: 'retention sweep batch knob',
+  // SOFTWARE_*
+  SOFTWARE_INSTALL_REMEDIATION_MAX_ATTEMPTS: 'remediation retry limit',
+  SOFTWARE_INSTALL_REMEDIATION_MAX_PER_PASS: 'worker throughput knob',
+  SOFTWARE_REMEDIATION_REQUEST_CLEANUP_ENABLED: 'cleanup job toggle',
+  SOFTWARE_REMEDIATION_REQUEST_RETENTION_HOURS: 'data retention window',
+  SOFTWARE_UPLOAD_SESSION_CLEANUP_ENABLED: 'cleanup job toggle',
+  SOFTWARE_UPLOAD_SESSION_IDLE_TTL_HOURS: 'timing knob',
+  SOFTWARE_UPLOAD_SESSION_MAX_AGE_HOURS: 'timing knob',
+  // SSO_*
+  SSO_DOMAIN_VERIFICATION_STRICT: 'SSO policy flag',
+  // STALE_*
+  STALE_REAPER_MAX_PER_RUN: 'worker throughput knob',
+  // SYNTHETIC_*
+  SYNTHETIC_TEST_IP_ALLOWLIST: 'synthetic monitor access',
+  SYNTHETIC_TEST_TOKEN: 'synthetic monitor secret (names only)',
+  // TD_*
+  TD_SYNNEX_DIGITAL_BRIDGE_TIMEOUT_MS: 'timing knob',
+  // TENANT_*
+  TENANT_TOOL_MAX_IN_FLIGHT_PER_ORG: 'tenant tool in-flight cap',
+  // TERMINAL_*
+  TERMINAL_INPUT_MAX_BYTES_PER_MIN: 'rate limit knob',
+  TERMINAL_INPUT_MAX_MESSAGES_PER_MIN: 'rate limit knob',
+  // TICKET_*
+  TICKET_IMPORT_GLOBAL_CONCURRENCY: 'worker concurrency knob',
+  TICKET_IMPORT_LEASE_MS: 'timing knob',
+  TICKET_IMPORT_MAX_BYTES_PER_HOUR: 'rate limit knob',
+  TICKET_IMPORT_MAX_CLOCK_SKEW_MS: 'timing knob',
+  TICKET_IMPORT_MAX_ISSUES_PER_RUN: 'report size cap',
+  TICKET_IMPORT_MAX_TICKET_BYTES: 'size cap',
+  TICKET_IMPORT_SLICE_MS: 'timing knob',
+  TICKET_IMPORT_SOURCE_CONCURRENCY: 'outbound concurrency knob',
+  TICKET_IMPORT_SOURCE_TIMEOUT_MS: 'timing knob',
+  TICKET_IMPORT_WORKER_CONCURRENCY: 'worker concurrency knob',
+  TICKET_OUTBOX_RETENTION_BATCH_SIZE: 'retention sweep batch knob',
+  TICKET_OUTBOX_RETENTION_DAYS: 'data retention window',
+  TICKET_OUTBOX_RETENTION_MAX_BATCHES: 'retention sweep batch knob',
+  // TOPOLOGY_*
+  TOPOLOGY_DISABLED: 'feature kill switch',
+  // TRUST_*
+  TRUST_ACTION_TOKEN_SECRET: 'hosted partner-trust secret (names only)',
+  // TURN_*
+  TURN_CREDENTIAL_MINT_LIMIT_PER_WINDOW: 'rate limit knob',
+  TURN_CREDENTIAL_MINT_WINDOW_SECONDS: 'rate limit knob',
+  TURN_CREDENTIAL_TTL_SECONDS: 'timing knob',
+  TZ: 'process time zone; switched per test by testUtils/hostTimeZone.ts',
+  // UNINSTALL_*
+  UNINSTALL_INTENT_DECOMMISSION_HOURS: 'timing knob',
+  UNINSTALL_INTENT_REAP_CHUNK_SIZE: 'worker throughput knob',
+  UNINSTALL_INTENT_REAP_INTERVAL_MS: 'timing knob',
+  UNINSTALL_INTENT_REAP_MAX_DEVICES_PER_RUN: 'worker throughput knob',
+  // USER_*
+  USER_RISK_ON_DEMAND_DEDUPE_WINDOW_MS: 'timing knob',
+  USER_RISK_RETENTION_BATCH_SIZE: 'retention sweep batch knob',
+  USER_RISK_RETENTION_CRON: 'job schedule override',
+  USER_RISK_RETENTION_DAYS: 'data retention window',
+  USER_RISK_RETENTION_MAX_BATCHES: 'retention sweep batch knob',
+  USER_RISK_SCAN_CRON: 'job schedule override',
+  USER_RISK_TRAINING_DEDUP_HOURS: 'timing knob',
+  USER_RISK_WORKER_CONCURRENCY: 'worker throughput knob',
+  WORKER_STARTUP_CONCURRENCY: 'bounded background worker initialization throughput',
+  // VIEWER_*
+  VIEWER_BINARY_DIR: 'filesystem path',
+  // VITEST
+  VITEST: 'test-runner hook (skips server bootstrap on import)',
+  // WINGET_*
+  WINGET_BOOTSTRAP_ARTIFACT_DIR: 'filesystem path',
+  // WIN_*
+  WIN_TEST_VM_SSH_KEY: 'AI patch-test lab VM',
+  WIN_TEST_VM_TARGET: 'AI patch-test lab VM',
+  // WS_*
+  WS_TICKETS_REQUIRE_REDIS: 'remote access strictness flag',
+  WS_TICKET_BIND_IP: 'remote access ticket binding flag',
+};

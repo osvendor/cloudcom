@@ -18,25 +18,47 @@ type pendingResponse struct {
 	ch           chan *ipc.Envelope
 	expectedType string
 	validate     func(*ipc.Envelope) error
+	// discard marks a tombstone left by sendCommandAbandoningLateReply: the
+	// sender stopped waiting at abandonedAt, so HandleResponse consumes a
+	// late reply (keeping it from being forwarded as unsolicited) and drops
+	// the entry. A tombstone has no ch.
+	discard     bool
+	abandonedAt time.Time
 }
 
 // Session represents a connected user helper with verified identity.
 type Session struct {
-	UID            uint32 // Numeric UID (0 on Windows; kept for logging/compat)
-	IdentityKey    string // Platform identity: UID string on Unix, SID on Windows
-	Username       string
-	DisplayEnv     string
-	SessionID      string
-	PID            int // OS process ID of the helper process
-	Capabilities   *ipc.Capabilities
-	TCCStatus      *ipc.TCCStatus
-	AllowedScopes  []string
-	WinSessionID   string         // Windows session ID string (e.g., "1", "2") for targeting
-	HelperRole     ipc.HelperRole // "system" or "user" — determines scopes and capabilities
-	BinaryKind     string
-	DesktopContext string
-	ConnectedAt    time.Time
-	LastSeen       time.Time
+	UID           uint32 // Numeric UID (0 on Windows; kept for logging/compat)
+	IdentityKey   string // Platform identity: UID string on Unix, SID on Windows
+	Username      string
+	DisplayEnv    string
+	SessionID     string
+	PID           int // OS process ID of the helper process
+	Capabilities  *ipc.Capabilities
+	TCCStatus     *ipc.TCCStatus
+	AllowedScopes []string
+	WinSessionID  string // Windows session ID string (e.g., "1", "2") for targeting
+	// WinSessionVerified is true when WinSessionID came from the kernel (the
+	// peer PID's session) rather than the helper's self-report. Caller
+	// verification (#6354) only targets verified sessions on Windows.
+	WinSessionVerified bool
+	HelperRole         ipc.HelperRole // "system" or "user" — determines scopes and capabilities
+	BinaryKind         string
+	DesktopContext     string
+	// ConsentProtocolVersion is the consent prompt exchange this helper
+	// advertised at auth (ipc.ConsentProtocolVersion), 0 for version 1. Set
+	// once at auth by consentProtocolFromAuth, never changed afterwards.
+	ConsentProtocolVersion int
+	// SupportsTargetedPamDismiss is true when this SYSTEM helper advertised it
+	// can dismiss one specific consent.exe (ipc.PamDismissConsentRequest.Instance).
+	// Set once at auth by targetedPamDismissFromAuth, never changed afterwards.
+	SupportsTargetedPamDismiss bool
+	// SupportsPamDialogClose is true when this SYSTEM helper advertised it
+	// honours pam_close_dialog (#10370). Set once at auth by
+	// pamDialogCloseFromAuth, never changed afterwards.
+	SupportsPamDialogClose bool
+	ConnectedAt            time.Time
+	LastSeen               time.Time
 
 	conn    *ipc.Conn
 	mu      sync.Mutex
@@ -51,6 +73,29 @@ type Session struct {
 
 	broker      *Broker
 	peerProcess *ownedPeerProcessRef
+
+	// Prompt host advertisement (#10190), set once at auth by
+	// applyAuthAdvertisements and never changed afterwards: the clamped
+	// prompt protocol, the granted "<kind>@<n>" entries, and the renderer
+	// build version. Read through PromptProtocol / PromptKindAds /
+	// PromptKindVersion / RendererVersion.
+	promptProtocol  int
+	promptKinds     []string
+	rendererVersion string
+	// uiLocale is the UI language the helper probed (AuthRequest.UILocale,
+	// sanitized by uiLocaleFromAuth); set once at auth, read through UILocale.
+	uiLocale string
+	// agentHandlesTCCNotice is what this session's auth response told the
+	// helper (AuthResponse.AgentHandlesTCCNotice, #10190 W04): the agent
+	// shows the macOS permission notice from this helper's tcc_status.
+	agentHandlesTCCNotice atomic.Bool
+	// tccForward orders this session's tcc_status reports to the agent's
+	// handler (tcc_notice.go).
+	tccForward tccForwardQueue
+
+	// helperLog caps relayed helper_log records (#9266); see helperLogLimiter.
+	helperLogOnce sync.Once
+	helperLog     *ipc.HelperLogCap
 }
 
 // NewSession creates a new session for a verified user helper connection.
@@ -111,6 +156,20 @@ var ErrDuplicateCommand = fmt.Errorf("duplicate in-flight command id")
 // SendCommand sends a command to the user helper and waits for a response.
 // Returns the response envelope or an error if the timeout is reached.
 func (s *Session) SendCommand(id, cmdType string, payload any, timeout time.Duration) (*ipc.Envelope, error) {
+	wait, err := s.startCommand(id, cmdType, payload)
+	if err != nil {
+		return nil, err
+	}
+	return wait(timeout)
+}
+
+// startCommand registers the pending response for id, sends the command, and
+// returns a function that waits for the correlated reply. The send happens
+// before startCommand returns, so a caller that waits on another goroutine
+// keeps the same on-the-wire ordering as a synchronous SendCommand. The
+// returned wait must be called exactly once: it is what removes the pending
+// entry. On error nothing is left registered.
+func (s *Session) startCommand(id, cmdType string, payload any) (func(timeout time.Duration) (*ipc.Envelope, error), error) {
 	ch := make(chan *ipc.Envelope, 1)
 	s.mu.Lock()
 	if s.closed {
@@ -129,16 +188,25 @@ func (s *Session) SendCommand(id, cmdType string, payload any, timeout time.Dura
 	done := s.done
 	s.mu.Unlock()
 
-	defer func() {
+	unregister := func() {
 		s.mu.Lock()
 		delete(s.pending, id)
 		s.mu.Unlock()
-	}()
+	}
 
 	if err := s.conn.SendTyped(id, cmdType, payload); err != nil {
+		unregister()
 		return nil, err
 	}
 
+	return func(timeout time.Duration) (*ipc.Envelope, error) {
+		defer unregister()
+		return awaitResponse(ch, done, timeout)
+	}, nil
+}
+
+// awaitResponse waits for the reply registered by startCommand.
+func awaitResponse(ch chan *ipc.Envelope, done <-chan struct{}, timeout time.Duration) (*ipc.Envelope, error) {
 	select {
 	case resp, ok := <-ch:
 		if !ok || resp == nil {
@@ -146,6 +214,9 @@ func (s *Session) SendCommand(id, cmdType string, payload any, timeout time.Dura
 		}
 		return resp, nil
 	case <-done:
+		if resp := deliveredResponse(ch); resp != nil {
+			return resp, nil
+		}
 		return nil, fmt.Errorf("session closed while waiting for response")
 	case <-time.After(timeout):
 		return nil, ErrCommandTimeout
@@ -219,12 +290,7 @@ func (s *Session) sendCommandWithQuiescence(id, cmdType string, payload any, tim
 				finish(resp)
 			case <-done:
 				// Prefer a response already delivered concurrently with teardown.
-				select {
-				case resp := <-ch:
-					finish(resp)
-				default:
-					finish(nil)
-				}
+				finish(deliveredResponse(ch))
 			}
 		}()
 	}
@@ -245,12 +311,97 @@ func (s *Session) sendCommandWithQuiescence(id, cmdType string, payload any, tim
 		finish(resp)
 		return resp, nil, nil
 	case <-done:
+		if resp := deliveredResponse(ch); resp != nil {
+			finish(resp)
+			return resp, nil, nil
+		}
 		finish(nil)
 		return nil, quiesced, fmt.Errorf("session closed while waiting for response")
 	case <-timer.C:
 		waitForLateResponse()
 		return nil, quiesced, ErrCommandTimeout
 	}
+}
+
+// deliveredResponse returns a response RecvLoop already placed in ch, or nil.
+//
+// Callers use it after observing session close. RecvLoop delivers a helper's
+// reply into the buffered channel before it can see the helper's EOF, so when
+// the helper answers and then exits (a backup helper acking a run, sending its
+// terminal result and closing), BOTH the response channel and done are ready
+// by the time the waiting goroutine is scheduled. select chooses among ready
+// cases at random, so without this check a command the helper actually
+// answered is reported as "session closed while waiting for response" — which
+// for an async backup run turns a completed job into a failure (#6918).
+func deliveredResponse(ch <-chan *ipc.Envelope) *ipc.Envelope {
+	select {
+	case resp := <-ch:
+		return resp
+	default:
+		return nil
+	}
+}
+
+// CommandStream is an in-flight command whose helper may answer its ID more
+// than once (the consent prompt's presentation acknowledgement, then its
+// terminal result). Unlike SendCommand, the registration survives the first
+// reply and stays until Close; replies arriving after Close are not routed.
+type CommandStream struct {
+	session *Session
+	id      string
+	ch      chan *ipc.Envelope
+	done    <-chan struct{}
+	once    sync.Once
+}
+
+// Envelopes delivers every reply correlated to the stream's ID, in arrival
+// order. It is never closed; select on Done to observe the helper going away
+// (and drain Envelopes first — a reply can land just before the close).
+func (cs *CommandStream) Envelopes() <-chan *ipc.Envelope { return cs.ch }
+
+// Done is closed when the helper session is closed.
+func (cs *CommandStream) Done() <-chan struct{} { return cs.done }
+
+// Close drops the registration. Safe to call more than once.
+func (cs *CommandStream) Close() {
+	cs.once.Do(func() {
+		cs.session.mu.Lock()
+		if current, ok := cs.session.pending[cs.id]; ok && current.ch == cs.ch {
+			delete(cs.session.pending, cs.id)
+		}
+		cs.session.mu.Unlock()
+	})
+}
+
+// commandStreamBuffer bounds the replies a stream holds before the reader
+// drains them. The consent exchange needs two; extras are dropped (and
+// logged) by HandleResponse rather than blocking the receive loop.
+const commandStreamBuffer = 4
+
+// OpenCommandStream sends cmdType with the given id and keeps the id
+// registered for replies until the returned stream is closed. The caller owns
+// all timing: nothing here times out.
+func (s *Session) OpenCommandStream(id, cmdType string, payload any) (*CommandStream, error) {
+	ch := make(chan *ipc.Envelope, commandStreamBuffer)
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("session closed")
+	}
+	if _, exists := s.pending[id]; exists {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("%w: %q (session %q)", ErrDuplicateCommand, id, s.SessionID)
+	}
+	s.pending[id] = pendingResponse{ch: ch}
+	done := s.done
+	s.mu.Unlock()
+
+	cs := &CommandStream{session: s, id: id, ch: ch, done: done}
+	if err := s.conn.SendTyped(id, cmdType, payload); err != nil {
+		cs.Close()
+		return nil, err
+	}
+	return cs, nil
 }
 
 // SendNotify sends a fire-and-forget message (no response expected).
@@ -275,6 +426,10 @@ func (s *Session) HandleResponse(env *ipc.Envelope) bool {
 			)
 			return true
 		}
+		if pending.discard {
+			s.discardLateReply(env, pending.abandonedAt)
+			return true
+		}
 		if pending.validate != nil && env.Error == "" {
 			if err := pending.validate(env); err != nil {
 				log.Warn("response payload validation failed, dropping",
@@ -286,9 +441,24 @@ func (s *Session) HandleResponse(env *ipc.Envelope) bool {
 				return true
 			}
 		}
+		// Deliver under s.mu, re-reading the registration: abandonPending may
+		// have swapped in a tombstone since the read above, and a reply sent to
+		// the abandoned channel after its last check would be lost unlogged and
+		// strand the tombstone. The send never blocks, so holding s.mu is cheap.
+		s.mu.Lock()
+		if current, still := s.pending[env.ID]; still && current.discard {
+			s.mu.Unlock()
+			s.discardLateReply(env, current.abandonedAt)
+			return true
+		}
+		dropped := false
 		select {
 		case pending.ch <- env:
 		default:
+			dropped = true
+		}
+		s.mu.Unlock()
+		if dropped {
 			log.Warn("response channel full, dropping", "id", env.ID)
 		}
 		return true
@@ -480,6 +650,8 @@ func expectedResponseType(cmdType string) string {
 		return ipc.TypePamDialogResult
 	case ipc.TypePamDismissConsent:
 		return ipc.TypePamDismissConsentResult
+	case ipc.TypePamCloseDialog:
+		return ipc.TypePamCloseDialogResult
 	case ipc.TypeClipboardGet:
 		return ipc.TypeClipboardData
 	case ipc.TypeClipboardSet:
@@ -494,6 +666,12 @@ func expectedResponseType(cmdType string) string {
 		return ipc.TypeLaunchResult
 	case backupipc.TypeBackupCommand:
 		return backupipc.TypeBackupResult
+	case ipc.TypeCallerVerifyRequest:
+		return ipc.TypeCallerVerifyResponse
+	case ipc.TypeMessageShow:
+		return ipc.TypeMessagePresented
+	case ipc.TypeChatOpen, ipc.TypeChatMessage:
+		return ipc.TypeChatPresented
 	default:
 		return ""
 	}
@@ -501,6 +679,24 @@ func expectedResponseType(cmdType string) string {
 
 func responseValidator(cmdType string, payload any) func(*ipc.Envelope) error {
 	switch cmdType {
+	case ipc.TypeCallerVerifyRequest:
+		// Only an offered number, not_me or timeout is a legal answer. A
+		// malformed answer is dropped here, so the caller times out (never
+		// approves) instead of acting on it.
+		req, ok := payload.(ipc.CallerVerifyRequest)
+		if !ok {
+			return func(*ipc.Envelope) error { return fmt.Errorf("caller_verify request payload has unexpected type") }
+		}
+		return func(env *ipc.Envelope) error {
+			var answer ipc.CallerVerifyResponse
+			if err := json.Unmarshal(env.Payload, &answer); err != nil {
+				return fmt.Errorf("unmarshal caller_verify response: %w", err)
+			}
+			if !req.AnswerAllowed(answer.Choice) {
+				return fmt.Errorf("caller_verify response carries an unoffered choice")
+			}
+			return nil
+		}
 	case ipc.TypeCommand:
 		req, ok := payload.(ipc.IPCCommand)
 		if !ok || req.CommandID == "" {

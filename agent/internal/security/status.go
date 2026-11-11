@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/breeze-rmm/agent/internal/config"
+	"github.com/breeze-rmm/agent/internal/procspawn"
 )
 
 // ErrNotSupported is returned when platform-specific operations are unavailable.
@@ -35,6 +36,14 @@ type AVProduct struct {
 }
 
 // SecurityStatus is the agent payload for endpoint security posture.
+//
+// RealTimeProtection and FirewallEnabled are nil (omitted) when the collector
+// failed, so the API stores "unknown" instead of a fabricated false that fires
+// the antivirus not_protected/realtime_disabled checks (#7965). A genuine false
+// is still sent.
+//
+// FirewallStatus is "enabled", "disabled" or "unsupported", and is omitted when
+// the read failed. FirewallStatusReason says why a host is unsupported (#10909).
 type SecurityStatus struct {
 	DeviceID                       string      `json:"deviceId"`
 	DeviceName                     string      `json:"deviceName"`
@@ -46,9 +55,11 @@ type SecurityStatus struct {
 	DefinitionsUpdatedAt           string      `json:"definitionsDate,omitempty"`
 	LastScanAt                     string      `json:"lastScan,omitempty"`
 	LastScanType                   string      `json:"lastScanType,omitempty"`
-	RealTimeProtection             bool        `json:"realTimeProtection"`
+	RealTimeProtection             *bool       `json:"realTimeProtection,omitempty"`
 	ThreatCount                    int         `json:"threatCount"`
-	FirewallEnabled                bool        `json:"firewallEnabled"`
+	FirewallEnabled                *bool       `json:"firewallEnabled,omitempty"`
+	FirewallStatus                 string      `json:"firewallStatus,omitempty"`
+	FirewallStatusReason           string      `json:"firewallStatusReason,omitempty"`
 	EncryptionStatus               string      `json:"encryptionStatus"`
 	EncryptionDetails              any         `json:"encryptionDetails,omitempty"`
 	LocalAdminSummary              any         `json:"localAdminSummary,omitempty"`
@@ -84,6 +95,11 @@ func normalizeOS(goos string) string {
 }
 
 func defaultDataDir() string {
+	// A support session keeps all files (a quarantine included) in its
+	// private folder, never the installed agent's machine-wide one (#7629).
+	if config.UserWorkspaceActive() {
+		return config.GetDataDir()
+	}
 	switch runtime.GOOS {
 	case "windows":
 		programData := os.Getenv("ProgramData")
@@ -111,6 +127,28 @@ func providerFromName(name string) string {
 	// "Bitdefender ..." name isn't misread as Microsoft Defender (#2075).
 	case strings.Contains(lower, "bitdefender"):
 		return "bitdefender"
+	// Vendor-name matches with no overlap with the broad cases below. They sit
+	// ahead of "defender" so a product name that also carries that word can't be
+	// misread as Microsoft Defender (#7551).
+	case strings.Contains(lower, "emsisoft"):
+		return "emsisoft"
+	case strings.Contains(lower, "webroot"):
+		return "webroot"
+	// Trend Micro Apex One / OfficeScan / Worry-Free / Vision One (#8171).
+	// "trend" alone is too common, so require the vendor name.
+	case strings.Contains(lower, "trend micro"), strings.Contains(lower, "trendmicro"):
+		return "trend_micro"
+	// CylancePROTECT was rebranded Aurora Endpoint Defense, but Windows Security
+	// Center still registers it as "CylancePROTECT" (#9178).
+	case strings.Contains(lower, "cylance"):
+		return "cylance"
+	// WithSecure is F-Secure's business brand; older agents still register as
+	// "F-Secure ...".
+	case strings.Contains(lower, "withsecure"), strings.Contains(lower, "f-secure"):
+		return "withsecure"
+	// ThreatDown is Malwarebytes' business rebrand and runs the same engine.
+	case strings.Contains(lower, "threatdown"):
+		return "malwarebytes"
 	case strings.Contains(lower, "defender"):
 		return "windows_defender"
 	case strings.Contains(lower, "sophos"):
@@ -121,13 +159,37 @@ func providerFromName(name string) string {
 		return "crowdstrike"
 	case strings.Contains(lower, "malwarebytes"):
 		return "malwarebytes"
-	case strings.Contains(lower, "eset"):
+	case containsWord(lower, "eset"):
 		return "eset"
 	case strings.Contains(lower, "kaspersky"):
 		return "kaspersky"
 	default:
 		return "other"
 	}
+}
+
+// containsWord reports whether word occurs in s with no ASCII letter directly
+// before or after it. "eset" is short enough to appear inside unrelated product
+// names ("Preset", "Reset"), so a plain substring match misattributes them to
+// ESET (#7551). Digits and punctuation still count as boundaries, so
+// "eset_endpoint" and "ESET-NOD32" match.
+func containsWord(s, word string) bool {
+	for start := 0; ; {
+		i := strings.Index(s[start:], word)
+		if i < 0 {
+			return false
+		}
+		i += start
+		end := i + len(word)
+		if (i == 0 || !isASCIILetter(s[i-1])) && (end == len(s) || !isASCIILetter(s[end])) {
+			return true
+		}
+		start = i + 1
+	}
+}
+
+func isASCIILetter(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
 }
 
 // resolveWSCPrimary picks the Windows Security Center product that owns the
@@ -159,8 +221,8 @@ func resolveWSCPrimary(products []AVProduct) (AVProduct, bool) {
 // only source reporting active real-time protection. It must NOT when another
 // registered product already supplied both the provider and the
 // real-time-protection value: provider "other" is a real attribution for a
-// registered product whose display name we don't map (CylancePROTECT, for
-// example), not a "nothing found" sentinel. Treating it as one relabelled a
+// registered product whose display name we don't map, not a "nothing found"
+// sentinel. Treating it as one relabelled a
 // third-party product's real-time protection as Defender's, reporting
 // real_time_protection=true on a windows_defender row for a device where
 // Defender was fully disabled (#3593).
@@ -179,6 +241,9 @@ func latestScanTime(defenderStatus DefenderStatus) string {
 }
 
 func encryptionString(enabled bool, detectErr error) string {
+	if errors.Is(detectErr, ErrBitLockerUnavailable) {
+		return "unsupported"
+	}
 	if detectErr != nil {
 		return "unknown"
 	}
@@ -186,6 +251,20 @@ func encryptionString(enabled bool, detectErr error) string {
 		return "encrypted"
 	}
 	return "unencrypted"
+}
+
+// applyEncryptionPosture records the encryption read on status and returns
+// the error CollectStatus should report, if any. No BitLocker on this host is
+// a state ("unsupported"), not a collection failure (#10902).
+func applyEncryptionPosture(status *SecurityStatus, enabled bool, details map[string]any, detectErr error) error {
+	status.EncryptionStatus = encryptionString(enabled, detectErr)
+	if details != nil {
+		status.EncryptionDetails = details
+	}
+	if detectErr == nil || errors.Is(detectErr, ErrBitLockerUnavailable) {
+		return nil
+	}
+	return detectErr
 }
 
 func boolPtr(value bool) *bool {
@@ -550,18 +629,82 @@ func floatFromAny(value any) (float64, bool) {
 	return 0, false
 }
 
+// BitLocker enum values as Get-BitLockerVolume reports them. Windows
+// PowerShell 5.1's ConvertTo-Json serialises enums as their integer value
+// (-EnumsAsStrings is PowerShell 6+), so the raw JSON can carry 6 rather than
+// "XtsAes128" (#9608). Numbering and names follow the BitLocker module's
+// enums, so an integer maps to the same name the [string] cast emits.
+var (
+	bitLockerEncryptionMethodNames = map[int]string{
+		0: "None",
+		1: "Aes128Diffuser",
+		2: "Aes256Diffuser",
+		3: "Aes128",
+		4: "Aes256",
+		5: "Hardware",
+		6: "XtsAes128",
+		7: "XtsAes256",
+	}
+	bitLockerVolumeStatusNames = map[int]string{
+		0: "FullyDecrypted",
+		1: "FullyEncrypted",
+		2: "EncryptionInProgress",
+		3: "DecryptionInProgress",
+		4: "EncryptionSuspended",
+		5: "DecryptionSuspended",
+		6: "FullyEncryptedWipeInProgress",
+		7: "FullyEncryptedWipeSuspended",
+	}
+	bitLockerProtectionStatusNames = map[int]string{
+		0: "Off",
+		1: "On",
+		2: "Unknown",
+	}
+)
+
+// bitLockerEnumName returns the enum name for a BitLocker field that may
+// arrive as a name, an integer, or a stringified integer. An integer outside
+// the table becomes "Unknown" rather than leaking a bare number into the UI.
+// A JSON bool (some callers coerce ProtectionStatus) maps to On/Off. Empty
+// or absent input returns "".
+func bitLockerEnumName(value any, names map[int]string) string {
+	if b, ok := value.(bool); ok {
+		if b {
+			return "On"
+		}
+		return "Off"
+	}
+	raw, ok := stringFromAny(value)
+	if !ok {
+		return ""
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return raw
+	}
+	if name, known := names[n]; known {
+		return name
+	}
+	return "Unknown"
+}
+
+// bitLockerVolumesPS casts the enum properties to [string] so Windows
+// PowerShell 5.1 emits their names; parseBitLockerVolumes still accepts the
+// integer form (#9608).
+const bitLockerVolumesPS = `Get-BitLockerVolume | Select-Object MountPoint,@{n='ProtectionStatus';e={[string]$_.ProtectionStatus}},@{n='EncryptionMethod';e={[string]$_.EncryptionMethod}},@{n='VolumeStatus';e={[string]$_.VolumeStatus}},EncryptionPercentage | ConvertTo-Json -Compress`
+
 func collectEncryptionDetailsWindows() (map[string]any, error) {
-	output, err := runCommand(
-		10*time.Second,
-		"powershell",
-		"-NoProfile",
-		"-NonInteractive",
-		"-Command",
-		"Get-BitLockerVolume | Select-Object MountPoint,ProtectionStatus,EncryptionMethod,VolumeStatus,EncryptionPercentage | ConvertTo-Json -Compress",
-	)
+	if bitLockerNotInstalled() {
+		return nil, ErrBitLockerUnavailable
+	}
+	output, err := runBitLockerPowerShell(10*time.Second, bitLockerVolumesPS)
 	if err != nil {
 		return nil, err
 	}
+	return parseBitLockerVolumes(output)
+}
+
+func parseBitLockerVolumes(output string) (map[string]any, error) {
 	parsed, err := parseJSONValue(output)
 	if err != nil {
 		return nil, err
@@ -571,19 +714,13 @@ func collectEncryptionDetailsWindows() (map[string]any, error) {
 	volumes := make([]map[string]any, 0, len(rawVolumes))
 	for _, item := range rawVolumes {
 		mountPoint, _ := stringFromAny(item["MountPoint"])
-		method, _ := stringFromAny(item["EncryptionMethod"])
+		method := bitLockerEnumName(item["EncryptionMethod"], bitLockerEncryptionMethodNames)
 		if method == "" {
-			method = "bitlocker"
+			method = "unknown"
 		}
-		volumeStatus, _ := stringFromAny(item["VolumeStatus"])
-
-		protected := false
-		if value, ok := boolFromAny(item["ProtectionStatus"]); ok {
-			protected = value
-		} else if value, ok := stringFromAny(item["ProtectionStatus"]); ok {
-			normalized := strings.ToLower(strings.TrimSpace(value))
-			protected = normalized == "on" || normalized == "protected" || normalized == "1"
-		}
+		volumeStatus := bitLockerEnumName(item["VolumeStatus"], bitLockerVolumeStatusNames)
+		protection := strings.ToLower(bitLockerEnumName(item["ProtectionStatus"], bitLockerProtectionStatusNames))
+		protected := protection == "on" || protection == "protected" || protection == "true"
 
 		entry := map[string]any{
 			"mount":     mountPoint,
@@ -624,66 +761,28 @@ func collectEncryptionDetailsDarwin() (map[string]any, error) {
 }
 
 func collectEncryptionDetailsLinux() (map[string]any, error) {
-	type lsblkNode struct {
-		Name       string      `json:"name"`
-		Type       string      `json:"type"`
-		Mountpoint string      `json:"mountpoint"`
-		Fstype     string      `json:"fstype"`
-		Children   []lsblkNode `json:"children"`
-	}
-	type lsblkPayload struct {
-		Blockdevices []lsblkNode `json:"blockdevices"`
-	}
-
-	output, err := runCommand(8*time.Second, "lsblk", "-J", "-o", "NAME,TYPE,MOUNTPOINT,FSTYPE")
+	report, err := collectLinuxEncryption()
 	if err != nil {
 		return nil, err
 	}
+	return linuxEncryptionDetails(report), nil
+}
 
-	var payload lsblkPayload
-	if err := json.Unmarshal([]byte(output), &payload); err != nil {
-		return nil, err
-	}
-
-	volumes := make([]map[string]any, 0)
-	var walk func(node lsblkNode, inheritedProtected bool)
-	walk = func(node lsblkNode, inheritedProtected bool) {
-		isProtected := inheritedProtected ||
-			strings.EqualFold(node.Type, "crypt") ||
-			strings.Contains(strings.ToLower(node.Fstype), "luks")
-
-		if strings.TrimSpace(node.Mountpoint) != "" {
-			method := "none"
-			if isProtected {
-				method = "luks"
-			}
-			volumes = append(volumes, map[string]any{
-				"mount":     node.Mountpoint,
-				"device":    node.Name,
-				"method":    method,
-				"protected": isProtected,
-			})
-		}
-
-		for _, child := range node.Children {
-			walk(child, isProtected)
-		}
-	}
-
-	for _, node := range payload.Blockdevices {
-		walk(node, false)
-	}
-
-	return map[string]any{
+func linuxEncryptionDetails(report linuxEncryptionReport) map[string]any {
+	details := map[string]any{
 		"source":  "lsblk",
-		"volumes": volumes,
-	}, nil
+		"volumes": report.Volumes,
+	}
+	if len(report.Warnings) > 0 {
+		details["warnings"] = report.Warnings
+	}
+	return details
 }
 
 func collectEncryptionDetails() (map[string]any, error) {
 	switch runtime.GOOS {
 	case "windows":
-		return collectEncryptionDetailsWindows()
+		return bitLockerDetailsProbe.Refresh()
 	case "darwin":
 		return collectEncryptionDetailsDarwin()
 	case "linux":
@@ -691,54 +790,6 @@ func collectEncryptionDetails() (map[string]any, error) {
 	default:
 		return nil, ErrNotSupported
 	}
-}
-
-func collectLocalAdminSummaryWindows() (map[string]any, error) {
-	output, err := runCommand(
-		10*time.Second,
-		"powershell",
-		"-NoProfile",
-		"-NonInteractive",
-		"-Command",
-		"Get-LocalGroupMember -Group 'Administrators' | Select-Object Name,ObjectClass,SID,PrincipalSource | ConvertTo-Json -Compress",
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	parsed, err := parseJSONValue(output)
-	if err != nil {
-		return nil, err
-	}
-
-	members := toObjectSlice(parsed)
-	accounts := make([]map[string]any, 0, len(members))
-	for _, member := range members {
-		username, _ := stringFromAny(member["Name"])
-		if username == "" {
-			continue
-		}
-		sid, _ := stringFromAny(member["SID"])
-		isBuiltIn := strings.HasSuffix(strings.TrimSpace(sid), "-500") ||
-			strings.EqualFold(username, "Administrator")
-		entry := map[string]any{
-			"username":   username,
-			"isBuiltIn":  isBuiltIn,
-			"enabled":    true,
-			"objectType": member["ObjectClass"],
-		}
-		if isBuiltIn {
-			entry["defaultAccount"] = true
-		}
-		accounts = append(accounts, entry)
-	}
-
-	return map[string]any{
-		"source":            "windows_local_group",
-		"adminCount":        len(accounts),
-		"localAccountCount": len(accounts),
-		"accounts":          accounts,
-	}, nil
 }
 
 func collectLocalAdminSummaryDarwin() (map[string]any, error) {
@@ -839,31 +890,6 @@ func collectLocalAdminSummary() (map[string]any, error) {
 	default:
 		return nil, ErrNotSupported
 	}
-}
-
-func collectPasswordPolicySummaryWindows() (map[string]any, error) {
-	output, err := runCommand(
-		10*time.Second,
-		"powershell",
-		"-NoProfile",
-		"-NonInteractive",
-		"-Command",
-		"$p=Get-CimInstance -ClassName Win32_AccountPolicy; [pscustomobject]@{minLength=[int]$p.MinPasswordLength;maxAgeDays=[int]$p.MaxPasswordAge.TotalDays;lockoutThreshold=[int]$p.LockoutThreshold;historyCount=[int]$p.PasswordHistorySize} | ConvertTo-Json -Compress",
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	parsed, err := parseJSONValue(output)
-	if err != nil {
-		return nil, err
-	}
-	record, ok := parsed.(map[string]any)
-	if !ok {
-		return nil, fmt.Errorf("unexpected windows password policy payload")
-	}
-	record["source"] = "win32_account_policy"
-	return record, nil
 }
 
 func parsePwPolicyDarwin(output string) map[string]any {
@@ -996,10 +1022,25 @@ func collectPasswordPolicySummaryLinux() (map[string]any, error) {
 	return result, nil
 }
 
+// collectPasswordPolicySummary is a fresh read (CIS checks and remediation
+// depend on it); it also refreshes the cache the security-status tick uses.
 func collectPasswordPolicySummary() (map[string]any, error) {
-	switch runtime.GOOS {
+	return collectPasswordPolicySummaryFor(runtime.GOOS)
+}
+
+// collectPasswordPolicySummaryForStatus is the security-status tick's read:
+// cached on Windows, where the probe spawns secedit.exe (#9267, #9597).
+func collectPasswordPolicySummaryForStatus(goos string) (map[string]any, error) {
+	if goos == "windows" {
+		return collectPasswordPolicySummaryWindowsCached()
+	}
+	return collectPasswordPolicySummaryFor(goos)
+}
+
+func collectPasswordPolicySummaryFor(goos string) (map[string]any, error) {
+	switch goos {
 	case "windows":
-		return collectPasswordPolicySummaryWindows()
+		return passwordPolicyProbe.Refresh()
 	case "darwin":
 		return collectPasswordPolicySummaryDarwin()
 	case "linux":
@@ -1009,7 +1050,17 @@ func collectPasswordPolicySummary() (map[string]any, error) {
 	}
 }
 
-// CollectStatus gathers AV/firewall/encryption posture for this endpoint.
+// CollectStatusFresh is CollectStatus for an explicit, technician-initiated
+// request: it discards the cached slow posture probes first so nothing in the
+// answer is older than the request.
+func CollectStatusFresh(cfg *config.Config) (SecurityStatus, error) {
+	invalidateSlowPostureProbes()
+	return CollectStatus(cfg)
+}
+
+// CollectStatus gathers AV/firewall/encryption posture for this endpoint. It
+// runs on the 5-minute security tick; see slow_probe.go for which Windows
+// probes are cached between ticks (#9267).
 func CollectStatus(cfg *config.Config) (SecurityStatus, error) {
 	var status SecurityStatus
 	var errs []error
@@ -1034,59 +1085,46 @@ func CollectStatus(cfg *config.Config) (SecurityStatus, error) {
 	// separately whether an AV source actually resolved the provider (#3593).
 	providerIdentified := false
 
+	// realTime accumulates across AV sources. avCollected records that at least
+	// one AV source answered; avFailed that at least one applicable source
+	// errored. Both are needed to tell "no source applies on this OS" (a real
+	// false) from "every source failed" (unknown) — see avRealTimeProtectionState.
+	realTime := false
+	avCollected := false
+	avFailed := false
+
 	// Windows Security Center AV products (workstations) first.
 	if runtime.GOOS == "windows" {
 		products, wscErr := GetWindowsSecurityCenterProducts()
 		if wscErr != nil {
 			if !errors.Is(wscErr, ErrNotSupported) {
 				errs = append(errs, wscErr)
+				avFailed = true
 			}
 		} else {
+			avCollected = true
 			status.WindowsSecurityCenterAvailable = true
 			status.AVProducts = products
 			if primary, identified := resolveWSCPrimary(products); primary.Provider != "" {
 				status.Provider = primary.Provider
-				status.RealTimeProtection = primary.RealTimeProtection
+				realTime = primary.RealTimeProtection
 				status.DefinitionsUpdatedAt = primary.Timestamp
 				providerIdentified = identified
 			}
 		}
 	}
 
-	// Defender on macOS (Microsoft Defender for Endpoint via mdatp).
+	// macOS AV sources, in attribution order (#9390):
+	//  1. CylancePROTECT / Aurora Endpoint Defense (app bundle + launch daemon probe).
+	//  2. Microsoft Defender for Endpoint (mdatp). It takes the provider label
+	//     only under the Windows Defender-fallback rule (macDefenderClaimsProvider):
+	//     when nothing was identified, or when it is the only source with active
+	//     real-time protection. Both products are always listed in AVProducts.
 	if runtime.GOOS == "darwin" {
-		macDefenderStatus, macDefenderProduct, macDefenderErr := getMacDefenderStatus()
-		if macDefenderErr != nil {
-			if !errors.Is(macDefenderErr, ErrNotSupported) {
-				errs = append(errs, macDefenderErr)
-			}
-		} else {
-			if !providerIdentified && macDefenderStatus.Enabled {
-				status.Provider = "windows_defender"
-				providerIdentified = true
-			}
-			if macDefenderProduct != nil {
-				status.AVProducts = append(status.AVProducts, *macDefenderProduct)
-			}
-			if status.ProviderVersion == "" {
-				status.ProviderVersion = macDefenderStatus.ProviderVersion
-			}
-			if macDefenderStatus.RealTimeProtection {
-				status.RealTimeProtection = true
-			}
-			if status.DefinitionsVersion == "" {
-				status.DefinitionsVersion = macDefenderStatus.DefinitionsVersion
-			}
-			if status.DefinitionsUpdatedAt == "" {
-				status.DefinitionsUpdatedAt = macDefenderStatus.DefinitionsUpdatedAt
-			}
-			status.LastScanAt = latestScanTime(macDefenderStatus)
-			if macDefenderStatus.LastFullScan != "" {
-				status.LastScanType = "full"
-			} else if macDefenderStatus.LastQuickScan != "" {
-				status.LastScanType = "quick"
-			}
-		}
+		tally := avTally{providerIdentified: providerIdentified, realTime: realTime, collected: avCollected, failed: avFailed}
+		applyMacAVSources(&status, &tally, collectMacAVSources())
+		providerIdentified, realTime, avCollected, avFailed = tally.providerIdentified, tally.realTime, tally.collected, tally.failed
+		errs = append(errs, tally.errs...)
 	}
 
 	// Elastic Defend on Linux (#2018): Linux has no security-center registry,
@@ -1098,8 +1136,10 @@ func CollectStatus(cfg *config.Config) (SecurityStatus, error) {
 		if elasticErr != nil {
 			if !errors.Is(elasticErr, ErrNotSupported) {
 				errs = append(errs, elasticErr)
+				avFailed = true
 			}
 		} else if elasticProduct != nil {
+			avCollected = true
 			status.AVProducts = append(status.AVProducts, *elasticProduct)
 			if !providerIdentified {
 				status.Provider = elasticProduct.Provider
@@ -1109,7 +1149,7 @@ func CollectStatus(cfg *config.Config) (SecurityStatus, error) {
 				status.ProviderVersion = elasticVersion
 			}
 			if elasticProduct.RealTimeProtection {
-				status.RealTimeProtection = true
+				realTime = true
 			}
 		}
 	}
@@ -1119,16 +1159,18 @@ func CollectStatus(cfg *config.Config) (SecurityStatus, error) {
 	if defErr != nil {
 		if !errors.Is(defErr, ErrNotSupported) {
 			errs = append(errs, defErr)
+			avFailed = true
 		}
 	} else {
-		if defenderOwnsProvider(providerIdentified, status.RealTimeProtection, defenderStatus.RealTimeProtection) {
+		avCollected = true
+		if defenderOwnsProvider(providerIdentified, realTime, defenderStatus.RealTimeProtection) {
 			status.Provider = "windows_defender"
 		}
 		if status.ProviderVersion == "" {
 			status.ProviderVersion = defenderStatus.ProviderVersion
 		}
 		if defenderStatus.RealTimeProtection {
-			status.RealTimeProtection = true
+			realTime = true
 		}
 		if status.DefinitionsVersion == "" {
 			status.DefinitionsVersion = defenderStatus.DefinitionsVersion
@@ -1144,26 +1186,23 @@ func CollectStatus(cfg *config.Config) (SecurityStatus, error) {
 		}
 	}
 
-	firewallEnabled, fwErr := GetFirewallStatus()
-	if fwErr != nil {
-		errs = append(errs, fwErr)
-	}
-	status.FirewallEnabled = firewallEnabled
+	status.RealTimeProtection = avRealTimeProtectionState(realTime, avCollected, avFailed)
 
-	encryptionEnabled, encErr := getEncryptionStatus()
-	if encErr != nil {
-		errs = append(errs, encErr)
+	firewallEnabled, fwErr := GetFirewallStatus()
+	if err := applyFirewallPosture(&status, firewallEnabled, fwErr); err != nil {
+		errs = append(errs, err)
 	}
-	status.EncryptionStatus = encryptionString(encryptionEnabled, encErr)
-	if details, err := collectEncryptionDetails(); err == nil {
-		status.EncryptionDetails = details
+
+	encryptionEnabled, encDetails, encErr := collectEncryptionPosture()
+	if err := applyEncryptionPosture(&status, encryptionEnabled, encDetails, encErr); err != nil {
+		errs = append(errs, err)
 	}
 
 	if localAdmins, err := collectLocalAdminSummary(); err == nil {
 		status.LocalAdminSummary = localAdmins
 	}
 
-	if passwordPolicy, err := collectPasswordPolicySummary(); err == nil {
+	if passwordPolicy, err := collectPasswordPolicySummaryForStatus(runtime.GOOS); err == nil {
 		status.PasswordPolicySummary = passwordPolicy
 	}
 
@@ -1178,6 +1217,27 @@ func CollectStatus(cfg *config.Config) (SecurityStatus, error) {
 	}
 
 	return status, errors.Join(errs...)
+}
+
+// avRealTimeProtectionState decides whether the accumulated real-time
+// protection value is a real reading. It is unknown (nil) only when an
+// applicable AV source errored and no source answered — e.g. both the Security
+// Center and Defender queries failed on Windows (#7965). When no source applies
+// and none failed (Linux without Elastic Defend), false is a real reading.
+func avRealTimeProtectionState(realTime, collected, failed bool) *bool {
+	if failed && !collected {
+		return nil
+	}
+	return boolPtr(realTime)
+}
+
+// firewallState reports the firewall reading only when the query succeeded;
+// a failed query is unknown (nil), not "disabled" (#7965).
+func firewallState(enabled bool, err error) *bool {
+	if err != nil {
+		return nil
+	}
+	return boolPtr(enabled)
 }
 
 // GetFirewallStatus returns whether a firewall is enabled on the host.
@@ -1207,28 +1267,29 @@ func getFirewallStatusWindows() (bool, error) {
 	return false, nil
 }
 
+// runFirewallCommand is a seam so the darwin firewall order is testable off-macOS.
+var runFirewallCommand = runCommand
+
 func getFirewallStatusDarwin() (bool, error) {
-	// Prefer locale-invariant numeric check via defaults read.
-	// globalstate: 0=off, 1=on, 2=on (essential services only).
-	output, err := runCommand(5*time.Second, "defaults", "read", "/Library/Preferences/com.apple.alf", "globalstate")
-	if err == nil {
-		switch strings.TrimSpace(output) {
-		case "1", "2":
-			return true, nil
-		case "0":
-			return false, nil
+	// macOS 15+ dropped the com.apple.alf defaults domain, so spawning
+	// defaults there only fails (#10911).
+	if major, known := macOSMajorVersion(); !known || major < 15 {
+		// Locale-invariant numeric check: 0=off, 1=on, 2=on (essential services only).
+		output, err := runFirewallCommand(5*time.Second, "defaults", "read", "/Library/Preferences/com.apple.alf", "globalstate")
+		if err == nil {
+			switch strings.TrimSpace(output) {
+			case "1", "2":
+				return true, nil
+			case "0":
+				return false, nil
+			}
 		}
 	}
 
-	// Fallback: socketfilterfw text output (locale-dependent, English-only match).
-	output, err = runCommand(5*time.Second, "/usr/libexec/ApplicationFirewall/socketfilterfw", "--getglobalstate")
+	output, err := runFirewallCommand(5*time.Second, "/usr/libexec/ApplicationFirewall/socketfilterfw", "--getglobalstate")
 	if err == nil {
-		lower := strings.ToLower(output)
-		if strings.Contains(lower, "enabled") {
-			return true, nil
-		}
-		if strings.Contains(lower, "disabled") {
-			return false, nil
+		if enabled, ok := parseSocketfilterfwState(output); ok {
+			return enabled, nil
 		}
 	}
 
@@ -1251,7 +1312,7 @@ func firewallStatusFromCommand(timeout time.Duration, name string, args ...strin
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, name, args...)
+	cmd := procspawn.CommandContext(ctx, name, args...)
 	output, err := cmd.CombinedOutput()
 	if ctx.Err() == context.DeadlineExceeded {
 		return "", false, false
@@ -1298,48 +1359,47 @@ func interpretFirewallState(tool, state string) (enabled bool, known bool) {
 	return false, false
 }
 
-func getFirewallStatusLinux() (bool, error) {
-	if hasCommand("ufw") {
-		output, err := runCommand(5*time.Second, "ufw", "status")
-		if err == nil {
-			if enabled, known := interpretFirewallState("ufw", output); known {
-				return enabled, nil
-			}
-		}
-	}
-
-	// firewall-cmd / systemctl probe a different daemon (firewalld) than ufw.
-	// On a host where ufw is the ACTIVE firewall but firewalld is installed
-	// + masked (a common Ubuntu/Debian shape), `firewall-cmd --state` exits
-	// non-zero and prints "not running" or a D-Bus failure on stdout. The
-	// previous version trusted that text regardless of exit code, which
-	// silently reported the host as firewall=disabled — strictly worse than
-	// the WARN it replaced because FirewallEnabled feeds security posture
-	// (status.go's posture computation). We now only trust a recognized state
-	// when the tool ALSO exited 0; non-zero exit → unknown → fall through.
-	if hasCommand("firewall-cmd") {
-		if stdout, zeroExit, ok := firewallStatusFromCommand(5*time.Second, "firewall-cmd", "--state"); ok && zeroExit {
-			if enabled, known := interpretFirewallState("firewall-cmd", stdout); known {
-				return enabled, nil
-			}
-		}
-	}
-
-	if hasCommand("systemctl") {
-		if stdout, zeroExit, ok := firewallStatusFromCommand(5*time.Second, "systemctl", "is-active", "firewalld"); ok && zeroExit {
-			if enabled, known := interpretFirewallState("systemctl", stdout); known {
-				return enabled, nil
-			}
-		}
-	}
-
-	return false, fmt.Errorf("unable to determine firewall status")
+// collectEncryptionPosture returns the headline encryption state and the
+// per-volume details. On Linux both come from a single lsblk evaluation so
+// the headline always matches the "/" volume in the details (#7478).
+func collectEncryptionPosture() (enabled bool, details map[string]any, statusErr error) {
+	return collectEncryptionPostureFor(runtime.GOOS)
 }
 
+// collectEncryptionPostureFor is the security-status tick's encryption read.
+// On Windows both BitLocker probes are cached slow probes (#9267).
+func collectEncryptionPostureFor(goos string) (enabled bool, details map[string]any, statusErr error) {
+	if goos == "windows" {
+		enabled, statusErr = getEncryptionStatusWindowsCached()
+		if d, err := collectEncryptionDetailsWindowsCached(); err == nil {
+			details = d
+		}
+		return enabled, details, statusErr
+	}
+	if goos == "linux" {
+		report, err := collectLinuxEncryption()
+		if err != nil {
+			return false, nil, err
+		}
+		return report.RootProtected, linuxEncryptionDetails(report), report.RootErr
+	}
+	enabled, statusErr = getEncryptionStatus()
+	if d, err := collectEncryptionDetails(); err == nil {
+		details = d
+	}
+	return enabled, details, statusErr
+}
+
+// getEncryptionStatus is a fresh read; on Windows it also refreshes the cache
+// the security-status tick uses.
 func getEncryptionStatus() (bool, error) {
-	switch runtime.GOOS {
+	return getEncryptionStatusFor(runtime.GOOS)
+}
+
+func getEncryptionStatusFor(goos string) (bool, error) {
+	switch goos {
 	case "windows":
-		return getEncryptionStatusWindows()
+		return bitLockerStatusProbe.Refresh()
 	case "darwin":
 		return getEncryptionStatusDarwin()
 	default:
@@ -1347,8 +1407,13 @@ func getEncryptionStatus() (bool, error) {
 	}
 }
 
+const bitLockerSystemDriveStatusPS = "Get-BitLockerVolume -MountPoint $env:SystemDrive | Select-Object -ExpandProperty ProtectionStatus"
+
 func getEncryptionStatusWindows() (bool, error) {
-	output, err := runCommand(8*time.Second, "powershell", "-NoProfile", "-NonInteractive", "-Command", "Get-BitLockerVolume -MountPoint $env:SystemDrive | Select-Object -ExpandProperty ProtectionStatus")
+	if bitLockerNotInstalled() {
+		return false, ErrBitLockerUnavailable
+	}
+	output, err := runBitLockerPowerShell(8*time.Second, bitLockerSystemDriveStatusPS)
 	if err != nil {
 		return false, err
 	}
@@ -1385,26 +1450,11 @@ func getEncryptionStatusDarwin() (bool, error) {
 }
 
 func getEncryptionStatusLinux() (bool, error) {
-	if !hasCommand("lsblk") {
-		return false, fmt.Errorf("lsblk not found")
-	}
-
-	output, err := runCommand(5*time.Second, "lsblk", "-o", "TYPE,MOUNTPOINT", "-nr")
+	report, err := collectLinuxEncryption()
 	if err != nil {
 		return false, err
 	}
-
-	for _, line := range strings.Split(output, "\n") {
-		fields := strings.Fields(line)
-		if len(fields) < 2 {
-			continue
-		}
-		if fields[0] == "crypt" && fields[1] == "/" {
-			return true, nil
-		}
-	}
-
-	return false, nil
+	return report.RootProtected, report.RootErr
 }
 
 func hasCommand(name string) bool {
@@ -1431,7 +1481,7 @@ func runCommand(timeout time.Duration, name string, args ...string) (string, err
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, name, args...)
+	cmd := procspawn.CommandContext(ctx, name, args...)
 	output, err := cmd.CombinedOutput()
 	if ctx.Err() == context.DeadlineExceeded {
 		return "", fmt.Errorf("command timed out: %s", name)

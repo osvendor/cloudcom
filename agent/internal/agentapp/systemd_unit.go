@@ -2,8 +2,11 @@ package agentapp
 
 import (
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
+
+	"github.com/breeze-rmm/agent/internal/branding"
 )
 
 // currentUnitVersion is the breeze-unit-version this binary ships. Bump it
@@ -87,6 +90,15 @@ RestartSec=30
 TimeoutStopSec=30
 KillMode=mixed
 
+# Delegate=yes hands this unit's cgroup subtree to the agent. Network
+# isolation (#10088, OD14) splits it into ` + "`agent`" + ` (the agent process, which
+# alone gets the management-plane permit) and ` + "`children`" + ` (every terminal,
+# script and helper the agent spawns, placed there before exec). Like
+# RuntimeDirectory, Delegate is NOT a sandbox directive: it restricts nothing
+# in the children, so it does not violate the unsandboxed invariant below.
+# KillMode=mixed still reaches every process in the subtree on stop.
+Delegate=yes
+
 # INTENTIONALLY UNSANDBOXED. The remote terminal and remote script execution
 # features spawn child processes that must behave like a root SSH session:
 #   - package managers drop privileges to unprivileged users (needs CAP_SETUID/SETGID/CHOWN)
@@ -149,4 +161,17 @@ func reconcileTransientArgs(pid int, binPath string) []string {
 		fmt.Sprintf("--unit=breeze-unit-reconcile-%d", pid),
 		binPath, "service", "reconcile-unit",
 	}
+}
+
+// currentLinuxUnit returns the unit written to disk: the embedded linuxUnit,
+// with only its Description= line replaced when the build carries a brand
+// (see internal/branding). A brand that is not valid falls back to the
+// embedded unit and prints a warning. linuxUnit itself never changes, so
+// TestStaticUnitMatchesEmbedded keeps holding.
+func currentLinuxUnit() string {
+	unit, err := branding.UnitWithDescription(linuxUnit, branding.AgentServiceDescription)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: ignoring the branded service description: %v\n", err)
+	}
+	return unit
 }

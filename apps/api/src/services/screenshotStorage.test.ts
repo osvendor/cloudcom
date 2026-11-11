@@ -27,7 +27,7 @@ vi.mock('../db', () => {
   const insertValues = vi.fn(() => ({ returning: insertReturning }));
   const insertFn = vi.fn(() => ({ values: insertValues }));
 
-  const selectLimit = vi.fn();
+  const selectLimit = vi.fn().mockResolvedValue([{ count: 0, bytes: 0 }]);
   const selectWhere = vi.fn(() => ({ limit: selectLimit }));
   const selectFrom = vi.fn(() => ({ where: selectWhere }));
   const selectFn = vi.fn(() => ({ from: selectFrom }));
@@ -74,7 +74,13 @@ vi.mock('../db/schema/ai', () => ({
   },
 }));
 
-import { storeScreenshot, getScreenshot, deleteExpiredScreenshots } from './screenshotStorage';
+import {
+  storeScreenshot,
+  getScreenshot,
+  deleteExpiredScreenshots,
+  ScreenshotTooLargeError,
+  ScreenshotQuotaExceededError,
+} from './screenshotStorage';
 import { db } from '../db';
 import { mkdir, writeFile, readFile, unlink } from 'fs/promises';
 
@@ -185,6 +191,143 @@ describe('screenshotStorage', () => {
       expect(expiresAt.getTime()).toBeGreaterThan(expectedMin);
       expect(expiresAt.getTime()).toBeLessThan(expectedMax);
     });
+
+    it('removes the written file and rethrows when the DB insert fails', async () => {
+      const insertErr = new Error('insert failed');
+      mocks.insertReturning.mockRejectedValueOnce(insertErr);
+
+      await expect(storeScreenshot({
+        deviceId: TEST_DEVICE_ID,
+        orgId: TEST_ORG_ID,
+        imageBase64: 'dGVzdGltYWdl',
+        width: 1920,
+        height: 1080,
+        capturedBy: 'helper',
+      })).rejects.toBe(insertErr);
+
+      expect(writeFile).toHaveBeenCalledTimes(1);
+      const writtenPath = vi.mocked(writeFile).mock.calls[0]![0];
+      expect(unlink).toHaveBeenCalledWith(writtenPath);
+    });
+
+    it('recreates the device directory once when the orphan sweep pruned it mid-capture (#8117)', async () => {
+      mocks.insertReturning.mockResolvedValueOnce([{ id: TEST_SCREENSHOT_ID }]);
+      vi.mocked(writeFile).mockRejectedValueOnce(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
+
+      await expect(storeScreenshot({
+        deviceId: TEST_DEVICE_ID,
+        orgId: TEST_ORG_ID,
+        imageBase64: 'dGVzdGltYWdl',
+        width: 1920,
+        height: 1080,
+        capturedBy: 'helper',
+      })).resolves.toMatchObject({ id: TEST_SCREENSHOT_ID });
+
+      expect(mkdir).toHaveBeenCalledTimes(2);
+      expect(writeFile).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not retry a write that failed for any other reason', async () => {
+      const diskFull = Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' });
+      vi.mocked(writeFile).mockRejectedValueOnce(diskFull);
+
+      await expect(storeScreenshot({
+        deviceId: TEST_DEVICE_ID,
+        orgId: TEST_ORG_ID,
+        imageBase64: 'dGVzdGltYWdl',
+        width: 1920,
+        height: 1080,
+        capturedBy: 'helper',
+      })).rejects.toBe(diskFull);
+      expect(writeFile).toHaveBeenCalledTimes(1);
+    });
+
+    it('removes the written file when the insert returns no row', async () => {
+      mocks.insertReturning.mockResolvedValueOnce([]);
+
+      await expect(storeScreenshot({
+        deviceId: TEST_DEVICE_ID,
+        orgId: TEST_ORG_ID,
+        imageBase64: 'dGVzdGltYWdl',
+        width: 1920,
+        height: 1080,
+        capturedBy: 'helper',
+      })).rejects.toThrow('Failed to store screenshot record in database');
+
+      const writtenPath = vi.mocked(writeFile).mock.calls[0]![0];
+      expect(unlink).toHaveBeenCalledWith(writtenPath);
+    });
+
+    it('still surfaces the insert error when removing the file also fails', async () => {
+      const insertErr = new Error('insert failed');
+      mocks.insertReturning.mockRejectedValueOnce(insertErr);
+      vi.mocked(unlink).mockRejectedValueOnce(Object.assign(new Error('EACCES'), { code: 'EACCES' }));
+      const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+      await expect(storeScreenshot({
+        deviceId: TEST_DEVICE_ID,
+        orgId: TEST_ORG_ID,
+        imageBase64: 'dGVzdGltYWdl',
+        width: 1920,
+        height: 1080,
+        capturedBy: 'helper',
+      })).rejects.toBe(insertErr);
+
+      expect(errSpy).toHaveBeenCalled();
+      errSpy.mockRestore();
+    });
+
+    it('rejects an oversized image before touching the filesystem or DB', async () => {
+      // 1,600,001 bytes decoded — one byte over the default MAX_SCREENSHOT_BYTES.
+      const oversized = Buffer.alloc(1_600_001, 'a').toString('base64');
+
+      await expect(storeScreenshot({
+        deviceId: TEST_DEVICE_ID,
+        orgId: TEST_ORG_ID,
+        imageBase64: oversized,
+        width: 1920,
+        height: 1080,
+        capturedBy: 'helper',
+      })).rejects.toBeInstanceOf(ScreenshotTooLargeError);
+
+      expect(mkdir).not.toHaveBeenCalled();
+      expect(writeFile).not.toHaveBeenCalled();
+      expect(db.insert).not.toHaveBeenCalled();
+    });
+
+    it('rejects a new screenshot once the device is at its live-count quota', async () => {
+      mocks.selectLimit.mockResolvedValueOnce([{ count: 20, bytes: 1000 }]);
+
+      await expect(storeScreenshot({
+        deviceId: TEST_DEVICE_ID,
+        orgId: TEST_ORG_ID,
+        imageBase64: 'dGVzdGltYWdl',
+        width: 1920,
+        height: 1080,
+        capturedBy: 'helper',
+      })).rejects.toBeInstanceOf(ScreenshotQuotaExceededError);
+
+      expect(writeFile).not.toHaveBeenCalled();
+      expect(db.insert).not.toHaveBeenCalled();
+    });
+
+    it('rejects a new screenshot once the device is at its live-byte quota', async () => {
+      // Under the count quota (20) but the incoming image would push total
+      // live bytes over MAX_SCREENSHOT_BYTES_PER_DEVICE (20 * 1,600,000).
+      mocks.selectLimit.mockResolvedValueOnce([{ count: 5, bytes: 20 * 1_600_000 }]);
+
+      await expect(storeScreenshot({
+        deviceId: TEST_DEVICE_ID,
+        orgId: TEST_ORG_ID,
+        imageBase64: 'dGVzdGltYWdl',
+        width: 1920,
+        height: 1080,
+        capturedBy: 'helper',
+      })).rejects.toBeInstanceOf(ScreenshotQuotaExceededError);
+
+      expect(writeFile).not.toHaveBeenCalled();
+      expect(db.insert).not.toHaveBeenCalled();
+    });
   });
 
   // ─── getScreenshot ───────────────────────────────────────────────────
@@ -287,6 +430,39 @@ describe('screenshotStorage', () => {
       expect(unlink).toHaveBeenCalledWith(expect.stringContaining('old2.jpg'));
       // DB delete called for each record
       expect(db.delete).toHaveBeenCalledTimes(2);
+    });
+
+    it('keeps the row when the file cannot be removed, so the next sweep retries', async () => {
+      const stuck = {
+        id: 'expired-stuck',
+        deviceId: TEST_DEVICE_ID,
+        orgId: TEST_ORG_ID,
+        storageKey: `screenshots/${TEST_ORG_ID}/${TEST_DEVICE_ID}/stuck.jpg`,
+        expiresAt: new Date(Date.now() - 86400000),
+      };
+      const gone = {
+        id: 'expired-gone',
+        deviceId: TEST_DEVICE_ID,
+        orgId: TEST_ORG_ID,
+        storageKey: `screenshots/${TEST_ORG_ID}/${TEST_DEVICE_ID}/gone.jpg`,
+        expiresAt: new Date(Date.now() - 86400000),
+      };
+
+      mocks.selectWhere.mockResolvedValueOnce([stuck, gone]);
+      vi.mocked(unlink)
+        .mockRejectedValueOnce(Object.assign(new Error('EBUSY: resource busy'), { code: 'EBUSY' }))
+        .mockResolvedValueOnce(undefined);
+      const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+      const count = await deleteExpiredScreenshots();
+
+      expect(count).toBe(1);
+      expect(db.delete).toHaveBeenCalledTimes(1);
+      expect(errSpy).toHaveBeenCalledWith(
+        expect.stringContaining('stuck.jpg'),
+        expect.anything(),
+      );
+      errSpy.mockRestore();
     });
 
     it('returns 0 when no expired screenshots exist', async () => {

@@ -1,7 +1,43 @@
 import { describe, expect, it, vi } from 'vitest';
+import { PgDialect } from 'drizzle-orm/pg-core';
+import type { SQL } from 'drizzle-orm';
 import {
   admitPartnerDeviceCapacity,
+  previewPartnerDeviceCapacity,
+  effectivePartnerAdmissionLimit,
 } from './partnerDeviceCapacity';
+
+describe('billing growth admission', () => {
+  const now = new Date('2026-10-22T12:00:00Z');
+  const paid = { maxDevices: 110, plan: 'community', billingSubscriptionStatus: 'active',
+    billingAdmissionLimit: 165, billingAdmissionExpiresAt: new Date('2026-10-23T00:00:00Z') };
+  it('admits a temporary spike while retaining a finite ceiling', () => {
+    expect(effectivePartnerAdmissionLimit(paid, now)).toBe(165);
+    expect(effectivePartnerAdmissionLimit({ ...paid, billingAdmissionLimit: 999999 }, now)).toBe(110);
+  });
+  it.each(['past_due', 'incomplete', 'trialing', 'canceled'])('does not widen admission for %s', status => {
+    expect(effectivePartnerAdmissionLimit({ ...paid, billingSubscriptionStatus: status }, now)).toBe(110);
+  });
+  it('fails closed for expired/missing proof and never makes the paid cap smaller', () => {
+    expect(effectivePartnerAdmissionLimit({ ...paid, billingAdmissionExpiresAt: now }, now)).toBe(110);
+    expect(effectivePartnerAdmissionLimit({ ...paid, billingAdmissionExpiresAt: null }, now)).toBe(110);
+    expect(effectivePartnerAdmissionLimit({ ...paid, billingAdmissionLimit: 50 }, now)).toBe(110);
+    expect(effectivePartnerAdmissionLimit({ maxDevices: 110 }, now)).toBe(110);
+    expect(effectivePartnerAdmissionLimit({ ...paid, maxDevices: null }, now)).toBeNull();
+  });
+});
+
+describe('beta offers: admission limit pinned', () => {
+  const now = new Date('2026-10-22T12:00:00Z');
+  const betaPartner = { plan: 'community', billingSubscriptionStatus: 'active',
+    billingAdmissionLimit: null, billingAdmissionExpiresAt: null };
+  it('monthly beta (max_devices NULL, per-device) is unlimited', () => {
+    expect(effectivePartnerAdmissionLimit({ maxDevices: null, ...betaPartner }, now)).toBeNull();
+  });
+  it('prepaid beta of 5 units keeps its 1250 cap above the 1,100 widening ceiling', () => {
+    expect(effectivePartnerAdmissionLimit({ maxDevices: 1250, ...betaPartner }, now)).toBe(1250);
+  });
+});
 
 function transactionFixture(input: {
   orgPartnerId?: string | null;
@@ -85,5 +121,50 @@ describe('admitPartnerDeviceCapacity', () => {
       code: 'ORG_PARTNER_CHANGED',
     }));
     expect(f.calls).toEqual(['timeout', 'org:share']);
+  });
+
+  it('leaves devices parked in a holding org out of the licensed count', async () => {
+    const f = transactionFixture({ maxDevices: 5, activeCount: 4 });
+    await admitPartnerDeviceCapacity(f.tx, { orgId: 'org-1', expectedPartnerId: 'partner-1' });
+    const orgSubquery = new PgDialect().sqlToQuery(f.whereArgs[0] as SQL);
+    expect(orgSubquery.sql).toContain('"organizations"."type" <> $');
+    expect(orgSubquery.params).toContain('unassigned_pool');
+  });
+
+  it('leaves out a device the caller already moved into a counted org', async () => {
+    const f = transactionFixture({ maxDevices: 5, activeCount: 4 });
+    await admitPartnerDeviceCapacity(f.tx, { orgId: 'org-1', expectedPartnerId: 'partner-1', excludeDeviceId: 'device-9' });
+    const count = new PgDialect().sqlToQuery(f.whereArgs[1] as SQL);
+    expect(count.sql).toContain('"devices"."id" <> $');
+    expect(count.params).toContain('device-9');
+  });
+});
+
+describe('previewPartnerDeviceCapacity', () => {
+  function unlockedFixture(input: { maxDevices: number | null; activeCount: number }) {
+    const locks: string[] = [];
+    let index = 0;
+    const tx = {
+      execute: vi.fn(),
+      select: vi.fn(() => {
+        const i = index++;
+        const rows = i === 0 ? [{ partnerId: 'partner-1' }] : i === 1 ? [{ maxDevices: input.maxDevices }] : null;
+        if (rows) {
+          const limited = Object.assign(Promise.resolve(rows), { for: (mode: string) => { locks.push(mode); return Promise.resolve(rows); } });
+          return { from: () => ({ where: () => ({ limit: () => limited }) }) };
+        }
+        if (i === 2) return { from: () => ({ where: () => ({}) }) };
+        return { from: () => ({ where: async () => [{ count: input.activeCount }] }) };
+      }),
+    };
+    return { tx: tx as any, locks };
+  }
+
+  it('answers like the admission but takes no row lock and sets no lock timeout', async () => {
+    const f = unlockedFixture({ maxDevices: 3, activeCount: 3 });
+    await expect(previewPartnerDeviceCapacity(f.tx, { orgId: 'org-1', expectedPartnerId: 'partner-1' }))
+      .resolves.toEqual({ allowed: false, partnerId: 'partner-1', maxDevices: 3, activeCount: 3 });
+    expect(f.locks).toEqual([]);
+    expect(f.tx.execute).not.toHaveBeenCalled();
   });
 });

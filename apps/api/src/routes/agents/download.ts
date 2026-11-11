@@ -1,23 +1,113 @@
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import { statSync, createReadStream } from 'node:fs';
 import { Readable } from 'node:stream';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
 import { VALID_OS, VALID_ARCH } from './schemas';
-import { isS3Configured, getPresignedUrl, isS3NotFound } from '../../services/s3Storage';
-import { getBinarySource, getGithubReleaseVersion, getGithubAgentUrl, getGithubHelperUrl, getGithubUserHelperUrl, getGithubWatchdogUrl, getGithubBackupUrl, getGithubRecoveryIsoUrl, HELPER_FILENAMES } from '../../services/binarySource';
+import { isS3Configured, getPresignedUrl, getObjectStream, isS3NotFound } from '../../services/s3Storage';
+import { binaryS3Key, binaryStoreDir, type BinaryStore } from '../../services/binaryStores';
+import { getBinarySource, getGithubReleaseVersion, getGithubAgentUrl, getGithubUserHelperUrl, getGithubWatchdogUrl, getGithubBackupUrl, getGithubRecoveryIsoUrl, HELPER_FILENAMES } from '../../services/binarySource';
 import { getPromotedComponentVersion, getRegisteredComponentVersion, type PromotedComponent } from '../../services/promotedAgentVersion';
-import { fetchVerifiedMacosPkg } from '../../services/installerBuilder';
+import { fetchVerifiedMacosPkg, fetchVerifiedHelperInstaller } from '../../services/installerBuilder';
 import { getWindowsReleaseAssetUrl } from '../../services/releaseSource';
+import { getTrustedClientIp, rateLimitIpKey } from '../../services/clientIp';
 
 export const downloadRoutes = new Hono();
+
+// This whole route prefix (/api/v1/agents/) is exempted from the global rate
+// limiter (it assumes agent-auth's own per-agent limiting applies, which
+// does not cover any of these unauthenticated download routes — see
+// AGENT_AUTH_SKIP_ID_SEGMENTS) and there is no Caddy rate_limit on it
+// either, so every route below must carry its own per-IP bound. Fails
+// CLOSED on Redis errors — a Redis outage must not thereby disable the
+// limiter on a public endpoint.
+//
+// One bucket PER ROUTE (keyed on `logTag`, e.g. `agent-download`,
+// `install-script-download`), not one shared bucket across every route. A
+// single office/site rollout behind one NAT IP legitimately calls several of
+// these routes back-to-back (install.sh, then the agent binary, then
+// watchdog/backup), so a shared bucket means the busiest route (typically
+// install.sh, hit once per machine) uses up capacity meant for every other route's
+// legitimate traffic on the same IP. None of these routes carry an
+// enrollment/download key or any other form of caller identity to key on
+// instead — they are deliberately unauthenticated (see each route's own
+// comment for why) — so per-route-per-IP is the finest-grained bucketing
+// available without adding auth to routes that intentionally have none.
+//
+// Sizing: an earlier 120/min shared bucket 429'd a normal single-site mass
+// rollout (as few as ~20-60 machines starting installs in the same minute
+// already drew 429s; hundreds rejected the vast majority of their requests).
+// A realistic large single-site rollout is bounded in the hundreds of machines (not
+// unbounded) and a real machine's install traffic for ANY ONE of these
+// routes is 1 request, so the target is "a few hundred machines' worth of
+// the SAME route from one IP within a few minutes succeeds, sustained
+// higher-than-that traffic on that IP+route does not." 600 requests / 300s
+// (5 min) per route per IP: comfortably covers a ~500-machine rollout
+// bursting through in a few minutes (the limiter is a sliding window, so the
+// full 600 can land in the rollout's first seconds), while a sustained flood
+// is still capped at an average of 120 req/min indefinitely — an order of
+// magnitude above any real single-site rollout's sustained rate, but still a
+// hard, non-negotiable ceiling per IP per route.
+export const PUBLIC_AGENT_DOWNLOAD_IP_LIMIT = 600;
+export const PUBLIC_AGENT_DOWNLOAD_IP_WINDOW_SECONDS = 300;
+
+/**
+ * Shared low-level limiter: checks `bucketKey` against `limit`/`windowSeconds`,
+ * failing CLOSED (503) on a missing or errored Redis client. Every public,
+ * unauthenticated download route below builds its own `bucketKey` (its own
+ * namespace, so one route's traffic never shares capacity with another's)
+ * and calls this.
+ */
+async function enforceDownloadRateLimit(
+  c: Context,
+  bucketKey: string,
+  logTag: string,
+  limit: number,
+  windowSeconds: number,
+): Promise<Response | null> {
+  try {
+    const { getRedis } = await import('../../services');
+    const { rateLimiter } = await import('../../services/rate-limit');
+    const redis = getRedis();
+    if (!redis) {
+      console.error(`[${logTag}] rate-limit unavailable: redis client missing`);
+      return c.json({ error: 'Service temporarily unavailable' }, 503);
+    }
+    const rateResult = await rateLimiter(redis, bucketKey, limit, windowSeconds);
+    if (!rateResult.allowed) {
+      return c.json({ error: 'Too many requests. Please try again later.' }, 429);
+    }
+    return null;
+  } catch (err) {
+    console.error(
+      `[${logTag}] rate-limit check failed (failing closed):`,
+      err instanceof Error ? err.message : err,
+    );
+    return c.json({ error: 'Service temporarily unavailable' }, 503);
+  }
+}
+
+async function enforcePublicAgentDownloadRateLimit(
+  c: Context,
+  logTag: string,
+): Promise<Response | null> {
+  const ip = getTrustedClientIp(c, 'unknown');
+  return enforceDownloadRateLimit(
+    c,
+    `public-agent-download:${logTag}:${rateLimitIpKey(ip)}`,
+    logTag,
+    PUBLIC_AGENT_DOWNLOAD_IP_LIMIT,
+    PUBLIC_AGENT_DOWNLOAD_IP_WINDOW_SECONDS,
+  );
+}
 
 // ============================================
 // Shared component-binary download handler
 // ============================================
-// The agent/helper/watchdog/backup/user-helper routes below are five
+// The agent/watchdog/backup/recovery-iso/user-helper routes below were
 // near-verbatim copies of the same ~90-line shape: validate os/arch → GitHub
-// redirect (BINARY_SOURCE=github) → S3 presign (404-falls-to-disk,
-// non-404→500) → disk stream. registerComponentDownloadRoute hoists that
+// redirect (BINARY_SOURCE=github) → S3 presigned redirect, or an S3 stream
+// for objectStorageDelivery 'stream' (either way a NotFound falls through to
+// disk and any other fault is a 500) → disk stream. registerComponentDownloadRoute hoists that
 // shape into one place so a future fix (e.g. stream backpressure) lands
 // once. The .pkg and install.sh/uninstall.sh routes have real behavioral
 // differences (macOS-only, different validation/response shape) and are
@@ -27,8 +117,6 @@ interface ComponentDownloadConfig {
   path: string;
   /** Log-line prefix, e.g. 'watchdog-download' → '[watchdog-download] ...'. */
   logTag: string;
-  /** S3 key prefix, e.g. 'watchdog' → 'watchdog/breeze-watchdog-linux-amd64'. */
-  s3Prefix: string;
   /** Human label used in the 404 body, e.g. 'Watchdog binary "..." is not available.' */
   entityLabel: string;
   /** Resolves the on-disk filename for a validated (os, arch) pair. */
@@ -46,8 +134,19 @@ interface ComponentDownloadConfig {
    * builder falls back to the env-resolved BINARY_VERSION/BREEZE_VERSION.
    */
   githubUrlFor: (os: string, arch: string, version?: string) => string;
-  /** Local binary directory to serve from in non-github mode. */
-  binaryDir: () => string;
+  /**
+   * Binaries directory the file is staged in (non-github mode). It decides
+   * BOTH the disk path and the S3 key (binaryS3Key), so the route always
+   * reads the object syncBinaries() uploaded for that file (#7515).
+   */
+  store: BinaryStore;
+  /**
+   * How a local-mode S3 copy reaches the caller. 'redirect' (the default) 302s
+   * to a presigned URL so the bytes bypass the API. 'stream' serves them from
+   * this origin: use it for a binary fetched by a client that refuses a
+   * redirect to an object-storage host (#7576).
+   */
+  objectStorageDelivery?: 'redirect' | 'stream';
 }
 
 // breeze-{component}-{os}-{arch}[.exe] — the shape shared by agent, watchdog,
@@ -63,6 +162,9 @@ function registerComponentDownloadRoute(config: ComponentDownloadConfig): void {
     // the param keys at the type level the way it does for the inline
     // `.get('/download/:os/:arch', ...)` routes this replaced — every
     // registered path always includes :os/:arch, so this is safe at runtime.
+    const rateLimited = await enforcePublicAgentDownloadRateLimit(c, config.logTag);
+    if (rateLimited) return rateLimited;
+
     const os = c.req.param('os') as string;
     const arch = c.req.param('arch') as string;
 
@@ -200,7 +302,7 @@ function registerComponentDownloadRoute(config: ComponentDownloadConfig): void {
         // build IS the requested one), but say so: if the agent then reports a
         // checksum failure, this line is what tells an operator why.
         console.warn(
-          `[${config.logTag}] serving ${filename} for a requested version without being able to verify it: set BINARY_VERSION or BREEZE_VERSION so this server knows which build it holds`,
+          `[${config.logTag}] serving ${filename} for a requested version without being able to verify it: set BREEZE_VERSION (or BINARY_VERSION) so this server knows which build it holds — on a server-only release image the baked BREEZE_BINARIES_VERSION does this`,
           { requestedVersion },
         );
       }
@@ -219,10 +321,48 @@ function registerComponentDownloadRoute(config: ComponentDownloadConfig): void {
       }
     }
 
-    // Local mode: try S3 presigned redirect first (bandwidth offload)
-    if (isS3Configured()) {
+    // Local mode, objectStorageDelivery 'stream': serve the S3 copy from this
+    // origin. Same key, same NotFound-falls-to-disk / fault-is-500 split as the
+    // presign branch below.
+    if (isS3Configured() && config.objectStorageDelivery === 'stream') {
+      const s3Key = binaryS3Key(config.store, filename);
+      let object: Awaited<ReturnType<typeof getObjectStream>>;
       try {
-        const s3Key = `${config.s3Prefix}/${filename}`;
+        object = await getObjectStream(s3Key);
+      } catch (err) {
+        console.error(`[${config.logTag}] S3 fetch failed for ${filename}:`, err);
+        return c.json({ error: 'Internal server error', message: 'Failed to retrieve binary file' }, 500);
+      }
+      if (object.body) {
+        const body = object.body;
+        // Headers are already sent by the time this fires, so all that is left
+        // is to log it: the client sees a truncated body, and the agent's
+        // signed-manifest size/SHA-256 check rejects it. A client that hangs
+        // up makes the server cancel the web stream, which destroys this one
+        // with an AbortError — that is not an object-storage fault, so it is
+        // not logged as one.
+        body.once('error', (err) => {
+          if (err?.name === 'AbortError') return;
+          console.error(`[${config.logTag}] S3 stream error while serving ${filename}:`, err);
+        });
+        const headers: Record<string, string> = {
+          'Content-Type': 'application/octet-stream',
+          'Content-Disposition': `attachment; filename="${filename}"`,
+          'Cache-Control': 'no-cache',
+        };
+        if (object.contentLength !== null) {
+          headers['Content-Length'] = String(object.contentLength);
+        }
+        return new Response(Readable.toWeb(body) as ReadableStream, { status: 200, headers });
+      }
+      console.warn(`[${config.logTag}] S3 object missing for ${filename}, falling back to disk`);
+    }
+
+    // Local mode: try S3 presigned redirect first (bandwidth offload). The key
+    // comes from the file's store, the same one syncBinaries() uploaded it to.
+    if (isS3Configured() && config.objectStorageDelivery !== 'stream') {
+      try {
+        const s3Key = binaryS3Key(config.store, filename);
         const url = await getPresignedUrl(s3Key);
         return c.redirect(url, 302);
       } catch (err) {
@@ -237,7 +377,7 @@ function registerComponentDownloadRoute(config: ComponentDownloadConfig): void {
     }
 
     // Local mode: serve from disk
-    const binaryDir = config.binaryDir();
+    const binaryDir = binaryStoreDir(config.store);
     const filePath = join(binaryDir, filename);
 
     let fileStat: ReturnType<typeof statSync>;
@@ -299,12 +439,11 @@ function registerComponentDownloadRoute(config: ComponentDownloadConfig): void {
 registerComponentDownloadRoute({
   path: '/download/:os/:arch',
   logTag: 'agent-download',
-  s3Prefix: 'agent',
   entityLabel: 'Agent binary',
   component: 'agent',
   filenameFor: perArchFilename('agent'),
   githubUrlFor: getGithubAgentUrl,
-  binaryDir: () => resolve(process.env.AGENT_BINARY_DIR || './agent/bin'),
+  store: 'agent',
 });
 
 // ============================================
@@ -323,41 +462,84 @@ registerComponentDownloadRoute({
 // computed from the local staged file, and serving any other source could
 // hand out bytes that don't match it. BINARY_SOURCE=github deployments get a
 // 404 here and auto edition migration stays inert.
-downloadRoutes.get('/download/windows/amd64/msi', async (c) => {
-  const binaryDir = resolve(process.env.AGENT_BINARY_DIR || './agent/bin');
-  const filePath = join(binaryDir, 'breeze-agent.msi');
+function registerDiskOnlyMsiDownloadRoute(config: {
+  path: string;
+  logTag: string;
+  filename: string;
+  downloadFilename: string;
+  entityLabel: string;
+  directory?: () => string;
+}): void {
+  downloadRoutes.get(config.path, async (c) => {
+    const rateLimited = await enforcePublicAgentDownloadRateLimit(c, config.logTag);
+    if (rateLimited) return rateLimited;
 
-  let fileStat: ReturnType<typeof statSync>;
-  let stream: ReturnType<typeof createReadStream>;
-  try {
-    fileStat = statSync(filePath);
-    stream = createReadStream(filePath);
-  } catch (err) {
-    const isNotFound = err instanceof Error && 'code' in err && (err as NodeJS.ErrnoException).code === 'ENOENT';
-    if (!isNotFound) {
-      console.error('[agent-msi-download] Failed to read breeze-agent.msi:', err);
-      return c.json({ error: 'Internal server error', message: 'Failed to read installer file' }, 500);
+    const binaryDir = config.directory?.() ?? binaryStoreDir('agent');
+    const filePath = join(binaryDir, config.filename);
+
+    let fileStat: ReturnType<typeof statSync>;
+    let stream: ReturnType<typeof createReadStream>;
+    try {
+      fileStat = statSync(filePath);
+      stream = createReadStream(filePath);
+    } catch (err) {
+      const isNotFound = err instanceof Error && 'code' in err && (err as NodeJS.ErrnoException).code === 'ENOENT';
+      if (!isNotFound) {
+        console.error(`[${config.logTag}] Failed to read ${config.filename}:`, err);
+        return c.json({ error: 'Internal server error', message: 'Failed to read installer file' }, 500);
+      }
+      console.warn(`[${config.logTag}] Staged MSI missing`, { filePath });
+      return c.json(
+        { error: 'Installer not found', message: `The ${config.entityLabel} MSI installer is not staged on this server.` },
+        404
+      );
     }
-    console.warn('[agent-msi-download] Staged MSI missing', { filePath });
-    return c.json(
-      { error: 'Installer not found', message: 'The agent MSI installer is not staged on this server.' },
-      404
-    );
-  }
 
-  // Readable.toWeb (not the hand-rolled bridge the older routes in this file
-  // still use) gets backpressure and zero-copy chunk transfer for free — same
-  // as the ticket-attachment streams.
-  return new Response(Readable.toWeb(stream) as ReadableStream, {
-    status: 200,
-    headers: {
-      'Content-Type': 'application/octet-stream',
-      'Content-Disposition': 'attachment; filename="breeze-agent.msi"',
-      'Content-Length': String(fileStat.size),
-      'Cache-Control': 'no-cache',
-    },
+    // Readable.toWeb (not the hand-rolled bridge the older routes in this file
+    // still use) gets backpressure and zero-copy chunk transfer for free — same
+    // as the ticket-attachment streams.
+    return new Response(Readable.toWeb(stream) as ReadableStream, {
+      status: 200,
+      headers: {
+        'Content-Type': 'application/octet-stream',
+        'Content-Disposition': `attachment; filename="${config.downloadFilename}"`,
+        'Content-Length': String(fileStat.size),
+        'Cache-Control': 'no-cache',
+      },
+    });
   });
+}
+
+registerDiskOnlyMsiDownloadRoute({
+  path: '/download/windows/amd64/msi',
+  logTag: 'agent-msi-download',
+  filename: 'breeze-agent.msi',
+  downloadFilename: 'breeze-agent.msi',
+  entityLabel: 'agent',
 });
+
+registerDiskOnlyMsiDownloadRoute({
+  path: '/download/rustdesk/windows/amd64/msi',
+  logTag: 'rustdesk-host-msi-download',
+  filename: 'cloudcom-rustdesk-host.msi',
+  downloadFilename: 'cloudcom-rustdesk-host.msi',
+  entityLabel: 'RustDesk host',
+  // A separate persistent directory survives promotions of versioned agent binaries.
+  directory: () => process.env.CLOUDCOM_RUSTDESK_HOST_DIR || binaryStoreDir('agent'),
+});
+
+// Keep queued, checksum-pinned installations independent of later promotions.
+// Explicit routes also prevent caller-controlled paths into the artifact store.
+for (const version of ['1.5.0.68', '1.5.0.69']) {
+  registerDiskOnlyMsiDownloadRoute({
+    path: `/download/rustdesk/windows/amd64/msi/${version}`,
+    logTag: 'rustdesk-host-msi-download',
+    filename: `cloudcom-rustdesk-host-${version}.msi`,
+    downloadFilename: `cloudcom-rustdesk-host-${version}.msi`,
+    entityLabel: 'RustDesk host',
+    directory: () => process.env.CLOUDCOM_RUSTDESK_HOST_DIR || binaryStoreDir('agent'),
+  });
+}
 
 // ============================================
 // Agent .pkg Installer Download (macOS, public, no auth)
@@ -383,10 +565,34 @@ downloadRoutes.get('/download/:os/:arch/pkg', async (c) => {
     return c.json({ error: 'Invalid architecture', message: `Supported values: amd64, arm64. Got: ${arch}` }, 400);
   }
 
+  // This whole route prefix (/api/v1/agents/) is exempted from the global
+  // rate limiter (it assumes agent-auth's own per-agent limiting applies,
+  // which does not cover this unauthenticated route — see
+  // AGENT_AUTH_SKIP_ID_SEGMENTS) and there is no Caddy rate_limit on it
+  // either, so this route must carry its own per-IP bound. Own bucket
+  // namespace (`public-pkg-download`, distinct from `public-agent-download`),
+  // same re-derived sizing as the other download routes above — a macOS
+  // fleet rollout behind shared NAT is exposed to the identical over-block
+  // risk the other routes were re-sized for.
+  const ip = getTrustedClientIp(c, 'unknown');
+  const rateLimited = await enforceDownloadRateLimit(
+    c,
+    `public-pkg-download:${rateLimitIpKey(ip)}`,
+    'pkg-download',
+    PUBLIC_AGENT_DOWNLOAD_IP_LIMIT,
+    PUBLIC_AGENT_DOWNLOAD_IP_WINDOW_SECONDS,
+  );
+  if (rateLimited) return rateLimited;
+
   const filename = `breeze-agent-darwin-${arch}.pkg`;
   try {
     const { buffer, artifact } = await fetchVerifiedMacosPkg(arch as 'amd64' | 'arm64');
-    return new Response(new Uint8Array(buffer), {
+    // Stream the cached artifact instead of copying it into a fresh
+    // Uint8Array per request — `buffer` is a shared, process-lifetime cache
+    // entry (fetchVerifiedMacosPkg), so N concurrent slow readers previously
+    // held N full-size duplicate copies in memory for the socket-drain
+    // duration. Readable.from(buffer) reads the same underlying memory.
+    return new Response(Readable.toWeb(Readable.from(buffer)) as ReadableStream, {
       status: 200,
       headers: {
         'Content-Type': 'application/octet-stream',
@@ -416,19 +622,63 @@ downloadRoutes.get('/download/:os/:arch/pkg', async (c) => {
 });
 
 // ============================================
-// Helper Binary Download (public, no auth)
+// Helper (Tauri desktop app) Installer Download (public, no auth)
 // ============================================
+// Deliberately NOT folded into registerComponentDownloadRoute like the
+// agent/watchdog/backup/user-helper routes below: those binaries are each
+// independently checksum- or signature-verified downstream (install.sh, or
+// the agent's own Ed25519-pinned self-updater), so a dumb-pipe serve is safe
+// there. The Helper installer has no such downstream check — no client-side
+// updater/signature-pin mechanism exists for it — so this route is the only
+// place its bytes are ever verified. Same shape as the .pkg route above:
+// verify against the signed release manifest, refuse to serve on any
+// mismatch rather than falling back to unverified bytes.
+downloadRoutes.get('/download/helper/:os/:arch', async (c) => {
+  // Public and unauthenticated like every other route in this file, so it
+  // carries the same per-route-per-IP bound (see
+  // enforcePublicAgentDownloadRateLimit). Checked before any verified fetch.
+  const rateLimited = await enforcePublicAgentDownloadRateLimit(c, 'helper-download');
+  if (rateLimited) return rateLimited;
 
-registerComponentDownloadRoute({
-  path: '/download/helper/:os/:arch',
-  logTag: 'helper-download',
-  s3Prefix: 'helper',
-  entityLabel: 'Helper binary',
-  component: 'helper',
-  filenameFor: (os) => HELPER_FILENAMES[os],
-  invalidOsMessage: (os) => `No helper binary available for OS: ${os}`,
-  githubUrlFor: (os, _arch, version) => getGithubHelperUrl(os, version),
-  binaryDir: () => resolve(process.env.HELPER_BINARY_DIR || './agent/bin'),
+  const os = c.req.param('os');
+  const arch = c.req.param('arch');
+
+  if (!VALID_OS.has(os)) {
+    return c.json({ error: 'Invalid OS', message: `Supported values: linux, darwin, windows. Got: ${os}` }, 400);
+  }
+  if (!VALID_ARCH.has(arch)) {
+    return c.json({ error: 'Invalid architecture', message: `Supported values: amd64, arm64. Got: ${arch}` }, 400);
+  }
+
+  const filename = HELPER_FILENAMES[os];
+  if (!filename) {
+    return c.json({ error: 'Invalid OS', message: `No helper binary available for OS: ${os}` }, 400);
+  }
+
+  try {
+    const { buffer, artifact } = await fetchVerifiedHelperInstaller(os);
+    return new Response(new Uint8Array(buffer), {
+      status: 200,
+      headers: {
+        'Content-Type': 'application/octet-stream',
+        'Content-Disposition': `attachment; filename="${filename}"`,
+        'Content-Length': String(buffer.length),
+        'Cache-Control': 'no-store',
+        'X-Breeze-Artifact-SHA256': artifact.sha256,
+        'X-Breeze-Release': artifact.release,
+      },
+    });
+  } catch (err) {
+    console.error(`[helper-download] Refusing to serve unverified installer ${filename}:`, err);
+    return c.json(
+      {
+        error: 'Installer unavailable',
+        message: 'The Helper installer could not be verified. Retry later or contact your administrator.',
+      },
+      503,
+      { 'Retry-After': '30' },
+    );
+  }
 });
 
 // ============================================
@@ -439,15 +689,26 @@ registerComponentDownloadRoute({
 // /agent-versions/:version/download?component=watchdog, which hands back this
 // same-origin URL so the downloader's host-match guard passes (see
 // buildServerRelativeAgentDownloadUrl + issue #646).
+//
+// objectStorageDelivery 'stream' (#7576): `breeze-agent service install` also
+// fetches this route to stage the watchdog on first install, and that client
+// follows redirects only to GitHub release hosts and the build's own control
+// planes. It refused the 302 to a presigned object-storage URL ("release
+// redirect to untrusted origin"), so hosted installs served from object
+// storage never got a watchdog. Serving the bytes from this origin fixes shipped agents without an
+// agent release and keeps that allowlist narrow. Integrity is unchanged: the
+// agent binds the bytes to the size and SHA-256 in the signed release manifest.
+// The cost is ~9 MB per watchdog fetch through the API instead of object
+// storage. BINARY_SOURCE=github still 302s to GitHub, which the client trusts.
 registerComponentDownloadRoute({
   path: '/download/watchdog/:os/:arch',
   logTag: 'watchdog-download',
-  s3Prefix: 'watchdog',
   entityLabel: 'Watchdog binary',
   component: 'watchdog',
   filenameFor: perArchFilename('watchdog'),
   githubUrlFor: getGithubWatchdogUrl,
-  binaryDir: () => resolve(process.env.AGENT_BINARY_DIR || './agent/bin'),
+  store: 'agent',
+  objectStorageDelivery: 'stream',
 });
 
 // ============================================
@@ -457,16 +718,16 @@ registerComponentDownloadRoute({
 // this as a non-fatal post-install step, and /agent-versions/:version/download
 // hands back this same-origin URL for component=backup so any future verified
 // self-heal fetch passes the downloader's host-match guard (see
-// buildServerRelativeAgentDownloadUrl). Mirrors the watchdog route exactly.
+// buildServerRelativeAgentDownloadUrl). Mirrors the watchdog route, except that
+// an object-storage copy is still handed out as a presigned redirect.
 registerComponentDownloadRoute({
   path: '/download/backup/:os/:arch',
   logTag: 'backup-download',
-  s3Prefix: 'backup',
   entityLabel: 'Backup binary',
   component: 'backup',
   filenameFor: perArchFilename('backup'),
   githubUrlFor: getGithubBackupUrl,
-  binaryDir: () => resolve(process.env.AGENT_BINARY_DIR || './agent/bin'),
+  store: 'agent',
 });
 
 // breeze-recovery-linux-<arch>.iso (W04b): the bare-metal recovery media,
@@ -479,13 +740,12 @@ registerComponentDownloadRoute({
 registerComponentDownloadRoute({
   path: '/download/recovery-iso/:os/:arch',
   logTag: 'recovery-iso-download',
-  s3Prefix: 'recovery-iso',
   entityLabel: 'Recovery media',
   component: 'recovery-iso',
   filenameFor: (os, arch) => (os === 'linux' ? `breeze-recovery-linux-${arch}.iso` : undefined),
   invalidOsMessage: (os) => `Recovery media is only available for linux today. Got: ${os}`,
   githubUrlFor: (_os, arch, version) => getGithubRecoveryIsoUrl(arch, version),
-  binaryDir: () => resolve(process.env.AGENT_BINARY_DIR || './agent/bin'),
+  store: 'agent',
 });
 
 // breeze-user-helper: the GUI-subsystem sibling of breeze-agent (Windows in
@@ -495,16 +755,15 @@ registerComponentDownloadRoute({
 // fetched by the agent's verified updater (component=user-helper). Without this
 // server-relative route the agent-versions response handed back the canonical
 // github.com asset URL, which the updater's host-equality check rejects (#1878).
-// Mirrors the watchdog route: github redirect / S3 presign / local disk.
+// Same shape as the agent route: github redirect / S3 presign / local disk.
 registerComponentDownloadRoute({
   path: '/download/user-helper/:os/:arch',
   logTag: 'user-helper-download',
-  s3Prefix: 'user-helper',
   entityLabel: 'User-helper binary',
   component: 'user-helper',
   filenameFor: perArchFilename('user-helper'),
   githubUrlFor: getGithubUserHelperUrl,
-  binaryDir: () => resolve(process.env.AGENT_BINARY_DIR || './agent/bin'),
+  store: 'agent',
 });
 
 // ============================================
@@ -526,6 +785,9 @@ function resolveInstallScriptServerUrl(requestUrl: string): string | null {
 }
 
 downloadRoutes.get('/install.sh', async (c) => {
+  const rateLimited = await enforcePublicAgentDownloadRateLimit(c, 'install-script-download');
+  if (rateLimited) return rateLimited;
+
   const serverUrl = resolveInstallScriptServerUrl(c.req.url);
   if (!serverUrl) {
     return c.json(
@@ -545,7 +807,10 @@ downloadRoutes.get('/install.sh', async (c) => {
   });
 });
 
-downloadRoutes.get('/uninstall.sh', async () => {
+downloadRoutes.get('/uninstall.sh', async (c) => {
+  const rateLimited = await enforcePublicAgentDownloadRateLimit(c, 'uninstall-script-download');
+  if (rateLimited) return rateLimited;
+
   return new Response(generateUninstallScript(), {
     status: 200,
     headers: {
@@ -560,8 +825,11 @@ function generateUninstallScript(): string {
 set -euo pipefail
 
 AGENT_BINARY="/usr/local/bin/breeze-agent"
+AGENT_BINARY_TRUSTED="/Library/Breeze/bin/breeze-agent"
 WATCHDOG_BINARY="/usr/local/bin/breeze-watchdog"
 BACKUP_BINARY="/usr/local/bin/breeze-backup"
+ISOLATION_RECOVERY_ROOT="/usr/local/lib/breeze"
+ISOLATION_DATA_DIR="/var/lib/breeze"
 
 fatal() {
   echo "Error: $*" >&2
@@ -615,13 +883,35 @@ breeze_stop_helpers() {
   done
 }
 
+# Callers stop every job and remove the live agent binary first. This removes
+# every Breeze binary from BOTH install directories: an agent relocated to
+# /Library/Breeze/bin can still leave a pre-relocation copy in /usr/local/bin.
+# Logs in /Library/Logs/Breeze are kept on purpose (they record the uninstall).
 breeze_remove_auxiliary() {
   rm -f /Library/LaunchDaemons/com.breeze.watchdog.plist \\
     /Library/LaunchAgents/com.breeze.desktop-helper-user.plist \\
     /Library/LaunchAgents/com.breeze.desktop-helper-loginwindow.plist \\
-    /usr/local/bin/breeze-watchdog /usr/local/bin/breeze-desktop-helper \\
-    /usr/local/bin/breeze-backup \\
+    /usr/local/bin/breeze-agent /usr/local/bin/breeze-watchdog \\
+    /usr/local/bin/breeze-desktop-helper /usr/local/bin/breeze-backup \\
+    /Library/Breeze/bin/breeze-agent /Library/Breeze/bin/breeze-watchdog \\
+    /Library/Breeze/bin/breeze-desktop-helper /Library/Breeze/bin/breeze-backup \\
+    /Library/Breeze/pkg-staging/breeze-agent \\
+    /Library/Breeze/pkg-staging/breeze-watchdog \\
+    /Library/Breeze/pkg-staging/breeze-backup \\
     "/Library/Application Support/Breeze/agent.sock" || return 1
+  # Remove the tree only while empty: anything else in it is not ours to delete.
+  rmdir /Library/Breeze/pkg-staging /Library/Breeze/bin /Library/Breeze 2>/dev/null || true
+  if [ -d /Library/Breeze ]; then
+    echo "Note: left /Library/Breeze in place because it is not empty" >&2
+  fi
+  # self_uninstall disables the agent label so a reboot mid-teardown cannot
+  # restart it. With the plists gone that is no longer needed, and a label left
+  # disabled makes the next install's bootstrap fail with EIO 5 (#7831).
+  # POSIX sh has no \`local\`: prefixed names keep these out of callers' way.
+  for _breeze_label in com.breeze.agent com.breeze.watchdog; do
+    _breeze_out="$(launchctl enable "system/$_breeze_label" 2>&1)" ||
+      echo "Warning: could not clear the launchd disable for $_breeze_label ($_breeze_out); the .pkg and 'breeze-agent service install' re-enable it" >&2
+  done
   # Only forget this package's receipt; configuration and logs retain their policy.
   receipts="$(pkgutil --pkgs)" || return 1
   # Consume all input: grep -q can SIGPIPE printf under Bash pipefail.
@@ -636,12 +926,61 @@ uninstall_macos() {
   breeze_stop_watchdog || return 1
   breeze_stop_helpers || return 1
   breeze_bootout system/com.breeze.agent || return 1
-  rm -f /Library/LaunchDaemons/com.breeze.agent.plist "$AGENT_BINARY" || return 1
+  rm -f /Library/LaunchDaemons/com.breeze.agent.plist "$AGENT_BINARY" "$AGENT_BINARY_TRUSTED" || return 1
   breeze_remove_auxiliary || return 1
 
   echo "Breeze Agent uninstalled."
   echo "Config at /Library/Application Support/Breeze/ was preserved."
   echo "To remove config: sudo rm -rf '/Library/Application Support/Breeze'"
+  echo "Logs at /Library/Logs/Breeze/ were kept. To remove them: sudo rm -rf /Library/Logs/Breeze"
+}
+
+# Network isolation is released before anything it depends on is touched:
+# removing the agent or the recovery timers first would leave this host cut off
+# with nothing left to undo it. Returns non-zero when the release cannot be
+# confirmed. A host that was never isolated has no journal and no table.
+release_isolation_linux() {
+  local data_dir="$ISOLATION_DATA_DIR"
+  local journal=0 rules="absent" tables
+  if [[ -e "$data_dir/isolation.json" ]]; then
+    journal=1
+  fi
+  # A failed listing is "unknown", never "absent": only a listing that ran and
+  # lacks our table proves the rules are gone.
+  if command -v nft >/dev/null 2>&1; then
+    if tables="$(nft list tables 2>/dev/null)"; then
+      # Not grep -q: it can SIGPIPE printf under pipefail.
+      if printf '%s\\n' "$tables" | grep -Fx 'table inet breeze_isolation' >/dev/null; then
+        rules="present"
+      fi
+    else
+      rules="unknown"
+    fi
+  fi
+  # No journal: no build that isolates has run here, so nothing is ours to
+  # release, even when the engine cannot be asked (a kernel without nf_tables).
+  if [[ "$journal" -eq 0 && "$rules" != "present" ]]; then
+    return 0
+  fi
+  if [[ -x "$AGENT_BINARY" ]] && "$AGENT_BINARY" containment release-all --reason uninstall; then
+    return 0
+  fi
+  # A broken agent must not block this: the recovery binary is installed
+  # separately for exactly that case.
+  local recovery
+  for recovery in "$ISOLATION_RECOVERY_ROOT"/isolation-recovery/*/breeze-isolation-recovery; do
+    if [[ -x "$recovery" ]] && "$recovery" release-all --data-dir "$data_dir" --reason uninstall; then
+      return 0
+    fi
+  done
+  # Nothing could run. A journal alone is harmless once the rules are observably
+  # gone (a half-removed install); rules still in place, or an engine that cannot
+  # be asked, are not.
+  if [[ "$rules" == "absent" ]] && command -v nft >/dev/null 2>&1; then
+    warn "no agent or recovery binary to record the release; no isolation rules are installed"
+    return 0
+  fi
+  return 1
 }
 
 uninstall_linux() {
@@ -653,7 +992,11 @@ uninstall_linux() {
 
   echo "Uninstalling Breeze Agent for Linux..."
 
+  release_isolation_linux || fatal "network isolation could not be released; nothing was removed. Release it from the console or with: sudo breeze-agent containment release --force"
+
   if command -v systemctl >/dev/null 2>&1; then
+    systemctl stop breeze-isolation-poll.timer 2>/dev/null || true
+    systemctl disable breeze-isolation-poll.timer breeze-isolation.service 2>/dev/null || true
     if systemctl is-active --quiet breeze-agent 2>/dev/null; then
       systemctl stop breeze-agent
       echo "Service stopped."
@@ -679,6 +1022,11 @@ uninstall_linux() {
   rm -f "$AGENT_BINARY"
   rm -f "$WATCHDOG_BINARY"
   rm -f "$BACKUP_BINARY"
+  rm -f /etc/systemd/system/breeze-isolation.service \\
+    /etc/systemd/system/breeze-isolation-poll.service \\
+    /etc/systemd/system/breeze-isolation-poll.timer
+  rm -rf "$ISOLATION_RECOVERY_ROOT/isolation-recovery"
+  rmdir "$ISOLATION_RECOVERY_ROOT" 2>/dev/null || true
   rmdir "$ipc_dir" 2>/dev/null || true
 
   if command -v systemctl >/dev/null 2>&1; then
@@ -820,6 +1168,25 @@ else
   CONFIG_DIR="/etc/breeze"
 fi
 BINARY_NAME="breeze-agent"
+# The macOS .pkg installs the agent to /Library/Breeze/bin or /usr/local/bin
+# (agent/installer/macos/install-location.sh, #7211), so enrollment must use
+# the binary it actually installed (#8778).
+MACOS_TRUSTED_BIN_DIR="/Library/Breeze/bin"
+
+# resolve_macos_agent_bin: print the agent binary the .pkg installed. Mirrors
+# choose_bin_dir in install-location.sh: an agent already in the trusted dir
+# stays there (so it wins over a leftover pre-relocation copy), otherwise the
+# package used /usr/local/bin. Fails when neither holds an executable agent.
+resolve_macos_agent_bin() {
+  local p
+  for p in "\$MACOS_TRUSTED_BIN_DIR/\$BINARY_NAME" "\$INSTALL_DIR/\$BINARY_NAME"; do
+    if [[ -f "\$p" && ! -L "\$p" && -x "\$p" ]]; then
+      echo "\$p"
+      return 0
+    fi
+  done
+  return 1
+}
 DOWNLOAD_URL="\${BREEZE_SERVER}/api/v1/agents/download/\${OS}/\${ARCH}"
 PKG_URL="\${BREEZE_SERVER}/api/v1/agents/download/\${OS}/\${ARCH}/pkg"
 VERSION_METADATA_URL="\${BREEZE_SERVER}/api/v1/agent-versions/latest?platform=\${OS}&arch=\${ARCH}&component=agent"
@@ -1007,22 +1374,20 @@ if [[ "\$OS" == "darwin" ]]; then
 
   # Enroll agent
   info "Enrolling agent with Breeze server..."
-  ENROLL_ARGS=(enroll)
-  # The token is mandatory and already validated above as non-empty, so append
-  # it unconditionally — there is no token-less enroll path.
-  ENROLL_ARGS+=("\$BREEZE_ENROLL_TOKEN")
-  ENROLL_ARGS+=(--server "\$BREEZE_SERVER")
-  if [[ -n "\$BREEZE_ENROLLMENT_SECRET" ]]; then
-    ENROLL_ARGS+=(--enrollment-secret "\$BREEZE_ENROLLMENT_SECRET")
-  fi
-  if [[ -n "\$BREEZE_SITE_ID" ]]; then
-    ENROLL_ARGS+=(--site-id "\$BREEZE_SITE_ID")
-  fi
+  ENROLL_ARGS=(enroll --server "\$BREEZE_SERVER")
   if [[ -n "\$BREEZE_DEVICE_ROLE" ]]; then
     ENROLL_ARGS+=(--device-role "\$BREEZE_DEVICE_ROLE")
   fi
 
-  if ! "\$INSTALL_DIR/\$BINARY_NAME" "\${ENROLL_ARGS[@]}"; then
+  # The enrollment token and secret are handed to the agent through its
+  # environment rather than its command line: any other local account can
+  # read a process's argv (e.g. /proc/*/cmdline on Linux, ps on macOS), but
+  # not another user's environment. Scoped with a VAR=value prefix so it only
+  # applies to this one invocation, never exported into this shell.
+  MACOS_AGENT_BIN="\$(resolve_macos_agent_bin)" || \
+    fatal "The package installed, but no breeze-agent was found in \$MACOS_TRUSTED_BIN_DIR or \$INSTALL_DIR."
+  if ! BREEZE_AGENT_ENROLLMENT_KEY="\$BREEZE_ENROLL_TOKEN" BREEZE_AGENT_ENROLLMENT_SECRET="\$BREEZE_ENROLLMENT_SECRET" \
+      "\$MACOS_AGENT_BIN" "\${ENROLL_ARGS[@]}"; then
     fatal "Enrollment failed. Check the server URL and that the enrollment token is valid and not expired (plus the enrollment secret, if your server requires one)."
   fi
   success "Agent enrolled successfully"
@@ -1083,6 +1448,26 @@ success "Downloaded agent binary ($(wc -c < "\$TMPFILE" | tr -d ' ') bytes)"
 info "Verifying agent binary checksum..."
 verify_sha256 "\$TMPFILE" "\$EXPECTED_SHA256"
 success "Verified agent binary checksum"
+
+# ----- Refuse an agent too old for this script's enrollment flow (#9566) -----
+# This script hands the enrollment token to \`breeze-agent enroll\` through
+# BREEZE_AGENT_ENROLLMENT_KEY with no positional argument. Agents before
+# MIN_AGENT_VERSION only knew \`enroll <enrollment-key>\`, so against one the user
+# would see a bare cobra "accepts 1 arg(s), received 0" after a good download.
+# 0.118.0 is the first tag containing env-var enrollment (aa95674df5, #7199).
+# Conservative: only fail when the version parses AND is clearly lower; a binary
+# that cannot be executed here (noexec tmp) or prints something unparseable
+# (dev build) is let through. Runs before the existing install is touched.
+MIN_AGENT_VERSION="0.118.0"
+chmod 755 "\$TMPFILE" 2>/dev/null || true
+DOWNLOADED_VERSION_RAW="$("\$TMPFILE" version 2>/dev/null | head -n 1)" || DOWNLOADED_VERSION_RAW=""
+DOWNLOADED_VERSION="$(printf '%s' "\$DOWNLOADED_VERSION_RAW" | sed -n 's/^[^0-9]*\\([0-9][0-9]*\\.[0-9][0-9]*\\.[0-9][0-9]*\\).*/\\1/p' | head -n 1)"
+if [[ -n "\$DOWNLOADED_VERSION" ]]; then
+  OLDEST_VERSION="$(printf '%s\\n%s\\n' "\$MIN_AGENT_VERSION" "\$DOWNLOADED_VERSION" | sort -t. -k1,1n -k2,2n -k3,3n | head -n 1)"
+  if [[ "\$DOWNLOADED_VERSION" != "\$MIN_AGENT_VERSION" && "\$OLDEST_VERSION" == "\$DOWNLOADED_VERSION" ]]; then
+    fatal "The agent binary served by this server is v\$DOWNLOADED_VERSION, which is older than this server's install flow (needs v\$MIN_AGENT_VERSION or newer). Set BREEZE_VERSION on the server (or check the release channel) so it serves a current agent, then re-run this script."
+  fi
+fi
 
 # ----- Stop existing service before replacing binary (safe for upgrades) -----
 if command -v systemctl &>/dev/null && systemctl is-active --quiet breeze-agent 2>/dev/null; then
@@ -1167,24 +1552,31 @@ mkdir -p "\$CONFIG_DIR"
 chmod 0700 "\$CONFIG_DIR"
 success "Config directory ready"
 
+# ----- Create data directory and breeze group (#9566) -----
+# Without these a first enroll logs WARNs about the DNS cache file
+# (/var/lib/breeze/dns-cache.json) and the missing breeze group (helper token
+# left root-only). Mirrors agent/scripts/install/install-linux.sh and
+# \`breeze-agent service install\` (0755 data dir, system group).
+mkdir -p /var/lib/breeze
+chmod 0755 /var/lib/breeze
+if command -v groupadd &>/dev/null && ! getent group breeze &>/dev/null; then
+  groupadd --system breeze 2>/dev/null || warn "Could not create the breeze group; the helper token file will stay root-only"
+fi
+
 # ----- Enroll agent -----
 info "Enrolling agent with Breeze server..."
-ENROLL_ARGS=(enroll)
-# The token is mandatory and already validated above as non-empty, so append
-# it unconditionally — there is no token-less enroll path.
-ENROLL_ARGS+=("\$BREEZE_ENROLL_TOKEN")
-ENROLL_ARGS+=(--server "\$BREEZE_SERVER")
-if [[ -n "\$BREEZE_ENROLLMENT_SECRET" ]]; then
-  ENROLL_ARGS+=(--enrollment-secret "\$BREEZE_ENROLLMENT_SECRET")
-fi
-if [[ -n "\$BREEZE_SITE_ID" ]]; then
-  ENROLL_ARGS+=(--site-id "\$BREEZE_SITE_ID")
-fi
+ENROLL_ARGS=(enroll --server "\$BREEZE_SERVER")
 if [[ -n "\$BREEZE_DEVICE_ROLE" ]]; then
   ENROLL_ARGS+=(--device-role "\$BREEZE_DEVICE_ROLE")
 fi
 
-if ! "\$INSTALL_DIR/\$BINARY_NAME" "\${ENROLL_ARGS[@]}"; then
+# The enrollment token and secret are handed to the agent through its
+# environment rather than its command line: any other local account can read
+# a process's argv (e.g. /proc/*/cmdline, world-readable on Linux) but not
+# another user's environment. Scoped with a VAR=value prefix so it only
+# applies to this one invocation, never exported into this shell.
+if ! BREEZE_AGENT_ENROLLMENT_KEY="\$BREEZE_ENROLL_TOKEN" BREEZE_AGENT_ENROLLMENT_SECRET="\$BREEZE_ENROLLMENT_SECRET" \
+    "\$INSTALL_DIR/\$BINARY_NAME" "\${ENROLL_ARGS[@]}"; then
   fatal "Enrollment failed. Check the server URL and that the enrollment token is valid and not expired (plus the enrollment secret, if your server requires one)."
 fi
 success "Agent enrolled successfully"

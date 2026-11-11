@@ -3,31 +3,52 @@
  *
  * Tools for querying, inspecting, and managing individual devices.
  * - query_devices (Tier 1): Search and filter devices
- * - get_device_details (Tier 1): Comprehensive device info with hardware/network/metrics
+ * - get_device_details (Tier 1): Comprehensive device info with hardware/memory modules/network/metrics
  * - get_device_context (Tier 1): Retrieve AI memory about a device
  * - set_device_context (Tier 2): Record context/memory about a device
  * - resolve_device_context (Tier 2): Mark context entry as resolved
  * - manage_tags (Tier 2): List/add/remove device tags
  * - query_custom_fields (Tier 1): Get custom field definitions or device values
+ * - get_fleet_device_stats (Tier 1): Exact fleet-wide device counts by status
  */
 
+import {
+  WORKLOAD_RUNTIMES,
+  WORKLOAD_STATES,
+  TIME_SYNC_DOMAIN_ROLES,
+  TIME_SYNC_FINDING_CODES,
+  TIME_SYNC_HEALTH,
+} from '@breeze/shared';
+import { pageEnvelope, pageParamSchema, readPageArgs } from './aiToolPagination';
+import { orgNameOf, readReachSpansOrgs, splitOrgLegend } from './aiToolOrgLegend';
 import { db } from '../db';
 import {
   devices,
   deviceHardware,
   deviceNetwork,
   deviceDisks,
+  deviceMemoryModules,
   deviceMetrics,
   sites,
   customFieldDefinitions,
 } from '../db/schema';
-import { eq, and, desc, sql, inArray, SQL } from 'drizzle-orm';
+import { eq, and, asc, desc, sql, inArray, SQL } from 'drizzle-orm';
 import { escapeLike } from '../utils/sql';
+import { sqlTextArray } from '../db/sqlValues';
 import type { AuthContext } from '../middleware/auth';
 import type { AiTool } from './aiTools';
 import { verifyDeviceAccess } from './aiTools';
-import { resolveSiteAllowedDeviceIds, runFrozenDeviceIds } from './aiToolsSiteScope';
+import { requestDeviceGroupReevaluationAfterCommit } from '../jobs/deviceGroupJobs';
+import { resolveSiteAllowedDeviceIds, runFrozenDeviceIds, siteScopeCondition, deviceScopeCondition } from './aiToolsSiteScope';
+import { queryDeviceStats } from './deviceStats';
+import { getDeviceHardwareHealthView } from './hardwareHealth/view';
+import { getDeviceTimeStatusView } from './timeSync/view';
+import { getDeviceWorkloadsView } from './workloads/view';
+import { projectWorkloadsForAi } from './workloads/aiProjection';
+import { fleetTimeFiltersSchema, listFleetTimeStatus } from './timeSync/fleet';
+import { getDeviceReliability, getDeviceReliabilityOffenders } from './reliabilityScoring';
 import { projectPublicDevice } from '../routes/devices/helpers';
+import { readPlacement } from './assetPlacement';
 import {
   sanitizeUntrustedText,
   wrapUntrustedData,
@@ -39,6 +60,7 @@ import {
   createDeviceContext,
   resolveDeviceContext,
 } from './brainDeviceContext';
+import { notParkedDeviceCondition } from './unassignedPool/selectorPredicate';
 
 type AiToolTier = 1 | 2 | 3 | 4;
 
@@ -56,10 +78,23 @@ export function customFieldDefinitionConditions(auth: AuthContext): SQL[] {
     conditions.push(
       sql`(${customFieldDefinitions.orgId} = ${auth.orgId} OR ${customFieldDefinitions.orgId} IS NULL)`
     );
+    if (auth.partnerId) {
+      conditions.push(
+        sql`(${customFieldDefinitions.partnerId} = ${auth.partnerId} OR ${customFieldDefinitions.partnerId} IS NULL)`
+      );
+    }
+    return conditions;
   }
   if (auth.partnerId) {
+    // Partner-scope caller with no direct org: mirror
+    // routes/customFields.ts:238-249 (`partnerId = P OR orgId IN
+    // accessibleOrgIds`). `partnerId = P OR partnerId IS NULL` matches every
+    // org-owned definition system-wide, leaving RLS as the only gate.
+    const accessibleOrgIds = (auth.accessibleOrgIds ?? []).filter((id): id is string => Boolean(id));
     conditions.push(
-      sql`(${customFieldDefinitions.partnerId} = ${auth.partnerId} OR ${customFieldDefinitions.partnerId} IS NULL)`
+      accessibleOrgIds.length > 0
+        ? sql`(${customFieldDefinitions.partnerId} = ${auth.partnerId} OR ${customFieldDefinitions.orgId} IN ${accessibleOrgIds})`
+        : eq(customFieldDefinitions.partnerId, auth.partnerId)
     );
   }
   return conditions;
@@ -83,6 +118,39 @@ export async function readCustomFieldDefinitions(auth: AuthContext) {
     .orderBy(customFieldDefinitions.name);
 }
 
+// #5351 — per-slot memory inventory for get_device_details. A 4-socket
+// server can report 48+ slots; the list is capped like disks/NICs, while the
+// summary is computed from every slot first so free-slot counts stay exact.
+const MEMORY_MODULES_TOOL_LIMIT = 32;
+
+type MemoryModuleRow = typeof deviceMemoryModules.$inferSelect;
+
+function projectMemoryModule(row: MemoryModuleRow) {
+  return {
+    locator: row.locator, bankLabel: row.bankLabel, populated: row.populated, capacityMb: row.capacityMb,
+    memoryType: row.memoryType, formFactor: row.formFactor, speedMts: row.speedMts,
+    configuredSpeedMts: row.configuredSpeedMts, manufacturer: row.manufacturer, partNumber: row.partNumber,
+    serialNumber: row.serialNumber,
+  };
+}
+
+function summarizeMemory(hardware: typeof deviceHardware.$inferSelect | null, modules: MemoryModuleRow[]) {
+  // No module rows and no applied memory block = the agent never reported
+  // slot inventory (needs an agent update) — not "zero slots".
+  if (modules.length === 0 && !hardware?.memoryObservedAt) return { reported: false as const };
+  const populated = modules.filter((row) => row.populated);
+  return {
+    reported: true as const,
+    slotsTotal: hardware?.memorySlotsTotal ?? modules.length,
+    slotsPopulated: populated.length,
+    slotsFree: modules.length - populated.length,
+    installedMb: populated.reduce((total, row) => total + (row.capacityMb ?? 0), 0),
+    maxCapacityMb: hardware?.memoryMaxCapacityMb ?? null,
+    soldered: hardware?.memorySoldered ?? null,
+    observedAt: hardware?.memoryObservedAt ?? null,
+  };
+}
+
 export function registerDeviceTools(aiTools: Map<string, AiTool>): void {
   function registerTool(tool: AiTool): void {
     aiTools.set(tool.definition.name, tool);
@@ -99,7 +167,7 @@ export function registerDeviceTools(aiTools: Map<string, AiTool>): void {
     alwaysLoad: true,
     definition: {
       name: 'query_devices',
-      description: 'Search and filter devices in the organization. Returns a summary list of matching devices including hostname, OS, status, IP, and last seen time.',
+      description: 'Search and filter devices in the organization. Returns a summary list of matching devices including hostname, OS, status, IP, and last seen time, sorted by hostname for stable pagination.',
       input_schema: {
         type: 'object' as const,
         properties: {
@@ -108,11 +176,19 @@ export function registerDeviceTools(aiTools: Map<string, AiTool>): void {
           siteId: { type: 'string', description: 'Filter by site UUID' },
           search: { type: 'string', description: 'Search by hostname or display name (partial match)' },
           tags: { type: 'array', items: { type: 'string' }, description: 'Filter by tags (devices must have all specified tags)' },
-          limit: { type: 'number', description: 'Max results to return (default 25, max 100)' }
+          // Default 20 (was 25): the 25-row budget-fixture page (DEVICE_ROW in
+          // aiToolsDevice.outputShape.test.ts) sat within ~100 chars of
+          // MAX_TOOL_RESULT_CHARS, leaving no room for the org fields a
+          // multi-org caller gets (#10408).
+          ...pageParamSchema(20, 100),
         }
       }
     },
     handler: async (input, auth) => {
+      const page = readPageArgs('query_devices', input, { defaultLimit: 20, maxLimit: 100 });
+      if (!page.ok) return JSON.stringify({ error: page.error, code: page.code });
+      const { limit, offset, fingerprint } = page;
+
       const conditions: SQL[] = [];
       const orgCondition = auth.orgCondition(devices.orgId);
       if (orgCondition) conditions.push(orgCondition);
@@ -121,6 +197,8 @@ export function registerDeviceTools(aiTools: Map<string, AiTool>): void {
       // (so RLS lets techs read their own sessions), so ephemeral devices are NOT
       // filtered by the org axis — exclude them explicitly from model-visible lists.
       conditions.push(eq(devices.isEphemeral, false));
+      // Devices parked in a holding org are never model-visible, whatever the scope.
+      conditions.push(notParkedDeviceCondition());
 
       if (input.status) conditions.push(eq(devices.status, input.status as typeof devices.status.enumValues[number]));
       if (input.osType) conditions.push(eq(devices.osType, input.osType as typeof devices.osType.enumValues[number]));
@@ -133,6 +211,12 @@ export function registerDeviceTools(aiTools: Map<string, AiTool>): void {
           sql`(${devices.hostname} ILIKE ${searchPattern} OR ${devices.displayName} ILIKE ${searchPattern})`
         );
       }
+      // `tags` is documented as "devices must have ALL specified tags" → array
+      // containment (@>), not overlap (&&). (#9122)
+      if (Array.isArray(input.tags)) {
+        const tagFilter = input.tags.filter((t): t is string => typeof t === 'string' && t.length > 0);
+        if (tagFilter.length > 0) conditions.push(sql`${devices.tags} @> ${sqlTextArray(tagFilter)}`);
+      }
 
       // Site axis (app-layer only; RLS does NOT enforce it): a site-restricted
       // caller may only enumerate devices in their allowed sites. The optional
@@ -142,7 +226,7 @@ export function registerDeviceTools(aiTools: Map<string, AiTool>): void {
       if (auth.allowedSiteIds && queryOrgId) {
         const allowed = await resolveSiteAllowedDeviceIds(queryOrgId, auth);
         if (!allowed || allowed.length === 0) {
-          return JSON.stringify({ devices: [], total: 0, showing: 0 });
+          return JSON.stringify(pageEnvelope({ key: 'devices', items: [], limit, offset, fingerprint, total: 0 }));
         }
         conditions.push(inArray(devices.id, allowed));
       }
@@ -152,8 +236,9 @@ export function registerDeviceTools(aiTools: Map<string, AiTool>): void {
       const frozenDeviceIds = runFrozenDeviceIds(auth);
       if (frozenDeviceIds) conditions.push(inArray(devices.id, frozenDeviceIds));
 
-      const limit = Math.min(Math.max(1, Number(input.limit) || 25), 100);
-
+      // #10408: a caller reaching several orgs gets each row's org, or it mixes
+      // customers (wrong-org narration, cross-org proposals the write path refuses).
+      const spansOrgs = readReachSpansOrgs(auth);
       const results = await db
         .select({
           id: devices.id,
@@ -165,13 +250,20 @@ export function registerDeviceTools(aiTools: Map<string, AiTool>): void {
           agentVersion: devices.agentVersion,
           lastSeenAt: devices.lastSeenAt,
           tags: devices.tags,
-          siteName: sites.name
+          siteName: sites.name,
+          ...(spansOrgs ? { orgId: devices.orgId, orgName: orgNameOf(devices.orgId) } : {}),
         })
         .from(devices)
         .leftJoin(sites, eq(devices.siteId, sites.id))
         .where(conditions.length > 0 ? and(...conditions) : undefined)
-        .orderBy(desc(devices.lastSeenAt))
-        .limit(limit);
+        // Fix 2: `desc(lastSeenAt)` alone has no tiebreaker, so agent
+        // heartbeat churn between page requests can shift a device across
+        // the offset boundary — an offset page then skips or duplicates
+        // rows. `(hostname, id)` is stable and unique, so offset pagination
+        // is deterministic across calls.
+        .orderBy(asc(devices.hostname), asc(devices.id))
+        .limit(limit)
+        .offset(offset);
 
       // Get count
       const countResult = await db
@@ -181,10 +273,13 @@ export function registerDeviceTools(aiTools: Map<string, AiTool>): void {
 
       const total = Number(countResult[0]?.count ?? 0);
 
+      if (!spansOrgs) {
+        return JSON.stringify(pageEnvelope({ key: 'devices', items: results, limit, offset, fingerprint, total }));
+      }
+      const legend = splitOrgLegend(results as Array<(typeof results)[number] & { orgId: string; orgName: string | null }>);
       return JSON.stringify({
-        devices: results,
-        total,
-        showing: results.length
+        ...pageEnvelope({ key: 'devices', items: legend.rows, limit, offset, fingerprint, total }),
+        organizations: legend.organizations,
       });
     }
   });
@@ -196,11 +291,12 @@ export function registerDeviceTools(aiTools: Map<string, AiTool>): void {
   registerTool({
     tier: 1,
     domain: 'devices',
-    searchHint: 'device hardware, network interfaces, disk usage and recent metrics',
+    searchHint: 'device hardware, RAM slots and memory modules, network interfaces, disk usage and recent metrics',
+    alwaysLoad: true,
     deviceArgs: ['deviceId'],
     definition: {
       name: 'get_device_details',
-      description: 'Get comprehensive details about a specific device including hardware specs, network interfaces, disk usage, and recent metrics.',
+      description: 'Get comprehensive details about a specific device including hardware specs, installed memory modules per RAM slot (capacity, type, speed, manufacturer, part/serial number, free slots), network interfaces, disk usage, physical placement (room, rack, rack unit), and recent metrics.',
       input_schema: {
         type: 'object' as const,
         properties: {
@@ -217,14 +313,19 @@ export function registerDeviceTools(aiTools: Map<string, AiTool>): void {
       const { device } = access;
 
       // Fetch related data in parallel
-      const [hardware, network, disks, recentMetrics] = await Promise.all([
+      const [hardware, network, disks, recentMetrics, memoryModules, placement] = await Promise.all([
         db.select().from(deviceHardware).where(eq(deviceHardware.deviceId, deviceId)).limit(1),
         db.select().from(deviceNetwork).where(eq(deviceNetwork.deviceId, deviceId)),
         db.select().from(deviceDisks).where(eq(deviceDisks.deviceId, deviceId)),
         db.select().from(deviceMetrics)
           .where(eq(deviceMetrics.deviceId, deviceId))
           .orderBy(desc(deviceMetrics.timestamp))
-          .limit(5)
+          .limit(5),
+        db.select().from(deviceMemoryModules)
+          .where(eq(deviceMemoryModules.deviceId, deviceId))
+          .orderBy(asc(deviceMemoryModules.slotIndex), asc(deviceMemoryModules.id)),
+        // #8134: room / rack / rack unit / height U, or null when not recorded.
+        readPlacement('device', deviceId, device.orgId),
       ]);
 
       // Get site name
@@ -234,17 +335,219 @@ export function registerDeviceTools(aiTools: Map<string, AiTool>): void {
         .where(eq(sites.id, device.siteId))
         .limit(1);
 
+      // A-W05 (5c): cap the sub-arrays so a NIC-heavy or disk-heavy device
+      // can't blow the page budget; every column here is already a scalar
+      // (no jsonb on device_hardware/device_network/device_disks).
       return JSON.stringify({
         device: {
           ...projectPublicDevice(device),
           siteName: site?.name
         },
         hardware: hardware[0] ?? null,
-        networkInterfaces: network,
-        disks,
+        networkInterfaces: network.slice(0, 16),
+        networkInterfaceCount: network.length,
+        disks: disks.slice(0, 16),
+        diskCount: disks.length,
+        // #5351: summary first, from EVERY slot, then the bounded list.
+        memorySummary: summarizeMemory(hardware[0] ?? null, memoryModules),
+        memoryModules: memoryModules.slice(0, MEMORY_MODULES_TOOL_LIMIT).map(projectMemoryModule),
+        memoryModuleCount: memoryModules.length,
+        placement,
         recentMetrics
       }, (_, v) => typeof v === 'bigint' ? Number(v) : v);
     }
+  });
+
+  // ============================================
+  registerTool({
+    tier: 1,
+    domain: 'devices',
+    deviceArgs: ['deviceId'],
+    searchHint:
+      'time synchronization, NTP source, domain PDC, time service findings, timezone mismatch',
+    definition: {
+      name: 'list_time_sync_issues',
+      description:
+        'List observed time synchronization status in the accessible Windows fleet. Filter by finding, role, domain, health, organization or site; paged. PDC domain context respects caller access. Optional deviceId restricts the whole result, including domain context, to one device.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          health: { type: 'string', enum: [...TIME_SYNC_HEALTH] },
+          finding: { type: 'string', enum: [...TIME_SYNC_FINDING_CODES] },
+          role: { type: 'string', enum: [...TIME_SYNC_DOMAIN_ROLES] },
+          orgId: { type: 'string', format: 'uuid' },
+          siteId: { type: 'string', format: 'uuid' },
+          deviceId: { type: 'string', format: 'uuid' },
+          domain: { type: 'string', minLength: 1, maxLength: 255 },
+          page: { type: 'integer', minimum: 1, default: 1 },
+          limit: { type: 'integer', minimum: 1, maximum: 100, default: 50, description: 'Max devices per page (default 50, max 100)' },
+        },
+      },
+    },
+    handler: async (input, auth) =>
+      JSON.stringify(
+        await listFleetTimeStatus(fleetTimeFiltersSchema.parse(input), auth),
+      ),
+  });
+
+  // get_fleet_device_stats - Tier 1 (auto-execute). #6797
+  registerTool({
+    tier: 1,
+    domain: 'devices',
+    searchHint: 'how many devices, device count, online offline totals, fleet size, devices by status',
+    definition: {
+      name: 'get_fleet_device_stats',
+      description:
+        'Exact live fleet device counts: total, online, offline, byStatus, migrationRequiredCount, logShippingFailingCount. Use for "how many devices" instead of paging query_devices. Excludes decommissioned, parked and Quick Support devices. Optional orgId narrows to one org.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          orgId: { type: 'string', format: 'uuid', description: 'Narrow to one organization' },
+        },
+      },
+    },
+    handler: async (input, auth) => {
+      const orgId = typeof input.orgId === 'string' ? input.orgId : undefined;
+      // Same tenant narrowing as GET /devices/stats (routes/devices/scope.ts):
+      // org axis + optional orgId (denied when inaccessible), plus the site and
+      // exact-device axes that only the AI surface carries.
+      if (orgId && !auth.canAccessOrg(orgId)) {
+        return JSON.stringify({ error: 'Access to this organization denied' });
+      }
+      const scope = and(
+        auth.orgCondition(devices.orgId),
+        siteScopeCondition(auth, devices.siteId),
+        deviceScopeCondition(auth, devices.id),
+        orgId ? eq(devices.orgId, orgId) : undefined,
+      );
+      return JSON.stringify(await queryDeviceStats(scope));
+    },
+  });
+
+  // get_device_hardware_health - Tier 1 (auto-execute)
+  // ============================================
+
+  registerTool({
+    tier: 1,
+    domain: 'devices',
+    deviceArgs: ['deviceId'],
+    searchHint: 'RAID arrays, physical disks, cache batteries, hardware collector health and reliability score inputs',
+    definition: {
+      name: 'get_device_hardware_health',
+      description: 'Get current hardware health, components, collectors, optional recent events, and (with includeReliability) the reliability score\'s factor breakdown and top hardware offenders — the real inputs behind the score, so an explanation is grounded in actual events, not guessed causes.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          deviceId: { type: 'string', description: 'The device UUID' },
+          includeEvents: { type: 'boolean', default: false },
+          includeReliability: {
+            type: 'boolean',
+            default: false,
+            description: 'Include the reliability score\'s per-factor drivers and top 30-day hardware offenders. Use before explaining or diagnosing reliability.'
+          }
+        },
+        required: ['deviceId']
+      }
+    },
+    handler: async (input, auth) => {
+      const deviceId = input.deviceId as string;
+      const access = await verifyDeviceAccess(deviceId, auth);
+      if ('error' in access) return JSON.stringify({ error: access.error });
+      const view = await getDeviceHardwareHealthView(deviceId, { eventLimit: input.includeEvents === true ? 50 : 0 });
+      const result: Record<string, unknown> = { ...(view ?? { error: 'no_hardware_health' }) };
+      if (input.includeReliability === true) {
+        const [reliability, offenders] = await Promise.all([
+          getDeviceReliability(deviceId),
+          getDeviceReliabilityOffenders(deviceId, 30, 5),
+        ]);
+        result.reliability = reliability
+          ? {
+              score: reliability.reliabilityScore,
+              trendDirection: reliability.trendDirection,
+              // The scored inputs behind the number: per-factor score/weight/lostPoints/evidence.
+              drivers: reliability.drivers ?? [],
+              // #5876: a fresh score after a fix/reimage is not long-term health.
+              baseline: reliability.baseline
+                ? {
+                    reason: reliability.baseline.reason,
+                    baselineAt: reliability.baseline.baselineAt,
+                    provisional: reliability.baseline.provisional,
+                    reportedDaysSinceBaseline: reliability.baseline.reportedDaysSinceBaseline,
+                  }
+                : null,
+            }
+          : null;
+        // Top hardware offenders (source + distinct event count) for the same
+        // 30-day window the hardware driver's evidence covers — lets the model
+        // name the actual source instead of guessing (#7132).
+        result.hardwareOffenders30d = offenders.hardware;
+      }
+      return JSON.stringify(result);
+    }
+  });
+
+  registerTool({
+    tier: 1,
+    domain: 'devices',
+    deviceArgs: ['deviceId'],
+    searchHint:
+      'Windows time synchronization, timezone, NTP source and time findings',
+    definition: {
+      name: 'get_device_time_status',
+      description:
+        'Get current Windows time synchronization, expected timezone provenance, findings and recent time events.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          deviceId: { type: 'string', description: 'The device UUID' },
+        },
+        required: ['deviceId'],
+      },
+    },
+    handler: async (input, auth) => {
+      const deviceId = input.deviceId as string;
+      const access = await verifyDeviceAccess(deviceId, auth);
+      if ('error' in access) return JSON.stringify({ error: access.error });
+      return JSON.stringify(await getDeviceTimeStatusView(deviceId));
+    },
+  });
+
+  // query_device_workloads - Tier 1 (auto-execute, read-only)
+  registerTool({
+    tier: 1,
+    domain: 'devices',
+    deviceArgs: ['deviceId'],
+    searchHint:
+      'containers, virtual machines, Docker, Podman, Hyper-V, Proxmox, workload inventory, compose projects',
+    definition: {
+      name: 'query_device_workloads',
+      description:
+        'List containers and VMs (Docker, Podman, Hyper-V, Proxmox) on a device with per-runtime status and counts; workloads are capped (see truncated). containerd is detect-only (no counts). Collection is off by default until a configuration policy enables "Workload inventory".',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          deviceId: { type: 'string', description: 'The device UUID' },
+          runtime: { type: 'string', enum: [...WORKLOAD_RUNTIMES], description: 'Only workloads of this runtime' },
+          state: { type: 'string', enum: [...WORKLOAD_STATES], description: 'Only workloads in this state' },
+          limit: { type: 'integer', minimum: 1, maximum: 200, default: 200, description: 'Max workloads returned (default 200, max 200)' },
+        },
+        required: ['deviceId'],
+      },
+    },
+    handler: async (input, auth) => {
+      const deviceId = input.deviceId as string;
+      const access = await verifyDeviceAccess(deviceId, auth);
+      if ('error' in access) return JSON.stringify({ error: access.error });
+      const view = await getDeviceWorkloadsView(deviceId);
+      if (!view) return JSON.stringify({ error: 'Device not found or access denied' });
+      return JSON.stringify(
+        projectWorkloadsForAi(deviceId, access.device?.hostname, view, {
+          runtime: input.runtime as (typeof WORKLOAD_RUNTIMES)[number] | undefined,
+          state: input.state as (typeof WORKLOAD_STATES)[number] | undefined,
+          limit: typeof input.limit === 'number' ? input.limit : undefined,
+        }),
+      );
+    },
   });
 
   // ============================================
@@ -481,6 +784,7 @@ export function registerDeviceTools(aiTools: Map<string, AiTool>): void {
         // Ephemeral Quick Support devices live in an org the tech can still read,
         // so exclude them explicitly or their tags leak into the tag vocabulary.
         conditions.push(eq(devices.isEphemeral, false));
+        conditions.push(notParkedDeviceCondition());
 
         // Site axis: a site-restricted caller may only enumerate tags from
         // devices in their allowed sites (RLS does NOT enforce site).
@@ -523,17 +827,32 @@ export function registerDeviceTools(aiTools: Map<string, AiTool>): void {
         if ('error' in access) return JSON.stringify({ error: access.error });
 
         if (action === 'add') {
-          const tagsArray = sql`${tagsInput}::text[]`;
+          // ARRAY[$1, $2, ...]::text[], one bound parameter per tag. A bare
+          // `${tagsInput}::text[]` is spread by Drizzle into `($1, $2)::text[]`,
+          // which Postgres rejects for every list length (#8297).
+          const tagsArray = sql`ARRAY[${sql.join(tagsInput.map((tag) => sql`${tag}`), sql`, `)}]::text[]`;
+          // own-device-row-allowlisted: ai-tool-device-tags
           await db.execute(
             sql`UPDATE devices SET tags = (SELECT array_agg(DISTINCT t) FROM unnest(array_cat(tags, ${tagsArray})) t), updated_at = now() WHERE id = ${deviceId}`
           );
         } else {
           for (const tag of tagsInput) {
+            // own-device-row-allowlisted: ai-tool-device-tags
             await db.execute(
               sql`UPDATE devices SET tags = array_remove(tags, ${tag}), updated_at = now() WHERE id = ${deviceId}`
             );
           }
         }
+
+        // Dynamic groups store membership; a tag rule is stale until this
+        // device is re-evaluated (#8832), same as PATCH /devices/:id.
+        requestDeviceGroupReevaluationAfterCommit({
+          deviceId,
+          orgId: access.device.orgId,
+          eventType: 'device.updated',
+          changedFields: ['tags'],
+          reason: 'ai_manage_tags',
+        });
 
         const [updated] = await db
           .select({ tags: devices.tags })

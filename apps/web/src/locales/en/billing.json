@@ -24,7 +24,8 @@
         "perDeviceRole": "Per device role",
         "perDeviceGroup": "Per device group",
         "perSeat": "Per seat",
-        "manual": "Manual quantity"
+        "manual": "Manual quantity",
+        "hourBlock": "Block hours"
       },
       "dynamicGroup": "dynamic",
       "deletedGroup": "{{name}} (deleted group)",
@@ -54,7 +55,8 @@
         "auto": "auto",
         "groupDeleted": "group deleted",
         "siteDeleted": "site deleted",
-        "siteDeletedNamed": "site deleted: {{name}}"
+        "siteDeletedNamed": "site deleted: {{name}}",
+        "manualQuantityMissing": "quantity missing"
       },
       "lineScope": {
         "site": "Site: {{name}}"
@@ -70,7 +72,7 @@
         "autoIssue": "Auto-issue",
         "renewal": "Renewal",
         "estimatedPerPeriod": "Est. / period",
-        "notes": "Notes",
+        "notes": "Internal notes",
         "invoiceNote": "Invoice note"
       },
       "values": {
@@ -135,7 +137,14 @@
         "flaggedOverage": "{{count}} line(s) are over their included quantity and were not billed: {{names}}",
         "uncoveredDevices": "Invoice generated, but {{count}} device(s) are not billed by any line on this contract: {{breakdown}}",
         "priceBookGaps": "{{count}} catalog line(s) billed at the contract snapshot — no {{currency}} price in the catalog: {{lines}}",
-        "draftDeleted": "Draft deleted"
+        "draftDeleted": "Draft deleted",
+        "skipped": {
+          "already_billed": "No invoice generated — this billing period has already been billed.",
+          "not_due": "No invoice generated — this contract is not due for billing yet.",
+          "renewal_pending": "No invoice generated — this contract is past its end date and waiting on its renewal.",
+          "expired": "No invoice generated — this contract has expired.",
+          "unknown": "No invoice was generated for this contract."
+        }
       },
       "cancelConfirm": {
         "title": "Cancel this contract?",
@@ -220,8 +229,8 @@
       },
       "content": {
         "title": "Content",
-        "notesOptional": "Notes (optional, added to the Notes block on generated invoices)",
-        "termsOptional": "Invoice note (optional, added to the Notes block on generated invoices)",
+        "notesOptional": "Internal notes (never shown to the customer)",
+        "termsOptional": "Invoice note (optional, printed on every generated invoice)",
         "termsPlaceholder": "e.g. Net 30. Auto-renews unless cancelled 30 days prior."
       },
       "lines": {
@@ -254,6 +263,8 @@
         "descriptionPlaceholder": "e.g. Workstation management",
         "unitPrice": "Unit price",
         "quantity": "Quantity",
+        "quantityInvalid": "Enter a quantity (up to 2 decimals).",
+        "quantityTooLarge": "Quantity is too large (at most 10 digits before the decimal point).",
         "siteOptional": "Site (optional — scopes the device count)",
         "allSites": "All sites",
         "linkCatalogItemOptional": "Link catalog item (optional)",
@@ -384,7 +395,9 @@
         "message_other": "Delete {{count}} draft contracts? Only drafts are deleted{{untouched}}; this cannot be undone.",
         "untouchedSuffix": " — any active or paused contracts in your selection are left untouched",
         "confirm": "Delete drafts"
-      }
+      },
+      "fromQuoteReady": "From {{number}} · ready to activate",
+      "fromQuoteReadyUnnumbered": "From a quote · ready to activate"
     },
     "contractPax8Drawer": {
       "title": "Link a Pax8 subscription",
@@ -588,6 +601,94 @@
       "warnings": {
         "markupRemoved": "Saved, but some unsupported formatting was removed: {{tags}}. Agreement bodies support headings, bold, italic, underline, lists and links."
       }
+    },
+    "hourBlock": {
+      "form": {
+        "hoursPerPeriod": "Hours included per period",
+        "extraRate": "Price per extra hour",
+        "rolloverMode": "Unused hours at period end",
+        "rolloverExpire": "Expire",
+        "rolloverCarry": "Carry forward",
+        "carryCap": "Carry-forward limit in hours (blank for no limit)",
+        "alertPct": "Alert at % of block used (optional)",
+        "required": "Enter the included hours and the price per extra hour.",
+        "firstPeriod": "Hours count from the first billing period still to be invoiced; on a draft contract this is set when it is activated. Earlier time bills as usual.",
+        "midPeriodEdit": "Changes apply to the current open period ({{start}} – {{end}}) at its close.",
+        "midPeriodEditNoDates": "Changes apply to the current open period at its close.",
+        "onlyOne": "This organization already has an active block. Retire it before adding another."
+      },
+      "row": {
+        "perPeriod": "{{hours}} hours per period",
+        "retiredBadge": "Retired",
+        "startsOn": "Counts from {{date}}"
+      },
+      "errors": {
+        "exists": "This organization already has an active block-hours line. Retire it first, then add the new one.",
+        "locked": "That field can't be changed on a block-hours line."
+      },
+      "retire": {
+        "title": "Retire block hours",
+        "message": "\"{{description}}\" has billing history, so it is retired instead of deleted. No new periods; already-billed periods still settle. Its closed periods stay on the contract.",
+        "confirm": "Retire block",
+        "toast": "Block hours retired"
+      },
+      "detail": {
+        "title": "Block hours",
+        "usage": "{{used}} of {{included}} hours used · {{remaining}} remaining · period ends {{end}}",
+        "carried": "Includes {{hours}} hours carried forward.",
+        "unapproved": "{{hours}} hours of this time are not yet approved.",
+        "foreign": "{{hours}} hours were logged in another currency; they still draw down the block.",
+        "over": "{{hours}} hours over the block → {{amount}} at period close",
+        "advanceNote": "Overage bills on the following invoice.",
+        "arrearsNote": "Overage bills on this period's invoice.",
+        "lateEntry": "{{hours}} hours were entered after their period closed and bill separately.",
+        "startsLater": "Block starts {{date}}.",
+        "extraRate": "Extra hours: {{rate}} each",
+        "loadFailed": "Block usage couldn't be loaded."
+      },
+      "history": {
+        "title": "Closed block periods",
+        "empty": "No block period has closed yet.",
+        "included": "Included",
+        "carriedIn": "Carried in",
+        "used": "Used",
+        "over": "Over",
+        "carriedOut": "Carried out",
+        "loadMore": "Load more",
+        "invoiceRemoved": "Overage invoice removed — hours not billed"
+      }
+    },
+    "relatedNotice": {
+      "title_one": "This organization has {{count}} other contract",
+      "title_other": "This organization has {{count}} other contracts",
+      "overlapWarning": "Another contract here bills on the same schedule over overlapping dates. Activating both bills the customer for both.",
+      "sameCadence": "Same schedule, overlapping dates",
+      "perPeriod": "{{amount}} per period",
+      "estimateUnavailable": "Per-period estimate unavailable",
+      "deliverables_one": "{{count}} deliverable",
+      "deliverables_other": "{{count}} deliverables",
+      "signedAgreements_one": "{{count}} signed agreement",
+      "signedAgreements_other": "{{count}} signed agreements",
+      "activateConfirm": {
+        "title": "Activate alongside another contract?",
+        "message": "This organization already has a contract that bills on the same schedule over overlapping dates. Activating this one bills the customer for both.",
+        "confirm": "Activate anyway"
+      },
+      "adopt": {
+        "action": "Fold into this contract",
+        "title": "Fold “{{name}}” into this contract?",
+        "message": "Use this when “{{name}}” covers the same services as this contract, so the customer is not billed twice.",
+        "deliverables_one": "Its {{count}} deliverable moves here, with its history.",
+        "deliverables_other": "Its {{count}} deliverables move here, with their history.",
+        "agreements_one": "Its {{count}} signed agreement is re-linked to this contract.",
+        "agreements_other": "Its {{count}} signed agreements are re-linked to this contract.",
+        "noLines": "Its lines are not copied. This contract's lines and prices stay as they are.",
+        "deleted": "“{{name}}” is then deleted. This cannot be undone.",
+        "confirm": "Fold in and delete draft",
+        "success": "“{{name}}” was folded into this contract",
+        "error": "Could not fold the draft into this contract",
+        "collision": "These deliverable names already exist on this contract: {{names}}. Rename or remove them on one side, then try again."
+      }
     }
   },
   "agreements": {
@@ -613,7 +714,24 @@
       "viewContract": "View contract",
       "notLinked": "Not linked",
       "rowSubtitle": "Accepted with quote {{quoteNumber}} by {{signer}} on {{date}}",
-      "rowSubtitleNoQuote": "Signed by {{signer}} on {{date}}"
+      "rowSubtitleNoQuote": "Signed by {{signer}} on {{date}}",
+      "evidenceUnavailable": "Accepted via quote — acceptance evidence unavailable",
+      "recordSigned": "Record signed agreement",
+      "source": {
+        "quote": "via quote {{number}}",
+        "recorded": "recorded by MSP — {{method}}"
+      },
+      "fileType": {
+        "image": "scanned copy"
+      },
+      "sendForSignature": "Send for signature",
+      "filter": {
+        "pending": "Awaiting signature",
+        "signed": "Signed",
+        "closed": "Declined / voided / expired"
+      },
+      "downloadOriginal": "Original",
+      "certifiedUnavailable": "The certified copy couldn’t be produced for this agreement — the original file was downloaded instead."
     },
     "templateEditor": {
       "usage": "Used on {{quotes}} quotes · {{signed}} signed agreements",
@@ -627,7 +745,154 @@
       }
     },
     "contractPill": {
-      "under": "Under {{template}} v{{n}}"
+      "under": "Under {{template}} v{{n}}",
+      "fromQuote": "From quote {{number}}"
+    },
+    "recordSigned": {
+      "title": "Record signed agreement",
+      "organization": "Organization",
+      "organizationPlaceholder": "Select an organization",
+      "orgFallback": "this organization",
+      "template": "Agreement template",
+      "templatePlaceholder": "Select an agreement template",
+      "templatesError": "Couldn't load agreement templates.",
+      "orgsError": "Couldn't load organizations.",
+      "contractError": "Couldn't load this contract.",
+      "contractsError": "Couldn't load this organization's contracts. You can still record the agreement and link it to a contract later.",
+      "contract": "Contract (optional)",
+      "contractNone": "Not linked to a contract",
+      "method": "How it was agreed",
+      "reference": "Reference",
+      "referenceHelp": "Where a reviewer would find the signed agreement — a PO number, an email and date, or a ticket.",
+      "signerName": "Who agreed",
+      "signerEmail": "Their email (optional)",
+      "signedAt": "Date signed",
+      "file": "Signed copy (optional)",
+      "fileHelp": "PDF, PNG or JPEG, up to 10 MB. With a signed copy attached, that file is what gets filed.",
+      "fileTooLarge": "That file is larger than 10 MB.",
+      "fileWrongType": "Attach a PDF, PNG or JPEG file.",
+      "variables": "Agreement details",
+      "unresolved": "Provide a value for: {{names}}",
+      "needsSignedCopy": "Breeze can't fill {{names}} without a quote. Attach the signed copy to record this agreement.",
+      "consequence": "This files a signed agreement for {{org}}. It cannot be deleted afterwards.",
+      "submit": "Record signed agreement",
+      "success": "Signed agreement recorded.",
+      "error": "Couldn't record the signed agreement."
+    },
+    "requests": {
+      "columns": {
+        "template": "Template",
+        "organization": "Organization",
+        "recipients": "Recipients",
+        "sent": "Sent",
+        "expires": "Expires",
+        "status": "Status"
+      },
+      "status": {
+        "draft": "Draft",
+        "sent": "Awaiting signature",
+        "viewed": "Viewed",
+        "signed": "Signed",
+        "declined": "Declined",
+        "voided": "Voided",
+        "expired": "Expired"
+      },
+      "empty": {
+        "pending": {
+          "title": "Nothing awaiting signature",
+          "description": "Agreements you send for signature appear here until the customer signs."
+        },
+        "closed": {
+          "title": "No declined, voided or expired requests",
+          "description": "Requests that were declined, voided or ran past their expiry show up here."
+        }
+      },
+      "loadError": "Couldn’t load agreement requests.",
+      "recipientsMore": "+{{count}} more",
+      "notSent": "Not sent",
+      "declinedReason": "Declined: {{reason}}",
+      "voidedReason": "Voided: {{reason}}",
+      "copyLink": {
+        "label": "Copy link",
+        "success": "Signing link copied",
+        "error": "Couldn’t copy the signing link.",
+        "clipboardError": "Couldn’t copy to the clipboard. Signing link: {{link}}"
+      },
+      "void": {
+        "label": "Void",
+        "title": "Void this agreement request?",
+        "description": "The signing link stops working and the recipients can no longer sign this agreement.",
+        "reasonLabel": "Reason (optional)",
+        "confirm": "Void request",
+        "confirming": "Voiding…",
+        "success": "Agreement request voided.",
+        "error": "Couldn’t void the agreement request."
+      },
+      "deleteDraft": {
+        "label": "Delete draft",
+        "success": "Draft deleted.",
+        "error": "Couldn’t delete the draft."
+      },
+      "remind": {
+        "label": "Remind",
+        "success_one": "Reminder sent to {{count}} recipient",
+        "success_other": "Reminder sent to {{count}} recipients",
+        "error": "Couldn’t send the reminder.",
+        "notEmailed": {
+          "no_email_service": "Reminder recorded, but email isn’t configured. Copy the signing link and share it.",
+          "no_recipients": "Reminder recorded, but there were no recipients to email. Copy the signing link and share it.",
+          "send_failed": "Reminder recorded, but the email failed to deliver. Copy the signing link and share it."
+        }
+      },
+      "remindedCount_one": "Reminded {{count}} time",
+      "remindedCount_other": "Reminded {{count}} times"
+    },
+    "send": {
+      "title": "Send for signature",
+      "contract": "File against contract (optional)",
+      "contractsError": "Couldn’t load this organization’s contracts. You can still send the agreement and link it to a contract later.",
+      "recipients": "Recipients",
+      "recipientsHelp": "Email addresses, separated by commas or new lines. Prefilled from the organization’s billing contact.",
+      "recipientsRequired": "Add at least one recipient email.",
+      "recipientsInvalid": "These don’t look like email addresses: {{emails}}",
+      "recipientsTooMany": "At most 50 recipients.",
+      "cover": "Cover message (optional)",
+      "expiry": "Link expires on",
+      "expiryPast": "Choose an expiry date in the future.",
+      "expiryDefaultHint_one": "Default: {{count}} day, from Billing settings → Agreements.",
+      "expiryDefaultHint_other": "Default: {{count}} days, from Billing settings → Agreements.",
+      "autoReminderHint_one": "Automatic reminders go out every day, up to {{max}} in total.",
+      "autoReminderHint_other": "Automatic reminders go out every {{count}} days, up to {{max}} in total.",
+      "expiryDefaultUnavailable": "Couldn't load your default expiry from Billing settings. Leave the date blank and your default applies when the agreement is created.",
+      "expiryBlankHint": "Leave blank to use your default from Billing settings → Agreements.",
+      "label": "Label (optional)",
+      "labelHint": "Internal only. Customers see the template name.",
+      "createDraft": "Create draft & preview",
+      "creating": "Creating…",
+      "preview": {
+        "title": "Preview",
+        "loading": "Loading preview…",
+        "error": "Couldn’t load the preview.",
+        "uploaded": "This template is an uploaded document. The uploaded file is what the customer signs."
+      },
+      "unresolved": {
+        "title": "Fill in the missing values before sending"
+      },
+      "updatePreview": "Update preview",
+      "updating": "Updating…",
+      "submit": "Send",
+      "sending": "Sending…",
+      "createError": "Couldn’t create the draft.",
+      "updateError": "Couldn’t update the agreement.",
+      "sendError": "Couldn’t send the agreement.",
+      "discardError": "Couldn’t discard the draft — it is still listed under Awaiting signature, where you can delete it.",
+      "sent_one": "Agreement sent to {{count}} recipient",
+      "sent_other": "Agreement sent to {{count}} recipients",
+      "notEmailed": {
+        "no_email_service": "Sent, but email isn’t configured. Copy the signing link from Awaiting signature and share it.",
+        "no_recipients": "Sent, but there were no recipients to email. Copy the signing link from Awaiting signature and share it.",
+        "send_failed": "Sent, but the email failed to deliver. Copy the signing link from Awaiting signature and share it."
+      }
     }
   },
   "quotes": {
@@ -856,6 +1121,7 @@
         "saveCoverPage": "Couldn't save the cover page",
         "saveCustomer": "Could not change the customer.",
         "saveTerms": "Could not save terms.",
+        "saveFooter": "Could not save the footer line.",
         "saveTitle": "Could not save the title.",
         "unitPriceZeroOrMore": "Enter a unit price of 0 or more.",
         "updateBlock": "Could not update the block.",
@@ -865,7 +1131,9 @@
         "uploadImage": "Could not upload the image.",
         "noPriceForCurrency": "No {{currency}} price for this item. Add one in the catalog or enter a manual line.",
         "sectionAddedListStale": "Section added, but the list could not refresh. Reload the page to see it.",
-        "lineAddedListStale": "Line added, but the list could not refresh. Reload the page to see it."
+        "lineAddedListStale": "Line added, but the list could not refresh. Reload the page to see it.",
+        "saveExpiry": "Could not save the expiry date.",
+        "saveIntroNotes": "Could not save the intro notes."
       },
       "image": {
         "alt": "Quote image",
@@ -910,7 +1178,8 @@
         "skuOptional": "SKU (optional)",
         "tidyWithAi": "Tidy with AI",
         "unitCost": "Unit cost",
-        "unitPriceForAria": "Unit price for {{item}}"
+        "unitPriceForAria": "Unit price for {{item}}",
+        "partNumberRequiredHint": "Add a part number to include this in the parts order."
       },
       "liveTotals": {
         "annualRecurring": "Annual recurring",
@@ -924,7 +1193,7 @@
         "subtotal": "Subtotal",
         "tax": "Tax",
         "taxRate": "Tax rate",
-        "taxRateHelp": "Applies to lines marked taxable. Set in the organization’s tax settings.",
+        "taxRateHelp": "Applies to lines marked taxable. Comes from the organization’s tax settings, or your default tax rate when the organization has none. It follows those settings while the quote is a draft and is fixed when the quote is sent.",
         "title": "Live totals",
         "total": "Total"
       },
@@ -995,6 +1264,15 @@
         "headerStyleAccent": "Accent",
         "reshapedWarning": "This table didn't fit the {{columns}}-column x {{rows}}-row limit, so it was reshaped to fit. Saving replaces the stored table with what you see here."
       },
+      "footer": {
+        "title": "Footer line (every page)",
+        "helper": "One short line printed at the bottom of every page — e.g. validity dates. Leave blank to use the default footer. Put fine print in Terms & Conditions, not here.",
+        "placeholder": "Blank = use the default footer",
+        "inheritedPartner": "Using the partner document footer from Billing settings: “{{text}}”",
+        "inheritedBrand": "Using this organization's footer text from its Portal settings: “{{text}}”",
+        "inheritedNone": "No default footer is set in Settings — the page footer will be empty.",
+        "counter": "{{count}} / {{max}}"
+      },
       "terms": {
         "placeholder": "Payment terms, delivery notes, etc.",
         "title": "Terms & Conditions (plain text)",
@@ -1023,6 +1301,7 @@
         "noPublishedVersion": "This template has no published version yet. Publish it before adding it to a quote.",
         "pinnedVersion": "Pinned to v{{version}}",
         "autoVariablesTitle": "Filled automatically from the quote",
+        "autoValueBlank": "Blank",
         "autoHint": "These values resolve from the quote when the proposal is sent.",
         "manualVariablesTitle": "Fill in for this proposal",
         "labelFieldLabel": "Section label",
@@ -1033,11 +1312,13 @@
         "readOnlyHint": "Remove and re-add this section to change the template, version, or variables.",
         "updateToVersion": "Update to v{{version}}",
         "saveVariables": "Save variables",
-        "unresolvedWarning": "Unresolved variables (will block sending): {{names}}"
+        "unresolvedWarning": "Unresolved variables (will block sending): {{names}}",
+        "placementHint": "Customers see this after the totals, collapsed until they open it. In the PDF it follows the price."
       },
       "coverPage": {
         "title": "Cover page",
         "enable": "Show a cover page",
+        "showContents": "Add a contents list to the PDF",
         "summaryOn": "Shown as the first page of the proposal.",
         "summaryOff": "No cover page — the proposal starts with its content.",
         "titleLabel": "Cover title",
@@ -1077,6 +1358,14 @@
       },
       "warnings": {
         "markupRemoved": "Saved, but some unsupported formatting was removed: {{tags}}. Rich text supports headings, bold, italic, underline, lists and links."
+      },
+      "intro": {
+        "expiryLabel": "Valid until",
+        "expiryHelper": "Printed on the proposal. The customer can accept through the end of this day. Leave blank for no expiry.",
+        "expiryPast": "This date has passed — the customer cannot accept an expired proposal.",
+        "notesLabel": "Intro notes",
+        "notesHelper": "Printed above the first section of the proposal.",
+        "notesPlaceholder": "A short note to the customer, e.g. what this proposal covers."
       }
     },
     "actions": {
@@ -1125,15 +1414,21 @@
         "recipientRequired": "Enter at least one recipient to send.",
         "signaturePreviewLabel": "Signature (set in Settings → Branding):",
         "subjectLabel": "Subject",
-        "subjectPlaceholder": "Proposal {{number}} from your company",
-        "subjectPlaceholderNoNumber": "Proposal from your company",
+        "subjectPartnerFallback": "your company",
+        "subjectPlaceholder": "Proposal {{number}} from {{partner}}",
+        "subjectPlaceholderNoNumber": "Proposal from {{partner}}",
+        "subjectPlaceholderTemplate": "Uses the subject from your proposal email template",
+        "subjectPlaceholderTitled": "{{title}} — proposal from {{partner}}",
         "title": "Send this proposal?",
         "toLabel": "To",
         "toPlaceholder": "Add recipient…",
         "tooManyRecipients": "Use at most {{max}} addresses.",
         "zeroTotalWarning": "This quote totals {{zero}} — check that its items are priced before sending.",
         "noBillingContactHint": "No billing contact is saved for this organization — enter an email, or add one in the <orgLink>organization settings</orgLink>.",
-        "revisionWarning": "Sending this replaces {{number}} and disables the link the customer already has."
+        "revisionWarning": "Sending this replaces {{number}} and disables the link the customer already has.",
+        "noPartNumberWarning_one": "{{count}} product line has no part number and won't be added to the parts order.",
+        "noPartNumberWarning_other": "{{count}} product lines have no part number and won't be added to the parts order.",
+        "sendAnyway": "Send anyway"
       },
       "sendEmailWarning": {
         "noBillingContact": "Proposal marked Sent, but no email was delivered — {{orgName}} has no billing contact email. Add one in the organization settings, then resend.",
@@ -1181,6 +1476,9 @@
       "currencyUnknown": "Your Stripe account's settlement currency hasn't been cached, so it couldn't be checked against this {{documentCurrency}} quote. Refresh your Stripe account details under Settings → Integrations to enable the mismatch check.",
       "acceptOnBehalf": {
         "button": "Accept on behalf",
+        "emptyDraftTitle": "Add at least one item before accepting.",
+        "emptySentTitle": "This quote has no items. Use Revise quote to issue a version with items.",
+        "errorQuoteEmpty": "This quote has no items. Close this dialog and add an item, or use Revise quote if it was already sent.",
         "title": "Record the customer's acceptance",
         "methodLabel": "How did they agree?",
         "method": {
@@ -1195,8 +1493,10 @@
         "signerNameLabel": "Who agreed",
         "signerEmailLabel": "Their email (optional)",
         "consequenceInvoice": "An invoice for {{amount}} will be issued and numbered now.",
+        "consequenceInvoiceDraft": "A draft invoice will be created. It is not issued or numbered yet.",
         "consequenceContracts": "Recurring lines become draft contracts you activate later.",
-        "consequenceEmail": "The invoice will be emailed to the customer.",
+        "consequenceEmail": "The invoice will be emailed to {{recipients}}.",
+        "consequenceEmailNotConfigured": "No email service is configured; the invoice will not be emailed. Share it from the invoice page.",
         "consequenceDraft": "This quote was never sent. The customer's first sight of it will be the invoice.",
         "submit": "Accept and issue invoice",
         "success": "Quote accepted. Invoice {{number}} issued.",
@@ -1209,7 +1509,17 @@
         "evidenceHelp": "PDF, PNG or JPEG, up to 10 MB — e.g. the signed PO or document.",
         "evidenceTooLarge": "This file is larger than 10 MB. Choose a smaller file.",
         "evidenceAttached": "Evidence attached.",
-        "evidenceError": "The acceptance was recorded, but the evidence file could not be attached. Attach it from the quote page."
+        "evidenceError": "The acceptance was recorded, but the evidence file could not be attached. Attach it from the quote page.",
+        "consequenceEmailNoRecipient": "No recipient is recorded on this quote, so the invoice may not be emailed. Send it to the customer yourself if needed.",
+        "successNoRecipient": "Quote accepted. Invoice {{number}} issued. It may not have been emailed — no recipient is recorded on this quote.",
+        "successNoEmailService": "Quote accepted. Invoice {{number}} issued. It was not emailed — no email service is configured. Share it from the invoice page.",
+        "overlap": {
+          "title": "This organization already has a contract on the same schedule",
+          "body": "The acceptance created a new draft contract. Activating it as well as the existing one bills the customer for both. Review both before activating either.",
+          "newContract": "New draft from this quote",
+          "existingContract": "Existing contract",
+          "done": "Done"
+        }
       },
       "declineOnBehalf": {
         "button": "Decline on behalf",
@@ -1304,7 +1614,9 @@
           "vendor": "Vendor"
         },
         "title": "To be ordered",
-        "unknownVendor": "Other / unknown vendor"
+        "unknownVendor": "Other / unknown vendor",
+        "excluded": "Not in this order (no part number): {{names}}",
+        "untitledLine": "Untitled line"
       },
       "pax8Order": {
         "message_one": "This quote staged a Pax8 order ({{count}} item) awaiting provisioning details",
@@ -1359,6 +1671,14 @@
         "attachError": "Could not attach the evidence file.",
         "downloadError": "Could not download the evidence file.",
         "tooLarge": "This file is larger than 10 MB. Choose a smaller file."
+      },
+      "generatedContracts": {
+        "title_one": "This quote created {{count}} contract",
+        "title_other": "This quote created {{count}} contracts",
+        "draftHint_one": "{{count}} draft bills nothing until it is activated. Review and activate it to start billing.",
+        "draftHint_other": "{{count}} drafts bill nothing until they are activated. Review and activate them to start billing.",
+        "ready": "Ready to activate",
+        "unavailable": "Couldn't load the contracts this quote created. Reload to try again."
       }
     },
     "currency": {
@@ -1417,65 +1737,24 @@
     },
     "document": {
       "deviceSet": {
-        "badge": "Est.",
-        "estimate": "Estimated quantity — billed at the actual number of {{set}} each billing period.",
         "setDevices": "devices",
         "setSeats": "seats",
-        "setGroup": "devices in “{{name}}”",
-        "atSite": "{{set}} at {{site}}",
-        "allowanceBill": "Includes {{included}}; additional units billed at {{price}} each.",
-        "allowanceFlag": "Includes {{included}}; additional units are reported for review, not billed automatically."
+        "setGroup": "devices in “{{name}}”"
       },
       "additionalItems": "Additional items",
       "contract": {
-        "download": "Download agreement",
-        "previewTitle": "{{name}} agreement",
         "unavailable": "Agreement file unavailable",
         "versionFooter": "{{name}} — v{{version}}"
       },
-      "draft": "Draft",
-      "empty": "This proposal doesn’t have any content yet.",
-      "imageUnavailable": "Image unavailable",
-      "issued": "Issued",
-      "preparedFor": "Prepared for",
-      "taxId": "Tax ID: {{id}}",
-      "imageZoomAria": "View larger image",
       "preview": {
         "description": "This is what your customer sees on their proposal link.",
         "downloadPdf": "Download PDF",
-        "preparing": "Preparing…"
-      },
-      "pricing": "Pricing",
-      "pricingScrollAria": "Pricing — scroll sideways for more columns",
-      "proposal": "Proposal",
-      "proposalImageAlt": "Proposal image",
-      "recurrence": {
-        "annual": "Annual",
-        "monthly": "Monthly"
-      },
-      "table": {
-        "amount": "Amount",
-        "description": "Description",
-        "qty": "Qty",
-        "tax": "Tax",
-        "unitPrice": "Unit price"
-      },
-      "terms": "Terms",
-      "totals": {
-        "annualRecurring": "Annual recurring",
-        "depositDue": "Deposit due",
-        "depositDueNow": "Deposit due now",
-        "dueOnAcceptance": "Due on acceptance",
-        "firstPeriodSubtotal": "First period subtotal",
-        "firstPeriodTotal": "First-period total",
-        "monthlyRecurring": "Monthly recurring",
-        "recurringNote": "Accepting this proposal bills the one-time charges now. Recurring lines bill on their own schedule.",
-        "remainingBalance": "Remaining balance (due per terms)",
-        "subtotal": "Subtotal",
-        "tax": "Tax"
-      },
-      "unsupportedBlock": "This block type isn't supported by this viewer yet.",
-      "validUntil": "Valid until"
+        "preparing": "Preparing…",
+        "loading": "Loading the customer view…",
+        "loadError": "Could not load the customer view of this proposal.",
+        "retry": "Try again",
+        "signatureInert": "Your customer signs here"
+      }
     },
     "page": {
       "accessDenied": "You don't have permission to view quotes.",
@@ -1680,7 +1959,8 @@
       "saveNotes": "Could not save notes.",
       "saveTerms": "Could not save terms.",
       "updateLine": "Could not update line.",
-      "noPriceForCurrency": "No {{currency}} price for this item. Add one in the catalog or enter a manual line."
+      "noPriceForCurrency": "No {{currency}} price for this item. Add one in the catalog or enter a manual line.",
+      "saveLineDetail": "Couldn't update how time entries print"
     },
     "fields": {
       "descriptionOptional": "Description (optional)",
@@ -1747,6 +2027,35 @@
     "linesScrollAria": "Invoice lines — scroll sideways for more columns",
     "unsavedField": {
       "lines": "Line items"
+    },
+    "lineDetail": {
+      "default": "Billing default",
+      "grouping": "Layout",
+      "groupingDay": "Group by day",
+      "groupingEntry": "One row per entry",
+      "help": "Overrides your billing default for this draft only.",
+      "hide": "Hide",
+      "show": "Show",
+      "showDate": "Date worked",
+      "showNote": "Technician's note",
+      "showWorkedTime": "Worked vs billed time",
+      "title": "Time entry lines"
+    },
+    "refreshTimeLines": {
+      "billedElsewhere": "{{count}} lines will block Issue: their time entries were billed on another invoice. Remove them before issuing:",
+      "billedElsewhere_one": "{{count}} line will block Issue: its time entry was billed on another invoice. Remove it before issuing:",
+      "billedElsewhere_other": "{{count}} lines will block Issue: their time entries were billed on another invoice. Remove them before issuing:",
+      "button": "Refresh from time entries",
+      "drifted": "{{count}} lines left unchanged: their time entries' billed time no longer matches the quantity. Edit the quantity or assemble a new draft.",
+      "drifted_one": "{{count}} line left unchanged: its time entry's billed time no longer matches the quantity. Edit the quantity or assemble a new draft.",
+      "drifted_other": "{{count}} lines left unchanged: their time entries' billed time no longer matches the quantity. Edit the quantity or assemble a new draft.",
+      "error": "Couldn't refresh from time entries",
+      "help": "Updates notes, dates worked and approval from the source time entries. Quantities, prices and descriptions you edited by hand never change.",
+      "running": "Refreshing…",
+      "skipped": "{{count}} lines skipped: their time entries were billed elsewhere, removed, or are no longer billable on this draft.",
+      "skipped_one": "{{count}} line skipped: its time entry was billed elsewhere, removed, or is no longer billable on this draft.",
+      "skipped_other": "{{count}} lines skipped: their time entries were billed elsewhere, removed, or are no longer billable on this draft.",
+      "summary": "Refreshed: {{refreshed}} · Already current: {{unchanged}}"
     }
   },
   "invoiceActions": {
@@ -1813,6 +2122,7 @@
       "title": "Send this invoice?",
       "message": "This emails the invoice to {{customer}} for {{amount}}."
     },
+    "sourceHeldForHourBlock": "Some time on this draft is held for this organization's block hours and will be billed when the block period closes. Remove those lines, then Issue.",
     "unsavedHint": "“{{field}}” has an unsaved change — Issue unlocks once it saves.",
     "unsavedTitle": "“{{field}}” has an unsaved change — Issue unlocks once it saves."
   },
@@ -1883,7 +2193,8 @@
       "check": "Check",
       "bank_transfer": "Bank transfer",
       "card": "Card",
-      "other": "Other"
+      "other": "Other",
+      "ach_debit": "ACH debit"
     },
     "payments": {
       "amount": "Amount",
@@ -1917,19 +2228,21 @@
       },
       "reverseError": "Could not reverse the payment.",
       "reverseSuccess": "Payment reversed",
-      "reverseInQuickbooksToo": "Reverse this in QuickBooks too",
       "sendLink": "Send payment link",
       "setUp": "Set up",
       "shareLinkPrompt": "Share this payment link with your customer:",
       "stripeNudge": "Connect Stripe to accept online card payments.",
       "title": "Payments",
       "viaStripe": "via Stripe",
-      "quickbooks": "QuickBooks",
-      "viaQuickbooks": "via QuickBooks",
-      "inQuickbooks": "In QuickBooks",
-      "syncingToQuickbooks": "Syncing…",
-      "quickbooksSyncFailed": "QuickBooks sync failed",
-      "currencyUnknown": "Your Stripe account's settlement currency hasn't been cached, so it couldn't be checked against this {{documentCurrency}} invoice. Refresh your Stripe account details under Settings → Integrations to enable the mismatch check."
+      "currencyUnknown": "Your Stripe account's settlement currency hasn't been cached, so it couldn't be checked against this {{documentCurrency}} invoice. Refresh your Stripe account details under Settings → Integrations to enable the mismatch check.",
+      "inProvider": "In {{provider}}",
+      "syncingToProvider": "Syncing…",
+      "providerSyncFailed": "{{provider}} sync failed",
+      "reverseInProviderToo": "Reverse this in {{provider}} too",
+      "overpayment": "Amount is more than the balance due ({{balance}}).",
+      "fillLabel": "Fill amount",
+      "fillDeposit": "Deposit ({{amount}})",
+      "fillBalance": "Full balance ({{amount}})"
     },
     "requestPayment": {
       "invoiceSent": "Invoice sent",
@@ -1944,7 +2257,8 @@
       "paid": "Paid",
       "subtotal": "Subtotal",
       "tax": "Tax",
-      "total": "Total"
+      "total": "Total",
+      "depositDueNow": "Deposit due now"
     },
     "terms": "Terms & Conditions",
     "void": {
@@ -1969,54 +2283,35 @@
       "error": "Could not reset the link"
     },
     "accountingSync": {
-      "title": "QuickBooks sync",
+      "title": "{{provider}} sync",
       "status": {
         "pending": "Not pushed yet",
         "synced": "Synced",
         "error": "Sync failed",
         "synced_with_tax_variance": "Synced with tax difference"
       },
-      "taxVarianceHint": "QuickBooks calculated a different tax total. Compare both records before closing the period.",
-      "docNumber": "QuickBooks document {{docNumber}}",
+      "taxVarianceHint": "{{provider}} calculated a different tax total. Compare both records before closing the period.",
+      "docNumber": "{{provider}} document {{docNumber}}",
       "lastSynced": "Last synced {{when}}",
       "syncing": "Syncing…",
-      "push": "Push to QuickBooks",
-      "pushed": "Invoice pushed to QuickBooks.",
-      "pushFailed": "Failed to push the invoice to QuickBooks.",
-      "voidedHint": "This invoice is voided — there is nothing to push to QuickBooks.",
-      "remoteDeletedHint": "This invoice was deleted in QuickBooks. Pushing again would create a duplicate — resolve it in QuickBooks first."
+      "push": "Push to {{provider}}",
+      "pushed": "Invoice pushed to {{provider}}.",
+      "pushFailed": "Failed to push the invoice to {{provider}}.",
+      "voidedHint": "This invoice is voided — there is nothing to push to {{provider}}.",
+      "remoteDeletedHint": "This invoice was deleted in {{provider}}. Pushing again would create a duplicate — resolve it in {{provider}} first."
     }
   },
   "invoiceDocument": {
-    "billTo": "Bill to",
-    "documentType": "Invoice",
-    "due": "Due",
-    "empty": "This invoice doesn’t have any line items yet.",
-    "fallbackTitle": "Invoice",
-    "issued": "Issued",
     "preview": {
       "description": "This is what your customer sees on their invoice.",
       "downloadError": "Could not download the invoice PDF.",
       "downloadPdf": "Download PDF",
-      "preparing": "Preparing…"
+      "loadError": "Could not load the customer view of this invoice.",
+      "loading": "Loading the customer view…",
+      "preparing": "Preparing…",
+      "retry": "Try again"
     },
-    "table": {
-      "amount": "Amount",
-      "description": "Description",
-      "qty": "Qty",
-      "tax": "Tax",
-      "unitPrice": "Unit price"
-    },
-    "terms": "Terms & Conditions",
-    "ticketHeader": "Ticket #{{number}}",
-    "ticketWork": "Ticket work",
-    "totals": {
-      "amountDue": "Amount due",
-      "paid": "Paid",
-      "subtotal": "Subtotal",
-      "tax": "Tax",
-      "total": "Total"
-    }
+    "ticketHeader": "Ticket #{{number}}"
   },
   "invoiceWorkspace": {
     "backLabel": "Invoices",
@@ -2047,11 +2342,11 @@
       "success": "{{succeeded}} {{verb}}",
       "void": "Void",
       "voidedVerb": "voided",
-      "quickbooks": "Push to QuickBooks",
-      "quickbooksQueued": "{{enqueued}} queued for QuickBooks",
-      "quickbooksQueuedPartial": "{{enqueued}} queued for QuickBooks, {{skipped}} skipped",
-      "quickbooksQueuedFailed": "{{enqueued}} queued for QuickBooks, {{skipped}} skipped, {{failed}} failed to queue",
-      "quickbooksFailed": "Failed to queue the QuickBooks push. Retry."
+      "pushToProvider": "Push to {{provider}}",
+      "providerQueued": "{{enqueued}} queued for {{provider}}",
+      "providerQueuedPartial": "{{enqueued}} queued for {{provider}}, {{skipped}} skipped",
+      "providerQueuedFailed": "{{enqueued}} queued for {{provider}}, {{skipped}} skipped, {{failed}} failed to queue",
+      "providerFailed": "Failed to queue the {{provider}} push. Retry."
     },
     "bulkDelete": {
       "message": "Delete {{count}} selected invoice(s)? Only DRAFT invoices will be deleted; this cannot be undone.",
@@ -2090,7 +2385,9 @@
       "sourceAria": "Invoice source",
       "title": "New invoice",
       "to": "To",
-      "working": "Working…"
+      "working": "Working…",
+      "heldForHourBlock_one": "{{count}} time entry ({{hours}} hours) is held for this organization's block hours and will be billed when the block period closes.",
+      "heldForHourBlock_other": "{{count}} time entries ({{hours}} hours) are held for this organization's block hours and will be billed when the block period closes."
     },
     "empty": {
       "description": "Assemble unbilled time and parts into a draft, or start a blank invoice.",
@@ -2146,17 +2443,18 @@
       "title": "Billing address"
     },
     "contact": {
-      "description": "Quotes and invoices are emailed to this address. Without it, sending a proposal marks it Sent but nothing is emailed.",
-      "email": "Contact email",
-      "emailInvalid": "Enter a valid email address",
-      "emailPlaceholder": "billing@customer.example",
-      "name": "Contact name",
+      "description": "Quotes and invoices are emailed to the organization's billing contact by default — the organization-level contact with the Billing role. You can still change the recipients each time you send.",
+      "manage": "Manage contacts",
+      "noEmail": "{{name}} has the Billing role but no email address, so quotes and invoices can't be emailed until one is added.",
+      "none": "No contact has the Billing role. Until one does, sending a proposal marks it Sent but nothing is emailed.",
+      "recipientLabel": "Default recipient:",
       "title": "Billing contact"
     },
     "currency": {
       "title": "Currency",
       "description": "New quotes, invoices, contracts, time entries and parts for this organization are stamped with this currency. Nothing that already exists is changed.",
       "label": "Billing currency",
+      "partnerDefault": "Not inherited: each organization keeps its own billing currency. The partner default ({{currency}}) only applies to organizations created from now on.",
       "loading": "Checking what a change to {{currency}} would affect…",
       "error": "The currency change summary could not be loaded.",
       "panelTitle": "Change the billing currency to {{currency}}?",
@@ -2202,22 +2500,48 @@
       "taxId": "Tax ID",
       "taxRate": "Tax rate (%)",
       "title": "Tax"
+    },
+    "terms": {
+      "description": "Days from issue until this organization's invoices are due. Leave blank to use the partner default. Changes apply to invoices issued from now on; issued invoices keep their due date.",
+      "invalid": "Enter a whole number of days from 0 to 365.",
+      "partnerDefault": "Partner default",
+      "paymentTermsDays": "Payment terms (days)",
+      "title": "Payment terms"
     }
   },
   "partnerBillingSettings": {
+    "agreements": {
+      "title": "Agreements",
+      "description": "Defaults for agreements you send for signature. Senders can still pick a different expiry on each request.",
+      "expiryDays": "Default link expiry (days)",
+      "expiryDaysHelp": "A new agreement request's signing link expires this many days after it is created, unless the sender picks another date.",
+      "expiryDaysInvalid": "Enter a whole number of days from {{min}} to {{max}}.",
+      "remindersEnabled": "Send automatic reminders",
+      "remindersHelp": "Emails the same signing link to the recipients again until the agreement is signed, declined, voided or expires.",
+      "intervalDays": "Remind every (days)",
+      "intervalDaysInvalid": "Enter a whole number of days from {{min}} to {{max}}.",
+      "maxReminders": "Stop after (reminders)",
+      "maxRemindersHelp": "Counts every reminder on the request, manual or automatic.",
+      "maxRemindersInvalid": "Enter a whole number from {{min}} to {{max}}.",
+      "readOnlyNoSend": "Changing agreement defaults requires permission to send agreements. You have view-only access."
+    },
     "company": {
+      "addressInherited": "Same as company details",
       "addressLine1": "Address line 1",
       "addressLine2": "Address line 2",
+      "addressTitle": "Address",
       "city": "City",
       "country": "Country",
       "defaultTerms": "Default terms & conditions",
       "defaultTermsPlaceholder": "Payment terms, disclaimers, warranty language, etc.",
       "description": "Shown as the seller on quotes and invoices.",
+      "inheritedFromCompanyDetails": "Company details",
       "name": "Company name",
       "phone": "Phone",
       "postal": "Postal code",
       "region": "State / region",
       "title": "Company contact",
+      "useCompanyAddress": "Use company address",
       "website": "Website"
     },
     "defaults": {
@@ -2230,30 +2554,45 @@
       "autoEmailInvoiceHelp": "When a customer accepts a proposal, the issued invoice is emailed right away with a secure view & pay link — no sign-in needed.",
       "notifyOnBehalfAcceptance": "Email the customer when you record an acceptance on their behalf",
       "notifyOnBehalfAcceptanceHelp": "When someone on your team accepts a quote for a customer, the customer gets a short note saying who recorded it and when, with the invoice number if one was issued. They can reply if it's wrong. Off by default.",
-      "currencyCode": "Currency code",
+      "currencyCode": "Default currency for new organizations",
+      "currencyHelp": "New organizations start in this currency. Existing organizations keep their own — change one on that organization's Billing tab.",
       "defaultMarkup": "Default markup (%)",
       "defaultTaxRate": "Default tax rate (%)",
-      "description": "Currency, tax, numbering, and terms applied to new quotes and invoices across your customers.",
+      "description": "Defaults for quotes and invoices across your customers. An organization can override its own tax rate and payment terms. Its currency starts from the default currency here and is changed on that organization's Billing tab.",
       "deviceAppendix": "Include billed devices appendix on invoice PDFs",
       "deviceAppendixHelp": "Adds a page listing every device counted on each invoice line. Off by default; the choice is frozen when an invoice is issued.",
       "documentPageSize": "Page size",
       "documentPageSizeA4": "A4",
       "documentPageSizeLetter": "Letter",
-      "documentTheme": "Document theme",
-      "documentThemeClassic": "Classic",
-      "documentThemeCondensed": "Condensed",
-      "invoiceFooter": "Invoice footer",
+      "documentTheme": "Document fonts",
+      "documentThemeClassic": "Helvetica",
+      "documentThemeCondensed": "Barlow Condensed + DM Sans",
+      "invoiceFooter": "Document footer",
+      "invoiceFooterHelp": "Printed at the bottom of every quote and invoice page. An organization's own footer text (its Portal settings) replaces this for that organization, and a quote's own footer line replaces both.",
       "invoiceFooterPlaceholder": "Payment instructions, thank-you note, etc.",
       "invoiceNumberPrefix": "Invoice number prefix",
       "markupHelp": "Default markup over distributor cost, used to pre-fill the sell price when importing catalog items. The resulting gross margin is shown as you import.",
       "paymentTermsDays": "Payment terms (days)",
-      "title": "Billing defaults"
+      "prefixInvalid": "Enter a prefix of 1 to 12 characters.",
+      "taxRateInvalid": "Enter a tax rate from 0 to 100.",
+      "termsDaysInvalid": "Enter a whole number of days from 0 to 365.",
+      "title": "Billing defaults",
+      "lineDetailTitle": "Time entry lines on invoices",
+      "lineDetailHelp": "Choose what customers see for time entries. A draft invoice can override this; the choice is frozen when the invoice is issued.",
+      "lineShowDate": "Show the date worked",
+      "lineShowNote": "Show the technician's note",
+      "lineShowWorkedTime": "Show worked vs billed time",
+      "lineGrouping": "Layout",
+      "lineGroupingEntry": "One row per entry",
+      "lineGroupingDay": "Group by day"
     },
     "loadError": "Billing settings failed to load.",
     "loading": "Loading billing settings…",
     "saveButton": "Save billing settings",
     "saveError": "Failed to save billing settings.",
-    "saveSuccess": "Billing settings saved"
+    "saveSuccess": "Billing settings saved",
+    "readOnlyNotice": "You have view-only access to billing settings. Ask an administrator to change them.",
+    "readOnlyNoPartnerWideNotice": "Billing settings apply to all organizations, so changing them requires full partner org access. You have view-only access."
   },
   "shared": {
     "documentWorkspace": {
@@ -2272,13 +2611,15 @@
   "partnerBillingSettingsTabs": {
     "defaults": "Defaults",
     "documents": "Documents",
+    "agreements": "Agreements",
     "connections": "Connections",
-    "rates": "Rates"
+    "rates": "Rates",
+    "payments": "Payments"
   },
   "billingConnectionsTab": {
     "accounting": {
       "title": "Accounting",
-      "description": "Stripe and QuickBooks connect under Integrations — manage them there.",
+      "description": "Stripe, QuickBooks and Xero connect under Integrations — manage them there.",
       "cta": "Manage accounting connections →"
     },
     "catalog": {
@@ -2306,7 +2647,8 @@
     "currencyWarning": "The assigned billing profile uses {{currency}}. After this change, the matching partner default will apply.",
     "loadError": "Billing profiles could not be loaded.",
     "saveError": "The billing profile could not be saved.",
-    "partialSave": "The billing profile was saved, but the other billing settings were not. Retry Save to finish."
+    "partialSave": "The billing profile was saved, but the other billing settings were not. Retry Save to finish.",
+    "aiUsage": "AI usage: {{summary}}"
   },
   "rates": {
     "title": "Rates",
@@ -2324,6 +2666,8 @@
     "setDefault": "Set as default",
     "archive": "Archive",
     "usageUnavailable": "Organization usage is unavailable.",
+    "readOnlyNotice": "You have view-only access to billing rates. Ask an administrator to change them.",
+    "readOnlyNoPartnerWideNotice": "Billing rates apply to all organizations, so changing them requires full partner org access. You have view-only access.",
     "edit": "Edit billing profile",
     "name": "Name",
     "currency": "Currency",
@@ -2340,6 +2684,305 @@
     "minimumSummary": "{{minutes}} min minimum",
     "roundingSummary": "Round to {{minutes}} min",
     "inherits": "Uses All other work",
-    "currencyHelp": "A default profile or a profile with rates cannot change currency. Blank rounding means no rounding."
+    "currencyHelp": "A default profile or a profile with rates cannot change currency. Blank rounding means no rounding.",
+    "ai": {
+      "column": "AI usage",
+      "sectionTitle": "AI usage",
+      "sectionHelp": "How Breeze AI usage by organizations on this billing profile is charged. Bill Breeze's cost plus a markup, or set a price per model.",
+      "coverage": "AI usage billing",
+      "coverageBillable": "Billable",
+      "coverageIncluded": "Included",
+      "coverageNotBilled": "Not billed",
+      "markup": "Markup on cost (%)",
+      "markupHelp": "Added to Breeze's USD cost for each request. 25 bills cost plus 25%. Leave blank to bill only the models on the price list.",
+      "markupInvalid": "Enter a percentage from 0 to 1000 with at most two decimals.",
+      "priceListTitle": "Price list",
+      "priceListHelp": "Prices are in {{currency}} per million tokens. A listed model uses its price instead of the markup.",
+      "priceListEmpty": "No model prices yet.",
+      "addRate": "Add model price",
+      "removeRate": "Remove",
+      "modelId": "Model",
+      "modelPlaceholder": "Pick or type a model id",
+      "inputPrice": "Input",
+      "outputPrice": "Output",
+      "cacheReadPrice": "Cache read",
+      "cacheWritePrice": "Cache write",
+      "rowInvalid": "Enter a model id and all four prices, for example 3.00 or 0.30.",
+      "rowDuplicate": "This model is already on the price list.",
+      "choicesUnavailable": "Model suggestions are unavailable. Type a model id instead.",
+      "usdOnlyWarning": "Markup applies only to USD cards; add a price list for {{currency}} or usage will be recorded unpriced.",
+      "summaryBillableMarkup": "Billable · cost +{{percent}}%",
+      "summaryBillablePriceList_one": "Billable · price list ({{count}} model)",
+      "summaryBillablePriceList_other": "Billable · price list ({{count}} models)",
+      "summaryBillablePriceListMarkup_one": "Billable · price list ({{count}} model), others cost +{{percent}}%",
+      "summaryBillablePriceListMarkup_other": "Billable · price list ({{count}} models), others cost +{{percent}}%",
+      "summaryBillableUnpriced": "Billable · no pricing set",
+      "summaryIncluded": "Included",
+      "summaryNotBilled": "Not billed"
+    }
+  },
+  "autopay": {
+    "chargeConfirmTitle": "Confirm automatic payment",
+    "chargeConfirmMessage": "Charge up to {{amount}}, including any processing fee, for invoice {{invoice}} using {{method}}?",
+    "noticeQueued": "Automatic payment notice queued",
+    "requestDeliveryFailed": "Request email could not be delivered. Resend the request.",
+    "skipNoContact": "No billing contact email is available. Add an email or enter a recipient.",
+    "skipStripeNotReady": "Stripe is not ready for automatic payments. Check the connection and permissions.",
+    "skipAlreadyActive": "Automatic payments are already active or paused.",
+    "title": "Automatic payment",
+    "loading": "Loading automatic payments…",
+    "error": "Could not complete this action. Please try again.",
+    "saved": "Automatic payment updated",
+    "save": "Save",
+    "invalid": "Enter 0–60 whole days and a positive cap amount with a three-letter currency.",
+    "offset-days": "Days after issue",
+    "offset-rule": "Compared with the due date",
+    "cap-enabled": "Automatic payment limit",
+    "cap-amount": "Maximum amount",
+    "cap-currency": "Currency",
+    "ach-mode": "Payment methods",
+    "inherit": "{{value}} — inherited from {{source}}",
+    "source": {
+      "org": "Organization",
+      "partner": "Partner default",
+      "default": "Breeze default"
+    },
+    "option": {
+      "earlier": "Whichever is earlier",
+      "later": "Whichever is later",
+      "false": "Unlimited",
+      "true": "Limit enabled",
+      "ach_preferred": "Bank account preferred; cards accepted",
+      "ach_only": "Bank account only"
+    },
+    "achRisk": "Bank payments are available for eligible US accounts in USD. Your business is responsible for ACH returns and Stripe return fees; individual account returns can arrive up to 60 days later.",
+    "stripeNotReady": "Automatic payments are unavailable. Check Stripe permissions: {{permissions}}.",
+    "stripeDisconnected": "Connect Stripe first",
+    "card": "Card",
+    "bank": "Bank account",
+    "done": "Request completed.",
+    "status": {
+      "not_requested": "Not requested",
+      "requested": "Requested",
+      "active": "Active",
+      "paused": "Paused",
+      "cancelled": "Off",
+      "needs_attention": "Needs attention"
+    },
+    "pending": "Bank verification is pending. No automatic payments can be made yet.",
+    "effective": "Applies to invoices issued after {{date}}",
+    "recipient": "Request recipient override (optional)",
+    "request": "Send request",
+    "resend": "Resend request",
+    "pause": "Pause",
+    "resume": "Resume",
+    "turnOff": "Turn off",
+    "cancel": "Cancel",
+    "processingWarning": "Future automatic payments will stop. A bank payment already processing cannot be recalled.",
+    "unasked_one": "{{count}} client not yet asked",
+    "unasked_other": "{{count}} clients not yet asked",
+    "sendNow": "Send now",
+    "dismiss": "Dismiss",
+    "select": "Select",
+    "client": "Client",
+    "statusLabel": "Status",
+    "method": "Payment method",
+    "selectClient": "Select {{name}}",
+    "empty": "No clients found.",
+    "requestedCount_one": "Request sent to {{count}} client.",
+    "requestedCount_other": "Requests sent to {{count}} clients.",
+    "chargeDate": "Charge on or around {{date}}",
+    "excludeInvoice": "Exclude this invoice from automatic payments",
+    "excludeRefusedProcessing": "This invoice's payment is already processing and can't be stopped. You can exclude the invoice once the payment completes or fails.",
+    "excludeContract": "Exclude invoices containing this contract",
+    "failed": "Could not update automatic payment. Please try again.",
+    "states": {
+      "awaiting_notice": "Awaiting notice",
+      "scheduled": "Scheduled",
+      "collecting": "Collecting payment",
+      "retry_scheduled": "Retry scheduled",
+      "action_required": "Confirmation required",
+      "succeeded": "Payment received",
+      "failed": "Payment failed",
+      "skipped_by_client": "Skipped by client",
+      "excluded_by_msp": "Excluded by provider",
+      "cancelled": "Cancelled",
+      "not_needed": "No payment needed",
+      "reserved": "Payment reserved",
+      "created": "Payment created",
+      "confirming": "Confirming payment",
+      "processing": "Payment processing",
+      "requires_action": "Confirmation required",
+      "canceled": "Cancelled",
+      "unapplied": "Payment needs reconciliation"
+    },
+    "reasons": {
+      "not_enrolled": "Not enrolled",
+      "enrolled_after_issue": "Enrolled after invoice issue",
+      "method_not_usable": "Payment method unavailable",
+      "over_cap": "Above automatic payment limit",
+      "above_authorized_cap": "Above the limit the client authorized",
+      "issued_before_authorization": "Issued before the client's updated authorization: collect manually",
+      "cap_currency_mismatch": "Limit currency does not match",
+      "ach_currency_unsupported": "Bank payment currency unsupported",
+      "excluded_contract": "Contract excluded",
+      "excluded_invoice": "Invoice excluded",
+      "charging_disabled": "Automatic charging disabled",
+      "stripe_unavailable": "Stripe unavailable",
+      "bank_unverified": "Not charged: the client's bank was not verified in time. Collect manually",
+      "charging_on_hold": "Not charged: automatic payments stayed switched off. Collect manually",
+      "service_unavailable": "Not charged: Stripe stayed unreachable. Collect manually",
+      "control_pending:skip": "Skip requested; stopping the pending payment",
+      "control_pending:exclude": "Exclusion requested; stopping the pending payment",
+      "control_pending:stop": "Stop requested; stopping the pending payment",
+      "control_pending:renotice": "Updating the notice; stopping the pending payment",
+      "skip": "Skipped by client",
+      "exclude": "Excluded by provider",
+      "stop": "Automatic payments stopped",
+      "client_request": "Requested by client",
+      "no_billing_contact": "No billing contact",
+      "delivery_failed": "Notice delivery failed",
+      "consent_required": "Payment authorization is missing. Request updated authorization."
+    },
+    "chargeFailed": "Could not start payment. Please try again.",
+    "chargeResultUnknown": "We could not confirm what happened to this payment. Refreshing the invoice to show its current status.",
+    "chargeStarted": "Payment attempt started",
+    "chargeNow": "Charge now",
+    "noCharge": "No charges yet",
+    "noticeStuck": "Payment notice needs attention",
+    "unapplied": "{{count}} payment(s) need reconciliation. Review unresolved money before collecting again.",
+    "lastCharge": "Last charge",
+    "attention": "Attention",
+    "attemptStates": {
+      "reserved": "Payment reserved",
+      "created": "Payment created",
+      "confirming": "Confirming payment",
+      "processing": "Processing",
+      "succeeded": "Payment received",
+      "failed": "Failed",
+      "requires_action": "Confirmation required",
+      "canceled": "Cancelled",
+      "unapplied": "Payment needs reconciliation",
+      "returned": "Returned",
+      "refunded": "Refunded",
+      "disputed": "Disputed"
+    },
+    "fees": {
+      "title": "Processing fees",
+      "cardBps": "Credit-card fee (basis points, 0–300)",
+      "ach": "Bank payment fee (USD, 0.00–25.00)",
+      "inactive": "Card fees are inactive until your partner administrator affirms both statements below.",
+      "notified": "I notified my acquirer (Stripe) and the card networks at least 30 days ago",
+      "cost": "This fee does not exceed my cost of card acceptance",
+      "rules": "Credit cards only. No card fee in CA, CT, ME or MA; Colorado is capped at 2%. Fees apply only to eligible US automatic payments in USD. One-time pay links have no fee.",
+      "legal": "Breeze is not legal advice. You are responsible for surcharge eligibility, notices and tax treatment.",
+      "lowerAuthorization": "Clients with lower authorized terms: {{count}}. Their existing authorization remains in effect until they accept updated terms.",
+      "authorizedCard": "Authorized: {{accepted}} basis points; configured: {{configured}}",
+      "authorizedAch": "Authorized: USD {{accepted}}; configured: USD {{configured}}",
+      "authorizedCap": "Authorized limit: {{accepted}}; configured: {{configured}}",
+      "noCap": "no limit",
+      "requestAuthorization": "Request updated authorization",
+      "requestFailed": "Could not request updated authorization. Check the billing contact and Stripe readiness.",
+      "requested": "Updated authorization requested. Existing authorization remains in effect.",
+      "attestationOnFile": "Attestation on file: {{name}} affirmed both statements on {{date}}.",
+      "attestationOnFileUnknown": "Attestation on file: both statements were affirmed on {{date}}.",
+      "reattestHelp": "To re-attest, tick both statements and save. That records a new attestation under your name with the current date, replacing the one on file. It does not change any client's authorized fee.",
+      "authorizedCardNone": "No authorization on file; configured: {{configured}} basis points",
+      "authorizedAchNone": "No authorization on file; configured: USD {{configured}}",
+      "lowerAuthorizationOrg": "This client has not authorized the configured terms. Any existing authorization stays in effect until they accept updated terms.",
+      "blankPartner": "Blank uses the Breeze default (no fee). To exempt one client, set its fee to 0 on that client's Billing page.",
+      "blankOrg": "Blank uses the partner default. Enter 0 to exempt this client.",
+      "inactiveOrg": "Card fees are inactive until a partner administrator affirms both fee statements on the Payments tab of the partner Billing settings.",
+      "missingAuthorization": "No authorization on file: {{count}}. Automatic payments can't charge these clients until they authorize their saved payment method.",
+      "missingAuthorizationOrg": "This client has no authorization on file for its saved payment method. Automatic payments can't charge it until the client authorizes.",
+      "requestMissingAuthorization": "Request authorization"
+    },
+    "enrollmentTitle": "Automatic payment enrollment",
+    "requestSentTo": "Request sent to {{email}}.",
+    "result": {
+      "paused": "Automatic payments paused.",
+      "resumed": "Automatic payments resumed.",
+      "turnedOff": "Automatic payments turned off."
+    },
+    "needsAttention": {
+      "method_unusable": "The saved payment method can't be charged.",
+      "stripe_account_changed": "The connected Stripe account changed after this client enrolled.",
+      "key_missing_permissions": "The Stripe key is missing permissions that automatic payments need.",
+      "verification_failed": "Bank account verification failed."
+    },
+    "chargeOutcome": {
+      "succeeded": "Payment received.",
+      "processing": "Payment submitted. It is processing, and the invoice updates when it settles.",
+      "requiresAction": "The client's bank requires them to confirm this payment. If a billing contact is on file, they are emailed a link to confirm it.",
+      "declined": "The payment did not go through.",
+      "cardDeclined": "The card was declined.",
+      "expiredCard": "The card has expired. Ask the client to update their payment method.",
+      "insufficientFunds": "The payment was declined for insufficient funds.",
+      "canceled": "The payment was canceled before it completed.",
+      "unapplied": "The payment was captured but needs reconciliation. Review it before collecting again."
+    },
+    "chargeRefused": {
+      "notice_lead": "The client's notice period has not ended yet. The invoice can be charged once it does.",
+      "no_eligible_notice": "This invoice has no automatic payment notice, so it cannot be charged automatically.",
+      "renotice_required": "The payment notice must be sent again before this invoice can be charged.",
+      "collection_in_progress": "A payment for this invoice is already in progress.",
+      "checkout_session_unrevoked": "The client may be paying this invoice online right now. Try again in a few minutes.",
+      "retry_not_due": "The next retry is not due yet.",
+      "not_payable": "This invoice is not open for payment.",
+      "nothing_to_pay": "Nothing is left to pay on this invoice.",
+      "enrollment_inactive": "Automatic payments are not active for this client.",
+      "schedule_inactive": "This invoice is no longer scheduled for automatic payment.",
+      "generic": "Automatic payment could not be started. Refresh the invoice to see its current status.",
+      "excluded_contract": "This invoice's contract is excluded from automatic payments, so it was not charged. If the client had been told about this payment, they were emailed that it won't happen."
+    },
+    "stepUp": {
+      "heading": "Confirm it's you",
+      "intro": {
+        "autopay_charge_now": "Charging this invoice now needs a fresh second-factor check.",
+        "partner_payment_settings_update": "Changing payment settings needs a fresh second-factor check for these exact values.",
+        "org_payment_settings_update": "Changing this organization's payment settings needs a fresh second-factor check for these exact values.",
+        "autopay_request_recipient": "Sending the authorization request to an address other than the billing contact needs a fresh second-factor check."
+      },
+      "code": "Authenticator code",
+      "passkey": "You will confirm with your passkey.",
+      "noFactor": "Add an authenticator app or passkey to your account first.",
+      "noFactorSmsOnly": "Text-message codes cannot confirm this action. Add an authenticator app or passkey to your account first.",
+      "enrollLink": "Set up a second factor",
+      "confirm": "Confirm",
+      "failed": "Verification failed. Try again.",
+      "unavailable": "Unable to start verification"
+    },
+    "notEnabled": {
+      "title": "Automatic payments aren't enabled for your account",
+      "hint": "Automatic payments haven't been turned on yet. Ask your Breeze administrator to enable them, then come back to request enrollment from your clients."
+    }
+  },
+  "reminders": {
+    "title": "Payment reminders",
+    "description": "Send reminders to the organization's billing contact for unpaid invoices. Reminders work without automatic payments.",
+    "enabled": "Send payment reminders",
+    "on": "Enabled",
+    "off": "Disabled",
+    "inherit": "Use {{source}}: {{value}}",
+    "before": "Days before the due date",
+    "repeat": "Repeat before due every (days)",
+    "overdue": "Remind overdue every (days)",
+    "noRepeat": "No repeat",
+    "orgRepeatHelp": "Blank inherits the partner setting. You cannot disable only upcoming repeats here when the partner repeats them; disable reminders for this organization to stop all reminders.",
+    "partnerRepeatHelp": "Leave the repeat interval blank for one upcoming reminder. Blank in the other fields uses the displayed default.",
+    "cadenceHelp": "No reminder is sent on the due date. The first overdue reminder is sent one overdue interval later. Changing dates or intervals does not resend already allocated reminders.",
+    "invalid": "Enter whole days from 1 to 31, or leave blank to inherit.",
+    "sources": {
+      "org": "organization",
+      "partner": "partner default",
+      "default": "Breeze default"
+    },
+    "save": "Save payment settings",
+    "saving": "Saving…",
+    "saved": "Reminder settings saved",
+    "saveFailed": "Could not save reminder settings",
+    "loadFailed": "Could not load reminder settings",
+    "retry": "Retry",
+    "loading": "Loading payment settings…"
   }
 }

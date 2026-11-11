@@ -19,6 +19,17 @@ STORAGE_MODE="${BREEZE_SETUP_STORAGE_MODE:-}"
 INSTALL_SYSTEMD="${BREEZE_SETUP_INSTALL_SYSTEMD:-}"
 SYSTEMD_SERVICE_NAME="${BREEZE_SETUP_SYSTEMD_SERVICE_NAME:-breeze-rmm}"
 SYSTEMD_HELPER_FILE="${BREEZE_SETUP_SYSTEMD_HELPER_FILE:-/usr/local/lib/${SYSTEMD_SERVICE_NAME}/breeze-compose-boot.sh}"
+# --upgrade [VERSION] (#7024): move an existing install to another signed
+# release. See run_upgrade.
+UPGRADE_MODE="false"
+UPGRADE_TARGET_VERSION=""
+ALLOW_DOWNGRADE="false"
+UPGRADE_STAGED_ENV=""
+# --allow-unverified-release: install a version setup cannot verify anyway (a
+# release older than SIGNED_IMAGE_INVENTORY_MIN_VERSION, or a tag that is not
+# an exact release), from its unverified image tags. Fresh installs only. See
+# require_verifiable_release.
+ALLOW_UNVERIFIED_RELEASE="false"
 
 MIN_CPU_CORES="${BREEZE_SETUP_MIN_CPU_CORES:-2}"
 MIN_RAM_MB="${BREEZE_SETUP_MIN_RAM_MB:-4096}"
@@ -47,9 +58,12 @@ SELECTED_BREEZE_VERSION="${BREEZE_SETUP_VERSION:-}"
 # before this floor have nothing to download or verify: template downloads are
 # pinned to the SELECTED release tag (resolve_template_remote_base), so an
 # older tag's raw.githubusercontent.com tree never contains that script, and
-# no older GitHub Release publishes a signed manifest. Below the floor, image
-# refs keep tracking BREEZE_VERSION exactly as they always have; at/above it,
-# configure_signed_release_image_refs is the fail-closed source of truth.
+# no older GitHub Release publishes a signed manifest. Release signatures only
+# cover the server container images from this floor on, so an older release
+# (or a version that is not an exact release) is refused unless the operator
+# passes --allow-unverified-release; with it, image refs track the release tag
+# unverified. At/above the floor, configure_signed_release_image_refs is the
+# fail-closed source of truth.
 SIGNED_IMAGE_INVENTORY_MIN_VERSION="0.112.0"
 BACK_STATUS=42
 BOOTSTRAP_ENV_KEYS=(
@@ -80,8 +94,25 @@ Guided Breeze self-host setup.
 
 Usage:
   bash scripts/guided-setup.sh [options]
+  bash scripts/guided-setup.sh --upgrade [VERSION] [-y] [--no-up]
 
 Options:
+  --upgrade [VERSION]  Upgrade an existing install to VERSION (default: the latest
+                       published release). Verifies that release's signed image
+                       inventory, backs up .env, rewrites BREEZE_VERSION and the
+                       four BREEZE_*_IMAGE_REF digests together, then pulls and
+                       restarts. `docker compose pull` alone never upgrades a
+                       digest-pinned install. Does not modify docker-compose.yml.
+  --allow-downgrade    With --upgrade, allow a target older than the current
+                       BREEZE_VERSION. Migrations are forward-only; restore the
+                       matching database backup before running an older release.
+  --allow-unverified-release
+                       Install a version setup cannot verify: a release older than
+                       0.112.0 (release signatures only cover the server container
+                       images from 0.112.0 on), or a tag that is not an exact
+                       release, such as a locally built image. Refused by default;
+                       with this flag setup warns and uses the unverified image
+                       tags. Not valid with --upgrade.
   --work-dir DIR       Directory that should contain docker-compose.yml and .env.
                        Defaults to the current directory.
   --env-file FILE      Environment file to create/update. Defaults to WORK_DIR/.env.
@@ -102,7 +133,9 @@ Environment overrides:
   BREEZE_SETUP_GITHUB_REPO   GitHub repo for latest release lookup.
   BREEZE_SETUP_VERSION       Preselect the Breeze version/tag; skips the GitHub
                              release lookup and the GHCR image check (for pinned,
-                             air-gapped, or locally built images).
+                             air-gapped, or locally built images). Anything other
+                             than an exact release, 0.112.0 or later, also needs
+                             --allow-unverified-release.
   BREEZE_SETUP_SECRET_MODE   Secret workflow: auto or manual.
   BREEZE_SETUP_STORAGE_MODE  Storage mode: docker or local.
   BREEZE_SETUP_DRY_RUN       Exercise prompts without Docker/systemd changes: true or false.
@@ -149,6 +182,23 @@ while [[ $# -gt 0 ]]; do
       [[ -n "${RENDER_SYSTEMD_DIR}" ]] || { echo "--render-systemd-unit requires a directory." >&2; exit 2; }
       shift 2
       ;;
+    --upgrade)
+      UPGRADE_MODE="true"
+      if [[ -n "${2:-}" && "${2}" != -* ]]; then
+        UPGRADE_TARGET_VERSION="$2"
+        shift 2
+      else
+        shift
+      fi
+      ;;
+    --allow-downgrade)
+      ALLOW_DOWNGRADE="true"
+      shift
+      ;;
+    --allow-unverified-release)
+      ALLOW_UNVERIFIED_RELEASE="true"
+      shift
+      ;;
     -y|--yes)
       YES_MODE="true"
       shift
@@ -177,6 +227,19 @@ case "${DRY_RUN}" in
     exit 2
     ;;
 esac
+
+if [[ "${ALLOW_DOWNGRADE}" == "true" && "${UPGRADE_MODE}" != "true" ]]; then
+  echo "--allow-downgrade only applies to --upgrade." >&2
+  exit 2
+fi
+if [[ "${ALLOW_UNVERIFIED_RELEASE}" == "true" && "${UPGRADE_MODE}" == "true" ]]; then
+  echo "--allow-unverified-release does not apply to --upgrade: --upgrade only moves to a release whose images are covered by release signatures (${SIGNED_IMAGE_INVENTORY_MIN_VERSION} or later)." >&2
+  exit 2
+fi
+if [[ "${UPGRADE_MODE}" == "true" && ( "${INSTALL_SYSTEMD_ONLY}" == "true" || -n "${RENDER_SYSTEMD_DIR}" ) ]]; then
+  echo "--upgrade cannot be combined with --install-systemd or --render-systemd-unit." >&2
+  exit 2
+fi
 
 if [[ -z "${WORK_DIR}" ]]; then
   echo "Working directory cannot be empty." >&2
@@ -599,9 +662,11 @@ prepare_templates() {
   local need_download="false"
   # Below SIGNED_IMAGE_INVENTORY_MIN_VERSION the selected release's tag tree
   # never contains scripts/release/verify-release-images.sh (template
-  # downloads are pinned to that tag), so it is neither required nor fetched.
+  # downloads are pinned to that tag), so it is neither required nor fetched;
+  # neither is it for a tag that is not an exact release. Both are reachable
+  # only with --allow-unverified-release.
   local want_verifier="false"
-  if release_has_signed_image_inventory "${SELECTED_BREEZE_VERSION}"; then
+  if release_is_verifiable "${SELECTED_BREEZE_VERSION}"; then
     want_verifier="true"
   fi
   if [[ -n "${REMOTE_BASE}" ]]; then
@@ -759,8 +824,17 @@ wait_for_docker() {
   return 1
 }
 
+# Capture the list first: piping into \`grep -q\` lets grep exit at the first
+# match, a still-writing docker compose can be killed by SIGPIPE, and pipefail turns
+# that into "no such service" (#7960). A failed query exits the helper rather
+# than reading as "absent": callers test this in an if, where set -e is off.
 service_exists() {
-  "\${compose[@]}" config --services | grep -qx "\$1"
+  local services
+  if ! services="\$("\${compose[@]}" config --services)"; then
+    echo "Failed to read Compose services from docker compose config --services." >&2
+    exit 1
+  fi
+  grep -qx -- "\$1" <<< "\${services}"
 }
 
 start_remaining_services() {
@@ -3244,6 +3318,22 @@ generate_secret() {
   esac
 }
 
+# APP_ENCRYPTION_KEY_ID makes the API seal secrets as AAD-bound enc:v3
+# envelopes; without it they fall back to unbound enc:v1 (#5568). Generate one
+# on first run, but NEVER replace an existing id: envelopes are tagged with it,
+# so changing it would orphan them. Any [A-Za-z0-9._-]+ value is valid.
+ensure_app_encryption_key_id() {
+  local current
+  current="$(get_env_value "APP_ENCRYPTION_KEY_ID")"
+  if ! looks_like_placeholder "${current}"; then
+    printf '%s' "${current}"
+    return
+  fi
+  current="key-$(date +%Y%m%d)"
+  set_env_value "APP_ENCRYPTION_KEY_ID" "${current}"
+  printf '%s' "${current}"
+}
+
 prompt_secret() {
   local key="$1"
   local label="$2"
@@ -3452,6 +3542,65 @@ release_has_signed_image_inventory() {
   version_at_least "${version}" "${SIGNED_IMAGE_INVENTORY_MIN_VERSION}"
 }
 
+# True when setup can verify the images VERSION would run: an exact release
+# version at or above SIGNED_IMAGE_INVENTORY_MIN_VERSION. Anything else has no
+# signed image inventory to check the images against.
+release_is_verifiable() {
+  local version="${1#v}"
+  is_exact_release_version "${version}" && release_has_signed_image_inventory "${version}"
+}
+
+# Why VERSION cannot be verified; shared by the refusal and the override warning.
+unverifiable_release_reason() {
+  local version="${1#v}" floor="${SIGNED_IMAGE_INVENTORY_MIN_VERSION}"
+  if is_exact_release_version "${version}"; then
+    printf 'Breeze %s is older than %s. Release signatures only cover the server container images from %s on, so setup cannot verify the images %s would run.' \
+      "${version}" "${floor}" "${floor}" "${version}"
+  else
+    printf "'%s' is not an exact release version (MAJOR.MINOR.PATCH, for example %s). Release signatures only cover the server container images of exact releases from %s on, so setup cannot verify the images it names." \
+      "${version}" "${floor}" "${floor}"
+  fi
+}
+
+unverifiable_release_choices() {
+  local version="${1#v}" floor="${SIGNED_IMAGE_INVENTORY_MIN_VERSION}"
+  if is_exact_release_version "${version}"; then
+    printf 'Choose %s or later, or rerun with --allow-unverified-release to install %s from its unverified image tags.' \
+      "${floor}" "${version}"
+  else
+    printf "Enter an exact release version, %s or later, or rerun with --allow-unverified-release to use the '%s' image tags unverified." \
+      "${floor}" "${version}"
+  fi
+}
+
+# Refuses a release whose images setup cannot verify, unless the operator
+# passed --allow-unverified-release. Called wherever a version is chosen
+# (preselected, latest-release lookup, read back from .env, typed) and again
+# before image refs are written.
+require_verifiable_release() {
+  local version="$1"
+  if release_is_verifiable "${version}" || [[ "${ALLOW_UNVERIFIED_RELEASE}" == "true" ]]; then
+    return 0
+  fi
+  fail "$(unverifiable_release_reason "${version}") $(unverifiable_release_choices "${version}")"
+}
+
+# Pins the four first-party image refs to the selected release's verified
+# digests. A release below SIGNED_IMAGE_INVENTORY_MIN_VERSION, or a tag that
+# is not an exact release, has no signed image inventory, so it is refused
+# here as well as at selection unless --allow-unverified-release was given;
+# then its refs keep tracking the unverified tag.
+configure_release_image_refs() {
+  if release_is_verifiable "${SELECTED_BREEZE_VERSION}"; then
+    configure_signed_release_image_refs
+    return
+  fi
+  require_verifiable_release "${SELECTED_BREEZE_VERSION}"
+  warn "Proceeding because --allow-unverified-release was given. $(unverifiable_release_reason "${SELECTED_BREEZE_VERSION}")"
+  warn "The API, web, portal and binaries image refs track the ${SELECTED_BREEZE_VERSION#v} tag and are NOT verified."
+  warn "Move to ${SIGNED_IMAGE_INVENTORY_MIN_VERSION} or later with guided-setup.sh --upgrade for signed, digest-pinned images."
+}
+
 configure_signed_release_image_refs() {
   local version tag repo base manifest signature resolved key variable value line_count
 
@@ -3643,6 +3792,7 @@ select_breeze_version() {
   local current latest default_value answer
 
   if [[ -n "${SELECTED_BREEZE_VERSION}" ]]; then
+    require_verifiable_release "${SELECTED_BREEZE_VERSION}"
     return
   fi
 
@@ -3673,6 +3823,7 @@ select_breeze_version() {
   if [[ "${YES_MODE}" == "true" ]]; then
     if [[ -n "${default_value}" ]]; then
       answer="${default_value#v}"
+      require_verifiable_release "${answer}"
       confirm_breeze_version_available "${answer}"
       SELECTED_BREEZE_VERSION="${answer}"
       log "Selected Breeze version: ${answer}"
@@ -3695,6 +3846,15 @@ select_breeze_version() {
 
     if [[ -n "${answer}" ]]; then
       answer="${answer#v}"
+      if ! release_is_verifiable "${answer}" && [[ "${ALLOW_UNVERIFIED_RELEASE}" != "true" ]]; then
+        warn "$(unverifiable_release_reason "${answer}")"
+        warn "$(unverifiable_release_choices "${answer}")"
+        # Stop offering a refused default (e.g. an old BREEZE_VERSION from .env).
+        if [[ "${answer}" == "${default_value#v}" ]]; then
+          default_value=""
+        fi
+        continue
+      fi
       if ! confirm_breeze_version_available "${answer}"; then
         continue
       fi
@@ -3952,11 +4112,7 @@ configure_core_env() {
 
   prompt_breeze_version
   configure_release_manifest_trust_root
-  if release_has_signed_image_inventory "${SELECTED_BREEZE_VERSION}"; then
-    configure_signed_release_image_refs
-  else
-    warn "Release v${SELECTED_BREEZE_VERSION} predates signed image inventories; image refs track the release tag as before. Upgrade to ${SIGNED_IMAGE_INVENTORY_MIN_VERSION}+ for digest-pinned images."
-  fi
+  configure_release_image_refs
 
   section "Database And Redis"
   subsection "Postgres"
@@ -3993,6 +4149,7 @@ configure_core_env() {
   prompt_secret "JWT_SECRET" "JWT signing secret" "base64_64" true >/dev/null
   prompt_secret "AGENT_ENROLLMENT_SECRET" "Agent enrollment secret" "hex32" true >/dev/null
   app_key="$(prompt_secret "APP_ENCRYPTION_KEY" "Application encryption key" "hex32" true)"
+  ensure_app_encryption_key_id >/dev/null
   mfa_key="$(prompt_secret "MFA_ENCRYPTION_KEY" "MFA encryption key" "hex32" true)"
   while [[ "${app_key}" == "${mfa_key}" ]]; do
     warn "MFA_ENCRYPTION_KEY must not reuse APP_ENCRYPTION_KEY."
@@ -4188,6 +4345,16 @@ print_manual_start_commands() {
   log "Run this when ready:"
   log "  $(compose_command_for_display) pull"
   log "  $(compose_command_for_display) up -d"
+  print_upgrade_hint
+}
+
+# The images are pinned by digest, so `docker compose pull` re-fetches the
+# SAME release forever and editing BREEZE_VERSION alone does not change what
+# runs (#7024). Say how to upgrade wherever the installer prints next steps.
+print_upgrade_hint() {
+  log ""
+  log "To upgrade later, run: bash guided-setup.sh --work-dir ${WORK_DIR} --env-file ${ENV_FILE} --upgrade [VERSION]"
+  log "Images are pinned by digest: 'docker compose pull' or editing BREEZE_VERSION alone will not upgrade Breeze."
 }
 
 print_bootstrap_cleanup_reminder() {
@@ -4442,6 +4609,187 @@ start_stack() {
   fi
 }
 
+# --- --upgrade (#7024) --------------------------------------------------------
+# A guided install at/above SIGNED_IMAGE_INVENTORY_MIN_VERSION pins the four
+# first-party images by digest, so `docker compose pull` only re-fetches the
+# release it already runs, and bumping BREEZE_VERSION by hand leaves the old
+# digests running while BREEZE_VERSION claims the new release. --upgrade is
+# the one supported way to move: it resolves the target's digests through the
+# SAME fail-closed path as a fresh install (configure_signed_release_image_refs
+# -> scripts/release/verify-release-images.sh) and writes them together with
+# BREEZE_VERSION, or writes nothing.
+
+UPGRADE_IMAGE_REF_KEYS=(
+  BREEZE_API_IMAGE_REF
+  BREEZE_WEB_IMAGE_REF
+  BREEZE_PORTAL_IMAGE_REF
+  BREEZE_BINARIES_IMAGE_REF
+)
+
+is_exact_release_version() {
+  [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]
+}
+
+resolve_upgrade_target_version() {
+  local target="${UPGRADE_TARGET_VERSION:-${SELECTED_BREEZE_VERSION}}"
+
+  if [[ -z "${target}" ]]; then
+    # Runs inside $(...): print nothing to stdout except the version.
+    target="$(fetch_latest_github_release_version)" \
+      || fail "Could not look up the latest Breeze release. Pass the target explicitly: --upgrade <version>."
+  fi
+  printf '%s' "${target#v}"
+}
+
+# The verifier that is already installed is preferred: it is the code the
+# operator accepted at install time. It is only fetched (pinned to the TARGET
+# release tag, exactly as a fresh install fetches it) when it is missing or
+# --download asks for a fresh copy.
+ensure_upgrade_verifier() {
+  if [[ -f "${RELEASE_IMAGE_VERIFIER_FILE}" && "${DOWNLOAD_MODE}" != "always" ]]; then
+    log "Using installed verifier ${RELEASE_IMAGE_VERIFIER_FILE}."
+    return
+  fi
+  if [[ "${DOWNLOAD_MODE}" == "never" ]]; then
+    fail "Missing ${RELEASE_IMAGE_VERIFIER_FILE}; rerun without --no-download so --upgrade can fetch it."
+  fi
+  resolve_template_remote_base
+  download_template "scripts/release/verify-release-images.sh"
+}
+
+print_upgrade_compose_reminder() {
+  local target="$1" repo
+  repo="$(github_repo_for_release_lookup)"
+
+  subsection "Compose File"
+  log "--upgrade does not change ${COMPOSE_FILE}. Releases can add services, volumes, or"
+  log "required variables, so compare it with the v${target} templates before starting:"
+  log "  https://raw.githubusercontent.com/${repo}/v${target}/docker-compose.yml"
+  log "  https://raw.githubusercontent.com/${repo}/v${target}/.env.example"
+  log "Release notes: https://github.com/${repo}/releases/tag/v${target}"
+}
+
+# Writes BREEZE_VERSION + the four digests on a staged copy of .env and only
+# swaps it in once the signed inventory verified and every ref was written, so
+# a failed verification leaves the original .env byte-for-byte unchanged.
+stage_upgraded_env() {
+  local target="$1" real_env="${ENV_FILE}"
+
+  UPGRADE_STAGED_ENV="$(mktemp "${real_env}.upgrade.XXXXXX")"
+  cp "${real_env}" "${UPGRADE_STAGED_ENV}" || fail "Failed to stage a copy of ${real_env}."
+  chmod 600 "${UPGRADE_STAGED_ENV}" || fail "Failed to secure permissions on ${UPGRADE_STAGED_ENV}."
+
+  ENV_FILE="${UPGRADE_STAGED_ENV}"
+  configure_release_manifest_trust_root
+  set_env_value "BREEZE_VERSION" "${target}"
+  configure_signed_release_image_refs
+  ENV_FILE="${real_env}"
+
+  backup_file "${ENV_FILE}"
+  local staged="${UPGRADE_STAGED_ENV}"
+  if ! mv "${staged}" "${ENV_FILE}"; then
+    # Keep the verified copy for the operator: on_exit deletes UPGRADE_STAGED_ENV.
+    UPGRADE_STAGED_ENV=""
+    fail "Failed to replace ${ENV_FILE}; it is unchanged. The verified upgraded copy is kept at ${staged}."
+  fi
+  UPGRADE_STAGED_ENV=""
+  chmod 600 "${ENV_FILE}" || fail "Failed to set secure permissions on ${ENV_FILE}."
+}
+
+run_upgrade() {
+  local current target key
+  local -a previous_refs=()
+
+  section "Upgrade Breeze"
+  require_command curl
+  require_command awk
+  require_command openssl
+  if [[ "${NO_UP}" != "true" ]] && ! dry_run_enabled; then
+    require_command docker
+    docker compose version >/dev/null 2>&1 \
+      || fail "Docker Compose v2 plugin is required. Install Docker Engine/Desktop with the compose plugin."
+  fi
+
+  [[ -f "${ENV_FILE}" ]] \
+    || fail "Missing ${ENV_FILE}. --upgrade updates an existing install; run this script without --upgrade to install."
+  [[ -f "${COMPOSE_FILE}" ]] \
+    || fail "Missing ${COMPOSE_FILE}. Run --upgrade from (or --work-dir to) the directory that holds your install."
+
+  current="$(get_env_value "BREEZE_VERSION")"
+  current="${current#v}"
+  is_exact_release_version "${current}" \
+    || fail "BREEZE_VERSION in ${ENV_FILE} is '${current}', not an exact release version. Set it to the release you are running (for example 0.115.0) and retry."
+
+  target="$(resolve_upgrade_target_version)"
+  is_exact_release_version "${target}" \
+    || fail "Upgrade target '${target}' is not an exact release version (for example 0.116.0)."
+  release_has_signed_image_inventory "${target}" \
+    || fail "--upgrade only targets releases with a signed image inventory (${SIGNED_IMAGE_INVENTORY_MIN_VERSION} or later); v${target} has none. Release signatures only cover the server container images from ${SIGNED_IMAGE_INVENTORY_MIN_VERSION} on, and --upgrade never pulls an image it cannot verify."
+
+  log "Current release (BREEZE_VERSION): ${current}"
+  log "Target release:                   ${target}"
+  if [[ "${target}" == "${current}" ]]; then
+    log "Already on ${target}: re-verifying its signed inventory and re-pinning the image digests."
+    log "This also repairs an install whose BREEZE_VERSION was edited by hand without new digests."
+  elif ! version_at_least "${target}" "${current}"; then
+    if [[ "${ALLOW_DOWNGRADE}" != "true" ]]; then
+      fail "Refusing to downgrade from ${current} to ${target}. Database migrations are forward-only; restore the matching database backup first, then rerun with --allow-downgrade."
+    fi
+    warn "Downgrading from ${current} to ${target} (--allow-downgrade). The database must already match ${target}."
+  fi
+
+  if ! ask_yes_no "Resolve signed images for ${target} and update ${ENV_FILE}?" "yes"; then
+    log "Upgrade cancelled; ${ENV_FILE} was not changed."
+    return 1
+  fi
+
+  for key in "${UPGRADE_IMAGE_REF_KEYS[@]}"; do
+    previous_refs+=("$(get_env_value "${key}")")
+  done
+
+  SELECTED_BREEZE_VERSION="${target}"
+  ensure_upgrade_verifier
+  stage_upgraded_env "${target}"
+
+  subsection "Updated ${ENV_FILE}"
+  log "BREEZE_VERSION: ${current} -> ${target}"
+  local i
+  for i in "${!UPGRADE_IMAGE_REF_KEYS[@]}"; do
+    key="${UPGRADE_IMAGE_REF_KEYS[i]}"
+    log "${key}:"
+    log "  was ${previous_refs[i]:-<unset>}"
+    log "  now $(get_env_value "${key}")"
+  done
+
+  print_upgrade_compose_reminder "${target}"
+
+  if [[ "${NO_UP}" == "true" ]]; then
+    log ""
+    log "Apply the upgrade when ready:"
+    log "  $(compose_command_for_display) pull"
+    log "  $(compose_command_for_display) up -d"
+    return
+  fi
+
+  section "Restart Breeze"
+  if ! ask_yes_no "Pull the verified ${target} images and restart Breeze now?" "yes"; then
+    log "Not restarting. Apply the upgrade with:"
+    log "  $(compose_command_for_display) pull"
+    log "  $(compose_command_for_display) up -d"
+    return
+  fi
+  compose pull \
+    || fail "docker compose pull failed; ${ENV_FILE} now pins ${target}. Fix registry access, then run: $(compose_command_for_display) pull && $(compose_command_for_display) up -d"
+  compose up -d \
+    || fail "docker compose up -d failed. Inspect with: $(compose_command_for_display) logs api"
+  if ! wait_for_api_health; then
+    warn "Breeze ${target} did not report healthy. The previous .env is in the backup listed above."
+    return 1
+  fi
+  log ""
+  log "${C_OK}Breeze upgraded to ${target}.${C_RESET}"
+}
+
 on_exit() {
   local exit_status=$?
   # Remove any leftover atomic-write temp files. Each writer mktemp's
@@ -4453,6 +4801,12 @@ on_exit() {
   [[ -n "${COMPOSE_FILE:-}" ]] && rm -f "${COMPOSE_FILE}".tmp.* 2>/dev/null
   [[ -n "${PROXY_GUIDE_FILE:-}" ]] && rm -f "${PROXY_GUIDE_FILE}".tmp.* 2>/dev/null
   [[ -n "${RELEASE_VERIFY_TMP:-}" ]] && rm -rf "${RELEASE_VERIFY_TMP}" 2>/dev/null
+  # A --upgrade that failed before its swap leaves a staged .env copy (and, if
+  # it died mid-write, that copy's own set_env_value temps). ENV_FILE may still
+  # point at the staged copy, so the .env temp glob above already covered it.
+  if [[ -n "${UPGRADE_STAGED_ENV:-}" ]]; then
+    rm -f "${UPGRADE_STAGED_ENV}" "${UPGRADE_STAGED_ENV}".tmp.* 2>/dev/null
+  fi
   if [[ "${STACK_STARTED}" == "true" && "${BOOTSTRAP_SCRUBBED}" != "true" ]]; then
     warn "Bootstrap admin values may still be present in ${ENV_FILE}. Remove BREEZE_BOOTSTRAP_ADMIN_* after first login."
   fi
@@ -4472,6 +4826,11 @@ main() {
 
   if [[ "${INSTALL_SYSTEMD_ONLY}" == "true" ]]; then
     install_systemd_only
+    return
+  fi
+
+  if [[ "${UPGRADE_MODE}" == "true" ]]; then
+    run_upgrade
     return
   fi
 
@@ -4509,6 +4868,7 @@ main() {
     configure_boot_start
     log ""
     log "${C_OK}Guided setup complete.${C_RESET}"
+    print_upgrade_hint
   else
     log ""
     log "${C_OK}Generated setup files are ready.${C_RESET}"

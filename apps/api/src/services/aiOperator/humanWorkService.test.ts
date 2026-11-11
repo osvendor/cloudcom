@@ -13,6 +13,13 @@ const calls = {
   createTicket: [] as unknown[], createTaskTarget: [] as unknown[], enqueue: [] as unknown[],
 };
 
+// #8972 W0: every ticket-child writer now locks the ticket row first; the lock is
+// mocked here (real SQL is covered by ticketChildLockOrder.integration.test.ts).
+const { lockTicketForWriteMock } = vi.hoisted(() => ({
+  lockTicketForWriteMock: vi.fn(async (_tx: unknown, id: string) => ({ id, orgId: 'o-1', partnerId: 'p-1', status: 'open', deletedAt: null as Date | null, workKind: 'support' })),
+}));
+vi.mock('../ticketRowLock', () => ({ lockTicketForWrite: lockTicketForWriteMock, lockTicketsForWrite: vi.fn(async () => []) }));
+
 vi.mock('../../db', () => ({
   db: {},
   runOutsideDbContext: (fn: () => unknown) => fn(),
@@ -64,7 +71,7 @@ describe('humanWorkService constants (recipe spec §6.5)', () => {
     // createTicket requires a TicketActor with a non-null userId, and the
     // Operator is not a users row. Precedent: DELIVERABLE_SWEEP_ACTOR
     // (services/serviceDeliverableService.ts).
-    expect(OPERATOR_TASK_ACTOR.userId).toBe('00000000-0000-0000-0000-000000000000');
+    expect(OPERATOR_TASK_ACTOR).toMatchObject({ kind: 'system', source: 'ai_operator' });
     expect(OPERATOR_TASK_ACTOR.name).toBe('AI Operator');
   });
 
@@ -139,6 +146,8 @@ describe('openHumanWorkStep', () => {
     });
 
     expect(result).toEqual({ stepId: 'step-1', checklistItemId: 'item-9', ticketId: 'ticket-1' });
+    // #8972 W0: the ticket row is locked after ensureTaskTicket
+    expect(lockTicketForWriteMock).toHaveBeenCalledWith(dbh, 'ticket-1');
     // The ticket target existed, so no ticket was created.
     expect(calls.createTicket).toHaveLength(0);
     expect(inserted[0]).toMatchObject({

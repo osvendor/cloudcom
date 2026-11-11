@@ -10,13 +10,52 @@ import {
   recoveryTokens,
   restoreJobs,
 } from '../db/schema';
-import { getGithubReleasePageUrl } from './binarySource';
+import { getGithubReleasePageUrl, getPairedBinariesVersion } from './binarySource';
 
 export const BMR_BOOTSTRAP_VERSION = 1;
+// The recovery helper ships with the agent binaries, so a server-only image
+// (paired with an older binaries release) must require that release's helper,
+// not its own server version — otherwise every recovery ISO it serves is
+// rejected as too old. Full-release images: pairing empty, unchanged.
 export const BMR_MIN_HELPER_VERSION =
-  process.env.BREEZE_VERSION ||
-  process.env.BINARY_VERSION ||
-  '0.5.0';
+  getPairedBinariesVersion() ??
+  (process.env.BREEZE_VERSION ||
+    process.env.BINARY_VERSION ||
+    '0.5.0');
+
+// Parse a helper version exactly like the recovery console's parseVersion
+// (agent/internal/recoveryconsole/console.go): strip one leading "v", split
+// on ".", and treat any non-integer component (e.g. "1-rc1", "dev") as 0.
+function parseHelperVersion(value: string): number[] {
+  return value
+    .trim()
+    .replace(/^v/, '')
+    .split('.')
+    .map((part) => {
+      const trimmed = part.trim();
+      if (!/^[+-]?\d+$/.test(trimmed)) return 0;
+      const n = Number.parseInt(trimmed, 10);
+      // Go's Atoi errors (→ 0) on int64 overflow; treat anything past the
+      // safe-integer range the same way rather than as a huge number.
+      return Number.isSafeInteger(n) ? n : 0;
+    });
+}
+
+// #5629: the exchange route refuses a too-old helper BEFORE claiming the
+// one-time code. This must agree case-for-case with the console's own
+// post-exchange versionAtLeast check — if the server let through a helper
+// the console then refuses, the code would be spent for nothing again.
+export function isHelperVersionAtLeast(have: string, want: string): boolean {
+  const h = parseHelperVersion(have);
+  const w = parseHelperVersion(want);
+  for (let i = 0; i < h.length || i < w.length; i++) {
+    const hv = h[i] ?? 0;
+    const wv = w[i] ?? 0;
+    if (hv !== wv) return hv > wv;
+  }
+  return true;
+}
+
 export const RECOVERY_DOWNLOAD_SESSION_TTL_MS = 60 * 60 * 1000;
 export const RECOVERY_TOKEN_REGEX = /^brz_rec_[a-f0-9]{64}$/;
 
@@ -110,6 +149,33 @@ export function buildRecoveryDownloadDescriptor(args: {
   };
 }
 
+/**
+ * #7081 R19: refusal for a recovery bootstrap that cannot serve the snapshot's
+ * key root. A `prefixed_flat` snapshot's objects live under `<prefix>/`,
+ * which only the API's token-mode download (`bootstrap.download`: logical
+ * paths, mapped through the snapshot's recorded root) resolves; the helper's
+ * direct mode reads bare logical keys from the bucket and would miss them.
+ */
+export const RECOVERY_REQUIRES_TOKEN_MODE = {
+  error: 'recovery_requires_token_mode',
+  code: 'recovery_requires_token_mode',
+  message: 'This snapshot uses a key prefix and can only be recovered with token-mode download. Update the recovery media.',
+} as const;
+
+/**
+ * Whether a built bootstrap may be returned for a snapshot with this recorded
+ * key layout: every layout but `legacy_flat` (an unreadable one included)
+ * requires the token-mode download descriptor. The builder issues one for
+ * every snapshot today, so this guards against a regression, not a live path.
+ */
+export function bootstrapServesKeyLayout(
+  keyLayout: unknown,
+  payload: { bootstrap: { download: unknown } },
+): boolean {
+  if (keyLayout === 'legacy_flat') return true;
+  return payload.bootstrap.download != null;
+}
+
 export async function expireUnusedRecoveryTokens(): Promise<void> {
   // System-scoped on purpose (D9): this is a housekeeping sweep of expired
   // tokens across ALL orgs, and its most important callers are the public,
@@ -188,6 +254,7 @@ export async function resolveSnapshotProviderConfig(snapshotDbId: string | null 
       systemStateManifest: backupSnapshots.systemStateManifest,
       isIncremental: backupSnapshots.isIncremental,
       storageIdentity: backupSnapshots.storageIdentity,
+      keyLayout: backupSnapshots.keyLayout,
     })
     .from(backupSnapshots)
     .where(eq(backupSnapshots.id, snapshotDbId))
@@ -424,7 +491,14 @@ export function buildAuthenticatedBootstrapPayload(args: {
   recovery?: AuthenticatedBootstrapRecovery | null;
   grantedCapabilities?: string[];
   fileIndex?: { status: 'complete'; manifestSha256: string; externalCount: number; originSnapshotIds: string[] } | null;
+  /**
+   * The snapshot's integrity expectation (services/backupRestoreIntegrity.ts
+   * integrityPayload), on the envelope and on the nested bootstrap. Omitted
+   * when there is none.
+   */
+  integrity?: Record<string, unknown> | null;
 }) {
+  const integrity = args.integrity ? { integrity: args.integrity } : {};
   const providerSnapshotId =
     getStringValue(asNullableRecord(args.snapshot), 'snapshotId') ?? args.snapshotId;
   const download = providerSnapshotId
@@ -456,6 +530,7 @@ export function buildAuthenticatedBootstrapPayload(args: {
       : null,
     download,
     ...(args.recovery ? { recovery: args.recovery } : {}),
+    ...integrity,
   };
 
   return {
@@ -474,6 +549,7 @@ export function buildAuthenticatedBootstrapPayload(args: {
     // the top-level response, not the doubly-nested `bootstrap.bootstrap`.
     snapshot: args.fileIndex && args.snapshot ? { ...args.snapshot, fileIndex: args.fileIndex } : args.snapshot,
     authenticatedAt: args.authenticatedAt.toISOString(),
+    ...integrity,
     bootstrap,
   };
 }

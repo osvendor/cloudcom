@@ -59,6 +59,26 @@ const ALLOWED_WITHOUT_LITERAL_ID: ReadonlyArray<{
   reason: string;
 }> = [
   {
+    file: 'services/timeSync/fleet.ts',
+    orderByContains: '...fleetOrder',
+    reason: 'time sync fleet: fleetOrder is a shared array ending in asc(devices.id), the base table key',
+  },
+  {
+    file: 'services/aiAgents/agentService.ts',
+    orderByContains: 'limited.offset(opts.offset)',
+    reason: 'A-W05: listAgents applies optional limit/offset in later statements; the base query orders by desc(aiAgents.createdAt), desc(aiAgents.id)',
+  },
+  {
+    file: 'services/aiToolsIntegrations.ts',
+    orderByContains: 'baseQuery.limit(limit + 1).offset(offset)',
+    reason: 'A-W05: query_psa_status pages baseQuery, which orders by desc(psaConnections.createdAt), desc(psaConnections.id) in the preceding statement',
+  },
+  {
+    file: 'services/aiToolsCisBenchmark.ts',
+    orderByContains: 'desc(rankedResults.resultId)',
+    reason: 'A-W05: rankedResults is a subquery; its resultId column is cis_baseline_results.id, the unique base key',
+  },
+  {
     file: 'routes/patches/list.ts',
     orderByContains: 'orderByClause',
     reason: 'orderByClause always ends in asc/desc(patches.id) — see the #3157 comment there',
@@ -87,6 +107,12 @@ const ALLOWED_WITHOUT_LITERAL_ID: ReadonlyArray<{
       'the offset is applied in a separate statement (`cursorMode ? rowsQuery : rowsQuery.offset(offset)`); the ordering is resolveSearchOrder(), which ends every branch in asc/desc(deviceEventLogs.id)',
   },
   {
+    file: 'services/dnsSecurityEventsPage.ts',
+    orderByContains: 'pageQuery.offset(opts.offset)',
+    reason:
+      'legacy offset paging is applied in a separate statement (`!opts.cursor && opts.offset ? pageQuery.offset(opts.offset) : pageQuery`); pageQuery orders by desc(dnsSecurityEvents.timestamp), desc(dnsSecurityEvents.id) — the same key the keyset cursor uses',
+  },
+  {
     file: 'services/reliabilityScoring.ts',
     orderByContains: 'deviceReliability.deviceId',
     reason: 'device_reliability has no id column; device_id is its primary key',
@@ -107,6 +133,18 @@ const ALLOWED_WITHOUT_LITERAL_ID: ReadonlyArray<{
     file: 'routes/cisHardening.ts',
     orderByContains: 'rankedResults.resultId',
     reason: 'cis_baseline_results.id, aliased to resultId inside the window-function subquery',
+  },
+  {
+    file: 'services/portal/softwareInventoryReadModel.ts',
+    orderByContains: '...SUMMARY_GROUP_ORDER',
+    reason:
+      'W04 (#7734): the organization summary groups by name/version/vendor and orders by that complete tuple, uniquely identifying each aggregate row, including NULL groups. The per-device query uses softwareInventory.id. The complete grouping/order tuple is pinned by softwareInventoryReadModel.ordering.test.ts; real-Postgres page walks are covered by portalSoftwareInventory.integration.test.ts.',
+  },
+  {
+    file: 'services/portal/networkVisibilityReadModel.ts',
+    orderByContains: '...STABLE_ASSET_ORDER',
+    reason:
+      'STABLE_ASSET_ORDER (same file) always ends in asc(discoveredAssets.id) as the final tiebreaker, after hostname NULLS LAST and ip_address, so the offset walk over customer-facing network assets is deterministic (#5861 PR 2)',
   },
 ];
 

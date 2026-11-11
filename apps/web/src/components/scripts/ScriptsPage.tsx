@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
+import { postScriptExecute, isGroupTarget, type ScriptExecuteResult, type ScriptRunTarget } from '@/lib/scriptExecute';
 import { useTranslation } from 'react-i18next';
-import { extractApiError } from '@/lib/apiError';
 import { Plus, Download, Search, Upload, X, Loader2, Check, FileCode, ArrowRight } from 'lucide-react';
 import ScriptList, { type Script, type ScriptLanguage, type OSType } from './ScriptList';
 import { ScriptBundleExportModal, ScriptBundleImportModal } from './ScriptBundleImport';
@@ -9,21 +9,23 @@ import ExecutionDetails from './ExecutionDetails';
 import type { ScriptExecution } from './ExecutionHistory';
 import type { ScriptParameter } from './ScriptForm';
 import { fetchWithAuth, useAuthStore } from '../../stores/auth';
+import { usePermissions } from '@/lib/permissions';
 import { fetchAllScripts } from '@/lib/scriptsFetch';
 import { useJwtClaims } from '@/lib/authScope';
 import { useOrgStore } from '../../stores/orgStore';
 import { showToast } from '../shared/Toast';
+import { PageHeader } from '../shared/PageHeader';
 import { cn } from '@/lib/utils';
 import { navigateTo } from '@/lib/navigation';
 import { asList } from '@/lib/asList';
 import { runAction, handleActionError } from '@/lib/runAction';
 import { cloneScript } from '@/lib/api/scripts';
 import { deviceScriptsHref, scriptExecutionsHref } from '@/lib/deviceScriptsLink';
-import type { ScriptAdmissionResult } from '@breeze/shared';
 // Initializes the shared i18next singleton. Islands hydrate independently, so
 // an island that hydrates before whichever other island happens to pull i18n in
 // would otherwise render raw keys (and mismatch the SSR markup).
 import '../../lib/i18n';
+import { useStableT } from '@/lib/i18n/useStableT';
 
 type ModalMode =
   | 'closed'
@@ -50,6 +52,9 @@ type SystemScript = {
 
 export default function ScriptsPage() {
   const { t } = useTranslation('scripts');
+  const { can } = usePermissions();
+  const canWrite = can('scripts', 'write'); // UX gate; API enforces scripts.write
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   const [scripts, setScripts] = useState<ScriptWithDetails[]>([]);
   const [sites, setSites] = useState<Site[]>([]);
   const [loading, setLoading] = useState(true);
@@ -99,16 +104,16 @@ export default function ScriptsPage() {
           void navigateTo('/login', { replace: true });
           return;
         }
-        if (!opts.silent) setError(t('scriptsPage.errors.fetch'));
+        if (!opts.silent) setError(stableT('scriptsPage.errors.fetch'));
         return;
       }
       // A silent (background) refetch must not swap the page for the error
       // branch either — that would unmount the open import modal (#6005).
-      if (!opts.silent) setError(err instanceof Error ? err.message : t('scriptsPage.errors.generic'));
+      if (!opts.silent) setError(err instanceof Error ? err.message : stableT('scriptsPage.errors.generic'));
     } finally {
       if (!opts.silent) setLoading(false);
     }
-  }, [t]);
+  }, [stableT]);
 
   const fetchSites = useCallback(async () => {
     try {
@@ -181,24 +186,19 @@ export default function ScriptsPage() {
 
   const handleExecute = async (
     scriptId: string,
-    deviceIds: string[],
+    target: ScriptRunTarget,
     parameters: Record<string, string | number | boolean>,
     runAs: 'system' | 'user'
-  ) => {
-    const response = await fetchWithAuth(`/scripts/${scriptId}/execute`, {
-      method: 'POST',
-      body: JSON.stringify({ deviceIds, parameters, runAs })
-    });
-
-    const data = await response.json().catch(() => ({})) as ScriptAdmissionResult & { error?: string };
-
-    if (!response.ok) {
-      throw new Error(extractApiError(data, t('scriptsPage.errors.execute')));
-    }
+  ): Promise<ScriptExecuteResult> => {
+    // Failures throw an ActionError to the modal, which renders them inline
+    // (including the device-group target codes) — see postScriptExecute.
+    const data = await postScriptExecute(scriptId, target, parameters, runAs, t('scriptsPage.errors.execute'));
 
     const admittedTargets = data.targets.filter(target => target.admission === 'admitted');
     if (admittedTargets.length > 0) {
-      await fetchScripts();
+      // silent: a loading swap would remount the execution modal and discard
+      // its per-device admission result (#8670 sweep, same failure as #6005).
+      await fetchScripts({ silent: true });
       // #4886 — a library run left the operator stranded on this (now stale)
       // list with no way to see the result land. A single-device run goes to
       // that device's Scripts tab (same hash-highlight convention DeviceDetails
@@ -207,9 +207,11 @@ export default function ScriptsPage() {
       // script's execution-history list instead.
       // Keep partial admission results visible so the operator can inspect
       // blocked or suppressed targets before leaving the execute flow.
-      if (admittedTargets.length !== data.targets.length) return data;
-      if (deviceIds.length === 1) {
-        void navigateTo(deviceScriptsHref(deviceIds[0]!, admittedTargets[0]?.executionId));
+      // Same for group-run warnings (e.g. a refused group): navigating would
+      // tear the modal down before the operator ever sees them.
+      if (admittedTargets.length !== data.targets.length || (data.warnings?.length ?? 0) > 0) return data;
+      if (!isGroupTarget(target) && target.length === 1) {
+        void navigateTo(deviceScriptsHref(target[0]!, admittedTargets[0]?.executionId));
       } else {
         void navigateTo(scriptExecutionsHref(scriptId));
       }
@@ -290,7 +292,8 @@ export default function ScriptsPage() {
           ? t('scriptsPage.library.partnerPermission') : undefined,
       });
       setCompletedImports(prev => new Set(prev).add(`${targetKey}:${systemScript.name}`));
-      await fetchScripts();
+      // silent: the library modal stays open for further imports.
+      await fetchScripts({ silent: true });
     } catch (err) {
       handleActionError(err, t('scriptsPage.errors.import'));
     } finally {
@@ -349,48 +352,55 @@ export default function ScriptsPage() {
 
   return (
     <div className="space-y-6" data-testid="scripts-page">
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-xl font-semibold tracking-tight" data-testid="scripts-heading">{t('scriptsPage.title')}</h1>
-          <p className="text-muted-foreground">{t('scriptsPage.description')}</p>
-        </div>
-        <div className="flex items-center gap-2">
-          <button
-            type="button"
-            onClick={() => setModalMode('bundle-import')}
-            className="inline-flex h-10 items-center justify-center gap-2 rounded-md border px-4 text-sm font-medium transition hover:bg-muted"
-            data-testid="bundle-import-open"
-          >
-            <Upload className="h-4 w-4" />
-            {t('bundle.importButton')}
-          </button>
-          <button
-            type="button"
-            onClick={() => setModalMode('bundle-export')}
-            disabled={scripts.length === 0}
-            className="inline-flex h-10 items-center justify-center gap-2 rounded-md border px-4 text-sm font-medium transition hover:bg-muted disabled:cursor-not-allowed disabled:opacity-60"
-            data-testid="bundle-export-open"
-          >
-            <Download className="h-4 w-4" />
-            {t('bundle.exportButton')}
-          </button>
-          <button
-            type="button"
-            onClick={handleOpenLibrary}
-            className="inline-flex h-10 items-center justify-center gap-2 rounded-md border px-4 text-sm font-medium transition hover:bg-muted"
-          >
-            <Download className="h-4 w-4" />
-            {t('scriptsPage.actions.importFromLibrary')}
-          </button>
-          <a
-            href="/scripts/new"
-            className="inline-flex h-10 items-center justify-center gap-2 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground transition hover:bg-primary/90"
-          >
-            <Plus className="h-4 w-4" />
-            {t('scriptsPage.actions.newScript')}
-          </a>
-        </div>
-      </div>
+      <PageHeader
+        title={t('scriptsPage.title')}
+        description={t('scriptsPage.description')}
+        headingTestId="scripts-heading"
+        actions={
+          <>
+            {canWrite && (
+            <button
+              type="button"
+              onClick={() => setModalMode('bundle-import')}
+              className="inline-flex h-10 items-center justify-center gap-2 rounded-md border px-4 text-sm font-medium transition hover:bg-muted"
+              data-testid="bundle-import-open"
+            >
+              <Upload className="h-4 w-4" />
+              {t('bundle.importButton')}
+            </button>
+            )}
+            <button
+              type="button"
+              onClick={() => setModalMode('bundle-export')}
+              disabled={scripts.length === 0}
+              className="inline-flex h-10 items-center justify-center gap-2 rounded-md border px-4 text-sm font-medium transition hover:bg-muted disabled:cursor-not-allowed disabled:opacity-60"
+              data-testid="bundle-export-open"
+            >
+              <Download className="h-4 w-4" />
+              {t('bundle.exportButton')}
+            </button>
+            {canWrite && (
+            <button
+              type="button"
+              onClick={handleOpenLibrary}
+              className="inline-flex h-10 items-center justify-center gap-2 rounded-md border px-4 text-sm font-medium transition hover:bg-muted"
+            >
+              <Download className="h-4 w-4" />
+              {t('scriptsPage.actions.importFromLibrary')}
+            </button>
+            )}
+            {canWrite && (
+            <a
+              href="/scripts/new"
+              className="inline-flex h-10 items-center justify-center gap-2 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground transition hover:bg-primary/90"
+            >
+              <Plus className="h-4 w-4" />
+              {t('scriptsPage.actions.newScript')}
+            </a>
+            )}
+          </>
+        }
+      />
 
       {error && (
         <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
@@ -407,10 +417,12 @@ export default function ScriptsPage() {
           <p className="text-sm text-muted-foreground max-w-md mb-6">
             {t('scriptsPage.empty.description')}
           </p>
+{canWrite && (
           <a href="/scripts/new" className="inline-flex items-center gap-1.5 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 transition-colors">
             {t('scriptsPage.actions.createScript')}
             <ArrowRight className="h-4 w-4" />
           </a>
+          )}
         </div>
       ) : (
         <ScriptList

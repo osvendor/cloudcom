@@ -38,6 +38,8 @@ export function launchBrowserDesktop(input: Omit<DesktopConnectionParams, 'mode'
       document.body.style.overflow = 'hidden'; dialog.current?.focus();
       const trap = (event: KeyboardEvent) => {
         if (event.key !== 'Tab' || !dialog.current) return;
+        // Nested browser-only dialogs own their focus loop.
+        if (event.target instanceof Element && event.target.closest('[data-browser-local-input="true"]')) return;
         const items = Array.from(dialog.current.querySelectorAll<HTMLElement>('button:not(:disabled),a[href],input:not(:disabled),select:not(:disabled),[tabindex="0"]')).filter(el => el.getClientRects().length);
         const first = items[0], last = items.at(-1);
         if (!first) { event.preventDefault(); dialog.current.focus(); }

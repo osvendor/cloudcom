@@ -27,6 +27,7 @@ vi.mock('../db/schema', () => ({
   },
   alertRules: {
     retiredAt: 'retired_at',
+    isActive: 'is_active',
     id: 'id',
     orgId: 'org_id',
     name: 'name',
@@ -56,6 +57,8 @@ vi.mock('../db/schema', () => ({
 
 vi.mock('./alertService', () => ({
   createAlert: vi.fn().mockResolvedValue('alert-1'),
+  resolveAlert: vi.fn().mockResolvedValue(true),
+  RESOLVABLE_ALERT_STATUSES: ['active', 'acknowledged', 'suppressed'],
 }));
 
 vi.mock('./featureConfigResolver', () => ({
@@ -75,7 +78,7 @@ vi.mock('./sentry', () => ({
 
 import { db } from '../db';
 import { alertTemplates, alertRules, alerts } from '../db/schema';
-import { createAlert } from './alertService';
+import { createAlert, resolveAlert } from './alertService';
 import { checkDeviceMaintenanceWindow } from './featureConfigResolver';
 import { captureException } from './sentry';
 import {
@@ -87,6 +90,7 @@ import {
   emitRebootPendingAlert,
   rebootPendingSince,
   rebootPendingDays,
+  loadOldestRebootRequiredSince,
 } from './patchAlerts';
 
 const ORG_ID = 'org-1';
@@ -106,17 +110,24 @@ function mockSelectOnce(rows: unknown[]) {
   } as any);
 }
 
-type InsertCall = { table: unknown; values: Record<string, unknown> };
+type InsertCall = { table: unknown; values: Record<string, unknown>; onConflictDoNothing: boolean };
 let insertCalls: InsertCall[];
 
-function primeInserts(rowsByTable: Map<unknown, Record<string, unknown>>) {
+/** A row of `null` makes that table's insert conflict (RETURNING yields nothing). */
+function primeInserts(rowsByTable: Map<unknown, Record<string, unknown> | null>) {
   insertCalls = [];
   vi.mocked(db.insert).mockImplementation((table: unknown) => ({
     values: vi.fn((values: Record<string, unknown>) => {
-      insertCalls.push({ table, values });
-      const row = rowsByTable.get(table) ?? {};
+      const call: InsertCall = { table, values, onConflictDoNothing: false };
+      insertCalls.push(call);
+      const row = rowsByTable.get(table);
+      const returning = vi.fn().mockResolvedValue(row === null ? [] : [row ?? {}]);
       return {
-        returning: vi.fn().mockResolvedValue([row]),
+        returning,
+        onConflictDoNothing: vi.fn(() => {
+          call.onConflictDoNothing = true;
+          return { returning };
+        }),
       };
     }),
   }) as any);
@@ -166,7 +177,53 @@ describe.each([ensurePatchJobFailureRule, ensureRebootPendingRule])('patch rule 
     expect(await ensureRule(ORG_ID)).toBe(retired ? 'fresh-rule' : 'existing-rule');
     expect(lookup?.params).toContain(ORG_ID);
     expect(lookup?.params).toContain('retired_at');
-    expect(insertCalls.filter((call) => call.table === alertRules)).toHaveLength(retired ? 1 : 0);
+    const ruleInserts = insertCalls.filter((call) => call.table === alertRules);
+    expect(ruleInserts).toHaveLength(retired ? 1 : 0);
+    // #7650: the insert must defer to the unique index, never race it blind.
+    for (const call of ruleInserts) expect(call.onConflictDoNothing).toBe(true);
+  });
+
+  // #7650: another first fire committed the rule between our lookup and our
+  // insert. The insert does nothing; the winner's row is read back and used.
+  it('returns the concurrent winner when its own insert conflicts', async () => {
+    mockSelectOnce([]); // fast-path lookup: nothing yet
+    mockSelectOnce([{ id: 'template-1' }]); // ensureGlobalTemplate: existing template
+    mockSelectOnce([{ id: 'winner-rule' }]); // re-select after the conflict
+    primeInserts(new Map([[alertRules, null]]));
+
+    expect(await ensureRule(ORG_ID)).toBe('winner-rule');
+    const ruleInserts = insertCalls.filter((call) => call.table === alertRules);
+    expect(ruleInserts).toHaveLength(1);
+    expect(ruleInserts[0]!.onConflictDoNothing).toBe(true);
+  });
+
+  it('throws when the insert conflicts but no live built-in rule can be read back', async () => {
+    mockSelectOnce([]);
+    mockSelectOnce([{ id: 'template-1' }]);
+    mockSelectOnce([]);
+    primeInserts(new Map([[alertRules, null]]));
+
+    await expect(ensureRule(ORG_ID)).rejects.toThrow(/conflicted/);
+  });
+
+  // #7626: an operator switched the built-in rule off. The lookup must find
+  // that inactive row and hand it back (createAlert then raises nothing),
+  // never filter it out and provision a fresh active rule in its place.
+  it('reuses a switched-off rule instead of re-creating it active', async () => {
+    let lookup: ReturnType<PgDialect['sqlToQuery']> | undefined;
+    vi.mocked(db.select).mockReturnValueOnce({
+      from: vi.fn().mockReturnValue({
+        where: vi.fn((condition: SQL) => {
+          lookup = new PgDialect().sqlToQuery(condition);
+          return { limit: vi.fn().mockResolvedValue([{ id: 'inactive-rule', isActive: false, retiredAt: null }]) };
+        }),
+      }),
+    } as any);
+    primeInserts(new Map([[alertRules, { id: 'fresh-rule' }]]));
+
+    expect(await ensureRule(ORG_ID)).toBe('inactive-rule');
+    expect(lookup?.params).not.toContain('is_active');
+    expect(insertCalls).toHaveLength(0);
   });
 });
 
@@ -445,5 +502,97 @@ describe('emitRebootPendingAlert', () => {
 
     expect(result).toBeNull();
     expect(vi.mocked(createAlert)).not.toHaveBeenCalled();
+  });
+});
+
+// #6835: postgres.js returns an aggregate (MIN over a timestamptz) as a raw
+// string — drizzle's `sql<Date>` generic is type-only and does not map it. The
+// loader must hand back a real Date, or `rebootPendingSince` throws
+// `oldestRebootRequiredSince.getTime is not a function` in the sweep.
+describe('loadOldestRebootRequiredSince', () => {
+  function mockMinRow(oldest: unknown) {
+    vi.mocked(db.select).mockReturnValueOnce({
+      from: vi.fn().mockReturnValue({
+        innerJoin: vi.fn().mockReturnValue({
+          where: vi.fn().mockResolvedValue([{ oldest }]),
+        }),
+      }),
+    } as never);
+  }
+
+  it('coerces the string form postgres.js returns for MIN() into a Date', async () => {
+    mockMinRow('2026-09-01 12:00:00+00');
+    const oldest = await loadOldestRebootRequiredSince(DEVICE_ID, ORG_ID);
+    expect(oldest).toBeInstanceOf(Date);
+    expect(oldest?.toISOString()).toBe('2026-09-01T12:00:00.000Z');
+  });
+
+  it('feeds a usable Date into rebootPendingSince (the sweep path that threw)', async () => {
+    mockMinRow('2026-09-10 08:30:00+00');
+    const oldest = await loadOldestRebootRequiredSince(DEVICE_ID, ORG_ID);
+    const now = new Date('2026-09-20T08:30:00.000Z');
+    const since = rebootPendingSince({
+      uptimeSeconds: 30 * 24 * 60 * 60,
+      oldestRebootRequiredSince: oldest,
+      now,
+    });
+    expect(since?.toISOString()).toBe('2026-09-10T08:30:00.000Z');
+    expect(rebootPendingDays(since!, now)).toBe(10);
+  });
+
+  it('passes a Date through unchanged', async () => {
+    const d = new Date('2026-09-01T12:00:00.000Z');
+    mockMinRow(d);
+    expect((await loadOldestRebootRequiredSince(DEVICE_ID, ORG_ID))?.getTime()).toBe(d.getTime());
+  });
+
+  it('returns null when no row matched (MIN over zero rows is NULL)', async () => {
+    mockMinRow(null);
+    expect(await loadOldestRebootRequiredSince(DEVICE_ID, ORG_ID)).toBeNull();
+  });
+
+  it('reads the zone-less text of a `timestamp` column as UTC, not server-local time', async () => {
+    // patch_job_results.completed_at is `timestamp` WITHOUT time zone, so the
+    // real driver hands back '2026-09-01 12:00:00' with no offset.
+    mockMinRow('2026-09-01 12:00:00');
+    const oldest = await loadOldestRebootRequiredSince(DEVICE_ID, ORG_ID);
+    expect(oldest?.toISOString()).toBe('2026-09-01T12:00:00.000Z');
+  });
+
+  it('throws on an unparseable value instead of silently dropping the reboot flag', async () => {
+    mockMinRow('not-a-timestamp');
+    await expect(loadOldestRebootRequiredSince(DEVICE_ID, ORG_ID)).rejects.toThrow(TypeError);
+  });
+});
+
+describe('resolveClearedRebootPendingAlerts', () => {
+  function mockCandidates(ids: string[]) {
+    vi.mocked(db.select).mockReturnValueOnce({
+      from: () => ({
+        innerJoin: () => ({
+          innerJoin: () => ({
+            where: () => ({ orderBy: () => ({ limit: () => Promise.resolve(ids.map((id) => ({ id }))) }) }),
+          }),
+        }),
+      }),
+    } as never);
+  }
+
+  it('one failing resolve does not strand the rest of the batch, and the count survives', async () => {
+    const { resolveClearedRebootPendingAlerts } = await import('./patchAlerts');
+    mockCandidates(['a1', 'a2', 'a3']);
+    vi.mocked(resolveAlert).mockReset();
+    vi.mocked(resolveAlert)
+      .mockResolvedValueOnce(true)
+      .mockRejectedValueOnce(new Error('publish failed'))
+      .mockResolvedValueOnce(true);
+
+    await expect(resolveClearedRebootPendingAlerts()).resolves.toBe(2);
+    expect(vi.mocked(resolveAlert)).toHaveBeenCalledTimes(3);
+    expect(vi.mocked(captureException)).toHaveBeenCalledWith(
+      expect.any(Error),
+      undefined,
+      expect.objectContaining({ alertId: 'a2' }),
+    );
   });
 });

@@ -3,12 +3,15 @@ import { zValidator } from '../../lib/validation';
 import { eq } from 'drizzle-orm';
 import { db } from '../../db';
 import { automationPolicies } from '../../db/schema';
-import { requirePermission, requireScope } from '../../middleware/auth';
+import { requireMfa, requirePermission, requireScope } from '../../middleware/auth';
 import { writeRouteAudit } from '../../services/auditEvents';
+import { invalidateOrgPolicyProbeCache } from '../../services/agentOrgSettingsCache';
+import { scheduleComplianceAlertReconcile } from '../../services/complianceAlertReconcileTrigger';
 import {
   canManagePartnerWidePolicies,
   PARTNER_WIDE_WRITE_DENIED_MESSAGE,
 } from '../../services/partnerWideAccess';
+import { canMutateOrgWideGovernance, SITE_CEILING_WRITE_DENIED_MESSAGE } from '../../services/siteCeilingAccess';
 import { AuthContext, policyIdSchema } from './schemas';
 import { getPolicyWithOrgCheck, normalizePolicyResponse } from './helpers';
 
@@ -45,10 +48,23 @@ actionRoutes.post(
   requireScope('organization', 'partner', 'system'),
   // Mutates policy enforcement state — requires device-write.
   requirePermission('devices', 'write'),
+  requireMfa(),
   zValidator('param', policyIdSchema),
   async (c) => {
     const auth = c.get('auth') as AuthContext;
     const { id } = c.req.valid('param');
+
+    // Turning off compliance evaluation/remediation for a policy is an
+    // org-wide governance write — same capability class as the other
+    // objects in `canMutateOrgWideGovernance`'s family, even though
+    // `automation_policies` isn't in the site-ceiling contract's hand-listed
+    // table set. A site-restricted caller can silently stop enforcement for
+    // devices at sites they cannot see. The route-local `AuthContext` (above)
+    // doesn't carry `allowedSiteIds`/`allowedDeviceIds`, so check against the
+    // raw context value, which does.
+    if (!canMutateOrgWideGovernance(c.get('auth'))) {
+      return c.json({ error: SITE_CEILING_WRITE_DENIED_MESSAGE }, 403);
+    }
 
     const policy = await getPolicyWithOrgCheck(id, auth);
     if (!policy) {
@@ -64,6 +80,16 @@ actionRoutes.post(
       .set({ enabled: false, updatedAt: new Date() })
       .where(eq(automationPolicies.id, id))
       .returning();
+
+    // A disabled policy is never evaluated again, so no policy.compliant will
+    // close the alerts it raised; the compliance-alert reconcile does.
+    const owner = policy.orgId !== null
+      ? { orgId: policy.orgId }
+      : policy.partnerId ? { partnerId: policy.partnerId } : null;
+    if (updated && owner) scheduleComplianceAlertReconcile(owner, 'automation-policy-deactivate');
+    // Every agent of this org (every org, for a partner-wide policy) gets this
+    // policy's probes from a 60 s per-org heartbeat cache (#8053).
+    if (updated) invalidateOrgPolicyProbeCache(policy.orgId ?? undefined);
 
     writeRouteAudit(c, {
       orgId: policy.orgId,

@@ -10,6 +10,7 @@ import {
   partnerExportRecordBaseSchema,
   partnerExportResourceSchema,
   partnerExportTimestampSchema,
+  partnerTicketExportRecordSchema,
   strictPartnerExportRecordSchema,
 } from './schemas';
 
@@ -27,7 +28,7 @@ const baseRecord = {
 };
 
 describe('partner export schemas', () => {
-  it('defines the exact resource names for all thirteen public routes', () => {
+  it('defines the exact resource names for all fifteen public routes', () => {
     expect(PARTNER_EXPORT_RESOURCES).toEqual([
       'organizations',
       'sites',
@@ -42,11 +43,14 @@ describe('partner export schemas', () => {
       'backup-configurations',
       'custom-fields',
       'custom-field-values',
+      'alerts',
+      'tickets',
+      'device-status',
     ]);
     for (const resource of PARTNER_EXPORT_RESOURCES) {
       expect(partnerExportResourceSchema.parse(resource)).toBe(resource);
     }
-    expect(partnerExportResourceSchema.safeParse('alerts').success).toBe(false);
+    expect(partnerExportResourceSchema.safeParse('ticket-comments').success).toBe(false);
   });
 
   it('accepts only bounded version-one record base fields', () => {
@@ -175,5 +179,18 @@ describe('partner export schemas', () => {
       ...blocked,
       fieldPaths: ['x'.repeat(257)],
     }).success).toBe(false);
+  });
+});
+
+describe('partner ticket record merge fields (#8972)', () => {
+  it('declares mergedIntoTicketId (uuid) and mergedAt (timestamp), both nullable', () => {
+    const { shape } = partnerTicketExportRecordSchema;
+    expect(Object.keys(shape)).toEqual(expect.arrayContaining(['mergedIntoTicketId', 'mergedAt']));
+    expect(shape.mergedIntoTicketId.safeParse(null).success).toBe(true);
+    expect(shape.mergedIntoTicketId.safeParse(ID).success).toBe(true);
+    expect(shape.mergedIntoTicketId.safeParse('nope').success).toBe(false);
+    expect(shape.mergedAt.safeParse(null).success).toBe(true);
+    expect(shape.mergedAt.safeParse('2026-09-27T08:00:00.000Z').success).toBe(true);
+    expect(shape.mergedAt.safeParse('yesterday').success).toBe(false);
   });
 });

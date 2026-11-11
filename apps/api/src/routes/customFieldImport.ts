@@ -7,6 +7,7 @@ import {
   PARTNER_WIDE_WRITE_DENIED_MESSAGE,
   canManagePartnerWidePolicies,
 } from '../services/partnerWideAccess';
+import { canMutateOrgWideGovernance, SITE_CEILING_WRITE_DENIED_MESSAGE } from '../services/siteCeilingAccess';
 import { resolveImportPartnerId } from './importScope';
 import {
   commitCustomFieldDefinitionImport,
@@ -179,9 +180,10 @@ function resolveDefinitionImportContext(
   }
 
   // The caller's own organization allowlist travels with the request: the
-  // importer's snapshot READ runs in a SYSTEM db context (see the service
-  // header — the table has no partner-wide RLS SELECT branch), so RLS is not
-  // the boundary on it and this is. Null is system scope; for an organization
+  // importer's snapshot READ bounds itself by it (see the service header). The
+  // read runs in the request's own RLS context since #5199, so this is defence
+  // in depth, and it is what turns an out-of-reach org into `org-not-found`
+  // rather than a silent drop. Null is system scope; for an organization
   // token it is the single org, which is what makes admitting that scope safe —
   // rows naming any other organization come back `org-not-found` and write
   // nothing.
@@ -220,6 +222,11 @@ customFieldImportRoutes.post(
   zValidator('json', commitImportSchema),
   async (c) => {
     const auth = c.get('auth') as AuthContext;
+    // Same site-ceiling gate as the CRUD create route: a bulk backfill
+    // creates the same org-wide governance objects one row at a time.
+    if (!canMutateOrgWideGovernance(auth)) {
+      return c.json({ error: SITE_CEILING_WRITE_DENIED_MESSAGE }, 403);
+    }
     const body = c.req.valid('json');
     const ctx = resolveDefinitionImportContext(auth, body);
     if ('error' in ctx) return c.json({ error: ctx.error }, ctx.status);

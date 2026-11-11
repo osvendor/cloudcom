@@ -284,3 +284,97 @@ describe('normalizeRing autoApprove.autoApproveUnrated (#3758)', () => {
     expect(ring.autoApprove?.autoApproveUnrated).toBe(true);
   });
 });
+
+describe('normalizePatch — install failure overlay (#4223)', () => {
+  it('carries a well-formed installFailure through', () => {
+    const failure = { deviceCount: 2, error: 'preflight check "battery" failed', failedAt: '2026-08-29T18:00:00.000Z' };
+    expect(normalizePatch({ id: 'p1', installFailure: failure }, 0).installFailure).toEqual(failure);
+  });
+
+  it('drops a null or malformed installFailure', () => {
+    expect(normalizePatch({ id: 'p1', installFailure: null }, 0).installFailure).toBeUndefined();
+    expect(normalizePatch({ id: 'p1', installFailure: { error: 'x' } }, 0).installFailure).toBeUndefined();
+  });
+});
+
+// #7800: APT patches carry no release date. The row's createdAt is when the
+// catalog first imported the patch, not when the vendor released it, so it
+// must never stand in for the release date.
+describe('normalizePatch releaseDate (#7800)', () => {
+  it('leaves releaseDate empty when it is null, instead of using the import date', () => {
+    const patch = normalizePatch(
+      { id: 'p1', title: 'libssl3', releaseDate: null, createdAt: '2026-10-02T08:00:00.000Z' },
+      0,
+    );
+    expect(patch.releaseDate).toBe('');
+  });
+
+  it('leaves releaseDate empty when it is absent, even with a createdAt present', () => {
+    expect(normalizePatch({ id: 'p1', createdAt: '2026-09-30T08:00:00.000Z' }, 0).releaseDate).toBe('');
+  });
+
+  it('still uses a real release date from any of the accepted field names', () => {
+    expect(normalizePatch({ id: 'p1', releaseDate: '2026-09-01', createdAt: '2026-10-02' }, 0).releaseDate).toBe('2026-09-01');
+    expect(normalizePatch({ id: 'p1', releasedAt: '2026-09-02' }, 0).releaseDate).toBe('2026-09-02');
+    expect(normalizePatch({ id: 'p1', release_date: '2026-09-03' }, 0).releaseDate).toBe('2026-09-03');
+  });
+});
+
+// #8187: rings own application rules. The editor round-trips normalizeRing's
+// output, so a malformed stored value must not reach the form.
+describe('normalizeRing — appRules (#8187)', () => {
+  it('passes a stored rule list through', () => {
+    const appRules = [{ source: 'third_party', packageId: 'Mozilla.Firefox', action: 'block' }];
+    expect(normalizeRing({ id: 'r1', name: 'Pilot', appRules }).appRules).toEqual(appRules);
+  });
+
+  it('coerces a missing or non-array value to []', () => {
+    expect(normalizeRing({ id: 'r1', name: 'Pilot' }).appRules).toEqual([]);
+    expect(normalizeRing({ id: 'r1', name: 'Pilot', appRules: 'x' }).appRules).toEqual([]);
+    expect(normalizeRing({ id: 'r1', name: 'Pilot', appRules: { a: 1 } }).appRules).toEqual([]);
+  });
+});
+
+describe('normalizePatch — outstanding device count (#8728)', () => {
+  it('reads outstandingDeviceCount, including 0', () => {
+    expect(normalizePatch({ id: 'p1', title: 'KB1', outstandingDeviceCount: 4 }, 0).outstandingDeviceCount).toBe(4);
+    expect(normalizePatch({ id: 'p1', title: 'KB1', outstandingDeviceCount: 0 }, 0).outstandingDeviceCount).toBe(0);
+  });
+
+  it('leaves it undefined when the endpoint does not supply a number (e.g. the ring list)', () => {
+    expect(normalizePatch({ id: 'p1', title: 'KB1' }, 0).outstandingDeviceCount).toBeUndefined();
+    expect(normalizePatch({ id: 'p1', title: 'KB1', outstandingDeviceCount: '3' }, 0).outstandingDeviceCount).toBeUndefined();
+  });
+});
+
+describe('normalizePatch — severitySource (#9387)', () => {
+  it('carries a derived severity source through', () => {
+    const patch = normalizePatch({ id: 'p1', title: 'KB1', severity: 'important', severitySource: 'derived' }, 0);
+    expect(patch.severitySource).toBe('derived');
+  });
+
+  it('carries a vendor severity source through', () => {
+    expect(normalizePatch({ id: 'p1', title: 'KB1', severity: 'critical', severitySource: 'vendor' }, 0).severitySource).toBe('vendor');
+  });
+
+  it('drops a missing or unrecognised source', () => {
+    expect(normalizePatch({ id: 'p1', title: 'KB1', severity: 'important' }, 0).severitySource).toBeUndefined();
+    expect(normalizePatch({ id: 'p1', title: 'KB1', severity: 'important', severitySource: null }, 0).severitySource).toBeUndefined();
+    expect(normalizePatch({ id: 'p1', title: 'KB1', severity: 'important', severitySource: 'guess' }, 0).severitySource).toBeUndefined();
+  });
+
+  it('never marks an unrated patch as derived', () => {
+    expect(normalizePatch({ id: 'p1', title: 'KB1', severity: 'unknown', severitySource: 'derived' }, 0).severitySource).toBeUndefined();
+  });
+});
+
+describe('normalizePatch — catalog identity (#9533)', () => {
+  it('carries externalId and version so same-title rows can be told apart', () => {
+    const patch = normalizePatch({ id: 'p1', title: 'KB1', externalId: 'guid-1', version: '1.2' }, 0);
+    expect(patch.externalId).toBe('guid-1');
+    expect(patch.version).toBe('1.2');
+    const bare = normalizePatch({ id: 'p2', title: 'KB2' }, 1);
+    expect(bare.externalId).toBeUndefined();
+    expect(bare.version).toBeNull();
+  });
+});

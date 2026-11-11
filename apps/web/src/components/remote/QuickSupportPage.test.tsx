@@ -56,6 +56,7 @@ function view(overrides: Partial<SupportSessionView> = {}): SupportSessionView {
     hardExpiresAt: CREATED.hardExpiresAt,
     deviceId: null,
     deviceOnline: false,
+    desktopReady: false,
     attributedOrgId: null,
     attributionLabel: null,
     endedAt: null,
@@ -85,13 +86,14 @@ function installFetch(options: {
   detail?: SupportSessionView[];
   list?: SupportSessionView[];
   endResponse?: Response;
+  created?: typeof CREATED;
 } = {}) {
   const detailQueue = [...(options.detail ?? [view()])];
   let lastDetail = detailQueue[0];
   fetchMock.mockImplementation(async (url: string, opts?: RequestInit) => {
     if (url === LIST_URL) return makeResponse({ sessions: options.list ?? [] });
     if (url === '/remote/support-sessions' && opts?.method === 'POST') {
-      return makeResponse(CREATED, true, 201);
+      return makeResponse(options.created ?? CREATED, true, 201);
     }
     if (url === `${DETAIL_URL}/end` && opts?.method === 'POST') {
       return options.endResponse ?? makeResponse({ success: true });
@@ -184,6 +186,21 @@ describe('QuickSupportPage', () => {
     expect(writeText).not.toHaveBeenCalledWith('ABC-DEF-GHI');
   });
 
+  // #10508: an API without a configured public base returns a bare path; the
+  // clipboard must still get a link that works when pasted into email or chat.
+  it('copies an absolute URL when the API returns a relative landing path', async () => {
+    installFetch({ created: { ...CREATED, landingUrl: '/quick?code=ABCDEFGHI' } });
+    render(<QuickSupportPage />);
+    await createSession();
+
+    fireEvent.click(screen.getByTestId('quick-support-copy-link'));
+
+    await waitFor(() =>
+      expect(writeText).toHaveBeenCalledWith(`${window.location.origin}/quick?code=ABCDEFGHI`),
+    );
+    expect(writeText).not.toHaveBeenCalledWith('/quick?code=ABCDEFGHI');
+  });
+
   it('polls every 3s and stops permanently once the session is terminal', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     installFetch({
@@ -239,12 +256,12 @@ describe('QuickSupportPage', () => {
     expect(detailCallCount()).toBe(1);
   });
 
-  it('renders the connect button only once a device is enrolled and online', async () => {
+  it('waits for heartbeat capabilities even after the socket reports ready', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     installFetch({
       detail: [
-        view({ status: 'claimed', deviceId: 'dev-9', deviceOnline: false }),
-        view({ status: 'ready', deviceId: 'dev-9', deviceOnline: true }),
+        view({ status: 'ready', deviceId: 'dev-9', deviceOnline: true, desktopReady: false }),
+        view({ status: 'ready', deviceId: 'dev-9', deviceOnline: true, desktopReady: true }),
       ],
     });
     render(<QuickSupportPage />);
@@ -252,6 +269,7 @@ describe('QuickSupportPage', () => {
 
     await waitFor(() => expect(detailCallCount()).toBe(1));
     expect(screen.queryByTestId('quick-support-connect')).not.toBeInTheDocument();
+    expect(screen.getByTestId('quick-support-status')).not.toHaveTextContent('Ready to connect');
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(3000);
@@ -337,11 +355,11 @@ describe('QuickSupportPage', () => {
         view({
           status: 'ready',
           deviceId: 'dev-9',
-          deviceOnline: true,
+          deviceOnline: true, desktopReady: true,
           attributionLabel: 'Reception PC',
         }),
       ],
-      detail: [view({ status: 'ready', deviceId: 'dev-9', deviceOnline: true })],
+      detail: [view({ status: 'ready', deviceId: 'dev-9', deviceOnline: true, desktopReady: true })],
     });
     render(<QuickSupportPage />);
 

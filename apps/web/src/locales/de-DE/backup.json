@@ -19,6 +19,7 @@
     "running": "Wird ausgeführt",
     "failed": "Fehlgeschlagen",
     "completed": "Abgeschlossen",
+    "completedWithErrors": "Abgeschlossen mit Fehlern",
     "partial": "Teilweise",
     "queued": "In der Warteschlange",
     "cancelled": "Abgesagt",
@@ -40,6 +41,7 @@
     "stalledTooltip": "Seit {{minutes}} Min. keine Daten empfangen",
     "filesProgress": "{{done}} / {{total}} Dateien",
     "speedValue": "{{value}}/s",
+    "etaValue": "noch etwa {{value}}",
     "created": "Erstellt",
     "updated": "Aktualisiert",
     "files": "Dateien",
@@ -47,12 +49,13 @@
     "policyId": "Richtlinien-ID",
     "featureLinkId": "Feature-Link-ID",
     "errorLog": "Fehlerprotokoll",
-    "savings": "{{protected}} gesichert — {{uploaded}} hochgeladen",
     "errorCount_one": "{{count}} Fehler",
     "errorCount_other": "{{count}} Fehler",
     "failedCount_one": "{{count}} fehlgeschlagen",
     "failedCount_other": "{{count}} fehlgeschlagen",
-    "failedFilesTooltip": "Dateien, die bei dieser Sicherung fehlgeschlagen sind"
+    "failedFilesTooltip": "Dateien, die bei dieser Sicherung fehlgeschlagen sind",
+    "filesNotBackedUp_one": "{{count}} Datei nicht gesichert",
+    "filesNotBackedUp_other": "{{count}} Dateien nicht gesichert"
   },
   "backupOverviewContent": {
     "noProviderTimelineAvailableYet": "Noch keine Anbieter-Zeitleiste verfügbar.",
@@ -115,12 +118,14 @@
     "filesOk": "Dateien OK",
     "filesFailed": "Dateien fehlgeschlagen",
     "lowReadinessDevices": "Geräte mit geringer Bereitschaft",
-    "devicesScoringBelowThe85PointReadinessThreshold": "Geräte, die unter dem 85-Punkte-Bereitschaftsschwellenwert liegen.",
+    "lowReadinessDevicesDescription": "Geräte, die unter dem {{threshold}}-Punkte-Bereitschaftsschwellenwert liegen.",
     "allDevicesMeetTheReadinessThreshold": "Alle Geräte erfüllen den Bereitschaftsschwellenwert.",
     "score": "Punktzahl",
     "estRto": "Schätzung: RTO",
     "estRpo": "Schätzung: RPO",
-    "riskFactors": "Risikofaktoren"
+    "riskFactors": "Risikofaktoren",
+    "reason": "Grund",
+    "noDevicesScoredYet": "Für kein Gerät liegt bereits ein Bereitschaftswert vor."
   },
   "backupVerificationTab": {
     "loadingVerificationData": "Verifizierungsdaten werden geladen...",
@@ -174,7 +179,9 @@
     "oneOrMoreVssWritersAreNotStable": "Einer oder mehrere VSS-Writer sind nicht stabil. Überprüfen Sie vor der nächsten Ausführung die neuesten Writer-Zustände.",
     "vssUnprotectedVolumes": "Vom Live-Volume gelesen, nicht von einer VSS-Schattenkopie: {{volumes}}. Auf diesen Volumes verwendete Dateien wurden möglicherweise übersprungen oder in einem inkonsistenten Zustand erfasst.",
     "lastBackupFailed": "Letzte Sicherung fehlgeschlagen",
+    "lastBackupFailedWithCategory": "Letzte Sicherung fehlgeschlagen: {{category}}",
     "lastBackupCompletedWithWarnings": "Letzte Sicherung mit Warnungen abgeschlossen",
+    "lastBackupCompletedWithErrors": "Letzte Sicherung mit Fehlern abgeschlossen",
     "writer": "VSS-Writer",
     "state": "Status",
     "noVssWriterDetailsWereReportedForThe": "Für die letzte Sicherung wurden keine VSS-Writerdetails gemeldet.",
@@ -213,10 +220,30 @@
     "created2": "Erstellt",
     "expires2": "Läuft ab",
     "protection2": "Schutz",
+    "integrity": "Integrität",
     "hold": "Aufbewahrungssperre",
     "standard": "Standard",
     "restorePointCount_one": "{{count}} Wiederherstellungspunkt",
-    "restorePointCount_other": "{{count}} Wiederherstellungspunkte"
+    "restorePointCount_other": "{{count}} Wiederherstellungspunkte",
+    "activePhase": {
+      "waiting_for_device": "An das Gerät gesendet, wartet auf den Start",
+      "queued_on_device": "Wartet, bis eine andere Sicherung auf diesem Gerät abgeschlossen ist",
+      "resuming": "Unterbrochene Sicherung wird fortgesetzt",
+      "scanning": "Dateien werden durchsucht",
+      "backing_up": "Wird gesichert"
+    },
+    "activeJobs": {
+      "title": "Laufende Sicherung",
+      "processedOfTotal": "{{done}} von {{total}} verarbeitet",
+      "processed": "{{done}} verarbeitet",
+      "lastHeard": "Letzte Meldung des Geräts: {{relative}}",
+      "mode": {
+        "file": "Dateisicherung",
+        "system_image": "System-Image-Sicherung",
+        "mssql": "SQL Server-Sicherung",
+        "hyperv": "Hyper-V-Sicherung"
+      }
+    }
   },
   "deviceVaultStatus": {
     "loadingVaultStatus": "Tresorstatus wird geladen...",
@@ -481,6 +508,22 @@
     "selectASnapshot": "Wählen Sie einen Snapshot aus",
     "chooseTheRecoveryPointYouWantToRestore": "Wählen Sie den Wiederherstellungspunkt aus, von dem Sie wiederherstellen möchten.",
     "noSnapshotsAvailable": "Keine Snapshots verfügbar.",
+    "device": "Gerät",
+    "selectADevice": "Gerät auswählen",
+    "chooseTheDeviceToRestore": "Wählen Sie das Gerät, dessen Sicherung Sie wiederherstellen möchten.",
+    "deviceOption_one": "{{device}} ({{count}} Snapshot)",
+    "deviceOption_other": "{{device}} ({{count}} Snapshots)",
+    "unknownDevice": "Unbekanntes Gerät",
+    "reviewDevice": "Gerät: {{device}}",
+    "snapshotNeedsSecondFactor": "Zweiter Faktor erforderlich",
+    "secondFactorNote": "Dieser Wiederherstellungspunkt ist nicht verifiziert. Beim Start der Wiederherstellung müssen Sie mit Ihrem zweiten Faktor bestätigen.",
+    "secondFactorNoteNotEnrolled": "Dieser Wiederherstellungspunkt ist nicht verifiziert und Sie haben keinen zweiten Faktor eingerichtet. Für den Start der Wiederherstellung ist einer erforderlich.",
+    "secondFactorSetUp": "Zwei-Faktor-Authentifizierung einrichten",
+    "commandDetails": "Befehlsdetails",
+    "copyCommandId": "Befehls-ID kopieren",
+    "commandIdCopied": "Befehls-ID kopiert",
+    "commandIdCopyFailed": "Befehls-ID konnte nicht kopiert werden",
+    "carriedSnapshotUnavailable": "Der Snapshot, mit dem Sie den Assistenten geöffnet haben, ist nicht mehr verfügbar. Wählen Sie ein Gerät und einen seiner Snapshots.",
     "selectRestoreType": "Wählen Sie den Wiederherstellungstyp aus",
     "fullRestoresEverythingSelectiveRestoresSpecificFiles": "Vollständig stellt alles wieder her, selektiv stellt bestimmte Dateien wieder her.",
     "fullRestore": "Vollständige Wiederherstellung",
@@ -491,9 +534,9 @@
     "chooseFilesToRestoreForSelectiveRecoveries": "Wählen Sie die wiederherzustellenden Dateien für selektive Wiederherstellungen aus.",
     "fullRestoreSelectedSkipThisStepToContinue": "Vollständige Wiederherstellung ausgewählt. Überspringen Sie diesen Schritt, um fortzufahren.",
     "destination": "Ziel",
-    "restoreToTheOriginalLocationOrProvideAn": "Stellen Sie die Wiederherstellung am ursprünglichen Speicherort her oder geben Sie einen alternativen Pfad an.",
-    "originalLocation": "Ursprünglicher Standort",
-    "restoreFilesInPlace": "Dateien an Ort und Stelle wiederherstellen.",
+    "restoreToAStagingFolderOrProvideAn": "Stellen Sie in einen Staging-Ordner auf dem Gerät oder in einen Pfad Ihrer Wahl wieder her.",
+    "stagingFolder": "Staging-Ordner auf dem Gerät",
+    "stagingFolderHint": "Dateien werden im temporären Verzeichnis des Geräts (breeze-restore) abgelegt; Originale werden nie überschrieben.",
     "alternatePath": "Alternativer Pfad",
     "alternatePathPlaceholder": "z. B. D:\\Restored oder /var/restore",
     "alternatePathRequired": "Geben Sie einen Zielpfad ein, um fortzufahren.",
@@ -517,14 +560,38 @@
     "command": "Befehl:",
     "targetPath": "Zielpfad:",
     "completed": "Abgeschlossen:",
-    "resultPayload": "Ergebnisnutzlast",
     "noRestoreHistoryYetStartARestoreTo": "Noch kein Wiederherstellungsverlauf. Starten Sie hier eine Wiederherstellung, um Live-Ergebnisdetails zu laden.",
     "recentRestoreHistory": "Aktueller Wiederherstellungsverlauf",
     "mostRecentRestoreJobsForThisOrganization": "Die aktuellsten Wiederherstellungsjobs für diese Organisation.",
     "noRestoreHistoryYet": "Noch kein Wiederherstellungsverlauf.",
-    "restore": "wiederherstellen ·",
     "files2": "Dateien:",
-    "size": "Größe:"
+    "size": "Größe:",
+    "filesSelected_one": "{{formatted}} Datei ausgewählt",
+    "filesSelected_other": "{{formatted}} Dateien ausgewählt",
+    "folderFileCount_one": "{{formatted}} Datei",
+    "folderFileCount_other": "{{formatted}} Dateien",
+    "allFilesFromSnapshot": "Alle Dateien aus dem Snapshot",
+    "selectionFiles_one": "{{formatted}} Datei",
+    "selectionFiles_other": "{{formatted}} Dateien",
+    "selectionFolders_one": "{{formatted}} Ordner",
+    "selectionFolders_other": "{{formatted}} Ordner",
+    "largeFolderSelectionTitle": "Große Auswahl",
+    "selectFolder": "Ordner {{name}} auswählen",
+    "confirmLargeFolderSelection": "Diese Auswahl umfasst etwa {{formatted}} Dateien und die Wiederherstellung kann einige Zeit dauern. Fortfahren?",
+    "kindVm": "Als VM wiederherstellen",
+    "kindInstantBoot": "Sofortstart",
+    "kindSelective": "Selektive Wiederherstellung",
+    "kindFull": "Vollständige Wiederherstellung",
+    "kindRebuild": "Neuaufbau als VHDX",
+    "restoreQueuedOnDevice": "Wiederherstellung auf {{device}} in die Warteschlange gestellt.",
+    "restoreStartedOnDevice": "Wiederherstellung auf {{device}} gestartet.",
+    "restoreQueued": "Wiederherstellung in die Warteschlange gestellt.",
+    "restoreStarted": "Wiederherstellung gestartet.",
+    "viewProgress": "Fortschritt anzeigen",
+    "cancelRestore": "Wiederherstellung abbrechen",
+    "cancellingRestore": "Wird abgebrochen...",
+    "restoreCancelled": "Wiederherstellung abgebrochen.",
+    "cancelRestoreFailed": "Die Wiederherstellung konnte nicht abgebrochen werden."
   },
   "sLAConfigDialog": {
     "name": "Name",
@@ -583,6 +650,7 @@
     "snapshotDetails": "Snapshot-Details",
     "size": "Größe:",
     "files": "Dateien:",
+    "location": "Speicherort:",
     "holdReason": "Grund der Aufbewahrungssperre:",
     "holdSource": "Quelle der Aufbewahrungssperre:",
     "enforcement": "Durchsetzung:",
@@ -603,12 +671,30 @@
     "providerEnforcedImmutabilityCannotBeReleasedFromBreeze": "Vom Speicheranbieter erzwungene Unveränderlichkeit kann nicht in Breeze aufgehoben werden.",
     "fileTree": "Dateibaum",
     "noFileTreeAvailable": "Kein Dateibaum verfügbar.",
+    "fileIndexBuilding": "Die Dateiliste dieses Snapshots wird vorbereitet. Bei großen Backups kann das einige Minuten dauern.",
+    "fileIndexUnavailable": "Die Dateiliste dieses Snapshots ist derzeit nicht verfügbar. Sie können trotzdem den gesamten Snapshot wiederherstellen.",
+    "fileIndexIntegrityFailed": "Dieser Snapshot hat die Integritätsprüfung nicht bestanden, daher können seine Dateien nicht aufgelistet werden.",
+    "fileIndexDeviceLocal": "Dieser Snapshot ist auf dem Gerät gespeichert, und Breeze kann seine Dateiliste dort noch nicht lesen.",
+    "fileIndexRetry": "Erneut versuchen",
+    "searchPlaceholder": "Dateien in diesem Snapshot suchen",
+    "searchEmpty": "Keine Dateien gefunden",
+    "searchTimeout": "Die Suche hat zu lange gedauert. Versuchen Sie es erneut.",
+    "browseTimeout": "Das Auflisten dieses Ordners hat zu lange gedauert. Versuchen Sie es erneut.",
+    "searchLoadMore": "Mehr laden",
+    "searchRestoreFile": "Diese Datei wiederherstellen",
+    "searchMinLength": "Geben Sie mindestens 2 Zeichen ein",
+    "searchLoading": "Suche läuft…",
     "path": "Pfad:",
     "useTheRestoreWorkflowToRecoverOrExport": "Verwenden Sie den Wiederherstellungsworkflow, um Dateien aus diesem Snapshot wiederherzustellen oder zu exportieren.",
     "select": "Auswählen",
+    "folderFileCount_one": "{{count}} Datei",
+    "folderFileCount_other": "{{count}} Dateien",
+    "selectFolder": "Ordner {{name}} auswählen",
+    "confirmLargeFolderSelection": "Diese Auswahl umfasst etwa {{count}} Dateien und die Wiederherstellung kann einige Zeit dauern. Fortfahren?",
     "name": "Name",
     "size2": "Größe",
-    "modified": "Geändert"
+    "modified": "Geändert",
+    "noSnapshotsYetFilesAppearHere": "Noch keine Snapshots vorhanden. Dateien erscheinen hier, sobald die erste Sicherung abgeschlossen ist."
   },
   "vMRestoreConfirmStep": {
     "reviewConfirm": "Überprüfen und bestätigen",
@@ -622,8 +708,9 @@
     "mode": "Modus",
     "rebuildHost": "Rebuild-Host",
     "outputPath": "Ausgabepfad",
-    "rebuildEngine": "Rebuild-Engine (Linux)",
-    "manualAttachNote": "Hängen Sie die VHDX-Datei manuell an eine Hyper-V-VM an; die automatische VM-Erstellung für Linux-Gäste kommt mit der Windows-Engine.",
+    "rebuildEngine": "Rebuild-Engine",
+    "manualAttachNote": "Hängen Sie die VHDX-Datei manuell an eine Hyper-V-VM an. Breeze erstellt die VM nur dann selbst, wenn ein Windows-Snapshot auf einem Windows-Host mit angegebenem VM-Namen neu aufgebaut wird.",
+    "hypervVmNote": "Breeze erstellt die Hyper-V-VM „{{vmName}}“ auf dem Rebuild-Host, sobald das Abbild validiert ist.",
     "newIdentityNote": "Das umgebaute Abbild erhält immer eine neue Maschinenidentität und übernimmt nie die Identität des ursprünglichen Geräts."
   },
   "vMRestoreSpecsStep": {
@@ -641,7 +728,6 @@
     "chooseTheSnapshotToRestoreAsAVirtual": "Wählen Sie den Snapshot aus, der als virtuelle Maschine wiederhergestellt werden soll.",
     "noSnapshotsAvailable": "Keine Snapshots verfügbar.",
     "cpu": "CPU",
-    "mb": "MB",
     "gb": "GB",
     "selectTargetHost": "Wählen Sie den Zielhost aus",
     "chooseAWindowsDeviceWithHyperVTo": "Wählen Sie ein Windows-Gerät mit Hyper-V zum Hosten der virtuellen Maschine.",
@@ -663,15 +749,31 @@
     "back": "Zurück",
     "continue": "Weiter",
     "starting": "Beginnt...",
-    "rebuildEngineLinux": "Rebuild-Engine (Linux)",
-    "rebuildEngineDescription": "Baut diesen Linux-Ganzmaschinen-Snapshot auf einem Linux-Gerät mit dem Breeze-Helper zu einem Hyper-V-VHDX-Datenträgerabbild um. Das Abbild erhält immer eine neue Maschinenidentität.",
-    "selectRebuildHost": "Linux-Rebuild-Host auswählen",
+    "rebuildEngineLinux": "Rebuild-Engine",
+    "rebuildEngineDescription": "Baut diesen Ganzmaschinen-Snapshot auf einem Gerät derselben Plattform mit dem Breeze-Helper zu einem Hyper-V-VHDX-Datenträgerabbild um. Das Abbild erhält immer eine neue Maschinenidentität.",
+    "selectRebuildHost": "Rebuild-Host auswählen",
     "chooseALinuxDeviceWithQemuUtils": "Wählen Sie ein Linux-Gerät, das online ist, qemu-utils installiert hat und genügend freien Speicher für das Abbild bietet.",
+    "chooseAWindowsRebuildHost": "Wählen Sie ein Windows-Gerät, das online ist, den Breeze-Helper ausführt und genügend freien Speicher für das Abbild bietet. Hyper-V wird nur zum Erstellen der VM benötigt.",
     "outputPath": "Ausgabepfad",
     "outputPathHint": "Absoluter Pfad auf dem Rebuild-Host, der auf .vhdx endet.",
-    "outputPathInvalid": "Geben Sie einen absoluten Pfad ein, der auf .vhdx endet.",
+    "outputPathInvalid": "Geben Sie einen absoluten Pfad für das Betriebssystem des Rebuild-Hosts ein, der auf .vhdx endet (unter Windows ein Laufwerkspfad wie C:\\, unter Linux ein Pfad, der mit / beginnt).",
+    "hypervOptional": "Hyper-V-VM (optional)",
+    "hypervSpecsHint": "Geben Sie einen VM-Namen ein, damit der Rebuild-Host die VM mit CPU und Arbeitsspeicher aus dem Schritt „VM-Spezifikationen“ erstellt.",
+    "hypervVmName": "VM-Name",
+    "hypervVmNamePlaceholder": "z. B. srv-01-restored",
+    "hypervSwitch": "Virtueller Switch",
+    "hypervSwitchPlaceholder": "Leer lassen für keinen Netzwerkadapter",
+    "hypervNoNicHint": "Kein Switch ausgewählt – die VM erhält keinen Netzwerkadapter, bis Sie einen verbinden.",
     "startRebuild": "Rebuild starten",
-    "rebuildStarted": "Rebuild gestartet. Die VHDX-Datei erscheint auf dem Rebuild-Host, sobald der Rebuild abgeschlossen ist."
+    "rebuildStarted": "Rebuild gestartet. Die VHDX-Datei erscheint auf dem Rebuild-Host, sobald der Rebuild abgeschlossen ist.",
+    "rebuildErrorNotRestorable": "Dieser Snapshot kann nicht neu aufgebaut werden: Er ist nicht als Bare-Metal-wiederherstellbar markiert. Wählen Sie einen Snapshot des gesamten Computers, der als Bare-Metal-wiederherstellbar markiert ist, oder verwenden Sie die vollständige Wiederherstellung.",
+    "rebuildErrorNotRestorableReasons": "Dieser Snapshot kann nicht neu aufgebaut werden: {{reasons}}.",
+    "rebuildErrorHostUnsupported": "Der Rebuild-Host muss dasselbe Betriebssystem wie der Snapshot ausführen. Wählen Sie einen anderen Host.",
+    "rebuildErrorRecoveryInProgress": "Für dieses Gerät läuft bereits eine Bare-Metal-Wiederherstellung. Warten Sie, bis sie abgeschlossen ist, oder brechen Sie sie ab, und versuchen Sie es dann erneut.",
+    "rebuildErrorSnapshotNotFound": "Dieser Snapshot existiert nicht mehr. Laden Sie die Seite neu und wählen Sie einen anderen Snapshot.",
+    "rebuildErrorHostNotFound": "Der ausgewählte Rebuild-Host existiert nicht mehr. Wählen Sie einen anderen Host.",
+    "enterAVmNameToContinue": "Geben Sie einen VM-Namen ein, um fortzufahren.",
+    "enterAVmNameOnTheVmNameStep": "Geben Sie im Schritt „VM-Name“ einen VM-Namen ein, um die Wiederherstellung zu starten."
   },
   "vaultConfigDialog": {
     "device": "Gerät",
@@ -681,7 +783,9 @@
     "vaultType": "Tresortyp",
     "retentionCount": "Aufbewahrungsanzahl",
     "numberOfSnapshotsToKeepInTheVault": "Anzahl der Snapshots, die im Tresor aufbewahrt werden sollen (1–100).",
-    "cancel": "Abbrechen"
+    "cancel": "Abbrechen",
+    "failedToSave": "Der Tresor konnte nicht gespeichert werden. Bitte erneut versuchen.",
+    "deviceConfigNotSent": "Tresor gespeichert, aber die Konfiguration konnte nicht an das Gerät gesendet werden: {{error}}"
   },
   "vaultDashboard": {
     "loadingVaults": "Tresore werden geladen...",
@@ -703,7 +807,12 @@
     "actions": "Aktionen",
     "sync": "Synchronisieren",
     "edit": "Bearbeiten",
-    "deactivate": "Deaktivieren"
+    "deactivate": "Deaktivieren",
+    "inactive": "Inaktiv",
+    "syncStarted": "Tresor-Synchronisierung gestartet",
+    "failedToSync": "Die Tresor-Synchronisierung konnte nicht gestartet werden. Bitte erneut versuchen.",
+    "failedToDeactivate": "Der Tresor konnte nicht deaktiviert werden. Bitte erneut versuchen.",
+    "deviceConfigNotSent": "Tresor gespeichert, aber die Konfiguration konnte nicht an das Gerät gesendet werden: {{error}}"
   },
   "dRDashboard": {
     "loadingDisasterRecovery": "Disaster Recovery wird geladen...",
@@ -817,7 +926,7 @@
     "uniqueDeviceCount_other": "{{count}} einzigartige Geräte",
     "chooseAStepTypeForEachGroup": "Wählen Sie für jede Wiederherstellungsgruppe einen Schritttyp.",
     "rebuildWaitTimeoutOutOfRange": "Das Wartezeitlimit für den Bare-Metal-Neuaufbau muss eine ganze Zahl zwischen {{min}} und {{max}} Minuten sein.",
-    "rebuildOutputDirMustBeAbsolute": "Das Ausgabeverzeichnis für den Bare-Metal-Neuaufbau muss ein absoluter Pfad sein, der mit \"/\" beginnt, und darf höchstens {{max}} Zeichen lang sein.",
+    "rebuildOutputDirMustBeAbsolute": "Das Ausgabeverzeichnis für den Bare-Metal-Neuaufbau muss ein absoluter Pfad sein (beginnend mit \"/\" oder mit einem Windows-Laufwerk wie C:\\) und darf höchstens {{max}} Zeichen lang sein.",
     "partialSaveFailure": "Ein Teil dieses Plans wurde vor dem Fehler gespeichert, daher können Plan und Liste jetzt voneinander abweichen. Beheben Sie das Problem und speichern Sie erneut. Server meldet: {{message}}"
   },
   "dRPlanGroupCard": {
@@ -845,9 +954,13 @@
       "bareMetalRebuild": "Bare-Metal-Neuaufbau (Rebuild-Engine)"
     },
     "rebuildHost": "Rebuild-Host",
-    "rebuildHostHint": "Linux-Gerät mit qemu-utils, das Proben ausführt. Beim Failover wird stattdessen auf jedem Gerät das Wiederherstellungsmedium gestartet.",
+    "rebuildHostHint": "Muss dasselbe Betriebssystem wie die geprobten Geräte ausführen; Breeze lehnt ein nicht passendes Paar beim Start ab. Beim Failover wird stattdessen auf jedem Gerät das Wiederherstellungsmedium gestartet.",
+    "rebuildHostOs": "Betriebssystem des Hosts",
+    "rebuildHostOsLinux": "Linux-Hosts",
+    "rebuildHostOsWindows": "Windows-Hosts",
     "outputDir": "Ausgabeverzeichnis",
-    "outputDirHint": "Verzeichnis auf dem Rebuild-Host, das pro Gerät ein VHDX-Image erhält.",
+    "outputDirHint": "Verzeichnis auf dem Rebuild-Host, das pro Gerät ein VHDX-Image erhält. Leer lassen für den Standard des Hosts.",
+    "outputDirOsMismatch": "Dieses Verzeichnis passt nicht zum Betriebssystem des Hosts: Windows-Hosts benötigen einen Laufwerkspfad wie C:\\, Linux-Hosts einen Pfad, der mit / beginnt.",
     "waitTimeout": "Wartezeitlimit (Min.)",
     "waitTimeoutHint": "Minuten, die auf die Anmeldung jedes Geräts gewartet wird, bevor der Schritt fehlschlägt."
   },
@@ -950,6 +1063,8 @@
     "codeExpires": "Läuft ab um {{time}}",
     "overdueNotice": "Noch keine Rückmeldung — prüfen Sie die Wiederherstellungskonsole.",
     "fileIndexPreparing": "Dateiindex für snapshot-übergreifende Verweise wird vorbereitet…",
+    "snapshotsLoadFailed": "Snapshots konnten nicht geladen werden. Laden Sie die Seite neu, um es erneut zu versuchen.",
+    "noSnapshots": "Noch keine Snapshots, die sich per Bare-Metal wiederherstellen lassen. Erforderlich ist eine Komplettsicherung des Geräts, die als Bare-Metal-wiederherstellbar markiert ist.",
     "statusFailed": "Wiederherstellung fehlgeschlagen",
     "statusRefused": "Wiederherstellung abgelehnt",
     "status": {
@@ -959,7 +1074,224 @@
       "restoring": "Wird wiederhergestellt",
       "validated": "Validiert",
       "rebooted": "Neu gestartet",
-      "checked_in": "Angemeldet"
+      "checked_in": "Angemeldet",
+      "completed": "Abgeschlossen"
     }
+  },
+  "backupHealth": {
+    "title": "Backup-Zustand",
+    "subtitle": "Jedes von Breeze verwaltete Gerät, plus alles, was Ihr Backup-Anbieter meldet.",
+    "staleBanner": "Einige Anbieterdaten sind veraltet. Angezeigt wird der zuletzt bekannte Stand.",
+    "unmappedNotice": "{{value}} Geräte gehören zu Anbieterkunden, die noch keiner Breeze-Organisation zugeordnet sind.",
+    "statusTitle": "Status",
+    "recencyTitle": "Letzte erfolgreiche Sicherung",
+    "coverage": "{{covered}} von {{total}} Endgeräten haben eine aktuelle Sicherung",
+    "definition": "„Aktuell“ bedeutet eine erfolgreiche Sicherung in den letzten 48 Stunden. Der Zustand eines Geräts richtet sich nach seinem letzten Lauf – es kann also eine aktuelle Sicherung haben und trotzdem „Kritisch“ anzeigen, wenn dieser Lauf fehlgeschlagen ist.",
+    "providerOnly": "{{value}} Endgeräte nur beim Anbieter",
+    "m365Accounts": "{{value}} Microsoft 365 Konten",
+    "status": {
+      "no_backups": "Keine Sicherungen",
+      "completed": "Abgeschlossen",
+      "completed_with_errors": "Mit Fehlern abgeschlossen",
+      "in_progress": "In Bearbeitung",
+      "unsuccessful": "Nicht erfolgreich",
+      "other": "Sonstige",
+      "failed": "Fehlgeschlagen",
+      "interrupted": "Unterbrochen",
+      "over_quota": "Kontingent überschritten",
+      "no_selection": "Nichts ausgewählt",
+      "not_started": "Nicht gestartet",
+      "unknown": "Unbekannt",
+      "paused": "Pausiert"
+    },
+    "recency": {
+      "never": "Nie",
+      "under_24h": "Weniger als 24 Stunden",
+      "under_48h": "Weniger als 48 Stunden",
+      "over_48h": "Mehr als 48 Stunden"
+    },
+    "health": {
+      "healthy": "In Ordnung",
+      "warning": "Prüfen",
+      "critical": "Kritisch",
+      "unknown": "Unbekannt"
+    },
+    "osType": {
+      "workstation": "Arbeitsplatz",
+      "server": "Server",
+      "unknown": "Unbekannt"
+    },
+    "sourceAll": "Alle Quellen",
+    "healthAll": "Jeder Zustand",
+    "sourceBreeze": "Breeze",
+    "searchPlaceholder": "Gerät oder Organisation suchen",
+    "includeWithoutBackup": "Geräte ohne jede Sicherung einbeziehen",
+    "table": {
+      "device": "Gerät",
+      "computerName": "Computername",
+      "source": "Quelle",
+      "dataSources": "Datenquellen",
+      "selected": "Ausgewählt",
+      "used": "Belegt",
+      "history": "Letzte 28 Tage",
+      "errors": "Fehler",
+      "verifiedBootable": "Startfähigkeit geprüft",
+      "agent": "Agent"
+    },
+    "verifiedBootable": {
+      "passed": "Bestanden",
+      "failed": "Fehlgeschlagen",
+      "never_run": "Nie ausgeführt",
+      "not_applicable": "k. A."
+    },
+    "dataSource": {
+      "files": "Dateien & Ordner",
+      "system_state": "Systemstatus",
+      "mssql": "SQL Server",
+      "hyperv": "Hyper-V",
+      "vmware": "VMware",
+      "bare_metal": "Bare Metal",
+      "image": "Datenträgerabbild",
+      "m365_mail": "Microsoft 365-E-Mail",
+      "m365_sharepoint": "SharePoint",
+      "m365_exchange": "Exchange",
+      "m365_onedrive": "OneDrive",
+      "m365_teams": "Teams",
+      "gws_mail": "Google Workspace-E-Mail",
+      "gws_drive": "Google Drive",
+      "gws_shared_drive": "Geteilte Google-Ablagen",
+      "other": "Sonstige"
+    },
+    "noObservation": "Keine Beobachtung",
+    "openDevice": "Gerät öffnen",
+    "empty": "Kein Gerät passt zu diesen Filtern.",
+    "loadMore": "Mehr laden",
+    "error": "Backup-Zustand konnte nicht geladen werden",
+    "external": {
+      "title": "Externe Sicherung",
+      "customer": "Anbieterkunde",
+      "lastSuccess": "Letzte erfolgreiche Sicherung",
+      "lastSession": "Letzte Sitzung",
+      "bootCheck": "Letzte Startprüfung",
+      "unlink": "Verknüpfung lösen",
+      "unlinkConfirm": "Verknüpfung dieses Anbietergeräts mit dem Breeze-Gerät lösen? Es bleibt im Backup-Produkt und kann erneut verknüpft werden.",
+      "unlinkedToast": "Verknüpfung des Anbietergeräts gelöst",
+      "errorUnlink": "Verknüpfung des Anbietergeräts konnte nicht gelöst werden",
+      "error": "Externer Sicherungsstatus konnte nicht geladen werden",
+      "alsoCheck": "Prüfen Sie auch die Verbindungen zu externen Backup-Produkten unter \"Integrationen\"."
+    },
+    "saasAccountsSubtitle": "Microsoft 365 / Google Workspace",
+    "saas": "SaaS",
+    "saasAccounts": "{{value}} SaaS-Konten",
+    "workloadBackup": "{{workload}}-Backup",
+    "sourceProvider": "Backup-Anbieter"
+  },
+  "restoreResultNotices": {
+    "systemStateRequiresRebuildTitle": "Der Systemstatus wird durch einen Bare-Metal-Neuaufbau angewendet",
+    "systemStateRequiresRebuildBody": "Diese Windows-Wiederherstellung hat nur Dateien wiederhergestellt. Um den Systemstatus des Snapshots anzuwenden, führen Sie einen Bare-Metal-Neuaufbau dieses Snapshots aus (Als VM wiederherstellen, Rebuild-Engine).",
+    "unattestedSnapshot": "Nicht attestierter Snapshot: Dateien wurden nicht gegen eine Snapshot-Attestierung geprüft.",
+    "resultCode": "Ergebniscode: {{code}}",
+    "restrictedDescriptors_one": "{{count}} Element mit einer restriktiven Zugriffsliste wiederhergestellt",
+    "restrictedDescriptors_other": "{{count}} Elemente mit einer restriktiven Zugriffsliste wiederhergestellt",
+    "restrictedDescriptorsBody": "Ihre gespeicherten Berechtigungen nannten Konten, die dieser Computer nicht kennt, oder konnten nicht gelesen werden. Daher können nur SYSTEM und Administratoren darauf zugreifen (Besitzer: Administratoren). Prüfen und vergeben Sie die Berechtigungen bei Bedarf neu.",
+    "restrictedDescriptorsShowPaths_one": "{{count}} Pfad anzeigen",
+    "restrictedDescriptorsShowPaths_other": "{{count}} Pfade anzeigen",
+    "restrictedDescriptorsUnlisted_one": "{{count}} weiteres Element ist nicht aufgeführt.",
+    "restrictedDescriptorsUnlisted_other": "{{count}} weitere Elemente sind nicht aufgeführt."
+  },
+  "unattestedRestoreStepUp": {
+    "heading": "Diese Wiederherstellung bestätigen",
+    "introUnattested": "Für diese Sicherung gibt es keine Integritätsbestätigung, daher kann ihr Inhalt vor der Wiederherstellung nicht mit einem überprüften Datensatz abgeglichen werden.",
+    "introProducerOnly": "Diese Sicherung wurde dort gespeichert, wo nur das ursprüngliche Gerät ihre Integrität prüfen kann. Die Wiederherstellung auf ein anderes Gerät erfordert Ihre Bestätigung.",
+    "twoFactor": "Bestätigen Sie mit Zwei-Faktor-Authentifizierung, um fortzufahren.",
+    "confirmOnly": "Bestätigen Sie, um fortzufahren. Die Wiederherstellung wird im Audit-Protokoll erfasst.",
+    "code": "Authentifizierungscode",
+    "passkey": "Sie werden aufgefordert, Ihren Passkey zu verwenden.",
+    "enrollIntro": "Zum Bestätigen dieser Wiederherstellung ist ein zweiter Faktor erforderlich, und Ihr Konto hat noch keinen. Richten Sie in Ihrem Profil eine Authenticator-App oder einen Passkey ein und versuchen Sie es dann erneut.",
+    "enrollIntroSmsOnly": "Zum Bestätigen dieser Wiederherstellung ist eine Authenticator-App oder ein Passkey erforderlich. Ihr Konto hat nur SMS-Codes; richten Sie eines davon in Ihrem Profil ein.",
+    "enrollLink": "Zwei-Faktor-Authentifizierung einrichten",
+    "enrollStillRequired": "Ihr Konto hat noch immer keinen zweiten Faktor. Richten Sie einen ein und versuchen Sie es dann erneut.",
+    "enrollStillRequiredSmsOnly": "Ihr Konto hat noch immer keine Authenticator-App und keinen Passkey.",
+    "confirm": "Bestätigen und wiederherstellen",
+    "cancel": "Abbrechen",
+    "failed": "Die Überprüfung wurde nicht akzeptiert. Versuchen Sie es erneut.",
+    "unavailable": "Die Überprüfung konnte nicht gestartet werden. Versuchen Sie es erneut."
+  },
+  "snapshotIntegrityBadge": {
+    "verified": "Verifiziert",
+    "checking": "Wird geprüft",
+    "unverified": "Nicht verifiziert",
+    "failed": "Integritätsprüfung fehlgeschlagen"
+  },
+  "reparseSkipNotice": {
+    "summary_one": "{{count}} Analysepunkt übersprungen: Junctions und Bereitstellungspunkte werden nicht verfolgt und nicht wiederhergestellt. Das ist erwartet, kein Fehler.",
+    "summary_other": "{{count}} Analysepunkte übersprungen: Junctions und Bereitstellungspunkte werden nicht verfolgt und nicht wiederhergestellt. Das ist erwartet, kein Fehler.",
+    "showDetails": "Übersprungene Pfade anzeigen"
+  },
+  "failureCategory": {
+    "device_offline": {
+      "label": "Gerät offline",
+      "hint": "Das Gerät hat während der Sicherung die Verbindung zu Breeze verloren. Lassen Sie es während des gesamten Sicherungsfensters eingeschaltet und online."
+    },
+    "timeout": {
+      "label": "Hängt oder Zeitlimit überschritten",
+      "hint": "Die Sicherung hat keinen Fortschritt mehr gemacht oder ihr Zeitlimit überschritten. Sehr große Sicherungen können mehr als ein Fenster benötigen. Prüfen Sie die Auslastung des Geräts und den Umfang der Sicherungsauswahl."
+    },
+    "storage": {
+      "label": "Speicherproblem",
+      "hint": "Breeze konnte nicht in das Sicherungsziel schreiben, oder die Upload-Berechtigung ist abgelaufen. Testen Sie die Speicherkonfiguration und prüfen Sie deren Anmeldedaten und freien Speicherplatz."
+    },
+    "agent": {
+      "label": "Agent-Problem",
+      "hint": "Die Sicherungskomponente auf dem Gerät wurde unerwartet beendet. Aktualisieren Sie den Agent und führen Sie die Sicherung erneut aus. Wenn das wiederholt auftritt, prüfen Sie die Agent-Protokolle des Geräts."
+    },
+    "configuration": {
+      "label": "Konfigurationsproblem",
+      "hint": "Es gab nichts Gültiges zu sichern, oder die Sicherungskonfiguration wurde geändert, während der Auftrag startete. Überprüfen Sie das Sicherungsprofil des Geräts."
+    },
+    "source_access": {
+      "label": "Dateien konnten nicht gelesen werden",
+      "hint": "Einige Dateien waren gesperrt, in Verwendung oder für den Agent nicht lesbar. Prüfen Sie die unten aufgeführten Dateien und den VSS-Status."
+    },
+    "cancelled": {
+      "label": "Abgebrochen",
+      "hint": "Von einem Benutzer oder von Breeze beendet, bevor die Sicherung abgeschlossen war."
+    },
+    "unknown": {
+      "label": "Anderer Fehler",
+      "hint": "Breeze erkennt diesen Fehler noch nicht. Die vollständige Meldung wird unten angezeigt."
+    },
+    "troubleshootingLink": "Leitfaden zur Fehlerbehebung"
+  },
+  "fullRunReason": {
+    "no_prior_snapshot": "Erste Sicherung für dieses Gerät und Ziel",
+    "base_expired": "Die vorherige Sicherung war durch die Aufbewahrung abgelaufen",
+    "storage_identity_changed": "Das Sicherungsziel wurde geändert",
+    "backup_type_mismatch": "Die vorherige Sicherung hatte einen anderen Typ",
+    "base_job_not_completed": "Keine frühere Sicherung wurde erfolgreich abgeschlossen",
+    "base_retired": "Die vorherige Sicherung wurde durch die Aufbewahrung entfernt",
+    "base_retired_race": "Die vorherige Sicherung wurde durch die Aufbewahrung entfernt",
+    "base_deleted_race": "Die vorherige Sicherung wurde durch die Aufbewahrung entfernt",
+    "no_verified_base": "Keine frühere Sicherung hat die Integritätsprüfung bestanden",
+    "key_root_changed": "Der Zielordner (Präfix) wurde geändert",
+    "base_key_root_unreadable": "Der Speicherort der vorherigen Sicherung konnte nicht gelesen werden",
+    "invalid_destination_prefix": "Das Zielpräfix ist ungültig",
+    "nothing_reused": "Eine frühere Sicherung war vorhanden, aber es konnten keine unveränderten Dateien wiederverwendet werden",
+    "unrecorded": "Grund nicht erfasst (diese Sicherung lief, bevor Breeze ihn aufgezeichnet hat)"
+  },
+  "jobDataSummary": {
+    "uploadedAndReused": "{{uploaded}} hochgeladen · {{reused}} wiederverwendet",
+    "processedBeforeStopped": "{{processed}} verarbeitet, bevor der Lauf endete",
+    "full": "Voll",
+    "heading": "Was dieser Lauf gespeichert hat",
+    "protected": "Gesichert",
+    "uploadedThisRun": "In diesem Lauf hochgeladen",
+    "reusedFromEarlier": "Aus früheren Sicherungen wiederverwendet",
+    "backupType": "Sicherungstyp",
+    "incremental": "Inkrementell",
+    "fullWithReason": "Voll — {{reason}}",
+    "explainer": "Nur neue oder geänderte Dateien werden hochgeladen. Unveränderte Dateien werden aus früheren Sicherungen dieses Geräts am selben Ziel wiederverwendet.",
+    "learnMore": "So funktionieren inkrementelle Sicherungen",
+    "resumedAt": "Dieser Lauf hat am {{time}} eine unterbrochene Sicherung fortgesetzt."
   }
 }

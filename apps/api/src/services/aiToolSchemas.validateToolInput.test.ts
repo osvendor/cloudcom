@@ -12,6 +12,14 @@ describe('validateToolInput error formatting', () => {
     }
   });
 
+  // #5396: completed_with_errors is a real backup_status value; the AI tool
+  // must be able to filter on it (and its JSON input_schema mirrors this enum).
+  it('accepts query_backups filtered by completed_with_errors', () => {
+    expect(
+      validateToolInput('query_backups', { action: 'list_jobs', status: 'completed_with_errors' }),
+    ).toEqual({ success: true });
+  });
+
   it('accepts valid input', () => {
     expect(validateToolInput('manage_patches', { action: 'list' })).toEqual({ success: true });
   });
@@ -155,5 +163,11 @@ describe('run_script run context (#4888)', () => {
 
   it('still accepts a call that names no run context at all', () => {
     expect(validateToolInput('run_script', base).success).toBe(true);
+  });
+});
+
+describe('get_elevation_history status (#8971)', () => {
+  it('accepts the withdrawn status', () => {
+    expect(validateToolInput('get_elevation_history', { status: 'withdrawn' })).toEqual({ success: true });
   });
 });

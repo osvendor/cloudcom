@@ -1,4 +1,5 @@
 import { navigateTo } from '@/lib/navigation';
+import { normalizeOsFingerprint } from './osFingerprint';
 import { ActionError } from '@/lib/runAction';
 import { useNetworkAssetMutations } from '../devices/networkDevice/settings/useNetworkAssetMutations';
 import { useCallback, useEffect, useMemo, useState } from 'react';
@@ -16,6 +17,7 @@ import {
   type DiscoveredAssetTypeSource,
 } from './networkTypes';
 import { asList } from '@/lib/asList';
+import { useStableT } from '@/lib/i18n/useStableT';
 
 // Re-exported so existing consumers importing it from './DiscoveredAssetList'
 // keep working; the canonical declaration now lives in ./networkTypes.
@@ -176,7 +178,7 @@ export function mapAsset(asset: ApiDiscoveryAsset): DiscoveredAsset {
     reachability: asset.reachability,
     lastSeen: asset.lastSeenAt ?? asset.updatedAt ?? asset.createdAt,
     openPorts: normalizeOpenPorts(asset.openPorts),
-    osFingerprint: asset.osFingerprint ?? undefined,
+    osFingerprint: normalizeOsFingerprint(asset.osFingerprint) ?? undefined,
     snmpData: asset.snmpData ?? undefined,
     responseTimeMs: asset.responseTimeMs ?? null,
     linkedDeviceId: asset.linkedDeviceId,
@@ -202,7 +204,7 @@ export function toDetail(asset: DiscoveredAsset): AssetDetail {
   return {
     ...asset,
     openPorts: asset.openPorts ?? [],
-    osFingerprint: asset.osFingerprint ?? '—',
+    osFingerprint: normalizeOsFingerprint(asset.osFingerprint) ?? '—',
     snmpData: asset.snmpData ?? {},
     linkedDeviceId: asset.linkedDeviceId ?? undefined
   };
@@ -257,6 +259,7 @@ interface DiscoveredAssetListProps {
 
 export default function DiscoveredAssetList({ timezone }: DiscoveredAssetListProps) {
   const { t } = useTranslation('discovery');
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   const { approve, dismiss } = useNetworkAssetMutations();
   const [assets, setAssets] = useState<DiscoveredAsset[]>([]);
   const [loading, setLoading] = useState(true);
@@ -275,7 +278,7 @@ export default function DiscoveredAssetList({ timezone }: DiscoveredAssetListPro
       setError(undefined);
       const response = await fetchWithAuth('/discovery/assets');
       if (!response.ok) {
-        throw new Error(t('discoveredAssetList.errors.fetch'));
+        throw new Error(stableT('discoveredAssetList.errors.fetch'));
       }
       const data = await response.json();
       const items = asList(data, 'assets');
@@ -284,11 +287,11 @@ export default function DiscoveredAssetList({ timezone }: DiscoveredAssetListPro
       const validIds = new Set(mappedAssets.map((asset: DiscoveredAsset) => asset.id));
       setSelectedAssetIds(prev => new Set([...prev].filter(id => validIds.has(id))));
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('discoveredAssetList.errors.generic'));
+      setError(err instanceof Error ? err.message : stableT('discoveredAssetList.errors.generic'));
     } finally {
       setLoading(false);
     }
-  }, [t]);
+  }, [stableT]);
 
   const filteredAssets = useMemo(() => {
     let result = assets;

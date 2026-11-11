@@ -14,13 +14,13 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/breeze-rmm/agent/internal/procspawn"
 	"github.com/breeze-rmm/agent/internal/securefs"
 )
 
@@ -102,13 +102,13 @@ func (h *Heartbeat) enrollNativeRustDeskTargetLinux() error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
-	capability, err := exec.CommandContext(ctx, executable, "--cloudcom-managed-protocol").Output()
+	capability, err := procspawn.CommandContext(ctx, executable, "--cloudcom-managed-protocol").Output()
 	if err != nil || strings.TrimSpace(string(capability)) != "2" {
 		return errors.New("RustDesk service does not advertise managed protocol v2")
 	}
 	ctx, cancel = context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
-	peerBytes, err := exec.CommandContext(ctx, executable, "--get-id").Output()
+	peerBytes, err := procspawn.CommandContext(ctx, executable, "--get-id").Output()
 	if err != nil {
 		return errors.New("could not read RustDesk peer ID")
 	}
@@ -118,7 +118,7 @@ func (h *Heartbeat) enrollNativeRustDeskTargetLinux() error {
 	}
 	ctx, cancel = context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
-	publicKeyBytes, err := exec.CommandContext(ctx, executable, "--cloudcom-managed-public-key").Output()
+	publicKeyBytes, err := procspawn.CommandContext(ctx, executable, "--cloudcom-managed-public-key").Output()
 	if err != nil {
 		return errors.New("could not read managed RustDesk public key")
 	}

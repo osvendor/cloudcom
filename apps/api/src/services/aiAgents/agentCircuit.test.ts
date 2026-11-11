@@ -204,6 +204,13 @@ describe('classifyTerminal', () => {
     expect(classifyTerminal('completed', null, NEEDS_ATTENTION)).toBe('increment');
   });
 
+  it('is neutral on a blocked run — an admin\'s model choice or a provider refusal is not an agent fault (W03)', () => {
+    expect(classifyTerminal('blocked', 'model_refused', null)).toBe('neutral');
+    expect(classifyTerminal('blocked', 'model_unavailable', NEEDS_ATTENTION)).toBe('neutral');
+    // Even with an error code the failure classifier WOULD increment on.
+    expect(classifyTerminal('blocked', 'sdk_error', null)).toBe('neutral');
+  });
+
   it('resets on a clean completed run (no verdict)', () => {
     expect(classifyTerminal('completed', null, null)).toBe('reset');
   });
@@ -266,9 +273,18 @@ describe('classifyTerminal with run profile (P2-1)', () => {
 // new profile that is not explicitly handled fails here instead of silently
 // inheriting `full`'s reset behaviour.
 describe('classifyTerminal per profile (AI patch agent W01)', () => {
-  it.each(AI_AGENT_RUN_PROFILES)('%s completion is streak-neutral unless it is full', (profile) => {
-    expect(classifyTerminal('completed', null, 'no_action', profile)).toBe(profile === 'full' ? 'reset' : 'neutral');
-    expect(classifyTerminal('awaiting_approval', null, null, profile)).toBe(profile === 'full' ? 'reset' : 'neutral');
+  // Profiles deliberately NOT streak-neutral: their clean finish resets the streak.
+  const RESETS_STREAK: ReadonlySet<string> = new Set(['full', 'device_troubleshooting']);
+  it.each(AI_AGENT_RUN_PROFILES)('%s completion is streak-neutral unless it resets by decision', (profile) => {
+    const expected = RESETS_STREAK.has(profile) ? 'reset' : 'neutral';
+    expect(classifyTerminal('completed', null, 'no_action', profile)).toBe(expected);
+    expect(classifyTerminal('awaiting_approval', null, null, profile)).toBe(expected);
+  });
+
+  it('device_troubleshooting (#11084): a clean finish resets, a genuine failure still increments', () => {
+    expect(classifyTerminal('completed', null, 'no_action', 'device_troubleshooting')).toBe('reset');
+    expect(classifyTerminal('awaiting_approval', null, null, 'device_troubleshooting')).toBe('reset');
+    expect(classifyTerminal('failed', 'llm_unavailable', null, 'device_troubleshooting')).toBe('increment');
   });
 
   it('a patch plan is advice a human must accept, so even needs_attention is neutral', () => {
@@ -279,6 +295,12 @@ describe('classifyTerminal per profile (AI patch agent W01)', () => {
     expect(classifyTerminal('failed', 'llm_unavailable', null, 'patch')).toBe('increment');
     expect(classifyTerminal('failed', 'max_turns_exceeded', null, 'patch')).toBe('increment');
     expect(classifyTerminal('failed', 'stalled', null, 'patch')).toBe('neutral');
+  });
+
+  it('remediation_research runs are streak-neutral on completion and approval (W2)', () => {
+    expect(classifyTerminal('completed', null, 'needs_attention', 'remediation_research')).toBe('neutral');
+    expect(classifyTerminal('awaiting_approval', null, null, 'remediation_research')).toBe('neutral');
+    expect(classifyTerminal('failed', 'llm_unavailable', null, 'remediation_research')).toBe('increment');
   });
 });
 
@@ -520,6 +542,8 @@ describe('recordRunTerminal', () => {
       orgId: ORG_ID,
       dedupeKey: `circuit-open-${ORG_ID}-${AGENT_ID}-${RUN_ID}`,
       priority: 'high',
+      // #4461: was `/ai-agents/${agentId}` — no such page exists.
+      link: `/ai-agents/runs#agent=${AGENT_ID}`,
     }));
     expect(createAuditLogAsyncMock).toHaveBeenCalledTimes(1);
     expect(createAuditLogAsyncMock).toHaveBeenCalledWith(expect.objectContaining({

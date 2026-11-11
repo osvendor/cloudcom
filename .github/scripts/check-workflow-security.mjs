@@ -18,12 +18,13 @@ const WINDOWS_SIGNING_PUBLISHER_RULE = 'windows-signing-must-assert-publisher';
 const WINDOWS_SIGNING_RELEASE_GATE_RULE = 'windows-signing-gate-must-block-release';
 const WINDOWS_SIGNING_ARTIFACT_PARITY_RULE = 'windows-signing-providers-must-cover-same-artifacts';
 const SSLCOM_SIGNING_TOOLCHAIN_RULE = 'sslcom-signing-must-pin-toolchain';
+const SIGNING_ENVIRONMENT_RULE = 'signing-secrets-must-use-signing-environment';
+export const PINNED_GATE_RULE = 'pinned-ci-gate-invariants';
 const TAURI_SIGNED_ARTIFACT_MARKER = 'breeze-viewer-windows.msi';
 const TAURI_SIGNED_ARTIFACT_RE = /breeze-[a-z0-9-]+-windows\.msi/gu;
 const PROVIDER_RESOLVER_SCRIPT = '.github/scripts/resolve-windows-signing-provider.mjs';
 const CONVERGENCE_SCRIPT = '.github/scripts/assert-windows-signing-convergence.mjs';
 const SHARED_SIGNATURE_VERIFIER = '.github/scripts/Verify-WindowsSignature.ps1';
-const AZURE_SIGNING_ACTION_PREFIX = 'azure/artifact-signing-action@';
 const SSLCOM_ACTION_PREFIX = 'SSLcom/esigner-codesign@';
 const PINNED_EXTERNAL_USES = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)*@[0-9a-f]{40}$/u;
 const PUBLIC_AGENT_WINDOWS_ASSETS = [
@@ -42,6 +43,31 @@ const SSLCOM_SECRETS = [
   'SSLCOM_CERT_SHA256',
   'SSLCOM_ENVIRONMENT_LABEL',
 ];
+// Secrets that sign, or let a job sign, a released artifact. They live only in
+// the signing-production / signing-prerelease environments, whose deployment
+// policy admits v* tags alone, so every job that names one must declare one of
+// those environments. Public keys are deliberately absent: verification jobs on
+// branches and in promotion workflows read them.
+const PROTECTED_SIGNING_SECRET_RE = new RegExp(
+  '\\bsecrets\\.('
+  + [
+    'RELEASE_MANIFEST_ED25519_PRIVATE_KEY',
+    'RELEASE_MANIFEST_MINISIGN_PRIVATE_KEY',
+    'TAURI_SIGNING_PRIVATE_KEY(?:_PASSWORD)?',
+    'APPLE_[A-Za-z0-9_]+',
+    'SSLCOM_[A-Za-z0-9_]+',
+  ].join('|')
+  + ')\\b',
+  // GitHub resolves secret names case-insensitively.
+  'giu',
+);
+// Access that can reach any secret, including the protected ones: the whole
+// context, an object filter over it, or a computed index.
+const WHOLE_SECRET_CONTEXT_RE = /\btojson\(secrets\)|\bsecrets\.\*|\bsecrets\[/iu;
+const SIGNING_ENVIRONMENTS = new Set(['signing-production', 'signing-prerelease']);
+// The release workflow's selector: prerelease tags (with a '-') sign in
+// signing-prerelease, every other tag in signing-production.
+const SIGNING_ENVIRONMENT_SELECTOR = "${{contains(github.ref_name,'-')&&'signing-prerelease'||'signing-production'}}";
 
 function stripInlineComment(line) {
   let quote = null;
@@ -450,6 +476,12 @@ function containsSecretReference(value) {
     /\bsecrets\./u.test(normalized)
     || /\btojson\(\s*secrets\s*\)/iu.test(normalized)
   );
+}
+
+// Repository or organization variables (`vars.X`, `vars['X']`, `toJSON(vars)`).
+function containsVarsReference(value) {
+  const normalized = normalizePropertyAccess(value);
+  return /\bvars\./u.test(normalized) || /\btojson\(\s*vars\s*\)/iu.test(normalized);
 }
 
 function secretReferenceLines(lines) {
@@ -1072,12 +1104,12 @@ function artifactsMatching(job, lineFilter) {
   return [...found].sort(codePointCompare);
 }
 
-// Artifacts handed to a signing action, via azure `files:` or eSigner
-// `file_path:`. Deliberately NOT every MSI named in the job — download and
-// upload steps name them too, so a deleted sign step would go unnoticed while
-// the unsigned file was re-uploaded over the signed artifact name.
+// Artifacts handed to the eSigner action via `file_path:`. Deliberately NOT
+// every MSI named in the job — download and upload steps name them too, so a
+// deleted sign step would go unnoticed while the unsigned file was re-uploaded
+// over the signed artifact name.
 function signedWindowsArtifacts(job) {
-  return artifactsMatching(job, (trimmed) => /^(?:files|file_path):/u.test(trimmed));
+  return artifactsMatching(job, (trimmed) => /^file_path:/u.test(trimmed));
 }
 
 // Artifacts passed to the shared verifier.
@@ -1096,10 +1128,11 @@ function publicReleaseSigningViolations(file, lines) {
   }
 
   const jobs = workflowJobs(lines);
-  // Each provider is located by the action or script that defines it, so the
-  // rules survive any renaming of the jobs themselves.
+  // Each job is located by the action or script that defines it, so the rules
+  // survive any renaming of the jobs themselves. SSL.com eSigner is the only
+  // signing provider: the Azure Artifact Signing lane was retired, so there is
+  // no second signing job to find.
   const resolver = findJobByShape(jobs, PROVIDER_RESOLVER_SCRIPT);
-  const azure = findJobByShape(jobs, AZURE_SIGNING_ACTION_PREFIX);
   const sslcom = findJobByShape(jobs, SSLCOM_ACTION_PREFIX);
   const gate = findJobByShape(jobs, CONVERGENCE_SCRIPT);
   const integrityGate = findJobByShape(jobs, 'require_success');
@@ -1107,7 +1140,6 @@ function publicReleaseSigningViolations(file, lines) {
   const violations = [];
   const structural = [
     [resolver, 'a provider resolution job', WINDOWS_SIGNING_PROVIDER_FAIL_CLOSED_RULE],
-    [azure, 'an Azure signing job', WINDOWS_SIGNING_PUBLISHER_RULE],
     [sslcom, 'an SSL.com signing job', SSLCOM_SIGNING_CERTIFICATE_PIN_RULE],
     [gate, 'a provider convergence gate', WINDOWS_SIGNING_PROVIDER_CONVERGENCE_RULE],
     [integrityGate, 'a release integrity gate', WINDOWS_SIGNING_RELEASE_GATE_RULE],
@@ -1132,14 +1164,8 @@ function publicReleaseSigningViolations(file, lines) {
     file,
   );
 
-  // Only the Azure signer may hold OIDC.
-  requirePattern(
-    azure,
-    /id-token:\s*write/u,
-    WINDOWS_SIGNING_PROVIDER_LEAST_PRIVILEGE_RULE,
-    violations,
-    file,
-  );
+  // No Windows signing job holds OIDC. Only the retired Azure signer ever
+  // needed it; eSigner authenticates with environment-scoped credentials.
   for (const section of [resolver, sslcom, gate]) {
     forbidPattern(
       section,
@@ -1150,25 +1176,23 @@ function publicReleaseSigningViolations(file, lines) {
     );
   }
 
-  // Both providers must assert the publisher through the shared verifier. The
-  // Azure path previously verified only that *some* signature existed, so a
-  // mis-set endpoint or certificate profile shipped under any identity.
-  for (const section of [azure, sslcom]) {
-    requirePattern(
-      section,
-      new RegExp(escapeRegExp(SHARED_SIGNATURE_VERIFIER), 'u'),
-      WINDOWS_SIGNING_TIMESTAMP_RULE,
-      violations,
-      file,
-    );
-    requirePattern(
-      section,
-      /-ExpectedSubject\s+\$env:EXPECTED_SUBJECT/u,
-      WINDOWS_SIGNING_PUBLISHER_RULE,
-      violations,
-      file,
-    );
-  }
+  // The signing job must assert the publisher through the shared verifier. An
+  // inline check once verified only that *some* signature existed, so a
+  // mis-set credential or certificate shipped under any identity.
+  requirePattern(
+    sslcom,
+    new RegExp(escapeRegExp(SHARED_SIGNATURE_VERIFIER), 'u'),
+    WINDOWS_SIGNING_TIMESTAMP_RULE,
+    violations,
+    file,
+  );
+  requirePattern(
+    sslcom,
+    /-ExpectedSubject\s+\$env:EXPECTED_SUBJECT/u,
+    WINDOWS_SIGNING_PUBLISHER_RULE,
+    violations,
+    file,
+  );
 
   // SSL.com credential + certificate pinning.
   requirePattern(
@@ -1194,21 +1218,13 @@ function publicReleaseSigningViolations(file, lines) {
     violations,
     file,
   );
-  // -AllowUnpinnedLeaf turns the certificate pin off. It is correct on the
-  // Azure path, whose leaves rotate, and never on the pinned one.
+  // -AllowUnpinnedLeaf turns the certificate pin off. It existed for a
+  // provider whose leaf certificates rotated automatically; the pinned path
+  // must never carry it.
   forbidPattern(
     sslcom,
     /-AllowUnpinnedLeaf/u,
     SSLCOM_SIGNING_CERTIFICATE_PIN_RULE,
-    violations,
-    file,
-  );
-  // Verifying without a pin has to be an explicit, reviewable choice rather
-  // than the silent consequence of an empty secret.
-  requirePattern(
-    azure,
-    /-AllowUnpinnedLeaf/u,
-    WINDOWS_SIGNING_PUBLISHER_RULE,
     violations,
     file,
   );
@@ -1244,72 +1260,44 @@ function publicReleaseSigningViolations(file, lines) {
     );
   }
 
-  // Agent-family artifacts stay unsigned in the public pipeline — on BOTH
-  // providers, not just SSL.com.
-  for (const section of [azure, sslcom]) {
-    for (const asset of PUBLIC_AGENT_WINDOWS_ASSETS) {
-      forbidPattern(
-        section,
-        new RegExp(escapeRegExp(asset), 'u'),
-        SSLCOM_SIGNING_AGENT_ISOLATION_RULE,
-        violations,
-        file,
-      );
-    }
-    // A directory-wide batch sign would pick up whatever is staged without
-    // naming any forbidden file.
+  // Agent-family artifacts stay unsigned in the public pipeline.
+  for (const asset of PUBLIC_AGENT_WINDOWS_ASSETS) {
     forbidPattern(
-      section,
-      /(?:command:\s*batch_sign|dir_path:)/u,
+      sslcom,
+      new RegExp(escapeRegExp(asset), 'u'),
       SSLCOM_SIGNING_AGENT_ISOLATION_RULE,
       violations,
       file,
     );
   }
+  // A directory-wide batch sign would pick up whatever is staged without
+  // naming any forbidden file.
+  forbidPattern(
+    sslcom,
+    /(?:command:\s*batch_sign|dir_path:)/u,
+    SSLCOM_SIGNING_AGENT_ISOLATION_RULE,
+    violations,
+    file,
+  );
 
-  // Both providers must cover exactly the same artifact set, or one of them can
-  // quietly leave a file unsigned while overwriting the signed artifact name.
-  // Every artifact a provider verifies must also have been signed by it, and
-  // both providers must cover the same set.
-  for (const section of [azure, sslcom]) {
-    if (!section) {
-      continue;
-    }
-    const signed = signedWindowsArtifacts(section);
-    const verified = verifiedWindowsArtifacts(section);
+  // Every artifact the signing job verifies must also have been signed by it,
+  // or a deleted sign step can quietly leave a file unsigned while the job
+  // still overwrites the signed artifact name.
+  if (sslcom) {
+    const signed = signedWindowsArtifacts(sslcom);
+    const verified = verifiedWindowsArtifacts(sslcom);
     if (signed.join(',') !== verified.join(',')) {
-      violations.push({
-        file,
-        line: section.lines[0].line,
-        rule: WINDOWS_SIGNING_ARTIFACT_PARITY_RULE,
-        message: `signing job "${section.name}" signs [${signed.join(' ')}] but verifies [${verified.join(' ')}]`,
-      });
-    }
-  }
-  if (azure && sslcom) {
-    const azureArtifacts = signedWindowsArtifacts(azure);
-    const sslcomArtifacts = signedWindowsArtifacts(sslcom);
-    if (azureArtifacts.join(',') !== sslcomArtifacts.join(',')) {
       violations.push({
         file,
         line: sslcom.lines[0].line,
         rule: WINDOWS_SIGNING_ARTIFACT_PARITY_RULE,
-        message: `Windows signing providers must cover the same artifacts; azure=[${azureArtifacts.join(' ')}] sslcom=[${sslcomArtifacts.join(' ')}]`,
+        message: `signing job "${sslcom.name}" signs [${signed.join(' ')}] but verifies [${verified.join(' ')}]`,
       });
     }
   }
 
-  // Convergence gate: exactly one provider ran, and it succeeded.
+  // Convergence gate: the selected provider ran, and it succeeded.
   requirePattern(gate, /!cancelled\(\)/u, WINDOWS_SIGNING_PROVIDER_CONVERGENCE_RULE, violations, file);
-  if (azure) {
-    requirePattern(
-      gate,
-      new RegExp(`needs\\.${escapeRegExp(azure.name)}\\.result`, 'u'),
-      WINDOWS_SIGNING_PROVIDER_CONVERGENCE_RULE,
-      violations,
-      file,
-    );
-  }
   if (sslcom) {
     requirePattern(
       gate,
@@ -1321,7 +1309,7 @@ function publicReleaseSigningViolations(file, lines) {
   }
   requirePattern(
     gate,
-    /node\s+\.github\/scripts\/assert-windows-signing-convergence\.mjs\s+"\$PROVIDER"\s+"\$AZURE_RESULT"\s+"\$SSLCOM_RESULT"/u,
+    /node\s+\.github\/scripts\/assert-windows-signing-convergence\.mjs\s+"\$PROVIDER"\s+"\$SSLCOM_RESULT"/u,
     WINDOWS_SIGNING_PROVIDER_CONVERGENCE_RULE,
     violations,
     file,
@@ -1340,6 +1328,367 @@ function publicReleaseSigningViolations(file, lines) {
     );
   }
 
+  return violations;
+}
+
+// The job-level `environment:` name, in any of its three spellings: a scalar,
+// a block mapping with `name:`, or a flow mapping. A `url:`-only mapping has no
+// name and returns null.
+function jobEnvironmentName(job) {
+  const { lines } = job;
+  for (const [index, line] of lines.entries()) {
+    if (line.isBlockScalarContent || parentLineIndex(lines, index) !== 0) {
+      continue;
+    }
+    const entry = mappingEntry(line.trimmed);
+    if (entry?.key !== 'environment') {
+      continue;
+    }
+    if (entry.value.startsWith('{')) {
+      const name = flowMappingEntries(entry.value).find(({ key }) => key === 'name');
+      return name ? unquote(name.value) : null;
+    }
+    if (entry.value !== '') {
+      return unquote(entry.value);
+    }
+    for (let nestedIndex = index + 1; nestedIndex < lines.length; nestedIndex += 1) {
+      const nested = lines[nestedIndex];
+      if (nested.indent <= line.indent) {
+        break;
+      }
+      if (nested.isBlockScalarContent || parentLineIndex(lines, nestedIndex) !== index) {
+        continue;
+      }
+      const child = mappingEntry(nested.trimmed);
+      if (child?.key === 'name') {
+        return /^[>|][0-9+-]*$/u.test(child.value)
+          ? blockScalarValue(lines, nestedIndex)
+          : unquote(child.value);
+      }
+    }
+    return null;
+  }
+  return null;
+}
+
+function isSigningEnvironment(name) {
+  if (name === null) {
+    return false;
+  }
+  return (
+    SIGNING_ENVIRONMENTS.has(name.trim())
+    || name.replace(/\s+/gu, '') === SIGNING_ENVIRONMENT_SELECTOR
+  );
+}
+
+// Protected secret names (or a whole-context marker) referenced on one line,
+// folding a block scalar into its opening line so a reference split across
+// folded lines is still seen.
+function protectedSigningReferences(lines, index) {
+  const line = lines[index];
+  const scalar = normalizePropertyAccess(
+    line.isBlockScalarContent
+      ? line.content
+      : `${line.content} ${blockScalarValue(lines, index)}`,
+  );
+  const found = new Set(
+    [...scalar.matchAll(PROTECTED_SIGNING_SECRET_RE)].map((match) => match[1].toUpperCase()),
+  );
+  if (WHOLE_SECRET_CONTEXT_RE.test(scalar)) {
+    found.add('the whole secrets context');
+  }
+  return found;
+}
+
+function signingEnvironmentViolations(file, lines) {
+  const violations = [];
+  const jobLineNumbers = new Set();
+
+  for (const job of workflowJobs(lines)) {
+    for (const line of job.lines) {
+      jobLineNumbers.add(line.line);
+    }
+    if (isSigningEnvironment(jobEnvironmentName(job))) {
+      continue;
+    }
+
+    const names = new Set();
+    let firstLine = null;
+    for (const [index, line] of job.lines.entries()) {
+      const found = protectedSigningReferences(job.lines, index);
+      const entry = line.isBlockScalarContent ? null : mappingEntry(line.trimmed);
+      // A reusable-workflow call cannot declare an environment, and `inherit`
+      // hands it every repository secret.
+      if (
+        entry?.key === 'secrets'
+        && unquote(entry.value) === 'inherit'
+        && parentLineIndex(job.lines, index) === 0
+      ) {
+        found.add('the whole secrets context');
+      }
+      if (found.size === 0) {
+        continue;
+      }
+      firstLine ??= line.line;
+      for (const name of found) {
+        names.add(name);
+      }
+    }
+    if (firstLine === null) {
+      continue;
+    }
+    violations.push({
+      file,
+      line: firstLine,
+      rule: SIGNING_ENVIRONMENT_RULE,
+      message: `job "${job.name}" reads ${[...names].sort(codePointCompare).join(', ')} but does not declare environment signing-production or signing-prerelease`,
+    });
+  }
+
+  // Workflow-level env (or anything else outside a job) reaches every job.
+  for (const [index, line] of lines.entries()) {
+    if (jobLineNumbers.has(line.line)) {
+      continue;
+    }
+    const found = protectedSigningReferences(lines, index);
+    if (found.size === 0) {
+      continue;
+    }
+    violations.push({
+      file,
+      line: line.line,
+      rule: SIGNING_ENVIRONMENT_RULE,
+      message: `${[...found].sort(codePointCompare).join(', ')} must be read inside a job that declares environment signing-production or signing-prerelease, not at workflow level`,
+    });
+  }
+
+  return violations;
+}
+
+// ── The pinned CI Gate (W02, #10746) ─────────────────────────────────────
+//
+// The org ruleset requires ci-gate.yml from main, and the merge queue trusts
+// its verdict. It must never run candidate code, hold write access or
+// secrets, install anything, share a cache, or be cancelled or softened. This
+// rule pins the whole file to that shape: anything not listed is a violation.
+const PINNED_GATE_FILE = 'ci-gate.yml';
+const GATE_FILTER = '[ci-gate-ruleset-only]';
+const MERGE_GROUP_ONLY = "github.event_name == 'merge_group'";
+const PULL_REQUEST_ONLY = "github.event_name == 'pull_request'";
+const MERGE_GROUP_ENV = {
+  GH_TOKEN: '${{ github.token }}',
+  BASE_SHA: '${{ github.event.merge_group.base_sha }}',
+  HEAD_SHA: '${{ github.event.merge_group.head_sha }}',
+  HEAD_REF: '${{ github.event.merge_group.head_ref }}',
+};
+// The kill switch (W05, #10749): the only repository variable the gate may read.
+const THIN_QUEUE_ENV = ['THIN_QUEUE', '${{ vars.CI_THIN_QUEUE }}'];
+const GATE_RUN = {
+  select: { run: 'node .github/scripts/ci-gate.mjs select', if: MERGE_GROUP_ONLY,
+    env: { ...MERGE_GROUP_ENV, [THIN_QUEUE_ENV[0]]: THIN_QUEUE_ENV[1] } },
+  verify: { run: 'node .github/scripts/ci-gate.mjs verify', if: MERGE_GROUP_ONLY, env: MERGE_GROUP_ENV },
+  anchor: { run: 'node .github/scripts/ci-gate.mjs anchor', if: PULL_REQUEST_ONLY,
+    env: {
+      GH_TOKEN: '${{ github.token }}',
+      PR_HEAD_SHA: '${{ github.event.pull_request.head.sha }}',
+      PR_NUMBER: '${{ github.event.pull_request.number }}',
+    } },
+};
+// Every `with:` key each action may take, and the values that are fixed. An action
+// with several specs picks the one whose `if:` the step has. `step` lists the
+// extra step keys that spec allows, each with its one value.
+const UPLOAD_KEYS = ['name', 'path', 'retention-days', 'if-no-files-found'];
+const GATE_ACTIONS = {
+  'actions/checkout': [{ keys: ['ref', 'fetch-depth', 'persist-credentials', 'sparse-checkout', 'sparse-checkout-cone-mode'],
+    fixed: { ref: '${{ github.workflow_sha }}', 'fetch-depth': '0', 'persist-credentials': 'false', 'sparse-checkout': '.github/scripts', 'sparse-checkout-cone-mode': 'false' } }],
+  'actions/setup-node': [{ keys: ['node-version', 'package-manager-cache'], fixed: { 'package-manager-cache': 'false' } }],
+  'actions/upload-artifact': [
+    { keys: UPLOAD_KEYS, if: PULL_REQUEST_ONLY,
+      fixed: { name: 'ci-gate-anchor-attempt-${{ github.run_attempt }}', path: 'ci-gate-anchor.json', 'retention-days': '7', 'if-no-files-found': 'ignore' } },
+    // The selection upload is the one soft step: verify reads the local file, so a
+    // failed upload only means CI finds no selection and runs everything.
+    { keys: UPLOAD_KEYS, if: MERGE_GROUP_ONLY, order: 'upload-selection', step: { 'continue-on-error': 'true', 'timeout-minutes': '2' },
+      fixed: { name: 'ci-gate-selection-attempt-${{ github.run_attempt }}', path: 'ci-gate-selection.json', 'retention-days': '7', 'if-no-files-found': 'ignore' } },
+  ],
+};
+// select publishes the list, the upload hands it to CI, and verify judges by it.
+const MERGE_GROUP_ORDER = ['select', 'upload-selection', 'verify'];
+const STEP_KEYS = ['name', 'uses', 'with', 'if', 'env', 'run'];
+const GATE_FORBIDDEN_KEYS = new Set(['continue-on-error', 'concurrency', 'cancel-in-progress', 'paths', 'paths-ignore',
+  'cache', 'cache-dependency-path', 'container', 'services']);
+
+function directChildren(lines, index) {
+  const children = [];
+  for (let child = index + 1; child < lines.length && lines[child].indent > lines[index].indent; child += 1) {
+    if (!lines[child].isBlockScalarContent && parentLineIndex(lines, child) === index) {
+      children.push(child);
+    }
+  }
+  return children;
+}
+
+// A step's first line is `- key: value`; its other keys are its children.
+function stepEntry(lines, index) {
+  const line = lines[index];
+  return isSequenceItem(line) ? mappingEntry(line.trimmed.slice(1).trim()) : mappingEntry(line.trimmed);
+}
+
+function entriesOf(lines, indexes) {
+  return indexes.map((index) => ({ index, line: lines[index], ...stepEntry(lines, index) }));
+}
+
+function scalarOf(lines, entry) {
+  return /^[>|][0-9+-]*$/u.test(entry.value) ? blockScalarValue(lines, entry.index) : unquote(entry.value);
+}
+
+function pinnedGateViolations(file, lines) {
+  if (file !== PINNED_GATE_FILE) {
+    return [];
+  }
+  const violations = [];
+  const seen = new Set();
+  const flag = (line, message) => {
+    const at = line?.line ?? 1;
+    if (!seen.has(`${at}\0${message}`)) {
+      seen.add(`${at}\0${message}`);
+      violations.push({ file, line: at, rule: PINNED_GATE_RULE, message: `pinned CI Gate: ${message}` });
+    }
+  };
+
+  const top = entriesOf(lines, lines.flatMap((line, index) => (line.indent === 0 && !line.isBlockScalarContent ? [index] : [])));
+  const topEntry = (key) => top.find((entry) => entry.key === key);
+  for (const entry of top) {
+    if (!['name', 'on', 'permissions', 'jobs'].includes(entry.key)) {
+      flag(entry.line, `top-level ${entry.key} is not allowed`);
+    }
+  }
+
+  const on = topEntry('on');
+  const events = on ? entriesOf(lines, directChildren(lines, on.index)) : [];
+  if (!on || on.value !== '' || events.map(({ key }) => key).sort().join(',') !== 'merge_group,pull_request') {
+    flag(on?.line, 'triggers must be exactly pull_request and merge_group');
+  }
+  for (const event of events) {
+    const filters = entriesOf(lines, directChildren(lines, event.index));
+    if (event.value !== '' || filters.length !== 1 || filters[0].key !== 'branches' || filters[0].value !== GATE_FILTER) {
+      flag(event.line, `${event.key} must be filtered to exactly branches: ${GATE_FILTER}`);
+    }
+  }
+
+  const permissions = topEntry('permissions');
+  const granted = permissions ? entriesOf(lines, directChildren(lines, permissions.index)) : [];
+  if (!permissions || permissions.value !== '' || granted.map(({ key, value }) => `${key}: ${value}`).sort().join(', ') !== 'actions: read, contents: read') {
+    flag(permissions?.line, 'permissions must be exactly contents: read and actions: read');
+  }
+
+  const jobs = topEntry('jobs');
+  const jobEntries = jobs ? entriesOf(lines, directChildren(lines, jobs.index)) : [];
+  if (jobEntries.length !== 1) {
+    flag(jobs?.line, 'there must be exactly one job');
+  }
+  const ran = new Set();
+  const order = [];
+  // Lines a spec allows a forbidden key on, and the one line allowed to read a variable.
+  const exempt = new Set();
+  let varsAt = null;
+  for (const job of jobEntries) {
+    const keys = entriesOf(lines, directChildren(lines, job.index));
+    const value = (key) => keys.find((entry) => entry.key === key);
+    for (const entry of keys) {
+      if (entry.key === 'if') {
+        flag(entry.line, 'job-level if: is not allowed');
+      } else if (entry.key === 'permissions') {
+        flag(entry.line, 'job-level permissions are not allowed');
+      } else if (!['name', 'runs-on', 'timeout-minutes', 'steps'].includes(entry.key)) {
+        flag(entry.line, `job key ${entry.key} is not allowed`);
+      }
+    }
+    if (unquote(value('name')?.value ?? '') !== 'CI Gate') flag(job.line, 'the job name must be exactly CI Gate');
+    if (value('runs-on')?.value !== 'ubuntu-latest') flag(job.line, 'runs-on must be ubuntu-latest');
+    if (value('timeout-minutes')?.value !== '145') flag(job.line, 'timeout-minutes must be 145');
+
+    const steps = value('steps') ? directChildren(lines, value('steps').index) : [];
+    for (const stepIndex of steps) {
+      const step = entriesOf(lines, [stepIndex, ...directChildren(lines, stepIndex)]);
+      const field = (key) => step.find((entry) => entry.key === key);
+      const condition = field('if') ? unquote(field('if').value) : null;
+      const env = field('env') ? entriesOf(lines, directChildren(lines, field('env').index)) : [];
+      const uses = field('uses') ? unquote(field('uses').value) : null;
+      const run = field('run') ? scalarOf(lines, field('run')) : null;
+      const action = uses?.split('@')[0];
+      // An action with several specs is held to the one whose if: the step has.
+      const specs = run === null ? GATE_ACTIONS[action] ?? [] : [];
+      const spec = specs.find((candidate) => (candidate.if ?? null) === condition) ?? specs[0];
+      const allowed = [...STEP_KEYS, ...Object.keys(spec?.step ?? {})];
+      for (const entry of step) {
+        if (!allowed.includes(entry.key)) {
+          flag(entry.line, `step key ${entry.key} is not allowed`);
+        }
+      }
+
+      if (run !== null) {
+        // One plain line: a block scalar could hide a second command after it.
+        const subcommand = Object.keys(GATE_RUN).find((name) => GATE_RUN[name].run === run && !/^[>|]/u.test(field('run').value));
+        if (!subcommand) {
+          flag(field('run').line, `run must be exactly one of: ${Object.values(GATE_RUN).map((candidate) => candidate.run).join(' | ')}`);
+          continue;
+        }
+        if (ran.has(subcommand)) flag(field('run').line, `the ${subcommand} step must appear once`);
+        ran.add(subcommand);
+        order.push(subcommand);
+        const expected = GATE_RUN[subcommand];
+        if (condition !== expected.if) flag(step[0].line, `the ${subcommand} step must have if: ${expected.if}`);
+        const actual = Object.fromEntries(env.map(({ key, value }) => [key, unquote(value)]));
+        if (JSON.stringify(Object.entries(actual).sort()) !== JSON.stringify(Object.entries(expected.env).sort())) {
+          flag(field('env')?.line ?? step[0].line, `the ${subcommand} step env must be exactly ${Object.keys(expected.env).join(', ')}`);
+        }
+        const thinQueue = env.find(({ key, value }) => key === THIN_QUEUE_ENV[0] && unquote(value) === THIN_QUEUE_ENV[1]);
+        if (subcommand === 'select' && thinQueue) varsAt = thinQueue.index;
+        continue;
+      }
+      if (env.length) flag(field('env').line, 'only the select, verify and anchor steps may set env');
+      if (!spec) {
+        flag(field('uses')?.line ?? step[0].line, `uses ${uses ?? '(none)'} is not allowed; only ${Object.keys(GATE_ACTIONS).join(', ')}`);
+        continue;
+      }
+      if (condition !== (spec.if ?? null)) {
+        flag(step[0].line, `${action} must have ${specs.map((candidate) => (candidate.if ? `if: ${candidate.if}` : 'no if:')).join(' or ')}`);
+      }
+      if (spec.order && order.includes(spec.order)) flag(step[0].line, `the ${spec.order} step must appear once`);
+      if (spec.order) order.push(spec.order);
+      for (const [key, fixed] of Object.entries(spec.step ?? {})) {
+        const entry = field(key);
+        if (!entry || scalarOf(lines, entry) !== fixed) flag(entry?.line ?? step[0].line, `${action} must set ${key}: ${fixed}`);
+        else exempt.add(entry.index);
+      }
+      const inputs = field('with') ? entriesOf(lines, directChildren(lines, field('with').index)) : [];
+      for (const input of inputs) {
+        if (!spec.keys.includes(input.key)) flag(input.line, `${action} input ${input.key} is not allowed`);
+      }
+      for (const [key, fixed] of Object.entries(spec.fixed)) {
+        const input = inputs.find((entry) => entry.key === key);
+        if (!input || scalarOf(lines, input) !== fixed) flag(input?.line ?? step[0].line, `${action} must set ${key}: ${fixed}`);
+      }
+    }
+  }
+  for (const subcommand of Object.keys(GATE_RUN)) {
+    if (!ran.has(subcommand)) flag(jobs?.line, `the gate must run ${GATE_RUN[subcommand].run}`);
+  }
+  const positions = MERGE_GROUP_ORDER.map((name) => order.indexOf(name));
+  if (positions.some((at, i) => at < 0 || (i > 0 && at < positions[i - 1]))) {
+    flag(jobs?.line, `the merge_group steps must run in order: ${MERGE_GROUP_ORDER.join(', ')}`);
+  }
+
+  for (const [index, line] of lines.entries()) {
+    const key = line.isBlockScalarContent ? null : stepEntry(lines, index)?.key;
+    if (GATE_FORBIDDEN_KEYS.has(key) && !exempt.has(index)) flag(line, `${key} is not allowed`);
+    if (index !== varsAt && containsVarsReference(line.content)) {
+      flag(line, `vars are allowed only as ${THIN_QUEUE_ENV[0]}: ${THIN_QUEUE_ENV[1]} in the select step`);
+    }
+  }
+  for (const line of secretReferenceLines(lines)) {
+    flag(line, 'secrets are not allowed');
+  }
   return violations;
 }
 
@@ -1406,6 +1755,8 @@ export function inspectWorkflowText(file, text) {
 
   violations.push(...developerSigningViolations(file, lines));
   violations.push(...publicReleaseSigningViolations(file, lines));
+  violations.push(...signingEnvironmentViolations(file, lines));
+  violations.push(...pinnedGateViolations(file, lines));
 
   return violations.sort(compareViolations);
 }

@@ -28,6 +28,8 @@ vi.mock('../../stores/orgStore', () => ({
     selector ? selector(orgState.current) : orgState.current,
 }));
 
+const flowsGate = vi.hoisted(() => ({ value: { enabled: false, loaded: true } }));
+vi.mock('../../stores/featuresStore', () => ({ useFlowsGate: () => flowsGate.value }));
 import AutomationEditPage from './AutomationEditPage';
 import { fetchWithAuth } from '../../stores/auth';
 
@@ -65,6 +67,16 @@ beforeEach(() => {
     organizationsLoaded: true,
     organizations: [{ id: 'org-1', name: 'Acme' }],
   };
+});
+
+describe('AutomationEditPage back link (#7158 a11y)', () => {
+  it('gives the icon-only back-to-automations link an accessible name', async () => {
+    mockEndpoints({ ...baseAutomation, managedByAgentId: null, actions: [] });
+
+    render(<AutomationEditPage automationId="automation-1" />);
+
+    expect(await screen.findByRole('link', { name: 'Back to Jobs' })).toHaveAttribute('href', '/jobs');
+  });
 });
 
 describe('AutomationEditPage managed automations', () => {
@@ -241,5 +253,55 @@ describe('AutomationEditPage — run_script run context (#4888)', () => {
 
     expect((screen.getByTestId('action-0-when-offline-select') as HTMLSelectElement).value).toBe('skip');
     expect((putBody().actions as Array<Record<string, unknown>>)[0]).toMatchObject({ whenOffline: 'skip' });
+  });
+});
+
+describe('AutomationEditPage — alert workflow filter round-trip (#6367 W05c2)', () => {
+  it('preserves the loaded filter on an unrelated edit', async () => {
+    const filter = { ruleId: 'r1', severity: ['critical'], kind: ['cpu'] };
+    mockEndpoints({
+      ...baseAutomation,
+      trigger: { ...baseAutomation.trigger, filter },
+      actions: [{ type: 'execute_command', command: 'echo test' }],
+    });
+
+    render(<AutomationEditPage automationId="automation-1" />);
+
+    fireEvent.click(await screen.findByRole('button', { name: /Save Changes/i }));
+
+    await waitFor(() => expect(fetchMock.mock.calls.some(([, init]) => (init as RequestInit | undefined)?.method === 'PUT')).toBe(true));
+
+    const call = fetchMock.mock.calls.find(([, init]) => (init as RequestInit | undefined)?.method === 'PUT')!;
+    expect(JSON.parse(String((call[1] as RequestInit).body)).trigger.filter).toEqual(filter);
+  });
+});
+
+describe('AutomationEditPage — Jobs moving to Flows (#5221 W06)', () => {
+  beforeEach(() => {
+    fetchMock.mockReset();
+    flowsGate.value = { enabled: false, loaded: true };
+  });
+
+  it('switched row is read-only with a flow link', async () => {
+    mockEndpoints({ ...baseAutomation, conversion: { id: 'c-1', state: 'switched', flowId: 'f-1' } });
+    render(<AutomationEditPage automationId="automation-1" />);
+    const link = await screen.findByTestId('automation-moved-flow-link');
+    expect(link.getAttribute('href')).toBe('/flows/f-1');
+    expect(screen.queryByRole('button', { name: /save/i })).toBeNull();
+  });
+
+  it('a shadow conversion keeps the editor (editing resets the shadow server-side)', async () => {
+    mockEndpoints({ ...baseAutomation, conversion: { id: 'c-1', state: 'shadow', flowId: 'f-1' } });
+    render(<AutomationEditPage automationId="automation-1" />);
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/automations/automation-1'));
+    expect(screen.queryByTestId('automation-moved-notice')).toBeNull();
+  });
+
+  it('with Flows on, /jobs/new points to Flows instead of the form', async () => {
+    flowsGate.value = { enabled: true, loaded: true };
+    fetchMock.mockImplementation(() => Promise.resolve(json({ data: [] })));
+    render(<AutomationEditPage isNew />);
+    const notice = await screen.findByTestId('automation-new-opens-flows');
+    expect(notice.querySelector('a')?.getAttribute('href')).toBe('/flows');
   });
 });

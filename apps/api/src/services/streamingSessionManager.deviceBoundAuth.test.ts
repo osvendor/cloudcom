@@ -24,6 +24,14 @@ const { queryMock, capturedMcpArgs, capturedTenantSdkToolArgs } = vi.hoisted(() 
 
 vi.mock('@anthropic-ai/claude-agent-sdk', () => ({ query: queryMock }));
 
+// Wisp W04 Task 4: getOrCreate resolves the session's delegation grant itself
+// (lookupWispGrant); every session in this suite is an ordinary one.
+vi.mock('./wisp/chatCeiling', () => ({
+  lookupWispGrant: vi.fn(async () => null),
+  unreachableWispAuth: (auth: unknown) => auth,
+  WispSessionUnavailableError: class WispSessionUnavailableError extends Error {},
+}));
+
 vi.mock('../db', () => ({
   db: {
     // Only DB read on this path: the aiBudgets approvalMode lookup.
@@ -42,10 +50,21 @@ vi.mock('../db', () => ({
 }));
 
 vi.mock('./aiCostTracker', () => ({
-  recordUsageFromSdkResult: vi.fn(() => Promise.resolve()),
   // Also consumed on the result/done path — see the note in clientLoop.test.ts.
   sumInputTokens: (u: Record<string, number | null | undefined> | null | undefined) =>
     (u?.input_tokens ?? 0) + (u?.cache_read_input_tokens ?? 0) + (u?.cache_creation_input_tokens ?? 0),
+}));
+vi.mock('./aiBudgetReservations', () => ({
+  markAiBudgetReservationIndeterminate: vi.fn(async () => ({ kind: 'indeterminate' })),
+  readSdkUsageSnapshot: vi.fn(async () => null),
+}));
+vi.mock('./aiModels/platformModels', async (orig) => ({
+  ...(await orig<typeof import('./aiModels/platformModels')>()),
+  getPlatformModelByModelId: vi.fn(async () => null),
+}));
+vi.mock('./aiModels/settleInvocation', async (orig) => ({
+  ...(await orig<typeof import('./aiModels/settleInvocation')>()),
+  settleInvocation: vi.fn(async () => ({ costCents: 0, invocationIds: [], deferred: false })),
 }));
 vi.mock('./aiAgent', () => ({ sanitizeErrorForClient: (e: unknown) => String(e) }));
 vi.mock('./sentry', () => ({ captureException: vi.fn() }));
@@ -73,7 +92,11 @@ vi.mock('./toolSources/sdkBridge', () => ({
   tenantMcpToolNames: vi.fn(() => []),
 }));
 
+// Keeps the lazy real ./flows/flowTools graph (~5 s cold) out of whichever test reaches it first (#11011).
+vi.mock('./flows/flowTools', () => ({ resolveFlowTools: async () => [] }));
+
 import { StreamingSessionManager, buildDeviceBoundSessionAuth } from './streamingSessionManager';
+import { makeResolvedModel } from './aiModels/__fixtures__/resolvedModel';
 import { buildOrgAccessClosures, dbAccessContextFromAuth } from '../middleware/auth';
 import type { AuthContext } from '../middleware/auth';
 import { devices } from '../db/schema';
@@ -104,17 +127,12 @@ function makePartnerAuth(): AuthContext {
 const DB_SESSION = {
   orgId: DEVICE_ORG,
   sdkSessionId: null,
-  model: 'claude-sonnet-4-5-20250929',
   maxTurns: 50,
   turnCount: 0,
   systemPrompt: null,
 };
 
-const PLATFORM_CONFIG = {
-  source: 'platform' as const,
-  apiKey: 'platform-key',
-  model: 'claude-sonnet-4-6',
-};
+const PLATFORM_CONFIG = makeResolvedModel('platform');
 
 describe('buildDeviceBoundSessionAuth', () => {
   it('narrows a partner-scope login to the device org (sibling org under the same partner)', () => {
@@ -404,5 +422,117 @@ describe('getOrCreate — device-bound sessions narrow the tool-facing auth', ()
       scope: auth.scope,
       partnerId: auth.partnerId,
     });
+  });
+});
+
+describe('getOrCreate — device-page write default org (#6675)', () => {
+  let manager: StreamingSessionManager;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    capturedMcpArgs.length = 0;
+    capturedTenantSdkToolArgs.length = 0;
+    queryMock.mockImplementation(() => ({
+      async *[Symbol.asyncIterator]() {
+        await new Promise(() => undefined);
+      },
+      interrupt: vi.fn(),
+      close: vi.fn(),
+    }));
+    manager = new StreamingSessionManager();
+  });
+
+  afterEach(() => {
+    manager.shutdown();
+  });
+
+  it('keeps full read scope and carries the page org as the write default', async () => {
+    const session = await manager.getOrCreate(
+      'sess-page',
+      { ...DB_SESSION, deviceId: null, writeDefaultOrgId: DEVICE_ORG },
+      makePartnerAuth(),
+      undefined,
+      'PROMPT',
+      undefined,
+      PLATFORM_CONFIG,
+    );
+
+    const toolAuth = capturedMcpArgs[0]!.getAuth() as AuthContext;
+    // Reads: not narrowed.
+    expect(toolAuth.accessibleOrgIds).toEqual([LOGIN_ORG, DEVICE_ORG]);
+    expect(toolAuth.orgId).toBeNull();
+    expect(toolAuth.allowedDeviceIds).toBeUndefined();
+    // Writes: default to the page org.
+    expect(toolAuth.aiWriteDefaultOrgId).toBe(DEVICE_ORG);
+    // RBAC / audit auth never carries it.
+    expect(session.auth.aiWriteDefaultOrgId).toBeUndefined();
+  });
+
+  it('re-applies the default on the per-request auth refresh', async () => {
+    await manager.getOrCreate(
+      'sess-page-refresh',
+      { ...DB_SESSION, deviceId: null, writeDefaultOrgId: DEVICE_ORG },
+      makePartnerAuth(),
+      undefined,
+      'PROMPT',
+      undefined,
+      PLATFORM_CONFIG,
+    );
+    // Follow-up message: the row's org moved, so the fresh value must win
+    // over anything captured at creation.
+    const session = await manager.getOrCreate(
+      'sess-page-refresh',
+      { ...DB_SESSION, orgId: LOGIN_ORG, deviceId: null, writeDefaultOrgId: LOGIN_ORG },
+      makePartnerAuth(),
+      undefined,
+      'PROMPT',
+      undefined,
+      PLATFORM_CONFIG,
+    );
+
+    expect(session.toolAuth.aiWriteDefaultOrgId).toBe(LOGIN_ORG);
+    expect((capturedMcpArgs[0]!.getAuth() as AuthContext).aiWriteDefaultOrgId).toBe(LOGIN_ORG);
+
+    // And a follow-up with no anchor drops it rather than keeping a stale one.
+    const cleared = await manager.getOrCreate(
+      'sess-page-refresh',
+      { ...DB_SESSION, deviceId: null },
+      makePartnerAuth(),
+      undefined,
+      'PROMPT',
+      undefined,
+      PLATFORM_CONFIG,
+    );
+    expect(cleared.toolAuth.aiWriteDefaultOrgId).toBeUndefined();
+  });
+
+  it('sets no default for a session without a page anchor', async () => {
+    const session = await manager.getOrCreate(
+      'sess-no-anchor',
+      { ...DB_SESSION, deviceId: null },
+      makePartnerAuth(),
+      undefined,
+      'PROMPT',
+      undefined,
+      PLATFORM_CONFIG,
+    );
+
+    expect(session.toolAuth.aiWriteDefaultOrgId).toBeUndefined();
+    expect(session.toolAuth).toBe(session.auth);
+  });
+
+  it('ignores a write default on a device-bound session (already org-pinned)', async () => {
+    const session = await manager.getOrCreate(
+      'sess-bound-with-default',
+      { ...DB_SESSION, deviceId: DEVICE_ID, writeDefaultOrgId: LOGIN_ORG },
+      makePartnerAuth(),
+      undefined,
+      'PROMPT',
+      undefined,
+      PLATFORM_CONFIG,
+    );
+
+    expect(session.toolAuth.aiWriteDefaultOrgId).toBeUndefined();
+    expect(session.toolAuth.orgId).toBe(DEVICE_ORG);
   });
 });

@@ -7,21 +7,113 @@
  * - capture_agent_pprof (Tier 2): On-demand Go runtime profiles from the agent
  */
 
+import { keysetEnvelope, keysetParamSchema, keysetWhereCondition, readKeysetArgs } from './aiToolPagination';
 import { db } from '../db';
 import { agentLogs, devices } from '../db/schema';
-import { and, eq, gte, lte, ilike, inArray, desc, type SQL } from 'drizzle-orm';
+import { and, eq, gte, lte, ilike, notIlike, inArray, desc, sql, type SQL } from 'drizzle-orm';
 import { escapeLike } from '../utils/sql';
 import type { AuthContext } from '../middleware/auth';
 import type { AiTool } from './aiTools';
 import { redactAgentLogRow } from './logRedaction';
-import { deviceScopeCondition, deviceSiteDenied, resolveSiteAllowedDeviceIds } from './aiToolsSiteScope';
+import { deviceScopeCondition, deviceSiteDenied, orgIdIn, resolveSiteAllowedDeviceIds } from './aiToolsSiteScope';
 import { sanitizeThrownToolError } from './aiToolErrors';
-import { aiExecuteCommand, aiQueueCommandForExecution } from './aiDispatch';
+import { resolveReadableToolOrgScope } from './aiToolWriteOrg';
+import { aiExecuteCommand } from './aiDispatch';
+import type { CommandResult } from './commandQueue';
 
 type AiToolTier = 1 | 2 | 3 | 4;
 
-function getOrgId(auth: AuthContext): string | null {
-  return auth.orgId ?? auth.accessibleOrgIds?.[0] ?? null;
+const NO_ORG_CONTEXT_ERROR = 'No organization context available';
+
+/**
+ * True when the caller's reach is a non-empty org list. An unrestricted
+ * (system, `null`) reach is refused: a device-by-id command against any
+ * tenant on the platform is never a default. (Under the old
+ * `auth.orgId ?? accessibleOrgIds[0]` a system caller was refused too, unless
+ * its token carried an `orgId`.)
+ */
+function hasOrgReach(auth: AuthContext): boolean {
+  return Array.isArray(auth.accessibleOrgIds) && auth.accessibleOrgIds.length > 0;
+}
+
+/**
+ * The device a device-keyed command targets, looked up under the caller's
+ * whole org reach (`auth.orgCondition`) plus the site axis. It used to be
+ * pinned to `auth.orgId ?? accessibleOrgIds[0]`, which for a partner login is
+ * whichever customer org sorts first, so a device in any other org was
+ * "not found" (#10396). Bounded by the caller's reach, so this never widens it.
+ */
+async function findReachableDevice(auth: AuthContext, deviceId: string): Promise<{ id: string } | null> {
+  const [device] = await db
+    .select({ id: devices.id, siteId: devices.siteId })
+    .from(devices)
+    .where(and(eq(devices.id, deviceId), auth.orgCondition(devices.orgId)))
+    .limit(1);
+  if (!device) return null;
+  // Site axis (app-layer only; RLS does NOT enforce it).
+  if (deviceSiteDenied(auth, device.siteId, device.id)) return null;
+  return device;
+}
+
+/**
+ * Turn the agent's `set_log_level` command result into the tool response.
+ * Only a completed command that names the level it applied counts as
+ * success; everything else is an `error` with the command id so the operator
+ * can inspect the stored result.
+ *
+ * Agents built before #7416 report only `newLevel`/`durationMinutes`: their
+ * override lives in the service's memory, is lost on restart and never
+ * reaches the desktop helper, so `persisted` is reported as false for them.
+ */
+export function summarizeSetLogLevelResult(result: CommandResult): Record<string, unknown> {
+  const commandId = result.commandId ?? null;
+  if (result.status === 'timeout') {
+    return {
+      error: 'The agent did not confirm the log level change within 30 seconds. It may still apply when the agent picks the command up; check the command result before relying on it.',
+      commandId,
+    };
+  }
+  if (result.status !== 'completed') {
+    return { error: result.error || 'Setting the log level failed', commandId };
+  }
+
+  let reported: Record<string, unknown>;
+  try {
+    reported = JSON.parse(result.stdout || '{}');
+  } catch {
+    return { error: 'The agent returned an unreadable result for the log level change', commandId };
+  }
+  const appliedLevel = typeof reported.appliedLevel === 'string'
+    ? reported.appliedLevel
+    : typeof reported.newLevel === 'string' ? reported.newLevel : undefined;
+  if (!appliedLevel) {
+    return { error: 'The agent completed the command but did not report the level it applied', commandId };
+  }
+
+  const persisted = reported.persisted === true;
+  const response: Record<string, unknown> = {
+    commandId,
+    status: 'applied',
+    appliedLevel,
+    durationMinutes: reported.durationMinutes,
+    persisted,
+  };
+  if (typeof reported.baseLevel === 'string') response.baseLevel = reported.baseLevel;
+  if (typeof reported.expiresAt === 'string') response.expiresAt = reported.expiresAt;
+
+  if (persisted) {
+    // persisted means the service wrote the file; helpers apply it on their
+    // next poll, and nothing reports back from them.
+    response.note = 'Helper processes (desktop, user and backup helpers) apply the override within 30 seconds; helpers older than this agent version ignore it.';
+  } else {
+    const reason = typeof reported.persistError === 'string'
+      ? ` (${reported.persistError})`
+      : reported.persisted === undefined
+        ? ' (this agent version predates persistent overrides)'
+        : ' (the agent did not report whether the override was saved)';
+    response.warning = `Applied to the running agent service only${reason}: it will be lost if the service restarts and does not reach the desktop helper, so WebRTC/remote-desktop diagnostics stay at their configured level.`;
+  }
+  return response;
 }
 
 export interface AgentLogQueryFilters {
@@ -31,6 +123,11 @@ export interface AgentLogQueryFilters {
   startTime?: string;
   endTime?: string;
   message?: string;
+  /**
+   * Full-control W13 (#6783): `watchdog` keeps only the breeze-watchdog's rows (component `watchdog.*`, the filter
+   * GET /devices/:id/watchdog-logs applies); `agent` excludes them. Absent = both, the behaviour before W13.
+   */
+  source?: 'agent' | 'watchdog';
 }
 
 /**
@@ -41,13 +138,16 @@ export interface AgentLogQueryFilters {
  *
  * Returns `null` when a site-restricted caller has zero in-scope devices —
  * distinct from `[]` (an unrestricted caller with no filters).
+ *
+ * `orgId` is one org, or the caller's whole reach from
+ * `resolveReadableToolOrgScope` (#10396) — never an arbitrary pick from it.
  */
 export async function buildAgentLogConditions(
-  orgId: string,
+  orgId: string | readonly string[],
   auth: AuthContext,
   filters: AgentLogQueryFilters,
 ): Promise<SQL[] | null> {
-  const conditions: SQL[] = [eq(agentLogs.orgId, orgId)];
+  const conditions: SQL[] = [orgIdIn(agentLogs.orgId, orgId)];
 
   if (filters.deviceIds && filters.deviceIds.length > 0) {
     conditions.push(inArray(agentLogs.deviceId, filters.deviceIds));
@@ -70,6 +170,8 @@ export async function buildAgentLogConditions(
   if (filters.startTime) conditions.push(gte(agentLogs.timestamp, new Date(filters.startTime)));
   if (filters.endTime) conditions.push(lte(agentLogs.timestamp, new Date(filters.endTime)));
   if (filters.message) conditions.push(ilike(agentLogs.message, `%${escapeLike(filters.message)}%`));
+  if (filters.source === 'watchdog') conditions.push(ilike(agentLogs.component, 'watchdog.%'));
+  if (filters.source === 'agent') conditions.push(notIlike(agentLogs.component, 'watchdog.%'));
 
   return conditions;
 }
@@ -95,6 +197,10 @@ export function registerAgentLogTools(aiTools: Map<string, AiTool>): void {
       input_schema: {
         type: 'object' as const,
         properties: {
+          orgId: {
+            type: 'string',
+            description: 'Organization UUID to search. Omit to search every organization you can access.',
+          },
           deviceIds: {
             type: 'array',
             items: { type: 'string' },
@@ -121,9 +227,15 @@ export function registerAgentLogTools(aiTools: Map<string, AiTool>): void {
             type: 'string',
             description: 'Text search within log messages (case-insensitive partial match)',
           },
-          limit: {
-            type: 'number',
-            description: 'Maximum results to return (default: 100, max: 500)',
+          source: {
+            type: 'string',
+            enum: ['agent', 'watchdog'],
+            description: 'watchdog = only the breeze-watchdog health journal; agent = exclude it (default both)',
+          },
+          ...keysetParamSchema(18, 500),
+          includeFields: {
+            type: 'boolean',
+            description: 'Include the structured fields object per log line (default false)',
           },
         },
         required: [],
@@ -131,53 +243,99 @@ export function registerAgentLogTools(aiTools: Map<string, AiTool>): void {
     },
     handler: async (input: Record<string, unknown>, auth: AuthContext) => {
       try {
-        const orgId = getOrgId(auth);
-        if (!orgId) {
-          return JSON.stringify({ error: 'No organization context available' });
-        }
+        const page = readKeysetArgs('search_agent_logs', input, { defaultLimit: 18, maxLimit: 500 });
+        if (!page.ok) return JSON.stringify({ error: page.error, code: page.code });
+        const { limit, after, fingerprint } = page;
+        const includeFields = input.includeFields === true;
 
-        const conditions = await buildAgentLogConditions(orgId, auth, {
+        // #10396: never `accessibleOrgIds[0]`. No orgId = every org the caller
+        // reaches; an explicit one is access-checked.
+        const orgScope = resolveReadableToolOrgScope(
+          auth,
+          typeof input.orgId === 'string' && input.orgId ? input.orgId : undefined,
+        );
+        if (!orgScope.ok) {
+          return JSON.stringify({ error: orgScope.error });
+        }
+        const scope = orgScope.allAccessibleOrgs
+          ? { allAccessibleOrgs: true, orgCount: orgScope.orgIds.length }
+          : { orgId: orgScope.orgIds[0] };
+
+        const conditions = await buildAgentLogConditions(orgScope.orgIds, auth, {
           deviceIds: Array.isArray(input.deviceIds) ? input.deviceIds as string[] : undefined,
           level: typeof input.level === 'string' ? input.level : undefined,
           component: typeof input.component === 'string' ? input.component : undefined,
           startTime: typeof input.startTime === 'string' ? input.startTime : undefined,
           endTime: typeof input.endTime === 'string' ? input.endTime : undefined,
           message: typeof input.message === 'string' ? input.message : undefined,
+          source: input.source === 'watchdog' || input.source === 'agent' ? input.source : undefined,
         });
         if (conditions === null) {
-          return JSON.stringify({ logs: [], count: 0 });
+          return JSON.stringify({
+            ...keysetEnvelope<{ createdAtText: string; id: string }>({
+              key: 'logs', items: [], limit, fingerprint, after,
+              keyOf: (r) => ({ t: r.createdAtText, i: r.id }),
+            }),
+            count: 0,
+            scope,
+          });
         }
 
-        const maxLimit = Math.min(Number(input.limit) || 100, 500);
+        if (after) {
+          conditions.push(keysetWhereCondition(agentLogs.createdAt, agentLogs.id, after)!);
+        }
 
         const results = await db
-          .select()
+          .select({
+            id: agentLogs.id,
+            deviceId: agentLogs.deviceId,
+            timestamp: agentLogs.timestamp,
+            createdAt: agentLogs.createdAt,
+            // Q1: full microsecond-precision text for the keyset cursor —
+            // NEVER derive it from the Date-typed `createdAt` above.
+            createdAtText: sql<string>`${agentLogs.createdAt}::text`,
+            level: agentLogs.level,
+            component: agentLogs.component,
+            message: agentLogs.message,
+            fields: agentLogs.fields,
+            agentVersion: agentLogs.agentVersion,
+          })
           .from(agentLogs)
           .where(and(...conditions))
-          // Receipt time dominates. Ingest writes up to 100 rows in one INSERT,
-          // so a whole batch shares created_at to the microsecond and the random
-          // uuid id would shuffle it; agent event time only breaks ties WITHIN a
-          // single receipt instant, which cannot reorder rows across receipts.
-          .orderBy(desc(agentLogs.createdAt), desc(agentLogs.timestamp), desc(agentLogs.id))
-          .limit(maxLimit);
+          // Receipt time is total-ordered with `id` as the tiebreak — matches
+          // the keyset predicate's `(created_at, id)` comparison exactly.
+          .orderBy(desc(agentLogs.createdAt), desc(agentLogs.id))
+          .limit(limit + 1);
 
-        return JSON.stringify({
-          logs: results.map((r) => {
-            const redacted = redactAgentLogRow(r);
-            return {
-              id: r.id,
-              deviceId: r.deviceId,
-              timestamp: r.timestamp.toISOString(),
-              receivedAt: r.createdAt.toISOString(),
-              level: r.level,
-              component: r.component,
-              message: redacted.message,
-              fields: redacted.fields,
-              agentVersion: r.agentVersion,
-            };
-          }),
-          count: results.length,
+        const items = results.map((r) => {
+          const redacted = redactAgentLogRow(r);
+          const rawMessage = typeof redacted.message === 'string' ? redacted.message : '';
+          const truncated = rawMessage.length > 1000;
+          return {
+            id: r.id,
+            deviceId: r.deviceId,
+            timestamp: r.timestamp instanceof Date ? r.timestamp.toISOString() : r.timestamp,
+            receivedAt: r.createdAt instanceof Date ? r.createdAt.toISOString() : r.createdAt,
+            createdAtText: r.createdAtText,
+            level: r.level,
+            component: r.component,
+            message: truncated ? rawMessage.slice(0, 1000) : redacted.message,
+            messageTruncated: truncated,
+            ...(includeFields ? { fields: redacted.fields } : {}),
+            agentVersion: r.agentVersion,
+          };
         });
+
+        const envelope = keysetEnvelope({
+          key: 'logs', items, limit, fingerprint, after,
+          keyOf: (r) => ({ t: r.createdAtText, i: r.id }),
+        });
+        const outLogs = (envelope.logs as Array<Record<string, unknown>>).map(
+          ({ createdAtText: _createdAtText, ...rest }) => rest
+        );
+        // `count` mirrors legacy semantics: the number of rows on THIS page
+        // (never a real total — no COUNT query has ever backed this field).
+        return JSON.stringify({ ...envelope, logs: outLogs, count: outLogs.length, scope });
       } catch (err) {
         const message = sanitizeThrownToolError('agent-logs', err);
         console.error('[ai:search_agent_logs]', message, err);
@@ -213,7 +371,7 @@ export function registerAgentLogTools(aiTools: Map<string, AiTool>): void {
           },
           durationMinutes: {
             type: 'number',
-            description: 'Auto-revert after this many minutes (default: 60)',
+            description: 'Auto-revert after this many minutes (default: 60, max: 1440)',
           },
         },
         required: ['deviceId', 'level'],
@@ -221,9 +379,8 @@ export function registerAgentLogTools(aiTools: Map<string, AiTool>): void {
     },
     handler: async (input: Record<string, unknown>, auth: AuthContext) => {
       try {
-        const orgId = getOrgId(auth);
-        if (!orgId) {
-          return JSON.stringify({ error: 'No organization context available' });
+        if (!hasOrgReach(auth)) {
+          return JSON.stringify({ error: NO_ORG_CONTEXT_ERROR });
         }
 
         const deviceId = input.deviceId as string;
@@ -234,37 +391,22 @@ export function registerAgentLogTools(aiTools: Map<string, AiTool>): void {
           return JSON.stringify({ error: 'deviceId and level are required' });
         }
 
-        // Verify device belongs to the caller's organization
-        const [device] = await db
-          .select({ id: devices.id, siteId: devices.siteId })
-          .from(devices)
-          .where(and(eq(devices.id, deviceId), eq(devices.orgId, orgId)))
-          .limit(1);
-
-        if (!device) {
-          return JSON.stringify({ error: 'Device not found or access denied' });
-        }
-        // Site axis (app-layer only; RLS does NOT enforce it).
-        if (deviceSiteDenied(auth, device.siteId, device.id)) {
+        if (!(await findReachableDevice(auth, deviceId))) {
           return JSON.stringify({ error: 'Device not found or access denied' });
         }
 
-        const result = await aiQueueCommandForExecution(auth, 'set_agent_log_level', deviceId, 'set_log_level', {
+        // Wait for the agent's result instead of returning "queued": a
+        // command that never ran used to look exactly like one that
+        // succeeded (#7416).
+        const result = await aiExecuteCommand(auth, 'set_agent_log_level', deviceId, 'set_log_level', {
           level,
           durationMinutes,
         }, {
           userId: auth.user.id,
+          timeoutMs: 30000,
         });
 
-        if (result.error) {
-          return JSON.stringify({ error: result.error });
-        }
-
-        return JSON.stringify({
-          commandId: result.command?.id ?? null,
-          status: 'queued',
-          message: `Log level will be set to ${level} for ${durationMinutes} minutes`,
-        });
+        return JSON.stringify(summarizeSetLogLevelResult(result));
       } catch (err) {
         const message = sanitizeThrownToolError('agent-logs', err);
         console.error('[ai:set_agent_log_level]', message, err);
@@ -304,9 +446,8 @@ export function registerAgentLogTools(aiTools: Map<string, AiTool>): void {
     },
     handler: async (input: Record<string, unknown>, auth: AuthContext) => {
       try {
-        const orgId = getOrgId(auth);
-        if (!orgId) {
-          return JSON.stringify({ error: 'No organization context available' });
+        if (!hasOrgReach(auth)) {
+          return JSON.stringify({ error: NO_ORG_CONTEXT_ERROR });
         }
 
         const deviceId = input.deviceId as string;
@@ -321,18 +462,7 @@ export function registerAgentLogTools(aiTools: Map<string, AiTool>): void {
           });
         }
 
-        // Verify device belongs to the caller's organization
-        const [device] = await db
-          .select({ id: devices.id, siteId: devices.siteId })
-          .from(devices)
-          .where(and(eq(devices.id, deviceId), eq(devices.orgId, orgId)))
-          .limit(1);
-
-        if (!device) {
-          return JSON.stringify({ error: 'Device not found or access denied' });
-        }
-        // Site axis (app-layer only; RLS does NOT enforce it).
-        if (deviceSiteDenied(auth, device.siteId, device.id)) {
+        if (!(await findReachableDevice(auth, deviceId))) {
           return JSON.stringify({ error: 'Device not found or access denied' });
         }
 

@@ -1,16 +1,95 @@
 import { defineConfig } from 'vitest/config';
+import { BaseSequencer, type TestSpecification } from 'vitest/node';
 import { config } from 'dotenv';
+import { readFileSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
+import { SUITE_MAP_PATH, TIMINGS_PATH, timingShard } from '../../.github/scripts/shard-partition.mjs';
 
 // Load test environment variables
 config({ path: '../../.env.test', quiet: true });
 
+const REPO_ROOT = path.resolve(import.meta.dirname, '../..');
+
+// W07a (#10751): `--shard=i/n` packs files by recorded seconds (the committed
+// table at .github/ci-timings/integration.json, rebuilt by
+// `.github/scripts/test-timings.mjs refresh`) instead of vitest's equal file
+// counts. Every shard computes the same whole plan and keeps its slice; the
+// plan's digest is logged and, in CI, written to shard-plan-<i>.json. A missing
+// or invalid table falls back to vitest's own sharding with a warning; a file in
+// no shard or in two throws before any test runs. Order within a shard is
+// still BaseSequencer.sort.
+//
+// W07b2 (#10751): CI's integration-test job sets BREEZE_INTEGRATION_SUITES (the
+// PR's named-suite selection, from the changes job) and
+// BREEZE_INTEGRATION_SUITES_MODE. Every shard logs what that selection would
+// run; it runs every file until ENFORCE_PR_SUITES in
+// .github/scripts/integration-suites.mjs is flipped (shadow).
+const readError = (error: unknown) => (error as NodeJS.ErrnoException).code ?? String(error);
+
+class TimingSequencer extends BaseSequencer {
+  override async shard(files: TestSpecification[]): Promise<TestSpecification[]> {
+    const shard = this.ctx.config.shard;
+    if (!shard) return super.shard(files);
+    let timingsText: string | null = null;
+    let timingsError: string | undefined;
+    try {
+      timingsText = readFileSync(path.join(REPO_ROOT, TIMINGS_PATH), 'utf8');
+    } catch (error) {
+      // Absent or unreadable: timingShard warns with this reason and falls back.
+      timingsError = readError(error);
+    }
+    // In GitHub Actions the env is always set (by integration-test), so unset
+    // there is broken wiring: the selection then warns and selects all. A local
+    // run without it has no selection at all.
+    const suites = process.env.BREEZE_INTEGRATION_SUITES;
+    let selection: { suites?: string; mode?: string; mapText: string | null; mapError?: string } | undefined;
+    if (suites !== undefined || process.env.GITHUB_ACTIONS === 'true') {
+      selection = { suites, mode: process.env.BREEZE_INTEGRATION_SUITES_MODE, mapText: null };
+      try {
+        selection.mapText = readFileSync(path.join(REPO_ROOT, SUITE_MAP_PATH), 'utf8');
+      } catch (error) {
+        // Unreadable: the selection warns with this reason and selects every suite.
+        selection.mapError = readError(error);
+      }
+    }
+    return timingShard(files, {
+      index: shard.index,
+      count: shard.count,
+      repoRoot: REPO_ROOT,
+      timingsText,
+      timingsError,
+      selection,
+      fallback: (specs) => super.shard(specs),
+      writePlan: process.env.CI
+        ? (plan: { index: number }) => writeFileSync(
+          path.join(this.ctx.config.root, `shard-plan-${plan.index}.json`),
+          `${JSON.stringify(plan, null, 2)}\n`,
+        )
+        : undefined,
+    });
+  }
+}
+
 export default defineConfig({
+  resolve: {
+    alias: {
+      '@breeze/shared': path.resolve(import.meta.dirname, '../../packages/shared/src'),
+    },
+  },
   test: {
     // explicit: vitest 5 flips the default to true; flip per package in a follow-up
     clearMocks: false,
     globals: true,
     environment: 'node',
     include: [
+      'src/services/accounting/accountingFeePush.integration.test.ts',
+      'src/index.autopay.integration.test.ts',
+      'src/db/schema/autopaySetupAttempts.integration.test.ts',
+      'src/services/autopay/enrollmentService.integration.test.ts',
+      'src/services/autopay/cardExpiryCheck.integration.test.ts',
+      // Charging locks/replay require real PostgreSQL (never the unit DB mocks).
+      'src/services/autopay/charging.integration.test.ts',
+      'src/services/autopay/**/*.integration.test.ts',
       'src/jobs/scriptVerifyReconciliation.integration.test.ts',
       'src/__tests__/integration/**/*.test.ts',
       'src/routes/integrationConnectionScope.integration.test.ts',
@@ -26,9 +105,32 @@ export default defineConfig({
       // Co-located real-DB integration test for the contract renewal sweep
       // service. Follows the same pattern as the inboundEmail test above.
       'src/services/contractRenewal.integration.test.ts',
+      // Hardware & RAID monitoring real-DB migration/RLS proof (W01 #6856).
+      'src/services/hardwareHealth/**/*.integration.test.ts',
+      'src/services/timeSync/**/*.integration.test.ts',
+      'src/services/workloads/**/*.integration.test.ts',
+      // Workload image currency (W05 #8194): the pass under real RLS + the system-only cache.
+      'src/services/imageCurrency/**/*.integration.test.ts',
+      // Hardware & RAID monitoring (W05 BMC in-band): real-DB migration/enum
+      // proof and BMC discovery-worker/topology-publish suites. Import
+      // `__tests__/integration/setup` (real postgres pool + autoMigrate).
+      // Belong to vitest.integration.config.ts (excluded from the unit runner).
+      'src/services/discovery/agentReportedBmcLink.integration.test.ts',
+      'src/jobs/discoveryWorker.bmc.integration.test.ts',
+      // Scheduled discovery dispatch is enqueued only after the job row commits (#7187 hazard).
+      'src/jobs/discoveryWorker.dispatchAfterCommit.integration.test.ts',
+      // Scan auto-link matches on NIC MAC only and repairs IP-only links on re-scan.
+      'src/jobs/discoveryWorker.autoLinkMac.integration.test.ts',
+      'src/services/topology/bmc.integration.test.ts',
       // #5861 Customer Portal Network Visibility: real-Postgres proof of
       // org isolation and partner-wide monitor result scoping.
       'src/services/portal/networkVisibilityReadModel.integration.test.ts',
+      // #7731 portal hardware health: real-Postgres proof of org isolation.
+      'src/services/portal/hardwareHealthReadModel.integration.test.ts',
+      // #7732 portal hardware inventory: real-Postgres proof of org isolation.
+      'src/services/portal/hardwareInventoryReadModel.integration.test.ts',
+      // #7733 portal performance metrics: real-Postgres proof of org isolation.
+      'src/services/portal/performanceReadModel.integration.test.ts',
       // Co-located real-DB integration test for the platform-admin bootstrap
       // (#2655): the mocked unit suite executes no SQL, so it never caught the
       // prod-bundle `= ANY(::text[])` array-literal failure. This drives the
@@ -94,6 +196,9 @@ export default defineConfig({
       // — none of which the mocked unit suites can prove (see the file's own
       // header comment for the per-property rationale).
       'src/routes/agents/enrollmentCollision.integration.test.ts',
+      // #9521: enrollment vs. first-report lock order on the org export lock and
+      // topology_site_state, plus the in-handler deadlock retry (real triggers).
+      'src/routes/agents/enrollmentDeadlock.integration.test.ts',
       // Co-located real-DB integration test for #2725 (installed inventory must
       // not erase pending third-party rows): proves the raw-SQL CASE guard in
       // upsertInstalledPatches against the real device_patch_status enum and
@@ -193,6 +298,9 @@ export default defineConfig({
       // (real Redis; no Postgres fixtures used). Belongs to
       // vitest.integration.config.ts, not the no-Redis unit runner.
       'src/services/mfaStepUpGrant.integration.test.ts',
+      // Real-Redis test of the per-org script-review concurrency slot Lua
+      // scripts (#5637): cap, release, TTL self-heal, idempotent release.
+      'src/services/scriptProposals/reviewConcurrency.integration.test.ts',
       // Co-located real-DB integration test for the nightly enrollment-key
       // purge sweep: the #2775 live-bootstrap-token exemption (proving
       // Postgres itself evaluates the correlated NOT EXISTS subquery per row,
@@ -212,6 +320,16 @@ export default defineConfig({
       'src/routes/installerRotationRevocation.integration.test.ts',
       // One-time legacy token/child cutover and replay proof.
       'src/db/installerBootstrapCredentialGeneration.migration.integration.test.ts',
+      // v0.122.0 EU deploy: the quarantine execution-authority migration on a
+      // table with security links (deferred parity trigger + ALTER TABLE).
+      'src/db/securityQuarantineExecutionAuthorityMigration.integration.test.ts',
+      // Hardware & RAID monitoring (W03): disposable-database replay proof for
+      // the monitor-kind enum and alert subject-identity migrations.
+      'src/db/hardwareAlertMigrations.integration.test.ts',
+      // Hardware & RAID monitoring (W03 Task 10/11): real-Postgres subject
+      // reconciliation, transactional outbox commit boundaries, and the
+      // single-response-owner contract.
+      'src/services/alertSubjects.integration.test.ts',
       // Co-located real-DB end-to-end coverage for the tier3-supervised-four-eyes
       // split (Task 10): four_eyes fan-out ownership (both admins, never the
       // requester), a t+30min approve/release proving the new 60-minute
@@ -253,6 +371,11 @@ export default defineConfig({
       // of the predicate and cannot test this at all.
       'src/routes/enrollmentKeysExpiredFilter.integration.test.ts',
       'src/routes/enrollmentKeysSiteScope.integration.test.ts',
+      // #7217 — failed Add Device attempts leave no live key; failed
+      // short-link downloads give their use back; the list names the site.
+      'src/routes/enrollmentKeysFailureCleanup.integration.test.ts',
+      // #7345 — Add Device reuses one parent key per (org, site, creator).
+      'src/routes/enrollmentKeysAddDeviceParent.integration.test.ts',
       // Co-located real-DB integration test for the fleet posture report
       // (#3244): the mixed never-scanned/stale/clean/detected fixture that
       // guards the two-query split — a mocked unit test cannot catch the
@@ -273,6 +396,13 @@ export default defineConfig({
       // persistence and the draft-preview-doesn't-persist rule.
       'src/services/invoiceService.issue.integration.test.ts',
       'src/services/invoicePdf.integration.test.ts',
+      // #9402 W1b: the customer-document assembler's row filter is SQL, so a
+      // mocked DB proves nothing about hidden lines — this runs it on Postgres
+      // under portal, staff and system contexts.
+      'src/services/customerDocument.integration.test.ts',
+      // #9418 W2a: the quote half — hidden lines and internal header columns
+      // never leave, on Postgres, under the same three contexts.
+      'src/services/customerDocument.quote.integration.test.ts',
       // Wave 3.5c (#4085): real-Postgres + real-Redis/BullMQ coverage for the
       // durable event-dispatch pipeline (enqueueRouteEvent, eventDispatchProcessor,
       // the event_delivery_receipts state machine) — a real Worker draining a
@@ -297,6 +427,15 @@ export default defineConfig({
       // the shared glob above; named here for discoverability only (same
       // pattern staleBackupReaper.integration.test.ts uses).
       'src/__tests__/integration/agentCommandRelay.integration.test.ts',
+      // #4134: per-instance relay shards across two logical API instances —
+      // routing to the socket owner's shard, the second-consumer guard, the
+      // shutdown drain and the dead-shard sweep. Named for discoverability only.
+      'src/__tests__/integration/agentCommandRelayShards.integration.test.ts',
+      // Real-Postgres proof for the discovered-asset site move service: the two
+      // BEFORE UPDATE triggers on discovered_assets (topology binding lifecycle +
+      // monitor-authority detach) and the network_monitors site guard the
+      // re-attach must pass. The mocked unit suite never executes any of them.
+      'src/services/discoveredAssetSiteMove.integration.test.ts',
     ],
     exclude: [
       // Uses fresh request-pool modules and manages its own temporary role;
@@ -350,7 +489,8 @@ export default defineConfig({
     // time (not just the tests within a file) so setup.ts / autoMigrate
     // / seed don't race each other across workers.
     sequence: {
-      concurrent: false
+      concurrent: false,
+      sequencer: TimingSequencer,
     },
     fileParallelism: false,
     // Longer timeouts for database operations
@@ -363,7 +503,8 @@ export default defineConfig({
     coverage: {
       provider: 'v8',
       reporter: ['text', 'json', 'html'],
-      include: ['src/**/*.ts'],
+      include: [
+'src/**/*.ts'],
       exclude: [
         'src/**/*.test.ts',
         'src/__tests__/**',

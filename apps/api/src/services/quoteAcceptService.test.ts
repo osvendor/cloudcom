@@ -1,4 +1,7 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+const { plan } = vi.hoisted(() => ({ plan: vi.fn().mockResolvedValue(null) }));
+vi.mock('./autopay/scheduler', () => ({ planAutopayForInvoice: plan }));
+
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 const { stagePax8OrderFromQuoteMock, createContractMock, createExecutedDocumentsMock, callLog } = vi.hoisted(() => ({
   stagePax8OrderFromQuoteMock: vi.fn(),
@@ -40,7 +43,7 @@ function queueResult(rows: unknown[]) { results.push(rows); }
 vi.mock('../db', () => {
   const makeChain = () => {
     const chain: Record<string, unknown> = {};
-    const methods = ['select', 'from', 'where', 'limit', 'orderBy', 'insert', 'values', 'returning', 'update', 'set', 'delete', 'for', 'innerJoin', 'execute', 'transaction'];
+    const methods = ['select', 'from', 'where', 'limit', 'orderBy', 'insert', 'values', 'returning', 'update', 'set', 'delete', 'for', 'innerJoin', 'leftJoin', 'execute', 'transaction'];
     for (const m of methods) chain[m] = vi.fn(() => chain);
     (chain as { then: unknown }).then = (resolve: (v: unknown) => unknown) => {
       const rows = results.shift() ?? [];
@@ -58,6 +61,8 @@ vi.mock('../db', () => {
 
 import { acceptQuote } from './quoteAcceptService';
 import { db } from '../db';
+import { SQL } from 'drizzle-orm';
+import { PgDialect } from 'drizzle-orm/pg-core';
 import { computeQuoteSha256 } from './quoteContentHash';
 import { buildContractHashParts } from './contractDocumentService';
 import type { ContractBlockRenderData } from './contractTemplateRender';
@@ -66,6 +71,8 @@ type Chain = {
   set: { mock: { calls: unknown[][] } };
   values: { mock: { calls: unknown[][] } };
   insert: { mock: { calls: unknown[][] } };
+  update: { mock: { calls: unknown[][] } };
+  leftJoin: { mock: { calls: unknown[][] } };
 };
 
 const baseParams = {
@@ -140,6 +147,20 @@ describe('acceptQuote deposit snapshot', () => {
     stagePax8OrderFromQuoteMock.mockResolvedValue({ orderId: null, lineCount: 0 });
   });
 
+  it('characterization: a quote group outside the quote org yields 409 before acceptance or contract writes', async () => {
+    queueResult([{ id: 'q1', orgId: 'org1', partnerId: 'p1', status: 'sent', expiryDate: null }]);
+    queueResult([]); // blocks
+    queueResult([{
+      id: 'line-1', contractLineType: 'per_device_group', customerVisible: true,
+      deviceGroupId: '11111111-1111-4111-8111-111111111111', deviceGroupName: 'Foreign group',
+      siteId: null, siteName: null,
+    }]);
+    queueResult([]); // org-scoped group lookup excludes partner/foreign groups
+    await expect(acceptQuote(baseParams)).rejects.toMatchObject({ status: 409, code: 'QUOTE_LINE_REFERENCE_DELETED' });
+    expect((db as unknown as Chain).insert).not.toHaveBeenCalled();
+    expect(createContractMock).not.toHaveBeenCalled();
+  });
+
   it('snapshots quote.depositAmount onto the issued invoice as depositDue when a deposit is configured', async () => {
     queueAcceptHappyPath({ depositType: 'percent', depositPercent: '30.00', depositAmount: '300.00' });
 
@@ -149,6 +170,8 @@ describe('acceptQuote deposit snapshot', () => {
     // calls[0] is the invoices update (issueFields); calls[1] is the quotes
     // status->converted update. See queueAcceptHappyPath's call-order doc above.
     expect(setMock.mock.calls[0]![0]).toMatchObject({ depositDue: '300.00' });
+    expect(plan).toHaveBeenCalledWith(db, 'inv1');
+    expect(plan).toHaveBeenCalledTimes(1);
   });
 
   // #3777 review finding 1: the auto-issued invoice and the acceptance hash
@@ -160,6 +183,49 @@ describe('acceptQuote deposit snapshot', () => {
 
     const setMock = (db as unknown as Chain).set;
     expect(setMock.mock.calls[0]![0]).toMatchObject({ documentLocale: 'de-DE' });
+  });
+
+  // Settings consolidation W06 (#6229): the direct accept issue resolves terms
+  // through the SAME resolver as issueInvoice — org override ?? partner ?? 30.
+  // The org's terms ride on the partner read (left join), so no extra query.
+  describe('auto-issued invoice due date from resolved payment terms', () => {
+    beforeEach(() => { vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(new Date('2026-09-23T12:00:00Z')); });
+    afterEach(() => { vi.useRealTimers(); });
+
+    it('uses the org override over the partner default', async () => {
+      queueAcceptHappyPath({}, {}, { termsDays: 30, orgTermsDays: 10 });
+      await acceptQuote(baseParams);
+      const setMock = (db as unknown as Chain).set;
+      expect(setMock.mock.calls[0]![0]).toMatchObject({ issueDate: '2026-09-23', dueDate: '2026-10-03' });
+    });
+
+    it('an org override of 0 is due on the issue date', async () => {
+      queueAcceptHappyPath({}, {}, { termsDays: 30, orgTermsDays: 0 });
+      await acceptQuote(baseParams);
+      const setMock = (db as unknown as Chain).set;
+      expect(setMock.mock.calls[0]![0]).toMatchObject({ dueDate: '2026-09-23' });
+    });
+
+    it('a blank org override inherits the partner default', async () => {
+      queueAcceptHappyPath({}, {}, { termsDays: 14, orgTermsDays: null });
+      await acceptQuote(baseParams);
+      const setMock = (db as unknown as Chain).set;
+      expect(setMock.mock.calls[0]![0]).toMatchObject({ dueDate: '2026-10-07' });
+    });
+
+    it('joins the quote org onto the partner read (scoped to the same partner)', async () => {
+      queueAcceptHappyPath({}, {}, { termsDays: 30, orgTermsDays: 5 });
+      await acceptQuote(baseParams);
+      const leftJoin = (db as unknown as Chain).leftJoin;
+      expect(leftJoin).toHaveBeenCalledTimes(1);
+      // The ON clause must pin the org to the quote's org AND to the same
+      // partner — dropping the partner predicate is the cross-tenant leak the
+      // join comment rules out, and the positional mock can't see it otherwise.
+      const { sql, params } = new PgDialect().sqlToQuery(leftJoin.mock.calls[0]![1] as SQL);
+      expect(sql).toContain('"organizations"."id" = $');
+      expect(sql).toContain('"organizations"."partner_id" = "partners"."id"');
+      expect(params).toContain('org1');
+    });
   });
 
   it('leaves depositDue unset on the invoice when the quote has no deposit configured', async () => {
@@ -510,13 +576,15 @@ const renderData: ContractBlockRenderData[] = [{
   bodyHtml: '<p>Effective {{dates.effective}}.</p>', fileData: null,
   versionSha256: 'a'.repeat(64), declaredVariables: [], templateName: 'MSA', versionNumber: 1,
 }];
+// The quote_acceptances insert's DB-default signed_at, as `.returning()` yields it.
+const ACC_SIGNED_AT = new Date('2026-07-16T12:34:56Z');
 
 function queueContractAcceptPath(partnerSettings: Record<string, unknown> = {}) {
   queueResult([contractQuote]);              // 1 select quote FOR UPDATE
   queueResult([contractBlock]);              // 2 blocks
   queueResult([monthlyLine]);                // 3 lines
   queueResult([{ prefix: 'INV', termsDays: 30, settings: partnerSettings }]); // 4 partners select
-  queueResult([{ id: 'acc1' }]);             // 5 quote_acceptances insert
+  queueResult([{ id: 'acc1', signedAt: ACC_SIGNED_AT }]); // 5 quote_acceptances insert (DB-returned signed_at)
   queueResult([{ id: 'inv1' }]);             // 6 invoices insert
   queueResult([]);                           // 7 invoices update (issueFields)
   queueResult([]);                           // 8 quotes update -> converted
@@ -548,6 +616,7 @@ describe('acceptQuote contract document snapshot', () => {
     // createExecutedDocuments receives the created contract ids (deterministic
     // first-created link) — the transaction-ordering requirement.
     expect(callLog).toEqual(['createContract', 'createExecutedDocuments']);
+    expect(plan).not.toHaveBeenCalled();
     const snapshotArgs = createExecutedDocumentsMock.mock.calls[0]!;
     expect(snapshotArgs[2]).toEqual(['contractA']); // contractIds
     expect(snapshotArgs[3]).toBe(renderData);       // renderData
@@ -566,6 +635,22 @@ describe('acceptQuote contract document snapshot', () => {
     // an unstamped quote falls back to the partner language, 'en' here.
     expect((acceptanceValues as { renderLocale?: string }).renderLocale).toBe('en');
     expect(snapshotArgs[6]).toBe('en'); // createExecutedDocuments renders under the same locale
+    // #8865 W1b: the evidence snapshot (arg index 7) mirrors the acceptance row,
+    // signed_at taken from the DB-returned value, hash = the acceptance hash.
+    expect(snapshotArgs[7]).toMatchObject({
+      signerName: baseParams.signerName,
+      signerEmail: baseParams.signerEmail,
+      signerIp: baseParams.ipAddress,
+      signerUserAgent: baseParams.userAgent,
+      signedAt: ACC_SIGNED_AT,
+      acceptanceOrigin: 'customer',
+      acceptanceMethod: 'typed-signature',
+      acceptanceReference: null,
+      recordedByUserId: null,
+      contentHashVersion: 2,
+      acceptanceRenderLocale: 'en',
+    });
+    expect(snapshotArgs[7].contentSha256).toBe(acceptanceValues.quoteSha256);
     // And that hash genuinely differs from the no-contract hash (proves folding).
     const withoutContracts = computeQuoteSha256(contractQuote as any, [contractBlock] as any, [monthlyLine] as any, []);
     expect(acceptanceValues.quoteSha256).not.toBe(withoutContracts);
@@ -666,5 +751,121 @@ describe('acceptQuote superseded public-link guard', () => {
 
     expect(thrown).toMatchObject({ status: 410, code: 'QUOTE_SUPERSEDED' });
     expect(thrown).not.toMatchObject({ status: 409, code: 'INVALID_STATE' });
+  });
+});
+
+// #9221: the accepted quote's one-time invoice lines carry the quote line's
+// internal unit cost as the invoice line's cost_basis snapshot, so per-client
+// profitability (which folds invoice_lines.cost_basis) has a cost for
+// quote-sourced lines. Forward-only — nothing here touches historical rows.
+describe('acceptQuote quote-line unit cost -> invoice-line cost basis (#9221)', () => {
+  beforeEach(() => {
+    results.length = 0;
+    vi.clearAllMocks();
+    stagePax8OrderFromQuoteMock.mockResolvedValue({ orderId: null, lineCount: 0 });
+  });
+
+  // .values call order (see queueAcceptHappyPath): [0] quote_acceptances,
+  // [1] invoices, [2] invoice_lines.
+  const invoiceLineValues = () =>
+    (db as unknown as Chain).values.mock.calls[2]![0] as Record<string, unknown>;
+  const acceptanceValues = () =>
+    (db as unknown as Chain).values.mock.calls[0]![0] as { quoteSha256: string };
+
+  it('stamps quote_lines.unit_cost onto invoice_lines.cost_basis', async () => {
+    queueAcceptHappyPath({}, { unitCost: '612.40' });
+
+    await acceptQuote(baseParams);
+
+    expect(invoiceLineValues()).toMatchObject({ unitPrice: '1000.00', costBasis: '612.40' });
+  });
+
+  it('keeps an explicit zero cost as a known 0.00, not unknown', async () => {
+    queueAcceptHappyPath({}, { unitCost: '0.00' });
+
+    await acceptQuote(baseParams);
+
+    expect(invoiceLineValues()).toHaveProperty('costBasis', '0.00');
+  });
+
+  it('writes costBasis null when the quote line has no unit cost (unknown, never zero)', async () => {
+    queueAcceptHappyPath({}, { unitCost: null });
+
+    await acceptQuote(baseParams);
+
+    expect(invoiceLineValues()).toHaveProperty('costBasis', null);
+  });
+
+  it('writes costBasis null when the quote line omits unitCost entirely', async () => {
+    const { line } = queueAcceptHappyPath();
+    delete (line as Record<string, unknown>).unitCost;
+
+    await acceptQuote(baseParams);
+
+    expect(invoiceLineValues()).toHaveProperty('costBasis', null);
+  });
+
+  it('drops a cost not representable at the invoice currency minor unit (snapshotCost rule)', async () => {
+    // JPY has no minor unit: a '12.50' cost cannot be stored exactly, so it is a
+    // gap (null) rather than a silently rounded figure.
+    queueAcceptHappyPath({ currencyCode: 'JPY' }, { unitPrice: '1000', unitCost: '12.50' });
+
+    await acceptQuote(baseParams);
+
+    expect(invoiceLineValues()).toHaveProperty('costBasis', null);
+  });
+
+  it('cost basis is NOT an acceptance-hash input: the recorded quoteSha256 is identical with and without a unit cost', async () => {
+    queueAcceptHappyPath({}, { unitCost: null });
+    await acceptQuote(baseParams);
+    const withoutCost = acceptanceValues().quoteSha256;
+
+    results.length = 0;
+    vi.clearAllMocks();
+    stagePax8OrderFromQuoteMock.mockResolvedValue({ orderId: null, lineCount: 0 });
+
+    queueAcceptHappyPath({}, { unitCost: '612.40' });
+    await acceptQuote(baseParams);
+    const withCost = acceptanceValues().quoteSha256;
+
+    expect(withoutCost).toMatch(/^[0-9a-f]{64}$/);
+    expect(withCost).toBe(withoutCost);
+    // ...and the cost did land on the invoice line in the second run.
+    expect(invoiceLineValues()).toHaveProperty('costBasis', '612.40');
+  });
+});
+
+// #9963: a quote with no customer-visible line items (sent before the send gate
+// existed, or one whose only lines are internal) must not convert into a $0
+// draft invoice. The customer path refuses with copy the customer can act on.
+describe('acceptQuote empty-quote gate (#9963)', () => {
+  beforeEach(() => {
+    results.length = 0;
+    vi.clearAllMocks();
+    stagePax8OrderFromQuoteMock.mockResolvedValue({ orderId: null, lineCount: 0 });
+  });
+
+  it('refuses a sent quote with no lines (422 QUOTE_EMPTY) and writes nothing', async () => {
+    queueAcceptHappyPath();
+    // Replace the queued line rows (3rd result) with an empty line set.
+    results[2] = [];
+    const err = await acceptQuote(baseParams).catch((e: unknown) => e);
+    expect(err).toMatchObject({ status: 422, code: 'QUOTE_EMPTY' });
+    expect((err as Error).message).toMatch(/contact/i);
+    expect((db as unknown as Chain).insert.mock.calls.length).toBe(0);
+    expect((db as unknown as Chain).update.mock.calls.length).toBe(0);
+  });
+
+  it('refuses a viewed quote whose only lines are internal-only', async () => {
+    queueAcceptHappyPath({ status: 'viewed' }, { customerVisible: false });
+    await expect(acceptQuote(baseParams)).rejects.toMatchObject({ status: 422, code: 'QUOTE_EMPTY' });
+    expect((db as unknown as Chain).insert.mock.calls.length).toBe(0);
+    expect((db as unknown as Chain).update.mock.calls.length).toBe(0);
+  });
+
+  it('keeps the status guard first: an empty DRAFT on the customer path is 409 INVALID_STATE', async () => {
+    queueAcceptHappyPath({ status: 'draft' });
+    results[2] = [];
+    await expect(acceptQuote(baseParams)).rejects.toMatchObject({ status: 409, code: 'INVALID_STATE' });
   });
 });

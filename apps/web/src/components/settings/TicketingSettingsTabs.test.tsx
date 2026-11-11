@@ -41,11 +41,17 @@ vi.mock('./InboundEmailCard', () => ({
 vi.mock('./M365MailboxCard', () => ({
   default: () => <div data-testid="m365-mailbox-card">MailboxStub</div>
 }));
+vi.mock('./GmailMailboxCard', () => ({
+  default: () => <div data-testid="gmail-mailbox-card">GmailMailboxStub</div>
+}));
 vi.mock('./CannedResponsesCard', () => ({
   default: () => <div data-testid="stub-canned-responses-card">CannedStub</div>
 }));
 vi.mock('./TicketChecklistTemplatesPage', () => ({
   default: () => <div data-testid="stub-ticket-checklist-templates-page">ChecklistTemplatesStub</div>
+}));
+vi.mock('./TicketRoutingTab', () => ({
+  default: () => <div data-testid="stub-ticket-routing-tab">RoutingStub</div>
 }));
 vi.mock('./TicketFormsCard', () => ({
   default: () => <div data-testid="stub-ticket-forms-card">FormsStub</div>
@@ -114,6 +120,21 @@ describe('TicketingSettingsTabs', () => {
     expect(screen.getByTestId('ticketing-tab-panel-templates')).toBeInTheDocument();
     expect(screen.getByTestId('stub-canned-responses-card')).toBeInTheDocument();
     expect(screen.getByTestId('stub-ticket-checklist-templates-page')).toBeInTheDocument();
+  });
+
+  it('renders the Routing tab for partner scope and shows the routing panel', async () => {
+    renderWithPartnerScope();
+    expect(screen.getByTestId('ticketing-tab-routing')).toHaveTextContent('Routing');
+    await userEvent.click(screen.getByTestId('ticketing-tab-routing'));
+    expect(screen.getByTestId('ticketing-tab-panel-routing')).toBeInTheDocument();
+    expect(screen.getByTestId('stub-ticket-routing-tab')).toBeInTheDocument();
+    expect(window.location.hash).toBe('#routing');
+  });
+
+  it('honors a #routing/<ruleId> deep link (head segment picks the tab)', () => {
+    window.location.hash = '#routing/11111111-1111-4111-8111-111111111111';
+    renderWithPartnerScope();
+    expect(screen.getByTestId('stub-ticket-routing-tab')).toBeInTheDocument();
   });
 
   it('has no Export tab (moved out under M5)', () => {
@@ -185,6 +206,15 @@ describe('TicketingSettingsTabs — org scope (dual-ownership Templates tab regr
     await userEvent.click(screen.getByTestId('ticketing-tab-templates'));
     expect(screen.getByTestId('stub-canned-responses-card')).toBeInTheDocument();
     expect(screen.getByTestId('stub-ticket-checklist-templates-page')).toBeInTheDocument();
+  });
+
+  it('shows the Routing tab for an org-scoped user (dual-ownership, gates internally)', async () => {
+    render(<TicketingSettingsTabs />);
+    expect(screen.getByTestId('ticketing-tab-routing')).toBeInTheDocument();
+    await userEvent.click(screen.getByTestId('ticketing-tab-routing'));
+    expect(screen.getByTestId('ticketing-tab-panel-routing')).toBeInTheDocument();
+    expect(screen.getByTestId('stub-ticket-routing-tab')).toBeInTheDocument();
+    expect(screen.queryByTestId('ticketing-tab-panel-pending')).not.toBeInTheDocument();
   });
 
   it('does not widen access: forms/email/timeTracking tabs stay hidden for org scope', () => {

@@ -186,7 +186,7 @@ curl -X PATCH /api/v1/devices/<device-id> \
 
 ### Accepted value types
 
-Each value must first match the Zod wire schema (`string`, `number`, `boolean`, or `null` -- `null` removes the field), then be validated against the **target definition's own declared `type` and `options`**. A value that fails either check is rejected -- not silently stored -- with `400 { error, code: "invalid-custom-field-value", fields: [{ fieldKey, reason }] }`. `reason` is one of:
+Each value must first match the Zod wire schema (`string`, `number`, `boolean`, or `null` -- `null` removes the field), then be validated against the **target definition's own declared `type` and `options`**. A value that fails either check is rejected -- not silently stored -- with `400 { error, code: "INVALID_CUSTOM_FIELD_VALUE", fields: [{ fieldKey, reason }] }`. `reason` is one of:
 
 | Reason | Meaning |
 |---|---|
@@ -285,6 +285,15 @@ A silently-rejected write is exactly the failure this summary exists to prevent 
 </Aside>
 
 To read a custom field value back into a script as an input, bind a script parameter with source **From a device custom field** — see [Parameter sources](/features/scripts/#parameter-sources).
+
+### Filtering and columns on the device list
+
+Since v0.117.0 custom fields are available on the fleet-wide device views, not only on a device's detail page:
+
+- **Advanced filter** -- custom fields appear in the device filter's field picker under their display names, so you can build a condition such as "Asset owner equals Finance" and save it as a saved filter. Before v0.117.0 a custom field could only be filtered by hand-editing the filter.
+- **Device list column** -- each custom field can be added as a column from the device list's column picker. Custom-field columns are off by default.
+
+Custom fields are not yet available as fields in the ad-hoc report builder or the device CSV export.
 
 ---
 

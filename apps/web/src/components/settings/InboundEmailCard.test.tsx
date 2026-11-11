@@ -33,6 +33,8 @@ interface CfgShape {
   autoresponderEnabled: boolean;
   unknownSenderMode: 'quarantine' | 'triage' | 'drop';
   dropUnverifiedSenders: boolean;
+  staffForwardRouting?: boolean;
+  defaultAssigneeUserId?: string | null;
   autoresponseSubject: string | null;
   autoresponseBody: string | null;
   slug: string;
@@ -56,9 +58,14 @@ const CFG: CfgShape = {
   domainConfigured: true,
 };
 
+// GET /orgs/partners/me/default-assignee-candidates: the server already
+// filtered to users the save accepts.
+const CANDIDATES = [{ id: 'u-1', name: 'Tess Tech', email: 'tess@msp.example' }];
+
 function routeFetch(cfg: CfgShape = CFG) {
   fetchWithAuth.mockImplementation((url: string) => {
     if (url === '/ticket-config') return Promise.resolve(jsonRes({ data: { inbound: cfg } }));
+    if (url === '/orgs/partners/me/default-assignee-candidates') return Promise.resolve(jsonRes({ data: CANDIDATES }));
     if (url === '/orgs/organizations?page=1&limit=100')
       return Promise.resolve(jsonRes({ data: [{ id: 'o-1', name: 'Acme Org' }] }));
     if (url === '/orgs/partners/me') return Promise.resolve(jsonRes({ id: 'p-1' }));
@@ -143,6 +150,63 @@ describe('InboundEmailCard', () => {
       expect(fetchWithAuth).toHaveBeenCalledWith('/orgs/partners/me', expect.objectContaining({ method: 'PATCH' })),
     );
     expect(lastInboundPatch().dropUnverifiedSenders).toBe(true);
+  });
+
+  it('toggling staff-forward routing PATCHes staffForwardRouting=true', async () => {
+    routeFetch();
+    render(<InboundEmailCard />);
+    await screen.findByTestId('inbound-email-card');
+    expect((screen.getByTestId('inbound-staff-forward-toggle') as HTMLInputElement).checked).toBe(false);
+    fireEvent.click(screen.getByTestId('inbound-staff-forward-toggle'));
+    await waitFor(() =>
+      expect(fetchWithAuth).toHaveBeenCalledWith('/orgs/partners/me', expect.objectContaining({ method: 'PATCH' })),
+    );
+    expect(lastInboundPatch().staffForwardRouting).toBe(true);
+  });
+
+  it('preserves staffForwardRouting=true when another inbound setting is saved (wholesale replace)', async () => {
+    routeFetch({ ...CFG, staffForwardRouting: true });
+    render(<InboundEmailCard />);
+    await screen.findByTestId('inbound-email-card');
+    expect((screen.getByTestId('inbound-staff-forward-toggle') as HTMLInputElement).checked).toBe(true);
+    fireEvent.click(screen.getByTestId('inbound-drop-unverified-toggle'));
+    await waitFor(() =>
+      expect(fetchWithAuth).toHaveBeenCalledWith('/orgs/partners/me', expect.objectContaining({ method: 'PATCH' })),
+    );
+    expect(lastInboundPatch().staffForwardRouting).toBe(true);
+  });
+
+  it('no longer renders the default-assignee picker (it moved to the Routing tab)', async () => {
+    routeFetch();
+    render(<InboundEmailCard />);
+    await screen.findByTestId('inbound-email-card');
+    expect(screen.queryByTestId('inbound-default-assignee')).not.toBeInTheDocument();
+    expect(fetchWithAuth.mock.calls.some((c) => c[0] === '/orgs/partners/me/default-assignee-candidates')).toBe(false);
+  });
+
+  it('a card save still PATCHes the existing defaultAssigneeUserId so it is not wiped', async () => {
+    routeFetch({ ...CFG, defaultAssigneeUserId: 'u-2', staffForwardRouting: true });
+    render(<InboundEmailCard />);
+    await screen.findByTestId('inbound-email-card');
+    fireEvent.click(screen.getByTestId('inbound-drop-unverified-toggle'));
+    await waitFor(() =>
+      expect(fetchWithAuth).toHaveBeenCalledWith('/orgs/partners/me', expect.objectContaining({ method: 'PATCH' })),
+    );
+    const inbound = lastInboundPatch();
+    expect(inbound.defaultAssigneeUserId).toBe('u-2');
+    expect(inbound.staffForwardRouting).toBe(true);
+    expect(inbound.dropUnverifiedSenders).toBe(true);
+  });
+
+  it('a card save with no stored default assignee PATCHes null', async () => {
+    routeFetch();
+    render(<InboundEmailCard />);
+    await screen.findByTestId('inbound-email-card');
+    fireEvent.click(screen.getByTestId('inbound-drop-unverified-toggle'));
+    await waitFor(() =>
+      expect(fetchWithAuth).toHaveBeenCalledWith('/orgs/partners/me', expect.objectContaining({ method: 'PATCH' })),
+    );
+    expect(lastInboundPatch().defaultAssigneeUserId).toBeNull();
   });
 
   it('toggling enable PATCHes /orgs/partners/me with the COMPLETE ticketing.inbound (no address when override is null)', async () => {

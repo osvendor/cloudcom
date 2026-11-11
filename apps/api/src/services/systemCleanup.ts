@@ -12,6 +12,7 @@ import { and, eq, sql } from 'drizzle-orm';
 import { db, runOutsideDbContext, withDbAccessContext, type DbAccessContext } from '../db';
 import { devices, deviceCommands, deviceFilesystemCleanupRuns } from '../db/schema';
 import { queueCommandForExecutionWithSystemPrecheck, CommandTypes } from './commandQueue';
+import { checkAiRemoteToolsPolicy } from './aiRemoteToolsPolicy';
 import { SYSTEM_CLEANUP_RUN_MAX_TIMEOUT_MS } from './commandTimeouts';
 import { SYSTEM_CLEANUP_ACTION_IDS, SYSTEM_CLEANUP_RISK_FLAGS, systemCleanupRunBodySchema, systemCleanupRunBudgetMs } from '@breeze/shared/validators';
 import { compareAgentVersions, parseComparableVersion } from './agentEditionCompat';
@@ -187,7 +188,9 @@ export interface StartSystemCleanupRunArgs extends QueueSystemCleanupListArgs {
 export type SystemCleanupQueueResult =
   | { ok: true; commandId: string }
   | { ok: false; status: 409; error: 'agent_update_required'; minAgentVersion: string }
-  | { ok: false; status: 400 | 503; error: string };
+  | { ok: false; status: 400 | 503; error: string }
+  // The device's remote_access policy disables remote tools.
+  | { ok: false; status: 403; error: string };
 export type SystemCleanupStartResult =
   | { ok: true; commandId: string; cleanupRunId: string; deadlineAt: string }
   | Exclude<SystemCleanupQueueResult, { ok: true }>
@@ -200,6 +203,10 @@ async function queueSystemCleanupListOutsideContext(
   // only answer with a bare failure the UI cannot explain.
   const gate = systemCleanupAgentGate(args.device);
   if (!gate.ok) return gate;
+  // Shared by the route and the AI tool (which reaches the device
+  // only through here, not through aiDispatch), so the policy lives here too.
+  const policy = await checkAiRemoteToolsPolicy(args.device.id, CommandTypes.SYSTEM_CLEANUP_LIST);
+  if (!policy.allowed) return { ok: false, status: 403, error: policy.error };
 
   const queued = await queueCommandForExecutionWithSystemPrecheck(
     args.device.id,
@@ -225,6 +232,10 @@ async function startSystemCleanupRunOutsideContext(
 
   const selection = systemCleanupRunBodySchema.safeParse({ actionIds: args.actionIds, params: args.params });
   if (!selection.success) return { ok: false, status: 400, error: 'Invalid system cleanup selection' };
+
+  // Before the run row is claimed, so a refusal leaves nothing behind.
+  const policy = await checkAiRemoteToolsPolicy(args.device.id, CommandTypes.SYSTEM_CLEANUP_RUN);
+  if (!policy.allowed) return { ok: false, status: 403, error: policy.error };
 
   const deadlineAt = new Date(Date.now() + systemCleanupRunBudgetMs(args.actionIds));
 
@@ -371,6 +382,18 @@ type FailSystemCleanupArgs = {
 };
 
 export async function failSystemCleanupRunAndCancelCommand(args: FailSystemCleanupArgs): Promise<boolean> {
+  return (await failSystemCleanupRunAndCancelCommandDetailed(args)) !== null;
+}
+
+/**
+ * The same transaction, reporting whether the COMMAND was cancelled too:
+ * `null` = lost the run CAS (nothing changed); `commandCancelled: false` =
+ * the run is failed but the device had already claimed its command, so the
+ * cleaner may still run to completion (#10161 review).
+ */
+async function failSystemCleanupRunAndCancelCommandDetailed(
+  args: FailSystemCleanupArgs,
+): Promise<{ commandCancelled: boolean } | null> {
   return withDbAccessContext(dbContextFor({ orgId: args.orgId }), () =>
     db.transaction((tx) => failSystemCleanupRunInTransaction(tx, args)),
   );
@@ -379,7 +402,7 @@ export async function failSystemCleanupRunAndCancelCommand(args: FailSystemClean
 async function failSystemCleanupRunInTransaction(
   tx: Parameters<Parameters<typeof db.transaction>[0]>[0],
   args: FailSystemCleanupArgs,
-): Promise<boolean> {
+): Promise<{ commandCancelled: boolean } | null> {
   const [run] = await tx
     .update(deviceFilesystemCleanupRuns)
     .set({ status: 'failed', error: args.error, updatedAt: new Date() })
@@ -392,7 +415,7 @@ async function failSystemCleanupRunInTransaction(
       eq(deviceFilesystemCleanupRuns.status, 'running'),
     ))
     .returning({ id: deviceFilesystemCleanupRuns.id, commandId: deviceFilesystemCleanupRuns.commandId });
-  if (!run) return false;
+  if (!run) return null;
 
   {
     const completedAt = new Date();
@@ -417,10 +440,10 @@ async function failSystemCleanupRunInTransaction(
       .returning({ id: deviceCommands.id });
     // Losing this CAS is fine and expected: the agent already claimed it,
     // so a real result is on its way and the late-result branch in the
-    // handler records it without flipping the status back.
-    void cancelled;
+    // handler records it without flipping the status back. The caller is
+    // told, so an operator is never told a started cleaner was stopped.
+    return { commandCancelled: cancelled !== undefined };
   }
-  return true;
 }
 
 function dbContextFor(device: { orgId: string }): DbAccessContext {
@@ -635,4 +658,58 @@ export async function resolveSystemCleanupRunStatus(args: {
       deadlineAt: storedDeadline,
     },
   };
+}
+
+export type SystemCleanupCancelResult =
+  /** commandCancelled false: the device had already claimed the command; the cleaner may still finish. */
+  | { ok: true; cleanupRunId: string; commandId: string | null; commandCancelled: boolean }
+  | { ok: false; status: 404; error: 'run_not_found' }
+  | { ok: false; status: 409; error: 'not_running'; runStatus: string };
+
+/**
+ * Operator cancel of a system run (#6485 F-5), shared by
+ * `POST /devices/:id/filesystem/system-cleanup/run/:cleanupRunId/cancel` and
+ * the AI tool's `cancel` action (#10161), so the two lanes cannot drift.
+ *
+ * CASes on the RUN row (not the command, whose generic cancel 409s the moment
+ * the agent claims it) through `failSystemCleanupRunAndCancelCommand`, the
+ * same atomic fail-the-run-then-cancel-the-command transaction the lazy
+ * timeout uses. A command the agent already claimed keeps running on the
+ * device; its late result is recorded on the run without changing `failed`.
+ *
+ * Runs in the CALLER's DB context, like `resolveSystemCleanupRunStatus`;
+ * `device` must already be access-verified. Writes no audit row: each caller
+ * audits its own surface.
+ */
+export async function cancelSystemCleanupRun(args: {
+  device: { id: string; orgId: string };
+  cleanupRunId: string;
+}): Promise<SystemCleanupCancelResult> {
+  const { device, cleanupRunId } = args;
+  const runScope = and(
+    eq(deviceFilesystemCleanupRuns.id, cleanupRunId),
+    eq(deviceFilesystemCleanupRuns.deviceId, device.id),
+    eq(deviceFilesystemCleanupRuns.orgId, device.orgId),
+    eq(deviceFilesystemCleanupRuns.kind, 'system'),
+  );
+  const [run] = await db.select().from(deviceFilesystemCleanupRuns).where(runScope).limit(1);
+  if (!run) return { ok: false, status: 404, error: 'run_not_found' };
+  if (run.status !== 'running') return { ok: false, status: 409, error: 'not_running', runStatus: run.status };
+
+  const finalised = await failSystemCleanupRunAndCancelCommandDetailed({
+    runId: cleanupRunId, deviceId: device.id, orgId: device.orgId, error: 'cancelled_by_operator',
+  });
+  if (finalised === null) {
+    // Lost the CAS: a real result (or another cancel) landed between the read
+    // above and here. Re-read rather than assume `failed`: the winner could be
+    // a completed `executed` run, and reporting a successful run as failed is
+    // its own false report.
+    const [current] = await db
+      .select({ status: deviceFilesystemCleanupRuns.status })
+      .from(deviceFilesystemCleanupRuns)
+      .where(runScope)
+      .limit(1);
+    return { ok: false, status: 409, error: 'not_running', runStatus: current?.status ?? 'failed' };
+  }
+  return { ok: true, cleanupRunId, commandId: run.commandId ?? null, commandCancelled: finalised.commandCancelled };
 }

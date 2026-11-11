@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import OrgBillingSettings from './OrgBillingSettings';
@@ -8,6 +8,8 @@ vi.mock('../../stores/auth', () => ({ fetchWithAuth: vi.fn() }));
 vi.mock('@/lib/navigation', () => ({ navigateTo: vi.fn() }));
 const showToast = vi.fn();
 vi.mock('../shared/Toast', () => ({ showToast: (a: unknown) => showToast(a) }));
+const stepUpMint = vi.hoisted(() => vi.fn());
+vi.mock('../../lib/mfaStepUp', () => ({ mintStepUpGrant: stepUpMint }));
 
 const fetchMock = vi.mocked(fetchWithAuth);
 const json = (payload: unknown, ok = true, status = ok ? 200 : 500): Response =>
@@ -19,80 +21,63 @@ const orgPayload = (over: Record<string, unknown> = {}) => json({
   billingContact: null,
   billingAddressLine1: null, billingAddressLine2: null, billingAddressCity: null,
   billingAddressRegion: null, billingAddressPostalCode: null, billingAddressCountry: null,
+  // partners.invoice_terms_days is NOT NULL DEFAULT 30, so the API always sends a partner default.
+  invoiceTermsDays: null, partnerDefaultInvoiceTermsDays: 30,
   ...over,
 });
 const findPatch = () =>
   fetchMock.mock.calls.find((c) => c[0] === '/orgs/org-1/billing-settings' && (c[1] as RequestInit)?.method === 'PATCH');
 
 describe('OrgBillingSettings — billing contact', () => {
+  // The Billing tab used to edit `billingContact` inline, and the API wrote
+  // that into the org's PRIMARY contact — a technical contact's email was
+  // overwritten with the billing address. Contact data now has one home, the
+  // org record's Contacts tab: this card shows who invoices go to and links
+  // there, and Save never sends contact fields.
   beforeEach(() => vi.clearAllMocks());
 
-  it('loads and shows the saved billing contact email + name', async () => {
+  it('shows the default recipient read-only and links to the org Contacts tab', async () => {
     fetchMock.mockResolvedValue(orgPayload({ billingContact: { email: 'ap@customer.example', name: 'AP Dept' } }));
     render(<OrgBillingSettings orgId="org-1" />);
-    await waitFor(() =>
-      expect((screen.getByTestId('org-billing-contact-email') as HTMLInputElement).value).toBe('ap@customer.example'));
-    expect((screen.getByTestId('org-billing-contact-name') as HTMLInputElement).value).toBe('AP Dept');
+    const recipient = await screen.findByTestId('org-billing-contact-recipient');
+    expect(recipient).toHaveTextContent('AP Dept');
+    expect(recipient).toHaveTextContent('ap@customer.example');
+    // Read-only: there is no field to type a contact into.
+    expect(screen.queryByTestId('org-billing-contact-email')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('org-billing-contact-name')).not.toBeInTheDocument();
+    expect(screen.getByTestId('org-billing-contact-manage')).toHaveAttribute('href', '/organizations/org-1#contacts');
   });
 
-  it('sends billingContactEmail/Name in the PATCH body when filled', async () => {
+  it('says so when no contact has the billing role', async () => {
+    fetchMock.mockResolvedValue(orgPayload({ billingContact: null }));
+    render(<OrgBillingSettings orgId="org-1" />);
+    expect(await screen.findByTestId('org-billing-contact-none')).toBeInTheDocument();
+    expect(screen.queryByTestId('org-billing-contact-recipient')).not.toBeInTheDocument();
+    expect(screen.getByTestId('org-billing-contact-manage')).toHaveAttribute('href', '/organizations/org-1#contacts');
+  });
+
+  it('distinguishes a billing contact with no email address from no billing contact', async () => {
+    fetchMock.mockResolvedValue(orgPayload({ billingContact: { name: 'AP Dept', email: null, phone: '555-0100' } }));
+    render(<OrgBillingSettings orgId="org-1" />);
+    const noEmail = await screen.findByTestId('org-billing-contact-no-email');
+    expect(noEmail).toHaveTextContent('AP Dept');
+    expect(screen.queryByTestId('org-billing-contact-none')).not.toBeInTheDocument();
+  });
+
+  it('never sends billing contact fields on Save', async () => {
     fetchMock.mockImplementation(async (_input: string, opts?: RequestInit) =>
-      opts?.method === 'PATCH' ? json({ data: {} }) : orgPayload());
+      opts?.method === 'PATCH' ? json({ data: {} }) : orgPayload({ billingContact: { email: 'ap@customer.example', name: 'AP Dept' } }));
     render(<OrgBillingSettings orgId="org-1" />);
     await waitFor(() => expect(screen.getByTestId('org-billing-settings')).toBeInTheDocument());
 
-    fireEvent.change(screen.getByTestId('org-billing-contact-email'), { target: { value: 'billing@customer.example' } });
-    fireEvent.change(screen.getByTestId('org-billing-contact-name'), { target: { value: 'Accounts Payable' } });
     fireEvent.click(screen.getByTestId('org-billing-save'));
 
-    await waitFor(() => {
-      const patch = findPatch();
-      expect(patch).toBeTruthy();
-      expect(JSON.parse((patch![1] as RequestInit).body as string)).toMatchObject({
-        billingContactEmail: 'billing@customer.example', billingContactName: 'Accounts Payable',
-      });
-    });
-  });
-
-  it('blocks save on a client-invalid contact email (guards the round-trip)', async () => {
-    fetchMock.mockImplementation(async (_input: string, opts?: RequestInit) =>
-      opts?.method === 'PATCH' ? json({ data: {} }) : orgPayload());
-    render(<OrgBillingSettings orgId="org-1" />);
-    await waitFor(() => expect(screen.getByTestId('org-billing-settings')).toBeInTheDocument());
-
-    fireEvent.change(screen.getByTestId('org-billing-contact-email'), { target: { value: 'not-an-email' } });
-
-    // Inline error shows and the Save button is disabled…
-    expect(screen.getByTestId('org-billing-contact-email-error')).toBeInTheDocument();
-    expect(screen.getByTestId('org-billing-save')).toBeDisabled();
-    // …and even clicking it issues no PATCH (save() early-returns).
-    fireEvent.click(screen.getByTestId('org-billing-save'));
-    expect(findPatch()).toBeUndefined();
-
-    // Correcting the address clears the error and re-enables save.
-    fireEvent.change(screen.getByTestId('org-billing-contact-email'), { target: { value: 'ap@customer.example' } });
-    expect(screen.queryByTestId('org-billing-contact-email-error')).not.toBeInTheDocument();
-    expect(screen.getByTestId('org-billing-save')).not.toBeDisabled();
-  });
-
-  it('serializes a cleared contact email to null (never "") so the schema does not 400', async () => {
-    // The linchpin of the design: orgBillingSettingsSchema rejects '' via .email();
-    // clearing the field must send null. Mirrors PartnerBillingSettings' address test.
-    fetchMock.mockImplementation(async (_input: string, opts?: RequestInit) =>
-      opts?.method === 'PATCH' ? json({ data: {} }) : orgPayload({ billingContact: { email: 'ap@customer.example', name: 'AP' } }));
-    render(<OrgBillingSettings orgId="org-1" />);
-    await waitFor(() =>
-      expect((screen.getByTestId('org-billing-contact-email') as HTMLInputElement).value).toBe('ap@customer.example'));
-
-    // Clear the email to whitespace-only, then save.
-    fireEvent.change(screen.getByTestId('org-billing-contact-email'), { target: { value: '   ' } });
-    fireEvent.click(screen.getByTestId('org-billing-save'));
-
-    await waitFor(() => {
-      const patch = findPatch();
-      expect(patch).toBeTruthy();
-      expect(JSON.parse((patch![1] as RequestInit).body as string).billingContactEmail).toBeNull();
-    });
+    await waitFor(() => expect(findPatch()).toBeTruthy());
+    const body = JSON.parse((findPatch()![1] as RequestInit).body as string);
+    expect(body).not.toHaveProperty('billingContactEmail');
+    expect(body).not.toHaveProperty('billingContactName');
+    // Positive control: the rest of the form is still saved.
+    expect(body).toHaveProperty('taxExempt', false);
   });
 });
 
@@ -113,7 +98,8 @@ describe('OrgBillingSettings — tax rate inherited-value placeholder', () => {
     const input = screen.getByTestId('org-billing-taxrate') as HTMLInputElement;
     expect(input.value).toBe('');
     expect(input.placeholder).toBe('7.5');
-    expect(screen.getByText(/inherits from partner default/i)).toBeInTheDocument();
+    const taxField = within(screen.getByTestId('org-billing-taxrate').parentElement as HTMLElement);
+    expect(taxField.getByText(/inherits from partner default/i)).toBeInTheDocument();
   });
 
   it('shows a "no partner default configured" note when the partner has no default set', async () => {
@@ -122,7 +108,8 @@ describe('OrgBillingSettings — tax rate inherited-value placeholder', () => {
     await waitFor(() => expect(screen.getByTestId('org-billing-settings')).toBeInTheDocument());
 
     expect((screen.getByTestId('org-billing-taxrate') as HTMLInputElement).placeholder).toBe('');
-    expect(screen.getByText(/no partner default configured/i)).toBeInTheDocument();
+    const taxField = within(screen.getByTestId('org-billing-taxrate').parentElement as HTMLElement);
+    expect(taxField.getByText(/no partner default configured/i)).toBeInTheDocument();
   });
 });
 
@@ -319,7 +306,30 @@ describe('OrgBillingSettings — currency selector and change flow', () => {
   });
 });
 
-vi.mock('../../lib/permissions', () => ({ usePermissions: () => ({ can: () => true }) }));
+const reminderPermissions = vi.hoisted(() => ({ canManagePayments: true }));
+vi.mock('../../lib/permissions', () => ({ usePermissions: () => ({
+  can: (resource: string, action: string) => resource === 'billing' && action === 'manage'
+    ? reminderPermissions.canManagePayments : true,
+}) }));
+beforeEach(() => { reminderPermissions.canManagePayments = true; });
+it.each([true, false])('preserves tax/address Save when payments cannot load (permission=%s)', async allowed => {
+  reminderPermissions.canManagePayments = allowed;
+  fetchMock.mockImplementation(async (url, init) => {
+    if (String(url).endsWith('/billing/payment-settings')) return json({ error: 'Unavailable' }, false, 403);
+    if (url === '/billing-profiles') return json({ profiles: [] });
+    if (url === '/billing-profiles/work-types') return json({ workTypes: [] });
+    if (String(url).endsWith('/billing-profile')) return json({ assignment: null });
+    return orgPayload();
+  });
+  render(<OrgBillingSettings orgId="org-1" />);
+  fireEvent.change(await screen.findByTestId('org-billing-taxid'), { target: { value: 'TEST-TAX' } });
+  await waitFor(() => expect(screen.getByTestId('org-billing-save')).not.toBeDisabled());
+  fireEvent.click(screen.getByTestId('org-billing-save'));
+  await waitFor(() => expect(findPatch()).toBeDefined());
+  expect(JSON.parse(findPatch()![1]!.body as string)).toMatchObject({ taxId: 'TEST-TAX' });
+  expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'PUT')).toHaveLength(0);
+});
+
 
 const standardProfile = { id: 'standard', name: 'Standard rates', currencyCode: 'USD', isActive: true, isDefault: true, baseCoverage: 'billable', baseHourlyRate: '150.00', baseMinimumMinutes: null, roundingIncrementMinutes: null, rules: [] };
 function profileApi(assignment: string | null = null, currency = 'USD', failSave = false) {
@@ -346,11 +356,11 @@ describe('OrgBillingSettings billing profile', () => {
     profileApi();
     render(<OrgBillingSettings orgId="org-1" />);
     fireEvent.change(await screen.findByTestId('org-billing-profile'), { target: { value: 'silver' } });
-    fireEvent.change(screen.getByTestId('org-billing-contact-name'), { target: { value: 'Accounts Payable' } });
+    fireEvent.change(screen.getByTestId('org-billing-taxid'), { target: { value: 'VAT-123' } });
     expect(fetchMock.mock.calls.filter(([, init]) => init?.method)).toHaveLength(0);
     fireEvent.click(screen.getByTestId('org-billing-save'));
     await waitFor(() => expect(findPatch()).toBeDefined());
-    expect(JSON.parse(findPatch()![1]!.body as string)).toMatchObject({ billingProfileId: 'silver', billingContactName: 'Accounts Payable' });
+    expect(JSON.parse(findPatch()![1]!.body as string)).toMatchObject({ billingProfileId: 'silver', taxId: 'VAT-123' });
     expect(fetchMock.mock.calls.filter(([, init]) => init?.method)).toHaveLength(1);
     await waitFor(() => expect(screen.getByTestId('org-billing-save')).not.toBeDisabled());
     fireEvent.click(screen.getByTestId('org-billing-save'));
@@ -427,5 +437,310 @@ describe('OrgBillingSettings assignment save consistency', () => {
     fireEvent.click(screen.getByTestId('org-billing-save'));
     await waitFor(() => expect(findPatch()).toBeDefined());
     expect(JSON.parse(findPatch()![1]!.body as string)).not.toHaveProperty('billingProfileId');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Settings consolidation W06 (#6229): org payment-terms override. Blank =
+// inherit the partner default, shown as the placeholder VALUE (rule 4). Saved
+// through the page Save (runAction); cleared sends null, never ''.
+// ---------------------------------------------------------------------------
+
+describe('OrgBillingSettings — payment terms override', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  const withPatch = (over: Record<string, unknown> = {}) =>
+    fetchMock.mockImplementation(async (_input: string, opts?: RequestInit) =>
+      opts?.method === 'PATCH' ? json({ data: {} }) : orgPayload(over));
+
+  it('shows the partner default days as the placeholder when the org inherits', async () => {
+    fetchMock.mockResolvedValue(orgPayload({ invoiceTermsDays: null, partnerDefaultInvoiceTermsDays: 30 }));
+    render(<OrgBillingSettings orgId="org-1" />);
+    await waitFor(() => expect(screen.getByTestId('org-billing-settings')).toBeInTheDocument());
+    const input = screen.getByTestId('org-billing-terms-days') as HTMLInputElement;
+    expect(input.value).toBe('');
+    expect(input.placeholder).toBe('30');
+  });
+
+  it('loads a saved override of 0 as "0", not blank', async () => {
+    fetchMock.mockResolvedValue(orgPayload({ invoiceTermsDays: 0, partnerDefaultInvoiceTermsDays: 30 }));
+    render(<OrgBillingSettings orgId="org-1" />);
+    await waitFor(() =>
+      expect((screen.getByTestId('org-billing-terms-days') as HTMLInputElement).value).toBe('0'));
+  });
+
+  it('PATCHes the override as a number', async () => {
+    withPatch({ invoiceTermsDays: null, partnerDefaultInvoiceTermsDays: 30 });
+    render(<OrgBillingSettings orgId="org-1" />);
+    await waitFor(() => expect(screen.getByTestId('org-billing-settings')).toBeInTheDocument());
+    fireEvent.change(screen.getByTestId('org-billing-terms-days'), { target: { value: '14' } });
+    fireEvent.click(screen.getByTestId('org-billing-save'));
+    await waitFor(() => {
+      const patch = findPatch();
+      expect(patch).toBeTruthy();
+      expect(JSON.parse((patch![1] as RequestInit).body as string).invoiceTermsDays).toBe(14);
+    });
+  });
+
+  it('clearing the override sends null (inherit), never ""', async () => {
+    withPatch({ invoiceTermsDays: 14, partnerDefaultInvoiceTermsDays: 30 });
+    render(<OrgBillingSettings orgId="org-1" />);
+    await waitFor(() =>
+      expect((screen.getByTestId('org-billing-terms-days') as HTMLInputElement).value).toBe('14'));
+    fireEvent.change(screen.getByTestId('org-billing-terms-days'), { target: { value: '' } });
+    fireEvent.click(screen.getByTestId('org-billing-save'));
+    await waitFor(() => {
+      const patch = findPatch();
+      expect(patch).toBeTruthy();
+      expect(JSON.parse((patch![1] as RequestInit).body as string).invoiceTermsDays).toBeNull();
+    });
+  });
+
+  it.each(['366', '-1', '2.5'])('blocks save on an out-of-range value %s', async (value) => {
+    withPatch({ invoiceTermsDays: null, partnerDefaultInvoiceTermsDays: 30 });
+    render(<OrgBillingSettings orgId="org-1" />);
+    await waitFor(() => expect(screen.getByTestId('org-billing-settings')).toBeInTheDocument());
+    fireEvent.change(screen.getByTestId('org-billing-terms-days'), { target: { value } });
+    expect(screen.getByTestId('org-billing-terms-days-error')).toBeInTheDocument();
+    expect(screen.getByTestId('org-billing-save')).toBeDisabled();
+    fireEvent.click(screen.getByTestId('org-billing-save'));
+    expect(findPatch()).toBeUndefined();
+  });
+});
+
+describe('OrgBillingSettings resolved card AI usage', () => {
+  beforeEach(() => vi.clearAllMocks());
+  const aiApi = (assignment: string | null, ai: Record<string, unknown>) => {
+    fetchMock.mockImplementation(async (url) => {
+      if (url === '/billing-profiles') return json({ profiles: [
+        { ...standardProfile, ...ai },
+        { ...standardProfile, id: 'silver', name: 'Silver', isDefault: false, aiCoverage: 'included', aiMarkupPercent: null, aiRates: [] },
+      ] });
+      if (url === '/billing-profiles/work-types') return json({ workTypes: [] });
+      if (String(url).endsWith('/billing-profile')) return json({ assignment: assignment ? { billingProfileId: assignment } : null });
+      return orgPayload();
+    });
+  };
+
+  it('shows the inherited default card AI terms read-only under the resolved card', async () => {
+    aiApi(null, { aiCoverage: 'billable', aiMarkupPercent: '25.00', aiRates: [] });
+    render(<OrgBillingSettings orgId="org-1" />);
+    const line = await screen.findByTestId('org-billing-profile-ai');
+    expect(line).toHaveTextContent('AI usage: Billable · cost +25%');
+    expect(line.closest('[data-testid="org-billing-profile-rates"]')).not.toBeNull();
+    expect(line.querySelector('input, select, button')).toBeNull();
+  });
+
+  it('describes a price-list card and follows a staged assignment without any request', async () => {
+    aiApi(null, { aiCoverage: 'billable', aiMarkupPercent: null, aiRates: [
+      { modelId: 'a', inputPricePerM: '3', outputPricePerM: '15', cacheReadPricePerM: '0.3', cacheWritePricePerM: '3.75' },
+      { modelId: 'b', inputPricePerM: '1', outputPricePerM: '5', cacheReadPricePerM: '0.1', cacheWritePricePerM: '1.25' },
+    ] });
+    render(<OrgBillingSettings orgId="org-1" />);
+    expect(await screen.findByTestId('org-billing-profile-ai')).toHaveTextContent('AI usage: Billable · price list (2 models)');
+    fireEvent.change(screen.getByTestId('org-billing-profile'), { target: { value: 'silver' } });
+    expect(screen.getByTestId('org-billing-profile-ai')).toHaveTextContent('AI usage: Included');
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method)).toHaveLength(0);
+  });
+
+  it('reads a profile without AI fields as Not billed', async () => {
+    aiApi('standard', {});
+    render(<OrgBillingSettings orgId="org-1" />);
+    expect(await screen.findByTestId('org-billing-profile-ai')).toHaveTextContent('AI usage: Not billed');
+  });
+});
+
+it('mounts org reminders independently of enrollment rollout', async () => {
+  const fields = {
+    autopayOffsetDays: { value: 0, source: 'default' }, autopayOffsetRule: { value: 'later', source: 'default' },
+    autopayCap: { value: { enabled: false }, source: 'default' }, achMode: { value: 'ach_preferred', source: 'default' },
+    cardFeeBps: { value: 0, source: 'default' }, achFeeAmount: { value: '0.00', source: 'default' }, feeAttested: false,
+    remindersEnabled: { value: false, source: 'default' },
+    reminderBeforeDueDays: { value: 3, source: 'default' },
+    reminderRepeatDays: { value: null, source: 'default' },
+    overdueReminderEveryDays: { value: 7, source: 'default' },
+  };
+  fetchMock.mockImplementation(async url => {
+    if (String(url).endsWith('/billing/payment-settings')) return json({
+      effective: fields, inherited: fields, autopayEnabled: false,
+      values: { autopayOffsetDays: null, autopayOffsetRule: null, autopayCapEnabled: null, autopayCapAmount: null, autopayCapCurrency: null, achMode: null, cardFeeBps: null, achFeeAmount: null },
+    });
+    if (url === '/billing-profiles') return json({ profiles: [] });
+    return json({ id: '11111111-1111-4111-8111-111111111111', currencyCode: 'USD', billingContact: null });
+  });
+  render(<OrgBillingSettings orgId="11111111-1111-4111-8111-111111111111" />);
+  expect(await screen.findByTestId('autopay-payments-shell')).toBeInTheDocument();
+  expect(await screen.findByTestId('autopay-reminders-section')).toBeInTheDocument();
+  expect(screen.queryByTestId('autopay-settings-section')).toBeNull();
+});
+
+describe('OrgBillingSettings reminder Save integration', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    const fields = {
+      autopayOffsetDays: { value: 0, source: 'default' },
+      autopayOffsetRule: { value: 'later', source: 'default' },
+      autopayCap: { value: { enabled: false }, source: 'default' },
+      achMode: { value: 'ach_preferred', source: 'default' },
+      cardFeeBps: { value: 0, source: 'default' }, achFeeAmount: { value: '0.00', source: 'default' }, feeAttested: false,
+      remindersEnabled: { value: false, source: 'default' },
+      reminderBeforeDueDays: { value: 5, source: 'partner' },
+      reminderRepeatDays: { value: null, source: 'default' },
+      overdueReminderEveryDays: { value: 7, source: 'default' },
+    };
+    fetchMock.mockImplementation(async url => {
+      if (String(url).endsWith('/billing/payment-settings')) return json({
+        autopayEnabled: false, effective: fields, inherited: fields,
+        values: { autopayOffsetDays: null, autopayOffsetRule: null, autopayCapEnabled: null,
+          autopayCapAmount: null, autopayCapCurrency: null, achMode: null, cardFeeBps: null, achFeeAmount: null },
+      });
+      if (url === '/billing-profiles') return json({ profiles: [] });
+      if (url === '/billing-profiles/work-types') return json({ workTypes: [] });
+      if (String(url).endsWith('/billing-profile')) return json({ assignment: null });
+      return orgPayload();
+    });
+  });
+
+  it('saves reminder fields through the single page Save while enrollment is disabled', async () => {
+    render(<OrgBillingSettings orgId="org-1" />);
+    const before = await screen.findByTestId('autopay-reminders-before');
+    expect(before).toHaveValue(null);
+    expect(before).toHaveAttribute('placeholder', '5');
+    expect(screen.queryByTestId('autopay-settings-save')).toBeNull();
+    fireEvent.change(before, { target: { value: '9' } });
+    fireEvent.change(screen.getByTestId('autopay-reminders-enabled'), { target: { value: 'false' } });
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method)).toHaveLength(0);
+    fireEvent.click(screen.getByTestId('org-billing-save'));
+    await waitFor(() => expect(findPatch()).toBeDefined());
+    const puts = fetchMock.mock.calls.filter(([, init]) => init?.method === 'PUT');
+    expect(puts).toHaveLength(1);
+    expect(puts[0][0]).toBe('/orgs/org-1/billing/payment-settings');
+    expect(JSON.parse(puts[0][1]!.body as string)).toEqual({
+      remindersEnabled: false, reminderBeforeDueDays: 9, reminderRepeatDays: null, overdueReminderEveryDays: null,
+    });
+  });
+
+  it('blocks both page mutations when a loaded reminder interval is invalid', async () => {
+    render(<OrgBillingSettings orgId="org-1" />);
+    fireEvent.change(await screen.findByTestId('autopay-reminders-before'), { target: { value: '32' } });
+    expect(screen.getByTestId('org-billing-save')).toBeDisabled();
+    fireEvent.click(screen.getByTestId('org-billing-save'));
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method)).toHaveLength(0);
+  });
+});
+
+function feeView(enabled=true){
+  const effective={autopayOffsetDays:{value:0,source:'default'},autopayOffsetRule:{value:'later',source:'default'},
+    autopayCap:{value:{enabled:false},source:'default'},achMode:{value:'ach_preferred',source:'default'},
+    cardFeeBps:{value:300,source:'partner'},achFeeAmount:{value:'2.50',source:'partner'},feeAttested:true,
+    remindersEnabled:{value:false,source:'default'},reminderBeforeDueDays:{value:3,source:'default'},
+    reminderRepeatDays:{value:null,source:'default'},overdueReminderEveryDays:{value:7,source:'default'}};
+  return {autopayEnabled:enabled,effective,inherited:effective,values:{autopayOffsetDays:null,autopayOffsetRule:null,
+    autopayCapEnabled:null,autopayCapAmount:null,autopayCapCurrency:null,achMode:null,cardFeeBps:null,achFeeAmount:null}};
+}
+
+it('mounts inherited fees without partner attestation in the org page',async()=>{
+  fetchMock.mockImplementation(async path=>String(path).endsWith('/payment-settings')?json(feeView()):
+    String(path).endsWith('/autopay')?json({status:'not_requested',method:null}):orgPayload());
+  render(<OrgBillingSettings orgId="11111111-1111-4111-8111-111111111111"/>);
+  expect(await screen.findByTestId('autopay-org-fee-settings-page')).toBeInTheDocument();
+  expect(await screen.findByTestId('autopay-card-fee-bps')).toHaveAttribute('placeholder','300');
+  expect(screen.queryByTestId('autopay-attest-notified')).toBeNull();
+});
+
+// The org's own payment settings override the partner's: changing one asks for
+// a second-factor confirmation, so a Save that changes none of them (a tax ID
+// or address edit) must not send the payment-settings PUT at all.
+describe('OrgBillingSettings payment-settings Save and second-factor confirmation', () => {
+  const path = '/orgs/org-1/billing/payment-settings';
+  const puts = () => fetchMock.mock.calls.filter(([url, init]) => url === path && init?.method === 'PUT')
+    .map(([, init]) => JSON.parse(init!.body as string) as Record<string, unknown>);
+  beforeEach(() => {
+    vi.clearAllMocks();
+    stepUpMint.mockResolvedValue('grant-org');
+    const base = feeView();
+    // Stored org overrides, so an untouched draft is not all-blank.
+    const view = { ...base, values: { ...base.values, cardFeeBps: 150, autopayCapEnabled: true,
+      autopayCapAmount: '500.00', autopayCapCurrency: 'USD' } };
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === '/users/me') return Response.json({ mfaEnabled: true, mfaMethod: 'totp' });
+      if (url === '/auth/passkeys') return Response.json([]);
+      if (url === path && init?.method === 'PUT') {
+        const { stepUpGrant, ...settings } = JSON.parse(init.body as string);
+        return stepUpGrant ? Response.json({ data: {} }) : Response.json({ error: 'Step-up required', code: 'STEP_UP_REQUIRED',
+          stepUp: { operation: 'org_payment_settings_update', resource: { orgId: 'org-1', settings } } }, { status: 403 });
+      }
+      if (url === path) return json(view);
+      if (String(url).endsWith('/autopay')) return json({ status: 'not_requested', method: null });
+      if (init?.method === 'PATCH') return json({ data: {} });
+      return orgPayload();
+    });
+  });
+
+  it('sends no payment-settings PUT when only non-payment fields changed', async () => {
+    render(<OrgBillingSettings orgId="org-1" />);
+    await screen.findByTestId('autopay-card-fee-bps');
+    fireEvent.change(screen.getByTestId('org-billing-taxid'), { target: { value: 'GB123' } });
+    fireEvent.click(screen.getByTestId('org-billing-save'));
+    await waitFor(() => expect(findPatch()).toBeDefined());
+    expect(JSON.parse((findPatch()![1] as RequestInit).body as string)).toHaveProperty('taxId', 'GB123');
+    expect(puts()).toHaveLength(0);
+    expect(screen.queryByTestId('billing-stepup')).toBeNull();
+    expect(stepUpMint).not.toHaveBeenCalled();
+  });
+
+  it('asks for a confirmation when a payment setting changed and resubmits the same values with the grant', async () => {
+    render(<OrgBillingSettings orgId="org-1" />);
+    fireEvent.change(await screen.findByTestId('autopay-card-fee-bps'), { target: { value: '300' } });
+    fireEvent.click(screen.getByTestId('org-billing-save'));
+    fireEvent.change(await screen.findByTestId('billing-stepup-code'), { target: { value: '333444' } });
+    // Nothing else is saved while the confirmation is open.
+    expect(findPatch()).toBeUndefined();
+    fireEvent.click(screen.getByTestId('billing-stepup-confirm'));
+    await waitFor(() => expect(findPatch()).toBeDefined());
+    const [first, second] = puts();
+    expect(first).toMatchObject({ cardFeeBps: 300, autopayCapAmount: '500.00' });
+    expect(second).toEqual({ ...first, stepUpGrant: 'grant-org' });
+    expect(stepUpMint).toHaveBeenCalledWith({ operation: 'org_payment_settings_update',
+      resource: { orgId: 'org-1', settings: first }, reauth: { method: 'totp', code: '333444' } });
+    await waitFor(() => expect(screen.queryByTestId('billing-stepup')).toBeNull());
+  });
+
+  it('saves nothing else when the confirmation is closed', async () => {
+    render(<OrgBillingSettings orgId="org-1" />);
+    fireEvent.change(await screen.findByTestId('autopay-card-fee-bps'), { target: { value: '300' } });
+    fireEvent.change(screen.getByTestId('org-billing-taxid'), { target: { value: 'GB123' } });
+    fireEvent.click(screen.getByTestId('org-billing-save'));
+    fireEvent.click(await screen.findByTestId('billing-stepup-cancel'));
+    await waitFor(() => expect(screen.getByTestId('org-billing-save')).not.toBeDisabled());
+    expect(puts()).toHaveLength(1);
+    expect(findPatch()).toBeUndefined();
+    // The draft is kept for another try.
+    expect(screen.getByTestId('autopay-card-fee-bps')).toHaveValue(300);
+    expect(screen.getByTestId('org-billing-taxid')).toHaveValue('GB123');
+  });
+});
+
+// #7510: org currency is NOT inherited — organizations.currency_code is NOT NULL,
+// stamped from the partner default when the org is created. Settings rule 3
+// requires a stated exception to say so where it applies, so the field names the
+// partner default and that it only applies to new organizations.
+describe('OrgBillingSettings — currency is not inherited (#7510)', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('names the partner default currency and says it only applies to new organizations', async () => {
+    fetchMock.mockResolvedValue(orgPayload({ currencyCode: 'CAD', partnerDefaultCurrencyCode: 'EUR' }));
+    render(<OrgBillingSettings orgId="org-1" />);
+    const note = await screen.findByTestId('org-billing-currency-partner-default');
+    expect(note).toHaveTextContent('EUR');
+    expect(note).toHaveTextContent(/not inherited/i);
+    expect(note).toHaveTextContent(/organizations created from now on/i);
+  });
+
+  it('omits the note when the partner default is unknown', async () => {
+    fetchMock.mockResolvedValue(orgPayload({ currencyCode: 'CAD' }));
+    render(<OrgBillingSettings orgId="org-1" />);
+    await waitFor(() => expect(screen.getByTestId('org-billing-settings')).toBeInTheDocument());
+    expect(screen.queryByTestId('org-billing-currency-partner-default')).not.toBeInTheDocument();
   });
 });

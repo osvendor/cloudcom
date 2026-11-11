@@ -4,8 +4,9 @@
  * Uses H264 video track from the agent's pion peer connection.
  */
 
-import { classifyAnswerPoll } from './answerPoll';
+import { classifyAnswerPoll, resolveAnswerTimeoutMs } from './answerPoll';
 import { apiFetch } from './api';
+import { createIceTrickle } from './iceTrickle';
 
 /**
  * Error thrown when the remote agent reports a session failure
@@ -18,6 +19,28 @@ export class AgentSessionError extends Error {
     super(message);
     this.name = 'AgentSessionError';
   }
+}
+
+export const RELAY_REQUIRED_MESSAGE = 'Remote desktop needs the TURN relay while this device is isolated';
+
+/**
+ * A server-decided isolation restriction is terminal for this WebRTC attempt.
+ * Reuse AgentSessionError's transport/UI propagation so the operator sees the
+ * specific refusal instead of a generic connection failure or automatic retry.
+ */
+export class RelayRequiredError extends AgentSessionError {
+  constructor(message = RELAY_REQUIRED_MESSAGE) {
+    super(message);
+    this.name = 'RelayRequiredError';
+  }
+}
+
+function relayRequiredErrorFromResponse(data: unknown): RelayRequiredError | undefined {
+  if (typeof data !== 'object' || data === null || !('code' in data)) return;
+  if (data.code !== 'isolation_relay_unavailable' && data.code !== 'isolation_relay_not_permitted') return;
+  return new RelayRequiredError(
+    'error' in data && typeof data.error === 'string' && data.error.length > 0 ? data.error : undefined,
+  );
 }
 
 /**
@@ -139,6 +162,11 @@ export interface WebRTCSession {
   close: () => void;
 }
 
+/**
+ * How long to gather before sending the offer. Candidates gathered later are
+ * trickled after the answer (#9182, see iceTrickle.ts), so this only needs to
+ * cover the fast host/srflx candidates.
+ */
 const ICE_GATHER_TIMEOUT_MS = 3000;
 
 /**
@@ -157,6 +185,21 @@ const DEFAULT_ICE_SERVERS: readonly RTCIceServer[] = [{ urls: 'stun:stun.l.googl
  * (issue #3041).
  */
 export const ANSWER_POLL_INITIAL_INTERVAL_MS = 50;
+/**
+ * How long to wait for the agent's answer when the API gives no budget of its
+ * own (an older API, or a session with no end-user prompt). A consent-mode
+ * start extends this from the poll response's `answerTimeoutMs` (#6818).
+ */
+export const DEFAULT_ANSWER_TIMEOUT_MS = 15_000;
+
+/** Optional progress callbacks for createWebRTCSession. */
+export interface WebRTCSessionHooks {
+  /**
+   * Fires once, while the answer is still outstanding, when the API reports
+   * this start is waiting on the end user's consent dialog (#6818).
+   */
+  onAwaitingUserApproval?: () => void;
+}
 export const ANSWER_POLL_MAX_INTERVAL_MS = 500;
 const ANSWER_POLL_BACKOFF_FACTOR = 1.5;
 
@@ -172,14 +215,14 @@ export function nextAnswerPollInterval(currentMs: number): number {
  * One attempt at a peer connection plus its two data channels, propagating any
  * failure as-is. Callers classify; this only guarantees it leaves nothing open.
  */
-function buildPeerConnection(iceServers: RTCIceServer[]): {
+function buildPeerConnection(iceServers: RTCIceServer[], relayOnly: boolean): {
   pc: RTCPeerConnection;
   inputChannel: RTCDataChannel;
   controlChannel: RTCDataChannel;
 } {
   let pc: RTCPeerConnection | undefined;
   try {
-    pc = new RTCPeerConnection({ iceServers });
+    pc = new RTCPeerConnection(relayOnly ? { iceServers, iceTransportPolicy: 'relay' } : { iceServers });
 
     // Receive-only video transceiver (agent sends H264 video track)
     pc.addTransceiver('video', { direction: 'recvonly' });
@@ -211,14 +254,22 @@ function buildPeerConnection(iceServers: RTCIceServer[]): {
  * as a generic "WebRTC connection failed" — retryable-looking, and it suppressed
  * the notice that tells the operator why quality dropped (issue #3410).
  */
-function createPeerConnection(iceServers: RTCIceServer[]): {
+function createPeerConnection(iceServers: RTCIceServer[], relayOnly: boolean): {
   pc: RTCPeerConnection;
   inputChannel: RTCDataChannel;
   controlChannel: RTCDataChannel;
 } {
   try {
-    return buildPeerConnection(iceServers);
+    return buildPeerConnection(iceServers, relayOnly);
   } catch (firstErr) {
+    if (relayOnly) {
+      // Never retry STUN-only while isolated. Keep the constructor's reason:
+      // a malformed TURN entry is a server-config fault, not missing TURN.
+      console.warn('Relay-only ICE servers from the API were rejected by RTCPeerConnection:', firstErr);
+      const cause = firstErr instanceof Error ? firstErr.message : String(firstErr);
+      throw new RelayRequiredError(`${RELAY_REQUIRED_MESSAGE} (relay configuration rejected: ${cause})`);
+    }
+
     // The ICE list comes from the API and is only checked for being a non-empty
     // array — a malformed `urls` or a TURN entry without credentials makes the
     // constructor throw per spec. That is a server-config fault, not a missing
@@ -240,7 +291,7 @@ function createPeerConnection(iceServers: RTCIceServer[]): {
       firstErr,
     );
     try {
-      return buildPeerConnection([...DEFAULT_ICE_SERVERS]);
+      return buildPeerConnection([...DEFAULT_ICE_SERVERS], false);
     } catch (retryErr) {
       const cause = retryErr instanceof Error ? retryErr.message : String(retryErr);
       throw new WebRTCUnsupportedError(
@@ -261,12 +312,15 @@ function createPeerConnection(iceServers: RTCIceServer[]): {
  * 4. POST offer to API (triggers start_desktop command to agent)
  * 5. Poll for answer (agent creates pion PeerConnection and returns SDP answer)
  * 6. Set remote description → ICE completes → video flows
+ * 7. Trickle: late local candidates are POSTed, the agent's late ones polled
+ *    and added (#9182)
  */
 export async function createWebRTCSession(
   params: AuthenticatedConnectionParams,
   videoEl: HTMLVideoElement,
   displayIndex?: number,
   targetSessionId?: number,
+  hooks: WebRTCSessionHooks = {},
 ): Promise<WebRTCSession> {
   // Bail out before any network work when the WebView has no WebRTC at all.
   // This must come first: the ICE-servers request below would otherwise burn a
@@ -278,6 +332,7 @@ export async function createWebRTCSession(
 
   // Fetch ICE servers (includes TURN credentials if configured)
   let iceServers: RTCIceServer[] = [...DEFAULT_ICE_SERVERS];
+  let relayOnly = false;
   try {
     const iceResp = await apiFetch(
       params.apiUrl,
@@ -286,20 +341,38 @@ export async function createWebRTCSession(
     );
     if (iceResp.ok) {
       const iceData = await iceResp.json();
+      relayOnly = iceData.relayOnly === true;
       if (Array.isArray(iceData.iceServers) && iceData.iceServers.length > 0) {
         iceServers = iceData.iceServers;
+      } else if (relayOnly) {
+        throw new RelayRequiredError();
       }
+    } else if (isSessionEndedResponse(iceResp.status)) {
+      // #10542: the session was ended/revoked server-side. The offer would
+      // 401 too, so end now instead of building a peer, gathering candidates
+      // and posting an offer that cannot succeed.
+      const reason = await fetchSessionEndedReason(params);
+      throw new SessionEndedError(reason ?? undefined);
+    } else if (iceResp.status === 409) {
+      const iceData = await iceResp.json();
+      const relayError = relayRequiredErrorFromResponse(iceData);
+      if (relayError) throw relayError;
     }
   } catch (error) {
+    if (error instanceof RelayRequiredError || error instanceof SessionEndedError) throw error;
     console.warn('Failed to fetch ICE servers, falling back to STUN-only:', error);
   }
 
-  const { pc, inputChannel, controlChannel } = createPeerConnection(iceServers);
+  const { pc, inputChannel, controlChannel } = createPeerConnection(iceServers, relayOnly);
+  // Trickle ICE (#9182): listens from before setLocalDescription so no late
+  // local candidate is missed.
+  const trickle = createIceTrickle(pc, params);
 
   let closed = false;
   const close = () => {
     if (closed) return;
     closed = true;
+    trickle.stop();
     try { inputChannel.close(); } catch { /* ignore */ }
     try { controlChannel.close(); } catch { /* ignore */ }
     try { pc.close(); } catch { /* ignore */ }
@@ -330,6 +403,8 @@ export async function createWebRTCSession(
     if (!localDesc?.sdp) {
       throw new Error('Failed to generate local SDP');
     }
+    // Everything gathered so far is in this SDP; anything later trickles.
+    trickle.markOfferSent(localDesc.sdp);
 
     // POST offer to API — this triggers the agent to create a pion session
     const offerResp = await apiFetch(
@@ -356,15 +431,25 @@ export async function createWebRTCSession(
         throw new SessionEndedError(reason ?? undefined);
       }
       const msg = await offerResp.text().catch(() => 'unknown error');
+      if (offerResp.status === 409) {
+        // Isolation can change after the ICE fetch. Preserve the server's
+        // refusal here too, so the transport caller does not hide it.
+        let data: unknown;
+        try { data = JSON.parse(msg); } catch { /* keep the existing generic error */ }
+        const relayError = relayRequiredErrorFromResponse(data);
+        if (relayError) throw relayError;
+      }
       throw new Error(`Failed to submit WebRTC offer: ${msg}`);
     }
 
     // Poll for the answer (agent processes offer and returns SDP answer)
-    const answerSdp = await pollForAnswer(params, 15000);
+    const answerSdp = await pollForAnswer(params, DEFAULT_ANSWER_TIMEOUT_MS, hooks);
 
     await pc.setRemoteDescription(
       new RTCSessionDescription({ type: 'answer', sdp: answerSdp }),
     );
+    // Send our late candidates and fetch the agent's (#9182).
+    trickle.start(answerSdp);
 
     return {
       pc,
@@ -413,6 +498,37 @@ function waitForIceGathering(pc: RTCPeerConnection, timeoutMs: number): Promise<
  * disconnect with no recorded reason, so a null return here is the normal,
  * silent case, not an error condition worth logging.
  */
+/**
+ * #10542: tell the API a reconnect is starting, before the old peer is closed.
+ *
+ * Closing the old peer makes the agent report a peer drop at once. The API
+ * holds that report for a short grace instead of ending the session (and
+ * revoking this viewer's token) only when the viewer fetched ICE servers for
+ * the still-active session first. createWebRTCSession fetches them too, but
+ * only after the old peer is gone, which can lose the race to the agent's
+ * report. Best effort: any failure, or no answer within `timeoutMs`, lets the
+ * reconnect go ahead exactly as before.
+ */
+export async function announceViewerReconnect(
+  params: AuthenticatedConnectionParams,
+  timeoutMs = 2_000,
+): Promise<void> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    await apiFetch(
+      params.apiUrl,
+      `/api/v1/desktop-ws/${params.sessionId}/viewer/ice-servers`,
+      params.accessToken,
+      { signal: controller.signal },
+    );
+  } catch {
+    // Best effort; the reconnect itself reports any real failure.
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function fetchSessionEndedReason(params: AuthenticatedConnectionParams): Promise<string | null> {
   try {
     const resp = await apiFetch(
@@ -435,8 +551,17 @@ async function fetchSessionEndedReason(params: AuthenticatedConnectionParams): P
  * Also checks for session failure so the viewer sees agent-side errors
  * immediately instead of waiting for the full timeout.
  */
-async function pollForAnswer(params: AuthenticatedConnectionParams, timeoutMs: number): Promise<string> {
+async function pollForAnswer(
+  params: AuthenticatedConnectionParams,
+  defaultTimeoutMs: number,
+  hooks: WebRTCSessionHooks,
+): Promise<string> {
   const start = Date.now();
+  // #6818: re-derived from every successful poll. In consent mode the agent
+  // holds its answer until the end user clicks Allow, so the API's budget
+  // (consent dialog + on-demand helper spawn) replaces the default.
+  let timeoutMs = defaultTimeoutMs;
+  let awaitingApprovalReported = false;
   let intervalMs = ANSWER_POLL_INITIAL_INTERVAL_MS;
   // Remembered so a timeout can say WHY it timed out. Without this a server
   // returning 503 for 15s is indistinguishable from an agent that never
@@ -452,18 +577,28 @@ async function pollForAnswer(params: AuthenticatedConnectionParams, timeoutMs: n
 
     if (resp.ok) {
       const data = await resp.json();
-      // SEC-038 W06: a terminal failure, a pending/confirmed teardown, or an
+      // A terminal failure, a pending/confirmed teardown, or an
       // ended status all take precedence over an answer from an earlier
       // attempt on this session. Never reconnect using stale signaling data.
       const verdict = classifyAnswerPoll(data);
       if (verdict.kind === 'failed') {
         throw new AgentSessionError(verdict.message || 'Remote desktop failed to start on agent');
       }
+      if (verdict.kind === 'denied') {
+        // The consent gate refused the start and the API revoked the viewer
+        // token, so this sessionId can never connect: terminal, no fallback.
+        throw new SessionEndedError(verdict.message);
+      }
       if (verdict.kind === 'ended') {
         throw new SessionEndedError();
       }
       if (verdict.kind === 'answer') {
         return verdict.answer;
+      }
+      timeoutMs = resolveAnswerTimeoutMs(data, defaultTimeoutMs);
+      if (data.promptMode === 'consent' && !awaitingApprovalReported) {
+        awaitingApprovalReported = true;
+        hooks.onAwaitingUserApproval?.();
       }
     } else if (isSessionEndedResponse(resp.status)) {
       // Session ended/revoked server-side mid-poll — stop immediately so the
@@ -491,7 +626,7 @@ async function pollForAnswer(params: AuthenticatedConnectionParams, timeoutMs: n
     } else {
       // 5xx/408 — genuinely transient, so keep polling. Log the first of each
       // kind so a real outage is visible rather than silently absorbed into a
-      // generic timeout 15s later.
+      // generic timeout later.
       if (resp.status !== lastErrorStatus) {
         console.warn(`Answer poll got HTTP ${resp.status}; retrying until timeout`);
       }

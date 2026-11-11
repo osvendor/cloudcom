@@ -12,6 +12,7 @@
         "low": "Bajo",
         "medium": "Medio"
       },
+      "customRangeIncomplete": "Elige una fecha de inicio y una de fin (primero el inicio, con 366 días de diferencia como máximo) para aplicar un rango personalizado.",
       "dashboardOptions": {
         "capacity": "Planificación de capacidad",
         "operations": "Resumen de operaciones",
@@ -31,7 +32,8 @@
       "subtitle": "Información sobre su flota y servicios",
       "title": "Analítica",
       "trend": {
-        "operationalHealth": "Salud operativa"
+        "operationalHealth": "Salud operativa",
+        "weekOf": "Semana del {{date}}"
       },
       "widgets": {
         "alertTable": {
@@ -40,7 +42,7 @@
           "title": "Estadísticas de alerta"
         },
         "capacity": {
-          "title": "Previsión de capacidad"
+          "title": "Previsión de capacidad de disco"
         },
         "complianceGauge": {
           "policiesEvaluated": "Políticas {{count}} evaluadas",
@@ -61,10 +63,11 @@
           "title": "Sesiones remotas"
         },
         "uptime": {
-          "label": "Tiempo de actividad de la flota",
+          "label": "En línea ahora",
           "title": "tiempo de actividad"
         }
-      }
+      },
+      "dateRangeSelectLabel": "Rango de fechas"
     },
     "capacityForecast": {
       "actual": "Real",
@@ -103,6 +106,7 @@
     },
     "gaugeWidget": {
       "criticalValue": "Crítico {{value}}",
+      "noData": "No hay comprobaciones de cumplimiento para evaluar",
       "warnValue": "Advertir {{value}}"
     },
     "queryBuilder": {
@@ -113,7 +117,8 @@
         "p95": "P95",
         "sum": "Suma"
       },
-      "description": "Configure métricas y agregación para su panel",
+      "coverageNote": "Las consultas solo cubren los primeros {{count}} dispositivos en línea. Los dispositivos sin conexión y el resto de una flota mayor no se incluyen.",
+      "description": "Elija una métrica y una agregación para consultar sus dispositivos en línea",
       "errors": {
         "failedToExecuteQuery": "No se pudo ejecutar la consulta",
         "noDevicesSelected": "No hay dispositivos seleccionados para la consulta"
@@ -127,28 +132,13 @@
         "timeRange": "Rango de tiempo"
       },
       "metricNames": {
-        "activeDevices": "Dispositivos activos",
-        "automationRuns": "Ejecuciones de automatización",
         "cpuUtilization": "CPU Utilización",
         "diskUsage": "Uso del disco",
-        "incidentCount": "Recuento de incidentes",
-        "loginVolume": "Volumen de inicio de sesión",
         "memoryUtilization": "Utilización de la memoria",
-        "mfaAdoption": "MFA Adopción",
-        "networkThroughput": "Rendimiento de la red",
-        "patchCompliance": "Cumplimiento de parches",
-        "remoteSessions": "Sesiones remotas",
-        "responseTime": "Tiempo de respuesta",
-        "slaCompliance": "SLA Cumplimiento",
-        "threatAlerts": "Alertas de amenazas",
-        "uptime": "tiempo de actividad",
-        "vulnerabilityScore": "Puntuación de vulnerabilidad"
+        "networkThroughput": "Rendimiento de la red"
       },
       "metricTypes": {
-        "availability": "Disponibilidad",
-        "performance": "Rendimiento",
-        "security": "Seguridad",
-        "usage": "Uso"
+        "performance": "Rendimiento"
       },
       "runQuery": "Ejecutar consulta",
       "running": "En ejecución...",
@@ -164,7 +154,16 @@
     "slaComplianceCard": {
       "defaultPeriodLabel": "últimos 30 días",
       "downtime": "Tiempo de inactividad {{value}}",
+      "exclusions": {
+        "maintenanceApplied": "Ventanas de mantenimiento excluidas",
+        "maintenanceSkipped": "Ventanas de mantenimiento no excluidas: demasiados dispositivos para revisar",
+        "maintenanceUnavailable": "Ventanas de mantenimiento no excluidas: estado no disponible",
+        "none": "Sin exclusiones",
+        "title": "Exclusiones",
+        "weekends": "Fines de semana excluidos"
+      },
       "incidents": "incidentes {{count}}",
+      "noDevices": "Aún no se midieron dispositivos",
       "status": {
         "atRisk": "En riesgo",
         "breach": "Incumplimiento",
@@ -172,6 +171,34 @@
       },
       "targetUptime": "Objetivo {{target}}% de tiempo de actividad",
       "title": "SLA Cumplimiento"
+    },
+    "slaEmptyState": {
+      "create": "Crear definición de SLA",
+      "created": "Definición de SLA creada",
+      "description": "Una definición de SLA fija el objetivo de disponibilidad con el que esta pestaña mide sus dispositivos. Cree una para empezar a seguir el cumplimiento.",
+      "errors": {
+        "create": "No se pudo crear la definición de SLA"
+      },
+      "form": {
+        "cancel": "Cancelar",
+        "excludeMaintenance": "Excluir dispositivos en una ventana de mantenimiento",
+        "excludeWeekends": "Excluir fines de semana",
+        "measurementWindow": "Período de medición",
+        "name": "Nombre",
+        "organization": "Organización",
+        "scopeNote": "Mide todos los dispositivos de la organización.",
+        "selectOrganization": "Seleccione una organización",
+        "submit": "Crear",
+        "uptimeTarget": "Objetivo de disponibilidad (%)",
+        "uptimeTargetInvalid": "Ingrese un valor de 0 a 100.",
+        "windows": {
+          "daily": "Diario",
+          "monthly": "Mensual",
+          "weekly": "Semanal"
+        }
+      },
+      "noPermission": "Pida a un administrador con acceso de gestión de organizaciones que cree una definición de SLA.",
+      "title": "Aún no hay una definición de SLA"
     },
     "tableWidget": {
       "filterPlaceholder": "Filtrar",
@@ -224,6 +251,16 @@
       "serverReplaceAgeYears": "Planificar reemplazo de servidores después de (años)",
       "serverReplaceAgeYearsHelp": "Los servidores siguen su propio calendario y se listan en una sección separada del informe."
     },
+    "backupStatusOptions": {
+      "cancel": "Cancelar",
+      "createReport": "Crear informe",
+      "includeDevicesWithoutBackup": "Incluir equipos sin ningún respaldo",
+      "includeDevicesWithoutBackupHelp": "Si está desactivado, el informe solo lista equipos con alguna evidencia de respaldo, como el correo resumen propio del proveedor.",
+      "sources": "Fuentes de respaldo",
+      "sourcesHelp": "Elija qué fuentes de respaldo incluir en el informe.",
+      "sourceBreeze": "Respaldo de Breeze",
+      "sourceProvider": "Proveedores de respaldo conectados"
+    },
     "vulnerabilityManagementOptions": {
       "cancel": "Cancelar",
       "createReport": "Crear informe",
@@ -252,6 +289,12 @@
     },
     "reportEditPage": {
       "backToReports": "Volver a Informes",
+      "backupPreview": {
+        "description": "Genera la instantánea de respaldos actual con las opciones anteriores. Solo se ejecuta cuando lo solicitas.",
+        "error": "No se pudo generar la vista previa.",
+        "run": "Generar vista previa",
+        "title": "Vista previa"
+      },
       "description": "Actualice la configuración de \"{{name}}\".",
       "errors": {
         "fetchReport": "No se pudo recuperar el informe",
@@ -300,6 +343,13 @@
         "replaceNow": "Reemplazar ahora",
         "unknownAge": "Antigüedad desconocida"
       },
+      "backupStatus": {
+        "healthy": "Correcto",
+        "warning": "Advertencia",
+        "critical": "Crítico",
+        "unknown": "Desconocido",
+        "truncated": "La lista de equipos alcanzó su límite de filas y está incompleta."
+      },
       "vulnerabilityManagement": {
         "critical": "Críticos abiertos",
         "expiringExceptions": "Excepciones que vencen el próximo período",
@@ -322,7 +372,16 @@
         "security_compliance_posture": "Postura de seguridad y cumplimiento",
         "software_inventory": "Inventario de software",
         "threat_detection_review": "Revisión de detección de amenazas",
-        "endpoint_management_review": "Revisión de administración de endpoints"
+        "endpoint_management_review": "Revisión de administración de endpoints",
+        "ticket_sla_attainment": "Cumplimiento de SLA de tickets",
+        "technician_time_billability": "Tiempo y facturabilidad del técnico",
+        "ar_aging": "Antigüedad de cuentas por cobrar",
+        "ai_usage_by_client": "Uso de IA por cliente",
+        "mrr_renewals": "MRR y renovaciones",
+        "quote_win_rate": "Tasa de éxito de cotizaciones",
+        "client_profitability": "Rentabilidad por cliente",
+        "ticket_sla_performance": "Rendimiento de SLA",
+        "backup_status": "Estado de respaldo"
       },
       "threatDetection": {
         "agents": "Equipos con agente de detección",
@@ -351,6 +410,29 @@
         "noncompliant": "Sin cumplimiento",
         "notMeasured": "N/D",
         "staleEnrolments": "Inscripciones obsoletas"
+      },
+      "slaPerformance": {
+        "priority": "Prioridad",
+        "ticketsOpened": "Tickets abiertos",
+        "firstResponse": "Primera respuesta",
+        "resolution": "Resolución",
+        "target": "Objetivo",
+        "measured": "Medidos",
+        "withinSla": "% dentro del SLA",
+        "median": "Mediana",
+        "mean": "Media",
+        "varies": "varía",
+        "breaches": "Incumplimientos",
+        "breachCount_one": "{{count}} incumplimiento",
+        "breachCount_other": "{{count}} incumplimientos",
+        "unavailable": "No se pudo leer el resumen de SLA de esta ejecución, por lo que no se puede mostrar aquí. Vuelva a generar el informe.",
+        "notes": "Qué se mide",
+        "priorities": {
+          "urgent": "Urgente",
+          "high": "Alta",
+          "normal": "Normal",
+          "low": "Baja"
+        }
       },
       "identityAccess": {
         "notMeasured": "N/D",
@@ -390,7 +472,7 @@
         "fetchReports": "No se pudieron recuperar los informes",
         "generateReport": "No se pudo generar el informe",
         "generic": "Se produjo un error",
-        "noCompletedRun": "Todavía no hay una narrativa completada para abrir"
+        "noCompletedRun": "Todavía no hay una ejecución completada para abrir"
       },
       "formats": {
         "csv": "CSV",
@@ -399,6 +481,7 @@
       },
       "loading": "Cargando informes...",
       "never": "Nunca",
+      "notGeneratedYet": "Aún no generado",
       "success": {
         "generated": "Informe \"{{name}}\" generado."
       },
@@ -419,14 +502,24 @@
         "security_compliance_posture": "Postura de seguridad y cumplimiento",
         "software_inventory": "Inventario de software",
         "threat_detection_review": "Revisión de detección de amenazas",
-        "endpoint_management_review": "Revisión de administración de endpoints"
+        "endpoint_management_review": "Revisión de administración de endpoints",
+        "ticket_sla_attainment": "Cumplimiento de SLA de tickets",
+        "technician_time_billability": "Tiempo y facturabilidad del técnico",
+        "ar_aging": "Antigüedad de cuentas por cobrar",
+        "ai_usage_by_client": "Uso de IA por cliente",
+        "mrr_renewals": "MRR y renovaciones",
+        "quote_win_rate": "Tasa de éxito de cotizaciones",
+        "client_profitability": "Rentabilidad por cliente",
+        "ticket_sla_performance": "Rendimiento de SLA",
+        "backup_status": "Estado de respaldo"
       },
       "runsTable": {
         "actions": "Acciones",
         "completed": "Terminado",
         "report": "Informe",
         "started": "Iniciado",
-        "status": "Estado"
+        "status": "Estado",
+        "organization": "Organización"
       },
       "schedules": {
         "daily": "A diario",
@@ -446,7 +539,8 @@
         "lastGenerated": "Última generación",
         "name": "Nombre",
         "schedule": "Cronograma",
-        "type": "Tipo"
+        "type": "Tipo",
+        "covers": "Cubre"
       },
       "tabs": {
         "recentRuns": "Ejecuciones recientes",
@@ -455,7 +549,21 @@
       "templates": "Plantillas",
       "title": "Informes",
       "tryAgain": "Intentar otra vez",
-      "unknownReport": "Informe desconocido"
+      "unknownReport": "Informe desconocido",
+      "partnerWideIncomplete": "No se pudieron cargar algunos informes que abarcan todas las organizaciones, por lo que esta lista puede estar incompleta. Cambia a Todas las organizaciones para ver todos los informes.",
+      "covers": {
+        "combined": "Todas las organizaciones · Combinado",
+        "unknownOrg": "Organización desconocida",
+        "seriesAll": "Todas las orgs · {{count}} · Uno por organización",
+        "seriesSelected_one": "{{count}} org · Uno por organización",
+        "seriesSelected_other": "{{count}} orgs · Uno por organización"
+      },
+      "delivery": {
+        "noRecipients": "Sin destinatarios",
+        "noRecipientsHint": "La última ejecución programada no tenía a quién enviar. Agrega destinatarios para entregar este informe.",
+        "partial": "Entregado parcialmente",
+        "failed": "Correo no enviado"
+      }
     },
     "reportBuilder": {
       "actions": {
@@ -729,6 +837,7 @@
           "os": "OS",
           "owner": "Propietario",
           "patch_level": "Nivel de parche",
+          "product_number": "Número de producto",
           "serial": "Serie",
           "site": "Sitio",
           "status": "Estado"
@@ -800,7 +909,11 @@
         "updateFailed": "No se pudieron actualizar los destinatarios del informe",
         "convertFailed": "No se pudo convertir esta dirección de correo electrónico",
         "mfaRequired": "La conversión de un destinatario requiere autenticación multifactor. Activa MFA en tu perfil y vuelve a intentarlo.",
-        "loadFailed": "No se pudieron cargar los destinatarios del informe"
+        "loadFailed": "No se pudieron cargar los destinatarios del informe",
+        "businessEmailOnly": "Los informes de negocio se envían solo a las direcciones de correo electrónico de abajo. No se pueden agregar contactos de la organización.",
+        "partnerOwnedEmailOnly": "Este informe abarca todas las organizaciones, por lo que se envía solo a las direcciones de correo electrónico de abajo. No se pueden agregar contactos de la organización.",
+        "oneTimeNotEmailed": "Los informes de una sola vez no se envían por correo electrónico. Elija una programación recurrente para enviar este informe a los contactos.",
+        "emailAddresses": "Direcciones de correo electrónico"
       },
       "previewTable": {
         "selectFields": "Seleccione campos para completar la tabla de vista previa."
@@ -834,6 +947,9 @@
         "everyDay": "Cada día"
       },
       "scheduleOptions": {
+        "one_time": {
+          "label": "Una sola vez"
+        },
         "daily": {
           "label": "A diario"
         },
@@ -878,6 +994,7 @@
           "title": "Tipo de informe"
         }
       },
+      "removeField": "Quitar {{field}}",
       "selectedFields": "Campos seleccionados",
       "success": {
         "created": "Informe \"{{name}}\" guardado.",
@@ -897,7 +1014,12 @@
         "tuesday": "Martes",
         "wednesday": "Miércoles"
       },
-      "where": "Dónde"
+      "where": "Dónde",
+      "filterLabels": {
+        "logic": "Lógica de filtro",
+        "field": "Campo de filtro",
+        "operator": "Operador de filtro"
+      }
     },
     "reportTemplates": {
       "blankConfigurationDescription": "Configure un informe desde cero o comience con una configuración en blanco.",
@@ -934,7 +1056,16 @@
         "security_compliance_posture": "Postura de seguridad y cumplimiento",
         "software_inventory": "Inventario de software",
         "threat_detection_review": "Revisión de detección de amenazas",
-        "endpoint_management_review": "Revisión de administración de endpoints"
+        "endpoint_management_review": "Revisión de administración de endpoints",
+        "ticket_sla_attainment": "Cumplimiento de SLA de tickets",
+        "technician_time_billability": "Tiempo y facturabilidad del técnico",
+        "ar_aging": "Antigüedad de cuentas por cobrar",
+        "ai_usage_by_client": "Uso de IA por cliente",
+        "mrr_renewals": "MRR y renovaciones",
+        "quote_win_rate": "Tasa de éxito de cotizaciones",
+        "client_profitability": "Rentabilidad por cliente",
+        "ticket_sla_performance": "Rendimiento de SLA",
+        "backup_status": "Estado de respaldo"
       },
       "schedules": {
         "daily": "A diario",
@@ -945,6 +1076,8 @@
       "spec": {
         "cadence": "Cadencia",
         "defaultRange": "Rango predeterminado",
+        "lastFullMonth": "Último mes completo",
+        "asOfRunDate": "A la fecha de ejecución",
         "format": "Formato"
       },
       "success": {
@@ -988,11 +1121,59 @@
         "endpoint_management_review": {
           "description": "Evidencia de Microsoft Intune: cobertura de inscripción, desglose de cumplimiento con tendencia de 30 días, inscripciones obsoletas y licencias, indicando la actualidad de cada sincronización.",
           "name": "Revisión de administración de endpoints de Intune"
+        },
+        "ticket_sla_attainment": {
+          "name": "Cumplimiento de SLA de tickets",
+          "description": "Cumplimiento de respuesta y resolución del período, recalculado a partir de las marcas de tiempo del ticket en lugar de leerse de los sellos de incumplimiento, de modo que un ticket respondido tarde pero eventualmente respondido sigue contando como incumplido. Agrupado por organización, prioridad, técnico o categoría."
+        },
+        "technician_time_billability": {
+          "name": "Tiempo y facturabilidad del técnico",
+          "description": "Tiempo registrado frente a una capacidad semanal asumida, el desglose facturable / incluido / no facturable, y cuánto del tiempo facturable ha sido realmente aprobado y facturado. Los técnicos sin tiempo registrado en el período aparecen en cero en lugar de omitirse."
+        },
+        "ar_aging": {
+          "name": "Antigüedad de cuentas por cobrar",
+          "description": "Saldos de facturas impagas agrupados en corriente / 1–30 / 31–60 / 61–90 / más de 90 días de mora, un conjunto de totales por moneda sin conversión. Las facturas sin fecha de vencimiento reciben su propio grupo, nunca \"corriente\"."
+        },
+        "ai_usage_by_client": {
+          "name": "Uso de IA por cliente",
+          "description": "Uso de IA de la plataforma por cliente en el período: solicitudes, tokens, costo de Breeze, el monto a cobrar según el perfil de facturación del cliente y lo que ya se facturó. El uso incluido y los modelos sin precio se muestran por separado, nunca mezclados."
+        },
+        "mrr_renewals": {
+          "name": "MRR y renovaciones",
+          "description": "Ingresos recurrentes mensuales y anuales de los contratos activos, medidos el día en que se ejecuta el informe, con los contratos que se renuevan dentro del horizonte elegido y lo que realmente se ha facturado como recurrente. Un conjunto de totales por moneda, sin conversión."
+        },
+        "quote_win_rate": {
+          "name": "Tasa de éxito de cotizaciones",
+          "description": "La proporción de cotizaciones enviadas que se ganaron, contada por oportunidad, de modo que una cotización revisada y reenviada cuenta una sola vez. La tasa principal incluye solo las oportunidades resueltas, con la cantidad aún abierta al lado. Los valores son antes de impuestos, un conjunto por moneda, sin conversión."
+        },
+        "ticket_sla_performance": {
+          "name": "Rendimiento de SLA",
+          "description": "Tiempos de respuesta y resolución frente al SLA, listos para el cliente, por prioridad y con incumplimientos."
+        },
+        "client_profitability": {
+          "name": "Rentabilidad por cliente",
+          "description": "Ingresos facturados por cliente en el período, por fuente (recurrentes, mano de obra, productos, IA, otros), con las horas registradas y una estimación opcional del costo laboral a partir de una tarifa por hora única. Las cifras que usan esa tarifa se rotulan como estimaciones. Un conjunto de totales por moneda, nunca convertido."
+        },
+        "backup_status": {
+          "name": "Informe de estado de respaldo",
+          "description": "Estado de respaldo de cada equipo en Breeze y los proveedores de respaldo conectados, en una sola instantánea: categorías de cobertura, último respaldo exitoso y un historial de 28 días por equipo."
         }
       },
       "title": "Plantillas de informes",
       "useTemplate": "Usar plantilla",
-      "useTemplateTitle": "Utilice {{name}}"
+      "useTemplateTitle": "Utilice {{name}}",
+      "groups": {
+        "business": "Negocio",
+        "general": "Otros",
+        "businessDescription": "Cifras del propio negocio del MSP, no de los dispositivos de los clientes — solo para el personal."
+      },
+      "delivery": {
+        "contactsLoading": "Cargando los contactos de la organización…",
+        "contactsFailed": "No se pudieron cargar los contactos de esta organización. Aún puede agregar direcciones de correo electrónico.",
+        "noContacts": "Esta organización no tiene contactos con dirección de correo electrónico.",
+        "removeEmail": "Quitar {{email}}",
+        "recipientsFailed": "Se creó el informe \"{{name}}\", pero no se pudieron agregar todos sus destinatarios. Agréguelos desde el informe."
+      }
     },
     "threatDetectionOptions": {
       "cancel": "Cancelar",
@@ -1024,6 +1205,388 @@
       "adminDetail": "Incluir el detalle de inicios de sesión de administradores",
       "adminDetailHelp": "Lista cada inicio de sesión interactivo de una cuenta con rol de administrador, incluida la dirección de origen. Es la sección que un auditor lee primero.",
       "coverageNote": "El informe cubre únicamente inicios de sesión interactivos e imprime la ventana que realmente cubre. Microsoft conserva los registros de inicio de sesión unos 30 días y exige una licencia Entra ID P1 o P2 para entregarlos, por lo que el primer informe tras activar la recolección es parcial y lo declara."
+    },
+    "reportPeriod": {
+      "label": "Período del informe",
+      "kinds": {
+        "last_full_month": "Último mes completo",
+        "last_30_days": "Últimos 30 días",
+        "last_quarter": "Último trimestre completo",
+        "custom": "Fechas personalizadas"
+      },
+      "start": "Fecha de inicio",
+      "end": "Fecha de fin (incluida)",
+      "help": "Los períodos predefinidos se calculan cada vez que se ejecuta el informe, así que una programación mensual siempre cubre el mes que acaba de terminar.",
+      "errors": {
+        "missing": "Elige una fecha de inicio y una fecha de fin.",
+        "invalid": "Ambas fechas deben ser fechas reales del calendario.",
+        "order": "La fecha de inicio no puede ser posterior a la fecha de fin."
+      }
+    },
+    "ticketSlaOptions": {
+      "approximationNote": "El cumplimiento se recalcula a partir de las marcas de tiempo del ticket en lugar de leer los indicadores de incumplimiento, por lo que un ticket respondido tarde sigue contando como incumplido. El tiempo en pausa se guarda como un total acumulado, así que las pausas posteriores a la primera respuesta mejoran levemente el cumplimiento de respuesta.",
+      "groupBy": "Agrupar por",
+      "groupByAutomatic": "Automático: por organización para todas las organizaciones, por prioridad para una sola organización",
+      "groupByValues": {
+        "organization": "Organización",
+        "priority": "Prioridad",
+        "technician": "Técnico (asignado actual)",
+        "category": "Categoría"
+      },
+      "technicianNote": "Los tickets se agrupan por su asignado actual. El historial de reasignaciones no se registra, así que no es necesariamente el técnico que respondió.",
+      "includeNoSla": "Listar tickets sin objetivo de SLA",
+      "includeNoSlaHelp": "Los tickets sin objetivo de SLA siempre se cuentan por separado y nunca afectan el cumplimiento. Esta opción solo controla si aparecen en las filas de detalle.",
+      "cancel": "Cancelar",
+      "createReport": "Crear informe"
+    },
+    "technicianTimeOptions": {
+      "groupBy": "Agrupar por",
+      "groupByValues": {
+        "technician": "Técnico",
+        "organization": "Organización",
+        "work_type": "Tipo de trabajo"
+      },
+      "orgAxisNote": "Las entradas de tiempo sin organización aparecen en su propia fila \"Sin organización\". Un informe que pertenece a una sola organización solo ve el tiempo registrado en sus tickets.",
+      "capacityHours": "Capacidad semanal por técnico (horas)",
+      "capacityHoursHelp": "La utilización supone la misma capacidad para cada técnico, prorrateada por días hábiles. No se modelan vacaciones ni jornadas a tiempo parcial.",
+      "cancel": "Cancelar",
+      "createReport": "Crear informe"
+    },
+    "arAgingOptions": {
+      "asOf": "Antigüedad de saldos al",
+      "asOfHelp": "Déjalo vacío para calcular la antigüedad al día en que se ejecuta el informe. Una fecha solo mueve la fecha de referencia: los saldos son los actuales, así que no reconstruye saldos pasados ni deshace pagos registrados después de esa fecha.",
+      "asOfInvalid": "Ingresa una fecha real del calendario o deja el campo vacío.",
+      "groupBy": "Agrupar por",
+      "groupByValues": {
+        "organization": "Organización",
+        "currency": "Moneda"
+      },
+      "currencyNote": "Cada moneda tiene sus propios totales. Los montos no se convierten entre monedas.",
+      "includePaidInPeriod": "Listar facturas pagadas en lo que va del mes",
+      "includePaidInPeriodHelp": "Agrega una nota con las facturas pagadas por completo desde el primer día del mes de referencia hasta la fecha de referencia. Nunca cambia los tramos de antigüedad.",
+      "cancel": "Cancelar",
+      "createReport": "Crear informe"
+    },
+    "aiUsageByClientOptions": {
+      "groupBy": "Agrupar por",
+      "groupByAutomatic": "Automático: por organización para todas las organizaciones, por modelo para una sola organización",
+      "groupByValues": {
+        "organization": "Organización",
+        "model": "Modelo"
+      },
+      "periodNote": "Los cargos se facturan por mes calendario UTC. Un período definido en otra zona horaria puede diferir de la factura para el uso cercano a los límites del mes.",
+      "unpricedNote": "El uso de un modelo sin tarifa en el perfil de facturación del cliente se cuenta como sin precio. Nunca se trata como gratuito.",
+      "cancel": "Cancelar",
+      "createReport": "Crear informe"
+    },
+    "mrrRenewalsOptions": {
+      "runTimeNote": "Este informe siempre se mide el día en que se ejecuta. No tiene período ni fecha de corte que configurar.",
+      "groupBy": "Agrupar por",
+      "groupByValues": {
+        "organization": "Organización",
+        "contract": "Contrato"
+      },
+      "renewalHorizon": "Horizonte de renovación",
+      "renewalHorizonOption": "Próximos {{days}} días",
+      "renewalHorizonHelp": "Los contratos cuyo plazo termina dentro de esta ventana se listan como renovaciones.",
+      "cancel": "Cancelar",
+      "createReport": "Crear informe"
+    },
+    "quoteWinRateOptions": {
+      "groupBy": "Agrupar por",
+      "groupByAutomatic": "Automático: por organización para todas las organizaciones, por autor para una organización",
+      "groupByValues": {
+        "organization": "Organización",
+        "author": "Autor",
+        "currency": "Moneda"
+      },
+      "periodNote": "El período se aplica a la fecha en que se envió la cotización por primera vez. Una cotización revisada y reenviada cuenta una sola vez, como una oportunidad.",
+      "cancel": "Cancelar",
+      "createReport": "Crear informe"
+    },
+    "ticketSlaPerformanceOptions": {
+      "includeSubjects": "Incluir asuntos de los tickets",
+      "includeSubjectsHelp": "Los informes entregados son visibles para todos los usuarios del portal de esta organización. Déjelo desactivado salvo que todos los usuarios puedan ver el asunto de cada ticket.",
+      "cancel": "Cancelar",
+      "createReport": "Crear informe"
+    },
+    "clientProfitabilityOptions": {
+      "groupBy": "Agrupar por",
+      "groupByDefault": "Predeterminado según el alcance del informe",
+      "groupByValues": {
+        "organization": "Organización",
+        "source": "Fuente"
+      },
+      "groupByHelp": "Por defecto se agrupa por organización en un informe de todas las organizaciones y por fuente en una sola organización.",
+      "laborEnabled": "Estimar el costo laboral",
+      "laborAmount": "Costo laboral por hora",
+      "laborCurrency": "Moneda",
+      "laborHelp": "Una tarifa única para todos los técnicos. Las cifras que la usan se rotulan como estimaciones.",
+      "cancel": "Cancelar",
+      "createReport": "Crear informe"
+    },
+    "ownerScope": {
+      "legend": "El informe abarca",
+      "allOrganizations": "Todas las organizaciones",
+      "allOrganizationsHint": "Abarca todas las organizaciones activas y de prueba, determinadas en cada ejecución. Las organizaciones excluidas se indican en las notas del informe. Requiere acceso a todas las organizaciones.",
+      "singleOrganization": "Una organización",
+      "singleOrganizationHint": "La organización seleccionada en el selector de organizaciones.",
+      "singleOrganizationDisabledHint": "Selecciona una organización en el selector de organizaciones para crear un informe con ámbito de organización.",
+      "needsOrganizationHint": "Selecciona una organización en el selector de organizaciones para crear este informe. Los informes de todas las organizaciones requieren acceso a todas las organizaciones."
+    },
+    "orgPicker": {
+      "label": "Organización",
+      "placeholder": "Elige una organización",
+      "hint": "Estás viendo todas las organizaciones. Elige la organización para la que es este informe.",
+      "required": "Elige una organización antes de guardar este informe.",
+      "chooseFirst": "Elige una organización arriba antes de usar una plantilla.",
+      "previewNeedsOrg": "Elige una organización para ver una vista previa en vivo."
+    },
+    "series": {
+      "covers": {
+        "legend": "El informe abarca",
+        "org": "Una organización",
+        "orgHint": "Un informe para un cliente, enviado a los contactos de esa organización.",
+        "series": "Un informe por organización",
+        "seriesHint": "Una definición, con una copia independiente para cada organización que abarca, enviada a los contactos de esa organización.",
+        "combined": "Todas las organizaciones combinadas",
+        "combinedHint": "Un informe combinado de todas sus organizaciones, para su propio equipo."
+      },
+      "schedule": {
+        "label": "Con qué frecuencia se envía la copia de cada organización",
+        "placeholder": "Elija una programación",
+        "hint": "Un informe enviado a muchas organizaciones se ejecuta según una programación, por lo que no puede ser único. Elija con qué frecuencia se envía la copia de cada organización.",
+        "required": "Elija con qué frecuencia se envía el informe."
+      },
+      "targeting": {
+        "legend": "Qué organizaciones",
+        "all": "Todas las organizaciones",
+        "allHint": "Incluye todas las organizaciones actuales y futuras. Desmarque las que desee omitir.",
+        "selected": "Organizaciones elegidas",
+        "selectedHint": "Incluye exactamente las organizaciones que marque.",
+        "search": "Buscar organizaciones",
+        "summary": "Abarca {{covered}} de {{total}} organizaciones",
+        "noneSelected": "Elija al menos una organización.",
+        "empty": "Ninguna organización coincide."
+      },
+      "recipients": {
+        "legend": "Quién recibe la copia de cada organización",
+        "primaryContact": "El contacto principal de la organización",
+        "roles": "Contactos con estos roles",
+        "noRuleWarning": "No hay ninguna regla seleccionada, por lo que una organización recibe su copia solo cuando usted agrega contactos en la copia de esa organización.",
+        "internalCc": "Copias internas",
+        "internalCcHint": "La copia de cada organización también se envía a estas direcciones de su equipo.",
+        "ccPlaceholder": "name@example.com",
+        "ccAdd": "Agregar",
+        "ccInvalid": "Ingrese una dirección de correo electrónico válida.",
+        "ccRemove": "Quitar {{email}}",
+        "previewLoading": "Comprobando destinatarios…",
+        "previewContacts_one": "Se resuelve en {{count}} contacto",
+        "previewContacts_other": "Se resuelve en {{count}} contactos",
+        "previewOrgs_one": "en {{count}} organización",
+        "previewOrgs_other": "en {{count}} organizaciones",
+        "previewMissing_one": "{{count}} organización no tiene destinatario cliente: {{names}}",
+        "previewMissing_other": "{{count}} organizaciones no tienen destinatario cliente: {{names}}",
+        "previewMore": "y {{count}} más",
+        "previewFailed": "No se pudieron comprobar los destinatarios. Aun así, se determinan para cada organización cuando se ejecuta su informe.",
+        "previewNoTargets": "Elija organizaciones para ver quién recibe el informe."
+      },
+      "builder": {
+        "filtersDisabled": "Los filtros de sitio, dispositivo y grupo no están disponibles aquí: la copia de cada organización abarca toda la organización.",
+        "created": "Informe multiorganización “{{name}}” creado",
+        "saved": "Informe multiorganización “{{name}}” guardado",
+        "saveFailed": "No se pudo guardar el informe multiorganización.",
+        "targetsFailed": "Se guardó la configuración, pero no se actualizaron las organizaciones abarcadas. Intente guardar de nuevo."
+      },
+      "list": {
+        "filtersLabel": "Mostrar",
+        "filters": {
+          "all": "Todos",
+          "multi": "Multiorganización",
+          "single": "Una organización",
+          "combined": "Combinado"
+        },
+        "noMatches": "Ningún informe coincide con este filtro.",
+        "loadFailed": "No se pudieron cargar los informes multiorganización. Se muestran los demás informes.",
+        "multiOrgBadge": "Multiorganización",
+        "multiOrgBadgeTitle": "Parte del informe multiorganización “{{name}}”",
+        "expand": "Mostrar organizaciones",
+        "collapse": "Ocultar organizaciones",
+        "summary": "{{date}} · {{delivered}}/{{total}} entregados",
+        "summaryNoRecipient_one": "{{count}} sin destinatario",
+        "summaryNoRecipient_other": "{{count}} sin destinatario",
+        "summaryBlocked_one": "{{count}} bloqueada",
+        "summaryBlocked_other": "{{count}} bloqueadas",
+        "summaryNever": "Aún no se ejecutó",
+        "runsSeriesColumn": "Informe multiorganización",
+        "actions": {
+          "edit": "Editar informe multiorganización",
+          "transferOwner": "Transferir propietario",
+          "delete": "Eliminar informe multiorganización",
+          "pause": "Pausar",
+          "resume": "Reanudar"
+        },
+        "pausedBadge": "En pausa",
+        "pausedTitle": "En pausa: ninguna copia de organización se ejecuta hasta que lo reanude.",
+        "paused": "“{{name}}” en pausa",
+        "resumed": "“{{name}}” reanudado",
+        "pauseFailed": "No se pudo pausar ni reanudar el informe multiorganización.",
+        "deleteTitle": "¿Eliminar el informe multiorganización?",
+        "deleteMessage": "“{{name}}” deja de ejecutarse. La copia de cada organización se archiva con su historial de ejecuciones.",
+        "deleteConfirm": "Eliminar",
+        "deleted": "Informe multiorganización “{{name}}” eliminado",
+        "deleteFailed": "No se pudo eliminar el informe multiorganización."
+      },
+      "drilldown": {
+        "columns": {
+          "org": "Organización",
+          "state": "Estado",
+          "lastRun": "Última ejecución",
+          "delivery": "Entrega",
+          "recipients": "Destinatarios",
+          "actions": "Acciones"
+        },
+        "states": {
+          "active": "Activa",
+          "excluded": "Excluida",
+          "ineligible": "No apta",
+          "blocked_no_authority": "Bloqueada: el propietario no tiene acceso",
+          "blocked_no_recipients": "Sin destinatario cliente",
+          "detached": "Desvinculada"
+        },
+        "delivery": {
+          "sent": "Enviado",
+          "not_scheduled": "No enviado por correo"
+        },
+        "neverRun": "Aún no se ejecutó",
+        "actions": {
+          "runNow": "Ejecutar ahora",
+          "editRecipients": "Editar destinatarios",
+          "exclude": "Excluir",
+          "include": "Incluir",
+          "detach": "Desvincular"
+        },
+        "lastOrgHint": "Un informe multiorganización con organizaciones elegidas necesita al menos una. Elimínelo en su lugar.",
+        "noAuthorityHint": "El propietario no puede acceder a esta organización, por lo que su copia no se ejecuta. Transfiera el propietario para solucionarlo.",
+        "excludeTitle": "¿Excluir a {{org}}?",
+        "excludeMessage": "{{org}} deja de recibir este informe. Su copia se archiva con su historial de ejecuciones, y al incluirla de nuevo se restaura la misma copia.",
+        "excludeConfirm": "Excluir",
+        "detachTitle": "¿Desvincular a {{org}}?",
+        "detachMessage": "La copia de {{org}} se convierte en un informe independiente que puede editar libremente. Conserva su historial de ejecuciones y deja de seguir este informe multiorganización. Mientras exista esa copia independiente, {{org}} queda fuera del informe multiorganización aunque la incluya de nuevo.",
+        "detachConfirm": "Desvincular",
+        "excluded": "{{org}} excluida",
+        "included": "{{org}} incluida",
+        "detached": "{{org}} desvinculada",
+        "generated": "Informe generado para {{org}}",
+        "updateFailed": "No se pudo actualizar el informe multiorganización.",
+        "detachFailed": "No se pudo desvincular el informe.",
+        "generateFailed": "No se pudo generar el informe.",
+        "detachedHint": "Su copia independiente se administra por separado. Elimina ese informe para volver a incluir esta organización en el informe multiorganización."
+      },
+      "transferOwner": {
+        "title": "Transferir propietario",
+        "description": "La copia de cada organización se ejecuta con el acceso del propietario. Elija un usuario del socio con acceso a todas las organizaciones.",
+        "label": "Nuevo propietario",
+        "placeholder": "Elija un usuario",
+        "current": "{{name}} (propietario actual)",
+        "confirm": "Transferir",
+        "loadFailed": "No se pudieron cargar los usuarios.",
+        "forbidden": "Necesita permiso para ver usuarios para transferir el propietario.",
+        "noCandidates": "Ningún otro usuario tiene acceso a todas las organizaciones.",
+        "transferred": "Propietario transferido a {{name}}",
+        "failed": "No se pudo transferir el propietario."
+      },
+      "child": {
+        "partOf": "Parte del informe multiorganización “{{name}}”",
+        "partOfUnnamed": "Parte de un informe multiorganización",
+        "lockedExplanation": "La configuración compartida se edita en el informe multiorganización. Aquí solo se pueden cambiar los destinatarios de esta organización.",
+        "managedByMsp": "Administrado por su MSP",
+        "managedExplanation": "Su MSP administra este informe. Usted puede cambiar quién recibe el informe en su organización.",
+        "editSeries": "Editar informe multiorganización",
+        "detach": "Desvincular",
+        "archived": "Esta copia está archivada: la organización ya no está abarcada por el informe multiorganización.",
+        "summary": {
+          "type": "Tipo",
+          "schedule": "Programación",
+          "format": "Formato"
+        },
+        "recipients": {
+          "title": "Destinatarios de esta organización",
+          "description": "Elija quién recibe la copia de esta organización, además de la regla del informe multiorganización.",
+          "default": "Seguir la regla",
+          "add": "Enviar siempre",
+          "remove": "No enviar nunca",
+          "byRule": "Incluido por regla",
+          "loadFailed": "No se pudieron cargar los destinatarios.",
+          "updated": "Destinatarios actualizados",
+          "updateFailed": "No se pudieron actualizar los destinatarios.",
+          "empty": "Esta organización no tiene contactos con dirección de correo electrónico."
+        }
+      },
+      "editPage": {
+        "title": "Editar informe multiorganización",
+        "description": "Los cambios se aplican a la copia de cada organización de “{{name}}”.",
+        "breadcrumb": "Informes",
+        "back": "Volver a Informes",
+        "loading": "Cargando informe multiorganización…",
+        "notFound": "Este informe multiorganización ya no existe.",
+        "loadFailed": "No se pudo cargar el informe multiorganización."
+      },
+      "errors": {
+        "seriesTypeUnsupported": "Este tipo de informe no se puede enviar como un informe por organización.",
+        "seriesConfigOrgSpecific": "Quite los filtros de sitio, dispositivo y grupo: un informe multiorganización abarca organizaciones completas.",
+        "seriesManaged": "Este informe pertenece a un informe multiorganización. Edite el informe multiorganización o desvincule primero esta copia.",
+        "seriesOwnerIneligible": "Ese usuario no puede ser propietario de un informe multiorganización.",
+        "seriesOwnerIneligiblePermission": "Ese usuario no puede ser propietario de un informe multiorganización: su rol no concede el permiso de exportación de informes (reports:export).",
+        "seriesOwnerIneligibleOrgAccess": "Ese usuario no puede ser propietario de un informe multiorganización: necesita acceso a todas las organizaciones.",
+        "seriesOwnerIneligibleInactive": "La cuenta de ese usuario no está activa, por lo que no puede ser propietario de un informe multiorganización.",
+        "seriesOwnerIneligibleMembership": "Ese usuario ya no es miembro de su socio, por lo que no puede ser propietario de un informe multiorganización.",
+        "seriesOwnerIneligibleNotPartner": "Ese usuario no pertenece a su socio, por lo que no puede ser propietario de un informe multiorganización.",
+        "seriesOwnerIneligibleTenantInactive": "Su cuenta de socio no está activa, por lo que un informe multiorganización no puede recibir un nuevo propietario.",
+        "seriesNotFound": "Este informe multiorganización ya no existe.",
+        "seriesWriteDenied": "Solo los usuarios del socio con acceso a todas las organizaciones pueden modificar informes multiorganización.",
+        "seriesTargetOrgInaccessible": "Una de las organizaciones elegidas no está disponible para usted.",
+        "seriesTargetOrgHidden": "Quick Support y la organización de espera de dispositivos sin asignar no pueden incluirse en un informe multiorganización.",
+        "reportNotSeriesChild": "Este informe ya no forma parte de un informe multiorganización.",
+        "recipientModeRequiresSeries": "\"No enviar nunca\" solo se aplica a una copia de un informe multiorganización.",
+        "recipientsNeedExportAndMfa": "Enviar informes a destinatarios requiere el permiso de exportación y el inicio de sesión con autenticación multifactor.",
+        "seriesAuthorityUnverifiable": "No se pudo confirmar el acceso del propietario en este momento. Intente de nuevo en un momento."
+      }
+    },
+    "seriesCombine": {
+      "banner": "Algunas organizaciones tienen informes casi idénticos que se pueden combinar en un informe multiorganización. Grupos encontrados: {{groups}}",
+      "review": "Revisar",
+      "title": "Combinar en un informe multiorganización",
+      "groupLabel": "Grupo",
+      "groupSummary": "{{type}} · {{schedule}} · organizaciones: {{orgs}}",
+      "nameLabel": "Nombre del informe multiorganización",
+      "targetLegend": "Organizaciones incluidas",
+      "targetSelected": "Solo estas organizaciones (no se envía nada nuevo)",
+      "targetAll": "Todas las organizaciones, incluidas las que se agreguen después",
+      "targetAllWarning": "Las organizaciones que hoy no tienen una copia empezarán a recibir este informe, solo con la copia interna hasta que agregues destinatarios del cliente.",
+      "adopt": "Se conserva y se convierte",
+      "archive": "Duplicado, se archivará",
+      "deliverableLinked": "Se usa como evidencia de una entrega de servicio",
+      "lastRun": "Última ejecución {{date}}",
+      "neverRun": "Nunca se ejecutó",
+      "contacts": "Destinatarios del cliente: {{list}}",
+      "noContacts": "Sin destinatarios del cliente",
+      "ccShared": "Copia interna en cada copia: {{list}}",
+      "ccNone": "Sin copia interna",
+      "ccConflictHeading": "Estas direcciones en copia solo están en algunos de estos informes. Elige qué pasa con cada una:",
+      "ccInclude": "Copiar en todas",
+      "ccDrop": "Dejar de copiar",
+      "ccUnresolved": "Elige qué pasa con cada dirección en copia antes de combinar.",
+      "ruleNote": "Cada cliente conserva exactamente los destinatarios que tiene hoy. Puedes agregar una regla de destinatarios más adelante en el informe multiorganización.",
+      "confirm": "Combinar",
+      "success": "Combinado en “{{name}}”",
+      "failed": "No se pudieron combinar estos informes.",
+      "groupChanged": "Estos informes cambiaron desde que abriste esta ventana. La lista se actualizó.",
+      "stalled": "No se envía hoy (su propietario perdió el acceso). Al combinar se reanuda el envío.",
+      "ccHeldBy": "Actualmente en copia en: {{list}}",
+      "ownerIneligible": "No puedes ser propietario de un informe para estas organizaciones: {{list}}",
+      "ccTooMany": "Demasiadas direcciones en copia interna (máximo {{max}}).",
+      "otherOrgs": "otras organizaciones"
     }
   }
 }

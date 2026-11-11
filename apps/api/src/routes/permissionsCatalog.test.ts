@@ -72,6 +72,11 @@ describe('permissions catalog routes', () => {
         expect(body.actionLabels[p.action]).toBeTruthy();
       }
       expect(body.actionLabels.cross_site_restore).toBe('Cross-Site Restore');
+      // #4617: the on-behalf customer approval permission carries a label.
+      expect(keys).toContain('tickets:record_approval');
+      expect(keys).toContain('tickets:email_review');
+      expect(body.actionLabels.email_review).toBe('Review Inbound Email');
+      expect(body.actionLabels.record_approval).toBe('Record Customer Approval');
       expect(body.resourceLabels.workspace).toBe('Workspace');
 
       // W02: the agreements resource must carry a human label, or the role
@@ -80,6 +85,8 @@ describe('permissions catalog routes', () => {
       expect(keys).toContain('agreements:write');
       expect(body.resourceLabels.agreements).toBe('Agreements');
       expect(body.actionLabels.credentials).toBe('Manage Credentials');
+      expect(keys).toContain('webhooks:read');
+      expect(body.resourceLabels.webhooks).toBe('Webhooks');
     });
 
     it('rejects unauthenticated requests', async () => {

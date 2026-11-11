@@ -2,6 +2,7 @@ package clipboard
 
 import (
 	"crypto/sha256"
+	"errors"
 	"fmt"
 )
 
@@ -26,6 +27,30 @@ type Content struct {
 	Image       []byte
 	ImageFormat string
 }
+
+// ErrNoSupportedFormat: the clipboard is empty or holds only formats the agent
+// cannot read. Unlike a failure to open it, this is a lasting state.
+var ErrNoSupportedFormat = errors.New("clipboard: no supported format")
+
+// noContentError is what a provider returns when no format yielded content.
+// failure is the first read that failed for another reason than the format
+// being absent; it means the clipboard's contents are unknown, not empty.
+func noContentError(failure error) error {
+	if failure != nil {
+		return &formatReadError{cause: failure}
+	}
+	return ErrNoSupportedFormat
+}
+
+// ErrFormatUnreadable marks a read failure on a format the clipboard listed:
+// errors.Is holds for noContentError's failure result. The Windows system
+// helper asks the user helper on it, as it does on ErrNoSupportedFormat.
+var ErrFormatUnreadable = errors.New("clipboard: listed format could not be read")
+
+type formatReadError struct{ cause error }
+
+func (e *formatReadError) Error() string   { return "clipboard: read failed: " + e.cause.Error() }
+func (e *formatReadError) Unwrap() []error { return []error{ErrFormatUnreadable, e.cause} }
 
 type Provider interface {
 	GetContent() (Content, error)

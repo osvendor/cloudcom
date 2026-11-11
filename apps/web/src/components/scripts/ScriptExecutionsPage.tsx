@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
+import { postScriptExecute, isGroupTarget, type ScriptExecuteResult, type ScriptRunTarget } from '@/lib/scriptExecute';
 import { useTranslation } from 'react-i18next';
 import { ArrowLeft, Play } from 'lucide-react';
 import ExecutionHistory, { type ScriptExecution } from './ExecutionHistory';
@@ -7,12 +8,10 @@ import ScriptExecutionModal, { type Site } from './ScriptExecutionModal';
 import type { Script } from './ScriptList';
 import type { ScriptParameter } from './ScriptForm';
 import { fetchWithAuth } from '../../stores/auth';
-import { extractApiError } from '@/lib/apiError';
 import { navigateTo } from '@/lib/navigation';
 import Breadcrumbs from '../layout/Breadcrumbs';
 import { asList } from '@/lib/asList';
 import { deviceScriptsHref, scriptExecutionsHref } from '@/lib/deviceScriptsLink';
-import type { ScriptAdmissionResult } from '@breeze/shared';
 import { handleActionError } from '@/lib/runAction';
 import { requestScriptExecutionCancel } from '@/lib/cancelScriptExecution';
 import { usePermissions } from '@/lib/permissions';
@@ -20,6 +19,8 @@ import { usePermissions } from '@/lib/permissions';
 // an island that hydrates before whichever other island happens to pull i18n in
 // would otherwise render raw keys (and mismatch the SSR markup).
 import '../../lib/i18n';
+import { useStableT } from '@/lib/i18n/useStableT';
+import { usePageItemName } from '../layout/usePageItemName';
 
 type ScriptExecutionsPageProps = {
   scriptId: string;
@@ -37,6 +38,7 @@ const POLL_INTERVAL_MS = 2000;
 
 export default function ScriptExecutionsPage({ scriptId }: ScriptExecutionsPageProps) {
   const { t } = useTranslation('scripts');
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   const { permissions } = usePermissions();
   const [script, setScript] = useState<ScriptWithDetails | null>(null);
   const [executions, setExecutions] = useState<ScriptExecution[]>([]);
@@ -62,14 +64,14 @@ export default function ScriptExecutionsPage({ scriptId }: ScriptExecutionsPageP
           void navigateTo('/login', { replace: true });
           return;
         }
-        throw new Error(t('scriptExecutionsPage.errors.fetchScript'));
+        throw new Error(stableT('scriptExecutionsPage.errors.fetchScript'));
       }
       const data = await response.json();
       setScript(data.script ?? data);
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('scriptExecutionsPage.errors.generic'));
+      setError(err instanceof Error ? err.message : stableT('scriptExecutionsPage.errors.generic'));
     }
-  }, [scriptId, t]);
+  }, [scriptId, stableT]);
 
   const fetchExecutions = useCallback(async () => {
     try {
@@ -81,7 +83,7 @@ export default function ScriptExecutionsPage({ scriptId }: ScriptExecutionsPageP
           void navigateTo('/login', { replace: true });
           return;
         }
-        throw new Error(t('scriptExecutionsPage.errors.fetchExecutions'));
+        throw new Error(stableT('scriptExecutionsPage.errors.fetchExecutions'));
       }
       const data = await response.json();
       const list = asList(data, 'executions') as ScriptExecution[];
@@ -97,11 +99,11 @@ export default function ScriptExecutionsPage({ scriptId }: ScriptExecutionsPageP
         return updated ? { ...prev, ...updated } : prev;
       });
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('scriptExecutionsPage.errors.generic'));
+      setError(err instanceof Error ? err.message : stableT('scriptExecutionsPage.errors.generic'));
     } finally {
       setLoading(false);
     }
-  }, [scriptId, t]);
+  }, [scriptId, stableT]);
 
   const fetchSites = useCallback(async () => {
     try {
@@ -196,28 +198,19 @@ export default function ScriptExecutionsPage({ scriptId }: ScriptExecutionsPageP
 
   const handleExecute = async (
     _scriptId: string,
-    deviceIds: string[],
+    target: ScriptRunTarget,
     parameters: Record<string, string | number | boolean>,
     runAs: 'system' | 'user'
-  ) => {
-    // runaction-exempt: this throws to ScriptExecutionModal, which renders the
-    // failure (or the per-target admission result) inline in its own form —
-    // a toast on top would be redundant, not a silent failure.
-    const response = await fetchWithAuth(`/scripts/${scriptId}/execute`, {
-      method: 'POST',
-      body: JSON.stringify({ deviceIds, parameters, runAs })
-    });
-
-    if (!response.ok) {
-      if (response.status === 401) {
-        void navigateTo('/login', { replace: true });
-        throw new Error(t('scriptExecutionsPage.errors.execute'));
-      }
-      const data = await response.json();
-      throw new Error(extractApiError(data, t('scriptExecutionsPage.errors.execute')));
-    }
-
-    const admission = await response.json() as ScriptAdmissionResult;
+  ): Promise<ScriptExecuteResult> => {
+    // Failures throw an ActionError (toast suppressed) to ScriptExecutionModal,
+    // which renders them, or the per-target admission result, inline.
+    const admission = await postScriptExecute(
+      scriptId,
+      target,
+      parameters,
+      runAs,
+      t('scriptExecutionsPage.errors.execute'),
+    );
     const admittedTargets = admission.targets.filter(target => target.admission === 'admitted');
     if (admittedTargets.length > 0) {
       await fetchExecutions();
@@ -227,14 +220,18 @@ export default function ScriptExecutionsPage({ scriptId }: ScriptExecutionsPageP
       // multi-device run has no single "the" device, so it stays on this
       // execution-history page (already the right place) via a self-navigate
       // that picks up the just-fetched row.
-      if (deviceIds.length === 1) {
-        void navigateTo(deviceScriptsHref(deviceIds[0]!, admittedTargets[0]?.executionId));
+      // Keep the modal (and its warnings, e.g. a refused group) visible.
+      if ((admission.warnings?.length ?? 0) > 0) return admission;
+      if (!isGroupTarget(target) && target.length === 1) {
+        void navigateTo(deviceScriptsHref(target[0]!, admittedTargets[0]?.executionId));
       } else {
         void navigateTo(scriptExecutionsHref(scriptId));
       }
     }
     return admission;
   };
+
+  usePageItemName(script?.name);
 
   if (loading && !script) {
     return (
@@ -285,6 +282,7 @@ export default function ScriptExecutionsPage({ scriptId }: ScriptExecutionsPageP
           <a
             href={`/scripts/${scriptId}`}
             className="flex h-10 w-10 items-center justify-center rounded-md border hover:bg-muted"
+            aria-label={t('scriptExecutionsPage.actions.backToScript')}
           >
             <ArrowLeft className="h-5 w-5" />
           </a>

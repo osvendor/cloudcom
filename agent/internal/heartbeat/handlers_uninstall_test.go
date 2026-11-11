@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/breeze-rmm/agent/internal/remote/tools"
+	"github.com/breeze-rmm/agent/internal/securefs"
 )
 
 // orderedIndex returns the index of needle in haystack, failing the test when
@@ -201,8 +202,9 @@ func TestBuildDarwinUninstallScript(t *testing.T) {
 				o.RemoveConfig = false
 				return o
 			}(),
-			wantOrder:  []string{"rm -f '/usr/local/bin/breeze-agent'"},
-			wantAbsent: []string{"rm -rf"},
+			wantOrder: []string{"rm -f '/usr/local/bin/breeze-agent'"},
+			// The isolation recovery directory is always removed; config is not.
+			wantAbsent: []string{"rm -rf '/Library/Application Support/Breeze'"},
 		},
 		{
 			name: "single quotes in paths are escaped for sh",
@@ -291,6 +293,9 @@ func TestBuildLinuxUninstallScript(t *testing.T) {
 // remain installed as a clean uninstall — and no shutdown may be scheduled.
 // On success, the ack says "initiated"/"handed off", never "completed".
 func TestHandleSelfUninstall_ResultContract(t *testing.T) {
+	origRelease := releaseIsolationForUninstallFn
+	releaseIsolationForUninstallFn = func(*Heartbeat) error { return nil }
+	t.Cleanup(func() { releaseIsolationForUninstallFn = origRelease })
 	origPrepare := prepareSelfUninstallFn
 	origSchedule := scheduleSelfUninstallShutdownFn
 	t.Cleanup(func() {
@@ -422,7 +427,7 @@ func TestDarwinUninstallScriptExecutable(t *testing.T) {
 	for _, removeConfig := range []bool{false, true} {
 		root := t.TempDir()
 		calls := filepath.Join(root, "calls")
-		for _, name := range []string{"launchctl", "pkill", "pkgutil", "rm", "ps", "sleep"} {
+		for _, name := range []string{"launchctl", "pkill", "pkgutil", "rm", "rmdir", "ps", "sleep"} {
 			body := "#!/bin/sh\nprintf '%s %s\\n' \"${0##*/}\" \"$*\" >> \"$FIXTURE_CALLS\"\n"
 			switch name {
 			case "ps":
@@ -435,6 +440,9 @@ func TestDarwinUninstallScriptExecutable(t *testing.T) {
 			}
 		}
 		script := buildDarwinUninstallScript(darwinUninstallScriptOptions{Label: "com.breeze.agent", WatchdogLabel: "com.breeze.watchdog", WatchdogProcess: "breeze-watchdog", PlistPath: "/Library/LaunchDaemons/com.breeze.agent.plist", BinaryPath: "/usr/local/bin/breeze-agent", ConfigDir: "/Library/Application Support/Breeze", RemoveConfig: removeConfig, DelaySeconds: 5})
+		// Never consult this host's real isolation journal: if one existed,
+		// the release step would run the installed agent.
+		script = strings.ReplaceAll(script, "/Library/Application Support/Breeze/data", root+"/no-journal")
 		cmd := exec.Command("/bin/sh", "-c", script)
 		cmd.Env = append(os.Environ(), "PATH="+root+":/usr/bin:/bin", "FIXTURE_CALLS="+calls)
 		if out, err := cmd.CombinedOutput(); err != nil {
@@ -451,11 +459,73 @@ func TestDarwinUninstallScriptExecutable(t *testing.T) {
 				t.Errorf("missing %s", artifact)
 			}
 		}
+		// #7831: the live binary is BinaryPath, but a pre-relocation copy in the
+		// other directory must go too, then the empty /Library/Breeze tree, and
+		// the launchd disable phase 1 set must be cleared once the plist is gone
+		// or the next install's bootstrap fails with EIO 5.
+		for _, artifact := range []string{"/usr/local/bin/breeze-agent", "/Library/Breeze/bin/breeze-agent", "/Library/Breeze/bin/breeze-watchdog", "rmdir /Library/Breeze/pkg-staging /Library/Breeze/bin /Library/Breeze"} {
+			if !strings.Contains(s, artifact) {
+				t.Errorf("missing %s", artifact)
+			}
+		}
+		assertOrder(t, s, "rm -f /Library/LaunchDaemons/com.breeze.agent.plist", "launchctl enable system/com.breeze.agent")
 		if strings.Contains(s, "rm -rf /Library/Application Support/Breeze") != removeConfig {
 			t.Errorf("changed optional config policy: %s", s)
 		}
 		if strings.Contains(s, "com.breeze.agent-user") || strings.Contains(s, "com.breeze.helper") {
 			t.Errorf("unowned label: %s", s)
 		}
+	}
+}
+
+func TestResolveTrustedOrLegacyBinaryPath(t *testing.T) {
+	tests := []struct {
+		name   string
+		exists bool
+		want   string
+	}{
+		{
+			name:   "trusted path exists: prefer it",
+			exists: true,
+			want:   securefs.TrustedExecutableDir + "/breeze-agent",
+		},
+		{
+			name:   "trusted path missing (migration never ran): fall back to legacy",
+			exists: false,
+			want:   securefs.LegacyExecutableDir + "/breeze-agent",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			statFn := func(path string) error {
+				if tt.exists {
+					return nil
+				}
+				return os.ErrNotExist
+			}
+			got := resolveTrustedOrLegacyBinaryPath("breeze-agent", statFn)
+			if got != tt.want {
+				t.Errorf("resolveTrustedOrLegacyBinaryPath() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestSelfUninstallRefusedInASupportSession: a support session is not the
+// installed agent and must never uninstall it. self_uninstall arrives over the
+// same command channel as everything else, so a mis-routed or forged one in a
+// support session is refused before anything is touched (#7629).
+func TestSelfUninstallRefusedInASupportSession(t *testing.T) {
+	origPrepare, origSchedule := prepareSelfUninstallFn, scheduleSelfUninstallShutdownFn
+	t.Cleanup(func() { prepareSelfUninstallFn, scheduleSelfUninstallShutdownFn = origPrepare, origSchedule })
+	prepareSelfUninstallFn = func(bool) error {
+		t.Error("self-uninstall preparation ran in a support session")
+		return nil
+	}
+	scheduleSelfUninstallShutdownFn = func(*Heartbeat) { t.Error("self-uninstall shutdown scheduled in a support session") }
+
+	result := handleSelfUninstall(&Heartbeat{supportMode: true}, Command{ID: "cmd-1", Type: "self_uninstall"})
+	if result.Status != "failed" {
+		t.Fatalf("status = %q, want failed", result.Status)
 	}
 }

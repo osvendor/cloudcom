@@ -15,14 +15,45 @@ import type { AiAgentMode, AiAgentProtectedResources, RiskTier } from '@breeze/s
 import { getToolTier } from './aiTools';
 import { getUserPermissions, hasPermission } from './permissions';
 import { rateLimiter } from './rate-limit';
+import { TOOL_RATE_LIMITS, resolveToolRateLimitMultiplier, scaleToolRateLimit, type ToolRateLimitScope } from './aiToolRateLimits';
+export { listEffectiveToolRateLimits, type EffectiveToolRateLimit } from './aiToolRateLimits';
 import { getRedis } from './redis';
+import { describePax8Action, describePax8Submit, humanizeToolAction } from './actionIntents/actionLabel';
 import { isSecretBearingTool } from './actionIntents/secretBearingTools';
 import { WORKSPACE_TOOL_NAMES } from './workspace/workspaceToolNames';
+import { isFlowToolName } from './flows/toolNames';
 import type { AuthContext } from '../middleware/auth';
+import { isAutomationPrincipal, isFlowPrincipal } from '../middleware/principalKind';
 import { envFlag } from '../config/env';
 import { resolveActOperation } from './aiAgents/actManifest';
 import { warrantyHpCmslRequested } from '@breeze/shared/validators';
 import { getCachedAiKillStateSnapshot } from './aiKillState';
+import { AGENT_COORDINATOR_CARRIER_TOOLS, AGENT_HUMAN_ONLY_ACTIONS, AGENT_HUMAN_ONLY_TOOLS, AGENT_DENIED_READ_TOOLS } from './aiToolExposure';
+// Leaf data module (no imports) — the specialist kind table, so the tier
+// tables below derive from it instead of re-typing kind names.
+import {
+  CHAT_TIER2_SPECIALIST_KINDS,
+  CHAT_TIER3_SPECIALIST_KINDS,
+  SPECIALIST_KIND_LABELS,
+  isSpecialistKind,
+} from './wisp/specialistPolicy';
+import { LIVE_READ_INPUT_FLAGS, requestsLiveDeviceRead } from './aiLiveDeviceReads';
+import { classifyChatReadOnlyEventLogsQuery, type PinnedEventLogsQuery } from './aiChatEventLogsReadOnly';
+import { classifyWispUnattendedRead, type WispUnattendedRead } from './wisp/unattendedReads';
+import { ONBOARDING_ORG_LIMIT } from './wisp/assessableOrgs';
+// Env-only operator knob; the module imports nothing but @breeze/shared.
+import { iocHuntFourEyesDeviceThreshold } from './securityScanSweepConfig';
+import { IOC_HUNT_RUN_ACTION } from './iocHuntActions';
+import { PORTAL_TOOL_SENSITIVE_LABELS } from './portal/portalSensitiveParents';
+
+// Re-exported so every existing importer of AGENT_HUMAN_ONLY_TOOLS keeps
+// working unchanged after the move to aiToolExposure.ts (W01 quorum
+// amendment WQ4, #6755): the two agent-denial registries now live in one
+// data-only file, enforced here.
+export { AGENT_HUMAN_ONLY_ACTIONS, AGENT_HUMAN_ONLY_TOOLS, AGENT_DENIED_READ_TOOLS };
+// Re-exported for the tier-parity contract tests, which read every tier table
+// from this module.
+export { LIVE_READ_INPUT_FLAGS, requestsLiveDeviceRead };
 
 type AiToolTier = 1 | 2 | 3 | 4;
 
@@ -40,6 +71,8 @@ export const BLOCKED_TOOLS: ReadonlySet<string> = new Set<string>([
 // Exported for the tier-parity contract tests (aiGuardrailsTierParity.shared.ts).
 export const TOOL_ACTION_INPUT_KEYS: Record<string, string> = {
   execute_command: 'commandType',
+  // Wisp W07: launch_specialist is multiplexed on the specialist KIND.
+  launch_specialist: 'kind',
 };
 
 // Actions that are Tier 2 (auto-execute + audit):
@@ -49,7 +82,17 @@ export const TOOL_ACTION_INPUT_KEYS: Record<string, string> = {
 // tierConfig.ts parity guard, issue #2686). Not part of the runtime API —
 // resolution always goes through checkGuardrails().
 export const TIER2_ACTIONS: Record<string, string[]> = {
-  manage_policy_feature_link: ['describe'],
+  // Wisp W07 (spec §3 "acts alone") + #11084 Decision 3: the chat Tier-2
+  // launch kinds, derived from SPECIALIST_KIND_POLICY (leaf data module).
+  launch_specialist: [...CHAT_TIER2_SPECIALIST_KINDS],
+  manage_policy_feature_link: ['describe', 'list'], // list is a pure read (#10412); add/update/remove keep their tiers
+  // EDR response actions (#8167 W03, spec §4.10): a scan is non-disruptive,
+  // so it runs without approval. The tool's base tier is 3, so every OTHER
+  // action — isolate, release, and any value not offered yet (no adapter
+  // implements the agent-update or process-kill actions; the approvalScope
+  // contract forbids classifying actions outside the real enum) — stays
+  // Tier 3 / four_eyes.
+  edr_endpoint_action: ['scan'],
   manage_alerts: ['acknowledge', 'resolve', 'suppress'],
   manage_tickets: [
     'create',
@@ -60,30 +103,124 @@ export const TIER2_ACTIONS: Record<string, string[]> = {
     'link_alert',
     'unlink_alert',
     'create_from_alert',
-    'edit_comment',
-    'delete_comment',
+    // edit_comment/delete_comment moved to TIER3_ACTIONS (W02, #6756): a
+    // public comment's text changes or disappears in the portal with no
+    // restore path (ticketService.ts editTicketComment / deleteTicketComment).
+    //
+    // comment, update_status and update_fields stay here: their BASE class is
+    // tier 2, and isInputAwareTier3 escalates the customer-reaching inputs
+    // (public comment, resolve, requester repoint) on top.
+    //
     // Time-tracking downgraded from Tier 3 (2026-07-20): starting/stopping a
     // timer or logging time is org-internal bookkeeping, consistent with
     // create/comment above. move_org stays Tier 3 (tenant-shape mutation).
     'log_time_entry',
     'start_timer',
     'stop_timer',
+    'update_time_entry',
     // P2-4 (#4191) ticket triage: same family as update_fields — low-risk,
     // ticket-scoped mutations an autonomous triage run makes. link_device
     // only sets a currently-null device_id (never overwrites); draft only
     // writes an internal ticket_drafts row, never a customer-visible comment.
     'link_device',
-    'draft'
+    'draft',
+    // #8596: ticket-to-ticket links. Same tier as comment/assign: internal,
+    // reversible, bounded to one org (the service refuses cross-org links).
+    // Listing them here is also what denies them to a ticket-triggered
+    // (device-less) agent run — ticketShadowGuardrail.contract.test.ts
+    // derives its mutation set from this list.
+    'link_ticket',
+    'unlink_ticket',
+    // Full-control W06 (#6776, W06-D4): assign / status (not resolved) / priority over up to
+    // 50 tickets of ONE organization (the handler refuses a mixed-org batch). Never a delete.
+    'bulk_update'
   ],
+  // #6930: ticket-scoped checklist step edits, same family as update_fields.
+  // Ticking a step is not a tool action at all (see aiToolsTicketing.ts).
+  manage_ticket_checklist: ['add_item', 'update_item', 'delete_item', 'reorder', 'apply_template', 'save_as_template', 'duplicate_template'],
+  // Full-control W06 (#6776) tier-2 rows (plan "Final per-action classes"):
+  //  - an ORG-owned checklist template create (a partner-wide one escalates through
+  //    isInputAwareTier3);
+  //  - the inbox list: attacker-authored mail, plain tier 2 so an agent needs an
+  //    allowlist entry (a read-only resolution would skip it, quorum QW1);
+  //  - attachment content read and attach-from-artifact (a pending, invisible row);
+  //  - your own time suggestions: confirm logs a time entry (bookkeeping, like
+  //    log_time_entry), dismiss/undo are an inverse pair.
+  manage_ticket_checklist_templates: ['create'],
+  manage_ticket_inbox: ['list'],
+  manage_ticket_attachments: ['read_content', 'attach_from_artifact'],
+  manage_time_suggestions: ['confirm', 'dismiss', 'undo'],
+  // Full-control W07 (#6777): alert correlation + signal triage. Group ack/resolve is the
+  // manage_alerts:acknowledge/resolve precedent over the members of ONE organization's group;
+  // feedback / rca_feedback are ML labels; anomaly dismiss/resolve set a status on one row.
+  // `promote` is NOT here: it raises a real alert (TIER3_SUPERVISED_ACTIONS).
+  manage_alert_correlations: ['acknowledge_group', 'resolve_group', 'acknowledge_related', 'feedback', 'rca_feedback'],
+  manage_device_anomalies: ['dismiss', 'resolve'],
+  // Full-control W08 (#6778): network topology. Starting a diagnostic dispatches a bounded probe to a device
+  // (inline, in the person's own session); the monitoring/manual/template-draft writes are tenant-internal
+  // rows with a revision compare-and-swap; a template PREVIEW persists a short-lived record only.
+  // Publishing / revoking a template and applying one are supervised (TIER3_SUPERVISED_ACTIONS).
+  run_topology_diagnostic: ['start', 'cancel'],
+  manage_topology_manual: ['create_node', 'update_node', 'delete_node', 'create_relationship', 'delete_relationship'],
+  manage_topology_monitoring: ['upsert_policy', 'delete_policy', 'upsert_target', 'delete_target', 'patch_settings'],
+  manage_topology_templates: ['create_template', 'update_template', 'create_version'],
+  apply_topology_template: ['preview'],
+  // Full-control W09 (#6779): SNMP templates and known guests are tenant-internal rows, reversible (the delete result carries
+  // the removed row). probe_network_asset and trigger_unifi_sync are tier 2 as whole tools (TOOL_TIERS).
+  manage_snmp_templates: ['create', 'update', 'delete'],
+  manage_known_guests: ['add', 'delete'],
+  // Full-control W11 (#6781): reversible, tenant-internal bookkeeping. A recommendation status is one audit row
+  // (reopen undoes it); an access-review item decision is recorded only (completing the review, which revokes,
+  // is human-only and absent from the tool); an audit-baseline apply request is one pending row a different
+  // person must approve. Every other W11 write is tier 3 (TIER3_ACTIONS).
+  manage_security_recommendations: ['complete', 'dismiss'],
+  manage_access_reviews: ['decide_item'],
+  manage_audit_baselines: ['request_apply'],
+  // Full-control W12 (#6782): tenant-internal, reversible. A new catalog item is inert until something references it;
+  // a metadata edit changes no install target; cancel stops pending installs (create/retry redo them); a fleet-finding
+  // status is undone by reopen; an org custom-field definition create/edit is undone by another edit. A PARTNER-WIDE
+  // catalog item or definition create is supervised (input-aware, quorum QW1); the tool never edits an existing
+  // partner-wide row (W12-D10). Install-target edits, deploys, inventory policy writes and value writes are tier 3.
+  manage_software_catalog: ['create', 'update', 'import_package'],
+  manage_software_deployments: ['cancel'],
+  manage_fleet_findings: ['acknowledge', 'dismiss', 'reopen'],
+  manage_custom_fields: ['create_definition', 'update_definition'],
+  // Full-control W13 (#6783, plan class review): tenant-internal and reversible. A link group only changes how the
+  // device list renders its members (nothing targets or alerts by it) and is undone by linking again — dissolve
+  // included (members keep their data). A manual asset is one hand-entered inventory row; link / unlink attach it to
+  // a device or a discovered asset for de-duplication. Its hard delete is tier 3.
+  manage_device_links: ['create', 'update', 'dissolve'],
+  // Full-control W13 PR B (#6783): listing a device's event-log channels runs a live agent command (devices:execute,
+  // like execute_command event_logs_list) and returns names and sizes only — read-only, see TIER2_READONLY_ACTIONS.
+  browse_device_event_log: ['list_logs'],
+  manage_manual_assets: ['create', 'update', 'link', 'unlink'],
+  // Full-control W14 PR B (#6784): a pure read, auto-executed (TIER2_READONLY_ACTIONS).
+  manage_contracts: ['preview_invoice'],
+  // W15 PR A (#6785): only local draft and line edits; sync and preflight are supervised.
+  manage_pax8_orders: ['create_draft', 'add_line', 'update_line', 'remove_line'],
+  // Full-control W14 (#6784, W14 plan): an ORG-OWNED agreement template's create / rename is tenant-internal and
+  // reversible (archive hides a new one) and pins nowhere until a version is published. A call that asserts
+  // ownerScope 'partner' escalates to supervised (isInputAwareTier3).
+  manage_contract_templates: ['create', 'update'],
   manage_services: ['list'],
-  // SR5-01 partial relaxation (2026-07-20): directory LISTING is recon-only —
+  // Live device inspection: listing processes / scheduled tasks runs a live
+  // command on the device (devices:execute, like GET /system-tools/...). Tier 2
+  // read-only, like file_operations:list and manage_services:list: no prompt,
+  // but an audit row, and an MCP key needs ai:write.
+  manage_processes: ['list'],
+  manage_scheduled_tasks: ['list'],
+  // Asking the device for its OS-native cleaner catalog is a live command
+  // (POST /devices/:id/filesystem/system-cleanup/list needs devices:execute).
+  // `status` reads the stored run and stays Tier 1 (TIER1_READ_ACTIONS).
+  system_cleanup: ['list'],
+  // Privileged-read rule, partial relaxation (2026-07-20): directory LISTING is recon-only —
   // filenames leak far less than contents — so it auto-executes with audit.
   // file READ stays Tier 3 below: the agent runs as root/LocalSystem and an
   // unapproved read can exfiltrate any file's contents.
   file_operations: ['list'],
   // #3088 approval-fatigue fix (2026-08-04): read-only execute_command
   // commandTypes are non-mutating device reads and auto-execute with audit,
-  // consistent with their sibling tools (manage_processes list is Tier 1,
+  // consistent with their sibling tools (manage_processes list,
   // manage_services list and file_operations list are Tier 2). This is an
   // explicit conservative allowlist keyed on commandType (the agent-side
   // handler discriminator — see TOOL_ACTION_INPUT_KEYS above); anything not
@@ -92,7 +229,7 @@ export const TIER2_ACTIONS: Record<string, string[]> = {
   //
   // Deliberately NOT downgraded, despite being nominally "read" operations:
   //   - file_read: arbitrary-file exfiltration off a root/LocalSystem agent
-  //     (same SR5-01 rationale as file_operations read).
+  //     (same privileged-read rationale as file_operations read).
   //   - kill_process, start/stop/restart_service: mutating.
   //   - list_services: agent/internal/remote/tools/services_{windows,linux}.go
   //     populates ServiceInfo.Path from the service's full binary path/command
@@ -107,6 +244,13 @@ export const TIER2_ACTIONS: Record<string, string[]> = {
   //     failed-logon Account Name, or any credential/PII another app logged.
   // Both would let an AI actor pull that content into its context with zero
   // human review under auto_approve session mode.
+  //
+  // #7906 narrows the event_logs_query case WITHOUT a static entry here: in
+  // an interactive chat session only, a System/Setup query with no XPath and
+  // a strictly-validated payload resolves Tier 2 read-only through the
+  // payload-aware classifier (aiChatEventLogsReadOnly.ts, wired in
+  // checkGuardrails via GuardrailContext.chatSession). Every other channel,
+  // any XPath, and every non-chat principal keep the base Tier 3.
   execute_command: [
     'event_logs_list',
     'file_list',
@@ -115,7 +259,7 @@ export const TIER2_ACTIONS: Record<string, string[]> = {
   // Fleet tools — Tier 2 actions (auto-execute + audit)
   manage_configuration_policy: ['activate', 'deactivate'],
   manage_deployments: ['pause', 'resume'],
-  // SR5-01 (2026-09-17 audit §2.4): registry reads are privileged agent
+  // Privileged-read rule (2026-09-17 audit §2.4): registry reads are privileged agent
   // executions, not device reads — Tier 1 gave them no approval gate AND no
   // MFA. Raised alongside their devices:execute mapping below. Deliberately
   // NOT added to TIER2_READONLY_ACTIONS: unlike file_operations.list these
@@ -124,10 +268,13 @@ export const TIER2_ACTIONS: Record<string, string[]> = {
   // scan downgraded from Tier 3 (2026-07-20): discovery, not mutation —
   // consistent with approve/decline/defer here. install/rollback stay Tier 3.
   manage_patches: ['approve', 'decline', 'defer', 'bulk_approve', 'scan'],
-  manage_groups: ['add_devices', 'remove_devices'],
+  // #6268: stopping an IOC sweep is the safe direction (queued scans are
+  // cancelled, running ones finish), so it auto-executes with an audit row.
+  ioc_hunt: ['cancel_sweep'],
+  // manage_groups add_devices/remove_devices moved to TIER3_ACTIONS (#10149, QW9).
   // manage_maintenance_windows mutations disabled — managed via configuration policies
   manage_automations: ['enable', 'disable'],
-  // manage_alert_rules mutations disabled — managed via configuration policies
+  // manage_alert_rules is read-only; author conditions via manage_monitor_definitions
   // manage_service_monitors mutations disabled — managed via configuration policies
   generate_report: ['create', 'update', 'delete', 'generate'],
   // Policy prerequisite tools — Tier 2 create/update actions.
@@ -138,9 +285,16 @@ export const TIER2_ACTIONS: Record<string, string[]> = {
   // unattended enforcement/remediation on the fleet. The two backup tools stay
   // here deliberately; see the note in TIER3_ACTIONS for the full rationale.
   manage_backup_configs: ['create', 'update'],
-  manage_backup_profiles: ['create', 'update', 'delete'],
-  // Notification channel & saved filter tools — Tier 2 actions
-  manage_notification_channels: ['test', 'create', 'update', 'delete'],
+  // W03 (#6757): update/delete moved to TIER3_ACTIONS (supervised, W03-D1);
+  // create stays here as the base class and escalates through
+  // isInputAwareTier3 when ownerScope === 'partner'.
+  manage_backup_profiles: ['create'],
+  // Notification channel & saved filter tools — Tier 2 actions.
+  // manage_notification_channels `test` stays tier 2 ONLY because the AI
+  // handler is a lookup stub that sends nothing (W02-D9, pinned by
+  // aiToolsAlerts.channelSecrets.test.ts); create/update/delete are tier 3
+  // below (W02, #6756).
+  manage_notification_channels: ['test'],
   manage_saved_filters: ['create', 'delete'],
 };
 
@@ -150,7 +304,7 @@ export const TIER2_ACTIONS: Record<string, string[]> = {
 // call is exactly the approval-fatigue scenario #3088 measured (25 prompts in
 // 35 minutes). Entries here keep Tier 2 — and its ai_tool_executions
 // audit-ledger row; they are deliberately NOT demoted to Tier 1, which never
-// writes one (recon reads stay in the audit trail, SR5-01 precedent) — but
+// writes one (recon reads stay in the audit trail, privileged-read precedent) — but
 // auto-execute under every session approval mode. A paused session still
 // prompts (aiAgentSdk.ts gates on !isPaused).
 //
@@ -160,10 +314,17 @@ export const TIER2_ACTIONS: Record<string, string[]> = {
 // entry does not belong here; leaving a read out only costs one lightweight
 // prompt.
 export const TIER2_READONLY_ACTIONS: Record<string, string[]> = {
-  manage_policy_feature_link: ['describe'],
+  manage_policy_feature_link: ['describe', 'list'],
+  // Full-control W14 PR B (#6784): what the next billing run would bill — no write anywhere.
+  manage_contracts: ['preview_invoice'],
   execute_command: ['event_logs_list', 'file_list', 'list_processes'],
+  // Full-control W13 PR B (#6783): channel names and sizes only; query / get_event return event text and are tier 3.
+  browse_device_event_log: ['list_logs'],
   file_operations: ['list'],
+  manage_processes: ['list'],
+  manage_scheduled_tasks: ['list'],
   manage_services: ['list'],
+  system_cleanup: ['list'],
 };
 
 // #3130 companion for whole tools: base-Tier-2 tools whose EVERY operation is
@@ -172,6 +333,9 @@ export const TIER2_READONLY_ACTIONS: Record<string, string[]> = {
 // semantics as TIER2_READONLY_ACTIONS: keep the Tier-2 audit row, skip the
 // per-step prompt.
 export const TIER2_READONLY_TOOLS = new Set<string>([
+  // Full-control W17 (#6788): runs VSS_WRITER_LIST on the machine, so it is not tier 1; it changes nothing, and a
+  // supervised card per lookup is noise. The browse_device_event_log:list_logs and manage_services:list precedent.
+  'get_vss_status',
   'get_catalog_item',
   'get_contract',
   'get_invoice',
@@ -184,6 +348,11 @@ export const TIER2_READONLY_TOOLS = new Set<string>([
   'list_quotes',
   'lookup_distributor_product',
   'search_catalog',
+  // Reads under an administrator-approved diagnostic grant: the approval
+  // already happened (on the grant), so a covered read runs without a second
+  // per-step prompt; an uncovered one is refused by the handler, never escalated.
+  'diagnostic_list_directory',
+  'diagnostic_read_file',
 ]);
 
 /**
@@ -207,12 +376,153 @@ export const TIER1_NON_READONLY_TOOLS: ReadonlySet<string> = new Set<string>(WOR
 export const TIER1_ACTIONS: Record<string, string[]> = {
   security_scan: ['vulnerabilities'],
   manage_tags: ['list'],
+  // Endpoint messaging history reads (#8742); `send` stays at the tool's base Tier 3.
+  send_endpoint_message: ['list', 'get'],
+  // Full-control W04 (#6758, W04-D2 — LOOSENING, Todd signs off in the PR):
+  // reads of staff-written policy config, already tier 1 on the plural sibling
+  // tools that read the same tables (manage_software_policies list/get). The
+  // writes stay at the base tier 3, classified per action below.
+  manage_software_policy: ['list', 'get'],
+  manage_browser_policy: ['list'],
+};
+
+/**
+ * Spec 2026-09-23 W01-D3: the explicit read allowlist for registry-tier-1
+ * multiplexers. A tier-1 tool with an `action`/discriminator enum resolves
+ * to tier 1 (read-only to headless agents, via `isReadOnlyResolution`) for
+ * ANY action not otherwise escalated — so an unclassified new enum member
+ * would silently default to "read" rather than failing closed. Every action
+ * of such a tool must appear here, in TIER2_ACTIONS, or in TIER3_ACTIONS
+ * (enforced by aiGuardrails.tier1WriteActions.contract.test.ts). Exported for
+ * contract tests only — see the note on TIER2_ACTIONS.
+ */
+export const TIER1_READ_ACTIONS: Record<string, readonly string[]> = {
+  configuration_policy_compliance: ['summary', 'status'],
+  // disk_cleanup:preview reads the latest filesystem-cleanup snapshot and
+  // writes a device_filesystem_cleanup_runs bookkeeping row
+  // (aiToolsFilesystem.ts:391-410) — it does NOT dispatch a scan, and it
+  // changes no device state. Reclassifying it is W04's call (spec W01-D3).
+  disk_cleanup: ['preview'],
+  generate_report: ['list', 'data', 'history', 'download'],
+  // #6268 (base Tier 1): reads over PR A's sweep services; preview writes nothing.
+  ioc_hunt: ['list_rule_sets', 'preview_sweep', 'list_sweeps', 'sweep_status'],
+  get_dns_security: ['allowed', 'blocked', 'redirected'],
+  get_service_monitoring_status: ['status', 'summary', 'results', 'known_services'],
+  manage_alert_rules: ['list_rules', 'get_rule', 'test_rule', 'list_channels', 'alert_summary'],
+  manage_alerts: ['list', 'get'],
+  manage_automations: ['list', 'get', 'history'],
+  manage_backup_configs: ['list', 'get'],
+  manage_backup_profiles: ['list', 'get'],
+  // Full-control W06 (#6776): PSA configuration + ticket-ops reads. Each is a read of
+  // staff-written config or of the caller's own rows; the inbox list and attachment
+  // content are deliberately NOT here (plain tier 2, quorum QW1).
+  manage_ticket_config: ['get_config', 'get_org_settings', 'list_categories', 'list_domains'],
+  manage_ticket_checklist_templates: ['list', 'get'],
+  manage_ticket_attachments: ['list'],
+  manage_ticket_forms: ['list', 'available'],
+  manage_ticket_response_templates: ['list'],
+  manage_time_suggestions: ['list'],
+  // Full-control W07 (#6777): the anomaly list is a read of metric rows (get_alert_correlations and
+  // the extra get_fleet_health actions are whole-tool reads, so they need no entry).
+  // Full-control W17 (#6788): none of these writes. The routes' `refresh` flag does, and no tool input maps to it.
+  manage_backup_verification: ['health', 'list', 'readiness'],
+  list_bmr_recoveries: ['list', 'get'],
+  manage_c2c_configs: ['list'],
+  manage_device_anomalies: ['list'],
+  // The two whole-tool reads below are multiplexers with an `action` enum, so the tier-1
+  // write-action contract wants their (all-read) vocabulary declared. `get_fleet_health`'s
+  // default (no action) is the fleet list.
+  get_alert_correlations: ['groups', 'get', 'by_alert', 'links', 'analyze', 'evaluation', 'explain'],
+  get_fleet_health: ['list', 'history', 'offenders', 'evaluation', 'org_summary'],
+  // Full-control W08 (#6778): the topology reads (whole-tool reads declare their vocabulary too).
+  get_topology_graph: ['graph', 'nodes', 'node', 'relationship', 'evidence', 'group_members', 'expansion', 'health'],
+  run_topology_diagnostic: ['collectors', 'get'],
+  manage_topology_monitoring: ['list_policies', 'list_targets', 'get_settings'],
+  manage_topology_templates: ['list_templates', 'list_versions', 'site_options'],
+  apply_topology_template: ['status'],
+  // Full-control W09 (#6779): the SNMP / known-guest / UniFi reads (whole-tool reads declare their vocabulary too).
+  manage_snmp_templates: ['list', 'get', 'browse_oids', 'validate_oids'],
+  get_snmp_metrics: ['history', 'dashboard'],
+  manage_known_guests: ['list'],
+  get_unifi_status: ['status', 'hosts', 'collectors', 'mappings', 'telemetry', 'sync_runs', 'controller_sites'],
+  // Full-control W11 (#6781): the security-policy reads.
+  manage_security_recommendations: ['list'],
+  manage_access_reviews: ['list', 'get'],
+  manage_audit_baselines: ['list', 'compliance', 'device_results'],
+  manage_security_policies: ['list'],
+  manage_recovery_keys: ['list'],
+  manage_pam_rules: ['list_rules', 'get_config', 'list_signer_groups'],
+  // Full-control W12 (#6782): the software reads.
+  manage_software_catalog: ['list', 'get'],
+  manage_software_deployments: ['list', 'get', 'summary', 'results'],
+  manage_software_inventory: ['list', 'names', 'devices'],
+  // Full-control W13 (#6783): the device-record reads.
+  manage_device_function: ['get'],
+  manage_device_links: ['list', 'get', 'for_device'],
+  manage_manual_assets: ['list'],
+  manage_device_warranty: ['get', 'expiring'],
+  // Full-control W13 PR B (#6783).
+  manage_tenant_variables: ['list'],
+  manage_support_sessions: ['list', 'get'],
+  // Full-control W14 (#6784).
+  manage_billing_profiles: ['list', 'get', 'list_work_types', 'get_org_profile'],
+  manage_billing_settings: ['get_partner', 'get_org', 'currency_impact', 'reporting_totals'],
+  manage_contract_templates: ['list', 'get', 'get_version', 'usage'],
+  manage_contract_documents: ['list'],
+  // Full-control W14 PR B (#6784): the accounting reads. remote_candidates never sends the model's term to the
+  // provider (filtered in Breeze, quorum QW8).
+  manage_accounting_sync: ['status', 'owed_operations', 'customers', 'mappings', 'income_accounts', 'remote_candidates'],
+  // Full-control W18 PR B (#6789): the portal settings read and the recipient list.
+  manage_org_portal_settings: ['get'],
+  manage_report_recipients: ['list'],
+  // Full-control W16 PR B (#6786): tier 1 because neither writes. preview takes a short row lock and still needs
+  // devices:write and MFA, as its route does; applied reads the ledger.
+  manage_fleet_designs: ['preview', 'applied'],
+  // W15 PR A (#6785): mapped products and subscription/order evidence reads.
+  search_pax8_products: ['search', 'provision_details', 'dependencies', 'pricing'],
+  manage_pax8_subscriptions: ['list', 'drift'],
+  manage_pax8_orders: ['list', 'get', 'preview'],
+  // Full-control W18 PR A (#6789): the role directory's four reads. No role or user write is a tool action (W18-1).
+  list_roles: ['list', 'get', 'users', 'effective_permissions'],
+  manage_delivery: ['resolve', 'list_routing', 'list_escalation'],
+  manage_deployments: ['list', 'get', 'device_status'],
+  manage_groups: ['list', 'get', 'preview', 'membership_log'],
+  manage_maintenance_windows: ['list', 'get', 'active_now'],
+  // create/update/delete are retired: they return guidance before any DB
+  // access and map to devices:read in TOOL_PERMISSIONS, so they classify as
+  // reads here.
+  manage_monitors: ['get', 'create', 'update', 'delete'],
+  manage_notification_channels: ['list'],
+  manage_patches: ['list', 'compliance', 'device_history'],
+  manage_peripheral_policies: ['list', 'get'],
+  // manage_processes:list and manage_scheduled_tasks:list are NOT here: they
+  // run a live command on the device, so they sit in TIER2_ACTIONS (+ the
+  // read-only allowlist) with file_operations:list / manage_services:list.
+  manage_saved_filters: ['list', 'get'],
+  manage_service_monitors: ['list'],
+  manage_software_policies: ['list', 'get'],
+  manage_ticket_checklist: ['list', 'list_templates', 'get_template'],
+  manage_tickets: ['list', 'get', 'list_work_types', 'list_links', 'merge_preview'],
+  manage_update_rings: ['list', 'get'],
+  query_agent_versions: ['list_versions', 'check_upgrades'],
+  query_analytics: ['sla_compliance', 'capacity_predictions', 'sla_definitions'],
+  query_backups: ['list_configs', 'list_jobs', 'list_policies'],
+  query_custom_fields: ['list_definitions', 'get_device_values'],
+  // system_cleanup:list is NOT here: it asks the device live (TIER2_ACTIONS).
+  system_cleanup: ['status'],
 };
 
 // Mutations that require approval (Tier 3) even if the tool is registered as Tier 1
 // Exported for contract tests only — see the note on TIER2_ACTIONS.
 export const TIER3_ACTIONS: Record<string, string[]> = {
-  // SR5-01: filesystem READ is privileged. The endpoint agent runs as
+  // Wisp W07 (spec §3 "asks first"): every chat Tier-3 specialist kind
+  // needs the person's approval in chat — for a bulk reply the card
+  // shows the exact ticket list and message.
+  launch_specialist: [...CHAT_TIER3_SPECIALIST_KINDS],
+  // Customer-visible: the text is shown to an end user under the MSP's brand,
+  // so a human must always have read it (same class as a public ticket reply).
+  send_endpoint_message: ['send'],
+  // Privileged-read rule: filesystem READ is privileged. The endpoint agent runs as
   // root/LocalSystem and does not restrict reads to an approved root, so an
   // unapproved read can exfiltrate any file (/etc/shadow, SAM hive, SSH keys).
   // Require interactive approval (Tier 3) for read, same as the mutations.
@@ -230,7 +540,10 @@ export const TIER3_ACTIONS: Record<string, string[]> = {
   // apt-get/dnf, journalctl, tmutil, brew) as root/LocalSystem with a 90-minute
   // ceiling, and some of its handlers cannot be undone (`Previous
   // Installations` deletes Windows.old, which is the rollback path).
-  system_cleanup: ['run'],
+  // `cancel` (#10161) mirrors POST …/run/:cleanupRunId/cancel, a requireMfa()
+  // route that mutates: the MFA-route invariant (TOOL_EXTRA_PERMISSIONS note)
+  // puts it at Tier 3.
+  system_cleanup: ['run', 'cancel'],
   manage_startup_items: ['disable', 'enable'],
   manage_scheduled_tasks: ['run', 'disable', 'enable'],
   // Fleet tools — Tier 3 actions (require user approval)
@@ -242,11 +555,27 @@ export const TIER3_ACTIONS: Record<string, string[]> = {
   // through configuration policies"), so the gate costs no live workflow —
   // it is here so re-enabling the handler cannot silently reopen the hole.
   manage_patches: ['install', 'rollback', 'setup_auto_approval'],
-  manage_groups: ['create', 'update', 'delete'],
-  manage_automations: ['run'],
+  // #6268: a fleet IOC sweep (detect-only, single org; scope input-aware in
+  // resolveApprovalScope) and an IOC rule import (publishes a rule set every
+  // policy using it then scans with).
+  ioc_hunt: [IOC_HUNT_RUN_ACTION, 'import_iocs'],
+  // #10149 (QW9): membership writes are supervised. Membership feeds agent run
+  // scope (triggers.deviceGroupIds), group-targeted config/peripheral policies,
+  // and schedules peripheral reconciliation for every touched device.
+  manage_groups: ['create', 'update', 'delete', 'add_devices', 'remove_devices'],
+  // create/update/delete added W01-D3 (#6755): handler-disabled today
+  // (aiToolsFleet.ts:2041, managed via configuration policies), same pattern
+  // as manage_patches.setup_auto_approval above — escalated so re-enabling
+  // the handler cannot silently reopen an unallowlisted agent write.
+  manage_automations: ['run', 'create', 'update', 'delete'],
   manage_processes: ['kill'],
   manage_policy_feature_link: ['remove'],
   registry_operations: ['set_value', 'create_key', 'delete_key'],
+  // create/update/delete added W01-D3 (#6755): handler-disabled today
+  // (aiToolsFleet.ts:2742, managed via configuration policies) — escalated so
+  // re-enabling the handler cannot silently reopen an unallowlisted agent
+  // write.
+  manage_maintenance_windows: ['create', 'update', 'delete'],
   // Policy prerequisite tools (#3552) — the standalone feature policies that
   // manage_configuration_policy links via featurePolicyId. These were Tier 2
   // (auto-execute + audit, no approval) while the configuration policy that
@@ -282,7 +611,8 @@ export const TIER3_ACTIONS: Record<string, string[]> = {
   // reads still auto-execute with no prompt. Only the mutations escalate.
   //
   // Deliberately NOT escalated (judgment calls, left at Tier 2, #3552):
-  //   - manage_backup_configs / manage_backup_profiles. They change storage
+  //   - manage_backup_configs (and, until W03 #6757, manage_backup_profiles —
+  //     see its entry below). They change storage
   //     destinations, credentials, retention and selection sets — real, but
   //     PROTECTIVE scheduling rather than enforcement or remediation: no
   //     payload there causes an agent to uninstall, block, or reboot anything.
@@ -293,13 +623,98 @@ export const TIER3_ACTIONS: Record<string, string[]> = {
   manage_peripheral_policies: ['create', 'update'],
   // Backup & DR — Tier 3 actions (require user approval)
   manage_dr_plan: ['delete_group'],
-  manage_hyperv_checkpoints: ['delete', 'apply'],
+  // W03 (#6757, W03-D2): create queues a HYPERV_CHECKPOINT command on the
+  // customer's Hyper-V host — "touches a customer machine" is supervised at
+  // minimum. delete/apply destroy or rewind state (four-eyes below).
+  manage_hyperv_checkpoints: ['create', 'delete', 'apply'],
+  // W03-D1: whether a profile is partner-wide is DB state (orgId null), and
+  // guardrails are DB-free. Narrowing a linked partner-wide profile silently
+  // stops protecting data in every org, so update/delete fail safe.
+  manage_backup_profiles: ['update', 'delete'],
+  // W03-D2: both actions push vault_configure to the device, and vaultPath
+  // may point backup copies at a model-chosen SMB share — the W02
+  // notification-channel class (data to a new destination).
+  configure_vault: ['create', 'update'],
   // Monitoring tools — Tier 3 actions (require user approval)
-  manage_monitors: ['create', 'update', 'delete'],
   manage_delivery: ['create_routing','update_routing','delete_routing','set_default','create_escalation','update_escalation','delete_escalation'],
   // Ticketing — move_org is a tenant-shape mutation and requires approval.
   // log_time_entry/start_timer/stop_timer downgraded to Tier 2 (2026-07-20).
-  manage_tickets: ['move_org'],
+  // edit_comment/delete_comment (W02, #6756): no restore — a public comment's
+  // text changes or disappears in the portal at once (the old text survives
+  // only in the audit log).
+  manage_tickets: ['move_org', 'merge', 'edit_comment', 'delete_comment'],
+  // #8883 W5: ticket routing rule writes (partner-wide gate enforced in the service).
+  manage_ticket_routing_rules: ['create', 'update', 'reorder', 'delete'],
+  // Full-control W06 (#6776). Partner-wide ticket configuration, MFA-route mutations and
+  // terminal/irreversible acts are tier 3 (plan "Per-tool class review"); the four hard
+  // deletes are four-eyes (irreversible AND partner-wide, spec Class rule). Splits by
+  // scope are in TIER3_SUPERVISED_ACTIONS / TIER3_FOUR_EYES_ACTIONS below.
+  manage_ticket_config: [
+    'update_org_settings', 'create_category', 'update_category', 'delete_category', 'reorder_categories',
+    'create_status', 'update_status', 'reorder_statuses', 'set_priorities',
+    'create_domain', 'update_domain', 'delete_domain',
+  ],
+  manage_ticket_checklist_templates: ['update', 'delete', 'add_item', 'update_item', 'remove_item', 'reorder_items'],
+  manage_ticket_inbox: ['convert', 'dismiss'],
+  manage_ticket_attachments: ['delete'],
+  manage_ticket_forms: ['create', 'update', 'delete'],
+  manage_ticket_response_templates: ['create', 'update', 'delete'],
+  // Full-control W07 (#6777): promoting an anomaly raises a real alert and publishes alert.triggered,
+  // which reaches notification channels and ticket automation (spec Q2: reaches a person).
+  // Full-control W17 (#6788): run queues a command on the machine and cannot be unsent. C2C create and update choose
+  // whose mail is copied, to which storage and on what schedule, and auto_approve runs tier 2 unprompted; delete is
+  // not reversible. Create and cancel of a bare-metal recovery stay human.
+  manage_backup_verification: ['run'],
+  manage_c2c_configs: ['create', 'update', 'delete'],
+  manage_device_anomalies: ['promote'],
+  // Full-control W08 (#6778): see TIER3_SUPERVISED_ACTIONS.
+  manage_topology_templates: ['publish_version', 'revoke_template'],
+  apply_topology_template: ['apply'],
+  // Full-control W11 (#6781): see TIER3_SUPERVISED_ACTIONS; manage_security_policies:create is input-aware.
+  manage_access_reviews: ['create'],
+  manage_audit_baselines: ['create'],
+  manage_security_policies: ['create', 'update'],
+  manage_recovery_keys: ['rotate', 'collect'],
+  manage_pam_rules: [
+    'create_rule', 'update_rule', 'delete_rule', 'set_config',
+    'create_signer_group', 'update_signer_group', 'delete_signer_group',
+  ],
+  // Full-control W12 (#6782): see TIER3_SUPERVISED_ACTIONS.
+  manage_software_catalog: [
+    'archive', 'add_version', 'update_version', 'promote_version',
+    'add_install_method', 'update_install_method', 'delete_install_method',
+  ],
+  manage_software_deployments: ['create', 'retry'],
+  manage_device_software: ['update', 'uninstall'],
+  manage_software_inventory: ['approve', 'deny', 'clear'],
+  manage_custom_fields: ['delete_definition', 'set_values'],
+  // Full-control W13 (#6783): see TIER3_SUPERVISED_ACTIONS.
+  manage_device_function: ['set'],
+  manage_manual_assets: ['delete'],
+  manage_device_warranty: ['refresh'],
+  // Full-control W13 PR B (#6783): see TIER3_SUPERVISED_ACTIONS.
+  browse_device_event_log: ['query', 'get_event'],
+  manage_tenant_variables: ['create', 'update', 'delete'],
+  manage_support_sessions: ['end'],
+  // Full-control W14 (#6784): see TIER3_SUPERVISED_ACTIONS.
+  manage_billing_profiles: [
+    'create', 'update', 'archive', 'set_rows', 'clone', 'create_work_type', 'update_work_type',
+    'set_org_profile', 'clear_org_profile',
+  ],
+  manage_billing_settings: ['update_partner', 'update_org'],
+  manage_contract_templates: ['create_version', 'publish', 'archive'],
+  manage_contract_documents: ['link'],
+  // Full-control W14 PR B (#6784): see TIER3_SUPERVISED_ACTIONS / TIER3_FOUR_EYES_ACTIONS.
+  manage_accounting_sync: ['link_mapping', 'unlink_mapping', 'sync_mapping', 'push', 'push_bulk'],
+  // Full-control W18 PR B (#6789): see TIER3_SUPERVISED_ACTIONS / TIER3_FOUR_EYES_ACTIONS.
+  manage_org_portal_settings: ['update', 'set_sensitive_access'],
+  manage_report_recipients: ['add', 'remove', 'convert'],
+  // Full-control W16 PR B (#6786): see TIER3_SUPERVISED_ACTIONS / TIER3_FOUR_EYES_ACTIONS.
+  manage_ai_agent_schedules: ['create', 'update', 'delete'],
+  manage_fleet_designs: ['run', 'apply', 'rollback', 'document'],
+  // W15 PR A (#6785, Gate B): sync calls the vendor partner-wide; preflight sends staged content.
+  manage_pax8_subscriptions: ['sync', 'link', 'unlink'],
+  manage_pax8_orders: ['preflight', 'submit', 'reconcile'],
   // Money-authoring drafts vs money-moving actions (#2551): this boundary
   // tracks reversibility/external-commitment, not dollar amount. Drafting —
   // create_draft, add_manual_line, add_catalog_line, update, etc. — only
@@ -318,8 +733,23 @@ export const TIER3_ACTIONS: Record<string, string[]> = {
   // threshold for drafting was proposed and explicitly deferred (not
   // rejected) — see #2551 for the full analysis and the decision record.
   manage_invoices: ['issue', 'void', 'record_payment', 'void_payment'],
-  manage_contracts: ['activate', 'pause', 'resume', 'cancel'],
-  manage_quotes: ['send'],
+  manage_contracts: ['activate', 'pause', 'resume', 'cancel', 'generate_invoice'],
+  // decline (W02, #6756) records the CUSTOMER's decision on their behalf with
+  // no reopen (only revise), and its route requires quotes:accept;
+  // create_pay_link opens a Stripe Checkout session on the partner's
+  // connected account for the converted invoice.
+  manage_quotes: ['send', 'decline', 'create_pay_link'],
+  // Billing price book (W02, #6756). Contract renewals read the price book
+  // LIVE (generateDueInvoice → addContractLine → resolvePrice in
+  // catalogService.ts), so every price-affecting edit reaches future
+  // invoices. Supervised, not four-eyes, because each handler returns the
+  // value it replaced (`previous`), making it reversible within a minute.
+  // create_item stays tier 2: a new, unreferenced item changes no document.
+  manage_billing_catalog: ['update_item', 'archive_item', 'set_price', 'remove_price', 'set_org_price', 'remove_org_price', 'set_bundle_components'],
+  // Notification channels (W02, #6756). update redirects live, already-routed
+  // alert data to a new destination; delete silences every linked route and
+  // destroys the stored destination; create points at an unverified owner.
+  manage_notification_channels: ['create', 'update', 'delete'],
   // Org lifecycle (issue #2366) — tenant-shape mutations require approval.
   // add_contact (#3258) writes customer PII (a first-class contact record),
   // so it escalates too, even though it reshapes no tenant boundary.
@@ -333,6 +763,11 @@ export const TIER3_ACTIONS: Record<string, string[]> = {
   // too: rollback (containment RELEASE) is four_eyes, kill/quarantine
   // (containment/mitigation) are supervised. See spec §3.2.
   s1_threat_action: ['kill', 'quarantine', 'rollback'],
+  // EDR response actions (#8167 W03, spec §4.10). Same split as
+  // s1_threat_action: isolate is protective containment (supervised),
+  // releasing isolation reverses a mitigation (four_eyes). Listed by hand —
+  // the tier-table contracts parse this file as text.
+  edr_endpoint_action: ['isolate', 'unisolate'],
 };
 
 // Spec 2026-08-05 §3: within tier 3, `four_eyes` requires a SECOND human
@@ -373,20 +808,51 @@ export const TIER3_ACTIONS: Record<string, string[]> = {
 // See docs/superpowers/specs/ai-mcp/2026-08-05-tier3-supervised-four-eyes-split-design.md §3.2
 // for the full classification rationale.
 export const TIER3_FOUR_EYES_ACTIONS: Record<string, string[]> = {
+  manage_pax8_orders: ['submit'],
   // Financial / externally binding. `void` is not named in spec §3.2's
   // bullet list, but TOOL_PERMISSIONS maps it to the same `invoices:send`
   // RBAC action as issue/record_payment/void_payment — voiding an issued
   // invoice is the same externally-binding class, so it is classified
   // alongside them (see task report "concerns").
   manage_invoices: ['issue', 'void', 'record_payment', 'void_payment'],
-  manage_contracts: ['activate', 'cancel'],
+  // generate_invoice (full-control W14 PR B, #6784, quorum QW1 — Todd sign-off): creates the period's invoice and,
+  // when the contract auto-issues, issues it and emails the customer. Irreversible (void is not undo) and it leaves
+  // the tenant. Mandatory effect digest over the whole computed invoice (pinnedEffectPolicy.ts).
+  manage_contracts: ['activate', 'cancel', 'generate_invoice'],
   manage_quotes: ['send'],
+  // Full-control W14 PR B (#6784, QW1 — Todd sign-off): the invoice is written into the partner's QuickBooks / Xero
+  // books (and a not-yet-synced customer / item with it), which no Breeze action reverses. Mandatory pins.
+  manage_accounting_sync: ['push', 'push_bulk'],
+  // Full-control W18 PR B (#6789, Decision 2): per-host patch, CVE and rack data, the hours balance and trust-page
+  // editing open to a customer's portal users, and what they have seen cannot be recalled. Mandatory effect digest
+  // over the requested flags and the row's current sensitive values (pinnedEffectPolicy.ts).
+  manage_org_portal_settings: ['set_sensitive_access'],
+  // Full-control W16 PR B (#6786). delete: a baseline cascades every org's override, and that tightening cannot be
+  // restored. Static for both owners because the input names no owner, so a single-org override on an unarmed baseline
+  // is stricter than the class rule requires (recorded in the plan). apply bills through role corrections and reaches
+  // every device a design names; rollback removes monitoring and reverses those roles (Decision 5). All three carry a
+  // mandatory effect digest (pinnedEffectPolicy.ts).
+  manage_ai_agent_schedules: ['delete'],
+  manage_fleet_designs: ['apply', 'rollback'],
   // update_org is deliberately ABSENT here: its scope is input-aware (a
   // `status` change is four_eyes, a plain rename is supervised) and is
   // resolved by resolveApprovalScope's override hook, not this static table.
   // See TIER3_INPUT_AWARE_ACTIONS.
   manage_organizations: ['create_org'],
+  // #8972: `merge` is Tier 3 (one approver, spec §5.7), not four-eyes: it is
+  // same-org, unlike move_org's re-tenanting.
   manage_tickets: ['move_org'],
+  // Full-control W06 (#6776, W06-D10): hard deletes of config that is partner-wide, or whose
+  // ownership is DB state (guardrails are DB-free): irreversible AND partner-wide.
+  manage_ticket_config: ['delete_domain'],
+  manage_ticket_checklist_templates: ['delete'],
+  manage_ticket_forms: ['delete'],
+  manage_ticket_response_templates: ['delete'],
+  // W02 QV3 (#6756): deleting a PARTNER-WIDE channel is irreversible (its
+  // destination and secret config are gone) and silences alerting for every
+  // org. Guardrails are DB-free and cannot tell a partner-wide channel from an
+  // org one by id, so the fail-safe applies to every delete.
+  manage_notification_channels: ['delete'],
   // Grants an AUTHORITY, not a device action: it converts "this agent must ask
   // a human for <opKey>" into "this agent may run <opKey> unattended for this
   // org from now on". Proposing that and authorising it are separate
@@ -399,6 +865,8 @@ export const TIER3_FOUR_EYES_ACTIONS: Record<string, string[]> = {
   // quarantine are protective mitigation and stay supervised (same rationale
   // as s1_isolate_device isolate — urgent protective action must not wait).
   s1_threat_action: ['rollback'],
+  // Containment RELEASE, same rationale as s1_threat_action rollback (#8167).
+  edr_endpoint_action: ['unisolate'],
 };
 
 export const TIER3_FOUR_EYES_TOOLS = new Set<string>([
@@ -419,6 +887,21 @@ export const TIER3_FOUR_EYES_TOOLS = new Set<string>([
   // headless registry via makeSessionAwareHandler, but still carry a real
   // tier via m365ToolTiers).
   'm365_disable_user', 'm365_reset_password',
+  // Identity / account control — M365 control-plane identity catalog (Operator
+  // Recipe Library M1, spec §7.1): all Tier 3, all four-eyes.
+  'm365_revoke_sessions', 'm365_remove_license', 'm365_assign_license',
+  'm365_remove_from_group', 'm365_add_to_group', 'm365_retire_intune_device',
+  'm365_create_user', 'm365_set_auto_reply',
+  // AI Operator plan approval — ONE four-eyes decision over an ordered,
+  // digest-pinned set of provider effects (Recipe Library spec §6.4). Four-eyes
+  // for the same reason every effect inside it is: the set can destroy a
+  // person's access across two providers.
+  'operator_plan',
+  // Wisp memory (W03 #9909): human-only (HUMAN_ONLY_TOOLS) and never declared to
+  // chat, Helper or agents — a person confirms/retracts on the memory page. Tier 3
+  // with operator_plan so the external MCP never advertises them; four_eyes is
+  // the conservative classification should any approval path ever reach them.
+  'confirm_memory', 'retract_memory',
   // Identity / account control — Google Workspace. Every mutating Google tool
   // acts on a human identity/mailbox/account, not a device, so the whole
   // mutating surface is classified four_eyes (categorical reading of spec
@@ -432,6 +915,7 @@ export const TIER3_FOUR_EYES_TOOLS = new Set<string>([
   'google_set_forwarding', 'google_disable_forwarding',
   'google_add_mail_delegate', 'google_remove_mail_delegate',
   'google_suspend_user', 'google_offboard_user', 'google_wipe_mobile_device',
+  'google_account_wipe_mobile_device',
   'google_restore_user', 'google_signout', 'google_set_vacation',
   'google_update_user', 'google_share_calendar', 'google_move_ou',
   'google_rename_user', 'google_add_to_group', 'google_remove_from_group',
@@ -440,50 +924,44 @@ export const TIER3_FOUR_EYES_TOOLS = new Set<string>([
   // TIER3_FOUR_EYES_ACTIONS/TIER3_SUPERVISED_ACTIONS above, so this only
   // matters if the action is missing/unrecognized — fail-safe.
   's1_threat_action',
-  // PAM elevation grant: rule auto-approve can grant elevated device access
-  // with no further human review (see TOOL_PERMISSIONS comment on
-  // request_elevation above). Not named in spec §3.2; classified four_eyes
-  // out of caution — flagged in the task report "concerns".
+  // EDR response actions whole-tool catch-all (#8167): an unknown action
+  // string fails closed to four_eyes instead of falling through.
+  'edr_endpoint_action',
+  // Network-isolation containment RELEASE (W13 #10101, spec §2/§3.10, ai.mdx):
+  // lifting an isolation reverses a mitigation on a device under incident
+  // response — the same class as s1_threat_action rollback and
+  // edr_endpoint_action unisolate. Isolating (execute_containment) stays
+  // supervised. The sole-operator WebAuthn fallback still applies, because the
+  // tool is not on selfApprovalPolicy's forbidden list.
+  'release_containment',
+  // PAM elevation request. Classified four_eyes out of caution (not named in
+  // spec §3.2). Full-control W04 (#6758) re-read the handler: it always
+  // inserts a PENDING request and applies only an auto_deny rule verdict —
+  // an auto_approve rule is NOT applied (aiToolsPam.ts), so a separate
+  // pam:approve holder still answers it. Four-eyes is kept, not loosened.
   'request_elevation',
 ]);
 
-/**
- * Tools the `ai_agent` principal may NEVER call, whatever its allowlist says.
- *
- * A third unconditional denial class alongside BLOCKED_TOOLS (tier 4) and
- * `isSecretBearingTool` — and, like those, enforced in `checkAgentGuardrails`
- * ABOVE the allowlist and the multiplexed-action resolution, so the deny
- * cannot depend on a parseable `action` or on the snapshot omitting the name.
- *
- * `manage_ai_agents` (P2-5, #4192) grants an agent a pre-authorized action
- * key: an agent able to call it could grant ITSELF new unattended authority,
- * which is the one escalation no approval scope can contain (the grant
- * outlives the run). Membership here is a registry, not a hard-coded string,
- * so aiGuardrails.agentPrincipal.contract.test.ts can treat the class as
- * unconditionally denied instead of duplicating the literal.
- */
-export const AGENT_HUMAN_ONLY_TOOLS = new Set<string>([
-  'manage_ai_agents',
-  // Execution plane (spec §5.5). FULLY DEREGISTERED as of #6086 — chat-to-agent
-  // delegation is withdrawn until caller authorization can be preserved for the
-  // length of a run, so no tier, schema, handler or MCP declaration remains.
-  // Kept here anyway, and pinned by workspaceLaunchTool.registration.test.ts:
-  // an agent that could launch analysis runs could launch runs that launch
-  // runs, so if the name is ever re-wired this deny (unconditional, above the
-  // allowlist in `checkAgentGuardrails`) must already be in place rather than
-  // being something the re-wiring has to remember. A HUMAN asks for analysis.
-  //
-  // This entry is ALSO load-bearing for the workspace_stage/run/collect/cancel
-  // permission mapping (2026-09-17 ROLE audit §2.7): those four are flat
-  // `ai_agents:read`, which is only defensible while no chat caller can obtain
-  // a run-bearing principal. Re-wiring launch without first raising them to an
-  // execute-class permission hands arbitrary code execution to every
-  // `ai_agents:read` holder. See the LANDMINE note at their TOOL_PERMISSIONS
-  // entries, and aiGuardrails.workspaceToolSurface.contract.test.ts.
-  'workspace_launch_analysis',
-]);
+// AGENT_HUMAN_ONLY_TOOLS and AGENT_DENIED_READ_TOOLS moved to
+// aiToolExposure.ts (W01 quorum amendment WQ4, #6755) and are re-exported
+// near the top of this file so every existing importer keeps working.
 
 export const TIER3_SUPERVISED_ACTIONS: Record<string, string[]> = {
+  // Wisp W07: one approver (the person asking, or a colleague) — the
+  // specialist's own effects still mint their own intents.
+  launch_specialist: [...CHAT_TIER3_SPECIALIST_KINDS],
+  // #6268 Gate B 8: an IOC import authors detection rules (a set with
+  // auto-quarantine on is refused in the handler, under the set lock).
+  // ioc_hunt:sweep is NOT here: its scope is input-aware (expectedDeviceCount).
+  ioc_hunt: ['import_iocs'],
+  // Supervised, not four_eyes: same class as a public ticket reply. list/get
+  // resolve to Tier 1 (TIER1_ACTIONS) and never reach tier 3.
+  send_endpoint_message: ['send'],
+  // #8972: merging two tickets of ONE org (spec §5.7: Tier 3, approval). It is
+  // irreversible, which is why it needs approval at all; it is not tenant-
+  // shaping like move_org (four_eyes), so one approver suffices.
+  // #8883 W5: routing rules are config objects, not externally binding: one approver.
+  manage_ticket_routing_rules: ['create', 'update', 'reorder', 'delete'],
   // complement of TIER3_FOUR_EYES_ACTIONS within TIER3_ACTIONS.
   file_operations: ['read', 'write', 'delete', 'mkdir', 'rename'],
   manage_services: ['start', 'stop', 'restart'],
@@ -500,7 +978,9 @@ export const TIER3_SUPERVISED_ACTIONS: Record<string, string[]> = {
   // maintenance operations a tech could run by hand on the box, and nothing in
   // it is externally binding or financial. Its irreversibility (Windows.old)
   // is a property of the ACTION the tech picked, not of the approval class.
-  system_cleanup: ['run'],
+  // `cancel` (#10161) fails one run on one device and reaches no one: the
+  // requester approves.
+  system_cleanup: ['run', 'cancel'],
   manage_startup_items: ['disable', 'enable'],
   manage_scheduled_tasks: ['run', 'disable', 'enable'],
   manage_configuration_policy: ['create', 'update', 'delete'],
@@ -511,11 +991,21 @@ export const TIER3_SUPERVISED_ACTIONS: Record<string, string[]> = {
   manage_deliverables: ['apply_template'],
   manage_deployments: ['create', 'start', 'cancel'],
   manage_patches: ['install', 'setup_auto_approval'],
-  manage_groups: ['create', 'update', 'delete'],
-  manage_automations: ['run'],
+  // #10149 (QW9): membership writes are supervised. Membership feeds agent run
+  // scope (triggers.deviceGroupIds), group-targeted config/peripheral policies,
+  // and schedules peripheral reconciliation for every touched device.
+  manage_groups: ['create', 'update', 'delete', 'add_devices', 'remove_devices'],
+  // create/update/delete added W01-D3 (#6755): handler-disabled today, same
+  // supervised (not four_eyes) class as the sibling fleet tools above —
+  // nothing here is externally binding or financial.
+  manage_automations: ['run', 'create', 'update', 'delete'],
   manage_processes: ['kill'],
   manage_policy_feature_link: ['remove'],
   registry_operations: ['set_value', 'create_key', 'delete_key'],
+  // create/update/delete added W01-D3 (#6755): handler-disabled today,
+  // supervised (not four_eyes) — nothing here is externally binding or
+  // financial.
+  manage_maintenance_windows: ['create', 'update', 'delete'],
   // #3552 policy-prerequisite escalations. `supervised`, matching the
   // configuration policy they link into (manage_configuration_policy
   // create/update/delete above), the Tier-3 singular siblings in
@@ -527,9 +1017,138 @@ export const TIER3_SUPERVISED_ACTIONS: Record<string, string[]> = {
   manage_software_policies: ['create', 'update'],
   manage_peripheral_policies: ['create', 'update'],
   manage_dr_plan: ['delete_group'],
-  manage_monitors: ['create', 'update', 'delete'],
   manage_delivery: ['create_routing','update_routing','delete_routing','set_default','create_escalation','update_escalation','delete_escalation'],
   manage_contracts: ['pause', 'resume'],
+  // Full-control W04 (#6758): base-tier-3 policy and remediation tools whose
+  // whole-tool TIER3_SUPERVISED_TOOLS entry was the only classifier. Every
+  // write is enumerated so a new enum member reds the enumeration contract
+  // instead of landing on the backstop. Software update can arm fleet
+  // uninstall; peripheral writes queue device syncs; secure_delete is
+  // irreversible but single-device and tenant-internal (sup by the class
+  // rule); the three finding status flips have no reopen path (kept sup).
+  manage_software_policy: ['create', 'update', 'delete'],
+  manage_browser_policy: ['create', 'update', 'apply'],
+  manage_peripheral_policy: ['create', 'update', 'disable', 'add_exception', 'remove_exception'],
+  remediate_sensitive_data: ['encrypt', 'quarantine', 'secure_delete', 'accept_risk', 'false_positive', 'mark_remediated'],
+  // W03 (#6757) — see the TIER3_ACTIONS notes for each. manage_hyperv_vm is
+  // registry tier 3 (whole-tool backstop below); every power action is
+  // enumerated here so a new one reds the enumeration contract. force_stop is
+  // irreversible but single-device and tenant-internal: supervised, not
+  // four-eyes, under the spec's class rule.
+  manage_hyperv_vm: ['start', 'stop', 'force_stop', 'pause', 'resume', 'save'],
+  manage_hyperv_checkpoints: ['create'],
+  manage_backup_profiles: ['update', 'delete'],
+  configure_vault: ['create', 'update'],
+  // W02 (#6756) — see the TIER3_ACTIONS notes for each.
+  manage_tickets: ['edit_comment', 'delete_comment', 'merge'],
+  // Full-control W06 (#6776): reversible partner-wide config, MFA-route mutations,
+  // customer-visible forms, terminal inbox acts and the permanent attachment delete.
+  manage_ticket_config: [
+    'update_org_settings', 'create_category', 'update_category', 'delete_category', 'reorder_categories',
+    'create_status', 'update_status', 'reorder_statuses', 'set_priorities',
+    'create_domain', 'update_domain',
+  ],
+  manage_ticket_checklist_templates: ['update', 'add_item', 'update_item', 'remove_item', 'reorder_items'],
+  manage_ticket_inbox: ['convert', 'dismiss'],
+  manage_ticket_attachments: ['delete'],
+  manage_ticket_forms: ['create', 'update'],
+  // Full-control W07 (#6777): see TIER3_ACTIONS.
+  // Full-control W17 (#6788): see TIER3_ACTIONS.
+  manage_backup_verification: ['run'],
+  manage_c2c_configs: ['create', 'update', 'delete'],
+  manage_device_anomalies: ['promote'],
+  // Full-control W08 (#6778): publishing makes a version appliable partner/org-wide and is not undoable;
+  // revoking a template is terminal and disables every policy that references it; applying rewrites the
+  // monitoring configuration of every previewed site. One approver (the requester).
+  manage_topology_templates: ['publish_version', 'revoke_template'],
+  apply_topology_template: ['apply'],
+  // Full-control W11 (#6781, plan class review + quorum). One approver (the requester):
+  // - access-review create has no delete or cancel (QW6); audit-baseline create arms the daily
+  //   collect_audit_policy sweep on the org's devices of that OS (QW3);
+  // - a security-policy update edits AV/EDR settings (no endpoint reads them today, plan fact 5; kept
+  //   supervised); create is input-aware (partner-wide is four-eyes, resolveApprovalScope);
+  // - recovery-key rotate invalidates the current key (irreversible, one device); collect re-escrows keys;
+  // - PAM writes decide who gets local admin. They cannot write auto_approve, and in an org with an
+  //   auto-approve rule only non-widening changes are allowed (W11-D3), so none grants standing elevation.
+  manage_access_reviews: ['create'],
+  manage_audit_baselines: ['create'],
+  manage_security_policies: ['update'],
+  manage_recovery_keys: ['rotate', 'collect'],
+  manage_pam_rules: [
+    'create_rule', 'update_rule', 'delete_rule', 'set_config',
+    'create_signer_group', 'update_signer_group', 'delete_signer_group',
+  ],
+  // Full-control W12 (#6782, plan class review). One approver (the requester):
+  // - catalog install-target edits (a version added — auto-promoted —, edited or promoted; an install method added,
+  //   edited or deleted) change what armed auto-install policies, automations and `latest` deployments install on
+  //   customer machines with no further approval (plan fact 1); archive has no restore route;
+  // - deployment create/retry dispatch software_install; device-software update/uninstall queue a device command;
+  // - inventory approve/deny/clear append to (or remove from) the org's default allow/blocklist, which with an
+  //   enforcing policy drives auto-uninstall (plan fact 5);
+  // - a custom-field definition delete cascades every device's value (irreversible); a value write changes installer
+  //   arguments and dynamic-group targeting (quorum QW1; set_values returns the previous values).
+  manage_software_catalog: [
+    'archive', 'add_version', 'update_version', 'promote_version',
+    'add_install_method', 'update_install_method', 'delete_install_method',
+  ],
+  manage_software_deployments: ['create', 'retry'],
+  manage_device_software: ['update', 'uninstall'],
+  manage_software_inventory: ['approve', 'deny', 'clear'],
+  manage_custom_fields: ['delete_definition', 'set_values'],
+  // Full-control W13 (#6783, plan class review). One approver (the requester):
+  // - a device function is an ALLOWED execution-targeting filter (filterEngine.ts field table): setting or clearing it
+  //   changes which devices dynamic groups select for scripts, deployments and policy (plan fact 1);
+  // - a manual-asset delete is a hard delete with no restore (retiredAt is the soft path);
+  // - a warranty refresh sends the device's serial number to the manufacturer's warranty API now (spec class rule:
+  //   nothing that leaves the tenant may be tier 2).
+  manage_device_function: ['set'],
+  manage_manual_assets: ['delete'],
+  manage_device_warranty: ['refresh'],
+  // Full-control W13 PR B (#6783, plan class review + quorum QW1/QW2/QW6). One approver (the requester):
+  // - an event-log query / event read returns event TEXT from any channel (Security / Application logs can carry
+  //   credentials and PII) — the execute_command event_logs_query base class, without its chat-only exemption;
+  // - a tenant-variable value is substituted into every script dispatched to the org's devices ({{var.<key>}}), and
+  //   a delete loses the value (the tool never touches secrets or existing partner-wide rows, W13-D7/D13);
+  // - ending a support session self-destructs the temporary client and decommissions it (irreversible).
+  browse_device_event_log: ['query', 'get_event'],
+  manage_tenant_variables: ['create', 'update', 'delete'],
+  manage_support_sessions: ['end'],
+  // Full-control W14 (#6784, W14 plan class review + quorum QW2/QW3/QW5). One approver (the requester):
+  // - rate cards and work types are partner-wide by construction and price every org's time entries; an org's
+  //   rate-card assignment picks what that org is billed (the manage_billing_catalog:set_org_price precedent);
+  // - partner billing settings rewrite every org's invoice defaults and customer-facing text; org billing settings
+  //   change one org's tax, terms and the contact its invoices are emailed to;
+  // - an org-owned agreement template's draft versions are append-only, and publish / archive cannot be undone
+  //   (the partner-wide ones are refused in the handler, W14-D5); filing a signed agreement cannot be undone.
+  // Every write's result and audit row carries the previous values (QW3).
+  manage_billing_profiles: [
+    'create', 'update', 'archive', 'set_rows', 'clone', 'create_work_type', 'update_work_type',
+    'set_org_profile', 'clear_org_profile',
+  ],
+  manage_billing_settings: ['update_partner', 'update_org'],
+  manage_contract_templates: ['create_version', 'publish', 'archive'],
+  manage_contract_documents: ['link'],
+  // Full-control W14 PR B (#6784, PR B quorum QB9): linking a mapping (and its enqueued sync) and re-syncing a
+  // linked one OVERWRITE the remote customer / item with Breeze's values; unlink is local. A sync that would
+  // CREATE the remote record is refused in the handler (QB5), so none of these is creation-capable.
+  manage_accounting_sync: ['link_mapping', 'unlink_mapping', 'sync_mapping'],
+  // Full-control W18 PR B (#6789): a portal settings change reaches customers at once (reversible, but seen); a
+  // recipient add or convert sends report data out of Breeze on the schedule, and a remove can restore a series
+  // delivery. update refuses a parent enable that would activate a dormant sensitive child (row-locked).
+  manage_org_portal_settings: ['update'],
+  manage_report_recipients: ['add', 'remove', 'convert'],
+  // Full-control W16 PR B (#6786). Schedule create and update: each run a schedule starts uses credits and may notify
+  // people, so neither can be tier 2. Fleet run: Decision 1's recorded exception, because a design run applies nothing
+  // (maxActionsPerRun 0). Fleet document: deleting the document reverses it.
+  manage_ai_agent_schedules: ['create', 'update'],
+  manage_fleet_designs: ['run', 'document'],
+  // W15 PR A (#6785): local billing links, partner-wide sync and vendor isMock preflight.
+  manage_pax8_subscriptions: ['sync', 'link', 'unlink'],
+  manage_pax8_orders: ['preflight', 'reconcile'],
+  manage_ticket_response_templates: ['create', 'update'],
+  manage_quotes: ['decline', 'create_pay_link'],
+  manage_billing_catalog: ['update_item', 'archive_item', 'set_price', 'remove_price', 'set_org_price', 'remove_org_price', 'set_bundle_components'],
+  manage_notification_channels: ['create', 'update'],
   // create_site adds a location within an existing org, not a new tenant —
   // spec §3.2's tenant-shape bullet names only create_org/update_org.
   // add_contact (#3258) writes customer PII but is neither externally-binding
@@ -537,9 +1156,30 @@ export const TIER3_SUPERVISED_ACTIONS: Record<string, string[]> = {
   // rather than four_eyes — see spec §5.
   manage_organizations: ['create_site', 'add_contact'],
   s1_threat_action: ['kill', 'quarantine'],
+  // Protective containment must not wait on a second approver (#8167).
+  edr_endpoint_action: ['isolate'],
 };
 
 export const TIER3_SUPERVISED_TOOLS = new Set<string>([
+  // Tool Catalog W04 (#5219, Decision 11): starting a flow carries the upper
+  // bound of any flow's tier until W05's per-flow tiers; one requester tap.
+  'run_flow',
+  // Wisp W07: the specialist approval carrier — one approver, no four-eyes and
+  // no effect-digest pin (the coordinator re-runs every gate at release under
+  // the approver). launch_specialist is NOT here: its base tier is 2, and its
+  // tier-3 kinds are classified by TIER3_SUPERVISED_ACTIONS above.
+  'wisp_specialist_request',
+  // Full-control W16 PR A (#6786), Decision 1: a RECORDED EXCEPTION to the class rule. A launch cannot be undone
+  // (credits) and it can notify people, which the rule would make four-eyes. Supervised instead, because what each
+  // launches is findings or per-effect approvals: a patch run executes nothing (patchLimits pins the run loop to 0
+  // actions; proposed installs are minted afterwards as supervised manage_patches:install cards), and an operator
+  // task asks approval for each change it makes.
+  // Per-org caps bound the spend; launch_specialist's patch_plan / operator_recipe kinds are already supervised; REST
+  // "Run now" is one person + MFA. Signed off in the W16 PR A body. Moving either to four-eyes needs no other change.
+  'run_patch_plan', 'create_operator_task',
+  // #8742: customer-visible endpoint message; every action is enumerated in
+  // TIER1_ACTIONS / TIER3_SUPERVISED_ACTIONS.
+  'send_endpoint_message',
   // The customer's "regular work on a PC" (spec §3.2's explicit supervised list).
   'execute_command', 'run_script',
   // #3525: stopping a script is a de-escalation — it never starts work, carries
@@ -563,11 +1203,17 @@ export const TIER3_SUPERVISED_TOOLS = new Set<string>([
   'take_screenshot', 'analyze_screen',
   'apply_cis_remediation', 'manage_hyperv_vm', 'manage_peripheral_policy',
   'manage_software_policy', 'manage_browser_policy',
+  // Full-control W12 (#6782): bootstrap_homebrew has no action (whole tool); manage_device_software's two actions are
+  // enumerated in TIER3_SUPERVISED_ACTIONS — this is the backstop.
+  'bootstrap_homebrew', 'manage_device_software',
   // Monitor definitions (#5289 Task 8): ordinary config-object CRUD (create/
   // update/delete/enable/disable/attach/detach), same class as the software/
   // browser/peripheral policy tools above — no identity, tenant-destruction,
   // or restore/rewind action in its surface.
   'manage_monitor_definitions',
+  // Ticket routing rules (#8883 W5): config-object CRUD + reorder, same class;
+  // whole-tool backstop for its TIER3_SUPERVISED_ACTIONS entry.
+  'manage_ticket_routing_rules',
   'network_discovery', 'remediate_sensitive_data',
   'remediate_software_violation', 'remediate_vulnerability',
   'execute_playbook', 'execute_containment',
@@ -575,6 +1221,29 @@ export const TIER3_SUPERVISED_TOOLS = new Set<string>([
   // ("backup triggers, ... agent upgrades").
   'trigger_backup', 'trigger_hyperv_backup', 'trigger_mssql_backup',
   'trigger_agent_upgrade', 'trigger_agent_restart',
+  // Full-control W04 (#6758, W04-D7): registry tier 2 → 3. Creating a
+  // baseline arms a RECURRING on-site discovery scan of a model-chosen subnet
+  // (every 1-168 h) — the one-shot network_discovery is already supervised,
+  // and at tier 2 auto_approve would schedule it with no prompt.
+  'configure_network_baseline',
+  // W03 (#6757): registry tier 2 → 3. Vault sync and MSSQL verify queue a
+  // device command (VAULT_SYNC / MSSQL_VERIFY stages the backup artifact on
+  // the device); C2C sync is a vendor pull by intent (today the worker fails
+  // it not-implemented). Same class as the backup triggers above.
+  'trigger_vault_sync', 'trigger_c2c_sync', 'verify_mssql_backup',
+  // Topology M4 Task 4 (#6000), same class as network_discovery: every
+  // accepted recipe is ONE bounded, same-site OBSERVATIONAL check from the
+  // fixed M1/M3 set (gateway/DNS/internet/configured target/routed trace) —
+  // no arbitrary shell, configuration, identity, destination or destructive
+  // operation exists in its input. Supervised removes nothing: it still needs
+  // an explicit approval with a FRESH second factor (freshApproverFactor.ts),
+  // a mandatory pinned effect digest and live re-authorization at release. It
+  // is not policy-decidable and has no unattended grant.
+  'diagnose_connectivity',
+  // Real outbound POST to a human-configured
+  // URL, and its route requires MFA — see the registry-tier comment beside
+  // aiToolsIntegrations.ts's test_webhook registration.
+  'test_webhook',
 ]);
 
 /**
@@ -587,6 +1256,22 @@ export const TIER3_SUPERVISED_TOOLS = new Set<string>([
  */
 export const TIER3_INPUT_AWARE_ACTIONS: ReadonlySet<string> = new Set<string>([
   'manage_organizations:update_org',
+  // #6268 Gate B 6: supervised up to IOC_HUNT_FOUR_EYES_DEVICE_THRESHOLD
+  // expected devices, four_eyes above it or when the count is missing.
+  'ioc_hunt:sweep',
+  // A customer-visible ticket reply is a different class of act from an
+  // internal note — the note stays at the tool's base Tier 2 (auto-execute
+  // + audit), but an AI-composed comment that will be shown to the ticket
+  // requester needs a human to have actually looked at it first. Only the
+  // INPUT (`isPublic`) says which one a given call is, so it cannot be
+  // classified by (tool, action) alone in the static tables.
+  'manage_tickets:comment',
+  // W02 (#6756): resolving a ticket emails the requester (with the supplied
+  // resolution note), and a custom statusName resolves to a base status only
+  // through the DB, so it fails safe. Repointing the requester redirects every
+  // later requester email to an address the model chose.
+  'manage_tickets:update_status',
+  'manage_tickets:update_fields',
   // RMM-QA-176 D9: a 'maintenance' feature link is the canonical
   // monitoring-suppression source, so authoring one is a different class of
   // act from authoring any other link — but only the INPUT says which it is,
@@ -595,6 +1280,29 @@ export const TIER3_INPUT_AWARE_ACTIONS: ReadonlySet<string> = new Set<string>([
   // HP CMSL collection — the pair is unchanged, the predicate gained an arm.
   'manage_policy_feature_link:add',
   'manage_policy_feature_link:update',
+  // W03 (#6757): a partner-wide backup profile ("all orgs") is supervised;
+  // an org-owned one stays at the base Tier 2. Only the create INPUT says
+  // which — on update/delete ownership is DB state (static supervised).
+  'manage_backup_profiles:create',
+  // W06 (#6776): a partner-wide checklist template is supervised; an org-owned one stays at
+  // the base tier 2. Only the create INPUT (`data.ownerScope`) says which.
+  'manage_ticket_checklist_templates:create',
+  // Full-control W12 (#6782, quorum QW1): a partner-wide catalog item or custom-field definition (`ownerScope:
+  // 'partner'`) is supervised; an org-owned one stays at the base tier 2.
+  'manage_software_catalog:create',
+  'manage_custom_fields:create_definition',
+  // Full-control W14 (#6784, W14-D5): an agreement template that is partner-wide (`ownerScope: 'partner'`) is
+  // supervised on create / update; an org-owned one stays at tier 2. Ownership is immutable DB state, so the call
+  // ASSERTS it and the handler refuses a mismatch at call time and again at release.
+  'manage_contract_templates:create',
+  'manage_contract_templates:update',
+  // Full-control W11 (#6781, W11-D4): deactivation is irreversible in the product; an org row is supervised, a
+  // partner-wide row (every org) four-eyes. Ownership is DB state, so the call ASSERTS it in `ownerScope` and
+  // the handler refuses a mismatch; only the literal 'organization' resolves supervised.
+  'manage_compliance_policies:deactivate',
+  // Full-control W11 (#6781, W11-D13): a security policy has no delete; an org create is supervised, a
+  // partner-wide create (`ownerScope: 'partner'`, every org) four-eyes. Only the create INPUT says which.
+  'manage_security_policies:create',
 ]);
 
 /**
@@ -603,7 +1311,12 @@ export const TIER3_INPUT_AWARE_ACTIONS: ReadonlySet<string> = new Set<string>([
  * ask the SAME question — a second copy of this predicate is how a tier and
  * its scope drift apart.
  *
- * Two arms, both on manage_policy_feature_link's add/update:
+ * manage_tickets (W02, #6756): a public comment, a resolve (or any custom
+ * statusName) and an update_fields that repoints the requester — each reaches
+ * the ticket requester by email. Internal notes and other status/field edits
+ * stay at the base tier.
+ *
+ * Two arms on manage_policy_feature_link's add/update:
  *
  *  - `featureType === 'maintenance'` (RMM-QA-176 D9). Strict `===`: a
  *    non-string featureType stays at the base tier, which is safe here because
@@ -626,15 +1339,80 @@ export const TIER3_INPUT_AWARE_ACTIONS: ReadonlySet<string> = new Set<string>([
  * stray featureType or inlineSettings argument would be escalated into an
  * approval that the MCP transport then denies outright.
  */
+/** `manage_tickets update_fields` keys that change who receives requester email (W02, #6756). */
+const TICKET_REQUESTER_FIELD_KEYS = ['submittedBy', 'submitterName', 'submitterEmail'] as const;
+
 export function isInputAwareTier3(
   toolName: string,
   action: string | undefined,
   input: Record<string, unknown>,
 ): boolean {
+  if (toolName === 'manage_tickets') {
+    if (action === 'comment') {
+      // Mirrors the handler's own default (aiToolsTicketing.ts): only an
+      // EXPLICIT `isPublic: true` requests a customer-visible reply. Absent,
+      // `false` or a non-boolean stays an internal note at the base Tier 2 —
+      // the handler writes `isPublic: input.isPublic === true`, the same
+      // expression, so the guard and the write cannot disagree.
+      return input.isPublic === true;
+    }
+    if (action === 'update_status') {
+      // `to === 'resolved'` emails the requester (ticketNotifyWorker.ts
+      // ticket.status_changed). A custom `statusName` is resolved to a base
+      // status only in the DB; guardrails are DB-free, so it escalates.
+      return input.status === 'resolved' || input.statusName !== undefined;
+    }
+    if (action === 'update_fields') {
+      // Repointing the requester redirects every later public comment and
+      // resolve email to a model-chosen address.
+      const fields = input.fields;
+      return typeof fields === 'object' && fields !== null
+        && TICKET_REQUESTER_FIELD_KEYS.some((key) => Object.hasOwn(fields, key));
+    }
+    return false;
+  }
+  if (toolName === 'collect_evidence') {
+    // W04-D3 (#6758): a screenshot is screen capture (take_screenshot is tier
+    // 3 supervised). A non-array evidenceTypes cannot be read, so it fails
+    // safe; Zod rejects it a moment later anyway.
+    const types = input.evidenceTypes;
+    return !Array.isArray(types) || types.includes('screenshot');
+  }
+  if (toolName === 'manage_ticket_checklist_templates') {
+    // Mirrors the handler: createChecklistTemplateSchema defaults ownerScope to 'organization', so only the
+    // literal 'partner' makes a partner-wide row. A `data` that is not an object is rejected by the handler's
+    // schema before any write, so it needs no escalation (same posture as manage_backup_profiles).
+    if (action !== 'create') return false;
+    const data = input.data;
+    return typeof data === 'object' && data !== null && !Array.isArray(data)
+      && (data as Record<string, unknown>).ownerScope === 'partner';
+  }
+  if (toolName === 'manage_software_catalog' || toolName === 'manage_custom_fields') {
+    // Full-control W12 (#6782, quorum QW1): mirrors both handlers — only the literal ownerScope 'partner' creates a
+    // partner-wide row (every org of the partner); anything else is org-owned at the base tier 2.
+    const create = toolName === 'manage_software_catalog' ? 'create' : 'create_definition';
+    return action === create && input.ownerScope === 'partner';
+  }
+  if (toolName === 'manage_contract_templates') {
+    // Full-control W14 (#6784, W14-D5): mirrors the handler — only the literal ownerScope 'partner' addresses a
+    // partner-wide template (every org of the partner); absent or 'organization' is an org-owned one at tier 2, and
+    // the handler refuses an assertion that does not match the row.
+    return (action === 'create' || action === 'update') && input.ownerScope === 'partner';
+  }
+  if (toolName === 'manage_backup_profiles') {
+    // Mirrors the handler (aiToolsPolicyPrereqs.ts create branch): only the
+    // literal 'partner' creates a partner-wide row; anything else is an
+    // org-owned profile, so the guard and the write cannot disagree.
+    return action === 'create' && input.ownerScope === 'partner';
+  }
   if (toolName !== 'manage_policy_feature_link') return false;
   if (action !== 'add' && action !== 'update') return false;
   return (
     input.featureType === 'maintenance'
+    // #10100: containment extraAllow grants an isolated device network permits
+    // (execution_gated); the handler refuses a containment update that omits
+    // featureType, so this input check cannot be bypassed on update.
+    || input.featureType === 'containment'
     || warrantyHpCmslRequested(input.inlineSettings)
   );
 }
@@ -647,10 +1425,83 @@ export function isInputAwareTier3(
  */
 export const TIER3_INPUT_AWARE_TOOLS: ReadonlySet<string> = new Set<string>([
   's1_isolate_device',
+  // Full-control W04 (#6758, W04-D3): base tier 2 with no `action` string;
+  // escalated to tier 3 SUPERVISED by isInputAwareTier3 when `evidenceTypes`
+  // asks for a screenshot (the take_screenshot class) or is not an array.
+  'collect_evidence',
   // run_script { proposalId }: scope comes from the proposal's REVIEWED risk
   // tier, handed in through GuardrailContext (AI script authoring, spec §4.5).
   'run_script',
+  // Full-control W11 (#6781, W11-D4): base tier 3; its one action's scope comes from the asserted `ownerScope`
+  // (resolveApprovalScope): supervised for an org-owned policy, four-eyes otherwise.
+  'manage_compliance_policies',
 ]);
+
+/**
+ * Tool Catalog W03 (#5218). Every NON-action input key that an input-aware
+ * branch of `checkGuardrails` / `resolveApprovalScope` reads to pick a tier or
+ * an approval scope. A flow step's tier is fixed at save time, so the flow
+ * validator requires each of these (plus the action selector and any
+ * LIVE_READ_INPUT_FLAGS flag) to be literal — a template must never choose its
+ * own tier at run time. Pinned by aiGuardrails.tierDecidingKeys.contract.test.ts;
+ * a new input-aware branch needs an entry here.
+ *
+ * (event_logs_query's payload-aware classifications, read-only #7906 and the
+ * #10973 unattended-reads switch, are chat-session only and never apply to a
+ * flow, which runs without a chat session and without a guardrail context.)
+ */
+export const TIER_DECIDING_INPUT_KEYS: Readonly<Record<string, readonly string[]>> = {
+  // isInputAwareTier3: comment + isPublic === true, update_status to
+  // 'resolved' or any statusName, and update_fields carrying a requester key
+  // (inside `fields`) escalate to tier 3 (W02, #6756).
+  manage_tickets: ['isPublic', 'status', 'statusName', 'fields'],
+  // isInputAwareTier3: featureType === 'maintenance' or an HP CMSL inlineSettings payload.
+  manage_policy_feature_link: ['featureType', 'inlineSettings'],
+  // resolveApprovalScope: isolate === false is four-eyes.
+  s1_isolate_device: ['isolate'],
+  // isProposalRunScript: a proposalId changes the tier source entirely.
+  run_script: ['proposalId'],
+  // resolveApprovalScope: update_org with a `status` key is four-eyes.
+  manage_organizations: ['status'],
+  // resolveApprovalScope: sweep above the four-eyes device threshold (or with no count) is four-eyes.
+  ioc_hunt: ['expectedDeviceCount'],
+  // isInputAwareTier3: evidenceTypes containing 'screenshot' (or not an array) is supervised (W04, #6758).
+  collect_evidence: ['evidenceTypes'],
+  // isInputAwareTier3: create with ownerScope === 'partner' is supervised (W03, #6757).
+  manage_backup_profiles: ['ownerScope'],
+  // isInputAwareTier3: create with data.ownerScope === 'partner' is supervised (W06, #6776).
+  manage_ticket_checklist_templates: ['data'],
+  // isInputAwareTier3: create / create_definition with ownerScope === 'partner' is supervised (W12, #6782).
+  manage_software_catalog: ['ownerScope'],
+  manage_custom_fields: ['ownerScope'],
+  // isInputAwareTier3: template create / update with ownerScope === 'partner' is supervised (W14, #6784).
+  manage_contract_templates: ['ownerScope'],
+  // resolveApprovalScope: deactivate is supervised only for ownerScope === 'organization' (W11, #6781).
+  manage_compliance_policies: ['ownerScope'],
+  // resolveApprovalScope: create with ownerScope === 'partner' is four-eyes (W11, #6781).
+  manage_security_policies: ['ownerScope'],
+};
+
+/** The action selector, the input-aware keys, and the live-read flag, in that order. */
+export function tierDecidingInputKeys(toolName: string): string[] {
+  const keys = [TOOL_ACTION_INPUT_KEYS[toolName] ?? 'action', ...(TIER_DECIDING_INPUT_KEYS[toolName] ?? [])];
+  const liveFlag = LIVE_READ_INPUT_FLAGS[toolName];
+  if (liveFlag) keys.push(liveFlag);
+  return keys;
+}
+
+/**
+ * Why a proposal-backed `run_script` was refused a tier, when the input named
+ * a `proposalId` but `loadProposalGuardrailContext` could not hand back a
+ * reviewed risk tier for it (#7129). Deliberately collapses "no such id" and
+ * "exists in a different org" into the SAME `proposal_not_found` value — the
+ * caller must never be able to tell a cross-tenant id apart from a
+ * nonexistent one.
+ */
+export type ProposalContextDenyReason =
+  | 'proposal_not_found'
+  | 'proposal_review_pending'
+  | 'proposal_review_failed';
 
 /**
  * Optional, DB-FREE context a caller may hand to the guardrail so an
@@ -663,6 +1514,31 @@ export const TIER3_INPUT_AWARE_TOOLS: ReadonlySet<string> = new Set<string>([
  */
 export interface GuardrailContext {
   proposal?: { riskTier: RiskTier; strictHits: string[] };
+  /**
+   * Set only when `proposal` is undefined AND the loader actually resolved a
+   * specific reason (vs. no context being supplied at all) — lets the tier-4
+   * deny below give the caller a model-actionable reason instead of the
+   * generic `proposal_context_missing` catch-all.
+   */
+  proposalDenyReason?: ProposalContextDenyReason;
+  /**
+   * #7906: set ONLY by the interactive chat gate (`createSessionPreToolUse` /
+   * its postToolUse twin in aiAgentSdk.ts) for a `user_session` principal
+   * that is not a Helper session. Opts the call in to the payload-aware
+   * read-only `event_logs_query` classification. MCP, intents, the agent
+   * catalog and headless runs never set it — `checkAgentGuardrails` strips
+   * it — so they keep the base Tier 3.
+   */
+  chatSession?: true;
+  /**
+   * #10973: set ONLY by the chat gate (`chatGuardrailContext`, aiAgentSdk.ts) for
+   * a call whose LIVE Wisp ceiling says the grant-level unattended-reads switch
+   * is on, and only when the gate could skip the card. Lowers a Security
+   * `event_logs_query` from the restricted grammar to Tier 2; honored only with
+   * `chatSession`. `checkAgentGuardrails` strips it. A troubleshooting run reaches
+   * the same switch through its own verified path in runLoop.ts, never this flag.
+   */
+  wispUnattendedReads?: true;
 }
 
 /** A `run_script` call that names a proposal instead of a library script. */
@@ -694,6 +1570,28 @@ export function resolveApprovalScope(
     // tenant access — externally binding, same class as the other
     // TIER3_FOUR_EYES_ACTIONS members — vs a plain name edit, which is inert.
     return 'status' in input ? 'four_eyes' : 'supervised';
+  }
+  if (toolName === 'manage_compliance_policies' && action === 'deactivate') {
+    // W11-D4 (#6781): only an asserted org-owned row is supervised; a partner-wide row, or an assertion that is
+    // missing or not the literal 'organization', is four-eyes. The handler refuses an assertion that does not
+    // match the row, so the cheaper scope never reaches a partner-wide policy.
+    return input.ownerScope === 'organization' ? 'supervised' : 'four_eyes';
+  }
+  if (toolName === 'manage_security_policies' && action === 'create') {
+    // W11-D13 (#6781): mirrors the handler (createPolicySchema defaults ownerScope to 'organization'): only the
+    // literal 'partner' creates a partner-wide row, which cannot be deleted and applies to every org.
+    return input.ownerScope === 'partner' ? 'four_eyes' : 'supervised';
+  }
+  if (toolName === 'ioc_hunt' && action === IOC_HUNT_RUN_ACTION) {
+    // #6268 Gate B 6: a sweep the approver sees as "up to N devices" is
+    // supervised up to the four-eyes threshold, four_eyes above it. A count
+    // that is missing or not a non-negative integer cannot be trusted to bound
+    // the sweep, so it takes the stricter scope. createSweep refuses the
+    // released call as a scope change when it would target more devices.
+    const n = input.expectedDeviceCount;
+    return typeof n === 'number' && Number.isInteger(n) && n >= 0 && n <= iocHuntFourEyesDeviceThreshold()
+      ? 'supervised'
+      : 'four_eyes';
   }
   if (isInputAwareTier3(toolName, action, input)) {
     // MANDATORY, not stylistic: manage_policy_feature_link is in NEITHER
@@ -732,8 +1630,14 @@ export const TOOL_PERMISSIONS: Record<string, { resource: string; action: string
   list_time_entries: { resource: 'time_entries', action: 'read' },
   get_running_timer: { resource: 'time_entries', action: 'read' },
   get_timesheet: { resource: 'time_entries', action: 'read' },
+  get_ticket_approval_status: { resource: 'tickets', action: 'read' },
   query_devices: { resource: 'devices', action: 'read' },
   get_device_details: { resource: 'devices', action: 'read' },
+  get_device_hardware_health: { resource: 'devices', action: 'read' },
+  get_device_time_status: { resource: 'devices', action: 'read' },
+  list_device_restore_point_attempts: { resource: 'devices', action: 'read' },
+  query_device_workloads: { resource: 'devices', action: 'read' },
+  list_time_sync_issues: { resource: 'devices', action: 'read' },
   get_vulnerability_report: { resource: 'devices', action: 'read' },
   get_device_vulnerabilities: { resource: 'devices', action: 'read' },
   // routes/patches/operations.ts:29 (/scan) and :171 (/:id/rollback) both
@@ -742,8 +1646,13 @@ export const TOOL_PERMISSIONS: Record<string, { resource: string; action: string
   analyze_metrics: { resource: 'devices', action: 'read' },
   get_s1_status: { resource: 'devices', action: 'read' },
   get_s1_threats: { resource: 'devices', action: 'read' },
+  get_edr_status: { resource: 'devices', action: 'read' },
+  list_edr_detections: { resource: 'devices', action: 'read' },
   s1_isolate_device: { resource: 'devices', action: 'execute' },
   s1_threat_action: { resource: 'devices', action: 'execute' },
+  edr_endpoint_action: { resource: 'devices', action: 'execute' },
+  // Route parity: POST /edr/connections/:id/sync requires ORGS_WRITE.
+  sync_edr_data: { resource: 'organizations', action: 'write' },
   execute_command: { resource: 'devices', action: 'execute' },
   run_script: { resource: 'scripts', action: 'execute' },
   // Authoring is inert, but it is still script work: whoever may read the
@@ -766,9 +1675,28 @@ export const TOOL_PERMISSIONS: Record<string, { resource: string; action: string
   manage_ai_agents: {
     authorize_supervised_key: { resource: 'ai_agents', action: 'write' },
   },
+  // Same grants as routes/endpointMessages (send.ts requires endpoint_messages:send
+  // + MFA, list.ts requires endpoint_messages:read). MFA is satisfied by the chat
+  // entry point; see the MFA note beside TOOL_ACTION_EXTRA_PERMISSIONS.
+  send_endpoint_message: {
+    send: { resource: 'endpoint_messages', action: 'send' },
+    list: { resource: 'endpoint_messages', action: 'read' },
+    get: { resource: 'endpoint_messages', action: 'read' },
+  },
+  manage_ticket_routing_rules: {
+    create: { resource: 'tickets', action: 'write' },
+    update: { resource: 'tickets', action: 'write' },
+    reorder: { resource: 'tickets', action: 'write' },
+    delete: { resource: 'tickets', action: 'write' },
+  },
   manage_tickets: {
     list: { resource: 'tickets', action: 'read' },
     get: { resource: 'tickets', action: 'read' },
+    // #11431: read-only (id + name of active partner work types, Tier-1 read);
+    // implemented and in the schema enum but unmapped, so it was refused as an
+    // unknown action. Gated like GET /work-types and the sibling
+    // manage_billing_profiles.list_work_types: billing_profiles:read.
+    list_work_types: { resource: 'billing_profiles', action: 'read' },
     create: { resource: 'tickets', action: 'write' },
     comment: { resource: 'tickets', action: 'write' },
     assign: { resource: 'tickets', action: 'write' },
@@ -780,9 +1708,13 @@ export const TOOL_PERMISSIONS: Record<string, { resource: string; action: string
     edit_comment: { resource: 'tickets', action: 'write' },
     delete_comment: { resource: 'tickets', action: 'write' },
     move_org: { resource: 'tickets', action: 'write' },
+    // #8972: the staff routes gate both on tickets:write (routes/tickets/merge.ts).
+    merge_preview: { resource: 'tickets', action: 'write' },
+    merge: { resource: 'tickets', action: 'write' },
     log_time_entry: { resource: 'time_entries', action: 'write' },
     start_timer: { resource: 'time_entries', action: 'write' },
     stop_timer: { resource: 'time_entries', action: 'write' },
+    update_time_entry: { resource: 'time_entries', action: 'write' },
     // P2-4 (#4191): deliberately 'update', not 'write' — no seeded role
     // grants `tickets:update` (seed.ts only ever grants tickets:read/write/
     // manage), so this fails CLOSED for `checkToolPermission`'s interactive
@@ -793,7 +1725,110 @@ export const TOOL_PERMISSIONS: Record<string, { resource: string; action: string
     // caller of these two actions needs a real permission grant added first.
     link_device: { resource: 'tickets', action: 'update' },
     draft: { resource: 'tickets', action: 'update' },
+    // #8596 — same grants as routes/tickets/links.ts (GET read, POST/DELETE write).
+    list_links: { resource: 'tickets', action: 'read' },
+    link_ticket: { resource: 'tickets', action: 'write' },
+    unlink_ticket: { resource: 'tickets', action: 'write' },
+    // W06 (#6776): routes/tickets/bulk.ts POST /bulk gates on tickets:write.
+    bulk_update: { resource: 'tickets', action: 'write' },
   },
+  // #6930 — same grants as routes/tickets/checklist.ts (TICKETS_READ/WRITE)
+  // and the templates route (reads are TICKETS_READ).
+  manage_ticket_checklist: {
+    list: { resource: 'tickets', action: 'read' },
+    list_templates: { resource: 'tickets', action: 'read' },
+    get_template: { resource: 'tickets', action: 'read' },
+    add_item: { resource: 'tickets', action: 'write' },
+    update_item: { resource: 'tickets', action: 'write' },
+    delete_item: { resource: 'tickets', action: 'write' },
+    reorder: { resource: 'tickets', action: 'write' },
+    apply_template: { resource: 'tickets', action: 'write' },
+    save_as_template: { resource: 'tickets', action: 'write' },
+    duplicate_template: { resource: 'tickets', action: 'write' },
+  },
+  // Full-control W06 (#6776) — per-action grants copied from each route (route-binding rows pin them).
+  // routes/orgTicketSettings.ts: ORGS_READ / ORGS_WRITE (+ requireMfa); ticketCategories.ts and
+  // ticketConfig.ts: TICKETS_READ / TICKETS_WRITE (+ the admin predicate, applied in the handler).
+  manage_ticket_config: {
+    get_config: { resource: 'tickets', action: 'read' },
+    get_org_settings: { resource: 'organizations', action: 'read' },
+    list_categories: { resource: 'tickets', action: 'read' },
+    list_domains: { resource: 'tickets', action: 'read' },
+    update_org_settings: { resource: 'organizations', action: 'write' },
+    create_category: { resource: 'tickets', action: 'write' },
+    update_category: { resource: 'tickets', action: 'write' },
+    delete_category: { resource: 'tickets', action: 'write' },
+    reorder_categories: { resource: 'tickets', action: 'write' },
+    create_status: { resource: 'tickets', action: 'write' },
+    update_status: { resource: 'tickets', action: 'write' },
+    reorder_statuses: { resource: 'tickets', action: 'write' },
+    set_priorities: { resource: 'tickets', action: 'write' },
+    create_domain: { resource: 'tickets', action: 'write' },
+    update_domain: { resource: 'tickets', action: 'write' },
+    delete_domain: { resource: 'tickets', action: 'write' },
+  },
+  manage_ticket_checklist_templates: {
+    list: { resource: 'tickets', action: 'read' },
+    get: { resource: 'tickets', action: 'read' },
+    create: { resource: 'tickets', action: 'write' },
+    update: { resource: 'tickets', action: 'write' },
+    delete: { resource: 'tickets', action: 'write' },
+    add_item: { resource: 'tickets', action: 'write' },
+    update_item: { resource: 'tickets', action: 'write' },
+    remove_item: { resource: 'tickets', action: 'write' },
+    reorder_items: { resource: 'tickets', action: 'write' },
+  },
+  // routes/ticketConfig.ts gates all three email-inbound routes on tickets:email_review (#10951).
+  manage_ticket_inbox: {
+    list: { resource: 'tickets', action: 'email_review' },
+    convert: { resource: 'tickets', action: 'email_review' },
+    dismiss: { resource: 'tickets', action: 'email_review' },
+  },
+  manage_ticket_attachments: {
+    list: { resource: 'tickets', action: 'read' },
+    read_content: { resource: 'tickets', action: 'read' },
+    attach_from_artifact: { resource: 'tickets', action: 'write' },
+    delete: { resource: 'tickets', action: 'write' },
+  },
+  manage_ticket_forms: {
+    list: { resource: 'tickets', action: 'read' },
+    available: { resource: 'tickets', action: 'read' },
+    create: { resource: 'tickets', action: 'write' },
+    update: { resource: 'tickets', action: 'write' },
+    delete: { resource: 'tickets', action: 'write' },
+  },
+  manage_ticket_response_templates: {
+    list: { resource: 'tickets', action: 'read' },
+    create: { resource: 'tickets', action: 'write' },
+    update: { resource: 'tickets', action: 'write' },
+    delete: { resource: 'tickets', action: 'write' },
+  },
+  manage_time_suggestions: {
+    list: { resource: 'time_entries', action: 'read' },
+    confirm: { resource: 'time_entries', action: 'write' },
+    dismiss: { resource: 'time_entries', action: 'write' },
+    undo: { resource: 'time_entries', action: 'write' },
+  },
+  // Full-control W07 (#6777) — per-action grants copied from each route (route-binding rows pin them).
+  // routes/alerts/correlations.ts + routes/alertTemplates/correlations.ts: every read is alerts:read.
+  get_alert_correlations: { resource: 'alerts', action: 'read' },
+  // acknowledge: requireAlertAcknowledge; resolve: requireAlertWrite; both feedback routes: requireAlertRead.
+  manage_alert_correlations: {
+    acknowledge_group: { resource: 'alerts', action: 'acknowledge' },
+    resolve_group: { resource: 'alerts', action: 'write' },
+    acknowledge_related: { resource: 'alerts', action: 'acknowledge' },
+    feedback: { resource: 'alerts', action: 'read' },
+    rca_feedback: { resource: 'alerts', action: 'read' },
+  },
+  // routes/devices/anomalies.ts: list is devices:read; the status PATCH (all three statuses) is alerts:write.
+  manage_device_anomalies: {
+    list: { resource: 'devices', action: 'read' },
+    dismiss: { resource: 'alerts', action: 'write' },
+    resolve: { resource: 'alerts', action: 'write' },
+    promote: { resource: 'alerts', action: 'write' },
+  },
+  // routes/reliability.ts POST /:deviceId/feedback is gated on devices:read (requireReliabilityRead).
+  reliability_feedback: { resource: 'devices', action: 'read' },
   list_invoices: { resource: 'invoices', action: 'read' },
   get_invoice: { resource: 'invoices', action: 'read' },
   manage_invoices: {
@@ -808,6 +1843,7 @@ export const TOOL_PERMISSIONS: Record<string, { resource: string; action: string
     delete_draft: { resource: 'invoices', action: 'write' },
     assemble_from_org: { resource: 'invoices', action: 'write' },
     assemble_from_ticket: { resource: 'invoices', action: 'write' },
+    refresh_time_lines: { resource: 'invoices', action: 'write' },
     issue: { resource: 'invoices', action: 'send' },
     void: { resource: 'invoices', action: 'send' },
     record_payment: { resource: 'invoices', action: 'send' },
@@ -817,10 +1853,17 @@ export const TOOL_PERMISSIONS: Record<string, { resource: string; action: string
   search_catalog: { resource: 'catalog', action: 'read' },
   get_catalog_item: { resource: 'catalog', action: 'read' },
   lookup_distributor_product: { resource: 'catalog', action: 'read' },
-  manage_catalog: {
+  manage_billing_catalog: {
     create_item: { resource: 'catalog', action: 'write' },
     update_item: { resource: 'catalog', action: 'write' },
-    archive_item: { resource: 'catalog', action: 'write' },
+    // Matches POST /catalog/items/:id/archive
+    // (routes/catalog/catalog.ts:24,75 — `deletePerm`, i.e. catalog:delete).
+    archive_item: { resource: 'catalog', action: 'delete' },
+    // W02-D5 (#6756): implemented and documented but unmapped, so
+    // resolveToolPermissionRequirements failed closed with "Unknown action".
+    // PUT/DELETE /catalog/items/:id/prices/:currencyCode (catalog/pricing.ts) are catalog:write.
+    set_price: { resource: 'catalog', action: 'write' },
+    remove_price: { resource: 'catalog', action: 'write' },
     set_org_price: { resource: 'catalog', action: 'write' },
     remove_org_price: { resource: 'catalog', action: 'write' },
     set_bundle_components: { resource: 'catalog', action: 'write' },
@@ -838,6 +1881,9 @@ export const TOOL_PERMISSIONS: Record<string, { resource: string; action: string
     pause: { resource: 'contracts', action: 'manage' },
     resume: { resource: 'contracts', action: 'manage' },
     cancel: { resource: 'contracts', action: 'manage' },
+    // Full-control W14 PR B (#6784): GET-equivalent preview; POST /contracts/:id/generate is contracts:manage.
+    preview_invoice: { resource: 'contracts', action: 'read' },
+    generate_invoice: { resource: 'contracts', action: 'manage' },
   },
   // Service deliverables W02 (#5573 spec §10). `contracts`, not a new resource:
   // the REST routes for deliverables AND key dates gate on contracts:read /
@@ -888,16 +1934,85 @@ export const TOOL_PERMISSIONS: Record<string, { resource: string; action: string
     move_line: { resource: 'quotes', action: 'write' },
     reorder_lines: { resource: 'quotes', action: 'write' },
     send: { resource: 'quotes', action: 'send' },
-    decline: { resource: 'quotes', action: 'write' },
-    create_pay_link: { resource: 'quotes', action: 'write' },
+    // Recording the customer's decision (however it
+    // came in) is the same authority whichever way they answered: matches
+    // accept-on-behalf and the route's own gate (routes/quotes/lifecycle.ts:
+    // 30, 253-254 — decline-on-behalf is `acceptPerm`, i.e. quotes:accept).
+    decline: { resource: 'quotes', action: 'accept' },
+    // No staff REST twin for THIS action; the matching
+    // staff authority is POST /invoices/:id/pay-link (routes/invoices/stripe.ts:
+    // 19,26), gated on invoices:send. A Stripe checkout session is created on
+    // the partner's connected account, same as that route. `quotes:read` extra
+    // below because the handler still has to read the quote to resolve it.
+    create_pay_link: { resource: 'invoices', action: 'send' },
   },
   // GET orgContacts.ts /organizations/:id/contacts: PERMISSIONS.ORGS_READ.
   // GET remediationSuggestions.ts /: PERMISSIONS.DEVICES_READ.
   list_remediation_suggestions: { resource: 'devices', action: 'read' },
+  // GET remediationSuggestions.ts /: PERMISSIONS.DEVICES_READ — proven fixes are
+  // the same class of read as the suggestions list they feed.
+  find_proven_fixes: { resource: 'devices', action: 'read' },
   list_incidents: { resource: 'alerts', action: 'read' },
   list_ai_agents: { resource: 'ai_agents', action: 'read' },
   list_ai_agent_runs: { resource: 'ai_agents', action: 'read' },
   get_ai_agent_run: { resource: 'ai_agents', action: 'read' },
+  // A-W05 (D13a): same permission as the REST download (GET /ai/artifacts/:id,
+  // routes/aiArtifacts.ts) — the tool's scope is stricter (own run/session
+  // only), not its permission.
+  read_artifact: { resource: 'ai_agents', action: 'read' },
+  // Same permission as the editor's GET /orgs/:orgId/trust-page.
+  get_trust_page_status: { resource: 'organizations', action: 'read' },
+  // #9763: same permission as GET /orgs/partners/me/settings-inheritance(/orgs) (ORGS_READ).
+  get_partner_settings_inheritance: { resource: 'organizations', action: 'read' },
+  // Tool Catalog W03 (#5218): flows reuse the automations permissions.
+  draft_flow: { resource: 'automations', action: 'write' },
+  validate_flow: { resource: 'automations', action: 'read' },
+  get_flow: { resource: 'automations', action: 'read' },
+  list_flows: { resource: 'automations', action: 'read' },
+  // Tool Catalog W04 (#5219): flow runs.
+  run_flow: { resource: 'automations', action: 'write' },
+  list_flow_runs: { resource: 'automations', action: 'read' },
+  get_flow_run: { resource: 'automations', action: 'read' },
+  cancel_flow_run: { resource: 'automations', action: 'write' },
+  // #8973 W4: business-hours calendars read with the ticket permission.
+  list_business_calendars: { resource: 'tickets', action: 'read' },
+  // #8883 W5: ticket routing rules (reads here; manage_ticket_routing_rules is per-action below).
+  list_ticket_routing_rules: { resource: 'tickets', action: 'read' },
+  test_ticket_routing_rule: { resource: 'tickets', action: 'read' },
+  // Wisp W03 memory (services/wisp/memoryTools.ts): the chat-use permission
+  // (routes/ai.ts), same as the /wisp/memory routes. confirm/retract are
+  // HUMAN_ONLY_TOOLS; mapped so a direct dispatch still carries an RBAC gate.
+  recall: { resource: 'ai_sessions', action: 'use' },
+  remember: { resource: 'ai_sessions', action: 'use' },
+  confirm_memory: { resource: 'ai_sessions', action: 'use' },
+  retract_memory: { resource: 'ai_sessions', action: 'use' },
+  // Wisp W05a concerns/watches (services/wisp/concernTools.ts), w00 A1: the
+  // chat-use permission, same as the /wisp/concerns and /wisp/watches routes.
+  list_concerns: { resource: 'ai_sessions', action: 'use' },
+  raise_concern: { resource: 'ai_sessions', action: 'use' },
+  snooze_concern: { resource: 'ai_sessions', action: 'use' },
+  resolve_concern: { resource: 'ai_sessions', action: 'use' },
+  create_watch: { resource: 'ai_sessions', action: 'use' },
+  // Wisp W08 thread links (services/wisp/linkTools.ts): the chat-use
+  // permission, same as the /wisp/thread/:id/links routes. The object's own
+  // read permission is checked per object by resolveEntityRef.
+  link_entity: { resource: 'ai_sessions', action: 'use' },
+  list_links: { resource: 'ai_sessions', action: 'use' },
+  // Wisp check-in timers (services/wisp/checkInTools.ts, #10991 W03): the
+  // chat-use permission. A subject's own read permission is checked per
+  // object by resolveEntityRef.
+  schedule_check_in: { resource: 'ai_sessions', action: 'use' },
+  list_check_ins: { resource: 'ai_sessions', action: 'use' },
+  cancel_check_in: { resource: 'ai_sessions', action: 'use' },
+  // Wisp W07 specialists (services/aiToolsWisp.ts), w00 A1: the chat-use
+  // permission. The kind's own permissions (SPECIALIST_KIND_POLICY) are
+  // ceiling terms the coordinator checks against the grantor AND the acting
+  // human — not tool gates.
+  launch_specialist: { resource: 'ai_sessions', action: 'use' },
+  wisp_specialist_request: { resource: 'ai_sessions', action: 'use' },
+  // Full-control W16 PR A (#6786): = requirePermission on POST /ai/patch-plan/runs and POST /ai/operator/tasks.
+  run_patch_plan: { resource: 'ai_agents', action: 'write' },
+  create_operator_task: { resource: 'ai_agents', action: 'write' },
   list_sites: { resource: 'sites', action: 'read' },
   get_site: { resource: 'sites', action: 'read' },
   list_org_contacts: { resource: 'organizations', action: 'read' },
@@ -910,7 +2025,10 @@ export const TOOL_PERMISSIONS: Record<string, { resource: string; action: string
   },
   manage_services: { resource: 'devices', action: 'execute' },
   manage_processes: {
-    list: { resource: 'devices', action: 'read' },
+    // Live inspection: list dispatches list_processes to the agent, the same
+    // command GET /system-tools/devices/:id/processes sends, and that router
+    // requires DEVICES_EXECUTE on every method (routes/systemTools/index.ts).
+    list: { resource: 'devices', action: 'execute' },
     kill: { resource: 'devices', action: 'execute' },
   },
   security_scan: {
@@ -921,18 +2039,36 @@ export const TOOL_PERMISSIONS: Record<string, { resource: string; action: string
     restore: { resource: 'devices', action: 'execute' },
     vulnerabilities: { resource: 'devices', action: 'read' },
   },
+  // #6268: mirrors routes/security/sweeps.ts (reads devices:read, create/cancel
+  // devices:execute) and routes/security/yaraIocImport.ts (devices:write).
+  ioc_hunt: {
+    list_rule_sets: { resource: 'devices', action: 'read' },
+    preview_sweep: { resource: 'devices', action: 'read' },
+    list_sweeps: { resource: 'devices', action: 'read' },
+    sweep_status: { resource: 'devices', action: 'read' },
+    sweep: { resource: 'devices', action: 'execute' },
+    cancel_sweep: { resource: 'devices', action: 'execute' },
+    import_iocs: { resource: 'devices', action: 'write' },
+  },
+  // Stored snapshot read. `refresh: true` scans the device live and requires
+  // devices:execute instead (LIVE_READ_INPUT_FLAGS; POST
+  // /devices/:id/filesystem/scan).
   analyze_disk_usage: { resource: 'devices', action: 'read' },
   disk_cleanup: {
     preview: { resource: 'devices', action: 'read' },
     execute: { resource: 'devices', action: 'execute' },
   },
   system_cleanup: {
-    list: { resource: 'devices', action: 'read' },
+    // Live: asks the device for its cleaner catalog, like POST
+    // /devices/:id/filesystem/system-cleanup/list (DEVICES_EXECUTE).
+    list: { resource: 'devices', action: 'execute' },
     run: { resource: 'devices', action: 'execute' },
+    // POST …/run/:cleanupRunId/cancel (DEVICES_EXECUTE).
+    cancel: { resource: 'devices', action: 'execute' },
     status: { resource: 'devices', action: 'read' },
   },
   file_operations: {
-    // SR5-01: read/list require devices.execute (not devices.read). Reading an
+    // Privileged-read rule: read/list require devices.execute (not devices.read). Reading an
     // arbitrary file off a root/LocalSystem agent is a privileged operation.
     list: { resource: 'devices', action: 'execute' },
     read: { resource: 'devices', action: 'execute' },
@@ -944,10 +2080,15 @@ export const TOOL_PERMISSIONS: Record<string, { resource: string; action: string
   query_audit_log: { resource: 'audit', action: 'read' },
   query_change_log: { resource: 'devices', action: 'read' },
   network_discovery: { resource: 'devices', action: 'execute' },
+  // Stored boot history. `triggerCollection: true` collects live from the
+  // device and requires devices:execute instead (LIVE_READ_INPUT_FLAGS; POST
+  // /devices/:id/collect-boot-metrics).
   analyze_boot_performance: { resource: 'devices', action: 'read' },
   manage_startup_items: { resource: 'devices', action: 'execute' },
   manage_scheduled_tasks: {
-    list: { resource: 'devices', action: 'read' },
+    // Live inspection: list dispatches tasks_list to the agent, like GET
+    // /system-tools/devices/:id/tasks (DEVICES_EXECUTE router-wide).
+    list: { resource: 'devices', action: 'execute' },
     run: { resource: 'devices', action: 'execute' },
     disable: { resource: 'devices', action: 'execute' },
     enable: { resource: 'devices', action: 'execute' },
@@ -987,6 +2128,9 @@ export const TOOL_PERMISSIONS: Record<string, { resource: string; action: string
   manage_patches: {
     list: { resource: 'devices', action: 'read' },
     compliance: { resource: 'devices', action: 'read' },
+    // #6665: read-only per-device patch job history (scheduled + user
+    // initiated) — same DEVICES_READ tier as list/compliance above.
+    device_history: { resource: 'devices', action: 'read' },
     scan: { resource: 'devices', action: 'execute' },
     approve: { resource: 'devices', action: 'execute' },
     decline: { resource: 'devices', action: 'execute' },
@@ -1036,7 +2180,6 @@ export const TOOL_PERMISSIONS: Record<string, { resource: string; action: string
     run: { resource: 'automations', action: 'write' },
   },
   manage_alert_rules: {
-    list_templates: { resource: 'alerts', action: 'read' },
     list_rules: { resource: 'alerts', action: 'read' },
     get_rule: { resource: 'alerts', action: 'read' },
     create_rule: { resource: 'alerts', action: 'write' },
@@ -1081,25 +2224,18 @@ export const TOOL_PERMISSIONS: Record<string, { resource: string; action: string
   // mapping exists so the chat path reports that typed error rather than
   // "No RBAC permission mapping".
   //
-  // LANDMINE (2026-09-17 AI tool ROLE audit §2.7). Flat `ai_agents:read` is a
-  // LOW-BAR grant — seeded Org Admin holds it — and `workspace_run` executes
-  // arbitrary bash / python / node. It is safe ONLY because no chat or MCP
-  // caller can ever reach a workspace: `resolveWorkspace`
-  // (workspace/workspaceTools.ts) derives the run id from the caller identity
-  // alone (`auth.principal.kind === 'ai_agent'` + `runId`), there is no
-  // `runId` tool input, and chat-initiated launch is withdrawn (#6086,
-  // `workspace_launch_analysis` in AGENT_HUMAN_ONLY_TOOLS below). Agent
-  // principals bypass this table entirely, so it is never the control for a
-  // legitimate run.
-  //
-  // RE-ENABLING chat-initiated launch hands a CHAT caller a run-bearing
-  // principal, and at that moment this table becomes the ONLY gate. These four
-  // entries MUST be raised to an execute-class permission in the same change.
-  // Pinned by aiGuardrails.workspaceToolSurface.contract.test.ts.
-  workspace_stage: { resource: 'ai_agents', action: 'read' },
-  workspace_run: { resource: 'ai_agents', action: 'read' },
-  workspace_collect: { resource: 'ai_agents', action: 'read' },
-  workspace_cancel: { resource: 'ai_agents', action: 'read' },
+  // CLOSED (2026-09-17 AI tool ROLE audit §2.7 landmine): raised to the
+  // execute-class `ai_workspace:execute` by Wisp W02 (spec §4.6) — the old
+  // flat `ai_agents:read` was a low-bar grant seeded Org Admin holds, while
+  // `workspace_run` executes arbitrary bash / python / node. Partner Admin
+  // holds the new key through `*:*`; no other role is seeded with it.
+  // `resolveWorkspace` (workspace/workspaceTools.ts) still answers non-agent
+  // principals with `workspace_requires_run`, and agent principals still
+  // bypass this table. Pinned by aiGuardrails.workspaceToolSurface.contract.test.ts.
+  workspace_stage: { resource: 'ai_workspace', action: 'execute' },
+  workspace_run: { resource: 'ai_workspace', action: 'execute' },
+  workspace_collect: { resource: 'ai_workspace', action: 'execute' },
+  workspace_cancel: { resource: 'ai_workspace', action: 'execute' },
   set_agent_log_level: { resource: 'devices', action: 'execute' },
   capture_agent_pprof: { resource: 'devices', action: 'execute' },
   // Event log tools
@@ -1143,6 +2279,9 @@ export const TOOL_PERMISSIONS: Record<string, { resource: string; action: string
   get_monitor_activity: { resource: 'alerts', action: 'read' },
   reset_monitor_escalation: { resource: 'alerts', action: 'write' },
   manage_monitor_definitions: {
+    // #11431: `describe` is read-only (valid kinds + condition shapes) and the
+    // tool tells the model to call it FIRST; unmapped, it was refused as unknown.
+    describe: { resource: 'alerts', action: 'read' },
     create: { resource: 'alerts', action: 'write' },
     update: { resource: 'alerts', action: 'write' },
     delete: { resource: 'alerts', action: 'write' },
@@ -1171,6 +2310,7 @@ export const TOOL_PERMISSIONS: Record<string, { resource: string; action: string
   // Security + reliability read tools
   get_security_posture: { resource: 'devices', action: 'read' },
   get_fleet_health: { resource: 'devices', action: 'read' },
+  get_fleet_device_stats: { resource: 'devices', action: 'read' },
   get_invite_funnel: { resource: 'devices', action: 'read' },
   // Fleet hygiene findings (Task 8) — read-only, mirrors the
   // GET /fleet/findings route's requireFindingsRead (DEVICES_READ) gate.
@@ -1188,7 +2328,7 @@ export const TOOL_PERMISSIONS: Record<string, { resource: string; action: string
   },
   query_custom_fields: { resource: 'devices', action: 'read' },
   registry_operations: {
-    // SR5-01 precedent, applied (2026-09-17 audit §2.4). These are not device
+    // Privileged-read precedent, applied (2026-09-17 audit §2.4). These are not device
     // reads: the handler dispatches a real agent command
     // (aiToolsScripts.ts, aiExecuteCommand(auth, 'registry_operations', …)),
     // and the HTTP path for agent commands requires DEVICES_EXECUTE plus
@@ -1227,7 +2367,15 @@ export const TOOL_PERMISSIONS: Record<string, { resource: string; action: string
   // surfaces on `organizations:*` and `backup:*` rather than the device grants
   // the data's shape suggests (2026-09-17 audit §2.5 — one decision, nine
   // tools). Route evidence is cited per line.
-  query_backups: { resource: 'organizations', action: 'read' },   // routes/backup/jobs.ts:61
+  // Per-action map: list_configs mirrors routes/backup/configs.ts:232
+  // (backup:read), list_jobs mirrors routes/backup/jobs.ts:61 (organizations:read),
+  // list_policies mirrors routes/configurationPolicies/crud.ts's GET / (devices:read).
+  // Bound in aiGuardrails.routeBinding.contract.test.ts.
+  query_backups: {
+    list_configs: { resource: 'backup', action: 'read' },
+    list_jobs: { resource: 'organizations', action: 'read' },
+    list_policies: { resource: 'devices', action: 'read' },
+  },
   get_backup_status: { resource: 'organizations', action: 'read' },   // routes/backup/jobs.ts:147
   browse_snapshots: { resource: 'backup', action: 'read' },   // routes/backup/snapshots.ts:200, 273
   trigger_backup: { resource: 'devices', action: 'execute' },
@@ -1268,28 +2416,46 @@ export const TOOL_PERMISSIONS: Record<string, { resource: string; action: string
   get_sla_breaches: { resource: 'organizations', action: 'read' },
   get_sla_compliance_report: { resource: 'organizations', action: 'read' },
   configure_backup_sla: { resource: 'organizations', action: 'write' },
-  query_dr_plans: { resource: 'organizations', action: 'read' },
-  get_dr_plan_details: { resource: 'organizations', action: 'read' },
-  get_dr_execution_status: { resource: 'organizations', action: 'read' },
+  // Route requires devices:read (routes/dr.ts:34-37, requireDrRead); the
+  // tool matches it (aiGuardrails.routeBinding.contract.test.ts).
+  query_dr_plans: { resource: 'devices', action: 'read' },
+  get_dr_plan_details: { resource: 'devices', action: 'read' },
+  get_dr_execution_status: { resource: 'devices', action: 'read' },
   execute_dr_plan: { resource: 'devices', action: 'execute' },
-  manage_dr_plan: { resource: 'organizations', action: 'write' },
+  // Mirrors routes/dr.ts:38 (requireDrWrite = devices:write) on every plan and
+  // group write.
+  manage_dr_plan: { resource: 'devices', action: 'write' },
   // Monitoring tools — RBAC mappings
   query_monitors: { resource: 'devices', action: 'read' },
   manage_monitors: {
     get: { resource: 'devices', action: 'read' },
-    create: { resource: 'devices', action: 'write' },
-    update: { resource: 'devices', action: 'write' },
-    delete: { resource: 'devices', action: 'write' },
+    // Retired mutations return a refusal before DB access, so they need no write permission.
+    create: { resource: 'devices', action: 'read' },
+    update: { resource: 'devices', action: 'read' },
+    delete: { resource: 'devices', action: 'read' },
   },
   get_service_monitoring_status: { resource: 'devices', action: 'read' },
   // Integration & webhook tools
-  query_webhooks: { resource: 'devices', action: 'read' },
-  query_psa_status: { resource: 'devices', action: 'read' },
-  test_webhook: { resource: 'devices', action: 'write' },
+  // Matches REST GET /webhooks and GET /webhooks/:id/deliveries
+  // (routes/webhooks.ts — webhooks:read), bound in
+  // aiGuardrails.routeBinding.contract.test.ts.
+  query_webhooks: { resource: 'webhooks', action: 'read' },
+  // Route requires organizations:read (routes/psa.ts:435); the tool matches
+  // it (aiGuardrails.routeBinding.contract.test.ts).
+  query_psa_status: { resource: 'organizations', action: 'read' },
+  // Matches POST /webhooks/:id/test
+  // (routes/webhooks.ts:683-684 — organizations:write, plus requireMfa();
+  // see the MFA note beside TOOL_EXTRA_PERMISSIONS). The tool is tier 3
+  // supervised (TIER3_SUPERVISED_TOOLS) because the route mutates and
+  // requires MFA.
+  test_webhook: { resource: 'organizations', action: 'write' },
   // Agent version & remote session tools
   query_agent_versions: { resource: 'devices', action: 'read' },
   trigger_agent_upgrade: { resource: 'devices', action: 'execute' },
-  trigger_agent_restart: { resource: 'devices', action: 'execute' },
+  // Mirrors routes/devices/agentRecovery.ts POST /:id/agent-recovery, which gates on
+  // devices:recover_agent (PERMISSIONS.DEVICES_RECOVER_AGENT), not devices:execute
+  // (W04 route-binding, aiGuardrails.routeBinding.contract.test.ts).
+  trigger_agent_restart: { resource: 'devices', action: 'recover_agent' },
   list_remote_sessions: { resource: 'devices', action: 'read' },
   create_remote_session: { resource: 'devices', action: 'execute' },
   // Compliance policy tools
@@ -1327,7 +2493,9 @@ export const TOOL_PERMISSIONS: Record<string, { resource: string; action: string
   get_cis_device_report: { resource: 'devices', action: 'read' },
   apply_cis_remediation: { resource: 'devices', action: 'execute' },
   get_huntress_status: { resource: 'devices', action: 'read' },
+  get_harmony_evidence: { resource: 'devices', action: 'read' },
   get_huntress_incidents: { resource: 'devices', action: 'read' },
+  get_huntress_agents: { resource: 'devices', action: 'read' },
   sync_huntress_data: { resource: 'organizations', action: 'write' },
   // User risk scoring tools
   get_user_risk_scores: { resource: 'users', action: 'read' },
@@ -1343,7 +2511,19 @@ export const TOOL_PERMISSIONS: Record<string, { resource: string; action: string
   m365_recent_signins: { resource: 'organizations', action: 'read' },
   m365_list_group_memberships: { resource: 'organizations', action: 'read' },
   m365_disable_user: { resource: 'organizations', action: 'write' },
+  // Org-wide identity governance, provider-neutral: a plan may hold M365,
+  // Google and device effects at once, so it takes the identity-tenant ceiling.
+  operator_plan: { resource: 'organizations', action: 'write' },
   m365_reset_password: { resource: 'organizations', action: 'write' },
+  // M1 control-plane identity writes: same org-governance ceiling as the pair above.
+  m365_revoke_sessions: { resource: 'organizations', action: 'write' },
+  m365_remove_license: { resource: 'organizations', action: 'write' },
+  m365_assign_license: { resource: 'organizations', action: 'write' },
+  m365_remove_from_group: { resource: 'organizations', action: 'write' },
+  m365_add_to_group: { resource: 'organizations', action: 'write' },
+  m365_retire_intune_device: { resource: 'organizations', action: 'write' },
+  m365_create_user: { resource: 'organizations', action: 'write' },
+  m365_set_auto_reply: { resource: 'organizations', action: 'write' },
   // Google Workspace helpdesk tools (DWD service-account-backed). Same
   // reasoning as the M365 block above; routes/google.ts:29-30 gates the
   // Google surface on ORGS_READ / ORGS_WRITE.
@@ -1359,6 +2539,7 @@ export const TOOL_PERMISSIONS: Record<string, { resource: string; action: string
   google_share_calendar: { resource: 'organizations', action: 'write' },
   google_offboard_user: { resource: 'organizations', action: 'write' },
   google_wipe_mobile_device: { resource: 'organizations', action: 'write' },
+  google_account_wipe_mobile_device: { resource: 'organizations', action: 'write' },
   google_security_drift: { resource: 'organizations', action: 'read' },
   google_email_report: { resource: 'organizations', action: 'read' },
   google_list_user_groups: { resource: 'organizations', action: 'read' },
@@ -1386,13 +2567,18 @@ export const TOOL_PERMISSIONS: Record<string, { resource: string; action: string
   // Registration-debt payoff: RBAC entries for tools that were registered in
   // aiTools but had no TOOL_PERMISSIONS entry (legacyPermissionGaps in
   // aiToolsRegistryParity.test.ts). See that file's history for context.
-  // Incidents (analogy: manage_dr_plan/sync_huntress_data org-write; get_dr_plan_details org-read)
-  create_incident: { resource: 'organizations', action: 'write' },
-  get_incident_timeline: { resource: 'organizations', action: 'read' },
-  generate_incident_report: { resource: 'organizations', action: 'read' },
+  // Mirrors routes/incidents.ts POST / (requireIncidentWrite = alerts:write, L42/66-71),
+  // not organizations:write (W04 route-binding).
+  create_incident: { resource: 'alerts', action: 'write' },
+  // Route requires alerts:read (routes/incidents.ts:37, requireIncidentRead),
+  // matching list_incidents above (aiGuardrails.routeBinding.contract.test.ts).
+  get_incident_timeline: { resource: 'alerts', action: 'read' },
+  generate_incident_report: { resource: 'alerts', action: 'read' },
   // Device-execute (analogy: s1_isolate_device, execute_command; collect_evidence includes
   // screenshot => privileged extraction like take_screenshot)
   execute_containment: { resource: 'devices', action: 'execute' },
+  // W13 (#10101): the human release route's permission (routes/devices/networkIsolation.ts).
+  release_containment: { resource: 'devices', action: 'execute' },
   collect_evidence: { resource: 'devices', action: 'execute' },
 
   // Policy-prereq family (analogy: manage_backup_profiles per-action map)
@@ -1434,13 +2620,26 @@ export const TOOL_PERMISSIONS: Record<string, { resource: string; action: string
     encrypt: { resource: 'devices', action: 'execute' },
     quarantine: { resource: 'devices', action: 'execute' },
     secure_delete: { resource: 'devices', action: 'execute' },
-    accept_risk: { resource: 'devices', action: 'write' },
-    false_positive: { resource: 'devices', action: 'write' },
-    mark_remediated: { resource: 'devices', action: 'write' },
+    // All six actions share POST /sensitive-data/remediate, which gates on
+    // devices:execute (routes/sensitiveData.ts requireSensitiveDataExecute, L43/808-812).
+    accept_risk: { resource: 'devices', action: 'execute' },
+    false_positive: { resource: 'devices', action: 'execute' },
+    mark_remediated: { resource: 'devices', action: 'execute' },
   },
-  request_elevation: { resource: 'devices', action: 'execute' },   // requesting is not approving — unchanged (fix/pam-dedicated-permissions); rule auto-approve makes this privilege-granting; an admin-authored auto_approve rule yields elevation with no pam:approve holder in the loop
+  request_elevation: { resource: 'devices', action: 'execute' },   // requesting is not approving — unchanged (fix/pam-dedicated-permissions); the AI handler inserts a pending request and ignores an auto_approve rule verdict (W04 re-read), so a pam:approve holder still answers it
   revoke_elevation: { resource: 'pam', action: 'approve' },    // routes/pam.ts revoke gates on requirePamApprove (fix/pam-dedicated-permissions)
   get_elevation_history: { resource: 'devices', action: 'read' },  // requirePamRead, unchanged
+
+  // Administrator-approved read-only diagnostic access (aiToolsDiagnosticAccess.ts).
+  // Requesting and using need devices:execute (the same bar as file_operations —
+  // the agent reads as root/LocalSystem); APPROVING is decided per grant by the
+  // approvals flow, which requires devices:execute + approvals:decide on the
+  // device's org and site (services/diagnosticAccess/grants.ts isEligibleApprover).
+  request_diagnostic_access: { resource: 'devices', action: 'execute' },
+  list_diagnostic_access_grants: { resource: 'devices', action: 'read' },
+  revoke_diagnostic_access: { resource: 'devices', action: 'read' }, // revoking only removes access; handler limits it to the requester or an eligible approver
+  diagnostic_list_directory: { resource: 'devices', action: 'execute' },
+  diagnostic_read_file: { resource: 'devices', action: 'execute' },
 
   // Compliance / software / peripheral (analogy: query_compliance_policies policies:read;
   // manage_configuration_policy map)
@@ -1484,6 +2683,361 @@ export const TOOL_PERMISSIONS: Record<string, { resource: string; action: string
   list_network_assets: { resource: 'devices', action: 'read' },
   get_network_asset: { resource: 'devices', action: 'read' },
   get_network_asset_reachability: { resource: 'devices', action: 'read' },
+  // Topology reads (M3 Task 6): the devices:read floor is enforced by requireTopologySiteAccess.
+  get_interface_history: { resource: 'topology', action: 'read' },
+  get_link_health: { resource: 'topology', action: 'read' },
+  get_topology_impact: { resource: 'topology', action: 'read' },
+  get_recent_network_changes: { resource: 'topology', action: 'read' },
+  // M3-D12: the devices:read floor comes from requireTopologySiteAccess('read').
+  get_topology_monitoring_status: { resource: 'topology', action: 'read' },
+  // M4 Task 1 (#6000): same floor, applied by the M4-D1 site-pinned gate.
+  get_topology: { resource: 'topology', action: 'read' },
+  get_link_evidence: { resource: 'topology', action: 'read' },
+  get_diagnostic_run: { resource: 'topology', action: 'read' },
+  // M4 Task 4: devices:execute here (one pair per tool, catalog-backed, the
+  // network_discovery precedent); the full floor — topology:execute +
+  // devices:execute + both reads, org/site ceilings — is
+  // requireTopologySiteAccess('execute'), applied at proposal AND at release.
+  diagnose_connectivity: { resource: 'devices', action: 'execute' },
+  // Full-control W08 (#6778) — the topology routes gate on requireTopologySiteCapability (topologyPermissionPairs),
+  // which aiGuardrails.routeBinding cannot parse; aiToolsTopologyOps.permissions.contract.test.ts pins the
+  // capability -> grant mapping instead. The headline pair is here, the rest of the capability floor in the
+  // extras maps (approver eligibility reads requiredPermissionsForTool, so the whole floor must be visible).
+  get_topology_graph: { resource: 'topology', action: 'read' },
+  run_topology_diagnostic: {
+    collectors: { resource: 'topology', action: 'read' },
+    get: { resource: 'topology', action: 'read' },
+    start: { resource: 'topology', action: 'execute' },
+    cancel: { resource: 'topology', action: 'execute' },
+  },
+  manage_topology_manual: { resource: 'topology', action: 'write' },
+  manage_topology_monitoring: {
+    list_policies: { resource: 'topology', action: 'read' },
+    list_targets: { resource: 'topology', action: 'read' },
+    get_settings: { resource: 'topology', action: 'read' },
+    upsert_policy: { resource: 'topology', action: 'write' },
+    delete_policy: { resource: 'topology', action: 'write' },
+    upsert_target: { resource: 'topology', action: 'write' },
+    delete_target: { resource: 'topology', action: 'write' },
+    patch_settings: { resource: 'topology', action: 'write' },
+  },
+  // Template-library routes authorise in the service: topology + devices read for a read, write for a write.
+  manage_topology_templates: {
+    list_templates: { resource: 'topology', action: 'read' },
+    list_versions: { resource: 'topology', action: 'read' },
+    site_options: { resource: 'topology', action: 'read' },
+    create_template: { resource: 'topology', action: 'write' },
+    update_template: { resource: 'topology', action: 'write' },
+    revoke_template: { resource: 'topology', action: 'write' },
+    create_version: { resource: 'topology', action: 'write' },
+    publish_version: { resource: 'topology', action: 'write' },
+  },
+  apply_topology_template: {
+    preview: { resource: 'topology', action: 'write' },
+    apply: { resource: 'topology', action: 'write' },
+    status: { resource: 'topology', action: 'read' },
+  },
+  // Full-control W09 (#6779) — each floor is read from its route by the W09 rows of aiGuardrails.routeBinding.contract.test.ts.
+  // SNMP templates / metrics / probe: devices:read|write (routes/snmp.ts, monitoringAssetMetrics.ts, discoveryAssetProbe.ts).
+  // Known guests: organizations:read|write. UniFi: billing:manage for reads AND the sync (routes/unifi/index.ts).
+  manage_snmp_templates: {
+    list: { resource: 'devices', action: 'read' },
+    get: { resource: 'devices', action: 'read' },
+    browse_oids: { resource: 'devices', action: 'read' },
+    validate_oids: { resource: 'devices', action: 'read' },
+    create: { resource: 'devices', action: 'write' },
+    update: { resource: 'devices', action: 'write' },
+    delete: { resource: 'devices', action: 'write' },
+  },
+  get_snmp_metrics: { resource: 'devices', action: 'read' },
+  probe_network_asset: { resource: 'devices', action: 'write' },
+  manage_known_guests: {
+    list: { resource: 'organizations', action: 'read' },
+    add: { resource: 'organizations', action: 'write' },
+    delete: { resource: 'organizations', action: 'write' },
+  },
+  get_unifi_status: { resource: 'billing', action: 'manage' },
+  trigger_unifi_sync: { resource: 'billing', action: 'manage' },
+  // Full-control W10 (#6780) — each floor is read from its route by the W10 rows of aiGuardrails.routeBinding.contract.test.ts.
+  // Device AI activity: devices:read (routes/devices/aiOrigin.ts). Operator tasks, agent schedules, fleet designs: ai_agents:read.
+  get_device_ai_activity: { resource: 'devices', action: 'read' },
+  list_operator_tasks: { resource: 'ai_agents', action: 'read' },
+  get_operator_task: { resource: 'ai_agents', action: 'read' },
+  list_ai_agent_schedules: { resource: 'ai_agents', action: 'read' },
+  list_fleet_designs: { resource: 'ai_agents', action: 'read' },
+  get_fleet_design: { resource: 'ai_agents', action: 'read' },
+  // Full-control W11 (#6781) — each floor is read from its route by the W11 rows of
+  // aiGuardrails.routeBinding.contract.test.ts (the security read routes behind requireSecurityReadAccess
+  // are devices:read too, routes/security/readAuthorization.ts).
+  get_security_compliance: { resource: 'devices', action: 'read' },
+  manage_security_recommendations: {
+    list: { resource: 'devices', action: 'read' },
+    complete: { resource: 'devices', action: 'write' },
+    dismiss: { resource: 'devices', action: 'write' },
+  },
+  manage_access_reviews: {
+    list: { resource: 'users', action: 'read' },
+    get: { resource: 'users', action: 'read' },
+    create: { resource: 'users', action: 'write' },
+    decide_item: { resource: 'users', action: 'write' },
+  },
+  manage_audit_baselines: {
+    list: { resource: 'audit', action: 'read' },
+    compliance: { resource: 'audit', action: 'read' },
+    device_results: { resource: 'audit', action: 'read' },
+    create: { resource: 'organizations', action: 'write' },
+    request_apply: { resource: 'devices', action: 'write' },
+  },
+  manage_compliance_policies: { resource: 'devices', action: 'write' },
+  manage_security_policies: {
+    list: { resource: 'devices', action: 'read' },
+    create: { resource: 'devices', action: 'write' },
+    update: { resource: 'devices', action: 'write' },
+  },
+  manage_recovery_keys: {
+    list: { resource: 'devices', action: 'read' },
+    rotate: { resource: 'devices', action: 'execute' },
+    collect: { resource: 'devices', action: 'execute' },
+  },
+  manage_pam_rules: {
+    list_rules: { resource: 'devices', action: 'read' },
+    get_config: { resource: 'devices', action: 'read' },
+    list_signer_groups: { resource: 'devices', action: 'read' },
+    create_rule: { resource: 'pam', action: 'manage_policy' },
+    update_rule: { resource: 'pam', action: 'manage_policy' },
+    delete_rule: { resource: 'pam', action: 'manage_policy' },
+    set_config: { resource: 'pam', action: 'manage_policy' },
+    create_signer_group: { resource: 'pam', action: 'manage_policy' },
+    update_signer_group: { resource: 'pam', action: 'manage_policy' },
+    delete_signer_group: { resource: 'pam', action: 'manage_policy' },
+  },
+  // Full-control W12 (#6782) — each floor is read from its route by the W12 rows of
+  // aiGuardrails.routeBinding.contract.test.ts.
+  manage_software_catalog: {
+    list: { resource: 'devices', action: 'read' },
+    get: { resource: 'devices', action: 'read' },
+    create: { resource: 'devices', action: 'write' },
+    update: { resource: 'devices', action: 'write' },
+    archive: { resource: 'devices', action: 'write' },
+    add_version: { resource: 'devices', action: 'write' },
+    update_version: { resource: 'devices', action: 'write' },
+    promote_version: { resource: 'devices', action: 'write' },
+    add_install_method: { resource: 'devices', action: 'write' },
+    update_install_method: { resource: 'devices', action: 'write' },
+    delete_install_method: { resource: 'devices', action: 'write' },
+    import_package: { resource: 'devices', action: 'write' },
+  },
+  search_packages: { resource: 'devices', action: 'read' },
+  manage_software_deployments: {
+    list: { resource: 'devices', action: 'read' },
+    get: { resource: 'devices', action: 'read' },
+    summary: { resource: 'devices', action: 'read' },
+    results: { resource: 'devices', action: 'read' },
+    create: { resource: 'devices', action: 'execute' },
+    cancel: { resource: 'devices', action: 'execute' },
+    retry: { resource: 'devices', action: 'execute' },
+  },
+  get_device_software: { resource: 'devices', action: 'read' },
+  manage_device_software: { resource: 'devices', action: 'execute' },
+  bootstrap_homebrew: { resource: 'devices', action: 'execute' },
+  manage_software_inventory: {
+    list: { resource: 'devices', action: 'read' },
+    names: { resource: 'devices', action: 'read' },
+    devices: { resource: 'devices', action: 'read' },
+    approve: { resource: 'devices', action: 'write' },
+    deny: { resource: 'devices', action: 'write' },
+    clear: { resource: 'devices', action: 'write' },
+  },
+  manage_fleet_findings: { resource: 'devices', action: 'write' },
+  manage_custom_fields: { resource: 'devices', action: 'write' },
+  // Full-control W13 (#6783, PR A) — each floor is read from its route by the W13 rows of
+  // aiGuardrails.routeBinding.contract.test.ts.
+  get_device_events: { resource: 'devices', action: 'read' },
+  get_device_health: { resource: 'devices', action: 'read' },
+  get_process_samples: { resource: 'devices', action: 'read' },
+  get_management_posture: { resource: 'devices', action: 'read' },
+  manage_device_function: {
+    get: { resource: 'devices', action: 'read' },
+    set: { resource: 'devices', action: 'write' },
+  },
+  manage_device_links: {
+    list: { resource: 'devices', action: 'read' },
+    get: { resource: 'devices', action: 'read' },
+    for_device: { resource: 'devices', action: 'read' },
+    create: { resource: 'devices', action: 'write' },
+    update: { resource: 'devices', action: 'write' },
+    dissolve: { resource: 'devices', action: 'delete' },
+  },
+  manage_manual_assets: {
+    list: { resource: 'devices', action: 'read' },
+    create: { resource: 'devices', action: 'write' },
+    update: { resource: 'devices', action: 'write' },
+    delete: { resource: 'devices', action: 'delete' },
+    link: { resource: 'devices', action: 'write' },
+    unlink: { resource: 'devices', action: 'write' },
+  },
+  manage_device_warranty: {
+    get: { resource: 'devices', action: 'read' },
+    expiring: { resource: 'devices', action: 'read' },
+    refresh: { resource: 'devices', action: 'write' },
+  },
+  // Full-control W13 PR B (#6783): the system-tools router (devices:execute), routes/tenantVariables.ts
+  // (variables:read / variables:manage) and the remote router (remote:access).
+  // Full-control W17 (#6788): each mirrors its REST twin. Verification reads are organizations:read and the run is
+  // devices:execute (routes/backup/verification.ts); the VSS lookup runs a command (routes/backup/vss.ts); recovery
+  // and health reads are backup:read; C2C configs are organizations:read/write (routes/c2c/configs.ts).
+  manage_backup_verification: {
+    health: { resource: 'organizations', action: 'read' },
+    list: { resource: 'organizations', action: 'read' },
+    readiness: { resource: 'organizations', action: 'read' },
+    run: { resource: 'devices', action: 'execute' },
+  },
+  get_vss_status: { resource: 'devices', action: 'execute' },
+  list_bmr_recoveries: { resource: 'backup', action: 'read' },
+  get_backup_health: { resource: 'backup', action: 'read' },
+  manage_c2c_configs: {
+    list: { resource: 'organizations', action: 'read' },
+    create: { resource: 'organizations', action: 'write' },
+    update: { resource: 'organizations', action: 'write' },
+    delete: { resource: 'organizations', action: 'write' },
+  },
+  browse_device_event_log: { resource: 'devices', action: 'execute' },
+  manage_tenant_variables: {
+    list: { resource: 'variables', action: 'read' },
+    create: { resource: 'variables', action: 'manage' },
+    update: { resource: 'variables', action: 'manage' },
+    delete: { resource: 'variables', action: 'manage' },
+  },
+  manage_support_sessions: { resource: 'remote', action: 'access' },
+  // Full-control W14 (#6784): routes/billingProfiles.ts + orgBillingProfile.ts (billing_profiles:*),
+  // routes/invoices/settings.ts (invoices:write; reporting totals has no grant at REST, the tool requires
+  // invoices:read) and the settings read routes GET /orgs/partners/me, /orgs/organizations/:id (organizations:read,
+  // quorum QW6), routes/contracts/templates.ts + documents.ts (agreements:*), routes/devices/billing.ts
+  // (devices:read + contracts:read, the second in TOOL_EXTRA_PERMISSIONS).
+  manage_billing_profiles: {
+    list: { resource: 'billing_profiles', action: 'read' },
+    get: { resource: 'billing_profiles', action: 'read' },
+    list_work_types: { resource: 'billing_profiles', action: 'read' },
+    get_org_profile: { resource: 'billing_profiles', action: 'read' },
+    create: { resource: 'billing_profiles', action: 'write' },
+    update: { resource: 'billing_profiles', action: 'write' },
+    archive: { resource: 'billing_profiles', action: 'write' },
+    set_rows: { resource: 'billing_profiles', action: 'write' },
+    clone: { resource: 'billing_profiles', action: 'write' },
+    create_work_type: { resource: 'billing_profiles', action: 'write' },
+    update_work_type: { resource: 'billing_profiles', action: 'write' },
+    set_org_profile: { resource: 'billing_profiles', action: 'write' },
+    clear_org_profile: { resource: 'billing_profiles', action: 'write' },
+  },
+  manage_billing_settings: {
+    get_partner: { resource: 'organizations', action: 'read' },
+    get_org: { resource: 'organizations', action: 'read' },
+    currency_impact: { resource: 'invoices', action: 'write' },
+    reporting_totals: { resource: 'invoices', action: 'read' },
+    update_partner: { resource: 'invoices', action: 'write' },
+    update_org: { resource: 'invoices', action: 'write' },
+  },
+  manage_contract_templates: {
+    list: { resource: 'agreements', action: 'read' },
+    get: { resource: 'agreements', action: 'read' },
+    get_version: { resource: 'agreements', action: 'read' },
+    usage: { resource: 'agreements', action: 'read' },
+    create: { resource: 'agreements', action: 'write' },
+    update: { resource: 'agreements', action: 'write' },
+    create_version: { resource: 'agreements', action: 'write' },
+    publish: { resource: 'agreements', action: 'write' },
+    archive: { resource: 'agreements', action: 'write' },
+  },
+  manage_contract_documents: {
+    list: { resource: 'agreements', action: 'read' },
+    link: { resource: 'agreements', action: 'write' },
+  },
+  get_device_billing: { resource: 'devices', action: 'read' },
+  // Full-control W18 PR B (#6789): each = its REST route's requirePermission (orgPortalSettings.ts, reports/recipients.ts).
+  // add and convert also need reports:export (TOOL_ACTION_EXTRA_PERMISSIONS, Decision 5).
+  manage_org_portal_settings: {
+    get: { resource: 'organizations', action: 'read' },
+    update: { resource: 'organizations', action: 'write' },
+    set_sensitive_access: { resource: 'organizations', action: 'write' },
+  },
+  // Full-control W16 PR B (#6786): each = its REST route's requirePermission. scripts:write (apply and preview with
+  // automation refs; rollback's script rows) and contracts:write (document's evidence link) depend on the input, on
+  // REST too, so the handler enforces them.
+  manage_ai_agent_schedules: {
+    create: { resource: 'ai_agents', action: 'write' },
+    update: { resource: 'ai_agents', action: 'write' },
+    delete: { resource: 'ai_agents', action: 'write' },
+  },
+  manage_fleet_designs: {
+    run: { resource: 'ai_agents', action: 'write' },
+    preview: { resource: 'devices', action: 'write' },
+    applied: { resource: 'ai_agents', action: 'read' },
+    apply: { resource: 'devices', action: 'write' },
+    rollback: { resource: 'devices', action: 'write' },
+    document: { resource: 'documents', action: 'write' },
+  },
+  manage_report_recipients: {
+    list: { resource: 'reports', action: 'read' },
+    add: { resource: 'reports', action: 'write' },
+    remove: { resource: 'reports', action: 'write' },
+    convert: { resource: 'reports', action: 'write' },
+  },
+  // Full-control W14 PR B (#6784): routes/accounting/index.ts — accounting:read on the reads, accounting:manage on
+  // every write (the rest of each write's floor is in TOOL_ACTION_EXTRA_PERMISSIONS).
+  manage_accounting_sync: {
+    status: { resource: 'accounting', action: 'read' },
+    owed_operations: { resource: 'accounting', action: 'read' },
+    customers: { resource: 'accounting', action: 'read' },
+    mappings: { resource: 'accounting', action: 'read' },
+    income_accounts: { resource: 'accounting', action: 'read' },
+    remote_candidates: { resource: 'accounting', action: 'read' },
+    link_mapping: { resource: 'accounting', action: 'manage' },
+    unlink_mapping: { resource: 'accounting', action: 'manage' },
+    sync_mapping: { resource: 'accounting', action: 'manage' },
+    push: { resource: 'accounting', action: 'manage' },
+    push_bulk: { resource: 'accounting', action: 'manage' },
+  },
+  // W15 PR A (#6785): REST requires billing:manage even for reads exposing vendor costs.
+  get_pax8_status: { resource: 'billing', action: 'manage' },
+  // Full-control W18 PR A (#6789): each = its REST route's requirePermission. The summary and readiness sections
+  // need their own grants on top (resolved in the handler from the live permission set, as on REST).
+  get_org_summary: { resource: 'organizations', action: 'read' },
+  get_account_readiness: { resource: 'organizations', action: 'read' },
+  get_audit_retention: { resource: 'audit', action: 'read' },
+  list_portal_users: { resource: 'organizations', action: 'read' },
+  list_users: { resource: 'users', action: 'read' },
+  get_user: { resource: 'users', action: 'read' },
+  list_roles: {
+    list: { resource: 'users', action: 'read' },
+    get: { resource: 'users', action: 'read' },
+    users: { resource: 'users', action: 'read' },
+    effective_permissions: { resource: 'users', action: 'read' },
+  },
+  search_pax8_products: {
+    search: { resource: 'billing', action: 'manage' },
+    provision_details: { resource: 'billing', action: 'manage' },
+    dependencies: { resource: 'billing', action: 'manage' },
+    pricing: { resource: 'billing', action: 'manage' },
+  },
+  manage_pax8_subscriptions: {
+    list: { resource: 'billing', action: 'manage' },
+    drift: { resource: 'billing', action: 'manage' },
+    sync: { resource: 'billing', action: 'manage' },
+    link: { resource: 'billing', action: 'manage' },
+    unlink: { resource: 'billing', action: 'manage' },
+  },
+  manage_pax8_orders: {
+    list: { resource: 'billing', action: 'manage' },
+    get: { resource: 'billing', action: 'manage' },
+    create_draft: { resource: 'billing', action: 'manage' },
+    add_line: { resource: 'billing', action: 'manage' },
+    update_line: { resource: 'billing', action: 'manage' },
+    remove_line: { resource: 'billing', action: 'manage' },
+    preview: { resource: 'billing', action: 'manage' },
+    preflight: { resource: 'billing', action: 'manage' },
+    submit: { resource: 'billing', action: 'manage' },
+    reconcile: { resource: 'billing', action: 'manage' },
+  },
   acknowledge_network_device: { resource: 'alerts', action: 'acknowledge' },
   configure_network_baseline: { resource: 'devices', action: 'write' },
 };
@@ -1547,6 +3101,20 @@ const TOOL_EXTRA_PERMISSIONS: Record<string, { resource: string; action: string 
   create_remote_session: [{ resource: 'remote', action: 'access' }],
   list_remote_sessions: [{ resource: 'remote', action: 'access' }],
   computer_control: [{ resource: 'remote', action: 'access' }],
+  // W04-D9/QW6: devices:execute (base) dispatches the containment command, and the
+  // tool also writes incident_actions (moves the incident to contained), which REST
+  // gates on alerts:write (routes/incidentActions.ts POST /:id/contain).
+  execute_containment: [{ resource: 'alerts', action: 'write' }],
+  // Full-control W08 (#6778): every topology capability includes topology:read + devices:read (topologyPermissionPairs).
+  get_topology_graph: [{ resource: 'topology', action: 'read' }, { resource: 'devices', action: 'read' }],
+  run_topology_diagnostic: [{ resource: 'topology', action: 'read' }, { resource: 'devices', action: 'read' }],
+  manage_topology_manual: [{ resource: 'topology', action: 'read' }, { resource: 'devices', action: 'read' }],
+  manage_topology_monitoring: [{ resource: 'topology', action: 'read' }, { resource: 'devices', action: 'read' }],
+  manage_topology_templates: [{ resource: 'topology', action: 'read' }, { resource: 'devices', action: 'read' }],
+  apply_topology_template: [{ resource: 'topology', action: 'read' }, { resource: 'devices', action: 'read' }],
+  // Full-control W14 (#6784): GET /devices/:id/billing requires devices:read AND contracts:read (contract-line
+  // descriptions carry rates).
+  get_device_billing: [{ resource: 'contracts', action: 'read' }],
 };
 
 /**
@@ -1564,6 +3132,23 @@ export const TOOL_ACTION_EXTRA_PERMISSIONS: Record<
   string,
   Record<string, { resource: string; action: string }[]>
 > = {
+  // Full-control W18 PR B (#6789, Decision 5): a recipient add or convert is a scheduled delivery of report data out
+  // of Breeze, the bulk output reports:export gates on the download and generate paths (recipientGate.ts). REST
+  // requires it only on a series child's add; the tool requires it on every add and convert (tool-only, declared).
+  manage_report_recipients: {
+    add: [{ resource: 'reports', action: 'export' }],
+    convert: [{ resource: 'reports', action: 'export' }],
+  },
+  // Full-control W14 PR B (#6784): the REST mapping writes add the entity's grant (organizations:write for a
+  // customer, catalog:write for an item, requireMappingWrite); the tool has no input-aware rows, so it requires BOTH
+  // (a tightening). Both push routes add invoices:write (requireInvoicePush).
+  manage_accounting_sync: {
+    link_mapping: [{ resource: 'organizations', action: 'write' }, { resource: 'catalog', action: 'write' }],
+    unlink_mapping: [{ resource: 'organizations', action: 'write' }, { resource: 'catalog', action: 'write' }],
+    sync_mapping: [{ resource: 'organizations', action: 'write' }, { resource: 'catalog', action: 'write' }],
+    push: [{ resource: 'invoices', action: 'write' }],
+    push_bulk: [{ resource: 'invoices', action: 'write' }],
+  },
   manage_tickets: {
     // routes/tickets/moveOrg.ts:21-23 — TICKETS_WRITE *and* ORGS_WRITE (plus
     // requireMfa(); see the MFA note above). Moving a ticket between orgs
@@ -1571,125 +3156,58 @@ export const TOOL_ACTION_EXTRA_PERMISSIONS: Record<
     // organizations grant is the real authority being exercised.
     move_org: [{ resource: 'organizations', action: 'write' }],
   },
+  manage_quotes: {
+    // create_pay_link's primary grant is invoices:send
+    // (the Stripe-session authority, matching POST /invoices/:id/pay-link);
+    // the handler also reads the quote by id to resolve the converted invoice
+    // (createQuotePayLink → quotePay.ts), so quotes:read is required too.
+    create_pay_link: [{ resource: 'quotes', action: 'read' }],
+  },
+  // Full-control W08 (#6778): the rest of each write capability's floor (permissionPairs.ts). `execute` adds
+  // devices:execute; `configure` adds devices:write + devices:execute; the template library and application
+  // writes need devices:write.
+  run_topology_diagnostic: {
+    start: [{ resource: 'devices', action: 'execute' }],
+    cancel: [{ resource: 'devices', action: 'execute' }],
+  },
+  manage_topology_monitoring: {
+    upsert_policy: [{ resource: 'devices', action: 'write' }, { resource: 'devices', action: 'execute' }],
+    delete_policy: [{ resource: 'devices', action: 'write' }, { resource: 'devices', action: 'execute' }],
+    upsert_target: [{ resource: 'devices', action: 'write' }, { resource: 'devices', action: 'execute' }],
+    delete_target: [{ resource: 'devices', action: 'write' }, { resource: 'devices', action: 'execute' }],
+  },
+  manage_topology_templates: {
+    create_template: [{ resource: 'devices', action: 'write' }],
+    update_template: [{ resource: 'devices', action: 'write' }],
+    revoke_template: [{ resource: 'devices', action: 'write' }],
+    create_version: [{ resource: 'devices', action: 'write' }],
+    publish_version: [{ resource: 'devices', action: 'write' }],
+  },
+  apply_topology_template: {
+    preview: [{ resource: 'devices', action: 'write' }],
+    apply: [{ resource: 'devices', action: 'write' }],
+  },
   manage_invoices: {
-    // SEC-145 — materializing a contract line reads the contract, so the
+    // Materializing a contract line reads the contract, so the
     // caller needs contracts:read on top of invoices:write. Per-action so
     // unrelated invoice edits are not raised to contract-read authority.
     add_contract_line: [{ resource: 'contracts', action: 'read' }],
   },
+  file_operations: {
+    // write/rename/mkdir change the device's file system with the agent's own
+    // privileges: the same grant as script execution. Mirrors
+    // requireScriptsExecute on POST /system-tools/devices/:id/files/upload,
+    // /files/move and /files/mkdir (fileBrowser.ts).
+    write: [{ resource: 'scripts', action: 'execute' }],
+    rename: [{ resource: 'scripts', action: 'execute' }],
+    mkdir: [{ resource: 'scripts', action: 'execute' }],
+  },
 };
 
-// Per-tool rate limits: { limit, windowSeconds }
-export const TOOL_RATE_LIMITS: Record<string, { limit: number; windowSeconds: number }> = {
-  execute_command: { limit: 10, windowSeconds: 300 },
-  run_script: { limit: 5, windowSeconds: 300 },
-  // Deliberately looser than run_script: a stop is the safe direction, and a
-  // rate limit that blocks a tech's assistant from halting a runaway script is
-  // worse than the burst it prevents.
-  cancel_script_execution: { limit: 20, windowSeconds: 300 },
-  security_scan: { limit: 3, windowSeconds: 600 },
-  network_discovery: { limit: 2, windowSeconds: 600 },
-  file_operations: { limit: 20, windowSeconds: 300 },
-  manage_services: { limit: 10, windowSeconds: 300 },
-  s1_isolate_device: { limit: 5, windowSeconds: 600 },
-  s1_threat_action: { limit: 5, windowSeconds: 600 },
-  analyze_disk_usage: { limit: 10, windowSeconds: 300 },
-  disk_cleanup: { limit: 3, windowSeconds: 600 },
-  // Per TOOL, not per action (checkToolRateLimit keys on the tool name), and
-  // `run` returns immediately while the model polls `status` on this same
-  // counter — spec §9.1's "2 per hour" would exhaust after the first poll and
-  // lock the model out of the run it just started. 30/h leaves room for a
-  // catalog, a run and a poll every few minutes. The safety on `run` is the
-  // Tier 3 supervised approval; the single-run-per-device claim in
-  // startSystemCleanupRun refuses a second run while one is in flight.
-  system_cleanup: { limit: 30, windowSeconds: 3600 },
-  manage_startup_items: { limit: 5, windowSeconds: 600 },
-  manage_scheduled_tasks: { limit: 10, windowSeconds: 300 },
-  take_screenshot: { limit: 10, windowSeconds: 300 },
-  analyze_screen: { limit: 10, windowSeconds: 300 },
-  computer_control: { limit: 20, windowSeconds: 300 },
-  // Fleet tools — per-tool rate limits
-  manage_deployments: { limit: 10, windowSeconds: 600 },
-  manage_patches: { limit: 15, windowSeconds: 300 },
-  manage_groups: { limit: 20, windowSeconds: 300 },
-  manage_maintenance_windows: { limit: 15, windowSeconds: 300 },
-  manage_automations: { limit: 10, windowSeconds: 600 },
-  manage_alert_rules: { limit: 15, windowSeconds: 300 },
-  manage_service_monitors: { limit: 15, windowSeconds: 300 },
-  generate_report: { limit: 10, windowSeconds: 300 },
-  // Brain device context tools
-  set_device_context: { limit: 20, windowSeconds: 300 },
-  resolve_device_context: { limit: 20, windowSeconds: 300 },
-  // Event log tools
-  search_logs: { limit: 30, windowSeconds: 300 },
-  get_log_trends: { limit: 20, windowSeconds: 300 },
-  detect_log_correlations: { limit: 10, windowSeconds: 300 },
-  // One export is a full table scan's worth of work — far below search_logs'
-  // 30/5min on purpose.
-  export_dataset: { limit: 5, windowSeconds: 300 },
-  // Agent log tools
-  set_agent_log_level: { limit: 5, windowSeconds: 600 },
-  capture_agent_pprof: { limit: 3, windowSeconds: 600 },
-  // Configuration policy tools
-  get_configuration_policy: { limit: 30, windowSeconds: 300 },
-  manage_configuration_policy: { limit: 20, windowSeconds: 300 },
-  configuration_policy_compliance: { limit: 30, windowSeconds: 300 },
-  apply_configuration_policy: { limit: 10, windowSeconds: 300 },
-  remove_configuration_policy_assignment: { limit: 10, windowSeconds: 300 },
-  // Playbook tools
-  execute_playbook: { limit: 5, windowSeconds: 600 },
-  manage_processes: { limit: 15, windowSeconds: 300 },
-  // Tags and registry tools
-  manage_tags: { limit: 20, windowSeconds: 300 },
-  registry_operations: { limit: 15, windowSeconds: 300 },
-  // Backup tools
-  trigger_backup: { limit: 5, windowSeconds: 600 },
-  restore_snapshot: { limit: 3, windowSeconds: 600 },
-  restore_as_vm: { limit: 3, windowSeconds: 900 },
-  instant_boot_vm: { limit: 3, windowSeconds: 900 },
-  trigger_mssql_backup: { limit: 5, windowSeconds: 600 },
-  restore_mssql_database: { limit: 3, windowSeconds: 900 },
-  verify_mssql_backup: { limit: 5, windowSeconds: 600 },
-  manage_hyperv_vm: { limit: 10, windowSeconds: 300 },
-  trigger_hyperv_backup: { limit: 5, windowSeconds: 900 },
-  restore_hyperv_vm: { limit: 3, windowSeconds: 900 },
-  manage_hyperv_checkpoints: { limit: 5, windowSeconds: 600 },
-  trigger_vault_sync: { limit: 10, windowSeconds: 600 },
-  configure_vault: { limit: 10, windowSeconds: 300 },
-  trigger_c2c_sync: { limit: 10, windowSeconds: 300 },
-  restore_c2c_items: { limit: 5, windowSeconds: 600 },
-  configure_backup_sla: { limit: 10, windowSeconds: 300 },
-  execute_dr_plan: { limit: 3, windowSeconds: 900 },
-  manage_dr_plan: { limit: 10, windowSeconds: 300 },
-  // Monitoring tools
-  query_monitors: { limit: 30, windowSeconds: 300 },
-  manage_monitors: { limit: 10, windowSeconds: 300 },
-  get_service_monitoring_status: { limit: 30, windowSeconds: 300 },
-  // Integration & webhook tools
-  test_webhook: { limit: 5, windowSeconds: 300 },
-  // AI agent governance — a grant is a rare, deliberate act.
-  manage_ai_agents: { limit: 5, windowSeconds: 3600 },
-  // Agent version & remote session tools
-  trigger_agent_upgrade: { limit: 5, windowSeconds: 600 },
-  trigger_agent_restart: { limit: 5, windowSeconds: 600 },
-  create_remote_session: { limit: 10, windowSeconds: 300 },
-  // Notification channel & saved filter tools
-  manage_delivery: { limit: 10, windowSeconds: 300 },
-  manage_notification_channels: { limit: 10, windowSeconds: 300 },
-  manage_saved_filters: { limit: 15, windowSeconds: 300 },
-  // CIS hardening tools
-  get_cis_compliance: { limit: 30, windowSeconds: 300 },
-  get_cis_device_report: { limit: 30, windowSeconds: 300 },
-  apply_cis_remediation: { limit: 10, windowSeconds: 600 },
-  // Huntress integration tools
-  sync_huntress_data: { limit: 10, windowSeconds: 300 },
-  // User risk tools
-  assign_security_training: { limit: 10, windowSeconds: 300 },
-  // Registration-debt payoff: rate limits for newly-permissioned tools.
-  execute_containment: { limit: 5, windowSeconds: 600 },       // mirrors s1_isolate_device
-  collect_evidence: { limit: 10, windowSeconds: 300 },          // mirrors take_screenshot-class dispatch
-  remediate_software_violation: { limit: 10, windowSeconds: 600 }, // mirrors apply_cis_remediation
-};
+// Per-tool rate limits live in services/aiToolRateLimits.ts (a leaf module, so
+// routes can serve the effective values without importing the tool registry);
+// re-exported here because this is where every guardrail reader looks for them.
+export { TOOL_RATE_LIMITS } from './aiToolRateLimits';
 
 interface GuardrailCheckCommon {
   allowed: boolean;
@@ -1700,6 +3218,18 @@ interface GuardrailCheckCommon {
    * — with the Tier-2 audit-ledger row — even under per_step approval mode.
    */
   readOnly?: boolean;
+  /**
+   * #7906: set only on the chat-session read-only `event_logs_query`
+   * resolution — the strictly-parsed payload the call was classified on. The
+   * chat gate pins it on the ToolExecutionContext so dispatch uses exactly
+   * these values, never the raw input.
+   */
+  pinnedEventLogsQuery?: PinnedEventLogsQuery;
+  /**
+   * #10973: set only when `wispUnattendedReads` lowered a Security query to Tier
+   * 2. The chat gate dispatches this classified call, never the raw input.
+   */
+  wispUnattendedRead?: WispUnattendedRead;
   reason?: string;
   description?: string;
 }
@@ -1755,6 +3285,23 @@ export function isReadOnlyResolution(
 }
 
 /**
+ * #10027: true for a call to a registry-Tier-3 tool whose action a per-action
+ * table rates below Tier 3 but which is NOT read-only by `isReadOnlyResolution`
+ * (today only `edr_endpoint_action` `scan`: Tier 2 by #8167, starts an EDR
+ * scan). With MCP_TIER3_INTENTS_ENABLED on, the MCP gate runs a below-Tier-3
+ * action on a Tier-3 tool directly only when it is read-only; this is every
+ * other one, filed for approval at the tool's Tier 3. Read-only needs an
+ * explicit opt-in (TIER2_READONLY_ACTIONS / TIER2_READONLY_TOOLS) at Tier 2,
+ * so a new Tier-2 action lands here, approval-gated, by default.
+ */
+export function needsRegistryTier3Approval(
+  toolName: string,
+  check: Pick<GuardrailCheck, 'tier' | 'readOnly'>,
+): boolean {
+  return getToolTier(toolName) === 3 && check.tier < 3 && !isReadOnlyResolution(toolName, check);
+}
+
+/**
  * `'act'` (wave 4 Part B): a manifest-matched, rule-equivalent mutation under
  * a live `mode: 'act'` policy. Distinct from `'allow'` — `'act'` additionally
  * signals the run-loop pre-hook to revalidate (live policy + guardrail
@@ -1788,6 +3335,34 @@ export function resolveActionForTool(toolName: string, input: Record<string, unk
   const actionKey = TOOL_ACTION_INPUT_KEYS[toolName] ?? 'action';
   const actionValue = input[actionKey];
   return typeof actionValue === 'string' ? actionValue : undefined;
+}
+
+/**
+ * The model-actionable `run_script { proposalId }` deny message (#7129). Three
+ * distinct, model-actionable outcomes instead of one catch-all:
+ * - `proposal_not_found` — no such id in the caller's org. Deliberately the
+ *   SAME message for "doesn't exist" and "exists in a different org" (see
+ *   `ProposalContextDenyReason`) — never leak cross-tenant existence.
+ * - `proposal_review_pending` — the review hasn't finished; tells the model to
+ *   poll `get_script_proposal` and retry instead of giving up.
+ * - `proposal_review_failed` — the review ended negatively (static-scan
+ *   rejection or a technical review failure); a new proposal is required.
+ * `undefined` (no context supplied at all, e.g. a caller that never loaded
+ * one) falls back to the original generic `proposal_context_missing`.
+ */
+function buildProposalDenyReason(denyReason: ProposalContextDenyReason | undefined): string {
+  switch (denyReason) {
+    case 'proposal_not_found':
+      return 'proposal_not_found: no reviewed proposal with that id exists in the caller\'s organization';
+    case 'proposal_review_pending':
+      return 'proposal_review_pending: the proposal\'s review has not completed yet — call get_script_proposal '
+        + 'to check its status, then retry run_script once the review is no longer pending';
+    case 'proposal_review_failed':
+      return 'proposal_review_failed: the proposal\'s review ended negatively (scan rejection or a technical '
+        + 'review failure) — call get_script_proposal for details; submit a new proposal to retry';
+    default:
+      return 'proposal_context_missing: run_script with a proposalId requires a reviewed proposal in the caller\'s organization';
+  }
 }
 
 /**
@@ -1828,7 +3403,7 @@ export function checkGuardrails(
       tier: 4,
       allowed: false,
       requiresApproval: false,
-      reason: 'proposal_context_missing: run_script with a proposalId requires a reviewed proposal in the caller\'s organization',
+      reason: buildProposalDenyReason(context?.proposalDenyReason),
     };
   }
 
@@ -1878,6 +3453,54 @@ export function checkGuardrails(
       ...(TIER2_READONLY_ACTIONS[toolName]?.includes(action) ? { readOnly: true } : {}),
       description: buildApprovalDescription(toolName, action, input)
     };
+  }
+
+  // A stored-data read whose input asks the device for fresh data
+  // (LIVE_READ_INPUT_FLAGS). Tier 2 read-only, like file_operations:list and
+  // manage_services:list: no prompt, but an audit row, and an MCP key needs
+  // ai:write. Without the flag the tool keeps its base tier.
+  if (requestsLiveDeviceRead(toolName, input)) {
+    return {
+      tier: 2,
+      allowed: true,
+      requiresApproval: false,
+      readOnly: true,
+      description: buildApprovalDescription(toolName, action, input)
+    };
+  }
+
+  // #7906: chat-only, payload-aware read-only event_logs_query. Placed after
+  // every escalation table (none names event_logs_query) and before the base
+  // tier, which would otherwise resolve execute_command's static Tier 3.
+  if (context?.chatSession === true) {
+    const pinnedEventLogsQuery = classifyChatReadOnlyEventLogsQuery(toolName, input);
+    if (pinnedEventLogsQuery) {
+      return {
+        tier: 2,
+        allowed: true,
+        requiresApproval: false,
+        readOnly: true,
+        pinnedEventLogsQuery,
+        description: buildApprovalDescription(toolName, action, input)
+      };
+    }
+
+    // #10973: the grant-level switch. Not read-only: this read is Tier 2 only
+    // because the grantor opted in, so it keeps a Tier-2 audit row and no
+    // read-only presentation. Registry reads and set_device_context are Tier 2
+    // already; only this one needs lowering.
+    if (context.wispUnattendedReads === true) {
+      const wispUnattendedRead = classifyWispUnattendedRead(toolName, input);
+      if (wispUnattendedRead?.kind === 'security_event_query') {
+        return {
+          tier: 2,
+          allowed: true,
+          requiresApproval: false,
+          wispUnattendedRead,
+          description: buildApprovalDescription(toolName, action, input)
+        };
+      }
+    }
   }
 
   // Use base tier from tool registration. Split by literal tier (rather than
@@ -2249,6 +3872,40 @@ function siteScopeDenial(
 }
 
 /**
+ * A single predicate for "is this NAME (not this call, not this policy) ever
+ * reachable by a headless `ai_agent` principal" (W01 quorum amendment WQ4,
+ * #6755). Both `checkAgentGuardrails` (below) and
+ * `agentToolCatalog.ts`'s `listAgentReachableTools` used to hand-duplicate
+ * this same four-way check; this is the one place it is written now.
+ * Deliberately excludes session-only (M365/Google) exposure: that is a
+ * reachability gate on missing ActiveSession state, not an identity-based
+ * deny, and stays local to `listAgentReachableTools`.
+ */
+export function isNeverAgentTool(toolName: string): boolean {
+  return BLOCKED_TOOLS.has(toolName)
+    || isSecretBearingTool(toolName)
+    || AGENT_HUMAN_ONLY_TOOLS.has(toolName)
+    || AGENT_DENIED_READ_TOOLS.has(toolName);
+}
+
+/** Reason text for `isNeverAgentTool`'s deny — kept out of the predicate so the predicate stays a pure boolean the two call sites can share. */
+function neverAgentToolDenyReason(toolName: string): string {
+  if (isSecretBearingTool(toolName)) {
+    return `Tool "${toolName}" is secret-bearing and never available to agents`;
+  }
+  if (AGENT_HUMAN_ONLY_TOOLS.has(toolName)) {
+    return `Tool "${toolName}" is human-only and is never available to agents`;
+  }
+  if (AGENT_DENIED_READ_TOOLS.has(toolName)) {
+    return `Tool "${toolName}" reads data never available to agents`;
+  }
+  // BLOCKED_TOOLS — already denied above via base.tier === 4 (checkGuardrails
+  // sets tier 4 exactly and only for BLOCKED_TOOLS); kept so isNeverAgentTool
+  // stays total.
+  return `Tool "${toolName}" is not available to agents`;
+}
+
+/**
  * Structural guardrails for the ai_agent principal. This path intentionally
  * never consults user RBAC: an agent has no user role to authorize against.
  */
@@ -2257,8 +3914,26 @@ export function checkAgentGuardrails(
   input: Record<string, unknown>,
   policy: AgentGuardrailPolicy | null | undefined,
   context?: GuardrailContext,
+  /**
+   * W5 PR C (#5220, Decision 9): the LIVE invocation tier of a flow tool
+   * (`flow__<slug>`), which has no `TOOL_TIERS` entry. Agents may start
+   * Tier-1 flows only, so only `1` is accepted, and only for a flow tool name
+   * — any other name is classified by `checkGuardrails` as before (an unknown
+   * name stays tier 4 / denied). Every other gate below (env flag, kill
+   * switch, policy, enabled, mode) still applies; the agent path also
+   * requires the allowlist (services/flows/agentFlowTools.ts).
+   */
+  opts: { resolvedTier?: 1 } = {},
 ): AgentGuardrailCheck {
-  const base = checkGuardrails(toolName, input, context);
+  // #7906: the chat-session opt-in is never honored for an agent run, even if
+  // a caller hands it in — headless principals keep event_logs_query at Tier 3.
+  // #10973: the same for the unattended-reads flag.
+  const agentContext = context?.chatSession || context?.wispUnattendedReads
+    ? { ...context, chatSession: undefined, wispUnattendedReads: undefined }
+    : context;
+  const base: GuardrailCheck = opts.resolvedTier === 1 && isFlowToolName(toolName)
+    ? { tier: 1, allowed: true, requiresApproval: false, readOnly: true, description: `Run ${toolName}` }
+    : checkGuardrails(toolName, input, agentContext);
   const deny = (reason: string): AgentGuardrailCheck =>
     ({ ...base, allowed: false, requiresApproval: false, disposition: 'deny', reason });
 
@@ -2282,14 +3957,25 @@ export function checkAgentGuardrails(
   if (!isAgentGuardrailPolicy(policy)) {
     return deny('AI agent run policy snapshot is missing or invalid');
   }
-  if (!base.allowed || base.tier === 4 || BLOCKED_TOOLS.has(toolName)) {
+  if (!base.allowed || base.tier === 4) {
     return deny(base.reason ?? `Tool "${toolName}" is not available to agents`);
   }
-  if (isSecretBearingTool(toolName)) {
-    return deny(`Tool "${toolName}" is secret-bearing and never available to agents`);
+  // Unconditional deny, above the allowlist and the multiplexed-action
+  // resolution below: BLOCKED_TOOLS, secret-bearing, AGENT_HUMAN_ONLY_TOOLS
+  // and AGENT_DENIED_READ_TOOLS (W01-D5 / WQ1 / WQ2) all sit here so none of
+  // them can depend on a parseable `action` or on the snapshot omitting the
+  // name.
+  if (isNeverAgentTool(toolName)) {
+    return deny(neverAgentToolDenyReason(toolName));
   }
-  if (AGENT_HUMAN_ONLY_TOOLS.has(toolName)) {
-    return deny(`Tool "${toolName}" is human-only and is never available to agents`);
+
+  // W02-D2 (#6756): single human-only ACTIONS of an otherwise reachable tool
+  // (AGENT_HUMAN_ONLY_ACTIONS). Same placement rule as the whole-tool deny
+  // above: before the site gate, the allowlist and every mode branch, so an
+  // allowlist entry naming the action cannot reach past it.
+  const humanOnlyAction = resolveActionForTool(toolName, input);
+  if (humanOnlyAction !== undefined && AGENT_HUMAN_ONLY_ACTIONS.has(`${toolName}:${humanOnlyAction}`)) {
+    return deny(`Action "${toolName}:${humanOnlyAction}" is human-only and is never available to agents`);
   }
 
   const siteDenial = siteScopeDenial(input, policy.deviceSiteId);
@@ -2338,11 +4024,22 @@ export function checkAgentGuardrails(
   // reachable only by this run). It is still allowlist- and
   // protected-resource-gated below.
   const workspaceTool = TIER1_NON_READONLY_TOOLS.has(toolName);
-  if (!readOnly && policy.deviceId === null && !ticketScoped && !workspaceTool) {
+  // Wisp W07 exemption: a coordinator approval CARRIER (AGENT_COORDINATOR_
+  // CARRIER_TOOLS — every entry is also HUMAN_ONLY_TOOLS, so no model can
+  // raise one) is minted by deterministic code under a device-less assessment
+  // run. It executes nothing org-wide by itself: its release re-runs every
+  // coordinator gate (grant ceiling, org, budget, per-kind permissions held by
+  // the APPROVER). Exempt from the device-less deny and from the agent's own
+  // mutation allowlist — which an operator would never list it in — and
+  // nothing else: the kill switch, disabled/off, tier-4 and never-agent
+  // denies above still apply, and shadow mode still yields 'propose'.
+  const coordinatorCarrier = AGENT_COORDINATOR_CARRIER_TOOLS.has(toolName);
+  if (!readOnly && policy.deviceId === null && !ticketScoped && !workspaceTool && !coordinatorCarrier) {
     return deny(`Tool "${toolName}" mutates and the run is not device-bound`);
   }
 
-  const allowlisted = policy.toolAllowlist.includes(toolName)
+  const allowlisted = coordinatorCarrier
+    || policy.toolAllowlist.includes(toolName)
     || (action !== undefined && policy.toolAllowlist.includes(`${toolName}:${action}`));
   if (!readOnly && !allowlisted) {
     return deny(`Tool "${toolName}"${action ? `:${action}` : ''} is not in the agent's allowlist`);
@@ -2436,14 +4133,22 @@ export async function checkPermissionRequirement(
  * (e.g. a tool's base permission plus TOOL_EXTRA_PERMISSIONS) — calling the
  * single-requirement form in a loop re-fetches getUserPermissions each time.
  */
+/** The RBAC denial an automation principal (AI agent or flow run) gets. */
+function automationPermissionDenial(auth: Pick<AuthContext, 'principal'>): string {
+  return isFlowPrincipal(auth)
+    ? 'Flow principals are never granted user permissions'
+    : 'AI agent principals are never granted user permissions';
+}
+
 export async function checkPermissionRequirements(
   auth: AuthContext,
   requirements: Array<{ resource: string; action: string }>
 ): Promise<string | null> {
   // Spec 2026-08-22 §3.2: an agent has no role; this helper's "no token ⇒
-  // allowed" fallback would fail OPEN for it. Deny before anything else.
-  if (auth.principal?.kind === 'ai_agent') {
-    return 'AI agent principals are never granted user permissions';
+  // allowed" fallback would fail OPEN for it. Deny before anything else. A
+  // flow run (W04 #5219) has no role either.
+  if (isAutomationPrincipal(auth)) {
+    return automationPermissionDenial(auth);
   }
   if (requirements.length === 0) return null;
   if (!auth.token) {
@@ -2475,11 +4180,14 @@ export async function checkPermissionRequirements(
 
 type ToolPermissionRequirement = { resource: string; action: string };
 
+/** What a LIVE_READ_INPUT_FLAGS request requires in place of the tool's stored-read mapping. */
+const LIVE_DEVICE_READ_PERMISSION: ToolPermissionRequirement = { resource: 'devices', action: 'execute' };
+
 type ToolPermissionResolution =
   | { ok: true; requirements: ToolPermissionRequirement[] }
   | { ok: false; denial: string };
 
-function resolveToolPermissionRequirements(
+export function resolveToolPermissionRequirements(
   toolName: string,
   input: Record<string, unknown>,
 ): ToolPermissionResolution {
@@ -2492,7 +4200,11 @@ function resolveToolPermissionRequirements(
   let required: ToolPermissionRequirement;
   const action = input.action as string | undefined;
 
-  if ('resource' in permDef && 'action' in permDef) {
+  if (requestsLiveDeviceRead(toolName, input)) {
+    // Live device read (LIVE_READ_INPUT_FLAGS): execute-level, like the REST
+    // route that sends the same command. The base mapping is the stored read.
+    required = LIVE_DEVICE_READ_PERMISSION;
+  } else if ('resource' in permDef && 'action' in permDef) {
     required = permDef as ToolPermissionRequirement;
   } else if (action && (permDef as Record<string, ToolPermissionRequirement>)[action]) {
     required = (permDef as Record<string, ToolPermissionRequirement>)[action]!;
@@ -2500,7 +4212,7 @@ function resolveToolPermissionRequirements(
     // Unknown action for a mapped tool — deny (fail-closed)
     // Include redirect hints for tools that have been replaced by policy-based management
     const redirectHints: Record<string, string> = {
-      manage_service_monitors: 'To add, update, or remove monitoring watches, use manage_policy_feature_link with the existing policy\'s featureLinkId and action "update". First call get_configuration_policy to find the monitoring featureLinkId and current inlineSettings.watches array, then update it with the new watch appended.',
+      manage_service_monitors: 'Use manage_monitor_definitions to author service/process monitors, then manage_policy_feature_link with featureType "monitors" to attach them to a policy.',
     };
     const hint = redirectHints[toolName];
     return {
@@ -2554,9 +4266,11 @@ export async function checkToolPermission(
   // EVERY tool. This must stay the first statement: checkToolPermission
   // short-circuits before it delegates to checkPermissionRequirements, so the
   // deny there does not cover this path. (aiAgentSdk's tool loop, intent
-  // release revalidation, approvals and the MCP server all enter here.)
-  if (auth.principal?.kind === 'ai_agent') {
-    return 'AI agent principals are never granted user permissions';
+  // release revalidation, approvals and the MCP server all enter here.) The
+  // same holds for a flow run (W04 #5219): the runner never calls this, and a
+  // flow must never be granted a tool through it.
+  if (isAutomationPrincipal(auth)) {
+    return automationPermissionDenial(auth);
   }
   // Helper sessions use a synthetic auth with no roleId — tool access is
   // governed by the helper whitelist (helperToolFilter), not user RBAC.
@@ -2595,22 +4309,41 @@ export function checkToolPermissionForResolvedUser(
  * Check per-tool rate limits.
  * Returns null if allowed, or an error message if rate limited.
  */
+/**
+ * Enforce the per-tool sliding-window limit for one call.
+ *
+ * #6476: the enforced limit is ceil(TOOL_RATE_LIMITS[tool].limit × m), where m
+ * is the effective `toolRateLimitMultiplier` (1–10, default 1) of `scope.orgId`
+ * — the chat session's org, or the MCP API key's org (partner fallback for a
+ * partner-scope caller). The Redis counter stays keyed per user per tool,
+ * across orgs; the CURRENT call's org decides the ceiling it is judged against.
+ * The multiplier can only raise a limit (see services/aiToolRateLimits.ts).
+ */
 export async function checkToolRateLimit(
   toolName: string,
-  userId: string
+  userId: string,
+  scope: ToolRateLimitScope,
 ): Promise<string | null> {
   const config = TOOL_RATE_LIMITS[toolName];
   if (!config) return null; // No rate limit for this tool
 
+  const multiplier = await resolveToolRateLimitMultiplier(scope);
+  const limit = scaleToolRateLimit(config.limit, multiplier);
+
   const redis = getRedis();
   const key = `ai:tool:${userId}:${toolName}`;
 
-  const result = await rateLimiter(redis, key, config.limit, config.windowSeconds);
+  const result = await rateLimiter(redis, key, limit, config.windowSeconds);
   if (!result.allowed) {
     return `Tool rate limit exceeded for ${toolName}. Try again at ${result.resetAt.toISOString()}`;
   }
 
   return null;
+}
+
+/** Model-chosen free text in a W04 headline, capped at 80 characters (#6758). */
+function w04Cap(text: string): string {
+  return text.length > 80 ? `${text.slice(0, 80)}…` : text;
 }
 
 /** A trimmed string, or a finite number coerced to a string — never '', null, undefined, NaN. */
@@ -2627,6 +4360,36 @@ function nonEmptyText(value: unknown): string | null {
  */
 function serviceNameFromPayload(payload: Record<string, unknown>): string | null {
   return nonEmptyText(payload.name !== undefined ? payload.name : payload.serviceName);
+}
+
+/** `alice@acme.example` -> `acme.example`. Null for a value with no `@`-domain. */
+function emailDomain(value: string): string | null {
+  const at = value.lastIndexOf('@');
+  return at === -1 || at === value.length - 1 ? null : value.slice(at + 1).toLowerCase();
+}
+
+/**
+ * Flags a destination address whose domain differs from the workspace
+ * mailbox the Google tool call is acting on. `sourceEmail` (the tool's
+ * `userEmail`/`ownerEmail` argument) is used as a stand-in for the connected
+ * Google workspace's verified/primary domain: `buildApprovalDescription` and
+ * `checkGuardrails` are synchronous and run without any org/connection
+ * context (one caller, `mcpServer.ts`'s pre-execution tier check, has no
+ * loaded session at all), so this cannot look up the real, DB-stored
+ * `google_workspace_connections.customer_domain` for the org without turning
+ * this call chain async — out of scope for a display-string fix. Both sides
+ * of the comparison are therefore caller-suppliable tool arguments, not a
+ * server-verified domain, so the label below is worded as a heuristic rather
+ * than a confirmed-external flag. Display-only: does not block or alter the
+ * call. Domain-locking these tools outright using verified connection data
+ * is a possible future hardening.
+ */
+function externalDestinationFlag(sourceEmail: string | null, destEmail: string | null): string {
+  if (!sourceEmail || !destEmail) return '';
+  const sourceDomain = emailDomain(sourceEmail);
+  const destDomain = emailDomain(destEmail);
+  if (!sourceDomain || !destDomain || sourceDomain === destDomain) return '';
+  return ' (different domain from source mailbox)';
 }
 
 /**
@@ -2680,17 +4443,162 @@ const EXECUTE_COMMAND_HEADLINE_BUILDERS: Record<string, (payload: Record<string,
   },
 };
 
+const plural = (n: number, one: string, many: string): string => `${n} ${n === 1 ? one : many}`;
+
+function iocSweepScopeLabel(scope: unknown): string {
+  const s = (scope && typeof scope === 'object' ? scope : {}) as Record<string, unknown>;
+  const count = (key: string) => (Array.isArray(s[key]) ? (s[key] as unknown[]).length : 0);
+  switch (s.kind) {
+    case 'sites': return plural(count('siteIds'), 'site', 'sites');
+    case 'groups': return plural(count('groupIds'), 'group', 'groups');
+    case 'devices': return plural(count('deviceIds'), 'device', 'devices');
+    case 'orgs': return 'this organization';
+    default: return 'all reachable devices';
+  }
+}
+
+/**
+ * #6268 approval headlines for ioc_hunt. Sync and DB-free, so a sweep names
+ * the rule-set COUNT and "this organization" rather than set and org names
+ * (the approval card shows the ids and the org beside it).
+ */
+function iocHuntHeadline(action: string | undefined, input: Record<string, unknown>): string {
+  const idPrefix = (v: unknown) => (typeof v === 'string' && v.length > 0 ? v.slice(0, 8) : 'unknown');
+  if (action === IOC_HUNT_RUN_ACTION) {
+    const sets = Array.isArray(input.ruleSetIds) ? input.ruleSetIds.length : 0;
+    const n = input.expectedDeviceCount;
+    const reach = typeof n === 'number' && Number.isInteger(n) && n >= 0
+      ? `up to ${plural(n, 'device', 'devices')}`
+      : 'an unconfirmed number of devices';
+    const scan = input.scanType === 'custom'
+      ? `custom scan of ${plural(Array.isArray(input.paths) ? input.paths.length : 0, 'path', 'paths')}`
+      : input.scanType === 'full' ? 'full scan' : 'quick scan';
+    return `IOC sweep (${scan}): ${plural(sets, 'rule set', 'rule sets')} on ${reach} in this organization (${iocSweepScopeLabel(input.scope)})`;
+  }
+  if (action === 'import_iocs') {
+    const count = Array.isArray(input.iocs) ? input.iocs.length : 0;
+    return `Import ${plural(count, 'IOC', 'IOCs')} into rule set ${idPrefix(input.ruleSetId)}`;
+  }
+  if (action === 'cancel_sweep') return `Cancel IOC sweep ${idPrefix(input.sweepId)}`;
+  return humanizeToolAction('ioc_hunt', action);
+}
+
 /**
  * Build a human-readable description of what the tool is about to do.
  */
-function buildApprovalDescription(
+/**
+ * Where a notification channel's alerts would go, for an approval headline:
+ * the URL HOST only (never the path — webhook paths embed tokens) or a
+ * recipient count. Null when the input carries no recognisable destination.
+ */
+function describeChannelDestination(config: unknown): string | null {
+  if (!config || typeof config !== 'object') return null;
+  const c = config as Record<string, unknown>;
+  // Type-agnostic on purpose (an `update` carries no `type`): name EVERY
+  // destination the config holds, so a decoy key (a Slack-looking
+  // `webhookUrl` beside the `url` a webhook channel actually posts to) can
+  // never hide the real one. Hosts only — webhook paths and queries carry
+  // tokens. Email recipients by domain, never full address (PR review, #6756).
+  const parts: string[] = [];
+  const hosts = new Set<string>();
+  let unparseable = false;
+  // The keys the senders post to come first, then any other *Url key.
+  const urlKeys = ['url', 'webhookUrl', ...Object.keys(c).filter((k) => /url$/i.test(k) && k !== 'url' && k !== 'webhookUrl')];
+  for (const key of urlKeys) {
+    const value = c[key];
+    if (typeof value !== 'string' || value.length === 0) continue;
+    try {
+      hosts.add(new URL(value).host);
+    } catch {
+      unparseable = true;
+    }
+  }
+  if (hosts.size > 0) parts.push(`host ${[...hosts].join(', ')}`);
+  if (unparseable) parts.push('an unparseable URL');
+
+  const recipients = [c.recipients, c.to, c.phoneNumbers]
+    .flatMap((v) => (Array.isArray(v) ? v : typeof v === 'string' ? [v] : []))
+    .filter((v): v is string => typeof v === 'string' && v.length > 0);
+  const domains = new Set<string>();
+  let phones = 0;
+  for (const r of recipients) {
+    const at = r.lastIndexOf('@');
+    if (at > 0 && at < r.length - 1) domains.add(r.slice(at + 1).toLowerCase());
+    else phones += 1;
+  }
+  const emailCount = recipients.length - phones;
+  // Every distinct domain, never a truncated list.
+  if (emailCount > 0) parts.push(`${emailCount} recipient(s) at ${[...domains].sort().join(', ')}`);
+  if (phones > 0) parts.push(`${phones} phone number(s)`);
+
+  if (['routingKey', 'integrationKey'].some((k) => typeof c[k] === 'string' && (c[k] as string).length > 0)) {
+    parts.push('a new routing key (not shown)');
+  }
+  if (['token', 'user', 'userKey', 'botToken'].some((k) => typeof c[k] === 'string' && (c[k] as string).length > 0)) {
+    parts.push('new credentials (not shown)');
+  }
+  return parts.length > 0 ? parts.join('; ') : null;
+}
+
+/**
+ * "Wisp wants to run <kind> at <org>: <reason>" — plus the exact batch for a
+ * bulk reply (w00 A30). `orgName` is the name the chat gate resolved for the
+ * verified target org (#10144); without it the card says "this organization",
+ * never a raw id prefix a person cannot read.
+ */
+export function describeSpecialistRequest(input: Record<string, unknown>, orgName?: string | null): string {
+  const kind = typeof input.kind === 'string' ? input.kind : '';
+  const label = isSpecialistKind(kind) ? SPECIALIST_KIND_LABELS[kind] : 'a specialist';
+  // Tenant-controlled text on a card, a stored intent reason and a push: one
+  // line, bounded.
+  const name = orgName?.replace(/\s+/g, ' ').trim() ?? '';
+  const org = name ? (name.length > 80 ? `${name.slice(0, 80)}…` : name) : 'this organization';
+  const reason = nonEmptyText(input.reason);
+  let text = `Wisp wants to run ${label} at ${org}${reason ? `: ${reason}` : ''}`;
+  const params = input.params && typeof input.params === 'object' ? input.params as Record<string, unknown> : {};
+  if (kind === 'bulk_ticket_reply') {
+    const ids = Array.isArray(params.ticketIds) ? params.ticketIds.length : 0;
+    const message = nonEmptyText(params.message);
+    text += ` — sends this message to ${ids} ticket(s)${params.holdTickets === true ? ' and sets them to pending' : ''}`;
+    if (message) text += `: "${message.length > 300 ? `${message.slice(0, 300)}…` : message}"`;
+  }
+  // #10406: one card covers the whole batch, so it says how far it reaches.
+  if (kind === 'assessment' && params.scope === 'orgs_with_open_alerts') {
+    text += ` — covers up to ${ONBOARDING_ORG_LIMIT} orgs in this grant with open alerts, worst first`;
+  }
+  if (kind === 'device_troubleshooting') {
+    // Model-written restatement of the ask: one line, bounded, like the org name.
+    const goal = nonEmptyText(params.goal)?.replace(/\s+/g, ' ').trim();
+    if (goal) text += ` — one device, goal: "${goal.length > 200 ? `${goal.slice(0, 200)}…` : goal}"`;
+  }
+  return text;
+}
+
+export function buildApprovalDescription(
   toolName: string,
   action: string | undefined,
   input: Record<string, unknown>
 ): string {
   const parts: string[] = [];
 
+  // W03 (#6757): call-specific copy needs its primary id; without one the
+  // humanized label is used (the W02 / #9657 fallback rule,
+  // approvalLabels.contract.test.ts).
+  const w03PrimaryKey = W03_PRIMARY_ID_KEYS[toolName];
+  if (w03PrimaryKey && !w03Present(input[w03PrimaryKey])) return humanizeToolAction(toolName, action);
+
   switch (toolName) {
+    case 'operator_plan': {
+      const n = Array.isArray(input.effects) ? input.effects.length : 0;
+      parts.push(`Approve a ${n}-effect plan for AI Operator task ${String(input.taskId ?? '')}`);
+      break;
+    }
+    // Wisp W07: the specialist approval card and the chat escalation.
+    case 'wisp_specialist_request':
+    case 'launch_specialist': {
+      parts.push(describeSpecialistRequest(input));
+      break;
+    }
     case 'execute_command': {
       const commandType = nonEmptyText(input.commandType);
       const payload = (input.payload && typeof input.payload === 'object'
@@ -2699,6 +4607,29 @@ function buildApprovalDescription(
       const specific = commandType ? EXECUTE_COMMAND_HEADLINE_BUILDERS[commandType]?.(payload) : null;
       parts.push(specific ?? `Execute "${input.commandType}" command`);
       if (input.deviceId) parts.push(`on device ${(input.deviceId as string).slice(0, 8)}...`);
+      break;
+    }
+
+    // Endpoint messaging (#8742 W02). Names severity, reach and acknowledgement
+    // so the approver knows what they approve; like the ticket copy, it never
+    // echoes the message text (that is in the input details below the card).
+    case 'send_endpoint_message': {
+      if (action !== 'send') { parts.push(humanizeToolAction(toolName, action)); break; }
+      const t = (input.targets && typeof input.targets === 'object' ? input.targets : {}) as Record<string, unknown>;
+      const count = (k: string) => (Array.isArray(t[k]) ? (t[k] as unknown[]).length : 0);
+      const reach = [
+        count('deviceIds') ? `${count('deviceIds')} device(s)` : null,
+        count('siteIds') ? `every device in ${count('siteIds')} site(s)` : null,
+        count('deviceGroupIds') ? `every device in ${count('deviceGroupIds')} group(s)` : null,
+      ].filter((x): x is string => x !== null);
+      const scope = reach.length > 0
+        ? reach.join(' and ')
+        : (typeof t.orgId === 'string' ? 'every device in an organization' : 'no targets');
+      const severity = typeof input.severity === 'string' ? input.severity : 'info';
+      parts.push(
+        `Show a ${severity} message to ${scope}${input.requiresAck === true ? ', acknowledgement required' : ''}.`
+        + ' Review the title and body in the details before approving.',
+      );
       break;
     }
 
@@ -2731,18 +4662,30 @@ function buildApprovalDescription(
           ? Object.keys(input.fields as Record<string, unknown>)
           : [];
         parts.push(`Update ticket #${shortTicketId} fields (${fieldNames.join(', ') || 'none'})`);
+        if (fieldNames.some((name) => (TICKET_REQUESTER_FIELD_KEYS as readonly string[]).includes(name))) {
+          parts.push('— changes the requester (future customer emails go to the new requester)');
+        }
       } else if (action === 'link_device') {
         const target = typeof input.hostname === 'string'
           ? input.hostname
           : (typeof input.serial === 'string' ? input.serial : 'unknown device');
         parts.push(`Link device ${target} to ticket #${shortTicketId}`);
       } else if (action === 'comment') {
-        parts.push(`Post private AI triage note on ticket #${shortTicketId}`);
+        // W02 (#6756): the same predicate the tier uses, so the headline can
+        // never call a public reply an internal note. Content is never shown.
+        parts.push(input.isPublic === true
+          ? `Post PUBLIC comment on ticket #${shortTicketId} (customer-visible; emails the requester)`
+          : `Post internal note on ticket #${shortTicketId}`);
+      } else if (action === 'update_status') {
+        const target = typeof input.statusName === 'string' ? `"${input.statusName}"` : String(input.status ?? 'unknown');
+        parts.push(`Set ticket #${shortTicketId} status to ${target}`
+          + (input.status === 'resolved' ? ' (resolved: emails the requester)' : '')
+          + (typeof input.statusName === 'string' ? ' (custom status; may resolve and email the requester)' : ''));
       } else if (action === 'draft') {
         const kindLabel = input.kind === 'resolution_note' ? 'resolution note' : 'reply';
         parts.push(`Store AI ${kindLabel} draft on ticket #${shortTicketId}`);
       } else {
-        parts.push(`${toolName}${action ? `: ${action}` : ''}`);
+        parts.push(humanizeToolAction(toolName, action));
       }
       break;
     }
@@ -2771,8 +4714,12 @@ function buildApprovalDescription(
           '(creates a per-organization agent policy override if this organization does not already have one)',
         );
       } else {
-        parts.push(`${toolName}${action ? `: ${action}` : ''}`);
+        parts.push(humanizeToolAction(toolName, action));
       }
+      break;
+
+    case 'ioc_hunt':
+      parts.push(iocHuntHeadline(action, input));
       break;
 
     case 'security_scan':
@@ -2781,7 +4728,16 @@ function buildApprovalDescription(
       break;
 
     case 'file_operations':
-      parts.push(`File ${action}: ${input.path}`);
+      // #9853: a permanent delete cannot be restored from the agent trash; the
+      // approver must see that before approving.
+      parts.push(action === 'delete' && input.permanent === true
+        ? `File delete (permanent, cannot be restored): ${input.path}`
+        : `File ${action}: ${input.path}`);
+      break;
+
+    case 'diagnose_connectivity':
+      parts.push(`Topology ${typeof input.recipe_id === 'string' ? input.recipe_id.replace(/_/g, ' ') : 'connectivity'} diagnostic`);
+      if (typeof input.site_id === 'string') parts.push(`at site ${input.site_id.slice(0, 8)}...`);
       break;
 
     case 'network_discovery':
@@ -2827,6 +4783,10 @@ function buildApprovalDescription(
     case 'manage_groups':
       if (action === 'create') parts.push(`Create ${input.type ?? 'static'} device group "${input.name}"`);
       else if (action === 'delete') parts.push(`Delete device group ${(input.groupId as string)?.slice(0, 8)}...`);
+      else if (action === 'add_devices' || action === 'remove_devices') {
+        const count = Array.isArray(input.deviceIds) ? input.deviceIds.length : 0;
+        parts.push(`${action === 'add_devices' ? 'Add' : 'Remove'} ${count} device(s) ${action === 'add_devices' ? 'to' : 'from'} device group ${(input.groupId as string)?.slice(0, 8)}...`);
+      }
       else parts.push(`Group ${action}: ${(input.groupId as string)?.slice(0, 8) ?? input.name ?? ''}...`);
       break;
 
@@ -2904,12 +4864,125 @@ function buildApprovalDescription(
 
     case 'manage_processes':
       if (action === 'kill') {
-        parts.push(`Kill process PID ${input.processId}`);
+        // W04 (#6758): the name is the model's claim — the handler sends the
+        // PID only and never checks it (#4149), so the approver is told so.
+        const processName = nonEmptyText(input.processName);
+        parts.push(`Kill process PID ${input.processId}`
+          + (processName ? ` ("${w04Cap(processName)}" as given — not verified against the PID)` : ''));
       } else {
         parts.push('List processes');
       }
       if (input.deviceId) parts.push(`on device ${(input.deviceId as string).slice(0, 8)}...`);
       break;
+
+    // W04 (#6758): containment, evidence and elevation name what and where.
+    case 'execute_containment': {
+      const actionType = nonEmptyText(input.actionType);
+      if (!nonEmptyText(input.deviceId)) {
+        parts.push(humanizeToolAction(toolName, action));
+        break;
+      }
+      parts.push(`Containment: ${actionType ? w04Cap(actionType.replace(/_/g, ' ')) : '(unspecified action)'} on device ${String(input.deviceId).slice(0, 8)}...`);
+      break;
+    }
+    // W13 (#10101): the approver must see that this LIFTS a containment, and which episode.
+    case 'release_containment': {
+      if (!nonEmptyText(input.deviceId)) {
+        parts.push(humanizeToolAction(toolName, action));
+        break;
+      }
+      parts.push(`Release network isolation (episode ${String(input.isolationId ?? '').slice(0, 8)}...) on device ${String(input.deviceId).slice(0, 8)}... — the device rejoins the network`);
+      const reason = nonEmptyText(input.reason);
+      if (reason) parts.push(`— reason: "${w04Cap(reason)}"`);
+      break;
+    }
+    case 'collect_evidence': {
+      const types = Array.isArray(input.evidenceTypes) ? input.evidenceTypes.filter((t): t is string => typeof t === 'string') : [];
+      parts.push(`Collect evidence (${types.length ? types.map(w04Cap).join(', ') : 'unspecified'})`);
+      if (types.includes('screenshot')) parts.push('— includes a SCREENSHOT of the device screen');
+      if (input.deviceId) parts.push(`from device ${String(input.deviceId).slice(0, 8)}...`);
+      break;
+    }
+    case 'request_elevation':
+      if (!nonEmptyText(input.deviceId)) {
+        parts.push(humanizeToolAction(toolName, action));
+        break;
+      }
+      parts.push(`Request local admin elevation for you on device ${String(input.deviceId).slice(0, 8)}... (a second approver must grant it)`);
+      break;
+
+    // W02 (#6756): the approver must see WHERE alert data will go — the
+    // destination host or the recipient count, never a URL path or token
+    // (webhook paths carry secrets).
+    case 'manage_notification_channels': {
+      const channelRef = typeof input.channelId === 'string' ? `${input.channelId.slice(0, 8)}...` : 'unknown';
+      if (action === 'create' || action === 'update') {
+        const verb = action === 'create'
+          ? `Create ${typeof input.type === 'string' ? `${input.type} ` : ''}notification channel`
+          : `Update notification channel ${channelRef}`;
+        // Destination before the model-chosen name, and the name capped, so
+        // free text can never push the destination out of view.
+        const destination = describeChannelDestination(input.config);
+        parts.push(verb);
+        if (destination) parts.push(`→ ${destination}`);
+        if (typeof input.name === 'string') {
+          parts.push(`named "${input.name.length > 80 ? `${input.name.slice(0, 80)}…` : input.name}"`);
+        }
+      } else if (action === 'delete') {
+        parts.push(`Delete notification channel ${channelRef} (linked alert routes go silent; cannot be undone)`);
+      } else {
+        parts.push(humanizeToolAction(toolName, action));
+      }
+      break;
+    }
+
+    case 'manage_quotes': {
+      const quoteRef = typeof input.quoteId === 'string' ? `${input.quoteId.slice(0, 8)}...` : 'unknown';
+      if (action === 'decline') {
+        parts.push(`Record quote ${quoteRef} as DECLINED by the customer`
+          + (typeof input.method === 'string' ? ` (via ${input.method})` : '')
+          + ' — cannot be reopened, only revised');
+      } else if (action === 'create_pay_link') {
+        parts.push(`Create a Stripe payment link for converted quote ${quoteRef}`);
+      } else if (action === 'send' && typeof input.quoteId === 'string') {
+        parts.push(`Send quote ${quoteRef} to the customer`);
+      } else {
+        parts.push(humanizeToolAction(toolName, action));
+      }
+      break;
+    }
+
+    case 'manage_billing_catalog': {
+      const itemRef = typeof input.catalogId === 'string' ? `${input.catalogId.slice(0, 8)}...` : 'unknown';
+      const orgRef = typeof input.orgId === 'string' ? `${input.orgId.slice(0, 8)}...` : 'unknown';
+      const price = input.price && typeof input.price === 'object' ? (input.price as Record<string, unknown>).unitPrice : undefined;
+      const override = input.override && typeof input.override === 'object' ? input.override as Record<string, unknown> : {};
+      const currency = typeof input.currencyCode === 'string' ? input.currencyCode.toUpperCase() : '';
+      if (action === 'set_price') {
+        parts.push(`Set the ${currency} price of catalog item ${itemRef} to ${String(price ?? 'unknown')} (contract renewals bill at it)`);
+      } else if (action === 'remove_price') {
+        parts.push(`Remove the ${currency} price of catalog item ${itemRef}`);
+      } else if (action === 'set_org_price') {
+        parts.push(`Set organization ${orgRef} price of catalog item ${itemRef} to ${String(override.unitPrice ?? 'unknown')}`
+          + (typeof override.currencyCode === 'string' ? ` ${override.currencyCode}` : ''));
+      } else if (action === 'remove_org_price') {
+        parts.push(`Remove organization ${orgRef} price override of catalog item ${itemRef}`);
+      } else if (action === 'archive_item') {
+        parts.push(`Archive catalog item ${itemRef}`);
+      } else if (action === 'update_item') {
+        // Price-affecting fields show their new value (contract renewals bill
+        // the live price); other fields are named only (PR review, #6756).
+        const item = input.item && typeof input.item === 'object' ? input.item as Record<string, unknown> : {};
+        const PRICE_FIELDS = ['unitPrice', 'costBasis', 'markupPercent', 'taxable', 'isActive'];
+        const fields = Object.keys(item).map((k) => (PRICE_FIELDS.includes(k) ? `${k} → ${String(item[k])}` : k));
+        parts.push(`Update catalog item ${itemRef} (${fields.join(', ') || 'no fields'})`);
+      } else if (action === 'set_bundle_components') {
+        parts.push(`Replace the components of bundle ${itemRef} (${Array.isArray(input.components) ? input.components.length : 0} component(s))`);
+      } else {
+        parts.push(humanizeToolAction(toolName, action));
+      }
+      break;
+    }
 
     case 'manage_tags':
       parts.push(`${action?.toUpperCase()} tags`);
@@ -2918,8 +4991,9 @@ function buildApprovalDescription(
       break;
 
     case 'registry_operations':
-      parts.push(`Registry ${action}: ${input.keyPath}`);
-      if (input.valueName) parts.push(`\\${input.valueName}`);
+      // W04 (#6758): key path and value name capped; the value data is never echoed.
+      parts.push(`Registry ${action?.replace(/_/g, ' ')}: ${w04Cap(nonEmptyText(input.keyPath) ?? '(no key)')}`);
+      if (input.valueName) parts.push(`\\${w04Cap(String(input.valueName))}`);
       if (input.deviceId) parts.push(`on device ${(input.deviceId as string).slice(0, 8)}...`);
       break;
 
@@ -2949,33 +5023,348 @@ function buildApprovalDescription(
         parts.push(
           `Add contact "${acHeadline}"${acOthers.length ? ` (${acOthers.join(', ')})` : ''} to organization ${(input.orgId as string)?.slice(0, 8) ?? '(own org)'}...`
         );
-        // Review finding (fix round 2): `siteId` and `isPrimary` are the only
-        // two add_contact inputs whose effect reaches beyond inserting a row,
-        // and neither was shown. `isPrimary: true` DEMOTES whoever currently
-        // holds the scope's primary slot and REPLACES the legacy projection —
-        // organizations.billing_contact, or sites.contact when a site is
-        // pinned, which is a public partner-API DTO. Without these the
-        // approver cannot tell "file a new contact" (routine, hence
-        // supervised) apart from "overwrite this customer's billing contact".
+        // Review finding (fix round 2): `siteId`, `isPrimary` and an
+        // org-level `billing` role are the add_contact inputs whose effect
+        // reaches beyond inserting a row, and none was shown. `isPrimary: true`
+        // DEMOTES whoever holds the scope's primary slot (and, pinned to a
+        // site, REPLACES sites.contact, a public partner-API DTO). An
+        // org-level `billing` role can make the new contact THE billing
+        // contact — organizations.billing_contact, the invoice/quote recipient.
+        // Without these the approver cannot tell "file a new contact"
+        // (routine, hence supervised) apart from "re-point this customer's
+        // invoices".
         const acSiteId = typeof input.siteId === 'string' ? input.siteId : undefined;
         if (acSiteId) parts.push(`on site ${acSiteId.slice(0, 8)}...`);
         if (input.isPrimary === true) {
           parts.push(
-            `as PRIMARY contact (replaces the ${acSiteId ? "site's current contact" : 'current billing contact'})`
+            `as PRIMARY contact (replaces the ${acSiteId ? "site's current contact" : "organization's current primary contact"})`
           );
+        }
+        if (!acSiteId && Array.isArray(input.roles) && input.roles.includes('billing')) {
+          parts.push("with the Billing role (can become the organization's default invoice recipient)");
         }
       } else parts.push(`Organizations: ${action}`);
       break;
 
-    case 'manage_monitors':
-      if (action === 'create') parts.push(`Create monitor "${input.name}" (${input.monitorType})`);
-      else if (action === 'delete') parts.push(`Delete monitor ${(input.monitorId as string)?.slice(0, 8)}...`);
-      else parts.push(`Monitor ${action}: ${(input.monitorId as string)?.slice(0, 8) ?? input.name ?? ''}...`);
+    // These four tools grant mail
+    // forwarding/delegation or calendar visibility to an arbitrary external
+    // address. Previously they had no case here, so the always-visible web
+    // headline AND the mobile takeover/push title (buildActionLabel reads
+    // this `description` as its `reason`) both fell through to the bare
+    // tool name with zero destination information. The exact destination
+    // now appears in the headline on every surface, flagged distinctly when
+    // its domain differs from the mailbox being acted on.
+    case 'google_set_forwarding': {
+      const userEmail = nonEmptyText(input.userEmail);
+      const forwardTo = nonEmptyText(input.forwardTo);
+      parts.push(
+        `Forward mail from ${userEmail ?? 'unknown mailbox'} to ${forwardTo ?? 'unknown address'}` +
+        externalDestinationFlag(userEmail, forwardTo)
+      );
+      break;
+    }
+
+    case 'google_disable_forwarding': {
+      const userEmail = nonEmptyText(input.userEmail);
+      parts.push(`Disable mail forwarding for ${userEmail ?? 'unknown mailbox'}`);
+      if (input.removeAddress === true) {
+        const forwardTo = nonEmptyText(input.forwardTo);
+        if (forwardTo) {
+          parts.push(`and remove forwarding address ${forwardTo}${externalDestinationFlag(userEmail, forwardTo)}`);
+        }
+      }
+      break;
+    }
+
+    case 'google_add_mail_delegate': {
+      const userEmail = nonEmptyText(input.userEmail);
+      const delegateEmail = nonEmptyText(input.delegateEmail);
+      parts.push(
+        `Grant ${delegateEmail ?? 'unknown address'} delegate access to ${userEmail ?? 'unknown mailbox'}'s mailbox` +
+        externalDestinationFlag(userEmail, delegateEmail)
+      );
+      break;
+    }
+
+    case 'google_share_calendar': {
+      const ownerEmail = nonEmptyText(input.ownerEmail);
+      const shareWithEmail = nonEmptyText(input.shareWithEmail);
+      parts.push(
+        `Share ${ownerEmail ?? 'unknown'}'s calendar with ${shareWithEmail ?? 'unknown address'}` +
+        externalDestinationFlag(ownerEmail, shareWithEmail)
+      );
+      break;
+    }
+
+    // W03 (#6757, W03-D8): backup, DR and Hyper-V headlines name the target
+    // and what changes. Selected-path LISTS are never echoed (a count only),
+    // and model-chosen free text is capped at 80 characters.
+    case 'restore_snapshot': {
+      const n = Array.isArray(input.selectedPaths) ? input.selectedPaths.length : 0;
+      const target = nonEmptyText(input.targetPath);
+      parts.push(
+        `Restore snapshot ${w03Id(input.snapshotId)} onto device ${w03Id(input.deviceId)}: `
+        + (n > 0 ? `${n} selected path(s)` : 'full restore')
+        + (target ? ` into ${w03Cap(target)}` : ' to the original location (overwrites live files)'),
+      );
+      break;
+    }
+    case 'restore_as_vm':
+      parts.push(input.engine === 'rebuild'
+        ? `Rebuild snapshot ${w03Id(input.snapshotId)} as a disk image on host ${w03Id(input.rebuildHostDeviceId)}`
+        : `Restore snapshot ${w03Id(input.snapshotId)} as a new VM on host ${w03Id(input.targetDeviceId)}`);
+      break;
+    case 'instant_boot_vm':
+      parts.push(`Instant-boot snapshot ${w03Id(input.snapshotId)} as a VM on host ${w03Id(input.targetDeviceId)}`);
+      break;
+    case 'restore_hyperv_vm':
+      parts.push(`Restore Hyper-V snapshot ${w03Id(input.snapshotId)} onto host ${w03Id(input.deviceId)}`
+        + (input.generateNewId === false ? ' reusing the original VM id' : ' as a new VM'));
+      break;
+    case 'restore_mssql_database': {
+      const db = nonEmptyText(input.targetDatabase);
+      parts.push(`Restore SQL snapshot ${w03Id(input.snapshotId)} over database ${db ? `"${w03Cap(db)}"` : '(unnamed)'} on device ${w03Id(input.deviceId)}`);
+      break;
+    }
+    case 'restore_c2c_items': {
+      const n = Array.isArray(input.itemIds) ? input.itemIds.length : 0;
+      parts.push(`Restore ${n} cloud backup item(s)${typeof input.targetConnectionId === 'string' ? ` to connection ${w03Id(input.targetConnectionId)}` : ''}`);
+      break;
+    }
+    case 'execute_dr_plan':
+      parts.push(`Run a ${w03Cap(nonEmptyText(input.executionType) ?? 'DR')} of DR plan ${w03Id(input.planId)} (every group's restore runs on its devices)`);
+      break;
+    case 'manage_hyperv_vm': {
+      const verb = HYPERV_VM_VERBS[action ?? ''];
+      parts.push(verb ? `${verb} VM ${w03Id(input.vmId)}` : `${humanizeToolAction(toolName, action)} on VM ${w03Id(input.vmId)}`);
+      break;
+    }
+    case 'manage_hyperv_checkpoints': {
+      const name = nonEmptyText(input.checkpointName);
+      const verb = HYPERV_CHECKPOINT_VERBS[action ?? ''];
+      parts.push(`${verb ?? humanizeToolAction(toolName, action)} checkpoint${name ? ` "${w03Cap(name)}"` : ''} on VM ${w03Id(input.vmId)}`);
+      break;
+    }
+    case 'configure_vault': {
+      const path = nonEmptyText(input.vaultPath);
+      const details = [
+        typeof input.vaultType === 'string' ? `${w03Cap(input.vaultType)} vault` : null,
+        path ? `at ${w03Cap(path)}` : (action === 'update' ? 'path unchanged' : null),
+        input.retentionCount !== undefined ? `keep ${w03Cap(String(input.retentionCount))} cop(ies)` : null,
+        typeof input.isActive === 'boolean' ? (input.isActive ? 'active' : 'inactive') : null,
+      ].filter((x): x is string => x !== null);
+      const subject = action === 'create' ? `on device ${w03Id(input.deviceId)}` : `vault ${w03Id(input.vaultId)}`;
+      parts.push(`${humanizeToolAction(toolName, action)} ${subject}${details.length ? `: ${details.join(', ')}` : ''}`);
+      break;
+    }
+    case 'manage_pax8_subscriptions':
+    case 'manage_pax8_orders':
+      if (action === 'submit') {
+        parts.push(describePax8Submit(input));
+        break;
+      }
+      parts.push(describePax8Action(toolName, action) ?? humanizeToolAction(toolName, action));
+      break;
+
+    // Full-control W14 PR B (#6784): the four-eyes card states every figure the approvers sign (the assertions the
+    // handler and the pinned effect digest both enforce). Ids are truncated; amounts and dates are the model's
+    // assertions, refused at release when they are not the live invoice.
+    case 'manage_contracts': {
+      if (action !== 'generate_invoice' || typeof input.contractId !== 'string') { parts.push(humanizeToolAction(toolName, action)); break; }
+      const total = typeof input.expectedTotal === 'string' ? input.expectedTotal : '?';
+      const period = typeof input.periodStart === 'string' ? input.periodStart : '?';
+      const n = Array.isArray(input.expectedRecipients) ? input.expectedRecipients.length : 0;
+      parts.push(`Generate the invoice for contract ${input.contractId.slice(0, 8)}... for the period starting ${period}, `
+        + `total ${total} in the contract currency, then `
+        + (input.autoIssue === true
+          ? `ISSUE it and email it to ${n} recipient(s) — cannot be undone (void is not undo)`
+          : 'leave it as a draft'));
+      break;
+    }
+
+    case 'manage_accounting_sync': {
+      const provider = input.provider === 'xero' ? 'Xero' : input.provider === 'quickbooks' ? 'QuickBooks' : 'the accounting provider';
+      const entity = input.entityType === 'catalog_item' ? 'item' : 'customer';
+      if (action === 'push' && typeof input.invoiceId === 'string') {
+        parts.push(`Push invoice ${input.invoiceId.slice(0, 8)}... into ${provider} (and its customer / items if not yet synced) — it stays in the books`);
+      } else if (action === 'push_bulk') {
+        const n = Array.isArray(input.invoiceIds) ? input.invoiceIds.length : 0;
+        parts.push(`Push ${n} invoice(s) into ${provider} (and their customers / items if not yet synced) — they stay in the books`);
+      } else if (action === 'link_mapping' || action === 'sync_mapping') {
+        parts.push(`${action === 'link_mapping' ? 'Link' : 'Re-sync'} a Breeze ${entity} to ${provider} — OVERWRITES the ${provider} ${entity}'s details with Breeze's`);
+      } else if (action === 'unlink_mapping') {
+        parts.push(`Unlink a Breeze ${entity} from ${provider} (nothing is changed in ${provider})`);
+      } else {
+        parts.push(humanizeToolAction(toolName, action));
+      }
+      break;
+    }
+
+    // Full-control W17 (#6788): the machine a check runs on, and whose mail a C2C config copies, where and when.
+    case 'manage_backup_verification':
+      if (action === 'run') {
+        const check = input.verificationType === 'test_restore' ? 'test restore' : 'integrity';
+        parts.push(`Run a backup ${check} check on device ${w03Id(input.deviceId)}. Queues a command on the machine.`);
+      } else {
+        parts.push(humanizeToolAction(toolName, action));
+      }
+      break;
+
+    // Full-control W18 PR B (#6789): who sees what. Ids are truncated; the flag labels say what a portal user gains.
+    case 'manage_org_portal_settings': {
+      if (action === 'update') {
+        const settings = input.settings && typeof input.settings === 'object' ? Object.keys(input.settings as object) : [];
+        parts.push(`Change ${w03Cap(settings.join(', ') || '(nothing)')} on organization ${w03Id(input.orgId)}'s customer portal. Customers see this immediately.`);
+      } else if (action === 'set_sensitive_access') {
+        const flags = input.flags && typeof input.flags === 'object' ? Object.entries(input.flags as Record<string, unknown>) : [];
+        const label = (key: string) => PORTAL_TOOL_SENSITIVE_LABELS[key as keyof typeof PORTAL_TOOL_SENSITIVE_LABELS] ?? w03Cap(key);
+        const on = flags.filter(([, v]) => v === true).map(([k]) => label(k));
+        const off = flags.filter(([, v]) => v === false).map(([k]) => label(k));
+        parts.push([
+          `Let organization ${w03Id(input.orgId)}'s portal users see: ${on.join(', ') || '(nothing new)'}.`,
+          ...(off.length ? [`Remove: ${off.join(', ')}.`] : []),
+          'Data seen in the portal cannot be recalled.',
+        ].join(' '));
+      } else {
+        parts.push(humanizeToolAction(toolName, action));
+      }
+      break;
+    }
+
+    // Full-control W16 PR A (#6786): what a launch costs and what it can do. The org id is truncated (the headline is
+    // input-only); the `on device <id>...` stub is rewritten to the device's name for every intent path
+    // (approvalDeviceName.ts).
+    case 'run_patch_plan':
+      parts.push(`Run the patch agent for organization ${w03Id(input.orgId)} now. It uses AI credits and may notify people. `
+        + 'It proposes installs for approval; nothing is installed without a further approval.');
+      break;
+    case 'create_operator_task':
+      parts.push(`Start an AI task to restore the ${w03Cap(String(input.serviceName ?? '(unspecified)'))} service on device ${w03Id(input.deviceId)}. `
+        + 'It uses AI credits. Each change it makes asks for approval.');
+      break;
+
+    // Full-control W16 PR B (#6786): the headline is input-only, so ids are truncated. A chat intent's card adds what
+    // only the stored rows can say (aiDesignIntentTarget.ts: devices, automatic restarts, the overrides a delete loses).
+    case 'manage_ai_agent_schedules':
+      if (action === 'create') {
+        parts.push(input.ownerScope === 'partner'
+          ? `Schedule ${input.kind ? `${w03Cap(String(input.kind))} ` : ''}runs of agent ${w03Id(input.agentId)} (${w03Cap(String(input.cron ?? ''))}, ${w03Cap(String(input.timezone ?? ''))}) for every organization. Each run uses AI credits and may notify people.`
+          : `Set organization ${w03Id(input.orgId)}'s override of schedule ${w03Id(input.baselineScheduleId)}${input.enabled === false ? ', turning its runs off' : ''}. Each run uses AI credits and may notify people.`);
+      } else if (action === 'update') {
+        // Every change the call makes: a brake on the card must not hide a widening beside it. The two brakes are
+        // different, and the approver has to be able to tell them apart (Decision 3).
+        const changes = [
+          ...(input.actMode === false ? ['stop unattended actions, including ones already waiting'] : []),
+          ...(input.enabled === false ? ['stop future runs'] : []),
+          ...(input.enabled === true ? ['turn its runs on'] : []),
+          ...(Array.isArray(input.sweepKinds) ? [`set its kinds to ${w03Cap(input.sweepKinds.join(', ') || '(none)')}`] : []),
+          ...(input.cron !== undefined ? [`run on cron ${w03Cap(String(input.cron))}`] : []),
+          ...(input.timezone !== undefined ? [`use timezone ${w03Cap(String(input.timezone))}`] : []),
+        ];
+        parts.push(`On schedule ${w03Id(input.scheduleId)}: ${changes.join('; ') || '(no change)'}.`);
+      } else if (action === 'delete') {
+        parts.push(`Delete schedule ${w03Id(input.scheduleId)}. If it is a baseline, every organization's override of it goes too. This cannot be undone.`);
+      } else {
+        parts.push(humanizeToolAction(toolName, action));
+      }
+      break;
+    case 'manage_fleet_designs': {
+      const approval = input.approval && typeof input.approval === 'object' ? input.approval as Record<string, unknown> : {};
+      const count = (key: string) => (Array.isArray(approval[key]) ? new Set(approval[key] as unknown[]).size : 0);
+      if (action === 'run') {
+        parts.push(`Run a Fleet Design for organization ${w03Id(input.orgId)}${input.siteId ? ` at site ${w03Id(input.siteId)}` : ''}. It uses AI credits and may notify people; nothing is applied.`);
+      } else if (action === 'apply') {
+        parts.push(`Apply Fleet Design ${w03Id(input.reportRunId)} to its organization: ${count('functions')} function groups, ${count('monitoring')} monitoring items, `
+          + `${count('automation')} scripts, ${count('roleCorrections')} device role changes (billing). Undo is available until the objects change.`);
+      } else if (action === 'rollback') {
+        parts.push(`Undo Fleet Design ${w03Id(input.reportRunId)}. Monitoring it added stops, and device roles it changed are restored (billing). Items changed since the apply stay as they are.`);
+      } else if (action === 'document') {
+        parts.push(`File Fleet Design ${w03Id(input.reportRunId)} in its organization's documents, and attach it to a deliverable when one is meant to carry it.`);
+      } else {
+        parts.push(humanizeToolAction(toolName, action));
+      }
+      break;
+    }
+
+    case 'manage_report_recipients':
+      if (action === 'add' && input.mode === 'remove') {
+        parts.push(`Exclude contact ${w03Id(input.contactId)} from series report ${w03Id(input.reportId)}'s delivery.`);
+      } else if (action === 'add') {
+        parts.push(`Send report ${w03Id(input.reportId)} to contact ${w03Id(input.contactId)} on its schedule. Report data leaves Breeze by email.`);
+      } else if (action === 'remove') {
+        parts.push(`Stop or restore delivery of report ${w03Id(input.reportId)} for contact ${w03Id(input.contactId)}.`);
+      } else if (action === 'convert') {
+        parts.push(`Move ${w03Cap(String(input.email ?? '(unspecified)'))} on report ${w03Id(input.reportId)} to a contact recipient.`);
+      } else {
+        parts.push(humanizeToolAction(toolName, action));
+      }
+      break;
+
+    case 'manage_c2c_configs':
+      if (action === 'create') {
+        const users = Array.isArray(input.targetUsers) ? input.targetUsers.length : 0;
+        const schedule = input.schedule && typeof input.schedule === 'object' ? (input.schedule as { frequency?: unknown }).frequency : undefined;
+        parts.push(`Create cloud-to-cloud backup config ${w03Cap(String(input.name ?? '(unnamed)'))}: `
+          + `${w03Cap(String(input.backupScope ?? '(unspecified)'))} for ${users} users, schedule ${w03Cap(String(schedule ?? 'none'))}.`);
+      } else if (action === 'update') {
+        const changed = Object.keys(input).filter((key) => !['action', 'orgId', 'configId'].includes(key));
+        parts.push(`Update cloud-to-cloud backup config ${w03Id(input.configId)}: ${w03Cap(changed.join(', ') || '(nothing)')}.`);
+      } else if (action === 'delete') {
+        parts.push(`Delete cloud-to-cloud backup config ${w03Id(input.configId)}. Refused if it has backup history.`);
+      } else {
+        parts.push(humanizeToolAction(toolName, action));
+      }
+      break;
+
+    case 'manage_backup_profiles':
+      if (action === 'create' && input.ownerScope === 'partner') {
+        parts.push(`Create a PARTNER-WIDE backup profile${input.name ? ` "${w03Cap(String(input.name))}"` : ''} (applies to every organization)`);
+      } else if (action === 'update' || action === 'delete') {
+        // Ownership is DB state: the headline cannot say whether this one is
+        // partner-wide, so it says that it may be (W03-D1, QW6).
+        parts.push(`${humanizeToolAction(toolName, action)} ${w03Id(input.profileId)} (may be partner-wide; ownership is checked when it runs)`);
+      } else {
+        parts.push(humanizeToolAction(toolName, action));
+      }
       break;
 
     default:
-      parts.push(`${toolName}${action ? `: ${action}` : ''}`);
+      parts.push(humanizeToolAction(toolName, action));
   }
 
   return parts.join(' ');
+}
+
+/** The input key each W03 headline is built around (W03-D8). */
+const W03_PRIMARY_ID_KEYS: Readonly<Record<string, string>> = {
+  restore_snapshot: 'snapshotId',
+  restore_as_vm: 'snapshotId',
+  instant_boot_vm: 'snapshotId',
+  restore_hyperv_vm: 'snapshotId',
+  restore_mssql_database: 'snapshotId',
+  restore_c2c_items: 'itemIds',
+  execute_dr_plan: 'planId',
+  manage_hyperv_vm: 'vmId',
+  manage_hyperv_checkpoints: 'vmId',
+};
+
+function w03Present(value: unknown): boolean {
+  return (typeof value === 'string' && value.length > 0) || (Array.isArray(value) && value.length > 0);
+}
+
+const HYPERV_VM_VERBS: Readonly<Record<string, string>> = {
+  start: 'Start', stop: 'Shut down', force_stop: 'Force-stop (hard power-off)', pause: 'Pause', resume: 'Resume', save: 'Save the state of',
+};
+const HYPERV_CHECKPOINT_VERBS: Readonly<Record<string, string>> = {
+  create: 'Create', delete: 'Delete (merge away)', apply: 'Apply (discards current VM state since)',
+};
+
+/** First 8 characters of an id for a headline, or a placeholder. */
+function w03Id(value: unknown): string {
+  return typeof value === 'string' && value.length > 0 ? `${value.slice(0, 8)}...` : '(unspecified)';
+}
+
+/** Model-chosen free text in a headline, capped at 80 characters. */
+function w03Cap(text: string): string {
+  return text.length > 80 ? `${text.slice(0, 80)}…` : text;
 }

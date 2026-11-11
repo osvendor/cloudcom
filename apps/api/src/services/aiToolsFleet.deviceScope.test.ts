@@ -39,11 +39,18 @@ const { deleteSpy, reportScopeMocks, reportPreflightMock, patchHelperMocks, auto
   },
 }));
 vi.mock('../db', () => ({
+  hasDbAccessContext: () => false,
+  withDbTransaction: (fn: () => Promise<unknown>) => fn(),
   runOutsideDbContext: vi.fn((fn: any) => fn()),
   withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn()),
   withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
   db: { select: vi.fn(), insert: vi.fn(), update: vi.fn(), delete: deleteSpy, transaction: vi.fn() },
 }));
+const resolverMock = vi.hoisted(() => vi.fn());
+vi.mock('./monitors/monitorResolver', () => ({ resolveMonitorsForDevice: resolverMock }));
+// Tool Catalog W06 (#5221): list/get/history carry each automation's conversion summary;
+// covered in aiToolsFleet.test.ts. No conversions here.
+vi.mock('./flows/conversion/ledger', () => ({ conversionSummariesFor: vi.fn(async () => new Map()) }));
 vi.mock('../jobs/peripheralJobs', () => ({
   schedulePeripheralPolicyDevice: vi.fn(async () => undefined),
 }));
@@ -407,6 +414,15 @@ describe('manage_groups — member lists are narrowed to the allowlist', () => {
     expect(previewMock).toHaveBeenCalled();
     expect((previewMock.mock.calls[0] as any[])[1]).toMatchObject({ allowedDeviceIds: ['dev-1'] });
   });
+
+  it('preview leaves out decommissioned devices, as group membership does (#9933)', async () => {
+    previewMock.mockClear();
+    await handlerFor('manage_groups')(
+      { action: 'preview', filterConditions: { logic: 'and', conditions: [] } },
+      deviceBoundAuth(),
+    );
+    expect((previewMock.mock.calls[0] as any[])[1]).toMatchObject({ excludeDecommissioned: true });
+  });
 });
 
 // ── 5. manage_alert_rules ────────────────────────────────────────────────────
@@ -541,62 +557,48 @@ describe('manage_maintenance_windows get — device targets are narrowed', () =>
 });
 
 // ── 8. manage_service_monitors ───────────────────────────────────────────────
-describe('manage_service_monitors list — narrowed to policies that reach the caller', () => {
-  function mockMonitors(assignments: Array<Record<string, unknown>>) {
+// W05c2 (#6371): the list resolves effective monitors per DEVICE, so the device
+// axis is enforced before the resolver ever runs for a sibling device.
+describe('manage_service_monitors list — resolves only devices that reach the caller', () => {
+  function mockDevices(rows: Array<{ id: string; orgId: string; siteId: string }>) {
     let call = 0;
     mockDb.select.mockImplementation(() => {
       if (call++ === 0) {
-        const chain: any = {
-          innerJoin: () => chain,
-          where: () => ({ orderBy: () => Promise.resolve([
-            { watchId: 'w1', name: 'svc-a', policyId: 'pol-1' },
-            { watchId: 'w2', name: 'svc-b', policyId: 'pol-2' },
-          ]) }),
-        };
-        return { from: () => chain };
+        return { from: () => ({ where: () => ({ orderBy: () => ({ limit: () => Promise.resolve(rows) }) }) }) };
       }
-      return { from: () => ({ where: () => Promise.resolve(assignments) }) };
+      return { from: () => ({ where: () => Promise.resolve([
+        { id: 'mon-1', name: 'Spooler', kind: 'service', enabled: true, condition: { serviceName: 'Spooler' } },
+      ]) }) };
     });
   }
 
-  it('drops a policy assigned only to a sibling device', async () => {
-    mockMonitors([
-      { configPolicyId: 'pol-1', level: 'device', targetId: 'dev-1' },
-      { configPolicyId: 'pol-2', level: 'device', targetId: 'dev-2' },
+  beforeEach(() => {
+    resolverMock.mockReset();
+    resolverMock.mockResolvedValue({
+      kind: 'resolved',
+      monitors: [{ monitorId: 'mon-1', enabled: true, overrides: null, sourcePolicyId: 'pol-1' }],
+    });
+  });
+
+  it('never resolves a sibling device for a device-bound run', async () => {
+    mockDevices([
+      { id: 'dev-1', orgId: 'org-1', siteId: 'site-1' },
+      { id: 'dev-2', orgId: 'org-1', siteId: 'site-1' },
     ]);
     const body = JSON.parse(await handlerFor('manage_service_monitors')({ action: 'list' }, deviceBoundAuth()));
-    expect(body.monitors.map((m: any) => m.policyId)).toEqual(['pol-1']);
+    expect(resolverMock.mock.calls.map((c) => c[0])).toEqual(['dev-1']);
+    expect(body.monitors.map((m: any) => m.deviceId)).toEqual(['dev-1']);
     expect(body.showing).toBe(1);
   });
 
-  it('keeps an org-wide policy, which reaches the run device too', async () => {
-    mockMonitors([
-      { configPolicyId: 'pol-1', level: 'organization', targetId: 'org-1' },
-      { configPolicyId: 'pol-2', level: 'site', targetId: 'site-9' },
+  it('unrestricted caller resolves every accessible device', async () => {
+    mockDevices([
+      { id: 'dev-1', orgId: 'org-1', siteId: 'site-1' },
+      { id: 'dev-2', orgId: 'org-1', siteId: 'site-2' },
     ]);
-    const body = JSON.parse(await handlerFor('manage_service_monitors')({ action: 'list' }, deviceBoundAuth()));
-    expect(body.monitors.map((m: any) => m.policyId)).toEqual(['pol-1']);
-  });
-
-  it('unrestricted caller sees every monitor and runs no assignment query', async () => {
-    let assignmentQueries = 0;
-    let call = 0;
-    mockDb.select.mockImplementation(() => {
-      if (call++ === 0) {
-        const chain: any = {
-          innerJoin: () => chain,
-          where: () => ({ orderBy: () => Promise.resolve([
-            { watchId: 'w1', policyId: 'pol-1' }, { watchId: 'w2', policyId: 'pol-2' },
-          ]) }),
-        };
-        return { from: () => chain };
-      }
-      assignmentQueries++;
-      return { from: () => ({ where: () => Promise.resolve([]) }) };
-    });
     const body = JSON.parse(await handlerFor('manage_service_monitors')({ action: 'list' }, unrestrictedAuth()));
     expect(body.showing).toBe(2);
-    expect(assignmentQueries).toBe(0);
+    expect(body).not.toHaveProperty('truncated');
   });
 });
 
@@ -723,35 +725,50 @@ describe('manage_automations list — the target scan runs for the device axis t
 
 // ── 11. manage_patches compliance ────────────────────────────────────────────
 describe('manage_patches compliance — the org-wide snapshot is not for narrowed runs', () => {
-  function mockCompliance(orgDevices: Array<{ id: string; siteId: string }>) {
+  /** Returns the WHERE of the device-count query (the counted population). */
+  function mockCompliance(orgDevices: Array<{ id: string; siteId: string }>, deviceCount = 5) {
+    const captured: { count?: SQL } = {};
     mockDb.select.mockImplementation((cols?: any) => {
       const keys = cols ? Object.keys(cols) : [];
       if (keys.length === 2 && keys.includes('id') && keys.includes('siteId')) {
         return { from: () => ({ where: () => Promise.resolve(orgDevices) }) };
       }
       if (keys.includes('devicesNeedingPatches')) {
-        return { from: () => ({ where: () => Promise.resolve([{ pending: 2, installed: 1, failed: 0, missing: 1, devicesNeedingPatches: 1 }]) }) };
+        const where = () => Promise.resolve([{ pending: 2, installed: 1, failed: 0, missing: 1, devicesNeedingPatches: 1 }]);
+        return { from: () => ({ innerJoin: () => ({ where }) }) };
       }
       if (keys.includes('total')) {
         return { from: () => ({ where: () => Promise.resolve([{ total: 3 }]) }) };
       }
-      // precomputed org-wide snapshot
-      return { from: () => ({ where: () => ({ orderBy: () => ({ limit: () => Promise.resolve([{ id: 'snap-1', totalDevices: 999 }]) }) }) }) };
+      if (keys.includes('deviceCount')) {
+        return { from: () => ({ where: (cond: SQL) => { captured.count = cond; return Promise.resolve([{ deviceCount }]); } }) };
+      }
+      throw new Error(`unexpected select: ${keys.join(',')}`);
     });
+    return captured;
   }
 
   it('recomputes over the allowlist for a device-LESS run instead of returning the org snapshot', async () => {
-    mockCompliance([{ id: 'dev-1', siteId: 'site-1' }, { id: 'dev-2', siteId: 'site-1' }]);
+    const captured = mockCompliance([{ id: 'dev-1', siteId: 'site-1' }, { id: 'dev-2', siteId: 'site-1' }], 1);
     const body = JSON.parse(await handlerFor('manage_patches')({ action: 'compliance' }, deviceLessRunAuth()));
     expect(body.snapshot.id).toBeUndefined();
     expect(body.snapshot.siteScoped).toBe(true);
     expect(body.snapshot.totalDevices).toBe(1);
+    // The counted population is the run's own device, never its sibling.
+    const { params } = new PgDialect().sqlToQuery(captured.count!);
+    expect(params).toContain('dev-1');
+    expect(params).not.toContain('dev-2');
   });
 
-  it('an unrestricted caller still gets the precomputed snapshot (no regression)', async () => {
+  // #10396: `patch_compliance_snapshots` has no writer, so the unrestricted
+  // caller is computed live too — over every device in the org, unnarrowed.
+  it('an unrestricted caller gets live org-wide figures, not narrowed ones', async () => {
     mockCompliance([]);
     const body = JSON.parse(await handlerFor('manage_patches')({ action: 'compliance' }, unrestrictedAuth()));
-    expect(body.snapshot.id).toBe('snap-1');
+    expect(body.snapshot.totalDevices).toBe(5);
+    expect(body.snapshot.nonCompliantDevices).toBe(1);
+    expect(body.snapshot.siteScoped).toBeUndefined();
+    expect(body.scope).toEqual({ orgId: 'org-1' });
   });
 });
 

@@ -1,9 +1,11 @@
 import { jsPDF } from 'jspdf';
-import autoTable, { type CellHookData } from 'jspdf-autotable';
+import { autoTable, type CellHookData } from 'jspdf-autotable';
 import type { PostureControls, PostureProduct, PostureSummary } from '../types/postureReport';
 import type { ExecutiveSummary } from '../types/executiveSummaryReport';
 import type { HardwareLifecycleSummary } from '../types/hardwareLifecycleReport';
 import { renderHardwareLifecycleReport } from './hardwareLifecyclePdf';
+import type { BackupStatusReportData } from '../types/backupStatusReport';
+import { renderBackupStatusReport } from './backupStatusReport';
 import type { ThreatDetectionSummary } from '../types/threatDetectionReport';
 import type { IdentityAccessSummary } from '../types/identityAccessReport';
 // Namespace import, not a named one: the arm below must be observable by a
@@ -19,9 +21,15 @@ import * as identityAccessPdf from './identityAccessPdf';
 // Namespace imports for the three business report types (#3198 W02), same
 // no-cycle / spy-visibility reason as threatDetectionPdf/identityAccessPdf.
 import * as ticketSlaPdf from './ticketSlaPdf';
+import * as ticketSlaPerformancePdf from './ticketSlaPerformancePdf';
 import * as technicianTimePdf from './technicianTimePdf';
 import * as arAgingPdf from './arAgingPdf';
-import type { TicketSlaSummary, TechnicianTimeSummary, ArAgingSummary } from '../types/businessReports';
+import * as aiUsageByClientPdf from './aiUsageByClientPdf';
+import * as mrrRenewalsPdf from './mrrRenewalsPdf';
+import * as quoteWinRatePdf from './quoteWinRatePdf';
+import * as clientProfitabilityPdf from './clientProfitabilityPdf';
+import type { TicketSlaSummary, TechnicianTimeSummary, ArAgingSummary, AiUsageByClientSummary, MrrRenewalsSummary, QuoteWinRateSummary, ClientProfitabilitySummary } from '../types/businessReports';
+import { isTicketSlaPerformanceSummary, type TicketSlaPerformanceSummary } from '../types/ticketSlaPerformance';
 import {
   NARRATIVE_BULLET_MAX_CHARS,
   NARRATIVE_HEADLINE_MAX_CHARS,
@@ -159,7 +167,7 @@ export type BuildOpts = {
   /** IANA timezone for formatting ISO date cells in generic tables. */
   timezone: string;
   summary?: PostureSummary | ExecutiveSummary | OrgNarrativeReportSummary | FleetDesignReportSummary | HardwareLifecycleSummary | ThreatDetectionSummary | EndpointManagementSummary | VulnerabilityManagementSummary | IdentityAccessSummary
-    | TicketSlaSummary | TechnicianTimeSummary | ArAgingSummary;
+    | TicketSlaSummary | TechnicianTimeSummary | ArAgingSummary | AiUsageByClientSummary | MrrRenewalsSummary | QuoteWinRateSummary | ClientProfitabilitySummary | TicketSlaPerformanceSummary | BackupStatusReportData;
   /** Slim baseline from the previous completed run, when the caller supplied
    * one (report_runs.result.previous) — drives the scorecard trend chip and
    * its "since <date>" label. */
@@ -178,6 +186,11 @@ const DESIGNED_BUSINESS_TYPES: ReadonlySet<string> = new Set([
   'ticket_sla_attainment',
   'technician_time_billability',
   'ar_aging',
+  'ai_usage_by_client',
+  'mrr_renewals',
+  'quote_win_rate',
+  'client_profitability',
+  'ticket_sla_performance',
 ]);
 
 const PAGE = { w: 297, h: 210, mx: 14, bandH: 19, footY: 199 } as const;
@@ -201,12 +214,18 @@ const REPORT_TYPE_LABELS: Record<string, string> = {
   ai_fleet_design: 'Fleet Design',
   identity_access_review: 'Identity & Access Review',
   hardware_lifecycle: 'Hardware Lifecycle',
+  backup_status: 'Backup Status',
   threat_detection_review: 'Threat Detection Review',
   endpoint_management_review: 'Endpoint Management Review',
   vulnerability_management: 'Vulnerability Management',
   ticket_sla_attainment: 'Ticket SLA Attainment',
   technician_time_billability: 'Technician Time & Billability',
   ar_aging: 'AR Aging',
+  ai_usage_by_client: 'AI Usage by Client',
+  mrr_renewals: 'MRR & Renewals',
+  quote_win_rate: 'Quote Win Rate',
+  client_profitability: 'Client Profitability',
+  ticket_sla_performance: 'Service Level Performance',
 };
 
 const reportTypeLabel = (t: string): string => REPORT_TYPE_LABELS[t] ?? titleCase(t);
@@ -626,6 +645,9 @@ function drawLegend(doc: jsPDF, y: number): void {
 const yesNo = (v: boolean | undefined): string => (v ? 'Yes' : 'No');
 const boolStatus = (v: boolean | undefined): MetricStatus => (v === undefined ? 'na' : v ? 'good' : 'bad');
 const pctStr = (v: number | null | undefined): string => (v == null ? 'N/A' : `${v}%`);
+/** A control % is over ASSESSED devices; disclose the in-scope devices it leaves out. */
+const withNotAssessed = (value: string, unknown: number | undefined): string =>
+  unknown != null && unknown > 0 ? `${value} \u00b7 ${unknown} not assessed` : value;
 function pctStatus(v: number | null | undefined, good = 90, warn = 60): MetricStatus {
   if (v == null) return 'na';
   if (v >= good) return 'good';
@@ -633,8 +655,40 @@ function pctStatus(v: number | null | undefined, good = 90, warn = 60): MetricSt
   return 'bad';
 }
 
-export function buildPostureBackupMetric(controls: PostureControls) {
+/**
+ * The cover's Backup metric. Given the product inventory, it names every
+ * backup product (first-party config, SaaS backup, third-party providers such
+ * as Cove — #6012) and grades by how many are working; without one it keeps
+ * the legacy Yes/No. A site-restricted report withholds org-wide backup
+ * evidence (`backupConfigured` absent), and a partial product list must not
+ * stand in for it there, so that case stays legacy too.
+ */
+export function buildPostureBackupMetric(controls: PostureControls, products: PostureProduct[] = []) {
   const backupRequired = controls.backupRequired !== false;
+  const backupProducts = products.filter((product) => product.category === 'backup');
+  if (backupProducts.length > 0 && controls.backupConfigured !== undefined) {
+    // A product counts as working only when it is active AND backs up every
+    // device it covers: "1 of 200 devices backed up" must not grade green on
+    // the cover (the per-device shortfall is otherwise only in the inventory).
+    const activeCount = backupProducts.filter((product) =>
+      product.active !== false &&
+      (product.deviceCoverage == null ||
+        product.activeDeviceCoverage == null ||
+        product.activeDeviceCoverage >= product.deviceCoverage),
+    ).length;
+    const anyActive = backupProducts.some((product) => product.active !== false);
+    return {
+      label: 'Backup',
+      value: backupProducts.map((product) => product.product).join(', '),
+      status: !backupRequired
+        ? 'neutral'
+        : activeCount === backupProducts.length
+          ? 'good'
+          : anyActive
+            ? 'warn'
+            : 'bad',
+    } satisfies Metric;
+  }
   const backupValue = backupRequired
     ? `${yesNo(controls.backupConfigured)}${controls.backupConfigured && controls.backupEncrypted ? ' (encrypted)' : ''}`
     : controls.backupConfigured
@@ -645,6 +699,55 @@ export function buildPostureBackupMetric(controls: PostureControls) {
     value: backupValue,
     status: backupRequired ? boolStatus(controls.backupConfigured) : 'neutral',
   } satisfies Metric;
+}
+
+/**
+ * Ruling 23: a coverage % is over ASSESSED devices, so it must not take a
+ * pass colour when the not-assessed share exceeds 20% (mirrors the trust page
+ * coverage floor). Every unknown count here is deviceCount − assessed, so
+ * unknown / (unknown + assessed) = unknown / deviceCount.
+ */
+const NOT_ASSESSED_SHARE_MAX = 0.2;
+function coverageShareStatus(base: MetricStatus, unknown: number | undefined, deviceCount: number): MetricStatus {
+  if (base === 'na' || unknown == null || unknown <= 0 || deviceCount <= 0) return base;
+  return unknown / deviceCount > NOT_ASSESSED_SHARE_MAX ? 'na' : base;
+}
+
+/** The posture cover's control-coverage grid, column-major (left: device
+ *  protection & hygiene; right: access, identity & network). Pure; exported for tests. */
+export function buildPostureCoverageMetrics(summary: PostureSummary): Metric[] {
+  const c = summary.controls ?? {};
+  const deviceCount = summary.deviceCount ?? 0;
+  const protectionMetrics: Metric[] = [
+    { label: 'Managed EDR coverage', value: withNotAssessed(pctStr(c.edrCoveragePct), c.edrUnknownCount), status: coverageShareStatus(pctStatus(c.edrCoveragePct), c.edrUnknownCount, deviceCount), target: '>=90%' },
+    { label: 'AV + real-time protection', value: withNotAssessed(pctStr(c.anyAvCoveragePct), c.anyAvUnknownCount), status: coverageShareStatus(pctStatus(c.anyAvCoveragePct), c.anyAvUnknownCount, deviceCount), target: '>=95%' },
+    {
+      label: 'Unprotected devices',
+      value: String(c.unprotectedCount ?? 0),
+      status: (c.unprotectedCount ?? 0) > 0 ? 'bad' : 'good',
+      target: 'none', // "0" beside a value of 0 read as a duplicated numeral
+    },
+    { label: 'AV definitions current', value: pctStr(c.avDefinitionsCurrentPct), status: pctStatus(c.avDefinitionsCurrentPct), target: '>=95%' },
+    { label: 'Disk encryption', value: withNotAssessed(pctStr(c.encryptionPct), c.encryptionUnknownCount), status: coverageShareStatus(pctStatus(c.encryptionPct), c.encryptionUnknownCount, deviceCount), target: '>=90%' },
+    { label: 'Patch current (no critical pending)', value: withNotAssessed(pctStr(c.patchCurrentPct), c.patchUnknownCount), status: coverageShareStatus(pctStatus(c.patchCurrentPct, 90, 70), c.patchUnknownCount, deviceCount), target: '>=90%' },
+  ];
+  if (c.cisIncluded !== false) {
+    const cisVal =
+      c.cisAvgPassRate == null
+        ? 'Not assessed'
+        : `${c.cisAvgPassRate}% (${c.cisAssessedCount ?? 0}/${deviceCount})`;
+    protectionMetrics.push({ label: 'CIS hardening', value: cisVal, status: pctStatus(c.cisAvgPassRate, 90, 70), target: '>=90%' });
+  }
+  const backupMetric = buildPostureBackupMetric(c, summary.securityProducts ?? []);
+  const accessMetrics: Metric[] = [
+    { label: 'Host firewall', value: withNotAssessed(pctStr(c.firewallPct), c.firewallUnknownCount), status: coverageShareStatus(pctStatus(c.firewallPct), c.firewallUnknownCount, deviceCount), target: '>=95%' },
+    { label: 'Password complexity', value: withNotAssessed(pctStr(c.passwordComplexityPct), c.passwordUnknownCount), status: coverageShareStatus(pctStatus(c.passwordComplexityPct), c.passwordUnknownCount, deviceCount), target: '>=90%' },
+    { label: 'Local-admin exposure', value: withNotAssessed(pctStr(c.localAdminExposurePct), c.localAdminUnknownCount), status: coverageShareStatus(pctStatus(c.localAdminExposurePct == null ? null : 100 - c.localAdminExposurePct), c.localAdminUnknownCount, deviceCount), target: '<=10%' },
+    { label: 'Identity provider connected', value: yesNo(c.identityProviderConnected), status: boolStatus(c.identityProviderConnected) },
+    backupMetric,
+    { label: 'DNS filtering active', value: yesNo(c.dnsFilteringActive), status: boolStatus(c.dnsFilteringActive) },
+  ];
+  return [...protectionMetrics, ...accessMetrics];
 }
 
 type PostureAggregates = { criticalCount: number; unprotectedCount: number };
@@ -703,36 +806,7 @@ function renderPostureCover(
   drawLegend(doc, ccHeadingY); // color key, right-aligned to the heading
   // Left column: device protection & hygiene. Right column: access, identity
   // & network. The grid fills column-major, so array order = reading order.
-  const protectionMetrics: Metric[] = [
-    { label: 'Managed EDR coverage', value: pctStr(c.edrCoveragePct), status: pctStatus(c.edrCoveragePct), target: '>=90%' },
-    { label: 'AV + real-time protection', value: pctStr(c.anyAvCoveragePct), status: pctStatus(c.anyAvCoveragePct), target: '>=95%' },
-    {
-      label: 'Unprotected devices',
-      value: String(c.unprotectedCount ?? 0),
-      status: (c.unprotectedCount ?? 0) > 0 ? 'bad' : 'good',
-      target: 'none', // "0" beside a value of 0 read as a duplicated numeral
-    },
-    { label: 'AV definitions current', value: pctStr(c.avDefinitionsCurrentPct), status: pctStatus(c.avDefinitionsCurrentPct), target: '>=95%' },
-    { label: 'Disk encryption', value: pctStr(c.encryptionPct), status: pctStatus(c.encryptionPct), target: '>=90%' },
-    { label: 'Patch current (no critical pending)', value: pctStr(c.patchCurrentPct), status: pctStatus(c.patchCurrentPct, 90, 70), target: '>=90%' },
-  ];
-  if (c.cisIncluded !== false) {
-    const cisVal =
-      c.cisAvgPassRate == null
-        ? 'Not assessed'
-        : `${c.cisAvgPassRate}% (${c.cisAssessedCount ?? 0}/${deviceCount})`;
-    protectionMetrics.push({ label: 'CIS hardening', value: cisVal, status: pctStatus(c.cisAvgPassRate, 90, 70), target: '>=90%' });
-  }
-  const backupMetric = buildPostureBackupMetric(c);
-  const accessMetrics: Metric[] = [
-    { label: 'Host firewall', value: pctStr(c.firewallPct), status: pctStatus(c.firewallPct), target: '>=95%' },
-    { label: 'Password complexity', value: pctStr(c.passwordComplexityPct), status: pctStatus(c.passwordComplexityPct), target: '>=90%' },
-    { label: 'Local-admin exposure', value: pctStr(c.localAdminExposurePct), status: pctStatus(c.localAdminExposurePct == null ? null : 100 - c.localAdminExposurePct), target: '<=10%' },
-    { label: 'Identity provider connected', value: yesNo(c.identityProviderConnected), status: boolStatus(c.identityProviderConnected) },
-    backupMetric,
-    { label: 'DNS filtering active', value: yesNo(c.dnsFilteringActive), status: boolStatus(c.dnsFilteringActive) },
-  ];
-  y = drawMetricGrid(doc, [...protectionMetrics, ...accessMetrics], y);
+  y = drawMetricGrid(doc, buildPostureCoverageMetrics(summary), y);
 
   y = drawSectionHeading(doc, 'Privileged access (PAM)', y + 2.5);
   const pamMetrics: Metric[] = [
@@ -1648,12 +1722,18 @@ function drawPostureProductRow(doc: jsPDF, product: PostureProduct, y: number): 
     ? ` — ${product.deviceCoverage} device${product.deviceCoverage === 1 ? '' : 's'}`
     : '';
   // "Installed on N" reads as "protecting N". When only a subset of those devices
-  // are actually protecting (native AV with real-time protection on), spell that
-  // out so one RTP-on device can't imply full-fleet coverage (issue #2517).
+  // are actually protecting (native AV with real-time protection on; a backup
+  // product with a successful backup in the window), spell that out so one
+  // active device can't imply full-fleet coverage (issue #2517). The wording
+  // follows the category — "real-time protection" means nothing for a backup
+  // product (#6012).
   const activeCount = product.activeDeviceCoverage;
+  const activeNote = product.category === 'backup'
+    ? 'with a successful backup in the period'
+    : 'with real-time protection on';
   const rtpNote =
     product.deviceCoverage != null && activeCount != null && activeCount < product.deviceCoverage
-      ? `, ${activeCount} with real-time protection on`
+      ? `, ${activeCount} ${activeNote}`
       : '';
   // Sync status is only interesting when it's a problem; success is machine
   // noise on a client-facing page.
@@ -2055,6 +2135,26 @@ function buildReportPdfWithPalette(rows: unknown[], opts: BuildOpts): jsPDF {
       },
     );
   } else if (
+    opts.reportType === 'backup_status'
+    && opts.summary
+    && Array.isArray((opts.summary as BackupStatusReportData).rows)
+  ) {
+    drawHeaderBand(doc, opts);
+    drawFooter(doc, opts);
+    renderBackupStatusReport(
+      doc,
+      opts.summary as BackupStatusReportData,
+      { generatedAt: opts.generatedAt, timezone: opts.timezone },
+      {
+        C,
+        PAGE,
+        drawHeaderBand: (d) => drawHeaderBand(d, opts),
+        drawFooter: (d) => drawFooter(d, opts),
+        drawTitleBlock,
+        drawSectionHeading,
+      },
+    );
+  } else if (
     opts.reportType === 'threat_detection_review'
     && opts.summary
     // `!= null` FIRST: `typeof null === 'object'`, so a summary carrying an
@@ -2265,6 +2365,137 @@ function buildReportPdfWithPalette(rows: unknown[], opts: BuildOpts): jsPDF {
         contactName: opts.branding?.contactName ?? null,
         previous: opts.previous,
       },
+      {
+        C,
+        PAGE,
+        drawHeaderBand: (d) => drawHeaderBand(d, opts),
+        drawFooter: (d) => drawFooter(d, opts),
+        drawTitleBlock,
+        drawSectionHeading,
+      },
+    );
+  } else if (
+    opts.reportType === 'ai_usage_by_client'
+    && opts.summary
+    // Same guard shape as the SLA / technician arms: `!= null` first
+    // (typeof null === 'object'), and `groups` is what separates this summary
+    // from the other period-bearing business summaries.
+    && (opts.summary as AiUsageByClientSummary).period != null
+    && typeof (opts.summary as AiUsageByClientSummary).period === 'object'
+    && Array.isArray((opts.summary as AiUsageByClientSummary).groups)
+  ) {
+    drawHeaderBand(doc, opts);
+    drawFooter(doc, opts);
+    aiUsageByClientPdf.renderAiUsageByClientReport(
+      doc,
+      opts.summary as AiUsageByClientSummary,
+      {
+        generatedAt: opts.generatedAt,
+        partnerName: opts.branding?.name ?? null,
+        contactEmail: opts.branding?.contactEmail ?? null,
+        contactName: opts.branding?.contactName ?? null,
+        previous: opts.previous,
+      },
+      {
+        C,
+        PAGE,
+        drawHeaderBand: (d) => drawHeaderBand(d, opts),
+        drawFooter: (d) => drawFooter(d, opts),
+        drawTitleBlock,
+        drawSectionHeading,
+      },
+    );
+  } else if (
+    opts.reportType === 'mrr_renewals'
+    && opts.summary
+    && typeof (opts.summary as MrrRenewalsSummary).asOf === 'string'
+    && Array.isArray((opts.summary as MrrRenewalsSummary).byCurrency)
+  ) {
+    drawHeaderBand(doc, opts);
+    drawFooter(doc, opts);
+    mrrRenewalsPdf.renderMrrRenewalsReport(
+      doc,
+      opts.summary as MrrRenewalsSummary,
+      {
+        generatedAt: opts.generatedAt,
+        partnerName: opts.branding?.name ?? null,
+        contactEmail: opts.branding?.contactEmail ?? null,
+        contactName: opts.branding?.contactName ?? null,
+        previous: opts.previous,
+      },
+      {
+        C,
+        PAGE,
+        drawHeaderBand: (d) => drawHeaderBand(d, opts),
+        drawFooter: (d) => drawFooter(d, opts),
+        drawTitleBlock,
+        drawSectionHeading,
+      },
+    );
+  } else if (
+    opts.reportType === 'quote_win_rate'
+    && opts.summary
+    && (opts.summary as QuoteWinRateSummary).overall != null
+    && typeof (opts.summary as QuoteWinRateSummary).overall === 'object'
+    && (opts.summary as QuoteWinRateSummary).period != null
+    && Array.isArray((opts.summary as QuoteWinRateSummary).groups)
+  ) {
+    drawHeaderBand(doc, opts);
+    drawFooter(doc, opts);
+    quoteWinRatePdf.renderQuoteWinRateReport(
+      doc,
+      opts.summary as QuoteWinRateSummary,
+      {
+        generatedAt: opts.generatedAt,
+        partnerName: opts.branding?.name ?? null,
+        contactEmail: opts.branding?.contactEmail ?? null,
+        contactName: opts.branding?.contactName ?? null,
+        previous: opts.previous,
+      },
+      {
+        C,
+        PAGE,
+        drawHeaderBand: (d) => drawHeaderBand(d, opts),
+        drawFooter: (d) => drawFooter(d, opts),
+        drawTitleBlock,
+        drawSectionHeading,
+      },
+    );
+  } else if (
+    opts.reportType === 'client_profitability'
+    && opts.summary
+    && Array.isArray((opts.summary as ClientProfitabilitySummary).byCurrency)
+    && Array.isArray((opts.summary as ClientProfitabilitySummary).orgs)
+    && Array.isArray((opts.summary as ClientProfitabilitySummary).sources)
+  ) {
+    drawHeaderBand(doc, opts);
+    drawFooter(doc, opts);
+    clientProfitabilityPdf.renderClientProfitabilityReport(
+      doc,
+      opts.summary as ClientProfitabilitySummary,
+      {
+        generatedAt: opts.generatedAt,
+        partnerName: opts.branding?.name ?? null,
+        contactEmail: opts.branding?.contactEmail ?? null,
+        contactName: opts.branding?.contactName ?? null,
+      },
+      {
+        C,
+        PAGE,
+        drawHeaderBand: (d) => drawHeaderBand(d, opts),
+        drawFooter: (d) => drawFooter(d, opts),
+        drawTitleBlock,
+        drawSectionHeading,
+      },
+    );
+  } else if (opts.reportType === 'ticket_sla_performance' && isTicketSlaPerformanceSummary(opts.summary)) {
+    // Self-contained chrome: both tables paginate on their own.
+    drawHeaderBand(doc, opts);
+    drawFooter(doc, opts);
+    ticketSlaPerformancePdf.renderTicketSlaPerformanceReport(
+      doc,
+      opts.summary,
+      { generatedAt: opts.generatedAt },
       {
         C,
         PAGE,

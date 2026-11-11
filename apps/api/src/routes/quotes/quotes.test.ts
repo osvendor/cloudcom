@@ -1,10 +1,24 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
+// Route audits: assert the call, not the persistence path.
+vi.mock('../../services/auditEvents', async (importActual) => ({
+  ...(await importActual<typeof import('../../services/auditEvents')>()),
+  writeRouteAudit: vi.fn(),
+}));
+
+vi.mock('../../services/sentry', () => ({ captureException: vi.fn() }));
+// #10361: the detail route lists the contracts a quote's accept created.
+vi.mock('../../services/contractService', async (importActual) => ({
+  ...(await importActual<typeof import('../../services/contractService')>()),
+  listContracts: vi.fn(),
+}));
+
 // Mock the service layer — routes are thin; we assert wiring, validation, error mapping.
 vi.mock('../../services/quoteService', () => ({
   createQuote: vi.fn(),
   cloneQuote: vi.fn(),
   getQuote: vi.fn(),
+  refreshDraftQuoteTaxRate: vi.fn(async () => false),
   listQuotes: vi.fn(),
   updateQuote: vi.fn(),
   deleteDraftQuote: vi.fn(),
@@ -31,6 +45,8 @@ vi.mock('../../services/quoteTypes', () => ({
 // connection row (#3777 review F5). Mocked so the default (no connection) never
 // consumes a row from the branding `dbRows` queue below.
 vi.mock('../../services/stripeConnectService', () => ({ getConnection: vi.fn() }));
+const emailMock = vi.hoisted(() => ({ getEmailService: vi.fn(() => null as unknown) }));
+vi.mock('../../services/email', () => ({ getEmailService: emailMock.getEmailService }));
 
 // Contract-block serialization has its own unit tests (contractTemplateRender.test.ts);
 // here we only assert the route's WIRING — it calls renderContractBlocksForClient
@@ -46,6 +62,8 @@ vi.mock('../../services/contractTemplateRender', () => ({
   // ADMIN-only authoring fields for the editor. Default empty map so every other
   // GET /:id test is unaffected (no `authoring` merged onto contract blocks).
   loadContractBlockAuthoring: vi.fn(async () => new Map()),
+  // #9867: the editor's resolved auto-variable values. Display-only.
+  resolveQuoteEditorAutoVariables: vi.fn(() => ({ 'client.name': 'Acme Co' })),
   // Real implementation (not a bare vi.fn()) — mirrors contractTemplateRender.ts's
   // attachContractAuthoring exactly, so the "merges authoring onto contract
   // blocks" test below exercises the actual merge semantics the route relies on.
@@ -105,7 +123,7 @@ vi.mock('../../db', () => {
     };
     return chain;
   };
-  return { db: { select: () => builder() } };
+  return { db: { select: () => builder() }, withDbTransaction: (fn: () => Promise<unknown>) => fn() };
 });
 
 // Mock auth middleware to inject a partner-scoped actor with quote perms.
@@ -127,10 +145,13 @@ import { eq } from 'drizzle-orm';
 import { partners } from '../../db/schema/orgs';
 import { quoteRoutes } from './index';
 import * as svc from '../../services/quoteService';
+import { writeRouteAudit } from '../../services/auditEvents';
 import { QuoteServiceError } from '../../services/quoteTypes';
-import { renderContractBlocksForClient, loadContractBlockAuthoring, loadContractPdfInputs } from '../../services/contractTemplateRender';
+import { renderContractBlocksForClient, loadContractBlockAuthoring, loadContractPdfInputs, resolveQuoteEditorAutoVariables } from '../../services/contractTemplateRender';
 import { ContractTemplateServiceError } from '../../services/contractTemplateService';
 import { getConnection } from '../../services/stripeConnectService';
+import { listContracts } from '../../services/contractService';
+import { captureException } from '../../services/sentry';
 
 function app() {
   // quoteRoutes already applies authMiddleware internally
@@ -164,7 +185,7 @@ describe('quote crud + lines routes', () => {
   });
 
   it('POST / creates a quote', async () => {
-    (svc.createQuote as any).mockResolvedValue({ id: QUOTE_ID, status: 'draft' });
+    (svc.createQuote as any).mockResolvedValue({ id: QUOTE_ID, orgId: ORG_ID, status: 'draft' });
     const res = await app().request('/', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -174,6 +195,9 @@ describe('quote crud + lines routes', () => {
     const body = await res.json();
     expect(body.data.id).toBe(QUOTE_ID);
     expect(svc.createQuote).toHaveBeenCalledOnce();
+    expect(writeRouteAudit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      orgId: ORG_ID, action: 'quote.create', resourceType: 'quote', resourceId: QUOTE_ID,
+    }));
   });
 
   it('POST /:id/clone clones a quote into a new draft (bodyless legacy call → no retarget)', async () => {
@@ -283,6 +307,18 @@ describe('quote crud + lines routes', () => {
     expect(svc.getQuote).toHaveBeenCalledWith(QUOTE_ID, expect.anything());
   });
 
+  it('GET /:id refreshes a stale draft tax rate BEFORE loading the quote (#7507)', async () => {
+    (svc.getQuote as any).mockResolvedValue({ quote: { id: QUOTE_ID }, blocks: [], lines: [] });
+    const res = await app().request(`/${QUOTE_ID}`, { method: 'GET' });
+    expect(res.status).toBe(200);
+    expect(svc.refreshDraftQuoteTaxRate).toHaveBeenCalledWith(QUOTE_ID, expect.anything());
+    // Order matters: the detail must be read AFTER the refresh, or the editor
+    // shows the stale rate it was meant to replace.
+    const refreshOrder = (svc.refreshDraftQuoteTaxRate as any).mock.invocationCallOrder[0];
+    const getOrder = (svc.getQuote as any).mock.invocationCallOrder[0];
+    expect(refreshOrder).toBeLessThan(getOrder);
+  });
+
   it('GET /:id resolves presentation.theme="condensed" from the partner default (no query beyond the existing branding selects)', async () => {
     (svc.getQuote as any).mockResolvedValue({ quote: { id: QUOTE_ID, orgId: ORG_ID, partnerId: 'p1' }, blocks: [], lines: [] });
     // Branding selects: partner row (documentTheme condensed/pageSize letter), then portal_branding row.
@@ -376,6 +412,96 @@ describe('quote crud + lines routes', () => {
     expect(body.code).toBe('VERSION_NOT_FOUND');
   });
 
+  describe('GET /:id generated contracts (#10361)', () => {
+    const withPerms = (perms: string[]) => {
+      gate.permGate = async (c: any, next: any) => {
+        c.set('permissions', {
+          permissions: perms.map((p) => { const [resource, action] = p.split(':'); return { resource, action }; }),
+          partnerId: 'p1', orgId: null, roleId: 'r1', scope: 'partner',
+        });
+        return next();
+      };
+    };
+
+    it('lists the contracts this quote created, scoped to the quote org and the caller, for a contracts:read holder', async () => {
+      withPerms(['quotes:read', 'contracts:read']);
+      (svc.getQuote as any).mockResolvedValue({ quote: { id: QUOTE_ID, orgId: ORG_ID, partnerId: 'p1', status: 'converted' }, blocks: [], lines: [] });
+      vi.mocked(listContracts).mockResolvedValue([
+        { id: 'c-monthly', name: 'Q-1 — Monthly', status: 'draft', intervalMonths: 1, estimatedPeriodValue: '150.00', sourceQuote: { id: QUOTE_ID, quoteNumber: 'Q-1' } },
+        { id: 'c-annual', name: 'Q-1 — Annual', status: 'active', intervalMonths: 12, estimatedPeriodValue: '1200.00', sourceQuote: { id: QUOTE_ID, quoteNumber: 'Q-1' } },
+      ] as never);
+
+      const res = await app().request(`/${QUOTE_ID}`, { method: 'GET' });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      // Only what the callout renders — not the whole contract row.
+      expect(body.data.contracts).toEqual([
+        { id: 'c-monthly', name: 'Q-1 — Monthly', status: 'draft', intervalMonths: 1 },
+        { id: 'c-annual', name: 'Q-1 — Annual', status: 'active', intervalMonths: 12 },
+      ]);
+      expect(listContracts).toHaveBeenCalledWith(
+        { orgId: ORG_ID, sourceQuoteId: QUOTE_ID },
+        expect.objectContaining({ userId: 'u1', partnerId: 'p1', accessibleOrgIds: null }),
+      );
+    });
+
+    it('reads with the caller\'s site allowlist, so the site axis applies (#10361)', async () => {
+      gate.permGate = async (c: any, next: any) => {
+        c.set('auth', { user: { id: 'u1' }, partnerId: 'p1', orgId: null, scope: 'partner', accessibleOrgIds: [ORG_ID], allowedSiteIds: ['site-a'] });
+        c.set('permissions', {
+          permissions: [{ resource: 'quotes', action: 'read' }, { resource: 'contracts', action: 'read' }],
+          partnerId: 'p1', orgId: null, roleId: 'r1', scope: 'partner',
+        });
+        return next();
+      };
+      (svc.getQuote as any).mockResolvedValue({ quote: { id: QUOTE_ID, orgId: ORG_ID, partnerId: 'p1', status: 'converted' }, blocks: [], lines: [] });
+      vi.mocked(listContracts).mockResolvedValue([] as never);
+      const res = await app().request(`/${QUOTE_ID}`, { method: 'GET' });
+      expect(res.status).toBe(200);
+      expect(listContracts).toHaveBeenCalledWith(
+        { orgId: ORG_ID, sourceQuoteId: QUOTE_ID },
+        { userId: 'u1', partnerId: 'p1', accessibleOrgIds: [ORG_ID], allowedSiteIds: ['site-a'] },
+      );
+    });
+
+    it('returns contracts: null and never reads contracts for a caller without contracts:read', async () => {
+      withPerms(['quotes:read']);
+      (svc.getQuote as any).mockResolvedValue({ quote: { id: QUOTE_ID, orgId: ORG_ID, partnerId: 'p1', status: 'converted' }, blocks: [], lines: [] });
+      const res = await app().request(`/${QUOTE_ID}`, { method: 'GET' });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data.contracts).toBeNull();
+      expect(body.data.contractsUnavailable).toBe(false);
+      expect(listContracts).not.toHaveBeenCalled();
+    });
+
+    it('skips the read for a quote that was never accepted (no contract can exist yet)', async () => {
+      withPerms(['quotes:read', 'contracts:read']);
+      (svc.getQuote as any).mockResolvedValue({ quote: { id: QUOTE_ID, orgId: ORG_ID, partnerId: 'p1', status: 'sent' }, blocks: [], lines: [] });
+      const res = await app().request(`/${QUOTE_ID}`, { method: 'GET' });
+      const body = await res.json();
+      expect(body.data.contracts).toEqual([]);
+      expect(listContracts).not.toHaveBeenCalled();
+    });
+
+    it('degrades to contracts: null (not a failed page) when the contract read throws', async () => {
+      withPerms(['quotes:read', 'contracts:read']);
+      (svc.getQuote as any).mockResolvedValue({ quote: { id: QUOTE_ID, orgId: ORG_ID, partnerId: 'p1', status: 'accepted' }, blocks: [], lines: [] });
+      vi.mocked(listContracts).mockRejectedValueOnce(new Error('db down'));
+      const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const res = await app().request(`/${QUOTE_ID}`, { method: 'GET' });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data.contracts).toBeNull();
+      // Distinct from "no permission": the web says the list could not load
+      // rather than implying no contract exists.
+      expect(body.data.contractsUnavailable).toBe(true);
+      expect(errSpy).toHaveBeenCalledWith('GET /quotes/:id: generated-contract lookup failed', expect.objectContaining({ quoteId: QUOTE_ID }));
+      expect(captureException).toHaveBeenCalledOnce();
+      errSpy.mockRestore();
+    });
+  });
+
   it('POST /:id/lines adds a manual line', async () => {
     (svc.addManualLine as any).mockResolvedValue({ id: 'line1' });
     const res = await app().request(`/${QUOTE_ID}/lines`, {
@@ -411,12 +537,15 @@ describe('quote crud + lines routes', () => {
   });
 
   it('DELETE /:id deletes a draft quote', async () => {
-    (svc.deleteDraftQuote as any).mockResolvedValue(undefined);
+    (svc.deleteDraftQuote as any).mockResolvedValue({ id: QUOTE_ID, orgId: ORG_ID });
     const res = await app().request(`/${QUOTE_ID}`, { method: 'DELETE' });
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.data.ok).toBe(true);
     expect(svc.deleteDraftQuote).toHaveBeenCalledWith(QUOTE_ID, expect.anything());
+    expect(writeRouteAudit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      orgId: ORG_ID, action: 'quote.delete', resourceType: 'quote', resourceId: QUOTE_ID,
+    }));
   });
 
   it('PATCH /:id/blocks/:blockId updates a heading block (200, forwards body)', async () => {
@@ -671,6 +800,10 @@ describe('quote crud + lines routes', () => {
       const res = await app().request(`/${QUOTE_ID}/pdf`, { method: 'GET' });
 
       expect(res.status).toBe(200);
+      // #7507: a draft PDF prints the current rate — refreshed before the read.
+      expect(svc.refreshDraftQuoteTaxRate).toHaveBeenCalledWith(QUOTE_ID, expect.anything());
+      expect((svc.refreshDraftQuoteTaxRate as any).mock.invocationCallOrder[0])
+        .toBeLessThan((svc.getQuote as any).mock.invocationCallOrder[0]);
       expect(res.headers.get('content-type')).toBe('application/pdf');
       const disposition = res.headers.get('content-disposition') ?? '';
       expect(disposition).toContain('inline');
@@ -780,6 +913,41 @@ describe('quote crud + lines routes', () => {
       const body = await res.json();
       expect(body.data.stripeConnected).toBeNull();
       expect(body.data.currencyWarning).toBeNull();
+    });
+  });
+
+  describe('GET /:id — contractAutoValues (#9867)', () => {
+    it('returns the resolved auto-variable values, built from the bill-to, live seller and branding locale', async () => {
+      const billTo = { name: 'Acme Co', address: null, taxId: null };
+      (svc.getQuote as any).mockResolvedValue({ quote: { id: QUOTE_ID, orgId: ORG_ID, partnerId: 'p1' }, blocks: [], lines: [], billTo });
+      const res = await app().request(`/${QUOTE_ID}`, { method: 'GET' });
+      expect(res.status).toBe(200);
+      expect((await res.json()).data.contractAutoValues).toEqual({ 'client.name': 'Acme Co' });
+      const [quoteArg, opts] = vi.mocked(resolveQuoteEditorAutoVariables).mock.calls.at(-1)!;
+      expect((quoteArg as { id: string }).id).toBe(QUOTE_ID);
+      expect(opts).toEqual(expect.objectContaining({ billTo, locale: expect.any(String) }));
+      expect(opts).toHaveProperty('seller');
+    });
+
+    it('a resolver failure degrades to null instead of failing the quote load', async () => {
+      (svc.getQuote as any).mockResolvedValue({ quote: { id: QUOTE_ID, orgId: ORG_ID, partnerId: 'p1' }, blocks: [], lines: [] });
+      vi.mocked(resolveQuoteEditorAutoVariables).mockImplementationOnce(() => { throw new Error('boom'); });
+      const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const res = await app().request(`/${QUOTE_ID}`, { method: 'GET' });
+      expect(res.status).toBe(200);
+      expect((await res.json()).data.contractAutoValues).toBeNull();
+      expect(errSpy).toHaveBeenCalled();
+      errSpy.mockRestore();
+    });
+  });
+
+  describe('GET /:id — emailConfigured (#9256)', () => {
+    it.each([[true, { sendEmail: vi.fn() }], [false, null]])('returns emailConfigured=%s from the server email transport', async (expected, svcValue) => {
+      (svc.getQuote as any).mockResolvedValue({ quote: { id: QUOTE_ID, orgId: ORG_ID, partnerId: 'p1' }, blocks: [], lines: [] });
+      emailMock.getEmailService.mockReturnValue(svcValue);
+      const res = await app().request(`/${QUOTE_ID}`, { method: 'GET' });
+      expect(res.status).toBe(200);
+      expect((await res.json()).data.emailConfigured).toBe(expected);
     });
   });
 

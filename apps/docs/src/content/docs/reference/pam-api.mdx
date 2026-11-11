@@ -144,9 +144,17 @@ Only a `pending` request can be decided. The transition is an atomic compare-and
 
 `enforcementStatus` reflects the device-side actuation of the approval (see [Device actuation](#device-actuation)) — e.g. `pending_dispatch` once approved, progressing to `active` as the agent applies it.
 
+An approve for a specific executable is refused when the request carries no file hash, because the device could not confirm the target's identity. The request is then denied and the response reports the refusal with its reason:
+
+```json
+{ "success": true, "id": "…", "status": "denied", "enforcementStatus": "refused", "reason": "Target identity could not be verified on the device; re-request elevation." }
+```
+
+A refused approve is recorded and reported as refused. Its audit entry keeps the `pam.elevation_request.approve` action with result `denied` and the refusal reason. It publishes `elevation.denied`, not `elevation.approved`, and the event payload carries `enforcementStatus: "refused"` and the `reason`. Policy auto-approvals refused at ingest publish `elevation.denied` in the same way. The same refusal on the approvals inbox (`POST /mobile/approvals/:id/approve`) returns `enforcementStatus: "refused"` and the `reason` alongside the decided approval. The approval itself is stored as not approved: `approval.status` is `denied` and `approval.refusalReason` carries the reason. Every read of that approval afterwards, including the inbox's Recent list, reports it the same way. The approver's approve stays on the record: the approval's `decidedAt` is when they approved, and the elevation request keeps them as its approver. A non-null `refusalReason` is what tells an approve the server refused apart from an approver's own denial, which has `refusalReason: null`.
+
 | Status | Meaning |
 |---|---|
-| `200` | `{ "success": true, "id": "…", "status": "approved" \| "denied", "enforcementStatus": "…" }` |
+| `200` | `{ "success": true, "id": "…", "status": "approved" \| "denied", "enforcementStatus": "…" }`, plus `reason` when `enforcementStatus` is `refused` |
 | `400` | Invalid id or body |
 | `401` | Invalid `proof`, or `reauthPassword`/`reauthMfaCode` missing or incorrect for a critical approve (`code: "reauth_required"`) |
 | `403` | Site access denied, MFA not satisfied, or an under-assured approve rejected by partner step-up policy |
@@ -174,6 +182,30 @@ Ends an active elevation early.
 ```
 
 `enforcementStatus` is always `cleanup_pending` on a successful revoke — the agent-side cleanup is dispatched asynchronously (see [Device actuation](#device-actuation)); the time-bound expiry enforcer is the safety net if cleanup doesn't confirm.
+
+---
+
+
+## Elevation audit export
+
+**v0.118.0+.** `GET /pam/elevation-audit/export` exports the elevation audit ledger for one organization, one page per request, as CSV or JSON Lines. Each row is one audit event with its request context: site, device, subject, target and decision.
+
+It needs `devices:read` and `audit:export`, plus MFA according to your MFA policy. It accepts user sessions only, not API keys.
+
+| Query parameter | Required | Description |
+|---|---|---|
+| `from`, `to` | yes | ISO 8601 timestamps with offset. `from` must be before `to`; the window may be at most 366 days. |
+| `orgId` | partner and system callers | The organization to export. An organization caller exports its own organization. |
+| `format` | no | `csv` (default) or `jsonl`. |
+| `siteId`, `deviceId`, `elevationRequestId`, `eventType` | no | Narrow the export. An unknown `eventType` returns `400`. |
+| `limit` | no | Rows per page, 1–1000 (default 1000). |
+| `cursor` | no | The `X-Next-Cursor` value from the previous page. |
+
+Keep requesting pages with `cursor` set to `X-Next-Cursor` while `X-Has-More` is `true`. The window is fully exported only once `X-Window-Complete` is `true`: the newest few minutes of events are held back until they settle (`X-Settled-Through`), so resume from `X-Next-Cursor` later to pick them up. Because the cursor always marks the resume position, a SIEM can also use it to follow the ledger. Other response headers: `X-Row-Count` and `X-Export-Schema-Version`.
+
+<Aside type="note">
+  Request columns show each request's current state, not its state when the event was recorded. The export shows what the ledger holds at the time of the request.
+</Aside>
 
 ---
 
@@ -376,7 +408,7 @@ The route is single-use: it atomically transitions the request from `approved` t
 | `400` | Invalid body, or device decommissioned |
 | `403` | PAM actuator disabled, site access denied, or MFA not satisfied |
 | `404` | Device or elevation request not found |
-| `409` | Request not approved (`wrong_status`) or already being actuated (`race_lost`) |
+| `409` | Request not approved (`wrong_status`) or already being actuated (`RACE_LOST`) |
 
 <Aside type="caution">
   The actuator is **disabled by default in every environment** and must be explicitly enabled server-side once just-in-time credentials and agent-side re-validation are deployed. While disabled, this endpoint returns `403`.

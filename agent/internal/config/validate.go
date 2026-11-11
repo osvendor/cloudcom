@@ -3,16 +3,16 @@ package config
 import (
 	"fmt"
 	"net/url"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
 	"unicode"
 
 	"github.com/breeze-rmm/agent/internal/hostpolicy"
-	"github.com/breeze-rmm/agent/internal/logging"
 )
 
-var log = logging.L("config")
+var log = newConfigLogger()
 
 var uuidRegex = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 var hexIDRegex = regexp.MustCompile(`^[0-9a-fA-F]{32,128}$`)
@@ -171,12 +171,36 @@ func (c *Config) ValidateTiered() ValidationResult {
 		c.HeartbeatIntervalSeconds = 3600
 	}
 
+	// ws_first_reconnect_window_seconds: 0 is meaningful (the 1-5 s spread of
+	// #9145), so only negatives fall back to the default and only values above
+	// the ceiling are clamped.
+	if c.WsFirstReconnectWindowSeconds < 0 {
+		result.Warnings = append(result.Warnings, fmt.Errorf("ws_first_reconnect_window_seconds %d is negative, using default %d", c.WsFirstReconnectWindowSeconds, DefaultWsFirstReconnectWindowSeconds))
+		c.WsFirstReconnectWindowSeconds = DefaultWsFirstReconnectWindowSeconds
+	} else if c.WsFirstReconnectWindowSeconds > MaxWsFirstReconnectWindowSeconds {
+		result.Warnings = append(result.Warnings, fmt.Errorf("ws_first_reconnect_window_seconds %d exceeds maximum %d, clamped to %d", c.WsFirstReconnectWindowSeconds, MaxWsFirstReconnectWindowSeconds, MaxWsFirstReconnectWindowSeconds))
+		c.WsFirstReconnectWindowSeconds = MaxWsFirstReconnectWindowSeconds
+	}
+
 	if c.MetricsIntervalSeconds < 5 {
 		result.Warnings = append(result.Warnings, fmt.Errorf("metrics_interval_seconds %d is below minimum 5, clamped to 5", c.MetricsIntervalSeconds))
 		c.MetricsIntervalSeconds = 5
 	} else if c.MetricsIntervalSeconds > 3600 {
 		result.Warnings = append(result.Warnings, fmt.Errorf("metrics_interval_seconds %d exceeds maximum 3600, clamped to 3600", c.MetricsIntervalSeconds))
 		c.MetricsIntervalSeconds = 3600
+	}
+
+	// Fatals: hardware.tool_dirs must be absolute local directories without control characters
+	for _, dir := range c.Hardware.ToolDirs {
+		invalid := strings.TrimSpace(dir) == "" || !filepath.IsAbs(dir)
+		for _, r := range dir {
+			if unicode.IsControl(r) {
+				invalid = true
+			}
+		}
+		if invalid {
+			result.Fatals = append(result.Fatals, fmt.Errorf("hardware.tool_dirs requires absolute paths without control characters"))
+		}
 	}
 
 	// Warnings: unknown collectors

@@ -1,8 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import { CONFIG_FEATURE_TYPES } from '@breeze/shared';
+import { CONFIG_FEATURE_TYPES, RETIRED_CONFIG_FEATURE_TYPES } from '@breeze/shared';
 
 import { FEATURE_META, EDITOR_EXCLUDED_FEATURE_TYPES } from './types';
-import { FEATURE_TYPES } from '../ConfigPolicyDetailPage';
+import { FEATURE_TYPES, LEGACY_TAB_ALIASES } from '../ConfigPolicyDetailPage';
 
 // Guards against the cross-package drift in issue #2004: the config-policy
 // editor's feature tabs must stay in lockstep with the canonical
@@ -34,12 +34,20 @@ describe('config-policy editor feature-type parity (#2004)', () => {
     }
   });
 
-  it('excludes nothing — every canonical feature type has an editor tab', () => {
-    // onedrive_helper gained its editor tab in the phase-3 work, emptying the
-    // exclusion list. The mechanism is retained (see types.ts) but currently
-    // exposes the full canonical set; assert that so a stray re-exclusion is
-    // caught here rather than silently hiding a tab.
+  it('exposes every canonical type except the documented exclusions, and no retired type', () => {
+    // Every canonical type has a tab (containment gained ContainmentTab in #10100).
     expect([...EDITOR_EXCLUDED_FEATURE_TYPES]).toEqual([]);
-    expect(Object.keys(FEATURE_META).sort()).toEqual([...CONFIG_FEATURE_TYPES].sort());
+    expect(Object.keys(FEATURE_META).sort()).toEqual(
+      CONFIG_FEATURE_TYPES.filter((t) => !(EDITOR_EXCLUDED_FEATURE_TYPES as readonly string[]).includes(t)).sort(),
+    );
+    for (const retired of RETIRED_CONFIG_FEATURE_TYPES) {
+      expect(FEATURE_META).not.toHaveProperty(retired);
+      expect(FEATURE_TYPES as readonly string[]).not.toContain(retired);
+    }
+  });
+
+  it('aliases exactly the retired hashes to monitors', () => {
+    expect(LEGACY_TAB_ALIASES).toEqual({ alert_rule: 'monitors', monitoring: 'monitors' });
+    expect(Object.keys(LEGACY_TAB_ALIASES).sort()).toEqual([...RETIRED_CONFIG_FEATURE_TYPES].sort());
   });
 });

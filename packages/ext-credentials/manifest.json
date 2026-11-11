@@ -1,0 +1,152 @@
+{
+  "apiVersion": "breeze.extensions/v1",
+  "name": "credentials",
+  "version": "0.3.3",
+  "routeNamespace": "credentials",
+  "requires": {
+    "serverSdk": "^1.0.0",
+    "webSdk": "^1.0.0",
+    "breeze": ">=0.1.0 <0.2.0",
+    "capabilities": [
+      "server.routes.v1",
+      "server.db.rls.v1",
+      "server.audit.v1",
+      "web.pages.v1",
+      "web.navigation.v1"
+    ]
+  },
+  "server": {
+    "entry": "server/index.cjs"
+  },
+  "web": {
+    "entry": "web/index.js",
+    "slots": [],
+    "pages": [
+      {
+        "element": "cloudcom-credentials-page",
+        "path": "/vault",
+        "id": "vault"
+      },
+      {
+        "element": "cloudcom-credential-documents-page",
+        "path": "/documentation",
+        "id": "documentation"
+      },
+      {
+        "element": "cloudcom-browser-companion-page",
+        "path": "/browser-companion",
+        "id": "browser-companion"
+      }
+    ],
+    "navigation": [
+      {
+        "order": 115,
+        "label": "Credentials",
+        "path": "/vault",
+        "id": "vault"
+      },
+      {
+        "order": 116,
+        "label": "Documentation",
+        "path": "/documentation",
+        "id": "documentation"
+      }
+    ]
+  },
+  "migrationsDir": "migrations",
+  "schemaCompatibilityFloor": "0.3.2",
+  "publicRoutes": [],
+  "agentRoutes": false,
+  "jobs": [],
+  "aiTools": [],
+  "tenancy": {
+    "orgExportColumns": {
+      "credentials_documents": {
+        "include": [
+          "id",
+          "org_id",
+          "name",
+          "filename",
+          "mime_type",
+          "source_organization",
+          "source_id",
+          "sha256",
+          "size_bytes",
+          "sheet_count",
+          "created_at"
+        ],
+        "exclude": [
+          "payload_ciphertext"
+        ]
+      },
+      "credentials_records": {
+        "include": [
+          "id",
+          "org_id",
+          "name",
+          "category",
+          "username",
+          "email",
+          "url",
+          "has_password",
+          "has_otp",
+          "archived",
+          "source_organization",
+          "source_id",
+          "created_at",
+          "updated_at"
+        ],
+        "exclude": [
+          "secret_ciphertext"
+        ]
+      },
+      "credentials_companion_script_runs": {
+        "include": [
+          "id",
+          "org_id",
+          "device_id",
+          "actor_id",
+          "request_id",
+          "ticket_id",
+          "script_id",
+          "mode",
+          "status",
+          "created_at",
+          "updated_at",
+          "preview_id",
+          "command_id",
+          "noted"
+        ],
+        "exclude": [
+          "result",
+          "error",
+          "fingerprint"
+        ]
+      }
+    },
+    "nonTenantTables": [],
+    "deviceCascadeDeleteTables": [
+      "credentials_companion_script_runs"
+    ],
+    "orgCascadeDeleteTables": [
+      "credentials_records",
+      "credentials_documents",
+      "credentials_companion_script_runs"
+    ],
+    "orgMergePolicies": {
+      "credentials_documents": {
+        "kind": "leave-for-erasure",
+        "note": "Documentation ciphertext is bound to its original client and record; reassignment requires explicit re-import."
+      },
+      "credentials_records": {
+        "kind": "leave-for-erasure",
+        "note": "Credential ciphertext is bound to its original client and record; reassignment requires explicit re-import."
+      },
+      "credentials_companion_script_runs": {
+        "kind": "leave-for-erasure",
+        "note": "Script run provenance remains bound to its original client."
+      }
+    },
+    "deviceOrgDenormalizedTables": []
+  }
+}

@@ -371,7 +371,7 @@ func TestReplaceBinary(t *testing.T) {
 
 	// Verify executable permission on Unix
 	info, _ := os.Stat(binaryPath)
-	if info.Mode().Perm()&0111 == 0 {
+	if runtime.GOOS != "windows" && info.Mode().Perm()&0111 == 0 {
 		t.Fatal("binary should be executable after replacement")
 	}
 }

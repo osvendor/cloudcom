@@ -98,6 +98,13 @@ vi.mock('./emailDomains/partnerLaneLookup', () => ({
   })),
 }));
 
+// #7507: send re-resolves a draft's tax rate; these suites are not about tax, so
+// the sync is a no-op (no extra db read queued into the mocked chain).
+vi.mock('./quoteService', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./quoteService')>();
+  return { ...actual, syncDraftQuoteTaxRate: vi.fn(async () => false) };
+});
+
 vi.mock('./quoteDeviceSet', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./quoteDeviceSet')>();
   return { ...actual, countQuoteDeviceSetLines: vi.fn() };
@@ -260,6 +267,61 @@ describe('assertQuoteSendGates requires an explicit action', () => {
 });
 
 /**
+ * Empty-quote gate (#9963): a quote with no customer-visible line items must
+ * never be sent — accepting it would convert to a $0 draft invoice. The gate
+ * lives in assertQuoteSendGates so /send, the scheduled-send fire path, the AI
+ * send tool and the on-behalf accept of a draft all refuse it, not only the UI.
+ */
+describe('assertQuoteSendGates empty-quote gate (#9963)', () => {
+  const draft = { id: 'q1', status: 'draft', depositType: 'none', depositPercent: null, taxRate: null, currencyCode: 'USD' } as never;
+  const visible = { quantity: '1', unitPrice: '100.00', taxable: true, customerVisible: true, recurrence: 'one_time', depositEligible: false };
+
+  it('refuses a send with no lines at all (422 QUOTE_EMPTY, actionable copy)', () => {
+    expect(() => assertQuoteSendGates(draft, [], [], [], 'send')).toThrow(
+      expect.objectContaining({ status: 422, code: 'QUOTE_EMPTY', message: 'Add at least one item before sending' }),
+    );
+  });
+
+  it('refuses when every line is internal-only (customerVisible false)', () => {
+    expect(() => assertQuoteSendGates(draft, [], [{ ...visible, customerVisible: false }] as never, [], 'send')).toThrow(
+      expect.objectContaining({ status: 422, code: 'QUOTE_EMPTY' }),
+    );
+  });
+
+  it('names the accept verb on the accept path', () => {
+    expect(() => assertQuoteSendGates(draft, [], [], [], 'accept')).toThrow(
+      expect.objectContaining({ status: 422, code: 'QUOTE_EMPTY', message: 'Add at least one item before accepting' }),
+    );
+  });
+
+  it('passes a quote with one customer-visible line', () => {
+    expect(() => assertQuoteSendGates(draft, [], [visible] as never, [], 'send')).not.toThrow();
+  });
+});
+
+describe('sendQuote empty-quote gate (#9963)', () => {
+  beforeEach(() => { results.length = 0; setCalls.length = 0; vi.clearAllMocks(); });
+
+  it('refuses to send a draft with no lines and claims nothing', async () => {
+    queueResult([{ id: 'q1' }]); // sendQuote: child row lock
+    queueResult([{
+      id: 'q1', orgId: 'org1', partnerId: 'p1', status: 'draft',
+      taxRate: null, depositType: 'none', depositPercent: null,
+    }]);
+    queueResult([]); // blocks
+    queueResult([]); // lines — none
+    queueResult([]); // no staged Pax8 order
+    queueResult([]); // no successor revision
+    queueResult([]); // getQuote: listQuoteOrders — order headers
+    queueResult([]); // getQuote: listQuoteOrders — order lines
+
+    await expect(sendQuote('q1', actor)).rejects.toMatchObject({ status: 422, code: 'QUOTE_EMPTY' });
+    // No draft→sent claim was written.
+    expect(setCalls.some((c) => c.status === 'sent')).toBe(false);
+  });
+});
+
+/**
  * Send-time deposit gate (Task 7): a deposit config can silently become
  * unsatisfiable while drafting (recomputeAndPersist stores NULL deposit_amount
  * in that case, per quoteService). sendQuote is the hard stop that keeps a
@@ -276,7 +338,9 @@ describe('sendQuote deposit validation', () => {
       taxRate: null, depositType: 'percent', depositPercent: '30.00',
     }]);
     queueResult([]); // blocks
-    queueResult([]); // lines — none at all, so dueOnAcceptanceTotal is $0
+    // One RECURRING visible line (the empty-quote gate, #9963, needs an item)
+    // and no one-time lines, so dueOnAcceptanceTotal is $0.
+    queueResult([{ line: { quantity: '1', unitPrice: '100.00', taxable: true, customerVisible: true, recurrence: 'monthly', depositEligible: false }, deviceGroup: null, site: null }]);
     queueResult([]); // no staged Pax8 order
     queueResult([]); // no successor revision
     queueResult([]); // getQuote: listQuoteOrders — order headers
@@ -393,6 +457,7 @@ describe('sendQuote customer-facing PDF', () => {
 
     queueResult([{ id: 'p1', name: 'Acme MSP', billingTermsAndConditions: null, invoiceFooter: null, settings: { language: 'de-DE' } }]); // partnerRow (reused for partner name)
     queueResult([{ name: 'Customer Co', taxId: null, billingContact: { email: 'billing@customer.example' } }]); // org (billing snapshot + recipient)
+    queueResult([]); // freeze: portal_branding footer (#6232)
     queueResult([{ id: 'q1' }]); // update ... returning (claimed)
     queueResult([]); // portalBranding — none configured
     queueResult([{ // final re-select
@@ -458,6 +523,7 @@ describe('sendQuote device-set drift report (#3205 W05)', () => {
     queueResult([descriptorLine]); // quoteDeviceSetEstimate lines
     queueResult([{ id: 'p1', name: 'Acme MSP', billingTermsAndConditions: null, invoiceFooter: null }]);
     queueResult([{ name: 'Customer Co', taxId: null, billingContact: null }]);
+    queueResult([]); // freeze: portal_branding footer (#6232)
     queueResult([{ id: 'q1' }]); // draft -> sent claim
     // The email is deferred post-commit (#3905): sendQuote's only remaining DB
     // call here is the final re-select of the committed row.
@@ -522,9 +588,9 @@ describe('sendQuote email delivery status', () => {
   const lineRow = { quantity: '1', unitPrice: '100.00', taxable: false, customerVisible: true, recurrence: 'one_time', depositEligible: false, lineTotal: '100.00' };
 
   /** getQuote (quote/blocks/lines/pax8/billTo-org) + partnerRow + org + claim. */
-  function queueThroughClaim(org: Record<string, unknown>, partner: Record<string, unknown> = {}) {
+  function queueThroughClaim(org: Record<string, unknown>, partner: Record<string, unknown> = {}, quote: Record<string, unknown> = {}) {
     queueResult([{ id: 'q1' }]); // sendQuote: child row lock
-    queueResult([quoteRow]);
+    queueResult([{ ...quoteRow, ...quote }]);
     queueResult([]); // blocks
     queueResult([{ line: lineRow, deviceGroup: null, site: null }]); // lines
     queueResult([]); // no staged Pax8 order
@@ -534,6 +600,7 @@ describe('sendQuote email delivery status', () => {
     queueResult([org]); // getQuote's draft billTo org lookup
     queueResult([{ id: 'p1', name: 'Acme MSP', billingTermsAndConditions: null, invoiceFooter: null, ...partner }]);
     queueResult([org]); // org (billing snapshot + recipient)
+    queueResult([]); // freeze: portal_branding footer (#6232)
     queueResult([{ id: 'q1' }]); // update ... returning (claimed)
   }
 
@@ -664,7 +731,7 @@ describe('sendQuote email delivery status', () => {
     await (await sendQuote('q1', actor)).deliverEmail();
 
     // The From itself is now decided inside EmailService and pinned by
-    // email.golden.test.ts ('"Acme MSP via Breeze" <EMAIL_FROM address>' for
+    // email.golden.test.ts ('"Acme MSP" <EMAIL_FROM address>' for
     // quote.sent). What THIS site is responsible for is naming the purpose and
     // handing over the partner it already read.
     expect(sendEmailMock).toHaveBeenCalledWith(expect.objectContaining({
@@ -769,6 +836,25 @@ describe('sendQuote email delivery status', () => {
     const sent = sendEmailMock.mock.calls[0]![0] as { subject: string; html: string };
     expect(sent.subject).toBe('Your workstation refresh');
     expect(sent.html).toContain('Todd @ Acme MSP');
+  });
+
+  it('addresses the email with the quote title and the send-frozen bill-to name', async () => {
+    // billToName is NULL on the draft row: the customer name only exists on the
+    // frozen snapshot, so this proves the email reads frozen values, not the draft.
+    queueThroughClaim(
+      { name: 'Customer Co', taxId: null, billingContact: { email: 'billing@customer.example' } },
+      {},
+      { title: 'Office Network Refresh' },
+    );
+    queueResult([{ id: 'q1', orgId: 'org1', partnerId: 'p1', status: 'sent' }]);
+    queueResult([]); // portalBranding
+
+    await (await sendQuote('q1', actor)).deliverEmail();
+
+    const sent = sendEmailMock.mock.calls[0]![0] as { subject: string; html: string; text: string };
+    expect(sent.subject).toBe('Office Network Refresh — proposal from Acme MSP');
+    expect(sent.html).toContain('work with Customer Co.');
+    expect(sent.text).toContain('Office Network Refresh (proposal Q-2026-0001)');
   });
 
   it('omits reply-to when the partner has no billing email', async () => {
@@ -931,6 +1017,7 @@ describe('sendQuote bill-to snapshot', () => {
     queueResult([org]);    // getQuote's own draft billTo org lookup (status is 'draft' for every quote sent through this helper)
     queueResult([{ id: 'p1', name: 'Acme MSP', billingTermsAndConditions: null, invoiceFooter: null }]); // partnerRow (reused for partner name)
     queueResult([org]);    // org (billing snapshot + recipient)
+    queueResult([]); // freeze: portal_branding footer (#6232)
     queueResult([{ id: 'q1' }]); // update ... returning (claimed)
     queueResult([]);       // portalBranding
     queueResult([{ id: 'q1', orgId: 'org1', partnerId: 'p1', status: 'sent' }]); // final re-select
@@ -1075,6 +1162,7 @@ describe('sendQuote presentation snapshot', () => {
     queueResult([{ name: 'Customer Co', taxId: null, billingAddressLine1: null, billingAddressLine2: null, billingAddressCity: null, billingAddressRegion: null, billingAddressPostalCode: null, billingAddressCountry: null }]); // getQuote's own draft billTo org lookup
     queueResult([partnerRow]); // partnerRow
     queueResult([{ name: 'Customer Co', taxId: null, billingContact: { email: 'billing@customer.example' } }]); // org (billing snapshot + recipient)
+    queueResult([]); // freeze: portal_branding footer (#6232)
     queueResult([{ id: 'q1' }]); // update ... returning (claimed)
     queueResult([]);       // portalBranding
     queueResult([{ id: 'q1', orgId: 'org1', partnerId: 'p1', status: 'sent' }]); // final re-select
@@ -1137,6 +1225,113 @@ describe('sendQuote presentation snapshot', () => {
 });
 
 /**
+ * #6232 — the send-time `terms` stamp must use the SAME three-level footer chain
+ * (quote.terms → portal_branding.footerText → partners.invoiceFooter, #7510) as every
+ * render path (resolveDocumentFooter). A two-level stamp left a sent quote with
+ * no partner footer following later portal-footer edits instead of freezing.
+ */
+describe('sendQuote footer stamp (#6232)', () => {
+  beforeEach(() => {
+    results.length = 0;
+    setCalls.length = 0;
+    vi.clearAllMocks();
+    capturedPdfArgs = null;
+    sendEmailMock.mockResolvedValue(undefined);
+  });
+
+  function queueSendPath(
+    quote: Record<string, unknown>,
+    partnerRow: Record<string, unknown>,
+    portalFooter: string | null,
+  ) {
+    queueResult([{ id: 'q1' }]); // sendQuote: child row lock
+    queueResult([quote]); // getQuote: quote
+    queueResult([]);       // getQuote: blocks
+    queueResult([{ line: { quantity: '1', unitPrice: '100.00', taxable: false, customerVisible: true, recurrence: 'one_time', depositEligible: false, lineTotal: '100.00' }, deviceGroup: null, site: null }]); // getQuote: lines
+    queueResult([]);       // getQuote: no staged Pax8 order
+    queueResult([]);       // getQuote: no successor revision
+    queueResult([]); // getQuote: listQuoteOrders — order headers
+    queueResult([]); // getQuote: listQuoteOrders — order lines
+    queueResult([{ name: 'Customer Co', taxId: null, billingAddressLine1: null, billingAddressLine2: null, billingAddressCity: null, billingAddressRegion: null, billingAddressPostalCode: null, billingAddressCountry: null }]); // getQuote's own draft billTo org lookup
+    queueResult([partnerRow]); // freeze: partnerRow
+    queueResult([{ name: 'Customer Co', taxId: null, billingContact: { email: 'billing@customer.example' } }]); // freeze: org
+    queueResult([{ footerText: portalFooter }]); // freeze: portal_branding footer
+    queueResult([{ id: 'q1' }]); // claim update ... returning
+    queueResult([{ id: 'q1', orgId: 'org1', partnerId: 'p1', status: 'sent' }]); // final re-select
+    queueResult([{ logoUrl: null, primaryColor: null, footerText: portalFooter }]); // deferred email: portalBranding
+  }
+
+  const baseQuote = {
+    id: 'q1', orgId: 'org1', partnerId: 'p1', status: 'draft',
+    taxRate: null, depositType: 'none', depositPercent: null,
+    quoteNumber: 'Q-2026-0001', issueDate: '2026-01-01', expiryDate: null,
+    total: '100.00', currencyCode: 'USD', terms: null, termsAndConditions: null,
+    sellerSnapshot: null, billToName: null, billToTaxId: null,
+    presentationSnapshot: null, documentLocale: null,
+  };
+  const partner = (invoiceFooter: string | null) => ({
+    id: 'p1', name: 'Acme MSP', billingTermsAndConditions: null, invoiceFooter,
+  });
+
+  function claimSet() {
+    const found = setCalls.find((s) => s.status === 'sent' && 'presentationSnapshot' in s);
+    expect(found, 'send update should be the draft→sent claim').toBeDefined();
+    return found!;
+  }
+
+  it('freezes the portal-branding footer when neither the quote nor the partner sets one', async () => {
+    queueSendPath(baseQuote, partner(null), 'Portal footer');
+    await sendQuote('q1', actor);
+    expect(claimSet().terms).toBe('Portal footer');
+  });
+
+  it('prefers the org (portal-branding) footer over the partner default (#7510)', async () => {
+    queueSendPath(baseQuote, partner('Partner footer'), 'Portal footer');
+    await sendQuote('q1', actor);
+    expect(claimSet().terms).toBe('Portal footer');
+  });
+
+  it('freezes the partner footer when the org sets none', async () => {
+    queueSendPath(baseQuote, partner('Partner footer'), null);
+    await sendQuote('q1', actor);
+    expect(claimSet().terms).toBe('Partner footer');
+  });
+
+  it("keeps the quote's own footer line over both inherited levels", async () => {
+    queueSendPath({ ...baseQuote, terms: 'Quote footer' }, partner('Partner footer'), 'Portal footer');
+    await sendQuote('q1', actor);
+    expect(claimSet().terms).toBe('Quote footer');
+  });
+
+  it("stamps the explicit empty marker '' (not NULL) when all three levels are empty (#7216)", async () => {
+    // NULL means "not frozen — resolve live", so a NULL stamp let a footer
+    // added after send appear on the already-sent quote. '' is frozen "none".
+    queueSendPath(baseQuote, partner(null), null);
+    await sendQuote('q1', actor);
+    expect(claimSet().terms).toBe('');
+  });
+
+  it("the emailed PDF of a quote sent with no footer carries the frozen '' (#7216)", async () => {
+    queueSendPath(baseQuote, partner(null), null);
+    await (await sendQuote('q1', actor)).deliverEmail();
+    expect(capturedPdfArgs).not.toBeNull();
+    expect((capturedPdfArgs![0] as Record<string, unknown>).terms).toBe('');
+    expect((capturedPdfArgs![4] as Record<string, unknown>).footer).toBe('');
+  });
+
+  it('renders the send-time emailed PDF with the frozen footer, not a two-level live chain', async () => {
+    queueSendPath(baseQuote, partner('Partner footer'), null);
+    await (await sendQuote('q1', actor)).deliverEmail();
+    expect(capturedPdfArgs).not.toBeNull();
+    // renderQuotePdf(quote, blocks, lines, loadImage, branding, ...) — the
+    // emailed attachment must carry the same stamped footer every later render
+    // (admin PDF, portal PDF) reads off the sent quote.
+    expect((capturedPdfArgs![0] as Record<string, unknown>).terms).toBe('Partner footer');
+    expect((capturedPdfArgs![4] as Record<string, unknown>).footer).toBe('Partner footer');
+  });
+});
+
+/**
  * Multi-currency wave 5 (#3777): sendQuote stamps `document_locale` once, at the
  * draft→sent claim, from the partner's language unless the draft already
  * carries one. resendQuote never writes the column (asserted in its own suite).
@@ -1162,6 +1357,7 @@ describe('sendQuote document_locale stamp', () => {
     queueResult([{ name: 'Customer Co', taxId: null, billingAddressLine1: null, billingAddressLine2: null, billingAddressCity: null, billingAddressRegion: null, billingAddressPostalCode: null, billingAddressCountry: null }]); // getQuote's own draft billTo org lookup
     queueResult([partnerRow]); // partnerRow
     queueResult([{ name: 'Customer Co', taxId: null, billingContact: { email: 'billing@customer.example' } }]); // org (billing snapshot + recipient)
+    queueResult([]); // freeze: portal_branding footer (#6232)
     queueResult([{ id: 'q1' }]); // update ... returning (claimed)
     queueResult([]);       // portalBranding
     queueResult([{ id: 'q1', orgId: 'org1', partnerId: 'p1', status: 'sent' }]); // final re-select
@@ -1202,6 +1398,15 @@ describe('sendQuote document_locale stamp', () => {
     // frozenQuote carries the stamp so the same-request PDF renders with it.
     expect(capturedPdfArgs).not.toBeNull();
     expect((capturedPdfArgs![0] as Record<string, unknown>).documentLocale).toBe('pt-BR');
+  });
+
+  it("brands the emailed PDF with the partner's Settings → Branding logo and colours when the org has no portal branding", async () => {
+    const logo = 'data:image/png;base64,iVBORw0KGgo=';
+    queueSendPath(baseQuote, { id: 'p1', name: 'Acme MSP', billingTermsAndConditions: null, invoiceFooter: null, settings: { branding: { logoUrl: logo, primaryColor: '#00bfa6', secondaryColor: '#0b1b2d' } } });
+    await (await sendQuote('q1', actor)).deliverEmail();
+    expect(capturedPdfArgs).not.toBeNull();
+    // renderQuotePdf(quote, blocks, lines, loadImage, branding, ...) — branding is arg index 4.
+    expect(capturedPdfArgs![4]).toMatchObject({ logoUrl: logo, primaryColor: '#00bfa6', secondaryColor: '#0b1b2d' });
   });
 
   it('threads the freshly stamped locale into the same-request PDF render (frozenQuote)', async () => {
@@ -1282,11 +1487,15 @@ describe('sendQuote contract-variable gate', () => {
     billingAddressPostalCode: '89501', billingAddressCountry: 'US',
   };
 
+  // The empty-quote gate (#9963) runs before the contract-variable gate, so the
+  // variable-gate cases carry one customer-visible item.
+  const visibleLineRow = { line: { quantity: '1', unitPrice: '100.00', taxable: false, customerVisible: true, recurrence: 'one_time', depositEligible: false, lineTotal: '100.00' }, deviceGroup: null, site: null };
+
   it('blocks send with the unresolved (manual) variable name when a contract block variable is unfilled', async () => {
     queueResult([{ id: 'q1' }]);             // sendQuote: child row lock
     queueResult([baseQuote]);              // getQuote: quote
     queueResult([contractBlock({})]);       // getQuote: blocks — governing_state left blank
-    queueResult([]);                        // getQuote: lines
+    queueResult([visibleLineRow]);          // getQuote: lines — one item, so the empty-quote gate passes
     queueResult([]);                        // getQuote: no staged Pax8 order
     queueResult([]);                        // getQuote: no successor revision
     queueResult([]); // getQuote: listQuoteOrders — order headers
@@ -1308,7 +1517,7 @@ describe('sendQuote contract-variable gate', () => {
     queueResult([{ id: 'q1' }]); // sendQuote: child row lock
     queueResult([baseQuote]);
     queueResult([contractBlock({})]);
-    queueResult([]);
+    queueResult([visibleLineRow]);
     queueResult([]); // getQuote: no staged Pax8 order
     queueResult([]); // getQuote: no successor revision
     queueResult([]); // getQuote: listQuoteOrders — order headers
@@ -1337,6 +1546,7 @@ describe('sendQuote contract-variable gate', () => {
     queueResult([templateRow]);             // loadContractBlockRenderData: template select
     queueResult([{ id: 'p1', name: 'Acme MSP', billingTermsAndConditions: null, invoiceFooter: null }]); // partnerRow
     queueResult([org]);                     // org (billing snapshot + recipient)
+    queueResult([]); // freeze: portal_branding footer (#6232)
     queueResult([{ id: 'q1' }]);            // update ... returning (claimed)
     // #3905 — the final re-select now runs INSIDE the send transaction, before
     // the deferred delivery's own reads.
@@ -1384,6 +1594,7 @@ describe('sendQuote contract-variable gate', () => {
     queueResult([templateRow]);              // send gate: template
     queueResult([{ id: 'p1', name: 'Acme MSP', billingTermsAndConditions: null, invoiceFooter: null }]); // partnerRow
     queueResult([org]);                      // org (billing snapshot + recipient)
+    queueResult([]); // freeze: portal_branding footer (#6232)
     queueResult([{ id: 'q1' }]);             // update ... returning (claimed)
     // #3905 — the final re-select now runs INSIDE the send transaction, before
     // the deferred delivery's own reads.

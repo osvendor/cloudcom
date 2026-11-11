@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { policyAwareMonitorEventLogWarnings } from '../services/monitorEventLogWarnings';
 import { monitorConversionRoutes } from './monitorDefinitions.conversion';
 import { z } from 'zod';
 import { and, eq, inArray, sql } from 'drizzle-orm';
@@ -31,9 +32,16 @@ import {
 import { buildCompiledCondition } from '../services/monitors/monitorCompiler';
 import { MONITOR_KIND_SPECS } from '../services/monitors/kinds';
 import { resolveMonitorsForDevice } from '../services/monitors/monitorResolver';
+import {
+  monitorsLinkSettings,
+  readMonitorsLink,
+  shouldRemoveEmptiedLink,
+} from '../services/monitors/monitorAttachments';
 import { isMonitorAttachableToPolicy } from '../services/monitors/monitorAttachability';
 import { canManagePartnerWidePolicies, PARTNER_WIDE_WRITE_DENIED_MESSAGE } from '../services/partnerWideAccess';
+import { canMutateOrgWideGovernance, SITE_CEILING_WRITE_DENIED_MESSAGE } from '../services/siteCeilingAccess';
 import { convertRuleToMonitor } from '../services/monitors/ruleConversionService';
+import { conversionErrorResponse } from './monitorConversionErrors';
 import {
   listMonitorDeviceActivity,
   listMonitorEpisodes,
@@ -151,6 +159,18 @@ monitorDefinitionRoutes.get('/kinds', requireScope('organization', 'partner', 's
   }),
 );
 
+/**
+ * Advisory save-time warnings (#8174): an event_log rule on Information- or
+ * Warning-level Application events from a provider the agent does not collect
+ * at those levels can never fully match. Computed from the saved row so a
+ * partial PATCH (no kind/condition in the body) is still checked. Omitted when
+ * empty so the response shape is unchanged for every other monitor.
+ */
+async function collectionWarnings(row: { kind: unknown; condition: unknown; autoResolveConditions?: unknown; orgId: string | null; partnerId: string | null }): Promise<{ warnings?: string[] }> {
+  const warnings = await policyAwareMonitorEventLogWarnings(row);
+  return warnings.length > 0 ? { warnings } : {};
+}
+
 // POST /monitors
 monitorDefinitionRoutes.post(
   '/',
@@ -160,6 +180,13 @@ monitorDefinitionRoutes.post(
   zValidator('json', createMonitorDefinitionSchema),
   async (c) => {
     const auth = c.get('auth');
+    // A monitor's responses compile verbatim into a managed automation that
+    // runs as SYSTEM on every device an attaching org-wide policy reaches —
+    // the same governance capability as every other org-wide config object,
+    // even though monitorService itself carries no site axis to narrow it.
+    if (!canMutateOrgWideGovernance(auth)) {
+      return c.json({ error: SITE_CEILING_WRITE_DENIED_MESSAGE }, 403);
+    }
     // The web client carries the selected org as an ambient `?orgId=` query,
     // not in the body. Partner tokens have auth.orgId === null, so without
     // this fallback every "This organization only" create 403s (cf. #808).
@@ -179,7 +206,7 @@ monitorDefinitionRoutes.post(
         resourceName: created.name,
         details: { kind: created.kind, partnerWide: created.orgId === null },
       });
-      return c.json({ data: created }, 201);
+      return c.json({ data: created, ...await collectionWarnings(created) }, 201);
     } catch (error) {
       const mapped = errorResponse(error);
       if (mapped) return c.json(mapped.body, mapped.status);
@@ -216,10 +243,19 @@ monitorDefinitionRoutes.get('/:id', requireScope('organization', 'partner', 'sys
     )
     .where(eq(configPolicyMonitors.monitorId, monitor.id));
 
+  // Same display-safe projection as the response/action fields on `monitor`
+  // itself: a policy-attachment override can carry the same MSP-authored
+  // action payload, so an org-scope caller viewing a partner-wide monitor
+  // gets the attachment's shape without its contents.
+  const visibleAttachments =
+    monitor.orgId === null && auth.scope === 'organization'
+      ? attachments.map((a) => ({ ...a, overrides: {} }))
+      : attachments;
+
   return c.json({
     data: {
       ...monitor,
-      attachments,
+      attachments: visibleAttachments,
       compiled: {
         alertTemplateId: monitor.compiledAlertTemplateId,
         alertRuleId: monitor.compiledAlertRuleId,
@@ -238,6 +274,9 @@ monitorDefinitionRoutes.patch(
   zValidator('json', updateMonitorDefinitionSchema),
   async (c) => {
     const auth = c.get('auth');
+    if (!canMutateOrgWideGovernance(auth)) {
+      return c.json({ error: SITE_CEILING_WRITE_DENIED_MESSAGE }, 403);
+    }
     try {
       const updated = await updateMonitorDefinition(c.req.param('id')!, c.req.valid('json'), auth);
       writeRouteAudit(c, {
@@ -247,7 +286,7 @@ monitorDefinitionRoutes.patch(
         resourceId: updated.id,
         resourceName: updated.name,
       });
-      return c.json({ data: updated });
+      return c.json({ data: updated, ...await collectionWarnings(updated) });
     } catch (error) {
       const mapped = errorResponse(error);
       if (mapped) return c.json(mapped.body, mapped.status);
@@ -264,6 +303,9 @@ monitorDefinitionRoutes.delete(
   requireMfa(),
   async (c) => {
     const auth = c.get('auth');
+    if (!canMutateOrgWideGovernance(auth)) {
+      return c.json({ error: SITE_CEILING_WRITE_DENIED_MESSAGE }, 403);
+    }
     const id = c.req.param('id')!;
     try {
       const existing = await getMonitorDefinition(id, auth);
@@ -301,53 +343,6 @@ const attachSchema = z.union([
   }),
 ]);
 
-interface AttachmentItem {
-  monitorId: string;
-  enabled: boolean;
-  overrides: Record<string, unknown> | null;
-  sortOrder: number;
-}
-
-/**
- * Current attachment items for a policy, read from the NORMALIZED rows rather
- * than the link's inline settings — the child table is what the resolver and
- * the compatibility trigger see, so it is the only honest source.
- */
-async function currentItems(configPolicyId: string): Promise<{ linkId: string | null; items: AttachmentItem[] }> {
-  const [link] = await db
-    .select({ id: configPolicyFeatureLinks.id })
-    .from(configPolicyFeatureLinks)
-    .where(
-      and(
-        eq(configPolicyFeatureLinks.configPolicyId, configPolicyId),
-        eq(configPolicyFeatureLinks.featureType, 'monitors'),
-      ),
-    )
-    .limit(1);
-  if (!link) return { linkId: null, items: [] };
-
-  const rows = await db
-    .select({
-      monitorId: configPolicyMonitors.monitorId,
-      enabled: configPolicyMonitors.enabled,
-      overrides: configPolicyMonitors.overrides,
-      sortOrder: configPolicyMonitors.sortOrder,
-    })
-    .from(configPolicyMonitors)
-    .where(eq(configPolicyMonitors.featureLinkId, link.id))
-    .orderBy(configPolicyMonitors.sortOrder);
-
-  return {
-    linkId: link.id,
-    items: rows.map((r) => ({
-      monitorId: r.monitorId,
-      enabled: r.enabled,
-      overrides: (r.overrides as Record<string, unknown> | null) ?? null,
-      sortOrder: r.sortOrder,
-    })),
-  };
-}
-
 // POST /monitors/:id/attachments
 monitorDefinitionRoutes.post(
   '/:id/attachments',
@@ -357,6 +352,13 @@ monitorDefinitionRoutes.post(
   zValidator('json', attachSchema),
   async (c) => {
     const auth = c.get('auth');
+    // Attaching (including the createPolicyFor branch, which additionally
+    // gets its own site-scoped refusal below) changes what every device the
+    // policy reaches runs — same capability as every other org-wide
+    // governance write, so it takes the same check.
+    if (!canMutateOrgWideGovernance(auth)) {
+      return c.json({ error: SITE_CEILING_WRITE_DENIED_MESSAGE }, 403);
+    }
     const monitor = await getMonitorDefinition(c.req.param('id')!, auth);
     if (!monitor) return c.json({ error: 'Monitor not found' }, 404);
     const body = c.req.valid('json');
@@ -432,7 +434,7 @@ monitorDefinitionRoutes.post(
       configPolicyId = created.id;
     }
 
-    const { linkId, items } = await currentItems(configPolicyId);
+    const { linkId, items, inheritance } = await readMonitorsLink(configPolicyId);
     if (items.some((i) => i.monitorId === monitor.id)) {
       return c.json({ error: 'Monitor already attached to this policy' }, 409);
     }
@@ -464,7 +466,7 @@ monitorDefinitionRoutes.post(
 
     try {
       if (linkId) {
-        await updateFeatureLink(linkId, { inlineSettings: { items: nextItems } }, configPolicyId);
+        await updateFeatureLink(linkId, { inlineSettings: monitorsLinkSettings(nextItems, inheritance) }, configPolicyId);
       } else {
         await addFeatureLink(configPolicyId, 'monitors', null, { items: nextItems });
       }
@@ -499,6 +501,9 @@ monitorDefinitionRoutes.delete(
   requireMfa(),
   async (c) => {
     const auth = c.get('auth');
+    if (!canMutateOrgWideGovernance(auth)) {
+      return c.json({ error: SITE_CEILING_WRITE_DENIED_MESSAGE }, 403);
+    }
     const monitor = await getMonitorDefinition(c.req.param('id')!, auth);
     if (!monitor) return c.json({ error: 'Monitor not found' }, 404);
 
@@ -530,16 +535,14 @@ monitorDefinitionRoutes.delete(
       return c.json({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE }, 403);
     }
 
-    const { items } = await currentItems(attachment.configPolicyId);
+    const { items, inheritance } = await readMonitorsLink(attachment.configPolicyId);
     const nextItems = items.filter((i) => i.monitorId !== monitor.id);
-    if (nextItems.length === 0) {
-      // An empty monitors link would keep claiming the feature for this policy
-      // (and shadow a parent policy's monitors link), so remove it outright.
+    if (shouldRemoveEmptiedLink(nextItems, inheritance)) {
       await removeFeatureLink(attachment.featureLinkId, attachment.configPolicyId);
     } else {
       await updateFeatureLink(
         attachment.featureLinkId,
-        { inlineSettings: { items: nextItems } },
+        { inlineSettings: monitorsLinkSettings(nextItems, inheritance) },
         attachment.configPolicyId,
       );
     }
@@ -808,8 +811,15 @@ monitorDefinitionRoutes.post(
             return c.json({ error: 'RULE_ALREADY_MANAGED' }, 409);
           case 'not_convertible':
             return c.json({ error: 'RULE_NOT_CONVERTIBLE' }, 409);
+          case 'system_managed':
+            return c.json({
+              error: 'System-managed rule — it keeps alerting on its own and needs no conversion',
+              code: 'RULE_SYSTEM_MANAGED',
+            }, 409);
           case 'partner_wide_denied':
             return c.json({ error: result.failure.message }, 403);
+          case 'governance_denied':
+            return c.json({ error: SITE_CEILING_WRITE_DENIED_MESSAGE }, 403);
         }
       }
 
@@ -825,7 +835,10 @@ monitorDefinitionRoutes.post(
 
       return c.json({ data: { monitorId, configPolicyId } }, 201);
     } catch (error) {
-      const mapped = errorResponse(error);
+      // The group converter re-checks access, hashes and state under its own
+      // row locks and refuses with a ConversionError (e.g. a concurrent
+      // convert of the same group → preview_stale / already_converted).
+      const mapped = errorResponse(error) ?? conversionErrorResponse(error);
       if (mapped) return c.json(mapped.body, mapped.status);
       throw error;
     }

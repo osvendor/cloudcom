@@ -17,10 +17,15 @@ import {
 } from './aiGuardrails';
 
 describe('system_cleanup guardrails', () => {
-  it('escalates run — and only run — to Tier 3', () => {
-    expect(TIER3_ACTIONS.system_cleanup).toEqual(['run']);
+  it('escalates run and cancel — and only those — to Tier 3', () => {
+    expect(TIER3_ACTIONS.system_cleanup).toEqual(['run', 'cancel']);
     expect(checkGuardrails('system_cleanup', { action: 'run' }).tier).toBe(3);
-    expect(checkGuardrails('system_cleanup', { action: 'list' }).tier).toBe(1);
+    // #10161: cancel mirrors POST …/run/:cleanupRunId/cancel, a requireMfa() route that mutates — the MFA-route
+    // invariant (TOOL_EXTRA_PERMISSIONS note) puts it at Tier 3.
+    expect(checkGuardrails('system_cleanup', { action: 'cancel' })).toMatchObject({ tier: 3, requiresApproval: true });
+    // list asks the device for its catalog: a live read, Tier 2 read-only
+    // (no prompt, audit row). status reads the stored run: Tier 1.
+    expect(checkGuardrails('system_cleanup', { action: 'list' })).toMatchObject({ tier: 2, readOnly: true, requiresApproval: false });
     expect(checkGuardrails('system_cleanup', { action: 'status' }).tier).toBe(1);
     expect(checkGuardrails('system_cleanup', { action: 'status' }).requiresApproval).toBe(false);
   });
@@ -31,15 +36,17 @@ describe('system_cleanup guardrails', () => {
     // state-destroying. The contract test in
     // aiGuardrails.approvalScope.contract.test.ts fails if the pair is in
     // NEITHER table or in BOTH.
-    expect(TIER3_SUPERVISED_ACTIONS.system_cleanup).toEqual(['run']);
+    expect(TIER3_SUPERVISED_ACTIONS.system_cleanup).toEqual(['run', 'cancel']);
     expect(TIER3_FOUR_EYES_ACTIONS.system_cleanup).toBeUndefined();
     expect(checkGuardrails('system_cleanup', { action: 'run' }).approvalScope).toBe('supervised');
+    expect(checkGuardrails('system_cleanup', { action: 'cancel' }).approvalScope).toBe('supervised');
   });
 
-  it('maps RBAC per action: list and status read devices, run executes on them', () => {
+  it('maps RBAC per action: status reads the stored run, list, run and cancel need devices:execute', () => {
     expect(TOOL_PERMISSIONS.system_cleanup).toEqual({
-      list: { resource: 'devices', action: 'read' },
+      list: { resource: 'devices', action: 'execute' },
       run: { resource: 'devices', action: 'execute' },
+      cancel: { resource: 'devices', action: 'execute' },
       status: { resource: 'devices', action: 'read' },
     });
   });

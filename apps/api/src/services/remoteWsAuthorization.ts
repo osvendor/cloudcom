@@ -13,6 +13,7 @@ import {
   users,
 } from '../db/schema';
 import { checkRemoteAccess } from './remoteAccessPolicy';
+import { checkVncConsentGate } from '../routes/remote/vncConsentGate';
 import { partnerTrustMode } from '../config/partnerTrustMode';
 import { evaluateCapabilityContinuationForState } from './partnerTrust';
 import {
@@ -20,6 +21,7 @@ import {
   type ConsumeWsTicketResult,
 } from './remoteSessionAuth';
 import { getRedis } from './redis';
+import { isTimestampRevoked } from './tokenRevocation';
 import { rateLimiter } from './rate-limit';
 import {
   PERMISSIONS,
@@ -30,6 +32,7 @@ import type {
   RemoteWsKind,
 } from './remoteWsOwnership';
 import { tightenStatementTimeout } from '../db/lockTimeout';
+import { isViewerFailureDiagnosticRow } from './viewerFailureDiagnostics';
 
 const ACTIVE_SESSION_STATES = ['pending', 'connecting', 'active'];
 const REMOTE_WS_RATE_LIMIT = 10;
@@ -98,7 +101,10 @@ export type RemoteWsAuthorizationResult =
         | 'policy_denied'
         | 'partner_trust_denied'
         | 'rate_limited'
-        | 'authorization_unavailable';
+        | 'authorization_unavailable'
+        | 'credential_revoked'
+        | 'consent_required'
+        | 'prompt_policy_unavailable';
     };
 
 export type RemoteWsLiveAuthorizationResult =
@@ -265,13 +271,42 @@ async function resolveRemoteWsLiveAuthority(
     const expectedDatabaseType = consumed.sessionType === 'tunnel' ? null : consumed.sessionType;
     if (expectedDatabaseType !== null && joined.session.type !== expectedDatabaseType) return { denied: 'session_missing' as const };
     if (joined.session.userId !== user.id) return { denied: 'session_not_owned' as const };
+
+    // A password reset/change, MFA factor change, suspend, role change or
+    // membership removal all set this blanket Redis marker as part of their
+    // credential-revocation cleanup (services/tokenRevocation.ts
+    // revokeAllUserTokens, called from runPostCommitCleanup). This viewer-WS
+    // authority path is deliberately independent of the user-JWT bearer (it
+    // is re-derived per ticket/connect-code/continuation-mint call, never
+    // through authMiddleware), so it must consult the same revocation signal
+    // explicitly rather than relying on a JWT epoch claim that never reaches
+    // it. Closes the residual window between a credential change committing
+    // and a live/pending session finishing teardown, and independently
+    // covers any future revocation path that only ever sets this marker.
+    //
+    // The session row's own `createdAt` is passed as the issued-at bound —
+    // the same idea isUserTokenRevoked's other call sites use with a JWT
+    // `iat` (authMiddleware). Without it, the blanket marker denies EVERY
+    // check for this user for its full TTL (15 minutes), including a
+    // brand-new legitimate session created after the revocation event; with
+    // it, only sessions that predate the revocation are denied.
+    //
+    // `createdAt` is millisecond precision, unlike a JWT `iat`, so this uses
+    // isTimestampRevoked rather than isUserTokenRevoked directly: it applies
+    // the same cutoff comparison without importing the 1-second same-second
+    // grace that JWT `iat` needs, so a session created in the same UTC
+    // second as the revocation — even strictly before it — is denied rather
+    // than misread as "created after."
+    if (await isTimestampRevoked(user.id, joined.session.createdAt.getTime())) {
+      return { denied: 'credential_revoked' as const };
+    }
+
     // Preserve the viewer's read-only failure status exception. All lifecycle,
     // membership/site, role and policy checks below still apply; callers that
     // can mint credentials, signal or relay always use the default live mode.
     const readingFailure = accessMode === 'failure-diagnostics' &&
       consumed.sessionType === 'desktop' &&
-      (joined.session.status === 'failed' ||
-        (joined.session.status === 'disconnected' && !!joined.session.errorMessage));
+      isViewerFailureDiagnosticRow(joined.session.status, joined.session.errorMessage);
     if (!ACTIVE_SESSION_STATES.includes(joined.session.status) && !readingFailure) return { denied: 'session_inactive' as const };
     if (joined.device.status !== 'online' && !readingFailure) return { denied: 'device_offline' as const };
 
@@ -348,6 +383,21 @@ async function resolveRemoteWsLiveAuthority(
       : await checkRemoteAccess(joined.device.id, capability);
     if (!policy.allowed) return { denied: 'policy_denied' as const };
 
+    // VNC has no end-user consent prompt, so a VNC tunnel is refused on a
+    // device whose prompt mode is `consent`. Checked here, in the same system
+    // transaction, so admission, every ticket/code mint and each live
+    // revalidation of an open relay see a switch to consent.
+    if (consumed.sessionType === 'tunnel' && joined.session.type === 'vnc') {
+      const consentGate = await checkVncConsentGate(joined.device.id);
+      if (!consentGate.ok) {
+        return {
+          denied: consentGate.status === 409
+            ? 'consent_required' as const
+            : 'prompt_policy_unavailable' as const,
+        };
+      }
+    }
+
     // Desktop/terminal continuation re-proves partner trust. Tunnel lifecycle
     // is a separate transport boundary and remains with its existing route
     // admission gates until its own live-continuation work is adopted.
@@ -380,7 +430,7 @@ export async function authorizeLiveRemoteSessionAccess(
     );
     if ('denied' in live && live.denied !== undefined) {
       const status = live.denied === 'session_missing' ? 404
-        : live.denied === 'device_offline' ? 503 : 403;
+        : live.denied === 'device_offline' || live.denied === 'prompt_policy_unavailable' ? 503 : 403;
       return { ok: false, status, reason: live.denied };
     }
     return { ok: true, user: live.user, session: live.session, device: live.device };
@@ -400,7 +450,8 @@ export async function revalidateRemoteWsAuthority(
       statementTimeoutMs,
     );
     if ('denied' in live && live.denied !== undefined) {
-      const status = live.denied === 'session_missing' ? 404 : live.denied === 'device_offline' ? 503 : 403;
+      const status = live.denied === 'session_missing' ? 404
+        : live.denied === 'device_offline' || live.denied === 'prompt_policy_unavailable' ? 503 : 403;
       return { ok: false, status, reason: live.denied };
     }
     return { ok: true };
@@ -430,7 +481,7 @@ export async function authorizeRemoteSessionContinuation(
     if ('denied' in live && live.denied !== undefined) {
       const status = live.denied === 'session_missing'
         ? 404
-        : live.denied === 'device_offline'
+        : live.denied === 'device_offline' || live.denied === 'prompt_policy_unavailable'
           ? 503
           : 403;
       return { ok: false, status, reason: live.denied };

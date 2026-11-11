@@ -14,7 +14,9 @@ import {
   decryptCommandsForDelivery,
   hasSensitivePayload,
   TERMINAL_PAYLOAD_STRIP_KEYS,
+  TYPE_SCOPED_TERMINAL_STRIP_KEYS,
   terminalPayloadErasureSet,
+  sealStorageCredentialsForPersistence,
 } from './sensitiveCommandPayload';
 
 const DEVICE = '99999999-9999-4999-8999-999999999999';
@@ -119,6 +121,59 @@ describe('terminal payload erasure', () => {
   });
 });
 
+describe('type-scoped terminal payload erasure (#8741 notify_user)', () => {
+  it('declares title/body as notify_user-only strip keys and keeps them out of the global set', () => {
+    expect(TYPE_SCOPED_TERMINAL_STRIP_KEYS).toMatchObject({ notify_user: ['title', 'body'] });
+    // Global: stripping title/body from every other command type would destroy
+    // forensics (e.g. script titles). They must not leak into the global list.
+    expect(TERMINAL_PAYLOAD_STRIP_KEYS).not.toContain('title');
+    expect(TERMINAL_PAYLOAD_STRIP_KEYS).not.toContain('body');
+    // And notify_user must NOT be a sensitive (encrypted) type.
+    expect(hasSensitivePayload('notify_user')).toBe(false);
+  });
+
+  it('emits a CASE keyed on type that removes title and body only for notify_user rows', () => {
+    const query = new PgDialect().sqlToQuery(terminalPayloadErasureSet().payload);
+    expect(query.sql).toContain('"device_commands"."type" =');
+    expect(query.params).toContain('notify_user');
+    const typeIdx = query.params.indexOf('notify_user');
+    const tail = query.params.slice(typeIdx + 1);
+    // title/body are subtracted in the notify_user branch, after the global keys.
+    expect(tail).toEqual(expect.arrayContaining(['title', 'body', ...TERMINAL_PAYLOAD_STRIP_KEYS]));
+    // The ELSE branch (every other type) carries the global keys only.
+    expect(query.params.filter((p) => p === 'title')).toHaveLength(1);
+    expect(query.params.filter((p) => p === 'body')).toHaveLength(1);
+    expect(query.sql.indexOf('ELSE')).toBeGreaterThan(query.sql.indexOf('WHEN'));
+  });
+});
+
+describe('type-scoped terminal payload erasure (#8928 pam_request_notify)', () => {
+  it('erases the technician deny reason at terminal state, for pam_request_notify rows only', () => {
+    expect(TYPE_SCOPED_TERMINAL_STRIP_KEYS.pam_request_notify).toEqual(['reason']);
+    // `reason` is an ordinary field on other types: never global, never encrypted.
+    expect(TERMINAL_PAYLOAD_STRIP_KEYS).not.toContain('reason');
+    expect(hasSensitivePayload('pam_request_notify')).toBe(false);
+    const query = new PgDialect().sqlToQuery(terminalPayloadErasureSet().payload);
+    expect(query.params).toContain('pam_request_notify');
+    expect(query.params).toContain('reason');
+  });
+});
+
+describe('type-scoped terminal payload erasure (#8743 endpoint chat)', () => {
+  it('strips the chat message object (body + sender) from chat_open/chat_message rows only', () => {
+    expect(TYPE_SCOPED_TERMINAL_STRIP_KEYS.chat_open).toEqual(['message']);
+    expect(TYPE_SCOPED_TERMINAL_STRIP_KEYS.chat_message).toEqual(['message']);
+    // `message` is an ordinary field name on other types: never global.
+    expect(TERMINAL_PAYLOAD_STRIP_KEYS).not.toContain('message');
+    expect(hasSensitivePayload('chat_open')).toBe(false);
+    expect(hasSensitivePayload('chat_message')).toBe(false);
+    const query = new PgDialect().sqlToQuery(terminalPayloadErasureSet().payload);
+    expect(query.params).toContain('chat_open');
+    expect(query.params).toContain('chat_message');
+    expect(query.params.filter((p) => p === 'message')).toHaveLength(2);
+  });
+});
+
 describe('script secret envelope in the payload registry', () => {
   const ctx = {
     commandId: '11111111-1111-4111-8111-111111111111',
@@ -202,5 +257,88 @@ describe('script secret envelope in the payload registry', () => {
     expect((delivered?.payload as Record<string, unknown>).secretEnv).toEqual({
       api_token: 'super-secret-value',
     });
+  });
+});
+
+describe('storage destination credentials at rest', () => {
+  const ctx = {
+    commandId: '44444444-4444-4444-8444-444444444444',
+    deviceId: '55555555-5555-4555-8555-555555555555',
+  };
+  const providerConfig = {
+    bucket: 'tenant-bucket',
+    accessKey: 'AKIA-SYNTHETIC-ACCESS',
+    secretKey: 'synthetic-secret-value',
+  };
+
+  it('erases stored storage destinations when a command reaches a terminal state', () => {
+    expect(TERMINAL_PAYLOAD_STRIP_KEYS).toEqual(
+      expect.arrayContaining(['providerConfig', 'providerConfigEnvelope']),
+    );
+    // Stable references are not credential material and stay for forensics.
+    expect(TERMINAL_PAYLOAD_STRIP_KEYS).not.toContain('providerConfigRef');
+  });
+
+  it('seals an inline storage destination before persistence for storage command types', () => {
+    const sealed = sealStorageCredentialsForPersistence(
+      'hyperv_restore',
+      { snapshotId: 's', provider: 's3', providerConfig },
+      ctx,
+    );
+    expect(sealed.providerConfig).toBeUndefined();
+    expect(typeof sealed.providerConfigEnvelope).toBe('string');
+    expect(sealed.provider).toBe('s3');
+    expect(JSON.stringify(sealed)).not.toContain('synthetic-secret-value');
+    expect(JSON.stringify(sealed)).not.toContain('AKIA-SYNTHETIC-ACCESS');
+    expect(hasSensitivePayload('hyperv_restore')).toBe(true);
+  });
+
+  it('leaves other command types and payloads without a destination untouched', () => {
+    const other = { path: '/tmp', providerConfig: { note: 'not a storage command' } };
+    expect(sealStorageCredentialsForPersistence('file_list', other, ctx)).toBe(other);
+    const refOnly = { provider: 's3', providerConfigRef: { configId: 'c', orgId: 'o' } };
+    expect(sealStorageCredentialsForPersistence('backup_restore', refOnly, ctx)).toBe(refOnly);
+  });
+
+  it('opens the sealed destination at delivery with the matching command binding', () => {
+    const sealed = sealStorageCredentialsForPersistence(
+      'mssql_restore',
+      { snapshotId: 's', provider: 's3', providerConfig },
+      ctx,
+    );
+    const delivered = decryptCommandForDelivery({
+      id: ctx.commandId,
+      type: 'mssql_restore',
+      deviceId: ctx.deviceId,
+      payload: sealed,
+    });
+    expect(delivered?.payload).toEqual({ snapshotId: 's', provider: 's3', providerConfig });
+  });
+
+  it('drops the command when the sealed destination is replayed onto another device', () => {
+    const sealed = sealStorageCredentialsForPersistence(
+      'mssql_restore',
+      { provider: 's3', providerConfig },
+      ctx,
+    );
+    expect(
+      decryptCommandForDelivery({
+        id: ctx.commandId,
+        type: 'mssql_restore',
+        deviceId: '66666666-6666-4666-8666-666666666666',
+        payload: sealed,
+      }),
+    ).toBeNull();
+  });
+
+  it('still delivers a plaintext destination queued before sealing existed', () => {
+    const legacy = { snapshotId: 's', provider: 's3', providerConfig };
+    const delivered = decryptCommandForDelivery({
+      id: ctx.commandId,
+      type: 'backup_restore',
+      deviceId: ctx.deviceId,
+      payload: legacy,
+    });
+    expect(delivered?.payload).toEqual(legacy);
   });
 });

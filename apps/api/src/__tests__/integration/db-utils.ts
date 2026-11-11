@@ -8,6 +8,7 @@
  * that will catch any actual type errors at runtime against a real database.
  */
 import { randomUUID } from 'crypto';
+import type { PlanType } from '@breeze/shared';
 import { getTestDb, type TestDatabase } from './setup';
 import { hashPassword } from '../../services/password';
 import { createAccessToken, type TokenPayload } from '../../services/jwt';
@@ -164,7 +165,7 @@ export interface CreatePartnerOptions {
   name?: string;
   slug?: string;
   type?: 'msp' | 'enterprise' | 'internal';
-  plan?: 'free' | 'pro' | 'enterprise' | 'unlimited';
+  plan?: PlanType;
   /** Defaults to 'active'. Use 'suspended' / 'churned' / 'pending' to test the tenant-status gate. */
   status?: 'pending' | 'active' | 'suspended' | 'churned';
   /** Set to a Date to soft-delete the partner (drives the deletedAt branch in tenantStatus.ts). */
@@ -205,12 +206,14 @@ export interface CreateOrganizationOptions {
   partnerId: string;
   name?: string;
   slug?: string;
-  type?: 'customer' | 'internal';
+  type?: 'customer' | 'internal' | 'quick_support' | 'unassigned_pool';
   status?: 'active' | 'suspended' | 'trial' | 'churned';
   /** Set to a Date to soft-delete the org (drives the deletedAt branch in tenantStatus.ts). */
   deletedAt?: Date | null;
   /** ISO-4217 org billing currency (multi-currency wave 1). Defaults to 'USD'. */
   currencyCode?: string;
+  /** organizations.settings JSONB (e.g. `{ helper: { enabled: true } }`). Defaults to the column default. */
+  settings?: Record<string, unknown>;
 }
 
 export async function createOrganization(options: CreateOrganizationOptions) {
@@ -227,7 +230,8 @@ export async function createOrganization(options: CreateOrganizationOptions) {
       slug: options.slug || `test-org-${timestamp}-${rand}`,
       type: options.type || 'customer',
       status: options.status || 'active',
-      deletedAt: options.deletedAt ?? null
+      deletedAt: options.deletedAt ?? null,
+      ...(options.settings ? { settings: options.settings } : {}),
     })
     .returning();
 
@@ -306,6 +310,49 @@ export async function createSite(options: CreateSiteOptions) {
     .returning();
 
   return site;
+}
+
+// ============================================
+// Device Utilities
+// ============================================
+
+export interface CreateDeviceOptions {
+  orgId: string;
+  siteId: string;
+  hostname?: string;
+}
+
+/**
+ * Minimal device row, inserted over the superuser test connection (so every
+ * devices trigger — including the ownership-epoch init trigger — fires as it
+ * does in production).
+ */
+export async function createDevice(options: CreateDeviceOptions): Promise<{ id: string }> {
+  const id8 = randomUUID().slice(0, 8);
+  const [device] = await getTestDb().execute<{ id: string }>(sql`
+    INSERT INTO devices (
+      org_id, site_id, agent_id, hostname, os_type, os_version,
+      architecture, agent_version
+    ) VALUES (
+      ${options.orgId}, ${options.siteId}, ${`agent-${randomUUID()}`},
+      ${options.hostname ?? `host-${id8}`}, 'windows', '11', 'amd64', '2.0.0'
+    )
+    RETURNING id
+  `);
+  if (!device) throw new Error('createDevice: insert returned no row');
+  return { id: device.id };
+}
+
+/**
+ * A device's current `agent_id`: what an agent authenticated as that device
+ * carries into a command claim (#8318 §6.4 — the claim's flip re-checks it).
+ */
+export async function deviceAgentId(deviceId: string): Promise<string> {
+  const [row] = await getTestDb().execute<{ agent_id: string }>(
+    sql`SELECT agent_id FROM devices WHERE id = ${deviceId}::uuid`,
+  );
+  if (!row) throw new Error(`deviceAgentId: no device ${deviceId}`);
+  return row.agent_id;
 }
 
 // ============================================
@@ -399,6 +446,26 @@ export async function assignUserToPartner(
     .returning();
 
   return assignment;
+}
+
+/**
+ * A user's current session epochs (what their access token would carry as
+ * `aep` / `mep`) and credential epoch. Fixtures that issue partner service
+ * principal keys pass the session pair as `actorSessionEpochs`, and fixtures
+ * that insert key rows directly stamp the owner's credential / MFA epochs.
+ */
+export async function userEpochs(userId: string): Promise<{
+  authEpoch: number;
+  mfaEpoch: number;
+  credentialEpoch: number;
+}> {
+  const [row] = await getTestDb()
+    .select({ authEpoch: users.authEpoch, mfaEpoch: users.mfaEpoch, credentialEpoch: users.credentialEpoch })
+    .from(users)
+    .where(eq(users.id, userId))
+    .limit(1);
+  if (!row) throw new Error(`userEpochs: user ${userId} not found`);
+  return row;
 }
 
 export async function assignUserToOrganization(

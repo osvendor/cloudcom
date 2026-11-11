@@ -1,0 +1,24 @@
+import { act, render, screen } from '@testing-library/react';
+import { afterEach, expect, it, vi } from 'vitest';
+import DashboardWrapper from './DashboardWrapper';
+const mock = vi.hoisted(() => ({ state: { isAuthenticated: true, isLoading: false, tokens: null as null | {accessToken: string}, authThrottledUntil: null }, restore: vi.fn() }));
+vi.mock('../../stores/auth', () => ({ useAuthStore: () => mock.state, restoreAccessTokenFromCookieDetailed: mock.restore }));
+vi.mock('./Sidebar', () => ({default: () => <div>Sidebar</div>}));
+vi.mock('./Header', () => ({default: () => <div>Header</div>}));
+vi.mock('../../lib/navigation', () => ({navigateTo: vi.fn()}));
+vi.mock('react-i18next', () => ({useTranslation: () => ({t: (key: string) => key})}));
+afterEach(() => vi.useRealTimers());
+it('leaves the loading screen after asynchronous cookie recovery and token updates', async () => {
+ vi.useFakeTimers();
+ let finish!: (value: string) => void;
+ mock.restore.mockReturnValue(new Promise(resolve => { finish = resolve; }));
+ const view = render(<DashboardWrapper currentPath="/"><div>Dashboard ready</div></DashboardWrapper>);
+ await act(async () => { vi.advanceTimersByTime(100); });
+ expect(mock.restore).toHaveBeenCalledTimes(1);
+ expect(screen.getByText('states.loading')).toBeTruthy();
+ mock.state = {...mock.state, tokens: {accessToken: 'test-token'}};
+ view.rerender(<DashboardWrapper currentPath="/"><div>Dashboard ready</div></DashboardWrapper>);
+ await act(async () => { finish('restored'); });
+ expect(screen.getByText('Dashboard ready')).toBeTruthy();
+ expect(screen.queryByText('states.loading')).toBeNull();
+});

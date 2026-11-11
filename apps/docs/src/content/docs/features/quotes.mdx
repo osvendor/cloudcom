@@ -17,6 +17,8 @@ Quotes, along with the rest of the Billing section, are only available when the 
 
 The editor is where you assemble and price a quote. Add lines from the shared **catalog picker** -- start typing to search your catalog by name or SKU -- or add a **manual line** for anything not in the catalog. The running subtotal, tax, and total update live as you edit. A **last-saved** indicator in the header shows when your changes were last persisted.
 
+The **tax rate** is not set per quote. It comes from the organization's tax settings (**Billing** tab), or your partner default tax rate when the organization has none; a tax-exempt organization gets no tax. While the quote is a draft it follows those settings -- opening or editing the draft picks up a changed rate -- and it is fixed when you **send** the quote (or accept it on the customer's behalf). Changing a rate later never alters a quote that has already been sent; clone it to get a draft at the current rate.
+
 ### Reordering, Bulk Edit, and Undo
 
 - **Drag to reorder** -- every line has a drag handle, so you can rearrange lines within and between pricing sections directly; the **⋯** menu offers the same moves for keyboard use. A sticky **Contents** outline in the side rail lets you jump between sections of a long quote, and pricing sections can be collapsed while you work.
@@ -31,6 +33,19 @@ Each line's internal cost details (SKU, cost, markup, profit) collapse into a on
 ### Quote Title
 
 Give a quote a **title** (for example, "Server refresh -- Q1" or "New-hire onboarding bundle"). The title appears at the top of the quote and on the PDF the customer sees, so a proposal reads as a named piece of work rather than just a number.
+
+### Valid Until and Intro Notes
+
+The top of a draft quote has two fields that print on the proposal:
+
+- **Valid until** -- the last day the customer can accept the quote. It prints in the proposal's header, and the quote expires once that day has passed (UTC). Leave it blank for a quote that does not expire. The editor warns you if the date you pick has already passed.
+- **Intro notes** -- a short note to the customer (up to 5,000 characters), printed above the first section of the proposal. Leave it blank to print no intro.
+
+Both save when you leave the field, like the other editor fields.
+
+### Footer Line
+
+**Footer line (every page)** is one short line (up to 160 characters) printed at the bottom of every page of the quote, such as a validity date. Leave it blank to use the default footer; the editor shows which default applies or notes that none is set. The organization's own footer text (its Portal settings) wins over your partner document footer (Billing settings), so the default is the organization's footer when it has one, and yours otherwise. The footer line is separate from **Terms & Conditions**, which is where fine print belongs. Available since v0.117.0.
 
 ### Line Titles and Descriptions
 
@@ -131,14 +146,14 @@ When a customer accepts a quote that has a deposit, Breeze issues the invoice wi
 
 When a customer accepts a quote, Breeze turns it into the documents that bill it:
 
-- **One-time lines** become an **invoice** (with the deposit due first, if one was set). The customer is taken straight to that invoice's own view-and-pay page, and unless you turn it off in **Settings → Billing**, Breeze emails them the invoice with the same link right away.
+- **One-time lines** become an **invoice** (with the deposit due first, if one was set). When you take [online payments](/features/online-payments/) and money is due on acceptance, the customer's accept button reads **Sign & pay** (or **Sign & pay deposit**) with the amount, and signing goes straight to Stripe checkout. Otherwise, or if checkout can't be opened at that moment, the customer is taken straight to that invoice's own view-and-pay page, and unless you turn it off in **Settings → Billing**, Breeze emails them the invoice with the same link right away. If they close the tab without paying, opening the quote link again shows **Acceptance recorded — one more step** with a **Pay** button for whatever is still due on that invoice. The link no longer shows the proposal itself, and it keeps working only until the original link would have expired (the quote's valid-until date, or 30 days after it was first sent when it has none). The emailed invoice link is the one that lasts.
 - **Recurring lines** become one or more **draft contracts** -- monthly and annual lines split into separate drafts, one billing cadence each -- that you review and activate. See [Recurring Contracts → From an Accepted Quote](/features/contracts/#from-an-accepted-quote).
 
 If the accepted quote contains **Pax8-backed** catalog items, acceptance also **stages a Pax8 order** for those items alongside the invoice and contracts. Acceptance doesn't submit anything to Pax8; you complete the commitment and provisioning details and submit it afterward. See [Distributor Integrations → Complete an order staged from a quote](/features/distributor-integrations/#complete-an-order-staged-from-a-quote).
 
 ### Ordering What You Sold
 
-Once a quote is won (accepted or converted), its detail view grows a **To be ordered** procurement breakdown of the SKU-bearing lines — item, SKU, part number, vendor, quantity, and (if you can see margin) unit cost, extended cost, and markup — so you can place vendor orders without re-deriving a purchase order from the pricing tables. Lines are grouped by vendor, with cost totals per group.
+Once a quote is won (accepted or converted), its detail view grows a **To be ordered** procurement breakdown (the parts order) of the lines that carry a SKU or part number — item, SKU, part number, vendor, quantity, and (if you can see margin) unit cost, extended cost, and markup — so you can place vendor orders without re-deriving a purchase order from the pricing tables. Lines are grouped by vendor, with cost totals per group. Product lines with neither a SKU nor a part number are left out and listed as **Not in this order**; the line editor and the **Send** dialog warn about such lines before the quote goes out.
 
 - **Mark ordered** — select lines and record the order against them: vendor, order reference, tracking number, expected arrival date, notes, and per-line quantities. Partial quantities are supported, so a line can be split across orders.
 - **Mark received** — record arrivals as they land; lines track **Ordered → Partly received → Received**, and order lines can be cancelled.
@@ -155,6 +170,8 @@ Vendor cost figures are the quote's own snapshot of each line at the time it was
 </Steps>
 
 The **Send** dialog accepts an optional **personal message**. When you add one, it renders in the email above the accept link, so you can add a short note to the customer without leaving the quote. Leave it blank to send the standard email.
+
+The proposal page the accept link opens has a **Download PDF** button, so a customer without a portal account can save the same PDF the portal offers. The download stops working when the link does: once the customer accepts or declines, or a revision replaces the quote.
 
 Partners edit the proposal email under **Settings → Partner → Email templates** (Quote / proposal) -- subject, heading, button label, and HTML body. Merge variables: `{{quote_number}}`, `{{partner_name}}`, `{{total}}`, `{{expiry_date}}`, and `{{accept_url}}`. The **Review & accept** button always uses the server accept link; partners cannot point it somewhere else. A personal message from the send dialog and your email signature still appear around that body. Leave it on the default to keep the built-in wording. This does not change the email card's accent bar or pull colors from the Branding tab.
 
@@ -218,7 +235,7 @@ A quote is priced in the customer organization's billing currency, which it inhe
 
 ## Document themes and content blocks
 
-Quotes and contracts render as branded documents. Under **Settings → Partner → Branding** you choose a **document theme** — fonts, colors, and cover treatment — and every quote, contract, and PDF you generate uses it. Set it once and customer-facing documents stay consistent.
+Quotes and invoices render as branded documents. Under **Settings → Billing → Documents** you choose the **Document fonts** (Helvetica, or Barlow Condensed + DM Sans) and the **Page size** (Letter or A4), and every quote and invoice uses them. A quote keeps the fonts and page size it had when you sent it, so changing them later only affects drafts and new quotes. Quote PDFs match the web proposal the customer sees and use the logo and colors from **Settings → Partner → Branding** (see [Branding](/features/branding/)). In the quote editor's **Cover page** section, **Show a cover page** adds a title page, and **Add a contents list to the PDF** adds a contents list.
 
 Beyond priced line items, a quote body can contain content blocks that turn it into a full proposal:
 
@@ -247,6 +264,11 @@ A **Contract** block attaches a document from your [agreement template library](
 
 The block pins to **whichever published version was latest at attach time** -- it doesn't automatically follow later edits to the template. If a newer version of the same template is published afterward, the block shows an **Update to vN** button so you can re-pin it to that newer version deliberately; nothing changes until you click it.
 
+**Where the customer sees it.** Wherever the block sits in the editor, the agreement appears **after the totals** so a long agreement never pushes the price down:
+
+- **Proposal link, customer portal, and Preview:** each agreement, followed by the quote's Terms & Conditions, shows as a collapsed row after the totals (below the sign panel on the customer's page), with its name and an estimated reading time. The customer opens it to read it, and the signature checkbox names and links every agreement. Rows expand automatically when the page is printed.
+- **PDF:** the proposal and its price come first. Each authored agreement then starts on its own page, followed by the Terms & Conditions. Uploaded-PDF agreements are appended as their own pages at the end.
+
 **Variables** are resolved when the block renders: auto variables (customer name/address, your organization's name, quote number/title, totals, dates) come from the quote automatically; manual variables use whatever you entered when you attached (or last edited) the block. An uploaded-PDF template has no variables -- it's attached as-is.
 
 <Aside type="caution">
@@ -264,13 +286,15 @@ Reuse the structure and line items of an existing proposal instead of rebuilding
 
 The clone is a fresh, editable **draft** with its own new quote number, in the same partner. It does **not** carry over the source quote's acceptance or conversion state -- you get a clean proposal to adjust and send.
 
+The clone's tax rate is the one that applies **now** (see [The Quote Editor](#the-quote-editor)), not the rate the source quote was sent with.
+
 If you retarget the clone to a **different company**, Breeze applies that company's billing details and tax rate and clears the site and bill-to override, so the new draft reflects the new customer rather than the original one.
 
 Cloning requires quote **write** permission.
 
 ## Changing the Customer on a Draft
 
-While a quote is still a **draft**, you can move it to a different customer without cloning. The editor has a **Customer** selector next to the title; switching it re-resolves the tax rate and clears the site and bill-to override -- unless the same edit supplies new values for them.
+While a quote is still a **draft**, you can move it to a different customer without cloning. The editor has a **Customer** selector next to the title; switching it re-resolves the tax rate for the new customer, clears the site, and clears the bill-to override unless the same edit supplies a new one.
 
 **Issued quotes -- ones you've already sent or that have been accepted -- are immutable**, including their customer. To point an issued quote at a different customer, use [Clone quote](#cloning-a-quote) and retarget the clone.
 

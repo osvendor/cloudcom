@@ -1,7 +1,14 @@
 import type { ReleaseDecision } from './scriptProposals/approvalMethod';
+import type { ActionIntentSource } from '../db/schema/actionIntents';
 import type { scripts } from '../db/schema';
 import type { RunScriptSnapshot } from './actionIntents/runScriptSnapshot';
 import type { TenantVariableScope } from './tenantVariableResolution';
+import type { TopologyRequestContext } from './topology/access';
+import type { VerifiedTopologyDiagnostic } from './topology/aiDiagnosticEffect';
+import type { ApprovalBinding } from './networkIsolation/service';
+import type { PinnedEventLogsQuery } from './aiChatEventLogsReadOnly';
+import type { WispUnattendedRead } from './wisp/unattendedReads';
+import type { FlowToolCallInput, FlowToolDescriptor } from './flows/flowTools';
 
 /**
  * One `run_script` release, resolved once and verified against the approval's
@@ -121,13 +128,22 @@ export type ToolExecutionContext = {
    */
   releaseDecision?: ReleaseDecision;
   /**
+   * The released intent's `source` (`chat` | `mcp_api` | `ai_agent`) — set by
+   * the SAME two release paths that set `actionIntentId`, from the intent row
+   * they hold, and by nothing else (#6268). `ioc_hunt sweep` stamps its sweep
+   * `origin` from it (`mcp_api` → `mcp`, otherwise `ai_chat`); the auth alone
+   * cannot say which surface filed the approval. Absent on every direct call.
+   */
+  intentSource?: ActionIntentSource;
+  /**
    * #4177 (W04): set ONLY by jobs/intentReleaseWorker.ts, and only when it
    * releases an agent-originated intent whose action creates a row OWNED by
    * a real user (`USER_OWNED_RELEASE_ACTIONS` — `manage_tickets:
    * log_time_entry`, whose `time_entries.user_id` is a users FK, plus the
    * three `services/aiToolsFleet.ts` writers added by #6200:
    * `manage_deployments:create`, `manage_patches:install` and
-   * `manage_patches:rollback`). The worker
+   * `manage_patches:rollback`, and the three `manage_alerts` mutations
+   * added by #6907: `acknowledge`, `resolve` and `suppress`). The worker
    * swaps the rebuilt agent auth for the APPROVER's own AuthContext
    * (`action_intents.decided_by_user_id`) and names them here, so the
    * handler can (a) assert the auth it received really is that approver
@@ -136,4 +152,120 @@ export type ToolExecutionContext = {
    * lets the handler keep `source: 'manual'` for a human's own tool call.
    */
   approverRelease?: { approverUserId: string };
+  /**
+   * A-W05 (D13a/Q4) — the SAME capture anchor `captureContextFrom`
+   * (`artifacts/toolResultCapture.ts`) computed for this call, threaded
+   * through so `read_artifact`'s handler can scope `findArtifactForCaller`
+   * to exactly the run or chat session THIS call is running in. Capture
+   * writes and this read must use one anchor or a model could read an
+   * artifact captured from a different session of the same user —
+   * `findArtifactForCaller` deliberately does not accept "any session
+   * belonging to this user" as a match.
+   *
+   * Structurally identical to `ArtifactCallerAnchor`
+   * (`artifacts/artifactService.ts`) — typed independently here rather than
+   * imported, because this file must not depend on the artifact service
+   * layer for an otherwise-unrelated execution-input bag.
+   *
+   * Set by `executeTool` ONLY for `read_artifact` and `run_flow` (a name check, not a
+   * blanket computation folded into every call's context) so every other
+   * tool's `context` identity is unaffected — see the comment at the call
+   * site in `aiTools.ts`. Absent for a call with no attributable org/run/
+   * session (an unauthenticated or system-scope caller), which is what makes
+   * "no anchor" a safe, typed refusal rather than an unscoped lookup.
+   *
+   * `wispThreadId` (Wisp W04, w00 A24) is present only when the chat session
+   * is attached to a Wisp thread; it lets the read also match that thread's
+   * attachments (see `ArtifactCallerAnchor.wispThreadId`).
+   */
+  captureAnchor?: { orgId: string; runId?: string | null; sessionId?: string | null; wispThreadId?: string | null };
+  /**
+   * Topology M4-D1 (#6000): the site context the topology gate
+   * (`topology/aiToolGate.ts`) issued for THIS call — the pinned site of a
+   * server-owned topology session (or a one-site MCP key), with the caller's
+   * live permissions. Set by `executeTool` ONLY for topology tool names, and
+   * always OVERWRITTEN there: a caller-supplied value is never trusted, and a
+   * topology handler that finds it absent refuses rather than resolving a site
+   * from its own input.
+   */
+  topologyRequest?: TopologyRequestContext;
+  /**
+   * Topology M4 Task 2: the alias scope for host identities in THIS call's
+   * result — `session:<id>` inside a topology session (stable across the
+   * investigation's tool calls and its evidence snapshot), otherwise a fresh
+   * request-local scope. Set by `executeTool` next to `topologyRequest`.
+   */
+  topologyAliasScope?: string;
+  /**
+   * Topology M4 Task 4 (#6000): a `diagnose_connectivity` release's effect,
+   * re-derived by the release path and verified against the approval's pinned
+   * effect digest (`computeEffectDigestForRelease`). Set ONLY from that
+   * recompute on a MATCH — never from model arguments or the auth identity —
+   * and travels with `actionIntentId`. The handler refuses without both, and
+   * still re-derives and re-binds the effect inside its acceptance
+   * transaction; it never selects a different origin or target.
+   */
+  verifiedTopologyDiagnostic?: VerifiedTopologyDiagnostic;
+  /**
+   * Network-isolation W13 (#10101, spec §3.8 "Approval binding"): the episode
+   * a four-eyes `release_containment` approval was pinned over —
+   * `(orgId, deviceId, isolationId, generation)` as of approval time. Set ONLY
+   * from the release path's effect-digest recompute on a MATCH (so it equals
+   * what the approver saw), never from model arguments, and travels with
+   * `actionIntentId`. The handler refuses without both and passes it to
+   * `releaseNetworkIsolation`, which re-checks it under the episode lock: an
+   * extend (a new generation) or an org move after approval refuses the release.
+   */
+  verifiedIsolationRelease?: Readonly<ApprovalBinding>;
+  /**
+   * Full-control W16 PR B (#6786, Fact 8): the digest a four-eyes
+   * `manage_fleet_designs:apply` or `:rollback` release verified. Set ONLY from the
+   * release path's effect-digest recompute on a MATCH, never from model arguments,
+   * and travels with `actionIntentId`. Both release paths verify in an earlier
+   * transaction than the one that writes, so the handler refuses without both and
+   * re-derives the digest under the report-run lock: a change committed in between
+   * refuses (`CONTENT_CHANGED`) instead of applying to what the approver never saw.
+   */
+  verifiedFleetDesignBinding?: Readonly<{ digest: string }>;
+  /**
+   * #7906: the strictly-parsed `event_logs_query` payload the chat gate
+   * classified as Tier-2 read-only (System/Setup, no XPath). Set ONLY by
+   * `createSessionPreToolUse` from `checkGuardrails`' own parse — never from
+   * model arguments. `execute_command` dispatches exactly these values and
+   * refuses if it arrives on any other commandType, so the call that runs is
+   * the call that was classified.
+   */
+  pinnedEventLogsQuery?: PinnedEventLogsQuery;
+  /**
+   * #10973: the call a gate classified as one of the four unattended reads. Set
+   * ONLY by `createSessionPreToolUse` and the troubleshooting run's pre-tool hook.
+   * The SDK handler dispatches `pinned` in place of the model's arguments
+   * (`dispatchArgs`, aiAgentSdkTools.ts), so the call that runs is the call that
+   * was classified.
+   */
+  pinnedWispUnattendedRead?: WispUnattendedRead;
+  /**
+   * W5 PR C (#5220): the flow tool the chat gate resolved LIVE and gated at
+   * its invocation tier, with the validated call. Set ONLY by
+   * `createSessionPreToolUse`'s flow branch — never from model arguments —
+   * and carried to the `flow__<slug>` SDK handler (sdkFlowTools.ts) through
+   * `wrapExtraToolWithHooks`, so the handler starts the run on exactly the
+   * publication the gate checked (a re-enable in between is
+   * `flow_tool_changed`, never a run at a tier nobody gated).
+   */
+  flowToolGate?: FlowToolGate;
+  /**
+   * W5 PR C (#5220): set ONLY by `createSessionPreToolUse` when it LOWERED
+   * `run_flow` below its static Tier 3 to the target flow's invocation tier —
+   * the flow and the publication seq that tier was computed for. The run_flow
+   * handler starts the run on exactly that publication or refuses
+   * (`flow_tool_changed`).
+   */
+  runFlowGate?: { flowId: string; publicationSeq: number };
 };
+
+/** See `ToolExecutionContext.flowToolGate`. */
+export interface FlowToolGate {
+  descriptor: FlowToolDescriptor;
+  call: FlowToolCallInput;
+}

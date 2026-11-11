@@ -3,7 +3,10 @@
  *
  * Strategy:
  * 1. Run the real ticketService functions (with mocked DB / deps).
- * 2. Capture the TicketEvent objects passed to the mocked emitTicketEvent.
+ * 2. Capture the TicketEvent objects passed to the mocked emitTicketEvent —
+ *    or, for an event queued from the committed ticket_outbox row (#7963:
+ *    ticket.created), capture that row and map it through the publisher's
+ *    real assigneeNotificationFromOutboxRow.
  * 3. Feed each captured event through the real handleTicketEvent (with mocked
  *    DB / email), asserting the expected side-effects.
  *
@@ -188,11 +191,24 @@ vi.mock('./ticketMailbox/resolveOutboundMailbox', () => ({
 
 // ── real implementations ─────────────────────────────────────────────────────
 
+// #8972 W0: ticket-child writers lock the ticket row first; these select mocks have
+// no .for(), so the helper is stubbed and its call is asserted below.
+const { lockTicketForWriteMock } = vi.hoisted(() => ({
+  lockTicketForWriteMock: vi.fn(async (_tx: unknown, id: string) => ({
+    id, orgId: 'o-1', partnerId: 'p-1', status: 'open', deletedAt: null, workKind: 'support',
+  })),
+}));
+vi.mock('./ticketRowLock', () => ({
+  lockTicketForWrite: lockTicketForWriteMock,
+  lockTicketsForWrite: vi.fn(async () => new Map()),
+}));
+
 import { createTicket, addTicketComment, changeTicketStatus, updateTicketFields } from './ticketService';
 import { handleTicketEvent } from '../jobs/ticketNotifyWorker';
+import { assigneeNotificationFromOutboxRow } from '../jobs/ticketOutboxPublisher';
 import type { TicketEvent } from './ticketEvents';
 
-const actor = { userId: 'u-actor', name: 'Actor User' };
+const actor = { kind: 'user' as const, userId: 'u-actor', name: 'Actor User' };
 
 describe('ticket-events producer→consumer contract', () => {
   beforeEach(() => {
@@ -218,7 +234,7 @@ describe('ticket-events producer→consumer contract', () => {
 
   // ── createTicket with assignee → ticket.created ──────────────────────────
 
-  it('createTicket with assignee: emitted event feeds handleTicketEvent → in-app insert + email', async () => {
+  it('createTicket with assignee: the outbox row, mapped by the publisher, feeds handleTicketEvent → in-app insert + email', async () => {
     // Service selects, in call order: org lookup, then the #5075 W04 Service
     // Management mode read on partners, then the assignee lookup (users table).
     // The mode row must be seeded explicitly — this queue is positional, and an
@@ -231,10 +247,18 @@ describe('ticket-events producer→consumer contract', () => {
 
     await createTicket({ orgId: 'o-1', subject: 'Contract test', source: 'manual', assigneeId: 'u-assignee' }, actor);
 
-    // Exactly one event was emitted
-    expect(hoisted.emitCaptured).toHaveLength(1);
-    const event = hoisted.emitCaptured[0] as TicketEvent;
-    expect(event.type).toBe('ticket.created');
+    // Nothing is queued from inside the transaction (#7963's rule, applied to
+    // creates); the committed outbox row is what the publisher maps to a job.
+    expect(hoisted.emitCaptured).toHaveLength(0);
+    const outbox = hoisted.insertValuesMock.mock.calls
+      .map((c) => c[0] as { orgId: string; ticketId: string; eventType: string; payload: Record<string, unknown> })
+      .find((v) => v.eventType === 'ticket.created');
+    expect(outbox).toBeDefined();
+    const job = assigneeNotificationFromOutboxRow({
+      id: 42, org_id: outbox!.orgId, ticket_id: outbox!.ticketId, event_type: outbox!.eventType, payload: outbox!.payload,
+    });
+    expect(job).toMatchObject({ type: 'ticket.created', actorUserId: 'u-actor', eventId: 'ticket-outbox-42' });
+    const event = job as TicketEvent;
 
     // Worker selects: ticket lookup, then the org-name lookup for the push body.
     // The assignee row now comes from the mocked loadUserCandidate, not the queue.
@@ -247,14 +271,14 @@ describe('ticket-events producer→consumer contract', () => {
 
     await handleTicketEvent(event);
 
-    // The seam assertion: the emitted event's assigneeId/orgId reach the
-    // consumer's notification write, and the dedupe key is anchored on the
-    // event's own eventId (W07 D2).
+    // The seam assertion: the row's assigneeId/orgId reach the consumer's
+    // notification write, and the dedupe key is anchored on the publisher's
+    // deterministic eventId (W07 D2), so a re-queued job notifies once.
     expect(hoisted.createNotificationMock).toHaveBeenCalledWith(expect.objectContaining({
       userId: 'u-assignee',
       orgId: 'o-1',
       type: 'ticket',
-      dedupeKey: expect.stringContaining('ticket:t-c1:assigned:u-assignee:')
+      dedupeKey: 'ticket:t-c1:assigned:u-assignee:ticket-outbox-42'
     }));
     expect(hoisted.sendEmailMock).toHaveBeenCalledWith(expect.objectContaining({
       to: 'tech@msp.example',
@@ -275,6 +299,8 @@ describe('ticket-events producer→consumer contract', () => {
     hoisted.updateReturningQueue.push([{ id: 't-c2' }]);
 
     await addTicketComment('t-c2', { content: 'We are looking into this.', isPublic: true }, actor);
+    // #8972 W0: the comment writer locked the ticket row first
+    expect(lockTicketForWriteMock).toHaveBeenCalledWith(expect.anything(), 't-c2');
 
     expect(hoisted.emitCaptured).toHaveLength(1);
     const event = hoisted.emitCaptured[0] as TicketEvent;
@@ -297,10 +323,10 @@ describe('ticket-events producer→consumer contract', () => {
   // ── changeTicketStatus (resolve) → ticket.status_changed ─────────────────
 
   it('changeTicketStatus to resolved: emitted event feeds handleTicketEvent → requester email with resolution note', async () => {
-    // Service: ticket lookup for changeTicketStatus
-    hoisted.selectQueue.push([{
-      id: 't-c3', orgId: 'o-1', partnerId: 'p-1', status: 'open', resolvedAt: null
-    }]);
+    // Service: ticket lookup for changeTicketStatus, then its re-read under
+    // the ticket lock (#8972 W0)
+    const row = { id: 't-c3', orgId: 'o-1', partnerId: 'p-1', status: 'open', resolvedAt: null };
+    hoisted.selectQueue.push([row], [row]);
     // Service: update returning
     hoisted.updateReturningQueue.push([{ id: 't-c3', status: 'resolved' }]);
     // Service: comment insert returning
@@ -342,12 +368,14 @@ describe('ticket-events producer→consumer contract', () => {
   // ── updateTicketFields → ticket.updated ───────────────────────────────────
 
   it('updateTicketFields: emitted ticket.updated event feeds handleTicketEvent → explicit no-op (no insert, no email)', async () => {
-    // Service selects: ticket lookup
-    hoisted.selectQueue.push([{
+    // Service selects: ticket lookup, then its re-read under the ticket lock
+    // (#8972 W0: a priority change can restamp SLA)
+    const row = {
       id: 't-c4', orgId: 'o-1', partnerId: 'p-1', status: 'open',
       subject: 'Old subject', priority: 'normal', description: null,
       categoryId: null, dueDate: null, deviceId: null, tags: []
-    }]);
+    };
+    hoisted.selectQueue.push([row], [row]);
     // Service update: returning
     hoisted.updateReturningQueue.push([{ id: 't-c4', subject: 'New subject', priority: 'high' }]);
     // Service insert: system feed entry returning
@@ -367,6 +395,31 @@ describe('ticket-events producer→consumer contract', () => {
     hoisted.insertValuesMock.mockClear();
 
     // Worker: ticket.updated is a deliberate no-op — must not throw, insert, or email
+    await expect(handleTicketEvent(event)).resolves.toBeUndefined();
+    expect(hoisted.insertValuesMock).not.toHaveBeenCalled();
+    expect(hoisted.sendEmailMock).not.toHaveBeenCalled();
+  });
+
+  // #7900: a reclassification rides ticket.updated (no new event type).
+  it('updateTicketFields: a ticketType change emits ticket.updated changed=[ticketType] → consumer no-op', async () => {
+    hoisted.selectQueue.push([{
+      id: 't-c5', orgId: 'o-1', partnerId: 'p-1', status: 'open',
+      subject: 'S', priority: 'normal', description: null,
+      categoryId: null, dueDate: null, deviceId: null, tags: [], ticketType: 'incident'
+    }]);
+    hoisted.updateReturningQueue.push([{ id: 't-c5', ticketType: 'problem' }]);
+    hoisted.insertReturningQueue.push([{ id: 'feed-3' }]);
+
+    await updateTicketFields('t-c5', { ticketType: 'problem' }, actor);
+
+    expect(hoisted.emitCaptured).toHaveLength(1);
+    const event = hoisted.emitCaptured[0] as TicketEvent;
+    expect(event.type).toBe('ticket.updated');
+    if (event.type === 'ticket.updated') {
+      expect(event.payload.changed).toEqual(['ticketType']);
+    }
+
+    hoisted.insertValuesMock.mockClear();
     await expect(handleTicketEvent(event)).resolves.toBeUndefined();
     expect(hoisted.insertValuesMock).not.toHaveBeenCalled();
     expect(hoisted.sendEmailMock).not.toHaveBeenCalled();

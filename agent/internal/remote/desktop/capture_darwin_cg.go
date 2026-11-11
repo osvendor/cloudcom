@@ -18,7 +18,8 @@ CGImageRef CGWindowListCreateImage_compat(CGRect screenBounds,
     CGWindowListOption listOption, CGWindowID windowID,
     CGWindowImageOption imageOption) __asm__("_CGWindowListCreateImage");
 
-// ScreenCaptureResult holds the capture result (must match capture_darwin.go)
+// ScreenCaptureResult holds the capture result (same shape as the
+// CGDisplayStream shim in capture_darwin_displaystream.go)
 typedef struct {
     void* data;
     int width;
@@ -42,8 +43,14 @@ int initCaptureCG(int displayIndex) {
     uint32_t displayCount = 0;
 
     CGError err = CGGetActiveDisplayList(maxDisplays, displays, &displayCount);
-    if (err != kCGErrorSuccess || displayCount == 0) {
+    if (err != kCGErrorSuccess) {
         return 1; // failed to get display list
+    }
+    // Zero active displays: nothing attached, or attached but asleep
+    // (#10874). Reported as code 11, like ScreenCaptureKit, not as a
+    // display-list failure.
+    if (displayCount == 0) {
+        return 11;
     }
 
     uint32_t idx = (uint32_t)displayIndex;
@@ -151,8 +158,13 @@ type darwinCGCapturer struct {
 
 // newCGCapturer creates a CoreGraphics-based capturer (macOS 12-13 fallback).
 func newCGCapturer(config CaptureConfig) (ScreenCapturer, error) {
-	slog.Warn("using CoreGraphics fallback for screen capture (macOS 12-13); ScreenCaptureKit unavailable — consider upgrading to macOS 14+",
-		"darwinVersion", macOSMajorVersion, "displayIndex", config.DisplayIndex)
+	// Debug, not Warn: since #8058 every permission check (the TCC loop, up
+	// to every 2 minutes) captures through CoreGraphics. The callers that
+	// pick CoreGraphics for a session log why (newPlatformCapturer, the
+	// probe plan's fallback).
+	slog.Debug("opening CoreGraphics screen capture",
+		"darwinVersion", macOSMajorVersion, "displayIndex", config.DisplayIndex,
+		"sckCaptureUnhealthy", sckCaptureUnhealthy.Load())
 	darwinCaptureMu.Lock()
 	errCode := int(C.initCaptureCG(C.int(config.DisplayIndex)))
 	if errCode != 0 {

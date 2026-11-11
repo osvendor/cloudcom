@@ -8,6 +8,11 @@
     "monitorLabel": "Monitor"
   },
   "list": {
+    "views": {
+      "ariaLabel": "Monitoransichten",
+      "all": "Alle Monitore",
+      "needsConversion": "Konvertierung erforderlich"
+    },
     "title": "Monitore",
     "description": "Überwachen Sie eine Bedingung, reagieren Sie auf dem Gerät, benachrichtigen Sie und eskalieren Sie, wenn sie wiederholt auftritt.",
     "new": "Neuer Monitor",
@@ -32,7 +37,48 @@
     },
     "deleteConfirm": "Monitor {{name}} löschen? Die zugehörige Alarmregel und die Reaktionsautomatisierung werden ebenfalls entfernt.",
     "builtIn": "Integriert",
-    "builtInHint": "Von Breeze bereitgestellt. Schwellenwerte bearbeiten, deaktivieren oder löschen – er kommt nicht zurück."
+    "builtInHint": "Von Breeze bereitgestellt. Schwellenwerte bearbeiten, deaktivieren oder löschen – er kommt nicht zurück.",
+    "recommended": {
+      "title": "Empfohlen",
+      "description": "Integrierte Monitore einer Richtlinie zuordnen."
+    }
+  },
+  "lifecycle": {
+    "autoResolveOn": "Ein",
+    "autoResolveOff": "Aus",
+    "rearmLabel": "Wiederaktivierung",
+    "rearmNewEvidence": "Neue Hinweise",
+    "rearmAfterDelay": "Nach N Minuten",
+    "rearmAfterMinutes_one": "Nach {{count}} Minute",
+    "rearmAfterMinutes_other": "Nach {{count}} Minuten",
+    "rearmDelayLabel": "Wiederaktivieren nach (Minuten)",
+    "rearmHelp": "Neue Hinweise: Nur ein Ereignis, das der geschlossene Alarm noch nicht gesehen hat, öffnet ihn erneut. Nach N Minuten: Auch ältere Ereignisse können ihn erneut öffnen, sobald seit dem Schließen N Minuten vergangen sind.",
+    "inheritOption": "Erben ({{value}}, {{source}})",
+    "inheritOptionPlain": "Erben",
+    "sources": {
+      "org": "Organisationsstandard",
+      "partner": "Partnerstandard",
+      "builtin": "Integrierter Standard"
+    },
+    "errors": {
+      "cooldown": "Geben Sie eine ganze Zahl von 0 bis 1440 ein.",
+      "cooldownOrInherit": "Geben Sie eine ganze Zahl von 0 bis 1440 ein oder lassen Sie das Feld leer, um den Wert zu erben.",
+      "rearmDelay": "Geben Sie eine ganze Anzahl von Minuten von 1 bis 1440 ein."
+    }
+  },
+  "lifecycleDefaults": {
+    "title": "Lebenszyklus-Standards",
+    "descriptionPartner": "Der Standard für die Monitore aller Organisationen. Eine Organisation kann ihn überschreiben, und die eigene Einstellung eines Monitors hat Vorrang vor beiden.",
+    "descriptionOrg": "Überschreibt den Partnerstandard für diese Organisation. Lassen Sie ein Feld leer, um ihn zu erben. Die eigene Einstellung eines Monitors hat Vorrang.",
+    "readOnly": "Sie haben keine Berechtigung, den Partnerstandard zu ändern.",
+    "saved": "Lebenszyklus-Standards gespeichert",
+    "saveAction": "Standards speichern",
+    "overrideCount_one": "{{count}} Monitor überschreibt dies",
+    "overrideCount_other": "{{count}} Monitore überschreiben dies",
+    "errors": {
+      "load": "Die Lebenszyklus-Standards konnten nicht geladen werden.",
+      "save": "Die Lebenszyklus-Standards konnten nicht gespeichert werden."
+    }
   },
   "editor": {
     "attachedToPolicy": "Monitor erstellt und der Richtlinie zugeordnet",
@@ -44,11 +90,22 @@
     },
     "sections": {
       "watch": "Was überwacht werden soll",
-      "noise": "Schweregrad & Rauschunterdrückung",
+      "lifecycle": "Alarm-Lebenszyklus",
       "respond": "Reagieren",
       "notify": "Benachrichtigen",
       "escalate": "An eine Person eskalieren",
       "deployed": "Bereitgestellt für"
+    },
+    "lifecycle": {
+      "overrides": {
+        "org": "Dieser Monitor überschreibt den Organisationsstandard ({{value}})",
+        "partner": "Dieser Monitor überschreibt den Partnerstandard ({{value}})",
+        "builtin": "Dieser Monitor überschreibt den integrierten Standard ({{value}})",
+        "unknown": "Dieser Monitor überschreibt den geerbten Standard."
+      },
+      "partnerWideHint": "Eine Organisation mit eigenem Standard verwendet diesen statt des hier angezeigten geerbten Werts.",
+      "inheritedUnavailable": "Die geerbten Werte konnten nicht geladen werden. Sie können trotzdem speichern.",
+      "windowWarning": "Das Ereignisfenster ({{window}} Min.) ist kürzer als die Abklingzeit ({{cooldown}} Min.). Ein neues Ereignis während der Abklingzeit kann aus dem Fenster herausfallen, bevor der Alarm erneut geöffnet wird."
     },
     "tabs": {
       "settings": "Einstellungen",
@@ -68,7 +125,8 @@
       "recurrenceThreshold": "Eskalieren nach",
       "recurrenceWindowDays": "Vorfällen innerhalb (Tagen)",
       "pauseResponses": "Automatische Reaktionen anhalten, bis eine Person sie zurücksetzt",
-      "aiAgent": "KI-Agent (aktiviert KI-Triage-Reaktionen)"
+      "aiAgent": "KI-Agent (aktiviert KI-Triage-Reaktionen)",
+      "psaBoard": "PSA-Board für Alarm-Tickets"
     },
     "deliveryModes": {
       "inherit": "Routing-Regeln verwenden",
@@ -88,14 +146,18 @@
       "create": "Monitor erstellen",
       "test": "Auf einem Gerät testen",
       "deploy": "Bereitstellen für…",
-      "delete": "Löschen"
+      "delete": "Löschen",
+      "backToMonitors": "Zurück zu Monitoren"
     },
     "errors": {
       "load": "Monitor konnte nicht geladen werden",
       "save": "Monitor konnte nicht gespeichert werden",
       "delete": "Monitor konnte nicht gelöscht werden",
       "test": "Test fehlgeschlagen",
-      "generic": "Ein Fehler ist aufgetreten"
+      "generic": "Ein Fehler ist aufgetreten",
+      "invalidCondition": "Einige Bedingungswerte fehlen oder liegen außerhalb des zulässigen Bereichs. Es wurde nichts gespeichert.",
+      "invalidResponses": "Einige Reaktionseinstellungen fehlen oder liegen außerhalb des zulässigen Bereichs. Es wurde nichts gespeichert.",
+      "restartServiceRequiresName": "Der Dienstneustart erfordert einen Dienstnamen."
     },
     "saved": "Monitor gespeichert",
     "deleted": "Monitor gelöscht",
@@ -109,7 +171,8 @@
     "testDialog": {
       "title": "Auf einem Gerät testen",
       "selectDevice": "Gerät",
-      "run": "Test ausführen"
+      "run": "Test ausführen",
+      "saveToTest": "Speichern, um Ihre Änderungen zu testen"
     },
     "deliveryPreview": {
       "selectOrg": "Wählen Sie eine Organisation für die Zustellungsvorschau.",
@@ -139,6 +202,40 @@
         "disabled": "deaktiviert",
         "unavailable": "nicht verfügbar"
       }
+    },
+    "composite": {
+      "children": "Teilbedingungen",
+      "add": "Bedingung hinzufügen",
+      "matchLabel": "Übereinstimmung"
+    },
+    "restart": {
+      "label": "Dienst auf dem Gerät neu starten",
+      "maxAttempts": "Maximale Neustartversuche",
+      "cooldownSeconds": "Neustartwartezeit (Sekunden)"
+    },
+    "networkCheckAsset": {
+      "label": "Gerät",
+      "unbound": "Keine Asset-Bindung",
+      "failed": "Assets konnten nicht geladen werden",
+      "orgRequired": "Wählen Sie eine Organisation als Eigentümer, um ein Asset zu binden.",
+      "pingName": "Ping für {{label}}"
+    },
+    "psaBoardDefault": "Standard-Board der Verbindung verwenden",
+    "psaBoardHelp": "Alarm-Tickets für diesen Monitor werden in diesem Board statt im Standard-Board der Verbindung erstellt.",
+    "psaBoardReadOnly": "Alarm-Tickets gehen an PSA-Board #{{id}}",
+    "psaBoardUnavailable": "PSA-Boards konnten nicht geladen werden, daher ist die Board-Überschreibung derzeit nicht verfügbar.",
+    "clearsWhen": {
+      "title": "Wird aufgehoben, wenn",
+      "hint": "Wird nur durch ein Ereignis aufgehoben, das nach dem auslösenden Ereignis des Alarms protokolliert wurde.",
+      "noneHint": "Es ist keine Wiederherstellungsbedingung festgelegt. Der Alarm wird aufgehoben, sobald der Auslöser nicht mehr zutrifft.",
+      "add": "Wiederherstellungsbedingung hinzufügen",
+      "removeCondition": "Entfernen",
+      "keepCustom": "Benutzerdefinierte Bedingung behalten",
+      "customTitle": "Benutzerdefinierte Wiederherstellungsbedingung (API)",
+      "customHint": "Diese Bedingung wurde über die API festgelegt und kann hier nicht bearbeitet werden. Beim Speichern bleibt sie unverändert.",
+      "replaceCustom": "Ersetzen",
+      "invalid": "Einer der Werte der Wiederherstellungsbedingung ist ungültig.",
+      "customUnusable": "Diese Bedingung kann nicht ausgewertet werden, daher werden die Alarme dieses Monitors nicht automatisch aufgehoben. Ersetzen Sie sie, um das zu beheben."
     }
   },
   "kinds": {
@@ -160,7 +257,10 @@
     "software_presence": "Softwarevorhandensein",
     "backup_continuity": "Backup-Kontinuität",
     "script": "Skriptprüfung",
-    "network_check": "Netzwerkprüfung"
+    "network_check": "Netzwerkprüfung",
+    "hardware_health": "Hardwarezustand",
+    "time_sync": "Zeitsynchronisierung",
+    "container_image_currency": "Aktualität von Container-Images"
   },
   "fields": {
     "operator": "Vergleich",
@@ -201,7 +301,20 @@
     "port": "Portnummer",
     "expectStatus": "Erwarteter Statuscode",
     "pollingIntervalSeconds": "Abfrage alle (Sekunden)",
-    "match": "Übereinstimmung"
+    "match": "Übereinstimmung",
+    "pingCount": "Echo-Anfragen",
+    "expectBanner": "Erwartetes Banner",
+    "httpMethod": "HTTP-Methode",
+    "expectedBody": "Antwort muss enthalten",
+    "followRedirects": "Weiterleitungen folgen",
+    "verifySsl": "TLS-Zertifikat prüfen",
+    "recordType": "Eintragstyp",
+    "expectedValue": "Erwarteter Wert",
+    "nameserver": "DNS-Server",
+    "degradedIsFailure": "Beeinträchtigt als Ausfall werten",
+    "maxResponseMs": "Fehler bei Antwort langsamer als (ms)",
+    "eventLogCollectionNoSource": "Anwendungsereignisse der Stufen Information und Warnung werden nur von {{providers}} erfasst. Ereignisse anderer Quellen entsprechen dieser Regel nur bei Fehler oder Kritisch, sofern die Quelle nicht in einer Ereignisprotokoll-Konfigurationsrichtlinie aufgeführt ist (Konfigurationsrichtlinie → Ereignisprotokolle → Anwendungsanbieter).",
+    "eventLogCollectionSourceNotCollected": "Der Agent erfasst keine Anwendungsereignisse der Stufen Information oder Warnung von „{{source}}“, sofern die Quelle nicht in einer Ereignisprotokoll-Konfigurationsrichtlinie aufgeführt ist (Konfigurationsrichtlinie → Ereignisprotokolle → Anwendungsanbieter). Andernfalls entspricht diese Regel nur ihren Fehler- oder kritischen Ereignissen. Integrierte Anbieter: {{providers}}."
   },
   "operators": {
     "gt": "größer als",
@@ -225,6 +338,7 @@
     "system": "System"
   },
   "eventLevels": {
+    "info": "Informationen",
     "warning": "Warnung",
     "error": "Fehler",
     "critical": "Kritisch"
@@ -257,7 +371,8 @@
   },
   "backupChecks": {
     "no_successful_backup": "Kein erfolgreiches Backup",
-    "consecutive_failures": "Aufeinanderfolgende Fehlschläge"
+    "consecutive_failures": "Aufeinanderfolgende Fehlschläge",
+    "completed_with_errors": "Mit Dateifehlern abgeschlossen"
   },
   "checkTypes": {
     "icmp_ping": "ICMP-Ping",
@@ -275,6 +390,7 @@
       "device_group": "eine Gerätegruppe"
     },
     "selectPolicy": "Konfigurationsrichtlinie",
+    "attachToPolicy": "Richtlinie zuweisen…",
     "selectTarget": "Ziel",
     "noOrgSelected": "Wählen Sie eine Organisation aus, für die bereitgestellt werden soll.",
     "policyName": "Richtlinienname",
@@ -283,9 +399,13 @@
     "cancel": "Abbrechen",
     "detachConfirm": "Von {{policy}} lösen?",
     "errors": {
+      "loadGroups": "Gerätegruppen konnten nicht geladen werden.",
       "attach": "Monitor konnte nicht angehängt werden",
-      "detach": "Monitor konnte nicht gelöst werden"
-    }
+      "detach": "Monitor konnte nicht gelöst werden",
+      "linkedFeature": "Die Monitore dieser Richtlinie stammen aus einer gemeinsamen Funktionsrichtlinie. Bearbeiten Sie diese oder wählen Sie eine andere Richtlinie."
+    },
+    "partnerWideGroups": "Alle Org. (partnerweit)",
+    "organizationGroups": "Organisationsgruppen"
   },
   "policyTab": {
     "title": "Monitore",
@@ -313,7 +433,7 @@
   "legacy": {
     "title": "Ältere Alarmregeln",
     "description": "Eigenständige Alarmregeln, die nicht von einem Monitor verwaltet werden. Konvertieren Sie sie, um Reaktionen, Zustellung und Eskalation an einem Ort zu erhalten.",
-    "empty": "Keine älteren Regeln.",
+    "empty": "Keine eigenständigen Alarmregeln müssen konvertiert werden.",
     "columns": {
       "name": "Name",
       "template": "Vorlage",
@@ -324,9 +444,30 @@
     "convert": "In Monitor umwandeln",
     "converted": "Umgewandelt",
     "notConvertible": "Die Bedingungen dieser Regel können nicht als einzelner Monitor ausgedrückt werden.",
+    "systemManaged": "Systemverwaltete Regel. Breeze löst diesen Alarm selbst aus, daher gibt es nichts zu konvertieren.",
     "errors": {
       "fetch": "Alarmregeln konnten nicht geladen werden",
       "convert": "Regel konnte nicht umgewandelt werden"
+    }
+  },
+  "builtInRules": {
+    "title": "Integrierte Alarme",
+    "description": "Alarme, die Breeze selbst auslöst. Schalten Sie eine Regel aus, um diesen Alarm für ihre Organisation zu beenden; bereits offene Alarme bleiben offen, bis Sie sie auflösen.",
+    "columns": {
+      "name": "Bezeichnung",
+      "organization": "Organisation",
+      "active": "Aktiv"
+    },
+    "kinds": {
+      "policyViolation": "Richtlinienverstöße: {{subject}}",
+      "configCompliance": "Konfigurationskonformität: {{subject}}"
+    },
+    "toggle": "{{name}} ein- oder ausschalten",
+    "switchedOn": "{{name}} eingeschaltet",
+    "switchedOff": "{{name}} ausgeschaltet",
+    "errors": {
+      "fetch": "Integrierte Alarme konnten nicht geladen werden",
+      "toggle": "Integrierter Alarm konnte nicht aktualisiert werden"
     }
   },
   "devices": {
@@ -385,5 +526,218 @@
         "skippedNoResponse": "Übersprungen (keine Reaktion konfiguriert)"
       }
     }
+  },
+  "conversion": {
+    "banner": {
+      "rowsCount_one": "{{count}} Altregel",
+      "rowsCount_other": "{{count}} Altregeln",
+      "policiesCount_one": "{{count}} Richtlinie",
+      "policiesCount_other": "{{count}} Richtlinien",
+      "text": "{{rows}} in {{policies}} wurden noch nicht in Monitore konvertiert.",
+      "review": "Prüfen",
+      "convertEverything": "Alles konvertieren…",
+      "confirmTitle": "Alle Altregeln, Überwachungen und alarmausgelösten Automatisierungen in allen Ihren Richtlinien konvertieren?",
+      "confirmBody": "{{rows}} in {{policies}} des gesamten Partners. Konvertierte Zeilen werden stillgelegt. Nicht konvertierbare Zeilen bleiben jetzt zur Prüfung oder manuellen Stilllegung; eine künftige Version konvertiert Reste und legt nicht konvertierbare still.",
+      "confirmRun": "Alles konvertieren",
+      "convertedAll": "{{rows}} in {{policies}} konvertiert; {{unconvertible}} nicht konvertierbar.",
+      "errors": {
+        "convertAll": "Konvertierung aller Einträge fehlgeschlagen"
+      }
+    },
+    "pendingPolicies": {
+      "title": "Richtlinien mit Altregeln",
+      "loading": "Richtlinien werden geladen…",
+      "empty": "Keine Richtlinie enthält Inline-Alarmregeln, Überwachungen oder alarmausgelöste Automatisierungen.",
+      "error": "Die Richtlinien mit Legacy-Regeln konnten nicht geladen werden. Zum erneuten Versuch aktualisieren."
+    },
+    "title": "Konvertierung erforderlich",
+    "description": "Inline-Alarmregeln, Dienst-/Prozessüberwachungen und alarmausgelöste Automatisierungen dieser Richtlinie wurden noch nicht in Monitore konvertiert. Beim Konvertieren wird die Quellzeile an Ort und Stelle stillgelegt; nichts wird gelöscht.",
+    "checking": "Geräte werden geprüft…",
+    "devicesChecked_one": "{{count}} Gerät auf identisches Verhalten geprüft.",
+    "devicesChecked_other": "{{count}} Geräte auf identisches Verhalten geprüft.",
+    "blocked": {
+      "parent_unconverted": "Konvertieren Sie zuerst die übergeordnete Richtlinie — ihre Inline-Regeln bestimmen, was diese Richtlinie erbt.",
+      "prerequisite_missing": "Eine erforderliche Korrektur ist auf diesem Server noch nicht bereitgestellt. Die Konvertierung ist bis dahin deaktiviert."
+    },
+    "refusedTitle_one": "Konvertierung abgelehnt: {{count}} Gerät würde sein Verhalten ändern.",
+    "refusedTitle_other": "Konvertierung abgelehnt: {{count}} Geräte würden ihr Verhalten ändern.",
+    "convert": "Konvertieren",
+    "convertAll_one": "{{count}} konvertierbare konvertieren",
+    "convertAll_other": "Alle {{count}} konvertierbaren konvertieren",
+    "retire": "Stilllegen",
+    "converted": "{{rows}} Altzeilen in {{monitors}} Monitore konvertiert.",
+    "retired": "{{name}} stillgelegt.",
+    "undone_one": "{{count}} Konvertierung rückgängig gemacht.",
+    "undone_other": "{{count}} Konvertierungen rückgängig gemacht.",
+    "openAlerts_one": "{{count}} offener Alarm wechselt zum Monitor",
+    "openAlerts_other": "{{count}} offene Alarme wechseln zum Monitor",
+    "sourceTables": {
+      "config_policy_alert_rules": "Inline-Alarmregel",
+      "config_policy_monitoring_watches": "Dienst-/Prozessüberwachung",
+      "alert_templates": "Alarmvorlage",
+      "automations": "Alarmausgelöste Automatisierung",
+      "config_policy_automations": "Richtlinienautomatisierung",
+      "network_monitors": "Netzwerkprüfung"
+    },
+    "outcomes": {
+      "convertible": "Konvertierbar",
+      "unconvertible": "Nicht konvertierbar"
+    },
+    "roles": {
+      "primary": "Überwachungsmonitor",
+      "resource_cpu": "CPU-Monitor",
+      "resource_memory": "Speicher-Monitor",
+      "response": "Reaktion"
+    },
+    "reasons": {
+      "unknown": "Nicht konvertierbar ({{code}}).",
+      "nested_group": "Die Regel verschachtelt Bedingungsgruppen; ein zusammengesetzter Monitor ist eine flache Gruppe.",
+      "no_condition": "Die Vorlage hat keine auswertbare Bedingung und hat nie ausgelöst.",
+      "escalation_policy_axis": "Die Eskalationsrichtlinie gehört einer Organisation, die Richtlinie ist aber partnerweit.",
+      "custom": "Benutzerdefinierte Bedingungen haben keine Monitorart.",
+      "process_count": "Prozessanzahl-Bedingungen haben keine Monitorart."
+    },
+    "errors": {
+      "preview": "Konvertierungsvorschau konnte nicht geladen werden",
+      "convert": "Konvertierung fehlgeschlagen",
+      "retire": "Stilllegen fehlgeschlagen",
+      "revert": "Konvertierung konnte nicht rückgängig gemacht werden"
+    },
+    "ledger": {
+      "title": "Konvertierungsverlauf",
+      "undo": "Rückgängig",
+      "more": "Mehr laden",
+      "empty": "Kein Konvertierungsverlauf.",
+      "system": "Automatisches System",
+      "unknownUser": "Unbekannter Benutzer",
+      "reverted": "Rückgängig gemacht",
+      "deadline": "Rückgängig ist nach Entfernung der Quelllaufzeit durch die Stilllegung der Legacy-Benachrichtigungen nicht verfügbar."
+    },
+    "errorCodes": {
+      "preview_stale": "Die Richtlinie wurde seit dieser Vorschau geändert. Erstellen Sie vor der Konvertierung erneut eine Vorschau.",
+      "conversion_contended": "Gleichzeitige Änderungen haben die Konvertierung unterbrochen. Es wurde nichts geändert. Versuchen Sie es erneut.",
+      "preview_failed": "Die Vorschau konnte nicht erstellt werden. Versuchen Sie es später erneut.",
+      "equivalence_delta": "Die konvertierten Monitore würden sich nicht auf jedem Gerät wie die Legacy-Regeln verhalten. Prüfen Sie die Vorschau vor der Konvertierung.",
+      "CONVERSION_PREREQUISITE_MISSING": "Ein erforderliches Plattform-Update wurde noch nicht bereitgestellt, daher ist keine Konvertierung möglich.",
+      "blocked": "Diese Konvertierung ist blockiert. Konvertieren Sie zuerst die übergeordnete Richtlinie und versuchen Sie es dann erneut.",
+      "already_converted": "Diese Regeln wurden bereits konvertiert. Aktualisieren Sie, um den aktuellen Stand zu sehen.",
+      "partner_wide_denied": "Zum Konvertieren partnerweiter Richtlinien ist voller Partnerzugriff erforderlich.",
+      "policy_not_found": "Die Richtlinie wurde nicht gefunden. Möglicherweise wurde sie gelöscht.",
+      "source_not_found": "Die Legacy-Regel wurde nicht gefunden. Möglicherweise wurde sie bereits konvertiert oder gelöscht.",
+      "conversion_not_found": "Diese Konvertierung wurde nicht gefunden.",
+      "conversion_revert_unavailable": "Diese Konvertierung kann nicht mehr rückgängig gemacht werden.",
+      "invalid_reason": "Dieser Stilllegungsgrund ist ungültig.",
+      "unknown": "Die Konvertierung ist fehlgeschlagen. Versuchen Sie es erneut."
+    },
+    "retirement": {
+      "summary_one": "{{count}} alte Regel konnte nicht in einen Monitor umgewandelt werden – bitte prüfen.",
+      "summary_other": "{{count}} alte Regeln konnten nicht in Monitore umgewandelt werden – bitte prüfen.",
+      "review": "Prüfen",
+      "dismiss": "Ausblenden",
+      "openAlertsNote": "Diese Regeln lösen nicht mehr aus. Ihre offenen Warnungen bleiben offen, bis jemand sie löst; legen Sie die Bedingung bei Bedarf als Monitor neu an.",
+      "reasons": {
+        "custom_condition": "benutzerdefinierte Bedingung",
+        "nested_group": "verschachtelte Bedingungsgruppe",
+        "no_condition": "keine auswertbare Bedingung",
+        "equivalence_delta": "Umwandlung würde ändern, was auf einigen Geräten auslöst",
+        "escalation_policy_axis": "Eskalationsrichtlinie gehört zu einer einzelnen Organisation",
+        "parent_unconverted": "übergeordnete Richtlinie wurde nicht umgewandelt",
+        "policy_inactive": "Richtlinie ist inaktiv oder archiviert",
+        "prerequisite_missing": "auf diesem Server fehlt eine vorausgesetzte Korrektur",
+        "metric_without_kind": "für die Metrik gibt es keinen Monitortyp",
+        "child_kind_not_composable": "Bedingung ist nicht für zusammengesetzte Monitore geeignet",
+        "too_many_conditions": "zu viele Bedingungen",
+        "too_many_responses": "mehr als zehn Reaktionen wären erforderlich",
+        "auto_resolve_conditions": "benutzerdefinierte Auflösungsbedingungen können nicht beibehalten werden",
+        "target_unconvertible": "das Reaktionsziel kann nicht konvertiert werden",
+        "already_managed": "wird bereits von einem Monitor verwaltet",
+        "no_org": "Prüfung gehört zu keiner Organisation",
+        "asset_missing": "das verknüpfte erkannte Asset existiert nicht mehr",
+        "condition_invalid": "Prüfungseinstellungen ergeben keine gültige Monitorbedingung",
+        "no_active_rules": "Prüfung hat keine aktive Alarmregel",
+        "multiple_network_rules": "Prüfung hat mehr als eine aktive Alarmregel",
+        "network_predicate_unsupported": "Alarmbedingung hat keine Entsprechung bei Monitoren",
+        "network_threshold_out_of_range": "Fehlerschwelle liegt außerhalb des zulässigen Bereichs (höchstens 100 aufeinanderfolgende Fehler)",
+        "site_binding_unrepresentable": "standortgebundene Prüfung ist mit keinem erkannten Asset verknüpft",
+        "config_override_unrepresentable": "benutzerdefiniertes Ziel oder Zeitlimit kann nicht übernommen werden",
+        "built_in": "integrierte Systemregel; sie alarmiert weiterhin selbstständig",
+        "no_rules": "Vorlage hat keine zu konvertierenden Regeln",
+        "target_or_owner": "Ziel oder Besitzer einer Regel weicht von ihrer Vorlage ab",
+        "blocked": "Konvertierung ist blockiert",
+        "disabled_response_automation": "Reaktionsautomatisierung ist deaktiviert",
+        "alert_workflow_kept": "Alarm-Workflow bleibt unverändert",
+        "unknown": "Konvertierung abgelehnt; Quelle prüfen"
+      }
+    }
+  },
+  "device": {
+    "title": "Wirksame Monitore",
+    "empty": "Für dieses Gerät gelten keine Monitore.",
+    "error": "Wirksame Monitore konnten nicht geladen werden.",
+    "monitor": "Monitorname",
+    "kind": "Art",
+    "policy": "Quellrichtlinie",
+    "state": "Zustand",
+    "episode": "Offene Episode",
+    "escalation": "Eskalation"
+  },
+  "monitors": {
+    "fields": {
+      "hardware_health": {
+        "componentTypes": "Komponenten",
+        "minHealth": "Mindestzustand",
+        "includePredictiveFailure": "Vorhergesagte Ausfälle einbeziehen",
+        "consecutiveSnapshots": "Aufeinanderfolgende Momentaufnahmen",
+        "componentTypeOptions": {
+          "controller": "Controller",
+          "virtual_disk": "Virtuelle Datenträger",
+          "physical_disk": "Physische Datenträger",
+          "cache_battery": "Cache-Batterien",
+          "enclosure": "Gehäuse",
+          "collector": "Überwachungstools"
+        },
+        "minHealthOptions": {
+          "warning": "Warnung",
+          "critical": "Kritisch"
+        }
+      },
+      "time_sync": {
+        "findings": "Befunde",
+        "consecutiveSnapshots": "Aufeinanderfolgende Momentaufnahmen",
+        "findingOptions": {
+          "pdc_no_external_source": "Der PDC der Gesamtstruktur-Stammdomäne hat keine externe Quelle",
+          "source_local_clock": "Lokale Uhr wird verwendet",
+          "dc_vm_host_sync": "Domänencontroller synchronisiert mit dem VM-Host",
+          "ntp_server_unresolvable": "NTP-Servername ist ungültig oder nicht auflösbar",
+          "ntp_peer_unreachable": "NTP-Gegenstelle ist nicht erreichbar",
+          "domain_source_unavailable": "Domänenzeitquelle nicht verfügbar",
+          "member_not_on_hierarchy": "Domänenhierarchie wird nicht verwendet",
+          "sync_disabled": "Zeitsynchronisierung ist deaktiviert",
+          "sync_stale": "Keine aktuelle erfolgreiche Synchronisierung",
+          "correction_refused": "Zeitkorrektur wurde abgelehnt",
+          "timezone_mismatch": "Zeitzone weicht von der erwarteten Zeitzone ab",
+          "policy_not_applied": "Zeitrichtlinie wurde nicht angewendet",
+          "policy_conflict_gpo": "Gruppenrichtlinie steuert die Zeiteinstellungen"
+        }
+      },
+      "container_image_currency": {
+        "minDaysBehind": "Mindestanzahl Tage veraltet"
+      }
+    }
+  },
+  "httpMethods": {
+    "GET": "GET (abrufen)",
+    "HEAD": "HEAD (nur Kopfzeilen)",
+    "POST": "POST (senden)",
+    "PUT": "PUT (ersetzen)",
+    "OPTIONS": "OPTIONS (Funktionen)"
+  },
+  "dnsRecordTypes": {
+    "A": "A (IPv4-Adresse)",
+    "AAAA": "AAAA (IPv6-Adresse)",
+    "MX": "MX (Mailserver)",
+    "CNAME": "CNAME (Aliasname)",
+    "TXT": "TXT (Texteintrag)",
+    "NS": "NS (DNS-Server)"
   }
 }

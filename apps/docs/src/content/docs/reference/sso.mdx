@@ -266,7 +266,7 @@ When Breeze auto-discovers a provider's endpoints from its issuer URL, it refuse
 | `orgId` | `uuid` | Depends | Inferred for org-scoped users | Target organization. Ignored when `ownerScope` is `partner` — a partner provider is owned by the caller's partner, never an organization. |
 | `name` | `string` | Yes | -- | Display name (1--255 characters). |
 | `type` | `oidc` or `saml` | Yes | -- | Provider protocol. |
-| `preset` | `string` | No | -- | Preset ID (e.g., `azure-ad`, `okta`). Pre-fills scopes and attribute mapping. |
+| `preset` | `string` | No | -- | OIDC preset ID: `azure-ad`, `okta`, `google` or `auth0`. Pre-fills scopes and attribute mapping when the request does not send them. Any other value returns `400`. |
 | `issuer` | `url` | No | -- | IdP issuer URL. Triggers OIDC discovery when set. |
 | `clientId` | `string` | No | -- | OAuth 2.0 Client ID. |
 | `clientSecret` | `string` | No | -- | OAuth 2.0 Client Secret. Encrypted at rest. |
@@ -276,7 +276,7 @@ When Breeze auto-discovers a provider's endpoints from its issuer URL, it refuse
 | `defaultRoleId` | `uuid` | No | -- | Role assigned to auto-provisioned users. Must be an org-scoped role in the target org (or, for partner providers, a partner-scoped role belonging to your partner). |
 | `allowedDomains` | `string` | No | -- | Comma-separated email domains. Empty means all domains are allowed. |
 | `enforceSSO` | `boolean` | No | `false` | Disable password login for the organization. |
-| `trustsIdpMfa` | `boolean` | No | `false` | Treat the IdP's own MFA assertion (`amr: mfa` in the id_token) as satisfying Breeze's MFA-gated routes. See [Satisfying Breeze MFA with your IdP](#satisfying-breeze-mfa-with-your-idp). |
+| `trustsIdpMfa` | `boolean` | No | `false` | Treat the IdP's own MFA assertion (`amr: mfa` or `amr: phr` in the id_token) as satisfying Breeze's MFA-gated routes. See [Satisfying Breeze MFA with your IdP](#satisfying-breeze-mfa-with-your-idp). |
 
 <Aside type="caution">
   The `clientSecret` is encrypted before storage using the server's encryption key. It is never returned in API responses. The `hasClientSecret` boolean field indicates whether a secret is configured.
@@ -380,7 +380,12 @@ While an organization provider signs in a customer's users, a **partner-owned pr
 
 ### Login Entry Point
 
-When an active partner provider exists, the main login page shows a **"Sign in with \{provider\}"** button — before any organization is chosen. The button appears only on **self-hosted deployments that resolve to exactly one partner** (`IS_HOSTED` not set to `true`). Hosted and multi-partner instances never show it: exposing one tenant's IdP on a shared login page would leak tenant information, so those deployments continue to use per-organization SSO entry points.
+When an active partner provider exists, a **"Sign in with \{provider\}"** button appears on the login page before any organization is chosen. Where it appears depends on the deployment:
+
+- **Self-hosted, single partner** (`IS_HOSTED` not set to `true`, exactly one partner): the button appears on the shared `/login` page automatically.
+- **Hosted or multi-partner:** the shared `/login` page never shows a partner's button, because naming one tenant's IdP on a page every visitor sees would disclose it. Instead, every partner has its own sign-in page at **`/login/<partner-slug>`**, for example `https://us.2breeze.app/login/acme-msp`. It shows that partner's [login branding](#login-page-branding) and SSO button. Partner admins find the exact URL under **Settings → Partner Settings → Branding → Login Branding**, in the **Your sign-in page** field. The slug match is case-insensitive.
+
+The partner page does not confirm whether a slug exists. An unknown slug, a suspended or deleted partner, and a partner with no branding or provider configured all render the stock login page, and the API returns the same response for each.
 
 If more than one partner provider is active, the button deterministically targets the **oldest active** provider (by creation time), so activating a second provider never silently changes the login page. The button starts the standard OIDC flow via `GET /api/v1/sso/login/partner/:partnerId`.
 
@@ -400,7 +405,12 @@ The forgot-password and reset-password flows honor SSO enforcement. A partner-sc
 
 ### Satisfying Breeze MFA with your IdP
 
-By default, Breeze never accepts an IdP's own multi-factor authentication as satisfying its own MFA-gated routes (mutating SSO provider config, PAM checkouts, and similar sensitive actions) — every account, SSO-provisioned or not, must separately satisfy Breeze's own MFA requirement on those routes. Set `trustsIdpMfa: true` on a provider (organization or partner-owned) to change that: when the id_token from that provider's login includes `amr: mfa` — an [RFC 8176](https://www.rfc-editor.org/rfc/rfc8176) Authentication Method Reference claim meaning the user completed multi-factor authentication at the IdP — Breeze treats MFA as satisfied for that sign-in.
+By default, Breeze never accepts an IdP's own multi-factor authentication as satisfying its own MFA-gated routes (mutating SSO provider config, PAM checkouts, and similar sensitive actions) — every account, SSO-provisioned or not, must separately satisfy Breeze's own MFA requirement on those routes. Set `trustsIdpMfa: true` on a provider (organization or partner-owned) to change that: when the id_token from that provider's login includes either of these [RFC 8176](https://www.rfc-editor.org/rfc/rfc8176) Authentication Method Reference values, Breeze treats MFA as satisfied for that sign-in:
+
+- `mfa`: the user completed multi-factor authentication at the IdP.
+- `phr`: the user completed phishing-resistant authentication at the IdP, such as a passkey / WebAuthn sign-in. Pocket ID, for example, reports a passkey login as `amr: ["phr"]`.
+
+No other `amr` value is accepted. Single-factor references such as `hwk`, `swk`, `otp` or `pwd` on their own do not satisfy Breeze MFA.
 
 Two things to know before turning this on:
 
@@ -421,7 +431,7 @@ Partner administrators can brand the login screen itself — separate from any S
 
 The API surface is `GET`/`PUT /api/v1/partners/me/login-branding`. The `PUT` is a **full replace**: any field omitted from the request is cleared, not preserved.
 
-Login branding renders under the same rule as the partner SSO button: only on self-hosted deployments that resolve to exactly one partner. It is distinct from [organization and portal branding](/features/branding/), which covers post-login surfaces (dashboard, end-user portal, and email templates).
+Login branding renders under the same rule as the partner SSO button: on the shared `/login` page only for self-hosted deployments that resolve to exactly one partner, and on the partner's own `/login/<partner-slug>` page on any deployment. It is distinct from [organization and portal branding](/features/branding/), which covers post-login surfaces (dashboard, end-user portal, and email templates).
 
 ---
 
@@ -546,6 +556,7 @@ All routes are prefixed with `/api/v1/sso`, except where a full path starting wi
 | `GET` | `/sso/login/:orgId` | None | Initiate SSO login for an organization. Generates PKCE + state and redirects to the IdP. |
 | `GET` | `/sso/login/partner/:partnerId` | None | Initiate partner-wide SSO login (technician sign-in). Uses the oldest active partner provider. |
 | `GET` | `/api/v1/auth/login-context` | None | Login-page context: partner login branding and the partner SSO button target. Returns empty values on hosted or multi-partner deployments. |
+| `GET` | `/api/v1/auth/login-context/partner/:slug` | None | Same response as `/auth/login-context`, resolved by partner slug on any deployment. Backs `/login/<partner-slug>`. Unknown, inactive, and unconfigured slugs all return empty values with status 200. |
 | `GET` | `/sso/callback` | None | IdP callback. Exchanges code for tokens, provisions user, creates session. Redirects to the app with a token exchange code. |
 | `POST` | `/sso/exchange` | None | Exchange a one-time SSO code for JWT access and refresh tokens. |
 

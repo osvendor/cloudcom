@@ -192,6 +192,92 @@ describe('IdentitySection', () => {
   });
 });
 
+describe('IdentitySection — own save echoing back (#7388)', () => {
+  it('does not flag a conflict when the refetched asset lands after saving flips back and matches the draft', async () => {
+    const { rerender } = render(<IdentitySection {...props} />);
+    fireEvent.change(screen.getByTestId('network-settings-identity-type'), { target: { value: 'router' } });
+    fireEvent.click(screen.getByTestId('network-settings-identity-save'));
+    await waitFor(() => expect(props.onAnnounce).toHaveBeenCalled());
+    await waitFor(() => expect(screen.getByTestId('network-settings-identity-type')).toBeEnabled());
+
+    // Parent's refetched asset commits only after `saving` is already false.
+    rerender(<IdentitySection {...props} asset={{ ...asset, type: 'router' }} />);
+
+    expect(screen.queryByTestId('network-settings-identity-conflict')).not.toBeInTheDocument();
+    expect(screen.getByTestId('network-settings-identity-type')).toHaveValue('router');
+    expect(screen.getByTestId('network-settings-identity-save')).toBeDisabled();
+  });
+});
+
+describe('IdentitySection — normalised echo (#7388)', () => {
+  it('does not flag a conflict when tags/notes come back normalised after save', async () => {
+    const { rerender } = render(<IdentitySection {...props} />);
+    fireEvent.change(screen.getByTestId('network-settings-identity-tags'), { target: { value: ' core , floor-2 ,, ' } });
+    fireEvent.change(screen.getByTestId('network-settings-identity-notes'), { target: { value: 'Closet B  ' } });
+    fireEvent.click(screen.getByTestId('network-settings-identity-save'));
+    await waitFor(() => expect(props.onAnnounce).toHaveBeenCalled());
+    await waitFor(() => expect(screen.getByTestId('network-settings-identity-tags')).toBeEnabled());
+
+    rerender(<IdentitySection {...props} asset={{ ...asset, tags: ['core', 'floor-2'], notes: 'Closet B' }} />);
+
+    expect(screen.queryByTestId('network-settings-identity-conflict')).not.toBeInTheDocument();
+    expect(screen.getByTestId('network-settings-identity-save')).toBeDisabled();
+  });
+});
+
+describe('IdentitySection — partial match is still a conflict (#7388)', () => {
+  it('flags a conflict when the incoming baseline matches only some of the draft', () => {
+    const { rerender } = render(<IdentitySection {...props} />);
+    fireEvent.change(screen.getByTestId('network-settings-identity-type'), { target: { value: 'router' } });
+    fireEvent.change(screen.getByTestId('network-settings-identity-name'), { target: { value: 'Mine' } });
+
+    rerender(<IdentitySection {...props} asset={{ ...asset, type: 'router', label: 'Theirs' }} />);
+
+    expect(screen.getByTestId('network-settings-identity-conflict')).toBeInTheDocument();
+  });
+});
+
+describe('IdentitySection — change site', () => {
+  const extras = { orgId: 'org-1', siteId: 'site-a', siteName: 'HQ' };
+  const SITE_A = { id: 'site-a', orgId: 'org-1', name: 'HQ' };
+  const SITE_B = { id: 'site-b', orgId: 'org-1', name: 'Branch' };
+
+  it('shows the current site and offers Change site when the asset carries an org and site', () => {
+    render(<IdentitySection {...props} extras={extras} />);
+    expect(screen.getByTestId('network-settings-identity-site')).toHaveTextContent('HQ');
+    expect(screen.getByTestId('network-settings-identity-change-site')).toBeInTheDocument();
+  });
+
+  it('hides Change site when the org or site is unknown', () => {
+    render(<IdentitySection {...props} extras={{ siteName: 'HQ' }} />);
+    expect(screen.queryByTestId('network-settings-identity-change-site')).not.toBeInTheDocument();
+  });
+
+  it('moves the asset through the single writer and tells the operator what the move undid', async () => {
+    fetchMock
+      .mockResolvedValueOnce(ok({ data: [SITE_A, SITE_B] }))
+      .mockResolvedValueOnce(ok({
+        id: asset.id, siteId: 'site-b',
+        siteMove: { unlinkedDevice: true, monitorsReattached: 1, topologyPoliciesDisabled: 2 },
+      }));
+    render(<IdentitySection {...props} extras={extras} />);
+
+    fireEvent.click(screen.getByTestId('network-settings-identity-change-site'));
+    const select = await screen.findByLabelText(/new site/i);
+    fireEvent.change(select, { target: { value: 'site-b' } });
+    fireEvent.click(screen.getByRole('button', { name: /move device/i }));
+
+    await waitFor(() => expect(props.onSaved).toHaveBeenCalled());
+    expect(fetchMock).toHaveBeenLastCalledWith('/discovery/assets/asset-1', expect.objectContaining({ method: 'PATCH' }));
+    expect(patchBody()).toEqual({ siteId: 'site-b' });
+    expect(showToast).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'success',
+      message: expect.stringMatching(/moved to branch.*link to its agent device was removed.*2 topology monitoring policies were disabled/i),
+    }));
+    await waitFor(() => expect(props.onAnnounce).toHaveBeenCalledWith(expect.stringMatching(/moved to branch/i)));
+  });
+});
+
 it('shows a refresh error after a successful mutation when onSaved returns false', async () => {
   render(<IdentitySection {...props} onSaved={vi.fn().mockResolvedValue(false)} />);
   fireEvent.change(screen.getByTestId('network-settings-identity-name'), { target: { value: 'Edited' } });

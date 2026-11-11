@@ -42,6 +42,7 @@
   },
   "denyPrompt": "Perché rifiuti questa richiesta? Il motivo è facoltativo.",
   "denyReasonPlaceholder": "Facoltativo: viene condiviso con chi ha inviato la richiesta",
+  "denyReasonShownToUserHint": "L’utente finale lo vede nella sua notifica (primi 500 caratteri).",
   "confirmDeny": "Conferma il rifiuto",
   "cancel": "Annulla",
   "deny": "Rifiuta",
@@ -67,6 +68,7 @@
     "noApproverDevice": "Registra un dispositivo di approvazione nel profilo e riprova.",
     "notSoleApprover": "Un’altra persona autorizzata deve decidere su questa richiesta.",
     "siteCeiling": "Questa approvazione concede un'autorità a livello di intera organizzazione. Il tuo accesso è limitato a siti specifici, quindi un'altra persona autorizzata deve decidere su questa richiesta.",
+    "approverScopeRequired": "Questa approvazione riguarda tutte le organizzazioni del partner, quindi richiede un approvatore a livello di partner con accesso a tutte le organizzazioni.",
     "verificationFailed": "La verifica è stata annullata o non è riuscita. Riprova.",
     "alreadyDecided": "Questa richiesta è già stata decisa.",
     "expired": "Questa richiesta è scaduta prima che si potesse decidere.",
@@ -98,18 +100,82 @@
     "loading": "Caricamento delle approvazioni recenti…",
     "error": "Impossibile caricare le approvazioni recenti.",
     "retry": "Riprova",
+    "decisionReasonLabel": "Motivo dell’approvatore",
     "empty": "Nulla si è concluso di recente.",
     "status": {
       "failed": "Non riuscita",
-      "rejected": "Rifiutata",
+      "rejected": "Negata",
       "expired": "Scaduta",
       "cancelled": "Annullata",
       "completed": "Completata",
       "denied": "Negata",
+      "refused": "Approvata, poi bloccata",
       "approved": "Approvata",
       "reported": "Segnalata",
       "unknown": "Sconosciuto"
     }
   },
-  "proposedByAgentExecuteNotice": "Approvare questo lo esegue subito — non è una simulazione, nemmeno in modalità ombra."
+  "proposedByAgentExecuteNotice": "Approvare questo lo esegue subito — non è una simulazione, nemmeno in modalità ombra.",
+  "assuranceDefaultNotice": {
+    "upcomingTitle": "I dispositivi approvatore saranno richiesti dal {{date}}",
+    "upcomingBody": "Per il tuo account partner non è stata salvata alcuna scelta di sicurezza delle approvazioni, quindi si applica il predefinito della piattaforma: dal {{date}}, approvare una richiesta a rischio alto o critico richiede un dispositivo approvatore registrato invece di un semplice clic. Registra un dispositivo prima di allora per non rallentare le approvazioni.",
+    "activeTitle": "Le approvazioni ad alto rischio richiedono un dispositivo approvatore",
+    "activeBody": "Dal {{date}}, il predefinito della piattaforma richiede un dispositivo approvatore registrato per approvare richieste a rischio alto e critico, perché per il tuo account partner non è stata salvata alcuna scelta di sicurezza delle approvazioni. Per questo queste approvazioni chiedono il tuo dispositivo.",
+    "settingsLink": "Rivedi la sicurezza delle approvazioni",
+    "registerLink": "Registra un dispositivo approvatore"
+  },
+  "diagnosticAccess": {
+    "title": "Accesso diagnostico in sola lettura",
+    "organization": "Organizzazione",
+    "device": "Dispositivo",
+    "access": "Accesso",
+    "readOnlyOps": "Sola lettura: {{operations}}. Nessuna scrittura, eliminazione, rinomina, script o modifica del registro.",
+    "duration": "Durata",
+    "durationValue": "{{minutes}} minuti dall'approvazione",
+    "purpose": "Scopo",
+    "requestedBy": "Richiesto da",
+    "principalUser": "Breeze AI",
+    "principalApiKey": "Chiave API MCP",
+    "principalOauth": "Connessione OAuth MCP",
+    "paths": "Percorsi",
+    "recursive": "Intero sottoalbero",
+    "thisFolderOnly": "Questa cartella e i file che contiene direttamente",
+    "sensitiveHeading": "Archivi sensibili richiesti esplicitamente",
+    "noSensitive": "Le posizioni note di password e cookie del browser, archivi di credenziali, chiavi private e token salvati vengono trattenute, anche all'interno di questi percorsi. È un elenco fisso; tutto il resto all'interno di questi percorsi è leggibile.",
+    "opList": "elencare",
+    "opRead": "leggere",
+    "classes": {
+      "browser_secrets": "Password, cookie del browser e relative chiavi",
+      "credential_store": "Archivi di credenziali del sistema operativo",
+      "private_keys": "Chiavi private (SSH, GnuPG, TLS)",
+      "session_tokens": "Token di sessione e credenziali cloud salvati"
+    }
+  },
+  "operatorPlan": {
+    "title": "Piano per l’attività IA",
+    "summary_one": "{{count}} effetto, revisione {{revision}} del piano",
+    "summary_other": "{{count}} effetti, revisione {{revision}} del piano",
+    "groupBreeze": "Dispositivi Breeze",
+    "groupM365": "Microsoft 365",
+    "groupGoogle": "Google Workspace",
+    "effectOrdinal": "Passaggio {{ordinal}}",
+    "targetLine": "{{targetLabel}} ({{principalLabel}})",
+    "orderNote": "Gli effetti vengono eseguiti in questo ordine. L’accesso viene disattivato per ultimo, quindi un arresto anticipato non lascia mai la posta senza instradamento.",
+    "empty": "Questo piano non contiene effetti.",
+    "invalid": "Impossibile visualizzare questo piano per intero. Non approvarlo."
+  },
+  "intentStatus": {
+    "title": "Stato dell’approvazione",
+    "waitingForApprovers": "In attesa degli approvatori",
+    "notFound": "Impossibile trovare quell’approvazione.",
+    "status": {
+      "pending_approval": "Approvazione in sospeso",
+      "in_progress": "In corso",
+      "completed": "Completata",
+      "failed": "Non riuscita",
+      "rejected": "Rifiutato",
+      "expired": "Scaduta",
+      "cancelled": "Annullata"
+    }
+  }
 }

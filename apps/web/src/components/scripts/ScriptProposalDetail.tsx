@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import '@/lib/i18n';
 import { fetchWithAuth } from '../../stores/auth';
+import { usePageItemName } from '../layout/usePageItemName';
 
 // The as-built detail DTO (packages/shared/src/types/scriptProposals.ts,
 // ScriptProposalDetailDto) — this read-only page renders only the fields
@@ -23,6 +24,27 @@ const RISK_KEYS: Record<RiskTier, string> = {
   high: 'scriptProposalDetail.riskHigh',
   critical: 'scriptProposalDetail.riskCritical',
 };
+
+const STATUS_KEYS: Record<string, string> = {
+  proposed: 'scriptProposalDetail.status.proposed',
+  scan_rejected: 'scriptProposalDetail.status.scan_rejected',
+  review_failed: 'scriptProposalDetail.status.review_failed',
+  reviewed: 'scriptProposalDetail.status.reviewed',
+  approved: 'scriptProposalDetail.status.approved',
+  rejected: 'scriptProposalDetail.status.rejected',
+  changes_requested: 'scriptProposalDetail.status.changes_requested',
+  expired: 'scriptProposalDetail.status.expired',
+  superseded: 'scriptProposalDetail.status.superseded',
+  executed: 'scriptProposalDetail.status.executed',
+  verified: 'scriptProposalDetail.status.verified',
+  verification_failed: 'scriptProposalDetail.status.verification_failed',
+  promoted: 'scriptProposalDetail.status.promoted',
+};
+
+// States the approvals page can act on: approve/request changes (proposed,
+// reviewed, approved), the failed-review override (review_failed) and save to
+// library (verified). See ScriptProposalApprovalCard.
+const ACTIONABLE_STATUSES = new Set(['proposed', 'reviewed', 'approved', 'review_failed', 'verified']);
 
 function isRiskTier(value: string | null): value is RiskTier {
   return value === 'low' || value === 'medium' || value === 'high' || value === 'critical';
@@ -66,6 +88,8 @@ export default function ScriptProposalDetail({ proposalId }: { proposalId: strin
     };
   }, [proposalId]);
 
+  usePageItemName(proposal?.proposal.goal);
+
   if (state === 'loading') {
     return <p className="text-sm text-muted-foreground">{t('scriptProposalDetail.loading')}</p>;
   }
@@ -83,6 +107,9 @@ export default function ScriptProposalDetail({ proposalId }: { proposalId: strin
   }
 
   const riskTier = proposal.proposal.riskTier;
+  const rawStatus = proposal.proposal.status;
+  // An unknown future status falls back to the raw value rather than a blank.
+  const statusLabel = (status: string) => (STATUS_KEYS[status] ? t(/* i18n-dynamic */ STATUS_KEYS[status]) : status);
 
   return (
     <div className="rounded-lg border bg-card p-6 shadow-xs">
@@ -90,7 +117,7 @@ export default function ScriptProposalDetail({ proposalId }: { proposalId: strin
       <dl className="mt-4 space-y-2 text-sm">
         <div>
           <dt className="text-muted-foreground">{t('scriptProposalDetail.statusLabel')}</dt>
-          <dd>{proposal.proposal.status}</dd>
+          <dd>{statusLabel(proposal.proposal.status)}</dd>
         </div>
         {riskTier && isRiskTier(riskTier) && (
           <div>
@@ -105,6 +132,15 @@ export default function ScriptProposalDetail({ proposalId }: { proposalId: strin
           </div>
         )}
       </dl>
+      {ACTIONABLE_STATUSES.has(rawStatus) && (
+        <a
+          href={`/approvals#proposal-${proposalId}`}
+          className="mt-4 inline-block text-sm font-medium text-primary hover:underline"
+          data-testid="script-proposal-review-link"
+        >
+          {t('scriptProposalDetail.reviewInApprovals')}
+        </a>
+      )}
     </div>
   );
 }

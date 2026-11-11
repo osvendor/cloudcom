@@ -7,13 +7,25 @@ import { PERMISSIONS } from '../../services/permissions';
 import { db, runOutsideDbContext } from '../../db';
 import { devices, unifiCollectors, unifiDeviceTelemetry, unifiClients, unifiSiteMappings, unifiSyncRuns, sites } from '../../db/schema';
 import { createUnifiClient, UnifiApiError } from '../../services/unifi/unifiClient';
+import { buildMappingHostList } from '../../services/unifi/unifiMappingHosts';
 import { getConnection, getDecryptedApiKey, upsertConnection, deleteConnection, createSelfHostedIntegration } from '../../services/unifi/unifiConnectionService';
 import { listControllerSitesForIntegration } from '../../services/unifi/unifiControllerSiteService';
 import { listCollectors, upsertCollector, deleteCollector, upsertSelfHostedController } from '../../services/unifi/unifiCollectorService';
+import { toUnifiTelemetryDevice } from './telemetryReadModel';
 import { enqueueUnifiSync } from '../../jobs/unifiWorker';
 import { canManagePartnerWidePolicies } from '../../services/partnerWideAccess';
+import { revokeUnifiCollectorDrift, revokeUnifiMappingDrift, snapshotUnifiCollectors, snapshotUnifiMappings } from '../../services/topology/unifiAuthority';
+import {
+  diffUnifiMappings,
+  resolveUnifiMappingTargets,
+  writeUnifiControllerAudits,
+  writeUnifiMappingAudits,
+  type UnifiMappingAuditMeta,
+} from '../../services/unifi/unifiMappingWrites';
 
 export const unifiRoutes = new Hono();
+
+const MANUAL_MAPPING_AUDIT: UnifiMappingAuditMeta = { source: 'manual', sourceVerified: true, matchTier: null, matchKey: null };
 
 type RouteAuth = Pick<AuthContext, 'scope' | 'partnerId' | 'orgId' | 'partnerOrgAccess' | 'canAccessOrg'>;
 
@@ -173,7 +185,12 @@ unifiRoutes.post('/disconnect', partnerScopes, writePerm, requireMfa(), async (c
   // Idempotent: a 0-row delete means "already disconnected", which is the desired
   // end state — report success so runAction doesn't toast a misleading failure on
   // a double-click or concurrent disconnect.
+  // The integration delete cascades its collectors; revoke their UniFi topology
+  // sources (M2 D1 source lifecycle) in the same request transaction.
+  const conn = await getConnection(db, partner.partnerId);
+  const collectorsBefore = conn ? await snapshotUnifiCollectors(conn.id) : [];
   await deleteConnection(db, partner.partnerId);
+  if (conn) await revokeUnifiCollectorDrift(conn.id, collectorsBefore);
   return c.json({ success: true });
 });
 
@@ -191,22 +208,10 @@ unifiRoutes.get('/hosts', partnerScopes, readPerm, async (c) => {
     const [hosts, allSites] = await runOutsideDbContext(() =>
       Promise.all([client.listHosts(), client.listSites()])
     );
-    // listSites already drops sites with a malformed id, so this map only ever holds
-    // genuinely mappable sites.
-    const sitesByHost = new Map<string, Array<{ id: string; name: string }>>();
-    for (const s of allSites) {
-      const list = sitesByHost.get(s.hostId) ?? [];
-      list.push({ id: s.id, name: s.name });
-      sitesByHost.set(s.hostId, list);
-    }
-    return c.json({
-      // Only surface mappable consoles: a host must have at least one valid site, and
-      // — when its type is known — be a console (drops cloud keys / non-console hosts).
-      // This stops the UI from offering host×site rows that can only save junk mappings.
-      hosts: hosts
-        .filter((h) => (h.type ?? 'console') === 'console' && (sitesByHost.get(h.id)?.length ?? 0) > 0)
-        .map((h) => ({ id: h.id, name: h.name, model: h.model, sites: sitesByHost.get(h.id) ?? [] })),
-    });
+    // Every host with a site is listed, whatever its type. The response is additive:
+    // type, unknownConsole and omitted are new; id/name/model/sites stay unchanged.
+    const list = buildMappingHostList(hosts, allSites);
+    return c.json({ hosts: list.hosts, omitted: list.omitted });
   } catch (err) {
     return c.json({ success: false, message: err instanceof Error ? err.message : String(err) }, 502);
   }
@@ -220,18 +225,16 @@ unifiRoutes.put('/mappings', partnerScopes, writePerm, requireMfa(), zValidator(
   const conn = await getConnection(db, partner.partnerId);
   if (!conn) return c.json({ success: false, message: 'Not connected' }, 400);
   const { mappings, hostIds } = c.req.valid('json');
-  // Resolve + authorize EVERY target site before any write. Doing this inline
-  // per-iteration would leave earlier mappings persisted when a later cross-org
-  // entry hits the 403, so the client sees a failure on a partially-applied batch.
-  const resolved: Array<{ m: (typeof mappings)[number]; orgId: string; siteId: string }> = [];
-  for (const m of mappings) {
-    const [site] = await db.select({ id: sites.id, orgId: sites.orgId }).from(sites).where(eq(sites.id, m.siteId)).limit(1);
-    if (!site) return c.json({ success: false, message: `Unknown Breeze site: ${m.siteId}` }, 400);
-    if (!auth.canAccessOrg(site.orgId)) {
-      return c.json({ success: false, message: 'Access to target organization denied' }, 403);
-    }
-    resolved.push({ m, orgId: site.orgId, siteId: site.id });
+  // Every target is authorized before any write (see resolveUnifiMappingTargets).
+  const targets = await resolveUnifiMappingTargets(auth, conn.partnerId, mappings);
+  if (!targets.ok) {
+    const { status, message, code } = targets.error;
+    return c.json({ success: false, message, ...(code ? { code } : {}) }, status);
   }
+  const resolved = mappings.map((m, i) => ({ m, ...targets.targets[i]! }));
+  // M2 D1: a remapped or deleted controller site revokes the UniFi topology
+  // sources its old mapping authorized (revokeUnifiMappingDrift below).
+  const mappingsBefore = await snapshotUnifiMappings(conn.id);
   for (const { m, orgId, siteId } of resolved) {
     await db.insert(unifiSiteMappings).values({
       integrationId: conn.id,
@@ -292,6 +295,9 @@ unifiRoutes.put('/mappings', partnerScopes, writePerm, requireMfa(), zValidator(
         .where(and(eq(unifiSiteMappings.integrationId, conn.id), inArray(unifiSiteMappings.id, staleIds)));
     }
   }
+  await revokeUnifiMappingDrift(conn.id, mappingsBefore);
+  const mappingsAfter = await snapshotUnifiMappings(conn.id);
+  writeUnifiMappingAudits(c, conn.id, diffUnifiMappings(mappingsBefore, mappingsAfter), () => MANUAL_MAPPING_AUDIT);
   return c.json({ success: true });
 });
 
@@ -347,6 +353,7 @@ unifiRoutes.put('/collectors', partnerScopes, writePerm, requireMfa(), zValidato
   const [dev] = await db.select({ id: devices.id, orgId: devices.orgId }).from(devices).where(eq(devices.id, body.collectorDeviceId)).limit(1);
   if (!dev) return c.json({ success: false, message: 'Unknown collector agent' }, 400);
   if (dev.orgId !== site.orgId) return c.json({ success: false, message: 'Collector agent must belong to the site\'s organization' }, 400);
+  const collectorsBefore = await snapshotUnifiCollectors(conn.id);
   const collector = await upsertCollector(db, {
     integrationId: conn.id,
     orgId: site.orgId,
@@ -358,6 +365,9 @@ unifiRoutes.put('/collectors', partnerScopes, writePerm, requireMfa(), zValidato
     pollIntervalSeconds: body.pollIntervalSeconds,
     createdBy: auth.user.id,
   });
+  // A reassigned collector (device/site/controller) revokes its old topology sources.
+  await revokeUnifiCollectorDrift(conn.id, collectorsBefore);
+  writeUnifiControllerAudits(c, conn.id, collectorsBefore, await snapshotUnifiCollectors(conn.id), collector.id);
   return c.json({ success: true, collectorId: collector.id });
 });
 
@@ -386,6 +396,7 @@ unifiRoutes.put('/controllers', partnerScopes, writePerm, requireMfa(), zValidat
   const [dev] = await db.select({ id: devices.id, orgId: devices.orgId }).from(devices).where(eq(devices.id, body.collectorDeviceId)).limit(1);
   if (!dev) return c.json({ success: false, message: 'Unknown collector agent' }, 400);
   if (dev.orgId !== site.orgId) return c.json({ success: false, message: 'Collector agent must belong to the site\'s organization' }, 400);
+  const collectorsBefore = await snapshotUnifiCollectors(conn.id);
   const collector = await upsertSelfHostedController(db, {
     integrationId: conn.id,
     orgId: site.orgId,
@@ -396,6 +407,8 @@ unifiRoutes.put('/controllers', partnerScopes, writePerm, requireMfa(), zValidat
     pollIntervalSeconds: body.pollIntervalSeconds,
     createdBy: auth.user.id,
   });
+  await revokeUnifiCollectorDrift(conn.id, collectorsBefore);
+  writeUnifiControllerAudits(c, conn.id, collectorsBefore, await snapshotUnifiCollectors(conn.id), collector.id);
   return c.json({ success: true, collectorId: collector.id });
 });
 
@@ -409,7 +422,11 @@ unifiRoutes.delete('/collectors/:hostId', partnerScopes, writePerm, requireMfa()
   const hostId = c.req.param('hostId');
   if (!hostId) return c.json({ success: false, message: 'hostId is required' }, 400);
   // Idempotent (see /disconnect): already-absent is the desired end state.
+  const collectorsBefore = await snapshotUnifiCollectors(conn.id);
   await deleteCollector(db, conn.id, hostId);
+  await revokeUnifiCollectorDrift(conn.id, collectorsBefore);
+  // A delete that matched nothing leaves the snapshots equal: no audit.
+  writeUnifiControllerAudits(c, conn.id, collectorsBefore, await snapshotUnifiCollectors(conn.id));
   return c.json({ success: true });
 });
 
@@ -431,9 +448,9 @@ unifiRoutes.get('/telemetry', partnerScopes, readPerm, async (c) => {
   // site outside their allowlist even within an org they can access. Unrestricted
   // (partner-wide) callers have canAccessSite undefined → no-op.
   if (auth.canAccessSite && !auth.canAccessSite(siteId)) return c.json({ error: 'Access to this site denied' }, 403);
-  const devicesOut = await db.select().from(unifiDeviceTelemetry).where(eq(unifiDeviceTelemetry.siteId, siteId));
-  const clientsOut = await db.select().from(unifiClients).where(eq(unifiClients.siteId, siteId));
-  return c.json({ devices: devicesOut, clients: clientsOut });
+  const devicesOut = await db.select().from(unifiDeviceTelemetry).where(and(eq(unifiDeviceTelemetry.siteId, siteId), eq(unifiDeviceTelemetry.orgId, site.orgId)));
+  const clientsOut = await db.select().from(unifiClients).where(and(eq(unifiClients.siteId, siteId), eq(unifiClients.orgId, site.orgId)));
+  return c.json({ devices: devicesOut.map(toUnifiTelemetryDevice), clients: clientsOut });
 });
 
 // POST /unifi/sync — manual sync trigger

@@ -11,8 +11,30 @@ const { supportUsageForOrgMock } = vi.hoisted(() => ({
   supportUsageForOrgMock: vi.fn(),
 }));
 
+// Portal registration W3 (#11380): portalAuthMiddleware re-checks the portal
+// access policy on every request. Not under test here, so it resolves like an
+// org with no policy rows: password allowed, today's behaviour (the gate itself
+// is covered in authOrgStatusGate.test.ts and auth.logout.test.ts).
+vi.mock('../services/portalAccessPolicy', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../services/portalAccessPolicy')>();
+  return {
+    ...actual,
+    resolvePortalAccessPolicy: async (orgId: string) => ({
+      orgId, partnerId: 'partner-1', entraTenant: null,
+      ...actual.pickEffectivePortalAccessPolicy(null, null, actual.getPortalSignInCapabilities(), { entraTenantProven: false }),
+    }),
+  };
+});
 vi.mock('../services/portal/supportUsage', () => ({
   supportUsageForOrg: supportUsageForOrgMock,
+}));
+
+const { portalHourBlockForOrgMock } = vi.hoisted(() => ({
+  portalHourBlockForOrgMock: vi.fn(),
+}));
+
+vi.mock('../services/portal/hourBlock', () => ({
+  portalHourBlockForOrg: portalHourBlockForOrgMock,
 }));
 
 vi.mock('nanoid', () => ({
@@ -21,6 +43,7 @@ vi.mock('nanoid', () => ({
 
 // Mock all services
 vi.mock('../services/password', () => ({
+  getDummyPasswordHash: vi.fn(async () => 'dummy-hash'),
   hashPassword: vi.fn().mockResolvedValue('hashed-password'),
   isPasswordStrong: vi.fn(() => ({ valid: true, errors: [] })),
   verifyPassword: vi.fn()
@@ -30,6 +53,14 @@ vi.mock('../services/email', () => ({
   getEmailService: vi.fn(() => ({
     sendPasswordReset: sendPasswordResetMock
   }))
+}));
+
+// #8972 W0: the comment POST locks the ticket row first (services/ticketRowLock.ts).
+vi.mock('../services/ticketRowLock', () => ({
+  lockTicketForWrite: vi.fn(async (_tx: unknown, id: string) => ({
+    id, orgId: 'org-123', partnerId: 'partner-1', status: 'open', deletedAt: null, workKind: 'support',
+  })),
+  lockTicketsForWrite: vi.fn(async () => new Map()),
 }));
 
 vi.mock('../db', () => ({
@@ -82,6 +113,13 @@ vi.mock('../services/tenantStatus', () => ({
 // as the tenantStatus mock immediately above — the resolver itself is covered
 // directly by `services/portal/timezone.test.ts` and the hydration contract by
 // `routes/portal/authOrgStatusGate.test.ts`.
+// #8166: the EDR portal leg reads its own flag row; off here (no extra select).
+vi.mock('../services/portal/edrVisibility', () => ({
+  isEdrVisibilityEnabled: vi.fn(async () => false),
+  edrEndpointProtectedSql: vi.fn(),
+  edrEndpointLinkedSql: vi.fn(),
+}));
+
 vi.mock('../services/portal/timezone', () => ({
   resolveOrgTimezone: vi.fn(async () => 'UTC'),
 }));
@@ -98,25 +136,52 @@ vi.mock('../services/ticketService', () => ({
   }
 }));
 
+// The unified backup read model (#6012) builds SQL fragments from schema
+// columns at module load, which this file's partial schema mock does not
+// carry. No test here exercises a backup handler, so it is stubbed whole.
+vi.mock('../services/backupHealthReadModel', () => ({
+  listBackupHealthRows: vi.fn(async () => ({ rows: [], nextCursor: null })),
+  getFirstPartyCoverageForDevices: vi.fn(async () => new Map()),
+  getProviderCoverageForDevices: vi.fn(async () => new Map()),
+}));
+
 vi.mock('../db/schema', () => ({
+  // services/patchSeverityOverlay.ts builds module-level SQL fragments from these at import time.
+  patches: { severity: 'patches.severity', category: 'patches.category' },
+  // Software summary ordering is constructed when the portal routes load.
+  softwareInventory: { name: 'softwareInventory.name', version: 'softwareInventory.version', vendor: 'softwareInventory.vendor' },
   assetCheckouts: {},
   backupConfigs: {},
   backupJobs: {},
   backupSlaEvents: {},
   backupVerifications: {},
+  deviceDisks: {},
+  deviceConnections: {},
+  deviceHardware: {},
+  deviceMemoryModules: {},
+  deviceNetwork: {},
+  deviceHardwareComponents: {},
+  deviceHardwareEvents: {},
+  deviceHardwareHealth: {},
   devicePatches: {},
+  OUTSTANDING_DEVICE_PATCH_STATUSES: ['pending'],
+  deviceVulnerabilities: {},
+  vulnerabilities: { severity: 'vulnerabilities.severity' },
   deviceWarranty: {},
   devices: {},
+  discoveredAssets: {},
   // The portal route graph transitively imports networkBaseline.ts, which reads
   // discoveredAssetTypeEnum.enumValues at module load — the full-module mock must
   // provide it or the whole suite fails to load.
   discoveredAssetTypeEnum: { enumValues: [] },
   huntressAgents: {},
   organizations: {},
+  partners: { id: 'partners.id', name: 'partners.name' },
   portalBranding: {},
   portalUsers: {},
   recoveryReadiness: {},
-  RESTORABLE_BACKUP_JOB_STATUSES: ['completed', 'partial'],
+  RESTORABLE_BACKUP_JOB_STATUSES: ['completed', 'completed_with_errors', 'partial'],
+  DEGRADED_BACKUP_JOB_STATUSES: ['completed_with_errors', 'partial'],
   s1Agents: {},
   securityStatus: {},
   ticketComments: {},
@@ -163,8 +228,6 @@ const mockSelectLimit = mockSelectResult;
 const mockSelectWhere = mockSelectResult;
 const mockSelectOrderLimitOffset = mockSelectResult;
 const mockSelectOrder = mockSelectResult;
-const mockSelectLeftJoinWhere = mockSelectResult;
-const mockSelectLeftJoinOrderLimitOffset = mockSelectResult;
 
 const mockUpdateReturning = (result: any) => ({
   set: vi.fn().mockReturnValue({
@@ -181,6 +244,7 @@ const portalUser = {
   name: 'Portal User',
   passwordHash: 'hash',
   authMethod: 'password',
+  browserAccess: 'granted',
   receiveNotifications: true,
   status: 'active',
   authEpoch: 1,
@@ -341,8 +405,9 @@ describe('portal routes', () => {
             id: 'portal-user-1',
             email: 'portal@example.com',
             orgId: 'f1b0c8a6-45d1-4f84-8b8b-0ad0ce620001',
-            authMethod: 'password',
-            partnerId: 'f1b0c8a6-45d1-4f84-8b8b-0ad0ce620777'
+            authMethod: 'password', browserAccess: 'granted',
+            partnerId: 'f1b0c8a6-45d1-4f84-8b8b-0ad0ce620777',
+            partnerName: 'CloudWise',
           }
         ]) as any)
         .mockReturnValueOnce(mockSelectLimit([]) as any); // password reset defaults enabled
@@ -366,7 +431,8 @@ describe('portal routes', () => {
         to: 'portal@example.com',
         resetUrl: 'http://localhost:4321/portal/reset-password?token=nanoid-token&orgId=f1b0c8a6-45d1-4f84-8b8b-0ad0ce620001',
         purpose: 'portal.password_reset',
-        partnerId: 'f1b0c8a6-45d1-4f84-8b8b-0ad0ce620777'
+        partnerId: 'f1b0c8a6-45d1-4f84-8b8b-0ad0ce620777',
+        partnerName: 'CloudWise',
       });
     });
 
@@ -376,7 +442,7 @@ describe('portal routes', () => {
           id: 'portal-user-1',
           email: 'portal@example.com',
           orgId: 'f1b0c8a6-45d1-4f84-8b8b-0ad0ce620001',
-          authMethod: 'password',
+          authMethod: 'password', browserAccess: 'granted',
         }]) as any)
         .mockReturnValueOnce(mockSelectLimit([{ enablePasswordReset: false }]) as any);
 
@@ -404,7 +470,8 @@ describe('portal routes', () => {
             id: 'portal-user-1',
             email: 'portal@example.com',
             orgId: 'org-123',
-            authMethod: 'password'
+            authMethod: 'password', browserAccess: 'granted',
+            authEpoch: 1
           }
         ]) as any)
         .mockReturnValueOnce(mockSelectLimit([]) as any); // issuance feature flag
@@ -431,7 +498,8 @@ describe('portal routes', () => {
       } as any);
 
       vi.mocked(db.select)
-        .mockReturnValueOnce(mockSelectLimit([{ orgId: 'org-123', authMethod: 'password' }]) as any)
+        // validatePortalCapability's row select: must match the v2 token payload.
+        .mockReturnValueOnce(mockSelectLimit([{ ...portalUser, orgId: 'org-123', browserAccess: 'granted' }]) as any)
         .mockReturnValueOnce(mockSelectLimit([]) as any); // consumption feature flag
 
       const res = await app.request('/portal/auth/reset-password', {
@@ -471,7 +539,8 @@ describe('portal routes', () => {
           id: 'portal-user-reset-disabled',
           email: 'reset-disabled@example.com',
           orgId: 'org-reset-disabled',
-          authMethod: 'password',
+          authMethod: 'password', browserAccess: 'granted',
+          authEpoch: 1,
         }]) as any)
         .mockReturnValueOnce(mockSelectLimit([{ enablePasswordReset: true }]) as any);
 
@@ -482,7 +551,12 @@ describe('portal routes', () => {
       });
 
       vi.mocked(db.select)
-        .mockReturnValueOnce(mockSelectLimit([{ orgId: 'org-reset-disabled', authMethod: 'password' }]) as any)
+        .mockReturnValueOnce(mockSelectLimit([{
+          ...portalUser,
+          id: 'portal-user-reset-disabled',
+          email: 'reset-disabled@example.com',
+          orgId: 'org-reset-disabled',
+        }]) as any)
         .mockReturnValueOnce(mockSelectLimit([{ enablePasswordReset: false }]) as any);
 
       const res = await app.request('/portal/auth/reset-password', {
@@ -714,7 +788,7 @@ describe('portal routes', () => {
           submittedBy: portalUser.id,
           submitterEmail: portalUser.email
         }),
-        expect.objectContaining({ userId: portalUser.id })
+        expect.objectContaining({ kind: 'portal_user', portalUserId: portalUser.id, email: portalUser.email })
       );
     });
   });
@@ -924,7 +998,7 @@ describe('portal routes', () => {
       expect(await res.json()).toMatchObject({ code: 'PORTAL_ASSET_CHECKOUT_DISABLED' });
     });
 
-    it('should return available assets', async () => {
+    it('returns the assets checked out to the portal user', async () => {
       vi.mocked(db.select)
         .mockReturnValueOnce(
           mockSelectLimit([
@@ -937,9 +1011,10 @@ describe('portal routes', () => {
           ]) as any
         )
         .mockReturnValueOnce(mockSelectLimit([]) as any) // asset checkout defaults enabled
-        .mockReturnValueOnce(mockSelectLeftJoinWhere([{ count: 1 }]) as any)
+        .mockReturnValueOnce(mockSelectWhere([]) as any) // EXISTS(open checkout held by this user) subquery
+        .mockReturnValueOnce(mockSelectWhere([{ count: 1 }]) as any)
         .mockReturnValueOnce(
-          mockSelectLeftJoinOrderLimitOffset([
+          mockSelectOrderLimitOffset([
             {
               id: 'device-1',
               hostname: 'asset-1',
@@ -1379,6 +1454,63 @@ describe('portal routes', () => {
       expect(supportUsageForOrgMock).toHaveBeenCalledWith(
         expect.objectContaining({ month: '2026-09' })
       );
+    });
+
+    describe('GET /portal/support-usage/hour-block (block hours W04)', () => {
+      const path = '/portal/support-usage/hour-block';
+
+      it('returns 401 with no Authorization header', async () => {
+        const res = await app.request(path);
+        expect(res.status).toBe(401);
+        expect(portalHourBlockForOrgMock).not.toHaveBeenCalled();
+      });
+
+      it('returns 403 PORTAL_SUPPORT_USAGE_DISABLED when the Support usage section is off (no row)', async () => {
+        vi.mocked(db.select)
+          .mockReturnValueOnce(mockSelectLimit([portalUser]) as any) // loginUser()
+          .mockReturnValueOnce(mockSelectLimit([portalUser]) as any) // portalAuthMiddleware hydration
+          .mockReturnValueOnce(mockSelectLimit([]) as any); // enableSupportUsage gate: no row → fail closed
+
+        const token = await loginUser();
+        const res = await app.request(path, { headers: { Authorization: `Bearer ${token}` } });
+
+        expect(res.status).toBe(403);
+        expect(await res.json()).toMatchObject({ code: 'PORTAL_SUPPORT_USAGE_DISABLED' });
+        expect(portalHourBlockForOrgMock).not.toHaveBeenCalled();
+      });
+
+      it('returns 403 PORTAL_HOUR_BLOCK_DISABLED when Support usage is on but Support hours is off', async () => {
+        vi.mocked(db.select)
+          .mockReturnValueOnce(mockSelectLimit([portalUser]) as any)
+          .mockReturnValueOnce(mockSelectLimit([portalUser]) as any)
+          .mockReturnValueOnce(mockSelectLimit([{ enableSupportUsage: true }]) as any)
+          .mockReturnValueOnce(mockSelectLimit([{ enableHourBlock: false }]) as any);
+
+        const token = await loginUser();
+        const res = await app.request(path, { headers: { Authorization: `Bearer ${token}` } });
+
+        expect(res.status).toBe(403);
+        expect(await res.json()).toMatchObject({ code: 'PORTAL_HOUR_BLOCK_DISABLED' });
+        expect(portalHourBlockForOrgMock).not.toHaveBeenCalled();
+      });
+
+      it('returns 200 and reads only the session org when both flags are on, even with tickets disabled', async () => {
+        vi.mocked(db.select)
+          .mockReturnValueOnce(mockSelectLimit([portalUser]) as any)
+          .mockReturnValueOnce(mockSelectLimit([portalUser]) as any)
+          .mockReturnValueOnce(mockSelectLimit([{ enableSupportUsage: true }]) as any)
+          .mockReturnValueOnce(mockSelectLimit([{ enableHourBlock: true }]) as any);
+        portalHourBlockForOrgMock.mockResolvedValue({ hourBlock: null, startsOn: null });
+
+        const token = await loginUser();
+        const res = await app.request(`${path}?orgId=00000000-0000-4000-8000-000000000000`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+
+        expect(res.status).toBe(200);
+        expect(await res.json()).toEqual({ hourBlock: null, startsOn: null });
+        expect(portalHourBlockForOrgMock).toHaveBeenCalledWith({ orgId: portalUser.orgId });
+      });
     });
   });
 });

@@ -1,4 +1,12 @@
+import { findPartnerOwnedGroupIds } from '../../services/deviceGroupOwnership';
+vi.mock('../../services/deviceGroupOwnership', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../services/deviceGroupOwnership')>()),
+  findPartnerOwnedGroupIds: vi.fn(async () => [] as string[]),
+}));
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+// The holding-org refusal reads the org; the db mocks below do not model it.
+vi.mock('../../services/unassignedPool/protectedOrg', () => ({ isHoldingOrg: vi.fn(async () => false) }));
 import { Hono } from 'hono';
 import { slaRoutes } from './sla';
 
@@ -109,6 +117,21 @@ vi.mock('../../middleware/auth', () => ({
 import { authMiddleware } from '../../middleware/auth';
 
 describe('sla routes', () => {
+  it.each(['POST', 'PATCH'])('refuses partner group SLA targets without persisting (%s)', async (method) => {
+    const groupId = '77777777-7777-4777-8777-777777777777';
+    vi.mocked(findPartnerOwnedGroupIds).mockResolvedValueOnce([groupId]);
+
+    const res = await app.request(method === 'POST' ? '/backup/sla/configs' : `/backup/sla/configs/${CONFIG_ID}`, {
+      method, headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({name:'SLA',rpoTargetMinutes:60,rtoTargetMinutes:120,targetGroups:[groupId]}),
+    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ code: 'PARTNER_GROUP_TARGET_UNSUPPORTED', groupIds: [groupId] });
+    expect(insertMock).not.toHaveBeenCalled();
+    expect(updateMock).not.toHaveBeenCalled();
+    expect(findPartnerOwnedGroupIds).toHaveBeenCalledWith([groupId]);
+  });
+
   let app: Hono;
 
   beforeEach(() => {
@@ -283,7 +306,7 @@ describe('sla routes', () => {
     expect(body.data.avgRtoMinutes).toBe(45);
   });
 
-  it('narrows the SLA dashboard to allowed device sites (SEC-021 sibling)', async () => {
+  it('narrows the SLA dashboard to allowed device sites (same rule as /backup/health)', async () => {
     permissionsState = { allowedSiteIds: [SITE_A] };
     const breachesChain = chainMock([{ count: 1 }]);
     const eventsChain = chainMock([{ count: 4 }]);

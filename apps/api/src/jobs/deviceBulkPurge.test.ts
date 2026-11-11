@@ -30,7 +30,7 @@ vi.mock('../services/agentOrgRateLimit', () => ({
   invalidateOrgDeviceCount: vi.fn(async () => undefined),
 }));
 vi.mock('../services/deviceLifecycle', () => ({
-  purgeRemovedDevice: vi.fn(async () => ({ linkGroupId: null, linkGroupDissolved: false })),
+  purgeRemovedDevice: vi.fn(async () => ({ linkGroupId: null, linkGroupDissolved: false, detachedTopologyAlerts: 0 })),
   DeviceLifecycleError: class DeviceLifecycleError extends Error {
     constructor(public code: string, message: string) {
       super(message);
@@ -40,6 +40,19 @@ vi.mock('../services/deviceLifecycle', () => ({
       return this.code === 'NOT_FOUND' ? 404 : 409;
     }
   },
+}));
+
+// #8117 — screenshot keys are read in each device's purge transaction and the
+// files removed after it commits (file side: screenshotStorage.files.test.ts).
+const screenshotMocks = vi.hoisted(() => ({
+  listDeviceScreenshotStorageKeys: vi.fn(async (_tx: unknown, deviceId: string) => [`screenshots/o/${deviceId}/f.jpg`]),
+  removeScreenshotFiles: vi.fn(async (_keys: readonly string[], _context: string) => ({ removed: 1, missing: 0, failed: 0 })),
+}));
+vi.mock('../services/screenshotStorage', () => ({
+  listDeviceScreenshotStorageKeys: screenshotMocks.listDeviceScreenshotStorageKeys,
+}));
+vi.mock('../services/screenshotFiles', () => ({
+  removeScreenshotFiles: screenshotMocks.removeScreenshotFiles,
 }));
 
 /** Org id the fake `SELECT org_id ... FOR UPDATE` reports per device. */
@@ -76,6 +89,7 @@ import { purgeRemovedDevice, DeviceLifecycleError } from '../services/deviceLife
 import { createAuditLog } from '../services/auditService';
 import { invalidateOrgDeviceCount } from '../services/agentOrgRateLimit';
 import { enqueueOrReplaceStale } from '../services/bullmqUtils';
+import { db } from '../db';
 
 function payload(overrides: Partial<DeviceBulkPurgeJobPayload> = {}): DeviceBulkPurgeJobPayload {
   return {
@@ -91,6 +105,15 @@ function payload(overrides: Partial<DeviceBulkPurgeJobPayload> = {}): DeviceBulk
     ...overrides,
   };
 }
+
+/** A successful purge as the service reports it (#11153 adds the uninstall fields). */
+const PURGED = {
+  linkGroupId: null,
+  linkGroupDissolved: false,
+  detachedTopologyAlerts: 0,
+  uninstallState: 'completed' as const,
+  forced: false,
+};
 
 function fakeJob(data: DeviceBulkPurgeJobPayload, name = 'device-bulk-purge-v2') {
   const progress: unknown[] = [];
@@ -110,7 +133,7 @@ beforeEach(() => {
   lockedOrgByDevice.clear();
   lockedOrgByDevice.set(DEV_1, ORG_A);
   lockedOrgByDevice.set(DEV_2, ORG_A);
-  vi.mocked(purgeRemovedDevice).mockResolvedValue({ linkGroupId: null, linkGroupDissolved: false });
+  vi.mocked(purgeRemovedDevice).mockResolvedValue(PURGED);
 });
 
 describe('processDeviceBulkPurgeJob', () => {
@@ -145,7 +168,7 @@ describe('processDeviceBulkPurgeJob', () => {
     vi.mocked(purgeRemovedDevice).mockImplementation(async (_tx, id) => {
       if (id === DEV_1) throw new DeviceLifecycleError('UNINSTALL_PENDING', 'queued');
       if (id === DEV_2) throw new DeviceLifecycleError('NOT_REMOVED', 'restored');
-      return { linkGroupId: null, linkGroupDissolved: false };
+      return PURGED;
     });
 
     const { job } = fakeJob(payload());
@@ -160,6 +183,43 @@ describe('processDeviceBulkPurgeJob', () => {
     expect(purgeRemovedDevice).toHaveBeenCalledTimes(2);
   });
 
+  it('skips an unconfirmed uninstall as UNINSTALL_NOT_CONFIRMED and never forces (#11153)', async () => {
+    vi.mocked(purgeRemovedDevice).mockImplementation(async (_tx, id) => {
+      if (id === DEV_1) {
+        throw new DeviceLifecycleError('UNINSTALL_NOT_CONFIRMED', 'not confirmed', { uninstallState: 'expired' });
+      }
+      return { ...PURGED, uninstallState: 'completed' };
+    });
+
+    const { job } = fakeJob(payload());
+    const result = (await processDeviceBulkPurgeJob(job as never)) as DeviceBulkPurgeResult;
+
+    expect(result.skipped).toEqual([{ deviceId: DEV_1, code: 'UNINSTALL_NOT_CONFIRMED' }]);
+    expect(result.purged).toEqual([DEV_2]);
+    // Bulk has no "delete anyway": the fourth (options) argument is never a force.
+    expect(vi.mocked(purgeRemovedDevice).mock.calls).toHaveLength(2);
+    for (const call of vi.mocked(purgeRemovedDevice).mock.calls) {
+      expect((call[3] as { force?: boolean } | undefined)?.force).not.toBe(true);
+    }
+  });
+
+  it('records the uninstall state in each per-device audit entry (#11153)', async () => {
+    vi.mocked(purgeRemovedDevice).mockImplementation(async (_tx, id) =>
+      ({ ...PURGED, uninstallState: id === DEV_1 ? 'reattached' : 'completed' }));
+
+    const { job } = fakeJob(payload());
+    await processDeviceBulkPurgeJob(job as never);
+
+    expect(createAuditLog).toHaveBeenCalledWith(expect.objectContaining({
+      resourceId: DEV_1,
+      details: expect.objectContaining({ uninstallState: 'reattached', force: false }),
+    }));
+    expect(createAuditLog).toHaveBeenCalledWith(expect.objectContaining({
+      resourceId: DEV_2,
+      details: expect.objectContaining({ uninstallState: 'completed', force: false }),
+    }));
+  });
+
   it('re-applies the serialized site ceiling inside every worker transaction', async () => {
     const ceiling = ['site-visible'];
     vi.mocked(purgeRemovedDevice).mockImplementation(async (_tx, id, allowedSiteIds) => {
@@ -170,7 +230,7 @@ describe('processDeviceBulkPurgeJob', () => {
           'Device access or linked state changed before deletion',
         );
       }
-      return { linkGroupId: null, linkGroupDissolved: false };
+      return PURGED;
     });
 
     const { job } = fakeJob(payload({
@@ -214,7 +274,7 @@ describe('processDeviceBulkPurgeJob', () => {
     try {
       vi.mocked(purgeRemovedDevice).mockImplementation(async (_tx, id) => {
         if (id === DEV_1) throw new Error('connection terminated');
-        return { linkGroupId: null, linkGroupDissolved: false };
+        return PURGED;
       });
 
       const { job } = fakeJob(payload());
@@ -267,11 +327,11 @@ describe('processDeviceBulkPurgeJob', () => {
    * were never in the selection, and the operator who ran a 200-device purge
    * has no other way to find out it happened.
    */
-  it('records a dissolved link group in the per-device audit entry', async () => {
+  it('records detached topology alerts and a dissolved link group in the per-device audit entry', async () => {
     vi.mocked(purgeRemovedDevice).mockImplementation(async (_tx, id) =>
       id === DEV_1
-        ? { linkGroupId: 'grp-vm-1', linkGroupDissolved: true }
-        : { linkGroupId: null, linkGroupDissolved: false },
+        ? { ...PURGED, linkGroupId: 'grp-vm-1', linkGroupDissolved: true, detachedTopologyAlerts: 2 }
+        : PURGED,
     );
 
     const { job } = fakeJob(payload());
@@ -280,7 +340,7 @@ describe('processDeviceBulkPurgeJob', () => {
     expect(createAuditLog).toHaveBeenCalledWith(
       expect.objectContaining({
         resourceId: DEV_1,
-        details: expect.objectContaining({ linkGroupId: 'grp-vm-1', linkGroupDissolved: true }),
+        details: expect.objectContaining({ linkGroupId: 'grp-vm-1', linkGroupDissolved: true, detachedTopologyAlerts: 2 }),
       }),
     );
   });
@@ -296,6 +356,7 @@ describe('processDeviceBulkPurgeJob', () => {
     for (const d of details) {
       expect(d).not.toHaveProperty('linkGroupId');
       expect(d).not.toHaveProperty('linkGroupDissolved');
+      expect(d).not.toHaveProperty('detachedTopologyAlerts');
     }
   });
 
@@ -383,5 +444,58 @@ describe('createDeviceBulkPurgeWorker', () => {
     // Concurrency 1: the cascade takes wide row locks across ~40 tables, and
     // two of these racing on the same org is contention for no throughput win.
     expect(options.concurrency).toBe(1);
+  });
+});
+
+describe('processDeviceBulkPurgeJob — helper screenshot files (#8117)', () => {
+  it('removes a purged device\'s screenshot files only after its transaction commits', async () => {
+    const events: string[] = [];
+    vi.mocked(db.transaction).mockImplementationOnce(async (cb: any) => {
+      const result = await cb({
+        execute: vi.fn(async () => [{ org_id: ORG_A }]),
+      });
+      events.push('commit');
+      return result;
+    });
+    screenshotMocks.removeScreenshotFiles.mockImplementationOnce(async () => {
+      events.push('unlink');
+      return { removed: 1, missing: 0, failed: 0 };
+    });
+
+    const { job } = fakeJob(payload({ targets: [{ deviceId: DEV_1, orgId: ORG_A, hostname: 'host-1' }] }));
+    const result = (await processDeviceBulkPurgeJob(job as never)) as DeviceBulkPurgeResult;
+
+    expect(result.purged).toEqual([DEV_1]);
+    expect(screenshotMocks.listDeviceScreenshotStorageKeys).toHaveBeenCalledWith(expect.anything(), DEV_1);
+    expect(screenshotMocks.removeScreenshotFiles).toHaveBeenCalledWith(
+      [`screenshots/o/${DEV_1}/f.jpg`],
+      expect.stringContaining(DEV_1),
+    );
+    expect(events).toEqual(['commit', 'unlink']);
+  });
+
+  it('removes no files for a skipped or refused device', async () => {
+    lockedOrgByDevice.set(DEV_1, ORG_B); // ORG_CHANGED before the purge
+    vi.mocked(purgeRemovedDevice).mockImplementation(async (_tx, id) => {
+      // Refused AFTER the keys were read: the transaction rolls back.
+      if (id === DEV_2) throw new DeviceLifecycleError('UNINSTALL_PENDING', 'queued');
+      return PURGED;
+    });
+
+    const { job } = fakeJob(payload());
+    const result = (await processDeviceBulkPurgeJob(job as never)) as DeviceBulkPurgeResult;
+
+    expect(result.purged).toEqual([]);
+    expect(screenshotMocks.removeScreenshotFiles).not.toHaveBeenCalled();
+  });
+
+  it('counts the device as purged even when its files cannot be removed', async () => {
+    screenshotMocks.removeScreenshotFiles.mockResolvedValue({ removed: 0, missing: 0, failed: 1 });
+
+    const { job } = fakeJob(payload());
+    const result = (await processDeviceBulkPurgeJob(job as never)) as DeviceBulkPurgeResult;
+
+    expect(result.purged).toEqual([DEV_1, DEV_2]);
+    expect(screenshotMocks.removeScreenshotFiles).toHaveBeenCalledTimes(2);
   });
 });

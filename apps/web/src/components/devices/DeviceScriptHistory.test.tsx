@@ -16,6 +16,7 @@ vi.mock('../shared/Toast', () => ({ showToast: vi.fn() }));
 
 type MockExecuteModalProps = {
   script: { id: string; name: string };
+  orgId?: string;
   initialDeviceIds?: string[];
   initialParameters?: Record<string, string | number | boolean>;
   onExecute: (
@@ -28,8 +29,9 @@ type MockExecuteModalProps = {
 };
 
 vi.mock('../scripts/ScriptExecutionModal', () => ({
-  default: ({ script, initialDeviceIds, initialParameters, onExecute, onClose }: MockExecuteModalProps) => (
+  default: ({ script, orgId, initialDeviceIds, initialParameters, onExecute, onClose }: MockExecuteModalProps) => (
     <div data-testid="mock-execution-modal">
+      <div data-testid="mock-org-id">{orgId ?? ''}</div>
       <div data-testid="mock-script-name">{script.name}</div>
       <div data-testid="mock-initial-device-ids">{JSON.stringify(initialDeviceIds ?? null)}</div>
       <div data-testid="mock-initial-parameters">{JSON.stringify(initialParameters ?? null)}</div>
@@ -74,6 +76,8 @@ const scriptDetail = {
 
 describe('DeviceScriptHistory "Run again" (#4885)', () => {
   beforeEach(() => {
+    // These suites exercise the chronological table (#7413 made per-script latest the default).
+    window.location.hash = '#scripts/view=all';
     vi.clearAllMocks();
     fetchWithAuthMock.mockImplementation(async (input: string) => {
       const url = String(input);
@@ -88,7 +92,7 @@ describe('DeviceScriptHistory "Run again" (#4885)', () => {
   });
 
   async function openDetails() {
-    render(<DeviceScriptHistory deviceId={DEVICE_ID} />);
+    render(<DeviceScriptHistory deviceId={DEVICE_ID} orgId="org-b" />);
     fireEvent.click(await screen.findByText('Collect Inventory'));
     return screen.findByText('Execution Details');
   }
@@ -104,6 +108,13 @@ describe('DeviceScriptHistory "Run again" (#4885)', () => {
     expect(screen.getByTestId('mock-initial-parameters')).toHaveTextContent(JSON.stringify({ target: 'C:\\Temp' }));
     // The details view closed in favor of the execute flow.
     expect(screen.queryByText('Execution Details')).toBeNull();
+  });
+
+  it('pins the execute modal to the device org (#7479)', async () => {
+    await openDetails();
+    fireEvent.click(screen.getByTestId('device-script-run-again'));
+    expect(await screen.findByTestId('mock-execution-modal')).toBeInTheDocument();
+    expect(screen.getByTestId('mock-org-id')).toHaveTextContent('org-b');
   });
 
   it('refreshes history after a successful "Run again" submission', async () => {
@@ -184,6 +195,8 @@ describe('DeviceScriptHistory "Run again" (#4885)', () => {
 
 describe('DeviceScriptHistory highlighted execution (#4886)', () => {
   beforeEach(() => {
+    // These suites exercise the chronological table (#7413 made per-script latest the default).
+    window.location.hash = '#scripts/view=all';
     vi.clearAllMocks();
     fetchWithAuthMock.mockImplementation(async (input: string) => {
       const url = String(input);
@@ -270,6 +283,8 @@ describe('DeviceScriptHistory run context (#4888)', () => {
   }
 
   beforeEach(() => {
+    // These suites exercise the chronological table (#7413 made per-script latest the default).
+    window.location.hash = '#scripts/view=all';
     vi.clearAllMocks();
   });
 
@@ -321,6 +336,8 @@ describe('DeviceScriptHistory AI initiator chip (#5022 W02)', () => {
   }
 
   beforeEach(() => {
+    // These suites exercise the chronological table (#7413 made per-script latest the default).
+    window.location.hash = '#scripts/view=all';
     vi.clearAllMocks();
   });
 
@@ -351,5 +368,57 @@ describe('DeviceScriptHistory AI initiator chip (#5022 W02)', () => {
     expect(screen.getByTestId('run-context-chip')).toBeInTheDocument();
     // Two chips render: the row's and the detail drawer's.
     expect(screen.getAllByTestId('ai-initiator-chip').length).toBeGreaterThanOrEqual(1);
+  });
+});
+
+// #9563 — the device page's post-run details read "Queued — device offline"
+// while the header above it said Online. `queued` only means no live agent
+// session took the command; the device's own status decides the copy.
+describe('DeviceScriptHistory queued copy follows the device status (#9563)', () => {
+  beforeEach(() => {
+    window.location.hash = '#scripts/view=all';
+    vi.clearAllMocks();
+    fetchWithAuthMock.mockImplementation(async (input: string) => {
+      const url = String(input);
+      if (url === `/devices/${DEVICE_ID}/scripts`) {
+        return jsonResponse({ data: [{
+          ...executionRow,
+          status: 'queued',
+          exitCode: null,
+          stdout: '',
+          startedAt: null,
+          completedAt: null,
+          createdAt: '2026-02-08T00:00:00.000Z',
+        }] });
+      }
+      return jsonResponse({}, 404);
+    });
+  });
+
+  it('an online device shows awaiting-pickup copy, never "device offline"', async () => {
+    render(<DeviceScriptHistory deviceId={DEVICE_ID} deviceStatus="online" highlightExecutionId="exec-1" />);
+
+    expect(await screen.findByText('Queued — waiting for the device to pick it up')).toBeInTheDocument();
+    expect(screen.getByText('Queued — awaiting pickup')).toBeInTheDocument();
+    expect(screen.queryByText(/device offline/i)).toBeNull();
+  });
+
+  it('the default per-script latest view badge follows the device status too', async () => {
+    window.location.hash = '#scripts';
+    const { unmount } = render(<DeviceScriptHistory deviceId={DEVICE_ID} deviceStatus="offline" />);
+    expect((await screen.findByTestId('device-script-latest-status-script-1')).textContent).toBe('Queued — device offline');
+    unmount();
+
+    render(<DeviceScriptHistory deviceId={DEVICE_ID} deviceStatus="online" />);
+    expect((await screen.findByTestId('device-script-latest-status-script-1')).textContent).toBe('Queued — awaiting pickup');
+  });
+
+  it('an offline device keeps the device-offline copy', async () => {
+    render(<DeviceScriptHistory deviceId={DEVICE_ID} deviceStatus="offline" highlightExecutionId="exec-1" />);
+
+    expect(await screen.findByText('Execution Details')).toBeInTheDocument();
+    // Row chip and detail banner both say offline.
+    expect(screen.getAllByText('Queued — device offline').length).toBeGreaterThanOrEqual(2);
+    expect(screen.getByText(/device is offline/i)).toBeInTheDocument();
   });
 });

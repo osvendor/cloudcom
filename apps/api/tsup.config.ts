@@ -12,10 +12,15 @@ export default defineConfig({
     // pattern as scripts/recover-stuck-agents below, so worker.cjs lands at
     // dist/worker.cjs (the compose `worker` service's `command`).
     worker: 'src/worker.ts',
+    'scripts/credentials-import': 'scripts/credentials-import.ts',
+    'scripts/documentation-import': 'scripts/documentation-import.ts',
     'scripts/recover-stuck-agents': 'scripts/recover-stuck-agents.ts',
     // #6605: `node dist/scripts/upgrade-preflight.cjs [--strict]` — run the new
     // image against the current database before upgrading.
     'scripts/upgrade-preflight': 'scripts/upgrade-preflight.ts',
+    // #8865 W1a: `node dist/scripts/verify-acceptance-hashes.cjs --limit 100` —
+    // re-verify stored quote acceptance hashes after a freeze-path deploy.
+    'scripts/verify-acceptance-hashes': 'scripts/verify-acceptance-hashes.ts',
   },
   format: ['cjs'],
   // @breeze/api is a deployed application, not a consumed library: package.json

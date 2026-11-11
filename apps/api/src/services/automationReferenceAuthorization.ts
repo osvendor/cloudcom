@@ -6,13 +6,17 @@ import {
   softwareCatalog,
   softwareVersions,
 } from '../db/schema';
+import { selectNotificationChannelsWithConfig, type NotificationChannelWithConfig } from './notificationChannelConfig';
 import type { NormalizedAutomationAction } from './automationRuntime';
 
 type DbTransaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
 type ScriptRow = typeof scripts.$inferSelect;
 type CatalogRow = typeof softwareCatalog.$inferSelect;
 type VersionRow = typeof softwareVersions.$inferSelect;
-type ChannelRow = typeof notificationChannels.$inferSelect;
+// Carries `config` from notification_channel_configs (#6379). Sends run under
+// system scope, so the value is present there; under a narrower context it is
+// null for a channel the context does not own.
+type ChannelRow = NotificationChannelWithConfig;
 
 export type AutomationReferenceOwner =
   | { scope: 'organization'; orgId: string; partnerId: string }
@@ -34,7 +38,7 @@ export class AutomationReferenceAuthorizationError extends Error {
   }
 }
 
-function scriptOwnershipCondition(owner: AutomationReferenceOwner): SQL {
+export function scriptOwnershipCondition(owner: AutomationReferenceOwner): SQL {
   if (owner.scope === 'partner') {
     return or(
       eq(scripts.isSystem, true),
@@ -173,6 +177,8 @@ export async function resolveOwnedAutomationReferences(
       .where(and(
         inArray(softwareVersions.catalogId, [...catalogIds]),
         eq(softwareVersions.isLatest, true),
+        // Archived packages (#4980) resolve as missing, like deleted ones.
+        isNull(softwareCatalog.deletedAt),
         catalogOwnershipCondition(owner),
       ));
 
@@ -193,13 +199,13 @@ export async function resolveOwnedAutomationReferences(
   }
 
   if (channelIds.size > 0) {
-    const rows = await tx
-      .select()
-      .from(notificationChannels)
-      .where(and(
+    const rows = await selectNotificationChannelsWithConfig(
+      and(
         inArray(notificationChannels.id, [...channelIds]),
         channelOwnershipCondition(owner),
-      ));
+      ),
+      { executor: tx },
+    );
 
     for (const row of rows) {
       if (channelIds.has(row.id) && ownsXorRow(row, owner)) {

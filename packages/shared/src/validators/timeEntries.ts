@@ -1,26 +1,82 @@
 import { z } from 'zod';
 import { optionalQueryBoolean } from './queryParams';
 
-export const billingStatusSchema = z.enum(['not_billed', 'billed', 'no_charge', 'contract']);
+// 'awaiting_approval' (#4617): held from billing until the customer approves.
+// Readable (list filter, responses) but never client-writable: only the
+// server-side approval gate sets or clears it.
+export const billingStatusSchema = z.enum(['not_billed', 'billed', 'no_charge', 'contract', 'awaiting_approval']);
 export type BillingStatus = z.infer<typeof billingStatusSchema>;
 // `billed` is an invoice lifecycle fact, not a routine time/part disposition.
 // Invoice issue writes it internally after locking the invoice and every source;
 // public create/update inputs retain the technician-owned dispositions only.
+// `awaiting_approval` is excluded for the same reason (the approval gate owns it).
 const routineBillingStatusSchema = z.enum(['not_billed', 'no_charge', 'contract']);
 
 const CLOCK_SKEW_MS = 5 * 60_000;
 const notFarFuture = (d: Date) => d.getTime() <= Date.now() + CLOCK_SKEW_MS;
+
+/**
+ * A `z.coerce.date()` field that reports a plain "<field> is required" when
+ * the value is missing, instead of zod v4's self-contradictory "Expected
+ * date, received Date" (paper cut G2-4, #6497 — `new Date(undefined)` coerces
+ * to an Invalid Date rather than throwing, so bare `z.coerce.date()` never
+ * gets the chance to say the field is absent). A single custom issue, not a
+ * union, so it survives error formatters that unwrap `invalid_union` issues
+ * into their per-branch messages (see `apps/api/src/lib/validation.ts`
+ * `collectIssues`).
+ */
+function requiredDate(fieldName: string) {
+  return z.any().transform((val, ctx) => {
+    // `z.coerce.date()` runs `new Date(val)`, and `new Date(null)`,
+    // `new Date(false)`, and `new Date(0)` all evaluate to a "valid"
+    // 1970-01-01 epoch Date rather than throwing — so a `null`/boolean/`0`
+    // sentinel for "not set" would otherwise sail through coercion and
+    // silently create a ~56-year-long time entry instead of being rejected
+    // the same way an omitted field is. Reject every non-date-like input
+    // shape up front; only strings, finite numbers, and Date instances are
+    // allowed to reach coercion.
+    if (
+      val === undefined ||
+      val === null ||
+      typeof val === 'boolean' ||
+      val === 0 ||
+      !(typeof val === 'string' || (typeof val === 'number' && Number.isFinite(val)) || val instanceof Date)
+    ) {
+      ctx.addIssue({ code: 'custom', message: `${fieldName} is required` });
+      return z.NEVER;
+    }
+    const parsed = z.coerce.date().safeParse(val);
+    if (!parsed.success) {
+      ctx.addIssue({ code: 'custom', message: `${fieldName} must be a valid date` });
+      return z.NEVER;
+    }
+    return parsed.data;
+  });
+}
 
 // Currency is never accepted from the client on entries or parts: the server
 // stamps `currency_code` once (ticket org currency at creation / first attach,
 // partner currency when a standalone entry first carries a rate) and never
 // restamps it (multi-currency spec §7). Editing hourlyRate/unitPrice does not
 // change the snapshot; billed rows reject monetary edits (ENTRY_BILLED / PART_BILLED).
+// #4186: the only provenance values a client may assert. 'timer' is the /start
+// default; 'location' marks an arrival-prompt start (and its offline replay on
+// POST /). Every other source stays server-stamped.
+export const clientTimeEntrySourceSchema = z.enum(['timer', 'location']);
+
+const siteRequiresOrgOrTicket = {
+  check: (v: { siteId?: string; orgId?: string; ticketId?: string }) => !v.siteId || !!v.orgId || !!v.ticketId,
+  params: { message: 'siteId requires orgId or ticketId', path: ['siteId'] }
+};
+
 export const createTimeEntrySchema = z.object({
   workTypeId: z.string().uuid().nullable().optional(),
   ticketId: z.string().guid().optional(),
-  startedAt: z.coerce.date().refine(notFarFuture, { message: 'startedAt cannot be in the future' }),
-  endedAt: z.coerce.date(),
+  orgId: z.string().guid().optional(),
+  siteId: z.string().guid().optional(),
+  source: z.literal('location').optional(),
+  startedAt: requiredDate('startedAt').refine(notFarFuture, { message: 'startedAt cannot be in the future' }),
+  endedAt: requiredDate('endedAt'),
   description: z.string().max(10_000).optional(),
   isBillable: z.boolean().optional(),
   hourlyRate: z.number().nonnegative().multipleOf(0.01).nullable().optional(),
@@ -29,7 +85,7 @@ export const createTimeEntrySchema = z.object({
 }).refine((v) => v.endedAt.getTime() > v.startedAt.getTime(), {
   message: 'endedAt must be after startedAt',
   path: ['endedAt']
-});
+}).refine(siteRequiresOrgOrTicket.check, siteRequiresOrgOrTicket.params);
 
 export const updateTimeEntrySchema = z.object({
   resetBilling: z.boolean().optional(),
@@ -47,8 +103,13 @@ export const updateTimeEntrySchema = z.object({
 export const startTimerSchema = z.object({
   workTypeId: z.string().uuid().nullable().optional(),
   ticketId: z.string().guid().optional(),
-  description: z.string().max(10_000).optional()
-});
+  orgId: z.string().guid().optional(),
+  siteId: z.string().guid().optional(),
+  source: clientTimeEntrySourceSchema.optional(),
+  description: z.string().max(10_000).optional(),
+  // #4617: "log as non-billable" when a hard approval policy refuses a billable start.
+  isBillable: z.boolean().optional()
+}).refine(siteRequiresOrgOrTicket.check, siteRequiresOrgOrTicket.params);
 
 export const stopTimerSchema = z.object({
   description: z.string().max(10_000).optional(),
@@ -59,6 +120,7 @@ export const listTimeEntriesQuerySchema = z.object({
   userId: z.string().guid().optional(),
   ticketId: z.string().guid().optional(),
   orgId: z.string().guid().optional(),
+  siteId: z.string().guid().optional(),
   from: z.coerce.date().optional(),
   to: z.coerce.date().optional(),
   running: optionalQueryBoolean,
@@ -107,11 +169,24 @@ export const updateTicketPartSchema = ticketPartSchema
   .partial()
   .refine((v) => Object.keys(v).length > 0, { message: 'At least one field is required' });
 
+const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
+
 export const billablesExportQuerySchema = z.object({
   from: z.coerce.date(),
-  to: z.coerce.date(),
+  // A date-only `to` covers that whole UTC day — the same inclusive-end rule
+  // invoice assembly applies to its period end (`${to}T23:59:59Z`,
+  // invoiceService.assembleDraftFromOrg). Without it `to` coerced to UTC
+  // midnight and listBillables' lte(startedAt, to) dropped the last day (sweep C2).
+  // A full timestamp is taken as given.
+  to: z.preprocess(
+    (v) => (typeof v === 'string' && DATE_ONLY_RE.test(v) ? `${v}T23:59:59Z` : v),
+    z.coerce.date()
+  ),
   orgId: z.string().guid().optional()
 }).refine((v) => v.to.getTime() >= v.from.getTime(), { message: 'to must be on/after from', path: ['to'] })
+  // At most 366 × 24h. A full-timestamp `to` keeps the original boundary; a
+  // date-only `to` (end of day, 23:59:59) therefore allows at most 366 calendar
+  // days inclusive — 367 days reaches 366d 23:59:59 and is rejected.
   .refine((v) => v.to.getTime() - v.from.getTime() <= 366 * 24 * 60 * 60 * 1000, { message: 'Export window cannot exceed 366 days', path: ['to'] });
 
 export type CreateTimeEntryInput = z.infer<typeof createTimeEntrySchema>;

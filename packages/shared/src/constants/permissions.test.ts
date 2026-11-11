@@ -10,6 +10,7 @@ describe('PERMISSION_GRANTS topology grants', () => {
   it('exposes topology grants', () => {
     expect(PERMISSION_GRANTS.TOPOLOGY_WRITE).toEqual({ resource: 'topology', action: 'write' });
     expect(PERMISSION_GRANTS.TOPOLOGY_READ).toEqual({ resource: 'topology', action: 'read' });
+    expect(PERMISSION_GRANTS.TOPOLOGY_EXECUTE).toEqual({ resource: 'topology', action: 'execute' });
   });
 });
 
@@ -71,9 +72,13 @@ describe('agreements permission (agreements vocabulary + IA split, W02)', () => 
 
   // No `manage`: publish and archive are write operations on a template
   // (spec §4). A third action would be an ungated capability with no gate.
-  it('declares no third action', () => {
+  // #9075 W2a (OD7 B) adds `send` — sending a legal document, copying its
+  // link, voiding it and recording a client's assent are a different blast
+  // radius from editing templates. Still no `manage`.
+  it('declares exactly read, write and send', () => {
     const agreementKeys = Object.keys(PERMISSION_GRANTS).filter((k) => k.startsWith('AGREEMENTS_'));
-    expect(agreementKeys.sort()).toEqual(['AGREEMENTS_READ', 'AGREEMENTS_WRITE']);
+    expect(agreementKeys.sort()).toEqual(['AGREEMENTS_READ', 'AGREEMENTS_SEND', 'AGREEMENTS_WRITE']);
+    expect((PERMISSION_GRANTS as Record<string, unknown>).AGREEMENTS_SEND).toEqual({ resource: 'agreements', action: 'send' });
   });
 });
 
@@ -81,5 +86,43 @@ describe('quotes:accept permission (accept-on-behalf, 2026-09-21 spec §7)', () 
   it('declares a dedicated accept capability, distinct from quotes:send', () => {
     expect(PERMISSION_GRANTS.QUOTES_ACCEPT).toEqual({ resource: 'quotes', action: 'accept' });
     expect(PERMISSION_GRANTS.QUOTES_ACCEPT).not.toEqual(PERMISSION_GRANTS.QUOTES_SEND);
+  });
+});
+
+describe('AI for Office prompt-template permissions', () => {
+  it('declares read and write on the client_ai_templates resource', () => {
+    expect(PERMISSION_GRANTS.CLIENT_AI_TEMPLATES_READ).toEqual({ resource: 'client_ai_templates', action: 'read' });
+    expect(PERMISSION_GRANTS.CLIENT_AI_TEMPLATES_WRITE).toEqual({ resource: 'client_ai_templates', action: 'write' });
+  });
+
+  it('is distinct from the generic organizations grants', () => {
+    expect(PERMISSION_GRANTS.CLIENT_AI_TEMPLATES_READ).not.toEqual(PERMISSION_GRANTS.ORGS_READ);
+    expect(PERMISSION_GRANTS.CLIENT_AI_TEMPLATES_WRITE).not.toEqual(PERMISSION_GRANTS.ORGS_WRITE);
+  });
+});
+
+describe('webhooks permission', () => {
+  it('declares a dedicated read capability, distinct from organizations:read', () => {
+    expect(PERMISSION_GRANTS.WEBHOOKS_READ).toEqual({ resource: 'webhooks', action: 'read' });
+    expect(PERMISSION_GRANTS.WEBHOOKS_READ).not.toEqual(PERMISSION_GRANTS.ORGS_READ);
+  });
+
+  // Managing webhooks stays on organizations:write; no webhooks:write exists.
+  it('declares no write action', () => {
+    const keys = Object.keys(PERMISSION_GRANTS).filter((k) => k.startsWith('WEBHOOKS_'));
+    expect(keys).toEqual(['WEBHOOKS_READ']);
+  });
+});
+
+describe('agent recovery grant (#9234)', () => {
+  it('is its own devices action, distinct from devices:execute', () => {
+    expect(PERMISSION_GRANTS.DEVICES_RECOVER_AGENT).toEqual({ resource: 'devices', action: 'recover_agent' });
+    expect(PERMISSION_GRANTS.DEVICES_RECOVER_AGENT).not.toEqual(PERMISSION_GRANTS.DEVICES_EXECUTE);
+  });
+});
+
+describe('AI workspace execute grant (Wisp W02, spec §4.6)', () => {
+  it('is its own execute-class key, not ai_agents:read', () => {
+    expect(PERMISSION_GRANTS.AI_WORKSPACE_EXECUTE).toEqual({ resource: 'ai_workspace', action: 'execute' });
   });
 });

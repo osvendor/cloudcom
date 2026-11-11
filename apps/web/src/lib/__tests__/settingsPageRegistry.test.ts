@@ -1,3 +1,4 @@
+import { SETTINGS_CATALOG, SIDEBAR_SETTINGS_IDS } from '../settingsCatalog';
 import { describe, expect, it } from 'vitest';
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { resolve, dirname, join, relative } from 'node:path';
@@ -12,7 +13,9 @@ const SIDEBAR_PATH = join(WEB_SRC, 'components/layout/Sidebar.tsx');
 // The account-menu links (profile/api-keys/partner-service-principals) live in
 // the header dropdown, not the Settings sidebar section. Both are legitimate,
 // pre-existing reachability sources this guard must also recognize.
-const SETTINGS_INDEX_PATH = join(WEB_SRC, 'pages/settings/index.astro');
+// #6220: the index page renders the settings catalogue, so the catalogue is the
+// source of its links.
+const SETTINGS_INDEX_PATH = join(WEB_SRC, 'lib/settingsCatalog.ts');
 const HEADER_PATH = join(WEB_SRC, 'components/layout/Header.tsx');
 
 // Every entry here is a filed, justified exception — not a place to silence a
@@ -24,11 +27,6 @@ const ALLOWLIST: Record<string, string> = {
   // The settings landing page itself — reached by navigating to /settings,
   // not by a link *inside* Sidebar/index/Header (self-referential).
   'index.astro': 'the settings index/landing page itself, not a link target',
-  // Reached from the Alerts feature (AlertTemplateList.tsx breadcrumb/nav), not
-  // from the Settings nav surfaces this guard scans — pre-existing, out of
-  // scope for the billing/ticketing settings consolidation wave.
-  'alert-templates/index.astro': 'reached via the Alerts feature (AlertTemplateList.tsx), not Settings nav',
-  'alert-templates/[id].astro': 'reached via the Alerts feature (AlertTemplateEditor.tsx), not Settings nav',
 };
 
 function walk(dir: string, base = dir): string[] {
@@ -95,4 +93,36 @@ describe('billing Rates has one settings home', () => {
     expect(rates).toContain('<WorkTypesCard');
     expect(categories).not.toContain('<WorkTypesCard');
   });
+});
+
+it('Payments has one hash-addressed settings home', () => {
+  expect(SETTINGS_CATALOG.filter(entry => entry.id === 'billing-payments')).toEqual([
+    expect.objectContaining({ href: '/settings/billing#payments', requiredPermission: { resource: 'billing', action: 'manage' } }),
+  ]);
+  const page = readFileSync(join(WEB_SRC, 'components/billing/PartnerBillingSettingsPage.tsx'), 'utf8');
+  expect(page).toContain("activeTab === 'payments'"); expect(page).toContain('<PaymentsSettingsTab');
+  expect(page).toContain('useHashTab');
+});
+
+it('Payments is reachable independently of autopay rollout', () => {
+  const entry = SETTINGS_CATALOG.find(entry => entry.id === 'billing-payments');
+  expect(entry).toMatchObject({ href: '/settings/billing#payments', requiredPermission: { resource: 'billing', action: 'manage' } });
+  expect(entry?.requiresAutopay).toBeUndefined();
+});
+
+// W04 (#10135): the reachability check above is a substring match, so
+// `/settings/ai` passes vacuously against `/settings/ai-agents`. Pin the hub
+// directly: one catalogue entry owns the path, it is a real page (not a tab
+// behind a hash), and the page renders the catalogue filtered to the AI group.
+it('Settings → AI is one hash-free hub at /settings/ai listing the AI group', () => {
+  const hubs = SETTINGS_CATALOG.filter((entry) => entry.href.split('#')[0] === '/settings/ai');
+  expect(hubs).toEqual([expect.objectContaining({ id: 'ai', group: 'ai', sidebarOnly: true })]);
+  expect(hubs[0]!.href).toBe('/settings/ai');
+  expect(SIDEBAR_SETTINGS_IDS).toContain(hubs[0]!.id);
+
+  const page = readFileSync(join(SETTINGS_PAGES_DIR, 'ai.astro'), 'utf-8');
+  expect(page).not.toMatch(/Astro\.redirect\(/);
+  expect(page).toContain("import SettingsCatalog from '../../components/settings/SettingsCatalog'");
+  expect(page).toMatch(/<SettingsCatalog\b[^>]*\bgroup="ai"/);
+  expect(page).toContain('titleKey="titles.settingsAi"');
 });

@@ -24,6 +24,17 @@ const ALERT_ID  = 'cccccccc-cccc-cccc-cccc-cccccccccccc';
 
 // ─── Mock DB (before any imports that touch it) ───────────────────────────────
 
+// Holding-org delivery eligibility is its own read (covered by the
+// scriptDispatch suite and parkedCommandDelivery.integration.test.ts); kept
+// out of this suite's db mock.
+vi.mock('../services/unassignedPool/deliveryEligibility', async () => ({
+  ...(await vi.importActual<typeof import('../services/unassignedPool/deliveryEligibility')>(
+    '../services/unassignedPool/deliveryEligibility',
+  )),
+  isParkedDevice: vi.fn(async () => false),
+  assertCommandDeliverable: vi.fn(async () => undefined),
+}));
+
 vi.mock('../db', () => ({
   db: {
     select: vi.fn(),
@@ -40,6 +51,8 @@ vi.mock('../db', () => ({
 // ─── Mock DB schema (prevents Drizzle from trying to connect) ─────────────────
 
 vi.mock('../db/schema', () => ({
+  deviceReliability: { deviceId: 'deviceId', details: 'details', reliabilityScore: 'reliabilityScore', trendDirection: 'trendDirection' },
+  deviceReliabilityBaselines: { id: 'id', deviceId: 'deviceId', baselineAt: 'baselineAt', createdAt: 'createdAt', clearedAt: 'clearedAt', reason: 'reason', source: 'source' },
   devices:                  { id: 'id', orgId: 'orgId', siteId: 'siteId', status: 'status', osType: 'osType', agentId: 'agentId' },
   deviceHardware:           { deviceId: 'deviceId' },
   deviceNetwork:            { deviceId: 'deviceId' },
@@ -82,6 +95,9 @@ vi.mock('../middleware/auth', () => ({
   requireScope:      vi.fn(() => (c: any, next: any) => next()),
   requirePermission: vi.fn(() => (c: any, next: any) => next()),
   requireMfa:        vi.fn(() => (c: any, next: any) => next()),
+  // #7103 — POST /scripts/:id/execute is self-managed and hands the service
+  // a runner built on withAuthDbAccessContext; a passthrough is enough here.
+  withAuthDbAccessContext: vi.fn((_auth: any, fn: () => Promise<unknown>) => fn()),
 }));
 
 // ─── Mock side-effect services ────────────────────────────────────────────────
@@ -112,7 +128,6 @@ vi.mock('../services/enrollmentKeySecurity', () => ({
 
 vi.mock('../services/alertCooldown', () => ({
   setCooldown:                   vi.fn(),
-  markConfigPolicyRuleCooldown:  vi.fn(),
 }));
 
 vi.mock('../services/eventBus', () => ({

@@ -8,6 +8,8 @@ export type WebhookDeliveryStatus = 'success' | 'failed' | 'pending';
 
 export type WebhookDelivery = {
   id: string;
+  orgId?: string | null;
+  orgName?: string | null;
   timestamp: string;
   event: string;
   status: WebhookDeliveryStatus;
@@ -15,10 +17,38 @@ export type WebhookDelivery = {
   attempt?: number;
 };
 
+/**
+ * Map one row of `GET /webhooks/:id/deliveries` onto the table's row shape.
+ * The API speaks `pending | delivered | failed | retrying`, `createdAt` and
+ * `responseStatus`; an unmapped status would leave the row without an icon
+ * and crash the whole page, so anything unknown renders as pending.
+ */
+export function normalizeDelivery(raw: Record<string, unknown>): WebhookDelivery {
+  const status = raw.status;
+  const mapped: WebhookDeliveryStatus =
+    status === 'delivered' || status === 'success'
+      ? 'success'
+      : status === 'failed'
+        ? 'failed'
+        : 'pending';
+  const responseCode = raw.responseCode ?? raw.responseStatus;
+  return {
+    id: String(raw.id),
+    orgId: typeof raw.orgId === 'string' ? raw.orgId : null,
+    orgName: typeof raw.orgName === 'string' ? raw.orgName : null,
+    timestamp: String(raw.timestamp ?? raw.createdAt ?? ''),
+    event: String(raw.event ?? raw.eventType ?? ''),
+    status: mapped,
+    responseCode: typeof responseCode === 'number' ? responseCode : null,
+    attempt: typeof raw.attempt === 'number' ? raw.attempt : undefined,
+  };
+}
+
 type WebhookDeliveryHistoryProps = {
   deliveries: WebhookDelivery[];
   onRetry?: (delivery: WebhookDelivery) => void | Promise<void>;
   timezone?: string;
+  showOrganization?: boolean;
 };
 
 const statusStyles: Record<WebhookDeliveryStatus, string> = {
@@ -42,7 +72,8 @@ function formatTimestamp(value: string, timezone?: string) {
 export default function WebhookDeliveryHistory({
   deliveries,
   onRetry,
-  timezone
+  timezone,
+  showOrganization = false
 }: WebhookDeliveryHistoryProps) {
   const { t } = useTranslation('common');
   const [retryingId, setRetryingId] = useState<string | null>(null);
@@ -72,15 +103,16 @@ export default function WebhookDeliveryHistory({
             <tr className="text-left text-xs font-semibold uppercase tracking-wide text-muted-foreground">
               <th className="px-4 py-3">{t('longTail.webhooks.WebhookDeliveryHistory.headers.timestamp')}</th>
               <th className="px-4 py-3">{t('longTail.webhooks.WebhookDeliveryHistory.headers.event')}</th>
+              {showOrganization && <th className="px-4 py-3">{t('longTail.webhooks.ownership.organization')}</th>}
               <th className="px-4 py-3">{t('common:labels.status')}</th>
               <th className="px-4 py-3">{t('longTail.webhooks.WebhookDeliveryHistory.headers.response')}</th>
-              <th className="px-4 py-3 text-right">{t('longTail.webhooks.WebhookDeliveryHistory.headers.action')}</th>
+              {onRetry && <th className="px-4 py-3 text-right">{t('longTail.webhooks.WebhookDeliveryHistory.headers.action')}</th>}
             </tr>
           </thead>
           <tbody className="divide-y">
             {deliveries.length === 0 ? (
               <tr>
-                <td colSpan={5} className="px-4 py-12 text-center">
+                <td colSpan={4 + Number(Boolean(onRetry)) + Number(showOrganization)} className="px-4 py-12 text-center">
                   <p className="text-sm text-muted-foreground">{t('longTail.webhooks.WebhookDeliveryHistory.empty')}</p>
                 </td>
               </tr>
@@ -95,6 +127,11 @@ export default function WebhookDeliveryHistory({
                       {formatTimestamp(delivery.timestamp, timezone)}
                     </td>
                     <td className="px-4 py-3 text-sm font-medium">{delivery.event}</td>
+                    {showOrganization && (
+                      <td className="px-4 py-3 text-sm text-muted-foreground">
+                        {delivery.orgId ? delivery.orgName ?? delivery.orgId : t('longTail.webhooks.ownership.test')}
+                      </td>
+                    )}
                     <td className="px-4 py-3 text-sm">
                       <span
                         className={cn(
@@ -109,17 +146,19 @@ export default function WebhookDeliveryHistory({
                     <td className="px-4 py-3 text-sm text-muted-foreground">
                       {delivery.responseCode ? `HTTP ${delivery.responseCode}` : '—'}
                     </td>
+                    {onRetry && (
                     <td className="px-4 py-3 text-right">
                       <button
                         type="button"
                         onClick={() => handleRetry(delivery)}
-                        disabled={delivery.status !== 'failed' || !onRetry || isRetrying}
+                        disabled={delivery.status !== 'failed' || isRetrying}
                         className="inline-flex h-8 items-center gap-1 rounded-md border px-2 text-xs font-medium hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
                       >
                         <RotateCcw className="h-3.5 w-3.5" />
                         {isRetrying ? t('longTail.webhooks.WebhookDeliveryHistory.retrying') : t('common:actions.retry')}
                       </button>
                     </td>
+                    )}
                   </tr>
                 );
               })

@@ -6,6 +6,7 @@ import { fetchWithAuth, useAuthStore } from '../../stores/auth';
 // an island that hydrates before whichever other island happens to pull i18n in
 // would otherwise render raw keys (and mismatch the SSR markup).
 import '../../lib/i18n';
+import { useStableT } from '@/lib/i18n/useStableT';
 
 interface StatusInfo {
   status: string;
@@ -25,33 +26,59 @@ function isSafeUrl(url: string): boolean {
 
 export default function AccountInactiveScreen() {
   const { t } = useTranslation('auth');
+  // Effects use the stable translator so a locale change does not re-run them
+  // (#3632); JSX keeps the plain `t` so rendered text still re-translates.
+  const stableT = useStableT(t);
   const [info, setInfo] = useState<StatusInfo | null>(null);
   const [loading, setLoading] = useState(true);
   const logout = useAuthStore((s) => s.logout);
 
   useEffect(() => {
     const defaultMessages: Record<string, string> = {
-      pending: t('accountInactive.defaultMessages.pending', {
+      pending: stableT('accountInactive.defaultMessages.pending', {
         defaultValue: 'Your account is being set up. Please check back shortly.',
       }),
-      suspended: t('accountInactive.defaultMessages.suspended', {
+      suspended: stableT('accountInactive.defaultMessages.suspended', {
         defaultValue: 'Your account has been suspended. Please contact your administrator.',
       }),
-      churned: t('accountInactive.defaultMessages.churned', {
+      churned: stableT('accountInactive.defaultMessages.churned', {
         defaultValue: 'Your account is no longer active. Please contact support.',
       }),
     };
 
+    // Sentinel for "a navigation is already under way — render nothing".
+    const LEAVING = Symbol('leaving');
+    // Keep the spinner up while a navigation is pending instead of flashing an
+    // empty "Account Inactive" card.
+    let leaving = false;
+
     fetchWithAuth('/partner/me')
-      .then((res) => (res.ok ? res.json() : null))
+      .then(async (res) => {
+        if (res.ok) return res.json();
+        // #6627: never read a non-OK answer as "no data → go home". `/` is
+        // behind partnerGuard, so for an inactive partner every protected call
+        // there 403s PARTNER_INACTIVE straight back to this screen — a loop.
+        if (res.status === 428) {
+          // Forced-MFA gate: enrollment is the only way forward. (fetchWithAuth
+          // also redirects on this 428; setting it here keeps a later `/`
+          // navigation from overriding it.)
+          window.location.href = '/auth/mfa/setup?forced=1';
+          return LEAVING;
+        }
+        // No partner association (e.g. a system user): nothing to show here.
+        if (res.status === 404) return null;
+        throw new Error(`GET /partner/me failed: ${res.status}`);
+      })
       .then((data) => {
+        if (data === LEAVING) { leaving = true; return; }
         if (!data || data.status === 'active') {
+          leaving = true;
           window.location.href = '/';
           return;
         }
         setInfo({
           status: data.status,
-          message: data.statusMessage ?? defaultMessages[data.status] ?? t('accountInactive.defaultMessages.generic', { defaultValue: 'Your account is not active.' }),
+          message: data.statusMessage ?? defaultMessages[data.status] ?? stableT('accountInactive.defaultMessages.generic', { defaultValue: 'Your account is not active.' }),
           actionUrl: data.statusActionUrl,
           actionLabel: data.statusActionLabel,
           meetingUrl: data.statusMeetingUrl,
@@ -61,15 +88,15 @@ export default function AccountInactiveScreen() {
       .catch(() => {
         setInfo({
           status: 'unknown',
-          message: t('accountInactive.defaultMessages.loadFailed', { defaultValue: 'Unable to load account status. Please try again later.' }),
+          message: stableT('accountInactive.defaultMessages.loadFailed', { defaultValue: 'Unable to load account status. Please try again later.' }),
           actionUrl: null,
           actionLabel: null,
           meetingUrl: null,
           meetingLabel: null,
         });
       })
-      .finally(() => setLoading(false));
-  }, [t]);
+      .finally(() => { if (!leaving) setLoading(false); });
+  }, [stableT]);
 
   const handleLogout = () => {
     logout();

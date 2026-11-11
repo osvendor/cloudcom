@@ -199,13 +199,13 @@ const AUD_AI_AGENT_ARTIFACT = 'reads only narrative / fleet-design scalars of th
 const AUD_EVIDENCE_REFUSES = 'deliverable evidence refuses msp_staff definitions/runs before any link, attach or run (ruling F1)';
 const AUD_EVIDENCE_LINKED = 'reaches report_runs only through deliverable evidence, which can never reference an msp_staff run (ruling F1)';
 const AUD_CALLER_AUTHORIZED = 'keyed on a definition its caller already authorized, audience included';
+const AUD_SERIES_COMBINE = 'series W04 Combine: partner scope with org_access=all only (route + service belt canManagePartnerWidePolicies); msp_staff business types are excluded before grouping (assertSeriesTypeSupported refuses PARTNER_ONLY_DELIVERY_REPORT_TYPES)';
+const AUD_SERIES = 'series children carry their series type, and assertSeriesTypeSupported refuses every msp_staff (business) type at series create; the series type is immutable';
+const SERIES_CHILD_PIN = 'series children are org-owned by construction (reports_series_child_shape_chk: series_id IS NULL OR org_id IS NOT NULL), so no series_id predicate can reach a partner-owned row';
 
 const SITE_ALLOWLIST: SiteAllowlist = new Map<string, Map<string, AllowEntry>>([
   ['src/routes/aiAgents.ts', new Map([
     ['GET /runs/:runId', pinned(4, `AI-agent run artifact reads join reports and pin eq(reports.orgId, run.orgId) AND auth.orgCondition(reports.orgId); ${ORG_PIN}`, AUD_AI_AGENT_ARTIFACT)],
-  ])],
-  ['src/routes/fleetDesign.ts', new Map([
-    ['GET /', pinned(2, 'lists type ai_fleet_design (system-authored, org-owned) under auth.orgCondition(reports.orgId)', AUD_TYPE_PINNED)],
   ])],
   ['src/services/aiAgents/fleetDesignReport.ts', new Map([
     ['persistFleetDesignReport', pinned(3, `Fleet Design is system-authored and org-owned: definition read/update keyed on eq(reports.orgId, run.orgId); the run update targets the artifact row it just inserted; ${ORG_PIN}`, AUD_TYPE_PINNED)],
@@ -227,8 +227,17 @@ const SITE_ALLOWLIST: SiteAllowlist = new Map<string, Map<string, AllowEntry>>([
   ['src/services/evidenceBaseline.ts', new Map([
     ['previousOccurrenceBaselineFor', pinned(1, 'reaches report_runs only through service_deliverable_evidence of one org-owned deliverable (evidence linkage validates reports.org_id = <deliverable org>)', AUD_EVIDENCE_LINKED)],
   ])],
+  ['src/services/actionIntents/aiDesignIntentTarget.ts', new Map([
+    ['fleetDesignTarget', pinned(2, 'decides which org an intent belongs in, so there is no intent org to filter on yet and no auth to guard with: a system read of one run by id AND type ai_fleet_design. A row with no org returns null, and both callers (createSessionPreToolUse, createMcpActionIntent) use the org only when the call\'s reach covers it; the mandatory pin then re-reads the run under eq(reports.orgId, <intent org>) (fleetDesign/applyTargets.ts loadOrgReport)', AUD_TYPE_PINNED)],
+  ])],
+  ['src/services/fleetDesign/applyTargets.ts', new Map([
+    ['loadOrgReport', pinned(2, `four-eyes digest material, read with no auth by design (the release paths have none to give, and partnerOwnedReportVisibility is TRUE for system scope): one run by id AND eq(reports.orgId, <intent org>) AND type ai_fleet_design; ${ORG_PIN}`, AUD_TYPE_PINNED)],
+  ])],
   ['src/services/fleetDesign/drift.ts', new Map([
     ['loadApprovedDesign', pinned(1, 'reads the run id taken from fleet_design_applied_items pinned to eq(orgId, orgId); applied items only reference org-owned ai_fleet_design runs', AUD_TYPE_PINNED)],
+  ])],
+  ['src/services/fleetDesign/listing.ts', new Map([
+    ['listFleetDesigns', pinned(2, 'lists type ai_fleet_design (system-authored, org-owned) under auth.orgCondition(reports.orgId); moved verbatim from routes/fleetDesign.ts GET / (#6780) and shared by the route and list_fleet_designs', AUD_TYPE_PINNED)],
   ])],
   ['src/services/fleetDesign/ledger.ts', new Map([
     ['lockReportRun', pinned(2, 'Fleet Design ledger reads type ai_fleet_design under orgCondition(reports.org_id); a partner-owned row is never that type', AUD_TYPE_PINNED)],
@@ -261,24 +270,49 @@ const SITE_ALLOWLIST: SiteAllowlist = new Map<string, Map<string, AllowEntry>>([
     ['listUnsettledDeliveries', pinned(1, 'system-context reconciler scan; the reconciler settles partner-owned runs as failed and shows nothing to a caller', AUD_SYSTEM)],
     ['query', pinned(1, 'summarizeDeliveries\' count query: keyed on a run id its caller already authorized (aiAgents run detail pins the run to the agent run\'s org; the delivery pass runs in system context)', AUD_SYSTEM)],
   ])],
+  ['src/services/reportSeries/combine.ts', new Map([
+    ['loadCandidateRows', pinned(1, `Combine candidate scan: isNotNull(reports.orgId) joined to organizations of ONE partner (eq(organizations.partnerId, partnerId)); callers are gated on canManagePartnerWidePolicies; ${ORG_PIN}`, AUD_SERIES_COMBINE)],
+    ['loadLockedGroupRows', pinned(1, `Combine re-read FOR UPDATE: the caller's report ids AND the same org-owned, one-partner predicate as loadCandidateRows; ${ORG_PIN}`, AUD_SERIES_COMBINE)],
+    ['loadStalledReportIds', pinned(1, 'Combine stalled flag: the latest run (DISTINCT ON report_id) of report ids that loadCandidateRows just returned (org-owned, one partner); only a boolean per id leaves the service', AUD_SERIES_COMBINE)],
+    ['archiveCombineExtras', pinned(1, `Combine archive of same-org duplicates: ids from loadLockedGroupRows AND eq(reports.orgId, orgId); ${ORG_PIN}`, AUD_SERIES_COMBINE)],
+    ['adoptCombineRow', pinned(1, `Combine adoption: one row by id AND eq(reports.orgId, row.orgId), locked by loadLockedGroupRows; ${ORG_PIN}`, AUD_SERIES_COMBINE)],
+  ])],
+  ['src/services/reportSeries/reconcile.ts', new Map([
+    ['listSeriesChildren', pinned(1, `children of ONE series id, read by the reconciler / gate / series store in the caller's context; ${SERIES_CHILD_PIN}`, AUD_SERIES)],
+    ['updateSeriesChild', pinned(1, `updates one child by id AND org_id AND series_id that listSeriesChildren just returned; ${SERIES_CHILD_PIN}`, AUD_SERIES)],
+    ['findSeriesNeedingReconcile', pinned(2, `system-context repair-sweep drift scan (active children + live detached standalones, which were children and keep their org); returns series ids only and shows nothing to a caller; ${SERIES_CHILD_PIN}`, AUD_SYSTEM)],
+    ['evaluate', pinned(1, `worker gate (system context) re-reads the ONE child the job named, by id AND org_id, and admits it only while series_id still names the series; ${SERIES_CHILD_PIN}`, AUD_SERIES)],
+  ])],
+  ['src/services/reportSeries/targets.ts', new Map([
+    ['listDetachedOrgIds', pinned(1, `org ids of the live detached standalones of ONE series (detached_from_series_id = <series>), read only to un-target those orgs and never shown to a caller; a detached standalone was a child, so it keeps its org (reports_detached_from_series_chk + ${SERIES_CHILD_PIN})`, AUD_SERIES)],
+  ])],
+  ['src/services/reportSeries/store.ts', new Map([
+    ['buildSeriesDetail', pinned(1, `latest run per active child id returned by listSeriesChildren for a series its callers (listSeries / getSeriesDetail) already loaded under requireSeriesPartner + eq(partner_id, token partner); ${SERIES_CHILD_PIN}`, AUD_SERIES)],
+    ['detachSeriesChild', pinned(2, `locks (series row FIRST, then the child) and clears series_id on ONE org-owned child of a series the caller owns (requireSeriesPartner + lockOwnSeries); the route authorized the caller's tenancy on it (tenantAuthorizedReportCondition) before calling; ${SERIES_CHILD_PIN}`, AUD_SERIES)],
+    ['deleteSeries', pinned(1, `archives children of ONE series the caller owns (requireSeriesPartner + FOR UPDATE lock on the series row); ${SERIES_CHILD_PIN}`, AUD_SERIES)],
+  ])],
   ['src/services/serviceDeliverableService.ts', new Map([
     ['validateReferences', pinned(1, `evidence linkage validates eq(reports.orgId, <deliverable org>) — ${ORG_PIN}`, AUD_EVIDENCE_REFUSES)],
     ['insertEvidenceRef', pinned(2, `run evidence joins reports and pins eq(reports.orgId, orgId); ${ORG_PIN}`, AUD_EVIDENCE_REFUSES)],
+    ['selectEvidence', pinned(1, `#9961 evidence display-name LEFT JOIN pins eq(reports.orgId, service_deliverable_evidence.orgId) on top of the id; only reports.name is read, and only for a reports:read caller; ${ORG_PIN}`, AUD_EVIDENCE_LINKED)],
   ])],
   ['src/jobs/reportScheduleWorker.ts', new Map([
     ['findDueReports', pinned(2, 'system DB context due scan; nothing selected is shown to anyone — every due row is re-authorized per run (#3198 W01 Task 6)', AUD_WORKER)],
     ['claimReportOccurrence', pinned(1, 'system DB context occurrence CAS by report id on a row findDueReports selected', AUD_WORKER)],
-    ['processRunScheduledReport', pinned(4, 'system DB context, reads by id, re-asserts live partner authority per row before generating (#3198 W01 Task 6); run updates target the run it inserted', AUD_WORKER)],
+    ['processRunScheduledReport', pinned(3, 'system DB context, reads by id, re-asserts live partner authority per row before generating (#3198 W01 Task 6); run updates target the run it inserted', AUD_WORKER)],
+    ['stampOccurrence', pinned(1, 'system DB context; stamps lastGeneratedAt on the report id a job just loaded (the same stamp processRunScheduledReport made inline before it was extracted, and the series-gate skip path reuses)', AUD_WORKER)],
+    ['loadGatedSeriesChild', pinned(1, 'system DB context re-read by id of the series child the job named, after seriesChildGate admitted it; series children are org-owned (reports_series_child_shape_chk) and processRunScheduledReport re-authorizes it exactly like any org-owned row', AUD_WORKER)],
+    ['recordRunDelivery', pinned(1, 'system DB context; writes the delivery summary onto the run processRunScheduledReport just inserted, keyed on that run id (multi-org series W01)', AUD_WORKER)],
   ])],
   ['src/jobs/reportRunDeliveryReconciler.ts', new Map([
     ['loadRunOwners', pinned(2, 'system reconciler maps narrative delivery runs to their owner by id; partner-owned runs are settled failed, never delivered (#3198 W01 Task 6)', AUD_SYSTEM)],
   ])],
   // Raw-SQL sites (fix round 1): system-context tenant lifecycle, never a caller read.
-  ['src/services/tenantCascade.ts', new Map([
-    ['clearSql', pinned(2, 'org erasure pre-clear in system context: DELETE FROM report_runs WHERE report_id IN (SELECT id FROM reports WHERE org_id = <erased org>) — a partner-owned definition has org_id NULL and never matches; its runs go with the partner sweep via ON DELETE CASCADE', AUD_SYSTEM)],
-  ])],
+  // (tenantCascade.ts's report_runs pre-clear left in #4247: report_runs has its
+  // own org_id now and is erased by the ordinary org cascade loop.)
   ['src/services/orgMergeCustomExecutors.ts', new Map([
-    ['rehomeReportChildrenThenDelete', pinned(8, 'org merge (platform admin, system context): every statement keys on t.org_id = <loser> and s.org_id = <survivor>; a partner-owned definition has org_id NULL and is never re-homed, deduplicated or deleted', AUD_SYSTEM)],
+    ['rehomeReportChildrenThenDelete', pinned(12, 'org merge (platform admin, system context): every statement keys on t.org_id = <loser> and s.org_id = <survivor>; a partner-owned definition has org_id NULL and is never re-homed, deduplicated or deleted', AUD_SYSTEM)],
+    ['archiveCollidingSeriesChildren', pinned(8, 'org merge (platform admin, system context): every statement keys on t.org_id = <loser> and s.org_id = <survivor> with series_id IS NOT NULL; series children are org-owned (reports_series_child_shape_chk), so a partner-owned definition is never archived or joined', AUD_SYSTEM)],
     ['reports', pinned(1, 'org merge preview counter: SELECT count(*) FROM reports t WHERE t.org_id = <loser> — a NULL-org partner-owned row never matches, and only a count is returned to the admin', AUD_SYSTEM)],
   ])],
 ]);
@@ -804,7 +838,11 @@ describe('scan analyzer (#3198 W02 B1)', () => {
 // The tree
 // ---------------------------------------------------------------------------
 
-describe('partner-owned report visibility is mechanical (#3198 W01, per-site since W02)', () => {
+// Every test below walks the whole API source tree (five of them scan every
+// file end to end). Their runtime grows with the repo and with runner load:
+// the guarded-scope scan hit vitest's 5 s default on a loaded CI shard (#8629).
+// 30 s matches the other repo-scan contract tests.
+describe('partner-owned report visibility is mechanical (#3198 W01, per-site since W02)', { timeout: 30_000 }, () => {
   const files = ROOTS.flatMap((r) => walk(r));
 
   it('finds query sites on every guarded table (guards against a vacuous scan)', () => {
@@ -839,7 +877,7 @@ describe('partner-owned report visibility is mechanical (#3198 W01, per-site sin
 
   it('finds raw-SQL sites in template text (guards against a vacuous raw arm)', () => {
     const raw = files.flatMap((f) => querySiteMatches(code(f)).filter((h) => h.text.startsWith('sql`')).map(() => rel(f)));
-    expect(new Set(raw)).toEqual(new Set(['src/services/tenantCascade.ts', 'src/services/orgMergeCustomExecutors.ts']));
+    expect(new Set(raw)).toEqual(new Set(['src/services/orgMergeCustomExecutors.ts', 'src/services/reportSeries/reconcile.ts']));
   });
 
   it('every guard entrypoint reaches the helper', () => {

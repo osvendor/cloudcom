@@ -1,11 +1,18 @@
 import { z } from 'zod';
-import { coerceS3EndpointUrl, deriveS3RegionFromEndpoint, optionalQueryBoolean } from '@breeze/shared';
+import { EXTERNAL_BACKUP_STATUSES, coerceS3EndpointUrl, deriveS3RegionFromEndpoint, optionalQueryBoolean } from '@breeze/shared';
 import {
   backupRetentionSchema as sharedBackupRetentionSchema,
   backupRetentionUpdateSchema as sharedBackupRetentionUpdateSchema,
   backupScheduleSchema as sharedBackupScheduleSchema,
+  backupDestinationPrefixReasonMessage,
+  normalizeBackupDestinationPrefix,
 } from '@breeze/shared/validators';
 import { drRestoreConfigSchema } from '../../services/drBareMetalRebuildStep';
+// Pool-free leaf (imports only zod) — this module must stay pool-free at load.
+import { hypervOptionsSchema, isAbsoluteRebuildPath } from '../../services/bareMetalRebuildSchemas';
+import { BACKUP_HEALTH_MAX_LIMIT } from '../../services/backupHealthCursor';
+// Pool-free leaf (secretCrypto only).
+import { findCiphertextShapedValue } from '../../services/backupProviderConfigSealing';
 
 const queryBoolean = z.preprocess((value) => {
   if (typeof value === 'boolean') return value;
@@ -23,16 +30,48 @@ const queryBoolean = z.preprocess((value) => {
  * Backblaze B2 reject requests signed with a mismatched region, so a
  * blanket default is never safe. Returns the resolved region so callers
  * can persist it.
+ *
+ * Also validates and normalizes the destination key prefix
+ * (`normalizeBackupDestinationPrefix`, #7081). Callers persist the returned
+ * `prefix` (and drop the key when it is null) so a stored prefix is always in
+ * normalized form.
+ *
+ * On an update, pass the stored prefix as `storedPrefix`: a stored prefix the
+ * update leaves unchanged is not re-validated (`keepStoredPrefix: true`, the
+ * caller leaves it as is), so an edit to another field of a destination saved
+ * before validation existed is not refused. A new or changed prefix always
+ * is. Backups to a destination whose stored prefix is invalid are refused at
+ * mint (`invalid_destination_prefix`), never written to the bucket root.
  */
-export function validateS3Details(details: Record<string, unknown>): {
+export function validateS3Details(
+  details: Record<string, unknown>,
+  opts: { storedPrefix?: unknown } = {},
+): {
   error: string | null;
   region: string | null;
   endpoint: string | undefined;
+  prefix: string | null;
+  keepStoredPrefix?: true;
 } {
   const bucket = typeof details.bucket === 'string' ? details.bucket.trim() : '';
   if (!bucket) {
-    return { error: 'S3 bucket is required', region: null, endpoint: undefined };
+    return { error: 'S3 bucket is required', region: null, endpoint: undefined, prefix: null };
   }
+  const normalizedPrefix = normalizeBackupDestinationPrefix(details.prefix);
+  const keepStoredPrefix = !normalizedPrefix.ok
+    && 'storedPrefix' in opts
+    && opts.storedPrefix !== undefined
+    && details.prefix === opts.storedPrefix;
+  if (!normalizedPrefix.ok && !keepStoredPrefix) {
+    return {
+      error: `Invalid key prefix: ${backupDestinationPrefixReasonMessage(normalizedPrefix.reason)}`,
+      region: null,
+      endpoint: undefined,
+      prefix: null,
+    };
+  }
+  const prefix = normalizedPrefix.ok ? normalizedPrefix.prefix : null;
+  const keep = keepStoredPrefix ? { keepStoredPrefix: true as const } : {};
   const explicitRegion = typeof details.region === 'string' ? details.region.trim() : '';
   const endpoint = typeof details.endpoint === 'string' ? details.endpoint : undefined;
 
@@ -57,6 +96,8 @@ export function validateS3Details(details: Record<string, unknown>): {
         error: error instanceof Error ? error.message : 'S3 endpoint is not a valid URL',
         region: null,
         endpoint: undefined,
+        prefix,
+        ...keep,
       };
     }
   }
@@ -67,9 +108,11 @@ export function validateS3Details(details: Record<string, unknown>): {
       error: 'S3 region is required (set it explicitly or use an endpoint that includes it, e.g. s3.us-west-004.backblazeb2.com)',
       region: null,
       endpoint: normalizedEndpoint,
+      prefix,
+      ...keep,
     };
   }
-  return { error: null, region, endpoint: normalizedEndpoint };
+  return { error: null, region, endpoint: normalizedEndpoint, prefix, ...keep };
 }
 
 /**
@@ -101,6 +144,11 @@ export function canonicalizeS3CredentialFields(details: Record<string, unknown>)
   delete details.secretAccessKey;
 }
 
+// A destination setting can't be submitted in the stored (sealed) format:
+// the server would open it as if it had sealed it itself. See
+// findCiphertextShapedValue.
+const DETAILS_IN_STORED_FORMAT_MESSAGE = 'Destination settings cannot contain values in the internal encrypted format';
+
 export const configSchema = z.object({
   name: z.string().min(1),
   provider: z.enum(['s3', 'local']),
@@ -110,6 +158,9 @@ export const configSchema = z.object({
   details: z.record(z.string(), z.any()).refine(
     (val) => JSON.stringify(val).length <= 65536,
     { message: 'Object too large (max 64KB)' }
+  ).refine(
+    (val) => findCiphertextShapedValue(val) === null,
+    { message: DETAILS_IN_STORED_FORMAT_MESSAGE }
   ).optional()
 }).superRefine((data, ctx) => {
   if (data.provider !== 's3') return;
@@ -127,6 +178,9 @@ export const configUpdateSchema = z.object({
   details: z.record(z.string(), z.any()).refine(
     (val) => JSON.stringify(val).length <= 65536,
     { message: 'Object too large (max 64KB)' }
+  ).refine(
+    (val) => findCiphertextShapedValue(val) === null,
+    { message: DETAILS_IN_STORED_FORMAT_MESSAGE }
   ).optional()
 });
 
@@ -166,7 +220,7 @@ export const jobListSchema = z.object({
   // passing one through to a pgEnum comparison makes Postgres raise
   // `invalid input value for enum backup_status` (a 500, not an empty list).
   status: z.enum([
-    'pending', 'running', 'completed', 'failed', 'cancelled', 'partial',
+    'pending', 'running', 'completed', 'completed_with_errors', 'failed', 'cancelled', 'partial',
     'queued', 'canceled',
   ]).optional(),
   device: z.string().optional(),
@@ -207,11 +261,23 @@ export const usageHistoryQuerySchema = z.object({
   days: z.coerce.number().int().min(3).max(90).optional()
 });
 
+/**
+ * Confirmation fields every privileged-restore request may carry
+ * (routes/backup/restoreIntegrityGate.ts): a step-up grant for operation
+ * `backup_unattested_restore`, or — only on a deployment running with
+ * two-factor authentication disabled — an explicit confirmation.
+ */
+export const restoreIntegrityConfirmationFields = {
+  stepUpGrant: z.string().uuid().optional(),
+  confirmUnattestedRestore: z.boolean().optional(),
+};
+
 export const restoreSchema = z.object({
+  ...restoreIntegrityConfirmationFields,
   snapshotId: z.string().min(1),
   deviceId: z.string().min(1).optional(),
   targetPath: z.string().optional(),
-  selectedPaths: z.array(z.string()).optional(),
+  selectedPaths: z.array(z.string().max(4096)).max(10_000).optional(),
   restoreType: z.enum(['full', 'selective']).default('full'),
 }).superRefine((value, ctx) => {
   if (value.restoreType === 'selective' && (!value.selectedPaths || value.selectedPaths.length === 0)) {
@@ -251,6 +317,24 @@ export const verificationListSchema = z.object({
 
 export const backupHealthQuerySchema = z.object({
   refresh: queryBoolean.optional()
+});
+
+/** Comma-separated enum list in a query string: `?health=critical,warning`. */
+const csvEnum = <T extends readonly [string, ...string[]]>(values: T) =>
+  z.preprocess(
+    (v) => (typeof v === 'string' ? v.split(',').map((s) => s.trim()).filter(Boolean) : v),
+    z.array(z.enum(values)).min(1),
+  );
+
+export const backupHealthDevicesQuerySchema = z.object({
+  orgId: z.string().uuid().optional(),
+  source: csvEnum(['breeze', 'provider'] as const).optional(),
+  health: csvEnum(['healthy', 'warning', 'critical', 'unknown'] as const).optional(),
+  status: csvEnum([...EXTERNAL_BACKUP_STATUSES] as unknown as [string, ...string[]]).optional(),
+  withBackup: queryBoolean.optional(),
+  search: z.string().trim().max(200).optional(),
+  cursor: z.string().max(4096).optional(),
+  limit: z.coerce.number().int().min(1).max(BACKUP_HEALTH_MAX_LIMIT).optional(),
 });
 
 export const recoveryReadinessQuerySchema = z.object({
@@ -307,6 +391,7 @@ export const extendedPolicyUpdateSchema = policyUpdateSchema.extend({
 // ── BMR / Recovery Token schemas ────────────────────────────────────
 
 export const bmrCreateTokenSchema = z.object({
+  ...restoreIntegrityConfirmationFields,
   snapshotId: z.string().guid(),
   restoreType: z.enum(['full', 'selective', 'bare_metal']),
   targetConfig: z
@@ -318,9 +403,15 @@ export const bmrCreateTokenSchema = z.object({
   expiresInHours: z.number().int().min(1).max(168).default(24),
 });
 
+// The snapshot integrity protocol the recovery client implements (2 = checks
+// every restored byte against the snapshot attestation). Optional in the
+// schema so an older client gets an actionable refusal, not a 400.
+const recoveryIntegrityProtocolVersion = z.number().int().min(0).max(1000).optional();
+
 export const bmrAuthenticateSchema = z.object({
   token: z.string().min(1),
   capabilities: z.array(z.string().min(1).max(64)).max(16).optional(),
+  integrityProtocolVersion: recoveryIntegrityProtocolVersion,
 });
 
 export const bmrRecoveryDownloadSchema = z.object({
@@ -328,9 +419,21 @@ export const bmrRecoveryDownloadSchema = z.object({
   path: z.string().min(1).max(4096),
 });
 
+// Recovery-token-authenticated (not session-authenticated): the shipped
+// run-recovery.sh/.ps1 launch script only ever holds the plaintext recovery
+// token, the same credential /bmr/recover/authenticate already accepts —
+// there is no user session to gate this behind requirePermission the way
+// /bmr/signing-key and /bmr/media/:id/signature are.
+export const bmrRecoveryBinarySignatureSchema = z.object({
+  token: z.string().min(1),
+  platform: z.enum(['linux', 'windows']),
+  architecture: z.string().min(1).max(20),
+});
+
 // ── Bare-metal recovery schemas (W04a) ──────────────────────────────
 
 export const bmrRecoveryCreateSchema = z.object({
+  ...restoreIntegrityConfirmationFields,
   snapshotId: z.string().guid(),
   identity: z.enum(['original', 'new']).default('original'),
 });
@@ -351,6 +454,14 @@ export const bmrRecoveryListSchema = z.object({
 export const bmrExchangeSchema = z.object({
   code: z.string().min(1).max(32),
   capabilities: z.array(z.string().min(1).max(64)).max(16).optional(),
+  // #5629: the recovery console's own version, so the server can refuse a
+  // too-old ISO before the one-time code is claimed. Optional — media that
+  // predates this field is still gated only by the console after exchange.
+  helperVersion: z.string().min(1).max(64).optional(),
+  // W07a: the OS the recovery media boots, so a code issued for the other
+  // platform is refused (409 media_platform_mismatch) before it is claimed.
+  mediaPlatform: z.enum(['linux', 'windows']).optional(),
+  integrityProtocolVersion: recoveryIntegrityProtocolVersion,
 });
 
 // W09a (#6464) Task 6: bound the agent-reported `result` payload so an
@@ -416,6 +527,11 @@ export const bmrCompleteSchema = z.object({
     // errorCount on the ordinary backup-result path (resultSchemas.ts). Optional
     // and omitted (not zero) by an agent that doesn't report it.
     failedFiles: z.number().int().nonnegative().optional(),
+    // Stable, machine-readable outcome reason from the recovery helper:
+    // `system_state_requires_rebuild` when a Windows recovery restored files
+    // only (system state is applied by a bare-metal rebuild), or an integrity
+    // check code. Omitted by helpers that predate it.
+    code: z.string().max(64).optional(),
   }),
 });
 
@@ -434,12 +550,14 @@ export const bmrMediaListSchema = z.object({
 });
 
 // Restore-as-VM (W05a): two engines behind one route. `hyperv` is the
-// existing Hyper-V path (fields verbatim); `rebuild` drives the Linux rebuild
-// engine on a helper host and produces a VHDX. The rebuild variant is strict
+// existing Hyper-V path (fields verbatim); `rebuild` drives the rebuild
+// engine on a helper host of the snapshot's platform (Linux or Windows) and
+// produces a VHDX. The rebuild variant is strict
 // and carries NO `identity` field — the server always creates the recovery
 // with `identity: 'new'` (spec §9: a rehearsal image can never resume the
 // production identity), so a client cannot even ask.
 const bmrVmRestoreHypervSchema = z.object({
+  ...restoreIntegrityConfirmationFields,
   engine: z.literal('hyperv'),
   snapshotId: z.string().guid(),
   targetDeviceId: z.string().guid(),
@@ -459,15 +577,22 @@ export const rebuildVhdxOutputPathSchema = z
   .string()
   .min(1)
   .max(1024)
-  .refine((p) => p.startsWith('/') && p.endsWith('.vhdx'), 'absolute .vhdx path required');
+  .refine(
+    (p) => isAbsoluteRebuildPath(p) && p.toLowerCase().endsWith('.vhdx'),
+    'absolute .vhdx path required (POSIX or a Windows drive letter, no UNC)',
+  );
 
 const bmrVmRestoreRebuildSchema = z
   .object({
+    ...restoreIntegrityConfirmationFields,
     engine: z.literal('rebuild'),
     snapshotId: z.string().guid(),
     rebuildHostDeviceId: z.string().guid(),
     outputPath: rebuildVhdxOutputPathSchema,
     imageSizeGb: z.number().int().min(1).optional(),
+    // W06d: create a Hyper-V VM after the rebuild — Windows rebuild hosts only
+    // (400 hyperv_requires_windows_host otherwise, checked where the host is known).
+    hyperv: hypervOptionsSchema,
   })
   .strict();
 
@@ -485,6 +610,7 @@ export const bmrVmRestoreSchema = z.preprocess(
 export type BmrVmRestoreInput = z.infer<typeof bmrVmRestoreSchema>;
 
 export const instantBootSchema = z.object({
+  ...restoreIntegrityConfirmationFields,
   snapshotId: z.string().guid(),
   targetDeviceId: z.string().guid(),
   vmName: z.string().min(1).max(200),
@@ -506,6 +632,7 @@ export const hypervBackupSchema = z.object({
 });
 
 export const hypervRestoreSchema = z.object({
+  ...restoreIntegrityConfirmationFields,
   deviceId: z.string().guid(),
   snapshotId: z.string().guid(),
   vmName: z.string().min(1).max(256).optional(),

@@ -1,3 +1,4 @@
+import { readEnrolledRustDeskId } from '../../services/cloudcom/remoteAccessEnrollment';
 import { Hono } from 'hono';
 import { z } from 'zod';
 import { zValidator } from '../../lib/validation';
@@ -30,7 +31,8 @@ cloudcomRemoteAccessRoutes.get('/:id/remote-access-options', ...guards,
     if (!device) return c.json({ error: 'Device not found' }, 404);
     try {
       const settings = await readPartnerRemoteAccessSettings(device.orgId);
-      return c.json({ providers: listRemoteAccessOptions({ customFields: device.customFields as Record<string, unknown> | null }, settings) });
+      const enrolledRustDeskId = await readEnrolledRustDeskId(device.id, device.orgId, settings);
+      return c.json({ providers: listRemoteAccessOptions({ customFields: device.customFields as Record<string, unknown> | null, enrolledRustDeskId }, settings) });
     } catch {
       // Errors from config/decryption may contain secrets. Do not log the input
       // or raw exception, or convert a configuration failure into an empty list.
@@ -50,7 +52,8 @@ cloudcomRemoteAccessRoutes.post('/:id/remote-access-options/:providerId/launch',
       // Read again at issuance so disabling/removing a provider after opening
       // the menu cannot launch it from a stale client-side snapshot.
       const settings = await readPartnerRemoteAccessSettings(device.orgId);
-      launcher = launchRemoteAccessOption({ customFields: device.customFields as Record<string, unknown> | null }, settings, providerId);
+      const enrolledRustDeskId = await readEnrolledRustDeskId(device.id, device.orgId, settings);
+      launcher = launchRemoteAccessOption({ customFields: device.customFields as Record<string, unknown> | null, enrolledRustDeskId }, settings, providerId);
     } catch {
       return c.json({ error: 'Unable to launch remote tool', code: 'config_error' }, 500);
     }

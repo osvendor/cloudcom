@@ -34,8 +34,10 @@ import {
   BMR_BOOTSTRAP_VERSION,
   BMR_MIN_HELPER_VERSION,
   asRecord,
+  bootstrapServesKeyLayout,
   buildAuthenticatedBootstrapPayload,
   expireUnusedRecoveryTokens,
+  RECOVERY_REQUIRES_TOKEN_MODE,
   generateRecoveryToken,
   hashRecoveryToken,
   isValidRecoveryTokenFormat,
@@ -46,6 +48,9 @@ import {
   toIsoString,
 } from '../../services/recoveryBootstrap';
 import { getAuthenticatedRecoveryDownloadTarget } from '../../services/recoveryDownloadService';
+import { evaluateRecoveryIntegrity } from '../../services/backupRecoveryIntegrityGate';
+import { CommandTypes } from '../../services/commandTypes';
+import { checkRestoreIntegrityRequest, recordRequestAuthorization, restoreIntegrityResponse } from './restoreIntegrityGate';
 import {
   getRecoveryMediaArtifact,
   getRecoveryMediaDownloadTarget,
@@ -70,6 +75,7 @@ import {
   bmrCreateTokenSchema,
   bmrMediaCreateSchema,
   bmrMediaListSchema,
+  bmrRecoveryBinarySignatureSchema,
   bmrTokenListSchema,
 } from './schemas';
 
@@ -90,10 +96,33 @@ const BMR_AUTHENTICATE_TOKEN_WINDOW_SECONDS = 60 * 60;
 // stolen token brute-forcing paths within that same snapshot — a case the path
 // scoping already bounds regardless of how high this request-rate ceiling is.
 // 10,000/minute comfortably covers the largest recoveries seen while still
-// bounding runaway retry loops; the per-IP limiter (enforcePublicRateLimit,
-// used by authenticate/complete) is unchanged.
+// bounding runaway retry loops.
 const BMR_DOWNLOAD_TOKEN_LIMIT = 10_000;
 const BMR_DOWNLOAD_TOKEN_WINDOW_SECONDS = 60;
+// A per-IP backstop alongside the per-token limit above: the token limiter
+// alone never engages for a request carrying no token, a malformed token, or
+// a random guess — exactly the anonymous flood this route is otherwise
+// exposed to (each such request still ran the system-wide expiry sweep
+// below). Set to the same order of magnitude as the token limit so it never
+// becomes the bottleneck for one legitimate large recovery running from a
+// single machine — it exists to bound a source sending garbage, not to
+// second-guess a valid, path-scoped token's own request volume.
+const BMR_DOWNLOAD_IP_LIMIT = 10_000;
+// Same per-IP backstop shape as BMR_DOWNLOAD_IP_LIMIT above, for the
+// token-authed phase-progress route (bmrRecoveries.ts): the per-token limiter
+// there never engages for a request carrying no token, a malformed token, or
+// a random guess, leaving an anonymous flood of that route otherwise
+// unbounded. Exported so bmrRecoveries.ts can size its call the same way the
+// download route sizes its own.
+export const BMR_PROGRESS_IP_LIMIT = 10_000;
+// Bounds how often the system-wide expired-token sweep actually runs. It was
+// previously invoked unconditionally on every single request to this public,
+// unauthenticated route (before even the per-IP/per-token checks or token
+// format validation) — an anonymous flood turned into a flood of full-table
+// UPDATEs. The sweep itself is idempotent housekeeping (see
+// expireUnusedRecoveryTokens's own docblock), so skipping it when another
+// request already ran it recently is always safe.
+const BMR_EXPIRY_SWEEP_MIN_INTERVAL_SECONDS = 30;
 const recoveryDownloadQuerySchema = z.object({
   token: z.string().min(1).optional(),
   path: z.string().min(1).max(4096),
@@ -316,13 +345,37 @@ export function runInRecoveryOrgContext<T>(orgId: string, fn: () => Promise<T>):
   );
 }
 
+const BMR_UNRESOLVED_IP_LIMIT_MULTIPLIER = 20;
+const BMR_UNRESOLVED_EXCHANGE_MULTIPLIER = 3;
+let lastUnresolvedWarnAt = 0;
+
 export async function enforcePublicRateLimit(
   c: any,
-  action: 'authenticate' | 'complete' | 'exchange',
+  action: 'authenticate' | 'complete' | 'exchange' | 'download' | 'progress' | 'binary-signature',
   limit: number
 ) {
   const ip = getTrustedClientIp(c);
-  const rateCheck = await rateLimiter(getRedis(), `bmr:${action}:${rateLimitIpKey(ip)}`, limit, 60);
+  // #5409: an unresolvable client IP (proxy not in TRUSTED_PROXY_CIDRS, no
+  // socket metadata) is the literal 'unknown' — every recovering machine would
+  // then share one strict per-IP bucket. Use a distinct bucket with a widened
+  // limit instead. authenticate/complete are also bounded per token (opaque
+  // high-entropy bearer). exchange has NO effective per-token bound (the
+  // limiter keys on the submitted guess), so it relies on the code's entropy
+  // and TTL and gets only a small multiplier.
+  const unresolved = ip === 'unknown';
+  if (unresolved) {
+    const now = Date.now();
+    if (now - lastUnresolvedWarnAt > 5 * 60_000) {
+      lastUnresolvedWarnAt = now;
+      console.warn(
+        `[bmr] client IP unresolved for public ${action} route — using shared unresolved rate-limit bucket; check TRUSTED_PROXY_CIDRS / TRUST_PROXY_HEADERS`
+      );
+    }
+  }
+  const key = unresolved ? `bmr:${action}:unresolved` : `bmr:${action}:${rateLimitIpKey(ip)}`;
+  const multiplier = action === 'exchange' ? BMR_UNRESOLVED_EXCHANGE_MULTIPLIER : BMR_UNRESOLVED_IP_LIMIT_MULTIPLIER;
+  const effectiveLimit = unresolved ? limit * multiplier : limit;
+  const rateCheck = await rateLimiter(getRedis(), key, effectiveLimit, 60);
   if (rateCheck.allowed) return null;
 
   const retryAfter = Math.max(1, Math.ceil((rateCheck.resetAt.getTime() - Date.now()) / 1000));
@@ -330,9 +383,27 @@ export async function enforcePublicRateLimit(
   return c.json({ error: 'Rate limit exceeded. Please wait before retrying.' }, 429);
 }
 
+// Runs the expired-recovery-token sweep at most once per
+// BMR_EXPIRY_SWEEP_MIN_INTERVAL_SECONDS, using the rate limiter as a shared
+// "has anyone already done this recently" gate rather than a per-caller
+// bucket (every caller shares one bucket key). Fails OPEN (still runs the
+// sweep) on a Redis error — the sweep is safe to run redundantly; only its
+// FREQUENCY is bounded here, so a Redis outage must not silently stop the
+// housekeeping it gates.
+async function expireUnusedRecoveryTokensThrottled(): Promise<void> {
+  try {
+    const redis = getRedis();
+    const gate = await rateLimiter(redis, 'bmr:expire-sweep', 1, BMR_EXPIRY_SWEEP_MIN_INTERVAL_SECONDS);
+    if (!gate.allowed) return;
+  } catch (err) {
+    console.error('[bmr] expiry-sweep throttle check failed (running sweep anyway):', err instanceof Error ? err.message : err);
+  }
+  await expireUnusedRecoveryTokens();
+}
+
 export async function enforceTokenRateLimit(
   c: any,
-  action: 'authenticate' | 'download' | 'exchange' | 'progress' | 'reissue',
+  action: 'authenticate' | 'download' | 'exchange' | 'progress' | 'reissue' | 'binary-signature',
   tokenHash: string,
   limit: number,
   windowSeconds: number
@@ -498,6 +569,21 @@ bmrRoutes.post(
       }
     }
 
+    // Integrity (routes/backup/restoreIntegrityGate.ts): a recovery restores
+    // the snapshot onto its own device. A snapshot without a usable
+    // attestation needs a step-up; its authorization is bound to the token in
+    // this request's transaction, and recovery authentication checks it.
+    const integrityRequest = {
+      orgId,
+      snapshotDbId: snapshot.id,
+      targetDeviceId: snapshot.deviceId,
+      commandType: CommandTypes.BMR_RECOVER,
+      stepUpGrant: payload.stepUpGrant,
+      confirmUnattestedRestore: payload.confirmUnattestedRestore,
+    };
+    const integrityCheck = await checkRestoreIntegrityRequest(c, integrityRequest);
+    if (!integrityCheck.ok) return restoreIntegrityResponse(c, integrityCheck);
+
     const plainToken = generateRecoveryToken();
     const tokenHash = hashRecoveryToken(plainToken);
     const expiresAt = new Date(Date.now() + payload.expiresInHours * 60 * 60 * 1000);
@@ -519,6 +605,15 @@ bmrRoutes.post(
 
     if (!row) {
       return c.json({ error: 'Failed to create recovery token' }, 500);
+    }
+    if (integrityCheck.authorizationReason) {
+      await recordRequestAuthorization(
+        c,
+        integrityRequest,
+        integrityCheck.authorizationReason,
+        { recoveryTokenId: row.id },
+        { inCurrentTransaction: true, confirmationMethod: integrityCheck.confirmationMethod },
+      );
     }
 
     const serverUrl = resolveServerUrl(c.req.url);
@@ -1170,10 +1265,35 @@ bmrPublicRoutes.post(
       // and the run was dead. Sliding is bounded by the token's own
       // expires_at (24 h for exchange-minted tokens) and by the per-token
       // authenticate rate limit above.
+      // Restore integrity (services/backupRecoveryIntegrityGate.ts): the
+      // recovery client must check restored bytes against the snapshot
+      // attestation, and a snapshot without a usable attestation needs a
+      // confirmed authorization bound to this token or its recovery. Runs on
+      // every (re-)authentication, before the status flips below, so a token
+      // issued before this check existed is covered at its next call.
+      const { capabilities: clientCapabilities, integrityProtocolVersion } = c.req.valid('json');
+      const integrityOutcome = await evaluateRecoveryIntegrity({
+        snapshotDbId: snapshot.id,
+        targetDeviceId: row.deviceId,
+        clientIntegrityProtocolVersion: integrityProtocolVersion,
+        recoveryTokenId: row.id,
+      });
+      if (!integrityOutcome.ok) {
+        writeAuditEvent(c, {
+          orgId: row.orgId,
+          action: 'bmr.recovery.authenticate',
+          resourceType: 'recovery_token',
+          resourceId: row.id,
+          details: { snapshotId: row.snapshotId, reason: integrityOutcome.body.error },
+          result: 'failure',
+          errorMessage: integrityOutcome.body.error,
+        });
+        return c.json(integrityOutcome.body, integrityOutcome.status);
+      }
+
       // W09 (#6464) Task 5: capability negotiation runs BEFORE the status
       // flips below. An incompatible or not-yet-ready client is refused
       // here, before authenticatedAt/status are ever written.
-      const { capabilities: clientCapabilities } = c.req.valid('json');
       // readSnapshotFileIndexState already resolves referencedFiles via the
       // snapshot's owning job (backupSnapshotFileIndex.ts loadReferencedFiles),
       // so a separate backupJobs query here would be redundant.
@@ -1307,6 +1427,8 @@ bmrPublicRoutes.post(
         .where(eq(bareMetalRecoveries.recoveryTokenId, row.id))
         .limit(1);
 
+      const integrity = integrityOutcome.integrity;
+
       const authenticatedPayload = buildAuthenticatedBootstrapPayload({
         tokenId: row.id,
         deviceId: row.deviceId,
@@ -1372,9 +1494,130 @@ bmrPublicRoutes.post(
           : null,
         grantedCapabilities: negotiation.granted,
         fileIndex: negotiation.fileIndex,
+        integrity,
       });
 
+      // #7081 R19: a prefixed snapshot is recoverable only through the
+      // token-mode download; never hand out a bootstrap without one. Checked
+      // on the built payload (the guard is against a builder regression), so
+      // the token is already authenticated here: the refusal is audited as
+      // its own event rather than as a failed authentication.
+      if (!bootstrapServesKeyLayout(snapshot.keyLayout, authenticatedPayload)) {
+        console.error('[bmr] refused a recovery bootstrap: the snapshot uses a key prefix and no token-mode download was issued', {
+          tokenId: row.id,
+          snapshotId: snapshot.snapshotId,
+          keyLayout: snapshot.keyLayout,
+        });
+        writeAuditEvent(c, {
+          orgId: row.orgId,
+          action: 'bmr.recovery.bootstrap_refused',
+          resourceType: 'recovery_token',
+          resourceId: row.id,
+          details: { snapshotId: row.snapshotId, reason: RECOVERY_REQUIRES_TOKEN_MODE.code },
+          result: 'failure',
+          errorMessage: RECOVERY_REQUIRES_TOKEN_MODE.message,
+        });
+        return c.json({ ...RECOVERY_REQUIRES_TOKEN_MODE }, 409);
+      }
+
       return c.json(authenticatedPayload);
+    });
+  }
+);
+
+// Recovery-token-authenticated (same auth model as /bmr/recover/authenticate
+// above, never a user session — the launch script only ever holds the
+// plaintext recovery token) delivery of the per-binary minisign signature,
+// so run-recovery.sh/.ps1 can verify the helper binary before executing it
+// instead of trusting the archive's contents blindly. Detached signatures
+// are not secrets; what this route guards is *which* artifact a caller may
+// ask about — only a valid, non-terminal token for that exact artifact's
+// own recovery token.
+//
+// Deliberately never returns the verification public key: the launch
+// script's trust root is the key baked into its own bundle at build time
+// (see recoveryMediaService.ts's buildLaunchScript), never anything this
+// route hands back over the same connection the script is trying to
+// verify. Verification must not depend on the server being verified, so a
+// binary signed by any other key is refused no matter what this route
+// returns.
+bmrPublicRoutes.post(
+  '/bmr/recover/binary-signature',
+  zValidator('json', bmrRecoveryBinarySignatureSchema),
+  async (c) => {
+    const rateLimited = await enforcePublicRateLimit(c, 'binary-signature', 20);
+    if (rateLimited) return rateLimited;
+
+    const { token, platform, architecture } = c.req.valid('json');
+    if (!isValidRecoveryTokenFormat(token)) {
+      return c.json({ error: 'Invalid recovery token' }, 401);
+    }
+
+    const tokenHash = hashRecoveryToken(token);
+    const tokenRateLimited = await enforceTokenRateLimit(
+      c,
+      'binary-signature',
+      tokenHash,
+      BMR_AUTHENTICATE_TOKEN_LIMIT,
+      BMR_AUTHENTICATE_TOKEN_WINDOW_SECONDS
+    );
+    if (tokenRateLimited) return tokenRateLimited;
+
+    // System-scoped lookup for the same reason authenticate's is: the
+    // caller presents an opaque bearer token, not a JWT, so there is no org
+    // to scope to until this resolves the token's own org. Everything after
+    // is read inside runInRecoveryOrgContext(row.orgId, ...).
+    const [row] = await withSystemDbAccessContext(() =>
+      db
+        .select({ id: recoveryTokens.id, orgId: recoveryTokens.orgId, status: recoveryTokens.status })
+        .from(recoveryTokens)
+        .where(eq(recoveryTokens.tokenHash, tokenHash))
+        .limit(1)
+    );
+    if (!row) {
+      return c.json({ error: 'Invalid recovery token' }, 401);
+    }
+    if (row.status === 'revoked' || row.status === 'expired') {
+      return c.json({ error: `Token is ${row.status}` }, 401);
+    }
+
+    return runInRecoveryOrgContext(row.orgId, async () => {
+      const [artifact] = await db
+        .select({ metadata: recoveryMediaArtifacts.metadata, status: recoveryMediaArtifacts.status })
+        .from(recoveryMediaArtifacts)
+        .where(
+          and(
+            eq(recoveryMediaArtifacts.tokenId, row.id),
+            eq(recoveryMediaArtifacts.platform, platform),
+            eq(recoveryMediaArtifacts.architecture, architecture)
+          )
+        )
+        .limit(1);
+
+      if (!artifact || artifact.status !== 'ready') {
+        return c.json({ error: 'Recovery media artifact not found' }, 404);
+      }
+
+      const metadata = asRecord(artifact.metadata);
+      const signature = typeof metadata.binarySignatureBase64 === 'string' ? metadata.binarySignatureBase64 : null;
+      const keyId = typeof metadata.binarySignatureKeyId === 'string' ? metadata.binarySignatureKeyId : null;
+      if (!signature) {
+        // Matches the artifact's own `legacy_unsigned` status vocabulary:
+        // this build was produced without RECOVERY_SIGNING_* configured, so
+        // there is nothing to verify against. The launch script fails
+        // closed on this, by design — see the fixer record.
+        return c.json({ error: 'No binary signature is available for this recovery media artifact' }, 404);
+      }
+
+      writeRouteAudit(c, {
+        orgId: row.orgId,
+        action: 'bmr.recover.binarySignature',
+        resourceType: 'recovery_token',
+        resourceId: row.id,
+      });
+
+      // No publicKey field, deliberately — see this route's doc comment.
+      return c.json({ signature, keyId });
     });
   }
 );
@@ -1383,7 +1626,13 @@ bmrPublicRoutes.get(
   '/bmr/recover/download',
   zValidator('query', recoveryDownloadQuerySchema),
   async (c) => {
-    await expireUnusedRecoveryTokens();
+    // Per-IP backstop FIRST — before the expiry sweep or any token
+    // validation — so an anonymous flood of garbage requests is rejected
+    // before it can trigger either.
+    const ipRateLimited = await enforcePublicRateLimit(c, 'download', BMR_DOWNLOAD_IP_LIMIT);
+    if (ipRateLimited) return ipRateLimited;
+
+    await expireUnusedRecoveryTokensThrottled();
 
     const { token: queryToken, path } = c.req.valid('query');
     if (queryToken?.trim() && !allowRecoveryQueryToken()) {
@@ -1583,13 +1832,23 @@ bmrPublicRoutes.get(
         },
       });
 
+      // #6489: a local-provider `.gz` object is decompressed on the fly
+      // (getAuthenticatedRecoveryDownloadTarget), so its decompressed length
+      // isn't known up front — that branch returns `contentLength: null`.
+      // Sending a `Content-Length` header at all in that case would either
+      // lie (the compressed size) or require buffering the whole object
+      // first, so the header is only set when a real length is known.
+      const streamHeaders: Record<string, string> = {
+        'Content-Type': target.contentType,
+        'Cache-Control': 'no-store',
+      };
+      if (target.contentLength != null) {
+        streamHeaders['Content-Length'] = String(target.contentLength);
+      }
+
       return new Response(webStream, {
         status: 200,
-        headers: {
-          'Content-Type': target.contentType,
-          'Content-Length': String(target.contentLength),
-          'Cache-Control': 'no-store',
-        },
+        headers: streamHeaders,
       });
     });
   }
@@ -1682,6 +1941,7 @@ bmrPublicRoutes.post(
         return c.json({
           restoreJobId: existingRestoreJob?.id ?? null,
           status: existingRestoreJob?.status ?? 'completed',
+          tokenConsumed: true,
         });
       }
 
@@ -1718,8 +1978,40 @@ bmrPublicRoutes.post(
             ? 'partial'
             : 'failed';
 
+      // #5408: the token is consumed by the first completion that actually
+      // restored the machine (`completed` or `partial`), not by a failed
+      // attempt. The recovery binary reports every run here, including one
+      // that died mid-download on a network drop; consuming the token on that
+      // report meant the operator's retry answered "Token is used" and they
+      // had to mint a new token from the console they were trying to recover.
+      // A failed attempt is still recorded (restore job + audit event) and
+      // leaves the token authenticated, so a retry within the token's TTL
+      // re-authenticates with it. The single-use guarantee is unchanged: once
+      // a completion consumes the token, authenticate/download/complete all
+      // refuse it, and the token's expires_at stays the outer bound.
+      const consumesToken = restoreStatus !== 'failed';
       const completionTime = new Date();
-      const persistedRestoreJob = await db.transaction(async (tx) => {
+      const attemptTargetConfig = {
+        ...asRecord(row.targetConfig),
+        result: {
+          status: result.status,
+          filesRestored: result.filesRestored ?? null,
+          bytesRestored: result.bytesRestored ?? null,
+          stateApplied: result.stateApplied ?? null,
+          driversInjected: result.driversInjected ?? null,
+          validated: result.validated ?? null,
+          warnings: result.warnings ?? [],
+          error: result.error ?? null,
+          // D14: per-file failure count for a partially-successful
+          // recovery. Optional and left null (not 0) when an older agent
+          // build doesn't report it.
+          failedFiles: result.failedFiles ?? null,
+          // Outcome code (e.g. system_state_requires_rebuild); null for
+          // a helper that does not report one.
+          code: result.code ?? null,
+        },
+      };
+      const completion = await db.transaction(async (tx) => {
         const [restoreJob] = await tx
           .insert(restoreJobs)
           .values({
@@ -1728,23 +2020,7 @@ bmrPublicRoutes.post(
             deviceId: row.deviceId,
             restoreType: 'bare_metal',
             status: restoreStatus,
-            targetConfig: {
-              ...asRecord(row.targetConfig),
-              result: {
-                status: result.status,
-                filesRestored: result.filesRestored ?? null,
-                bytesRestored: result.bytesRestored ?? null,
-                stateApplied: result.stateApplied ?? null,
-                driversInjected: result.driversInjected ?? null,
-                validated: result.validated ?? null,
-                warnings: result.warnings ?? [],
-                error: result.error ?? null,
-                // D14: per-file failure count for a partially-successful
-                // recovery. Optional and left null (not 0) when an older agent
-                // build doesn't report it.
-                failedFiles: result.failedFiles ?? null,
-              },
-            },
+            targetConfig: attemptTargetConfig,
             recoveryTokenId: row.id,
             restoredSize: result.bytesRestored ?? null,
             restoredFiles: result.filesRestored ?? null,
@@ -1759,7 +2035,7 @@ bmrPublicRoutes.post(
             status: restoreJobs.status,
           });
 
-        const persisted =
+        let persisted =
           restoreJob ??
           (
             await tx
@@ -1772,7 +2048,47 @@ bmrPublicRoutes.post(
               .limit(1)
           )[0];
 
-        if (persisted) {
+        // restore_jobs is unique per recovery token, so a retry after a
+        // failed attempt lands on that attempt's row: overwrite it with this
+        // attempt's outcome. Only a `failed` row is overwritten (guarded in
+        // the UPDATE itself, so a concurrent completion that already moved it
+        // on wins); any other pre-existing row for the token — e.g. the
+        // pending job a VM rebuild pre-creates — is returned untouched, as
+        // before.
+        if (!restoreJob && persisted?.status === 'failed') {
+          const [overwritten] = await tx
+            .update(restoreJobs)
+            .set({
+              status: restoreStatus,
+              targetConfig: attemptTargetConfig,
+              restoredSize: result.bytesRestored ?? null,
+              restoredFiles: result.filesRestored ?? null,
+              completedAt: completionTime,
+              updatedAt: completionTime,
+            })
+            .where(and(eq(restoreJobs.id, persisted.id), eq(restoreJobs.status, 'failed')))
+            .returning({
+              id: restoreJobs.id,
+              status: restoreJobs.status,
+            });
+          if (overwritten) {
+            persisted = overwritten;
+          } else {
+            // Zero rows: a concurrent completion moved the row off `failed`
+            // after our SELECT. Re-read it so the response reports the row
+            // that actually won rather than the stale `failed` snapshot.
+            const [current] = await tx
+              .select({ id: restoreJobs.id, status: restoreJobs.status })
+              .from(restoreJobs)
+              .where(eq(restoreJobs.id, persisted.id))
+              .limit(1);
+            if (current) persisted = current;
+          }
+        }
+
+        if (!persisted) return { job: null, tokenConsumed: false };
+
+        if (consumesToken) {
           await tx
             .update(recoveryTokens)
             .set({
@@ -1786,11 +2102,28 @@ bmrPublicRoutes.post(
             .update(recoveryMediaArtifacts)
             .set({ status: 'expired' })
             .where(eq(recoveryMediaArtifacts.tokenId, row.id));
+          return { job: persisted, tokenConsumed: true };
         }
 
-        return persisted ?? null;
+        // This attempt failed, so it does not consume the token — but a
+        // concurrent completion may already have. Report the token's actual
+        // state rather than inferring it from this attempt's own result.
+        if (restoreJob || persisted.status === 'failed') {
+          return { job: persisted, tokenConsumed: false };
+        }
+        const [currentToken] = await tx
+          .select({ status: recoveryTokens.status, completedAt: recoveryTokens.completedAt })
+          .from(recoveryTokens)
+          .where(eq(recoveryTokens.id, row.id))
+          .limit(1);
+        return {
+          job: persisted,
+          tokenConsumed: currentToken?.status === 'used' && currentToken.completedAt != null,
+        };
       });
 
+      const persistedRestoreJob = completion.job;
+      const { tokenConsumed } = completion;
       writeAuditEvent(c, {
         orgId: row.orgId,
         action: 'bmr.recovery.complete',
@@ -1800,13 +2133,23 @@ bmrPublicRoutes.post(
           snapshotId: row.snapshotId,
           restoreJobId: persistedRestoreJob?.id ?? null,
           status: result.status,
+          tokenConsumed,
+          ...(result.error ? { error: result.error.slice(0, 500) } : {}),
         },
-        result: 'success',
+        result: restoreStatus === 'failed' ? 'failure' : 'success',
+        ...(restoreStatus === 'failed'
+          ? {
+              errorMessage: tokenConsumed
+                ? 'Recovery attempt failed; token was already consumed by a concurrent completion'
+                : 'Recovery attempt failed; token remains usable for a retry',
+            }
+          : {}),
       });
 
       return c.json({
         restoreJobId: persistedRestoreJob?.id ?? null,
         status: persistedRestoreJob?.status ?? restoreStatus,
+        tokenConsumed,
       });
     });
   }

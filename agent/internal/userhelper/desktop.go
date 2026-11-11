@@ -6,6 +6,8 @@ import (
 	"image"
 	"regexp"
 
+	"github.com/pion/webrtc/v4"
+
 	"github.com/breeze-rmm/agent/internal/ipc"
 	"github.com/breeze-rmm/agent/internal/remote/desktop"
 )
@@ -46,6 +48,11 @@ func (h *helperDesktopManager) startSession(req *ipc.DesktopStartRequest) (*ipc.
 	var iceServers []desktop.ICEServerConfig
 	if len(req.ICEServers) > 0 {
 		if err := json.Unmarshal(req.ICEServers, &iceServers); err != nil {
+			// Relay-only has no safe default: falling back would surface as a
+			// misleading "no TURN server" error, so name the real cause.
+			if req.RelayOnly {
+				return nil, fmt.Errorf("relay-only desktop session: invalid iceServers payload: %w", err)
+			}
 			log.Warn("failed to parse ICE servers from IPC, using defaults", "error", err)
 		}
 	}
@@ -81,7 +88,7 @@ func validateDesktopStartRequest(req *ipc.DesktopStartRequest) error {
 	if req.Offer == "" {
 		return fmt.Errorf("offer is required")
 	}
-	// SEC-038: reject a generation we could not compare before anything else
+	// Reject a generation we could not compare before anything else
 	// looks at the request. Empty is fine (older service); malformed is not.
 	if req.StartGeneration != "" {
 		if _, err := parseHelperGeneration(req.StartGeneration); err != nil {
@@ -160,4 +167,56 @@ func (h *helperDesktopManager) hasActiveSessions() bool {
 
 func (h *helperDesktopManager) setAtLoginWindow(atLoginWindow bool) {
 	h.mgr.SetAtLoginWindow(atLoginWindow)
+}
+
+// Trickle ICE (#9182). The helper hosts the peer connection on service
+// installs, so its late local candidates travel helper -> service -> API and
+// viewer candidates come back the other way.
+
+// localICECandidateNotice converts one trickle entry to its IPC form.
+func localICECandidateNotice(sessionID, startGeneration string, c desktop.LocalICECandidate) ipc.DesktopLocalICECandidate {
+	notice := ipc.DesktopLocalICECandidate{
+		SessionID:       sessionID,
+		StartGeneration: startGeneration,
+		Seq:             c.Seq,
+		Complete:        c.Complete,
+	}
+	if !c.Complete && c.Candidate != nil {
+		notice.Candidate = &ipc.ICECandidate{
+			Candidate:        c.Candidate.Candidate,
+			SDPMid:           c.Candidate.SDPMid,
+			SDPMLineIndex:    c.Candidate.SDPMLineIndex,
+			UsernameFragment: c.Candidate.UsernameFragment,
+		}
+	}
+	return notice
+}
+
+// beginICETrickle starts sending the session's queued and future late
+// candidates. The service sends it once it has recorded this helper as the
+// session's owner.
+func (h *helperDesktopManager) beginICETrickle(req ipc.DesktopICETrickleBegin) error {
+	if !helperDesktopSessionIDPattern.MatchString(req.SessionID) {
+		return fmt.Errorf("invalid sessionId")
+	}
+	if !h.mgr.BeginICETrickle(req.SessionID, req.StartGeneration) {
+		return fmt.Errorf("no desktop session ready to trickle")
+	}
+	return nil
+}
+
+// addRemoteICECandidate applies a viewer candidate the service relayed.
+func (h *helperDesktopManager) addRemoteICECandidate(req ipc.DesktopRemoteICECandidate) error {
+	if !helperDesktopSessionIDPattern.MatchString(req.SessionID) {
+		return fmt.Errorf("invalid sessionId")
+	}
+	if err := req.Candidate.Validate(); err != nil {
+		return err
+	}
+	return h.mgr.AddRemoteICECandidate(req.SessionID, req.StartGeneration, webrtc.ICECandidateInit{
+		Candidate:        req.Candidate.Candidate,
+		SDPMid:           req.Candidate.SDPMid,
+		SDPMLineIndex:    req.Candidate.SDPMLineIndex,
+		UsernameFragment: req.Candidate.UsernameFragment,
+	})
 }

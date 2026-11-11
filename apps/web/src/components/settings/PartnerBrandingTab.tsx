@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import type { InheritableBrandingSettings } from '@breeze/shared';
 import { sanitizeImageSrc } from '../../lib/safeImageSrc';
+import { MAX_LOGO_BYTES, LOGO_ACCEPT, resizeToDataUrl } from '../../lib/logoDataUrl';
 import { useTranslation } from 'react-i18next';
 import '@/lib/i18n';
 
@@ -8,38 +9,6 @@ type Props = {
   data: InheritableBrandingSettings;
   onChange: (data: InheritableBrandingSettings) => void;
 };
-
-const MAX_LOGO_BYTES = 400_000;
-const LOGO_ACCEPT = 'image/png,image/jpeg,image/webp';
-
-function resizeToDataUrl(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const objectUrl = URL.createObjectURL(file);
-    const img = new Image();
-    img.onload = () => {
-      URL.revokeObjectURL(objectUrl);
-      const MAX = 256;
-      let { width, height } = img;
-      if (width > MAX || height > MAX) {
-        const ratio = Math.min(MAX / width, MAX / height);
-        width = Math.round(width * ratio);
-        height = Math.round(height * ratio);
-      }
-      const canvas = document.createElement('canvas');
-      canvas.width = width;
-      canvas.height = height;
-      const ctx = canvas.getContext('2d');
-      if (!ctx) { reject(new Error('Canvas unavailable')); return; }
-      ctx.drawImage(img, 0, 0, width, height);
-      resolve(canvas.toDataURL('image/png'));
-    };
-    img.onerror = () => {
-      URL.revokeObjectURL(objectUrl);
-      reject(new Error('Invalid image file'));
-    };
-    img.src = objectUrl;
-  });
-}
 
 export default function PartnerBrandingTab({ data, onChange }: Props) {
   const { t } = useTranslation('settings');
@@ -110,15 +79,18 @@ export default function PartnerBrandingTab({ data, onChange }: Props) {
     <div className="space-y-6">
       <div className="grid gap-6 sm:grid-cols-2">
         <div className="space-y-2">
-          <label className="text-sm font-medium">{t('partnerBranding.primaryColor')}</label>
+          <label id="partner-branding-primary-color-label" htmlFor="partner-branding-primary-color" className="text-sm font-medium">{t('partnerBranding.primaryColor')}</label>
           <div className="flex gap-2">
+            {/* The swatch and the hex field edit the same value; both carry the one label. */}
             <input
               type="color"
+              aria-labelledby="partner-branding-primary-color-label"
               value={data.primaryColor || '#3b82f6'}
               onChange={e => set({ primaryColor: e.target.value })}
               className="h-10 w-12 cursor-pointer rounded-md border bg-background p-1"
             />
             <input
+              id="partner-branding-primary-color"
               type="text"
               value={data.primaryColor ?? ''}
               onChange={e => set({ primaryColor: e.target.value || undefined })}
@@ -129,15 +101,18 @@ export default function PartnerBrandingTab({ data, onChange }: Props) {
         </div>
 
         <div className="space-y-2">
-          <label className="text-sm font-medium">{t('partnerBranding.secondaryColor')}</label>
+          <label id="partner-branding-secondary-color-label" htmlFor="partner-branding-secondary-color" className="text-sm font-medium">{t('partnerBranding.secondaryColor')}</label>
           <div className="flex gap-2">
+            {/* The swatch and the hex field edit the same value; both carry the one label. */}
             <input
               type="color"
+              aria-labelledby="partner-branding-secondary-color-label"
               value={data.secondaryColor || '#64748b'}
               onChange={e => set({ secondaryColor: e.target.value })}
               className="h-10 w-12 cursor-pointer rounded-md border bg-background p-1"
             />
             <input
+              id="partner-branding-secondary-color"
               type="text"
               value={data.secondaryColor ?? ''}
               onChange={e => set({ secondaryColor: e.target.value || undefined })}
@@ -148,8 +123,9 @@ export default function PartnerBrandingTab({ data, onChange }: Props) {
         </div>
 
         <div className="space-y-2">
-          <label className="text-sm font-medium">{t('partnerBranding.theme')}</label>
+          <label htmlFor="partner-branding-theme" className="text-sm font-medium">{t('partnerBranding.theme')}</label>
           <select
+            id="partner-branding-theme"
             value={data.theme ?? ''}
             onChange={e => set({ theme: (e.target.value || undefined) as InheritableBrandingSettings['theme'] })}
             className="h-10 w-full rounded-md border bg-background px-3 text-sm"
@@ -163,9 +139,9 @@ export default function PartnerBrandingTab({ data, onChange }: Props) {
 
         <div className="space-y-2 col-span-full">
           <label htmlFor="logo-file-input" className="text-sm font-medium">{t('partnerBranding.logo')}</label>
-          <div className="rounded-lg border bg-muted/40 p-4 space-y-3">
+          <div className="space-y-3">
             <div className="flex items-center gap-4">
-              <div className="flex h-14 w-14 shrink-0 items-center justify-center rounded-lg border bg-background overflow-hidden">
+              <div data-preview className="flex h-14 w-14 shrink-0 items-center justify-center rounded-lg border bg-background overflow-hidden">
                 {safeLogo ? (
                   <img
                     src={safeLogo}
@@ -226,15 +202,17 @@ export default function PartnerBrandingTab({ data, onChange }: Props) {
       </div>
 
       <div className="space-y-2">
-        <label className="text-sm font-medium">{t('partnerBranding.customCss')}</label>
+        <label htmlFor="partner-branding-custom-css" className="text-sm font-medium">{t('partnerBranding.customCss')}</label>
         <textarea
+          id="partner-branding-custom-css"
+          aria-describedby="partner-branding-custom-css-help"
           value={data.customCss ?? ''}
           onChange={e => set({ customCss: e.target.value || undefined })}
           rows={5}
           className="w-full rounded-md border bg-background px-3 py-2 font-mono text-sm"
           placeholder={t('partnerBranding.customCssPlaceholder')}
         />
-        <p className="text-xs text-muted-foreground">
+        <p id="partner-branding-custom-css-help" className="text-xs text-muted-foreground">
           {t('partnerBranding.customCssHelp')}
         </p>
       </div>

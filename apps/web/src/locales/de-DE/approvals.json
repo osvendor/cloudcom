@@ -42,6 +42,7 @@
   },
   "denyPrompt": "Warum lehnen Sie diese Anfrage ab? Eine Begründung ist optional.",
   "denyReasonPlaceholder": "Optional – wird der anfragenden Person mitgeteilt",
+  "denyReasonShownToUserHint": "Die Endbenutzerin bzw. der Endbenutzer sieht dies in der Benachrichtigung (erste 500 Zeichen).",
   "confirmDeny": "Ablehnung bestätigen",
   "cancel": "Abbrechen",
   "deny": "Ablehnen",
@@ -67,6 +68,7 @@
     "noApproverDevice": "Registrieren Sie in Ihrem Profil ein Genehmigungsgerät und versuchen Sie es erneut.",
     "notSoleApprover": "Eine andere berechtigte Person muss diese Anfrage genehmigen.",
     "siteCeiling": "Diese Genehmigung gewährt organisationsweite Berechtigungen. Ihr Zugriff ist auf bestimmte Standorte beschränkt, daher muss eine andere Person diese Anfrage entscheiden.",
+    "approverScopeRequired": "Diese Genehmigung betrifft alle Organisationen des Partners. Sie muss daher von einer genehmigenden Person auf Partnerebene mit Zugriff auf alle Organisationen entschieden werden.",
     "verificationFailed": "Die Überprüfung wurde abgebrochen oder ist fehlgeschlagen. Versuchen Sie es erneut.",
     "alreadyDecided": "Über diese Anfrage wurde bereits entschieden.",
     "expired": "Diese Anfrage ist abgelaufen, bevor eine Entscheidung getroffen wurde.",
@@ -98,6 +100,7 @@
     "loading": "Kürzliche Genehmigungen werden geladen…",
     "error": "Kürzliche Genehmigungen konnten nicht geladen werden.",
     "retry": "Erneut versuchen",
+    "decisionReasonLabel": "Grund des Genehmigers",
     "empty": "Kürzlich wurde nichts abgeschlossen.",
     "status": {
       "failed": "Fehlgeschlagen",
@@ -106,10 +109,73 @@
       "cancelled": "Abgebrochen",
       "completed": "Abgeschlossen",
       "denied": "Abgelehnt",
+      "refused": "Genehmigt, dann blockiert",
       "approved": "Genehmigt",
       "reported": "Gemeldet",
       "unknown": "Unbekannt"
     }
   },
-  "proposedByAgentExecuteNotice": "Eine Genehmigung führt dies jetzt aus — kein Testlauf, auch nicht im Schattenmodus."
+  "proposedByAgentExecuteNotice": "Eine Genehmigung führt dies jetzt aus — kein Testlauf, auch nicht im Schattenmodus.",
+  "assuranceDefaultNotice": {
+    "upcomingTitle": "Genehmigergeräte sind ab {{date}} erforderlich",
+    "upcomingBody": "Für Ihr Partnerkonto wurde keine Auswahl zur Genehmigungssicherheit gespeichert, daher gilt der Plattformstandard: Ab {{date}} erfordert die Genehmigung einer Anfrage mit hohem oder kritischem Risiko ein registriertes Genehmigergerät statt eines einzelnen Klicks. Registrieren Sie vorher ein Gerät, damit Genehmigungen nicht aufgehalten werden.",
+    "activeTitle": "Genehmigungen mit hohem Risiko erfordern ein Genehmigergerät",
+    "activeBody": "Seit {{date}} verlangt der Plattformstandard ein registriertes Genehmigergerät, um Anfragen mit hohem und kritischem Risiko zu genehmigen, da für Ihr Partnerkonto keine Auswahl zur Genehmigungssicherheit gespeichert wurde. Deshalb fragen diese Genehmigungen nach Ihrem Gerät.",
+    "settingsLink": "Genehmigungssicherheit prüfen",
+    "registerLink": "Genehmigergerät registrieren"
+  },
+  "diagnosticAccess": {
+    "title": "Schreibgeschützter Diagnosezugriff",
+    "organization": "Organisation",
+    "device": "Gerät",
+    "access": "Zugriff",
+    "readOnlyOps": "Nur lesen: {{operations}}. Kein Schreiben, Löschen, Umbenennen, keine Skripte oder Registrierungsänderungen.",
+    "duration": "Dauer",
+    "durationValue": "{{minutes}} Minuten ab Genehmigung",
+    "purpose": "Zweck",
+    "requestedBy": "Angefordert von",
+    "principalUser": "Breeze AI",
+    "principalApiKey": "MCP-API-Schlüssel",
+    "principalOauth": "MCP-OAuth-Verbindung",
+    "paths": "Pfade",
+    "recursive": "Gesamter Unterbaum",
+    "thisFolderOnly": "Dieser Ordner und die direkt darin liegenden Dateien",
+    "sensitiveHeading": "Ausdrücklich angeforderte sensible Speicher",
+    "noSensitive": "Bekannte Speicherorte von Browserpasswörtern und Cookies, Anmeldeinformationsspeichern, privaten Schlüsseln und gespeicherten Token werden zurückgehalten, auch innerhalb dieser Pfade. Dies ist eine feste Liste; alles andere in diesen Pfaden ist lesbar.",
+    "opList": "auflisten",
+    "opRead": "lesen",
+    "classes": {
+      "browser_secrets": "Browserpasswörter, Cookies und deren Schlüssel",
+      "credential_store": "Anmeldeinformationsspeicher des Betriebssystems",
+      "private_keys": "Private Schlüssel (SSH, GnuPG, TLS)",
+      "session_tokens": "Gespeicherte Sitzungstoken und Cloud-Anmeldedaten"
+    }
+  },
+  "operatorPlan": {
+    "title": "Plan für die KI-Aufgabe",
+    "summary_one": "{{count}} Auswirkung, Planrevision {{revision}}",
+    "summary_other": "{{count}} Auswirkungen, Planrevision {{revision}}",
+    "groupBreeze": "Breeze-Geräte",
+    "groupM365": "Microsoft 365",
+    "groupGoogle": "Google Workspace",
+    "effectOrdinal": "Schritt {{ordinal}}",
+    "targetLine": "{{targetLabel}} ({{principalLabel}})",
+    "orderNote": "Die Auswirkungen werden in dieser Reihenfolge ausgeführt. Die Anmeldung wird zuletzt deaktiviert, sodass ein vorzeitiger Abbruch nie E-Mails ohne Weiterleitung hinterlässt.",
+    "empty": "Dieser Plan enthält keine Auswirkungen.",
+    "invalid": "Dieser Plan konnte nicht vollständig angezeigt werden. Genehmigen Sie ihn nicht."
+  },
+  "intentStatus": {
+    "title": "Genehmigungsstatus",
+    "waitingForApprovers": "Warten auf Genehmiger",
+    "notFound": "Diese Genehmigung wurde nicht gefunden.",
+    "status": {
+      "pending_approval": "Genehmigung ausstehend",
+      "in_progress": "In Bearbeitung",
+      "completed": "Abgeschlossen",
+      "failed": "Fehlgeschlagen",
+      "rejected": "Abgelehnt",
+      "expired": "Abgelaufen",
+      "cancelled": "Abgebrochen"
+    }
+  }
 }

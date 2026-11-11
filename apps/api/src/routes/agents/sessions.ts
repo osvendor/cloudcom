@@ -3,12 +3,12 @@ import { zValidator } from '../../lib/validation';
 import { and, eq } from 'drizzle-orm';
 import { db } from '../../db';
 import { devices, deviceSessions } from '../../db/schema';
-import { writeAuditEvent } from '../../services/auditEvents';
+import { recordAgentIngestSubmission } from '../metrics';
 import { publishEvent } from '../../services/eventBus';
 import { submitSessionsSchema } from './schemas';
 import { sanitizeTimestamp } from './helpers';
 import { requireAgentRole } from '../../middleware/requireAgentRole';
-import { observeSessionPrincipal } from '../../services/callerVerification/loginObservation';
+import { isObservablePrincipal, observeSessionPrincipal } from '../../services/callerVerification/loginObservation';
 
 export const sessionsRoutes = new Hono();
 // Session ingest is the main agent's job; reject watchdog-role tokens.
@@ -50,117 +50,138 @@ sessionsRoutes.put('/:id/sessions', zValidator('json', submitSessionsSchema), as
   const now = new Date();
   const activeSessions = data.sessions.filter((session) => session.isActive !== false);
 
-  await db.transaction(async (tx) => {
-    const existingActive = await tx
-      .select({
-        id: deviceSessions.id,
-        username: deviceSessions.username,
-        sessionType: deviceSessions.sessionType,
-        osSessionId: deviceSessions.osSessionId,
-        loginAt: deviceSessions.loginAt,
-      })
-      .from(deviceSessions)
-      .where(
-        and(
-          eq(deviceSessions.deviceId, device.id),
-          eq(deviceSessions.isActive, true)
-        )
+  try {
+    await db.transaction(async (tx) => {
+      const existingActive = await tx
+        .select({
+          id: deviceSessions.id,
+          username: deviceSessions.username,
+          sessionType: deviceSessions.sessionType,
+          osSessionId: deviceSessions.osSessionId,
+          loginAt: deviceSessions.loginAt,
+        })
+        .from(deviceSessions)
+        .where(
+          and(
+            eq(deviceSessions.deviceId, device.id),
+            eq(deviceSessions.isActive, true)
+          )
+        );
+
+      const existingByKey = new Map(
+        existingActive.map((row) => [
+          getSessionIdentityKey({
+            username: row.username,
+            sessionType: row.sessionType,
+            osSessionId: row.osSessionId ?? null,
+          }),
+          row,
+        ])
       );
+      const seenKeys = new Set<string>();
 
-    const existingByKey = new Map(
-      existingActive.map((row) => [
-        getSessionIdentityKey({
-          username: row.username,
-          sessionType: row.sessionType,
-          osSessionId: row.osSessionId ?? null,
-        }),
-        row,
-      ])
-    );
-    const seenKeys = new Set<string>();
+      for (const session of activeSessions) {
+        const osSessionId = session.sessionId ?? null;
+        const key = getSessionIdentityKey({
+          username: session.username,
+          sessionType: session.sessionType,
+          osSessionId,
+        });
+        seenKeys.add(key);
 
-    for (const session of activeSessions) {
-      const osSessionId = session.sessionId ?? null;
-      const key = getSessionIdentityKey({
-        username: session.username,
-        sessionType: session.sessionType,
-        osSessionId,
-      });
-      seenKeys.add(key);
+        const loginAt = sanitizeTimestamp(session.loginAt) ?? now;
+        const lastActivityAt = sanitizeTimestamp(session.lastActivityAt) ?? now;
+        const existing = existingByKey.get(key);
 
-      const loginAt = sanitizeTimestamp(session.loginAt) ?? now;
-      const lastActivityAt = sanitizeTimestamp(session.lastActivityAt) ?? now;
-      const existing = existingByKey.get(key);
+        if (!existing) {
+          await tx
+            .insert(deviceSessions)
+            .values({
+              orgId: device.orgId,
+              deviceId: device.id,
+              username: session.username,
+              sessionType: session.sessionType,
+              osSessionId,
+              loginAt,
+              idleMinutes: session.idleMinutes ?? null,
+              activityState: session.activityState ?? 'active',
+              loginPerformanceSeconds: session.loginPerformanceSeconds ?? null,
+              isActive: true,
+              lastActivityAt,
+              updatedAt: now,
+            });
+          continue;
+        }
 
-      if (!existing) {
         await tx
-          .insert(deviceSessions)
-          .values({
-            orgId: device.orgId,
-            deviceId: device.id,
-            username: session.username,
-            sessionType: session.sessionType,
-            osSessionId,
-            loginAt,
+          .update(deviceSessions)
+          .set({
             idleMinutes: session.idleMinutes ?? null,
             activityState: session.activityState ?? 'active',
             loginPerformanceSeconds: session.loginPerformanceSeconds ?? null,
             isActive: true,
             lastActivityAt,
             updatedAt: now,
-          });
-        continue;
+          })
+          .where(eq(deviceSessions.id, existing.id));
       }
 
-      await tx
-        .update(deviceSessions)
-        .set({
-          idleMinutes: session.idleMinutes ?? null,
-          activityState: session.activityState ?? 'active',
-          loginPerformanceSeconds: session.loginPerformanceSeconds ?? null,
-          isActive: true,
-          lastActivityAt,
-          updatedAt: now,
-        })
-        .where(eq(deviceSessions.id, existing.id));
-    }
+      for (const stale of existingActive) {
+        const key = getSessionIdentityKey({
+          username: stale.username,
+          sessionType: stale.sessionType,
+          osSessionId: stale.osSessionId ?? null,
+        });
+        if (seenKeys.has(key)) {
+          continue;
+        }
 
-    for (const stale of existingActive) {
-      const key = getSessionIdentityKey({
-        username: stale.username,
-        sessionType: stale.sessionType,
-        osSessionId: stale.osSessionId ?? null,
-      });
-      if (seenKeys.has(key)) {
-        continue;
+        const durationSeconds = Math.max(0, Math.floor((now.getTime() - stale.loginAt.getTime()) / 1000));
+        await tx
+          .update(deviceSessions)
+          .set({
+            isActive: false,
+            logoutAt: now,
+            durationSeconds,
+            activityState: 'disconnected',
+            updatedAt: now,
+          })
+          .where(eq(deviceSessions.id, stale.id));
       }
+    });
 
-      const durationSeconds = Math.max(0, Math.floor((now.getTime() - stale.loginAt.getTime()) / 1000));
-      await tx
-        .update(deviceSessions)
-        .set({
-          isActive: false,
-          logoutAt: now,
-          durationSeconds,
-          activityState: 'disconnected',
-          updatedAt: now,
-        })
-        .where(eq(deviceSessions.id, stale.id));
+    // Caller verification (#6354 W02): only when the report carries OS identity
+    // that can actually bind (isObservablePrincipal — the same predicate
+    // observeSessionPrincipal gates its writes on), share-lock the device for
+    // the rest of the request so a device org move (FOR UPDATE on this row
+    // before it revokes workstation grants) cannot interleave with the
+    // observation. Taken late, and only then, so ordinary session reports —
+    // including principals without a UPN — pay no extra statement and never
+    // queue concurrent heartbeat writes (agentHotPathQueryBudget pins this).
+    const observes = activeSessions.some((session) => isObservablePrincipal(session.username, session.principal))
+      || (data.events ?? []).some((event) => event.type === 'login' && isObservablePrincipal(event.username, event.principal));
+    if (observes) {
+      const [locked] = await db.select({ orgId: devices.orgId }).from(devices)
+        .where(eq(devices.id, device.id)).limit(1).for('share');
+      if (locked?.orgId !== device.orgId) throw new Error('Device organization changed during session report');
     }
-  });
-
-  // Caller verification (#6354): independent login telemetry. Runs in the
-  // ambient agent-auth transaction (the nested session transaction above has
-  // released its savepoint, not committed the request). Errors are NOT
-  // swallowed: a failed upload keeps the events queued on the agent for retry,
-  // and the binding helper is idempotent.
-  for (const session of activeSessions) {
-    await observeSessionPrincipal(device.orgId, device.hostname, session.username, session.principal);
-  }
-  for (const event of data.events ?? []) {
-    if (event.type === 'login') {
-      await observeSessionPrincipal(device.orgId, device.hostname, event.username, event.principal);
+    // Caller verification (#6354): independent login telemetry. Runs in the
+    // ambient agent-auth transaction (the nested session transaction above has
+    // released its savepoint, not committed the request). Errors are NOT
+    // swallowed: a failed upload keeps the events queued on the agent for retry,
+    // and the binding helper is idempotent.
+    for (const session of activeSessions) {
+      await observeSessionPrincipal(device.orgId, device.hostname, session.username, session.principal);
     }
+    for (const event of data.events ?? []) {
+      if (event.type === 'login') {
+        await observeSessionPrincipal(device.orgId, device.hostname, event.username, event.principal);
+      }
+    }
+  } catch (err) {
+    // Surfaced as a 500 so the agent keeps the report queued and retries.
+    recordAgentIngestSubmission('sessions', 'failed');
+    throw err;
   }
 
   const events = data.events ?? [];
@@ -191,18 +212,11 @@ sessionsRoutes.put('/:id/sessions', zValidator('json', submitSessionsSchema), as
     }
   }
 
-  writeAuditEvent(c, {
-    orgId: agent?.orgId ?? device.orgId,
-    actorType: 'agent',
-    actorId: agent?.agentId ?? agentId,
-    action: 'agent.sessions.submit',
-    resourceType: 'device',
-    resourceId: device.id,
-    details: {
-      activeSessions: activeSessions.length,
-      events: events.length,
-    },
-  });
+  // #4340 — no per-report audit. A sessions report arrives every few minutes
+  // per device and was ~11% of audit_logs; the session history it carries is
+  // itself durable in device_sessions (loginAt/logoutAt per session), so the
+  // routine report is only counted.
+  recordAgentIngestSubmission('sessions', 'success');
 
   return c.json({
     success: true,

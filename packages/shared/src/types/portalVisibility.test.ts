@@ -2,6 +2,7 @@ import { describe, expect, expectTypeOf, it } from 'vitest';
 import type {
   BackupDeviceRow,
   BackupOverviewDto,
+  BackupTileDto,
   DashboardDto,
   EnrichedPortalDevice,
   NetworkOverviewDto,
@@ -33,8 +34,14 @@ describe('portal visibility DTOs', () => {
     >();
   });
 
+  it('PortalRunDto type includes ticket_sla_performance', () => {
+    expectTypeOf<'ticket_sla_performance'>().toMatchTypeOf<PortalRunDto['type']>();
+  });
+
   it('exports every approved top-level DTO', () => {
     expectTypeOf<DashboardDto>().toBeObject();
+    // #9351: absent (not null) when the org turned portal Backups off.
+    expectTypeOf<DashboardDto['backup']>().toEqualTypeOf<BackupTileDto | undefined>();
     expectTypeOf<SecurityOverviewDto>().toBeObject();
     expectTypeOf<SecurityDeviceRow>().toBeObject();
     expectTypeOf<BackupOverviewDto>().toBeObject();
@@ -60,6 +67,19 @@ describe('portal visibility DTOs', () => {
     expectTypeOf<
       Exclude<NetworkOverviewDto, { dataStatus: 'ok' }>['totalAssets']
     >().toEqualTypeOf<null>();
+  });
+
+  it('excludes the #3198 business report types from the portal run union', () => {
+    // A portal run row's type comes from the database, so this union is the
+    // only place the compiler can be told what may appear. SLA attainment,
+    // technician time and AR aging are the MSP's OWN numbers — technician
+    // utilisation and money owed are not a customer's business — so they must
+    // never become assignable here (spec §2, §3.5).
+    expectTypeOf<PortalRunDto['type']>().not.toEqualTypeOf<'ticket_sla_attainment'>();
+    type Listable = PortalRunDto['type'];
+    type BusinessTypes = 'ticket_sla_attainment' | 'technician_time_billability' | 'ar_aging' | 'ai_usage_by_client';
+    type Leak = Extract<Listable, BusinessTypes>;
+    expectTypeOf<Leak>().toEqualTypeOf<never>();
   });
 
 });

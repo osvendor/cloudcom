@@ -37,6 +37,7 @@ const visibleLine: InvoiceDetail['lines'][number] = {
 
 function detail(lines: InvoiceDetail['lines'], extra: Partial<InvoiceDetail['invoice']> = {}): InvoiceDetail {
   return {
+    autopay: null,
     invoice: {
       id: 'inv-1', invoiceNumber: null, orgId: 'org-1', siteId: null, status: 'draft',
       currencyCode: 'USD', issueDate: null, dueDate: null, sentAt: null, subtotal: '100.00', taxRate: null,
@@ -82,6 +83,26 @@ describe('InvoiceActions — issue flows', () => {
     expect(fetchMock).toHaveBeenCalledWith('/invoices/inv-1/issue', { method: 'POST' });
     // Plain Issue never hits /send.
     expect(fetchMock.mock.calls.find((c) => c[0] === '/invoices/inv-1/send')).toBeUndefined();
+  });
+
+  it.each(['draft', 'sent'] as const)('%s send reports one queued-notice toast without claiming delivery', async (status) => {
+    const onChanged = vi.fn();
+    fetchMock.mockImplementation(async (input: string, opts?: RequestInit) => {
+      if (input === '/orgs/partners/me') return json({ invoiceDeviceAppendix: false });
+      if (input === '/orgs/organizations/org-1') return json({ billingContact: { email: 'ap@acme.test' } });
+      if (input === '/invoices/inv-1/send' && opts?.method === 'POST') {
+        return json({ data: { emailed: false, reason: 'notice_queued', recipients: [] } });
+      }
+      return json({ data: {} });
+    });
+    render(<InvoiceActions detail={detail([visibleLine], { status, sentAt: null })} onChanged={onChanged} variant="header" />);
+    fireEvent.click(screen.getByTestId(status === 'draft' ? 'invoice-issue-send' : 'invoice-resend'));
+    await waitFor(() => expect(screen.getByTestId('invoice-send-to')).toHaveValue('ap@acme.test'));
+    fireEvent.click(screen.getByTestId(status === 'draft' ? 'invoice-issue-send-confirm' : 'invoice-send-confirm'));
+    await waitFor(() => expect(onChanged).toHaveBeenCalled());
+    expect(showToast).toHaveBeenCalledTimes(1);
+    expect(showToast).toHaveBeenCalledWith({ type: 'success', message: 'Automatic payment notice queued' });
+    expect(fetchMock.mock.calls.filter(([url, opts]) => url === '/invoices/inv-1/send' && opts?.method === 'POST')).toHaveLength(1);
   });
 
   it('Issue & Send shows a success toast when the email was dispatched (emailed:true)', async () => {
@@ -252,5 +273,39 @@ describe('InvoiceActions — permission gating', () => {
     state.permissions = [{ resource: 'invoices', action: 'read' }];
     render(<InvoiceActions detail={detail([visibleLine])} variant="header" />);
     expect(screen.queryByTestId('invoice-actions-header')).not.toBeInTheDocument();
+  });
+});
+
+describe('InvoiceActions issue refusal for held time (#8196)', () => {
+  it('shows localized copy for a 409 SOURCE_AWAITING_APPROVAL', async () => {
+    fetchMock.mockImplementation(async (input: string, opts?: RequestInit) => {
+      if (input === '/invoices/inv-1/issue' && opts?.method === 'POST') {
+        return { ok: false, status: 409, json: async () => ({ error: 'raw server text', code: 'SOURCE_AWAITING_APPROVAL' }) } as Response;
+      }
+      return json({ data: {} });
+    });
+    render(<InvoiceActions detail={detail([visibleLine])} onChanged={vi.fn()} variant="header" />);
+    fireEvent.click(screen.getByTestId('invoice-issue'));
+    await waitFor(() => expect(showToast).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'error',
+      message: expect.stringMatching(/awaiting customer approval/),
+    })));
+    expect(showToast).not.toHaveBeenCalledWith(expect.objectContaining({ message: 'raw server text' }));
+  });
+
+  it('shows localized copy for a 409 SOURCE_HELD_FOR_HOUR_BLOCK (#8970)', async () => {
+    fetchMock.mockImplementation(async (input: string, opts?: RequestInit) => {
+      if (input === '/invoices/inv-1/issue' && opts?.method === 'POST') {
+        return { ok: false, status: 409, json: async () => ({ error: 'raw server text', code: 'SOURCE_HELD_FOR_HOUR_BLOCK' }) } as Response;
+      }
+      return json({ data: {} });
+    });
+    render(<InvoiceActions detail={detail([visibleLine])} onChanged={vi.fn()} variant="header" />);
+    fireEvent.click(screen.getByTestId('invoice-issue'));
+    await waitFor(() => expect(showToast).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'error',
+      message: expect.stringMatching(/held for this organization's block hours/),
+    })));
+    expect(showToast).not.toHaveBeenCalledWith(expect.objectContaining({ message: 'raw server text' }));
   });
 });

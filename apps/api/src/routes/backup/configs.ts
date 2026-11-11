@@ -9,117 +9,53 @@ import { DeleteObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
 import { createGuardedS3Client } from '../../services/guardedS3Client';
 import { assertSafeUrl, SsrfBlockedError } from '../../services/urlSafety';
 import { selfHostAllowsPrivateNetwork } from '../../config/env';
-import { db } from '../../db';
+import { db, withDbTransaction } from '../../db';
+import { isPgForeignKeyViolation } from '../../utils/pgErrors';
 import { backupConfigs, backupSnapshots } from '../../db/schema';
 import { normalizeStorageIdentity } from '../../jobs/backupRetention';
 import { requireMfa, requirePermission, requireScope } from '../../middleware/auth';
+import { recordCredentialChange } from '../../services/backupStorageCredentialHistory';
 import { writeRouteAudit } from '../../services/auditEvents';
 import { canMutateOrgWideGovernance, SITE_CEILING_WRITE_DENIED_MESSAGE } from '../../services/siteCeilingAccess';
+import {
+  isRecord,
+  isRedactedSecretMarker,
+  preserveSecretFields,
+  redactProviderConfig,
+  s3EndpointOriginChanged,
+} from '../../services/backupProviderConfigSecrets';
 import {
   assertBackupStorageEncryptionSupported,
   buildBackupStorageEncryptionResponse,
 } from '../../services/backupEncryption';
 import { checkBackupProviderCapabilities, type ProviderCapabilityStatus } from '../../services/backupSnapshotStorage';
 import { PERMISSIONS } from '../../services/permissions';
-import { coerceS3EndpointUrl, deriveS3RegionFromEndpoint } from '@breeze/shared';
+import {
+  backupDestinationPrefixReasonMessage,
+  coerceS3EndpointUrl,
+  deriveS3RegionFromEndpoint,
+  normalizeBackupDestinationPrefix,
+} from '@breeze/shared';
 import { resolveScopedOrgId } from './helpers';
 import { canonicalizeS3CredentialFields, configSchema, configUpdateSchema, validateS3Details } from './schemas';
 
+import { isHoldingOrg } from '../../services/unassignedPool/protectedOrg';
+import { PROTECTED_ORG_ERROR } from '../../services/unassignedPool/orgType';
 export const configsRoutes = new Hono();
 
+const CONFIG_DELETE_BLOCKERS: Array<[constraint: string, what: string]> = [
+  ['backup_jobs_config_id_backup_configs_id_fk', 'backup job history'],
+  ['backup_snapshots_config_id_backup_configs_id_fk', 'snapshots'],
+  ['backup_policies_config_id_backup_configs_id_fk', 'backup policies'],
+];
+
+function describeConfigDeleteBlocker(err: unknown): string {
+  const hit = CONFIG_DELETE_BLOCKERS.find(([constraint]) => isPgForeignKeyViolation(err, constraint));
+  const what = hit ? hit[1] : 'other records (such as backup history, snapshots or policies)';
+  return `This destination can't be deleted because it still has ${what}. Disable it instead, or remove the dependent records first.`;
+}
+
 const configIdParamSchema = z.object({ id: z.string().guid() });
-const MASKED_SECRET = '********';
-const SECRET_FIELD_NAMES = new Set([
-  'accesskey',
-  'accesskeyid',
-  'apikey',
-  'apisecret',
-  'authtoken',
-  'clientsecret',
-  'credential',
-  'credentials',
-  'password',
-  'secret',
-  'secretaccesskey',
-  'secretkey',
-  'sessiontoken',
-  'token',
-]);
-
-type JsonRecord = Record<string, unknown>;
-
-function isRecord(value: unknown): value is JsonRecord {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
-}
-
-function isSecretField(key: string): boolean {
-  const normalized = key.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
-  return SECRET_FIELD_NAMES.has(normalized) || normalized.endsWith('token') || normalized.endsWith('secret');
-}
-
-function isRedactedSecretMarker(value: unknown): boolean {
-  if (typeof value === 'string') {
-    const trimmed = value.trim();
-    return trimmed === MASKED_SECRET || /^\*+$/.test(trimmed);
-  }
-  if (isRecord(value)) {
-    return value.redacted === true || value.hasSecret === true || value.masked === MASKED_SECRET;
-  }
-  return false;
-}
-
-function redactProviderConfig(value: unknown): unknown {
-  if (Array.isArray(value)) {
-    return value.map(redactProviderConfig);
-  }
-  if (!isRecord(value)) {
-    return value;
-  }
-
-  const redacted: JsonRecord = {};
-  for (const [key, nestedValue] of Object.entries(value)) {
-    if (isSecretField(key)) {
-      redacted[key] = {
-        redacted: true,
-        hasSecret: nestedValue !== null && nestedValue !== undefined && nestedValue !== '',
-        masked: MASKED_SECRET,
-      };
-    } else {
-      redacted[key] = redactProviderConfig(nestedValue);
-    }
-  }
-  return redacted;
-}
-
-function preserveSecretFields(incoming: unknown, existing: unknown): unknown {
-  if (!isRecord(incoming)) {
-    return incoming;
-  }
-
-  const existingRecord = isRecord(existing) ? existing : {};
-  const merged: JsonRecord = {};
-
-  for (const [key, value] of Object.entries(incoming)) {
-    const previous = existingRecord[key];
-    if (isSecretField(key) && isRedactedSecretMarker(value)) {
-      merged[key] = previous;
-    } else if (isRecord(value) && isRecord(previous)) {
-      merged[key] = preserveSecretFields(value, previous);
-    } else {
-      merged[key] = value;
-    }
-  }
-
-  for (const [key, value] of Object.entries(existingRecord)) {
-    if (isSecretField(key) && !(key in merged)) {
-      merged[key] = value;
-    } else if (isRecord(value) && isRecord(merged[key])) {
-      merged[key] = preserveSecretFields(merged[key], value);
-    }
-  }
-
-  return merged;
-}
 
 function buildCapabilityState(
   checkedAt: string | null,
@@ -161,7 +97,19 @@ async function probeS3Config(rawDetails: Record<string, unknown>): Promise<void>
   const accessKeyId = typeof details.accessKey === 'string' ? details.accessKey : '';
   const secretAccessKey = typeof details.secretKey === 'string' ? details.secretKey : '';
   const endpoint = typeof details.endpoint === 'string' ? details.endpoint : undefined;
-  const prefix = typeof details.prefix === 'string' ? details.prefix.replace(/\/+$/, '') : '';
+  // #7081: probe under the normalized prefix, where new snapshots are
+  // written. A stored prefix that predates validation and no longer
+  // normalizes fails the test: backups to that destination are refused at
+  // mint (invalid_destination_prefix), so a green connection test would
+  // mislead.
+  const normalizedPrefix = normalizeBackupDestinationPrefix(details.prefix);
+  if (!normalizedPrefix.ok) {
+    throw new Error(
+      `Invalid key prefix: ${backupDestinationPrefixReasonMessage(normalizedPrefix.reason)}. ` +
+        'Backups to this destination are refused until the prefix is corrected.',
+    );
+  }
+  const prefix = normalizedPrefix.prefix ?? '';
 
   if (!bucket.trim() || !accessKeyId.trim() || !secretAccessKey.trim()) {
     throw new Error('S3 bucket and credentials are required');
@@ -260,6 +208,8 @@ configsRoutes.post(
     if (!orgId) {
       return c.json({ error: 'orgId is required for this scope' }, 400);
     }
+    // canAccessOrg is true for system scope: the holding org is never a target.
+    if (await isHoldingOrg(orgId)) return c.json(PROTECTED_ORG_ERROR, 409);
 
     const payload = c.req.valid('json');
     const details: Record<string, unknown> = { ...(payload.details ?? {}) };
@@ -270,8 +220,12 @@ configsRoutes.post(
       // (jobs/backupWorker.ts -> agent/internal/backup/providers/s3.go), which
       // does no scheme coercion of its own, so a scheme-less value stored here
       // fails on every device while this API's own test probe passes.
-      const { region, endpoint } = validateS3Details(details);
+      const { region, endpoint, prefix } = validateS3Details(details);
       if (region) details.region = region;
+      // #7081: persist the normalized key prefix (the schema already refused
+      // an invalid one); no prefix is stored as an absent key.
+      if (prefix) details.prefix = prefix;
+      else delete details.prefix;
       if (endpoint) {
         details.endpoint = endpoint;
       } else {
@@ -301,14 +255,15 @@ configsRoutes.post(
     // its previous default already cleared and no new one to replace it (the
     // org default is the destination every partner-wide backup resolves to).
     // The partial unique index on (org_id) WHERE is_default enforces at most one.
-    const [row] = await db.transaction(async (tx) => {
+    // The key record is written in the same transaction as the destination.
+    const [row] = await withDbTransaction(async () => {
       if (payload.isDefault === true) {
-        await tx
+        await db
           .update(backupConfigs)
           .set({ isDefault: false, updatedAt: now })
           .where(and(eq(backupConfigs.orgId, orgId), eq(backupConfigs.isDefault, true)));
       }
-      return tx
+      const inserted = await db
         .insert(backupConfigs)
         .values({
           orgId,
@@ -325,6 +280,17 @@ configsRoutes.post(
           updatedAt: now,
         })
         .returning();
+      const created = inserted[0];
+      if (created) {
+        // A key configured from now on has never been sent to a device.
+        await recordCredentialChange({
+          orgId,
+          configId: created.id,
+          previous: null,
+          next: { provider: created.provider, providerConfig: created.providerConfig },
+        });
+      }
+      return inserted;
     });
 
     if (!row) {
@@ -389,11 +355,14 @@ configsRoutes.patch(
     // org with NO default destination — and the org default is what every
     // partner-wide and profile-linked backup resolves to, so their scheduled
     // backups would start skipping with no obvious cause.
+    // Locked: the key change recorded below compares against exactly this
+    // state, and a concurrent change waits for this one to commit.
     const [current] = await db
       .select()
       .from(backupConfigs)
       .where(and(eq(backupConfigs.id, configId), eq(backupConfigs.orgId, orgId)))
-      .limit(1);
+      .limit(1)
+      .for('update');
 
     if (!current) {
       return c.json({ error: 'Config not found' }, 404);
@@ -445,6 +414,34 @@ configsRoutes.patch(
         canonicalizeS3CredentialFields(canonicalizedIncoming);
         incomingDetails = canonicalizedIncoming;
       }
+
+      // Same origin-binding contract as credentialOriginBinding.ts:
+      // a masked or omitted accessKey/secretKey must not be carried forward
+      // across a storage-endpoint change. `preserveSecretFields` below has no
+      // notion of "the destination changed" — it would otherwise reattach the
+      // stored real S3 credentials to whatever endpoint this PATCH names.
+      if (current.provider === 's3' && isRecord(incomingDetails)) {
+        const storedDetails = isRecord(current.providerConfig) ? current.providerConfig : {};
+        const storedHasAccessKey = typeof storedDetails.accessKey === 'string' && storedDetails.accessKey.length > 0;
+        const storedHasSecretKey = typeof storedDetails.secretKey === 'string' && storedDetails.secretKey.length > 0;
+        if (
+          (storedHasAccessKey || storedHasSecretKey)
+          && s3EndpointOriginChanged(storedDetails.endpoint, incomingDetails.endpoint)
+        ) {
+          const hasFreshAccessKey = typeof incomingDetails.accessKey === 'string'
+            && incomingDetails.accessKey.length > 0
+            && !isRedactedSecretMarker(incomingDetails.accessKey);
+          const hasFreshSecretKey = typeof incomingDetails.secretKey === 'string'
+            && incomingDetails.secretKey.length > 0
+            && !isRedactedSecretMarker(incomingDetails.secretKey);
+          if (!hasFreshAccessKey || !hasFreshSecretKey) {
+            return c.json({
+              error: 'Changing the storage endpoint requires re-entering the access key and secret key',
+            }, 400);
+          }
+        }
+      }
+
       const nextProviderConfig = incomingDetails !== undefined
         ? preserveSecretFields(incomingDetails, current.providerConfig)
         : current.providerConfig;
@@ -455,11 +452,20 @@ configsRoutes.patch(
         // ONLY thing standing between a malformed endpoint and the database on
         // the PATCH path. Do not remove it without adding equivalent
         // validation elsewhere. Covered by the PATCH tests in configs.test.ts.
-        const { error, region, endpoint } = validateS3Details(nextProviderConfig);
+        const storedDetails = isRecord(current.providerConfig) ? current.providerConfig : {};
+        const { error, region, endpoint, prefix, keepStoredPrefix } = validateS3Details(nextProviderConfig, {
+          storedPrefix: storedDetails.prefix,
+        });
         if (error) {
           return c.json({ error }, 400);
         }
         if (region) nextProviderConfig.region = region;
+        // #7081: persist the normalized key prefix; none is an absent key. An
+        // unchanged stored prefix is left as it is (see validateS3Details).
+        if (!keepStoredPrefix) {
+          if (prefix) nextProviderConfig.prefix = prefix;
+          else delete nextProviderConfig.prefix;
+        }
         if (endpoint) {
           nextProviderConfig.endpoint = endpoint;
         } else {
@@ -502,18 +508,30 @@ configsRoutes.patch(
     // Demote + promote atomically: the partial unique index on (org_id) WHERE
     // is_default allows at most one default, so a concurrent promote must not
     // see a half-applied swap.
-    const [row] = await db.transaction(async (tx) => {
+    // The key record is written in the same transaction as the change.
+    const [row] = await withDbTransaction(async () => {
       if (payload.isDefault === true) {
-        await tx
+        await db
           .update(backupConfigs)
           .set({ isDefault: false, updatedAt: new Date() })
           .where(and(eq(backupConfigs.orgId, orgId), eq(backupConfigs.isDefault, true)));
       }
-      return tx
+      const updated = await db
         .update(backupConfigs)
         .set(updateData)
         .where(and(eq(backupConfigs.id, configId), eq(backupConfigs.orgId, orgId)))
         .returning();
+      const changed = updated[0];
+      if (changed && payload.details !== undefined) {
+        // A replaced key stays listed until there is evidence it was disabled.
+        await recordCredentialChange({
+          orgId,
+          configId: changed.id,
+          previous: { provider: current.provider, providerConfig: current.providerConfig },
+          next: { provider: changed.provider, providerConfig: changed.providerConfig },
+        });
+      }
+      return updated;
     });
 
     if (!row) {
@@ -566,10 +584,42 @@ configsRoutes.delete(
   }
 
   const { id: configId } = c.req.valid('param');
-  const [deleted] = await db
-    .delete(backupConfigs)
+  // Locked so the first-start key recording (services/backupStorageCredentialHistory.ts)
+  // and this deletion see the destination one after the other.
+  const [existing] = await db
+    .select()
+    .from(backupConfigs)
     .where(and(eq(backupConfigs.id, configId), eq(backupConfigs.orgId, orgId)))
-    .returning();
+    .limit(1)
+    .for('update');
+  if (!existing) {
+    return c.json({ error: 'Config not found' }, 404);
+  }
+  let deleted: typeof existing | undefined;
+  try {
+    [deleted] = await withDbTransaction(async () => {
+      // The destination's key stays listed (with its settings sealed, so it can
+      // still be checked) until there is evidence it was disabled.
+      await recordCredentialChange({
+        orgId,
+        configId: existing.id,
+        previous: { provider: existing.provider, providerConfig: existing.providerConfig },
+        next: null,
+      });
+      return db
+        .delete(backupConfigs)
+        .where(and(eq(backupConfigs.id, configId), eq(backupConfigs.orgId, orgId)))
+        .returning();
+    });
+  } catch (err) {
+    // Jobs, snapshots and policies keep NO ACTION FKs to the destination:
+    // history (and the objects it tracks in storage) must not be silently
+    // destroyed. The savepoint above has rolled back, so nothing was recorded.
+    if (isPgForeignKeyViolation(err)) {
+      return c.json({ error: describeConfigDeleteBlocker(err) }, 409);
+    }
+    throw err;
+  }
 
   if (!deleted) {
     return c.json({ error: 'Config not found' }, 404);

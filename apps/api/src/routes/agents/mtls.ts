@@ -9,6 +9,7 @@ import { lookup as dnsLookup } from 'dns/promises';
 import { db, withSystemDbAccessContext } from '../../db';
 import { isAgentTenantActive } from '../../services/tenantStatus';
 import { devices, organizations, deviceMtlsCertificates } from '../../db/schema';
+import { updateOwnDeviceRow } from '../../services/agentOwnDeviceRow';
 import { authMiddleware, requireMfa, requirePermission, type AuthContext } from '../../middleware/auth';
 import { matchAgentTokenHash } from '../../middleware/agentAuth';
 import { writeAuditEvent } from '../../services/auditEvents';
@@ -25,21 +26,31 @@ import { getOrgHelperSettings, issueMtlsCertForDevice, isObject } from './helper
 import { disconnectAgent } from '../agentWs';
 import { getRedis } from '../../services/redis';
 import { rateLimiter } from '../../services/rate-limit';
-import { encryptSecret } from '../../services/secretCrypto';
+import { encryptSecret, isEncryptedSecret } from '../../services/secretCrypto';
+import { isMaskedIntegrationSecret } from '../../services/notificationChannelSecrets';
+import {
+  LOG_FORWARDING_ORIGIN_CHANGE_MESSAGE,
+  LOG_FORWARDING_SECRET_DESTINATIONS,
+  MASKED_SETTINGS_SECRET,
+} from '../../services/settingsSecretMasking';
+import { settingsSecretWouldFollowNewOrigin } from '../../services/credentialOriginBinding';
 import { isPrivateIp } from '../../services/urlSafety';
 import { canonicalIpLiteral, classifyNonRoutableHostname, isIpLiteralHost } from '../../services/ipRanges';
 import { terminateDeviceRemoteSessions, TEARDOWN_FAILED } from '../../services/remoteSessionTeardown';
+import { requestDeviceGroupReevaluationAfterCommit } from '../../jobs/deviceGroupJobs';
 import {
   getAgentMtlsBindingMode,
   normalizeCertificateSerial,
   readAgentCertificateAssertion,
   type AgentMtlsBindingMode,
 } from '../../services/agentCertificateBinding';
+import { invalidateOrgHelperSettingsCache } from '../../services/agentOrgSettingsCache';
 import { issueRenewalChallenge, verifyAndConsumeRenewalProof } from '../../services/mtlsRenewalProof';
 import {
   queueCertificateRevocationCore,
   revokeCertificateNowOrEnqueue,
 } from '../../services/deviceMtlsCertificateLifecycle';
+import { activateIssuedCertificateCore } from '../../services/deviceMtlsCertificateIssuance';
 
 export const mtlsRoutes = new Hono();
 
@@ -53,7 +64,6 @@ const MTLS_RENEW_ATTEMPT_LIMIT = 1;
 const MTLS_RENEW_ATTEMPT_WINDOW_SECONDS = 30;
 const MTLS_RENEW_SUCCESS_LIMIT = 1;
 const MTLS_RENEW_SUCCESS_WINDOW_SECONDS = 3600;
-const LOG_FORWARDING_MASK = '****';
 
 // Wave 5 Task 4: proof-of-possession + two-phase renewal.
 //
@@ -178,12 +188,31 @@ async function validateLogForwardingTarget(rawUrl: string | undefined): Promise<
   return [];
 }
 
+class LogForwardingSecretInputError extends Error {}
+
+// The masked marker (any run of asterisks, so the shorter one earlier
+// responses used still works) keeps the stored secret; an empty value clears
+// it; plaintext replaces it. A sealed value is only accepted when it is the
+// stored one — a client is never given ciphertext, so anything else is refused.
 function resolveSecretForStorage(incoming: unknown, existing: unknown): string | undefined {
   if (typeof incoming !== 'string') return undefined;
   const trimmed = incoming.trim();
   if (!trimmed) return undefined;
-  if (trimmed === LOG_FORWARDING_MASK) return encryptSecret(toOptionalString(existing)) ?? undefined;
+  if (isMaskedIntegrationSecret(trimmed)) return encryptSecret(toOptionalString(existing)) ?? undefined;
+  if (isEncryptedSecret(trimmed) && trimmed !== existing) {
+    throw new LogForwardingSecretInputError('Log forwarding credentials must be re-entered, not submitted as a sealed value');
+  }
   return encryptSecret(trimmed) ?? undefined;
+}
+
+// A kept secret is reported as `undefined` in the request shape handed to the
+// origin check (omitted = kept); a cleared one as ''; a typed one as itself.
+function secretRequestShape(incoming: Record<string, unknown>, key: string, cleared: boolean): unknown {
+  if (cleared) return '';
+  if (!Object.prototype.hasOwnProperty.call(incoming, key)) return undefined;
+  const value = incoming[key];
+  if (typeof value !== 'string') return undefined;
+  return value.trim().length === 0 ? '' : value.trim();
 }
 
 type OrgMtlsPolicy = { certLifetimeDays: number; expiredCertPolicy: 'auto_reissue' | 'quarantine' };
@@ -811,17 +840,16 @@ mtlsRoutes.post('/renew-cert', agentBearerAuthMiddleware, async (c) => {
     // "succeed" while leaving the device un-quarantined. Require exactly 1 row;
     // if none, fail closed (500) rather than tearing down / returning as if the
     // device were isolated.
+    //
+    // #8318 §6.4: bound to the bearer context's id + agent_id through
+    // updateOwnDeviceRow; a stale install cannot quarantine the row's new owner.
     const quarantined = await withSystemDbAccessContext(async () =>
-      db
-        .update(devices)
-        .set({
-          status: 'quarantined',
-          quarantinedAt: new Date(),
-          quarantinedReason: 'mtls_cert_expired',
-          updatedAt: new Date(),
-        })
-        .where(eq(devices.id, device.id))
-        .returning({ id: devices.id })
+      updateOwnDeviceRow(db, { deviceId: device.id, agentId: device.agentId }, {
+        status: 'quarantined',
+        quarantinedAt: new Date(),
+        quarantinedReason: 'mtls_cert_expired',
+        updatedAt: new Date(),
+      })
     );
 
     if (quarantined.length !== 1) {
@@ -1096,83 +1124,26 @@ mtlsRoutes.post('/renew-cert', agentBearerAuthMiddleware, async (c) => {
     });
   }
 
-  // ---- Legacy (no protocolVersion): activate immediately, one transaction.
-  // Insert the new row as pending_activation FIRST (satisfies
-  // queueCertificateRevocationCore's "a replacement already exists" guard),
-  // demote the old active row (if any), THEN promote the new row to active —
-  // never both active at once, honoring the partial unique index. ----
-  const now = new Date();
+  // ---- Legacy (no protocolVersion): activate immediately, one transaction:
+  // record the new certificate, demote the old active row, promote the new
+  // one and update the legacy devices.mtls_cert_* columns. The same core
+  // records certificates issued at enrollment, provisioning and quarantine
+  // approve (services/deviceMtlsCertificateIssuance.ts). ----
   let txResult: { demotedOldCertId: string | null } | null = null;
   try {
     txResult = await withSystemDbAccessContext(() =>
       db.transaction(async (tx) => {
-        const [existingActive] = await tx
-          .select({ id: deviceMtlsCertificates.id })
-          .from(deviceMtlsCertificates)
-          .where(and(eq(deviceMtlsCertificates.deviceId, device.id), eq(deviceMtlsCertificates.state, 'active')))
-          .limit(1);
-
-        const [inserted] = await tx
-          .insert(deviceMtlsCertificates)
-          .values({
-            orgId: device.orgId,
-            deviceId: device.id,
-            providerCertificateId: cert.id,
-            serialNumber: parsedCert.serialNumber,
-            fingerprintSha256: parsedCert.fingerprintSha256,
-            publicKeySpki: parsedCert.publicKeySpkiBase64,
-            legacyProvenance: false,
-            state: 'pending_activation',
-            issuedAt: new Date(cert.issuedOn),
-            expiresAt: new Date(cert.expiresOn),
-            activationExpiresAt: now,
-          })
-          .returning({ id: deviceMtlsCertificates.id });
-
-        if (!inserted) {
-          throw new Error('mtls_history_insert_failed');
-        }
-
-        let demoted = false;
-        if (existingActive) {
-          demoted = await queueCertificateRevocationCore(tx, existingActive.id);
-        }
-
-        const activated = await tx
-          .update(deviceMtlsCertificates)
-          .set({ state: 'active', activatedAt: now, updatedAt: now })
-          .where(and(eq(deviceMtlsCertificates.id, inserted.id), eq(deviceMtlsCertificates.state, 'pending_activation')))
-          .returning({ id: deviceMtlsCertificates.id });
-
-        if (activated.length !== 1) {
-          throw new Error('mtls_history_activation_failed');
-        }
-
-        // Fix round 3 (code review): `cert.serialNumber` is Cloudflare's raw
-        // `serial_number` API field — format is NOT guaranteed to match the
-        // canonical uppercase-hex-no-separators form the certificate binding
-        // decision (services/agentCertificateBinding.ts) compares against.
-        // Normalize with the SAME shared helper that read side uses, so new
-        // rows are stored canonical (the loader also defensively normalizes
-        // on read, for rows written before this fix and for Task 1's
-        // migration import of historical raw values).
-        const legacyUpdated = await tx
-          .update(devices)
-          .set({
-            mtlsCertSerialNumber: normalizeCertificateSerial(cert.serialNumber),
-            mtlsCertExpiresAt: new Date(cert.expiresOn),
-            mtlsCertIssuedAt: new Date(cert.issuedOn),
-            mtlsCertCfId: cert.id,
-            updatedAt: now,
-          })
-          .where(eq(devices.id, device.id))
-          .returning({ id: devices.id });
-
-        if (legacyUpdated.length !== 1) {
-          throw new Error('legacy_device_update_failed');
-        }
-
-        return { demotedOldCertId: demoted ? existingActive!.id : null };
+        const activation = await activateIssuedCertificateCore(tx, {
+          orgId: device.orgId,
+          deviceId: device.id,
+          // #8318 §6.4: the bearer context's identity; the legacy column write
+          // inside is bound to it.
+          agentId: device.agentId,
+          cert,
+          parsedCert,
+          now: new Date(),
+        });
+        return { demotedOldCertId: activation.demotedCertificateId };
       }),
     );
   } catch (txErr) {
@@ -1433,19 +1404,18 @@ mtlsRoutes.post(
             throw new Error('mtls_confirm_activation_failed');
           }
 
-          const legacyUpdated = await tx
-            .update(devices)
-            .set({
-              // I3: store the canonical form, matching the legacy renewal
-              // path's write and what the binding reader expects.
-              mtlsCertSerialNumber: pendingSerial ?? pendingRow.serialNumber,
-              mtlsCertExpiresAt: pendingRow.expiresAt,
-              mtlsCertIssuedAt: pendingRow.issuedAt,
-              mtlsCertCfId: pendingRow.providerCertificateId,
-              updatedAt: now,
-            })
-            .where(eq(devices.id, device.id))
-            .returning({ id: devices.id });
+          // #8318 §6.4: bound to the bearer context's id + agent_id through
+          // updateOwnDeviceRow; 0 rows (a stale install after a reattach
+          // confirm) fails the transaction like any other missed write.
+          const legacyUpdated = await updateOwnDeviceRow(tx, { deviceId: device.id, agentId: device.agentId }, {
+            // I3: store the canonical form, matching the legacy renewal
+            // path's write and what the binding reader expects.
+            mtlsCertSerialNumber: pendingSerial ?? pendingRow.serialNumber,
+            mtlsCertExpiresAt: pendingRow.expiresAt,
+            mtlsCertIssuedAt: pendingRow.issuedAt,
+            mtlsCertCfId: pendingRow.providerCertificateId,
+            updatedAt: now,
+          });
 
           if (legacyUpdated.length !== 1) {
             throw new Error('legacy_device_update_failed');
@@ -1572,6 +1542,7 @@ mtlsRoutes.post('/:id/approve', authMiddleware, requirePermission('devices', 'wr
     return c.json({ error: 'Device is not quarantined' }, 400);
   }
 
+  // own-device-row-allowlisted: quarantine-approve-user-route
   const approved = await db
     .update(devices)
     .set({
@@ -1652,6 +1623,7 @@ mtlsRoutes.post('/:id/deny', authMiddleware, requirePermission('devices', 'write
     return c.json({ error: 'Device is not quarantined' }, 400);
   }
 
+  // own-device-row-allowlisted: quarantine-deny-user-route
   const denied = await db
     .update(devices)
     .set({
@@ -1676,6 +1648,15 @@ mtlsRoutes.post('/:id/deny', authMiddleware, requirePermission('devices', 'write
   if (denied.length !== 1) {
     return c.json({ error: 'Device quarantine state changed' }, 409);
   }
+
+  // #9933 — removed devices are left out of dynamic groups; drop any rows this
+  // device holds once the deny commits (same as decommissionDeviceInTransaction).
+  requestDeviceGroupReevaluationAfterCommit({
+    deviceId: device.id,
+    orgId: device.orgId,
+    eventType: 'device.created',
+    reason: 'device_decommissioned',
+  });
 
   // Tear down any live remote-control session to a device we're decommissioning.
   // Never throws; a TEARDOWN_FAILED is recorded in the audit trail below.
@@ -1819,6 +1800,8 @@ mtlsRoutes.patch(
         updatedAt: new Date(),
       })
       .where(eq(organizations.id, orgId));
+    // The legacy flag is served to the org's heartbeats from a 60 s cache (#8053).
+    invalidateOrgHelperSettingsCache(orgId);
 
     writeAuditEvent(c, {
       orgId,
@@ -1865,8 +1848,8 @@ mtlsRoutes.get(
     const forwarding = (isObject(settings.logForwarding) ? settings.logForwarding : { enabled: false }) as Record<string, unknown>;
     const safe = {
       ...forwarding,
-      elasticsearchApiKey: forwarding.elasticsearchApiKey ? '****' : undefined,
-      elasticsearchPassword: forwarding.elasticsearchPassword ? '****' : undefined,
+      elasticsearchApiKey: forwarding.elasticsearchApiKey ? MASKED_SETTINGS_SECRET : undefined,
+      elasticsearchPassword: forwarding.elasticsearchPassword ? MASKED_SETTINGS_SECRET : undefined,
     };
 
     return c.json({ settings: { logForwarding: safe } });
@@ -1918,22 +1901,50 @@ mtlsRoutes.patch(
     const resolvedIndexPrefix = hasOwn(incoming, 'indexPrefix')
       ? toOptionalString(incoming.indexPrefix)
       : toOptionalString(existingForwarding.indexPrefix);
-    let resolvedApiKey = hasOwn(incoming, 'elasticsearchApiKey')
-      ? resolveSecretForStorage(incoming.elasticsearchApiKey, existingForwarding.elasticsearchApiKey)
-      : encryptSecret(toOptionalString(existingForwarding.elasticsearchApiKey)) ?? undefined;
+    let resolvedApiKey: string | undefined;
+    let resolvedPassword: string | undefined;
+    try {
+      resolvedApiKey = hasOwn(incoming, 'elasticsearchApiKey')
+        ? resolveSecretForStorage(incoming.elasticsearchApiKey, existingForwarding.elasticsearchApiKey)
+        : encryptSecret(toOptionalString(existingForwarding.elasticsearchApiKey)) ?? undefined;
+      resolvedPassword = hasOwn(incoming, 'elasticsearchPassword')
+        ? resolveSecretForStorage(incoming.elasticsearchPassword, existingForwarding.elasticsearchPassword)
+        : encryptSecret(toOptionalString(existingForwarding.elasticsearchPassword)) ?? undefined;
+    } catch (err) {
+      if (err instanceof LogForwardingSecretInputError) {
+        return c.json({ error: err.message }, 400);
+      }
+      throw err;
+    }
     let resolvedUsername = hasOwn(incoming, 'elasticsearchUsername')
       ? toOptionalString(incoming.elasticsearchUsername)
       : toOptionalString(existingForwarding.elasticsearchUsername);
-    let resolvedPassword = hasOwn(incoming, 'elasticsearchPassword')
-      ? resolveSecretForStorage(incoming.elasticsearchPassword, existingForwarding.elasticsearchPassword)
-      : encryptSecret(toOptionalString(existingForwarding.elasticsearchPassword)) ?? undefined;
 
     // Explicit auth-method updates should clear stale credentials from the other mode.
-    if (providedBasic && !providedApiKey) {
+    const clearsApiKey = providedBasic && !providedApiKey;
+    const clearsBasic = providedApiKey && !providedBasic;
+    if (clearsApiKey) {
       resolvedApiKey = undefined;
-    } else if (providedApiKey && !providedBasic) {
+    } else if (clearsBasic) {
       resolvedUsername = undefined;
       resolvedPassword = undefined;
+    }
+
+    // A stored credential must not follow the endpoint to a new origin unless
+    // it is entered again (same contract as credentialOriginBinding.ts).
+    if (resolvedUrl && settingsSecretWouldFollowNewOrigin(
+      {
+        logForwarding: {
+          elasticsearchUrl: resolvedUrl,
+          elasticsearchApiKey: secretRequestShape(incoming, 'elasticsearchApiKey', clearsApiKey),
+          elasticsearchPassword: secretRequestShape(incoming, 'elasticsearchPassword', clearsBasic),
+        },
+      },
+      { logForwarding: existingForwarding },
+      LOG_FORWARDING_SECRET_DESTINATIONS,
+      isMaskedIntegrationSecret,
+    )) {
+      return c.json({ error: LOG_FORWARDING_ORIGIN_CHANGE_MESSAGE }, 400);
     }
 
     if (data.enabled) {
@@ -1968,8 +1979,8 @@ mtlsRoutes.patch(
     const { elasticsearchApiKey, elasticsearchPassword, ...safeData } = normalizedForwarding;
     const maskedDetails = {
       ...safeData,
-      elasticsearchApiKey: elasticsearchApiKey ? '****' : undefined,
-      elasticsearchPassword: elasticsearchPassword ? '****' : undefined,
+      elasticsearchApiKey: elasticsearchApiKey ? MASKED_SETTINGS_SECRET : undefined,
+      elasticsearchPassword: elasticsearchPassword ? MASKED_SETTINGS_SECRET : undefined,
     };
 
     writeAuditEvent(c, {

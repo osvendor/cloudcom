@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { render, screen } from '@testing-library/react';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { BackupOverviewDto } from '@breeze/shared';
 import { BackupOverview } from './BackupOverview';
 
@@ -21,6 +21,8 @@ const configuredOverview: BackupOverviewDto = {
   meanReadinessScore: 76,
   readinessScoredDevices: 3,
   readinessTotalDevices: 4,
+  byHealth: { healthy: 3, warning: 0, critical: 1, unknown: 0 },
+  externalProviders: ['Cove Data Protection'],
 };
 
 const emptyOverview: BackupOverviewDto = {
@@ -37,9 +39,85 @@ const emptyOverview: BackupOverviewDto = {
   meanReadinessScore: null,
   readinessScoredDevices: null,
   readinessTotalDevices: null,
+  byHealth: { healthy: 0, warning: 0, critical: 0, unknown: 0 },
+  externalProviders: [],
 };
 
 describe('BackupOverview', () => {
+  afterEach(() => vi.useRealTimers());
+
+  it('renders SaaS workloads separately with health, relative backup time and item counts', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-09-02T12:00:00Z'));
+    render(<BackupOverview overview={{
+      ...configuredOverview,
+      saasWorkloads: [
+        { providerLabel: 'NinjaOne SaaS Backup (Dropsuite)', workload: 'm365_mail', accountType: 'm365', health: 'healthy', status: 'completed', lastSuccessAt: '2026-09-02T11:30:00Z', itemCount: 42 },
+        { providerLabel: null, workload: 'gws_drive', accountType: 'gws', health: 'critical', status: 'failed', lastSuccessAt: null, itemCount: null },
+      ],
+    }} />);
+
+    expect(screen.getByTestId('portal-backup-saas').textContent).toContain('Microsoft 365 / Google Workspace backup');
+    const rows = screen.getAllByTestId('portal-backup-saas-row');
+    expect(rows).toHaveLength(2);
+    expect(rows[0].textContent).toContain('Microsoft 365 mail backup');
+    expect(rows[0].textContent).toContain('NinjaOne SaaS Backup (Dropsuite)');
+    expect(rows[0].textContent).toContain('Healthy');
+    expect(rows[0].textContent).toContain('30 minutes ago');
+    expect(rows[0].textContent).toContain('42');
+    expect(rows[1].textContent).toContain('Google Drive backup');
+    expect(rows[1].textContent).toContain('Critical');
+    expect(rows[1].textContent).toContain('No successful backup yet');
+    expect(rows[1].textContent).toContain('Not available');
+    expect(rows[1].textContent).not.toMatch(/Dropsuite|NinjaOne|dropsuite/);
+    expect(screen.getByTestId('portal-backup-overview-protected').textContent).toContain('3 of 4');
+  });
+
+  it('labels every supported SaaS workload and preserves zero item counts', () => {
+    const labels = [
+      ['m365_mail', 'Microsoft 365 mail backup'],
+      ['m365_onedrive', 'OneDrive backup'],
+      ['m365_sharepoint', 'SharePoint backup'],
+      ['m365_teams', 'Teams backup'],
+      ['gws_mail', 'Google Workspace mail backup'],
+      ['gws_drive', 'Google Drive backup'],
+      ['gws_shared_drive', 'Google shared drives backup'],
+      ['m365_exchange', 'Exchange backup'],
+    ];
+    render(<BackupOverview overview={{
+      ...configuredOverview,
+      saasWorkloads: labels.map(([workload]) => ({
+        providerLabel: null, workload,
+        accountType: workload.startsWith('gws') ? 'gws' : 'm365',
+        health: 'unknown', status: 'unknown', lastSuccessAt: null, itemCount: 0,
+      })),
+    }} />);
+
+    const rows = screen.getAllByTestId('portal-backup-saas-row');
+    labels.forEach(([, label], index) => {
+      expect(rows[index].textContent).toContain(label);
+    });
+    expect(screen.getAllByTestId('portal-backup-saas-items').every((cell) => cell.textContent?.endsWith('0'))).toBe(true);
+  });
+
+  it('does not claim no backup data when only SaaS workloads are present', () => {
+    render(<BackupOverview overview={{
+      ...emptyOverview,
+      saasWorkloads: [{ providerLabel: null, workload: 'm365_exchange', accountType: 'm365', health: 'healthy', status: 'completed', lastSuccessAt: '2026-09-02T11:00:00Z', itemCount: null }],
+    }} />);
+
+    expect(screen.getByTestId('portal-backup-saas')).not.toBeNull();
+    expect(screen.queryByTestId('portal-backup-overview-status')).toBeNull();
+    expect(screen.getByTestId('portal-backup-overview-protected').textContent).toContain('0 of 4');
+  });
+
+  it('hides the SaaS section for missing and empty arrays', () => {
+    const { rerender } = render(<BackupOverview overview={configuredOverview} />);
+    expect(screen.queryByTestId('portal-backup-saas')).toBeNull();
+    rerender(<BackupOverview overview={{ ...configuredOverview, saasWorkloads: [] }} />);
+    expect(screen.queryByTestId('portal-backup-saas')).toBeNull();
+  });
+
   it('renders configured backup health and breach counts in the reader’s words', () => {
     render(<BackupOverview overview={configuredOverview} hasBackupActivity />);
 
@@ -80,7 +158,7 @@ describe('BackupOverview', () => {
 
   it('never contradicts a ledger that holds backups', () => {
     // dataStatus 'no_data' keys on a passed VERIFICATION, not on backups: the
-    // band used to sit above "Protected devices 3 of 4" and a real restore point.
+    // band used to sit above "Devices backed up 3 of 4" and a real restore point.
     render(
       <BackupOverview
         overview={{ ...configuredOverview, dataStatus: 'no_data', lastPassedVerification: null }}
@@ -174,7 +252,7 @@ describe('BackupOverview', () => {
     expect(ledger.className).not.toMatch(/(^|\s)border(\s|$)/);
 
     const rows = Array.from(ledger.children);
-    expect(rows).toHaveLength(6);
+    expect(rows).toHaveLength(8);
     for (const row of rows) {
       expect(row.querySelector('dt')).not.toBeNull();
       expect(row.querySelector('dd')).not.toBeNull();
@@ -183,12 +261,14 @@ describe('BackupOverview', () => {
     }
 
     for (const label of [
-      'Protected devices',
+      'Devices backed up',
+      'Backup health',
       'Last verification',
       'Last restore test',
       'Recovery readiness',
       'Backups behind schedule',
       'Restores slower than promised',
+      'Third-party backup',
     ]) {
       expect(screen.getByText(label).tagName).toBe('DT');
     }
@@ -217,5 +297,37 @@ describe('BackupOverview', () => {
     const secondary = screen.getByText(/Average across/);
     expect(secondary.className).toContain('text-xs');
     expect(secondary.className).not.toMatch(/font-display|text-figures/);
+  });
+
+  it('counts devices by backup health, non-zero buckets only', () => {
+    render(<BackupOverview overview={configuredOverview} hasBackupActivity />);
+
+    const row = screen.getByTestId('portal-backup-overview-health');
+    expect(row.textContent).toContain('3 Healthy');
+    expect(row.textContent).toContain('1 Critical');
+    expect(row.textContent).not.toContain('Warning');
+    expect(row.querySelector('.text-success-on-tint')).not.toBeNull();
+    expect(row.querySelector('.text-destructive-on-tint')).not.toBeNull();
+  });
+
+  it('says so when no device has been assessed', () => {
+    render(<BackupOverview overview={emptyOverview} />);
+
+    expect(screen.getByTestId('portal-backup-overview-health').textContent).toContain(
+      'No devices assessed'
+    );
+  });
+
+  it('names the third-party backup providers, or that none is connected', () => {
+    const { unmount } = render(<BackupOverview overview={configuredOverview} hasBackupActivity />);
+    expect(screen.getByTestId('portal-backup-overview-providers').textContent).toContain(
+      'Cove Data Protection'
+    );
+    unmount();
+
+    render(<BackupOverview overview={{ ...configuredOverview, externalProviders: [] }} hasBackupActivity />);
+    expect(screen.getByTestId('portal-backup-overview-providers').textContent).toContain(
+      'None connected'
+    );
   });
 });

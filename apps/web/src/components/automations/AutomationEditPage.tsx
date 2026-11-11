@@ -1,19 +1,24 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
-import { ArrowLeft, Bot, Link2 } from 'lucide-react';
+import { ArrowLeft, ArrowRightLeft, Bot, Link2 } from 'lucide-react';
 import AutomationForm, { type ActionFormValues, type AutomationFormValues } from './AutomationForm';
 import { fetchWithAuth } from '../../stores/auth';
 import { fetchAllSites } from '@/lib/fetchAllSites';
 import { useOrgStore } from '../../stores/orgStore';
 import { useDefaultOwnerScope } from '@/hooks/useDefaultOwnerScope';
 import type { DeploymentTargetConfig } from '@breeze/shared';
-import { extractApiError } from '@/lib/apiError';
+import { ActionError, runAction } from '@/lib/runAction';
+import { showToast } from '../shared/Toast';
 import { navigateTo } from '@/lib/navigation';
 import Breadcrumbs from '../layout/Breadcrumbs';
 // Initializes the shared i18next singleton. Islands hydrate independently, so
 // an island that hydrates before whichever other island happens to pull i18n in
 // would otherwise render raw keys (and mismatch the SSR markup).
 import '../../lib/i18n';
+import { useStableT } from '@/lib/i18n/useStableT';
+import { usePageItemName } from '../layout/usePageItemName';
+import { useFlowsGate } from '../../stores/featuresStore';
+import { conversionErrorMessage } from './conversion/conversionApi';
 
 type Site = { id: string; name: string };
 type Group = { id: string; name: string };
@@ -160,10 +165,12 @@ function buildActionPayload(action: ActionFormValues) {
 
 export default function AutomationEditPage({ automationId, isNew = false }: AutomationEditPageProps) {
   const { t } = useTranslation('scripts');
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   const [loading, setLoading] = useState(!isNew);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string>();
   const [defaultValues, setDefaultValues] = useState<Partial<AutomationFormValues>>();
+  usePageItemName(isNew ? undefined : defaultValues?.name);
   const [webhookUrl, setWebhookUrl] = useState<string>();
   // #3824: a seeded, agent-owned automation is read-only — render a notice
   // instead of the editor. The API 409s on save anyway.
@@ -173,6 +180,14 @@ export default function AutomationEditPage({ automationId, isNew = false }: Auto
   // over the agent-managed notice below since a monitor-compiled automation
   // is never also agent-owned in practice.
   const [managedByMonitorId, setManagedByMonitorId] = useState<string | null>(null);
+  // #5221 W06: a Job switched to a flow is frozen (the API 409s
+  // `automation_converted`); show where it lives now instead of the editor.
+  const [movedToFlowId, setMovedToFlowId] = useState<string | null>(null);
+  // R1 (Decision 8): with Flows on, new Jobs are made in Flows (POST is 410).
+  const { enabled: flowsOn, loaded: flowsLoaded } = useFlowsGate();
+  // #8599: the stored owner org (null/undefined for a partner-wide automation).
+  // Scopes the group picker and decides which target modes are offered.
+  const [storedOwnerOrgId, setStoredOwnerOrgId] = useState<string>();
   const [sites, setSites] = useState<Site[]>([]);
   const [groups, setGroups] = useState<Group[]>([]);
   const [scripts, setScripts] = useState<Script[]>([]);
@@ -192,12 +207,17 @@ export default function AutomationEditPage({ automationId, isNew = false }: Auto
       setError(undefined);
       const response = await fetchWithAuth(`/automations/${automationId}`);
       if (!response.ok) {
-        throw new Error(t('automationEditPage.errors.fetch'));
+        throw new Error(stableT('automationEditPage.errors.fetch'));
       }
       const data = await response.json();
       const automation = data.automation ?? data;
       setManagedByAgentId(asString(automation.managedByAgentId) ?? null);
       setManagedByMonitorId(asString(automation.managedByMonitorId) ?? null);
+      const conversion = isPlainRecord(automation.conversion) ? automation.conversion : null;
+      setMovedToFlowId(
+        conversion && conversion.state === 'switched' ? asString(conversion.flowId) ?? null : null,
+      );
+      setStoredOwnerOrgId(asString(automation.orgId));
 
       const trigger = isPlainRecord(automation.trigger)
         ? automation.trigger
@@ -231,11 +251,17 @@ export default function AutomationEditPage({ automationId, isNew = false }: Auto
         : [{ type: 'run_script' as const }];
 
       setDefaultValues({
+        // orgId NULL = partner-wide (#2133). Only an explicit null counts: a
+        // payload without the field is treated as org-owned.
+        ownerScope: automation.orgId === null ? 'partner' : 'organization',
         name: asString(automation.name) ?? '',
         description: asString(automation.description),
         triggerType,
         cronExpression: asString(trigger.cronExpression) ?? asString(trigger.cron),
-        eventType: asString(trigger.eventType),
+        eventType: asString(trigger.eventType) ?? asString(trigger.event),
+        // #6367 W05c2: round-trip the stored filter untouched. Absent stays
+        // absent so an automation with no filter never gains an empty `{}`.
+        eventFilter: isPlainRecord(trigger.filter) ? trigger.filter : undefined,
         webhookSecret: asString(trigger.secret) ?? asString(trigger.webhookSecret),
         conditions: Array.isArray(automation.conditions) ? automation.conditions : [],
         targetConfig,
@@ -246,11 +272,11 @@ export default function AutomationEditPage({ automationId, isNew = false }: Auto
 
       setWebhookUrl(asString(trigger.webhookUrl));
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('automationEditPage.errors.generic'));
+      setError(err instanceof Error ? err.message : stableT('automationEditPage.errors.generic'));
     } finally {
       setLoading(false);
     }
-  }, [automationId, isNew, t]);
+  }, [automationId, isNew, stableT]);
 
   const fetchSites = useCallback(async () => {
     try {
@@ -334,7 +360,12 @@ export default function AutomationEditPage({ automationId, isNew = false }: Auto
           : values.triggerType === 'event'
             ? {
                 type: 'event',
-                eventType: values.eventType
+                eventType: values.eventType,
+                // #6367 W05c2: existing non-alert filters (ruleId,
+                // configPolicyAlertRuleId, nested device.* keys, …) stay
+                // intact even though their controls are hidden — only the
+                // form itself edits `eventFilter`.
+                ...(values.eventFilter ? { filter: values.eventFilter } : {})
               }
             : values.triggerType === 'webhook'
               ? {
@@ -362,6 +393,9 @@ export default function AutomationEditPage({ automationId, isNew = false }: Auto
         // creation, and the server rejects it on non-partner callers.
         Object.assign(payload, {
           enabled: true,
+          // The API reads orgId from the body only (not ?orgId=), and 400s for a
+          // multi-org partner without it. Partner-wide rows have no org.
+          ...(values.ownerScope !== 'partner' && currentOrgId ? { orgId: currentOrgId } : {}),
           ...(isPartnerScope && values.ownerScope ? { ownerScope: values.ownerScope } : {})
         });
       }
@@ -369,18 +403,22 @@ export default function AutomationEditPage({ automationId, isNew = false }: Auto
       const url = isNew ? '/automations' : `/automations/${automationId}`;
       const method = isNew ? 'POST' : 'PUT';
 
-      const response = await fetchWithAuth(url, {
-        method,
-        body: JSON.stringify(payload)
+      await runAction({
+        request: () => fetchWithAuth(url, { method, body: JSON.stringify(payload) }),
+        errorFallback: t('automationEditPage.errors.save'),
+        successMessage: t('common:states.saved'),
+        // #8599: the API names the offending groups/devices; put that behind a
+        // sentence that says what is wrong rather than a bare id list.
+        friendly: (code, message) =>
+          code === 'INVALID_TARGET'
+            ? t('automationEditPage.errors.invalidTarget', { detail: message })
+            : conversionErrorMessage(code),
       });
-
-      if (!response.ok) {
-        const data = await response.json().catch(() => ({}));
-        throw new Error(extractApiError(data, t('automationEditPage.errors.save')));
-      }
 
       void navigateTo('/jobs');
     } catch (err) {
+      if (err instanceof ActionError && err.status === 401) return;
+      if (!(err instanceof ActionError)) showToast({ type: 'error', message: t('automationEditPage.errors.generic') });
       setError(err instanceof Error ? err.message : t('automationEditPage.errors.generic'));
     } finally {
       setSaving(false);
@@ -427,6 +465,7 @@ export default function AutomationEditPage({ automationId, isNew = false }: Auto
         <a
           href="/jobs"
           className="flex h-10 w-10 items-center justify-center rounded-md border hover:bg-muted"
+          aria-label={t('automationEditPage.actions.backToAutomations')}
         >
           <ArrowLeft className="h-5 w-5" />
         </a>
@@ -448,7 +487,33 @@ export default function AutomationEditPage({ automationId, isNew = false }: Auto
         </div>
       )}
 
-      {managedByMonitorId ? (
+      {isNew && flowsLoaded && flowsOn ? (
+        <div className="rounded-lg border border-primary/30 bg-primary/5 p-6" data-testid="automation-new-opens-flows">
+          <div className="flex items-center gap-2">
+            <ArrowRightLeft className="h-5 w-5 text-primary" />
+            <h2 className="text-sm font-semibold">{t('flows:jobs.migration.banner.r1')}</h2>
+          </div>
+          <p className="mt-2 text-sm text-muted-foreground">{t('flows:conversion.errors.automations_moved_to_flows')}</p>
+          <a href="/flows" className="mt-4 inline-flex items-center gap-1 text-sm font-medium text-primary hover:underline">
+            {t('flows:jobs.migration.newJobOpensFlows')}
+          </a>
+        </div>
+      ) : movedToFlowId ? (
+        <div className="rounded-lg border border-primary/30 bg-primary/5 p-6" data-testid="automation-moved-notice">
+          <div className="flex items-center gap-2">
+            <ArrowRightLeft className="h-5 w-5 text-primary" />
+            <h2 className="text-sm font-semibold">{t('flows:conversion.state.switched')}</h2>
+          </div>
+          <p className="mt-2 text-sm text-muted-foreground">{t('flows:conversion.panel.switchedNote')}</p>
+          <a
+            href={`/flows/${movedToFlowId}`}
+            className="mt-4 inline-flex items-center gap-1 text-sm font-medium text-primary hover:underline"
+            data-testid="automation-moved-flow-link"
+          >
+            {t('flows:conversion.panel.openFlow')}
+          </a>
+        </div>
+      ) : managedByMonitorId ? (
         <div
           className="rounded-lg border border-blue-500/40 bg-blue-500/10 p-6"
           data-testid="automation-managed-notice"
@@ -490,6 +555,7 @@ export default function AutomationEditPage({ automationId, isNew = false }: Auto
           defaultValues={isNew ? { ownerScope: defaultOwnerScope, ...defaultValues } : defaultValues}
           webhookUrl={webhookUrl}
           showOwnerScope={isNew && isPartnerScope}
+          ownerOrgId={isNew ? currentOrgId ?? undefined : storedOwnerOrgId}
           submitLabel={isNew ? t('automationEditPage.actions.create') : t('automationEditPage.actions.saveChanges')}
           loading={saving}
           sites={sites}

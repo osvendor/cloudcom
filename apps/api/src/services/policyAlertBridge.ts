@@ -9,7 +9,13 @@ import {
   organizations,
 } from '../db/schema';
 import { createAlert, resolveAlert, RESOLVABLE_ALERT_STATUSES } from './alertService';
+import { insertBuiltInAlertRule, type BuiltInAlertRuleSource } from './builtInAlertRules';
 import type { BreezeEvent } from './eventBus';
+import {
+  handleConfigComplianceCompliant,
+  handleConfigComplianceViolation,
+  isConfigCompliancePayload,
+} from './configComplianceAlertBridge';
 
 const { db } = dbModule;
 const runWithSystemDbAccess = async <T>(fn: () => Promise<T>): Promise<T> => {
@@ -18,7 +24,10 @@ const runWithSystemDbAccess = async <T>(fn: () => Promise<T>): Promise<T> => {
 };
 
 const POLICY_TEMPLATE_NAME = 'Policy Compliance Violation';
-const POLICY_RULE_PREFIX = 'Policy Violation Rule';
+/** Every org alert rule this bridge creates is named `<prefix>:<policyId>` (complianceAlertReconcile.ts finds them by it). */
+export const POLICY_RULE_PREFIX = 'Policy Violation Rule';
+/** The `source` this bridge stamps on its alert rules and alerts. */
+export const POLICY_ALERT_SOURCE = 'policy-evaluation' satisfies BuiltInAlertRuleSource;
 
 type PolicyEventPayload = {
   policyId?: string;
@@ -61,11 +70,19 @@ async function ensureTemplate(orgId: string): Promise<string> {
       orgId,
       name: POLICY_TEMPLATE_NAME,
       description: 'Auto-generated template for policy compliance violations',
-      conditions: { source: 'policy-evaluation' },
+      conditions: { source: POLICY_ALERT_SOURCE },
       severity: 'medium',
       titleTemplate: 'Policy violation on {{hostname}}',
       messageTemplate: '{{policyName}} reported a compliance violation on {{hostname}}',
-      autoResolve: true,
+      // The conditions above only mark where the alert came from; the condition
+      // registry cannot evaluate them. With auto-resolve on, the alert worker's
+      // sweep read them as "no longer met" and closed every policy alert while
+      // the device was still failing. These alerts close on policy.compliant
+      // (handlePolicyCompliant) or through the compliance-alert reconcile when
+      // the policy stops applying (complianceAlertReconcile.ts). Rows created
+      // before this change are corrected by
+      // 2026-11-10-130100-policy-compliance-alert-template-no-auto-resolve.sql.
+      autoResolve: false,
       isBuiltIn: true,
       cooldownMinutes: 30,
     })
@@ -78,7 +95,8 @@ async function ensureTemplate(orgId: string): Promise<string> {
   return created.id;
 }
 
-async function ensureRule(
+/** Exported for testing (#7650 concurrent first-fire); handlePolicyViolation calls it. */
+export async function ensureRule(
   orgId: string,
   policyId: string,
   policyName: string,
@@ -103,30 +121,19 @@ async function ensureRule(
 
   const templateId = await ensureTemplate(orgId);
 
-  const [created] = await db
-    .insert(alertRules)
-    .values({
-      orgId,
-      templateId,
-      name: ruleName,
-      targetType: 'org',
-      targetId: orgId,
-      isActive: true,
-      overrideSettings: {
-        severity: mapSeverityFromEnforcement(enforcement),
-        cooldownMinutes: 30,
-        policyId,
-        policyName,
-        source: 'policy-evaluation',
-      },
-    })
-    .returning({ id: alertRules.id });
-
-  if (!created) {
-    throw new Error('Failed to create policy alert rule');
-  }
-
-  return created.id;
+  // Concurrent first fire returns the winner's row, never a second rule (#7650).
+  return insertBuiltInAlertRule({
+    orgId,
+    templateId,
+    name: ruleName,
+    overrideSettings: {
+      severity: mapSeverityFromEnforcement(enforcement),
+      cooldownMinutes: 30,
+      policyId,
+      policyName,
+      source: POLICY_ALERT_SOURCE,
+    },
+  });
 }
 
 async function resolvePolicyAlertsForDevice(ruleId: string, deviceId: string): Promise<void> {
@@ -142,7 +149,7 @@ async function resolvePolicyAlertsForDevice(ruleId: string, deviceId: string): P
     );
 
   for (const alert of openAlerts) {
-    await resolveAlert(alert.id, 'Auto-resolved: policy returned to compliant state');
+    await resolveAlert(alert.id, 'Auto-resolved: policy returned to compliant state', undefined, false, 'condition_cleared');
   }
 }
 
@@ -235,7 +242,7 @@ export async function handlePolicyViolation(orgId: string, payload: PolicyEventP
     title: `Policy violation: ${policyName} on ${hostname}`,
     message: `${policyName} reported a non-compliant state on ${hostname}.`,
     context: {
-      source: 'policy-evaluation',
+      source: POLICY_ALERT_SOURCE,
       policyId: payload.policyId,
       policyName,
       remediationRunId: payload.remediationRunId ?? null,
@@ -278,6 +285,12 @@ async function handlePolicyCompliant(orgId: string, payload: PolicyEventPayload)
  */
 export async function handlePolicyViolationEvent(event: BreezeEvent): Promise<void> {
   await runWithSystemDbAccess(async () => {
+    // Configuration-policy compliance (#6669) publishes the same event type
+    // with a compliance-rule payload and no policyId.
+    if (isConfigCompliancePayload(event.payload)) {
+      await handleConfigComplianceViolation(event.orgId, event.payload);
+      return;
+    }
     await handlePolicyViolation(event.orgId, (event.payload ?? {}) as PolicyEventPayload);
   });
 }
@@ -285,6 +298,10 @@ export async function handlePolicyViolationEvent(event: BreezeEvent): Promise<vo
 /** Handle a `policy.compliant` event. See handlePolicyViolationEvent. */
 export async function handlePolicyCompliantEvent(event: BreezeEvent): Promise<void> {
   await runWithSystemDbAccess(async () => {
+    if (isConfigCompliancePayload(event.payload)) {
+      await handleConfigComplianceCompliant(event.orgId, event.payload);
+      return;
+    }
     await handlePolicyCompliant(event.orgId, (event.payload ?? {}) as PolicyEventPayload);
   });
 }

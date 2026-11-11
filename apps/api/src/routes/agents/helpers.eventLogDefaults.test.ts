@@ -57,7 +57,7 @@ vi.mock('../../services/sentry', () => ({ captureException: vi.fn() }));
 vi.mock('../../services/cloudflareMtls', () => ({ CloudflareMtlsService: vi.fn() }));
 vi.mock('../../services/softwarePolicyService', () => ({ recordSoftwarePolicyAudit: vi.fn() }));
 vi.mock('../../services/featureConfigResolver', () => ({
-  resolvePatchConfigForDevice: vi.fn(),
+  resolvePatchConfigPolicyForDevice: vi.fn(),
 }));
 vi.mock('../../services/filesystemAnalysis', () => ({
   getFilesystemScanState: vi.fn(),

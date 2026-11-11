@@ -1,9 +1,10 @@
 /** Offline-only durable alert admission. DB preparation and admission never await Redis. */
 import { and, eq, inArray, isNull, or, sql } from 'drizzle-orm';
 import { db, withSystemDbAccessContext } from '../db';
-import { alerts, alertRules, alertTemplates, configPolicyAlertRules, devices, offlineTransitionEffects as effects, type OfflineEffect } from '../db/schema';
-import { alertRuleOwnershipConditionForOrg, getApplicableRules, getApplicableRulesFromPolicy } from './alertService';
-import { evaluateConditions, interpolateTemplate } from './alertConditions';
+import { alerts, alertRules, alertTemplates, devices, offlineTransitionEffects as effects, type OfflineEffect } from '../db/schema';
+import { alertRuleOwnershipConditionForOrg, getApplicableRules } from './alertService';
+import { createLifecycleLoader, hasMalformedLegacyCooldownOverride } from './alertLifecycle/resolve';
+import { interpolateTemplate } from './alertConditions';
 import { resolveMaintenanceConfigForDevice, isInMaintenanceWindow } from './featureConfigResolver';
 import { getRedisConnection } from './redis';
 import { enqueueAlertCorrelation } from '../jobs/alertCorrelation';
@@ -49,15 +50,19 @@ export async function expandOfflineAlertPlan(effect: OfflineEffect): Promise<str
         and(eq(alertRules.targetType, 'device'), eq(alertRules.targetId, device.id)),
       )));
     const plans: OfflineRulePlan[] = [];
+    const loadLifecycle = createLifecycleLoader();
     for (const { rule, template } of rules) {
       const overrides = rule.overrideSettings as Record<string, unknown> | null;
       const conditions = overrides?.conditions ?? template.conditions;
       if (!hasOfflineCondition(conditions)) continue;
       plans.push({
-        ruleId: rule.id, policy: false, name: rule.name, templateId: template.id,
+        ruleId: rule.id, name: rule.name, templateId: template.id,
         conditions, severity: (overrides?.severity as OfflineRulePlan['severity']) ?? template.severity,
         titleTemplate: template.titleTemplate, messageTemplate: template.messageTemplate,
-        cooldownMinutes: (overrides?.cooldownMinutes as number) ?? template.cooldownMinutes,
+        // Throwing here would fail the whole plan and starve this rule's siblings.
+        cooldownMinutes: hasMalformedLegacyCooldownOverride(rule)
+          ? null
+          : (await loadLifecycle({ rule, template, deviceOrgId: device.orgId })).cooldownMinutes,
       });
     }
     // Reuse effective monitor resolution, including disabled attachments,
@@ -66,13 +71,11 @@ export async function expandOfflineAlertPlan(effect: OfflineEffect): Promise<str
     for (const { rule, template, monitor, effectiveConditions, effectiveSeverity, effectiveCooldownMinutes } of applicable) {
       if (rule.targetType !== 'monitor' || monitor?.kind !== 'offline') continue;
       plans.push({
-        ruleId: rule.id, monitorId: monitor.id, policy: false, name: rule.name, templateId: template.id,
+        ruleId: rule.id, monitorId: monitor.id, name: rule.name, templateId: template.id,
         conditions: effectiveConditions, severity: effectiveSeverity, cooldownMinutes: effectiveCooldownMinutes,
         titleTemplate: template.titleTemplate, messageTemplate: template.messageTemplate,
       });
     }
-    const policyRules = await getApplicableRulesFromPolicy(device.id);
-    for (const rule of policyRules) plans.push({ ...rule, ruleId: rule.id, policy: true });
     for (const rule of plans) {
       children.push(await insertOfflineEffect(effect, { type: 'alert-rule', observation: payload.observation, rule }, rule.ruleId));
     }
@@ -86,8 +89,7 @@ async function prepareRule(observation: OfflineObservation, rule: OfflineRulePla
     const [sourceDevice] = await db.select({ id: devices.id }).from(devices).where(and(eq(devices.id, observation.deviceId), eq(devices.orgId, observation.orgId)));
     if (!sourceDevice) return null;
     // Read current eligibility without holding a device lock across Redis work.
-    const table = rule.policy ? configPolicyAlertRules : alertRules;
-    const [exists] = await db.select({ id: table.id }).from(table).where(and(eq(table.id, rule.ruleId), isNull(table.retiredAt)));
+    const [exists] = await db.select({ id: alertRules.id }).from(alertRules).where(and(eq(alertRules.id, rule.ruleId), isNull(alertRules.retiredAt)));
     if (!exists) return null;
     if (rule.monitorId) {
       // A delayed effect must not fire a monitor that was detached or disabled.
@@ -105,14 +107,6 @@ async function prepareRule(observation: OfflineObservation, rule: OfflineRulePla
         triggered: true, conditionsMet: [`Device offline for ${durationMinutes}min`], conditionsNotMet: [],
         context: { durationMinutes },
       };
-    }
-    if (rule.policy) {
-      const maintenance = await resolveMaintenanceConfigForDevice(observation.deviceId);
-      const status = maintenance ? isInMaintenanceWindow(maintenance) : null;
-      if (status?.active && status.suppressAlerts) return null;
-      const result = await evaluateConditions(rule.conditions, observation.deviceId);
-      if (!result.triggered) return null;
-      return result;
     }
     return { triggered: true, conditionsMet: ['Device offline'], conditionsNotMet: [], context: {} };
   }, 'offlineAlerts.prepare');
@@ -135,10 +129,10 @@ async function durableSuppression(effect: OfflineEffect, rule: OfflineRulePlan) 
   )).orderBy(sql`${effects.createdAt} DESC`).limit(1);
   const [resolved] = await db.select({ count: sql<number>`count(*)::int` }).from(alerts).where(and(
     eq(alerts.deviceId, effect.deviceId), eq(alerts.orgId, effect.orgId),
-    rule.policy ? eq(alerts.configPolicyId, rule.ruleId) : eq(alerts.ruleId, rule.ruleId),
+    eq(alerts.ruleId, rule.ruleId),
     sql`${alerts.resolvedAt} > clock_timestamp() - interval '10 minutes'`,
   ));
-  const multiplier = !rule.policy && latest?.payload.type === 'alert-postprocess'
+  const multiplier = latest?.payload.type === 'alert-postprocess'
     ? Math.min(latest.payload.multiplier * 2, 4) : 1;
   return { cooling: summary?.cooling ?? false, flapping: (summary?.triggers ?? 0) + (resolved?.count ?? 0) >= 4, multiplier };
 }
@@ -147,7 +141,8 @@ export async function admitOfflineAlertRule(effect: OfflineEffect): Promise<stri
   const payload = effect.payload;
   if (payload.type !== 'alert-rule') throw new Error('Expected alert rule');
   const { observation, rule } = payload;
-  if (!Number.isInteger(rule.cooldownMinutes) || rule.cooldownMinutes < 0 || rule.cooldownMinutes > 10080) {
+  const { cooldownMinutes } = rule;
+  if (cooldownMinutes === null || !Number.isInteger(cooldownMinutes) || cooldownMinutes < 0 || cooldownMinutes > 10080) {
     throw new Error('Invalid offline alert cooldown');
   }
   const children: string[] = [];
@@ -169,20 +164,19 @@ export async function admitOfflineAlertRule(effect: OfflineEffect): Promise<stri
         return;
       }
     }
-    const table = rule.policy ? configPolicyAlertRules : alertRules;
-    const [exists] = await db.select({ id: table.id }).from(table).where(eq(table.id, rule.ruleId));
+    const [exists] = await db.select({ id: alertRules.id }).from(alertRules).where(eq(alertRules.id, rule.ruleId));
     if (!exists) return finishOfflineEffect(effect);
     const durable = await durableSuppression(effect, rule);
     if (durable.cooling || redis?.cooling) return finishOfflineEffect(effect);
     const [open] = await db.select({ id: alerts.id }).from(alerts).where(and(
-      eq(alerts.deviceId, device.id), rule.policy ? eq(alerts.configPolicyId, rule.ruleId) : eq(alerts.ruleId, rule.ruleId),
+      eq(alerts.deviceId, device.id), eq(alerts.ruleId, rule.ruleId),
       inArray(alerts.status, ['active', 'acknowledged', 'suppressed']),
     )).limit(1);
     if (open) return finishOfflineEffect(effect);
     const flapping = durable.flapping || redis?.flapping === true;
     const multiplier = Math.max(durable.multiplier, redis?.multiplier ?? 1);
     const occurredAt = new Date().toISOString();
-    const cooldownUntil = new Date(new Date(occurredAt).getTime() + rule.cooldownMinutes * multiplier * 60_000);
+    const cooldownUntil = new Date(new Date(occurredAt).getTime() + cooldownMinutes * multiplier * 60_000);
     const alertId = flapping ? null : offlineEffectId(effect.transitionId, 'alert', rule.ruleId);
     if (alertId) {
       const context = {
@@ -193,13 +187,14 @@ export async function admitOfflineAlertRule(effect: OfflineEffect): Promise<stri
       const title = interpolateTemplate(rule.titleTemplate, context);
       const message = interpolateTemplate(rule.messageTemplate, context);
       const [inserted] = await db.insert(alerts).values({
-        id: alertId, ruleId: rule.policy ? null : rule.ruleId,
+        ownerKind: 'device',
+        id: alertId, ruleId: rule.ruleId,
         ...(rule.monitorId ? { monitorId: rule.monitorId } : {}),
-        configPolicyId: rule.policy ? rule.ruleId : null, configItemName: rule.policy ? rule.name : null,
+        configPolicyId: null, configItemName: null,
         deviceId: device.id, orgId: device.orgId, severity: rule.severity, title, message,
         status: 'active', triggeredAt: new Date(occurredAt),
         context: { ...context, conditionsMet: prepared.conditionsMet, conditionsNotMet: prepared.conditionsNotMet,
-          cooldownMinutes: rule.cooldownMinutes, ...(rule.policy ? { source: 'config_policy' } : { templateId: rule.templateId }) },
+          cooldownMinutes, templateId: rule.templateId },
       }).onConflictDoNothing().returning({ id: alerts.id });
       // Existing stable alert identity means this observation already admitted it,
       // even if it is now resolved; never reconstruct consequences from current config.
@@ -207,11 +202,11 @@ export async function admitOfflineAlertRule(effect: OfflineEffect): Promise<stri
       children.push(await insertOfflineEffect(effect, {
         type: 'alert-event', siteId: device.siteId, occurredAt,
         event: { alertId, deviceId: device.id, severity: rule.severity, title, message,
-          ...(rule.policy ? { configPolicyAlertRuleId: rule.ruleId, configItemName: rule.name, source: 'config_policy' } : { ruleId: rule.ruleId }) },
+          ruleId: rule.ruleId },
       }, rule.ruleId));
     }
     children.push(await insertOfflineEffect(effect, {
-      type: 'alert-postprocess', ruleId: rule.ruleId, policy: rule.policy, alertId,
+      type: 'alert-postprocess', ruleId: rule.ruleId, alertId,
       occurredAt, multiplier, recordTrigger: !flapping,
     }, rule.ruleId, cooldownUntil));
     await finishOfflineEffect(effect);

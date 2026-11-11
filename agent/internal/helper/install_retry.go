@@ -1,0 +1,173 @@
+package helper
+
+import "time"
+
+// Failure accounting shared by the first-install branch of Apply and
+// applyPendingUpdate (#6927). Both call downloadAndInstall for the version the
+// server offered, and both must stop re-running the download and the
+// privileged installer on every heartbeat once that version keeps failing.
+//
+// A version is abandoned after maxHelperInstallFailures failed attempts.
+// CheckUpdate ignores an abandoned version until helperAbandonRetryAfter has
+// passed, which bounds a persistently failing install to a few attempts per
+// cooldown window, and still lets a transient outage (network, AV holding the
+// fresh binary) heal without an agent restart. Offering a different version
+// re-arms the install immediately.
+const (
+	maxHelperInstallFailures = 3
+	helperAbandonRetryAfter  = 6 * time.Hour
+)
+
+func (m *Manager) nowTime() time.Time {
+	if m.now != nil {
+		return m.now()
+	}
+	return time.Now()
+}
+
+// isAbandonedLocked reports whether version is inside its abandon cooldown.
+// An expired abandonment is cleared here. Must be called with m.mu held.
+func (m *Manager) isAbandonedLocked(version string) bool {
+	if version == "" || version != m.abandonedVersion {
+		return false
+	}
+	if m.nowTime().Sub(m.abandonedAt) < helperAbandonRetryAfter {
+		return true
+	}
+	log.Info("helper abandon cooldown elapsed, allowing a retry", "targetVersion", version)
+	m.abandonedVersion = ""
+	m.abandonedAt = time.Time{}
+	return false
+}
+
+// recordInstallFailureLocked counts one failed attempt at version. The count
+// is kept per version (failuresVersion), so an offer that disappears for one
+// heartbeat and comes back does not reset it. Must be called with m.mu held.
+func (m *Manager) recordInstallFailureLocked(version string) {
+	if m.failuresVersion != version {
+		m.failuresVersion = version
+		m.updateFailures = 0
+	}
+	m.updateFailures++
+}
+
+// abandonIfExhaustedLocked abandons the pending version once it has used up
+// its failure budget, and reports whether it did. Called before an attempt, so
+// the cap is maxHelperInstallFailures attempts. Must be called with m.mu held.
+func (m *Manager) abandonIfExhaustedLocked() bool {
+	if m.pendingHelperVersion == "" || m.failuresVersion != m.pendingHelperVersion ||
+		m.updateFailures < maxHelperInstallFailures {
+		return false
+	}
+	log.Warn("helper install abandoned after repeated failures, clearing pending version",
+		"targetVersion", m.pendingHelperVersion,
+		"failures", m.updateFailures,
+		"retryAfter", helperAbandonRetryAfter.String(),
+	)
+	m.abandonedVersion = m.pendingHelperVersion
+	m.abandonedAt = m.nowTime()
+	m.pendingHelperVersion = ""
+	m.clearInstallFailuresLocked()
+	return true
+}
+
+// clearInstallFailuresLocked resets the failure count. Must be called with m.mu held.
+func (m *Manager) clearInstallFailuresLocked() {
+	m.updateFailures = 0
+	m.failuresVersion = ""
+}
+
+// Install-issue codes reported in the heartbeat (helperInstallIssue, #6925)
+// and persisted on the device row. Empty means no issue.
+const (
+	// InstallIssueAwaitingServerOffer: Assist is enabled but not installed and
+	// the server has offered no helper version to install (#6920 root cause).
+	InstallIssueAwaitingServerOffer = "awaiting_server_offer"
+	// InstallIssueInstallAbandoned: the offered version failed to install
+	// maxHelperInstallFailures times and is in its abandon cooldown (#6927).
+	InstallIssueInstallAbandoned = "install_abandoned"
+	// InstallIssueWebView2Outdated: Assist is installed but the agent refused
+	// to launch it because the WebView2 runtime is older than the installed
+	// build requires (#10183). The version found is in the agent WARN log.
+	InstallIssueWebView2Outdated = "webview2_outdated"
+	// InstallIssueCrashLoop: Assist kept exiting and the session watcher gave
+	// up; it retries after watcherGiveUpRetry or on a new Assist version
+	// (#10183). Exit codes are in the agent log.
+	InstallIssueCrashLoop = "crash_loop"
+	// InstallIssueUnmanagedInstall: deploy is off and the installed Assist was
+	// not installed by the agent, so the agent leaves it alone (#10185).
+	InstallIssueUnmanagedInstall = "unmanaged_install"
+)
+
+// notInstalledIssueLocked is the heartbeat code for the waiting branch of
+// Apply; it tracks notInstalledReasonLocked. Must be called with m.mu held.
+func (m *Manager) notInstalledIssueLocked() string {
+	if m.abandonedVersion != "" {
+		return InstallIssueInstallAbandoned
+	}
+	return InstallIssueAwaitingServerOffer
+}
+
+// InstallIssue returns the install-issue code for the heartbeat
+// (helperInstallIssue), or "" when there is none (healthy, disabled with
+// nothing installed, installing an offered version, or Apply not run yet).
+//
+// Machine-level codes the last Apply set win. Otherwise, while Assist is
+// enabled, a per-session launch refusal (webview2_outdated) outranks a session
+// whose watcher gave up (crash_loop). The order is fixed so the code does not
+// flap between heartbeats.
+func (m *Manager) InstallIssue() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.installIssue != "" {
+		return m.installIssue
+	}
+	if !m.lastApplyEnabled {
+		return ""
+	}
+	crashLoop := false
+	for _, state := range m.sessions {
+		if state.launchIssue != "" {
+			return state.launchIssue
+		}
+		if state.watcherGaveUp {
+			crashLoop = true
+		}
+	}
+	if crashLoop {
+		return InstallIssueCrashLoop
+	}
+	return ""
+}
+
+// notInstalledReasonLocked is the one-per-episode warning Apply logs when
+// Assist is enabled but not installed and nothing is pending. It names an
+// abandoned version so the log does not send an operator to look for a
+// missing server-side offer when the agent gave up on one. Must be called
+// with m.mu held.
+func (m *Manager) notInstalledReasonLocked() string {
+	if m.abandonedVersion != "" {
+		return "breeze assist enabled but not installed; install of " + m.abandonedVersion +
+			" abandoned after repeated failures, retrying after " + helperAbandonRetryAfter.String() +
+			" or when a different version is offered"
+	}
+	return "breeze assist enabled but not installed; waiting for the server to offer a helper version"
+}
+
+// WithdrawOffer is called on a heartbeat that carries no helper version offer.
+// The server stops offering when it has no helper build for this device (for
+// example the helper row was deleted, which otherwise makes every retry fail
+// with a 404 on the download info), or when the helper is already current or
+// the update gate is closed. A pending version the server no longer offers must
+// not keep driving installs. The failure count is kept, so a re-offer of the
+// same version continues against the same budget.
+func (m *Manager) WithdrawOffer() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.pendingHelperVersion == "" {
+		return
+	}
+	log.Info("server no longer offers a helper version, clearing pending version",
+		"targetVersion", m.pendingHelperVersion)
+	m.pendingHelperVersion = ""
+}

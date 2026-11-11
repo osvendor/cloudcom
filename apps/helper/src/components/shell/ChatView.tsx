@@ -6,6 +6,7 @@ import ChatFileCard, {
   openWorkspaceFile,
   type WorkspaceFileSummary,
 } from '../workspace/ChatFileCard';
+import { SafeMarkdownImage, SafeMarkdownLink } from '../../lib/safeMarkdown';
 
 // Extracted from App.tsx's default return (messages map, composer,
 // ThinkingIndicator). Reads the chat store directly, as App did. The composer
@@ -146,7 +147,7 @@ function ToolCallIndicator({ toolName }: { toolName?: string }) {
 
 function ThinkingIndicator() {
   return (
-    <div className="helper-message helper-message-assistant bg-ws-surface rounded-surface shadow-[var(--ws-shadow-1)]">
+    <div className="helper-message helper-message-assistant bg-ws-surface rounded-surface">
       <div className="helper-thinking">
         <span className="helper-thinking-dot" />
         <span className="helper-thinking-dot" />
@@ -216,7 +217,7 @@ export default function ChatView({
           return (
             <div
               key={msg.id}
-              className={`helper-message helper-message-${msg.role} bg-ws-surface rounded-surface shadow-[var(--ws-shadow-1)]`}
+              className={`helper-message helper-message-${msg.role} bg-ws-surface rounded-surface`}
             >
               <div className="helper-message-content">
                 {msg.role === 'assistant' ? (
@@ -226,6 +227,10 @@ export default function ChatView({
                       components={{
                         p: ({ children }) => <p>{withCitations(children, fileResolutionMap, username)}</p>,
                         li: ({ children }) => <li>{withCitations(children, fileResolutionMap, username)}</li>,
+                        // AI-authored markdown images must never auto-load —
+                        // see lib/safeMarkdown.tsx for why.
+                        img: ({ src, alt }) => <SafeMarkdownImage src={src} alt={alt} />,
+                        a: ({ href, children }) => <SafeMarkdownLink href={href}>{children}</SafeMarkdownLink>,
                       }}
                     >
                       {msg.content}
@@ -248,7 +253,7 @@ export default function ChatView({
       </div>
 
       {/* Input */}
-      <form onSubmit={handleSubmit} className="helper-input-form bg-ws-surface border-ws-border-subtle shadow-[var(--ws-shadow-1)]">
+      <form onSubmit={handleSubmit} className="helper-input-form bg-ws-surface border-ws-border-subtle">
         <textarea
           value={draft}
           onChange={(e) => setDraft(e.target.value)}

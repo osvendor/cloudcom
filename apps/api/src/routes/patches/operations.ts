@@ -9,10 +9,12 @@ import {
   patches,
   devicePatches,
   patchJobs,
+  patchJobResults,
   patchRollbacks,
-  devices
+  devices,
+  users
 } from '../../db/schema';
-import { scanSchema, listJobsSchema, patchIdParamSchema, rollbackSchema } from './schemas';
+import { scanSchema, listJobsSchema, jobIdParamSchema, patchIdParamSchema, rollbackSchema } from './schemas';
 import { getPagination, writePatchAuditForOrgIds } from './helpers';
 
 export const operationsRoutes = new Hono();
@@ -20,6 +22,49 @@ export const operationsRoutes = new Hono();
 function canAccessDeviceSite(device: { siteId?: string | null }, permissions: UserPermissions | undefined): boolean {
   if (!permissions?.allowedSiteIds) return true;
   return typeof device.siteId === 'string' && canAccessSite(permissions, device.siteId);
+}
+
+function targetDeviceIds(targets: unknown): string[] {
+  const ids = (targets as { deviceIds?: unknown } | null)?.deviceIds;
+  return Array.isArray(ids) ? ids.filter((id): id is string => typeof id === 'string') : [];
+}
+
+/**
+ * A job's `targets.deviceIds` can span the whole org. For a caller limited to
+ * a subset of sites, keep only the devices in those sites (the same rule the
+ * per-device results already follow). Unrestricted callers get rows unchanged.
+ */
+async function narrowJobTargetsToSites<T extends { targets: unknown }>(
+  jobs: T[],
+  permissions: UserPermissions | undefined
+): Promise<T[]> {
+  if (!permissions?.allowedSiteIds) return jobs;
+
+  const allIds = [...new Set(jobs.flatMap((job) => targetDeviceIds(job.targets)))];
+  const visible = new Set<string>();
+  if (allIds.length > 0) {
+    const rows = await db
+      .select({ id: devices.id, siteId: devices.siteId })
+      .from(devices)
+      .where(inArray(devices.id, allIds));
+    for (const row of rows) {
+      if (canAccessDeviceSite(row, permissions)) visible.add(row.id);
+    }
+  }
+
+  return jobs.map((job) => {
+    const targets = job.targets;
+    if (!targets || typeof targets !== 'object' || Array.isArray(targets)) {
+      return { ...job, targets: { deviceIds: [] } };
+    }
+    return {
+      ...job,
+      targets: {
+        ...(targets as Record<string, unknown>),
+        deviceIds: targetDeviceIds(targets).filter((id) => visible.has(id)),
+      },
+    };
+  });
 }
 
 // POST /patches/scan - Trigger patch scan for devices
@@ -131,22 +176,66 @@ operationsRoutes.post(
 operationsRoutes.get(
   '/jobs',
   requireScope('organization', 'partner', 'system'),
+  // Same RBAC bar as every sibling patch READ (list.ts, compliance.ts,
+  // approvals.ts) — job history is exactly the kind of read DEVICES_READ was
+  // meant to gate. This route previously had no permission check at all
+  // (issue #2606).
+  requirePermission(PERMISSIONS.DEVICES_READ.resource, PERMISSIONS.DEVICES_READ.action),
   zValidator('query', listJobsSchema),
   async (c) => {
     const auth = c.get('auth');
     const query = c.req.valid('query');
     const { page, limit, offset } = getPagination(query);
+    const permissions = c.get('permissions') as UserPermissions | undefined;
+    const allowedSiteIds = permissions?.allowedSiteIds;
+
+    if (allowedSiteIds && allowedSiteIds.length === 0) {
+      return c.json({ data: [], pagination: { page, limit, total: 0 } });
+    }
 
     const conditions = [];
     const orgCond = auth.orgCondition(patchJobs.orgId);
     if (orgCond) conditions.push(orgCond);
     if (query.status) conditions.push(eq(patchJobs.status, query.status));
+    if (allowedSiteIds) {
+      // Site-restricted callers only see jobs that target at least one device
+      // in their sites. `jsonb_exists` (the `?` operator) is false rather than
+      // an error when `targets.deviceIds` is missing or not an array.
+      conditions.push(sql`EXISTS (
+        SELECT 1 FROM ${devices}
+        WHERE ${devices.orgId} = ${patchJobs.orgId}
+          AND ${inArray(devices.siteId, allowedSiteIds)}
+          AND jsonb_exists(${patchJobs.targets}->'deviceIds', ${devices.id}::text)
+      )`);
+    }
 
     const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
 
     const jobs = await db
-      .select()
+      .select({
+        id: patchJobs.id,
+        orgId: patchJobs.orgId,
+        policyId: patchJobs.policyId,
+        ringId: patchJobs.ringId,
+        configPolicyId: patchJobs.configPolicyId,
+        name: patchJobs.name,
+        patches: patchJobs.patches,
+        targets: patchJobs.targets,
+        status: patchJobs.status,
+        scheduledAt: patchJobs.scheduledAt,
+        startedAt: patchJobs.startedAt,
+        completedAt: patchJobs.completedAt,
+        devicesTotal: patchJobs.devicesTotal,
+        devicesCompleted: patchJobs.devicesCompleted,
+        devicesFailed: patchJobs.devicesFailed,
+        devicesPending: patchJobs.devicesPending,
+        devicesQueued: patchJobs.devicesQueued,
+        createdBy: patchJobs.createdBy,
+        createdByName: users.name,
+        createdAt: patchJobs.createdAt
+      })
       .from(patchJobs)
+      .leftJoin(users, eq(users.id, patchJobs.createdBy))
       .where(whereClause)
       .orderBy(desc(patchJobs.createdAt), desc(patchJobs.id))
       .limit(limit)
@@ -158,9 +247,103 @@ operationsRoutes.get(
       .where(whereClause);
 
     return c.json({
-      data: jobs,
+      data: await narrowJobTargetsToSites(jobs, permissions),
       pagination: { page, limit, total: Number(countResult[0]?.count ?? 0) }
     });
+  }
+);
+
+// GET /patches/jobs/:id - Patch job detail with per-device results
+operationsRoutes.get(
+  '/jobs/:id',
+  requireScope('organization', 'partner', 'system'),
+  requirePermission(PERMISSIONS.DEVICES_READ.resource, PERMISSIONS.DEVICES_READ.action),
+  zValidator('param', jobIdParamSchema),
+  async (c) => {
+    const { id } = c.req.valid('param');
+
+    // patch_jobs carries FORCE RLS keyed on org_id (breeze_has_org_access), so
+    // this select is already tenant-scoped at the database level via the
+    // request's withDbAccessContext — an org-scoped caller simply gets zero
+    // rows for a job outside their org, same as any other cross-tenant probe.
+    const [job] = await db
+      .select({
+        id: patchJobs.id,
+        orgId: patchJobs.orgId,
+        policyId: patchJobs.policyId,
+        ringId: patchJobs.ringId,
+        configPolicyId: patchJobs.configPolicyId,
+        name: patchJobs.name,
+        patches: patchJobs.patches,
+        targets: patchJobs.targets,
+        status: patchJobs.status,
+        scheduledAt: patchJobs.scheduledAt,
+        startedAt: patchJobs.startedAt,
+        completedAt: patchJobs.completedAt,
+        devicesTotal: patchJobs.devicesTotal,
+        devicesCompleted: patchJobs.devicesCompleted,
+        devicesFailed: patchJobs.devicesFailed,
+        devicesPending: patchJobs.devicesPending,
+        devicesQueued: patchJobs.devicesQueued,
+        createdBy: patchJobs.createdBy,
+        createdByName: users.name,
+        createdAt: patchJobs.createdAt
+      })
+      .from(patchJobs)
+      .leftJoin(users, eq(users.id, patchJobs.createdBy))
+      .where(eq(patchJobs.id, id))
+      .limit(1);
+
+    if (!job) {
+      return c.json({ error: 'Patch job not found' }, 404);
+    }
+
+    // patch_job_results has no org_id column and no RLS policy of its own
+    // (device-join RLS shape — see schema comment); scope it explicitly by
+    // joining devices for the job's own org rather than trusting job_id alone,
+    // since job_id is a plain (unscoped) equality filter under RLS.
+    const results = await db
+      .select({
+        id: patchJobResults.id,
+        deviceId: patchJobResults.deviceId,
+        deviceHostname: devices.hostname,
+        deviceSiteId: devices.siteId,
+        patchId: patchJobResults.patchId,
+        patchTitle: patches.title,
+        status: patchJobResults.status,
+        startedAt: patchJobResults.startedAt,
+        completedAt: patchJobResults.completedAt,
+        exitCode: patchJobResults.exitCode,
+        output: patchJobResults.output,
+        errorMessage: patchJobResults.errorMessage,
+        rebootRequired: patchJobResults.rebootRequired,
+        rebootedAt: patchJobResults.rebootedAt,
+        createdAt: patchJobResults.createdAt
+      })
+      .from(patchJobResults)
+      .innerJoin(devices, and(eq(devices.id, patchJobResults.deviceId), eq(devices.orgId, job.orgId)))
+      .leftJoin(patches, eq(patches.id, patchJobResults.patchId))
+      .where(eq(patchJobResults.jobId, job.id))
+      .orderBy(desc(patchJobResults.createdAt));
+
+    // Site-restricted callers only see per-device results and target devices
+    // in their allowed sites (the job row itself is org-scoped; results are not).
+    const permissions = c.get('permissions') as UserPermissions | undefined;
+    const visibleResults = results
+      .filter((r) => canAccessDeviceSite({ siteId: r.deviceSiteId }, permissions))
+      .map(({ deviceSiteId: _deviceSiteId, ...rest }) => rest);
+    const [visibleJob] = await narrowJobTargetsToSites([job], permissions);
+    // Same visibility rule as the jobs list: a site-restricted caller does not
+    // see a job that touches none of their devices.
+    if (
+      permissions?.allowedSiteIds &&
+      visibleResults.length === 0 &&
+      targetDeviceIds(visibleJob?.targets).length === 0
+    ) {
+      return c.json({ error: 'Patch job not found' }, 404);
+    }
+
+    return c.json({ data: { ...visibleJob, results: visibleResults } });
   }
 );
 
@@ -206,7 +389,7 @@ operationsRoutes.post(
 
     if (data.deviceIds && data.deviceIds.length > 0) {
       // Bind each rollback target to the device's own `installed` observation
-      // (#5565), mirroring how install binds to `pending` (SEC-115). A device
+      // (#5565), mirroring how install binds to `pending`. A device
       // that exists but never reported this patch as installed is skipped
       // rather than sent a rollback for a catalog row it has no relation to.
       const requestedDevices = await db

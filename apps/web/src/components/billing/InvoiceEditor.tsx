@@ -9,9 +9,11 @@ import { formatTime } from '../../lib/dateTimeFormat';
 import { showToast } from '../shared/Toast';
 import { UnsavedBadge, MarginPanel, useShowMargin } from './billingUi';
 import { useSavedFlash, SrSaved, fieldRing, unsavedHintId, UnsavedFieldHint } from './shared/saveCues';
+import { useServerSyncedDraft } from './shared/useServerSyncedDraft';
 import {
   type InvoiceDetail,
   type InvoiceLine,
+  type TimeLineRefreshResult,
   formatMoney,
   lineTitle,
   lineWorkedVsBilledNote,
@@ -22,6 +24,9 @@ import CatalogItemPicker from '../catalog/CatalogItemPicker';
 import PolishButton from '../catalog/PolishButton';
 import { listCatalog, type CatalogItem } from '../../lib/api/catalog';
 import { formatPercent } from '@/lib/i18n/format';
+import { useStableT } from '@/lib/i18n/useStableT';
+import { useRegisterDirtyForm } from '@/lib/keyboard/useRegisterDirtyForm';
+import { EntityLink } from '@/components/shared/EntityLink';
 
 const UNAUTHORIZED = () => void navigateTo('/login', { replace: true });
 
@@ -69,6 +74,7 @@ type PendingDelete = { memberIds: string[]; timer: ReturnType<typeof setTimeout>
 
 export default function InvoiceEditor({ detail, onChanged, onPendingEditsChange, onUnsavedEditsChange, onSaveFailure, onRegisterPendingDeleteFlush, showMargin }: Props) {
   const { t } = useTranslation('billing');
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   const { can } = usePermissions();
   const canWrite = can('invoices', 'write');
   // Cost/margin is a read affordance (mirrors InvoiceDetail + the quote rails'
@@ -209,18 +215,15 @@ export default function InvoiceEditor({ detail, onChanged, onPendingEditsChange,
 
   const serverNotes = invoice.notes ?? '';
   const serverTerms = invoice.termsAndConditions ?? '';
-  const [notes, setNotes] = useState(serverNotes);
-  const [notesDirty, setNotesDirty] = useState(false);
   const [notesSaved, flashNotesSaved] = useSavedFlash();
-  const [terms, setTerms] = useState(serverTerms);
-  const [termsDirty, setTermsDirty] = useState(false);
   const [termsSaved, flashTermsSaved] = useSavedFlash();
 
   // Re-sync the free-text fields when the SERVER value changes — a refetch
   // brought different notes/terms, so the local draft is stale and must be
-  // replaced. Derived DURING RENDER (React's documented "adjusting state when a
-  // prop changes" pattern) rather than from a `useEffect`, and that distinction
-  // is the entire fix for #3277.
+  // replaced, UNLESS the new value is the echo of our own save and the user has
+  // typed since (#4296 — see useServerSyncedDraft). Derived DURING RENDER
+  // (React's documented "adjusting state when a prop changes" pattern) rather
+  // than from a `useEffect`, and that distinction is the entire fix for #3277.
   //
   // The previous shape was:
   //   useEffect(() => { setNotes(invoice.notes ?? ''); setNotesDirty(false); }, [invoice.notes]);
@@ -248,18 +251,8 @@ export default function InvoiceEditor({ detail, onChanged, onPendingEditsChange,
   // value. Comparing the NORMALISED strings additionally stops a null → ''
   // round-trip from spuriously clobbering a draft, which the raw-prop dependency
   // did not.
-  const [syncedServerNotes, setSyncedServerNotes] = useState(serverNotes);
-  if (syncedServerNotes !== serverNotes) {
-    setSyncedServerNotes(serverNotes);
-    setNotes(serverNotes);
-    setNotesDirty(false);
-  }
-  const [syncedServerTerms, setSyncedServerTerms] = useState(serverTerms);
-  if (syncedServerTerms !== serverTerms) {
-    setSyncedServerTerms(serverTerms);
-    setTerms(serverTerms);
-    setTermsDirty(false);
-  }
+  const { draft: notes, dirty: notesDirty, edit: editNotes, markSaved: markNotesSaved } = useServerSyncedDraft(serverNotes);
+  const { draft: terms, dirty: termsDirty, edit: editTerms, markSaved: markTermsSaved } = useServerSyncedDraft(serverTerms);
 
   // Per-line dirty fields, reported up from each LineRow. This MUST be lifted:
   // a line field whose save failed keeps its local value (nothing reverts it)
@@ -306,6 +299,8 @@ export default function InvoiceEditor({ detail, onChanged, onPendingEditsChange,
     for (const key of failedKeys) if (dirtyLineKeys.has(key)) return t('invoiceEditor.unsavedField.lines');
     return null;
   }, [pending.size, failedKeys, notesDirty, termsDirty, dirtyLineKeys, t]);
+  // Unsaved input blocks the g/c chords and queue keys (see useRegisterDirtyForm).
+  useRegisterDirtyForm(hasPendingEdits || notesDirty || termsDirty || dirtyLineKeys.size > 0);
   useEffect(() => { onPendingEditsChange?.(hasPendingEdits); }, [hasPendingEdits, onPendingEditsChange]);
   useEffect(() => { onUnsavedEditsChange?.(unsavedFieldLabel); }, [unsavedFieldLabel, onUnsavedEditsChange]);
   // Clear BOTH on unmount so a stale signal can't lock Issue after the editor is
@@ -342,10 +337,10 @@ export default function InvoiceEditor({ detail, onChanged, onPendingEditsChange,
       setCatalog(body.data);
       setCatalogFailed(false);
     } catch (err) {
-      handleActionError(err, t('invoiceEditor.errors.loadCatalog'));
+      handleActionError(err, stableT('invoiceEditor.errors.loadCatalog'));
       setCatalogFailed(true);
     }
-  }, [t]);
+  }, [stableT]);
 
   useEffect(() => { void loadCatalog(); }, [loadCatalog]);
 
@@ -459,12 +454,12 @@ export default function InvoiceEditor({ detail, onChanged, onPendingEditsChange,
     runScoped(`remove-${lineId}`, async () => {
       await runAction({
         request: () => fetchWithAuth(`/invoices/${invoice.id}/lines/${lineId}`, { method: 'DELETE', keepalive: true }),
-        errorFallback: t('invoiceEditor.errors.removeLine'),
+        errorFallback: stableT('invoiceEditor.errors.removeLine'),
         onUnauthorized: UNAUTHORIZED,
       });
       refresh();
-    }, t('invoiceEditor.errors.removeLine')),
-  [runScoped, invoice.id, refresh, t]);
+    }, stableT('invoiceEditor.errors.removeLine')),
+  [runScoped, invoice.id, refresh, stableT]);
 
   // undo → cancel the timer, unhide (nothing was ever sent).
   const undoLineDelete = useCallback((lineId: string) => {
@@ -550,11 +545,11 @@ export default function InvoiceEditor({ detail, onChanged, onPendingEditsChange,
       if (failed > 0 && failed < results.length) {
         showToast({
           type: 'warning',
-          message: t('invoiceEditor.undo.partialFlush', { applied: results.length - failed, failed }),
+          message: stableT('invoiceEditor.undo.partialFlush', { applied: results.length - failed, failed }),
         });
       }
     })();
-  }, [flushLineDelete, t]);
+  }, [flushLineDelete, stableT]);
   const flushAllRef = useRef(flushAllPendingDeletes);
   useEffect(() => { flushAllRef.current = flushAllPendingDeletes; }, [flushAllPendingDeletes]);
   useEffect(() => {
@@ -592,11 +587,62 @@ export default function InvoiceEditor({ detail, onChanged, onPendingEditsChange,
         successMessage: t('invoiceEditor.success.notesSaved'),
         onUnauthorized: UNAUTHORIZED,
       });
-      setNotesDirty(false);
+      markNotesSaved(notes);
       refresh();
     }, t('invoiceEditor.errors.saveNotes'));
     if (ok) flashNotesSaved();
-  }, [notesDirty, notes, invoice.id, refresh, runScoped, flashNotesSaved, t]);
+  }, [notesDirty, notes, invoice.id, refresh, runScoped, flashNotesSaved, markNotesSaved, t]);
+
+  // #8604: per-invoice time-entry itemization override (drafts only). Each
+  // change PATCHes just its own field; null = inherit the billing default.
+  const saveLineDetail = useCallback(async (
+    field: 'lineGrouping' | 'lineShowDate' | 'lineShowNote' | 'lineShowWorkedTime',
+    value: 'entry' | 'day' | boolean | null,
+  ) => {
+    await runScoped(`lineDetail-${field}`, async () => {
+      await runAction({
+        request: () => fetchWithAuth(`/invoices/${invoice.id}`, {
+          method: 'PATCH', body: JSON.stringify({ [field]: value }),
+        }),
+        errorFallback: t('invoiceEditor.errors.saveLineDetail'),
+        onUnauthorized: UNAUTHORIZED,
+      });
+      refresh();
+    }, t('invoiceEditor.errors.saveLineDetail'));
+  }, [invoice.id, refresh, runScoped, t]);
+
+  // #8606: re-read each time-entry line's source entry (note, date worked,
+  // worked minutes, approval). The server never changes amounts or a
+  // hand-edited description; the summary says what it did and did not touch.
+  const hasTimeLines = lines.some((l) => l.sourceType === 'time_entry');
+  const [refreshResult, setRefreshResult] = useState<TimeLineRefreshResult | null>(null);
+  const refreshSummary = refreshResult?.summary ?? null;
+  // Lines the operator must act on, named (not just counted): a line whose
+  // entry was billed on another invoice will fail Issue (SOURCE_ALREADY_BILLED),
+  // and a drifted line kept its old quantity.
+  const refreshNamed = useMemo(() => {
+    const titleOf = (id: string) => {
+      const l = lines.find((x) => x.id === id);
+      return l ? lineTitle(l) : id;
+    };
+    const outcomes = refreshResult?.lines ?? [];
+    const billedElsewhere = outcomes.filter((o) => o.status === 'skipped' && o.reason === 'billed_elsewhere').map((o) => titleOf(o.lineId));
+    const drifted = outcomes.filter((o) => o.status === 'quantityDrifted').map((o) => titleOf(o.lineId));
+    return { billedElsewhere, drifted, otherSkipped: (refreshSummary?.skipped ?? 0) - billedElsewhere.length };
+  }, [refreshResult, refreshSummary, lines]);
+  const refreshTimeLines = useCallback(async () => {
+    setRefreshResult(null);
+    await runScoped('refreshTimeLines', async () => {
+      const result = await runAction<TimeLineRefreshResult>({
+        request: () => fetchWithAuth(`/invoices/${invoice.id}/refresh-time-lines`, { method: 'POST' }),
+        errorFallback: t('invoiceEditor.refreshTimeLines.error'),
+        parseSuccess: (body) => (body as { data: TimeLineRefreshResult }).data,
+        onUnauthorized: UNAUTHORIZED,
+      });
+      setRefreshResult(result);
+      refresh();
+    }, t('invoiceEditor.refreshTimeLines.error'));
+  }, [invoice.id, refresh, runScoped, t]);
 
   const saveTerms = useCallback(async () => {
     if (!termsDirty) return;
@@ -609,11 +655,11 @@ export default function InvoiceEditor({ detail, onChanged, onPendingEditsChange,
         successMessage: t('invoiceEditor.success.termsSaved'),
         onUnauthorized: UNAUTHORIZED,
       });
-      setTermsDirty(false);
+      markTermsSaved(terms);
       refresh();
     }, t('invoiceEditor.errors.saveTerms'));
     if (ok) flashTermsSaved();
-  }, [termsDirty, terms, invoice.id, refresh, runScoped, flashTermsSaved, t]);
+  }, [termsDirty, terms, invoice.id, refresh, runScoped, flashTermsSaved, markTermsSaved, t]);
 
   // Tax rate is inherited from partner Billing settings, not set per invoice. When
   // a line is marked taxable but no rate is configured, the Tax row reads $0.00
@@ -887,9 +933,7 @@ export default function InvoiceEditor({ detail, onChanged, onPendingEditsChange,
             {invoice.billToName ? (
               <>
                 <p className="text-sm">
-                  <a href={`/organizations/${encodeURIComponent(invoice.orgId)}`} data-testid="org-record-link" className="hover:underline">
-                    {invoice.billToName}
-                  </a>
+                  <EntityLink kind="org" id={invoice.orgId} name={invoice.billToName} />
                 </p>
                 {/* Draft-only fallback (sweep paper cut #16): set by the API
                     ONLY alongside a fallen-back billToName — see invoiceTypes.
@@ -913,7 +957,7 @@ export default function InvoiceEditor({ detail, onChanged, onPendingEditsChange,
             </div>
             <textarea
               value={notes}
-              onChange={(e) => { setNotes(e.target.value); setNotesDirty(true); }}
+              onChange={(e) => editNotes(e.target.value)}
               // Gate ENTRY, not save (disabled, like the qty/price inputs) — a
               // readOnly field is still focusable, so if canWrite flipped false
               // mid-edit the onBlur guard would silently drop the typed note.
@@ -929,6 +973,91 @@ export default function InvoiceEditor({ detail, onChanged, onPendingEditsChange,
             />
           </div>
 
+          {invoice.status === 'draft' && (
+            <div className="rounded-lg border bg-card p-4 shadow-xs" data-testid="invoice-line-detail">
+              <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">{t('invoiceEditor.lineDetail.title')}</h3>
+              <p className="mt-1 text-xs text-muted-foreground">{t('invoiceEditor.lineDetail.help')}</p>
+              <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                {([
+                  ['lineShowDate', 'invoice-line-detail-show-date', 'showDate'],
+                  ['lineShowNote', 'invoice-line-detail-show-note', 'showNote'],
+                  ['lineShowWorkedTime', 'invoice-line-detail-show-worked-time', 'showWorkedTime'],
+                ] as const).map(([field, testId, labelKey]) => {
+                  const stored = invoice[field];
+                  const id = `${testId}-select`;
+                  return (
+                    <div key={field}>
+                      <label className="text-xs font-medium" htmlFor={id}>{t(/* i18n-dynamic */ `invoiceEditor.lineDetail.${labelKey}`)}</label>
+                      <select
+                        id={id}
+                        value={stored == null ? '' : stored ? 'show' : 'hide'}
+                        disabled={!canWrite || isPending(`lineDetail-${field}`)}
+                        onChange={(e) => void saveLineDetail(field, e.target.value === '' ? null : e.target.value === 'show')}
+                        data-testid={testId}
+                        className="mt-1 w-full rounded-md border bg-background px-2 py-1.5 text-sm disabled:opacity-60"
+                      >
+                        <option value="">{t('invoiceEditor.lineDetail.default')}</option>
+                        <option value="show">{t('invoiceEditor.lineDetail.show')}</option>
+                        <option value="hide">{t('invoiceEditor.lineDetail.hide')}</option>
+                      </select>
+                    </div>
+                  );
+                })}
+                <div>
+                  <label className="text-xs font-medium" htmlFor="invoice-line-detail-grouping-select">{t('invoiceEditor.lineDetail.grouping')}</label>
+                  <select
+                    id="invoice-line-detail-grouping-select"
+                    value={invoice.lineGrouping ?? ''}
+                    disabled={!canWrite || isPending('lineDetail-lineGrouping')}
+                    onChange={(e) => void saveLineDetail('lineGrouping', e.target.value === 'day' ? 'day' : e.target.value === 'entry' ? 'entry' : null)}
+                    data-testid="invoice-line-detail-grouping"
+                    className="mt-1 w-full rounded-md border bg-background px-2 py-1.5 text-sm disabled:opacity-60"
+                  >
+                    <option value="">{t('invoiceEditor.lineDetail.default')}</option>
+                    <option value="entry">{t('invoiceEditor.lineDetail.groupingEntry')}</option>
+                    <option value="day">{t('invoiceEditor.lineDetail.groupingDay')}</option>
+                  </select>
+                </div>
+              </div>
+              {canWrite && hasTimeLines && (
+                <div className="mt-4 border-t pt-3">
+                  <button
+                    type="button"
+                    onClick={() => void refreshTimeLines()}
+                    disabled={isPending('refreshTimeLines')}
+                    data-testid="invoice-refresh-time-lines"
+                    className="inline-flex h-8 items-center justify-center rounded-md border px-3 text-xs font-medium hover:bg-muted disabled:opacity-50"
+                  >
+                    {isPending('refreshTimeLines') ? t('invoiceEditor.refreshTimeLines.running') : t('invoiceEditor.refreshTimeLines.button')}
+                  </button>
+                  <p className="mt-1 text-xs text-muted-foreground">{t('invoiceEditor.refreshTimeLines.help')}</p>
+                  {refreshSummary && (
+                    <div role="status" className="mt-2 space-y-1 text-xs" data-testid="invoice-refresh-time-lines-summary">
+                      <p>{t('invoiceEditor.refreshTimeLines.summary', { refreshed: refreshSummary.refreshed, unchanged: refreshSummary.unchanged })}</p>
+                      {refreshNamed.billedElsewhere.length > 0 && (
+                        <div className="text-destructive" data-testid="invoice-refresh-time-lines-billed-elsewhere">
+                          <p>{t('invoiceEditor.refreshTimeLines.billedElsewhere', { count: refreshNamed.billedElsewhere.length })}</p>
+                          <ul className="ml-4 list-disc">{refreshNamed.billedElsewhere.map((title, i) => <li key={i}>{title}</li>)}</ul>
+                        </div>
+                      )}
+                      {refreshSummary.quantityDrifted > 0 && (
+                        <div className="text-[hsl(36_92%_28%)] dark:text-warning" data-testid="invoice-refresh-time-lines-drifted">
+                          <p>{t('invoiceEditor.refreshTimeLines.drifted', { count: refreshSummary.quantityDrifted })}</p>
+                          <ul className="ml-4 list-disc">{refreshNamed.drifted.map((title, i) => <li key={i}>{title}</li>)}</ul>
+                        </div>
+                      )}
+                      {refreshNamed.otherSkipped > 0 && (
+                        <p className="text-muted-foreground" data-testid="invoice-refresh-time-lines-skipped">
+                          {t('invoiceEditor.refreshTimeLines.skipped', { count: refreshNamed.otherSkipped })}
+                        </p>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+
           <div className="rounded-lg border bg-card p-4 shadow-xs">
             <div className="mb-2 flex items-center justify-between gap-2">
               <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">{t('invoiceEditor.terms.title')}</h3>
@@ -936,7 +1065,7 @@ export default function InvoiceEditor({ detail, onChanged, onPendingEditsChange,
             </div>
             <textarea
               value={terms}
-              onChange={(e) => { setTerms(e.target.value); setTermsDirty(true); }}
+              onChange={(e) => editTerms(e.target.value)}
               onBlur={() => { if (canWrite) void saveTerms(); }}
               disabled={!canWrite || isPending('terms')}
               data-testid="invoice-terms"

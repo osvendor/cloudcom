@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { isKnownWindowsZone } from '@breeze/shared';
 import { DEVICES_SORT_KEYS } from './cursor';
 import { discoveredAssetTypeEnum } from '../../db/schema/discovery';
 import { MAINTENANCE_MAX_BULK_DEVICES, MAINTENANCE_MAX_DURATION_HOURS } from '../../services/maintenanceStepUpLimits';
@@ -58,6 +59,8 @@ export const listDevicesSchema = z.object({
    *  count it received on page 1. Default off because the count(*) is the
    *  most expensive part of the query at scale. */
   includeTotal: boolStr,
+  /** Opt in to the warranty projection/join for the list column. */
+  includeWarranty: boolStr,
 
   // Single-value filters (compat).
   orgId: z.string().guid().optional(),
@@ -72,6 +75,7 @@ export const listDevicesSchema = z.object({
 
   status: z.enum(['online', 'offline', 'maintenance', 'decommissioned', 'updating', 'pending']).optional(),
   includeDecommissioned: boolStr,
+  isolated: boolStr,
   osType: z.enum(['windows', 'macos', 'linux']).optional(),
   role: z.enum(DEVICE_ROLES).optional(),
   search: z.string().optional()
@@ -216,6 +220,14 @@ export const updateDeviceSchema = z.object({
   deviceRole: z.enum(DEVICE_ROLES).optional(),
   // Hardware Lifecycle report — see createManualAssetSchema.purchaseDate.
   purchaseDate: purchaseDateSchema,
+  // Site-move hardening (topology site location W1, spec S§12). Guard fields, never written:
+  // `expectedSiteId` is the site the caller believes the device is in (409 if it is not);
+  // `siteMoveTrigger` labels the `device.site_move` audit; it is a client-asserted hint, not verified
+  // (W3 derives suggestion evidence server-side). Client-supplied evidence is never accepted:
+  // an `evidence` key is a 400 (z.never), not silently stripped, so a client cannot believe it was recorded.
+  expectedSiteId: z.string().guid().optional(),
+  siteMoveTrigger: z.enum(['manual', 'topology_suggestion']).optional(),
+  evidence: z.never().optional(),
 });
 
 // POST /devices/provision — admin pre-creates a device row + downloadable
@@ -228,6 +240,23 @@ export const updateDeviceSchema = z.object({
 // bulk-remove over a whole fleet (#3986 task 7 — see task-7-brief.md).
 export const decommissionDeviceSchema = z.object({
   uninstallAgent: z.boolean().optional().default(false),
+}).strict();
+
+// DELETE /devices/:id/permanent — optional body (#11153). Without it the purge
+// refuses a device whose agent never confirmed it was uninstalled
+// (409 UNINSTALL_NOT_CONFIRMED). `force: true` is the operator's explicit
+// "delete anyway"; a strict boolean, so `"true"` or a stray key is a 400 rather
+// than a delete the client did not quite ask for.
+export const permanentDeleteDeviceSchema = z.object({
+  force: z.boolean().optional().default(false),
+}).strict();
+
+// POST /devices/:id/remote-access-launch (#10922). `providerId` picks one of
+// the tenant's configured tools; omitted means "the default". Strict, so a
+// misspelled field is a 400 rather than a silent launch of the default tool.
+// The 100-char cap matches the partner-settings provider id limit (orgs.ts).
+export const remoteAccessLaunchSchema = z.object({
+  providerId: z.string().min(1).max(100).optional(),
 }).strict();
 
 export const provisionDeviceSchema = z.object({
@@ -277,13 +306,57 @@ export const processSamplesQuerySchema = z.object({
   message: 'Provide either ?at=<ts> or both ?from and ?to'
 });
 
-export const createCommandSchema = z.object({
-  // 'wake' is the user-facing wake action. Internally it dispatches via the
-  // wakeOnLan service and writes a deviceCommands row of type 'wake_on_lan'
-  // addressed to a relay agent. See apps/api/src/services/wakeOnLan.ts.
-  type: z.enum(['script', 'reboot', 'reboot_safe_mode', 'shutdown', 'update', 'collect_evidence', 'execute_containment', 'wake', 'refresh_inventory']),
-  payload: z.any().optional()
-});
+const timeTimezonePayloadSchema = z
+  .object({
+    windowsId: z
+      .string()
+      .refine(isKnownWindowsZone, 'Unknown Windows timezone'),
+  })
+  .strict();
+const emptyTimePayloadSchema = z.object({}).strict();
+export const createCommandSchema = z
+  .object({
+    // 'wake' is the user-facing wake action. Internally it dispatches via the
+    // wakeOnLan service and writes a deviceCommands row of type 'wake_on_lan'
+    // addressed to a relay agent. See apps/api/src/services/wakeOnLan.ts.
+    type: z.enum([
+      'script',
+      'reboot',
+      'reboot_safe_mode',
+      'shutdown',
+      'update',
+      'collect_evidence',
+      'execute_containment',
+      'wake',
+      'refresh_inventory',
+      'time_resync',
+      'time_set_timezone',
+      'time_apply_policy',
+    ]),
+    payload: z.any().optional(),
+  })
+  .superRefine((value, ctx) => {
+    // Time management commands (#7452 W03a, index §F.4) carry a fixed payload
+    // contract; every other type keeps its existing free-form payload.
+    const schema =
+      value.type === 'time_set_timezone'
+        ? timeTimezonePayloadSchema
+        : value.type === 'time_resync' || value.type === 'time_apply_policy'
+          ? emptyTimePayloadSchema
+          : null;
+    if (!schema) return;
+    const parsed = schema.safeParse(
+      value.payload === undefined ? {} : value.payload,
+    );
+    if (!parsed.success)
+      for (const issue of parsed.error.issues) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['payload', ...issue.path],
+          message: issue.message,
+        });
+      }
+  });
 
 /**
  * Per-request cap on bulk command operations. 500 keeps the worst-case
@@ -400,3 +473,27 @@ export const BULK_LIFECYCLE_MAX_DEVICES = 500;
 export const bulkDeviceIdsSchema = z.object({
   deviceIds: z.array(z.string().guid()).min(1).max(BULK_LIFECYCLE_MAX_DEVICES),
 });
+
+/**
+ * Per-request cap on POST /devices/bulk/site (#9796, plan Gate B item 2: 100, the 50-per-batch
+ * bulk-restore precedent doubled). Each device is a row lock + guarded UPDATE + denormalized
+ * rewrite in its own short transaction, so the request stays well inside a normal timeout.
+ * The web mirrors this constant (apps/web/src/components/devices/bulkActionGating.ts) and disables — never
+ * chunks — a larger selection.
+ */
+export const BULK_SITE_MOVE_CAP = 100;
+
+/** Lower-cased so a duplicate that differs only in case is caught, and `toSiteId === device.siteId` holds. */
+const lowerCaseGuid = z.string().guid().transform((value) => value.toLowerCase());
+
+/**
+ * `POST /devices/bulk/site` body. `expectedSiteId` is REQUIRED and non-null: `devices.site_id` is
+ * NOT NULL and the list row always knows its site, so every move carries the stale-view guard.
+ * Duplicate ids are rejected by the route (whole batch, Gate B item 3), not deduplicated here.
+ */
+export const bulkSiteMoveSchema = z.object({
+  siteId: lowerCaseGuid,
+  devices: z.array(z.object({ id: lowerCaseGuid, expectedSiteId: lowerCaseGuid }).strict())
+    .min(1)
+    .max(BULK_SITE_MOVE_CAP),
+}).strict();

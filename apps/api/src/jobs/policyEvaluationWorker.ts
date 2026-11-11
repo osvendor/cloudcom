@@ -4,13 +4,16 @@
  * Schedules and runs policy evaluations based on checkIntervalMinutes.
  */
 
-import { Job, Queue, Worker } from 'bullmq';
+import { DelayedError, Job, Queue, Worker } from 'bullmq';
 import { and, eq } from 'drizzle-orm';
 import * as dbModule from '../db';
 import { automationPolicies } from '../db/schema';
 import { getBullMQConnection } from '../services/redis';
+import { canRunBackgroundWork } from '../services/capacityGuard';
 import { attachWorkerObservability } from './workerObservability';
 import { evaluatePolicy, scanAndEvaluateConfigPolicyCompliance } from '../services/policyEvaluationService';
+import type { ComplianceAlertReconcileResult } from '../services/complianceAlertReconcile';
+import type { ComplianceAlertReconcileScope } from '../services/complianceAlertReconcileTrigger';
 
 const { db } = dbModule;
 const runWithSystemDbAccess = async <T>(fn: () => Promise<T>): Promise<T> => {
@@ -30,6 +33,8 @@ let _configPolicyTableWarningLogged = false;
 
 const POLICY_EVALUATION_QUEUE = 'policy-evaluation';
 const SCAN_INTERVAL_MS = 60 * 1000;
+/** The periodic compliance-alert reconcile: the safety net behind the config-write hooks. */
+const RECONCILE_INTERVAL_MS = 15 * 60 * 1000;
 
 type ScanDuePoliciesJob = {
   type: 'scan-due-policies';
@@ -44,7 +49,23 @@ type ScanConfigPolicyComplianceJob = {
   type: 'scan-config-policy-compliance';
 };
 
-type PolicyEvaluationJobData = ScanDuePoliciesJob | EvaluatePolicyJob | ScanConfigPolicyComplianceJob;
+/**
+ * Closes compliance alerts whose rule no longer applies. With a scope it is the
+ * follow-up of a config write (complianceAlertReconcileTrigger.ts); without one
+ * it is the periodic sweep over every open compliance alert.
+ */
+type ReconcileComplianceAlertsJob = {
+  type: 'reconcile-compliance-alerts';
+  configPolicyId?: string;
+  orgId?: string;
+  partnerId?: string;
+};
+
+type PolicyEvaluationJobData =
+  | ScanDuePoliciesJob
+  | EvaluatePolicyJob
+  | ScanConfigPolicyComplianceJob
+  | ReconcileComplianceAlertsJob;
 
 let policyEvaluationQueue: Queue<PolicyEvaluationJobData> | null = null;
 let policyEvaluationWorker: Worker<PolicyEvaluationJobData> | null = null;
@@ -73,10 +94,11 @@ export function getPolicyEvaluationQueue(): Queue<PolicyEvaluationJobData> {
 
 async function processScanDuePolicies(): Promise<{ queued: number }> {
   const nowMs = Date.now();
-  const policies = await db
+  // Release the database transaction before waiting on Redis below.
+  const policies = await runWithSystemDbAccess(() => db
     .select()
     .from(automationPolicies)
-    .where(eq(automationPolicies.enabled, true));
+    .where(eq(automationPolicies.enabled, true)));
 
   const duePolicies = policies.filter((policy) => isPolicyDue(policy, nowMs));
 
@@ -104,11 +126,45 @@ async function processScanDuePolicies(): Promise<{ queued: number }> {
   return { queued: duePolicies.length };
 }
 
-async function processEvaluatePolicy(policyId: string): Promise<{
+/**
+ * #7347 — runs an evaluation in its own system transaction, then — only once
+ * that transaction has committed — enqueues the remediation runs it created
+ * (`afterCommit`, which never rejects). Each run row is INSERTed in the
+ * transaction and the execute-run worker reads it on its own connection:
+ * enqueued inside, a fast worker finds no run and throws `Automation run not
+ * found`, and a rollback leaves a job for a run that never existed. A
+ * transaction that throws — including a failed commit — propagates before
+ * anything is enqueued. The worker calls these with no ambient context, so
+ * this transaction is the outermost one and really commits when it returns.
+ *
+ * The config-compliance scan also publishes its policy.* events from
+ * `afterCommit`. The policy-alert-bridge reads the committed compliance row on
+ * its own connection, so an event published inside the transaction made the
+ * first failing check raise nothing.
+ */
+async function commitThenEnqueue<R extends object>(
+  evaluate: () => Promise<R & { afterCommit?: () => Promise<void> }>,
+): Promise<R> {
+  const { afterCommit, ...result } = await runWithSystemDbAccess(evaluate);
+  if (afterCommit) await afterCommit();
+  return result as unknown as R;
+}
+
+function processEvaluatePolicy(policyId: string): Promise<{
   policyId: string;
   devicesEvaluated: number;
   compliant: number;
   nonCompliant: number;
+}> {
+  return commitThenEnqueue(() => admitEvaluatePolicy(policyId));
+}
+
+async function admitEvaluatePolicy(policyId: string): Promise<{
+  policyId: string;
+  devicesEvaluated: number;
+  compliant: number;
+  nonCompliant: number;
+  afterCommit?: () => Promise<void>;
 }> {
   const [policy] = await db
     .select()
@@ -133,6 +189,7 @@ async function processEvaluatePolicy(policyId: string): Promise<{
   const result = await evaluatePolicy(policy, {
     source: 'policy-evaluation-worker',
     requestRemediation: true,
+    deferEnqueue: true,
   });
 
   return {
@@ -140,50 +197,172 @@ async function processEvaluatePolicy(policyId: string): Promise<{
     devicesEvaluated: result.devicesEvaluated,
     compliant: result.summary.compliant,
     nonCompliant: result.summary.non_compliant,
+    ...(result.afterCommit ? { afterCommit: result.afterCommit } : {}),
   };
 }
 
 async function processConfigPolicyComplianceScan(): Promise<{
   rulesScanned: number;
   devicesEvaluated: number;
+  devicesFailed: number;
+  ruleSetsFailed: number;
 }> {
   try {
-    const result = await scanAndEvaluateConfigPolicyCompliance();
-    return {
-      rulesScanned: result.rulesScanned,
-      devicesEvaluated: result.devicesEvaluated,
-    };
+    return await commitThenEnqueue(async () => {
+      const result = await scanAndEvaluateConfigPolicyCompliance({ deferEnqueue: true });
+      return {
+        rulesScanned: result.rulesScanned,
+        devicesEvaluated: result.devicesEvaluated,
+        devicesFailed: result.devicesFailed,
+        ruleSetsFailed: result.ruleSetsFailed,
+        ...(result.afterCommit ? { afterCommit: result.afterCommit } : {}),
+      };
+    });
   } catch (error: unknown) {
     if (isRelationNotFoundError(error)) {
       if (!_configPolicyTableWarningLogged) {
         _configPolicyTableWarningLogged = true;
         console.warn('[PolicyEvaluationWorker] Config policy tables not found — run "pnpm db:migrate" to create them. Skipping compliance scan.');
       }
-      return { rulesScanned: 0, devicesEvaluated: 0 };
+      return { rulesScanned: 0, devicesEvaluated: 0, devicesFailed: 0, ruleSetsFailed: 0 };
     }
     throw error;
   }
 }
 
+function reconcileScopeOf(data: ReconcileComplianceAlertsJob): ComplianceAlertReconcileScope | undefined {
+  if (data.configPolicyId) return { configPolicyId: data.configPolicyId };
+  if (data.orgId) return { orgId: data.orgId };
+  if (data.partnerId) return { partnerId: data.partnerId };
+  return undefined;
+}
+
+/**
+ * Where the periodic sweep resumes. It checks at most a bounded number of
+ * devices per run and carries on from here on the next one; a scoped run
+ * always starts from the beginning of its scope.
+ */
+let sweepCursor: string | null = null;
+
+/**
+ * The reconcile opens its own system transaction per batch, so it runs with no
+ * ambient context (see the #7347 note in the processor below).
+ */
+async function processReconcileComplianceAlerts(data: ReconcileComplianceAlertsJob): Promise<ComplianceAlertReconcileResult> {
+  // Loaded on first use, like the automation worker below: it pulls in the
+  // alert service and both alert bridges, which the evaluation jobs never need.
+  const { reconcileComplianceAlerts } = await import('../services/complianceAlertReconcile');
+  const scope = reconcileScopeOf(data);
+  if (scope) return reconcileComplianceAlerts(scope);
+  const result = await reconcileComplianceAlerts(undefined, { afterDeviceId: sweepCursor });
+  sweepCursor = result.nextDeviceCursor;
+  return result;
+}
+
+/**
+ * Queues a scoped reconcile. Requests for one scope coalesce while one is
+ * waiting; one that arrives while it runs is kept and runs after it, so a
+ * change committed mid-run is never missed (`keepLastIfActive`).
+ */
+export async function enqueueComplianceAlertReconcile(scope: ComplianceAlertReconcileScope): Promise<void> {
+  const key = 'configPolicyId' in scope
+    ? `policy-${scope.configPolicyId}`
+    : 'orgId' in scope ? `org-${scope.orgId}` : `partner-${scope.partnerId}`;
+  await getPolicyEvaluationQueue().add(
+    'reconcile-compliance-alerts',
+    { type: 'reconcile-compliance-alerts', ...scope },
+    {
+      deduplication: { id: `compliance-alert-reconcile-${key}`, keepLastIfActive: true },
+      removeOnComplete: true,
+      removeOnFail: { count: 50 },
+    },
+  );
+}
+
+/** Test-only: the `reconcile-compliance-alerts` job body, driven against real Postgres. */
+export const __processReconcileComplianceAlerts = processReconcileComplianceAlerts;
+
+/** Test-only: the `scan-config-policy-compliance` job body, driven against real Postgres. */
+export const __processConfigPolicyComplianceScan = processConfigPolicyComplianceScan;
+/** Test-only: the `evaluate-policy` job body, driven against real Postgres. */
+export const __processEvaluatePolicy = processEvaluatePolicy;
+
+// Fixed job-type keys only. Aggregate once a minute, rather than logging each
+// device or retry; elapsed time is wall time, not CPU or database execution time.
+const policyWorkload = new Map<PolicyEvaluationJobData['type'], {
+  completed: number; failed: number; deferred: number;
+  elapsedMs: number; maxElapsedMs: number; devicesEvaluated: number;
+}>();
+let policyWorkloadLastLogAt = Date.now();
+function recordPolicyWorkload(
+  type: PolicyEvaluationJobData['type'], outcome: 'completed' | 'failed' | 'deferred',
+  elapsedMs: number, devicesEvaluated = 0,
+): void {
+  const counters = policyWorkload.get(type) ?? {
+    completed: 0, failed: 0, deferred: 0, elapsedMs: 0, maxElapsedMs: 0, devicesEvaluated: 0,
+  };
+  counters[outcome] += 1;
+  counters.elapsedMs += elapsedMs;
+  counters.maxElapsedMs = Math.max(counters.maxElapsedMs, elapsedMs);
+  counters.devicesEvaluated += devicesEvaluated;
+  policyWorkload.set(type, counters);
+  const now = Date.now();
+  if (now - policyWorkloadLastLogAt < 60_000) return;
+  try {
+    console.info('[PolicyEvaluationWorker] Workload', {
+      windowMs: now - policyWorkloadLastLogAt, jobs: Object.fromEntries(policyWorkload),
+    });
+  } catch { /* Diagnostic logging must not change a committed job's outcome. */ }
+  policyWorkload.clear();
+  policyWorkloadLastLogAt = now;
+}
+
+async function processPolicyEvaluationJob(job: Job<PolicyEvaluationJobData>): Promise<object> {
+  const { data } = job;
+  if (data.type === 'scan-due-policies') return processScanDuePolicies();
+  // Both evaluations own their transaction and publish only after commit.
+  if (data.type === 'scan-config-policy-compliance') return processConfigPolicyComplianceScan();
+  if (data.type === 'reconcile-compliance-alerts') return processReconcileComplianceAlerts(data);
+  return processEvaluatePolicy(data.policyId);
+}
+
 export function createPolicyEvaluationWorker(): Worker<PolicyEvaluationJobData> {
   return new Worker<PolicyEvaluationJobData>(
     POLICY_EVALUATION_QUEUE,
-    async (job: Job<PolicyEvaluationJobData>) => {
-      return runWithSystemDbAccess(async () => {
-        if (job.data.type === 'scan-due-policies') {
-          return processScanDuePolicies();
+    async (job: Job<PolicyEvaluationJobData>, token?: string) => {
+      const startedAt = performance.now();
+      let outcome: 'completed' | 'failed' | 'deferred' = 'failed';
+      let devicesEvaluated = 0;
+      try {
+        // Admission happens before any DB context. An already-started evaluation
+        // commits and publishes afterCommit work even if pressure later changes.
+        if (!canRunBackgroundWork()) {
+          // A recurring scan has its next scheduled tick already. Retaining each
+          // missed tick would build a catch-up storm; explicit work is retained.
+          if (job.opts?.repeat && (job.data.type === 'scan-due-policies'
+            || job.data.type === 'scan-config-policy-compliance'
+            || (job.data.type === 'reconcile-compliance-alerts' && !reconcileScopeOf(job.data)))) {
+            outcome = 'deferred';
+            return { deferredForCapacity: true };
+          }
+          if (!token) throw new Error('Policy capacity deferral requires a worker lock token');
+          await job.moveToDelayed(Date.now() + 60_000, token);
+          outcome = 'deferred';
+          throw new DelayedError();
         }
-
-        if (job.data.type === 'scan-config-policy-compliance') {
-          return processConfigPolicyComplianceScan();
+        const result = await processPolicyEvaluationJob(job);
+        if ('devicesEvaluated' in result && typeof result.devicesEvaluated === 'number') {
+          devicesEvaluated = result.devicesEvaluated;
         }
-
-        return processEvaluatePolicy(job.data.policyId);
-      });
+        outcome = 'completed';
+        return result;
+      } finally {
+        recordPolicyWorkload(job.data.type, outcome, Math.round(performance.now() - startedAt), devicesEvaluated);
+      }
     },
     {
       connection: getBullMQConnection(),
-      concurrency: 3,
+      concurrency: 1,
       lockDuration: 300_000,
       stalledInterval: 60_000,
       maxStalledCount: 2,
@@ -231,7 +410,20 @@ export async function initializePolicyEvaluationWorker(): Promise<void> {
     }
   );
 
-  console.log('[PolicyEvaluationWorker] Scheduled policy evaluation scan jobs (standalone + config policy)');
+  // Safety net for compliance alerts whose rule stopped applying through a path
+  // with no hook (a device moved, a group deleted, a policy retired, a hook's
+  // enqueue lost): the config-write hooks only cover the common paths.
+  await queue.add(
+    'reconcile-compliance-alerts',
+    { type: 'reconcile-compliance-alerts' },
+    {
+      repeat: { every: RECONCILE_INTERVAL_MS },
+      removeOnComplete: { count: 10 },
+      removeOnFail: { count: 50 },
+    }
+  );
+
+  console.log('[PolicyEvaluationWorker] Scheduled policy evaluation scan jobs (standalone + config policy) and the compliance-alert reconcile');
 }
 
 export async function shutdownPolicyEvaluationWorker(): Promise<void> {

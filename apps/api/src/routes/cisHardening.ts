@@ -11,16 +11,26 @@ import {
   cisRemediationActions,
   devices,
   organizations,
+  users,
 } from '../db/schema';
 import { scheduleCisRemediation, scheduleCisRemediationWithResult, scheduleCisScan } from '../jobs/cisJobs';
 import { captureException } from '../services/sentry';
-import { authMiddleware, requirePermission, requireScope, type AuthContext } from '../middleware/auth';
-import { canAccessSite, type UserPermissions } from '../services/permissions';
+import { authMiddleware, requireMfa, requirePermission, requireScope, type AuthContext } from '../middleware/auth';
+import { canAccessSite, PERMISSIONS, type UserPermissions } from '../services/permissions';
+import {
+  captureCisBaselineAuthority,
+  describeCisScheduleApproval,
+  EMPTY_CIS_BASELINE_AUTHORITY,
+  isCisBaselineScheduled,
+  withoutCisBaselineAuthority,
+} from '../services/cisBaselineScheduleAuthority';
 import { extractFailedCheckIds, normalizeCisSchedule } from '../services/cisHardening';
+import { averageCisScore } from '../services/cisScore';
 import { writeRouteAudit } from '../services/auditEvents';
 import { canManagePartnerWidePolicies, PARTNER_WIDE_WRITE_DENIED_MESSAGE } from '../services/partnerWideAccess';
 import { resolveOrgId } from './networkShared';
 
+import { notParkedDeviceCondition } from '../services/unassignedPool/selectorPredicate';
 export const cisHardeningRoutes = new Hono();
 
 const osTypeSchema = z.enum(['windows', 'macos', 'linux']);
@@ -131,6 +141,9 @@ async function resolveAuthorizedCisScanDeviceIds(
   permissions: UserPermissions | undefined,
   baseline: typeof cisBaselines.$inferSelect,
   requestedDeviceIds: string[] | undefined,
+  // When the caller selected one org, a partner-wide baseline scans only that
+  // org's devices (#9606). Absent → every org the caller can access.
+  requestedOrgId?: string,
 ): Promise<
   | { deviceIds: string[] }
   | { error: string; status: 400 | 403; deniedDeviceIds?: string[] }
@@ -156,13 +169,14 @@ async function resolveAuthorizedCisScanDeviceIds(
     ...(deviceOrgAccess ? [deviceOrgAccess] : []),
     eq(devices.osType, baseline.osType),
   ];
+  if (requestedOrgId) conditions.push(eq(devices.orgId, requestedOrgId));
 
   if (hasExplicitDeviceIds) {
     conditions.push(inArray(devices.id, requestedDeviceIds));
   } else {
     // Mirror selectCisScanTargetDevices: server-resolved fan-out must never
     // include Quick Support machines or devices that have been decommissioned.
-    conditions.push(eq(devices.isEphemeral, false), ne(devices.status, 'decommissioned'));
+    conditions.push(eq(devices.isEphemeral, false), notParkedDeviceCondition(), ne(devices.status, 'decommissioned'));
   }
 
   const rows = await db
@@ -209,11 +223,26 @@ async function resolveAuthorizedCisScanDeviceIds(
 
 function mapBaselineRow(row: typeof cisBaselines.$inferSelect) {
   return {
-    ...row,
+    ...withoutCisBaselineAuthority(row),
+    // 'reapproval_required' = the schedule is on but carries no valid stored
+    // authority, so the scheduler skips it until a user with devices:execute
+    // (and MFA) saves the baseline again.
+    scheduleApproval: describeCisScheduleApproval(row),
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
   };
 }
+
+/**
+ * The CIS write surface (baseline save — which arms a recurring scan — plus
+ * remediation request and approval, which queue hardening commands on
+ * endpoints) is a device-execution action: devices:execute with MFA, the same
+ * bar as script runs and software deployment.
+ */
+const requireCisExecute = requirePermission(PERMISSIONS.DEVICES_EXECUTE.resource, PERMISSIONS.DEVICES_EXECUTE.action);
+
+const CIS_SCHEDULE_AUTHORITY_DENIED =
+  'You cannot approve a recurring CIS scan for this owner. A scheduled baseline must be saved by a user who can run commands on every device it targets.';
 
 function mapResultRow(row: typeof cisBaselineResults.$inferSelect) {
   return {
@@ -327,8 +356,32 @@ cisHardeningRoutes.get(
       .limit(limit)
       .offset(offset);
 
+    const data = rows.map(mapBaselineRow);
+    // Name the approver of every schedule that stopped because that user no
+    // longer qualifies, so the UI can say who to replace. Best-effort: a user
+    // this caller cannot see simply has no name.
+    const stoppedApproverIds = [...new Set(data
+      .filter((row) => row.scheduleApproval.reason === 'approver_invalid' && row.scheduleApproval.approvedBy)
+      .map((row) => row.scheduleApproval.approvedBy!))];
+    const approverNames = new Map<string, string>();
+    if (stoppedApproverIds.length > 0) {
+      const named = await db
+        .select({ id: users.id, name: users.name })
+        .from(users)
+        .where(inArray(users.id, stoppedApproverIds));
+      for (const user of named) approverNames.set(user.id, user.name);
+    }
+
     return c.json({
-      data: rows.map(mapBaselineRow),
+      data: data.map((row) => (row.scheduleApproval.reason === 'approver_invalid'
+        ? {
+            ...row,
+            scheduleApproval: {
+              ...row.scheduleApproval,
+              approverName: approverNames.get(row.scheduleApproval.approvedBy ?? '') ?? null,
+            },
+          }
+        : row)),
       pagination: {
         limit,
         offset,
@@ -341,7 +394,8 @@ cisHardeningRoutes.get(
 cisHardeningRoutes.post(
   '/baselines',
   requireScope('organization', 'partner', 'system'),
-  requirePermission('orgs', 'write'),
+  requireCisExecute,
+  requireMfa(),
   zValidator('json', upsertBaselineSchema),
   async (c) => {
     const auth = c.get('auth');
@@ -380,9 +434,25 @@ cisHardeningRoutes.post(
         }
       }
 
+      const nextSchedule = normalizeCisSchedule(body.scanSchedule);
+      const nextIsActive = body.isActive ?? existing.isActive;
+      // Every save of a scheduled baseline re-arms its stored authority to the
+      // saving user (fresh generation); turning the schedule off clears it.
+      let authority: ReturnType<typeof captureCisBaselineAuthority> | typeof EMPTY_CIS_BASELINE_AUTHORITY =
+        EMPTY_CIS_BASELINE_AUTHORITY;
+      if (isCisBaselineScheduled({ isActive: nextIsActive, scanSchedule: nextSchedule })) {
+        const captured = captureCisBaselineAuthority(auth, { orgId: existing.orgId, partnerId: existing.partnerId });
+        if (!captured) return c.json({ error: CIS_SCHEDULE_AUTHORITY_DENIED }, 403);
+        authority = captured;
+      }
+
       const [updated] = await db
         .update(cisBaselines)
         .set({
+          ...authority,
+          // A save is an explicit (re-)approval: the row leaves the legacy
+          // grandfathering path permanently.
+          executionAuthorityLegacy: null,
           // Ownership is immutable: no orgId/partnerId in the SET. Moving a
           // baseline between owners would silently re-tenant every historical
           // result that references it.
@@ -391,8 +461,8 @@ cisHardeningRoutes.post(
           benchmarkVersion: body.benchmarkVersion,
           level: body.level,
           customExclusions: body.customExclusions ?? [],
-          scanSchedule: normalizeCisSchedule(body.scanSchedule),
-          isActive: body.isActive ?? existing.isActive,
+          scanSchedule: nextSchedule,
+          isActive: nextIsActive,
           updatedAt: new Date(),
         })
         .where(eq(cisBaselines.id, existing.id))
@@ -442,9 +512,21 @@ cisHardeningRoutes.post(
       owner = { orgId: orgResult.orgId, partnerId: null };
     }
 
+    const createdSchedule = normalizeCisSchedule(body.scanSchedule);
+    const createdIsActive = body.isActive ?? true;
+    let createdAuthority: ReturnType<typeof captureCisBaselineAuthority> | typeof EMPTY_CIS_BASELINE_AUTHORITY =
+      EMPTY_CIS_BASELINE_AUTHORITY;
+    if (isCisBaselineScheduled({ isActive: createdIsActive, scanSchedule: createdSchedule })) {
+      const captured = captureCisBaselineAuthority(auth, owner);
+      if (!captured) return c.json({ error: CIS_SCHEDULE_AUTHORITY_DENIED }, 403);
+      createdAuthority = captured;
+    }
+
     const [created] = await db
       .insert(cisBaselines)
       .values({
+        ...createdAuthority,
+        executionAuthorityLegacy: null,
         orgId: owner.orgId,
         partnerId: owner.partnerId,
         name: body.name,
@@ -452,8 +534,8 @@ cisHardeningRoutes.post(
         benchmarkVersion: body.benchmarkVersion,
         level: body.level,
         customExclusions: body.customExclusions ?? [],
-        scanSchedule: normalizeCisSchedule(body.scanSchedule),
-        isActive: body.isActive ?? true,
+        scanSchedule: createdSchedule,
+        isActive: createdIsActive,
         createdBy: auth.user.id,
         updatedAt: new Date(),
       })
@@ -515,6 +597,7 @@ cisHardeningRoutes.post(
       permissions,
       baseline,
       body.deviceIds,
+      body.orgId,
     );
     if ('error' in resolved) {
       return c.json({
@@ -540,6 +623,7 @@ cisHardeningRoutes.post(
         jobId,
         deviceCount: resolvedDeviceIds.length,
         requestedDeviceCount: body.deviceIds?.length ?? null,
+        requestedOrgId: body.orgId ?? null,
       },
     });
 
@@ -629,6 +713,7 @@ cisHardeningRoutes.get(
         baselineCreatedAt: sql<Date>`${cisBaselines.createdAt}`.as('baseline_created_at'),
         baselineUpdatedAt: cisBaselines.updatedAt,
         deviceHostname: devices.hostname,
+        deviceDisplayName: devices.displayName,
         deviceStatus: devices.status,
         deviceOsType: sql<string>`${devices.osType}`.as('device_os_type'),
         rn: sql<number>`row_number() over (partition by ${cisBaselineResults.deviceId}, ${cisBaselineResults.baselineId} order by ${cisBaselineResults.checkedAt} desc)`.as('rn'),
@@ -653,11 +738,17 @@ cisHardeningRoutes.get(
     const [summaryRow] = await db
       .select({
         total: sql<number>`count(*)`,
-        averageScore: sql<number>`coalesce(round(avg(${rankedResults.score})), 100)`,
         failingDevices: sql<number>`coalesce(sum(case when ${rankedResults.failedChecks} > 0 then 1 else 0 end), 0)`,
       })
       .from(rankedResults)
       .where(and(...latestConditions));
+
+    // Shared with the posture report (#9606): average the latest per-device scores.
+    const scoreRows = await db
+      .select({ score: rankedResults.score })
+      .from(rankedResults)
+      .where(and(...latestConditions));
+    const averageScore = averageCisScore(scoreRows.map((r) => r.score)) ?? 100;
 
     const rows = await db
       .select({
@@ -683,6 +774,7 @@ cisHardeningRoutes.get(
         baselineCreatedAt: rankedResults.baselineCreatedAt,
         baselineUpdatedAt: rankedResults.baselineUpdatedAt,
         deviceHostname: rankedResults.deviceHostname,
+        deviceDisplayName: rankedResults.deviceDisplayName,
         deviceStatus: rankedResults.deviceStatus,
         deviceOsType: rankedResults.deviceOsType,
       })
@@ -693,7 +785,6 @@ cisHardeningRoutes.get(
       .offset(offset);
 
     const total = Number(summaryRow?.total ?? 0);
-    const averageScore = Number(summaryRow?.averageScore ?? 100);
     const failingDevices = Number(summaryRow?.failingDevices ?? 0);
 
     const toISO = (v: unknown): string =>
@@ -731,6 +822,7 @@ cisHardeningRoutes.get(
         device: {
           id: row.deviceId,
           hostname: row.deviceHostname,
+          displayName: row.deviceDisplayName ?? null,
           osType: row.deviceOsType,
           status: row.deviceStatus,
         },
@@ -802,7 +894,8 @@ cisHardeningRoutes.get(
 cisHardeningRoutes.post(
   '/remediate',
   requireScope('organization', 'partner', 'system'),
-  requirePermission('orgs', 'write'),
+  requireCisExecute,
+  requireMfa(),
   zValidator('json', remediateSchema),
   async (c) => {
     const auth = c.get('auth');
@@ -966,7 +1059,8 @@ cisHardeningRoutes.post(
 cisHardeningRoutes.post(
   '/remediate/approve',
   requireScope('organization', 'partner', 'system'),
-  requirePermission('orgs', 'write'),
+  requireCisExecute,
+  requireMfa(),
   zValidator('json', approveRemediationSchema),
   async (c) => {
     const auth = c.get('auth');
@@ -1235,6 +1329,7 @@ cisHardeningRoutes.get(
       .select({
         action: cisRemediationActions,
         deviceHostname: devices.hostname,
+        deviceDisplayName: devices.displayName,
         baselineName: cisBaselines.name,
       })
       .from(cisRemediationActions)
@@ -1245,6 +1340,18 @@ cisHardeningRoutes.get(
       .limit(limit)
       .offset(offset);
 
+    // Approver display names for the audit detail row (#9606). Skipped when no
+    // listed action has been decided, so the common pending view costs nothing.
+    const approverIds = [...new Set(rows.map((r) => r.action.approvedBy).filter((id): id is string => !!id))];
+    const approverNames = new Map<string, string>();
+    if (approverIds.length > 0) {
+      const approvers = await db
+        .select({ id: users.id, name: users.name })
+        .from(users)
+        .where(inArray(users.id, approverIds));
+      for (const a of approvers) approverNames.set(a.id, a.name);
+    }
+
     return c.json({
       data: rows.map((row) => ({
         ...row.action,
@@ -1252,6 +1359,8 @@ cisHardeningRoutes.get(
         executedAt: row.action.executedAt?.toISOString() ?? null,
         approvedAt: row.action.approvedAt?.toISOString() ?? null,
         deviceHostname: row.deviceHostname,
+        deviceDisplayName: row.deviceDisplayName ?? null,
+        approverName: row.action.approvedBy ? approverNames.get(row.action.approvedBy) ?? null : null,
         baselineName: row.baselineName,
       })),
       pagination: {

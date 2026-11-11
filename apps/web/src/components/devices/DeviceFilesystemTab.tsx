@@ -5,6 +5,7 @@ import { osRootScanPath } from '@breeze/shared';
 import { showToast } from '@/components/shared/Toast';
 import { ActionError, runAction } from '@/lib/runAction';
 import { fetchWithAuth } from '@/stores/auth';
+import { usePermissions } from '../../lib/permissions';
 import '../../lib/i18n';
 import type { OSType } from './DeviceList';
 import VolumePicker from './filesystem/VolumePicker';
@@ -30,6 +31,7 @@ import type { FilesystemCleanupPreview } from './filesystem/filesystemTabUtils';
 type DeviceFilesystemTabProps = {
   deviceId: string;
   osType: OSType;
+  deviceStatus?: 'online' | 'offline' | 'maintenance' | 'decommissioned' | 'quarantined' | 'updating' | 'pending';
   onOpenFiles?: () => void;
 };
 
@@ -38,9 +40,17 @@ const SCAN_TIMEOUT_SECONDS = 300;
 export default function DeviceFilesystemTab({
   deviceId,
   osType,
+  deviceStatus,
   onOpenFiles,
 }: DeviceFilesystemTabProps) {
   const { t } = useTranslation('devices');
+  // Analyze now, the native cleaner check and the file manager each send a
+  // live command to the device (devices.execute on the API); the recorded
+  // snapshot here needs only read.
+  const { can } = usePermissions();
+  const canReachDevice = can('devices', 'execute');
+  const isOffline = deviceStatus != null && deviceStatus !== 'online';
+  const offlineTitle = isOffline ? t('deviceFilesystemTab.deviceIsOfflineScansRequireAConnectedAgent') : undefined;
   const volumes = useFilesystemVolumes(deviceId);
   // W02's hook is stateless about selection, so the composer owns it — the
   // same shape W02's own mount used before the split.
@@ -194,21 +204,25 @@ export default function DeviceFilesystemTab({
         <div className="flex flex-wrap items-center justify-between gap-3">
           <h3 data-testid="filesystem-heading" className="text-lg font-semibold">{t('deviceFilesystemTab.title')}</h3>
           <div className="flex flex-wrap items-center gap-2">
-            <button
-              type="button"
-              data-testid="filesystem-analyze-button"
-              onClick={() => { void runAnalyze(); }}
-              disabled={busy !== null || !scanPath}
-              className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs font-medium hover:bg-muted disabled:opacity-50"
-            >
-              {busy === 'scan' ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
-              {t('deviceFilesystemTab.analyzeNow')}
-            </button>
+            {canReachDevice && (
+              <button
+                type="button"
+                data-testid="filesystem-analyze-button"
+                onClick={() => { void runAnalyze(); }}
+                disabled={busy !== null || !scanPath || isOffline}
+                title={offlineTitle}
+                className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs font-medium hover:bg-muted disabled:opacity-50"
+              >
+                {busy === 'scan' ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
+                {t('deviceFilesystemTab.analyzeNow')}
+              </button>
+            )}
             <button
               type="button"
               data-testid="filesystem-preview-button"
               onClick={() => { void runCleanupPreview(); }}
-              disabled={busy !== null || !snapshotState.snapshot}
+              disabled={busy !== null || !snapshotState.snapshot || isOffline}
+              title={offlineTitle}
               className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs font-medium hover:bg-muted disabled:opacity-50"
             >
               {busy === 'preview' ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
@@ -224,7 +238,7 @@ export default function DeviceFilesystemTab({
               <RefreshCw className={`h-3.5 w-3.5 ${busy === 'refresh' ? 'animate-spin' : ''}`} />
               {t('deviceFilesystemTab.refresh')}
             </button>
-            {onOpenFiles && (
+            {onOpenFiles && canReachDevice && (
               <button
                 type="button"
                 data-testid="filesystem-open-files"
@@ -310,7 +324,7 @@ export default function DeviceFilesystemTab({
       {/* OS-native cleaners (Disk Cleanup v2 §8). A SECOND engine on the same
           surface: it is not path-scoped, so it deliberately sits below the
           volume-scoped panels and does not react to the volume chips. */}
-      <SystemCleanupPanel deviceId={deviceId} />
+      {canReachDevice && <SystemCleanupPanel deviceId={deviceId} />}
 
       <CleanupRunHistory deviceId={deviceId} refreshToken={historyToken} />
     </div>

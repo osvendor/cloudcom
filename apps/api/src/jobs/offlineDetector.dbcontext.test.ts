@@ -131,10 +131,6 @@ vi.mock('../services/eventBus', () => ({
 
 vi.mock('../services/alertService', () => ({
   createAlert: vi.fn(async () => null),
-  evaluateDeviceAlertsFromPolicy: vi.fn(async () => {
-    ctxState.events.push(`alertEvaluation@depth${ctxState.depth}`);
-    return [];
-  }),
   alertRuleOwnershipConditionForOrg: vi.fn(() => ({ op: 'ownership' })),
 }));
 
@@ -330,6 +326,33 @@ describe('offlineDetector DB-context scoping (#3233)', () => {
     ]);
   });
 
+  it('mark-offline reports the status write for a parked device and enqueues nothing', async () => {
+    const device = {
+      id: '00000000-0000-4000-8000-000000000004',
+      orgId: '10000000-0000-4000-8000-000000000004',
+      siteId: '20000000-0000-4000-8000-000000000004',
+      hostname: 'parked', displayName: null, status: 'offline',
+      lastSeenAt: new Date('2026-05-17T00:00:00.000Z'), isEphemeral: false,
+    };
+    mockDb.update.mockImplementation(updateChain([device]) as never);
+    const { persistOfflineTransition } = await import('../services/offlineEffectsStore');
+    vi.mocked(persistOfflineTransition).mockImplementationOnce(async () => {
+      ctxState.events.push(`persistEffects@depth${ctxState.depth}`);
+      return [];
+    });
+
+    const result = await runJob({
+      type: 'mark-offline',
+      transitionId: offlineTransitionId(device.orgId, device.id, device.lastSeenAt.toISOString()),
+      deviceId: device.id,
+      orgId: device.orgId,
+      observedLastSeenAt: device.lastSeenAt.toISOString(),
+    }) as { transitioned: boolean; alertCreated: boolean };
+
+    expect(result).toEqual({ transitioned: true, alertCreated: false });
+    expect(ctxState.events).toEqual(['ctx:enter', 'markOfflineCas@depth1', 'persistEffects@depth1', 'ctx:exit']);
+  });
+
   it('duplicate or stale mark-offline work loses the CAS and emits nothing', async () => {
     mockDb.update.mockImplementation(updateChain([]) as never);
 
@@ -349,20 +372,11 @@ describe('offlineDetector DB-context scoping (#3233)', () => {
     expect(ctxState.events).toEqual(['ctx:enter', 'markOfflineCas@depth1', 'ctx:exit']);
   });
 
-  it('reevaluate-offline-sweep reads in-context but fans out OUTSIDE it', async () => {
-    mockDb.select.mockReturnValueOnce(
-      selectPageChain([{ id: 'd1', orgId: 'o1' }], 'reevalSelect') as never
-    );
-
+  it('drains retired reevaluation sweeps without database or queue work', async () => {
     const result = (await runJob({ type: 'reevaluate-offline-sweep' })) as { queued: number };
-
-    expect(result.queued).toBe(1);
-    expect(ctxState.events).toEqual([
-      'ctx:enter',
-      'reevalSelect@depth1',
-      'ctx:exit',
-      'addBulk(1)@depth0',
-    ]);
+    expect(result.queued).toBe(0);
+    expect(ctxState.events).toEqual([]);
+    expect(mockDb.select).not.toHaveBeenCalled();
   });
 
   it('reap-uninstall-intent closes the page context before the per-row writes', async () => {
@@ -423,8 +437,8 @@ describe('offlineDetector DB-context scoping (#3233)', () => {
     expect(ctxState.events).not.toContain('clearReplLink@depth1');
   });
 
-  it('never enqueues while a DB context is held, across all three sweeps', async () => {
-    for (const type of ['detect-offline', 'reevaluate-offline-sweep']) {
+  it('never enqueues while a DB context is held, in the detection sweep', async () => {
+    for (const type of ['detect-offline']) {
       ctxState.events = [];
       mockDb.select.mockReset();
       mockDb.select.mockReturnValueOnce(

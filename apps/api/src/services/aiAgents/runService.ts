@@ -4,20 +4,26 @@ import type { SQL } from 'drizzle-orm';
 import { AI_AGENT_LIMIT_DEFAULTS } from '@breeze/shared';
 import type {
   AgentRunVerdict,
+  AiAgentEscalationRole,
   AiAgentKind,
   AiAgentLimits,
   AiAgentPolicySnapshot,
+  AiAgentRecipients,
   AiAgentRunProfile,
   AiAgentRunStatus,
   AiAgentTriggerKind,
   AiAgentTriggers,
 } from '@breeze/shared';
 import { envFlag, isHosted } from '../../config/env';
+import { agentRunModelRole } from './agentModelRole';
+import { ASSESSMENT_MAX_CONCURRENT_RUNS, ASSESSMENT_MAX_RUNS_PER_HOUR } from './assessmentProfile';
+import { TROUBLESHOOT_MAX_CONCURRENT_RUNS, TROUBLESHOOT_MAX_RUNS_PER_HOUR } from './troubleshootProfile';
 import { PG_UUID_REGEX } from '../../utils/uuid';
 import {
   db,
   getCurrentDbAccessContext,
   runOutsideDbContext,
+  withDbTransaction,
   withSystemDbAccessContext,
 } from '../../db';
 // Direct module imports, NOT the ../../db/schema barrel: this module is the
@@ -30,7 +36,7 @@ import { aiBudgets } from '../../db/schema/ai';
 import { deviceGroupMemberships, devices } from '../../db/schema/devices';
 import { organizations } from '../../db/schema/orgs';
 import {
-  checkBudget, checkComputeCredits, reserveComputeCents, settleComputeCents,
+  checkBudget, checkComputeCredits, reserveComputeCents, settleComputeCents, type AiBillingSource,
 } from '../aiCostTracker';
 import { WORKSPACE_TOOL_NAMES } from '../workspace/workspaceToolNames';
 import { deploymentRegion } from '../workspace/workspacePaths';
@@ -39,14 +45,25 @@ import { isToolAllowlisted } from './toolAllowlist';
 import { isDeviceInMaintenanceWindow } from '../deploymentEngine';
 import { publishEvent } from '../eventBus';
 import { captureException } from '../sentry';
-import { getLlmBillingSourceForOrg } from '../llm/llmConfigResolver';
+import type { ResolvedModel } from '../aiModels/resolveModel';
+import { admissionServedColumns } from './admissionFailover';
+import { notifyModelBlocked } from './modelBlocked';
 import { isCircuitOpen, isTerminalRunStatus, recordRunTerminal } from './agentCircuit';
 import {
   RUN_TERMINAL_OUTBOX_TRANSITION_SEQ,
   enqueueTaskOutbox,
 } from '../aiOperator/taskOutbox';
+import { assertDepthOneRequester, lineageFor } from './grantDepthGuard';
 import { AgentRunOwnershipError, assertRunOwnership } from './agentAuthContext';
 import { resolveEffectiveAgentSystem } from './effectivePolicy';
+import {
+  assertWithinCeiling,
+  CeilingViolationError,
+  GrantInactiveError,
+  resolveGrantCeiling,
+  WISP_CHAT_CALLABLE_AGENT_DENIED_ACTIONS,
+  type GrantCeiling,
+} from '../wisp/grantAuthority';
 import { agentRunMatchesResourceScope } from './runResourceScope';
 import { recordAgentRunSkip } from './skipVisibility';
 import { closeAgentRunSession, reconcileHungExecutions } from './executionLedger';
@@ -185,18 +202,45 @@ import { closeAgentRunSession, reconcileHungExecutions } from './executionLedger
  *                            admitServiceRecoveryTask via taskDeadline.ts,
  *                            recipe library E2 #6167): caps the recipe's
  *                            deadline and any requested one. Merged with min.
- *  - taskMaxReasoningRuns  — DEFERRED to Operator P3-3 (#6590): the
- *                            coordinator's admitReasoningRun caps on the
- *                            recipe's bounds.maxReasoningRuns only today.
- *  - taskMaxMutationAttemptsPerTarget — DEFERRED to P3-3 (#6590): same, via
- *                            the recipe's bounds.maxMutationAttempts.
- *  - taskMaxBudgetCents    — DEFERRED to P3-3 (#6590): the per-task budget
- *                            rollup does not exist yet; per-run and per-day
- *                            caps above still bound every run a task admits.
- *  - taskMaxActiveTargets  — DEFERRED to the fleet waves (#6590): admission
- *                            writes exactly one target today.
- *  - taskMaxPendingPerOrg  — DEFERRED to P3-3 (#6590): admission capacity
- *                            (spec §12's 429) is not built yet.
+ *  - taskMaxReasoningRuns  — AI Operator dispatch (taskCoordinator.ts
+ *                            admitReasoningRun via taskLimits.ts, #6590):
+ *                            the narrower of this and the recipe's
+ *                            bounds.maxReasoningRuns. Merged with min.
+ *  - taskMaxMutationAttemptsPerTarget — AI Operator dispatch (taskCoordinator
+ *                            advanceVerify via taskLimits.ts, #6590): the
+ *                            narrower of this and bounds.maxMutationAttempts
+ *                            gates every retry after a mutation. Merged with min.
+ *  - taskMaxBudgetCents    — AI Operator dispatch (admitReasoningRun via
+ *                            taskLimits.ts, #6590): sum of cost_cents over
+ *                            the task's runs; a new run is refused once it
+ *                            reaches the ceiling. A run in flight is not cut
+ *                            short — per-run and per-day caps above still
+ *                            bound each run. Merged with min.
+ *  - taskMaxActiveTargets  — AI Operator admission (taskService.ts via
+ *                            taskLimits.ts, #6590): the targets a task is
+ *                            admitted with (exactly one today). Merged with min.
+ *  - taskMaxPendingPerOrg  — AI Operator admission (taskService.ts via
+ *                            taskLimits.ts, #6590): non-terminal tasks in the
+ *                            org, counted under a per-org advisory lock;
+ *                            refusal is the route's 429. Merged with min.
+ *  - maxConcurrentResearchRuns — HERE (admission rule 6b, via profileCaps()),
+ *                            research-profile runs only — counted separately
+ *                            from every other per-run-shape concurrency cap
+ *                            above (AI Suggested Fixes W2).
+ *  - maxResearchRunsPerHour — HERE (admission rule 6b, via profileCaps()),
+ *                            research-profile runs only — counted separately
+ *                            from every other per-hour cap.
+ *  - maxAutoResearchRunsPerHour — HERE (admission rule 6c): caps AUTO research
+ *                            (trigger_kind 'alert') per org under the
+ *                            (agent, org) advisory lock; 0 disables auto research.
+ *  - researchQuickMaxTurns / researchDeepMaxTurns — run loop (researchLimits(),
+ *                            researchProfile.ts): substitute for maxTurnsPerRun
+ *                            on a research-profile run, keyed by depth; not
+ *                            enforced here.
+ *  - researchQuickBudgetCentsPerRun / researchDeepBudgetCentsPerRun — run loop
+ *                            (researchLimits(), researchProfile.ts): substitute
+ *                            for maxBudgetCentsPerRun on a research-profile
+ *                            run, keyed by depth; not enforced here.
  */
 
 export interface CreateAgentRunInput {
@@ -229,6 +273,16 @@ export interface CreateAgentRunInput {
      * those stay keyed on `deviceId`.
      */
     focusDeviceId?: string | null;
+    /**
+     * #6749 — the alert's `context.source` (e.g. `'warranty_evaluator'`),
+     * resolved by the caller from `alerts.context ->> 'source'`. Used ONLY
+     * for the unconditional lifecycle-source exclusion below — never a
+     * caller-configurable filter, unlike every other field here. `null`/
+     * absent means "not a lifecycle-sourced alert" and never trips the
+     * exclusion (fail-open by design: an unresolved source must not block
+     * an otherwise-matching fault alert from triage).
+     */
+    source?: string | null;
   };
   /**
    * The triggering ticket for `triggerKind: 'ticket'` runs (wave 6 PR 3,
@@ -275,6 +329,18 @@ export interface CreateAgentRunInput {
   };
   /** e.g. `alert:${alertId}`, `manual:${randomUUID()}`. Unique per org. */
   dedupeKey: string;
+  /**
+   * AI Suggested Fixes W3 — supplied ONLY by the automation `ai_triage` lane.
+   * Asked after every opt-out gate (kill switch, enabled, mode, resource
+   * scope, circuit, trigger filters, model availability, maintenance), and
+   * only when the run would
+   * start in shadow: true means fix memory would attach a proven fix for this
+   * alert, so a shadow full run is skipped (`proven_fix_available`) and the
+   * caller attaches the fix instead. Never consulted in act mode. Runs inside
+   * admission's system context; it must open no context of its own and must
+   * not write. A throw is treated as false (the run is admitted as before).
+   */
+  provenFixProbe?: () => Promise<boolean>;
   /**
    * AI Operator task linkage (#5205 W06, spec §6.2). TRUSTED INTERNAL INPUT —
    * `taskCoordinator.ts` is the only producer, and no HTTP surface may build
@@ -336,7 +402,26 @@ export interface CreateAgentRunInput {
    * Required for an `analysis` run; ignored for every other profile.
    */
   analysis?: { deviceIds: string[]; inputHandles: string[] };
+  /**
+   * Wisp W02 (Wisp design §4.3, §4.5) — TRUSTED INTERNAL INPUT, like `task`:
+   * the delegation grant and the revision this run is admitted under. Never
+   * forwarded from a caller's payload. Admission step 1d resolves the live
+   * ceiling (pinned revision ∩ the grantor's live authority) and skips
+   * `grant_inactive` / `grant_org_out_of_ceiling`; the inserted run's
+   * allowlist is intersected with the ceiling and the pair is stamped on the
+   * row, so the run loop and release re-check the SAME pin.
+   *
+   * `requestedByRunId` is the depth guard's input (w00 A11): when set, it must
+   * name Wisp's own assessment run (depth 0, profile `assessment`) under the
+   * same grant and org; the inserted row is then a depth-1 specialist child
+   * carrying the lineage. W07's `requestSpecialist.requestedByRunId` forwards it.
+   */
+  grant?: { grantId: string; grantRevisionId: string; requestedByRunId?: string | null };
 }
+
+// Wisp W02/W07 (w00 A11): the depth-one guard lives in a leaf module shared
+// with Operator task admission; re-exported here, where W02 published it.
+export { GrantDepthExceededError } from './grantDepthGuard';
 
 export type AgentRunSkipReason =
   | 'kill_switch_off' | 'no_effective_agent' | 'agent_disabled' | 'mode_off'
@@ -345,6 +430,8 @@ export type AgentRunSkipReason =
   | 'max_concurrent_runs' | 'max_runs_per_hour' | 'org_budget_exceeded'
   | 'agent_daily_budget_exceeded' | 'duplicate' | 'ownership_mismatch'
   | 'device_not_in_org'
+  // AI Suggested Fixes W2 — research-profile volume guards.
+  | 'max_concurrent_research_runs' | 'research_rate' | 'research_auto_cap'
   // Phase 2 wave P2-1 (alert verdicts) — the verdict-profile equivalents of
   // max_concurrent_runs/max_runs_per_hour, counted against
   // maxConcurrentVerdictRuns/maxVerdictRunsPerHour instead (admission rule
@@ -383,6 +470,24 @@ export type AgentRunSkipReason =
   // profileCaps()). Same posture as every pair above: deliberately NOT added
   // to PUBLISHED_SKIP_REASONS — volume guards on a scheduled shape.
   | 'max_concurrent_patch_runs' | 'patch_rate'
+  // Wisp W05 — the assessment-profile equivalents, counted against the
+  // ASSESSMENT_MAX_CONCURRENT_RUNS/ASSESSMENT_MAX_RUNS_PER_HOUR constants
+  // (assessmentProfile.ts; admission rule 6b, via profileCaps()). Same
+  // posture as every pair above: deliberately NOT added to
+  // PUBLISHED_SKIP_REASONS — the wake coordinator's alert-storm coalescing
+  // leans on them, so they are volume guards, not policy events.
+  | 'max_concurrent_assessment_runs' | 'assessment_rate'
+  // Wisp delegation W1 (#11084) — the device_troubleshooting volume guards
+  // (TROUBLESHOOT_MAX_CONCURRENT_RUNS / TROUBLESHOOT_MAX_RUNS_PER_HOUR,
+  // troubleshootProfile.ts). Not published, same posture as the pair above.
+  | 'max_concurrent_troubleshoot_runs' | 'troubleshoot_rate'
+  // #11084 — a device_troubleshooting admission without a grant; a caller
+  // bug surfaced as a skip (same posture as assessment_requires_grant).
+  | 'troubleshoot_requires_grant'
+  // Wisp W05 — an assessment admitted without a grant (rule 2a). A caller
+  // bug, surfaced as a skip rather than a throw so the wake coordinator never
+  // wedges on it; not published (nothing an admin can act on).
+  | 'assessment_requires_grant'
   // Execution plane W04 (spec §8). The first four are POLICY events, not
   // volume guards, so unlike every other profile's pair they ARE published:
   // a technician who launched an analysis and got nothing needs to see why.
@@ -404,10 +509,59 @@ export type AgentRunSkipReason =
   // The sandbox backend's circuit breaker is open (R5, spec §9). Published:
   // a technician whose analysis will not start deserves to know the provider
   // is down rather than that they did something wrong.
-  | 'workspace_unavailable';
+  | 'workspace_unavailable'
+  // AI model registry W03 (spec §9.1): the agent's model (its bound offering,
+  // or the `ai_agents` assignment default) is not usable for this org right
+  // now — disabled, outside the permitted set, unpriced, its connection down,
+  // or the partner's registry cutover not done yet. Published: an admin has to
+  // pick another model (recipients are also notified once per agent per day).
+  | 'model_unavailable'
+  // AI Suggested Fixes W3 (Q1 = C): a SHADOW full triage run skipped because
+  // fix memory already has an attachable proven fix for the alert; the
+  // automation lane attaches it instead. Not published: an expected,
+  // memory-served outcome, not a policy event.
+  | 'proven_fix_available'
+  // Wisp W02 (admission step 1d): the pinned delegation grant is not usable
+  // (paused / revoked / expired / grantor lost standing), or the run's org is
+  // outside its live ceiling. Policy events — published.
+  | 'grant_inactive' | 'grant_org_out_of_ceiling';
 
 export type CreateAgentRunResult =
   | { created: true; run: AiAgentRunRow }
+  | { created: false; skipped: AgentRunSkipReason };
+
+export type CreateAgentRunOptions = {
+  /**
+   * #7187 — insert the ledger row but do NOT announce or enqueue it; return an
+   * `enqueue()` continuation instead (the #3445 `deliver()` shape).
+   *
+   * For a caller that runs the gate inside a SYSTEM transaction that stays open
+   * after the gate returns (the automation runtime's per-device claim
+   * transaction). `inSystemDbContext` joins that transaction, so the row is
+   * still uncommitted when step 10 would run: the runner's CAS out of `queued`
+   * then matches nothing and the run is stranded until the stall reaper, and a
+   * rollback leaves a job for a row that never existed. Such a caller passes
+   * this flag and calls `enqueue()` after its transaction commits.
+   */
+  deferEnqueue?: boolean;
+  /**
+   * Called with the funding admission resolved for this run (step 3d), once
+   * the agent's model is known. Lets a caller attach budget/credit denial
+   * detail computed against the SAME funding admission used, instead of
+   * re-resolving it (and risking disagreeing on a pinned offering).
+   */
+  onFundingResolved?: (funding: AiBillingSource) => void;
+};
+
+/**
+ * The gate's result for a caller that passed `deferEnqueue`. `enqueue` is
+ * present only on a created run; it performs step 10 (announce, enqueue, and
+ * mark the row `enqueue_failed` if either fails) and resolves to the result an
+ * immediate admission would have returned. It must run after the caller's
+ * transaction has committed and with no ambient DB context.
+ */
+export type DeferredCreateAgentRunResult =
+  | { created: true; run: AiAgentRunRow; enqueue?: () => Promise<CreateAgentRunResult> }
   | { created: false; skipped: AgentRunSkipReason };
 
 /**
@@ -501,12 +655,41 @@ async function deviceMatchesAnyGroup(
  * whenever the list is non-empty, same treatment as `ctx.siteId === null`
  * above it.
  */
+/**
+ * #6749 — alert sources that are lifecycle/administrative (date-driven, not
+ * fault-driven) and must NEVER admit a triage run, regardless of how the
+ * agent's other filters are configured. Warranty alerts are graded
+ * `info`/`low`/`medium` since #10371, but any agent whose `alertSeverities`
+ * includes one of those levels would still admit them (an expired warranty is
+ * worth seeing, never worth investigating), so severity alone can't exclude
+ * them — every such fleet's warranty alerts would otherwise burn a full
+ * triage run each.
+ * Unconditional exclusion (not an opt-in `alertSources` filter) because
+ * there is nothing for a triage agent to ever usefully do with one of these:
+ * no tenant should have to remember to opt out per agent.
+ */
+const LIFECYCLE_ALERT_SOURCES: ReadonlySet<string> = new Set(['warranty_evaluator']);
+
+/**
+ * #11328 — alerts an AI agent raises about its OWN work: an unattended action
+ * that failed verification (`actVerify.ts`) and a fix that did not hold
+ * (`fixWatch.ts`). They publish `alert.triggered` so channels, routing and
+ * escalation page a human, but they must never admit an agent run: a triage
+ * agent in act mode would act on its own failure, fail again and raise a new
+ * alert for the new run, a loop bounded only by cooldown, rate and budget
+ * caps. Same reasoning as the automation-output guard in automationWorker.ts.
+ * Unconditional, like the lifecycle set above.
+ */
+const AGENT_OUTPUT_ALERT_SOURCES: ReadonlySet<string> = new Set(['ai_agent_act_verify', 'ai_agent_fix_watch']);
+
 export async function evaluateAgentTriggerFilters(
   triggers: AiAgentTriggers,
   ctx: NonNullable<CreateAgentRunInput['alertContext']>,
   deviceId: string | null,
   orgId: string,
 ): Promise<boolean> {
+  if (ctx.source != null && (LIFECYCLE_ALERT_SOURCES.has(ctx.source) || AGENT_OUTPUT_ALERT_SOURCES.has(ctx.source))) return false;
+
   const severities = triggers.alertSeverities ?? [];
   if (!severities.includes(ctx.severity)) return false;
 
@@ -655,7 +838,31 @@ const PUBLISHED_SKIP_REASONS: ReadonlySet<AgentRunSkipReason> = new Set([
   'analysis_not_available', 'external_processing_disabled', 'workspace_capability_missing',
   'analysis_region_unavailable', 'compute_budget_exceeded', 'compute_credits_exhausted',
   'too_many_input_devices', 'workspace_unavailable',
+  // AI model registry W03 — a policy event an admin must act on.
+  'model_unavailable',
+  // Wisp W02 — delegation-ceiling refusals.
+  'grant_inactive', 'grant_org_out_of_ceiling',
 ]);
+
+/**
+ * Wisp W02: the run's allowlist under a delegation ceiling — entries whose
+ * tool is never delegable are dropped, and with a ceiling allowlist only its
+ * tools survive. Entry shape (`tool` or `tool:action`) is preserved. Never
+ * wider than `allowlist`.
+ */
+export function intersectAllowlistWithCeiling(
+  allowlist: readonly string[],
+  ceiling: Pick<GrantCeiling, 'toolAllowlist' | 'deniedTools'>,
+): string[] {
+  return allowlist.filter((entry) => {
+    const colon = entry.indexOf(':');
+    const tool = colon === -1 ? entry : entry.slice(0, colon);
+    // #11433: an action-floored tool is callable only by a human's Wisp turn, never by a run (the run loop's
+    // ceiling check passes no action), so it stays out of the allowlist as when it was a whole-tool deny.
+    if (ceiling.deniedTools.has(tool) || WISP_CHAT_CALLABLE_AGENT_DENIED_ACTIONS.has(tool)) return false;
+    return ceiling.toolAllowlist === null || ceiling.toolAllowlist.has(tool);
+  });
+}
 
 /**
  * The fallback daily sandbox-compute ceiling for an org with no `ai_budgets`
@@ -937,6 +1144,39 @@ function profileCaps(
         concurrentSkip: 'max_concurrent_analysis_runs',
         rateSkip: 'analysis_rate',
       };
+    // AI Suggested Fixes W2 — per-(agent, org) research caps. The partner
+    // baseline research agent is the run's agentId for every org, so this is
+    // per org. Auto research has its own tighter hourly cap (rule 6c below).
+    case 'remediation_research':
+      return {
+        maxConcurrent: limits.maxConcurrentResearchRuns ?? AI_AGENT_LIMIT_DEFAULTS.maxConcurrentResearchRuns,
+        maxPerWindow: limits.maxResearchRunsPerHour ?? AI_AGENT_LIMIT_DEFAULTS.maxResearchRunsPerHour,
+        windowMs: 3_600_000,
+        concurrentSkip: 'max_concurrent_research_runs',
+        rateSkip: 'research_rate',
+      };
+    // Wisp W05 — per-(agent, org) assessment caps. Module CONSTANTS, not
+    // policy limits (assessmentProfile.ts; W05 planner call 4): no policy
+    // page configures this profile. The hourly cap is what bounds an alert
+    // storm after the wake coordinator's debounce.
+    case 'assessment':
+      return {
+        maxConcurrent: ASSESSMENT_MAX_CONCURRENT_RUNS,
+        maxPerWindow: ASSESSMENT_MAX_RUNS_PER_HOUR,
+        windowMs: 3_600_000,
+        concurrentSkip: 'max_concurrent_assessment_runs',
+        rateSkip: 'assessment_rate',
+      };
+    // Wisp delegation W1 (#11084) — per-(agent, org) caps for Wisp hand-offs.
+    // The partner troubleshoot agent is every org's agentId, so this is per org.
+    case 'device_troubleshooting':
+      return {
+        maxConcurrent: TROUBLESHOOT_MAX_CONCURRENT_RUNS,
+        maxPerWindow: TROUBLESHOOT_MAX_RUNS_PER_HOUR,
+        windowMs: 3_600_000,
+        concurrentSkip: 'max_concurrent_troubleshoot_runs',
+        rateSkip: 'troubleshoot_rate',
+      };
     default: {
       const exhaustive: never = profile;
       throw new Error(`[profileCaps] Unknown run profile: ${String(exhaustive)}`);
@@ -950,11 +1190,76 @@ function profileCaps(
  * cross-table ownership invariant, insert the ledger row, enqueue.
  *
  * It NEVER runs the agent inline. The only side effects are one insert, one
- * event and one BullMQ enqueue.
+ * event and one BullMQ enqueue. With `options.deferEnqueue` the event and the
+ * enqueue move into the returned `enqueue()` continuation (#7187).
  */
+type AdmissionModel =
+  | { ok: true; resolved: ResolvedModel }
+  | { ok: false; message: string; notify: boolean };
+
+/**
+ * Step 3d of admission (AI model registry W03). The policy's bound offering is
+ * requested with origin `policy`, so resolveModel re-checks it against the
+ * org's current `ai_agents` permitted set (quorum #11) and only ever takes the
+ * bounded same-connection, same-funding fallback.
+ *
+ * `registry_unavailable` is the partner's one-time cutover not having run (or
+ * having failed transiently): skipped, but never reported to an admin as "your
+ * model is gone".
+ */
+async function resolveAgentModelForAdmission(
+  orgId: string,
+  offeringId: string | null,
+  role: AiAgentEscalationRole,
+): Promise<AdmissionModel> {
+  // Loaded lazily: the resolver's module graph (candidate loader, the schema
+  // barrel, the registry cutover) is only needed on the admission path, and
+  // runService is imported — via transitionRunStatus — by many modules that
+  // never admit a run.
+  const [{ readOrgPartnerId }, { resolveModel }, { reportIfPlatformKeyMissing }] = await Promise.all([
+    import('../aiModels/candidateLoader'),
+    import('../aiModels/resolveModel'),
+    import('../aiModels/oneShotUnavailable'),
+  ]);
+  const partnerId = await readOrgPartnerId(orgId);
+  if (!partnerId) {
+    // ownership_mismatch territory (step 8 would refuse it too); nothing to resolve against.
+    return { ok: false, message: 'No AI model is available for AI agents.', notify: false };
+  }
+  const result = await resolveModel({
+    partnerId, orgId, surface: 'ai_agents', role,
+    ...(offeringId ? { requested: { offeringId, origin: 'policy' as const } } : {}),
+  });
+  if (result.ok) return { ok: true, resolved: result };
+  // A keyless deployment raises the hourly platform-key alert (as the one-shot surfaces do).
+  reportIfPlatformKeyMissing(result);
+  return { ok: false, message: result.message, notify: result.reason !== 'registry_unavailable' };
+}
+
+/** The circuit-open notifier's recipients rule: the agent ROW's owner + the effective recipients. */
+async function notifyAdmissionModelBlocked(
+  orgId: string,
+  agentId: string,
+  recipients: AiAgentRecipients,
+  message: string,
+): Promise<void> {
+  const [agentRow] = await inSystemDbContext(() => db
+    .select({ name: aiAgents.name, orgId: aiAgents.orgId, partnerId: aiAgents.partnerId })
+    .from(aiAgents)
+    .where(eq(aiAgents.id, agentId))
+    .limit(1));
+  if (!agentRow) return;
+  await notifyModelBlocked({
+    orgId, agentId, agentName: agentRow.name,
+    agent: { orgId: agentRow.orgId, partnerId: agentRow.partnerId, recipients },
+    reason: 'model_unavailable', message,
+  });
+}
+
 export async function createAndEnqueueAgentRun(
   input: CreateAgentRunInput,
-): Promise<CreateAgentRunResult> {
+  options: CreateAgentRunOptions = {},
+): Promise<DeferredCreateAgentRunResult> {
   const { orgId, kind, triggerKind, deviceId, dedupeKey } = input;
 
   // Branch-review fix (wave 6 PR 3, #3828): `ticketId` must only ever
@@ -1044,10 +1349,67 @@ export async function createAndEnqueueAgentRun(
     return skip('workspace_unavailable');
   }
 
+  // 1d. Wisp W02 — the delegation ceiling (Wisp design §4.3, §4.5). Before the
+  //     policy read: a run under a grant that cannot be used must not resolve
+  //     an agent at all. The depth guard first (w00 A11): a grant-bearing
+  //     request may come only from Wisp's own run under the same grant and org.
+  let grantCeiling: GrantCeiling | null = null;
+  if (input.grant) {
+    const { grantId, grantRevisionId, requestedByRunId } = input.grant;
+    if (requestedByRunId) {
+      const [requester] = await inSystemDbContext(() => db
+        .select({
+          grantId: aiAgentRuns.grantId,
+          orgId: aiAgentRuns.orgId,
+          depth: aiAgentRuns.depth,
+          profile: aiAgentRuns.profile,
+        })
+        .from(aiAgentRuns)
+        .where(eq(aiAgentRuns.id, requestedByRunId))
+        .limit(1));
+      // W07: the true depth-one predicate (lineage columns), shared with
+      // Operator task admission.
+      assertDepthOneRequester(requester, grantId, orgId, 'createAndEnqueueAgentRun');
+    }
+    try {
+      grantCeiling = await resolveGrantCeiling(grantId, grantRevisionId);
+    } catch (err) {
+      if (err instanceof GrantInactiveError) return skip('grant_inactive');
+      throw err;
+    }
+    try {
+      // The single comparator, not a hand-rolled set lookup.
+      assertWithinCeiling(grantCeiling, { orgId });
+    } catch (err) {
+      if (err instanceof CeilingViolationError) return skip('grant_org_out_of_ceiling');
+      throw err;
+    }
+  }
+
+  // Wisp W07 (w00 A11): a grant-bearing run requested by Wisp's assessment
+  // (the guard above proved it) is a specialist child — depth 1, pointing at
+  // its requester and the revision it was requested under. A grant-bearing
+  // run with no requester (the assessment itself) and every grant-less run
+  // are depth 0 with no lineage.
+  const lineage = lineageFor(grantCeiling ? input.grant : null);
+
   // 2. Effective policy. Throws 404 when the org itself is missing — that is a
   //    caller bug, not a skip, and is deliberately allowed to propagate.
-  const resolved = await resolveEffectiveAgentSystem(orgId, kind);
-  if (!resolved) return skip('no_effective_agent');
+  const resolvedPolicy = await resolveEffectiveAgentSystem(orgId, kind);
+  if (!resolvedPolicy) return skip('no_effective_agent');
+  // Wisp W02: under a grant the run is admitted — and recorded — with its
+  // allowlist intersected with the ceiling, computed ONCE here so every later
+  // gate (the workspace capability check below) and the stored policySnapshot
+  // agree. Narrower ⇒ release denies more ⇒ fail closed.
+  const resolved: AiAgentPolicySnapshot = grantCeiling
+    ? {
+        ...resolvedPolicy,
+        effective: {
+          ...resolvedPolicy.effective,
+          toolAllowlist: intersectAllowlistWithCeiling(resolvedPolicy.effective.toolAllowlist, grantCeiling),
+        },
+      }
+    : resolvedPolicy;
   snapshot = resolved;
 
   // 2a. Fleet Designer (W01) — the kind/profile pairing, BOTH directions, and
@@ -1064,6 +1426,26 @@ export async function createAndEnqueueAgentRun(
   //     instead), no read-only tool denial. A designer runs on the design
   //     profile or it does not run.
   if (kind === 'designer' && (input.profile ?? 'full') !== 'design') return skip('ownership_mismatch');
+  // AI Suggested Fixes W2 — same shape as the designer arm: a research agent
+  // runs its read-only, zero-action profile or it does not run.
+  if (kind === 'research' && (input.profile ?? 'full') !== 'remediation_research') return skip('ownership_mismatch');
+  // Wisp W05 — an assessment is the org's triage agent working under a Wisp
+  // grant, or it does not run: another kind is an ownership mismatch, and a
+  // grant-less assessment would run with no ceiling, no budget accounting and
+  // no grantor (`assessment_requires_grant`, a caller bug surfaced as a skip).
+  if ((input.profile ?? 'full') === 'assessment' && (kind !== 'triage' || !input.grant)) {
+    return skip(kind !== 'triage' ? 'ownership_mismatch' : 'assessment_requires_grant');
+  }
+  // Wisp delegation W1 (#11084) — both directions, like the designer/research
+  // arms: the troubleshoot agent runs its device-pinned, forced-shadow profile
+  // or it does not run (the manual route's `full` default would otherwise run
+  // it with its stored mutating allowlist and none of the profile's floor),
+  // and that profile is the troubleshoot agent's on exactly one device under a
+  // Wisp grant. A grant-less run would have no ceiling and no origin thread.
+  if (kind === 'troubleshoot' && (input.profile ?? 'full') !== 'device_troubleshooting') return skip('ownership_mismatch');
+  if ((input.profile ?? 'full') === 'device_troubleshooting' && (kind !== 'troubleshoot' || !deviceId || !input.grant)) {
+    return skip(kind !== 'troubleshoot' || !deviceId ? 'ownership_mismatch' : 'troubleshoot_requires_grant');
+  }
   const effective = resolved.effective;
   if (!effective.enabled) return skip('agent_disabled');
   if (effective.mode === 'off') return skip('mode_off');
@@ -1107,10 +1489,25 @@ export async function createAndEnqueueAgentRun(
   // narrower than "not forced shadow": the lift is keyed on the ticket
   // condition specifically, so it can never reach the anomaly force below —
   // an unproven detector has no lift at all, full stop.
+  //
+  // Wisp W05b (#9917) — assessment runs are ALSO always forced shadow, with
+  // no lift. An assessment reads tenant-authored text (tickets, alerts, the
+  // thread) and w00 allows it Tier 1 plus auto-approved Tier 2 only: an
+  // `act` start would make intentService's `resolvePolicyDecisionState`
+  // treat a supervised Tier-3 `propose_action` intent as policy-decidable,
+  // i.e. executable with no human. Shadow keeps every assessment proposal
+  // pending a human decision; like the anomaly force it changes only
+  // `modeAtStart`, never admission precedence.
+  //
+  // Wisp delegation W1 (#11084) — device_troubleshooting runs are ALSO always
+  // forced shadow, with no lift, for the same reason: the run reads device
+  // output and every change it wants must stay a pending human decision.
   const ticketAutonomy = (triggerKind === 'ticket' || input.ticketId)
     && effective.mode === 'act' && effective.triggers.ticketAutonomousWrites === true;
   const modeAtStart = ((triggerKind === 'ticket' || input.ticketId) && !ticketAutonomy)
-    || triggerKind === 'anomaly' || input.anomalyIncidentId ? 'shadow' : effective.mode;
+    || triggerKind === 'anomaly' || input.anomalyIncidentId
+    || (input.profile ?? 'full') === 'assessment'
+    || (input.profile ?? 'full') === 'device_troubleshooting' ? 'shadow' : effective.mode;
 
   // 2b. Circuit breaker (wave 6 PR 2, #3828). Placed as early as possible
   // after the kill switch — this is the first point `resolved.agentId` is
@@ -1155,6 +1552,35 @@ export async function createAndEnqueueAgentRun(
     return skip('trigger_filter_mismatch');
   }
 
+  // 3d. The agent's model (AI model registry W03, spec §9: decided BEFORE
+  //     admission; quorum #4: its funding drives every budget gate below and
+  //     is persisted on the run so compute settlement never re-derives it;
+  //     review finding 6: the run loop re-resolves exactly this offering).
+  //     Resolved HERE, outside the admission transaction below: the resolver
+  //     reads on its own pooled connection (and may run the partner's one-time
+  //     registry cutover), which must never happen while this admission holds
+  //     a connection idle in transaction behind its advisory lock.
+  const modelRole = agentRunModelRole({ profile: input.profile ?? 'full', modeAtStart });
+  const agentModel = await resolveAgentModelForAdmission(orgId, effective.offeringId ?? null, modelRole);
+  if (!agentModel.ok) {
+    if (agentModel.notify) {
+      await notifyAdmissionModelBlocked(orgId, resolved.agentId, effective.recipients, agentModel.message)
+        .catch((error: unknown) => {
+          console.error('[aiAgentRunService] model-blocked notify failed (non-fatal)', {
+            orgId, agentId: resolved.agentId, error,
+          });
+        });
+    }
+    return skip('model_unavailable');
+  }
+  const billingSource = agentModel.resolved.funding;
+  options.onFundingResolved?.(billingSource);
+  const admittedOfferingId = agentModel.resolved.offering.id;
+  // #7787: admission that resolved straight to a fallback (primary cooling or
+  // ineligible) records that failover on the run, as chat does on its ledger.
+  // Provenance only: the run's reservation key stays hop 0's.
+  const admissionServed = admissionServedColumns(agentModel.resolved);
+
   // 4. Maintenance windows. Reads partner-wide (org_id NULL) windows, so it has
   //    to run inside the system context below — an org-scoped RLS context sees
   //    none of them (#1105).
@@ -1174,6 +1600,26 @@ export async function createAndEnqueueAgentRun(
     // admissions never are) is likewise inert for this trigger kind in v1.
     if (effective.triggers.respectMaintenanceWindows && deviceId) {
       if (await isDeviceInMaintenanceWindow(deviceId)) return skip('maintenance_window');
+    }
+
+    // 4a. AI Suggested Fixes W3 (plan Decisions, Q1 = C:
+    //     docs/superpowers/plans/ai-mcp/2026-09-26-ai-suggested-fixes-w3-consumers.md): a SHADOW
+    //     full triage run is skipped when fix memory would attach a proven fix
+    //     for this alert. After every opt-out gate above, so an org that opted
+    //     out (or an alert the filters exclude) keeps its own skip; keyed on
+    //     modeAtStart, the EFFECTIVE mode (override-aware); act mode never
+    //     asks. The probe is read-only and runs on this same connection, so it
+    //     sits before the admission lock — a short-circuit inserts nothing.
+    if (modeAtStart === 'shadow' && input.provenFixProbe) {
+      // Savepoint, catch outside: a failed read would otherwise abort THIS
+      // admission transaction (the lock and insert below would hit 25P02).
+      const probe = input.provenFixProbe;
+      const proven = await withDbTransaction(() => probe()).catch((error: unknown) => {
+        console.error('[aiAgentRunService] proven-fix probe failed; admitting the full run', { orgId, error });
+        captureException(error, undefined, { orgId, stage: 'proven_fix_probe' });
+        return false;
+      });
+      if (proven) return skip('proven_fix_available');
     }
 
     // 4b. Serialize the whole check-then-insert for this (agent, org).
@@ -1360,9 +1806,25 @@ export async function createAndEnqueueAgentRun(
       return skip(caps.rateSkip);
     }
 
+    // 6c. AI Suggested Fixes W2 — AUTO research has its own, tighter hourly
+    //     cap (spec "rate-capped per org per hour"). Counted here, under the
+    //     (agent, org) advisory lock taken at 4b, so two concurrent automatic
+    //     requests for different alerts cannot both read cap-1 and both admit.
+    //     Every research admission for this org resolves the same effective
+    //     agent, so agentOrgScope is the per-org scope. Manual runs are never
+    //     counted. A cap of 0 disables auto research.
+    if (profile === 'remediation_research' && triggerKind === 'alert') {
+      const autoCap = effective.limits.maxAutoResearchRunsPerHour ?? AI_AGENT_LIMIT_DEFAULTS.maxAutoResearchRunsPerHour;
+      const [autoRecent] = await db
+        .select({ value: count() })
+        .from(aiAgentRuns)
+        .where(and(agentOrgScope, profileScope, eq(aiAgentRuns.triggerKind, 'alert'), gte(aiAgentRuns.queuedAt, new Date(now - 3_600_000))));
+      if ((autoRecent?.value ?? 0) >= autoCap) return skip('research_auto_cap');
+    }
+
     // 7. Budgets: the org's AI budget first, then the agent's own daily cap
-    //    (spec §4.3 — "per org, on top of ai_budgets").
-    const billingSource = await getLlmBillingSourceForOrg(orgId);
+    //    (spec §4.3 — "per org, on top of ai_budgets"). `billingSource` is the
+    //    funding of the offering resolved in step 3d.
     if (await checkBudget(orgId, billingSource)) return skip('org_budget_exceeded');
 
     const startOfUtcDay = new Date();
@@ -1467,6 +1929,18 @@ export async function createAndEnqueueAgentRun(
     if (profile === 'patch' && (agentRow.kind !== 'patch' || deviceId !== null)) {
       return skip('ownership_mismatch');
     }
+    // 8a (research). The remediation_research profile is driven only by a
+    //     research agent, and always against exactly one device (its catalog
+    //     and OS filter are per-device; spec "submit_suggestions").
+    if (profile === 'remediation_research' && (agentRow.kind !== 'research' || deviceId === null)) {
+      return skip('ownership_mismatch');
+    }
+    // 8a (troubleshoot, #11084). Re-asserted against the ROW, not the input
+    //     kind: device_troubleshooting is driven only by a troubleshoot agent,
+    //     against exactly one device.
+    if (profile === 'device_troubleshooting' && (agentRow.kind !== 'troubleshoot' || deviceId === null)) {
+      return skip('ownership_mismatch');
+    }
 
     // 8b. device ∈ org. `assertRunOwnership` covers agent<->org only; the
     //     (orgId, deviceId) pair arrives from the caller and was inserted
@@ -1534,15 +2008,22 @@ export async function createAndEnqueueAgentRun(
         taskStepKey: input.task?.taskStepKey ?? null,
         taskAttemptOrdinal: input.task?.attemptOrdinal ?? null,
         promptVersion: input.task?.promptVersion ?? null,
-        // The CONFIGURED model, which is all admission knows. `runLoop.ts`
-        // overwrites this with the model it actually used the moment it
-        // resolves `effective.model ?? llm.model` — that fallback to the org's
-        // LLM default is invisible here, and spec §6.2 asks for the RESOLVED
-        // model, not the requested one.
-        resolvedModel: input.task ? (resolved.effective.model ?? null) : null,
+        // Wisp W02: both or none (`ai_agent_runs_grant_link_chk`).
+        grantId: grantCeiling ? input.grant!.grantId : null,
+        grantRevisionId: grantCeiling ? input.grant!.grantRevisionId : null,
+        // Wisp W07: specialist lineage (`ai_agent_runs_depth_chk`).
+        ...lineage,
+        // Stamped by runLoop.ts with the model the run actually used, once
+        // resolveModel has bound the offering (spec §6.2). Admission knows only
+        // the offering, not a model string (W08: the policy model string is gone).
+        resolvedModel: null,
         // Execution plane W04 — the frozen input allowlist. NULL for every
         // other profile (`stagedInputs` is only ever set in step 4d).
         stagedInputs,
+        // AI model registry W03 (step 3d): what admission checked credits for.
+        fundingSource: billingSource,
+        admittedOfferingId,
+        ...admissionServed,
       })
       .onConflictDoNothing({ target: [aiAgentRuns.orgId, aiAgentRuns.dedupeKey] })
       .returning();
@@ -1616,10 +2097,26 @@ export async function createAndEnqueueAgentRun(
         finishedAt: null,
         queuedAt: new Date(),
         correlationId: randomUUID(),
+        // #9451 — a new attempt: reopen its compute settlement. The new
+        // `queuedAt` above is the attempt identity in its debit key
+        // (`ai-compute:<run id>:<attempt>`), so it can never collide with the
+        // previous attempt's.
+        computeCents: null,
+        computeSettledAt: null,
         // Execution plane W04 — a reclaimed row must never carry a PREVIOUS
         // attempt's frozen inputs: this attempt froze its own set (or, for a
         // non-analysis profile, none at all).
         stagedInputs,
+        // AI model registry W03: this attempt's own admission decision.
+        fundingSource: billingSource,
+        admittedOfferingId,
+        ...admissionServed,
+        // Wisp W02: this attempt's own grant pin. A reclaim must never leave a
+        // previous attempt's pin (or none) on a row admitted under a ceiling —
+        // the run loop and release enforce whatever the row carries.
+        grantId: grantCeiling ? input.grant!.grantId : null,
+        grantRevisionId: grantCeiling ? input.grant!.grantRevisionId : null,
+        ...lineage,
       })
       .where(and(
         eq(aiAgentRuns.orgId, orgId),
@@ -1654,9 +2151,25 @@ export async function createAndEnqueueAgentRun(
   if (!admission.created) return admission;
   const run = admission.run;
 
-  // 10. Announce, then enqueue — outside the DB context (see above). A failure
-  //     in either leaves a row no worker will ever pick up, so it is failed
-  //     here rather than left to sit in `queued` forever.
+  // #7187 — the caller's transaction still holds the row uncommitted; step 10
+  // is its to run once that transaction commits.
+  if (options.deferEnqueue) {
+    return { created: true, run, enqueue: () => announceAndEnqueueAgentRun(input, run) };
+  }
+  return announceAndEnqueueAgentRun(input, run);
+}
+
+/**
+ * Step 10 of the admission gate: announce, then enqueue — outside the DB
+ * context (see step 4). A failure in either leaves a row no worker will ever
+ * pick up, so it is failed here rather than left to sit in `queued` forever.
+ * Never throws.
+ */
+async function announceAndEnqueueAgentRun(
+  input: CreateAgentRunInput,
+  run: AiAgentRunRow,
+): Promise<CreateAgentRunResult> {
+  const { orgId, triggerKind, deviceId } = input;
   try {
     await publishEvent(
       'ai.agent.run.queued',
@@ -1679,7 +2192,8 @@ export async function createAndEnqueueAgentRun(
     // takes, so there is only one way a reservation ever ends.
     if ((input.profile ?? 'full') === 'analysis') {
       try {
-        await settleComputeCents(orgId, run.id, 0, await getLlmBillingSourceForOrg(orgId));
+        // NULL = admitted before W03: the previous fail-safe.
+        await settleComputeCents(orgId, run.id, 0, run.fundingSource ?? 'platform');
       } catch (settleError) {
         console.error('[aiAgentRunService] failed to release a compute reservation', {
           runId: run.id, error: settleError,
@@ -1757,6 +2271,12 @@ export async function transitionRunStatus(
         // below on any terminal transition. Returned from the CAS itself so
         // the release reads the value the transition actually observed.
         computeReservedCents: aiAgentRuns.computeReservedCents,
+        // AI model registry W03 — the funding admission checked; the release
+        // below settles on it rather than re-deriving one per org.
+        fundingSource: aiAgentRuns.fundingSource,
+        // #9451 — NULL = the run never left `queued`, so no sandbox ever ran:
+        // the release below settles it at 0, not at the reservation.
+        startedAt: aiAgentRuns.startedAt,
       });
     const row = rows[0] ?? null;
 
@@ -1833,12 +2353,18 @@ export async function transitionRunStatus(
   // settle at the reservation, never $0" — a run we lost track of is exactly
   // the case where the measured number is gone. A normally finished run has
   // already settled (which NULLs the column), so this is a no-op for it, and
-  // `settleComputeCents` is idempotent against a cleared reservation.
+  // `settleComputeCents` settles each run attempt at most once (#9451: the
+  // first settle claims it; a later one changes nothing and bills nothing).
+  //
+  // #9451 — a run that never STARTED (enqueue failure, cancelled while
+  // queued) ran no sandbox, so it is settled at 0: billing it the worst case
+  // would charge an org for compute that never existed.
   const outstandingReservation = moved.computeReservedCents ?? 0;
   if (isTerminalRunStatus(to) && outstandingReservation > 0) {
     try {
       await settleComputeCents(
-        moved.orgId, moved.id, outstandingReservation, await getLlmBillingSourceForOrg(moved.orgId),
+        // NULL = admitted before W03: the previous fail-safe.
+        moved.orgId, moved.id, moved.startedAt ? outstandingReservation : 0, moved.fundingSource ?? 'platform',
       );
     } catch (error) {
       console.error('[aiAgentRunService] compute reservation release failed; the org keeps a held reservation', {

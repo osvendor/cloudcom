@@ -1,0 +1,278 @@
+import { describe, expect, it, vi, beforeEach } from 'vitest';
+
+const { loadPolicyProviders } = vi.hoisted(() => ({ loadPolicyProviders: vi.fn(async (): Promise<string[]> => []) }));
+vi.mock('./eventLogPolicyProviders', () => ({ loadPolicyApplicationProviders: loadPolicyProviders }));
+
+vi.mock('../db', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../db')>()),
+  db: { select: vi.fn(), insert: vi.fn(), update: vi.fn(), delete: vi.fn(), transaction: vi.fn() },
+  hasDbAccessContext: () => true,
+  withDbTransaction: async (fn: () => Promise<unknown>) => fn(),
+}));
+
+vi.mock('./monitors/monitorService', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./monitors/monitorService')>()),
+  getMonitorDefinition: vi.fn(async () => ({ id: 'm', kind: 'event_log', condition: {} })),
+  createMonitorDefinition: vi.fn(async (input: Record<string, unknown>) => ({ id: 'm', orgId: ORG_ID, ...input })),
+  updateMonitorDefinition: vi.fn(async (_id: string, patch: Record<string, unknown>) => ({
+    id: 'm',
+    orgId: ORG_ID,
+    kind: 'event_log',
+    condition: { category: 'application', level: 'error', countThreshold: 1, windowMinutes: 60 },
+    ...patch,
+  })),
+}));
+
+const ORG_ID = '11111111-1111-4111-8111-111111111111';
+
+import { MONITOR_KINDS } from '@breeze/shared';
+import { registerMonitorTools } from './aiToolsMonitors';
+import { toolInputSchemas } from './aiToolSchemas';
+import type { AuthContext } from '../middleware/auth';
+import type { AiTool } from './aiTools';
+import { SITE_CEILING_WRITE_DENIED_MESSAGE } from './siteCeilingAccess';
+
+// #7826 — the model must be able to learn valid monitor kinds + condition
+// shapes from the tool itself, derived from the same zod registry the API
+// validates with (no hand-written list to drift).
+
+const ORG = '11111111-1111-4111-8111-111111111111';
+
+function registry(): Map<string, AiTool> {
+  const reg = new Map<string, AiTool>();
+  registerMonitorTools(reg);
+  return reg;
+}
+
+function auth(overrides: Record<string, unknown> = {}): AuthContext {
+  return {
+    principal: 'user',
+    user: { id: 'u1', email: 'a@b.c', name: 'A', isPlatformAdmin: false },
+    token: null,
+    partnerId: null,
+    orgId: ORG,
+    scope: 'organization',
+    accessibleOrgIds: [ORG],
+    partnerOrgAccess: null,
+    orgCondition: () => undefined,
+    canAccessOrg: (orgId: string) => orgId === ORG,
+    ...overrides,
+  } as unknown as AuthContext;
+}
+
+async function call(input: Record<string, unknown>, as: AuthContext = auth()) {
+  const tool = registry().get('manage_monitor_definitions')!;
+  return JSON.parse(await tool.handler(input, as));
+}
+
+describe('manage_monitor_definitions discoverability (#7826)', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('exposes every MONITOR_KINDS value as an enum on the input schema, plus a describe action', () => {
+    const def = registry().get('manage_monitor_definitions')!.definition;
+    const props = def.input_schema.properties as Record<string, { enum?: string[]; description?: string }>;
+    expect([...(props.kind?.enum ?? [])].sort()).toEqual([...MONITOR_KINDS].sort());
+    expect(props.action?.enum).toContain('describe');
+    expect(def.description ?? '').toMatch(/describe/);
+    expect((def.description ?? '').length).toBeLessThanOrEqual(300);
+    expect((props.kind?.description ?? '').length).toBeLessThanOrEqual(160);
+  });
+
+  it('the zod input schema accepts describe + kind', () => {
+    expect(toolInputSchemas.manage_monitor_definitions!.safeParse({ action: 'describe', kind: 'memory' }).success).toBe(true);
+  });
+
+  it('describe without kind lists every kind', async () => {
+    const result = await call({ action: 'describe' });
+    expect(result.kinds).toEqual([...MONITOR_KINDS]);
+  });
+
+  it('describe with kind returns the strict condition JSON schema from the registry', async () => {
+    const result = await call({ action: 'describe', kind: 'memory' });
+    expect(result.kind).toBe('memory');
+    expect(Object.keys(result.condition.properties).sort()).toEqual(['durationMinutes', 'operator', 'value']);
+    expect(result.condition.additionalProperties).toBe(false);
+    expect(result.condition.required).toEqual(expect.arrayContaining(['operator', 'value']));
+  });
+
+  it('describe works for every kind', async () => {
+    for (const kind of MONITOR_KINDS) {
+      const result = await call({ action: 'describe', kind });
+      expect(result.error, kind).toBeUndefined();
+      expect(Object.keys(result.condition.properties ?? {}).length, kind).toBeGreaterThan(0);
+    }
+  });
+
+  it('describe composite exposes match + children', async () => {
+    const result = await call({ action: 'describe', kind: 'composite' });
+    expect(Object.keys(result.condition.properties)).toEqual(expect.arrayContaining(['match', 'children']));
+  });
+
+  it('describe rejects an unknown kind and lists the valid ones', async () => {
+    const result = await call({ action: 'describe', kind: 'metric_threshold' });
+    for (const kind of MONITOR_KINDS) expect(result.error).toContain(kind);
+  });
+
+  it('describe is read-only: not blocked by the site-ceiling write gate', async () => {
+    const ceiling = auth({ allowedSiteIds: [] });
+    const result = await call({ action: 'describe', kind: 'cpu' }, ceiling);
+    expect(result.error).toBeUndefined();
+    // Control: the same auth is denied on a write.
+    const write = await call({ action: 'create', definition: {} }, ceiling);
+    expect(write.error).toBe(SITE_CEILING_WRITE_DENIED_MESSAGE);
+  });
+
+  it('create with an unknown kind points the model at describe and the valid kinds', async () => {
+    const result = await call({
+      action: 'create',
+      definition: {
+        name: 'RAM',
+        kind: 'metric_threshold',
+        severity: 'high',
+        condition: { metric: 'ram', operator: 'gt', threshold: 90, durationMinutes: 10 },
+      },
+    });
+    expect(result.error).toContain('describe');
+    for (const kind of MONITOR_KINDS) expect(result.error).toContain(kind);
+  });
+
+  it('create with a known kind and bad condition points at describe for that kind', async () => {
+    const result = await call({
+      action: 'create',
+      definition: { name: 'x', kind: 'cpu', severity: 'high', condition: { operator: 'gt', threshold: 90 } },
+    });
+    expect(result.error).toContain('describe" with kind "cpu"');
+  });
+
+  it('update with an unknown kind lists valid kinds; a kind-less update error stays terse', async () => {
+    const bad = await call({ action: 'update', monitorId: ORG, definition: { kind: 'bogus' } });
+    for (const kind of MONITOR_KINDS) expect(bad.error).toContain(kind);
+    const terse = await call({ action: 'update', monitorId: ORG, definition: { severity: 'nope' } });
+    expect(terse.error).toBeTruthy();
+    expect(terse.error).not.toContain('Valid kinds');
+  });
+
+  // #7060 — an invalid event_log level ("information") or a retired `type` key
+  // must steer app-presence requests to compliance. Since #8174 `info` is a
+  // valid level (Application events from allowlisted providers only).
+  describe('event_log app-presence hint (#7060)', () => {
+    const base = { name: 'Installs', severity: 'high' };
+    const eventLog = (condition: Record<string, unknown>) => ({ ...base, kind: 'event_log', condition });
+
+    it('create with an Information level adds the hint', async () => {
+      const r = await call({ action: 'create', definition: eventLog({ category: 'application', level: 'information' }) });
+      expect(r.error).toContain('required_software');
+      expect(r.error).toContain('Information');
+    });
+
+    it('create with a condition type key adds the hint', async () => {
+      const r = await call({
+        action: 'create',
+        definition: eventLog({ type: 'event_log', category: 'application', level: 'warning' }),
+      });
+      expect(r.error).toContain('required_software');
+    });
+
+    it('composite with a bad event_log child level adds the hint', async () => {
+      const child = { kind: 'event_log', condition: { category: 'application', level: 'information' } };
+      const r = await call({
+        action: 'create',
+        definition: {
+          ...base,
+          kind: 'composite',
+          condition: { match: 'all', children: [child, { kind: 'offline', condition: {} }] },
+        },
+      });
+      expect(r.error).toContain('required_software');
+    });
+
+    it('update of an event_log level adds the hint', async () => {
+      const r = await call({
+        action: 'update',
+        monitorId: ORG,
+        definition: { kind: 'event_log', condition: { category: 'application', level: 'information' } },
+      });
+      expect(r.error).toContain('required_software');
+    });
+
+    it('does not add the hint to non-event_log errors or unrelated event_log errors', async () => {
+      const cpu = await call({ action: 'create', definition: { ...base, kind: 'cpu', condition: { operator: 'gt' } } });
+      expect(cpu.error).not.toContain('required_software');
+      const other = await call({ action: 'create', definition: eventLog({ category: 'bogus', level: 'error' }) });
+      expect(other.error).not.toContain('required_software');
+    });
+
+    it('describe event_log carries the per-category collection guidance', async () => {
+      const r = await call({ action: 'describe', kind: 'event_log' });
+      expect(r.guidance).toContain('required_software');
+      expect(r.guidance).toContain('Application log error/critical from every provider');
+      expect(r.guidance).toContain('MsiInstaller');
+      expect(r.guidance).toContain('Configuration policy → Event Logs → Application providers');
+      expect(r.guidance).not.toContain('can never match');
+      expect(r.guidance).toContain('WHEA');
+      const cpu = await call({ action: 'describe', kind: 'cpu' });
+      expect(cpu.guidance).toBeUndefined();
+    });
+
+    it('error text reads cleanly (no doubled period)', async () => {
+      const r = await call({ action: 'create', definition: eventLog({ category: 'application', level: 'information' }) });
+      expect(r.error).not.toContain('..');
+      expect(r.error).toContain('Use action "describe"');
+    });
+
+    // #8174 — info is a valid level; allowlisted providers' Information events are collected.
+    it('create at info level for an allowlisted provider succeeds with no warning', async () => {
+      const r = await call({
+        action: 'create',
+        definition: eventLog({ category: 'application', level: 'info', sourcePattern: 'MsiInstaller' }),
+      });
+      expect(r.error).toBeUndefined();
+      expect(r.success).toBe(true);
+      expect(r.warnings).toBeUndefined();
+    });
+
+    it('create at info level for a non-allowlisted provider succeeds with a collection warning', async () => {
+      const r = await call({
+        action: 'create',
+        definition: eventLog({ category: 'application', level: 'info', sourcePattern: 'Application Error' }),
+      });
+      expect(r.success).toBe(true);
+      expect(r.warnings).toHaveLength(1);
+      expect(r.warnings[0]).toContain('Application Error');
+      expect(r.warnings[0]).toContain('MsiInstaller');
+    });
+
+    it('update to info level for a non-allowlisted provider returns a collection warning', async () => {
+      const r = await call({
+        action: 'update',
+        monitorId: ORG,
+        definition: { condition: { category: 'application', level: 'info', sourcePattern: 'VSS' } },
+      });
+      expect(r.success).toBe(true);
+      expect(r.warnings?.[0]).toContain('VSS');
+    });
+
+    it('no hint when level and category are valid but another field is rejected', async () => {
+      const r = await call({
+        action: 'create',
+        definition: eventLog({ category: 'application', level: 'warning', windowMinutes: 99999 }),
+      });
+      expect(r.error).toBeTruthy();
+      expect(r.error).not.toContain('required_software');
+    });
+  });
+});
+
+
+describe('policy-aware event log warnings (#10493)', () => {
+  beforeEach(() => { vi.clearAllMocks(); loadPolicyProviders.mockResolvedValue([]); });
+  it.each(['create', 'update'])('%s suppresses warnings for a provider collected by scoped policies', async (action) => {
+    const input = { action, monitorId: ORG_ID, definition: {
+      name: 'UPS', severity: 'high', kind: 'event_log', condition: { category: 'application', level: 'warning', sourcePattern: 'Dell UPS Local Node Manager' },
+    } };
+    expect((await call(input)).warnings).toHaveLength(1);
+    loadPolicyProviders.mockResolvedValue(['Dell UPS Local Node Manager']);
+    expect((await call(input)).warnings).toBeUndefined();
+    expect(loadPolicyProviders).toHaveBeenLastCalledWith({ orgId: ORG_ID, partnerId: null });
+  });
+});

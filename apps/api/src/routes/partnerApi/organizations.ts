@@ -1,9 +1,9 @@
 import type { Context } from 'hono';
 import { Hono } from 'hono';
-import { and, asc, eq, gt, inArray, lte, ne, or, param, sql, type SQL } from 'drizzle-orm';
+import { and, asc, eq, gt, inArray, lte, or, param, sql, type SQL } from 'drizzle-orm';
 import { z } from 'zod';
 import { db } from '../../db';
-import { organizations, sites } from '../../db/schema';
+import { organizationExternalLinks, organizations, sites } from '../../db/schema';
 import { requirePartnerApiScope, type PartnerApiPrincipalContext } from '../../middleware/partnerApiAuth';
 import {
   decodePartnerExportCursor,
@@ -35,6 +35,7 @@ import {
 } from './schemas';
 import { acquirePartnerExportReadLocks } from './consistency';
 
+import { notHiddenOrgType, notInHiddenOrgCondition } from '../../services/unassignedPool/visibility';
 const CURSOR_LIFETIME_MS = 24 * 60 * 60 * 1000;
 const UUID_SCHEMA = z.string().uuid();
 const querySchema = z.object({
@@ -274,16 +275,31 @@ partnerOrganizationRoutes.get('/organizations', requirePartnerApiScope('organiza
       inArray(organizations.id, orgIds),
       // Belt-and-braces: partnerApiAuth already keeps the hidden 'quick_support'
       // org out of accessibleOrgIds, but it must never reach a public export.
-      ne(organizations.type, 'quick_support'),
+      notHiddenOrgType(),
       ...paginationConditions({ id: organizations.id, orgId: organizations.id, createdAt: organizations.createdAt, updatedAt: organizations.partnerExportUpdatedAt }, parsed.traversal),
     )).orderBy(...paginationOrder({ id: organizations.id, orgId: organizations.id, updatedAt: organizations.partnerExportUpdatedAt }, parsed.traversal))
       .limit(getPartnerExportFetchLimit(parsed.limit));
+    // One page-wide read under the same export locks/snapshot as the orgs.
+    // Filter the partner explicitly in addition to the org-axis RLS policy.
+    const links = rows.length === 0 ? [] : await db.select({
+      orgId: organizationExternalLinks.orgId, system: organizationExternalLinks.system,
+      externalId: organizationExternalLinks.externalId, label: organizationExternalLinks.label,
+    }).from(organizationExternalLinks).where(and(
+      inArray(organizationExternalLinks.orgId, rows.map((row) => row.id)),
+      eq(organizationExternalLinks.partnerId, principal.partnerId),
+    )).orderBy(asc(organizationExternalLinks.system), asc(organizationExternalLinks.externalId));
+    const linksByOrg = new Map<string, Array<{ system: string; externalId: string; label: string | null }>>();
+    for (const { orgId, ...link } of links) {
+      const current = linksByOrg.get(orgId) ?? [];
+      current.push(link);
+      linksByOrg.set(orgId, current);
+    }
     const normalized = rows.map((row) => normalizeSourceRow({ ...row, siteId: null }));
     const envelope = buildEnvelope({
       resource: 'organizations', partnerId: principal.partnerId, rows: normalized, query: parsed,
       makeRecord: (row) => ({
         id: row.id, orgId: row.orgId, siteId: null, sourceUpdatedAt: row.updatedAt,
-        name: row.name, slug: row.slug, type: row.type,
+        name: row.name, slug: row.slug, type: row.type, externalLinks: linksByOrg.get(row.id) ?? [],
       }),
     });
     return c.json(organizationExportEnvelopeSchema.parse(envelope));
@@ -313,7 +329,7 @@ partnerOrganizationRoutes.get('/sites', requirePartnerApiScope('sites:read'), as
       // Same belt-and-braces as /organizations above; expressed as NOT EXISTS
       // because sites carry no org type. Kept as raw SQL so it does not consume
       // one of the positionally-mocked db.select() calls in the unit tests.
-      sql`NOT EXISTS (SELECT 1 FROM ${organizations} WHERE ${organizations.id} = ${sites.orgId} AND ${organizations.type} = 'quick_support')`,
+      notInHiddenOrgCondition(sites.orgId),
       ...paginationConditions({ id: sites.id, orgId: sites.orgId, createdAt: sites.createdAt, updatedAt: sites.partnerExportUpdatedAt }, parsed.traversal),
     )).orderBy(...paginationOrder({ id: sites.id, orgId: sites.orgId, updatedAt: sites.partnerExportUpdatedAt }, parsed.traversal))
       .limit(getPartnerExportFetchLimit(parsed.limit));

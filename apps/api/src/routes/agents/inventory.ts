@@ -2,21 +2,24 @@ import { Hono } from 'hono';
 import { bodyLimit } from 'hono/body-limit';
 import { z } from 'zod';
 import { zValidator } from '../../lib/validation';
-import { vpnPresenceIngestSchema } from '@breeze/shared';
+import { vpnPresenceIngestSchema, ERROR_CODES } from '@breeze/shared';
 import { eq } from 'drizzle-orm';
 import { db } from '../../db';
 import {
   devices,
   deviceHardware,
-  deviceDisks,
-  deviceNetwork,
 } from '../../db/schema';
+import { ownDeviceRowChangedHands, updateOwnDeviceRow } from '../../services/agentOwnDeviceRow';
+import { staleAgentCredentialRejection } from '../../middleware/agentAuthRejection';
+import { syncDeviceDisks, syncDeviceNetwork, writeHardwareReport } from '../../services/inventoryChildSync';
 import {
+  agentMemoryInventorySchema,
   agentWarrantyInfoSchema,
   updateHardwareSchema,
   updateSoftwareSchema,
   updateDisksSchema,
   updateNetworkSchema,
+  type AgentMemoryInventory,
 } from './schemas';
 import { sanitizeDate } from './helpers';
 import { upsertAgentWarranty } from '../../services/warrantySync';
@@ -61,21 +64,27 @@ inventoryRoutes.put('/:id/hardware', bodyLimit({ maxSize: 5 * 1024 * 1024, onErr
     .where(eq(deviceHardware.deviceId, device.id))
     .limit(1);
 
-  await db
-    .insert(deviceHardware)
-    .values({
-      deviceId: device.id,
-      orgId: device.orgId,
-      ...data,
-      updatedAt: new Date()
-    })
-    .onConflictDoUpdate({
-      target: deviceHardware.deviceId,
-      set: {
-        ...data,
-        updatedAt: new Date()
-      }
-    });
+  // #5351: the optional `memory` block is pulled out BEFORE the upsert (the
+  // hardware columns are spread from the body) and validated on its own. An
+  // invalid block is logged and ignored — the base hardware still saves and
+  // stored memory stays untouched; it is never truncated into a partial
+  // snapshot. Absent = untouched too (older agents, failed collection).
+  const { memory: rawMemory, ...hardware } = data;
+  let memory: AgentMemoryInventory | null = null;
+  if (rawMemory !== undefined && rawMemory !== null) {
+    const parsed = agentMemoryInventorySchema.safeParse(rawMemory);
+    if (parsed.success) {
+      memory = parsed.data;
+    } else {
+      const issues = parsed.error.issues.slice(0, 3)
+        .map((issue) => `${issue.path.join('.') || '(root)'}: ${issue.message}`).join('; ');
+      console.warn(`[agents.hardware] ignored invalid memory block for device ${device.id}: ${issues}`);
+    }
+  }
+
+  // One short transaction: the hardware upsert, the memory_* summary columns
+  // and the per-slot rows commit together (services/inventoryChildSync.ts).
+  await db.transaction((tx) => writeHardwareReport(tx, device, hardware, memory, new Date()));
 
   // Enqueue a warranty sync only when this report makes both the manufacturer
   // and serial number known for the first time (empty/absent -> populated).
@@ -145,7 +154,7 @@ inventoryRoutes.put('/:id/software', bodyLimit({ maxSize: 5 * 1024 * 1024, onErr
       c.header('Retry-After', '5');
       return c.json({
         error: 'Software inventory ingest is contended; retry this report later',
-        code: 'software_inventory_lock_timeout',
+        code: ERROR_CODES.SOFTWARE_INVENTORY_LOCK_TIMEOUT,
       }, 503);
     }
     throw error;
@@ -166,30 +175,9 @@ inventoryRoutes.put('/:id/disks', bodyLimit({ maxSize: 5 * 1024 * 1024, onError:
     return c.json({ error: 'Device not found' }, 404);
   }
 
-  await db.transaction(async (tx) => {
-    await tx
-      .delete(deviceDisks)
-      .where(eq(deviceDisks.deviceId, device.id));
-
-    if (data.disks.length > 0) {
-      const now = new Date();
-      await tx.insert(deviceDisks).values(
-        data.disks.map((disk) => ({
-          deviceId: device.id,
-          orgId: device.orgId,
-          mountPoint: disk.mountPoint,
-          device: disk.device || null,
-          fsType: disk.fsType || null,
-          totalGb: disk.totalGb,
-          usedGb: disk.usedGb,
-          freeGb: disk.freeGb,
-          usedPercent: disk.usedPercent,
-          health: disk.health || 'healthy',
-          updatedAt: now
-        }))
-      );
-    }
-  });
+  // Diff + upsert, not delete + re-insert: an unchanged report must not take
+  // the partner-export org lock (#6698, services/inventoryChildSync.ts).
+  await db.transaction((tx) => syncDeviceDisks(tx, device, data.disks, new Date()));
 
   return c.json({ success: true, count: data.disks.length });
 });
@@ -254,7 +242,7 @@ inventoryRoutes.put('/:id/network', bodyLimit({ maxSize: 5 * 1024 * 1024, onErro
       }))
     : null;
 
-  await db.transaction(async (tx) => {
+  const outcome = await db.transaction(async (tx) => {
     // Lock ordering: take the devices-row lock BEFORE touching device_network.
     // Every other writer that spans both tables (re-enrollment, site move,
     // moveOrg) locks devices first, then child tables — updating devices last
@@ -264,32 +252,33 @@ inventoryRoutes.put('/:id/network', bodyLimit({ maxSize: 5 * 1024 * 1024, onErro
     // Leave devices.activeVpns untouched when the agent didn't report VPN
     // state, so an old agent (or a transient collection failure) never
     // overwrites last-known-good.
+    //
+    // #8318 §6.4: bound to the authenticated agent_id (`:id`, which the row
+    // was read by) through updateOwnDeviceRow. A 0-row write persisted
+    // nothing, so the request is not answered as a success, and the adapter
+    // sync is skipped with it: a row that changed hands after the read above
+    // gets the stale-credential 401, a vanished row the 404 the read gives.
     if (vpnProvided) {
-      await tx
-        .update(devices)
-        .set({ activeVpns, updatedAt: now })
-        .where(eq(devices.id, device.id));
+      const identity = { deviceId: device.id, agentId };
+      const written = await updateOwnDeviceRow(tx, identity, { activeVpns, updatedAt: now });
+      if (written.length === 0) {
+        return (await ownDeviceRowChangedHands(tx, identity)) ? 'stale_caller' as const : 'device_missing' as const;
+      }
     }
 
-    await tx
-      .delete(deviceNetwork)
-      .where(eq(deviceNetwork.deviceId, device.id));
-
-    if (data.adapters.length > 0) {
-      await tx.insert(deviceNetwork).values(
-        data.adapters.map((adapter) => ({
-          deviceId: device.id,
-          orgId: device.orgId,
-          interfaceName: adapter.interfaceName,
-          macAddress: adapter.macAddress || null,
-          ipAddress: adapter.ipAddress || null,
-          ipType: adapter.ipType || 'ipv4',
-          isPrimary: adapter.isPrimary || false,
-          updatedAt: now
-        }))
-      );
-    }
+    await syncDeviceNetwork(tx, device, data.adapters, now);
+    return 'written' as const;
   });
+  if (outcome === 'stale_caller') {
+    console.warn('[agents.network] stale network submit: the device row changed hands after auth; refusing it', {
+      deviceId: device.id,
+      agentId,
+    });
+    throw staleAgentCredentialRejection();
+  }
+  if (outcome === 'device_missing') {
+    return c.json({ error: 'Device not found' }, 404);
+  }
 
   return c.json({
     success: true,
@@ -336,6 +325,9 @@ inventoryRoutes.put(
       coverageStartDate: data.coverageStartDate ?? null,
       coverageType: data.coverageType ?? null,
       coverageKind: data.coverageKind ?? null,
+      // #5511 W01 (D10). This literal is an independent drop point from the zod
+      // schema: a field can validate and still never reach the service.
+      entitlements: data.entitlements ?? null,
     });
 
     return c.json({ success: true });

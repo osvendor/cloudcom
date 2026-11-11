@@ -166,6 +166,17 @@ describe('formatActionMessage (automated command labels)', () => {
   });
 });
 
+describe('formatActionMessage (restart decisions made at the device, #10190 W05)', () => {
+  // services/rebootUserActionAudit.ts writes these; the person at the device
+  // is not a console user, so the copy says where the decision was made.
+  it('labels both restart decisions instead of humanizing the key', () => {
+    expect(formatActionMessage('device.reboot.user_postponed', null, 'success'))
+      .toBe('Restart postponed at the device');
+    expect(formatActionMessage('device.reboot.user_restart_now', null, 'success'))
+      .toBe('Restart now chosen at the device');
+  });
+});
+
 describe('GET /devices/:id/events validation', () => {
   let app: Hono;
 
@@ -461,6 +472,55 @@ describe('GET /devices/:id/events — redacts raw AI provenance ids from details
     expect(row.details).not.toHaveProperty('aiAgentRunId');
     expect(JSON.stringify(body)).not.toContain('sess-super-secret');
     expect(JSON.stringify(body)).not.toContain('run-super-secret');
+  });
+
+  it('redacts secret-shaped values persisted in details (#6577)', async () => {
+    const planted = 'ghp_PLANTEDsecretTOKENvalue6577abcdef';
+    vi.mocked(db.select).mockImplementationOnce(() => ({
+      from: vi.fn(() => ({
+        leftJoin: vi.fn(() => ({
+          where: vi.fn(() => ({
+            orderBy: vi.fn(() => ({
+              limit: vi.fn().mockResolvedValue([
+                {
+                  id: 'audit-2',
+                  timestamp: new Date('2026-02-08T00:00:00.000Z'),
+                  sortKey: '1',
+                  action: 'device.command',
+                  actorType: 'user',
+                  actorEmail: 'tech@example.com',
+                  actorId: 'user-1',
+                  resourceType: 'device',
+                  resourceId: '11111111-1111-1111-1111-111111111111',
+                  resourceName: 'host-1',
+                  result: 'success',
+                  details: {
+                    command: 'run',
+                    payload: { password: planted, note: `token=${planted}` },
+                    triggerKind: 'manual',
+                  },
+                  errorMessage: null,
+                  ipAddress: null,
+                  initiatedBy: 'manual',
+                  actorName: null,
+                },
+              ]),
+            })),
+          })),
+        })),
+      })),
+    }) as never);
+
+    const res = await app.request(
+      '/devices/11111111-1111-1111-1111-111111111111/events',
+      { method: 'GET', headers: { Authorization: 'Bearer token' } }
+    );
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).not.toContain(planted);
+    const row = JSON.parse(text).data.find((r: { id: string }) => r.id === 'audit-2');
+    expect(row.details.payload.password).toBe('[REDACTED]');
+    expect(row.details).toMatchObject({ command: 'run', triggerKind: 'manual' });
   });
 });
 

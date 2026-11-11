@@ -20,7 +20,9 @@ const (
 	// consentHelperWait bounds the head start given to the target session's
 	// user helper before the consent prompt is sent. Missing it is not fatal:
 	// the prompt then reports helper-absent and consentUnavailableBehavior
-	// decides.
+	// decides. Mirrored as AGENT_CONSENT_HELPER_WAIT_MS in
+	// apps/api/src/routes/remote/consentTiming.ts, which sizes the viewer's
+	// answer wait from it (#6818); change both together.
 	consentHelperWait = 30 * time.Second
 )
 
@@ -105,6 +107,31 @@ func (h *Heartbeat) acquireDesktopLeases(sessionID string, winID uint32, wantCon
 	h.desktopLeases[sessionID] = &desktopLeaseHold{winID: winID, roles: roles}
 	h.mu.Unlock()
 	return nil
+}
+
+// consentHelperPossible reports whether the target Windows session can host
+// the user-role helper that renders consent prompts, notices and the session
+// banner. False only when the lifecycle manager positively says it cannot
+// (no signed-in user, or the session is not active). A failed check returns
+// true so the caller keeps the bounded consentHelperWait rather than guessing
+// the session is empty.
+func (h *Heartbeat) consentHelperPossible(sessionID string, winID uint32) bool {
+	lc := h.lifecycleController()
+	if lc == nil {
+		// acquireDesktopLeases reports the missing manager as the failure.
+		return true
+	}
+	available, err := lc.HelperRoleAvailable(sessionbroker.HelperKey{WindowsSessionID: winID, Role: ipc.HelperRoleUser})
+	if err != nil {
+		log.Warn("could not check whether the target session has a signed-in user; waiting for the consent helper",
+			"sessionId", sessionID, "winSession", winID, "error", err.Error())
+		return true
+	}
+	if !available {
+		log.Info("target session cannot host the consent helper (nobody signed in, or the session is disconnected); skipping the consent-helper wait",
+			"sessionId", sessionID, "winSession", winID)
+	}
+	return available
 }
 
 // releaseDesktopLeases stops renewal and releases every role held for the

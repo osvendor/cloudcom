@@ -11,14 +11,15 @@ import {
   alerts,
   alertRules,
   notificationChannels,
+  notificationChannelConfigs,
   alertNotifications,
   escalationPolicies,
   devices,
   organizations,
-  partners,
-  configPolicyAlertRules
+  partners
 } from '../db/schema';
-import { eq, and, ne, inArray, isNull, or, gt, type SQL } from 'drizzle-orm';
+import { getNotificationChannelWithConfig, type NotificationChannelWithConfig } from './notificationChannelConfig';
+import { eq, and, ne, inArray, isNull, isNotNull, or, gt, type SQL } from 'drizzle-orm';
 import { getRedis, getBullMQConnection, isRedisAvailable } from './redis';
 import { rateLimiter } from './rate-limit';
 import { checkNotificationThrottle } from './notificationThrottle';
@@ -35,16 +36,23 @@ import {
   type WebhookConfig,
   type PagerDutyConfig,
   type PushoverConfig,
-  type PushoverPriority,
   type AlertSeverity
 } from './notificationSenders';
 import { sendSmsNotification, type SmsChannelConfig } from './notificationSenders/smsSender';
 import type { BreezeEvent } from './eventBus';
 import { decryptNotificationChannelConfig } from './notificationChannelSecrets';
+import { applyPartnerPushoverDefaults, readPartnerPushoverDefaults } from './partnerPushoverDefaults';
 import { attachWorkerObservability } from '../jobs/workerObservability';
 import { escalationStepSchema, type EscalationStep } from './delivery/escalationSteps';
-import { escalationOccurrences, listEscalationUsers, processUserEscalation, type UserEscalationJob } from './delivery/escalationExecution';
+import {
+  escalationOccurrences, listEscalationUsers, processEscalationEvent, processUserEscalation,
+  type EscalationEventJob, type UserEscalationJob,
+} from './delivery/escalationExecution';
 import { resolveDelivery } from './delivery/resolveDelivery';
+import { alertOwnerKey } from './alertOwner';
+import { enrichAlertSubjects } from './alertSubject';
+import type { AlertSubject } from '@breeze/shared';
+import { alertOwningSiteId } from './alertOwnership';
 import { partnerIdForOrg, railOwnershipCondition } from './delivery/railOwnership';
 
 const { db } = dbModule;
@@ -92,7 +100,7 @@ interface ProcessAlertJobData {
   alertId: string;
 }
 
-type NotificationJobData = SendNotificationJobData | ProcessAlertJobData | UserEscalationJob;
+type NotificationJobData = SendNotificationJobData | ProcessAlertJobData | UserEscalationJob | EscalationEventJob;
 
 /**
  * Create the notification worker
@@ -115,6 +123,14 @@ export function createNotificationWorker(): Worker<NotificationJobData> {
           // Background entry point establishes the same context as process-alert.
           const userJob = job.data;
           return runWithSystemDbAccess(() => processUserEscalation(userJob));
+        }
+
+        case 'escalation-event': {
+          // A read plus publishEvent, which leaves the DB context itself before
+          // any Redis work. A publish failure throws and BullMQ retries.
+          const eventJob = job.data;
+          await runWithSystemDbAccess(() => processEscalationEvent(eventJob));
+          return;
         }
 
         case 'process-alert': {
@@ -192,6 +208,17 @@ export async function processAlertNotifications(data: ProcessAlertJobData): Prom
     .limit(1);
 
   if (!alert) {
+    // Nothing is sent, and a return is not a throw, so BullMQ will not retry
+    // and `removeOnComplete` deletes the job. Before #10926 every rule, monitor
+    // and sourced alert landed here because `alert.triggered` was published
+    // inside the inserting transaction. That is fixed (the publish now waits
+    // for COMMIT via the alert outbox), but a row that is not visible must
+    // never go quiet again: the only legitimate cause left is an alert deleted
+    // before this job ran.
+    console.warn(
+      '[NotificationDispatcher] process-alert found no alert row; nothing was sent',
+      JSON.stringify({ errorId: 'PROCESS_ALERT_ROW_NOT_FOUND', alertId: data.alertId }),
+    );
     return { queued: 0, inAppSent: false, durationMs: Date.now() - startTime };
   }
 
@@ -209,12 +236,18 @@ export async function processAlertNotifications(data: ProcessAlertJobData): Prom
     return { queued: 0, inAppSent: false, durationMs: Date.now() - startTime };
   }
 
-  // Get device info for in-app notification
-  const [device] = await db
+  // Get device info for in-app notification. Only a device in the ALERT's org
+  // is attributable: a site-owned topology alert (M3-D6) stays in its site's
+  // org after its origin device moves org, and must not disclose that device.
+  const [deviceRow] = alert.deviceId === null ? [] : await db
     .select()
     .from(devices)
     .where(eq(devices.id, alert.deviceId))
     .limit(1);
+  const device = deviceRow && deviceRow.orgId === alert.orgId ? deviceRow : undefined;
+
+  const [subject] = await enrichAlertSubjects([{ ...alert, deviceName: device?.displayName || device?.hostname }]);
+  if (!subject) throw new Error('Alert subject missing');
 
   // Always send in-app notifications first (baseline notification)
   let inAppSent = false;
@@ -227,6 +260,8 @@ export async function processAlertNotifications(data: ProcessAlertJobData): Prom
       orgId: alert.orgId,
       deviceId: alert.deviceId,
       deviceName: device?.displayName || device?.hostname,
+      subjectName: subject.subjectName,
+      ownerKind: subject.ownerKind,
       link: `/alerts/${alert.id}`
     });
     inAppSent = inAppResult.success;
@@ -242,59 +277,20 @@ export async function processAlertNotifications(data: ProcessAlertJobData): Prom
   // previews is what fires here. The all-enabled-channels fallback is gone: the
   // "Everything else" routing row is the default a technician can read.
   let monitorId: string | null = alert.monitorId ?? null;
-  let legacyOverride: { channelIds?: string[] | null; escalationPolicyId?: string | null } | null = null;
-
-  // Conversion re-keys open alerts to their monitor in the same transaction as
-  // the retirement (W05c1 convert), so a converted source needs no special
-  // case here. `retireSource` is the other path: an UNCONVERTIBLE source has no
-  // monitor to carry its open alerts to, so a retired row must still answer for
-  // alerts that fired BEFORE it was retired — otherwise those alerts fall to
-  // default routing and silently lose their channels and escalation policy.
-  // Newer alerts never reach a retired source. W05d deletes both branches.
-  if (alert.ruleId) {
+  // A queued alert may only carry the compiled rule identity. Read that
+  // monitor pointer alone; legacy channel and escalation settings no longer
+  // participate in active delivery, including alerts queued before retirement.
+  if (alert.ruleId && !monitorId) {
     const [rule] = await db
-      .select({ overrideSettings: alertRules.overrideSettings, managedByMonitorId: alertRules.managedByMonitorId })
+      .select({ managedByMonitorId: alertRules.managedByMonitorId })
       .from(alertRules)
       .where(and(
         eq(alertRules.id, alert.ruleId),
+        isNotNull(alertRules.managedByMonitorId),
         or(isNull(alertRules.retiredAt), gt(alertRules.retiredAt, alert.createdAt)),
       ))
       .limit(1);
-    if (rule) {
-      monitorId = monitorId ?? rule.managedByMonitorId ?? null;
-      if (!rule.managedByMonitorId) {
-        // Transitional (spec §Delivery resolution "Transitional", W05b → W05d):
-        // an UNMANAGED legacy rule keeps its own channel/escalation overrides
-        // until it is converted. Retired sources are excluded; queued alerts
-        // depend on the transactional carry-over described above.
-        // W05d deletes the branch. A MANAGED (monitor-compiled) rule is never
-        // read for delivery — the monitor definition is the source of truth.
-        const overrides = (rule.overrideSettings ?? {}) as Record<string, unknown>;
-        legacyOverride = {
-          channelIds: Array.isArray(overrides.notificationChannelIds) ? (overrides.notificationChannelIds as string[]) : null,
-          escalationPolicyId: typeof overrides.escalationPolicyId === 'string' ? overrides.escalationPolicyId : null,
-        };
-      }
-    }
-  } else if (alert.configPolicyId) {
-    // Config-policy inline rule (#5289 Task 9): `configPolicyId` holds the
-    // config_policy_alert_rules row id (historical column name). Same
-    // transitional treatment as an unmanaged alert_rules row, including the
-    // retired-but-older-than-the-alert case described above.
-    const [cpRule] = await db
-      .select({
-        escalationPolicyId: configPolicyAlertRules.escalationPolicyId,
-        notificationChannelIds: configPolicyAlertRules.notificationChannelIds
-      })
-      .from(configPolicyAlertRules)
-      .where(and(
-        eq(configPolicyAlertRules.id, alert.configPolicyId),
-        or(isNull(configPolicyAlertRules.retiredAt), gt(configPolicyAlertRules.retiredAt, alert.createdAt)),
-      ))
-      .limit(1);
-    if (cpRule) {
-      legacyOverride = { channelIds: cpRule.notificationChannelIds ?? null, escalationPolicyId: cpRule.escalationPolicyId ?? null };
-    }
+    monitorId = rule?.managedByMonitorId ?? null;
   }
 
   // Dual-axis rail resolution (#2130): the alert org's partner, for the
@@ -305,8 +301,9 @@ export async function processAlertNotifications(data: ProcessAlertJobData): Prom
     orgId: alert.orgId,
     severity: alert.severity as AlertSeverity,
     monitorId,
-    siteId: device?.siteId ?? null,
-    legacyOverride
+    // Route by the alert's OWNING site: a topology policy alert's topology
+    // site (M3-D6), else its device's current site.
+    siteId: alertOwningSiteId(alert, device?.siteId)
   });
 
   // Escalation resolves independently of channels (spec): "inbox now, page
@@ -334,8 +331,12 @@ export async function processAlertNotifications(data: ProcessAlertJobData): Prom
     return inboxOnly();
   }
 
-  const channelOptions = await db.select({ id: notificationChannels.id, type: notificationChannels.type, config: notificationChannels.config })
-    .from(notificationChannels).where(inArray(notificationChannels.id, channelIds));
+  // Config lives in notification_channel_configs (#6379); this runs under
+  // system scope, so inherited partner-wide channels get theirs too.
+  const channelOptions = await db.select({ id: notificationChannels.id, type: notificationChannels.type, config: notificationChannelConfigs.config })
+    .from(notificationChannels)
+    .leftJoin(notificationChannelConfigs, eq(notificationChannelConfigs.channelId, notificationChannels.id))
+    .where(inArray(notificationChannels.id, channelIds));
   const optionsById = new Map(channelOptions.map(channel => [channel.id, channel]));
   const missingChannelIds = channelIds.filter(id => !optionsById.has(id));
   if (missingChannelIds.length > 0) {
@@ -407,10 +408,11 @@ type PrepareSendResult =
   | {
       send: true;
       alert: typeof alerts.$inferSelect;
-      channel: typeof notificationChannels.$inferSelect;
+      channel: NotificationChannelWithConfig;
       notificationRecord: typeof alertNotifications.$inferSelect;
       device: typeof devices.$inferSelect | undefined;
       org: typeof organizations.$inferSelect | undefined;
+      subject: AlertSubject;
     };
 
 /**
@@ -505,17 +507,14 @@ export async function processSendNotification(data: SendNotificationJobData): Pr
     // Get channel — the alert org's own, or a partner-wide channel owned by
     // that org's partner (#2130).
     const sendOrgPartnerId = await partnerIdForOrg(alert.orgId);
-    const [channel] = await db
-      .select()
-      .from(notificationChannels)
-      .where(
-        and(
-          eq(notificationChannels.id, data.channelId),
-          railOwnershipCondition(notificationChannels.orgId, notificationChannels.partnerId, alert.orgId, sendOrgPartnerId),
-          eq(notificationChannels.enabled, true)
-        )
-      )
-      .limit(1);
+    // Joined with its config row (#6379) — read under system scope, so an
+    // inherited partner-wide channel's config is present.
+    const channel = await getNotificationChannelWithConfig(data.channelId, {
+      where: and(
+        railOwnershipCondition(notificationChannels.orgId, notificationChannels.partnerId, alert.orgId, sendOrgPartnerId),
+        eq(notificationChannels.enabled, true)
+      ),
+    });
 
     if (!channel) {
       // A resolved {success:false} completes the BullMQ job (no 'failed' event)
@@ -529,6 +528,19 @@ export async function processSendNotification(data: SendNotificationJobData): Pr
       return {
         send: false,
         result: { success: false, channelType: 'unknown', error: 'Channel not found for alert organization or its partner' }
+      } satisfies PrepareSendResult;
+    }
+
+    // System scope reads every config row, so a null here means the channel
+    // was written without its notification_channel_configs row (#6379) — a
+    // data bug. Refuse loudly rather than send to an empty destination.
+    if (channel.config === null || channel.config === undefined) {
+      console.error(
+        `[NotificationDispatcher] Channel ${channel.id} has no config row (notification_channel_configs) — send for alert ${data.alertId} dropped`
+      );
+      return {
+        send: false,
+        result: { success: false, channelType: channel.type, error: 'Notification channel has no stored configuration' }
       } satisfies PrepareSendResult;
     }
 
@@ -607,12 +619,14 @@ export async function processSendNotification(data: SendNotificationJobData): Pr
       } satisfies PrepareSendResult;
     }
 
-    // Get device info for context
-    const [device] = await db
+    // Get device info for context — only a device in the ALERT's org (a
+    // site-owned topology alert outlives its origin device's org move, M3-D6).
+    const [deviceRow] = alert.deviceId === null ? [] : await db
       .select()
       .from(devices)
       .where(eq(devices.id, alert.deviceId))
       .limit(1);
+    const device = deviceRow && deviceRow.orgId === alert.orgId ? deviceRow : undefined;
 
     // Get org info
     const [org] = await db
@@ -663,12 +677,13 @@ export async function processSendNotification(data: SendNotificationJobData): Pr
     }
 
     // Feature #4: per-channel sliding-window throttle (defense-in-depth vs alert storms).
-    // Keyed by (channelId, device:<deviceId>) so one flooding device cannot starve other devices.
+    // Keyed by channel and owner so one flooding subject cannot starve another.
     if (channel.throttleMaxPerWindow && channel.throttleMaxPerWindow > 0) {
       const windowSeconds = channel.throttleWindowSeconds ?? 3600;
+      const ownerKey = alertOwnerKey(alert);
       const throttle = await checkNotificationThrottle(
         channel.id,
-        `device:${alert.deviceId}`,
+        ownerKey,
         channel.throttleMaxPerWindow,
         windowSeconds
       );
@@ -676,7 +691,7 @@ export async function processSendNotification(data: SendNotificationJobData): Pr
         const windowExpiresIso = new Date(throttle.windowExpiresAt).toISOString();
         const throttleMessage = `Throttled: ${throttle.currentCount} delivered in last ${windowSeconds}s (cap=${channel.throttleMaxPerWindow})`;
         console.warn(
-          `[NotificationThrottle] Suppressed: channel=${channel.id} device=${alert.deviceId} ` +
+          `[NotificationThrottle] Suppressed: channel=${channel.id} owner=${ownerKey} ` +
           `count=${throttle.currentCount}/${channel.throttleMaxPerWindow} resetsAt=${windowExpiresIso}`
         );
         // Use 'failed' status + descriptive errorMessage so UI / queries that
@@ -735,14 +750,16 @@ export async function processSendNotification(data: SendNotificationJobData): Pr
       }
     }
 
-    return { send: true, alert, channel, notificationRecord, device, org } satisfies PrepareSendResult;
+    const [subject] = await enrichAlertSubjects([{ ...alert, deviceName: device?.displayName || device?.hostname, orgName: org?.name }]);
+    if (!subject) throw new Error('Alert subject missing');
+    return { send: true, alert, channel, notificationRecord, device, org, subject } satisfies PrepareSendResult;
   });
 
   if (!prepared.send) {
     return { ...prepared.result, durationMs: Date.now() - startTime };
   }
 
-  const { alert, channel, notificationRecord, device, org } = prepared;
+  const { alert, channel, notificationRecord, device, org, subject } = prepared;
 
   // Phase 4c: Per-channel notification templates (pure computation — no DB/Redis needed)
   const channelTemplates = channel.templates as Record<string, string> | null;
@@ -753,8 +770,11 @@ export async function processSendNotification(data: SendNotificationJobData): Pr
       severity: alert.severity,
       message: alert.message || '',
       deviceId: alert.deviceId,
-      device: device?.displayName || device?.hostname || '',
-      deviceName: device?.displayName || device?.hostname || '',
+      device: device?.displayName || device?.hostname || subject.subjectName,
+      deviceName: device?.displayName || device?.hostname || subject.subjectName,
+      ownerKind: subject.ownerKind,
+      ownerLabel: subject.ownerLabel,
+      subjectName: subject.subjectName,
       hostname: device?.hostname || '',
       orgName: org?.name || '',
       triggeredAt: alert.triggeredAt.toISOString(),
@@ -763,8 +783,8 @@ export async function processSendNotification(data: SendNotificationJobData): Pr
 
   // Use the per-channel template message body if available
   const alertForSend = messageBody !== (alert.message || alert.title)
-    ? { ...alert, message: messageBody }
-    : alert;
+    ? { ...alert, ...subject, message: messageBody }
+    : { ...alert, ...subject };
 
   // Send notification based on channel type — OUTSIDE any DB context (#1105).
   let success = false;
@@ -937,7 +957,7 @@ export async function processSendNotification(data: SendNotificationJobData): Pr
  */
 async function sendEmailChannelNotification(
   config: Record<string, unknown>,
-  alert: typeof alerts.$inferSelect,
+  alert: typeof alerts.$inferSelect & Partial<AlertSubject>,
   device: typeof devices.$inferSelect | undefined,
   org: typeof organizations.$inferSelect | undefined
 ): Promise<{ success: boolean; error?: string }> {
@@ -957,6 +977,8 @@ async function sendEmailChannelNotification(
     severity: alert.severity as AlertSeverity,
     summary: alert.message || alert.title,
     deviceName: device?.displayName || device?.hostname,
+    subjectName: alert.subjectName,
+    ownerKind: alert.ownerKind,
     occurredAt: alert.triggeredAt,
     dashboardUrl,
     orgName: org?.name
@@ -968,7 +990,7 @@ async function sendEmailChannelNotification(
  */
 async function sendWebhookChannelNotification(
   config: WebhookConfig,
-  alert: typeof alerts.$inferSelect,
+  alert: typeof alerts.$inferSelect & Partial<AlertSubject>,
   device: typeof devices.$inferSelect | undefined,
   org: typeof organizations.$inferSelect | undefined
 ): Promise<{ success: boolean; error?: string; retryable?: boolean }> {
@@ -993,6 +1015,10 @@ async function sendWebhookChannelNotification(
     severity: alert.severity,
     summary: alert.message || alert.title,
     deviceId: alert.deviceId,
+    owner: alert.owner,
+    ownerKind: alert.ownerKind,
+    ownerLabel: alert.ownerLabel,
+    subjectName: alert.subjectName,
     deviceName: device?.displayName ?? device?.hostname ?? undefined,
     orgId: alert.orgId,
     orgName: org?.name,
@@ -1009,7 +1035,7 @@ async function sendWebhookChannelNotification(
 async function sendChatWebhookChannelNotification(
   channelType: 'slack' | 'teams',
   config: Record<string, unknown>,
-  alert: typeof alerts.$inferSelect,
+  alert: typeof alerts.$inferSelect & Partial<AlertSubject>,
   device: typeof devices.$inferSelect | undefined,
   org: typeof organizations.$inferSelect | undefined
 ): Promise<{ success: boolean; error?: string; retryable?: boolean }> {
@@ -1022,7 +1048,7 @@ async function sendChatWebhookChannelNotification(
     ? `${process.env.DASHBOARD_URL}/alerts/${alert.id}`
     : undefined;
 
-  const payloadTemplate = '{"text":"[{{severity}}] {{alertName}}: {{summary}}{{dashboardUrl}}"}';
+  const payloadTemplate = '{"text":"[{{severity}}] {{alertName}}{{subjectPart}}: {{summary}}{{dashboardUrl}}"}';
 
   return sendWebhookNotification(
     {
@@ -1038,11 +1064,14 @@ async function sendChatWebhookChannelNotification(
       summary: alert.message || alert.title,
       deviceId: alert.deviceId,
       deviceName: device?.displayName ?? device?.hostname ?? undefined,
+      subjectName: alert.subjectName,
+      ownerKind: alert.ownerKind,
       orgId: alert.orgId,
       orgName: org?.name,
       triggeredAt: alert.triggeredAt.toISOString(),
       ruleId: alert.ruleId ?? undefined,
       context: {
+        subjectPart: alert.ownerKind && alert.ownerKind !== 'device' && alert.subjectName ? ` · ${alert.subjectName}` : '',
         dashboardUrl: dashboardUrl ? ` ${dashboardUrl}` : ''
       }
     }
@@ -1054,7 +1083,7 @@ async function sendChatWebhookChannelNotification(
  */
 export async function sendSmsChannelNotification(
   config: SmsChannelConfig,
-  alert: typeof alerts.$inferSelect,
+  alert: typeof alerts.$inferSelect & Partial<AlertSubject>,
   device: typeof devices.$inferSelect | undefined,
   org: typeof organizations.$inferSelect | undefined
 ): Promise<{ success: boolean; error?: string }> {
@@ -1067,6 +1096,8 @@ export async function sendSmsChannelNotification(
     severity: alert.severity as AlertSeverity,
     summary: alert.message || alert.title,
     deviceName: device?.displayName || device?.hostname,
+    subjectName: alert.subjectName,
+    ownerKind: alert.ownerKind,
     occurredAt: alert.triggeredAt,
     dashboardUrl,
     orgName: org?.name
@@ -1083,7 +1114,7 @@ export async function sendSmsChannelNotification(
  */
 async function sendPagerDutyChannelNotification(
   config: PagerDutyConfig,
-  alert: typeof alerts.$inferSelect,
+  alert: typeof alerts.$inferSelect & Partial<AlertSubject>,
   device: typeof devices.$inferSelect | undefined,
   org: typeof organizations.$inferSelect | undefined
 ): Promise<{ success: boolean; error?: string }> {
@@ -1098,6 +1129,8 @@ async function sendPagerDutyChannelNotification(
     summary: alert.message || alert.title,
     deviceId: alert.deviceId,
     deviceName: device?.displayName ?? device?.hostname ?? undefined,
+    subjectName: alert.subjectName,
+    ownerKind: alert.ownerKind,
     orgId: alert.orgId,
     orgName: org?.name,
     triggeredAt: alert.triggeredAt.toISOString(),
@@ -1115,51 +1148,31 @@ async function sendPagerDutyChannelNotification(
  * Send notification via Pushover channel.
  *
  * Per-org channels may leave any field blank; in that case we fall back to
- * the partner-level `pushoverAppToken` / `pushoverDefaultUser` /
- * `pushoverDefaultSound` / `pushoverDefaultPriority` from
- * `partners.settings.notifications`. This mirrors the Slack-webhook-URL
- * inheritance pattern.
+ * the partner-level Pushover defaults in `partners.settings.notifications`
+ * (partnerPushoverDefaults.ts, which opens the sealed token and user key).
  */
-async function sendPushoverChannelNotification(
+export async function sendPushoverChannelNotification(
   config: PushoverConfig,
-  alert: typeof alerts.$inferSelect,
+  alert: typeof alerts.$inferSelect & Partial<AlertSubject>,
   device: typeof devices.$inferSelect | undefined,
   org: typeof organizations.$inferSelect | undefined
 ): Promise<{ success: boolean; error?: string }> {
-  const merged: PushoverConfig = { ...config };
+  let merged: PushoverConfig = { ...config };
 
   const tokenBlank = !merged.token || merged.token.trim().length === 0;
   const userBlank = !merged.user || merged.user.trim().length === 0;
   const needsInherit = tokenBlank || userBlank || merged.sound === undefined || merged.priority === undefined;
 
   if (needsInherit && org?.partnerId) {
-    const inherited = await runWithSystemDbAccess(async () => {
+    const partnerSettings = await runWithSystemDbAccess(async () => {
       const [partner] = await db
         .select({ settings: partners.settings })
         .from(partners)
         .where(eq(partners.id, org.partnerId))
         .limit(1);
-      const notifications = (partner?.settings as { notifications?: Record<string, unknown> } | null)?.notifications;
-      return {
-        pushoverAppToken: typeof notifications?.pushoverAppToken === 'string' ? notifications.pushoverAppToken : undefined,
-        pushoverDefaultUser: typeof notifications?.pushoverDefaultUser === 'string' ? notifications.pushoverDefaultUser : undefined,
-        pushoverDefaultSound: typeof notifications?.pushoverDefaultSound === 'string' ? notifications.pushoverDefaultSound : undefined,
-        pushoverDefaultPriority: typeof notifications?.pushoverDefaultPriority === 'number' ? notifications.pushoverDefaultPriority as PushoverPriority : undefined,
-      };
+      return partner?.settings;
     });
-
-    if (tokenBlank && inherited.pushoverAppToken) {
-      merged.token = inherited.pushoverAppToken;
-    }
-    if (userBlank && inherited.pushoverDefaultUser) {
-      merged.user = inherited.pushoverDefaultUser;
-    }
-    if (merged.sound === undefined && inherited.pushoverDefaultSound) {
-      merged.sound = inherited.pushoverDefaultSound;
-    }
-    if (merged.priority === undefined && inherited.pushoverDefaultPriority !== undefined) {
-      merged.priority = inherited.pushoverDefaultPriority;
-    }
+    merged = applyPartnerPushoverDefaults(merged, readPartnerPushoverDefaults(partnerSettings));
   }
 
   const dashboardUrl = process.env.DASHBOARD_URL
@@ -1173,6 +1186,8 @@ async function sendPushoverChannelNotification(
     summary: alert.message || alert.title,
     deviceId: alert.deviceId,
     deviceName: device?.displayName ?? device?.hostname ?? undefined,
+    subjectName: alert.subjectName,
+    ownerKind: alert.ownerKind,
     orgId: alert.orgId,
     orgName: org?.name,
     triggeredAt: alert.triggeredAt.toISOString(),
@@ -1240,8 +1255,9 @@ async function scheduleEscalation(alertId: string, policyId: string, orgId: stri
   )];
   const validChannels = requestedChannelIds.length > 0
     ? await db
-      .select({ id: notificationChannels.id, type: notificationChannels.type, config: notificationChannels.config })
+      .select({ id: notificationChannels.id, type: notificationChannels.type, config: notificationChannelConfigs.config })
       .from(notificationChannels)
+      .leftJoin(notificationChannelConfigs, eq(notificationChannelConfigs.channelId, notificationChannels.id))
       .where(
         and(
           railOwnershipCondition(notificationChannels.orgId, notificationChannels.partnerId, orgId, orgPartnerId),
@@ -1257,7 +1273,9 @@ async function scheduleEscalation(alertId: string, policyId: string, orgId: stri
   const eligibleUsers = new Set(requestedUsers
     ? (await listEscalationUsers({ orgId, partnerId: null })).map(user => user.id) : []);
   for (const step of escalationOccurrences(steps, originalIndexes, alertId)) {
-    for (const channelId of [...new Set(step.channelIds)].filter(id => validChannelIdSet.has(id))) {
+    const channelIds = [...new Set(step.channelIds)].filter(id => validChannelIdSet.has(id));
+    const userIds = [...new Set(step.userIds)].filter(id => eligibleUsers.has(id));
+    for (const channelId of channelIds) {
       const channel = validChannelById.get(channelId)!;
       const job = await queue.add('send', { type: 'send', alertId, channelId, escalationStep: step.escalationStep }, {
         delay: step.delayMs, jobId: `escalation-${alertId}-step${step.escalationStep}-${channelId}`,
@@ -1266,12 +1284,33 @@ async function scheduleEscalation(alertId: string, policyId: string, orgId: stri
       });
       await retryIfFailedJob(job, `alert ${alertId} escalation step ${step.escalationStep}`);
     }
-    for (const userId of [...new Set(step.userIds)].filter(id => eligibleUsers.has(id))) {
+    for (const userId of userIds) {
       const job = await queue.add('escalation-user', { type: 'escalation-user', alertId, userId, escalationStep: step.escalationStep }, {
         delay: step.delayMs, jobId: `escalation-${alertId}-step${step.escalationStep}-user-${userId}`,
         attempts: 3, backoff: { type: 'exponential', delay: 30000 }, removeOnComplete: true, removeOnFail: { age: 3600 },
       });
       await retryIfFailedJob(job, `alert ${alertId} user escalation ${step.escalationStep}`);
+    }
+    // #10565: the occurrence's single alert.escalated publisher. Only for an
+    // occurrence that pages someone; one with no surviving target is not an
+    // escalation anyone sees. The event is secondary to paging: a failed
+    // enqueue is logged and must not stop later occurrences from scheduling.
+    if (channelIds.length > 0 || userIds.length > 0) {
+      try {
+        const job = await queue.add('escalation-event', {
+          type: 'escalation-event', alertId, escalationStep: step.escalationStep, escalationPolicyId: policyId,
+        }, {
+          delay: step.delayMs, jobId: `escalation-${alertId}-step${step.escalationStep}-event`,
+          attempts: 3, backoff: { type: 'exponential', delay: 30000 }, removeOnComplete: true, removeOnFail: { age: 3600 },
+        });
+        await retryIfFailedJob(job, `alert ${alertId} escalation event ${step.escalationStep}`);
+      } catch (err) {
+        console.error(
+          `[NotificationDispatcher] Failed to schedule alert.escalated for alert ${alertId} `
+          + `step ${step.escalationStep} (policy ${policyId}) — its sends are scheduled; the event will not be published:`,
+          err
+        );
+      }
     }
   }
 
@@ -1287,7 +1326,7 @@ export async function cancelAlertEscalations(alertId: string): Promise<number> {
 
   let cancelled = 0;
   for (const job of delayed) {
-    if ((job.data.type === 'send' || job.data.type === 'escalation-user') &&
+    if ((job.data.type === 'send' || job.data.type === 'escalation-user' || job.data.type === 'escalation-event') &&
         job.data.alertId === alertId &&
         job.data.escalationStep) {
       await job.remove();

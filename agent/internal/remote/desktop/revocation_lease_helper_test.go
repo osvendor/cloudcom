@@ -117,7 +117,7 @@ type helperHarness struct {
 // test here; the wiring is.
 func newHelperHarness(t *testing.T, id string, answer func(sessionID string) *ipc.DesktopLeaseUpdate) *helperHarness {
 	t.Helper()
-	h := &helperHarness{t: t, mgr: NewSessionManager()}
+	h := &helperHarness{t: t, mgr: NewSessionManagerWithPreloader(nil)}
 	h.clock = newVirtualClock(func(msg string) { t.Errorf("%s", msg) })
 	h.mgr.clock = h.clock.watchdogClock()
 

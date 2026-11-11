@@ -1,28 +1,15 @@
 import type { AuthContext } from '../../middleware/auth';
-import { hasSatisfiedMfa } from '../../middleware/auth';
+import { hasSatisfiedMfa, isInteractiveUserSession } from '../../middleware/auth';
 import { canAccessOrg, getUserPermissions, hasPermission, userCanDecideApprovals, PERMISSIONS } from '../permissions';
 import { runOutsideDbContext, withSystemDbAccessContext } from '../../db';
-import type { ScriptProposalDetailDto, ScriptProposalReviewFindingDto } from '@breeze/shared';
+import type { ScriptProposalDetailDto } from '@breeze/shared';
 import {
   loadProposalRow, loadLatestReview, loadProposalExecutions, loadProposalDevices, loadProposalRequesterUserId,
 } from './queries';
+import { scopeDeviceIdsToCaller } from '../aiToolsSiteScope';
+import { projectFindings } from './reviewFindings';
 
 export type ProposalReadDenial = 'not_found' | 'forbidden';
-
-const FINDING_SEVERITIES = new Set(['info', 'warning', 'blocking']);
-
-function projectFindings(raw: unknown): ScriptProposalReviewFindingDto[] {
-  if (!Array.isArray(raw)) return [];
-  const out: ScriptProposalReviewFindingDto[] = [];
-  for (const item of raw) {
-    if (!item || typeof item !== 'object') continue;
-    const f = item as { severity?: unknown; text?: unknown; lineRef?: unknown };
-    if (typeof f.text !== 'string') continue;
-    const severity = FINDING_SEVERITIES.has(String(f.severity)) ? (f.severity as ScriptProposalReviewFindingDto['severity']) : 'info';
-    out.push({ severity, text: f.text, ...(typeof f.lineRef === 'number' ? { lineRef: f.lineRef } : {}) });
-  }
-  return out;
-}
 
 /**
  * THE read rule for a script proposal (spec §4.10, roadmap §3.5). One function,
@@ -35,6 +22,14 @@ function projectFindings(raw: unknown): ScriptProposalReviewFindingDto[] {
  *   - the caller is the proposal's requester (derived — see
  *     loadProposalRequesterUserId), or
  *   - the caller STILL holds approvals:decide for that org.
+ *
+ * The caller's site/exact-device ceiling (`scopeDeviceIdsToCaller`, the same
+ * intersection the sibling AI read `getScriptProposalForPrincipal` applies —
+ * see `scriptProposals/proposals.ts`) is then intersected with the proposal's
+ * target device ids. A site-restricted caller with zero overlap fails closed
+ * the same way an out-of-org caller does; a partial overlap narrows the
+ * returned device/execution lists to the visible subset, so hidden-site
+ * hostnames and statuses are not returned.
  */
 export async function loadScriptProposalDetail(
   auth: AuthContext,
@@ -55,14 +50,43 @@ export async function loadScriptProposalDetail(
   const isRequester = requesterId !== null && requesterId === auth.user.id;
   if (!canDecide && !isRequester) return { ok: false, reason: 'forbidden' };
 
+  // Fail closed when a site- or exact-device-restricted caller's ceiling has
+  // zero overlap with the proposal's targets: a live approvals:decide grant or
+  // requester status is org-scoped, not site-scoped, so it does not by itself
+  // entitle the caller to hidden-site devices.
+  const scopedDeviceIds = await scopeDeviceIdsToCaller(auth, proposal.orgId, proposal.targetDeviceIds);
+  if (scopedDeviceIds !== null && scopedDeviceIds.length === 0) return { ok: false, reason: 'forbidden' };
+  const visibleDeviceIds = scopedDeviceIds ?? (proposal.targetDeviceIds ?? []);
+
   const canWriteScripts = hasPermission(perms!, PERMISSIONS.SCRIPTS_WRITE.resource, PERMISSIONS.SCRIPTS_WRITE.action);
+  const canExecuteScripts = hasPermission(perms!, PERMISSIONS.SCRIPTS_EXECUTE.resource, PERMISSIONS.SCRIPTS_EXECUTE.action);
   const mfaOk = hasSatisfiedMfa(auth);
+  // #10954: the human override (reviewOverride.ts). Every leg is the proposal
+  // org's, live. Running also needs the normal approve permission and every
+  // target in the caller's scope: the run is all-or-nothing on who may sign it.
+  const canSignOverride = proposal.status === 'review_failed' && isInteractiveUserSession(auth) && mfaOk && canExecuteScripts;
+  const canOverrideRun = canSignOverride && canDecide
+    && visibleDeviceIds.length === (proposal.targetDeviceIds ?? []).length
+    && proposal.expiresAt.getTime() > Date.now();
+  const canOverrideSave = canSignOverride && canWriteScripts;
 
   const [review, executions, devices] = await Promise.all([
     loadLatestReview(proposalId, proposal.orgId),
     loadProposalExecutions(proposalId),
-    loadProposalDevices(proposal.targetDeviceIds ?? []),
+    loadProposalDevices(visibleDeviceIds),
   ]);
+  const visibleSet = new Set(visibleDeviceIds);
+  const scopedExecutions = scopedDeviceIds === null ? executions : executions.filter((e) => visibleSet.has(e.deviceId));
+
+  const reviewReachedNoVerdict = proposal.status === 'review_failed'
+    || (review?.reviewerKind === 'model' && review.status !== 'completed');
+  const reviewFailure: ScriptProposalDetailDto['reviewFailure'] = reviewReachedNoVerdict
+    ? {
+        // `decision_note` holds the whole reason until an override replaces it.
+        reason: (proposal.status === 'review_failed' ? proposal.decisionNote : null) ?? review?.summary ?? null,
+        humanApproved: proposal.status !== 'review_failed' && proposal.decidedBy !== null,
+      }
+    : null;
 
   const verdict = (review?.verdict ?? {}) as { findings?: unknown; blastRadius?: unknown };
   const verificationResult = (proposal.verificationResult ?? null) as
@@ -82,7 +106,7 @@ export async function loadScriptProposalDetail(
         id: proposal.id, status: proposal.status, language: proposal.language, content: proposal.content,
         contentDigest: proposal.contentDigest, goal: proposal.goal, expectedEffect: proposal.expectedEffect,
         rollbackNote: proposal.rollbackNote ?? null, verification: proposal.verification, runAs: proposal.runAs,
-        timeoutSeconds: proposal.timeoutSeconds, targetDeviceIds: proposal.targetDeviceIds ?? [],
+        timeoutSeconds: proposal.timeoutSeconds, targetDeviceIds: visibleDeviceIds,
         basicHits: proposal.basicHits ?? [], strictHits: proposal.strictHits ?? [],
         touchClasses: proposal.touchClasses ?? [], riskTier: proposal.riskTier ?? null, revision: proposal.revision,
         acknowledgedPatterns: proposal.acknowledgedPatterns ?? [],
@@ -104,7 +128,7 @@ export async function loadScriptProposalDetail(
           }
         : null,
       devices: devices.map((d) => ({ id: d.id, hostname: d.hostname, osType: d.osType ?? null, status: d.status })),
-      executions: executions.map((e) => ({
+      executions: scopedExecutions.map((e) => ({
         id: e.id, deviceId: e.deviceId, deviceHostname: e.hostname ?? null, status: e.status,
         exitCode: e.exitCode ?? null,
         startedAt: e.startedAt?.toISOString() ?? null, completedAt: e.completedAt?.toISOString() ?? null,
@@ -115,10 +139,13 @@ export async function loadScriptProposalDetail(
         attempts: verificationResult?.attempts ?? 0,
         detail: verificationResult?.detail ?? null,
       },
+      reviewFailure,
       viewer: {
         canDecide,
         canAcknowledge: canWriteScripts && mfaOk,
         canPromote: canWriteScripts && mfaOk && proposal.status === 'verified',
+        canOverrideRun,
+        canOverrideSave,
       },
     },
   };

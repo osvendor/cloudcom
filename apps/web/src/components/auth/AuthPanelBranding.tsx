@@ -16,19 +16,19 @@ import '../../lib/i18n';
  * branding payload is present it swaps in the partner logo/accent/headline and
  * DROPS the Breeze marketing copy.
  */
-export default function AuthPanelBranding({ tagline }: { tagline: string }) {
+export default function AuthPanelBranding({ tagline, partnerSlug }: { tagline: string; partnerSlug?: string }) {
   const { t } = useTranslation('auth');
   const [branding, setBranding] = useState<LoginContextBranding | null>(null);
 
   useEffect(() => {
     let cancelled = false;
-    getLoginContext().then((ctx) => {
+    getLoginContext(partnerSlug).then((ctx) => {
       if (!cancelled && ctx.branding) setBranding(ctx.branding);
     });
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [partnerSlug]);
 
   const panelStyle = branding?.accentColor ? { backgroundColor: branding.accentColor } : undefined;
   const safeLogo = branding?.logoUrl ? sanitizeImageSrc(branding.logoUrl) : null;
@@ -45,7 +45,11 @@ export default function AuthPanelBranding({ tagline }: { tagline: string }) {
               src={safeLogo}
               alt=""
               data-testid="partner-logo"
-              className="h-8 max-w-[180px] object-contain"
+              // Sized for badge-style logos too (#7899): h-8 left a round
+              // badge unreadable, h-16/lg:h-20 was still small, so h-24
+              // (96px) / lg:h-32 (128px). The width cap is min(panel, 280px)
+              // because the panel's content box is only ~242px wide at md.
+              className="h-24 w-auto max-w-[min(100%,280px)] object-contain lg:h-32"
             />
           ) : (
             <>

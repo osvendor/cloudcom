@@ -219,6 +219,42 @@ describe("DeploymentProgress", () => {
     expect(detailCalls).toBe(3);
   });
 
+  describe("header status label (#9637)", () => {
+    const cases: Array<[string, string, string, Record<string, unknown>]> = [
+      ["completed", "Deployment complete", "completed", { completed: 2, total: 2 }],
+      ["completed_with_errors", "Completed with errors", "completed_with_errors", { completed: 1, failed: 1, total: 2 }],
+      ["failed", "Failed", "failed", { failed: 2, total: 2 }],
+      ["cancelled", "Cancelled", "cancelled", { cancelled: 2, total: 2 }],
+      ["in_progress", "In progress", "in_progress", { inProgress: 1, total: 1 }],
+      ["pending (immediate)", "In progress", "pending", { pending: 1, total: 1 }],
+    ];
+    it.each(cases)("%s", async (_n, label, status, counts) => {
+      routeFetch({ detail: detailPayload(status, counts) });
+      render(<DeploymentProgress deploymentId={DEP_ID} />);
+      const pct = await screen.findByTestId("deployment-percent");
+      expect(pct.nextElementSibling?.textContent).toBe(label);
+    });
+
+    it("a pending deployment whose scheduled time has passed reads In progress", async () => {
+      const payload = detailPayload("pending", { pending: 1, total: 1 });
+      (payload.data as Record<string, unknown>).scheduledAt = "2020-01-01T10:00:00Z";
+      routeFetch({ detail: payload });
+      render(<DeploymentProgress deploymentId={DEP_ID} />);
+      const pct = await screen.findByTestId("deployment-percent");
+      expect(pct.nextElementSibling?.textContent).toBe("In progress");
+    });
+
+    it("shows Scheduled with the time for a future scheduled deployment", async () => {
+      const payload = detailPayload("pending", { pending: 1, total: 1 });
+      payload.data.scheduleType = "scheduled";
+      (payload.data as Record<string, unknown>).scheduledAt = "2999-06-15T10:00:00Z";
+      routeFetch({ detail: payload });
+      render(<DeploymentProgress deploymentId={DEP_ID} />);
+      const pct = await screen.findByTestId("deployment-percent");
+      expect(pct.nextElementSibling?.textContent).toMatch(/^Scheduled for .*2999/);
+    });
+  });
+
   it("does not poll once the aggregate status is terminal", async () => {
     vi.useFakeTimers();
     let detailCalls = 0;
@@ -455,5 +491,211 @@ describe("DeploymentProgress — package manager unavailable (#3604)", () => {
     expect(
       screen.queryByTestId("deployment-manager-unavailable-summary"),
     ).not.toBeInTheDocument();
+  });
+});
+
+describe("DeploymentProgress — in-flight installs (#3578)", () => {
+  beforeEach(() => {
+    fetchMock.mockReset();
+    showToast.mockReset();
+  });
+
+  const minutesAgo = (m: number) => new Date(Date.now() - m * 60_000).toISOString();
+  const inFlight = (id: string, extra: Record<string, unknown>) => ({
+    ...RESULT_QUEUED_OFFLINE,
+    id,
+    deviceId: `device-${id}`,
+    hostname: `HOST-${id}`,
+    queuedOffline: false,
+    ...extra,
+  });
+
+  it("shows the agent's stage and how long it has been in it instead of a bare Pending", async () => {
+    routeFetch({
+      detail: detailPayload("in_progress", { pending: 3, total: 3 }),
+      results: {
+        data: [
+          inFlight("a", { sentAt: minutesAgo(9), agentStage: null, agentStageAt: null }),
+          inFlight("b", { sentAt: minutesAgo(9), agentStage: "downloading", agentStageAt: minutesAgo(3) }),
+          inFlight("c", { sentAt: minutesAgo(20), agentStage: "installing", agentStageAt: minutesAgo(12) }),
+        ],
+        total: 3,
+      },
+    });
+
+    render(<DeploymentProgress deploymentId={DEP_ID} />);
+    await screen.findByText("Chrome Rollout");
+
+    const rowA = screen.getByTestId("deployment-result-row-a");
+    expect(within(rowA).getByText("Sent to agent")).toBeInTheDocument();
+    expect(within(rowA).getByTestId("deployment-result-elapsed-a")).toHaveTextContent("for 9 minutes");
+
+    const rowB = screen.getByTestId("deployment-result-row-b");
+    expect(within(rowB).getByText("Downloading")).toBeInTheDocument();
+    expect(within(rowB).getByTestId("deployment-result-elapsed-b")).toHaveTextContent("for 3 minutes");
+
+    const rowC = screen.getByTestId("deployment-result-row-c");
+    expect(within(rowC).getByText("Installing")).toBeInTheDocument();
+    expect(within(rowC).getByTestId("deployment-result-elapsed-c")).toHaveTextContent("for 12 minutes");
+
+    // None of them has been quiet past the agent's own ceiling.
+    expect(screen.queryByTestId(/^deployment-result-silent-/)).not.toBeInTheDocument();
+  });
+
+  it("warns when the agent has been quiet longer than it allows itself", async () => {
+    routeFetch({
+      detail: detailPayload("in_progress", { pending: 1, total: 1 }),
+      results: {
+        data: [inFlight("d", { sentAt: minutesAgo(25), agentStage: "downloading", agentStageAt: minutesAgo(18) })],
+        total: 1,
+      },
+    });
+
+    render(<DeploymentProgress deploymentId={DEP_ID} />);
+    await screen.findByText("Chrome Rollout");
+
+    const hint = screen.getByTestId("deployment-result-silent-d");
+    expect(hint).toHaveTextContent("No update from the agent for 18 minutes");
+    // Quotes the server's timeout so the operator knows what happens next.
+    expect(hint).toHaveTextContent("75 minutes");
+  });
+
+  it("keeps the queued-offline and terminal rows unchanged", async () => {
+    routeFetch({
+      detail: detailPayload("in_progress", { pending: 1, completed: 1, total: 2 }),
+      results: { data: [RESULT_COMPLETED, RESULT_QUEUED_OFFLINE], total: 2 },
+    });
+
+    render(<DeploymentProgress deploymentId={DEP_ID} />);
+    await screen.findByText("Chrome Rollout");
+
+    expect(screen.getByText("Queued — device offline")).toBeInTheDocument();
+    expect(screen.queryByTestId(/^deployment-result-elapsed-/)).not.toBeInTheDocument();
+  });
+});
+
+describe("DeploymentProgress restore-point badge (#4759)", () => {
+  const restorePoint = (status: string) => ({
+    status,
+    requestId: "r-1",
+    attemptedAt: "2026-07-20T10:00:30Z",
+    durationMs: 900,
+    message: null,
+    existingPointAgeMinutes: null,
+    frequencyMinutes: null,
+  });
+
+  it("renders the badge on a device row whose result carries an outcome", async () => {
+    routeFetch({
+      detail: detailPayload("completed", { completed: 1, total: 1 }),
+      results: {
+        data: [{ ...RESULT_COMPLETED, restorePoint: restorePoint("created") }],
+        total: 1,
+      },
+    });
+
+    render(<DeploymentProgress deploymentId={DEP_ID} />);
+    await screen.findByText("Chrome Rollout");
+
+    const row = screen.getByTestId("deployment-result-row-res-1");
+    expect(within(row).getByTestId("restore-point-badge").textContent).toMatch(
+      /restore point creation confirmed/i,
+    );
+  });
+
+  it("shows only the rows that have an outcome, one badge per device", async () => {
+    routeFetch({
+      detail: detailPayload("completed", { completed: 2, total: 2 }),
+      results: {
+        data: [
+          { ...RESULT_COMPLETED, restorePoint: restorePoint("requested") },
+          { ...RESULT_QUEUED_OFFLINE, restorePoint: null },
+        ],
+        total: 2,
+      },
+    });
+
+    render(<DeploymentProgress deploymentId={DEP_ID} />);
+    await screen.findByText("Chrome Rollout");
+
+    expect(screen.getAllByTestId("restore-point-badge")).toHaveLength(1);
+    const row = screen.getByTestId("deployment-result-row-res-1");
+    expect(within(row).getByTestId("restore-point-badge").textContent).toMatch(/awaiting the device/i);
+  });
+
+  it("renders no badge when no row has an outcome (agents that predate #4609)", async () => {
+    routeFetch({
+      detail: detailPayload("completed", { completed: 1, total: 1 }),
+      results: { data: [RESULT_COMPLETED], total: 1 },
+    });
+
+    render(<DeploymentProgress deploymentId={DEP_ID} />);
+    await screen.findByText("Chrome Rollout");
+
+    expect(screen.queryByTestId("restore-point-badge")).not.toBeInTheDocument();
+  });
+});
+
+describe("DeploymentProgress — vendor output beside the exit code (#10307)", () => {
+  beforeEach(() => {
+    fetchMock.mockReset();
+    showToast.mockReset();
+  });
+
+  const ESC = "\u001b";
+  const RESULT_POST_SCRIPT_FAILED = {
+    ...RESULT_FAILED_NO_HOSTNAME,
+    id: "res-ctrld",
+    hostname: "WS-CTRLD",
+    exitCode: 1,
+    errorMessage: "post_install_script_failed: post-install script exited with code 1",
+    output: [
+      ...Array.from({ length: 30 }, (_, i) => `${ESC}[90mINF${ESC}[0m step ${i + 1}`),
+      `${ESC}[31mERR${ESC}[0m failed to provision: Invalid provisioning code <img src=x onerror=alert(1)>`,
+      "",
+    ].join("\n"),
+  };
+
+  it("shows a bounded, ANSI-free tail of the device output as plain text", async () => {
+    routeFetch({
+      detail: detailPayload("failed", { failed: 1, total: 1 }),
+      results: { data: [RESULT_POST_SCRIPT_FAILED], total: 1 },
+    });
+
+    const { container } = render(<DeploymentProgress deploymentId={DEP_ID} />);
+    await screen.findByText("Chrome Rollout");
+
+    const excerpt = screen.getByTestId(`deployment-result-output-${RESULT_POST_SCRIPT_FAILED.id}`);
+    expect(excerpt).toHaveTextContent("Device output (last lines)");
+    const text = excerpt.textContent ?? "";
+    // The vendor's reason is visible...
+    expect(text).toContain("ERR failed to provision: Invalid provisioning code <img src=x onerror=alert(1)>");
+    // ...ANSI is gone...
+    expect(text).not.toContain(ESC);
+    expect(text).not.toContain("[90m");
+    // ...the excerpt is the tail, not all 31 lines...
+    expect(text).not.toContain("step 20");
+    expect(text).toContain("step 30");
+    // ...and the output is text, never markup.
+    expect(container.querySelector("img")).toBeNull();
+    // The agent's error stays alongside it.
+    const row = screen.getByTestId(`deployment-result-row-${RESULT_POST_SCRIPT_FAILED.id}`);
+    expect(row).toHaveTextContent("post_install_script_failed");
+  });
+
+  it("shows no excerpt for a successful row or a failed row with no output", async () => {
+    routeFetch({
+      detail: detailPayload("completed_with_errors", { completed: 1, failed: 1, total: 2 }),
+      results: {
+        data: [{ ...RESULT_COMPLETED, output: "installed ok" }, RESULT_FAILED_NO_HOSTNAME],
+        total: 2,
+      },
+    });
+
+    render(<DeploymentProgress deploymentId={DEP_ID} />);
+    await screen.findByText("Chrome Rollout");
+
+    expect(screen.queryByTestId(`deployment-result-output-${RESULT_COMPLETED.id}`)).toBeNull();
+    expect(screen.queryByTestId(`deployment-result-output-${RESULT_FAILED_NO_HOSTNAME.id}`)).toBeNull();
   });
 });

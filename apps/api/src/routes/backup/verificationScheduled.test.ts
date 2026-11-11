@@ -24,10 +24,13 @@ vi.mock('../../db', () => ({
     update: (...args: unknown[]) => updateMock(...(args as [])),
   },
   withSystemDbAccessContext: vi.fn(async (fn: () => any) => fn()),
+  withSystemDbAccessContextIsolated: vi.fn(async (fn: () => any) => fn()),
+  withDbTransactionIfHeld: vi.fn(async (fn: () => any) => fn()),
 }));
 
 vi.mock('../../db/schema', () => ({
-  RESTORABLE_BACKUP_JOB_STATUSES: ['completed', 'partial'],
+  RESTORABLE_BACKUP_JOB_STATUSES: ['completed', 'completed_with_errors', 'partial'],
+  DEGRADED_BACKUP_JOB_STATUSES: ['completed_with_errors', 'partial'],
   backupJobs: {
     orgId: 'backup_jobs.org_id',
     deviceId: 'backup_jobs.device_id',

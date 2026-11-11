@@ -37,7 +37,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { and, eq, isNull, ne, sql } from 'drizzle-orm';
+import { and, eq, inArray, isNull, ne, sql } from 'drizzle-orm';
 import { db } from '../../db';
 import { assertNoAmbientDbContext, type DbContextRunner } from './dbContextGuard';
 import {
@@ -50,13 +50,24 @@ import {
   sites,
 } from '../../db/schema';
 import type { AccountingEntityMapping as AccountingEntityMappingRow } from '../../db/schema';
-import { getConnection } from './accountingConnectionService';
+import { resolveActiveConnection } from './accountingConnectionService';
 import type { AccountingConnection } from './accountingConnectionService';
 import { normalizeCurrencyCode } from './accountingCurrency';
 import { getValidAccessToken, ReauthRequiredError } from './accountingTokens';
-import { getAccountingProvider } from './providerRegistry';
+import { accountingProviderDisplayName, getAccountingProvider } from './providerRegistry';
 import { captureException } from '../sentry';
 import { getRedis } from '../redis';
+import {
+  isAccountingProviderError,
+  providerFaultSuffix,
+  providerPermissionMessage,
+  providerRateLimitedRetryLaterMessage,
+  providerRateLimitedTryAgainMessage,
+  rateLimitRetryAfterMs,
+  rateLimitSourceOf,
+  refusalCodeOf,
+  type AccountingThrottleSource,
+} from './accountingProviderError';
 // Narrow import: `../orgImport`'s barrel pulls in `services/tenantLifecycle.ts`,
 // which dynamically imports `routes/agentWs.ts` — several callers of this
 // module (quoteSendWorker, stripeReconcileSweep, invoiceWorker, contractWorker,
@@ -64,7 +75,7 @@ import { getRedis } from '../redis';
 // workers whose closure must never reach socket-local dispatch (see
 // workerEntrypointClosure.contract.test.ts).
 import { billingAddressColumns } from '../orgImport/addressColumns';
-// Narrow import: `./quickbooksCustomerImport` transitively pulls in
+// Narrow import: `./accountingCustomerImport` transitively pulls in
 // `../orgImport` (for commitOrgImport/previewOrgImport), same reachability
 // concern as billingAddressColumns above.
 import { siteAddressFrom } from './addressMapping';
@@ -74,6 +85,7 @@ import type {
   AccountingCustomerPayload,
   AccountingEntityMapping as AccountingEntityMappingSeam,
   AccountingItemPayload,
+  AccountingProviderId,
   RemoteAddress,
   RemoteCustomer,
   RemoteIncomeAccount,
@@ -81,18 +93,22 @@ import type {
   RemoteRef,
 } from './types';
 
+import { HIDDEN_ORG_TYPES, notHiddenOrgType } from '../unassignedPool/visibility';
+import { UNASSIGNED_POOL_ORG_TYPE } from '../unassignedPool/orgType';
 export type MappingEntityType = 'org' | 'catalog_item';
 export type MappingDecision = 'confirmed' | 'create_new' | 'unlinked';
 
 export interface ListMappingProposalsInput {
   partnerId: string;
-  provider: 'quickbooks';
+  provider: AccountingProviderId;
   entityType: MappingEntityType;
 }
 
 export type AccountingMappingErrorCode =
   | 'not_connected'
   | 'reauth_required'
+  | 'provider_error'
+  // 'quickbooks_error': pre-W01 alias; never produced any more, kept for compile compatibility
   | 'quickbooks_error'
   | 'record_failed'
   | 'sync_in_progress'
@@ -112,19 +128,52 @@ export type AccountingMappingErrorCode =
   // a catalog item syncs once per partner), so the price book can genuinely
   // lack a row in the resolved target currency. Surfaced the same way
   // income_account_required is: a pre-flight 409 before any provider call.
-  | 'item_price_required';
+  | 'item_price_required'
+  // Throttled by the provider or Breeze's own limiter (429, `retryAfterMs`).
+  // Routes answer 429 + Retry-After; the sync worker delays the job without
+  // consuming an attempt. Deliberately NOT in MAPPING_TERMINAL_CODES.
+  | 'rate_limited'
+  // The provider lacks the hook a route needs (Xero W02: settings pickers). 409.
+  | 'capability_unavailable'
+  // Xero W03 — provider verdicts only the user can resolve (409, terminal, never Sentry):
+  // a same-named remote record exists (`details.remoteName`), the record Breeze would
+  // adopt (or is mapped to) is archived, the mapped record no longer exists, or the
+  // grant lacks the scope for this call.
+  | 'duplicate_name'
+  | 'remote_archived'
+  | 'remote_missing'
+  | 'provider_permission'
+  // #7292 — the provider answered HTTP 400 `validation` with no neutral refusal
+  // code (e.g. a name Xero or QuickBooks will not accept). Only editing the record
+  // fixes it, so it is terminal (409, never retried). Unlike the codes above it is
+  // still reported to Sentry ONCE by the coordinator: a code-less 400 can also be a
+  // Breeze payload bug, and that must stay visible.
+  | 'provider_rejected';
 
 // Typed failure the route translates straight to an HTTP status (mirrors
-// QbImportError in quickbooksCustomerImport.ts). Narrowing `code`/`status` to
+// AccountingImportError in accountingCustomerImport.ts). Narrowing `code`/`status` to
 // literals lets a route drop its `as`-cast.
 export class AccountingMappingError extends Error {
+  /** Set on `rate_limited` only: how long to wait before retrying. */
+  readonly retryAfterMs?: number;
+  /** Set on `rate_limited` only: who throttled (provider 429, Breeze's limiter, or its store). */
+  readonly throttleSource?: AccountingThrottleSource;
+  /** Safe, structured context for the client (e.g. `remoteName` on `duplicate_name`). */
+  readonly details?: Readonly<Record<string, string>>;
   constructor(
     public readonly code: AccountingMappingErrorCode,
-    public readonly status: 404 | 409 | 502,
+    public readonly status: 404 | 409 | 429 | 502,
     message: string,
+    opts: {
+      retryAfterMs?: number; throttleSource?: AccountingThrottleSource; cause?: unknown;
+      details?: Readonly<Record<string, string>>;
+    } = {},
   ) {
-    super(message);
+    super(message, opts.cause === undefined ? undefined : { cause: opts.cause });
     this.name = 'AccountingMappingError';
+    this.retryAfterMs = opts.retryAfterMs;
+    this.throttleSource = opts.throttleSource;
+    this.details = opts.details;
   }
 }
 
@@ -171,6 +220,23 @@ function orgBillingEmail(billingContact: unknown): string | null {
 }
 
 /**
+ * Which connection a call must act on (Xero W01):
+ * - `{ connectionId }` — jobs: the exact connection the work was enqueued for;
+ * - `{ provider }` — routes: the `:provider` in the URL;
+ * - `undefined` — producer-less callers: the partner's active connection.
+ */
+export type ConnectionTarget =
+  | { connectionId: string }
+  | { provider: AccountingProviderId }
+  | undefined;
+
+function notConnectedMessage(provider: AccountingProviderId | null): string {
+  return provider
+    ? `${accountingProviderDisplayName(provider)} is not connected for this partner`
+    : 'No accounting system is connected for this partner';
+}
+
+/**
  * Resolve the partner's connection row, rejecting disconnected/reauth DB
  * states as typed errors. This is a plain read through the ambient `db` (the
  * caller's partner-scoped context) — it never refreshes a live access token,
@@ -181,22 +247,33 @@ function orgBillingEmail(billingContact: unknown): string | null {
  * Split out of `resolveConnectionAndToken` below (Phase C, Task 5 — the
  * unlink-without-live-token fix): callers that DO need a live token call
  * `resolveConnectionAndToken`, which composes this with `resolveLiveConnection`.
+ *
+ * Always the partner's ONE active row (accounting_connections_partner_idx),
+ * then checked against the caller's target: a route's :provider, or a job's
+ * connectionId. A mismatch is `not_connected` — never "use whatever is
+ * connected now".
  */
 export async function resolveConnection(
   partnerId: string,
-  provider: 'quickbooks',
+  target?: ConnectionTarget,
 ): Promise<AccountingConnection> {
-  const conn = await getConnection(db, partnerId, provider);
-  if (!conn) {
-    throw new AccountingMappingError('not_connected', 404, 'QuickBooks is not connected for this partner');
+  const wanted = target && 'provider' in target ? target.provider : null;
+  const conn = await resolveActiveConnection(db, partnerId);
+  if (!conn) throw new AccountingMappingError('not_connected', 404, notConnectedMessage(wanted));
+  if (wanted && conn.provider !== wanted) {
+    throw new AccountingMappingError('not_connected', 404, notConnectedMessage(wanted));
   }
+  if (target && 'connectionId' in target && conn.id !== target.connectionId) {
+    throw new AccountingMappingError('not_connected', 404, notConnectedMessage(conn.provider));
+  }
+  const label = accountingProviderDisplayName(conn.provider);
   // A previously-connected partner whose token was revoked/expired needs
   // "reconnect", not "connect" — distinct remediation from never-connected.
   if (conn.status === 'reauth_required') {
-    throw new AccountingMappingError('reauth_required', 409, 'QuickBooks needs to be reconnected');
+    throw new AccountingMappingError('reauth_required', 409, `${label} needs to be reconnected`);
   }
   if (conn.status !== 'connected') {
-    throw new AccountingMappingError('not_connected', 404, 'QuickBooks is not connected for this partner');
+    throw new AccountingMappingError('not_connected', 404, notConnectedMessage(conn.provider));
   }
   return conn;
 }
@@ -221,7 +298,17 @@ export async function resolveLiveConnection(conn: AccountingConnection): Promise
     accessToken = await getValidAccessToken(db, conn);
   } catch (err) {
     if (err instanceof ReauthRequiredError) {
-      throw new AccountingMappingError('reauth_required', 409, 'QuickBooks needs to be reconnected');
+      throw new AccountingMappingError('reauth_required', 409, `${accountingProviderDisplayName(conn.provider)} needs to be reconnected`);
+    }
+    // A throttled token endpoint (Xero W01): typed, so routes answer 429 and
+    // workers delay the job instead of treating it as an unexpected failure.
+    const retryAfterMs = rateLimitRetryAfterMs(err);
+    if (retryAfterMs !== null) {
+      const throttleSource = rateLimitSourceOf(err) ?? 'provider';
+      throw new AccountingMappingError(
+        'rate_limited', 429, providerRateLimitedTryAgainMessage(accountingProviderDisplayName(conn.provider), throttleSource),
+        { retryAfterMs, throttleSource, cause: err },
+      );
     }
     throw err;
   }
@@ -246,11 +333,11 @@ export async function resolveLiveConnection(conn: AccountingConnection): Promise
  */
 export async function resolveConnectionAndToken(
   partnerId: string,
-  provider: 'quickbooks',
+  target: ConnectionTarget,
   runInDbContext: DbContextRunner,
 ): Promise<{ conn: AccountingConnection; liveConn: AccountingConnection }> {
   assertNoAmbientDbContext('resolveConnectionAndToken');
-  const conn = await runInDbContext(() => resolveConnection(partnerId, provider));
+  const conn = await runInDbContext(() => resolveConnection(partnerId, target));
   const liveConn = await resolveLiveConnection(conn);
   return { conn, liveConn };
 }
@@ -262,12 +349,32 @@ export async function resolveConnectionAndToken(
  * Sentry for forensics but never surfaced in the thrown message, so a caller
  * can't leak an upstream response body to the client.
  */
-async function callProviderOrThrow<T>(action: () => Promise<T>, errorMessage: string): Promise<T> {
+export async function callProviderOrThrow<T>(action: () => Promise<T>, errorMessage: string): Promise<T> {
   try {
     return await action();
   } catch (err) {
+    // An already-typed throttle (e.g. a wrapper that resolved its own token)
+    // passes through unchanged; every other AccountingMappingError keeps the
+    // existing provider_error wrapping below.
+    if (err instanceof AccountingMappingError && err.code === 'rate_limited') throw err;
+    // A throttle is not an upstream failure (Xero W01): 429 + retryAfterMs, no
+    // Sentry event. The message is built from the provider label only, never
+    // from the error, for the same no-leak reason as the 502 below.
+    const retryAfterMs = rateLimitRetryAfterMs(err);
+    if (retryAfterMs !== null && isAccountingProviderError(err)) {
+      const throttleSource = rateLimitSourceOf(err) ?? 'provider';
+      throw new AccountingMappingError(
+        'rate_limited', 429, providerRateLimitedTryAgainMessage(accountingProviderDisplayName(err.provider), throttleSource),
+        { retryAfterMs, throttleSource, cause: err },
+      );
+    }
+    // A scope refusal is the user's to fix (reconnect and approve), not an
+    // upstream fault (Xero W03): 409, no Sentry event.
+    if (refusalCodeOf(err) === 'insufficient_scope' && isAccountingProviderError(err)) {
+      throw new AccountingMappingError('provider_permission', 409, providerPermissionMessage(accountingProviderDisplayName(err.provider)), { cause: err });
+    }
     captureException(err instanceof Error ? err : new Error(String(err)));
-    throw new AccountingMappingError('quickbooks_error', 502, errorMessage);
+    throw new AccountingMappingError('provider_error', 502, errorMessage);
   }
 }
 
@@ -343,7 +450,7 @@ function findExactMatch<T extends { id: string }>(
  * `organizations` (e.g. routes/portal.compat.test.ts, which imports this
  * module transitively via accountingInvoicePush) would throw on load.
  */
-const notQuickSupportOrg = () => ne(organizations.type, 'quick_support');
+const notQuickSupportOrg = () => notHiddenOrgType();
 
 /**
  * Ids of the partner's hidden `quick_support` orgs (in practice exactly one).
@@ -370,7 +477,7 @@ async function loadQuickSupportOrgIds(partnerId: string): Promise<Set<string>> {
     .from(organizations)
     .where(and(
       eq(organizations.partnerId, partnerId),
-      eq(organizations.type, 'quick_support'),
+      inArray(organizations.type, [...HIDDEN_ORG_TYPES]),
       isNull(organizations.deletedAt),
     ));
   return new Set(rows.map((r) => r.id));
@@ -389,9 +496,10 @@ async function proposeOrgMappings(
   // `runOutsideDbContext` here, which only swaps which `db` the
   // AsyncLocalStorage proxy resolves to and does NOT close a transaction the
   // caller already opened (#1105).
+  const providerLabel = accountingProviderDisplayName(conn.provider);
   const remoteCustomers = await callProviderOrThrow(
     () => getAccountingProvider(conn.provider).listRemoteCustomers(liveConn),
-    'QuickBooks returned an error while listing customers',
+    `${providerLabel} returned an error while listing customers`,
   );
   const remoteNameById = new Map(remoteCustomers.map((c) => [c.id, c.displayName]));
 
@@ -437,7 +545,7 @@ async function buildOrgProposals(
     .from(organizationExternalLinks)
     .where(and(
       eq(organizationExternalLinks.partnerId, partnerId),
-      eq(organizationExternalLinks.system, 'quickbooks'),
+      eq(organizationExternalLinks.system, conn.provider),
     ));
 
   // Neither read above carries the org query's `type` filter, so both can still
@@ -454,9 +562,15 @@ async function buildOrgProposals(
   // first time reconciliation sees it — every later call hits this as a
   // current-mapping (tier 1) row instead of re-deriving it. ON CONFLICT DO
   // NOTHING: a concurrent caller may have already inserted the same row.
+  // Carry the live SyncToken + currency from the listing just fetched, exactly
+  // as a manual confirm does — a row without a token could never be updated in
+  // QuickBooks (#7134). The provider also self-heals a missing token, so rows
+  // backfilled before this fix recover on their next sync.
+  const remoteById = new Map(remoteCustomers.map((c) => [c.id, c]));
   for (const link of links) {
     if (hiddenOrgIds.has(link.orgId)) continue;
     if (mappingByOrgId.has(link.orgId)) continue;
+    const remote = remoteById.get(link.externalId);
     const [inserted] = await db
       .insert(accountingEntityMappings)
       .values({
@@ -466,6 +580,8 @@ async function buildOrgProposals(
         breezeEntityId: link.orgId,
         remoteEntityType: 'Customer',
         remoteEntityId: link.externalId,
+        remoteSyncToken: remote?.remoteVersion ?? null,
+        remoteCurrencyCode: remote?.currencyCode ?? null,
         linkStatus: 'confirmed',
         syncStatus: 'pending',
       })
@@ -534,9 +650,10 @@ async function proposeItemMappings(
 ): Promise<MappingProposal[]> {
   // See the comment in proposeOrgMappings above — fetch first with nothing
   // held, then one short DB context for the reads.
+  const providerLabel = accountingProviderDisplayName(conn.provider);
   const remoteItems = await callProviderOrThrow(
     () => getAccountingProvider(conn.provider).listRemoteItems(liveConn),
-    'QuickBooks returned an error while listing items',
+    `${providerLabel} returned an error while listing items`,
   );
   const remoteNameById = new Map(remoteItems.map((i) => [i.id, i.displayName]));
 
@@ -620,7 +737,7 @@ export async function listMappingProposals(
   runInDbContext: DbContextRunner,
 ): Promise<MappingProposal[]> {
   const { partnerId, provider, entityType } = input;
-  const { conn, liveConn } = await resolveConnectionAndToken(partnerId, provider, runInDbContext);
+  const { conn, liveConn } = await resolveConnectionAndToken(partnerId, { provider }, runInDbContext);
 
   return entityType === 'org'
     ? proposeOrgMappings(partnerId, conn, liveConn, runInDbContext)
@@ -633,16 +750,17 @@ export async function listMappingProposals(
  * and the provider call so the route stays a thin pass-through.
  */
 export async function listRemoteIncomeAccountsForPartner(
-  input: { partnerId: string; provider: 'quickbooks' },
+  input: { partnerId: string; provider: AccountingProviderId },
   runInDbContext: DbContextRunner,
 ): Promise<RemoteIncomeAccount[]> {
-  const { conn, liveConn } = await resolveConnectionAndToken(input.partnerId, input.provider, runInDbContext);
+  const { conn, liveConn } = await resolveConnectionAndToken(input.partnerId, { provider: input.provider }, runInDbContext);
   // Nothing to persist, so there is no second DB phase: the connection read
   // committed inside `resolveConnectionAndToken`'s short context and this
   // provider call runs with no connection held.
+  const providerLabel = accountingProviderDisplayName(conn.provider);
   return callProviderOrThrow(
     () => getAccountingProvider(conn.provider).listRemoteIncomeAccounts(liveConn),
-    'QuickBooks returned an error while listing income accounts',
+    `${providerLabel} returned an error while listing income accounts`,
   );
 }
 
@@ -656,7 +774,7 @@ export async function listRemoteIncomeAccountsForPartner(
 
 export interface SaveMappingDecisionInput {
   partnerId: string;
-  provider: 'quickbooks';
+  provider: AccountingProviderId;
   breezeEntityType: MappingEntityType;
   breezeEntityId: string;
   decision: MappingDecision;
@@ -665,7 +783,7 @@ export interface SaveMappingDecisionInput {
 
 export interface SyncMappedEntityInput {
   partnerId: string;
-  provider: 'quickbooks';
+  provider: AccountingProviderId;
   breezeEntityType: MappingEntityType;
   breezeEntityId: string;
 }
@@ -697,7 +815,9 @@ async function loadOwnedOrg(
     .where(and(
       eq(organizations.id, orgId),
       eq(organizations.partnerId, partnerId),
-      opts.allowQuickSupport ? undefined : notQuickSupportOrg(),
+      // Even the `unlinked` escape hatch never reaches the holding org: it can
+      // never have been offered, so it can hold no mapping row to clear.
+      opts.allowQuickSupport ? ne(organizations.type, UNASSIGNED_POOL_ORG_TYPE) : notQuickSupportOrg(),
       isNull(organizations.deletedAt),
     ));
   const org = rows[0] as OrgRow | undefined;
@@ -774,6 +894,8 @@ async function upsertMappingRow(params: {
   breezeEntityId: string;
   remoteEntityType: 'Customer' | 'Item';
   fields: MappingDecisionFields;
+  /** Display name of the connected provider, for the operator-facing conflict message. */
+  providerLabel: string;
 }): Promise<MappingRow> {
   try {
     if (params.existing) {
@@ -811,7 +933,7 @@ async function upsertMappingRow(params: {
       throw new AccountingMappingError(
         'mapping_conflict',
         409,
-        'This QuickBooks record is already mapped to a different Breeze entity',
+        `This ${params.providerLabel} record is already mapped to a different Breeze entity`,
       );
     }
     throw err;
@@ -843,7 +965,7 @@ export async function saveMappingDecision(
   // Phase 1 — connection, ownership and the current mapping rows, in ONE short
   // context that commits before the `confirmed` path's QuickBooks list call.
   const { conn, mappingRows, hiddenOrgIds, existing } = await runInDbContext(async () => {
-    const conn = await resolveConnection(partnerId, provider);
+    const conn = await resolveConnection(partnerId, { provider });
 
     if (breezeEntityType === 'org') {
       // `unlinked` never reaches QuickBooks, so it stays available for the
@@ -870,6 +992,7 @@ export async function saveMappingDecision(
     };
   });
 
+  const providerLabel = accountingProviderDisplayName(conn.provider);
   let fields: MappingDecisionFields;
   let proposedRemoteName: string | null = null;
 
@@ -887,7 +1010,7 @@ export async function saveMappingDecision(
       throw new AccountingMappingError(
         'mapping_conflict',
         409,
-        'This QuickBooks record is already mapped to a different Breeze entity',
+        `This ${providerLabel} record is already mapped to a different Breeze entity`,
       );
     }
 
@@ -895,13 +1018,20 @@ export async function saveMappingDecision(
     // live token — resolved here, not upfront (see the function doc above).
     const liveConn = await resolveLiveConnection(conn);
     const remoteProvider = getAccountingProvider(conn.provider);
-    const remoteList = await callProviderOrThrow(
-      () => (remoteEntityType === 'Customer' ? remoteProvider.listRemoteCustomers(liveConn) : remoteProvider.listRemoteItems(liveConn)),
-      `QuickBooks returned an error while listing ${remoteEntityType === 'Customer' ? 'customers' : 'items'}`,
+    const found: RemoteCustomer | RemoteItem | null = await callProviderOrThrow(
+      async () => {
+        // One record when the provider can (Xero W03 refinement 15); the whole list otherwise (QuickBooks).
+        if (remoteEntityType === 'Customer' && remoteProvider.getRemoteCustomer) return remoteProvider.getRemoteCustomer(liveConn, remoteEntityId);
+        if (remoteEntityType === 'Item' && remoteProvider.getRemoteItem) return remoteProvider.getRemoteItem(liveConn, remoteEntityId);
+        const list: Array<RemoteCustomer | RemoteItem> = remoteEntityType === 'Customer'
+          ? await remoteProvider.listRemoteCustomers(liveConn)
+          : await remoteProvider.listRemoteItems(liveConn);
+        return list.find((r) => r.id === remoteEntityId) ?? null;
+      },
+      `${providerLabel} returned an error while listing ${remoteEntityType === 'Customer' ? 'customers' : 'items'}`,
     );
-    const found = remoteList.find((r) => r.id === remoteEntityId);
     if (!found) {
-      throw new AccountingMappingError('entity_not_found', 404, `QuickBooks ${remoteEntityType} ${remoteEntityId} was not found`);
+      throw new AccountingMappingError('entity_not_found', 404, `${providerLabel} ${remoteEntityType} ${remoteEntityId} was not found`);
     }
 
     // RemoteItem carries no currencyCode (only RemoteCustomer does), so this is
@@ -909,7 +1039,7 @@ export async function saveMappingDecision(
     // — the gate documents the intent rather than relying on that incidentally.
     proposedRemoteName = found.displayName;
     const remoteCurrencyCode = breezeEntityType === 'org' ? (found as RemoteCustomer).currencyCode ?? null : null;
-    fields = { remoteEntityId, remoteSyncToken: found.syncToken ?? null, remoteCurrencyCode, linkStatus: 'confirmed', syncStatus: 'pending', lastError: null };
+    fields = { remoteEntityId, remoteSyncToken: found.remoteVersion ?? null, remoteCurrencyCode, linkStatus: 'confirmed', syncStatus: 'pending', lastError: null };
   } else if (decision === 'create_new') {
     fields = { remoteEntityId: null, remoteSyncToken: null, remoteCurrencyCode: null, linkStatus: 'create_new', syncStatus: 'pending', lastError: null };
   } else {
@@ -918,7 +1048,7 @@ export async function saveMappingDecision(
 
   // Phase 2 — its own short context, so the decision COMMITS on its own.
   const row = await runInDbContext(() =>
-    upsertMappingRow({ existing, integrationId: conn.id, partnerId, breezeEntityType, breezeEntityId, remoteEntityType, fields }));
+    upsertMappingRow({ existing, integrationId: conn.id, partnerId, breezeEntityType, breezeEntityId, remoteEntityType, fields, providerLabel }));
   return mappingResult(row, proposedRemoteName);
 }
 
@@ -1005,6 +1135,7 @@ function buildCustomerPayload(org: OrgRow): AccountingCustomerPayload {
 async function resolveItemSellPrice(
   item: CatalogItemRow,
   partnerId: string,
+  providerLabel: string,
 ): Promise<{ currencyCode: string; unitPrice: string }> {
   const partnerRows = await db
     .select({ currencyCode: partners.currencyCode })
@@ -1025,7 +1156,7 @@ async function resolveItemSellPrice(
     throw new AccountingMappingError(
       'item_price_required',
       409,
-      `This catalog item has no price in the partner's currency (${targetCurrency}); add one before syncing to QuickBooks`,
+      `This catalog item has no price in the partner's currency (${targetCurrency}); add one before syncing to ${providerLabel}`,
     );
   }
   return { currencyCode: targetCurrency, unitPrice: priceRow.unitPrice };
@@ -1058,12 +1189,13 @@ function assertCreateCurrencyMatchesRealm(
   entityCurrencyCode: string | null,
   label: 'organization' | 'catalog item',
 ): void {
+  const providerLabel = accountingProviderDisplayName(conn.provider);
   const home = normalizeCurrencyCode(conn.homeCurrency);
   if (!home) {
     throw new AccountingMappingError(
       'currency_mismatch',
       409,
-      'The connected QuickBooks company\'s home currency is unknown, so Breeze cannot safely create records in it. Reconnect QuickBooks to capture it, then retry.',
+      `The connected ${providerLabel} company's home currency is unknown, so Breeze cannot safely create records in it. Reconnect ${providerLabel} to capture it, then retry.`,
     );
   }
   const entityCurrency = normalizeCurrencyCode(entityCurrencyCode);
@@ -1071,7 +1203,7 @@ function assertCreateCurrencyMatchesRealm(
     throw new AccountingMappingError(
       'currency_mismatch',
       409,
-      `This ${label} is priced in ${entityCurrency ?? 'an unknown currency'}, but the connected QuickBooks company's home currency is ${home}. QuickBooks fixes a record's currency when it is created and never lets it change, so Breeze will not create it.`,
+      `This ${label} is priced in ${entityCurrency ?? 'an unknown currency'}, but the connected ${providerLabel} company's home currency is ${home}. ${providerLabel} fixes a record's currency when it is created and never lets it change, so Breeze will not create it.`,
     );
   }
 }
@@ -1098,16 +1230,89 @@ function buildItemPayload(
 }
 
 /**
+ * A provider verdict that is the USER's to resolve, not an upstream fault (Xero W03):
+ * persisted on the row, answered 409, terminal in the worker, never sent to Sentry.
+ * Null for everything else — including every QuickBooks fault, which carries its own
+ * fault number in providerCode, never one of these neutral codes.
+ *
+ * `isUpdate` — the mapping already carried a remote ref when this sync started.
+ * A `duplicate_name` then means the rename collided with a DIFFERENT, unlinked
+ * provider record: nothing is being created, and re-pointing the mapping at that
+ * record would orphan the one Breeze owns. So the link-instead advice and
+ * `details.remoteName` appear ONLY when Breeze was creating; an update gets
+ * rename advice with no `details`. W03b must offer "Link it" only when
+ * `details.remoteName` is present.
+ */
+function providerRefusal(
+  err: unknown, entityType: MappingEntityType, providerLabel: string, breezeName: string, isUpdate: boolean,
+): AccountingMappingError | null {
+  const noun = entityType === 'org' ? 'customer' : 'item';
+  const local = entityType === 'org' ? 'organization' : 'catalog item';
+  switch (refusalCodeOf(err)) {
+    case 'duplicate_name':
+      if (isUpdate) {
+        return new AccountingMappingError('duplicate_name', 409,
+          `${providerLabel} already has a different ${noun} named "${breezeName}" — rename this ${local} or that ${providerLabel} ${noun}, then sync again`,
+          { cause: err });
+      }
+      return new AccountingMappingError('duplicate_name', 409,
+        `${providerLabel} already has a ${noun} named "${breezeName}" — link this ${local} to it instead of creating a new one`,
+        { details: { remoteName: breezeName }, cause: err });
+    case 'remote_archived':
+      return new AccountingMappingError('remote_archived', 409,
+        `The ${providerLabel} ${noun} for "${breezeName}" is archived — restore it in ${providerLabel}, then sync again`, { cause: err });
+    case 'remote_missing':
+      return new AccountingMappingError('remote_missing', 409,
+        `The ${providerLabel} ${noun} linked to "${breezeName}" no longer exists — unlink it and map it again`, { cause: err });
+    case 'duplicate_key':
+      // Reuses the existing terminal conflict code: more than one remote record claims this entity.
+      return new AccountingMappingError('mapping_conflict', 409,
+        `${providerLabel} has more than one ${noun} that could be this ${local} — link the right one explicitly`, { cause: err });
+    case 'insufficient_scope':
+      return new AccountingMappingError('provider_permission', 409, providerPermissionMessage(providerLabel), { cause: err });
+    default:
+      return null;
+  }
+}
+
+/**
+ * A provider 400 `validation` verdict that carries NO neutral refusal code
+ * (#7292) — e.g. a contact name Xero rejects, or a QuickBooks Business
+ * Validation fault. Retrying re-sends the same payload, so it can never
+ * succeed: terminal 409 with a fix-the-record message. Gated on HTTP 400 so a
+ * provider's own pre-flight `validation` guards (no status: a missing tenant
+ * id, an unparseable payload) and every transient (5xx, timeout, 429) keep the
+ * retryable 502. The message carries the fault CLASS only (`providerFaultSuffix`),
+ * the same text invoice-push already persists — never a raw provider body.
+ * The payment/invoice-only refusal codes `providerRefusal` does not handle
+ * (remote_locked, amount_exceeds_due, remote_deleted, remote_batched) are not
+ * produced by customer/item upserts; if one ever were, it lands here — still
+ * terminal, with this generic advice.
+ */
+function providerRejection(
+  err: unknown, entityType: MappingEntityType, providerLabel: string,
+): AccountingMappingError | null {
+  if (!isAccountingProviderError(err) || err.kind !== 'validation' || err.httpStatus !== 400) return null;
+  const noun = entityType === 'org' ? 'customer' : 'item';
+  const local = entityType === 'org' ? 'organization' : 'catalog item';
+  return new AccountingMappingError('provider_rejected', 409,
+    `${providerLabel} rejected the ${noun} sync${providerFaultSuffix(err)} — check this ${local}'s details in Breeze, then sync again`,
+    { cause: err });
+}
+
+/**
  * Never persists or rethrows a raw provider error's message/body (mirrors
  * `callProviderOrThrow`'s sanitization) — only the HTTP status, when the
  * provider attached one, is safe to keep.
  */
-function sanitizeSyncErrorMessage(err: unknown, breezeEntityType: MappingEntityType): string {
+function sanitizeSyncErrorMessage(err: unknown, breezeEntityType: MappingEntityType, providerLabel: string): string {
   const label = breezeEntityType === 'org' ? 'customer' : 'item';
   const status = err && typeof err === 'object' && typeof (err as { status?: unknown }).status === 'number'
     ? (err as { status: number }).status
     : undefined;
-  return status ? `QuickBooks rejected the ${label} sync (HTTP ${status})` : `QuickBooks rejected the ${label} sync`;
+  return status
+    ? `${providerLabel} rejected the ${label} sync (HTTP ${status})`
+    : `${providerLabel} rejected the ${label} sync`;
 }
 
 /**
@@ -1150,6 +1355,8 @@ async function persistRemoteRef(params: {
   remoteEntityId: string;
   remoteSyncToken: string | null;
   remoteCurrencyCode: string | null;
+  /** Display name of the connected provider, for the refusal message. */
+  providerLabel: string;
 }): Promise<MappingRow> {
   const rows = await db
     .update(accountingEntityMappings)
@@ -1167,7 +1374,7 @@ async function persistRemoteRef(params: {
     .returning();
   const row = (rows as MappingRow[])[0];
   if (!row) {
-    throw new Error(`persistRemoteRef matched no accounting_entity_mappings row (id=${params.mappingId}); refusing to lose the QuickBooks sync result`);
+    throw new Error(`persistRemoteRef matched no accounting_entity_mappings row (id=${params.mappingId}); refusing to lose the ${params.providerLabel} sync result`);
   }
   return row;
 }
@@ -1179,19 +1386,25 @@ async function persistRemoteRef(params: {
  * QBO sparse update carrying the persisted Id+SyncToken (mirrors
  * `AccountingEntityMapping` in types.ts); its absence makes it a create —
  * Item creation additionally requires `accounting_connections.default_income_account_ref`.
+ *
+ * `target` (Xero W01): the sync worker passes the exact connection its job was
+ * enqueued for (`{ connectionId }`); omitted, the connection is resolved by
+ * `input.provider` as before (the explicit-sync route and the invoice push).
  */
 export async function syncMappedEntity(
   input: SyncMappedEntityInput,
   runInDbContext: DbContextRunner,
+  target?: ConnectionTarget,
 ): Promise<MappingResult> {
   assertNoAmbientDbContext('syncMappedEntity');
+  const providerLabel = accountingProviderDisplayName(input.provider);
   const redis = getRedis();
-  if (!redis) throw new Error('QuickBooks mapping sync coordination is unavailable');
+  if (!redis) throw new Error(`${providerLabel} mapping sync coordination is unavailable`);
   const key = `accounting-mapping-sync:${input.partnerId}:${input.provider}:${input.breezeEntityType}:${input.breezeEntityId}`;
   const token = randomUUID();
   const ttl = 5 * 60 * 1000;
   if (await redis.set(key, token, 'PX', ttl, 'NX') !== 'OK') {
-    throw new AccountingMappingError('sync_in_progress', 409, 'QuickBooks mapping sync is already in progress');
+    throw new AccountingMappingError('sync_in_progress', 409, `${providerLabel} mapping sync is already in progress`);
   }
   // The web's explicit sync and the worker must not both CREATE from the same
   // pending row. Renew across slow provider calls without holding a DB connection.
@@ -1203,7 +1416,7 @@ export async function syncMappedEntity(
   }, 30_000);
   renewal.unref();
   try {
-    return await syncMappedEntityUnderLease(input, runInDbContext);
+    return await syncMappedEntityUnderLease(input, runInDbContext, target);
   } finally {
     clearInterval(renewal);
     try {
@@ -1221,6 +1434,7 @@ export async function syncMappedEntity(
 async function syncMappedEntityUnderLease(
   input: SyncMappedEntityInput,
   runInDbContext: DbContextRunner,
+  target: ConnectionTarget,
 ): Promise<MappingResult> {
   const { partnerId, provider, breezeEntityType, breezeEntityId } = input;
   assertNoAmbientDbContext('syncMappedEntity');
@@ -1231,7 +1445,8 @@ async function syncMappedEntityUnderLease(
   // entity_not_found, a create-time currency_mismatch) is raised here, before
   // a token is resolved or QuickBooks is touched.
   const prep = await runInDbContext(async () => {
-    const conn = await resolveConnection(partnerId, provider);
+    const conn = await resolveConnection(partnerId, target ?? { provider });
+    const providerLabel = accountingProviderDisplayName(conn.provider);
 
     const mappingRows = await loadMappingRows(partnerId, conn.id, breezeEntityType);
     const mapping = mappingRows.find((m) => m.breezeEntityId === breezeEntityId);
@@ -1251,23 +1466,23 @@ async function syncMappedEntityUnderLease(
       if (breezeEntityType === 'org') {
         const org = await loadOwnedOrg(breezeEntityId, partnerId);
         if (isCreate) assertCreateCurrencyMatchesRealm(conn, org.currencyCode, 'organization');
-        return { conn, mapping, existingRef, kind: 'org' as const, payload: buildCustomerPayload(org) };
+        return { conn, mapping, existingRef, kind: 'org' as const, providerLabel, payload: buildCustomerPayload(org) };
       }
 
       if (isCreate && !conn.defaultIncomeAccountRef) {
         throw new AccountingMappingError(
           'income_account_required',
           409,
-          'Select a default QuickBooks income account before creating catalog items in QuickBooks',
+          `Select a default ${providerLabel} income account before creating catalog items in ${providerLabel}`,
         );
       }
       const item = await loadOwnedCatalogItem(breezeEntityId, partnerId);
-      const { currencyCode, unitPrice } = await resolveItemSellPrice(item, partnerId);
+      const { currencyCode, unitPrice } = await resolveItemSellPrice(item, partnerId, providerLabel);
       // The Item payload's currency is the PARTNER's default currency (see
       // resolveItemSellPrice), so that is what QBO would stamp the new Item at.
       if (isCreate) assertCreateCurrencyMatchesRealm(conn, currencyCode, 'catalog item');
       return {
-        conn, mapping, existingRef, kind: 'catalog_item' as const,
+        conn, mapping, existingRef, kind: 'catalog_item' as const, providerLabel,
         payload: buildItemPayload(item, conn, currencyCode, unitPrice),
       };
     } catch (err) {
@@ -1285,7 +1500,7 @@ async function syncMappedEntityUnderLease(
   });
 
   if ('refusal' in prep) throw prep.refusal;
-  const { conn, mapping, existingRef } = prep;
+  const { conn, mapping, existingRef, providerLabel } = prep;
   // Token refresh and the upsert both run with NO context held (see
   // `resolveLiveConnection`).
   const liveConn = await resolveLiveConnection(conn);
@@ -1302,10 +1517,28 @@ async function syncMappedEntityUnderLease(
     // record and marking sync_status='error' would misreport the mapping.
     if (err instanceof AccountingMappingError) throw err;
 
-    const message = sanitizeSyncErrorMessage(err, breezeEntityType);
-    captureException(err instanceof Error ? err : new Error(String(err)), undefined, {
-      service: 'accountingMappingService', accounting_mapping_id: mapping.id, breeze_entity_type: breezeEntityType,
-    });
+    // A refusal the USER resolves (Xero W03: duplicate name, archived/missing
+    // record, missing scope) takes precedence: persisted like any failure, but a
+    // typed 409 and no Sentry event. Throttled (Xero W01): the same persistence
+    // as a transient failure — the row is marked `error` so it never reads as
+    // silently stuck — but no Sentry event, and a typed 429 the worker delays on
+    // and the route answers with Retry-After. A code-less provider validation
+    // verdict (#7292) is terminal like a refusal, but still reported to Sentry
+    // (once — the worker no longer retries it).
+    const refusal = providerRefusal(
+      err, breezeEntityType, providerLabel, prep.kind === 'org' ? prep.payload.displayName : prep.payload.name, existingRef !== null,
+    );
+    const rejection = refusal ? null : providerRejection(err, breezeEntityType, providerLabel);
+    const retryAfterMs = refusal || rejection ? null : rateLimitRetryAfterMs(err);
+    const throttleSource = rateLimitSourceOf(err) ?? undefined;
+    const message = refusal?.message ?? rejection?.message ?? (retryAfterMs !== null
+      ? providerRateLimitedRetryLaterMessage(providerLabel, 'sync', throttleSource)
+      : sanitizeSyncErrorMessage(err, breezeEntityType, providerLabel));
+    if (!refusal && retryAfterMs === null) {
+      captureException(err instanceof Error ? err : new Error(String(err)), undefined, {
+        service: 'accountingMappingService', accounting_mapping_id: mapping.id, breeze_entity_type: breezeEntityType,
+      });
+    }
     // Phase 2 (failure) — its OWN short context, so the error marker COMMITS
     // before the throw below. Written inside the caller's transaction it was a
     // savepoint that rolled straight back with the throw: the operator saw a
@@ -1315,12 +1548,20 @@ async function syncMappedEntityUnderLease(
     } catch (markErr) {
       // Still best-effort: markMappingError swallows a failed UPDATE, but
       // OPENING the context can fail too, and that must not replace the typed
-      // 502 below with a raw error. Sentry already has the original.
+      // 409/502/429 below with a raw error. On the failure path Sentry already
+      // has the original (so does a #7292 rejection); on the refusal and throttle
+      // paths it does not (neither is ever reported), so this marker failure is
+      // the only event for it.
       captureException(markErr instanceof Error ? markErr : new Error(String(markErr)), undefined, {
         service: 'accountingMappingService', accounting_mapping_id: mapping.id, partner_id: partnerId,
       });
     }
-    throw new AccountingMappingError('quickbooks_error', 502, message);
+    if (refusal) throw refusal;
+    if (rejection) throw rejection;
+    if (retryAfterMs !== null) {
+      throw new AccountingMappingError('rate_limited', 429, message, { retryAfterMs, throttleSource, cause: err });
+    }
+    throw new AccountingMappingError('provider_error', 502, message);
   }
 
   let addressImported = false;
@@ -1335,12 +1576,13 @@ async function syncMappedEntityUnderLease(
         mappingId: mapping.id,
         partnerId,
         remoteEntityId: remote.id,
-        remoteSyncToken: remote.syncToken ?? null,
+        remoteSyncToken: remote.remoteVersion ?? null,
         // RemoteRef.currencyCode is only ever populated by upsertCustomer (types.ts)
         // — a catalog_item sync's `remote` always carries none — but the explicit
         // entity-type gate documents that this is a deliberate org-only field, not
         // an accident of which provider methods happen to fill it in today.
         remoteCurrencyCode: breezeEntityType === 'org' ? (remote.currencyCode ?? null) : null,
+        providerLabel,
       });
     });
   } catch (dbErr) {
@@ -1348,10 +1590,10 @@ async function syncMappedEntityUnderLease(
       service: 'accountingMappingService',
       accounting_mapping_id: mapping.id,
       remote_entity_id: remote.id,
-      remote_sync_token: remote.syncToken ?? 'none',
+      remote_sync_token: remote.remoteVersion ?? 'none',
     });
     const label = breezeEntityType === 'org' ? 'customer' : 'item';
-    const message = `QuickBooks accepted the ${label} sync (remote id ${remote.id}) but Breeze failed to record it — do not retry; contact support to reconcile`;
+    const message = `${providerLabel} accepted the ${label} sync (remote id ${remote.id}) but Breeze failed to record it — do not retry; contact support to reconcile`;
     // Exclude this unsafe-to-retry create from the pending-row sweep too.
     try {
       await runInDbContext(() => markMappingError(mapping.id, partnerId, message));
@@ -1367,7 +1609,7 @@ async function syncMappedEntityUnderLease(
       writeAuditEvent(requestLikeFromSnapshot({}), {
         orgId: breezeEntityId, actorType: 'system', initiatedBy: 'integration',
         action: 'organization.update', resourceType: 'organization', resourceId: breezeEntityId,
-        details: { source: 'quickbooks', message: 'Address imported from QuickBooks' },
+        details: { source: conn.provider, message: `Address imported from ${providerLabel}` },
       });
     } catch (err) {
       captureException(err instanceof Error ? err : new Error(String(err)));

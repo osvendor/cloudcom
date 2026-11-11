@@ -5,6 +5,7 @@ import {
   agentAcceptsServedEdition,
   agentBinaryUpdateDispatchRefusal,
   AGENT_BINARY_UPDATE_COMMAND_TYPES,
+  effectiveWatchdogEdition,
 } from './agentEditionCompat';
 
 const ORIGINAL_EDITION = process.env.BINARY_EDITION;
@@ -136,6 +137,59 @@ describe('agentBinaryUpdateDispatchRefusal (#4093)', () => {
     ).toBeNull();
   });
 
+  // #4297 — the watchdog's OWN reported edition (devices.watchdog_edition)
+  // decides; the main agent's edition is only the fallback for a watchdog that
+  // has not reported one for its installed build.
+  it("prefers the watchdog's own reported edition over the main-agent proxy", () => {
+    // Main agent silent inside the check band (proxy alone would refuse), but
+    // the watchdog — the binary that downloads — reported its edition.
+    expect(
+      agentBinaryUpdateDispatchRefusal({
+        commandType: 'update_agent',
+        targetRole: 'watchdog',
+        device: {
+          agentEdition: null,
+          agentVersion: '0.105.1',
+          watchdogVersion: '0.108.0',
+          watchdogEdition: 'self-host',
+        },
+      }),
+    ).toBeNull();
+
+    // Self-host server: the main agent reports self-host (proxy alone would
+    // allow), but the watchdog reports hosted, and hosted builds hard-refuse
+    // self-host artifacts.
+    process.env.BINARY_EDITION = 'self-host';
+    const reason = agentBinaryUpdateDispatchRefusal({
+      commandType: 'update_watchdog',
+      targetRole: 'watchdog',
+      device: {
+        agentEdition: 'self-host',
+        agentVersion: '0.108.0',
+        watchdogVersion: '0.108.0',
+        watchdogEdition: 'hosted',
+      },
+    });
+    expect(reason).toMatch(/withheld/i);
+    expect(reason).toContain('edition=hosted');
+  });
+
+  it('falls back to the main-agent edition when the watchdog has not reported one', () => {
+    process.env.BINARY_EDITION = 'self-host';
+    expect(
+      agentBinaryUpdateDispatchRefusal({
+        commandType: 'update_watchdog',
+        targetRole: 'watchdog',
+        device: {
+          agentEdition: 'hosted',
+          agentVersion: '0.108.0',
+          watchdogVersion: '0.108.0',
+          watchdogEdition: null,
+        },
+      }),
+    ).toMatch(/withheld/i);
+  });
+
   it('agrees with the raw predicate on the fail-closed unparseable case', () => {
     expect(agentAcceptsServedEdition({ reportedEdition: null, agentVersion: 'dev-abc' })).toBe(false);
     expect(
@@ -145,6 +199,23 @@ describe('agentBinaryUpdateDispatchRefusal (#4093)', () => {
         device: { agentEdition: null, agentVersion: 'dev-abc', watchdogVersion: 'dev-abc' },
       }),
     ).toMatch(/withheld/i);
+  });
+});
+
+describe('effectiveWatchdogEdition (#4297)', () => {
+  it("returns the watchdog's own reported edition when it has one", () => {
+    expect(effectiveWatchdogEdition({ watchdogEdition: 'hosted', agentEdition: 'self-host' })).toBe('hosted');
+    expect(effectiveWatchdogEdition({ watchdogEdition: 'self-host', agentEdition: null })).toBe('self-host');
+  });
+
+  it('falls back to the main-agent edition when the watchdog has not reported', () => {
+    expect(effectiveWatchdogEdition({ watchdogEdition: null, agentEdition: 'self-host' })).toBe('self-host');
+    expect(effectiveWatchdogEdition({ agentEdition: 'hosted' })).toBe('hosted');
+  });
+
+  it('is null when neither binary has reported', () => {
+    expect(effectiveWatchdogEdition({ watchdogEdition: null, agentEdition: null })).toBeNull();
+    expect(effectiveWatchdogEdition({})).toBeNull();
   });
 });
 
@@ -188,6 +259,7 @@ describe('agent-binary update command types are only named at known sites (#4093
   const ALLOWED = new Set([
     'apps/api/src/services/agentEditionCompat.ts', // the gate itself
     'apps/api/src/services/aiToolsAgentMgmt.ts', // trigger_agent_upgrade — the one dispatcher
+    'apps/api/src/services/commandDelivery.ts', // bounded rollout admission after the normal dispatch/claim gates
     'apps/api/src/services/partnerTrust.ts', // partner trust probation allowlist classifies these as lifecycle; it never dispatches them
     // #5128: the fail-closed offline-policy registry must classify EVERY
     // command type or it throws at dispatch. Classification only — the file
@@ -195,6 +267,19 @@ describe('agent-binary update command types are only named at known sites (#4093
     // a dispatcher. Both types are pinned to the `live` class there, which is
     // the class that refuses to queue for an offline device.
     'apps/api/src/services/commandOfflinePolicy.ts',
+    // #8167 W03: `update_agent` here is the normalized EDR VENDOR action key
+    // (@breeze/shared EDR_ENDPOINT_ACTIONS) — a request to the EDR console to
+    // update ITS agent. Neither file builds a Breeze device command; the only
+    // EDR send path is adapter.performAction.
+    'apps/api/src/services/edrProviders/types.ts',
+    'apps/api/src/services/edrProviders/actions.ts',
+    // #10091 (network-isolation W1c): claim-time revalidation only READS queued
+    // update/update_agent rows to refuse a below-floor agent target while an
+    // isolation episode is unresolved. It never builds or dispatches one.
+    'apps/api/src/services/commandClaimEligibility.ts',
+    // #10919: the same claim-time check, moved here. Only inspects queued update rows for the
+    // isolation upgrade floor; never builds, inserts or dispatches a command.
+    'apps/api/src/services/networkIsolation/upgradeFloor.ts',
   ]);
 
   function walk(dir: string, out: string[] = []): string[] {

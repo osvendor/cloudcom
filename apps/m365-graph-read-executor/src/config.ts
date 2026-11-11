@@ -48,6 +48,13 @@ export interface ExecutorSyncConfig {
   /** #5784 W05. Own bucket rate: /auditLogs/signIns is not signin_activity's surface. */
   signinEventsRpm: number;
   /**
+   * #9394. `$top` for the /auditLogs/signIns walk. Small by default: a
+   * 1000-row page did not come back inside the 30 s per-request budget on a
+   * tenant of a few hundred users, and a weekday of that tenant (~1,500
+   * sign-ins) is ~15 pages of 100. Graph caps the page at 1000.
+   */
+  signinEventsPageSize: number;
+  /**
    * Continuation encryption secret. `null` means "mint an ephemeral one at
    * boot": continuations then die with the process and do not cross replicas,
    * which the API handles by restarting the sign-in domain from page 1. That
@@ -81,12 +88,25 @@ function privateBindAddress(value: string): boolean {
   const version = isIP(value);
   if (version === 4) {
     const [first, second = -1] = value.split('.').map(Number);
-    return first === 10
+    // RFC1918, plus RFC 6598 shared space (100.64.0.0/10): Azure Container Apps
+    // workload-profile replicas only get an address from its 100.100.0.0/17 overlay.
+    // Neither range is internet-routable.
+    //
+    // Exactly 127.0.0.1 (and ::1 below) is also allowed: on Azure Container Apps
+    // the in-pod Envoy sidecar delivers both ingress and health probes to the app
+    // over loopback only, so a pod-IP bind never becomes healthy. Loopback is never
+    // reachable more broadly than the pod's private interface. Other 127/8
+    // addresses stay rejected.
+    return value === '127.0.0.1'
+      || first === 10
       || (first === 172 && second >= 16 && second <= 31)
-      || (first === 192 && second === 168);
+      || (first === 192 && second === 168)
+      || (first === 100 && second >= 64 && second <= 127);
   }
   if (version === 6) {
     const normalized = value.toLowerCase();
+    // Canonical IPv6 loopback only; not IPv4-mapped or expanded spellings.
+    if (normalized === '::1') return true;
     return !normalized.includes('%')
       && (normalized.startsWith('fc') || normalized.startsWith('fd'));
   }
@@ -233,6 +253,7 @@ function parseSyncConfig(source: Environment): ExecutorSyncConfig {
     maxItemsSkus: boundedInteger(source, 'M365_SYNC_MAX_ITEMS_SKUS', 200, 1, 5_000),
     maxItemsSigninEvents: boundedInteger(source, 'M365_SYNC_MAX_ITEMS_SIGNIN_EVENTS', 25_000, 1, 200_000),
     signinEventsRpm: boundedInteger(source, 'M365_SIGNIN_EVENTS_RPM', 6, 1, 60),
+    signinEventsPageSize: boundedInteger(source, 'M365_SYNC_SIGNIN_EVENTS_PAGE_SIZE', 100, 10, 1_000),
     continuationKey: parseContinuationKey(source),
   };
 }

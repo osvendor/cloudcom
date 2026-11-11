@@ -87,4 +87,25 @@ describe('executor internal request authentication', () => {
       rawBody: body,
     })).rejects.toMatchObject({ code: 'internal_request_unauthorized' });
   });
+
+  it('binds verify-identity tokens to the verify-identity operation only', async () => {
+    const { authenticator, body, token } = await fixture({ operation: 'verify-identity' });
+    await expect(authenticator.verify({
+      authorization: `Bearer ${token}`,
+      operation: 'verify-identity',
+      rawBody: body,
+    })).resolves.toEqual({ correlationId: CORRELATION_ID });
+    for (const operation of ['retest', 'execute-action'] as const) {
+      await expect(authenticator.verify({ authorization: `Bearer ${token}`, operation, rawBody: body }))
+        .rejects.toMatchObject({ code: 'internal_request_unauthorized' });
+    }
+  });
+
+  it('rejects a token whose operation claim is the removed complete-consent operation at every remaining operation', async () => {
+    const { authenticator, body, token } = await fixture({ operation: 'complete-consent' });
+    for (const operation of ['verify-identity', 'retest', 'execute-action'] as const) {
+      await expect(authenticator.verify({ authorization: `Bearer ${token}`, operation, rawBody: body }))
+        .rejects.toMatchObject({ code: 'internal_request_unauthorized' });
+    }
+  });
 });

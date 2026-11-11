@@ -10,8 +10,11 @@ Astro.response.headers.set('Referrer-Policy', 'no-referrer');
 const profile = await loadPortalProfile(Astro.request);
 if (!profile) return Astro.redirect(withBase('/login') + '?next=' + encodeURIComponent(stripBase(Astro.url.pathname) + Astro.url.search), 302);
 if (profile.accessMode !== 'remote_only') return Astro.redirect(withBase('/quotes'), 302);
-const request = parseNativeLoginRequest(Astro.url.searchParams);
+const params = new URLSearchParams(Astro.url.searchParams);
+const unified = params.getAll('unified').length === 1 && params.get('unified') === '1';
+if (unified) params.delete('unified');
+const request = parseNativeLoginRequest(params);
 ---
 <PortalLayout title="Sign in to the remote app" remoteOnly>
-  <NativeSignInPage accountName={profile.name || profile.email} request={request} client:load />
+  <NativeSignInPage accountName={profile.name || profile.email} request={request} unified={unified} client:load />
 </PortalLayout>

@@ -41,7 +41,7 @@ const AV_PRODUCTS = [
     productState: 393472
   },
   {
-    displayName: 'CylancePROTECT',
+    displayName: 'Acme Endpoint Shield',
     provider: 'other',
     realTimeProtection: true,
     definitionsUpToDate: true,
@@ -65,6 +65,41 @@ describe('upsertSecurityStatusForDevice — avProducts persistence (#3641)', () 
   beforeEach(() => {
     insertedValues.length = 0;
     conflictSets.length = 0;
+  });
+
+  // #4340 — the ingest route diffs these against the previously stored row to
+  // decide whether a submit is a real change worth an audit record, so they
+  // must be the NORMALIZED values actually written.
+  it('returns the normalized provider and threat count it wrote', async () => {
+    await expect(upsertSecurityStatusForDevice(DEVICE_ID, ORG_ID, { provider: 'Defender', threatCount: 2 }))
+      .resolves.toEqual({ provider: 'windows_defender', threatCount: 2 });
+    await expect(upsertSecurityStatusForDevice(DEVICE_ID, ORG_ID, {}))
+      .resolves.toEqual({ provider: 'other', threatCount: 0 });
+  });
+
+  // #8538 — the agent omits realTimeProtection when every applicable AV source
+  // failed (#7965) but still marshals provider:"other". "other" must stay a real
+  // attribution for an unmapped product; a failed collection stores "unknown".
+  it('stores provider unknown when collection failed (provider other, realTimeProtection omitted)', async () => {
+    await expect(upsertSecurityStatusForDevice(DEVICE_ID, ORG_ID, { provider: 'other' }))
+      .resolves.toMatchObject({ provider: 'unknown' });
+    expect(firstInsert().provider).toBe('unknown');
+    expect(lastSet().provider).toBe('unknown');
+    expect(firstInsert().realTimeProtection).toBeNull();
+  });
+
+  it('keeps provider other for a real reading (unmapped product, realTimeProtection known)', async () => {
+    await expect(upsertSecurityStatusForDevice(DEVICE_ID, ORG_ID, { provider: 'other', realTimeProtection: false }))
+      .resolves.toMatchObject({ provider: 'other' });
+    await expect(upsertSecurityStatusForDevice(DEVICE_ID, ORG_ID, { provider: 'other', realTimeProtection: true }))
+      .resolves.toMatchObject({ provider: 'other' });
+  });
+
+  it('accepts an explicit provider unknown and leaves successful collections alone', async () => {
+    await expect(upsertSecurityStatusForDevice(DEVICE_ID, ORG_ID, { provider: 'unknown' }))
+      .resolves.toMatchObject({ provider: 'unknown' });
+    await expect(upsertSecurityStatusForDevice(DEVICE_ID, ORG_ID, { provider: 'windows_defender' }))
+      .resolves.toMatchObject({ provider: 'windows_defender' });
   });
 
   it('persists the per-product array on insert and on conflict update', async () => {
@@ -108,6 +143,38 @@ describe('upsertSecurityStatusForDevice — avProducts persistence (#3641)', () 
 
     expect(firstInsert()).toMatchObject({ avProducts: null });
     expect(lastSet().avProducts).toBeNull();
+  });
+
+  // #7965: an agent whose Security Center + Defender queries both failed omits
+  // realTimeProtection (and firewallEnabled when that query failed too). A
+  // missing value is "unknown" and must be stored as null, never as false —
+  // a stored false fires the antivirus not_protected / realtime_disabled checks.
+  it('stores null (unknown) when the payload omits realTimeProtection and firewallEnabled', async () => {
+    const parsed = securityStatusIngestSchema.parse({ provider: 'other', threatCount: 0, encryptionStatus: 'unknown' });
+    await upsertSecurityStatusForDevice(DEVICE_ID, ORG_ID, parsed);
+
+    expect(firstInsert().realTimeProtection).toBeNull();
+    expect(firstInsert().firewallEnabled).toBeNull();
+    expect(lastSet().realTimeProtection).toBeNull();
+    expect(lastSet().firewallEnabled).toBeNull();
+  });
+
+  it('still stores an explicit false from older agents as false', async () => {
+    await upsertSecurityStatusForDevice(DEVICE_ID, ORG_ID, {
+      provider: 'other',
+      realTimeProtection: false,
+      firewallEnabled: false
+    });
+
+    expect(firstInsert()).toMatchObject({ realTimeProtection: false, firewallEnabled: false });
+    expect(lastSet()).toMatchObject({ realTimeProtection: false, firewallEnabled: false });
+  });
+
+  it('falls back to the per-product value only when the top-level field is omitted', async () => {
+    await upsertSecurityStatusForDevice(DEVICE_ID, ORG_ID, { avProducts: AV_PRODUCTS });
+
+    expect(firstInsert().realTimeProtection).toBe(true);
+    expect(lastSet().realTimeProtection).toBe(true);
   });
 
   it('truncates over-long strings instead of rejecting the whole submission', () => {

@@ -36,6 +36,9 @@ vi.mock('../../services/auditEvents', () => ({
   writeAuditEvent: vi.fn(),
 }));
 
+const recordAgentIngestSubmission = vi.hoisted(() => vi.fn());
+vi.mock('../metrics', () => ({ recordAgentIngestSubmission }));
+
 vi.mock('../../services/eventBus', () => ({
   publishEvent: vi.fn().mockResolvedValue(undefined),
 }));
@@ -44,7 +47,10 @@ vi.mock('../../middleware/requireAgentRole', () => ({
   requireAgentRole: vi.fn((_c: unknown, next: () => Promise<void>) => next()),
 }));
 
-vi.mock('../../services/callerVerification/loginObservation', () => ({
+vi.mock('../../services/callerVerification/loginObservation', async (importOriginal) => ({
+  // The predicate is pure and decides whether the route takes the device lock,
+  // so keep the real one; only the DB-writing observer is mocked.
+  isObservablePrincipal: (await importOriginal<typeof import('../../services/callerVerification/loginObservation')>()).isObservablePrincipal,
   observeSessionPrincipal: vi.fn(),
 }));
 
@@ -55,12 +61,31 @@ vi.mock('./helpers', () => ({
 import { db } from '../../db';
 import { sessionsRoutes } from './sessions';
 import { observeSessionPrincipal } from '../../services/callerVerification/loginObservation';
+import { writeAuditEvent } from '../../services/auditEvents';
 
+// #6354 W02: when a report carries OS identity, the device row is
+// share-locked (a second read) so an org move cannot interleave with login
+// observation. Reports without identity take no lock.
+const deviceLockModes: string[] = [];
 function mockDeviceLookup() {
   vi.mocked(db.select).mockReturnValueOnce({
     from: vi.fn().mockReturnValue({
       where: vi.fn().mockReturnValue({
         limit: vi.fn().mockResolvedValue([{ id: DEVICE_ID, orgId: 'org-1', hostname: 'host-1' }]),
+      }),
+    }),
+  } as any);
+}
+function mockDeviceLock(orgId = 'org-1') {
+  vi.mocked(db.select).mockReturnValueOnce({
+    from: vi.fn().mockReturnValue({
+      where: vi.fn().mockReturnValue({
+        limit: vi.fn().mockReturnValue({
+          for: vi.fn(async (mode: string) => {
+            deviceLockModes.push(mode);
+            return [{ orgId }];
+          }),
+        }),
       }),
     }),
   } as any);
@@ -110,6 +135,7 @@ describe('PUT /agents/:id/sessions', () => {
 
   it('forwards independent login principal from an authenticated session report', async () => {
     mockDeviceLookup();
+    mockDeviceLock();
     const principal = { sid: 'S-1-5-21-1', username: 'alex', upn: 'alex@example.com' };
     const response = await app.request(`/agents/${AGENT_ID}/sessions`, {
       method: 'PUT', headers: { 'Content-Type': 'application/json' },
@@ -117,6 +143,53 @@ describe('PUT /agents/:id/sessions', () => {
     });
     expect(response.status).toBe(200);
     expect(observeSessionPrincipal).toHaveBeenCalledWith('org-1', 'host-1', 'alex', principal);
+  });
+
+  it('share-locks the device only for a report carrying OS identity (#6354 W02)', async () => {
+    deviceLockModes.length = 0;
+    mockDeviceLookup();
+    const plain = await app.request(`/agents/${AGENT_ID}/sessions`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessions: [], events: [{ type: 'login', username: 'alex', sessionType: 'console' }] }),
+    });
+    expect(plain.status).toBe(200);
+    expect(deviceLockModes).toEqual([]);
+
+    mockDeviceLookup();
+    mockDeviceLock();
+    const principal = { sid: 'S-1-5-21-1', username: 'alex', upn: 'alex@example.com' };
+    const withIdentity = await app.request(`/agents/${AGENT_ID}/sessions`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessions: [], events: [{ type: 'login', username: 'alex', sessionType: 'console', principal }] }),
+    });
+    expect(withIdentity.status).toBe(200);
+    expect(deviceLockModes).toEqual(['share']);
+  });
+
+  it('takes no lock for a principal that cannot bind (no UPN) — steady-state report (#6354 W02)', async () => {
+    deviceLockModes.length = 0;
+    mockDeviceLookup();
+    const response = await app.request(`/agents/${AGENT_ID}/sessions`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sessions: [{ username: 'simuser', sessionType: 'ssh', sessionId: '1', principal: { uid: 1000, username: 'simuser' } }],
+        events: [{ type: 'login', username: 'simuser', sessionType: 'ssh', principal: { uid: 1000, username: 'simuser' } }],
+      }),
+    });
+    expect(response.status).toBe(200);
+    expect(deviceLockModes).toEqual([]);
+  });
+
+  it('refuses to observe when the device moved org during the report (#6354 W02)', async () => {
+    mockDeviceLookup();
+    mockDeviceLock('org-2');
+    const principal = { sid: 'S-1-5-21-1', username: 'alex', upn: 'alex@example.com' };
+    const response = await app.request(`/agents/${AGENT_ID}/sessions`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessions: [], events: [{ type: 'login', username: 'alex', sessionType: 'console', principal }] }),
+    });
+    expect(response.status).toBe(500);
+    expect(observeSessionPrincipal).not.toHaveBeenCalled();
   });
 
   it('rejects a principal that carries both sid and uid', async () => {
@@ -218,5 +291,41 @@ describe('PUT /agents/:id/sessions', () => {
     const sessionUpdate = updatedValues.find((v) => 'idleMinutes' in v);
     expect(sessionUpdate).toBeDefined();
     expect(sessionUpdate.idleMinutes).toBeNull();
+  });
+
+  // #4340 — a per-report `agent.sessions.submit` audit was ~11% of audit_logs.
+  // The session history itself lives in device_sessions (loginAt/logoutAt per
+  // session), so a routine report is only counted, never audited.
+  it('does NOT audit a successful sessions report — counts it in the ingest metric', async () => {
+    mockDeviceLookup();
+    const res = await app.request(`/agents/${AGENT_ID}/sessions`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sessions: [{ username: 'alice', sessionType: 'console', isActive: true }],
+        events: [{ type: 'login', username: 'alice', sessionType: 'console' }],
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(writeAuditEvent).not.toHaveBeenCalled();
+    expect(recordAgentIngestSubmission).toHaveBeenCalledTimes(1);
+    expect(recordAgentIngestSubmission).toHaveBeenCalledWith('sessions', 'success');
+  });
+
+  it('counts a failed session write as a failed ingest and still surfaces the error', async () => {
+    mockDeviceLookup();
+    vi.mocked(db.transaction).mockRejectedValueOnce(new Error('db down'));
+    app.onError((_err, c) => c.json({ error: 'boom' }, 500));
+
+    const res = await app.request(`/agents/${AGENT_ID}/sessions`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessions: [{ username: 'alice', sessionType: 'console', isActive: true }], events: [] }),
+    });
+
+    expect(res.status).toBe(500);
+    expect(recordAgentIngestSubmission).toHaveBeenCalledWith('sessions', 'failed');
+    expect(recordAgentIngestSubmission).not.toHaveBeenCalledWith('sessions', 'success');
   });
 });

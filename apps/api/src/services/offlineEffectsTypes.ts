@@ -13,11 +13,11 @@ export interface OfflineObservation {
 
 export interface OfflineRulePlan {
   ruleId: string;
-  policy: boolean;
   name: string;
   severity: AlertSeverity;
   conditions: unknown;
-  cooldownMinutes: number;
+  /** Null when the rule's stored cooldown is malformed: admission rejects this task alone. */
+  cooldownMinutes: number | null;
   titleTemplate: string;
   messageTemplate: string;
   templateId?: string;
@@ -29,6 +29,6 @@ export type OfflineEffectPayload =
   | { type: 'alert-rule'; observation: OfflineObservation; rule: OfflineRulePlan }
   | { type: 'alert-event'; siteId: string; occurredAt: string; event: Record<string, unknown> }
   | {
-    type: 'alert-postprocess'; ruleId: string; policy: boolean; alertId: string | null;
+    type: 'alert-postprocess'; ruleId: string; alertId: string | null;
     occurredAt: string; multiplier: number; recordTrigger: boolean;
   };

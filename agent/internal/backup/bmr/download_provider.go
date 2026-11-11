@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	stdpath "path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -642,7 +643,10 @@ func (p *recoveryDownloadProvider) downloadOnce(remotePath, localPath string) er
 	if err != nil {
 		return fmt.Errorf("bmr: create local destination file: %w", err)
 	}
-	_, copyErr := io.Copy(file, resp.Body)
+	// Report each chunk to a download-progress callback on p.ctx, if any:
+	// the bare_metal_rebuild helper's stall watchdog counts body bytes as
+	// progress, so one large file is not mistaken for a hung helper (#6664).
+	_, copyErr := io.Copy(providers.DownloadProgressWriter(p.ctx, file), resp.Body)
 	closeErr := file.Close()
 	if copyErr != nil {
 		// io.Copy's error is either a read failure on resp.Body (the
@@ -679,7 +683,7 @@ func formatRecoveryTokenHeader(format, token string) string {
 }
 
 func pathClean(path string) string {
-	cleaned := filepath.ToSlash(filepath.Clean(path))
+	cleaned := stdpath.Clean(path)
 	if cleaned == "." {
 		return ""
 	}

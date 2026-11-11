@@ -72,7 +72,7 @@ describe('ExecutionDetails custom-field write summary', () => {
 
     expect(screen.getByTestId('exec-custom-fields-applied')).toBeInTheDocument();
     expect(screen.getByTestId('exec-custom-fields-rejected')).toHaveTextContent('asset_tag');
-    expect(screen.getByTestId('exec-custom-fields-rejected')).toHaveTextContent('No matching field definition');
+    expect(screen.getByTestId('exec-custom-fields-rejected')).toHaveTextContent('No custom field with this key');
   });
 
   it('falls back to the raw reason code for a reason with no translation', () => {
@@ -224,5 +224,108 @@ describe('ExecutionDetails Stop affordance', () => {
     await user.click(screen.getByTestId('confirm-stop'));
 
     expect(onCancel).toHaveBeenCalledWith(expect.objectContaining({ id: 'exec-1' }), 5);
+  });
+});
+
+describe('ExecutionDetails empty stdout (sweep E5)', () => {
+  it('shows "No output" in the open section body, not also "(empty)" in its header', () => {
+    // stderr gets real content so its own (unrelated) collapsed "(empty)"
+    // marker can't interfere with the assertion below.
+    renderExecution({ stdout: undefined, stderr: 'a warning' });
+
+    // The stdout section is `defaultOpen`, so the body's own "No output"
+    // message is visible; the header marker used to render at the same time
+    // and say the identical thing twice.
+    expect(screen.getByText('No output')).toBeInTheDocument();
+    expect(screen.queryByText('(empty)')).toBeNull();
+  });
+
+  it('still shows the "(empty)" marker on a collapsed empty section', () => {
+    // stderr has no content and defaults to collapsed — the header marker is
+    // the only signal of emptiness a collapsed section gives, so it must
+    // still render there.
+    renderExecution({ stdout: 'ok' });
+
+    expect(screen.getByText('(empty)')).toBeInTheDocument();
+  });
+});
+
+describe('ExecutionDetails restore-point badge (#4759)', () => {
+  it('renders the restore-point badge when the execution carries an outcome', () => {
+    renderExecution({
+      restorePoint: {
+        status: 'created',
+        requestId: 'r-1',
+        attemptedAt: '2026-09-02T14:03:00Z',
+        durationMs: 900,
+        message: null,
+        existingPointAgeMinutes: null,
+        frequencyMinutes: null
+      }
+    });
+
+    expect(screen.getByTestId('restore-point-badge').textContent).toMatch(
+      /restore point creation confirmed/i
+    );
+  });
+
+  it('shows a requested-but-unreported execution as pending, not as success', () => {
+    renderExecution({
+      restorePoint: {
+        status: 'requested',
+        requestId: 'r-2',
+        attemptedAt: null,
+        durationMs: null,
+        message: null,
+        existingPointAgeMinutes: null,
+        frequencyMinutes: null
+      }
+    });
+
+    expect(screen.getByTestId('restore-point-badge').textContent).toMatch(/awaiting the device/i);
+  });
+
+  it('renders nothing when there is no outcome (null from the API, or absent)', () => {
+    const { unmount } = renderExecution({ restorePoint: null });
+    expect(screen.queryByTestId('restore-point-badge')).toBeNull();
+    unmount();
+    renderExecution({});
+    expect(screen.queryByTestId('restore-point-badge')).toBeNull();
+  });
+});
+
+describe('ExecutionDetails queued/pending delivery copy (#9563)', () => {
+  const queued: Partial<ScriptExecution> = {
+    status: 'queued',
+    startedAt: null,
+    completedAt: undefined,
+    exitCode: undefined,
+    stdout: undefined
+  };
+
+  it('a queued run on an ONLINE device says it is awaiting pickup, never "device offline"', () => {
+    renderExecution({ ...queued, deviceStatus: 'online' });
+    expect(screen.getByText('Queued — waiting for the device to pick it up')).toBeInTheDocument();
+    expect(screen.getByText(/no active agent session/i)).toBeInTheDocument();
+    expect(screen.queryByText(/device offline/i)).toBeNull();
+    expect(screen.queryByText(/device is offline/i)).toBeNull();
+  });
+
+  it('a queued run with an unknown device status gets the same neutral copy', () => {
+    renderExecution({ ...queued });
+    expect(screen.getByText('Queued — waiting for the device to pick it up')).toBeInTheDocument();
+    expect(screen.queryByText(/device offline/i)).toBeNull();
+  });
+
+  it('a queued run on an OFFLINE device keeps a distinct offline message', () => {
+    renderExecution({ ...queued, deviceStatus: 'offline' });
+    expect(screen.getByText('Queued — device offline')).toBeInTheDocument();
+    expect(screen.getByText(/device is offline/i)).toBeInTheDocument();
+    expect(screen.queryByText(/no active agent session/i)).toBeNull();
+  });
+
+  it('a pending run on an offline device says the device is offline', () => {
+    renderExecution({ ...queued, status: 'pending', deviceStatus: 'offline' });
+    expect(screen.getByText(/device is offline/i)).toBeInTheDocument();
   });
 });

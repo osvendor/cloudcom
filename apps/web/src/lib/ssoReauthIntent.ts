@@ -2,8 +2,9 @@
  * #4055 — which card started the IdP re-verification round-trip.
  *
  * A passwordless (SSO-provisioned) account can start the same
- * `POST /sso/reauth/start` trip from two places on the profile page: the TOTP
- * setup card and the "Add a passkey" card. Both leave the origin entirely
+ * `POST /sso/reauth/start` trip from several places on the profile page: the
+ * TOTP setup card and the "Add a passkey" card, and (#4045) the recovery-code,
+ * disable-MFA and delete-passkey actions. All of them leave the origin entirely
  * (`window.location.assign(<IdP url>)`), so every scrap of React state is gone
  * by the time the SSO callback redirects back to
  * `/settings/profile#ssoReauthGrant=<id>` — and that return URL is minted
@@ -20,12 +21,30 @@
  * "which card do I go back to" preference has no business on it.
  */
 
-export type SsoReauthIntent = 'totp' | 'passkey';
+/**
+ * `totp` / `passkey`: the two ENROLLMENT cards (#4055) — the grant that comes
+ * back is `enroll_first_factor` for an account with no factor yet, and
+ * `sso_reauth_manage_factor` for one that already holds a factor (#7369: it
+ * stands in for the password while the card still demands the existing-factor
+ * step-up). The callback picks the purpose from the factor state, not from this
+ * intent, which only decides where the user lands.
+ * `recovery_codes` / `disable_mfa` / `delete_passkey` (#4045) and
+ * `remove_totp` (#10650, removing the authenticator app on its own): the
+ * factor-MANAGEMENT actions of an account that already holds a factor — the
+ * grant that comes back is `sso_reauth_manage_factor` and stands in for the
+ * password on that one action.
+ */
+export type SsoReauthIntent = 'totp' | 'passkey' | 'recovery_codes' | 'disable_mfa' | 'delete_passkey' | 'remove_totp';
+
+/** The #4045 factor-management subset of {@link SsoReauthIntent}. */
+export type SsoReauthManageIntent = Extract<SsoReauthIntent, 'recovery_codes' | 'disable_mfa' | 'delete_passkey' | 'remove_totp'>;
+
+const INTENTS: readonly SsoReauthIntent[] = ['totp', 'passkey', 'recovery_codes', 'disable_mfa', 'delete_passkey', 'remove_totp'];
 
 export const SSO_REAUTH_INTENT_KEY = 'breeze.ssoReauth.intent';
 
-function isIntent(value: string | null): value is SsoReauthIntent {
-  return value === 'totp' || value === 'passkey';
+export function isSsoReauthIntent(value: unknown): value is SsoReauthIntent {
+  return typeof value === 'string' && (INTENTS as readonly string[]).includes(value);
 }
 
 /** Record the originating card immediately before navigating to the IdP. */
@@ -55,7 +74,7 @@ export function takeSsoReauthIntent(): SsoReauthIntent | null {
   try {
     const stored = window.sessionStorage.getItem(SSO_REAUTH_INTENT_KEY);
     if (stored !== null) window.sessionStorage.removeItem(SSO_REAUTH_INTENT_KEY);
-    return isIntent(stored) ? stored : null;
+    return isSsoReauthIntent(stored) ? stored : null;
   } catch {
     return null;
   }

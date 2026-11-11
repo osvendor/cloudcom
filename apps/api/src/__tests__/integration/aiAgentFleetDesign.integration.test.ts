@@ -81,6 +81,11 @@ import {
 import { processSweepOccurrence } from '../../jobs/aiAgentSweepScheduler';
 import { registerAgentRunEnqueuer, type AgentRunEnqueuer } from '../../services/aiAgents/runService';
 import type { AuthContext } from '../../middleware/auth';
+import { usePlatformAiKeyPlaceholder } from './helpers/platformAiKey';
+
+// W03 (#7601): agent admission resolves the agent's model first; the
+// platform default is only usable with a platform key configured.
+usePlatformAiKeyPlaceholder();
 
 const runDb = it.runIf(!!process.env.DATABASE_URL);
 
@@ -238,7 +243,7 @@ function submission(deviceId: string): FleetDesignSubmission {
         }],
         alertRules: [{
           name: 'File server disk over 85%', severity: 'high',
-          conditions: [{ type: 'metric', metric: 'disk', operator: 'gt', value: 85, durationMinutes: 15 }],
+          kind: 'disk', condition: { operator: 'gt', value: 85, durationMinutes: 15 }, responses: [], deliveryMode: 'inherit', deliveryChannelIds: [],
           cooldownMinutes: 60, rationale: 'Data volume growth is the failure mode.', action: 'none', paging: 'business_hours',
         }],
       },

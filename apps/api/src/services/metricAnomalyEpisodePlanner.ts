@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 
-import { episodeKeyFor, type AttributionDimensionOrNull } from './metricAnomalyEpisodeKeys';
+import { EPISODE_PEAK_PREFERRED_METRICS, episodeKeyFor, type AttributionDimensionOrNull } from './metricAnomalyEpisodeKeys';
 
 /**
  * Pure planner for the `episodes` stage (spec §5, §6). No DB, no clock.
@@ -18,6 +18,14 @@ import { episodeKeyFor, type AttributionDimensionOrNull } from './metricAnomalyE
  *    orphan older than the anchor, or an older burst in the same batch.
  *    `cleanUntil` (the next island's start) bounds the clean-data check that
  *    decides its close_reason in SQL.
+ *
+ * Persistence gate (`minBuckets`): an island that would CREATE an episode
+ * needs at least `minBuckets` distinct buckets. A shorter island is left
+ * unassigned (pending) while another bucket could still join it, and becomes
+ * a TRANSIENT once none can: its rows are closed `cleared` with no episode.
+ * Rows that join an existing anchor are never gated. Prod (2026-09-26) had
+ * 72% of episodes as single 5-minute blips — Defender scans, Windows Update,
+ * indexers — which buried the sustained ones.
  */
 
 export interface UnassignedAnomalyRow {
@@ -88,6 +96,8 @@ export interface EpisodeAssemblyPlan {
   anchorAttaches: PlannedAttach[];
   creates: PlannedEpisode[];
   supersedes: PlannedSupersede[];
+  /** Rows of settled islands shorter than `minBuckets`: closed `cleared`, no episode. */
+  transients: string[];
 }
 
 export interface PlanEpisodeAssemblyInput {
@@ -96,6 +106,14 @@ export interface PlanEpisodeAssemblyInput {
   /** groupKeyOf(deviceId, episodeKey) -> snoozed_until of a live user snooze. */
   activeSnoozes: ReadonlyMap<string, Date>;
   gapMinutes: number;
+  /** Distinct buckets an island needs before it may create an episode. */
+  minBuckets: number;
+  /**
+   * End of the completed detection range. An island is settled (no bucket
+   * can still join it) once its end + gap + one bucket <= this — the same
+   * bound episode-resolve uses (A4). NULL: every island counts as settled.
+   */
+  settledBefore: Date | null;
   newId?: () => string;
 }
 
@@ -128,6 +146,16 @@ function chooseAnchor(candidates: readonly AnchorEpisode[]): AnchorEpisode | und
   return [...candidates].sort((a, b) => b.lastSeenAt.getTime() - a.lastSeenAt.getTime())[0];
 }
 
+const PREFERRED_PEAK = new Set(EPISODE_PEAK_PREFERRED_METRICS);
+
+/** EPISODE_PEAK_PREFERRED_METRICS first, then score DESC, window_start ASC. */
+function peakRankBefore(candidate: UnassignedAnomalyRow, peak: UnassignedAnomalyRow): boolean {
+  const candidatePreferred = PREFERRED_PEAK.has(candidate.metricName);
+  if (candidatePreferred !== PREFERRED_PEAK.has(peak.metricName)) return candidatePreferred;
+  if (candidate.score !== peak.score) return candidate.score > peak.score;
+  return candidate.windowStart < peak.windowStart;
+}
+
 function summarize(rows: readonly UnassignedAnomalyRow[]) {
   const first = rows[0]!;
   let firstSeen = first.windowStart;
@@ -138,9 +166,7 @@ function summarize(rows: readonly UnassignedAnomalyRow[]) {
   for (const candidate of rows) {
     if (candidate.windowStart < firstSeen) firstSeen = candidate.windowStart;
     if (candidate.windowEnd > lastSeen) lastSeen = candidate.windowEnd;
-    if (candidate.score > peak.score || (candidate.score === peak.score && candidate.windowStart < peak.windowStart)) {
-      peak = candidate;
-    }
+    if (peakRankBefore(candidate, peak)) peak = candidate;
     names.add(candidate.metricName);
     buckets.add(candidate.windowStart.getTime());
   }
@@ -158,9 +184,12 @@ function summarize(rows: readonly UnassignedAnomalyRow[]) {
   };
 }
 
+const BUCKET_MS = 5 * 60_000;
+
 export function planEpisodeAssembly(input: PlanEpisodeAssemblyInput): EpisodeAssemblyPlan {
   const gapMs = input.gapMinutes * 60_000;
   const newId = input.newId ?? randomUUID;
+  const settledBefore = input.settledBefore?.getTime() ?? Number.POSITIVE_INFINITY;
 
   const groups = new Map<string, { meta: GroupMeta; rows: UnassignedAnomalyRow[] }>();
   for (const candidate of input.rows) {
@@ -190,7 +219,7 @@ export function planEpisodeAssembly(input: PlanEpisodeAssemblyInput): EpisodeAss
     anchorsByGroup.set(groupKey, [...(anchorsByGroup.get(groupKey) ?? []), candidate]);
   }
 
-  const plan: EpisodeAssemblyPlan = { anchorAttaches: [], creates: [], supersedes: [] };
+  const plan: EpisodeAssemblyPlan = { anchorAttaches: [], creates: [], supersedes: [], transients: [] };
 
   for (const groupKey of [...groups.keys()].sort()) {
     const { meta, rows } = groups.get(groupKey)!;
@@ -216,13 +245,27 @@ export function planEpisodeAssembly(input: PlanEpisodeAssemblyInput): EpisodeAss
     }
 
     const anchorIdx = islands.findIndex((island) => island.some((item) => item.kind === 'anchor'));
+    // Islands too short to open an episode drop out here: transient once
+    // settled, otherwise pending (left unassigned for the next tick). Neither
+    // supersedes the anchor nor counts toward recurrence.
+    const eligible = islands.filter((island, idx) => {
+      if (idx === anchorIdx) return true;
+      const islandRows = island.flatMap((item) => (item.kind === 'row' ? [item.row] : []));
+      if (new Set(islandRows.map((candidate) => candidate.windowStart.getTime())).size >= input.minBuckets) return true;
+      const islandEnd = Math.max(...island.map((item) => item.end));
+      const settled = idx < islands.length - 1 || islandEnd + gapMs + BUCKET_MS <= settledBefore;
+      if (settled) plan.transients.push(...islandRows.map((candidate) => candidate.id));
+      return false;
+    });
+    islands.splice(0, islands.length, ...eligible);
+    const anchorIdxAfter = islands.findIndex((island) => island.some((item) => item.kind === 'anchor'));
     const lastIdx = islands.length - 1;
     const snoozedUntil = input.activeSnoozes.get(groupKey) ?? null;
     let createdInGroup = 0;
 
     islands.forEach((island, idx) => {
       const islandRows = island.flatMap((item) => (item.kind === 'row' ? [item.row] : []));
-      if (idx === anchorIdx && current) {
+      if (idx === anchorIdxAfter && current) {
         const memberStatus: MemberStatus = current.status === 'open' ? 'open' : 'dismissed';
         for (const candidate of islandRows) {
           plan.anchorAttaches.push({
@@ -236,7 +279,7 @@ export function planEpisodeAssembly(input: PlanEpisodeAssemblyInput): EpisodeAss
       }
 
       const isHead = idx === lastIdx;
-      if (isHead && current && current.status === 'open' && anchorIdx >= 0 && anchorIdx < idx) {
+      if (isHead && current && current.status === 'open' && anchorIdxAfter >= 0 && anchorIdxAfter < idx) {
         plan.supersedes.push({ episodeId: current.id, cleanUntil: new Date(island[0]!.start) });
       }
       // A3: only the HEAD island can become a snoozed successor. An older

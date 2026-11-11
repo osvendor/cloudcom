@@ -329,6 +329,60 @@ describe('content routes — settings (exempt from the content flag gate)', () =
     expect(body.dlpConfig.detectors.ssn).toBe('redact');
   });
 
+  it('rejects a custom DLP pattern with a catastrophic nested-quantifier shape', async () => {
+    const { app } = makeApp({ db: fakeSettingsDb() });
+    const res = await app.request(`/content/settings?orgId=${ORG_ID}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        dlpConfig: { customPatterns: [{ name: 'evil', pattern: '(a+)+$', action: 'redact' }] },
+      }),
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.details[0]).toMatchObject({ name: 'evil', reason: 'nested_quantifier' });
+  });
+
+  it('rejects a custom DLP pattern that exceeds the shared length cap', async () => {
+    const { app } = makeApp({ db: fakeSettingsDb() });
+    const res = await app.request(`/content/settings?orgId=${ORG_ID}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        dlpConfig: { customPatterns: [{ name: 'too-long', pattern: 'a'.repeat(201), action: 'redact' }] },
+      }),
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.details[0]).toMatchObject({ name: 'too-long', reason: 'pattern_too_long' });
+  });
+
+  it('rejects more than the shared max custom DLP pattern count', async () => {
+    const { app } = makeApp({ db: fakeSettingsDb() });
+    const many = Array.from({ length: 51 }, (_, i) => ({ name: `p${i}`, pattern: `p${i}`, action: 'redact' }));
+    const res = await app.request(`/content/settings?orgId=${ORG_ID}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ dlpConfig: { customPatterns: many } }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('accepts and persists a safe custom DLP pattern', async () => {
+    const db = fakeSettingsDb();
+    const { app } = makeApp({ db });
+    const putRes = await app.request(`/content/settings?orgId=${ORG_ID}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        dlpConfig: { customPatterns: [{ name: 'employee-id', pattern: 'EMP-\\d{6}', action: 'redact' }] },
+      }),
+    });
+    expect(putRes.status).toBe(200);
+    const body = await putRes.json();
+    expect(body.dlpConfig.customPatterns).toEqual([{ name: 'employee-id', pattern: 'EMP-\\d{6}', action: 'redact' }]);
+  });
+
   it('rejects unknown top-level keys', async () => {
     const { app } = makeApp({ db: fakeSettingsDb() });
     const res = await app.request(`/content/settings?orgId=${ORG_ID}`, {
@@ -347,6 +401,72 @@ describe('content routes — settings (exempt from the content flag gate)', () =
     expect(res.status).toBe(403);
   });
 
+  it('rejects enabling content with only workspace:write (no workspace:execute/devices:execute)', async () => {
+    // Simulate a caller that only has the configuration-authority grant, same
+    // shape as adminGate's write-only fallback for the rest of /content/*.
+    const writeOnlyApp = new Hono<WorkspaceRouteEnv>();
+    writeOnlyApp.use('*', async (c, next) => {
+      c.set('auth', { user: { id: 'u1' }, scope: 'partner', accessibleOrgIds: [ORG_ID] } as WorkspaceRouteEnv['Variables']['auth']);
+      c.set('extensionAuthorization', {
+        hasPermission: (resource: string, action: string) => resource === 'workspace' && action === 'write',
+        mfaSatisfied: true,
+      });
+      await next();
+    });
+    writeOnlyApp.route('/', createContentRoutes({
+      contentIngestService: { run: vi.fn(), status: vi.fn() } as unknown as ContentRouteDeps['contentIngestService'],
+      ingestJobs: { ensureJob: vi.fn(), list: vi.fn() } as unknown as ContentRouteDeps['ingestJobs'],
+      ingestRunner: { advance: vi.fn() } as unknown as ContentRouteDeps['ingestRunner'],
+      db: fakeSettingsDb(),
+      audit: vi.fn(async () => {}),
+      log: vi.fn(),
+    }));
+
+    const res = await writeOnlyApp.request(`/content/settings?orgId=${ORG_ID}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ contentEnabled: true }),
+    });
+    expect(res.status).toBe(403);
+  });
+
+  it('rejects relaxing a DLP detector with only workspace:write', async () => {
+    const writeOnlyApp = new Hono<WorkspaceRouteEnv>();
+    writeOnlyApp.use('*', async (c, next) => {
+      c.set('auth', { user: { id: 'u1' }, scope: 'partner', accessibleOrgIds: [ORG_ID] } as WorkspaceRouteEnv['Variables']['auth']);
+      c.set('extensionAuthorization', {
+        hasPermission: (resource: string, action: string) => resource === 'workspace' && action === 'write',
+        mfaSatisfied: true,
+      });
+      await next();
+    });
+    writeOnlyApp.route('/', createContentRoutes({
+      contentIngestService: { run: vi.fn(), status: vi.fn() } as unknown as ContentRouteDeps['contentIngestService'],
+      ingestJobs: { ensureJob: vi.fn(), list: vi.fn() } as unknown as ContentRouteDeps['ingestJobs'],
+      ingestRunner: { advance: vi.fn() } as unknown as ContentRouteDeps['ingestRunner'],
+      db: fakeSettingsDb(),
+      audit: vi.fn(async () => {}),
+      log: vi.fn(),
+    }));
+
+    const res = await writeOnlyApp.request(`/content/settings?orgId=${ORG_ID}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ dlpConfig: { detectors: { ssn: 'off' } } }),
+    });
+    expect(res.status).toBe(403);
+  });
+
+  it('allows a workspace:execute + devices:execute caller to enable content', async () => {
+    const { app } = makeApp({ db: fakeSettingsDb() });
+    const res = await app.request(`/content/settings?orgId=${ORG_ID}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ contentEnabled: true }),
+    });
+    expect(res.status).toBe(200);
+  });
+
   it('audits the settings update', async () => {
     const { app, deps } = makeApp({ db: fakeSettingsDb() });
     await app.request(`/content/settings?orgId=${ORG_ID}`, {
@@ -359,6 +479,62 @@ describe('content routes — settings (exempt from the content flag gate)', () =
       orgId: ORG_ID,
       result: 'success',
     }));
+  });
+});
+
+describe('content routes — #3474 cleanup', () => {
+  const put = (app: ReturnType<typeof makeApp>['app'], body: unknown) =>
+    app.request(`/content/settings?orgId=${ORG_ID}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+  it('flag-gate 404 body matches every other 404 ("not found")', async () => {
+    const { app } = makeApp({ db: fakeSettingsDb() }); // content disabled (no row)
+    const res = await app.request(`/content/status?orgId=${ORG_ID}`);
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ error: 'not found' });
+  });
+
+  it('audit details carry dlpConfig before/after when dlpConfig is changed', async () => {
+    const { app, deps } = makeApp({ db: fakeSettingsDb() });
+    const res = await put(app, { dlpConfig: { detectors: { email: 'block' } } });
+    expect(res.status).toBe(200);
+    const call = vi.mocked(deps.audit).mock.calls.at(-1)![0] as { details: Record<string, any> };
+    expect(call.details.dlpConfigBefore.detectors.email).toBe('off');
+    expect(call.details.dlpConfigAfter.detectors.email).toBe('block');
+  });
+
+  it('audit details omit dlpConfig when only contentEnabled is patched', async () => {
+    const { app, deps } = makeApp({ db: fakeSettingsDb() });
+    await put(app, { contentEnabled: true });
+    const call = vi.mocked(deps.audit).mock.calls.at(-1)![0] as { details: Record<string, unknown> };
+    expect(call.details).not.toHaveProperty('dlpConfigBefore');
+    expect(call.details).not.toHaveProperty('dlpConfigAfter');
+  });
+
+  it("rejects a typo'd detector key instead of silently dropping it", async () => {
+    const { app } = makeApp({ db: fakeSettingsDb() });
+    const res = await put(app, { dlpConfig: { detectors: { credit_crad: 'block' } } });
+    expect(res.status).toBe(400);
+    expect(JSON.stringify((await res.json()).details)).toContain('credit_crad');
+  });
+
+  it('flag gate: exemption is exact — nested /content/settings 404s, real exempt paths pass', async () => {
+    const { app } = makeApp({ db: fakeSettingsDb() }); // content disabled
+    const q = `orgId=${ORG_ID}`;
+    expect((await app.request(`/content/ingest-run/content/settings?${q}`, { method: 'POST' })).status).toBe(404);
+    expect((await app.request(`/content/settings?${q}`)).status).toBe(200);
+    expect((await app.request(`/content/jobs?${q}`)).status).not.toBe(404);
+  });
+
+  it('still accepts every known detector key', async () => {
+    const { app } = makeApp({ db: fakeSettingsDb() });
+    const res = await put(app, { dlpConfig: { detectors: {
+      credit_card: 'block', iban: 'log', ssn: 'redact', api_key: 'off', email: 'log', phone: 'off',
+    } } });
+    expect(res.status).toBe(200);
   });
 });
 

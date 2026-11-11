@@ -38,13 +38,37 @@ vi.mock('../shared/Toast', () => ({
   showToast: vi.fn()
 }));
 
+// The real form is pinned by DiscoveryProfileForm.test.tsx; here it is a stub
+// that hands the page whatever values the test sets, plus a hook to drive the
+// count loader the page passes it in edit mode.
+const { mockFormValues } = vi.hoisted(() => ({
+  mockFormValues: { current: null as Record<string, unknown> | null, loadedAgents: null as unknown }
+}));
 vi.mock('./DiscoveryProfileForm', () => ({
   defaultAlertSettings: {
     enabled: false,
     severity: 'warning',
     channels: []
   },
-  default: () => null
+  default: ({ onSubmit, loadMovableAssetCount, loadSiteAgents }: {
+    onSubmit: (values: unknown) => void;
+    loadMovableAssetCount?: () => Promise<number>;
+    loadSiteAgents?: (siteId: string) => Promise<unknown>;
+  }) => (
+    <div>
+      <button type="button" data-testid="mock-form-submit" onClick={() => onSubmit(mockFormValues.current)}>submit</button>
+      {loadSiteAgents && (
+        <button
+          type="button"
+          data-testid="mock-form-load-agents"
+          onClick={() => void loadSiteAgents('site-1').then((agents) => { mockFormValues.loadedAgents = agents; })}
+        >agents</button>
+      )}
+      {loadMovableAssetCount && (
+        <button type="button" data-testid="mock-form-load-count" onClick={() => void loadMovableAssetCount()}>count</button>
+      )}
+    </div>
+  )
 }));
 
 vi.mock('./DiscoveryJobList', () => ({
@@ -116,13 +140,159 @@ function makeJsonResponse(payload: unknown, ok = true, status = ok ? 200 : 500):
   } as unknown as Response;
 }
 
+const editFormValues = {
+  name: 'HQ sweep',
+  siteId: 'site-1',
+  subnets: ['10.0.0.0/24'],
+  methods: ['ping'],
+  schedule: { cadence: 'daily', time: '02:00', timezone: 'UTC' },
+  snmp: {
+    version: 'v2c', community: 'public', port: 161, timeout: 2000, retries: 1,
+    username: '', authProtocol: 'sha', authPassphrase: '', privacyProtocol: 'aes', privacyPassphrase: ''
+  },
+  alertSettings: { enabled: false, alertOnNew: true, alertOnDisappeared: true, alertOnChanged: true, changeRetentionDays: 90 }
+};
+
 describe('DiscoveryPage', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     orgStoreState.currentOrgId = 'org-1';
     orgStoreState.sites = [];
     orgStoreState.allOrgs = false;
+    mockFormValues.current = null;
+    mockFormValues.loadedAgents = null;
     window.history.pushState({}, '', '/discovery#profiles');
+  });
+
+  describe('profile site move (edit)', () => {
+    const openEditor = async () => {
+      orgStoreState.sites = [{ id: 'site-1', name: 'HQ' }, { id: 'site-2', name: 'Branch' }];
+      fetchWithAuthMock.mockResolvedValueOnce(makeJsonResponse(profilesPayload));
+      fetchWithAuthMock.mockResolvedValueOnce(makeJsonResponse(profilesPayload.data[0]));
+      render(<DiscoveryPage />);
+      await screen.findAllByText('HQ sweep');
+      fireEvent.click(desktop().getByTitle('Edit profile'));
+      await screen.findByTestId('mock-form-submit');
+    };
+
+    it('sends siteId and moveDiscoveredAssets on PATCH and toasts what moved', async () => {
+      await openEditor();
+      fetchWithAuthMock.mockResolvedValueOnce(makeJsonResponse({
+        ...profilesPayload.data[0],
+        siteId: 'site-2',
+        assetMove: { candidates: 12, moved: 12, unlinkedDevices: 1, monitorsReattached: 0, topologyPoliciesDisabled: 2 }
+      }));
+      fetchWithAuthMock.mockResolvedValueOnce(makeJsonResponse(profilesPayload));
+      mockFormValues.current = { ...editFormValues, siteId: 'site-2', moveDiscoveredAssets: true };
+
+      fireEvent.click(screen.getByTestId('mock-form-submit'));
+
+      await waitFor(() => {
+        expect(fetchWithAuthMock).toHaveBeenCalledWith('/discovery/profiles/profile-1', expect.objectContaining({ method: 'PATCH' }));
+      });
+      const patchCall = fetchWithAuthMock.mock.calls.find(([url, init]) => url === '/discovery/profiles/profile-1' && init?.method === 'PATCH');
+      expect(JSON.parse(String(patchCall?.[1]?.body))).toMatchObject({ siteId: 'site-2', moveDiscoveredAssets: true });
+
+      await waitFor(() => {
+        expect(showToastMock).toHaveBeenCalledWith({
+          message: 'Profile moved to Branch. 12 network devices moved; 1 agent link removed; 2 topology policies disabled.',
+          type: 'success'
+        });
+      });
+    });
+
+    it('toasts a plain update when the site did not change and omits zero clauses', async () => {
+      await openEditor();
+      fetchWithAuthMock.mockResolvedValueOnce(makeJsonResponse({ ...profilesPayload.data[0], name: 'HQ sweep v2' }));
+      fetchWithAuthMock.mockResolvedValueOnce(makeJsonResponse(profilesPayload));
+      mockFormValues.current = { ...editFormValues, name: 'HQ sweep v2', moveDiscoveredAssets: false };
+
+      fireEvent.click(screen.getByTestId('mock-form-submit'));
+
+      await waitFor(() => {
+        expect(showToastMock).toHaveBeenCalledWith({ message: 'Discovery profile "HQ sweep v2" updated', type: 'success' });
+      });
+      const patchCall = fetchWithAuthMock.mock.calls.find(([url, init]) => url === '/discovery/profiles/profile-1' && init?.method === 'PATCH');
+      expect(JSON.parse(String(patchCall?.[1]?.body))).toMatchObject({ siteId: 'site-1', moveDiscoveredAssets: false });
+    });
+
+    it('#7969: a new profile POST carries the chosen scan agent', async () => {
+      orgStoreState.sites = [{ id: 'site-1', name: 'HQ' }];
+      fetchWithAuthMock.mockResolvedValueOnce(makeJsonResponse(profilesPayload));
+      render(<DiscoveryPage />);
+      await screen.findAllByText('HQ sweep');
+      fireEvent.click(screen.getAllByRole('button', { name: /New Profile/ })[0]!);
+      await screen.findByTestId('mock-form-submit');
+      fetchWithAuthMock.mockResolvedValueOnce(makeJsonResponse({ ...profilesPayload.data[0], id: 'profile-new' }));
+      fetchWithAuthMock.mockResolvedValueOnce(makeJsonResponse(profilesPayload));
+      mockFormValues.current = { ...editFormValues, pinnedDeviceId: 'dev-1' };
+
+      fireEvent.click(screen.getByTestId('mock-form-submit'));
+
+      await waitFor(() => {
+        expect(fetchWithAuthMock).toHaveBeenCalledWith('/discovery/profiles', expect.objectContaining({ method: 'POST' }));
+      });
+      const postCall = fetchWithAuthMock.mock.calls.find(([url, init]) => url === '/discovery/profiles' && init?.method === 'POST');
+      expect(JSON.parse(String(postCall?.[1]?.body))).toMatchObject({ pinnedDeviceId: 'dev-1', siteId: 'site-1' });
+    });
+
+    it('#7969: sends the chosen scan agent, and null for Automatic', async () => {
+      await openEditor();
+      fetchWithAuthMock.mockResolvedValueOnce(makeJsonResponse(profilesPayload.data[0]));
+      fetchWithAuthMock.mockResolvedValueOnce(makeJsonResponse(profilesPayload));
+      mockFormValues.current = { ...editFormValues, pinnedDeviceId: 'dev-1', moveDiscoveredAssets: false };
+      fireEvent.click(screen.getByTestId('mock-form-submit'));
+      await waitFor(() => {
+        expect(fetchWithAuthMock).toHaveBeenCalledWith('/discovery/profiles/profile-1', expect.objectContaining({ method: 'PATCH' }));
+      });
+      const patchCall = fetchWithAuthMock.mock.calls.find(([url, init]) => url === '/discovery/profiles/profile-1' && init?.method === 'PATCH');
+      expect(JSON.parse(String(patchCall?.[1]?.body))).toMatchObject({ pinnedDeviceId: 'dev-1' });
+    });
+
+    it('#7969: Automatic (empty pin) is sent as null so the API clears the pin', async () => {
+      await openEditor();
+      fetchWithAuthMock.mockResolvedValueOnce(makeJsonResponse(profilesPayload.data[0]));
+      fetchWithAuthMock.mockResolvedValueOnce(makeJsonResponse(profilesPayload));
+      mockFormValues.current = { ...editFormValues, pinnedDeviceId: '', moveDiscoveredAssets: false };
+      fireEvent.click(screen.getByTestId('mock-form-submit'));
+      await waitFor(() => {
+        expect(fetchWithAuthMock).toHaveBeenCalledWith('/discovery/profiles/profile-1', expect.objectContaining({ method: 'PATCH' }));
+      });
+      const patchCall = fetchWithAuthMock.mock.calls.find(([url, init]) => url === '/discovery/profiles/profile-1' && init?.method === 'PATCH');
+      expect(JSON.parse(String(patchCall?.[1]?.body)).pinnedDeviceId).toBeNull();
+    });
+
+    it('#7969: loads the site\'s devices for the scan-agent picker, scoped to the current org', async () => {
+      await openEditor();
+      fetchWithAuthMock.mockResolvedValueOnce(makeJsonResponse({ data: [
+        { id: 'dev-2', hostname: 'zulu', status: 'offline' },
+        { id: 'dev-1', hostname: 'alpha', displayName: 'Alpha desk', status: 'online' },
+      ] }));
+
+      fireEvent.click(screen.getByTestId('mock-form-load-agents'));
+
+      await waitFor(() => expect(mockFormValues.loadedAgents).not.toBeNull());
+      const url = String(fetchWithAuthMock.mock.calls.at(-1)?.[0]);
+      expect(url).toMatch(/^\/devices\?/);
+      const params = new URLSearchParams(url.split('?')[1]);
+      expect(params.get('siteId')).toBe('site-1');
+      expect(params.get('orgId')).toBe('org-1');
+      expect(mockFormValues.loadedAgents).toEqual([
+        { id: 'dev-1', name: 'Alpha desk', online: true },
+        { id: 'dev-2', name: 'zulu', online: false },
+      ]);
+    });
+
+    it('loads the movable-asset count from the profile endpoint', async () => {
+      await openEditor();
+      fetchWithAuthMock.mockResolvedValueOnce(makeJsonResponse({ count: 7, siteId: 'site-1' }));
+
+      fireEvent.click(screen.getByTestId('mock-form-load-count'));
+
+      await waitFor(() => {
+        expect(fetchWithAuthMock).toHaveBeenCalledWith('/discovery/profiles/profile-1/movable-assets');
+      });
+    });
   });
 
   it('derives the initial tab from window.location.hash', async () => {
@@ -177,6 +347,30 @@ describe('DiscoveryPage', () => {
 
     expect(window.location.hash).toBe('#changes');
     expect(await screen.findByText('Changes tab')).toBeInTheDocument();
+  });
+
+  it('deletes a profile through a confirm dialog and toasts the outcome', async () => {
+    const confirmSpy = vi.spyOn(window, 'confirm');
+    fetchWithAuthMock.mockResolvedValueOnce(makeJsonResponse(profilesPayload));
+    fetchWithAuthMock.mockResolvedValueOnce(makeJsonResponse({ success: true }));
+    fetchWithAuthMock.mockResolvedValueOnce(makeJsonResponse({ data: [] }));
+
+    render(<DiscoveryPage />);
+    await screen.findAllByText('HQ sweep');
+
+    fireEvent.click(desktop().getByTitle('Delete profile'));
+    expect(confirmSpy).not.toHaveBeenCalled();
+    expect(fetchWithAuthMock).not.toHaveBeenCalledWith('/discovery/profiles/profile-1', expect.objectContaining({ method: 'DELETE' }));
+
+    fireEvent.click(await screen.findByTestId('discovery-profile-delete-confirm'));
+
+    await waitFor(() => {
+      expect(fetchWithAuthMock).toHaveBeenCalledWith('/discovery/profiles/profile-1', { method: 'DELETE' });
+    });
+    await waitFor(() => {
+      expect(showToastMock).toHaveBeenCalledWith({ message: 'Discovery profile "HQ sweep" deleted', type: 'success' });
+    });
+    confirmSpy.mockRestore();
   });
 
   it('toasts and shows a per-profile loading state while queuing a scan', async () => {

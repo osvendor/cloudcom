@@ -24,12 +24,9 @@
  */
 import { and, asc, desc, eq, gt, isNull, lt, sql } from 'drizzle-orm';
 import type { AgentRunVerdict, AiAgentMode, AiSweepKind } from '@breeze/shared';
-import {
-  db,
-  getCurrentDbAccessContext,
-  runOutsideDbContext,
-  withSystemDbAccessContext,
-} from '../../db';
+import { db } from '../../db';
+import { createSourcedAlert } from '../alertService';
+import { inSystemDbContext, readAlertRecovery, windowElapsed } from '../outcomeProbes';
 // Direct module imports, not the schema barrel — same reasoning as
 // agentCircuit.ts/runService.ts: this sits on the run-finish path, and the
 // barrel would drag every partial-mock unit test of that path into stubbing
@@ -52,12 +49,6 @@ import {
   notifyDemotion,
   type NotifyDemotionInput,
 } from './supervisedKeyDemote';
-
-/** Same skip-if-already-system shape duplicated across this module family. */
-function inSystemDbContext<T>(fn: () => Promise<T>): Promise<T> {
-  if (getCurrentDbAccessContext()?.scope === 'system') return fn();
-  return runOutsideDbContext(() => withSystemDbAccessContext(fn));
-}
 
 /**
  * v1 watch windows are CONSTANTS (plan header) — configurability needs the
@@ -233,6 +224,14 @@ async function loadWatchAnchor(
     return null;
   }
 
+  const deviceId = alertRow.deviceId;
+  if (deviceId === null) {
+    console.warn('[fixWatch] triggering alert has no device — skipping watch', {
+      ...input.logContext, orgId: input.orgId, alertId: input.alertId, reason: 'alert_has_no_device',
+    });
+    return null;
+  }
+
   const [org] = await database
     .select({ partnerId: organizations.partnerId })
     .from(organizations)
@@ -245,7 +244,7 @@ async function loadWatchAnchor(
     return null;
   }
 
-  return { ...alertRow, partnerId: org.partnerId };
+  return { ...alertRow, deviceId, partnerId: org.partnerId };
 }
 
 /**
@@ -560,15 +559,11 @@ export async function checkFixWatchPhase1(watchId: string): Promise<FixWatchPhas
       return giveUpIfTimedOut(watch, watchId);
     }
 
-    let alertStatus: string | null = null;
-    if (watch.alertId) {
-      const [alertRow] = await db
-        .select({ status: alerts.status })
-        .from(alerts)
-        .where(eq(alerts.id, watch.alertId))
-        .limit(1);
-      alertStatus = alertRow?.status ?? null;
-    }
+    // Extracted probe (outcomeProbes.ts). fixWatch keeps its historical rule:
+    // ANY resolve counts as recovery here — only the suggestion watcher reads
+    // resolutionReason.
+    const reading = watch.alertId ? await readAlertRecovery(watch.alertId) : null;
+    const alertStatus: string | null = reading?.status ?? null;
 
     if (alertStatus === 'resolved') return moveToWatching(watchId);
 
@@ -621,8 +616,7 @@ async function giveUpIfTimedOut(
   watch: Pick<AiAgentFixWatch, 'createdAt'>,
   watchId: string,
 ): Promise<FixWatchPhase1Outcome> {
-  const ageMs = Date.now() - watch.createdAt.getTime();
-  if (ageMs < RECOVERY_TIMEOUT_HOURS * 60 * 60 * 1000) return { action: 'still_pending' };
+  if (!windowElapsed(watch.createdAt, RECOVERY_TIMEOUT_HOURS)) return { action: 'still_pending' };
 
   const [moved] = await db
     .update(aiAgentFixWatches)
@@ -907,7 +901,7 @@ async function sendRecurrenceNotifications(
     // `device_id` so the probe rides `idx_alerts_device_triggered`
     // (2026-05-17-b) instead of scanning jsonb across the table.
     //
-    // Check-then-insert rather than a unique index over a jsonb expression:
+    // Check-then-create rather than a unique index over a jsonb expression:
     // `alerts` is one of the hottest tables in the schema, and such an index
     // would have to be built over every historical row for a guard whose
     // failure mode is cosmetic. Two siblings whose statements interleave
@@ -932,15 +926,15 @@ async function sendRecurrenceNotifications(
       .limit(1);
     if (alreadyRaised) return;
 
-    // Rule-less attention alert — mirrors `actVerify.ts`'s
-    // `recordActVerifyFailureAlert` direct-insert pattern (`ruleId: null`,
-    // `status: 'active'`), with the `configItemName`/`context.source` the
-    // plan specifies for this alert family.
-    await db.insert(alerts).values({
-      ruleId: null,
+    // Rule-less attention alert, with the `configItemName`/`context.source`
+    // the plan specifies for this alert family. #11328 — through the shared
+    // create path so `alert.triggered` publishes (after COMMIT); the raw
+    // insert this replaced reached the inbox but no notification channel,
+    // routing rule or escalation. The episode guard above keeps a sibling
+    // watch from raising, and so publishing, a second one.
+    await createSourcedAlert({
       deviceId: watch.deviceId,
       orgId: watch.orgId,
-      configPolicyId: null,
       configItemName: FIX_WATCH_ALERT_CONFIG_ITEM,
       severity: 'high',
       title: `Agent fix did not hold: ${agentRow.name}`,
@@ -956,8 +950,8 @@ async function sendRecurrenceNotifications(
         agentId: watch.agentId,
         recurrenceAlertId,
       },
-      status: 'active',
-      triggeredAt: new Date(),
+      publisher: 'ai-agent-fix-watch',
+      eventPayload: { watchId: watch.id, runId: watch.runId, agentId: watch.agentId },
     });
   });
 }

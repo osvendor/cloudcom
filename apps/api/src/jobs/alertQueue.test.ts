@@ -45,8 +45,10 @@ vi.mock('../db/schema', () => ({
 vi.mock('../services/alertService', () => ({
   evaluateDeviceAlerts: vi.fn(),
   checkAllAutoResolve: vi.fn(),
-  evaluateDeviceAlertsFromPolicy: vi.fn(),
-  checkAutoResolveFromConfigPolicy: vi.fn(),
+}));
+
+vi.mock('../services/subjectAlertOutbox', () => ({
+  drainSubjectAlertOutbox: vi.fn(async () => undefined),
 }));
 
 import {
@@ -78,7 +80,7 @@ describe('alert queue helpers', () => {
       'evaluate-device',
       expect.objectContaining({ deviceId: 'device-1', orgId: 'org-1' }),
       expect.objectContaining({
-        jobId: expect.stringMatching(/^alert-evaluate-device:device-1:[a-z0-9]+$/),
+        jobId: expect.stringMatching(/^alert-evaluate-device-device-1-[a-z0-9]+$/),
       }),
     );
   });

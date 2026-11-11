@@ -31,7 +31,8 @@
       "policy": "Politika"
     },
     "pagination": "{{from}}–{{to}} / {{total}} gösteriliyor",
-    "prev": "Önceki"
+    "prev": "Önceki",
+    "eventFilterLabel": "Olay türü"
   },
   "peripheralPoliciesList": {
     "errors": {
@@ -62,7 +63,10 @@
       "created": "Oluşturuldu"
     },
     "partnerWideTitle": "İş ortağı çapında politika — her kuruluştaki cihazlarda uygulanır",
-    "allOrgs": "İş ortağı çapında"
+    "allOrgs": "İş ortağı çapında",
+    "classFilterLabel": "Cihaz sınıfı",
+    "actionFilterLabel": "Eylem",
+    "statusFilterLabel": "Durum"
   },
   "peripheralPolicyForm": {
     "errors": {
@@ -75,6 +79,14 @@
     "allOrganizations": "Tüm kuruluşlar",
     "partnerWide": "(iş ortağı çapında politika)",
     "thisOrganization": "Yalnızca bu kuruluş",
+    "appliesTo": "Uygulandığı yer",
+    "targets": {
+      "organization": "Tüm cihazlar",
+      "site": "Belirli siteler ({{total}})",
+      "group": "Belirli cihaz grupları ({{total}})",
+      "device": "Belirli cihazlar ({{total}})"
+    },
+    "targetReadOnlyHint": "Hedefler bu formda değiştirilemez. Kaydetme mevcut hedefleri korur.",
     "deviceClass": "Cihaz Sınıfı",
     "classes": {
       "storage": "Depolama",
@@ -98,7 +110,12 @@
     "serialNumber": "Seri Numarası",
     "allow": "İzin ver:",
     "reason": "Sebep",
+    "expiresAt": "Sona erer (yerel saatiniz)",
     "updatePolicy": "Güncelleme Politikası",
-    "createPolicy": "Politika Oluştur"
+    "createPolicy": "Politika Oluştur",
+    "saved": {
+      "created": "Politika oluşturuldu",
+      "updated": "Politika güncellendi"
+    }
   }
 }

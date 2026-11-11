@@ -20,6 +20,14 @@ beforeEach(() => {
   navigateTo.mockReset();
 });
 
+describe('IncidentsPage kind-filter select accessible name (#7156)', () => {
+  it('gives the kind filter select a real accessible name', async () => {
+    fetchWithAuth.mockResolvedValueOnce(feed([]));
+    render(<IncidentsPage />);
+    expect(await screen.findByRole('combobox', { name: 'Kind' })).toBeInTheDocument();
+  });
+});
+
 describe('IncidentsPage feed', () => {
   it('renders source badges for tracked and finding rows', async () => {
     fetchWithAuth.mockResolvedValueOnce(feed([trackedRow, findingRow]));
@@ -96,5 +104,32 @@ describe('IncidentsPage feed', () => {
 
     expect(screen.getByText('Promote from the EDR view')).toBeInTheDocument();
     expect(screen.queryByRole('link', { name: /View in/ })).toBeNull();
+  });
+});
+
+describe('IncidentsPage framework EDR sources (#8166)', () => {
+  const fwRow = { ...findingRow, source: 'bitdefender', sourceId: 'bd-1', title: 'Ransomware' };
+
+  it('renders the provider label for a framework source', async () => {
+    fetchWithAuth.mockResolvedValueOnce(feed([fwRow]));
+    render(<IncidentsPage />);
+    await waitFor(() => expect(screen.getByText('Ransomware')).toBeInTheDocument());
+    expect(screen.getByText('Bitdefender GravityZone')).toBeInTheDocument();
+  });
+
+  it('renders a generic non-empty label for an unknown source', async () => {
+    fetchWithAuth.mockResolvedValueOnce(feed([{ ...fwRow, source: 'acme', sourceId: 'a-1', title: 'Odd one' }]));
+    render(<IncidentsPage />);
+    await waitFor(() => expect(screen.getByText('Odd one')).toBeInTheDocument());
+    expect(screen.getByText('EDR provider')).toBeInTheDocument();
+  });
+
+  it('never renders "undefined" in the View-in-source link for an unknown source with a linkOut', async () => {
+    fetchWithAuth.mockResolvedValueOnce(
+      feed([{ ...fwRow, source: 'acme', sourceId: 'a-2', title: 'Linked', linkOut: 'https://example.invalid/x' }]),
+    );
+    render(<IncidentsPage />);
+    await waitFor(() => expect(screen.getByText('Linked')).toBeInTheDocument());
+    expect(screen.getByRole('link', { name: /View in EDR provider/ })).toBeInTheDocument();
   });
 });

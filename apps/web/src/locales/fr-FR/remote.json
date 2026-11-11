@@ -36,6 +36,8 @@
     },
     "errors": {
       "agentUpgradeRequired": "Le bureau à distance nécessite une mise à jour de l'agent sur cet appareil (prise en charge du bail de révocation de session et de la barrière de démarrage). L'agent se met à jour automatiquement — cela se règle généralement en moins d'une minute. Le terminal et le transfert de fichiers ne sont pas concernés.",
+      "deviceNotFoundOrAccessDenied": "Appareil introuvable ou accès refusé",
+      "siteAccessDenied": "Accès refusé à ce site",
       "connectionFailed": "Connexion défaillante",
       "createDesktopCode": "Échec de la création du code de connexion au bureau",
       "createDesktopSession": "Impossible de créer une session de bureau",
@@ -47,7 +49,8 @@
       "securityCheckToast": "Lancement à distance indisponible : le contrôle de sécurité a échoué. Contactez votre administrateur.",
       "securityPolicy": "Lancement à distance bloqué par la politique de sécurité",
       "server": "Échec du lancement à distance : erreur serveur. Contactez votre administrateur.",
-      "vncTunnelFailed": "Le tunnel VNC n'a pas pu s'ouvrir"
+      "vncTunnelFailed": "Le tunnel VNC n'a pas pu s'ouvrir",
+      "providerUnavailable": "Cet outil d'accès à distance n'est plus disponible pour cet appareil. Actualisez la page et réessayez."
     },
     "fallback": {
       "linuxFirstRun": "Sous Linux, rendez le fichier téléchargé exécutable (chmod +x) et lancez-le une fois. Cela enregistre la visionneuse ; les sessions s'ouvriront ensuite automatiquement.",
@@ -64,6 +67,14 @@
     },
     "launching": "Lancement...",
     "launchingViewer": "Lancement du visionnement...",
+    "loginWindow": {
+      "connectVnc": "Se connecter avec le relais VNC",
+      "description": "macOS bloque la saisie clavier et souris à distance dans la fenêtre de connexion : le Bureau à distance n’a donc pas été démarré.",
+      "enableVncRelay": "Activez le relais VNC dans la politique de configuration de cet appareil pour ouvrir une session à l’écran de connexion, ou reconnectez-vous après qu’un utilisateur a ouvert une session.",
+      "title": "Ce Mac est à la fenêtre de connexion",
+      "unavailableTitle": "Bureau à distance indisponible",
+      "useVncRelay": "Utilisez le relais VNC pour ouvrir une session à l’écran de connexion."
+    },
     "openInBrowser": "Ouvrir dans le navigateur",
     "policyDisabled": "Le bureau à distance est désactivé par la politique",
     "policyDisabledNamed": "Le bureau à distance est désactivé par la politique « {{name}} »",
@@ -82,6 +93,10 @@
         "default": "La session a été terminée par une politique de sécurité. Reconnectez-vous pour réessayer."
       }
     },
+    "startFailed": {
+      "description": "L’agent n’a pas pu démarrer la session. Réessayez ou consultez les journaux de diagnostic de l’appareil.",
+      "title": "Le Bureau à distance n’a pas pu démarrer"
+    },
     "unavailable": {
       "default": "Le mode de bureau n’est pas disponible sur cet appareil",
       "headless": "Cet appareil n’a pas d’affichage — le bureau à distance n’est pas disponible",
@@ -90,11 +105,19 @@
       "missingEntitlement": "Le bureau de la fenêtre de connexion est bloqué jusqu’à ce que le droit requis Apple soit approuvé",
       "missingPermission": "macOS les permissions requises pour un accès non surveillé au bureau manquent toujours",
       "noDisplaySession": "Aucune session graphique active — connectez-vous d’abord via RDP ou la console",
-      "unsupportedOs": "Le bureau de la fenêtre de connexion nécessite macOS 14 (Sonoma) ou une version ultérieure. Activez le relais VNC dans la politique de configuration de l’appareil pour se connecter à l’écran de connexion.",
+      "unsupportedOs": "macOS bloque la saisie clavier et souris à distance dans la fenêtre de connexion : le Bureau à distance ne peut donc pas contrôler ce Mac à cet endroit. Activez le relais VNC dans la politique de configuration de l’appareil pour se connecter à l’écran de connexion.",
       "virtualDisplay": "Aucun écran capturable n’est disponible pour ce Mac. Activez le relais VNC pour se connecter via le partage d’écran macOS.",
       "waylandUnsupported": "Il s’agit d’un bureau Wayland — le bureau à distance nécessite un agent plus récent",
       "x11AuthFailed": "Impossible de s’authentifier auprès du serveur d’affichage (autorité X)",
       "x11ConnectFailed": "Impossible de se connecter au serveur d’affichage de cet appareil"
+    },
+    "opensNewWindow": "(s’ouvre dans une nouvelle fenêtre)",
+    "split": {
+      "builtInViewer": "Visionneuse intégrée",
+      "connectWith": "Se connecter avec {{name}}",
+      "connectWithBuiltIn": "Se connecter avec la visionneuse intégrée",
+      "menuLabel": "Choisir le mode de connexion",
+      "opensInBrowser": "S'ouvre dans un nouvel onglet du navigateur"
     }
   },
   "connectVncButton": {
@@ -194,6 +217,7 @@
       "copy": "Copier",
       "delete": "Supprimer",
       "download": "Télécharger",
+      "mkdir": "Nouveau dossier",
       "move": "Bouge",
       "purge": "Purger",
       "restore": "Restaurer",
@@ -235,6 +259,7 @@
     "emptyDirectory": "Annuaire vide",
     "errors": {
       "copy": "Impossible de copier",
+      "createFolder": "Impossible de créer le dossier",
       "delete": "Impossible de supprimer",
       "download": "Impossible de télécharger",
       "downloadTooLarge": "Trop volumineux pour être téléchargé ({{size}}). L’explorateur de fichiers transfère des fichiers jusqu’à {{max}}.",
@@ -249,6 +274,15 @@
     "home": "Accueil",
     "modified": "Modifié",
     "moveTo": "Passer à",
+    "newFolder": {
+      "action": "Nouveau dossier",
+      "title": "Nouveau dossier",
+      "nameLabel": "Nom du dossier",
+      "location": "Sera créé dans {{path}}",
+      "created": "Dossier {{name}} créé",
+      "invalidName": "Le nom du dossier ne peut pas contenir de séparateurs de chemin ni de caractères interdits par le système de fichiers de cet appareil.",
+      "nameExists": "Un fichier ou un dossier portant ce nom existe déjà ici."
+    },
     "selectedCount": "Comte sélectionné",
     "size": "Taille",
     "title": "Gestionnaire de fichiers",
@@ -280,8 +314,8 @@
       "threads": "Fils de filage"
     },
     "errors": {
-      "handlerNotConfigured": "Impossible de gérer le gestionnaire non configuré",
-      "killFailed": "Impossible d’arrêter le processus"
+      "handlerNotConfigured": "Le gestionnaire d'arrêt de processus n'est pas configuré",
+      "killFailed": "Échec de l'arrêt du processus"
     },
     "killConfirm": "Kill Confirmer",
     "killProcess": "Arrêter le processus",
@@ -303,15 +337,24 @@
     "title": "Responsable de processus",
     "totalCpu": "CPU total",
     "pid": "PID",
-    "cpu": "CPU"
+    "cpu": "CPU",
+    "monitorThis": "Surveiller ceci"
   },
   "proxyTunnelPage": {
     "errors": {
+      "closeFailed": "Impossible de fermer le tunnel",
+      "invalidProxyUrl": "Le serveur a renvoyé une adresse de proxy non valide.",
       "invalidTicket": "Ce lien n'est plus valide ou a expiré.",
-      "obtainTicket": "Impossible de récupérer le ticket",
-      "prepareConnection": "Impossible de préparer la connexion",
+      "obtainTicket": "Impossible d'obtenir le ticket du tunnel",
+      "popupBlocked": "Votre navigateur a bloqué le nouvel onglet. Autorisez les fenêtres pop-up pour ce site et réessayez.",
+      "prepareConnection": "Impossible de préparer la connexion du proxy",
       "tlsUntrusted": "Cet appareil a présenté un certificat non fiable ou auto-signé.",
       "tunnelFailed": "Le tunnel n'a pas pu s'ouvrir"
+    },
+    "cookieBlocked": {
+      "title": "Ce navigateur a bloqué la session proxy intégrée.",
+      "body": "Ouvrez l'appareil dans un nouvel onglet pour continuer.",
+      "storageBody": "Il bloque le stockage du site dans les pages intégrées, dont la page de l'appareil a besoin. Un nouvel onglet fonctionne."
     },
     "openInNewTab": "Ouvrir dans un nouvel onglet",
     "preparingConnection": "Préparation de la connexion par procuration...",
@@ -351,25 +394,25 @@
     "enterStrings": "Saisir les chaînes",
     "enterValueName": "Saisir le nom de la valeur",
     "errors": {
-      "createKey": "Impossible de créer la clé",
+      "createKey": "Impossible de créer la clé de registre",
       "createKeyDetail": "Impossible de créer une clé de registre : {{message}}",
-      "deleteKey": "Impossible de supprimer la clé",
+      "deleteKey": "Impossible de supprimer la clé de registre",
       "deleteKeyDetail": "Impossible de supprimer la clé du registre : {{message}}",
-      "deleteValue": "Impossible de supprimer la valeur",
+      "deleteValue": "Impossible de supprimer la valeur du registre",
       "deleteValueDetail": "Impossible de supprimer la valeur du registre : {{message}}",
-      "invalidFormat": "Format non valide",
-      "invalidNumber": "Nombre non valide",
-      "keyNameBackslash": "Le nom de la clé ne peut pas contenir de barre oblique inverse",
-      "keyNameRequired": "Le nom de la clé est obligatoire",
-      "keyProvider": "Fournisseur de clés non disponible",
-      "loadKeys": "Impossible de charger les clés",
+      "invalidFormat": "Format de valeur invalide",
+      "invalidNumber": "Valeur numérique invalide",
+      "keyNameBackslash": "Le nom de la clé ne peut pas contenir de barre oblique inversée",
+      "keyNameRequired": "Le nom de la clé est requis",
+      "keyProvider": "Le fournisseur de clés de registre n'est pas configuré",
+      "loadKeys": "Impossible de charger les clés du registre",
       "loadKeysDetail": "Impossible de charger les clés du registre : {{message}}",
-      "loadValues": "Impossible de charger les valeurs",
+      "loadValues": "Impossible de charger les valeurs du registre",
       "loadValuesDetail": "Impossible de charger les valeurs du registre : {{message}}",
-      "saveValue": "Impossible d’enregistrer la valeur",
+      "saveValue": "Impossible d'enregistrer la valeur du registre",
       "saveValueDetail": "Impossible d’enregistrer la valeur du registre : {{message}}",
-      "valueNameRequired": "Le nom de la valeur est obligatoire",
-      "valueProvider": "Fournisseur de valeurs non disponible"
+      "valueNameRequired": "Le nom de la valeur est requis",
+      "valueProvider": "Le fournisseur de valeurs de registre n'est pas configuré"
     },
     "hexadecimal": "Hexadécimal",
     "key": "Clé",
@@ -440,14 +483,14 @@
     "disconnect": "Déconnecter",
     "errorMessage": "Erreur : {{message}}",
     "errors": {
-      "closedUnexpectedly": "Impossible de fermer de façon inattendue",
-      "connection": "Impossible de connecter",
+      "closedUnexpectedly": "La connexion s'est fermée de manière inattendue",
+      "connection": "Erreur de connexion",
       "createSession": "Impossible de créer une session",
-      "createTicket": "Impossible de créer un ticket",
-      "failed": "Impossible d’échouer",
+      "createTicket": "Impossible de créer le ticket de connexion",
+      "failed": "Échec de la connexion",
       "initialize": "Impossible d’initialiser",
-      "invalidTicket": "Impossible de valider le ticket",
-      "webSocket": "Impossible de faire le web socket"
+      "invalidTicket": "Réponse de ticket de connexion invalide",
+      "webSocket": "Erreur de connexion WebSocket"
     },
     "exitFullscreen": "Sortie plein écran",
     "fullscreen": "Plein écran",
@@ -483,23 +526,23 @@
       "deleteRegistryValue": "Impossible de supprimer la valeur du registre",
       "disableTask": "Impossible de désactiver la tâche",
       "enableTask": "Impossible d’activer la tâche",
-      "eventDetails": "Impossible de pouvoir faire des détails de l’événement",
+      "eventDetails": "Impossible de récupérer les détails de l'événement",
       "fetchEventLogs": "Impossible de récupérer les journaux d’événements",
       "fetchProcesses": "Impossible de récupérer les processus",
       "fetchServices": "Impossible de récupérer des services",
       "fetchTasks": "Impossible de récupérer des tâches",
       "killProcess": "Impossible d’arrêter le processus",
-      "processDetails": "Impossible de traiter les détails",
+      "processDetails": "Impossible d'obtenir les détails du processus",
       "queryEvents": "Impossible d’interroger les événements",
-      "registryKeys": "Impossible de pouvoir enregistrer les clés",
-      "registryValues": "Impossible de registrar les valeurs",
+      "registryKeys": "Impossible de charger les clés du registre",
+      "registryValues": "Impossible de charger les valeurs du registre",
       "restartService": "Impossible de relancer le service",
       "runTask": "Impossible d’exécuter la tâche",
       "setRegistryValue": "Impossible de définir la valeur du registre",
       "startService": "Impossible de démarrer le service",
       "stopService": "Impossible d’arrêter le service",
-      "taskDetails": "Impossible de fournir des tâches détaillées",
-      "taskHistory": "Impossible de faire des tâches historiques"
+      "taskDetails": "Impossible de charger les détails de la tâche",
+      "taskHistory": "Impossible de charger l'historique de la tâche"
     },
     "policyDisabled": "Une politique de configuration a désactivé les outils système à distance.",
     "policyDisabledNamed": "La politique de configuration « {{name}} » a désactivé les outils système à distance.",
@@ -602,7 +645,7 @@
     "displayName": "Nom d’affichage",
     "executablePath": "Chemin exécutable",
     "loading": "Chargement",
-    "noDescription": "Aucune description",
+    "noDescription": "Aucune description disponible",
     "noServicesAvailable": "Aucun service disponible",
     "noServicesFound": "Aucun service trouvé",
     "ok": "Ok",
@@ -620,9 +663,10 @@
     },
     "stopService": "Arrêter le service",
     "summary": "{{shown}} de {{total}} services sur {{device}}",
-    "title": "Titre",
+    "title": "Services",
     "windowsOnlyDescription": "Le Gestionnaire de Services n’est disponible que pour les appareils Windows. {{device}} court {{os}}.",
-    "windowsOnlyTitle": "Windows Seul titre"
+    "windowsOnlyTitle": "Windows uniquement",
+    "monitorThis": "Surveiller ceci"
   },
   "sessionHistory": {
     "columns": {
@@ -637,7 +681,10 @@
       "lastSevenDays": "Sept derniers jours",
       "lastThirtyDays": "Trente derniers jours",
       "today": "Aujourd’hui",
-      "yesterday": "Hier"
+      "yesterday": "Hier",
+      "typeFilterLabel": "Type de session",
+      "userFilterLabel": "Utilisateur",
+      "dateFilterLabel": "Plage de dates"
     },
     "noSessions": "Pas de sessions",
     "page": "Page {{current}} de {{total}}",
@@ -655,6 +702,7 @@
       "disconnected": "Déconnecté",
       "failed": "Échec",
       "pending": "En attente",
+      "endedByUser": "Terminée par l’utilisateur",
       "teardownPending": "En cours de fin (en attente de l’appareil)"
     },
     "subtitle": "Journal d’audit d’accès à distance",
@@ -671,7 +719,7 @@
   "sessionHistoryPage": {
     "detailsTitle": "Détails Titre",
     "errors": {
-      "exportFetch": "Impossible d’exporter la récupération"
+      "exportFetch": "Impossible de récupérer les sessions pour l'exportation"
     },
     "fields": {
       "dataTransferred": "Données transférées",
@@ -691,6 +739,7 @@
       "timeline": "Chronologie"
     },
     "subtitle": "Consultez et auditez les sessions d’accès à distance",
+    "endedByUser": "Terminée par l’utilisateur",
     "teardownPending": "En attente de la confirmation de l’appareil",
     "title": "Historique des sessions",
     "viewDevice": "Dispositif de vue",
@@ -736,12 +785,12 @@
     },
     "disconnect": "Déconnecter",
     "errors": {
-      "authenticationDetail": "Impossible de pouvoir authentification détail",
-      "authenticationFailed": "Impossible d’authentification échouée",
-      "connectionLost": "Connexion perdue",
-      "loadViewer": "Impossible de charger le visualiseur",
-      "securityFailure": "Échec de sécurité",
-      "securityType": "Impossible de typer la sécurité"
+      "authenticationDetail": "Échec de l'authentification : {{reason}}. Vérifiez votre mot de passe VNC.",
+      "authenticationFailed": "Échec de l'authentification",
+      "connectionLost": "Connexion perdue de manière inattendue",
+      "loadViewer": "Impossible de charger la visionneuse VNC",
+      "securityFailure": "Échec de sécurité : {{reason}}",
+      "securityType": "Type de sécurité non pris en charge : {{reason}}"
     },
     "exitFullscreen": "Sortie plein écran",
     "fullscreen": "Plein écran",
@@ -762,8 +811,8 @@
     "disconnect": "Déconnecter",
     "errors": {
       "connect": "Impossible de se connecter",
-      "invalidTicket": "Impossible de valider le ticket",
-      "obtainTicket": "Impossible de récupérer le ticket"
+      "invalidTicket": "Réponse de ticket de tunnel invalide",
+      "obtainTicket": "Impossible d'obtenir le ticket du tunnel VNC"
     },
     "sessionTitle": "Titre de la session"
   },
@@ -829,5 +878,23 @@
       "unlabeled": "Session sans libellé",
       "openSession": "Ouvrir le détail de la session"
     }
+  },
+  "activeSessionsBanner": {
+    "title_one": "Une autre personne a une session sur cet appareil",
+    "title_other": "{{count}} autres personnes ont des sessions sur cet appareil",
+    "session": "{{name}} — {{type}}, depuis {{duration}}",
+    "unknownUser": "Utilisateur inconnu",
+    "sessionConnecting": "{{name}} — {{type}}, connexion en cours…",
+    "duration": {
+      "minutes_one": "{{count}} minute",
+      "minutes_other": "{{count}} minutes",
+      "hoursMinutes": "{{hours}} h et {{minutes}} min",
+      "lessThanMinute": "moins d'une minute",
+      "hours_one": "{{count}} heure",
+      "hours_other": "{{count}} heures"
+    },
+    "announcement_one": "{{names}} a une session sur cet appareil",
+    "announcement_other": "{{names}} ont des sessions sur cet appareil",
+    "announcementNone": "Personne d'autre n'a de session sur cet appareil"
   }
 }

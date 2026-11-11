@@ -4,15 +4,44 @@ import { zValidator } from '../../lib/validation';
 import { db } from '../../db';
 import { auditLogs } from '../../db/schema';
 import { requirePermission, requireScope } from '../../middleware/auth';
-import { recommendationsQuerySchema, recommendationActionSchema } from './schemas';
+import {
+  recommendationsQuerySchema,
+  recommendationActionSchema,
+  recommendationActionQuerySchema
+} from './schemas';
 import {
   getPagination,
   paginate,
   getPolicyOrgId,
   getRecommendationStatusMap,
+  resolveRecommendationStatus,
+  resolveOrgRecommendationBreakdown,
   buildBe9Recommendations
 } from './helpers';
 import { requireSecurityReadAccess } from './readAuthorization';
+import { markRequestAuditWritten } from '../../services/auditRequestTracking';
+import type { AuthContext } from '../../middleware/auth';
+
+// The org a complete/dismiss is recorded against: the caller-selected ?orgId
+// (validated for access), else the token's single org. A multi-org partner
+// user has auth.orgId === null, so without honouring ?orgId these actions
+// always 400'd (#8086).
+function resolveActionOrgId(
+  auth: AuthContext,
+  requestedOrgId: string | undefined
+): { orgId: string } | { error: string; status: 400 | 403 } {
+  if (requestedOrgId) {
+    if (!auth.canAccessOrg(requestedOrgId)) {
+      return { error: 'Access denied to this organization', status: 403 };
+    }
+    return { orgId: requestedOrgId };
+  }
+  const orgId = getPolicyOrgId(auth);
+  if (!orgId) {
+    return { error: 'orgId is required: choose an organization to act on this recommendation', status: 400 };
+  }
+  return { orgId };
+}
 
 export const recommendationsRoutes = new Hono();
 
@@ -33,7 +62,9 @@ recommendationsRoutes.get(
 
     let recommendations = recommendationsResult.recommendations.map((rec) => ({
       ...rec,
-      status: recommendationStatusMap.get(rec.id) ?? 'open'
+      status: resolveRecommendationStatus(rec.id, recommendationsResult.affectedByOrg?.get(rec.id), recommendationStatusMap),
+      // Per-org rows so the UI can act on ONE org's recommendation (#9714).
+      orgs: resolveOrgRecommendationBreakdown(rec.id, recommendationsResult.affectedByOrg?.get(rec.id), recommendationStatusMap)
     }));
 
     if (query.priority) {
@@ -50,7 +81,7 @@ recommendationsRoutes.get(
 
     const all = recommendationsResult.recommendations.map((rec) => ({
       ...rec,
-      status: recommendationStatusMap.get(rec.id) ?? 'open'
+      status: resolveRecommendationStatus(rec.id, recommendationsResult.affectedByOrg?.get(rec.id), recommendationStatusMap)
     }));
 
     return c.json({
@@ -71,13 +102,15 @@ recommendationsRoutes.post(
   requireScope('organization', 'partner', 'system'),
   requirePermission('devices', 'write'),
   zValidator('param', recommendationActionSchema),
+  zValidator('query', recommendationActionQuerySchema),
   async (c) => {
     const auth = c.get('auth');
     const { id } = c.req.valid('param');
-    const orgId = getPolicyOrgId(auth);
-    if (!orgId) {
-      return c.json({ error: 'Unable to determine organization context' }, 400);
+    const resolved = resolveActionOrgId(auth, c.req.valid('query').orgId);
+    if ('error' in resolved) {
+      return c.json({ error: resolved.error }, resolved.status);
     }
+    const { orgId } = resolved;
 
     const recommendationsResult = await buildBe9Recommendations(auth, orgId);
     if (recommendationsResult.error) {
@@ -99,6 +132,7 @@ recommendationsRoutes.post(
       details: { recommendationId: id },
       result: 'success'
     });
+    markRequestAuditWritten();
 
     return c.json({ data: { id, status: 'completed' } });
   }
@@ -109,13 +143,15 @@ recommendationsRoutes.post(
   requireScope('organization', 'partner', 'system'),
   requirePermission('devices', 'write'),
   zValidator('param', recommendationActionSchema),
+  zValidator('query', recommendationActionQuerySchema),
   async (c) => {
     const auth = c.get('auth');
     const { id } = c.req.valid('param');
-    const orgId = getPolicyOrgId(auth);
-    if (!orgId) {
-      return c.json({ error: 'Unable to determine organization context' }, 400);
+    const resolved = resolveActionOrgId(auth, c.req.valid('query').orgId);
+    if ('error' in resolved) {
+      return c.json({ error: resolved.error }, resolved.status);
     }
+    const { orgId } = resolved;
 
     const recommendationsResult = await buildBe9Recommendations(auth, orgId);
     if (recommendationsResult.error) {
@@ -137,7 +173,49 @@ recommendationsRoutes.post(
       details: { recommendationId: id },
       result: 'success'
     });
+    markRequestAuditWritten();
 
     return c.json({ data: { id, status: 'dismissed' } });
+  }
+);
+
+recommendationsRoutes.post(
+  '/recommendations/:id/reopen',
+  requireScope('organization', 'partner', 'system'),
+  requirePermission('devices', 'write'),
+  zValidator('param', recommendationActionSchema),
+  zValidator('query', recommendationActionQuerySchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const { id } = c.req.valid('param');
+    const resolved = resolveActionOrgId(auth, c.req.valid('query').orgId);
+    if ('error' in resolved) {
+      return c.json({ error: resolved.error }, resolved.status);
+    }
+    const { orgId } = resolved;
+
+    const recommendationsResult = await buildBe9Recommendations(auth, orgId);
+    if (recommendationsResult.error) {
+      return c.json({ error: recommendationsResult.error.message }, recommendationsResult.error.status);
+    }
+    const recommendation = recommendationsResult.recommendations.find((item) => item.id === id);
+    if (!recommendation) {
+      return c.json({ error: 'Recommendation not found' }, 404);
+    }
+
+    await db.insert(auditLogs).values({
+      orgId,
+      actorType: 'user',
+      actorId: auth.user.id,
+      actorEmail: auth.user.email,
+      action: 'security.recommendation.reopen',
+      resourceType: 'security_recommendation',
+      resourceName: id,
+      details: { recommendationId: id },
+      result: 'success'
+    });
+    markRequestAuditWritten();
+
+    return c.json({ data: { id, status: 'open' } });
   }
 );

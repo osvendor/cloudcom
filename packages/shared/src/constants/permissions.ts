@@ -12,6 +12,10 @@
 // NB: named PERMISSION_GRANTS (not PERMISSIONS) to avoid colliding with the
 // older nested PERMISSIONS constant in this package.
 export const PERMISSION_GRANTS = {
+  CREDENTIALS_READ: { resource: 'credentials', action: 'read' },
+  CREDENTIALS_REVEAL: { resource: 'credentials', action: 'reveal' },
+  CREDENTIALS_OTP: { resource: 'credentials', action: 'otp' },
+  CREDENTIALS_IMPORT: { resource: 'credentials', action: 'import' },
   // Backup / recovery
   BACKUP_READ: { resource: 'backup', action: 'read' },
   BACKUP_WRITE: { resource: 'backup', action: 'write' },
@@ -22,6 +26,10 @@ export const PERMISSION_GRANTS = {
   DEVICES_WRITE: { resource: 'devices', action: 'write' },
   DEVICES_DELETE: { resource: 'devices', action: 'delete' },
   DEVICES_EXECUTE: { resource: 'devices', action: 'execute' },
+  // Ask the watchdog to restart or start a wedged/stopped agent (#9234). Its own
+  // grant so an MSP can hand out agent recovery without arbitrary device
+  // commands, or withhold it from a role that otherwise holds devices:execute.
+  DEVICES_RECOVER_AGENT: { resource: 'devices', action: 'recover_agent' },
 
   // Signed, resource-bound rollback of customer-machine agent components.
   AGENT_ROLLBACK_CREATE: { resource: 'agent_rollback', action: 'create' },
@@ -36,6 +44,7 @@ export const PERMISSION_GRANTS = {
   // Network topology (discovery topology view + saved layout — #1728)
   TOPOLOGY_READ: { resource: 'topology', action: 'read' },
   TOPOLOGY_WRITE: { resource: 'topology', action: 'write' },
+  TOPOLOGY_EXECUTE: { resource: 'topology', action: 'execute' },
 
   // Scripts
   SCRIPTS_READ: { resource: 'scripts', action: 'read' },
@@ -60,6 +69,10 @@ export const PERMISSION_GRANTS = {
   TICKETS_READ: { resource: 'tickets', action: 'read' },
   TICKETS_WRITE: { resource: 'tickets', action: 'write' },
   TICKETS_MANAGE: { resource: 'tickets', action: 'manage' },
+  // #4617: record a customer's approval/denial of held work on their behalf.
+  TICKETS_RECORD_APPROVAL: { resource: 'tickets', action: 'record_approval' },
+  // #10951: triage the inbound-email Review queue (list, convert, assign, dismiss) without a *:* admin grant.
+  TICKETS_EMAIL_REVIEW: { resource: 'tickets', action: 'email_review' },
 
   // Microsoft 365 partner-global ticket mailbox administration
   TICKET_MAILBOX_READ: { resource: 'ticket_mailbox', action: 'read' },
@@ -96,6 +109,11 @@ export const PERMISSION_GRANTS = {
   // operations on a template, so there is nothing left for a third verb to gate.
   AGREEMENTS_READ: { resource: 'agreements', action: 'read' },
   AGREEMENTS_WRITE: { resource: 'agreements', action: 'write' },
+  // #9075 W2a (OD7 B): sending an agreement for signature, copying its link,
+  // voiding it, reminding, and recording a client's signature obtained
+  // elsewhere. A different blast radius from editing templates — the same
+  // split quotes make with quotes:send / quotes:accept.
+  AGREEMENTS_SEND: { resource: 'agreements', action: 'send' },
 
   // Quotes / Proposals (billing program — sub-project 4)
   QUOTES_READ: { resource: 'quotes', action: 'read' },
@@ -131,6 +149,12 @@ export const PERMISSION_GRANTS = {
   ORGS_WRITE: { resource: 'organizations', action: 'write' },
   ORGS_DELETE: { resource: 'organizations', action: 'delete' },
 
+  // Outbound webhooks: reading endpoint configuration and delivery history.
+  // Kept apart from organizations:read so a role that can see an organization
+  // does not thereby see where its events are sent. Managing webhooks stays on
+  // organizations:write, so there is no webhooks:write.
+  WEBHOOKS_READ: { resource: 'webhooks', action: 'read' },
+
   // Partner-wide OAuth/MCP connected applications. These are deliberately
   // separate from organization administration: one disconnect revokes every
   // grant for the shared client under the partner.
@@ -145,6 +169,13 @@ export const PERMISSION_GRANTS = {
   SITES_READ: { resource: 'sites', action: 'read' },
   SITES_WRITE: { resource: 'sites', action: 'write' },
   SITES_DELETE: { resource: 'sites', action: 'delete' },
+  SITES_SET_LOCATION: { resource: 'sites', action: 'set_location' },
+
+  // Endpoint messaging (#8293): push a message to the person at a device.
+  // Deliberately separate from devices:execute ("may talk to a user" is not
+  // "may run code").
+  ENDPOINT_MESSAGES_SEND: { resource: 'endpoint_messages', action: 'send' },
+  ENDPOINT_MESSAGES_READ: { resource: 'endpoint_messages', action: 'read' },
 
   // Automations
   AUTOMATIONS_READ: { resource: 'automations', action: 'read' },
@@ -191,6 +222,13 @@ export const PERMISSION_GRANTS = {
   // organizations:write.
   AI_SESSIONS_USE: { resource: 'ai_sessions', action: 'use' },
 
+  // AI for Office prompt templates (the admin template manager). Dedicated so
+  // that viewing or authoring the prompts offered to every add-in user does not
+  // ride on the generic organizations grants. Writes additionally require an
+  // MFA-assured session at the route.
+  CLIENT_AI_TEMPLATES_READ: { resource: 'client_ai_templates', action: 'read' },
+  CLIENT_AI_TEMPLATES_WRITE: { resource: 'client_ai_templates', action: 'write' },
+
   // AI agents (#3821) — authoring an agent policy is what will eventually
   // authorize autonomous action on customer machines, so it gets its own
   // capability rather than riding on organizations:write. Sharing that grant
@@ -199,6 +237,14 @@ export const PERMISSION_GRANTS = {
   // by the partner who granted it. Same reasoning as AI_SESSIONS_READ_ALL.
   AI_AGENTS_READ: { resource: 'ai_agents', action: 'read' },
   AI_AGENTS_WRITE: { resource: 'ai_agents', action: 'write' },
+  // AI model registry (#7598 W03, spec §5.3 / §15 #7): a partner grants this
+  // deliberately to the techs who may use premium/fast offerings whose
+  // `required_permission` names it. Seeded on NO role.
+  AI_MODELS_PREMIUM: { resource: 'ai_models', action: 'premium' },
+  // Wisp W02 (spec §4.6): the execute-class gate on the sandbox workspace
+  // tools (workspace_stage/run/collect/cancel), which run arbitrary code.
+  // Partner Admin holds it through `*:*`; seeded on NO other role.
+  AI_WORKSPACE_EXECUTE: { resource: 'ai_workspace', action: 'execute' },
 
   // Tool sources (BYO MCP/OpenAPI, spec 2026-09-07 §5): manage registrations…
   TOOL_SOURCES_READ: { resource: 'tool_sources', action: 'read' },
@@ -223,7 +269,7 @@ export const PERMISSION_GRANTS = {
   PAM_APPROVE: { resource: 'pam', action: 'approve' },
   PAM_MANAGE_POLICY: { resource: 'pam', action: 'manage_policy' },
 
-  // Accounting / QuickBooks integration (SEC-2026-09-05-057). The interactive
+  // Accounting / QuickBooks integration. The interactive
   // QuickBooks routes used to gate on partner authority alone, so any
   // full-partner member — however low their role — could read the shared
   // provider realm (customers, entity mappings, income accounts, remote

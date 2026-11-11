@@ -5,19 +5,6 @@ import { zodResolver } from '@hookform/resolvers/zod';
 import { Plus, Trash2, Sparkles, AlertTriangle, Braces } from 'lucide-react';
 import type { EditorProps } from '@monaco-editor/react';
 
-// Statically import Monaco's editor stylesheet so Astro bundles it into the
-// route's <head> as a hashed <link>. @monaco-editor/loader otherwise injects
-// this CSS into <head> at runtime, and Astro's View-Transition document swap
-// rebuilds <head> from the new page's server markup — dropping that runtime
-// injection and leaving the editor's hidden `.inputarea` <textarea> rendered as
-// a bare unstyled white box on SPA navigation (issue #1186). A build-time <link>
-// is part of every editor route's server markup, so it survives the swap. The
-// stylesheet is self-contained (all its url() assets — the codicon font and a
-// few images — are inline data: URIs), so Vite processes it without external
-// asset resolution. CSS-only — does not pull the Monaco JS wrapper into the
-// static bundle (see lib/monacoLoader.ts).
-import 'monaco-editor/min/vs/editor/editor.main.css';
-
 import { SCRIPT_BUILTIN_PARAMETER_KEYS, SCRIPT_PARAMETER_SOURCES, scriptSecretEnvName } from '@breeze/shared';
 import ScriptAiPanel from './ScriptAiPanel';
 import ScriptTestRunner from './ScriptTestRunner';
@@ -42,6 +29,8 @@ import {
   rowsToMapping, parameterBindingKey, parameterSource, stripSecretParameterValueFields,
   type ScriptFormDefaults, type ScriptFormValues, type ScriptSubmitValues,
 } from './ScriptFormSchema';
+import { useStableT } from '@/lib/i18n/useStableT';
+import { useRegisterDirtyForm } from '@/lib/keyboard/useRegisterDirtyForm';
 
 export type { ScriptFormValues, ScriptParameter, ScriptSubmitValues } from './ScriptFormSchema';
 
@@ -191,6 +180,7 @@ export default function ScriptForm({
   scriptId,
 }: ScriptFormProps) {
   const { t } = useTranslation('scripts');
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   // Resolved after mount, never during render. Reading `navigator` inline made
   // SSR emit "Ctrl+S" while the client's first render produced "⌘S" on macOS,
   // which React reports as a hydration mismatch on every Mac visit. Starting
@@ -247,7 +237,7 @@ export default function ScriptForm({
         .catch((err) => {
           if (!cancelled) {
             console.error('Failed to load script editor:', err);
-            setEditorLoadError(t('scriptForm.editor.loadError'));
+            setEditorLoadError(stableT('scriptForm.editor.loadError'));
           }
         });
     };
@@ -258,7 +248,7 @@ export default function ScriptForm({
       document.removeEventListener('astro:after-swap', loadEditor);
       disposeEditor();
     };
-  }, [disposeEditor, t]);
+  }, [disposeEditor, stableT]);
 
   // Force editor relayout after View Transition navigation completes
   useEffect(() => {
@@ -376,6 +366,7 @@ export default function ScriptForm({
   const isDirtyRef = useRef(false);
   const skipGuardRef = useRef(false);
   isDirtyRef.current = isDirty;
+  useRegisterDirtyForm(isDirty);
 
   useEffect(() => {
     const onBeforeUnload = (e: BeforeUnloadEvent) => {
@@ -383,7 +374,7 @@ export default function ScriptForm({
     };
     const onAstroNav = (e: Event) => {
       if (skipGuardRef.current) { skipGuardRef.current = false; return; }
-      if (isDirtyRef.current && !window.confirm(t('scriptForm.unsavedConfirm'))) {
+      if (isDirtyRef.current && !window.confirm(stableT('scriptForm.unsavedConfirm'))) {
         e.preventDefault();
       }
     };
@@ -393,7 +384,7 @@ export default function ScriptForm({
       window.removeEventListener('beforeunload', onBeforeUnload);
       document.removeEventListener('astro:before-preparation', onAstroNav);
     };
-  }, [t]);
+  }, [stableT]);
 
   const formRef = useRef<HTMLFormElement>(null);
 
@@ -573,6 +564,14 @@ export default function ScriptForm({
   return (
     <form
       ref={formRef}
+      // zodResolver(scriptSchema) is the actual validation (see
+      // errors.timeoutSeconds etc. below) — the input's min/max/pattern
+      // attributes are decorative only. Without noValidate, the browser's
+      // own constraint validation runs first and tries to focus the first
+      // invalid field; since #7179 that field can be inside a collapsed,
+      // now-`inert` CollapsibleSection and unfocusable, which is exactly
+      // the class of bug noValidate + the zod resolver avoids entirely.
+      noValidate
       onSubmit={handleSubmit(async values => {
         // Allow the post-save navigation through the guard. Set BEFORE
         // onSubmit so it's true before navigateTo dispatches the event.

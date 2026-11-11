@@ -5,6 +5,12 @@ import ScriptTestRunner from './ScriptTestRunner';
 const { fetchWithAuthMock } = vi.hoisted(() => ({ fetchWithAuthMock: vi.fn() }));
 
 vi.mock('@/lib/navigation', () => ({ navigateTo: vi.fn() }));
+// The live session list (GET /devices/:id/sessions/live) needs devices:execute
+// or remote:access; the default grants cover it.
+const perms = vi.hoisted(() => ({ granted: new Set<string>(['scripts:execute', 'devices:read', 'devices:execute']) }));
+vi.mock('@/lib/permissions', () => ({
+  usePermissions: () => ({ permissions: [], can: (r: string, a: string) => perms.granted.has(`${r}:${a}`) }),
+}));
 vi.mock('../../stores/auth', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../stores/auth')>();
   return { ...actual, fetchWithAuth: fetchWithAuthMock };
@@ -39,6 +45,14 @@ describe('ScriptTestRunner', () => {
   // in milliseconds of wall clock instead of minutes — the deadline path is
   // untestable with real timers.
   const flush = (ms = 0) => act(async () => { await vi.advanceTimersByTimeAsync(ms); });
+
+  it('gives the test device select a real accessible name (#7156)', async () => {
+    render(
+      <ScriptTestRunner osTypes={['windows']} isDirty={false} onSaveChanges={async () => true} />
+    );
+
+    expect(await screen.findByRole('combobox', { name: 'Test device' })).toBeInTheDocument();
+  });
 
   it('disables test runs and explains why when the script was never saved', async () => {
     render(
@@ -119,6 +133,83 @@ describe('ScriptTestRunner', () => {
       deviceIds: [DEVICE_ID],
       triggerType: 'manual',
     });
+  }, 10000);
+
+  // #6537 — the test runner is where an author checks a custom-field marker,
+  // and it used to show only stdout/stderr: a write rejected as
+  // not_script_writable (the default for every new field) was invisible.
+  it('surfaces the custom-field write-back outcome, including rejections', async () => {
+    fetchWithAuthMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url.startsWith('/devices')) return jsonResponse({ data: [onlineDevice] });
+      if (url === `/scripts/${SCRIPT_ID}/execute` && init?.method === 'POST') {
+        return jsonResponse({
+          requestId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+          status: 'queued',
+          targets: [{ requestedDeviceId: DEVICE_ID, admission: 'admitted', executionId: EXECUTION_ID }],
+        }, 201);
+      }
+      if (url === `/scripts/executions/${EXECUTION_ID}`) {
+        return jsonResponse({
+          id: EXECUTION_ID,
+          status: 'completed',
+          exitCode: 0,
+          stdout: null,
+          stderr: '',
+          customFieldResult: {
+            applied: [],
+            rejected: [
+              { key: 'ram_slot_type', reason: 'not_script_writable' },
+              { key: 'ram_slot_tpe', reason: 'unknown_field' },
+            ],
+          },
+        });
+      }
+      return jsonResponse({}, 404);
+    });
+
+    render(
+      <ScriptTestRunner scriptId={SCRIPT_ID} osTypes={['windows']} isDirty={false} onSaveChanges={async () => true} />
+    );
+
+    await waitFor(() => expect(screen.getByText('test-box')).toBeInTheDocument());
+    fireEvent.change(screen.getByTestId('test-device-select'), { target: { value: DEVICE_ID } });
+    fireEvent.click(screen.getByTestId('test-run-button'));
+
+    const rejected = await screen.findByTestId('exec-custom-fields-rejected', {}, { timeout: 5000 });
+    expect(rejected).toHaveTextContent('ram_slot_type');
+    expect(rejected).toHaveTextContent('Field is not script-writable');
+    expect(rejected).toHaveTextContent('ram_slot_tpe');
+    expect(rejected).toHaveTextContent('No custom field with this key');
+  }, 10000);
+
+  it('renders no custom-field section for a run that wrote nothing', async () => {
+    fetchWithAuthMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url.startsWith('/devices')) return jsonResponse({ data: [onlineDevice] });
+      if (url === `/scripts/${SCRIPT_ID}/execute` && init?.method === 'POST') {
+        return jsonResponse({
+          requestId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+          status: 'queued',
+          targets: [{ requestedDeviceId: DEVICE_ID, admission: 'admitted', executionId: EXECUTION_ID }],
+        }, 201);
+      }
+      if (url === `/scripts/executions/${EXECUTION_ID}`) {
+        return jsonResponse({
+          id: EXECUTION_ID, status: 'completed', exitCode: 0, stdout: 'plain', stderr: '', customFieldResult: null,
+        });
+      }
+      return jsonResponse({}, 404);
+    });
+
+    render(
+      <ScriptTestRunner scriptId={SCRIPT_ID} osTypes={['windows']} isDirty={false} onSaveChanges={async () => true} />
+    );
+
+    await waitFor(() => expect(screen.getByText('test-box')).toBeInTheDocument());
+    fireEvent.change(screen.getByTestId('test-device-select'), { target: { value: DEVICE_ID } });
+    fireEvent.click(screen.getByTestId('test-run-button'));
+
+    await screen.findByText('plain', {}, { timeout: 5000 });
+    expect(screen.queryByTestId('exec-custom-fields-applied')).toBeNull();
   }, 10000);
 
   it('shows a typed rejection inline and never polls an execution', async () => {
@@ -838,6 +929,34 @@ describe('ScriptTestRunner — run context (#4888)', () => {
     expect(postBodies()[0]).toMatchObject({ runAs: 'user', targetSessionId: 3 });
   });
 
+  it('does not ask the device for its live sessions without devices:execute or remote:access', async () => {
+    const liveCalls = () => fetchWithAuthMock.mock.calls.filter(([url]) => String(url).endsWith('/sessions/live'));
+    const renderUserRun = async () => {
+      const view = render(
+        <ScriptTestRunner
+          scriptId={SCRIPT_ID} osTypes={['windows']} isDirty={false}
+          onSaveChanges={async () => true} scriptRunAs="system"
+        />
+      );
+      await waitFor(() => expect(screen.getByText('test-box')).toBeInTheDocument());
+      fireEvent.change(screen.getByTestId('test-device-select'), { target: { value: DEVICE_ID } });
+      fireEvent.change(screen.getByTestId('test-run-context'), { target: { value: 'user' } });
+      await waitFor(() => expect(screen.getByTestId('test-run-session-target')).toBeInTheDocument());
+      return view;
+    };
+
+    mockRun(ON_DEMAND_DEVICE);
+    perms.granted = new Set(['scripts:execute', 'devices:read']);
+    const first = await renderUserRun();
+    expect(liveCalls()).toHaveLength(0);
+    first.unmount();
+
+    perms.granted = new Set(['scripts:execute', 'devices:read', 'remote:access']);
+    await renderUserRun();
+    await waitFor(() => expect(liveCalls()).toHaveLength(1));
+    perms.granted = new Set(['scripts:execute', 'devices:read', 'devices:execute']);
+  });
+
   it('never offers a session target for an always-on helper', async () => {
     mockRun({ ...onlineDevice, helperLifecycleMode: 'always-on' });
     render(
@@ -893,4 +1012,45 @@ describe('ScriptTestRunner — run context (#4888)', () => {
     expect(chip).toHaveTextContent(/not recorded/i);
     expect(chip).not.toHaveTextContent(/^Run context\s*System$/i);
   });
+});
+
+describe('ScriptTestRunner offline notice (sweep E5)', () => {
+  it('clears "will wait until it reconnects" once the run completes', async () => {
+    const offlineDevice = { ...onlineDevice, status: 'offline' };
+    let polls = 0;
+    fetchWithAuthMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url.startsWith('/devices')) return jsonResponse({ data: [offlineDevice] });
+      if (url === `/scripts/${SCRIPT_ID}/execute` && init?.method === 'POST') {
+        return jsonResponse({
+          requestId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+          status: 'queued',
+          targets: [{ requestedDeviceId: DEVICE_ID, admission: 'admitted', executionId: EXECUTION_ID }],
+        }, 201);
+      }
+      if (url === `/scripts/executions/${EXECUTION_ID}`) {
+        polls += 1;
+        return jsonResponse({ id: EXECUTION_ID, status: 'completed', exitCode: 0, stdout: 'done', stderr: '' });
+      }
+      return jsonResponse({}, 404);
+    });
+
+    render(
+      <ScriptTestRunner scriptId={SCRIPT_ID} osTypes={['windows']} isDirty={false} onSaveChanges={async () => true} />
+    );
+
+    await waitFor(() => expect(screen.getByText(/test-box/)).toBeInTheDocument());
+    fireEvent.change(screen.getByTestId('test-device-select'), { target: { value: DEVICE_ID } });
+    // Pre-run: the device really is offline, so the notice is accurate here.
+    expect(screen.getByText(/is offline/i)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId('test-run-button'));
+
+    await waitFor(() => expect(screen.getByText('done')).toBeInTheDocument(), { timeout: 5000 });
+    expect(polls).toBeGreaterThan(0);
+
+    // The device can (and here does) go straight back to offline once the
+    // run finishes — that must not resurrect a "waiting to reconnect"
+    // notice next to a result that already arrived.
+    expect(screen.queryByText(/is offline/i)).toBeNull();
+  }, 10000);
 });

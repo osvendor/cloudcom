@@ -3,6 +3,7 @@ package rebuild
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -26,20 +27,31 @@ func identity(ctx context.Context, r *run) error {
 			r.warn("no recovery marker given; the server will not auto-complete this recovery")
 			return nil
 		}
-		dir := filepath.Join(r.staging, "var", "lib", "breeze")
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return err
-		}
-		data, _ := json.MarshalIndent(map[string]string{
-			"recoveryId": r.opts.Marker.RecoveryID, "nonce": r.opts.Marker.Nonce,
-			"snapshotId": r.opts.SnapshotID, "completedAt": time.Now().UTC().Format(time.RFC3339),
-		}, "", "  ")
-		return os.WriteFile(filepath.Join(dir, "recovery-marker.json"), data, 0o600)
+		return writeRecoveryMarker(r, filepath.Join(r.staging, "var", "lib", "breeze"))
 	case IdentityNew:
 		return applyNewIdentity(r.staging)
 	default:
 		return fmt.Errorf("unknown identity mode %q", r.opts.Identity)
 	}
+}
+
+// writeRecoveryMarker writes r.opts.Marker (non-nil) as recovery-marker.json
+// in dir, the restored agent's data dir that its heartbeat reads
+// (heartbeat.LoadRecoveryMarker(config.GetDataDir())): /var/lib/breeze on
+// Linux, <root volume>\ProgramData\Breeze\data on Windows. Used by both
+// engines.
+func writeRecoveryMarker(r *run, dir string) error {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(map[string]string{
+		"recoveryId": r.opts.Marker.RecoveryID, "nonce": r.opts.Marker.Nonce,
+		"snapshotId": r.opts.SnapshotID, "completedAt": time.Now().UTC().Format(time.RFC3339),
+	}, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, "recovery-marker.json"), data, 0o600)
 }
 
 // applyNewIdentity makes the tree boot as a fresh machine: empty machine-id
@@ -54,8 +66,37 @@ func applyNewIdentity(root string) error {
 			_ = os.WriteFile(filepath.Join(root, "etc", "hostname"), []byte(name+"-restored\n"), 0o644)
 		}
 	}
-	_ = os.Remove(filepath.Join(root, "etc", "breeze", "secrets.yaml"))
+	if err := removeSecretsAndTemps(filepath.Join(root, "etc", "breeze")); err != nil {
+		return err
+	}
 	return stripEnrollment(filepath.Join(root, "etc", "breeze", "agent.yaml"))
+}
+
+// secretsAndTempFiles are every file an "identity: new" pass deletes from
+// the agent's config dir: secrets.yaml itself, plus the temp files a
+// crashed writer can leave behind for it (config.writeYAMLFile's ".tmp",
+// config.atomicWriteFile's ".partial") and for agent.yaml — whose own
+// content survives, since stripEnrollment edits it rather than deleting it.
+func secretsAndTempFiles(dir string) []string {
+	return []string{
+		filepath.Join(dir, "secrets.yaml"),
+		filepath.Join(dir, "secrets.yaml.tmp"),
+		filepath.Join(dir, "secrets.yaml.partial"),
+		filepath.Join(dir, "agent.yaml.tmp"),
+		filepath.Join(dir, "agent.yaml.partial"),
+	}
+}
+
+// removeSecretsAndTemps deletes secretsAndTempFiles(dir), warn-free but
+// error-propagating: a missing file is fine, anything else is not (18b
+// row 4; shared by both engines' "identity: new").
+func removeSecretsAndTemps(dir string) error {
+	for _, f := range secretsAndTempFiles(dir) {
+		if err := os.Remove(f); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("delete %s: %w", filepath.Base(f), err)
+		}
+	}
+	return nil
 }
 
 // stripEnrollment deletes enrollmentKeys from an agent.yaml document,

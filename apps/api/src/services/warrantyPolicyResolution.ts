@@ -12,6 +12,8 @@
  * routes/agents/helpers.ts would pull alertService and the event bus into every
  * heartbeat for one boolean.
  */
+import { hierarchyFor } from './deviceHierarchy';
+import { candidatesWithLink, policySetFor, type ApplicabilityRule, type DevicePolicySetOpts } from './devicePolicySet';
 import { db } from '../db';
 import {
   devices,
@@ -21,7 +23,7 @@ import {
   deviceGroupMemberships,
   organizations,
 } from '../db/schema';
-import { eq, and, inArray, or, type SQL } from 'drizzle-orm';
+import { eq, and, asc, inArray, or, type SQL } from 'drizzle-orm';
 import { policyOwnershipCondition } from './configPolicyOwnership';
 import { captureException } from './sentry';
 
@@ -33,6 +35,24 @@ const LEVEL_PRIORITY: Record<string, number> = {
   organization: 2,
   partner: 1,
 };
+
+/** #8142: warranty's own rules (raw partner, no role/OS filter). */
+const WARRANTY_APPLICABILITY: ApplicabilityRule = { ownership: 'orgOrPartner', partnerTarget: 'partner', roleOs: 'none' };
+
+/**
+ * Warranty's ranking — NOT the shared one: level DESC, then the HIGHER
+ * priority number wins. Input order (created_at, id) breaks a remaining tie.
+ */
+export function warrantyInlineFromRows(rows: ReadonlyArray<{ inlineSettings: unknown; level: string; priority: number }>): unknown | undefined {
+  if (rows.length === 0) return undefined;
+  const sorted = [...rows].sort((a, b) => {
+    const la = LEVEL_PRIORITY[a.level] ?? 0;
+    const lb = LEVEL_PRIORITY[b.level] ?? 0;
+    if (la !== lb) return lb - la;
+    return b.priority - a.priority;
+  });
+  return sorted[0]!.inlineSettings;
+}
 
 /**
  * The WHOLE inlineSettings blob of the warranty feature link in effect for a
@@ -50,22 +70,40 @@ const LEVEL_PRIORITY: Record<string, number> = {
  * Throws on a database error. The heartbeat caller depends on that: an error
  * must omit the config block entirely rather than resolve to "off".
  */
-export async function resolveEffectiveWarrantyInlineSettings(deviceId: string): Promise<unknown | undefined> {
-  const [device] = await db
-    .select({ orgId: devices.orgId, siteId: devices.siteId })
-    .from(devices)
-    .where(eq(devices.id, deviceId))
-    .limit(1);
+export async function resolveEffectiveWarrantyInlineSettings(deviceId: string, opts?: DevicePolicySetOpts): Promise<unknown | undefined> {
+  const passed = hierarchyFor(deviceId, opts);
+  const set = policySetFor(deviceId, opts);
+  if (set) {
+    if (!set.hierarchy.org) {
+      // Same invariant break, same report as the read path below.
+      console.error(
+        `[warranty] org ${set.hierarchy.orgId} for device ${deviceId} did not resolve; partner-wide warranty policies cannot apply to this evaluation`
+      );
+      captureException(new Error(`warranty: organizations row missing for device org ${set.hierarchy.orgId}`));
+    }
+    return warrantyInlineFromRows(candidatesWithLink(set, 'warranty', WARRANTY_APPLICABILITY).map(({ candidate, link }) => ({
+      inlineSettings: link.inlineSettings, level: candidate.level, priority: candidate.priority,
+    })));
+  }
+  const [device] = passed
+    ? [{ orgId: passed.orgId, siteId: passed.siteId }]
+    : await db
+      .select({ orgId: devices.orgId, siteId: devices.siteId })
+      .from(devices)
+      .where(eq(devices.id, deviceId))
+      .limit(1);
 
   if (!device) return undefined;
 
   // The device org's partner. Needed twice below: a `level='partner'` assignment
   // targets `partners.id`, and a partner-wide policy carries `org_id NULL`.
-  const [org] = await db
-    .select({ partnerId: organizations.partnerId })
-    .from(organizations)
-    .where(eq(organizations.id, device.orgId))
-    .limit(1);
+  const [org] = passed
+    ? (passed.org ? [{ partnerId: passed.org.partnerId }] : [])
+    : await db
+      .select({ partnerId: organizations.partnerId })
+      .from(organizations)
+      .where(eq(organizations.id, device.orgId))
+      .limit(1);
 
   // Not reachable by the schema: `devices.org_id` is NOT NULL with an FK to
   // `organizations.id`, and `organizations.partner_id` is itself NOT NULL. So an
@@ -84,11 +122,12 @@ export async function resolveEffectiveWarrantyInlineSettings(deviceId: string): 
     );
   }
 
-  const groupRows = await db
-    .select({ groupId: deviceGroupMemberships.groupId })
-    .from(deviceGroupMemberships)
-    .where(eq(deviceGroupMemberships.deviceId, deviceId));
-  const groupIds = groupRows.map((r) => r.groupId);
+  const groupIds = passed
+    ? [...passed.groupIds]
+    : (await db
+      .select({ groupId: deviceGroupMemberships.groupId })
+      .from(deviceGroupMemberships)
+      .where(eq(deviceGroupMemberships.deviceId, deviceId))).map((r) => r.groupId);
 
   // `config_policy_assignments.targetId` is POLYMORPHIC — its referent depends
   // on `level` ('device' → devices.id, 'device_group' → device_groups.id,
@@ -141,16 +180,8 @@ export async function resolveEffectiveWarrantyInlineSettings(deviceId: string): 
         policyOwnershipCondition({ orgId: device.orgId, partnerId: org?.partnerId ?? null }),
         or(...targetConditions)
       )
-    );
+    )
+    .orderBy(asc(configPolicyAssignments.createdAt), asc(configPolicyAssignments.id));
 
-  if (rows.length === 0) return undefined;
-
-  rows.sort((a, b) => {
-    const la = LEVEL_PRIORITY[a.level] ?? 0;
-    const lb = LEVEL_PRIORITY[b.level] ?? 0;
-    if (la !== lb) return lb - la; // higher level priority wins
-    return b.priority - a.priority; // higher priority number wins
-  });
-
-  return rows[0]!.inlineSettings;
+  return warrantyInlineFromRows(rows);
 }

@@ -8,8 +8,10 @@ import { executionRowStatusConfig as statusConfig, resolveExecutionStatusLabel }
 import type { ExecutionStatus, CancelState } from '@breeze/shared';
 import type { RunContextValue } from '@/components/common/RunContext';
 import { hasPermission } from '@/lib/permissions';
+import { FilterSelect } from '../shared/FilterSelect';
 import type { Permission } from '@/stores/auth';
 import { ConfirmDialog } from '@/components/shared/ConfirmDialog';
+import type { RestorePointBadgeOutcome } from '../restorePoints/RestorePointBadge';
 export type { ExecutionStatus } from '@breeze/shared';
 type ScriptsT = TFunction<'scripts'>;
 
@@ -54,6 +56,10 @@ export type ScriptExecution = {
   // marker. Only present once the execution-detail endpoint has been fetched
   // (the list endpoint omits it, same as stdout/stderr).
   customFieldResult?: ScriptCustomFieldWriteResult | null;
+  // #4759 W08 — the newest System Restore ledger row for this execution, from
+  // GET /scripts/executions/:id only (the list endpoint omits it). NULL/absent
+  // when Breeze never asked. status 'requested' means the device has not reported.
+  restorePoint?: RestorePointBadgeOutcome | null;
   // #4885 — the runtime values this execution was submitted with. Both
   // GET /scripts/:id/executions and GET /scripts/executions/:id already
   // return `script_executions.parameters` on the wire; this was simply never
@@ -70,6 +76,10 @@ export type ScriptExecution = {
   // "too late" / "stop failed" copy once the execution reaches a terminal
   // status. Absent/null means no cancel was ever requested.
   cancelState?: CancelState | null;
+  // #9563 — the device's own status (devices.status), from both execution read
+  // endpoints. Lets a `queued` run say "device offline" only when the device
+  // really is offline, rather than whenever no agent session took the command.
+  deviceStatus?: string | null;
 };
 
 type ExecutionHistoryProps = {
@@ -292,13 +302,14 @@ export default function ExecutionHistory({
               className="h-10 w-full rounded-md border bg-background pl-9 pr-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring sm:w-48"
             />
           </div>
-          <select
+          <FilterSelect
+            label={t('executionHistory.filters.statusLabel')}
             value={statusFilter}
             onChange={event => {
               setStatusFilter(event.target.value);
               setCurrentPage(1);
             }}
-            className="h-10 w-full rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring sm:w-36"
+            className="w-full sm:w-36"
           >
             <option value="all">{t('executionHistory.filters.allStatus')}</option>
             <option value="pending">{t('executionHistory.status.pending')}</option>
@@ -309,21 +320,22 @@ export default function ExecutionHistory({
             <option value="failed">{t('executionHistory.status.failed')}</option>
             <option value="timeout">{t('executionHistory.status.timeout')}</option>
             <option value="cancelled">{t('executionHistory.status.cancelled')}</option>
-          </select>
-          <select
+          </FilterSelect>
+          <FilterSelect
+            label={t('executionHistory.filters.dateLabel')}
             value={dateFilter}
             onChange={event => {
               setDateFilter(event.target.value);
               setCurrentPage(1);
             }}
-            className="h-10 w-full rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring sm:w-36"
+            className="w-full sm:w-36"
           >
             <option value="all">{t('executionHistory.filters.allTime')}</option>
             <option value="hour">{t('executionHistory.filters.lastHour')}</option>
             <option value="day">{t('executionHistory.filters.lastDay')}</option>
             <option value="week">{t('executionHistory.filters.lastWeek')}</option>
             <option value="month">{t('executionHistory.filters.lastMonth')}</option>
-          </select>
+          </FilterSelect>
         </div>
         <span className="text-xs text-muted-foreground tabular-nums whitespace-nowrap">
           {t('executionHistory.summary', { shown: filteredExecutions.length, total: executions.length })}
@@ -388,13 +400,8 @@ export default function ExecutionHistory({
                 return (
                   <tr
                     key={execution.id}
-                    tabIndex={0}
-                    role="button"
-                    className="transition hover:bg-muted/40 cursor-pointer focus-visible:bg-muted/40 focus-visible:outline-hidden"
+                    className="transition hover:bg-muted/40 cursor-pointer"
                     onClick={() => onViewDetails?.(execution)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onViewDetails?.(execution); }
-                    }}
                   >
                     {showScriptName && (
                       <td className="px-4 py-3 text-sm font-medium">{execution.scriptName}</td>
@@ -411,7 +418,7 @@ export default function ExecutionHistory({
                           'h-3 w-3',
                           (execution.status === 'running' || execution.status === 'cancelling') && 'animate-spin'
                         )} />
-                        {t(/* i18n-dynamic */ `executionHistory.${resolveExecutionStatusLabel(execution.status, execution.cancelState)}`)}
+                        {t(/* i18n-dynamic */ `executionHistory.${resolveExecutionStatusLabel(execution.status, execution.cancelState, execution.deviceStatus)}`)}
                       </span>
                     </td>
                     <td className="px-4 py-3 text-sm text-muted-foreground">

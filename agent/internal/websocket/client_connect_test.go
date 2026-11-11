@@ -1,8 +1,10 @@
 package websocket
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -342,8 +344,8 @@ func TestConnect_DoesNotPublishConnectionAfterStopDuringHandshake(t *testing.T) 
 
 	select {
 	case err := <-connectResult:
-		if err == nil || !strings.Contains(err.Error(), "client is stopped") {
-			t.Fatalf("connect error = %v, want client stopped", err)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("connect error = %v, want context.Canceled", err)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("connect did not return after the delayed upgrade")

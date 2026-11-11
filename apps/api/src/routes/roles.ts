@@ -1,10 +1,10 @@
 import { Hono } from 'hono';
 import { zValidator } from '../lib/validation';
 import { z } from 'zod';
-import { and, eq, or, count, inArray, sql } from 'drizzle-orm';
+import { and, eq, or, count, inArray } from 'drizzle-orm';
 import { HTTPException } from 'hono/http-exception';
 import { db } from '../db';
-import { roles, permissions, rolePermissions, partnerUsers, organizationUsers, users, organizations } from '../db/schema';
+import { roles, permissions, rolePermissions, partnerUsers, organizationUsers } from '../db/schema';
 import { authMiddleware, requireMfa, requirePermission } from '../middleware/auth';
 import {
   clearPermissionCache,
@@ -17,6 +17,16 @@ import {
 import { createAuditLogAsync } from '../services/auditService';
 import { getTrustedClientIpOrUndefined } from '../services/clientIp';
 import { canManagePartnerWidePolicies } from '../services/partnerWideAccess';
+import { isPgForeignKeyViolation } from '../utils/pgErrors';
+import {
+  getEffectivePermissions,
+  getRoleDetail,
+  getRoleEffectivePermissions,
+  listRoleUsers,
+  listRolesForScope,
+  resolvePartnerFocusedOrgId,
+  resolveRoleActingScope,
+} from '../services/roleDirectory';
 
 export const roleRoutes = new Hono();
 
@@ -71,14 +81,24 @@ const createRoleSchema = z.object({
   // org-scoped, non-system roles — stays permanently empty. The orgId is
   // validated against the caller's own org allowlist (see the handler) before it
   // re-scopes the creation.
-  orgId: z.string().guid().optional()
+  orgId: z.string().guid().optional(),
+  // #8370: the owner axis, stated explicitly by the caller (Partner-Wide First,
+  // docs/agents/tenancy-rls.md). Create-only — updateRoleSchema has no such
+  // field, so a role never moves between axes. When omitted, the legacy rule
+  // applies (orgId present → organization, else the token's own scope), which
+  // is what let the web dialog silently mint org roles from the header org.
+  ownerScope: z.enum(['partner', 'organization']).optional(),
+  // #5317: `roles.force_mfa` — members of this role must have MFA enrolled
+  // (enforced in services/mfaPolicy.ts). Not inherited through parentRoleId.
+  forceMfa: z.boolean().optional()
 });
 
 const updateRoleSchema = z.object({
   name: z.string().min(1).max(100).optional(),
   description: z.string().optional(),
   permissions: z.array(permissionSchema).optional(),
-  parentRoleId: z.string().guid().nullable().optional()
+  parentRoleId: z.string().guid().nullable().optional(),
+  forceMfa: z.boolean().optional()
 });
 
 type ScopeContext =
@@ -104,34 +124,6 @@ type RoleAuth = {
   canAccessOrg: (orgId: string) => boolean;
 };
 
-// #3524: a partner admin may act on a single org INSIDE THEIR TREE by naming it
-// — create passes it as `body.orgId`, every other endpoint via the `?orgId=`
-// the web client injects for the focused org. This returns that org id only when
-// it is a legitimate target, so partner admins can fully create/list/manage that
-// org's roles and thereby populate (and maintain) the SSO org-provider
-// default-role picker. Two gates: `canAccessOrg` (for a partner this resolves to
-// exactly their own orgs) and exclusion of the hidden `quick_support` org, which
-// is internal-only and must never hold user-facing roles or SSO providers. The
-// roles RLS policies (`breeze_has_org_access`) backstop every query at the DB.
-// Returns null (→ caller keeps its token scope) for a non-partner caller, a
-// missing/foreign org, or the quick_support org.
-async function resolvePartnerFocusedOrgId(
-  auth: RoleAuth,
-  targetOrgId: string | undefined | null
-): Promise<string | null> {
-  if (auth.scope !== 'partner' || !targetOrgId || !auth.canAccessOrg(targetOrgId)) {
-    return null;
-  }
-  const [org] = await db
-    .select({ type: organizations.type })
-    .from(organizations)
-    .where(eq(organizations.id, targetOrgId))
-    .limit(1);
-  if (!org || org.type === 'quick_support') {
-    return null;
-  }
-  return targetOrgId;
-}
 
 // Resolve the scope a request should ACT under: a partner's validated focused
 // org (→ organization scope) if present, else the caller's own token scope.
@@ -142,62 +134,6 @@ async function resolveActingScope(auth: RoleAuth, targetOrgId: string | undefine
   return focusedOrgId ? { scope: 'organization', orgId: focusedOrgId } : getScopeContext(auth);
 }
 
-// Resolve the scope for a request that targets ONE KNOWN ROLE, from that role's
-// own axis rather than from `?orgId=`.
-//
-// Why not just `resolveActingScope(auth, c.req.query('orgId'))`: `fetchWithAuth`
-// injects the focused org into EVERY request (apps/web/src/stores/auth.ts) and
-// `orgStore` auto-selects one on load, so a partner admin effectively always
-// sends an orgId. Deriving the scope from that param alone flipped the acting
-// scope to `organization` for every request, and the `role.scope !==
-// scopeContext.scope` guard below then 404'd every partner-scoped role — while
-// `GET /roles` happily kept listing them. The role itself is the only reliable
-// statement of which axis a request is operating on.
-//
-// Returns null when the caller may not act on this role at all; every caller
-// turns that into the same 404 the ownership checks already produce.
-async function resolveRoleActingScope(
-  auth: RoleAuth,
-  role: { scope: string; isSystem: boolean; partnerId: string | null; orgId: string | null },
-  focusedOrgId: string | undefined | null
-): Promise<ScopeContext | null> {
-  const tokenScope = getScopeContext(auth);
-
-  if (role.scope === 'partner') {
-    // Only a partner token can act on the partner axis, and only on its own
-    // partner's roles. A focused org must not drag us off this axis.
-    if (tokenScope.scope !== 'partner') return null;
-    if (!role.isSystem && role.partnerId !== tokenScope.partnerId) return null;
-    return tokenScope;
-  }
-
-  if (role.scope === 'organization') {
-    if (tokenScope.scope === 'organization') {
-      // An org caller cannot change organization context, so its TOKEN org is
-      // authoritative and a stale or hand-supplied `?orgId=` must never be able
-      // to deny it. A system org role (org_id null) resolves in the token org;
-      // a concrete one must belong to it.
-      if (role.isSystem) return tokenScope;
-      return role.orgId === tokenScope.orgId ? tokenScope : null;
-    }
-
-    // Partner token: the request must still NAME the org it is acting on, and
-    // for a concrete org role that name has to match the role's own org.
-    //
-    // Deriving the org from `role.org_id` alone would let a focused org be
-    // silently overridden by a role id: a partner focused on org A could send
-    // org B's role id and PATCH/DELETE/clone against B, which is the wrong
-    // customer even though the partner has umbrella access to both. Requiring
-    // the match keeps the request bound to the org it names, which is what the
-    // rest of this file's comments promise.
-    const resolved = await resolvePartnerFocusedOrgId(auth, focusedOrgId);
-    if (!resolved) return null;
-    if (!role.isSystem && role.orgId !== resolved) return null;
-    return { scope: 'organization', orgId: resolved };
-  }
-
-  return null;
-}
 
 function resolveAuditOrgId(auth: { orgId: string | null }, scopeContext: ScopeContext): string | null {
   if (scopeContext.scope === 'organization') {
@@ -416,204 +352,16 @@ async function validateParentRole(
   return { valid: true };
 }
 
-// Helper to get effective permissions (own + inherited from parent chain)
-async function getEffectivePermissions(
-  roleId: string,
-  visited: Set<string> = new Set()
-): Promise<{ resource: string; action: string; inherited: boolean; sourceRoleId: string; sourceRoleName: string }[]> {
-  if (visited.has(roleId)) {
-    return [];
-  }
-  visited.add(roleId);
 
-  // Get the role info
-  const [role] = await db
-    .select({
-      id: roles.id,
-      name: roles.name,
-      parentRoleId: roles.parentRoleId
-    })
-    .from(roles)
-    .where(eq(roles.id, roleId))
-    .limit(1);
-
-  if (!role) {
-    return [];
-  }
-
-  // Get direct permissions for this role
-  const directPerms = await db
-    .select({
-      resource: permissions.resource,
-      action: permissions.action
-    })
-    .from(rolePermissions)
-    .innerJoin(permissions, eq(rolePermissions.permissionId, permissions.id))
-    .where(eq(rolePermissions.roleId, roleId));
-
-  const result: { resource: string; action: string; inherited: boolean; sourceRoleId: string; sourceRoleName: string }[] = directPerms.map((p) => ({
-    resource: p.resource,
-    action: p.action,
-    inherited: false,
-    sourceRoleId: role.id,
-    sourceRoleName: role.name
-  }));
-
-  // Get inherited permissions from parent
-  if (role.parentRoleId) {
-    const inheritedPerms = await getEffectivePermissions(role.parentRoleId, visited);
-
-    // Add inherited permissions that aren't already directly assigned
-    const directPermSet = new Set(directPerms.map((p) => `${p.resource}:${p.action}`));
-
-    for (const inherited of inheritedPerms) {
-      const key = `${inherited.resource}:${inherited.action}`;
-      if (!directPermSet.has(key)) {
-        result.push({
-          ...inherited,
-          inherited: true
-        });
-      }
-    }
-  }
-
-  return result;
-}
-
-// GET /roles - List all roles (system + custom for scope)
+// GET /roles - List all roles (system + custom for scope). W18 (#6789): the
+// query lives in services/roleDirectory.ts, shared with the list_roles AI tool.
 roleRoutes.get(
   '/',
   requirePermission(PERMISSIONS.USERS_READ.resource, PERMISSIONS.USERS_READ.action),
   async (c) => {
     const auth = c.get('auth');
     const scopeContext = getScopeContext(auth);
-
-    // #3524: when a PARTNER admin is focused on one org (the web client injects
-    // ?orgId=), also surface that org's org-scoped roles. Without this the role a
-    // partner just created for the org is invisible here, so the SSO org-provider
-    // default-role picker — which populates from GET /roles — stays empty and the
-    // feature is inert. `resolvePartnerFocusedOrgId` validates the org against the
-    // caller's tree and excludes the hidden quick_support org; the roles SELECT
-    // RLS policy (breeze_has_org_access) backstops the query at the DB.
-    const focusedOrgId = await resolvePartnerFocusedOrgId(auth, c.req.query('orgId'));
-
-    const roleColumns = {
-      id: roles.id,
-      name: roles.name,
-      description: roles.description,
-      scope: roles.scope,
-      isSystem: roles.isSystem,
-      parentRoleId: roles.parentRoleId,
-      createdAt: roles.createdAt,
-      updatedAt: roles.updatedAt
-    };
-
-    let rolesData;
-
-    if (scopeContext.scope === 'partner') {
-      const partnerRoles = await db
-        .select(roleColumns)
-        .from(roles)
-        .where(
-          and(
-            eq(roles.scope, 'partner'),
-            or(eq(roles.isSystem, true), eq(roles.partnerId, scopeContext.partnerId))
-          )
-        );
-
-      if (focusedOrgId) {
-        const orgRoles = await db
-          .select(roleColumns)
-          .from(roles)
-          .where(
-            and(
-              eq(roles.scope, 'organization'),
-              or(eq(roles.isSystem, true), eq(roles.orgId, focusedOrgId))
-            )
-          );
-        rolesData = [...partnerRoles, ...orgRoles];
-      } else {
-        rolesData = partnerRoles;
-      }
-    } else {
-      rolesData = await db
-        .select(roleColumns)
-        .from(roles)
-        .where(
-          and(
-            eq(roles.scope, 'organization'),
-            or(eq(roles.isSystem, true), eq(roles.orgId, scopeContext.orgId))
-          )
-        );
-    }
-
-    // Get user counts for each role. Partner-scoped roles count partner_users;
-    // org-scoped roles (the focused-org set, #3524) count organization_users for
-    // that org — merged so every role reports the right membership.
-    const partnerRoleIds = rolesData.filter((r) => r.scope === 'partner').map((r) => r.id);
-    const orgRoleIds = rolesData.filter((r) => r.scope === 'organization').map((r) => r.id);
-
-    // `count` is every membership row; `activeCount` only those whose user
-    // is status='active' — the set the AI-agent recipient resolver
-    // (services/aiAgents/recipients.ts) can actually notify, so the agent
-    // forms can flag a role that would fail act mode's recipient check.
-    const userCounts: { roleId: string; count: number; activeCount: number }[] = [];
-
-    if (scopeContext.scope === 'partner') {
-      if (partnerRoleIds.length > 0) {
-        const counts = await db
-          .select({ roleId: partnerUsers.roleId, count: count(), activeCount: sql<number>`count(*) filter (where exists (select 1 from users u where u.id = ${partnerUsers.userId} and u.status = 'active'))` })
-          .from(partnerUsers)
-          .where(
-            and(
-              eq(partnerUsers.partnerId, scopeContext.partnerId),
-              inArray(partnerUsers.roleId, partnerRoleIds)
-            )
-          )
-          .groupBy(partnerUsers.roleId);
-        userCounts.push(...counts.map((row) => ({ roleId: row.roleId, count: Number(row.count), activeCount: Number(row.activeCount ?? 0) })));
-      }
-      if (focusedOrgId && orgRoleIds.length > 0) {
-        const counts = await db
-          .select({ roleId: organizationUsers.roleId, count: count(), activeCount: sql<number>`count(*) filter (where exists (select 1 from users u where u.id = ${organizationUsers.userId} and u.status = 'active'))` })
-          .from(organizationUsers)
-          .where(
-            and(
-              eq(organizationUsers.orgId, focusedOrgId),
-              inArray(organizationUsers.roleId, orgRoleIds)
-            )
-          )
-          .groupBy(organizationUsers.roleId);
-        userCounts.push(...counts.map((row) => ({ roleId: row.roleId, count: Number(row.count), activeCount: Number(row.activeCount ?? 0) })));
-      }
-    } else if (orgRoleIds.length > 0) {
-      const counts = await db
-        .select({ roleId: organizationUsers.roleId, count: count(), activeCount: sql<number>`count(*) filter (where exists (select 1 from users u where u.id = ${organizationUsers.userId} and u.status = 'active'))` })
-        .from(organizationUsers)
-        .where(
-          and(
-            eq(organizationUsers.orgId, scopeContext.orgId),
-            inArray(organizationUsers.roleId, orgRoleIds)
-          )
-        )
-        .groupBy(organizationUsers.roleId);
-      userCounts.push(...counts.map((row) => ({ roleId: row.roleId, count: Number(row.count), activeCount: Number(row.activeCount ?? 0) })));
-    }
-
-    const userCountMap = new Map(userCounts.map((uc) => [uc.roleId, uc.count]));
-    const activeUserCountMap = new Map(userCounts.map((uc) => [uc.roleId, uc.activeCount]));
-
-    // Build a map of role IDs to names for parent role lookup
-    const roleNameMap = new Map(rolesData.map((r) => [r.id, r.name]));
-
-    const data = rolesData.map((role) => ({
-      ...role,
-      parentRoleName: role.parentRoleId ? roleNameMap.get(role.parentRoleId) || null : null,
-      userCount: userCountMap.get(role.id) || 0,
-      activeUserCount: activeUserCountMap.get(role.id) || 0
-    }));
-
-    return c.json({ data });
+    return c.json({ data: await listRolesForScope(auth, scopeContext, c.req.query('orgId')) });
   }
 );
 
@@ -627,6 +375,24 @@ roleRoutes.post(
     const auth = c.get('auth');
     let scopeContext = getScopeContext(auth);
     const body = c.req.valid('json');
+
+    // #8370: an explicit owner axis is validated against the caller before any
+    // org re-scoping. These checks only narrow what the legacy path already
+    // allowed; the partner-wide gate (canManagePartnerWidePolicies, enforced by
+    // the router middleware for every partner token) is unchanged.
+    if (body.ownerScope === 'partner') {
+      if (auth.scope !== 'partner') {
+        return c.json({ error: 'Only partner-scope users can create partner roles' }, 403);
+      }
+      if (body.orgId !== undefined) {
+        return c.json({ error: 'orgId must not be sent with ownerScope "partner"' }, 400);
+      }
+    } else if (body.ownerScope === 'organization' && auth.scope === 'partner' && body.orgId === undefined) {
+      return c.json(
+        { error: 'orgId is required: send the owning organization as orgId when ownerScope is "organization"' },
+        400
+      );
+    }
 
     // #3524: a partner admin may target a specific org so the SSO default-role
     // picker (which offers only org-scoped, non-system roles) can be populated.
@@ -675,6 +441,7 @@ roleRoutes.post(
       description: string | null;
       scope: 'partner' | 'organization';
       isSystem: boolean;
+      forceMfa: boolean;
       parentRoleId?: string | null;
       partnerId?: string;
       orgId?: string;
@@ -683,6 +450,7 @@ roleRoutes.post(
       description: body.description || null,
       scope: scopeContext.scope,
       isSystem: false,
+      forceMfa: body.forceMfa ?? false,
       parentRoleId: body.parentRoleId || null
     };
 
@@ -740,7 +508,8 @@ roleRoutes.post(
       details: {
         scope: scopeContext.scope,
         permissionCount: body.permissions.length,
-        parentRoleId: result.parentRoleId ?? null
+        parentRoleId: result.parentRoleId ?? null,
+        forceMfa: result.forceMfa
       }
     });
 
@@ -751,6 +520,7 @@ roleRoutes.post(
         description: result.description,
         scope: result.scope,
         isSystem: result.isSystem,
+        forceMfa: result.forceMfa,
         parentRoleId: result.parentRoleId,
         parentRoleName,
         createdAt: result.createdAt,
@@ -761,104 +531,16 @@ roleRoutes.post(
   }
 );
 
-// GET /roles/:id - Get role with permissions
+// GET /roles/:id - Get role with permissions (services/roleDirectory.ts, W18 #6789)
 roleRoutes.get(
   '/:id',
   requirePermission(PERMISSIONS.USERS_READ.resource, PERMISSIONS.USERS_READ.action),
   async (c) => {
-    const auth = c.get('auth');
-    const focusedOrgId = c.req.query('orgId');
-    const roleId = c.req.param('id')!;
-
-    // Get role
-    const [role] = await db
-      .select({
-        id: roles.id,
-        name: roles.name,
-        description: roles.description,
-        scope: roles.scope,
-        isSystem: roles.isSystem,
-        parentRoleId: roles.parentRoleId,
-        partnerId: roles.partnerId,
-        orgId: roles.orgId,
-        createdAt: roles.createdAt,
-        updatedAt: roles.updatedAt
-      })
-      .from(roles)
-      .where(eq(roles.id, roleId))
-      .limit(1);
-
+    const role = await getRoleDetail(c.get('auth'), c.req.param('id')!, c.req.query('orgId'));
     if (!role) {
       return c.json({ error: 'Role not found' }, 404);
     }
-
-    // Verify access to this role. The acting scope is derived from the role's
-    // own axis, NOT from `?orgId=` — see resolveRoleActingScope.
-    const scopeContext = await resolveRoleActingScope(auth, role, focusedOrgId);
-    if (!scopeContext) {
-      return c.json({ error: 'Role not found' }, 404);
-    }
-
-    // Get permissions for the role
-    const rolePerms = await db
-      .select({
-        resource: permissions.resource,
-        action: permissions.action
-      })
-      .from(rolePermissions)
-      .innerJoin(permissions, eq(rolePermissions.permissionId, permissions.id))
-      .where(eq(rolePermissions.roleId, roleId));
-
-    // Get user count
-    let userCount = 0;
-    if (scopeContext.scope === 'partner') {
-      const [result] = await db
-        .select({ count: count() })
-        .from(partnerUsers)
-        .where(
-          and(
-            eq(partnerUsers.partnerId, scopeContext.partnerId),
-            eq(partnerUsers.roleId, roleId)
-          )
-        );
-      userCount = Number(result?.count || 0);
-    } else {
-      const [result] = await db
-        .select({ count: count() })
-        .from(organizationUsers)
-        .where(
-          and(
-            eq(organizationUsers.orgId, scopeContext.orgId),
-            eq(organizationUsers.roleId, roleId)
-          )
-        );
-      userCount = Number(result?.count || 0);
-    }
-
-    // Get parent role name if exists
-    let parentRoleName: string | null = null;
-    if (role.parentRoleId) {
-      const [parent] = await db
-        .select({ name: roles.name })
-        .from(roles)
-        .where(eq(roles.id, role.parentRoleId))
-        .limit(1);
-      parentRoleName = parent?.name || null;
-    }
-
-    return c.json({
-      id: role.id,
-      name: role.name,
-      description: role.description,
-      scope: role.scope,
-      isSystem: role.isSystem,
-      parentRoleId: role.parentRoleId,
-      parentRoleName,
-      permissions: rolePerms,
-      userCount,
-      createdAt: role.createdAt,
-      updatedAt: role.updatedAt
-    });
+    return c.json(role);
   }
 );
 
@@ -933,6 +615,9 @@ roleRoutes.patch(
       }
     }
 
+    // force_mfa is deliberately NOT a reason to walk descendants: it is not
+    // inherited through parentRoleId (services/mfaPolicy.ts reads the member's
+    // own role row), so only this role's direct members are affected.
     const affectedRoleIds = new Set<string>([roleId]);
     if (body.permissions !== undefined || body.parentRoleId !== undefined) {
       for (const descendantRoleId of await getDescendantRoleIds(roleId)) {
@@ -943,7 +628,13 @@ roleRoutes.patch(
 
     const result = await db.transaction(async (tx) => {
       // Update role fields
-      const updates: { name?: string; description?: string | null; parentRoleId?: string | null; updatedAt: Date } = {
+      const updates: {
+        name?: string;
+        description?: string | null;
+        parentRoleId?: string | null;
+        forceMfa?: boolean;
+        updatedAt: Date;
+      } = {
         updatedAt: new Date()
       };
 
@@ -957,6 +648,10 @@ roleRoutes.patch(
 
       if (body.parentRoleId !== undefined) {
         updates.parentRoleId = body.parentRoleId;
+      }
+
+      if (body.forceMfa !== undefined) {
+        updates.forceMfa = body.forceMfa;
       }
 
       const [updatedRole] = await tx
@@ -1025,7 +720,8 @@ roleRoutes.patch(
         scope: scopeContext.scope,
         changedFields: Object.keys(body),
         permissionCount: rolePerms.length,
-        parentRoleId: result.parentRoleId ?? null
+        parentRoleId: result.parentRoleId ?? null,
+        forceMfa: result.forceMfa
       }
     });
 
@@ -1035,6 +731,7 @@ roleRoutes.patch(
       description: result.description,
       scope: result.scope,
       isSystem: result.isSystem,
+      forceMfa: result.forceMfa,
       parentRoleId: result.parentRoleId,
       parentRoleName,
       permissions: rolePerms,
@@ -1126,11 +823,23 @@ roleRoutes.delete(
       );
     }
 
-    // Delete role permissions and role
-    await db.transaction(async (tx) => {
-      await tx.delete(rolePermissions).where(eq(rolePermissions.roleId, roleId));
-      await tx.delete(roles).where(eq(roles.id, roleId));
-    });
+    // Delete role permissions and role. access_review_items.role_id has no
+    // ON DELETE action on purpose: a completed review's items (decisions,
+    // notes, reviewer) are evidence and must not vanish because the reviewed
+    // role was deleted afterwards. The FK is the check (an RLS-scoped count
+    // here could miss items on reviews the caller cannot see), so map its
+    // violation to a clean 409.
+    try {
+      await db.transaction(async (tx) => {
+        await tx.delete(rolePermissions).where(eq(rolePermissions.roleId, roleId));
+        await tx.delete(roles).where(eq(roles.id, roleId));
+      });
+    } catch (err) {
+      if (isPgForeignKeyViolation(err, 'access_review_items_role_id_roles_id_fk')) {
+        return c.json({ error: 'Role is referenced by access reviews' }, 409);
+      }
+      throw err;
+    }
 
     writeRoleAudit(c, auth, scopeContext, {
       action: 'role.delete',
@@ -1149,12 +858,12 @@ roleRoutes.post(
   '/:id/clone',
   requirePermission(PERMISSIONS.USERS_WRITE.resource, PERMISSIONS.USERS_WRITE.action),
   requireMfa(),
-  zValidator('json', z.object({ name: z.string().min(1).max(100) })),
+  zValidator('json', z.object({ name: z.string().min(1).max(100), description: z.string().optional() })),
   async (c) => {
     const auth = c.get('auth');
     const focusedOrgId = c.req.query('orgId');
     const roleId = c.req.param('id')!;
-    const { name } = c.req.valid('json');
+    const { name, description } = c.req.valid('json');
     const callerPermissions = await getCallerPermissions(c, auth);
 
     // Get source role
@@ -1165,6 +874,7 @@ roleRoutes.post(
         description: roles.description,
         scope: roles.scope,
         isSystem: roles.isSystem,
+        forceMfa: roles.forceMfa,
         partnerId: roles.partnerId,
         orgId: roles.orgId
       })
@@ -1205,13 +915,20 @@ roleRoutes.post(
       description: string | null;
       scope: 'partner' | 'organization';
       isSystem: boolean;
+      forceMfa: boolean;
       partnerId?: string;
       orgId?: string;
     } = {
       name,
-      description: sourceRole.description ? `Cloned from ${sourceRole.name}: ${sourceRole.description}` : `Cloned from ${sourceRole.name}`,
+      // #9603: never the source's text or server-written English; the clone dialog
+      // sends its own localized, editable description (null when none is given).
+      description: description ?? null,
       scope: scopeContext.scope,
-      isSystem: false
+      isSystem: false,
+      // #5317: a clone keeps the source's MFA requirement — cloning the
+      // force-MFA Partner Admin role must not silently drop it. The clone is a
+      // custom role, so the caller can turn it off afterwards via PATCH.
+      forceMfa: sourceRole.forceMfa
     };
 
     if (scopeContext.scope === 'partner') {
@@ -1261,7 +978,8 @@ roleRoutes.post(
         sourceRoleId: sourceRole.id,
         sourceRoleName: sourceRole.name,
         scope: scopeContext.scope,
-        permissionCount: rolePerms.length
+        permissionCount: rolePerms.length,
+        forceMfa: result.forceMfa
       }
     });
 
@@ -1272,6 +990,7 @@ roleRoutes.post(
         description: result.description,
         scope: result.scope,
         isSystem: result.isSystem,
+        forceMfa: result.forceMfa,
         permissions: rolePerms,
         createdAt: result.createdAt,
         updatedAt: result.updatedAt
@@ -1281,155 +1000,30 @@ roleRoutes.post(
   }
 );
 
-// GET /roles/:id/users - List users with this role
+// GET /roles/:id/users - List users with this role (services/roleDirectory.ts, W18 #6789)
 roleRoutes.get(
   '/:id/users',
   requirePermission(PERMISSIONS.USERS_READ.resource, PERMISSIONS.USERS_READ.action),
   async (c) => {
-    const auth = c.get('auth');
-    const focusedOrgId = c.req.query('orgId');
-    const roleId = c.req.param('id')!;
-
-    // Verify role exists and is accessible
-    const [role] = await db
-      .select({
-        id: roles.id,
-        isSystem: roles.isSystem,
-        scope: roles.scope,
-        partnerId: roles.partnerId,
-        orgId: roles.orgId
-      })
-      .from(roles)
-      .where(eq(roles.id, roleId))
-      .limit(1);
-
-    if (!role) {
+    const usersData = await listRoleUsers(c.get('auth'), c.req.param('id')!, c.req.query('orgId'));
+    if (!usersData) {
       return c.json({ error: 'Role not found' }, 404);
     }
-
-    // Verify access to this role. The acting scope is derived from the role's
-    // own axis, NOT from `?orgId=` — see resolveRoleActingScope.
-    const scopeContext = await resolveRoleActingScope(auth, role, focusedOrgId);
-    if (!scopeContext) {
-      return c.json({ error: 'Role not found' }, 404);
-    }
-
-    // Get users with this role
-    let usersData;
-
-    if (scopeContext.scope === 'partner') {
-      usersData = await db
-        .select({
-          id: users.id,
-          name: users.name,
-          email: users.email,
-          status: users.status,
-          lastLoginAt: users.lastLoginAt
-        })
-        .from(partnerUsers)
-        .innerJoin(users, eq(partnerUsers.userId, users.id))
-        .where(
-          and(
-            eq(partnerUsers.partnerId, scopeContext.partnerId),
-            eq(partnerUsers.roleId, roleId)
-          )
-        );
-    } else {
-      usersData = await db
-        .select({
-          id: users.id,
-          name: users.name,
-          email: users.email,
-          status: users.status,
-          lastLoginAt: users.lastLoginAt
-        })
-        .from(organizationUsers)
-        .innerJoin(users, eq(organizationUsers.userId, users.id))
-        .where(
-          and(
-            eq(organizationUsers.orgId, scopeContext.orgId),
-            eq(organizationUsers.roleId, roleId)
-          )
-        );
-    }
-
     return c.json({ data: usersData });
   }
 );
 
-// GET /roles/:id/effective-permissions - Get all permissions including inherited ones
+// GET /roles/:id/effective-permissions - Get all permissions including inherited
+// ones (services/roleDirectory.ts, W18 #6789)
 roleRoutes.get(
   '/:id/effective-permissions',
   requirePermission(PERMISSIONS.USERS_READ.resource, PERMISSIONS.USERS_READ.action),
   async (c) => {
-    const auth = c.get('auth');
-    const focusedOrgId = c.req.query('orgId');
-    const roleId = c.req.param('id')!;
-
-    // Get role
-    const [role] = await db
-      .select({
-        id: roles.id,
-        name: roles.name,
-        isSystem: roles.isSystem,
-        scope: roles.scope,
-        parentRoleId: roles.parentRoleId,
-        partnerId: roles.partnerId,
-        orgId: roles.orgId
-      })
-      .from(roles)
-      .where(eq(roles.id, roleId))
-      .limit(1);
-
-    if (!role) {
+    const body = await getRoleEffectivePermissions(c.get('auth'), c.req.param('id')!, c.req.query('orgId'));
+    if (!body) {
       return c.json({ error: 'Role not found' }, 404);
     }
-
-    // Verify access to this role. The acting scope is derived from the role's
-    // own axis, NOT from `?orgId=` — see resolveRoleActingScope.
-    const scopeContext = await resolveRoleActingScope(auth, role, focusedOrgId);
-    if (!scopeContext) {
-      return c.json({ error: 'Role not found' }, 404);
-    }
-
-    // Get effective permissions including inherited ones
-    const effectivePerms = await getEffectivePermissions(roleId);
-
-    // Build inheritance chain for display
-    const inheritanceChain: { id: string; name: string }[] = [];
-    let currentRoleId: string | null = role.parentRoleId;
-
-    while (currentRoleId) {
-      const [parentRole] = await db
-        .select({
-          id: roles.id,
-          name: roles.name,
-          parentRoleId: roles.parentRoleId
-        })
-        .from(roles)
-        .where(eq(roles.id, currentRoleId))
-        .limit(1);
-
-      if (parentRole) {
-        inheritanceChain.push({ id: parentRole.id, name: parentRole.name });
-        currentRoleId = parentRole.parentRoleId;
-      } else {
-        break;
-      }
-    }
-
-    return c.json({
-      roleId: role.id,
-      roleName: role.name,
-      inheritanceChain,
-      permissions: effectivePerms.map((p) => ({
-        resource: p.resource,
-        action: p.action,
-        inherited: p.inherited,
-        sourceRoleId: p.sourceRoleId,
-        sourceRoleName: p.sourceRoleName
-      }))
-    });
+    return c.json(body);
   }
 );
 

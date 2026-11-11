@@ -2,8 +2,8 @@ import { Hono } from 'hono';
 import { zValidator } from '../../lib/validation';
 import { and, asc, eq, sql, type SQL } from 'drizzle-orm';
 import { z } from 'zod';
-import { createTicketFormSchema, updateTicketFormSchema } from '@breeze/shared';
-import { db } from '../../db';
+import { createTicketFormSchema, updateTicketFormSchema, ERROR_CODES } from '@breeze/shared';
+import { db, withDbTransaction } from '../../db';
 import { organizations, ticketForms } from '../../db/schema';
 import { authMiddleware, requireMfa, requirePermission, requireScope, type AuthContext } from '../../middleware/auth';
 import { writeRouteAudit } from '../../services/auditEvents';
@@ -124,14 +124,14 @@ ticketFormRoutes.get(
     const { orgId } = c.req.valid('query');
     // Access check BEFORE any fetch — this endpoint feeds the ticket-creation
     // picker and must not leak form existence for an org the caller can't see.
-    if (!auth.canAccessOrg(orgId)) return c.json({ error: 'Access denied to this organization' }, 403);
+    if (!auth.canAccessOrg(orgId)) return c.json({ error: 'Access denied to this organization', code: ERROR_CODES.ACCESS_DENIED }, 403);
     const orgRows = await db
       .select({ id: organizations.id, partnerId: organizations.partnerId })
       .from(organizations)
       .where(eq(organizations.id, orgId))
       .limit(1);
     const org = orgRows[0];
-    if (!org) return c.json({ error: 'Organization not found' }, 404);
+    if (!org) return c.json({ error: 'Organization not found', code: ERROR_CODES.NOT_FOUND }, 404);
     const forms = await listTicketFormsForOrg({ id: org.id, partnerId: org.partnerId });
     return c.json({ data: forms });
   }
@@ -159,14 +159,14 @@ ticketFormRoutes.post(
     // token — a client-supplied partner id is NEVER trusted.
     let owner: { orgId: string | null; partnerId: string | null };
     if (payload.ownerScope === 'partner') {
-      if (!auth.partnerId) return c.json({ error: 'Partner-wide forms require partner scope' }, 403);
-      if (!canManagePartnerWidePolicies(auth)) return c.json({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE }, 403);
+      if (!auth.partnerId) return c.json({ error: 'Partner-wide forms require partner scope', code: ERROR_CODES.ACCESS_DENIED }, 403);
+      if (!canManagePartnerWidePolicies(auth)) return c.json({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE, code: ERROR_CODES.ACCESS_DENIED }, 403);
       owner = { orgId: null, partnerId: auth.partnerId };
     } else {
       const requestedOrgId = payload.orgId ?? c.req.query('orgId') ?? undefined;
       if (auth.scope === 'organization') {
         if (!auth.orgId || (requestedOrgId && requestedOrgId !== auth.orgId)) {
-          return c.json({ error: 'Organization context required' }, 403);
+          return c.json({ error: 'Organization context required', code: ERROR_CODES.ACCESS_DENIED }, 403);
         }
         owner = { orgId: auth.orgId, partnerId: null };
       } else {
@@ -213,14 +213,16 @@ ticketFormRoutes.post(
     const normalizedVisibleOrgIds = normalizeVisibleOrgIds(payload.visibleOrgIds);
     if (payload.ownerScope === 'partner') {
       try {
-        await syncTicketFormOrgLinks(row.id, normalizedVisibleOrgIds, auth.partnerId!);
+        // Savepoint so a SQL failure in the sync rolls back and the cleanup
+        // delete below can still run (#11203).
+        await withDbTransaction(async () => syncTicketFormOrgLinks(row.id, normalizedVisibleOrgIds, auth.partnerId!));
       } catch (err) {
         // A failed sync (e.g. cross-partner org id) must not leave an
         // orphaned half-created form behind — delete it and surface the 400.
         // The rollback itself must not be allowed to throw and mask the
         // original TicketFormError with an unrelated 500.
         try {
-          await db.delete(ticketForms).where(eq(ticketForms.id, row.id));
+          await withDbTransaction(async () => db.delete(ticketForms).where(eq(ticketForms.id, row.id)));
         } catch (rollbackErr) {
           console.warn('[ticket-forms] rollback delete failed after syncTicketFormOrgLinks error', {
             formId: row.id,
@@ -258,10 +260,10 @@ ticketFormRoutes.put(
     const payload = c.req.valid('json');
 
     const row = await getFormWithAccess(id, auth);
-    if (!row) return c.json({ error: 'Ticket form not found' }, 404);
+    if (!row) return c.json({ error: 'Ticket form not found', code: ERROR_CODES.NOT_FOUND }, 404);
 
     if (row.orgId === null && !canManagePartnerWidePolicies(auth)) {
-      return c.json({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE }, 403);
+      return c.json({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE, code: ERROR_CODES.ACCESS_DENIED }, 403);
     }
 
     // visibleOrgIds is only meaningful on a partner-wide row (org-owned forms
@@ -338,10 +340,10 @@ ticketFormRoutes.delete(
     const { id } = c.req.valid('param');
 
     const row = await getFormWithAccess(id, auth);
-    if (!row) return c.json({ error: 'Ticket form not found' }, 404);
+    if (!row) return c.json({ error: 'Ticket form not found', code: ERROR_CODES.NOT_FOUND }, 404);
 
     if (row.orgId === null && !canManagePartnerWidePolicies(auth)) {
-      return c.json({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE }, 403);
+      return c.json({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE, code: ERROR_CODES.ACCESS_DENIED }, 403);
     }
 
     // Hard delete per spec — existing tickets keep the rendered description +

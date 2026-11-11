@@ -367,7 +367,7 @@ describe('QuoteEditor — inline line editing', () => {
     expect(screen.getByTestId('quote-total-monthly')).toHaveTextContent('$1.01');
   });
 
-  it('renders the tax rate read-only (set at creation, not editable per-quote)', async () => {
+  it('renders the tax rate read-only (resolved from org/partner settings, not editable per-quote)', async () => {
     const withRate: QuoteDetailData = {
       ...detail,
       quote: { ...detail.quote, taxRate: '0.0895' },
@@ -380,6 +380,19 @@ describe('QuoteEditor — inline line editing', () => {
     const rate = screen.getByTestId('quote-tax-rate');
     expect(rate.tagName).not.toBe('INPUT');
     expect(rate).toHaveTextContent('8.95%');
+  });
+
+  // #7507: the rate is resolved (org tax settings → partner default) and frozen
+  // when the quote is SENT, not at creation — the hint says where it comes from.
+  it('tax hint says where the rate comes from and that it is fixed when the quote is sent', async () => {
+    const withRate: QuoteDetailData = { ...detail, quote: { ...detail.quote, taxRate: '0.0895' } };
+    render(<QuoteEditor detail={withRate} onChanged={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId('quote-editor')).toBeInTheDocument());
+    const hint = screen.getByTestId('quote-tax-rate-help');
+    expect(hint).toHaveTextContent(/organization.s tax settings/i);
+    expect(hint).toHaveTextContent(/default tax rate/i);
+    expect(hint).toHaveTextContent(/fixed when the quote is sent/i);
+    expect(hint).not.toHaveTextContent(/when the quote was created/i);
   });
 
   it('rejects a fractional quantity with an inline error, keeps the input, and PATCHes nothing', async () => {

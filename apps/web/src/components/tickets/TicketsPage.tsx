@@ -8,16 +8,27 @@ import { runAction, ActionError } from '../../lib/runAction';
 import { showToast } from '../shared/Toast';
 import { navigateTo } from '@/lib/navigation';
 import { useHashState } from '@/lib/useHashState';
+import { OverflowTabs, type OverflowTab } from '../shared/OverflowTabs';
 import { loginPathWithNext } from '../../lib/authScope';
-import TicketQueueList from './TicketQueueList';
+import TicketQueueList, { queueOptionId } from './TicketQueueList';
 import TicketArchivedList from './TicketArchivedList';
 import TicketWorkbench from './TicketWorkbench';
 import InboundReviewQueue from './InboundReviewQueue';
 import { ConfirmDialog } from '../shared/ConfirmDialog';
 import { usePermissions } from '../../lib/permissions';
 import { useQueueKeyboard } from './useQueueKeyboard';
-import { type TicketPriority, type TicketStatus, type TicketSummary } from './ticketConfig';
+import { formatRelative, NEUTRAL_CHIP_TEXT, slaState, ticketDisplayNumber, type TicketPriority, type TicketStatus, type TicketSummary } from './ticketConfig';
+import { useUiStore } from '../../stores/uiStore';
 import { fetchTicketConfig, type TicketConfig } from '../../lib/ticketConfigApi';
+import { useStableT } from '@/lib/i18n/useStableT';
+import { replaceUrl } from '../../lib/replaceUrl';
+import {
+  TICKET_TYPE_ORDER,
+  isTicketType,
+  ticketTypeFromHash,
+  ticketTypeLabelKey,
+  type TicketType,
+} from './ticketType';
 
 // Aggregate outcome of a POST /tickets/bulk call.
 interface BulkResult { updated: number; skipped: number; failed: number; total: number; skippedReasons?: Record<string, number> }
@@ -40,6 +51,26 @@ function skipReasonLabel(code: string, t: TFunction): string {
 
 function translatedPriorityLabel(config: TicketConfig | null, priority: TicketPriority, t: TFunction): string {
   return config?.priorities[priority]?.label ?? t(/* i18n-dynamic */ `ticketsPage.priority.${priority}`);
+}
+
+/** What the queue's live region says when j/k lands on a ticket:
+ *  "<number> <subject>, <priority> priority[, <SLA state>]". */
+function queueAnnouncement(ticket: TicketSummary, config: TicketConfig | null, t: TFunction): string {
+  const parts = {
+    number: ticketDisplayNumber(ticket),
+    subject: ticket.subject,
+    priority: translatedPriorityLabel(config, ticket.priority, t),
+  };
+  const sla = slaState(ticket);
+  const slaText =
+    sla.kind === 'ok' ? t('ticketsPage.announce.sla.ok', { relative: formatRelative(sla.minutesLeft) })
+    : sla.kind === 'at-risk' ? t('ticketsPage.announce.sla.atRisk', { relative: formatRelative(sla.minutesLeft) })
+    : sla.kind === 'paused' ? t('ticketsPage.announce.sla.paused', { relative: formatRelative(sla.minutesLeft) })
+    : sla.kind === 'breached' ? t('ticketsPage.announce.sla.breached')
+    : null;
+  return slaText
+    ? t('ticketsPage.announce.ticketWithSla', { ...parts, sla: slaText })
+    : t('ticketsPage.announce.ticket', parts);
 }
 
 function translatedStatusLabel(config: TicketConfig | null, status: TicketStatus, t: TFunction): string {
@@ -90,6 +121,8 @@ const SORT_OPTIONS: Array<{ value: TicketSort; labelKey: string }> = [
 const isTicketSort = (value: string): value is TicketSort =>
   SORT_OPTIONS.some((o) => o.value === value);
 
+const isClosedStatus = (status: TicketStatus): boolean => status === 'resolved' || status === 'closed';
+
 const PRIORITY_ORDER: TicketPriority[] = ['low', 'normal', 'high', 'urgent'];
 
 // Bulk status options exclude 'resolved': resolving requires a per-ticket
@@ -116,35 +149,63 @@ function tabQuery(tab: Exclude<Tab, 'review' | 'archived'>): string {
   }
 }
 
-// Hash layout (hash-based UI state per CLAUDE.md): `#<selection>&sort=<sort>`.
+// Hash layout (hash-based UI state per CLAUDE.md):
+// `#<selection>&sort=<sort>&type=<type>&merged=1`.
+// `merged=1` is the "Show merged" list toggle (#8972); absent = off.
 // The bare segment is the selected ticket key (internal number or id); the
-// `sort=` segment carries the queue sort. Both are optional, and the default
-// sort ('triage') is omitted so plain `#T-2026-0001` hashes keep working.
+// `sort=` segment carries the queue sort and `type=` the ticket-type filter
+// (#7900). All are optional, and the default sort ('triage') is omitted so
+// plain `#T-2026-0001` hashes keep working. A `type=` segment is matched
+// BEFORE the selection fallback, so it can never be read as a ticket key; an
+// unknown type value is dropped, not turned into a selection.
 // Pure: takes the raw hash (leading `#` already stripped by useHashState, #2421).
-function parseHash(hash: string): { selection: string | null; sort: TicketSort } {
+function parseHash(hash: string): { selection: string | null; sort: TicketSort; type: TicketType | null; showMerged: boolean } {
   let selection: string | null = null;
   let sort: TicketSort = 'triage';
+  let type: TicketType | null = null;
+  let showMerged = false;
   for (const part of hash.split('&')) {
     if (!part) continue;
     if (part.startsWith('sort=')) {
       const value = part.slice('sort='.length);
       if (isTicketSort(value)) sort = value;
-    } else {
+    } else if (part.startsWith('merged=')) {
+      showMerged = part.slice('merged='.length) === '1';
+    } else if (!part.startsWith('type=')) {
       selection = part;
     }
   }
-  return { selection, sort };
+  // Same helper as the sidebar, over the whole hash, so a repeated `type=`
+  // segment resolves identically in the list filter and the nav highlight.
+  return { selection, sort, type: ticketTypeFromHash(hash), showMerged };
 }
 
-function hashFor(selection: string | null, sort: TicketSort): string {
+// The whole queue hash as ONE piece of state (#8682 sweep). Selection, sort and
+// type must move together: with one `useHashState` per field, each field had
+// its own hashchange listener. React flushes a discrete event like hashchange
+// in a microtask, which the browser runs between listener callbacks, so each
+// field's update committed (and ran effects) separately — so the auto-select
+// effect saw e.g. the new selection with
+// the OLD type and wrote that stale mix straight back over the new URL.
+type QueueHash = { selection: string | null; sort: TicketSort; type: TicketType | ''; showMerged: boolean };
+const DEFAULT_QUEUE_HASH: QueueHash = { selection: null, sort: 'triage', type: '', showMerged: false };
+function parseQueueHash(hash: string): QueueHash {
+  const { selection, sort, type, showMerged } = parseHash(hash);
+  return { selection, sort, type: type ?? '', showMerged };
+}
+
+function hashFor(selection: string | null, sort: TicketSort, type: TicketType | null = null, showMerged = false): string {
   const parts: string[] = [];
   if (selection) parts.push(selection);
   if (sort !== 'triage') parts.push(`sort=${sort}`);
+  if (type) parts.push(`type=${type}`);
+  if (showMerged) parts.push('merged=1');
   return parts.length > 0 ? `#${parts.join('&')}` : '';
 }
 
 export default function TicketsPage() {
   const { t } = useTranslation('tickets');
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   // Soft-delete / restore / archived queue are all tickets:manage-gated (server
   // re-enforces). UX-only: hides controls the caller can't use. Partner/Org Admin.
   const { can } = usePermissions();
@@ -158,9 +219,11 @@ export default function TicketsPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
   // SSR-safe hash adoption + hashchange subscription live in the hook (#2421).
-  // parse → undefined falls back to the null default, preserving "no selection".
-  const [selectedNumber, setSelectedNumber] = useHashState<string | null>(null, (h) => parseHash(h).selection ?? undefined);
-  const [sort, setSort] = useHashState<TicketSort>('triage', (h) => parseHash(h).sort);
+  // One hook for the whole hash so an external change lands atomically (see
+  // QueueHash). Ticket-type filter (#7900): '' = All. Hash-backed so the
+  // Service Desk nav entries (`/tickets#type=<type>`) and bookmarks deep-link in.
+  const [queueHash, setQueueHash] = useHashState<QueueHash>(DEFAULT_QUEUE_HASH, parseQueueHash);
+  const { selection: selectedNumber, sort, type: typeFilter, showMerged } = queueHash;
   const [search, setSearch] = useState('');
   // Debounced twin of `search` — only this drives the list fetch, so typing
   // doesn't fire a 100-row query per keystroke (the input itself stays instant).
@@ -175,6 +238,9 @@ export default function TicketsPage() {
   const [assignees, setAssignees] = useState<Array<{ id: string; name: string | null; email: string }> | null>(null);
   // Bulk selection (UI brief §6): checkbox column + slide-up action bar.
   const [bulkSelectedIds, setBulkSelectedIds] = useState<Set<string>>(new Set());
+  // Polite live-region text: set on keyboard moves and `x` toggles only, so
+  // auto-select on load and pointer clicks stay silent.
+  const [announcement, setAnnouncement] = useState('');
   const [bulkAssignee, setBulkAssignee] = useState(''); // '' = none; 'unassign' sentinel = null assignee
   const [bulkStatus, setBulkStatus] = useState('');
   // Bulk delete is confirm-gated (soft-delete hides from all queues).
@@ -193,13 +259,23 @@ export default function TicketsPage() {
 
   // 'mine'/'unassigned' tabs already pin the assignee param; the filter select is locked there.
   const assigneeLocked = tab === 'mine' || tab === 'unassigned';
-  const filtersActive = Boolean(priorityFilter || categoryFilter || assigneeFilter);
+  const filtersActive = Boolean(priorityFilter || categoryFilter || assigneeFilter || typeFilter);
+
+  // Single writer for the hash: state and URL always move together, so
+  // selection, sort, type and the merged toggle never clobber each other.
+  // Declared before clearFilters, which rewrites it. `mergedValue` defaults to
+  // the current toggle so the existing three-field callers keep it.
+  const writeHash = useCallback((selection: string | null, sortValue: TicketSort, typeValue: TicketType | '', mergedValue: boolean = showMerged) => {
+    setQueueHash({ selection, sort: sortValue, type: typeValue, showMerged: mergedValue });
+    replaceUrl(hashFor(selection, sortValue, typeValue || null, mergedValue) || window.location.pathname + window.location.search);
+  }, [setQueueHash, showMerged]);
 
   const clearFilters = useCallback(() => {
     setPriorityFilter('');
     setCategoryFilter('');
     setAssigneeFilter('');
-  }, []);
+    if (typeFilter) writeHash(selectedNumber, sort, '');
+  }, [typeFilter, selectedNumber, sort, writeHash]);
 
   // Filter options load once; failures degrade per-select (these are filters, not critical path).
   useEffect(() => {
@@ -225,43 +301,58 @@ export default function TicketsPage() {
     return () => { cancelled = true; };
   }, []);
 
+  // The /tickets query string for the current tab + filters; null on the
+  // review tab, which isn't a ticket query (InboundReviewQueue loads its own
+  // data, so tabQuery never sees 'review').
+  const ticketQuery = useMemo(() => {
+    if (tab === 'review') return null;
+    // The archived tab is a normal ticket query with deleted=only (the server
+    // gates it on tickets:manage and stamps each row with deletedAt).
+    const params = tab === 'archived'
+      ? new URLSearchParams({ deleted: 'only' })
+      : new URLSearchParams(tabQuery(tab));
+    if (debouncedSearch) params.set('search', debouncedSearch);
+    if (priorityFilter) params.set('priority', priorityFilter);
+    if (categoryFilter) params.set('categoryId', categoryFilter);
+    // Omit for "All": the API rejects a blank ticketType= with 400.
+    if (typeFilter) params.set('ticketType', typeFilter);
+    // The 'mine'/'unassigned' tabs already set assignee; the filter applies only on the other tabs.
+    if (assigneeFilter && tab !== 'mine' && tab !== 'unassigned') params.set('assignee', assigneeFilter);
+    // 'triage' is the server default, so it's omitted — which also lets the
+    // closed tab keep its tabQuery() sort=newest until the user picks a sort.
+    if (sort !== 'triage') params.set('sort', sort);
+    // #8972: merged tombstones are hidden server-side unless asked for. Sent on
+    // every tab; it only changes results where closed tickets can appear.
+    if (showMerged) params.set('showMerged', 'true');
+    params.set('limit', '100');
+    return params.toString();
+  }, [tab, debouncedSearch, priorityFilter, categoryFilter, assigneeFilter, typeFilter, sort, showMerged]);
+  // The query the rows in `tickets` were fetched for (null until the first load).
+  const [loadedQuery, setLoadedQuery] = useState<string | null>(null);
+  const listIsCurrent = ticketQuery !== null && loadedQuery === ticketQuery;
+
   const fetchTickets = useCallback(async () => {
-    // The review tab isn't a ticket query — it renders InboundReviewQueue, which
-    // loads its own data. Skip the /tickets fetch so tabQuery never sees 'review'.
-    if (tab === 'review') { setLoading(false); return; }
+    if (ticketQuery === null) { setLoading(false); return; }
     const seq = ++fetchSeq.current;
     setLoading(true);
     setError(undefined);
     try {
-      // The archived tab is a normal ticket query with deleted=only (the server
-      // gates it on tickets:manage and stamps each row with deletedAt).
-      const params = tab === 'archived'
-        ? new URLSearchParams({ deleted: 'only' })
-        : new URLSearchParams(tabQuery(tab));
-      if (debouncedSearch) params.set('search', debouncedSearch);
-      if (priorityFilter) params.set('priority', priorityFilter);
-      if (categoryFilter) params.set('categoryId', categoryFilter);
-      // The 'mine'/'unassigned' tabs already set assignee; the filter applies only on the other tabs.
-      if (assigneeFilter && tab !== 'mine' && tab !== 'unassigned') params.set('assignee', assigneeFilter);
-      // 'triage' is the server default, so it's omitted — which also lets the
-      // closed tab keep its tabQuery() sort=newest until the user picks a sort.
-      if (sort !== 'triage') params.set('sort', sort);
-      params.set('limit', '100');
-      const res = await fetchWithAuth(`/tickets?${params.toString()}`);
+      const res = await fetchWithAuth(`/tickets?${ticketQuery}`);
       if (!res.ok) {
         if (res.status === 401) { void navigateTo(loginPathWithNext(), { replace: true }); return; }
-        throw new Error(t('ticketsPage.loadFailed'));
+        throw new Error(stableT('ticketsPage.loadFailed'));
       }
       const body = await res.json();
       if (seq !== fetchSeq.current) return;
       setTickets(body.data ?? []);
+      setLoadedQuery(ticketQuery);
     } catch (e) {
       if (seq !== fetchSeq.current) return;
-      setError(e instanceof Error ? e.message : t('ticketsPage.loadFailed'));
+      setError(e instanceof Error ? e.message : stableT('ticketsPage.loadFailed'));
     } finally {
       if (seq === fetchSeq.current) setLoading(false);
     }
-  }, [tab, debouncedSearch, priorityFilter, categoryFilter, assigneeFilter, sort, t]);
+  }, [ticketQuery, stableT]);
 
   const fetchStats = useCallback(async () => {
     try {
@@ -291,6 +382,25 @@ export default function TicketsPage() {
   // the connection-capped US droplet, also contended for DB connections).
   const patchTicketRow = useCallback((id: string, patch: Partial<TicketSummary>) => {
     setTickets((prev) => prev.map((t) => (t.id === id ? { ...t, ...patch } : t)));
+  }, []);
+
+  // #9564: the ticket the user just changed in the workbench, held so a
+  // reconcile that drops it from the current view (resolving from "All open",
+  // reassigning out of "Mine") doesn't swap the workbench to another ticket
+  // under them. It keeps the pane until the user selects something else or
+  // switches tabs. A snapshot, not a fetch: the workbench loads its own detail.
+  const [heldTicket, setHeldTicket] = useState<TicketSummary | null>(null);
+  const ticketsRef = useRef(tickets);
+  ticketsRef.current = tickets;
+  const onWorkbenchPatched = useCallback((id: string, patch: Partial<TicketSummary>) => {
+    patchTicketRow(id, patch);
+    setHeldTicket((prev) => {
+      const base = prev?.id === id ? prev : ticketsRef.current.find((t) => t.id === id);
+      return base ? { ...base, ...patch } : prev;
+    });
+  }, [patchTicketRow]);
+  const onWorkbenchDeleted = useCallback((id: string) => {
+    setHeldTicket((prev) => (prev?.id === id ? null : prev));
   }, []);
 
   // Debounced background reconcile after a mutation: coalesces bursts (rapid
@@ -336,29 +446,104 @@ export default function TicketsPage() {
     setBulkSelectedIds(new Set());
     setBulkAssignee('');
     setBulkStatus('');
-  }, [search, priorityFilter, categoryFilter, assigneeFilter]);
+  }, [search, priorityFilter, categoryFilter, assigneeFilter, typeFilter]);
 
-  // Single writer for the hash so selection and sort never clobber each other.
-  const writeHash = useCallback((selection: string | null, sortValue: TicketSort) => {
-    history.replaceState(null, '', hashFor(selection, sortValue) || window.location.pathname + window.location.search);
-  }, []);
-
-  const selected = useMemo(
+  const heldMatchesSelection = heldTicket !== null && selectedNumber !== null
+    && (heldTicket.internalNumber === selectedNumber || heldTicket.id === selectedNumber);
+  const selectedInList = useMemo(
     () => tickets.find((t) => t.internalNumber === selectedNumber || t.id === selectedNumber) ?? null,
     [tickets, selectedNumber]
   );
+  // Fall back to the held ticket when the list no longer contains it, so the
+  // auto-select effect below sees a valid selection and leaves it alone.
+  const selected = selectedInList ?? (heldMatchesSelection ? heldTicket : null);
+  const heldDroppedFromView = selectedInList === null && heldMatchesSelection;
+
+  // Release the hold once the user navigates away: another selection, or a tab
+  // switch. Switching to Closed keeps a resolved/closed hold — that is where the
+  // ticket now lives, and the "View in Closed" link lands there.
+  useEffect(() => {
+    if (heldTicket && !heldMatchesSelection) setHeldTicket(null);
+  }, [heldTicket, heldMatchesSelection]);
+  const prevTab = useRef(tab);
+  useEffect(() => {
+    if (prevTab.current === tab) return;
+    prevTab.current = tab;
+    setHeldTicket((prev) => (prev && tab === 'closed' && isClosedStatus(prev.status) ? prev : null));
+  }, [tab]);
+
+  // Keys of tickets that have appeared in a loaded list this session. A
+  // selection that was once listed (tab switch, filter change) keeps the
+  // original "fall back to the first row" behaviour; a selection that was
+  // NEVER listed is a deep link to a ticket outside this view and must not be
+  // silently swapped for another ticket (sweep G10).
+  const seenKeysRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    if (!listIsCurrent) return;
+    for (const row of tickets) {
+      seenKeysRef.current.add(row.id);
+      if (row.internalNumber) seenKeysRef.current.add(row.internalNumber);
+    }
+  }, [listIsCurrent, tickets]);
+  const deepLinkAbsent = selectedNumber !== null && !selected && !seenKeysRef.current.has(selectedNumber);
+  // null = nothing to look up; 'missing' = lookup finished, caller cannot see it.
+  const [absentLookup, setAbsentLookup] = useState<{ key: string; status: 'pending' | 'missing' } | null>(null);
+  useEffect(() => {
+    if (tab === 'review' || tab === 'archived') return;
+    if (loading || !listIsCurrent || !deepLinkAbsent || selectedNumber === null) return;
+    const key = selectedNumber;
+    let cancelled = false;
+    setAbsentLookup({ key, status: 'pending' });
+    void (async () => {
+      let found: TicketSummary | null = null;
+      try {
+        const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(key);
+        if (isUuid) {
+          const res = await fetchWithAuth(`/tickets/${key}`);
+          if (res.ok) found = ((await res.json()) as { data?: TicketSummary }).data ?? null;
+        } else {
+          // No by-number endpoint: the list search matches internalNumber; the
+          // exact match is picked client-side. Status-agnostic (no statusGroup).
+          const res = await fetchWithAuth(`/tickets?${new URLSearchParams({ search: key, limit: '5' })}`);
+          if (res.ok) {
+            const rows = ((await res.json()) as { data?: TicketSummary[] }).data ?? [];
+            found = rows.find((r) => r.internalNumber?.toLowerCase() === key.toLowerCase()) ?? null;
+          }
+        }
+      } catch {
+        found = null;
+      }
+      if (cancelled) return;
+      if (found) {
+        setHeldTicket(found);
+        setAbsentLookup(null);
+      } else {
+        setAbsentLookup({ key, status: 'missing' });
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [tab, loading, listIsCurrent, deepLinkAbsent, selectedNumber]);
+  const absentNotice = deepLinkAbsent && absentLookup?.key === selectedNumber && absentLookup.status === 'missing'
+    ? selectedNumber
+    : null;
 
   // Auto-select first row when nothing valid is selected (UI brief: no-selection state auto-selects)
   useEffect(() => {
     // The review + archived tabs have no ticket selection / workbench pane.
     if (tab === 'review' || tab === 'archived') return;
-    if (!loading && tickets.length > 0 && !selected) {
+    // A deep link to an unlisted ticket is resolved by the lookup above, never
+    // by selecting an unrelated row.
+    if (deepLinkAbsent) return;
+    // `listIsCurrent`: never auto-select out of a list fetched for other
+    // filters — after an external hash change (sidebar entry, back/forward,
+    // bookmark) the old rows are still on screen until the refetch lands, and
+    // picking one would overwrite the selection the new URL asked for.
+    if (!loading && listIsCurrent && tickets.length > 0 && !selected) {
       const first = tickets[0];
       const key = first.internalNumber ?? first.id;
-      writeHash(key, sort);
-      setSelectedNumber(key);
+      writeHash(key, sort, typeFilter);
     }
-  }, [tab, loading, tickets, selected, sort, writeHash]);
+  }, [tab, loading, listIsCurrent, tickets, selected, sort, typeFilter, writeHash, deepLinkAbsent]);
 
   const select = useCallback((t: TicketSummary) => {
     // Below the split-pane breakpoint the workbench pane is hidden; navigate
@@ -368,16 +553,28 @@ export default function TicketsPage() {
       return;
     }
     const key = t.internalNumber ?? t.id;
-    writeHash(key, sort);
-    setSelectedNumber(key);
-  }, [sort, writeHash]);
+    writeHash(key, sort, typeFilter);
+  }, [sort, typeFilter, writeHash]);
+
+  // #8972: after a merge the source is a closed tombstone; follow the survivor
+  // (by number when the dialog knew it, else by id — both resolve in `selected`).
+  const onWorkbenchMerged = useCallback((survivorId: string, survivorNumber: string | null) => {
+    writeHash(survivorNumber ?? survivorId, sort, typeFilter);
+    scheduleReconcile();
+  }, [sort, typeFilter, writeHash, scheduleReconcile]);
 
   const move = useCallback((delta: 1 | -1) => {
     if (tickets.length === 0) return;
     const idx = selected ? tickets.findIndex((t) => t.id === selected.id) : -1;
     const next = tickets[Math.min(tickets.length - 1, Math.max(0, idx + delta))];
-    if (next) select(next);
-  }, [tickets, selected, select]);
+    if (!next) return;
+    select(next);
+    // DOM focus follows the selection (roving tab stop) so Tab leaves from
+    // the right row and the row scrolls into view; the live region gives a
+    // short summary instead of the row's full text.
+    document.getElementById(queueOptionId(next.id))?.focus();
+    setAnnouncement(queueAnnouncement(next, config, t));
+  }, [tickets, selected, select, config, t]);
 
   const assignMe = useCallback(async () => {
     if (!selected) return;
@@ -411,6 +608,14 @@ export default function TicketsPage() {
     });
   }, []);
 
+  // `x`: the keyboard path to bulk selection (row checkboxes are pointer-only).
+  const toggleActiveBulk = useCallback(() => {
+    if (!selected) return;
+    const count = bulkSelectedIds.size + (bulkSelectedIds.has(selected.id) ? -1 : 1);
+    toggleBulkSelect(selected.id);
+    setAnnouncement(t('ticketsPage.selectedCount', { count }));
+  }, [selected, bulkSelectedIds, toggleBulkSelect, t]);
+
   const clearBulkSelection = useCallback(() => {
     setBulkSelectedIds(new Set());
     setBulkAssignee('');
@@ -430,6 +635,8 @@ export default function TicketsPage() {
         onUnauthorized: () => void navigateTo(loginPathWithNext(), { replace: true })
       });
       showBulkOutcomeToast(result.data, t('ticketsPage.bulk.updatedPast'), t);
+      // The snapshot may now be stale (or deleted); let the queue re-select.
+      setHeldTicket(null);
       clearBulkSelection();
       setPaneRefresh((t) => t + 1);
       void fetchTickets();
@@ -453,6 +660,7 @@ export default function TicketsPage() {
         onUnauthorized: () => void navigateTo(loginPathWithNext(), { replace: true })
       });
       showBulkOutcomeToast(result.data, t('ticketsPage.bulk.deletedPast'), t);
+      setHeldTicket(null);
       clearBulkSelection();
       setPaneRefresh((t) => t + 1);
       void fetchTickets();
@@ -496,6 +704,8 @@ export default function TicketsPage() {
     onFocusReply: () => focusComposer(false),
     onFocusInternal: () => focusComposer(true),
     onResolve: () => { if (selected) setResolveToken((t) => t + 1); },
+    // Bulk selection lives on the live queue tabs only (review/archived have none).
+    onToggleBulk: tab === 'review' || tab === 'archived' ? undefined : toggleActiveBulk,
     onEscape: () => (document.activeElement as HTMLElement | null)?.blur()
   });
 
@@ -536,63 +746,48 @@ export default function TicketsPage() {
         </a>
       </div>
 
-      <div className="mb-3 flex items-center gap-1 border-b">
-        {TABS.map((tabItem) => (
-          <button
-            key={tabItem.id}
-            type="button"
-            onClick={() => setTab(tabItem.id)}
-            data-testid={`tickets-tab-${tabItem.id}`}
-            className={cn(
-              'border-b-2 px-3 py-2 text-sm font-medium -mb-px',
-              tab === tabItem.id ? 'border-primary text-foreground' : 'border-transparent text-muted-foreground hover:text-foreground'
-            )}
-          >
-            {t(/* i18n-dynamic */ `ticketsPage.tabs.${tabItem.labelKey}`)}
-            {tabCount(tabItem.id) !== null && <span className="ml-1.5 text-xs text-muted-foreground">{tabCount(tabItem.id)}</span>}
-          </button>
-        ))}
-        {reviewAvailable && (
-          <button
-            type="button"
-            onClick={() => setTab('review')}
-            data-testid="tickets-tab-review"
-            className={cn(
-              'border-b-2 px-3 py-2 text-sm font-medium -mb-px',
-              tab === 'review' ? 'border-primary text-foreground' : 'border-transparent text-muted-foreground hover:text-foreground'
-            )}
-          >
-            {t('ticketsPage.reviewQueue')}
-            {tabCount('review') !== null && (
-              <span className="ml-1.5 rounded-full bg-amber-500/20 px-1.5 text-xs font-semibold text-amber-800 dark:bg-amber-500/30 dark:text-amber-200" data-testid="tickets-tab-review-badge">
-                {tabCount('review')}
-              </span>
-            )}
-          </button>
-        )}
-        {canManage && (
-          // Soft-deleted queue. tickets:manage only (server re-enforces via
-          // deleted=only → 403 for non-managers), so the tab stays hidden otherwise.
-          <button
-            type="button"
-            onClick={() => setTab('archived')}
-            data-testid="tickets-tab-archived"
-            className={cn(
-              'border-b-2 px-3 py-2 text-sm font-medium -mb-px',
-              tab === 'archived' ? 'border-primary text-foreground' : 'border-transparent text-muted-foreground hover:text-foreground'
-            )}
-          >
-            {t('ticketsPage.archived')}
-          </button>
-        )}
-        <input
-          type="search"
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-          placeholder={t('ticketsPage.searchPlaceholder')}
-          data-testid="tickets-search-input"
-          className="ml-auto mb-1 w-56 rounded-md border bg-background px-2.5 py-1.5 text-sm"
+      <div className="mb-3 space-y-2">
+        <OverflowTabs
+          tabs={[
+            // These five are plain informational counts (rendered as muted
+            // text, including "0", before this fix) — not the "needs
+            // attention" signal `OverflowTab.count`/`CountBadge` renders
+            // (amber pill, and it hides on a falsy count). Appending the
+            // number onto the label keeps that plain-text meaning instead of
+            // relabeling every count as an alert. Only Review queue (below)
+            // is a genuine "needs attention" count and uses the real prop.
+            ...TABS.map((tabItem): OverflowTab => {
+              const label = t(/* i18n-dynamic */ `ticketsPage.tabs.${tabItem.labelKey}`);
+              const count = tabCount(tabItem.id);
+              return { id: tabItem.id, label: count !== null ? `${label} ${count}` : label, icon: null };
+            }),
+            ...(reviewAvailable
+              ? [{ id: 'review', label: t('ticketsPage.reviewQueue'), icon: null, count: tabCount('review') ?? undefined } satisfies OverflowTab]
+              : []),
+            // Soft-deleted queue. tickets:manage only (server re-enforces via
+            // deleted=only → 403 for non-managers), so the tab stays hidden otherwise.
+            ...(canManage
+              ? [{ id: 'archived', label: t('ticketsPage.archived'), icon: null } satisfies OverflowTab]
+              : []),
+          ]}
+          activeTab={tab}
+          onTabChange={(id) => setTab(id as Tab)}
+          testIdPrefix="tickets-tab-"
         />
+        {/* Below `lg` this drops to its own line under the tabs (#7148 —
+            a fixed w-56 box in the same row as the tabs overflowed by 94px
+            at 1024px); at `lg` and up it sits at the end of its own row,
+            right-aligned. */}
+        <div className="flex lg:justify-end">
+          <input
+            type="search"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder={t('ticketsPage.searchPlaceholder')}
+            data-testid="tickets-search-input"
+            className="w-full rounded-md border bg-background px-2.5 py-1.5 text-sm lg:w-56"
+          />
+        </div>
       </div>
 
       {tab !== 'review' && (
@@ -621,6 +816,22 @@ export default function TicketsPage() {
             <option key={cat.id} value={cat.id}>{cat.name}</option>
           ))}
         </select>
+        <select
+          value={typeFilter}
+          onChange={(e) => {
+            const value = e.target.value;
+            const next: TicketType | '' = isTicketType(value) ? value : '';
+            writeHash(selectedNumber, sort, next);
+          }}
+          aria-label={t('ticketsPage.filterByType')}
+          data-testid="tickets-filter-type"
+          className={filterSelectClass(!!typeFilter)}
+        >
+          <option value="">{t('ticketsPage.allTypes')}</option>
+          {TICKET_TYPE_ORDER.map((type) => (
+            <option key={type} value={type}>{t(/* i18n-dynamic */ ticketTypeLabelKey(type))}</option>
+          ))}
+        </select>
         {assignees !== null && (
           <select
             value={assigneeFilter}
@@ -642,8 +853,7 @@ export default function TicketsPage() {
           onChange={(e) => {
             const value = e.target.value;
             if (!isTicketSort(value)) return;
-            setSort(value);
-            writeHash(selectedNumber, value);
+            writeHash(selectedNumber, value, typeFilter);
           }}
           aria-label={t('ticketsPage.sortTickets')}
           data-testid="ticket-sort"
@@ -653,6 +863,15 @@ export default function TicketsPage() {
             <option key={o.value} value={o.value}>{t(/* i18n-dynamic */ `ticketsPage.sort.${o.labelKey}`)}</option>
           ))}
         </select>
+        <label className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
+          <input
+            type="checkbox"
+            checked={showMerged}
+            onChange={(e) => writeHash(selectedNumber, sort, typeFilter, e.target.checked)}
+            data-testid="ticket-list-show-merged"
+          />
+          {t('ticketsPage.showMerged')}
+        </label>
       </div>
       )}
 
@@ -709,7 +928,21 @@ export default function TicketsPage() {
               >
                 {t('ticketsPage.selectAll')}
               </button>
+              {/* The queue's j/k/x/a/r/n/e keys are otherwise undiscoverable:
+                  this opens the global `?` card, which lists them. */}
+              <button
+                type="button"
+                onClick={() => useUiStore.getState().openShortcutsHelp()}
+                aria-label={t('common:layout.shortcuts.title')}
+                aria-keyshortcuts="?"
+                data-testid="tickets-shortcuts-hint"
+                className="ml-auto inline-flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground"
+              >
+                {t('ticketsPage.shortcutsButton')}
+                <kbd aria-hidden="true" className={cn('inline-flex min-w-4 items-center justify-center rounded border bg-muted px-1 font-mono text-[11px] font-semibold leading-4', NEUTRAL_CHIP_TEXT)}>?</kbd>
+              </button>
             </div>
+            <p role="status" className="sr-only" data-testid="tickets-queue-announcer">{announcement}</p>
             <div className="min-h-0 flex-1 overflow-y-auto">
               <TicketQueueList
                 tickets={tickets}
@@ -720,6 +953,7 @@ export default function TicketsPage() {
                 onClearFilters={filtersActive ? clearFilters : undefined}
                 bulkSelectedIds={bulkSelectedIds}
                 onToggleSelect={toggleBulkSelect}
+                hostHandlesArrowKeys
               />
             </div>
             {bulkSelectedIds.size > 0 && (
@@ -798,10 +1032,42 @@ export default function TicketsPage() {
           </div>
           <div className="hidden min-w-0 flex-1 min-[1100px]:block">
             {selected ? (
-              <TicketWorkbench ticketId={selected.id} resolveRequestToken={resolveToken} refreshToken={paneRefresh} assignees={assignees} categories={categories} onTicketPatched={patchTicketRow} onChanged={scheduleReconcile} />
+              <div className="flex h-full min-h-0 flex-col">
+                {heldDroppedFromView && tab !== 'closed' && isClosedStatus(selected.status) && (
+                  // #9564: the ticket left this view (resolved/closed from an
+                  // open-only tab); say where it went instead of vanishing it.
+                  <div
+                    role="status"
+                    className="flex items-center gap-2 border-b bg-muted/40 px-4 py-2 text-sm"
+                    data-testid="tickets-moved-to-closed"
+                  >
+                    <span>
+                      {t('ticketsPage.movedToClosed.message', {
+                        status: selected.statusName || translatedStatusLabel(config, selected.status, t),
+                        tab: t('ticketsPage.tabs.closed'),
+                      })}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setTab('closed')}
+                      className="font-medium text-primary hover:underline"
+                      data-testid="tickets-moved-to-closed-view"
+                    >
+                      {t('ticketsPage.movedToClosed.view', { tab: t('ticketsPage.tabs.closed') })}
+                    </button>
+                  </div>
+                )}
+                <div className="min-h-0 flex-1">
+                  <TicketWorkbench ticketId={selected.id} resolveRequestToken={resolveToken} refreshToken={paneRefresh} assignees={assignees} categories={categories} onTicketPatched={onWorkbenchPatched} onDeleted={onWorkbenchDeleted} onMerged={onWorkbenchMerged} onChanged={scheduleReconcile} />
+                </div>
+              </div>
             ) : (
               <div className="flex h-full items-center justify-center text-sm text-muted-foreground" data-testid="tickets-no-selection">
-                <p>{t('ticketsPage.noSelection')}</p>
+                {absentNotice ? (
+                  <p role="status" data-testid="tickets-deeplink-absent">{t('ticketsPage.ticketNotInView', { number: absentNotice })}</p>
+                ) : (
+                  <p>{t('ticketsPage.noSelection')}</p>
+                )}
               </div>
             )}
           </div>

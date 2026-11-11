@@ -1,7 +1,7 @@
 import '@/lib/i18n';
 
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import DevicePatchStatusTab from './DevicePatchStatusTab';
 import { fetchWithAuth } from '../../stores/auth';
@@ -909,4 +909,513 @@ describe('DevicePatchStatusTab', () => {
     expect(screen.getByText('Installed (date unknown)')).toBeInTheDocument();
   });
 
+  it('shows a failed install attempt and its reason instead of "Pending Approval" (#4223)', async () => {
+    const BATTERY = 'preflight check "battery" failed: running on battery power (battery: 76%)';
+    fetchWithAuthMock.mockResolvedValue(
+      makeJsonResponse({
+        data: {
+          compliancePercent: 50,
+          pending: [
+            {
+              id: 'failed-native-1',
+              title: '2026-08 Cumulative Update for Windows 11 (KB5041585)',
+              source: 'microsoft',
+              category: 'security',
+              status: 'pending',
+              approvalStatus: 'pending',
+              installFailure: { deviceCount: 1, error: BATTERY, failedAt: '2026-08-29T18:00:00.000Z' }
+            },
+            {
+              id: 'failed-third-party-1',
+              title: 'Google Chrome',
+              source: 'third_party',
+              category: 'application',
+              status: 'pending',
+              approvalStatus: 'pending',
+              installFailure: { deviceCount: 1, error: null, failedAt: '2026-08-29T18:00:00.000Z' }
+            },
+            {
+              id: 'clean-native-1',
+              title: '2026-08 .NET Update (KB5041000)',
+              source: 'microsoft',
+              category: 'security',
+              status: 'pending',
+              approvalStatus: 'pending',
+              installFailure: null
+            }
+          ],
+          installed: []
+        }
+      })
+    );
+
+    render(<DevicePatchStatusTab deviceId={deviceId} osType="windows" />);
+
+    const nativeBadge = await screen.findByTestId('device-patch-failed-native-1-install-failed');
+    expect(nativeBadge.textContent).toContain('Install failed');
+    expect(screen.getByText(BATTERY)).toBeTruthy();
+    const thirdPartyBadge = screen.getByTestId('device-patch-failed-third-party-1-install-failed');
+    expect(thirdPartyBadge.textContent).toContain('Install failed');
+    expect(screen.getByText('No reason reported by the agent')).toBeTruthy();
+    // Only the patch with no failed attempt still reads "Pending Approval".
+    expect(screen.getAllByText('Pending Approval')).toHaveLength(1);
+    expect(screen.queryByTestId('device-patch-clean-native-1-install-failed')).toBeNull();
+    // #7214 (paper cut #24): "Patch Controls" must not count a patch whose
+    // latest install attempt failed as awaiting approval — it stopped being
+    // "pending approval" the moment the row shows "Install failed" above.
+    // Two native patches are pending; only clean-native-1 has no failure.
+    expect(screen.getByText('(1 pending approval)')).toBeInTheDocument();
+    expect(screen.queryByText('(2 pending approval)')).not.toBeInTheDocument();
+  });
+
+  // #7680: Windows keeps an update that installed but needs a restart at
+  // IsInstalled=0 until the device restarts, so it stays in the pending list.
+  // The row must say it is installed and waiting for a reboot, not read as an
+  // untouched pending (or pending-approval) patch.
+  it('shows "Installed, reboot required" for a pending patch whose latest install needs a restart (#7680)', async () => {
+    const installedAt = '2026-10-01T09:30:00.000Z';
+    fetchWithAuthMock.mockResolvedValue(
+      makeJsonResponse({
+        data: {
+          compliancePercent: 50,
+          pending: [
+            {
+              id: 'restart-approved', title: '2026-09 .NET Framework Security Update (KB5126052)', source: 'microsoft',
+              category: 'security', status: 'pending', approvalStatus: 'approved', installFailure: null,
+              awaitingRestart: { installedAt }
+            },
+            {
+              id: 'restart-unapproved', title: '2026-09 Cumulative Update (KB5126000)', source: 'microsoft',
+              category: 'security', status: 'pending', approvalStatus: 'pending', installFailure: null,
+              awaitingRestart: { installedAt }
+            },
+            {
+              id: 'clean-native-2', title: '2026-09 Servicing Stack Update (KB5126001)', source: 'microsoft',
+              category: 'security', status: 'pending', approvalStatus: 'pending', installFailure: null, awaitingRestart: null
+            }
+          ],
+          installed: []
+        }
+      })
+    );
+
+    render(<DevicePatchStatusTab deviceId={deviceId} osType="windows" timezone="UTC" />);
+
+    const badge = await screen.findByTestId('device-patch-restart-approved-awaiting-restart');
+    expect(badge.textContent).toContain('Installed, reboot required');
+    expect(badge.getAttribute('title')).toContain('It stays listed as pending until the device restarts.');
+    expect(screen.getByTestId('device-patch-restart-unapproved-awaiting-restart')).toBeInTheDocument();
+    expect(screen.queryByTestId('device-patch-clean-native-2-awaiting-restart')).toBeNull();
+    // An installed-awaiting-restart patch is not waiting on an approval.
+    expect(screen.getAllByText('Pending Approval')).toHaveLength(1);
+    expect(screen.getByText('(1 pending approval)')).toBeInTheDocument();
+  });
+  // #7625: a patch the linked update ring auto-approves used to read
+  // "Pending Approval" because the badge only knew about manual approvals.
+  it('shows the ring-aware approval state instead of "Pending Approval" for ring-managed patches (#7625)', async () => {
+    const pendingPatch = (id: string, title: string, effectiveApproval: unknown) => ({
+      id, title, source: 'microsoft', category: 'security', status: 'pending',
+      approvalStatus: 'pending', effectiveApproval, installFailure: null
+    });
+    fetchWithAuthMock.mockResolvedValue(
+      makeJsonResponse({
+        data: {
+          compliancePercent: 0,
+          approvalEvaluation: { available: true, ring: { id: 'ring-1', name: 'Workstations Ring' } },
+          pending: [
+            pendingPatch('auto-1', 'Auto Update (KB1)', { state: 'auto_approved', reason: 'ring_auto_approve', holdUntil: null }),
+            pendingPatch('held-1', 'Held Update (KB2)', { state: 'deferred', reason: 'held_by_deferral', holdUntil: '2026-10-07T12:00:00.000Z' }),
+            pendingPatch('manual-1', 'Manual Update (KB3)', { state: 'needs_approval', reason: 'awaiting_manual_approval', holdUntil: null }),
+            pendingPatch('excl-1', 'Excluded Update (KB4)', { state: 'excluded', reason: 'blocked_by_category', holdUntil: null })
+          ],
+          installed: []
+        }
+      })
+    );
+
+    render(<DevicePatchStatusTab deviceId={deviceId} osType="windows" timezone="UTC" />);
+
+    const auto = await screen.findByTestId('device-patch-auto-1-approval');
+    expect(auto.textContent).toBe('Auto-approved');
+    expect(auto.getAttribute('title')).toContain('Workstations Ring');
+    expect(screen.getByTestId('device-patch-held-1-approval').textContent).toBe(
+      `Auto-approves ${new Date('2026-10-07T12:00:00.000Z').toLocaleDateString([], { timeZone: 'UTC' })}`
+    );
+    expect(screen.getByTestId('device-patch-manual-1-approval').textContent).toBe('Pending Approval');
+    expect(screen.getByTestId('device-patch-excl-1-approval').textContent).toBe('Excluded by policy');
+    // Only the patch nothing will approve counts as awaiting approval.
+    expect(screen.getByText('(1 pending approval)')).toBeInTheDocument();
+    expect(screen.getByText(/Workstations Ring/, { selector: '[data-testid="device-patch-approval-ring"]' })).toBeInTheDocument();
+    // The per-row Install action is still gated on a manual approval; its
+    // title says the ring installs it on schedule.
+    const installAuto = screen.getByRole('button', { name: /Auto Update \(KB1\)/ });
+    expect(installAuto).toBeDisabled();
+    expect(installAuto.getAttribute('aria-label')).toContain('next scheduled patch run');
+  });
+
+  // #11073, spec 4.6: says who owns it, not that a policy blocked it.
+  it('shows a patch a vendor lane delivers as managed by Vendor updates', async () => {
+    fetchWithAuthMock.mockResolvedValue(
+      makeJsonResponse({
+        data: {
+          compliancePercent: 0,
+          approvalEvaluation: { available: true, ring: { id: 'ring-1', name: 'Workstations Ring' } },
+          pending: [{
+            id: 'driver-1', title: 'Dell Inc. - Display', source: 'microsoft', category: 'driver', status: 'pending',
+            approvalStatus: 'pending', installFailure: null,
+            effectiveApproval: { state: 'excluded', reason: 'managed_by_vendor_updates', holdUntil: null }
+          }],
+          installed: []
+        }
+      })
+    );
+
+    render(<DevicePatchStatusTab deviceId={deviceId} osType="windows" timezone="UTC" />);
+
+    const badge = await screen.findByTestId('device-patch-driver-1-approval');
+    expect(badge.textContent).toBe('Managed by Vendor updates');
+    expect(badge.getAttribute('title')).toContain('scheduled patch runs skip it');
+    expect(badge.getAttribute('title')).not.toContain('Workstations Ring');
+  });
+
+  it('explains a held-back patch when the policy links an invalid update ring', async () => {
+    fetchWithAuthMock.mockResolvedValue(
+      makeJsonResponse({
+        data: {
+          compliancePercent: 0,
+          approvalEvaluation: { available: true, ring: null },
+          pending: [{
+            id: 'badring-1', title: 'Held Update (KB5)', source: 'microsoft', category: 'security', status: 'pending',
+            approvalStatus: 'approved', effectiveApproval: { state: 'excluded', reason: 'ring_reference_invalid', holdUntil: null }, installFailure: null
+          }],
+          installed: []
+        }
+      })
+    );
+
+    render(<DevicePatchStatusTab deviceId={deviceId} osType="windows" timezone="UTC" />);
+
+    const badge = await screen.findByTestId('device-patch-badring-1-approval');
+    expect(badge.textContent).toBe('Excluded by policy');
+    expect(badge.getAttribute('title')).toContain('links an update ring that no longer exists');
+  });
+
+  it('explains an excluded per-user install the evaluator denied as unsupported_user_scope (#10249)', async () => {
+    fetchWithAuthMock.mockResolvedValue(
+      makeJsonResponse({
+        data: {
+          compliancePercent: 0,
+          approvalEvaluation: { available: true, ring: { id: 'ring-1', name: 'Workstations Ring' } },
+          pending: [{
+            id: 'user-1', title: 'Zoom', source: 'third_party', category: 'application', status: 'pending', scope: 'user',
+            approvalStatus: 'approved', effectiveApproval: { state: 'excluded', reason: 'unsupported_user_scope', holdUntil: null }, installFailure: null
+          }],
+          installed: []
+        }
+      })
+    );
+
+    render(<DevicePatchStatusTab deviceId={deviceId} osType="windows" timezone="UTC" />);
+
+    const badge = await screen.findByTestId('device-patch-user-1-approval');
+    expect(badge.textContent).toBe('Excluded by policy');
+    expect(badge.getAttribute('title')).toContain('per-user install that Breeze cannot apply yet');
+    // Not a category exclusion: the fallback title must not be used.
+    expect(badge.getAttribute('title')).not.toContain('category');
+  });
+
+  it('falls back to the manual approval badge when the ring evaluation is unavailable (#7625)', async () => {
+    fetchWithAuthMock.mockResolvedValue(
+      makeJsonResponse({
+        data: {
+          compliancePercent: 0,
+          approvalEvaluation: { available: false, ring: null },
+          pending: [
+            { id: 'p-1', title: 'Some Update (KB9)', source: 'microsoft', category: 'security', status: 'pending', approvalStatus: 'pending', effectiveApproval: null, installFailure: null }
+          ],
+          installed: []
+        }
+      })
+    );
+
+    render(<DevicePatchStatusTab deviceId={deviceId} osType="windows" />);
+
+    expect((await screen.findByTestId('device-patch-p-1-approval')).textContent).toBe('Pending Approval');
+    expect(screen.getByTestId('device-patch-approval-unavailable')).toBeInTheDocument();
+  });
+  it('combines the ring-aware state with a failed install attempt (#7625 x #4223)', async () => {
+    const failure = { deviceCount: 1, error: 'battery', failedAt: '2026-09-29T18:00:00.000Z' };
+    const row = (id: string, effectiveApproval: unknown, extra: Record<string, unknown> = {}) => ({
+      id, title: `Patch ${id} (KB${id.length})`, source: 'microsoft', category: 'security', status: 'pending',
+      approvalStatus: 'pending', effectiveApproval, installFailure: failure, ...extra
+    });
+    fetchWithAuthMock.mockResolvedValue(
+      makeJsonResponse({
+        data: {
+          compliancePercent: 0,
+          approvalEvaluation: { available: true, ring: { id: 'ring-1', name: 'Workstations Ring' } },
+          pending: [
+            row('needs', { state: 'needs_approval', reason: 'awaiting_manual_approval', holdUntil: null }),
+            row('auto', { state: 'auto_approved', reason: 'ring_auto_approve', holdUntil: null }),
+            row('nodate', { state: 'deferred', reason: 'held_by_deferral', holdUntil: null }, { installFailure: null }),
+            row('otherring', { state: 'needs_approval', reason: 'awaiting_manual_approval', holdUntil: null }, { installFailure: null, approvalStatus: 'approved' })
+          ],
+          installed: []
+        }
+      })
+    );
+
+    render(<DevicePatchStatusTab deviceId={deviceId} osType="windows" />);
+
+    await screen.findByTestId('device-patch-needs-install-failed');
+    // #4223 suppression still holds: a failed attempt hides "Pending Approval"...
+    expect(screen.queryByTestId('device-patch-needs-approval')).toBeNull();
+    // ...but a real ring verdict stays visible next to the failure.
+    expect(screen.getByTestId('device-patch-auto-install-failed')).toBeInTheDocument();
+    expect(screen.getByTestId('device-patch-auto-approval').textContent).toBe('Auto-approved');
+    // No age anchor: held with no date.
+    expect(screen.getByTestId('device-patch-nodate-approval').textContent).toBe('Deferred');
+    // A manual approval for another ring passes the Install gate but not the
+    // ring-aware evaluator; the badge says why the two disagree.
+    expect(screen.getByTestId('device-patch-otherring-approval').getAttribute('title')).toContain('different update ring');
+  });
+  // #7637 option B: the install poll skips the ring-aware evaluation
+  // (approvalView=0) and the tab keeps the last known badges instead of
+  // flashing the manual-only fallback mid-install.
+  it('polls with approvalView=0 during an install and keeps the last ring-aware badges', async () => {
+    const ring = { id: 'ring-1', name: 'Workstations Ring' };
+    const approved = {
+      id: 'appr-1', title: 'Approved Update (KB10)', source: 'microsoft', category: 'security', status: 'pending',
+      approvalStatus: 'approved', effectiveApproval: { state: 'approved', reason: 'manual', holdUntil: null }, installFailure: null
+    };
+    const auto = {
+      id: 'auto-1', title: 'Auto Update (KB11)', source: 'microsoft', category: 'security', status: 'pending',
+      approvalStatus: 'pending', effectiveApproval: { state: 'auto_approved', reason: 'ring_auto_approve', holdUntil: null }, installFailure: null
+    };
+    const fresh = {
+      id: 'new-1', title: 'Newly Seen Update (KB12)', source: 'microsoft', category: 'security', status: 'pending',
+      approvalStatus: 'pending', effectiveApproval: null, installFailure: null
+    };
+    const fullLoad = { data: { compliancePercent: 0, approvalEvaluation: { available: true, ring }, pending: [approved, auto], installed: [] } };
+    // What the server returns when the evaluation is skipped: no verdicts. A
+    // third pending patch keeps the count from dropping, so polling continues,
+    // and proves the poll response was applied.
+    const pollLoad = {
+      data: {
+        compliancePercent: 0,
+        approvalEvaluation: null,
+        pending: [{ ...approved, effectiveApproval: null }, { ...auto, effectiveApproval: null }, fresh],
+        installed: []
+      }
+    };
+    fetchWithAuthMock.mockImplementation(async (url: string) => {
+      if (typeof url === 'string' && url.includes('/patches/install')) {
+        return makeJsonResponse({ success: true, commandId: 'cmd-1', patchCount: 1 });
+      }
+      if (typeof url === 'string' && url.startsWith(`/devices/${deviceId}/patches`) && !url.includes('/history')) {
+        return makeJsonResponse(url.includes('approvalView=0') ? pollLoad : fullLoad);
+      }
+      return makeJsonResponse({});
+    });
+
+    render(<DevicePatchStatusTab deviceId={deviceId} osType="windows" />);
+
+    expect((await screen.findByTestId('device-patch-auto-1-approval')).textContent).toBe('Auto-approved');
+    // A normal load does not skip the evaluation.
+    expect(fetchWithAuthMock).toHaveBeenCalledWith(`/devices/${deviceId}/patches`);
+
+    fireEvent.click(screen.getByRole('button', { name: /Install pending Windows patches|Install pending OS patches/i }));
+    fireEvent.click(await screen.findByTestId('confirm-install-patches'));
+    await screen.findByText(/Installing patches/i);
+
+    // First poll tick (5 s): the request skips the evaluation...
+    await screen.findByText('Newly Seen Update (KB12)', {}, { timeout: 8000 });
+    expect(fetchWithAuthMock).toHaveBeenCalledWith(`/devices/${deviceId}/patches?approvalView=0`);
+    // ...and the badges and ring line from the last full load stay put.
+    expect(screen.getByTestId('device-patch-auto-1-approval').textContent).toBe('Auto-approved');
+    expect(screen.getByTestId('device-patch-appr-1-approval').textContent).toBe('Approved');
+    expect(screen.getByTestId('device-patch-approval-ring').textContent).toContain('Workstations Ring');
+  }, 15000);
+
+  // #10250: a failed (or reboot-pending) single-patch install never shrinks the
+  // pending list, so the old count-only poll spun "Installing..." for 30 min.
+  describe('install polling stops on the install outcome (#10250)', () => {
+    const patch = {
+      id: 'kb-1', title: 'Cumulative Update (KB5050001)', source: 'microsoft', category: 'security', status: 'pending',
+      approvalStatus: 'approved', effectiveApproval: { state: 'approved', reason: 'manual', holdUntil: null }, installFailure: null
+    };
+    const load = (p: Record<string, unknown>) => ({ data: { compliancePercent: 0, pending: [p], installed: [] } });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    function mockInstall(opts: { poll: () => unknown; commandStatus: () => string }) {
+      fetchWithAuthMock.mockImplementation(async (url: string) => {
+        if (url.includes('/patches/install')) {
+          return makeJsonResponse({ success: true, commandId: 'cmd-1', commandStatus: 'sent', patchCount: 1 });
+        }
+        if (url === `/devices/${deviceId}/commands/cmd-1`) {
+          return makeJsonResponse({ data: { id: 'cmd-1', status: opts.commandStatus() } });
+        }
+        if (url.startsWith(`/devices/${deviceId}/patches`) && !url.includes('/history')) {
+          return makeJsonResponse(opts.poll());
+        }
+        return makeJsonResponse({});
+      });
+    }
+
+    async function clickRowInstall() {
+      const button = await screen.findByRole('button', { name: 'Install Cumulative Update (KB5050001)' });
+      fireEvent.click(button);
+      await screen.findByText(/Installing patches/i);
+      return button;
+    }
+
+    it('stops polling and shows the failure once the targeted patch reports a new install failure', async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      let failed = false;
+      mockInstall({
+        poll: () => load(failed
+          ? { ...patch, installFailure: { deviceCount: 1, error: 'installer exited 1603', failedAt: '2026-10-28T10:00:00.000Z' } }
+          : patch),
+        commandStatus: () => (failed ? 'failed' : 'sent'),
+      });
+
+      render(<DevicePatchStatusTab deviceId={deviceId} osType="windows" />);
+      await clickRowInstall();
+      expect(screen.getByText('Polling...')).toBeInTheDocument();
+
+      failed = true;
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      expect(await screen.findByText(/0 installed, 1 failed, 0 awaiting a restart/)).toBeInTheDocument();
+      expect(screen.getByTestId('device-patch-kb-1-install-failed')).toBeInTheDocument();
+      expect(screen.queryByText('Polling...')).not.toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Install Cumulative Update (KB5050001)' })).not.toBeDisabled();
+    }, 15000);
+
+    it('stops polling when a Windows install succeeds but waits for a restart', async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      let done = false;
+      mockInstall({
+        poll: () => load(done ? { ...patch, awaitingRestart: { installedAt: '2026-10-28T10:00:00.000Z' } } : patch),
+        commandStatus: () => (done ? 'completed' : 'sent'),
+      });
+
+      render(<DevicePatchStatusTab deviceId={deviceId} osType="windows" />);
+      await clickRowInstall();
+
+      done = true;
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      expect(await screen.findByText(/0 installed, 0 failed, 1 awaiting a restart/)).toBeInTheDocument();
+      expect(screen.queryByText('Polling...')).not.toBeInTheDocument();
+    }, 15000);
+
+    it('stops polling when the install command is cancelled before the device ran it', async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      let status = 'pending';
+      mockInstall({ poll: () => load(patch), commandStatus: () => status });
+
+      render(<DevicePatchStatusTab deviceId={deviceId} osType="windows" />);
+      await clickRowInstall();
+
+      status = 'cancelled';
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      expect(await screen.findByText(/The install command ended \(cancelled\)/)).toBeInTheDocument();
+      expect(screen.queryByText('Polling...')).not.toBeInTheDocument();
+    }, 15000);
+
+    it('waits for the post-install rescan after the command completes, then stops once the patch leaves the pending list', async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      let phase: 'running' | 'completed' | 'rescanned' = 'running';
+      mockInstall({
+        poll: () => (phase === 'rescanned' ? { data: { compliancePercent: 100, pending: [], installed: [] } } : load(patch)),
+        commandStatus: () => (phase === 'running' ? 'sent' : 'completed'),
+      });
+
+      render(<DevicePatchStatusTab deviceId={deviceId} osType="windows" />);
+      await clickRowInstall();
+
+      phase = 'completed';
+      await vi.advanceTimersByTimeAsync(5_000);
+      // Command done, rescan not in yet: still polling rather than reporting a non-result.
+      expect(screen.getByText('Polling...')).toBeInTheDocument();
+
+      phase = 'rescanned';
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      expect(await screen.findByText(/1 patch\(es\) installed successfully/)).toBeInTheDocument();
+      expect(screen.queryByText('Polling...')).not.toBeInTheDocument();
+    }, 15000);
+
+    it('reports a mixed batch from the bulk install button once every targeted patch has an outcome', async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      const second = { ...patch, id: 'kb-2', title: 'Security Update (KB5050002)' };
+      let done = false;
+      mockInstall({
+        poll: () => (done
+          ? load({ ...patch, installFailure: { deviceCount: 1, error: 'installer exited 1603', failedAt: '2026-10-28T10:00:00.000Z' } })
+          : { data: { compliancePercent: 0, pending: [patch, second], installed: [] } }),
+        commandStatus: () => (done ? 'failed' : 'sent'),
+      });
+
+      render(<DevicePatchStatusTab deviceId={deviceId} osType="windows" />);
+      fireEvent.click(await screen.findByRole('button', { name: /Install pending Windows patches|Install pending OS patches/i }));
+      fireEvent.click(await screen.findByTestId('confirm-install-patches'));
+      await screen.findByText(/Installing patches/i);
+      const installCall = fetchWithAuthMock.mock.calls.find(([url]) => String(url).includes('/patches/install'));
+      expect(JSON.parse(String((installCall?.[1] as RequestInit | undefined)?.body)).patchIds).toEqual(['kb-1', 'kb-2']);
+
+      done = true;
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      expect(await screen.findByText(/1 installed, 1 failed, 0 awaiting a restart, 0 not yet confirmed/)).toBeInTheDocument();
+      expect(screen.queryByText('Polling...')).not.toBeInTheDocument();
+    }, 15000);
+
+    it('does not read a response without a pending list as a successful install', async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      let broken = false;
+      mockInstall({ poll: () => (broken ? { data: {} } : load(patch)), commandStatus: () => 'sent' });
+
+      render(<DevicePatchStatusTab deviceId={deviceId} osType="windows" />);
+      await clickRowInstall();
+
+      broken = true;
+      const callsBeforeTick = fetchWithAuthMock.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(5_000);
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      // Stopping would end with a full (non-poll) reload of the patch list.
+      const callsAfter = fetchWithAuthMock.mock.calls.slice(callsBeforeTick).map(([url]) => String(url));
+      expect(callsAfter).toContain(`/devices/${deviceId}/patches?approvalView=0`);
+      expect(callsAfter).not.toContain(`/devices/${deviceId}/patches`);
+      expect(screen.getByText('Polling...')).toBeInTheDocument();
+      expect(screen.queryByText(/installed successfully/)).not.toBeInTheDocument();
+    }, 15000);
+
+    it('stops and says so when the patch list keeps failing to load', async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      let failing = false;
+      mockInstall({ poll: () => load(patch), commandStatus: () => 'sent' });
+      const base = fetchWithAuthMock.getMockImplementation()!;
+      fetchWithAuthMock.mockImplementation(async (url: string, init?: RequestInit) => (
+        failing && url.includes('approvalView=0') ? makeJsonResponse({ error: 'boom' }, false, 503) : base(url, init)
+      ));
+
+      render(<DevicePatchStatusTab deviceId={deviceId} osType="windows" />);
+      await clickRowInstall();
+
+      failing = true;
+      await vi.advanceTimersByTimeAsync(25_000);
+      expect(screen.getByText('Polling...')).toBeInTheDocument();
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      expect(await screen.findByText(/Could not check the install status/)).toBeInTheDocument();
+      expect(screen.queryByText('Polling...')).not.toBeInTheDocument();
+    }, 15000);
+  });
 });

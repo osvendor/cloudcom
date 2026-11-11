@@ -20,7 +20,10 @@ const { state } = vi.hoisted(() => ({
     // #6689: where-conditions of the reopen re-read, and an optional override
     // of the rows it returns (null = serve selectRows like any other select).
     reopenRereads: [] as unknown[],
-    reopenRereadRows: null as unknown[] | null
+    reopenRereadRows: null as unknown[] | null,
+    // Test hook: force an insert into `table` to throw (optionally with a pg `code`),
+    // to exercise the durable-failed-row insert itself failing.
+    failInsert: null as { table: string; code?: string; message?: string; wrapped?: boolean } | null
   }
 }));
 
@@ -150,6 +153,19 @@ vi.mock('../../db', () => {
     const table = tableName(tbl);
     return {
       values(values: Record<string, unknown>) {
+        if (state.failInsert && state.failInsert.table === table) {
+          const e = new Error(state.failInsert.message ?? 'insert failed') as Error & { code?: string; cause?: unknown };
+          if (state.failInsert.code) {
+            if (state.failInsert.wrapped) {
+              // Production shape: postgres-js error wrapped by DrizzleQueryError — the
+              // SQLSTATE is on `.cause.code`, and the top-level error has no `.code`.
+              e.cause = { code: state.failInsert.code };
+            } else {
+              e.code = state.failInsert.code;
+            }
+          }
+          throw e;
+        }
         state.inserts.push({ table, values });
         return {
           returning() {
@@ -196,10 +212,11 @@ vi.mock('../../db/schema', () => ({
     deletedAt: 'deletedAt', submittedBy: 'submittedBy', requesterContactId: 'requesterContactId',
     assignedTo: 'assignedTo', submitterEmail: 'submitterEmail'
   },
-  users: { __t: 'users', id: 'id', email: 'email' },
+  users: { __t: 'users', id: 'id', email: 'email', partnerId: 'partnerId', orgId: 'orgId', status: 'status' },
+  partnerUsers: { __t: 'partner_users', userId: 'userId', partnerId: 'partnerId', orgAccess: 'orgAccess', orgIds: 'orgIds' },
   ticketComments: { __t: 'ticket_comments', ticketId: 'ticketId' },
   portalUsers: { __t: 'portal_users', id: 'id', orgId: 'orgId', email: 'email' },
-  organizations: { __t: 'organizations', id: 'id', partnerId: 'partnerId' },
+  organizations: { __t: 'organizations', id: 'id', partnerId: 'partnerId', status: 'status', type: 'type', deletedAt: 'deletedAt' },
   partners: { __t: 'partners', id: 'id', status: 'status' },
   ticketMailboxConnections: {
     __t: 'ticket_mailbox_connections', id: 'id', partnerId: 'partnerId', tenantId: 'tenantId',
@@ -237,13 +254,25 @@ vi.mock('./resolveOrg', () => ({
   loadPartnerInboundPolicy: loadPolicyMock
 }));
 
-const { createTicketMock, changeStatusMock } = vi.hoisted(() => ({
+const { createTicketMock, changeStatusMock, assignTicketMock, TicketServiceErrorMock } = vi.hoisted(() => ({
+  assignTicketMock: vi.fn(),
+  // Stand-in for ticketService's error class: the default-assignee step
+  // recognizes an eligibility refusal by instanceof + code.
+  TicketServiceErrorMock: class TicketServiceError extends Error {
+    constructor(message: string, public status = 400, public code?: string) {
+      super(message);
+    }
+  },
   createTicketMock: vi.fn(),
   changeStatusMock: vi.fn()
 }));
 vi.mock('../ticketService', () => ({
   createTicket: createTicketMock,
-  changeTicketStatus: changeStatusMock
+  changeTicketStatus: changeStatusMock,
+  assignTicket: assignTicketMock,
+  TicketServiceError: TicketServiceErrorMock,
+  // #8326 — emailComments writes the reply's ticket.commented outbox row through it.
+  writeTicketCommentedOutbox: vi.fn(),
 }));
 
 const { emitMock } = vi.hoisted(() => ({ emitMock: vi.fn() }));
@@ -287,7 +316,19 @@ vi.mock('../ticketEmailLinks', async () => {
   };
 });
 
-import { processInboundEmail } from './inboundEmailService';
+// #8972 W0: ticket-child writers lock the ticket row first; these select mocks have
+// no .for(), so the helper is stubbed and its call is asserted below.
+const { lockTicketForWriteMock } = vi.hoisted(() => ({
+  lockTicketForWriteMock: vi.fn(async (_tx: unknown, id: string) => ({
+    id, orgId: 'org-1', partnerId: '22222222-2222-4222-8222-222222222222', status: 'open', deletedAt: null, workKind: 'support',
+  })),
+}));
+vi.mock('../ticketRowLock', () => ({
+  lockTicketForWrite: lockTicketForWriteMock,
+  lockTicketsForWrite: vi.fn(async () => new Map()),
+}));
+
+import { processInboundEmail, InboundEmailProcessingRecorded } from './inboundEmailService';
 import type { NormalizedInboundEmail } from './types';
 
 function email(overrides: Partial<NormalizedInboundEmail> = {}): NormalizedInboundEmail {
@@ -324,9 +365,12 @@ beforeEach(() => {
   state.insertedCommentId = 'c-1';
   state.reopenRereads = [];
   state.reopenRereadRows = null;
+  state.failInsert = null;
   resolveMock.mockReset();
   createTicketMock.mockReset();
   changeStatusMock.mockReset();
+  assignTicketMock.mockReset();
+  assignTicketMock.mockResolvedValue({});
   emitMock.mockReset();
   maybeSendAutoresponseMock.mockReset();
   captureExceptionMock.mockReset();
@@ -348,6 +392,7 @@ beforeEach(() => {
 
 describe('processInboundEmail', () => {
   const mailboxGeneration = {
+    provider: 'm365' as const,
     connectionId: '44444444-4444-4444-8444-444444444444',
     partnerId: '22222222-2222-4222-8222-222222222222',
     tenantId: '11111111-1111-4111-8111-111111111111',
@@ -358,7 +403,7 @@ describe('processInboundEmail', () => {
     state.selectRows['ticket_mailbox_connections'] = [];
 
     await processInboundEmail(
-      email({ provider: 'm365', resolvedPartnerId: mailboxGeneration.partnerId }),
+      email({ provider: 'm365' as const, resolvedPartnerId: mailboxGeneration.partnerId }),
       mailboxGeneration,
     );
 
@@ -369,7 +414,7 @@ describe('processInboundEmail', () => {
 
   it('fails closed for an M365 job with no mailbox generation', async () => {
     await processInboundEmail(email({
-      provider: 'm365',
+      provider: 'm365' as const,
       resolvedPartnerId: mailboxGeneration.partnerId,
     }));
 
@@ -385,7 +430,7 @@ describe('processInboundEmail', () => {
     state.selectRows['portal_users'] = [];
 
     await processInboundEmail(
-      email({ provider: 'm365', resolvedPartnerId: 'untrusted-payload-partner' }),
+      email({ provider: 'm365' as const, resolvedPartnerId: 'untrusted-payload-partner' }),
       mailboxGeneration,
     );
 
@@ -472,6 +517,9 @@ describe('processInboundEmail', () => {
 
     await processInboundEmail(email({ inReplyTo: '<msg-1@tickets.example.com>' }));
 
+    // #8972 W0: the email-authored comment writer locked the ticket row first
+    expect(lockTicketForWriteMock).toHaveBeenCalledWith(expect.anything(), 't-1');
+
     // public inbound comment inserted directly into ticket_comments
     const comments = state.inserts.filter((i) => i.table === 'ticket_comments').map((i) => i.values);
     expect(comments).toHaveLength(1);
@@ -490,7 +538,7 @@ describe('processInboundEmail', () => {
       't-1',
       { status: 'open' },
       {},
-      expect.objectContaining({ principalKind: 'system', name: 'Inbound Email' })
+      expect.objectContaining({ kind: 'system', source: 'inbound_email', name: 'Inbound Email' })
     );
     const ticketUpdates = state.updates.filter((u) => u.table === 'tickets');
     expect(ticketUpdates.some((u) => 'status' in u.set || 'resolvedAt' in u.set)).toBe(false);
@@ -638,7 +686,10 @@ describe('processInboundEmail', () => {
       emailThreadKey: '<msg-1@tickets.example.com>', internalNumber: 'T-2026-0001'
     }];
 
-    await processInboundEmail(email({ inReplyTo: '<msg-1@tickets.example.com>' }));
+    // The error path now THROWS the recorded-failure sentinel (after writing the
+    // durable failed row) so the outer work tx rolls back; the worker swallows it.
+    await expect(processInboundEmail(email({ inReplyTo: '<msg-1@tickets.example.com>' })))
+      .rejects.toBeInstanceOf(InboundEmailProcessingRecorded);
 
     // NO comment appended, NO reopen
     expect(state.inserts.filter((i) => i.table === 'ticket_comments')).toHaveLength(0);
@@ -671,6 +722,8 @@ describe('processInboundEmail', () => {
     expect(input.submitterEmail).toBe('jane@customer.com');
     expect(input.orgId).toBe('o-1');
     expect(input.submittedBy).toBe('pu-1');
+    // #8883 W5: a fresh create is not a continuation, so routing runs.
+    expect(input).not.toHaveProperty('continuationOfTicketId');
 
     const log = inboundOf();
     expect(log).toHaveLength(1);
@@ -720,6 +773,8 @@ describe('processInboundEmail', () => {
     expect(createTicketMock).toHaveBeenCalledTimes(1);
     // A reply to a CLOSED ticket spawns a linked ticket but is NOT a fresh acknowledgement.
     expect(maybeSendAutoresponseMock).not.toHaveBeenCalled();
+    // #8883 W5 (Gate B14): explicit continuation provenance, so createTicket skips routing.
+    expect((createTicketMock.mock.calls[0]![0] as Record<string, unknown>).continuationOfTicketId).toBe('t-closed');
   });
 
   it('stamps a stable generated anchor on email_thread_key when the inbound email has no Message-Id', async () => {
@@ -857,6 +912,19 @@ describe('processInboundEmail', () => {
     expect(captureMessageMock).not.toHaveBeenCalled();
   });
 
+  it('names the source consulted in the quarantine reason without alerting Sentry (#10862)', async () => {
+    resolveMock.mockResolvedValue('p-1');
+    await processInboundEmail(email({
+      senderAuth: { spf: 'fail', dkim: 'fail', dmarc: 'fail', verified: false },
+      senderAuthConsulted: 'Exchange Online stamp: dmarc=fail',
+    }));
+
+    const log = inboundOf();
+    expect(log[0]!.parseStatus).toBe('quarantined');
+    expect(log[0]!.error).toBe('unverified sender (SPF/DKIM/DMARC): Exchange Online stamp: dmarc=fail');
+    expect(captureMessageMock).not.toHaveBeenCalled();
+  });
+
   it('creates a NEW linked ticket when the matched ticket is closed', async () => {
     resolveMock.mockResolvedValue('p-1');
     state.selectRows['ticket_email_inbound'] = [];
@@ -945,7 +1013,17 @@ describe('processInboundEmail', () => {
 
   // TEST 2 — durable failed-log path: when a WORK write throws, logInboundFailedDurable
   // still commits a `failed` row in a fresh transaction (the prior commit's key fix).
-  it('durable-fail: when createTicket throws, a failed row is still written, sentry is called, and the function resolves', async () => {
+  it('a failure BEFORE partner resolution rethrows for a BullMQ retry and writes no partner-less failed row', async () => {
+    const transient = new Error('recipient lookup timed out');
+    resolveMock.mockRejectedValue(transient);
+
+    await expect(processInboundEmail(email({ subject: 'No partner yet' }))).rejects.toBe(transient);
+    // No partner_id NULL row: no partner-scoped review queue could ever show it.
+    expect(inboundOf().filter((r) => r.parseStatus === 'failed')).toHaveLength(0);
+    expect(captureExceptionMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('durable-fail: when createTicket throws, a failed row is still written, sentry is called, and it throws the recorded-failure sentinel (rolls back partial work)', async () => {
     resolveMock.mockResolvedValue('p-1');
     state.selectRows['ticket_email_inbound'] = []; // no dup
     state.selectRows['tickets'] = []; // no thread match
@@ -957,8 +1035,11 @@ describe('processInboundEmail', () => {
     const dbError = new Error('deadlock detected');
     createTicketMock.mockRejectedValue(dbError);
 
-    // (c) Must NOT rethrow — processInboundEmail resolves even when work throws.
-    await expect(processInboundEmail(email({ subject: 'Will fail' }))).resolves.toBeUndefined();
+    // (c) Throws the recorded-failure sentinel so the outer tx rolls back the
+    // partial work; the durable failed row (below) is the terminal record and the
+    // worker swallows this so BullMQ does not retry.
+    await expect(processInboundEmail(email({ subject: 'Will fail' })))
+      .rejects.toBeInstanceOf(InboundEmailProcessingRecorded);
 
     // (a) A ticket_email_inbound insert with parseStatus: 'failed' was still captured
     // (the durable path ran — logInboundFailedDurable opens a fresh context via the
@@ -975,6 +1056,54 @@ describe('processInboundEmail', () => {
     expect((captureExceptionMock.mock.calls[0]![0] as Error).message).toContain('deadlock');
   });
 
+  it('#8972: a ticket merged under the match is retried (BullMQ), not recorded as a terminal failed row', async () => {
+    resolveMock.mockResolvedValue('p-1');
+    state.selectRows['ticket_email_inbound'] = [];
+    state.selectRows['tickets'] = [];
+    state.selectRows['portal_users'] = [{ id: 'pu-1', orgId: 'o-1' }];
+    state.selectRows['organizations'] = [{ id: 'o-1' }];
+    const { TicketMergedError } = await import('../ticketMerge/errors');
+    const merged = new TicketMergedError('t-src', 't-survivor');
+    createTicketMock.mockRejectedValue(merged);
+
+    await expect(processInboundEmail(email({ subject: 'Raced a merge' }))).rejects.toBe(merged);
+    expect(inboundOf().filter((r) => r.parseStatus === 'failed')).toEqual([]);
+    expect(captureExceptionMock).not.toHaveBeenCalled();
+  });
+
+  it('when the durable failed-row insert ALSO fails, it throws the ORIGINAL error (not the sentinel) so BullMQ retries — no silent ack', async () => {
+    resolveMock.mockResolvedValue('p-1');
+    state.selectRows['ticket_email_inbound'] = [];
+    state.selectRows['tickets'] = [];
+    state.selectRows['portal_users'] = [{ id: 'pu-1', orgId: 'o-1' }];
+    state.selectRows['organizations'] = [{ id: 'o-1' }];
+    createTicketMock.mockRejectedValue(new Error('deadlock detected'));
+    // The terminal failed-row insert itself fails (e.g. DB down) — not a 23505.
+    state.failInsert = { table: 'ticket_email_inbound', message: 'connection refused' };
+
+    // Must NOT throw the swallow-me sentinel (that would make the worker ack the job
+    // and drop the message unrecorded). Throws the original processing error instead.
+    await expect(processInboundEmail(email({ subject: 'double fault' })))
+      .rejects.not.toBeInstanceOf(InboundEmailProcessingRecorded);
+    await expect(processInboundEmail(email({ subject: 'double fault' })))
+      .rejects.toThrow('deadlock detected');
+  });
+
+  it('treats a 23505 on the failed-row insert as already-recorded (throws the sentinel — a concurrent retry logged it)', async () => {
+    resolveMock.mockResolvedValue('p-1');
+    state.selectRows['ticket_email_inbound'] = [];
+    state.selectRows['tickets'] = [];
+    state.selectRows['portal_users'] = [{ id: 'pu-1', orgId: 'o-1' }];
+    state.selectRows['organizations'] = [{ id: 'o-1' }];
+    createTicketMock.mockRejectedValue(new Error('deadlock detected'));
+    // Production shape: the 23505 is WRAPPED by DrizzleQueryError (code on .cause.code,
+    // none on the top-level error). isPgUniqueViolation must still recognize it.
+    state.failInsert = { table: 'ticket_email_inbound', code: '23505', message: 'duplicate key', wrapped: true };
+
+    await expect(processInboundEmail(email({ subject: 'concurrent retry' })))
+      .rejects.toBeInstanceOf(InboundEmailProcessingRecorded);
+  });
+
   // TEST 3 — org-not-in-partner guard: when the portal-user's org is not in the
   // resolved partner, createFromEmail throws and the outcome is a durable `failed` row.
   it('org-not-in-partner guard: returns failed with "not in partner" error and no ticket created', async () => {
@@ -986,7 +1115,8 @@ describe('processInboundEmail', () => {
     // The org guard in createFromEmail: organizations select returns [] (org not in partner).
     state.selectRows['organizations'] = [];
 
-    await expect(processInboundEmail(email({ subject: 'Org mismatch test' }))).resolves.toBeUndefined();
+    await expect(processInboundEmail(email({ subject: 'Org mismatch test' })))
+      .rejects.toBeInstanceOf(InboundEmailProcessingRecorded);
 
     // No ticket was created.
     expect(createTicketMock).not.toHaveBeenCalled();
@@ -1251,7 +1381,7 @@ describe('processInboundEmail', () => {
     expect(comments[0]!.authorName).toBe('Jane Stored-Name');
 
     const ticketUpdates = state.updates.filter((u) => u.table === 'tickets');
-    expect(changeStatusMock).toHaveBeenCalledWith('t-1', { status: 'open' }, {}, expect.objectContaining({ principalKind: 'system' }));
+    expect(changeStatusMock).toHaveBeenCalledWith('t-1', { status: 'open' }, {}, expect.objectContaining({ kind: 'system', source: 'inbound_email' }));
     expect(ticketUpdates.some((u) => 'status' in u.set)).toBe(false);
 
     const log = inboundOf();
@@ -1576,6 +1706,7 @@ describe('processInboundEmail — inbound enabled master switch (#3597)', () => 
 
   it('gates the M365 poll path too (the flag is per-partner, not per-transport)', async () => {
     const mailboxGeneration = {
+      provider: 'm365' as const,
       connectionId: '44444444-4444-4444-8444-444444444444',
       partnerId: '22222222-2222-4222-8222-222222222222',
       tenantId: '11111111-1111-4111-8111-111111111111',
@@ -1585,7 +1716,7 @@ describe('processInboundEmail — inbound enabled master switch (#3597)', () => 
     loadPolicyMock.mockResolvedValue(disabled);
 
     await processInboundEmail(
-      email({ provider: 'm365', resolvedPartnerId: mailboxGeneration.partnerId }),
+      email({ provider: 'm365' as const, resolvedPartnerId: mailboxGeneration.partnerId }),
       mailboxGeneration,
     );
 
@@ -1980,5 +2111,336 @@ describe('processInboundEmail — inbound attachments (#6688)', () => {
     expect((createTicketMock.mock.calls[0]![0] as { description: string }).description).toBe('It is broken.');
     expect(state.inserts.filter((i) => i.table === 'ticket_attachments')).toHaveLength(0);
     expect(state.inserts.filter((i) => i.table === 'ticket_comments')).toHaveLength(0);
+  });
+});
+
+describe('staff-forward intake', () => {
+  // Staff-forward routing runs only for connected Gmail mailboxes.
+  const gmail = (o: Partial<NormalizedInboundEmail> = {}) => email({ provider: 'gmail', resolvedPartnerId: 'p-1', ...o });
+  // Mailbox providers (gmail, m365) are processed only under their mailbox
+  // generation; the native Mailgun address takes none.
+  const ingest = (n: NormalizedInboundEmail) => processInboundEmail(n, n.provider === 'gmail' || n.provider === 'm365'
+    ? {
+      provider: n.provider,
+      connectionId: '44444444-4444-4444-8444-444444444444',
+      partnerId: 'p-1',
+      tenantId: n.provider === 'm365' ? '11111111-1111-4111-8111-111111111111' : null,
+      consentAttemptId: '66666666-6666-4666-8666-666666666666',
+    }
+    : undefined);
+  const forwardBody = [
+    'Can you look at this?',
+    '',
+    '---------- Forwarded message ---------',
+    'From: Jane Client <jane@client.example>',
+    'Date: Sun, Sep 20, 2026 at 1:00 PM',
+    'Subject: Printer down',
+    '',
+    'Our printer stopped working.',
+  ].join('\n');
+
+  beforeEach(() => {
+    state.selectRows['ticket_email_inbound'] = [];
+    state.selectRows['tickets'] = [];
+    state.selectRows['portal_users'] = [];
+    state.selectRows['ticket_mailbox_connections'] = [{ id: '44444444-4444-4444-8444-444444444444' }];
+    // The outer sender is partner-level staff of this partner with access to
+    // every org. The users/partner_users join is served from the 'users' key.
+    state.selectRows['users'] = [{ orgAccess: 'all', orgIds: null }];
+    resolveMock.mockResolvedValue('p-1');
+    resolveRequesterMock.mockReset();
+    loadPolicyMock.mockResolvedValue({
+      enabled: true, unknownSenderMode: 'quarantine', defaultTriageOrgId: null,
+      dropUnverifiedSenders: false, staffForwardRouting: true,
+    });
+  });
+
+  it('routes a staff forward by the ORIGINAL sender domain, with no autoresponse and no contact', async () => {
+    state.selectRows['organizations'] = [{ id: 'o-client' }];
+    resolveOrgMock.mockImplementation(async (addr: string) =>
+      addr.endsWith('@client.example') ? { orgId: 'o-client', autoCreateContact: true } : { orgId: 'o-msp', autoCreateContact: true });
+
+    await ingest(gmail({ from: 'tech@msp.example', text: forwardBody, forwardScanText: forwardBody }));
+
+    expect(createTicketMock).toHaveBeenCalledTimes(1);
+    const input = createTicketMock.mock.calls[0]![0] as Record<string, unknown>;
+    expect(input.orgId).toBe('o-client');
+    expect(input.requesterContactId ?? null).toBeNull();
+    expect(resolveRequesterMock).not.toHaveBeenCalled();
+    expect(maybeSendAutoresponseMock).not.toHaveBeenCalled();
+    expect(String(inboundOf()[0]!.error ?? inboundOf()[0]!.note ?? JSON.stringify(inboundOf()[0]))).toContain('staff-forward');
+  });
+
+  it('does not scan HTML-only mail: an HTML-only staff forward routes normally by sender', async () => {
+    state.selectRows['organizations'] = [{ id: 'o-msp' }];
+    resolveOrgMock.mockImplementation(async (addr: string) =>
+      addr.endsWith('@client.example') ? { orgId: 'o-client', autoCreateContact: false } : { orgId: 'o-msp', autoCreateContact: false });
+    const html = forwardBody.split('\n').map((l) => `<div>${l.replace(/</g, '&lt;').replace(/>/g, '&gt;') || '<br>'}</div>`).join('');
+
+    // A normalized message with no text and no forwardScanText (the provider
+    // normalizers' HTML-only shapes are covered in their own suites).
+    await ingest(gmail({ from: 'tech@msp.example', text: '', html }));
+    // Gmail/Graph shape, or an older producer: text present, no forwardScanText.
+    await ingest(gmail({ from: 'tech@msp.example', text: forwardBody, html, providerMessageId: 'pm-2', messageId: '<pm-2@msp.example>' }));
+
+    expect(createTicketMock).toHaveBeenCalledTimes(2);
+    for (const call of createTicketMock.mock.calls) {
+      expect((call[0] as Record<string, unknown>).orgId).toBe('o-msp');
+    }
+    expect(resolveOrgMock).not.toHaveBeenCalledWith('jane@client.example', expect.anything());
+  });
+
+  it('routes by the original sender even when the staff forwarder has a portal login', async () => {
+    state.selectRows['portal_users'] = [{ id: 'pu-staff', orgId: 'o-msp' }];
+    state.selectRows['organizations'] = [{ id: 'o-client' }];
+    resolveOrgMock.mockImplementation(async (addr: string) =>
+      addr.endsWith('@client.example') ? { orgId: 'o-client', autoCreateContact: true } : null);
+
+    await ingest(gmail({ from: 'tech@msp.example', text: forwardBody, forwardScanText: forwardBody }));
+
+    const input = createTicketMock.mock.calls[0]![0] as Record<string, unknown>;
+    expect(input.orgId).toBe('o-client');
+    expect(input.submittedBy ?? null).toBeNull();
+    expect(maybeSendAutoresponseMock).not.toHaveBeenCalled();
+  });
+
+  it('ignores a forwarded block when the outer sender is not partner staff (ordinary routing)', async () => {
+    state.selectRows['users'] = [];
+    state.selectRows['organizations'] = [{ id: 'o-other' }];
+    resolveOrgMock.mockImplementation(async (addr: string) =>
+      addr.endsWith('@client.example') ? { orgId: 'o-client', autoCreateContact: false } : { orgId: 'o-other', autoCreateContact: false });
+
+    await ingest(gmail({ from: 'someone@other.example', text: forwardBody, forwardScanText: forwardBody }));
+
+    const input = createTicketMock.mock.calls[0]![0] as Record<string, unknown>;
+    expect(input.orgId).toBe('o-other');
+  });
+
+  it('is disabled when the partner has not turned staffForwardRouting on (default)', async () => {
+    loadPolicyMock.mockResolvedValue({ enabled: true, unknownSenderMode: 'quarantine', defaultTriageOrgId: null, dropUnverifiedSenders: false, staffForwardRouting: false });
+    state.selectRows['organizations'] = [{ id: 'o-msp' }];
+    resolveOrgMock.mockImplementation(async (addr: string) =>
+      addr.endsWith('@client.example') ? { orgId: 'o-client', autoCreateContact: false } : { orgId: 'o-msp', autoCreateContact: false });
+
+    await ingest(gmail({ from: 'tech@msp.example', text: forwardBody, forwardScanText: forwardBody }));
+
+    const input = createTicketMock.mock.calls[0]![0] as Record<string, unknown>;
+    expect(input.orgId).toBe('o-msp');
+  });
+
+  it('does not reroute a forward whose original sender is on the forwarder\'s own domain', async () => {
+    state.selectRows['organizations'] = [{ id: 'o-msp' }];
+    resolveOrgMock.mockResolvedValue({ orgId: 'o-msp', autoCreateContact: false });
+    const internal = forwardBody.replace('jane@client.example', 'colleague@msp.example');
+
+    await ingest(gmail({ from: 'tech@msp.example', text: internal, forwardScanText: internal }));
+
+    expect(resolveOrgMock).not.toHaveBeenCalledWith('colleague@msp.example', expect.anything());
+    expect(String(inboundOf()[0]!.error ?? '')).not.toContain('staff-forward');
+  });
+
+  it('gives no forward routing to a sender who is not active partner-level staff of THIS partner', async () => {
+    // A customer-org user, a disabled user, or a user of another partner: the
+    // staff query returns nothing (its predicates are proven in the integration suite).
+    state.selectRows['users'] = [];
+    state.selectRows['organizations'] = [{ id: 'o-msp' }];
+    resolveOrgMock.mockImplementation(async (addr: string) =>
+      addr.endsWith('@client.example') ? { orgId: 'o-client', autoCreateContact: false } : { orgId: 'o-msp', autoCreateContact: false });
+
+    await ingest(gmail({ from: 'tech@msp.example', text: forwardBody, forwardScanText: forwardBody }));
+
+    expect((createTicketMock.mock.calls[0]![0] as Record<string, unknown>).orgId).toBe('o-msp');
+    expect(resolveOrgMock).not.toHaveBeenCalledWith('jane@client.example', expect.anything());
+  });
+
+  it('never applies to a staff forward that fails sender authentication (quarantined first)', async () => {
+    resolveOrgMock.mockResolvedValue({ orgId: 'o-client', autoCreateContact: false });
+
+    await ingest(gmail({
+      from: 'tech@msp.example', text: forwardBody, forwardScanText: forwardBody,
+      senderAuth: { spf: 'fail', dkim: 'fail', dmarc: 'fail', verified: false },
+    }));
+
+    expect(createTicketMock).not.toHaveBeenCalled();
+    expect(inboundOf()[0]!.parseStatus).toBe('quarantined');
+  });
+
+  it('threads a staff forward that replies on an existing ticket instead of creating one', async () => {
+    resolveOrgMock.mockResolvedValue({ orgId: 'o-client', autoCreateContact: false });
+    state.selectRows['tickets'] = [{
+      id: 't-1', partnerId: 'p-1', orgId: 'o-1', status: 'open',
+      emailThreadKey: '<msg-1@tickets.example.com>', internalNumber: 'T-2026-0001'
+    }];
+    state.selectRows['portal_users'] = [{ id: 'pu-1', orgId: 'o-1' }];
+
+    await ingest(gmail({
+      from: 'tech@msp.example', text: forwardBody, forwardScanText: forwardBody,
+      inReplyTo: '<msg-1@tickets.example.com>',
+    }));
+
+    expect(createTicketMock).not.toHaveBeenCalled();
+    expect(state.inserts.filter((i) => i.table === 'ticket_comments')).toHaveLength(1);
+  });
+
+  it('falls through to ordinary routing when the original domain is unmapped', async () => {
+    state.selectRows['organizations'] = [{ id: 'o-msp' }];
+    resolveOrgMock.mockImplementation(async (addr: string) =>
+      addr.endsWith('@msp.example') ? { orgId: 'o-msp', autoCreateContact: false } : null);
+
+    await ingest(gmail({ from: 'tech@msp.example', text: forwardBody, forwardScanText: forwardBody }));
+
+    const input = createTicketMock.mock.calls[0]![0] as Record<string, unknown>;
+    expect(input.orgId).toBe('o-msp');
+  });
+
+  it('requires the staff member\'s org access to cover the target org', async () => {
+    state.selectRows['organizations'] = [{ id: 'o-msp' }];
+    resolveOrgMock.mockImplementation(async (addr: string) =>
+      addr.endsWith('@client.example') ? { orgId: 'o-client', autoCreateContact: false } : { orgId: 'o-msp', autoCreateContact: false });
+
+    // Limited to other orgs: routes normally by the forwarder.
+    state.selectRows['users'] = [{ orgAccess: 'selected', orgIds: ['o-other'] }];
+    await ingest(gmail({ from: 'tech@msp.example', text: forwardBody, forwardScanText: forwardBody }));
+    // No org access at all: routes normally.
+    state.selectRows['users'] = [{ orgAccess: 'none', orgIds: null }];
+    await ingest(gmail({
+      from: 'tech@msp.example', text: forwardBody, forwardScanText: forwardBody,
+      providerMessageId: 'pm-none', messageId: '<pm-none@msp.example>',
+    }));
+    // Selected orgs that include the target org: re-routed.
+    state.selectRows['users'] = [{ orgAccess: 'selected', orgIds: ['o-client'] }];
+    await ingest(gmail({
+      from: 'tech@msp.example', text: forwardBody, forwardScanText: forwardBody,
+      providerMessageId: 'pm-sel', messageId: '<pm-sel@msp.example>',
+    }));
+
+    expect(createTicketMock.mock.calls.map((c) => (c[0] as Record<string, unknown>).orgId)).toEqual(['o-msp', 'o-msp', 'o-client']);
+  });
+
+  it('never applies to Mailgun or Microsoft 365 mail, even with a forward marker in a plain body', async () => {
+    state.selectRows['organizations'] = [{ id: 'o-msp' }];
+    resolveOrgMock.mockImplementation(async (addr: string) =>
+      addr.endsWith('@client.example') ? { orgId: 'o-client', autoCreateContact: false } : { orgId: 'o-msp', autoCreateContact: false });
+
+    await ingest(email({ provider: 'mailgun', from: 'tech@msp.example', text: forwardBody, forwardScanText: forwardBody }));
+    await ingest(email({
+      provider: 'm365', resolvedPartnerId: 'p-1', from: 'tech@msp.example', text: forwardBody, forwardScanText: forwardBody,
+      providerMessageId: 'pm-m365', messageId: '<pm-m365@msp.example>',
+    }));
+
+    expect(createTicketMock.mock.calls.map((c) => (c[0] as Record<string, unknown>).orgId)).toEqual(['o-msp', 'o-msp']);
+    expect(resolveOrgMock).not.toHaveBeenCalledWith('jane@client.example', expect.anything());
+  });
+});
+
+// Partner default assignee (settings.ticketing.inbound.defaultAssigneeUserId).
+// The real applyDefaultInboundAssignee runs; only ticketService is mocked.
+describe('default inbound assignee', () => {
+  const DEFAULT_USER = '77777777-7777-4777-8777-777777777777';
+
+  beforeEach(() => {
+    resolveMock.mockResolvedValue('p-1');
+    state.selectRows['ticket_email_inbound'] = [];
+    state.selectRows['tickets'] = [];
+    state.selectRows['portal_users'] = [{ id: 'pu-1', orgId: 'o-1' }];
+    state.selectRows['organizations'] = [{ id: 'o-1' }];
+    createTicketMock.mockResolvedValue({ id: 't-new', internalNumber: 'T-2026-0009', assignedTo: null });
+    loadPolicyMock.mockResolvedValue({
+      enabled: true, unknownSenderMode: 'quarantine', defaultTriageOrgId: null,
+      dropUnverifiedSenders: false, staffForwardRouting: false, defaultAssigneeUserId: DEFAULT_USER,
+    });
+  });
+
+  it('assigns a newly created ticket to the default assignee as the system actor', async () => {
+    await processInboundEmail(email({ subject: 'brand new issue' }));
+
+    expect(createTicketMock).toHaveBeenCalledTimes(1);
+    // The ticket is created unassigned and then assigned through assignTicket,
+    // so the ticket.assigned notification rides the committed outbox row.
+    expect((createTicketMock.mock.calls[0]![0] as Record<string, unknown>).assigneeId).toBeUndefined();
+    expect(assignTicketMock).toHaveBeenCalledTimes(1);
+    const [ticketId, assigneeId, actor] = assignTicketMock.mock.calls[0]!;
+    expect(ticketId).toBe('t-new');
+    expect(assigneeId).toBe(DEFAULT_USER);
+    expect((actor as { kind: string }).kind).toBe('system');
+    const log = inboundOf();
+    expect(log[0]!.parseStatus).toBe('created');
+    expect(String(log[0]!.error ?? '')).not.toContain('default assignee');
+  });
+
+  it('assigns tickets from every create path, including the triage org for an unknown sender', async () => {
+    state.selectRows['portal_users'] = [];
+    loadPolicyMock.mockResolvedValue({
+      enabled: true, unknownSenderMode: 'triage', defaultTriageOrgId: 'o-1',
+      dropUnverifiedSenders: false, staffForwardRouting: false, defaultAssigneeUserId: DEFAULT_USER,
+    });
+
+    await processInboundEmail(email({ from: 'stranger@nowhere.example' }));
+
+    expect(assignTicketMock).toHaveBeenCalledWith('t-new', DEFAULT_USER, expect.objectContaining({ kind: 'system' }));
+  });
+
+  it('does nothing when the partner has no default assignee', async () => {
+    loadPolicyMock.mockResolvedValue({
+      enabled: true, unknownSenderMode: 'quarantine', defaultTriageOrgId: null,
+      dropUnverifiedSenders: false, staffForwardRouting: false, defaultAssigneeUserId: null,
+    });
+
+    await processInboundEmail(email());
+
+    expect(createTicketMock).toHaveBeenCalledTimes(1);
+    expect(assignTicketMock).not.toHaveBeenCalled();
+  });
+
+  it('does not override an assignment the ticket already has', async () => {
+    // Positive control first: an unassigned new ticket does get the default.
+    createTicketMock.mockResolvedValueOnce({ id: 't-unassigned', internalNumber: 'T-2026-0009', assignedTo: null });
+    await processInboundEmail(email({ providerMessageId: '<a@customer.com>', messageId: '<a@customer.com>' }));
+    // A ticket that already carries an assignee keeps it.
+    createTicketMock.mockResolvedValueOnce({ id: 't-owned', internalNumber: 'T-2026-0010', assignedTo: 'someone-else' });
+    await processInboundEmail(email({ providerMessageId: '<b@customer.com>', messageId: '<b@customer.com>' }));
+
+    expect(createTicketMock).toHaveBeenCalledTimes(2);
+    expect(assignTicketMock).toHaveBeenCalledTimes(1);
+    expect(assignTicketMock.mock.calls[0]![0]).toBe('t-unassigned');
+  });
+
+  it('never touches the assignee of an existing ticket a reply threads onto', async () => {
+    // Positive control: a new ticket from the same sender gets the default.
+    await processInboundEmail(email({ providerMessageId: '<new@customer.com>', messageId: '<new@customer.com>' }));
+    expect(assignTicketMock).toHaveBeenCalledTimes(1);
+
+    state.selectRows['tickets'] = [{
+      id: 't-live', partnerId: 'p-1', orgId: 'o-1', status: 'open', assignedTo: null,
+      emailThreadKey: '<thread-live>', internalNumber: 'T-2026-0002',
+    }];
+    await processInboundEmail(email({ inReplyTo: '<thread-live>', providerMessageId: '<r@customer.com>', messageId: '<r@customer.com>' }));
+
+    expect(createTicketMock).toHaveBeenCalledTimes(1);
+    expect(assignTicketMock).toHaveBeenCalledTimes(1);
+    expect(inboundOf().map((r) => r.parseStatus)).toEqual(['created', 'matched']);
+  });
+
+  it.each(['ASSIGNEE_NOT_FOUND', 'ASSIGNEE_WRONG_PARTNER', 'ASSIGNEE_NOT_ELIGIBLE'])(
+    'keeps the ticket, unassigned, and records why when the default assignee is refused (%s)',
+    async (code) => {
+      assignTicketMock.mockRejectedValue(new TicketServiceErrorMock('refused', 400, code));
+
+      await processInboundEmail(email());
+
+      const log = inboundOf();
+      expect(log).toHaveLength(1);
+      expect(log[0]!.parseStatus).toBe('created');
+      expect(log[0]!.ticketId).toBe('t-new');
+      expect(String(log[0]!.error)).toContain(`default assignee not applied (${code})`);
+    },
+  );
+
+  it('treats any other assignment error as a processing failure, not a silent skip', async () => {
+    assignTicketMock.mockRejectedValue(new Error('db down'));
+
+    await expect(processInboundEmail(email())).rejects.toBeInstanceOf(InboundEmailProcessingRecorded);
+
+    expect(captureExceptionMock).toHaveBeenCalled();
   });
 });

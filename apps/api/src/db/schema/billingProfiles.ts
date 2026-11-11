@@ -1,4 +1,5 @@
 import { pgTable, uuid, text, char, integer, boolean, numeric, timestamp } from 'drizzle-orm/pg-core';
+import type { AiCoverage } from '@breeze/shared';
 import { partners, organizations } from './orgs';
 import { users } from './users';
 import { supportedCurrencies } from './currency';
@@ -19,6 +20,9 @@ export const billingProfiles = pgTable('billing_profiles', {
   baseCoverage: text('base_coverage').$type<'billable' | 'included' | 'non_billable'>().notNull(),
   baseHourlyRate: numeric('base_hourly_rate', { precision: 10, scale: 2 }),
   baseMinimumMinutes: integer('base_minimum_minutes'),
+  // AI chargeback (#7608). SQL owns the coverage / markup CHECKs (2026-11-26-100000).
+  aiCoverage: text('ai_coverage').$type<AiCoverage>().notNull().default('non_billable'),
+  aiMarkupPercent: numeric('ai_markup_percent', { precision: 7, scale: 2 }),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
 });
@@ -34,6 +38,22 @@ export const billingProfileRules = pgTable('billing_profile_rules', {
   notes: text('notes'),
 });
 
+/** Per-model client AI price list on a card (#7608). Partner-axis; SQL owns the
+ *  composite (billing_profile_id, partner_id) FK, the unique key and the CHECKs
+ *  (2026-11-26-100000), matching billingProfileRules. */
+export const billingProfileAiRates = pgTable('billing_profile_ai_rates', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  partnerId: uuid('partner_id').notNull().references(() => partners.id),
+  billingProfileId: uuid('billing_profile_id').notNull().references(() => billingProfiles.id, { onDelete: 'cascade' }),
+  modelId: text('model_id').notNull(),
+  inputPricePerM: numeric('input_price_per_m', { precision: 14, scale: 6 }).notNull(),
+  outputPricePerM: numeric('output_price_per_m', { precision: 14, scale: 6 }).notNull(),
+  cacheReadPricePerM: numeric('cache_read_price_per_m', { precision: 14, scale: 6 }).notNull(),
+  cacheWritePricePerM: numeric('cache_write_price_per_m', { precision: 14, scale: 6 }).notNull(),
+  notes: text('notes'),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
 export const orgBillingProfileAssignments = pgTable('org_billing_profile_assignments', {
   id: uuid('id').primaryKey().defaultRandom(),
   // SQL owns the DEFERRABLE INITIALLY IMMEDIATE (org_id, partner_id) FK.
@@ -43,6 +63,32 @@ export const orgBillingProfileAssignments = pgTable('org_billing_profile_assignm
   assignedBy: uuid('assigned_by').references(() => users.id),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+/**
+ * Read-only snapshot of the six legacy labour-pricing columns taken by
+ * 2026-10-29-100300-drop-legacy-labour-pricing-columns.sql right before it
+ * dropped them (#4628 W04b, #6472). skip_reason names why the conversion did
+ * not carry a value into a billing profile; NULL means it did. Nothing in the
+ * app writes here after that migration. Partner-axis like
+ * org_billing_profile_assignments; SQL owns the CHECKs, the unique key and the
+ * DEFERRABLE (org_id, partner_id) FK.
+ */
+export const legacyLabourPricingArchive = pgTable('legacy_labour_pricing_archive', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  partnerId: uuid('partner_id').notNull().references(() => partners.id),
+  orgId: uuid('org_id').references(() => organizations.id),
+  sourceTable: text('source_table').$type<'ticket_categories' | 'org_ticket_settings'>().notNull(),
+  sourceId: uuid('source_id').notNull(),
+  sourceName: text('source_name').notNull(),
+  defaultBillable: boolean('default_billable'),
+  defaultHourlyRate: numeric('default_hourly_rate', { precision: 10, scale: 2 }),
+  rateCurrency: char('rate_currency', { length: 3 }),
+  ownerCurrencyCode: char('owner_currency_code', { length: 3 }),
+  skipReason: text('skip_reason').$type<
+    'org_currency_off_list' | 'org_rate_currency_mismatch' | 'non_billable_org_rate' | 'non_billable_category_rate' | 'category_rate_currency_unsupported'
+  >(),
+  archivedAt: timestamp('archived_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
 export type BillingProfile = typeof billingProfiles.$inferSelect;

@@ -5,13 +5,38 @@ const vulnerabilityMocks = vi.hoisted(() => ({
 }));
 
 vi.mock('../db', () => ({ db: { select: vi.fn() } }));
+vi.mock('./backupConnectionFreshness', () => ({ loadBackupConnectionFreshness: vi.fn(async () => new Map([
+  ['connection-1', { isActive: true, lastSyncAt: new Date(), syncIntervalMinutes: 30 }],
+])) }));
 vi.mock('./securityComplianceReportVulnerabilities', () => vulnerabilityMocks);
+// Third-party backup evidence (#6012) has its own module + suite
+// (securityComplianceReportBackupProviders.test.ts); here it is a seam, so the
+// positional db.select sequence below is unchanged by it.
+const backupProviderMocks = vi.hoisted(() => ({
+  loadBackupProviderEvidence: vi.fn(),
+}));
+vi.mock('./securityComplianceReportBackupProviders', () => backupProviderMocks);
+// EDR provider framework (#8164) coverage has its own module + suite
+// (securityComplianceReportEdr.test.ts, securityComplianceReport.edr.test.ts);
+// here it is a seam returning "no EDR", so the positional sequence is unchanged.
+vi.mock('./securityComplianceReportEdr', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./securityComplianceReportEdr')>()),
+  loadEdrDeviceCoverage: vi.fn(async () => new Set<string>()),
+}));
+// The partner approval-security policy is read through loadPartnerPolicy (a
+// system-context partner-axis read), not the positional db.select sequence.
+vi.mock('./authenticatorPolicy', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./authenticatorPolicy')>()),
+  loadPartnerPolicy: vi.fn(),
+}));
 
 import { db } from '../db';
+import { loadPartnerPolicy } from './authenticatorPolicy';
 import {
   generateSecurityCompliancePostureReport as generateSecurityCompliancePostureReportWithAuthority,
 } from './securityComplianceReport';
 import type { OrgReportExecutionAuthority } from './siteScope';
+import { POSTURE_DEVICE_ROW_CSV_LABELS } from '@breeze/shared';
 
 /** Thenable that resolves to `rows` and supports any drizzle chain method. */
 function selectChain(rows: any) {
@@ -88,9 +113,13 @@ function mockGeneratorQueries(over: Partial<Record<number, any[]>> = {}, opts: {
   for (const [i, rows] of Object.entries(over)) {
     if (rows) seq[Number(i) - 1] = rows;
   }
-  // No-partner orgs skip the authenticator_policies query (#15), so drop that slot
-  // to keep the remaining queries aligned with the generator's actual call order.
-  if (opts.noPartner) seq.splice(14, 1);
+  // Slot 15 is served by loadPartnerPolicy, not db.select — drop it from the
+  // positional sequence and hand its first row to the policy loader instead.
+  const [authenticatorPolicyRow] = seq.splice(14, 1)[0] ?? [];
+  vi.mocked(loadPartnerPolicy).mockReset();
+  vi.mocked(loadPartnerPolicy).mockImplementation(async (partnerId) =>
+    partnerId ? ((authenticatorPolicyRow ?? null) as any) : null,
+  );
   const m = vi.mocked(db.select);
   m.mockReset();
   // Fill any sparse holes (e.g. overriding #18 without #17) with [] so every
@@ -102,12 +131,30 @@ function mockGeneratorQueries(over: Partial<Record<number, any[]>> = {}, opts: {
 describe('generateSecurityCompliancePostureReport', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    backupProviderMocks.loadBackupProviderEvidence.mockResolvedValue({ evidence: [], coveredDeviceCount: 0 });
     vulnerabilityMocks.loadOpenVulnerabilityCounts.mockResolvedValue(
       new Map([
         ['dev-1', { high: 2, critical: 1 }],
         ['dev-2', { high: 1, critical: 0 }],
       ]),
     );
+  });
+
+  it('preserves backupConfigured for an org with only native C2C backup', async () => {
+    mockGeneratorQueries({ 8: [], 9: [{ status: 'active', provider: 'm365' }] });
+    const result = await generateSecurityCompliancePostureReport(ORG, {});
+    expect((result.summary as any).controls.backupConfigured).toBe(true);
+  });
+
+  it('keeps endpoint backup unconfigured with provider SaaS evidence alone', async () => {
+    mockGeneratorQueries({ 8: [] });
+    vi.mocked(db.select).mockImplementation(((selection: Record<string, unknown>) => selectChain(selection?.accountType ? [{
+      orgId: ORG, provider: 'dropsuite', portalShowProviderName: true, connectionId: 'connection-1', accountType: 'm365', dataSources: ['m365_mail'],
+      status: 'completed', lastSuccessAt: new Date(), errorsCount: 0,
+    }] : [])) as never);
+    const result = await generateSecurityCompliancePostureReport(ORG, {});
+    expect((result.summary as any).controls.backupConfigured).toBe(false);
+    expect(JSON.stringify(result.summary)).toContain('NinjaOne SaaS Backup (Dropsuite)');
   });
 
   it('places tenant-safe open vulnerability counts into per-device rows', async () => {
@@ -124,6 +171,18 @@ describe('generateSecurityCompliancePostureReport', () => {
     expect(rows['pc-2']).toMatchObject({ openVulnHigh: 1, openVulnCritical: 0 });
   });
 
+  // #9964: the portal CSV header row is labelled from this map, so every
+  // per-device row column needs an entry (and no label may name a dead column).
+  it('emits exactly the per-device columns the CSV label map covers', async () => {
+    mockGeneratorQueries();
+    const result = await generateSecurityCompliancePostureReport(ORG, {});
+    const rows = result.rows as Array<Record<string, unknown>>;
+    expect(rows.length).toBeGreaterThan(0);
+    for (const row of rows) {
+      expect(Object.keys(row).sort()).toEqual(Object.keys(POSTURE_DEVICE_ROW_CSV_LABELS).sort());
+    }
+  });
+
   it('does not query or expose organization-wide posture evidence to a site-restricted caller', async () => {
     const sequences = [
       [{ id: ORG, name: 'Acme Co', partnerId: 'p1' }],
@@ -133,6 +192,7 @@ describe('generateSecurityCompliancePostureReport', () => {
       [], // huntress_agents
       [], // outstanding device patches
       [], // patch-assessed device set
+      [], // backup_jobs device set (backups_verified; no M365 read when restricted)
     ];
     const select = vi.mocked(db.select);
     select.mockReset();
@@ -147,6 +207,9 @@ describe('generateSecurityCompliancePostureReport', () => {
     const summary = result.summary as any;
 
     expect(select).toHaveBeenCalledTimes(sequences.length);
+    // Third-party backup evidence is device-scoped: only the caller's
+    // in-site devices are ever looked up (#6012).
+    expect(backupProviderMocks.loadBackupProviderEvidence).toHaveBeenCalledWith(ORG, ['dev-a']);
     expect(summary.controls).not.toHaveProperty('identityProviderConnected');
     expect(summary.controls).not.toHaveProperty('backupConfigured');
     expect(summary.controls).not.toHaveProperty('dnsFilteringActive');
@@ -163,7 +226,11 @@ describe('generateSecurityCompliancePostureReport', () => {
     expect(byHost['pc-1'].protection).toMatch(/Huntress/i);
     expect(byHost['pc-2'].protectionManaged).toBe(false);
 
-    expect((r.summary as any).controls.edrCoveragePct).toBe(33);
+    // EDR/AV denominators are the assessed devices (spec §19.7): pc-3 has no
+    // status row, agent row or check-in, so it is unknown, not a failure.
+    expect((r.summary as any).controls.edrCoveragePct).toBe(50);
+    expect((r.summary as any).controls.edrUnknownCount).toBe(1);
+    expect((r.summary as any).controls.anyAvUnknownCount).toBe(1);
     expect((r.summary as any).controls.unprotectedCount).toBe(2);
   });
 
@@ -178,8 +245,10 @@ describe('generateSecurityCompliancePostureReport', () => {
     const r = await generateSecurityCompliancePostureReport(ORG, { sites: [] });
     const c = (r.summary as any).controls;
     // Before the fix, elastic_defend normalized to 'other' → dev-2 would be
-    // unprotected (anyAv 33%). Recognized as native AV it joins dev-1 in coverage.
-    expect(c.anyAvCoveragePct).toBe(67);
+    // unprotected. Recognized as native AV it joins dev-1 in coverage; dev-3
+    // (no evidence) is unknown and out of the assessed denominator (spec §19.7).
+    expect(c.anyAvCoveragePct).toBe(100);
+    expect(c.anyAvUnknownCount).toBe(1);
     expect(c.unprotectedCount).toBe(1);
     const byHost = Object.fromEntries((r.rows as any[]).map((x) => [x.hostname, x]));
     expect(byHost['pc-2'].protection).toMatch(/Elastic Defend/i);
@@ -321,6 +390,43 @@ describe('generateSecurityCompliancePostureReport', () => {
     expect(summary.postureScore).toBe(82);
   });
 
+  it('lists a third-party backup provider as a backup product (#6012)', async () => {
+    backupProviderMocks.loadBackupProviderEvidence.mockResolvedValue({
+      evidence: [
+        { product: 'Managed cloud backup', category: 'backup', active: true, lastSyncStatus: null, deviceIds: ['dev-1'] },
+        { product: 'Managed cloud backup', category: 'backup', active: false, lastSyncStatus: null, deviceIds: ['dev-2'] },
+      ],
+      coveredDeviceCount: 1,
+    });
+    mockGeneratorQueries();
+    const summary = (await generateSecurityCompliancePostureReport(ORG, {})).summary as any;
+    expect(summary.securityProducts).toContainEqual({
+      product: 'Managed cloud backup', category: 'backup', active: true, lastSyncStatus: null,
+      deviceCoverage: 2, activeDeviceCoverage: 1,
+    });
+    expect(backupProviderMocks.loadBackupProviderEvidence).toHaveBeenCalledWith(ORG, ['dev-1', 'dev-2', 'dev-3']);
+  });
+
+  it('counts backup as configured from third-party coverage alone', async () => {
+    backupProviderMocks.loadBackupProviderEvidence.mockResolvedValue({
+      evidence: [{ product: 'Managed cloud backup', category: 'backup', active: true, lastSyncStatus: null, deviceIds: ['dev-1'] }],
+      coveredDeviceCount: 1,
+    });
+    mockGeneratorQueries({ 8: [], 9: [] }); // no first-party config, no SaaS backup
+    const summary = (await generateSecurityCompliancePostureReport(ORG, {})).summary as any;
+    expect(summary.controls.backupConfigured).toBe(true);
+  });
+
+  it('does not count backup as configured from a third party with no fresh backup', async () => {
+    backupProviderMocks.loadBackupProviderEvidence.mockResolvedValue({
+      evidence: [{ product: 'Managed cloud backup', category: 'backup', active: false, lastSyncStatus: null, deviceIds: ['dev-1'] }],
+      coveredDeviceCount: 0,
+    });
+    mockGeneratorQueries({ 8: [], 9: [] });
+    const summary = (await generateSecurityCompliancePostureReport(ORG, {})).summary as any;
+    expect(summary.controls.backupConfigured).toBe(false);
+  });
+
   it('summarizes privileged access from PAM tables', async () => {
     mockGeneratorQueries();
     const r = await generateSecurityCompliancePostureReport(ORG, {});
@@ -330,6 +436,33 @@ describe('generateSecurityCompliancePostureReport', () => {
     expect(p.elevationsApproved).toBe(1);
     expect(p.elevationsDenied).toBe(1);
     expect(p.mfaStepUpEnforced).toBe(true);
+  });
+
+  it('reports MFA step-up as not enforced for a partner that explicitly chose "not required"', async () => {
+    const original = process.env.APPROVER_ASSURANCE_DEFAULT_ENFORCE_FROM;
+    try {
+      process.env.APPROVER_ASSURANCE_DEFAULT_ENFORCE_FROM = '2000-01-01';
+      mockGeneratorQueries({ 15: [{ requireEnrollment: false, enforceFrom: null, floorOverrides: {} }] });
+      const r = await generateSecurityCompliancePostureReport(ORG, {});
+      expect((r.summary as any).privilegedAccess.mfaStepUpEnforced).toBe(false);
+      expect(loadPartnerPolicy).toHaveBeenCalledWith('p1');
+    } finally {
+      if (original === undefined) delete process.env.APPROVER_ASSURANCE_DEFAULT_ENFORCE_FROM;
+      else process.env.APPROVER_ASSURANCE_DEFAULT_ENFORCE_FROM = original;
+    }
+  });
+
+  it('reports MFA step-up as enforced for a partner inheriting the platform default after the date', async () => {
+    const original = process.env.APPROVER_ASSURANCE_DEFAULT_ENFORCE_FROM;
+    try {
+      process.env.APPROVER_ASSURANCE_DEFAULT_ENFORCE_FROM = '2000-01-01';
+      mockGeneratorQueries({ 15: [] });
+      const r = await generateSecurityCompliancePostureReport(ORG, {});
+      expect((r.summary as any).privilegedAccess.mfaStepUpEnforced).toBe(true);
+    } finally {
+      if (original === undefined) delete process.env.APPROVER_ASSURANCE_DEFAULT_ENFORCE_FROM;
+      else process.env.APPROVER_ASSURANCE_DEFAULT_ENFORCE_FROM = original;
+    }
   });
 
   it('renders CIS as null (not 0) when no baseline scans exist', async () => {
@@ -384,6 +517,18 @@ describe('generateSecurityCompliancePostureReport', () => {
     const c = (await generateSecurityCompliancePostureReport(ORG, {})).summary!.controls as any;
     expect(c.patchCurrentPct).toBe(50); // dev-1 current, dev-2 has critical pending
     expect(c.patchUnknownCount).toBe(1); // dev-3 unscanned
+  });
+
+  it('password/local-admin unknown counts include devices with no status row (Ruling 23: deviceCount − assessed)', async () => {
+    mockGeneratorQueries({
+      2: [{ id: 'd', hostname: 'h', osType: 'windows', siteName: 'S' }, { id: 'silent', hostname: 's', osType: 'windows', siteName: 'S' }],
+      3: [{ deviceId: 'd', provider: 'other', realTimeProtection: false, definitionsDate: null, encryptionStatus: 'unknown', firewallEnabled: null, passwordPolicySummary: null, localAdminSummary: null }],
+      4: [],
+      5: []
+    });
+    const c = (await generateSecurityCompliancePostureReport(ORG, {})).summary!.controls as any;
+    expect(c.passwordUnknownCount).toBe(2);
+    expect(c.localAdminUnknownCount).toBe(2);
   });
 
   it('treats missing per-device data as explicit unknown, never pass/fail (C1/M1/M2)', async () => {
@@ -463,13 +608,42 @@ describe('generateSecurityCompliancePostureReport', () => {
     expect(c.unprotectedCount).toBe(2);
   });
 
-  it('handles a no-partner org (authenticator query skipped → MFA step-up false)', async () => {
+  it('does not count provider "unknown" (failed collection, #8538) as native AV or list it as a product', async () => {
+    mockGeneratorQueries({
+      2: [{ id: 'u', hostname: 'pc-u', osType: 'windows', siteName: 'S' }],
+      3: [
+        { deviceId: 'u', provider: 'unknown', realTimeProtection: true, definitionsDate: null, encryptionStatus: 'unknown', firewallEnabled: null, passwordPolicySummary: null, localAdminSummary: null }
+      ],
+      4: [],
+      5: []
+    });
+    const r = await generateSecurityCompliancePostureReport(ORG, {});
+    const c = r.summary!.controls as any;
+    expect(c.anyAvCoveragePct).toBe(0);
+    expect(c.unprotectedCount).toBe(1);
+    const names = (r.summary as any).securityProducts.map((p: any) => p.product.toLowerCase());
+    expect(names).not.toContain('unknown');
+  });
+
+  it('handles a no-partner org (no policy → platform default decides MFA step-up)', async () => {
+    const original = process.env.APPROVER_ASSURANCE_DEFAULT_ENFORCE_FROM;
+    try {
+      process.env.APPROVER_ASSURANCE_DEFAULT_ENFORCE_FROM = '2999-01-01';
+      mockGeneratorQueries({}, { noPartner: true });
+      const before = await generateSecurityCompliancePostureReport(ORG, {});
+      expect((before.summary as any).privilegedAccess.mfaStepUpEnforced).toBe(false);
+      process.env.APPROVER_ASSURANCE_DEFAULT_ENFORCE_FROM = '2000-01-01';
+      mockGeneratorQueries({}, { noPartner: true });
+      const after = await generateSecurityCompliancePostureReport(ORG, {});
+      expect((after.summary as any).privilegedAccess.mfaStepUpEnforced).toBe(true);
+    } finally {
+      if (original === undefined) delete process.env.APPROVER_ASSURANCE_DEFAULT_ENFORCE_FROM;
+      else process.env.APPROVER_ASSURANCE_DEFAULT_ENFORCE_FROM = original;
+    }
     mockGeneratorQueries({}, { noPartner: true });
     const r = await generateSecurityCompliancePostureReport(ORG, {});
-    // The skipped authenticator query must not misalign downstream results.
-    expect((r.summary as any).privilegedAccess.mfaStepUpEnforced).toBe(false);
     expect((r.summary as any).postureScore).toBe(82); // posture query still aligned
-    expect((r.summary as any).controls.edrCoveragePct).toBe(33); // unchanged from base fixture
+    expect((r.summary as any).controls.edrCoveragePct).toBe(50); // unchanged from base fixture (1 of 2 assessed)
   });
 
   it('lists active security products', async () => {
@@ -572,9 +746,10 @@ describe('generateSecurityCompliancePostureReport', () => {
     it('base Defender/other rows (lines 71-72): Huntress-managed + other/RTP-off + no-row', async () => {
       // dev-1 Huntress-managed (protected); dev-2 provider 'other' (unprotected);
       // dev-3 no status row (unknown → unprotected bucket).
+      // EDR/AV over assessed devices (spec §19.7): dev-3 has no evidence → 1 of 2.
       expect(await protectionSlice({})).toEqual({
-        edrCoveragePct: 33,
-        anyAvCoveragePct: 33,
+        edrCoveragePct: 50,
+        anyAvCoveragePct: 50,
         unprotectedCount: 2,
         rows: [
           { hostname: 'pc-1', protectionManaged: true, realTimeProtection: true },
@@ -590,8 +765,9 @@ describe('generateSecurityCompliancePostureReport', () => {
           { deviceId: 'dev-2', provider: 'elastic_defend', realTimeProtection: true, definitionsDate: new Date(), encryptionStatus: 'encrypted', firewallEnabled: true, passwordPolicySummary: { minLength: 12, lockoutThreshold: 5 }, localAdminSummary: { adminCount: 1 } }
         ]
       })).toEqual({
-        edrCoveragePct: 33,
-        anyAvCoveragePct: 67,
+        // over assessed devices (spec §19.7): dev-3 has no evidence.
+        edrCoveragePct: 50,
+        anyAvCoveragePct: 100,
         unprotectedCount: 1,
         rows: [
           { hostname: 'pc-1', protectionManaged: true, realTimeProtection: null },
@@ -624,7 +800,7 @@ describe('generateSecurityCompliancePostureReport', () => {
       expect(c.unprotectedCount).toBe(0);
     });
 
-    it('custom-age row (line 232): a 10-day-old Defender row with RTP on remains protected', async () => {
+    it('custom-age row (line 232): a 10-day-old Defender row with RTP on remains protected but is not AV-coverage evidence', async () => {
       const tenDaysAgo = new Date(Date.now() - 10 * 86400000);
       mockGeneratorQueries({
         2: [{ id: 'd', hostname: 'h', osType: 'windows', siteName: 'S' }],
@@ -634,12 +810,16 @@ describe('generateSecurityCompliancePostureReport', () => {
         4: [],
         5: [],
       });
-      // maxSecurityStatusAgeDays: 7 makes this row "stale" for enc/fw, but
-      // protection ignores freshness entirely.
+      // maxSecurityStatusAgeDays: 7 makes this row "stale". The protection
+      // classification (unprotectedCount) ignores freshness, but since spec
+      // §19 item 18 a stale row is no longer EVIDENCE for the AV coverage
+      // denominator: with no agent row and no check-in the device is an
+      // explicit unknown (was: anyAvCoveragePct 100).
       const r = await generateSecurityCompliancePostureReport(ORG, { maxSecurityStatusAgeDays: 7 });
       const c = (r.summary as any).controls;
       expect(c.unprotectedCount).toBe(0);
-      expect(c.anyAvCoveragePct).toBe(100);
+      expect(c.anyAvCoveragePct).toBeNull();
+      expect(c.anyAvUnknownCount).toBe(1);
     });
 
     it('assessed/stale rows (lines 254-255): a no-row device is unknown → unprotected bucket', async () => {
@@ -657,8 +837,9 @@ describe('generateSecurityCompliancePostureReport', () => {
         4: [],
         5: [],
       })).toEqual({
+        // over assessed devices (spec §19.7): pc-n has no evidence → 2 of 2.
         edrCoveragePct: 0,
-        anyAvCoveragePct: 67,
+        anyAvCoveragePct: 100,
         unprotectedCount: 1,
         rows: [
           { hostname: 'pc-a', protectionManaged: false, realTimeProtection: true },

@@ -234,6 +234,8 @@ The registry currently covers:
 - Automation webhook trigger secrets.
 - PSA, Huntress, SentinelOne, DNS filter, backup private-key, and organization
   log-forwarding secrets.
+- Ticket import source credentials (`ticket_import_sources.credentials_encrypted`,
+  bound to the source's row id).
 
 ### Validation
 
@@ -307,6 +309,8 @@ The legacy fallback list is, in order, every non-empty value of:
 4. **Drain the legacy list.** Existing enrollment keys are short-lived (24h TTL by default) and self-rotate as devices enroll, so the fallback list naturally goes idle within a TTL cycle. Audit the `enrollment_keys` table: once no rows remain whose hash is reachable only through legacy peppers (typically after one TTL window plus margin), drop the legacy values from the env in a follow-up rotation.
 
 There is no re-hash migration script for enrollment keys -- the fallback path plus natural TTL turnover is the expected migration mechanism. Forced rotation of all peppers without waiting for TTL drain will invalidate every unexpired enrollment key (devices in flight will need a fresh key).
+
+**Installer bootstrap tokens have no fallback.** The same pepper keys the HMAC that `installer_bootstrap_tokens.token_hash` stores (`hashBootstrapToken` in `apps/api/src/services/installerBootstrapToken.ts`), and that lookup consults only the current `ENROLLMENT_KEY_PEPPER`. Rotating it invalidates every outstanding installer link and every already-downloaded installer that has not yet enrolled (Windows MSI, macOS, Linux), for the full installer TTL (30 days by default). Re-issue installers from Add Device or the Enrollment Keys page after rotating.
 
 ### MFA_RECOVERY_CODE_PEPPER (no fallback chain)
 

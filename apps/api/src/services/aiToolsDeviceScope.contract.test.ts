@@ -11,6 +11,7 @@ import {
   delegatesToGuardedHelper,
   enclosingWindow,
   functionBody,
+  handlerWindow,
   matchClose,
   splitOr,
   tablesWithColumnIn,
@@ -197,6 +198,10 @@ const CROSS_FILE_GUARDED_DELEGATES: ReadonlyArray<readonly [string, string]> = [
   // `aiToolsMonitors.deviceScope.test.ts`.
   ['listMonitorDeviceActivity', join('monitors', 'episodeQueries.ts')],
   ['listMonitorEpisodes', join('monitors', 'episodeQueries.ts')],
+  // `list_time_sync_issues`: `listFleetTimeStatus` builds its whole read through
+  // `fleetScope` (deviceScopeCondition + siteScopeCondition) and pins an optional
+  // deviceId to the device axis. Behaviour: `timeSync/fleet.test.ts`.
+  ['listFleetTimeStatus', join('timeSync', 'fleet.ts')],
 ];
 
 /**
@@ -467,10 +472,11 @@ function optionalDeviceArgTools(): { unguarded: string[]; total: number } {
         : '';
       if (/'deviceIds?'/.test(required)) continue; // the id is mandatory — not the RC2 shape
       total++;
-      // Handler window: from `handler` to the next tool definition's `name:`.
+      // Handler window: from `handler` to the next tool definition's `name:`,
+      // following a `handler: <identifier>` reference to its body (#8600).
       nameRe.lastIndex = handlerIdx;
       const next = nameRe.exec(src);
-      const window = src.slice(handlerIdx, next ? next.index : src.length);
+      const window = handlerWindow(src, handlerIdx, next ? next.index : src.length);
       nameRe.lastIndex = handlerIdx;
       if (namesDeviceAxis(window) || delegatesToGuardedHelper(window, helpers)) continue;
       unguarded.push(`${file}:${m[1]!}`);

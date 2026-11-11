@@ -4,6 +4,7 @@ import { graphQuerySchema, topologyScopeSchema, type TopologyScope } from '@bree
 import { getSecretDerivedKeyMaterials } from '../secretCrypto';
 import { getPermissionAuthorityVersion, getUserPermissions, hasPermission } from '../permissions';
 import { requireTopologySiteAccess, topologyPermissionPairs, type TopologyRequestContext } from './access';
+import { loadTopologyFlags, topologyInterfaceHealthExposed, topologyPhysicalExposed } from './flags';
 
 export class GraphReadError extends Error {
   constructor(public readonly code: string, public readonly status: 400 | 403 | 404 | 409 | 503, message: string) {
@@ -19,13 +20,20 @@ export const nodeListQuerySchema = z.object({
 }).strict();
 export type NodeListQuery = z.input<typeof nodeListQuerySchema>;
 const filterSchema = z.union([graphQuerySchema, nodeListQuerySchema.omit({ cursor: true })]);
+/**
+ * A grouped-overview card (#7818): its kind and the SHA-256 of its internal grouping key
+ * (presentationGroups.ts). Membership is re-resolved from the complete site on use, under
+ * the same revision binding as every other claim; the token never carries member ids.
+ */
+const groupClaimSchema = z.object({ kind: z.enum(['network', 'gateway', 'unidentified', 'hidden']), key: z.string().regex(/^[a-f0-9]{64}$/) }).strict();
 const claimsSchema = topologyScopeSchema.extend({
   version: z.literal(1), kind: z.enum(['graph', 'nodes', 'evidence']), authority: z.string().regex(/^[a-f0-9]{64}$/),
   graphRevision: z.string().regex(/^(0|[1-9]\d*)$/), filter: filterSchema,
   after: z.string().uuid().optional(), edgeAfter: z.string().uuid().optional(),
   boundaryAfter: z.string().uuid().optional(), boundaryOnly: z.boolean().optional(),
-  relationshipId: z.string().uuid().optional(), expiresAt: z.number().int().nonnegative(),
-}).strict();
+  relationshipId: z.string().uuid().optional(), group: groupClaimSchema.optional(), expiresAt: z.number().int().nonnegative(),
+}).strict().refine((claims) => !claims.group || (claims.kind === 'graph' && 'view' in claims.filter
+  && claims.filter.view !== 'physical' && !claims.filter.focusNodeId), { message: 'A group claim scopes only an unfocused, grouped graph read' });
 export type GraphTokenClaims = z.infer<typeof claimsSchema>;
 const DOMAIN = 'topology-read-cursor:v1';
 const invalidToken = () => new GraphReadError('invalid_topology_cursor', 400, 'Invalid or expired topology cursor');
@@ -64,10 +72,16 @@ export async function graphAuthority(ctx: TopologyRequestContext) {
   if (!current) throw new GraphReadError('topology_permission_denied', 403, 'Topology permission denied');
   await requireTopologySiteAccess(ctx.auth, current, ctx.scope.siteId, 'read');
   await requireTopologySiteAccess(ctx.auth, ctx.permissions, ctx.scope.siteId, 'read');
+  // D9/D15.4: the physical capability is part of read authority, so cursors,
+  // frontiers and ETags issued while it was on are refused once it is off.
+  const flags = await loadTopologyFlags(ctx);
+  const physical = topologyPhysicalExposed(flags);
+  // M3 Task 6: port measurement exposure is part of read authority too.
+  const interfaceHealth = topologyInterfaceHealthExposed(flags);
   const after = await getPermissionAuthorityVersion(ctx.auth.user.id);
   if (after === null || after !== before) throw new GraphReadError('topology_authority_unavailable', 503, 'Permissions changed during the request; retry');
   const digest = createHash('sha256').update(JSON.stringify({
-    version: after, actor: ctx.auth.user.id, principal: ctx.auth.principal,
+    version: after, actor: ctx.auth.user.id, principal: ctx.auth.principal, exposure: interfaceHealth ? { physical, interfaceHealth } : { physical },
     orgId: ctx.scope.orgId, siteId: ctx.scope.siteId,
     authSites: sorted(ctx.auth.allowedSiteIds), authOrgs: sorted(ctx.auth.accessibleOrgIds),
     permissions: [ctx.permissions, current].map((p) => ({
@@ -76,7 +90,12 @@ export async function graphAuthority(ctx: TopologyRequestContext) {
       orgs: sorted(p.allowedOrgIds), sites: sorted(p.allowedSiteIds),
     })),
   })).digest('hex');
-  return { digest, canEdit: topologyPermissionPairs('write').every(([r, a]) => hasPermission(current, r, a) && hasPermission(ctx.permissions, r, a)) };
+  // `current` is the live permission re-read above; presence's site gate (presenceVisibility.ts) reuses it rather
+  // than fetching twice.
+  return { digest, physical, interfaceHealth, current, canEdit: topologyPermissionPairs('write').every(([r, a]) => hasPermission(current, r, a) && hasPermission(ctx.permissions, r, a)),
+    // Site location W3: gates "Move to <site>" / "Keep at <site>" in the UI. The routes re-check devices:write and MFA, plus
+    // both sites for a move and the device's own site for a confirmation.
+    canMoveDevices: hasPermission(current, 'devices', 'write') && hasPermission(ctx.permissions, 'devices', 'write') };
 }
 /** Weak validator ignores response assembly time; revisions, projection and authority remain included. */
 export function topologyReadEtag(authority: string, value: unknown): string {

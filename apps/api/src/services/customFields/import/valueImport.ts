@@ -15,8 +15,8 @@
  * are all per VALUE; only device resolution is per row.
  *
  * ── Where the reads happen ──────────────────────────────────────────────────
- * TWO separate escalations to a SYSTEM db context, for two different reasons.
- * They are easy to conflate and the distinction matters, so:
+ * ONE escalation to a SYSTEM db context, and one read that looks like it but
+ * is not. They are easy to conflate and the distinction matters, so:
  *
  *  1. **Device resolution** — W06's `loadDeviceResolutionSnapshot`. It escalates
  *     because a partner's import legitimately spans that partner's
@@ -26,15 +26,12 @@
  *     read — the organization and site predicates W06 carries IN ITS SQL are
  *     the whole of it, and this module never widens the scope it is handed.
  *  2. **Visible definitions** — W04's `loadVisibleCustomFieldDefinitions`,
- *     called once per resolved organization below. It escalates for an
- *     unrelated reason, and that reason has now EXPIRED:
- *     `custom_field_definitions` used to have no partner-wide RLS SELECT branch
- *     (it was the last entry in `PARTNER_WIDE_SELECT_BRANCH_EXEMPT`), so an
- *     org-scoped request context could not see a partner-wide definition at all
- *     and every value naming one would be annotated `no-definition`. #4944
- *     added that branch, so the escalation inside that function is now
- *     redundant and is retained only pending a separate follow-up. Either way
- *     it says nothing about (1) — do not read (1)'s scope out of it.
+ *     called once per resolved organization below. It used to escalate too,
+ *     because `custom_field_definitions` had no partner-wide RLS SELECT branch.
+ *     #4944 added that branch and #5199 removed the escalation: it now reads in
+ *     the REQUEST's context, which reaches every organization (1) can resolve,
+ *     since (1) is bounded by the same caller reach. Do not read (1)'s scope
+ *     out of it either way.
  *
  * Everything else — the already-stored values, the existing warranty rows — is
  * read in the REQUEST's own context, deliberately. Those reads are bounded to
@@ -96,6 +93,7 @@ import {
   type WarrantyImportWrite,
 } from './warrantyTarget';
 import { captureException } from '../../sentry';
+import { isAgentOwnedWarrantySource } from '../../warrantyDataSources';
 import {
   DEFAULT_IMPORT_SYSTEM,
   type AnnotatedImportValue,
@@ -161,6 +159,10 @@ const RESERVED_IDENTITY_WARNING =
 const PROVIDER_WARRANTY_WARNING =
   'A manufacturer warranty lookup already owns this device\'s warranty data — '
   + 'enable "override provider warranty" to replace it';
+
+const AGENT_WARRANTY_WARNING =
+  'This device reports its own warranty data through the Breeze agent — '
+  + 'an import cannot replace it, and the next agent report would overwrite it';
 
 interface StoredValue extends CustomFieldValueColumns {
   definitionId: string;
@@ -254,9 +256,9 @@ async function loadAnnotationState(
   // ONE call per DISTINCT organization, not per row. `loadVisibleCustomFieldDefinitions`
   // (W04) is reused rather than re-implemented as a batched query, because it
   // owns the org-XOR-partner visibility rule and a second copy of that rule is
-  // exactly the kind of drift the partner-wide retrofits cost us. It does open a
-  // system context per call (#1105); a file spanning dozens of organizations
-  // would be worth batching, and this is where that would go.
+  // exactly the kind of drift the partner-wide retrofits cost us. It is one
+  // round trip per org in the request's own transaction; a file spanning dozens
+  // of organizations would be worth batching, and this is where that would go.
   for (const orgId of orgIds) {
     const definitions = await loadVisibleCustomFieldDefinitions(orgId);
     state.definitionsByOrg.set(orgId, new Map(definitions.map((d) => [d.fieldKey, d])));
@@ -341,6 +343,13 @@ function decideValue(
       return { annotation: { target: mapping, outcome: 'type-error', reason: coerced.reason } };
     }
     const existing = state.warrantyByDevice.get(target.deviceId);
+    // Mirrors `applyWarrantyImport`'s unconditional agent-owned refusal, so the
+    // preview does not report `applied` for a row the commit refuses.
+    if (isAgentOwnedWarrantySource(existing?.dataSource)) {
+      return {
+        annotation: { target: mapping, outcome: 'skipped-provider-owned', warning: AGENT_WARRANTY_WARNING },
+      };
+    }
     if (existing?.dataSource === 'provider' && !state.overrideProviderWarranty) {
       return {
         annotation: { target: mapping, outcome: 'skipped-provider-owned', warning: PROVIDER_WARRANTY_WARNING },
@@ -586,9 +595,20 @@ async function writeRow(
   // already has one, and re-asserting it would be a write per row per run.
   const needsLink = !!externalId && target.method !== 'link';
   // The SAME key derivation W06's resolver uses, so the row the next run looks
-  // up is the row this one wrote. A batch-level default here would silently
-  // break re-resolution.
+  // up is the row this one wrote. The batch source is applied once, upstream,
+  // in the route's `withBatchSystem`, so preview and commit agree; do not add a
+  // second default here.
   const linkSystem = row.externalSystem?.trim() || DEFAULT_IMPORT_SYSTEM;
+  // device_external_links_uniq is scoped to the whole PARTNER, deliberately
+  // (a source system's identity is unique across its tenant, not per org — see
+  // the migration header). A caller whose reach is a strict subset of the
+  // partner (an organization-scoped token) must never be able to tell FROM
+  // THE RESPONSE whether an (system, externalId) pair was already claimed by
+  // a SIBLING org's device: comparing `linkCreated` across guessed values
+  // would answer that with one bit per guess. A caller who already sees the
+  // whole partner (accessibleOrgIds === null) learns nothing new either way,
+  // so the real outcome is reported for them.
+  const restrictedReach = ctx.accessibleOrgIds !== null;
 
   return db.transaction(async (tx) => {
     // Every statement below is issued on `tx`. Issuing on the ambient `db` proxy
@@ -620,7 +640,12 @@ async function writeRow(
         // same link first is a no-op, not a failure.
         .onConflictDoNothing()
         .returning({ id: deviceExternalLinks.id });
-      linkCreated = created.length > 0;
+      // For a restricted-reach caller, collapse "inserted" and "conflicted"
+      // to the same answer — see the comment on `restrictedReach` above. The
+      // conflict itself is real (the row genuinely was not (re)written), but
+      // WHY it conflicted — this device's own prior link vs. a sibling org's
+      // — is exactly the bit that must not reach the response.
+      linkCreated = restrictedReach ? true : created.length > 0;
     }
 
     const warranty = hasWarranty

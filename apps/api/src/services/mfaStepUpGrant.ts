@@ -35,9 +35,23 @@ export type StepUpOperation =
   | 'add_factor'
   | 'rotate_recovery_codes'
   | 'delete_passkey'
+  // #10650: removing the authenticator app on its own (POST
+  // /auth/mfa/totp/remove) without switching MFA off. Proven by a passkey or
+  // the authenticator itself; /mfa/step-up refuses SMS for it.
+  | 'remove_totp'
   | 'register_approver_device'
   | 'agent_rollback'
   | 'enroll_first_factor'
+  // #4045: the SSO re-auth callback's OTHER output. A passwordless account
+  // that already holds a factor proves "user at the keyboard" through a fresh,
+  // forced IdP round-trip instead of the password it does not have. It
+  // replaces ONLY the password leg of recovery-code rotation, passkey deletion
+  // and MFA disable — each of which still demands its own existing-factor
+  // proof (an operation-bound step-up grant, or a live MFA code). Minted only
+  // by GET /sso/callback (reauth mode) for an MFA-protected account, and
+  // compiler-excluded from the client-requestable STEP_UP_OPERATIONS in
+  // routes/auth/schemas.ts exactly like `enroll_first_factor`.
+  | 'sso_reauth_manage_factor'
   // RMM-QA-176: entering or EXTENDING device maintenance mode. Bound by
   // resourceDigest to the exact { deviceIds, reason, durationHours } the
   // technician was shown, so a grant can never be replayed against a
@@ -50,11 +64,33 @@ export type StepUpOperation =
   // operator was shown, so a grant can never be replayed against a different
   // device, destination, or billing acknowledgement.
   | 'device_move_org'
+  // #8729 "Force reboot now": an immediate reboot that force-closes running
+  // apps and discards unsaved work. Bound by resourceDigest to { deviceId }, so
+  // a grant minted for one device can never force-reboot another. Single-use.
+  | 'device_force_reboot'
+  // Parked-device assignment: moving a device out of the partner's holding
+  // area into a customer org. Single: bound to { deviceId, targetOrgId,
+  // targetSiteId }. Bulk: ONE grant bound to the whole sorted batch — a
+  // single-device grant never covers a batch, and a batch grant never covers
+  // a different batch.
+  | 'parked_device_assign'
+  | 'parked_device_assign_bulk'
+  // Turning ON deploy-key enrollment for a partner (a new way for devices to
+  // enroll into its holding area). Bound to the partner; the resource schema
+  // only accepts enabled=true. Turning it OFF is a kill switch and needs no
+  // step-up.
+  | 'pre_assignment_enable'
   // AI script authoring W04 (#5612): enabling the unattended lane on an org
   // is the same class of action as enabling agent act mode — a fresh MFA
   // proof, bound to the org AND to the value being set, so a grant minted to
   // turn the lane ON cannot be replayed to widen something else.
   | 'ai_script_lane_grant'
+  // Partner-wide sibling of `ai_script_lane_grant`: raising the PARTNER
+  // ceiling (`unattended_allowed` and, while it is already true, any
+  // widening of tier/classes/rate/protected-resources/proposing) fans
+  // out to every org under the partner that has opted in, so it gets the
+  // same fresh-MFA-plus-resource-binding treatment as the org-scope grant.
+  | 'ai_partner_script_ceiling_grant'
   // #5601: a "recent ceremony" credential for consecutive approval decides.
   // THE ONLY MULTI-USE OPERATION IN THIS MODULE — redeemed with the
   // non-consuming `readStepUpGrant`/`validateStepUpGrant` (GET), never
@@ -74,7 +110,54 @@ export type StepUpOperation =
   // STEP_UP_OPERATIONS in routes/auth/schemas.ts, by the compiler. Letting a
   // client mint one would turn an ordinary TOTP step-up into a bypass of the
   // enforcing-partner L3 passkey floor on supervised rows.
-  | 'approval_decide';
+  | 'approval_decide'
+  // Topology M3 (#5999, amendments M3-D2/D3): arming a recurring monitoring
+  // policy or a standing interface-telemetry poll hands unattended, repeating
+  // execution on customer machines to a stored frozen actor. Bound by
+  // resourceDigest to the exact { siteId, action, subjectId } the operator saw,
+  // so a grant for one policy/target can never arm another.
+  | 'topology_arm'
+  // Restoring a backup that has no usable integrity attestation (written
+  // before attestations existed, or a device-local backup restored onto
+  // another device). Bound by resourceDigest to exactly one { snapshotDbId,
+  // targetDeviceId, commandType }; consumed when the restore is requested,
+  // and recorded as a durable authorization with its audit event
+  // (services/backupRestoreAuthorization.ts).
+  | 'backup_unattested_restore'
+  // Charging a client now (autopay): an off-session payment the MSP starts by
+  // hand. Bound by resourceDigest to exactly one invoice; consumed right
+  // before the charge is reserved, so it can never pay a different invoice.
+  | 'autopay_charge_now'
+  // Saving the partner's payment settings (automatic-payment cap, schedule,
+  // fees, reminders). Bound to the partner AND to the exact values saved, so
+  // a grant minted for one change cannot save a different, wider one.
+  | 'partner_payment_settings_update'
+  // Sending a client's automatic-payment authorization request to an address
+  // other than its billing contact. Bound to the exact org set, recipient and
+  // request mode.
+  | 'autopay_request_recipient'
+  // Saving an organization's own payment settings, which override the
+  // partner's (cap, schedule, fees, payment methods, reminders). Asked for only
+  // when a saved value differs from the stored one; bound to the organization
+  // AND to the exact values saved, like partner_payment_settings_update.
+  | 'org_payment_settings_update'
+  // Ticket migration windows (#8313): opening a window widens a keyless
+  // partner service principal into import mode across the chosen orgs. Bound
+  // to the exact { partnerId, principalId, sorted orgIds, endsAt,
+  // writesPerHour } the admin confirmed, so a grant can never open a wider,
+  // longer or faster window than the one shown.
+  | 'migration_window_open'
+  // Caller verification (#6354 W05): an administrative disable authorised by
+  // an interactive step-up instead of a caller challenge. Bound to the exact
+  // { orgId, Entra tenant, Entra OID, reason } the technician confirmed.
+  | 'caller_verification_administrative_disable'
+  // Wisp W02 (Wisp design §4.2): creating or refreshing (widening) a
+  // delegation grant. Bound by resourceDigest to the grantor (always the
+  // caller), the anchor partner, the scope org ('*' = partner-wide) and the
+  // server-computed ceiling hash the user was shown (GET /wisp/grants/preview),
+  // so a grant can never be spent on a different scope or a wider ceiling.
+  // TTL 600 s (OPERATION_TTL_SECONDS below).
+  | 'wisp_grant';
 
 export interface StepUpGrant {
   id: string;
@@ -119,6 +202,9 @@ const TTL_SECONDS = 300;
  */
 const OPERATION_TTL_SECONDS: Partial<Record<StepUpOperation, number>> = {
   approval_decide: 120,
+  // Wisp W02: the grant-creation modal shows the ceiling preview, then the
+  // factor prompt, then the confirm — a longer single-use window (spec §4.2).
+  wisp_grant: 600,
 };
 
 /** Redis TTL a grant of this operation is written with. */
@@ -137,6 +223,34 @@ function bindsMatch(record: GrantBind, bind: GrantBind): boolean {
     && (record.resourceDigest ?? '') === (bind.resourceDigest ?? '');
 }
 
+/**
+ * Canonical form of a uuid id inside a resource digest (#10119). Postgres
+ * renders a `uuid` column lowercase, but a client may send any case in a path
+ * segment or a request body, so the mint and the redeeming route would
+ * otherwise hash two different strings for the same device and the grant could
+ * never be spent: an unrecoverable 403 `STEP_UP_REQUIRED`.
+ *
+ * Only ever apply this to a field that is uuid-typed AT ITS SOURCE — a Zod
+ * `.uuid()` on the binding schema, or a uuid column. Case is not significant
+ * in a uuid, so folding it loses nothing. It IS significant in free text: a
+ * maintenance `reason`, a rollback version string, an Entra tenant or object id
+ * (`z.string().min(1).max(64)`, never uuid-validated) must be hashed as given,
+ * or two genuinely different bindings could collapse onto one digest.
+ */
+export function canonicalId(id: string): string {
+  return id.trim().toLowerCase();
+}
+
+/**
+ * The same, for an array of uuid ids. Folds BEFORE dedup and sort, which is the
+ * order that matters: `[...new Set(ids)].sort()` on raw input keeps two
+ * spellings of one device as two entries, and sorts uppercase ahead of
+ * lowercase, so the digest depends on how the caller typed the ids.
+ */
+export function canonicalIds(ids: readonly string[]): string[] {
+  return [...new Set(ids.map(canonicalId))].sort();
+}
+
 export function rollbackResourceDigest(input: {
   deviceId: string;
   currentVersion: string;
@@ -145,7 +259,7 @@ export function rollbackResourceDigest(input: {
 }): `sha256:${string}` {
   const canonical = JSON.stringify({
     currentVersion: input.currentVersion,
-    deviceId: input.deviceId,
+    deviceId: canonicalId(input.deviceId),
     reason: input.reason,
     targetVersion: input.targetVersion,
   });
@@ -173,10 +287,21 @@ export function maintenanceResourceDigest(input: {
   durationHours: number;
 }): `sha256:${string}` {
   const canonical = JSON.stringify({
-    deviceIds: [...new Set(input.deviceIds)].sort(),
+    deviceIds: canonicalIds(input.deviceIds),
     durationHours: input.durationHours,
     reason: input.reason.trim(),
   });
+  return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
+}
+
+/**
+ * Canonical digest for a `device_force_reboot` grant (#8729): the device id
+ * alone, so a grant minted for one device can never force-reboot another.
+ * Lowercased so the mint and the route agree whatever case each was given
+ * the uuid in (#9380 review).
+ */
+export function forceRebootResourceDigest(input: { deviceId: string }): `sha256:${string}` {
+  const canonical = JSON.stringify({ deviceId: canonicalId(input.deviceId) });
   return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
 }
 
@@ -199,34 +324,284 @@ export function moveOrgResourceDigest(input: {
 }): `sha256:${string}` {
   const canonical = JSON.stringify({
     acceptCurrencyMismatch: input.acceptCurrencyMismatch === true,
-    deviceId: input.deviceId,
-    targetOrgId: input.targetOrgId,
-    targetSiteId: input.targetSiteId,
+    deviceId: canonicalId(input.deviceId),
+    targetOrgId: canonicalId(input.targetOrgId),
+    targetSiteId: canonicalId(input.targetSiteId),
   });
   return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
+}
+
+export interface ParkedAssignResource {
+  deviceId: string;
+  targetOrgId: string;
+  targetSiteId: string;
+}
+
+/** Binding for a single parked-device assignment. */
+export function parkedAssignResourceDigest(input: ParkedAssignResource): `sha256:${string}` {
+  const canonical = JSON.stringify({
+    kind: 'parked_device_assign',
+    deviceId: canonicalId(input.deviceId),
+    targetOrgId: canonicalId(input.targetOrgId),
+    targetSiteId: canonicalId(input.targetSiteId),
+  });
+  return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
+}
+
+/**
+ * Binding for a bulk parked-device assignment: the whole batch, sorted by
+ * deviceId so item order does not matter, while adding, removing or changing
+ * any item changes the digest.
+ */
+export function parkedBulkAssignResourceDigest(items: readonly ParkedAssignResource[]): `sha256:${string}` {
+  const sorted = [...items]
+    .map((item) => ({ deviceId: canonicalId(item.deviceId), targetOrgId: canonicalId(item.targetOrgId), targetSiteId: canonicalId(item.targetSiteId) }))
+    .sort((a, b) => (a.deviceId < b.deviceId ? -1 : a.deviceId > b.deviceId ? 1 : 0));
+  const canonical = JSON.stringify({ kind: 'parked_device_assign_bulk', items: sorted });
+  return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
+}
+
+/** Binding for turning ON deploy-key enrollment for one partner. */
+export function preAssignmentEnableResourceDigest(input: { partnerId: string }): `sha256:${string}` {
+  const canonical = JSON.stringify({ kind: 'pre_assignment_enable', partnerId: canonicalId(input.partnerId), enabled: true });
+  return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
+}
+
+/**
+ * The exact set of values a WIDENING transition on an already-enabled/-opted
+ * -in unattended lane touches. Bound into the resource digest so a grant
+ * minted to widen one set of fields cannot be replayed to save a DIFFERENT,
+ * wider set the operator never saw. `unattendedAllowedClasses` is sorted by
+ * the caller before hashing so member order never changes the digest.
+ */
+export interface ScriptLaneWideningDelta {
+  maxUnattendedRiskTier: string;
+  unattendedAllowedClasses: string[];
+  maxUnattendedPerHour: number;
+  protectedResourcesEmptied: boolean;
+  proposingEnabled: boolean;
+}
+
+/**
+ * The canonical, explicitly-picked form of a widening delta that both digests
+ * hash. Picking (rather than spreading the input) means the mint side (a
+ * client resource parsed by `routes/auth/schemas.ts`) and the redeem side (the
+ * delta the policy routes build server-side) hash the same keys in the same
+ * order, and a stray key — e.g. the retired `reviewerModel` from a cached
+ * pre-W08 client (#7606) — can never change the digest.
+ */
+function canonicalWidening(widening: ScriptLaneWideningDelta | undefined) {
+  if (!widening) return null;
+  return {
+    maxUnattendedRiskTier: widening.maxUnattendedRiskTier,
+    unattendedAllowedClasses: [...widening.unattendedAllowedClasses].sort(),
+    maxUnattendedPerHour: widening.maxUnattendedPerHour,
+    protectedResourcesEmptied: widening.protectedResourcesEmptied,
+    proposingEnabled: widening.proposingEnabled,
+  };
 }
 
 /** Bind a factor-removal grant to one exact server-side passkey row. */
 /**
  * W04 (#5612): binds an `ai_script_lane_grant` to the org and the requested
  * value (`unattendedEnabled`), and to the lane-reset action when `reset` is
- * set. Same one-org-one-value shape as the maintenance digest.
+ * set. Same one-org-one-value shape as the maintenance digest. `widening`
+ * additionally binds a grant minted for a WIDENING save (tier/classes/rate/
+ * emptied protectedResources/proposingEnabled changed while the
+ * lane is already enabled) to the exact wider values being persisted.
  */
 export function scriptLanePolicyResourceDigest(input: {
   orgId: string;
   unattendedEnabled: boolean;
   reset?: boolean;
+  widening?: ScriptLaneWideningDelta;
 }): `sha256:${string}` {
   const canonical = JSON.stringify({
-    orgId: input.orgId,
+    orgId: canonicalId(input.orgId),
     unattendedEnabled: input.unattendedEnabled,
     reset: input.reset === true,
+    widening: canonicalWidening(input.widening),
   });
   return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
 }
 
+/**
+ * Partner-wide sibling of {@link scriptLanePolicyResourceDigest}: binds an
+ * `ai_partner_script_ceiling_grant` to the partner and the requested
+ * `unattendedAllowed` value, plus the same widening-delta shape when the
+ * ceiling is already allowed and the save raises it further.
+ */
+export function partnerScriptCeilingResourceDigest(input: {
+  partnerId: string;
+  unattendedAllowed: boolean;
+  widening?: ScriptLaneWideningDelta;
+}): `sha256:${string}` {
+  const canonical = JSON.stringify({
+    partnerId: canonicalId(input.partnerId),
+    unattendedAllowed: input.unattendedAllowed,
+    widening: canonicalWidening(input.widening),
+  });
+  return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
+}
+
+/** Topology arm step-up binding (M3-D2/D3): one site, one action, one subject. */
+export function topologyArmResourceDigest(input: {
+  siteId: string;
+  action: 'arm_policy' | 'arm_telemetry';
+  subjectId: string;
+}): `sha256:${string}` {
+  const canonical = JSON.stringify({
+    action: input.action,
+    siteId: canonicalId(input.siteId),
+    subjectId: canonicalId(input.subjectId),
+  });
+  return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
+}
+
+/**
+ * Unattested-restore step-up binding: one snapshot, one target device, one
+ * restore command type. Keys in fixed order, ids lower-cased, so the mint
+ * route and every restore route produce byte-identical input.
+ */
+export function unattestedRestoreResourceDigest(input: {
+  snapshotDbId: string;
+  targetDeviceId: string;
+  commandType: string;
+}): `sha256:${string}` {
+  const canonical = JSON.stringify({
+    commandType: input.commandType,
+    snapshotDbId: canonicalId(input.snapshotDbId),
+    targetDeviceId: canonicalId(input.targetDeviceId),
+  });
+  return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
+}
+
+/**
+ * Canonical JSON for an open settings object: keys sorted at every depth and
+ * `undefined` dropped, so two equivalent patches always hash the same.
+ */
+function canonicalValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalValue);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.keys(value as Record<string, unknown>).sort()
+      .filter(key => (value as Record<string, unknown>)[key] !== undefined)
+      .map(key => [key, canonicalValue((value as Record<string, unknown>)[key])]));
+  }
+  return value;
+}
+
+/** Charge-now step-up binding: one invoice. */
+export function autopayChargeNowResourceDigest(input: { invoiceId: string }): `sha256:${string}` {
+  const canonical = JSON.stringify({ kind: 'autopay_charge_now', invoiceId: canonicalId(input.invoiceId) });
+  return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
+}
+
+/**
+ * Partner payment-settings binding: the partner and every value in the saved
+ * patch (as parsed by the shared patch schema on both the mint and the write
+ * side), independent of key order.
+ */
+export function partnerPaymentSettingsResourceDigest(input: {
+  partnerId: string;
+  settings: Record<string, unknown>;
+}): `sha256:${string}` {
+  const canonical = JSON.stringify({
+    kind: 'partner_payment_settings_update',
+    partnerId: canonicalId(input.partnerId),
+    settings: canonicalValue(input.settings),
+  });
+  return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
+}
+
+/**
+ * Organization payment-settings binding: the organization and every value in
+ * the saved patch (as parsed by the shared org patch schema on both the mint
+ * and the write side), independent of key order. Its own `kind`, so a partner
+ * grant never fits an organization save.
+ */
+export function orgPaymentSettingsResourceDigest(input: {
+  orgId: string;
+  settings: Record<string, unknown>;
+}): `sha256:${string}` {
+  const canonical = JSON.stringify({
+    kind: 'org_payment_settings_update',
+    orgId: canonicalId(input.orgId),
+    settings: canonicalValue(input.settings),
+  });
+  return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
+}
+
+/**
+ * Migration window open binding (#8313): the partner, the principal, the
+ * deduplicated sorted org set, the end (normalised to ISO) and the throughput
+ * as requested (null when the admin left the default), independent of order.
+ */
+export function migrationWindowOpenResourceDigest(input: {
+  partnerId: string;
+  principalId: string;
+  orgIds: readonly string[];
+  endsAt: string;
+  writesPerHour?: number | null;
+}): `sha256:${string}` {
+  const canonical = JSON.stringify({
+    kind: 'migration_window_open',
+    partnerId: canonicalId(input.partnerId),
+    principalId: canonicalId(input.principalId),
+    orgIds: canonicalIds(input.orgIds),
+    endsAt: new Date(input.endsAt).toISOString(),
+    writesPerHour: input.writesPerHour ?? null,
+  });
+  return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
+}
+
+/**
+ * Redirected authorization-request binding: the deduplicated, sorted org set,
+ * the exact recipient, and the mode (absent means 'request', as on the route).
+ */
+export function autopayRequestRecipientResourceDigest(input: {
+  orgIds: readonly string[];
+  recipientOverride: string;
+  mode?: 'request' | 'reauthorize';
+}): `sha256:${string}` {
+  const canonical = JSON.stringify({
+    kind: 'autopay_request_recipient',
+    mode: input.mode ?? 'request',
+    orgIds: canonicalIds(input.orgIds),
+    recipientOverride: input.recipientOverride,
+  });
+  return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
+}
+
+export function callerVerificationAdministrativeDigest(input: {
+  orgId: string; entraTenantId: string; entraOid: string; reason: string;
+}): `sha256:${string}` {
+  const reasonHash = createHash('sha256').update(input.reason.trim()).digest('hex');
+  // Only `orgId` is folded: it is `z.string().uuid()`. `entraTenantId` and
+  // `entraOid` are `z.string().min(1).max(64)` and never uuid-validated, so they
+  // are hashed exactly as given (#10119).
+  const canonical = [canonicalId(input.orgId), input.entraTenantId, input.entraOid, reasonHash].join('|');
+  return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
+}
+
+/**
+ * Wisp W02 grant binding (w00 "Flags, env, permissions"): canonical
+ * `${grantorUserId}:${partnerId}:${orgId ?? '*'}:${requestedCeilingHash}`.
+ * The grantor is always the authenticated caller, never a body field.
+ */
+export function wispGrantResourceDigest(input: {
+  grantorUserId: string;
+  partnerId: string;
+  orgId: string | null;
+  requestedCeilingHash: string;
+}): `sha256:${string}` {
+  // `requestedCeilingHash` is a server-computed `^[a-f0-9]{64}$` digest, not an
+  // id, so it is left exactly as given (#10119).
+  const canonical = `${canonicalId(input.grantorUserId)}:${canonicalId(input.partnerId)}:${input.orgId === null ? '*' : canonicalId(input.orgId)}:${input.requestedCeilingHash}`;
+  return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
+}
+
 export function passkeyRemovalResourceDigest(passkeyId: string): `sha256:${string}` {
-  const canonical = JSON.stringify({ passkeyId });
+  const canonical = JSON.stringify({ passkeyId: canonicalId(passkeyId) });
   return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
 }
 

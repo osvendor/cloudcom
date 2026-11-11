@@ -122,11 +122,12 @@ describe('Sidebar — permission-aware nav for billing vs technician vs admin', 
     expect(hasSectionHeader(container, 'Backup')).toBe(false);
     expect(hasSectionHeader(container, 'Reporting')).toBe(false);
     expect(hasSectionHeader(container, 'Administration')).toBe(false);
-    // Sections that still have at least one visible item keep their header:
-    // Billing holds the items it can access, and AI has the always-visible
-    // Fleet Orchestration landing item.
+    // #10135: every AI entry is now permission- or flag-gated (Findings, the old
+    // ungated Fleet Orchestration landing item, needs ai_agents:read), so a
+    // billing-only role with AI for Office off sees no AI header either.
+    expect(hasSectionHeader(container, 'AI')).toBe(false);
+    // Sections that still have at least one visible item keep their header.
     expect(hasSectionHeader(container, 'Billing')).toBe(true);
-    expect(hasSectionHeader(container, 'AI')).toBe(true);
   });
 
   it('Partner Technician sees fleet/ops items but no billing and no user/role admin', async () => {
@@ -163,7 +164,10 @@ describe('Sidebar — permission-aware nav for billing vs technician vs admin', 
     expect(has(container, '/devices')).toBe(true);
     expect(has(container, '/billing/invoices')).toBe(true);
     expect(has(container, '/settings/users')).toBe(true);
-    expect(has(container, '/settings/roles')).toBe(true);
+    // Roles moved to the /settings catalogue (#6220); the sidebar keeps the
+    // daily-use items plus a More settings entry.
+    expect(has(container, '/settings/roles')).toBe(false);
+    expect(has(container, '/settings')).toBe(true);
     expect(has(container, '/security')).toBe(true);
     expect(has(container, '/reports')).toBe(true);
     expect(has(container, '/backup')).toBe(true);
@@ -185,24 +189,17 @@ describe('Sidebar — permission-aware nav for billing vs technician vs admin', 
 });
 
 describe('Sidebar — SSO (sso:admin) and platform-admin gating', () => {
-  it('hides SSO from a users:read role lacking sso:admin, but shows the other identity items', async () => {
-    state.user.permissions = [{ resource: 'users', action: 'read' }];
-    const { container } = render(<Sidebar currentPath="/settings/users" />);
-    await waitFor(() => expect(has(container, '/settings/users')).toBe(true));
-
-    // Access Reviews piggybacks on users:read, so it shows.
-    expect(has(container, '/settings/access-reviews')).toBe(true);
-    // SSO is the only item gated on sso:admin — hidden without that grant.
-    expect(has(container, '/settings/sso')).toBe(false);
-  });
-
-  it('shows SSO once the role holds sso:admin', async () => {
+  it('keeps the sidebar to daily-use identity items; SSO/Access Reviews live on /settings (#6220)', async () => {
     state.user.permissions = [
       { resource: 'users', action: 'read' },
       { resource: 'sso', action: 'admin' },
     ];
     const { container } = render(<Sidebar currentPath="/settings/users" />);
-    await waitFor(() => expect(has(container, '/settings/sso')).toBe(true));
+    await waitFor(() => expect(has(container, '/settings/users')).toBe(true));
+    expect(has(container, '/settings/sso')).toBe(false);
+    expect(has(container, '/settings/access-reviews')).toBe(false);
+    // The catalogue entry point is ungated so every role can reach the rest.
+    expect(has(container, '/settings')).toBe(true);
   });
 
   it('hides all platformAdminOnly items from a non-platform-admin even with wildcard permissions', async () => {
@@ -227,27 +224,27 @@ describe('Sidebar — SSO (sso:admin) and platform-admin gating', () => {
     expect(has(container, '/admin/connected-apps')).toBe(true);
     expect(hasSectionHeader(container, 'Administration')).toBe(true);
   });
-  // #6498: the AI Assistant entry points at /workspace, whose every API call
+  // #6498: the Wisp entry (was "AI Assistant" at /workspace; W08 #9921) points at /wisp, whose every API call
   // requires ai_sessions:use (#6396). Without the gate a devices:read-only role
   // navigated straight into a composer that 403s on send.
-  it('hides the AI Assistant (/workspace) entry without ai_sessions:use and shows it with', async () => {
+  it('hides the Wisp (/wisp) entry without ai_sessions:use and shows it with', async () => {
     state.user.permissions = [{ resource: 'devices', action: 'read' }];
     const { container, rerender } = render(<Sidebar currentPath="/" />);
     await waitFor(() => expect(has(container, '/devices')).toBe(true));
-    expect(has(container, '/workspace')).toBe(false);
+    expect(has(container, '/wisp')).toBe(false);
 
     state.user.permissions = [
       { resource: 'devices', action: 'read' },
       { resource: 'ai_sessions', action: 'use' },
     ];
     rerender(<Sidebar currentPath="/" />);
-    await waitFor(() => expect(has(container, '/workspace')).toBe(true));
+    await waitFor(() => expect(has(container, '/wisp')).toBe(true));
   });
 
-  it('shows the AI Assistant entry to a wildcard admin', async () => {
+  it('shows the Wisp entry to a wildcard admin', async () => {
     state.user.permissions = ADMIN;
     const { container } = render(<Sidebar currentPath="/" />);
-    await waitFor(() => expect(has(container, '/workspace')).toBe(true));
+    await waitFor(() => expect(has(container, '/wisp')).toBe(true));
   });
 
   it('shows Agreements for agreements:read alone and hides it without', async () => {

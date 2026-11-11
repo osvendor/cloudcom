@@ -20,13 +20,16 @@ import {
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import type { TriggerType } from './AutomationList';
-import type { DeploymentTargetConfig } from '@breeze/shared';
+import { type DeploymentTargetConfig, MONITOR_KINDS } from '@breeze/shared';
 import { DeviceTargetSelector } from '../filters/DeviceTargetSelector';
 import ActionsEditor, {
   type Script,
   type NotificationChannel,
   type SoftwareCatalogItem,
 } from './ActionsEditor';
+import { readWorkflowSelection, writeWorkflowSelection } from './alertWorkflowFilter';
+
+const ALERT_WORKFLOW_SEVERITIES = ['critical', 'high', 'medium', 'low', 'info'] as const;
 
 type ScriptsT = TFunction<'scripts'>;
 
@@ -112,6 +115,10 @@ const createAutomationSchema = (t: ScriptsT) => {
     triggerType: z.enum(['schedule', 'event', 'webhook', 'manual']),
     cronExpression: z.string().optional(),
     eventType: z.string().optional(),
+    // #6367 W05c2: free-form, mirrors `AutomationTrigger.filter` server-side.
+    // Must NOT default to `{}` — an absent value has to stay absent so a
+    // loaded automation with no filter round-trips byte-identically.
+    eventFilter: z.record(z.string(), z.unknown()).optional(),
     webhookSecret: z.string().optional(),
     conditions: z.array(conditionSchema).optional(),
     targetConfig: z.custom<DeploymentTargetConfig>().optional(),
@@ -142,6 +149,12 @@ type AutomationFormProps = {
   softwareCatalog?: SoftwareCatalogItem[];
   /** Show the ownership-scope selector (create-only, partner-scope users). */
   showOwnerScope?: boolean;
+  /**
+   * The org that owns this automation (the org-switcher org on create, the
+   * stored org on edit). Scopes the group picker: an org-owned automation can
+   * only target groups of its own org. Ignored for partner-wide automations.
+   */
+  ownerOrgId?: string;
 };
 
 const getTriggerTypeOptions = (t: ScriptsT): { value: TriggerType; label: string; description: string; icon: typeof Clock }[] => [
@@ -219,7 +232,8 @@ export default function AutomationForm({
   scripts = [],
   notificationChannels = [],
   softwareCatalog = [],
-  showOwnerScope = false
+  showOwnerScope = false,
+  ownerOrgId
 }: AutomationFormProps) {
   const { t } = useTranslation('scripts');
   const [conditionsExpanded, setConditionsExpanded] = useState(true);
@@ -271,11 +285,20 @@ export default function AutomationForm({
     name: 'conditions'
   });
 
+  const watchOwnerScope = watch('ownerScope');
+  const partnerWide = watchOwnerScope === 'partner';
+  // A group or device id belongs to exactly one org, so the server rejects them
+  // on a partner-wide automation (INVALID_TARGET). Offer only the modes that
+  // fan out per org, and block saving a stored/leftover id-based target.
+  const partnerIdTargetBlocked = partnerWide
+    && conditionMode === 'advanced'
+    && (automationTargetConfig.type === 'groups' || automationTargetConfig.type === 'devices');
   const watchTriggerType = watch('triggerType');
   const watchCronExpression = watch('cronExpression');
   const watchOnFailure = watch('onFailure');
 
   const isLoading = useMemo(() => loading ?? isSubmitting, [loading, isSubmitting]);
+  const submitDisabled = isLoading || partnerIdTargetBlocked;
 
   const cronDescription = useMemo(() => {
     if (!watchCronExpression) return '';
@@ -470,6 +493,52 @@ export default function AutomationForm({
             </div>
           )}
 
+          {/* Alert workflow filter (#6367 W05c2): typed severity/kind
+              restriction for `alert.triggered` — shown whenever that event
+              type is selected, independent of trigger type, matching the
+              matcher's own `eventType`-only gating. */}
+          {watch('eventType') === 'alert.triggered' && (
+            <div className="mt-4 space-y-3 rounded-md border bg-background p-4" data-testid="workflow-filter">
+              <p className="text-xs text-muted-foreground">{t('automationForm.alertWorkflow.hint')}</p>
+              {(['severity', 'kind'] as const).map((dimension) => {
+                const selected = readWorkflowSelection(
+                  watch('eventFilter') as Record<string, unknown> | undefined,
+                  dimension,
+                );
+                const options: readonly string[] = dimension === 'kind' ? MONITOR_KINDS : ALERT_WORKFLOW_SEVERITIES;
+                return (
+                  <fieldset key={dimension} className="rounded border p-3">
+                    <legend className="px-1 text-xs font-medium text-muted-foreground">
+                      {t(/* i18n-dynamic */ `automationForm.alertWorkflow.${dimension}`)}
+                    </legend>
+                    <div className="flex flex-wrap gap-3">
+                      {options.map((value) => (
+                        <label key={value} className="flex items-center gap-2 text-sm">
+                          <input
+                            type="checkbox"
+                            data-testid={`workflow-${dimension}-${value}`}
+                            checked={selected.includes(value)}
+                            onChange={(event) => {
+                              const values = event.target.checked
+                                ? [...selected, value]
+                                : selected.filter((v) => v !== value);
+                              setValue(
+                                'eventFilter',
+                                writeWorkflowSelection(watch('eventFilter') as Record<string, unknown> | undefined, dimension, values),
+                                { shouldDirty: true },
+                              );
+                            }}
+                          />
+                          {t(/* i18n-dynamic */ `monitoring:${dimension === 'kind' ? 'kinds' : 'severities'}.${value}`)}
+                        </label>
+                      ))}
+                    </div>
+                  </fieldset>
+                );
+              })}
+            </div>
+          )}
+
           {/* Webhook Config */}
           {watchTriggerType === 'webhook' && (
             <div className="mt-4 space-y-2 rounded-md border bg-background p-4">
@@ -623,12 +692,30 @@ export default function AutomationForm({
                 </button>
               </div>
             ) : (
-              <DeviceTargetSelector
-                value={automationTargetConfig}
-                onChange={setAutomationTargetConfig}
-                modes={['all', 'filter']}
-                showPreview={true}
-              />
+              <>
+                <DeviceTargetSelector
+                  value={automationTargetConfig}
+                  onChange={setAutomationTargetConfig}
+                  modes={partnerWide ? ['all', 'filter'] : ['all', 'groups', 'filter']}
+                  showPreview={true}
+                  orgId={partnerWide ? undefined : ownerOrgId}
+                  flagRefusedGroups
+                />
+                {partnerWide && (
+                  <p data-testid="automation-target-partner-note" className="text-xs text-muted-foreground">
+                    {t('automationForm.partnerGroupsNote')}
+                  </p>
+                )}
+                {partnerIdTargetBlocked && (
+                  <div
+                    role="alert"
+                    data-testid="automation-target-partner-blocked"
+                    className="rounded-md border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive"
+                  >
+                    {t('automationForm.partnerTargetBlocked')}
+                  </div>
+                )}
+              </>
             )}
           </div>
         )}
@@ -706,7 +793,7 @@ export default function AutomationForm({
         </button>
         <button
           type="submit"
-          disabled={isLoading}
+          disabled={submitDisabled}
           className="flex h-11 w-full items-center justify-center rounded-md bg-primary text-sm font-medium text-primary-foreground transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60 sm:w-auto sm:px-6"
         >
           {isLoading ? t('common:states.saving') : resolvedSubmitLabel}

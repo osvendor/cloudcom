@@ -24,6 +24,7 @@ import type { BindingRow, EntraSubject, CallerVerificationActor } from './types'
 import { CallerVerificationRequiredError, CallerVerificationValidationError as Invalid } from './errors';
 import { reachableContact } from './access';
 import { withSubjectLocks } from './locks';
+import { markRequestAuditWritten } from '../auditRequestTracking';
 
 const SYSTEM_ACTOR = '00000000-0000-0000-0000-000000000000';
 
@@ -39,10 +40,19 @@ export async function bindingsForContact(orgId: string, contactId: string): Prom
   return db.select().from(b).where(and(eq(b.orgId, orgId), eq(b.contactId, contactId), isNull(b.revokedAt)));
 }
 
-/** Exactly one active binding for the subject, or a fail-closed refusal. */
+/**
+ * Exactly one active binding for the subject, or a fail-closed refusal.
+ * Entra tenant and object ids are GUIDs: matched case-insensitively (W05 —
+ * a tenant pasted in upper case must not make a subject unmatchable).
+ */
 export async function resolveTargetBinding(orgId: string, subject: EntraSubject): Promise<BindingRow> {
   const rows = await db.select().from(b)
-    .where(and(eq(b.orgId, orgId), eq(b.entraTenantId, subject.entraTenantId), eq(b.entraOid, subject.entraOid), isNull(b.revokedAt)))
+    .where(and(
+      eq(b.orgId, orgId),
+      sql`lower(${b.entraTenantId}) = ${subject.entraTenantId.toLowerCase()}`,
+      sql`lower(${b.entraOid}) = ${subject.entraOid.toLowerCase()}`,
+      isNull(b.revokedAt),
+    ))
     .limit(2);
   if (rows.length !== 1) {
     throw new CallerVerificationRequiredError({
@@ -68,6 +78,7 @@ async function audit(orgId: string, action: string, resourceId: string, userId: 
   await db.execute(sql`INSERT INTO audit_logs(org_id,actor_type,actor_id,action,resource_type,resource_id,result)
     VALUES(${orgId}::uuid,${userId ? 'user' : 'system'}::actor_type,${userId ?? SYSTEM_ACTOR}::uuid,
     ${action},'caller_verification',${resourceId}::uuid,'success')`);
+  markRequestAuditWritten();
 }
 
 async function claim(input: BindingClaim, source: 'directory_sync' | 'technician_attested', userId: string | null): Promise<BindingRow> {
@@ -134,11 +145,18 @@ export async function observeLogin(input: { orgId: string; contactId: string; os
   const others = await db.select().from(b)
     .where(and(eq(b.orgId, input.orgId), eq(b.osPrincipal, input.osPrincipal), isNull(b.revokedAt)));
   await withSubjectLocks(db, [target.id, ...others.map((r) => r.id)], async () => {
+    // A self-report claiming a principal another contact's established binding already
+    // holds is quarantined for technician review, never auto-resolved by revoking the
+    // established side: telemetry is corroborating evidence, not an authority to evict it.
     if (others.some((r) => r.contactId !== input.contactId)) {
-      const ids = [...new Set([target.id, ...others.map((r) => r.id)])];
-      await db.execute(sql`UPDATE caller_verification_subject_bindings SET revoked_at=now(),updated_at=now() WHERE id IN (${idList(ids)})`);
-      await revokeGrantsForBindings(input.orgId, ids);
-      await audit(input.orgId, 'caller_verification.binding_conflict', target.id, null);
+      await audit(input.orgId, 'caller_verification.binding_observation_quarantined', target.id, null);
+      return;
+    }
+    // Once a principal is on file for this contact (from any source), a later self-report
+    // never silently rewrites it — that overwrite is exactly what lets an untrusted endpoint
+    // relabel someone else's identity evidence. First observation still binds normally.
+    if (target.osPrincipal !== null && target.osPrincipal !== input.osPrincipal) {
+      await audit(input.orgId, 'caller_verification.binding_observation_quarantined', target.id, null);
       return;
     }
     await db.update(b)

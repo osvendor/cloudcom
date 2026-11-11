@@ -17,6 +17,8 @@ import { EmptyState } from '../shared/EmptyState';
 import { PageHeader } from '../shared/PageHeader';
 import AiAgentForm, { type AiAgentDto } from './AiAgentForm';
 import AgentCreateFlow from './aiAgents/AgentCreateFlow';
+import WispPartnerSettingsCard from './WispPartnerSettingsCard';
+import { replaceUrl } from '../../lib/replaceUrl';
 
 // Task 13 (#5051): create no longer opens this drawer at all — it opens the
 // full-width `AgentCreateFlow` in place of the list instead (see `creating`
@@ -102,12 +104,36 @@ export default function AiAgentsPage() {
     patch: t('aiAgentsPage.kinds.patch'),
     helpdesk: t('aiAgentsPage.kinds.helpdesk'),
     designer: t('aiAgentsPage.kinds.designer'),
+    research: t('aiAgentsPage.kinds.research'),
+    troubleshoot: t('aiAgentsPage.kinds.troubleshoot'),
   };
   const KIND_HINT: Record<(typeof AI_AGENT_KINDS)[number], string> = {
     triage: t('aiAgentsPage.kindHints.triage'),
     patch: t('aiAgentsPage.kindHints.patch'),
     helpdesk: t('aiAgentsPage.kindHints.helpdesk'),
     designer: t('aiAgentsPage.kindHints.designer'),
+    research: t('aiAgentsPage.kindHints.research'),
+    troubleshoot: t('aiAgentsPage.kindHints.troubleshoot'),
+  };
+  // #10135: fix memory / fleet design are reports written by these agent
+  // kinds; they are no longer in the sidebar, so the roster links to them.
+  const kindReportLink = (kind: string) => {
+    const target =
+      kind === 'research'
+        ? { href: '/ai-agents/fix-memory', label: t('aiAgentsPage.kindHints.researchLink') }
+        : kind === 'designer'
+          ? { href: '/ai-agents/fleet-design', label: t('aiAgentsPage.kindHints.designerLink') }
+          : null;
+    if (!target) return null;
+    return (
+      <a
+        href={target.href}
+        className="text-primary hover:underline"
+        data-testid={`ai-agents-kind-link-${kind}`}
+      >
+        {target.label}
+      </a>
+    );
   };
   // Same reason, over `AI_AGENT_RUN_STATUSES`. Shares the runs page's own
   // vocabulary rather than minting a second set of status words.
@@ -231,7 +257,7 @@ export default function AiAgentsPage() {
     // the URL and pushes a history entry, so Back would step through empty
     // fragments instead of leaving the page.
     if (typeof window !== 'undefined' && window.location.hash.startsWith('#agent=')) {
-      window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}`);
+      replaceUrl(`${window.location.pathname}${window.location.search}`);
     }
   }, [setHashAgentId]);
 
@@ -529,6 +555,10 @@ export default function AiAgentsPage() {
           detail matters while nothing can run at all. */}
       {subsystemBanner()}
 
+      {/* W08 (#9921): the partner "Wisp enabled" switch. Settings rule 9 home;
+          renders nothing unless Wisp exists for this viewer. */}
+      <WispPartnerSettingsCard />
+
       {/* Task 13 (#5051): the guided create flow replaces the list ENTIRELY
           while open — full width, its own header/footer — rather than
           opening in the drawer. Edit is unaffected: it still opens
@@ -623,7 +653,10 @@ export default function AiAgentsPage() {
               {AI_AGENT_KINDS.map((kind) => (
                 <Fragment key={kind}>
                   <dt className="font-medium text-foreground">{KIND_LABEL[kind]}</dt>
-                  <dd className="text-muted-foreground">{KIND_HINT[kind]}</dd>
+                  <dd className="text-muted-foreground">
+                    {KIND_HINT[kind]}
+                    {kindReportLink(kind) && <> {kindReportLink(kind)}</>}
+                  </dd>
                 </Fragment>
               ))}
             </dl>
@@ -688,8 +721,19 @@ export default function AiAgentsPage() {
 
       {live.length > 0 && (
         <>
-        <span id={allOrgsHintId} className="sr-only">{t('aiAgentsPage.allOrgsHint')}</span>
-        <span id={inertHintId} className="sr-only">{t('aiAgentsPage.inertBadge.hint')}</span>
+        {/* Sweep E7: these two sr-only nodes used to render unconditionally,
+            so a screen reader stepping through the page linearly (not by
+            following an individual badge's aria-describedby) hit "No
+            partner-wide baseline exists yet for this kind" right above the
+            very first row even when that row WAS the partner-wide baseline —
+            reading as a contradiction. Only emit each hint when some row in
+            the list actually references it. */}
+        {live.some((agent) => agent.allOrgs) && (
+          <span id={allOrgsHintId} className="sr-only">{t('aiAgentsPage.allOrgsHint')}</span>
+        )}
+        {live.some((agent) => !agent.allOrgs && agent.hasPartnerBaseline === false) && (
+          <span id={inertHintId} className="sr-only">{t('aiAgentsPage.inertBadge.hint')}</span>
+        )}
         <ul className="divide-y rounded-lg border" data-testid="ai-agents-list">
           {live.map((agent) => (
             <li
@@ -713,6 +757,9 @@ export default function AiAgentsPage() {
                   >
                     {t(/* i18n-dynamic */ `aiAgentsPage.kinds.${agent.kind}`)}
                   </span>
+                  {kindReportLink(agent.kind) && (
+                    <span className="text-xs">{kindReportLink(agent.kind)}</span>
+                  )}
                   {agent.allOrgs && (
                     // `title=` alone is invisible to touch and to keyboard
                     // users, so the explanation is a real described-by node.

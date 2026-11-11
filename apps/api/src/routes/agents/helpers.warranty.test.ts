@@ -67,7 +67,7 @@ vi.mock('../../services/warrantyPolicyResolution', () => ({
   resolveEffectiveWarrantyInlineSettings: resolveEffectiveWarrantyInlineSettingsMock,
 }));
 vi.mock('../../services/featureConfigResolver', () => ({
-  resolvePatchConfigForDevice: vi.fn(),
+  resolvePatchConfigPolicyForDevice: vi.fn(),
 }));
 vi.mock('../../services/filesystemAnalysis', () => ({
   getFilesystemScanState: vi.fn(),

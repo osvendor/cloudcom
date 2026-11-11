@@ -75,6 +75,17 @@
 const IDENTITY_TENANT_WRITE_TOOLS = [
   'm365_disable_user',
   'm365_reset_password',
+  // M1 control-plane identity writes (Operator Recipe Library): tenant-wide
+  // directory/mailbox/device objects, so the same org-wide ceiling applies.
+  'm365_revoke_sessions',
+  'm365_remove_license',
+  'm365_assign_license',
+  'm365_remove_from_group',
+  'm365_add_to_group',
+  'm365_retire_intune_device',
+  'm365_create_user',
+  'm365_set_auto_reply',
+  'google_account_wipe_mobile_device',
   'google_add_mail_delegate',
   'google_add_to_group',
   'google_assign_license',
@@ -99,6 +110,15 @@ const IDENTITY_TENANT_WRITE_TOOLS = [
 
 export const ORG_WIDE_GOVERNANCE_TOOL_ACTIONS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
   ['manage_ai_agents', new Set(['authorize_supervised_key'])],
+  // A plan approval authorizes effects on the org's identity tenants (M365 /
+  // Google) as one set; no per-site slice exists, so a site-restricted user
+  // can neither raise nor approve it.
+  ['operator_plan', new Set<string>()],
+  // Full-control W16 PR B (#6786): a schedule runs across an org or a whole partner, and an apply or rollback touches
+  // every device a design names, so a site-restricted user can neither raise nor approve one. This carries the site and
+  // device ceiling across the durable boundary; a partner baseline's partner-wide gate is `assertAgentWriteAllowed`.
+  ['manage_ai_agent_schedules', new Set(['create', 'update', 'delete'])],
+  ['manage_fleet_designs', new Set(['apply', 'rollback'])],
   ...IDENTITY_TENANT_WRITE_TOOLS.map(
     (name) => [name, new Set<string>()] as [string, ReadonlySet<string>],
   ),

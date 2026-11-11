@@ -20,9 +20,10 @@ import DeclineOnBehalfDialog from './DeclineOnBehalfDialog';
 import { OrgCombobox, orgComboboxOptions } from '../shared/OrgCombobox';
 import { useShowMargin } from '../billingUi';
 import { useReviseQuote, isRevisable } from './useReviseQuote';
-import { computeQuoteProfit, type QuoteProfit } from '@breeze/shared';
+import { computeQuoteProfit, isUnorderableProductLine, type QuoteProfit } from '@breeze/shared';
 import { useQuotePdfDownload } from './useQuoteImage';
 import { type Quote, type QuoteDetail as QuoteDetailData, formatMoney } from './quoteTypes';
+import { useStableT } from '@/lib/i18n/useStableT';
 
 const UNAUTHORIZED = () => void navigateTo('/login', { replace: true });
 
@@ -244,6 +245,7 @@ interface Props {
  */
 export default function QuoteActions({ detail, onChanged, variant, savePending = false, unsavedFieldLabel = null, saveFailureNonce = 0, onSendWhilePending }: Props) {
   const { t } = useTranslation('billing');
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   const { can } = usePermissions();
   const organizations = useOrgStore((s) => s.organizations);
   const { quote, lines, revisionOf } = detail;
@@ -271,6 +273,11 @@ export default function QuoteActions({ detail, onChanged, variant, savePending =
   // Partner-scope support data, loaded when the composer opens: the partner's
   // email signature (preview only — the server appends it). null = unknown.
   const [signature, setSignature] = useState<string | null>(null);
+  // Same partner fetch: the name the default subject renders ("… from
+  // <partner>") and whether a saved quote_send template overrides that
+  // default subject. null / false = unknown → generic placeholder wording.
+  const [partnerName, setPartnerName] = useState<string | null>(null);
+  const [hasCustomSubject, setHasCustomSubject] = useState(false);
   // Stripe-connect status (drives the deposit-can't-be-paid warning) and the
   // warn-don't-block currency warning come PRECOMPUTED on the detail payload
   // (GET /quotes/:id). Never fetched from /partner/stripe-connect here: that
@@ -359,6 +366,12 @@ export default function QuoteActions({ detail, onChanged, variant, savePending =
     [lines],
   );
 
+  // #8232: product-like lines with no part number/SKU won't reach the parts
+  // order once the quote is accepted. Warn before the first send (lines are
+  // only editable on a draft) but never block — stock on hand is a legitimate
+  // reason. Not margin data, so it isn't gated on margin visibility.
+  const noPartNumberCount = useMemo(() => lines.filter(isUnorderableProductLine).length, [lines]);
+
   const orgName = useMemo(() => {
     const billTo = quote.billToName?.trim();
     if (billTo) return billTo;
@@ -420,8 +433,16 @@ export default function QuoteActions({ detail, onChanged, variant, savePending =
         try {
           const res = await fetchWithAuth('/orgs/partners/me');
           if (!res.ok) return;
-          const partner = (await res.json()) as { emailSignature?: string | null };
+          const partner = (await res.json()) as {
+            name?: string | null;
+            emailSignature?: string | null;
+            settings?: { emailTemplates?: { quote_send?: { subject?: unknown } } } | null;
+          };
           setSignature(partner.emailSignature?.trim() || null);
+          setPartnerName(partner.name?.trim() || null);
+          // Mirrors renderPartnerEmail: a non-blank saved subject wins over the default.
+          const customSubject = partner.settings?.emailTemplates?.quote_send?.subject;
+          setHasCustomSubject(typeof customSubject === 'string' && customSubject.trim() !== '');
         } catch { /* no preview — the server still appends the signature */ }
       })();
     }
@@ -464,7 +485,7 @@ export default function QuoteActions({ detail, onChanged, variant, savePending =
     if (!queued) return;
     if (saveFailureNonce !== queued.atFailureNonce) {
       setQueued(null);
-      showToast({ message: t('quotes.actions.sendCanceledSaveFailed'), type: 'error' });
+      showToast({ message: stableT('quotes.actions.sendCanceledSaveFailed'), type: 'error' });
       return;
     }
     if (savePending) return;
@@ -480,7 +501,7 @@ export default function QuoteActions({ detail, onChanged, variant, savePending =
       return;
     }
     openSend();
-  }, [queued, saveFailureNonce, savePending, unsavedFieldLabel, refuseForUnsaved, openSend, t]);
+  }, [queued, saveFailureNonce, savePending, unsavedFieldLabel, refuseForUnsaved, openSend, stableT]);
 
   // Escape hatch for a hung save: the queued-open above normally fires within a
   // blur-save round-trip. If the editor is still not quiescent after 10s the
@@ -493,10 +514,10 @@ export default function QuoteActions({ detail, onChanged, variant, savePending =
     if (!queued) return;
     const timer = setTimeout(() => {
       setQueued(null);
-      showToast({ message: t('quotes.actions.savingTimeout'), type: 'warning' });
+      showToast({ message: stableT('quotes.actions.savingTimeout'), type: 'warning' });
     }, 10_000);
     return () => clearTimeout(timer);
-  }, [queued, t]);
+  }, [queued, stableT]);
 
   // The options of the last scheduled send, kept so "Send now" can cancel the
   // delayed job and dispatch the SAME composed email immediately. null after a
@@ -1022,18 +1043,29 @@ export default function QuoteActions({ detail, onChanged, variant, savePending =
           <button
             type="button"
             onClick={() => setAcceptOpen(true)}
+            // An item-less quote has nothing to accept (#9963): the server
+            // refuses it (422 QUOTE_EMPTY) rather than issue a $0 invoice, so
+            // say why here instead of opening a dialog that can only fail.
+            disabled={isEmpty}
+            title={!isEmpty ? undefined
+              : isDraft ? t('quotes.actions.acceptOnBehalf.emptyDraftTitle')
+              : t('quotes.actions.acceptOnBehalf.emptySentTitle')}
             data-testid="quote-accept-on-behalf"
             className={`${btnBase} border hover:bg-muted disabled:opacity-50`}
           >
             {t('quotes.actions.acceptOnBehalf.button')}
           </button>
         )}
+        {/* Declining on behalf is a consequential, customer-facing decision —
+            give it the same destructive treatment as other destructive
+            actions in billing (e.g. quote-delete-open below) so it never
+            reads as a twin of Accept on behalf beside it. */}
         {canDeclineOnBehalf && (
           <button
             type="button"
             onClick={() => setDeclineOpen(true)}
             data-testid="quote-decline-on-behalf"
-            className={`${btnBase} border hover:bg-muted disabled:opacity-50`}
+            className={`${btnBase} border border-destructive/40 text-destructive hover:bg-destructive/10`}
           >
             {t('quotes.actions.declineOnBehalf.button')}
           </button>
@@ -1279,6 +1311,13 @@ export default function QuoteActions({ detail, onChanged, variant, savePending =
           </p>
         )}
 
+        {!resendMode && noPartNumberCount > 0 && (
+          <p className="mt-2 flex items-start gap-1 rounded-md border border-warning/40 bg-warning/10 px-2 py-1 text-xs text-warning-foreground dark:text-warning" data-testid="quote-send-no-part-number-warning">
+            <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-warning" aria-hidden="true" />
+            <span>{t('quotes.actions.sendConfirm.noPartNumberWarning', { count: noPartNumberCount })}</span>
+          </p>
+        )}
+
         {/* Envelope fields: label-left rows in one bordered box, like a mail client. */}
         <div className="mt-4 divide-y rounded-md border">
           <div className="flex items-center gap-2 px-3">
@@ -1338,11 +1377,18 @@ export default function QuoteActions({ detail, onChanged, variant, savePending =
               disabled={sending}
               // The placeholder mirrors the server default so leaving the field
               // blank is a visible, deliberate choice — not a missing subject.
-              placeholder={
-                quote.quoteNumber
-                  ? t('quotes.actions.sendConfirm.subjectPlaceholder', { number: quote.quoteNumber })
-                  : t('quotes.actions.sendConfirm.subjectPlaceholderNoNumber')
-              }
+              // Same branches as the API's defaultSubject('quote_send'): a saved
+              // template subject wins; else "<title> — proposal from <partner>",
+              // or "Proposal <number> from <partner>" for an untitled quote.
+              placeholder={(() => {
+                if (hasCustomSubject) return t('quotes.actions.sendConfirm.subjectPlaceholderTemplate');
+                const partner = partnerName ?? t('quotes.actions.sendConfirm.subjectPartnerFallback');
+                const title = quote.title?.trim();
+                if (title) return t('quotes.actions.sendConfirm.subjectPlaceholderTitled', { title, partner });
+                return quote.quoteNumber
+                  ? t('quotes.actions.sendConfirm.subjectPlaceholder', { number: quote.quoteNumber, partner })
+                  : t('quotes.actions.sendConfirm.subjectPlaceholderNoNumber', { partner });
+              })()}
               data-testid="quote-send-subject"
               className="min-w-0 flex-1 rounded-sm border-0 bg-transparent py-2 text-sm focus:outline-hidden focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-60"
             />
@@ -1495,7 +1541,9 @@ export default function QuoteActions({ detail, onChanged, variant, savePending =
           >
             {sending
               ? t('quotes.actions.sending')
-              : resendMode ? t('quotes.actions.resend') : t('quotes.actions.sendProposal')}
+              : resendMode
+                ? t('quotes.actions.resend')
+                : noPartNumberCount > 0 ? t('quotes.actions.sendConfirm.sendAnyway') : t('quotes.actions.sendProposal')}
           </button>
         </div>
       </Dialog>
@@ -1509,6 +1557,7 @@ export default function QuoteActions({ detail, onChanged, variant, savePending =
           lines={lines}
           recipients={recipients}
           autoEmailInvoiceOnAccept={detail.autoEmailInvoiceOnAccept}
+          emailConfigured={detail.emailConfigured}
           onAccepted={() => { setAcceptOpen(false); refresh(); }}
         />
       )}

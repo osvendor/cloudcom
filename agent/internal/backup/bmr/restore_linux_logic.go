@@ -3,6 +3,7 @@ package bmr
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
@@ -44,8 +45,9 @@ var etcRestoreExcludes = []string{
 
 // isExcludedEtcPath reports whether relPath (a path relative to /etc,
 // forward-slash separated) must be skipped by the /etc restore — either an
-// exact match on one of etcRestoreExcludes (a single excluded file) or
-// nested under one of them (an excluded directory).
+// exact match on one of etcRestoreExcludes (a single excluded file), nested
+// under one of them (an excluded directory), or the source machine's own
+// Breeze agent state (isBreezeAgentEtcPath).
 func isExcludedEtcPath(relPath string) bool {
 	relPath = filepath.ToSlash(relPath)
 	for _, excl := range etcRestoreExcludes {
@@ -53,7 +55,60 @@ func isExcludedEtcPath(relPath string) bool {
 			return true
 		}
 	}
+	return isBreezeAgentEtcPath(relPath)
+}
+
+// breezeAgentUnitPrefix is the name prefix every systemd unit the Breeze
+// agent installs carries (breeze-agent, breeze-watchdog, breeze-agent-user,
+// breeze-recovery).
+const breezeAgentUnitPrefix = "breeze-"
+
+// systemdUnitDirs are the /etc-relative systemd unit directories whose
+// breeze-* entries a restore must skip.
+var systemdUnitDirs = []string{"systemd/system/", "systemd/user/"}
+
+// isBreezeAgentEtcPath reports whether relPath (relative to /etc,
+// forward-slash separated) is the SOURCE machine's Breeze agent state, which
+// a live BMR restore must never copy onto the recovery target (#6436):
+//
+//   - breeze, breeze/...: /etc/breeze, the agent's config and enrollment
+//     identity.
+//   - systemd/{system,user}/breeze-*: the agent's unit files and their
+//     .d drop-in directories.
+//   - systemd/{system,user}/<target>.wants|.requires/breeze-*: the
+//     enablement links that start those units at boot.
+//
+// The recovery target runs its own recovery helper and re-enrolls
+// explicitly; inheriting the source's units left a target with no agent
+// binary or /var/lib/breeze restarting breeze-watchdog every 15 s.
+func isBreezeAgentEtcPath(relPath string) bool {
+	relPath = filepath.ToSlash(relPath)
+	if relPath == "breeze" || strings.HasPrefix(relPath, "breeze/") {
+		return true
+	}
+	for _, dir := range systemdUnitDirs {
+		rest, ok := strings.CutPrefix(relPath, dir)
+		if !ok {
+			continue
+		}
+		parts := strings.Split(rest, "/")
+		// systemd/system/breeze-agent.service[.d[/override.conf]]
+		if isBreezeAgentUnit(parts[0]) {
+			return true
+		}
+		// systemd/system/multi-user.target.wants/breeze-agent.service
+		if len(parts) >= 2 && (strings.HasSuffix(parts[0], ".wants") || strings.HasSuffix(parts[0], ".requires")) &&
+			isBreezeAgentUnit(parts[1]) {
+			return true
+		}
+	}
 	return false
+}
+
+// isBreezeAgentUnit reports whether a systemd unit (or unit drop-in
+// directory) name belongs to the Breeze agent — see breezeAgentUnitPrefix.
+func isBreezeAgentUnit(unit string) bool {
+	return strings.HasPrefix(unit, breezeAgentUnitPrefix)
 }
 
 // parseSystemdEnabledUnits extracts unit names from the output of
@@ -164,4 +219,55 @@ func crontabSpoolEntries(spoolDir string) (entries map[string]string, skipped []
 		return nil, nil, err
 	}
 	return entries, skipped, nil
+}
+
+// Package reinstall inputs. packages/rpm.txt and packages/dpkg.txt come
+// from the snapshot, so every entry is checked before it reaches a package
+// manager's argv or stdin: a name must look like a package name (never like
+// an option), and a dpkg selections line must be exactly "<name>[:arch]
+// <state>".
+var (
+	packageNamePattern       = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+:~-]{0,254}$`)
+	dpkgSelectionLinePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9.+-]*(:[a-z0-9]+)?\s+(install|hold|deinstall|purge)$`)
+)
+
+// validPackageName reports whether s can be passed to dnf as a package name.
+func validPackageName(s string) bool { return packageNamePattern.MatchString(s) }
+
+// validDpkgSelectionLine reports whether s is one `dpkg --get-selections`
+// line.
+func validDpkgSelectionLine(s string) bool { return dpkgSelectionLinePattern.MatchString(s) }
+
+// dnfInstallArgs builds the `dnf` argv for the package list in data (one
+// name per line, blank lines ignored): "install -y --" followed by every
+// valid name, so nothing after "--" is read as an option. It returns the
+// number of names kept and the number skipped as invalid.
+func dnfInstallArgs(data []byte) (args []string, valid, skipped int) {
+	args = []string{"install", "-y", "--"}
+	for _, line := range strings.Split(string(data), "\n") {
+		name := strings.TrimSpace(line)
+		if name == "" {
+			continue
+		}
+		if !validPackageName(name) {
+			skipped++
+			continue
+		}
+		args = append(args, name)
+		valid++
+	}
+	return args, valid, skipped
+}
+
+// invalidDpkgSelectionLines counts the non-blank lines of a selections file
+// that are not valid selection lines. A file with any is not applied.
+func invalidDpkgSelectionLines(data []byte) int {
+	n := 0
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" && !validDpkgSelectionLine(line) {
+			n++
+		}
+	}
+	return n
 }

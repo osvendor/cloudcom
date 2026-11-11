@@ -1,0 +1,180 @@
+import { render, screen, waitFor, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+const fetchWithAuth = vi.fn();
+vi.mock('../../stores/auth', () => ({
+  fetchWithAuth: (...a: unknown[]) => fetchWithAuth(...a),
+  useAuthStore: Object.assign(
+    (selector: (s: Record<string, unknown>) => unknown) => selector({ user: { canManagePartnerWide: true } }),
+    { getState: () => ({}) },
+  ),
+}));
+vi.mock('@/lib/authScope', () => ({
+  useJwtClaims: () => ({ status: 'resolved', claims: { scope: 'partner', partnerId: 'p-1', orgId: null } }),
+}));
+// Two orgs, none focused: W01's page picker is visible and nothing is picked.
+vi.mock('../../stores/orgStore', () => ({
+  useOrgStore: () => ({
+    currentOrgId: null,
+    organizations: [
+      { id: 'o-1', partnerId: 'p-1', name: 'Acme', status: 'active', createdAt: '' },
+      { id: 'o-2', partnerId: 'p-1', name: 'Birch', status: 'active', createdAt: '' },
+    ],
+  }),
+}));
+const navigateTo = vi.fn();
+vi.mock('@/lib/navigation', () => ({ navigateTo: (...a: unknown[]) => navigateTo(...a) }));
+vi.mock('../shared/Toast', () => ({ showToast: vi.fn() }));
+
+import ReportTemplates from './ReportTemplates';
+
+const ok = (payload: unknown, status = 200) => Promise.resolve({ ok: true, status, json: () => Promise.resolve(payload) });
+const posts = (url: string) => fetchWithAuth.mock.calls.filter(([u, i]) => u === url && (i as { method?: string })?.method === 'POST');
+
+async function useTemplate(name: string) {
+  const heading = await screen.findByText(name);
+  await userEvent.setup().click(within(heading.closest('div.group') as HTMLElement).getByRole('button', { name: /use template/i }));
+}
+
+describe('ReportTemplates — one report per organization (W03)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    fetchWithAuth.mockImplementation((url: string, init?: { method?: string }) => {
+      if (url === '/reports/series' && init?.method === 'POST') return ok({ series: { id: 's-t' }, targets: [], orgs: [] }, 201);
+      if (url === '/reports/series/recipients/preview') return ok({ totalCustomerRecipients: 1, orgCount: 2, orgsWithoutCustomerRecipient: [] });
+      return Promise.resolve({ ok: false, status: 404, json: () => Promise.resolve({}) });
+    });
+  });
+
+  it('a partner-wide user opens a lifecycle template with no org picked and creates a series', async () => {
+    const user = userEvent.setup();
+    render(<ReportTemplates />);
+    await useTemplate('Hardware Lifecycle Report');
+    const covers = screen.getByTestId('template-covers-hardware_lifecycle');
+    await user.click(within(covers).getByTestId('covers-mode-series'));
+    // A recurring template pre-fills its own schedule.
+    expect(within(covers).getByTestId('series-schedule-select')).toHaveValue('monthly');
+    await user.click(screen.getByTestId('lifecycle-create-report'));
+    await waitFor(() => expect(posts('/reports/series')).toHaveLength(1));
+    const body = JSON.parse((posts('/reports/series')[0]![1] as { body: string }).body);
+    expect(body).toMatchObject({
+      type: 'hardware_lifecycle', schedule: 'monthly', targetMode: 'all', orgIds: [],
+      recipientRule: { primaryContact: true, roles: [] },
+      config: { replaceAgeYears: 4 },
+    });
+    expect(body).not.toHaveProperty('orgId');
+    await waitFor(() => expect(navigateTo).toHaveBeenCalledWith('/reports#series/s-t'));
+  });
+
+  it('staying on one organization with none picked still sends nothing (W01 guard)', async () => {
+    const user = userEvent.setup();
+    render(<ReportTemplates />);
+    await useTemplate('Hardware Lifecycle Report');
+    // #8796: the dialog itself asks which organization the report is for.
+    expect(within(screen.getByTestId('template-covers-hardware_lifecycle')).getByTestId('template-org-picker')).toBeInTheDocument();
+    await user.click(screen.getByTestId('lifecycle-create-report'));
+    expect(posts('/reports')).toHaveLength(0);
+    expect(posts('/reports/series')).toHaveLength(0);
+  });
+
+  it('an organization picked inside the dialog owns the report (#8796)', async () => {
+    const user = userEvent.setup();
+    fetchWithAuth.mockImplementation((url: string, init?: { method?: string }) => {
+      if (url === '/reports' && init?.method === 'POST') return ok({ id: 'rep-2' }, 201);
+      return Promise.resolve({ ok: false, status: 404, json: () => Promise.resolve({}) });
+    });
+    render(<ReportTemplates />);
+    await useTemplate('Hardware Lifecycle Report');
+    const picker = within(screen.getByTestId('template-org-picker')).getByRole('combobox');
+    await user.selectOptions(picker, 'o-2');
+    await user.click(screen.getByTestId('lifecycle-create-report'));
+    await waitFor(() => expect(posts('/reports')).toHaveLength(1));
+    expect(JSON.parse((posts('/reports')[0]![1] as { body: string }).body)).toMatchObject({ type: 'hardware_lifecycle', orgId: 'o-2' });
+  });
+
+  it('a one-time posture template leaves the series schedule empty and refuses to create until one is picked', async () => {
+    const user = userEvent.setup();
+    render(<ReportTemplates />);
+    await useTemplate('Security & Compliance Posture (Insurance)');
+    const covers = screen.getByTestId('template-covers-security_compliance_posture');
+    await user.click(within(covers).getByTestId('covers-mode-series'));
+    const select = within(covers).getByTestId('series-schedule-select');
+    expect(select).toHaveValue('');
+    expect(within(covers).getByTestId('series-schedule-hint')).toHaveTextContent("can't be one-time");
+    await user.click(screen.getByTestId('posture-options-submit'));
+    expect(posts('/reports/series')).toHaveLength(0);
+    expect(within(covers).getByTestId('series-schedule-required')).toBeInTheDocument();
+    await user.selectOptions(select, 'weekly');
+    expect(within(covers).queryByTestId('series-schedule-required')).toBeNull();
+    await user.click(screen.getByTestId('posture-options-submit'));
+    await waitFor(() => expect(posts('/reports/series')).toHaveLength(1));
+    expect(JSON.parse((posts('/reports/series')[0]![1] as { body: string }).body).schedule).toBe('weekly');
+  });
+
+  // Review follow-up: contacts belong to one organization. A contact ticked for
+  // the first org picked must never be attached to a report for the next one.
+  it('switching the organization in the dialog drops contacts picked for the previous one', async () => {
+    const user = userEvent.setup();
+    fetchWithAuth.mockImplementation((url: string, init?: { method?: string }) => {
+      if (url === '/orgs/organizations/o-1/contacts') return ok({ data: [{ id: 'c-a', name: 'Acme Owner', email: 'a@acme.test' }] });
+      if (url === '/orgs/organizations/o-2/contacts') return ok({ data: [{ id: 'c-b', name: 'Birch Owner', email: 'b@birch.test' }] });
+      if (url === '/reports' && init?.method === 'POST') return ok({ id: 'rep-3' }, 201);
+      if (url === '/reports/rep-3/recipients' && init?.method === 'POST') return ok({}, 201);
+      return Promise.resolve({ ok: false, status: 404, json: () => Promise.resolve({}) });
+    });
+    render(<ReportTemplates />);
+    await useTemplate('Hardware Lifecycle Report');
+    const picker = within(screen.getByTestId('template-org-picker')).getByRole('combobox');
+    await user.selectOptions(picker, 'o-1');
+    await user.click(within(await screen.findByTestId('template-delivery-contact-c-a')).getByRole('checkbox'));
+    await user.selectOptions(picker, 'o-2');
+    expect(within(await screen.findByTestId('template-delivery-contact-c-b')).getByRole('checkbox')).not.toBeChecked();
+    await user.click(screen.getByTestId('lifecycle-create-report'));
+    await waitFor(() => expect(navigateTo).toHaveBeenCalledWith('/reports'));
+    expect(JSON.parse((posts('/reports')[0]![1] as { body: string }).body)).toMatchObject({ orgId: 'o-2' });
+    expect(posts('/reports/rep-3/recipients')).toHaveLength(0);
+  });
+
+  // W03 final review: a type that cannot fan out (a managed-evidence type)
+  // must still require an org up front, as before W03.
+  it('a template that cannot fan out still asks for an organization first', async () => {
+    render(<ReportTemplates />);
+    await userEvent.setup().click(await screen.findByTestId('report-template-use-threat_detection_review'));
+    expect(await screen.findByText('Choose an organization above before using a template.')).toBeInTheDocument();
+    expect(screen.queryByTestId('template-covers-threat_detection_review')).toBeNull();
+    expect(posts('/reports')).toHaveLength(0);
+  });
+
+  // #8796: backup status now carries the shared Covers block, and it is
+  // series-eligible, so it opens with no org picked like lifecycle does.
+  it('backup status offers one report per organization from its own dialog', async () => {
+    const user = userEvent.setup();
+    render(<ReportTemplates />);
+    await useTemplate('Backup Status Report');
+    const covers = screen.getByTestId('template-covers-backup_status');
+    await user.click(within(covers).getByTestId('covers-mode-series'));
+    // One-time template: the series schedule is never defaulted.
+    const select = within(covers).getByTestId('series-schedule-select');
+    expect(select).toHaveValue('');
+    // The single-org delivery block steps aside for the series recipients.
+    expect(screen.queryByTestId('template-delivery')).toBeNull();
+    await user.selectOptions(select, 'weekly');
+    await user.click(screen.getByTestId('backup-status-create-report'));
+    await waitFor(() => expect(posts('/reports/series')).toHaveLength(1));
+    expect(posts('/reports')).toHaveLength(0);
+    const body = JSON.parse((posts('/reports/series')[0]![1] as { body: string }).body);
+    expect(body).toMatchObject({ type: 'backup_status', schedule: 'weekly', targetMode: 'all' });
+    expect(body.config).not.toHaveProperty('emailRecipients');
+  });
+
+  // Stack check: the Covers + recipients fields make the modal taller than a
+  // laptop viewport; the panel must scroll so Create stays reachable.
+  it('the template modal panel scrolls', async () => {
+    render(<ReportTemplates />);
+    await useTemplate('Hardware Lifecycle Report');
+    const panel = screen.getByTestId('template-covers-hardware_lifecycle').closest('div.rounded-lg') as HTMLElement;
+    expect(panel.className).toContain('overflow-y-auto');
+    expect(panel.className).toContain('max-h-[90vh]');
+  });
+});

@@ -1,0 +1,17 @@
+import {el,field,button,row,controls} from './workspace-ui.js';
+const join=(p,n)=>p.replace(/[\\/]+$/,'')+(p.includes('\\')||/^[A-Za-z]:/.test(p)?'\\':'/')+n;
+export async function renderFiles(opts){
+ const {request,devicePath,root,status,isCurrent}=opts,run=controls(opts),input=field('Directory path'),out=el('div'),upload=field('Upload file (up to 4 MiB)','file');let path='';
+ const browse=p=>run(async()=>{status('Loading files…');const d=await request(devicePath('/files?'+new URLSearchParams({path:p})));if(!isCurrent())return;path=d.path||p;input.input.value=path;out.replaceChildren();
+  for(const f of d.data||[]){const selected=f.path||join(path,f.name);const actions=[];
+   if(f.type==='directory')actions.push(button('Open',()=>browse(selected)));
+   else actions.push(button('Download',()=>run(async()=>{const d=await request(devicePath('/files/download?'+new URLSearchParams({path:selected})));if(!isCurrent())return;if(d.encoding!=='base64'||typeof d.content!=='string')throw Error('Invalid download response');const bytes=Uint8Array.from(atob(d.content),c=>c.charCodeAt(0)),url=URL.createObjectURL(new Blob([bytes]));const a=el('a',null,{href:url,download:f.name});a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);},'Download started.')));
+   for(const action of ['copy','move'])actions.push(button(action==='copy'?'Copy':'Move',()=>{if(!isCurrent())return;out.querySelector('form')?.remove();const form=el('form'),dest=field('Full destination path','text',selected);form.onsubmit=e=>e.preventDefault();form.append(el('p',selected),dest.wrap,button('Confirm '+action,()=>run(async()=>{if(!dest.input.value.trim()||dest.input.value===selected)throw Error('Enter a different destination.');if(!confirm(action+' '+selected+' to '+dest.input.value+'?'))return;await request(devicePath('/files/'+action),'POST',{items:[{sourcePath:selected,destPath:dest.input.value}]});status('Action completed. Browse to refresh.');form.remove();})),button('Cancel',()=>form.remove()));out.prepend(form);}));
+   actions.push(button('Recycle',()=>run(async()=>{if(!confirm('Move '+selected+' to the device recycle area?'))return;await request(devicePath('/files/delete'),'POST',{paths:[selected],permanent:false});status('Recycled. Browse to refresh.');}),true));
+   row(out,[f.name,f.type,f.size==null?'':f.size+' bytes'],actions);
+  }status((d.data?.length||0)+' entries loaded.');
+ });
+ const drives=()=>run(async()=>{const d=await request(devicePath('/files/drives'));if(!isCurrent())return;out.replaceChildren();for(const drive of d.data||[]){const p=drive.mountPoint||drive.letter;row(out,[drive.label||p,p],[button('Open',()=>browse(p))]);}status('Choose a drive or enter a directory path.');});
+ root.append(input.wrap,button('Browse',()=>browse(input.input.value)),button('Drives',drives),upload.wrap,button('Upload',()=>run(async()=>{const f=upload.input.files?.[0];if(!f||!path)throw Error('Browse a directory and select a file first.');if(f.size>4*1024*1024)throw Error('Maximum upload size is 4 MiB.');const target=join(path,f.name);if(!confirm('Upload to '+target+'? An existing file may be replaced.'))return;const bytes=new Uint8Array(await f.arrayBuffer());let binary='';for(let i=0;i<bytes.length;i+=8192)binary+=String.fromCharCode(...bytes.subarray(i,i+8192));if(!isCurrent())return;await request(devicePath('/files/upload'),'POST',{path:target,encoding:'base64',content:btoa(binary)});status('Uploaded. Browse to refresh.');})),out);await drives();
+}
+

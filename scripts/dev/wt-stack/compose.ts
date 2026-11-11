@@ -34,10 +34,28 @@ function docker(args: string[], opts: { input?: string } = {}): string {
   });
 }
 
+/**
+ * #6443 — keys wt-stack pins in `.env.stack`. Compose lets an exported shell
+ * variable beat every --env-file, and a shell value can never match this
+ * stack's random caddy port, so container-creating calls drop them.
+ */
+export const STACK_PINNED_ENV_KEYS = ['WEBAUTHN_ORIGIN', 'WEBAUTHN_RP_ID'] as const;
+
+export function stackProcessEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const out = { ...env };
+  for (const k of STACK_PINNED_ENV_KEYS) delete out[k];
+  return out;
+}
+
 export function composeUp(project: string, opts: { rebuild: boolean }): void {
   const args = [...composeArgs(project), 'up', '-d'];
   if (opts.rebuild) args.push('--build');
-  execFileSync('docker', args, { cwd: ROOT, stdio: 'inherit' });
+  execFileSync('docker', args, { cwd: ROOT, stdio: 'inherit', env: stackProcessEnv() });
+}
+
+/** Recreate one service so it re-reads the env files (a restart does not). */
+export function recreateService(project: string, service: string): void {
+  execFileSync('docker', [...composeArgs(project), 'up', '-d', '--no-deps', service], { cwd: ROOT, stdio: 'inherit', env: stackProcessEnv() });
 }
 
 export function containerName(project: string, service: string): string {
@@ -72,6 +90,52 @@ export function seedDatabase(project: string): void {
   if (!existsSync(SEED_SQL)) throw new Error(`Seed file not found: ${SEED_SQL}`);
   execFileSync('docker', [...composeArgs(project), 'exec', '-T', 'postgres', 'psql', '-v', 'ON_ERROR_STOP=1', '-U', 'breeze', '-d', 'breeze'],
     { cwd: ROOT, input: readFileSync(SEED_SQL, 'utf8'), stdio: ['pipe', 'inherit', 'inherit'] });
+}
+
+function composeLsNames(): string[] {
+  const out = execFileSync('docker', ['compose', 'ls', '-a', '--format', 'json'], { encoding: 'utf8' });
+  return (JSON.parse(out) as Array<{ Name: string }>).map((p) => p.Name);
+}
+
+/** Breeze compose projects Docker knows about, including stopped ones. */
+export function listBreezeProjects(): string[] {
+  return composeLsNames().filter((n) => n === 'breeze' || n.startsWith('breeze-wt-'));
+}
+
+/**
+ * #9864 — true when the project still has containers or volumes. `compose ls`
+ * drops a project once its containers are gone, so a stack taken down with
+ * `--keep-volumes` is found through its volume labels.
+ */
+export function composeProjectExists(project: string): boolean {
+  if (composeLsNames().includes(project)) return true;
+  const vols = execFileSync('docker', ['volume', 'ls', '-q', '--filter', `label=com.docker.compose.project=${project}`], { encoding: 'utf8' });
+  return vols.trim().length > 0;
+}
+
+/**
+ * #9864 — parse `docker ps --format '{{.Label "com.docker.compose.project"}}|{{.Ports}}'`
+ * and return the project label ('' when unlabelled) of each container whose
+ * HOST side publishes `port` (`0.0.0.0:8443->80/tcp`, `[::]:8443->80/tcp`).
+ * Parsed here rather than via `docker ps --filter publish=`, whose match on the
+ * host vs container side of a binding is not something to rely on.
+ */
+export function parsePortOwners(output: string, port: number): string[] {
+  const hostSide = new RegExp(`:${port}(?:-\\d+)?->`);
+  const owners: string[] = [];
+  for (const line of output.split('\n')) {
+    const sep = line.indexOf('|');
+    if (sep < 0) continue;
+    const ports = line.slice(sep + 1).split(',').map((p) => p.trim());
+    if (ports.some((p) => hostSide.test(p))) owners.push(line.slice(0, sep).trim());
+  }
+  return owners;
+}
+
+/** #9864 — compose project label of each running container publishing host `port`. */
+export function portOwners(port: number): string[] {
+  const out = execFileSync('docker', ['ps', '--format', '{{.Label "com.docker.compose.project"}}|{{.Ports}}'], { encoding: 'utf8' });
+  return parsePortOwners(out, port);
 }
 
 export function composeDown(project: string, removeVolumes: boolean): void {

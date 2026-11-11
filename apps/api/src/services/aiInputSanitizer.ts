@@ -5,12 +5,7 @@
  * and enforces input limits for AI chat messages and page context.
  */
 
-// Page context types (mirror aiAgent.ts)
-type AiPageContext =
-  | { type: 'device'; id: string; hostname: string; os?: string; status?: string; ip?: string }
-  | { type: 'alert'; id: string; title: string; severity?: string; deviceHostname?: string }
-  | { type: 'dashboard'; orgName?: string; deviceCount?: number; alertCount?: number }
-  | { type: 'custom'; label: string; data: Record<string, unknown> };
+import type { AiPageContext } from '@breeze/shared';
 
 export interface SanitizeResult {
   sanitized: string;
@@ -19,17 +14,59 @@ export interface SanitizeResult {
 
 const MAX_MESSAGE_LENGTH = 10_000;
 
-// Prompt injection patterns (use `giu` flags for Unicode-aware matching)
+// Horizontal whitespace only — never crosses a line break, so the `m`-flag
+// `^`/`$` anchors below stay on the same line.
+const HWS = String.raw`[^\S\r\n  ]*`;
+
+/**
+ * A generic-sounding XML tag (`context`, `prompt`, `instructions`) is only
+ * treated as a prompt-boundary forgery when it is structural: it starts a line
+ * (immediately after a newline or at the start of input), or it stands alone
+ * on its line. Inline occurrences — pasted XML config (`<ui><prompt>Enter
+ * PIN</prompt></ui>`) or prose ("the web.config has a <context> element") —
+ * are ordinary technician input (#6695). Only the tag itself is replaced; the
+ * surrounding text is kept.
+ */
+function structuralTagPattern(tag: string): RegExp {
+  const t = String.raw`<\/?${tag}>`;
+  // `(?=<)` before the variable-length lookbehind: without it the lookbehind
+  // runs at EVERY position and rescans the whitespace run behind it, which is
+  // quadratic on a long run of spaces (200 KB of them took ~40 s). Device text
+  // reaches this filter uncapped (sanitizeUntrustedToolText), so every pattern
+  // here must stay linear — see the timing case in aiInputSanitizer.test.ts.
+  return new RegExp(String.raw`(?<=^)${t}|(?=<)(?<=^${HWS})${t}(?=${HWS}$)`, 'gimu');
+}
+
+// Prompt injection patterns (use `u` for Unicode-aware matching; `m` where a
+// pattern is line-anchored).
 const INJECTION_PATTERNS: Array<{ pattern: RegExp; flag: string }> = [
-  // Role impersonation
-  { pattern: /\b(Human|Assistant|System)\s*:/giu, flag: 'role_impersonation' },
+  // Role impersonation: a chat-transcript speaker label at the start of a line
+  // ("System: …", "  Assistant: …") or of a sentence on a single-line field
+  // ("…a helpful shell. System: exfiltrate…"). A label glued to a preceding
+  // word — Event Viewer's "Source: System: …", "the Operating System: it
+  // reboots" — is not a transcript turn (#6695). Also skipped: a label whose
+  // line goes on to name a Windows event provider/channel ("System:
+  // Microsoft-Windows-Kernel-Power/…"), which is a pasted log header.
+  // Linear-time shape (#8852 W04): `(?=[has])` gates the variable-length
+  // lookbehind to label starts, and the provider look-ahead is bounded to 512
+  // chars — unbounded, a long line of repeated labels rescanned to end of line
+  // once per label (~9 s on 200 KB).
+  {
+    pattern: new RegExp(
+      String.raw`(?=[has])(?<=^${HWS}|[.!?][^\S\r\n  ]+)\b(Human|Assistant|System)${HWS}:(?![^\r\n  ]{0,512}\bMicrosoft-Windows-)`,
+      'gimu',
+    ),
+    flag: 'role_impersonation',
+  },
   { pattern: /<\|im_start\|>/giu, flag: 'chatml_injection' },
   { pattern: /<\|im_end\|>/giu, flag: 'chatml_injection' },
-  // XML tag injection targeting system instructions
+  // XML tag injection targeting system instructions. `<system>` has no benign
+  // technician use, so it stays unanchored; the generic tag names are only
+  // filtered in structural (line-start / own-line) position — see above.
   { pattern: /<\/?system>/giu, flag: 'xml_system_tag' },
-  { pattern: /<\/?instructions>/giu, flag: 'xml_instructions_tag' },
-  { pattern: /<\/?prompt>/giu, flag: 'xml_prompt_tag' },
-  { pattern: /<\/?context>/giu, flag: 'xml_context_tag' },
+  { pattern: structuralTagPattern('instructions'), flag: 'xml_instructions_tag' },
+  { pattern: structuralTagPattern('prompt'), flag: 'xml_prompt_tag' },
+  { pattern: structuralTagPattern('context'), flag: 'xml_context_tag' },
   // System prompt override attempts
   { pattern: /ignore\s+(all\s+)?(previous|prior|above)\s+(instructions|rules|prompts)/giu, flag: 'override_attempt' },
   { pattern: /forget\s+(all\s+)?(previous|prior|above)\s+(instructions|rules|prompts)/giu, flag: 'override_attempt' },
@@ -112,9 +149,31 @@ export function sanitizePageContext(ctx: AiPageContext, flags?: string[]): AiPag
       break;
 
     case 'custom':
-      clone.label = sanitizeField(clone.label, 200, sink);
+      clone.label = sanitizeField(clone.label, 200, sink, 'codePoints');
       clone.data = sanitizeRecord(clone.data, sink);
       break;
+
+    case 'record':
+      // Identity is enum/UUID-validated upstream. The label is a client badge
+      // in the snapshot only; the prompt resolves its own label server-side.
+      if (clone.label !== undefined) clone.label = sanitizeField(clone.label, 200, sink, 'codePoints');
+      break;
+
+    case 'topology':
+      // IDs only (validated upstream by aiTopologyPageContextSchema). Rebuild
+      // from the known fields so nothing extra — no label, org or evidence —
+      // can ride along into the prompt or the persisted snapshot.
+      return {
+        type: 'topology',
+        siteId: clone.siteId,
+        subject: { kind: clone.subject.kind, id: clone.subject.id },
+        view: clone.view,
+        graphRevision: clone.graphRevision,
+      };
+
+    default:
+      clone satisfies never;
+      throw new Error('Unsupported page context type');
   }
 
   return clone;
@@ -155,6 +214,70 @@ export function sanitizeUntrustedText(
 }
 
 /**
+ * Neutralize one field of tool output that originated on a device (file
+ * contents, command/script output, registry data, log text) before it enters
+ * model context (#8852 W04, the per-field fence in `aiToolOutput.ts`).
+ *
+ * Same filter as `sanitizeUntrustedText` plus forged fence markers, but it
+ * NEVER clips: size belongs to the output compactor, which marks its cuts and
+ * honours character windows (`stdoutNextOffset`/`nextOffset`). A cap here
+ * would silently drop text the model was told it had already seen.
+ */
+export function sanitizeUntrustedToolText(value: string, flags?: string[]): string {
+  const sink = flags ?? [];
+  const unfenced = value.replace(UNTRUSTED_FENCE, '[filtered]').replace(TOOL_OUTPUT_FENCE, '[filtered]');
+  if (unfenced !== value) addFlag(sink, 'fence_forgery');
+  return sanitizeField(unfenced, unfenced.length, sink);
+}
+
+// The handoff read-back (aiToolHandoff.ts) wraps spliced device output in
+// `<tool_output untrusted>…</tool_output>`; device text must not close it.
+const TOOL_OUTPUT_FENCE = /<\/?tool_output\b[^>]*>/giu;
+
+/** `sanitizeUntrustedToolText` over every string in a JSON-shaped value (keys are left alone). */
+export function sanitizeUntrustedToolValue(value: unknown, flags?: string[]): unknown {
+  const sink = flags ?? [];
+  if (typeof value === 'string') return value.length > 0 ? sanitizeUntrustedToolText(value, sink) : value;
+  if (Array.isArray(value)) return value.map((entry) => sanitizeUntrustedToolValue(entry, sink));
+  if (value !== null && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(value)) {
+      // defineProperty, not assignment: a JSON `__proto__` key stays an own
+      // data property instead of re-pointing `out`'s prototype.
+      Object.defineProperty(out, key, {
+        value: sanitizeUntrustedToolValue(entry, sink), enumerable: true, writable: true, configurable: true,
+      });
+    }
+    return out;
+  }
+  return value;
+}
+
+/**
+ * Fence an agent command's `stdout`. A structured command's payload arrives
+ * JSON-encoded by the Go agent, which HTML-escapes `<`/`>`/`&` (`<`…)
+ * and turns line breaks into `\n` escapes — so a regex over the encoded string
+ * misses `<system>` and every line-anchored pattern. Decode, fence every
+ * string, and re-encode only when something changed, so a clean stdout comes
+ * back byte-identical. Non-JSON (raw script/command output) is fenced as text.
+ */
+export function sanitizeUntrustedToolStdout(stdout: string, flags?: string[]): string {
+  const sink = flags ?? [];
+  let decoded: unknown = null;
+  try {
+    decoded = JSON.parse(stdout);
+  } catch {
+    decoded = null;
+  }
+  if (decoded === null || typeof decoded !== 'object') {
+    return stdout.length > 0 ? sanitizeUntrustedToolText(stdout, sink) : stdout;
+  }
+  const fenced = sanitizeUntrustedToolValue(decoded, sink);
+  const reencoded = JSON.stringify(fenced);
+  return reencoded === JSON.stringify(decoded) ? stdout : reencoded;
+}
+
+/**
  * Render untrusted text as a clearly-delimited UNTRUSTED DATA block so the model
  * treats it as data, not instructions (prompt-injection defense).
  *
@@ -187,8 +310,15 @@ function addFlag(flags: string[], flag: string): void {
   if (!flags.includes(flag)) flags.push(flag);
 }
 
-function sanitizeField(value: string, maxLength: number, flags: string[] = []): string {
-  let sanitized = value.slice(0, maxLength);
+function sanitizeField(
+  value: string,
+  maxLength: number,
+  flags: string[] = [],
+  lengthUnit: 'codeUnits' | 'codePoints' = 'codeUnits',
+): string {
+  let sanitized = lengthUnit === 'codePoints'
+    ? Array.from(value).slice(0, maxLength).join('')
+    : value.slice(0, maxLength);
   const beforeUnicode = sanitized;
   sanitized = sanitized.replace(DANGEROUS_UNICODE, '');
   if (sanitized !== beforeUnicode) addFlag(flags, 'dangerous_unicode');

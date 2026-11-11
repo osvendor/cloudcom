@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/breeze-rmm/agent/internal/collectors"
+	"github.com/breeze-rmm/agent/internal/promptkinds"
 	"github.com/breeze-rmm/agent/internal/remote/tools"
 )
 
@@ -54,6 +55,7 @@ var handlerRegistry = map[string]CommandHandler{
 	tools.CmdShutdown:       handleShutdown,
 	tools.CmdLock:           handleLock,
 	tools.CmdRebootSafeMode: handleRebootSafeMode,
+	tools.CmdForceReboot:    handleForceReboot,
 	tools.CmdWakeOnLan:      handleWakeOnLan,
 
 	// On-demand inventory refresh
@@ -76,6 +78,8 @@ var handlerRegistry = map[string]CommandHandler{
 	// File operations
 	tools.CmdFileList:           handleFileList,
 	tools.CmdFileRead:           handleFileRead,
+	tools.CmdDiagFileList:       handleDiagFileList,
+	tools.CmdDiagFileRead:       handleDiagFileRead,
 	tools.CmdFileWrite:          handleFileWrite,
 	tools.CmdFileDelete:         handleFileDelete,
 	tools.CmdFileMkdir:          handleFileMkdir,
@@ -119,6 +123,19 @@ func (h *Heartbeat) dispatchCommand(cmd Command) (tools.CommandResult, bool) {
 		return tools.CommandResult{}, false
 	}
 	start := time.Now()
+	// A diagnostic read authorization is only ever honoured by diag_file_list
+	// and diag_file_read. Any other command carrying one is refused before its handler
+	// runs, so a read-only grant can never ride along on a write, delete,
+	// rename, script or registry command (which would ignore it anyway —
+	// refusing makes the misuse visible instead of silently accepted).
+	if _, present := cmd.Payload[tools.DiagnosticAuthorizationPayloadKey]; present &&
+		cmd.Type != tools.CmdDiagFileList && cmd.Type != tools.CmdDiagFileRead {
+		result := tools.NewErrorResult(&tools.DiagError{
+			Code: tools.DiagErrWriteNotPermitted,
+			Msg:  "a diagnostic read authorization cannot be used with " + cmd.Type,
+		}, time.Since(start).Milliseconds())
+		return result, true
+	}
 	result := handler(h, cmd)
 	// Only override DurationMs if the handler did not set it.
 	// Handlers that measure their own duration set a positive value.
@@ -230,6 +247,10 @@ func handleReboot(_ *Heartbeat, cmd Command) tools.CommandResult {
 	return tools.Reboot(cmd.Payload)
 }
 
+func handleForceReboot(_ *Heartbeat, cmd Command) tools.CommandResult {
+	return tools.ForceReboot(cmd.Payload)
+}
+
 func handleShutdown(_ *Heartbeat, cmd Command) tools.CommandResult {
 	return tools.Shutdown(cmd.Payload)
 }
@@ -262,7 +283,7 @@ func handleRefreshInventory(h *Heartbeat, _ Command) tools.CommandResult {
 		// full refresh of everything in the dispatched list below.
 		go h.sendHardwareInventory()
 		go h.sendPatchInventory()
-		go h.sendSecurityStatus()
+		go h.sendSecurityStatus(true)
 		go h.sendSessionInventory()
 		// Reset the daily gates so the scheduler doesn't immediately re-run the
 		// hardware/patch scans right after this manual refresh.
@@ -305,23 +326,17 @@ func handleRebootSafeMode(h *Heartbeat, cmd Command) tools.CommandResult {
 		return tools.NewErrorResult(err, time.Since(start).Milliseconds())
 	}
 
-	if h.sessionBroker != nil {
-		h.sessionBroker.BroadcastNotification("Safe Mode Reboot", safeModeRebootNotice(delay), "critical")
-	}
+	// A notice.info card where the session's renderer draws it and the
+	// server enables it (#10190 W04); otherwise exactly today's broadcast.
+	h.notifySafeModeReboot(delay)
 	return tools.RebootToSafeMode(cmd.Payload)
 }
 
 // safeModeRebootNotice renders the user-facing Safe Mode warning for a delay
 // that has already been parsed and clamped by tools.ShutdownDelayMinutes.
+// The wording lives with the notice.info constructor, whose Legacy it is.
 func safeModeRebootNotice(delayMinutes int) string {
-	if delayMinutes <= 0 {
-		return "System is rebooting into Safe Mode with Networking. Please save all work."
-	}
-	unit := "minutes"
-	if delayMinutes == 1 {
-		unit = "minute"
-	}
-	return fmt.Sprintf("System will reboot into Safe Mode with Networking in %d %s. Please save all work.", delayMinutes, unit)
+	return promptkinds.LegacySafeModeRebootBody(delayMinutes)
 }
 
 func handleCollectSoftware(_ *Heartbeat, cmd Command) tools.CommandResult {
@@ -337,7 +352,7 @@ func handleCollectSoftware(_ *Heartbeat, cmd Command) tools.CommandResult {
 // uninstallSoftware is indirected so the re-report gating in
 // handleSoftwareUninstall can be tested on both a successful and a failed
 // uninstall without running a real package manager.
-var uninstallSoftware = tools.UninstallSoftware
+var uninstallSoftware = tools.UninstallSoftwareWithUserExec
 
 // handleSoftwareUninstall removes software and, on success, immediately
 // re-reports software inventory.
@@ -353,7 +368,11 @@ var uninstallSoftware = tools.UninstallSoftware
 // re-report is idempotent anyway — the API replaces the device's whole software
 // list per report — so the worst case is a redundant PUT.
 func handleSoftwareUninstall(h *Heartbeat, cmd Command) tools.CommandResult {
-	result := uninstallSoftware(cmd.Payload)
+	var userExec tools.UserUninstallExec
+	if h != nil {
+		userExec = tools.UserUninstallExec(h.makeUserExecFunc())
+	}
+	result := uninstallSoftware(cmd.Payload, userExec)
 	if result.Status == "completed" && h != nil {
 		if h.sendSoftwareInventoryFn != nil {
 			h.sendSoftwareInventoryFn()
@@ -374,6 +393,14 @@ func handleFileList(_ *Heartbeat, cmd Command) tools.CommandResult {
 
 func handleFileRead(_ *Heartbeat, cmd Command) tools.CommandResult {
 	return tools.ReadFile(cmd.Payload)
+}
+
+func handleDiagFileList(h *Heartbeat, cmd Command) tools.CommandResult {
+	return tools.DiagnosticListFiles(cmd.ID, cmd.Payload, h.diagnosticGrantEnv())
+}
+
+func handleDiagFileRead(h *Heartbeat, cmd Command) tools.CommandResult {
+	return tools.DiagnosticReadFile(cmd.ID, cmd.Payload, h.diagnosticGrantEnv())
 }
 
 func handleFileWrite(_ *Heartbeat, cmd Command) tools.CommandResult {
@@ -409,7 +436,7 @@ func handleFileTrashPurge(_ *Heartbeat, cmd Command) tools.CommandResult {
 }
 
 func handleFilesystemAnalysis(_ *Heartbeat, cmd Command) tools.CommandResult {
-	return tools.AnalyzeFilesystem(cmd.Payload)
+	return tools.AnalyzeFilesystemCommand(cmd.ID, cmd.Payload)
 }
 
 func handleFileListDrives(_ *Heartbeat, cmd Command) tools.CommandResult {

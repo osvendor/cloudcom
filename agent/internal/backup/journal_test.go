@@ -1,6 +1,7 @@
 package backup
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -33,12 +34,19 @@ func TestOpenSnapshotJournal_FreshWhenNoFileExists(t *testing.T) {
 	}
 	j.Abandon()
 
-	entries, err := os.ReadDir(dir)
+	all, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatalf("ReadDir: %v", err)
 	}
-	if len(entries) != 1 {
-		t.Fatalf("expected exactly one journal file on disk, got %d", len(entries))
+	// The journal plus its lock file (kept, never removed).
+	var entries []os.DirEntry
+	for _, e := range all {
+		if !strings.HasSuffix(e.Name(), journalLockSuffix) {
+			entries = append(entries, e)
+		}
+	}
+	if len(entries) != 1 || len(all) != 2 {
+		t.Fatalf("expected exactly one journal file and its lock on disk, got %d entries", len(all))
 	}
 	if !strings.HasPrefix(entries[0].Name(), "backup-journal-") || !strings.HasSuffix(entries[0].Name(), ".jsonl") {
 		t.Errorf("unexpected journal filename: %s", entries[0].Name())
@@ -169,9 +177,16 @@ func TestOpenSnapshotJournal_CorruptLineStartsFresh(t *testing.T) {
 	journalPath := j1.path
 	j1.Abandon()
 
-	// Overwrite with a valid header followed by a malformed data line.
-	corrupt := `{"snapshotId":"snapshot-corrupt","createdAt":"2026-07-01T00:00:00Z","identity":"test-identity"}
-{this is not valid json`
+	// Overwrite with a current, resumable header followed by a malformed data
+	// line that is not the last one (a torn LAST line is not corruption, see
+	// TestJournalTornTail_*).
+	header, err := json.Marshal(journalHeader{SnapshotID: "snapshot-corrupt", CreatedAt: time.Now().UTC(),
+		Identity: "test-identity", FormatVersion: journalFormatVersion})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	corrupt := string(header) + "\n" + `{this is not valid json` + "\n" +
+		`{"sourcePath":"/data/a.txt","backupPath":"snapshots/x/files/a.gz","size":1,"modTime":"2026-01-01T00:00:00Z"}` + "\n"
 	if err := os.WriteFile(journalPath, []byte(corrupt), 0o600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}

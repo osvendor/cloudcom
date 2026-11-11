@@ -146,8 +146,9 @@ function paymentLine(overrides: Partial<ChangeSetPaymentLine> = {}): ChangeSetPa
     amountMinor: 15000,
     currency: 'USD',
     txnDate: '2026-09-02',
-    remotePaymentSyncToken: '0',
+    remotePaymentVersion: '0',
     paymentMethodName: 'Check',
+    method: 'check',
     paymentRefNum: '10441',
     breezePaymentId: null,
     ...overrides,
@@ -368,7 +369,7 @@ describe('QuickBooks payment applier — real Postgres', () => {
 
   runDb('a later payment clears the payment-pull marker but never a push-originated one (finding G)', async () => {
     const fx = await seedFixture();
-    const invoiceId = await seedInvoice(fx, { total: '150.00' });
+    const invoiceId = await seedInvoice(fx, { total: '300.00' });
     const mappingId = await seedInvoiceMapping(fx, invoiceId, '145');
 
     // A payment-originated marker (a currency mismatch that has since been fixed).
@@ -452,7 +453,7 @@ describe('QuickBooks payment applier — real Postgres', () => {
 
     await expect(withSystemDbAccessContext(() => voidPayment(applied.invoicePaymentId!, {
       userId: fx.userId, partnerId: fx.partnerId, accessibleOrgIds: [fx.orgId],
-    }))).rejects.toMatchObject({ status: 409, code: 'QUICKBOOKS_OWNED_PAYMENT' });
+    }))).rejects.toMatchObject({ status: 409, code: 'PROVIDER_OWNED_PAYMENT' });
 
     // Refused BEFORE any write: the payment, its mapping and the invoice's own
     // money columns are all exactly as the pull left them.

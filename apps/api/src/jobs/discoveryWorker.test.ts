@@ -8,6 +8,9 @@ const { mockDb } = vi.hoisted(() => ({
     select: vi.fn(),
     update: vi.fn(),
     insert: vi.fn(),
+    execute: vi.fn(async (_query: unknown) => [] as unknown[]),
+    // A nested db.transaction is a savepoint; the mock hands back the same db.
+    transaction: vi.fn(async (cb: (tx: unknown) => unknown) => cb(mockDb)),
   }
 }));
 
@@ -23,9 +26,16 @@ vi.mock('../db', () => ({
   withSystemDbAccessContext: undefined
 }));
 
+// Placement reconciliation itself is covered by services/assetPlacement.test.ts;
+// here only its wiring into the auto-link write is asserted.
+const { reconcileMock } = vi.hoisted(() => ({ reconcileMock: vi.fn(async (_args: unknown) => 'noop') }));
+vi.mock('../services/assetPlacement', () => ({
+  reconcilePlacementOnLinkOrThrow: reconcileMock,
+}));
+
 vi.mock('../db/schema', () => ({
   discoveryProfiles: { id: 'discoveryProfiles.id' },
-  discoveryJobs: { id: 'discoveryJobs.id' },
+  discoveryJobs: { id: 'discoveryJobs.id', status: 'discoveryJobs.status' },
   discoveredAssets: {
     id: 'discoveredAssets.id',
     orgId: 'discoveredAssets.orgId',
@@ -37,7 +47,15 @@ vi.mock('../db/schema', () => ({
     assetType: 'discoveredAssets.assetType',
     detectedAssetType: 'discoveredAssets.detectedAssetType',
     detectedTypeSource: 'discoveredAssets.detectedTypeSource',
-    autoLinkSuppressedAt: 'discoveredAssets.autoLinkSuppressedAt'
+    autoLinkSuppressedAt: 'discoveredAssets.autoLinkSuppressedAt',
+    approvalStatus: 'discoveredAssets.approvalStatus'
+  },
+  deviceHardwareComponents: {
+    deviceId: 'deviceHardwareComponents.deviceId',
+    orgId: 'deviceHardwareComponents.orgId',
+    componentType: 'deviceHardwareComponents.componentType',
+    stale: 'deviceHardwareComponents.stale',
+    attributes: 'deviceHardwareComponents.attributes',
   },
   networkTopology: {
     id: 'networkTopology.id',
@@ -57,6 +75,7 @@ vi.mock('../db/schema', () => ({
     id: 'devices.id',
     orgId: 'devices.orgId',
     siteId: 'devices.siteId',
+    deviceRole: 'devices.deviceRole',
     deviceRoleSource: 'devices.deviceRoleSource',
     agentId: 'devices.agentId',
     status: 'devices.status',
@@ -102,6 +121,9 @@ vi.mock('../services/networkBaseline', () => ({
   buildEventFingerprint: vi.fn(() => 'fingerprint')
 }));
 
+vi.mock('../services/topology/identityDirty', () => ({ markTopologyIdentityDirty: vi.fn() }));
+vi.mock('../services/sentry', () => ({ captureException: vi.fn() }));
+
 vi.mock('./networkBaselineWorker', () => ({
   enqueueBaselineComparison: vi.fn(async () => 'enqueued'),
   getNetworkBaselineQueue: vi.fn()
@@ -110,7 +132,7 @@ vi.mock('./networkBaselineWorker', () => ({
 import { db } from '../db';
 import { buildApprovalDecision } from '../services/assetApproval';
 import { inferAssetTypeFromVendor, lookupMacVendor } from '../services/macVendorLookup';
-import { devices, discoveredAssets } from '../db/schema';
+import { devices, discoveredAssets, deviceHardwareComponents } from '../db/schema';
 import type { DiscoveredHostResult } from './discoveryWorker';
 
 const { cleanupSpeculativeTopologyLinks, processResults, buildScanUpdateSet, __testables } = await import('./discoveryWorker') as typeof import('./discoveryWorker');
@@ -138,6 +160,21 @@ function makeSelectChain(
   chain.then = (resolve: (v: unknown) => void, reject: (e: unknown) => void) =>
     Promise.resolve(currentValue).then(resolve, reject);
   return chain;
+}
+
+// True for the BMC-identity projection (`{deviceId: deviceHardwareComponents.deviceId}`)
+// so a mock `select` implementation can special-case it without consuming the
+// pre-existing FIFO NIC-query fixtures.
+function isBmcProjection(selection: unknown): boolean {
+  return typeof selection === 'object' && selection !== null && 'deviceId' in selection
+    && (selection as { deviceId: unknown }).deviceId === deviceHardwareComponents.deviceId;
+}
+
+// A conditional-returning UPDATE result: awaitable directly (empty array,
+// matching the old unconditional-update mocks) and also supports `.returning()`
+// for the new gated auto-link write.
+function updateResult() {
+  return Object.assign(Promise.resolve([]), { returning: () => Promise.resolve([{ id: 'asset-1' }]) });
 }
 
 function collectSqlLeafStrings(node: unknown, seen = new Set<unknown>(), acc: string[] = []): string[] {
@@ -266,11 +303,12 @@ describe('processResults — type_source', () => {
 
     vi.mocked(buildApprovalDecision).mockReturnValue({ approvalStatus: 'pending', shouldAlert: false });
 
-    vi.mocked(mockDb.select).mockImplementation(() =>
-      makeSelectChain(selectQueue[selectCallIndex++] ?? [], (condition) => {
+    vi.mocked(mockDb.select).mockImplementation((selection?: unknown) => {
+      if (isBmcProjection(selection)) return makeSelectChain([]);
+      return makeSelectChain(selectQueue[selectCallIndex++] ?? [], (condition) => {
         capturedWherePredicates.push(condition);
-      })
-    );
+      });
+    });
 
     vi.mocked(mockDb.update).mockImplementation(() => {
       const chain: Record<string, unknown> = {};
@@ -280,7 +318,7 @@ describe('processResults — type_source', () => {
         if (capturedUpdateSet === null) capturedUpdateSet = args;
         return chain;
       };
-      chain.where = () => Promise.resolve([]);
+      chain.where = () => updateResult();
       return chain;
     });
 
@@ -394,6 +432,34 @@ describe('processResults — type_source', () => {
     expect(capturedInsertValues!.detectedAssetType).toBe('server');
   });
 
+  it('marks topology identity dirty when a scan creates a discovered asset (an SNMP target subject by IP)', async () => {
+    const { markTopologyIdentityDirty } = await import('../services/topology/identityDirty');
+    selectQueue = [...baseSelectQueue(), [], []];
+    await processResults(makeData([{ ip: '192.168.1.60', assetType: 'switch', methods: [] }]));
+    const data = makeData([]);
+    expect(vi.mocked(markTopologyIdentityDirty)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(markTopologyIdentityDirty)).toHaveBeenCalledWith(expect.anything(), { orgId: data.orgId, siteId: data.siteId });
+  });
+
+  // #5998 review: a failed dirty mark leaves new SNMP subjects unresolved
+  // until some other identity change; it must reach Sentry, not only a log.
+  it('reports a failed topology identity dirty mark to Sentry and still completes the job', async () => {
+    const { markTopologyIdentityDirty } = await import('../services/topology/identityDirty');
+    const { captureException } = await import('../services/sentry');
+    const failure = new Error('dirty mark failed');
+    vi.mocked(markTopologyIdentityDirty).mockRejectedValueOnce(failure);
+    selectQueue = [...baseSelectQueue(), [], []];
+    await processResults(makeData([{ ip: '192.168.1.62', assetType: 'switch', methods: [] }]));
+    expect(vi.mocked(captureException)).toHaveBeenCalledWith(failure);
+  });
+
+  it('does not mark topology identity dirty when a scan only refreshes existing assets', async () => {
+    const { markTopologyIdentityDirty } = await import('../services/topology/identityDirty');
+    selectQueue = [...baseSelectQueue(), [{ id: 'asset-1', typeSource: 'auto', detectedTypeSource: null }], [{ linkedDeviceId: null }], []];
+    await processResults(makeData([{ ip: '192.168.1.61', assetType: 'switch', methods: [] }]));
+    expect(vi.mocked(markTopologyIdentityDirty)).not.toHaveBeenCalled();
+  });
+
   describe('SNMP identity ingest wiring', () => {
     const sysObjectId = '.1.3.6.1.4.1.253.8.62.1.37.1.4.1.1';
     const xeroxHost: DiscoveredHostResult = {
@@ -466,7 +532,7 @@ describe('processResults — type_source', () => {
       chain.set = (a: Record<string, unknown>) => { args = a; return chain; };
       chain.where = (w: unknown) => {
         updateCalls.push({ table, args, where: w });
-        return Promise.resolve([]);
+        return updateResult();
       };
       return chain;
     });
@@ -490,8 +556,82 @@ describe('processResults — type_source', () => {
     // COALESCE keeps a NULL device_role_source (never set) counting as
     // non-manual, as the old IS DISTINCT FROM did.
     expect(where.params).toContain('devices.deviceRoleSource');
-    expect(where.sql).toContain(`not in ('manual', 'ai')`);
     expect(where.sql).toContain(`coalesce(`);
+  });
+
+  it('only lets discovery claim a device role nobody else owns — never an agent-detected one (#7971)', async () => {
+    // A Windows Server with RDP/SMB and no SSH classifies as 'workstation' on
+    // the agent's port scan. Its OS-derived role ('server', source 'auto') must
+    // outrank that guess. The guard is a POSITIVE allowlist in the statement:
+    // discovery may overwrite only its own earlier write ('discovery') or an
+    // agent-sourced row that still carries no role ('auto' + 'unknown'). Any
+    // other source — manual, ai, or a source added later — is left alone.
+    const updateCalls: Array<{ table: unknown; args: Record<string, unknown>; where: unknown }> = [];
+
+    selectQueue = [
+      ...baseSelectQueue(),
+      [{ id: 'asset-1', typeSource: 'auto', detectedTypeSource: null }], // [6] existing
+      [{ linkedDeviceId: null }],                                          // [7] not yet linked
+      [{ deviceId: 'device-1' }],                                          // [8] auto-link match found
+    ];
+
+    vi.mocked(mockDb.update).mockImplementation((table: unknown) => {
+      const chain: Record<string, unknown> = {};
+      let args: Record<string, unknown> = {};
+      chain.set = (a: Record<string, unknown>) => { args = a; return chain; };
+      chain.where = (w: unknown) => {
+        updateCalls.push({ table, args, where: w });
+        return updateResult();
+      };
+      return chain;
+    });
+
+    await processResults(makeData([
+      { ip: '192.168.1.54', mac: 'aa:bb:cc:dd:ee:54', assetType: 'workstation', methods: [] },
+    ]));
+
+    const roleUpdate = updateCalls.find((c) => c.table === devices && 'deviceRole' in c.args);
+    expect(roleUpdate).toBeDefined();
+    const where = renderSqlQuery(roleUpdate!.where);
+    expect(where.params).toContain('devices.deviceRoleSource');
+    // Pin the whole clause, not loose substrings: dropping the role conjunct or
+    // turning the inner `and` into `or` must fail here, and each placeholder
+    // must bind the right column.
+    const normalized = where.sql.replace(/\s+/g, ' ');
+    const clause = normalized.match(
+      /\(coalesce\(\$(\d+), 'auto'\) = 'discovery' or \(coalesce\(\$(\d+), 'auto'\) = 'auto' and coalesce\(\$(\d+), 'unknown'\) = 'unknown'\)\)/,
+    );
+    expect(clause).not.toBeNull();
+    const [, srcA, srcB, role] = clause!;
+    expect(where.params[Number(srcA) - 1]).toBe('devices.deviceRoleSource');
+    expect(where.params[Number(srcB) - 1]).toBe('devices.deviceRoleSource');
+    expect(where.params[Number(role) - 1]).toBe('devices.deviceRole');
+    // The old deny-list let an 'auto' role through; it must be gone.
+    expect(where.sql).not.toContain(`not in ('manual', 'ai')`);
+  });
+
+  it('reconciles placement in automatic mode inside the same savepoint as the auto-link write (#8134)', async () => {
+    selectQueue = [
+      ...baseSelectQueue(),
+      [{ id: 'asset-1', typeSource: 'auto', detectedTypeSource: null }], // [6] existing
+      [{ linkedDeviceId: null }],                                          // [7] not yet linked
+      [{ deviceId: 'device-1' }],                                          // [8] auto-link match found
+    ];
+    vi.mocked(mockDb.update).mockImplementation(() => {
+      const chain: Record<string, unknown> = {};
+      chain.set = () => chain;
+      chain.where = () => updateResult();
+      return chain;
+    });
+
+    await processResults(makeData([
+      { ip: '192.168.1.55', mac: 'aa:bb:cc:dd:ee:55', assetType: 'workstation', methods: [] },
+    ]));
+
+    expect(mockDb.transaction).toHaveBeenCalled();
+    expect(reconcileMock).toHaveBeenCalledWith(expect.objectContaining({
+      discoveredAssetId: 'asset-1', deviceId: 'device-1', mode: 'automatic', executor: mockDb,
+    }));
   });
 
   it('does not auto-link a same-MAC/private-IP device from a sibling site', async () => {
@@ -507,11 +647,12 @@ describe('processResults — type_source', () => {
         updatePayloads.push(args);
         return chain;
       };
-      chain.where = () => Promise.resolve([]);
+      chain.where = () => updateResult();
       return chain;
     });
 
-    vi.mocked(mockDb.select).mockImplementation(() => {
+    vi.mocked(mockDb.select).mockImplementation((selection?: unknown) => {
+      if (isBmcProjection(selection)) return makeSelectChain([]);
       const callIndex = selectCallIndex++;
       const initialRows = callIndex === 7
         ? [{ deviceId: 'sibling-site-device' }]
@@ -558,7 +699,7 @@ describe('processResults — type_source', () => {
         updatePayloads.push(args);
         return chain;
       };
-      chain.where = () => Promise.resolve([]);
+      chain.where = () => updateResult();
       return chain;
     });
 
@@ -585,7 +726,7 @@ describe('processResults — type_source', () => {
         updatesByPhase[phase]!.push(args);
         return chain;
       };
-      chain.where = () => Promise.resolve([]);
+      chain.where = () => updateResult();
       return chain;
     });
 
@@ -767,7 +908,7 @@ describe('processResults — type_source', () => {
           updateCalls.push({ table, args });
           return chain;
         };
-        chain.where = () => Promise.resolve([]);
+        chain.where = () => updateResult();
         return chain;
       });
 
@@ -819,7 +960,7 @@ describe('processResults — type_source', () => {
           updateCalls.push({ table, args });
           return chain;
         };
-        chain.where = () => Promise.resolve([]);
+        chain.where = () => updateResult();
         return chain;
       });
 
@@ -869,6 +1010,11 @@ describe('cleanupSpeculativeTopologyLinks', () => {
 
     expect(deleted).toBe(2);
     expect(vi.mocked(db.delete)).toHaveBeenCalledWith(expect.anything());
+    // M2 D5: tagged as legacy collector absence around the DELETE, then cleared.
+    const settings = vi.mocked(mockDb.execute).mock.calls.map(([query]) => new PgDialect().sqlToQuery(query as never).sql);
+    expect(settings).toEqual([expect.stringContaining("'breeze.topology_delete_cause', 'collector_absence', true"), expect.stringContaining("'breeze.topology_delete_cause', '', true")]);
+    expect(vi.mocked(mockDb.execute).mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(db.delete).mock.invocationCallOrder[0]!);
+    expect(vi.mocked(mockDb.execute).mock.invocationCallOrder[1]).toBeGreaterThan(vi.mocked(db.delete).mock.invocationCallOrder[0]!);
   });
 });
 
@@ -884,6 +1030,7 @@ describe('processDispatchScan (wave 3.5b #4084 — dispatch via facade)', () => 
     siteId: 'site-1',
     agentId: 'agent-1',
   };
+  const JOB_ROW_SCHEDULED = { status: 'scheduled' };
   const PROFILE_ROW = { id: 'profile-1' };
   const VALID_AGENT_ROW = { agentId: 'agent-1', orgId: 'org-1', siteId: 'site-1', status: 'online' };
 
@@ -893,7 +1040,7 @@ describe('processDispatchScan (wave 3.5b #4084 — dispatch via facade)', () => 
 
   beforeEach(() => {
     vi.clearAllMocks();
-    selectQueue = [[PROFILE_ROW], [VALID_AGENT_ROW]];
+    selectQueue = [[JOB_ROW_SCHEDULED], [PROFILE_ROW], [VALID_AGENT_ROW]];
     selectCallIndex = 0;
     updateLog = [];
 
@@ -952,5 +1099,21 @@ describe('processDispatchScan (wave 3.5b #4084 — dispatch via facade)', () => 
       const message = (u.payload.errors as { message?: string } | undefined)?.message;
       return typeof message === 'string' && /dispatch outcome indeterminate/i.test(message);
     })).toBe(true);
+  });
+
+  // The cancel route can only best-effort remove the queued BullMQ dispatch;
+  // a job already picked up for processing when cancel ran still reaches
+  // here. The worker must not decrypt SNMP credentials, dispatch to the
+  // agent, or overwrite the operator's 'cancelled' status.
+  it('skips dispatch entirely when the job was cancelled before the worker picked it up', async () => {
+    selectQueue = [[{ status: 'cancelled' }]];
+    selectCallIndex = 0;
+
+    const result = await __testables.processDispatchScan(DATA);
+
+    expect(result).toEqual({ dispatched: false, agentId: null, durationMs: expect.any(Number) });
+    expect(agentRelayMock.dispatchCommandToAgent).not.toHaveBeenCalled();
+    expect(agentRelayMock.isAgentConnectedAnywhere).not.toHaveBeenCalled();
+    expect(updateLog).toEqual([]);
   });
 });

@@ -10,89 +10,20 @@ export const listAlertRulesSchema = z.object({
   orgId: z.string().guid().optional(),
   isActive: z.enum(['true', 'false']).optional(),
   enabled: z.enum(['true', 'false']).optional(),
-  includeRetired: z.enum(['true', 'false']).optional()
+  includeRetired: z.enum(['true', 'false']).optional(),
+  // #7206: the Monitors "Needs conversion" list. Excludes monitor-managed rules
+  // and built-in system anchor rules (see services/monitors/systemManagedRules.ts).
+  needsConversion: z.enum(['true', 'false']).optional(),
+  // #7626: only built-in system anchor rules — the Monitors "Built-in alerts"
+  // list, where each can be switched on or off.
+  systemManaged: z.enum(['true', 'false']).optional()
 });
 
-export const createAlertRuleSchema = z.object({
-  orgId: z.string().guid().optional(),
-  // Ownership axis (#2128, mirrors software/security policies). 'organization'
-  // (default) = classic org-scoped rule. 'partner' = partner-wide / all-orgs;
-  // the server derives the partner from the caller's own token. Create-only.
-  ownerScope: z.enum(['organization', 'partner']).optional(),
-  templateId: z.string().guid().optional(),
-  name: z.string().min(1).max(200).optional(),
-  description: z.string().max(2000).optional(),
-  severity: z.enum(['critical', 'high', 'medium', 'low', 'info']).optional(),
-  targetType: z.string().min(1).max(50).optional(),
-  targetId: z.string().guid().optional(),
-  targets: z.object({
-    type: z.enum(['all', 'org', 'site', 'group', 'device']),
-    ids: z.array(z.string().guid()).optional()
-  }).optional(),
-  conditions: z.any().optional(),
-  notificationChannelIds: z.array(z.string().guid()).optional(),
-  notificationChannels: z.array(z.string().guid()).optional(),
-  cooldownMinutes: z.coerce.number().int().min(1).max(1440).optional(),
-  autoResolve: z.boolean().optional(),
-  enabled: z.boolean().optional(),
-  active: z.boolean().optional(),
-  isActive: z.boolean().optional(),
-  overrideSettings: z.any().optional(),
-  overrides: z.any().optional(),
-  escalationPolicyId: z.string().guid().optional()
-}).superRefine((data, ctx) => {
-  if (!data.templateId) {
-    if (!data.name) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['name'],
-        message: 'Rule name is required'
-      });
-    }
-    if (!data.severity) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['severity'],
-        message: 'Severity is required'
-      });
-    }
-    if (data.conditions === undefined) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['conditions'],
-        message: 'Conditions are required'
-      });
-    }
-  }
-});
-
-export const updateAlertRuleSchema = z.object({
-  templateId: z.string().guid().optional(),
-  name: z.string().min(1).max(200).optional(),
-  description: z.string().max(2000).optional(),
-  severity: z.enum(['critical', 'high', 'medium', 'low', 'info']).optional(),
-  targetType: z.string().min(1).max(50).optional(),
-  targetId: z.string().guid().optional(),
-  targets: z.object({
-    type: z.enum(['all', 'org', 'site', 'group', 'device']),
-    ids: z.array(z.string().guid()).optional()
-  }).optional(),
-  conditions: z.any().optional(),
-  notificationChannelIds: z.array(z.string().guid()).optional(),
-  notificationChannels: z.array(z.string().guid()).optional(),
-  cooldownMinutes: z.coerce.number().int().min(1).max(1440).optional(),
-  autoResolve: z.boolean().optional(),
-  enabled: z.boolean().optional(),
-  active: z.boolean().optional(),
-  overrideSettings: z.any().optional(),
-  overrides: z.any().optional(),
-  escalationPolicyId: z.string().guid().optional(),
-  isActive: z.boolean().optional()
-});
-
-export const testAlertRuleSchema = z.object({
-  deviceId: z.string().guid()
-});
+// #7626: the one write left on legacy alert_rules. Strict: on/off is all a
+// built-in rule exposes; everything else about it is owned by Breeze.
+export const setBuiltInRuleActiveSchema = z.object({
+  isActive: z.boolean()
+}).strict();
 
 export const bulkAlertActionSchema = z.object({
   action: z.enum(['acknowledge', 'resolve', 'suppress', 'dismiss']),
@@ -140,6 +71,12 @@ export const suppressAlertSchema = z.object({
   // Absolute ISO deadline the alert stays muted until. Omit for indefinite
   // ("Forever") suppression — the row's suppressedUntil is then left null.
   until: z.string().optional()
+});
+
+export const unsuppressAlertSchema = z.object({
+  // The status the alert had before it was muted (the caller knows; the server
+  // cannot reliably infer it). Omitted => fall back to acknowledgedAt.
+  restoreStatus: z.enum(['active', 'acknowledged']).optional()
 });
 
 // Notification Channels schemas

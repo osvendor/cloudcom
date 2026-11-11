@@ -44,7 +44,7 @@ export interface FleetDesignApplyPreviewFunction {
 export interface FleetDesignApplyDisplacement {
   policyId: string;
   policyName: string;
-  featureType: 'monitoring' | 'alert_rule';
+  featureType: 'monitors';
   deviceCount: number;
 }
 
@@ -120,6 +120,7 @@ export interface FleetDesignLedgerItem {
 }
 
 export type FleetDesignRollbackRefusal =
+  | 'legacy_source_retired'
   | 'modified_since_apply'
   | 'group_has_other_members'
   | 'policy_missing'
@@ -142,11 +143,21 @@ export type FleetDesignCreatedRefs = {
   alertRuleLinkId?: string;
   assignmentId?: string;
   linkId?: string;
-  linksSnapshot?: { monitoring: unknown; alertRule: unknown };
+  linksSnapshot?: { monitoring: unknown; alertRule: unknown; monitors?: unknown };
+  /** W05c2: on a watch/rule ledger row, the monitor definition that item created. */
+  monitorId?: string;
+  /** W05c2: the policy's inline `monitors` feature link. */
+  monitorLinkId?: string;
+  /** W05c2: on the policy ledger row, item ref → monitor definition id, cumulative across applies. */
+  monitorIdsByItemRef?: Record<string, string>;
+  /** W05c2: author fields of every created definition at apply time, for rollback's unmodified check. */
+  monitorSnapshots?: Record<string, unknown>;
   membershipSnapshot?: string[];
   scriptId?: string;
   /** W04: the name the script was created under (may carry a rename suffix). */
   scriptName?: string;
+  /** W16 (#6786): on a role_correction row, the role this design applied, for rollback's "still ours" check. */
+  deviceRole?: string;
 };
 
 /** `fleet_design_applied_items.before_image` — state before the apply, for rollback. */

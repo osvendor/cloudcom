@@ -6,10 +6,16 @@ import { fetchWithAuth } from '../../stores/auth';
 import { installAstroClientRouterStandIn, type ClientRouterStandIn } from '../../__tests__/astroClientRouterStandIn';
 
 // Org scope, so the fleet-view gate stays open and the data paths under test run.
+const scopeState = vi.hoisted(() => ({ scope: 'org' as 'org' | 'all', orgId: 'org-1' as string | null }));
 vi.mock('@/hooks/useOrgScope', () => ({
-  useOrgScope: () => ({ ready: true, status: 'resolved', scope: 'org', orgId: 'org-1', org: null, error: null }),
-  getOrgScope: () => ({ ready: true, status: 'resolved', scope: 'org', orgId: 'org-1', org: null, error: null }),
+  useOrgScope: () => (scopeState.scope === 'all'
+    ? { ready: true, status: 'resolved', scope: 'all', orgId: null, org: null, error: null }
+    : { ready: true, status: 'resolved', scope: 'org', orgId: scopeState.orgId, org: null, error: null }),
+  getOrgScope: () => (scopeState.scope === 'all'
+    ? { ready: true, status: 'resolved', scope: 'all', orgId: null, org: null, error: null }
+    : { ready: true, status: 'resolved', scope: 'org', orgId: scopeState.orgId, org: null, error: null }),
 }));
+vi.mock('./BackupHealthOverview', () => ({ default: () => <div data-testid="stub-health-overview" /> }));
 vi.mock('../../stores/auth', () => ({
   registerOrgIdProvider: vi.fn(),
   fetchWithAuth: vi.fn()
@@ -42,6 +48,8 @@ const makeJsonResponse = (payload: unknown, ok = true, status = ok ? 200 : 500):
 describe('BackupDashboard usage history chart', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    scopeState.scope = 'org';
+    scopeState.orgId = 'org-1';
     window.location.hash = '';
     HTMLDialogElement.prototype.showModal = vi.fn(function showModal(this: HTMLDialogElement) {
       this.setAttribute('open', '');
@@ -114,6 +122,59 @@ describe('BackupDashboard usage history chart', () => {
     expect(await screen.findByLabelText('Storage usage trend by provider over time')).not.toBeNull();
     expect(screen.getByText(/Chunk retry exceeded threshold/i)).toBeTruthy();
     expect(screen.queryByText('Chart placeholder: integrate provider usage history.')).toBeNull();
+
+    // G3-4 (#6496): with real provider rows present, the "no storage
+    // providers configured" empty state must not render alongside them.
+    expect(screen.getByText('S3')).toBeTruthy();
+    expect(screen.getByText('Local')).toBeTruthy();
+    expect(screen.queryByText(/No storage providers configured yet/i)).toBeNull();
+
+    // #6496: the chart axis dates must use the app's own long date format
+    // (e.g. "Feb 1, 2026"), not the runtime default short-numeric US locale
+    // (e.g. "2/1/2026"). Assert the shape rather than an exact day, since the
+    // UTC timestamps land on different local calendar days depending on the
+    // test runner's timezone.
+    const longDatePattern = /^[A-Z][a-z]{2} \d{1,2}, 2026$/;
+    const shortNumericPattern = /^\d{1,2}\/\d{1,2}\/2026$/;
+    const axisLabels = screen.getAllByText(longDatePattern);
+    expect(axisLabels.length).toBe(2);
+    expect(screen.queryByText(shortNumericPattern)).toBeNull();
+  });
+
+  it('renders the /backup/dashboard storageProviders rows instead of the empty state (#2562)', async () => {
+    fetchWithAuthMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === '/backup/dashboard') {
+        // The shape apps/api/src/routes/backup/dashboard.ts actually sends.
+        return makeJsonResponse({
+          data: {
+            storage: { totalBytes: 2048, snapshots: 2 },
+            latestJobs: [],
+            attentionItems: [],
+            storageProviders: [
+              { id: 'backblaze', name: 'Backblaze B2', usedBytes: 2048, snapshots: 2, configs: 1 },
+              { id: 's3', name: 'S3', usedBytes: 0, snapshots: 0, configs: 1 },
+            ],
+          },
+        });
+      }
+      if (url === '/backup/usage-history?days=14') {
+        return makeJsonResponse({ data: { points: [] } });
+      }
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<BackupDashboard />);
+
+    await screen.findByText('Storage by Provider');
+    expect(screen.getByText('Backblaze B2')).toBeTruthy();
+    expect(screen.getByTestId('storage-provider-used-backblaze').textContent).toBe('2.00 KB');
+    // A configured destination with no snapshots yet is still a row, not the
+    // "none configured" empty state.
+    expect(screen.getByTestId('storage-provider-used-s3').textContent).toBe('0 B');
+    expect(screen.queryByText(/No storage providers configured yet/i)).toBeNull();
+    // No capacity is known for object storage, so no "/ --" placeholder.
+    expect(screen.queryByText(/\/ --/)).toBeNull();
   });
 
   it('shows the recovery bootstrap tab', async () => {
@@ -239,7 +300,9 @@ describe('BackupDashboard usage history chart', () => {
       fireEvent.click(link);
 
       expect(await screen.findByText('File Restore Wizard Stub')).toBeTruthy();
-      expect(window.location.hash).toBe('#restore');
+      // #6456: the snapshot being browsed is carried into the Restore tab's
+      // hash so the wizard doesn't make the operator re-pick it.
+      expect(window.location.hash).toBe('#restore?snapshot=snap-1');
     } finally {
       router.uninstall();
     }
@@ -444,5 +507,263 @@ describe('BackupDashboard usage history chart', () => {
     await screen.findByText('edge-02');
     expect(screen.getByText('Partial')).toBeTruthy();
     expect(screen.queryByText('Warning')).toBeNull();
+  });
+
+  it('renders a pending catch-up recent job as "Queued", not the generic Warning bucket (#11036)', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    fetchWithAuthMock.mockImplementation(async (input) => {
+      const url = String(input);
+
+      if (url === '/backup/dashboard') {
+        return makeJsonResponse({
+          data: {
+            stats: [],
+            recentJobs: [
+              { id: 'job-pending', device: 'edge-03', config: 'Primary S3', status: 'pending', started: '1m ago', duration: '-', size: '-' },
+            ],
+            storageProviders: [],
+            attentionItems: [],
+          },
+        });
+      }
+
+      if (url === '/backup/usage-history?days=14') {
+        return makeJsonResponse({ data: { points: [] } });
+      }
+
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<BackupDashboard />);
+
+    await screen.findByText('edge-03');
+    expect(screen.getByText('Queued')).toBeTruthy();
+    expect(screen.queryByText('Warning')).toBeNull();
+    expect(warn).not.toHaveBeenCalledWith(expect.stringContaining('Unmapped backup job status'));
+    warn.mockRestore();
+  });
+
+  it('renders a cancelled recent job as "Cancelled", not the generic Warning bucket (#11036)', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    fetchWithAuthMock.mockImplementation(async (input) => {
+      const url = String(input);
+
+      if (url === '/backup/dashboard') {
+        return makeJsonResponse({
+          data: {
+            stats: [],
+            recentJobs: [
+              { id: 'job-cancelled', device: 'edge-03', config: 'Primary S3', status: 'cancelled', started: '1m ago', duration: '-', size: '-' },
+            ],
+            storageProviders: [],
+            attentionItems: [],
+          },
+        });
+      }
+
+      if (url === '/backup/usage-history?days=14') {
+        return makeJsonResponse({ data: { points: [] } });
+      }
+
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<BackupDashboard />);
+
+    await screen.findByText('edge-03');
+    expect(screen.getByText('Cancelled')).toBeTruthy();
+    expect(screen.queryByText('Warning')).toBeNull();
+    expect(warn).not.toHaveBeenCalledWith(expect.stringContaining('Unmapped backup job status'));
+    warn.mockRestore();
+  });
+
+  it('keeps skipped reparse points out of a recent job\'s red error line (#9543)', async () => {
+    const reparseNote =
+      '1 reparse point(s) were not backed up (junctions and mount points are skipped, not followed; 1 other): ' +
+      'C:\\a.exe (other reparse point, tag 0x8000001B)';
+    fetchWithAuthMock.mockImplementation(async (input) => {
+      const url = String(input);
+
+      if (url === '/backup/dashboard') {
+        return makeJsonResponse({
+          data: {
+            stats: [],
+            recentJobs: [
+              { id: 'job-stopped', device: 'edge-03', config: 'Primary S3', status: 'failed', started: '5m ago', duration: '3m', size: '85 B', errorLog: `backup stopped; ${reparseNote}` },
+              { id: 'job-clean', device: 'edge-04', config: 'Primary S3', status: 'completed', started: '6m ago', duration: '3m', size: '85 B', errorLog: reparseNote },
+            ],
+            storageProviders: [],
+            attentionItems: [],
+          },
+        });
+      }
+
+      if (url === '/backup/usage-history?days=14') {
+        return makeJsonResponse({ data: { points: [] } });
+      }
+
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<BackupDashboard />);
+
+    await screen.findByText('edge-04');
+    expect(screen.getByText('backup stopped')).toBeTruthy();
+    expect(screen.queryByText(/reparse point/i)).toBeNull();
+  });
+
+  it('labels a recent job diagnostic with its failure category (#11027)', async () => {
+    fetchWithAuthMock.mockImplementation(async (input) => {
+      const url = String(input);
+
+      if (url === '/backup/dashboard') {
+        return makeJsonResponse({
+          data: {
+            stats: [],
+            // The key the API actually sends (GET /backup/dashboard → latestJobs).
+            latestJobs: [
+              { id: 'job-bad', device: 'edge-05', config: 'Primary S3', status: 'failed', started: '5m ago', duration: '3m', size: '85 B', errorLog: 'Agent not connected', failureCategory: 'device_offline' },
+              { id: 'job-ok', device: 'edge-06', config: 'Primary S3', status: 'completed', started: '6m ago', duration: '3m', size: '85 B', errorLog: null, failureCategory: null },
+            ],
+            storageProviders: [],
+            attentionItems: [],
+          },
+        });
+      }
+
+      if (url === '/backup/usage-history?days=14') {
+        return makeJsonResponse({ data: { points: [] } });
+      }
+
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<BackupDashboard />);
+
+    await screen.findByText('edge-06');
+    const badges = screen.getAllByTestId('backup-failure-category');
+    expect(badges).toHaveLength(1);
+    expect(badges[0]?.getAttribute('data-category')).toBe('device_offline');
+    expect(screen.getByText('Agent not connected')).toBeTruthy();
+  });
+
+  it('keeps the recoverable index drop note out of a recent job\'s red error line (#11026)', async () => {
+    const indexNote = 'snapshot file index omitted (17950 entries): the result exceeded the 4934464 byte server result budget, so per-file restore browsing is unavailable for this snapshot';
+    fetchWithAuthMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === '/backup/dashboard') {
+        return makeJsonResponse({
+          data: {
+            stats: [],
+            recentJobs: [
+              { id: 'job-stopped', device: 'edge-03', config: 'Primary S3', status: 'failed', started: '5m ago', duration: '3m', size: '85 B', errorLog: `backup stopped || bounded: ${indexNote}` },
+              { id: 'job-clean', device: 'edge-04', config: 'Primary S3', status: 'completed', started: '6m ago', duration: '3m', size: '85 B', errorLog: `bounded: ${indexNote}` },
+            ],
+            storageProviders: [],
+            attentionItems: [],
+          },
+        });
+      }
+      if (url === '/backup/usage-history?days=14') {
+        return makeJsonResponse({ data: { points: [] } });
+      }
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<BackupDashboard />);
+
+    await screen.findByText('edge-04');
+    expect(screen.getByText('backup stopped')).toBeTruthy();
+    expect(screen.queryByText(/snapshot file index/i)).toBeNull();
+  });
+
+  it('counts completed_with_errors jobs as successful restore points in the 24h success rate (#5396)', async () => {
+    // completed_with_errors is a restorable snapshot, so it belongs in the
+    // numerator (like completed) as well as the denominator — not just the
+    // denominator the way `partial` is.
+    fetchWithAuthMock.mockImplementation(async (input) => {
+      const url = String(input);
+
+      if (url === '/backup/dashboard') {
+        return makeJsonResponse({
+          data: {
+            jobsLast24h: { completed: 1, completedWithErrors: 1, failed: 0, partial: 0, running: 0, pending: 0 },
+            recentJobs: [],
+            storageProviders: [],
+            attentionItems: [],
+          },
+        });
+      }
+
+      if (url === '/backup/usage-history?days=14') {
+        return makeJsonResponse({ data: { points: [] } });
+      }
+
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<BackupDashboard />);
+
+    await screen.findByText('Success Rate (24h)');
+    // (1 completed + 1 completed_with_errors) of 2 total = 100%.
+    expect(screen.getByText('100%')).toBeTruthy();
+  });
+
+  it('renders a completed_with_errors recent job as its own amber state, never green "Success"', async () => {
+    fetchWithAuthMock.mockImplementation(async (input) => {
+      const url = String(input);
+
+      if (url === '/backup/dashboard') {
+        return makeJsonResponse({
+          data: {
+            stats: [],
+            recentJobs: [
+              {
+                id: 'job-cwe',
+                device: 'edge-03',
+                config: 'Primary S3',
+                status: 'completed_with_errors',
+                started: '5m ago',
+                duration: '3m',
+                size: '85 B',
+              },
+            ],
+            storageProviders: [],
+            attentionItems: [],
+          },
+        });
+      }
+
+      if (url === '/backup/usage-history?days=14') {
+        return makeJsonResponse({ data: { points: [] } });
+      }
+
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<BackupDashboard />);
+
+    await screen.findByText('edge-03');
+    expect(screen.getByText('Completed with errors')).toBeTruthy();
+    expect(screen.queryByText('Success')).toBeNull();
+    expect(screen.queryByText('Warning')).toBeNull();
+  });
+
+  it('renders the health view alone in all-organizations mode, calling neither org-only endpoint', async () => {
+    scopeState.scope = 'all';
+    fetchWithAuthMock.mockResolvedValue(makeJsonResponse({ data: {} }));
+    render(<BackupDashboard />);
+    expect(await screen.findByTestId('stub-health-overview')).toBeInTheDocument();
+    const urls = fetchWithAuthMock.mock.calls.map(([u]) => String(u));
+    expect(urls).not.toContain('/backup/dashboard');
+    expect(urls.some((u) => u.startsWith('/backup/usage-history'))).toBe(false);
+  });
+
+  it('renders the health view above the tiles in org mode and still loads the dashboard', async () => {
+    scopeState.scope = 'org';
+    fetchWithAuthMock.mockResolvedValue(makeJsonResponse({ data: {} }));
+    render(<BackupDashboard />);
+    expect(await screen.findByTestId('stub-health-overview')).toBeInTheDocument();
+    expect(fetchWithAuthMock.mock.calls.map(([u]) => String(u))).toContain('/backup/dashboard');
   });
 });

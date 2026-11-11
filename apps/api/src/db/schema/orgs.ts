@@ -1,6 +1,6 @@
-import { pgTable, uuid, varchar, text, timestamp, jsonb, pgEnum, integer, boolean, numeric, char, uniqueIndex, index } from 'drizzle-orm/pg-core';
+import { pgTable, uuid, varchar, text, timestamp, jsonb, pgEnum, integer, boolean, numeric, char, uniqueIndex, index, check, type AnyPgColumn } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
-import type { ImpactWeightOverrides } from '@breeze/shared';
+import type { ImpactWeightOverrides, PartnerPurchaseSelection, RearmMode } from '@breeze/shared';
 
 export const partnerTypeEnum = pgEnum('partner_type', ['msp', 'enterprise', 'internal']);
 // `offboarding` (#2774) is the terminal-intent drain state: users locked out
@@ -18,7 +18,13 @@ export const planTypeEnum = pgEnum('plan_type', ['free', 'starter', 'community',
 // (organizations_partner_quick_support_uniq). It must stay inside
 // accessibleOrgIds so RLS lets techs reach their own support sessions, but it
 // is excluded from every user-facing org enumeration and device/billing count.
-export const orgTypeEnum = pgEnum('org_type', ['customer', 'internal', 'quick_support']);
+//
+// 'unassigned_pool' is the hidden per-partner holding org for devices enrolled
+// with a partner deploy key. Exactly one per
+// partner (organizations_partner_unassigned_pool_uniq). Unlike quick_support it
+// is NEVER inside a human caller's accessibleOrgIds, is execution-denied, and
+// is protected by triggers (see services/unassignedPool/orgType.ts).
+export const orgTypeEnum = pgEnum('org_type', ['customer', 'internal', 'quick_support', 'unassigned_pool']);
 export const orgStatusEnum = pgEnum('org_status', ['active', 'suspended', 'trial', 'churned', 'offboarding', 'merging', 'archived', 'purging']);
 
 export const partners = pgTable('partners', {
@@ -31,6 +37,10 @@ export const partners = pgTable('partners', {
   status: partnerStatusEnum('status').notNull().default('active'),
   maxOrganizations: integer('max_organizations'),
   maxDevices: integer('max_devices'),
+  // Billing-controlled, finite temporary enrollment allowance. It is not paid
+  // capacity and never comes from signup intent or partner-editable settings.
+  billingAdmissionLimit: integer('billing_admission_limit'),
+  billingAdmissionExpiresAt: timestamp('billing_admission_expires_at', { withTimezone: true }),
   // First-class partner timezone (issue #1318). The canonical default that a tz
   // field resolves to when no more-specific scope (explicit/site/org) is set.
   // Kept in sync with the legacy `settings.timezone` JSONB key, which remains
@@ -39,6 +49,8 @@ export const partners = pgTable('partners', {
   settings: jsonb('settings').default({}),
   ssoConfig: jsonb('sso_config'),
   billingEmail: varchar('billing_email', { length: 255 }),
+  // Durable signup preference. It never grants plan, capacity or subscription authority.
+  purchaseSelection: jsonb('purchase_selection').$type<PartnerPurchaseSelection | null>(),
   // Plain-text signature appended to outbound customer emails (quote sends).
   emailSignature: text('email_signature'),
   // Auto-email the issued invoice (with its public pay link) when a quote is
@@ -49,6 +61,12 @@ export const partners = pgTable('partners', {
   // acceptance ON THEIR BEHALF. DEFAULT OFF — a new outbound customer email
   // must not start firing on upgrade. Same dedicated-column reasoning as above.
   notifyCustomerOnBehalfAcceptance: boolean('notify_customer_on_behalf_acceptance').notNull().default(false),
+  // Per-partner switch (and kill switch) for deploy-key enrollment into the
+  // partner's holding area. Effective only while the platform flag
+  // PRE_ASSIGNMENT_ENROLLMENT_ENABLED is also on
+  // (services/unassignedPool/switches.ts). Default OFF. Dedicated column, same
+  // reasoning as above.
+  deployKeyEnrollmentEnabled: boolean('deploy_key_enrollment_enabled').notNull().default(false),
   // P2-6 (#4193). PARTIAL overrides of DEFAULT_IMPACT_WEIGHTS (@breeze/shared);
   // NULL means "defaults". Dedicated column, not a partners.settings
   // sub-object — settings cards replace sub-objects wholesale (#3597) and
@@ -83,6 +101,7 @@ export const partners = pgTable('partners', {
   signupIpClassifiedAt: timestamp('signup_ip_classified_at', { withTimezone: true }),
   emailVerifiedAt: timestamp('email_verified_at', { withTimezone: true }),
   paymentMethodAttachedAt: timestamp('payment_method_attached_at', { withTimezone: true }),
+  autopayEnabled: boolean('autopay_enabled').notNull().default(false),
   stripeCustomerId: text('stripe_customer_id'),
   // Billing identity snapshot, written ONLY by the separate billing service
   // from its payment-provider webhooks and read only by the abuse sweep
@@ -138,6 +157,14 @@ export const partners = pgTable('partners', {
   // keeps gate === read-back with no #3608 stored-false ambiguity. Resolved
   // ONCE at issue onto invoices.device_appendix; never read at render time.
   invoiceDeviceAppendix: boolean('invoice_device_appendix').notNull().default(false),
+  // #8604: invoice labor line itemization defaults (resolver:
+  // resolveInvoiceLineDetail in @breeze/shared). Defaults reproduce the
+  // pre-#8604 document. Frozen at issue onto invoices.line_*; never read at
+  // render time for an issued invoice. grouping is CHECK ('entry','day') in SQL.
+  invoiceLineGrouping: varchar('invoice_line_grouping', { length: 8 }).notNull().default('entry'),
+  invoiceLineShowDate: boolean('invoice_line_show_date').notNull().default(false),
+  invoiceLineShowNote: boolean('invoice_line_show_note').notNull().default(true),
+  invoiceLineShowWorkedTime: boolean('invoice_line_show_worked_time').notNull().default(true),
   // Partner-authored AI copy style for enrich/polish (NULL = built-in house
   // format: generic customer-friendly name + "• "-bulleted spec description).
   catalogAiStyle: text('catalog_ai_style'),
@@ -146,6 +173,10 @@ export const partners = pgTable('partners', {
   // surface gate on this; it is NOT in settings JSONB because that is
   // partner-writable and the partner must not be able to self-enable.
   aiForOfficeEnabled: boolean('ai_for_office_enabled').notNull().default(false),
+  // Trust Center footer removal — operator-granted (spec trust-center §9, §18.3).
+  // Dedicated column for the same reason as aiForOfficeEnabled: settings JSONB is
+  // partner-writable and the partner must not self-enable.
+  trustPageUnbranded: boolean('trust_page_unbranded').notNull().default(false),
   // #5075 W04 — which service-desk/billing module this partner runs.
   // 'native' = Breeze's own service desk & billing (default, and what every
   // partner ran before this column existed); 'external' = the partner's PSA is
@@ -159,6 +190,20 @@ export const partners = pgTable('partners', {
   // Partner-writable via PATCH /partners/me (unlike aiForOfficeEnabled above,
   // which is a platform-granted entitlement).
   serviceManagementMode: text('service_management_mode').$type<'native' | 'external' | 'off'>().notNull().default('native'),
+  // Partner billing toggle (spec 2026-10-16-partner-billing-enabled-design.md §5.6):
+  // a dedicated column, not partners.settings, because gates and job predicates query it.
+  // Migration 2027-01-05-120000 backfills existing partners, then sets DEFAULT true + NOT NULL.
+  billingEnabled: boolean('billing_enabled').notNull().default(true),
+  // #9075 W4a (OD8 B): agreement-request defaults (Settings → Billing →
+  // Agreements). Partner level only — no org override. Dedicated columns for
+  // the billingEnabled reason: the reminder job's selector queries them.
+  // Never read directly — always through services/agreementRequestDefaults.ts.
+  // Expiry: days a new request lives when the sender sets none.
+  agreementDefaultExpiryDays: integer('agreement_default_expiry_days').notNull().default(30),
+  // Automatic reminders every N days since the last email; NULL = off (default).
+  agreementReminderIntervalDays: integer('agreement_reminder_interval_days'),
+  // Automatic reminders stop once reminder_count reaches this (manual ones count).
+  agreementMaxReminders: integer('agreement_max_reminders').notNull().default(3),
   // FK to psa_connections(id) ON DELETE RESTRICT, declared in the migration
   // only: integrations.ts already imports orgs.ts, so a `.references()` here
   // would close an import cycle. Paired with the mode by
@@ -167,7 +212,48 @@ export const partners = pgTable('partners', {
   // #2774 — NULL = not offboarding. Set on drain entry, cleared on
   // abort/finalize. Drain deadline = this + OFFBOARDING_DRAIN_WINDOW_HOURS.
   offboardingStartedAt: timestamp('offboarding_started_at', { withTimezone: true }),
-});
+  // Alert re-arm lifecycle W2 (#10765): the partner DEFAULT every org and
+  // monitor inherits (org override → monitor override beat it). Read ONLY via
+  // services/alertLifecycle/resolve.ts (contract test). The rearm delay is set
+  // iff the mode is 'after_delay' (partners_alert_rearm_delay_chk).
+  alertAutoResolve: boolean('alert_auto_resolve').notNull().default(false),
+  alertRearmMode: text('alert_rearm_mode').$type<RearmMode>().notNull().default('new_evidence'),
+  alertRearmDelayMinutes: integer('alert_rearm_delay_minutes'),
+  alertCooldownMinutes: integer('alert_cooldown_minutes').notNull().default(5),
+}, (table) => [
+  check('partners_agreement_default_expiry_days_check', sql`${table.agreementDefaultExpiryDays} BETWEEN 1 AND 365`),
+  check('partners_agreement_reminder_interval_days_check',
+    sql`${table.agreementReminderIntervalDays} IS NULL OR ${table.agreementReminderIntervalDays} BETWEEN 1 AND 30`),
+  check('partners_agreement_max_reminders_check', sql`${table.agreementMaxReminders} BETWEEN 1 AND 10`),
+  check('partners_alert_rearm_mode_chk', sql`${table.alertRearmMode} IN ('new_evidence', 'after_delay')`),
+  check('partners_alert_rearm_delay_chk', sql`(${table.alertRearmMode} = 'after_delay') = (${table.alertRearmDelayMinutes} IS NOT NULL)
+    AND (${table.alertRearmDelayMinutes} IS NULL OR ${table.alertRearmDelayMinutes} BETWEEN 1 AND 1440)`),
+  check('partners_alert_cooldown_chk', sql`${table.alertCooldownMinutes} BETWEEN 0 AND 1440`),
+  check('partners_purchase_selection_valid', sql`${table.purchaseSelection} IS NULL OR COALESCE((
+  (
+    jsonb_typeof(${table.purchaseSelection}) = 'object'
+    AND ${table.purchaseSelection} ?& ARRAY['catalogVersion', 'capacity', 'billingPeriod']
+    AND ${table.purchaseSelection} - ARRAY['catalogVersion', 'capacity', 'billingPeriod'] = '{}'::jsonb
+    AND ${table.purchaseSelection}->'catalogVersion' = '"launch-2026-10"'::jsonb
+    AND (
+      (${table.purchaseSelection}->'billingPeriod' = '"monthly"'::jsonb AND ${table.purchaseSelection}->'capacity' IN ('100'::jsonb, '150'::jsonb, '200'::jsonb, '250'::jsonb, '300'::jsonb, '350'::jsonb, '400'::jsonb, '450'::jsonb, '500'::jsonb, '750'::jsonb, '1000'::jsonb))
+      OR (${table.purchaseSelection}->'billingPeriod' = '"annual"'::jsonb AND ${table.purchaseSelection}->'capacity' IN ('100'::jsonb, '250'::jsonb, '500'::jsonb, '1000'::jsonb))
+    )
+  )
+  OR (
+    jsonb_typeof(${table.purchaseSelection}) = 'object'
+    AND ${table.purchaseSelection} ? 'intent'
+    AND ${table.purchaseSelection} - ARRAY['intent', 'offer'] = '{}'::jsonb
+    AND ${table.purchaseSelection}->'intent' IN ('"cloud"'::jsonb, '"wisp"'::jsonb)
+    AND (
+      NOT ${table.purchaseSelection} ? 'offer'
+      OR (
+        jsonb_typeof(${table.purchaseSelection}->'offer') = 'string'
+        AND ${table.purchaseSelection}->>'offer' ~ '^[a-z][a-z0-9_-]{0,31}$'
+      )
+    )
+  )), false)`),
+]);
 
 /**
  * Name of the per-partner, case-insensitive, lifetime slug uniqueness index
@@ -207,8 +293,15 @@ export const organizations = pgTable('organizations', {
   // Multi-currency (spec §5): the org's billing currency, inherited from the
   // partner at creation. Deliberately NO .default() — every creation path must
   // stamp it explicitly, so a missed path is a loud insert failure, never a
-  // silent USD document. Editing is NOT exposed until wave 6.
+  // silent USD document. Not inherited afterwards: a later partner currency
+  // change never moves it (#7510); it is edited per org from the org Billing tab
+  // (wave 6, with a currency-change impact preview).
   currencyCode: char('currency_code', { length: 3 }).notNull(),
+  // Settings consolidation W06 (#6229): org override of the partner's invoice
+  // payment terms. NULL = inherit `partners.invoice_terms_days`; deliberately
+  // no default and no backfill. DB CHECK bounds it to 0–365. Resolved ONLY by
+  // services/invoiceTerms.ts#resolveInvoiceTermsDays and frozen as due_date at issue.
+  invoiceTermsDays: integer('invoice_terms_days'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
   partnerExportUpdatedAt: timestamp('partner_export_updated_at', { precision: 3 }).defaultNow().notNull(),
@@ -224,6 +317,15 @@ export const organizations = pgTable('organizations', {
   // code to execute on a vendor sandbox. Default false until the DPA review;
   // enforced at analysis-run ADMISSION (runService.ts), never in the catalog.
   aiExternalProcessing: boolean('ai_external_processing').notNull().default(false),
+  // Alert re-arm lifecycle W2 (#10765): org OVERRIDE of the partner's alert
+  // lifecycle default. Each NULL = inherit `partners.alert_*`; no defaults, no
+  // backfill. CHECKs (migration 2027-01-20-130000): mode in
+  // ('new_evidence','after_delay'), delay 1–1440 set iff mode = 'after_delay',
+  // cooldown 0–1440. Read ONLY via services/alertLifecycle/resolve.ts.
+  alertAutoResolve: boolean('alert_auto_resolve'),
+  alertRearmMode: text('alert_rearm_mode').$type<RearmMode>(),
+  alertRearmDelayMinutes: integer('alert_rearm_delay_minutes'),
+  alertCooldownMinutes: integer('alert_cooldown_minutes'),
   deletedAt: timestamp('deleted_at')
 }, (table) => ({
   orgPartnerUnique: uniqueIndex('organizations_id_partner_id_unique').on(table.id, table.partnerId),
@@ -247,7 +349,17 @@ export const sites = pgTable('sites', {
   settings: jsonb('settings').default({}),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
-  partnerExportUpdatedAt: timestamp('partner_export_updated_at', { precision: 3 }).defaultNow().notNull()
+  partnerExportUpdatedAt: timestamp('partner_export_updated_at', { precision: 3 }).defaultNow().notNull(),
+  // #4186: deliberately pinned site coordinate (never a technician position).
+  latitude: numeric('latitude', { precision: 9, scale: 6, mode: 'number' }),
+  longitude: numeric('longitude', { precision: 9, scale: 6, mode: 'number' }),
+  geofenceRadiusM: integer('geofence_radius_m'),
+  locationSource: varchar('location_source', { length: 16 }).$type<'technician' | 'manual' | 'geocoded'>(),
+  // FK sites_location_set_by_fkey -> users(id) ON DELETE SET NULL is defined in
+  // the SQL migration (authoritative): users.ts imports orgs.ts, so a Drizzle
+  // reference here would be cyclic.
+  locationSetBy: uuid('location_set_by'),
+  locationSetAt: timestamp('location_set_at', { withTimezone: true }),
 }, (table) => ({
   idOrgUnique: uniqueIndex('sites_id_org_id_uniq').on(table.id, table.orgId),
   orgIdIdx: index('sites_org_id_idx').on(table.orgId),
@@ -281,6 +393,25 @@ export const enrollmentKeys = pgTable('enrollment_keys', {
   // Plain uuid — the FK lives in SQL to avoid a circular import with
   // supportSessions.ts (which imports organizations from this file).
   supportSessionId: uuid('support_session_id'),
+  // Parent-lineage for a child key minted by redeeming a public /s/:code
+  // short-link (routes/enrollmentKeys.ts publicShortLinkRoutes). Distinct
+  // from bootstrapTokenId above, which links a child to the
+  // installer_bootstrap_tokens row that minted it (the MCP bootstrap /
+  // authenticated-installer path) — a /s/:code redemption mints its child
+  // directly against the parent link row, with no bootstrap-token row in
+  // between, so it carries no bootstrapTokenId at all. Nullable: only set
+  // for that one redemption path. Self-referencing FK, so it needs the lazy
+  // `(): AnyPgColumn =>` form (a plain `() =>` reference can't resolve a
+  // table to itself at module-eval time).
+  sourceLinkKeyId: uuid('source_link_key_id').references((): AnyPgColumn => enrollmentKeys.id, { onDelete: 'set null' }),
+  // Snapshot of the parent's credentialGeneration at the moment this child
+  // was minted. Rotating the parent bumps its own credentialGeneration;
+  // comparing this snapshot against the parent's CURRENT value at rotation
+  // time is what lets rotation find and revoke children minted from the
+  // superseded credential, the same pattern installerBootstrapTokens.
+  // parentCredentialGeneration already uses for bootstrap-token-derived
+  // children.
+  sourceLinkKeyGeneration: integer('source_link_key_generation'),
 });
 
 // Durable "loser merged into survivor" record (spec 2026-08-26). loser_org_id
@@ -295,3 +426,23 @@ export const orgMergeEvents = pgTable('org_merge_events', {
   summary: jsonb('summary').notNull(),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
 });
+
+// PAM ownership epochs W5 (#8207): a merged-away org whose shell must outlive
+// the merge because it still owns PAM-chain evidence (or is the survivor of a
+// held shell). Shape 3, partner-axis; no org_id column by design. Written in
+// merge Phase B, released only by the erasure path (services/orgEvidenceHold.ts).
+// survivor_org_id and merge_event_id are ON DELETE RESTRICT; loser_org_id has
+// no FK. Writes are system-only (RESTRICTIVE policies, migration
+// 2026-12-24-220000-org-evidence-holds.sql).
+export const orgEvidenceHolds = pgTable('org_evidence_holds', {
+  loserOrgId: uuid('loser_org_id').primaryKey(),
+  partnerId: uuid('partner_id').notNull().references(() => partners.id, { onDelete: 'cascade' }),
+  survivorOrgId: uuid('survivor_org_id').notNull().references(() => organizations.id, { onDelete: 'restrict' }),
+  mergeEventId: uuid('merge_event_id').notNull().references(() => orgMergeEvents.id, { onDelete: 'restrict' }),
+  reason: varchar('reason', { length: 32 }).$type<'pam_evidence' | 'transitive'>().notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+}, (table) => ({
+  survivorIdx: index('org_evidence_holds_survivor_idx').on(table.survivorOrgId),
+  partnerIdx: index('org_evidence_holds_partner_idx').on(table.partnerId),
+  mergeEventIdx: index('org_evidence_holds_merge_event_idx').on(table.mergeEventId),
+}));

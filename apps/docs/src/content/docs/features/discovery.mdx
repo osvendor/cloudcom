@@ -5,7 +5,7 @@ description: Scan subnets with ARP, ICMP ping, TCP port scans, and SNMP to disco
 
 import { Steps, Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
-Network Discovery lets you scan subnets across your managed sites to find devices, identify their type and manufacturer, map open services, and build a topology of how hosts connect through routers and switches. Scans are executed by the Breeze agent running on a device within the target network. The agent performs ARP resolution, ICMP ping sweeps, TCP port scans, and SNMP queries, then reports results back to the API via WebSocket. Discovered assets are stored per-organization and automatically linked to enrolled devices when a MAC or IP address match is found.
+Network Discovery lets you scan subnets across your managed sites to find devices, identify their type and manufacturer, map open services, and build a topology of how hosts connect through routers and switches. Scans are executed by the Breeze agent running on a device within the target network. The agent performs ARP resolution, ICMP ping sweeps, TCP port scans, and SNMP queries, then reports results back to the API via WebSocket. Discovered assets are stored per-organization and automatically linked to an enrolled device when the asset's MAC address matches one of that device's network adapters.
 
 Discovery profiles define what to scan and how. A profile is scoped to a single site and contains target subnets, scan methods, port ranges, SNMP communities, and a schedule. When a scan is triggered, a discovery job is created and dispatched through a background queue to an online agent at the profile's site. Results are processed asynchronously — assets are created or updated, topology edges are enriched, and the job record is updated with summary statistics.
 
@@ -194,7 +194,7 @@ Authorization: Bearer <token>
 | `snmpCommunities` | string[] | No | SNMPv1/v2c community strings (legacy `v3:<user>` prefix = noAuthNoPriv v3 user) |
 | `snmpCredentials` | object | No | Structured SNMP settings: `version` (`v1`/`v2c`/`v3`), `username`, `authProtocol`, `authPassphrase`, `privacyProtocol`, `privacyPassphrase`, `port`, `timeout` (ms), `retries` |
 | `schedule` | object | Yes | Schedule configuration (see below) |
-| `deepScan` | boolean | No | Allow subnets larger than /16 (65,536+ hosts). Default `false` |
+| `deepScan` | boolean | No | Allow subnets larger than /16 (65,536+ hosts). Without it, a profile with such a subnet is refused on save. Default `false` |
 | `identifyOS` | boolean | No | Attempt OS fingerprinting from SNMP and port data. Default `false` |
 | `resolveHostnames` | boolean | No | Perform reverse DNS lookups. Default `false` |
 | `timeout` | integer | No | Per-probe timeout in seconds. Default `2` |
@@ -211,7 +211,7 @@ Authorization: Bearer <token>
 In the profile form, the **Schedule** cadence dropdown offers **Manual**, **Hourly**, **Custom interval**, **Daily**, **Weekly**, and **Monthly**. Daily, Weekly, and Monthly (which compile to a `cron` schedule) show a **Timezone** field alongside the time picker; Hourly and Custom interval don't need one since they aren't clock-aligned. A new profile's **Custom interval** cadence defaults to running every 60 minutes until you change it.
 
 <Aside>
-  Subnets larger than a /16 (65,536 hosts) are skipped unless `deepScan` is set to `true`. This prevents accidental full-class-B scans that could take a long time and generate significant network traffic.
+  A profile with a subnet larger than a /16 (65,536 hosts) is refused on save with `400` (*Subnet "…" is too large: the agent skips subnets over 65,536 addresses (larger than a /16). Split it into smaller ranges.*) unless `deepScan` is `true`. The check runs when a profile is created and whenever an update changes its subnets or `deepScan`. This prevents accidental full-class-B scans that could take a long time and generate significant network traffic. `deepScan` is set through the API.
 </Aside>
 
 ### Updating a Profile
@@ -272,7 +272,7 @@ If `agentId` is omitted, the system automatically selects an online agent from t
 
 4. **Agent returns results** via WebSocket as a `command_result` message containing the list of discovered hosts.
 
-5. **API enqueues a process-results task** in the background queue. The worker creates or updates discovered assets, auto-links matches to enrolled devices by MAC/IP, enriches the network topology, and marks the job as `completed`.
+5. **API enqueues a process-results task** in the background queue. The worker creates or updates discovered assets, auto-links matches to enrolled devices by MAC address, enriches the network topology, and marks the job as `completed`.
 </Steps>
 
 ### Monitoring Job Status
@@ -521,13 +521,15 @@ Uplink ports carrying many MAC addresses are filtered out of host-attachment so 
 
 Where it's enabled, the **Topology** tab shows a per-site **Site Map** instead of the classic view above: a logical map of a site built automatically from what your agents passively observe on the network -- interfaces, routes, and neighbor tables -- refreshed on an interval without you having to run a scan. It adds shared configuration templates you can apply across many sites at once, automatic layout, and on-demand diagnostics you can launch straight from the map.
 
+The physical view, per-connection evidence and coverage, link health and port history, recurring monitoring policies, the routed path trace, impact analysis and the **Explain this** AI investigation are covered in [Network Topology Explorer](/features/network-topology/).
+
 <Aside type="caution">
   Site Map needs agents running **v0.115.0 or later** to collect the passive network evidence it's built from. Sites with older agents keep showing the classic Topology view (or an emptier map) until their agents are updated.
 </Aside>
 
 ### Turning it on
 
-Network Topology (Beta) is off for every partner by default. A partner admin enables it from **Settings → Partner → Modules**: the main toggle turns on topology materialization and the UI together, and four sub-toggles underneath control physical topology, interface health, diagnostics, and AI insights independently. Until it's turned on, a device's Topology tab shows an empty state explaining that Network Topology is off -- with a link straight to Modules settings for a partner admin, or "Ask your MSP to enable it" for an organization user.
+Network Topology (Beta) is off for every partner by default. A partner admin enables it from **Settings → Partner → Modules**: the main toggle turns on topology materialization and the UI together, and four sub-toggles underneath control physical topology, interface health, diagnostics, and AI insights independently (see [what each toggle unlocks](/features/network-topology/#turn-the-feature-on)). Until it's turned on, a device's Topology tab shows an empty state explaining that Network Topology is off -- with a link straight to Modules settings for a partner admin, or "Ask your MSP to enable it" for an organization user.
 
 <Aside type="note">
   Network Topology shipped in v0.115.0 but had no way to enable it until this Modules toggle landed in v0.116.0 -- every device's Topology tab showed a raw `materialization_disabled` code in the meantime. If you're on v0.115.0, there is no supported way to turn it on; upgrade to v0.116.0 or later.
@@ -545,7 +547,7 @@ The map lays itself out automatically -- **Arrange** nudges new nodes into place
 
 ### On-demand diagnostics
 
-Select a node or connection and click **Diagnose** to run an on-demand, ping/traceroute-style check without leaving the map. Choose what to test against -- the device's reported gateway, its configured DNS server, general internet reachability, or a target you've configured explicitly -- pick an agent to run it from, and start the check. Results stream back step by step (each hop's method, outcome, and round-trip detail), and you can cancel a run that's still in progress. Diagnostics require the `topology:diagnostics` capability to be enabled for your organization and an eligible agent at the site.
+Select a node or connection and click **Diagnose** to run an on-demand, ping/traceroute-style check without leaving the map. Choose what to test against -- the device's reported gateway, its configured DNS server, general internet reachability, a target you've configured explicitly, or a bounded routed path trace -- pick an agent to run it from, and start the check. Results stream back step by step (each hop's method, outcome, and round-trip detail), and you can cancel a run that's still in progress. Diagnostics require the **Diagnostics** module toggle, the `topology:execute` and `devices:execute` permissions, and an eligible agent at the site. See [Diagnostics and routed path trace](/features/network-topology/#diagnostics-and-routed-path-trace) for each check and the trace limits.
 
 ### Shared configuration templates
 
@@ -683,8 +685,11 @@ ARP scanning requires root/Administrator privileges and the libpcap library. ICM
 **Scan job stays in `scheduled` status.**
 The discovery worker requires Redis and the background queue to dispatch scan commands. Verify Redis is running and accessible. If Redis is unavailable, the job is immediately marked as `failed` with the message "Background job service unavailable." Also confirm at least one agent at the profile's site is online — the worker selects an online agent from the same site to execute the scan.
 
-**Large subnets are skipped.**
-Subnets larger than /16 (65,536+ hosts) are skipped by default to prevent excessive scan times and network traffic. Set `deepScan: true` on the profile to allow scanning of large subnets. Monitor the agent's resource usage when scanning large address ranges.
+**A profile with a large subnet won't save.**
+Subnets larger than /16 (65,536+ hosts) are refused on save (the error names the subnet) to prevent excessive scan times and network traffic. Split the range into /16 or smaller subnets, or set `deepScan: true` on the profile through the API to allow it. Profiles saved with an oversized subnet before v0.122.1 still have it skipped by the agent until `deepScan` is set. Monitor the agent's resource usage when scanning large address ranges.
 
 **Discovered assets are not auto-linking to enrolled devices.**
-Auto-linking matches assets to enrolled devices by MAC address or IP address within the same organization using the `device_network` table. If the enrolled device has a different IP than what discovery sees (e.g., the device is behind NAT or uses a VPN), auto-linking will not find a match. Use `POST /discovery/assets/:id/link` (or the network device detail page) to manually link the asset to the correct device. Also note that if an asset was manually unlinked, auto-linking is suppressed for it by design until you re-link it.
+Auto-linking matches an asset to an enrolled device at the same site only when the asset's MAC address matches one of the device's network adapters (the `device_network` table). An IP address is never used on its own — DHCP reuses addresses, so an IP match can tie a printer to a workstation. Assets discovered without a MAC (for example, on a routed subnet the scanning agent cannot ARP) and MACs reported by more than one device are not auto-linked. Use `POST /discovery/assets/:id/link` (or the network device detail page) to manually link the asset to the correct device. Also note that if an asset was manually unlinked, auto-linking is suppressed for it by design until you re-link it.
+
+**A discovered asset was linked to the wrong device.**
+An automatic link is re-checked on every scan: when the scan sees a MAC address the linked device does not report, the link is dropped and the asset appears on its own in the Devices list again. If that link had set the device's role (for example, a workstation shown as a printer), the role is handed back to the agent, which reports it on its next heartbeat. Manual links are never changed by a scan. To drop a wrong link immediately, use **Unlink** in the asset's Settings modal.

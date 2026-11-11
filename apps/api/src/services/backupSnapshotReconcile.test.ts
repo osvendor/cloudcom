@@ -1,3 +1,4 @@
+import { Readable } from 'node:stream';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const ORG_ID = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
@@ -40,6 +41,22 @@ function chainMock(resolvedValue: unknown = []) {
 
 const selectMock = vi.fn(() => chainMock([]));
 
+const snapshotIdClaims = vi.hoisted(() => ({
+  foreign: new Set<string>(),
+  live: new Set<string>(),
+  currentJobs: new Map<string, string>(),
+  // #7081: the key root recorded on each id's reservation.
+  roots: new Map<string, { keyLayout: string; keyPrefix: string | null }>(),
+}));
+vi.mock('./backupSnapshotIdReservations', () => ({
+  loadSnapshotIdClaims: vi.fn(async () => ({
+    foreign: new Set(snapshotIdClaims.foreign),
+    live: new Set(snapshotIdClaims.live),
+    currentJobs: new Map(snapshotIdClaims.currentJobs),
+    roots: new Map(snapshotIdClaims.roots),
+  })),
+}));
+
 vi.mock('../db', () => ({
   db: { select: (...args: unknown[]) => selectMock(...(args as [])) },
   runOutsideDbContext: (fn: () => unknown) => fn(),
@@ -71,6 +88,8 @@ vi.mock('../db/schema', () => ({
     orgId: 'backup_snapshots.org_id',
     snapshotId: 'backup_snapshots.snapshot_id',
     storageIdentity: 'backup_snapshots.storage_identity',
+    keyLayout: 'backup_snapshots.key_layout',
+    keyPrefix: 'backup_snapshots.key_prefix',
   },
   backupSnapshotRetirements: {
     id: 'backup_snapshot_retirements.id',
@@ -95,6 +114,20 @@ vi.mock('../jobs/backupRetention', () => ({
 
 const listBackupObjectsUnderPrefixMock = vi.fn();
 const fetchBackupObjectTextMock = vi.fn();
+// #6843: reconcile must stream the destination listing (iterateBackupObjectsUnderPrefix)
+// rather than collect it into one array (listBackupObjectsUnderPrefix) — the same
+// full-bucket materialization #6834 removed from the GC sweep. By default this
+// adapter delegates to listBackupObjectsUnderPrefixMock and re-yields its
+// resolved array as a single page, so the large existing body of
+// `listBackupObjectsUnderPrefixMock.mockResolvedValue([...])` fixtures below
+// keeps working unchanged. Tests that need to prove genuine multi-page
+// streaming set their own `iterateBackupObjectsUnderPrefixMock.mockImplementation`.
+const iterateBackupObjectsUnderPrefixMock = vi.fn();
+// #11233: reconcile reads each manifest as a stream. Unless a test sets its
+// own implementation, the stream carries whatever fetchBackupObjectTextMock
+// answers for the key, so the `fetchBackupObjectTextMock.mockResolvedValue(
+// manifest(...))` fixtures below keep working unchanged.
+const openBackupObjectStreamMock = vi.fn();
 vi.mock('./backupSnapshotStorage', () => ({
   BACKUP_SNAPSHOT_ROOT_DIR: 'snapshots',
   BACKUP_SNAPSHOT_MANIFEST_KEY: 'manifest.json',
@@ -102,7 +135,21 @@ vi.mock('./backupSnapshotStorage', () => ({
   backupSnapshotManifestKey: (id: string) => `snapshots/${id}/manifest.json`,
   listBackupObjectsUnderPrefix: (...args: unknown[]) =>
     listBackupObjectsUnderPrefixMock(...(args as [])),
+  iterateBackupObjectsUnderPrefix: (...args: unknown[]) => {
+    const override = iterateBackupObjectsUnderPrefixMock.getMockImplementation();
+    if (override) return override(...(args as []));
+    return (async function* () {
+      const items = await listBackupObjectsUnderPrefixMock(...(args as []));
+      if (items && items.length > 0) yield items;
+    })();
+  },
   fetchBackupObjectText: (...args: unknown[]) => fetchBackupObjectTextMock(...(args as [])),
+  openBackupObjectStream: async (...args: unknown[]) => {
+    if (openBackupObjectStreamMock.getMockImplementation()) return openBackupObjectStreamMock(...(args as []));
+    return Readable.from([Buffer.from(String(await fetchBackupObjectTextMock(...(args as []))))]);
+  },
+  MANIFEST_FETCH_MAX_BYTES: 200 * 1024 * 1024,
+  MANIFEST_STREAM_MAX_BYTES: 2 * 1024 * 1024 * 1024,
 }));
 
 const applyBackupCommandResultToJobMock = vi.fn();
@@ -114,6 +161,11 @@ vi.mock('./backupResultPersistence', () => ({
   LATE_RESULT_FENCE_REASON_PATTERN: /publish_lease_expired|base_retired/,
 }));
 
+const recordSnapshotFileIndexMock = vi.fn();
+vi.mock('./backupMetrics', () => ({
+  recordSnapshotFileIndex: (...args: unknown[]) => recordSnapshotFileIndexMock(...(args as [])),
+}));
+
 const captureExceptionMock = vi.fn();
 const captureMessageMock = vi.fn();
 vi.mock('./sentry', () => ({
@@ -123,6 +175,7 @@ vi.mock('./sentry', () => ({
 
 import {
   BackupReconcileError,
+  RECONCILE_INLINE_INDEX_MAX_CHARS,
   reconcileOrphanedBackupSnapshots,
 } from './backupSnapshotReconcile';
 
@@ -200,7 +253,9 @@ describe('reconcileOrphanedBackupSnapshots', () => {
     vi.clearAllMocks();
     whereArgs.length = 0;
     listBackupObjectsUnderPrefixMock.mockReset();
+    iterateBackupObjectsUnderPrefixMock.mockReset();
     fetchBackupObjectTextMock.mockReset();
+    openBackupObjectStreamMock.mockReset();
     applyBackupCommandResultToJobMock.mockReset();
     applyBackupCommandResultToJobMock.mockResolvedValue({
       applied: true,
@@ -236,6 +291,31 @@ describe('reconcileOrphanedBackupSnapshots', () => {
       reconcileOrphanedBackupSnapshots({ orgId: ORG_ID, configId: CONFIG_ID })
     ).rejects.toBeInstanceOf(BackupReconcileError);
     expect(listBackupObjectsUnderPrefixMock).not.toHaveBeenCalled();
+  });
+
+  it('never adopts an id still reserved to a live backup, and refuses one reserved to another org', async () => {
+    oneManifest('snap-1');
+    fetchBackupObjectTextMock.mockResolvedValue(manifest('snap-1'));
+    queueSelects(baseSelects([claimingJob({ status: 'running' })]));
+    snapshotIdClaims.live.add('snap-1');
+    try {
+      const result = await reconcileOrphanedBackupSnapshots({ orgId: ORG_ID, configId: CONFIG_ID });
+      expect(result.adopted).toBe(0);
+      expect(result.candidates[0]).toMatchObject({ snapshotId: 'snap-1', skipReason: 'reserved-for-active-backup' });
+    } finally {
+      snapshotIdClaims.live.clear();
+    }
+
+    oneManifest('snap-1');
+    queueSelects(baseSelects([claimingJob()]));
+    snapshotIdClaims.foreign.add('snap-1');
+    try {
+      const result = await reconcileOrphanedBackupSnapshots({ orgId: ORG_ID, configId: CONFIG_ID });
+      expect(result.candidates[0]).toMatchObject({ skipReason: 'claimed-by-another-organization' });
+    } finally {
+      snapshotIdClaims.foreign.clear();
+    }
+    expect(applyBackupCommandResultToJobMock).not.toHaveBeenCalled();
   });
 
   it('adopts a snapshot the job already recorded mid-run', async () => {
@@ -276,6 +356,150 @@ describe('reconcileOrphanedBackupSnapshots', () => {
     });
     expect(call.result.snapshot.files).toHaveLength(2);
     expect(call.result.metadata.storagePrefix).toBe('snapshots/snap-1');
+  });
+
+  describe('manifest larger than the whole-object fetch cap (#11233)', () => {
+    const MiB = 1024 * 1024;
+    const MANIFEST_KEY = 'snapshots/snap-1/manifest.json';
+
+    // Serves MANIFEST_KEY as an object of `size` bytes with each storage entry
+    // point's real size check: the whole-object text fetch refuses it over its
+    // maxBytes, the stream refuses it over its own cap and otherwise yields
+    // `chunks` lazily, so the test never holds the manifest either.
+    function serveManifest(size: number, chunks: () => Iterable<Buffer>) {
+      fetchBackupObjectTextMock.mockImplementation(async (input: { key: string; maxBytes?: number }) => {
+        throw Object.assign(new Error(`Object ${input.key} is ${size} bytes, exceeding the ${input.maxBytes}-byte fetch cap`), {
+          name: 'BackupObjectTooLargeError',
+        });
+      });
+      openBackupObjectStreamMock.mockImplementation(async (input: { key: string; maxBytes: number }) => {
+        if (input.key !== MANIFEST_KEY) throw new Error(`unexpected stream of ${input.key}`);
+        if (size > input.maxBytes) throw new Error(`Object ${input.key} is ${size} bytes, exceeding the ${input.maxBytes}-byte fetch cap`);
+        return Readable.from(chunks());
+      });
+    }
+
+    // A manifest of exactly `size` bytes: `head`, then whitespace, then `tail`.
+    function* padded(size: number, head: string, tail: string): Generator<Buffer> {
+      let left = size - Buffer.byteLength(head) - Buffer.byteLength(tail);
+      yield Buffer.from(head);
+      const block = Buffer.alloc(MiB, ' ');
+      while (left > 0) {
+        const piece = left >= MiB ? block : block.subarray(0, left);
+        left -= piece.length;
+        yield piece;
+      }
+      yield Buffer.from(tail);
+    }
+
+    const entry = (i: number) => JSON.stringify({
+      sourcePath: `C:/data/file-${i}.txt`,
+      backupPath: `snapshots/snap-1/files/path_0/file-${i}.txt.gz`,
+      size: 150,
+      modTime: '2026-08-01T09:00:00-07:00',
+    });
+
+    function adoptionSelects() {
+      queueSelects([
+        [CONFIG_ROW],
+        [],
+        [claimingJob()],
+        [{ orgId: ORG_ID, provider: 's3', providerConfig: CONFIG_ROW.providerConfig }],
+      ]);
+    }
+
+    it('adopts a snapshot whose manifest is over 200 MiB, with the entry listed past the old cap', async () => {
+      oneManifest('snap-1');
+      adoptionSelects();
+      const size = 200 * MiB + MiB;
+      serveManifest(size, () => padded(
+        size,
+        `{"id":"snap-1","timestamp":"2026-08-01T10:15:00Z","size":300,"formatVersion":2,"files":[${entry(0)}`,
+        `,${entry(1)}]}`,
+      ));
+
+      const result = await reconcileOrphanedBackupSnapshots({ orgId: ORG_ID, configId: CONFIG_ID });
+
+      expect(result.candidates[0]).toMatchObject({ snapshotId: 'snap-1', adopted: true, fileCount: 2, size: 300, skipReason: null });
+      expect(result.adopted).toBe(1);
+      const call = applyBackupCommandResultToJobMock.mock.calls[0]![0];
+      expect(call.result).toMatchObject({ filesBackedUp: 2, bytesBackedUp: 300 });
+      expect(call.result.snapshot).toMatchObject({ id: 'snap-1', timestamp: '2026-08-01T10:15:00Z', formatVersion: 2 });
+      expect(call.result.snapshot.files.map((f: { sourcePath: string }) => f.sourcePath)).toEqual(['C:/data/file-0.txt', 'C:/data/file-1.txt']);
+      expect(call.result.metadata.fileIndexInlineDroppedEntries).toBeUndefined();
+      expect(recordSnapshotFileIndexMock).not.toHaveBeenCalled();
+      expect(openBackupObjectStreamMock).toHaveBeenCalledWith(expect.objectContaining({ key: MANIFEST_KEY, maxBytes: 2 * 1024 * MiB }));
+    }, 60_000);
+
+    it('reports a manifest whose stream drops partway as manifest-unreadable and adopts nothing', async () => {
+      oneManifest('snap-1');
+      adoptionSelects();
+      serveManifest(200 * MiB + MiB, function* () {
+        yield Buffer.from(`{"id":"snap-1","files":[${entry(0)}`);
+        throw new Error('connection reset');
+      });
+
+      const result = await reconcileOrphanedBackupSnapshots({ orgId: ORG_ID, configId: CONFIG_ID });
+
+      expect(result.candidates[0]).toMatchObject({ adopted: false, skipReason: 'manifest-unreadable' });
+      expect(result.candidates[0]!.error).toContain('connection reset');
+      expect(applyBackupCommandResultToJobMock).not.toHaveBeenCalled();
+    });
+
+    it('adopts a file list past the inline budget without the inline list, counting every entry, as an agent result that dropped it', async () => {
+      oneManifest('snap-1');
+      adoptionSelects();
+      const pad = 'x'.repeat(200);
+      const own = 'snapshots/snap-1/files/';
+      const files = Array.from({ length: Math.ceil(RECONCILE_INLINE_INDEX_MAX_CHARS / 200) + 1_000 }, (_, i) => ({
+        sourcePath: `/data/${pad}/file-${i}`,
+        backupPath: i % 3 === 0 ? `snapshots/snap-0/files/data/file-${i}.gz` : `${own}data/file-${i}.gz`,
+        size: 10,
+      }));
+      fetchBackupObjectTextMock.mockResolvedValue(JSON.stringify({ id: 'snap-1', size: 4_242, files }));
+
+      const result = await reconcileOrphanedBackupSnapshots({ orgId: ORG_ID, configId: CONFIG_ID });
+
+      expect(result.candidates[0]).toMatchObject({ adopted: true, fileCount: files.length, size: 4_242 });
+      const call = applyBackupCommandResultToJobMock.mock.calls[0]![0];
+      const referenced = files.filter((f) => !f.backupPath.startsWith(own)).length;
+      expect(call.result).toMatchObject({
+        filesBackedUp: files.length,
+        bytesBackedUp: 4_242,
+        referencedFiles: referenced,
+        referencedBytes: referenced * 10,
+      });
+      expect(call.result.snapshot.files).toBeUndefined();
+      expect(call.result.metadata.fileIndexInlineDroppedEntries).toBe(files.length);
+      expect(recordSnapshotFileIndexMock).toHaveBeenCalledWith('inline_dropped', 'dropped');
+    }, 60_000);
+  });
+
+  // #6843: reconcile must never materialize the whole destination listing —
+  // it has to fold a MULTI-PAGE stream (as the real S3/local listers page)
+  // directly into the manifest-bearing-snapshot map, never assuming a single
+  // array. Before the fix, reconcile called listBackupObjectsUnderPrefix (the
+  // array collector) and this test's second page would simply never be
+  // fetched/considered by the production code path under test.
+  it('folds a multi-page listing stream without materializing it as one array', async () => {
+    listBackupObjectsUnderPrefixMock.mockRejectedValue(
+      new Error('reconcile must not call the array-collecting listBackupObjectsUnderPrefix'),
+    );
+    iterateBackupObjectsUnderPrefixMock.mockImplementation(async function* () {
+      yield [{ key: 'snapshots/snap-1/manifest.json', lastModified: new Date('2026-08-01T10:20:00Z') }];
+      yield [{ key: 'snapshots/snap-2/manifest.json', lastModified: new Date('2026-08-01T10:21:00Z') }];
+    });
+    fetchBackupObjectTextMock.mockImplementation((input: { key: string }) => {
+      const id = input.key.includes('snap-1') ? 'snap-1' : 'snap-2';
+      return Promise.resolve(manifest(id));
+    });
+    queueSelects(baseSelects());
+
+    const result = await reconcileOrphanedBackupSnapshots({ orgId: ORG_ID, configId: CONFIG_ID });
+
+    expect(listBackupObjectsUnderPrefixMock).not.toHaveBeenCalled();
+    expect(result.snapshotsInStorage).toBe(2);
+    expect(result.candidates.map((c) => c.snapshotId).sort()).toEqual(['snap-1', 'snap-2']);
   });
 
   // --- cross-tenant negatives ------------------------------------------------
@@ -444,6 +668,27 @@ describe('reconcileOrphanedBackupSnapshots', () => {
     expect(applyBackupCommandResultToJobMock.mock.calls[0]![0].jobId).toBe('job-newer');
   });
 
+  it('prefers the job a server-issued id is currently reserved to over a higher-ranked one', async () => {
+    // After another job took an unfinished id over, the earlier job still
+    // carries the id but may no longer publish it.
+    oneManifest();
+    fetchBackupObjectTextMock.mockResolvedValue(manifest('snap-1'));
+    snapshotIdClaims.currentJobs.set('snap-1', 'job-older');
+    try {
+      queueSelects(
+        baseSelects([
+          claimingJob({ id: 'job-newer', createdAt: new Date('2026-08-01T09:00:00Z') }),
+          claimingJob({ id: 'job-older', createdAt: new Date('2026-08-01T07:00:00Z') }),
+        ])
+      );
+      const result = await reconcileOrphanedBackupSnapshots({ orgId: ORG_ID, configId: CONFIG_ID });
+      expect(result.adopted).toBe(1);
+      expect(applyBackupCommandResultToJobMock.mock.calls[0]![0].jobId).toBe('job-older');
+    } finally {
+      snapshotIdClaims.currentJobs.clear();
+    }
+  });
+
   it('refuses a snapshot ANOTHER org also claims, even when one of our own jobs claims it too', async () => {
     // The dedupe keeps one winner per snapshot id. Consulting only the winner
     // would let a same-org job mask a foreign claim and hand another tenant's
@@ -500,6 +745,17 @@ describe('reconcileOrphanedBackupSnapshots', () => {
     oneManifest();
     fetchBackupObjectTextMock.mockResolvedValue(manifest('snap-1'));
     queueSelects(baseSelects([claimingJob({ status: 'completed' })]));
+
+    const result = await reconcileOrphanedBackupSnapshots({ orgId: ORG_ID, configId: CONFIG_ID });
+
+    expect(result.adopted).toBe(1);
+    expect(applyBackupCommandResultToJobMock.mock.calls[0]![0].source).toBe('reconcile');
+  });
+
+  it('adopts a half-written completed_with_errors job the same way (#5396)', async () => {
+    oneManifest();
+    fetchBackupObjectTextMock.mockResolvedValue(manifest('snap-1'));
+    queueSelects(baseSelects([claimingJob({ status: 'completed_with_errors' })]));
 
     const result = await reconcileOrphanedBackupSnapshots({ orgId: ORG_ID, configId: CONFIG_ID });
 
@@ -1055,6 +1311,30 @@ describe('reconcileOrphanedBackupSnapshots', () => {
     ).rejects.toMatchObject({ code: 'destination_unreadable' });
   });
 
+  // #6843: the listing is now a MULTI-PAGE stream — a failure partway
+  // through (page 1 succeeds, page 2's continuation fetch/directory read
+  // fails) must surface exactly like an immediate listing failure, not leak
+  // a partial manifest-bearing-snapshot map forward into the DB comparison.
+  it('surfaces a listing failure that occurs mid-stream (after an earlier page already yielded) as the same typed error', async () => {
+    iterateBackupObjectsUnderPrefixMock.mockImplementation(async function* () {
+      yield [{ key: 'snapshots/snap-1/manifest.json', lastModified: new Date('2026-08-01T10:20:00Z') }];
+      throw new Error('connection reset mid-listing');
+    });
+    queueSelects([[CONFIG_ROW]]);
+
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await expect(
+        reconcileOrphanedBackupSnapshots({ orgId: ORG_ID, configId: CONFIG_ID })
+      ).rejects.toMatchObject({ code: 'destination_unreadable' });
+    } finally {
+      error.mockRestore();
+    }
+    expect(captureExceptionMock).toHaveBeenCalledWith(
+      expect.objectContaining({ message: 'connection reset mid-listing' }),
+    );
+  });
+
   describe('D18 W01 -- retired/orphan-age/base-missing/late-result-fenced refusals', () => {
     it('refuses to adopt a retired snapshot id', async () => {
       oneManifest('RETIRED-1');
@@ -1118,6 +1398,173 @@ describe('reconcileOrphanedBackupSnapshots', () => {
       expect(candidate?.adopted).toBe(false);
     });
   });
+
+  describe('per key root (#7081)', () => {
+    const PREFIXED_CONFIG_ROW = { ...CONFIG_ROW, providerConfig: { ...CONFIG_ROW.providerConfig, prefix: 'orgB' } };
+    const P_ROOT = { keyLayout: 'prefixed_flat', keyPrefix: 'orgB' };
+    const LEGACY_ROOT = { keyLayout: 'legacy_flat', keyPrefix: null };
+
+    /** Every listing sees exactly the keys under its own `<prefix>/`; each listed prefix is recorded. */
+    const listed: string[] = [];
+    function bucket(keys: string[], writtenAt = '2026-08-01T10:20:00Z') {
+      listed.length = 0;
+      iterateBackupObjectsUnderPrefixMock.mockImplementation((input: { prefix: string }) => (async function* () {
+        listed.push(input.prefix);
+        const page = keys
+          .filter((key) => key.startsWith(`${input.prefix}/`))
+          .map((key) => ({ key, lastModified: new Date(writtenAt) }));
+        if (page.length > 0) yield page;
+      })());
+    }
+    const listedPrefixes = () => [...listed];
+    function prefixedSelects(claimJobs: unknown[]) {
+      return [
+        [PREFIXED_CONFIG_ROW],
+        [],
+        claimJobs,
+        [{ orgId: ORG_ID, provider: 's3', providerConfig: PREFIXED_CONFIG_ROW.providerConfig }],
+        [],
+      ];
+    }
+
+    afterEach(() => {
+      snapshotIdClaims.roots.clear();
+    });
+
+    it('lists the prefixed root and the legacy root for a destination with a prefix', async () => {
+      bucket([]);
+      queueSelects([[PREFIXED_CONFIG_ROW]]);
+
+      const result = await reconcileOrphanedBackupSnapshots({ orgId: ORG_ID, configId: CONFIG_ID });
+
+      expect(listedPrefixes().sort()).toEqual(['orgB/snapshots', 'snapshots']);
+      expect(result.snapshotsInStorage).toBe(0);
+    });
+
+    it('lists only the legacy root for a destination without a prefix', async () => {
+      bucket([]);
+      queueSelects([[CONFIG_ROW]]);
+
+      await reconcileOrphanedBackupSnapshots({ orgId: ORG_ID, configId: CONFIG_ID });
+
+      expect(listedPrefixes()).toEqual(['snapshots']);
+    });
+
+    it('lists only the legacy root, and warns, when the stored prefix is invalid', async () => {
+      bucket([]);
+      queueSelects([[{ ...CONFIG_ROW, providerConfig: { ...CONFIG_ROW.providerConfig, prefix: 'a//b' } }]]);
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+      try {
+        await reconcileOrphanedBackupSnapshots({ orgId: ORG_ID, configId: CONFIG_ID });
+        expect(listedPrefixes()).toEqual(['snapshots']);
+        expect(warn.mock.calls.some(([msg]) => String(msg).includes('invalid key prefix'))).toBe(true);
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it('adopts an orphan found under the prefixed root whose reservation records that root, reading it there', async () => {
+      bucket(['orgB/snapshots/snap-1/manifest.json']);
+      snapshotIdClaims.roots.set('snap-1', P_ROOT);
+      fetchBackupObjectTextMock.mockResolvedValue(manifest('snap-1'));
+      queueSelects(prefixedSelects([claimingJob()]));
+
+      const result = await reconcileOrphanedBackupSnapshots({ orgId: ORG_ID, configId: CONFIG_ID });
+
+      expect(result.adopted).toBe(1);
+      expect(fetchBackupObjectTextMock).toHaveBeenCalledWith(expect.objectContaining({ key: 'orgB/snapshots/snap-1/manifest.json' }));
+      const call = applyBackupCommandResultToJobMock.mock.calls[0]![0];
+      // The row's columns carry the root; helper-style storagePrefix metadata is not set.
+      expect(call.result.metadata.storagePrefix).toBeUndefined();
+      expect(call.result.metadata.reconciledFromStorage).toBe(true);
+    });
+
+    it.each([
+      ['no reservation', null],
+      ['a reservation under the legacy root', LEGACY_ROOT],
+      ['a reservation under another prefix', { keyLayout: 'prefixed_flat', keyPrefix: 'other' }],
+    ])('refuses an orphan found under the prefixed root with %s', async (_name, root) => {
+      bucket(['orgB/snapshots/snap-1/manifest.json']);
+      if (root) snapshotIdClaims.roots.set('snap-1', root);
+      fetchBackupObjectTextMock.mockResolvedValue(manifest('snap-1'));
+      queueSelects(prefixedSelects([claimingJob()]));
+
+      const result = await reconcileOrphanedBackupSnapshots({ orgId: ORG_ID, configId: CONFIG_ID });
+
+      expect(result.adopted).toBe(0);
+      expect(result.candidates[0]).toMatchObject({ snapshotId: 'snap-1', skipReason: 'key-root-mismatch' });
+      expect(applyBackupCommandResultToJobMock).not.toHaveBeenCalled();
+    });
+
+    it('refuses an orphan found under the legacy root whose reservation records a prefixed root', async () => {
+      bucket(['snapshots/snap-1/manifest.json']);
+      snapshotIdClaims.roots.set('snap-1', P_ROOT);
+      fetchBackupObjectTextMock.mockResolvedValue(manifest('snap-1'));
+      queueSelects(prefixedSelects([claimingJob()]));
+
+      const result = await reconcileOrphanedBackupSnapshots({ orgId: ORG_ID, configId: CONFIG_ID });
+
+      expect(result.candidates[0]).toMatchObject({ snapshotId: 'snap-1', skipReason: 'key-root-mismatch' });
+      expect(applyBackupCommandResultToJobMock).not.toHaveBeenCalled();
+    });
+
+    it('still adopts an orphan found under the legacy root of a prefixed destination as legacy', async () => {
+      bucket(['snapshots/snap-1/manifest.json']);
+      snapshotIdClaims.roots.set('snap-1', LEGACY_ROOT);
+      fetchBackupObjectTextMock.mockResolvedValue(manifest('snap-1'));
+      queueSelects(prefixedSelects([claimingJob()]));
+
+      const result = await reconcileOrphanedBackupSnapshots({ orgId: ORG_ID, configId: CONFIG_ID });
+
+      expect(result.adopted).toBe(1);
+      expect(fetchBackupObjectTextMock).toHaveBeenCalledWith(expect.objectContaining({ key: 'snapshots/snap-1/manifest.json' }));
+      const call = applyBackupCommandResultToJobMock.mock.calls[0]![0];
+      expect(call.result.metadata.storagePrefix).toBe('snapshots/snap-1');
+    });
+
+    it('refuses an orphan whose declared base is recorded under another root', async () => {
+      bucket(['orgB/snapshots/snap-1/manifest.json']);
+      snapshotIdClaims.roots.set('snap-1', P_ROOT);
+      fetchBackupObjectTextMock.mockResolvedValue(JSON.stringify({ id: 'snap-1', baseSnapshotId: 'base-0', files: [] }));
+      queueSelects([...prefixedSelects([claimingJob()]), [{ id: 'base-row', ...LEGACY_ROOT }]]);
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+      try {
+        const result = await reconcileOrphanedBackupSnapshots({ orgId: ORG_ID, configId: CONFIG_ID });
+        expect(result.candidates[0]).toMatchObject({ snapshotId: 'snap-1', skipReason: 'base-key-root-mismatch' });
+        expect(applyBackupCommandResultToJobMock).not.toHaveBeenCalled();
+        expect(warn.mock.calls.some(([msg]) => String(msg).includes('base_key_root_mismatch'))).toBe(true);
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it('adopts an orphan whose declared base is recorded under the same root', async () => {
+      bucket(['orgB/snapshots/snap-1/manifest.json']);
+      snapshotIdClaims.roots.set('snap-1', P_ROOT);
+      fetchBackupObjectTextMock.mockResolvedValue(JSON.stringify({ id: 'snap-1', baseSnapshotId: 'base-0', files: [] }));
+      queueSelects([...prefixedSelects([claimingJob()]), [{ id: 'base-row', ...P_ROOT }]]);
+
+      const result = await reconcileOrphanedBackupSnapshots({ orgId: ORG_ID, configId: CONFIG_ID });
+
+      expect(result.adopted).toBe(1);
+    });
+
+    it('refuses a legacy orphan whose declared base row records an unreadable root', async () => {
+      oneManifest('snap-1');
+      fetchBackupObjectTextMock.mockResolvedValue(JSON.stringify({ id: 'snap-1', baseSnapshotId: 'base-0', files: [] }));
+      queueSelects([...baseSelects([claimingJob()]), [{ id: 'base-row', keyLayout: 'prefixed_flat', keyPrefix: null }]]);
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+      try {
+        const result = await reconcileOrphanedBackupSnapshots({ orgId: ORG_ID, configId: CONFIG_ID });
+        expect(result.candidates[0]).toMatchObject({ skipReason: 'base-key-root-mismatch' });
+      } finally {
+        warn.mockRestore();
+      }
+    });
+  });
 });
 
 describe('manifestToCommandResult originalPath (D12 reconcile path)', () => {
@@ -1135,9 +1582,9 @@ describe('manifestToCommandResult originalPath (D12 reconcile path)', () => {
         modTime: '2026-09-09T19:17:35.000Z',
       }],
     };
-    const result = manifestToCommandResult({
+    const result = await manifestToCommandResult({
       snapshotId: manifest.id,
-      manifestText: JSON.stringify(manifest),
+      manifest: JSON.stringify(manifest),
       matchedBy: 'job-snapshot-id',
     });
     // Without this the orphan-reconcile path indexes the transient shadow-copy
@@ -1148,9 +1595,9 @@ describe('manifestToCommandResult originalPath (D12 reconcile path)', () => {
   it('derives referencedBytes/referencedFiles from backupPath ownership so an adopted incremental does not over-report transfer (#5410)', async () => {
     const { manifestToCommandResult } = await import('./backupSnapshotReconcile');
     const own = 'snapshots/snap-1/files/';
-    const result = manifestToCommandResult({
+    const result = await manifestToCommandResult({
       snapshotId: 'snap-1',
-      manifestText: JSON.stringify({
+      manifest: JSON.stringify({
         id: 'snap-1',
         baseSnapshotId: 'snap-0',
         files: [
@@ -1168,9 +1615,9 @@ describe('manifestToCommandResult originalPath (D12 reconcile path)', () => {
 
   it('omits the dedup fields, like the agent, for a manifest whose every object lives under its own snapshot prefix', async () => {
     const { manifestToCommandResult } = await import('./backupSnapshotReconcile');
-    const result = manifestToCommandResult({
+    const result = await manifestToCommandResult({
       snapshotId: 'snap-1',
-      manifestText: JSON.stringify({ id: 'snap-1', files: [{ sourcePath: '/a', backupPath: 'snapshots/snap-1/files/a.gz', size: 5 }] }),
+      manifest: JSON.stringify({ id: 'snap-1', files: [{ sourcePath: '/a', backupPath: 'snapshots/snap-1/files/a.gz', size: 5 }] }),
       matchedBy: 'time-window',
     });
     // A reconciled full backup must persist NULL, not 0, so the UI's dedup
@@ -1189,29 +1636,50 @@ describe('manifestToCommandResult originalPath (D12 reconcile path)', () => {
     const external = manifest.files.filter((f) => f.backupPath && !f.backupPath.startsWith(`snapshots/${manifest.id}/`));
     expect(contentless.length).toBeGreaterThan(0);
     // Pre-fix: the blanket .min(1) threw here and adoption skipped the snapshot as manifest-unreadable.
-    const result = manifestToCommandResult({ snapshotId: manifest.id, manifestText: fixture, matchedBy: 'job-snapshot-id' });
+    const result = await manifestToCommandResult({ snapshotId: manifest.id, manifest: fixture, matchedBy: 'job-snapshot-id' });
     expect(result.referencedFiles).toBe(external.length);
     expect(result.referencedBytes).toBe(external.reduce((n, f) => n + (f.size ?? 0), 0));
   });
 
   it('still rejects a CONTENT entry (no kind) with an empty backupPath', async () => {
     const { manifestToCommandResult } = await import('./backupSnapshotReconcile');
-    expect(() => manifestToCommandResult({
+    await expect(manifestToCommandResult({
       snapshotId: 'snap-1',
-      manifestText: JSON.stringify({ id: 'snap-1', files: [{ sourcePath: '/a', backupPath: '' }] }),
+      manifest: JSON.stringify({ id: 'snap-1', files: [{ sourcePath: '/a', backupPath: '' }] }),
       matchedBy: 'job-snapshot-id',
-    })).toThrow();
+    })).rejects.toThrow();
   });
 
   it('forwards baseSnapshotId and formatVersion (D18 W01)', async () => {
     const { manifestToCommandResult } = await import('./backupSnapshotReconcile');
-    const result = manifestToCommandResult({
+    const result = await manifestToCommandResult({
       snapshotId: 'snap-1',
-      manifestText: JSON.stringify({ id: 'snap-1', baseSnapshotId: 'snap-0', formatVersion: 2, files: [] }),
+      manifest: JSON.stringify({ id: 'snap-1', baseSnapshotId: 'snap-0', formatVersion: 2, files: [] }),
       matchedBy: 'job-snapshot-id',
     });
     expect(result.snapshot?.baseSnapshotId).toBe('snap-0');
     expect(result.snapshot?.formatVersion).toBe(2);
+  });
+
+  it('reads a null files key, which the agent writes for a snapshot with no files, as no files (#11233)', async () => {
+    const { manifestToCommandResult } = await import('./backupSnapshotReconcile');
+    const result = await manifestToCommandResult({
+      snapshotId: 'snap-1',
+      manifest: JSON.stringify({ id: 'snap-1', size: 0, files: null }),
+      matchedBy: 'job-snapshot-id',
+    });
+    expect(result).toMatchObject({ filesBackedUp: 0, bytesBackedUp: 0, snapshot: { files: [] } });
+  });
+
+  it('still refuses a manifest with no id, a mismatched id, or a top-level field of the wrong type', async () => {
+    const { manifestToCommandResult } = await import('./backupSnapshotReconcile');
+    const read = (doc: unknown) => manifestToCommandResult({ snapshotId: 'snap-1', manifest: JSON.stringify(doc), matchedBy: 'job-snapshot-id' });
+    await expect(read({ files: [] })).rejects.toThrow(/no snapshot id/);
+    await expect(read({ id: '', files: [] })).rejects.toThrow(/no snapshot id/);
+    await expect(read({ id: 'snap-2', files: [] })).rejects.toThrow(/declares snapshot snap-2/);
+    await expect(read({ id: 'snap-1', size: -1, files: [] })).rejects.toThrow();
+    await expect(read({ id: 'snap-1', timestamp: 7, files: [] })).rejects.toThrow();
+    await expect(read({ id: 'snap-1', files: [7] })).rejects.toThrow(/entry 0/);
   });
 });
 

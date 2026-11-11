@@ -43,6 +43,7 @@ import {
   resolveRefreshToken,
   installAuthorizedUserSessionCookies,
   validateStrictCookieCsrfRequest,
+  hasActiveTotpFactor,
 } from './helpers';
 import { installAuthBindingReplacement, requestAuthBinding } from './binding';
 import {
@@ -85,7 +86,40 @@ function loginErrorRedirect(reason: string): Response {
 
 export const cfAccessRedirectLoginRoutes = new Hono();
 
-function cfAccessIssuanceError(c: Parameters<typeof installAuthBindingReplacement>[0], error: unknown): Response | null {
+function cfAccessIssuanceError(
+  c: Parameters<typeof installAuthBindingReplacement>[0],
+  error: unknown,
+  diagnostic: {
+    phase: 'begin' | 'finish' | 'bind_cache';
+    elapsedMs: number;
+    hadBinding: boolean;
+    hadCapability: boolean;
+  },
+): Response | null {
+  // Never serialize the exception, its message/name, or binding/session values.
+  // These fixed labels distinguish failures without exposing authentication data.
+  const errorClass = error instanceof AuthBindingRotationRequiredError
+    ? 'AuthBindingRotationRequiredError'
+    : error instanceof AuthBindingUnavailableError
+      ? 'AuthBindingUnavailableError'
+      : error instanceof AuthIssuanceConflictError
+        ? 'AuthIssuanceConflictError'
+        : error instanceof AuthIssuanceCapabilityError
+          ? 'AuthIssuanceCapabilityError'
+          : null;
+  if (errorClass) {
+    let reason = 'unspecified';
+    if (error instanceof AuthBindingRotationRequiredError) {
+      if (['missing', 'invalid', 'expired', 'retired'].includes(error.reason)) reason = error.reason;
+    } else if (error instanceof AuthBindingUnavailableError) {
+      if (['active', 'logout_pending', 'missing'].includes(error.reason)) reason = error.reason;
+    }
+    console.warn('[cf-access-redirect] binding issuance rejected', {
+      errorClass,
+      reason,
+      ...diagnostic,
+    });
+  }
   // This handler backs a top-level browser navigation (CF Access redirects
   // the browser here, not an XHR/fetch call). A raw JSON 428/409 body
   // renders as plain text in the browser instead of landing the user
@@ -127,12 +161,20 @@ function cfAccessIssuanceError(c: Parameters<typeof installAuthBindingReplacemen
  * apps/api/src/middleware/cfAccessLogin.ts.
  */
 cfAccessRedirectLoginRoutes.get('/cf-access-login', async (c) => {
+  const startedAt = performance.now();
+  // Account discovery for both remote viewers. Only a verified Access identity
+  // can select staff SSO; a portal email/cookie is never promoted to staff.
+  // This read-only probe neither issues cookies nor grants any permission.
+  const remoteIdentity = c.req.query('remoteIdentity') === '1';
+  if (remoteIdentity) c.header('Cache-Control', 'no-store');
   if (!cfAccessTrustEnabled()) {
+    if (remoteIdentity) return c.json({ kind: 'none' });
     return loginErrorRedirect('disabled');
   }
 
   const token = c.req.header(CF_ACCESS_JWT_HEADER);
   if (!token) {
+    if (remoteIdentity) return c.json({ kind: 'none' });
     return loginErrorRedirect('no-jwt');
   }
 
@@ -166,6 +208,10 @@ cfAccessRedirectLoginRoutes.get('/cf-access-login', async (c) => {
   const [user] = await withSystemDbAccessContext(async () =>
     db.select().from(users).where(eq(users.email, normalizedEmail)).limit(1)
   );
+
+  // Even disabled staff identities must go through staff authentication and
+  // its denial. Never reinterpret them as an identically named portal user.
+  if (remoteIdentity) return c.json({ kind: user ? 'staff' : 'customer' });
 
   if (!user) {
     return loginErrorRedirect('no-user');
@@ -218,7 +264,7 @@ cfAccessRedirectLoginRoutes.get('/cf-access-login', async (c) => {
   }
 
   const trustsMfa = cfAccessTrustsMfa();
-  if (ENABLE_2FA && user.mfaEnabled && (user.mfaSecret || user.mfaMethod === 'sms' || user.mfaMethod === 'passkey') && !trustsMfa) {
+  if (ENABLE_2FA && user.mfaEnabled && (hasActiveTotpFactor(user) || user.mfaMethod === 'sms' || user.mfaMethod === 'passkey') && !trustsMfa) {
     // POC: MFA flow over redirect is deferred. For now, surface a clear
     // error so the user falls back to password login (which CAN do MFA).
     // Pre-PR follow-up: emit ?mfa=<tempToken>&mfaMethod=... and have the
@@ -279,9 +325,11 @@ cfAccessRedirectLoginRoutes.get('/cf-access-login', async (c) => {
   const binding = requestAuthBinding(c);
 
   let capability;
+  let issuancePhase: 'begin' | 'finish' | 'bind_cache' = 'begin';
   try {
     capability = await beginAuthIssuance(binding);
     const guardedCapability = capability;
+    issuancePhase = 'finish';
     const issued = await finishAuthIssuance(guardedCapability, async (tx) => {
         await tx
           .update(users)
@@ -293,11 +341,18 @@ cfAccessRedirectLoginRoutes.get('/cf-access-login', async (c) => {
           expectedEpochs: { authEpoch: user.authEpoch, mfaEpoch: user.mfaEpoch },
         });
     });
+    issuancePhase = 'bind_cache';
     await bindIssuedUserSession(issued);
     installAuthorizedUserSessionCookies(c, issued);
   } catch (error) {
+    const diagnostic = {
+      phase: issuancePhase,
+      elapsedMs: Math.round(performance.now() - startedAt),
+      hadBinding: binding.value.length > 0,
+      hadCapability: capability !== undefined,
+    };
     if (capability) await cancelAuthIssuance(capability).catch(() => undefined);
-    const response = cfAccessIssuanceError(c, error);
+    const response = cfAccessIssuanceError(c, error, diagnostic);
     if (response) return response;
     throw error;
   }

@@ -6,7 +6,7 @@
 
 import { Hono } from 'hono';
 import { routePath as honoRoutePath } from 'hono/route';
-import { avg, and, eq, gte, inArray, sql } from 'drizzle-orm';
+import { avg, and, eq, gte, inArray, lt, sql } from 'drizzle-orm';
 import { Counter, Gauge, Histogram } from 'prom-client';
 
 import { db, runOutsideDbContext, withSystemDbAccessContext } from '../db';
@@ -19,6 +19,11 @@ import {
   initializeRuntimeMetricDefaults,
   updateRuntimeMetrics,
 } from '../services/metricsRuntime';
+// #6452 — importing for its module-load side effect: registers
+// breeze_redis_used_memory_bytes / breeze_redis_maxmemory_bytes / etc onto the
+// shared registry. The watchdog itself is started separately from index.ts;
+// this import guarantees the series exist (seeded) even before the first tick.
+import '../services/redisMemoryMonitor';
 import {
   evaluateMetricsScrapeAuth,
   parseMetricsScrapeIpAllowlist,
@@ -50,18 +55,23 @@ import { setAbuseMetricsRecorder } from '../services/abuseMetrics';
 import { setProxyTrustMetricsRecorder } from '../services/clientIp';
 import { setSupportCodeMetricsRecorder } from '../services/supportCodeMissBudget';
 import {
+  registerM365ConsentFailureCausePrometheusCounter,
   registerM365CustomerGraphActionsPrometheusCounter,
   registerM365CustomerGraphReadPrometheusCounter,
 } from '../services/m365ControlPlane/metrics';
 import { registerM365GraphReadActionPrometheusCounter } from '../services/m365ControlPlane/readActionMetrics';
 import { registerM365GraphActionsPrometheusCounter } from '../services/m365ControlPlane/writeActionMetrics';
 import { registerM365SyncMetrics } from '../services/m365Sync/metrics';
+import { registerConnectionHealthMetrics } from '../services/connectionHealth/metrics';
 import { registerActionIntentPrometheusCounter } from '../services/actionIntents/metrics';
 import { registerAgentCertificateBindingPrometheusCounter } from '../services/agentCertificateBinding';
 import { registerRetentionPrometheusMetrics } from '../services/retentionMetrics';
 import { setExtensionMetricsRecorder } from '../extensions/metrics';
 import { envFloat } from '../utils/envFloat';
 
+import { notParkedDeviceCondition } from '../services/unassignedPool/selectorPredicate';
+import { admissionRouteLabelOf } from '../services/safeRequestLabel';
+import { resolveAnalyticsDateWindow, resolveAnalyticsOrgScope } from './analyticsQueryScope';
 export {
   recordBackupCommandTimeout,
   recordBackupDispatchFailure,
@@ -103,12 +113,14 @@ let METRICS_SCRAPE_IP_ALLOWLIST = parseMetricsScrapeIpAllowlist();
 const register = metricsRegistry;
 registerM365CustomerGraphReadPrometheusCounter(register);
 registerM365CustomerGraphActionsPrometheusCounter(register);
+registerM365ConsentFailureCausePrometheusCounter(register);
 registerM365GraphReadActionPrometheusCounter(register);
 registerM365GraphActionsPrometheusCounter(register);
 registerActionIntentPrometheusCounter(register);
 registerAgentCertificateBindingPrometheusCounter(register);
 registerRetentionPrometheusMetrics(register);
 registerM365SyncMetrics(register);
+registerConnectionHealthMetrics(register);
 
 /**
  * Route label for a request that never reached a registered handler — a 404, or
@@ -232,6 +244,34 @@ const agentHeartbeatTotal = new Counter({
   registers: [register]
 });
 
+// #8869 — agent Encrypted Client Hello telemetry. Counters only; the agent
+// reports `echActive` and `filterSignatureSeenAt` on its heartbeat.
+const agentHeartbeatEchTotal = new Counter({
+  name: 'breeze_agent_heartbeat_ech_total',
+  help: 'Heartbeats carrying echActive=true: the agent\'s most recent successful control-plane dial was ECH-accepted. Current agents omit the key when false, so active="false" is only ever set by non-agent clients',
+  labelNames: ['active'] as const,
+  registers: [register]
+});
+
+const agentFilterSignatureReportsTotal = new Counter({
+  name: 'breeze_agent_filter_signature_reports_total',
+  help: 'Heartbeats reporting a network filter signature (plaintext HTTP on the TLS port)',
+  registers: [register]
+});
+
+// #4340 — routine agent-telemetry submits used to be chained into audit_logs
+// (~97% of its volume). They are audited now only on failure or on a real
+// change; this counter is where the routine volume stays observable.
+export type AgentIngestKind = 'logs' | 'eventlogs' | 'sessions' | 'security_status' | 'management_posture';
+export type AgentIngestOutcome = 'success' | 'partial' | 'failed';
+
+const agentIngestSubmissionsTotal = new Counter({
+  name: 'breeze_agent_ingest_submissions_total',
+  help: 'Agent telemetry submissions by kind and outcome',
+  labelNames: ['kind', 'outcome'] as const,
+  registers: [register]
+});
+
 const scriptsExecutedTotal = new Counter({
   name: 'breeze_scripts_executed_total',
   help: 'Total scripts executed',
@@ -242,6 +282,97 @@ const backupDispatchFailuresTotal = new Counter({
   name: 'breeze_backup_dispatch_failures_total',
   help: 'Backup, restore, and verification start failures by operation and reason',
   labelNames: ['operation', 'reason'] as const,
+  registers: [register]
+});
+
+const backupReadDispatchesTotal = new Counter({
+  name: 'breeze_backup_read_dispatch_total',
+  help: 'Restore-shaped backup command delivery attempts by command type, mode (brokered, local, deferred, refused, legacy) and reason',
+  labelNames: ['command_type', 'mode', 'reason'] as const,
+  registers: [register]
+});
+
+const backupStorageSessionCallsTotal = new Counter({
+  name: 'breeze_backup_storage_session_calls_total',
+  help: 'Agent storage-session endpoint calls by session scope, operation and HTTP status (410 = expired, revoked or ended)',
+  labelNames: ['scope', 'op', 'status'] as const,
+  registers: [register]
+});
+
+const backupStorageSessionObjectsTotal = new Counter({
+  name: 'breeze_backup_storage_session_objects_total',
+  help: 'Presigned object URLs issued through storage sessions by session scope and method',
+  labelNames: ['scope', 'method'] as const,
+  registers: [register]
+});
+
+const backupStorageSessionMintsTotal = new Counter({
+  name: 'breeze_backup_storage_session_mint_total',
+  help: 'Storage-session issuance decisions at command delivery by session scope, outcome (minted, refused, deferred, legacy) and reason',
+  labelNames: ['scope', 'outcome', 'reason'] as const,
+  registers: [register]
+});
+
+const backupWriteUnexpectedLegacyTotal = new Counter({
+  name: 'breeze_backup_write_dispatch_unexpected_legacy_total',
+  help: 'Backup write deliveries that carried the storage destination (none are expected: backups to S3 storage use write sessions only), by command type and reason',
+  labelNames: ['command_type', 'reason'] as const,
+  registers: [register]
+});
+
+const backupConditionalWriteProbeTotal = new Counter({
+  name: 'breeze_backup_storage_conditional_write_probe_total',
+  help: 'Destination probes for create-only write support by outcome (supported, unsupported) and reason',
+  labelNames: ['outcome', 'reason'] as const,
+  registers: [register]
+});
+
+const backupSnapshotPublishRefusedTotal = new Counter({
+  name: 'breeze_backup_snapshot_publish_refused_total',
+  help: 'Backup results whose snapshot row was refused because the id is owned elsewhere, by reason (not_current_job, foreign_claim)',
+  labelNames: ['reason'] as const,
+  registers: [register]
+});
+
+const backupWriteJanitorTotal = new Counter({
+  name: 'breeze_backup_write_janitor_total',
+  help: 'Brokered backup write cleanup actions by action (abort_upload, sweep_prefix, publish, abandon) and outcome (ok, failed)',
+  labelNames: ['action', 'outcome'] as const,
+  registers: [register]
+});
+
+const backupCapabilityRegressionsTotal = new Counter({
+  name: 'breeze_backup_capability_regressed_total',
+  help: 'Backup helper protocol drops below the stored device value, by capability (read, integrity, write)',
+  labelNames: ['capability'] as const,
+  registers: [register]
+});
+
+const backupWriteDispatchesTotal = new Counter({
+  name: 'breeze_backup_write_dispatch_total',
+  help: 'Backup write commands handed to agents by command type, mode (brokered, legacy_credential, local, refused) and reason',
+  labelNames: ['command_type', 'mode', 'reason'] as const,
+  registers: [register]
+});
+
+const backupAttestationsTotal = new Counter({
+  name: 'breeze_backup_attestation_total',
+  help: 'Snapshot attestation outcomes, at recording (recorded, duplicate_same, conflict, binding_mismatch, invalid, missing_from_capable, not_offered, capability_unknown, missing_expectation, job_reuse_refused) and at server verification (verified, mismatch, verify_unavailable, verify_parked)',
+  labelNames: ['outcome'] as const,
+  registers: [register]
+});
+
+const backupSnapshotFileIndexTotal = new Counter({
+  name: 'breeze_backup_snapshot_file_index_total',
+  help: 'Snapshot file index events: inline_dropped (a result arrived without its file list because it did not fit), hydration (a run building the index from the manifest ended) and statistics (a large publish refreshed the table\'s planner statistics), by outcome (dropped, complete, skipped, a failure code, or analyzed/busy/error)',
+  labelNames: ['event', 'outcome'] as const,
+  registers: [register]
+});
+
+const backupRestoreIntegrityTotal = new Counter({
+  name: 'breeze_backup_restore_integrity_total',
+  help: 'Integrity expectations delivered with restore-shaped commands and recovery bootstraps, by command type, status (attested, unattested, absent, override, refused) and reason',
+  labelNames: ['type', 'status', 'reason'] as const,
   registers: [register]
 });
 
@@ -524,6 +655,9 @@ function initializeMetricDefaults(): void {
   alertQueueLengthGauge.set(0);
   agentHeartbeatTotal.labels('success').inc(0);
   agentHeartbeatTotal.labels('failed').inc(0);
+  agentHeartbeatEchTotal.labels('true').inc(0);
+  agentHeartbeatEchTotal.labels('false').inc(0);
+  agentFilterSignatureReportsTotal.inc(0);
   scriptsExecutedTotal.inc(0);
   backupDispatchFailuresTotal.labels('manual_backup', 'device_offline').inc(0);
   backupVerificationSkipsTotal.labels('integrity', 'device_offline').inc(0);
@@ -575,6 +709,8 @@ interface CounterValue {
 
 const httpRequestState = new Map<string, CounterValue>();
 const agentHeartbeatState = new Map<string, CounterValue>();
+const agentHeartbeatEchState = new Map<string, CounterValue>();
+let agentFilterSignatureReports = 0;
 const softwarePolicyEvaluationState = new Map<string, CounterValue>();
 const softwareRemediationDecisionState = new Map<string, CounterValue>();
 const sensitiveDataFindingState = new Map<string, CounterValue>();
@@ -658,13 +794,14 @@ export function resolveResponseStatus(c: any): number {
  * own registration; every global in index.ts is registered at `'*'`, which Hono
  * normalises to `/*`, so that is what `unmatched` keys on. NOTE: this means a
  * request short-circuited by a global middleware (rate limit, body limit) also
- * reports `unmatched`, and a path-scoped guard reports ITS pattern
+ * reports `unmatched` (except an agent request refused by W08 admission control,
+ * which reports its route template via `admissionRouteLabelOf`), and a path-scoped guard reports ITS pattern
  * (`/api/v1/agents/:id/*`) rather than the leaf route.
  */
 function resolveRoutePattern(c: any): string {
   const resolved = honoRoutePath(c);
   const pattern = typeof resolved === 'string' ? resolved.trim() : '';
-  if (pattern.length === 0 || pattern === '/*' || pattern === '*') return UNMATCHED_ROUTE_LABEL;
+  if (pattern.length === 0 || pattern === '/*' || pattern === '*') return admissionRouteLabelOf(c) ?? UNMATCHED_ROUTE_LABEL;
   return pattern;
 }
 
@@ -721,6 +858,23 @@ export function recordHttpRequest(
 export function recordAgentHeartbeat(status: 'success' | 'failed'): void {
   agentHeartbeatTotal.labels(status).inc();
   upsertCounterState(agentHeartbeatState, { status });
+}
+
+/** #8869 — one heartbeat that carried `echActive`. */
+export function recordAgentHeartbeatEch(active: boolean): void {
+  const label = active ? 'true' : 'false';
+  agentHeartbeatEchTotal.labels(label).inc();
+  upsertCounterState(agentHeartbeatEchState, { active: label });
+}
+
+/** #8869 — one heartbeat that carried a valid `filterSignatureSeenAt`. */
+export function recordAgentFilterSignatureReport(): void {
+  agentFilterSignatureReportsTotal.inc();
+  agentFilterSignatureReports += 1;
+}
+
+export function recordAgentIngestSubmission(kind: AgentIngestKind, outcome: AgentIngestOutcome): void {
+  agentIngestSubmissionsTotal.labels(kind, outcome).inc();
 }
 
 export function updateBusinessMetrics(metrics: {
@@ -806,6 +960,104 @@ function recordBackupDispatchFailureMetric(operation: string, reason: string, co
     operation: normalizedOperation,
     reason: normalizedReason,
   }, safeCount);
+}
+
+function recordBackupReadDispatchMetric(commandType: string, mode: string, reason: string, count = 1): void {
+  const safeCount = Number.isFinite(count) ? Math.max(0, Math.floor(count)) : 0;
+  if (safeCount === 0) return;
+  backupReadDispatchesTotal
+    .labels(normalizeMetricLabel(commandType, 'unknown'), normalizeMetricLabel(mode, 'unknown'), normalizeMetricLabel(reason, 'unknown'))
+    .inc(safeCount);
+}
+
+function safeMetricCount(count: number): number {
+  return Number.isFinite(count) ? Math.max(0, Math.floor(count)) : 0;
+}
+
+function recordStorageSessionCallMetric(scope: string, op: string, status: number, count = 1): void {
+  const safeCount = safeMetricCount(count);
+  if (safeCount === 0) return;
+  const statusLabel = Number.isInteger(status) && status >= 100 && status <= 599 ? String(status) : 'unknown';
+  backupStorageSessionCallsTotal
+    .labels(normalizeMetricLabel(scope, 'unknown'), normalizeMetricLabel(op, 'unknown'), statusLabel)
+    .inc(safeCount);
+}
+
+const STORAGE_SESSION_OBJECT_METHODS = new Set(['GET', 'PUT', 'UPLOAD_PART']);
+
+function recordStorageSessionObjectsMetric(scope: string, method: string, count = 1): void {
+  const safeCount = safeMetricCount(count);
+  if (safeCount === 0) return;
+  const methodLabel = STORAGE_SESSION_OBJECT_METHODS.has(method) ? method : 'unknown';
+  backupStorageSessionObjectsTotal.labels(normalizeMetricLabel(scope, 'unknown'), methodLabel).inc(safeCount);
+}
+
+function recordStorageSessionMintMetric(scope: string, outcome: string, reason: string, count = 1): void {
+  const safeCount = safeMetricCount(count);
+  if (safeCount === 0) return;
+  backupStorageSessionMintsTotal
+    .labels(normalizeMetricLabel(scope, 'unknown'), normalizeMetricLabel(outcome, 'unknown'), normalizeMetricLabel(reason, 'unknown'))
+    .inc(safeCount);
+}
+
+function recordBackupWriteDispatchMetric(commandType: string, mode: string, reason: string, count = 1): void {
+  const safeCount = safeMetricCount(count);
+  if (safeCount === 0) return;
+  backupWriteDispatchesTotal
+    .labels(normalizeMetricLabel(commandType, 'unknown'), normalizeMetricLabel(mode, 'unknown'), normalizeMetricLabel(reason, 'unknown'))
+    .inc(safeCount);
+}
+
+function recordBackupAttestationMetric(outcome: string, count = 1): void {
+  const safeCount = safeMetricCount(count);
+  if (safeCount === 0) return;
+  backupAttestationsTotal.labels(normalizeMetricLabel(outcome, 'unknown')).inc(safeCount);
+}
+
+function recordSnapshotFileIndexMetric(event: string, outcome: string, count = 1): void {
+  const safeCount = safeMetricCount(count);
+  if (safeCount === 0) return;
+  backupSnapshotFileIndexTotal
+    .labels(normalizeMetricLabel(event, 'unknown'), normalizeMetricLabel(outcome, 'unknown'))
+    .inc(safeCount);
+}
+
+function recordRestoreIntegrityMetric(commandType: string, status: string, reason: string, count = 1): void {
+  const safeCount = safeMetricCount(count);
+  if (safeCount === 0) return;
+  backupRestoreIntegrityTotal
+    .labels(normalizeMetricLabel(commandType, 'unknown'), normalizeMetricLabel(status, 'unknown'), normalizeMetricLabel(reason, 'unknown'))
+    .inc(safeCount);
+}
+
+function recordUnexpectedLegacyWriteMetric(commandType: string, reason: string, count = 1): void {
+  const safeCount = safeMetricCount(count);
+  if (safeCount === 0) return;
+  backupWriteUnexpectedLegacyTotal.labels(normalizeMetricLabel(commandType, 'unknown'), normalizeMetricLabel(reason, 'unknown')).inc(safeCount);
+}
+
+function recordConditionalWriteProbeMetric(outcome: string, reason: string, count = 1): void {
+  const safeCount = safeMetricCount(count);
+  if (safeCount === 0) return;
+  backupConditionalWriteProbeTotal.labels(normalizeMetricLabel(outcome, 'unknown'), normalizeMetricLabel(reason, 'unknown')).inc(safeCount);
+}
+
+function recordSnapshotPublishRefusedMetric(reason: string, count = 1): void {
+  const safeCount = safeMetricCount(count);
+  if (safeCount === 0) return;
+  backupSnapshotPublishRefusedTotal.labels(normalizeMetricLabel(reason, 'unknown')).inc(safeCount);
+}
+
+function recordBackupWriteJanitorMetric(action: string, outcome: string, count = 1): void {
+  const safeCount = safeMetricCount(count);
+  if (safeCount === 0) return;
+  backupWriteJanitorTotal.labels(normalizeMetricLabel(action, 'unknown'), normalizeMetricLabel(outcome, 'unknown')).inc(safeCount);
+}
+
+function recordBackupCapabilityRegressedMetric(capability: string, count = 1): void {
+  const safeCount = safeMetricCount(count);
+  if (safeCount === 0) return;
+  backupCapabilityRegressionsTotal.labels(normalizeMetricLabel(capability, 'unknown')).inc(safeCount);
 }
 
 function recordBackupVerificationSkipMetric(
@@ -988,6 +1240,19 @@ function bindMetricsRecorders(): void {
     onCommandTimeout: recordBackupCommandTimeoutMetric,
     onVerificationResult: recordBackupVerificationResultMetric,
     onLowReadinessDevices: setLowReadinessDevicesMetric,
+    onReadDispatch: recordBackupReadDispatchMetric,
+    onCapabilityRegressed: recordBackupCapabilityRegressedMetric,
+    onStorageSessionCall: recordStorageSessionCallMetric,
+    onStorageSessionObjects: recordStorageSessionObjectsMetric,
+    onStorageSessionMint: recordStorageSessionMintMetric,
+    onWriteDispatch: recordBackupWriteDispatchMetric,
+    onAttestation: recordBackupAttestationMetric,
+    onWriteJanitor: recordBackupWriteJanitorMetric,
+    onUnexpectedLegacyWrite: recordUnexpectedLegacyWriteMetric,
+    onConditionalWriteProbe: recordConditionalWriteProbeMetric,
+    onSnapshotPublishRefused: recordSnapshotPublishRefusedMetric,
+    onRestoreIntegrity: recordRestoreIntegrityMetric,
+    onSnapshotFileIndex: recordSnapshotFileIndexMetric,
   });
 
   setAnomalyMetricsRecorder({
@@ -1039,6 +1304,8 @@ export function resetMetricsForTesting(): void {
 
   httpRequestState.clear();
   agentHeartbeatState.clear();
+  agentHeartbeatEchState.clear();
+  agentFilterSignatureReports = 0;
   softwarePolicyEvaluationState.clear();
   softwareRemediationDecisionState.clear();
   sensitiveDataFindingState.clear();
@@ -1149,7 +1416,7 @@ async function readFleetGauges(nowMs: number): Promise<void> {
       .where(
         and(
           gte(devices.lastSeenAt, activeSince),
-          eq(devices.isEphemeral, false),
+          eq(devices.isEphemeral, false), notParkedDeviceCondition(),
           sql`${devices.status} != 'decommissioned'`
         )
       );
@@ -1275,12 +1542,22 @@ function emptyDashboardMetrics() {
 
 metricsRoutes.get('/', authMiddleware, requireScope('organization', 'partner', 'system'), requireMetricsRead, async (c) => {
   const auth = c.get('auth');
-  const orgCondition =
-    typeof auth?.orgCondition === 'function'
-      ? auth.orgCondition(devices.orgId)
-      : auth?.orgId
-        ? eq(devices.orgId, auth.orgId)
-        : undefined;
+  // The org switcher's selection arrives as `?orgId=`; it may only narrow the
+  // token's reach (#9648).
+  const orgScope = resolveAnalyticsOrgScope(auth, c.req.query('orgId'));
+  if (!orgScope.ok) {
+    return c.json({ error: orgScope.error }, orgScope.status);
+  }
+  const orgCondition = orgScope.orgCondition(devices.orgId);
+  // "Sessions in range" follows the selected range (preset or custom, #9650);
+  // the other figures here (uptime, active sessions) are point-in-time.
+  const sessionWindow = resolveAnalyticsDateWindow(
+    { range: c.req.query('range'), startDate: c.req.query('startDate'), endDate: c.req.query('endDate') },
+    (range) => (range === '24h' ? 1 : range === '7d' ? 7 : 30)
+  );
+  if (!sessionWindow.ok) {
+    return c.json({ error: sessionWindow.error }, sessionWindow.status);
+  }
 
   // `allowedSiteIds` is populated by requirePermission. `undefined` is
   // unrestricted; `[]` is restricted to no sites and must never widen into
@@ -1299,7 +1576,7 @@ metricsRoutes.get('/', authMiddleware, requireScope('organization', 'partner', '
     // they never inflate the fleet counts or skew the uptime denominator.
     const deviceStatusCondition = and(
       sql`${devices.status} != 'decommissioned'`,
-      eq(devices.isEphemeral, false),
+      eq(devices.isEphemeral, false), notParkedDeviceCondition(),
       orgCondition,
       siteCondition
     );
@@ -1342,9 +1619,9 @@ metricsRoutes.get('/', authMiddleware, requireScope('organization', 'partner', '
       .where(activeSessionCondition);
     const activeSessions = Number(sessionRow?.count ?? 0);
 
-    const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
     const totalSessionCondition = and(
-      gte(remoteSessions.createdAt, thirtyDaysAgo),
+      gte(remoteSessions.createdAt, sessionWindow.since),
+      sessionWindow.until ? lt(remoteSessions.createdAt, sessionWindow.until) : undefined,
       orgCondition,
       siteCondition
     );
@@ -1374,6 +1651,26 @@ metricsRoutes.get('/', authMiddleware, requireScope('organization', 'partner', '
   }
 });
 
+/**
+ * `device_metrics.timestamp` is `timestamp without time zone` holding UTC, so the
+ * raw fallback's date_trunc comes back as a bare "YYYY-MM-DD 00:00:00" (or a Date).
+ * Emit the same ISO-8601 `Z` form the rollup path does, so clients never have to
+ * guess the zone (#11284).
+ */
+function trendBucketToIso(bucket: unknown): string {
+  if (bucket instanceof Date) return bucket.toISOString();
+  const text = String(bucket);
+  const hasZone = /(Z|[+-]\d{2}(:?\d{2})?)$/i.test(text.replace(/^\d{4}-\d{2}-\d{2}/, ''));
+  // Postgres renders a whole-hour offset as "+00"; Date needs "+00:00".
+  const iso = text.replace(' ', 'T').replace(/([+-]\d{2})$/, '$1:00');
+  const parsed = new Date(`${iso}${hasZone ? '' : 'Z'}`);
+  if (Number.isNaN(parsed.getTime())) {
+    // Surfaces through the route's catch (500 + log) rather than shipping a non-ISO string.
+    throw new Error(`trendBucketToIso: unparseable bucket ${JSON.stringify(text)}`);
+  }
+  return parsed.toISOString();
+}
+
 metricsRoutes.get('/trends', authMiddleware, requireScope('organization', 'partner', 'system'), requireMetricsRead, async (c) => {
   // Trend metrics aggregate `metric_rollups`, which is pre-aggregated per
   // organization and carries no site axis. There is no safe site predicate to
@@ -1391,28 +1688,29 @@ metricsRoutes.get('/trends', authMiddleware, requireScope('organization', 'partn
   }
 
   const auth = c.get('auth');
-  const orgCondition =
-    typeof auth?.orgCondition === 'function'
-      ? auth.orgCondition(devices.orgId)
-      : auth?.orgId
-        ? eq(devices.orgId, auth.orgId)
-        : undefined;
-  const range = c.req.query('range') ?? '30d';
-  const days = range === '24h' ? 1 : range === '7d' ? 7 : 30;
-  const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+  const orgScope = resolveAnalyticsOrgScope(auth, c.req.query('orgId'));
+  if (!orgScope.ok) {
+    return c.json({ error: orgScope.error }, orgScope.status);
+  }
+  const orgCondition = orgScope.orgCondition(devices.orgId);
+  // Custom range (`startDate`/`endDate`) wins over the `range` preset (#9649).
+  const dateWindow = resolveAnalyticsDateWindow(
+    { range: c.req.query('range'), startDate: c.req.query('startDate'), endDate: c.req.query('endDate') },
+    (range) => (range === '24h' ? 1 : range === '7d' ? 7 : 30)
+  );
+  if (!dateWindow.ok) {
+    return c.json({ error: dateWindow.error }, dateWindow.status);
+  }
+  const { since, until } = dateWindow;
 
   try {
-    const rollupOrgCondition =
-      typeof auth?.orgCondition === 'function'
-        ? auth.orgCondition(metricRollups.orgId)
-        : auth?.orgId
-          ? eq(metricRollups.orgId, auth.orgId)
-          : undefined;
+    const rollupOrgCondition = orgScope.orgCondition(metricRollups.orgId);
     const rollupCondition = and(
       eq(metricRollups.sourceTable, 'device_metrics'),
       eq(metricRollups.bucketSeconds, 86400),
       inArray(metricRollups.metricName, ['cpu_percent', 'ram_percent']),
       gte(metricRollups.bucketStart, since),
+      ...(until ? [lt(metricRollups.bucketStart, until)] : []),
       sql`${metricRollups.sampleCount} > 0`,
       sql`${metricRollups.avgValue} IS NOT NULL`,
       ...(rollupOrgCondition ? [rollupOrgCondition] : [])
@@ -1443,9 +1741,11 @@ metricsRoutes.get('/trends', authMiddleware, requireScope('organization', 'partn
       return c.json(Array.from(byBucket.values()));
     }
 
-    const trendsCondition = orgCondition
-      ? and(gte(deviceMetrics.timestamp, since), orgCondition)
-      : gte(deviceMetrics.timestamp, since);
+    const trendsCondition = and(
+      gte(deviceMetrics.timestamp, since),
+      ...(until ? [lt(deviceMetrics.timestamp, until)] : []),
+      ...(orgCondition ? [orgCondition] : [])
+    );
     const rows = await db
       .select({
         bucket: sql<string>`date_trunc('day', ${deviceMetrics.timestamp})`.as('bucket'),
@@ -1461,7 +1761,7 @@ metricsRoutes.get('/trends', authMiddleware, requireScope('organization', 'partn
     if (rows.length > 0) {
       return c.json(
         rows.map((r) => ({
-          timestamp: r.bucket,
+          timestamp: trendBucketToIso(r.bucket),
           cpu: Math.round(Number(r.cpu ?? 0)),
           memory: Math.round(Number(r.memory ?? 0))
         }))
@@ -1538,6 +1838,8 @@ metricsRoutes.get('/json', authMiddleware, requireScope('system'), async (c) => 
       low_readiness_devices: backupLowReadinessDevices,
     },
     agent_heartbeats: Array.from(agentHeartbeatState.values()),
+    agent_heartbeat_ech: Array.from(agentHeartbeatEchState.values()),
+    agent_filter_signature_reports_total: agentFilterSignatureReports,
     process: {
       uptime_seconds: process.uptime(),
       node_version: process.version

@@ -1,12 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { mockDb, ctxState, queueMock } = vi.hoisted(() => ({
+const { mockDb, ctxState, queueMock, neSpy } = vi.hoisted(() => ({
   mockDb: {
     select: vi.fn(),
     insert: vi.fn(),
     update: vi.fn(),
     transaction: vi.fn()
   },
+  neSpy: vi.fn(),
   // Tracks DB-access-context depth + an ordered event log so a test can prove
   // the monitor scheduler READS inside a context but ENQUEUES outside one (#1105).
   ctxState: { depth: 0, events: [] as string[] },
@@ -28,7 +29,10 @@ vi.mock('bullmq', () => ({
   Worker: class {},
   Job: class {},
   UnrecoverableError: class extends Error {},
+  DelayedError: class extends Error {},
 }));
+
+vi.mock('../services/capacityGuard', () => ({ canRunBackgroundWork: () => true }));
 
 vi.mock('../db', () => ({
   db: mockDb,
@@ -51,6 +55,22 @@ vi.mock('../db', () => ({
   }
 }));
 
+// Plain-string mocked schema columns below cannot round-trip through a real
+// drizzle SQL compiler, so the only way to prove a predicate like
+// `ne(organizations.type, 'quick_support')` is actually emitted is to spy on
+// the drizzle-orm helper call itself rather than inspect the resulting SQL
+// tree (mirrors monitorScriptWorker.test.ts).
+vi.mock('drizzle-orm', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('drizzle-orm')>();
+  return {
+    ...actual,
+    ne: ((...args: Parameters<typeof actual.ne>) => {
+      neSpy(...args);
+      return actual.ne(...args);
+    }) as typeof actual.ne,
+  };
+});
+
 vi.mock('../db/schema', () => ({
   networkMonitors: {
     id: 'networkMonitors.id',
@@ -64,7 +84,8 @@ vi.mock('../db/schema', () => ({
   },
   organizations: {
     id: 'organizations.id',
-    partnerId: 'organizations.partnerId'
+    partnerId: 'organizations.partnerId',
+    type: 'organizations.type'
   },
   networkMonitorResults: {
     monitorId: 'networkMonitorResults.monitorId'
@@ -79,6 +100,7 @@ vi.mock('../db/schema', () => ({
   networkMonitorAlertRules: {
     monitorId: 'networkMonitorAlertRules.monitorId',
     isActive: 'networkMonitorAlertRules.isActive',
+    retiredAt: 'networkMonitorAlertRules.retiredAt',
     $inferSelect: {}
   },
   alerts: {
@@ -122,6 +144,7 @@ vi.mock('../services/alertService', () => ({
 }));
 
 import { db } from '../db';
+import { organizations } from '../db/schema';
 import { isCooldownActive, setCooldown } from '../services/alertCooldown';
 import { resolveAlert, createSourcedAlert } from '../services/alertService';
 import { dispatchCommandToAgent, isAgentConnectedAnywhere } from '../services/agentCommandRelay';
@@ -288,6 +311,26 @@ describe('recordMonitorCheckResult', () => {
     } as any);
   });
 
+  it('excludes retired legacy rules from alert evaluation', async () => {
+    const rulesWhere = vi.fn().mockResolvedValue([]);
+    vi.mocked(db.select)
+      .mockReturnValueOnce(selectLimitResolved([{
+        id: 'monitor-1', orgId: 'org-1', assetId: null, consecutiveFailures: 0,
+      }]) as any)
+      .mockReturnValueOnce({ from: () => ({ where: rulesWhere }) } as any);
+
+    await recordMonitorCheckResult('monitor-1', {
+      monitorId: 'monitor-1', status: 'offline', responseMs: 250,
+    }, { orgId: 'org-1', deviceId: 'device-1' });
+
+    const predicate = JSON.stringify(rulesWhere.mock.calls[0]);
+    expect(predicate).toContain('networkMonitorAlertRules.monitorId');
+    expect(predicate).toContain('networkMonitorAlertRules.isActive');
+    expect(predicate).toContain('networkMonitorAlertRules.retiredAt');
+    expect(predicate).toContain('is null');
+    expect(createSourcedAlert).not.toHaveBeenCalled();
+  });
+
   it('creates a monitor alert when an active rule matches', async () => {
     vi.mocked(db.select)
       .mockReturnValueOnce(selectLimitResolved([{
@@ -325,6 +368,8 @@ describe('recordMonitorCheckResult', () => {
 
     // #5241: the alert must go through the shared create+publish path so
     // `alert.triggered` actually fires — never a raw insert into `alerts`.
+    const createSourcedAlertMock = vi.mocked(createSourcedAlert);
+    const legacyId = 'monitor-1';
     expect(vi.mocked(db.insert)).not.toHaveBeenCalled();
     expect(vi.mocked(createSourcedAlert)).toHaveBeenCalledTimes(1);
     expect(vi.mocked(createSourcedAlert)).toHaveBeenCalledWith(expect.objectContaining({
@@ -335,20 +380,50 @@ describe('recordMonitorCheckResult', () => {
       context: expect.objectContaining({
         source: 'network_monitor',
         monitorId: 'monitor-1',
+        legacyNetworkMonitorId: legacyId,
         alertRuleId: 'rule-1',
       }),
       title: expect.stringContaining('Edge Ping'),
       message: expect.stringContaining('Edge Ping'),
       eventPayload: expect.objectContaining({
-        monitorId: 'monitor-1',
+        legacyNetworkMonitorId: legacyId,
         alertRuleId: 'rule-1',
         monitorType: 'icmp_ping',
         target: '8.8.8.8',
       }),
     }));
+    expect(createSourcedAlertMock.mock.calls.at(-1)![0].eventPayload).not.toHaveProperty('monitorId');
     expect(vi.mocked(isCooldownActive)).toHaveBeenCalledWith('rule-1', 'device-1');
     expect(vi.mocked(setCooldown)).toHaveBeenCalledWith('rule-1', 'device-1', 5);
     expect(vi.mocked(resolveAlert)).not.toHaveBeenCalled();
+  });
+
+  it('creates a monitor alert whose message, context and event show a URL target as scheme + host', async () => {
+    const secretUrl = 'https://ops:hunter2@status.example.com/hooks/T1/B1/abc123?token=xyz789';
+    vi.mocked(db.select)
+      .mockReturnValueOnce(selectLimitResolved([{
+        id: 'monitor-1', orgId: 'org-1', assetId: null, name: 'Status page',
+        target: secretUrl, monitorType: 'http_check', consecutiveFailures: 3,
+      }]) as any)
+      .mockReturnValueOnce(selectWhereResolved([{
+        id: 'rule-1', monitorId: 'monitor-1', condition: 'offline', threshold: null,
+        severity: 'high', message: null, isActive: true,
+      }]) as any)
+      .mockReturnValueOnce(selectWhereOrderLimitResolved([{ id: 'device-1' }]) as any)
+      .mockReturnValueOnce(selectWhereResolved([]) as any);
+
+    await recordMonitorCheckResult('monitor-1', {
+      monitorId: 'monitor-1', status: 'offline', responseMs: 250, error: 'timeout',
+    }, { orgId: 'org-1', deviceId: 'device-1' });
+
+    expect(vi.mocked(createSourcedAlert)).toHaveBeenCalledTimes(1);
+    const args = vi.mocked(createSourcedAlert).mock.calls[0]![0] as any;
+    expect(args.message).toContain('Target: https://status.example.com.');
+    expect(args.context.target).toBe('https://status.example.com');
+    expect(args.eventPayload.target).toBe('https://status.example.com');
+    for (const fragment of ['hunter2', '/hooks/', 'abc123', 'xyz789']) {
+      expect(JSON.stringify(args)).not.toContain(fragment);
+    }
   });
 
   it('does not burn the cooldown when alert creation fails (#5241)', async () => {
@@ -484,7 +559,10 @@ describe('recordMonitorCheckResult', () => {
 
     expect(vi.mocked(resolveAlert)).toHaveBeenCalledWith(
       'alert-1',
-      expect.stringContaining('recovered from offline')
+      expect.stringContaining('recovered from offline'),
+      undefined,
+      false,
+      'condition_cleared',
     );
     expect(vi.mocked(db.insert)).not.toHaveBeenCalled();
     expect(vi.mocked(createSourcedAlert)).not.toHaveBeenCalled();
@@ -545,6 +623,51 @@ describe('recordMonitorCheckResult', () => {
     const stateSet = txUpdateSet.mock.calls[0]![0] as { lastError: string };
     expect(stateSet.lastError).toContain('[PRIVATE_KEY_REDACTED]');
     expect(stateSet.lastError).not.toContain('BEGIN RSA PRIVATE KEY');
+  });
+
+  it('stores agent error text with URLs reduced to scheme + host', async () => {
+    const secretUrl = 'https://ops:hunter2@status.example.com/hooks/T1/B1/abc123?token=xyz789';
+    const goError = `Get "${secretUrl}": dial tcp 1.2.3.4:443: i/o timeout`;
+
+    const txInsertValues = vi.fn().mockResolvedValue(undefined);
+    const txUpdateSet = vi.fn().mockReturnValue({
+      where: vi.fn().mockResolvedValue(undefined),
+    });
+    vi.mocked(db.transaction).mockImplementation(async (callback: any) => callback({
+      insert: vi.fn().mockReturnValue({ values: txInsertValues }),
+      update: vi.fn().mockReturnValue({ set: txUpdateSet }),
+    }));
+
+    vi.mocked(db.select)
+      .mockReturnValueOnce(selectLimitResolved([{
+        id: 'monitor-1',
+        orgId: 'org-1',
+        assetId: null,
+        name: 'Status page',
+        target: secretUrl,
+        monitorType: 'http_check',
+        consecutiveFailures: 1
+      }]) as any)
+      .mockReturnValueOnce(selectWhereResolved([]) as any);
+
+    await recordMonitorCheckResult('monitor-1', {
+      monitorId: 'monitor-1',
+      status: 'offline',
+      responseMs: 0,
+      error: goError,
+      details: { monitorId: 'monitor-1', status: 'offline', error: goError },
+    }, { orgId: 'org-1', deviceId: 'device-1' });
+
+    const inserted = txInsertValues.mock.calls[0]![0] as { error: string; details: { error: string } };
+    const expected = 'Get "https://status.example.com": dial tcp 1.2.3.4:443: i/o timeout';
+    expect(inserted.error).toBe(expected);
+    expect(inserted.details.error).toBe(expected);
+    const stateSet = txUpdateSet.mock.calls[0]![0] as { lastError: string };
+    expect(stateSet.lastError).toBe(expected);
+    for (const fragment of ['hunter2', '/hooks/', 'abc123', 'xyz789']) {
+      expect(JSON.stringify(inserted)).not.toContain(fragment);
+      expect(stateSet.lastError).not.toContain(fragment);
+    }
   });
 
   // #5751 W03 (#5754): the TLS observation joins the SAME updateSet as
@@ -865,6 +988,19 @@ describe('partner-wide network monitors (#5291 W04)', () => {
     for (const call of queueMock.add.mock.calls as any[]) {
       expect(call[1].monitorId).toBe('m-partner');
     }
+  });
+
+  it('excludes the hidden quick_support org from the partner-wide org enumeration', async () => {
+    neSpy.mockClear();
+    vi.mocked(db.select)
+      .mockReturnValueOnce(selectWhereResolved([
+        { id: 'm-partner', orgId: null, partnerId: 'p1', pollingInterval: 60, lastChecked: null },
+      ]) as any)
+      .mockReturnValueOnce(selectWhereResolved([{ id: 'org-a', partnerId: 'p1' }]) as any);
+
+    await processScheduler();
+
+    expect(neSpy).toHaveBeenCalledWith(organizations.type, 'quick_support');
   });
 
   it('still enqueues exactly one job for an org-owned monitor', async () => {

@@ -1,6 +1,6 @@
 import { and, eq, sql, desc, gte, lte, inArray, isNull, type SQL } from 'drizzle-orm';
 import type { AnyPgColumn } from 'drizzle-orm/pg-core';
-import { db } from '../db';
+import { db, withDbTransactionIfHeld } from '../db';
 import {
   devices,
   manualAssets,
@@ -21,9 +21,14 @@ import {
 } from '@breeze/shared';
 import {
   BUSINESS_REPORT_TYPES,
+  emptyAiUsageByClientSummary,
   emptyArAgingSummary,
   emptyTechnicianTimeSummary,
   emptyTicketSlaSummary,
+  emptyMrrRenewalsSummary,
+  emptyQuoteWinRateSummary,
+  emptyClientProfitabilitySummary,
+  emptyTicketSlaPerformanceSummary,
 } from '@breeze/shared';
 import {
   systemReportAuthorityFor,
@@ -35,8 +40,10 @@ import {
 } from './siteScope';
 import { isManagedEvidenceType, type ManagedEvidenceType } from './managedEvidenceRegistry';
 import { reportTypeDef } from './reportRegistry';
+import { resolveReportDateRange } from './reportDateRange';
 import { endpointManagementConfigSchema } from './reportConfigSchemas';
 import { organizationScope, reportOwnerOfScope, type ReportScope } from './reportScope';
+import { alertSiteScopeByDeviceIds } from '../routes/alerts/helpers';
 // #3198 W02: shared with the business generators, which refuse a restricted
 // authority with a non-empty site list themselves (the zero-safe branch below
 // only sees the empty-list case).
@@ -47,6 +54,7 @@ import {
   UnsupportedReportScopeError,
 } from './reportErrors';
 
+import { notParkedDeviceCondition } from './unassignedPool/selectorPredicate';
 export {
   StoredArtifactOnlyReportError,
   UnexecutableReportScopeError,
@@ -96,7 +104,7 @@ export async function previousBaselineFor(
   scopeFingerprint: string,
 ): Promise<ReportResult['previous']> {
   try {
-    const [prior] = await db
+    const [prior] = await withDbTransactionIfHeld(() => db
       .select({
         summary: sql<Record<string, unknown> | null>`${reportRuns.result}->'summary'`,
         generatedAt: sql<string | null>`${reportRuns.result}->>'generatedAt'`,
@@ -109,7 +117,7 @@ export async function previousBaselineFor(
         eq(reportRuns.executionScopeFingerprint, scopeFingerprint),
       ))
       .orderBy(desc(reportRuns.completedAt))
-      .limit(1);
+      .limit(1));
     if (!prior?.summary || typeof prior.summary !== 'object') return undefined;
     return {
       generatedAt: prior.generatedAt ?? prior.completedAt?.toISOString() ?? null,
@@ -383,6 +391,7 @@ type DeviceInventoryRow = {
   ramTotalMb: number | null;
   diskTotalGb: number | null;
   serialNumber: string | null;
+  productSku: string | null;
 };
 
 /** Shared row query; callers retain their own authority checks and narrowing. */
@@ -401,11 +410,12 @@ export async function readDeviceInventoryRows(orgId: string, conditions: SQL[]) 
       cpuModel: deviceHardware.cpuModel,
       ramTotalMb: deviceHardware.ramTotalMb,
       diskTotalGb: deviceHardware.diskTotalGb,
-      serialNumber: deviceHardware.serialNumber
+      serialNumber: deviceHardware.serialNumber,
+      productSku: deviceHardware.productSku
     })
     .from(devices)
     .leftJoin(deviceHardware, eq(devices.id, deviceHardware.deviceId))
-    .where(and(eq(devices.orgId, orgId), eq(devices.isEphemeral, false), ...conditions))
+    .where(and(eq(devices.orgId, orgId), eq(devices.isEphemeral, false), notParkedDeviceCondition(), ...conditions))
     .orderBy(devices.hostname);
 }
 
@@ -426,7 +436,7 @@ export async function generateDeviceInventoryReport(
   // devices live in the partner's hidden 'quick_support' org, which deliberately
   // stays inside accessibleOrgIds so RLS lets a tech reach their own session.
   // Nothing filters them out for us — reports must exclude them explicitly.
-  const conditions: SQL[] = [eq(devices.orgId, orgId), eq(devices.isEphemeral, false)];
+  const conditions: SQL[] = [eq(devices.orgId, orgId), eq(devices.isEphemeral, false), notParkedDeviceCondition()];
 
   const filters = config.filters as Record<string, unknown> | undefined;
   if (filters?.deviceIds && Array.isArray(filters.deviceIds) && filters.deviceIds.length > 0) {
@@ -504,6 +514,7 @@ export async function generateDeviceInventoryReport(
         ramTotalMb: null,
         diskTotalGb: null,
         serialNumber: asset.serialNumber,
+        productSku: null,
       });
     }
 
@@ -525,7 +536,7 @@ export async function readSoftwareInventoryRows(orgId: string, conditions: SQL[]
     })
     .from(deviceSoftware)
     .innerJoin(devices, eq(deviceSoftware.deviceId, devices.id))
-    .where(and(eq(devices.orgId, orgId), eq(devices.isEphemeral, false), ...conditions))
+    .where(and(eq(devices.orgId, orgId), eq(devices.isEphemeral, false), notParkedDeviceCondition(), ...conditions))
     .orderBy(deviceSoftware.name, devices.hostname);
 }
 
@@ -535,7 +546,7 @@ export async function generateSoftwareInventoryReport(
   authority: OrgReportExecutionAuthority,
 ) {
   assertReportExecutionPreflight(orgId, config, authority, 'software_inventory');
-  const conditions: SQL[] = [eq(devices.orgId, orgId), eq(devices.isEphemeral, false)];
+  const conditions: SQL[] = [eq(devices.orgId, orgId), eq(devices.isEphemeral, false), notParkedDeviceCondition()];
 
   const filters = config.filters as Record<string, unknown> | undefined;
   if (filters?.deviceIds && Array.isArray(filters.deviceIds) && filters.deviceIds.length > 0) {
@@ -559,13 +570,9 @@ export async function generateAlertSummaryReport(
   assertReportExecutionPreflight(orgId, config, authority, 'alert_summary');
   const conditions: SQL[] = [eq(alerts.orgId, orgId)];
 
-  const dateRange = config.dateRange as Record<string, string> | undefined;
-  if (dateRange?.start) {
-    conditions.push(gte(alerts.triggeredAt, new Date(dateRange.start)));
-  }
-  if (dateRange?.end) {
-    conditions.push(lte(alerts.triggeredAt, new Date(dateRange.end)));
-  }
+  const reportWindow = resolveReportDateRange(config.dateRange);
+  if (reportWindow.start) conditions.push(gte(alerts.triggeredAt, reportWindow.start));
+  if (reportWindow.end) conditions.push(lte(alerts.triggeredAt, reportWindow.end));
 
   const filters = config.filters as Record<string, unknown> | undefined;
   if (filters?.severity && Array.isArray(filters.severity) && filters.severity.length > 0) {
@@ -573,11 +580,13 @@ export async function generateAlertSummaryReport(
   }
 
   const allowedDeviceIds = await resolveSiteAllowedDeviceIds(orgId, authority);
-  if (allowedDeviceIds) {
-    if (allowedDeviceIds.length === 0) {
+  if (allowedDeviceIds && authority.scope.kind === 'restricted') {
+    if (authority.scope.siteIds.length === 0) {
       return { rows: [], rowCount: 0, summary: {} };
     }
-    conditions.push(inArray(alerts.deviceId, allowedDeviceIds));
+    // Device alerts by in-scope device; site-owned topology alerts by their
+    // owning topology site (M3-D6), never the origin device's site.
+    conditions.push(alertSiteScopeByDeviceIds({ allowedSiteIds: authority.scope.siteIds, allowedDeviceIds })!);
   }
 
   const whereCondition = and(...conditions);
@@ -622,7 +631,7 @@ export async function generateComplianceReport(
   authority: OrgReportExecutionAuthority,
 ) {
   assertReportExecutionPreflight(orgId, config, authority, 'compliance');
-  const conditions: SQL[] = [eq(devices.orgId, orgId), eq(devices.isEphemeral, false)];
+  const conditions: SQL[] = [eq(devices.orgId, orgId), eq(devices.isEphemeral, false), notParkedDeviceCondition()];
 
   const filters = config.filters as Record<string, unknown> | undefined;
   if (filters?.siteIds && Array.isArray(filters.siteIds) && filters.siteIds.length > 0) {
@@ -693,7 +702,7 @@ export async function generatePerformanceReport(
   authority: OrgReportExecutionAuthority,
 ) {
   assertReportExecutionPreflight(orgId, config, authority, 'performance');
-  const deviceConditions: SQL[] = [eq(devices.orgId, orgId), eq(devices.isEphemeral, false)];
+  const deviceConditions: SQL[] = [eq(devices.orgId, orgId), eq(devices.isEphemeral, false), notParkedDeviceCondition()];
   if (addAllowedSiteCondition(deviceConditions, authority)) {
     return emptyRowsReport();
   }
@@ -711,13 +720,9 @@ export async function generatePerformanceReport(
 
   const conditions: SQL[] = [inArray(deviceMetrics.deviceId, deviceIds)];
 
-  const dateRange = config.dateRange as Record<string, string> | undefined;
-  if (dateRange?.start) {
-    conditions.push(gte(deviceMetrics.timestamp, new Date(dateRange.start)));
-  }
-  if (dateRange?.end) {
-    conditions.push(lte(deviceMetrics.timestamp, new Date(dateRange.end)));
-  }
+  const reportWindow = resolveReportDateRange(config.dateRange);
+  if (reportWindow.start) conditions.push(gte(deviceMetrics.timestamp, reportWindow.start));
+  if (reportWindow.end) conditions.push(lte(deviceMetrics.timestamp, reportWindow.end));
 
   const whereCondition = and(...conditions);
 
@@ -767,8 +772,12 @@ export async function generateExecutiveSummaryReport(
     .where(eq(organizations.id, orgId))
     .limit(1);
 
-  const dateRange = config.dateRange as Record<string, string> | undefined;
-  const deviceConditions: SQL[] = [eq(devices.orgId, orgId), eq(devices.isEphemeral, false)];
+  // #9562: the alert figures (alerts in window, severity counts, resolution
+  // rate) are the report's time-scoped section and MUST be bounded by the
+  // configured window, preset or explicit. The device figures are a
+  // point-in-time snapshot of the fleet and are deliberately not windowed.
+  const reportWindow = resolveReportDateRange(config.dateRange);
+  const deviceConditions: SQL[] = [eq(devices.orgId, orgId), eq(devices.isEphemeral, false), notParkedDeviceCondition()];
   const emptyDeviceScope = addAllowedSiteCondition(deviceConditions, authority);
   const deviceWhereCondition = and(...deviceConditions);
 
@@ -786,19 +795,17 @@ export async function generateExecutiveSummaryReport(
 
   // Alert stats
   const alertConditions: SQL[] = [eq(alerts.orgId, orgId)];
-  if (dateRange?.start) {
-    alertConditions.push(gte(alerts.triggeredAt, new Date(dateRange.start)));
-  }
-  if (dateRange?.end) {
-    alertConditions.push(lte(alerts.triggeredAt, new Date(dateRange.end)));
-  }
+  if (reportWindow.start) alertConditions.push(gte(alerts.triggeredAt, reportWindow.start));
+  if (reportWindow.end) alertConditions.push(lte(alerts.triggeredAt, reportWindow.end));
 
   const allowedDeviceIds = await resolveSiteAllowedDeviceIds(orgId, authority);
-  if (allowedDeviceIds) {
-    alertConditions.push(inArray(alerts.deviceId, allowedDeviceIds));
+  const restrictedSiteIds = allowedDeviceIds && authority.scope.kind === 'restricted' ? authority.scope.siteIds : null;
+  if (allowedDeviceIds && restrictedSiteIds) {
+    // Site-owned topology alerts follow their owning topology site (M3-D6).
+    alertConditions.push(alertSiteScopeByDeviceIds({ allowedSiteIds: restrictedSiteIds, allowedDeviceIds })!);
   }
 
-  const alertStats = allowedDeviceIds?.length === 0
+  const alertStats = restrictedSiteIds?.length === 0
     ? [{ total: 0, critical: 0, high: 0, resolved: 0 }]
     : await db
       .select({
@@ -1025,6 +1032,7 @@ function zeroSafeReport(type: ReportType, orgId: string): ReportResult {
     case 'performance':
     case 'security_compliance_posture':
     case 'hardware_lifecycle':
+    case 'backup_status':
     // #5784 W02 — NOT stored-artifact-only: a restricted authority with zero
     // sites gets an empty-but-shaped result rather than a throw.
     case 'threat_detection_review':
@@ -1093,6 +1101,21 @@ function zeroSafeReport(type: ReportType, orgId: string): ReportResult {
       return { rows: [], rowCount: 0, summary: emptyTechnicianTimeSummary(SITE_RESTRICTED_NOTE) as unknown as Record<string, unknown> };
     case 'ar_aging':
       return { rows: [], rowCount: 0, summary: emptyArAgingSummary(SITE_RESTRICTED_NOTE) as unknown as Record<string, unknown> };
+    // AI chargeback W10 (#7608): the AI ledger has no site axis either.
+    case 'ai_usage_by_client':
+      return { rows: [], rowCount: 0, summary: emptyAiUsageByClientSummary(SITE_RESTRICTED_NOTE) as unknown as Record<string, unknown> };
+    // Business reports phase 2 W1 (#9828): contracts have no site column.
+    case 'mrr_renewals':
+      return { rows: [], rowCount: 0, summary: emptyMrrRenewalsSummary(SITE_RESTRICTED_NOTE) as unknown as Record<string, unknown> };
+    // Business reports phase 2 W2 (#9828): no site filter exists for quote lineages.
+    case 'quote_win_rate':
+      return { rows: [], rowCount: 0, summary: emptyQuoteWinRateSummary(SITE_RESTRICTED_NOTE) as unknown as Record<string, unknown> };
+    // Business reports phase 2 W3 (#9828): invoices and time entries have no site column.
+    case 'client_profitability':
+      return { rows: [], rowCount: 0, summary: emptyClientProfitabilitySummary(SITE_RESTRICTED_NOTE) as unknown as Record<string, unknown> };
+    // #11018: tickets have no site axis either, and this one reaches customers.
+    case 'ticket_sla_performance':
+      return { rows: [], rowCount: 0, summary: emptyTicketSlaPerformanceSummary(SITE_RESTRICTED_NOTE) as unknown as Record<string, unknown> };
     default: {
       const exhaustive: never = type;
       throw new Error(`Invalid report type: ${String(exhaustive)}`);

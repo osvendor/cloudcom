@@ -8,6 +8,7 @@ import { getRedis, rateLimiter } from '../services';
 import { getActiveOrgTenant } from '../services/tenantStatus';
 import { getTrustedClientIp, rateLimitIpKey } from '../services/clientIp';
 import { authorizeHumanApiKeyCreator, authorizeServicePrincipalKey } from '../services/apiKeyAuthorization';
+import { MCP_SKIP_AMBIENT_DB_CONTEXT_KEY } from './mcpTenantToolSelfManagedContext';
 
 export interface ApiKeyContext {
   apiKey: {
@@ -25,6 +26,16 @@ export interface ApiKeyContext {
     // a human creator's permissions.
     principalType?: string;
     principalId?: string | null;
+    // Set ONLY by partnerServicePrincipalMcpAuth (MCP endpoint, `brz_sp_`
+    // key): the partner service principal this request authenticated as.
+    // `id` is then the partner_service_principal_keys row id, never an
+    // api_keys id, and orgId is null (partner scope).
+    partnerServicePrincipalId?: string;
+    // B-W02 (#6156): MCP tool domains this principal may use. `null` =
+    // unrestricted. Every MCP auth middleware sets it explicitly; a missing
+    // value (undefined) fails CLOSED to core-only in mcpServer.ts
+    // (services/mcpDomains.ts parseStoredMcpDomains). REST ignores it.
+    mcpDomains?: readonly string[] | null;
   };
   orgId: string;
 }
@@ -71,6 +82,27 @@ export async function enforcePreLookupProbeRateLimit(c: Context): Promise<void> 
       }
     });
   }
+}
+
+/**
+ * True when a human-delegated key's creator credential state moved on since
+ * mint (see the call site in apiKeyAuthMiddleware for the epoch rules).
+ * Exported so the B-W04 release path (services/mcpPrincipalAuth.ts) applies
+ * the identical comparison to a queued `mcp_api` intent's origin key.
+ */
+export function isApiKeyCreatorEpochStale(
+  apiKey: {
+    creatorCredentialEpoch?: number | null;
+    creatorAuthEpoch?: number | null;
+    creatorMfaEpoch?: number | null;
+  },
+  creator: { authEpoch: number; mfaEpoch: number; credentialEpoch: number },
+): boolean {
+  const credentialStale = typeof apiKey.creatorCredentialEpoch === 'number'
+    ? apiKey.creatorCredentialEpoch !== creator.credentialEpoch
+    : typeof apiKey.creatorAuthEpoch === 'number' && apiKey.creatorAuthEpoch !== creator.authEpoch;
+  const mfaStale = typeof apiKey.creatorMfaEpoch === 'number' && apiKey.creatorMfaEpoch !== creator.mfaEpoch;
+  return credentialStale || mfaStale;
 }
 
 /**
@@ -121,7 +153,11 @@ export async function apiKeyAuthMiddleware(c: Context, next: Next) {
         createdBy: apiKeys.createdBy,
         source: apiKeys.source,
         principalType: apiKeys.principalType,
-        principalId: apiKeys.principalId
+        principalId: apiKeys.principalId,
+        creatorAuthEpoch: apiKeys.creatorAuthEpoch,
+        creatorMfaEpoch: apiKeys.creatorMfaEpoch,
+        creatorCredentialEpoch: apiKeys.creatorCredentialEpoch,
+        mcpDomains: apiKeys.mcpDomains
       })
       .from(apiKeys)
       .where(eq(apiKeys.keyHash, keyHash))
@@ -174,7 +210,12 @@ export async function apiKeyAuthMiddleware(c: Context, next: Next) {
     // in PR 5 — do not build on that behavior.)
     const creator = await withSystemDbAccessContext(async () => {
       const [row] = await db
-        .select({ status: users.status })
+        .select({
+          status: users.status,
+          authEpoch: users.authEpoch,
+          mfaEpoch: users.mfaEpoch,
+          credentialEpoch: users.credentialEpoch
+        })
         .from(users)
         .where(eq(users.id, apiKey.createdBy))
         .limit(1);
@@ -182,6 +223,25 @@ export async function apiKeyAuthMiddleware(c: Context, next: Next) {
     });
     if (!creator || creator.status !== 'active') {
       throw new HTTPException(401, { message: 'API key creator is not active' });
+    }
+
+    // A human-delegated key's authority must not outlive the credential
+    // state its creator held at mint time. A password change/reset (and
+    // invite acceptance / an admin status change) bumps credential_epoch; an
+    // MFA factor add/remove/reset bumps mfa_epoch (services/authLifecycle.ts
+    // lists every writer).
+    //
+    // The binding is deliberately NOT auth_epoch (#7489): auth_epoch is the
+    // session epoch and also advances on ordinary logout, a role change, an
+    // email change, etc. — binding to it silently killed every key a user
+    // minted the next time they signed out. A key with no credential snapshot
+    // was minted before that fix and keeps its original auth_epoch binding
+    // (the migration carried the snapshot over only where the auth_epoch
+    // still matched, so a key already invalidated stays invalid). A NULL
+    // snapshot on both means the key predates epoch binding entirely and is
+    // not checked.
+    if (isApiKeyCreatorEpochStale(apiKey, creator)) {
+      throw new HTTPException(401, { message: 'API key creator credentials have changed' });
     }
   }
 
@@ -284,8 +344,20 @@ export async function apiKeyAuthMiddleware(c: Context, next: Next) {
     // on principal type too, without a second DB read.
     principalType: apiKey.principalType,
     principalId: apiKey.principalId,
+    // B-W02 (#6156): passed through untouched (string[] | null from the row).
+    mcpDomains: apiKey.mcpDomains,
   });
   c.set('apiKeyOrgId', apiKey.orgId);
+
+  // See MCP_SKIP_AMBIENT_DB_CONTEXT_KEY's doc comment: set only by
+  // mcpAuthMiddleware, only for an MCP tools/call request already known to
+  // target a tenant (BYO MCP) tool or a self-managed core action. Every DB read/write on that path manages
+  // its own short context, so the ambient wrap below is skipped rather than
+  // pinning a pooled connection across the tool's outbound call.
+  if (c.get(MCP_SKIP_AMBIENT_DB_CONTEXT_KEY) === true) {
+    await next();
+    return;
+  }
 
   await withDbAccessContext(
     {
@@ -297,8 +369,14 @@ export async function apiKeyAuthMiddleware(c: Context, next: Next) {
       // read its own partner row (billing gate, MCP provisioning). If the org
       // somehow has no partner link, fall back to an empty allowlist.
       accessiblePartnerIds: resolvedPartnerId ? [resolvedPartnerId] : [],
-      // Own partner — read-visibility of partner-wide catalog rows.
-      currentPartnerId: resolvedPartnerId ?? null
+      // Own partner: read-visibility of partner-wide rows (org_id NULL,
+      // partner_id = own partner) through each table's SELECT-only branch,
+      // exactly what an org-scoped JWT session gets from buildDbAccessContext.
+      // It grants no partner-axis access (accessiblePartnerIds stays empty for
+      // ordinary keys), so partner-wide scripts and config become readable
+      // but never writable. Without it an org key cannot even see the
+      // partner-wide scripts run_script is designed to run.
+      currentPartnerId: ownerTenant.partnerId ?? null
     },
     async () => {
       await next();

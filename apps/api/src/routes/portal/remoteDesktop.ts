@@ -10,7 +10,8 @@ import { preparePortalRemoteLease, touchPortalRemoteViewer } from '../../service
 import { resolveDesktopSessionPolicy } from '../../services/remoteAccessPolicy';
 import { buildStopDesktopCommand } from '../../services/remoteDesktopTerminalIntent';
 import { dispatchCommandToAgent } from '../../services/agentCommandRelay';
-import { createDesktopStartCommandId, getIceServers, resolveRemoteSessionPromptConfig } from '../remote/helpers';
+import { checkTurnCredentialMintRateLimit, createDesktopStartCommandId, getIceServers, resolveRemoteSessionPromptConfig } from '../remote/helpers';
+import { CONSENT_UPGRADE_REQUIRED_CODE, CONSENT_UPGRADE_REQUIRED_MESSAGE, REMOTE_PROMPT_POLICY_UNAVAILABLE_CODE, REMOTE_PROMPT_POLICY_UNAVAILABLE_MESSAGE, RemoteSessionPromptPolicyError, requiresConsentCapableAgent } from '../remote/consentGate';
 import { validatePortalCookieCsrfRequest, writePortalAudit } from './helpers';
 import { portalRemoteStartRateLimit } from './remoteRateLimit';
 import { expireStaleNativeSessionsForDevice } from '../../services/portalNativeAdmission';
@@ -27,7 +28,7 @@ function scoped<T>(p: PortalRemotePrincipal, action: () => Promise<T>) {
   return withDbAccessContext({ scope: 'organization', orgId: p.orgId, accessibleOrgIds: [p.orgId], userId: null }, action);
 }
 async function owned(p: PortalRemotePrincipal, sessionId: string) {
-  const [row] = await db.select({ session: portalRemoteSessions, device: { agentId: devices.agentId, hostname: devices.hostname } })
+  const [row] = await db.select({ session: portalRemoteSessions, device: { agentId: devices.agentId, hostname: devices.hostname, consentPromptProtocolVersion: devices.consentPromptProtocolVersion } })
     .from(portalRemoteSessions).innerJoin(devices, and(eq(devices.id, portalRemoteSessions.deviceId), eq(devices.orgId, portalRemoteSessions.orgId)))
     .where(and(eq(portalRemoteSessions.id, sessionId), eq(portalRemoteSessions.portalUserId, p.id), eq(portalRemoteSessions.orgId, p.orgId), eq(portalRemoteSessions.authEpoch, p.authEpoch))).limit(1);
   return row ?? null;
@@ -80,7 +81,9 @@ portalDesktopRoutes.get('/remote/sessions/:id', async c => {
   if (!parsed.success) return c.json({ error: 'Session unavailable' }, 404);
   const p = principal(c); const row = await scoped(p, () => owned(p, parsed.data));
   if (!row) return c.json({ error: 'Session unavailable' }, 404);
-  if (['pending','connecting','active'].includes(row.session.status)) {
+  const live = ['pending','connecting','active'].includes(row.session.status) && row.session.terminationPhase === 'none';
+  const includeIce = c.req.query('includeIce') === '1';
+  if (live) {
     const access = await scoped(p, () => authorizePortalRemote(p, row.session.deviceId, 'webrtc', { assignmentId: row.session.assignmentId, assignmentVersion: row.session.assignmentVersion }));
     if (!access.ok || row.session.hardDeadline.getTime() <= Date.now()
       || (row.session.status === 'pending' && Date.now() - row.session.createdAt.getTime() >= PORTAL_DESKTOP_START_TIMEOUT_MS)) {
@@ -91,10 +94,15 @@ portalDesktopRoutes.get('/remote/sessions/:id', async c => {
       const presence = await touchPortalRemoteViewer(row.session.id, p);
       if (!presence.ok) return c.json({ error: 'Remote access is unavailable' }, presence.reason === 'forbidden' ? 403 : 503);
     }
+    if (includeIce && !(await checkTurnCredentialMintRateLimit(`portal:${p.id}`)).allowed) {
+      return c.json({ error: 'Too many ICE server requests. Please try again later.', code: 'RATE_LIMITED' }, 429);
+    }
   }
   return c.json({ session: { id: row.session.id, status: row.session.status, hostname: row.device.hostname,
     webrtcAnswer: row.session.webrtcAnswer, terminationPhase: row.session.terminationPhase },
-    iceServers: getIceServers({ sessionId: row.session.id, userId: `portal:${p.id}`, deviceId: row.session.deviceId }) });
+    // Keep terminal status readable so the viewer can finish teardown, but an
+    // ended session must never mint fresh relay credentials.
+    iceServers: live && includeIce ? getIceServers({ sessionId: row.session.id, userId: `portal:${p.id}`, deviceId: row.session.deviceId }) : [] });
 });
 
 portalDesktopRoutes.post('/remote/sessions/:id/offer', zValidator('json', z.object({ offer: z.string().min(1).max(65535) }).strict()), async c => {
@@ -105,7 +113,18 @@ portalDesktopRoutes.post('/remote/sessions/:id/offer', zValidator('json', z.obje
   const p = principal(c); const row = await scoped(p, () => owned(p, parsed.data));
   if (!row) return c.json({ error: 'Session unavailable' }, 404);
   const policy = await scoped(p, () => resolveDesktopSessionPolicy(row.session.deviceId));
-  const prompt = await scoped(p, () => resolveRemoteSessionPromptConfig(row.session.deviceId));
+  let prompt: Awaited<ReturnType<typeof resolveRemoteSessionPromptConfig>>;
+  try {
+    prompt = await scoped(p, () => resolveRemoteSessionPromptConfig(row.session.deviceId));
+  } catch (error) {
+    if (error instanceof RemoteSessionPromptPolicyError) {
+      return c.json({ error: REMOTE_PROMPT_POLICY_UNAVAILABLE_MESSAGE, code: REMOTE_PROMPT_POLICY_UNAVAILABLE_CODE }, 503);
+    }
+    throw error;
+  }
+  if (requiresConsentCapableAgent(prompt, row.device)) {
+    return c.json({ error: CONSENT_UPGRADE_REQUIRED_MESSAGE, code: CONSENT_UPGRADE_REQUIRED_CODE }, 409);
+  }
   const commandId = createDesktopStartCommandId(row.session.id);
   const intent = await scoped(p, () => commitPortalDesktopStartIntent(row.session.id, p, commandId, c.req.valid('json').offer, prompt.mode));
   if (!intent.ok) return c.json({ error: 'This session cannot be started' }, 409);

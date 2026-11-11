@@ -33,15 +33,30 @@ export type BodyLimitRule =
   | 'avatar'
   | 'contract-template'
   | 'agent-ingest'
+  | 'agent-hardware-health'
+  | 'agent-time-status'
+  | 'agent-workloads'
+  | 'agent-topology-adjacency'
+  | 'agent-unifi-telemetry'
   | 'ticket-attachment'
   | 'org-document'
   | 'quote-acceptance-evidence'
+  | 'agreement-signed-copy'
+  | 'edr-webhook'
+  | 'flow-webhook'
+  | 'yara-test-sample'
+  | 'wisp-thread-attachment'
   // Route-level limits TIGHTER than the global default, so `bodyLimitForPath`
   // never returns them — the route's own gate is the one that answers. They
   // share this namespace so all body-limit 413s group on one tag.
   | 'agent-logs'
   | 'agent-process-sample'
-  | 'agent-pam-observation';
+  | 'agent-pam-observation'
+  // #8839: agentAuthMiddleware's own ceiling while it buffers a wrapped agent
+  // route's body before opening the org transaction (agentRequestBody.ts). It
+  // sits ABOVE every agent carve-out here, so behind the global gate it only
+  // answers if the gate is ever bypassed or reordered.
+  | 'agent-wrapped-body';
 
 export interface BodyLimitPolicy {
   rule: BodyLimitRule;
@@ -50,6 +65,19 @@ export interface BodyLimitPolicy {
 }
 
 export function bodyLimitForPath(path: string): BodyLimitPolicy {
+  // EDR vendor push webhook (W03 PR-B): unauthenticated ingress whose body is
+  // only a hint (opaque ids), so it is capped BELOW the default. GravityZone
+  // batches events; 256 KB is ample and bounds pre-auth work.
+  if (/^\/api\/v1\/webhooks\/edr\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(path)) {
+    return { rule: 'edr-webhook', maxSize: 256 * 1024, error: 'Request body too large' };
+  }
+  // Flow webhook ingress (Tool Catalog W05): public, HMAC/token authenticated in
+  // the handler, so the cap must hold before the body is read. 262,144 B is
+  // FLOW_RUN_LIMITS.webhookMaxBodyBytes (packages/shared); kept literal because
+  // this module is deliberately free of imports.
+  if (/^\/api\/v1\/webhooks\/flows\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(path)) {
+    return { rule: 'flow-webhook', maxSize: 262_144, error: 'Request body too large' };
+  }
   // Dev-push uploads agent binaries (~20MB); skip the default 1MB limit.
   if (path.startsWith('/api/v1/dev/push')) {
     return { rule: 'dev-push', maxSize: 150 * 1024 * 1024, error: 'Binary too large (max 150MB)' };
@@ -57,7 +85,7 @@ export function bodyLimitForPath(path: string): BodyLimitPolicy {
   // File browser uploads send base64-encoded content in JSON body (~33%
   // overhead). The agent caps file_write at 4MB decoded (~5.6MB base64, see
   // fileUploadBodySchema); 8MB covers that plus JSON envelope/escaping.
-  if (path.match(/^\/api\/v1\/system-tools\/devices\/[^/]+\/files\/upload$/)) {
+  if (path.match(/^\/api\/v1\/system-tools\/devices\/[^/]+\/files\/upload$/) || path === '/api/v1/browser-companion/request') {
     return { rule: 'file-upload', maxSize: 8 * 1024 * 1024, error: 'File too large (max 4MB)' };
   }
   // Chunked software package uploads (#2951): each chunk is a raw
@@ -159,6 +187,32 @@ export function bodyLimitForPath(path: string): BodyLimitPolicy {
       error: 'Evidence file too large (max 10 MB)',
     };
   }
+  // Record signed agreement (#8865 W1c): one multipart form with an optional
+  // externally signed copy (PDF/PNG/JPEG), capped at 10 MiB by the route and
+  // agreementRequestService. Same 64 KiB slack as the evidence carve-out.
+  if (path.match(/^\/api\/v1\/contracts\/agreement-requests\/record-signed$/)) {
+    return {
+      rule: 'agreement-signed-copy',
+      maxSize: 10 * 1024 * 1024 + 64 * 1024,
+      error: 'Signed copy too large (max 10 MB)',
+    };
+  }
+  // YARA rule test upload (#6263 W04-2): one raw octet-stream sample, capped
+  // at 10 MiB (YARA_TEST_SAMPLE_MAX_BYTES) by the route's own exact check,
+  // which answers YARA_TEST_TOO_LARGE inside this 64 KiB slack. Every other
+  // /security/yara path stays at the default.
+  if (/^\/api\/v1\/security\/yara\/rule-sets\/[0-9a-f-]{36}\/test$/i.test(path)) {
+    return { rule: 'yara-test-sample', maxSize: 10 * 1024 * 1024 + 64 * 1024, error: 'File too large (max 10 MB)' };
+  }
+  // Wisp thread attachment (W04 6b): one multipart text file OR a JSON
+  // `{ text, label }` paste, capped at 5 MiB of decoded text by the route
+  // (THREAD_ATTACHMENT_MAX_BYTES, 413 too_large). 1 MiB of headroom covers the
+  // multipart envelope and the JSON escaping of pasted text; the route
+  // registers the same ceiling (WISP_THREAD_ATTACHMENT_BODY_LIMIT). The JSON
+  // siblings under /wisp/thread stay at the default.
+  if (/^\/api\/v1\/wisp\/thread\/[^/]+\/attachments$/.test(path)) {
+    return { rule: 'wisp-thread-attachment', maxSize: 6 * 1024 * 1024, error: 'Attachment too large (max 5 MiB)' };
+  }
   if (path === '/api/v1/users/me/avatar') {
     return {
       rule: 'avatar',
@@ -190,6 +244,54 @@ export function bodyLimitForPath(path: string): BodyLimitPolicy {
   // final-segment allowlist (not a broad `agents/:id/.*`) so it does NOT match
   // `/monitoring-results` (deliberately 1MB in heartbeat.ts) or the already
   // carved-out `/commands/:id/result` above.
+  // Hardware/RAID snapshot ingest (#6856): bounded at 2 MiB by the route's own
+  // schema caps (max 2000 components, max 32 sources). Matched before the
+  // broader agent-ingest branch below so it gets its own distinct rule label
+  // and its own (smaller) size, not the 5MB agent-ingest allowance.
+  if (path.match(/^\/api\/v1\/agents\/[^/]+\/hardware-health$/)) {
+    return {
+      rule: 'agent-hardware-health',
+      maxSize: 2 * 1024 * 1024,
+      error: 'Request body too large',
+    };
+  }
+  if (path.match(/^\/api\/v1\/agents\/[^/]+\/time-status$/)) {
+    return {
+      rule: 'agent-time-status',
+      maxSize: 512 * 1024,
+      error: 'Request body too large',
+    };
+  }
+  // Workload inventory report (#3834): capped at 2 MiB. The schema caps (max
+  // 1000 workloads per runtime, max 5 runtimes, per-field widths) do NOT fit
+  // inside this at their maximums (~14 MB worst case); a typical item is
+  // ~750 B. The agent must keep its report under this byte budget itself
+  // (truncate and send `complete: false`) rather than rely on the schema caps,
+  // or the whole report — detection included — is refused with 413.
+  // Matched before the broader agent-ingest branch so it keeps its own label.
+  if (path.match(/^\/api\/v1\/agents\/[^/]+\/workloads$/)) {
+    return {
+      rule: 'agent-workloads',
+      maxSize: 2 * 1024 * 1024,
+      error: 'Request body too large',
+    };
+  }
+  // Discovery adjacency (M2 #5998 D14): one per-target AdjacencyV2 report of at
+  // most 4 MiB (ADJACENCY_V2_MAX_BYTES, which the route's schema re-checks) plus
+  // the `{parentJobId, report}` envelope. The agent bounds the report before
+  // posting, so this is a transport ceiling, not a normal operating size.
+  if (path.match(/^\/api\/v1\/agents\/[^/]+\/topology\/adjacency$/)) {
+    return { rule: 'agent-topology-adjacency', maxSize: 4 * 1024 * 1024 + 64 * 1024, error: 'Adjacency report too large (max 4 MiB)' };
+  }
+  // UniFi telemetry (M2 #5998 Task 5): the legacy poll body plus the optional
+  // typed `topologyV1` companion, which the shared wire guard bounds at 8 MiB
+  // (UNIFI_TOPOLOGY_V1_MAX_BYTES; the Go collector drops a larger companion
+  // before posting). The legacy half keeps its historical 1 MiB default, so
+  // the gate is the sum. Without this every companion-bearing poll above 1 MiB
+  // 413s here and the LEGACY telemetry of that poll is lost with it.
+  if (path.match(/^\/api\/v1\/agents\/[^/]+\/unifi-telemetry$/)) {
+    return { rule: 'agent-unifi-telemetry', maxSize: 9 * 1024 * 1024, error: 'UniFi telemetry too large (max 8 MiB topology + 1 MiB telemetry)' };
+  }
   if (path.match(/^\/api\/v1\/agents\/[^/]+\/(hardware|software|disks|network|connections|heartbeat)$/)) {
     return { rule: 'agent-ingest', maxSize: 5 * 1024 * 1024, error: 'Request body too large' };
   }

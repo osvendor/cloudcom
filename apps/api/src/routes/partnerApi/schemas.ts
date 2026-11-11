@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { discoveredAssetSourceEnum } from '../../db/schema/discovery';
+import { deviceStatusEnum } from '../../db/schema/devices';
 
 export const PARTNER_EXPORT_RESOURCES = [
   'organizations',
@@ -15,6 +16,9 @@ export const PARTNER_EXPORT_RESOURCES = [
   'backup-configurations',
   'custom-fields',
   'custom-field-values',
+  'alerts',
+  'tickets',
+  'device-status',
 ] as const;
 
 export const partnerExportResourceSchema = z.enum(PARTNER_EXPORT_RESOURCES);
@@ -104,6 +108,7 @@ export const partnerOrganizationExportRecordSchema = strictPartnerExportRecordSc
   name: z.string().min(1).max(255),
   slug: z.string().min(1).max(100),
   type: z.enum(['customer', 'internal']),
+  externalLinks: z.array(z.object({ system: z.string(), externalId: z.string(), label: z.string().nullable() }).strict()),
 });
 export const organizationExportEnvelopeSchema = createPartnerExportEnvelopeSchema(
   partnerOrganizationExportRecordSchema,
@@ -211,10 +216,13 @@ export const partnerDeviceInventoryExportRecordSchema = strictPartnerExportRecor
   deviceId: z.string().uuid(),
   hardware: z.object({
     processor: z.object({ model: nullableInventoryString, cores: inventoryCount, threads: inventoryCount }).strict(),
-    memory: z.object({ totalMb: inventoryCount }).strict(),
+    memory: z.object({
+      totalMb: inventoryCount, slotsTotal: inventoryCount, maxCapacityMb: inventoryCount, soldered: z.boolean().nullable(),
+    }).strict(),
     graphics: z.object({ model: nullableInventoryString }).strict(),
     motherboard: z.object({ manufacturer: nullableInventoryString, product: nullableInventoryString, version: nullableInventoryString }).strict(),
     firmware: z.object({ biosVersion: nullableInventoryString }).strict(),
+    system: z.object({ productSku: nullableInventoryString }).strict(),
   }).strict(),
   disks: z.array(z.object({
     id: z.string().uuid(), mountPoint: z.string().max(255), device: nullableInventoryString,
@@ -240,9 +248,18 @@ export const partnerDeviceInventoryExportRecordSchema = strictPartnerExportRecor
     generation: z.number().int().positive(), memoryMb: inventoryCount, processorCount: inventoryCount,
     rctEnabled: z.boolean(), passthroughDisks: z.boolean(),
   }).strict()).max(500),
+  // #5351: one entry per physical slot; empty slots are populated: false.
+  memoryModules: z.array(z.object({
+    id: z.string().uuid(), locator: z.string().max(128), bankLabel: z.string().max(128).nullable(),
+    populated: z.boolean(), capacityMb: inventoryCount, memoryType: z.string().max(32).nullable(),
+    formFactor: z.string().max(32).nullable(), speedMts: inventoryCount, configuredSpeedMts: inventoryCount,
+    manufacturer: z.string().max(128).nullable(), partNumber: z.string().max(128).nullable(),
+    serialNumber: z.string().max(128).nullable(),
+  }).strict()).max(500),
   collections: z.object({
     disks: partnerExportCollectionSchema, interfaces: partnerExportCollectionSchema,
     addresses: partnerExportCollectionSchema, virtualMachines: partnerExportCollectionSchema,
+    memoryModules: partnerExportCollectionSchema,
   }).strict(),
 });
 
@@ -411,6 +428,12 @@ export const partnerAutomationExportRecordSchema = strictPartnerExportRecordSche
     resource: z.literal('scripts'),
     id: z.string().uuid(),
   }).strict()).max(500),
+  /** W06 (#5221): the Job's newest flow conversion generation, or null. Additive. */
+  conversion: z.object({
+    id: z.string().uuid(),
+    state: z.enum(['shadow', 'switched', 'reverted']),
+    flowId: z.string().uuid(),
+  }).strict().nullable(),
 });
 export const automationExportEnvelopeSchema = createPartnerExportEnvelopeSchema(
   partnerAutomationExportRecordSchema,
@@ -606,3 +629,388 @@ export type PartnerExportEnvelope<T extends PartnerExportRecordBase> = {
   hasMore: boolean;
   blocked?: PartnerExportBlockedRecord[];
 };
+
+// ---------------------------------------------------------------------------
+// Alerts feed (alerts:read). Latest-state change feed keyed by the writing
+// transaction id (see migrations/2026-10-30-130000-partner-api-alerts-read.sql),
+// so it has its own cursor/checkpoint contract rather than the timestamp
+// watermark envelope above.
+// ---------------------------------------------------------------------------
+export const PARTNER_ALERT_STATUSES = ['active', 'acknowledged', 'resolved', 'suppressed', 'dismissed'] as const;
+export const PARTNER_ALERT_SEVERITIES = ['critical', 'high', 'medium', 'low', 'info'] as const;
+const nullableTimestamp = partnerExportTimestampSchema.nullable();
+const nullableUuid = z.string().uuid().nullable();
+
+/** alerts:write returns state only; alert content requires alerts:read. */
+export const partnerAlertWriteResponseSchema = z.object({
+  schemaVersion: z.literal('1'),
+  changed: z.boolean(),
+  data: z.object({
+    id: z.string().uuid(),
+    orgId: z.string().uuid(),
+    status: z.enum(PARTNER_ALERT_STATUSES),
+    acknowledgedAt: nullableTimestamp,
+    resolvedAt: nullableTimestamp,
+    resolutionReason: z.string().nullable(),
+    acknowledgedByPrincipalId: nullableUuid,
+    resolvedByPrincipalId: nullableUuid,
+  }).strict(),
+}).strict();
+
+export const partnerAlertExportRecordSchema = z.object({
+  // Every alert has an owner kind; only its reference can be unavailable.
+  owner: z.object({ kind: z.enum(['device', 'topology_site', 'backup_workload']), ref: z.string().nullable() }).strict(),
+  id: z.string().uuid(),
+  orgId: z.string().uuid(),
+  // Null when the alert's device is gone or not in the alert's organization.
+  deviceId: z.string().uuid().nullable(),
+  // Current device hostname at read time: enrichment, NOT a feed event. A
+  // device rename does not advance the feed and is excluded from `revision`.
+  // Limits are 2x the DB varchar length, set when zod counted UTF-16 units.
+  // zod >=4.6 counts code points like Postgres, so 2x is now only headroom;
+  // kept rather than tightening a partner-facing response contract (#9976).
+  deviceHostname: z.string().max(510).nullable(),
+  severity: z.enum(PARTNER_ALERT_SEVERITIES),
+  status: z.enum(PARTNER_ALERT_STATUSES),
+  title: z.string().max(1000),
+  message: z.string().max(12_000).nullable(),
+  triggeredAt: partnerExportTimestampSchema,
+  acknowledgedAt: nullableTimestamp,
+  resolvedAt: nullableTimestamp,
+  dismissedAt: nullableTimestamp,
+  suppressedUntil: nullableTimestamp,
+  requiresHuman: z.boolean(),
+  episodeId: nullableUuid,
+  ruleId: nullableUuid,
+  monitorId: nullableUuid,
+  // Opaque, monotonic per row: changes whenever the row is written. Compare
+  // for equality only; never parse.
+  changeVersion: z.string().regex(/^[0-9]{1,20}$/u),
+  revision: z.string().regex(/^[a-f0-9]{64}$/u),
+}).strict();
+
+export type PartnerAlertExportRecord = z.infer<typeof partnerAlertExportRecordSchema>;
+
+export const partnerAlertFeedEnvelopeSchema = z.object({
+  schemaVersion: z.literal('1'),
+  mode: z.enum(['full', 'incremental']),
+  data: z.array(partnerAlertExportRecordSchema).max(500),
+  nextCursor: partnerExportCursorTokenSchema.nullable(),
+  hasMore: z.boolean(),
+  // Present exactly on the last page of a traversal: pass it back as `since`
+  // to fetch everything written after this traversal. Persist it only after
+  // the whole traversal has been processed.
+  checkpoint: partnerExportCursorTokenSchema.nullable(),
+  blocked: z.array(partnerExportBlockedRecordSchema).max(500).optional(),
+}).strict().superRefine((value, ctx) => {
+  if (value.hasMore !== (value.nextCursor !== null)) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['nextCursor'], message: 'nextCursor must be present exactly when hasMore is true' });
+  }
+  if (value.hasMore === (value.checkpoint !== null)) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['checkpoint'], message: 'checkpoint must be present exactly on the last page' });
+  }
+});
+
+
+// ─── Partner API tickets (tickets:read) ───────────────────────────────────────
+
+export const PARTNER_TICKET_STATUSES = ['new', 'open', 'pending', 'on_hold', 'resolved', 'closed'] as const;
+export const PARTNER_TICKET_PRIORITIES = ['low', 'normal', 'high', 'urgent'] as const;
+export const PARTNER_TICKET_SOURCES = ['portal', 'email', 'alert', 'manual', 'api', 'ai'] as const;
+export const PARTNER_TICKET_WORK_KINDS = ['support', 'deliverable', 'project_task'] as const;
+// #7900: the fixed ITIL classification (separate from workKind).
+export const PARTNER_TICKET_TYPES = ['incident', 'service_request', 'problem', 'change'] as const;
+export const PARTNER_TICKET_COMMENT_TYPES = ['comment', 'internal', 'status_change', 'assignment', 'time_entry', 'system'] as const;
+export const PARTNER_TICKET_ORIGIN_PRINCIPAL_KINDS = ['user', 'ai_agent', 'system', 'service_principal', 'unknown'] as const;
+/** Long free-text ticket fields are capped in the DTO (see alerts.message). */
+export const PARTNER_TICKET_TEXT_MAX = 12_000;
+
+const partnerTicketRequesterSchema = z.object({
+  // The canonical requester PERSON (contacts) and the optional portal LOGIN.
+  contactId: nullableUuid,
+  portalUserId: nullableUuid,
+  // Snapshot taken at creation (2x varchar(255); see deviceHostname above).
+  name: z.string().max(510).nullable(),
+  email: z.string().max(510).nullable(),
+}).strict();
+
+export const partnerTicketExportRecordSchema = z.object({
+  id: z.string().uuid(),
+  orgId: z.string().uuid(),
+  // Legacy display id (always present) and the per-partner sequence number.
+  ticketNumber: z.string().max(100),
+  internalNumber: z.string().max(40).nullable(),
+  subject: z.string().max(510),
+  description: z.string().max(PARTNER_TICKET_TEXT_MAX).nullable(),
+  status: z.enum(PARTNER_TICKET_STATUSES),
+  // The partner's custom status row the core status was set through, if any.
+  statusId: nullableUuid,
+  priority: z.enum(PARTNER_TICKET_PRIORITIES),
+  source: z.enum(PARTNER_TICKET_SOURCES),
+  workKind: z.enum(PARTNER_TICKET_WORK_KINDS),
+  ticketType: z.enum(PARTNER_TICKET_TYPES),
+  categoryId: nullableUuid,
+  assigneeId: nullableUuid,
+  deviceId: nullableUuid,
+  requester: partnerTicketRequesterSchema,
+  tags: z.array(z.string().max(100)).max(50),
+  // External PSA/ITSM correlation, set by the integration itself.
+  externalTicketId: z.string().max(510).nullable(),
+  externalTicketUrl: z.string().max(4096).nullable(),
+  dueDate: nullableTimestamp,
+  firstResponseAt: nullableTimestamp,
+  resolvedAt: nullableTimestamp,
+  closedAt: nullableTimestamp,
+  pendingReason: z.string().max(PARTNER_TICKET_TEXT_MAX).nullable(),
+  resolutionNote: z.string().max(PARTNER_TICKET_TEXT_MAX).nullable(),
+  responseSlaMinutes: z.number().int().nullable(),
+  resolutionSlaMinutes: z.number().int().nullable(),
+  slaBreachedAt: nullableTimestamp,
+  slaBreachReason: z.string().max(1000).nullable(),
+  // #8973: the stored SLA deadlines (read-only, additive). Null when the
+  // target is null. *_warnAt is the 80% "breaching soon" point.
+  responseDueAt: nullableTimestamp,
+  resolutionDueAt: nullableTimestamp,
+  responseWarnAt: nullableTimestamp,
+  resolutionWarnAt: nullableTimestamp,
+  createdAt: partnerExportTimestampSchema,
+  updatedAt: partnerExportTimestampSchema,
+  // The migration window that imported the ticket (#8313), null for a live
+  // one. A mirror skips imported rows with it, so an import is never pushed
+  // back into its own source.
+  migrationWindowId: nullableUuid,
+  // #8972: set when this ticket was merged into another; the record is then a
+  // read-only tombstone. Null on every other ticket.
+  mergedIntoTicketId: nullableUuid,
+  mergedAt: nullableTimestamp,
+  // Opaque, monotonic per row: changes whenever the row is written. Compare
+  // for equality only; never parse.
+  changeVersion: z.string().regex(/^[0-9]{1,20}$/u),
+  revision: z.string().regex(/^[a-f0-9]{64}$/u),
+}).strict();
+
+export type PartnerTicketExportRecord = z.infer<typeof partnerTicketExportRecordSchema>;
+
+/**
+ * A removed ticket on the feed: soft-deleted, still in an accessible org. No
+ * other field — the consumer already holds the record. A ticket moved OUT of
+ * the principal's org set is not representable here (its new org is not
+ * readable) and is observed through the reconciliation list instead.
+ */
+export const partnerTicketTombstoneSchema = z.object({
+  id: z.string().uuid(),
+  orgId: z.string().uuid(),
+  removed: z.literal(true),
+  reason: z.literal('deleted'),
+  deletedAt: partnerExportTimestampSchema,
+  changeVersion: z.string().regex(/^[0-9]{1,20}$/u),
+}).strict();
+
+export type PartnerTicketTombstone = z.infer<typeof partnerTicketTombstoneSchema>;
+
+export const partnerTicketFeedItemSchema = z.union([partnerTicketExportRecordSchema, partnerTicketTombstoneSchema]);
+
+export const partnerTicketFeedEnvelopeSchema = z.object({
+  schemaVersion: z.literal('1'),
+  mode: z.enum(['full', 'incremental']),
+  data: z.array(partnerTicketFeedItemSchema).max(500),
+  nextCursor: partnerExportCursorTokenSchema.nullable(),
+  hasMore: z.boolean(),
+  // Present exactly on the last page of a traversal: pass it back as `since`
+  // to fetch everything written after this traversal. Persist it only after
+  // the whole traversal has been processed.
+  checkpoint: partnerExportCursorTokenSchema.nullable(),
+  blocked: z.array(partnerExportBlockedRecordSchema).max(500).optional(),
+}).strict().superRefine((value, ctx) => {
+  if (value.hasMore !== (value.nextCursor !== null)) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['nextCursor'], message: 'nextCursor must be present exactly when hasMore is true' });
+  }
+  if (value.hasMore === (value.checkpoint !== null)) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['checkpoint'], message: 'checkpoint must be present exactly on the last page' });
+  }
+});
+
+/**
+ * GET /partner-api/tickets/ids — reconciliation list: every LIVE ticket in
+ * the accessible org set with its changeVersion, keyset-paged by id. A mirror
+ * diffs it on a schedule to drop tickets it holds that are no longer
+ * reachable (moved out of the set, or anything it missed).
+ */
+export const partnerTicketIdRecordSchema = z.object({
+  id: z.string().uuid(),
+  orgId: z.string().uuid(),
+  changeVersion: z.string().regex(/^[0-9]{1,20}$/u),
+}).strict();
+
+export const partnerTicketIdListSchema = z.object({
+  schemaVersion: z.literal('1'),
+  data: z.array(partnerTicketIdRecordSchema).max(500),
+  nextCursor: partnerExportCursorTokenSchema.nullable(),
+  hasMore: z.boolean(),
+}).strict().superRefine((value, ctx) => {
+  if (value.hasMore !== (value.nextCursor !== null)) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['nextCursor'], message: 'nextCursor must be present exactly when hasMore is true' });
+  }
+});
+
+/** GET /partner-api/tickets/:id — one record, no feed metadata. */
+export const partnerTicketRecordResponseSchema = z.object({
+  schemaVersion: z.literal('1'),
+  data: partnerTicketExportRecordSchema,
+}).strict();
+
+export const partnerTicketCommentExportRecordSchema = z.object({
+  id: z.string().uuid(),
+  ticketId: z.string().uuid(),
+  orgId: z.string().uuid(),
+  commentType: z.enum(PARTNER_TICKET_COMMENT_TYPES),
+  isPublic: z.boolean(),
+  // 'internal' (staff or machine), 'portal', 'email', 'ai_agent'. The
+  // machine author is named by originPrincipalKind, never by a user id.
+  authorType: z.string().max(100).nullable(),
+  authorName: z.string().max(510).nullable(),
+  originPrincipalKind: z.enum(PARTNER_TICKET_ORIGIN_PRINCIPAL_KINDS),
+  // The partner service principal that wrote a 'service_principal' row (or
+  // the agent run for an 'ai_agent' row); a mirror compares it to its own
+  // principal id to suppress exactly its own echo.
+  originPrincipalId: nullableUuid,
+  content: z.string().max(PARTNER_TICKET_TEXT_MAX),
+  // Status-change / assignment feed rows carry the transition here.
+  oldValue: z.string().max(2000).nullable(),
+  newValue: z.string().max(2000).nullable(),
+  createdAt: partnerExportTimestampSchema,
+  editedAt: nullableTimestamp,
+  // #8313: the migration window that imported the comment (null when live),
+  // and, for an imported comment, who wrote it in the source — display only,
+  // no Breeze user or contact. `name` is also in authorName.
+  migrationWindowId: nullableUuid,
+  originalAuthor: z.object({
+    name: z.string().max(510).nullable(),
+    email: z.string().max(640).nullable(),
+    kind: z.enum(['staff', 'requester']),
+  }).strict().nullable(),
+  revision: z.string().regex(/^[a-f0-9]{64}$/u),
+}).strict();
+
+export type PartnerTicketCommentExportRecord = z.infer<typeof partnerTicketCommentExportRecordSchema>;
+
+/** A deleted comment: returned in its creation-order slot with no content. */
+export const partnerTicketCommentTombstoneSchema = z.object({
+  id: z.string().uuid(),
+  ticketId: z.string().uuid(),
+  orgId: z.string().uuid(),
+  removed: z.literal(true),
+  deletedAt: partnerExportTimestampSchema,
+  createdAt: partnerExportTimestampSchema,
+}).strict();
+
+export type PartnerTicketCommentTombstone = z.infer<typeof partnerTicketCommentTombstoneSchema>;
+
+export const partnerTicketCommentListItemSchema = z.union([partnerTicketCommentExportRecordSchema, partnerTicketCommentTombstoneSchema]);
+
+/**
+ * GET /partner-api/tickets/:id/comments — keyset pages in creation order.
+ * Edits surface as a changed `revision` + `editedAt`; deletes as tombstones.
+ * `created_at` never changes, so the keyset stays valid across both.
+ */
+export const partnerTicketCommentListSchema = z.object({
+  schemaVersion: z.literal('1'),
+  ticketId: z.string().uuid(),
+  data: z.array(partnerTicketCommentListItemSchema).max(500),
+  nextCursor: partnerExportCursorTokenSchema.nullable(),
+  hasMore: z.boolean(),
+  blocked: z.array(partnerExportBlockedRecordSchema).max(500).optional(),
+}).strict().superRefine((value, ctx) => {
+  if (value.hasMore !== (value.nextCursor !== null)) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['nextCursor'], message: 'nextCursor must be present exactly when hasMore is true' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Device status feed (device-status:read, #7577). LIVE state read at request
+// time — deliberately NOT part of the material-change export: no revision, no
+// sourceUpdatedAt, no snapshotAt/watermark, and no partner-export read locks.
+// Heartbeats would turn every row over constantly (see #6698).
+// ---------------------------------------------------------------------------
+// Same enum the console and MCP query_devices read (devices.status).
+export const PARTNER_DEVICE_STATUSES = deviceStatusEnum.enumValues;
+
+export const partnerDeviceStatusRecordSchema = z.object({
+  deviceId: z.string().uuid(),
+  orgId: z.string().uuid(),
+  siteId: z.string().uuid(),
+  status: z.enum(PARTNER_DEVICE_STATUSES),
+  lastSeenAt: partnerExportTimestampSchema.nullable(),
+  // 2x the varchar(50) column; see deviceHostname above.
+  agentVersion: z.string().max(100),
+}).strict();
+
+export type PartnerDeviceStatusRecord = z.infer<typeof partnerDeviceStatusRecordSchema>;
+
+export const partnerDeviceStatusEnvelopeSchema = z.object({
+  schemaVersion: z.literal('1'),
+  data: z.array(partnerDeviceStatusRecordSchema).max(500),
+  nextCursor: partnerExportCursorTokenSchema.nullable(),
+  hasMore: z.boolean(),
+  blocked: z.array(partnerExportBlockedRecordSchema).max(500).optional(),
+}).strict().superRefine((value, ctx) => {
+  if (value.hasMore !== (value.nextCursor !== null)) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['nextCursor'], message: 'nextCursor must be present exactly when hasMore is true' });
+  }
+});
+
+/**
+ * Write responses (tickets:write). `data` is the full record when the secret
+ * scanner passes; when it fires the record is withheld (`data: null`, the
+ * offending paths in `blocked`) but the ids are always present so the caller
+ * can correlate. `idempotencyReplay` marks a retry answered from the claim.
+ */
+export const partnerTicketWriteResponseSchema = z.object({
+  schemaVersion: z.literal('1'),
+  id: z.string().uuid(),
+  orgId: z.string().uuid(),
+  data: partnerTicketExportRecordSchema.nullable(),
+  blocked: z.array(partnerExportBlockedRecordSchema).max(1).optional(),
+  idempotencyReplay: z.literal(true).optional(),
+}).strict();
+
+export const partnerTicketCommentWriteResponseSchema = z.object({
+  schemaVersion: z.literal('1'),
+  id: z.string().uuid(),
+  ticketId: z.string().uuid(),
+  orgId: z.string().uuid(),
+  data: partnerTicketCommentExportRecordSchema.nullable(),
+  blocked: z.array(partnerExportBlockedRecordSchema).max(1).optional(),
+  idempotencyReplay: z.literal(true).optional(),
+}).strict();
+
+/** Current external-ticket read model, shared by refs and PSA mappings. */
+export const partnerAlertExternalTicketRecordSchema = z.object({
+  source: z.enum(['partner_api', 'psa']),
+  partnerServicePrincipalId: nullableUuid,
+  externalId: z.string(),
+  externalUrl: z.string().nullable(),
+  externalNumber: z.string().nullable(),
+  state: z.string().nullable(),
+  createdAt: partnerExportTimestampSchema,
+  updatedAt: nullableTimestamp,
+}).strict();
+
+export const partnerAlertExternalTicketsResponseSchema = z.object({
+  schemaVersion: z.literal('1'),
+  data: z.array(partnerAlertExternalTicketRecordSchema),
+}).strict();
+
+export const partnerAlertExternalTicketPutResponseSchema = z.object({
+  schemaVersion: z.literal('1'),
+  changed: z.boolean(),
+  data: z.object({
+    alertId: z.string().uuid(), orgId: z.string().uuid(), partnerServicePrincipalId: z.string().uuid(),
+    externalId: z.string(), externalUrl: z.string().nullable(), externalNumber: z.string().nullable(),
+    createdAt: partnerExportTimestampSchema, updatedAt: partnerExportTimestampSchema,
+  }).strict(),
+}).strict();
+
+export const partnerAlertExternalTicketDeleteResponseSchema = z.object({
+  schemaVersion: z.literal('1'), deleted: z.boolean(),
+}).strict();

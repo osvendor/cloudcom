@@ -43,7 +43,7 @@ const CAPABILITY_FN = 'canMutateOrgWideGovernance';
 const API_SRC = resolve(__dirname, '..');
 
 /**
- * The seven org-wide governance tables named in the contract. Hand-specified
+ * The org-wide governance tables named in the contract. Hand-specified
  * on purpose (§7C) — this is a fixed policy decision (which object CLASSES
  * have no per-site ownership model), not a structural property of the schema
  * the way the partner-axis table set is.
@@ -59,6 +59,14 @@ const GOVERNANCE_TABLE_NAMES = [
   'pamSignerGroups',
   'backupConfigs',
   'backupProfiles',
+  // A monitor definition's `responses` compile verbatim into a managed
+  // automation that runs as SYSTEM on every device an attaching org-wide
+  // policy reaches (`services/monitors/monitorCompiler.ts`), and the
+  // service itself carries no site axis to narrow that reach — same
+  // no-per-site-ownership shape as every other table in this list.
+  // `configPolicyMonitors` is the attachment join row (attach/detach).
+  'monitorDefinitions',
+  'configPolicyMonitors',
   // Identity-tenant connections: an M365 connection IS the org's whole Entra
   // tenant and a Google Workspace connection IS its whole Workspace customer
   // (the DWD service account behind every mutating google_* tool). Connecting
@@ -66,6 +74,13 @@ const GOVERNANCE_TABLE_NAMES = [
   // organization at once, and there is no per-site slice of it.
   'm365Connections',
   'googleWorkspaceConnections',
+  // A DNS allow/block policy is pushed to the org's DNS filtering provider and
+  // applies to every device behind it; the table has no site axis.
+  'dnsPolicies',
+  // YARA rule sets (#6263 W03a) are scanned by every device of every policy
+  // that attaches them (and may auto-quarantine there); no site axis.
+  'yaraRuleSets',
+  'yaraRules',
 ] as const;
 
 /**
@@ -73,6 +88,21 @@ const GOVERNANCE_TABLE_NAMES = [
  * site-ceiling gate. Every entry carries the reason it is exempt.
  */
 const ALLOWED_WITHOUT_CEILING_CHECK: Record<string, string> = {
+  // #6263 W03a. Called only from the mutating routes in
+  // routes/security/yara.ts, each of which runs writeDenial
+  // (canMutateOrgWideGovernance) before reaching it.
+  'services/yaraBuiltinPackStore.ts':
+    'boot-only system-scope upsert of THE built-in set (no org, no site); no caller, so no site-restricted actor can reach it (#6263 W03b)',
+  'services/yaraRuleSetPublisher.ts':
+    'reached only through routes/security/yara.ts and services/yaraIocImportService.ts mutations, which call canMutateOrgWideGovernance (writeDenial / create) first — verify when editing any of these files',
+  'services/yaraIocImportService.ts':
+    'every mutation runs writeDenial (services/yaraRuleSetAccess.ts: canMutateOrgWideGovernance + canManagePartnerWidePolicies) first; 403s pinned in yaraIocImportService.test.ts and routes/security/yaraIocImport.test.ts (#6263 W04; extracted for the AI ioc_hunt import_iocs path, #6268)',
+  // Background probe of a destination's create-only write support, started
+  // after a brokered backup write is issued. Writes only the
+  // provider_capabilities.conditionalWrites record, in system context; no
+  // caller-facing request reaches it.
+  'services/backupStorageCapabilityProbe.ts':
+    'writes only provider_capabilities.conditionalWrites from a background system-context probe; no caller-facing write path reaches it',
   // configurationPolicy.ts is the ONLY place that literally calls
   // .insert/.update/.delete(configurationPolicies | configPolicyFeatureLinks)
   // — routes/configurationPolicies/{crud,featureLinks}.ts and
@@ -80,7 +110,35 @@ const ALLOWED_WITHOUT_CEILING_CHECK: Record<string, string> = {
   // (they each call canMutateOrgWideGovernance before invoking these
   // functions). Verify both callers still gate before editing this file.
   'services/configurationPolicy.ts':
-    'mutations here are reached only through routes/configurationPolicies/{crud,featureLinks}.ts and services/aiToolsConfigPolicy.ts, which each call canMutateOrgWideGovernance before invoking these functions — verify both callers still gate when editing this file',
+    'mutations here are reached only through routes/configurationPolicies/{crud,featureLinks}.ts, services/aiToolsConfigPolicy.ts, routes/monitorDefinitions.ts (attach/detach) and services/aiToolsMonitors.ts (attach/detach), which each call canMutateOrgWideGovernance before invoking these functions — verify all four callers still gate when editing this file',
+
+  // create/update/delete are reached only through callers that already gate:
+  // routes/monitorDefinitions.ts and services/aiToolsMonitors.ts each call
+  // canMutateOrgWideGovernance before invoking these functions;
+  // services/monitors/conversion/{convert,equivalence}.ts gate internally
+  // (same import, `convert.ts:180,385`); services/fleetDesign/{apply,
+  // monitorAttachments}.ts are reached only through routes/fleetDesign.ts's
+  // apply/apply-preview routes, which refuse any site-restricted caller via
+  // `siteRestricted(c)` before calling. Verify all five callers still gate
+  // when editing this file.
+  'services/monitors/monitorService.ts':
+    'create/update/delete are reached only through gated callers: routes/monitorDefinitions.ts and services/aiToolsMonitors.ts (both call canMutateOrgWideGovernance before invoking), services/monitors/conversion/{convert,equivalence}.ts (gated internally with the same import), and services/fleetDesign/{apply,monitorAttachments}.ts (gated by routes/fleetDesign.ts\'s siteRestricted() check before calling) — verify all five callers still gate when editing this file',
+
+  // Compiles a definition INSIDE monitorService's own transaction
+  // (createValidatedMonitorInTx / updateMonitorDefinition) — reached only
+  // through monitorService.ts's create/update paths, which are themselves
+  // reached only through gated callers (see the monitorService.ts entry
+  // above). Never called directly from a route, AI tool or worker.
+  'services/monitors/monitorCompiler.ts':
+    'compiles a definition inside monitorService\'s own transaction — reached only through monitorService.ts\'s create/update, which is itself reached only through gated callers (see the monitorService.ts entry above)',
+
+  // Provisions the eight PARTNER-WIDE built-in default monitors on partner
+  // creation (inside createPartner's own transaction), a system-scope
+  // POST /orgs/partners route, and a detached post-listen boot backfill —
+  // never from a caller-supplied site-restricted identity, and it always
+  // inserts a fixed catalog with no caller-chosen target.
+  'services/monitors/builtInMonitors.ts':
+    'provisions built-in partner-wide monitors from createPartner (system), the system-scope POST /orgs/partners route, and a detached boot backfill — no caller-scoped site-restricted identity ever reaches this path',
 
   // Worker-side delivery-outcome bookkeeping (successCount/failureCount/
   // lastDeliveryAt only — never enabled/url/secret/events) runs inside
@@ -91,6 +149,29 @@ const ALLOWED_WITHOUT_CEILING_CHECK: Record<string, string> = {
   'services/webhookDeliveryRecord.ts':
     'updates only successCount/failureCount/lastDeliveryAt after a delivery attempt, invoked from the delivery worker in system context (runWithSystemDbAccess) — no caller-scoped auth object reaches this path',
 
+  // #6960 / #8736. Writes the software policy GENERATED for a
+  // `security_agents` feature link, inside the link-write transaction.
+  // syncManagedSoftwarePolicy is reached only through
+  // services/configurationPolicy.ts addFeatureLink / updateFeatureLink for a
+  // security_agents link, whose only callers for that feature type are
+  // routes/configurationPolicies/featureLinks.ts (POST + PATCH) and
+  // services/aiToolsConfigPolicy.ts (`manage_policy_feature_link`) — both call
+  // canMutateOrgWideGovernance before invoking them (the monitor-family callers
+  // currently pass only `monitors` links). The caller set is pinned by
+  // services/securityAgents/managedPolicyGenerator.callers.contract.test.ts.
+  // The other caller is the
+  // repairManagedSoftwarePolicies sweep in jobs/softwareComplianceWorker.ts,
+  // which reloads links by id in system context with no caller identity.
+  'services/securityAgents/managedPolicyGenerator.ts':
+    'derived write inside the security_agents link-write transaction — reached only through configurationPolicy.ts add/updateFeatureLink from routes/configurationPolicies/featureLinks.ts (POST/PATCH) and services/aiToolsConfigPolicy.ts manage_policy_feature_link, which both call canMutateOrgWideGovernance first, plus the system-context repair sweep in jobs/softwareComplianceWorker.ts — verify those callers still gate when editing this file',
+
+  // Security-scan dispatch flips a grandfathered legacy link to 'revoked' when
+  // its policy creator no longer holds devices:execute. Runs in the scan
+  // worker's system context; it only ever narrows (stops auto-quarantine), and
+  // writes nothing but execution_authority_legacy.
+  'services/securityScanQuarantineAuthority.ts':
+    'sets only execution_authority_legacy grandfathered -> revoked from the security-scan dispatch worker (system context) — fail-safe narrowing, no caller-scoped auth object reaches this path',
+
   // configureDefaults creates a default notification channel as part of
   // MCP-invite PARTNER BOOTSTRAP — the caller is a freshly-minted partner
   // API key with no org-scoped `allowedSiteIds` at all (site ceilings only
@@ -100,8 +181,9 @@ const ALLOWED_WITHOUT_CEILING_CHECK: Record<string, string> = {
   // The M365 control-plane connection lifecycle (consent / upgrade-consent /
   // retest / sync / disconnect, for BOTH the customer-graph-read and
   // customer-graph-actions profiles). Every caller-facing entry point is
-  // gated by its ROUTE: routes/m365CustomerGraphRead.ts (5 POST handlers) and
-  // routes/m365CustomerGraphActions.ts (3) each call
+  // gated by its ROUTE: routes/m365CustomerGraphRead.ts (7 POST handlers, incl.
+  // the W03 confirm-tenant continue/cancel) and routes/m365CustomerGraphActions.ts
+  // (5) each call
   // canMutateOrgWideGovernance before they resolve the org. The only other
   // caller, routes/m365ConsentCallback.ts, is the Microsoft admin-consent
   // redirect landing — it runs no authMiddleware and never reads `auth` at
@@ -117,6 +199,21 @@ const ALLOWED_WITHOUT_CEILING_CHECK: Record<string, string> = {
   // which the walk itself excludes.
   'services/m365ControlPlane/__testHelpers__/seedActionsConnection.ts':
     'test-only fixture seeder for integration suites — inserts a connection row directly and is imported exclusively by *.test.ts files, so no caller-scoped auth ever reaches it',
+
+  // DNS policy sync worker: records syncStatus/lastSynced/syncError after
+  // pushing an already-saved policy to the provider. Runs in system context
+  // from the BullMQ job, reloading the policy by id; no caller-scoped auth
+  // object reaches it. The caller-facing writers (routes/dnsSecurity.ts,
+  // services/aiToolsDns.ts) gate before enqueueing.
+  'jobs/dnsSyncJob.ts':
+    'updates only syncStatus/lastSynced/syncError on a saved DNS policy from the sync worker in system context (runWithSystemDbAccess) — no caller-scoped auth object reaches this path',
+
+  // DNS integration background delete (#10019): removes the policies of an
+  // integration the DELETE route already deactivated. That route is the
+  // caller-facing gate (requireOrgWideIntegrationAccess rejects any site
+  // ceiling); the worker reloads the row by id in system context.
+  'jobs/dnsSecurityRetention.ts':
+    'deletes dns_policies only for an integration already marked deleting by DELETE /dns-security/integrations/:id (site-ceiling gated by requireOrgWideIntegrationAccess); runs in a BullMQ worker in system context — no caller-scoped auth object reaches this path',
 
   'modules/mcpInvites/tools/configureDefaults.ts':
     'creates the default admin-email notification channel during MCP-invite partner bootstrap — the caller is a partner-bootstrap key, not a site-restricted org-scope caller, and the target org is fixed by the bootstrap context, not caller-chosen',
@@ -264,6 +361,15 @@ describe('site-ceiling write coverage (contract-site-ceiling-gate)', () => {
       'services/aiToolsAlerts.ts',
       'services/aiToolsFleet.ts',
       'services/aiToolsIntegrations.ts',
+      // Monitor-definition writes (SEC facet a hardening): every writer
+      // route and its AI-tool twin.
+      'routes/monitorDefinitions.ts',
+      'services/aiToolsMonitors.ts',
+      // Org-wide user-risk policy (weights, thresholds, interventions).
+      'routes/userRisk.ts',
+      // Org-wide DNS allow/block policies (route + AI-tool twin).
+      'routes/dnsSecurity.ts',
+      'services/aiToolsDns.ts',
     ];
 
     for (const rel of fixed) {
@@ -300,6 +406,11 @@ describe('approval_generation bump coverage (contract-site-ceiling-gate §3/§7E
     // same reasoning as its entry in ALLOWED_WITHOUT_CEILING_CHECK above.
     'services/webhookDeliveryRecord.ts':
       'updates only successCount/failureCount/lastDeliveryAt after a delivery attempt — never a governing edit a queued job needs to detect',
+    // A probed capability of the destination, not a governing edit: a queued
+    // backup needs no new approval because the destination learned it
+    // supports a create-only condition.
+    'services/backupStorageCapabilityProbe.ts':
+      'records only a probed destination capability (provider_capabilities.conditionalWrites) — never a governing edit a queued job needs to detect',
   };
 
   it('every file that writes a generation-tracked table also references approvalGeneration', () => {

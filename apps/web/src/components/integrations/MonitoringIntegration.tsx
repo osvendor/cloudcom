@@ -15,10 +15,12 @@ import {
 import { fetchWithAuth } from "../../stores/auth";
 import { useOrgStore } from "../../stores/orgStore";
 import { useOrgScope } from "@/hooks/useOrgScope";
+import { OrgLoadFailedState } from "../shared/OrgLoadFailedState";
 import { getJwtClaims } from "../../lib/authScope";
 import { extractApiError } from "@/lib/apiError";
 import { useTranslation } from "react-i18next";
 import "@/lib/i18n";
+import { IntegrationPanelHeader } from "./IntegrationPanelHeader";
 
 type WebhookEndpoint = {
   id: string;
@@ -277,8 +279,9 @@ export default function MonitoringIntegration() {
   // flashes the note (and a failed org-context load no longer strands here).
   const needsOrgSelection =
     canAddressManyOrgs && (orgScope.scope === "all" || orgScope.status === "empty");
-  // Partner/system with no org yet but context still resolving (or it failed):
-  // hold the loading frame instead of firing the doomed org-less GET.
+  // Partner/system with no org yet and context still resolving: hold the
+  // loading frame instead of firing the doomed org-less GET. (If the context
+  // load FAILED, the render below shows the retry card instead.)
   const awaitingOrgContext =
     canAddressManyOrgs && !currentOrgId && !needsOrgSelection;
 
@@ -542,19 +545,21 @@ export default function MonitoringIntegration() {
     }
   };
 
+  // The org context itself failed to load: say so (with retry) rather than
+  // holding the loading frame indefinitely — same card the dashboards use.
+  if (awaitingOrgContext && orgScope.status === "error") {
+    return <OrgLoadFailedState error={orgScope.error} />;
+  }
+
   if (needsOrgSelection) {
     return (
       <div className="space-y-6">
-        <div>
-          <h1 className="text-2xl font-semibold">
-            {t("monitoringIntegration.monitoringIntegrations")}
-          </h1>
-          <p className="text-sm text-muted-foreground">
-            {t(
-              "monitoringIntegration.connectObservabilityPlatformsAlertingToolsAndExternalMonitoring",
-            )}
-          </p>
-        </div>
+        <IntegrationPanelHeader
+          title={t("monitoringIntegration.monitoringIntegrations")}
+          description={t(
+            "monitoringIntegration.connectObservabilityPlatformsAlertingToolsAndExternalMonitoring",
+          )}
+        />
         <div className="rounded-md border bg-muted/40 p-4 text-sm text-muted-foreground">
           {/* Partner/system audience with no org selected: monitoring settings
               are genuinely per-org (a data target), so picking one is the
@@ -580,40 +585,36 @@ export default function MonitoringIntegration() {
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-        <div>
-          <h1 className="text-2xl font-semibold">
-            {t("monitoringIntegration.monitoringIntegrations")}
-          </h1>
-          <p className="text-sm text-muted-foreground">
-            {t(
-              "monitoringIntegration.connectObservabilityPlatformsAlertingToolsAndExternalMonitoring",
+      <IntegrationPanelHeader
+        title={t("monitoringIntegration.monitoringIntegrations")}
+        description={t(
+          "monitoringIntegration.connectObservabilityPlatformsAlertingToolsAndExternalMonitoring",
+        )}
+        actions={
+          <>
+            {hasChanges && (
+              <span className="text-xs text-amber-600">
+                {t("monitoringIntegration.unsavedChanges")}
+              </span>
             )}
-          </p>
-        </div>
-        <div className="flex flex-wrap items-center gap-3">
-          {hasChanges && (
-            <span className="text-xs text-amber-600">
-              {t("monitoringIntegration.unsavedChanges")}
-            </span>
-          )}
-          <button
-            type="button"
-            onClick={handleSave}
-            disabled={saveState.status === "saving"}
-            className="inline-flex items-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
-          >
-            {saveState.status === "saving" ? (
-              <Loader2 className="h-4 w-4 animate-spin" />
-            ) : (
-              <Save className="h-4 w-4" />
-            )}
-            {saveState.status === "saving"
-              ? t("monitoringIntegration.saving")
-              : t("monitoringIntegration.saveSettings")}
-          </button>
-        </div>
-      </div>
+            <button
+              type="button"
+              onClick={handleSave}
+              disabled={saveState.status === "saving"}
+              className="inline-flex items-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {saveState.status === "saving" ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                <Save className="h-4 w-4" />
+              )}
+              {saveState.status === "saving"
+                ? t("monitoringIntegration.saving")
+                : t("monitoringIntegration.saveSettings")}
+            </button>
+          </>
+        }
+      />
 
       {loadError && (
         <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">

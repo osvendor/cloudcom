@@ -30,8 +30,14 @@ import {
 } from '../../db/schema';
 import type { AuthContext } from '../../middleware/auth';
 import { canManagePartnerWidePolicies, PARTNER_WIDE_WRITE_DENIED_MESSAGE } from '../partnerWideAccess';
+import { urlOriginChanged } from '../credentialOriginBinding';
 import { credentialOriginFor, encryptToolSourceAuth, type ToolSourceAuthConfig } from './secrets';
-import type { CreateToolSourceInput, PatchToolSourceToolInput, UpdateToolSourceInput } from '@breeze/shared';
+import type {
+  CreateToolSourceInput,
+  PatchToolSourceToolInput,
+  ToolSourceDiscoverySummary,
+  UpdateToolSourceInput,
+} from '@breeze/shared';
 
 export const NAME_NOT_ADDRESSABLE = 'name_not_addressable';
 
@@ -53,13 +59,18 @@ export interface ToolSourceDto {
   slug: string;
   name: string;
   kind: string;
+  /** For `openapi`: the API base URL — where every operation and the credential go. */
   endpointUrl: string;
+  /** OpenAPI document URL (W2); null for mcp sources. */
+  specUrl: string | null;
   credentialOrigin: string;
   authKind: string;
   hasCredential: boolean;
   status: string;
   lastDiscoveredAt: Date | null;
   lastError: string | null;
+  /** Skips + warnings of the last completed discovery (W2, D17). */
+  lastDiscoverySummary: ToolSourceDiscoverySummary | null;
   rateLimitPerMinute: number;
   createdByUserId: string | null;
   createdAt: Date;
@@ -96,12 +107,14 @@ export function toToolSourceDto(
     name: row.name,
     kind: row.kind,
     endpointUrl: row.endpointUrl,
+    specUrl: row.specUrl ?? null,
     credentialOrigin: row.credentialOrigin,
     authKind: row.authKind,
     hasCredential: row.authKind !== 'none',
     status: row.status,
     lastDiscoveredAt: row.lastDiscoveredAt,
     lastError: row.lastError,
+    lastDiscoverySummary: row.lastDiscoverySummary ?? null,
     rateLimitPerMinute: row.rateLimitPerMinute,
     createdByUserId: row.createdByUserId,
     createdAt: row.createdAt,
@@ -284,7 +297,11 @@ export async function createToolSourceRow(
       slug: input.slug,
       name: input.name,
       kind: input.kind,
+      // For openapi this is the API BASE url, so `credentialOrigin` (derived
+      // above, unchanged from W01) pins the credential to the API host — never
+      // to wherever the document is served (D2).
       endpointUrl: input.endpointUrl,
+      specUrl: input.kind === 'openapi' ? (input.specUrl ?? null) : null,
       credentialOrigin,
       authKind: input.authKind,
       authConfigEncrypted: encrypted,
@@ -305,17 +322,48 @@ export interface UpdateOutcome {
 export async function updateToolSourceRow(
   existing: ToolSourceRow,
   input: UpdateToolSourceInput,
-): Promise<UpdateOutcome> {
+): Promise<UpdateOutcome | ServiceError> {
   const updates: Partial<typeof toolSources.$inferInsert> = { updatedAt: new Date() };
   let discoveryTriggered = false;
 
   if (input.name !== undefined) updates.name = input.name;
   if (input.rateLimitPerMinute !== undefined) updates.rateLimitPerMinute = input.rateLimitPerMinute;
 
-  if (input.endpointUrl !== undefined && input.endpointUrl !== existing.endpointUrl) {
-    updates.endpointUrl = input.endpointUrl;
-    updates.credentialOrigin = credentialOriginFor(input.endpointUrl);
+  const nextEndpointUrl = input.endpointUrl;
+  if (nextEndpointUrl !== undefined && nextEndpointUrl !== existing.endpointUrl) {
+    // Same origin-binding contract as credentialOriginBinding.ts:
+    // a stored credential must not silently follow the endpoint to a new
+    // origin. A same-origin path/query change (e.g. a different MCP mount
+    // path on the same host) is still allowed to keep the credential.
+    if (
+      existing.authKind !== 'none'
+      && input.authKind === undefined
+      && urlOriginChanged(existing.endpointUrl, nextEndpointUrl)
+    ) {
+      return {
+        status: 400,
+        error: 'Changing the endpoint origin requires re-entering the credential (or clearing it by setting authKind to "none")',
+        code: 'endpoint_origin_changed',
+      };
+    }
+    updates.endpointUrl = nextEndpointUrl;
+    updates.credentialOrigin = credentialOriginFor(nextEndpointUrl);
     discoveryTriggered = true;
+  }
+
+  if (input.specUrl !== undefined) {
+    // Kind is create-only, so the stored row decides whether a document URL
+    // means anything (mirrors tool_sources_spec_url_kind_chk).
+    if (existing.kind !== 'openapi') {
+      return { status: 400, error: 'Only an OpenAPI tool source has a spec URL', code: 'spec_url_not_applicable' };
+    }
+    // No credential re-entry needed: the credential stays pinned to
+    // endpoint_url's origin and is only sent with the document when the new
+    // spec URL shares that origin.
+    if (input.specUrl !== existing.specUrl) {
+      updates.specUrl = input.specUrl;
+      discoveryTriggered = true;
+    }
   }
 
   if (input.authKind !== undefined) {
@@ -381,7 +429,10 @@ export type PatchToolOutcome = { ok: true; row: ToolSourceToolRow; oldTier: numb
 /**
  * Refuses `enabled: true` on a removed or non-addressable tool (422); sets
  * `tier`/`enabled`; clears `reviewNeeded` whenever a human sets the tier
- * explicitly (that IS the review).
+ * explicitly (that IS the review). A tool still flagged `reviewNeeded` also
+ * refuses a bare `enabled: true` patch — the same request must set `tier`
+ * too, so a per-tool enable can never substitute for the review a human is
+ * meant to perform (mirrors the reviewNeeded exclusion in bulkToolsAction).
  */
 export async function patchSourceTool(
   tool: ToolSourceToolRow,
@@ -389,6 +440,9 @@ export async function patchSourceTool(
 ): Promise<PatchToolOutcome> {
   if (patch.enabled === true && (tool.removedAt !== null || tool.lastError === NAME_NOT_ADDRESSABLE)) {
     return { ok: false, status: 422, error: 'Cannot enable a removed or non-addressable tool' };
+  }
+  if (patch.enabled === true && tool.reviewNeeded && patch.tier === undefined) {
+    return { ok: false, status: 422, error: 'Tool still needs review; set a tier in the same request to review and enable it' };
   }
 
   const updates: Partial<typeof toolSourceTools.$inferInsert> = { updatedAt: new Date() };
@@ -408,7 +462,11 @@ export async function patchSourceTool(
 }
 
 /**
- * `enable_reads`: every tier-1, addressable, non-removed tool is enabled.
+ * `enable_reads`: every tier-1, addressable, non-removed, already-reviewed
+ * tool is enabled. A tool still flagged `reviewNeeded` is skipped — its
+ * proposed tier comes from the peer's own self-declared annotations, which
+ * are not corroborated server-side, so a human must confirm it individually
+ * (see patchSourceTool) before this bulk action can activate it.
  * `disable_all`: every tool on the source is disabled, removed or not.
  * Returns the number of rows changed.
  */
@@ -431,6 +489,10 @@ export async function bulkToolsAction(sourceId: string, mode: 'enable_reads' | '
         eq(toolSourceTools.tier, 1),
         isNull(toolSourceTools.removedAt),
         sql`(${toolSourceTools.lastError} IS DISTINCT FROM ${NAME_NOT_ADDRESSABLE})`,
+        // A tool still flagged for human review never activates through the
+        // bulk action — only an explicit per-tool tier confirmation (which
+        // clears reviewNeeded, see patchSourceTool) counts as that review.
+        eq(toolSourceTools.reviewNeeded, false),
       ),
     )
     .returning({ id: toolSourceTools.id });

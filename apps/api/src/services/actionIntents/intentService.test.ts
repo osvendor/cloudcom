@@ -245,6 +245,11 @@ vi.mock('./intentApprovers', () => ({
       .includes(toolName),
 }));
 
+const partnerAxisState = vi.hoisted(() => ({ required: vi.fn(async (): Promise<boolean> => true) }));
+vi.mock('./partnerAxisApprover', () => ({
+  intentRequiresPartnerAxisApprover: partnerAxisState.required,
+}));
+
 vi.mock('../../middleware/auth', () => ({
   dbAccessContextFromAuth: authMock.dbAccessContextFromAuth,
 }));
@@ -330,6 +335,20 @@ vi.mock('drizzle-orm', () => ({
   })),
 }));
 
+// Caller verification W05 (#6354): the two protected M365 tools resolve their
+// canonical target (lazy `../aiToolsM365` import) and run the gate in `check`
+// mode before anything is minted. Both collaborators are mocked at the module
+// boundary; this suite pins the WIRING (what is passed, what is inserted, that
+// a refusal mints nothing). Defaults pass, so every pre-W05 test is unchanged.
+const callerState = vi.hoisted(() => ({
+  resolveM365CallerTarget: vi.fn(),
+  requireCallerVerification: vi.fn(async () => undefined),
+  getEffectivePolicy: vi.fn(async () => ({ requiredTierResetPassword: 3, requiredTierDisableUser: 2 })),
+}));
+vi.mock('../aiToolsM365', () => ({ resolveM365CallerTarget: callerState.resolveM365CallerTarget }));
+vi.mock('../callerVerification/gate', () => ({ requireCallerVerification: callerState.requireCallerVerification }));
+vi.mock('../callerVerification/policy', () => ({ getEffectivePolicy: callerState.getEffectivePolicy }));
+
 // ---------------------------------------------------------------------------
 // Import under test (after mocks)
 // ---------------------------------------------------------------------------
@@ -353,6 +372,7 @@ import { buildActionLabel } from './actionLabel';
 import { db, withDbAccessContext } from '../../db';
 import { computeEffectDigestOutcome } from './effectDigest';
 import { SITE_CEILING_WRITE_DENIED_MESSAGE } from '../siteCeilingAccess';
+import { CallerVerificationRequiredError, CallerVerificationValidationError } from '../callerVerification/errors';
 
 // ---------------------------------------------------------------------------
 // Test fixtures
@@ -369,6 +389,9 @@ const RUN_ID_2 = '88888888-8888-4888-8888-888888888888';
 const DEVICE_ID = '99999999-9999-4999-8999-999999999999';
 const SITE_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const OTHER_ORG_ID = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+const CALLER_CONN = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+const CALLER_TENANT = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+const CALLER_OID = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
 
 function makeAuth(overrides?: {
   partnerId?: string | null;
@@ -510,6 +533,10 @@ function makeRunRow(overrides?: Record<string, unknown>) {
     agentId: AGENT_ID,
     orgId: ORG_ID,
     deviceId: DEVICE_ID,
+    // Mirrors `policySnapshot.effective.mode` by default, like a real,
+    // never-forced-shadow run row — `agentRunRowWithMode` below keeps the
+    // two in sync unless a test explicitly diverges them.
+    modeAtStart: 'shadow',
     policySnapshot: {
       schemaVersion: 1,
       agentId: AGENT_ID,
@@ -551,7 +578,10 @@ function queueAgentContext(opts?: { run?: Record<string, unknown>; agent?: Recor
  * `'shadow'` (the wave-3b baseline every OTHER test in this file relies on).
  */
 function agentRunRowWithMode(mode: string, overrides?: Record<string, unknown>) {
-  const base = makeRunRow(overrides);
+  // `modeAtStart` defaults to the same value as `mode` — a normal,
+  // never-forced-shadow run — unless `overrides` explicitly names its own
+  // `modeAtStart` (hardening tests below deliberately diverge them).
+  const base = makeRunRow({ modeAtStart: mode, ...overrides });
   return {
     ...base,
     policySnapshot: {
@@ -566,6 +596,12 @@ beforeEach(() => {
   vi.clearAllMocks();
   aiToolsState.tools.clear();
   aiToolsState.resolveWritableToolOrgId.mockReturnValue({ orgId: ORG_ID });
+  callerState.resolveM365CallerTarget.mockReset();
+  callerState.resolveM365CallerTarget.mockResolvedValue({
+    backend: 'direct', connectionId: CALLER_CONN, tenantId: CALLER_TENANT, orgId: ORG_ID, entraOid: CALLER_OID,
+  });
+  callerState.requireCallerVerification.mockReset();
+  callerState.requireCallerVerification.mockResolvedValue(undefined);
   guardrailMock.checkGuardrails.mockReturnValue({
     tier: 3,
     allowed: true,
@@ -608,6 +644,64 @@ beforeEach(() => {
 // ---------------------------------------------------------------------------
 // Audit §1.1: org-wide governance fan-out excludes site-restricted approvers
 // ---------------------------------------------------------------------------
+
+describe('createActionIntent: partner-axis approvers for a partner-wide intent', () => {
+  const SCHEDULE_ID = '00000000-0000-4000-8000-0000000000b1';
+  const scheduleDelete = () => baseInput({
+    toolName: 'manage_ai_agent_schedules',
+    input: { action: 'delete', scheduleId: SCHEDULE_ID },
+    idempotencyKey: 'key-schedule-delete',
+  });
+
+  beforeEach(() => {
+    partnerAxisState.required.mockReset();
+    partnerAxisState.required.mockResolvedValue(true);
+    // A schedule delete carries a mandatory digest; without one the raise refuses before the insert.
+    effectDigestState.computeEffectDigestOutcome.mockResolvedValue({ kind: 'pinned', digest: 'f'.repeat(64) });
+    dbState.insertActionIntentsResults.push([makeIntentRow()]);
+  });
+
+  it('asks the resolver for the partner axis, and the stored summary says so', async () => {
+    intentApproversState.resolveIntentApprovers.mockResolvedValueOnce([APPROVER_1]);
+    dbState.insertApprovalRequestsResults.push([{ id: 'approval-baseline' }]);
+
+    await createActionIntent(makeAuth(), scheduleDelete()).catch(() => undefined);
+
+    expect(partnerAxisState.required).toHaveBeenCalledWith({
+      actionName: 'manage_ai_agent_schedules',
+      arguments: { action: 'delete', scheduleId: SCHEDULE_ID },
+      orgId: ORG_ID,
+    });
+    expect(intentApproversState.resolveIntentApprovers).toHaveBeenCalledWith(
+      ORG_ID, expect.objectContaining({ requirePartnerAxis: true }),
+    );
+    expect(dbState.insertedActionIntentValues.at(-1)?.impactSummary).toContain('This needs a partner-level approver.');
+  });
+
+  it("an override delete keeps today's approver set and summary", async () => {
+    partnerAxisState.required.mockResolvedValue(false);
+    intentApproversState.resolveIntentApprovers.mockResolvedValueOnce([APPROVER_1]);
+    dbState.insertApprovalRequestsResults.push([{ id: 'approval-override' }]);
+
+    await createActionIntent(makeAuth(), scheduleDelete()).catch(() => undefined);
+
+    expect(intentApproversState.resolveIntentApprovers.mock.lastCall?.[1]).not.toHaveProperty('requirePartnerAxis');
+    expect(dbState.insertedActionIntentValues.at(-1)?.impactSummary).not.toContain('partner-level');
+  });
+
+  it('never consults the predicate for an action outside the registry', async () => {
+    intentApproversState.resolveIntentApprovers.mockResolvedValueOnce([APPROVER_1]);
+    dbState.insertApprovalRequestsResults.push([{ id: 'approval-ord' }]);
+
+    await createActionIntent(
+      makeAuth(),
+      baseInput({ toolName: 'manage_ai_agents', input: { action: 'list', orgId: ORG_ID }, idempotencyKey: 'key-other' }),
+    ).catch(() => undefined);
+
+    expect(partnerAxisState.required).not.toHaveBeenCalled();
+    expect(intentApproversState.resolveIntentApprovers.mock.lastCall?.[1]).not.toHaveProperty('requirePartnerAxis');
+  });
+});
 
 describe('createActionIntent — org-wide governance fan-out filter', () => {
   const govInput = () => baseInput({
@@ -1140,7 +1234,7 @@ describe('createActionIntent — ai_agent branch (wave 3b)', () => {
       expect.objectContaining({
         userId: APPROVER_1,
         type: 'approval',
-        link: '/approvals',
+        link: '/approvals#intent-intent-agent-notify',
         message: expect.stringContaining('Patch agent'),
         dedupeKey: 'intent-approval:intent-agent-notify',
       }),
@@ -1338,6 +1432,29 @@ describe('createActionIntent — approver fan-out', () => {
     );
   });
 
+  // A PAM elevation request never clears four_eyes through the sole-operator
+  // self-approval fallback: it needs a second person to approve.
+  it('never takes the sole-operator branch for request_elevation: cancels with no_eligible_approvers instead', async () => {
+    dbState.insertActionIntentsResults.push([makeIntentRow({ actionName: 'request_elevation' })]);
+    intentApproversState.resolveIntentApprovers.mockResolvedValueOnce([REQUESTER_ID]);
+    dbState.updateActionIntentsResults.push([
+      makeIntentRow({ actionName: 'request_elevation', status: 'cancelled', errorCode: 'no_eligible_approvers' }),
+    ]);
+
+    const snapshot = await createActionIntent(
+      makeAuth(),
+      baseInput({
+        toolName: 'request_elevation',
+        input: { deviceId: 'device-1', subjectUsername: 'localadmin', reason: 'Install driver' },
+      }),
+    );
+
+    expect(snapshot.status).toBe('cancelled');
+    expect(snapshot.errorCode).toBe('no_eligible_approvers');
+    expect(snapshot.requesterApprovalRequestId).toBeNull();
+    expect(dbState.insertedApprovalRequestsValues).toHaveLength(0);
+  });
+
   it('creates the intent then immediately cancels it when no one is eligible (not even the requester)', async () => {
     dbState.insertActionIntentsResults.push([makeIntentRow()]);
     // Nobody is eligible — not even the requester.
@@ -1511,6 +1628,35 @@ describe('createActionIntent — resolvePolicyDecisionState (Wave 5 Part B, real
     intentApproversState.resolveAgentIntentApprovers.mockResolvedValueOnce([APPROVER_1]);
     dbState.insertActionIntentsResults.push(echoInsertedIntent({ id: 'intent-shadow-mode' }));
     dbState.insertApprovalRequestsResults.push([{ id: 'approval-shadow-mode' }]);
+
+    const snap = await createActionIntent(makeAgentAuth(), agentInput());
+
+    expect(dbState.insertedActionIntentValues[0]?.policyDecisionState).toBe('human_required');
+    expect(snap.status).toBe('pending_approval');
+    expect(dbState.insertedApprovalRequestsValues).toHaveLength(1);
+    expect(policyDecideMock.attemptPolicyDecision).not.toHaveBeenCalled();
+  });
+
+  it("flag on + agent-originated + supervised + run's policy snapshot reads mode 'act' but the run was actually admitted with modeAtStart 'shadow' (anomaly/ticket forced-shadow downgrade) -> human_required, not unattempted (hardening)", async () => {
+    // Distinguishes this from the test above: `effective.mode` in the
+    // SNAPSHOT genuinely reads 'act' here (an anomaly- or ticket-triggered
+    // run is admitted against an agent whose resolved policy mode is 'act'
+    // — runService.ts only downgrades what the run RECORDS, never the
+    // snapshot's own `effective.mode`). The decidability gate must key on
+    // `modeAtStart`, not on the snapshot's mode, or the forced-shadow
+    // downgrade is silently undone here.
+    envMock.policyDecideEnabled.mockReturnValue(true);
+    guardrailMock.checkGuardrails.mockReturnValue({
+      tier: 3,
+      allowed: true,
+      requiresApproval: true,
+      description: 'Manage services on a device',
+      approvalScope: 'supervised',
+    });
+    queueAgentContext({ run: agentRunRowWithMode('act', { modeAtStart: 'shadow' }) });
+    intentApproversState.resolveAgentIntentApprovers.mockResolvedValueOnce([APPROVER_1]);
+    dbState.insertActionIntentsResults.push(echoInsertedIntent({ id: 'intent-forced-shadow' }));
+    dbState.insertApprovalRequestsResults.push([{ id: 'approval-forced-shadow' }]);
 
     const snap = await createActionIntent(makeAgentAuth(), agentInput());
 
@@ -1958,6 +2104,37 @@ describe('createActionIntent — supervised/four_eyes scope', () => {
     expect(msUntil(sv.approvalExpiresAt!)).toBeCloseTo(5 * 60 * 1000, -4);
   });
 
+  it('#6475: a supervised chat intent expires with the configured interactive window (clamped 5-60 min); four_eyes and mcp_api ignore it', async () => {
+    const supervised = {
+      tier: 3,
+      allowed: true,
+      requiresApproval: true,
+      description: 'Run a script on one or more devices',
+      approvalScope: 'supervised',
+    } as const;
+    const mint = async (key: string, extra: Record<string, unknown>) => {
+      intentApproversState.resolveIntentApprovers.mockResolvedValueOnce([]);
+      dbState.insertActionIntentsResults.push(echoInsertedIntent({ id: `intent-${key}` }));
+      dbState.insertApprovalRequestsResults.push([{ id: `approval-${key}` }]);
+      return createActionIntent(makeAuth(), baseInput({ idempotencyKey: key, ...extra }));
+    };
+
+    guardrailMock.checkGuardrails.mockReturnValue(supervised);
+    const thirty = await mint('w30', { source: 'chat', chatApprovalWindowMs: 30 * 60_000 });
+    const tooBig = await mint('w999', { source: 'chat', chatApprovalWindowMs: 24 * 60 * 60_000 });
+    const tooSmall = await mint('w1', { source: 'chat', chatApprovalWindowMs: 60_000 });
+    const mcp = await mint('wmcp', { source: 'mcp_api', chatApprovalWindowMs: 30 * 60_000 });
+
+    guardrailMock.checkGuardrails.mockReturnValue({ ...supervised, approvalScope: 'four_eyes' });
+    const fourEyes = await mint('wfe', { source: 'chat', chatApprovalWindowMs: 10 * 60_000 });
+
+    expect(msUntil(thirty.approvalExpiresAt!)).toBeCloseTo(30 * 60 * 1000, -4);
+    expect(msUntil(tooBig.approvalExpiresAt!)).toBeCloseTo(60 * 60 * 1000, -4);
+    expect(msUntil(tooSmall.approvalExpiresAt!)).toBeCloseTo(5 * 60 * 1000, -4);
+    expect(msUntil(mcp.approvalExpiresAt!)).toBeCloseTo(24 * 60 * 60 * 1000, -4);
+    expect(msUntil(fourEyes.approvalExpiresAt!)).toBeCloseTo(60 * 60 * 1000, -4);
+  });
+
   it('THE FIX: an approver with NO phone is still notified in-app', async () => {
     // Before wave 2 the only approver channel was mobile push, and
     // getUserPushTokens reads mobile_devices exclusively — so an approver who
@@ -1982,7 +2159,7 @@ describe('createActionIntent — supervised/four_eyes scope', () => {
       expect.objectContaining({
         userId: 'approver-1',
         type: 'approval',
-        link: '/approvals',
+        link: '/approvals#intent-intent-fe-notify',
         // Idempotent across outbox/BullMQ redelivery.
         dedupeKey: 'intent-approval:intent-fe-notify',
       }),
@@ -2085,6 +2262,77 @@ describe('createActionIntent — supervised/four_eyes scope', () => {
     );
   });
 
+  // Network-isolation W13 (#10101, ai.mdx "Approving your own request when you
+  // are the only approver"): the AI release of a containment is four-eyes, and
+  // a sole operator keeps the WebAuthn self-approval fallback — one
+  // requester-owned row carrying the pinned episode digest. (Real
+  // selfApprovalPolicy and pinnedEffectPolicy; the decide-time assurance gate is
+  // tool-agnostic.)
+  describe('release_containment (W13 #10101)', () => {
+    const releaseInput = {
+      deviceId: '11111111-1111-4111-8111-111111111111',
+      isolationId: '33333333-3333-4333-8333-333333333333',
+      reason: 'Incident contained and cleaned',
+    };
+    const fourEyes = {
+      tier: 3, allowed: true, requiresApproval: true,
+      description: 'Release network isolation', approvalScope: 'four_eyes',
+    } as const;
+
+    it('a sole operator gets one requester-owned row carrying the pinned episode digest', async () => {
+      guardrailMock.checkGuardrails.mockReturnValue(fourEyes);
+      effectDigestState.computeEffectDigestOutcome.mockResolvedValueOnce({ kind: 'pinned', digest: 'f'.repeat(64) });
+      intentApproversState.resolveIntentApprovers.mockResolvedValueOnce([REQUESTER_ID]);
+      dbState.insertActionIntentsResults.push(echoInsertedIntent({ id: 'intent-release-solo', actionName: 'release_containment' }));
+      dbState.insertApprovalRequestsResults.push([{ id: 'approval-release-solo' }]);
+
+      const snapshot = await createActionIntent(makeAuth(), baseInput({
+        toolName: 'release_containment', input: releaseInput, idempotencyKey: 'key-release-solo',
+      }));
+
+      expect(snapshot.status).toBe('pending_approval');
+      expect(snapshot.requesterApprovalRequestId).toBe('approval-release-solo');
+      expect(snapshot.fanOutUserIds).toEqual([REQUESTER_ID]);
+      expect(dbState.insertedActionIntentValues[0]).toMatchObject({
+        actionName: 'release_containment', approvalScope: 'four_eyes', effectDigest: 'f'.repeat(64),
+      });
+      expect(metricsMock.recordActionIntentEvent).toHaveBeenCalledWith(
+        expect.objectContaining({ details: expect.objectContaining({ soleOperator: true }) }),
+      );
+    });
+
+    it('with another eligible approver, the requester cannot self-approve: the row goes to the second person', async () => {
+      guardrailMock.checkGuardrails.mockReturnValue(fourEyes);
+      effectDigestState.computeEffectDigestOutcome.mockResolvedValueOnce({ kind: 'pinned', digest: 'f'.repeat(64) });
+      intentApproversState.resolveIntentApprovers.mockResolvedValueOnce([REQUESTER_ID, APPROVER_1]);
+      dbState.insertActionIntentsResults.push(echoInsertedIntent({ id: 'intent-release-pair', actionName: 'release_containment' }));
+      dbState.insertApprovalRequestsResults.push([{ id: 'approval-release-pair' }]);
+
+      const snapshot = await createActionIntent(makeAuth(), baseInput({
+        toolName: 'release_containment', input: releaseInput, idempotencyKey: 'key-release-pair',
+      }));
+
+      expect(snapshot.requesterApprovalRequestId).toBeNull();
+      const inserted = dbState.insertedApprovalRequestsValues[0] as Array<{ userId: string }>;
+      expect(inserted.map((r) => r.userId)).toEqual([APPROVER_1]);
+    });
+
+    it.each(['missing_arg', 'target_absent'] as const)(
+      'refuses to create the approval when the episode cannot be pinned (%s)', async (reason) => {
+        guardrailMock.checkGuardrails.mockReturnValue(fourEyes);
+        effectDigestState.computeEffectDigestOutcome.mockResolvedValueOnce({ kind: 'unresolved', reason });
+        // Everything else would succeed: the refusal is the mandatory pin alone.
+        intentApproversState.resolveIntentApprovers.mockResolvedValueOnce([APPROVER_1]);
+        dbState.insertActionIntentsResults.push(echoInsertedIntent({ id: `intent-release-${reason}`, actionName: 'release_containment' }));
+        dbState.insertApprovalRequestsResults.push([{ id: `approval-release-${reason}` }]);
+
+        await expect(createActionIntent(makeAuth(), baseInput({
+          toolName: 'release_containment', input: releaseInput, idempotencyKey: `key-release-${reason}`,
+        }))).rejects.toMatchObject({ code: 'effect_digest_unresolvable' });
+        expect(dbState.insertedApprovalRequestsValues).toHaveLength(0);
+      });
+  });
+
   it('persists approvalScope and classificationVersion on the inserted row', async () => {
     guardrailMock.checkGuardrails.mockReturnValue({
       tier: 3,
@@ -2161,6 +2409,7 @@ describe('createActionIntent — effect-digest pinning wiring', () => {
       'run_script',
       { scriptId: 'script-1', deviceIds: ['device-1'] },
       db,
+      { intentOrgId: ORG_ID },
     );
     expect(dbState.insertedActionIntentValues[0]?.effectDigest).toBe('d'.repeat(64));
   });
@@ -2185,6 +2434,7 @@ describe('createActionIntent — effect-digest pinning wiring', () => {
       'run_script',
       { scriptId: 'script-1', deviceIds: ['device-1'] },
       db,
+      { intentOrgId: ORG_ID },
     );
     expect(dbState.insertedActionIntentValues[0]?.effectDigest).toBe('e'.repeat(64));
   });
@@ -2201,7 +2451,7 @@ describe('createActionIntent — effect-digest pinning wiring', () => {
       baseInput({ toolName: 'm365_send_mail', input: { to: ['a@example.com'] }, idempotencyKey: 'key-fe-unpinnable' }),
     );
 
-    expect(computeEffectDigestOutcome).toHaveBeenCalledWith('m365_send_mail', { to: ['a@example.com'] }, db);
+    expect(computeEffectDigestOutcome).toHaveBeenCalledWith('m365_send_mail', { to: ['a@example.com'] }, db, { intentOrgId: ORG_ID });
     expect(dbState.insertedActionIntentValues[0]?.effectDigest).toBeNull();
     // `not_applicable` is the expected, correct case — it must NOT pollute the
     // unpinned signal.
@@ -2892,6 +3142,30 @@ describe('buildImpactSummary (#5106)', () => {
       expected: 'Execute a system command on a device.',
     },
     {
+      name: 'Pax8 submit impact names the company, line outcomes, price, and terminal cancellation',
+      toolName: 'manage_pax8_orders',
+      input: { action: 'submit', expectedCompany: { name: 'Fixture Company', pax8CompanyId: 'company-1' },
+        expectedLines: [{ action: 'cancel', productName: 'Fixture Seats', pax8ProductId: 'product-1',
+          fromQuantity: '7.00', quantity: '0', unitCost: '8.00', currency: 'USD', billingTerm: 'Monthly',
+          commitmentTerm: 'Annual', cancellationFeeApplied: true }] },
+      guardrailDescription: 'Generic Pax8 management description.',
+      expected: "Place a real, billable Pax8 order that cannot be undone for Fixture Company (company-1): 0 new subscriptions, 0 quantity changes, 1 cancellations. Cost is estimated at Pax8's current rate, re-checked before sending. CANCEL (terminal) Fixture Seats [product-1]: 7.00 → 0, 8.00 USD per seat / Monthly, commitment Annual, cancellation fee applies",
+    },
+    {
+      name: 'manage_invoices void gets plain-language impact (#9657)',
+      toolName: 'manage_invoices',
+      input: { action: 'void' },
+      guardrailDescription: 'Manage invoices.',
+      expected: 'Voids the invoice. It will no longer be payable.',
+    },
+    {
+      name: 'remediate_vulnerability does not surface the model-facing description (#9657)',
+      toolName: 'remediate_vulnerability',
+      input: {},
+      guardrailDescription: 'x',
+      expected: 'Queues patches for the selected vulnerabilities on the affected devices; devices may restart to finish installing them.',
+    },
+    {
       name: 'an unrecognized tool falls back to the guardrail description',
       toolName: 'query_devices',
       input: { filter: 'online' },
@@ -3026,5 +3300,392 @@ describe('createActionIntent org-wide governance site ceiling', () => {
     await createActionIntent(makeAuth({ allowedSiteIds: ['site-1'] }), baseInput());
 
     expect(dbState.insertedActionIntentValues).toHaveLength(1);
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// Caller verification W05 (#6354): protected M365 identity tools
+// ---------------------------------------------------------------------------
+describe('createActionIntent caller verification (#6354 W05)', () => {
+  const ZERO_INTENT = '00000000-0000-0000-0000-000000000000';
+  const protInput = (toolName = 'm365_disable_user', over: Partial<CreateActionIntentInput> = {}) => baseInput({
+    toolName,
+    input: { userIdentifier: 'jane@contoso.test', reason: 'offboarding' },
+    idempotencyKey: `key-${toolName}`,
+    ...over,
+  });
+  const arrangeApproval = () => {
+    guardrailMock.checkGuardrails.mockReturnValue({
+      tier: 3, allowed: true, requiresApproval: true, readOnly: false,
+      approvalScope: 'four_eyes', description: 'Identity change.',
+    });
+    intentApproversState.resolveIntentApprovers.mockResolvedValue([APPROVER_1]);
+  };
+  const refusal = (reason = 'no_fresh_verification') => new CallerVerificationRequiredError({
+    orgId: ORG_ID, contactId: null, action: 'disable_user', requiredTier: 2, reason: reason as never, latest: null,
+  });
+  const expectNothingMinted = () => {
+    expect(dbState.insertedActionIntentValues).toHaveLength(0);
+    expect(dbState.insertedApprovalRequestsValues).toHaveLength(0);
+    expect(dbState.insertedOutboxValues).toHaveLength(0);
+    expect(intentApproversState.resolveIntentApprovers).not.toHaveBeenCalled();
+    expect(pushState.dispatchApprovalPushToTokens).not.toHaveBeenCalled();
+    expect(notifyState.createNotification).not.toHaveBeenCalled();
+  };
+
+  beforeEach(() => { resetDbState(); });
+
+  it.each([
+    ['m365_disable_user', 'disable_user'],
+    ['m365_reset_password', 'reset_password'],
+  ])('%s: a passing check pins the exact tenant/oid/connection and calls the gate in check mode only', async (toolName, action) => {
+    arrangeApproval();
+    dbState.insertActionIntentsResults.push(echoInsertedIntent());
+    dbState.insertApprovalRequestsResults.push([{ id: 'approval-1' }]);
+
+    await createActionIntent(makeAuth(), protInput(toolName, { m365SessionId: 'sess-9' }));
+
+    expect(callerState.resolveM365CallerTarget).toHaveBeenCalledTimes(1);
+    expect(callerState.resolveM365CallerTarget).toHaveBeenCalledWith(expect.anything(), ORG_ID, 'jane@contoso.test', 'sess-9');
+    expect(callerState.requireCallerVerification).toHaveBeenCalledTimes(1);
+    expect(callerState.requireCallerVerification).toHaveBeenCalledWith({
+      orgId: ORG_ID, action,
+      target: { entraTenantId: CALLER_TENANT, entraOid: CALLER_OID },
+      backendTenantId: CALLER_TENANT,
+      technicianUserId: REQUESTER_ID,
+      intentId: ZERO_INTENT,
+      mode: 'check',
+    });
+    for (const call of callerState.requireCallerVerification.mock.calls) {
+      expect((call as unknown[])[0]).not.toMatchObject({ mode: 'consume' });
+    }
+    expect(dbState.insertedActionIntentValues).toHaveLength(1);
+    expect(dbState.insertedActionIntentValues[0]).toMatchObject({
+      actionName: toolName,
+      targetEntraTenantId: CALLER_TENANT,
+      targetEntraOid: CALLER_OID,
+      targetConnectionRef: CALLER_CONN,
+    });
+  });
+
+  it('resolves the target BEFORE the creation transaction (resolver and gate ran before any insert)', async () => {
+    arrangeApproval();
+    dbState.insertActionIntentsResults.push(echoInsertedIntent());
+    dbState.insertApprovalRequestsResults.push([{ id: 'approval-1' }]);
+    await createActionIntent(makeAuth(), protInput());
+    const insertOrder = vi.mocked(db.insert).mock.invocationCallOrder[0]!;
+    expect(callerState.resolveM365CallerTarget.mock.invocationCallOrder[0]).toBeLessThan(insertOrder);
+    expect(callerState.requireCallerVerification.mock.invocationCallOrder[0]).toBeLessThan(insertOrder);
+  });
+
+  it('a caller refusal creates no intent, no approval rows and no fan-out', async () => {
+    arrangeApproval();
+    callerState.requireCallerVerification.mockRejectedValueOnce(refusal());
+    await expect(createActionIntent(makeAuth(), protInput())).rejects.toBeInstanceOf(CallerVerificationRequiredError);
+    expectNothingMinted();
+  });
+
+  it.each([
+    ['subject_unmatched'], ['subject_ambiguous'], ['tenant_mismatch'],
+  ])('a %s target validation error becomes a typed refusal with the policy tier and mints nothing', async (code) => {
+    arrangeApproval();
+    callerState.resolveM365CallerTarget.mockRejectedValueOnce(new CallerVerificationValidationError(code, 'x'));
+    callerState.resolveM365CallerTarget.mockRejectedValueOnce(new CallerVerificationValidationError(code, 'x'));
+    await expect(createActionIntent(makeAuth(), protInput('m365_disable_user')))
+      .rejects.toMatchObject({ name: 'CallerVerificationRequiredError', payload: { reason: code, action: 'disable_user', requiredTier: 2 } });
+    await expect(createActionIntent(makeAuth(), protInput('m365_reset_password')))
+      .rejects.toMatchObject({ payload: { reason: code, action: 'reset_password', requiredTier: 3 } });
+    expect(callerState.requireCallerVerification).not.toHaveBeenCalled();
+    expectNothingMinted();
+  });
+
+  it('connection_not_ready becomes ActionIntentError connection_unavailable and mints nothing', async () => {
+    arrangeApproval();
+    callerState.resolveM365CallerTarget.mockRejectedValueOnce(new CallerVerificationValidationError('connection_not_ready', 'x'));
+    await expect(createActionIntent(makeAuth(), protInput())).rejects.toMatchObject({
+      name: 'ActionIntentError', code: 'connection_unavailable',
+    });
+    expect(callerState.requireCallerVerification).not.toHaveBeenCalled();
+    expectNothingMinted();
+  });
+
+  it('an unexpected resolver error propagates untouched', async () => {
+    arrangeApproval();
+    callerState.resolveM365CallerTarget.mockRejectedValueOnce(new Error('graph down'));
+    await expect(createActionIntent(makeAuth(), protInput())).rejects.toThrow('graph down');
+    expectNothingMinted();
+  });
+
+  it('an ai_agent principal is refused technician_mismatch without resolving or checking', async () => {
+    guardrailMock.checkGuardrails.mockReturnValue({
+      tier: 3, allowed: true, requiresApproval: true, description: 'Identity change.', approvalScope: 'supervised',
+    });
+    queueAgentContext();
+    await expect(createActionIntent(
+      makeAgentAuth(),
+      agentInput({ toolName: 'm365_reset_password', input: { userIdentifier: 'jane@contoso.test', reason: 'r' } }),
+    )).rejects.toMatchObject({ name: 'CallerVerificationRequiredError', payload: { reason: 'technician_mismatch', action: 'reset_password' } });
+    expect(callerState.resolveM365CallerTarget).not.toHaveBeenCalled();
+    expect(callerState.requireCallerVerification).not.toHaveBeenCalled();
+    expect(dbState.insertedActionIntentValues).toHaveLength(0);
+    expect(dbState.insertedApprovalRequestsValues).toHaveLength(0);
+  });
+
+  describe('live replay', () => {
+    const replayRow = (over: Record<string, unknown> = {}) => {
+      const input = protInput();
+      return makeIntentRow({
+        id: 'intent-live',
+        actionName: 'm365_disable_user',
+        source: 'chat',
+        idempotencyKey: input.idempotencyKey,
+        arguments: input.input,
+        argumentDigest: computeArgumentDigest(canonicalizeArguments(input.input)),
+        requestedByUserId: REQUESTER_ID,
+        requestingAgentRunId: null,
+        ...over,
+      });
+    };
+
+    it('returns the existing snapshot without calling the resolver or the gate and inserts nothing', async () => {
+      arrangeApproval();
+      dbState.selectActionIntentsResults.push([replayRow()]);
+      dbState.selectApprovalRequestsResults.push([{ id: 'approval-live', userId: APPROVER_1 }]);
+      const snapshot = await createActionIntent(makeAuth(), protInput());
+      expect(snapshot.id).toBe('intent-live');
+      expect(callerState.resolveM365CallerTarget).not.toHaveBeenCalled();
+      expect(callerState.requireCallerVerification).not.toHaveBeenCalled();
+      expectNothingMinted();
+    });
+
+    it.each([
+      ['requester', { requestedByUserId: APPROVER_2 }],
+      ['agent run', { requestingAgentRunId: RUN_ID }],
+      ['action', { actionName: 'm365_reset_password' }],
+      ['source', { source: 'mcp' }],
+      ['digest', { argumentDigest: 'f'.repeat(64) }],
+    ])('a live row with a different %s is an idempotency_conflict (no resolve, no gate)', async (_label, over) => {
+      arrangeApproval();
+      dbState.selectActionIntentsResults.push([replayRow(over)]);
+      await expect(createActionIntent(makeAuth(), protInput())).rejects.toMatchObject({
+        name: 'ActionIntentError', code: 'idempotency_conflict',
+      });
+      expect(callerState.resolveM365CallerTarget).not.toHaveBeenCalled();
+      expect(callerState.requireCallerVerification).not.toHaveBeenCalled();
+      expectNothingMinted();
+    });
+
+    it('B-W04: an mcp_api live row filed by a DIFFERENT origin credential is an idempotency_conflict', async () => {
+      arrangeApproval();
+      dbState.selectActionIntentsResults.push([replayRow({
+        source: 'mcp_api', originPrincipalKind: 'api_key', originPrincipalId: 'key-B',
+      })]);
+      await expect(createActionIntent(
+        makeAuth({ principal: { kind: 'api_key', apiKeyId: 'key-A' } }),
+        protInput('m365_disable_user', { source: 'mcp_api' }),
+      )).rejects.toMatchObject({ name: 'ActionIntentError', code: 'idempotency_conflict' });
+      expectNothingMinted();
+    });
+  });
+
+  it('non-protected tools never resolve a caller target or call the gate, and pin nothing', async () => {
+    guardrailMock.checkGuardrails.mockReturnValue({
+      tier: 3, allowed: true, requiresApproval: true, description: 'Run a script.', approvalScope: 'four_eyes',
+    });
+    intentApproversState.resolveIntentApprovers.mockResolvedValueOnce([APPROVER_1]);
+    dbState.insertActionIntentsResults.push(echoInsertedIntent());
+    dbState.insertApprovalRequestsResults.push([{ id: 'approval-1' }]);
+    await createActionIntent(makeAuth(), baseInput());
+    expect(callerState.resolveM365CallerTarget).not.toHaveBeenCalled();
+    expect(callerState.requireCallerVerification).not.toHaveBeenCalled();
+    expect(dbState.insertedActionIntentValues[0]).toMatchObject({
+      targetEntraTenantId: null, targetEntraOid: null, targetConnectionRef: null,
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B-W04 (#6158, D-B27/D-B28): MCP-origin intents
+// ---------------------------------------------------------------------------
+describe('createActionIntent — mcp_api origin (B-W04)', () => {
+  const KEY_A = { kind: 'api_key', apiKeyId: 'key-A' };
+  const mcpInput = (over: Partial<CreateActionIntentInput> = {}) => baseInput({
+    source: 'mcp_api', idempotencyKey: 'mcp:v1:abc', ...over,
+  });
+  const fourEyes = () => guardrailMock.checkGuardrails.mockReturnValue({
+    tier: 3, allowed: true, requiresApproval: true, description: 'Run a script', approvalScope: 'four_eyes',
+  });
+  const supervised = () => guardrailMock.checkGuardrails.mockReturnValue({
+    tier: 3, allowed: true, requiresApproval: true, description: 'Run a script', approvalScope: 'supervised',
+  });
+  const liveMcpRow = (over: Record<string, unknown> = {}) => makeIntentRow({
+    id: 'intent-live-mcp', source: 'mcp_api', originPrincipalKind: 'api_key', originPrincipalId: 'key-A',
+    idempotencyKey: 'mcp:v1:abc', ...over,
+  });
+
+  it('mcp_api replay with a different origin principal → idempotency_conflict', async () => {
+    fourEyes();
+    intentApproversState.resolveIntentApprovers.mockResolvedValueOnce([APPROVER_1]);
+    dbState.insertActionIntentsResults.push([]);
+    dbState.selectActionIntentsResults.push([liveMcpRow({ originPrincipalId: 'key-B' })]);
+    await expect(createActionIntent(makeAuth({ principal: KEY_A }), mcpInput()))
+      .rejects.toMatchObject({ code: 'idempotency_conflict' });
+  });
+
+  it('mcp_api replay with a different requester → idempotency_conflict', async () => {
+    fourEyes();
+    intentApproversState.resolveIntentApprovers.mockResolvedValueOnce([APPROVER_1]);
+    dbState.insertActionIntentsResults.push([]);
+    dbState.selectActionIntentsResults.push([liveMcpRow({ requestedByUserId: APPROVER_2 })]);
+    await expect(createActionIntent(makeAuth({ principal: KEY_A }), mcpInput()))
+      .rejects.toMatchObject({ code: 'idempotency_conflict' });
+  });
+
+  it('mcp_api replay with the same origin returns the live intent and does not re-notify', async () => {
+    fourEyes();
+    intentApproversState.resolveIntentApprovers.mockResolvedValueOnce([APPROVER_1]);
+    dbState.insertActionIntentsResults.push([]);
+    dbState.selectActionIntentsResults.push([liveMcpRow()]);
+    dbState.selectApprovalRequestsResults.push([{ id: 'approval-existing', userId: APPROVER_1 }]);
+    const snap = await createActionIntent(makeAuth({ principal: KEY_A }), mcpInput());
+    expect(snap.id).toBe('intent-live-mcp');
+    expect(notifyState.createNotification).not.toHaveBeenCalled();
+    expect(pushState.getUserPushTokens).not.toHaveBeenCalled();
+  });
+
+  it('correlationId is stored for an mcp_api intent and ignored for chat', async () => {
+    const CORR = '6f2b7c1e-1d2a-4c3b-9e8f-0a1b2c3d4e5f';
+    fourEyes();
+    intentApproversState.resolveIntentApprovers.mockResolvedValue([APPROVER_1]);
+    dbState.insertActionIntentsResults.push(echoInsertedIntent({ id: 'i-mcp' }));
+    dbState.insertApprovalRequestsResults.push([{ id: 'a-mcp' }]);
+    await createActionIntent(makeAuth({ principal: KEY_A }), mcpInput({ correlationId: CORR }));
+    dbState.insertActionIntentsResults.push(echoInsertedIntent({ id: 'i-chat' }));
+    dbState.insertApprovalRequestsResults.push([{ id: 'a-chat' }]);
+    await createActionIntent(makeAuth(), baseInput({ idempotencyKey: 'chat-key', correlationId: CORR }));
+    const [mcp, chat] = dbState.insertedActionIntentValues;
+    expect(mcp!.correlationId).toBe(CORR);
+    expect(chat!.correlationId).not.toBe(CORR);
+    expect(mcp!.originPrincipalKind).toBe('api_key');
+    expect(mcp!.originPrincipalId).toBe('key-A');
+  });
+
+  // #9758: an OAuth-originated MCP intent records the auth_epoch its filing
+  // call was verified at, so release can refuse after a password change.
+  it('stores originAuthEpoch on an oauth_grant mcp_api intent', async () => {
+    fourEyes();
+    intentApproversState.resolveIntentApprovers.mockResolvedValue([APPROVER_1]);
+    dbState.insertActionIntentsResults.push(echoInsertedIntent({ id: 'i-oauth' }));
+    dbState.insertApprovalRequestsResults.push([{ id: 'a-oauth' }]);
+    await createActionIntent(
+      makeAuth({ principal: { kind: 'oauth_grant', grantId: 'grant-1' } }),
+      mcpInput({ originAuthEpoch: 5 }),
+    );
+    const [row] = dbState.insertedActionIntentValues;
+    expect(row!.originPrincipalKind).toBe('oauth_grant');
+    expect(row!.originAuthEpoch).toBe(5);
+  });
+
+  it.each([
+    ['missing', undefined],
+    ['not an integer', 1.5],
+  ])('refuses an oauth_grant mcp_api intent whose auth epoch is %s, before insert', async (_label, epoch) => {
+    fourEyes();
+    intentApproversState.resolveIntentApprovers.mockResolvedValue([APPROVER_1]);
+    await expect(createActionIntent(
+      makeAuth({ principal: { kind: 'oauth_grant', grantId: 'grant-1' } }),
+      mcpInput({ originAuthEpoch: epoch }),
+    )).rejects.toMatchObject({ code: 'principal_not_supported' });
+    expect(dbState.insertedActionIntentValues).toHaveLength(0);
+  });
+
+  it('never stores originAuthEpoch on an api_key mcp_api intent or a chat intent', async () => {
+    fourEyes();
+    intentApproversState.resolveIntentApprovers.mockResolvedValue([APPROVER_1]);
+    dbState.insertActionIntentsResults.push(echoInsertedIntent({ id: 'i-key' }));
+    dbState.insertApprovalRequestsResults.push([{ id: 'a-key' }]);
+    await createActionIntent(makeAuth({ principal: KEY_A }), mcpInput({ originAuthEpoch: 5 }));
+    dbState.insertActionIntentsResults.push(echoInsertedIntent({ id: 'i-chat-epoch' }));
+    dbState.insertApprovalRequestsResults.push([{ id: 'a-chat-epoch' }]);
+    await createActionIntent(makeAuth(), baseInput({ idempotencyKey: 'chat-epoch', originAuthEpoch: 5 }));
+    const [key, chat] = dbState.insertedActionIntentValues;
+    expect(key!.originAuthEpoch).toBeNull();
+    expect(chat!.originAuthEpoch).toBeNull();
+  });
+
+  it('supervised mcp_api intent notifies its requester (headless: nobody watches a chat pane)', async () => {
+    supervised();
+    intentApproversState.resolveIntentApprovers.mockResolvedValueOnce([]);
+    dbState.insertActionIntentsResults.push(echoInsertedIntent({ id: 'i-sup' }));
+    dbState.insertApprovalRequestsResults.push([{ id: 'a-sup' }]);
+    await createActionIntent(makeAuth({ principal: KEY_A }), mcpInput());
+    expect(notifyState.createNotification).toHaveBeenCalled();
+  });
+
+  it('supervised chat intent still does not notify; a user-session mcp_api intent keeps that rule too', async () => {
+    supervised();
+    intentApproversState.resolveIntentApprovers.mockResolvedValue([]);
+    dbState.insertActionIntentsResults.push(echoInsertedIntent({ id: 'i-chat-sup' }));
+    dbState.insertApprovalRequestsResults.push([{ id: 'a-chat-sup' }]);
+    await createActionIntent(makeAuth(), baseInput({ idempotencyKey: 'k-chat-sup' }));
+    dbState.insertActionIntentsResults.push(echoInsertedIntent({ id: 'i-op-sup' }));
+    dbState.insertApprovalRequestsResults.push([{ id: 'a-op-sup' }]);
+    await createActionIntent(makeAuth(), baseInput({ idempotencyKey: 'k-op-sup', source: 'mcp_api' }));
+    expect(notifyState.createNotification).not.toHaveBeenCalled();
+  });
+
+  it('four_eyes mcp_api intent notifies its approvers (regression)', async () => {
+    fourEyes();
+    intentApproversState.resolveIntentApprovers.mockResolvedValueOnce([APPROVER_1]);
+    dbState.insertActionIntentsResults.push(echoInsertedIntent({ id: 'i-4e' }));
+    dbState.insertApprovalRequestsResults.push([{ id: 'a-4e' }]);
+    await createActionIntent(makeAuth({ principal: KEY_A }), mcpInput());
+    expect(notifyState.createNotification).toHaveBeenCalled();
+  });
+
+  it('beforeInsert (churn charge) runs when a new row is about to be inserted', async () => {
+    fourEyes();
+    intentApproversState.resolveIntentApprovers.mockResolvedValueOnce([APPROVER_1]);
+    dbState.selectActionIntentsResults.push([]); // pre-insert live lookup: none
+    dbState.insertActionIntentsResults.push(echoInsertedIntent({ id: 'i-charge' }));
+    dbState.insertApprovalRequestsResults.push([{ id: 'a-charge' }]);
+    const beforeInsert = vi.fn(async () => undefined);
+    await createActionIntent(makeAuth({ principal: KEY_A }), mcpInput({ beforeInsert }));
+    expect(beforeInsert).toHaveBeenCalledTimes(1);
+  });
+
+  it('beforeInsert is NOT charged for a replay of a live intent', async () => {
+    fourEyes();
+    intentApproversState.resolveIntentApprovers.mockResolvedValueOnce([APPROVER_1]);
+    dbState.selectActionIntentsResults.push([liveMcpRow()]); // pre-insert live lookup: hit
+    dbState.insertActionIntentsResults.push([]);
+    dbState.selectActionIntentsResults.push([liveMcpRow()]);
+    dbState.selectApprovalRequestsResults.push([{ id: 'approval-existing', userId: APPROVER_1 }]);
+    const beforeInsert = vi.fn(async () => undefined);
+    const snap = await createActionIntent(makeAuth({ principal: KEY_A }), mcpInput({ beforeInsert }));
+    expect(snap.id).toBe('intent-live-mcp');
+    expect(beforeInsert).not.toHaveBeenCalled();
+  });
+
+  it('at the live cap the churn budget is not charged (advisory pre-check)', async () => {
+    fourEyes();
+    intentApproversState.resolveIntentApprovers.mockResolvedValueOnce([APPROVER_1]);
+    dbState.selectActionIntentsResults.push([]); // no live replay
+    dbState.selectActionIntentsResults.push([{ n: 2 }]); // live count for this origin
+    const beforeInsert = vi.fn(async () => undefined);
+    await expect(createActionIntent(makeAuth({ principal: KEY_A }), mcpInput({ beforeInsert, maxLiveForOrigin: 2 })))
+      .rejects.toMatchObject({ code: 'too_many_pending_actions' });
+    expect(beforeInsert).not.toHaveBeenCalled();
+  });
+
+  it('a beforeInsert refusal propagates and nothing is inserted', async () => {
+    fourEyes();
+    intentApproversState.resolveIntentApprovers.mockResolvedValueOnce([APPROVER_1]);
+    dbState.selectActionIntentsResults.push([]);
+    const beforeInsert = vi.fn(async () => { throw new ActionIntentError('slow down', 'rate_limited'); });
+    await expect(createActionIntent(makeAuth({ principal: KEY_A }), mcpInput({ beforeInsert })))
+      .rejects.toMatchObject({ code: 'rate_limited' });
+    expect(dbState.insertedActionIntentValues).toHaveLength(0);
   });
 });

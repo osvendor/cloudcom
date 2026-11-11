@@ -49,7 +49,7 @@ const validEnv = {
   // never guesses its compatibility posture. Tests that assert the
   // missing/invalid throw override this.
   EVENT_PERMISSION_EPOCH_MODE: 'compat',
-  // Production-required (SEC-065): integration provider credentials are sealed
+  // Production-required: integration provider credentials are sealed
   // with AAD-bound enc:v3 ciphertext and fail closed without an active key id.
   // Supplied here so the suite's production happy-path tests don't trip it; the
   // test that asserts the throw overrides it explicitly.
@@ -70,6 +70,81 @@ describe('validateConfig', () => {
       expect(config.NODE_ENV).toBe('development');
       expect(config.API_PORT).toBe(3001);
       expect(config.REDIS_URL).toBe('redis://localhost:6379');
+    });
+  });
+
+  describe('BREEZE_AI_ARTIFACT_CAPTURE_ENABLED (#6732)', () => {
+    const blob = { ARTIFACT_S3_ACCESS_KEY: 'k', ARTIFACT_S3_SECRET_KEY: 's', S3_BUCKET: 'b' };
+    it('is off/valid when unset', () => {
+      withEnv(validEnv, () => { expect(() => validateConfig()).not.toThrow(); });
+    });
+    it('rejects a non-boolean value', () => {
+      withEnv({ ...validEnv, BREEZE_AI_ARTIFACT_CAPTURE_ENABLED: 'maybe' }, () => {
+        expect(() => validateConfig()).toThrow(/BREEZE_AI_ARTIFACT_CAPTURE_ENABLED must be a boolean/);
+      });
+    });
+    it('refuses true with no blob store configured (self-hosted included)', () => {
+      withEnv({ ...validEnv, IS_HOSTED: 'false', BREEZE_AI_ARTIFACT_CAPTURE_ENABLED: 'true' }, () => {
+        expect(() => validateConfig()).toThrow(/requires an artifact blob store/);
+      });
+    });
+    it('still refuses self-hosted when both flags are true and no blob store (workspace flag is inert there)', () => {
+      withEnv({ ...validEnv, IS_HOSTED: 'false', BREEZE_AI_WORKSPACE_ENABLED: 'true', BREEZE_AI_ARTIFACT_CAPTURE_ENABLED: 'true' }, () => {
+        expect(() => validateConfig()).toThrow(/artifact blob store/);
+      });
+    });
+    it('accepts true with a blob store configured', () => {
+      withEnv({ ...validEnv, IS_HOSTED: 'false', BREEZE_AI_ARTIFACT_CAPTURE_ENABLED: 'true', ...blob }, () => {
+        expect(() => validateConfig()).not.toThrow();
+      });
+    });
+  });
+
+  describe('APPROVER_ASSURANCE_DEFAULT_ENFORCE_FROM', () => {
+    it('is valid when unset or blank', () => {
+      withEnv(validEnv, () => { expect(() => validateConfig()).not.toThrow(); });
+      withEnv({ ...validEnv, APPROVER_ASSURANCE_DEFAULT_ENFORCE_FROM: '' }, () => {
+        expect(() => validateConfig()).not.toThrow();
+      });
+    });
+    it('accepts an ISO date or timestamp', () => {
+      withEnv({ ...validEnv, APPROVER_ASSURANCE_DEFAULT_ENFORCE_FROM: '2027-01-15' }, () => {
+        expect(() => validateConfig()).not.toThrow();
+      });
+      withEnv({ ...validEnv, APPROVER_ASSURANCE_DEFAULT_ENFORCE_FROM: '2027-01-15T09:00:00Z' }, () => {
+        expect(() => validateConfig()).not.toThrow();
+      });
+    });
+    it('refuses to boot on an unparseable value', () => {
+      withEnv({ ...validEnv, APPROVER_ASSURANCE_DEFAULT_ENFORCE_FROM: 'next tuesday' }, () => {
+        expect(() => validateConfig()).toThrow(/APPROVER_ASSURANCE_DEFAULT_ENFORCE_FROM/);
+      });
+    });
+  });
+
+  describe('AGENT_ENROLL_RATE_WINDOW_SECONDS upper bound (#9457)', () => {
+    // The window is the /enroll 429 Retry-After; W09 agents cap at 300 s after x1.3 jitter.
+    it('accepts 230 and refuses 231', () => {
+      withEnv({ ...validEnv, AGENT_ENROLL_RATE_WINDOW_SECONDS: '230' }, () => { expect(() => validateConfig()).not.toThrow(); });
+      withEnv({ ...validEnv, AGENT_ENROLL_RATE_WINDOW_SECONDS: '231' }, () => {
+        expect(() => validateConfig()).toThrow(/AGENT_ENROLL_RATE_WINDOW_SECONDS/);
+      });
+    });
+  });
+
+  describe.each(['AGENT_ENROLL_RATE_LIMIT', 'AGENT_ENROLL_RATE_WINDOW_SECONDS'])('%s (#7472)', (name) => {
+    it('is valid when unset, blank, or a positive integer', () => {
+      withEnv(validEnv, () => { expect(() => validateConfig()).not.toThrow(); });
+      withEnv({ ...validEnv, [name]: '' }, () => { expect(() => validateConfig()).not.toThrow(); });
+      withEnv({ ...validEnv, [name]: '120' }, () => { expect(() => validateConfig()).not.toThrow(); });
+    });
+    it('accepts surrounding whitespace', () => {
+      withEnv({ ...validEnv, [name]: ' 10 ' }, () => { expect(() => validateConfig()).not.toThrow(); });
+    });
+    it.each(['0', '-1', 'ten', '1.5', '+5', '007', '99999999999999999999'])('refuses to boot on %s', (bad) => {
+      withEnv({ ...validEnv, [name]: bad }, () => {
+        expect(() => validateConfig()).toThrow(new RegExp(name));
+      });
     });
   });
 
@@ -271,6 +346,28 @@ describe('validateConfig', () => {
         M365_CUSTOMER_GRAPH_READ_CLIENT_ID: 'not-a-uuid',
         M365_GRAPH_READ_EXECUTOR_SIGNING_PRIVATE_JWK_FILE: '/missing/signing.jwk',
       }, () => {
+        expect(() => validateConfig()).not.toThrow();
+      });
+    });
+  });
+
+  describe('Portal Entra app (portal registration W4)', () => {
+    const portalEntra = {
+      PORTAL_ENTRA_CLIENT_ID: '44444444-4444-4444-8444-444444444444',
+      PORTAL_ENTRA_CLIENT_SECRET: 'portal-entra-secret',
+    };
+
+    it('refuses boot when the app is configured with a malformed callback base', () => {
+      withEnv({ ...validEnv, ...portalEntra, PORTAL_ENTRA_CALLBACK_BASE_URL: 'https://portal.example.test/sub/path' }, () => {
+        expect(() => validateConfig()).toThrow(/PORTAL_ENTRA_CALLBACK_BASE_URL/);
+      });
+    });
+
+    it('boots with a valid base, and ignores the base entirely when the app is not configured', () => {
+      withEnv({ ...validEnv, ...portalEntra, PORTAL_ENTRA_CALLBACK_BASE_URL: 'https://portal.example.test' }, () => {
+        expect(() => validateConfig()).not.toThrow();
+      });
+      withEnv({ ...validEnv, PORTAL_ENTRA_CLIENT_ID: '', PORTAL_ENTRA_CALLBACK_BASE_URL: 'not a url' }, () => {
         expect(() => validateConfig()).not.toThrow();
       });
     });
@@ -1241,6 +1338,93 @@ describe('validateConfig', () => {
     warnSpy.mockRestore();
   });
 
+  it('warns at boot, naming the variable, when INSTALLER_BOOTSTRAP_TOKEN_TTL_MINUTES exceeds 30 days', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    withEnv({
+      ...validEnv,
+      INSTALLER_BOOTSTRAP_TOKEN_TTL_MINUTES: '129600',
+    }, () => {
+      validateConfig();
+      const ttlWarnings = warnSpy.mock.calls
+        .map((args) => String(args[0]))
+        .filter((line) => line.includes('INSTALLER_BOOTSTRAP_TOKEN_TTL_MINUTES'));
+      expect(ttlWarnings).toHaveLength(1);
+      expect(ttlWarnings[0]).toContain('43200');
+    });
+    warnSpy.mockRestore();
+  });
+
+  it.each(['43200', '10080', '', 'forever'])(
+    'does not warn about INSTALLER_BOOTSTRAP_TOKEN_TTL_MINUTES=%j',
+    (value) => {
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      withEnv({
+        ...validEnv,
+        INSTALLER_BOOTSTRAP_TOKEN_TTL_MINUTES: value,
+      }, () => {
+        validateConfig();
+        expect(
+          warnSpy.mock.calls.some((args) => String(args[0]).includes('INSTALLER_BOOTSTRAP_TOKEN_TTL_MINUTES')),
+        ).toBe(false);
+      });
+      warnSpy.mockRestore();
+    },
+  );
+
+  // #8313 W1 review finding 6.
+  it.each(['2e9', '2GiB', '2_147_483_648', '12abc', '0'])(
+    'warns at boot, naming the variable, when TICKET_IMPORT_MAX_BYTES_PER_HOUR=%j is not a plain positive integer',
+    (value) => {
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      withEnv({ ...validEnv, TICKET_IMPORT_MAX_BYTES_PER_HOUR: value }, () => {
+        validateConfig();
+        const lines = warnSpy.mock.calls.map((args) => String(args[0])).filter((line) => line.includes('TICKET_IMPORT_MAX_BYTES_PER_HOUR'));
+        expect(lines).toHaveLength(1);
+        expect(lines[0]).toContain('2147483648');
+      });
+      warnSpy.mockRestore();
+    },
+  );
+
+  it.each(['2147483648', '52428800', ''])('does not warn about TICKET_IMPORT_MAX_BYTES_PER_HOUR=%j', (value) => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    withEnv({ ...validEnv, TICKET_IMPORT_MAX_BYTES_PER_HOUR: value }, () => {
+      validateConfig();
+      expect(warnSpy.mock.calls.some((args) => String(args[0]).includes('TICKET_IMPORT_MAX_BYTES_PER_HOUR'))).toBe(false);
+    });
+    warnSpy.mockRestore();
+  });
+
+  // #8313 W4: the ticket import worker's knobs.
+  it.each([
+    ['TICKET_IMPORT_SLICE_MS', '5min'],
+    ['TICKET_IMPORT_LEASE_MS', '-1'],
+    ['TICKET_IMPORT_MAX_TICKET_BYTES', '256MiB'],
+  ])('warns at boot when %s=%j is not a plain positive integer', (key, value) => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    withEnv({ ...validEnv, [key]: value }, () => {
+      validateConfig();
+      expect(warnSpy.mock.calls.filter((args) => String(args[0]).includes(key))).toHaveLength(1);
+    });
+    warnSpy.mockRestore();
+  });
+
+  it('warns when the import lease cap is not below the worker concurrency, and not otherwise', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    withEnv({ ...validEnv, TICKET_IMPORT_WORKER_CONCURRENCY: '3', TICKET_IMPORT_GLOBAL_CONCURRENCY: '3' }, () => {
+      validateConfig();
+      const lines = warnSpy.mock.calls.map((args) => String(args[0])).filter((line) => line.includes('TICKET_IMPORT_GLOBAL_CONCURRENCY'));
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toContain('2 applies');
+    });
+    warnSpy.mockClear();
+    withEnv({ ...validEnv, TICKET_IMPORT_WORKER_CONCURRENCY: '4', TICKET_IMPORT_GLOBAL_CONCURRENCY: '3' }, () => {
+      validateConfig();
+      expect(warnSpy.mock.calls.some((args) => String(args[0]).includes('TICKET_IMPORT_'))).toBe(false);
+    });
+    warnSpy.mockRestore();
+  });
+
   it('rejects short AGENT_ENROLLMENT_SECRET in production when configured', () => {
     withEnv({
       ...validEnv,
@@ -1421,13 +1605,56 @@ describe('validateConfig', () => {
     });
   });
 
+  // W06 (#7604, D6): the env path bootstraps per-partner rows for EVERY
+  // partner, so it is self-host only — affirmatively declared, fail closed.
   const openAiCompatibleEnv = {
     ...validEnv,
+    IS_HOSTED: 'false',
     MCP_LLM_PROVIDER: 'openai-compatible',
-    MCP_LLM_BASE_URL: 'http://localhost:8000/v1',
+    MCP_LLM_BASE_URL: 'http://10.0.0.5:8000/v1',
     MCP_LLM_MODEL: 'test-model',
-    MCP_LLM_API_KEY: 'sk-test',
+    MCP_LLM_API_KEY: 'sk-test-key',
   };
+
+  it('refuses MCP_LLM_PROVIDER=openai-compatible on hosted, pointing at the per-partner connection', () => {
+    withEnv({ ...openAiCompatibleEnv, IS_HOSTED: 'true' }, () => {
+      expect(() => validateConfig()).toThrow(/MCP_LLM_PROVIDER=openai-compatible is for self-hosted Breeze/);
+      expect(() => validateConfig()).toThrow(/Partner Settings → AI Providers & Models/);
+    });
+  });
+
+  it('refuses MCP_LLM_PROVIDER=openai-compatible when IS_HOSTED is unset or unrecognised (fail closed)', () => {
+    for (const IS_HOSTED of ['', 'maybe']) {
+      withEnv({ ...openAiCompatibleEnv, IS_HOSTED }, () => {
+        expect(() => validateConfig()).toThrow(/MCP_LLM_PROVIDER=openai-compatible is for self-hosted Breeze/);
+      });
+    }
+  });
+
+  it('accepts a keyless openai-compatible endpoint (local model server)', () => {
+    const { MCP_LLM_API_KEY: _, ...rest } = openAiCompatibleEnv;
+    withEnv(rest as Record<string, string>, () => {
+      const config = validateConfig();
+      expect(config.MCP_LLM_PROVIDER).toBe('openai-compatible');
+    });
+    withEnv({ ...openAiCompatibleEnv, MCP_LLM_API_KEY: '' }, () => {
+      expect(validateConfig().MCP_LLM_PROVIDER).toBe('openai-compatible');
+    });
+  });
+
+  it('refuses an MCP_LLM_API_KEY shorter than 8 characters without echoing it', () => {
+    withEnv({ ...openAiCompatibleEnv, MCP_LLM_API_KEY: 'sk-Q7z' }, () => {
+      let message = '';
+      try {
+        validateConfig();
+      } catch (err) {
+        message = (err as Error).message;
+      }
+      expect(message).toContain('MCP_LLM_API_KEY');
+      expect(message).toContain('at least 8 characters');
+      expect(message).not.toContain('sk-Q7z');
+    });
+  });
 
   it('requires MCP_LLM_MODEL when MCP_LLM_PROVIDER is openai-compatible', () => {
     const { MCP_LLM_MODEL: _, ...rest } = openAiCompatibleEnv;
@@ -1442,10 +1669,10 @@ describe('validateConfig', () => {
     });
   });
 
-  it('requires MCP_LLM_API_KEY when MCP_LLM_PROVIDER is openai-compatible', () => {
-    const { MCP_LLM_API_KEY: _, ...rest } = openAiCompatibleEnv;
+  it('requires MCP_LLM_BASE_URL when MCP_LLM_PROVIDER is openai-compatible', () => {
+    const { MCP_LLM_BASE_URL: _, ...rest } = openAiCompatibleEnv;
     withEnv(rest as Record<string, string>, () => {
-      expect(() => validateConfig()).toThrow('MCP_LLM_API_KEY');
+      expect(() => validateConfig()).toThrow('MCP_LLM_BASE_URL');
     });
   });
 
@@ -1454,7 +1681,7 @@ describe('validateConfig', () => {
       const config = validateConfig();
       expect(config.MCP_LLM_PROVIDER).toBe('openai-compatible');
       expect(config.MCP_LLM_MODEL).toBe('test-model');
-      expect(config.MCP_LLM_API_KEY).toBe('sk-test');
+      expect(config.MCP_LLM_API_KEY).toBe('sk-test-key');
     });
   });
 
@@ -1541,6 +1768,28 @@ describe('validateConfig', () => {
       withEnv({ ...validEnv, NODE_ENV: 'production', CORS_ALLOWED_ORIGINS: 'https://app.breeze.io', TRUST_PROXY_HEADERS: 'false' }, () => {
         const config = validateConfig();
         expect(config.AGENT_REQUIRE_MANIFEST_SIGNING_KEY_ID).toBe('false');
+      });
+    });
+  });
+
+  // ---- #8616 heartbeat retain-state kill switch. Default on; 'false' makes
+  // the heartbeat answer every agent with the legacy payload.
+  describe('HEARTBEAT_RETAIN_STATE_ENABLED', () => {
+    it('defaults to true when unset', () => {
+      withEnv(validEnv, () => {
+        expect(validateConfig().HEARTBEAT_RETAIN_STATE_ENABLED).toBe('true');
+      });
+    });
+
+    it('accepts an explicit false', () => {
+      withEnv({ ...validEnv, HEARTBEAT_RETAIN_STATE_ENABLED: 'false' }, () => {
+        expect(validateConfig().HEARTBEAT_RETAIN_STATE_ENABLED).toBe('false');
+      });
+    });
+
+    it('boot-refuses an invalid value instead of silently staying on', () => {
+      withEnv({ ...validEnv, HEARTBEAT_RETAIN_STATE_ENABLED: 'off' }, () => {
+        expect(() => validateConfig()).toThrow('HEARTBEAT_RETAIN_STATE_ENABLED');
       });
     });
   });
@@ -2458,6 +2707,43 @@ describe('validateConfig', () => {
   });
 
   // ---------------------------------------------------------------------------
+  // MCP_UNATTENDED_TIER3_PRINCIPALS boot visibility
+  // ---------------------------------------------------------------------------
+  describe('MCP_UNATTENDED_TIER3_PRINCIPALS boot warnings', () => {
+    const principalWarnings = (value: string | undefined): string[] => {
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      let calls: string[] = [];
+      withEnv({ ...validEnv, ...(value === undefined ? {} : { MCP_UNATTENDED_TIER3_PRINCIPALS: value }) }, () => {
+        expect(() => validateConfig()).not.toThrow();
+        calls = warnSpy.mock.calls
+          .map((args) => args[0] as string)
+          .filter((msg) => msg.includes('MCP_UNATTENDED_TIER3_PRINCIPALS'));
+      });
+      warnSpy.mockRestore();
+      return calls;
+    };
+
+    it('lists the configured principals at boot', () => {
+      const calls = principalWarnings('api_key:11111111-1111-4111-8111-111111111111, oauth_client_user:client-a/22222222-2222-4222-8222-222222222222');
+      expect(calls).toHaveLength(1);
+      expect(calls[0]).toMatch(/LIFTED for Tier 3 tools for 2 principal\(s\)/);
+      expect(calls[0]).toContain('api_key:11111111-1111-4111-8111-111111111111');
+      expect(calls[0]).toContain('oauth_client_user:client-a/22222222-2222-4222-8222-222222222222');
+    });
+
+    it('warns separately about entries that can never match', () => {
+      const good = 'api_key:33333333-3333-4333-8333-333333333333';
+      const calls = principalWarnings(`${good},api_key:ok-1,apikey:typo,oauth_client_user:client-only,oauth_client_user:client-a/not-a-uuid,client-b/user`);
+      expect(calls.join('\n')).toMatch(new RegExp(`1 principal\\(s\\): ${good}\\.`));
+      expect(calls.join('\n')).toMatch(/ignoring 5 malformed entries that can never match: api_key:ok-1, apikey:typo, oauth_client_user:client-only, oauth_client_user:client-a\/not-a-uuid, client-b\/user/);
+    });
+
+    it('stays silent when unset or empty', () => {
+      expect(principalWarnings(undefined)).toEqual([]);
+      expect(principalWarnings(' , ')).toEqual([]);
+    });
+  });
+
   // TURN over TLS pairing warnings (#6163)
   // ---------------------------------------------------------------------------
   describe('TURN TLS pairing warnings (#6163)', () => {
@@ -2864,6 +3150,66 @@ describe('validateConfig', () => {
     });
   });
 
+  // Wisp W02 (Wisp design §10): the deployment switch is hosted-only.
+  it('refuses BREEZE_WISP_ENABLED=true in production without IS_HOSTED=true', () => {
+    withEnv({ ...workspaceProdEnv, IS_HOSTED: 'false', BREEZE_WISP_ENABLED: 'true' }, () => {
+      expect(() => validateConfig()).toThrow(/BREEZE_WISP_ENABLED=true requires IS_HOSTED=true/);
+    });
+  });
+
+  it('accepts BREEZE_WISP_ENABLED=true in production when hosted', () => {
+    withEnv({ ...workspaceProdEnv, BREEZE_WISP_ENABLED: 'true' }, () => {
+      expect(() => validateConfig()).not.toThrow();
+    });
+  });
+
+  it('refuses BREEZE_WISP_ENABLED=true in production with ENABLE_2FA=false (grants need step-up proof)', () => {
+    withEnv({ ...workspaceProdEnv, BREEZE_WISP_ENABLED: 'true', ENABLE_2FA: 'false' }, () => {
+      expect(() => validateConfig()).toThrow(/BREEZE_WISP_ENABLED=true requires ENABLE_2FA/);
+    });
+  });
+
+  it('rejects a non-boolean BREEZE_WISP_ENABLED', () => {
+    withEnv({ ...validEnv, BREEZE_WISP_ENABLED: 'maybe' }, () => {
+      expect(() => validateConfig()).toThrow(/BREEZE_WISP_ENABLED must be a boolean/);
+    });
+  });
+
+  // Vendor updates (#11065): the lab override opens closed firmware gates, so it
+  // never reaches production. A typo in the kill switch would silently not stop a lane.
+  it('refuses BREEZE_OEM_UPDATES_LAB_DEVICE_IDS under NODE_ENV=production', () => {
+    withEnv({ ...workspaceProdEnv, BREEZE_OEM_UPDATES_LAB_DEVICE_IDS: '11111111-1111-4111-8111-111111111111' }, () => {
+      expect(() => validateConfig()).toThrow(/BREEZE_OEM_UPDATES_LAB_DEVICE_IDS must not be set in production/);
+    });
+  });
+
+  it('allows BREEZE_OEM_UPDATES_LAB_DEVICE_IDS outside production', () => {
+    withEnv({ ...validEnv, BREEZE_OEM_UPDATES_LAB_DEVICE_IDS: '11111111-1111-4111-8111-111111111111' }, () => {
+      expect(() => validateConfig()).not.toThrow();
+    });
+  });
+
+  it('rejects a non-boolean BREEZE_OEM_UPDATES_ENABLED', () => {
+    withEnv({ ...validEnv, BREEZE_OEM_UPDATES_ENABLED: 'maybe' }, () => {
+      expect(() => validateConfig()).toThrow(/BREEZE_OEM_UPDATES_ENABLED must be a boolean/);
+    });
+  });
+
+  it('rejects a partner allowlist that parses to nothing: empty means every partner', () => {
+    withEnv({ ...validEnv, BREEZE_OEM_UPDATES_PARTNER_ALLOWLIST: ' , ,' }, () => {
+      expect(() => validateConfig()).toThrow(/BREEZE_OEM_UPDATES_PARTNER_ALLOWLIST/);
+    });
+  });
+
+  it('rejects an unknown lane in BREEZE_OEM_UPDATES_DISABLED_LANES', () => {
+    withEnv({ ...validEnv, BREEZE_OEM_UPDATES_DISABLED_LANES: 'dell,dels' }, () => {
+      expect(() => validateConfig()).toThrow(/BREEZE_OEM_UPDATES_DISABLED_LANES.*dels/);
+    });
+    withEnv({ ...validEnv, BREEZE_OEM_UPDATES_DISABLED_LANES: 'dell, HP' }, () => {
+      expect(() => validateConfig()).not.toThrow();
+    });
+  });
+
   // computePriceMultiplier() falls back to 1 for anything unparseable, silently.
   // Without a boot-time refusal a typo runs at 1x forever and only ever surfaces
   // as a margin discrepancy nobody traces back to an env var.
@@ -2966,6 +3312,22 @@ describe('envSchema ↔ validateConfig parse-input contract (#2896)', () => {
   ])('validates %s (regression: silently dropped before #2896)', (key) => {
     expect(ENV_SCHEMA_KEYS).toContain(key);
     expect(buildEnvParseInput({ [key]: 'sentinel' })[key]).toBe('sentinel');
+  });
+});
+
+describe('Xero env (W02)', () => {
+  const KEYS = ['XERO_CLIENT_ID', 'XERO_CLIENT_SECRET', 'XERO_REDIRECT_URI', 'XERO_WEBHOOK_KEY', 'XERO_DAILY_CALL_LIMIT'] as const;
+  it.each(KEYS)('declares %s in the env schema', (key) => {
+    expect(ENV_SCHEMA_KEYS).toContain(key);
+    expect(buildEnvParseInput({ [key]: 'sentinel' })[key]).toBe('sentinel');
+  });
+  it('boots with every Xero var unset (all optional)', () => {
+    withEnv({ ...validEnv }, () => { expect(() => validateConfig()).not.toThrow(); });
+  });
+  it.each(['unlimited', '0', '-3', '12.5'])('refuses an invalid XERO_DAILY_CALL_LIMIT %s', (value) => {
+    withEnv({ ...validEnv, XERO_DAILY_CALL_LIMIT: value }, () => {
+      expect(() => validateConfig()).toThrow(/XERO_DAILY_CALL_LIMIT/);
+    });
   });
 });
 
@@ -3292,6 +3654,155 @@ describe('IP_ALLOWLIST_ENFORCEMENT_MODE (#2896)', () => {
   );
 });
 
+// B-W03 (#6157): the stateless MCP era kill switch. Read per request by
+// mcpStatelessEnabled() with the envFlag vocabulary; a typo must fail boot
+// rather than leave an operator believing they enabled (or disabled) it.
+// B-W03 (#6157): CIMD flag + host allowlist.
+describe('OAUTH_CIMD_* boot validation', () => {
+  it('declares both keys', () => {
+    expect(ENV_SCHEMA_KEYS).toContain('OAUTH_CIMD_ENABLED');
+    expect(ENV_SCHEMA_KEYS).toContain('OAUTH_CIMD_ALLOWED_HOSTS');
+  });
+  it('refuses boot on a non-boolean OAUTH_CIMD_ENABLED', () => {
+    withEnv({ ...validEnv, OAUTH_CIMD_ENABLED: 'yes please' }, () => {
+      expect(() => validateConfig()).toThrow(/OAUTH_CIMD_ENABLED/);
+    });
+  });
+  it('accepts example.com,.example.org', () => {
+    withEnv({ ...validEnv, OAUTH_CIMD_ALLOWED_HOSTS: 'example.com,.example.org' }, () => {
+      expect(validateConfig().OAUTH_CIMD_ALLOWED_HOSTS).toBe('example.com,.example.org');
+    });
+  });
+  it.each(['https://example.com', 'example.com/path', '*.example.com', 'example.com,,example.org'])(
+    'boot rejects a malformed OAUTH_CIMD_ALLOWED_HOSTS entry: %s',
+    (value) => {
+      withEnv({ ...validEnv, OAUTH_CIMD_ALLOWED_HOSTS: value }, () => {
+        expect(() => validateConfig()).toThrow(/OAUTH_CIMD_ALLOWED_HOSTS/);
+      });
+    },
+  );
+});
+
+describe('MCP_STATELESS_ENABLED boolean guard', () => {
+  it('is declared in the schema', () => {
+    expect(ENV_SCHEMA_KEYS).toContain('MCP_STATELESS_ENABLED');
+  });
+  it.each(['true', 'false', '1', '0', 'on', 'off'])('accepts %s', (value) => {
+    withEnv({ ...validEnv, MCP_STATELESS_ENABLED: value }, () => {
+      expect(validateConfig().MCP_STATELESS_ENABLED).toBe(value);
+    });
+  });
+  it('refuses boot on a typo', () => {
+    withEnv({ ...validEnv, MCP_STATELESS_ENABLED: 'ture' }, () => {
+      expect(() => validateConfig()).toThrow(/MCP_STATELESS_ENABLED/);
+    });
+  });
+});
+
+describe('MCP Apps env guard (B-W05 #6159)', () => {
+  it('declares MCP_APPS_ENABLED in the schema', () => {
+    expect(ENV_SCHEMA_KEYS).toContain('MCP_APPS_ENABLED');
+  });
+  it('refuses boot on a boolean typo', () => {
+    withEnv({ ...validEnv, MCP_APPS_ENABLED: 'ture' }, () => {
+      expect(() => validateConfig()).toThrow(/MCP_APPS_ENABLED/);
+    });
+  });
+  it.each(['true', 'false', '1', '0', 'on', 'off'])('accepts MCP_APPS_ENABLED=%s', (value) => {
+    withEnv({ ...validEnv, MCP_APPS_ENABLED: value }, () => {
+      expect(validateConfig().MCP_APPS_ENABLED).toBe(value);
+    });
+  });
+});
+
+describe('MCP Tasks env guards (B-W06 #6160, D-B55)', () => {
+  const intKnobs = ['MCP_TASK_PENDING_POLL_INTERVAL_MS', 'MCP_TASK_POLL_INTERVAL_MS', 'MCP_TASK_TTL_GRACE_MS'];
+  it('declares every key in the schema', () => {
+    for (const k of ['MCP_TASKS_ENABLED', ...intKnobs]) expect(ENV_SCHEMA_KEYS).toContain(k);
+  });
+  it('refuses boot on a boolean typo', () => {
+    withEnv({ ...validEnv, MCP_TASKS_ENABLED: 'ture' }, () => {
+      expect(() => validateConfig()).toThrow(/MCP_TASKS_ENABLED/);
+    });
+  });
+  it.each(['true', 'false', '1', '0', 'on', 'off'])('accepts MCP_TASKS_ENABLED=%s', (value) => {
+    withEnv({ ...validEnv, MCP_TASKS_ENABLED: value, MCP_STATELESS_ENABLED: 'true' }, () => {
+      expect(validateConfig().MCP_TASKS_ENABLED).toBe(value);
+    });
+  });
+  it.each(intKnobs)('%s accepts a positive integer', (knob) => {
+    withEnv({ ...validEnv, [knob]: '15000' }, () => {
+      expect(validateConfig()[knob as 'MCP_TASK_POLL_INTERVAL_MS']).toBe('15000');
+    });
+  });
+  it.each(intKnobs.flatMap((k) => ['abc', '1.5', '-3', '0'].map((v) => [k, v] as const)))(
+    '%s refuses boot on %s',
+    (knob, value) => {
+      withEnv({ ...validEnv, [knob]: value }, () => {
+        expect(() => validateConfig()).toThrow(new RegExp(knob));
+      });
+    },
+  );
+
+  const tasksWarnings = (env: Record<string, string>): string[] => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    let calls: string[] = [];
+    withEnv({ ...validEnv, ...env }, () => {
+      expect(() => validateConfig()).not.toThrow();
+      calls = warnSpy.mock.calls.map((args) => args[0] as string).filter((msg) => msg.includes('MCP_TASKS_ENABLED'));
+    });
+    warnSpy.mockRestore();
+    return calls;
+  };
+  it('warns at boot when MCP_TASKS_ENABLED is on without MCP_STATELESS_ENABLED', () => {
+    const calls = tasksWarnings({ MCP_TASKS_ENABLED: 'true' });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatch(/MCP_STATELESS_ENABLED/);
+    expect(tasksWarnings({ MCP_TASKS_ENABLED: 'on', MCP_STATELESS_ENABLED: 'false' })).toHaveLength(1);
+  });
+  it('no warning when both are on, or Tasks are off', () => {
+    expect(tasksWarnings({ MCP_TASKS_ENABLED: 'true', MCP_STATELESS_ENABLED: 'true' })).toHaveLength(0);
+    expect(tasksWarnings({ MCP_TASKS_ENABLED: 'false' })).toHaveLength(0);
+    expect(tasksWarnings({})).toHaveLength(0);
+  });
+});
+
+describe('MCP Tier-3 intent env guards (B-W04 #6158)', () => {
+  const intKnobs = [
+    'MCP_INTENT_MAX_LIVE_PER_PRINCIPAL',
+    'MCP_INTENT_CREATES_PER_HOUR',
+    'MCP_INTENT_CREATES_PER_USER_PER_HOUR',
+    'MCP_APPROVAL_WAIT_MS',
+    'MCP_APPROVAL_WAITS_PER_PRINCIPAL',
+  ];
+  it('declares every key in the schema', () => {
+    for (const k of ['MCP_TIER3_INTENTS_ENABLED', ...intKnobs]) expect(ENV_SCHEMA_KEYS).toContain(k);
+  });
+  it('refuses boot on a boolean typo', () => {
+    withEnv({ ...validEnv, MCP_TIER3_INTENTS_ENABLED: 'ture' }, () => {
+      expect(() => validateConfig()).toThrow(/MCP_TIER3_INTENTS_ENABLED/);
+    });
+  });
+  it.each(['true', 'false', '1', '0'])('accepts MCP_TIER3_INTENTS_ENABLED=%s', (value) => {
+    withEnv({ ...validEnv, MCP_TIER3_INTENTS_ENABLED: value }, () => {
+      expect(validateConfig().MCP_TIER3_INTENTS_ENABLED).toBe(value);
+    });
+  });
+  it.each(intKnobs)('%s accepts a positive integer', (knob) => {
+    withEnv({ ...validEnv, [knob]: '15' }, () => {
+      expect(validateConfig()[knob as 'MCP_APPROVAL_WAIT_MS']).toBe('15');
+    });
+  });
+  it.each(intKnobs.flatMap((k) => ['abc', '1.5', '-3', '0'].map((v) => [k, v] as const)))(
+    '%s refuses boot on %s',
+    (knob, value) => {
+      withEnv({ ...validEnv, [knob]: value }, () => {
+        expect(() => validateConfig()).toThrow(new RegExp(knob));
+      });
+    },
+  );
+});
+
 describe('AGENT_AUTO_PROMOTE boolean guard (dead code until #2896)', () => {
   it('accepts an explicit false', () => {
     withEnv({ ...validEnv, AGENT_AUTO_PROMOTE: 'false' }, () => {
@@ -3486,6 +3997,35 @@ describe('BREEZE_AUTHENTICATOR_ATTESTATION_ENFORCED boolean guard (#1374)', () =
   });
 });
 
+// REMOTE_DESKTOP_FENCE_REQUIRED is required by default; a recognized false value
+// is the explicit opt-out. The runtime reader keeps the start fence required for
+// an unrecognized value, so a typo must refuse boot rather than leave an
+// operator believing they opted out.
+describe('REMOTE_DESKTOP_FENCE_REQUIRED boolean guard', () => {
+  it('is declared in the schema, so the superRefine rule actually runs', () => {
+    expect(ENV_SCHEMA_KEYS).toContain('REMOTE_DESKTOP_FENCE_REQUIRED');
+    expect(
+      buildEnvParseInput({ REMOTE_DESKTOP_FENCE_REQUIRED: 'sentinel' })
+        .REMOTE_DESKTOP_FENCE_REQUIRED,
+    ).toBe('sentinel');
+  });
+
+  it.each(['true', 'false', '1', '0', 'yes', 'no', 'on', 'off', 'FALSE', ' off '])(
+    'accepts the recognized boolean %j',
+    (value) => {
+      withEnv({ ...validEnv, REMOTE_DESKTOP_FENCE_REQUIRED: value }, () => {
+        expect(() => validateConfig()).not.toThrow();
+      });
+    },
+  );
+
+  it.each(['flase', 'enabled', 'ture'])('refuses boot on the typo %j', (value) => {
+    withEnv({ ...validEnv, REMOTE_DESKTOP_FENCE_REQUIRED: value }, () => {
+      expect(() => validateConfig()).toThrow(/REMOTE_DESKTOP_FENCE_REQUIRED/);
+    });
+  });
+});
+
 describe('BREEZE_AI_AGENTS_POLICY_DECIDE_ENABLED boolean guard', () => {
   it('is declared in the schema, so the superRefine rule actually runs', () => {
     expect(ENV_SCHEMA_KEYS).toContain('BREEZE_AI_AGENTS_POLICY_DECIDE_ENABLED');
@@ -3571,6 +4111,72 @@ describe('TOOL_SOURCES_ENABLED boolean guard', () => {
       });
     },
   );
+});
+
+describe('FLOWS_ENABLED boolean guard', () => {
+  it('is declared in the schema, so the superRefine rule actually runs', () => {
+    expect(ENV_SCHEMA_KEYS).toContain('FLOWS_ENABLED');
+    expect(buildEnvParseInput({ FLOWS_ENABLED: 'sentinel' }).FLOWS_ENABLED).toBe('sentinel');
+  });
+
+  it.each(['true', 'false', '1', '0', 'yes', 'no', 'on', 'off', 'FALSE', ' off ', ''])(
+    'accepts %j',
+    (value) => {
+      withEnv({ ...validEnv, FLOWS_ENABLED: value }, () => {
+        expect(() => validateConfig()).not.toThrow();
+      });
+    },
+  );
+
+  it.each(['maybe', 'ture', 'enabled', 'y'])('refuses boot on the near-miss value %s', (value) => {
+    withEnv({ ...validEnv, FLOWS_ENABLED: value }, () => {
+      expect(() => validateConfig()).toThrow(/FLOWS_ENABLED must be a boolean/);
+    });
+  });
+});
+
+describe('FLOW_APPROVAL_TTL_HOURS range guard (#5219)', () => {
+  it('is declared in the schema, so the superRefine rule actually runs', () => {
+    expect(ENV_SCHEMA_KEYS).toContain('FLOW_APPROVAL_TTL_HOURS');
+    expect(buildEnvParseInput({ FLOW_APPROVAL_TTL_HOURS: 'sentinel' }).FLOW_APPROVAL_TTL_HOURS).toBe('sentinel');
+  });
+
+  it.each(['1', '24', '168', ' 72 ', ''])('accepts %j', (value) => {
+    withEnv({ ...validEnv, FLOW_APPROVAL_TTL_HOURS: value }, () => {
+      expect(() => validateConfig()).not.toThrow();
+    });
+  });
+
+  it.each(['0', '169', '-1', '2.5', 'day'])('refuses boot on %j', (value) => {
+    withEnv({ ...validEnv, FLOW_APPROVAL_TTL_HOURS: value }, () => {
+      expect(() => validateConfig()).toThrow(/FLOW_APPROVAL_TTL_HOURS must be an integer between 1 and 168/);
+    });
+  });
+});
+
+describe.each([
+  ['FLOW_MAX_RUNNING_PER_OWNER', 1, 500, ['1', '20', '500', ' 64 ', ''], ['0', '501', '-1', '2.5', 'lots']],
+  ['FLOW_RUN_RETENTION_DAYS', 7, 3650, ['7', '90', '3650', ' 30 ', ''], ['6', '0', '3651', '-1', '1.5', 'forever']],
+  ['FLOW_WEBHOOK_RATE_PER_MINUTE', 1, 6000, ['1', '120', '6000', ' 60 ', ''], ['0', '6001', '-1', '2.5', 'fast']],
+  ['FLOW_WEBHOOK_DELIVERY_RETENTION_DAYS', 1, 365, ['1', '30', '365', ' 7 ', ''], ['0', '366', '-1', '1.5', 'forever']],
+  ['FLOW_FOREACH_MAX_PARALLEL', 1, 10, ['1', '5', '10', ' 3 ', ''], ['0', '11', '-1', '2.5', 'many']],
+] as const)('%s range guard (#5219 A8)', (key, min, max, accepted, refused) => {
+  it('is declared in the schema, so the superRefine rule actually runs', () => {
+    expect(ENV_SCHEMA_KEYS).toContain(key);
+    expect(buildEnvParseInput({ [key]: 'sentinel' })[key]).toBe('sentinel');
+  });
+
+  it.each(accepted)('accepts %j', (value) => {
+    withEnv({ ...validEnv, [key]: value }, () => {
+      expect(() => validateConfig()).not.toThrow();
+    });
+  });
+
+  it.each(refused)('refuses boot on %j', (value) => {
+    withEnv({ ...validEnv, [key]: value }, () => {
+      expect(() => validateConfig()).toThrow(new RegExp(`${key} must be an integer between ${min} and ${max}`));
+    });
+  });
 });
 
 describe('TOOL_SOURCES_ALLOW_PRIVATE_EGRESS boolean guard + hosted refusal', () => {
@@ -3721,5 +4327,83 @@ describe('execution-plane env (W01): BREEZE_REGION / BREEZE_AI_WORKSPACE_ENABLED
         });
       },
     );
+  });
+
+  it('refuses boot when TUNNEL_ORIGIN_TEMPLATE shares the app registrable domain', () => {
+    withEnv({ ...validEnv, PUBLIC_APP_URL: 'https://us.breeze-app.test', TUNNEL_ORIGIN_TEMPLATE: 'https://{id}.tunnel.breeze-app.test' }, () => {
+      expect(() => validateConfig()).toThrow(/TUNNEL_ORIGIN_TEMPLATE/);
+    });
+  });
+
+  it('boots with a tunnel template on a separate registrable domain', () => {
+    withEnv({
+      ...validEnv, PUBLIC_APP_URL: 'https://us.breeze-app.test',
+      TUNNEL_ORIGIN_TEMPLATE: 'https://{id}.us.breezetunnel.test', TUNNEL_FRAME_ANCESTOR: 'https://us.breeze-app.test',
+    }, () => {
+      expect(() => validateConfig()).not.toThrow();
+    });
+  });
+});
+
+// #7640: compose maps these as `${VAR:-}`, so the key is always injected, as ''
+// when the operator left it unset. '' must behave exactly like "not set".
+describe('empty-string compose passthrough (#7640)', () => {
+  it('treats empty PARTNER_HOOKS_URL, MCP_LLM_PROVIDER and MCP_LLM_BASE_URL as unset', () => {
+    withEnv({ ...validEnv, PARTNER_HOOKS_URL: '', MCP_LLM_PROVIDER: '', MCP_LLM_BASE_URL: '' }, () => {
+      const config = validateConfig();
+      expect(config.PARTNER_HOOKS_URL).toBeUndefined();
+      expect(config.MCP_LLM_PROVIDER).toBe('anthropic');
+      expect(config.MCP_LLM_BASE_URL).toBeUndefined();
+    });
+  });
+
+  it('still refuses a malformed PARTNER_HOOKS_URL / MCP_LLM_BASE_URL / MCP_LLM_PROVIDER', () => {
+    withEnv({ ...validEnv, PARTNER_HOOKS_URL: 'not-a-url' }, () => {
+      expect(() => validateConfig()).toThrow(/PARTNER_HOOKS_URL/);
+    });
+    withEnv({ ...validEnv, MCP_LLM_BASE_URL: 'not-a-url' }, () => {
+      expect(() => validateConfig()).toThrow(/MCP_LLM_BASE_URL/);
+    });
+    withEnv({ ...validEnv, MCP_LLM_PROVIDER: 'bogus' }, () => {
+      expect(() => validateConfig()).toThrow(/MCP_LLM_PROVIDER/);
+    });
+  });
+
+  it('still requires MCP_LLM_BASE_URL when provider is openai-compatible and the base URL is empty', () => {
+    withEnv({ ...validEnv, IS_HOSTED: 'false', MCP_LLM_PROVIDER: 'openai-compatible', MCP_LLM_BASE_URL: '', MCP_LLM_MODEL: 'm' }, () => {
+      expect(() => validateConfig()).toThrow(/MCP_LLM_BASE_URL is required/);
+    });
+  });
+});
+
+// #9700: INTERNAL_SERVICE_CIDRS exempts the in-cluster plain-HTTP hop from
+// FORCE_HTTPS. It must name a private network — a public or all-addresses range
+// would let internet clients claim the internal exemption.
+describe('INTERNAL_SERVICE_CIDRS validation (#9700)', () => {
+  it('accepts the compose bridge subnet', () => {
+    withEnv({ ...validEnv, INTERNAL_SERVICE_CIDRS: '172.31.0.0/24' }, () => {
+      expect(() => validateConfig()).not.toThrow();
+    });
+  });
+
+  it('accepts unset (exemption disabled)', () => {
+    withEnv({ ...validEnv, INTERNAL_SERVICE_CIDRS: '' }, () => {
+      expect(() => validateConfig()).not.toThrow();
+    });
+  });
+
+  it.each(['0.0.0.0/0', '::/0', '203.0.113.0/24', 'not-a-cidr', '172.31.0.0/99', '10.0.0.0/1', '172.16.0.0/8', 'fc00::/1'])(
+    'refuses %j',
+    (entry) => {
+      withEnv({ ...validEnv, INTERNAL_SERVICE_CIDRS: `172.31.0.0/24,${entry}` }, () => {
+        expect(() => validateConfig()).toThrow(/INTERNAL_SERVICE_CIDRS/);
+      });
+    },
+  );
+
+  it('refuses an INTERNAL_API_HOSTS entry that is not a bare host[:port]', () => {
+    withEnv({ ...validEnv, INTERNAL_SERVICE_CIDRS: '172.31.0.0/24', INTERNAL_API_HOSTS: 'http://api:3001/x' }, () => {
+      expect(() => validateConfig()).toThrow(/INTERNAL_API_HOSTS/);
+    });
   });
 });

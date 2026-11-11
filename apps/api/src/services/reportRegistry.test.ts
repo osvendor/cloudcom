@@ -11,10 +11,13 @@ vi.mock('../db', () => ({
 }));
 
 import {
+  BUSINESS_REPORT_REQUIRED_PERMISSIONS,
   BUSINESS_REPORT_TYPES,
   MANAGED_EVIDENCE_REPORT_TYPES,
   REPORT_TYPES,
+  REPORT_TYPE_REQUIRED_PERMISSIONS,
 } from '@breeze/shared';
+import { GENERATE_REPORT_TYPES } from './aiReportTypes';
 import { MSP_STAFF_REPORT_TYPES, REPORT_GENERATORS, reportTypeDef } from './reportRegistry';
 import { MANAGED_EVIDENCE_REGISTRY } from './managedEvidenceRegistry';
 import { PORTAL_DEFINITIONS_FOR_TEST } from './portal/reportsSelfService';
@@ -33,6 +36,7 @@ import type {
 } from './reportGenerationService';
 import type { generateSecurityCompliancePostureReport } from './securityComplianceReport';
 import type { generateHardwareLifecycleReport } from './hardwareLifecycleReport';
+import type { generateBackupStatusReport } from './backupStatusReport';
 import type { generateThreatDetectionReport } from './threatDetectionReport';
 import type { generateEndpointManagementReport } from './endpointManagementReport';
 import type { generateVulnerabilityManagementReport } from './vulnerabilityManagementReport';
@@ -54,7 +58,7 @@ describe('REPORT_GENERATORS', () => {
     }
   });
 
-  it('only the three #3198 business types support partner scope', () => {
+  it(`only the ${BUSINESS_REPORT_TYPES.length} BUSINESS_REPORT_TYPES support partner scope`, () => {
     const partnerCapable = Object.values(REPORT_GENERATORS)
       .filter((d) => d.supportedScopes.includes('partner'))
       .map((d) => d.type)
@@ -93,9 +97,27 @@ describe('REPORT_GENERATORS', () => {
     }
   });
 
+  it('each business type requires exactly the shared BUSINESS_REPORT_REQUIRED_PERMISSIONS entry (one source for API and web)', () => {
+    for (const type of BUSINESS_REPORT_TYPES) {
+      expect(REPORT_GENERATORS[type].requiredPermissions).toBe(BUSINESS_REPORT_REQUIRED_PERMISSIONS[type]);
+    }
+  });
+
+  it('ticket_sla_performance is org-only, audience any, requires tickets:read', () => {
+    const def = REPORT_GENERATORS.ticket_sla_performance;
+    expect(def.supportedScopes).toEqual(['organization']);
+    expect(def.audience).toBe('any');
+    expect(def.execution).toBe('managed_evidence');
+    expect(def.detailRowCap).toBe(Number.POSITIVE_INFINITY);
+    expect(def.requiredPermissions).toBe(REPORT_TYPE_REQUIRED_PERMISSIONS.ticket_sla_performance);
+    expect(def.requiredPermissions).toEqual([{ resource: 'tickets', action: 'read' }]);
+    expect(GENERATE_REPORT_TYPES as readonly string[]).not.toContain('ticket_sla_performance');
+    expect(Object.keys(MANAGED_EVIDENCE_REGISTRY)).toContain('ticket_sla_performance');
+  });
+
   it('no pre-#3198 type gains a permission requirement (route middleware is unchanged)', () => {
     for (const def of Object.values(REPORT_GENERATORS)) {
-      if ((BUSINESS_REPORT_TYPES as readonly string[]).includes(def.type)) {
+      if (REPORT_TYPE_REQUIRED_PERMISSIONS[def.type]) {
         expect(def.requiredPermissions.length).toBeGreaterThan(0);
       } else {
         expect(def.requiredPermissions).toEqual([]);
@@ -105,8 +127,8 @@ describe('REPORT_GENERATORS', () => {
 
   // Ruling F1 (#3198 W02 final review): margin, utilization, AR and SLA
   // attainment are internal to the MSP (spec §2). The audience set is exactly
-  // the three business types; every other type stays visible to org callers.
-  it("audience 'msp_staff' is exactly the three business types; MSP_STAFF_REPORT_TYPES derives from it", () => {
+  // the BUSINESS_REPORT_TYPES; every other type stays visible to org callers.
+  it(`audience 'msp_staff' is exactly the ${BUSINESS_REPORT_TYPES.length} BUSINESS_REPORT_TYPES; MSP_STAFF_REPORT_TYPES derives from it`, () => {
     const mspStaff = Object.values(REPORT_GENERATORS)
       .filter((d) => d.audience === 'msp_staff').map((d) => d.type).sort();
     expect(mspStaff).toEqual([...BUSINESS_REPORT_TYPES].sort());
@@ -160,15 +182,17 @@ type OrgAxisOnly = {
   endpointManagement: RefusesPartnerAxis<typeof generateEndpointManagementReport>;
   vulnerabilityManagement: RefusesPartnerAxis<typeof generateVulnerabilityManagementReport>;
   identityAccess: RefusesPartnerAxis<typeof generateIdentityAccessReport>;
+  backupStatus: RefusesPartnerAxis<typeof generateBackupStatusReport>;
 };
 const ORG_AXIS_ONLY: OrgAxisOnly = {
   deviceInventory: true, softwareInventory: true, alertSummary: true, compliance: true,
   performance: true, executiveSummary: true, securityCompliance: true, hardwareLifecycle: true,
   threatDetection: true, endpointManagement: true, vulnerabilityManagement: true, identityAccess: true,
+  backupStatus: true,
 };
 
 describe('org-axis authority narrowing (#3198 W02 addendum B5)', () => {
-  it('the twelve org generators are typed org-axis only (the compile-time table above)', () => {
+  it('the thirteen org generators are typed org-axis only (the compile-time table above)', () => {
     expect(Object.values(ORG_AXIS_ONLY).every(Boolean)).toBe(true);
   });
 

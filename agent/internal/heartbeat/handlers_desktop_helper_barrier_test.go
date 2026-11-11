@@ -11,7 +11,7 @@ import (
 	"github.com/breeze-rmm/agent/internal/sessionbroker"
 )
 
-// SEC-038 W05 readiness barrier: a generation-bearing start must not reach a
+// Readiness barrier: a generation-bearing start must not reach a
 // helper that has not yet acknowledged this service's fence. The barrier lives
 // in startDesktopOnSession, and it is the mechanism that makes helper-restart
 // safety real — the helper-side fence logic alone cannot provide it, because a
@@ -150,7 +150,13 @@ func TestStartDesktopOnSessionSeedsOncePerHelperSession(t *testing.T) {
 			t.Fatalf("start %d failed: %q", i, result.Error)
 		}
 	}
-	want := []string{ipc.TypeDesktopFenceSync, ipc.TypeDesktopStart, ipc.TypeDesktopStart}
+	// Each completed start is followed by its trickle begin (#9182), sent
+	// once the helper is recorded as the session's owner.
+	want := []string{
+		ipc.TypeDesktopFenceSync,
+		ipc.TypeDesktopStart, ipc.TypeDesktopICETrickleBegin,
+		ipc.TypeDesktopStart, ipc.TypeDesktopICETrickleBegin,
+	}
 	for i, expect := range want {
 		if got := rig.nextType(t); got != expect {
 			t.Fatalf("message %d was %q, want %q (the seed must cost one round trip per helper session, not per start)", i, got, expect)
@@ -207,7 +213,7 @@ func TestTerminalAfterStartKeepsTheOwnerMappingWhenTheStopFails(t *testing.T) {
 
 	h := &Heartbeat{
 		sessionBroker: newTestBrokerWithSessions(t, session),
-		desktopMgr:    desktop.NewSessionManager(),
+		desktopMgr:    desktop.NewSessionManagerWithPreloader(nil),
 	}
 	h.desktopStartFence.noteStop("desktop-1", desktopStopFenceInput{Generation: 5, HasGeneration: true})
 	h.rememberDesktopOwner("desktop-1", session.SessionID)

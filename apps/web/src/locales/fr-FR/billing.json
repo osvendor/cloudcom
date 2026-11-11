@@ -24,7 +24,8 @@
         "perDeviceRole": "Par rôle d'appareil",
         "perDeviceGroup": "Par groupe d'appareils",
         "perSeat": "Par utilisateur",
-        "manual": "Quantité manuelle"
+        "manual": "Quantité manuelle",
+        "hourBlock": "Forfait d'heures"
       },
       "dynamicGroup": "dynamique",
       "deletedGroup": "{{name}} (groupe supprimé)",
@@ -54,7 +55,8 @@
         "auto": "auto",
         "groupDeleted": "groupe supprimé",
         "siteDeleted": "site supprimé",
-        "siteDeletedNamed": "site supprimé : {{name}}"
+        "siteDeletedNamed": "site supprimé : {{name}}",
+        "manualQuantityMissing": "quantité manquante"
       },
       "lineScope": {
         "site": "Site : {{name}}"
@@ -70,7 +72,7 @@
         "autoIssue": "Émission auto",
         "renewal": "Renouvellement",
         "estimatedPerPeriod": "Est. / période",
-        "notes": "Notes",
+        "notes": "Notes internes",
         "invoiceNote": "Note de facturation"
       },
       "values": {
@@ -135,7 +137,14 @@
         "flaggedOverage": "{{count}} ligne(s) dépassent la quantité incluse et n'ont pas été facturées : {{names}}",
         "uncoveredDevices": "Facture générée, mais {{count}} appareil(s) ne sont facturés par aucune ligne de ce contrat : {{breakdown}}",
         "priceBookGaps": "{{count}} ligne(s) de catalogue facturée(s) au prix figé du contrat — aucun prix en {{currency}} dans le catalogue : {{lines}}",
-        "draftDeleted": "Brouillon supprimé"
+        "draftDeleted": "Brouillon supprimé",
+        "skipped": {
+          "already_billed": "Aucune facture générée : cette période de facturation a déjà été facturée.",
+          "not_due": "Aucune facture générée : ce contrat n’est pas encore à facturer.",
+          "renewal_pending": "Aucune facture générée : ce contrat a dépassé sa date de fin et attend son renouvellement.",
+          "expired": "Aucune facture générée : ce contrat est expiré.",
+          "unknown": "Aucune facture n’a été générée pour ce contrat."
+        }
       },
       "cancelConfirm": {
         "title": "Annuler ce contrat ?",
@@ -220,8 +229,8 @@
       },
       "content": {
         "title": "Contenu",
-        "notesOptional": "Notes (facultatif, ajoutées au bloc Notes des factures générées)",
-        "termsOptional": "Note de facturation (facultatif, ajoutée au bloc Notes des factures générées)",
+        "notesOptional": "Notes internes (jamais montrées au client)",
+        "termsOptional": "Note de facturation (facultatif, imprimée sur chaque facture générée)",
         "termsPlaceholder": "ex. Net 30. Renouvellement automatique sauf annulation 30 jours avant."
       },
       "lines": {
@@ -254,6 +263,8 @@
         "descriptionPlaceholder": "ex. Gestion des postes de travail",
         "unitPrice": "Prix unitaire",
         "quantity": "Quantité",
+        "quantityInvalid": "Saisissez une quantité (jusqu’à 2 décimales).",
+        "quantityTooLarge": "La quantité est trop grande (au plus 10 chiffres avant la virgule).",
         "siteOptional": "Site (facultatif : limite le comptage des appareils)",
         "allSites": "Tous les sites",
         "linkCatalogItemOptional": "Lier un article du catalogue (facultatif)",
@@ -384,7 +395,9 @@
         "message_other": "Supprimer {{count}} contrats brouillon ? Seuls les brouillons sont supprimés{{untouched}} ; cette action est irréversible.",
         "untouchedSuffix": " — les contrats actifs ou suspendus de votre sélection restent inchangés",
         "confirm": "Supprimer les brouillons"
-      }
+      },
+      "fromQuoteReady": "Issu de {{number}} · prêt à activer",
+      "fromQuoteReadyUnnumbered": "Issu d’un devis · prêt à activer"
     },
     "contractPax8Drawer": {
       "title": "Lier un abonnement Pax8",
@@ -588,6 +601,94 @@
       "warnings": {
         "markupRemoved": "Enregistré, mais une mise en forme non prise en charge a été supprimée : {{tags}}. Le corps des conventions prend en charge les titres, le gras, l'italique, le soulignement, les listes et les liens."
       }
+    },
+    "hourBlock": {
+      "form": {
+        "hoursPerPeriod": "Heures incluses par période",
+        "extraRate": "Prix par heure supplémentaire",
+        "rolloverMode": "Heures non utilisées en fin de période",
+        "rolloverExpire": "Expirent",
+        "rolloverCarry": "Reportées",
+        "carryCap": "Plafond de report en heures (vide pour illimité)",
+        "alertPct": "Alerter à ce % du forfait consommé (facultatif)",
+        "required": "Saisissez les heures incluses et le prix par heure supplémentaire.",
+        "firstPeriod": "Les heures comptent à partir de la première période de facturation encore à facturer ; pour un contrat brouillon, elle est fixée à l'activation. Le temps antérieur est facturé comme d'habitude.",
+        "midPeriodEdit": "Les modifications s'appliquent à la période en cours ({{start}} – {{end}}) à sa clôture.",
+        "midPeriodEditNoDates": "Les modifications s'appliquent à la période en cours à sa clôture.",
+        "onlyOne": "Cette organisation a déjà un forfait actif. Retirez-le avant d'en ajouter un autre."
+      },
+      "row": {
+        "perPeriod": "{{hours}} heures par période",
+        "retiredBadge": "Retiré",
+        "startsOn": "Compte à partir du {{date}}"
+      },
+      "errors": {
+        "exists": "Cette organisation a déjà une ligne de forfait d'heures active. Retirez-la d'abord, puis ajoutez la nouvelle.",
+        "locked": "Ce champ ne peut pas être modifié sur une ligne de forfait d'heures."
+      },
+      "retire": {
+        "title": "Retirer le forfait d'heures",
+        "message": "« {{description}} » a un historique de facturation ; il est donc retiré au lieu d'être supprimé. Plus de nouvelles périodes ; les périodes déjà facturées sont toujours réglées. Les périodes clôturées restent dans le contrat.",
+        "confirm": "Retirer le forfait",
+        "toast": "Forfait d'heures retiré"
+      },
+      "detail": {
+        "title": "Forfait d'heures",
+        "usage": "{{used}} heures utilisées sur {{included}} · {{remaining}} restantes · la période se termine le {{end}}",
+        "carried": "Comprend {{hours}} heures reportées.",
+        "unapproved": "{{hours}} heures de ce temps ne sont pas encore approuvées.",
+        "foreign": "{{hours}} heures ont été saisies dans une autre devise ; elles décomptent quand même le forfait.",
+        "over": "{{hours}} heures au-delà du forfait → {{amount}} à la clôture de la période",
+        "advanceNote": "Le dépassement est facturé sur la facture suivante.",
+        "arrearsNote": "Le dépassement est facturé sur la facture de cette période.",
+        "lateEntry": "{{hours}} heures ont été saisies après la clôture de leur période et sont facturées séparément.",
+        "startsLater": "Le forfait commence le {{date}}.",
+        "extraRate": "Heures supplémentaires : {{rate}} chacune",
+        "loadFailed": "Impossible de charger la consommation du forfait."
+      },
+      "history": {
+        "title": "Périodes de forfait clôturées",
+        "empty": "Aucune période de forfait n'a encore été clôturée.",
+        "included": "Incluses",
+        "carriedIn": "Reportées en entrée",
+        "used": "Utilisées",
+        "over": "Dépassement",
+        "carriedOut": "Reportées en sortie",
+        "loadMore": "Charger plus",
+        "invoiceRemoved": "Facture du dépassement supprimée — heures non facturées"
+      }
+    },
+    "relatedNotice": {
+      "title_one": "Cette organisation a {{count}} autre contrat",
+      "title_other": "Cette organisation a {{count}} autres contrats",
+      "overlapWarning": "Un autre contrat facture au même rythme sur des dates qui se chevauchent. Si vous activez les deux, le client paie pour les deux.",
+      "sameCadence": "Même rythme, dates qui se chevauchent",
+      "perPeriod": "{{amount}} par période",
+      "estimateUnavailable": "Estimation par période indisponible",
+      "deliverables_one": "{{count}} livrable",
+      "deliverables_other": "{{count}} livrables",
+      "signedAgreements_one": "{{count}} convention signée",
+      "signedAgreements_other": "{{count}} conventions signées",
+      "activateConfirm": {
+        "title": "Activer en plus d’un autre contrat ?",
+        "message": "Cette organisation a déjà un contrat qui facture au même rythme sur des dates qui se chevauchent. Si vous activez celui-ci, le client paie pour les deux.",
+        "confirm": "Activer quand même"
+      },
+      "adopt": {
+        "action": "Intégrer à ce contrat",
+        "title": "Intégrer « {{name}} » à ce contrat ?",
+        "message": "Utilisez cette option lorsque « {{name}} » couvre les mêmes services que ce contrat, afin que le client ne soit pas facturé deux fois.",
+        "deliverables_one": "Son {{count}} livrable est déplacé ici, avec son historique.",
+        "deliverables_other": "Ses {{count}} livrables sont déplacés ici, avec leur historique.",
+        "agreements_one": "Sa {{count}} convention signée est rattachée à ce contrat.",
+        "agreements_other": "Ses {{count}} conventions signées sont rattachées à ce contrat.",
+        "noLines": "Ses lignes ne sont pas copiées. Les lignes et les prix de ce contrat restent inchangés.",
+        "deleted": "« {{name}} » est ensuite supprimé. Cette action est irréversible.",
+        "confirm": "Intégrer et supprimer le brouillon",
+        "success": "« {{name}} » a été intégré à ce contrat",
+        "error": "Impossible d'intégrer le brouillon à ce contrat",
+        "collision": "Ces noms de livrables existent déjà dans ce contrat : {{names}}. Renommez-les ou supprimez-les d'un côté, puis réessayez."
+      }
     }
   },
   "agreements": {
@@ -613,7 +714,24 @@
       "viewContract": "Voir le contrat",
       "notLinked": "Non liée",
       "rowSubtitle": "Acceptée avec le devis {{quoteNumber}} par {{signer}} le {{date}}",
-      "rowSubtitleNoQuote": "Signée par {{signer}} le {{date}}"
+      "rowSubtitleNoQuote": "Signée par {{signer}} le {{date}}",
+      "evidenceUnavailable": "Acceptée par devis — preuve d’acceptation non disponible",
+      "recordSigned": "Enregistrer une convention signée",
+      "source": {
+        "quote": "via le devis {{number}}",
+        "recorded": "enregistrée par le MSP — {{method}}"
+      },
+      "fileType": {
+        "image": "copie numérisée"
+      },
+      "sendForSignature": "Envoyer pour signature",
+      "filter": {
+        "pending": "En attente de signature",
+        "signed": "Signées",
+        "closed": "Refusées / annulées / expirées"
+      },
+      "downloadOriginal": "Original",
+      "certifiedUnavailable": "La copie certifiée n’a pas pu être générée pour cet accord ; le fichier original a été téléchargé à la place."
     },
     "templateEditor": {
       "usage": "Utilisé sur {{quotes}} devis · {{signed}} conventions signées",
@@ -627,7 +745,154 @@
       }
     },
     "contractPill": {
-      "under": "Sous {{template}} v{{n}}"
+      "under": "Sous {{template}} v{{n}}",
+      "fromQuote": "Issu du devis {{number}}"
+    },
+    "recordSigned": {
+      "title": "Enregistrer une convention signée",
+      "organization": "Organisation",
+      "organizationPlaceholder": "Sélectionner une organisation",
+      "orgFallback": "cette organisation",
+      "template": "Modèle de convention",
+      "templatePlaceholder": "Sélectionner un modèle de convention",
+      "templatesError": "Impossible de charger les modèles de convention.",
+      "orgsError": "Impossible de charger les organisations.",
+      "contractError": "Impossible de charger ce contrat.",
+      "contractsError": "Impossible de charger les contrats de cette organisation. Vous pouvez tout de même enregistrer la convention et la lier à un contrat plus tard.",
+      "contract": "Contrat (facultatif)",
+      "contractNone": "Non rattachée à un contrat",
+      "method": "Mode d'accord",
+      "reference": "Référence",
+      "referenceHelp": "Où un relecteur trouverait la convention signée — un numéro de bon de commande, un e-mail daté ou un ticket.",
+      "signerName": "Qui a donné son accord",
+      "signerEmail": "Son e-mail (facultatif)",
+      "signedAt": "Date de signature",
+      "file": "Copie signée (facultatif)",
+      "fileHelp": "PDF, PNG ou JPEG, jusqu'à 10 Mo. Si une copie signée est jointe, c'est ce fichier qui est archivé.",
+      "fileTooLarge": "Ce fichier dépasse 10 Mo.",
+      "fileWrongType": "Joignez un fichier PDF, PNG ou JPEG.",
+      "variables": "Informations de la convention",
+      "unresolved": "Renseignez une valeur pour : {{names}}",
+      "needsSignedCopy": "Breeze ne peut pas renseigner {{names}} sans devis. Joignez la copie signée pour enregistrer cet accord.",
+      "consequence": "Ceci archive une convention signée pour {{org}}. Elle ne pourra pas être supprimée ensuite.",
+      "submit": "Enregistrer la convention signée",
+      "success": "Convention signée enregistrée.",
+      "error": "Impossible d'enregistrer la convention signée."
+    },
+    "requests": {
+      "columns": {
+        "template": "Modèle",
+        "organization": "Organisation",
+        "recipients": "Destinataires",
+        "sent": "Envoyée",
+        "expires": "Expire",
+        "status": "Statut"
+      },
+      "status": {
+        "draft": "Brouillon",
+        "sent": "En attente de signature",
+        "viewed": "Consultée",
+        "signed": "Signée",
+        "declined": "Refusée",
+        "voided": "Annulée",
+        "expired": "Expirée"
+      },
+      "empty": {
+        "pending": {
+          "title": "Rien en attente de signature",
+          "description": "Les conventions envoyées pour signature apparaissent ici jusqu’à ce que le client signe."
+        },
+        "closed": {
+          "title": "Aucune demande refusée, annulée ou expirée",
+          "description": "Les demandes refusées, annulées ou expirées apparaissent ici."
+        }
+      },
+      "loadError": "Impossible de charger les demandes de convention.",
+      "recipientsMore": "+{{count}} autres",
+      "notSent": "Non envoyée",
+      "declinedReason": "Refusée : {{reason}}",
+      "voidedReason": "Annulée : {{reason}}",
+      "copyLink": {
+        "label": "Copier le lien",
+        "success": "Lien de signature copié",
+        "error": "Impossible de copier le lien de signature.",
+        "clipboardError": "Impossible de copier dans le presse-papiers. Lien de signature : {{link}}"
+      },
+      "void": {
+        "label": "Annuler",
+        "title": "Annuler cette demande de convention ?",
+        "description": "Le lien de signature cesse de fonctionner et les destinataires ne peuvent plus signer cette convention.",
+        "reasonLabel": "Motif (facultatif)",
+        "confirm": "Annuler la demande",
+        "confirming": "Annulation…",
+        "success": "Demande de convention annulée.",
+        "error": "Impossible d’annuler la demande de convention."
+      },
+      "deleteDraft": {
+        "label": "Supprimer le brouillon",
+        "success": "Brouillon supprimé.",
+        "error": "Impossible de supprimer le brouillon."
+      },
+      "remind": {
+        "label": "Relancer",
+        "success_one": "Rappel envoyé à {{count}} destinataire",
+        "success_other": "Rappel envoyé à {{count}} destinataires",
+        "error": "Impossible d’envoyer le rappel.",
+        "notEmailed": {
+          "no_email_service": "Rappel enregistré, mais l’e-mail n’est pas configuré. Copiez le lien de signature et transmettez-le.",
+          "no_recipients": "Rappel enregistré, mais il n’y avait aucun destinataire à joindre par e-mail. Copiez le lien de signature et transmettez-le.",
+          "send_failed": "Rappel enregistré, mais l’e-mail n’a pas pu être remis. Copiez le lien de signature et transmettez-le."
+        }
+      },
+      "remindedCount_one": "Relancé {{count}} fois",
+      "remindedCount_other": "Relancé {{count}} fois"
+    },
+    "send": {
+      "title": "Envoyer pour signature",
+      "contract": "Classer avec un contrat (facultatif)",
+      "contractsError": "Impossible de charger les contrats de cette organisation. Vous pouvez tout de même envoyer la convention et la lier à un contrat plus tard.",
+      "recipients": "Destinataires",
+      "recipientsHelp": "Adresses courriel, séparées par des virgules ou des sauts de ligne. Préremplies avec le contact de facturation de l’organisation.",
+      "recipientsRequired": "Ajoutez au moins une adresse de destinataire.",
+      "recipientsInvalid": "Ces valeurs ne sont pas des adresses valides : {{emails}}",
+      "recipientsTooMany": "50 destinataires au maximum.",
+      "cover": "Message d’accompagnement (facultatif)",
+      "expiry": "Le lien expire le",
+      "expiryPast": "Choisissez une date d’expiration future.",
+      "expiryDefaultHint_one": "Par défaut : {{count}} jour, d’après Paramètres de facturation → Conventions.",
+      "expiryDefaultHint_other": "Par défaut : {{count}} jours, d’après Paramètres de facturation → Conventions.",
+      "autoReminderHint_one": "Les rappels automatiques sont envoyés chaque jour, jusqu’à {{max}} au total.",
+      "autoReminderHint_other": "Les rappels automatiques sont envoyés tous les {{count}} jours, jusqu’à {{max}} au total.",
+      "expiryDefaultUnavailable": "Impossible de charger votre échéance par défaut depuis les Paramètres de facturation. Laissez la date vide et votre valeur par défaut s’appliquera à la création de la convention.",
+      "expiryBlankHint": "Laissez vide pour utiliser votre valeur par défaut de Paramètres de facturation → Conventions.",
+      "label": "Libellé (facultatif)",
+      "labelHint": "Usage interne uniquement. Les clients voient le nom du modèle.",
+      "createDraft": "Créer le brouillon et prévisualiser",
+      "creating": "Création…",
+      "preview": {
+        "title": "Aperçu",
+        "loading": "Chargement de l’aperçu…",
+        "error": "Impossible de charger l’aperçu.",
+        "uploaded": "Ce modèle est un document téléversé. Le client signe le fichier téléversé."
+      },
+      "unresolved": {
+        "title": "Renseignez les valeurs manquantes avant l’envoi"
+      },
+      "updatePreview": "Mettre à jour l’aperçu",
+      "updating": "Mise à jour…",
+      "submit": "Envoyer",
+      "sending": "Envoi…",
+      "createError": "Impossible de créer le brouillon.",
+      "updateError": "Impossible de mettre à jour la convention.",
+      "sendError": "Impossible d’envoyer la convention.",
+      "discardError": "Impossible de supprimer le brouillon ; il figure toujours sous En attente de signature, où vous pouvez le supprimer.",
+      "sent_one": "Convention envoyée à {{count}} destinataire",
+      "sent_other": "Convention envoyée à {{count}} destinataires",
+      "notEmailed": {
+        "no_email_service": "Envoyée, mais le courriel n’est pas configuré. Copiez le lien de signature depuis « En attente de signature » et partagez-le.",
+        "no_recipients": "Envoyée, mais il n’y avait aucun destinataire à joindre. Copiez le lien de signature depuis « En attente de signature » et partagez-le.",
+        "send_failed": "Envoyée, mais le courriel n’a pas pu être livré. Copiez le lien de signature depuis « En attente de signature » et partagez-le."
+      }
     }
   },
   "quotes": {
@@ -855,6 +1120,7 @@
         "reorderSections": "Impossible de réordonner les sections.",
         "saveCoverPage": "Impossible d'enregistrer la page de couverture",
         "saveCustomer": "Impossible de changer le client.",
+        "saveFooter": "Impossible d'enregistrer la ligne de pied de page.",
         "saveTerms": "Impossible d'enregistrer les conditions.",
         "saveTitle": "Impossible d'enregistrer le titre.",
         "unitPriceZeroOrMore": "Saisissez un prix unitaire supérieur ou égal à 0.",
@@ -865,7 +1131,9 @@
         "uploadImage": "Impossible de téléverser l'image.",
         "noPriceForCurrency": "Aucun prix en {{currency}} pour cet article. Ajoutez-en un dans le catalogue ou saisissez une ligne manuelle.",
         "sectionAddedListStale": "Section ajoutée, mais la liste n'a pas pu être actualisée. Rechargez la page pour la voir.",
-        "lineAddedListStale": "Ligne ajoutée, mais la liste n'a pas pu être actualisée. Rechargez la page pour la voir."
+        "lineAddedListStale": "Ligne ajoutée, mais la liste n'a pas pu être actualisée. Rechargez la page pour la voir.",
+        "saveExpiry": "Impossible d'enregistrer la date d'expiration.",
+        "saveIntroNotes": "Impossible d'enregistrer les notes d'introduction."
       },
       "image": {
         "alt": "Image du devis",
@@ -910,7 +1178,8 @@
         "skuHelp": "Votre référence de catalogue ou de distributeur pour cet article.",
         "skuOptional": "SKU (facultatif)",
         "tidyWithAi": "Peaufiner avec l'IA",
-        "unitCost": "Coût unitaire"
+        "unitCost": "Coût unitaire",
+        "partNumberRequiredHint": "Ajoutez une référence fabricant pour inclure cette ligne dans la commande de pièces."
       },
       "liveTotals": {
         "annualRecurring": "Récurrent annuel",
@@ -924,7 +1193,7 @@
         "subtotal": "Sous-total",
         "tax": "Taxe",
         "taxRate": "Taux de taxe",
-        "taxRateHelp": "S'applique aux lignes marquées taxables. Défini dans les paramètres fiscaux de l'organisation.",
+        "taxRateHelp": "S'applique aux lignes marquées taxables. Provient des paramètres fiscaux de l'organisation, ou de votre taux de taxe par défaut si l'organisation n'en a pas. Il suit ces paramètres tant que le devis est un brouillon et est figé à l'envoi du devis.",
         "title": "Totaux en direct",
         "total": "Total"
       },
@@ -995,6 +1264,15 @@
         "headerStyleAccent": "Accentué",
         "reshapedWarning": "Ce tableau dépassait la limite de {{columns}} colonnes x {{rows}} lignes et a été ajusté. L'enregistrement remplace le tableau stocké par celui affiché ici."
       },
+      "footer": {
+        "title": "Ligne de pied de page (chaque page)",
+        "helper": "Une courte ligne imprimée en bas de chaque page — par exemple, des dates de validité. Laissez vide pour utiliser le pied de page par défaut. Les mentions légales vont dans Conditions générales, pas ici.",
+        "placeholder": "Vide = utiliser le pied de page par défaut",
+        "inheritedPartner": "Utilise le pied de page des documents du partenaire depuis les paramètres de facturation : « {{text}} »",
+        "inheritedBrand": "Utilise le texte de pied de page de cette organisation depuis ses paramètres du portail : « {{text}} »",
+        "inheritedNone": "Aucun pied de page par défaut n'est défini dans les Paramètres — le pied de page de la page sera vide.",
+        "counter": "{{count}} / {{max}}"
+      },
       "terms": {
         "placeholder": "Conditions de paiement, notes de livraison, etc.",
         "title": "Conditions générales (texte brut)",
@@ -1023,6 +1301,7 @@
         "noPublishedVersion": "Ce modèle n'a pas encore de version publiée. Publiez-la avant de l'ajouter à un devis.",
         "pinnedVersion": "Épinglé à v{{version}}",
         "autoVariablesTitle": "Rempli automatiquement à partir du devis",
+        "autoValueBlank": "Vide",
         "autoHint": "Ces valeurs sont résolues à partir du devis lors de l'envoi de la proposition.",
         "manualVariablesTitle": "À remplir pour cette proposition",
         "labelFieldLabel": "Libellé de la section",
@@ -1033,11 +1312,13 @@
         "readOnlyHint": "Supprimez et rajoutez cette section pour changer le modèle, la version ou les variables.",
         "updateToVersion": "Mettre à jour vers v{{version}}",
         "saveVariables": "Enregistrer les variables",
-        "unresolvedWarning": "Variables non résolues (bloqueront l'envoi) : {{names}}"
+        "unresolvedWarning": "Variables non résolues (bloqueront l'envoi) : {{names}}",
+        "placementHint": "Les clients le voient après les totaux, replié jusqu’à ce qu’ils l’ouvrent. Dans le PDF, il suit le prix."
       },
       "coverPage": {
         "title": "Page de couverture",
         "enable": "Afficher une page de couverture",
+        "showContents": "Ajouter une table des matières au PDF",
         "summaryOn": "Affichée comme première page de la proposition.",
         "summaryOff": "Aucune page de couverture — la proposition commence par son contenu.",
         "titleLabel": "Titre de la couverture",
@@ -1077,6 +1358,14 @@
       },
       "warnings": {
         "markupRemoved": "Enregistré, mais une mise en forme non prise en charge a été supprimée : {{tags}}. Le texte enrichi prend en charge les titres, le gras, l'italique, le soulignement, les listes et les liens."
+      },
+      "intro": {
+        "expiryLabel": "Valable jusqu'au",
+        "expiryHelper": "Imprimée sur la proposition. Le client peut l'accepter jusqu'à la fin de cette journée. Laissez vide pour aucune expiration.",
+        "expiryPast": "Cette date est passée — le client ne peut pas accepter une proposition expirée.",
+        "notesLabel": "Notes d'introduction",
+        "notesHelper": "Imprimées au-dessus de la première section de la proposition.",
+        "notesPlaceholder": "Un court mot au client, par ex. ce que couvre cette proposition."
       }
     },
     "actions": {
@@ -1125,15 +1414,21 @@
         "recipientRequired": "Saisissez au moins un destinataire pour envoyer.",
         "signaturePreviewLabel": "Signature (définie dans Paramètres → Image de marque) :",
         "subjectLabel": "Objet",
-        "subjectPlaceholder": "Proposition {{number}} de votre entreprise",
-        "subjectPlaceholderNoNumber": "Proposition de votre entreprise",
+        "subjectPartnerFallback": "votre entreprise",
+        "subjectPlaceholder": "Proposition {{number}} de {{partner}}",
+        "subjectPlaceholderNoNumber": "Proposition de {{partner}}",
+        "subjectPlaceholderTemplate": "Utilise l'objet de votre modèle d'e-mail de proposition",
+        "subjectPlaceholderTitled": "{{title}} — proposition de {{partner}}",
         "title": "Envoyer cette proposition ?",
         "toLabel": "À",
         "toPlaceholder": "Ajouter un destinataire…",
         "tooManyRecipients": "Utilisez au maximum {{max}} adresses.",
         "zeroTotalWarning": "Ce devis totalise {{zero}} — vérifiez que ses lignes sont tarifées avant l'envoi.",
         "noBillingContactHint": "Aucun contact de facturation n'est enregistré pour cette organisation — saisissez un e-mail ou ajoutez-en un dans les <orgLink>paramètres de l'organisation</orgLink>.",
-        "revisionWarning": "L’envoi remplace {{number}} et désactive le lien que le client possède déjà."
+        "revisionWarning": "L’envoi remplace {{number}} et désactive le lien que le client possède déjà.",
+        "noPartNumberWarning_one": "{{count}} ligne de produit n'a pas de référence fabricant et ne sera pas ajoutée à la commande de pièces.",
+        "noPartNumberWarning_other": "{{count}} lignes de produit n'ont pas de référence fabricant et ne seront pas ajoutées à la commande de pièces.",
+        "sendAnyway": "Envoyer quand même"
       },
       "sendEmailWarning": {
         "noBillingContact": "Proposition marquée comme Envoyée, mais aucun e-mail n'a été remis — {{orgName}} n'a pas d'adresse e-mail de contact de facturation. Ajoutez-en une dans les paramètres de l'organisation, puis renvoyez.",
@@ -1181,6 +1476,9 @@
       "currencyUnknown": "La devise de règlement de votre compte Stripe n'est pas encore en cache ; elle n'a donc pas pu être comparée à ce devis en {{documentCurrency}}. Actualisez les détails de votre compte Stripe dans Paramètres → Intégrations pour activer la vérification.",
       "acceptOnBehalf": {
         "button": "Accepter au nom du client",
+        "emptyDraftTitle": "Ajoutez au moins un article avant l'acceptation.",
+        "emptySentTitle": "Ce devis ne contient aucun article. Utilisez Réviser le devis pour émettre une version avec des articles.",
+        "errorQuoteEmpty": "Ce devis ne contient aucun article. Fermez cette boîte de dialogue et ajoutez un article, ou utilisez Réviser le devis s'il a déjà été envoyé.",
         "title": "Enregistrer l'acceptation du client",
         "methodLabel": "Comment le client a-t-il donné son accord ?",
         "method": {
@@ -1195,8 +1493,10 @@
         "signerNameLabel": "Qui a donné son accord",
         "signerEmailLabel": "Son e-mail (facultatif)",
         "consequenceInvoice": "Une facture de {{amount}} sera émise et numérotée maintenant.",
+        "consequenceInvoiceDraft": "Une facture brouillon sera créée. Elle n’est pas encore émise ni numérotée.",
         "consequenceContracts": "Les lignes récurrentes deviennent des contrats en brouillon que vous activez plus tard.",
-        "consequenceEmail": "La facture sera envoyée par e-mail au client.",
+        "consequenceEmail": "La facture sera envoyée par e-mail à {{recipients}}.",
+        "consequenceEmailNotConfigured": "Aucun service e-mail n'est configuré ; la facture ne sera pas envoyée par e-mail. Partagez-la depuis la page de la facture.",
         "consequenceDraft": "Cette proposition n'a jamais été envoyée. La facture sera la première chose que le client en verra.",
         "submit": "Accepter et émettre la facture",
         "success": "Proposition acceptée. Facture {{number}} émise.",
@@ -1209,7 +1509,17 @@
         "evidenceHelp": "PDF, PNG ou JPEG, jusqu'à 10 Mo — par exemple le bon de commande signé ou le document.",
         "evidenceTooLarge": "Ce fichier dépasse 10 Mo. Choisissez un fichier plus petit.",
         "evidenceAttached": "Justificatif joint.",
-        "evidenceError": "L'acceptation a été enregistrée, mais le fichier justificatif n'a pas pu être joint. Joignez-le depuis la page de la proposition."
+        "evidenceError": "L'acceptation a été enregistrée, mais le fichier justificatif n'a pas pu être joint. Joignez-le depuis la page de la proposition.",
+        "consequenceEmailNoRecipient": "Aucun destinataire n'est enregistré sur ce devis ; la facture pourrait donc ne pas être envoyée par e-mail. Envoyez-la vous-même au client si nécessaire.",
+        "successNoRecipient": "Devis accepté. Facture {{number}} émise. Elle n'a peut-être pas été envoyée par e-mail : aucun destinataire n'est enregistré sur ce devis.",
+        "successNoEmailService": "Devis accepté. Facture {{number}} émise. Elle n'a pas été envoyée par e-mail : aucun service e-mail n'est configuré. Partagez-la depuis la page de la facture.",
+        "overlap": {
+          "title": "Cette organisation a déjà un contrat au même rythme",
+          "body": "L’acceptation a créé un nouveau brouillon de contrat. Si vous l’activez en plus du contrat existant, le client paie pour les deux. Vérifiez les deux avant d’en activer un.",
+          "newContract": "Nouveau brouillon issu de ce devis",
+          "existingContract": "Contrat existant",
+          "done": "Terminé"
+        }
       },
       "declineOnBehalf": {
         "button": "Refuser pour le client",
@@ -1304,7 +1614,9 @@
           "vendor": "Fournisseur"
         },
         "title": "À commander",
-        "unknownVendor": "Autre / fournisseur inconnu"
+        "unknownVendor": "Autre / fournisseur inconnu",
+        "excluded": "Absent de cette commande (aucune référence fabricant) : {{names}}",
+        "untitledLine": "Ligne sans titre"
       },
       "pax8Order": {
         "message_one": "Ce devis a préparé une commande Pax8 ({{count}} article) en attente des détails de provisionnement",
@@ -1359,6 +1671,14 @@
         "attachError": "Impossible de joindre le fichier justificatif.",
         "downloadError": "Impossible de télécharger le fichier justificatif.",
         "tooLarge": "Ce fichier dépasse 10 Mo. Choisissez un fichier plus petit."
+      },
+      "generatedContracts": {
+        "title_one": "Ce devis a créé {{count}} contrat",
+        "title_other": "Ce devis a créé {{count}} contrats",
+        "draftHint_one": "{{count}} brouillon ne facture rien tant qu’il n’est pas activé. Vérifiez-le et activez-le pour lancer la facturation.",
+        "draftHint_other": "{{count}} brouillons ne facturent rien tant qu’ils ne sont pas activés. Vérifiez-les et activez-les pour lancer la facturation.",
+        "ready": "Prêt à activer",
+        "unavailable": "Impossible de charger les contrats créés par ce devis. Rechargez la page pour réessayer."
       }
     },
     "currency": {
@@ -1417,65 +1737,24 @@
     },
     "document": {
       "deviceSet": {
-        "badge": "Est.",
-        "estimate": "Quantité estimée — facturée selon le nombre réel de {{set}} à chaque période de facturation.",
         "setDevices": "appareils",
         "setSeats": "postes",
-        "setGroup": "appareils dans « {{name}} »",
-        "atSite": "{{set}} sur le site {{site}}",
-        "allowanceBill": "Comprend {{included}}; les unités supplémentaires sont facturées {{price}} chacune.",
-        "allowanceFlag": "Comprend {{included}}; les unités supplémentaires sont signalées pour révision, pas facturées automatiquement."
+        "setGroup": "appareils dans « {{name}} »"
       },
       "additionalItems": "Articles supplémentaires",
       "contract": {
-        "download": "Télécharger la convention",
-        "previewTitle": "Convention {{name}}",
         "unavailable": "Fichier de la convention indisponible",
         "versionFooter": "{{name}} — version {{version}}"
       },
-      "draft": "Brouillon",
-      "empty": "Cette proposition n'a encore aucun contenu.",
-      "imageUnavailable": "Image indisponible",
-      "issued": "Émis",
-      "preparedFor": "Préparé pour",
-      "taxId": "Identifiant fiscal : {{id}}",
-      "imageZoomAria": "Voir l'image en grand",
       "preview": {
         "description": "Voici ce que votre client voit sur son lien de proposition.",
         "downloadPdf": "Télécharger le PDF",
-        "preparing": "Préparation…"
-      },
-      "pricing": "Tarification",
-      "pricingScrollAria": "Tarification — faites défiler horizontalement pour plus de colonnes",
-      "proposal": "Proposition",
-      "proposalImageAlt": "Image de la proposition",
-      "recurrence": {
-        "annual": "Annuel",
-        "monthly": "Mensuel"
-      },
-      "table": {
-        "amount": "Montant",
-        "description": "Description",
-        "qty": "Qté",
-        "tax": "Taxe",
-        "unitPrice": "Prix unitaire"
-      },
-      "terms": "Conditions",
-      "totals": {
-        "annualRecurring": "Récurrent annuel",
-        "depositDue": "Acompte dû",
-        "depositDueNow": "Acompte dû maintenant",
-        "dueOnAcceptance": "Dû à l'acceptation",
-        "firstPeriodSubtotal": "Sous-total de la première période",
-        "firstPeriodTotal": "Total de la première période",
-        "monthlyRecurring": "Récurrent mensuel",
-        "recurringNote": "L'acceptation de cette proposition facture maintenant les frais ponctuels. Les lignes récurrentes sont facturées selon leur propre calendrier.",
-        "remainingBalance": "Solde restant (selon les conditions)",
-        "subtotal": "Sous-total",
-        "tax": "Taxe"
-      },
-      "unsupportedBlock": "Ce type de bloc n'est pas encore pris en charge par cette visionneuse.",
-      "validUntil": "Valide jusqu'au"
+        "preparing": "Préparation…",
+        "loading": "Chargement de la vue client…",
+        "loadError": "Impossible de charger la vue client de cette proposition.",
+        "retry": "Réessayer",
+        "signatureInert": "Votre client signe ici"
+      }
     },
     "page": {
       "accessDenied": "Vous n'avez pas l'autorisation de consulter les devis.",
@@ -1680,7 +1959,8 @@
       "saveNotes": "Impossible d'enregistrer les notes.",
       "saveTerms": "Impossible d'enregistrer les conditions.",
       "updateLine": "Impossible de mettre à jour la ligne.",
-      "noPriceForCurrency": "Aucun prix en {{currency}} pour cet article. Ajoutez-en un dans le catalogue ou saisissez une ligne manuelle."
+      "noPriceForCurrency": "Aucun prix en {{currency}} pour cet article. Ajoutez-en un dans le catalogue ou saisissez une ligne manuelle.",
+      "saveLineDetail": "Impossible de mettre à jour l’impression des saisies de temps"
     },
     "fields": {
       "descriptionOptional": "Description (facultatif)",
@@ -1747,6 +2027,35 @@
     "linesScrollAria": "Lignes de la facture — faites défiler horizontalement pour plus de colonnes",
     "unsavedField": {
       "lines": "Lignes"
+    },
+    "lineDetail": {
+      "default": "Valeur par défaut de la facturation",
+      "grouping": "Présentation",
+      "groupingDay": "Regrouper par jour",
+      "groupingEntry": "Une ligne par saisie",
+      "help": "Remplace votre valeur de facturation par défaut pour ce brouillon uniquement.",
+      "hide": "Masquer",
+      "show": "Afficher",
+      "showDate": "Date du travail",
+      "showNote": "Note du technicien",
+      "showWorkedTime": "Temps travaillé et facturé",
+      "title": "Lignes de saisie de temps"
+    },
+    "refreshTimeLines": {
+      "billedElsewhere": "{{count}} lignes bloqueront l'émission : leurs saisies de temps ont été facturées sur une autre facture. Supprimez-les avant d'émettre :",
+      "billedElsewhere_one": "{{count}} ligne bloquera l'émission : sa saisie de temps a été facturée sur une autre facture. Supprimez-la avant d'émettre :",
+      "billedElsewhere_other": "{{count}} lignes bloqueront l'émission : leurs saisies de temps ont été facturées sur une autre facture. Supprimez-les avant d'émettre :",
+      "button": "Actualiser depuis les saisies de temps",
+      "drifted": "{{count}} lignes inchangées : le temps facturé de leurs saisies ne correspond plus à la quantité. Modifiez la quantité ou créez un nouveau brouillon.",
+      "drifted_one": "{{count}} ligne inchangée : le temps facturé de sa saisie ne correspond plus à la quantité. Modifiez la quantité ou créez un nouveau brouillon.",
+      "drifted_other": "{{count}} lignes inchangées : le temps facturé de leurs saisies ne correspond plus à la quantité. Modifiez la quantité ou créez un nouveau brouillon.",
+      "error": "Impossible d'actualiser depuis les saisies de temps",
+      "help": "Met à jour les notes, les dates travaillées et l'approbation depuis les saisies de temps. Les quantités, les prix et les descriptions modifiées à la main ne changent jamais.",
+      "running": "Actualisation…",
+      "skipped": "{{count}} lignes ignorées : leurs saisies de temps ont été facturées ailleurs, supprimées ou ne sont plus facturables sur ce brouillon.",
+      "skipped_one": "{{count}} ligne ignorée : sa saisie de temps a été facturée ailleurs, supprimée ou n'est plus facturable sur ce brouillon.",
+      "skipped_other": "{{count}} lignes ignorées : leurs saisies de temps ont été facturées ailleurs, supprimées ou ne sont plus facturables sur ce brouillon.",
+      "summary": "Actualisées : {{refreshed}} · Déjà à jour : {{unchanged}}"
     }
   },
   "invoiceActions": {
@@ -1813,6 +2122,7 @@
       "title": "Envoyer cette facture ?",
       "message": "La facture de {{amount}} sera envoyée par e-mail à {{customer}}."
     },
+    "sourceHeldForHourBlock": "Une partie du temps de ce brouillon est réservée à un forfait d’heures et sera facturée à la clôture de la période du forfait. Retirez ces lignes, puis émettez la facture.",
     "unsavedHint": "« {{field}} » contient une modification non enregistrée — l’émission sera disponible une fois enregistrée.",
     "unsavedTitle": "« {{field}} » contient une modification non enregistrée — l’émission sera disponible une fois enregistrée."
   },
@@ -1883,7 +2193,8 @@
       "check": "Chèque",
       "bank_transfer": "Virement bancaire",
       "card": "Carte",
-      "other": "Autre"
+      "other": "Autre",
+      "ach_debit": "Prélèvement ACH"
     },
     "payments": {
       "amount": "Montant",
@@ -1917,19 +2228,21 @@
       },
       "reverseError": "Impossible d'annuler le paiement.",
       "reverseSuccess": "Paiement annulé",
-      "reverseInQuickbooksToo": "Annulez également ce paiement dans QuickBooks",
       "sendLink": "Envoyer le lien de paiement",
       "setUp": "Configurer",
       "shareLinkPrompt": "Partagez ce lien de paiement avec votre client :",
       "stripeNudge": "Connectez Stripe pour accepter les paiements par carte en ligne.",
       "title": "Paiements",
       "viaStripe": "via Stripe",
-      "quickbooks": "QuickBooks",
-      "viaQuickbooks": "via QuickBooks",
-      "inQuickbooks": "Dans QuickBooks",
-      "syncingToQuickbooks": "Synchronisation…",
-      "quickbooksSyncFailed": "Échec de la synchronisation QuickBooks",
-      "currencyUnknown": "La devise de règlement de votre compte Stripe n'est pas encore en cache ; elle n'a donc pas pu être comparée à cette facture en {{documentCurrency}}. Actualisez les détails de votre compte Stripe dans Paramètres → Intégrations pour activer la vérification."
+      "currencyUnknown": "La devise de règlement de votre compte Stripe n'est pas encore en cache ; elle n'a donc pas pu être comparée à cette facture en {{documentCurrency}}. Actualisez les détails de votre compte Stripe dans Paramètres → Intégrations pour activer la vérification.",
+      "inProvider": "Dans {{provider}}",
+      "syncingToProvider": "Synchronisation…",
+      "providerSyncFailed": "Échec de la synchronisation {{provider}}",
+      "reverseInProviderToo": "Annulez également ce paiement dans {{provider}}",
+      "overpayment": "Le montant dépasse le solde dû ({{balance}}).",
+      "fillLabel": "Remplir le montant",
+      "fillDeposit": "Acompte ({{amount}})",
+      "fillBalance": "Solde total ({{amount}})"
     },
     "requestPayment": {
       "invoiceSent": "Facture envoyée",
@@ -1944,7 +2257,8 @@
       "paid": "Payé",
       "subtotal": "Sous-total",
       "tax": "Taxe",
-      "total": "Total"
+      "total": "Total",
+      "depositDueNow": "Acompte dû maintenant"
     },
     "terms": "Conditions générales",
     "void": {
@@ -1969,54 +2283,35 @@
       "error": "Impossible de réinitialiser le lien"
     },
     "accountingSync": {
-      "title": "Synchronisation QuickBooks",
+      "title": "Synchronisation {{provider}}",
       "status": {
         "pending": "Pas encore envoyée",
         "synced": "Synchronisée",
         "error": "Échec de la synchronisation",
         "synced_with_tax_variance": "Synchronisée avec un écart de taxe"
       },
-      "taxVarianceHint": "QuickBooks a calculé un total de taxes différent. Comparez les deux enregistrements avant de clôturer la période.",
-      "docNumber": "Document QuickBooks nº {{docNumber}}",
+      "taxVarianceHint": "{{provider}} a calculé un total de taxes différent. Comparez les deux enregistrements avant de clôturer la période.",
+      "docNumber": "Document {{provider}} nº {{docNumber}}",
       "lastSynced": "Dernière synchronisation : {{when}}",
       "syncing": "Synchronisation…",
-      "push": "Envoyer vers QuickBooks",
-      "pushed": "Facture envoyée vers QuickBooks.",
-      "pushFailed": "Échec de l'envoi de la facture vers QuickBooks.",
-      "voidedHint": "Cette facture est annulée — il n'y a rien à envoyer vers QuickBooks.",
-      "remoteDeletedHint": "Cette facture a été supprimée dans QuickBooks. L'envoyer de nouveau créerait un doublon — réglez d'abord la situation dans QuickBooks."
+      "push": "Envoyer vers {{provider}}",
+      "pushed": "Facture envoyée vers {{provider}}.",
+      "pushFailed": "Échec de l'envoi de la facture vers {{provider}}.",
+      "voidedHint": "Cette facture est annulée — il n'y a rien à envoyer vers {{provider}}.",
+      "remoteDeletedHint": "Cette facture a été supprimée dans {{provider}}. L'envoyer de nouveau créerait un doublon — réglez d'abord la situation dans {{provider}}."
     }
   },
   "invoiceDocument": {
-    "billTo": "Facturer à",
-    "documentType": "Facture",
-    "due": "Échéance",
-    "empty": "Cette facture ne contient encore aucune ligne.",
-    "fallbackTitle": "Facture",
-    "issued": "Émise",
     "preview": {
       "description": "Voici ce que votre client voit sur sa facture.",
       "downloadError": "Impossible de télécharger le PDF de la facture.",
       "downloadPdf": "Télécharger le PDF",
-      "preparing": "Préparation…"
+      "loadError": "Impossible de charger la vue client de cette facture.",
+      "loading": "Chargement de la vue client…",
+      "preparing": "Préparation…",
+      "retry": "Réessayer"
     },
-    "table": {
-      "amount": "Montant",
-      "description": "Description",
-      "qty": "Qté",
-      "tax": "Taxe",
-      "unitPrice": "Prix unitaire"
-    },
-    "terms": "Conditions générales",
-    "ticketHeader": "Ticket n° {{number}}",
-    "ticketWork": "Travail lié au ticket",
-    "totals": {
-      "amountDue": "Montant dû",
-      "paid": "Payé",
-      "subtotal": "Sous-total",
-      "tax": "Taxe",
-      "total": "Total"
-    }
+    "ticketHeader": "Ticket n° {{number}}"
   },
   "invoiceWorkspace": {
     "backLabel": "Factures",
@@ -2047,11 +2342,11 @@
       "success": "{{succeeded}} {{verb}}",
       "void": "Annuler",
       "voidedVerb": "annulées",
-      "quickbooks": "Envoyer vers QuickBooks",
-      "quickbooksQueued": "{{enqueued}} en file d'attente pour QuickBooks",
-      "quickbooksQueuedPartial": "{{enqueued}} en file d'attente pour QuickBooks, {{skipped}} ignorées",
-      "quickbooksQueuedFailed": "{{enqueued}} en file d'attente pour QuickBooks, {{skipped}} ignorées, {{failed}} n'ont pas pu être mises en file d'attente",
-      "quickbooksFailed": "Échec de la mise en file d'attente de l'envoi QuickBooks. Réessayez."
+      "pushToProvider": "Envoyer vers {{provider}}",
+      "providerQueued": "{{enqueued}} en file d'attente pour {{provider}}",
+      "providerQueuedPartial": "{{enqueued}} en file d'attente pour {{provider}}, {{skipped}} ignorées",
+      "providerQueuedFailed": "{{enqueued}} en file d'attente pour {{provider}}, {{skipped}} ignorées, {{failed}} n'ont pas pu être mises en file d'attente",
+      "providerFailed": "Échec de la mise en file d'attente de l'envoi {{provider}}. Réessayez."
     },
     "bulkDelete": {
       "message": "Supprimer {{count}} facture(s) sélectionnée(s) ? Seules les factures DRAFT seront supprimées ; cette action est irréversible.",
@@ -2090,7 +2385,9 @@
       "sourceAria": "Source de facture",
       "title": "Nouvelle facture",
       "to": "À",
-      "working": "Traitement…"
+      "working": "Traitement…",
+      "heldForHourBlock_one": "{{count}} saisie de temps ({{hours}} heures) est retenue pour le forfait d'heures de cette organisation et sera facturée à la clôture de la période du forfait.",
+      "heldForHourBlock_other": "{{count}} saisies de temps ({{hours}} heures) sont retenues pour le forfait d'heures de cette organisation et seront facturées à la clôture de la période du forfait."
     },
     "empty": {
       "description": "Assemblez le temps et les pièces non facturés dans un brouillon ou démarrez une facture vierge.",
@@ -2146,17 +2443,18 @@
       "title": "Adresse de facturation"
     },
     "contact": {
-      "description": "Les devis et factures sont envoyés par e-mail à cette adresse. Sans elle, l'envoi d'une proposition la marque Envoyée, mais aucun e-mail n'est envoyé.",
-      "email": "E-mail du contact",
-      "emailInvalid": "Saisissez une adresse e-mail valide",
-      "emailPlaceholder": "billing@customer.example",
-      "name": "Nom du contact",
+      "description": "Les devis et factures sont envoyés par défaut par e-mail au contact de facturation de l'organisation — le contact au niveau de l'organisation qui a le rôle Facturation. Vous pouvez toujours modifier les destinataires à chaque envoi.",
+      "manage": "Gérer les contacts",
+      "noEmail": "{{name}} a le rôle Facturation mais aucune adresse e-mail : les devis et factures ne peuvent pas être envoyés par e-mail tant qu'une adresse n'est pas ajoutée.",
+      "none": "Aucun contact n'a le rôle Facturation. D'ici là, l'envoi d'une proposition la marque Envoyée, mais aucun e-mail n'est envoyé.",
+      "recipientLabel": "Destinataire par défaut :",
       "title": "Contact de facturation"
     },
     "currency": {
       "title": "Devise",
       "description": "Les nouveaux devis, factures, contrats, saisies de temps et pièces de cette organisation sont horodatés dans cette devise. Rien de ce qui existe déjà n'est modifié.",
       "label": "Devise de facturation",
+      "partnerDefault": "Non hérité : chaque organisation conserve sa propre devise de facturation. La valeur par défaut du partenaire ({{currency}}) ne s'applique qu'aux organisations créées à partir de maintenant.",
       "loading": "Vérification de l'impact d'un passage à {{currency}}…",
       "error": "Le résumé du changement de devise n'a pas pu être chargé.",
       "panelTitle": "Changer la devise de facturation pour {{currency}} ?",
@@ -2202,22 +2500,48 @@
       "taxId": "Identifiant fiscal",
       "taxRate": "Taux de taxe (%)",
       "title": "Taxe"
+    },
+    "terms": {
+      "description": "Nombre de jours entre l'émission et l'échéance des factures de cette organisation. Laissez vide pour utiliser la valeur par défaut du partenaire. Les modifications s'appliquent aux factures émises à partir de maintenant ; les factures émises conservent leur date d'échéance.",
+      "invalid": "Saisissez un nombre entier de jours entre 0 et 365.",
+      "partnerDefault": "Valeur par défaut du partenaire",
+      "paymentTermsDays": "Délai de paiement (jours)",
+      "title": "Délai de paiement"
     }
   },
   "partnerBillingSettings": {
+    "agreements": {
+      "title": "Conventions",
+      "description": "Valeurs par défaut des conventions que vous envoyez pour signature. Les expéditeurs peuvent toujours choisir une autre échéance pour chaque demande.",
+      "expiryDays": "Expiration par défaut du lien (jours)",
+      "expiryDaysHelp": "Le lien de signature d’une nouvelle demande de convention expire ce nombre de jours après sa création, sauf si l’expéditeur choisit une autre date.",
+      "expiryDaysInvalid": "Saisissez un nombre entier de jours entre {{min}} et {{max}}.",
+      "remindersEnabled": "Envoyer des rappels automatiques",
+      "remindersHelp": "Renvoie par courriel le même lien de signature aux destinataires jusqu’à ce que la convention soit signée, refusée, annulée ou expirée.",
+      "intervalDays": "Rappeler tous les (jours)",
+      "intervalDaysInvalid": "Saisissez un nombre entier de jours entre {{min}} et {{max}}.",
+      "maxReminders": "Arrêter après (rappels)",
+      "maxRemindersHelp": "Compte tous les rappels de la demande, manuels ou automatiques.",
+      "maxRemindersInvalid": "Saisissez un nombre entier entre {{min}} et {{max}}.",
+      "readOnlyNoSend": "Modifier les valeurs par défaut des conventions nécessite l’autorisation d’envoyer des conventions. Vous disposez d’un accès en lecture seule."
+    },
     "company": {
+      "addressInherited": "Identique aux coordonnées de l'entreprise",
       "addressLine1": "Adresse ligne 1",
       "addressLine2": "Adresse ligne 2",
+      "addressTitle": "Adresse",
       "city": "Ville",
       "country": "Pays",
       "defaultTerms": "Conditions générales par défaut",
       "defaultTermsPlaceholder": "Conditions de paiement, clauses de non-responsabilité, garantie, etc.",
       "description": "Affiché comme vendeur sur les devis et factures.",
+      "inheritedFromCompanyDetails": "Coordonnées de l'entreprise",
       "name": "Nom de l'entreprise",
       "phone": "Téléphone",
       "postal": "Code postal",
       "region": "État / région",
       "title": "Contact entreprise",
+      "useCompanyAddress": "Utiliser l'adresse de l'entreprise",
       "website": "Site web"
     },
     "defaults": {
@@ -2230,30 +2554,45 @@
       "autoEmailInvoiceHelp": "Lorsqu'un client accepte une proposition, la facture émise est envoyée immédiatement par e-mail avec un lien sécurisé pour consulter et payer — sans connexion.",
       "notifyOnBehalfAcceptance": "Prévenir le client par e-mail lorsque vous enregistrez une acceptation en son nom",
       "notifyOnBehalfAcceptanceHelp": "Lorsqu'un membre de votre équipe accepte un devis pour un client, celui-ci reçoit un court message indiquant qui l'a enregistrée et quand, avec le numéro de facture si une facture a été émise. Il peut répondre en cas d'erreur. Désactivé par défaut.",
-      "currencyCode": "Code devise",
+      "currencyCode": "Devise par défaut des nouvelles organisations",
+      "currencyHelp": "Les nouvelles organisations démarrent dans cette devise. Les organisations existantes conservent la leur — modifiez-la dans l'onglet Facturation de chaque organisation.",
       "defaultMarkup": "Marge par défaut (%)",
       "defaultTaxRate": "Taux de taxe par défaut (%)",
-      "description": "Devise, taxe, numérotation et conditions appliquées aux nouveaux devis et factures de tous vos clients.",
+      "description": "Valeurs par défaut des devis et factures de vos clients. Une organisation peut définir son propre taux de taxe et ses propres conditions de paiement. Sa devise part de la devise par défaut définie ici et se modifie dans l'onglet Facturation de cette organisation.",
       "deviceAppendix": "Inclure l'annexe des appareils facturés dans les PDF de factures",
       "deviceAppendixHelp": "Ajoute une page listant chaque appareil compté sur chaque ligne de facture. Désactivé par défaut ; le choix est figé à l'émission de la facture.",
       "documentPageSize": "Format de page",
       "documentPageSizeA4": "A4",
       "documentPageSizeLetter": "Lettre",
-      "documentTheme": "Thème du document",
-      "documentThemeClassic": "Classique",
-      "documentThemeCondensed": "Condensé",
-      "invoiceFooter": "Pied de facture",
+      "documentTheme": "Polices des documents",
+      "documentThemeClassic": "Helvetica",
+      "documentThemeCondensed": "Barlow Condensed + DM Sans",
+      "invoiceFooter": "Pied de page des documents",
+      "invoiceFooterHelp": "Imprimé en bas de chaque page de vos devis et factures. Le texte de pied de page propre à une organisation (dans ses paramètres du portail) le remplace pour cette organisation, et la ligne de pied de page propre à un devis remplace les deux.",
       "invoiceFooterPlaceholder": "Instructions de paiement, message de remerciement, etc.",
       "invoiceNumberPrefix": "Préfixe de numéro de facture",
       "markupHelp": "Marge par défaut sur le coût distributeur, utilisée pour préremplir le prix de vente lors de l'import d'articles du catalogue. La marge brute résultante est affichée pendant l'import.",
       "paymentTermsDays": "Délai de paiement (jours)",
-      "title": "Valeurs par défaut de facturation"
+      "prefixInvalid": "Saisissez un préfixe de 1 à 12 caractères.",
+      "taxRateInvalid": "Saisissez un taux de taxe de 0 à 100.",
+      "termsDaysInvalid": "Saisissez un nombre entier de jours de 0 à 365.",
+      "title": "Valeurs par défaut de facturation",
+      "lineDetailTitle": "Lignes de saisie de temps sur les factures",
+      "lineDetailHelp": "Choisissez ce que les clients voient pour les saisies de temps. Un brouillon de facture peut remplacer ce choix ; il est figé à l’émission de la facture.",
+      "lineShowDate": "Afficher la date du travail",
+      "lineShowNote": "Afficher la note du technicien",
+      "lineShowWorkedTime": "Afficher le temps travaillé et le temps facturé",
+      "lineGrouping": "Présentation",
+      "lineGroupingEntry": "Une ligne par saisie",
+      "lineGroupingDay": "Regrouper par jour"
     },
     "loadError": "Échec du chargement des paramètres de facturation.",
     "loading": "Chargement des paramètres de facturation…",
     "saveButton": "Enregistrer les paramètres de facturation",
     "saveError": "Impossible d’enregistrer les paramètres de facturation.",
-    "saveSuccess": "Paramètres de facturation enregistrés"
+    "saveSuccess": "Paramètres de facturation enregistrés",
+    "readOnlyNotice": "Vous disposez d'un accès en lecture seule aux paramètres de facturation. Demandez à un administrateur de les modifier.",
+    "readOnlyNoPartnerWideNotice": "Les paramètres de facturation s'appliquent à toutes les organisations ; les modifier exige un accès complet aux organisations du partenaire. Vous disposez d'un accès en lecture seule."
   },
   "shared": {
     "documentWorkspace": {
@@ -2272,13 +2611,15 @@
   "partnerBillingSettingsTabs": {
     "defaults": "Valeurs par défaut",
     "documents": "Documents",
+    "agreements": "Conventions",
     "connections": "Connexions",
-    "rates": "Tarifs"
+    "rates": "Tarifs",
+    "payments": "Paiements"
   },
   "billingConnectionsTab": {
     "accounting": {
       "title": "Comptabilité",
-      "description": "Stripe et QuickBooks se connectent sous Intégrations — gérez-les là-bas.",
+      "description": "Stripe, QuickBooks et Xero se connectent sous Intégrations — gérez-les là-bas.",
       "cta": "Gérer les connexions comptables →"
     },
     "catalog": {
@@ -2306,7 +2647,8 @@
     "currencyWarning": "Le profil de facturation attribué utilise {{currency}}. Après ce changement, le profil par défaut du partenaire dans la devise correspondante s’appliquera.",
     "loadError": "Impossible de charger les profils de facturation.",
     "saveError": "Impossible d’enregistrer le profil de facturation.",
-    "partialSave": "Le profil de facturation a été enregistré, mais pas les autres paramètres de facturation. Réessayez d’enregistrer pour terminer."
+    "partialSave": "Le profil de facturation a été enregistré, mais pas les autres paramètres de facturation. Réessayez d’enregistrer pour terminer.",
+    "aiUsage": "Usage IA : {{summary}}"
   },
   "rates": {
     "title": "Tarifs",
@@ -2324,6 +2666,8 @@
     "setDefault": "Définir par défaut",
     "archive": "Archiver",
     "usageUnavailable": "L’utilisation par les organisations n’est pas disponible.",
+    "readOnlyNotice": "Vous disposez d'un accès en lecture seule aux tarifs de facturation. Demandez à un administrateur de les modifier.",
+    "readOnlyNoPartnerWideNotice": "Les tarifs de facturation s'appliquent à toutes les organisations ; les modifier exige un accès complet aux organisations du partenaire. Vous disposez d'un accès en lecture seule.",
     "edit": "Modifier le profil de facturation",
     "name": "Nom",
     "currency": "Devise",
@@ -2340,6 +2684,305 @@
     "minimumSummary": "Minimum de {{minutes}} min",
     "roundingSummary": "Arrondir à {{minutes}} min",
     "inherits": "Utilise Tous les autres travaux",
-    "currencyHelp": "La devise d’un profil par défaut ou comportant des tarifs ne peut pas être modifiée. Laissez l’arrondi vide pour ne pas arrondir."
+    "currencyHelp": "La devise d’un profil par défaut ou comportant des tarifs ne peut pas être modifiée. Laissez l’arrondi vide pour ne pas arrondir.",
+    "ai": {
+      "column": "Usage IA",
+      "sectionTitle": "Usage de l'IA",
+      "sectionHelp": "Comment l'usage de Breeze AI par les organisations utilisant ce profil de facturation est facturé. Facturez le coût Breeze majoré d'une marge, ou fixez un prix par modèle.",
+      "coverage": "Facturation de l'usage IA",
+      "coverageBillable": "Facturable",
+      "coverageIncluded": "Inclus",
+      "coverageNotBilled": "Non facturé",
+      "markup": "Marge sur le coût (%)",
+      "markupHelp": "Ajoutée au coût Breeze en USD de chaque requête. 25 facture le coût plus 25 %. Laissez vide pour ne facturer que les modèles de la liste de prix.",
+      "markupInvalid": "Saisissez un pourcentage de 0 à 1000 avec au plus deux décimales.",
+      "priceListTitle": "Liste de prix",
+      "priceListHelp": "Les prix sont en {{currency}} par million de jetons. Un modèle de la liste utilise son prix à la place de la marge.",
+      "priceListEmpty": "Aucun prix de modèle pour le moment.",
+      "addRate": "Ajouter un prix de modèle",
+      "removeRate": "Retirer",
+      "modelId": "Modèle",
+      "modelPlaceholder": "Choisissez ou saisissez un identifiant de modèle",
+      "inputPrice": "Entrée",
+      "outputPrice": "Sortie",
+      "cacheReadPrice": "Lecture du cache",
+      "cacheWritePrice": "Écriture du cache",
+      "rowInvalid": "Saisissez un identifiant de modèle et les quatre prix, par exemple 3.00 ou 0.30.",
+      "rowDuplicate": "Ce modèle figure déjà dans la liste de prix.",
+      "choicesUnavailable": "Les suggestions de modèles sont indisponibles. Saisissez plutôt un identifiant de modèle.",
+      "usdOnlyWarning": "La marge ne s'applique qu'aux profils en USD ; ajoutez une liste de prix en {{currency}} ou l'usage sera enregistré sans prix.",
+      "summaryBillableMarkup": "Facturable · coût +{{percent}} %",
+      "summaryBillablePriceList_one": "Facturable · liste de prix ({{count}} modèle)",
+      "summaryBillablePriceList_other": "Facturable · liste de prix ({{count}} modèles)",
+      "summaryBillablePriceListMarkup_one": "Facturable · liste de prix ({{count}} modèle), autres au coût +{{percent}} %",
+      "summaryBillablePriceListMarkup_other": "Facturable · liste de prix ({{count}} modèles), autres au coût +{{percent}} %",
+      "summaryBillableUnpriced": "Facturable · sans prix",
+      "summaryIncluded": "Inclus",
+      "summaryNotBilled": "Non facturé"
+    }
+  },
+  "autopay": {
+    "chargeConfirmTitle": "Confirmer le paiement automatique",
+    "chargeConfirmMessage": "Prélever jusqu’à {{amount}}, frais de traitement compris, pour la facture {{invoice}} avec {{method}} ?",
+    "noticeQueued": "Avis de paiement automatique en attente d’envoi",
+    "requestDeliveryFailed": "Le courriel de demande n’a pas pu être envoyé. Renvoyez la demande.",
+    "skipNoContact": "Aucune adresse de facturation disponible. Ajoutez une adresse ou indiquez un destinataire.",
+    "skipStripeNotReady": "Stripe n’est pas prêt pour les paiements automatiques. Vérifiez la connexion et les autorisations.",
+    "skipAlreadyActive": "Les paiements automatiques sont déjà actifs ou suspendus.",
+    "title": "Paiement automatique",
+    "loading": "Chargement des paiements automatiques…",
+    "error": "Impossible de terminer cette action. Veuillez réessayer.",
+    "saved": "Paiement automatique mis à jour",
+    "save": "Enregistrer",
+    "invalid": "Saisissez un nombre entier de jours entre 0 et 60 et un plafond positif avec un code de devise à trois lettres.",
+    "offset-days": "Jours après émission",
+    "offset-rule": "Comparaison avec la date d’échéance",
+    "cap-enabled": "Plafond de paiement automatique",
+    "cap-amount": "Montant maximal",
+    "cap-currency": "Devise",
+    "ach-mode": "Moyens de paiement",
+    "inherit": "{{value}} — hérité de {{source}}",
+    "source": {
+      "org": "Organisation cliente",
+      "partner": "Valeur par défaut du partenaire",
+      "default": "Valeur par défaut de Breeze"
+    },
+    "option": {
+      "earlier": "La date la plus proche",
+      "later": "La date la plus tardive",
+      "false": "Sans limite",
+      "true": "Plafond activé",
+      "ach_preferred": "Compte bancaire privilégié ; cartes acceptées",
+      "ach_only": "Compte bancaire uniquement"
+    },
+    "achRisk": "Les paiements bancaires sont disponibles pour les comptes américains éligibles en USD. Votre entreprise est responsable des rejets ACH et des frais de rejet Stripe ; les rejets de comptes individuels peuvent survenir jusqu’à 60 jours plus tard.",
+    "stripeNotReady": "Les paiements automatiques ne sont pas disponibles. Vérifiez les autorisations Stripe : {{permissions}}.",
+    "stripeDisconnected": "Connectez d’abord Stripe",
+    "card": "Carte",
+    "bank": "Compte bancaire",
+    "done": "Demande terminée.",
+    "status": {
+      "not_requested": "Non demandé",
+      "requested": "Demandé",
+      "active": "Actif",
+      "paused": "En pause",
+      "cancelled": "Désactivé",
+      "needs_attention": "Intervention requise"
+    },
+    "pending": "La vérification bancaire est en attente. Aucun paiement automatique ne peut encore être effectué.",
+    "effective": "S’applique aux factures émises après le {{date}}",
+    "recipient": "Autre destinataire de la demande (facultatif)",
+    "request": "Envoyer la demande",
+    "resend": "Renvoyer la demande",
+    "pause": "Mettre en pause",
+    "resume": "Reprendre",
+    "turnOff": "Désactiver",
+    "cancel": "Annuler",
+    "processingWarning": "Les futurs paiements automatiques seront arrêtés. Un paiement bancaire déjà en cours de traitement ne peut pas être rappelé.",
+    "unasked_one": "{{count}} client pas encore sollicité",
+    "unasked_other": "{{count}} clients pas encore sollicités",
+    "sendNow": "Envoyer maintenant",
+    "dismiss": "Masquer",
+    "select": "Sélectionner",
+    "client": "Client facturé",
+    "statusLabel": "État",
+    "method": "Moyen de paiement",
+    "selectClient": "Sélectionner {{name}}",
+    "empty": "Aucun client trouvé.",
+    "requestedCount_one": "Demande envoyée à {{count}} client.",
+    "requestedCount_other": "Demandes envoyées à {{count}} clients.",
+    "chargeDate": "Prélèvement aux alentours du {{date}}",
+    "excludeInvoice": "Exclure cette facture des paiements automatiques",
+    "excludeRefusedProcessing": "Le paiement de cette facture est déjà en cours de traitement et ne peut pas être arrêté. Vous pourrez exclure la facture une fois le paiement abouti ou échoué.",
+    "excludeContract": "Exclure les factures comprenant ce contrat",
+    "failed": "Impossible de mettre à jour le paiement automatique. Veuillez réessayer.",
+    "states": {
+      "awaiting_notice": "En attente de l’avis",
+      "scheduled": "Programmé",
+      "collecting": "Prélèvement en cours",
+      "retry_scheduled": "Nouvelle tentative programmée",
+      "action_required": "Confirmation requise",
+      "succeeded": "Paiement reçu",
+      "failed": "Échec du paiement",
+      "skipped_by_client": "Ignoré par le client",
+      "excluded_by_msp": "Exclu par le prestataire",
+      "cancelled": "Annulé",
+      "not_needed": "Aucun paiement nécessaire",
+      "reserved": "Paiement réservé",
+      "created": "Paiement créé",
+      "confirming": "Confirmation du paiement en cours",
+      "processing": "Traitement du paiement en cours",
+      "requires_action": "Confirmation requise",
+      "canceled": "Annulé",
+      "unapplied": "Rapprochement du paiement nécessaire"
+    },
+    "reasons": {
+      "not_enrolled": "Non inscrit",
+      "enrolled_after_issue": "Inscrit après l’émission de la facture",
+      "method_not_usable": "Moyen de paiement indisponible",
+      "over_cap": "Plafond de paiement automatique dépassé",
+      "above_authorized_cap": "Au-dessus de la limite autorisée par le client",
+      "issued_before_authorization": "Émise avant l'autorisation mise à jour du client : à encaisser manuellement",
+      "cap_currency_mismatch": "La devise du plafond ne correspond pas",
+      "ach_currency_unsupported": "Devise non prise en charge pour les paiements bancaires",
+      "excluded_contract": "Contrat exclu",
+      "excluded_invoice": "Facture exclue",
+      "charging_disabled": "Prélèvement automatique désactivé",
+      "stripe_unavailable": "Stripe indisponible",
+      "bank_unverified": "Non prélevée : le compte bancaire du client n'a pas été vérifié à temps. À encaisser manuellement",
+      "charging_on_hold": "Non prélevée : les paiements automatiques sont restés désactivés. À encaisser manuellement",
+      "service_unavailable": "Non prélevée : Stripe est resté inaccessible. À encaisser manuellement",
+      "control_pending:skip": "Demande d’omission reçue; arrêt du paiement en attente",
+      "control_pending:exclude": "Exclusion demandée; arrêt du paiement en attente",
+      "control_pending:stop": "Arrêt demandé; arrêt du paiement en attente",
+      "control_pending:renotice": "Mise à jour de l’avis ; arrêt du paiement en attente",
+      "skip": "Ignoré par le client",
+      "exclude": "Exclu par le prestataire",
+      "stop": "Paiements automatiques arrêtés",
+      "client_request": "Demandé par le client",
+      "no_billing_contact": "Aucun contact de facturation",
+      "delivery_failed": "Échec de l’envoi de l’avis",
+      "consent_required": "L’autorisation de paiement est manquante. Demandez une nouvelle autorisation."
+    },
+    "chargeFailed": "Impossible de lancer le paiement. Réessayez.",
+    "chargeResultUnknown": "Nous n’avons pas pu confirmer ce qu’il est advenu de ce paiement. Actualisation de la facture pour afficher son état actuel.",
+    "chargeStarted": "Tentative de paiement lancée",
+    "chargeNow": "Prélever maintenant",
+    "noCharge": "Aucun prélèvement",
+    "noticeStuck": "Avis de paiement à vérifier",
+    "unapplied": "{{count}} paiement(s) nécessitent un rapprochement. Vérifiez les montants non rapprochés avant un nouveau prélèvement.",
+    "lastCharge": "Dernier prélèvement",
+    "attention": "À vérifier",
+    "attemptStates": {
+      "reserved": "Paiement réservé",
+      "created": "Paiement créé",
+      "confirming": "Confirmation du paiement en cours",
+      "processing": "Traitement du paiement en cours",
+      "succeeded": "Paiement reçu",
+      "failed": "Échec du paiement",
+      "requires_action": "Confirmation requise",
+      "canceled": "Annulé",
+      "unapplied": "Rapprochement du paiement nécessaire",
+      "returned": "Rejeté",
+      "refunded": "Remboursé",
+      "disputed": "Contesté"
+    },
+    "fees": {
+      "title": "Frais de traitement",
+      "cardBps": "Frais de carte de crédit (points de base, 0–300)",
+      "ach": "Frais de paiement bancaire (USD, 0.00–25.00)",
+      "inactive": "Les frais de carte restent inactifs tant que votre administrateur partenaire n’a pas confirmé les deux déclarations ci-dessous.",
+      "notified": "J’ai informé mon acquéreur (Stripe) et les réseaux de cartes il y a au moins 30 jours",
+      "cost": "Ces frais ne dépassent pas mon coût d’acceptation des cartes",
+      "rules": "Cartes de crédit uniquement. Aucun frais de carte en CA, CT, ME ou MA ; plafond de 2 % au Colorado. Les frais s’appliquent uniquement aux paiements automatiques américains éligibles en USD. Les liens de paiement ponctuel sont sans frais.",
+      "legal": "Breeze ne fournit pas de conseils juridiques. Vous êtes responsable de l’éligibilité des majorations, des avis et du traitement fiscal.",
+      "lowerAuthorization": "Clients ayant autorisé des conditions inférieures : {{count}}. Leur autorisation actuelle reste en vigueur jusqu’à l’acceptation des nouvelles conditions.",
+      "authorizedCard": "Autorisé : {{accepted}} points de base ; configuré : {{configured}}",
+      "authorizedAch": "Autorisé : USD {{accepted}} ; configuré : USD {{configured}}",
+      "authorizedCap": "Plafond autorisé : {{accepted}} ; configuré : {{configured}}",
+      "noCap": "aucun plafond",
+      "requestAuthorization": "Demander une nouvelle autorisation",
+      "requestFailed": "Impossible de demander une nouvelle autorisation. Vérifiez le contact de facturation et la disponibilité de Stripe.",
+      "requested": "Nouvelle autorisation demandée. L’autorisation actuelle reste en vigueur.",
+      "attestationOnFile": "Attestation enregistrée : {{name}} a confirmé les deux déclarations le {{date}}.",
+      "attestationOnFileUnknown": "Attestation enregistrée : les deux déclarations ont été confirmées le {{date}}.",
+      "reattestHelp": "Pour attester de nouveau, cochez les deux déclarations puis enregistrez. Une nouvelle attestation est enregistrée à votre nom avec la date du jour et remplace celle en place. Les frais autorisés par vos clients ne changent pas.",
+      "authorizedCardNone": "Aucune autorisation enregistrée ; configuré : {{configured}} points de base",
+      "authorizedAchNone": "Aucune autorisation enregistrée ; configuré : USD {{configured}}",
+      "lowerAuthorizationOrg": "Ce client n’a pas autorisé les conditions configurées. Toute autorisation existante reste en vigueur jusqu’à l’acceptation des nouvelles conditions.",
+      "blankPartner": "Un champ vide applique la valeur par défaut de Breeze (sans frais). Pour exonérer un client, saisissez 0 comme frais sur sa page Facturation.",
+      "blankOrg": "Un champ vide reprend la valeur par défaut du partenaire. Saisissez 0 pour exonérer ce client.",
+      "inactiveOrg": "Les frais de carte restent inactifs tant qu’un administrateur partenaire n’a pas confirmé les deux déclarations sur les frais dans l’onglet Payments des paramètres de facturation du partenaire.",
+      "missingAuthorization": "Aucune autorisation enregistrée : {{count}}. Les paiements automatiques ne peuvent pas prélever ces clients tant qu’ils n’ont pas autorisé leur moyen de paiement enregistré.",
+      "missingAuthorizationOrg": "Ce client n’a aucune autorisation pour le moyen de paiement enregistré. Les paiements automatiques ne peuvent pas le prélever tant qu’il ne l’a pas autorisé.",
+      "requestMissingAuthorization": "Demander une autorisation"
+    },
+    "enrollmentTitle": "Inscription au paiement automatique",
+    "requestSentTo": "Demande envoyée à {{email}}.",
+    "result": {
+      "paused": "Paiements automatiques suspendus.",
+      "resumed": "Paiements automatiques repris.",
+      "turnedOff": "Paiements automatiques désactivés."
+    },
+    "needsAttention": {
+      "method_unusable": "Le moyen de paiement enregistré ne peut pas être prélevé.",
+      "stripe_account_changed": "Le compte Stripe connecté a changé après l’inscription de ce client.",
+      "key_missing_permissions": "Il manque à la clé Stripe des autorisations nécessaires aux paiements automatiques.",
+      "verification_failed": "La vérification du compte bancaire a échoué."
+    },
+    "chargeOutcome": {
+      "succeeded": "Paiement reçu.",
+      "processing": "Paiement envoyé. Il est en cours de traitement ; la facture sera mise à jour une fois le paiement réglé.",
+      "requiresAction": "La banque du client exige qu’il confirme ce paiement. Si un contact de facturation est enregistré, il reçoit par e-mail un lien pour le confirmer.",
+      "declined": "Le paiement n’a pas abouti.",
+      "cardDeclined": "La carte a été refusée.",
+      "expiredCard": "La carte a expiré. Demandez au client de mettre à jour son moyen de paiement.",
+      "insufficientFunds": "Le paiement a été refusé pour provision insuffisante.",
+      "canceled": "Le paiement a été annulé avant d’aboutir.",
+      "unapplied": "Le paiement a été encaissé mais doit être rapproché. Vérifiez-le avant de prélever à nouveau."
+    },
+    "chargeRefused": {
+      "notice_lead": "Le délai de préavis du client n’est pas encore écoulé. La facture pourra être prélevée ensuite.",
+      "no_eligible_notice": "Cette facture n’a pas d’avis de paiement automatique ; elle ne peut donc pas être prélevée automatiquement.",
+      "renotice_required": "L’avis de paiement doit être renvoyé avant de pouvoir prélever cette facture.",
+      "collection_in_progress": "Un paiement est déjà en cours pour cette facture.",
+      "checkout_session_unrevoked": "Le client est peut-être en train de payer cette facture en ligne. Réessayez dans quelques minutes.",
+      "retry_not_due": "La prochaine nouvelle tentative n’est pas encore due.",
+      "not_payable": "Cette facture n’est pas ouverte au paiement.",
+      "nothing_to_pay": "Il ne reste rien à payer sur cette facture.",
+      "enrollment_inactive": "Les paiements automatiques ne sont pas actifs pour ce client.",
+      "schedule_inactive": "Cette facture n’est plus planifiée pour un paiement automatique.",
+      "generic": "Le paiement automatique n’a pas pu démarrer. Actualisez la facture pour voir son état actuel.",
+      "excluded_contract": "Le contrat de cette facture est exclu des paiements automatiques, donc rien n'a été prélevé. Si le client avait été prévenu de ce paiement, il a reçu un e-mail indiquant qu'il n'aura pas lieu."
+    },
+    "stepUp": {
+      "heading": "Confirmez que c'est bien vous",
+      "intro": {
+        "autopay_charge_now": "Prélever cette facture maintenant nécessite une nouvelle vérification à deux facteurs.",
+        "partner_payment_settings_update": "Modifier les paramètres de paiement nécessite une nouvelle vérification à deux facteurs pour ces valeurs précises.",
+        "org_payment_settings_update": "Modifier les paramètres de paiement de cette organisation nécessite une nouvelle vérification à deux facteurs pour ces valeurs précises.",
+        "autopay_request_recipient": "Envoyer la demande d'autorisation à une adresse autre que celle du contact de facturation nécessite une nouvelle vérification à deux facteurs."
+      },
+      "code": "Code d'authentification",
+      "passkey": "Vous confirmerez avec votre clé d'accès.",
+      "noFactor": "Ajoutez d'abord une application d'authentification ou une clé d'accès à votre compte.",
+      "noFactorSmsOnly": "Les codes par SMS ne peuvent pas confirmer cette action. Ajoutez d'abord une application d'authentification ou une clé d'accès à votre compte.",
+      "enrollLink": "Configurer un second facteur",
+      "confirm": "Confirmer",
+      "failed": "Échec de la vérification. Réessayez.",
+      "unavailable": "Impossible de démarrer la vérification"
+    },
+    "notEnabled": {
+      "title": "Les paiements automatiques ne sont pas activés pour votre compte",
+      "hint": "Les paiements automatiques n'ont pas encore été activés. Demandez à votre administrateur Breeze de les activer, puis revenez demander l'inscription à vos clients."
+    }
+  },
+  "reminders": {
+    "title": "Rappels de paiement",
+    "description": "Envoyer des rappels de factures impayées au contact de facturation de l’organisation. Les rappels fonctionnent sans paiements automatiques.",
+    "enabled": "Envoyer des rappels de paiement",
+    "on": "Activés",
+    "off": "Désactivés",
+    "inherit": "Utiliser {{source}} : {{value}}",
+    "before": "Jours avant l’échéance",
+    "repeat": "Répéter avant l’échéance tous les (jours)",
+    "overdue": "Rappeler après l’échéance tous les (jours)",
+    "noRepeat": "Sans répétition",
+    "orgRepeatHelp": "Un champ vide reprend le paramètre du partenaire. Vous ne pouvez pas désactiver uniquement les répétitions avant l’échéance si le partenaire les a activées ; désactivez les rappels pour cette organisation pour tous les arrêter.",
+    "partnerRepeatHelp": "Laissez l’intervalle de répétition vide pour envoyer un seul rappel avant l’échéance. Les autres champs vides utilisent la valeur par défaut affichée.",
+    "cadenceHelp": "Aucun rappel n’est envoyé le jour de l’échéance. Le premier rappel de retard est envoyé un intervalle après l’échéance. Modifier les dates ou les intervalles ne renvoie pas les rappels déjà attribués.",
+    "invalid": "Saisissez un nombre entier de jours entre 1 et 31, ou laissez le champ vide pour hériter de la valeur.",
+    "sources": {
+      "org": "organisation",
+      "partner": "valeur par défaut du partenaire",
+      "default": "valeur par défaut de Breeze"
+    },
+    "save": "Enregistrer les paramètres de paiement",
+    "saving": "Enregistrement…",
+    "saved": "Paramètres de rappel enregistrés",
+    "saveFailed": "Impossible d’enregistrer les paramètres de rappel",
+    "loadFailed": "Impossible de charger les paramètres de rappel",
+    "retry": "Réessayer",
+    "loading": "Chargement des paramètres de paiement…"
   }
 }

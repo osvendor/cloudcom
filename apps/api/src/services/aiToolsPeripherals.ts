@@ -7,6 +7,7 @@
  */
 
 import { db } from '../db';
+import { findPartnerOwnedGroupIds, partnerGroupTargetRefusal } from './deviceGroupOwnership';
 import {
   organizations,
   peripheralEvents,
@@ -32,49 +33,36 @@ import {
   resolveSiteAllowedDeviceIds,
   SITE_SCOPE_EMPTY_NOTE,
 } from './aiToolsSiteScope';
+import type { ToolExecutionContext } from './toolExecutionContext';
+import { resolveWritableToolOrgId } from './aiToolWriteOrg';
+import { notHoldingOrgCondition } from './unassignedPool/selectorPredicate';
 
 type AiToolTier = 1 | 2 | 3 | 4;
+
+/**
+ * #6911: `manage_peripheral_policy:create` is user-owned on release
+ * (`USER_OWNED_RELEASE_ACTIONS` in `jobs/intentReleaseWorker.ts`) — it writes
+ * `auth.user.id` into `peripheral_policies.created_by`, a `users` FK. Under
+ * the rebuilt agent auth that id is an `aiAgents.id`, so refuse rather than
+ * write a row whose owner the worker and this handler's auth disagree about.
+ * Mirrors `aiToolsFleet.ts`'s `approverReleaseMismatch`.
+ */
+function approverReleaseMismatch(auth: AuthContext, context: ToolExecutionContext | undefined): boolean {
+  return !!context?.approverRelease && context.approverRelease.approverUserId !== auth.user.id;
+}
 
 function normalizePeripheralException(input: Record<string, unknown>): PeripheralExceptionRule {
   return {
     vendor: typeof input.vendor === 'string' ? input.vendor.trim() || undefined : undefined,
     product: typeof input.product === 'string' ? input.product.trim() || undefined : undefined,
     serialNumber: typeof input.serialNumber === 'string' ? input.serialNumber.trim() || undefined : undefined,
-    allow: typeof input.allow === 'boolean' ? input.allow : undefined,
+    // REST defaults allow ?? true (routes/peripheralControl.ts exception normalizer).
+    allow: typeof input.allow === 'boolean' ? input.allow : true,
     reason: typeof input.reason === 'string' ? input.reason.trim() || undefined : undefined,
     expiresAt: typeof input.expiresAt === 'string' ? input.expiresAt : undefined,
   };
 }
 
-function resolveWritableToolOrgId(
-  auth: AuthContext,
-  inputOrgId?: string
-): { orgId?: string; error?: string } {
-  if (auth.scope === 'organization') {
-    if (!auth.orgId) return { error: 'Organization context required' };
-    if (inputOrgId && inputOrgId !== auth.orgId) {
-      return { error: 'Cannot access another organization' };
-    }
-    return { orgId: auth.orgId };
-  }
-
-  if (inputOrgId) {
-    if (!auth.canAccessOrg(inputOrgId)) {
-      return { error: 'Access denied to this organization' };
-    }
-    return { orgId: inputOrgId };
-  }
-
-  if (auth.orgId) {
-    return { orgId: auth.orgId };
-  }
-
-  if (Array.isArray(auth.accessibleOrgIds) && auth.accessibleOrgIds.length === 1) {
-    return { orgId: auth.accessibleOrgIds[0] };
-  }
-
-  return { error: 'orgId is required for this operation' };
-}
 
 function combineWarning(current: string | undefined, next: string): string {
   return current ? `${current}; ${next}` : next;
@@ -109,7 +97,7 @@ export function registerPeripheralTools(aiTools: Map<string, AiTool>): void {
           },
           start: { type: 'string', description: 'ISO timestamp lower bound (max 90-day window)' },
           end: { type: 'string', description: 'ISO timestamp upper bound (max 90-day window)' },
-          limit: { type: 'number', description: 'Max rows to return (default 100, max 500). REST API supports up to 1000.' }
+          limit: { type: 'number', description: 'Max rows (default 100, max 500)' }
         }
       }
     },
@@ -238,12 +226,17 @@ export function registerPeripheralTools(aiTools: Map<string, AiTool>): void {
         required: ['action']
       }
     },
-    handler: async (input, auth) => {
+    handler: async (input, auth, context) => {
       if (!canMutateOrgWideGovernance(auth)) {
         return JSON.stringify({ error: SITE_CEILING_WRITE_DENIED_MESSAGE });
       }
       const action = String(input.action ?? '');
       const policyId = typeof input.policy_id === 'string' ? input.policy_id : undefined;
+      if (action === 'create' || action === 'update') {
+        const groupIds = (input.target_ids as { groupIds?: string[] } | undefined)?.groupIds ?? [];
+        const partnerGroupIds = await findPartnerOwnedGroupIds(groupIds);
+        if (partnerGroupIds.length > 0) return JSON.stringify(partnerGroupTargetRefusal(partnerGroupIds));
+      }
       const requestedPriority = input.priority;
       if (requestedPriority !== undefined && (
         typeof requestedPriority !== 'number'
@@ -291,7 +284,7 @@ export function registerPeripheralTools(aiTools: Map<string, AiTool>): void {
           .from(organizations)
           // The hidden 'quick_support' org holds only ephemeral support devices —
           // a partner-wide peripheral policy must not fan out into it.
-          .where(and(eq(organizations.partnerId, policy.partnerId), ne(organizations.type, 'quick_support')));
+          .where(and(eq(organizations.partnerId, policy.partnerId), ne(organizations.type, 'quick_support'), notHoldingOrgCondition()));
         return rows.map((row) => row.id);
       };
 
@@ -343,6 +336,10 @@ export function registerPeripheralTools(aiTools: Map<string, AiTool>): void {
       };
 
       if (action === 'create') {
+        // #6911: user-owned on release — see approverReleaseMismatch.
+        if (approverReleaseMismatch(auth, context)) {
+          return JSON.stringify({ error: 'approver_auth_mismatch', action });
+        }
         const orgResolved = resolveWritableToolOrgId(
           auth,
           typeof input.org_id === 'string' ? input.org_id : undefined
@@ -425,6 +422,32 @@ export function registerPeripheralTools(aiTools: Map<string, AiTool>): void {
 
         const oldDeviceIds = await resolvePeripheralPolicyDeviceIds(policy);
 
+        // Mirrors resolveUpdateTargeting in routes/peripheralControl.ts (#9620):
+        // same targetType + no target_ids keeps stored ids; switching targetType
+        // without naming new ids clears them instead of reinterpreting old ones.
+        const nextTargetType = (typeof input.target_type === 'string'
+          ? input.target_type
+          : policy.targetType) as typeof peripheralPolicies.targetType.enumValues[number];
+        type TargetIds = { siteIds?: string[]; groupIds?: string[]; deviceIds?: string[] };
+        const rawTargetIds = input.target_ids as TargetIds | undefined;
+        const updateTargeting: { targetType: typeof nextTargetType; targetIds: TargetIds } = {
+          targetType: nextTargetType,
+          targetIds: rawTargetIds !== undefined
+            ? {
+              siteIds: rawTargetIds.siteIds ?? [],
+              groupIds: rawTargetIds.groupIds ?? [],
+              deviceIds: rawTargetIds.deviceIds ?? [],
+            }
+            : nextTargetType === policy.targetType
+              ? ((policy.targetIds ?? {}) as TargetIds)
+              : { siteIds: [], groupIds: [], deviceIds: [] },
+        };
+
+        if (rawTargetIds === undefined) {
+          const partnerGroupIds = await findPartnerOwnedGroupIds(updateTargeting.targetIds.groupIds ?? []);
+          if (partnerGroupIds.length > 0) return JSON.stringify(partnerGroupTargetRefusal(partnerGroupIds));
+        }
+
         const [updated] = await db
           .update(peripheralPolicies)
           .set({
@@ -435,15 +458,9 @@ export function registerPeripheralTools(aiTools: Map<string, AiTool>): void {
             action: typeof input.policy_action === 'string'
               ? input.policy_action as typeof peripheralPolicies.action.enumValues[number]
               : policy.action,
-            targetType: typeof input.target_type === 'string'
-              ? input.target_type as typeof peripheralPolicies.targetType.enumValues[number]
-              : policy.targetType,
+            targetType: updateTargeting.targetType,
             priority: (requestedPriority as number | undefined) ?? policy.priority,
-            targetIds: (input.target_ids ?? policy.targetIds ?? {}) as {
-              siteIds?: string[];
-              groupIds?: string[];
-              deviceIds?: string[];
-            },
+            targetIds: updateTargeting.targetIds,
             isActive: typeof input.is_active === 'boolean' ? input.is_active : policy.isActive,
             updatedAt: new Date()
           })

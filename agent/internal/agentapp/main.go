@@ -21,9 +21,11 @@ import (
 	"github.com/breeze-rmm/agent/internal/authstate"
 	"github.com/breeze-rmm/agent/internal/collectors"
 	"github.com/breeze-rmm/agent/internal/config"
+	"github.com/breeze-rmm/agent/internal/ech"
 	"github.com/breeze-rmm/agent/internal/elevaccount"
 	"github.com/breeze-rmm/agent/internal/eventlog"
 	"github.com/breeze-rmm/agent/internal/heartbeat"
+	"github.com/breeze-rmm/agent/internal/helper"
 	"github.com/breeze-rmm/agent/internal/hostpolicy"
 	"github.com/breeze-rmm/agent/internal/ipc"
 	"github.com/breeze-rmm/agent/internal/logging"
@@ -31,8 +33,12 @@ import (
 	"github.com/breeze-rmm/agent/internal/observability"
 	"github.com/breeze-rmm/agent/internal/pamactuator"
 	"github.com/breeze-rmm/agent/internal/pamlifetime"
+	"github.com/breeze-rmm/agent/internal/promptidentity"
+	"github.com/breeze-rmm/agent/internal/remote/desktop"
 	"github.com/breeze-rmm/agent/internal/safemode"
 	"github.com/breeze-rmm/agent/internal/secmem"
+	"github.com/breeze-rmm/agent/internal/securefs"
+	"github.com/breeze-rmm/agent/internal/sessionbroker"
 	"github.com/breeze-rmm/agent/internal/state"
 	"github.com/breeze-rmm/agent/internal/unifi"
 	"github.com/breeze-rmm/agent/internal/userhelper"
@@ -62,12 +68,12 @@ func (t *unifiAuthTransport) RoundTrip(req *http.Request) (*http.Response, error
 }
 
 // newUnifiAPIClient builds an http.Client that authenticates to the Breeze API
-// as this agent and refuses redirects (token-leak guard).
+// as this agent and refuses redirects (token-leak guard). It backs the UniFi
+// collector config/telemetry calls and the workspace-index client, so its TLS
+// goes through the shared ECH dialer like the heartbeat's (#8869); tlsCfg may
+// be nil.
 func newUnifiAPIClient(token *secmem.SecureString, tlsCfg *tls.Config) *http.Client {
-	tr := &http.Transport{}
-	if tlsCfg != nil {
-		tr.TLSClientConfig = tlsCfg
-	}
+	tr := ech.NewTransport(tlsCfg)
 	return &http.Client{
 		Timeout:       30 * time.Second,
 		Transport:     &unifiAuthTransport{base: tr, token: token},
@@ -81,7 +87,6 @@ var (
 	serverURL        string
 	backupServerURL  string // seeded by bootstrap/enroll responses (#2288)
 	enrollmentSecret string
-	enrollSiteID     string
 	enrollDeviceRole string
 	forceEnroll      bool
 	quietEnroll      bool
@@ -210,7 +215,7 @@ func waitForEnrollment(ctx context.Context, cfgFile string) *config.Config {
 
 var rootCmd = &cobra.Command{
 	Use:   "breeze-agent",
-	Short: "Breeze RMM Agent",
+	Short: agentRootShort(),
 	Long:  `Breeze Agent - Remote Monitoring and Management agent for Windows, macOS, and Linux`,
 }
 
@@ -238,9 +243,20 @@ var runCmd = &cobra.Command{
 var enrollCmd = &cobra.Command{
 	Use:   "enroll [enrollment-key]",
 	Short: "Enroll this device with the Breeze server",
-	Args:  cobra.ExactArgs(1),
+	Long: `Enroll this device with the Breeze server.
+
+The enrollment key may be given positionally (visible in this process's own
+command line to any local user who can list processes — kept only for manual,
+interactive use and backward compatibility) or, preferably, via the
+BREEZE_AGENT_ENROLLMENT_KEY environment variable, which install.sh and the
+other unattended install paths use so the key never appears in argv.`,
+	Args: cobra.MaximumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
-		enrollDevice(args[0])
+		key := ""
+		if len(args) == 1 {
+			key = args[0]
+		}
+		enrollDevice(key)
 	},
 }
 
@@ -307,7 +323,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is /etc/breeze/agent.yaml)")
 	rootCmd.PersistentFlags().StringVar(&serverURL, "server", "", "Breeze server URL")
 	enrollCmd.Flags().StringVar(&enrollmentSecret, "enrollment-secret", "", "Enrollment secret (AGENT_ENROLLMENT_SECRET on the server)")
-	enrollCmd.Flags().StringVar(&enrollSiteID, "site-id", "", "Site ID to enroll into (optional, overrides enrollment key default)")
+	enrollCmd.SetFlagErrorFunc(enrollFlagError)
 	enrollCmd.Flags().StringVar(&enrollDeviceRole, "device-role", "", "Device role override (e.g. workstation, server)")
 	enrollCmd.Flags().BoolVar(&forceEnroll, "force", false, "Re-enroll even if already enrolled; replaces AgentID/AuthToken on success (no-op on failure)")
 	enrollCmd.Flags().BoolVar(&quietEnroll, "quiet", false, "Suppress stdout progress output (errors still go to stderr). Intended for unattended installs.")
@@ -323,6 +339,7 @@ func init() {
 	rootCmd.AddCommand(bootstrapCmd)
 	rootCmd.AddCommand(versionCmd)
 	rootCmd.AddCommand(statusCmd)
+	rootCmd.AddCommand(newContainmentCommand(config.GetDataDir))
 	rootCmd.AddCommand(supportCmd)
 	rootCmd.AddCommand(uninstallNotifyCmd)
 	rootCmd.AddCommand(userHelperCmd)
@@ -394,8 +411,42 @@ func Main(v string) {
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		// 1 unless the command asked for a specific code (ExitCodeError,
+		// e.g. `service install --strict-watchdog` → 78).
+		os.Exit(exitCodeFor(err))
 	}
+}
+
+// repairConfigThenInitLogging runs the startup config repair, then sets up
+// logging. The repair stays first: opening the log file creates files under
+// the config directory, which should not happen before that directory's
+// permissions are repaired. What the config package logs during the repair is
+// held in memory and written once the logger exists, so it reaches the agent
+// log file instead of a service's discarded stdout.
+func repairConfigThenInitLogging(cfg *config.Config, repair func()) {
+	config.HoldStartupLogs()
+	defer config.FlushStartupLogs()
+	repair()
+	initLogging(cfg)
+}
+
+// repairStartupPermissions ensures the macOS breeze group (no-op elsewhere)
+// and then repairs config/secret/helper-token permissions. The order matters
+// (#7829): fixPerms group-owns helper_token.yaml by the breeze group, so a
+// group created or repaired on this start must exist first, or the desktop
+// helper could not read its token until the NEXT restart. A group failure is
+// logged and does not skip the rest; the session broker retries it when it
+// sets up the socket. Support mode touches neither: it does not own the real
+// config dir.
+func repairStartupPermissions(supportMode bool, ensureGroup func() error, fixPerms func()) {
+	if supportMode {
+		return
+	}
+	if err := ensureGroup(); err != nil {
+		log.Warn("could not ensure IPC socket group before repairing config permissions",
+			"error", err.Error())
+	}
+	fixPerms()
 }
 
 // initLogging sets up structured logging from config. Call after config.Load().
@@ -406,6 +457,9 @@ func initLogging(cfg *config.Config) {
 
 	if cfg.LogFile != "" {
 		rw, err := logging.NewRotatingWriter(cfg.LogFile, cfg.LogMaxSizeMB, cfg.LogMaxBackups)
+		if err == nil {
+			trackLogFile(rw)
+		}
 		if err != nil {
 			logFileFallbackReason = describeLogFileError(err)
 			fmt.Fprintf(os.Stderr, "Failed to open log file %s: %s (logging to stdout)\n", cfg.LogFile, logFileFallbackReason)
@@ -710,11 +764,9 @@ func startAgent(cfg *config.Config) (*agentComponents, error) {
 	// Loosen config directory (0755) and agent.yaml (0644) so the Helper can read
 	// them. secrets.yaml stays root-only (0600). Skipped in support mode: this
 	// operates on the REAL config dir, which a support client does not own.
-	if !cfg.SupportMode {
-		config.FixConfigPermissions()
-	}
-
-	initLogging(cfg)
+	repairConfigThenInitLogging(cfg, func() {
+		repairStartupPermissions(cfg.SupportMode, sessionbroker.EnsureIPCGroup, config.FixConfigPermissions)
+	})
 
 	// Record this process's live PID immediately, before any startup step that
 	// can wedge (e.g. the mTLS renewal network call below). Otherwise a wedge
@@ -762,6 +814,10 @@ func startAgent(cfg *config.Config) (*agentComponents, error) {
 	secureToken := secmem.NewSecureString(cfg.AuthToken)
 	cfg.AuthToken = "" // Clear plaintext from config struct
 
+	// W09 (#8148): loop-level Retry-After switch, before the log shipper and
+	// the heartbeat (the first users of httputil.Do / the shipper) start.
+	applyRetryAfterSettings(cfg)
+
 	// Shared auth-failure monitor — gates heartbeat and log shipper
 	// HTTP calls after 3 consecutive 401s so a deauthorized agent
 	// stops spamming the API (#401).
@@ -783,9 +839,11 @@ func startAgent(cfg *config.Config) (*agentComponents, error) {
 			AgentID:      cfg.AgentID,
 			AuthToken:    secureToken,
 			AgentVersion: version,
-			HTTPClient:   nil, // will use default
+			HTTPClient:   newShipperHTTPClient(),
 			MinLevel:     cfg.LogShippingLevel,
 			AuthMonitor:  authMon,
+			// Restores a set_log_level override across restarts (#7416).
+			LevelOverridePath: config.LogLevelOverridePath(),
 		})
 		// Dev builds ship info-level logs for performance tuning and diagnostics.
 		if strings.HasPrefix(version, "dev-") && cfg.LogShippingLevel == "warn" {
@@ -798,6 +856,9 @@ func startAgent(cfg *config.Config) (*agentComponents, error) {
 			logging.SetShipperLevel("info")
 		}
 	}
+	// desktop_debug also lifts pion's own warnings (TURN Allocate failures and
+	// the like) to Warn in the agent log (#9182).
+	desktop.SetPionWarnLogging(cfg.DesktopDebug)
 
 	logProcessStartup(cachedMainProcessStartup())
 
@@ -815,7 +876,26 @@ func startAgent(cfg *config.Config) (*agentComponents, error) {
 	// Windows and when the dirs are already hardened. Skipped in support mode:
 	// an unelevated throwaway client has no business re-ACLing ProgramData.
 	if !cfg.SupportMode {
-		config.EnforceProgramDataTreePermissions()
+		treeResult, err := config.EnforceProgramDataTreePermissions()
+		if err != nil {
+			// A logs/data directory that is still a link after this pass
+			// would send everything written there to wherever it points.
+			// Nothing below may run until it is a real directory.
+			log.Error("refusing to start: an agent ProgramData directory is a link that could not be replaced", "error", err.Error())
+			// Flush so the refusal reaches agent_logs, bounded like the
+			// shutdown flush so an unreachable server cannot hold the
+			// service start open.
+			runWithTimeout("log shipper flush", shipperFlushBudget, logging.StopShipper)
+			return nil, err
+		}
+		if treeResult.LinkReplaced(config.LogDir()) {
+			// The log file opened above was reached through the link that
+			// was just replaced; reopen it in the real directory and record
+			// the replacement there too.
+			initLogging(cfg)
+			log.Warn("reopened the agent log after replacing linked ProgramData directories with real ones; earlier lines from this start were written to the former link target",
+				"replaced", strings.Join(treeResult.Replaced, ", "))
+		}
 	}
 
 	// Load mTLS client certificate if configured
@@ -880,6 +960,14 @@ func startAgent(cfg *config.Config) (*agentComponents, error) {
 	cfg.IsService = isWindowsService() && !cfg.SupportMode
 	cfg.IsHeadless = isHeadless() && !cfg.SupportMode
 
+	// Only the installed agent (service manager + canonical agent.yaml, never
+	// Quick Support) manages machine-wide state it shares with other Breeze
+	// processes on this host, such as the Breeze Assist install.
+	cfg.IsInstalledAgent = resolveIsInstalledAgent(cfg.SupportMode, runningUnderServiceManager(cfg),
+		config.ActiveConfigFile(), filepath.Join(config.ConfigDir(), "agent.yaml"))
+	log.Info("run mode resolved", "service", cfg.IsService, "installedAgent", cfg.IsInstalledAgent,
+		"supportMode", cfg.SupportMode, "configFile", config.ActiveConfigFile())
+
 	// Ensure SAS (Ctrl+Alt+Del) policy allows services to generate it.
 	// Only relevant on Windows when running as a service.
 	if cfg.IsService {
@@ -903,6 +991,12 @@ func startAgent(cfg *config.Config) (*agentComponents, error) {
 	// Start heartbeat - this implements the main agent run loop
 	hb := heartbeat.NewWithVersion(cfg, version, secureToken, tlsCfg)
 	hb.SetAuthMonitor(authMon)
+	// #8619: a server-signalled watchdog target on a host whose watchdog is
+	// not registered is installed through the bounded, persisted Ensure path
+	// instead of the legacy swap. Never in a support session.
+	if !cfg.SupportMode {
+		hb.EnableWatchdogEnsure()
+	}
 
 	// Bare-metal recovery W04a: if the rebuild engine left a marker on this
 	// disk (i.e. this agent booted up as the RESULT of a bare-metal
@@ -946,6 +1040,8 @@ func startAgent(cfg *config.Config) (*agentComponents, error) {
 		AgentID:   cfg.AgentID,
 		AuthToken: secureToken,
 		TLSConfig: tlsCfg,
+
+		FirstReconnectWindow: wsReconnectConfig(cfg),
 	}
 	wsClient := websocket.New(wsConfig, hb.HandleCommand)
 	hb.SetWebSocketClient(wsClient)
@@ -967,7 +1063,13 @@ func startAgent(cfg *config.Config) (*agentComponents, error) {
 		// on self-update/config-reload the orphaned loop keeps polling with a
 		// zeroed token and spins auth-failure logs (same class as ETW PR #959).
 		unifiCtx, unifiCancel = context.WithCancel(context.Background())
+		// #7970: the loop backs off to a long idle interval while this device
+		// has no collectors; the heartbeat's unifi_collectors_assigned hint
+		// wakes it so a new assignment is picked up within about one beat.
+		unifiWaker := unifi.NewWaker()
+		hb.SetUnifiCollectorWake(unifiWaker.Wake)
 		unifiDone = unifi.StartCollectorLoop(unifiCtx, unifi.CollectorDeps{
+			Wake: unifiWaker,
 			// URL provider, not a copied string: after backup-server-URL
 			// promotion (#2323) uploads must follow the promoted primary
 			// instead of POSTing to the dead one forever (#2423).
@@ -979,6 +1081,8 @@ func startAgent(cfg *config.Config) (*agentComponents, error) {
 			// via the ingest worker. Log at Warn so the log shipper (MinLevel
 			// warn) actually delivers them; Debug was invisible in the field.
 			Logf: func(format string, args ...any) { log.Warn(fmt.Sprintf(format, args...)) },
+			// Per-collector topology sequence/digest state (unifi-topology-*.json).
+			StateDir: config.GetDataDir(),
 		})
 	}
 
@@ -1105,14 +1209,109 @@ func logPAMActuatorStrategy(l *slog.Logger, configured string) {
 	}
 }
 
+// osExecutableFn and verifyTrustedExecutableOwnerFn are package-level vars so
+// tests can exercise verifyOwnExecutableTrustedIfPrivileged's branching
+// without needing to run the test binary as root.
+var (
+	osExecutableFn                 = os.Executable
+	verifyTrustedExecutableOwnerFn = securefs.VerifyTrustedExecutableOwner
+	geteuidFn                      = os.Geteuid
+)
+
+// verifyOwnExecutableTrustedIfPrivileged reports (but, see
+// enforceExecutableTrustAtStartup, does not currently enforce) when this
+// process is running as root/SYSTEM (a LaunchDaemon or systemd unit, not an
+// interactive dev/test run) but its own executable — or the directory
+// containing it — is not root-owned and free of group/other write access.
+// Nothing else in the install or startup path verified that before this
+// process execed; see securefs.VerifyTrustedExecutableOwner. Only evaluated
+// when actually privileged: an unprivileged `go test`/`go run`/manual build
+// under a developer's own uid must not be blocked by this.
+func verifyOwnExecutableTrustedIfPrivileged() error {
+	if geteuidFn() != 0 {
+		return nil
+	}
+	self, err := osExecutableFn()
+	if err != nil {
+		return fmt.Errorf("resolve own executable path: %w", err)
+	}
+	// Intentionally NOT filepath.EvalSymlinks'd: VerifyTrustedExecutableOwner
+	// itself refuses a symlinked final path component, and resolving it here
+	// first would erase exactly that signal.
+	return verifyTrustedExecutableOwnerFn(filepath.Clean(self))
+}
+
+// enforceExecutableTrustAtStartup gates whether
+// verifyOwnExecutableTrustedIfPrivileged's failure actually refuses to
+// start, versus just being logged. It is false for this release: on a
+// fleet where /usr/local/bin has been chowned by a package manager (the
+// Homebrew-on-Intel-macOS shape this check exists to catch), no installer
+// or self-updater in this release repairs that directory's ownership, so
+// fail-closed here would strand any already-affected host with no remote
+// recovery path the moment it next restarts. Flip this to true only once
+// the install/updater migration to securefs.TrustedExecutableDir has run
+// on the fleet for at least one release and telemetry from the warning
+// below shows it is safe to enforce.
+const enforceExecutableTrustAtStartup = false
+
+// reportExecutableTrustWarning logs an executable-trust check failure
+// loudly — through the same logger that feeds the agent's shipped log
+// stream, so it is visible server-side (searchable via agent logs) even
+// though enforceExecutableTrustAtStartup keeps this from blocking startup.
+func reportExecutableTrustWarning(err error) {
+	msg := "executable trust check failed at startup; continuing because " +
+		"enforcement is not yet enabled for this release"
+	fmt.Fprintf(os.Stderr, "Breeze agent: %s: %v\n", msg, err)
+	log.Warn(msg, "error", err.Error())
+}
+
 // runAgent starts the main agent run loop. The heartbeat module handles:
 // - Periodic heartbeat calls to the API endpoint
 // - Receiving pending commands from the server via heartbeat response
 // - Executing commands and reporting results back to the server
 func runAgent() {
+	if err := verifyOwnExecutableTrustedIfPrivileged(); err != nil {
+		reportExecutableTrustWarning(err)
+		if enforceExecutableTrustAtStartup {
+			os.Exit(1)
+		}
+	}
+	maybeMigrateLegacyInstall()
+
 	serviceMode := isWindowsService()
 	startup := currentProcessStartup("run", "", serviceMode)
 	cacheMainProcessStartup(startup)
+
+	// On Windows, if launched by the SCM, run under the service framework
+	// so we report Running/Stopped status back to the SCM correctly. The
+	// service registers first and then takes the config folder back and the
+	// instance guard itself (prepareServiceStart), retrying while it cannot
+	// rather than exiting: a service that exits before registering counts as
+	// a failed start, which the service manager does not retry. The service
+	// wrapper owns its own config loading, enrollment check, and
+	// cancellation via the SCM request channel.
+	if serviceMode {
+		if err := runAsService(cfgFile, startup); err != nil {
+			log.Error("service failed", "error", err.Error())
+			mainAgentExitFn(1)
+		}
+		return
+	}
+
+	// Before anything reads the config, and before the instance guard
+	// (which hardens the folder and so would hide that another account had
+	// it): the agent re-secures its config folder if another account created
+	// it (e.g. through an older Quick Support client run by a standard user),
+	// and refuses one that is a link. The console path stops here; the
+	// service path retries (prepareServiceStart).
+	if err := reclaimConfigDirFn(false); err != nil {
+		// The instance-guard marker (the Windows Event Log; stderr), so a
+		// service that stops here is not just an SCM start error.
+		writeInstanceGuardMarkerFn(startup, fmt.Errorf("agent config folder: %w", err))
+		mainAgentExitFn(exitConfigDirUntrusted)
+		return
+	}
+
 	guard, err := acquireMainAgentGuardFn(startup)
 	if err != nil {
 		writeInstanceGuardMarkerFn(startup, err)
@@ -1136,18 +1335,6 @@ func runAgent() {
 	// Self-heal the installed service unit from older installs (launchd plists on
 	// macOS; systemd unit on Linux) after a binary-only auto-update.
 	reconcileServiceUnitIfNeededFn()
-
-	// On Windows, if launched by the SCM, run under the service framework
-	// so we report Running/Stopped status back to the SCM correctly. The
-	// service wrapper owns its own config loading, enrollment check, and
-	// cancellation via the SCM request channel.
-	if serviceMode {
-		if err := runAsService(cfgFile); err != nil {
-			log.Error("service failed", "error", err.Error())
-			mainAgentExitFn(1)
-		}
-		return
-	}
 
 	// Console / Unix service-manager mode. Load config, prepare bootstrap
 	// logging, and wait for enrollment if needed. signal.NotifyContext
@@ -1295,6 +1482,11 @@ func applyEnrollResponseIdentity(cfg *config.Config, enrollResp *api.EnrollRespo
 	cfg.OrgID = enrollResp.OrgID
 	cfg.SiteID = enrollResp.SiteID
 	cfg.DeviceID = enrollResp.DeviceID
+	// #8206 — a new enrollment is a new device row, which starts at ownership
+	// epoch 1; the previous device's epoch must not carry over (a stale higher
+	// epoch would never be acknowledged and PAM would stay closed). 0 = none
+	// received yet; SaveEnrollment writes it from this config.
+	cfg.OwnershipEpoch = 0
 }
 
 // assertHostnameNonEmpty enforces the #439 contract: enrollment must
@@ -1337,14 +1529,47 @@ func gateEnrollPrimary(server string) error {
 	return hostpolicy.AllowedURL(server)
 }
 
+// resolveEnrollmentKey returns the positional key if given, else falls back
+// to BREEZE_AGENT_ENROLLMENT_KEY. An environment variable is not visible in
+// any process's argv, unlike a positional CLI argument — this is the
+// preferred delivery path for unattended installs and mirrors the existing
+// BREEZE_AGENT_ENROLLMENT_SECRET fallback used for the secret.
+func resolveEnrollmentKey(positional string) string {
+	if positional != "" {
+		return positional
+	}
+	return os.Getenv("BREEZE_AGENT_ENROLLMENT_KEY")
+}
+
 func enrollDevice(enrollmentKey string) {
+	enrollmentKey = resolveEnrollmentKey(enrollmentKey)
 	enrollmentKey, serverURL, enrollmentSecret = trimEnrollInputs(
 		enrollmentKey, serverURL, enrollmentSecret,
 	)
 
+	// Before reading the existing config: take the config folder back if
+	// another account created it, and remove an agent.yaml / secrets.yaml it
+	// could have written rather than carry their contents into this
+	// enrollment. Only for the machine-wide folder; a --config elsewhere is
+	// the caller's own.
+	if configFileInMachineDir(cfgFile) {
+		if err := reclaimConfigDirFn(true); err != nil {
+			enrollError(catConfig, "the agent config folder "+config.ConfigDir()+" cannot be used", err)
+			return
+		}
+	}
+
 	cfg, err := config.Load(cfgFile)
+	// One-shot ECH is armed only now, with the loaded config, so an existing
+	// `ech: false` opt-out or a stored server kill switch is honoured. Nothing
+	// above touches the network (env, trimming, config-folder reclaim and the
+	// config read are all local). A failed load leaves the shared dialer's
+	// flags as they are (initially both on), not config.Default().
 	if err != nil {
+		enableOneShotECH(nil)
 		cfg = config.Default()
+	} else {
+		enableOneShotECH(cfg)
 	}
 
 	if serverURL != "" {
@@ -1381,6 +1606,12 @@ func enrollDevice(enrollmentKey string) {
 	if cfg.ServerURL == "" {
 		enrollError(catConfig,
 			"server URL required — pass --server or set it in config",
+			nil)
+	}
+
+	if enrollmentKey == "" {
+		enrollError(catConfig,
+			"enrollment key required — pass it positionally or set BREEZE_AGENT_ENROLLMENT_KEY",
 			nil)
 	}
 
@@ -1456,6 +1687,62 @@ func (e *enrollFailure) Error() string {
 }
 
 func (e *enrollFailure) Unwrap() error { return e.detail }
+
+// saveEnrollmentFn persists a successful enrollment. A seam so tests can fail
+// the save after the server has accepted the enrollment.
+var saveEnrollmentFn = config.SaveEnrollment
+
+// promptIdentityDataDir is where the MSP identity cache lives (a seam for
+// tests).
+var promptIdentityDataDir = config.GetDataDir
+
+// clearPromptIdentityAfterEnrol drops the cached MSP identity and logo
+// (#10190 W03, spec §3.6): a new enrolment may belong to another MSP. The
+// dropped scope is remembered, so the service's next heartbeat purges the
+// prompt list entries created under it. A failure is logged, not fatal: the
+// next heartbeat's identity block replaces the cache anyway.
+func clearPromptIdentityAfterEnrol() {
+	if err := promptidentity.Open(promptIdentityDataDir(), promptidentity.Options{}).Clear(); err != nil {
+		logging.L("enroll").Warn("could not clear the cached MSP identity after enrollment", "error", err.Error())
+	}
+}
+
+// helperBrandingBaseDir is where the per-session helper configs live (a seam
+// for tests).
+var helperBrandingBaseDir = config.ConfigDir
+
+// clearHelperBrandingBeforeEnrol drops the persisted Helper branding (OD3): a
+// new enrolment may belong to another partner or organization. Local only. A
+// failure is logged, not fatal: the next heartbeat's decision replaces it.
+func clearHelperBrandingBeforeEnrol() {
+	if err := helper.ClearBranding(helperBrandingBaseDir()); err != nil {
+		logging.L("enroll").Warn("could not clear persisted Helper branding before enrollment", "error", err.Error())
+	}
+}
+
+// enrollPreflightFailure reports a config directory the agent could not
+// create or secure BEFORE the enroll request, so nothing exists server-side.
+func enrollPreflightFailure(cfgFile string, err error) *enrollFailure {
+	return &enrollFailure{cat: catConfig, friendly: fmt.Sprintf(
+		"could not create or secure the config directory %s, so no enrollment request was sent — run enrollment as SYSTEM (the MSI does) or from an elevated administrator prompt, then retry",
+		filepath.Dir(config.ResolveSavePath(cfgFile))), detail: err}
+}
+
+// enrollSaveFailure reports a save that failed AFTER the server accepted the
+// enrollment. The server has already created the device row by then and there
+// is no agent-side call that removes it, so the message says so and tells the
+// operator how to recover instead of leaving a pending device unexplained
+// (#7394). The path is the resolved agent.yaml, never the raw --config flag,
+// which is empty by default.
+func enrollSaveFailure(cfg *config.Config, cfgFile string, err error) *enrollFailure {
+	device := "agentId=" + cfg.AgentID
+	if cfg.DeviceID != "" {
+		device += ", deviceId=" + cfg.DeviceID
+	}
+	return &enrollFailure{cat: catConfig, friendly: fmt.Sprintf(
+		"the server enrolled this device (%s) but its credentials could not be saved to %s, so the agent cannot check in. The device was created on the server and will stay pending: delete it in the dashboard, fix the cause below, then run enrollment again",
+		device, config.ResolveSavePath(cfgFile)), detail: err}
+}
 
 // enrollWithConfig is the core of enrollment: collect system + hardware
 // identity, POST /agents/enroll, apply the response to cfg, and persist it to
@@ -1581,6 +1868,7 @@ func enrollWithConfig(cfg *config.Config, cfgFile, enrollmentKey, secret string)
 			DiskTotalGB:             hardwareInfo.DiskTotalGB,
 			GPUModel:                hardwareInfo.GPUModel,
 			SerialNumber:            hardwareInfo.SerialNumber,
+			ProductSKU:              hardwareInfo.ProductSKU,
 			Manufacturer:            hardwareInfo.Manufacturer,
 			Model:                   hardwareInfo.Model,
 			MotherboardManufacturer: hardwareInfo.MotherboardManufacturer,
@@ -1588,6 +1876,14 @@ func enrollWithConfig(cfg *config.Config, cfgFile, enrollmentKey, secret string)
 			MotherboardVersion:      hardwareInfo.MotherboardVersion,
 			BIOSVersion:             hardwareInfo.BIOSVersion,
 		},
+	}
+
+	// Create and secure the config directory before the enroll request. The
+	// server creates the device row as soon as it accepts the request, and
+	// nothing agent-side can remove it again, so a directory this process
+	// cannot secure must fail here rather than after (#7394).
+	if err := config.PrepareSaveDir(cfgFile); err != nil {
+		return enrollPreflightFailure(cfgFile, err)
 	}
 
 	enrollLog.Info("sending enrollment request")
@@ -1677,11 +1973,11 @@ func enrollWithConfig(cfg *config.Config, cfgFile, enrollmentKey, secret string)
 		}
 	}
 
-	if err := config.SaveTo(cfg, cfgFile); err != nil {
-		return &enrollFailure{cat: catConfig, friendly: fmt.Sprintf(
-			"enrollment succeeded but could not save config to %s — check that the directory exists and SYSTEM has write access (agentID=%s)",
-			cfgFile, cfg.AgentID), detail: err}
+	clearHelperBrandingBeforeEnrol()
+	if err := saveEnrollmentFn(cfg, cfgFile); err != nil {
+		return enrollSaveFailure(cfg, cfgFile, err)
 	}
+	clearPromptIdentityAfterEnrol()
 
 	enrollLog.Info("enrollment successful",
 		"agentId", cfg.AgentID,
@@ -1722,6 +2018,9 @@ func initEnrollLogging(cfg *config.Config, quiet bool) {
 	}
 
 	rw, err := logging.NewRotatingWriter(cfg.LogFile, cfg.LogMaxSizeMB, cfg.LogMaxBackups)
+	if err == nil {
+		trackLogFile(rw)
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: could not open log file %s: %s — structured logs will go to stdout\n", cfg.LogFile, describeLogFileError(err))
 		logging.Init(cfg.LogFormat, cfg.LogLevel, os.Stdout)
@@ -1846,6 +2145,28 @@ func desktopHelperRole() ipc.HelperRole {
 	return ipc.HelperRoleSystem
 }
 
+// Helper log rotation. Smaller than the agent's defaults: on Windows the
+// user-role helper's log lives in the user's own profile.
+const (
+	helperLogMaxSizeMB  = 10
+	helperLogMaxBackups = 3
+)
+
+// helperPanicFileMaxBytes bounds the stderr file. Panics are rare, but
+// anything else a library writes to stderr lands there too, and nothing
+// rotates it.
+const helperPanicFileMaxBytes = 1 << 20
+
+// openHelperPanicFile opens the stderr/panic file for appending, starting it
+// afresh when it has grown past helperPanicFileMaxBytes.
+func openHelperPanicFile(path string) (*os.File, error) {
+	flags := os.O_CREATE | os.O_APPEND | os.O_WRONLY
+	if fi, err := os.Stat(path); err == nil && fi.Size() > helperPanicFileMaxBytes {
+		flags |= os.O_TRUNC
+	}
+	return os.OpenFile(path, flags, 0600)
+}
+
 func runHelperProcess(name string, role ipc.HelperRole, context, binaryKind string) {
 	// Detach any inherited console immediately. This runs at the top of
 	// every helper role — user-helper, desktop-helper, and any future
@@ -1861,31 +2182,42 @@ func runHelperProcess(name string, role ipc.HelperRole, context, binaryKind stri
 	detachHelperConsole()
 
 	// Log to file in the same logs folder as the main agent (e.g.
-	// C:\ProgramData\Breeze\logs) — except on macOS, where these helpers
-	// run as the logged-in user and the shared directory is root-owned
-	// 0700 and re-hardened on every agent log open/rotation. There they
-	// get ~/Library/Logs/Breeze instead (#5877).
-	logDir, homeErr := config.HelperLogDir()
+	// C:\ProgramData\Breeze\logs) — except where the helper runs as the
+	// logged-in user and cannot write there: macOS, where the shared
+	// directory is root-owned 0700 and re-hardened on every agent log
+	// open/rotation (~/Library/Logs/Breeze, #5877), and the Windows
+	// user-role helper (%LOCALAPPDATA%\Breeze\logs, #9266).
+	logDir, homeErr := config.HelperLogDir(role == ipc.HelperRoleUser)
 	mkdirErr := os.MkdirAll(logDir, 0700)
 	logFileName := "user-helper.log"
+	panicFileName := "user-helper-panic.log"
 	if binaryKind == ipc.HelperBinaryDesktopHelper {
 		logFileName = "desktop-helper.log"
+		panicFileName = "desktop-helper-panic.log"
 	}
 	logPath := filepath.Join(logDir, logFileName)
 	var output io.Writer = os.Stdout
-	f, openErr := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	var panicFileErr error
+	// Rotated like agent.log: the helper lives for the whole logon session
+	// and used to append to one file forever.
+	rw, openErr := logging.NewRotatingWriter(logPath, helperLogMaxSizeMB, helperLogMaxBackups)
 	if openErr == nil {
 		// When spawned with CREATE_NO_WINDOW (service helper), stdout is invalid.
-		// Use file-only to avoid io.MultiWriter aborting on stdout write errors.
+		// Use file-only to avoid a tee aborting on stdout write errors.
 		if hasConsole() {
-			output = io.MultiWriter(os.Stdout, f)
+			output = logging.TeeWriter(os.Stdout, rw)
 		} else {
-			output = f
+			output = rw
 		}
-		// Redirect stderr to the same log file so Go panic stack traces
-		// are captured instead of being lost to NUL when spawned with
-		// CREATE_NO_WINDOW from the service.
-		redirectStderr(f)
+		// Redirect stderr so Go panic stack traces are captured instead of
+		// being lost to NUL when spawned with CREATE_NO_WINDOW from the
+		// service. Its own plain file, not the rotating one: rotation
+		// renames the file out from under any handle handed to the OS
+		// (same choice as cmd/breeze-backup).
+		var pf *os.File
+		if pf, panicFileErr = openHelperPanicFile(filepath.Join(logDir, panicFileName)); panicFileErr == nil {
+			redirectStderr(pf)
+		}
 	}
 	logging.Init("text", "info", output)
 
@@ -1899,6 +2231,9 @@ func runHelperProcess(name string, role ipc.HelperRole, context, binaryKind stri
 		slog.Warn("helper config load failed; helper log shipping disabled", "error", err)
 		cfg = config.Default()
 	}
+	// Long-lived process: configure the shared ECH dialer for the log shipper
+	// (no one-shot mode).
+	ech.Configure(cfg.ECH, cfg.ECHServerEnabled)
 
 	socketPath := ipc.DefaultSocketPath()
 	if cfg.IPCSocketPath != "" {
@@ -1917,9 +2252,11 @@ func runHelperProcess(name string, role ipc.HelperRole, context, binaryKind stri
 	//
 	// This block is reachable in BOTH user- and SYSTEM-context helpers: the
 	// LoadHelperConfig above reads agent.yaml (world-readable) and skips
-	// root-only secrets.yaml, so the AgentID/ServerURL/HelperAuthToken this gate
-	// needs are populated in a user session too (#2483). Everything the gate
-	// checks lives in agent.yaml by design (see secretKeyAllowedInAgentYAML).
+	// root-only secrets.yaml, so AgentID/ServerURL are populated in a user
+	// session too (#2483). HelperAuthToken comes from the group-scoped helper
+	// token file on Unix; on Windows no user-readable file carries it (it is
+	// delivered to the console-session Breeze Assist over IPC), so this gate
+	// stays closed there.
 	if cfg.AgentID != "" && cfg.ServerURL != "" && cfg.HelperAuthToken != "" {
 		helperToken := secmem.NewSecureString(cfg.HelperAuthToken)
 		cfg.AuthToken = ""
@@ -1930,8 +2267,11 @@ func runHelperProcess(name string, role ipc.HelperRole, context, binaryKind stri
 			AgentID:      cfg.AgentID,
 			AuthToken:    helperToken,
 			AgentVersion: version + "-helper",
+			HTTPClient:   newShipperHTTPClient(),
 			MinLevel:     cfg.LogShippingLevel,
 			AuthMonitor:  helperAuthMon,
+			// Follows the agent's set_log_level override (#7416).
+			LevelOverridePath: config.LogLevelOverridePath(),
 		})
 		// Dev builds ship info-level logs for performance tuning and diagnostics.
 		if strings.HasPrefix(version, "dev-") && cfg.LogShippingLevel == "warn" {
@@ -1944,7 +2284,16 @@ func runHelperProcess(name string, role ipc.HelperRole, context, binaryKind stri
 			logging.SetShipperLevel("info")
 		}
 		defer logging.StopShipper()
+	} else {
+		// No shipper (always the case on Windows): relay warn+ lines to
+		// the agent over IPC instead, so they still reach Agent Logs
+		// (#9266). Records logged before the first connection queue
+		// (bounded) and go out once it authenticates.
+		userhelper.EnableLogForwarding()
 	}
+	// Same pion warning elevation as the agent: a helper hosts the peer
+	// connection on service installs (#9182).
+	desktop.SetPionWarnLogging(cfg.DesktopDebug)
 
 	// Always record where diagnostics are going; the pre-#5877 code fell
 	// back to stdout silently, so an unwritable directory looked like an
@@ -1952,6 +2301,12 @@ func runHelperProcess(name string, role ipc.HelperRole, context, binaryKind stri
 	// or a CREATE_NO_WINDOW spawn, stdout goes nowhere at all). Emitted
 	// after the shipper is up so the warn still reaches Agent Logs.
 	logging.EmitLogFileOutcome(slog.Default(), logPath, openErr, mkdirErr, homeErr)
+	if panicFileErr != nil {
+		// Otherwise a later panic under CREATE_NO_WINDOW goes to NUL with
+		// nothing anywhere saying why.
+		slog.Warn("helper panic log unavailable; a panic stack trace would be lost",
+			"path", filepath.Join(logDir, panicFileName), "error", panicFileErr)
+	}
 
 	// Top-level panic recovery for the main goroutine of runHelperProcess.
 	// NOTE: recover() only catches panics in THIS goroutine. Panics in
@@ -2006,6 +2361,9 @@ func runHelperProcess(name string, role ipc.HelperRole, context, binaryKind stri
 	// disconnects in production are caused by permanent identity/auth problems
 	// (binary path mismatch, SID lookup failure on headless Windows, etc.),
 	// not transient socket hiccups. See issue #387.
+	// The helper is the same build as the agent: its prompt renderer
+	// version is the agent version (#10190 AuthRequest.rendererVersion).
+	userhelper.SetRendererVersion(version)
 	sup := &userhelper.Supervisor{
 		Name: name,
 		Policy: userhelper.ReconnectPolicy{

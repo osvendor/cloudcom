@@ -32,14 +32,14 @@ vi.mock('./ScriptList', () => ({
     onRun,
     onDuplicate
   }: {
-    scripts: Array<{ id: string; name: string; lastRun?: string }>;
-    onRun?: (script: { id: string; name: string; lastRun?: string }) => void;
-    onDuplicate?: (script: { id: string; name: string; lastRun?: string }) => void;
+    scripts: Array<{ id: string; name: string; lastRunAt?: string | null }>;
+    onRun?: (script: { id: string; name: string; lastRunAt?: string | null }) => void;
+    onDuplicate?: (script: { id: string; name: string; lastRunAt?: string | null }) => void;
   }) => (
     <div>
       {scripts.map(script => (
         <div key={script.id}>
-          <span data-testid={`last-run-${script.id}`}>{script.lastRun ?? 'Never'}</span>
+          <span data-testid={`last-run-${script.id}`}>{script.lastRunAt ?? 'Never'}</span>
           <button type="button" onClick={() => onRun?.(script)}>
             Run {script.name}
           </button>
@@ -325,6 +325,34 @@ describe('ScriptsPage post-run navigation (#4886)', () => {
     expect(navigateTo).not.toHaveBeenCalled();
   });
 
+  it('does not navigate or close the modal when a fully admitted run carries warnings', async () => {
+    const { navigateTo } = await import('@/lib/navigation');
+    fetchWithAuthMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.startsWith('/scripts?')) return makeJsonResponse({ data: [baseScript] });
+      if (url === '/orgs/sites') return makeJsonResponse({ data: [] });
+      if (url === '/scripts/script-1') return makeJsonResponse(baseScript);
+      if (url === '/scripts/script-1/execute') {
+        return makeJsonResponse({
+          requestId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+          status: 'queued',
+          targets: [{ requestedDeviceId: 'device-1', admission: 'admitted', executionId: 'execution-1' }],
+          warnings: ['GROUP_REFUSED:group-2'],
+        }, true, 201);
+      }
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<ScriptsPage />);
+    await screen.findByText('Run Cleanup Temp Files');
+    fireEvent.click(screen.getByText('Run Cleanup Temp Files'));
+    fireEvent.click(await screen.findByText('Confirm Execute'));
+
+    await waitFor(() => expect(fetchWithAuthMock.mock.calls.some(([url]) => String(url) === '/scripts/script-1/execute')).toBe(true));
+    await waitFor(() => expect(screen.getByText('Confirm Execute')).toBeTruthy());
+    expect(navigateTo).not.toHaveBeenCalled();
+  });
+
   it('keeps partial admission results on the page when one target is suppressed', async () => {
     const { navigateTo } = await import('@/lib/navigation');
     let scriptsFetchCount = 0;
@@ -416,3 +444,41 @@ describe('ScriptsPage bundle import result persistence (#6005)', () => {
     expect(screen.queryByTestId('bundle-import-choose-files')).not.toBeInTheDocument();
   });
 });
+
+describe('ScriptsPage header (#7151)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    fetchWithAuthMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.startsWith('/scripts?')) {
+        return makeJsonResponse({ data: [baseScript] });
+      }
+      return makeJsonResponse({ data: [] });
+    });
+  });
+
+  it('stacks the title/description and action buttons below md, via the shared PageHeader', async () => {
+    render(<ScriptsPage />);
+
+    const heading = await screen.findByTestId('scripts-heading');
+    // Outer header row must be the shared PageHeader's stacking wrapper, not
+    // a bare `flex items-center justify-between` row that never wraps.
+    const headerRow = heading.closest('[class*="flex-col"]');
+    expect(headerRow).not.toBeNull();
+    expect(headerRow?.className).toContain('md:flex-row');
+
+    // Action buttons must be able to wrap onto their own line instead of
+    // being clipped at the viewport edge.
+    const importButton = screen.getByTestId('bundle-import-open');
+    const actionsContainer = importButton.closest('[class*="flex-wrap"]');
+    expect(actionsContainer).not.toBeNull();
+  });
+});
+
+// #7215: write actions are now gated on the caller's permissions. These suites
+// exercise the actions themselves, so grant everything; the role-aware
+// behaviour is covered in the *.permissions.test.tsx suites.
+vi.mock('../../lib/permissions', () => ({
+  usePermissions: () => ({ permissions: [], can: () => true }),
+  hasPermission: () => true,
+}));

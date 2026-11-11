@@ -13,6 +13,8 @@ import {
   SEVERITY_LABEL_KEYS, STATUS_CHIP_CLASSES, STATUS_LABEL_KEYS,
 } from './findingLabels';
 import FindingDrawer from './FindingDrawer';
+import { useStableT } from '@/lib/i18n/useStableT';
+import { replaceUrl } from '../../lib/replaceUrl';
 
 /** The three mutually exclusive status views the feed offers. `active` is the
  *  default and matches the API's own default (open + acknowledged). */
@@ -49,7 +51,7 @@ function parseHashId(raw: string): string | null | undefined {
  *  leaves one and re-fires hashchange). */
 function clearHash(): void {
   if (typeof window === 'undefined') return;
-  window.history.replaceState(null, '', window.location.pathname + window.location.search);
+  replaceUrl(window.location.pathname + window.location.search);
 }
 
 // ─── Component ──────────────────────────────────────────────────────────
@@ -61,6 +63,7 @@ interface FindingsFeedProps {
 
 export default function FindingsFeed({ onRemediate }: FindingsFeedProps) {
   const { t } = useTranslation('common');
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
 
   const [findings, setFindings] = useState<FleetFinding[]>([]);
   const [total, setTotal] = useState(0);
@@ -123,7 +126,7 @@ export default function FindingsFeed({ onRemediate }: FindingsFeedProps) {
         setError(
           err instanceof Error && err.message
             ? err.message
-            : t('longTail.fleet.FindingsFeed.errors.loadFailed')
+            : stableT('longTail.fleet.FindingsFeed.errors.loadFailed')
         );
       })
       .finally(() => {
@@ -134,7 +137,7 @@ export default function FindingsFeed({ onRemediate }: FindingsFeedProps) {
     return () => {
       cancelled = true;
     };
-  }, [orgId, kind, severity, statusGroup, reloadToken, t]);
+  }, [orgId, kind, severity, statusGroup, reloadToken, stableT]);
 
   // Appends the next page onto the current list. Uses the same monotonic
   // `requestSeq` counter as the effect above, so a slow load-more that lands

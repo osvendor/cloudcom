@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
 
 // Central route matrix for the dedicated accounting permission family
-// (`accounting:read` / `accounting:manage`, SEC-2026-09-05-057 Option A).
+// (`accounting:read` / `accounting:manage`).
 //
 // Every interactive QuickBooks route is listed exactly once below with the
 // accounting capability it requires. The parameterized cases prove, for every
@@ -51,6 +51,12 @@ const { authState, effects, AccountingError } = vi.hoisted(() => {
       dbSelect: vi.fn(),
       dbUpdateReturning: vi.fn(),
       audit: vi.fn(),
+      resolveActiveConnectionRef: vi.fn(),
+      getPartnerConnectionRef: vi.fn(),
+      // Xero W02 connection-setup routes (picker, cancel, settings pickers).
+      loadPendingGrant: vi.fn(),
+      discardPendingTenantSelection: vi.fn(),
+      listSettingsOptions: vi.fn(),
     },
     AccountingError,
   };
@@ -84,6 +90,10 @@ vi.mock('../../middleware/auth', () => ({
   withAuthDbAccessContext: async (_auth: unknown, fn: () => unknown) => fn(),
 }));
 
+vi.mock('../../services/autopay/autopayGate', () => ({
+  isAutopayEnabledForPartner: vi.fn(async () => true),
+}));
+
 vi.mock('../../db', () => ({
   db: {
     select: effects.dbSelect,
@@ -93,6 +103,8 @@ vi.mock('../../db', () => ({
   },
   runOutsideDbContext: <T>(fn: () => T) => fn(),
   withSystemDbAccessContext: <T>(fn: () => T) => fn(),
+  // Disconnect's provider-side release asserts it holds no ambient context (F9).
+  hasDbAccessContext: () => false,
 }));
 
 vi.mock('../../services/accounting/accountingConnectionService', () => ({
@@ -105,12 +117,29 @@ vi.mock('../../services/accounting/accountingConnectionService', () => ({
   updateMultiCurrencyEnabled: vi.fn(),
   isHomeCurrencyCasAbort: () => false,
   AccountingConnectionError: AccountingError,
+  // Xero W01: bulk push resolves the partner's ONE connection first (its id
+  // rides on every job). A connected QuickBooks row keeps the route on its path.
+  resolveActiveConnectionRef: effects.resolveActiveConnectionRef,
+  // Any-status lookup (Xero W02): backs the /:provider/connect cross-provider
+  // pre-check and GET /accounting/providers (listProvidersHandler).
+  getPartnerConnectionRef: effects.getPartnerConnectionRef,
+  PENDING_TENANT_STATUS: 'pending_tenant',
 }));
 
-vi.mock('../../services/accounting/quickbooksCustomerImport', () => ({
-  listQuickbooksCustomersAnnotated: effects.listCustomers,
-  importQuickbooksCustomers: effects.importCustomers,
-  QbImportError: AccountingError,
+vi.mock('../../services/accounting/accountingTenantSelection', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../services/accounting/accountingTenantSelection')>()),
+  loadPendingGrant: effects.loadPendingGrant,
+  discardPendingTenantSelection: effects.discardPendingTenantSelection,
+}));
+
+vi.mock('../../services/accounting/accountingSettingsOptions', () => ({
+  listProviderSettingsOptions: effects.listSettingsOptions,
+}));
+
+vi.mock('../../services/accounting/accountingCustomerImport', () => ({
+  listAccountingCustomersAnnotated: effects.listCustomers,
+  importAccountingCustomers: effects.importCustomers,
+  AccountingImportError: AccountingError,
 }));
 
 vi.mock('../../services/accounting/accountingMappingService', () => ({
@@ -133,6 +162,10 @@ vi.mock('../../services/accounting/providerRegistry', () => ({
     listRemoteCustomers: effects.listRemoteCustomers,
     listRemoteItems: vi.fn(),
   }),
+  providerSupports: (id: string) => id === 'quickbooks',
+  // Xero W01 route gate: only QuickBooks is registered, configured and capable.
+  findAccountingProvider: (id: string) => (id === 'quickbooks'
+    ? { provider: 'quickbooks', displayName: 'QuickBooks', configError: () => null } : null),
 }));
 
 vi.mock('../../jobs/accountingSyncWorker', () => ({
@@ -144,12 +177,6 @@ vi.mock('../../jobs/accountingReconcileWorker', () => ({
 }));
 vi.mock('../../services/auditEvents', () => ({ writeRouteAudit: effects.audit }));
 vi.mock('../../services/sentry', () => ({ captureException: vi.fn(), captureMessage: vi.fn() }));
-vi.mock('../../config/env', () => ({
-  QBO_CLIENT_ID: 'client-id',
-  QBO_CLIENT_SECRET: 'client-secret',
-  QBO_REDIRECT_URI: 'https://api.example.test/accounting/quickbooks/callback',
-  QBO_ENVIRONMENT: 'production',
-}));
 
 import { accountingRoutes } from './index';
 
@@ -170,6 +197,10 @@ type RouteCase = {
 
 const routes: RouteCase[] = [
   // --- reads -------------------------------------------------------------
+  // No :provider in the path — registered before GET /:provider. Reads the
+  // connection through the same resolveActiveConnectionRef +
+  // requireAccountingPartnerAuthority/requireAccountingRead chain as status.
+  { name: 'providers', path: '/providers', effect: 'getPartnerConnectionRef', requires: 'accounting:read', mfa: false },
   { name: 'status', path: '/quickbooks', effect: 'getConnection', requires: 'accounting:read', mfa: false },
   { name: 'customers', path: '/quickbooks/customers', effect: 'listCustomers', requires: 'accounting:read', mfa: false },
   { name: 'mapping proposals', path: '/quickbooks/mappings?entityType=org', effect: 'listMappings', requires: 'accounting:read', mfa: false },
@@ -185,6 +216,15 @@ const routes: RouteCase[] = [
   },
   { name: 'settings refresh', method: 'POST', path: '/quickbooks/settings/refresh', effect: 'refreshRealmSettings', requires: 'accounting:manage', mfa: true },
   { name: 'reconcile', method: 'POST', path: '/quickbooks/reconcile', effect: 'enqueueReconcile', requires: 'accounting:manage', mfa: true },
+  // --- Xero W02 connection setup: the organisation picker, cancel and the
+  //     settings pickers ride the connect chain (manage; MFA on the writes) ---
+  { name: 'tenant list', path: '/quickbooks/tenants', effect: 'loadPendingGrant', requires: 'accounting:manage', mfa: false },
+  {
+    name: 'tenant select', method: 'POST', path: '/quickbooks/tenants/select',
+    body: { tenantId: 'ten-A' }, effect: 'loadPendingGrant', requires: 'accounting:manage', mfa: true,
+  },
+  { name: 'tenant cancel', method: 'POST', path: '/quickbooks/tenants/cancel', effect: 'discardPendingTenantSelection', requires: 'accounting:manage', mfa: true },
+  { name: 'settings options', path: '/quickbooks/settings/options', effect: 'listSettingsOptions', requires: 'accounting:manage', mfa: false },
   {
     name: 'mapping decision', method: 'PUT', path: '/quickbooks/mappings',
     body: { breezeEntityType: 'org', breezeEntityId: ENTITY_ID, decision: 'unlinked' }, effect: 'saveMapping',
@@ -266,25 +306,43 @@ beforeEach(() => {
   effects.listRemoteCustomers.mockResolvedValue([]);
   effects.pushInvoice.mockResolvedValue({
     mappingId: 'mapping-1', remoteEntityId: 'remote-1', docNumber: '1',
-    syncStatus: 'synced', taxVarianceCents: 0,
+    syncStatus: 'synced', taxVarianceCents: 0, totalVarianceCents: null,
   });
   effects.enqueueInvoice.mockResolvedValue(true);
   effects.enqueueReconcile.mockResolvedValue(true);
   effects.dbSelect.mockReturnValue({
-    from: () => ({ where: () => Promise.resolve([{ id: ENTITY_ID }]) }),
+    from: () => ({
+      where: () => Promise.resolve([{ id: ENTITY_ID }]),
+      innerJoin: () => ({ where: () => Promise.resolve([{ n: 0 }]) }),
+    }),
   });
   effects.dbUpdateReturning.mockResolvedValue([{
     status: 'connected', environment: 'production', pushMode: 'auto',
     defaultIncomeAccountRef: '79', defaultTaxCodeRef: null, lastError: null, pullPayments: true,
   }]);
+  effects.resolveActiveConnectionRef.mockImplementation(async (_db: unknown, partnerId: string) => ({
+    id: 'connection-1', partnerId, provider: 'quickbooks', status: 'connected',
+  }));
+  effects.getPartnerConnectionRef.mockImplementation(async (_db: unknown, partnerId: string) => ({
+    id: 'connection-1', partnerId, provider: 'quickbooks', status: 'connected',
+  }));
+  effects.loadPendingGrant.mockResolvedValue({
+    row: { id: 'connection-1', realmId: null, accessTokenExpiresAt: new Date(Date.now() + 600_000) },
+    selection: { connectableTenantType: 'ORGANISATION' },
+    accessToken: 'at', authEventId: 'evt-00001', tenants: [], grantFingerprint: 'fp',
+  });
+  effects.discardPendingTenantSelection.mockResolvedValue({ discarded: true, connectionId: 'conn-row-1', owedPaymentDeletes: { count: 0, remoteEntityIds: [] } });
+  effects.listSettingsOptions.mockResolvedValue({
+    organisation: { name: 'Demo', isDemoCompany: true }, incomeAccounts: [], taxRates: [], bankAccounts: [],
+  });
 });
 
 describe('accounting permission family — route matrix', () => {
   it('covers every interactive accounting route exactly once', () => {
     expect(new Set(routes.map((route) => route.name)).size).toBe(routes.length);
-    expect(routes).toHaveLength(15);
-    expect(readRoutes).toHaveLength(6);
-    expect(manageRoutes).toHaveLength(9);
+    expect(routes).toHaveLength(20);
+    expect(readRoutes).toHaveLength(7);
+    expect(manageRoutes).toHaveLength(13);
     expect(ungatedRoutes).toHaveLength(0);
   });
 

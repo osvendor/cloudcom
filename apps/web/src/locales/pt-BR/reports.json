@@ -12,6 +12,7 @@
         "low": "Baixos",
         "medium": "Médios"
       },
+      "customRangeIncomplete": "Escolha uma data de início e uma de término (início primeiro, no máximo 366 dias de diferença) para aplicar um período personalizado.",
       "dashboardOptions": {
         "capacity": "Planejamento de capacidade",
         "operations": "Visão geral de operações",
@@ -31,7 +32,8 @@
       "subtitle": "Insights sobre sua frota e seus serviços",
       "title": "Análises",
       "trend": {
-        "operationalHealth": "Saúde operacional"
+        "operationalHealth": "Saúde operacional",
+        "weekOf": "Semana de {{date}}"
       },
       "widgets": {
         "alertTable": {
@@ -40,7 +42,7 @@
           "title": "Estatísticas de alertas"
         },
         "capacity": {
-          "title": "Previsão de capacidade"
+          "title": "Previsão de capacidade de disco"
         },
         "complianceGauge": {
           "policiesEvaluated": "{{count}} políticas avaliadas",
@@ -61,10 +63,11 @@
           "title": "Sessões remotas"
         },
         "uptime": {
-          "label": "Disponibilidade da frota",
+          "label": "Online agora",
           "title": "Disponibilidade"
         }
-      }
+      },
+      "dateRangeSelectLabel": "Intervalo de datas"
     },
     "capacityForecast": {
       "actual": "Real",
@@ -103,6 +106,7 @@
     },
     "gaugeWidget": {
       "criticalValue": "Crítico {{value}}",
+      "noData": "Nenhuma verificação de conformidade para avaliar",
       "warnValue": "Aviso {{value}}"
     },
     "queryBuilder": {
@@ -113,7 +117,8 @@
         "p95": "P95",
         "sum": "Soma"
       },
-      "description": "Configure métricas e agregação para o seu painel",
+      "coverageNote": "As consultas cobrem apenas os primeiros {{count}} dispositivos online. Dispositivos offline e o restante de uma frota maior não são incluídos.",
+      "description": "Escolha uma métrica e uma agregação para consultar seus dispositivos online",
       "errors": {
         "failedToExecuteQuery": "Falha ao executar consulta",
         "noDevicesSelected": "Nenhum dispositivo selecionado para a consulta"
@@ -127,28 +132,13 @@
         "timeRange": "Intervalo de tempo"
       },
       "metricNames": {
-        "activeDevices": "Dispositivos ativos",
-        "automationRuns": "Execuções de automação",
         "cpuUtilization": "Utilização de CPU",
         "diskUsage": "Uso de disco",
-        "incidentCount": "Contagem de incidentes",
-        "loginVolume": "Volume de logins",
         "memoryUtilization": "Utilização de memória",
-        "mfaAdoption": "Adoção de MFA",
-        "networkThroughput": "Throughput de rede",
-        "patchCompliance": "Conformidade de patches",
-        "remoteSessions": "Sessões remotas",
-        "responseTime": "Tempo de resposta",
-        "slaCompliance": "Conformidade de SLA",
-        "threatAlerts": "Alertas de ameaças",
-        "uptime": "Disponibilidade",
-        "vulnerabilityScore": "Pontuação de vulnerabilidade"
+        "networkThroughput": "Throughput de rede"
       },
       "metricTypes": {
-        "availability": "Disponibilidade",
-        "performance": "Desempenho",
-        "security": "Segurança",
-        "usage": "Uso"
+        "performance": "Desempenho"
       },
       "runQuery": "Executar consulta",
       "running": "Executando...",
@@ -164,7 +154,16 @@
     "slaComplianceCard": {
       "defaultPeriodLabel": "Últimos 30 dias",
       "downtime": "Indisponibilidade {{value}}",
+      "exclusions": {
+        "maintenanceApplied": "Janelas de manutenção excluídas",
+        "maintenanceSkipped": "Janelas de manutenção não excluídas: dispositivos demais para verificar",
+        "maintenanceUnavailable": "Janelas de manutenção não excluídas: status indisponível",
+        "none": "Nenhuma exclusão",
+        "title": "Exclusões",
+        "weekends": "Fins de semana excluídos"
+      },
       "incidents": "{{count}} incidentes",
+      "noDevices": "Nenhum dispositivo medido ainda",
       "status": {
         "atRisk": "Em risco",
         "breach": "Violação",
@@ -172,6 +171,34 @@
       },
       "targetUptime": "Meta de {{target}}% de disponibilidade",
       "title": "Conformidade de SLA"
+    },
+    "slaEmptyState": {
+      "create": "Criar definição de SLA",
+      "created": "Definição de SLA criada",
+      "description": "Uma definição de SLA define a meta de disponibilidade usada por esta aba para medir seus dispositivos. Crie uma para começar a acompanhar a conformidade.",
+      "errors": {
+        "create": "Não foi possível criar a definição de SLA"
+      },
+      "form": {
+        "cancel": "Cancelar",
+        "excludeMaintenance": "Excluir dispositivos em janela de manutenção",
+        "excludeWeekends": "Excluir fins de semana",
+        "measurementWindow": "Período de medição",
+        "name": "Nome",
+        "organization": "Organização",
+        "scopeNote": "Mede todos os dispositivos da organização.",
+        "selectOrganization": "Selecione uma organização",
+        "submit": "Criar",
+        "uptimeTarget": "Meta de disponibilidade (%)",
+        "uptimeTargetInvalid": "Informe um valor de 0 a 100.",
+        "windows": {
+          "daily": "Diário",
+          "monthly": "Mensal",
+          "weekly": "Semanal"
+        }
+      },
+      "noPermission": "Peça a um administrador com acesso ao gerenciamento de organizações para criar uma definição de SLA.",
+      "title": "Ainda não há definição de SLA"
     },
     "tableWidget": {
       "filterPlaceholder": "Filtrar",
@@ -224,6 +251,16 @@
       "serverReplaceAgeYears": "Planejar substituição de servidores após (anos)",
       "serverReplaceAgeYearsHelp": "Os servidores seguem seu próprio cronograma e aparecem em uma seção separada do relatório."
     },
+    "backupStatusOptions": {
+      "cancel": "Cancelar",
+      "createReport": "Criar relatório",
+      "includeDevicesWithoutBackup": "Incluir dispositivos sem nenhum backup",
+      "includeDevicesWithoutBackupHelp": "Desativado, o relatório lista apenas dispositivos com alguma evidência de backup, como o próprio e-mail-resumo do provedor.",
+      "sources": "Fontes de backup",
+      "sourcesHelp": "Escolha quais fontes de backup incluir no relatório.",
+      "sourceBreeze": "Backup do Breeze",
+      "sourceProvider": "Provedores de backup conectados"
+    },
     "vulnerabilityManagementOptions": {
       "cancel": "Cancelar",
       "createReport": "Criar relatório",
@@ -252,6 +289,12 @@
     },
     "reportEditPage": {
       "backToReports": "Voltar para Relatórios",
+      "backupPreview": {
+        "description": "Gera o instantâneo de backup atual com as opções acima. Só é executado quando você solicitar.",
+        "error": "Não foi possível gerar a pré-visualização.",
+        "run": "Gerar pré-visualização",
+        "title": "Pré-visualização"
+      },
       "description": "Atualize a configuração de \"{{name}}\".",
       "errors": {
         "fetchReport": "Falha ao buscar relatório",
@@ -300,6 +343,13 @@
         "replaceNow": "Substituir agora",
         "unknownAge": "Idade desconhecida"
       },
+      "backupStatus": {
+        "healthy": "Saudável",
+        "warning": "Aviso",
+        "critical": "Crítico",
+        "unknown": "Desconhecido",
+        "truncated": "A lista de dispositivos atingiu o limite de linhas e está incompleta."
+      },
       "vulnerabilityManagement": {
         "critical": "Críticos abertos",
         "expiringExceptions": "Exceções que vencem no próximo período",
@@ -322,7 +372,16 @@
         "security_compliance_posture": "Postura de Seguranca e Conformidade",
         "software_inventory": "Inventario de Software",
         "threat_detection_review": "Revisão de detecção de ameaças",
-        "endpoint_management_review": "Revisão de gerenciamento de endpoints"
+        "endpoint_management_review": "Revisão de gerenciamento de endpoints",
+        "ticket_sla_attainment": "Cumprimento de SLA de chamados",
+        "technician_time_billability": "Tempo e faturabilidade do técnico",
+        "ar_aging": "Envelhecimento de contas a receber",
+        "ai_usage_by_client": "Uso de IA por cliente",
+        "mrr_renewals": "MRR e renovações",
+        "quote_win_rate": "Taxa de ganho de orçamentos",
+        "client_profitability": "Lucratividade por cliente",
+        "ticket_sla_performance": "Desempenho de SLA",
+        "backup_status": "Status do backup"
       },
       "threatDetection": {
         "agents": "Endpoints com agente de detecção",
@@ -351,6 +410,29 @@
         "noncompliant": "Fora de conformidade",
         "notMeasured": "N/D",
         "staleEnrolments": "Inscrições desatualizadas"
+      },
+      "slaPerformance": {
+        "priority": "Prioridade",
+        "ticketsOpened": "Tickets abertos",
+        "firstResponse": "Primeira resposta",
+        "resolution": "Resolução",
+        "target": "Meta",
+        "measured": "Medidos",
+        "withinSla": "% dentro do SLA",
+        "median": "Mediana",
+        "mean": "Média",
+        "varies": "varia",
+        "breaches": "Violações",
+        "breachCount_one": "{{count}} violação",
+        "breachCount_other": "{{count}} violações",
+        "unavailable": "Não foi possível ler o resumo de SLA desta execução, por isso ele não pode ser exibido aqui. Gere o relatório novamente.",
+        "notes": "O que é medido",
+        "priorities": {
+          "urgent": "Urgente",
+          "high": "Alta",
+          "normal": "Normal",
+          "low": "Baixa"
+        }
       },
       "identityAccess": {
         "notMeasured": "N/D",
@@ -390,7 +472,7 @@
         "fetchReports": "Falha ao buscar relatórios",
         "generateReport": "Falha ao gerar relatório",
         "generic": "Ocorreu um erro",
-        "noCompletedRun": "Ainda não há narrativa concluída para abrir"
+        "noCompletedRun": "Ainda não há execução concluída para abrir"
       },
       "formats": {
         "csv": "CSV",
@@ -399,6 +481,7 @@
       },
       "loading": "Carregando relatórios...",
       "never": "Nunca",
+      "notGeneratedYet": "Ainda não gerado",
       "success": {
         "generated": "Relatório \"{{name}}\" gerado."
       },
@@ -419,14 +502,24 @@
         "security_compliance_posture": "Postura de Seguranca e Conformidade",
         "software_inventory": "Inventario de Software",
         "threat_detection_review": "Revisão de detecção de ameaças",
-        "endpoint_management_review": "Revisão de gerenciamento de endpoints"
+        "endpoint_management_review": "Revisão de gerenciamento de endpoints",
+        "ticket_sla_attainment": "Cumprimento de SLA de chamados",
+        "technician_time_billability": "Tempo e faturabilidade do técnico",
+        "ar_aging": "Envelhecimento de contas a receber",
+        "ai_usage_by_client": "Uso de IA por cliente",
+        "mrr_renewals": "MRR e renovações",
+        "quote_win_rate": "Taxa de ganho de orçamentos",
+        "client_profitability": "Lucratividade por cliente",
+        "ticket_sla_performance": "Desempenho de SLA",
+        "backup_status": "Status do backup"
       },
       "runsTable": {
         "actions": "Acoes",
         "completed": "Concluido",
         "report": "Relatório",
         "started": "Iniciado",
-        "status": "Status"
+        "status": "Status",
+        "organization": "Organização"
       },
       "schedules": {
         "daily": "Diario",
@@ -446,7 +539,8 @@
         "lastGenerated": "Ultima Geracao",
         "name": "Nome",
         "schedule": "Agenda",
-        "type": "Tipo"
+        "type": "Tipo",
+        "covers": "Abrange"
       },
       "tabs": {
         "recentRuns": "Execuções Recentes",
@@ -455,7 +549,21 @@
       "templates": "Modelos",
       "title": "Relatórios",
       "tryAgain": "Tentar novamente",
-      "unknownReport": "Relatório Desconhecido"
+      "unknownReport": "Relatório Desconhecido",
+      "partnerWideIncomplete": "Não foi possível carregar alguns relatórios que abrangem todas as organizações, então esta lista pode estar incompleta. Mude para Todas as organizações para ver todos os relatórios.",
+      "covers": {
+        "combined": "Todas as organizações · Combinado",
+        "unknownOrg": "Organização desconhecida",
+        "seriesAll": "Todas as orgs · {{count}} · Um por organização",
+        "seriesSelected_one": "{{count}} org · Um por organização",
+        "seriesSelected_other": "{{count}} orgs · Um por organização"
+      },
+      "delivery": {
+        "noRecipients": "Sem destinatários",
+        "noRecipientsHint": "A última execução agendada não tinha ninguém para receber o e-mail. Adicione destinatários para entregar este relatório.",
+        "partial": "Entregue parcialmente",
+        "failed": "E-mail não enviado"
+      }
     },
     "reportBuilder": {
       "actions": {
@@ -729,6 +837,7 @@
           "os": "SO",
           "owner": "Proprietario",
           "patch_level": "Nivel de patch",
+          "product_number": "Número do produto",
           "serial": "Número de série",
           "site": "Site",
           "status": "Status"
@@ -800,7 +909,11 @@
         "updateFailed": "Não foi possível atualizar os destinatários do relatório",
         "convertFailed": "Não foi possível converter este endereço de e-mail",
         "mfaRequired": "A conversão de um destinatário exige autenticação multifator. Ative o MFA no seu perfil e tente novamente.",
-        "loadFailed": "Não foi possível carregar os destinatários do relatório"
+        "loadFailed": "Não foi possível carregar os destinatários do relatório",
+        "businessEmailOnly": "Relatórios de negócios são enviados somente para os endereços de e-mail abaixo. Não é possível adicionar contatos da organização.",
+        "partnerOwnedEmailOnly": "Este relatório abrange todas as organizações, por isso é enviado somente para os endereços de e-mail abaixo. Não é possível adicionar contatos da organização.",
+        "oneTimeNotEmailed": "Relatórios únicos não são enviados por e-mail. Escolha um agendamento recorrente para enviar este relatório aos contatos.",
+        "emailAddresses": "Endereços de e-mail"
       },
       "previewTable": {
         "selectFields": "Selecione campos para preencher a tabela de pre-visualização."
@@ -834,6 +947,9 @@
         "everyDay": "Todos os dias"
       },
       "scheduleOptions": {
+        "one_time": {
+          "label": "Único"
+        },
         "daily": {
           "label": "Diario"
         },
@@ -878,6 +994,7 @@
           "title": "Tipo de relatório"
         }
       },
+      "removeField": "Remover {{field}}",
       "selectedFields": "Campos selecionados",
       "success": {
         "created": "Relatório \"{{name}}\" salvo.",
@@ -897,7 +1014,12 @@
         "tuesday": "Terca-feira",
         "wednesday": "Quarta-feira"
       },
-      "where": "Onde"
+      "where": "Onde",
+      "filterLabels": {
+        "logic": "Lógica do filtro",
+        "field": "Campo do filtro",
+        "operator": "Operador do filtro"
+      }
     },
     "reportTemplates": {
       "blankConfigurationDescription": "Configure um relatório do zero ou comece com uma configuração em branco.",
@@ -934,7 +1056,16 @@
         "security_compliance_posture": "Postura de Seguranca e Conformidade",
         "software_inventory": "Inventario de Software",
         "threat_detection_review": "Revisão de detecção de ameaças",
-        "endpoint_management_review": "Revisão de gerenciamento de endpoints"
+        "endpoint_management_review": "Revisão de gerenciamento de endpoints",
+        "ticket_sla_attainment": "Cumprimento de SLA de chamados",
+        "technician_time_billability": "Tempo e faturabilidade do técnico",
+        "ar_aging": "Envelhecimento de contas a receber",
+        "ai_usage_by_client": "Uso de IA por cliente",
+        "mrr_renewals": "MRR e renovações",
+        "quote_win_rate": "Taxa de ganho de orçamentos",
+        "client_profitability": "Lucratividade por cliente",
+        "ticket_sla_performance": "Desempenho de SLA",
+        "backup_status": "Status do backup"
       },
       "schedules": {
         "daily": "Diario",
@@ -945,6 +1076,8 @@
       "spec": {
         "cadence": "Cadencia",
         "defaultRange": "Intervalo padrão",
+        "lastFullMonth": "Último mês completo",
+        "asOfRunDate": "Na data de execução",
         "format": "Formato"
       },
       "success": {
@@ -988,11 +1121,59 @@
         "endpoint_management_review": {
           "description": "Evidência do Microsoft Intune: cobertura de inscrição, detalhamento de conformidade com tendência de 30 dias, inscrições desatualizadas e licenças, informando a atualidade de cada sincronização.",
           "name": "Revisão de gerenciamento de endpoints do Intune"
+        },
+        "ticket_sla_attainment": {
+          "name": "Cumprimento de SLA de chamados",
+          "description": "Cumprimento de resposta e resolução do período, recalculado a partir dos registros de horário do chamado em vez de lido nos marcadores de violação — assim, um chamado respondido com atraso, mas eventualmente respondido, ainda conta como não cumprido. Agrupado por organização, prioridade, técnico ou categoria."
+        },
+        "technician_time_billability": {
+          "name": "Tempo e faturabilidade do técnico",
+          "description": "Tempo registrado em relação a uma capacidade semanal presumida, a divisão entre faturável / incluído / não faturável, e quanto do tempo faturável foi de fato aprovado e faturado. Técnicos sem tempo registrado no período aparecem com zero em vez de serem omitidos."
+        },
+        "ar_aging": {
+          "name": "Envelhecimento de contas a receber",
+          "description": "Saldos de faturas em aberto agrupados em corrente / 1–30 / 31–60 / 61–90 / mais de 90 dias vencidos, um conjunto de totais por moeda sem conversão. Faturas sem data de vencimento recebem seu próprio grupo, nunca \"corrente\"."
+        },
+        "ai_usage_by_client": {
+          "name": "Uso de IA por cliente",
+          "description": "Uso de IA da plataforma por cliente no período: solicitações, tokens, custo da Breeze, valor a cobrar conforme o perfil de faturamento do cliente e o que já foi faturado. O uso incluído e os modelos sem preço aparecem separados, nunca misturados."
+        },
+        "mrr_renewals": {
+          "name": "MRR e renovações",
+          "description": "Receita recorrente mensal e anual dos contratos ativos, medida no dia em que o relatório é executado, com os contratos que renovam dentro do horizonte escolhido e o que realmente foi faturado como recorrente. Um conjunto de totais por moeda, sem conversão."
+        },
+        "quote_win_rate": {
+          "name": "Taxa de ganho de orçamentos",
+          "description": "A parcela dos orçamentos enviados que foram ganhos, contada por oportunidade, de modo que um orçamento revisado e reenviado conta uma só vez. A taxa principal considera apenas as oportunidades decididas, com a quantidade ainda em aberto ao lado. Os valores são antes dos impostos, um conjunto por moeda, sem conversão."
+        },
+        "ticket_sla_performance": {
+          "name": "Desempenho de SLA",
+          "description": "Tempos de resposta e resolução em relação ao SLA, prontos para o cliente, por prioridade e com as violações."
+        },
+        "client_profitability": {
+          "name": "Lucratividade por cliente",
+          "description": "Receita faturada por cliente no período, por fonte (recorrente, mão de obra, produtos, IA, outros), com as horas registradas e uma estimativa opcional do custo de mão de obra a partir de uma única taxa horária. Os valores que usam essa taxa são identificados como estimativas. Um conjunto de totais por moeda, nunca convertido."
+        },
+        "backup_status": {
+          "name": "Relatório de status de backup",
+          "description": "Status de backup de cada dispositivo no Breeze e nos provedores de backup conectados, em um único instantâneo: categorias de cobertura, último backup bem-sucedido e um histórico de 28 dias por dispositivo."
         }
       },
       "title": "Modelos de Relatório",
       "useTemplate": "Usar modelo",
-      "useTemplateTitle": "Usar {{name}}"
+      "useTemplateTitle": "Usar {{name}}",
+      "groups": {
+        "business": "Negócio",
+        "general": "Geral",
+        "businessDescription": "Números do próprio negócio do MSP, não dos dispositivos dos clientes — apenas para a equipe."
+      },
+      "delivery": {
+        "contactsLoading": "Carregando os contatos da organização…",
+        "contactsFailed": "Não foi possível carregar os contatos desta organização. Você ainda pode adicionar endereços de e-mail.",
+        "noContacts": "Esta organização não tem contatos com endereço de e-mail.",
+        "removeEmail": "Remover {{email}}",
+        "recipientsFailed": "O relatório \"{{name}}\" foi criado, mas não foi possível adicionar todos os destinatários. Adicione-os pelo relatório."
+      }
     },
     "threatDetectionOptions": {
       "cancel": "Cancelar",
@@ -1024,6 +1205,388 @@
       "adminDetail": "Incluir o detalhamento de logins de administradores",
       "adminDetailHelp": "Lista cada login interativo de uma conta com papel de administrador, incluindo o endereço de origem. É a seção que um auditor lê primeiro.",
       "coverageNote": "O relatório cobre apenas logins interativos e imprime a janela que realmente cobre. A Microsoft mantém os registros de login por cerca de 30 dias e exige uma licença Entra ID P1 ou P2 para liberá-los, de modo que o primeiro relatório após ativar a coleta é parcial e diz isso."
+    },
+    "reportPeriod": {
+      "label": "Período do relatório",
+      "kinds": {
+        "last_full_month": "Último mês completo",
+        "last_30_days": "Últimos 30 dias",
+        "last_quarter": "Último trimestre completo",
+        "custom": "Datas personalizadas"
+      },
+      "start": "Data de início",
+      "end": "Data de término (inclusiva)",
+      "help": "Os períodos predefinidos são recalculados a cada execução do relatório, então um agendamento mensal sempre cobre o mês que acabou de terminar.",
+      "errors": {
+        "missing": "Escolha uma data de início e uma data de término.",
+        "invalid": "As duas datas precisam ser datas reais do calendário.",
+        "order": "A data de início não pode ser posterior à data de término."
+      }
+    },
+    "ticketSlaOptions": {
+      "approximationNote": "O cumprimento é recalculado a partir dos registros de data e hora do ticket, e não lido das marcações de violação, então um ticket respondido com atraso continua contando como falha. O tempo em pausa é armazenado como um total acumulado, então pausas após a primeira resposta melhoram levemente o cumprimento de resposta.",
+      "groupBy": "Agrupar por",
+      "groupByAutomatic": "Automático: por organização para todas as organizações, por prioridade para uma única organização",
+      "groupByValues": {
+        "organization": "Organização",
+        "priority": "Prioridade",
+        "technician": "Técnico (responsável atual)",
+        "category": "Categoria"
+      },
+      "technicianNote": "Os tickets são agrupados pelo responsável atual. O histórico de reatribuições não é registrado, então não é necessariamente o técnico que respondeu.",
+      "includeNoSla": "Listar tickets sem meta de SLA",
+      "includeNoSlaHelp": "Tickets sem meta de SLA são sempre contados à parte e nunca afetam o cumprimento. Esta opção só controla se eles aparecem nas linhas de detalhe.",
+      "cancel": "Cancelar",
+      "createReport": "Criar relatório"
+    },
+    "technicianTimeOptions": {
+      "groupBy": "Agrupar por",
+      "groupByValues": {
+        "technician": "Técnico",
+        "organization": "Organização",
+        "work_type": "Tipo de trabalho"
+      },
+      "orgAxisNote": "Lançamentos de horas sem organização aparecem em uma linha própria \"Sem organização\". Um relatório de uma única organização só vê as horas lançadas nos tickets dela.",
+      "capacityHours": "Capacidade semanal por técnico (horas)",
+      "capacityHoursHelp": "A utilização considera a mesma capacidade para todos os técnicos, proporcional aos dias úteis. Férias e meio período não são considerados.",
+      "cancel": "Cancelar",
+      "createReport": "Criar relatório"
+    },
+    "arAgingOptions": {
+      "asOf": "Idade dos saldos em",
+      "asOfHelp": "Deixe em branco para calcular a idade no dia em que o relatório é executado. Uma data move apenas a data de referência: os saldos são os atuais, então ela não reconstrói saldos passados nem desfaz pagamentos registrados depois dessa data.",
+      "asOfInvalid": "Informe uma data real do calendário ou deixe o campo em branco.",
+      "groupBy": "Agrupar por",
+      "groupByValues": {
+        "organization": "Organização",
+        "currency": "Moeda"
+      },
+      "currencyNote": "Cada moeda tem seus próprios totais. Os valores não são convertidos entre moedas.",
+      "includePaidInPeriod": "Listar faturas pagas no mês até a data",
+      "includePaidInPeriodHelp": "Adiciona uma nota com as faturas pagas integralmente do primeiro dia do mês de referência até a data de referência. Nunca altera as faixas de idade.",
+      "cancel": "Cancelar",
+      "createReport": "Criar relatório"
+    },
+    "aiUsageByClientOptions": {
+      "groupBy": "Agrupar por",
+      "groupByAutomatic": "Automático: por organização para todas as organizações, por modelo para uma única organização",
+      "groupByValues": {
+        "organization": "Organização",
+        "model": "Modelo"
+      },
+      "periodNote": "As cobranças são faturadas por mês-calendário UTC. Um período definido em outro fuso horário pode diferir da fatura para o uso próximo aos limites do mês.",
+      "unpricedNote": "O uso de um modelo sem tarifa no perfil de faturamento do cliente é contado como sem preço. Nunca é tratado como gratuito.",
+      "cancel": "Cancelar",
+      "createReport": "Criar relatório"
+    },
+    "mrrRenewalsOptions": {
+      "runTimeNote": "Este relatório é sempre medido no dia em que é executado. Não há período nem data de referência para definir.",
+      "groupBy": "Agrupar por",
+      "groupByValues": {
+        "organization": "Organização",
+        "contract": "Contrato"
+      },
+      "renewalHorizon": "Horizonte de renovação",
+      "renewalHorizonOption": "Próximos {{days}} dias",
+      "renewalHorizonHelp": "Os contratos cujo prazo termina dentro desta janela são listados como renovações.",
+      "cancel": "Cancelar",
+      "createReport": "Criar relatório"
+    },
+    "quoteWinRateOptions": {
+      "groupBy": "Agrupar por",
+      "groupByAutomatic": "Automático: por organização para todas as organizações, por autor para uma organização",
+      "groupByValues": {
+        "organization": "Organização",
+        "author": "Autor",
+        "currency": "Moeda"
+      },
+      "periodNote": "O período se aplica à data em que o orçamento foi enviado pela primeira vez. Um orçamento revisado e reenviado conta uma só vez, como uma oportunidade.",
+      "cancel": "Cancelar",
+      "createReport": "Criar relatório"
+    },
+    "ticketSlaPerformanceOptions": {
+      "includeSubjects": "Incluir assuntos dos tickets",
+      "includeSubjectsHelp": "Os relatórios entregues ficam visíveis para todos os usuários do portal desta organização. Deixe desativado, a menos que todos os usuários possam ver o assunto de cada ticket.",
+      "cancel": "Cancelar",
+      "createReport": "Criar relatório"
+    },
+    "clientProfitabilityOptions": {
+      "groupBy": "Agrupar por",
+      "groupByDefault": "Padrão para o escopo do relatório",
+      "groupByValues": {
+        "organization": "Organização",
+        "source": "Fonte"
+      },
+      "groupByHelp": "Por padrão, agrupa por organização em um relatório de todas as organizações e por fonte em uma única organização.",
+      "laborEnabled": "Estimar o custo de mão de obra",
+      "laborAmount": "Custo de mão de obra por hora",
+      "laborCurrency": "Moeda",
+      "laborHelp": "Uma única taxa para todos os técnicos. Os valores que a usam são identificados como estimativas.",
+      "cancel": "Cancelar",
+      "createReport": "Criar relatório"
+    },
+    "ownerScope": {
+      "legend": "O relatório abrange",
+      "allOrganizations": "Todas as organizações",
+      "allOrganizationsHint": "Abrange todas as organizações ativas e em avaliação, determinadas a cada execução. As organizações excluídas são listadas nas notas do relatório. Requer acesso a todas as organizações.",
+      "singleOrganization": "Uma organização",
+      "singleOrganizationHint": "A organização selecionada no seletor de organizações.",
+      "singleOrganizationDisabledHint": "Selecione uma organização no seletor de organizações para criar um relatório com escopo de organização.",
+      "needsOrganizationHint": "Selecione uma organização no seletor de organizações para criar este relatório. Relatórios de todas as organizações exigem acesso a todas as organizações."
+    },
+    "orgPicker": {
+      "label": "Organização",
+      "placeholder": "Escolha uma organização",
+      "hint": "Você está vendo todas as organizações. Escolha a organização deste relatório.",
+      "required": "Escolha uma organização antes de salvar este relatório.",
+      "chooseFirst": "Escolha uma organização acima antes de usar um modelo.",
+      "previewNeedsOrg": "Escolha uma organização para ver uma prévia ao vivo."
+    },
+    "series": {
+      "covers": {
+        "legend": "O relatório abrange",
+        "org": "Uma organização",
+        "orgHint": "Um relatório para um cliente, enviado aos contatos dessa organização.",
+        "series": "Um relatório por organização",
+        "seriesHint": "Uma definição, com uma cópia separada para cada organização abrangida, enviada aos contatos dessa organização.",
+        "combined": "Todas as organizações combinadas",
+        "combinedHint": "Um relatório combinado de todas as suas organizações, para a sua própria equipe."
+      },
+      "schedule": {
+        "label": "Com que frequência a cópia de cada organização é enviada",
+        "placeholder": "Escolha um agendamento",
+        "hint": "Um relatório enviado a várias organizações é executado em um agendamento, então não pode ser único. Escolha com que frequência a cópia de cada organização é enviada.",
+        "required": "Escolha com que frequência o relatório é enviado."
+      },
+      "targeting": {
+        "legend": "Quais organizações",
+        "all": "Todas as organizações",
+        "allHint": "Inclui todas as organizações atuais e futuras. Desmarque as que você quer ignorar.",
+        "selected": "Organizações escolhidas",
+        "selectedHint": "Inclui exatamente as organizações que você marcar.",
+        "search": "Pesquisar organizações",
+        "summary": "Abrange {{covered}} de {{total}} organizações",
+        "noneSelected": "Escolha pelo menos uma organização.",
+        "empty": "Nenhuma organização corresponde."
+      },
+      "recipients": {
+        "legend": "Quem recebe a cópia de cada organização",
+        "primaryContact": "O contato principal da organização",
+        "roles": "Contatos com estas funções",
+        "noRuleWarning": "Nenhuma regra está selecionada, então uma organização só recebe sua cópia quando você adiciona contatos na cópia dessa organização.",
+        "internalCc": "Cópias internas",
+        "internalCcHint": "A cópia de cada organização também é enviada a estes endereços da sua equipe.",
+        "ccPlaceholder": "name@example.com",
+        "ccAdd": "Adicionar",
+        "ccInvalid": "Informe um endereço de e-mail válido.",
+        "ccRemove": "Remover {{email}}",
+        "previewLoading": "Verificando destinatários…",
+        "previewContacts_one": "Resolve para {{count}} contato",
+        "previewContacts_other": "Resolve para {{count}} contatos",
+        "previewOrgs_one": "em {{count}} organização",
+        "previewOrgs_other": "em {{count}} organizações",
+        "previewMissing_one": "{{count}} organização não tem destinatário cliente: {{names}}",
+        "previewMissing_other": "{{count}} organizações não têm destinatário cliente: {{names}}",
+        "previewMore": "e mais {{count}}",
+        "previewFailed": "Não foi possível verificar os destinatários. Eles ainda são definidos para cada organização quando o relatório dela é executado.",
+        "previewNoTargets": "Escolha organizações para ver quem recebe o relatório."
+      },
+      "builder": {
+        "filtersDisabled": "Os filtros de site, dispositivo e grupo não estão disponíveis aqui: a cópia de cada organização abrange a organização inteira.",
+        "created": "Relatório multiorganização “{{name}}” criado",
+        "saved": "Relatório multiorganização “{{name}}” salvo",
+        "saveFailed": "Não foi possível salvar o relatório multiorganização.",
+        "targetsFailed": "As configurações foram salvas, mas as organizações abrangidas não foram atualizadas. Tente salvar novamente."
+      },
+      "list": {
+        "filtersLabel": "Mostrar",
+        "filters": {
+          "all": "Todos",
+          "multi": "Multiorganização",
+          "single": "Organização única",
+          "combined": "Combinado"
+        },
+        "noMatches": "Nenhum relatório corresponde a este filtro.",
+        "loadFailed": "Não foi possível carregar os relatórios multiorganização. Os demais relatórios são exibidos.",
+        "multiOrgBadge": "Multiorganização",
+        "multiOrgBadgeTitle": "Parte do relatório multiorganização “{{name}}”",
+        "expand": "Mostrar organizações",
+        "collapse": "Ocultar organizações",
+        "summary": "{{date}} · {{delivered}}/{{total}} entregues",
+        "summaryNoRecipient_one": "{{count}} sem destinatário",
+        "summaryNoRecipient_other": "{{count}} sem destinatário",
+        "summaryBlocked_one": "{{count}} bloqueada",
+        "summaryBlocked_other": "{{count}} bloqueadas",
+        "summaryNever": "Ainda não executado",
+        "runsSeriesColumn": "Relatório multiorganização",
+        "actions": {
+          "edit": "Editar relatório multiorganização",
+          "transferOwner": "Transferir proprietário",
+          "delete": "Excluir relatório multiorganização",
+          "pause": "Pausar",
+          "resume": "Retomar"
+        },
+        "pausedBadge": "Pausado",
+        "pausedTitle": "Pausado: nenhuma cópia de organização é executada até você retomar.",
+        "paused": "“{{name}}” pausado",
+        "resumed": "“{{name}}” retomado",
+        "pauseFailed": "Não foi possível pausar ou retomar o relatório multiorganização.",
+        "deleteTitle": "Excluir relatório multiorganização?",
+        "deleteMessage": "“{{name}}” deixa de ser executado. A cópia de cada organização é arquivada com seu histórico de execuções.",
+        "deleteConfirm": "Excluir",
+        "deleted": "Relatório multiorganização “{{name}}” excluído",
+        "deleteFailed": "Não foi possível excluir o relatório multiorganização."
+      },
+      "drilldown": {
+        "columns": {
+          "org": "Organização",
+          "state": "Estado",
+          "lastRun": "Última execução",
+          "delivery": "Entrega",
+          "recipients": "Destinatários",
+          "actions": "Ações"
+        },
+        "states": {
+          "active": "Ativa",
+          "excluded": "Excluída",
+          "ineligible": "Não elegível",
+          "blocked_no_authority": "Bloqueada: o proprietário não tem acesso",
+          "blocked_no_recipients": "Sem destinatário cliente",
+          "detached": "Desvinculada"
+        },
+        "delivery": {
+          "sent": "Enviado",
+          "not_scheduled": "Não enviado por e-mail"
+        },
+        "neverRun": "Ainda não executado",
+        "actions": {
+          "runNow": "Executar agora",
+          "editRecipients": "Editar destinatários",
+          "exclude": "Excluir",
+          "include": "Incluir",
+          "detach": "Desvincular"
+        },
+        "lastOrgHint": "Um relatório multiorganização com organizações escolhidas precisa de pelo menos uma. Exclua-o em vez disso.",
+        "noAuthorityHint": "O proprietário não consegue acessar esta organização, então a cópia dela não é executada. Transfira o proprietário para corrigir.",
+        "excludeTitle": "Excluir {{org}}?",
+        "excludeMessage": "{{org}} deixa de receber este relatório. A cópia dela é arquivada com seu histórico de execuções, e incluí-la novamente restaura a mesma cópia.",
+        "excludeConfirm": "Excluir",
+        "detachTitle": "Desvincular {{org}}?",
+        "detachMessage": "A cópia de {{org}} se torna um relatório independente que você pode editar livremente. Ela mantém seu histórico de execuções e deixa de acompanhar este relatório multiorganização. Enquanto essa cópia independente existir, {{org}} fica fora do relatório multiorganização, mesmo que você a inclua novamente.",
+        "detachConfirm": "Desvincular",
+        "excluded": "{{org}} excluída",
+        "included": "{{org}} incluída",
+        "detached": "{{org}} desvinculada",
+        "generated": "Relatório gerado para {{org}}",
+        "updateFailed": "Não foi possível atualizar o relatório multiorganização.",
+        "detachFailed": "Não foi possível desvincular o relatório.",
+        "generateFailed": "Não foi possível gerar o relatório.",
+        "detachedHint": "A cópia independente é gerenciada separadamente. Exclua esse relatório para trazer esta organização de volta ao relatório multiorganização."
+      },
+      "transferOwner": {
+        "title": "Transferir proprietário",
+        "description": "A cópia de cada organização é executada com o acesso do proprietário. Escolha um usuário do parceiro com acesso a todas as organizações.",
+        "label": "Novo proprietário",
+        "placeholder": "Escolha um usuário",
+        "current": "{{name}} (proprietário atual)",
+        "confirm": "Transferir",
+        "loadFailed": "Não foi possível carregar os usuários.",
+        "forbidden": "Você precisa de permissão para ver usuários para transferir o proprietário.",
+        "noCandidates": "Nenhum outro usuário tem acesso a todas as organizações.",
+        "transferred": "Proprietário transferido para {{name}}",
+        "failed": "Não foi possível transferir o proprietário."
+      },
+      "child": {
+        "partOf": "Parte do relatório multiorganização “{{name}}”",
+        "partOfUnnamed": "Parte de um relatório multiorganização",
+        "lockedExplanation": "As configurações compartilhadas são editadas no relatório multiorganização. Aqui só é possível alterar os destinatários desta organização.",
+        "managedByMsp": "Gerenciado pelo seu MSP",
+        "managedExplanation": "Seu MSP gerencia este relatório. Você pode alterar quem, na sua organização, o recebe.",
+        "editSeries": "Editar relatório multiorganização",
+        "detach": "Desvincular",
+        "archived": "Esta cópia está arquivada: a organização não é mais abrangida pelo relatório multiorganização.",
+        "summary": {
+          "type": "Tipo",
+          "schedule": "Agendamento",
+          "format": "Formato"
+        },
+        "recipients": {
+          "title": "Destinatários desta organização",
+          "description": "Escolha quem recebe a cópia desta organização, além da regra do relatório multiorganização.",
+          "default": "Seguir a regra",
+          "add": "Sempre enviar",
+          "remove": "Nunca enviar",
+          "byRule": "Incluído pela regra",
+          "loadFailed": "Não foi possível carregar os destinatários.",
+          "updated": "Destinatários atualizados",
+          "updateFailed": "Não foi possível atualizar os destinatários.",
+          "empty": "Esta organização não tem contatos com endereço de e-mail."
+        }
+      },
+      "editPage": {
+        "title": "Editar relatório multiorganização",
+        "description": "As alterações valem para a cópia de cada organização de “{{name}}”.",
+        "breadcrumb": "Relatórios",
+        "back": "Voltar para Relatórios",
+        "loading": "Carregando relatório multiorganização…",
+        "notFound": "Este relatório multiorganização não existe mais.",
+        "loadFailed": "Não foi possível carregar o relatório multiorganização."
+      },
+      "errors": {
+        "seriesTypeUnsupported": "Este tipo de relatório não pode ser enviado como um relatório por organização.",
+        "seriesConfigOrgSpecific": "Remova os filtros de site, dispositivo e grupo: um relatório multiorganização abrange organizações inteiras.",
+        "seriesManaged": "Este relatório pertence a um relatório multiorganização. Edite o relatório multiorganização ou desvincule esta cópia primeiro.",
+        "seriesOwnerIneligible": "Esse usuário não pode ser proprietário de um relatório multiorganização.",
+        "seriesOwnerIneligiblePermission": "Esse usuário não pode ser proprietário de um relatório multiorganização: a função dele não concede a permissão de exportação de relatórios (reports:export).",
+        "seriesOwnerIneligibleOrgAccess": "Esse usuário não pode ser proprietário de um relatório multiorganização: ele precisa de acesso a todas as organizações.",
+        "seriesOwnerIneligibleInactive": "A conta desse usuário não está ativa, por isso ele não pode ser proprietário de um relatório multiorganização.",
+        "seriesOwnerIneligibleMembership": "Esse usuário não é mais membro do seu parceiro, por isso não pode ser proprietário de um relatório multiorganização.",
+        "seriesOwnerIneligibleNotPartner": "Esse usuário não pertence ao seu parceiro, por isso não pode ser proprietário de um relatório multiorganização.",
+        "seriesOwnerIneligibleTenantInactive": "Sua conta de parceiro não está ativa, por isso um relatório multiorganização não pode receber um novo proprietário.",
+        "seriesNotFound": "Este relatório multiorganização não existe mais.",
+        "seriesWriteDenied": "Somente usuários do parceiro com acesso a todas as organizações podem alterar relatórios multiorganização.",
+        "seriesTargetOrgInaccessible": "Uma das organizações escolhidas não está disponível para você.",
+        "seriesTargetOrgHidden": "O Quick Support e a organização de espera de dispositivos não atribuídos não podem ser cobertos por um relatório multiorganização.",
+        "reportNotSeriesChild": "Este relatório não faz mais parte de um relatório multiorganização.",
+        "recipientModeRequiresSeries": "\"Nunca enviar\" só se aplica a uma cópia de um relatório multiorganização.",
+        "recipientsNeedExportAndMfa": "Enviar relatórios a destinatários exige a permissão de exportação e o login com autenticação multifator.",
+        "seriesAuthorityUnverifiable": "Não foi possível confirmar o acesso do proprietário agora. Tente novamente em instantes."
+      }
+    },
+    "seriesCombine": {
+      "banner": "Algumas organizações têm relatórios quase idênticos que podem ser combinados em um relatório multiorganização. Grupos encontrados: {{groups}}",
+      "review": "Revisar",
+      "title": "Combinar em um relatório multiorganização",
+      "groupLabel": "Grupo",
+      "groupSummary": "{{type}} · {{schedule}} · organizações: {{orgs}}",
+      "nameLabel": "Nome do relatório multiorganização",
+      "targetLegend": "Organizações abrangidas",
+      "targetSelected": "Somente estas organizações (nada novo é enviado)",
+      "targetAll": "Todas as organizações, inclusive as adicionadas depois",
+      "targetAllWarning": "Organizações sem uma cópia hoje passarão a receber este relatório, apenas com a cópia interna até você adicionar destinatários do cliente.",
+      "adopt": "Mantido e convertido",
+      "archive": "Duplicado, será arquivado",
+      "deliverableLinked": "Usado como evidência de uma entrega de serviço",
+      "lastRun": "Última execução {{date}}",
+      "neverRun": "Nunca executado",
+      "contacts": "Destinatários do cliente: {{list}}",
+      "noContacts": "Nenhum destinatário do cliente",
+      "ccShared": "Cópia interna em todas as cópias: {{list}}",
+      "ccNone": "Sem cópia interna",
+      "ccConflictHeading": "Estes endereços em cópia aparecem só em alguns destes relatórios. Escolha o que acontece com cada um:",
+      "ccInclude": "Copiar em todas",
+      "ccDrop": "Deixar de copiar",
+      "ccUnresolved": "Escolha o que acontece com cada endereço em cópia antes de combinar.",
+      "ruleNote": "Cada cliente mantém exatamente os destinatários que tem hoje. Você pode adicionar uma regra de destinatários depois, no relatório multiorganização.",
+      "confirm": "Combinar",
+      "success": "Combinado em “{{name}}”",
+      "failed": "Não foi possível combinar estes relatórios.",
+      "groupChanged": "Estes relatórios mudaram desde que você abriu esta janela. A lista foi atualizada.",
+      "stalled": "Não está sendo enviado hoje (o proprietário perdeu o acesso). Combinar retoma o envio.",
+      "ccHeldBy": "Atualmente em cópia em: {{list}}",
+      "ownerIneligible": "Você não pode ser proprietário de um relatório para estas organizações: {{list}}",
+      "ccTooMany": "Há endereços demais em cópia interna (máximo {{max}}).",
+      "otherOrgs": "outras organizações"
     }
   }
 }

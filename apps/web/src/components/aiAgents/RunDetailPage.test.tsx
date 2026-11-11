@@ -314,7 +314,7 @@ describe('RunDetailPage', () => {
 
     await waitFor(() => expect(screen.getByTestId('run-detail-trace-entry-1')).toBeInTheDocument());
     const link = screen.getByTestId('run-detail-intent-link-intent-1');
-    expect(link).toHaveAttribute('href', '/approvals');
+    expect(link).toHaveAttribute('href', '/approvals#intent-intent-1');
   });
 
   it('renders the ledger', async () => {
@@ -451,7 +451,7 @@ describe('RunDetailPage sweep findings', () => {
 
     await waitFor(() => expect(screen.getByTestId('ai-agent-run-sweep-finding-0')).toBeInTheDocument());
     const link = screen.getByTestId('ai-agent-run-sweep-proposal-link-0');
-    expect(link).toHaveAttribute('href', '/approvals');
+    expect(link).toHaveAttribute('href', '/approvals#intent-intent-9');
     expect(link).toHaveTextContent('Approval requested');
   });
 
@@ -1053,7 +1053,7 @@ describe('RunDetailPage heading order', () => {
     const h1s = screen.getAllByRole('heading', { level: 1 });
     expect(h1s).toHaveLength(1);
 
-    const budgetHeading = screen.getByText('Exposure budget');
+    const budgetHeading = screen.getByText('Action budget');
     expect(budgetHeading.tagName).toBe('H2');
 
     const sweepHeading = screen.getByText('Sweep findings');
@@ -1077,6 +1077,16 @@ describe('RunDetailPage ledger status labels', () => {
     // RUN_DETAIL.ledger[0].status is the raw enum 'completed' — the cell
     // must show the translated label, not the bare lowercase token.
     expect(row).toHaveTextContent('Completed');
+  });
+
+  it('labels a platform-refused ledger row Stopped, not with the raw token (#10411)', async () => {
+    mockEndpoints({ detail: { ...RUN_DETAIL, ledger: [{ ...RUN_DETAIL.ledger[0], status: 'refused' as never }] } });
+    render(<RunDetailPage runId="run-1" />);
+
+    await waitFor(() => expect(screen.getByTestId('run-detail-ledger')).toBeInTheDocument());
+    const row = screen.getByTestId('run-detail-ledger').querySelector('tbody tr');
+    expect(row).toHaveTextContent('Stopped');
+    expect(row).not.toHaveTextContent(/\brefused\b/);
   });
 });
 
@@ -1541,6 +1551,17 @@ describe('RunDetailPage evidence rendering', () => {
     expect(list).toHaveTextContent('Awaiting approval');
     expect(list.textContent).not.toContain('pending_approval');
   });
+
+  // #4461: this "view all" link used to be a bare `/approvals`.
+  it('deep-links the intents-list "view all" link to the specific intent', async () => {
+    mockEndpoints();
+    render(<RunDetailPage runId="run-1" />);
+
+    await waitFor(() => expect(screen.getByTestId('run-detail-intents')).toBeInTheDocument());
+    const list = screen.getByTestId('run-detail-intents');
+    const link = list.querySelector('a');
+    expect(link).toHaveAttribute('href', '/approvals#intent-intent-1');
+  });
 });
 
 // Critique finding #3 — the one actionable finding must not be a dead end.
@@ -1713,7 +1734,7 @@ describe('RunDetailPage findings at narrow widths', () => {
     expect(card).toHaveTextContent('Print Spooler is stopped');
     expect(card).toHaveTextContent('The watched Spooler service has been stopped since 09:12.');
     expect(screen.getByTestId('ai-agent-run-sweep-finding-card-0-evidence')).toBeInTheDocument();
-    expect(screen.getByTestId('ai-agent-run-sweep-card-proposal-link-0')).toHaveAttribute('href', '/approvals');
+    expect(screen.getByTestId('ai-agent-run-sweep-card-proposal-link-0')).toHaveAttribute('href', '/approvals#intent-intent-9');
   });
 
   // Review finding — the card's proposal line rendered as a bare, unlabelled
@@ -2286,7 +2307,7 @@ describe('RunDetailPage — patch plan', () => {
   });
 
   it.each([
-    ['rejected', 'Rejected'],
+    ['rejected', 'Denied'],
     ['approved', 'Approved'],
     ['expired', 'Expired'],
     ['failed', 'Failed'],
@@ -2714,5 +2735,43 @@ describe('RunDetailPage — sweep act outcomes (#4442 W05)', () => {
     await waitFor(() => expect(screen.getByTestId('ai-agent-run-sweep-finding-0')).toBeInTheDocument());
     expect(screen.getByTestId('ai-agent-run-sweep-proposal-link-0')).toBeInTheDocument();
     expect(screen.queryByTestId('ai-agent-run-sweep-proposal-outcome-0')).not.toBeInTheDocument();
+  });
+});
+
+// Wisp W07 (#9920) — "Wisp for <user>" provenance. `wisp` is the additive
+// run-detail field (null for every run not admitted under a Wisp grant).
+describe('RunDetailPage Wisp provenance', () => {
+  const WISP = {
+    grantId: '7d0c1e2f-0000-4000-8000-000000000001',
+    grantorUserId: '3f2a1b9c-0000-4000-8000-000000000002',
+    grantorName: 'Todd',
+    depth: 0 as const,
+    requestedByRunId: null,
+  };
+
+  it('renders "Wisp for Todd" in the meta grid when run.wisp is set', async () => {
+    mockEndpoints({ detail: { ...RUN_DETAIL, wisp: WISP } });
+    render(<RunDetailPage runId="run-1" />);
+
+    await waitFor(() => expect(screen.getByTestId('run-detail-wisp')).toBeInTheDocument());
+    expect(screen.getByTestId('run-detail-wisp')).toHaveTextContent('Wisp for Todd');
+    expect(within(screen.getByTestId('run-detail-meta')).getByTestId('run-detail-wisp')).toBeInTheDocument();
+  });
+
+  it('falls back to the grantor id prefix when the name is not visible', async () => {
+    mockEndpoints({ detail: { ...RUN_DETAIL, wisp: { ...WISP, grantorName: null } } });
+    render(<RunDetailPage runId="run-1" />);
+
+    await waitFor(() => expect(screen.getByTestId('run-detail-wisp')).toBeInTheDocument());
+    expect(screen.getByTestId('run-detail-wisp')).toHaveTextContent('Wisp for 3f2a1b9c');
+  });
+
+  it('renders nothing wisp-related when run.wisp is null', async () => {
+    mockEndpoints({ detail: { ...RUN_DETAIL, wisp: null } });
+    render(<RunDetailPage runId="run-1" />);
+
+    await waitFor(() => expect(screen.getByTestId('run-detail-meta')).toBeInTheDocument());
+    expect(screen.queryByTestId('run-detail-wisp')).toBeNull();
+    expect(screen.queryByText(/Wisp for/)).toBeNull();
   });
 });

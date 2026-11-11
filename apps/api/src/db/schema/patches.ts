@@ -100,7 +100,9 @@ export const patchComplianceReportStatusEnum = pgEnum('patch_compliance_report_s
   'pending',
   'running',
   'completed',
-  'failed'
+  'failed',
+  // The report file was removed by the retention job (jobs/patchReportRetention.ts).
+  'expired'
 ]);
 
 export const patchComplianceReportFormatEnum = pgEnum('patch_compliance_report_format', [
@@ -168,6 +170,13 @@ export const patchPolicies = pgTable('patch_policies', {
   categories: text('categories').array().notNull().default([]),
   excludeCategories: text('exclude_categories').array().notNull().default([]),
   categoryRules: jsonb('category_rules').notNull().default([]),
+  // Per-app block/pin rules (#8184), validated by ringAppRulesSchema.
+  // CHECK patch_policies_app_rules_array_chk (array) lives in the migration.
+  appRules: jsonb('app_rules').notNull().default([]),
+  // Windows feature-release policy (block | allow | pin), validated by
+  // ringFeatureUpdatesSchema. CHECK patch_policies_feature_updates_object_chk
+  // (object) lives in the migration. Default block = pre-control behaviour.
+  featureUpdates: jsonb('feature_updates').notNull().default({ mode: 'block' }),
   createdBy: uuid('created_by').references(() => users.id),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull()
@@ -180,7 +189,7 @@ export const patchApprovals = pgTable('patch_approvals', {
   policyId: uuid('policy_id').references(() => patchPolicies.id),
   ringId: uuid('ring_id').references(() => patchPolicies.id),
   status: patchApprovalStatusEnum('status').notNull().default('pending'),
-  approvedBy: uuid('approved_by').references(() => users.id),
+  approvedBy: uuid('approved_by').references(() => users.id, { onDelete: 'set null' }),
   approvedAt: timestamp('approved_at'),
   deferUntil: timestamp('defer_until'),
   notes: text('notes'),
@@ -214,6 +223,34 @@ export const devicePatches = pgTable('device_patches', {
   // before the user-context winget pass existed; NULL is treated as
   // machine-wide. Constrained by device_patches_scope_chk.
   scope: varchar('scope', { length: 16 }),
+  // This device's own agent-reported severity/category, written unconditionally
+  // by every scan (routes/agents/patches.ts) regardless of trust — unlike
+  // patches.severity/.category, which only a trusted source (a curated
+  // third-party catalog match) may set. Scoped to this device_id/org_id row,
+  // so one tenant's report can never move another tenant's classification.
+  // Effective severity/category for approval rules, UI and reports is
+  // COALESCE(patches.severity/.category, this row's reported_* value) — see
+  // services/patchSeverityOverlay.ts.
+  reportedSeverity: patchSeverityEnum('reported_severity'),
+  // Where reported_severity came from, as the agent reported it (#9387):
+  // 'vendor' (the vendor's own rating, e.g. Windows Update's MSRC severity) or
+  // 'derived' (inferred agent-side from the update's classification/title
+  // because the vendor published none). NULL when the agent sent no
+  // provenance (older agents, non-Windows providers) or the severity is
+  // unknown. Always written together with reported_severity so the pair can
+  // never disagree. Constrained by device_patches_reported_severity_source_chk.
+  reportedSeveritySource: varchar('reported_severity_source', { length: 16 }),
+  reportedCategory: text('reported_category'),
+  // What this device says the update is (#11073): driver, firmware, quality,
+  // feature, definition or other. Per device on purpose: it decides what Breeze
+  // patch jobs leave to a vendor lane, so it can never live on the shared row.
+  // NULL (older agents, other providers) is never left to a lane. Constrained by
+  // device_patches_reported_update_type_chk.
+  reportedUpdateType: varchar('reported_update_type', { length: 16 }),
+  // The vendor lane whose own update this is (#11073): dell, surface, hp or lenovo.
+  // A lane only delivers its vendor's updates, so NULL (an Intel driver on a Surface,
+  // say) is never left to one. Constrained by device_patches_reported_update_owner_chk.
+  reportedUpdateOwner: varchar('reported_update_owner', { length: 16 }),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull()
 }, (table) => ({
@@ -254,8 +291,8 @@ export const patchJobs = pgTable('patch_jobs', {
 
 export const patchJobResults = pgTable('patch_job_results', {
   id: uuid('id').primaryKey().defaultRandom(),
-  jobId: uuid('job_id').notNull().references(() => patchJobs.id),
-  deviceId: uuid('device_id').notNull().references(() => devices.id),
+  jobId: uuid('job_id').notNull().references(() => patchJobs.id, { onDelete: 'cascade' }),
+  deviceId: uuid('device_id').notNull().references(() => devices.id, { onDelete: 'cascade' }),
   // NULL = a WHOLE-DEVICE summary row (the device was skipped, never
   // dispatched, or closed with no approved set), which is about the device's
   // outcome for the job rather than about any one patch. Nullable since
@@ -285,21 +322,25 @@ export const patchJobResults = pgTable('patch_job_results', {
   // is not — the predicate is proven statically instead. See the migration.
   statusCreatedIdx: index('idx_patch_job_results_status_created')
     .on(table.createdAt)
-    .where(sql`status IN ('failed', 'queued')`)
+    .where(sql`status IN ('failed', 'queued')`),
+  // #4223: latest attempt per (device, patch) for the patch list / device
+  // patches install-failure overlay (services/patchInstallFailures.ts).
+  devicePatchCreatedIdx: index('idx_patch_job_results_device_patch_created')
+    .on(table.deviceId, table.patchId, table.createdAt)
 }));
 
 export const patchRollbacks = pgTable('patch_rollbacks', {
   id: uuid('id').primaryKey().defaultRandom(),
-  deviceId: uuid('device_id').notNull().references(() => devices.id),
+  deviceId: uuid('device_id').notNull().references(() => devices.id, { onDelete: 'cascade' }),
   patchId: uuid('patch_id').notNull().references(() => patches.id),
-  originalJobId: uuid('original_job_id').references(() => patchJobs.id),
+  originalJobId: uuid('original_job_id').references(() => patchJobs.id, { onDelete: 'set null' }),
   reason: text('reason'),
   status: patchRollbackStatusEnum('status').notNull().default('pending'),
   startedAt: timestamp('started_at'),
   completedAt: timestamp('completed_at'),
   output: text('output'),
   errorMessage: text('error_message'),
-  initiatedBy: uuid('initiated_by').references(() => users.id),
+  initiatedBy: uuid('initiated_by').references(() => users.id, { onDelete: 'set null' }),
   createdAt: timestamp('created_at').defaultNow().notNull()
 });
 

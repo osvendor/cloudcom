@@ -45,6 +45,35 @@ describe('useNetworkAssetMutations — request shapes', () => {
     expect(lastBody()).toEqual({ label: 'Main Switch', notes: null, tags: ['core'] });
   });
 
+  it('changeSite PATCHes siteId and folds the siteMove summary into the success toast', async () => {
+    fetchMock.mockResolvedValueOnce(ok({
+      id: ASSET, siteId: 'site-b',
+      siteMove: { unlinkedDevice: true, monitorsReattached: 3, topologyPoliciesDisabled: 1 },
+    }));
+
+    const result = await mutations().changeSite(ASSET, 'site-b', 'Branch');
+
+    expect(lastCall()[0]).toBe(`/discovery/assets/${ASSET}`);
+    expect(lastInit().method).toBe('PATCH');
+    expect(lastBody()).toEqual({ siteId: 'site-b' });
+    expect(result.siteMove).toEqual({ unlinkedDevice: true, monitorsReattached: 3, topologyPoliciesDisabled: 1 });
+    expect(toastMock).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'success',
+      message: 'Moved to Branch. The link to its agent device was removed because that device is in a different site. 1 topology monitoring policy was disabled.',
+    }));
+  });
+
+  it('changeSite keeps the toast short when the move undid nothing', async () => {
+    fetchMock.mockResolvedValueOnce(ok({
+      id: ASSET, siteId: 'site-b',
+      siteMove: { unlinkedDevice: false, monitorsReattached: 0, topologyPoliciesDisabled: 0 },
+    }));
+
+    await mutations().changeSite(ASSET, 'site-b', 'Branch');
+
+    expect(toastMock).toHaveBeenCalledWith(expect.objectContaining({ type: 'success', message: 'Moved to Branch.' }));
+  });
+
   it('patchIdentity carries resetTypeToAuto on its own', async () => {
     await mutations().patchIdentity(ASSET, { resetTypeToAuto: true });
     expect(lastBody()).toEqual({ resetTypeToAuto: true });
@@ -103,22 +132,24 @@ describe('useNetworkAssetMutations — request shapes', () => {
     expect(lastBody()).toEqual({ isActive: false });
   });
 
-  it('disableMonitoring DELETEs /monitoring/assets/:id', async () => {
-    await mutations().disableMonitoring(ASSET);
-    expect(lastCall()[0]).toBe(`/monitoring/assets/${ASSET}`);
-    expect(lastInit().method).toBe('DELETE');
+  it('disableMonitoring PATCHes SNMP only and returns the checked response', async () => {
+    fetchMock.mockResolvedValueOnce(ok({ snmpDevice: { id: 'snmp-1', templateId: null } }));
+    const result = await mutations().disableMonitoring(ASSET);
+    expect(lastCall()[0]).toBe(`/monitoring/assets/${ASSET}/snmp`);
+    expect(lastInit().method).toBe('PATCH');
+    expect(lastBody()).toEqual({ isActive: false });
+    expect(result).toEqual({ snmpDevice: { id: 'snmp-1', templateId: null } });
   });
 
-  it('createCheck POSTs /monitors with the assetId bound and deleteCheck DELETEs by monitor id', async () => {
-    const m = mutations();
-    await m.createCheck(ASSET, { name: 'Ping', monitorType: 'icmp_ping', target: '10.0.0.2' });
-    expect(lastCall()[0]).toBe('/monitors');
-    expect(lastInit().method).toBe('POST');
-    expect(lastBody()).toMatchObject({ assetId: ASSET, monitorType: 'icmp_ping', target: '10.0.0.2' });
+  it('does not expose legacy check creation or deletion', () => {
+    expect('createCheck' in mutations()).toBe(false);
+    expect('deleteCheck' in mutations()).toBe(false);
+  });
 
-    await m.deleteCheck('mon-3');
-    expect(lastCall()[0]).toBe('/monitors/mon-3');
-    expect(lastInit().method).toBe('DELETE');
+  it('does not report success when disabling SNMP fails in an HTTP-200 body', async () => {
+    fetchMock.mockResolvedValueOnce(ok({ success: false, error: 'Cannot pause SNMP' }));
+    await expect(mutations().disableMonitoring(ASSET)).rejects.toBeInstanceOf(ActionError);
+    expect(toastMock).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'success' }));
   });
 });
 

@@ -18,6 +18,10 @@ import { Hono } from 'hono';
 
 const selectMock = vi.hoisted(() => vi.fn());
 
+// Auth context the mocked authMiddleware installs. `null` keeps the default
+// system-scope caller; a test may swap in a partner caller (#9648).
+const authState = vi.hoisted(() => ({ auth: null as Record<string, unknown> | null }));
+
 // Site scope carried by `c.get('permissions')`. `undefined` is unrestricted,
 // `[]` is restricted-to-no-sites; the two must never be conflated.
 const permissionState = vi.hoisted(() => ({
@@ -39,6 +43,7 @@ vi.mock('drizzle-orm', async (importOriginal) => {
     }),
     eq: (column: unknown, value: unknown) => ({ op: 'eq', column, value }),
     gte: (column: unknown, value: unknown) => ({ op: 'gte', column, value }),
+    lt: (column: unknown, value: unknown) => ({ op: 'lt', column, value }),
     inArray: (column: unknown, values: unknown) => ({ op: 'inArray', column, values }),
   };
 });
@@ -75,7 +80,7 @@ vi.mock('../middleware/auth', () => ({
     if (!c.req.header('Authorization')) {
       return c.json({ error: 'Missing authorization header' }, 401);
     }
-    c.set('auth', {
+    c.set('auth', authState.auth ?? {
       user: { id: 'user-123', email: 'test@example.com' },
       scope: 'system',
       orgId: 'org-123'
@@ -90,7 +95,7 @@ vi.mock('../middleware/auth', () => ({
 
 import { authMiddleware } from '../middleware/auth';
 import { runOutsideDbContext, withSystemDbAccessContext } from '../db';
-import { devices } from '../db/schema';
+import { devices, remoteSessions } from '../db/schema';
 // Real dialect + real `sql` (the drizzle-orm mock above spreads the original and
 // replaces only the condition builders), so a captured predicate can be compiled
 // to the exact text Postgres would receive.
@@ -100,6 +105,7 @@ import {
   metricsMiddleware,
   metricsRoutes,
   recordAgentHeartbeat,
+  recordAgentIngestSubmission,
   recordBackupCommandTimeout,
   recordBackupDispatchFailure,
   recordBackupVerificationResult,
@@ -126,6 +132,13 @@ import {
   recordS1SyncRun,
 } from '../services/sentinelOne/metrics';
 
+import {
+  createPoolAdmission,
+  registerRequestPoolAdmission,
+  __resetRequestPoolAdmissionForTests,
+} from '../db/poolAdmission';
+import { __resetDeadlineExpiryTotalsForTests, withAcquireAndPrologueDeadline } from '../db/prologueDeadline';
+
 function mockRollupTrendRows(selectMock: ReturnType<typeof vi.fn>, rows: unknown[]) {
   selectMock.mockReturnValueOnce({
     from: () => ({
@@ -136,6 +149,23 @@ function mockRollupTrendRows(selectMock: ReturnType<typeof vi.fn>, rows: unknown
       }),
     }),
   });
+}
+
+function mockCapturingRollupTrendRows(selectMock: ReturnType<typeof vi.fn>, rows: unknown[]): any[] {
+  const captured: any[] = [];
+  selectMock.mockReturnValueOnce({
+    from: () => ({
+      where: (condition: any) => {
+        captured.push(condition);
+        return {
+          groupBy: () => ({
+            orderBy: () => Promise.resolve(rows),
+          }),
+        };
+      },
+    }),
+  });
+  return captured;
 }
 
 function mockRawTrendRows(selectMock: ReturnType<typeof vi.fn>, rows: unknown[]) {
@@ -327,6 +357,7 @@ describe('metrics routes', () => {
       }),
     });
     permissionState.permissions = undefined;
+    authState.auth = null;
     process.env.NODE_ENV = 'test';
     process.env.METRICS_SCRAPE_TOKEN = 'test-scrape-token';
     delete process.env.METRICS_INCLUDE_ORG_ID;
@@ -559,6 +590,75 @@ describe('metrics routes', () => {
     });
   });
 
+  describe('db pool admission gauges (#8143)', () => {
+    afterEach(() => {
+      __resetRequestPoolAdmissionForTests();
+      __resetDeadlineExpiryTotalsForTests();
+    });
+
+    async function scrape(): Promise<string> {
+      const res = await app.request('/metrics', { headers: { Authorization: 'Bearer token' } });
+      expect(res.status).toBe(200);
+      return res.text();
+    }
+
+    it('publishes -1 for the pool-size series when this process has no request pool', async () => {
+      const body = await scrape();
+      for (const name of [
+        'breeze_db_pool_admission_permits',
+        'breeze_db_pool_admission_in_use',
+        'breeze_db_pool_admission_waiting',
+        'breeze_db_pool_admission_abandoned',
+        'breeze_db_pool_admission_effective_permits',
+      ]) {
+        expect(getMetricLine(body, name)).toBe(`${name} -1`);
+      }
+      expect(getMetricLine(body, 'breeze_db_prologue_deadline_expiries_total', { timer: 'late' }))
+        .toBe('breeze_db_prologue_deadline_expiries_total{timer="late"} 0');
+    });
+
+    it('tracks permits in use, abandoned permits and the effective pool on scrape', async () => {
+      const gate = createPoolAdmission({ permits: 4 });
+      registerRequestPoolAdmission(gate);
+      const held = await gate.acquire('metrics-test');
+      const abandoned = await gate.acquire('metrics-test');
+      abandoned.abandon(new Error('prologue expired'));
+
+      const during = await scrape();
+      expect(getMetricLine(during, 'breeze_db_pool_admission_permits')).toBe('breeze_db_pool_admission_permits 4');
+      expect(getMetricLine(during, 'breeze_db_pool_admission_in_use')).toBe('breeze_db_pool_admission_in_use 2');
+      expect(getMetricLine(during, 'breeze_db_pool_admission_abandoned')).toBe('breeze_db_pool_admission_abandoned 1');
+      expect(getMetricLine(during, 'breeze_db_pool_admission_effective_permits'))
+        .toBe('breeze_db_pool_admission_effective_permits 3');
+
+      abandoned.release('connection-closed');
+      held.release('resolved');
+      const after = await scrape();
+      expect(getMetricLine(after, 'breeze_db_pool_admission_in_use')).toBe('breeze_db_pool_admission_in_use 0');
+      expect(getMetricLine(after, 'breeze_db_pool_admission_effective_permits'))
+        .toBe('breeze_db_pool_admission_effective_permits 4');
+      expect(getMetricLine(after, 'breeze_db_pool_admission_abandoned_returned_total', { how: 'connection-closed' }))
+        .toBe('breeze_db_pool_admission_abandoned_returned_total{how="connection-closed"} 1');
+    });
+
+    it('counts acquire timeouts by timer lateness', async () => {
+      vi.useFakeTimers();
+      try {
+        const expired = withAcquireAndPrologueDeadline('metrics-test', () => new Promise<never>(() => {}), {
+          acquireTimeoutMs: 1_000,
+          timeoutMs: 15_000,
+        }).catch(() => undefined);
+        await vi.advanceTimersByTimeAsync(1_000);
+        await expired;
+      } finally {
+        vi.useRealTimers();
+      }
+      const body = await scrape();
+      expect(getMetricLine(body, 'breeze_db_pool_acquire_timeouts_total', { timer: 'on-time' }))
+        .toBe('breeze_db_pool_acquire_timeouts_total{timer="on-time"} 1');
+    });
+  });
+
   it('registers the action-intents counter on the live registry', async () => {
     const res = await app.request('/metrics', {
       headers: { Authorization: 'Bearer token' }
@@ -582,6 +682,8 @@ describe('metrics routes', () => {
     // once defined but never registered here — this guards that regression.
     expect(body).toContain('# HELP breeze_m365_customer_graph_read_events_total');
     expect(body).toContain('# HELP breeze_m365_customer_graph_actions_events_total');
+    // #9322: the consent failure-cause sibling counter is live too.
+    expect(body).toContain('# HELP breeze_m365_consent_verification_failure_causes_total');
   });
 
   it('requires auth for metrics endpoints', async () => {
@@ -628,6 +730,26 @@ describe('metrics routes', () => {
       { timestamp: '2026-06-18T00:00:00.000Z', cpu: 21, memory: 76 },
     ]);
     expect(selectMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('normalises the raw fallback bucket to ISO UTC, matching the rollup path (#11284)', async () => {
+    const { db } = await import('../db');
+    const selectMock = vi.mocked(db.select);
+    mockRollupTrendRows(selectMock, []);
+    mockRawTrendRows(selectMock, [
+      { bucket: '2026-06-18 00:00:00', cpu: 21.2, memory: 75.8 },
+      { bucket: '2026-06-19 00:00:00+00', cpu: 30, memory: 40 },
+    ]);
+
+    const res = await app.request('/trends?range=7d', {
+      headers: { Authorization: 'Bearer token' },
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual([
+      { timestamp: '2026-06-18T00:00:00.000Z', cpu: 21, memory: 76 },
+      { timestamp: '2026-06-19T00:00:00.000Z', cpu: 30, memory: 40 },
+    ]);
   });
 
   it('requires scrape token for /scrape endpoint', async () => {
@@ -1295,6 +1417,26 @@ describe('metrics routes', () => {
     );
   });
 
+  // #4340 — routine agent-ingest successes are no longer chained into
+  // audit_logs; this counter is where their volume is observable instead.
+  it('renders agent ingest submissions by kind and outcome', async () => {
+    recordAgentIngestSubmission('logs', 'success');
+    recordAgentIngestSubmission('logs', 'success');
+    recordAgentIngestSubmission('security_status', 'failed');
+
+    const body = await (
+      await app.request('/metrics', { headers: { Authorization: 'Bearer token' } })
+    ).text();
+
+    expect(body).toContain('# HELP breeze_agent_ingest_submissions_total');
+    expect(
+      getMetricLine(body, 'breeze_agent_ingest_submissions_total', { kind: 'logs', outcome: 'success' })
+    ).toBe('breeze_agent_ingest_submissions_total{kind="logs",outcome="success"} 2');
+    expect(
+      getMetricLine(body, 'breeze_agent_ingest_submissions_total', { kind: 'security_status', outcome: 'failed' })
+    ).toBe('breeze_agent_ingest_submissions_total{kind="security_status",outcome="failed"} 1');
+  });
+
   it('keeps the agent-heartbeat counter usable after a metrics reset', async () => {
     resetMetricsForTesting();
     recordAgentHeartbeat('failed');
@@ -1531,6 +1673,41 @@ describe('metrics routes', () => {
       expect(selectMock).not.toHaveBeenCalled();
     });
 
+    it('counts sessions in the selected range, not a fixed 30 days (#9650)', async () => {
+      const captured = mockCurrentMetricsQueries(deviceRows, activeSessionRows, recentSessionRows);
+      const before = Date.now();
+
+      const res = await app.request('/?range=7d', { headers: { Authorization: 'Bearer token' } });
+
+      expect(res.status).toBe(200);
+      const gteCond = findCondition(captured[2], 'gte', remoteSessions.createdAt);
+      expect(gteCond).toBeDefined();
+      const since = (gteCond.value as Date).getTime();
+      const dayMs = 24 * 60 * 60 * 1000;
+      expect(before - since).toBeGreaterThanOrEqual(7 * dayMs - 1000);
+      expect(before - since).toBeLessThan(7 * dayMs + 60_000);
+    });
+
+    it('bounds sessions by a custom range and rejects an inverted one (#9650)', async () => {
+      const captured = mockCurrentMetricsQueries(deviceRows, activeSessionRows, recentSessionRows);
+
+      const res = await app.request('/?startDate=2026-01-01&endDate=2026-01-10', {
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(200);
+      const gteCond = findCondition(captured[2], 'gte', remoteSessions.createdAt);
+      expect((gteCond.value as Date).toISOString()).toBe('2026-01-01T00:00:00.000Z');
+      // A date-only endDate is inclusive: the window runs to the next UTC day.
+      const ltCond = findCondition(captured[2], 'lt', remoteSessions.createdAt);
+      expect((ltCond.value as Date).toISOString()).toBe('2026-01-11T00:00:00.000Z');
+
+      const bad = await app.request('/?startDate=2026-01-10&endDate=2026-01-01', {
+        headers: { Authorization: 'Bearer token' },
+      });
+      expect(bad.status).toBe(400);
+    });
+
     it('leaves the unrestricted query chains unchanged', async () => {
       const captured = mockCurrentMetricsQueries(deviceRows, activeSessionRows, recentSessionRows);
 
@@ -1599,5 +1776,276 @@ describe('metrics routes', () => {
         { timestamp: '2026-06-18T00:00:00.000Z', cpu: 20, memory: 70 },
       ]);
     });
+  });
+
+  // #9648: with a client selected, the page sends `?orgId=`; the KPI strip and
+  // Performance Trend must narrow to it, never widen past the token.
+  describe('selected org scope (#9648)', () => {
+    const ORG_A = '44444444-4444-4444-4444-444444444441';
+    const ORG_B = '44444444-4444-4444-4444-444444444442';
+    const ORG_FOREIGN = '44444444-4444-4444-4444-444444444449';
+
+    beforeEach(() => {
+      authState.auth = {
+        user: { id: 'user-123', email: 'test@example.com' },
+        scope: 'partner',
+        orgId: null,
+        partnerId: 'partner-1',
+        accessibleOrgIds: [ORG_A, ORG_B],
+        canAccessOrg: (orgId: string) => orgId === ORG_A || orgId === ORG_B,
+        orgCondition: (column: unknown) => ({ op: 'inArray', column, values: [ORG_A, ORG_B] }),
+      };
+    });
+
+    it('narrows every current-metric aggregate to the selected org', async () => {
+      const captured = mockCurrentMetricsQueries([], [], []);
+
+      const res = await app.request(`/?orgId=${ORG_A}`, { headers: { Authorization: 'Bearer token' } });
+
+      expect(res.status).toBe(200);
+      expect(captured).toHaveLength(3);
+      for (const condition of captured) {
+        expect(findCondition(condition, 'eq', devices.orgId)?.value).toBe(ORG_A);
+        // ANDed onto the token's reach, never substituted for it.
+        expect(findCondition(condition, 'inArray', devices.orgId)?.values).toEqual([ORG_A, ORG_B]);
+      }
+    });
+
+    it('narrows the raw device-metrics trend fallback to the selected org and window', async () => {
+      const { deviceMetrics } = await import('../db/schema');
+      mockCapturingRollupTrendRows(selectMock, []); // no rollups
+      const captured: any[] = [];
+      selectMock.mockReturnValueOnce({
+        from: () => ({
+          innerJoin: () => ({
+            where: (condition: any) => {
+              captured.push(condition);
+              return { groupBy: () => ({ orderBy: () => Promise.resolve([]) }) };
+            },
+          }),
+        }),
+      });
+
+      const res = await app.request(`/trends?startDate=2026-01-01&endDate=2026-01-31&orgId=${ORG_A}`, {
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(200);
+      expect(findCondition(captured[0], 'eq', devices.orgId)?.value).toBe(ORG_A);
+      expect(findCondition(captured[0], 'gte', deviceMetrics.timestamp)?.value).toEqual(
+        new Date('2026-01-01T00:00:00.000Z')
+      );
+      expect(findCondition(captured[0], 'lt', deviceMetrics.timestamp)?.value).toEqual(
+        new Date('2026-02-01T00:00:00.000Z')
+      );
+    });
+
+    it('narrows the rollup trend query to the selected org', async () => {
+      const { metricRollups } = await import('../db/schema');
+      const captured = mockCapturingRollupTrendRows(selectMock, [
+        { bucket: new Date('2026-06-18T00:00:00.000Z'), metricName: 'cpu_percent', value: 20 },
+      ]);
+
+      const res = await app.request(`/trends?range=7d&orgId=${ORG_A}`, {
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(200);
+      expect(findCondition(captured[0], 'eq', metricRollups.orgId)?.value).toBe(ORG_A);
+    });
+
+    it('keeps the whole accessible book when no org is selected', async () => {
+      const captured = mockCurrentMetricsQueries([], [], []);
+
+      const res = await app.request('/', { headers: { Authorization: 'Bearer token' } });
+
+      expect(res.status).toBe(200);
+      for (const condition of captured) {
+        expect(findCondition(condition, 'eq', devices.orgId)).toBeUndefined();
+        expect(findCondition(condition, 'inArray', devices.orgId)?.values).toEqual([ORG_A, ORG_B]);
+      }
+    });
+
+    it.each([['/'], ['/trends?range=7d']])(
+      'denies an org outside the caller\'s reach on %s without querying',
+      async (path) => {
+        const sep = path.includes('?') ? '&' : '?';
+        const res = await app.request(`${path}${sep}orgId=${ORG_FOREIGN}`, {
+          headers: { Authorization: 'Bearer token' },
+        });
+
+        expect(res.status).toBe(403);
+        expect(await res.json()).toEqual({ error: 'Access to this organization denied' });
+        expect(selectMock).not.toHaveBeenCalled();
+      }
+    );
+
+    it('denies an organization-scope caller naming a different org', async () => {
+      authState.auth = {
+        user: { id: 'user-123', email: 'test@example.com' },
+        scope: 'organization',
+        orgId: ORG_A,
+        accessibleOrgIds: [ORG_A],
+        canAccessOrg: (orgId: string) => orgId === ORG_A,
+        orgCondition: (column: unknown) => ({ op: 'eq', column, value: ORG_A }),
+      };
+
+      const res = await app.request(`/?orgId=${ORG_B}`, { headers: { Authorization: 'Bearer token' } });
+
+      expect(res.status).toBe(403);
+      expect(selectMock).not.toHaveBeenCalled();
+    });
+  });
+
+  // #9649: "Custom range" sends startDate/endDate and no `range`.
+  describe('GET /trends custom range (#9649)', () => {
+    it('bounds the rollup query by startDate/endDate (end date inclusive)', async () => {
+      const { metricRollups } = await import('../db/schema');
+      const captured = mockCapturingRollupTrendRows(selectMock, [
+        { bucket: new Date('2026-01-10T00:00:00.000Z'), metricName: 'cpu_percent', value: 20 },
+      ]);
+
+      const res = await app.request('/trends?startDate=2026-01-01&endDate=2026-01-31', {
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(200);
+      expect(findCondition(captured[0], 'gte', metricRollups.bucketStart)?.value).toEqual(
+        new Date('2026-01-01T00:00:00.000Z')
+      );
+      expect(findCondition(captured[0], 'lt', metricRollups.bucketStart)?.value).toEqual(
+        new Date('2026-02-01T00:00:00.000Z')
+      );
+    });
+
+    it.each([
+      ['an end before the start', 'startDate=2026-02-01&endDate=2026-01-01'],
+      ['only an end date', 'endDate=2026-01-31'],
+      ['an unparseable date', 'startDate=2026-13-45&endDate=2026-01-31'],
+      ['a span over a year', 'startDate=2024-01-01&endDate=2026-01-31'],
+    ])('rejects %s with 400 instead of silently using 30 days', async (_label, qs) => {
+      const res = await app.request(`/trends?${qs}`, { headers: { Authorization: 'Bearer token' } });
+
+      expect(res.status).toBe(400);
+      expect(selectMock).not.toHaveBeenCalled();
+    });
+  });
+});
+
+describe('backup storage-session and helper-capability metrics', () => {
+  beforeEach(() => {
+    resetMetricsForTesting();
+  });
+
+  async function seriesOf(name: string): Promise<Array<{ labels: Record<string, string | number>; value: number }>> {
+    const { metricsRegistry } = await import('../services/metricsRegistry');
+    const metric = metricsRegistry.getSingleMetric(name);
+    expect(metric, name).toBeDefined();
+    const data = await metric!.get();
+    return data.values.map((v) => ({ labels: v.labels as Record<string, string | number>, value: v.value }));
+  }
+
+  it('counts storage-session calls, resolved objects and mints without per-session or per-device labels', async () => {
+    const {
+      recordStorageSessionCall,
+      recordStorageSessionObjects,
+      recordStorageSessionMint,
+    } = await import('../services/backupMetrics');
+    recordStorageSessionCall('snapshot_read', 'resolve', 200);
+    recordStorageSessionCall('snapshot_read', 'renew', 410);
+    recordStorageSessionObjects('snapshot_read', 'GET', 7);
+    recordStorageSessionMint('snapshot_read', 'minted', 'ok');
+    recordStorageSessionMint('snapshot_read', 'refused', 'helper_unsupported');
+
+    const calls = await seriesOf('breeze_backup_storage_session_calls_total');
+    expect(calls).toEqual(expect.arrayContaining([
+      { labels: { scope: 'snapshot_read', op: 'resolve', status: '200' }, value: 1 },
+      { labels: { scope: 'snapshot_read', op: 'renew', status: '410' }, value: 1 },
+    ]));
+    for (const s of calls) expect(Object.keys(s.labels).sort()).toEqual(['op', 'scope', 'status']);
+
+    const objects = await seriesOf('breeze_backup_storage_session_objects_total');
+    expect(objects).toEqual([{ labels: { scope: 'snapshot_read', method: 'GET' }, value: 7 }]);
+
+    const mints = await seriesOf('breeze_backup_storage_session_mint_total');
+    expect(mints).toEqual(expect.arrayContaining([
+      { labels: { scope: 'snapshot_read', outcome: 'minted', reason: 'ok' }, value: 1 },
+      { labels: { scope: 'snapshot_read', outcome: 'refused', reason: 'helper_unsupported' }, value: 1 },
+    ]));
+    for (const s of mints) expect(Object.keys(s.labels).sort()).toEqual(['outcome', 'reason', 'scope']);
+  });
+
+  it('counts backup write dispatches by command type, mode and reason', async () => {
+    const { recordBackupWriteDispatch } = await import('../services/backupMetrics');
+    recordBackupWriteDispatch('backup_run', 'legacy_credential', 'inline_provider_config');
+    recordBackupWriteDispatch('mssql_backup', 'local', 'no_credential');
+
+    const series = await seriesOf('breeze_backup_write_dispatch_total');
+    expect(series).toEqual(expect.arrayContaining([
+      { labels: { command_type: 'backup_run', mode: 'legacy_credential', reason: 'inline_provider_config' }, value: 1 },
+      { labels: { command_type: 'mssql_backup', mode: 'local', reason: 'no_credential' }, value: 1 },
+    ]));
+  });
+
+  it('counts snapshot attestation outcomes by outcome only', async () => {
+    const { recordBackupAttestation } = await import('../services/backupMetrics');
+    recordBackupAttestation('recorded');
+    recordBackupAttestation('recorded');
+    recordBackupAttestation('missing_from_capable');
+    recordBackupAttestation('mismatch');
+
+    const series = await seriesOf('breeze_backup_attestation_total');
+    expect(series).toEqual(expect.arrayContaining([
+      { labels: { outcome: 'recorded' }, value: 2 },
+      { labels: { outcome: 'missing_from_capable' }, value: 1 },
+      { labels: { outcome: 'mismatch' }, value: 1 },
+    ]));
+    for (const s of series) expect(Object.keys(s.labels)).toEqual(['outcome']);
+  });
+
+  it('counts snapshot file index events by event and outcome (#11026)', async () => {
+    const { recordSnapshotFileIndex } = await import('../services/backupMetrics');
+    recordSnapshotFileIndex('inline_dropped', 'dropped');
+    recordSnapshotFileIndex('hydration', 'complete');
+    recordSnapshotFileIndex('hydration', 'complete');
+    recordSnapshotFileIndex('hydration', 'manifest_missing');
+
+    const series = await seriesOf('breeze_backup_snapshot_file_index_total');
+    expect(series).toEqual(expect.arrayContaining([
+      { labels: { event: 'inline_dropped', outcome: 'dropped' }, value: 1 },
+      { labels: { event: 'hydration', outcome: 'complete' }, value: 2 },
+      { labels: { event: 'hydration', outcome: 'manifest_missing' }, value: 1 },
+    ]));
+    for (const s of series) expect(Object.keys(s.labels).sort()).toEqual(['event', 'outcome']);
+  });
+
+  it('counts restore integrity expectations by command type, status and reason', async () => {
+    const { recordRestoreIntegrity } = await import('../services/backupMetrics');
+    recordRestoreIntegrity('backup_restore', 'attested', 'server_verified');
+    recordRestoreIntegrity('backup_restore', 'attested', 'server_verified');
+    recordRestoreIntegrity('vm_instant_boot', 'unattested', 'unattested_legacy');
+    recordRestoreIntegrity('bmr_recover', 'absent', 'snapshot_unresolved');
+
+    const series = await seriesOf('breeze_backup_restore_integrity_total');
+    expect(series).toEqual(expect.arrayContaining([
+      { labels: { type: 'backup_restore', status: 'attested', reason: 'server_verified' }, value: 2 },
+      { labels: { type: 'vm_instant_boot', status: 'unattested', reason: 'unattested_legacy' }, value: 1 },
+      { labels: { type: 'bmr_recover', status: 'absent', reason: 'snapshot_unresolved' }, value: 1 },
+    ]));
+    for (const s of series) expect(Object.keys(s.labels).sort()).toEqual(['reason', 'status', 'type']);
+  });
+
+  it('counts backup helper capability regressions by capability only', async () => {
+    const { recordBackupCapabilityRegressed } = await import('../services/backupMetrics');
+    recordBackupCapabilityRegressed('integrity');
+    recordBackupCapabilityRegressed('integrity');
+    recordBackupCapabilityRegressed('write');
+
+    const series = await seriesOf('breeze_backup_capability_regressed_total');
+    expect(series).toEqual(expect.arrayContaining([
+      { labels: { capability: 'integrity' }, value: 2 },
+      { labels: { capability: 'write' }, value: 1 },
+    ]));
+    for (const s of series) expect(Object.keys(s.labels)).toEqual(['capability']);
   });
 });

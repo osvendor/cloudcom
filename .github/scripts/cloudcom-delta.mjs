@@ -2,6 +2,9 @@ import { execFileSync } from 'node:child_process';
 import { appendFileSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
+const reviewedImpacts = JSON.parse(readFileSync(new URL('../cloudcom-reviewed-impacts.json', import.meta.url), 'utf8'));
+const reviewedPaths = new Set(Object.values(reviewedImpacts.groups).flatMap(group => group.paths));
+
 const baselinePath = new URL('../cloudcom-baseline.json', import.meta.url);
 const docsPath = /^(?:docs\/|apps\/docs\/|scripts\/docs-review\/|README(?:\.[^/]+)?$|AGENTS\.md$|[^/]+\.mdx?$)/u;
 const supported = [
@@ -53,7 +56,7 @@ const portalRemoteApiPaths = new Set([
   'apps/api/src/services/portalNativeLogin.ts', 'apps/api/src/services/portalNativeLogin.test.ts',
   'apps/api/src/routes/portal/nativeLogin.ts', 'apps/api/src/routes/portal/nativeLogin.test.ts',
   'apps/api/src/__tests__/integration/portalNativeLogin.integration.test.ts',
-  '.env.example', 'docker-compose.yml',
+  '.env.example', 'docker-compose.yml', 'docker-compose.dev.yml',
   'apps/api/migrations/2026-09-21-portal-remote-access.sql',
   'apps/api/migrations/2026-09-21-portal-remote-session-prompt.sql',
   'apps/api/migrations/2026-09-22-portal-remote-assignment-identity.sql',
@@ -225,6 +228,7 @@ const infraPaths = new Set([
   'apps/web/public/scripts/SHA256SUMS',
   '.github/workflows/cloudcom-candidate.yml',
   'scripts/release/cloudcom-candidate-workflow.test.mjs',
+  'scripts/release/inspect-candidate-archive.py', 'scripts/release/inspect-candidate-archive.test.mjs',
   'scripts/cloudcom/exchange-worker-release.mjs',
   'scripts/cloudcom/exchange-worker-release.test.mjs',
   'deploy/cloudcom-exchange-worker/compose.overlay.candidate.yml',
@@ -261,7 +265,7 @@ export function classify(paths) {
     if (portalRemoteApiPaths.has(path)) {
       result.api = true;
       result.portalRemote = true;
-      if (path === '.env.example' || path === 'docker-compose.yml') result.infra = true;
+      if (['.env.example', 'docker-compose.yml', 'docker-compose.dev.yml'].includes(path)) result.infra = true;
       continue;
     }
     if (portalRemoteWebPaths.has(path)) {
@@ -325,6 +329,11 @@ export function classify(paths) {
     }
     if (infraPaths.has(path) || path.startsWith('.github/workflows/') || path.startsWith('.github/cloudcom-') || path.startsWith('.github/scripts/cloudcom-') || path.startsWith('scripts/cloudcom/')) {
       result.infra = true;
+      continue;
+    }
+    if (reviewedPaths.has(path)) {
+      // Exact reviewed paths only. CI runs the selected manifest group's real gates.
+      result.api = true;
       continue;
     }
     const category = supported.find(([, pattern]) => pattern.test(path))?.[0];

@@ -21,7 +21,7 @@ export const ACTIVE_REMOTE_SESSION_STATUSES = ['pending', 'connecting', 'active'
 
 /**
  * A session row a teardown has just marked `disconnected`. Desktop rows must
- * carry the terminal generation the contract wrote (SEC-038 W03) so the stop
+ * carry the terminal generation the contract wrote so the stop
  * can name it; tunnel rows have no generation.
  */
 export type DisconnectedSession = {
@@ -46,7 +46,14 @@ async function getTunnelWs() {
   return _tunnelWs;
 }
 
-async function teardownDisconnectedTunnels(disconnected: DisconnectedSession[]): Promise<void> {
+/**
+ * Given tunnel rows already marked `disconnected`, revoke their viewer tokens
+ * and close the tunnel (locally, or with a `tunnel_close` to the owning
+ * agent). Exported for writers that disconnect tunnels inside their own
+ * transaction and tear down after it commits (the install incarnation
+ * boundary, services/deviceInstallBoundary).
+ */
+export async function teardownDisconnectedTunnels(disconnected: DisconnectedSession[]): Promise<void> {
   if (disconnected.length === 0) return;
   const agentByDevice = new Map<string, string | null>();
   try {
@@ -172,7 +179,7 @@ export async function teardownDisconnectedSessions(
         // session already marked disconnected. The relay reaches whichever
         // instance owns the socket, or reports `offline` honestly.
         //
-        // The stop names the terminal generation (SEC-038 W03): the agent's
+        // The stop names the terminal generation: the agent's
         // fence tombstones against it and the API binds the stop result back
         // to this exact decision. A row with no generation cannot be stopped
         // through the contract, so it is a loud error, not a bare stop.
@@ -183,7 +190,12 @@ export async function teardownDisconnectedSessions(
           captureException(invariant);
           throw invariant;
         }
-        await dispatchCommandToAgent(agentId, buildStopDesktopCommand(row.id, row.terminalGeneration));
+        // Outside any held DB context: the relay refuses to run inside one
+        // (#4142), and this teardown runs inline in request handlers. The
+        // send itself touches no database. The request transaction still
+        // waits on the ack (known limitation; tracked in #4142).
+        const generation = row.terminalGeneration;
+        await runOutsideDbContext(() => dispatchCommandToAgent(agentId, buildStopDesktopCommand(row.id, generation)));
       } catch (err) {
         console.error(
           `[remoteSessionTeardown] Failed to send stop_desktop for session ${row.id}:`,
@@ -218,11 +230,12 @@ export async function teardownDisconnectedSessions(
         try {
           // Same durable-relay reasoning as stop_desktop above: this fallback
           // exists precisely for the case where the socket is NOT local.
-          await dispatchCommandToAgent(agentId, {
+          // Outside any held DB context, as stop_desktop above (#4142).
+          await runOutsideDbContext(() => dispatchCommandToAgent(agentId, {
             id: `term-stop-${row.id}`,
             type: 'terminal_stop',
             payload: { sessionId: row.id },
-          });
+          }));
         } catch (err) {
           console.error(
             `[remoteSessionTeardown] Failed to send terminal_stop for session ${row.id}:`,

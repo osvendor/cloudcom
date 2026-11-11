@@ -2,7 +2,10 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // utils.ts (transitively imported by the handlers) pulls in the db module at
 // import time; stub it so importing the registry doesn't open a connection.
-vi.mock('../../db', () => ({ db: {} }));
+// `select` is a real mock (not `{}`) so handlers that query the db directly
+// (e.g. patchComplianceHandler) can be driven per-test.
+const { mockDbSelect } = vi.hoisted(() => ({ mockDbSelect: vi.fn() }));
+vi.mock('../../db', () => ({ db: { select: mockDbSelect } }));
 
 const { getRecentMetricsMock, getLatestMetricMock } = vi.hoisted(() => ({
   getRecentMetricsMock: vi.fn(),
@@ -16,9 +19,19 @@ vi.mock('./utils', async (importOriginal) => {
 });
 
 import './index';
-import { conditionPayloadsFrom, evaluateConditions, findRetiredConditionTypes, interpolateTemplate, retiredConditionTypeError } from './index';
+import { conditionPayloadsFrom, evaluateConditions, findRetiredConditionTypes, interpolateTemplate, retiredConditionTypeError, withMetConditionDescriptions } from './index';
 import { conditionRegistry } from './registry';
 import { offlineHandler } from './handlers/offline';
+import { interpolateAlertTemplate } from '@breeze/shared';
+import { patchComplianceKind } from '../monitors/kinds/patchCompliance';
+import { bandwidthKind } from '../monitors/kinds/bandwidth';
+import { networkErrorsKind } from '../monitors/kinds/networkErrors';
+import { serviceKind } from '../monitors/kinds/service';
+import { processKind } from '../monitors/kinds/process';
+import { scriptKind } from '../monitors/kinds/script';
+import { backupContinuityKind } from '../monitors/kinds/backupContinuity';
+import { compositeKind } from '../monitors/kinds/composite';
+import { eventLogKind } from '../monitors/kinds/eventLog';
 
 describe('condition registry wiring (issue #1857)', () => {
   it('resolves the legacy "status" condition type to the offline handler', () => {
@@ -64,6 +77,42 @@ describe('evaluateConditions context.actualValue (issue #1980)', () => {
     expect(result.context.actualValue).toBeCloseTo(92.33, 1);
     // Must not be the latest sub-threshold sample.
     expect(result.context.actualValue).not.toBe(88);
+    expect(getLatestMetricMock).not.toHaveBeenCalled();
+  });
+
+  it('keeps the latest raw sample fallback when a recognized metric window is empty', async () => {
+    getRecentMetricsMock.mockResolvedValue([]);
+    getLatestMetricMock.mockResolvedValue({ cpuPercent: 42 });
+    const result = await evaluateConditions({ type: 'metric', metric: 'cpu', operator: 'gt', value: 90 }, 'device-1');
+    expect(result.triggered).toBe(false);
+    expect(result.dataState).toBe('unknown');
+    expect(result.context.actualValue).toBe(42);
+    expect(getLatestMetricMock).toHaveBeenCalledExactlyOnceWith('device-1');
+  });
+
+  it('preserves a missing fallback row as undefined rather than fabricating a value', async () => {
+    getRecentMetricsMock.mockResolvedValue([]);
+    getLatestMetricMock.mockResolvedValue(null);
+    const result = await evaluateConditions({ type: 'metric', metric: 'cpu', operator: 'gt', value: 90 }, 'device-1');
+    expect(result.context.actualValue).toBeUndefined();
+    expect(result.dataState).toBe('unknown');
+    expect(getLatestMetricMock).toHaveBeenCalledExactlyOnceWith('device-1');
+  });
+
+  it('does not read raw metrics for an unrecognized metric name', async () => {
+    const result = await evaluateConditions({ type: 'metric', metric: 'not-a-metric', operator: 'gt', value: 90 }, 'device-1');
+    expect(result.context.actualValue).toBeUndefined();
+    expect(result.dataState).toBe('unknown');
+    expect(getLatestMetricMock).not.toHaveBeenCalled();
+  });
+
+  it('keeps an evaluated zero without falling back to a raw sample', async () => {
+    getRecentMetricsMock.mockResolvedValue([{ cpuPercent: 0 }]);
+    getLatestMetricMock.mockResolvedValue({ cpuPercent: 99 });
+    const result = await evaluateConditions({ type: 'metric', metric: 'cpu', operator: 'gt', value: 90 }, 'device-1');
+    expect(result.context.actualValue).toBe(0);
+    expect(result.triggered).toBe(false);
+    expect(getLatestMetricMock).not.toHaveBeenCalled();
   });
 });
 
@@ -238,5 +287,448 @@ describe('interpolateTemplate', () => {
     expect(interpolateTemplate('{{device}} offline', { deviceName: 'DESKTOP-8UG65K6' })).toBe(
       'DESKTOP-8UG65K6 offline',
     );
+  });
+});
+
+describe('evaluateConditions context for non-threshold kinds (issue #6932)', () => {
+  beforeEach(() => {
+    mockDbSelect.mockReset();
+    getRecentMetricsMock.mockReset();
+    getLatestMetricMock.mockReset();
+  });
+
+  it('fills actualValue/operator/threshold for a patch_compliance condition, so the built-in template renders with no {{ left', async () => {
+    // Drives db.select({...}).from(...).where(...).orderBy(...).limit(1).
+    mockDbSelect.mockReturnValue({
+      from: () => ({
+        where: () => ({
+          orderBy: () => ({
+            limit: () => Promise.resolve([{ patchComplianceScore: 50, capturedAt: new Date(), factorDetails: {} }]),
+          }),
+        }),
+      }),
+    });
+
+    const result = await evaluateConditions(
+      { type: 'patch_compliance', operator: 'lt', value: 80 },
+      'device-1'
+    );
+
+    expect(result.triggered).toBe(true);
+    expect(result.context.actualValue).toBe(50);
+    expect(result.context.threshold).toBe(80);
+    expect(result.context.operator).toBe('<');
+    expect(getLatestMetricMock).not.toHaveBeenCalled();
+
+    const title = interpolateAlertTemplate(patchComplianceKind.titleTemplate, {
+      ...result.context,
+      ruleName: 'Low patch compliance',
+      deviceName: 'DESKTOP-8UG65K6',
+    });
+    const message = interpolateAlertTemplate(patchComplianceKind.messageTemplate, {
+      ...result.context,
+      ruleName: 'Low patch compliance',
+      deviceName: 'DESKTOP-8UG65K6',
+    });
+
+    expect(title).not.toContain('{{');
+    expect(message).toBe('Low patch compliance: patch compliance 50% (< 80%)');
+  });
+
+  it('fills actualValue/operator/threshold for a bandwidth_high condition', async () => {
+    getRecentMetricsMock.mockResolvedValue([
+      // 15,000,000 bytes/sec from the agent = 120 Mbps.
+      { bandwidthInBps: 15_000_000, bandwidthOutBps: 0 },
+    ] as never);
+
+    const result = await evaluateConditions(
+      { type: 'bandwidth_high', direction: 'in', operator: 'gt', value: 100 },
+      'device-1'
+    );
+
+    expect(result.triggered).toBe(true);
+    expect(result.context.actualValue).toBe(120);
+    expect(result.context.threshold).toBe(100);
+    expect(result.context.operator).toBe('>');
+
+    const message = interpolateAlertTemplate(bandwidthKind.messageTemplate, {
+      ...result.context,
+      ruleName: 'High bandwidth',
+      direction: 'in',
+    });
+    expect(message).not.toContain('{{');
+    expect(message).toBe('High bandwidth: in bandwidth 120 Mbps (> 100 Mbps)');
+  });
+
+  it('fills actualValue/operator/threshold for a network_errors condition', async () => {
+    // Cumulative counters, newest first: 12 errors accrued across the window.
+    const now = Date.now();
+    getRecentMetricsMock.mockResolvedValue([
+      { timestamp: new Date(now), interfaceStats: [{ name: 'eth0', inErrors: 112, outErrors: 0 }] },
+      { timestamp: new Date(now - 2 * 60_000), interfaceStats: [{ name: 'eth0', inErrors: 100, outErrors: 0 }] },
+    ] as never);
+
+    const result = await evaluateConditions(
+      { type: 'network_errors', errorType: 'in', operator: 'gt', value: 5 },
+      'device-1'
+    );
+
+    expect(result.triggered).toBe(true);
+    expect(result.context.actualValue).toBe(12);
+    expect(result.context.threshold).toBe(5);
+    expect(result.context.operator).toBe('>');
+
+    const message = interpolateAlertTemplate(networkErrorsKind.messageTemplate, {
+      ...result.context,
+      ruleName: 'Network errors',
+      errorType: 'in',
+    });
+    expect(message).not.toContain('{{');
+  });
+});
+
+describe('evaluateConditions primary actualValue is deterministic, not a race (follow-up to #6932)', () => {
+  // Two synthetic handlers whose resolution order the test controls
+  // explicitly (via `pendingResolvers`), independent of their position in
+  // the conditions array — sibling leaves under a group run through
+  // `Promise.all`, so "whichever settles first" and "array order" are two
+  // different things, and only array (tree) order is allowed to matter.
+  let pendingResolvers: Array<() => void>;
+
+  function registerControlledHandler(type: string, actualValue: number) {
+    conditionRegistry.register({
+      type,
+      evaluate: () =>
+        new Promise((resolve) => {
+          pendingResolvers.push(() =>
+            resolve({ passed: true, description: `${type} fired`, actualValue }),
+          );
+        }),
+      validate: () => [],
+    });
+  }
+
+  beforeEach(() => {
+    pendingResolvers = [];
+    registerControlledHandler('test_order_leaf_a', 111);
+    registerControlledHandler('test_order_leaf_b', 222);
+  });
+
+  it('picks the FIRST-IN-ARRAY leaf even when it is the LAST to resolve (no threshold/metric leaf present)', async () => {
+    const resultPromise = evaluateConditions(
+      {
+        logic: 'or',
+        conditions: [
+          { type: 'test_order_leaf_a' }, // array position 0 — must win
+          { type: 'test_order_leaf_b' }, // array position 1 — resolves first in time
+        ],
+      },
+      'device-1',
+    );
+
+    // Resolve out of array order: b (index 1) completes before a (index 0).
+    pendingResolvers[1]!();
+    await Promise.resolve();
+    pendingResolvers[0]!();
+
+    const result = await resultPromise;
+    expect(result.context.actualValue).toBe(111);
+  });
+
+  it('still prefers a threshold/metric leaf over a non-threshold leaf that resolves first', async () => {
+    // A real macrotask delay (not just an extra microtask hop) so the
+    // non-threshold leaf UNAMBIGUOUSLY finishes first in wall-clock time —
+    // this is what makes the test a genuine red-first guard for the
+    // preference rule itself, not just for tree order (test above).
+    getRecentMetricsMock.mockImplementation(
+      () => new Promise((resolve) => setTimeout(() => resolve([{ ramPercent: 92 }]), 5)),
+    );
+    getLatestMetricMock.mockResolvedValue({ ramPercent: 92 });
+
+    const resultPromise = evaluateConditions(
+      {
+        logic: 'or',
+        conditions: [
+          { type: 'metric', metric: 'ram', operator: 'gt', value: 50 }, // array position 0, real threshold handler — settles LAST
+          { type: 'test_order_leaf_a' }, // array position 1, non-threshold — settles FIRST
+        ],
+      },
+      'device-1',
+    );
+
+    // Resolved on the next microtask, long before the real handler's 5ms timer.
+    pendingResolvers[0]!();
+
+    const result = await resultPromise;
+    expect(result.context.actualValue).toBe(92);
+  });
+});
+
+describe('evaluateConditions context for service/process watches (issue #7966)', () => {
+  beforeEach(() => {
+    mockDbSelect.mockReset();
+    getRecentMetricsMock.mockReset();
+    getLatestMetricMock.mockReset();
+    getLatestMetricMock.mockResolvedValue(null as never);
+  });
+
+  it.each([
+    ['service_stopped', 'serviceName', 'Spooler', serviceKind],
+    ['process_stopped', 'processName', 'nginx', processKind],
+  ] as const)('%s carries %s into the context so the kind templates render with no {{ left', async (type, key, name, kind) => {
+    const spy = vi.spyOn(conditionRegistry, 'evaluate').mockResolvedValue({ passed: true, description: 'stopped' } as never);
+    try {
+      const result = await evaluateConditions({ type, [key]: name } as never, 'device-1');
+      expect(result.triggered).toBe(true);
+      expect(result.context[key]).toBe(name);
+      const ctx = { ...result.context, deviceName: 'PC-1' };
+      expect(interpolateAlertTemplate(kind.titleTemplate, ctx)).not.toContain('{{');
+      expect(interpolateAlertTemplate(kind.messageTemplate, ctx)).not.toContain('{{');
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('finds the name on a leaf nested inside a condition group', async () => {
+    const spy = vi.spyOn(conditionRegistry, 'evaluate').mockResolvedValue({ passed: true, description: 'stopped' } as never);
+    try {
+      const result = await evaluateConditions(
+        { logic: 'and', conditions: [{ logic: 'or', conditions: [{ type: 'service_stopped', serviceName: 'Nested' }] }] } as never,
+        'device-1'
+      );
+      expect(result.context.serviceName).toBe('Nested');
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});
+
+const COMPILE_CTX = { monitorId: '00000000-0000-4000-8000-000000000001' };
+
+function renderKindMessage(
+  messageTemplate: string,
+  result: Awaited<ReturnType<typeof evaluateConditions>>,
+  extra: Record<string, unknown>,
+): string {
+  return interpolateTemplate(
+    messageTemplate,
+    withMetConditionDescriptions({ ...result.context, ...extra }, result.conditionsMet),
+  );
+}
+
+describe('monitor templates fill met-condition text before interpolation (issue #10740)', () => {
+  beforeEach(() => {
+    mockDbSelect.mockReset();
+    getRecentMetricsMock.mockReset();
+    getLatestMetricMock.mockReset();
+    getLatestMetricMock.mockResolvedValue(null as never);
+  });
+
+  it('script message renders the handler description from the compiled template', async () => {
+    const spy = vi.spyOn(conditionRegistry, 'evaluate').mockResolvedValue({
+      passed: true,
+      description: 'Defender Exploit Guard blocked a payload',
+    });
+    try {
+      const compiled = scriptKind.toAlertCondition(
+        scriptKind.conditionSchema.parse({
+          scriptId: '00000000-0000-4000-8000-000000000002',
+          intervalMinutes: 15,
+          timeoutSeconds: 60,
+          breachOnNonZeroExit: true,
+        }),
+        COMPILE_CTX,
+      );
+      const result = await evaluateConditions(compiled, 'device-1');
+      expect(result.triggered).toBe(true);
+      expect(result.context).not.toHaveProperty('description');
+      const message = renderKindMessage(scriptKind.messageTemplate, result, {
+        ruleName: 'Monitor Defender for Blocks',
+        deviceName: 'PC-1',
+      });
+      expect(message).toBe('Monitor Defender for Blocks: Defender Exploit Guard blocked a payload');
+      expect(message).not.toContain('{{');
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('backup-continuity message renders the handler description from the compiled template', async () => {
+    const spy = vi.spyOn(conditionRegistry, 'evaluate').mockResolvedValue({
+      passed: true,
+      description: 'No successful backup in the last 48h',
+    });
+    try {
+      const compiled = backupContinuityKind.toAlertCondition(
+        backupContinuityKind.conditionSchema.parse({
+          check: 'no_successful_backup',
+          maxAgeHours: 48,
+        }),
+        COMPILE_CTX,
+      );
+      const result = await evaluateConditions(compiled, 'device-1');
+      const message = renderKindMessage(backupContinuityKind.messageTemplate, result, {
+        ruleName: 'Backup stale',
+        deviceName: 'FS-1',
+      });
+      expect(message).toBe('Backup stale: FS-1 — No successful backup in the last 48h');
+      expect(message).not.toContain('{{');
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('composite message renders the joined met-condition list from the compiled template', async () => {
+    const spy = vi.spyOn(conditionRegistry, 'evaluate').mockImplementation(async (cond) => {
+      const type = (cond as { type?: string }).type;
+      if (type === 'backup_continuity') {
+        return { passed: true, description: 'No successful backup in the last 48h' };
+      }
+      if (type === 'offline') {
+        return { passed: true, description: 'Device offline for 15min' };
+      }
+      return { passed: false, description: `unexpected ${type ?? 'condition'}` };
+    });
+    try {
+      const compiled = compositeKind.toAlertCondition(
+        compositeKind.conditionSchema.parse({
+          match: 'all',
+          children: [
+            { kind: 'backup_continuity', condition: { check: 'no_successful_backup', maxAgeHours: 48 } },
+            { kind: 'offline', condition: { durationMinutes: 15 } },
+          ],
+        }),
+        COMPILE_CTX,
+      );
+      const result = await evaluateConditions(compiled, 'device-1');
+      expect(result.conditionsMet).toHaveLength(2);
+      const message = renderKindMessage(compositeKind.messageTemplate, result, {
+        ruleName: 'Backup and offline',
+        deviceName: 'FS-1',
+      });
+      expect(message).toBe(`Backup and offline: ${result.conditionsMet.join(', ')}`);
+      expect(message).toContain('No successful backup in the last 48h');
+      expect(message).toContain('Device offline for 15min');
+      expect(message).not.toContain('{{');
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});
+
+describe('event_log alert messages', () => {
+  const queueEventLogReads = (...results: Array<Array<Record<string, unknown>>>) => {
+    for (const rows of results) {
+      const query = {
+        from: vi.fn().mockReturnThis(),
+        where: vi.fn().mockReturnThis(),
+        orderBy: vi.fn().mockReturnThis(),
+        limit: vi.fn().mockReturnThis(),
+        then: Promise.resolve(rows).then.bind(Promise.resolve(rows)),
+      };
+      mockDbSelect.mockReturnValueOnce(query as never);
+    }
+  };
+  // Carries event text so the assertions below prove the handler ignores it.
+  const newestRow = () => ({
+    id: 'event-1',
+    timestamp: new Date('2026-10-30T11:30:00.000Z'),
+    createdAt: new Date('2026-10-30T11:31:00.000Z'),
+    logName: 'Application',
+    recordId: '42',
+    message: 'DEVICE-TEXT',
+  });
+  const leaf = { type: 'event_log', category: 'application', level: 'error', countThreshold: 5, windowMinutes: 60 };
+
+  beforeEach(() => {
+    mockDbSelect.mockReset();
+    getLatestMetricMock.mockReset();
+    getLatestMetricMock.mockResolvedValue(null as never);
+  });
+
+  it('renders the monitor kind template with the real count, category and window', async () => {
+    queueEventLogReads([{ count: 7 }], [newestRow()]);
+    const compiled = eventLogKind.toAlertCondition(
+      eventLogKind.conditionSchema.parse({
+        category: 'application', level: 'error', countThreshold: 5, windowMinutes: 60,
+      }),
+      COMPILE_CTX,
+    );
+
+    const result = await evaluateConditions(compiled, 'device-1');
+
+    expect(result.triggered).toBe(true);
+    expect(renderKindMessage(eventLogKind.messageTemplate, result, { deviceName: 'PC-1' }))
+      .toBe('7 matching application events on PC-1 within 60 minutes');
+  });
+
+  // The built-in event log templates in db/seed.ts run on the same handler.
+  it.each([
+    ['{{count}} hardware/disk errors detected on {{hostname}} within 30 minutes', '7 hardware/disk errors detected on PC-1 within 30 minutes'],
+    ['Application crash detected on {{hostname}}: {{message}}', 'Application crash detected on PC-1: application/error events >= 5 in 60min (found 7)'],
+  ])('renders the built-in template %s', async (template, expected) => {
+    queueEventLogReads([{ count: 7 }], [newestRow()]);
+
+    const result = await evaluateConditions(leaf, 'device-1');
+
+    expect(renderKindMessage(template, result, { hostname: 'PC-1' })).toBe(expected);
+  });
+
+  it('leaves no token when the leaf is below threshold', async () => {
+    queueEventLogReads([{ count: 0 }]);
+
+    const result = await evaluateConditions(
+      { logic: 'or', conditions: [leaf] } as never,
+      'device-1',
+    );
+
+    const message = renderKindMessage('{{count}} events: {{message}}', result, {});
+    expect(message).toBe('0 events: application/error events >= 5 in 60min (found 0)');
+  });
+
+  it('describes the leaf that passed when several event_log leaves share a group', async () => {
+    const spy = vi.spyOn(conditionRegistry, 'evaluate')
+      .mockImplementationOnce(async () => ({
+        passed: false,
+        description: 'first',
+        templateValues: { count: 0, category: 'security', windowMinutes: 10, message: 'first' },
+      }))
+      .mockImplementationOnce(async () => ({
+        passed: true,
+        description: 'second',
+        templateValues: { count: 9, category: 'system', windowMinutes: 30, message: 'second' },
+      }));
+    try {
+      const result = await evaluateConditions(
+        { logic: 'or', conditions: [{ type: 'event_log' }, { type: 'event_log' }] } as never,
+        'device-1',
+      );
+      expect(result.context).toMatchObject({ count: 9, category: 'system', windowMinutes: 30, message: 'second' });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('keeps the threshold leaf as actualValue while {{count}} still comes from the event_log leaf', async () => {
+    const spy = vi.spyOn(conditionRegistry, 'evaluate')
+      .mockImplementationOnce(async () => ({ passed: true, description: 'cpu', actualValue: 95 }))
+      .mockImplementationOnce(async () => ({
+        passed: true,
+        description: 'events',
+        actualValue: 3,
+        templateValues: { count: 3, category: 'system', windowMinutes: 30, message: 'events' },
+      }));
+    try {
+      const result = await evaluateConditions(
+        { logic: 'and', conditions: [
+          { type: 'metric', metric: 'cpu', operator: 'gt', value: 90 },
+          { type: 'event_log' },
+        ] } as never,
+        'device-1',
+      );
+      expect(result.context).toMatchObject({ actualValue: 95, count: 3 });
+    } finally {
+      spy.mockRestore();
+    }
   });
 });

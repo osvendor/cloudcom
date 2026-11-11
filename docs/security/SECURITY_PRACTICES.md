@@ -77,7 +77,7 @@ API keys follow the same security model as agent tokens:
 
 - **Format**: `brz_` prefix for identification
 - **Storage**: SHA-256 hash only — the plaintext key is shown once at creation, never again
-- **Scoping**: JSONB scope array with wildcard support (`*` for full access)
+- **Scoping**: JSONB scope array from a closed allowlist (`services/apiKeyScopes.ts`); wildcards (`*`) are rejected, and a creator can only delegate scopes they hold themselves
 - **Lifecycle**: Configurable expiration, revocable, status tracking (active/revoked/expired)
 - **Rate limiting**: Per-key configurable request limits
 - **Audit trail**: `lastUsedAt` timestamp and `usageCount` updated on every use
@@ -158,7 +158,7 @@ The agent runs on customer endpoints with elevated privileges. Its security is p
 - **Validation**: Every agent REST request and WebSocket connection validates the bearer token against the stored hash
 - **Status checks**: Decommissioned and quarantined devices are rejected with 403
 
-When a device record exists in the database but has no token hash — the case for legacy devices enrolled before the v0.62 token-hash migration — the API returns a structured `{ code: "re_enrollment_required" }` signal on both the WebSocket auth path and HTTP 401 responses (`apps/api/src/middleware/agentAuth.ts`, `apps/api/src/routes/agentWs.ts`). The agent treats this as a non-fault terminal state: it stops retrying with the orphaned credential and prompts the operator to re-enroll the device, rather than silently failing in a reconnect loop or appearing healthy while unable to receive commands. This makes upgrade behavior explicit and auditable.
+When a device record exists in the database but has no token hash — the case for legacy devices enrolled before the v0.62 token-hash migration — the API returns a structured `{ code: "RE_ENROLLMENT_REQUIRED" }` signal on both the WebSocket auth path and HTTP 401 responses (`apps/api/src/middleware/agentAuth.ts`, `apps/api/src/routes/agentWs.ts`). The agent treats this as a non-fault terminal state: it stops retrying with the orphaned credential and prompts the operator to re-enroll the device, rather than silently failing in a reconnect loop or appearing healthy while unable to receive commands. This makes upgrade behavior explicit and auditable.
 
 ### Config File Permissions
 
@@ -460,12 +460,14 @@ Breeze now includes a structured incident lifecycle API with auditable transitio
 
 - **Lifecycle states**: `detected` -> `analyzing` -> `contained` -> `recovering` -> `closed`
 - **Evidence chain**: evidence entries record who collected it, when, where it is stored, and optional integrity hash
-- **Containment governance**: high-risk actions (`network_isolation`, `account_disable`, `usb_block`) require an `approvalRef`
+- **Containment governance**: AI high-risk actions (`network_isolation`, `account_disable`, `usb_block`) require an `approvalRef`. Manual incident `/contain` calls record actions only; they do not execute endpoint isolation. Human network-isolation routes require an interactive session, device execution permission, site access, and MFA when enabled. A self-host with 2FA disabled provides password-only assurance.
 - **Timeline integrity**: incident timeline entries are appended for creation, containment, evidence collection, closure, and SLA escalation
 - **Eventing**: `incident.created`, `incident.contained`, `incident.escalated`, and `incident.closed` are emitted for downstream automations and integrations
 - **Auditability**: all mutating incident endpoints emit structured route audit events with actor identity and action metadata
 
 Core endpoints are exposed under `/api/v1/incidents/*` for creation, triage, containment, evidence handling, closure, and report generation.
+
+Network isolation is off by default behind `NETWORK_ISOLATION_ENABLED` and is Windows-only until Linux and macOS support ship. Every episode has a mandatory expiry (72 hours by default, up to 720 hours) and an audited offline break-glass code. Start gates never prevent console release, extension, acknowledgement, or code viewing for an existing episode. Disabling the feature flag blocks new starts; it does not release devices. Emergency fleet release uses a scripted release request for each episode. See the [network-isolation runbook](../../apps/docs/src/content/docs/features/network-isolation.mdx) for the permitted traffic and residual risks.
 
 ---
 
@@ -648,7 +650,7 @@ We follow coordinated disclosure. See [SECURITY.md](../SECURITY.md) for:
 - Response timelines (48-hour acknowledgment, severity-based fix targets)
 - Scope and disclosure policy
 
-**Email**: [security@lanternops.io](mailto:security@lanternops.io)
+**Email**: [security@breezermm.com](mailto:security@breezermm.com)
 
 ---
 
@@ -731,4 +733,4 @@ Breeze's security controls align with SOC 2 Trust Service Criteria:
 
 *Last updated: May 2026 (v0.65.0 cross-cutting hardening release)*
 
-*For questions about Breeze security practices, contact [security@lanternops.io](mailto:security@lanternops.io).*
+*For questions about Breeze security practices, contact [security@breezermm.com](mailto:security@breezermm.com).*

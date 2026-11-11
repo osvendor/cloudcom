@@ -22,6 +22,8 @@ vi.mock('../db', () => ({
   runOutsideDbContext: vi.fn((fn: any) => fn()),
   withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn()),
   withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+  withDbTransaction: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+  withDbTransactionIfHeld: vi.fn(async (fn: () => Promise<unknown>) => fn()),
   db: { select: vi.fn(), insert: vi.fn(), update: vi.fn(), delete: vi.fn(), transaction: vi.fn() },
 }));
 
@@ -300,8 +302,15 @@ describe('remediate_software_violation — device axis', () => {
 });
 
 describe('get_compliance_status — device axis', () => {
+  // get_compliance_status does a leading getPolicyWithOrgCheck lookup ahead of the
+  // compliance-records query; the fixture must resolve a real, org-matching
+  // policy row (same shape as the remediate_software_violation fixture
+  // above) or every call here short-circuits on "Policy not found" before
+  // ever touching automationPolicyCompliance.
+  const POLICY_ROW = { id: 'p1', orgId: 'org-1', partnerId: null, name: 'P', mode: 'enforce' };
+
   it('narrows automationPolicyCompliance.deviceId for a device-less run', async () => {
-    mockSelect([]);
+    mockSelect([POLICY_ROW]);
     const r = await handlerFor(registerComplianceTools, 'get_compliance_status')(
       { policyId: 'p1' }, deviceLessAuth());
     expect(JSON.parse(r).error).toBeUndefined();
@@ -309,9 +318,10 @@ describe('get_compliance_status — device axis', () => {
   });
 
   it('unrestricted control: no device narrowing, no device scan', async () => {
-    mockSelect([]);
-    await handlerFor(registerComplianceTools, 'get_compliance_status')(
+    mockSelect([POLICY_ROW]);
+    const r = await handlerFor(registerComplianceTools, 'get_compliance_status')(
       { policyId: 'p1' }, unrestrictedAuth());
+    expect(JSON.parse(r).error).toBeUndefined();
     expect(narrowedIds(automationPolicyCompliance.deviceId)).toBeUndefined();
     expect(deviceScans).toBe(0);
   });

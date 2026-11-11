@@ -24,7 +24,7 @@ should actually run.
 | Date | 2026-09-01 |
 | Breeze build SHA | `20a5d14494b7e9e45792982b7e6bc12ba83956d0` (branch `feat/quickbooks-accounting-mappings`) |
 | Tester | Final-review fix wave (automated) |
-| Environment | Local worktree, ephemeral `pnpm test-stack` Postgres 16 (pgvector) + Redis 7 containers |
+| Environment | Local worktree, ephemeral `pnpm test-stack` Postgres 16 (pgvector) + Redis 8 containers |
 
 The gate was re-run in full against that SHA, which is the head of the
 branch's code changes; only this document changed afterwards. See the
@@ -43,8 +43,8 @@ cd apps/api && npx vitest run src/services/accounting/ src/routes/accounting/ \
 
 ```bash
 cd apps/web && npx vitest run \
-  src/components/integrations/QuickbooksMappingWorkbench.test.tsx \
-  src/components/integrations/QuickbooksCustomerImport.test.tsx \
+  src/components/integrations/AccountingMappingWorkbench.test.tsx \
+  src/components/integrations/AccountingCustomerImport.test.tsx \
   src/lib/i18n/localeParity.test.ts \
   src/lib/i18n/translationCoverage.test.ts \
   src/lib/__tests__/no-silent-mutations.test.ts
@@ -87,7 +87,7 @@ cd apps/web && NODE_OPTIONS="--max-old-space-size=8192" npx tsc --noEmit -p .
 
 Stack: `pnpm test-stack up` (not the top-level `docker-compose.yml postgres
 redis` — see deviation note below), which brought up an ephemeral,
-worktree-scoped `pgvector/pgvector:pg16` + `redis:7-alpine` pair via
+worktree-scoped `pgvector/pgvector:pg16` + `redis:8-alpine` pair via
 `docker-compose.test.yml`, both reported healthy. `.env.test` was generated
 with:
 

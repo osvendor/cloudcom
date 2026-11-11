@@ -1,4 +1,7 @@
 export * from './errorCodes';
+// Partner service principal scope registry + task-named presets (#8173), shared
+// by the API validation layer and the web create dialog so they cannot drift.
+export * from './partnerServicePrincipalScopes';
 // Permission registry (resource:action grants) + derived literal-union types.
 export * from './permissions';
 
@@ -15,6 +18,29 @@ export * from './agentFileTransfer';
 // HP CMSL licence identifier — the thing a warranty feature link's recorded
 // consent is compared against (#5511 D2). Leaf module, no imports.
 export * from './hpCmsl';
+
+// Google Workspace DWD OAuth scopes, shared by the API and the web integration
+// page so the list an admin authorizes cannot drift. Leaf module, no imports.
+export * from './googleDwdScopes';
+
+// Fix memory (AI Suggested Fixes W1): proof rule, outcome states, origins,
+// alert resolution reasons. Leaf module, no imports.
+export * from './fixMemory';
+
+// Shared AI connection kind lists for registry and gateway dispatch.
+export * from './aiConnectionKinds';
+
+// Backup recovery-readiness score bands shared by the API summary/alerts and
+// the web readiness views. Leaf module, no imports.
+export * from './backupReadiness';
+
+// AI budget platform defaults: the single owner the API merge, the web and the
+// partner settings catalog all import. Leaf module, no imports.
+export * from './aiBudgetDefaults';
+
+// AI chat session lifetime (#11430): the API's expiry rule and the web's resume
+// check both import it. Leaf module, no imports.
+export * from './aiSessionLimits';
 
 // OS Types
 export const OS_TYPES = ['windows', 'macos', 'linux'] as const;
@@ -71,7 +97,7 @@ export const AUDIT_RESULTS = ['success', 'failure', 'denied', 'dispatched'] as c
 export const REMOTE_SESSION_TYPES = ['terminal', 'desktop', 'file_transfer'] as const;
 
 // Partner Plans
-export const PARTNER_PLANS = ['free', 'pro', 'enterprise', 'unlimited'] as const;
+export const PARTNER_PLANS = ['free', 'starter', 'community', 'pro', 'enterprise', 'unlimited'] as const;
 
 // Built-in Permissions
 export const PERMISSIONS = {
@@ -164,3 +190,20 @@ export const SESSION_EXPIRY_HOURS = 24;
 
 // Ticket comment attachments (W08 #3902)
 export * from './ticketAttachments';
+
+// Hardware & RAID monitoring (W01 #6856)
+export * from './hardwareHealth';
+export * from './timeSync';
+export * from './workloads';
+
+// Software-install time budgets, mirrored from the Go agent (#3578)
+export * from './softwareInstallTimeouts';
+
+// AI model registry W01 (#7599): AI surfaces and roles. Leaf module.
+export * from './aiSurfaces';
+
+// Alert lifecycle cooldown fallback
+export * from './alertLifecycle';
+// OAuth authorization-server error page reasons (#9938), shared by the API
+// renderError hook and the web /oauth/consent/error page. Leaf module, no imports.
+export * from './oauthErrorPage';

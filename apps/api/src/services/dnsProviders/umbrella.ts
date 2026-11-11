@@ -1,12 +1,21 @@
 import type { DnsAction } from '../../db/schema';
-import type { DnsEvent, DnsProvider } from './index';
+import type {
+  DnsEvent,
+  DnsEventSlice,
+  DnsEventSliceOptions,
+  DnsEventSliceWalkEnd,
+  DnsProvider
+} from './index';
 import { DnsProviderHttpError, requestJson } from './http';
 import { asArray, asNumber, asRecord, asString } from './helpers';
+import { storesAllowedTraffic } from './syncScope';
 
 export interface UmbrellaProviderConfig {
   organizationId?: string;
   blocklistId?: string;
   allowlistId?: string;
+  /** #10054 — see services/dnsProviders/syncScope.ts. */
+  storeAllowedTraffic?: boolean;
 }
 
 /** Cisco's OAuth2 client-credentials token endpoint (Umbrella API). */
@@ -41,6 +50,93 @@ const UMBRELLA_TRAFFIC_TYPE_HEADER = { 'x-traffic-type': 'dns' } as const;
  * clamped to the most recent 30 days rather than failing the sync.
  */
 const UMBRELLA_MAX_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
+
+/** Page size requested from `/reports/v2/activity`. */
+const UMBRELLA_ACTIVITY_PAGE_LIMIT = 1000;
+
+/**
+ * Cisco's hard ceiling on `offset`: "invalid offset: should be integer between
+ * 0 and 10000 inclusive" (HTTP 400, #7207). A window can therefore only be
+ * walked up to ~10k records; larger ones are split by time instead.
+ */
+const UMBRELLA_ACTIVITY_OFFSET_CAP = 10_000;
+
+/**
+ * Narrowest time slice the walk will split down to. A burst of more records
+ * than the offset cap can reach inside one second is kept up to the cap and
+ * the remainder dropped, rather than splitting forever. The endpoint pages by
+ * limit/offset only (no cursor), so the remainder is unreachable; the slice
+ * carries a `truncated` marker so the job records the loss on the integration
+ * instead of a plain success (#10047).
+ */
+const UMBRELLA_MIN_SLICE_MS = 1000;
+
+/**
+ * Activity requests per sync run (pages plus offset-cap probes). The job
+ * checkpoints `lastSync` after every completed slice, so hitting this ends the
+ * run early, records it as `partial`, and the next run resumes where it
+ * stopped — nothing is skipped. Halving 30 days down to one second is 22
+ * splits at 2 requests each; until the run's first slice completes, the probe
+ * also sizes the slice to what the remaining budget can page, so a run makes
+ * progress whatever page size the server serves (#10018).
+ */
+const UMBRELLA_MAX_REQUESTS_PER_RUN = 100;
+
+/** Per-run counters shared across the windows of one sliced sync. */
+interface ActivityRunState {
+  requests: number;
+  skippedUnparseable: number;
+  skippedNonDns: number;
+  /** Slices yielded so far this run. */
+  slicesCompleted: number;
+  /**
+   * Most records any page returned this run: the server's effective page
+   * size, which may be below the `limit` we ask for.
+   */
+  largestPage: number;
+}
+
+/** Bound a slice width to what the walk can use: [1 s, 30 days]. */
+function clampSliceWidth(ms: number): number {
+  return Math.min(UMBRELLA_MAX_WINDOW_MS, Math.max(UMBRELLA_MIN_SLICE_MS, Math.floor(ms)));
+}
+
+/**
+ * Offset for the one-record overflow probe that follows a window's first page
+ * (called with that page already counted, the probe not yet sent). A record at
+ * this offset means the window holds more than the walk can reach, so it is
+ * split rather than walked.
+ *
+ * Normally that is Cisco's offset cap. Until the run's first slice completes it
+ * is also bounded by the budget: after the probe, `remaining - 1` requests are
+ * left, the last of them the empty page that ends the walk, and each of the
+ * others reaches at most `largestPage` records past the first page — so a
+ * window holding more than `largestPage * (remaining - 1)` records could not
+ * be finished this run. Splitting it now, instead of paging into the budget
+ * and discarding the work, is what lets a run that starts deep in a backlog
+ * complete a slice (#10018). After the first slice the run has made progress,
+ * and slices are sized by the cap alone so the budget does not shrink the
+ * width carried into the next run.
+ */
+function reachableOffset(run: ActivityRunState): number {
+  if (run.slicesCompleted > 0) return UMBRELLA_ACTIVITY_OFFSET_CAP;
+  const remaining = UMBRELLA_MAX_REQUESTS_PER_RUN - run.requests;
+  return Math.min(UMBRELLA_ACTIVITY_OFFSET_CAP, run.largestPage * Math.max(0, remaining - 1));
+}
+
+/** A remembered width from the previous run, or undefined when it is unusable. */
+function rememberedSliceWidth(ms: number | undefined): number | undefined {
+  if (typeof ms !== 'number' || !Number.isFinite(ms) || ms <= 0) return undefined;
+  return clampSliceWidth(ms);
+}
+
+type ActivityWindowResult =
+  /** Every reachable record in the window; `truncated` if some were not. */
+  | { kind: 'complete'; events: DnsEvent[]; recordCount: number; truncated: boolean }
+  /** More records than the offset cap can reach — split the window. */
+  | { kind: 'overflow' }
+  /** The per-run request budget ran out before the window finished. */
+  | { kind: 'budget' };
 
 /** One `{ label, type }` pair off an activity record's `categories[]`. */
 interface UmbrellaLabel {
@@ -269,29 +365,61 @@ export class UmbrellaProvider implements DnsProvider {
     return error.status === 400 && /invalid_request|invalid_token|unauthorized/i.test(error.responseBody);
   }
 
+  /**
+   * Every in-window DNS event, collected from {@link syncEventSlices}. The sync
+   * job consumes the slices directly so it can checkpoint between them; this
+   * all-at-once form stays for the {@link DnsProvider} contract. Like the
+   * slices, it can stop short of `until` at the per-run request budget.
+   */
   async syncEvents(since: Date, until: Date): Promise<DnsEvent[]> {
+    const allEvents: DnsEvent[] = [];
+    for await (const slice of this.syncEventSlices(since, until)) {
+      for (const event of slice.events) allEvents.push(event);
+    }
+    return allEvents;
+  }
+
+  /**
+   * Walk the activity feed in time slices small enough to page under Cisco's
+   * offset cap (#7207).
+   *
+   * `/reports/v2/activity` rejects any `offset` above 10000, so a window
+   * holding more than ~10k events cannot be walked by offset alone — the old
+   * single walk hit a 400 on the page past the cap and failed the whole sync.
+   * Instead: try the window; if it holds more than the cap can reach, halve it
+   * and retry the earlier half; once a slice fits, yield it and move on to the
+   * next stretch (doubling the width again after a light slice, so one burst
+   * doesn't pin the rest of the run to tiny windows).
+   *
+   * Slices come out in chronological order and each is COMPLETE — everything
+   * between the previous slice's `until` and its own — which is what lets the
+   * job persist each one and advance `lastSync` to it. Adjacent slices share
+   * their boundary millisecond (the API window is inclusive at both ends as
+   * far as we can tell); the job's deterministic event id dedupes that overlap
+   * the same way it dedupes its own one-minute `lastSync` overlap.
+   *
+   * The walk starts at `options.initialSliceMs` (the width the previous run
+   * ended on) rather than the whole window, and returns the width to start
+   * the next run at. If the request budget runs out it returns `stoppedShort`
+   * with the unfetched stretch, so the job records the run as partial
+   * instead of leaving the last `success` on the row (#10018).
+   */
+  async *syncEventSlices(
+    since: Date,
+    until: Date,
+    options?: DnsEventSliceOptions
+  ): AsyncGenerator<DnsEventSlice, DnsEventSliceWalkEnd, undefined> {
     // `organizationId` is deliberately NOT read here. The next-gen Reports API
     // takes no org path segment — the OAuth2 token's own `sub` claim
     // (`org/<orgId>/client/<apiKey>`) scopes the request — so requiring it
     // would reject a perfectly valid integration. It stays on the config type
     // for backward compatibility with rows created before this change (#4597).
-    const limit = 1000;
-    const maxRequests = 100;
-    const allEvents: DnsEvent[] = [];
-
     const to = until.getTime();
     const from = Math.max(since.getTime(), to - UMBRELLA_MAX_WINDOW_MS);
-    let offset = 0;
-    // Every record we fail to map is a lost security event. Counting them by
-    // reason keeps an upstream shape change — which would otherwise return []
-    // and be recorded as a healthy "success" sync — visible in the logs.
-    let skippedUnparseable = 0;
-    let skippedNonDns = 0;
 
     if (from > since.getTime()) {
-      // The job advances `lastSync` to `until` on success, so the skipped
-      // stretch is never revisited — and it is not fetchable from this
-      // endpoint at all. Say so rather than narrowing the window mutely.
+      // The skipped stretch is never revisited — it is not fetchable from
+      // this endpoint at all. Say so rather than narrowing the window mutely.
       console.warn(
         `[UmbrellaProvider] requested sync window exceeds Cisco's 30-day maximum; ` +
         `clamped to ${new Date(from).toISOString()}..${new Date(to).toISOString()} — ` +
@@ -299,33 +427,130 @@ export class UmbrellaProvider implements DnsProvider {
       );
     }
 
-    for (let request = 0; request < maxRequests; request++) {
-      const url = new URL(UMBRELLA_ACTIVITY_URL);
-      // Epoch milliseconds, not ISO 8601: Cisco rejects ISO strings here with
-      // {"errors":[{"param":"from","error":"invalid timestamp specified"}]}
-      // (#4597 / #4637). Relative forms ("-7days", "now") are also accepted
-      // upstream; explicit bounds keep the sync window deterministic.
-      url.searchParams.set('from', String(from));
-      url.searchParams.set('to', String(to));
-      url.searchParams.set('limit', String(limit));
-      // This endpoint pages by limit/offset only — no cursor, no page token,
-      // and `meta` is documented as an empty object, so there is no total or
-      // has-more to read.
-      url.searchParams.set('offset', String(offset));
+    const run: ActivityRunState = {
+      requests: 0,
+      skippedUnparseable: 0,
+      skippedNonDns: 0,
+      slicesCompleted: 0,
+      largestPage: 0
+    };
+    try {
+      let cursor = from;
+      let width = rememberedSliceWidth(options?.initialSliceMs) ?? to - from;
+      do {
+        const end = Math.min(to, cursor + width);
+        const splittable = end - cursor > UMBRELLA_MIN_SLICE_MS;
+        const result = await this.fetchActivityWindow(cursor, end, splittable, run);
 
-      const payload = await this.withAuth((authorization) =>
-        requestJson<Record<string, unknown>>(url, {
-          headers: { Authorization: authorization, ...UMBRELLA_TRAFFIC_TYPE_HEADER }
-        })
-      );
+        if (result.kind === 'budget') {
+          // Nothing from the unfinished slice is yielded, so the caller's
+          // checkpoint stays at the last complete one and the next run
+          // resumes from there — no hole, just a later catch-up.
+          console.warn(
+            `[UmbrellaProvider] activity sync reached the ${UMBRELLA_MAX_REQUESTS_PER_RUN}-request budget; ` +
+            `${new Date(cursor).toISOString()}..${new Date(to).toISOString()} was not fetched this run ` +
+            'and is resumed on the next one.'
+          );
+          // A run that completed nothing must still leave the next one better
+          // off, or every run repeats the same work forever (#10018): the
+          // window it could not finish was too wide for one run's budget, so
+          // the next run starts at half of it. After a completed slice the
+          // working width is proven and is kept.
+          const nextWidth = run.slicesCompleted > 0 ? width : (end - cursor) / 2;
+          return {
+            stoppedShort: { from: new Date(cursor), to: new Date(to) },
+            sliceWidthMs: clampSliceWidth(nextWidth)
+          };
+        }
 
-      const records = asArray(payload.data);
-      for (const entry of records) {
-        const mapped = mapActivityRecord(entry);
-        if (mapped.kind === 'event') allEvents.push(mapped.event);
-        else if (mapped.kind === 'non-dns') skippedNonDns++;
-        else skippedUnparseable++;
+        if (result.kind === 'overflow') {
+          // Too many events for the offset cap: retry the earlier half.
+          width = Math.max(UMBRELLA_MIN_SLICE_MS, Math.floor((end - cursor) / 2));
+          continue;
+        }
+
+        if (result.truncated) {
+          // Server-side detail; the tenant-visible record of the loss is the
+          // slice's `truncated` marker, which the job turns into a
+          // `truncated` sync status (#10047).
+          console.warn(
+            `[UmbrellaProvider] ${new Date(cursor).toISOString()}..${new Date(end).toISOString()} holds ` +
+            `more than ${result.recordCount} activity records in under ${UMBRELLA_MIN_SLICE_MS} ms — ` +
+            `too many to split further and page under Cisco's offset cap of ${UMBRELLA_ACTIVITY_OFFSET_CAP}. ` +
+            `Kept the ${result.events.length} DNS events among the reachable records; the rest of that window cannot be fetched ` +
+            'and was dropped.'
+          );
+        }
+
+        run.slicesCompleted++;
+        yield {
+          events: result.events,
+          until: new Date(end),
+          ...(result.truncated
+            ? { truncated: { from: new Date(cursor), to: new Date(end), reachableRecords: result.recordCount } }
+            : {})
+        };
+
+        cursor = end;
+        if (result.recordCount < UMBRELLA_ACTIVITY_OFFSET_CAP / 4) width *= 2;
+      } while (cursor < to);
+      return { sliceWidthMs: clampSliceWidth(width) };
+    } finally {
+      // Every record we fail to map is a lost security event. Counting them by
+      // reason keeps an upstream shape change — which would otherwise return
+      // [] and be recorded as a healthy "success" sync — visible in the logs.
+      if (run.skippedUnparseable > 0) {
+        console.warn(
+          `[UmbrellaProvider] activity sync skipped ${run.skippedUnparseable} unparseable record(s) ` +
+          '(possible API shape drift, or an unrecognized verdict).'
+        );
       }
+      if (run.skippedNonDns > 0) {
+        console.warn(
+          `[UmbrellaProvider] activity sync skipped ${run.skippedNonDns} non-DNS record(s); the ` +
+          'x-traffic-type: dns header did not scope the combined feed.'
+        );
+      }
+    }
+  }
+
+  /**
+   * Page one `[from, to]` window by limit/offset, staying inside Cisco's
+   * offset cap.
+   *
+   * A `splittable` window reports `overflow` as soon as it is known to hold
+   * more than the walk can reach, so the caller can halve it. That is known
+   * after two requests: any non-empty first page is followed by a one-record
+   * probe at the reachable offset, and a record there means the walk could
+   * never finish. The probe fires whatever the first page's size — a server
+   * that caps `limit` below ours never returns a "full" page, and gating the
+   * probe on fullness let such a server cost 10000 ÷ page-size requests per
+   * halving, which exhausted the budget before any slice completed (#10018).
+   *
+   * The reachable offset is Cisco's offset cap — or, until the run's first
+   * slice completes, the smaller number of records the remaining budget can
+   * page, so the first slice is always one the run can finish.
+   *
+   * The probe is a shortcut, not the guarantee — events can land mid-walk —
+   * so the walk itself also stops before any offset past the cap. A window
+   * that cannot be split further keeps what the cap allows and reports itself
+   * `truncated` — unless the page that crossed the cap was shorter than the
+   * server's page size, which ends the window: then nothing lay past the cap.
+   */
+  private async fetchActivityWindow(
+    from: number,
+    to: number,
+    splittable: boolean,
+    run: ActivityRunState
+  ): Promise<ActivityWindowResult> {
+    const events: DnsEvent[] = [];
+    let skippedUnparseable = 0;
+    let skippedNonDns = 0;
+    let offset = 0;
+
+    for (;;) {
+      if (run.requests >= UMBRELLA_MAX_REQUESTS_PER_RUN) return { kind: 'budget' };
+      const records = await this.fetchActivityPage(from, to, offset, UMBRELLA_ACTIVITY_PAGE_LIMIT, run);
 
       // An EMPTY page is the end of the collection — not a short one. Cisco
       // documents no maximum for `limit`, so a server-side cap below ours
@@ -333,34 +558,85 @@ export class UmbrellaProvider implements DnsProvider {
       // Advancing by the records actually returned (never `page * limit`)
       // keeps the walk correct whatever page size the API decides to serve.
       if (records.length === 0) break;
-      offset += records.length;
+      run.largestPage = Math.max(run.largestPage, records.length);
 
-      if (request === maxRequests - 1) {
-        // Budget exhausted on a non-empty page, so the end of the collection
-        // was never reached. Anything left is not fetched, and the next run
-        // starts from `until`, so it is lost rather than retried.
-        console.warn(
-          `[UmbrellaProvider] activity sync reached the ${maxRequests}-request cap without ` +
-          'reaching the end of the collection; any remaining in-window events were not ' +
-          'fetched this run.'
-        );
+      for (const entry of records) {
+        const mapped = mapActivityRecord(entry);
+        if (mapped.kind === 'event') events.push(mapped.event);
+        else if (mapped.kind === 'non-dns') skippedNonDns++;
+        else skippedUnparseable++;
       }
+
+      // A first page SHORTER than one the server has already served this run
+      // is the whole window, so it needs no probe; this keeps a light slice
+      // at two requests. The first page of the run, or one as large as any
+      // seen, may be a server-capped full page and is always probed.
+      if (offset === 0 && splittable && records.length >= run.largestPage) {
+        if (run.requests >= UMBRELLA_MAX_REQUESTS_PER_RUN) return { kind: 'budget' };
+        const probe = await this.fetchActivityPage(from, to, reachableOffset(run), 1, run);
+        if (probe.length > 0) return { kind: 'overflow' };
+      }
+
+      const nextOffset = offset + records.length;
+      if (nextOffset > UMBRELLA_ACTIVITY_OFFSET_CAP) {
+        if (splittable) return { kind: 'overflow' };
+        run.skippedUnparseable += skippedUnparseable;
+        run.skippedNonDns += skippedNonDns;
+        // The next page would sit past the cap, so whether anything is left
+        // cannot be asked. A page shorter than the largest one served this run
+        // is the window's last (the same rule that skips the probe above), so
+        // only a page as large as any seen means records were dropped. Without
+        // this, a window of 10,001..10,999 records would be reported as a loss
+        // it never had — and that report is now tenant-visible (#10047). Like
+        // the probe rule, this assumes the server's page size is steady within
+        // a run; a full page that happens to end the window still reports.
+        const truncated = records.length >= run.largestPage;
+        return { kind: 'complete', events, recordCount: nextOffset, truncated };
+      }
+      offset = nextOffset;
     }
 
-    if (skippedUnparseable > 0) {
-      console.warn(
-        `[UmbrellaProvider] activity sync skipped ${skippedUnparseable} unparseable record(s) ` +
-        '(possible API shape drift, or an unrecognized verdict).'
-      );
-    }
-    if (skippedNonDns > 0) {
-      console.warn(
-        `[UmbrellaProvider] activity sync skipped ${skippedNonDns} non-DNS record(s); the ` +
-        'x-traffic-type: dns header did not scope the combined feed.'
-      );
+    // Skip counts only land for a window that is kept — a discarded overflow
+    // window is re-fetched in halves and would otherwise be counted twice.
+    run.skippedUnparseable += skippedUnparseable;
+    run.skippedNonDns += skippedNonDns;
+    return { kind: 'complete', events, recordCount: offset, truncated: false };
+  }
+
+  private async fetchActivityPage(
+    from: number,
+    to: number,
+    offset: number,
+    limit: number,
+    run: ActivityRunState
+  ): Promise<unknown[]> {
+    run.requests++;
+    const url = new URL(UMBRELLA_ACTIVITY_URL);
+    // Epoch milliseconds, not ISO 8601: Cisco rejects ISO strings here with
+    // {"errors":[{"param":"from","error":"invalid timestamp specified"}]}
+    // (#4597 / #4637). Relative forms ("-7days", "now") are also accepted
+    // upstream; explicit bounds keep the sync window deterministic.
+    url.searchParams.set('from', String(from));
+    url.searchParams.set('to', String(to));
+    url.searchParams.set('limit', String(limit));
+    // This endpoint pages by limit/offset only — no cursor, no page token,
+    // and `meta` is documented as an empty object, so there is no total or
+    // has-more to read. `offset` must stay within 0..10000 (#7207).
+    url.searchParams.set('offset', String(offset));
+    // #10054 — an integration that does not store allowed traffic asks for
+    // the blocked and proxied verdicts only, so allowed queries (~99% of the
+    // feed) are never paged and cost none of the per-run request budget. The
+    // sync job still drops allowed events before insert, whatever comes back.
+    if (!storesAllowedTraffic(this.config)) {
+      url.searchParams.set('verdict', 'blocked,proxied');
     }
 
-    return allEvents;
+    const payload = await this.withAuth((authorization) =>
+      requestJson<Record<string, unknown>>(url, {
+        headers: { Authorization: authorization, ...UMBRELLA_TRAFFIC_TYPE_HEADER }
+      })
+    );
+    return asArray(payload.data);
   }
 
   private getDestinationListId(type: 'block' | 'allow'): string {

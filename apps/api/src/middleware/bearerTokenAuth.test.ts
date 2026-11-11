@@ -116,8 +116,9 @@ vi.mock('jose', async () => {
   };
 });
 
-import { importJWK, jwtVerify, type JWK } from 'jose';
+import { errors, importJWK, jwtVerify, type JWK } from 'jose';
 import { db, withDbAccessContext, withSystemDbAccessContext } from '../db';
+import { MCP_SKIP_AMBIENT_DB_CONTEXT_KEY } from './mcpTenantToolSelfManagedContext';
 import { oauthGrants } from '../db/schema';
 import { isGrantRevoked, isJtiRevoked } from '../oauth/revocationCache';
 import { assertActiveTenantContext, TenantInactiveError } from '../services/tenantStatus';
@@ -180,7 +181,9 @@ function createContext(headers: Record<string, string | undefined> = {}): TestCo
       store.set(key, value);
     },
     get: (key: string) => store.get(key),
-  } as TestContext;
+    // B-W02: 401s set WWW-Authenticate on the context before throwing.
+    header: () => undefined,
+  } as unknown as TestContext;
 }
 
 async function mintToken(claims: Record<string, unknown>, opts: { issuer?: string; audience?: string; ttlSeconds?: number } = {}) {
@@ -347,6 +350,35 @@ describe('bearerTokenAuthMiddleware', () => {
     errorSpy.mockRestore();
   });
 
+  it.each([
+    ['non-200 JWKS response', () => new errors.JOSEError('Expected 200 OK from the JSON Web Key Set HTTP response')],
+    ['JWKS fetch timeout', () => new errors.JWKSTimeout()],
+    ['malformed JWKS document', () => new errors.JWKSInvalid('JSON Web Key Set malformed')],
+    ['unparseable JWKS body', () => new errors.JOSEError('Failed to parse the JSON Web Key Set HTTP response as JSON')],
+  ])('returns 503 (not 401) when the JWKS endpoint is unavailable: %s', async (_name, makeErr) => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.mocked(jwtVerify).mockRejectedValueOnce(makeErr());
+
+    await expect(
+      bearerTokenAuthMiddleware(createContext({ Authorization: 'Bearer token' }), vi.fn())
+    ).rejects.toMatchObject({
+      status: 503,
+      message: 'oauth verification temporarily unavailable',
+    });
+    expect(errorSpy).toHaveBeenCalled();
+    errorSpy.mockRestore();
+  });
+
+  it('keeps no-matching-key JWKS errors at 401', async () => {
+    vi.mocked(jwtVerify).mockRejectedValueOnce(new errors.JWKSNoMatchingKey());
+    await expectUnauthorized(createContext({ Authorization: 'Bearer token' }), /invalid token: ERR_JWKS_NO_MATCHING_KEY/);
+  });
+
+  it('keeps multiple-matching-keys at 401 (token-triggerable via a kid-less header)', async () => {
+    vi.mocked(jwtVerify).mockRejectedValueOnce(new errors.JWKSMultipleMatchingKeys());
+    await expectUnauthorized(createContext({ Authorization: 'Bearer token' }), /invalid token: ERR_JWKS_MULTIPLE_MATCHING_KEYS/);
+  });
+
   it('authorizes a matching live auth epoch before consulting Redis', async () => {
     dbState.liveUserRows = [{ id: userId, status: 'active', authEpoch: 6, grantActive: true }];
     const token = await mintToken({
@@ -369,6 +401,18 @@ describe('bearerTokenAuthMiddleware', () => {
       1,
       { attributes: { reason: 'authorized', legacyClaim: false } },
     );
+  });
+
+  // #9758: an MCP Tier-3 intent filed by this request records the epoch the
+  // token was verified at, so release can refuse after a bump.
+  it('carries the verified live auth epoch onto the OAuth apiKey context', async () => {
+    dbState.liveUserRows = [{ id: userId, status: 'active', authEpoch: 6, grantActive: true }];
+    const token = await mintToken({ sub: userId, partner_id: partnerId, org_id: orgId, auth_epoch: 6, jti: 'epoch-ctx-jti' });
+    const c = createContext({ Authorization: `Bearer ${token}` });
+
+    await bearerTokenAuthMiddleware(c, vi.fn());
+
+    expect((c.get('apiKey') as { oauthAuthEpoch?: unknown }).oauthAuthEpoch).toBe(6);
   });
 
   it.each([
@@ -415,6 +459,7 @@ describe('bearerTokenAuthMiddleware', () => {
       // No grant id was asked about, so the join answers nothing. `null` is
       // "not asked" and must stay distinct from `false` ("asked, and dead").
       grantActive: null,
+      grantMcpDomains: undefined,
     });
     expect(vi.mocked(db.select)).toHaveBeenCalled();
   });
@@ -609,6 +654,7 @@ describe('bearerTokenAuthMiddleware', () => {
       keyPrefix: 'oauth',
       scopes: ['mcp:read', 'mcp:write', 'ai:read', 'ai:write'],
       rateLimit: 1000,
+      oauthAuthEpoch: 1,
       createdBy: userId,
     });
     expect(c.get('apiKeyOrgId')).toBe(orgId);
@@ -747,6 +793,119 @@ describe('bearerTokenAuthMiddleware', () => {
     expect(sql).toContain('>=');
   });
 
+  describe('B-W02 (#6156): bearer 401s carry the challenge', () => {
+    // Through a real Hono app whose onError rebuilds the body the way
+    // apps/api/src/index.ts does (it ignores HTTPException#res), proving the
+    // header set on the context before the throw survives.
+    async function requestThroughApp(authorization: string) {
+      const { Hono } = await import('hono');
+      const { HTTPException } = await import('hono/http-exception');
+      const app = new Hono();
+      app.use('*', bearerTokenAuthMiddleware);
+      app.get('/mcp', (c) => c.json({ ok: true }));
+      app.onError((err, c) => {
+        if (err instanceof HTTPException) return c.json({ error: err.message }, err.status);
+        return c.json({ error: 'Internal Server Error' }, 500);
+      });
+      return app.request('/mcp', { headers: { Authorization: authorization } });
+    }
+    const CHALLENGE =
+      'Bearer realm="breeze", error="invalid_token", resource_metadata="https://issuer.test/.well-known/oauth-protected-resource", scope="mcp:read mcp:write mcp:execute"';
+
+    it('expired-token 401 carries the bearer challenge', async () => {
+      const token = await mintToken({ sub: userId, partner_id: partnerId, org_id: orgId, scope: 'mcp:read' }, { ttlSeconds: -60 });
+      const res = await requestThroughApp(`Bearer ${token}`);
+      expect(res.status).toBe(401);
+      expect(res.headers.get('www-authenticate')).toBe(CHALLENGE);
+    });
+
+    it('revoked-grant and live-authorization 401s carry it too', async () => {
+      dbState.liveUserRows = [{ id: userId, status: 'active', authEpoch: 1, grantActive: false, mcpDomains: null }];
+      const revoked = await requestThroughApp(`Bearer ${await mintToken({ sub: userId, partner_id: partnerId, org_id: orgId, jti: 'j-rev' })}`);
+      expect(revoked.status).toBe(401);
+      expect(revoked.headers.get('www-authenticate')).toBe(CHALLENGE);
+
+      dbState.liveUserRows = [{ id: userId, status: 'disabled', authEpoch: 1, grantActive: true, mcpDomains: null }];
+      const inactive = await requestThroughApp(`Bearer ${await mintToken({ sub: userId, partner_id: partnerId, org_id: orgId, jti: 'j-inactive' })}`);
+      expect(inactive.status).toBe(401);
+      expect(inactive.headers.get('www-authenticate')).toBe(CHALLENGE);
+    });
+
+    it('a 503 (verification unavailable) carries no challenge', async () => {
+      dbState.liveUserError = new Error('db down');
+      const res = await requestThroughApp(`Bearer ${await mintToken({ sub: userId, partner_id: partnerId, org_id: orgId, jti: 'j-503' })}`);
+      expect(res.status).toBe(503);
+      expect(res.headers.get('www-authenticate')).toBeNull();
+    });
+  });
+
+  describe('B-W02 (#6156): grant mcp_domains', () => {
+    const mint = (grantId: string, jti: string) => mintToken({
+      sub: userId,
+      partner_id: partnerId,
+      org_id: orgId,
+      scope: 'mcp:read',
+      jti,
+      grant_id: grantId,
+    });
+    const liveUserSelects = () => vi.mocked(db.select).mock.calls
+      .map((call) => call[0] as Record<string, unknown> | undefined)
+      .filter((selection) => selection && 'authEpoch' in selection);
+
+    it('mcpDomains comes from the grant row in the same live query', async () => {
+      dbState.liveUserRows = [{ id: userId, status: 'active', authEpoch: 1, grantActive: true, mcpDomains: ['devices'] }];
+      const c = createContext({ Authorization: `Bearer ${await mint('grant-domains', 'jti-domains')}` });
+      const next = vi.fn();
+
+      await bearerTokenAuthMiddleware(c, next);
+
+      expect(next).toHaveBeenCalledOnce();
+      expect((c.get('apiKey') as { mcpDomains: unknown }).mcpDomains).toEqual(['devices']);
+      // One round-trip: the live-user query selects the column; no second grant query.
+      const selects = liveUserSelects();
+      expect(selects).toHaveLength(1);
+      expect(selects[0]).toHaveProperty('mcpDomains');
+      expect(dbState.liveUserJoins).toHaveLength(1);
+      expect(vi.mocked(db.select)).toHaveBeenCalledTimes(1);
+    });
+
+    it('two grants for one client resolve their own domains', async () => {
+      const contexts: unknown[] = [];
+      for (const [grantId, domains] of [['grant-a', ['devices']], ['grant-b', null]] as const) {
+        dbState.liveUserRows = [{ id: userId, status: 'active', authEpoch: 1, grantActive: true, mcpDomains: domains }];
+        const token = await mintToken({
+          sub: userId, partner_id: partnerId, org_id: orgId, scope: 'mcp:read',
+          jti: `jti-${grantId}`, grant_id: grantId, client_id: 'shared-client',
+        });
+        const c = createContext({ Authorization: `Bearer ${token}` });
+        await bearerTokenAuthMiddleware(c, vi.fn());
+        contexts.push(c.get('apiKey'));
+      }
+      expect(contexts[0]).toMatchObject({ oauthGrantId: 'grant-a', oauthClientId: 'shared-client', mcpDomains: ['devices'] });
+      expect(contexts[1]).toMatchObject({ oauthGrantId: 'grant-b', oauthClientId: 'shared-client', mcpDomains: null });
+    });
+
+    it('inactive grant never reaches the context with a NULL (unrestricted) mcpDomains', async () => {
+      // A revoked/expired Grant's LEFT JOIN side is NULL, which would read as
+      // unrestricted — safe only because grantActive=false 401s first.
+      dbState.liveUserRows = [{ id: userId, status: 'active', authEpoch: 1, grantActive: false, mcpDomains: null }];
+      const c = createContext({ Authorization: `Bearer ${await mint('grant-dead', 'jti-dead')}` });
+      await expectUnauthorized(c, 'token revoked');
+      expect(c.get('apiKey')).toBeUndefined();
+    });
+
+    it('assertLiveOAuthUser reports grantMcpDomains only for a live grant', async () => {
+      dbState.liveUserRows = [{ id: userId, status: 'active', authEpoch: 3, grantActive: true, mcpDomains: ['tickets'] }];
+      await expect(
+        assertLiveOAuthUser({ sub: userId, auth_epoch: 3 }, new Date(), { grantId: 'g' }),
+      ).resolves.toEqual(expect.objectContaining({ ok: true, grantActive: true, grantMcpDomains: ['tickets'] }));
+      dbState.liveUserRows = [{ id: userId, status: 'active', authEpoch: 3, grantActive: false, mcpDomains: null }];
+      await expect(
+        assertLiveOAuthUser({ sub: userId, auth_epoch: 3 }, new Date(), { grantId: 'g' }),
+      ).resolves.toEqual(expect.objectContaining({ ok: true, grantActive: false, grantMcpDomains: undefined }));
+    });
+  });
+
   it('rejects a bearer without a durable Grant identifier', async () => {
     const token = await mintToken({
       sub: userId,
@@ -823,6 +982,7 @@ describe('bearerTokenAuthMiddleware', () => {
       keyPrefix: 'oauth',
       scopes: ['mcp:read', 'ai:read'],
       rateLimit: 1000,
+      oauthAuthEpoch: 1,
       createdBy: userId,
     });
     expect(c.get('apiKeyOrgId')).toBeUndefined();
@@ -883,6 +1043,39 @@ describe('bearerTokenAuthMiddleware', () => {
     expect(next).toHaveBeenCalledOnce();
   });
 
+  // B-W03 (#6157, D-B20): a CIMD client's id is its metadata-document URL;
+  // org blocks key on that same id, so they apply unchanged.
+  it('a CIMD client honours an org block', async () => {
+    const cimdClientId = 'https://client.example.com/oauth/metadata.json';
+    const blockedOrg = '44444444-4444-4444-8444-444444444444';
+    const allowedOrg = '55555555-5555-5555-8555-555555555555';
+    dbState.rows = [
+      [{ orgAccess: 'all', orgIds: null }],
+      [{ id: blockedOrg }, { id: allowedOrg }],
+      [{ orgId: blockedOrg }],
+    ];
+    const token = await mintToken({
+      sub: userId,
+      partner_id: partnerId,
+      org_id: null,
+      scope: 'mcp:read',
+      jti: 'cimd-client-jti',
+      client_id: cimdClientId,
+    });
+    const c = createContext({ Authorization: `Bearer ${token}` });
+    const next = vi.fn();
+
+    await bearerTokenAuthMiddleware(c, next);
+
+    expect(c.get('apiKey')).toMatchObject({ oauthClientId: cimdClientId });
+    expect(collectPredicateFacts(dbState.wherePredicates[2]).params).toContain(cimdClientId);
+    expect(withDbAccessContext).toHaveBeenCalledWith(
+      expect.objectContaining({ scope: 'partner', accessibleOrgIds: [allowedOrg] }),
+      expect.any(Function),
+    );
+    expect(next).toHaveBeenCalledOnce();
+  });
+
   it('passes [] (not null) for partner-scope tokens whose partner has no orgs (M-B1)', async () => {
     // Edge case: a brand-new partner with no orgs. Resolver returns []. We
     // MUST pass [] to withDbAccessContext — passing null would be the
@@ -936,9 +1129,70 @@ describe('bearerTokenAuthMiddleware', () => {
       expect.objectContaining({
         scope: 'partner',
         accessibleOrgIds: [],
+        // No membership row → no partner axis either, consistent with the
+        // empty org list.
+        accessiblePartnerIds: [],
       }),
       expect.any(Function)
     );
+  });
+
+  it('keeps the partner axis for a member whose orgAccess is none', async () => {
+    dbState.rows = [[{ orgAccess: 'none', orgIds: null }]];
+
+    const token = await mintToken({
+      sub: userId,
+      partner_id: partnerId,
+      org_id: null,
+      scope: 'mcp:read',
+      jti: 'member-no-orgs-jti',
+    });
+    const c = createContext({ Authorization: `Bearer ${token}` });
+    const next = vi.fn();
+
+    await bearerTokenAuthMiddleware(c, next);
+
+    expect(withDbAccessContext).toHaveBeenCalledWith(
+      expect.objectContaining({
+        scope: 'partner',
+        accessibleOrgIds: [],
+        accessiblePartnerIds: [partnerId],
+      }),
+      expect.any(Function)
+    );
+  });
+
+  it('skips the ambient withDbAccessContext wrap when the MCP tenant-tool-call flag is set (org token)', async () => {
+    const token = await mintToken({
+      sub: userId,
+      partner_id: partnerId,
+      org_id: orgId,
+      jti: 'org-token-skip-ambient-jti',
+    });
+    const c = createContext({ Authorization: `Bearer ${token}` });
+    c.set(MCP_SKIP_AMBIENT_DB_CONTEXT_KEY, true);
+    const next = vi.fn();
+
+    await bearerTokenAuthMiddleware(c, next);
+
+    expect(next).toHaveBeenCalled();
+    expect(withDbAccessContext).not.toHaveBeenCalled();
+  });
+
+  it('still wraps the ambient context for an ordinary org-token request (flag unset)', async () => {
+    const token = await mintToken({
+      sub: userId,
+      partner_id: partnerId,
+      org_id: orgId,
+      jti: 'org-token-ambient-jti',
+    });
+    const c = createContext({ Authorization: `Bearer ${token}` });
+    const next = vi.fn();
+
+    await bearerTokenAuthMiddleware(c, next);
+
+    expect(next).toHaveBeenCalled();
+    expect(withDbAccessContext).toHaveBeenCalledTimes(1);
   });
 });
 

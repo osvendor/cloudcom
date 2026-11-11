@@ -5,7 +5,8 @@
  * `extensions/stageExtension.ts` used to import `hasCoreAiToolName` directly
  * from `services/aiTools.ts` — the ~45-domain-module tool registry hub. That
  * static edge dragged the ENTIRE hub in whenever stageExtension.ts loaded,
- * including `aiToolsBackup.ts -> commandQueue.ts -> routes/agentWs.ts`. Since
+ * including modules whose closure reaches `routes/agentWs.ts` (see
+ * `pnpm --filter @breeze/api worker:closure`). Since
  * `extensions/builtinExtensions.ts` (which statically imports
  * stageExtension.ts) is one of `worker.ts`'s dynamic-import boot seeds, a
  * `BREEZE_ROLE=worker` process's REAL boot closure quietly reached the
@@ -59,3 +60,13 @@ export function hasCoreAiToolName(toolName: string): boolean {
 }
 
 extensionContributionRegistry.configureReservedAiToolNames(hasCoreAiToolName);
+
+/**
+ * B-W02 (#6156, D-B8): `whoami` is a server-intrinsic MCP tool (it needs the
+ * MCP principal context, which registry handlers never receive), so it is not
+ * in the `aiTools` map. Reserve its name here, in the leaf, so an extension
+ * can never register a tool that shadows it — and so `mcpDomains.ts` /
+ * `mcpWhoami.ts` can import the constant without an `aiTools` import cycle.
+ */
+export const MCP_WHOAMI_TOOL_NAME = 'whoami';
+registerReservedAiToolNamePredicate((name) => name === MCP_WHOAMI_TOOL_NAME);

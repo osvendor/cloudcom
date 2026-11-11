@@ -1,53 +1,19 @@
 import { sql } from 'drizzle-orm';
 import { db, withSystemDbAccessContext } from '../db';
+import { getActiveSecretEncryptionKeyId } from './secretCrypto';
+import { BACKUP_PROVIDER_CONFIG_COLUMN } from './backupProviderConfigSealing';
 import {
-  encryptSecret,
-  getActiveSecretEncryptionKeyId,
-  isEncryptedSecret,
-  reencryptSecret,
-  shouldReencryptSecret,
-} from './secretCrypto';
+  isSecretJsonPath,
+  transformEncryptedColumnValue,
+  type EncryptedColumnSpec,
+} from './encryptedColumnTransform';
 
-type EncryptedColumnKind = 'text' | 'text-array' | 'json';
-
-export interface EncryptedColumnSpec {
-  table: string;
-  column: string;
-  kind: EncryptedColumnKind;
-  idColumn?: string;
-  /**
-   * How the ciphertext is bound to its location.
-   *
-   * 'column' (default) — AAD is `table.column`. Stops a blob being moved
-   * between COLUMNS, which is all the historical columns need: their rows are
-   * addressed by an id the tenant cannot choose.
-   *
-   * 'row' — AAD is `table.column:<row id>`. Additionally stops a blob being
-   * moved between ROWS, which for a tenant-owned column means between TENANTS:
-   * without it, someone with DB write access could paste another tenant's
-   * ciphertext into their own row and have the application decrypt it back to
-   * them. Row-bound columns must be written by a caller that knows the row id
-   * (see services/tenantVariables.ts) — the generic
-   * `encryptColumnValueForWrite` helper refuses them rather than sealing a
-   * value under the wrong AAD.
-   */
-  aadBinding?: 'column' | 'row';
-  description: string;
-}
-
-/**
- * The AAD string for a registered column. The single constructor for both the
- * write path and the rotation walker, so the two can never derive a different
- * binding for the same column.
- */
-export function columnAad(spec: EncryptedColumnSpec, rowId?: string): string {
-  const base = `${spec.table}.${spec.column}`;
-  if (spec.aadBinding !== 'row') return base;
-  if (!rowId) {
-    throw new Error(`${base} is row-bound: a row id is required to derive its AAD`);
-  }
-  return `${base}:${rowId}`;
-}
+export {
+  columnAad,
+  isSecretJsonPath,
+  transformEncryptedColumnValue,
+  type EncryptedColumnSpec,
+} from './encryptedColumnTransform';
 
 export interface ReencryptSecretsOptions {
   dryRun?: boolean;
@@ -67,11 +33,34 @@ export interface ReencryptSecretsStats {
   scanned: number;
   changed: number;
   updated: number;
+  /** Rows changed by a concurrent write between read and re-seal; not written. */
+  contended: number;
   skippedMissingTables: string[];
   errors: Array<{ table: string; column: string; id: string; error: string }>;
 }
 
+/**
+ * Secrets in the `settings` JSON columns (organizations, partners, sites) that
+ * are identified by path: notification-channel destinations and credentials.
+ * A Slack incoming-webhook URL and the extra webhook URLs carry their
+ * credential in the URL itself; the Pushover application token and user key
+ * are the same pair a Pushover channel config seals (notificationChannelSecrets
+ * `secretKeysForType('pushover')`). Shared with response masking
+ * (settingsSecretMasking.ts), which serves all three columns.
+ */
+export const SETTINGS_SECRET_JSON_PATHS: readonly (readonly string[])[] = [
+  ['notifications', 'slackWebhookUrl'],
+  ['notifications', 'webhooks'],
+  ['notifications', 'pushoverAppToken'],
+  ['notifications', 'pushoverDefaultUser'],
+];
+
 export const encryptedColumnRegistry: EncryptedColumnSpec[] = [
+  { table: 'credentials_documents', column: 'payload_ciphertext', kind: 'text', aadBinding: 'row', description: 'Client documentation original and preview, bound to the record id' },
+  { table: 'credentials_records', column: 'secret_ciphertext', kind: 'text', aadBinding: 'row', description: 'Client credential passwords, OTP seeds and notes, bound to the record id' },
+  { table: 'billing_link_tokens', column: 'token_ct', kind: 'text', aadBinding: 'row', description: 'Autopay bearer link token, encrypted and bound to its row id' },
+  { table: 'caller_verifications', column: 'sealed_link_token', kind: 'text', aadBinding: 'row', description: 'Caller verification SMS/email link token (#6354 W03), sealed for post-commit (re)delivery and bound to its row id' },
+
   { table: 'sso_providers', column: 'client_secret', kind: 'text', description: 'OIDC client secret' },
   { table: 'user_sso_identities', column: 'access_token', kind: 'text', description: 'SSO access token' },
   { table: 'user_sso_identities', column: 'refresh_token', kind: 'text', description: 'SSO refresh token' },
@@ -81,7 +70,9 @@ export const encryptedColumnRegistry: EncryptedColumnSpec[] = [
   { table: 'webhooks', column: 'url', kind: 'text', description: 'outbound webhook delivery URL (may embed credentials in userinfo/query)' },
   { table: 'webhooks', column: 'secret', kind: 'text', description: 'outbound webhook signing secret' },
   { table: 'webhooks', column: 'headers', kind: 'json', description: 'outbound webhook encrypted headers' },
-  { table: 'notification_channels', column: 'config', kind: 'json', description: 'notification channel secret config' },
+  // Moved off notification_channels (#6379); the AAD tag keeps its old
+  // location so existing ciphertext decrypts (notificationChannelSecrets.ts).
+  { table: 'notification_channel_configs', column: 'config', kind: 'json', idColumn: 'channel_id', aadTag: 'notification_channels.config', description: 'notification channel secret config' },
   { table: 'discovery_profiles', column: 'snmp_communities', kind: 'text-array', description: 'SNMP community strings' },
   { table: 'discovery_profiles', column: 'snmp_credentials', kind: 'json', description: 'SNMP credential secrets' },
   { table: 'snmp_devices', column: 'community', kind: 'text', description: 'SNMP v1/v2c community string' },
@@ -91,7 +82,12 @@ export const encryptedColumnRegistry: EncryptedColumnSpec[] = [
   { table: 'psa_connections', column: 'credentials', kind: 'json', description: 'PSA connection credentials' },
   { table: 'stripe_connect_accounts', column: 'credentials', kind: 'json', description: 'Stripe Connect OAuth token (deauthorize use)' },
   { table: 'stripe_connect_accounts', column: 'api_key', kind: 'text', description: 'Per-partner Stripe secret/restricted key (API-key billing model)' },
-  { table: 'partner_llm_configs', column: 'api_key_encrypted', kind: 'text', aadBinding: 'row', description: 'Per-partner Anthropic API key (#3228) — AAD bound to the row id' },
+  // AI model registry W02 (#7600, quorum #13): the retired legacy table's rows
+  // were copied to partner_ai_connections with the SAME id, so the AAD tag stays
+  // the legacy column's logical identity and every stored ciphertext decrypts
+  // unchanged (the #6379 moved-column precedent). Row-bound: a blob pasted into
+  // another partner's connection does not decrypt. Never rename the tag.
+  { table: 'partner_ai_connections', column: 'api_key_encrypted', kind: 'text', aadBinding: 'row', aadTag: 'partner_llm_configs.api_key_encrypted', description: 'Per-partner AI connection key (#7600) — legacy AAD tag (id-preserving copy), bound to the row id' },
   { table: 'huntress_integrations', column: 'api_key_encrypted', kind: 'text', description: 'Huntress API key' },
   { table: 'huntress_integrations', column: 'webhook_secret_encrypted', kind: 'text', description: 'Huntress webhook secret' },
   { table: 'pax8_integrations', column: 'client_id_encrypted', kind: 'text', description: 'Pax8 OAuth client id' },
@@ -103,48 +99,43 @@ export const encryptedColumnRegistry: EncryptedColumnSpec[] = [
   { table: 'accounting_connections', column: 'refresh_token_encrypted', kind: 'text', description: 'Accounting provider OAuth refresh token (rotates)' },
   { table: 'accounting_connections', column: 'webhook_verifier_token_encrypted', kind: 'text', description: 'QBO webhook verifier token' },
   { table: 's1_integrations', column: 'api_token_encrypted', kind: 'text', description: 'SentinelOne API token' },
+  { table: 'harmony_integrations', column: 'credentials_encrypted', kind: 'text', aadBinding: 'row', description: 'Harmony Endpoint credentials, bound to the connection id' },
   { table: 'dns_filter_integrations', column: 'api_key', kind: 'text', description: 'DNS filter API key' },
   { table: 'dns_filter_integrations', column: 'api_secret', kind: 'text', description: 'DNS filter API secret' },
   { table: 'storage_encryption_keys', column: 'encrypted_private_key', kind: 'text', description: 'backup private key material' },
-  { table: 'organizations', column: 'settings', kind: 'json', description: 'organization settings with encrypted log-forwarding secrets' },
-  { table: 'partners', column: 'settings', kind: 'json', description: 'partner settings with encrypted remote-access launcher passwords (#716)' },
-  { table: 'sites', column: 'settings', kind: 'json', description: 'site-level settings with encrypted overrides' },
+  { table: 'organizations', column: 'settings', kind: 'json', secretJsonPaths: SETTINGS_SECRET_JSON_PATHS, description: 'organization settings with encrypted log-forwarding and notification-channel secrets' },
+  { table: 'partners', column: 'settings', kind: 'json', secretJsonPaths: SETTINGS_SECRET_JSON_PATHS, description: 'partner settings with encrypted remote-access launcher passwords (#716) and notification-channel secrets' },
+  { table: 'sites', column: 'settings', kind: 'json', secretJsonPaths: SETTINGS_SECRET_JSON_PATHS, description: 'site-level settings with encrypted overrides' },
   { table: 'td_synnex_digital_bridge_integrations', column: 'credentials', kind: 'json', description: 'TD SYNNEX Digital Bridge API credentials' },
   { table: 'td_synnex_ec_express_integrations', column: 'credentials', kind: 'json', description: 'TD SYNNEX EC Express API credentials' },
   { table: 'td_synnex_sftp_integrations', column: 'credentials', kind: 'json', description: 'TD SYNNEX nightly SFTP P&A password (credentials.password)' },
   { table: 'device_recovery_keys', column: 'encrypted_key', kind: 'text', description: 'escrowed BitLocker/FileVault recovery key (#2021)' },
   { table: 'tenant_variables', column: 'value', kind: 'text', aadBinding: 'row', description: 'tenant variable value (#3409) — AAD bound to the row id' },
+  { table: 'device_network_isolations', column: 'break_glass_secret_enc', kind: 'text', aadBinding: 'row', description: 'per-episode network-isolation break-glass secret (#10089) — AAD bound to the episode id, so a secret swapped onto another episode never decrypts' },
   { table: 'invoices', column: 'public_link_token_ct', kind: 'text', aadBinding: 'row', description: 'public invoice-link bearer token (row-bound: swapping ciphertext between invoices would move a live credential across tenants)' },
   { table: 'tool_sources', column: 'auth_config_encrypted', kind: 'text', aadBinding: 'row', description: 'external tool source credential JSON (#5216, spec 2026-09-07 §5.2) — AAD bound to the row id' },
+  { table: 'backup_storage_credential_history', column: 'sealed_previous_secret', kind: 'text', aadBinding: 'row', description: 'replaced S3 backup destination connection settings (endpoint, bucket, key pair), kept only to check the old key is disabled — AAD bound to the row id' },
+  { table: 'ticket_push_preferences', column: 'pushover_user_key_encrypted', kind: 'text', idColumn: 'user_id', aadBinding: 'row', description: 'per-user Pushover user key for ticket-assignment pushes — AAD bound to the user id when an encryption key id is configured' },
   { table: 'backup_provider_connections', column: 'credentials_encrypted', kind: 'text', aadBinding: 'row', description: 'external backup provider console credentials JSON (#6008 W01) — AAD bound to the row id, so a blob pasted into another partner\'s connection does not decrypt' },
+  { table: 'flows', column: 'webhook_secret_encrypted', kind: 'text', aadBinding: 'row', aadTag: 'flows.webhook_secret_encrypted', description: 'flow webhook signing secret (#5220 W5) — AAD bound to the row id, so a blob pasted onto another flow does not decrypt' },
+  { table: 'edr_connections', column: 'credentials_encrypted', kind: 'text', aadBinding: 'row', description: 'EDR vendor console credential JSON (#8164 W01) — AAD bound to the row id' },
+  { table: 'edr_connections', column: 'webhook_secret_encrypted', kind: 'text', aadBinding: 'row', description: 'EDR push/webhook shared secret Breeze generates (#8164 W03) — AAD bound to the row id' },
+  { table: 'edr_tenants', column: 'installer_secret_encrypted', kind: 'text', aadBinding: 'row', description: 'per-vendor-tenant installer token / link (#8164 W06) — AAD bound to the row id' },
+  { table: 'ticket_import_sources', column: 'credentials_encrypted', kind: 'text', aadBinding: 'row', description: 'ticket import source credential JSON (#8313 W4, spec 2026-10-19 §5.6) — AAD bound to the row id, so a blob pasted into another partner\'s source does not decrypt' },
+  { table: 'trust_signing_keys', column: 'private_key_enc', kind: 'text', description: 'Trust attestation ES256 private JWK (W3b)' },
+  // Sealed/opened by the column type itself (db/schema/backup.ts); listed here
+  // so key rotation re-seals it.
+  BACKUP_PROVIDER_CONFIG_COLUMN,
 ];
 
-const SECRET_JSON_KEYS = new Set([
-  'secret',
-  'webhookSecret',
-  'clientSecret',
-  'accessToken',
-  'refreshToken',
-  'token',
-  'apiKey',
-  'apiSecret',
-  'apiKeyValue',
-  'authToken',
-  'authPassword',
-  'routingKey',
-  'integrationKey',
-  'webhookUrl',
-  'password',
-  'privateKey',
-  'encrypted',
-  'elasticsearchApiKey',
-  'elasticsearchPassword',
-  'community',
-  'authPassphrase',
-  'privacyPassphrase',
-  'authPassword',
-  'privPassword',
-]);
+/**
+ * `isSecretJsonPath` for the `settings` columns. Response masking
+ * (services/settingsSecretMasking.ts) and partner-lock checks use this, so a
+ * leaf sealed on write is always masked on read.
+ */
+export function isSettingsSecretPath(path: readonly string[]): boolean {
+  return isSecretJsonPath(path, SETTINGS_SECRET_JSON_PATHS);
+}
 
 function rowsFromResult(result: unknown): Array<Record<string, unknown>> {
   if (Array.isArray(result)) return result as Array<Record<string, unknown>>;
@@ -156,87 +147,6 @@ function rowsFromResult(result: unknown): Array<Record<string, unknown>> {
 
 function valuesEqual(a: unknown, b: unknown): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
-}
-
-// Gate AAD-binding rollout behind an env var so this branch can ship the
-// machinery without forcing a v2 -> v3 rewrite across all production secrets
-// at the same time. Flip to default-on once the rotation script has been run
-// at least once with ENABLE_AAD_V3=true.
-function aadV3Enabled(): boolean {
-  return process.env.ENABLE_AAD_V3 === 'true';
-}
-
-function maybeReencryptString(value: string, force: boolean, aad?: string, alwaysAad = false): string {
-  const withAad = aad && (alwaysAad || aadV3Enabled()) ? aad : undefined;
-  const opts = withAad ? { aad: withAad } : undefined;
-  if (isEncryptedSecret(value)) {
-    return shouldReencryptSecret(value, { targetWithAad: Boolean(withAad) })
-      ? reencryptSecret(value, opts) ?? value
-      : value;
-  }
-  if (!force) {
-    return value;
-  }
-  // Plaintext reaching a registered column is a first encryption, not a
-  // rotation, so it goes through `encryptSecret`. `reencryptSecret` requires an
-  // active key id and throws without one, which would fail the whole write on a
-  // deployment that has not set APP_ENCRYPTION_KEY_ID — the shipped default.
-  // `encryptSecret` seals to v1 under the global key in that configuration,
-  // matching how every other write path degrades.
-  return encryptSecret(value, opts) ?? value;
-}
-
-function transformJsonSecrets(value: unknown, key?: string, aad?: string, alwaysAad = false): unknown {
-  if (typeof value === 'string') {
-    if (isEncryptedSecret(value) || (key && SECRET_JSON_KEYS.has(key) && value.length > 0)) {
-      return maybeReencryptString(value, Boolean(key && SECRET_JSON_KEYS.has(key)), aad, alwaysAad);
-    }
-    return value;
-  }
-
-  if (Array.isArray(value)) {
-    return value.map((entry) => transformJsonSecrets(entry, key, aad, alwaysAad));
-  }
-
-  if (value && typeof value === 'object') {
-    return Object.fromEntries(
-      Object.entries(value as Record<string, unknown>).map(([entryKey, entryValue]) => [
-        entryKey,
-        transformJsonSecrets(entryValue, entryKey, aad, alwaysAad),
-      ])
-    );
-  }
-
-  return value;
-}
-
-export function transformEncryptedColumnValue(
-  spec: EncryptedColumnSpec,
-  value: unknown,
-  rowId?: string,
-): unknown {
-  // AAD binds the ciphertext to its schema location so a blob from one column
-  // cannot be silently swapped into another. Only written for new v3 rows
-  // (gated by ENABLE_AAD_V3); existing v2 rows continue to decrypt unchanged.
-  //
-  // Row-bound columns are exempt from that gate: they are new, so they have no
-  // v2 rows to migrate and no flag day to coordinate. Their binding is applied
-  // from the first write, which is also what makes it safe for the write path
-  // and this walker to agree without consulting an env var.
-  const aad = columnAad(spec, rowId);
-  const alwaysAad = spec.aadBinding === 'row';
-
-  if (spec.kind === 'text') {
-    return typeof value === 'string' ? maybeReencryptString(value, true, aad, alwaysAad) : value;
-  }
-
-  if (spec.kind === 'text-array') {
-    return Array.isArray(value)
-      ? value.map((entry) => typeof entry === 'string' ? maybeReencryptString(entry, true, aad, alwaysAad) : entry)
-      : value;
-  }
-
-  return transformJsonSecrets(value, undefined, aad, alwaysAad);
 }
 
 /**
@@ -291,36 +201,43 @@ async function fetchBatch(
     .map((row) => ({ id: row.id as string, value: row.value }));
 }
 
+/**
+ * Writes the re-sealed value only if the row still holds exactly what was
+ * read (compare-and-set). A concurrent save — a credential edit landing
+ * between the read and this write — must never be overwritten with the
+ * re-sealed OLD value. Returns false when the row changed; the next run picks
+ * it up.
+ */
 async function updateValue(
   executor: SecretReencryptionExecutor,
   spec: EncryptedColumnSpec,
   id: string,
+  previous: unknown,
   value: unknown,
-): Promise<void> {
+): Promise<boolean> {
   const idColumn = spec.idColumn ?? 'id';
+  const target = sql.identifier(spec.column);
+  let assignment;
+  let unchanged;
   if (spec.kind === 'json') {
-    await executor.execute(sql`
-      UPDATE ${sql.identifier(spec.table)}
-      SET ${sql.identifier(spec.column)} = ${JSON.stringify(value)}::jsonb
-      WHERE ${sql.identifier(idColumn)} = ${id}
-    `);
-    return;
+    assignment = sql`${JSON.stringify(value)}::jsonb`;
+    unchanged = sql`${target} = ${JSON.stringify(previous)}::jsonb`;
+  } else if (spec.kind === 'text-array') {
+    // Bound as ONE jsonb parameter: Drizzle expands a JS array into a
+    // parenthesised parameter list, which `::text[]` cannot cast.
+    assignment = sql`ARRAY(SELECT jsonb_array_elements_text(${JSON.stringify(value)}::jsonb))`;
+    unchanged = sql`to_jsonb(${target}) = ${JSON.stringify(previous)}::jsonb`;
+  } else {
+    assignment = sql`${value as string}`;
+    unchanged = sql`${target} = ${previous as string}`;
   }
-
-  if (spec.kind === 'text-array') {
-    await executor.execute(sql`
-      UPDATE ${sql.identifier(spec.table)}
-      SET ${sql.identifier(spec.column)} = ${value as string[]}::text[]
-      WHERE ${sql.identifier(idColumn)} = ${id}
-    `);
-    return;
-  }
-
-  await executor.execute(sql`
+  const updated = rowsFromResult(await executor.execute(sql`
     UPDATE ${sql.identifier(spec.table)}
-    SET ${sql.identifier(spec.column)} = ${value as string}
-    WHERE ${sql.identifier(idColumn)} = ${id}
-  `);
+    SET ${target} = ${assignment}
+    WHERE ${sql.identifier(idColumn)} = ${id} AND ${unchanged}
+    RETURNING 1 AS updated
+  `));
+  return updated.length > 0;
 }
 
 export async function reencryptRegisteredSecrets(options: ReencryptSecretsOptions = {}): Promise<ReencryptSecretsStats> {
@@ -339,6 +256,7 @@ export async function reencryptRegisteredSecrets(options: ReencryptSecretsOption
     scanned: 0,
     changed: 0,
     updated: 0,
+    contended: 0,
     skippedMissingTables: [],
     errors: [],
   };
@@ -370,8 +288,12 @@ export async function reencryptRegisteredSecrets(options: ReencryptSecretsOption
 
             stats.changed++;
             if (!dryRun) {
-              await updateValue(executor, spec, row.id, transformed);
-              stats.updated++;
+              if (await updateValue(executor, spec, row.id, row.value, transformed)) {
+                stats.updated++;
+              } else {
+                stats.contended++;
+                logger.warn(`[secret-rotation] ${spec.table}.${spec.column} row ${row.id} changed while being re-sealed; left for the next run`);
+              }
             }
           } catch (err) {
             const message = err instanceof Error ? err.message : String(err);

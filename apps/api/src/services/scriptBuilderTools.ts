@@ -5,6 +5,7 @@
  * Includes 2 custom apply tools (code + metadata) and 8 existing tools.
  */
 
+import { fleetTimeFiltersSchema } from './timeSync/fleetFilters';
 import { z } from 'zod';
 import { tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
 import type { AuthContext } from '../middleware/auth';
@@ -12,14 +13,16 @@ import { dbAccessContextFromAuth } from '../middleware/auth';
 import { executeTool } from './aiTools';
 import { withDbAccessContext, runOutsideDbContext } from '../db';
 import type { AiToolTier } from '@breeze/shared/types/ai';
-import { scriptParameterDefinitionsSchema } from '@breeze/shared';
+import { scriptParameterDefinitionsSchema, WORKLOAD_RUNTIMES, WORKLOAD_STATES } from '@breeze/shared';
 import { compactToolResultForChat } from './aiToolOutput';
 import { captureException } from './sentry';
 import type { PreToolUseCallback, PostToolUseCallback } from './aiAgentSdkTools';
+import { postToolUseForCall, sdkToolUseIdFromExtra } from './aiToolUseCorrelation';
 import type { ToolExecutionContext } from './toolExecutionContext';
 import { sanitizeThrownToolError } from './aiToolErrors';
 import { normalizeScriptCode } from './scriptCodeNormalize';
 import { aiRunContextInputShape } from './scriptRunRequest';
+import { keysetZodShape, pageZodShape } from './aiToolPagination';
 
 const TOOL_EXECUTION_TIMEOUT_MS = 60_000;
 
@@ -42,6 +45,10 @@ export const SCRIPT_BUILDER_TOOL_TIERS: Record<string, AiToolTier> = {
   apply_script_metadata: 1,
   query_devices: 1,
   get_device_details: 1,
+  get_device_hardware_health: 1,
+  get_device_time_status: 1,
+  query_device_workloads: 1,
+  list_time_sync_issues: 1,
   manage_alerts: 1,
   list_scripts: 1,
   get_script_details: 1,
@@ -108,19 +115,21 @@ function makeExistingHandler(
   registeredToolName: string,
   getAuth: () => AuthContext,
   onPreToolUse?: PreToolUseCallback,
-  onPostToolUse?: PostToolUseCallback,
+  onPostToolUseHook?: PostToolUseCallback,
 ) {
   const toolName = SCRIPT_BUILDER_HANDLER_BY_MCP_TOOL[registeredToolName] ?? registeredToolName;
   const exposedToolName = scriptBuilderMcpToolName(registeredToolName);
 
-  return async (args: Record<string, unknown>) => {
+  return async (args: Record<string, unknown>, extra?: unknown) => {
+    // Carries the SDK's tool_use id so the result pairs with its call (#7931).
+    const onPostToolUse = postToolUseForCall(onPostToolUseHook, extra);
     const startTime = Date.now();
     let verifiedContext: ToolExecutionContext | undefined;
 
     if (onPreToolUse) {
       let check: Awaited<ReturnType<PreToolUseCallback>>;
       try {
-        check = await onPreToolUse(toolName, args, exposedToolName);
+        check = await onPreToolUse(toolName, args, exposedToolName, sdkToolUseIdFromExtra(extra));
       } catch (err) {
         captureException(err);
         console.error(`[ScriptBuilder] PreToolUse threw for ${toolName}:`, err);
@@ -203,9 +212,11 @@ function makeExistingHandler(
 // tool_result re-attach delivers to the editor.
 export function makeApplyHandler(
   toolName: string,
-  onPostToolUse?: PostToolUseCallback,
+  onPostToolUseHook?: PostToolUseCallback,
 ) {
-  return async (args: Record<string, unknown>) => {
+  return async (args: Record<string, unknown>, extra?: unknown) => {
+    // Carries the SDK's tool_use id so the result pairs with its call (#7931).
+    const onPostToolUse = postToolUseForCall(onPostToolUseHook, extra);
     const startTime = Date.now();
     // Scrub typographic Unicode (curly quotes, em-dashes, NBSP) the model
     // sometimes emits — it breaks script parsing on-device (PowerShell 5.1
@@ -295,7 +306,7 @@ export function buildScriptBuilderTools(
         status: z.enum(['online', 'offline', 'maintenance', 'decommissioned']).optional(),
         osType: z.enum(['windows', 'macos', 'linux']).optional(),
         search: z.string().max(200).optional(),
-        limit: z.number().int().min(1).max(50).optional(),
+        ...pageZodShape(25, 100),
       },
       makeExistingHandler('query_devices', getAuth, onPreToolUse, onPostToolUse)
     ),
@@ -308,6 +319,39 @@ export function buildScriptBuilderTools(
     ),
 
     tool(
+      'get_device_time_status',
+      'Get Windows time health, expected timezone, findings and recent events.',
+      { deviceId: uuid },
+      makeExistingHandler('get_device_time_status', getAuth, onPreToolUse, onPostToolUse),
+    ),
+
+    tool(
+      'query_device_workloads',
+      'List the containers and VMs a device hosts, with per-runtime status and counts.',
+      {
+        deviceId: z.string().uuid(),
+        runtime: z.enum(WORKLOAD_RUNTIMES).optional(),
+        state: z.enum(WORKLOAD_STATES).optional(),
+        limit: z.number().int().min(1).max(200).optional(),
+      },
+      makeExistingHandler('query_device_workloads', getAuth, onPreToolUse, onPostToolUse),
+    ),
+
+    tool(
+      'list_time_sync_issues',
+      'List observed time synchronization findings in the accessible fleet.',
+      fleetTimeFiltersSchema.shape,
+      makeExistingHandler('list_time_sync_issues', getAuth, onPreToolUse, onPostToolUse),
+    ),
+
+    tool(
+      'get_device_hardware_health',
+      'Get current hardware health, components, collectors and optional recent events.',
+      { deviceId: uuid, includeEvents: z.boolean().optional(), includeReliability: z.boolean().optional() },
+      makeExistingHandler('get_device_hardware_health', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
       'manage_alerts',
       'Query alerts for a device or org. Use to understand what issue a script should address.',
       {
@@ -316,7 +360,7 @@ export function buildScriptBuilderTools(
         status: z.enum(['active', 'acknowledged', 'resolved', 'suppressed']).optional(),
         severity: z.enum(['critical', 'high', 'medium', 'low', 'info']).optional(),
         deviceId: uuid.optional(),
-        limit: z.number().int().min(1).max(50).optional(),
+        ...keysetZodShape(15, 100),
       },
       makeExistingHandler('manage_alerts', getAuth, onPreToolUse, onPostToolUse)
     ),
@@ -329,7 +373,7 @@ export function buildScriptBuilderTools(
         category: z.string().optional(),
         language: z.enum(['powershell', 'bash', 'python', 'cmd']).optional(),
         osType: z.enum(['windows', 'macos', 'linux']).optional(),
-        limit: z.number().int().min(1).max(50).optional(),
+        ...pageZodShape(15, 50),
       },
       makeExistingHandler('list_scripts', getAuth, onPreToolUse, onPostToolUse)
     ),
@@ -367,6 +411,13 @@ export function buildScriptBuilderTools(
       'Fetch one script execution by ID with status, exit code, stdout, and stderr. Use for runs started outside the current tool call (the editor Test Run button, or an execution id from get_script_execution_history) — not to re-check an execute_script_on_device call that already returned.',
       {
         executionId: uuid.describe('The execution ID to fetch'),
+        // A-W05 (Q7): this file declares its own Zod shape independent of
+        // aiAgentSdkTools.ts — the window params must be added here too, or
+        // this surface strips them and the model can never page past 6000
+        // stdout chars.
+        stdoutOffset: z.number().int().min(0).optional().describe('Character offset into stdout (default 0)'),
+        stdoutMaxChars: z.number().int().min(1).max(5000).optional().describe('Max stdout chars to return (default 5000, max 5000)'),
+        stderrMaxChars: z.number().int().min(1).max(8000).optional().describe('Max stderr chars to return (default 1500, max 8000)'),
       },
       makeExistingHandler('get_script_execution', getAuth, onPreToolUse, onPostToolUse)
     ),
@@ -377,7 +428,11 @@ export function buildScriptBuilderTools(
       'Run a saved script on one or more devices. The script must be saved first. Requires user approval.',
       {
         scriptId: uuid.describe('The saved script ID to execute'),
-        deviceIds: z.array(uuid).min(1).max(10).describe('Target device IDs'),
+        // Exactly one of deviceIds / groupId (#8600); the raw-shape form cannot
+        // refine, so `toolInputSchemas.run_script` (the handler this routes to)
+        // enforces it at dispatch.
+        deviceIds: z.array(uuid).min(1).max(10).optional().describe('Target device IDs (max 10). Omit when groupId is given.'),
+        groupId: uuid.optional().describe('Saved device group UUID to run on instead of deviceIds. Its members are frozen when approval is requested and that list runs; refused above 10 devices.'),
         parameters: z.record(z.string(), z.unknown()).optional(),
         // #4888 — the same run-context pair the `run_script` handler this tool
         // dispatches to accepts. Adding fields here does NOT disturb the #4883

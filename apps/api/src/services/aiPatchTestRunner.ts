@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { resolveDefaultModel } from './aiAgent';
+
+const PATCH_ANALYSIS_MAX_TOKENS = 512;
 
 const execFileAsync = promisify(execFile);
 
@@ -94,7 +95,7 @@ async function runOnVm(
  * enqueued by Breeze's own patch pipeline rather than initiated by the
  * organization. Admitting it against the org's `ai_budget_reservations` cap
  * would let a background job exhaust a technician's interactive budget — the
- * opposite of what the SEC-142 fence is for.
+ * opposite of what the fence is for.
  *
  * Like the workspace embedder, metering this belongs to a platform/system
  * budget that does not exist yet. Recorded as an accepted exemption on #5557.
@@ -106,12 +107,20 @@ async function analyzeWithClaude(input: {
   output: string;
 }): Promise<{ result: 'pass' | 'fail' | 'inconclusive'; notes: string }> {
   // Dynamic import keeps the SDK out of the cold path when AI testing is disabled.
-  const { default: Anthropic } = await import('@anthropic-ai/sdk');
-  const client = new Anthropic();
-
-  const resp = await client.messages.create({
-    model: resolveDefaultModel(),
-    max_tokens: 512,
+  // The platform-only `patch_test` surface resolves with no partner; the
+  // factory supplies the client and the model/effort/thinking params (#7587:
+  // without an explicit effort this 512-token JSON reply was truncated).
+  const { resolveModel } = await import('./aiModels/resolveModel');
+  const { anthropicClientFor, createMessage } = await import('./aiModels/connectionFactory');
+  const resolved = await resolveModel({
+    partnerId: null,
+    orgId: null,
+    surface: 'patch_test',
+    maxTokens: PATCH_ANALYSIS_MAX_TOKENS,
+  });
+  if (!resolved.ok) return { result: 'inconclusive', notes: `AI analysis unavailable: ${resolved.message}` };
+  const { message: resp } = await createMessage(anthropicClientFor(resolved, null), resolved, {
+    max_tokens: PATCH_ANALYSIS_MAX_TOKENS,
     system: [
       {
         type: 'text' as const,

@@ -2,8 +2,8 @@ import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import '@/lib/i18n';
 import { Lock, Save, ShieldCheck, ShieldOff, Timer, Fingerprint } from 'lucide-react';
-import { useOrgStore } from '../../stores/orgStore';
 import { fetchWithAuth } from '../../stores/auth';
+import { SESSION_TIMEOUT_MAX_MINUTES } from '../../lib/sessionTimeout';
 
 type SecurityData = {
   minLength?: number;
@@ -22,10 +22,15 @@ type MtlsSettings = {
 };
 
 type OrgSecuritySettingsProps = {
+  /** The org being edited — the settings page's, never the header switcher's. */
+  orgId: string;
   security?: SecurityData;
   mtls?: MtlsSettings;
   onDirty?: () => void;
   onSave?: (data: SecurityData) => void;
+  /** Fired after the mTLS policy saved through its own route, so the page can
+   *  refresh the settings blob its section saves re-post wholesale. */
+  onMtlsSaved?: () => void;
   locked?: string[];
 };
 
@@ -40,7 +45,7 @@ const defaultSecurity: SecurityData = {
   ipAllowlist: ''
 };
 
-export default function OrgSecuritySettings({ security, mtls, onDirty, onSave, locked }: OrgSecuritySettingsProps) {
+export default function OrgSecuritySettings({ orgId, security, mtls, onDirty, onSave, onMtlsSaved, locked }: OrgSecuritySettingsProps) {
   const { t } = useTranslation('settings');
   const isLocked = (field: string) => locked?.includes(`security.${field}`) ?? false;
 
@@ -50,7 +55,11 @@ export default function OrgSecuritySettings({ security, mtls, onDirty, onSave, l
   const [expirationDays, setExpirationDays] = useState(initialData.expirationDays || 90);
   const [requireMfa, setRequireMfa] = useState(initialData.requireMfa ?? true);
   const [allowedMethods, setAllowedMethods] = useState(initialData.allowedMethods || { totp: true, sms: false });
-  const [sessionTimeout, setSessionTimeout] = useState(initialData.sessionTimeout || 60);
+  const [sessionTimeout, setSessionTimeout] = useState(
+    // #6111 — the org record is read raw; a legacy stored value above the
+    // ceiling must not be re-submitted (the API now rejects it with a 400).
+    Math.min(SESSION_TIMEOUT_MAX_MINUTES, initialData.sessionTimeout || 60),
+  );
   const [maxSessions, setMaxSessions] = useState(initialData.maxSessions || 3);
   const [ipAllowlist, setIpAllowlist] = useState(initialData.ipAllowlist || '');
 
@@ -60,8 +69,6 @@ export default function OrgSecuritySettings({ security, mtls, onDirty, onSave, l
   const [mtlsSaving, setMtlsSaving] = useState(false);
   const [mtlsError, setMtlsError] = useState<string>();
   const [mtlsSuccess, setMtlsSuccess] = useState(false);
-
-  const { currentOrgId } = useOrgStore();
 
   const markDirty = () => {
     onDirty?.();
@@ -74,7 +81,9 @@ export default function OrgSecuritySettings({ security, mtls, onDirty, onSave, l
       expirationDays,
       requireMfa,
       allowedMethods,
-      sessionTimeout,
+      // A cleared input reads as 0; the API rejects <1 and >720, so fall back to
+      // the default / clamp rather than submit a value that fails the whole save.
+      sessionTimeout: Math.min(SESSION_TIMEOUT_MAX_MINUTES, Math.max(1, sessionTimeout || 60)),
       maxSessions,
       ipAllowlist
     };
@@ -82,14 +91,12 @@ export default function OrgSecuritySettings({ security, mtls, onDirty, onSave, l
   };
 
   const handleMtlsSave = async () => {
-    if (!currentOrgId) return;
-
     setMtlsSaving(true);
     setMtlsError(undefined);
     setMtlsSuccess(false);
 
     try {
-      const response = await fetchWithAuth(`/agents/org/${currentOrgId}/settings/mtls`, {
+      const response = await fetchWithAuth(`/agents/org/${orgId}/settings/mtls`, {
         method: 'PATCH',
         body: JSON.stringify({
           certLifetimeDays,
@@ -104,6 +111,7 @@ export default function OrgSecuritySettings({ security, mtls, onDirty, onSave, l
 
       setMtlsSuccess(true);
       setTimeout(() => setMtlsSuccess(false), 3000);
+      onMtlsSaved?.();
     } catch (err) {
       setMtlsError(err instanceof Error ? err.message : t('orgSecuritySettings.mtls.errors.save'));
     } finally {
@@ -261,7 +269,7 @@ export default function OrgSecuritySettings({ security, mtls, onDirty, onSave, l
               <input
                 type="number"
                 min={15}
-                max={240}
+                max={SESSION_TIMEOUT_MAX_MINUTES}
                 value={sessionTimeout}
                 disabled={isLocked('sessionTimeout')}
                 onChange={event => {

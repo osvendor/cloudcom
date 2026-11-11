@@ -82,6 +82,7 @@ type HardwareState struct {
 	DiskTotalGB  uint64 `json:"diskTotalGb"`
 	BIOSVersion  string `json:"biosVersion"`
 	SerialNumber string `json:"serialNumber"`
+	ProductSKU   string `json:"productSku,omitempty"`
 	Motherboard  string `json:"motherboard"`
 }
 
@@ -106,9 +107,12 @@ type Snapshot struct {
 
 // ChangeTrackerCollector tracks changes in system configuration.
 type ChangeTrackerCollector struct {
-	snapshotPath     string
-	lastSnapshot     *Snapshot
-	gatherSnapshot   func() (*Snapshot, error)
+	snapshotPath   string
+	lastSnapshot   *Snapshot
+	gatherSnapshot func() (*Snapshot, error)
+	// serviceCollect overrides the service collector in the real gather path
+	// (tests only). Nil means NewServiceCollector().Collect.
+	serviceCollect   func() ([]ServiceInfo, error)
 	now              func() time.Time
 	collectorTimeout time.Duration
 	ignoreRules      []changeIgnoreRule
@@ -401,7 +405,10 @@ func (c *ChangeTrackerCollector) gatherCurrentSnapshot() (*Snapshot, error) {
 	)
 
 	softwareCollector := NewSoftwareCollector()
-	serviceCollector := NewServiceCollector()
+	collectServiceInfo := NewServiceCollector().Collect
+	if c.serviceCollect != nil {
+		collectServiceInfo = c.serviceCollect
+	}
 	invCollector := NewInventoryCollector()
 	hwCollector := NewHardwareCollector()
 
@@ -418,7 +425,7 @@ func (c *ChangeTrackerCollector) gatherCurrentSnapshot() (*Snapshot, error) {
 	go func() {
 		defer wg.Done()
 		services, servicesErr = collectWithTimeout(ctx, c.collectorTimeout, func(_ context.Context) ([]ServiceInfo, error) {
-			return serviceCollector.Collect()
+			return collectServiceInfo()
 		})
 	}()
 	go func() {
@@ -470,10 +477,11 @@ func (c *ChangeTrackerCollector) gatherCurrentSnapshot() (*Snapshot, error) {
 			snapshot.Services = maps.Clone(c.lastSnapshot.Services)
 		}
 	} else {
-		for _, svc := range services {
-			key := serviceKey(svc)
-			snapshot.Services[key] = svc
+		var prevServices map[string]ServiceInfo
+		if c.lastSnapshot != nil {
+			prevServices = c.lastSnapshot.Services
 		}
+		snapshot.Services = mergeServiceReads(prevServices, services)
 	}
 
 	if adaptersErr != nil {
@@ -534,15 +542,7 @@ func (c *ChangeTrackerCollector) gatherCurrentSnapshot() (*Snapshot, error) {
 			snapshot.Hardware = c.lastSnapshot.Hardware
 		}
 	} else {
-		snapshot.Hardware = &HardwareState{
-			RAMTotalMB:   hardware.RAMTotalMB,
-			CPUModel:     hardware.CPUModel,
-			CPUCores:     hardware.CPUCores,
-			DiskTotalGB:  hardware.DiskTotalGB,
-			BIOSVersion:  hardware.BIOSVersion,
-			SerialNumber: hardware.SerialNumber,
-			Motherboard:  strings.TrimSpace(hardware.MotherboardManufacturer + " " + hardware.MotherboardProduct),
-		}
+		snapshot.Hardware = hardwareStateFrom(hardware)
 	}
 
 	if systemInfoErr != nil || systemInfo == nil {
@@ -1051,6 +1051,20 @@ func (c *ChangeTrackerCollector) diffUserAccounts(current *Snapshot) []ChangeRec
 	return changes
 }
 
+// hardwareStateFrom projects collected hardware onto the fields the tracker diffs.
+func hardwareStateFrom(hardware *HardwareInfo) *HardwareState {
+	return &HardwareState{
+		RAMTotalMB:   hardware.RAMTotalMB,
+		CPUModel:     hardware.CPUModel,
+		CPUCores:     hardware.CPUCores,
+		DiskTotalGB:  hardware.DiskTotalGB,
+		BIOSVersion:  hardware.BIOSVersion,
+		SerialNumber: hardware.SerialNumber,
+		ProductSKU:   hardware.ProductSKU,
+		Motherboard:  strings.TrimSpace(hardware.MotherboardManufacturer + " " + hardware.MotherboardProduct),
+	}
+}
+
 // diffHardware compares the current hardware state against the previous
 // snapshot. Hardware is a singleton (not a map), so there is no add/remove —
 // only field-level "modified"/"updated" events. Returns no records when
@@ -1107,6 +1121,12 @@ func (c *ChangeTrackerCollector) diffHardware(current *Snapshot) []ChangeRecord 
 	}
 	if prev.SerialNumber != cur.SerialNumber {
 		emit("System Serial", prev.SerialNumber, cur.SerialNumber)
+	}
+	// Only a real value replacing a real value counts. An empty prev is a snapshot
+	// from an agent older than this field (a false change on every device after
+	// upgrade); an empty cur is a collection gap, not a board swap.
+	if prev.ProductSKU != "" && cur.ProductSKU != "" && prev.ProductSKU != cur.ProductSKU {
+		emit("Product Number", prev.ProductSKU, cur.ProductSKU)
 	}
 	if prev.Motherboard != cur.Motherboard {
 		emit("Motherboard", prev.Motherboard, cur.Motherboard)
@@ -1301,5 +1321,47 @@ func taskSubject(item TrackedScheduledTask) string {
 }
 
 func normalizeString(value string) string {
-	return strings.ToLower(strings.TrimSpace(value))
+	return strings.ToLower(strings.TrimSpace(stripCollectorControlChars(value)))
+}
+
+// mergeServiceReads keys the collected services for a snapshot. When a field
+// of a service was read unreliably (its raw value contained control
+// characters, #8904) and the previous snapshot has the same service, the
+// previous value is kept: the stripped read is still wrong, and recording it
+// would log a false change now and its reversal on the next clean read. With
+// no previous value there is nothing better, so the sanitised read is used.
+func mergeServiceReads(prev map[string]ServiceInfo, services []ServiceInfo) map[string]ServiceInfo {
+	out := make(map[string]ServiceInfo, len(services))
+	for _, svc := range services {
+		key := serviceKey(svc)
+		if svc.accountUnreliable || svc.startupTypeUnreliable {
+			if old, ok := prev[key]; ok {
+				slog.Warn("service read contained control characters, keeping previous value",
+					"service", svc.Name,
+					"accountUnreliable", svc.accountUnreliable,
+					"startupTypeUnreliable", svc.startupTypeUnreliable,
+					"readAccount", svc.Account,
+					"keptAccount", old.Account,
+					"readStartupType", svc.StartupType,
+					"keptStartupType", old.StartupType)
+				if svc.accountUnreliable {
+					svc.Account = old.Account
+				}
+				if svc.startupTypeUnreliable {
+					svc.StartupType = old.StartupType
+				}
+			} else {
+				slog.Warn("service read contained control characters and has no previous value, using sanitised read",
+					"service", svc.Name,
+					"accountUnreliable", svc.accountUnreliable,
+					"startupTypeUnreliable", svc.startupTypeUnreliable,
+					"readAccount", svc.Account,
+					"readStartupType", svc.StartupType)
+			}
+			svc.accountUnreliable = false
+			svc.startupTypeUnreliable = false
+		}
+		out[key] = svc
+	}
+	return out
 }

@@ -11,14 +11,17 @@
  */
 import type { AiTool } from './aiTools';
 import type { AuthContext } from '../middleware/auth';
+import { isFlowPrincipal } from '../middleware/principalKind';
 import type { ToolExecutionContext } from './toolExecutionContext';
 import { sanitizeThrownToolError } from './aiToolErrors';
 import { createArtifact } from './artifacts/artifactService';
+import { resolveWritableToolOrgId } from './aiToolWriteOrg';
 // W01's region accessor (env BREEZE_REGION). The only region source; this
 // wave writes no local region resolver of its own — reconciliation R1.
 import { breezeRegion } from '../config/env';
 import { emitRunProgress } from './aiAgents/runProgress';
 import { DATASET_ADAPTERS, EXPORT_DATASETS, type ExportDataset } from './aiToolsExportDatasets';
+import { SensitiveEventLogAccessError } from './eventLogSensitivity';
 import {
   buildExportStream, ExportCapError,
   EXPORT_DEFAULT_MAX_ROWS, EXPORT_HARD_MAX_ROWS, EXPORT_WALL_MS, EXPORT_DEFAULT_MAX_BYTES,
@@ -39,6 +42,13 @@ const CONTENT_TYPES: Record<ExportFormat, string> = {
 
 function isExportDataset(value: unknown): value is ExportDataset {
   return typeof value === 'string' && (EXPORT_DATASETS as readonly string[]).includes(value);
+}
+
+function refuseFlowExport(): string {
+  return JSON.stringify({
+    error: 'export_requires_run',
+    message: 'export_dataset writes an agent-run-owned artifact; a flow run cannot own one.',
+  });
 }
 
 export function registerExportTools(aiTools: Map<string, AiTool>): void {
@@ -80,8 +90,19 @@ export function registerExportTools(aiTools: Map<string, AiTool>): void {
           return JSON.stringify({ error: 'unknown_dataset', dataset: input.dataset });
         }
         dataset = input.dataset;
-        orgId = auth.orgId ?? auth.accessibleOrgIds?.[0] ?? null;
-        if (!orgId) return JSON.stringify({ error: 'No organization context available' });
+        // The artifact's OWNER org: never `accessibleOrgIds[0]`, an arbitrary
+        // org for a multi-org caller (#6667). A run's auth always carries its org.
+        // A read of org data: never answered from the device-page write
+        // default (#6675), which would silently scope the export to one org.
+        const resolvedOrg = resolveWritableToolOrgId(auth, undefined, { useWriteDefault: false });
+        if (!resolvedOrg.orgId) {
+          return JSON.stringify({ error: resolvedOrg.error ?? 'No organization context available' });
+        }
+        orgId = resolvedOrg.orgId;
+
+        // Tool catalog W04 (#5219): an artifact is owned by an AGENT run
+        // (ai_agent_runs); a flow run id is never substituted for one.
+        if (isFlowPrincipal(auth)) return refuseFlowExport();
 
         // Run IDENTITY comes from the PRINCIPAL, not from ToolExecutionContext
         // (reconciliation R4): `buildAgentAuthContext` puts the run id on
@@ -192,6 +213,12 @@ export function registerExportTools(aiTools: Map<string, AiTool>): void {
           return JSON.stringify({
             error: error.code,
             message: 'The export exceeded this run\'s artifact byte budget. Narrow the filters or the device set and try again.',
+          });
+        }
+        if (error instanceof SensitiveEventLogAccessError) {
+          return JSON.stringify({
+            error: 'sensitive_category_forbidden',
+            message: error.message,
           });
         }
         // sanitizeThrownToolError already logs the raw message/stack plus this

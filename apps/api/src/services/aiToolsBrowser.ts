@@ -20,38 +20,12 @@ import { publishEvent } from './eventBus';
 import { assertDeviceExecuteAllowed, TrustDeniedError } from './partnerTrust.commands';
 import { aiDispatchDeviceCommand } from './aiDispatch';
 import { deviceScopeCondition, resolveSiteAllowedDeviceIds } from './aiToolsSiteScope';
+// #6911: manage_browser_policy:create writes auth.user.id into browser_policies.created_by, a users FK; refused on an approver-release mismatch.
+import { approverReleaseMismatch } from './aiToolReleaseGuards';
+import { resolveWritableToolOrgId } from './aiToolWriteOrg';
 
 type AiToolTier = 1 | 2 | 3 | 4;
 
-function resolveWritableToolOrgId(
-  auth: AuthContext,
-  inputOrgId?: string
-): { orgId?: string; error?: string } {
-  if (auth.scope === 'organization') {
-    if (!auth.orgId) return { error: 'Organization context required' };
-    if (inputOrgId && inputOrgId !== auth.orgId) {
-      return { error: 'Cannot access another organization' };
-    }
-    return { orgId: auth.orgId };
-  }
-
-  if (inputOrgId) {
-    if (!auth.canAccessOrg(inputOrgId)) {
-      return { error: 'Access denied to this organization' };
-    }
-    return { orgId: inputOrgId };
-  }
-
-  if (auth.orgId) {
-    return { orgId: auth.orgId };
-  }
-
-  if (Array.isArray(auth.accessibleOrgIds) && auth.accessibleOrgIds.length === 1) {
-    return { orgId: auth.accessibleOrgIds[0] };
-  }
-
-  return { error: 'orgId is required for this operation' };
-}
 
 // A site-restricted caller may only mutate policies that target sites entirely
 // within their allowlist. Org/group/device/tag targets are not site-bounded, so
@@ -62,6 +36,10 @@ function resolveWritableToolOrgId(
 // single device, so such a caller can never confirm scope over one. Callers
 // with NEITHER restriction always pass. Mirrors the route-layer
 // browserSecurity.ts helper (AuthContext flavour).
+// Mirrors the `deviceIds` Zod cap (.max(1000)) on manage_browser_policy in
+// aiToolSchemas.ts; the implicit org-wide target set is held to the same bound.
+const MAX_BROWSER_POLICY_APPLY_DEVICES = 1000;
+
 export function policyWithinSiteWriteScope(
   auth: AuthContext,
   targetType: string,
@@ -219,6 +197,15 @@ export function registerBrowserTools(aiTools: Map<string, AiTool>): void {
       if (extDeviceCond) conditions.push(extDeviceCond);
 
       const siteScopeOrgId = auth.orgId ?? (typeof input.orgId === 'string' ? input.orgId : null);
+      // Fail closed: a site-restricted caller whose org never
+      // resolves must never fall through to an unfiltered query.
+      if ((auth.allowedSiteIds || auth.allowedDeviceIds) && !siteScopeOrgId) {
+        return JSON.stringify({
+          summary: { total: 0, low: 0, medium: 0, high: 0, critical: 0, sideloaded: 0 },
+          extensions: [],
+          violations: [],
+        });
+      }
       let siteAllowedDeviceIds: string[] | null = null;
       if ((auth.allowedSiteIds || auth.allowedDeviceIds) && siteScopeOrgId) {
         siteAllowedDeviceIds = await resolveSiteAllowedDeviceIds(siteScopeOrgId, auth);
@@ -350,7 +337,7 @@ export function registerBrowserTools(aiTools: Map<string, AiTool>): void {
         required: ['action']
       }
     },
-    handler: async (input, auth) => {
+    handler: async (input, auth, context) => {
       const action = input.action as 'list' | 'create' | 'update' | 'apply';
       const normalizeArray = (value: unknown): string[] => {
         if (!Array.isArray(value)) return [];
@@ -409,6 +396,10 @@ export function registerBrowserTools(aiTools: Map<string, AiTool>): void {
       }
 
       if (action === 'create') {
+        // #6911: user-owned on release — see approverReleaseMismatch.
+        if (approverReleaseMismatch(auth, context)) {
+          return JSON.stringify({ error: 'approver_auth_mismatch', action });
+        }
         const resolved = resolveWritableToolOrgId(auth, typeof input.orgId === 'string' ? input.orgId : undefined);
         if (resolved.error || !resolved.orgId) {
           return JSON.stringify({ error: resolved.error ?? 'orgId is required' });
@@ -519,6 +510,11 @@ export function registerBrowserTools(aiTools: Map<string, AiTool>): void {
       }
 
       if (action === 'apply') {
+        // #6911: user-owned on release — see approverReleaseMismatch. `apply`
+        // stamps `userId: auth.user.id` into the queued device command below.
+        if (approverReleaseMismatch(auth, context)) {
+          return JSON.stringify({ error: 'approver_auth_mismatch', action });
+        }
         const policyId = typeof input.policyId === 'string' ? input.policyId : '';
         if (!policyId) return JSON.stringify({ error: 'policyId is required for apply' });
 
@@ -562,6 +558,14 @@ export function registerBrowserTools(aiTools: Map<string, AiTool>): void {
 
         if (targetDevices.length === 0) {
           return JSON.stringify({ error: 'No target devices found' });
+        }
+
+        // Bound the RESOLVED set (implicit org-wide or explicit) before any
+        // trust check or dispatch; refuse rather than truncate.
+        if (targetDevices.length > MAX_BROWSER_POLICY_APPLY_DEVICES) {
+          return JSON.stringify({
+            error: `Policy resolves to ${targetDevices.length} devices, over the ${MAX_BROWSER_POLICY_APPLY_DEVICES}-device limit per apply call. Pass explicit deviceIds in batches of at most ${MAX_BROWSER_POLICY_APPLY_DEVICES}.`,
+          });
         }
 
         try {

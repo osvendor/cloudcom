@@ -18,16 +18,75 @@ import {
 } from '../db/schema';
 import { eq, and, desc, sql, gte, lte, inArray, SQL } from 'drizzle-orm';
 import type { AuthContext } from '../middleware/auth';
+import { isAutomationPrincipal } from '../middleware/principalKind';
 import type { AiTool } from './aiTools';
 import { schedulePolicySync } from '../jobs/dnsSyncJob';
+import { canMutateOrgWideGovernance } from './siteCeilingAccess';
 import {
   deviceScopeCondition,
   resolveSiteAllowedDeviceIds,
   runFrozenDeviceIds,
   SITE_SCOPE_EMPTY_NOTE
 } from './aiToolsSiteScope';
+import {
+  allowedTrafficCoverage,
+  allowedTrafficNote,
+  applyAllowedTrafficCoverage,
+  type DnsStatsSummary
+} from './dnsProviders/syncScope';
 
 type AiToolTier = 1 | 2 | 3 | 4;
+type DnsStatsAction = 'allowed' | 'blocked' | 'redirected' | undefined;
+
+/**
+ * #10054 — allowed DNS traffic is stored only for integrations that opted in,
+ * so the stats answer carries `allowedTraffic` (all | some | none), a plain
+ * note when the counts are partial or missing, and nulls instead of a
+ * misleading zero allowed count / ~100% blocked rate when nothing stores it.
+ */
+async function withAllowedTrafficCoverage<T extends DnsStatsSummary>(
+  auth: AuthContext,
+  integrationId: string | undefined,
+  action: DnsStatsAction,
+  summary: T
+) {
+  const conditions: SQL[] = [eq(dnsFilterIntegrations.isActive, true)];
+  const orgCondition = auth.orgCondition(dnsFilterIntegrations.orgId);
+  if (orgCondition) conditions.push(orgCondition);
+  if (integrationId) conditions.push(eq(dnsFilterIntegrations.id, integrationId));
+  const rows = await db
+    .select({ config: dnsFilterIntegrations.config })
+    .from(dnsFilterIntegrations)
+    .where(and(...conditions));
+  const allowedTraffic = allowedTrafficCoverage(rows.map((row) => row.config));
+  return {
+    summary: applyAllowedTrafficCoverage(summary, allowedTraffic, action),
+    allowedTraffic,
+    allowedTrafficNote: allowedTrafficNote(allowedTraffic)
+  };
+}
+
+/**
+ * #6911: `true` when the caller is an AI-agent principal, i.e. `auth.user.id`
+ * is an `aiAgents.id` (attribution only, never a `users` row), not a real
+ * user id. `manage_dns_policy`'s `add_block`/`add_allow` are Tier 2
+ * (auto-execute inline, no approval step — so no approver for
+ * `USER_OWNED_RELEASE_ACTIONS` to substitute) and write `auth.user.id` into
+ * `dns_policies.created_by` / the domain-list `addedBy` entries — an
+ * agent-mintable write via the `agentTier2` lane. Refuse before the write
+ * rather than let it fail as a 23503. Mirrors `aiToolsFleet.ts`'s
+ * `isAgentPrincipalCaller` (#6206).
+ */
+function isAgentPrincipalCaller(auth: AuthContext): boolean {
+  return isAutomationPrincipal(auth);
+}
+
+/** #6911: the refusal `manage_dns_policy` returns to an agent principal. */
+function refuseDnsAgentPrincipal(action: string): string {
+  return JSON.stringify({
+    error: `Action "${action}" requires a real user identity and cannot be performed by an AI agent.`,
+  });
+}
 
 function normalizeDnsDomain(domain: unknown): string | null {
   if (typeof domain !== 'string') return null;
@@ -304,11 +363,11 @@ export function registerDnsTools(aiTools: Map<string, AiTool>): void {
             : 0;
 
           return JSON.stringify({
-            summary: {
+            ...await withAllowedTrafficCoverage(auth, input.integrationId as string | undefined, input.action as DnsStatsAction, {
               ...summaryRow,
               blockedRate,
               timeRange: { start: start.toISOString(), end: end.toISOString() }
-            },
+            }),
             topBlockedDomains,
             topCategories,
             topDevices,
@@ -373,11 +432,11 @@ export function registerDnsTools(aiTools: Map<string, AiTool>): void {
         : 0;
 
       return JSON.stringify({
-        summary: {
+        ...await withAllowedTrafficCoverage(auth, input.integrationId as string | undefined, input.action as DnsStatsAction, {
           ...summaryRow,
           blockedRate,
           timeRange: { start: start.toISOString(), end: end.toISOString() }
-        },
+        }),
         topBlockedDomains,
         topCategories,
         topDevices,
@@ -419,12 +478,23 @@ export function registerDnsTools(aiTools: Map<string, AiTool>): void {
       // narrower than a site-restricted caller and has no per-row site check to
       // fall back on either — `runFrozenDeviceIds` is the axis the site flag
       // misses entirely for the device-less shape (#6086).
-      if ((auth.allowedSiteIds && auth.canAccessSite) || runFrozenDeviceIds(auth)) {
+      if (
+        !canMutateOrgWideGovernance(auth) ||
+        (auth.allowedSiteIds && auth.canAccessSite) ||
+        runFrozenDeviceIds(auth)
+      ) {
         return JSON.stringify({ error: 'DNS policy management requires full-organization access' });
       }
 
       const integrationId = input.integrationId as string;
       const action = input.action as 'add_block' | 'remove_block' | 'add_allow' | 'remove_allow';
+      // #6911: no approver to substitute at Tier 2 — refuse an agent
+      // principal before the write. See isAgentPrincipalCaller. Only
+      // add_block/add_allow write auth.user.id (createdBy on a newly
+      // created policy, addedBy per domain); the remove actions never do.
+      if ((action === 'add_block' || action === 'add_allow') && isAgentPrincipalCaller(auth)) {
+        return refuseDnsAgentPrincipal(action);
+      }
       const domainsInput = Array.isArray(input.domains) ? input.domains : [];
       const reason = typeof input.reason === 'string' ? input.reason : undefined;
 
@@ -529,6 +599,13 @@ export function registerDnsTools(aiTools: Map<string, AiTool>): void {
       const nowIso = new Date().toISOString();
 
       if (action === 'add_block' || action === 'add_allow') {
+        // #6911: already refused above (isAgentPrincipalCaller) before any
+        // domain was normalized — restated here so the guard covering THIS
+        // write (addedBy) is provable from this branch alone, not only from
+        // the earlier one covering the policy-row createdBy write.
+        if (isAgentPrincipalCaller(auth)) {
+          return refuseDnsAgentPrincipal(action);
+        }
         for (const domain of uniqueDomains) {
           if (domainMap.has(domain)) continue;
           domainMap.set(domain, {

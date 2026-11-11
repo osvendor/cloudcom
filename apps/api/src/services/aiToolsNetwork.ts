@@ -4,7 +4,7 @@
  * Tools for network change monitoring, baseline configuration, IP history, and discovery.
  * - get_network_changes (Tier 1): Query network change events
  * - acknowledge_network_device (Tier 2): Acknowledge a network change event
- * - configure_network_baseline (Tier 2): Create/update network baseline configuration
+ * - configure_network_baseline (Tier 3 supervised, W04): Create/update network baseline configuration
  * - get_ip_history (Tier 1): Query historical IP assignments
  * - network_discovery (Tier 3): Initiate a network discovery scan
  * - get_network_asset_reachability (Tier 1): Sourced, dated reachability for a discovered asset
@@ -13,6 +13,7 @@
 import { isIP } from 'node:net';
 import { z } from 'zod';
 import { maskOidShapedModel, nicVendorFromMac } from './assetIdentity';
+import { readPlacement, resolvePlacementAuthority } from './assetPlacement';
 import { db } from '../db';
 import {
   devices,
@@ -27,7 +28,29 @@ import { loadReachability } from './assetReachabilityLoader';
 import { deviceSiteDenied, siteScopeCondition, SITE_SCOPE_EMPTY_NOTE, deviceScopeCondition, filterToDeviceScope } from './aiToolsSiteScope';
 import { eq, and, desc, gte, inArray, lte, SQL } from 'drizzle-orm';
 import type { AuthContext } from '../middleware/auth';
+import { isAutomationPrincipal } from '../middleware/principalKind';
 import type { AiTool } from './aiTools';
+
+/**
+ * #6911: `true` when the caller is an AI-agent principal, i.e. `auth.user.id`
+ * is an `aiAgents.id` (attribution only, never a `users` row), not a real
+ * user id. `acknowledge_network_device` is Tier 2 (auto-execute inline, no
+ * approval step — so no approver for `USER_OWNED_RELEASE_ACTIONS` to
+ * substitute) and writes `auth.user.id` into
+ * `network_change_events.acknowledged_by` — an agent-mintable write via the
+ * `agentTier2` lane. Refuse before the write rather than let it fail as a
+ * 23503. Mirrors `aiToolsFleet.ts`'s `isAgentPrincipalCaller` (#6206).
+ */
+function isAgentPrincipalCaller(auth: AuthContext): boolean {
+  return isAutomationPrincipal(auth);
+}
+
+/** #6911: the refusal `acknowledge_network_device` returns to an agent principal. */
+function refuseNetworkAgentPrincipal(): string {
+  return JSON.stringify({
+    error: 'Action "acknowledge_network_device" requires a real user identity and cannot be performed by an AI agent.',
+  });
+}
 import {
   normalizeBaselineAlertSettings,
   normalizeBaselineScanSchedule,
@@ -38,6 +61,8 @@ import {
   type BaselineAuthorityEnvelope,
 } from './networkBaselineAuthority';
 import { aiExecuteCommand } from './aiDispatch';
+import { notParkedDeviceCondition } from './unassignedPool/selectorPredicate';
+import { inToolDbPhase } from './aiToolDbContext';
 
 type AiToolTier = 1 | 2 | 3 | 4;
 
@@ -58,6 +83,14 @@ function normalizeIpLiteral(value: string): string | null {
   return parsed === 6 ? withoutZone.toLowerCase() : withoutZone;
 }
 
+// network_discovery scanType -> the agent's scan methods. `full` is the
+// agent's own default set (agent/internal/discovery/scanner.go normalizeConfig).
+const DISCOVERY_SCAN_METHODS: Record<string, string[]> = {
+  ping: ['ping'],
+  arp: ['arp'],
+  full: ['arp', 'ping', 'port_scan', 'snmp'],
+};
+
 async function verifyDeviceAccess(
   deviceId: string,
   auth: AuthContext,
@@ -66,7 +99,7 @@ async function verifyDeviceAccess(
   if (auth.allowedDeviceIds && !auth.allowedDeviceIds.includes(deviceId)) {
     return { error: 'Device not found or access denied' };
   }
-  const conditions: SQL[] = [eq(devices.id, deviceId)];
+  const conditions: SQL[] = [eq(devices.id, deviceId), notParkedDeviceCondition()];
   const orgCond = auth.orgCondition(devices.orgId);
   if (orgCond) conditions.push(orgCond);
   const [device] = await db.select().from(devices).where(and(...conditions)).limit(1);
@@ -98,7 +131,7 @@ function siteAccessDenied(auth: AuthContext, siteId: string | null | undefined):
 // ============================================
 
 /**
- * SEC-2026-09-05-146 — same arming contract as the REST routes: an enabled
+ * Same arming contract as the REST routes: an enabled
  * recurring schedule created or changed through the AI/MCP tool is bound to the
  * calling principal's live authority. Returns null when the schedule is
  * disabled (nothing dispatches, so nothing needs an owner).
@@ -176,7 +209,7 @@ export function registerNetworkTools(aiTools: Map<string, AiTool>): void {
             description: 'Type: workstation, server, printer, router, switch, firewall, access_point, phone, iot, camera, nas, unknown, website, service',
           },
           linkedDeviceId: { type: 'string', description: 'Linked managed device UUID' },
-          limit: { type: 'number', description: 'Maximum rows (default 50, maximum 200)' },
+          limit: { type: 'number', description: 'Max rows (default 50, max 200)' },
         },
       },
     },
@@ -221,7 +254,7 @@ export function registerNetworkTools(aiTools: Map<string, AiTool>): void {
     deviceArgs: [],
     definition: {
       name: 'get_network_asset',
-      description: 'Get a discovered network asset by UUID with its model, IP, MAC, linked device and last-seen time.',
+      description: 'Get a discovered network asset by UUID with its model, IP, MAC, linked device, last-seen time and physical placement (room, rack, rack unit).',
       input_schema: {
         type: 'object', properties: { assetId: { type: 'string', description: 'Discovered asset UUID' } }, required: ['assetId'],
       },
@@ -241,7 +274,16 @@ export function registerNetworkTools(aiTools: Map<string, AiTool>): void {
         || (auth.scope === 'organization' && row.orgId !== auth.orgId)
         || (auth.scope === 'partner' && !(auth.accessibleOrgIds ?? []).includes(row.orgId))
         || deviceSiteDenied(auth, row.siteId, row.linkedDeviceId)) return jsonError('Asset not found');
-      return JSON.stringify({ asset: { ...row, model: maskOidShapedModel(row.model), nicVendor: nicVendorFromMac(row.macAddress) } });
+      // #8134: a linked asset's placement is its managed device's (the sole authority for that box).
+      const { authority, linked } = await resolvePlacementAuthority({ kind: 'discovered', id: row.id, orgId: row.orgId, siteId: row.siteId });
+      // Same rule as GET /discovery/assets/:id/placement: a linked device's
+      // placement is withheld when that device's site is outside the caller's.
+      const placementDenied = linked && deviceSiteDenied(auth, authority.siteId, authority.id);
+      return JSON.stringify({
+        asset: { ...row, model: maskOidShapedModel(row.model), nicVendor: nicVendorFromMac(row.macAddress) },
+        placement: placementDenied ? null : await readPlacement(authority.kind, authority.id, authority.orgId),
+        placementAuthority: { kind: authority.kind, id: authority.id, linked },
+      });
     },
   });
 
@@ -269,7 +311,7 @@ export function registerNetworkTools(aiTools: Map<string, AiTool>): void {
           },
           acknowledged: { type: 'boolean', description: 'Filter by acknowledgment status' },
           since: { type: 'string', description: 'Only include changes detected after this ISO timestamp' },
-          limit: { type: 'number', description: 'Max results (default: 50, max: 200)' }
+          limit: { type: 'number', description: 'Max results (default 50, max 200)' }
         }
       }
     },
@@ -362,6 +404,11 @@ export function registerNetworkTools(aiTools: Map<string, AiTool>): void {
       }
     },
     handler: async (input, auth) => {
+      // #6911: no approver to substitute at Tier 2 — refuse an agent
+      // principal before the write. See isAgentPrincipalCaller.
+      if (isAgentPrincipalCaller(auth)) {
+        return refuseNetworkAgentPrincipal();
+      }
       const eventId = input.event_id as string;
       const notes = typeof input.notes === 'string' ? input.notes : undefined;
 
@@ -421,11 +468,13 @@ export function registerNetworkTools(aiTools: Map<string, AiTool>): void {
   });
 
   // ============================================
-  // 3. configure_network_baseline - Tier 2 (mutating)
+  // 3. configure_network_baseline - Tier 3 supervised (arms recurring scans, W04-D7)
   // ============================================
 
   registerTool({
-    tier: 2,
+    // Full-control W04 (#6758, W04-D7): 2 → 3 supervised. Creating a baseline
+    // arms a recurring on-site discovery scan; aiGuardrails TIER3_SUPERVISED_TOOLS.
+    tier: 3,
     domain: 'network',
     searchHint: 'network baseline configuration, scheduled scan cadence and change alerts',
     definition: {
@@ -502,7 +551,7 @@ export function registerNetworkTools(aiTools: Map<string, AiTool>): void {
           ...(alertOverrides.rogueDevice !== undefined ? { rogueDevice: alertOverrides.rogueDevice } : {})
         });
 
-        // SEC-146: re-arm the authority envelope and bump the generation for the
+        // Re-arm the authority envelope and bump the generation for the
         // changed schedule. Also the re-approval path for a legacy row.
         let envelope: BaselineAuthorityEnvelope | null;
         try {
@@ -577,7 +626,7 @@ export function registerNetworkTools(aiTools: Map<string, AiTool>): void {
       // createCatalogItem in catalogService.ts). Suppressing the conflict at the
       // statement level keeps the transaction healthy; zero returned rows means
       // a baseline already exists for this org/site/subnet.
-      // SEC-146: bind the new recurring schedule to the calling principal.
+      // Bind the new recurring schedule to the calling principal.
       let createEnvelope: BaselineAuthorityEnvelope | null;
       try {
         createEnvelope = await armScheduleAuthority(auth, {
@@ -893,6 +942,9 @@ export function registerNetworkTools(aiTools: Map<string, AiTool>): void {
     deviceArgs: ['deviceId'],
     domain: 'network',
     searchHint: 'network discovery scan from a managed device to find nearby assets',
+    // The scan waits up to 120 s for the device, so it must not hold the
+    // per-call transaction across it (#7918; `AiTool.selfManagedDbContext`).
+    selfManagedDbContext: true,
     definition: {
       name: 'network_discovery',
       description: 'Initiate a network discovery scan from a device to find other devices on the network.',
@@ -903,18 +955,24 @@ export function registerNetworkTools(aiTools: Map<string, AiTool>): void {
           subnet: { type: 'string', description: 'CIDR subnet to scan (e.g., "192.168.1.0/24")' },
           scanType: { type: 'string', enum: ['ping', 'arp', 'full'], description: 'Type of scan (default: ping)' }
         },
-        required: ['deviceId']
+        required: ['deviceId', 'subnet']
       }
     },
     handler: async (input, auth) => {
       const deviceId = input.deviceId as string;
 
-      const access = await verifyDeviceAccess(deviceId, auth, true);
+      const access = await inToolDbPhase(auth, () => verifyDeviceAccess(deviceId, auth, true));
       if ('error' in access) return JSON.stringify({ error: access.error });
 
+      // The agent's handleNetworkDiscovery reads `subnets` and `methods`
+      // (agent/internal/heartbeat/handlers_network.go), the same shape the
+      // discovery-profile worker sends. A singular `subnet` / `scanType` left
+      // Subnets empty and every scan failed with "no valid subnets provided"
+      // (#8799).
+      const scanType = (input.scanType as string | undefined) ?? 'ping';
       const result = await aiExecuteCommand(auth, 'network_discovery', deviceId, 'network_discovery', {
-        subnet: input.subnet,
-        scanType: input.scanType ?? 'ping'
+        subnets: [input.subnet as string],
+        methods: DISCOVERY_SCAN_METHODS[scanType] ?? DISCOVERY_SCAN_METHODS.ping,
       }, { userId: auth.user.id, timeoutMs: 120000 });
 
       return JSON.stringify(result);

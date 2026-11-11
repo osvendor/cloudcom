@@ -13,9 +13,54 @@ import { and, desc, eq } from 'drizzle-orm';
 import { z } from 'zod';
 import { backupSnapshots } from '../db/schema/backup';
 import type { DrDb } from './bareMetalRecoveryService';
+// Pool-free leaf (imports only zod): this module must stay lazy on ../db.
+import { isAbsoluteRebuildPath, resolveSnapshotPlatform, type SnapshotPlatform } from './bareMetalRebuildSchemas';
+import { findCredentialShapedKeyPath } from './drStoredCredentialKeys';
 
 export const DR_STEP_BARE_METAL_REBUILD = 'BARE_METAL_REBUILD';
-export const DR_BARE_METAL_REBUILD_DEFAULT_OUTPUT_DIR = '/var/lib/breeze/rebuild/out';
+export const DR_BARE_METAL_REBUILD_DEFAULT_OUTPUT_DIR_LINUX = '/var/lib/breeze/rebuild/out';
+export const DR_BARE_METAL_REBUILD_DEFAULT_OUTPUT_DIR_WINDOWS = 'C:\\ProgramData\\Breeze\\rebuild\\out';
+/**
+ * The value a stored config carries when the operator left `outputDir` unset
+ * (configs are stored normalised, defaults applied). It stays the Linux
+ * default so every already-stored config keeps matching it; dispatch maps it
+ * to the rebuild host's own default through `defaultRebuildOutputDir` (W06d).
+ */
+export const DR_BARE_METAL_REBUILD_DEFAULT_OUTPUT_DIR = DR_BARE_METAL_REBUILD_DEFAULT_OUTPUT_DIR_LINUX;
+
+/** The rebuild host's default VHDX output directory, by `devices.osType`. */
+export function defaultRebuildOutputDir(osType: string): string {
+  return osType === 'windows' ? DR_BARE_METAL_REBUILD_DEFAULT_OUTPUT_DIR_WINDOWS : DR_BARE_METAL_REBUILD_DEFAULT_OUTPUT_DIR_LINUX;
+}
+
+/**
+ * Joins a file name onto an output dir with the dir's own separator: `\` for
+ * a drive-letter dir, `/` otherwise. Trailing separators are collapsed so the
+ * result never carries a doubled one.
+ */
+export function joinRebuildOutputPath(outputDir: string, file: string): string {
+  const sep = /^[A-Za-z]:\\/.test(outputDir) ? '\\' : '/';
+  const trimmed = sep === '\\' ? outputDir.replace(/\\+$/, '') : outputDir.replace(/\/+$/, '');
+  return `${trimmed}${sep}${file}`;
+}
+
+/**
+ * The step's default wait budget: how long a recovery may stay non-terminal
+ * before `drExecutionService` marks the device `timeout` and cancels it. It
+ * equals the reaper ceiling for the `bare_metal_rebuild` command itself
+ * (`WHOLE_MACHINE_RESTORE_TIMEOUT_MS`, 24 h), so by default the step never
+ * cancels a rebuild that its own command would still let run (#7087). The old
+ * 240 cancelled large rehearsals: a Windows whole-machine rebuild of 133k
+ * files / 20.6 GB took 5h23m in the lab. A stuck rebuild is caught earlier by
+ * the helper's own stall watchdog (#6664), not by this budget. A rebuild that
+ * keeps progressing is stopped by the helper's ceiling (22h50m, agent
+ * `backupipc.BareMetalRebuildRunBudget`). That ceiling is below the 24 h
+ * recovery token TTL, so the helper can still report its own failure.
+ *
+ * Configs are stored normalised, so plans saved before this change keep the
+ * `240` they stored until an operator edits the step.
+ */
+export const DR_BARE_METAL_REBUILD_DEFAULT_WAIT_TIMEOUT_MINUTES = 1440;
 
 export const drBareMetalRebuildConfigSchema = z.object({
   commandType: z.literal(DR_STEP_BARE_METAL_REBUILD),
@@ -26,9 +71,10 @@ export const drBareMetalRebuildConfigSchema = z.object({
     .string()
     .min(1)
     .max(1024)
-    .refine((p) => p.startsWith('/'), 'absolute path required')
+    .refine(isAbsoluteRebuildPath, 'absolute path required (POSIX or a Windows drive letter, no UNC)')
+    // Still the Linux value when unset; dispatch resolves it per host OS.
     .default(DR_BARE_METAL_REBUILD_DEFAULT_OUTPUT_DIR),
-  waitTimeoutMinutes: z.number().int().min(5).max(1440).default(240),
+  waitTimeoutMinutes: z.number().int().min(5).max(1440).default(DR_BARE_METAL_REBUILD_DEFAULT_WAIT_TIMEOUT_MINUTES),
 });
 export type DrBareMetalRebuildConfig = z.infer<typeof drBareMetalRebuildConfigSchema>;
 
@@ -48,10 +94,26 @@ export function isBareMetalRebuildConfig(restoreConfig: unknown): boolean {
  * strict schema and stored NORMALISED (defaults applied). A plain
  * `z.union([strict, record])` would let an invalid BARE_METAL_REBUILD config
  * fall through to the open record, so the discrimination is explicit.
+ *
+ * No step may store credential material — a storage destination
+ * (`providerConfig`), a password, a key, a bearer token — anywhere in the
+ * config: the plan is long-lived tenant data, and its payload is copied into
+ * every command the step queues. Storage destinations are resolved from the
+ * step's snapshot when the command is delivered instead.
  */
 export const drRestoreConfigSchema = z
   .record(z.string(), z.any())
   .transform((config, ctx): Record<string, unknown> => {
+    const credentialPath = findCredentialShapedKeyPath(config);
+    if (credentialPath) {
+      ctx.addIssue({
+        code: 'custom',
+        path: credentialPath,
+        message:
+          'Credentials cannot be stored in a DR plan. Storage destinations are resolved from the step snapshot when the step runs.',
+      });
+      return z.NEVER;
+    }
     if (!isBareMetalRebuildConfig(config)) return config;
     const parsed = drBareMetalRebuildConfigSchema.safeParse(config);
     if (parsed.success) return parsed.data;
@@ -87,4 +149,33 @@ export async function resolveLatestRestorableSnapshotId(
     .orderBy(desc(backupSnapshots.timestamp))
     .limit(1);
   return row?.id ?? null;
+}
+
+/**
+ * Same selection as `resolveLatestRestorableSnapshotId`, plus the snapshot's
+ * layout platform — for the one caller that needs it: the dispatcher's
+ * rebuild-host platform match (W06d). The authorization pass only needs
+ * existence and keeps the bare-id resolver, so its callers never change.
+ */
+export async function resolveLatestRestorableSnapshot(
+  orgId: string,
+  deviceId: string,
+  tx?: DrDb,
+): Promise<{ id: string; platform: SnapshotPlatform | null } | null> {
+  // Lazy for the same reason as resolveLatestRestorableSnapshotId.
+  const runner = tx ?? (await import('../db')).db;
+  const [row] = await runner
+    .select({ id: backupSnapshots.id, layoutManifest: backupSnapshots.layoutManifest })
+    .from(backupSnapshots)
+    .where(
+      and(
+        eq(backupSnapshots.orgId, orgId),
+        eq(backupSnapshots.deviceId, deviceId),
+        eq(backupSnapshots.bareMetalRestorable, true),
+      ),
+    )
+    .orderBy(desc(backupSnapshots.timestamp))
+    .limit(1);
+  if (!row) return null;
+  return { id: row.id, platform: resolveSnapshotPlatform(row.layoutManifest) };
 }

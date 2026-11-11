@@ -16,7 +16,15 @@ import (
 )
 
 // linuxRestorer applies Linux-specific system state during BMR.
-type linuxRestorer struct{}
+type linuxRestorer struct {
+	// warnings collects non-fatal notes from the last RestoreSystemState
+	// (e.g. package list entries skipped as invalid); applySystemState
+	// surfaces them in the recovery result (see restorerWarnings).
+	warnings []string
+}
+
+// Warnings returns the non-fatal notes recorded by RestoreSystemState.
+func (r *linuxRestorer) Warnings() []string { return r.warnings }
 
 func newRestorer() Restorer {
 	return &linuxRestorer{}
@@ -41,6 +49,7 @@ var etcTargetDir = "/etc"
 // system) is not an error — that's logged at info level and skipped.
 func (r *linuxRestorer) RestoreSystemState(stagingDir string) error {
 	slog.Info("bmr: restoring Linux system state", "stagingDir", stagingDir)
+	r.warnings = nil
 
 	var errs []error
 	if _, err := r.restoreEtcTree(stagingDir, etcTargetDir); err != nil {
@@ -162,8 +171,9 @@ func (r *linuxRestorer) restoreEtcTreeMode(stagingDir, targetEtc string, applyEx
 
 	if len(skipped) > 0 {
 		// Operator-visible: these paths are machine-identity/network config
-		// deliberately left untouched — see etcRestoreExcludes for why each
-		// one is excluded. Do not silently skip.
+		// or the source's own Breeze agent state, deliberately left
+		// untouched — see etcRestoreExcludes and isBreezeAgentEtcPath for
+		// why each one is excluded. Do not silently skip.
 		slog.Warn("bmr: skipped restoring machine-specific /etc paths",
 			"count", len(skipped), "paths", strings.Join(skipped, ", "))
 	}
@@ -352,6 +362,17 @@ func (r *linuxRestorer) reinstallPackages(stagingDir string) error {
 func (r *linuxRestorer) reinstallDpkg(listPath string) error {
 	slog.Info("bmr: reinstalling packages via dpkg", "list", listPath)
 
+	data, err := os.ReadFile(listPath)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", listPath, err)
+	}
+	if n := invalidDpkgSelectionLines(data); n > 0 {
+		msg := fmt.Sprintf("packages: dpkg selections not applied: %d invalid line(s) in the package selections list", n)
+		slog.Warn("bmr: " + msg)
+		r.warnings = append(r.warnings, msg)
+		return nil
+	}
+
 	out, err := runCommand(context.Background(), "bash", "-c",
 		fmt.Sprintf("dpkg --set-selections < %s", shellQuote(listPath)))
 	if err != nil {
@@ -375,19 +396,23 @@ func (r *linuxRestorer) reinstallDnf(listPath string) error {
 		return fmt.Errorf("read %s: %w", listPath, err)
 	}
 
-	packages := strings.Fields(strings.TrimSpace(string(data)))
-	if len(packages) == 0 {
-		slog.Info("bmr: rpm package list is empty, skipping package reinstall")
+	args, valid, skipped := dnfInstallArgs(data)
+	if skipped > 0 {
+		msg := fmt.Sprintf("packages: skipped %d invalid package name(s) in the package list", skipped)
+		slog.Warn("bmr: " + msg)
+		r.warnings = append(r.warnings, msg)
+	}
+	if valid == 0 {
+		slog.Info("bmr: rpm package list has no valid package names, skipping package reinstall")
 		return nil
 	}
 
-	args := append([]string{"install", "-y"}, packages...)
 	out, err := runCommand(context.Background(), "dnf", args...)
 	if err != nil {
 		return fmt.Errorf("dnf install: %s: %w", string(out), err)
 	}
 
-	slog.Info("bmr: dnf package restore complete", "packages", len(packages))
+	slog.Info("bmr: dnf package restore complete", "packages", valid)
 	return nil
 }
 
@@ -411,6 +436,26 @@ func (r *linuxRestorer) restoreServices(stagingDir, root string) error {
 	}
 
 	services := parseSystemdEnabledUnits(data)
+	if root == "" {
+		// Live restore: the source's own breeze-* units were deliberately
+		// not restored (isBreezeAgentEtcPath) — the recovery target runs its
+		// own helper and re-enrolls explicitly (#6436). Enabling them here
+		// would either re-enable the target's own agent units by name or
+		// fail on a unit that doesn't exist, so skip them, and say so.
+		var kept, skippedUnits []string
+		for _, svc := range services {
+			if isBreezeAgentUnit(svc) {
+				skippedUnits = append(skippedUnits, svc)
+				continue
+			}
+			kept = append(kept, svc)
+		}
+		if len(skippedUnits) > 0 {
+			slog.Info("bmr: not enabling the source's Breeze agent units on the recovery target",
+				"count", len(skippedUnits), "units", strings.Join(skippedUnits, ", "))
+		}
+		services = kept
+	}
 	if len(services) == 0 {
 		slog.Info("bmr: service list contained no enabled units, skipping service restore")
 		return nil

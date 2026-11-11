@@ -17,7 +17,9 @@ import {
 import { hashSupportCode } from '../services/quickSupportCode';
 import { hashEnrollmentKey, hashEnrollmentSecret } from '../services/enrollmentKeySecurity';
 import { getBinarySource, getGithubAgentUrl } from '../services/binarySource';
+import { isWindowsAgentSigned } from '../services/windowsAgentSigning';
 import { isS3Configured, getPresignedUrl, isS3NotFound } from '../services/s3Storage';
+import { binaryS3Key } from '../services/binaryStores';
 import { rateLimiter } from '../services/rate-limit';
 import { getRedis } from '../services/redis';
 import { getTrustedClientIp, rateLimitIpKey } from '../services/clientIp';
@@ -214,7 +216,10 @@ supportPublicRoutes.get('/check/:code', async (c) => {
       }
     : null;
 
-  return c.json({ valid: true, branding }, 200, CHECK_CACHE_HEADERS);
+  // `signed` follows the actual served bytes (see windowsAgentSigning.ts), not
+  // a filename-derived label — the page picks its Windows-prompt copy off
+  // this rather than unconditionally promising a named publisher (#7185).
+  return c.json({ valid: true, branding, signed: await isWindowsAgentSigned() }, 200, CHECK_CACHE_HEADERS);
 });
 
 /**
@@ -405,7 +410,7 @@ supportPublicRoutes.get('/download/:platform', async (c) => {
   // filename-preservation reason as the GitHub branch above.
   if (isS3Configured()) {
     try {
-      const url = await getPresignedUrl(`agent/${SUPPORT_AGENT_FILENAME}`);
+      const url = await getPresignedUrl(binaryS3Key('agent', SUPPORT_AGENT_FILENAME));
       const res = await proxyBinary(url, filename, 's3');
       if (res) return res;
     } catch (err) {

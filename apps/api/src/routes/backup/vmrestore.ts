@@ -13,6 +13,15 @@ import { recordBackupDispatchFailure } from '../../services/backupMetrics';
 import { queueCommandForExecution, CommandTypes } from '../../services/commandQueue';
 import { PERMISSIONS } from '../../services/permissions';
 import { startRebuildEngineVmRestore } from '../../services/vmRestoreRebuildEngine';
+import { getUserEpochs } from '../../services/authEpochs';
+import { isRestoreHelperUpdateRequiredError } from '../../services/backupRestoreGate';
+import {
+  checkRestoreIntegrityRequest,
+  gateRestoreCommand,
+  userCanStepUp,
+  recordRequestAuthorization,
+  restoreIntegrityResponse,
+} from './restoreIntegrityGate';
 import { resolveScopedOrgId } from './helpers';
 import {
   bmrVmRestoreSchema,
@@ -41,6 +50,8 @@ type VmRestoreDispatchOptions = {
   commandType: typeof CommandTypes.VM_RESTORE_FROM_BACKUP | typeof CommandTypes.VM_INSTANT_BOOT;
   commandPayload: Record<string, unknown>;
   userId?: string | null;
+  /** Reserved command id (a confirmed unattested restore's authorization is bound to it). */
+  commandId?: string;
 };
 
 type VmRestoreDispatchResult = {
@@ -50,10 +61,11 @@ type VmRestoreDispatchResult = {
 };
 
 function mapDispatchErrorStatus(error: string): number {
-  return error.startsWith('Device is ') ? 409 : 502;
+  return error.startsWith('Device is ') || isRestoreHelperUpdateRequiredError(error) ? 409 : 502;
 }
 
 function dispatchFailureReason(error: string): string {
+  if (isRestoreHelperUpdateRequiredError(error)) return 'helper_update_required';
   return error.startsWith('Device is ') ? 'device_offline' : 'enqueue_failed';
 }
 
@@ -66,20 +78,20 @@ async function markRestoreJobFailed(orgId: string, restoreJobId: string, error: 
         status: 'failed',
         completedAt: now,
         updatedAt: now,
-        targetConfig: sql`coalesce(${restoreJobs.targetConfig}, '{}'::jsonb) || jsonb_build_object('error', ${error})`,
+        targetConfig: sql`coalesce(${restoreJobs.targetConfig}, '{}'::jsonb) || jsonb_build_object('error', ${error}::text)`,
       })
       .where(eq(restoreJobs.id, restoreJobId));
   });
 }
 
 async function dispatchVmRestoreCommand(options: VmRestoreDispatchOptions): Promise<VmRestoreDispatchResult> {
-  const { restoreJobId, orgId, deviceId, commandType, commandPayload, userId } = options;
+  const { restoreJobId, orgId, deviceId, commandType, commandPayload, userId, commandId } = options;
   const { command, error } = await runInOrg(orgId, () =>
     queueCommandForExecution(
       deviceId,
       commandType,
       commandPayload,
-      { userId: userId ?? undefined },
+      { userId: userId ?? undefined, ...(commandId ? { commandId } : {}) },
     )
   );
 
@@ -113,9 +125,11 @@ async function dispatchVmRestoreCommand(options: VmRestoreDispatchOptions): Prom
 }
 
 // ── POST /backup/restore/as-vm — Trigger VM restore ────────────────
+// (mounted under backupRoutes' own '/backup' prefix in ./index.ts —
+// paths here must NOT repeat that prefix)
 
 vmRestoreRoutes.post(
-  '/backup/restore/as-vm',
+  '/restore/as-vm',
   requireScope('organization', 'partner', 'system'),
   requirePermission(PERMISSIONS.BACKUP_READ.resource, PERMISSIONS.BACKUP_READ.action),
   requirePermission(PERMISSIONS.DEVICES_EXECUTE.resource, PERMISSIONS.DEVICES_EXECUTE.action),
@@ -130,7 +144,8 @@ vmRestoreRoutes.post(
 
     const payload = c.req.valid('json');
 
-    // ── Rebuild engine (W05a): Linux whole-machine snapshot → VHDX on a Linux host ──
+    // ── Rebuild engine (W05a; W06d): whole-machine snapshot → VHDX on a rebuild
+    // host of the same platform, optionally a Hyper-V VM on a Windows host ──
     if (payload.engine === 'rebuild') {
       const authorization = await authorizeRouteResilienceResources(c, orgId, [
         { kind: 'snapshot', id: payload.snapshotId, role: 'source' },
@@ -138,6 +153,14 @@ vmRestoreRoutes.post(
       ], 'restore');
       if (!authorization.ok) return authorization.response;
 
+      // Read in the request context: the engine's org-scoped transaction
+      // below cannot see a partner-level technician's user row. The epochs
+      // are needed only to consume a grant, and the factor state only when
+      // there is no grant to consume (to tell enroll from step up). If a
+      // presented grant turns out to be invalid, the gate looks the factor
+      // state up itself and, if it cannot read it, asks for the step-up.
+      const userEpochs = auth.user?.id && payload.stepUpGrant ? await getUserEpochs(auth.user.id) : undefined;
+      const userMfaProtected = auth.user?.id && !payload.stepUpGrant ? await userCanStepUp(auth.user.id) : undefined;
       const result = await runInOrg(orgId, () =>
         startRebuildEngineVmRestore({
           orgId,
@@ -145,13 +168,46 @@ vmRestoreRoutes.post(
           rebuildHostDeviceId: payload.rebuildHostDeviceId,
           outputPath: payload.outputPath,
           ...(payload.imageSizeGb !== undefined ? { imageSizeGb: payload.imageSizeGb } : {}),
+          ...(payload.hyperv ? { hyperv: payload.hyperv } : {}),
           userId: auth.user?.id ?? null,
           requestUrl: c.req.url,
+          // Integrity: the rebuild recovers the snapshot's own device. A
+          // confirmed restore of a snapshot without a usable attestation is
+          // authorized for the recovery, in this same transaction.
+          integrity: async (snapshot) => {
+            const request = {
+              orgId,
+              snapshotDbId: snapshot.id,
+              targetDeviceId: snapshot.deviceId,
+              commandType: CommandTypes.BARE_METAL_REBUILD,
+              stepUpGrant: payload.stepUpGrant,
+              confirmUnattestedRestore: payload.confirmUnattestedRestore,
+              ...(userEpochs !== undefined ? { userEpochs } : {}),
+              ...(userMfaProtected !== undefined ? { userMfaProtected } : {}),
+              // The rebuild host runs the command.
+              executingDeviceId: payload.rebuildHostDeviceId,
+            };
+            const check = await checkRestoreIntegrityRequest(c, request);
+            if (!check.ok) return check;
+            if (!check.authorizationReason) return { ok: true };
+            const reason = check.authorizationReason;
+            const confirmationMethod = check.confirmationMethod;
+            return {
+              ok: true,
+              bindRecovery: (recoveryId: string) =>
+                recordRequestAuthorization(c, request, reason, { recoveryId }, { inCurrentTransaction: true, confirmationMethod }),
+            };
+          },
         })
       );
 
       if (!result.ok) {
-        return c.json({ error: result.error, ...(result.details ? { details: result.details } : {}) }, result.status);
+        if (result.body) return c.json(result.body, result.status);
+        return c.json({
+          error: result.error,
+          ...(result.message ? { message: result.message } : {}),
+          ...(result.details ? { details: result.details } : {}),
+        }, result.status);
       }
 
       writeRouteAudit(c, {
@@ -167,6 +223,7 @@ vmRestoreRoutes.post(
           commandId: result.commandId,
           outputPath: payload.outputPath,
           identity: 'new',
+          ...(payload.hyperv ? { hyperv: payload.hyperv } : {}),
         },
       });
 
@@ -214,6 +271,19 @@ vmRestoreRoutes.post(
       recordBackupDispatchFailure('manual_restore', 'device_offline');
       return c.json({ error: `Device is ${targetDevice.status}, cannot execute command` }, 409);
     }
+
+    // Integrity (routes/backup/restoreIntegrityGate.ts): decided before the
+    // restore job or command exists.
+    const integrity = await gateRestoreCommand(c, {
+      orgId,
+      snapshotDbId: snapshot.id,
+      targetDeviceId: payload.targetDeviceId,
+      commandType: CommandTypes.VM_RESTORE_FROM_BACKUP,
+      stepUpGrant: payload.stepUpGrant,
+      confirmUnattestedRestore: payload.confirmUnattestedRestore,
+      executingDeviceId: payload.targetDeviceId,
+    });
+    if (!integrity.ok) return restoreIntegrityResponse(c, integrity);
 
     // Create restore job.
     const [restoreJob] = await runInOrg(orgId, async () =>
@@ -264,6 +334,7 @@ vmRestoreRoutes.post(
         commandType: CommandTypes.VM_RESTORE_FROM_BACKUP,
         commandPayload,
         userId: auth.user?.id,
+        ...(integrity.commandId ? { commandId: integrity.commandId } : {}),
       });
 
       if (dispatchResult.error) {
@@ -278,7 +349,8 @@ vmRestoreRoutes.post(
         responseRow = dispatchResult.restoreJob;
       }
     } catch (err) {
-      const error = err instanceof Error ? err.message : 'Failed to dispatch restore command to agent';
+      // A fixed message: target_config is tenant-readable, the raw error goes to the log.
+      const error = 'Failed to dispatch restore command to agent';
       console.error('[BMR] Failed to dispatch VM restore command:', err);
       recordBackupDispatchFailure('manual_restore', 'enqueue_failed');
       await markRestoreJobFailed(orgId, restoreJob.id, error);
@@ -316,7 +388,7 @@ vmRestoreRoutes.post(
 // ── POST /backup/restore/instant-boot — Trigger instant boot VM ───────
 
 vmRestoreRoutes.post(
-  '/backup/restore/instant-boot',
+  '/restore/instant-boot',
   requireScope('organization', 'partner', 'system'),
   requirePermission(PERMISSIONS.BACKUP_READ.resource, PERMISSIONS.BACKUP_READ.action),
   requirePermission(PERMISSIONS.DEVICES_EXECUTE.resource, PERMISSIONS.DEVICES_EXECUTE.action),
@@ -370,6 +442,19 @@ vmRestoreRoutes.post(
       return c.json({ error: `Device is ${targetDevice.status}, cannot execute command` }, 409);
     }
 
+    // Integrity (routes/backup/restoreIntegrityGate.ts): decided before the
+    // restore job or command exists.
+    const integrity = await gateRestoreCommand(c, {
+      orgId,
+      snapshotDbId: snapshot.id,
+      targetDeviceId: payload.targetDeviceId,
+      commandType: CommandTypes.VM_INSTANT_BOOT,
+      stepUpGrant: payload.stepUpGrant,
+      confirmUnattestedRestore: payload.confirmUnattestedRestore,
+      executingDeviceId: payload.targetDeviceId,
+    });
+    if (!integrity.ok) return restoreIntegrityResponse(c, integrity);
+
     // Create restore job.
     const [restoreJob] = await runInOrg(orgId, async () =>
       db
@@ -417,6 +502,7 @@ vmRestoreRoutes.post(
         commandType: CommandTypes.VM_INSTANT_BOOT,
         commandPayload,
         userId: auth.user?.id,
+        ...(integrity.commandId ? { commandId: integrity.commandId } : {}),
       });
 
       if (dispatchResult.error) {
@@ -431,7 +517,8 @@ vmRestoreRoutes.post(
         responseRow = dispatchResult.restoreJob;
       }
     } catch (err) {
-      const error = err instanceof Error ? err.message : 'Failed to dispatch instant boot command to agent';
+      // A fixed message: target_config is tenant-readable, the raw error goes to the log.
+      const error = 'Failed to dispatch instant boot command to agent';
       console.error('[BMR] Failed to dispatch instant boot command:', err);
       recordBackupDispatchFailure('manual_restore', 'enqueue_failed');
       await markRestoreJobFailed(orgId, restoreJob.id, error);
@@ -467,7 +554,7 @@ vmRestoreRoutes.post(
 // ── GET /backup/restore/instant-boot/active — Active instant boots ─────────
 
 vmRestoreRoutes.get(
-  '/backup/restore/instant-boot/active',
+  '/restore/instant-boot/active',
   requirePermission(PERMISSIONS.BACKUP_READ.resource, PERMISSIONS.BACKUP_READ.action),
   async (c) => {
     const auth = c.get('auth');
@@ -546,7 +633,7 @@ vmRestoreRoutes.get(
 
 // ── GET /backup/restore/as-vm/estimate/:snapshotId — VM estimate ────
 
-vmRestoreRoutes.get('/backup/restore/as-vm/estimate/:snapshotId', requirePermission(PERMISSIONS.BACKUP_READ.resource, PERMISSIONS.BACKUP_READ.action), async (c) => {
+vmRestoreRoutes.get('/restore/as-vm/estimate/:snapshotId', requirePermission(PERMISSIONS.BACKUP_READ.resource, PERMISSIONS.BACKUP_READ.action), async (c) => {
   const auth = c.get('auth');
   const orgId = resolveScopedOrgId(auth, c.req.query('orgId'));
   if (!orgId) {

@@ -4,10 +4,14 @@ import { zValidator } from '../../lib/validation';
 import { eq, and, inArray } from 'drizzle-orm';
 import { db } from '../../db';
 import { backupJobs, backupSnapshots, devices, hypervVms } from '../../db/schema';
-import { requireMfa, requirePermission, requireScope } from '../../middleware/auth';
-import { executeCommand, CommandTypes } from '../../services/commandQueue';
+import { requireMfa, requirePermission, requireScope, withAuthDbAccessContext } from '../../middleware/auth';
+import { executeCommand, executeCommandWithSystemPrecheck, CommandTypes } from '../../services/commandQueue';
 import { writeRouteAudit } from '../../services/auditEvents';
 import { PERMISSIONS } from '../../services/permissions';
+import { dispatchTrackedDbRestore } from './dbRestoreJob';
+import { gateRestoreCommand, restoreIntegrityResponse } from './restoreIntegrityGate';
+import { isRestoreHelperUpdateRequiredError } from '../../services/backupRestoreGate';
+
 import { resolveScopedOrgId } from './helpers';
 import { resolveAllBackupAssignedDevices, resolveBackupConfigForDevice, effectiveBackupModes } from '../../services/featureConfigResolver';
 import { backupCommandResultSchema } from './resultSchemas';
@@ -20,7 +24,12 @@ import {
   resolveBackupWriteCommandDestination,
   resolveBackupProviderConfig,
   resolveBackupDestinationError,
+  type BackupWriteCommandDestination,
 } from '../../services/backupProviderConfig';
+import {
+  backupReadCredentialPayload,
+  backupWriteCredentialPayload,
+} from '../../services/backupCommandCredentials';
 import {
   hypervBackupSchema,
   hypervRestoreSchema,
@@ -33,6 +42,9 @@ import {
 } from './resilienceAuthorization';
 import { parseAgentJsonStdout } from '../../services/agentCommandStdout';
 import { applyBackupStartedAck, isBackupQueuedAck, isBackupStartedAck } from '../../services/backupProgress';
+import { normalizeStorageIdentity } from '../../jobs/backupRetention';
+import { isBackupHelperUpdateRequiredError } from '../../services/backupReadHelperGate';
+import { isBackupWriteHelperUpdateRequiredError } from '../../services/backupWriteHelperGate';
 
 const deviceIdParamSchema = z.object({
   deviceId: z.string().guid(),
@@ -280,6 +292,15 @@ hypervRoutes.post(
 
 // ── POST /hyperv/backup — Trigger VM backup (export) ────────────────
 
+// Registered in middleware/selfManagedDbContextRoutes.ts: this handler runs
+// with NO ambient request transaction. The backup job it creates must be
+// COMMITTED before the command is dispatched — the helper's storage access is
+// resolved when the command is delivered, on the delivery path's own
+// connection, and a helper that reports brokered writes is only given a write
+// session for a backup job that connection can see. Under the request
+// transaction the job was invisible there, so the helper was sent the storage
+// destination instead. The dispatch also waits on the device (up to 10 min)
+// and must not hold a pooled connection while it does (#1105).
 hypervRoutes.post(
   '/backup',
   requireScope('organization', 'partner', 'system'),
@@ -294,52 +315,72 @@ hypervRoutes.post(
     }
 
     const payload = c.req.valid('json');
-    const authorization = await authorizeRouteResilienceResources(c, orgId, [
-      { kind: 'device', id: payload.deviceId, role: 'source' },
-    ], 'verify');
-    if (!authorization.ok) return authorization.response;
 
-    const resolvedConfig = await resolveBackupConfigForDevice(payload.deviceId);
-    if (!resolvedConfig?.configId) {
-      return c.json({ error: 'A provider-backed backup configuration is required on this device' }, 400);
-    }
+    // Phase 1 — authorize, resolve the destination and create the job. This
+    // context commits when it returns, before anything is dispatched.
+    const phase1 = await withAuthDbAccessContext(auth, async (): Promise<
+      | { response: Response }
+      | { backupJob: { id: string }; configId: string; destination: BackupWriteCommandDestination }
+    > => {
+      const authorization = await authorizeRouteResilienceResources(c, orgId, [
+        { kind: 'device', id: payload.deviceId, role: 'source' },
+      ], 'verify');
+      if (!authorization.ok) return { response: authorization.response };
 
-    // D20b item A: the helper only builds a manager from the command payload
-    // when it has no agent.yaml backup config (mgr == nil — the normal state
-    // for every policy-managed device); without provider/providerConfig here
-    // the helper fails every on-demand hyperv_backup with "backup not
-    // configured on this device", even though a provider-backed config
-    // resolved just above. Same builder backupWorker.ts's
-    // prepareBackupDispatchTargets uses for a profile-scheduled run.
-    const destinationResult = await resolveBackupWriteCommandDestination(resolvedConfig.configId, orgId);
-    if (!destinationResult.ok) {
-      return c.json(
-        { error: destinationResult.message, reason: destinationResult.reason },
-        destinationResult.reason === 'encryption_unsupported' ? 422 : 400
-      );
-    }
-    const { destination } = destinationResult;
+      const resolvedConfig = await resolveBackupConfigForDevice(payload.deviceId);
+      if (!resolvedConfig?.configId) {
+        return { response: c.json({ error: 'A provider-backed backup configuration is required on this device' }, 400) };
+      }
 
-    const [backupJob] = await db
-      .insert(backupJobs)
-      .values({
-        orgId,
-        configId: resolvedConfig.configId,
-        featureLinkId: resolvedConfig.featureLinkId,
-        deviceId: payload.deviceId,
-        status: 'pending',
-        type: 'manual',
-        backupType: 'application',
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      })
-      .returning();
+      // D20b item A: the helper only builds a manager from the command payload
+      // when it has no agent.yaml backup config (mgr == nil — the normal state
+      // for every policy-managed device); without provider/providerConfig here
+      // the helper fails every on-demand hyperv_backup with "backup not
+      // configured on this device", even though a provider-backed config
+      // resolved just above. Same builder backupWorker.ts's
+      // prepareBackupDispatchTargets uses for a profile-scheduled run.
+      const destinationResult = await resolveBackupWriteCommandDestination(resolvedConfig.configId, orgId);
+      if (!destinationResult.ok) {
+        return {
+          response: c.json(
+            { error: destinationResult.message, reason: destinationResult.reason },
+            destinationResult.reason === 'encryption_unsupported' ? 422 : 400
+          ),
+        };
+      }
+      const { destination } = destinationResult;
 
-    if (!backupJob) {
-      return c.json({ error: 'Failed to create backup job' }, 500);
-    }
+      const [backupJob] = await db
+        .insert(backupJobs)
+        .values({
+          orgId,
+          configId: resolvedConfig.configId,
+          featureLinkId: resolvedConfig.featureLinkId,
+          deviceId: payload.deviceId,
+          status: 'pending',
+          type: 'manual',
+          backupType: 'application',
+          // Stamped at creation, as the backup worker does at dispatch: the snapshot
+          // persisted from this job copies it, and restores of that snapshot are
+          // only served through a storage session when it is present.
+          storageIdentity: normalizeStorageIdentity(destination.provider, destination.providerConfig),
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        })
+        .returning();
 
-    const result = await executeCommand(
+      if (!backupJob) {
+        return { response: c.json({ error: 'Failed to create backup job' }, 500) };
+      }
+      return { backupJob, configId: resolvedConfig.configId, destination };
+    });
+    if ('response' in phase1) return phase1.response;
+    const { backupJob, configId, destination } = phase1;
+
+    // Phase 2 — dispatch the now-committed job, holding no context. The
+    // precheck opens its own short one, so it is told which organization this
+    // request authorized the device under.
+    const result = await executeCommandWithSystemPrecheck(
       payload.deviceId,
       CommandTypes.HYPERV_BACKUP,
       {
@@ -348,16 +389,25 @@ hypervRoutes.post(
         // result — which arrives as a second, unsolicited command_result
         // frame after a queue-admission ack — back to this backup_jobs row.
         jobId: backupJob.id,
-        configId: resolvedConfig.configId,
-        provider: destination.provider,
-        providerConfig: destination.providerConfig,
-        storageEncryption: destination.storageEncryption,
+        configId,
+        // Provider + encryption plan + a reference: the destination itself is
+        // resolved when the command is delivered, never stored on the row.
+        ...backupWriteCredentialPayload(configId, orgId, destination),
         vmName: payload.vmName,
         consistencyType: payload.consistencyType,
       },
-      { userId: auth?.user?.id, timeoutMs: 600000 } // 10 min for large VMs
+      { userId: auth?.user?.id, timeoutMs: 600000, expectedOrgId: orgId } // 10 min for large VMs
     );
 
+    // Refused before a command row existed: the device's backup helper cannot
+    // write through a storage session. The job fails with the same message the
+    // operator sees, and the answer is a conflict the operator can act on.
+    if (result.status === 'failed' && isBackupWriteHelperUpdateRequiredError(result.error)) {
+      await withAuthDbAccessContext(auth, () => markBackupJobFailedIfInFlight(backupJob.id, result.error!));
+      return c.json({ error: result.error, reason: 'helper_update_required' }, 409);
+    }
+
+    // Phase 3 — record the reply, each write in a short context of its own.
     let snapshotDbId: string | null = null;
     let providerSnapshotId: string | null = null;
     let parsedData: unknown = null;
@@ -373,7 +423,8 @@ hypervRoutes.post(
       // (agentWs.ts processCommandResult / handleProviderBackedBackupResult).
       if (isBackupQueuedAck(parsedData) || isBackupStartedAck(parsedData)) {
         const queued = isBackupQueuedAck(parsedData);
-        await applyBackupStartedAck({ jobId: backupJob.id, deviceId: payload.deviceId, queued });
+        await withAuthDbAccessContext(auth, () =>
+          applyBackupStartedAck({ jobId: backupJob.id, deviceId: payload.deviceId, queued }));
         return c.json({
           data: { backupJobId: backupJob.id, status: 'running', queued },
         }, 202);
@@ -383,7 +434,7 @@ hypervRoutes.post(
       if (!parsedBackup.success) {
         throw new Error(describeZodIssues(parsedBackup.error));
       }
-      const persisted = await applyBackupCommandResultToJob({
+      const persisted = await withAuthDbAccessContext(auth, () => applyBackupCommandResultToJob({
         jobId: backupJob.id,
         orgId,
         deviceId: payload.deviceId,
@@ -396,14 +447,16 @@ hypervRoutes.post(
           ...parsedBackup.data,
           error: result.error,
         },
-      });
+        // The reply to the command this route dispatched to this device.
+        dispatchExpectationVerified: true,
+      }));
       snapshotDbId = persisted.snapshotDbId;
       providerSnapshotId = persisted.providerSnapshotId;
     } catch (error) {
-      await markBackupJobFailedIfInFlight(
+      await withAuthDbAccessContext(auth, () => markBackupJobFailedIfInFlight(
         backupJob.id,
         error instanceof Error ? error.message : 'Failed to persist Hyper-V backup result',
-      );
+      ));
       if (result.status === 'completed') {
         return c.json(
           { error: error instanceof Error ? error.message : 'Failed to persist Hyper-V backup result' },
@@ -440,6 +493,18 @@ hypervRoutes.post(
     });
   }
 );
+
+// Mirrors routes/backup/restore.ts and routes/backup/vmrestore.ts: a device
+// that is offline is a routine, expected dispatch outcome for a
+// reject-on-offline restore command, not an infra failure — surface it as
+// 409 so callers/monitoring can distinguish it from a genuine enqueue error.
+function mapDispatchErrorStatus(error: string): number {
+  // Both are states of the target device the operator can act on, not
+  // dispatch failures.
+  return error.startsWith('Device is ') || isBackupHelperUpdateRequiredError(error) || isRestoreHelperUpdateRequiredError(error)
+    ? 409
+    : 502;
+}
 
 // ── POST /hyperv/restore — Trigger VM restore (import) ──────────────
 
@@ -505,24 +570,54 @@ hypervRoutes.post(
       return c.json({ error: message, reason }, 422);
     }
 
-    const result = await executeCommand(
-      payload.deviceId,
-      CommandTypes.HYPERV_RESTORE,
-      {
+    // #6437: a real Hyper-V VM restore/import commonly runs well past 10
+    // minutes — the same shape of long-running restore that #6415/PR #6434
+    // gave a 24h ceiling to for whole-machine restores. `executeCommand`
+    // blocks the HTTP request on `waitForCommandResult(commandId, timeoutMs)`
+    // and terminalises the response as failed once `timeoutMs` elapses,
+    // independent of and much shorter than that ceiling — so a healthy
+    // restore was reported failed while the agent kept working. Dispatch
+    // async instead (the same D20 queued-ack + job-correlation pattern PR
+    // #5461 established for MSSQL_BACKUP/HYPERV_BACKUP): return as soon as
+    // the command is queued and let the stale command reaper own the
+    // deadline. The agent already reports its terminal result asynchronously
+    // over the command-result WS path — nothing on the agent side needs to
+    // change.
+    // #6974: track the restore in a restore_jobs row (linked by command id) so
+    // the terminal result is persisted by commandResultHandlers.hyperv_restore.
+    // Integrity (routes/backup/restoreIntegrityGate.ts): decided before the
+    // restore job or command exists.
+    const integrity = await gateRestoreCommand(c, {
+      orgId,
+      snapshotDbId: snapshot.id,
+      targetDeviceId: payload.deviceId,
+      commandType: CommandTypes.HYPERV_RESTORE,
+      stepUpGrant: payload.stepUpGrant,
+      confirmUnattestedRestore: payload.confirmUnattestedRestore,
+      executingDeviceId: payload.deviceId,
+    });
+    if (!integrity.ok) return restoreIntegrityResponse(c, integrity);
+
+    const queued = await dispatchTrackedDbRestore({
+      ...(integrity.commandId ? { commandId: integrity.commandId } : {}),
+      orgId,
+      snapshotId: snapshot.id,
+      deviceId: payload.deviceId,
+      userId: auth?.user?.id,
+      commandType: CommandTypes.HYPERV_RESTORE,
+      engine: 'hyperv',
+      targetConfig: { vmName: payload.vmName, generateNewId: payload.generateNewId },
+      buildPayload: (restoreJobId) => ({
+        restoreJobId,
         snapshotId: snapshot.providerSnapshotId,
         vmName: payload.vmName,
         generateNewId: payload.generateNewId,
-        provider: backupProviderConfig.provider,
-        providerConfig: backupProviderConfig.providerConfig,
-      },
-      { userId: auth?.user?.id, timeoutMs: 600000 }
-    );
+        ...backupReadCredentialPayload(snapshot.configId!, orgId, backupProviderConfig.provider),
+      }),
+    });
 
-    if (result.status === 'failed') {
-      return c.json(
-        { error: result.error || 'Hyper-V restore failed' },
-        500
-      );
+    if (!queued.ok) {
+      return c.json({ error: queued.error }, mapDispatchErrorStatus(queued.error) as any);
     }
 
     writeRouteAudit(c, {
@@ -533,15 +628,21 @@ hypervRoutes.post(
       details: {
         snapshotId: snapshot.id,
         vmName: payload.vmName,
+        commandId: queued.command.id,
+        restoreJobId: queued.restoreJobId,
       },
     });
 
-    try {
-      const data = result.stdout ? parseAgentJsonStdout(result.stdout) : null;
-      return c.json({ data });
-    } catch {
-      return c.json({ data: result.stdout });
-    }
+    return c.json({
+      data: {
+        commandId: queued.command.id,
+        restoreJobId: queued.restoreJobId,
+        status: queued.command.status,
+        deviceId: payload.deviceId,
+        snapshotId: snapshot.id,
+        vmName: payload.vmName,
+      },
+    }, 202);
   }
 );
 

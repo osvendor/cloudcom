@@ -12,7 +12,10 @@ vi.mock('../../lib/authScope', () => ({
   getJwtClaims: () => ({ scope: 'partner', orgId: null, partnerId: 'partner-1' }),
   useJwtClaims: () => ({ status: 'resolved' as const, claims: { scope: 'partner', orgId: null, partnerId: 'partner-1' } }),
 }));
-vi.mock('../../lib/permissions', () => ({
+// Partial mock: MfaPolicyOffBanner (mounted by PartnerSettingsPage) calls the
+// real hasPermission (#10295), so keep the module's other exports.
+vi.mock('../../lib/permissions', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../lib/permissions')>()),
   usePermissions: () => ({ can: () => true }),
 }));
 vi.mock('@/lib/navigation', () => ({ navigateTo: vi.fn() }));
@@ -28,7 +31,7 @@ const PARTNER_SHAPE = {
   createdAt: '2026-02-09T00:00:00.000Z', serviceManagementMode: 'native',
   currencyCode: 'USD', invoiceNumberPrefix: 'INV', invoiceTermsDays: 30,
   defaultMarkupPercent: null, autoTaxHardware: true, catalogAiStyle: null,
-  settings: { timezone: 'UTC', dateFormat: 'MM/DD/YYYY', timeFormat: '12h', language: 'en', businessHours: { preset: 'business' }, contact: {}, address: {} },
+  settings: { timezone: 'UTC', dateFormat: 'MM/DD/YYYY', timeFormat: '12h', language: 'en', contact: {}, address: {} },
 };
 
 const jsonResponse = (payload: unknown): Response =>
@@ -42,6 +45,7 @@ const fetchMock = vi.fn((...args: unknown[]) => {
 vi.mock('../../stores/auth', () => ({
   registerOrgIdProvider: vi.fn(),
   fetchWithAuth: (...args: unknown[]) => fetchMock(...args),
+  useAuthStore: (sel: (s: { user: { canManagePartnerWide?: boolean } }) => unknown) => sel({ user: { canManagePartnerWide: true } }),
 }));
 vi.mock('../../stores/orgStore', () => ({
   useOrgStore: Object.assign(
@@ -66,6 +70,11 @@ describe('W01 placement — every moved/mounted module renders from its new shel
 
   it('PartnerBillingSettingsPage mounts Defaults/Documents/Connections and the Connections tab reaches accounting/catalog/distributors links', async () => {
     render(<I18nextProvider i18n={i18n}><PartnerBillingSettingsPage /></I18nextProvider>);
+    // The tab row is the shared OverflowTabs component (#7148), which measures
+    // button widths via `offsetWidth` — jsdom always reports 0, collapsing
+    // every tab but the first behind "More" (see computeVisible in
+    // OverflowTabs.tsx) — so Connections is reached through it in tests.
+    await userEvent.click(await screen.findByTestId('billing-settings-tab-more'));
     await userEvent.click(await screen.findByTestId('billing-settings-tab-connections'));
     expect(await screen.findByTestId('billing-connections-accounting-link')).toBeInTheDocument();
     expect(screen.getByTestId('billing-connections-catalog-link')).toBeInTheDocument();
@@ -80,8 +89,8 @@ describe('W01 placement — every moved/mounted module renders from its new shel
 
   it('PartnerSettingsPage: Ticketing tab is a link, Modules is its own tab', async () => {
     render(<I18nextProvider i18n={i18n}><PartnerSettingsPage /></I18nextProvider>);
-    await userEvent.click(await screen.findByTestId('partner-settings-tab-ticketing'));
-    expect(await screen.findByTestId('partner-settings-ticketing-link')).toHaveAttribute('href', '/settings/ticketing');
+    // Ticketing is a rail link (#9787); the old `#ticketing` panel still renders for cached bookmarks.
+    expect(await screen.findByTestId('partner-settings-tab-ticketing')).toHaveAttribute('href', '/settings/ticketing');
     await userEvent.click(screen.getByTestId('partner-settings-tab-modules'));
     expect(await screen.findByTestId('partner-modules-card')).toBeInTheDocument();
   });

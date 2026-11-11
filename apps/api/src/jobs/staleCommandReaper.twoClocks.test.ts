@@ -76,7 +76,8 @@ vi.mock('../services/automationActionResults', () => ({
 }));
 
 import { PgDialect } from 'drizzle-orm/pg-core';
-import { reapStaleDeviceCommands } from './staleCommandReaper';
+import { fixOutcomes, scriptExecutions } from '../db/schema';
+import { propagateTimedOutDeviceCommand, reapStaleDeviceCommands } from './staleCommandReaper';
 
 /**
  * The mocked `deviceCommands` columns are plain strings, not Drizzle Column
@@ -180,6 +181,44 @@ describe('reapStaleDeviceCommands — two clocks (#5128)', () => {
     expect(setArg.result.error).toContain('never delivered');
   });
 
+  it('a row expired because its delivery was refused reports the refusal, not a reconnect deadline', async () => {
+    const deliverBy = new Date(NOW - 1000);
+    selectMock.mockReturnValue(selectChain([scriptRow({
+      type: 'backup_restore',
+      payload: { restoreJobId: 'rj-1' },
+      deliverBy,
+      result: { deliveryRefusal: 'the storage destination no longer resolves' },
+    })]));
+    const { command: update } = routeUpdates([{ id: 'c1' }]);
+
+    expect(await reapStaleDeviceCommands()).toBe(1);
+    const setArg = update.set.mock.calls[0]![0] as {
+      result: { status: string; reason: string; clock: string; error: string };
+    };
+    expect(setArg.result.status).toBe('timeout');
+    expect(setArg.result.clock).toBe('delivery');
+    expect(setArg.result.reason).toBe('delivery_refused');
+    expect(setArg.result.error).toContain('the storage destination no longer resolves');
+    expect(setArg.result.error).not.toContain('did not reconnect');
+  });
+
+  it('a legacy pending row whose delivery kept being deferred reports why it was never delivered', async () => {
+    selectMock.mockReturnValue(selectChain([scriptRow({
+      type: 'backup_restore',
+      payload: { restoreJobId: 'rj-1' },
+      deliverBy: null,
+      result: { deliveryDeferred: "the backup's file list was still being prepared" },
+    })]));
+    const { command: update } = routeUpdates([{ id: 'c1' }]);
+
+    expect(await reapStaleDeviceCommands()).toBe(1);
+    const setArg = update.set.mock.calls[0]![0] as { result: { status: string; reason?: string; error: string } };
+    expect(setArg.result.status).toBe('timeout');
+    expect(setArg.result.reason).toBe('delivery_deferred');
+    expect(setArg.result.error).toContain("the backup's file list was still being prepared");
+    expect(setArg.result.error).not.toContain('agent never received');
+  });
+
   it('a legacy pending row (deliver_by NULL) keeps the created_at + execution-timeout rule', async () => {
     selectMock.mockReturnValue(selectChain([scriptRow({ deliverBy: null })]));
     const { command: update } = routeUpdates([{ id: 'c1' }]);
@@ -215,6 +254,32 @@ describe('reapStaleDeviceCommands — two clocks (#5128)', () => {
     );
     expect(await reapStaleDeviceCommands()).toBe(0);
     expect(updateMock).not.toHaveBeenCalled();
+  });
+
+  // #9162: the agent takes the restore-point checkpoint on its own 5-minute
+  // budget before the script starts, so a stamped (enabled) block extends the
+  // execution deadline by that much. 60 s script, sent 8 min ago: past
+  // 60 s + 5 min grace, but inside 60 s + 5 min + 5 min.
+  it('a sent script with an enabled restore-point block gets the checkpoint budget on top', async () => {
+    const executedAt = new Date(NOW - 8 * 60 * 1000);
+    selectMock.mockReturnValue(selectChain([scriptRow({
+      status: 'sent',
+      executedAt,
+      payload: { timeoutSeconds: 60, restorePoint: { v: 1, enabled: true } },
+    })]));
+    expect(await reapStaleDeviceCommands()).toBe(0);
+    expect(updateMock).not.toHaveBeenCalled();
+  });
+
+  it('a sent script with a DISABLED restore-point block keeps the plain deadline', async () => {
+    const executedAt = new Date(NOW - 8 * 60 * 1000);
+    selectMock.mockReturnValue(selectChain([scriptRow({
+      status: 'sent',
+      executedAt,
+      payload: { timeoutSeconds: 60, restorePoint: { v: 1, enabled: false } },
+    })]));
+    routeUpdates([{ id: 'c1' }]);
+    expect(await reapStaleDeviceCommands()).toBe(1);
   });
 
   it('a sent row past its execution timeout is failed as timeout, not expired', async () => {
@@ -373,5 +438,42 @@ describe('reapStaleDeviceCommands — two clocks (#5128)', () => {
     selectMock.mockReturnValue(selectChain([scriptRow({ deliverBy: null })]));
     routeUpdates([{ id: 'c1' }]);
     expect(await reapStaleDeviceCommands()).toBe(1);
+  });
+});
+
+describe('propagateTimedOutDeviceCommand — fix outcomes learn which clock expired (AI Suggested Fixes I2)', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  /** Routes the script_executions CAS to a winner and captures the fix_outcomes write the inline hook makes. */
+  function routeForFixOutcome(): Array<Record<string, unknown>> {
+    const outcomeSets: Array<Record<string, unknown>> = [];
+    updateMock.mockImplementation((table: unknown) => {
+      if (table === scriptExecutions) return updateChain([{ id: 'exec-1' }]);
+      if (table === fixOutcomes) {
+        const chain = updateChain([{ id: 'o-1' }]);
+        chain.set = vi.fn((set: Record<string, unknown>) => { outcomeSets.push(set); return chain; });
+        return chain;
+      }
+      return updateChain([]);
+    });
+    return outcomeSets;
+  }
+
+  it('a delivery-clock expiry (kind=expired) records the attempt as inconclusive script_never_delivered', async () => {
+    const outcomeSets = routeForFixOutcome();
+    await propagateTimedOutDeviceCommand({
+      commandId: 'c1', payload: { executionId: 'exec-1' }, errorMsg: 'never delivered', completedAt: new Date(), kind: 'expired',
+    });
+    expect(outcomeSets).toHaveLength(1);
+    expect(outcomeSets[0]).toMatchObject({ state: 'inconclusive', stateReason: 'script_never_delivered' });
+  });
+
+  it('an execution-clock timeout (delivered, never answered) still counts as a failed attempt', async () => {
+    const outcomeSets = routeForFixOutcome();
+    await propagateTimedOutDeviceCommand({
+      commandId: 'c1', payload: { executionId: 'exec-1' }, errorMsg: 'no response', completedAt: new Date(), kind: 'timeout',
+    });
+    expect(outcomeSets).toHaveLength(1);
+    expect(outcomeSets[0]).toMatchObject({ state: 'failed', stateReason: 'script_failed' });
   });
 });

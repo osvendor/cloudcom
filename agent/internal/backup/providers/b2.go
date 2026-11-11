@@ -82,7 +82,7 @@ func (p *B2Provider) UploadContext(ctx context.Context, localPath, remotePath st
 	obj := bucket.Object(remotePath)
 	writer := obj.NewWriter(ctx)
 
-	if _, err := io.Copy(writer, file); err != nil {
+	if _, err := io.Copy(writer, uploadProgressSource(ctx, file)); err != nil {
 		_ = writer.Close()
 		return fmt.Errorf("failed to upload file to b2: %w", err)
 	}
@@ -94,6 +94,15 @@ func (p *B2Provider) UploadContext(ctx context.Context, localPath, remotePath st
 
 // Download retrieves a file from Backblaze B2.
 func (p *B2Provider) Download(remotePath, localPath string) error {
+	return p.DownloadContext(context.Background(), remotePath, localPath)
+}
+
+// DownloadContext retrieves a file from Backblaze B2. Cancelling ctx aborts
+// the in-progress read.
+func (p *B2Provider) DownloadContext(ctx context.Context, remotePath, localPath string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if remotePath == "" {
 		return errors.New("remote path is required")
 	}
@@ -115,7 +124,6 @@ func (p *B2Provider) Download(remotePath, localPath string) error {
 		"object", remotePath,
 	)
 
-	ctx := context.Background()
 	reader := bucket.Object(remotePath).NewReader(ctx)
 
 	file, err := os.Create(localPath)
@@ -124,7 +132,11 @@ func (p *B2Provider) Download(remotePath, localPath string) error {
 		return fmt.Errorf("failed to create local destination file: %w", err)
 	}
 
-	if _, err := io.Copy(file, reader); err != nil {
+	// Progress granularity caveat: blazer buffers ~10 MB chunks before Read
+	// returns, so below ~33 KB/s a chunk that IS progressing can report
+	// nothing for a whole 5 min stall window. Verify/test-restore only build
+	// S3 and Local providers today (cmd/breeze-backup/exec_backup.go).
+	if _, err := io.Copy(DownloadProgressWriter(ctx, file), reader); err != nil {
 		_ = file.Close()
 		_ = reader.Close()
 		return fmt.Errorf("failed to download file from b2: %w", err)
@@ -180,6 +192,9 @@ func (p *B2Provider) Delete(remotePath string) error {
 
 	ctx := context.Background()
 	if err := bucket.Object(remotePath).Delete(ctx); err != nil {
+		if b2IsNotFound(err) {
+			return nil // already gone: the delete's goal holds
+		}
 		return fmt.Errorf("failed to delete b2 object: %w", err)
 	}
 	return nil
@@ -212,4 +227,10 @@ func (p *B2Provider) getBucket() (*b2.Bucket, error) {
 		}
 	}
 	return nil, fmt.Errorf("b2 bucket %q not found", p.bucketName)
+}
+
+// b2IsNotFound reports whether err (as returned by the B2 client, unwrapped)
+// says the object does not exist.
+func b2IsNotFound(err error) bool {
+	return b2.IsNotExist(err)
 }

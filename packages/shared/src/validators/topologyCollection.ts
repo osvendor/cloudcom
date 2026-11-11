@@ -1,7 +1,7 @@
 import { z } from 'zod';
-import { collectionOutcomeSchema } from './topology';
+import { collectionOutcomeSchema, TOPOLOGY_INTERFACE_KINDS } from './topology';
 import { topologyCidrSchema, topologyDigestSchema, topologyFamilySchema, topologyIpSchema, topologyMacSchema, topologyPortSchema, topologyReasonSchema, topologySequenceSchema, topologyTimestampSchema, topologyUint32Schema, topologyUtf8KeySchema, topologyHostnameSchema, topologyWireGuard } from './topologyPrimitives';
-export { topologySequenceSchema, topologyCidrSchema } from './topologyPrimitives';
+export { topologySequenceSchema, topologyCidrSchema, topologyIpSchema } from './topologyPrimitives';
 export const NETWORK_CONTEXT_MAX_BYTES = 512 * 1024;
 const key = topologyUtf8KeySchema;
 const uint = topologyUint32Schema;
@@ -22,7 +22,7 @@ export const topologyAddressRowSchema = z.object({
 });
 export const topologyInterfaceRowSchema = z.object({
   rowKey: key, interfaceKey: key, osIndex: uint, name: key,
-  kind: z.enum(['ethernet', 'wifi', 'tunnel', 'bridge', 'cellular', 'virtual', 'other', 'unknown']),
+  kind: z.enum(TOPOLOGY_INTERFACE_KINDS),
   adminState: z.enum(['up', 'down', 'unknown']), operState: z.enum(['up', 'down', 'unknown']), mtu: uint.nullable(),
   addresses: z.array(topologyAddressRowSchema).max(1024), permanentMac: topologyMacSchema.optional(), currentMac: topologyMacSchema.optional(), parentInterfaceKey: key.optional(),
 });
@@ -62,16 +62,20 @@ export const topologyNeighborRowSchema = z.object({
   rowKey: key, address: topologyIpSchema, family, zone, interfaceKey: key, mac: topologyMacSchema.nullable(),
   state: z.enum(['reachable', 'stale', 'delay', 'probe', 'incomplete', 'failed', 'permanent', 'unknown']), isRouter: z.boolean().nullable(),
 }).superRefine(addressScope);
-function section<K extends string, S extends z.ZodType<{ rowKey: string }>>(kind: K, row: S, limit: number) {
+/** Shared Section<T> row/outcome rules (M1 collection, M2 adjacency and UniFi resources). */
+export function refineTopologySectionRows(v: { outcome: string; reasonCode?: string; rowCount: number; omittedRowCount?: number; rows: { rowKey: string }[] }, ctx: z.RefinementCtx) {
+  if (v.rowCount !== v.rows.length) ctx.addIssue({ code: 'custom', message: 'rowCount mismatch' });
+  if (new Set(v.rows.map(r => r.rowKey)).size !== v.rows.length) ctx.addIssue({ code: 'custom', message: 'Duplicate row key' });
+  if ((v.omittedRowCount ?? 0) > 0 && (v.outcome !== 'partial' || v.reasonCode !== 'limit_exceeded')) ctx.addIssue({ code: 'custom', message: 'Omitted rows require partial limit_exceeded' });
+  if (['failed', 'unsupported', 'not_attempted'].includes(v.outcome) && v.rows.length) ctx.addIssue({ code: 'custom', message: 'Outcome cannot contain positive rows' });
+}
+/** Section<T> factory: kind-tagged, context-scoped, outcome-bearing typed rows. */
+export function topologySection<K extends string, S extends z.ZodType<{ rowKey: string }>>(kind: K, row: S, limit: number) {
   return z.object({ kind: z.literal(kind), contextKey: key, addressFamily: family.optional(), contentDigest: topologyDigestSchema,
     outcome: collectionOutcomeSchema, reasonCode: topologyReasonSchema.optional(), rowCount: uint, omittedRowCount: uint.optional(), rows: z.array(row).max(limit),
-  }).superRefine((v, ctx) => {
-    if (v.rowCount !== v.rows.length) ctx.addIssue({ code: 'custom', message: 'rowCount mismatch' });
-    if (new Set(v.rows.map(r => r.rowKey)).size !== v.rows.length) ctx.addIssue({ code: 'custom', message: 'Duplicate row key' });
-    if ((v.omittedRowCount ?? 0) > 0 && (v.outcome !== 'partial' || v.reasonCode !== 'limit_exceeded')) ctx.addIssue({ code: 'custom', message: 'Omitted rows require partial limit_exceeded' });
-    if (['failed', 'unsupported', 'not_attempted'].includes(v.outcome) && v.rows.length) ctx.addIssue({ code: 'custom', message: 'Outcome cannot contain positive rows' });
-  });
+  }).superRefine(refineTopologySectionRows);
 }
+const section = topologySection;
 export const topologyContextSectionSchema = z.discriminatedUnion('kind', [
   section('interfaces', topologyInterfaceRowSchema, 128), section('routes', topologyRouteRowSchema, 2048), section('rules', topologyRuleRowSchema, 512),
   section('resolvers', topologyResolverRowSchema, 128), section('neighbors', topologyNeighborRowSchema, 4096),

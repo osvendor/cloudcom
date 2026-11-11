@@ -2,6 +2,7 @@ import { createHmac, timingSafeEqual } from 'crypto';
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie';
 import { Hono, type Context } from 'hono';
 import { z } from 'zod';
+import { getDomain } from 'tldts';
 import { zValidator } from '../../lib/validation';
 import {
   authMiddleware,
@@ -28,6 +29,7 @@ import {
 } from '../../services/ticketMailbox/consentSessionService';
 import {
   bindVerifiedTenant,
+  createGmailConnection,
   createPendingConnection,
   disableConnection,
   getMailboxConnection,
@@ -39,19 +41,27 @@ import {
   refreshErrorReason,
   restoreVerifiedConnection,
   setConnectedMailboxStatus,
+  updateGmailHandling,
+  updateTrustedArcSealers,
   type MailboxConnection,
 } from '../../services/ticketMailbox/connectionService';
+import {
+  HANDLED_LABEL_MAX_LENGTH,
+  isUsableHandledLabelName,
+} from '../../services/ticketMailbox/handledLabel';
 import {
   buildMicrosoftAuthorizationUrl,
   exchangeMicrosoftAuthorizationCode,
   hasMailboxConsentAdminRole,
   checkMailboxConsentAdminRoleViaGraph,
+  MicrosoftIdentityVerificationError,
   verifyMicrosoftAdminIdToken,
 } from '../../services/ticketMailbox/microsoftIdentity';
 import {
   getMailboxCallbackUri,
   getMailboxPlatformConfig,
 } from '../../services/ticketMailbox/mailboxToken';
+import { ERROR_CODES } from '@breeze/shared';
 
 const partnerScopes = requireScope('partner', 'system');
 const requireMailboxRead = requirePermission(
@@ -73,6 +83,11 @@ const connectBody = z.object({
   mailboxAddress: z.string().email(),
   displayName: z.string().max(120).optional(),
 });
+const gmailConnectBody = z.object({
+  orgId: z.string().uuid(),
+  mailboxAddress: z.string().email(),
+  displayName: z.string().max(120).optional(),
+});
 const callbackQuery = z.object({
   state: z.string().min(1),
   tenant: z.string().optional(),
@@ -82,8 +97,102 @@ const callbackQuery = z.object({
   error_description: z.string().optional(),
 });
 const idParam = z.object({ id: z.string().uuid() });
+// Per-mailbox Gmail "mark handled" (#7949). label null (or blank) = off.
+const gmailHandlingBody = z.object({
+  label: z.string().max(HANDLED_LABEL_MAX_LENGTH * 4).nullable(),
+  archive: z.boolean(),
+}).strict();
+
+// Trusted ARC sealers (#10862): lowercase domains as they appear in an ARC-Seal's d=.
+const ARC_SEALER_RE = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/;
+// Mail providers that seal every customer's mail with one shared d=: trusting one
+// would trust mail any of their customers can send, so it is never a gateway here.
+// Exchange's own seal (d=microsoft.com) sits on the same chain as the gateway's,
+// which makes it the easy wrong value to copy.
+const SHARED_PROVIDER_SEALERS = new Set([
+  'microsoft.com', 'outlook.com', 'office365.com', 'onmicrosoft.com',
+  'google.com', 'gmail.com', 'googlemail.com',
+]);
+const trustedArcSealersBody = z.object({
+  sealers: z.array(
+    z.string().max(253).regex(ARC_SEALER_RE).refine(
+      // getDomain is null for a public suffix or an IP: nobody's sealing domain, and
+      // a mistake here would mean trusting more than one operator.
+      (sealer) => getDomain(sealer, { allowPrivateDomains: true }) !== null,
+      'Must be a domain name',
+    ).refine(
+      (sealer) => !SHARED_PROVIDER_SEALERS.has(getDomain(sealer, { allowPrivateDomains: true }) ?? sealer),
+      'A mail provider\'s shared sealing domain cannot be a trusted gateway',
+    ),
+  ).max(10).refine((sealers) => new Set(sealers).size === sealers.length, 'Duplicate sealer'),
+}).strict();
 
 type CallbackQuery = z.infer<typeof callbackQuery>;
+
+/**
+ * Why a callback was turned away before any session work (#6936). A fixed enum:
+ * the settings card maps each code to a message, and nothing from the
+ * (untrusted) query string is ever reflected into the redirect.
+ *  - binding_mismatch: the HttpOnly browser-binding cookie is missing or does
+ *    not match the state. In practice the browser left on one host/scheme and
+ *    Microsoft sent it back to another (PUBLIC_APP_URL vs the URL the user
+ *    browsed), or third-party/strict cookie settings dropped it.
+ *  - invalid_callback: the query is malformed or mixes fields.
+ *  - expired: the state is unknown, already used, or past its TTL.
+ */
+export type CallbackRejectReason = 'binding_mismatch' | 'invalid_callback' | 'expired';
+
+function rejectCallback(c: Context, reason: CallbackRejectReason, phase?: CallbackPhase): Response {
+  // No DB write and no audit: the state is untrusted on every path that lands
+  // here, so it must not be allowed to mutate (or even look up) a connection.
+  // An abandoned row is surfaced by the list read instead (consentExpired).
+  // The stdout line is for self-hosters without Sentry (`docker logs`); the
+  // phase comes from the verified binding cookie, never from the query.
+  console.warn('[ticketMailbox] consent callback rejected', { reason, ...(phase ? { phase } : {}) });
+  return c.redirect(`/settings/ticketing?ticketMailbox=error&reason=${reason}#email`);
+}
+
+/**
+ * Sanitized stdout context for a consent-callback failure. `step` names where
+ * it failed; the other fields are allow-listed shapes only. Never tokens,
+ * codes, state, nonce, cookies, query tenant hints or raw Microsoft text.
+ */
+type CallbackFailureDiag = {
+  step:
+    | 'provider_error'
+    | 'platform_not_configured'
+    | 'connection_lookup'
+    | 'attempt_replaced'
+    | 'identity_session_setup'
+    | 'session_incomplete'
+    | 'admin_role_check'
+    | 'mailbox_probe'
+    | 'tenant_binding'
+    | 'identity_verification'
+    | 'unexpected_error';
+  providerError?: string;
+  aadsts?: string;
+  errorName?: string;
+};
+
+const PROVIDER_ERROR_CODE = /^[a-z_]{1,64}$/;
+const AADSTS_CODE = /\bAADSTS\d{4,7}\b/;
+const ERROR_CLASS_NAME = /^[A-Za-z]{1,64}$/;
+
+/** Microsoft's OAuth `error` code (strict pattern) plus the bare AADSTS number
+ * from `error_description`. The description text itself is never logged. */
+function providerErrorDiag(query: CallbackQuery): CallbackFailureDiag {
+  const aadsts = query.error_description?.match(AADSTS_CODE)?.[0];
+  return {
+    step: 'provider_error',
+    providerError: query.error && PROVIDER_ERROR_CODE.test(query.error) ? query.error : 'unrecognized',
+    ...(aadsts ? { aadsts } : {}),
+  };
+}
+
+function errorClassName(error: unknown): string {
+  return error instanceof Error && ERROR_CLASS_NAME.test(error.name) ? error.name : 'Error';
+}
 type CallbackIntent =
   | { kind: 'admin_success'; tenantHint: string }
   | { kind: 'identity_success'; code: string }
@@ -294,7 +403,13 @@ mailboxRoutes.get(
     const resolved = resolvePartnerId(c.get('auth'));
     if ('error' in resolved) return c.json({ error: resolved.error }, resolved.status);
     const list = await listMailboxConnections(resolved.partnerId);
-    return c.json({ connections: list });
+    // The Breeze Ticketing app's public client id, served at runtime so the
+    // card's Application Access Policy snippet works on prebuilt web images
+    // (#6935). Never the secret; null when the app is not configured.
+    // redirectUri: the exact value to register on the Entra app, from the same
+    // resolver the consent flow sends to Microsoft (#6936).
+    const appId = (await getMailboxPlatformConfig())?.clientId ?? null;
+    return c.json({ connections: list, appId, redirectUri: getMailboxCallbackUri() });
   },
 );
 
@@ -308,11 +423,11 @@ mailboxRoutes.post(
   async (c) => {
     const auth = c.get('auth');
     if (!canManagePartnerWidePolicies(auth)) {
-      return c.json({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE }, 403);
+      return c.json({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE, code: ERROR_CODES.ACCESS_DENIED }, 403);
     }
     const resolved = resolvePartnerId(auth);
     if ('error' in resolved) return c.json({ error: resolved.error }, resolved.status);
-    const platform = getMailboxPlatformConfig();
+    const platform = await getMailboxPlatformConfig();
     if (!platform) return c.json({ error: 'M365 ticket mailbox app is not configured' }, 400);
 
     const { mailboxAddress, displayName } = c.req.valid('json');
@@ -352,19 +467,73 @@ mailboxRoutes.post(
   },
 );
 
+// Gmail (Google Workspace) connect. Domain-wide delegation means there is no
+// OAuth redirect: the org's google_workspace_connections credential is verified
+// against the mailbox (a real read) and a CONNECTED gmail row is provisioned in
+// one call — the production path #6593 asked for.
+mailboxRoutes.post(
+  '/connect/gmail',
+  authMiddleware,
+  partnerScopes,
+  requireMailboxAdmin,
+  requireMfa(),
+  zValidator('json', gmailConnectBody),
+  async (c) => {
+    const auth = c.get('auth');
+    if (!canManagePartnerWidePolicies(auth)) {
+      return c.json({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE, code: ERROR_CODES.ACCESS_DENIED }, 403);
+    }
+    const resolved = resolvePartnerId(auth);
+    if ('error' in resolved) return c.json({ error: resolved.error }, resolved.status);
+
+    const { orgId, mailboxAddress, displayName } = c.req.valid('json');
+    const result = await createGmailConnection({
+      partnerId: resolved.partnerId,
+      orgId,
+      mailboxAddress,
+      displayName: displayName ?? null,
+      createdBy: auth.user.id,
+    });
+    if (!result.ok) {
+      const status = result.code === 'org_not_in_partner' ? 404
+        : result.code === 'no_google_connection' ? 400
+        : result.code === 'org_unavailable' ? 409
+        : result.code === 'connection_changed' ? 409
+        : 422;
+      return c.json({ error: result.error }, status);
+    }
+
+    writeRouteAudit(c, {
+      orgId,
+      action: 'ticket_mailbox.gmail_connected',
+      resourceType: 'ticket_mailbox_connection',
+      resourceId: result.id,
+      resourceName: mailboxAddress,
+      details: { provider: 'gmail' },
+    });
+    return c.json({ connectionId: result.id, status: 'connected' });
+  },
+);
+
 // Microsoft redirect target. The single-use DB session plus HttpOnly browser
 // binding authenticates this public callback; browser query tenant values are
 // never treated as verified ownership evidence.
-mailboxRoutes.get('/callback', zValidator('query', callbackQuery), async (c) => {
+//
+// Every exit before a session is consumed and verified redirects back to the
+// settings card via rejectCallback (no DB write) instead of a bare JSON 400 on
+// the API origin (#6936). The checks themselves, and their order, are unchanged.
+mailboxRoutes.get('/callback', zValidator('query', callbackQuery, (result, c) => {
+  if (!result.success) return rejectCallback(c, 'invalid_callback');
+}), async (c) => {
   const query = c.req.valid('query');
   const binding = readBrowserBinding(c, query.state);
-  if (!binding) return c.json({ error: 'OAuth state binding mismatch' }, 400);
+  if (!binding) return rejectCallback(c, 'binding_mismatch');
   const { phase } = binding;
   const intent = parseCallbackIntent(phase, query);
-  if (!intent) return c.json({ error: 'Invalid OAuth callback parameters' }, 400);
+  if (!intent) return rejectCallback(c, 'invalid_callback', phase);
 
   const session = await consumeConsentSession(query.state, phase);
-  if (!session) return c.json({ error: 'Invalid or expired OAuth state' }, 400);
+  if (!session) return rejectCallback(c, 'expired', phase);
   deleteCookie(c, STATE_COOKIE, { path: '/' });
 
   if (phase === 'identity_verification') {
@@ -374,14 +543,15 @@ mailboxRoutes.get('/callback', zValidator('query', callbackQuery), async (c) => 
       || !session.tenantHintHash
       || !constantTimeEqual(presentedHash, session.tenantHintHash)
     ) {
-      return c.json({ error: 'OAuth state binding mismatch' }, 400);
+      return rejectCallback(c, 'binding_mismatch', phase);
     }
   }
 
   let connection: MailboxConnection | null = null;
   const fail = async (
     outcome: 'invalid_identity' | 'insufficient_role' | 'probe_failed' | 'ownership_conflict' | 'stale_attempt',
-    redirect: 'error' | 'needs_policy' | 'stale' = 'error',
+    redirect: 'error' | 'needs_policy' | 'stale',
+    diag: CallbackFailureDiag,
     verifiedTenantId?: string,
     probeReason?: string,
   ): Promise<Response> => {
@@ -390,15 +560,25 @@ mailboxRoutes.get('/callback', zValidator('query', callbackQuery), async (c) => 
     } catch (error) {
       captureException(error instanceof Error ? error : new Error('Mailbox connection lookup failed'), c);
     }
+    let rowUpdated: boolean | 'error' = 'error';
     try {
-      const changed = await markCallbackFailed(session, probeReason);
-      if (!changed) {
+      rowUpdated = await markCallbackFailed(session, probeReason);
+      if (!rowUpdated) {
         outcome = 'stale_attempt';
         redirect = 'stale';
       }
     } catch (error) {
       captureException(error instanceof Error ? error : new Error('Mailbox status update failed'), c);
     }
+    // One stdout line per failed callback, so an operator without Sentry can
+    // see why from `docker logs` (grep -i ticketmailbox).
+    console.warn('[ticketMailbox] consent callback failed', {
+      connectionId: session.connectionId,
+      phase: session.phase,
+      outcome,
+      ...diag,
+      rowUpdated,
+    });
     writeCallbackAudit(
       c,
       session,
@@ -411,22 +591,22 @@ mailboxRoutes.get('/callback', zValidator('query', callbackQuery), async (c) => 
     return c.redirect(`/settings/ticketing?ticketMailbox=${redirect}#email`);
   };
 
-  if (intent.kind === 'provider_error') return fail('invalid_identity');
+  if (intent.kind === 'provider_error') return fail('invalid_identity', 'error', providerErrorDiag(query));
 
-  const platform = getMailboxPlatformConfig();
-  if (!platform) return fail('invalid_identity');
+  const platform = await getMailboxPlatformConfig();
+  if (!platform) return fail('invalid_identity', 'error', { step: 'platform_not_configured' });
 
   try {
     connection = await loadCallbackConnection(session);
   } catch (error) {
     captureException(error instanceof Error ? error : new Error('Mailbox connection lookup failed'), c);
-    return fail('invalid_identity');
+    return fail('invalid_identity', 'error', { step: 'connection_lookup' });
   }
   if (
     !connection
     || connection.consentAttemptId !== session.consentAttemptId
   ) {
-    return fail('stale_attempt', 'stale');
+    return fail('stale_attempt', 'stale', { step: 'attempt_replaced' });
   }
 
   if (intent.kind === 'admin_success') {
@@ -442,7 +622,7 @@ mailboxRoutes.get('/callback', zValidator('query', callbackQuery), async (c) => 
         !next.session.nonce
         || !setBindingCookie(c, next.session.phase, next.session.state, intent.tenantHint)
       ) {
-        return fail('invalid_identity');
+        return fail('invalid_identity', 'error', { step: 'identity_session_setup' });
       }
       return c.redirect(buildMicrosoftAuthorizationUrl({
         tenantHint: intent.tenantHint,
@@ -454,20 +634,22 @@ mailboxRoutes.get('/callback', zValidator('query', callbackQuery), async (c) => 
       }));
     } catch {
       captureException(new Error('Mailbox identity setup failed'), c);
-      return fail('invalid_identity');
+      return fail('invalid_identity', 'error', { step: 'identity_session_setup' });
     }
   }
 
   const tenantHint = binding.tenantHint;
   if (!tenantHint || !session.tenantHintHash || !session.nonce || !session.codeVerifier) {
-    return fail('invalid_identity');
+    return fail('invalid_identity', 'error', { step: 'session_incomplete' });
   }
 
   try {
     const exchanged = await exchangeMicrosoftAuthorizationCode({
       tenantHint,
       clientId: platform.clientId,
-      clientSecret: platform.clientSecret,
+      ...(platform.credentialVersion !== undefined
+        ? { credentialVersion: platform.credentialVersion }
+        : { clientSecret: platform.clientSecret }),
       redirectUri: getMailboxCallbackUri(),
       code: intent.code,
       codeVerifier: session.codeVerifier,
@@ -504,7 +686,7 @@ mailboxRoutes.get('/callback', zValidator('query', callbackQuery), async (c) => 
         if (graphCheck.reason !== 'no_accepted_role') {
           captureException(new Error(`Mailbox consent admin-role check failed via Graph: ${graphCheck.reason}`), c);
         }
-        return fail('insufficient_role');
+        return fail('insufficient_role', 'error', { step: 'admin_role_check' });
       }
     }
 
@@ -515,7 +697,53 @@ mailboxRoutes.get('/callback', zValidator('query', callbackQuery), async (c) => 
         reason: probe.reason,
       });
       captureException(new Error(`Mailbox probe failed during consent callback: ${probe.reason ?? 'unknown'}`), c);
-      return fail('probe_failed', 'needs_policy', claims.tid, probe.reason);
+      if (probe.kind === 'policy' || probe.kind === 'transient') {
+        // #7569: consent + admin identity were verified, only the app-only mailbox
+        // read failed (typically the Application Access Policy is not applied or
+        // has not propagated yet). Bind the verified tenant in `error` so the card
+        // shows the policy snippet + Re-test, instead of `reauth_required`, which
+        // hides that step and loops the admin through re-consent.
+        let bound = false;
+        try {
+          await callbackDb(() => bindVerifiedTenant(
+            session.connectionId,
+            session.partnerId,
+            session.consentAttemptId,
+            claims.tid,
+            { microsoftOid: claims.oid, breezeUserId: session.userId },
+            { status: 'error', lastError: failureMessage(probe.reason) },
+          ));
+          bound = true;
+        } catch (error) {
+          captureException(error instanceof Error ? error : new Error('Mailbox tenant binding failed'), c);
+          console.warn('[ticketMailbox] tenant bind failed after probe failure', {
+            connectionId: session.connectionId,
+            errorName: errorClassName(error),
+          });
+          if (isOwnershipConflict(error)) {
+            return fail('ownership_conflict', 'error', { step: 'tenant_binding' }, claims.tid);
+          }
+          // anything else: fall through to the re-consent failure path
+        }
+        if (bound) {
+          console.warn('[ticketMailbox] consent callback failed', {
+            connectionId: session.connectionId,
+            phase: session.phase,
+            outcome: 'probe_failed',
+            step: 'mailbox_probe',
+            probeKind: probe.kind,
+            rowUpdated: true,
+          });
+          writeCallbackAudit(
+            c,
+            session,
+            'ticket_mailbox.verification_failed',
+            auditDetails(session, connection, 'probe_failed', claims.tid, probe.reason),
+          );
+          return c.redirect('/settings/ticketing?ticketMailbox=needs_policy#email');
+        }
+      }
+      return fail('probe_failed', 'needs_policy', { step: 'mailbox_probe' }, claims.tid, probe.reason);
     }
 
     try {
@@ -528,7 +756,12 @@ mailboxRoutes.get('/callback', zValidator('query', callbackQuery), async (c) => 
       ));
     } catch (error) {
       captureException(error instanceof Error ? error : new Error('Mailbox tenant binding failed'), c);
-      return fail(isOwnershipConflict(error) ? 'ownership_conflict' : 'invalid_identity', 'error', claims.tid);
+      return fail(
+        isOwnershipConflict(error) ? 'ownership_conflict' : 'invalid_identity',
+        'error',
+        { step: 'tenant_binding' },
+        claims.tid,
+      );
     }
 
     writeCallbackAudit(
@@ -540,7 +773,15 @@ mailboxRoutes.get('/callback', zValidator('query', callbackQuery), async (c) => 
     return c.redirect('/settings/ticketing?ticketMailbox=connected#email');
   } catch (error) {
     captureException(error instanceof Error ? error : new Error('Mailbox identity verification failed'), c);
-    return fail('invalid_identity');
+    // A MicrosoftIdentityVerificationError already logged which check failed
+    // (microsoftIdentity.ts); anything else is unexpected, so name its class.
+    return fail(
+      'invalid_identity',
+      'error',
+      error instanceof MicrosoftIdentityVerificationError
+        ? { step: 'identity_verification' }
+        : { step: 'unexpected_error', errorName: errorClassName(error) },
+    );
   }
 });
 
@@ -554,15 +795,15 @@ mailboxRoutes.post(
   async (c) => {
     const auth = c.get('auth');
     if (!canManagePartnerWidePolicies(auth)) {
-      return c.json({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE }, 403);
+      return c.json({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE, code: ERROR_CODES.ACCESS_DENIED }, 403);
     }
     const resolved = resolvePartnerId(auth);
     if ('error' in resolved) return c.json({ error: resolved.error }, resolved.status);
     const { id } = c.req.valid('param');
     const connection = await getMailboxConnection(id, resolved.partnerId);
-    if (!connection) return c.json({ error: 'Connection not found' }, 404);
+    if (!connection) return c.json({ error: 'Connection not found', code: ERROR_CODES.NOT_FOUND }, 404);
     if (!['connected', 'error'].includes(connection.status) || !connection.tenantId) {
-      return c.json({ error: 'Mailbox re-consent required' }, 409);
+      return c.json({ error: 'Mailbox re-consent required', code: ERROR_CODES.MAILBOX_RECONSENT_REQUIRED }, 409);
     }
     const snapshot = {
       id: connection.id,
@@ -611,8 +852,83 @@ mailboxRoutes.post(
         probe.ok ? undefined : probe.reason,
       ),
     });
-    if (!changed) return c.json({ error: 'Mailbox connection changed during retest' }, 409);
+    if (!changed) return c.json({ error: 'Mailbox connection changed during retest', code: ERROR_CODES.CONFLICT }, 409);
     return c.json({ ok: probe.ok, ...(probe.ok ? {} : { error: failureMessage(probe.reason) }) });
+  },
+);
+
+// Edit a Gmail mailbox's "mark handled" setting: the user label added to mail
+// that became a ticket (null = off) and whether that mail is also archived.
+// Turning it on needs gmail.modify in the org's domain-wide delegation grant; the
+// settings card says so next to the field.
+mailboxRoutes.patch(
+  '/connections/:id/gmail-handling',
+  authMiddleware,
+  partnerScopes,
+  requireMailboxAdmin,
+  requireMfa(),
+  zValidator('param', idParam),
+  zValidator('json', gmailHandlingBody),
+  async (c) => {
+    const auth = c.get('auth');
+    if (!canManagePartnerWidePolicies(auth)) {
+      return c.json({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE }, 403);
+    }
+    const resolved = resolvePartnerId(auth);
+    if ('error' in resolved) return c.json({ error: resolved.error }, resolved.status);
+    const { id } = c.req.valid('param');
+    const body = c.req.valid('json');
+    const label = body.label?.trim() ? body.label.trim() : null;
+    if (label !== null && !isUsableHandledLabelName(label)) {
+      return c.json({
+        error: `Label must be 1 to ${HANDLED_LABEL_MAX_LENGTH} characters and not a Gmail system label (such as INBOX, TRASH or SPAM).`,
+      }, 400);
+    }
+    const updated = await updateGmailHandling(id, resolved.partnerId, { label, archive: body.archive });
+    if (!updated) return c.json({ error: 'Gmail mailbox connection not found' }, 404);
+    writeRouteAudit(c, {
+      orgId: updated.orgId,
+      action: 'ticket_mailbox.gmail_handling_updated',
+      resourceType: 'ticket_mailbox_connection',
+      resourceId: id,
+      resourceName: updated.mailboxAddress,
+      details: { provider: 'gmail', enabled: label !== null, archive: body.archive },
+    });
+    return c.json({ ok: true, gmailHandling: { label, archive: body.archive, error: null, errorAt: null } });
+  },
+);
+
+// Edit a Microsoft 365 mailbox's trusted ARC sealers (#10862). This decides whose
+// verdict lets external mail become a ticket, so it has the same gates as the
+// connection itself and is audited with the list it set.
+mailboxRoutes.patch(
+  '/connections/:id/trusted-arc-sealers',
+  authMiddleware,
+  partnerScopes,
+  requireMailboxAdmin,
+  requireMfa(),
+  zValidator('param', idParam),
+  zValidator('json', trustedArcSealersBody),
+  async (c) => {
+    const auth = c.get('auth');
+    if (!canManagePartnerWidePolicies(auth)) {
+      return c.json({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE }, 403);
+    }
+    const resolved = resolvePartnerId(auth);
+    if ('error' in resolved) return c.json({ error: resolved.error }, resolved.status);
+    const { id } = c.req.valid('param');
+    const { sealers } = c.req.valid('json');
+    const updated = await updateTrustedArcSealers(id, resolved.partnerId, sealers);
+    if (!updated) return c.json({ error: 'Microsoft 365 mailbox connection not found' }, 404);
+    writeRouteAudit(c, {
+      orgId: null,
+      action: 'ticket_mailbox.trusted_arc_sealers_updated',
+      resourceType: 'ticket_mailbox_connection',
+      resourceId: id,
+      resourceName: updated.mailboxAddress,
+      details: { provider: 'm365', sealers },
+    });
+    return c.json({ ok: true, trustedArcSealers: sealers });
   },
 );
 
@@ -626,13 +942,13 @@ mailboxRoutes.delete(
   async (c) => {
     const auth = c.get('auth');
     if (!canManagePartnerWidePolicies(auth)) {
-      return c.json({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE }, 403);
+      return c.json({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE, code: ERROR_CODES.ACCESS_DENIED }, 403);
     }
     const resolved = resolvePartnerId(auth);
     if ('error' in resolved) return c.json({ error: resolved.error }, resolved.status);
     const id = c.req.valid('param').id;
     const connection = await getMailboxConnection(id, resolved.partnerId);
-    if (!connection) return c.json({ error: 'Connection not found' }, 404);
+    if (!connection) return c.json({ error: 'Connection not found', code: ERROR_CODES.NOT_FOUND }, 404);
     await disableConnection(id, resolved.partnerId);
     writeRouteAudit(c, {
       orgId: null,

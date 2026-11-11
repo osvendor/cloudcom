@@ -1,5 +1,5 @@
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import { describe, expect, it, vi } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import '@/lib/i18n';
 
 import PatchList, { type Patch } from './PatchList';
@@ -90,6 +90,24 @@ describe('PatchList CVE chips', () => {
   });
 });
 
+describe('PatchList filter selects accessible name (#7156)', () => {
+  it('gives the severity and status filter selects a real accessible name', () => {
+    render(<PatchList patches={[]} />);
+
+    expect(screen.getByRole('combobox', { name: 'Severity' })).toBeInTheDocument();
+    expect(screen.getByRole('combobox', { name: 'Approval status' })).toBeInTheDocument();
+  });
+
+  it('gives the source and os "more filters" selects a real accessible name once expanded', () => {
+    render(<PatchList patches={[]} />);
+
+    fireEvent.click(screen.getByRole('button', { name: /more filters/i }));
+
+    expect(screen.getByRole('combobox', { name: 'Source' })).toBeInTheDocument();
+    expect(screen.getByRole('combobox', { name: 'Operating system' })).toBeInTheDocument();
+  });
+});
+
 describe('PatchList severity (#3758)', () => {
   it('renders an Unrated badge with a will-not-auto-approve note for a null-severity patch', () => {
     const patch = makePatch({
@@ -114,6 +132,42 @@ describe('PatchList severity (#3758)', () => {
     render(<PatchList patches={[patch]} />);
 
     expect(screen.queryByText(/will not auto-approve/i)).toBeNull();
+  });
+
+  // #9387: a severity the agent derived (Windows Update sent no MSRC rating)
+  // is labelled so nobody mistakes it for a vendor rating.
+  it('marks a derived severity as derived, with an explanation', () => {
+    const patch = makePatch({
+      id: 'dddddddd-dddd-dddd-dddd-dddddddddddd',
+      title: 'KB5127001',
+      severity: 'important',
+      severitySource: 'derived',
+    });
+
+    render(<PatchList patches={[patch]} />);
+
+    const markers = screen.getAllByTestId(`patch-row-${patch.id}-severity-derived`);
+    expect(markers.length).toBeGreaterThan(0);
+    expect(markers[0]).toHaveTextContent(/derived/i);
+    expect(markers[0]).toHaveAttribute('title', expect.stringMatching(/no rating/i));
+  });
+
+  it('does not mark a vendor-rated or provenance-less severity as derived', () => {
+    const vendor = makePatch({ id: 'aaaaaaaa-1111-1111-1111-111111111111', severity: 'critical', severitySource: 'vendor' });
+    const plain = makePatch({ id: 'bbbbbbbb-1111-1111-1111-111111111111', severity: 'critical' });
+
+    render(<PatchList patches={[vendor, plain]} />);
+
+    expect(screen.queryByTestId(`patch-row-${vendor.id}-severity-derived`)).toBeNull();
+    expect(screen.queryByTestId(`patch-row-${plain.id}-severity-derived`)).toBeNull();
+  });
+
+  it('never marks an unrated patch as derived', () => {
+    const patch = makePatch({ id: 'cccccccc-1111-1111-1111-111111111111', severity: 'unrated', severitySource: 'derived' });
+
+    render(<PatchList patches={[patch]} />);
+
+    expect(screen.queryByTestId(`patch-row-${patch.id}-severity-derived`)).toBeNull();
   });
 
   it('offers "Unrated" as a severity filter option', () => {
@@ -405,5 +459,286 @@ describe('PatchList bulk decline includes approved rows (#5585)', () => {
     }));
 
     expect(screen.queryByTestId('patch-bulk-decline')).toBeNull();
+  });
+});
+
+describe('PatchList install failure overlay (#4223)', () => {
+  const BATTERY = 'preflight check "battery" failed: running on battery power (battery: 76%)';
+
+  it('shows the failed install and its reason instead of "Pending"', () => {
+    const patch = makePatch({
+      id: 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
+      approvalStatus: 'pending',
+      installFailure: { deviceCount: 1, error: BATTERY, failedAt: '2026-08-29T18:00:00.000Z' },
+    });
+
+    render(<PatchList patches={[patch]} />);
+
+    const desktop = within(screen.getByTestId('responsive-table-desktop'));
+    const badge = desktop.getByTestId(`patch-row-${patch.id}-install-failed`);
+    expect(badge.textContent).toContain('Install failed');
+    expect(desktop.getByText(BATTERY)).toBeTruthy();
+    // The approval badge would claim "Pending" — provably wrong once an install ran.
+    expect(desktop.queryByText('Pending')).toBeNull();
+  });
+
+  it('counts failing devices when more than one failed', () => {
+    const patch = makePatch({
+      id: 'cccccccc-cccc-cccc-cccc-cccccccccccc',
+      approvalStatus: 'approved',
+      installFailure: { deviceCount: 3, error: 'disk space', failedAt: '2026-08-29T18:00:00.000Z' },
+    });
+
+    render(<PatchList patches={[patch]} />);
+
+    const desktop = within(screen.getByTestId('responsive-table-desktop'));
+    expect(desktop.getByTestId(`patch-row-${patch.id}-install-failed`).textContent).toContain('3 devices');
+    // A real approval state is still shown alongside the failure.
+    expect(desktop.getByText('Approved')).toBeTruthy();
+  });
+
+  it('renders the plain approval badge when there is no failure', () => {
+    const patch = makePatch({ id: 'dddddddd-dddd-dddd-dddd-dddddddddddd' });
+    render(<PatchList patches={[patch]} />);
+    const desktop = within(screen.getByTestId('responsive-table-desktop'));
+    expect(desktop.queryByTestId(`patch-row-${patch.id}-install-failed`)).toBeNull();
+    expect(desktop.getByText('Pending')).toBeTruthy();
+  });
+});
+
+// #7800: a patch with no release date (every APT patch) said nothing true in
+// the Release column — it used to show the catalog import date instead.
+describe('PatchList release column (#7800)', () => {
+  it('renders "Unknown" for a patch with no release date, on both surfaces', () => {
+    const patch = makePatch({ id: 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee', releaseDate: '' });
+    render(<PatchList patches={[patch]} />);
+
+    const desktop = within(screen.getByTestId('responsive-table-desktop'));
+    expect(desktop.getByTestId(`patch-row-${patch.id}-release`).textContent).toBe('Unknown');
+    const mobile = within(screen.getByTestId('responsive-table-cards'));
+    expect(mobile.getByTestId(`patch-row-${patch.id}-release`).textContent).toBe('Unknown');
+  });
+
+  it('renders the formatted date when the patch has one', () => {
+    const patch = makePatch({ id: 'ffffffff-ffff-ffff-ffff-ffffffffffff', releaseDate: '2026-02-07T12:00:00.000Z' });
+    render(<PatchList patches={[patch]} />);
+
+    const desktop = within(screen.getByTestId('responsive-table-desktop'));
+    expect(desktop.getByTestId(`patch-row-${patch.id}-release`).textContent)
+      .toBe(new Date('2026-02-07T12:00:00.000Z').toLocaleDateString());
+  });
+});
+
+// Date-only ISO strings parse as UTC midnight, so west-of-UTC zones rendered the
+// release date one calendar day early (2026-09-15 -> 9/14/2026).
+describe('PatchList release date is timezone-stable for date-only values', () => {
+  const originalTz = process.env.TZ;
+  beforeAll(() => { process.env.TZ = 'America/Los_Angeles'; });
+  afterAll(() => {
+    if (originalTz === undefined) delete process.env.TZ; else process.env.TZ = originalTz;
+  });
+
+  it('renders 2026-09-15 as that calendar date in a US timezone', () => {
+    expect(new Date('2026-09-15T12:00:00Z').getTimezoneOffset()).toBeGreaterThan(0);
+    const patch = makePatch({ id: '11111111-aaaa-aaaa-aaaa-111111111111', releaseDate: '2026-09-15' });
+    render(<PatchList patches={[patch]} />);
+
+    const desktop = within(screen.getByTestId('responsive-table-desktop'));
+    expect(desktop.getByTestId(`patch-row-${patch.id}-release`).textContent)
+      .toBe(new Date(2026, 8, 15).toLocaleDateString());
+  });
+});
+
+describe('PatchList outstanding devices column (#8728)', () => {
+  const PATCH_ID = '88888888-8888-4888-8888-888888888888';
+  const device = (n: number) => ({
+    deviceId: `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`,
+    hostname: `host-${n}`,
+    status: 'online',
+    lastCheckedAt: '2026-10-01T12:00:00.000Z',
+  });
+
+  it('has no Devices column when the page cannot load devices (ring view)', () => {
+    render(<PatchList patches={[makePatch({ id: PATCH_ID, outstandingDeviceCount: 3 })]} />);
+    const desktop = within(screen.getByTestId('responsive-table-desktop'));
+    expect(desktop.queryByText('Devices')).toBeNull();
+    expect(desktop.queryByTestId(`patch-row-${PATCH_ID}-devices`)).toBeNull();
+  });
+
+  it('shows the count as a badge, and zero as a muted dash with no button', () => {
+    const zeroId = '99999999-9999-4999-8999-999999999999';
+    render(
+      <PatchList
+        patches={[
+          makePatch({ id: PATCH_ID, title: 'Needed', outstandingDeviceCount: 3 }),
+          makePatch({ id: zeroId, title: 'Done', outstandingDeviceCount: 0 }),
+        ]}
+        loadPatchDevices={vi.fn()}
+      />
+    );
+    const desktop = within(screen.getByTestId('responsive-table-desktop'));
+    expect(desktop.getByText('Devices')).toBeTruthy();
+    expect(desktop.getByTestId(`patch-row-${PATCH_ID}-devices`).textContent).toBe('3 devices');
+    expect(desktop.queryByTestId(`patch-row-${zeroId}-devices`)).toBeNull();
+    expect(desktop.getByTestId(`patch-row-${zeroId}-devices-none`).textContent).toBe('—');
+  });
+
+  it('loads hostnames on demand when the count is clicked, and pages with Load more', async () => {
+    const loadPatchDevices = vi.fn()
+      .mockResolvedValueOnce({ devices: [device(1), device(2)], total: 3 })
+      .mockResolvedValueOnce({ devices: [device(3)], total: 3 });
+    render(
+      <PatchList
+        patches={[makePatch({ id: PATCH_ID, outstandingDeviceCount: 3 })]}
+        loadPatchDevices={loadPatchDevices}
+      />
+    );
+    expect(loadPatchDevices).not.toHaveBeenCalled();
+
+    const desktop = within(screen.getByTestId('responsive-table-desktop'));
+    fireEvent.click(desktop.getByTestId(`patch-row-${PATCH_ID}-devices`));
+
+    const popover = await screen.findByTestId('patch-devices-popover');
+    expect(loadPatchDevices).toHaveBeenCalledWith(PATCH_ID, 1);
+    await waitFor(() => expect(within(popover).getByText('host-1')).toBeTruthy());
+    expect(within(popover).getByText('host-2')).toBeTruthy();
+    expect(within(popover).getByRole('link', { name: 'host-1' }).getAttribute('href'))
+      .toBe(`/devices/${device(1).deviceId}#patches`);
+
+    fireEvent.click(within(popover).getByTestId('patch-devices-load-more'));
+    await waitFor(() => expect(within(popover).getByText('host-3')).toBeTruthy());
+    expect(loadPatchDevices).toHaveBeenLastCalledWith(PATCH_ID, 2);
+    expect(within(popover).queryByTestId('patch-devices-load-more')).toBeNull();
+  });
+
+  it('shows an error with a retry when loading fails', async () => {
+    const loadPatchDevices = vi.fn()
+      .mockRejectedValueOnce(new Error('boom'))
+      .mockResolvedValueOnce({ devices: [device(1)], total: 1 });
+    render(
+      <PatchList
+        patches={[makePatch({ id: PATCH_ID, outstandingDeviceCount: 1 })]}
+        loadPatchDevices={loadPatchDevices}
+      />
+    );
+    fireEvent.click(within(screen.getByTestId('responsive-table-desktop')).getByTestId(`patch-row-${PATCH_ID}-devices`));
+
+    const popover = await screen.findByTestId('patch-devices-popover');
+    const retry = await within(popover).findByTestId('patch-devices-retry');
+    fireEvent.click(retry);
+    await waitFor(() => expect(within(popover).getByText('host-1')).toBeTruthy());
+  });
+
+  it('retries page 1, not the next page, after a reopen whose first load fails', async () => {
+    const loadPatchDevices = vi.fn()
+      .mockResolvedValueOnce({ devices: [device(1)], total: 3 })
+      .mockResolvedValueOnce({ devices: [device(2)], total: 3 })
+      .mockRejectedValueOnce(new Error('boom'))
+      .mockResolvedValueOnce({ devices: [device(1)], total: 3 });
+    render(
+      <PatchList
+        patches={[makePatch({ id: PATCH_ID, outstandingDeviceCount: 3 })]}
+        loadPatchDevices={loadPatchDevices}
+      />
+    );
+    const trigger = within(screen.getByTestId('responsive-table-desktop')).getByTestId(`patch-row-${PATCH_ID}-devices`);
+
+    fireEvent.click(trigger);
+    let popover = await screen.findByTestId('patch-devices-popover');
+    await waitFor(() => expect(within(popover).getByText('host-1')).toBeTruthy());
+    fireEvent.click(within(popover).getByTestId('patch-devices-load-more'));
+    await waitFor(() => expect(within(popover).getByText('host-2')).toBeTruthy());
+
+    fireEvent.click(trigger); // close
+    await waitFor(() => expect(screen.queryByTestId('patch-devices-popover')).toBeNull());
+    fireEvent.click(trigger); // reopen: page-1 load rejects
+    popover = await screen.findByTestId('patch-devices-popover');
+    fireEvent.click(await within(popover).findByTestId('patch-devices-retry'));
+
+    await waitFor(() => expect(loadPatchDevices).toHaveBeenCalledTimes(4));
+    expect(loadPatchDevices.mock.calls.map((call) => call[1])).toEqual([1, 2, 1, 1]);
+    await waitFor(() => expect(within(popover).getByText('host-1')).toBeTruthy());
+    expect(within(popover).queryByText('host-2')).toBeNull();
+  });
+
+  it('ignores a response that lands after the popover was closed and reopened', async () => {
+    let resolveStale: (value: { devices: ReturnType<typeof device>[]; total: number }) => void = () => {};
+    const loadPatchDevices = vi.fn()
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveStale = resolve; }))
+      .mockResolvedValueOnce({ devices: [device(2)], total: 1 });
+    render(
+      <PatchList
+        patches={[makePatch({ id: PATCH_ID, outstandingDeviceCount: 1 })]}
+        loadPatchDevices={loadPatchDevices}
+      />
+    );
+    const trigger = within(screen.getByTestId('responsive-table-desktop')).getByTestId(`patch-row-${PATCH_ID}-devices`);
+
+    fireEvent.click(trigger); // open: first load hangs
+    fireEvent.click(trigger); // close
+    fireEvent.click(trigger); // reopen: second load resolves
+    const popover = await screen.findByTestId('patch-devices-popover');
+    await waitFor(() => expect(within(popover).getByText('host-2')).toBeTruthy());
+
+    resolveStale({ devices: [device(9)], total: 1 });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(within(popover).queryByText('host-9')).toBeNull();
+    expect(within(popover).getByText('host-2')).toBeTruthy();
+  });
+
+  // #9298 follow-up: device status labels come from devices.json
+  // (deviceList.statuses.full), the same wording as the device list.
+  it('labels device status with the device list wording', async () => {
+    render(
+      <PatchList
+        patches={[makePatch({ id: PATCH_ID, outstandingDeviceCount: 3 })]}
+        loadPatchDevices={vi.fn().mockResolvedValue({
+          devices: [device(1), { ...device(2), status: 'decommissioned' }, { ...device(3), status: 'not-a-status' }],
+          total: 3,
+        })}
+      />
+    );
+    fireEvent.click(within(screen.getByTestId('responsive-table-desktop')).getByTestId(`patch-row-${PATCH_ID}-devices`));
+    const popover = await screen.findByTestId('patch-devices-popover');
+    await waitFor(() => expect(within(popover).getByText('host-2')).toBeTruthy());
+    expect(within(popover).getByText('Online')).toBeTruthy();
+    expect(within(popover).getByText('Removed')).toBeTruthy();
+    // An unrecognised status gets the device list's "Unknown", never the raw value.
+    expect(within(popover).getByText('Unknown')).toBeTruthy();
+    expect(within(popover).queryByText('not-a-status')).toBeNull();
+  });
+
+  it('closes on Escape', async () => {
+    render(
+      <PatchList
+        patches={[makePatch({ id: PATCH_ID, outstandingDeviceCount: 1 })]}
+        loadPatchDevices={vi.fn().mockResolvedValue({ devices: [device(1)], total: 1 })}
+      />
+    );
+    fireEvent.click(within(screen.getByTestId('responsive-table-desktop')).getByTestId(`patch-row-${PATCH_ID}-devices`));
+    const popover = await screen.findByTestId('patch-devices-popover');
+    fireEvent.keyDown(popover, { key: 'Escape' });
+    await waitFor(() => expect(screen.queryByTestId('patch-devices-popover')).toBeNull());
+  });
+});
+
+// #9533: two catalog entries can share a title (e.g. one update id per OS
+// build). They looked like the same patch listed twice with identical Review
+// buttons; each row now says what tells it apart.
+describe('PatchList same-title rows (#9533)', () => {
+  it('shows version and catalog id on rows whose title repeats, and only on those', () => {
+    render(
+      <PatchList
+        patches={[
+          makePatch({ id: 'a', title: '2026-10 Cumulative Update', externalId: 'kb-a-guid', version: '26100.1' }),
+          makePatch({ id: 'b', title: '2026-10 cumulative update ', externalId: 'kb-b-guid', version: null }),
+          makePatch({ id: 'c', title: 'Google Chrome', externalId: 'Google.Chrome', version: '141.0' }),
+        ]}
+      />,
+    );
+    const desktop = within(screen.getByTestId('responsive-table-desktop'));
+    expect(desktop.getByTestId('patch-row-a-disambiguator')).toHaveTextContent('Package version 26100.1 · Catalog ID kb-a-guid');
+    expect(desktop.getByTestId('patch-row-b-disambiguator')).toHaveTextContent('Catalog ID kb-b-guid');
+    expect(desktop.queryByTestId('patch-row-c-disambiguator')).toBeNull();
   });
 });

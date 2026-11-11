@@ -90,3 +90,48 @@ describe('HelpPanel collapsed-shell interactivity', () => {
     expect(shell.className).not.toContain('pointer-events-none');
   });
 });
+
+// #7150: the panel is always mounted, sliding off-screen via translate-x-full
+// when closed. Its shadow-2xl stayed on even off-screen, and once its left
+// edge sat exactly on the viewport's right edge the blur spilled back into
+// view as a grey band on every page. shadow-2xl must only apply while open.
+describe('HelpPanel collapsed-shell shadow (#7150)', () => {
+  it('does not carry a box-shadow class when collapsed', () => {
+    useHelpStore.setState({ isOpen: false });
+    render(<HelpPanel />);
+    const shell = screen.getByTestId('help-panel');
+    expect(shell.className).not.toMatch(/shadow-2xl/);
+  });
+
+  it('carries the box-shadow class when open', () => {
+    useHelpStore.setState({ isOpen: true });
+    render(<HelpPanel />);
+    const shell = screen.getByTestId('help-panel');
+    expect(shell.className).toMatch(/shadow-2xl/);
+  });
+});
+
+// #10107: the Help panel shares the AI panel's shell. Open, it must start below
+// the app header (h-16) so the bell, theme and account menu stay clickable.
+describe('HelpPanel leaves the app header uncovered (#10107)', () => {
+  const classesOf = (testId: string) => screen.getByTestId(testId).className.split(/\s+/);
+
+  it('docks the open panel below the header, not over it', () => {
+    useHelpStore.setState({ isOpen: true });
+    render(<HelpPanel />);
+    const classes = classesOf('help-panel');
+    expect(classes).toEqual(
+      expect.arrayContaining(['fixed', 'top-16', 'bottom-0', 'right-0', 'max-w-full']),
+    );
+    expect(classes).not.toContain('top-0');
+    expect(classes).not.toContain('h-full');
+  });
+
+  it('starts the small-screen backdrop below the header too', () => {
+    useHelpStore.setState({ isOpen: true });
+    render(<HelpPanel />);
+    const classes = classesOf('help-panel-backdrop');
+    expect(classes).toEqual(expect.arrayContaining(['fixed', 'top-16', 'bottom-0', 'lg:hidden']));
+    expect(classes).not.toContain('inset-0');
+  });
+});

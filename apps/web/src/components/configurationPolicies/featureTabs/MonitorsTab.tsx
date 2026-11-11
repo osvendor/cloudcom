@@ -2,7 +2,9 @@ import { findDuplicateConditions } from "./duplicateConditions";
 import { DuplicateConditionNotice } from "./DuplicateConditionNotice";
 import { useState, useEffect } from "react";
 import { Radar, Trash2 } from "lucide-react";
-import type { FeatureTabProps } from "./types";
+import ConversionLedger from "../../monitoring/conversion/ConversionLedger";
+import NeedsConversionPanel from "../../monitoring/conversion/NeedsConversionPanel";
+import type { FeatureLink, FeatureTabProps } from "./types";
 import { FEATURE_META } from "./types";
 import { useFeatureLink } from "./useFeatureLink";
 import FeatureTabShell from "./FeatureTabShell";
@@ -17,6 +19,8 @@ type MonitorCatalogEntry = {
   severity: string;
   enabled: boolean;
   builtinKey: string | null;
+  /** Owning org; null = partner-wide; undefined = not reported. */
+  orgId?: string | null;
   condition: Record<string, unknown> | null;
 };
 
@@ -30,6 +34,12 @@ type MonitorAttachmentItem = {
 };
 
 type InlineSettingsLike = { inlineSettings: Record<string, unknown> | null } | undefined;
+
+type InheritanceMode = "cumulative" | "replace";
+function readInheritance(link: InlineSettingsLike): InheritanceMode {
+  const raw = (link?.inlineSettings as { inheritance?: unknown } | null | undefined)?.inheritance;
+  return raw === "replace" ? "replace" : "cumulative";
+}
 
 function seedItems(link: InlineSettingsLike): MonitorAttachmentItem[] {
   const raw = (link?.inlineSettings as { items?: unknown } | null | undefined)?.items;
@@ -47,6 +57,14 @@ function seedItems(link: InlineSettingsLike): MonitorAttachmentItem[] {
     .filter((it) => it.monitorId.length > 0);
 }
 
+const CHECK_INTERVAL_MIN = 10;
+const CHECK_INTERVAL_MAX = 3600;
+const CHECK_INTERVAL_DEFAULT = 60;
+
+function readCheckInterval(link: InlineSettingsLike): number | undefined {
+  const raw = (link?.inlineSettings as { checkIntervalSeconds?: unknown } | null | undefined)?.checkIntervalSeconds;
+  return typeof raw === "number" && Number.isFinite(raw) ? raw : undefined;
+}
 const SEVERITY_BADGE: Record<string, string> = {
   critical: "border-destructive/40 bg-destructive/15 text-destructive",
   warning: "border-warning/40 bg-warning/15 text-warning",
@@ -60,11 +78,30 @@ export default function MonitorsTab({
   linkedPolicyId,
   parentLink,
   allLinks = [],
+  orgId,
 }: FeatureTabProps) {
+  // Explicit null = partner-owned policy (#1724); undefined = unknown, so no filtering.
+  const isPartnerPolicy = orgId === null;
   const { t } = useTranslation("policies");
   const linkOf = (type: string) => allLinks.find((link) => link.featureType === type);
   const inlineRules = (linkOf("alert_rule")?.inlineSettings as { items?: Array<{ name?: string; conditions?: Array<Record<string, unknown>> }> } | undefined)?.items ?? [];
   const watches = (linkOf("monitoring")?.inlineSettings as { watches?: Array<{ watchType?: string; name?: string; enabled?: boolean }> } | undefined)?.watches ?? [];
+
+  const [ledgerRevision, setLedgerRevision] = useState(0);
+  // Bumped on conversion so the monitor catalog is re-read; otherwise a freshly
+  // converted monitor renders as "Monitor deleted" until reload (#6888).
+  const [catalogRevision, setCatalogRevision] = useState(0);
+  const refreshLinks = async () => {
+    setLedgerRevision((n) => n + 1);
+    setCatalogRevision((n) => n + 1);
+    const res = await fetchWithAuth(`/configuration-policies/${policyId}/features`);
+    if (!res.ok) return;
+    const json = await res.json();
+    const links: FeatureLink[] = Array.isArray(json?.data) ? json.data : [];
+    for (const type of ["monitors", "automation"] as const) {
+      onLinkChanged(links.find((link) => link.featureType === type) ?? null, type);
+    }
+  };
 
   const { save, remove, saving, error, clearError } = useFeatureLink(policyId);
   const isInherited = !!parentLink && !existingLink;
@@ -81,6 +118,24 @@ export default function MonitorsTab({
   const [catalogLoading, setCatalogLoading] = useState(true);
   const [catalogError, setCatalogError] = useState<string>();
 
+  // Interval inheritance is field-level, independent of attachment inheritance.
+  const ownCheckInterval = readCheckInterval(existingLink);
+  const parentCheckInterval = readCheckInterval(parentLink);
+  const savedCheckInterval = ownCheckInterval ?? parentCheckInterval ?? CHECK_INTERVAL_DEFAULT;
+  const [checkInterval, setCheckInterval] = useState<string>(String(savedCheckInterval));
+  const [checkIntervalError, setCheckIntervalError] = useState<string>();
+  const [checkIntervalEdited, setCheckIntervalEdited] = useState(false);
+  const [inheritance, setInheritance] = useState<InheritanceMode>(() => readInheritance(existingLink));
+  useEffect(() => { setInheritance(readInheritance(existingLink)); }, [existingLink]);
+  const parentItems = seedItems(parentLink);
+  useEffect(() => {
+    setCheckInterval(String(savedCheckInterval));
+    setCheckIntervalEdited(false);
+    setCheckIntervalError(undefined);
+  }, [savedCheckInterval, policyId, existingLink, parentLink]);
+  const isIntervalInherited = !checkIntervalEdited && ownCheckInterval === undefined && parentCheckInterval !== undefined;
+  const intervalPayload = () => checkIntervalEdited ? { checkIntervalSeconds: Number(checkInterval) } : {};
+
   useEffect(() => {
     if (!meta.fetchUrl) {
       setCatalogLoading(false);
@@ -88,6 +143,8 @@ export default function MonitorsTab({
     }
     let cancelled = false;
     setCatalogLoading(true);
+    // The effect re-runs after a conversion; a prior load error must not outlive a good refetch.
+    setCatalogError(undefined);
     fetchWithAuth(meta.fetchUrl)
       .then(async (res) => {
         if (!res.ok) {
@@ -108,6 +165,8 @@ export default function MonitorsTab({
             severity: String(r.severity ?? ""),
             enabled: Boolean(r.enabled),
             builtinKey: typeof r.builtinKey === "string" ? r.builtinKey : null,
+            // Fail closed: only an explicit null counts as partner-wide.
+            orgId: r.orgId === null ? null : typeof r.orgId === "string" ? r.orgId : undefined,
             condition: r.condition && typeof r.condition === "object" && !Array.isArray(r.condition)
               ? r.condition as Record<string, unknown>
               : null,
@@ -130,13 +189,17 @@ export default function MonitorsTab({
     return () => {
       cancelled = true;
     };
-  }, [meta.fetchUrl]);
+  }, [meta.fetchUrl, catalogRevision]);
 
   const catalogById = new Map(catalog.map((c) => [c.id, c]));
   const attachedIds = new Set(items.map((it) => it.monitorId));
-  const availableToAttach = catalog.filter((c) => !attachedIds.has(c.id));
+  // A partner-owned policy can only attach partner-wide monitors (the API
+  // refuses org-owned ones with MONITOR_NOT_ATTACHABLE, #8372). The full
+  // catalog stays available for resolving names of already-attached items.
+  const attachable = isPartnerPolicy ? catalog.filter((c) => c.orgId === null) : catalog;
+  const availableToAttach = attachable.filter((c) => !attachedIds.has(c.id));
 
-  const builtIns = catalog.filter((c) => Boolean(c.builtinKey));
+  const builtIns = attachable.filter((c) => Boolean(c.builtinKey));
   const anyBuiltInAttached = items.some((item) => builtIns.some((b) => b.id === item.monitorId));
   const attachBuiltIns = () => setItems((previous) => {
     const attached = new Set(previous.map((item) => item.monitorId));
@@ -186,29 +249,55 @@ export default function MonitorsTab({
       sortOrder: idx,
     }));
 
-  const handleSave = async () => {
-    clearError();
-    if (items.length === 0) {
-      if (existingLink) {
-        const ok = await remove(existingLink.id);
-        if (ok) onLinkChanged(null, "monitors");
-      }
-      return;
-    }
+  const saveAttachments = async (): Promise<boolean> => {
+    if (!existingLink && items.length === 0 && !checkIntervalEdited && inheritance === "cumulative") return true;
     const result = await save(existingLink?.id ?? null, {
       featureType: "monitors",
-      featurePolicyId: null, // inline settings — never stamp the parent CONFIG policy's own id
-      inlineSettings: { items: buildPayloadItems() },
+      featurePolicyId: null,
+      inlineSettings: { items: buildPayloadItems(), inheritance, ...intervalPayload() },
     });
-    if (result) onLinkChanged(result, "monitors");
+    if (result) {
+      setCheckIntervalEdited(false);
+      onLinkChanged(result, "monitors");
+    } else {
+      // Failed save (#8372): roll the optimistic selection back to the last
+      // persisted state so the list doesn't show attachments that never saved.
+      setItems(seedItems(existingLink ?? parentLink));
+      setInheritance(readInheritance(existingLink));
+    }
+    return !!result;
+  };
+
+  const validateCheckInterval = (): boolean => {
+    if (!checkIntervalEdited) return true;
+    const parsed = Number(checkInterval);
+    const ok = Number.isInteger(parsed) && parsed >= CHECK_INTERVAL_MIN && parsed <= CHECK_INTERVAL_MAX;
+    setCheckIntervalError(ok ? undefined : i18n.t("policies:configurationPolicies.featureTabs.monitorsTab.checkIntervalInvalid"));
+    return ok;
+  };
+
+  const handleSave = async () => {
+    clearError();
+    if (!validateCheckInterval()) return;
+    if (!(await saveAttachments())) return;
   };
 
   const handleRemove = async () => {
     if (!existingLink) return;
-    const ok = await remove(existingLink.id);
-    if (ok) {
-      onLinkChanged(null, "monitors");
+    clearError();
+    if (!validateCheckInterval()) return;
+    const result = await save(existingLink.id, {
+      featureType: "monitors",
+      featurePolicyId: null,
+      // Remove = stop overriding: an empty `replace` link would block every
+      // monitor the parent attaches, so the kept link goes back to cumulative.
+      inlineSettings: { items: [], inheritance: "cumulative", ...intervalPayload() },
+    });
+    if (result) {
+      onLinkChanged(result, "monitors");
+      setCheckIntervalEdited(false);
       setItems([]);
+      setInheritance("cumulative");
     }
   };
 
@@ -219,18 +308,24 @@ export default function MonitorsTab({
   // attach/detach/toggle/override controls below become live.
   const handleOverride = async () => {
     clearError();
+    if (!validateCheckInterval()) return;
     const result = await save(null, {
       featureType: "monitors",
       featurePolicyId: null,
-      inlineSettings: { items: buildPayloadItems() },
+      inlineSettings: { items: buildPayloadItems(), inheritance, ...intervalPayload() },
     });
-    if (result) onLinkChanged(result, "monitors");
+    if (result) {
+      setCheckIntervalEdited(false);
+      onLinkChanged(result, "monitors");
+    }
   };
 
   const handleRevert = async () => {
     if (!existingLink) return;
-    const ok = await remove(existingLink.id);
-    if (ok) onLinkChanged(null, "monitors");
+    const ok = await remove(existingLink.id, { successMessage: i18n.t("common:states.saved") });
+    // D11 retains an empty link when it owns collection settings.
+    // Read back the server state so that interval remains visible after revert.
+    if (ok) await refreshLinks();
   };
 
   return (
@@ -306,6 +401,74 @@ export default function MonitorsTab({
             </button>
           </div>
         )}
+
+        <fieldset className="rounded-md border bg-background p-4" data-testid="monitors-tab-agent-collection">
+          <legend className="px-1 text-sm font-medium">
+            {i18n.t("policies:configurationPolicies.featureTabs.monitorsTab.agentCollectionTitle")}
+          </legend>
+          <label className="mt-2 block text-sm" htmlFor="monitors-tab-check-interval">
+            {i18n.t("policies:configurationPolicies.featureTabs.monitorsTab.checkIntervalLabel")}
+          </label>
+          <input
+            id="monitors-tab-check-interval"
+            data-testid="monitors-tab-check-interval"
+            type="number"
+            min={CHECK_INTERVAL_MIN}
+            max={CHECK_INTERVAL_MAX}
+            step={1}
+            value={checkInterval}
+            disabled={isInherited}
+            onChange={(e) => { setCheckInterval(e.target.value); setCheckIntervalEdited(true); setCheckIntervalError(undefined); }}
+            className="mt-1 h-9 w-40 rounded-md border bg-background px-2 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
+          />
+          {isIntervalInherited && (
+            <p className="mt-1 text-xs text-muted-foreground" data-testid="monitors-tab-check-interval-inherited">
+              {t("configurationPolicies.featureTabs.monitorsTab.inherited")}
+            </p>
+          )}
+          <p className="mt-1 text-xs text-muted-foreground">
+            {i18n.t("policies:configurationPolicies.featureTabs.monitorsTab.checkIntervalHint")}
+          </p>
+          {checkIntervalError && <p className="mt-1 text-xs text-destructive">{checkIntervalError}</p>}
+        </fieldset>
+
+        <fieldset className="rounded-md border bg-background p-4" data-testid="monitors-tab-inheritance">
+          <legend className="px-1 text-sm font-medium">
+            {i18n.t("policies:configurationPolicies.featureTabs.monitorsTab.inheritanceTitle")}
+          </legend>
+          {(["cumulative", "replace"] as const).map((mode) => (
+            <label key={mode} className="mt-2 flex items-start gap-2 text-sm">
+              <input
+                type="radio"
+                name="monitors-tab-inheritance"
+                data-testid={`monitors-tab-inheritance-${mode}`}
+                checked={inheritance === mode}
+                disabled={isInherited}
+                onChange={() => setInheritance(mode)}
+              />
+              <span>
+                <span className="font-medium">
+                  {i18n.t(/* i18n-dynamic */ `policies:configurationPolicies.featureTabs.monitorsTab.inheritance.${mode}`)}
+                </span>
+                <span className="block text-xs text-muted-foreground">
+                  {i18n.t(/* i18n-dynamic */ `policies:configurationPolicies.featureTabs.monitorsTab.inheritance.${mode}Hint`)}
+                </span>
+              </span>
+            </label>
+          ))}
+          {inheritance === "replace" && parentItems.length > 0 && (
+            <div className="mt-3 rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-xs" data-testid="monitors-tab-ignored-inherited">
+              <p className="font-medium">
+                {i18n.t("policies:configurationPolicies.featureTabs.monitorsTab.ignoredInherited", { count: parentItems.length })}
+              </p>
+              <ul className="mt-1 list-disc pl-4">
+                {parentItems.map((it) => (
+                  <li key={it.monitorId}>{catalogById.get(it.monitorId)?.name ?? it.monitorId}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </fieldset>
 
         {items.length === 0 ? (
           <p className="text-sm text-muted-foreground">
@@ -421,6 +584,9 @@ export default function MonitorsTab({
             })}
           </ul>
         )}
+        {/* Retired links are hidden by the policy API; conversion checks its own sources and hides empty previews. */}
+        <NeedsConversionPanel key={policyId} policyId={policyId} hasLegacyRows onChanged={() => void refreshLinks()} />
+        <ConversionLedger policyId={policyId} revision={ledgerRevision} onChanged={() => void refreshLinks()} />
       </div>
     </FeatureTabShell>
   );

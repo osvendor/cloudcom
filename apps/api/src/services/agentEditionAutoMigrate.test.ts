@@ -1,10 +1,22 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
+// `open`: system contexts not yet committed (#7103 — the send must see 0).
+const txState = vi.hoisted(() => ({ open: 0 }));
 vi.mock('../db', () => ({
-  db: { select: vi.fn(), insert: vi.fn(), update: vi.fn(), delete: vi.fn() },
+  db: { select: vi.fn(), insert: vi.fn(), update: vi.fn(), delete: vi.fn(), execute: vi.fn(async () => []) },
+  runOutsideDbContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+  withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => {
+    txState.open += 1;
+    try {
+      return await fn();
+    } finally {
+      txState.open -= 1;
+    }
+  }),
 }));
 vi.mock('./binaryEdition', () => ({ getBinaryEdition: vi.fn(() => 'hosted') }));
 vi.mock('./binarySource', () => ({ getGithubReleaseVersion: vi.fn(() => '0.108.0') }));
+vi.mock('./agentRolloutAdmission', () => ({ admitAgentUpdate: vi.fn() }));
 vi.mock('./scriptDispatch', () => ({ dispatchScriptToDevice: vi.fn() }));
 vi.mock('./sentry', () => ({ captureException: vi.fn(), captureMessage: vi.fn() }));
 vi.mock('node:fs', () => ({ createReadStream: vi.fn(() => ({})) }));
@@ -19,9 +31,11 @@ import { createHash } from 'node:crypto';
 import { db } from '../db';
 import { getBinaryEdition } from './binaryEdition';
 import { getGithubReleaseVersion } from './binarySource';
+import { admitAgentUpdate } from './agentRolloutAdmission';
 import { dispatchScriptToDevice } from './scriptDispatch';
 import { captureException, captureMessage } from './sentry';
 import { stat } from 'node:fs/promises';
+import { devices } from '../db/schema/devices';
 import {
   maybeDispatchEditionMigration,
   EDITION_MIGRATION_SCRIPT_NAME,
@@ -56,11 +70,15 @@ const device = (o: Record<string, unknown> = {}) => ({
   ...o,
 }) as never;
 
-// db.select chain resolving to `rows` (script lookup).
-function selectResolving(rows: unknown[]) {
-  const limit = vi.fn().mockResolvedValue(rows);
-  const where = vi.fn(() => ({ limit }));
-  const from = vi.fn(() => ({ where }));
+// db.select chain. The module reads two tables: the system script lookup
+// (resolves to `rows`) and the #5016 per-org in-flight migration lookup on
+// `devices` (resolves to `inFlight`, default none).
+function selectResolving(rows: unknown[], inFlight: unknown[] = []) {
+  const from = vi.fn((table: unknown) => {
+    const limit = vi.fn().mockResolvedValue(table === devices ? inFlight : rows);
+    const where = vi.fn(() => ({ limit }));
+    return { where };
+  });
   return { from };
 }
 
@@ -105,6 +123,7 @@ function primeHappyPath() {
 describe('maybeDispatchEditionMigration', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(admitAgentUpdate).mockResolvedValue({ allowed: true, reason: 'admitted' });
     __resetEditionAutoMigrateStateForTests();
     process.env.AGENT_EDITION_AUTO_MIGRATE_ENABLED = 'true';
     process.env.PUBLIC_API_URL = 'https://eu.example.app';
@@ -116,6 +135,32 @@ describe('maybeDispatchEditionMigration', () => {
   afterEach(() => {
     delete process.env.AGENT_EDITION_AUTO_MIGRATE_ENABLED;
     delete process.env.PUBLIC_API_URL;
+  });
+
+  it('defers before the permanent claim and retries after rollout capacity returns', async () => {
+    const claim = primeHappyPath();
+    vi.mocked(admitAgentUpdate).mockResolvedValueOnce({ allowed: false, reason: 'host-pressure' });
+    await maybeDispatchEditionMigration(baseArgs());
+    expect(admitAgentUpdate).toHaveBeenCalledWith({
+      deviceId: 'device-1', siteKey: 'org-1:site-1', targets: { agent: '0.108.0' },
+    });
+    expect(claim.set).not.toHaveBeenCalled();
+    expect(dispatchScriptToDevice).not.toHaveBeenCalled();
+    expect(captureException).not.toHaveBeenCalled();
+    await maybeDispatchEditionMigration(baseArgs());
+    expect(dispatchScriptToDevice).toHaveBeenCalledTimes(1);
+    expect(claim.set).toHaveBeenCalledTimes(1);
+  });
+
+  it('reserves no rollout permit before update eligibility and script availability are proven', async () => {
+    primeHappyPath();
+    await maybeDispatchEditionMigration(baseArgs({ updateGateAllows: false }));
+    expect(admitAgentUpdate).not.toHaveBeenCalled();
+    vi.mocked(db.select).mockReturnValue(selectResolving([]) as never);
+    await maybeDispatchEditionMigration(baseArgs());
+    expect(admitAgentUpdate).not.toHaveBeenCalled();
+    expect(db.update).not.toHaveBeenCalled();
+    expect(dispatchScriptToDevice).not.toHaveBeenCalled();
   });
 
   it('dispatches the system migration script with msi url, sha256, and target edition', async () => {
@@ -131,6 +176,9 @@ describe('maybeDispatchEditionMigration', () => {
       target_edition: 'hosted',
     });
     expect(input.triggerType).toBe('policy');
+    // The canary and reaper windows are measured from the claim, so a command
+    // that sits queued for the 168h default could run long after both closed.
+    expect(input.offlinePolicy).toEqual({ kind: 'queue', deliverWithinMs: 15 * 60_000 });
     expect(input.device.id).toBe('device-1');
     // Informational success signal goes through captureMessage (BREEZE-18),
     // never a fabricated Error.
@@ -194,12 +242,183 @@ describe('maybeDispatchEditionMigration', () => {
     expect(dispatchScriptToDevice).not.toHaveBeenCalled();
   });
 
+  describe('staged-version hold-back warning (#7039)', () => {
+    const heldWarns = (spy: ReturnType<typeof vi.spyOn>) =>
+      spy.mock.calls
+        .map((c: unknown[]) => String(c[0]))
+        .filter((m: string) => m.includes('withholding automatic edition migration'));
+
+    it('names the org, the pin, the device and the action to take when a pin holds a device back', async () => {
+      primeHappyPath();
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      await maybeDispatchEditionMigration(
+        baseArgs({ pin: '0.107.0', resolveTarget: vi.fn().mockResolvedValue('0.107.0') }),
+      );
+      const msgs = heldWarns(warn);
+      expect(msgs).toHaveLength(1);
+      expect(msgs[0]).toContain('org org-1');
+      expect(msgs[0]).toContain('agent version pin 0.107.0');
+      expect(msgs[0]).toContain('device-1');
+      expect(msgs[0]).toContain('HOST-1');
+      expect(msgs[0]).toContain('staged release 0.108.0');
+      expect(msgs[0]).toMatch(/raise or clear/);
+      warn.mockRestore();
+    });
+
+    it('says "no pin" and points at promotion when the unpinned target is not the staged release', async () => {
+      primeHappyPath();
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      await maybeDispatchEditionMigration(baseArgs({ resolveTarget: vi.fn().mockResolvedValue('0.107.0') }));
+      const msgs = heldWarns(warn);
+      expect(msgs).toHaveLength(1);
+      expect(msgs[0]).toContain('org org-1');
+      expect(msgs[0]).toContain('no agent version pin');
+      expect(msgs[0]).toMatch(/promoted/);
+      warn.mockRestore();
+    });
+
+    it('warns separately for each held-back org instead of once per process', async () => {
+      primeHappyPath();
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const held = { pin: '0.107.0', resolveTarget: vi.fn().mockResolvedValue('0.107.0') };
+      await maybeDispatchEditionMigration(baseArgs(held));
+      await maybeDispatchEditionMigration(
+        baseArgs({ ...held, device: device({ id: 'device-2', orgId: 'org-2', hostname: 'HOST-2' }) }),
+      );
+      const msgs = heldWarns(warn);
+      expect(msgs).toHaveLength(2);
+      expect(msgs[1]).toContain('org org-2');
+      warn.mockRestore();
+    });
+
+    it('re-warns hourly per org with the count of distinct held-back devices, not every heartbeat', async () => {
+      primeHappyPath();
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const now = vi.spyOn(Date, 'now');
+      const t0 = 1_900_000_000_000;
+      const held = { pin: '0.107.0', resolveTarget: vi.fn().mockResolvedValue('0.107.0') };
+
+      now.mockReturnValue(t0);
+      await maybeDispatchEditionMigration(baseArgs(held));
+      now.mockReturnValue(t0 + 60_000);
+      await maybeDispatchEditionMigration(baseArgs(held));
+      await maybeDispatchEditionMigration(
+        baseArgs({ ...held, device: device({ id: 'device-2', hostname: 'HOST-2' }) }),
+      );
+      expect(heldWarns(warn)).toHaveLength(1);
+
+      now.mockReturnValue(t0 + 60 * 60_000 + 1);
+      await maybeDispatchEditionMigration(baseArgs(held));
+      const msgs = heldWarns(warn);
+      expect(msgs).toHaveLength(2);
+      expect(msgs[1]).toContain('2 stranded self-host device(s)');
+      now.mockRestore();
+      warn.mockRestore();
+    });
+  });
+
+  // #5016 — the heartbeat gate dispatched the reinstall to all six stranded
+  // PCs of one org within the same minute, and all six went silent. The gate
+  // must keep at most ONE migration in flight per org: the first device is
+  // the canary, and nothing else in that org is touched until it comes back.
+  describe('per-org canary (#5016)', () => {
+    const canaryRow = {
+      id: 'device-0',
+      hostname: 'CANARY-PC',
+      editionMigrationDispatchedAt: new Date('2026-09-06T00:57:00Z'),
+      lastSeenAt: new Date('2026-09-06T00:57:30Z'),
+    };
+    const holdWarns = (spy: ReturnType<typeof vi.spyOn>) =>
+      spy.mock.calls
+        .map((c: unknown[]) => String(c[0]))
+        .filter((m: string) => m.includes('holding automatic edition migration'));
+
+    it('holds (no claim, no dispatch) while another device in the org has an unresolved migration', async () => {
+      primeHappyPath();
+      vi.mocked(db.select).mockReturnValue(selectResolving([systemScriptRow], [canaryRow]) as never);
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+      await maybeDispatchEditionMigration(baseArgs());
+
+      expect(db.update).not.toHaveBeenCalled();
+      expect(dispatchScriptToDevice).not.toHaveBeenCalled();
+      const msgs = holdWarns(warn);
+      expect(msgs).toHaveLength(1);
+      expect(msgs[0]).toContain('org org-1');
+      expect(msgs[0]).toContain('device-0');
+      expect(msgs[0]).toContain('CANARY-PC');
+      expect(msgs[0]).toContain('migration.log');
+      // A stuck canary is operator-actionable: reported once, not per beat.
+      expect(captureMessage).toHaveBeenCalledWith(
+        expect.stringContaining('device-0'),
+        expect.objectContaining({ eventCode: 'agent_edition_auto_migration_canary_unresolved' }),
+      );
+      warn.mockRestore();
+    });
+
+    it('a held device is NOT vetoed: it migrates once the canary resolves', async () => {
+      primeHappyPath();
+      vi.mocked(db.select).mockReturnValue(selectResolving([systemScriptRow], [canaryRow]) as never);
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      await maybeDispatchEditionMigration(baseArgs());
+      expect(dispatchScriptToDevice).not.toHaveBeenCalled();
+
+      vi.mocked(db.select).mockReturnValue(selectResolving([systemScriptRow], []) as never);
+      await maybeDispatchEditionMigration(baseArgs());
+      expect(dispatchScriptToDevice).toHaveBeenCalledTimes(1);
+      warn.mockRestore();
+    });
+
+    it('reports a stuck canary to Sentry once per canary, and re-warns at most hourly', async () => {
+      primeHappyPath();
+      vi.mocked(db.select).mockReturnValue(selectResolving([systemScriptRow], [canaryRow]) as never);
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const now = vi.spyOn(Date, 'now');
+      const t0 = 1_900_000_000_000;
+      now.mockReturnValue(t0);
+      await maybeDispatchEditionMigration(baseArgs());
+      now.mockReturnValue(t0 + 60_000);
+      await maybeDispatchEditionMigration(baseArgs({ device: device({ id: 'device-2', hostname: 'HOST-2' }) }));
+      expect(holdWarns(warn)).toHaveLength(1);
+      now.mockReturnValue(t0 + 60 * 60_000 + 1);
+      await maybeDispatchEditionMigration(baseArgs());
+      expect(holdWarns(warn)).toHaveLength(2);
+      const sentry = vi.mocked(captureMessage).mock.calls.filter(
+        (c) => (c[1] as { eventCode?: string } | undefined)?.eventCode === 'agent_edition_auto_migration_canary_unresolved',
+      );
+      expect(sentry).toHaveLength(1);
+      now.mockRestore();
+      warn.mockRestore();
+    });
+
+    it('serialises the in-flight check and the claim per org with a transaction advisory lock', async () => {
+      const claim = primeHappyPath();
+      await maybeDispatchEditionMigration(baseArgs());
+      expect(db.execute).toHaveBeenCalledTimes(1);
+      const lockOrder = vi.mocked(db.execute).mock.invocationCallOrder[0]!;
+      const claimOrder = claim.returning.mock.invocationCallOrder[0]!;
+      expect(lockOrder).toBeLessThan(claimOrder);
+      // The lock is taken inside the system context whose commit publishes the claim.
+      const lockSql = JSON.stringify(vi.mocked(db.execute).mock.calls[0]![0]);
+      expect(lockSql).toContain('pg_advisory_xact_lock');
+    });
+  });
+
   it('withholds when the deployment release is unknown (BREEZE_VERSION unset)', async () => {
     primeHappyPath();
     vi.mocked(getGithubReleaseVersion).mockReturnValue('latest');
-    await maybeDispatchEditionMigration(baseArgs());
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await maybeDispatchEditionMigration(baseArgs({ pin: '0.108.0' }));
     expect(db.update).not.toHaveBeenCalled();
     expect(dispatchScriptToDevice).not.toHaveBeenCalled();
+    // #7039: the unknown-release cause wins over the pin wording — the pin is
+    // not what is holding the device back here.
+    const msgs = warn.mock.calls.map((c) => String(c[0]));
+    expect(msgs).toHaveLength(1);
+    expect(msgs[0]).toContain('org org-1');
+    expect(msgs[0]).toContain('Set BREEZE_VERSION');
+    expect(msgs[0]).not.toContain('agent version pin');
+    warn.mockRestore();
   });
 
   it('skips (before claiming) when the staged MSI is unreadable', async () => {
@@ -249,6 +468,27 @@ describe('maybeDispatchEditionMigration', () => {
     await maybeDispatchEditionMigration(baseArgs());
     expect(db.update).not.toHaveBeenCalled();
     expect(dispatchScriptToDevice).not.toHaveBeenCalled();
+  });
+
+  // #8318 §6.4 (review of wave 1b-1): the release is bound to the agent_id the
+  // claim was taken under. A reattach or an in-place re-enroll in between
+  // makes it a 0-row no-op; that is said, not swallowed.
+  it('warns when the claim release matches no row because the device changed hands since the claim', async () => {
+    const claim = primeHappyPath();
+    claim.returning.mockResolvedValueOnce([{ id: 'device-1' }]).mockResolvedValueOnce([]);
+    vi.mocked(dispatchScriptToDevice).mockResolvedValue({
+      ok: false,
+      code: 'insert_failed',
+      error: 'Failed to create command',
+    } as never);
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await maybeDispatchEditionMigration(baseArgs());
+
+    expect(claim.set).toHaveBeenCalledWith({ editionMigrationDispatchedAt: null });
+    const releaseWarnings = warnSpy.mock.calls.filter((call) => String(call[0]).includes('claim release for device device-1 matched no row'));
+    expect(releaseWarnings).toHaveLength(1);
+    warnSpy.mockRestore();
   });
 
   /**
@@ -320,5 +560,71 @@ describe('maybeDispatchEditionMigration', () => {
     // already exist, so the once-per-device claim must stand — only a typed
     // ok:false refusal (provably nothing queued) releases it.
     expect(claim.set).not.toHaveBeenCalledWith({ editionMigrationDispatchedAt: null });
+  });
+
+  // #7103 — the heartbeat wrapped this whole service in one system context, so
+  // the reinstall command went out before its rows (and the claim) committed.
+  it('writes the claim and the rows in its own context and sends only after it commits', async () => {
+    const claim = primeHappyPath();
+    const events: Array<{ kind: string; open: number }> = [];
+    claim.returning.mockImplementation(async () => {
+      events.push({ kind: 'claim', open: txState.open });
+      return [{ id: 'device-1' }];
+    });
+    const base = {
+      ok: true,
+      commandId: 'cmd-1',
+      executionId: 'exec-1',
+      executedAt: null,
+      ignoredParameters: [],
+      runAs: 'system' as const,
+      targetSessionId: null,
+    };
+    vi.mocked(dispatchScriptToDevice).mockImplementation((async (input: { deferDelivery?: boolean }) => {
+      events.push({ kind: 'create', open: txState.open });
+      const deliver = async () => {
+        events.push({ kind: 'send', open: txState.open });
+        return { ...base, delivered: true, deliveryOutcome: 'sent' };
+      };
+      return input.deferDelivery
+        ? { ...base, delivered: false, deliveryOutcome: 'deferred', deliver }
+        : deliver();
+    }) as never);
+
+    await maybeDispatchEditionMigration(baseArgs());
+
+    expect(vi.mocked(dispatchScriptToDevice).mock.calls[0]![0]).toMatchObject({ deferDelivery: true });
+    expect(events).toEqual([
+      { kind: 'claim', open: 1 },
+      { kind: 'create', open: 1 },
+      { kind: 'send', open: 0 },
+    ]);
+    expect(captureMessage).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ eventCode: 'agent_edition_auto_migration_dispatched' }),
+    );
+  });
+
+  it('keeps the claim when a claim-time refusal comes back after commit', async () => {
+    const claim = primeHappyPath();
+    vi.mocked(dispatchScriptToDevice).mockResolvedValue({
+      ok: true,
+      commandId: 'cmd-1',
+      executionId: 'exec-1',
+      executedAt: null,
+      ignoredParameters: [],
+      runAs: 'system' as const,
+      targetSessionId: null,
+      delivered: false,
+      deliveryOutcome: 'deferred',
+      deliver: async () => ({ ok: false, code: 'secret_gate_unavailable', error: 'gate down' }),
+    } as never);
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    await expect(maybeDispatchEditionMigration(baseArgs())).resolves.toBeUndefined();
+
+    expect(captureException).toHaveBeenCalled();
+    expect(claim.set).not.toHaveBeenCalledWith({ editionMigrationDispatchedAt: null });
+    error.mockRestore();
   });
 });

@@ -174,6 +174,21 @@ describe('export_dataset', () => {
     expect(createArtifact.mock.calls[0]![0]).toMatchObject({ runId: 'run-1', orgId: 'org-1' });
   });
 
+  it('never owns the artifact by accessibleOrgIds[0] when the run carries no org (#6667)', async () => {
+    createPager.mockResolvedValue(pagesOf([{ rows: [{ id: 1 }], nextCursor: null }]));
+    const tool = getTool();
+    const orglessRun = {
+      ...(auth as Record<string, unknown>),
+      orgId: null,
+      accessibleOrgIds: ['org-1', 'org-2'],
+    } as never;
+    const parsed = JSON.parse(await tool.handler(
+      { dataset: 'event_logs' }, orglessRun, { runTargets: [], stagedBytesRemaining: 1_000_000 },
+    ));
+    expect(parsed.error).toBe('orgId is required: you have access to multiple organizations');
+    expect(createArtifact).not.toHaveBeenCalled();
+  });
+
   it('refuses a direct chat/MCP call with export_requires_run — an artifact needs an owning run', async () => {
     createPager.mockResolvedValue(pagesOf([{ rows: [{ id: 1 }], nextCursor: null }]));
     const tool = getTool();
@@ -204,6 +219,38 @@ describe('export_dataset', () => {
     const tool = getTool();
     const parsed = JSON.parse(await tool.handler({ dataset: 'passwords' }, auth));
     expect(parsed.error).toBe('unknown_dataset');
+  });
+
+  it('returns a clean error instead of the generic export_failed path when the pager refuses on the sensitive-category gate', async () => {
+    const { SensitiveEventLogAccessError } = await import('./eventLogSensitivity');
+    sanitizeThrownToolError.mockClear();
+    createPager.mockResolvedValue(() => { throw new SensitiveEventLogAccessError(); });
+    const tool = getTool();
+    const parsed = JSON.parse(await tool.handler(
+      { dataset: 'event_logs' }, auth,
+      { runTargets: [], stagedBytesRemaining: 1_000_000 },
+    ));
+    expect(parsed.error).toBe('sensitive_category_forbidden');
+    expect(sanitizeThrownToolError).not.toHaveBeenCalled();
+  });
+
+  it('does not silently resolve an ambiguous multi-org auth to the device-page write default (#6675)', async () => {
+    const tool = getTool();
+    const partnerAuthWithWriteDefault = {
+      orgId: null,
+      accessibleOrgIds: ['org-1', 'org-2'],
+      allowedSiteIds: null,
+      canAccessOrg: (id: string) => id === 'org-1' || id === 'org-2',
+      aiWriteDefaultOrgId: 'org-2',
+      principal: { kind: 'ai_agent', agentId: 'agent-1', runId: 'run-1' },
+      user: { id: 'agent-1' },
+    } as never;
+    const parsed = JSON.parse(await tool.handler(
+      { dataset: 'event_logs' }, partnerAuthWithWriteDefault,
+      { runTargets: [], stagedBytesRemaining: 1_000_000 },
+    ));
+    expect(parsed.error).toBe('orgId is required: you have access to multiple organizations');
+    expect(createArtifact).not.toHaveBeenCalled();
   });
 
   it('logs orgId/runId/dataset context when an unexpected error escapes the handler', async () => {

@@ -18,6 +18,40 @@ Validation: browser network isolation, HTML Access-login detection, launch witho
 
 Rollback: restore the previous verified web image. No data rollback is required. Keep origin Access protection and agent transport policies intact.
 
+## Browser text clipboard adapter
+
+The browser-only `browser-clipboard-transform.mjs` adapter keeps native viewer
+sources unchanged. On the focused WebRTC desktop, Ctrl+V (Cmd+V on macOS) uses
+the browser's paste event rather than asynchronous clipboard reads. Text is
+limited to 1 MB and the remote paste keystroke is sent only after the agent's
+matching clipboard acknowledgement. Timeout, channel closure, and session end
+cancel the paste, avoiding accidentally pasting stale remote clipboard contents.
+
+Ctrl+C still copies in the remote application. The next remote clipboard update
+is written locally only following that shortcut; other incoming updates never
+overwrite the local clipboard automatically. Browsers that deny the asynchronous
+write can use the explicit **Copy remote text** button. Cached text is held only
+in the active viewer's memory and cleared when its channel/session ends.
+Native browser Copy commands are also handled on the focused remote surface;
+short duplicate keydown/copy events are collapsed into one remote shortcut.
+
+The existing agent's directional clipboard policies remain authoritative. This
+adapter supports plain text, not images/files/rich text. Unit tests cover failed
+permissions, bounds, acknowledgement ordering, closure and timeout cancellation.
+Real endpoint/browser clipboard acceptance must still be recorded for a release.
+
+Browser modifier remapping defaults to off for Windows-to-Windows and
+Mac-to-Mac sessions, and on across those OS families. The unconditional native
+default could send a held Windows key for a local Ctrl press. Manual toolbar
+overrides remain available and take precedence over automatic OS detection.
+
+The browser also handles a native Copy event on the focused remote surface, for
+browser shells that consume Ctrl+C before delivering KeyC. Keyboard and Copy
+events share a deduplicated remote-copy request. Local credential controls are
+outside that surface. Cmd/Control remapping defaults from the local and remote
+OS families, rather than unconditionally swapping Windows Control into Meta.
+Browser toolbar dropdowns are layered above the shell controls.
+
 ## Required concurrent access (not implemented)
 
 Multiple independently authorized users must be able to connect to the same computer at the same time. Joining, reconnecting, or leaving must not terminate another user's connection. This means sharing the same desktop; it does not promise separate Windows logon sessions.

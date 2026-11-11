@@ -22,14 +22,18 @@ import (
 // diagnostics at all, precisely where remote-desktop / consent / capture
 // features live.
 //
-// Everything a helper needs is deliberately kept in agent.yaml, which is
-// world-readable (0644) for exactly this reason: the server URL, agent id, and
-// the helper-scoped helper_auth_token (see secretKeyAllowedInAgentYAML and the
-// permissions_unix.go comment). This function returns those layered over
-// Default(), without the global-viper mutation or secrets.yaml dependency of
-// Load(). It mirrors PersistedServerURL's partial-decode approach (PR #2477):
-// no viper singleton, no ValidateTiered fatals from the missing secrets, and
-// unrelated schema drift elsewhere in agent.yaml cannot break the helper load.
+// The server URL and agent id are deliberately kept in agent.yaml, which is
+// world-readable (0644) for exactly this reason. helper_auth_token is NOT:
+// on Unix it lives in a separate, group-scoped helper_token.yaml (see
+// helpertoken_unix.go) that only breeze-group members — the console/GUI
+// users the installer adds — can read; on Windows no user-readable file
+// carries it at all (see helpertoken_windows.go), so HelperAuthToken is empty
+// there unless an older agent's agent.yaml still has it. This function
+// returns those layered over Default(), without the global-viper mutation or
+// secrets.yaml dependency of Load(). It mirrors PersistedServerURL's
+// partial-decode approach (PR #2477): no viper singleton, no ValidateTiered
+// fatals from the missing secrets, and unrelated schema drift elsewhere in
+// agent.yaml cannot break the helper load.
 //
 // cfgFile may be empty, in which case the default agent.yaml path is used.
 func LoadHelperConfig(cfgFile string) (*Config, error) {
@@ -56,6 +60,9 @@ func LoadHelperConfig(cfgFile string) (*Config, error) {
 		IPCSocketPath    *string `yaml:"ipc_socket_path"`
 		LogShippingLevel *string `yaml:"log_shipping_level"`
 		DesktopDebug     *bool   `yaml:"desktop_debug"`
+		// Helpers configure the shared ECH dialer from these (#8869).
+		ECH              *bool `yaml:"ech"`
+		ECHServerEnabled *bool `yaml:"ech_server_enabled"`
 	}
 	if err := yaml.Unmarshal(data, &parsed); err != nil {
 		return nil, fmt.Errorf("parsing %s: %w", path, err)
@@ -70,6 +77,16 @@ func LoadHelperConfig(cfgFile string) (*Config, error) {
 	if parsed.HelperAuthToken != nil {
 		cfg.HelperAuthToken = *parsed.HelperAuthToken
 	}
+	// On Unix, helper_auth_token no longer lives in agent.yaml (see
+	// isSecretYAMLKey / helpertoken_unix.go) — it lives in a group-scoped
+	// helper_token.yaml a breeze-group member (a console/GUI user the
+	// installer added) can read but other local accounts cannot. A read
+	// failure here (missing file, group not yet granted, ...) is not fatal:
+	// the caller already treats an empty HelperAuthToken as "not ready yet".
+	// No-op on Windows, where the token is delivered over IPC instead.
+	if fileToken, err := readHelperTokenFileFor(path); err == nil && fileToken != "" {
+		cfg.HelperAuthToken = fileToken
+	}
 	if parsed.IPCSocketPath != nil {
 		cfg.IPCSocketPath = *parsed.IPCSocketPath
 	}
@@ -78,6 +95,12 @@ func LoadHelperConfig(cfgFile string) (*Config, error) {
 	}
 	if parsed.DesktopDebug != nil {
 		cfg.DesktopDebug = *parsed.DesktopDebug
+	}
+	if parsed.ECH != nil {
+		cfg.ECH = *parsed.ECH
+	}
+	if parsed.ECHServerEnabled != nil {
+		cfg.ECHServerEnabled = *parsed.ECHServerEnabled
 	}
 
 	return cfg, nil

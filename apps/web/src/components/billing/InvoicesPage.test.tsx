@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import InvoicesPage from './InvoicesPage';
 import { fetchWithAuth } from '../../stores/auth';
+import { requestCreate } from '../../lib/keyboard/createIntent';
 import { useOrgStore } from '../../stores/orgStore';
 
 vi.mock('../../stores/auth', () => ({
@@ -56,6 +57,14 @@ describe('InvoicesPage', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     window.location.hash = '';
+  });
+
+  it('opens the new-invoice dialog when it arrives with a "c then i" create intent', async () => {
+    sessionStorage.clear();
+    requestCreate('invoice');
+    wireDefault();
+    render(<InvoicesPage />);
+    expect(await screen.findByTestId('invoices-assemble-dialog')).toBeInTheDocument();
   });
 
   it('renders invoice rows with status badge and currency totals', async () => {
@@ -181,6 +190,23 @@ describe('InvoicesPage', () => {
     const strip = screen.getByTestId('invoices-outstanding-strip');
     expect(strip).toHaveTextContent('$100.00');
     expect(strip.textContent).not.toContain('€');
+  });
+
+  it('excludes drafts (unissued, priced) from the Outstanding total and open count', async () => {
+    const data = [
+      { ...INVOICES[0], id: 'inv-a', invoiceNumber: 'INV-A', status: 'sent', balance: '100.00' },
+      { ...INVOICES[0], id: 'inv-b', invoiceNumber: 'INV-B', status: 'overdue', balance: '189.09' },
+      { ...INVOICES[0], id: 'inv-d', invoiceNumber: null, status: 'draft', balance: '560.00' },
+    ];
+    fetchMock.mockImplementation(async (input: string) => {
+      if (input.startsWith('/orgs/organizations')) return json({ data: ORGS });
+      if (input.startsWith('/invoices')) return json({ data });
+      return json({}, false, 404);
+    });
+    render(<InvoicesPage />);
+    const card = await screen.findByTestId('invoices-outstanding-card');
+    expect(card).toHaveTextContent('$289.09');
+    expect(card).toHaveTextContent('2 open');
   });
 
   it('hides the filter toolbar on a genuinely empty list', async () => {
@@ -391,6 +417,42 @@ describe('InvoicesPage', () => {
       expect(showToast).toHaveBeenCalledWith(expect.objectContaining({
         type: 'warning', message: expect.stringContaining('EUR'),
       }));
+    });
+
+    it('warns that entries are held for the block hours, then still opens the draft', async () => {
+      wireAssemble(() => json({
+        data: { invoice: { id: 'inv-new' }, lines: [], blockedByCurrency: [], heldForHourBlock: { count: 2, hours: 1.5 } },
+      }));
+      await openAndFill();
+      fireEvent.click(screen.getByTestId('invoices-assemble-submit'));
+      await waitFor(() => expect(navigateTo).toHaveBeenCalledWith('/billing/invoices/inv-new'));
+      expect(showToast).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'warning',
+        message: expect.stringMatching(/2 time entries \(1\.5 hours\) are held for this organization's block hours/),
+      }));
+    });
+
+    it('says nothing when nothing is held', async () => {
+      wireAssemble(() => json({
+        data: { invoice: { id: 'inv-new' }, lines: [], blockedByCurrency: [], heldForHourBlock: { count: 0, hours: 0 } },
+      }));
+      await openAndFill();
+      fireEvent.click(screen.getByTestId('invoices-assemble-submit'));
+      await waitFor(() => expect(navigateTo).toHaveBeenCalled());
+      expect(showToast).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'warning' }));
+    });
+
+    it('on 409 NOTHING_TO_INVOICE with held hours, explains why instead of leaving a bare error', async () => {
+      wireAssemble(() => json({
+        error: 'No unbilled billable work in range', code: 'NOTHING_TO_INVOICE',
+        details: { heldForHourBlock: { count: 1, hours: 1 } },
+      }, false, 409));
+      await openAndFill();
+      fireEvent.click(screen.getByTestId('invoices-assemble-submit'));
+      await waitFor(() => expect(showToast).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'warning', message: expect.stringContaining('1 time entry (1 hours) is held'),
+      })));
+      expect(navigateTo).not.toHaveBeenCalled();
     });
   });
 

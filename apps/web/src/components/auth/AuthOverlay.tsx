@@ -1,6 +1,6 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { bootstrapFromCfAccessRedirect, bootstrapFromSsoCode, markSsoExchangeFailed, restoreAccessTokenFromCookieDetailed, setThrottleMaskMounted, settleSsoLoginGate, SSO_EXCHANGE_FAILED_LOGIN_PATH, useAuthStore } from '../../stores/auth';
+import { bootstrapFromCfAccessRedirectDetailed, ensureSessionPermissions, bootstrapFromSsoCode, markSsoExchangeFailed, restoreAccessTokenFromCookieDetailed, setThrottleMaskMounted, settleSsoLoginGate, SSO_EXCHANGE_FAILED_LOGIN_PATH, useAuthStore } from '../../stores/auth';
 import { Loader2 } from 'lucide-react';
 import { navigateTo } from '../../lib/navigation';
 import * as Sentry from '@sentry/astro';
@@ -8,6 +8,7 @@ import * as Sentry from '@sentry/astro';
 // an island that hydrates before whichever other island happens to pull i18n in
 // would otherwise render raw keys (and mismatch the SSR markup).
 import '../../lib/i18n';
+import { replaceUrl } from '../../lib/replaceUrl';
 
 const CF_ACCESS_LOGIN_PARAM = 'cf-access-login';
 const SSO_CODE_FRAGMENT_PREFIX = 'ssoCode=';
@@ -32,7 +33,7 @@ function consumeSsoCodeFragment(): SsoCodeFragment {
   const hash = window.location.hash.replace(/^#/, '');
   if (!hash.startsWith(SSO_CODE_FRAGMENT_PREFIX)) return { present: false };
   const raw = hash.slice(SSO_CODE_FRAGMENT_PREFIX.length).split('&')[0] ?? '';
-  window.history.replaceState({}, '', window.location.pathname + window.location.search);
+  replaceUrl(window.location.pathname + window.location.search);
   let code: string | null;
   try {
     code = decodeURIComponent(raw) || null;
@@ -52,7 +53,7 @@ function consumeCfAccessLoginParam(): boolean {
     window.location.pathname +
     (cleanSearch ? `?${cleanSearch}` : '') +
     window.location.hash;
-  window.history.replaceState({}, '', cleanUrl);
+  replaceUrl(cleanUrl);
   return true;
 }
 
@@ -118,12 +119,34 @@ async function redirectToSsoExchangeFailed(): Promise<void> {
 export default function AuthOverlay() {
   const { t } = useTranslation('auth');
   const { isAuthenticated, isLoading, tokens, sessionExpiredReason, authThrottledUntil } = useAuthStore();
+  const mounted = useRef(false);
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
+  const permissionsUnknown = useAuthStore((s) => !!s.user && !Array.isArray(s.user.permissions));
+  const sessionGeneration = useAuthStore((s) => s.sessionGeneration);
   const [isChecking, setIsChecking] = useState(true);
   const [isRecovering, setIsRecovering] = useState(false);
+  const recoveryOwnsNavigation = useRef(false);
+  const cfRecoveryRequested = useRef(false);
+  const [recoveryUnavailable, setRecoveryUnavailable] = useState(false);
   const [recoverAttempted, setRecoverAttempted] = useState(false);
   const [cfBootstrapAttempted, setCfBootstrapAttempted] = useState(false);
   const [ssoBootstrapAttempted, setSsoBootstrapAttempted] = useState(false);
   const [fadeState, setFadeState] = useState<'visible' | 'fading' | 'hidden'>('visible');
+  const redirectTargetRef = useRef<'/login' | '/login?error=cf-access' | null>(null);
+  const [redirectTarget, setRedirectTarget] = useState<'/login' | '/login?error=cf-access' | null>(null);
+
+  function requestLoginRedirect(target: '/login' | '/login?error=cf-access' = '/login') {
+    if (redirectTargetRef.current || useAuthStore.getState().sessionExpiredReason) return;
+    // Claim synchronously: the state update below reruns the recovery effect.
+    redirectTargetRef.current = target;
+    setRedirectTarget(target);
+    void navigateTo(target, { replace: true }).catch(() => {
+      // Keep the ordinary full-page link available if the router cannot navigate.
+    });
+  }
 
   useEffect(() => {
     // Give the store time to rehydrate from localStorage
@@ -143,6 +166,10 @@ export default function AuthOverlay() {
       // `handleSessionExpired` owns the navigation this must stay dormant, or
       // its soft nav races the hard redirect and drops `next`/`reason`.
       if (state.sessionExpiredReason) return;
+      if (redirectTargetRef.current) return;
+      // An aborted fetch does not cancel server-side issuance. Do not start
+      // another login while recovery owns this browser's binding lease.
+      if (recoveryOwnsNavigation.current) return;
       // A rate-limited refresh legitimately takes longer than this timer
       // (the server's window is 60s). Bouncing to /login here would reinstate
       // exactly the forced logout #3696 removes — the throttle mask below just
@@ -150,7 +177,7 @@ export default function AuthOverlay() {
       // recovery (#3984).
       if (state.authThrottledUntil && state.authThrottledUntil > Date.now()) return;
       if (!state.isAuthenticated || !state.tokens?.accessToken) {
-        redirectToLogin();
+        requestLoginRedirect();
       }
     }, 10_000);
 
@@ -167,9 +194,11 @@ export default function AuthOverlay() {
     // already signed in) is stripped without an exchange: the live session wins
     // and the stale single-use grant must not linger in the address bar.
     if (isAuthenticated && tokens?.accessToken) {
+      recoveryOwnsNavigation.current = false;
       if (consumeSsoCodeFragment().present) settleSsoLoginGate();
       return;
     }
+    if (redirectTargetRef.current) return;
 
     // SSO redirect bootstrap (#3700): the SSO callback completed the IdP login
     // and handed us a one-time exchange grant in the fragment. Trade it for
@@ -239,21 +268,49 @@ export default function AuthOverlay() {
     // The SPA has no in-memory session yet, so trade the cookie for tokens and fetch
     // the user before falling through to the normal "no session, redirect to /login"
     // path. This runs once per overlay mount.
-    if (!isAuthenticated && !cfBootstrapAttempted) {
-      const shouldBootstrap = consumeCfAccessLoginParam();
+    if (!cfBootstrapAttempted) {
+      const shouldBootstrap = cfRecoveryRequested.current || consumeCfAccessLoginParam();
       if (shouldBootstrap) {
+        cfRecoveryRequested.current = true;
+        recoveryOwnsNavigation.current = true;
         setCfBootstrapAttempted(true);
         setIsRecovering(true);
-        void bootstrapFromCfAccessRedirect().then((ok) => {
-          if (cancelled) return;
+        void bootstrapFromCfAccessRedirectDetailed().then((outcome) => {
+          // Local recovery state rerenders this effect before the request finishes.
+          if (!mounted.current) return;
           setIsRecovering(false);
-          if (!ok) {
-            void navigateTo('/login?error=cf-access', { replace: true });
+          if (outcome === 'transient' || outcome === 'throttled') {
+            setRecoveryUnavailable(true);
+            return;
+          }
+          if (outcome === 'cancelled') {
+            const current = useAuthStore.getState();
+            if (current.sessionExpiredReason) return;
+            if (current.isAuthenticated && current.tokens?.accessToken) {
+              recoveryOwnsNavigation.current = false;
+              return;
+            }
+            if (current.isAuthenticated || current.isLoading) {
+              // A newer identity has no usable token yet. Offer an explicit
+              // cookie recovery, never initiate another login automatically.
+              setRecoveryUnavailable(true);
+              return;
+            }
+            recoveryOwnsNavigation.current = false;
+            requestLoginRedirect();
+            return;
+          }
+          recoveryOwnsNavigation.current = false;
+          if (outcome !== 'restored') {
+            requestLoginRedirect('/login?error=cf-access');
           }
         });
         return () => { cancelled = true; };
       }
     }
+
+    // A consumed CF handoff remains owned here until explicit retry or success.
+    if (cfRecoveryRequested.current && (isRecovering || recoveryUnavailable)) return;
 
     // Slow path: authenticated but no token (e.g. first load after login on
     // another tab). `!isRecovering` keeps it out of the stale-persisted-auth +
@@ -261,11 +318,13 @@ export default function AuthOverlay() {
     // would otherwise race it with a dead-cookie refresh whose failure
     // redirects to a bare /login mid-exchange.
     if (isAuthenticated && !tokens?.accessToken && !recoverAttempted && !isRecovering) {
+      recoveryOwnsNavigation.current = true;
       setRecoverAttempted(true);
       setIsRecovering(true);
 
       void restoreAccessTokenFromCookieDetailed().then((outcome) => {
-        if (cancelled) return;
+        // Local recovery state rerenders this effect before the request finishes.
+          if (!mounted.current) return;
         setIsRecovering(false);
 
         // 'throttled' (#3696) is NOT a dead session — the server rate-limited
@@ -274,8 +333,13 @@ export default function AuthOverlay() {
         // why the page is waiting and retries when the window elapses.
         if (outcome === 'throttled') return;
 
-        if (outcome !== 'restored') {
-          redirectToLogin();
+        if (outcome === 'transient') {
+          setRecoveryUnavailable(true);
+          return;
+        }
+        recoveryOwnsNavigation.current = false;
+        if (outcome === 'auth-failed' || outcome === 'origin-rejected') {
+          requestLoginRedirect();
         }
       });
 
@@ -295,11 +359,22 @@ export default function AuthOverlay() {
     // notice and no deep link. `sessionExpiredReason` is the flag that the
     // expiry flow is in progress — never drop this guard.
     if (!isAuthenticated && !sessionExpiredReason) {
-      redirectToLogin();
+      requestLoginRedirect();
     }
 
     return () => { cancelled = true; };
-  }, [isAuthenticated, isLoading, isChecking, tokens, recoverAttempted, isRecovering, cfBootstrapAttempted, ssoBootstrapAttempted, sessionExpiredReason]);
+  }, [isAuthenticated, isLoading, isChecking, tokens, recoverAttempted, isRecovering, recoveryUnavailable, cfBootstrapAttempted, ssoBootstrapAttempted, sessionExpiredReason]);
+
+  // #9927 / #9586: a session whose stored user has no permission list (signup
+  // auto-login, forced-MFA hand-off, a blob persisted before /users/me
+  // answered) would keep every permission-gated nav item hidden until the next
+  // login-page sign-in. Once the access token is in hand, read /users/me once
+  // per session; the store helper owns the once-per-session guard.
+  const hasAccessToken = !!tokens?.accessToken;
+  useEffect(() => {
+    if (isLoading || !isAuthenticated || !hasAccessToken || !permissionsUnknown) return;
+    void ensureSessionPermissions();
+  }, [isLoading, isAuthenticated, hasAccessToken, permissionsUnknown, sessionGeneration]);
 
   // Authenticated with token — fade out then unmount
   const shouldHide = !isChecking && !isLoading && isAuthenticated && !!tokens?.accessToken;
@@ -363,6 +438,22 @@ export default function AuthOverlay() {
     return <AuthThrottledMask retryAt={authThrottledUntil} />;
   }
 
+  if (recoveryUnavailable && !tokens?.accessToken) {
+    return (
+      <div className="fixed inset-0 z-50 flex items-center justify-center bg-background">
+        <div className="max-w-md space-y-4 p-6 text-center" role="status">
+          <p>Session recovery is taking longer than expected. Your sign-in has not been cleared.</p>
+          <p className="text-sm text-muted-foreground">Wait a moment, then retry. An earlier request may still be finishing.</p>
+          <button type="button" className="rounded-md border px-4 py-2" onClick={() => {
+            setRecoveryUnavailable(false);
+            setRecoverAttempted(false);
+            if (cfRecoveryRequested.current) setCfBootstrapAttempted(false);
+          }}>Retry session recovery</button>
+        </div>
+      </div>
+    );
+  }
+
   if (fadeState === 'hidden') {
     return null;
   }
@@ -386,13 +477,14 @@ export default function AuthOverlay() {
             ? t('common.loading', { defaultValue: 'Loading...' })
             : t('common.redirectingToLogin', { defaultValue: 'Redirecting to login...' })}
         </p>
+        {redirectTarget && (
+          <a href={redirectTarget} data-astro-reload className="mt-4 inline-block text-sm text-primary underline">
+            Continue to sign in
+          </a>
+        )}
       </div>
     </div>
   );
-}
-
-function redirectToLogin() {
-  void navigateTo('/login', { replace: true });
 }
 
 /**

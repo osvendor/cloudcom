@@ -14,7 +14,13 @@ export interface M365ConsentBrowserBinding {
   rawState: string;
   connectionId: string;
   consentAttemptId: string;
-  tenantHint: string | null;
+  /**
+   * identity_verification: the tenant the identity authority was pinned to, or
+   * null for `/organizations` (initial connect / reconnect of an unbound row).
+   * admin_consent: the tenant the identity phase cryptographically verified
+   * (required).
+   */
+  tenantId: string | null;
 }
 
 interface SignedBinding extends M365ConsentBrowserBinding {
@@ -53,14 +59,17 @@ function validBinding(value: unknown): value is SignedBinding {
     'expiresAt',
     'phase',
     'rawState',
-    'tenantHint',
+    'tenantId',
   ].sort().join(',')) return false;
   if (record.phase !== 'admin_consent' && record.phase !== 'identity_verification') return false;
   if (typeof record.rawState !== 'string' || record.rawState.length < 1 || record.rawState.length > 256) return false;
   if (!UUID.test(String(record.connectionId)) || !UUID.test(String(record.consentAttemptId))) return false;
   if (!Number.isSafeInteger(record.expiresAt)) return false;
-  if (record.phase === 'admin_consent') return record.tenantHint === null;
-  return typeof record.tenantHint === 'string' && GUID.test(record.tenantHint);
+  if (record.phase === 'admin_consent') {
+    return typeof record.tenantId === 'string' && GUID.test(record.tenantId);
+  }
+  return record.tenantId === null
+    || (typeof record.tenantId === 'string' && GUID.test(record.tenantId));
 }
 
 /**
@@ -194,12 +203,12 @@ export function createM365ConsentBinding(config: M365ConsentBindingConfig): M365
   };
 }
 
-// --- customer-graph-read instance (public names + values preserved byte-for-byte) ---
+// --- customer-graph-read instance (cookie name/path preserved; HMAC context v2 since #7910 W02) ---
 
 const READ_BINDING_CONFIG: M365ConsentBindingConfig = {
   cookieName: 'breeze_m365_graph_read_consent',
   cookiePath: '/api/v1/m365/consent/callback',
-  hmacContext: 'breeze:m365-customer-graph-read:browser-binding:v1',
+  hmacContext: 'breeze:m365-customer-graph-read:browser-binding:v2',
 };
 
 const readBinding = createM365ConsentBinding(READ_BINDING_CONFIG);
@@ -242,7 +251,7 @@ export function verifyM365ConsentBindingCookie(
 const ACTIONS_BINDING_CONFIG: M365ConsentBindingConfig = {
   cookieName: 'breeze_m365_graph_actions_consent',
   cookiePath: '/api/v1/m365/actions-consent/callback',
-  hmacContext: 'breeze:m365-customer-graph-actions:browser-binding:v1',
+  hmacContext: 'breeze:m365-customer-graph-actions:browser-binding:v2',
 };
 
 const actionsBinding = createM365ConsentBinding(ACTIONS_BINDING_CONFIG);

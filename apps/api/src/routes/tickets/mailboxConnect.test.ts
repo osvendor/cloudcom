@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
 import { createHmac } from 'crypto';
 
@@ -12,6 +12,8 @@ const TENANT_ID = '11111111-1111-4111-8111-111111111111';
 const ATTACKER_TENANT = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const MICROSOFT_OID = '55555555-5555-4555-8555-555555555555';
 const ATTEMPT_ID = '66666666-6666-4666-8666-666666666666';
+const ORG_ID = '77777777-7777-4777-8777-777777777777';
+const GMAIL_CONN_ID = '88888888-8888-4888-8888-888888888888';
 
 type PermissionName = 'ticket_mailbox:read' | 'ticket_mailbox:admin';
 type AuthState = {
@@ -22,10 +24,14 @@ type AuthState = {
   permissions: Set<PermissionName>;
 };
 
-const { authRef, mocks } = vi.hoisted(() => ({
+const { authRef, mocks, IdentityError } = vi.hoisted(() => ({
+  IdentityError: class MicrosoftIdentityVerificationError extends Error {
+    override readonly name = 'MicrosoftIdentityVerificationError';
+  },
   authRef: { current: null as AuthState | null },
   mocks: {
     createPendingConnection: vi.fn(),
+    createGmailConnection: vi.fn(),
     getMailboxConnection: vi.fn(),
     markPendingConsentFailed: vi.fn(async () => true),
     setConnectedMailboxStatus: vi.fn(async () => true),
@@ -36,6 +42,8 @@ const { authRef, mocks } = vi.hoisted(() => ({
     bindVerifiedTenant: vi.fn(async () => {}),
     listMailboxConnections: vi.fn(async (): Promise<unknown[]> => []),
     disableConnection: vi.fn(async () => true),
+    updateTrustedArcSealers: vi.fn(),
+    updateGmailHandling: vi.fn(),
     createAdminConsentSession: vi.fn(),
     createIdentityVerificationSession: vi.fn(),
     consumeConsentSession: vi.fn(),
@@ -94,6 +102,7 @@ vi.mock('../../services/ticketMailbox/mailboxToken', () => ({
 }));
 vi.mock('../../services/ticketMailbox/connectionService', () => ({
   createPendingConnection: mocks.createPendingConnection,
+  createGmailConnection: mocks.createGmailConnection,
   getMailboxConnection: mocks.getMailboxConnection,
   markPendingConsentFailed: mocks.markPendingConsentFailed,
   setConnectedMailboxStatus: mocks.setConnectedMailboxStatus,
@@ -104,6 +113,8 @@ vi.mock('../../services/ticketMailbox/connectionService', () => ({
   bindVerifiedTenant: mocks.bindVerifiedTenant,
   listMailboxConnections: mocks.listMailboxConnections,
   disableConnection: mocks.disableConnection,
+  updateGmailHandling: mocks.updateGmailHandling,
+  updateTrustedArcSealers: mocks.updateTrustedArcSealers,
   MAILBOX_VERIFICATION_FAILED: 'Mailbox verification failed',
 }));
 vi.mock('../../services/ticketMailbox/consentSessionService', () => ({
@@ -113,6 +124,7 @@ vi.mock('../../services/ticketMailbox/consentSessionService', () => ({
   hashTenantHint: mocks.hashTenantHint,
 }));
 vi.mock('../../services/ticketMailbox/microsoftIdentity', () => ({
+  MicrosoftIdentityVerificationError: IdentityError,
   buildMicrosoftAuthorizationUrl: vi.fn((input: Record<string, string>) => {
     const url = new URL(`https://login.microsoftonline.com/${input.tenantHint}/oauth2/v2.0/authorize`);
     Object.entries(input).forEach(([key, value]) => url.searchParams.set(key, value));
@@ -131,6 +143,7 @@ vi.mock('../../services/sentry', () => ({ captureException: mocks.captureExcepti
 
 import { PARTNER_WIDE_WRITE_DENIED_MESSAGE } from '../../services/partnerWideAccess';
 import { mailboxRoutes } from './mailboxConnect';
+import { ERROR_CODES } from '@breeze/shared';
 
 function cookieFor(
   phase: 'admin_consent' | 'identity_verification',
@@ -187,6 +200,21 @@ function adminAuth(overrides: Partial<AuthState> = {}): AuthState {
     permissions: new Set<PermissionName>(['ticket_mailbox:read', 'ticket_mailbox:admin']),
     ...overrides,
   };
+}
+
+// #6936: an early callback exit (untrusted state/binding/params) must land the
+// browser back on the settings card with a fixed reason code, never a bare JSON
+// 400 on the API origin, and must not touch the connection row or audit log.
+function expectCallbackRejected(response: Response, reason: string) {
+  expect(response.status).toBe(302);
+  expect(response.headers.get('location')).toBe(
+    `/settings/ticketing?ticketMailbox=error&reason=${reason}#email`,
+  );
+  expect(mocks.getMailboxConnection).not.toHaveBeenCalled();
+  expect(mocks.markPendingConsentFailed).not.toHaveBeenCalled();
+  expect(mocks.createIdentityVerificationSession).not.toHaveBeenCalled();
+  expect(mocks.bindVerifiedTenant).not.toHaveBeenCalled();
+  expect(mocks.writeAuditEvent).not.toHaveBeenCalled();
 }
 
 function expectNoLifecycleEffects() {
@@ -257,8 +285,29 @@ describe('M365 mailbox lifecycle routes', () => {
       expect(response.status).toBe(200);
       await expect(response.json()).resolves.toEqual({
         connections: [{ id: CONNECTION_ID, mailboxAddress: 'support@example.com' }],
+        appId: 'platform-client-id',
+        // #6936: the exact redirect URI to register on the Entra app, computed
+        // by the same resolver the consent flow uses.
+        redirectUri: 'https://app.example.com/api/v1/tickets/mailbox/callback',
       });
       expect(mocks.listMailboxConnections).toHaveBeenCalledWith(PARTNER_ID);
+    });
+
+    it('returns the public app id at runtime but never the client secret (#6935)', async () => {
+      mocks.listMailboxConnections.mockResolvedValue([]);
+      const response = await app.request('/connections');
+      expect(response.status).toBe(200);
+      const text = await response.text();
+      expect(JSON.parse(text)).toEqual({ connections: [], appId: 'platform-client-id', redirectUri: 'https://app.example.com/api/v1/tickets/mailbox/callback' });
+      expect(text).not.toContain('platform-client-secret');
+    });
+
+    it('returns appId null when the Breeze Ticketing app is not configured (#6935)', async () => {
+      mocks.platformConfig.mockReturnValue(null);
+      mocks.listMailboxConnections.mockResolvedValue([]);
+      const response = await app.request('/connections');
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toEqual({ connections: [], appId: null, redirectUri: 'https://app.example.com/api/v1/tickets/mailbox/callback' });
     });
 
     it('allows system scope only when auth supplies a server-derived partner', async () => {
@@ -309,7 +358,7 @@ describe('M365 mailbox lifecycle routes', () => {
       authRef.current = adminAuth({ partnerOrgAccess: orgAccess });
       const response = await request(app);
       expect(response.status).toBe(403);
-      await expect(response.json()).resolves.toEqual({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE });
+      await expect(response.json()).resolves.toEqual({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE, code: ERROR_CODES.ACCESS_DENIED });
       expectNoLifecycleEffects();
     });
 
@@ -456,7 +505,7 @@ describe('M365 mailbox lifecycle routes', () => {
     const response = await app.request('/callback?state=admin-state&tenant=11111111-1111-4111-8111-111111111111&admin_consent=True', {
       headers: cookie ? { cookie: `ticket_mailbox_oauth_state=${cookie}` } : undefined,
     });
-    expect(response.status).toBe(400);
+    expectCallbackRejected(response, 'binding_mismatch');
     expect(mocks.consumeConsentSession).not.toHaveBeenCalled();
     expect(mocks.writeAuditEvent).not.toHaveBeenCalled();
   });
@@ -500,6 +549,20 @@ describe('M365 mailbox lifecycle routes', () => {
     expect(JSON.stringify(mocks.writeAuditEvent.mock.calls)).not.toContain('platform-client-secret');
   });
 
+  it('keeps identity verification and tenant binding when the platform uses the Cloud Command certificate', async () => {
+    mocks.platformConfig.mockResolvedValueOnce({ clientId: 'cloud-command-app', credentialVersion: 'cert-1' });
+    const state = 'identity-state';
+    const response = await app.request(`/callback?state=${state}&code=authorization-code`, {
+      headers: { cookie: `ticket_mailbox_oauth_state=${cookieFor('identity_verification', state)}` },
+    });
+    expect(response.headers.get('location')).toContain('ticketMailbox=connected');
+    expect(mocks.exchangeMicrosoftAuthorizationCode).toHaveBeenCalledWith(expect.objectContaining({ clientId: 'cloud-command-app', credentialVersion: 'cert-1', codeVerifier: 'stored-code-verifier' }));
+    expect(mocks.exchangeMicrosoftAuthorizationCode.mock.calls[0]![0]).not.toHaveProperty('clientSecret');
+    expect(mocks.verifyMicrosoftAdminIdToken).toHaveBeenCalledWith('verified-id-token', { tenantHint: TENANT_ID, clientId: 'cloud-command-app', nonce: 'stored-nonce' });
+    expect(mocks.probeMailbox).toHaveBeenCalledWith(TENANT_ID, 'support@example.com');
+    expect(mocks.bindVerifiedTenant).toHaveBeenCalledTimes(1);
+  });
+
   it('cannot bind a completed callback after a newer connect attempt replaced its generation', async () => {
     mocks.bindVerifiedTenant.mockRejectedValue(new Error('Pending mailbox connection attempt is stale'));
     mocks.markPendingConsentFailed.mockResolvedValue(false);
@@ -524,7 +587,7 @@ describe('M365 mailbox lifecycle routes', () => {
       },
     });
 
-    expect(response.status).toBe(400);
+    expectCallbackRejected(response, 'binding_mismatch');
     expect(mocks.consumeConsentSession).toHaveBeenCalledWith('identity-state', 'identity_verification');
     expect(mocks.exchangeMicrosoftAuthorizationCode).not.toHaveBeenCalled();
     expect(mocks.verifyMicrosoftAdminIdToken).not.toHaveBeenCalled();
@@ -541,7 +604,7 @@ describe('M365 mailbox lifecycle routes', () => {
       headers: { cookie: `ticket_mailbox_oauth_state=identity_verification.${mac}` },
     });
 
-    expect(response.status).toBe(400);
+    expectCallbackRejected(response, 'binding_mismatch');
     expect(mocks.consumeConsentSession).not.toHaveBeenCalled();
     expect(mocks.exchangeMicrosoftAuthorizationCode).not.toHaveBeenCalled();
     expect(mocks.probeMailbox).not.toHaveBeenCalled();
@@ -556,7 +619,7 @@ describe('M365 mailbox lifecycle routes', () => {
       headers: cookie ? { cookie: `ticket_mailbox_oauth_state=${cookie}` } : undefined,
     });
 
-    expect(response.status).toBe(400);
+    expectCallbackRejected(response, 'binding_mismatch');
     expect(mocks.consumeConsentSession).not.toHaveBeenCalled();
     expect(mocks.exchangeMicrosoftAuthorizationCode).not.toHaveBeenCalled();
     expect(mocks.verifyMicrosoftAdminIdToken).not.toHaveBeenCalled();
@@ -570,7 +633,7 @@ describe('M365 mailbox lifecycle routes', () => {
       `/callback?state=${identityState}&code=authorization-code&tenant=${ATTACKER_TENANT}`,
       { headers: { cookie: `ticket_mailbox_oauth_state=${cookieFor('identity_verification', identityState)}` } },
     );
-    expect(response.status).toBe(400);
+    expectCallbackRejected(response, 'invalid_callback');
     expect(mocks.consumeConsentSession).not.toHaveBeenCalled();
     expect(mocks.probeMailbox).not.toHaveBeenCalled();
     expect(mocks.bindVerifiedTenant).not.toHaveBeenCalled();
@@ -674,15 +737,15 @@ describe('M365 mailbox lifecycle routes', () => {
     const response = await app.request('/callback?state=identity-state&code=authorization-code', {
       headers: { cookie: `ticket_mailbox_oauth_state=${cookieFor('identity_verification', 'identity-state')}` },
     });
-    expect(response.status).toBe(400);
+    expectCallbackRejected(response, 'expired');
     expect(mocks.exchangeMicrosoftAuthorizationCode).not.toHaveBeenCalled();
     expect(mocks.probeMailbox).not.toHaveBeenCalled();
     expect(mocks.bindVerifiedTenant).not.toHaveBeenCalled();
     expect(mocks.writeAuditEvent).not.toHaveBeenCalled();
   });
 
-  it('never binds tenant ownership when the stored mailbox probe fails', async () => {
-    mocks.probeMailbox.mockResolvedValue({ ok: false, error: 'Graph leaked body' });
+  it('never binds tenant ownership when the probe fails for an auth/consent reason (re-consent is the right next step)', async () => {
+    mocks.probeMailbox.mockResolvedValue({ ok: false, kind: 'auth', error: 'Graph leaked body' });
     const response = await app.request('/callback?state=identity-state&code=authorization-code', {
       headers: { cookie: `ticket_mailbox_oauth_state=${cookieFor('identity_verification', 'identity-state')}` },
     });
@@ -700,8 +763,55 @@ describe('M365 mailbox lifecycle routes', () => {
     expect(JSON.stringify(mocks.writeAuditEvent.mock.calls)).not.toContain('Graph leaked body');
   });
 
+  it.each([
+    ['policy not yet propagated (403)', 'policy', 'Graph 403 (ErrorAccessDenied)'],
+    ['mailbox not found yet (404)', 'policy', 'Graph 404 (ErrorInvalidUser)'],
+    ['transient Graph outage (503)', 'transient', 'Graph 503'],
+  ] as const)('#7569: %s keeps the verified tenant bound in `error` so the Application Access step stays visible', async (_l, kind, reason) => {
+    mocks.probeMailbox.mockResolvedValue({ ok: false, kind, error: 'x', reason });
+    const response = await app.request('/callback?state=identity-state&code=authorization-code', {
+      headers: { cookie: `ticket_mailbox_oauth_state=${cookieFor('identity_verification', 'identity-state')}` },
+    });
+    expect(response.status).toBe(302);
+    expect(response.headers.get('location')).toContain('ticketMailbox=needs_policy');
+    expect(mocks.bindVerifiedTenant).toHaveBeenCalledWith(
+      CONNECTION_ID, PARTNER_ID, ATTEMPT_ID, TENANT_ID,
+      { microsoftOid: MICROSOFT_OID, breezeUserId: USER_ID },
+      { status: 'error', lastError: `Mailbox verification failed: ${reason}` },
+    );
+    expect(mocks.markPendingConsentFailed).not.toHaveBeenCalled();
+    expect(mocks.writeAuditEvent).toHaveBeenCalledTimes(1);
+    expect(mocks.writeAuditEvent).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: 'ticket_mailbox.verification_failed',
+      details: expect.objectContaining({ outcome: 'probe_failed', probeReason: reason }),
+    }));
+  });
+
+  it('#7569: falls back to reauth_required when the tenant cannot be bound after a non-auth probe failure', async () => {
+    mocks.probeMailbox.mockResolvedValue({ ok: false, kind: 'policy', error: 'x', reason: 'Graph 403' });
+    mocks.bindVerifiedTenant.mockRejectedValue(new Error('Mailbox tenant is already owned by another partner'));
+    const response = await app.request('/callback?state=identity-state&code=authorization-code', {
+      headers: { cookie: `ticket_mailbox_oauth_state=${cookieFor('identity_verification', 'identity-state')}` },
+    });
+    expect(response.status).toBe(302);
+    expect(response.headers.get('location')).toContain('ticketMailbox=error');
+    expect(mocks.markPendingConsentFailed).toHaveBeenCalled();
+    expect(mocks.writeAuditEvent).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      details: expect.objectContaining({ outcome: 'ownership_conflict' }),
+    }));
+  });
+
+  it('#7569: an absent probe kind fails closed to reauth_required (no tenant bind)', async () => {
+    mocks.probeMailbox.mockResolvedValue({ ok: false, error: 'x' });
+    await app.request('/callback?state=identity-state&code=authorization-code', {
+      headers: { cookie: `ticket_mailbox_oauth_state=${cookieFor('identity_verification', 'identity-state')}` },
+    });
+    expect(mocks.bindVerifiedTenant).not.toHaveBeenCalled();
+    expect(mocks.markPendingConsentFailed).toHaveBeenCalled();
+  });
+
   it('carries the sanitized probe reason into lastError and the audit details', async () => {
-    mocks.probeMailbox.mockResolvedValue({ ok: false, error: 'Graph returned 403', reason: 'Graph 403 (ErrorAccessDenied)' });
+    mocks.probeMailbox.mockResolvedValue({ ok: false, kind: 'auth', error: 'Graph returned 401', reason: 'Graph 403 (ErrorAccessDenied)' });
     await app.request('/callback?state=identity-state&code=authorization-code', {
       headers: { cookie: `ticket_mailbox_oauth_state=${cookieFor('identity_verification', 'identity-state')}` },
     });
@@ -795,7 +905,7 @@ describe('M365 mailbox lifecycle routes', () => {
     mocks.getMailboxConnection.mockResolvedValue(connection({ status, tenantId }));
     const response = await app.request(`/connections/${CONNECTION_ID}/retest`, { method: 'POST' });
     expect(response.status).toBe(409);
-    await expect(response.json()).resolves.toEqual({ error: 'Mailbox re-consent required' });
+    await expect(response.json()).resolves.toEqual({ error: 'Mailbox re-consent required', code: ERROR_CODES.MAILBOX_RECONSENT_REQUIRED });
     expect(mocks.probeMailbox).not.toHaveBeenCalled();
     expect(mocks.writeRouteAudit).not.toHaveBeenCalled();
   });
@@ -854,7 +964,7 @@ describe('M365 mailbox lifecycle routes', () => {
     const response = await retest;
 
     expect(response.status).toBe(409);
-    await expect(response.json()).resolves.toEqual({ error: 'Mailbox connection changed during retest' });
+    await expect(response.json()).resolves.toEqual({ error: 'Mailbox connection changed during retest', code: ERROR_CODES.CONFLICT });
     expect(mocks.writeRouteAudit).toHaveBeenCalledTimes(1);
     expect(mocks.writeRouteAudit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       action: 'ticket_mailbox.retested',
@@ -927,7 +1037,7 @@ describe('M365 mailbox lifecycle routes', () => {
     const response = await app.request(path, {
       headers: { cookie: `ticket_mailbox_oauth_state=${cookieFor(phase as never, state)}` },
     });
-    expect(response.status).toBe(400);
+    expectCallbackRejected(response, 'invalid_callback');
     expect(mocks.consumeConsentSession).not.toHaveBeenCalled();
     expect(mocks.probeMailbox).not.toHaveBeenCalled();
     expect(mocks.bindVerifiedTenant).not.toHaveBeenCalled();
@@ -951,10 +1061,21 @@ describe('M365 mailbox lifecycle routes', () => {
     const response = await app.request(path, {
       headers: { cookie: `ticket_mailbox_oauth_state=${cookieFor(phase as never, state)}` },
     });
-    expect(response.status).toBe(400);
+    expectCallbackRejected(response, 'invalid_callback');
     expect(mocks.consumeConsentSession).not.toHaveBeenCalled();
     expect(mocks.probeMailbox).not.toHaveBeenCalled();
     expect(mocks.bindVerifiedTenant).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['no query at all', '/callback'],
+    ['an empty state', '/callback?state=&code=authorization-code'],
+  ])('redirects a callback with %s back to the card without consuming state', async (_label, path) => {
+    const response = await app.request(path, {
+      headers: { cookie: `ticket_mailbox_oauth_state=${cookieFor('identity_verification', 'identity-state')}` },
+    });
+    expectCallbackRejected(response, 'invalid_callback');
+    expect(mocks.consumeConsentSession).not.toHaveBeenCalled();
   });
 
   it.each(['state', 'code', 'tenant', 'admin_consent', 'error'])(
@@ -967,10 +1088,406 @@ describe('M365 mailbox lifecycle routes', () => {
       const response = await app.request(`${base.pathname}${base.search}`, {
         headers: { cookie: `ticket_mailbox_oauth_state=${cookieFor('identity_verification', 'identity-state')}` },
       });
-      expect(response.status).toBe(400);
+      expectCallbackRejected(response, 'invalid_callback');
       expect(mocks.consumeConsentSession).not.toHaveBeenCalled();
       expect(mocks.probeMailbox).not.toHaveBeenCalled();
       expect(mocks.bindVerifiedTenant).not.toHaveBeenCalled();
     },
   );
+  // Self-hosters have no Sentry DSN: every consent-callback failure must leave
+  // one sanitized `[ticketMailbox]` line in stdout (`docker logs`), and never
+  // tokens, codes, state, cookies, query tenant hints or raw Microsoft text.
+  describe('stdout diagnostics for callback failures', () => {
+    const SECRET_BITS = ['admin-state', 'identity-state', 'authorization-code', 'stored-nonce', 'stored-code-verifier'];
+
+    function warnCalls(): string {
+      return JSON.stringify(vi.mocked(console.warn).mock.calls);
+    }
+
+    beforeEach(() => {
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+    });
+    afterEach(() => {
+      vi.mocked(console.warn).mockRestore();
+    });
+
+    it('logs a provider error with only its validated code and AADSTS number, never the raw description', async () => {
+      const response = await app.request(
+        '/callback?state=identity-state&error=invalid_client&error_description=AADSTS7000215%3A+Invalid+client+secret+provided+for+app+xyz-SECRET-HINT',
+        { headers: { cookie: `ticket_mailbox_oauth_state=${cookieFor('identity_verification', 'identity-state')}` } },
+      );
+      expect(response.status).toBe(302);
+      expect(console.warn).toHaveBeenCalledWith('[ticketMailbox] consent callback failed', expect.objectContaining({
+        connectionId: CONNECTION_ID,
+        phase: 'identity_verification',
+        outcome: 'invalid_identity',
+        step: 'provider_error',
+        providerError: 'invalid_client',
+        aadsts: 'AADSTS7000215',
+      }));
+      const logged = warnCalls();
+      expect(logged).not.toContain('Invalid client secret');
+      expect(logged).not.toContain('SECRET-HINT');
+      for (const bit of SECRET_BITS) expect(logged).not.toContain(bit);
+    });
+
+    it('replaces an unexpected provider error code rather than echoing it', async () => {
+      await app.request(
+        '/callback?state=identity-state&error=Evil%20Code%3Cscript%3E',
+        { headers: { cookie: `ticket_mailbox_oauth_state=${cookieFor('identity_verification', 'identity-state')}` } },
+      );
+      expect(console.warn).toHaveBeenCalledWith('[ticketMailbox] consent callback failed', expect.objectContaining({
+        outcome: 'invalid_identity', providerError: 'unrecognized',
+      }));
+      expect(warnCalls()).not.toContain('Evil');
+      expect(warnCalls()).not.toContain('aadsts');
+    });
+
+    it.each([
+      ['an ownership conflict', new Error(`Mailbox tenant is already owned by another partner: ${OTHER_PARTNER_ID}`), 'ownership_conflict'],
+      ['any other bind failure', new Error('connection reset'), 'invalid_identity'],
+    ])('logs %s at tenant binding with its outcome', async (_label, error, outcome) => {
+      mocks.bindVerifiedTenant.mockRejectedValue(error);
+      await app.request('/callback?state=identity-state&code=authorization-code', {
+        headers: { cookie: `ticket_mailbox_oauth_state=${cookieFor('identity_verification', 'identity-state')}` },
+      });
+      expect(console.warn).toHaveBeenCalledWith('[ticketMailbox] consent callback failed', expect.objectContaining({
+        connectionId: CONNECTION_ID, outcome, step: 'tenant_binding',
+      }));
+      expect(warnCalls()).not.toContain(OTHER_PARTNER_ID);
+      expect(warnCalls()).not.toContain('connection reset');
+    });
+
+    it('logs a non-identity exception during verification with its error class only', async () => {
+      mocks.exchangeMicrosoftAuthorizationCode.mockRejectedValue(new TypeError('fetch failed: raw socket detail'));
+      await app.request('/callback?state=identity-state&code=authorization-code', {
+        headers: { cookie: `ticket_mailbox_oauth_state=${cookieFor('identity_verification', 'identity-state')}` },
+      });
+      expect(console.warn).toHaveBeenCalledWith('[ticketMailbox] consent callback failed', expect.objectContaining({
+        outcome: 'invalid_identity', step: 'unexpected_error', errorName: 'TypeError',
+      }));
+      expect(warnCalls()).not.toContain('raw socket detail');
+    });
+
+    it('logs an identity-check rejection as identity_verification (the check itself is logged by the service)', async () => {
+      mocks.verifyMicrosoftAdminIdToken.mockRejectedValue(new IdentityError('Microsoft identity verification failed'));
+      await app.request('/callback?state=identity-state&code=authorization-code', {
+        headers: { cookie: `ticket_mailbox_oauth_state=${cookieFor('identity_verification', 'identity-state')}` },
+      });
+      expect(console.warn).toHaveBeenCalledTimes(1);
+      expect(console.warn).toHaveBeenCalledWith('[ticketMailbox] consent callback failed', expect.objectContaining({
+        outcome: 'invalid_identity', step: 'identity_verification',
+      }));
+    });
+
+    it('logs a replaced consent attempt as stale_attempt', async () => {
+      mocks.getMailboxConnection.mockResolvedValue(connection({ consentAttemptId: '12121212-1212-4212-8212-121212121212' }));
+      await app.request('/callback?state=identity-state&code=authorization-code', {
+        headers: { cookie: `ticket_mailbox_oauth_state=${cookieFor('identity_verification', 'identity-state')}` },
+      });
+      expect(console.warn).toHaveBeenCalledWith('[ticketMailbox] consent callback failed', expect.objectContaining({
+        connectionId: CONNECTION_ID, outcome: 'stale_attempt', step: 'attempt_replaced',
+      }));
+    });
+
+    it('logs an unconfigured platform app', async () => {
+      mocks.platformConfig.mockReturnValue(null);
+      await app.request('/callback?state=identity-state&code=authorization-code', {
+        headers: { cookie: `ticket_mailbox_oauth_state=${cookieFor('identity_verification', 'identity-state')}` },
+      });
+      expect(console.warn).toHaveBeenCalledWith('[ticketMailbox] consent callback failed', expect.objectContaining({
+        outcome: 'invalid_identity', step: 'platform_not_configured',
+      }));
+    });
+
+    it('logs a failed identity-session setup after admin consent', async () => {
+      mocks.createIdentityVerificationSession.mockRejectedValue(new Error('db down'));
+      await app.request(`/callback?state=admin-state&tenant=${TENANT_ID}&admin_consent=True`, {
+        headers: { cookie: `ticket_mailbox_oauth_state=${cookieFor('admin_consent', 'admin-state')}` },
+      });
+      expect(console.warn).toHaveBeenCalledWith('[ticketMailbox] consent callback failed', expect.objectContaining({
+        phase: 'admin_consent', outcome: 'invalid_identity', step: 'identity_session_setup',
+      }));
+      expect(warnCalls()).not.toContain(TENANT_ID);
+    });
+
+    it('logs a failed connection lookup', async () => {
+      mocks.getMailboxConnection.mockRejectedValue(new Error('db down'));
+      await app.request('/callback?state=identity-state&code=authorization-code', {
+        headers: { cookie: `ticket_mailbox_oauth_state=${cookieFor('identity_verification', 'identity-state')}` },
+      });
+      expect(console.warn).toHaveBeenCalledWith('[ticketMailbox] consent callback failed', expect.objectContaining({
+        outcome: 'invalid_identity', step: 'connection_lookup',
+      }));
+    });
+
+    it.each([
+      ['binding_mismatch', '/callback?state=admin-state&tenant=11111111-1111-4111-8111-111111111111&admin_consent=True', undefined],
+      ['invalid_callback', '/callback?state=identity-state&code=authorization-code&tenant=' + ATTACKER_TENANT, cookieFor('identity_verification', 'identity-state')],
+      ['expired', '/callback?state=identity-state&code=authorization-code', cookieFor('identity_verification', 'identity-state')],
+    ])('logs a pre-session %s rejection with its reason and no connection id or query data', async (reason, path, cookie) => {
+      if (reason === 'expired') mocks.consumeConsentSession.mockResolvedValue(null);
+      await app.request(path, { headers: cookie ? { cookie: `ticket_mailbox_oauth_state=${cookie}` } : undefined });
+      expect(console.warn).toHaveBeenCalledWith('[ticketMailbox] consent callback rejected', expect.objectContaining({ reason }));
+      const logged = warnCalls();
+      expect(logged).not.toContain('connectionId');
+      expect(logged).not.toContain(ATTACKER_TENANT);
+      expect(logged).not.toContain(TENANT_ID);
+      for (const bit of SECRET_BITS) expect(logged).not.toContain(bit);
+    });
+  });
+});
+
+describe('POST /connect/gmail (production Gmail connect route, #6593)', () => {
+  let app: Hono;
+
+  const gmailBody = (overrides: Record<string, unknown> = {}) => ({
+    orgId: ORG_ID, mailboxAddress: 'help@client.example', displayName: 'Support', ...overrides,
+  });
+  const postGmail = (target: Hono, body: Record<string, unknown> = gmailBody()) =>
+    target.request('/connect/gmail', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    authRef.current = adminAuth();
+    mocks.createGmailConnection.mockResolvedValue({ ok: true, id: GMAIL_CONN_ID });
+    app = new Hono();
+    app.route('/', mailboxRoutes);
+  });
+
+  it('denies unauthenticated callers', async () => {
+    authRef.current = null;
+    expect((await postGmail(app)).status).toBe(401);
+    expect(mocks.createGmailConnection).not.toHaveBeenCalled();
+  });
+
+  it('denies callers missing mailbox admin', async () => {
+    authRef.current = adminAuth({ permissions: new Set(['ticket_mailbox:read']) });
+    expect((await postGmail(app)).status).toBe(403);
+    expect(mocks.createGmailConnection).not.toHaveBeenCalled();
+  });
+
+  it('denies callers missing MFA', async () => {
+    authRef.current = adminAuth({ mfa: false });
+    expect((await postGmail(app)).status).toBe(403);
+    expect(mocks.createGmailConnection).not.toHaveBeenCalled();
+  });
+
+  it.each(['selected', 'none'] as const)('denies partner orgAccess=%s before the service or audit', async (orgAccess) => {
+    authRef.current = adminAuth({ partnerOrgAccess: orgAccess });
+    const response = await postGmail(app);
+    expect(response.status).toBe(403);
+    await expect(response.json()).resolves.toEqual({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE, code: ERROR_CODES.ACCESS_DENIED });
+    expect(mocks.createGmailConnection).not.toHaveBeenCalled();
+    expect(mocks.writeRouteAudit).not.toHaveBeenCalled();
+  });
+
+  it('rejects an invalid body (missing orgId, bad email) before the service', async () => {
+    expect((await postGmail(app, { mailboxAddress: 'help@client.example' } as Record<string, unknown>)).status).toBe(400);
+    expect((await postGmail(app, gmailBody({ mailboxAddress: 'not-an-email' }))).status).toBe(400);
+    expect(mocks.createGmailConnection).not.toHaveBeenCalled();
+  });
+
+  it('provisions the connection, returns the connected DTO, and audits once', async () => {
+    const response = await postGmail(app);
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ connectionId: GMAIL_CONN_ID, status: 'connected' });
+    expect(mocks.createGmailConnection).toHaveBeenCalledWith({
+      partnerId: PARTNER_ID, orgId: ORG_ID, mailboxAddress: 'help@client.example',
+      displayName: 'Support', createdBy: USER_ID,
+    });
+    expect(mocks.writeRouteAudit).toHaveBeenCalledTimes(1);
+    expect(mocks.writeRouteAudit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      orgId: ORG_ID, action: 'ticket_mailbox.gmail_connected',
+      resourceId: GMAIL_CONN_ID, resourceName: 'help@client.example',
+      details: { provider: 'gmail' },
+    }));
+  });
+
+  it.each([
+    ['org_not_in_partner', 404],
+    ['no_google_connection', 400],
+    ['mailbox_unreadable', 422],
+  ] as const)('maps service failure %s to HTTP %d and does not audit', async (code, status) => {
+    mocks.createGmailConnection.mockResolvedValue({ ok: false, code, error: `err:${code}` });
+    const response = await postGmail(app);
+    expect(response.status).toBe(status);
+    await expect(response.json()).resolves.toEqual({ error: `err:${code}` });
+    expect(mocks.writeRouteAudit).not.toHaveBeenCalled();
+  });
+});
+
+describe('PATCH /connections/:id/trusted-arc-sealers (#10862)', () => {
+  let app: Hono;
+  const M365_ID = '33333333-3333-4333-8333-333333333333';
+
+  const patch = (target: Hono, body: unknown, id = M365_ID) =>
+    target.request(`/connections/${id}/trusted-arc-sealers`, {
+      method: 'PATCH', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    authRef.current = adminAuth();
+    mocks.updateTrustedArcSealers.mockResolvedValue({ id: M365_ID, mailboxAddress: 'help@client.example' });
+    app = new Hono();
+    app.route('/', mailboxRoutes);
+  });
+
+  it('denies unauthenticated, read-only and non-MFA callers before the service', async () => {
+    authRef.current = null;
+    expect((await patch(app, { sealers: ['gateway.example'] })).status).toBe(401);
+    authRef.current = adminAuth({ permissions: new Set(['ticket_mailbox:read']) });
+    expect((await patch(app, { sealers: ['gateway.example'] })).status).toBe(403);
+    authRef.current = adminAuth({ mfa: false });
+    expect((await patch(app, { sealers: ['gateway.example'] })).status).toBe(403);
+    expect(mocks.updateTrustedArcSealers).not.toHaveBeenCalled();
+  });
+
+  it.each(['selected', 'none'] as const)('denies partner orgAccess=%s before the service or audit', async (orgAccess) => {
+    authRef.current = adminAuth({ partnerOrgAccess: orgAccess });
+    expect((await patch(app, { sealers: ['gateway.example'] })).status).toBe(403);
+    expect(mocks.updateTrustedArcSealers).not.toHaveBeenCalled();
+    expect(mocks.writeRouteAudit).not.toHaveBeenCalled();
+  });
+
+  it('saves the list, audits once and returns it', async () => {
+    const response = await patch(app, { sealers: ['gateway.example', 'mx.gateway.example'] });
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ ok: true, trustedArcSealers: ['gateway.example', 'mx.gateway.example'] });
+    expect(mocks.updateTrustedArcSealers).toHaveBeenCalledWith(M365_ID, PARTNER_ID, ['gateway.example', 'mx.gateway.example']);
+    expect(mocks.writeRouteAudit).toHaveBeenCalledTimes(1);
+    expect(mocks.writeRouteAudit.mock.calls[0]![1]).toMatchObject({
+      action: 'ticket_mailbox.trusted_arc_sealers_updated',
+      details: { provider: 'm365', sealers: ['gateway.example', 'mx.gateway.example'] },
+    });
+  });
+
+  it('accepts an empty list, which turns it off', async () => {
+    expect((await patch(app, { sealers: [] })).status).toBe(200);
+    expect(mocks.updateTrustedArcSealers).toHaveBeenCalledWith(M365_ID, PARTNER_ID, []);
+  });
+
+  it.each([
+    ['uppercase', ['Gateway.Example']],
+    ['single label', ['localhost']],
+    ['a public suffix alone', ['co.uk']],
+    ['a wildcard', ['*.gateway.example']],
+    ['an email address', ['a@gateway.example']],
+    ['a trailing dot', ['gateway.example.']],
+    ['a leading hyphen', ['-gateway.example']],
+    ['surrounding space', [' gateway.example']],
+    ['an IP address', ['192.0.2.1']],
+    ['a too-long name', [`${'a'.repeat(250)}.example`]],
+    ['a duplicate', ['gateway.example', 'gateway.example']],
+    ['too many entries', Array.from({ length: 11 }, (_, i) => `g${i}.example`)],
+    ["Exchange's own sealing domain", ['microsoft.com']],
+    ["a mail provider's shared sealing domain", ['google.com']],
+    ['a host under a shared provider domain', ['arc.outlook.com']],
+  ])('rejects %s before the service', async (_label, sealers) => {
+    expect((await patch(app, { sealers })).status).toBe(400);
+    expect(mocks.updateTrustedArcSealers).not.toHaveBeenCalled();
+  });
+
+  it('rejects an unknown field, a missing or non-array list, and a non-uuid id', async () => {
+    expect((await patch(app, { sealers: [], extra: 1 })).status).toBe(400);
+    expect((await patch(app, {})).status).toBe(400);
+    expect((await patch(app, { sealers: 'gateway.example' })).status).toBe(400);
+    expect((await patch(app, { sealers: [] }, 'not-a-uuid')).status).toBe(400);
+    expect(mocks.updateTrustedArcSealers).not.toHaveBeenCalled();
+  });
+
+  it('denies organization scope before the service or audit', async () => {
+    authRef.current = adminAuth({ scope: 'organization', partnerId: null, partnerOrgAccess: null });
+    expect((await patch(app, { sealers: [] })).status).toBe(403);
+    expect(mocks.updateTrustedArcSealers).not.toHaveBeenCalled();
+    expect(mocks.writeRouteAudit).not.toHaveBeenCalled();
+  });
+
+  it('404s when no matching Microsoft 365 connection exists and writes no audit', async () => {
+    mocks.updateTrustedArcSealers.mockResolvedValue(null);
+    expect((await patch(app, { sealers: [] })).status).toBe(404);
+    expect(mocks.writeRouteAudit).not.toHaveBeenCalled();
+  });
+});
+
+describe('PATCH /connections/:id/gmail-handling (per-mailbox mark handled, #7949)', () => {
+  let app: Hono;
+
+  const patch = (target: Hono, body: unknown, id = GMAIL_CONN_ID) =>
+    target.request(`/connections/${id}/gmail-handling`, {
+      method: 'PATCH', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    authRef.current = adminAuth();
+    mocks.updateGmailHandling.mockResolvedValue({ id: GMAIL_CONN_ID, mailboxAddress: 'help@client.example', orgId: ORG_ID });
+    app = new Hono();
+    app.route('/', mailboxRoutes);
+  });
+
+  it('denies unauthenticated, read-only and non-MFA callers before the service', async () => {
+    authRef.current = null;
+    expect((await patch(app, { label: 'Breeze', archive: true })).status).toBe(401);
+    authRef.current = adminAuth({ permissions: new Set(['ticket_mailbox:read']) });
+    expect((await patch(app, { label: 'Breeze', archive: true })).status).toBe(403);
+    authRef.current = adminAuth({ mfa: false });
+    expect((await patch(app, { label: 'Breeze', archive: true })).status).toBe(403);
+    expect(mocks.updateGmailHandling).not.toHaveBeenCalled();
+  });
+
+  it.each(['selected', 'none'] as const)('denies partner orgAccess=%s before the service or audit', async (orgAccess) => {
+    authRef.current = adminAuth({ partnerOrgAccess: orgAccess });
+    const response = await patch(app, { label: 'Breeze', archive: true });
+    expect(response.status).toBe(403);
+    expect(mocks.updateGmailHandling).not.toHaveBeenCalled();
+    expect(mocks.writeRouteAudit).not.toHaveBeenCalled();
+  });
+
+  it('sets a trimmed label and the archive flag, and audits once', async () => {
+    const response = await patch(app, { label: '  Breeze/Ticketed ', archive: false });
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({
+      ok: true, gmailHandling: { label: 'Breeze/Ticketed', archive: false, error: null, errorAt: null },
+    });
+    expect(mocks.updateGmailHandling).toHaveBeenCalledWith(GMAIL_CONN_ID, PARTNER_ID, { label: 'Breeze/Ticketed', archive: false });
+    expect(mocks.writeRouteAudit).toHaveBeenCalledTimes(1);
+    expect(mocks.writeRouteAudit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      orgId: ORG_ID, action: 'ticket_mailbox.gmail_handling_updated', resourceId: GMAIL_CONN_ID,
+      details: { provider: 'gmail', enabled: true, archive: false },
+    }));
+  });
+
+  it.each([null, '', '   '])('turns it off for label %j', async (label) => {
+    expect((await patch(app, { label, archive: true })).status).toBe(200);
+    expect(mocks.updateGmailHandling).toHaveBeenCalledWith(GMAIL_CONN_ID, PARTNER_ID, { label: null, archive: true });
+  });
+
+  it.each(['INBOX', 'trash', 'CATEGORY_SOCIAL', 'x'.repeat(101)])('refuses unusable label %s with 400 before the service', async (label) => {
+    const response = await patch(app, { label, archive: true });
+    expect(response.status).toBe(400);
+    expect(mocks.updateGmailHandling).not.toHaveBeenCalled();
+    expect(mocks.writeRouteAudit).not.toHaveBeenCalled();
+  });
+
+  it('rejects a malformed body and unknown fields', async () => {
+    expect((await patch(app, { label: 'Breeze' })).status).toBe(400);
+    expect((await patch(app, { label: 'Breeze', archive: 'yes' })).status).toBe(400);
+    expect((await patch(app, { label: 'Breeze', archive: true, gmailHandledError: null })).status).toBe(400);
+    expect((await patch(app, { label: 'Breeze', archive: true }, 'not-a-uuid')).status).toBe(400);
+    expect(mocks.updateGmailHandling).not.toHaveBeenCalled();
+  });
+
+  it('returns 404 and does not audit when no live Gmail row of this partner matched', async () => {
+    mocks.updateGmailHandling.mockResolvedValue(null);
+    const response = await patch(app, { label: 'Breeze', archive: true });
+    expect(response.status).toBe(404);
+    expect(mocks.writeRouteAudit).not.toHaveBeenCalled();
+  });
 });

@@ -3,8 +3,8 @@ import { apiPost } from '../../lib/api';
 import { nativeCallbackUrl, type NativeLoginRequest } from '../../lib/nativeLogin';
 import NativeSignInConsent from './NativeSignInConsent';
 
-export default function NativeSignInPage({ accountName, request }: {
-  accountName: string; request: NativeLoginRequest | null;
+export default function NativeSignInPage({ accountName, request, unified = false }: {
+  accountName: string; request: NativeLoginRequest | null; unified?: boolean;
 }) {
   const inFlight = useRef(false);
   const [pending, setPending] = useState(false);
@@ -16,7 +16,7 @@ export default function NativeSignInPage({ accountName, request }: {
       const result = await apiPost<{ redirectUri: string }>('/portal/remote/native/authorize', request);
       const callback = nativeCallbackUrl(result.data?.redirectUri, request);
       if (!callback) throw new Error(result.error ?? 'A secure sign-in response was not provided. Try again from the app.');
-      window.location.assign(callback);
+      window.location.assign(unified ? `${callback}&authority=customer` : callback);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'Sign-in is unavailable. Try again from the app.');
     } finally { inFlight.current = false; setPending(false); }

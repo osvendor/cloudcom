@@ -61,6 +61,7 @@ import { getRedis, rateLimiter } from '../services';
 import { getActiveOrgTenant } from '../services/tenantStatus';
 import { authorizeHumanApiKeyCreator, authorizeServicePrincipalKey } from '../services/apiKeyAuthorization';
 import * as apiKeyAuthModule from './apiKeyAuth';
+import { MCP_SKIP_AMBIENT_DB_CONTEXT_KEY } from './mcpTenantToolSelfManagedContext';
 
 const { apiKeyAuthMiddleware, requireApiKeyScope } = apiKeyAuthModule;
 
@@ -356,6 +357,244 @@ describe('apiKeyAuth middleware', () => {
     expect(next).not.toHaveBeenCalled();
   });
 
+  it('accepts a human-delegated key whose creator epoch snapshot still matches the creator live epoch', async () => {
+    buildSequentialSelectMock([
+      [
+        {
+          id: 'key-epoch-match',
+          orgId: 'org-1',
+          name: 'Key',
+          keyPrefix: 'brz_',
+          keyHash: 'hash',
+          scopes: ['read'],
+          expiresAt: null,
+          rateLimit: 10,
+          usageCount: 0,
+          status: 'active',
+          createdBy: 'user-1',
+          principalType: 'human',
+          creatorAuthEpoch: 2,
+          creatorMfaEpoch: 1,
+        },
+      ],
+      [{ status: 'active', authEpoch: 2, mfaEpoch: 1 }],
+    ]);
+
+    const c = createContext({ 'X-API-Key': 'brz_epoch_match' });
+    const next = vi.fn();
+
+    await apiKeyAuthMiddleware(c, next);
+    expect(next).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects a pre-#7489 key (auth_epoch snapshot, no credential snapshot) once the creator auth_epoch advanced', async () => {
+    // A password reset/change ends every human-delegated key minted before
+    // it: a key minted earlier must not outlive the password change.
+    buildSequentialSelectMock([
+      [
+        {
+          id: 'key-epoch-stale-auth',
+          orgId: 'org-1',
+          name: 'Key',
+          keyPrefix: 'brz_',
+          keyHash: 'hash',
+          scopes: ['read'],
+          expiresAt: null,
+          rateLimit: 10,
+          usageCount: 0,
+          status: 'active',
+          createdBy: 'user-1',
+          principalType: 'human',
+          creatorAuthEpoch: 2,
+          creatorMfaEpoch: 1,
+        },
+      ],
+      // Creator's live auth_epoch has advanced past the key's snapshot —
+      // e.g. a password reset ran after this key was minted.
+      [{ status: 'active', authEpoch: 3, mfaEpoch: 1 }],
+    ]);
+
+    const c = createContext({ 'X-API-Key': 'brz_epoch_stale_auth' });
+    const next = vi.fn();
+
+    await expect(apiKeyAuthMiddleware(c, next)).rejects.toMatchObject({
+      status: 401,
+      message: 'API key creator credentials have changed',
+    });
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it('rejects a human-delegated key once the creator has reset an MFA factor after mint (mfa_epoch advanced)', async () => {
+    buildSequentialSelectMock([
+      [
+        {
+          id: 'key-epoch-stale-mfa',
+          orgId: 'org-1',
+          name: 'Key',
+          keyPrefix: 'brz_',
+          keyHash: 'hash',
+          scopes: ['read'],
+          expiresAt: null,
+          rateLimit: 10,
+          usageCount: 0,
+          status: 'active',
+          createdBy: 'user-1',
+          principalType: 'human',
+          creatorAuthEpoch: 2,
+          creatorMfaEpoch: 1,
+        },
+      ],
+      [{ status: 'active', authEpoch: 2, mfaEpoch: 2 }],
+    ]);
+
+    const c = createContext({ 'X-API-Key': 'brz_epoch_stale_mfa' });
+    const next = vi.fn();
+
+    await expect(apiKeyAuthMiddleware(c, next)).rejects.toMatchObject({
+      status: 401,
+      message: 'API key creator credentials have changed',
+    });
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it('control: a key belonging to an unrelated creator whose epoch never changed is unaffected', async () => {
+    buildSequentialSelectMock([
+      [
+        {
+          id: 'key-unrelated',
+          orgId: 'org-1',
+          name: 'Key',
+          keyPrefix: 'brz_',
+          keyHash: 'hash',
+          scopes: ['read'],
+          expiresAt: null,
+          rateLimit: 10,
+          usageCount: 0,
+          status: 'active',
+          createdBy: 'user-untouched',
+          principalType: 'human',
+          creatorAuthEpoch: 1,
+          creatorMfaEpoch: 1,
+        },
+      ],
+      [{ status: 'active', authEpoch: 1, mfaEpoch: 1 }],
+    ]);
+
+    const c = createContext({ 'X-API-Key': 'brz_unrelated' });
+    const next = vi.fn();
+
+    await apiKeyAuthMiddleware(c, next);
+    expect(next).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not enforce an epoch snapshot on a legacy key minted before this binding existed (NULL snapshot)', async () => {
+    buildSequentialSelectMock([
+      [
+        {
+          id: 'key-legacy',
+          orgId: 'org-1',
+          name: 'Key',
+          keyPrefix: 'brz_',
+          keyHash: 'hash',
+          scopes: ['read'],
+          expiresAt: null,
+          rateLimit: 10,
+          usageCount: 0,
+          status: 'active',
+          createdBy: 'user-1',
+          principalType: 'human',
+          creatorAuthEpoch: null,
+          creatorMfaEpoch: null,
+        },
+      ],
+      [{ status: 'active', authEpoch: 7, mfaEpoch: 4 }],
+    ]);
+
+    const c = createContext({ 'X-API-Key': 'brz_legacy' });
+    const next = vi.fn();
+
+    await apiKeyAuthMiddleware(c, next);
+    expect(next).toHaveBeenCalledTimes(1);
+  });
+
+  describe('#7489: keys bind to the credential epoch, not the session epoch', () => {
+    function humanKeyRow(snapshot: {
+      creatorAuthEpoch: number | null;
+      creatorMfaEpoch: number | null;
+      creatorCredentialEpoch: number | null;
+    }) {
+      return {
+        id: 'key-7489',
+        orgId: 'org-1',
+        name: 'Key',
+        keyPrefix: 'brz_',
+        keyHash: 'hash',
+        scopes: ['read'],
+        expiresAt: null,
+        rateLimit: 10,
+        usageCount: 0,
+        status: 'active',
+        createdBy: 'user-1',
+        principalType: 'human',
+        ...snapshot,
+      };
+    }
+
+    it('accepts a key after its creator logs out (auth_epoch advanced, credential_epoch unchanged)', async () => {
+      // Ordinary logout is a global sign-out: it advances users.auth_epoch.
+      // It is not a credential change, so it must not kill the creator's keys.
+      buildSequentialSelectMock([
+        [humanKeyRow({ creatorAuthEpoch: 2, creatorMfaEpoch: 1, creatorCredentialEpoch: 1 })],
+        [{ status: 'active', authEpoch: 3, mfaEpoch: 1, credentialEpoch: 1 }],
+      ]);
+
+      const next = vi.fn();
+      await apiKeyAuthMiddleware(createContext({ 'X-API-Key': 'brz_after_logout' }), next);
+      expect(next).toHaveBeenCalledTimes(1);
+    });
+
+    it('rejects a key once its creator changes or resets their password (credential_epoch advanced)', async () => {
+      buildSequentialSelectMock([
+        [humanKeyRow({ creatorAuthEpoch: 2, creatorMfaEpoch: 1, creatorCredentialEpoch: 1 })],
+        [{ status: 'active', authEpoch: 3, mfaEpoch: 1, credentialEpoch: 2 }],
+      ]);
+
+      const next = vi.fn();
+      await expect(
+        apiKeyAuthMiddleware(createContext({ 'X-API-Key': 'brz_after_password' }), next),
+      ).rejects.toMatchObject({ status: 401, message: 'API key creator credentials have changed' });
+      expect(next).not.toHaveBeenCalled();
+    });
+
+    it('still rejects a key once its creator changes an MFA factor, even with a matching credential_epoch', async () => {
+      buildSequentialSelectMock([
+        [humanKeyRow({ creatorAuthEpoch: 2, creatorMfaEpoch: 1, creatorCredentialEpoch: 1 })],
+        [{ status: 'active', authEpoch: 2, mfaEpoch: 2, credentialEpoch: 1 }],
+      ]);
+
+      const next = vi.fn();
+      await expect(
+        apiKeyAuthMiddleware(createContext({ 'X-API-Key': 'brz_after_mfa' }), next),
+      ).rejects.toMatchObject({ status: 401, message: 'API key creator credentials have changed' });
+      expect(next).not.toHaveBeenCalled();
+    });
+
+    it('falls back to the auth_epoch comparison for a key without a credential snapshot (minted before this binding)', async () => {
+      // A key the backfill could not prove still valid keeps its old
+      // (auth_epoch) binding: it is not silently revived.
+      buildSequentialSelectMock([
+        [humanKeyRow({ creatorAuthEpoch: 2, creatorMfaEpoch: 1, creatorCredentialEpoch: null })],
+        [{ status: 'active', authEpoch: 3, mfaEpoch: 1, credentialEpoch: 1 }],
+      ]);
+
+      const next = vi.fn();
+      await expect(
+        apiKeyAuthMiddleware(createContext({ 'X-API-Key': 'brz_legacy_auth_bound' }), next),
+      ).rejects.toMatchObject({ status: 401, message: 'API key creator credentials have changed' });
+      expect(next).not.toHaveBeenCalled();
+    });
+  });
+
   it('rejects when API key creator lookup returns no row', async () => {
     buildSequentialSelectMock([
       [
@@ -528,7 +767,9 @@ describe('apiKeyAuth middleware', () => {
         orgId: 'org-2',
         accessibleOrgIds: ['org-2'],
         accessiblePartnerIds: [],
-        currentPartnerId: null
+        // Own partner for read-visibility of partner-wide rows, as an org JWT
+        // session gets; no partner-axis grant (accessiblePartnerIds empty).
+        currentPartnerId: 'partner-1'
       },
       expect.any(Function)
     );
@@ -583,7 +824,7 @@ describe('apiKeyAuth middleware', () => {
     );
   });
 
-  it('keeps accessiblePartnerIds empty for non-MCP keys and skips the org→partner lookup', async () => {
+  it('keeps accessiblePartnerIds empty for non-MCP keys but sets currentPartnerId to the owning partner', async () => {
     // Two select calls expected: the api_keys lookup and the creator-status
     // lookup (SR2-15 subset). Owner-tenant status is delegated to
     // tenantStatus, so no third select happens for that.
@@ -627,7 +868,9 @@ describe('apiKeyAuth middleware', () => {
         orgId: 'org-4',
         accessibleOrgIds: ['org-4'],
         accessiblePartnerIds: [],
-        currentPartnerId: null
+        // Own partner for read-visibility of partner-wide rows, as an org JWT
+        // session gets; no partner-axis grant (accessiblePartnerIds empty).
+        currentPartnerId: 'partner-1'
       },
       expect.any(Function)
     );
@@ -798,6 +1041,49 @@ describe('apiKeyAuth middleware', () => {
       expect(next).toHaveBeenCalled();
     });
   });
+
+  describe('B-W02 (#6156): mcpDomains on the principal context', () => {
+    const keyRow = (mcpDomains: string[] | null) => ({
+      id: 'key-mcp',
+      orgId: 'org-2',
+      name: 'Key',
+      keyPrefix: 'brz_',
+      keyHash: 'hash',
+      scopes: ['ai:read'],
+      expiresAt: null,
+      rateLimit: 5,
+      usageCount: 0,
+      status: 'active',
+      createdBy: 'user-2',
+      mcpDomains,
+    });
+
+    const run = async (mcpDomains: string[] | null) => {
+      buildSequentialSelectMock([[keyRow(mcpDomains)], [{ status: 'active' }]]);
+      vi.mocked(db.update).mockReturnValueOnce({
+        set: vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue(undefined) })
+      } as any);
+      const c = createContext({ 'X-API-Key': 'brz_valid' });
+      const next = vi.fn();
+      await apiKeyAuthMiddleware(c, next);
+      expect(next).toHaveBeenCalled();
+      return c;
+    };
+
+    it('sets mcpDomains from the key row', async () => {
+      const c = await run(['tickets']);
+      // The key lookup must actually select the column, not rely on a mock row.
+      expect(Object.keys(vi.mocked(db.select).mock.calls[0]![0] as object)).toContain('mcpDomains');
+      expect(c.get('apiKey').mcpDomains).toEqual(['tickets']);
+    });
+
+    it('NULL row sets mcpDomains null', async () => {
+      const c = await run(null);
+      const ctx = c.get('apiKey');
+      expect('mcpDomains' in ctx).toBe(true);
+      expect(ctx.mcpDomains).toBeNull();
+    });
+  });
 });
 
 describe('requireApiKeyScope middleware', () => {
@@ -896,4 +1182,62 @@ describe('API key auth + requireMfa interaction (intentional break)', () => {
     // test's dynamic import('./auth') pull a heavier graph than the 5s default
     // allows. The assertion is unchanged.
   }, 20000);
+});
+
+describe('apiKeyAuth middleware — MCP tenant-tool-call self-managed context', () => {
+  const validKeyRow = {
+    id: 'key-4',
+    orgId: 'org-2',
+    name: 'Key',
+    keyPrefix: 'brz_',
+    keyHash: 'hash',
+    scopes: ['read'],
+    expiresAt: null,
+    rateLimit: 5,
+    usageCount: 2,
+    status: 'active',
+    createdBy: 'user-2'
+  };
+
+  beforeEach(() => {
+    vi.mocked(getActiveOrgTenant).mockResolvedValue({ orgId: 'org-2', partnerId: 'partner-1' });
+    vi.mocked(getRedis).mockReturnValue({} as any);
+    vi.mocked(rateLimiter).mockResolvedValue({
+      allowed: true,
+      remaining: 4,
+      resetAt: new Date(Date.now() + 60_000)
+    });
+    vi.mocked(authorizeHumanApiKeyCreator).mockResolvedValue({
+      ok: true,
+      permissions: {} as any,
+      allowedSiteIds: undefined,
+      clampedScopes: ['devices:read']
+    });
+    buildSequentialSelectMock([[validKeyRow], [{ status: 'active' }]]);
+    const whereFn = vi.fn().mockResolvedValue(undefined);
+    vi.mocked(db.update).mockReturnValueOnce({
+      set: vi.fn().mockReturnValue({ where: whereFn })
+    } as any);
+  });
+
+  it('skips the ambient withDbAccessContext wrap when the MCP tenant-tool-call flag is set', async () => {
+    const c = createContext({ 'X-API-Key': 'brz_valid' });
+    c.set(MCP_SKIP_AMBIENT_DB_CONTEXT_KEY, true);
+    const next = vi.fn();
+
+    await apiKeyAuthMiddleware(c, next);
+
+    expect(next).toHaveBeenCalled();
+    expect(vi.mocked(withDbAccessContext)).not.toHaveBeenCalled();
+  });
+
+  it('still wraps the ambient context for an ordinary request (flag unset)', async () => {
+    const c = createContext({ 'X-API-Key': 'brz_valid' });
+    const next = vi.fn();
+
+    await apiKeyAuthMiddleware(c, next);
+
+    expect(next).toHaveBeenCalled();
+    expect(vi.mocked(withDbAccessContext)).toHaveBeenCalledTimes(1);
+  });
 });

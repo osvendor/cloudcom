@@ -42,6 +42,9 @@ vi.mock('../../services/aiAgentSdk', () => ({
 }));
 
 vi.mock('../../middleware/clientAiAuth', () => ({
+  clientAiDbAccessContext: (orgId: string) => ({
+    scope: 'organization', orgId, accessibleOrgIds: [orgId], accessiblePartnerIds: [], userId: null,
+  }),
   clientAiAuthMiddleware: (c: any, next: any) => {
     if (!c.req.header('authorization')) return c.json({ error: 'Unauthorized' }, 401);
     c.set('clientAiAuth', {
@@ -57,6 +60,7 @@ vi.mock('../../middleware/clientAiAuth', () => ({
 }));
 
 vi.mock('../../db', () => ({
+  runOutsideDbContext: vi.fn((fn: () => unknown) => fn()),
   db: { select: dbSelectMock, insert: dbInsertMock, update: dbUpdateMock },
   withDbAccessContext: vi.fn((_ctx: unknown, fn: () => unknown) => fn()),
   withSystemDbAccessContext: vi.fn((fn: () => unknown) => fn()),
@@ -64,10 +68,16 @@ vi.mock('../../db', () => ({
 vi.mock('../../services/effectiveSettings', () => ({
   getEffectiveAiBudget: vi.fn().mockResolvedValue({ maxTurnsPerSession: 50 }),
 }));
-vi.mock('../../services/clientAiSessions', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('../../services/clientAiSessions')>()),
-  resolveClientLlmConfig: vi.fn(() =>
-    Promise.resolve({ source: 'platform', apiKey: 'test-platform-key', model: 'claude-sonnet-4-6' })),
+// W03 Task 9: create resolves the office_chat offering through the registry.
+vi.mock('../../services/aiModels/candidateLoader', () => ({
+  readOrgPartnerId: vi.fn(() => Promise.resolve('partner-1')),
+}));
+vi.mock('../../services/aiModels/sessionModel', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../services/aiModels/sessionModel')>()),
+  chooseSessionModel: vi.fn(() => Promise.resolve({
+    offeringId: 'off-1', offeringPartnerId: 'partner-1', options: null,
+    model: 'claude-sonnet-4-6', billingSource: 'platform',
+  })),
 }));
 vi.mock('../../services/streamingSessionManager', () => ({ streamingSessionManager: managerMock }));
 vi.mock('../../services/auditEvents', () => ({ writeAuditEvent: writeAuditEventMock }));
@@ -167,7 +177,9 @@ describe('POST /client-ai/sessions (create)', () => {
     );
   });
 
-  it('uses the policy allowedModels[0] when configured', async () => {
+  // W03 Task 9: allowedModels was backfilled into the office_chat assignment
+  // (W02) and no longer routes; the stored model is the resolved offering's.
+  it('ignores the policy allowedModels[0]: the model is the resolved offering\'s', async () => {
     policyState.policy = {
       ...defaultClientAiPolicy(ORG_ID), enabled: true,
       allowedModels: ['claude-haiku-4-5-20251001'],
@@ -175,7 +187,9 @@ describe('POST /client-ai/sessions (create)', () => {
     const valuesSpy = vi.fn(() => ({ returning: vi.fn(() => Promise.resolve([{ id: SESSION_ID }])) }));
     dbInsertMock.mockImplementation(() => ({ values: valuesSpy }));
     await buildApp().request('/client-ai/sessions', { method: 'POST', headers: AUTHED });
-    expect(valuesSpy).toHaveBeenCalledWith(expect.objectContaining({ model: 'claude-haiku-4-5-20251001' }));
+    expect(valuesSpy).toHaveBeenCalledWith(expect.objectContaining({
+      model: 'claude-sonnet-4-6', offeringId: 'off-1', offeringPartnerId: 'partner-1', billingSource: 'platform',
+    }));
   });
 
   // #6473 — a client session must also inherit the configured

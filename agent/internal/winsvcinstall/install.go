@@ -33,9 +33,18 @@ import (
 // distinguishable from "the SCM refused to tell us".
 var ErrNotInstalled = errors.New("service is not installed")
 
+// ErrAlreadyExists is what Manager.Create reports when the named service
+// already exists, i.e. another installer created it between our Open and our
+// Create. Install treats it as "update in place" rather than a failure.
+var ErrAlreadyExists = errors.New("service already exists")
+
 // ErrNotRunning is what Service.RequestStop reports when the service turned out
 // to be stopped already. Racing our own state sample is not a failure.
 var ErrNotRunning = errors.New("service is not running")
+
+// ErrAlreadyRunning is what Service.RequestStart reports when the service was
+// running already. startAndWait still confirms RUNNING rather than trusting it.
+var ErrAlreadyRunning = errors.New("service is already running")
 
 // State is the neutral spelling of a Windows service state.
 type State int
@@ -304,10 +313,26 @@ func Install(m Manager, req Request) (Outcome, error) {
 		}
 	} else {
 		svcHandle, err = m.Create(req.Spec, exePath)
-		if err != nil {
+		switch {
+		case err == nil:
+			defer func() { _ = svcHandle.Close() }()
+		case errors.Is(err, ErrAlreadyExists):
+			// Another installer created the service between our Open and our
+			// Create. Fall through to the update-in-place path.
+			svcHandle, err = m.Open(req.Spec.Name)
+			if err != nil {
+				return out, fmt.Errorf("the %q service was created concurrently but could not be re-opened: %w",
+					req.Spec.Name, err)
+			}
+			defer func() { _ = svcHandle.Close() }()
+			out.Existed = true
+			if err := svcHandle.Reconfigure(req.Spec, exePath); err != nil {
+				return out, fmt.Errorf("failed to reconfigure the concurrently created %q service: %w",
+					req.Spec.Name, err)
+			}
+		default:
 			return out, fmt.Errorf("failed to create the %q service: %w", req.Spec.Name, err)
 		}
-		defer func() { _ = svcHandle.Close() }()
 	}
 	out.Installed = true
 
@@ -392,7 +417,9 @@ func stopAndWait(s Service, t Timeouts) error {
 // message true, and it is the only way a service that starts and immediately
 // dies becomes a non-zero exit instead of a silent success.
 func startAndWait(s Service, t Timeouts) error {
-	if err := s.RequestStart(); err != nil {
+	// "Already running" (a re-run of the install one-liner, or the watchdog
+	// getting there first) falls through to the same RUNNING check (#7474).
+	if err := s.RequestStart(); err != nil && !errors.Is(err, ErrAlreadyRunning) {
 		return err
 	}
 	start := time.Now()

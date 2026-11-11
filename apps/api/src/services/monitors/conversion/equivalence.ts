@@ -6,6 +6,7 @@ import { automations, configPolicyAlertRules, configPolicyAutomations, configPol
 import type { AuthContext } from '../../../middleware/auth';
 import { addFeatureLink } from '../../configurationPolicy';
 import { resolveDelivery } from '../../delivery/resolveDelivery';
+import { resolveLegacyDeliveryBaseline } from './legacyDeliveryBaseline';
 import { canManagePartnerWidePolicies } from '../../partnerWideAccess';
 import { canMutateOrgWideGovernance } from '../../siteCeilingAccess';
 import { createMonitorDefinition } from '../monitorService';
@@ -13,7 +14,7 @@ import { resolveMonitorsForDevice } from '../monitorResolver';
 import { applyOverrides, getMonitorKindSpec } from '../kinds';
 import { resolveLegacyBaseline, type DbExecutor, type LegacyBaseline } from './legacyBaseline';
 import { loadPolicySources, type PolicySources } from './loadSources';
-import { canonical, sha, mapInlineRule, mapWatch, mapAutomationResponses, mergeResponseProposals, monitorSignature } from './mapping';
+import { canonical, sha, mapInlineRule, mapWatch, mapAutomationResponses, mergeResponseProposals, monitorSignature, type MonitorSignatureInput } from './mapping';
 import type { ConversionPreviewItem, ConversionSourceTable, EquivalenceDelta, ProposedMonitor } from './types';
 import { ConversionError } from './convert';
 import { rehomePolicyWorkflow } from './workflows';
@@ -29,8 +30,11 @@ export interface EquivalenceProposal {
 }
 class PreviewRollback extends Error {}
 
-async function effectiveSignature(p: ProposedMonitor, input: Parameters<typeof resolveDelivery>[0], executor: DbExecutor) {
-  const resolved = await resolveDelivery(input, executor);
+async function effectiveSignature(p: Omit<ProposedMonitor, 'cooldownMinutes' | 'autoResolve'> & MonitorSignatureInput, input: Parameters<typeof resolveDelivery>[0], executor: DbExecutor,
+  legacy?: Parameters<typeof resolveLegacyDeliveryBaseline>[1]) {
+  const resolved = legacy === undefined
+    ? await resolveDelivery(input, executor)
+    : await resolveLegacyDeliveryBaseline(input, legacy, executor);
   return sha(canonical({ behavior: monitorSignature({ ...p, deliveryMode: 'channels',
     deliveryChannelIds: resolved.channelIds, escalationPolicyId: resolved.escalationPolicyId }),
     skippedChannelIds: [...resolved.skippedChannelIds].sort((a, b) => a.id.localeCompare(b.id)),
@@ -56,15 +60,14 @@ export async function signatureMapForLegacy(deviceId: string, effective: LegacyB
       outcome: 'convertible', proposed: mapped.proposed, notes: [], openAlerts: 0 }, ...responses]);
     for (const p of item!.proposed) out.set(`rule:${row.id}:${p.role}`, await effectiveSignature(p, {
       orgId: device.orgId, siteId: device.siteId, severity: p.severity, kind: null,
-      legacyOverride: { channelIds: row.notificationChannelIds, escalationPolicyId: row.escalationPolicyId },
-    }, executor));
+    }, executor, { channelIds: row.notificationChannelIds, escalationPolicyId: row.escalationPolicyId }));
   }
   for (const row of effective.monitoring?.watches ?? []) {
     if (!row.enabled || row.retiredAt) continue;
     const mapped = mapWatch(row);
     if (!mapped.ok) { out.set(`legacy:watch:${row.id}`, sha(canonical(row))); continue; }
     for (const p of mapped.proposed) out.set(`watch:${row.id}:${p.role}`, await effectiveSignature(p,
-      { orgId: device.orgId, siteId: device.siteId, severity: p.severity, kind: null }, executor));
+      { orgId: device.orgId, siteId: device.siteId, severity: p.severity, kind: null }, executor, {}));
   }
   return out;
 }

@@ -21,13 +21,17 @@
  * verdict but is not evidence of a bad outcome.
  */
 import type { ActExecutionVerdict, ActVerificationVerdict } from '@breeze/shared';
+import { and, eq, inArray, sql } from 'drizzle-orm';
 import {
   db,
   getCurrentDbAccessContext,
   runOutsideDbContext,
+  withDbTransaction,
   withSystemDbAccessContext,
 } from '../../db';
 import { alerts } from '../../db/schema/alerts';
+import { createSourcedAlert } from '../alertService';
+import { captureException } from '../sentry';
 import type { ActAssetPin } from './actRevalidation';
 import type { ActTarget } from './actManifest';
 import type { AiOriginRef } from '@breeze/shared';
@@ -48,6 +52,18 @@ let _commandQueue: typeof import('../commandQueue') | null = null;
 async function getCommandQueue() {
   if (!_commandQueue) _commandQueue = await import('../commandQueue');
   return _commandQueue;
+}
+
+/**
+ * This lane dispatches `list_services` / `list_processes` straight
+ * through commandQueue (not `aiDispatch`), so it runs the same per-device
+ * remote-tools policy check itself. A refused read is `inconclusive`, never a
+ * pass or a fail. Lazy for the same reason as `getCommandQueue`.
+ */
+async function remoteToolsRefusal(deviceId: string, type: string): Promise<string | null> {
+  const { checkAiRemoteToolsPolicy } = await import('../aiRemoteToolsPolicy');
+  const decision = await checkAiRemoteToolsPolicy(deviceId, type);
+  return decision.allowed ? null : decision.error;
 }
 
 /**
@@ -162,6 +178,8 @@ async function verifyServiceRunning(
   run: VerifyActExecutionArgs['run'],
   agentUserId: string,
 ): Promise<{ verification: ActVerificationVerdict; detail?: string }> {
+  const refused = await remoteToolsRefusal(run.deviceId, 'list_services');
+  if (refused) return { verification: 'inconclusive', detail: refused };
   const { executeCommandWithSystemPrecheck } = await getCommandQueue();
   // NO DB context held across this call (#4150): it is a device round-trip
   // bounded at VERIFY_READ_TIMEOUT_MS, and `executeCommandWithSystemPrecheck`
@@ -232,6 +250,8 @@ export async function verifyProcessAbsentByNameForTask(
    */
   aiOrigin?: AiOriginRef,
 ): Promise<{ verification: ActVerificationVerdict; detail?: string }> {
+  const refused = await remoteToolsRefusal(device.deviceId, 'list_processes');
+  if (refused) return { verification: 'inconclusive', detail: refused };
   const { executeCommandWithSystemPrecheck } = await getCommandQueue();
   const result = await executeCommandWithSystemPrecheck(
     device.deviceId, 'list_processes', { search: target.processName, limit: 200 }, {
@@ -262,6 +282,8 @@ async function verifyProcessAbsent(
   run: VerifyActExecutionArgs['run'],
   agentUserId: string,
 ): Promise<{ verification: ActVerificationVerdict; detail?: string }> {
+  const refused = await remoteToolsRefusal(run.deviceId, 'list_processes');
+  if (refused) return { verification: 'inconclusive', detail: refused };
   const { executeCommandWithSystemPrecheck } = await getCommandQueue();
   // No DB context held across the round-trip — see `verifyServiceRunning`.
   const result = await executeCommandWithSystemPrecheck(
@@ -430,21 +452,42 @@ export interface RecordActVerifyFailureAlertArgs {
 }
 
 /**
- * Rule-less alert for a `verification: 'failed'` act execution — mirrors the
- * `dnsThreatAlerts.ts` direct-insert pattern (`ruleId: null`, `status:
- * 'active'`). Best-effort: logged on failure, never thrown, so a broken
- * alert path cannot turn a completed run into a failed one.
+ * Rule-less alert for a `verification: 'failed'` act execution. Best-effort:
+ * logged on failure, never thrown, so a broken alert path cannot turn a
+ * completed run into a failed one.
+ *
+ * #11328 — raised through `createSourcedAlert` so `alert.triggered` publishes
+ * (after COMMIT). The raw insert this replaced reached the inbox but no
+ * notification channel, routing rule or escalation. A model that retries the
+ * same failing action in one run must not page twice, so an alert still open
+ * for the same run, op and target is not raised (or published) again.
  */
 export async function recordActVerifyFailureAlert(args: RecordActVerifyFailureAlertArgs): Promise<void> {
   const { run, op, target, detail } = args;
+  const configItemName = `ai_agent_act_verify_${op.key}`;
   try {
-    await inSystemDbContext(async () => {
-      await db.insert(alerts).values({
-        ruleId: null,
+    // The savepoint keeps a failure here from aborting a system transaction
+    // the caller already holds (inSystemDbContext reuses it); the catch is
+    // outside it.
+    await inSystemDbContext(() => withDbTransaction(async () => {
+      const [open] = await db
+        .select({ id: alerts.id })
+        .from(alerts)
+        .where(and(
+          eq(alerts.orgId, run.orgId),
+          eq(alerts.deviceId, run.deviceId),
+          eq(alerts.configItemName, configItemName),
+          inArray(alerts.status, ['active', 'acknowledged', 'suppressed']),
+          sql`${alerts.context}->>'runId' = ${run.id}`,
+          sql`${alerts.context}->'target' = ${JSON.stringify(target)}::jsonb`,
+        ))
+        .limit(1);
+      if (open) return;
+
+      await createSourcedAlert({
         deviceId: run.deviceId,
         orgId: run.orgId,
-        configPolicyId: null,
-        configItemName: `ai_agent_act_verify_${op.key}`,
+        configItemName,
         severity: 'high',
         title: `Agent action needs attention: ${op.key}`,
         message: detail
@@ -457,13 +500,16 @@ export async function recordActVerifyFailureAlert(args: RecordActVerifyFailureAl
           opKey: op.key,
           target,
         },
-        status: 'active',
-        triggeredAt: new Date(),
+        publisher: 'ai-agent-act-verify',
+        eventPayload: { runId: run.id, agentId: run.agentId, opKey: op.key },
       });
-    });
+    }));
   } catch (error) {
     console.error('[actVerify] failed to record the act-verify-failure alert (non-fatal)', {
       runId: run.id, opKey: op.key, error,
     });
+    // Non-fatal for the run, but a failed verification that pages nobody must
+    // still be visible: the dedupe probe's failures are not captured anywhere else.
+    captureException(error, undefined, { errorId: 'act-verify-alert-failed', runId: run.id, opKey: op.key });
   }
 }

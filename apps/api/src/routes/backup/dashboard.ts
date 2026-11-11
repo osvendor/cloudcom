@@ -1,13 +1,14 @@
 import { Hono } from 'hono';
 import { zValidator } from '../../lib/validation';
 import { eq, and, sql, gte, lte, inArray } from 'drizzle-orm';
-import { db } from '../../db';
+import { db, withDbTransaction } from '../../db';
 import { requirePermission } from '../../middleware/auth';
 import {
   backupConfigs,
   backupJobs,
   backupSnapshots,
   devices,
+  IN_FLIGHT_BACKUP_JOB_STATUSES,
   RESTORABLE_BACKUP_JOB_STATUSES,
 } from '../../db/schema';
 import { PERMISSIONS, canAccessSite, type UserPermissions } from '../../services/permissions';
@@ -18,8 +19,22 @@ import {
   latestBackupRunOrderBy,
   latestBackupRunWindowOrder,
 } from '../../services/backupJobOrdering';
-import { getNextRun, resolveScopedOrgId } from './helpers';
+import {
+  classifyBackupFailure,
+  deriveBackupJobDataAccounting,
+  splitReparseSkipNotice,
+  stripInlineIndexDropNote,
+  type ActiveBackupJob,
+} from '@breeze/shared';
+import { getNextRun, loadJobResumedAt, resolveScopedOrgId } from './helpers';
 import { usageHistoryQuerySchema } from './schemas';
+import {
+  getFirstPartyCoverageForDevices,
+  getProviderAttentionItems,
+  getProviderCoverageForDevices,
+} from '../../services/backupHealthReadModel';
+import { getStorageByProvider } from '../../services/backupStorageByProvider';
+import { storedSnapshotBytesByProviderSince, sumStoredSnapshotBytes } from '../../services/backupStoredBytes';
 
 export const dashboardRoutes = new Hono();
 
@@ -88,7 +103,9 @@ async function resolveAttentionItems(
       .where(and(eq(backupJobs.orgId, orgId), jobDeviceScope))
       .as('ranked_backup_jobs_for_attention');
 
-    const rows = await db
+    // The savepoint is what lets the catch below work: a failure of this read
+    // would otherwise be rethrown when the request transaction ends (#11203).
+    const rows = await withDbTransaction(async () => db
       .select({
         deviceId: rankedJobs.deviceId,
         status: rankedJobs.status,
@@ -102,7 +119,7 @@ async function resolveAttentionItems(
       .from(rankedJobs)
       .leftJoin(devices, eq(rankedJobs.deviceId, devices.id))
       .where(lte(rankedJobs.rn, ATTENTION_LOOKBACK_JOBS))
-      .orderBy(rankedJobs.deviceId, rankedJobs.rn);
+      .orderBy(rankedJobs.deviceId, rankedJobs.rn));
 
     const scopedRows = allowedDeviceIds
       ? rows.filter((row) => allowedDeviceIds.includes(row.deviceId))
@@ -123,7 +140,25 @@ async function resolveAttentionItems(
       // stored a sliver of its data is exactly the case the issue reported as
       // invisible — it is not a success, and a dashboard that only surfaces
       // hard failures never mentions it.
-      if (!latest || !NEEDS_ATTENTION_JOB_STATUSES.has(latest.status)) continue;
+      if (!latest) continue;
+
+      // #5396: a latest run that missed files under the threshold is a
+      // restore point, so it is never part of a failure streak — but the
+      // operator must still see it. Its own single warning item.
+      if (latest.status === 'completed_with_errors') {
+        const deviceName = latest.deviceName ?? latest.deviceHostname ?? deviceId.slice(0, 8);
+        const lastFailureAt = (latest.completedAt ?? latest.createdAt).toISOString();
+        items.push({
+          id: `backup-failing-${deviceId}`,
+          title: `${deviceName}: latest backup completed with file errors`,
+          description: [stripInlineIndexDropNote(latest.errorLog).warning, `Completed ${lastFailureAt}`].filter(Boolean).join(' · '),
+          severity: 'warning',
+          lastFailureAt,
+        });
+        continue;
+      }
+
+      if (!NEEDS_ATTENTION_JOB_STATUSES.has(latest.status)) continue;
 
       let consecutiveFailures = 0;
       let reason: string | null = null;
@@ -134,7 +169,11 @@ async function resolveAttentionItems(
         if (!NEEDS_ATTENTION_JOB_STATUSES.has(job.status)) break;
         consecutiveFailures += 1;
         if (job.status === 'partial') sawPartial = true;
-        if (!reason && job.errorLog) reason = job.errorLog;
+        // #9543: the agent's skipped-reparse-point note is informational, so
+        // it is never the reason a device needs attention.
+        // #11026: nor is a historic note that a file list did not fit in the
+        // result: the list was not lost.
+        if (!reason && job.errorLog) reason = splitReparseSkipNotice(stripInlineIndexDropNote(job.errorLog).warning).diagnostic;
       }
 
       const deviceName = latest.deviceName ?? latest.deviceHostname ?? deviceId.slice(0, 8);
@@ -174,6 +213,41 @@ async function resolveAttentionItems(
   }
 }
 
+/**
+ * "Devices needing backup" — assigned devices with no fresh restore point from
+ * EITHER source.
+ *
+ * Coverage is the OR of the two sources (spec D4): a customer whose servers are
+ * protected by Cove is protected, full stop, and listing them here — under a
+ * button that dispatches a first-party backup job — is exactly the false
+ * negative this integration exists to remove. Both lookups go through the
+ * unified read model so this panel, the overview bars, the portal and the
+ * posture report cannot disagree about the word "covered".
+ */
+const OVERDUE_MAX_ITEMS = 20;
+
+async function resolveOverdueDevices(
+  orgId: string,
+  assignedDeviceIds: string[],
+  nameByDeviceId: ReadonlyMap<string, string>,
+): Promise<Array<{ id: string; name: string; lastBackup: string | null }>> {
+  if (assignedDeviceIds.length === 0) return [];
+  const firstParty = await getFirstPartyCoverageForDevices(orgId, assignedDeviceIds);
+  const provider = await getProviderCoverageForDevices(orgId, assignedDeviceIds);
+  const overdue: Array<{ id: string; name: string; lastBackup: string | null }> = [];
+  for (const deviceId of assignedDeviceIds) {
+    if (firstParty.get(deviceId)?.covered) continue;
+    if (provider.get(deviceId)?.covered) continue;
+    overdue.push({
+      id: deviceId,
+      name: nameByDeviceId.get(deviceId) ?? deviceId.slice(0, 8),
+      lastBackup: firstParty.get(deviceId)?.lastSuccessAt ?? null,
+    });
+    if (overdue.length >= OVERDUE_MAX_ITEMS) break;
+  }
+  return overdue;
+}
+
 dashboardRoutes.get(
   '/usage-history',
   requirePermission(PERMISSIONS.ORGS_READ.resource, PERMISSIONS.ORGS_READ.action),
@@ -191,38 +265,43 @@ dashboardRoutes.get(
     startDate.setUTCHours(0, 0, 0, 0);
     startDate.setUTCDate(startDate.getUTCDate() - (days - 1));
 
-    // Get snapshots with their config's provider
-    const snapshots = await db
-      .select({
-        size: backupSnapshots.size,
-        timestamp: backupSnapshots.timestamp,
-        provider: backupConfigs.provider,
-      })
-      .from(backupSnapshots)
-      .leftJoin(backupConfigs, eq(backupSnapshots.configId, backupConfigs.id))
-      .where(
-        and(
-          eq(backupSnapshots.orgId, orgId),
-          gte(backupSnapshots.timestamp, startDate)
-        )
-      );
+    // Stored bytes (#9631), not each snapshot's logical size. Snapshots
+    // captured before the window form the starting level, so the series
+    // ends at the same figure as Storage Used.
+    // Same site narrowing as /dashboard's Storage Used: RLS does not see
+    // the site axis, and the two figures must agree.
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    const allowedDeviceIds = await resolveSiteAllowedDeviceIds(orgId, perms);
+    const usageRows = allowedDeviceIds !== null && allowedDeviceIds.length === 0
+      ? []
+      : await storedSnapshotBytesByProviderSince(
+          and(
+            eq(backupSnapshots.orgId, orgId),
+            allowedDeviceIds ? inArray(backupSnapshots.deviceId, allowedDeviceIds) : undefined
+          ),
+          startDate
+        );
 
     const providers = new Set<string>();
+    const baselineByProvider = new Map<string, number>();
     const dailyIncrements = new Map<string, Map<string, number>>();
 
-    for (const snap of snapshots) {
-      const provider = snap.provider ?? 'unknown';
+    for (const row of usageRows) {
+      const provider = row.provider ?? 'unknown';
       providers.add(provider);
-      const dayKey = snap.timestamp.toISOString().slice(0, 10);
-      const dayMap = dailyIncrements.get(dayKey) ?? new Map<string, number>();
-      dayMap.set(provider, (dayMap.get(provider) ?? 0) + (snap.size ?? 0));
-      dailyIncrements.set(dayKey, dayMap);
+      if (row.day === null) {
+        baselineByProvider.set(provider, (baselineByProvider.get(provider) ?? 0) + row.bytes);
+        continue;
+      }
+      const dayMap = dailyIncrements.get(row.day) ?? new Map<string, number>();
+      dayMap.set(provider, (dayMap.get(provider) ?? 0) + row.bytes);
+      dailyIncrements.set(row.day, dayMap);
     }
 
     const providerList = Array.from(providers);
     if (providerList.length === 0) providerList.push('local');
     const runningByProvider = new Map(
-      providerList.map((p) => [p, 0])
+      providerList.map((p) => [p, baselineByProvider.get(p) ?? 0])
     );
     const points: Array<{
       timestamp: string;
@@ -290,8 +369,9 @@ dashboardRoutes.get('/dashboard', requirePermission(PERMISSIONS.ORGS_READ.resour
     ? inArray(backupSnapshots.deviceId, allowedDeviceIds)
     : undefined;
 
-  // Run aggregation queries in parallel
-  const [configCount, jobCount, snapshotCount, last24hStats, storageStats, assignedDevicesRaw, recentJobsRaw, attention] =
+  // Run the required aggregation queries in parallel. A failure in any of them
+  // is a 500. The optional reads that degrade instead run after this block.
+  const [configCount, jobCount, snapshotCount, last24hStats, storageStats, recentJobsRaw, storageProviders] =
     await Promise.all([
       db
         .select({ count: sql<number>`count(*)::int` })
@@ -308,9 +388,12 @@ dashboardRoutes.get('/dashboard', requirePermission(PERMISSIONS.ORGS_READ.resour
         .from(backupSnapshots)
         .where(and(eq(backupSnapshots.orgId, orgId), snapshotDeviceScope))
         .then((r) => r[0]?.count ?? 0),
-      noSiteAllowedDevices ? Promise.resolve({ completed: 0, failed: 0, partial: 0, running: 0, pending: 0 }) : db
+      noSiteAllowedDevices ? Promise.resolve({ completed: 0, completedWithErrors: 0, failed: 0, partial: 0, running: 0, pending: 0 }) : db
         .select({
           completed: sql<number>`count(*) filter (where ${backupJobs.status} = 'completed')::int`,
+          // #5396: restore points that missed files under the threshold. Own
+          // counter so the web success rate counts them without greening them.
+          completedWithErrors: sql<number>`count(*) filter (where ${backupJobs.status} = 'completed_with_errors')::int`,
           failed: sql<number>`count(*) filter (where ${backupJobs.status} = 'failed')::int`,
           // #3000: without its own counter a partial job vanishes from BOTH
           // sides of the dashboard's success-rate fraction, so a device whose
@@ -327,19 +410,11 @@ dashboardRoutes.get('/dashboard', requirePermission(PERMISSIONS.ORGS_READ.resour
             jobDeviceScope
           )
         )
-        .then((r) => r[0] ?? { completed: 0, failed: 0, partial: 0, running: 0, pending: 0 }),
-      noSiteAllowedDevices ? Promise.resolve({ totalBytes: 0, count: 0 }) : db
-        .select({
-          totalBytes: sql<number>`coalesce(sum(${backupSnapshots.size}), 0)::bigint`,
-          count: sql<number>`count(*)::int`,
-        })
-        .from(backupSnapshots)
-        .where(and(eq(backupSnapshots.orgId, orgId), snapshotDeviceScope))
-        .then((r) => r[0] ?? { totalBytes: 0, count: 0 }),
-      resolveAllBackupAssignedDevices(orgId).catch((err) => {
-        console.error(`[BackupDashboard] Failed to resolve assigned devices:`, err instanceof Error ? err.message : err);
-        return [];
-      }),
+        .then((r) => r[0] ?? { completed: 0, completedWithErrors: 0, failed: 0, partial: 0, running: 0, pending: 0 }),
+      // Stored bytes, not the sum of logical snapshot sizes (#9631).
+      noSiteAllowedDevices
+        ? Promise.resolve({ totalBytes: 0, count: 0 })
+        : sumStoredSnapshotBytes(and(eq(backupSnapshots.orgId, orgId), snapshotDeviceScope)),
       noSiteAllowedDevices ? Promise.resolve([]) : db
         .select({
           job: backupJobs,
@@ -356,8 +431,21 @@ dashboardRoutes.get('/dashboard', requirePermission(PERMISSIONS.ORGS_READ.resour
         // same-transaction fan-out reshuffles the top 5 between refreshes.
         .orderBy(...backupJobHistoryOrderBy)
         .limit(5),
-      resolveAttentionItems(orgId, jobDeviceScope, allowedDeviceIds, noSiteAllowedDevices),
+      getStorageByProvider(orgId, allowedDeviceIds),
     ]);
+
+  // Optional reads, each in a savepoint so a failure degrades the panel rather
+  // than ending the request in a 500 (#11203). They must not join the
+  // Promise.all above: every statement here shares one connection, so while a
+  // failed savepoint waits for its rollback, a sibling's next statement lands
+  // in the aborted transaction and fails on the outer scope.
+  let assignedError = false;
+  const assignedDevicesRaw = await withDbTransaction(() => resolveAllBackupAssignedDevices(orgId)).catch((err) => {
+    console.error(`[BackupDashboard] Failed to resolve assigned devices:`, err instanceof Error ? err.message : err);
+    assignedError = true;
+    return [];
+  });
+  const attention = await resolveAttentionItems(orgId, jobDeviceScope, allowedDeviceIds, noSiteAllowedDevices);
 
   const assignedDevices = allowedDeviceIds
     ? assignedDevicesRaw.filter((a) => allowedDeviceIds.includes(a.deviceId))
@@ -365,7 +453,45 @@ dashboardRoutes.get('/dashboard', requirePermission(PERMISSIONS.ORGS_READ.resour
   const recentJobs = allowedDeviceIds
     ? recentJobsRaw.filter((r) => allowedDeviceIds.includes(r.job.deviceId))
     : recentJobsRaw;
-  const protectedDevices = new Set(assignedDevices.map((a) => a.deviceId));
+
+  const assignedDeviceIds = assignedDevices.map((a) => a.deviceId);
+  const nameByDeviceId = new Map<string, string>(
+    recentJobs.map((r) => [r.job.deviceId, r.deviceName ?? r.deviceHostname ?? r.job.deviceId]),
+  );
+
+  // One try/catch and one savepoint for the whole provider block, all or
+  // nothing: a transient failure here must degrade the panel, not 500 the
+  // dashboard — and must SAY it degraded, so the UI never renders "no devices
+  // need backup" it cannot vouch for. There is one flag for the three reads, so
+  // partial results have nothing to report them with.
+  let overdueDevices: Array<{ id: string; name: string; lastBackup: string | null }> = [];
+  let providerCoverage = new Map<string, { covered: boolean; health: string }>();
+  let providerAttention: AttentionItem[] = [];
+  let providerError = false;
+  try {
+    // In sequence, not Promise.all: a read still running when a sibling fails
+    // would carry on after the savepoint has rolled back.
+    [overdueDevices, providerCoverage, providerAttention] = await withDbTransaction(async () => [
+      await resolveOverdueDevices(orgId, assignedDeviceIds, nameByDeviceId),
+      await getProviderCoverageForDevices(orgId, assignedDeviceIds),
+      noSiteAllowedDevices
+        ? ([] as AttentionItem[])
+        : ((await getProviderAttentionItems(orgId, {
+            allowedDeviceIds,
+            limit: ATTENTION_MAX_ITEMS,
+          })) as AttentionItem[]),
+    ] as const);
+  } catch (err) {
+    console.error('[BackupDashboard] provider coverage failed:', err instanceof Error ? err.message : err);
+    providerError = true;
+  }
+
+  // A device the vendor protects counts as protected even when no first-party
+  // policy is assigned to it (spec D4).
+  const protectedDevices = new Set(assignedDeviceIds);
+  for (const [deviceId, coverage] of providerCoverage) {
+    if (coverage.covered) protectedDevices.add(deviceId);
+  }
 
   const latestJobs = recentJobs.map((r) => ({
     id: r.job.id,
@@ -381,6 +507,8 @@ dashboardRoutes.get('/dashboard', requirePermission(PERMISSIONS.ORGS_READ.resour
     totalSize: r.job.totalSize ?? null,
     errorCount: r.job.errorCount ?? null,
     errorLog: r.job.errorLog ?? null,
+    failureCategory: classifyBackupFailure({ status: r.job.status, errorLog: r.job.errorLog }),
+    dataAccounting: deriveBackupJobDataAccounting(r.job),
   }));
 
   return c.json({
@@ -393,6 +521,7 @@ dashboardRoutes.get('/dashboard', requirePermission(PERMISSIONS.ORGS_READ.resour
       },
       jobsLast24h: {
         completed: last24hStats.completed,
+        completedWithErrors: last24hStats.completedWithErrors,
         failed: last24hStats.failed,
         // Must be serialized, not just counted: the web success-rate fraction
         // reads `partial` off this object, and omitting it here silently makes
@@ -409,14 +538,74 @@ dashboardRoutes.get('/dashboard', requirePermission(PERMISSIONS.ORGS_READ.resour
         protectedDevices: protectedDevices.size,
       },
       latestJobs,
-      attentionItems: attention.items,
+      // #2562: the Overview "Storage by Provider" panel read this key from the
+      // start, but it was never sent, so the panel always showed its
+      // "no storage providers configured" empty state.
+      storageProviders,
+      // NEW (D-13): the web has rendered this panel from an absent key since it
+      // was written. Provider-covered devices are excluded — dispatching a
+      // first-party job to a machine Cove already backed up is the false
+      // negative this integration removes.
+      overdueDevices,
+      attentionItems: [...attention.items, ...providerAttention].slice(0, ATTENTION_MAX_ITEMS),
       // Additive, backward-compatible degraded signal: true when the
       // attention-items sub-query failed and the list could not be computed.
-      // The UI must treat this as "unknown", not "all clear".
-      attentionError: attention.error,
+      // The UI must treat this as "unknown", not "all clear". A failed assigned-
+      // devices read counts: with none known, the overdue list is empty too.
+      attentionError: attention.error || providerError || assignedError,
     },
   });
 });
+
+type BackupJobRow = typeof backupJobs.$inferSelect;
+
+function isInFlight(status: string): status is ActiveBackupJob['status'] {
+  return (IN_FLIGHT_BACKUP_JOB_STATUSES as readonly string[]).includes(status);
+}
+
+/**
+ * Running before pending (a pending job behind a running one is waiting its
+ * turn on the device), then startedAt ascending (never-started last), then
+ * createdAt ascending: the order the device works them in.
+ */
+function compareActiveJobs(a: BackupJobRow, b: BackupJobRow): number {
+  if (a.status !== b.status) return a.status === 'running' ? -1 : 1;
+  if (a.startedAt && b.startedAt) {
+    const started = a.startedAt.getTime() - b.startedAt.getTime();
+    if (started !== 0) return started;
+  } else if (a.startedAt || b.startedAt) {
+    return a.startedAt ? -1 : 1;
+  }
+  return a.createdAt.getTime() - b.createdAt.getTime();
+}
+
+/**
+ * In-flight backups for the device page (#11027): what is running or queued
+ * right now, with enough progress fields for the web to derive a phase, speed,
+ * ETA and stall state.
+ */
+async function loadActiveBackupJobs(jobs: BackupJobRow[]): Promise<ActiveBackupJob[]> {
+  const active = jobs.filter((j) => isInFlight(j.status)).sort(compareActiveJobs);
+  if (active.length === 0) return [];
+
+  const resumedByJob = await loadJobResumedAt(active.map((j) => j.id));
+
+  return active.map((j) => ({
+    id: j.id,
+    status: j.status as ActiveBackupJob['status'],
+    backupMode: j.backupMode ?? null,
+    backupType: j.backupType ?? null,
+    createdAt: j.createdAt.toISOString(),
+    startedAt: j.startedAt?.toISOString() ?? null,
+    totalSize: j.totalSize ?? null,
+    transferredSize: j.transferredSize ?? null,
+    fileCount: j.fileCount ?? null,
+    totalFiles: j.totalFiles ?? null,
+    lastProgressAt: j.lastProgressAt?.toISOString() ?? null,
+    lastKeepaliveAt: j.lastKeepaliveAt?.toISOString() ?? null,
+    resumedAt: resumedByJob.get(j.id)?.toISOString() ?? null,
+  }));
+}
 
 dashboardRoutes.get('/status/:deviceId', requirePermission(PERMISSIONS.ORGS_READ.resource, PERMISSIONS.ORGS_READ.action), async (c) => {
   const auth = c.get('auth');
@@ -479,6 +668,8 @@ dashboardRoutes.get('/status/:deviceId', requirePermission(PERMISSIONS.ORGS_READ
   const lastFailure =
     jobs.find((j) => j.status === 'failed') ?? null;
 
+  const activeJobs = await loadActiveBackupJobs(jobs);
+
   return c.json({
     data: {
       deviceId,
@@ -505,11 +696,16 @@ dashboardRoutes.get('/status/:deviceId', requirePermission(PERMISSIONS.ORGS_READ
             // tab showed a clean, green backup for a run that read every file
             // off the live volume. Already secret-redacted at write time.
             errorLog: lastJob.errorLog ?? null,
+            failureCategory: classifyBackupFailure({ status: lastJob.status, errorLog: lastJob.errorLog }),
+            dataAccounting: deriveBackupJobDataAccounting(lastJob),
           }
         : null,
       lastSuccessAt: lastSuccess?.completedAt?.toISOString() ?? null,
       lastFailureAt: lastFailure?.completedAt?.toISOString() ?? null,
       lastFailureError: lastFailure?.errorLog ?? null,
+      lastFailureCategory: lastFailure
+        ? classifyBackupFailure({ status: lastFailure.status, errorLog: lastFailure.errorLog })
+        : null,
       nextScheduledAt: (() => {
         // Prefer normalized settings; fall back to inline_settings on the feature link
         const schedule = (resolved?.settings?.schedule ?? resolved?.inlineSettings) as Record<string, unknown> | null;
@@ -520,6 +716,7 @@ dashboardRoutes.get('/status/:deviceId', requirePermission(PERMISSIONS.ORGS_READ
         if (typeof frequency !== 'string' || typeof time !== 'string') return null;
         return getNextRun({ ...schedule, frequency, time } as any, resolved?.resolvedTimezone);
       })(),
+      activeJobs,
     },
   });
 });

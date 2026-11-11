@@ -9,8 +9,19 @@ import { captureException } from '../services/sentry';
 import { isPgUniqueViolation } from '../utils/pgErrors';
 import { authMiddleware, requireMfa, requirePermission, requireScope } from '../middleware/auth';
 import { sendCommandToAgent, isAgentConnected } from './agentWs';
-import { checkRemoteAccess } from '../services/remoteAccessPolicy';
-import { HTTP_TUNNEL_MAX_SESSION_HOURS } from './tunnelHttp';
+import {
+  checkRemoteAccess,
+  resolveDesktopSessionPolicy,
+  type DesktopSessionPolicy,
+} from '../services/remoteAccessPolicy';
+import { checkVncConsentGate } from './remote/vncConsentGate';
+import {
+  CONSENT_REQUIRED_TRANSPORT_UNAVAILABLE_CODE,
+  CONSENT_REQUIRED_TRANSPORT_UNAVAILABLE_MESSAGE,
+  REMOTE_PROMPT_POLICY_UNAVAILABLE_CODE,
+  REMOTE_PROMPT_POLICY_UNAVAILABLE_MESSAGE,
+} from './remote/consentGate';
+import { HTTP_TUNNEL_MAX_SESSION_HOURS, markTunnelViewerPresent } from './tunnelHttp';
 import { createWsTicket, createVncConnectCode, consumeVncConnectCode, getViewerAccessTokenExpirySeconds, HTTP_TICKET_TTL_MS } from '../services/remoteSessionAuth';
 import {
   createViewerAccessToken,
@@ -27,7 +38,11 @@ import type { AuthContext } from '../middleware/auth';
 import { canAccessSite, PERMISSIONS, type UserPermissions } from '../services/permissions';
 import { createRemoteSession, RemoteSessionDeniedError } from '../services/remoteSessionCreate';
 import { evaluateCapability, partnerIdForDevice, trustDenyBody, unresolvedPartnerDecision } from '../services/partnerTrust';
+import { cancelPendingAgentCommandsByPrefix } from '../services/agentCommandAwait';
+import { TUNNEL_CLOSED_ERROR, tunnelHttpCommandPrefix } from './tunnelHttpCore';
 import { partnerTrustMode } from '../config/partnerTrustMode';
+import { buildPathModeTicketUrl, buildTunnelEnterUrl, getTunnelOriginConfig } from '../config/tunnelOrigin';
+import { isTunnelOriginEnabledForOrg } from '../services/tunnelOriginOptIn';
 import { authorizeRemoteSessionContinuation } from '../services/remoteWsAuthorization';
 import { teardownDisconnectedSessions } from '../services/remoteSessionTeardown';
 import {
@@ -36,6 +51,7 @@ import {
   toTerminalSessionRow,
   type TerminalSessionRow,
 } from '../services/remoteDesktopTerminalIntent';
+import { markRequestAuditWritten } from '../services/auditRequestTracking';
 
 export const tunnelRoutes = new Hono();
 
@@ -60,6 +76,20 @@ async function authorizeTunnelContinuation(sessionId: string, userId: string) {
 }
 
 function liveAuthorizationResponse(c: Context, denial: { status: 403 | 404 | 429 | 503; reason: string }) {
+  // The live-authority check refuses VNC tunnels on consent-mode devices;
+  // answer with the same technician-facing codes as POST /tunnels.
+  if (denial.reason === 'consent_required') {
+    return c.json({
+      error: CONSENT_REQUIRED_TRANSPORT_UNAVAILABLE_MESSAGE,
+      code: CONSENT_REQUIRED_TRANSPORT_UNAVAILABLE_CODE,
+    }, 409);
+  }
+  if (denial.reason === 'prompt_policy_unavailable') {
+    return c.json({
+      error: REMOTE_PROMPT_POLICY_UNAVAILABLE_MESSAGE,
+      code: REMOTE_PROMPT_POLICY_UNAVAILABLE_CODE,
+    }, 503);
+  }
   return c.json({ error: 'Remote session access denied', reason: denial.reason }, denial.status);
 }
 
@@ -393,6 +423,7 @@ async function logTunnelAudit(
           ipAddress,
           result: 'success',
         });
+        markRequestAuditWritten();
       })
     );
   } catch (error) {
@@ -438,13 +469,25 @@ tunnelRoutes.post(
     if (!policyCheck.allowed) {
       return c.json({
         error: policyCheck.reason,
-        code: 'REMOTE_ACCESS_POLICY_DENIED',
+        // A parked device carries its own code (DEVICE_PENDING_ASSIGNMENT).
+        code: policyCheck.code ?? 'REMOTE_ACCESS_POLICY_DENIED',
         capability: tunnelCapability,
         policyName: policyCheck.policyName,
       }, 403);
     }
 
     const isVNC = body.type === 'vnc';
+    // VNC has no end-user consent prompt: refuse it on a consent-mode device.
+    // The agent cannot filter the raw RFB stream, so the viewer gates VNC
+    // clipboard on this policy (#8269). Same resolver the WebRTC offer ships to
+    // the agent, never taken from the request. Resolved before any side effect
+    // so a failure leaves no tunnel behind.
+    let vncClipboard: DesktopSessionPolicy['clipboard'] | undefined;
+    if (isVNC) {
+      const consentGate = await checkVncConsentGate(device.id);
+      if (!consentGate.ok) return c.json(consentGate.body, consentGate.status);
+      ({ clipboard: vncClipboard } = await resolveDesktopSessionPolicy(device.id));
+    }
     const targetHost = isVNC ? '127.0.0.1' : body.targetHost;
     const targetPort = isVNC ? 5900 : body.targetPort;
 
@@ -532,7 +575,7 @@ tunnelRoutes.post(
       sourceIp,
     );
 
-    return c.json(session, 201);
+    return c.json(vncClipboard ? { ...session, clipboard: vncClipboard } : session, 201);
   }
 );
 
@@ -579,7 +622,8 @@ tunnelRoutes.post(
     if (!policyCheck.allowed) {
       return c.json({
         error: policyCheck.reason,
-        code: 'REMOTE_ACCESS_POLICY_DENIED',
+        // A parked device carries its own code (DEVICE_PENDING_ASSIGNMENT).
+        code: policyCheck.code ?? 'REMOTE_ACCESS_POLICY_DENIED',
         capability: 'proxy',
         policyName: policyCheck.policyName,
       }, 403);
@@ -1096,6 +1140,18 @@ tunnelRoutes.get(
       return c.json({ error: 'Access to this site denied' }, 403);
     }
 
+    // ProxyTunnelPage polls this every 5s while the proxied page is open; the
+    // owner's poll is the only thing that keeps cookie-less path-token auth
+    // alive in tunnelHttp.ts (subresources from the sandboxed iframe often
+    // arrive without the tunnel cookie).
+    if (
+      session.type === 'proxy' &&
+      session.userId === auth.user.id &&
+      ['pending', 'connecting', 'active'].includes(session.status)
+    ) {
+      await markTunnelViewerPresent(session.id);
+    }
+
     // Server-computed idle time, never raw timestamps (same rule as GET
     // /tunnels — the client must not diff a server timestamp against its own
     // clock).
@@ -1107,9 +1163,15 @@ tunnelRoutes.get(
 );
 
 // DELETE /tunnels/:id — Close a tunnel (ownership enforced)
+// Closing tears down a live remote session, so it takes the same grants as
+// opening one (POST /tunnels). requirePermission also populates `permissions`,
+// which the site-scope check below relies on.
 tunnelRoutes.delete(
   '/:id',
   requireScope('organization', 'partner', 'system'),
+  requirePermission(PERMISSIONS.DEVICES_EXECUTE.resource, PERMISSIONS.DEVICES_EXECUTE.action),
+  requirePermission(PERMISSIONS.REMOTE_ACCESS.resource, PERMISSIONS.REMOTE_ACCESS.action),
+  requireMfa(),
   zValidator('param', idParamSchema),
   async (c) => {
     const auth = c.get('auth') as AuthContext;
@@ -1133,6 +1195,13 @@ tunnelRoutes.delete(
       return c.json({ error: 'Tunnel session not found' }, 404);
     }
 
+    // Site-scope (app-layer-only) re-enforcement, same rule as GET /tunnels/:id:
+    // a site-restricted caller may not close a tunnel to an out-of-site device.
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    if (await isTunnelDeviceSiteDenied(session.deviceId, perms)) {
+      return c.json({ error: 'Access to this site denied' }, 403);
+    }
+
     // Get device to find agent
     const [device] = await db
       .select()
@@ -1152,6 +1221,10 @@ tunnelRoutes.delete(
       .update(tunnelSessions)
       .set({ status: 'disconnected', endedAt: new Date() })
       .where(eq(tunnelSessions.id, id));
+
+    // Spec §4: Close cancels this tunnel's in-flight proxied requests so no
+    // device response lands after the user saw "disconnected".
+    cancelPendingAgentCommandsByPrefix(tunnelHttpCommandPrefix(id), TUNNEL_CLOSED_ERROR);
 
     // Revoke any viewer JWTs minted for this tunnel. The service logs if Redis
     // is unavailable; the check path (requireViewerToken) fails closed.
@@ -1240,14 +1313,18 @@ tunnelRoutes.post(
 );
 
 // POST /tunnels/:id/http-ticket — Issue a one-time HTTP proxy ticket (5-min TTL for proxy page load)
+const httpTicketQuerySchema = z.object({ mode: z.enum(['frame', 'tab']).optional() });
+
 tunnelRoutes.post(
   '/:id/http-ticket',
   requireScope('organization', 'partner', 'system'),
   requireMfa(),
   zValidator('param', idParamSchema),
+  zValidator('query', httpTicketQuerySchema),
   async (c) => {
     const auth = c.get('auth') as AuthContext;
     const { id } = c.req.valid('param');
+    const context = c.req.valid('query').mode ?? 'frame';
 
     const conditions = [eq(tunnelSessions.id, id)];
     if (auth.orgId) {
@@ -1299,17 +1376,26 @@ tunnelRoutes.post(
       ttlMs: HTTP_TICKET_TTL_MS,
     });
 
+    // Host mode needs the regional tunnel origin AND the owning partner's opt-in.
+    // orgId comes from the verified session row, never from client input.
+    const tunnelOrigin = getTunnelOriginConfig();
+    const hostMode = tunnelOrigin !== null && await isTunnelOriginEnabledForOrg(session.orgId);
+    const mode = hostMode ? 'host' : 'path';
+    const url = tunnelOrigin && hostMode
+      ? buildTunnelEnterUrl(tunnelOrigin, id, ticket.ticket, context)
+      : buildPathModeTicketUrl(id, ticket.ticket);
+
     await logTunnelAudit(
       'tunnel.http_ticket.mint',
       'tunnel_session',
       id,
       auth.user.id,
       session.orgId,
-      { deviceId: session.deviceId, type: session.type },
+      { deviceId: session.deviceId, type: session.type, mode, context },
       getClientIp(c),
     );
 
-    return c.json({ ticket });
+    return c.json({ ticket, url, mode });
   }
 );
 
@@ -1387,6 +1473,21 @@ tunnelRoutes.post(
   }
 );
 
+/**
+ * The session's remote_access clipboard policy for a VNC tunnel handed out by a
+ * route with no request DB context (code redemption, viewer-token downgrade).
+ * The viewer gates VNC clipboard on it because the agent cannot filter the raw
+ * RFB stream (#8269). Resolved in system scope: without a DB context the policy
+ * read sees no rows under deny-default RLS and would report the baseline
+ * instead of the device's policy.
+ */
+async function resolveVncClipboardPolicyContextless(
+  deviceId: string,
+): Promise<DesktopSessionPolicy['clipboard']> {
+  const { clipboard } = await withSystemDbAccessContext(() => resolveDesktopSessionPolicy(deviceId));
+  return clipboard;
+}
+
 // --- VNC exchange route (no auth — the code IS the auth) ---
 
 export const vncExchangeRoutes = new Hono();
@@ -1453,6 +1554,9 @@ vncExchangeRoutes.post(
     const liveAuthority = await authorizeTunnelContinuation(record.tunnelId, record.userId);
     if (!liveAuthority.ok) return liveAuthorizationResponse(c, liveAuthority);
 
+    // Before minting the ws-ticket and viewer token, so a failure hands out no credentials.
+    const clipboard = await resolveVncClipboardPolicyContextless(result.deviceId);
+
     // Build the WebSocket URL from the canonical external base URL. Using
     // c.req.url would yield an internal http://api:3001 in Caddy-fronted
     // deployments; honoring X-Forwarded-Proto doesn't help when Caddy itself
@@ -1500,6 +1604,7 @@ vncExchangeRoutes.post(
       tunnelId: record.tunnelId,
       wsUrl,
       deviceId: record.deviceId,
+      clipboard,
     });
   }
 );
@@ -1641,7 +1746,10 @@ vncViewerRoutes.post('/upgrade-to-webrtc', async (c) => {
 
   const policyCheck = await checkRemoteAccess(bound.deviceId, 'webrtcDesktop');
   if (!policyCheck.allowed) {
-    return c.json({ error: policyCheck.reason ?? 'WebRTC desktop access is disabled by policy' }, 403);
+    return c.json({
+      error: policyCheck.reason ?? 'WebRTC desktop access is disabled by policy',
+      ...(policyCheck.code ? { code: policyCheck.code } : {}),
+    }, 403);
   }
 
   // Reuse the same pattern as /sessions: terminate stragglers first, insert
@@ -1650,7 +1758,7 @@ vncViewerRoutes.post('/upgrade-to-webrtc', async (c) => {
   let stragglers: TerminalSessionRow[] = [];
   try {
     ({ session, stragglers } = await withSystemDbAccessContext(async () => {
-      // Through the terminal-intent contract (SEC-038 W03), returning the rows
+      // Through the terminal-intent contract, returning the rows
       // so each straggler's stop can name its terminal generation. The stop
       // itself is dispatched AFTER this context commits — the relay's ack wait
       // must not pin this connection idle-in-transaction.
@@ -1768,8 +1876,19 @@ vncViewerRoutes.post('/downgrade-to-vnc', async (c) => {
 
   const policyCheck = await checkRemoteAccess(bound.deviceId, 'vncRelay');
   if (!policyCheck.allowed) {
-    return c.json({ error: policyCheck.reason ?? 'VNC relay is disabled by policy' }, 403);
+    return c.json({
+      error: policyCheck.reason ?? 'VNC relay is disabled by policy',
+      ...(policyCheck.code ? { code: policyCheck.code } : {}),
+    }, 403);
   }
+
+  // Falling back from the desktop viewer to VNC would drop the consent prompt:
+  // refuse it on a consent-mode device.
+  const consentGate = await checkVncConsentGate(bound.deviceId);
+  if (!consentGate.ok) return c.json(consentGate.body, consentGate.status);
+
+  // Before the tunnel exists, so a failure leaves nothing to clean up.
+  const clipboard = await resolveVncClipboardPolicyContextless(bound.deviceId);
 
   // Insert the tunnel session row, then kick the agent off.
   const tunnel = await withSystemDbAccessContext(() => createRemoteSession('tunnel', {
@@ -1849,5 +1968,6 @@ vncViewerRoutes.post('/downgrade-to-vnc', async (c) => {
     wsUrl,
     accessToken,
     expiresInSeconds: getViewerAccessTokenExpirySeconds(),
+    clipboard,
   });
 });

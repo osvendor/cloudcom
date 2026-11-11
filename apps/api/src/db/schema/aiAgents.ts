@@ -2,10 +2,12 @@ import { sql } from 'drizzle-orm';
 import {
   bigint,
   boolean,
+  foreignKey,
   index,
   integer,
   jsonb,
   pgTable,
+  smallint,
   text,
   timestamp,
   unique,
@@ -29,6 +31,7 @@ import type {
 } from '@breeze/shared';
 import { alertCorrelationGroups, alerts } from './alerts';
 import { aiSessions } from './ai';
+import { partnerAiModels } from './aiModelRegistry';
 import { aiAgentSchedules } from './aiAgentSchedules';
 import { devices } from './devices';
 import { metricAnomalyIncidents } from './metricAnomalyIncidents';
@@ -50,7 +53,10 @@ export const aiAgents = pgTable('ai_agents', {
   name: varchar('name', { length: 120 }).notNull(),
   enabled: boolean('enabled').notNull().default(false),
   mode: text('mode').$type<AiAgentMode>().notNull().default('off'),
-  model: varchar('model', { length: 100 }),
+  // AI model registry W02 (#7600): the offering this policy is bound to. The
+  // legacy `model` column is no longer mapped (retired W08 #7606; W08b drops it).
+  offeringId: uuid('offering_id'),
+  offeringPartnerId: uuid('offering_partner_id'),
   toolAllowlist: jsonb('tool_allowlist').$type<string[]>().notNull().default([]),
   protectedResources: jsonb('protected_resources').$type<Partial<AiAgentProtectedResources>>().notNull().default({}),
   limits: jsonb('limits').$type<Partial<AiAgentLimits>>().notNull().default({}),
@@ -65,7 +71,10 @@ export const aiAgents = pgTable('ai_agents', {
   cooldownSeconds: integer('cooldown_seconds').notNull().default(900),
   disabledAt: timestamp('disabled_at', { withTimezone: true }),
   disabledBy: uuid('disabled_by').references(() => users.id),
-  createdBy: uuid('created_by').notNull().references(() => users.id),
+  // AI Suggested Fixes W2: nullable only for system-provisioned rows, which
+  // must set provisionedBy instead (ai_agents_creator_chk).
+  createdBy: uuid('created_by').references(() => users.id),
+  provisionedBy: varchar('provisioned_by', { length: 64 }),
   lastUpdatedBy: uuid('last_updated_by').references(() => users.id),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
@@ -76,6 +85,17 @@ export const aiAgents = pgTable('ai_agents', {
     .where(sql`${table.disabledAt} IS NULL`),
   partnerIdx: index('ai_agents_partner_id_idx').on(table.partnerId),
   orgIdx: index('ai_agents_org_id_idx').on(table.orgId),
+  offeringFk: foreignKey({
+    columns: [table.offeringId, table.offeringPartnerId],
+    foreignColumns: [partnerAiModels.id, partnerAiModels.partnerId],
+    name: 'ai_agents_offering_fk',
+  }).onDelete('set null'),
+  offeringOrgPartnerFk: foreignKey({
+    columns: [table.orgId, table.offeringPartnerId],
+    foreignColumns: [organizations.id, organizations.partnerId],
+    name: 'ai_agents_offering_org_partner_fk',
+  }),
+  offeringIdx: index('ai_agents_offering_idx').on(table.offeringId).where(sql`${table.offeringId} IS NOT NULL`),
 }));
 
 // Ledger (spec §4.2). org_id is ALWAYS the target org (the device's org), even
@@ -151,6 +171,10 @@ export const aiAgentRuns = pgTable('ai_agent_runs', {
   computeWallMs: bigint('compute_wall_ms', { mode: 'number' }),
   computeCents: integer('compute_cents'),
   computeReservedCents: integer('compute_reserved_cents'),
+  // #9451: this attempt's compute settlement claim (every billing source).
+  // Only the settle that sets it writes compute_cents, the rollups and the
+  // credit debit intent; the enqueue_failed reclaim (a new attempt) clears it.
+  computeSettledAt: timestamp('compute_settled_at', { withTimezone: true }),
   workspaceId: uuid('workspace_id'),
   errorCode: varchar('error_code', { length: 64 }),
   correlationId: varchar('correlation_id', { length: 64 }),
@@ -175,6 +199,24 @@ export const aiAgentRuns = pgTable('ai_agent_runs', {
   taskId: uuid('task_id'),
   taskStepKey: text('task_step_key'),
   taskAttemptOrdinal: integer('task_attempt_ordinal'),
+  // Wisp W02 (Wisp design §4.3): the delegation grant + the revision this run
+  // was admitted under. Both NULL for every non-Wisp run, both set otherwise
+  // (`ai_agent_runs_grant_link_chk`). FKs (grant_revision_id, grant_id) ->
+  // wisp_grant_revisions(id, grant_id) (ON DELETE SET NULL, erasure only) and
+  // grant_id -> wisp_grants(id) (ON DELETE RESTRICT) are SQL-ONLY
+  // (migrations/2027-01-04-100100-wisp-grants.sql), like `taskId` above.
+  grantId: uuid('grant_id'),
+  grantRevisionId: uuid('grant_revision_id'),
+  // Wisp W07 (w00 A11): specialist lineage. A child run requested by Wisp's
+  // assessment run carries depth 1, the requesting run and the grant revision
+  // the request was made under; every other row is depth 0 with both NULL
+  // (`ai_agent_runs_depth_chk`). FKs are SQL-ONLY
+  // (migrations/2027-01-05-100400-wisp-specialist-lineage.sql): the
+  // (requested_by_run_id, org_id) self-FK uses `ON DELETE SET NULL
+  // (requested_by_run_id)`, which Drizzle cannot model.
+  requestedByRunId: uuid('requested_by_run_id'),
+  parentGrantRevisionId: uuid('parent_grant_revision_id'),
+  depth: smallint('depth').notNull().default(0),
   // Spec §6.2: no prompt registry exists yet, so runs 1 and 4 of one task may
   // use different released prompts. That drift is accepted but must be
   // RECORDED. `resolvedModel` because runLoop.ts may fall back to the org's
@@ -185,6 +227,20 @@ export const aiAgentRuns = pgTable('ai_agent_runs', {
   // `analysis`-profile run — `{ handles, deviceIds, region }`. NULL for every
   // other profile. Read DEFENSIVELY (jsonb has no compile-time shape).
   stagedInputs: jsonb('staged_inputs').$type<AiAgentRunStagedInputs>(),
+  /** AI model registry W03 (#7601): funding of the offering resolved at admission. NULL = admitted before W03. */
+  fundingSource: text('funding_source').$type<'platform' | 'partner_key'>(),
+  /** W03 (review finding 6): the offering admission resolved; the run dispatches this one or is blocked. No FK (provenance id). */
+  admittedOfferingId: uuid('admitted_offering_id'),
+  /** W09 (#7607): the offering that served the run's model tokens when it was a failover hop. */
+  servedOfferingId: uuid('served_offering_id'),
+  /** W09: that hop's funding. Sandbox compute stays on `fundingSource` (D7). */
+  servedFundingSource: text('served_funding_source').$type<'platform' | 'partner_key'>(),
+  /** W09: the hop index; a re-driven run resumes on this hop's reservation key. */
+  servedFailoverHop: smallint('served_failover_hop'),
+  /** W09: why it failed over; restores the ledger provenance on a re-driven run. */
+  servedFailoverCause: text('served_failover_cause'),
+  /** #7787: the offering the run was routed to BEFORE its failover (the ledger's failover_from_offering_id). No FK (provenance id). */
+  servedFailoverFromOfferingId: uuid('served_failover_from_offering_id'),
 }, (table) => ({
   // Tenant-scoped (see 2026-09-02-ai-agents.sql): a global unique on
   // dedupe_key is enforced below RLS and leaks cross-tenant existence.

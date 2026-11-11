@@ -13,6 +13,7 @@ import {
   index,
   uniqueIndex,
   primaryKey,
+  check,
   type AnyPgColumn,
 } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
@@ -54,6 +55,20 @@ export const configFeatureTypeEnum = pgEnum('config_feature_type', [
   // Deliberately the plural: 'monitoring' above is the service/process watch
   // feature and the two must never be confusable.
   'monitors',
+  // #6856. APPENDED, matching the migration's ADD VALUE order.
+  'hardware_monitoring',
+  // #7455. APPENDED, matching the migration's ADD VALUE order.
+  'time_sync',
+  // #3834. APPENDED, matching the migration's ADD VALUE order.
+  'workload_inventory',
+  // #4609. APPENDED, matching the migration's ADD VALUE order.
+  'system_protection',
+  // #6960. APPENDED, matching the migration's ADD VALUE order.
+  'security_agents',
+  // #10100 — network-isolation containment tuning, inline-only, partner-wide
+  'containment',
+  // #11065 — vendor updates, inline-only, partner-wide. APPENDED, matching the migration.
+  'oem_updates',
 ]);
 
 export const configAssignmentLevelEnum = pgEnum('config_assignment_level', [
@@ -121,6 +136,32 @@ export const configPolicyFeatureLinks = pgTable('config_policy_feature_links', {
   featureType: configFeatureTypeEnum('feature_type').notNull(),
   featurePolicyId: uuid('feature_policy_id'),
   inlineSettings: jsonb('inline_settings'),
+  // Stored execution authority for device-execution effects a link enables
+  // (today: `security` auto-quarantine). Same envelope as
+  // sensitive_data_policies; owner = this link's policy. All NULL = none.
+  // See services/securityScanQuarantineAuthority.ts.
+  executionAuthorityVersion: integer('execution_authority_version'),
+  executionAuthorityKind: varchar('execution_authority_kind', { length: 32 })
+    .$type<'organization_restricted' | 'organization_unrestricted' | 'partner_unrestricted'>(),
+  executionAuthoritySiteIds: uuid('execution_authority_site_ids').array(),
+  executionAuthorityUserId: uuid('execution_authority_user_id'),
+  executionAuthorityPrincipalKind: varchar('execution_authority_principal_kind', { length: 16 })
+    .$type<'user' | 'system'>(),
+  executionAuthorityFingerprint: varchar('execution_authority_fingerprint', { length: 64 }),
+  executionAuthorityCapturedAt: timestamp('execution_authority_captured_at', { withTimezone: true }),
+  executionAuthorityGeneration: uuid('execution_authority_generation'),
+  // Links that existed before stored authority: 'grandfathered' = auto-
+  // quarantine keeps working while the policy's `created_by` holds
+  // devices:execute (checked live at dispatch); 'revoked' = that check failed
+  // once, detect-only until re-approved. NULL for every link written since.
+  executionAuthorityLegacy: varchar('execution_authority_legacy', { length: 16 })
+    .$type<'grandfathered' | 'revoked'>(),
+  // Outcome of the most recent dispatch-time authority check, written only on
+  // change: 'ok' | 'approver_invalid' (quarantine suppressed) | 'lookup_failed'
+  // (transient). NULL = not checked yet.
+  executionAuthorityStatus: varchar('execution_authority_status', { length: 32 })
+    .$type<'ok' | 'approver_invalid' | 'lookup_failed'>(),
+  executionAuthorityStatusAt: timestamp('execution_authority_status_at', { withTimezone: true }),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 }, (table) => ({
@@ -267,8 +308,9 @@ export const configPolicyPatchSettings = pgTable('config_policy_patch_settings',
   id: uuid('id').primaryKey().defaultRandom(),
   featureLinkId: uuid('feature_link_id').notNull().unique().references(() => configPolicyFeatureLinks.id, { onDelete: 'cascade' }),
   sources: text('sources').array().notNull().default(['os']),
-  autoApprove: boolean('auto_approve').notNull().default(false),
-  autoApproveSeverities: text('auto_approve_severities').array().default([]),
+  // auto_approve / auto_approve_severities dropped by
+  // 2026-12-31-160000-drop-policy-patch-auto-approve.sql (#8188): the Update
+  // Ring owns auto-approval.
   scheduleFrequency: varchar('schedule_frequency', { length: 20 }).notNull().default('weekly'),
   scheduleTime: varchar('schedule_time', { length: 10 }).notNull().default('02:00'),
   scheduleDayOfWeek: varchar('schedule_day_of_week', { length: 10 }).default('sun'),
@@ -283,6 +325,12 @@ export const configPolicyPatchSettings = pgTable('config_policy_patch_settings',
   rebootAllowDeferral: boolean('reboot_allow_deferral').notNull().default(false),
   rebootMaxDeferrals: integer('reboot_max_deferrals').notNull().default(3),
   rebootDeferralMinutes: integer('reboot_deferral_minutes').notNull().default(60),
+  // #8030: optional replacement text for the end-user restart prompt. NULL
+  // keeps the agent's built-in text. Plain text, validated by the shared
+  // patchInlineSettingsSchema; `{{countdown}}` is substituted by the agent.
+  rebootPromptTitle: varchar('reboot_prompt_title', { length: 100 }),
+  rebootPromptBody: varchar('reboot_prompt_body', { length: 500 }),
+  rebootPromptButton: varchar('reboot_prompt_button', { length: 40 }),
   // #1872: when true, the Windows agent suppresses the native Windows Update
   // automatic-install channel (NoAutoUpdate=1) so patches flow only through
   // Breeze. Breeze's own WUA-driven installs are unaffected.
@@ -325,6 +373,7 @@ export const configPolicyEventLogSettings = pgTable('config_policy_event_log_set
   retentionDays: integer('retention_days').notNull().default(30),
   maxEventsPerCycle: integer('max_events_per_cycle').notNull().default(100),
   collectCategories: text('collect_categories').array().notNull().default(['security', 'hardware', 'application', 'system']),
+  applicationProviders: text('application_providers').array().notNull().default(sql`'{}'::text[]`),
   minimumLevel: eventLogLevelEnum('minimum_level').notNull().default('info'),
   // 15m default (was 5m) — issue #2390. Shadowed in practice (writes always go
   // through eventLogInlineSettingsSchema, which supplies the value), but kept in
@@ -335,7 +384,98 @@ export const configPolicyEventLogSettings = pgTable('config_policy_event_log_set
   enableCorrelation: boolean('enable_correlation').notNull().default(true),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
-});
+}, (t) => [
+  check('config_policy_event_log_settings_app_providers_max', sql`cardinality(${t.applicationProviders}) <= 20`),
+]);
+
+// Single-item: one row per feature link (inherited RAID/disk-health
+// collection settings, #6856). Inline-only — no linked-policy variant.
+export const configPolicyHardwareMonitoringSettings = pgTable('config_policy_hardware_monitoring_settings', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  featureLinkId: uuid('feature_link_id').notNull().unique().references(() => configPolicyFeatureLinks.id, { onDelete: 'cascade' }),
+  enabled: boolean('enabled').notNull().default(true),
+  pollIntervalMinutes: integer('poll_interval_minutes').notNull().default(10),
+  diskHealthIntervalMinutes: integer('disk_health_interval_minutes').notNull().default(60),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+}, (t) => [
+  check('config_policy_hardware_monitoring_poll_interval_chk', sql`${t.pollIntervalMinutes} BETWEEN 5 AND 60`),
+  check('config_policy_hardware_monitoring_disk_interval_chk', sql`${t.diskHealthIntervalMinutes} BETWEEN 15 AND 1440`),
+]);
+
+// Single-item: one row per feature link (inherited W32Time management
+// settings, #7455). Inline-only — no linked-policy variant.
+export const configPolicyTimeSyncSettings = pgTable(
+  'config_policy_time_sync_settings',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    featureLinkId: uuid('feature_link_id')
+      .notNull()
+      .unique()
+      .references(() => configPolicyFeatureLinks.id, { onDelete: 'cascade' }),
+    enforceNtp: boolean('enforce_ntp').notNull().default(false),
+    ntpServers: text('ntp_servers').array().notNull().default([]),
+    pollIntervalMinutes: integer('poll_interval_minutes').notNull().default(60),
+    timezoneExpected: text('timezone_expected')
+      .$type<'site' | 'pinned'>()
+      .notNull()
+      .default('site'),
+    pinnedTimezone: text('pinned_timezone'),
+    timezoneAutoFix: boolean('timezone_auto_fix').notNull().default(false),
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+    updatedAt: timestamp('updated_at').defaultNow().notNull(),
+  },
+  (t) => [
+    check(
+      'config_policy_time_sync_servers_chk',
+      sql`cardinality(${t.ntpServers}) <= 5`,
+    ),
+    check(
+      'config_policy_time_sync_poll_chk',
+      sql`${t.pollIntervalMinutes} BETWEEN 15 AND 1440`,
+    ),
+    check(
+      'config_policy_time_sync_expected_chk',
+      sql`${t.timezoneExpected} IN ('site', 'pinned')`,
+    ),
+    check(
+      'config_policy_time_sync_pin_chk',
+      sql`${t.timezoneExpected} = 'site' OR ${t.pinnedTimezone} IS NOT NULL`,
+    ),
+    check(
+      'config_policy_time_sync_enforce_chk',
+      sql`NOT ${t.enforceNtp} OR cardinality(${t.ntpServers}) >= 1`,
+    ),
+  ],
+);
+
+// Single-item: one row per feature link (workload inventory enumeration
+// settings, #3834). Inline-only — no linked-policy variant. Detection is
+// always on; these gate enumeration only.
+export const configPolicyWorkloadInventorySettings = pgTable(
+  'config_policy_workload_inventory_settings',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    featureLinkId: uuid('feature_link_id')
+      .notNull()
+      .unique()
+      .references(() => configPolicyFeatureLinks.id, { onDelete: 'cascade' }),
+    enabled: boolean('enabled').notNull().default(false),
+    dockerEnabled: boolean('docker_enabled').notNull().default(true),
+    podmanEnabled: boolean('podman_enabled').notNull().default(true),
+    hypervEnabled: boolean('hyperv_enabled').notNull().default(true),
+    proxmoxEnabled: boolean('proxmox_enabled').notNull().default(true),
+    intervalMinutes: integer('interval_minutes').notNull().default(60),
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+    updatedAt: timestamp('updated_at').defaultNow().notNull(),
+  },
+  (t) => [
+    check(
+      'config_policy_workload_inventory_interval_chk',
+      sql`${t.intervalMinutes} BETWEEN 15 AND 1440`,
+    ),
+  ],
+);
 
 // Single-item: one row per feature link (sensitive data scan settings)
 export const configPolicySensitiveDataSettings = pgTable('config_policy_sensitive_data_settings', {
@@ -410,6 +550,9 @@ export const configPolicyRemoteAccessSettings = pgTable('config_policy_remote_ac
   notifyOnSessionEnd: boolean('notify_on_session_end').notNull().default(true),
   showActiveIndicator: boolean('show_active_indicator').notNull().default(true),
   technicianIdentityLevel: text('technician_identity_level').notNull().default('name_email'),
+  // #10190 W06 (OD-5 (c)): the person at the keyboard may end the session from
+  // the on-screen indicator (with confirmation; audited remote.session.ended_by_user).
+  allowUserEndSession: boolean('allow_user_end_session').notNull().default(true),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 });

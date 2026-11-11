@@ -40,6 +40,8 @@ import { useToastRailOffset } from '../../shared/toastRailOffset';
 import RichTextEditor from '../../common/RichTextEditor';
 import PolishButton from '../../catalog/PolishButton';
 import { BlockCard, QuoteImagePreview } from './QuoteBlockCard';
+import { blockContentLabel, nearestHeadingAbove } from './quoteOutlineLabels';
+import { ContractAutoVariableList } from './QuoteContractBlockEditor';
 import {
   TableBlockFields,
   CalloutBlockFields,
@@ -52,7 +54,9 @@ import {
 } from './QuoteBlockContentForms';
 import { QuoteBulkBar } from './QuoteBulkBar';
 import { UnassignedLines } from './QuoteUnassignedLines';
+import { QuoteIntroFields } from './QuoteIntroFields';
 import { UNAUTHORIZED, type LineUpdate, SrSaved, fieldRing, pendingKey, useSavedFlash, useShowInternalMargin } from './quoteEditorShared';
+import { useServerSyncedDraft } from '../shared/useServerSyncedDraft';
 import { useMenuKeyboard } from '../shared/menuKeyboard';
 import { UnsavedBadge, RecurringBillingNote, MarginPanel } from '../billingUi';
 import { feedCurrencyCode } from '../../settings/marginMath';
@@ -65,6 +69,8 @@ import {
   pctFromFraction,
   lineTitle,
 } from './quoteTypes';
+import { useStableT } from '@/lib/i18n/useStableT';
+import { useRegisterDirtyForm } from '@/lib/keyboard/useRegisterDirtyForm';
 
 // Phase 2: the add-block menu now offers `image` as well. An image block is
 // created with its uploaded `imageId` already in `content` — the editor uploads
@@ -118,6 +124,10 @@ function unresolvedNamesFromMessage(message: string, knownNames: string[]): stri
   return knownNames.filter((name) => message.includes(name));
 }
 
+/** The PDF footer is a single ellipsized line on every page; longer text prints
+ *  truncated and can spill a near-empty last page (#6648). */
+const QUOTE_FOOTER_MAX = 160;
+
 interface Props {
   detail: QuoteDetailData;
   /** Ask the parent to refetch the quote. May report whether the refetch
@@ -158,6 +168,7 @@ interface Props {
 
 export default function QuoteEditor({ detail, onChanged, onPendingEditsChange, onSaveFailure, onUnsavedEditsChange, onRegisterPendingDeleteFlush, showInternal: showInternalProp, onToggleInternal }: Props) {
   const { t } = useTranslation('billing');
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   const { can } = usePermissions();
   const canWrite = can('quotes', 'write');
   // Block writes answer with a `warnings` array when the rich-text subset had to
@@ -188,6 +199,7 @@ export default function QuoteEditor({ detail, onChanged, onPendingEditsChange, o
   const showInternal = showInternalProp ?? fallbackShowInternal;
   const toggleShowInternal = onToggleInternal ?? toggleFallbackShowInternal;
   const { quote, blocks: serverBlocks, lines: serverLines } = detail;
+  const inheritedFooter = detail.branding?.inheritedFooter ?? null;
   const currency = quote.currencyCode;
   useEffect(() => {
     const onDeviceCountsRefreshed = (event: Event) => {
@@ -278,7 +290,7 @@ export default function QuoteEditor({ detail, onChanged, onPendingEditsChange, o
 
   // Per-item "saving" state, keyed so one in-flight mutation never freezes the
   // rest of the editor. Scoped keys come from `pendingKey` (quoteEditorShared)
-  // plus a few editor-local literals ('terms', 'deposit', 'add-block',
+  // plus a few editor-local literals ('terms', 'expiry', 'intro', 'deposit', 'add-block',
   // 'cover-page', 'cover-image'). `pending` drives disabled styling;
   // `inFlight` is the synchronous double-submit guard (state updates are async).
   const inFlight = useRef<Set<string>>(new Set());
@@ -325,11 +337,26 @@ export default function QuoteEditor({ detail, onChanged, onPendingEditsChange, o
   const [catalogLoadFailed, setCatalogLoadFailed] = useState(false);
   const [ecActive, setEcActive] = useState(false);
   const [pax8Active, setPax8Active] = useState(false);
-  const [terms, setTerms] = useState(quote.termsAndConditions ?? '');
-  const [termsDirty, setTermsDirty] = useState(false);
+  // Drafts re-seed from the server during render and keep text typed while a
+  // save's refetch is in flight — see useServerSyncedDraft (#4807, #4296).
+  const { draft: terms, dirty: termsDirty, edit: editTerms, markSaved: markTermsSaved } =
+    useServerSyncedDraft(quote.termsAndConditions ?? '');
+  // Per-quote footer line (`quotes.terms`) — distinct from Terms & Conditions
+  // above (#6648). Blank = inherit the partner/brand footer.
+  const { draft: footer, dirty: footerDirty, edit: editFooter, markSaved: markFooterSaved } =
+    useServerSyncedDraft(quote.terms ?? '');
+  const [footerSaved, flashFooterSaved] = useSavedFlash();
   // Quiet "Saved" cue for the blur-to-save terms field (title moved to the
   // workspace header — see QuoteHeaderMeta).
   const [termsSaved, flashTermsSaved] = useSavedFlash();
+  // "Valid until" + intro notes (#9859): both print on the proposal. The date
+  // column is date-only (YYYY-MM-DD); '' in the draft means no expiry.
+  const { draft: expiry, dirty: expiryDirty, edit: editExpiry, markSaved: markExpirySaved } =
+    useServerSyncedDraft((quote.expiryDate ?? '').slice(0, 10));
+  const [expirySaved, flashExpirySaved] = useSavedFlash();
+  const { draft: introNotes, dirty: introDirty, edit: editIntro, markSaved: markIntroSaved } =
+    useServerSyncedDraft(quote.introNotes ?? '');
+  const [introSaved, flashIntroSaved] = useSavedFlash();
   const canCatalogWrite = can('catalog', 'write');
 
   // Two separate questions, mirroring the invoice editor (see the long note
@@ -342,6 +369,8 @@ export default function QuoteEditor({ detail, onChanged, onPendingEditsChange, o
   // "Saving changes…" up over a save that had already given up.
   const hasPendingEdits = pending.size > 0
     || pendingDeletedLineIds.size > 0 || pendingDeletedBlockIds.size > 0;
+  // Unsaved input blocks the g/c chords and queue keys (see useRegisterDirtyForm).
+  useRegisterDirtyForm(hasPendingEdits || termsDirty || footerDirty || expiryDirty || introDirty);
   useEffect(() => { onPendingEditsChange?.(hasPendingEdits); }, [hasPendingEdits, onPendingEditsChange]);
   // Clear on unmount so a stale `true` can't lock Send after the editor is gone
   // (e.g. the quote was just issued and the tab switched).
@@ -423,22 +452,6 @@ export default function QuoteEditor({ detail, onChanged, onPendingEditsChange, o
   const [contractVarValues, setContractVarValues] = useState<Record<string, string>>({});
   const [contractVarErrors, setContractVarErrors] = useState<Record<string, string>>({});
   const [contractLabel, setContractLabel] = useState('');
-
-  // Re-seed from the prop DURING RENDER, never from a passive effect (#4807;
-  // same defect and remedy as InvoiceEditor's notes/terms drafts — #2925,
-  // #3219, #3277, #3980, #4033 — and AiBudgetThresholdsInput, #4659/#4805). A
-  // passive effect is flushed AFTER commit, so a keystroke landing between the
-  // prop's commit and the effect's later run gets silently overwritten by the
-  // stale string the effect captured. Comparing the rendered STRING (not the
-  // prop's identity) means a refetch that hands back an equal-but-unchanged
-  // value changes nothing on screen and can't discard an in-progress edit.
-  const termsSeed = quote.termsAndConditions ?? '';
-  const [termsSeededFrom, setTermsSeededFrom] = useState(termsSeed);
-  if (termsSeededFrom !== termsSeed) {
-    setTermsSeededFrom(termsSeed);
-    setTerms(termsSeed);
-    setTermsDirty(false);
-  }
 
   // ---- deposit controls ----------------------------------------------------
   // Local mirrors of the persisted deposit config so the type select + percent
@@ -527,11 +540,66 @@ export default function QuoteEditor({ detail, onChanged, onPendingEditsChange, o
         errorFallback: t('quotes.editor.errors.saveTerms'),
         onUnauthorized: UNAUTHORIZED,
       });
-      setTermsDirty(false);
+      markTermsSaved(terms);
       refresh();
     }, t('quotes.editor.errors.saveTerms'));
     if (ok) flashTermsSaved();
-  }, [termsDirty, terms, quote.id, refresh, runScoped, flashTermsSaved, t]);
+  }, [termsDirty, terms, quote.id, refresh, runScoped, flashTermsSaved, markTermsSaved, t]);
+
+  // Blank → null, not '': the resolver uses `??`, so an empty string would WIN
+  // over the partner/brand footer and print a blank footer instead of inheriting.
+  const saveFooter = useCallback(async () => {
+    if (!footerDirty) return;
+    const value = footer.trim() === '' ? null : footer.trim();
+    const ok = await runScoped('footer', async () => {
+      await runAction({
+        request: () => fetchWithAuth(`/quotes/${quote.id}`, {
+          method: 'PATCH', body: JSON.stringify({ terms: value }),
+        }),
+        errorFallback: t('quotes.editor.errors.saveFooter'),
+        onUnauthorized: UNAUTHORIZED,
+      });
+      markFooterSaved(value ?? '');
+      refresh();
+    }, t('quotes.editor.errors.saveFooter'));
+    if (ok) flashFooterSaved();
+  }, [footerDirty, footer, quote.id, refresh, runScoped, flashFooterSaved, markFooterSaved, t]);
+
+  // Blank → null (no expiry), never '' — the API's date validator rejects it.
+  const saveExpiry = useCallback(async () => {
+    if (!expiryDirty) return;
+    const value = expiry === '' ? null : expiry;
+    const ok = await runScoped('expiry', async () => {
+      await runAction({
+        request: () => fetchWithAuth(`/quotes/${quote.id}`, {
+          method: 'PATCH', body: JSON.stringify({ expiryDate: value }),
+        }),
+        errorFallback: t('quotes.editor.errors.saveExpiry'),
+        onUnauthorized: UNAUTHORIZED,
+      });
+      markExpirySaved(value ?? '');
+      refresh();
+    }, t('quotes.editor.errors.saveExpiry'));
+    if (ok) flashExpirySaved();
+  }, [expiryDirty, expiry, quote.id, refresh, runScoped, flashExpirySaved, markExpirySaved, t]);
+
+  // Blank → null so the document prints no intro paragraph at all.
+  const saveIntro = useCallback(async () => {
+    if (!introDirty) return;
+    const value = introNotes.trim() === '' ? null : introNotes.trim();
+    const ok = await runScoped('intro', async () => {
+      await runAction({
+        request: () => fetchWithAuth(`/quotes/${quote.id}`, {
+          method: 'PATCH', body: JSON.stringify({ introNotes: value }),
+        }),
+        errorFallback: t('quotes.editor.errors.saveIntroNotes'),
+        onUnauthorized: UNAUTHORIZED,
+      });
+      markIntroSaved(value ?? '');
+      refresh();
+    }, t('quotes.editor.errors.saveIntroNotes'));
+    if (ok) flashIntroSaved();
+  }, [introDirty, introNotes, quote.id, refresh, runScoped, flashIntroSaved, markIntroSaved, t]);
 
   // Persist a deposit-config change via the quote-header PATCH. runAction surfaces
   // the API's 400 DEPOSIT_* validation message (e.g. "Deposit must be less than the
@@ -738,11 +806,14 @@ export default function QuoteEditor({ detail, onChanged, onPendingEditsChange, o
   const unsavedFieldLabel = useMemo(() => {
     if (pending.size > 0) return null;
     if (failedKeys.has('terms') && termsDirty) return t('quotes.editor.terms.title');
+    if (failedKeys.has('footer') && footerDirty) return t('quotes.editor.footer.title');
+    if (failedKeys.has('expiry') && expiryDirty) return t('quotes.editor.intro.expiryLabel');
+    if (failedKeys.has('intro') && introDirty) return t('quotes.editor.intro.notesLabel');
     for (const id of Object.keys(lineDrafts)) {
       if (failedKeys.has(pendingKey.line(id))) return t('quotes.editor.unsavedField.lines');
     }
     return null;
-  }, [pending.size, failedKeys, termsDirty, lineDrafts, t]);
+  }, [pending.size, failedKeys, termsDirty, footerDirty, expiryDirty, introDirty, lineDrafts, t]);
   useEffect(() => { onUnsavedEditsChange?.(unsavedFieldLabel); }, [unsavedFieldLabel, onUnsavedEditsChange]);
   useEffect(() => () => onUnsavedEditsChange?.(null), [onUnsavedEditsChange]);
 
@@ -757,9 +828,9 @@ export default function QuoteEditor({ detail, onChanged, onPendingEditsChange, o
     });
   }, [lines]);
 
-  // The tax rate is fixed at quote creation (org tax settings → partner default)
-  // and read-only in the editor, so the rail always computes with the committed
-  // server rate.
+  // The tax rate is read-only in the editor: the server re-resolves it (org tax
+  // settings → partner default) on every draft change and on open, and freezes
+  // it at send (#7507), so the rail always computes with the committed rate.
   const effectiveRate = quote.taxRate ? parseFloat(quote.taxRate) : null;
 
   // The figures the rail renders: optimistic recompute when any line is
@@ -979,34 +1050,45 @@ export default function QuoteEditor({ detail, onChanged, onPendingEditsChange, o
   // A quiet block-level nav for long quotes: each entry jumps to (and focuses)
   // its block. Labels mirror what the canvas shows — the author's own text
   // where one exists (table label, heading text, contract label), else the
-  // block-type default the add menu uses. Only rendered with 2+ blocks: a
+  // block's own text, else the block-type name (see outlineLabels below).
+  // Only rendered with 2+ blocks: a
   // one-block quote has nothing to navigate.
   const blockContainerRefs = useRef<Map<string, HTMLDivElement>>(new Map());
   const setBlockContainerRef = useCallback((blockId: string, el: HTMLDivElement | null) => {
     if (el) blockContainerRefs.current.set(blockId, el);
     else blockContainerRefs.current.delete(blockId);
   }, []);
-  const outlineLabel = useCallback((b: QuoteBlock): string => {
-    if (b.blockType === 'line_items') return pricingBlockLabel(b);
-    if (b.blockType === 'heading') {
-      const text = ((b.content?.text as string | undefined) ?? '').trim();
-      return text || t('quotes.editor.blockTypes.heading');
-    }
-    if (b.blockType === 'contract') {
-      const label = ((b.content?.label as string | undefined) ?? '').trim();
-      return label || t('quotes.editor.blockTypes.contract');
-    }
-    if (b.blockType === 'image') return t('quotes.editor.blockTypes.image');
-    if (b.blockType === 'table') {
-      const caption = ((b.content?.caption as string | undefined) ?? '').trim();
-      return caption || t('quotes.editor.blockTypes.table');
-    }
-    if (b.blockType === 'callout') {
-      const title = ((b.content?.title as string | undefined) ?? '').trim();
-      return title || t('quotes.editor.blockTypes.callout');
-    }
-    return t('quotes.editor.blockTypes.richText');
-  }, [pricingBlockLabel, t]);
+  // Unnamed rich text / image / table / callout blocks read from their own
+  // words, else "<type> · <nearest heading above>" (#9867) — a long proposal
+  // otherwise lists "Rich text" and "Image" several times each.
+  const outlineLabels = useMemo(() => {
+    const typeName: Partial<Record<QuoteBlock['blockType'], string>> = {
+      rich_text: t('quotes.editor.blockTypes.richText'),
+      image: t('quotes.editor.blockTypes.image'),
+      table: t('quotes.editor.blockTypes.table'),
+      callout: t('quotes.editor.blockTypes.callout'),
+    };
+    const labels = new Map<string, string>();
+    sortedBlocks.forEach((b, i) => {
+      if (b.blockType === 'line_items') { labels.set(b.id, pricingBlockLabel(b)); return; }
+      if (b.blockType === 'heading') {
+        const text = ((b.content?.text as string | undefined) ?? '').trim();
+        labels.set(b.id, text || t('quotes.editor.blockTypes.heading'));
+        return;
+      }
+      if (b.blockType === 'contract') {
+        const label = ((b.content?.label as string | undefined) ?? '').trim();
+        labels.set(b.id, label || t('quotes.editor.blockTypes.contract'));
+        return;
+      }
+      const own = blockContentLabel(b);
+      if (own) { labels.set(b.id, own); return; }
+      const type = typeName[b.blockType] ?? t('quotes.editor.blockTypes.richText');
+      const heading = nearestHeadingAbove(sortedBlocks, i);
+      labels.set(b.id, heading ? `${type} · ${heading}` : type);
+    });
+    return labels;
+  }, [sortedBlocks, pricingBlockLabel, t]);
   // Scroll-position highlight: the outline marks the topmost block currently in
   // the viewport. IntersectionObserver is feature-detected — in jsdom (and any
   // environment without it) the outline simply renders with no active entry.
@@ -1123,13 +1205,13 @@ export default function QuoteEditor({ detail, onChanged, onPendingEditsChange, o
     setContractTemplatesLoaded(true);
     void runAction<ContractTemplateWithLatest[]>({
       request: () => listContractTemplates(),
-      errorFallback: t('quotes.editor.errors.loadContractTemplates'),
+      errorFallback: stableT('quotes.editor.errors.loadContractTemplates'),
       onUnauthorized: UNAUTHORIZED,
       parseSuccess: (d) => (d as { data: ContractTemplateWithLatest[] }).data,
     })
       .then((list) => setContractTemplates(list))
       .catch(() => { /* toast already shown; keep the empty picker */ });
-  }, [addType, contractTemplatesLoaded, t]);
+  }, [addType, contractTemplatesLoaded, stableT]);
 
   // Pick a template → resolve its latest PUBLISHED version (fetch the detail so a
   // newer unpublished draft never gets pinned) and seed the manual variable form.
@@ -1178,6 +1260,8 @@ export default function QuoteEditor({ detail, onChanged, onPendingEditsChange, o
     ...(cp?.title != null ? { title: cp.title } : {}),
     ...(cp?.coverImageId != null ? { coverImageId: cp.coverImageId } : {}),
     ...(cp?.preparedForName != null ? { preparedForName: cp.preparedForName } : {}),
+    // Only carried when on, so existing cover saves keep their exact payload.
+    ...(cp?.showContents ? { showContents: true } : {}),
   }), []);
   const [cover, setCover] = useState<CoverPage>(() => coverFromQuote(quote.coverPage));
   // Guard the resync exactly like the ContractBlockEditor / heading / rich-text
@@ -1208,6 +1292,9 @@ export default function QuoteEditor({ detail, onChanged, onPendingEditsChange, o
     if (next.title?.trim()) body.title = next.title.trim();
     if (next.coverImageId) body.coverImageId = next.coverImageId;
     if (next.preparedForName?.trim()) body.preparedForName = next.preparedForName.trim();
+    // Carried on every cover save (the row is replaced wholesale), so editing
+    // the cover title can't silently switch the contents list off.
+    if (next.showContents) body.showContents = true;
     void runScoped('cover-page', async () => {
       await runAction({
         request: () => updateQuote(quote.id, { coverPage: body }),
@@ -1490,12 +1577,12 @@ export default function QuoteEditor({ detail, onChanged, onPendingEditsChange, o
     runScoped(pendingKey.block(blockId), async () => {
       await runAction({
         request: () => deleteBlock(quote.id, blockId),
-        errorFallback: t('quotes.editor.errors.removeSection'),
+        errorFallback: stableT('quotes.editor.errors.removeSection'),
         onUnauthorized: UNAUTHORIZED,
       });
       refresh();
-    }, t('quotes.editor.errors.removeSection')),
-  [quote.id, refresh, runScoped, t]);
+    }, stableT('quotes.editor.errors.removeSection')),
+  [quote.id, refresh, runScoped, stableT]);
 
   // ---- line mutations (scoped to a line_items block) ----------------------
   /**
@@ -1735,12 +1822,12 @@ export default function QuoteEditor({ detail, onChanged, onPendingEditsChange, o
     runScoped(pendingKey.line(lineId), async () => {
       await runAction({
         request: () => removeLine(quote.id, lineId),
-        errorFallback: t('quotes.editor.errors.removeLine'),
+        errorFallback: stableT('quotes.editor.errors.removeLine'),
         onUnauthorized: UNAUTHORIZED,
       });
       refresh();
-    }, t('quotes.editor.errors.removeLine')),
-  [quote.id, refresh, runScoped, t]);
+    }, stableT('quotes.editor.errors.removeLine')),
+  [quote.id, refresh, runScoped, stableT]);
 
   // ---- deferred-deletion lifecycle (undo grace window) --------------------
   // undo → cancel the timer, unhide (nothing was ever sent).
@@ -2380,18 +2467,11 @@ export default function QuoteEditor({ detail, onChanged, onPendingEditsChange, o
                     {contractVersion.declaredVariables.some((v) => v.kind === 'auto') && (
                       <div>
                         <p className="mb-1 text-xs font-medium text-muted-foreground">{t('quotes.editor.contract.autoVariablesTitle')}</p>
-                        <ul className="space-y-1">
-                          {contractVersion.declaredVariables.filter((v) => v.kind === 'auto').map((v) => (
-                            <li
-                              key={v.name}
-                              data-testid={`quote-block-contract-auto-${v.name}`}
-                              className="flex items-center justify-between rounded-md border bg-muted/40 px-2 py-1 text-xs"
-                            >
-                              <span className="font-medium">{v.label ?? v.name}</span>
-                              <span className="font-mono text-muted-foreground">{`{{${v.name}}}`}</span>
-                            </li>
-                          ))}
-                        </ul>
+                        <ContractAutoVariableList
+                          variables={contractVersion.declaredVariables.filter((v) => v.kind === 'auto')}
+                          values={detail.contractAutoValues}
+                          testIdPrefix="quote-block-contract-auto-"
+                        />
                         <p className="mt-1 text-xs text-muted-foreground">{t('quotes.editor.contract.autoHint')}</p>
                       </div>
                     )}
@@ -2518,6 +2598,22 @@ export default function QuoteEditor({ detail, onChanged, onPendingEditsChange, o
             {t('quotes.editor.coverPage.enable')}
           </label>
         )}
+        {canWrite && (
+          <label className="inline-flex cursor-pointer items-center gap-1.5 text-xs text-muted-foreground" data-testid="quote-contents">
+            <input
+              type="checkbox"
+              checked={cover.showContents === true}
+              onChange={(e) => {
+                const { showContents: _drop, ...rest } = cover;
+                saveCover(e.target.checked ? { ...rest, showContents: true } : rest);
+              }}
+              disabled={isPending('cover-page')}
+              data-testid="quote-contents-enabled"
+              className="h-3.5 w-3.5"
+            />
+            {t('quotes.editor.coverPage.showContents')}
+          </label>
+        )}
         {!internalControlled && (
           <button
             type="button"
@@ -2586,7 +2682,7 @@ export default function QuoteEditor({ detail, onChanged, onPendingEditsChange, o
                 <span className="mb-1 block text-xs text-muted-foreground">{t('quotes.editor.coverPage.imageLabel')}</span>
                 {cover.coverImageId ? (
                   <div className="flex items-center gap-3">
-                    <QuoteImagePreview quoteId={quote.id} imageId={cover.coverImageId} caption={cover.title ?? ''} />
+                    <QuoteImagePreview quoteId={quote.id} imageId={cover.coverImageId} caption={cover.title ?? ''} crop={detail.presentation?.pageSize ?? 'a4'} />
                     <button
                       type="button"
                       onClick={() => saveCover({ ...cover, coverImageId: null })}
@@ -2626,6 +2722,20 @@ export default function QuoteEditor({ detail, onChanged, onPendingEditsChange, o
           min-width floor (QuoteBlockCard.tsx) has to stay well under that,
           not just under the full 650px this column could theoretically
           offer. */}
+      {/* Proposal opening (#9859): above the canvas, in document order — the
+          date prints in the header, the notes above the first section. */}
+      <QuoteIntroFields
+        canWrite={canWrite}
+        expiry={{
+          value: expiry, dirty: expiryDirty, saved: expirySaved, busy: isPending('expiry'),
+          onChange: editExpiry, onBlur: () => void saveExpiry(),
+        }}
+        intro={{
+          value: introNotes, dirty: introDirty, saved: introSaved, busy: isPending('intro'),
+          onChange: editIntro, onBlur: () => void saveIntro(),
+        }}
+      />
+
       <div className="grid gap-6 xl:grid-cols-[1fr_300px]">
         {/* ── blocks ─────────────────────────────────────────────────── */}
         {/* min-w-0: this 1fr grid track holds a pricing table with a min-width
@@ -2785,6 +2895,7 @@ export default function QuoteEditor({ detail, onChanged, onPendingEditsChange, o
                 onAddManual={addManual}
                 onEditLine={editLine}
                 onEditBlock={editBlock}
+                contractAutoValues={detail.contractAutoValues}
                 onMoveLine={(line, dir) => moveLine(block.id, line, dir)}
                 onMoveLineToBlock={moveLineTo}
                 moveTargets={
@@ -2917,8 +3028,9 @@ export default function QuoteEditor({ detail, onChanged, onPendingEditsChange, o
                 onMissingCostClick={missingCostLineIds.length > 0 ? revealFirstMissingCost : undefined}
               />
             )}
-            {/* Read-only: the rate is resolved at quote creation (org tax settings,
-                falling back to the partner default) and isn't editable per-quote. */}
+            {/* Read-only: the rate is the org's tax settings (falling back to the
+                partner default), followed while drafting and fixed at send (#7507);
+                it isn't editable per-quote. */}
             <div className="mt-2 border-t pt-2">
               <div className="flex items-center justify-between gap-2">
                 <span className="text-sm text-muted-foreground">{t('quotes.editor.liveTotals.taxRate')}</span>
@@ -2926,7 +3038,7 @@ export default function QuoteEditor({ detail, onChanged, onPendingEditsChange, o
                   {quote.taxRate ? `${pctFromFraction(quote.taxRate)}%` : t('quotes.editor.symbols.notAvailable')}
                 </span>
               </div>
-              <p className="mt-1 text-xs text-muted-foreground">
+              <p className="mt-1 text-xs text-muted-foreground" data-testid="quote-tax-rate-help">
                 {t('quotes.editor.liveTotals.taxRateHelp')}
               </p>
             </div>
@@ -3045,7 +3157,7 @@ export default function QuoteEditor({ detail, onChanged, onPendingEditsChange, o
                           : 'text-muted-foreground hover:bg-muted hover:text-foreground'
                       }`}
                     >
-                      {outlineLabel(b)}
+                      {outlineLabels.get(b.id) ?? ''}
                     </button>
                   </li>
                 ))}
@@ -3070,7 +3182,7 @@ export default function QuoteEditor({ detail, onChanged, onPendingEditsChange, o
             </p>
             <textarea
               value={terms}
-              onChange={(e) => { setTerms(e.target.value); setTermsDirty(true); }}
+              onChange={(e) => editTerms(e.target.value)}
               onBlur={() => { if (canWrite) void saveTerms(); }}
               disabled={!canWrite || isPending('terms')}
               data-testid="quote-terms"
@@ -3079,6 +3191,43 @@ export default function QuoteEditor({ detail, onChanged, onPendingEditsChange, o
               placeholder={t('quotes.editor.terms.placeholder')}
             />
             <SrSaved show={termsSaved} testId="quote-terms-saved" />
+          </div>
+
+          <div className="rounded-lg border bg-card p-4 shadow-xs">
+            <div className="mb-2 flex items-center justify-between gap-2">
+              <label htmlFor="quote-footer" className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">{t('quotes.editor.footer.title')}</label>
+              <span className="flex items-center gap-2">
+                <UnsavedBadge show={footerDirty} />
+              </span>
+            </div>
+            <p className="mb-2 text-xs text-muted-foreground" data-testid="quote-footer-helper">
+              {t('quotes.editor.footer.helper')}
+            </p>
+            <input
+              id="quote-footer"
+              type="text"
+              value={footer}
+              maxLength={QUOTE_FOOTER_MAX}
+              onChange={(e) => editFooter(e.target.value)}
+              onBlur={() => { if (canWrite) void saveFooter(); }}
+              disabled={!canWrite || isPending('footer')}
+              data-testid="quote-footer"
+              className={`w-full rounded-md border bg-background px-3 py-2 text-sm transition-colors focus:outline-hidden focus:ring-2 focus:ring-ring disabled:opacity-60 ${fieldRing(footerDirty, footerSaved)}`}
+              placeholder={t('quotes.editor.footer.placeholder')}
+            />
+            <div className="mt-1 flex items-start justify-between gap-2 text-xs text-muted-foreground">
+              <p data-testid="quote-footer-inherited">
+                {footer.trim() !== ''
+                  ? null
+                  : inheritedFooter && inheritedFooter.text.trim() !== ''
+                    ? (inheritedFooter.source === 'partner'
+                        ? t('quotes.editor.footer.inheritedPartner', { text: inheritedFooter.text })
+                        : t('quotes.editor.footer.inheritedBrand', { text: inheritedFooter.text }))
+                    : t('quotes.editor.footer.inheritedNone')}
+              </p>
+              <span className="shrink-0 tabular-nums">{t('quotes.editor.footer.counter', { count: footer.length, max: QUOTE_FOOTER_MAX })}</span>
+            </div>
+            <SrSaved show={footerSaved} testId="quote-footer-saved" />
           </div>
         </div>
       </div>

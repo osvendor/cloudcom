@@ -1,9 +1,11 @@
-import { and, asc, eq, isNull, or, sql, type SQL } from 'drizzle-orm';
+import { and, asc, eq, inArray, isNull, or, sql, type SQL } from 'drizzle-orm';
 import { db } from '../../db';
 import { monitorDefinitions } from '../../db/schema/monitorDefinitions';
 import type { MonitorDefinitionRow } from '../../db/schema/monitorDefinitions';
 import { escalationPolicies } from '../../db/schema/alerts';
 import { organizations } from '../../db/schema/orgs';
+import { networkMonitors } from '../../db/schema/monitors';
+import { monitorConversions } from '../../db/schema/monitorConversions';
 import type { AuthContext } from '../../middleware/auth';
 import {
   canManagePartnerWidePolicies,
@@ -13,14 +15,21 @@ import { normalizeAutomationActions } from '../automationRuntime';
 import type { AutomationAction } from '../automationRuntime';
 import { getMonitorKindSpec, MonitorValidationError } from './kinds';
 import { compileMonitorInTx, type CompileOptions, type DbExecutor } from './monitorCompiler';
+import { assertNetworkCheckAssetOwner, NetworkCheckAssetError } from './networkCheckAsset';
 import { isPgForeignKeyViolation, pgErrorConstraint } from '../../utils/pgErrors';
-import type {
-  CreateMonitorDefinitionInput,
-  MonitorKind,
-  UpdateMonitorDefinitionInput,
+import { validateConditions } from '../alertConditions';
+import {
+  isLegacyRecoveryCondition,
+  isValidRearmPair,
+  REARM_PAIR_MESSAGE,
+  recoveryConditionProblem,
+  type CreateMonitorDefinitionInput,
+  type MonitorKind,
+  type UpdateMonitorDefinitionInput,
 } from '@breeze/shared';
 
 export { MonitorValidationError };
+export { NetworkMonitorAdoptionError, type CompileOptions } from './monitorCompiler';
 
 export class MonitorNotFoundError extends Error {
   constructor(id: string) {
@@ -77,6 +86,31 @@ function monitorReadCondition(auth: AuthContext): SQL | undefined {
   return orgCondition ? or(orgCondition, partnerWide) : partnerWide;
 }
 
+/**
+ * Display-safe projection for a partner-wide monitor viewed by an org-scope
+ * caller. `monitorReadCondition` deliberately admits partner-wide rows
+ * to any caller under that partner so an org technician can see what applies
+ * to their devices, but the MSP-authored action payloads (script/command text
+ * and parameters), delivery routing and the escalation/AI-agent wiring are
+ * administrative detail with no read-side justification for full exposure —
+ * `GET /automations/:compiledId` already withholds the equivalent compiled
+ * fields from org tokens. Only strips fields on rows the caller cannot write
+ * anyway (`assertCanWrite` refuses org scope on a partner-wide row), so this
+ * never removes something a caller could otherwise legitimately use.
+ */
+export function projectMonitorForCaller<T extends MonitorDefinitionRow>(row: T, auth: AuthContext): T {
+  if (row.orgId !== null || auth.scope !== 'organization') return row;
+  return {
+    ...row,
+    responses: [],
+    recurrenceActions: [],
+    deliveryChannelIds: [],
+    escalationPolicyId: null,
+    aiAgentId: null,
+    psaBoardId: null,
+  };
+}
+
 function assertCanWrite(auth: AuthContext, owner: MonitorOwner): void {
   if (owner.partnerId) {
     if (!canManagePartnerWidePolicies(auth)) {
@@ -90,6 +124,19 @@ function assertCanWrite(auth: AuthContext, owner: MonitorOwner): void {
   if (!owner.orgId) throw new MonitorOwnershipError('Organization context required');
   if (!auth.canAccessOrg(owner.orgId)) {
     throw new MonitorOwnershipError('Access to this organization denied');
+  }
+}
+
+/**
+ * `psa_board_id` names a board in the PARTNER's bound PSA (#10528), so it is
+ * partner-level config even on an org-owned monitor: only a caller who can
+ * manage partner-wide config may change it. "Unchanged" is always allowed, so
+ * an org user can still edit the rest of a monitor that carries a board.
+ */
+function assertCanSetPsaBoard(auth: AuthContext, next: number | null | undefined, current: number | null): void {
+  if (next === undefined || next === current) return;
+  if (!canManagePartnerWidePolicies(auth)) {
+    throw new MonitorOwnershipError(PARTNER_WIDE_WRITE_DENIED_MESSAGE);
   }
 }
 
@@ -181,6 +228,21 @@ function normalizeList(actions: unknown): AutomationAction[] {
   return normalizeAutomationActions(actions);
 }
 
+function assertRecoveryCondition(kind: MonitorKind, value: unknown, options: { allowLegacy: boolean }): void {
+  const problem = recoveryConditionProblem(kind, value, options);
+  if (problem) throw new MonitorValidationError(`autoResolveConditions ${problem}`);
+}
+
+/**
+ * The shared schema checks a raw blob's shape; only the API knows which handler
+ * types exist. An unknown `type` would otherwise save and then never resolve.
+ */
+function assertLegacyRecoveryHandlers(value: unknown): void {
+  if (!isLegacyRecoveryCondition(value)) return;
+  const errors = validateConditions(value);
+  if (errors.length > 0) throw new MonitorValidationError(`autoResolveConditions is invalid: ${errors.join('; ')}`);
+}
+
 function validateDefinitionShape(args: {
   kind: MonitorKind;
   condition: Record<string, unknown>;
@@ -221,10 +283,14 @@ function validateDefinitionShape(args: {
   return { condition: parsed.data as Record<string, unknown>, responses, recurrenceActions };
 }
 
-export async function listMonitorDefinitions(
-  auth: AuthContext,
-  filters?: { kind?: MonitorKind; enabled?: boolean },
-): Promise<MonitorDefinitionRow[]> {
+type MonitorListFilters = { kind?: MonitorKind; enabled?: boolean };
+
+/**
+ * The visibility + filter predicate shared by listMonitorDefinitions and
+ * listMonitorDefinitionsPage. The page applies it to both its count and its
+ * rows, so `total` is counted over exactly the rows the page can return.
+ */
+function listConditions(auth: AuthContext, filters?: MonitorListFilters): SQL | undefined {
   const conditions: SQL[] = [];
   const read = monitorReadCondition(auth);
   if (read) conditions.push(read);
@@ -232,12 +298,65 @@ export async function listMonitorDefinitions(
   if (filters?.enabled !== undefined) {
     conditions.push(eq(monitorDefinitions.enabled, filters.enabled));
   }
+  return conditions.length > 0 ? and(...conditions) : undefined;
+}
 
-  return db
+/** List the caller's visible monitor definitions, ordered by name (unpaged; the REST list route). */
+export async function listMonitorDefinitions(
+  auth: AuthContext,
+  filters?: MonitorListFilters,
+): Promise<MonitorDefinitionRow[]> {
+  const rows = await db
     .select()
     .from(monitorDefinitions)
-    .where(conditions.length > 0 ? and(...conditions) : undefined)
+    .where(listConditions(auth, filters))
     .orderBy(asc(monitorDefinitions.name));
+  return rows.map((row) => projectMonitorForCaller(row, auth));
+}
+
+/**
+ * One page of the caller's visible monitor definitions, paged in SQL (#6735),
+ * with the total of the whole filtered set.
+ *
+ * The page and the total come from ONE statement, so they share one snapshot:
+ * separate statements under READ COMMITTED can each see a different set, and
+ * a concurrent insert or delete between them would make `total`/`hasMore`
+ * disagree with the rows returned. The statement reads a one-row count and
+ * LEFT JOINs the page onto it, so an empty page (nothing visible, or an
+ * offset past the end) still carries the real total with no second query.
+ * `id` breaks name ties so the order is deterministic for an unchanged set.
+ * This is offset paging (the shared AI-tool cursor carries only an offset):
+ * a monitor added or removed between two page requests can still make a
+ * later page repeat or skip a row. Each page's own total is consistent.
+ */
+export async function listMonitorDefinitionsPage(
+  auth: AuthContext,
+  filters: MonitorListFilters | undefined,
+  page: { limit: number; offset: number },
+): Promise<{ rows: MonitorDefinitionRow[]; total: number }> {
+  const where = listConditions(auth, filters);
+  const counted = db
+    .select({ total: sql<number>`count(*)::int`.as('total') })
+    .from(monitorDefinitions)
+    .where(where)
+    .as('counted');
+  const pageIds = db
+    .select({ id: monitorDefinitions.id })
+    .from(monitorDefinitions)
+    .where(where)
+    .orderBy(asc(monitorDefinitions.name), asc(monitorDefinitions.id))
+    .limit(page.limit)
+    .offset(page.offset);
+  const rows = await db
+    .select({ total: counted.total, row: monitorDefinitions })
+    .from(counted)
+    .leftJoin(monitorDefinitions, inArray(monitorDefinitions.id, pageIds))
+    .orderBy(asc(monitorDefinitions.name), asc(monitorDefinitions.id));
+
+  return {
+    rows: rows.flatMap((r) => (r.row ? [projectMonitorForCaller(r.row, auth)] : [])),
+    total: Number(rows[0]?.total ?? 0),
+  };
 }
 
 export async function getMonitorDefinition(
@@ -251,7 +370,7 @@ export async function getMonitorDefinition(
     .from(monitorDefinitions)
     .where(read ? and(eq(monitorDefinitions.id, id), read) : eq(monitorDefinitions.id, id))
     .limit(1);
-  return row ?? null;
+  return row ? projectMonitorForCaller(row, auth) : null;
 }
 
 export async function createMonitorDefinition(
@@ -261,6 +380,7 @@ export async function createMonitorDefinition(
   executor: DbExecutor = db,
 ): Promise<MonitorDefinitionRow> {
   const owner = resolveOwnerForCreate(input, auth);
+  assertCanSetPsaBoard(auth, input.psaBoardId, null);
   await assertEscalationPolicyCompatible(input.escalationPolicyId ?? null, owner, executor);
   const shape = validateDefinitionShape({
     kind: input.kind,
@@ -269,6 +389,14 @@ export async function createMonitorDefinition(
     recurrenceActions: input.recurrenceActions,
     aiAgentId: input.aiAgentId ?? null,
   });
+  assertRecoveryCondition(input.kind, input.autoResolveConditions, { allowLegacy: false });
+
+  try {
+    await assertNetworkCheckAssetOwner(input.kind, shape.condition, owner, executor);
+  } catch (error) {
+    if (error instanceof NetworkCheckAssetError) throw new MonitorValidationError(error.message);
+    throw error;
+  }
 
   return createValidatedMonitorInTx(input, auth, owner, shape, options, executor);
 }
@@ -276,7 +404,7 @@ export async function createMonitorDefinition(
 async function createValidatedMonitorInTx(
   input: CreateMonitorDefinitionInput, auth: AuthContext,
   owner: ReturnType<typeof resolveOwnerForCreate>, shape: ReturnType<typeof validateDefinitionShape>,
-  _options: CompileOptions, executor: DbExecutor,
+  options: CompileOptions, executor: DbExecutor,
 ): Promise<MonitorDefinitionRow> {
   return executor.transaction(async (tx) => {
     const [created] = await tx
@@ -290,8 +418,11 @@ async function createValidatedMonitorInTx(
         enabled: input.enabled,
         condition: shape.condition,
         severity: input.severity,
-        cooldownMinutes: input.cooldownMinutes,
-        autoResolve: input.autoResolve,
+        // Omitted or null = inherit (#10765). Never `||`: 0 and false are real overrides.
+        cooldownMinutes: input.cooldownMinutes ?? null,
+        autoResolve: input.autoResolve ?? null,
+        rearmMode: input.rearmMode ?? null,
+        rearmDelayMinutes: input.rearmDelayMinutes ?? null,
         autoResolveConditions: input.autoResolveConditions ?? null,
         responses: shape.responses as unknown as Array<Record<string, unknown>>,
         deliveryMode: input.deliveryMode,
@@ -302,12 +433,13 @@ async function createValidatedMonitorInTx(
         recurrenceActions: shape.recurrenceActions as unknown as Array<Record<string, unknown>>,
         pauseResponsesOnEscalation: input.pauseResponsesOnEscalation,
         aiAgentId: input.aiAgentId ?? null,
+        psaBoardId: input.psaBoardId ?? null,
         createdBy: auth.scope === 'system' ? null : auth.user.id,
       })
       .returning();
     if (!created) throw new Error('Failed to create monitor definition');
 
-    const refs = await compileMonitorInTx(tx, created);
+    const refs = await compileMonitorInTx(tx, created, options);
     return {
       ...created,
       compiledAlertTemplateId: refs.alertTemplateId,
@@ -322,10 +454,12 @@ export async function updateMonitorDefinition(
   id: string,
   input: UpdateMonitorDefinitionInput,
   auth: AuthContext,
+  executor: DbExecutor = db,
 ): Promise<MonitorDefinitionRow> {
-  const existing = await getMonitorDefinition(id, auth);
+  const existing = await getMonitorDefinition(id, auth, executor);
   if (!existing) throw new MonitorNotFoundError(id);
   assertCanWrite(auth, { orgId: existing.orgId, partnerId: existing.partnerId });
+  assertCanSetPsaBoard(auth, input.psaBoardId, existing.psaBoardId ?? null);
 
   // The MERGED definition is what gets validated: a PATCH that changes only the
   // kind must still be checked against the stored condition, and vice versa.
@@ -337,6 +471,22 @@ export async function updateMonitorDefinition(
     aiAgentId: input.aiAgentId !== undefined ? input.aiAgentId : existing.aiAgentId,
   };
   const shape = validateDefinitionShape(merged);
+  // The schema cannot see the stored kind on a recovery-only patch, nor the
+  // stored recovery condition on a kind-only one. A patch touching neither leaves
+  // the stored value alone, so a row that could not be saved today can still be
+  // renamed or disabled (#10935).
+  if (input.autoResolveConditions !== undefined) {
+    assertRecoveryCondition(merged.kind, input.autoResolveConditions, { allowLegacy: true });
+    assertLegacyRecoveryHandlers(input.autoResolveConditions);
+  } else if (merged.kind !== existing.kind) {
+    assertRecoveryCondition(merged.kind, existing.autoResolveConditions, { allowLegacy: true });
+  }
+  try {
+    await assertNetworkCheckAssetOwner(merged.kind, shape.condition, existing, executor);
+  } catch (error) {
+    if (error instanceof NetworkCheckAssetError) throw new MonitorValidationError(error.message);
+    throw error;
+  }
 
   const effectiveEscalationPolicyId =
     input.escalationPolicyId !== undefined
@@ -345,7 +495,7 @@ export async function updateMonitorDefinition(
   await assertEscalationPolicyCompatible(effectiveEscalationPolicyId, {
     orgId: existing.orgId,
     partnerId: existing.partnerId,
-  });
+  }, executor);
 
   const recurrenceThreshold =
     input.recurrenceThreshold !== undefined ? input.recurrenceThreshold : existing.recurrenceThreshold;
@@ -365,7 +515,18 @@ export async function updateMonitorDefinition(
     throw new MonitorValidationError('deliveryChannelIds required when deliveryMode is channels');
   }
 
-  return db.transaction(async (tx) => {
+  // The re-arm pair is one setting: moving off after_delay clears the delay, and
+  // the MERGED pair is what must satisfy the rule (the schema cannot see the
+  // stored mode on a delay-only patch; the DB CHECK is the backstop).
+  const rearmMode = input.rearmMode !== undefined ? input.rearmMode : existing.rearmMode;
+  const rearmDelayMinutes = input.rearmDelayMinutes !== undefined
+    ? input.rearmDelayMinutes
+    : rearmMode === 'after_delay' ? existing.rearmDelayMinutes : null;
+  if (!isValidRearmPair({ rearmMode, rearmDelayMinutes })) {
+    throw new MonitorValidationError(REARM_PAIR_MESSAGE);
+  }
+
+  return executor.transaction(async (tx) => {
     const [updated] = await tx
       .update(monitorDefinitions)
       .set({
@@ -375,8 +536,11 @@ export async function updateMonitorDefinition(
         enabled: input.enabled !== undefined ? input.enabled : existing.enabled,
         condition: shape.condition,
         severity: input.severity ?? existing.severity,
-        cooldownMinutes: input.cooldownMinutes ?? existing.cooldownMinutes,
+        // Omitted keeps the stored override; null saves inherit (#10765).
+        cooldownMinutes: input.cooldownMinutes !== undefined ? input.cooldownMinutes : existing.cooldownMinutes,
         autoResolve: input.autoResolve !== undefined ? input.autoResolve : existing.autoResolve,
+        rearmMode,
+        rearmDelayMinutes,
         autoResolveConditions:
           input.autoResolveConditions !== undefined
             ? (input.autoResolveConditions ?? null)
@@ -396,6 +560,7 @@ export async function updateMonitorDefinition(
             ? input.pauseResponsesOnEscalation
             : existing.pauseResponsesOnEscalation,
         aiAgentId: merged.aiAgentId ?? null,
+        psaBoardId: input.psaBoardId !== undefined ? input.psaBoardId : (existing.psaBoardId ?? null),
         updatedAt: new Date(),
       })
       .where(eq(monitorDefinitions.id, id))
@@ -416,7 +581,36 @@ export async function deleteMonitorDefinition(id: string, auth: AuthContext, exe
   // monitor_id (and rule_id, once the cascade reaches the compiled rule) set
   // to NULL.
   try {
-    await executor.delete(monitorDefinitions).where(eq(monitorDefinitions.id, id));
+    await executor.transaction(async (tx) => {
+      // Shared lock order: monitor_definitions → network_monitors → conversion
+      // ledger rows. Keep delete aligned with PATCH/recompile and Revert.
+      const [lockedDefinition] = await tx.select({ id: monitorDefinitions.id })
+        .from(monitorDefinitions).where(eq(monitorDefinitions.id, id)).for('update');
+      if (!lockedDefinition) throw new MonitorNotFoundError(id);
+      const probes = await tx.select({ id: networkMonitors.id, orgId: networkMonitors.orgId })
+        .from(networkMonitors).where(eq(networkMonitors.managedByMonitorId, id))
+        .orderBy(asc(networkMonitors.id)).for('update');
+      // A live conversion identifies an adopted probe. Release it before the
+      // definition cascade so its results and legacy rules remain available.
+      // Compiler-created probes have no source ledger entry and still cascade.
+      const adopted = probes.length === 0 ? [] : await tx.select({
+        id: monitorConversions.sourceId, conversionId: monitorConversions.id,
+        sourceState: monitorConversions.sourceState,
+      }).from(monitorConversions)
+        .where(and(inArray(monitorConversions.sourceId, probes.map((probe) => probe.id)),
+          inArray(monitorConversions.orgId, probes.flatMap((probe) => probe.orgId ? [probe.orgId] : [])),
+          eq(monitorConversions.sourceTable, 'network_monitors'), isNull(monitorConversions.revertedAt)))
+        .orderBy(asc(monitorConversions.id)).for('update');
+      const now = new Date();
+      for (const source of adopted) {
+        await tx.update(networkMonitors).set({ managedByMonitorId: null, isActive: false,
+          retiredAt: now, retiredReason: 'monitor_deleted', updatedAt: now })
+          .where(and(eq(networkMonitors.id, source.id), eq(networkMonitors.managedByMonitorId, id)));
+        await tx.update(monitorConversions).set({ sourceState: { ...source.sourceState, sourceReleased: true } })
+          .where(eq(monitorConversions.id, source.conversionId));
+      }
+      await tx.delete(monitorDefinitions).where(eq(monitorDefinitions.id, id));
+    });
   } catch (error) {
     if (isPgForeignKeyViolation(error)) {
       // Belt-and-braces catch-all (see MonitorHasDependentsError's doc

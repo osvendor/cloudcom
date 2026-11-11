@@ -1,0 +1,100 @@
+import { act, renderHook, waitFor } from '@testing-library/react';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { fetchWithAuth } from '../../stores/auth';
+import { useAiStore } from '../../stores/aiStore';
+import { TOPOLOGY_EXPLAIN_QUESTION, topologySelectionKey, useTopologyInvestigation } from './useTopologyInvestigation';
+import { AI, aiExplanationFixture, aiSelection, jsonResponse, sseResponse } from './topologyAiFixtures';
+
+vi.mock('../../stores/auth', () => ({ fetchWithAuth: vi.fn() }));
+vi.mock('../shared/Toast', () => ({ showToast: vi.fn() }));
+
+const RESET = {
+  sessionId: null, sessionOrgId: null, hydratedSessionId: null, messages: [], isStreaming: false, isLoading: false, error: null, errorCode: null,
+  pendingApproval: null, topologySiteId: null, topologySelection: null, topologyPhase: null, topologyRunId: null, pageContext: null,
+};
+beforeEach(() => { vi.mocked(fetchWithAuth).mockReset(); useAiStore.setState(RESET as never); });
+const calls = () => vi.mocked(fetchWithAuth).mock.calls.map(([url, init]) => `${init?.method ?? 'GET'} ${String(url)}`);
+
+/** #9427: the attach a hydrate opens; no turn running. */
+const idleAttach = (): Response => {
+  const bytes = new TextEncoder().encode(`data: ${JSON.stringify({ type: 'attach_state', turn: 'idle', turnId: null, lastSeq: 0, turnUserMessageId: null, partial: false, replay: [], pendingCards: [], activePlan: null, turnModel: null })}\n\n`);
+  return { ok: true, status: 200, body: new ReadableStream<Uint8Array>({ start(c) { c.enqueue(bytes); c.close(); } }) } as unknown as Response;
+};
+/** The stored session for GET /ai/sessions/:id, and an idle attach for its /stream. */
+const reopen = (body: unknown) => vi.mocked(fetchWithAuth).mockImplementation(async (input) =>
+  String(input).endsWith('/stream') ? idleAttach() : jsonResponse(body));
+
+const storedSession = (selection = aiSelection()) => ({
+  session: { id: AI.session, status: 'active', orgId: 'org-1', type: 'topology', topologySiteId: AI.site, contextSnapshot: { type: 'topology', ...selection } },
+  messages: [
+    { id: 'u1', role: 'user', content: TOPOLOGY_EXPLAIN_QUESTION, createdAt: '2026-09-26T12:00:00.000Z' },
+    { id: 'a1', role: 'assistant', content: '{}', contentBlocks: [{ type: 'topology_explanation', explanation: aiExplanationFixture() }], createdAt: '2026-09-26T12:00:05.000Z' },
+  ],
+});
+
+describe('useTopologyInvestigation (M4 Task 5)', () => {
+  it('keys cancellation on site/subject/view, not on the graph revision', () => {
+    expect(topologySelectionKey(aiSelection())).toBe(topologySelectionKey(aiSelection({ graphRevision: '9' })));
+    expect(topologySelectionKey(aiSelection())).not.toBe(topologySelectionKey(aiSelection({ view: 'physical' })));
+    expect(topologySelectionKey(null)).toBe('');
+  });
+
+  it('makes no request until explain(); explain sends the one fixed question', async () => {
+    vi.mocked(fetchWithAuth).mockImplementation(async (input, init) => init?.method === 'POST' && String(input) === '/ai/sessions'
+      ? jsonResponse({ id: AI.session, orgId: 'org-1' })
+      : sseResponse([{ type: 'message_start', messageId: 'm' }, { type: 'topology_explanation', explanation: aiExplanationFixture() }, { type: 'done' }]));
+    const { result } = renderHook(() => useTopologyInvestigation(aiSelection()));
+    expect(result.current.status).toBe('idle');
+    expect(fetchWithAuth).not.toHaveBeenCalled();
+    await act(async () => { await result.current.explain(); });
+    await waitFor(() => expect(result.current.status).toBe('complete'));
+    expect(JSON.parse(String(vi.mocked(fetchWithAuth).mock.calls[1]![1]!.body)).content).toBe(TOPOLOGY_EXPLAIN_QUESTION);
+    expect(result.current.historical).toBe(false);
+    expect(result.current.sessionId).toBe(AI.session);
+  });
+
+  it('reopens a stored investigation read-only (no POST) and marks it historical when the selection differs', async () => {
+    reopen(storedSession(aiSelection({ graphRevision: '0' })));
+    const { result } = renderHook(() => useTopologyInvestigation(aiSelection(), { initialSessionId: AI.session }));
+    await waitFor(() => expect(result.current.status).toBe('complete'));
+    // W05 (#7603): loadSession also loads the composer's model choices (a read);
+    // #9427: then attaches to the session's turn (a read).
+    await waitFor(() => expect(calls()).toHaveLength(3));
+    expect(calls()).toEqual([`GET /ai/sessions/${AI.session}`, `GET /ai/models/choices/chat?sessionId=${AI.session}`, `GET /ai/sessions/${AI.session}/stream`]);
+    expect(result.current.historical).toBe(true);
+  });
+
+  it('reopens after a page reload, when only the persisted session id survived', async () => {
+    useAiStore.setState({ sessionId: AI.session, hydratedSessionId: null, messages: [] } as never);
+    reopen(storedSession());
+    const { result } = renderHook(() => useTopologyInvestigation(aiSelection(), { initialSessionId: AI.session }));
+    await waitFor(() => expect(result.current.status).toBe('complete'));
+    // W05 (#7603): loadSession also loads the composer's model choices (a read);
+    // #9427: then attaches to the session's turn (a read).
+    await waitFor(() => expect(calls()).toHaveLength(3));
+    expect(calls()).toEqual([`GET /ai/sessions/${AI.session}`, `GET /ai/models/choices/chat?sessionId=${AI.session}`, `GET /ai/sessions/${AI.session}/stream`]);
+  });
+
+  it('a reopened answer for the same selection is current, not historical', async () => {
+    reopen(storedSession());
+    const { result } = renderHook(() => useTopologyInvestigation(aiSelection(), { initialSessionId: AI.session }));
+    await waitFor(() => expect(result.current.status).toBe('complete'));
+    expect(result.current.historical).toBe(false);
+  });
+
+  it('interrupts a running turn when the panel unmounts', async () => {
+    let release!: () => void;
+    vi.mocked(fetchWithAuth).mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (init?.method === 'POST' && url === '/ai/sessions') return jsonResponse({ id: AI.session, orgId: 'org-1' });
+      if (url.endsWith('/interrupt')) return jsonResponse({ interrupted: true });
+      return sseResponse([{ type: 'message_start', messageId: 'm' }], new Promise<void>((resolve) => { release = resolve; }));
+    });
+    const { result, unmount } = renderHook(() => useTopologyInvestigation(aiSelection()));
+    act(() => { void result.current.explain(); });
+    await waitFor(() => expect(useAiStore.getState().isStreaming).toBe(true));
+    unmount();
+    await waitFor(() => expect(calls()).toContain(`POST /ai/sessions/${AI.session}/interrupt`));
+    release();
+  });
+});

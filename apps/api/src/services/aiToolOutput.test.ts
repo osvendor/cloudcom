@@ -1,5 +1,11 @@
-import { describe, expect, it } from 'vitest';
-import { MAX_TOOL_RESULT_CHARS, compactToolResultForChat, redactSensitiveToolInput } from './aiToolOutput';
+import { afterEach, describe, expect, it } from 'vitest';
+import {
+  MAX_TOOL_RESULT_CHARS,
+  SENTINEL_HINTS,
+  compactToolResultForChat,
+  redactSensitiveToolInput,
+  setToolPaginationHintResolver,
+} from './aiToolOutput';
 
 // #3521: a truncated array carries a trailing in-band sentinel string. When a
 // test cross-checks kept-vs-dropped counts, exclude that synthetic element.
@@ -588,6 +594,82 @@ describe('array truncation in-band sentinel (#3521)', () => {
   });
 });
 
+// #7131: array items landing exactly at the depth ceiling used to be replaced
+// wholesale by the opaque `[truncated: max depth reached]` marker. These tests
+// pin the generic contract directly against `compactValue`'s depth-ceiling
+// branch (via an unrecognized tool name, so the generic path is exercised)
+// rather than only through get_fleet_health, and without relying on the
+// overall payload being large enough to force a tighter compaction tier: five
+// levels of object nesting (a.b.c.d.e) put the array itself at depth 5, so its
+// items land at depth 6 — DEFAULT_CONFIG's own maxDepth — exercising the
+// ceiling with tier0 already.
+describe('array items at the depth ceiling are bounded, not dropped (#7131)', () => {
+  function nestedAt(items: unknown): string {
+    return JSON.stringify({ a: { b: { c: { d: { e: items } } } } });
+  }
+  function itemsOf(raw: string): unknown[] {
+    const parsed = JSON.parse(compactToolResultForChat('get_quote', raw)) as {
+      a: { b: { c: { d: { e: unknown[] } } } };
+    };
+    return parsed.a.b.c.d.e;
+  }
+
+  it('keeps a couple of small items whole plus a sentinel, instead of an opaque depth marker', () => {
+    const raw = nestedAt([
+      { type: 'crashes', severity: 'critical' },
+      { type: 'services', severity: 'error' },
+      { type: 'hangs', severity: 'warning' },
+      { type: 'hardware', severity: 'warning' },
+    ]);
+    const out = itemsOf(raw);
+
+    expect(out.some((x) => x === '[truncated: max depth reached]')).toBe(false);
+    expect(out[0]).toMatchObject({ type: 'crashes', severity: 'critical' });
+    expect(out[1]).toMatchObject({ type: 'services', severity: 'error' });
+    const last = out[out.length - 1];
+    expect(typeof last).toBe('string');
+    expect(last as string).toMatch(/truncated: 2 more items omitted/);
+  });
+
+  it('does not append a sentinel when every item already fits within the keep count', () => {
+    const out = itemsOf(nestedAt([{ type: 'crashes' }]));
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({ type: 'crashes' });
+  });
+
+  it('reduces an oversized object item to a short preview instead of keeping it unbounded', () => {
+    const big = { type: 'crashes', detail: 'x'.repeat(400) };
+    const out = itemsOf(nestedAt([big]));
+
+    expect(typeof out[0]).toBe('string');
+    expect((out[0] as string).length).toBeLessThan(JSON.stringify(big).length);
+    expect(out[0] as string).toMatch(/truncated at depth limit/);
+  });
+
+  it('still caps an oversized STRING item at the ceiling — not left unbounded', () => {
+    const longString = 'y'.repeat(5_000);
+    const out = itemsOf(nestedAt([longString]));
+
+    expect(typeof out[0]).toBe('string');
+    expect((out[0] as string).length).toBeLessThan(longString.length);
+  });
+
+  it('carries a prior truncation count forward when the array already carried a sentinel', () => {
+    const PRIOR = 12;
+    const raw = nestedAt([
+      { type: 'crashes' },
+      { type: 'services' },
+      `...[truncated: ${PRIOR} more items omitted. Use pagination or the REST API]`,
+    ]);
+    const out = itemsOf(raw);
+    const marker = out[out.length - 1] as string;
+    const n = Number(/truncated: (\d+) more/.exec(marker)![1]);
+    // The 2 real items minus the 1 kept (DEPTH_LIMIT_ARRAY_KEEP=2 means both
+    // survive here) plus the prior count — carried forward, not reset/dropped.
+    expect(n).toBeGreaterThanOrEqual(PRIOR);
+  });
+});
+
 describe('compactToolResultForChat — capture envelope (execution-plane W01, spec §5.2)', () => {
   const bigStdout = 'L'.repeat(30_000);
   const nativeResult = JSON.stringify({ status: 'success', exitCode: 0, stdout: bigStdout });
@@ -636,5 +718,185 @@ describe('compactToolResultForChat — capture envelope (execution-plane W01, sp
   it('honours an explicit maxChars', () => {
     const out = compactToolResultForChat('query_devices', JSON.stringify({ rows: Array.from({ length: 400 }, (_, i) => ({ i, pad: 'p'.repeat(40) })) }), 1_000);
     expect(out.length).toBeLessThanOrEqual(1_000);
+  });
+});
+
+describe('registry-aware truncation guidance (A-W05 D12)', () => {
+  afterEach(() => setToolPaginationHintResolver(() => 'none'));
+
+  const bigList = (key: string) => JSON.stringify({ [key]: Array.from({ length: 400 }, (_, i) => ({ id: i, name: `row-${i}`, note: 'x'.repeat(60) })) });
+
+  it('tells a cursor-capable tool to continue with nextCursor, in the sentinel and in _chat.nextStep', () => {
+    setToolPaginationHintResolver((name) => (name === 'paged_tool' ? 'cursor' : 'none'));
+    const out = JSON.parse(compactToolResultForChat('paged_tool', bigList('rows'))) as { rows: unknown[]; _chat: { nextStep: string } };
+    expect(out.rows.at(-1)).toMatch(/^\.\.\.\[truncated: \d+ more items omitted\. Call again with the nextCursor value\]$/);
+    expect(out._chat.nextStep).toBe(SENTINEL_HINTS.cursor);
+  });
+
+  it('tells a limit-only tool to shrink the page, and a tool with neither to narrow with filters', () => {
+    setToolPaginationHintResolver((name) => (name === 'limit_tool' ? 'limit' : 'none'));
+    const limited = JSON.parse(compactToolResultForChat('limit_tool', bigList('rows'))) as { rows: unknown[] };
+    expect(limited.rows.at(-1)).toMatch(/Pass a smaller limit or add filters\]$/);
+    const bare = JSON.parse(compactToolResultForChat('bare_tool', bigList('rows'))) as { rows: unknown[]; _chat: { nextStep: string } };
+    expect(bare.rows.at(-1)).toMatch(/Narrow the query with filters\]$/);
+    expect(bare._chat.nextStep).toBe(SENTINEL_HINTS.none);
+  });
+
+  it('still recognises the legacy sentinel on re-compaction (idempotent, no double count)', () => {
+    const raw = JSON.stringify({ rows: [...Array.from({ length: 10 }, (_, i) => ({ i })), '...[truncated: 77 more items omitted. Use pagination or the REST API]'] });
+    const once = compactToolResultForChat('bare_tool', raw);
+    expect(compactToolResultForChat('bare_tool', once)).toBe(once);
+  });
+
+  it('puts nextStep on the digest too', () => {
+    setToolPaginationHintResolver(() => 'cursor');
+    const huge = JSON.stringify({ blob: 'y'.repeat(40_000).split('').map((c, i) => ({ i, c })) });
+    const out = JSON.parse(compactToolResultForChat('paged_tool', huge, 400)) as { summarized?: boolean; _chat: { nextStep?: string } };
+    expect(out.summarized).toBe(true);
+    expect(out._chat.nextStep).toBe(SENTINEL_HINTS.cursor);
+  });
+
+  it('carries the top-level paging envelope keys through the digest (Task 0 — extreme page, every varchar at schema max)', () => {
+    setToolPaginationHintResolver(() => 'cursor');
+    // Simulate the worst realistic page a keyset-paged tool can emit: every
+    // varchar-ish field at its schema max, still overflowing every compaction
+    // tier, so the digest branch (row-less, `summarized: true`) fires. Without
+    // this fix, the digest drops `hasMore`/`nextCursor` exactly when the model
+    // most needs them to continue paging.
+    const MAX_VARCHAR = 'v'.repeat(255);
+    const raw = JSON.stringify({
+      total: 48213,
+      totalMode: 'exact',
+      showing: 100,
+      limit: 100,
+      offset: 0,
+      hasMore: true,
+      nextCursor: 'eyJ0IjoiMjAyNi0wOS0yMlQwMDowMDowMC4wMDAwMDAiLCJpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAxIn0=',
+      count: 100,
+      rows: Array.from({ length: 100 }, (_, i) => ({
+        id: `row-${i}`,
+        title: MAX_VARCHAR,
+        message: MAX_VARCHAR,
+        hostname: MAX_VARCHAR,
+        note: MAX_VARCHAR,
+      })),
+    });
+
+    const out = JSON.parse(compactToolResultForChat('paged_tool', raw)) as Record<string, unknown> & {
+      summarized?: boolean;
+      _chat: { nextStep?: string };
+    };
+
+    expect(out.summarized).toBe(true);
+    expect(out.total).toBe(48213);
+    expect(out.totalMode).toBe('exact');
+    expect(out.showing).toBe(100);
+    expect(out.limit).toBe(100);
+    expect(out.offset).toBe(0);
+    expect(out.hasMore).toBe(true);
+    expect(out.nextCursor).toBe('eyJ0IjoiMjAyNi0wOS0yMlQwMDowMDowMC4wMDAwMDAiLCJpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAxIn0=');
+    expect(out.count).toBe(100);
+    expect(out._chat.nextStep).toBe(SENTINEL_HINTS.cursor);
+  });
+
+  it('does not fire nextStep on a system_cleanup outputTail cut (Q8 — no array items were dropped)', () => {
+    setToolPaginationHintResolver(() => 'cursor');
+    const out = JSON.parse(compactToolResultForChat('system_cleanup', JSON.stringify({
+      cleanupRunId: 'run-1',
+      freedBytes: 1024,
+      actions: [{ id: 'win_dism_component_cleanup', status: 'completed', outputTail: 'x'.repeat(20_000) }],
+    }))) as { actions: Array<{ outputTailTruncated?: boolean }>; _chat?: { nextStep?: string } };
+    expect(out.actions[0]?.outputTailTruncated).toBe(true);
+    expect(out._chat?.nextStep).toBeUndefined();
+  });
+
+  it('DOES fire nextStep on a system_cleanup catalog truncation (real array items dropped)', () => {
+    setToolPaginationHintResolver(() => 'limit');
+    const actions = Array.from({ length: 80 }, (_, i) => ({ id: `action_${i}`, label: `Action ${i}` }));
+    const out = JSON.parse(compactToolResultForChat('system_cleanup', JSON.stringify({ catalog: { actions } }))) as {
+      catalog: { truncatedActionCount: number };
+      _chat?: { nextStep?: string };
+    };
+    expect(out.catalog.truncatedActionCount).toBeGreaterThan(0);
+    expect(out._chat?.nextStep).toBe(SENTINEL_HINTS.limit);
+  });
+});
+
+describe('character-window fields survive compaction intact (A-W05 Q3)', () => {
+  it('never truncates a `text`/`nextOffset` window even under heavy pressure from a sibling field, and preserves escape-heavy content byte-for-byte', () => {
+    const windowText = 'line one\nline "two" with quotes\\and a backslash\r\nline three\ttabbed';
+    const raw = JSON.stringify({
+      text: windowText,
+      nextOffset: 4096,
+      hasMore: true,
+      // Oversized sibling forces compaction tiers to engage.
+      otherField: 'z'.repeat(30_000),
+    });
+    const out = JSON.parse(compactToolResultForChat('read_artifact', raw)) as { text: string; nextOffset: number; hasMore: boolean };
+    expect(out.text).toBe(windowText);
+    expect(out.nextOffset).toBe(4096);
+    expect(out.hasMore).toBe(true);
+  });
+
+  it('never truncates a `stdout`/`stdoutNextOffset` window inside a command-shaped result, even with escape-heavy content', () => {
+    const stdoutText = 'result: {"nested":"json-looking but not parseable\\n"} tail\r\n\twith\ttabs "quoted"';
+    const raw = JSON.stringify({
+      status: 'success',
+      exitCode: 0,
+      stdout: stdoutText,
+      stdoutNextOffset: 6000,
+      stdoutHasMore: true,
+      stderr: 'z'.repeat(30_000), // oversized sibling forces compaction tiers to engage
+    });
+    const out = JSON.parse(compactToolResultForChat('get_script_execution', raw)) as { stdout: string; stdoutNextOffset: number };
+    expect(out.stdout).toBe(stdoutText);
+    expect(out.stdoutNextOffset).toBe(6000);
+  });
+
+  it('still compacts a plain `text` field that has no nextOffset/hasMore sibling (not a window)', () => {
+    const raw = JSON.stringify({ text: 'w'.repeat(30_000), other: 'z'.repeat(30_000) });
+    const out = JSON.parse(compactToolResultForChat('some_tool', raw)) as { text: string; _chat?: { outputCompacted?: boolean } };
+    expect(out.text.length).toBeLessThan(30_000);
+  });
+});
+
+// #10411: the chat handler compacts a tool result for the model, then
+// postToolUse compacts that SAME string again before persisting the
+// tool_result row. A JSON stdout becomes an object on the first pass, and the
+// second pass dropped it — the transcript kept only {status, exitCode,
+// commandId} while the model had read the stdout.
+describe('compactToolResultForChat is stable on its own output (#10411)', () => {
+  it('keeps a structured (JSON) stdout when an already-compacted command result is compacted again', () => {
+    const raw = JSON.stringify({
+      status: 'completed',
+      exitCode: 0,
+      commandId: 'cmd-1',
+      stdout: JSON.stringify({ processes: [{ name: 'svchost.exe', pid: 4 }], total: 1 }),
+    });
+    const once = compactToolResultForChat('execute_command', raw);
+    const twice = compactToolResultForChat('execute_command', once);
+    expect(JSON.parse(once).stdout).toEqual({ processes: [{ name: 'svchost.exe', pid: 4 }], total: 1 });
+    expect(JSON.parse(twice)).toEqual(JSON.parse(once));
+  });
+
+  it('keeps a first pass\'s stdoutChars/stderrChars instead of re-counting the already-shortened text', () => {
+    const firstPass = JSON.stringify({
+      status: 'completed',
+      exitCode: 1,
+      commandId: 'cmd-2',
+      stdout: 'out '.repeat(25),
+      stdoutChars: 30_000,
+      stderr: 'err '.repeat(10),
+      stderrChars: 9_000,
+    });
+    const again = JSON.parse(compactToolResultForChat('execute_command', firstPass));
+    expect(again.stdout).toBe('out '.repeat(25));
+    expect(again.stdoutChars).toBe(30_000);
+    expect(again.stderrChars).toBe(9_000);
+  });
+
+  it('never trusts a supplied stdoutChars smaller than the stdout it describes', () => {
+    const understated = JSON.stringify({ status: 'completed', exitCode: 0, stdout: 'x'.repeat(500), stdoutChars: 3 });
+    expect(JSON.parse(compactToolResultForChat('execute_command', understated)).stdoutChars).toBe(500);
   });
 });

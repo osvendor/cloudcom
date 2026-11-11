@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import {
   AlertTriangle,
   CheckCircle2,
@@ -10,9 +10,12 @@ import {
   Building2,
 } from "lucide-react";
 import { fetchWithAuth } from "../../stores/auth";
+import { useOrgStore } from "../../stores/orgStore";
+import { getJwtClaims } from "../../lib/authScope";
 import { formatDateTime } from "@/lib/dateTimeFormat";
 import { useTranslation } from "react-i18next";
 import "@/lib/i18n";
+import type { M365LegacyStatus } from "./m365ConsentSummary";
 
 type Connection = {
   connected: boolean;
@@ -28,8 +31,42 @@ type SaveState = {
   message?: string;
 };
 
-export default function M365Integration() {
+interface M365IntegrationProps {
+  /** Reports the legacy connection's state so the tenant section can order the sub-tab. */
+  onStatusChange?: (status: M365LegacyStatus) => void;
+  /** Label the card "Legacy" (an existing direct connection alongside the consent path). */
+  legacyBadge?: boolean;
+  /** Say that this direct connection wins over a consent connection for the same tenant. */
+  showPrecedenceNote?: boolean;
+  /** Consent-based onboarding is available for this org: point admins at it instead. */
+  consentAvailable?: boolean;
+}
+
+type OrgNameSource = {
+  organizations?: { id: string; name: string }[];
+};
+
+// Same canonical Entra tenant GUID shape the API enforces (routes/m365.ts).
+const TENANT_GUID_REGEX =
+  /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+
+export default function M365Integration({
+  onStatusChange,
+  legacyBadge = false,
+  showPrecedenceNote = false,
+  consentAvailable = false,
+}: M365IntegrationProps = {}) {
   const { t } = useTranslation("integrations");
+  const fieldId = useId();
+  const currentOrgId = useOrgStore((value) => value.currentOrgId);
+  const claims = getJwtClaims();
+  const orgId = currentOrgId || (claims.scope === "organization" ? claims.orgId : null);
+  const orgName = useOrgStore((value) => {
+    const organizations = (value as OrgNameSource).organizations;
+    return orgId && Array.isArray(organizations)
+      ? organizations.find((org) => org.id === orgId)?.name ?? null
+      : null;
+  });
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [notEnabled, setNotEnabled] = useState(false);
@@ -43,8 +80,26 @@ export default function M365Integration() {
   const [saveState, setSaveState] = useState<SaveState>({ status: "idle" });
 
   const isConnected = !!connection?.connected;
+
+  const status: M365LegacyStatus = loading
+    ? "loading"
+    : notEnabled
+      ? "not-enabled"
+      : isConnected
+        ? "connected"
+        : loadError
+          ? "error"
+          : "disconnected";
+  const onStatusChangeRef = useRef(onStatusChange);
+  onStatusChangeRef.current = onStatusChange;
+  useEffect(() => {
+    onStatusChangeRef.current?.(status);
+  }, [status]);
+  const tenantIdInvalid =
+    tenantId.trim().length > 0 && !TENANT_GUID_REGEX.test(tenantId.trim());
   const canSave =
     tenantId.trim().length > 0 &&
+    !tenantIdInvalid &&
     clientId.trim().length > 0 &&
     (clientSecret.trim().length > 0 || isConnected);
 
@@ -127,6 +182,8 @@ export default function M365Integration() {
   };
 
   const handleDisconnect = async () => {
+    // Same confirmation pattern as the consent steps' Disconnect.
+    if (!window.confirm(t("m365Integration.disconnectConfirm"))) return;
     setSaveState({ status: "saving" });
     try {
       const res = await fetchWithAuth("/m365/connection", { method: "DELETE" });
@@ -174,9 +231,9 @@ export default function M365Integration() {
             <Building2 className="h-5 w-5" />
           </div>
           <div>
-            <h1 className="text-2xl font-semibold">
+            <h2 className="text-lg font-semibold">
               {t("m365Integration.microsoft365")}
-            </h1>
+            </h2>
             <p className="text-sm text-muted-foreground">
               {t("m365Integration.connectAnEntraAzureADAppRegistrationSo")}
             </p>
@@ -206,12 +263,24 @@ export default function M365Integration() {
         <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-primary/10 text-primary">
           <Building2 className="h-5 w-5" />
         </div>
-        <div>
-          <h1 className="text-2xl font-semibold">
-            {t("m365Integration.microsoft365")}
-          </h1>
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <h2 className="text-lg font-semibold">
+              {orgName
+                ? t("m365Integration.legacyHeadingForOrg", { orgName })
+                : t("m365Integration.legacyHeading")}
+            </h2>
+            {legacyBadge && (
+              <span
+                data-testid="m365-legacy-badge"
+                className="inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium text-muted-foreground"
+              >
+                {t("m365Integration.legacyBadge")}
+              </span>
+            )}
+          </div>
           <p className="text-sm text-muted-foreground">
-            {t("m365Integration.connectAnEntraAzureADAppRegistrationSo2")}
+            {t("m365Integration.legacyScopeSummary")}
           </p>
         </div>
         {isConnected ? (
@@ -225,6 +294,41 @@ export default function M365Integration() {
         )}
       </div>
 
+      {showPrecedenceNote && (
+        <p
+          data-testid="m365-legacy-precedence-note"
+          className="rounded-md bg-muted p-3 text-sm text-muted-foreground"
+        >
+          {t("m365Integration.precedenceNote")}
+        </p>
+      )}
+
+      <div className="grid gap-3 rounded-lg border bg-muted/30 p-4 text-sm md:grid-cols-2">
+        <div data-testid="m365-legacy-powers">
+          <p className="font-medium">{t("m365Integration.powersHeading")}</p>
+          <p className="mt-1 text-muted-foreground">{t("m365Integration.powersList")}</p>
+        </div>
+        <div data-testid="m365-legacy-does-not-power">
+          <p className="font-medium">{t("m365Integration.doesNotPowerHeading")}</p>
+          <ul className="mt-1 list-disc space-y-0.5 pl-5 text-muted-foreground">
+            <li>{t("m365Integration.doesNotPowerSync")}</li>
+            <li>
+              <code className="rounded bg-muted px-1">m365_query_*</code>{" "}
+              {t("m365Integration.doesNotPowerQueryTools")}
+            </li>
+            <li>{t("m365Integration.doesNotPowerReports")}</li>
+          </ul>
+        </div>
+        {consentAvailable && (
+          <p
+            data-testid="m365-legacy-use-consent"
+            className="font-medium md:col-span-2"
+          >
+            {t("m365Integration.useConnectWithMicrosoft")}
+          </p>
+        )}
+      </div>
+
       {loadError && (
         <div className="rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">
           {loadError}
@@ -233,12 +337,12 @@ export default function M365Integration() {
 
       {/* Connection card */}
       <div className="rounded-xl border bg-card p-6 shadow-xs">
-        <h2 className="text-lg font-semibold">
+        <h3 className="text-base font-semibold">
           {t("m365Integration.connection")}
-        </h2>
+        </h3>
         <p className="mb-4 text-sm text-muted-foreground">
           {t("m365Integration.enterTheTenantIdAppClientIdAnd")}
-          {!isConnected && " Saving requires MFA verification."}
+          {!isConnected && t("m365Integration.savingRequiresMfa")}
         </p>
 
         <details className="mb-4 rounded-md border bg-muted/40 p-3 text-sm">
@@ -255,6 +359,11 @@ export default function M365Integration() {
               <span className="font-medium text-foreground">
                 {t("m365Integration.microsoftEntraIDAppRegistrations")}
               </span>
+              {t("m365Integration.searchAllApplicationsFirst")}
+              <span className="font-medium text-foreground">
+                {t("m365Integration.allApplications")}
+              </span>
+              {t("m365Integration.searchAllApplicationsFirst2")}
               {t("m365Integration.pickAnExistingAppOrClick")}
               <span className="font-medium text-foreground">
                 {t("m365Integration.newRegistration")}
@@ -309,25 +418,37 @@ export default function M365Integration() {
 
         <div className="grid gap-4 md:grid-cols-2">
           <div>
-            <label className="mb-1 block text-sm font-medium">
+            <label htmlFor={`${fieldId}-tenant`} className="mb-1 block text-sm font-medium">
               {t("m365Integration.tenantID")}
             </label>
             <input
+              id={`${fieldId}-tenant`}
               type="text"
               value={tenantId}
               onChange={(e) => setTenantId(e.target.value)}
-              placeholder={t(
-                "m365Integration.contosoOnmicrosoftComOrTenantGUID",
-              )}
+              placeholder={t("m365Integration.tenantIdGuidPlaceholder")}
+              aria-invalid={tenantIdInvalid}
+              aria-describedby={tenantIdInvalid ? `${fieldId}-tenant-hint` : undefined}
               className="h-10 w-full rounded-md border bg-background px-3 text-sm outline-hidden focus:ring-2 focus:ring-primary/30"
             />
+            {tenantIdInvalid && (
+              <p
+                id={`${fieldId}-tenant-hint`}
+                data-testid="m365-tenant-id-hint"
+                role="alert"
+                className="mt-1 text-xs text-red-600"
+              >
+                {t("m365Integration.tenantIdGuidHint")}
+              </p>
+            )}
           </div>
 
           <div>
-            <label className="mb-1 block text-sm font-medium">
+            <label htmlFor={`${fieldId}-client`} className="mb-1 block text-sm font-medium">
               {t("m365Integration.appClientID")}
             </label>
             <input
+              id={`${fieldId}-client`}
               type="text"
               value={clientId}
               onChange={(e) => setClientId(e.target.value)}
@@ -337,7 +458,7 @@ export default function M365Integration() {
           </div>
 
           <div className="md:col-span-2">
-            <label className="mb-1 block text-sm font-medium">
+            <label htmlFor={`${fieldId}-secret`} className="mb-1 block text-sm font-medium">
               {t("m365Integration.clientSecret")}
               {isConnected && (
                 <span className="ml-1 text-xs text-muted-foreground">
@@ -347,13 +468,14 @@ export default function M365Integration() {
             </label>
             <div className="relative">
               <input
+                id={`${fieldId}-secret`}
                 type={showSecret ? "text" : "password"}
                 value={clientSecret}
                 onChange={(e) => setClientSecret(e.target.value)}
                 placeholder={
                   isConnected
-                    ? "•••••••••• (stored, encrypted)"
-                    : "app client secret"
+                    ? t("m365Integration.clientSecretStoredPlaceholder")
+                    : t("m365Integration.clientSecretPlaceholder")
                 }
                 className="h-10 w-full rounded-md border bg-background px-3 pr-10 text-sm outline-hidden focus:ring-2 focus:ring-primary/30"
               />
@@ -436,9 +558,9 @@ export default function M365Integration() {
       {/* Status card */}
       {isConnected && (
         <div className="rounded-xl border bg-card p-6 shadow-xs">
-          <h2 className="text-lg font-semibold">
+          <h3 className="text-base font-semibold">
             {t("m365Integration.connectionDetails")}
-          </h2>
+          </h3>
           <div className="mt-4 space-y-2 text-sm">
             <div className="flex justify-between text-muted-foreground">
               <span>{t("m365Integration.tenant")}</span>

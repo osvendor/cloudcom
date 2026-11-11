@@ -49,14 +49,20 @@ describe('§9.2 — the disk tools over MCP', () => {
     // the destructive step to a tech in the web app.
     expect(Math.max(getToolTier('disk_cleanup')!, checkGuardrails('disk_cleanup', { action: 'execute' }).tier)).toBe(3);
     expect(Math.max(getToolTier('system_cleanup')!, checkGuardrails('system_cleanup', { action: 'run' }).tier)).toBe(3);
+    // cancel (#10161) mirrors a requireMfa() mutating route, so it is Tier 3 too: an MCP client cannot
+    // start a run, and cannot end one either.
+    expect(Math.max(getToolTier('system_cleanup')!, checkGuardrails('system_cleanup', { action: 'cancel' }).tier)).toBe(3);
   });
 
   it('their read-only actions stay reachable over MCP', () => {
     expect(Math.max(getToolTier('disk_cleanup')!, checkGuardrails('disk_cleanup', { action: 'preview' }).tier)).toBe(1);
-    expect(Math.max(getToolTier('system_cleanup')!, checkGuardrails('system_cleanup', { action: 'list' }).tier)).toBe(1);
     // `status` is a read of the run row: Tier 1, listed and callable over MCP.
     expect(Math.max(getToolTier('system_cleanup')!, checkGuardrails('system_cleanup', { action: 'status' }).tier)).toBe(1);
     expect(Math.max(getToolTier('analyze_disk_usage')!, checkGuardrails('analyze_disk_usage', {}).tier)).toBe(1);
+    // The live reads (catalog request, fresh scan) are Tier 2: reachable with
+    // ai:write, not with an ai:read-only key.
+    expect(Math.max(getToolTier('system_cleanup')!, checkGuardrails('system_cleanup', { action: 'list' }).tier)).toBe(2);
+    expect(Math.max(getToolTier('analyze_disk_usage')!, checkGuardrails('analyze_disk_usage', { refresh: true }).tier)).toBe(2);
   });
 
   it('both stay LISTED — they are mixed multiplexers, not wholly gated tools', () => {
@@ -64,7 +70,7 @@ describe('§9.2 — the disk tools over MCP', () => {
     // advertised-but-dead pattern). These two must NOT be suppressed, or MCP
     // clients lose read-only disk diagnosis entirely.
     expect(advertisedActions('disk_cleanup')).toEqual(['preview', 'execute']);
-    expect(advertisedActions('system_cleanup')).toEqual(['list', 'run', 'status']);
+    expect(advertisedActions('system_cleanup')).toEqual(['list', 'run', 'status', 'cancel']);
     expect(whollyGatedOverMcp('disk_cleanup')).toBe(false);
     expect(whollyGatedOverMcp('system_cleanup')).toBe(false);
     // analyze_disk_usage is not action-multiplexed at all, so it is never
@@ -73,9 +79,9 @@ describe('§9.2 — the disk tools over MCP', () => {
     expect(whollyGatedOverMcp('analyze_disk_usage')).toBe(false);
   });
 
-  it('only the destructive action carries the tools/list approval note', () => {
+  it('only the destructive action (and system_cleanup cancel) carries the tools/list approval note', () => {
     expect(TIER3_ACTIONS.disk_cleanup).toEqual(['execute']);
-    expect(TIER3_ACTIONS.system_cleanup).toEqual(['run']);
+    expect(TIER3_ACTIONS.system_cleanup).toEqual(['run', 'cancel']);
   });
 
   it('device-scoped org resolution is declared, so the ledger attributes to the DEVICE’s org', () => {

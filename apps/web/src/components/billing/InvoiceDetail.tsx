@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { autopayReasonKey, chargeBlockedKey, chargeNowAttempted, chargeNowFailureKey, chargeNowResultUnknown, chargeNowSuccessKey, STEP_UP_UNAVAILABLE } from './autopayReason';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import '../../lib/i18n';
 import { fetchWithAuth } from '../../stores/auth';
@@ -8,6 +9,7 @@ import { usePermissions } from '../../lib/permissions';
 import { showToast } from '../shared/Toast';
 import { Dialog } from '../shared/Dialog';
 import { ConfirmDialog } from '../shared/ConfirmDialog';
+import { useBillingStepUp, suppressBillingStepUpToast } from './useBillingStepUp';
 import ChangeCurrencyDialog, { type CurrencyChangeMode } from './ChangeCurrencyDialog';
 import {
   type InvoiceDetail as InvoiceDetailData,
@@ -19,19 +21,26 @@ import {
   formatDate,
   formatMoney,
   lineTaxAmount,
-  lineTitle,
-  lineBlurb,
-  lineWorkedVsBilledNote,
   pctFromFraction,
   sellerLines,
   computeInvoiceProfit,
 } from './invoiceTypes';
 import { StatusPill } from './shared/StatusPill';
+import { LineItemsTable } from './shared/LineItemsTable';
 import InvoiceActions from './InvoiceActions';
 import AccountingSyncCard from './AccountingSyncCard';
 import { MarginPanel, MarginToggle, useShowMargin } from './billingUi';
 import { computeChargeNow } from '@breeze/shared';
 import InvoiceLineDevices from './InvoiceLineDevices';
+import { DocumentLineDescription } from '@breeze/document-ui';
+import { lineDescriptionProps } from '@breeze/shared/documents';
+import { useStableT } from '@/lib/i18n/useStableT';
+import { localDateInputValue } from '@/lib/localDate';
+import {
+  ACCOUNTING_PROVIDER_NAMES,
+  isAccountingProviderId,
+  useActivePushProvider,
+} from '../../lib/accountingProviders';
 
 const UNAUTHORIZED = () => void navigateTo('/login', { replace: true });
 
@@ -48,8 +57,31 @@ interface Props {
 
 export default function InvoiceDetail({ detail, onChanged, actionsInHeader = false }: Props) {
   const { t } = useTranslation('billing');
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   const { can } = usePermissions();
   const { invoice, lines } = detail;
+  const canPushInvoices = can('invoices', 'write');
+  // Where a push from the sync card goes when the invoice has no mapping row
+  // yet: the partner's active connection, iff it can push invoices. Only asked
+  // when a push could actually be made — the push route also requires
+  // accounting:manage (same gate as the InvoicesPage bulk push), and a mapped
+  // invoice already names its provider. `null` hides only the push action;
+  // the card itself (status + post-Issue watch) always mounts.
+  const pushProvider = useActivePushProvider(
+    canPushInvoices && can('accounting', 'manage') && !detail.accountingSync,
+  );
+  const syncProvider = detail.accountingSync?.provider ?? pushProvider;
+  // Display name for the {{provider}} interpolation on payment-row sync
+  // badges, used as a fallback when a payment's own accountingSync carries no
+  // provider (an older API response — see paymentBadgeProvider below).
+  // Deliberately no brand fallback (never guess "QuickBooks"): when the
+  // provider genuinely isn't known, the interpolation is left blank rather
+  // than naming the wrong one.
+  const syncProviderName = syncProvider ? ACCOUNTING_PROVIDER_NAMES[syncProvider] : '';
+  // A pushed payment's badge names the provider it was pushed to (W01d "Invoice
+  // badge" deferral); the invoice-level name only for an older API response.
+  const paymentBadgeProvider = (p: InvoicePayment): string =>
+    p.accountingSync?.provider ? ACCOUNTING_PROVIDER_NAMES[p.accountingSync.provider] : syncProviderName;
   const currency = invoice.currencyCode;
   const invoiceStatusLabel = invoice.status === 'sent' && !invoice.sentAt
     ? t('invoice.status.issued')
@@ -67,6 +99,65 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
   // unconditionally for anyone with read access, and the per-line "Accounting
   // view" checkbox was a separate, unpersisted control — so hiding margin on a
   // quote didn't carry over here).
+  const [chargeConfirmOpen, setChargeConfirmOpen] = useState(false);
+  const [chargePending, setChargePending] = useState(false);
+  // Charge now needs a second-factor confirmation bound to this invoice.
+  const chargeStepUp = useBillingStepUp();
+  async function startAutopayCharge() {
+    if (chargePending || !detail.autopay?.canChargeNow || !detail.autopay.chargePreview) return;
+    setChargePending(true);
+    // The charge already happened (or was attempted): a failed refetch must not read as a failed charge.
+    const reloadAfterCharge = () => Promise.allSettled([Promise.resolve(onChanged()), loadPayments()]);
+    try {
+      // The route confirms with Stripe synchronously: a lost or unreadable response can follow
+      // money moving, so it is reported as an unknown result, never "try again" (R4).
+      const outcome = await chargeStepUp.run(stepUpGrant => runAction({
+        request: () => fetchWithAuth(`/invoices/${invoice.id}/autopay/charge-now`,
+          { method: 'POST', ...(stepUpGrant ? { body: JSON.stringify({ stepUpGrant }) } : {}) }),
+        errorFallback: t('autopay.chargeResultUnknown'),
+        successMessage: data => t(/* i18n-dynamic */ chargeNowSuccessKey(data)),
+        friendly: (_code, _message, body) => {
+          const key = chargeNowFailureKey(body);
+          return key ? t(/* i18n-dynamic */ key) : undefined;
+        },
+        // A 5xx may follow money moving and is reported as an unknown result below, except
+        // when the second-factor check itself could not run (nothing was attempted).
+        suppressErrorToast: (status, code) => (status >= 500 && code !== STEP_UP_UNAVAILABLE)
+          || suppressBillingStepUpToast(status, code),
+        onUnauthorized: UNAUTHORIZED }));
+      // Closed at the confirmation: nothing was charged and nothing needs reloading.
+      if (!outcome.confirmed) return;
+      await reloadAfterCharge();
+    } catch (error) {
+      if (error instanceof ActionError && chargeNowResultUnknown(error)) {
+        // Network failures and unreadable bodies were already toasted with the fallback.
+        if (error.status >= 500) showToast({ message: t('autopay.chargeResultUnknown'), type: 'warning' });
+        await reloadAfterCharge();
+        return;
+      }
+      if (error instanceof ActionError && chargeNowAttempted(error.body)) await reloadAfterCharge();
+      handleActionError(error, t('autopay.chargeFailed'));
+    }
+    finally { setChargePending(false); setChargeConfirmOpen(false); }
+  }
+  const [autopaySaving, setAutopaySaving] = useState(false);
+  const setAutopayExcluded = async (excluded: boolean) => {
+    if (autopaySaving) return;
+    setAutopaySaving(true);
+    try {
+      await runAction<{status?:string}>({ request: () => fetchWithAuth(`/invoices/${invoice.id}/autopay`, {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ excluded }),
+      }), errorFallback: t('autopay.failed'), successMessage: result => result.status === 'pending'
+        ? t(/* i18n-dynamic */ autopayReasonKey('control_pending:exclude'),{nsSeparator:false}) : t('autopay.saved'),
+        // A payment already with Stripe cannot be recalled, so the exclusion was refused, not queued.
+        friendly: (code, _message, body) => code === 'COLLECTION_IN_PROGRESS'
+          && (body as { details?: { reason?: string } } | null)?.details?.reason === 'payment_processing'
+          ? t('autopay.excludeRefusedProcessing') : undefined });
+      await onChanged();
+    } catch (error) { handleActionError(error, t('autopay.failed')); }
+    finally { setAutopaySaving(false); }
+  };
+
   const [showMargin, toggleMargin] = useShowMargin();
   const [payments, setPayments] = useState<InvoicePayment[]>([]);
   const [paymentsError, setPaymentsError] = useState(false);
@@ -76,7 +167,9 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
   const [payAmount, setPayAmount] = useState('');
   const [payMethod, setPayMethod] = useState<PaymentMethod>('bank_transfer');
   const [payRef, setPayRef] = useState('');
-  const [payDate, setPayDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [payDate, setPayDate] = useState(() => localDateInputValue());
+  // The idempotency key of the payment being recorded, tied to its form values (#3803).
+  const paymentAttemptRef = useRef<{ fingerprint: string; key: string } | null>(null);
 
   // Payment confirm dialog
   const [payConfirmOpen, setPayConfirmOpen] = useState(false);
@@ -125,13 +218,13 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
       // An operator must NOT read "No payments recorded" when the fetch actually
       // failed — surface a visible error (with inline retry) and a toast.
       setPaymentsError(true);
-      handleActionError(new Error(res.statusText), t('invoiceDetail.payments.loadFailed'));
+      handleActionError(new Error(res.statusText), stableT('invoiceDetail.payments.loadFailed'));
       return;
     }
     setPaymentsError(false);
     const body = (await res.json()) as { data: InvoicePayment[] };
     setPayments(body.data ?? []);
-  }, [invoice.id, t]);
+  }, [invoice.id, stableT]);
 
   useEffect(() => { void loadPayments(); }, [loadPayments]);
 
@@ -168,6 +261,10 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
   const canRecordPayment =
     invoice.status !== 'draft' && invoice.status !== 'void' && invoice.status !== 'paid' && Number(invoice.balance) > 0;
   const canVoid = invoice.status !== 'void' && invoice.status !== 'draft';
+  // Same statuses the collection service accepts; a paid or void invoice has nothing to charge.
+  const autopayChargeable = ['sent', 'partially_paid', 'overdue'].includes(invoice.status) && Number(invoice.balance) > 0;
+  const autopayStateText = detail.autopay ? t(/* i18n-dynamic */ `autopay.states.${detail.autopay.state}`, { defaultValue: detail.autopay.state }) : '';
+  const autopayReasonText = detail.autopay?.reason ? t(/* i18n-dynamic */ autopayReasonKey(detail.autopay.reason), {nsSeparator:false}) : '';
 
   // Deposit-aware charge amount — matches what the server's pay route charges
   // (computeChargeNow, the single source of truth), so the deposit strip never
@@ -178,6 +275,11 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
     amountPaid: invoice.amountPaid,
     balance: invoice.balance,
   }, invoice.currencyCode);
+  // Lead the sidebar with the deposit while one is still owed (#8786). A draft
+  // isn't payable yet and a void invoice owes nothing, so neither has a deposit
+  // "due now"; a zero charge (balance already cleared) has nothing to lead with.
+  const leadWithDeposit =
+    chargeNow.isDeposit && invoice.status !== 'void' && invoice.status !== 'draft' && Number(chargeNow.amount) > 0;
 
   // The due date is editable once the invoice is live (issued/partially paid/overdue);
   // the /due-date route is gated on invoices:write.
@@ -210,24 +312,40 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
     }
   }, [busy, dueDateDraft, invoice.id, refresh, t]);
 
+  // Client-side mirror of the server's OVERPAYMENT check (kept server-side too):
+  // compare in whole cents so 0.1 + 0.2 style float noise can't misfire.
+  const payOverBalance = payAmount !== '' && Math.round(Number(payAmount) * 100) > Math.round(Number(invoice.balance) * 100);
+
   const recordPayment = useCallback(async () => {
-    if (busy || !payAmount) return;
+    if (busy || !payAmount || payOverBalance) return;
     setBusy(true);
+    const payment = {
+      amount: Number(payAmount),
+      method: payMethod,
+      reference: payRef || undefined,
+      receivedAt: payDate,
+    };
+    // #3803: one idempotency key per intended payment. A re-click after a
+    // failure whose outcome is unknown (a timeout that actually landed) resends
+    // the same key, so the server answers with the payment it already has. A
+    // changed form is a different payment and gets a new key; so does the next
+    // payment after a success.
+    const fingerprint = JSON.stringify([invoice.id, payment.amount, payment.method, payment.reference ?? null, payment.receivedAt]);
+    if (paymentAttemptRef.current?.fingerprint !== fingerprint) {
+      paymentAttemptRef.current = { fingerprint, key: crypto.randomUUID() };
+    }
+    const idempotencyKey = paymentAttemptRef.current.key;
     try {
       await runAction({
         request: () => fetchWithAuth(`/invoices/${invoice.id}/payments`, {
           method: 'POST',
-          body: JSON.stringify({
-            amount: Number(payAmount),
-            method: payMethod,
-            reference: payRef || undefined,
-            receivedAt: payDate,
-          }),
+          body: JSON.stringify({ ...payment, idempotencyKey }),
         }),
         errorFallback: t('invoiceDetail.payments.recordError'),
         successMessage: t('invoiceDetail.payments.recordSuccess'),
         onUnauthorized: UNAUTHORIZED,
       });
+      paymentAttemptRef.current = null;
       setPayAmount(''); setPayRef('');
       refresh();
     } catch (err) {
@@ -235,19 +353,28 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
     } finally {
       setBusy(false);
     }
-  }, [busy, payAmount, payMethod, payRef, payDate, invoice.id, refresh, t]);
+  }, [busy, payAmount, payOverBalance, payMethod, payRef, payDate, invoice.id, refresh, t]);
 
   const voidPayment = useCallback(async (paymentId: string) => {
     if (busy) return;
     setBusy(true);
     try {
-      const result = await runAction<{ quickbooksRecordUntouched?: boolean }>({
+      const result = await runAction<{ providerRecordUntouched?: boolean }>({
         request: () => fetchWithAuth(`/invoices/${invoice.id}/payments/${paymentId}`, { method: 'DELETE' }),
         errorFallback: t('invoiceDetail.payments.reverseError'),
         onUnauthorized: UNAUTHORIZED,
       });
-      showToast(result.quickbooksRecordUntouched
-        ? { type: 'warning', message: t('invoiceDetail.payments.reverseInQuickbooksToo') }
+      // The payment being reversed names its own provider when it originated
+      // there (`p.source` is an accounting-provider id) — a more precise
+      // signal than the invoice-level `syncProviderName` for THIS specific
+      // payment, and available even when the invoice itself has no known
+      // active connection.
+      const reversalProviderName = reversePayment?.source && isAccountingProviderId(reversePayment.source)
+        ? ACCOUNTING_PROVIDER_NAMES[reversePayment.source]
+        : syncProviderName;
+      const untouched = result.providerRecordUntouched ?? false;
+      showToast(untouched
+        ? { type: 'warning', message: t('invoiceDetail.payments.reverseInProviderToo', { provider: reversalProviderName }) }
         : { type: 'success', message: t('invoiceDetail.payments.reverseSuccess') });
       setReversePayment(null);
       refresh();
@@ -256,7 +383,7 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
     } finally {
       setBusy(false);
     }
-  }, [busy, invoice.id, refresh, t]);
+  }, [busy, invoice.id, refresh, t, syncProviderName, reversePayment]);
 
   // Revoke every issued public view-and-pay link; the next send/copy dispenses
   // a fresh url. Rare action — for a link forwarded to the wrong hands.
@@ -379,75 +506,82 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
               )}
             </div>
           ) : (
-          <div className="rounded-lg border bg-card shadow-xs">
-            {/* #3205 W07: invoice-level provenance, rendered once. */}
-            {invoice.evidenceVersion === null && (
+          <LineItemsTable<InvoiceLine>
+            header={invoice.evidenceVersion === null ? (
+              // #3205 W07: invoice-level provenance, rendered once.
               <p className="mb-2 px-3 pt-2 text-xs text-muted-foreground" data-testid="invoice-devices-not-recorded">
                 {t('invoiceDetail.devices.notRecorded')}
               </p>
-            )}
-            {/* Labeled, keyboard-reachable scroll region: the internal view runs
-                to 7 columns, well past a phone viewport — scroll inside the card
-                instead of bleeding past its rounded edge (QuoteDetail pattern). */}
-            <div className="overflow-x-auto" role="region" aria-label={t('invoiceDetail.linesScrollAria')} tabIndex={0}>
-            <table className="w-full min-w-[32rem] text-sm" data-testid="invoice-detail-lines">
-              <thead>
-                <tr className="border-b text-left text-xs uppercase tracking-wide text-muted-foreground">
-                  <th className="px-3 py-2 font-medium">{t('invoiceDetail.lines.description')}</th>
-                  <th className="px-3 py-2 text-right font-medium">{t('invoiceDetail.lines.qty')}</th>
-                  <th className="px-3 py-2 text-right font-medium">{t('invoiceDetail.lines.price')}</th>
-                  {internalView && <th className="px-3 py-2 text-right font-medium">{t('invoiceDetail.lines.cost')}</th>}
-                  {internalView && <th className="px-3 py-2 text-right font-medium">{t('invoiceDetail.lines.margin')}</th>}
-                  {showTax && <th className="px-3 py-2 text-right font-medium">{t('invoiceDetail.lines.tax')}</th>}
-                  <th className="px-3 py-2 text-right font-medium">{t('invoiceDetail.lines.total')}</th>
-                </tr>
-              </thead>
-              <tbody>
-                {visibleLines.length === 0 ? (
-                  // Lines exist but every one is internal-only and the internal
-                  // view is off — say so instead of rendering a bare header.
-                  <tr>
-                    <td colSpan={4 + (showTax ? 1 : 0)} className="px-3 py-6 text-center text-sm text-muted-foreground" data-testid="invoice-detail-all-hidden">
-                      {t('invoiceDetail.lines.allHidden')}
-                    </td>
-                  </tr>
-                ) : (
-                visibleLines.map((l) => {
-                  const tax = showTax ? lineTaxAmount(l.lineTotal, l.taxable, invoice.taxRate) : null;
-                  const workedVsBilledNote = lineWorkedVsBilledNote(l, t);
-                  return (
-                  <tr
-                    key={l.id}
-                    data-testid={`invoice-detail-line-${l.id}`}
-                    className={`border-t ${l.parentLineId ? 'bg-muted/20 text-xs text-muted-foreground' : ''}`}
-                  >
-                    <td className={`px-3 py-2 ${l.parentLineId ? 'pl-8' : ''}`}>
-                      <span className={l.parentLineId ? '' : 'font-medium text-foreground'}>
-                        {l.parentLineId ? <span aria-hidden="true">↳ </span> : ''}{lineTitle(l)}
+            ) : undefined}
+            rows={visibleLines}
+            keyFor={(l) => l.id}
+            rowTestId={(l) => `invoice-detail-line-${l.id}`}
+            tableTestId="invoice-detail-lines"
+            scrollAriaLabel={t('invoiceDetail.linesScrollAria')}
+            descriptionHeader={t('invoiceDetail.lines.description')}
+            // Lines exist but every one is internal-only and the internal view
+            // is off — say so instead of rendering a bare header.
+            emptyMessage={t('invoiceDetail.lines.allHidden')}
+            emptyTestId="invoice-detail-all-hidden"
+            rowClassName={(l) => (l.parentLineId ? 'bg-muted/20 text-xs text-muted-foreground' : '')}
+            descriptionCellClassName={(l) => (l.parentLineId ? 'pl-8' : '')}
+            renderDescription={(l) => {
+              const desc = lineDescriptionProps(l, {
+                workedVsBilled: (worked, billed) => t('tickets:ticketTimeBilling.billedVsWorked', { worked, billed }),
+              });
+              return (
+                <>
+                  {/* sweep F9: Preview/PDF/portal already show the frozen
+                      `ticketLabel` (#6940) via this same `ticketNumber`
+                      API field — the default view was the one surface
+                      still silent about it. */}
+                  {l.ticketNumber && (
+                    <div className="mb-1 text-xs">
+                      <span
+                        data-testid={`invoice-detail-line-ticket-${l.id}`}
+                        className="inline-flex items-center rounded bg-primary/10 px-1.5 py-0.5 font-medium text-primary"
+                      >
+                        {t('invoiceDocument.ticketHeader', { number: l.ticketNumber })}
                       </span>
-                      {internalView && !l.customerVisible ? t('invoiceDetail.lines.hiddenMarker') : ''}
-                      {lineBlurb(l) && <div className="text-xs text-muted-foreground">{lineBlurb(l)}</div>}
-                      {workedVsBilledNote && (
-                        <div className="text-xs text-muted-foreground" data-testid={`invoice-detail-line-worked-vs-billed-${l.id}`}>
-                          {workedVsBilledNote}
-                        </div>
-                      )}
-                      <InvoiceLineDevices invoiceId={invoice.id} line={l} />
-                    </td>
-                    <td className="px-3 py-2 text-right">{l.quantity}</td>
-                    <td className="px-3 py-2 text-right">{formatMoney(l.unitPrice, currency)}</td>
-                    {internalView && <td className="px-3 py-2 text-right">{l.costBasis == null ? '—' : formatMoney(l.costBasis, currency)}</td>}
-                    {internalView && <td className="px-3 py-2 text-right">{lineMargin(l)}</td>}
-                    {showTax && <td className="px-3 py-2 text-right text-muted-foreground">{tax === null ? '—' : formatMoney(tax, currency)}</td>}
-                    <td className="px-3 py-2 text-right">{formatMoney(l.lineTotal, currency)}</td>
-                  </tr>
-                  );
-                })
-                )}
-              </tbody>
-            </table>
-            </div>
-          </div>
+                    </div>
+                  )}
+                  {/* The shared description cell (#9414 W5). The host owns the child arrow
+                      and the hidden marker (title prefix/suffix); the wrapper
+                      gives the title its weight and the muted rows go back to normal. */}
+                  <div className={l.parentLineId ? '' : 'font-medium text-foreground [&>*]:font-normal'}>
+                    <DocumentLineDescription
+                      {...desc}
+                      titlePrefix={l.parentLineId ? '↳ ' : undefined}
+                      titleSuffix={internalView && !l.customerVisible ? t('invoiceDetail.lines.hiddenMarker') : undefined}
+                      rowKey={l.id}
+                    />
+                  </div>
+                  <InvoiceLineDevices invoiceId={invoice.id} line={l} />
+                </>
+              );
+            }}
+            columns={[
+              { key: 'qty', header: t('invoiceDetail.lines.qty'), align: 'right' as const, cell: (l: InvoiceLine) => l.quantity },
+              { key: 'price', header: t('invoiceDetail.lines.price'), align: 'right' as const, cell: (l: InvoiceLine) => formatMoney(l.unitPrice, currency) },
+              ...(internalView ? [
+                { key: 'cost', header: t('invoiceDetail.lines.cost'), align: 'right' as const, cell: (l: InvoiceLine) => (l.costBasis == null ? '—' : formatMoney(l.costBasis, currency)) },
+                { key: 'margin', header: t('invoiceDetail.lines.margin'), align: 'right' as const, cell: (l: InvoiceLine) => lineMargin(l) },
+              ] : []),
+              ...(showTax ? [
+                {
+                  key: 'tax',
+                  header: t('invoiceDetail.lines.tax'),
+                  align: 'right' as const,
+                  cellClassName: 'text-muted-foreground',
+                  cell: (l: InvoiceLine) => {
+                    const tax = lineTaxAmount(l.lineTotal, l.taxable, invoice.taxRate);
+                    return tax === null ? '—' : formatMoney(tax, currency);
+                  },
+                },
+              ] : []),
+              { key: 'total', header: t('invoiceDetail.lines.total'), align: 'right' as const, cell: (l: InvoiceLine) => formatMoney(l.lineTotal, currency) },
+            ]}
+          />
           )}
         </div>
 
@@ -456,6 +590,22 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
             surrounding from/terms/payments cards are flatter (border only) so the
             rail isn't a stack of equal-weight boxes (mirrors QuoteDetail). */}
         <div className="space-y-4">
+          {detail.autopay && <section className="space-y-2 rounded-lg border bg-card p-4" data-testid="autopay-invoice-panel" aria-label={t('autopay.title')} aria-busy={autopaySaving}>
+            <h3 className="font-semibold">{t('autopay.title')}</h3>
+            <p className="text-sm">{autopayStateText}</p>
+            {/* FP-18 (P-16): never repeat the state line (excluded: "Excluded by provider" once). */}
+            {autopayReasonText && autopayReasonText !== autopayStateText && <p className="text-sm text-muted-foreground">{autopayReasonText}</p>}
+            {detail.autopay.collectOn && <p className="text-sm">{t('autopay.chargeDate', { date: formatDate(detail.autopay.collectOn) })}</p>}
+            <label className="flex items-start gap-2 text-sm"><input type="checkbox" className="mt-1" data-testid="autopay-invoice-excluded"
+              checked={detail.autopay.excluded} disabled={autopaySaving || !can('invoices', 'write') || !detail.autopay.canExclude}
+              onChange={event => void setAutopayExcluded(event.target.checked)} />{t('autopay.excludeInvoice')}</label>
+            {autopayChargeable && <button type="button" data-testid="autopay-charge-now" className="rounded-md border px-3 py-2 text-sm disabled:opacity-50"
+              disabled={chargePending || !can('invoices', 'write') || !detail.autopay.canChargeNow || !detail.autopay.chargePreview}
+              onClick={() => setChargeConfirmOpen(true)}>{t('autopay.chargeNow')}</button>}
+            {autopayChargeable && !detail.autopay.canChargeNow && chargeBlockedKey(detail.autopay.chargeBlockedReason) && (
+              <p className="text-xs text-muted-foreground" data-testid="autopay-charge-blocked">
+                {t(/* i18n-dynamic */ chargeBlockedKey(detail.autopay.chargeBlockedReason)!, {nsSeparator:false})}</p>)}
+          </section>}
           <div className="rounded-lg border bg-card p-4 shadow-xs" data-testid="invoice-detail-summary">
             <div className="mb-3 flex items-center justify-between">
               <StatusPill
@@ -515,13 +665,38 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
             </dl>
             {/* Balance-due focal number */}
             <div className="mt-3 flex min-w-0 items-end justify-between gap-2 border-t pt-3">
-              <span className="shrink-0 text-xs font-medium uppercase tracking-wide text-muted-foreground">{t('invoiceDetail.summary.balanceDue')}</span>
-              <span
-                className={`break-words text-2xl font-semibold tabular-nums ${Number(invoice.balance) > 0 && invoice.status !== 'void' ? '' : 'text-muted-foreground'}`}
-                data-testid="invoice-detail-balance"
-              >
-                {formatMoney(invoice.balance, currency)}
-              </span>
+              {invoice.status === 'void' ? (
+                // A void invoice owes nothing — show the state, not a stale balance.
+                <span className="text-2xl font-semibold uppercase tracking-wide text-muted-foreground" data-testid="invoice-detail-void-state">
+                  {invoiceStatusLabel}
+                </span>
+              ) : leadWithDeposit ? (
+                // Unpaid deposit: lead with what the customer's Pay button charges
+                // (#8786) so an operator recording an offline deposit payment sees
+                // it first; the full balance stays visible as the secondary line.
+                <div className="min-w-0 flex-1">
+                  <div className="flex min-w-0 items-end justify-between gap-2">
+                    <span className="shrink-0 text-xs font-medium uppercase tracking-wide text-muted-foreground" data-testid="invoice-detail-headline-label">{t('invoiceDetail.summary.depositDueNow')}</span>
+                    <span className="break-words text-2xl font-semibold tabular-nums" data-testid="invoice-detail-deposit-due-now">
+                      {formatMoney(chargeNow.amount, currency)}
+                    </span>
+                  </div>
+                  <div className="mt-1 flex min-w-0 justify-between gap-2 text-sm text-muted-foreground">
+                    <span className="shrink-0">{t('invoiceDetail.summary.balanceDue')}</span>
+                    <span className="break-words tabular-nums" data-testid="invoice-detail-balance">{formatMoney(invoice.balance, currency)}</span>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  <span className="shrink-0 text-xs font-medium uppercase tracking-wide text-muted-foreground" data-testid="invoice-detail-headline-label">{t('invoiceDetail.summary.balanceDue')}</span>
+                  <span
+                    className={`break-words text-2xl font-semibold tabular-nums ${Number(invoice.balance) > 0 ? '' : 'text-muted-foreground'}`}
+                    data-testid="invoice-detail-balance"
+                  >
+                    {formatMoney(invoice.balance, currency)}
+                  </span>
+                </>
+              )}
             </div>
             {/* Deposit strip — mirrors the customer portal so the operator sees the
                 same deposit-first framing the customer's Pay button uses. */}
@@ -566,16 +741,17 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
             </div>
           )}
 
-          {/* QuickBooks push status (Phase C). Renders only when the API
-              returned a mapping row — no connection, or an org-scoped read that
-              RLS-hides the partner-axis row, both come back null and the card
-              stays off the rail rather than implying "not synced". */}
+          {/* Accounting push status (Phase C). Always mounted: with no mapping
+              row it renders nothing, but its post-Issue watch still polls until
+              the auto-push lands the row. `provider` null (no push-capable
+              connection known to this caller) hides only the push action. */}
           <AccountingSyncCard
+            provider={syncProvider}
             invoiceId={invoice.id}
             sync={detail.accountingSync}
             invoiceStatus={invoice.status}
             invoiceTouchedAt={invoice.updatedAt}
-            canPush={can('invoices', 'write')}
+            canPush={canPushInvoices}
             onChanged={onChanged}
           />
 
@@ -653,12 +829,12 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
                           {t('invoiceDetail.payments.online')}
                         </span>
                       )}
-                      {p.source === 'quickbooks' && (
+                      {p.source && isAccountingProviderId(p.source) && (
                         <span
                           className="rounded border border-border bg-muted px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground"
-                          data-testid={`invoice-payment-quickbooks-${p.id}`}
+                          data-testid={`invoice-payment-${p.source}-${p.id}`}
                         >
-                          {t('invoiceDetail.payments.quickbooks')}
+                          {ACCOUNTING_PROVIDER_NAMES[p.source]}
                         </span>
                       )}
                       {p.accountingSync && (
@@ -672,10 +848,10 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
                           title={p.accountingSync.lastError ?? undefined}
                         >
                           {p.accountingSync.status === 'error'
-                            ? t('invoiceDetail.payments.quickbooksSyncFailed')
+                            ? t('invoiceDetail.payments.providerSyncFailed', { provider: paymentBadgeProvider(p) })
                             : p.accountingSync.status === 'pending'
-                              ? t('invoiceDetail.payments.syncingToQuickbooks')
-                              : t('invoiceDetail.payments.inQuickbooks')}
+                              ? t('invoiceDetail.payments.syncingToProvider', { provider: paymentBadgeProvider(p) })
+                              : t('invoiceDetail.payments.inProvider', { provider: paymentBadgeProvider(p) })}
                         </span>
                       )}
                     </span>
@@ -730,6 +906,26 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
 
             {canRecordPayment && can('invoices', 'send') && (
               <div className="mt-3 space-y-2 border-t pt-3" data-testid="invoice-payment-form">
+                {/* One-click amount fills (#8786). The deposit figure is computeChargeNow's,
+                    so it matches what the customer's Pay button would charge. */}
+                <div className="flex flex-wrap gap-2" role="group" aria-label={t('invoiceDetail.payments.fillLabel')}>
+                  {leadWithDeposit && (
+                    <button
+                      type="button" onClick={() => setPayAmount(chargeNow.amount)}
+                      data-testid="invoice-payment-fill-deposit"
+                      className="rounded-full border px-3 py-1 text-xs font-medium hover:bg-muted"
+                    >
+                      {t('invoiceDetail.payments.fillDeposit', { amount: formatMoney(chargeNow.amount, currency) })}
+                    </button>
+                  )}
+                  <button
+                    type="button" onClick={() => setPayAmount(invoice.balance)}
+                    data-testid="invoice-payment-fill-balance"
+                    className="rounded-full border px-3 py-1 text-xs font-medium hover:bg-muted"
+                  >
+                    {t('invoiceDetail.payments.fillBalance', { amount: formatMoney(invoice.balance, currency) })}
+                  </button>
+                </div>
                 <div className="grid grid-cols-2 gap-2">
                   <input
                     type="number" min="0" step="0.01" placeholder={t('invoiceDetail.payments.amount')} value={payAmount}
@@ -762,8 +958,13 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
                     className="h-9 rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
                   />
                 </div>
+                {payOverBalance && (
+                  <p role="alert" className="text-xs text-destructive" data-testid="invoice-payment-overpayment">
+                    {t('invoiceDetail.payments.overpayment', { balance: formatMoney(invoice.balance, currency) })}
+                  </p>
+                )}
                 <button
-                  type="button" onClick={() => setPayConfirmOpen(true)} disabled={busy || !payAmount}
+                  type="button" onClick={() => setPayConfirmOpen(true)} disabled={busy || !payAmount || payOverBalance}
                   title={!payAmount ? t('invoiceDetail.payments.amountRequired') : undefined}
                   aria-describedby={!payAmount ? 'invoice-payment-submit-hint' : undefined}
                   data-testid="invoice-payment-submit"
@@ -779,6 +980,24 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
           </div>
         </div>
       </div>
+
+      <ConfirmDialog
+        open={chargeConfirmOpen}
+        onClose={() => { if (!chargePending) setChargeConfirmOpen(false); }}
+        onConfirm={() => void startAutopayCharge()}
+        title={t('autopay.chargeConfirmTitle')}
+        message={t('autopay.chargeConfirmMessage', {
+          amount: detail.autopay?.chargePreview ? formatMoney(detail.autopay.chargePreview.amount, detail.autopay.chargePreview.currency) : '',
+          invoice: invoice.invoiceNumber ?? invoice.id,
+          method: detail.autopay?.chargePreview?.methodLabel ?? '',
+        })}
+        confirmLabel={t('autopay.chargeNow')}
+        variant="warning"
+        isLoading={chargePending}
+        confirmDisabled={!detail.autopay?.canChargeNow || !detail.autopay.chargePreview || !can('invoices', 'write')}
+        confirmTestId="autopay-charge-confirm"
+        dialogTestId="autopay-charge-dialog"
+      >{chargeStepUp.prompt}</ConfirmDialog>
 
       {/* Reverse-a-payment confirm dialog */}
       <ConfirmDialog

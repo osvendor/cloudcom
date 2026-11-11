@@ -16,18 +16,19 @@
  * tool's `{ error }` JSON shape, mirroring `routes/monitorDefinitions.ts`'s
  * `errorResponse` helper.
  *
- * Attach/detach duplicate the (route-local, unexported) `currentItems` /
- * attachment logic from `routes/monitorDefinitions.ts` because that logic is
- * not behind a shared service function. Keep the two in sync by hand until a
- * follow-up extracts a shared helper.
+ * Attach/detach read and rewrite the monitors link through
+ * `monitors/monitorAttachments.ts`, the same helper the REST route uses.
  */
+import { pageEnvelope, pageParamSchema, readPageArgs } from './aiToolPagination';
 import { and, eq, inArray, sql } from 'drizzle-orm';
 import { db } from '../db';
 import { configPolicyMonitors, configPolicyFeatureLinks, configurationPolicies } from '../db/schema';
 import type { AuthContext } from '../middleware/auth';
 import type { AiTool } from './aiTools';
 import { isMonitorAttachableToPolicy } from './monitors/monitorAttachability';
+import { monitorsLinkSettings, readMonitorsLink, shouldRemoveEmptiedLink } from './monitors/monitorAttachments';
 import { canManagePartnerWidePolicies, PARTNER_WIDE_WRITE_DENIED_MESSAGE } from './partnerWideAccess';
+import { canMutateOrgWideGovernance, SITE_CEILING_WRITE_DENIED_MESSAGE } from './siteCeilingAccess';
 import { pgErrorCode, pgErrorConstraint } from '../utils/pgErrors';
 import { toolErrorResult } from './aiToolErrors';
 import { describeFirstZodIssue } from '../lib/zodIssues';
@@ -41,7 +42,7 @@ import {
   createMonitorDefinition,
   deleteMonitorDefinition,
   getMonitorDefinition,
-  listMonitorDefinitions,
+  listMonitorDefinitionsPage,
   MonitorNotFoundError,
   MonitorOwnershipError,
   MonitorValidationError,
@@ -50,12 +51,127 @@ import {
 import { listMonitorDeviceActivity, listMonitorEpisodes } from './monitors/episodeQueries';
 import { resetMonitorEscalation } from './monitors/episodeReset';
 import { writeAuditEvent, requestLikeFromSnapshot } from './auditEvents';
+import { auditPartnerScopeId } from './auditReadScope';
 import {
   createMonitorDefinitionSchema,
   updateMonitorDefinitionSchema,
+  APPLICATION_INFO_EVENT_PROVIDERS,
   MONITOR_KINDS,
+  monitorConditionSchemas,
   type MonitorKind,
 } from '@breeze/shared';
+import { z } from 'zod';
+import { policyAwareMonitorEventLogWarnings } from './monitorEventLogWarnings';
+import { presentEndpointTarget } from '../utils/endpointDisplay';
+import { definitionReplacesCondition, resolveMonitorDefinitionInput } from './aiToolsMonitorEndpointInput';
+
+/**
+ * A network_check target may be a URL carrying credentials (userinfo, a
+ * `?token=` query, an authorizing path). Tool results show it as scheme + host
+ * plus a fingerprint, the same presentation webhook endpoints use.
+ */
+function presentNetworkCheckTarget(kind: unknown, value: unknown): unknown {
+  if (kind !== 'network_check' || !value || typeof value !== 'object' || Array.isArray(value)) return value;
+  const record = value as Record<string, unknown>;
+  if (typeof record.target !== 'string') return value;
+  const view = presentEndpointTarget(record.target);
+  return { ...record, target: view.target, targetFingerprint: view.fingerprint };
+}
+
+function presentMonitorDefinition<T extends { kind?: unknown; condition?: unknown }>(monitor: T): T {
+  return { ...monitor, condition: presentNetworkCheckTarget(monitor.kind, monitor.condition) };
+}
+
+function isMonitorKind(value: unknown): value is MonitorKind {
+  return typeof value === 'string' && (MONITOR_KINDS as readonly string[]).includes(value);
+}
+
+/**
+ * #7826 — the condition shape for a kind, derived from the SAME zod registry
+ * `createMonitorDefinitionSchema` validates with (no hand-written copy to
+ * drift). `io: 'input'` so defaulted fields read as optional.
+ */
+function describeMonitorKind(kind: MonitorKind): Record<string, unknown> {
+  const { $schema: _dropped, ...condition } = z.toJSONSchema(monitorConditionSchemas[kind], {
+    io: 'input',
+    unrepresentable: 'any',
+  }) as Record<string, unknown>;
+  return { kind, condition };
+}
+
+/**
+ * What the Windows agent collects per event_log category (#7060, ported from
+ * the retired alert_rule reference, #6669; Application info/warning provider
+ * allowlist #8174). Shown by `describe`; the app-presence hint below is also
+ * appended to rejected event_log level/type errors.
+ */
+const EVENT_LOG_COLLECTION_GUIDANCE =
+  'What the Windows agent collects for event_log: application = Application log error/critical from every provider, ' +
+  `plus warning/information from ${APPLICATION_INFO_EVENT_PROVIDERS.join(', ')} and providers listed in the winning Event Logs configuration policy; ` +
+  'system = System log error/critical from providers other than the hardware ones, plus unexpected-shutdown events; ' +
+  'hardware = System log error/critical from disk, NTFS, volume/storage-controller, WHEA machine-check and thermal providers; ' +
+  'security = Security log warning and above.';
+
+const EVENT_LOG_APP_PRESENCE_HINT =
+  'Valid event_log levels are info, warning, error and critical ("information" is not a level). ' +
+  `Information and Warning Application events are collected from ${APPLICATION_INFO_EVENT_PROVIDERS.join(', ')} plus providers added under Configuration policy → Event Logs → Application providers. Other providers are collected only at Error/Critical. ` +
+  'To detect a missing or removed app, prefer a configuration policy compliance rule with featureType "compliance" and { type: "required_software", softwareName }';
+
+const EVENT_LOG_LEVELS: readonly string[] = ['info', 'warning', 'error', 'critical'];
+
+/**
+ * True when an event_log condition carries the shape the model gets wrong when
+ * it is trying to detect app presence: a `type` key (copied from the retired
+ * alert_rule shape) or a `level` outside info|warning|error|critical.
+ * Judged from the input itself because the zod message for a rejected
+ * condition is only "condition does not match kind", with no field detail.
+ */
+function isRejectedEventLogCondition(condition: unknown): boolean {
+  if (!condition || typeof condition !== 'object' || Array.isArray(condition)) return false;
+  const c = condition as { type?: unknown; level?: unknown };
+  return c.type !== undefined || (c.level !== undefined && !EVENT_LOG_LEVELS.includes(String(c.level)));
+}
+
+function involvesBadEventLog(definition: unknown): boolean {
+  const def = definition as { kind?: unknown; condition?: unknown } | null | undefined;
+  if (def?.kind === 'event_log') return isRejectedEventLogCondition(def.condition);
+  if (def?.kind !== 'composite') return false;
+  const children = (def.condition as { children?: unknown } | null | undefined)?.children;
+  return (
+    Array.isArray(children) &&
+    children.some((c) => {
+      const child = c as { kind?: unknown; condition?: unknown } | null;
+      return child?.kind === 'event_log' && isRejectedEventLogCondition(child.condition);
+    })
+  );
+}
+
+/**
+ * Append the app-presence hint when an event_log level/type was rejected. The
+ * hint keys off input shape, not zod's first issue; that is safe because the
+ * event_log schema is strict, so a `type` key or bad level is itself a rejection.
+ */
+function withEventLogHint(definition: unknown, message: string): string {
+  return involvesBadEventLog(definition) ? `${message}. ${EVENT_LOG_APP_PRESENCE_HINT}` : message;
+}
+
+const KIND_LIST_HINT = `Valid kinds: ${MONITOR_KINDS.join(', ')}.`;
+
+/**
+ * Validation error for create/update that tells the model how to recover: an
+ * unknown kind lists the valid kinds; a known kind with a bad condition points
+ * at `describe` for that kind's shape.
+ */
+function definitionErrorMessage(definition: unknown, issue: string | null | undefined, isCreate: boolean): string {
+  const base = withEventLogHint(definition, issue ?? 'Invalid monitor definition');
+  const kind = (definition as { kind?: unknown } | null | undefined)?.kind;
+  if (kind !== undefined && !isMonitorKind(kind)) {
+    return `${base}. ${KIND_LIST_HINT} Use action "describe" (with kind) for each condition shape.`;
+  }
+  if (isMonitorKind(kind)) return `${base}. Use action "describe" with kind "${kind}" for its condition shape.`;
+  // Partial updates normally carry no kind; the kind list would be noise there.
+  return isCreate ? `${base}. ${KIND_LIST_HINT} Use action "describe" for condition shapes.` : base;
+}
 
 type Handler = (input: Record<string, unknown>, auth: AuthContext) => Promise<string>;
 
@@ -100,6 +216,9 @@ function auditMonitorToolEvent(
   try {
     writeAuditEvent(requestLikeFromSnapshot({}), {
       orgId: entry.orgId,
+      // The snapshot shim carries no auth, so attribute explicitly — same rule
+      // as the HTTP route (partner-scope callers only, #7696).
+      partnerId: auditPartnerScopeId(auth),
       actorId: auth.user.id,
       actorEmail: auth.user.email,
       action: entry.action,
@@ -145,51 +264,6 @@ async function attachmentsFor(monitorId: string) {
     .where(eq(configPolicyMonitors.monitorId, monitorId));
 }
 
-interface AttachmentItem {
-  monitorId: string;
-  enabled: boolean;
-  overrides: Record<string, unknown> | null;
-  sortOrder: number;
-}
-
-/** Mirrors `routes/monitorDefinitions.ts`'s local `currentItems` — see header note. */
-async function currentAttachmentItems(
-  configPolicyId: string,
-): Promise<{ linkId: string | null; items: AttachmentItem[] }> {
-  const [link] = await db
-    .select({ id: configPolicyFeatureLinks.id })
-    .from(configPolicyFeatureLinks)
-    .where(
-      and(
-        eq(configPolicyFeatureLinks.configPolicyId, configPolicyId),
-        eq(configPolicyFeatureLinks.featureType, 'monitors'),
-      ),
-    )
-    .limit(1);
-  if (!link) return { linkId: null, items: [] };
-
-  const rows = await db
-    .select({
-      monitorId: configPolicyMonitors.monitorId,
-      enabled: configPolicyMonitors.enabled,
-      overrides: configPolicyMonitors.overrides,
-      sortOrder: configPolicyMonitors.sortOrder,
-    })
-    .from(configPolicyMonitors)
-    .where(eq(configPolicyMonitors.featureLinkId, link.id))
-    .orderBy(configPolicyMonitors.sortOrder);
-
-  return {
-    linkId: link.id,
-    items: rows.map((r) => ({
-      monitorId: r.monitorId,
-      enabled: r.enabled,
-      overrides: (r.overrides as Record<string, unknown> | null) ?? null,
-      sortOrder: r.sortOrder,
-    })),
-  };
-}
-
 export function registerMonitorTools(aiTools: Map<string, AiTool>): void {
   function registerTool(tool: AiTool): void {
     aiTools.set(tool.definition.name, tool);
@@ -211,7 +285,7 @@ export function registerMonitorTools(aiTools: Map<string, AiTool>): void {
         properties: {
           kind: { type: 'string', enum: [...MONITOR_KINDS], description: 'Filter by monitor kind' },
           enabled: { type: 'boolean', description: 'Filter by enabled state' },
-          limit: { type: 'number', description: 'Max results (default 25, max 100)' },
+          ...pageParamSchema(25, 100),
         },
       },
     },
@@ -220,15 +294,22 @@ export function registerMonitorTools(aiTools: Map<string, AiTool>): void {
       if (typeof input.kind === 'string') filters.kind = input.kind as MonitorKind;
       if (typeof input.enabled === 'boolean') filters.enabled = input.enabled;
 
-      const rows = await listMonitorDefinitions(auth, filters);
-      if (rows.length === 0) return JSON.stringify({ monitors: [], total: 0, showing: 0 });
+      const pageArgs = readPageArgs('list_monitors', input, { defaultLimit: 25, maxLimit: 100 });
+      if (!pageArgs.ok) return JSON.stringify({ error: pageArgs.error, code: pageArgs.code });
+      const { limit, offset, fingerprint } = pageArgs;
 
-      const limit = Math.min(Math.max(1, Number(input.limit) || 25), 100);
-      const page = rows.slice(0, limit);
-      const counts = await attachmentCountsFor(page.map((r) => r.id));
+      // Page in SQL (#6735). The page and its total come from one statement
+      // (one snapshot), so `total`/`hasMore` describe exactly these rows.
+      const { rows: pageRows, total } = await listMonitorDefinitionsPage(auth, filters, { limit, offset });
+      if (pageRows.length === 0) {
+        return JSON.stringify(pageEnvelope({ key: 'monitors', items: [], limit, offset, fingerprint, total }));
+      }
 
-      return JSON.stringify({
-        monitors: page.map((r) => ({
+      const counts = await attachmentCountsFor(pageRows.map((r) => r.id));
+
+      return JSON.stringify(pageEnvelope({
+        key: 'monitors',
+        items: pageRows.map((r) => ({
           id: r.id,
           name: r.name,
           kind: r.kind,
@@ -237,9 +318,9 @@ export function registerMonitorTools(aiTools: Map<string, AiTool>): void {
           ownerScope: ownerScopeOf(r),
           attachmentCount: counts.get(r.id) ?? 0,
         })),
-        total: rows.length,
-        showing: page.length,
-      });
+        limit, offset, fingerprint,
+        total,
+      }));
     }),
   });
 
@@ -271,8 +352,8 @@ export function registerMonitorTools(aiTools: Map<string, AiTool>): void {
       const attachments = await attachmentsFor(monitor.id);
 
       return JSON.stringify({
-        monitor: { ...monitor, ownerScope: ownerScopeOf(monitor) },
-        attachments,
+        monitor: { ...presentMonitorDefinition(monitor), ownerScope: ownerScopeOf(monitor) },
+        attachments: attachments.map((a) => ({ ...a, overrides: presentNetworkCheckTarget(monitor.kind, a.overrides) })),
         compiled: {
           alertTemplateId: monitor.compiledAlertTemplateId,
           alertRuleId: monitor.compiledAlertRuleId,
@@ -386,14 +467,19 @@ export function registerMonitorTools(aiTools: Map<string, AiTool>): void {
     definition: {
       name: 'manage_monitor_definitions',
       description:
-        'Manage monitors; never edit compiled managed rows directly. Partner scope applies to every partner org and requires full partner org access; default is organization. Actions: create, update, delete, enable, disable, attach, detach.',
+        'Manage definitions, not compiled rows. Call describe (optional kind) FIRST for valid kinds and condition shapes. Default: org scope; partner scope needs full access. Actions: describe, create, update, delete, enable, disable, attach, detach. network_check = managed probe.',
       input_schema: {
         type: 'object' as const,
         properties: {
           action: {
             type: 'string',
-            enum: ['create', 'update', 'delete', 'enable', 'disable', 'attach', 'detach'],
+            enum: ['describe', 'create', 'update', 'delete', 'enable', 'disable', 'attach', 'detach'],
             description: 'The action to perform',
+          },
+          kind: {
+            type: 'string',
+            enum: [...MONITOR_KINDS],
+            description: 'Monitor kind (for describe: returns that kind\'s condition schema; omit to list kinds)',
           },
           monitorId: {
             type: 'string',
@@ -415,33 +501,90 @@ export function registerMonitorTools(aiTools: Map<string, AiTool>): void {
     handler: safeHandler('manage_monitor_definitions', async (input, auth) => {
       const action = input.action as string;
 
+      // Read-only discovery (#7826): no write capability needed, so it sits
+      // ahead of the site-ceiling gate that guards every mutating action.
+      if (action === 'describe') {
+        if (input.kind === undefined || input.kind === null) {
+          return JSON.stringify({ kinds: [...MONITOR_KINDS], hint: 'Call describe with kind for that kind\'s condition schema.' });
+        }
+        if (!isMonitorKind(input.kind)) {
+          return JSON.stringify({ error: `Unknown monitor kind. ${KIND_LIST_HINT}` });
+        }
+        const described = describeMonitorKind(input.kind);
+        return JSON.stringify(
+          input.kind === 'event_log'
+            ? { ...described, guidance: `${EVENT_LOG_COLLECTION_GUIDANCE} ${EVENT_LOG_APP_PRESENCE_HINT}.` }
+            : described,
+        );
+      }
+
+      // Site-ceiling gate up front, before any branch: a monitor's responses
+      // compile verbatim into a managed automation that runs as SYSTEM on
+      // every device an attaching org-wide policy reaches, so every action
+      // here (create, update, enable, disable, delete, attach, detach) takes
+      // the same capability as every other org-wide governance write. Chat
+      // reaches this handler (TOOL_TIERS tier 3, #6669), so this gate is live.
+      if (!canMutateOrgWideGovernance(auth)) {
+        return JSON.stringify({ error: SITE_CEILING_WRITE_DENIED_MESSAGE });
+      }
+
       if (action === 'create') {
-        const parsed = createMonitorDefinitionSchema.safeParse(input.definition ?? {});
+        // Nothing is stored yet, so a displayed endpoint or masked value is refused.
+        const resolvedInput = resolveMonitorDefinitionInput(input.definition ?? {}, null);
+        if (!resolvedInput.ok) return JSON.stringify({ error: resolvedInput.error });
+        const parsed = createMonitorDefinitionSchema.safeParse(resolvedInput.definition);
         if (!parsed.success) {
           return JSON.stringify({
-            error: describeFirstZodIssue(parsed.error) ?? 'Invalid monitor definition',
+            error: definitionErrorMessage(input.definition, describeFirstZodIssue(parsed.error), true),
           });
         }
         const created = await createMonitorDefinition(parsed.data, auth);
-        return JSON.stringify({ success: true, monitor: { ...created, ownerScope: ownerScopeOf(created) } });
+        const warnings = await policyAwareMonitorEventLogWarnings(created);
+        return JSON.stringify({
+          success: true,
+          monitor: { ...presentMonitorDefinition(created), ownerScope: ownerScopeOf(created) },
+          ...(warnings.length > 0 ? { warnings } : {}),
+        });
       }
 
       if (action === 'update' || action === 'enable' || action === 'disable') {
         if (!input.monitorId) return JSON.stringify({ error: 'monitorId is required' });
-        const patch: unknown =
+        let patch: unknown =
           action === 'enable'
             ? { enabled: true }
             : action === 'disable'
               ? { enabled: false }
               : (input.definition ?? {});
+        let keptStored: string[] = [];
+        if (action === 'update') {
+          // A condition copied from get_monitor carries the displayed target
+          // and masked header values; resolve them against the stored row.
+          let stored: Awaited<ReturnType<typeof getMonitorDefinition>> = null;
+          if (definitionReplacesCondition(patch)) {
+            stored = await getMonitorDefinition(input.monitorId as string, auth);
+            if (!stored) return JSON.stringify({ error: 'Monitor not found' });
+          }
+          const resolved = resolveMonitorDefinitionInput(patch, stored);
+          if (!resolved.ok) return JSON.stringify({ error: resolved.error });
+          patch = resolved.definition;
+          keptStored = resolved.keptStored;
+        }
         const parsed = updateMonitorDefinitionSchema.safeParse(patch);
         if (!parsed.success) {
           return JSON.stringify({
-            error: describeFirstZodIssue(parsed.error) ?? 'Invalid monitor definition',
+            error: definitionErrorMessage(patch, describeFirstZodIssue(parsed.error), false),
           });
         }
         const updated = await updateMonitorDefinition(input.monitorId as string, parsed.data, auth);
-        return JSON.stringify({ success: true, monitor: { ...updated, ownerScope: ownerScopeOf(updated) } });
+        const warnings = action === 'update' ? await policyAwareMonitorEventLogWarnings(updated) : [];
+        return JSON.stringify({
+          success: true,
+          monitor: { ...presentMonitorDefinition(updated), ownerScope: ownerScopeOf(updated) },
+          ...(warnings.length > 0 ? { warnings } : {}),
+          ...(keptStored.length > 0
+            ? { note: `${keptStored.join(' and ')} matched the displayed value, so the stored value was kept.` }
+            : {}),
+        });
       }
 
       if (action === 'delete') {
@@ -466,7 +609,7 @@ export function registerMonitorTools(aiTools: Map<string, AiTool>): void {
           return JSON.stringify({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE });
         }
 
-        const { linkId, items } = await currentAttachmentItems(input.configPolicyId as string);
+        const { linkId, items, inheritance } = await readMonitorsLink(input.configPolicyId as string);
         if (items.some((i) => i.monitorId === monitor.id)) {
           return JSON.stringify({ error: 'Monitor already attached to this policy' });
         }
@@ -492,7 +635,11 @@ export function registerMonitorTools(aiTools: Map<string, AiTool>): void {
 
         try {
           if (linkId) {
-            await updateFeatureLink(linkId, { inlineSettings: { items: nextItems } }, input.configPolicyId as string);
+            await updateFeatureLink(
+              linkId,
+              { inlineSettings: monitorsLinkSettings(nextItems, inheritance) },
+              input.configPolicyId as string,
+            );
           } else {
             await addFeatureLink(input.configPolicyId as string, 'monitors', null, { items: nextItems });
           }
@@ -545,14 +692,14 @@ export function registerMonitorTools(aiTools: Map<string, AiTool>): void {
           return JSON.stringify({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE });
         }
 
-        const { items } = await currentAttachmentItems(attachment.configPolicyId);
+        const { items, inheritance } = await readMonitorsLink(attachment.configPolicyId);
         const nextItems = items.filter((i) => i.monitorId !== monitor.id);
-        if (nextItems.length === 0) {
+        if (shouldRemoveEmptiedLink(nextItems, inheritance)) {
           await removeFeatureLink(attachment.featureLinkId, attachment.configPolicyId);
         } else {
           await updateFeatureLink(
             attachment.featureLinkId,
-            { inlineSettings: { items: nextItems } },
+            { inlineSettings: monitorsLinkSettings(nextItems, inheritance) },
             attachment.configPolicyId,
           );
         }

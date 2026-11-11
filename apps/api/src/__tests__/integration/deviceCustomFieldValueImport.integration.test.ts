@@ -215,9 +215,12 @@ describe('device custom-field VALUE import (real Postgres)', () => {
   runDb('RLS still refuses a write the app-layer scope wrongly admitted, and the row is isolated', async () => {
     // The app-layer scope below is DELIBERATELY wider than the request's RLS
     // context — the shape a caller bug would have. The resolver admits the
-    // orgA2 device, and Postgres refuses its INSERT anyway. That is the whole
-    // point of keeping the writes inside the request context instead of
-    // escaping to a system one.
+    // orgA2 device, and RLS refuses it anyway. Since #5199 the refusal lands one
+    // step earlier than it used to: `loadVisibleCustomFieldDefinitions` reads in
+    // the request context, where orgA2 (and therefore its partner-wide
+    // definitions) is invisible, so the value resolves no definition and is
+    // never written — rather than reaching the INSERT and failing there with
+    // `write-failed`. Either way RLS, not the app-layer scope, is what stops it.
     const world = await seedWorld();
     const first = await seedDevice({ orgId: world.orgA, siteId: world.siteA, hostname: 'row-a', serialNumber: 'sn-row-a' });
     const outside = await seedDevice({ orgId: world.orgA2, siteId: world.siteA2, hostname: 'row-b', serialNumber: 'sn-row-b' });
@@ -242,18 +245,20 @@ describe('device custom-field VALUE import (real Postgres)', () => {
       ),
     );
 
-    expect(summary.errors.map((e) => ({ index: e.index, code: e.code }))).toEqual([
-      { index: 1, code: 'write-failed' },
+    expect(summary.errors).toEqual([]);
+    // Row 1 is reported, with its one value failed and nothing applied; the rows
+    // either side of it still ran.
+    expect(summary.rows.map((r) => ({ index: r.index, applied: r.applied, failed: r.failed }))).toEqual([
+      { index: 0, applied: 1, failed: 0 },
+      { index: 1, applied: 0, failed: 1 },
+      { index: 2, applied: 1, failed: 0 },
     ]);
-    // The failing row rolled back to its own savepoint: the row BEFORE it is
-    // committed and the row AFTER it still ran.
-    expect(summary.rows.map((r) => r.index)).toEqual([0, 2]);
     expect((await storedValues(first))[0]).toMatchObject({ valueText: 'A' });
     expect(await storedValues(outside)).toHaveLength(0);
     expect((await storedValues(last))[0]).toMatchObject({ valueText: 'C' });
 
     // And no driver text escaped into the operator-facing copy.
-    expect(summary.errors[0]!.error).not.toMatch(/row-level security|policy|INSERT/i);
+    expect(JSON.stringify(summary)).not.toMatch(/row-level security|policy|INSERT/i);
   });
 
   runDb('applies the good values on a row and reports the rest, in one transaction', async () => {
@@ -607,5 +612,71 @@ describe('device custom-field VALUE import (real Postgres)', () => {
     expect(pinned.rows[0]).toMatchObject({ deviceId: two, applied: 1 });
     expect(await storedValues(one)).toHaveLength(0);
     expect((await storedValues(two))[0]).toMatchObject({ valueText: 'AB-1' });
+  });
+
+  runDb('an org-scoped caller sees the same linkCreated outcome whether or not a sibling org holds the identity', async () => {
+    // device_external_links_uniq keys on (partner_id, system,
+    // COALESCE(source_instance, ''), external_id) — the WHOLE partner, by
+    // design. A device in a SIBLING org (same partner, out of this caller's
+    // reach) already claimed 'shared-uid' via a prior import.
+    const world = await seedWorld();
+    const siblingTarget = await seedDevice({
+      orgId: world.orgA2, siteId: world.siteA2, hostname: 'claimed-sibling', serialNumber: 'sn-claimed-sibling',
+    });
+    await getTestDb().insert(deviceExternalLinks).values({
+      deviceId: siblingTarget,
+      orgId: world.orgA2,
+      partnerId: world.partnerA,
+      system: 'csv',
+      externalId: 'shared-uid',
+    });
+
+    const claimedDevice = await seedDevice({
+      orgId: world.orgA, siteId: world.siteA, hostname: 'org-a-claimed', serialNumber: 'sn-org-a-claimed',
+    });
+    const freeDevice = await seedDevice({
+      orgId: world.orgA, siteId: world.siteA, hostname: 'org-a-free', serialNumber: 'sn-org-a-free',
+    });
+
+    // Reach is ONE org of the partner — the shape an organization-scoped
+    // token actually carries.
+    const ctx: ValueImportContext = {
+      partnerId: world.partnerA,
+      accessibleOrgIds: [world.orgA],
+      allowedSiteIds: null,
+      mode: 'update',
+    };
+
+    const summary = await withDbAccessContext(partnerCtx(world.partnerA, [world.orgA]), () =>
+      commitDeviceCustomFieldImport(
+        [
+          // Guesses the identity a sibling org already holds — the DB insert
+          // conflicts and no-ops.
+          { hostname: 'org-a-claimed', externalSystem: 'csv', externalId: 'shared-uid', values: [] },
+          // Guesses an identity nobody holds — the DB insert actually lands.
+          { hostname: 'org-a-free', externalSystem: 'csv', externalId: 'unclaimed-uid', values: [] },
+        ] as CommitValueRowInput[],
+        ctx,
+        actor,
+      ),
+    );
+
+    expect(summary.errors).toEqual([]);
+    expect(summary.rows.map((r) => r.deviceId)).toEqual([claimedDevice, freeDevice]);
+    const [claimedRow, freeRow] = summary.rows;
+    // Both rows report the same linkCreated value, so the outcome says
+    // nothing about which externalIds a sibling org already holds.
+    expect(
+      claimedRow?.linkCreated,
+      'an org-scoped caller must see the SAME linkCreated outcome whether the identity was free or already claimed by a sibling org',
+    ).toBe(freeRow?.linkCreated);
+
+    // The conflicted row's write is still a real no-op: no link was minted
+    // under org A for an identity a sibling org already holds.
+    const claimedLinks = await getTestDb()
+      .select({ id: deviceExternalLinks.id })
+      .from(deviceExternalLinks)
+      .where(and(eq(deviceExternalLinks.deviceId, claimedDevice), eq(deviceExternalLinks.externalId, 'shared-uid')));
+    expect(claimedLinks).toHaveLength(0);
   });
 });

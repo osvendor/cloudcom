@@ -8,6 +8,11 @@
     "monitorLabel": "Moniteur"
   },
   "list": {
+    "views": {
+      "ariaLabel": "Vues des moniteurs",
+      "all": "Tous les moniteurs",
+      "needsConversion": "Conversion requise"
+    },
     "title": "Moniteurs",
     "description": "Surveillez une condition, réagissez sur l’appareil, notifiez et escaladez lorsqu’elle persiste.",
     "new": "Nouveau moniteur",
@@ -32,7 +37,48 @@
     },
     "deleteConfirm": "Supprimer le moniteur {{name}}? Sa règle d’alerte et son automatisation de réponse seront également supprimées.",
     "builtIn": "Intégré",
-    "builtInHint": "Fourni par Breeze. Modifiez les seuils, désactivez-le ou supprimez-le – il ne reviendra pas."
+    "builtInHint": "Fourni par Breeze. Modifiez les seuils, désactivez-le ou supprimez-le – il ne reviendra pas.",
+    "recommended": {
+      "title": "Recommandés",
+      "description": "Rattachez les moniteurs intégrés à une politique."
+    }
+  },
+  "lifecycle": {
+    "autoResolveOn": "Activé",
+    "autoResolveOff": "Désactivé",
+    "rearmLabel": "Réarmement",
+    "rearmNewEvidence": "Nouvelle preuve",
+    "rearmAfterDelay": "Après N minutes",
+    "rearmAfterMinutes_one": "Après {{count}} minute",
+    "rearmAfterMinutes_other": "Après {{count}} minutes",
+    "rearmDelayLabel": "Réarmer après (minutes)",
+    "rearmHelp": "Nouvelle preuve : seul un événement que l’alerte fermée n’a pas encore vu la rouvre. Après N minutes : des événements plus anciens peuvent aussi la rouvrir une fois que N minutes se sont écoulées depuis sa fermeture.",
+    "inheritOption": "Hériter ({{value}}, {{source}})",
+    "inheritOptionPlain": "Hériter",
+    "sources": {
+      "org": "Valeur par défaut de l’organisation",
+      "partner": "Valeur par défaut du partenaire",
+      "builtin": "Valeur par défaut intégrée"
+    },
+    "errors": {
+      "cooldown": "Saisissez un nombre entier de 0 à 1440.",
+      "cooldownOrInherit": "Saisissez un nombre entier de 0 à 1440 ou laissez le champ vide pour hériter de la valeur.",
+      "rearmDelay": "Saisissez un nombre entier de minutes de 1 à 1440."
+    }
+  },
+  "lifecycleDefaults": {
+    "title": "Valeurs par défaut du cycle de vie",
+    "descriptionPartner": "La valeur par défaut des moniteurs de toutes les organisations. Une organisation peut la remplacer, et le réglage propre à un moniteur l’emporte sur les deux.",
+    "descriptionOrg": "Remplace la valeur par défaut du partenaire pour cette organisation. Laissez un champ vide pour en hériter. Le réglage propre à un moniteur l’emporte sur cette valeur.",
+    "readOnly": "Vous n’avez pas l’autorisation de modifier la valeur par défaut du partenaire.",
+    "saved": "Valeurs par défaut du cycle de vie enregistrées",
+    "saveAction": "Enregistrer les valeurs par défaut",
+    "overrideCount_one": "{{count}} moniteur remplace cette valeur",
+    "overrideCount_other": "{{count}} moniteurs remplacent cette valeur",
+    "errors": {
+      "load": "Impossible de charger les valeurs par défaut du cycle de vie.",
+      "save": "Impossible d’enregistrer les valeurs par défaut du cycle de vie."
+    }
   },
   "editor": {
     "attachedToPolicy": "Moniteur créé et attaché à la politique",
@@ -44,11 +90,22 @@
     },
     "sections": {
       "watch": "Quoi surveiller",
-      "noise": "Gravité et bruit",
+      "lifecycle": "Cycle de vie de l’alerte",
       "respond": "Répondre",
       "notify": "Notifier",
       "escalate": "Escalader vers une personne",
       "deployed": "Déployé sur"
+    },
+    "lifecycle": {
+      "overrides": {
+        "org": "Ce moniteur remplace la valeur par défaut de l’organisation ({{value}})",
+        "partner": "Ce moniteur remplace la valeur par défaut du partenaire ({{value}})",
+        "builtin": "Ce moniteur remplace la valeur par défaut intégrée ({{value}})",
+        "unknown": "Ce moniteur remplace la valeur par défaut héritée."
+      },
+      "partnerWideHint": "Une organisation qui a sa propre valeur par défaut utilise celle-ci plutôt que la valeur héritée affichée ici.",
+      "inheritedUnavailable": "Impossible de charger les valeurs héritées. Vous pouvez tout de même enregistrer.",
+      "windowWarning": "La fenêtre d’événements ({{window}} min) est plus courte que le temps de recharge ({{cooldown}} min). Un nouvel événement pendant le temps de recharge peut sortir de la fenêtre avant la réouverture de l’alerte."
     },
     "tabs": {
       "settings": "Paramètres",
@@ -68,7 +125,8 @@
       "recurrenceThreshold": "Escalader après",
       "recurrenceWindowDays": "épisodes en (jours)",
       "pauseResponses": "Suspendre les réponses automatiques jusqu’à ce qu’une personne les réinitialise",
-      "aiAgent": "Agent IA (active les réponses de triage par IA)"
+      "aiAgent": "Agent IA (active les réponses de triage par IA)",
+      "psaBoard": "Tableau du PSA pour les billets d’alertes"
     },
     "deliveryModes": {
       "inherit": "Utiliser les règles de routage",
@@ -88,14 +146,18 @@
       "create": "Créer un moniteur",
       "test": "Tester sur un appareil",
       "deploy": "Déployer vers…",
-      "delete": "Supprimer"
+      "delete": "Supprimer",
+      "backToMonitors": "Retour aux moniteurs"
     },
     "errors": {
       "load": "Impossible de charger le moniteur",
       "save": "Impossible d’enregistrer le moniteur",
       "delete": "Impossible de supprimer le moniteur",
       "test": "Test échoué",
-      "generic": "Quelque chose a mal tourné"
+      "generic": "Quelque chose a mal tourné",
+      "invalidCondition": "Certaines valeurs de la condition sont manquantes ou hors limites. Rien n'a été enregistré.",
+      "invalidResponses": "Certains paramètres de réponse sont manquants ou hors limites. Rien n'a été enregistré.",
+      "restartServiceRequiresName": "Le redémarrage du service nécessite un nom de service."
     },
     "saved": "Moniteur enregistré",
     "deleted": "Moniteur supprimé",
@@ -109,7 +171,8 @@
     "testDialog": {
       "title": "Tester sur un appareil",
       "selectDevice": "Appareil",
-      "run": "Exécuter le test"
+      "run": "Exécuter le test",
+      "saveToTest": "Enregistrez pour tester vos modifications"
     },
     "deliveryPreview": {
       "selectOrg": "Sélectionnez une organisation pour prévisualiser la livraison.",
@@ -139,6 +202,40 @@
         "disabled": "désactivé",
         "unavailable": "indisponible"
       }
+    },
+    "composite": {
+      "children": "Conditions enfants",
+      "add": "Ajouter une condition",
+      "matchLabel": "Correspondance"
+    },
+    "restart": {
+      "label": "Redémarrer le service sur l'appareil",
+      "maxAttempts": "Nombre maximal de redémarrages",
+      "cooldownSeconds": "Délai entre redémarrages (secondes)"
+    },
+    "networkCheckAsset": {
+      "label": "Actif",
+      "unbound": "Aucun actif lié",
+      "failed": "Impossible de charger les actifs",
+      "orgRequired": "Sélectionnez une organisation propriétaire pour lier un actif.",
+      "pingName": "Ping vers {{label}}"
+    },
+    "psaBoardDefault": "Utiliser le tableau par défaut de la connexion",
+    "psaBoardHelp": "Les billets d’alertes de ce moniteur sont créés dans ce tableau plutôt que dans celui par défaut de la connexion.",
+    "psaBoardReadOnly": "Les billets d’alertes vont au tableau #{{id}} du PSA",
+    "psaBoardUnavailable": "Impossible de charger les tableaux du PSA; le remplacement du tableau est donc indisponible pour le moment.",
+    "clearsWhen": {
+      "title": "Se résout lorsque",
+      "hint": "Se résout seulement sur un événement journalisé après l'événement déclencheur de l'alerte.",
+      "noneHint": "Aucune condition de rétablissement n'est définie : l'alerte se résout dès que le déclencheur ne correspond plus.",
+      "add": "Ajouter une condition de rétablissement",
+      "removeCondition": "Retirer",
+      "keepCustom": "Conserver la condition personnalisée",
+      "customTitle": "Condition de rétablissement personnalisée (API)",
+      "customHint": "Cette condition a été définie au moyen de l'API et ne peut pas être modifiée ici. L'enregistrement la conserve telle quelle.",
+      "replaceCustom": "Remplacer",
+      "invalid": "L'une des valeurs de la condition de rétablissement n'est pas valide.",
+      "customUnusable": "Cette condition ne peut pas être évaluée : les alertes de ce moniteur ne se résoudront pas automatiquement. Remplacez-la pour corriger le problème."
     }
   },
   "kinds": {
@@ -160,7 +257,10 @@
     "software_presence": "Présence de logiciel",
     "backup_continuity": "Continuité des sauvegardes",
     "script": "Vérification de script",
-    "network_check": "Vérification réseau"
+    "network_check": "Vérification réseau",
+    "hardware_health": "État du matériel",
+    "time_sync": "Synchronisation de l’heure",
+    "container_image_currency": "Actualité des images de conteneur"
   },
   "fields": {
     "operator": "Comparaison",
@@ -201,7 +301,20 @@
     "port": "Numéro de port",
     "expectStatus": "Code de statut attendu",
     "pollingIntervalSeconds": "Interroger toutes les (secondes)",
-    "match": "Correspondance"
+    "match": "Correspondance",
+    "pingCount": "Requêtes d’écho",
+    "expectBanner": "Bannière attendue",
+    "httpMethod": "Méthode HTTP",
+    "expectedBody": "La réponse doit contenir",
+    "followRedirects": "Suivre les redirections",
+    "verifySsl": "Vérifier le certificat TLS",
+    "recordType": "Type d’enregistrement",
+    "expectedValue": "Valeur attendue",
+    "nameserver": "Serveur de noms",
+    "degradedIsFailure": "Considérer « dégradé » comme un échec",
+    "maxResponseMs": "Échec au-delà de (ms)",
+    "eventLogCollectionNoSource": "Les événements d’application de niveau Information et Avertissement sont recueillis uniquement auprès de {{providers}}. Les événements d’autres sources correspondent à cette règle seulement au niveau Erreur ou Critique, sauf si une stratégie de configuration des journaux d’événements inclut la source (Stratégie de configuration → Journaux d’événements → Fournisseurs d’applications).",
+    "eventLogCollectionSourceNotCollected": "L’agent ne recueille pas les événements d’application de niveau Information ou Avertissement de « {{source}} », sauf si une stratégie de configuration des journaux d’événements l’inclut (Stratégie de configuration → Journaux d’événements → Fournisseurs d’applications). Sinon, cette règle correspond uniquement à ses événements Erreur ou Critique. Fournisseurs intégrés : {{providers}}."
   },
   "operators": {
     "gt": "supérieur à",
@@ -225,6 +338,7 @@
     "system": "Système"
   },
   "eventLevels": {
+    "info": "Informations",
     "warning": "Avertissement",
     "error": "Erreur",
     "critical": "Critique"
@@ -257,7 +371,8 @@
   },
   "backupChecks": {
     "no_successful_backup": "Aucune sauvegarde réussie",
-    "consecutive_failures": "Défaillances consécutives"
+    "consecutive_failures": "Défaillances consécutives",
+    "completed_with_errors": "Terminée avec des erreurs de fichiers"
   },
   "checkTypes": {
     "icmp_ping": "Ping ICMP",
@@ -275,6 +390,7 @@
       "device_group": "un groupe de dispositifs"
     },
     "selectPolicy": "Politique de configuration",
+    "attachToPolicy": "Attacher à une politique…",
     "selectTarget": "Cible",
     "noOrgSelected": "Sélectionnez une organisation pour le déploiement.",
     "policyName": "Nom de la politique",
@@ -283,9 +399,13 @@
     "cancel": "Annuler",
     "detachConfirm": "Détacher de {{policy}}?",
     "errors": {
+      "loadGroups": "Impossible de charger les groupes d’appareils.",
       "attach": "Impossible de joindre le moniteur",
-      "detach": "Impossible de détacher le moniteur"
-    }
+      "detach": "Impossible de détacher le moniteur",
+      "linkedFeature": "Les moniteurs de cette politique proviennent d'une politique de fonctionnalité partagée. Modifiez cette politique ou choisissez-en une autre."
+    },
+    "partnerWideGroups": "Toutes les org. (à l’échelle du partenaire)",
+    "organizationGroups": "Groupes d’organisation"
   },
   "policyTab": {
     "title": "Moniteurs",
@@ -313,7 +433,7 @@
   "legacy": {
     "title": "Règles d’alerte héritées",
     "description": "Règles d’alerte autonomes qui ne sont pas gérées par un moniteur. Convertissez-les pour regrouper réponses, livraison et escalade en un seul endroit.",
-    "empty": "Aucune règle héritée.",
+    "empty": "Aucune règle d’alerte autonome n’a besoin d’être convertie.",
     "columns": {
       "name": "Nom",
       "template": "Modèle",
@@ -324,9 +444,30 @@
     "convert": "Convertir en moniteur",
     "converted": "Convertie",
     "notConvertible": "Les conditions de cette règle ne peuvent pas être exprimées comme un seul moniteur.",
+    "systemManaged": "Règle gérée par le système. Breeze déclenche cette alerte lui-même, il n'y a donc rien à convertir.",
     "errors": {
       "fetch": "Impossible de charger les règles d’alerte",
       "convert": "Impossible de convertir la règle"
+    }
+  },
+  "builtInRules": {
+    "title": "Alertes intégrées",
+    "description": "Alertes que Breeze déclenche lui-même. Désactivez-en une pour arrêter cette alerte pour son organisation; les alertes déjà ouvertes le restent jusqu'à ce que vous les résolviez.",
+    "columns": {
+      "name": "Nom",
+      "organization": "Organisation",
+      "active": "Activée"
+    },
+    "kinds": {
+      "policyViolation": "Violations de stratégie : {{subject}}",
+      "configCompliance": "Conformité de configuration : {{subject}}"
+    },
+    "toggle": "Activer ou désactiver {{name}}",
+    "switchedOn": "{{name}} activée",
+    "switchedOff": "{{name}} désactivée",
+    "errors": {
+      "fetch": "Impossible de charger les alertes intégrées",
+      "toggle": "Impossible de mettre à jour l'alerte intégrée"
     }
   },
   "devices": {
@@ -385,5 +526,218 @@
         "skippedNoResponse": "Ignoré (aucune réponse configurée)"
       }
     }
+  },
+  "conversion": {
+    "banner": {
+      "rowsCount_one": "{{count}} règle héritée",
+      "rowsCount_other": "{{count}} règles héritées",
+      "policiesCount_one": "{{count}} politique",
+      "policiesCount_other": "{{count}} politiques",
+      "text": "{{rows}} dans {{policies}} n'ont pas encore été converties en moniteurs.",
+      "review": "Examiner",
+      "convertEverything": "Tout convertir…",
+      "confirmTitle": "Convertir toutes les règles héritées, surveillances et automatisations déclenchées par alerte de toutes vos politiques ?",
+      "confirmBody": "{{rows}} dans {{policies}} de tout le partenaire. Les lignes converties sont retirées sur place. Les autres restent maintenant à examiner ou retirer manuellement; une future version convertit les restantes et retire celles non convertibles.",
+      "confirmRun": "Tout convertir",
+      "convertedAll": "{{rows}} converties dans {{policies}} ; {{unconvertible}} n'ont pas pu l'être.",
+      "errors": {
+        "convertAll": "Échec de la conversion globale"
+      }
+    },
+    "pendingPolicies": {
+      "title": "Politiques avec règles héritées",
+      "loading": "Chargement des politiques…",
+      "empty": "Aucune politique ne porte de règles d'alerte intégrées, de surveillances ou d'automatisations déclenchées par alerte.",
+      "error": "Impossible de charger les politiques avec des règles héritées. Actualisez pour réessayer."
+    },
+    "title": "Conversion requise",
+    "description": "Les règles d'alerte intégrées, les surveillances de services/processus et les automatisations déclenchées par alerte de cette politique n'ont pas encore été converties en moniteurs. La conversion retire la ligne source sur place ; rien n'est supprimé.",
+    "checking": "Vérification des appareils…",
+    "devicesChecked_one": "{{count}} appareil vérifié pour un comportement identique.",
+    "devicesChecked_other": "{{count}} appareils vérifiés pour un comportement identique.",
+    "blocked": {
+      "parent_unconverted": "Convertissez d'abord la politique parente : ses règles intégrées déterminent ce que cette politique hérite.",
+      "prerequisite_missing": "Un correctif prérequis n'est pas encore déployé sur ce serveur. La conversion est désactivée jusque-là."
+    },
+    "refusedTitle_one": "Conversion refusée : {{count}} appareil changerait de comportement.",
+    "refusedTitle_other": "Conversion refusée : {{count}} appareils changeraient de comportement.",
+    "convert": "Convertir",
+    "convertAll_one": "Convertir {{count}} convertible",
+    "convertAll_other": "Convertir les {{count}} convertibles",
+    "retire": "Retirer",
+    "converted": "{{rows}} lignes héritées converties en {{monitors}} moniteurs.",
+    "retired": "{{name}} retiré.",
+    "undone_one": "{{count}} conversion annulée.",
+    "undone_other": "{{count}} conversions annulées.",
+    "openAlerts_one": "{{count}} alerte ouverte passe au moniteur",
+    "openAlerts_other": "{{count}} alertes ouvertes passent au moniteur",
+    "sourceTables": {
+      "config_policy_alert_rules": "Règle d'alerte intégrée",
+      "config_policy_monitoring_watches": "Surveillance de service/processus",
+      "alert_templates": "Modèle d'alerte",
+      "automations": "Automatisation déclenchée par alerte",
+      "config_policy_automations": "Automatisation de politique",
+      "network_monitors": "Vérification réseau"
+    },
+    "outcomes": {
+      "convertible": "Conversion possible",
+      "unconvertible": "Non convertible"
+    },
+    "roles": {
+      "primary": "Moniteur",
+      "resource_cpu": "Moniteur CPU",
+      "resource_memory": "Moniteur mémoire",
+      "response": "Réponse"
+    },
+    "reasons": {
+      "unknown": "Non convertible ({{code}}).",
+      "nested_group": "La règle imbrique des groupes de conditions ; un moniteur composite est un seul groupe plat.",
+      "no_condition": "Le modèle n'a aucune condition évaluable et ne s'est jamais déclenché.",
+      "escalation_policy_axis": "La politique d'escalade appartient à une organisation alors que la politique est à l'échelle du partenaire.",
+      "custom": "Les conditions personnalisées n'ont pas de type de moniteur.",
+      "process_count": "Les conditions de nombre de processus n'ont pas de type de moniteur."
+    },
+    "errors": {
+      "preview": "Impossible de charger l'aperçu de conversion",
+      "convert": "Échec de la conversion",
+      "retire": "Échec du retrait",
+      "revert": "Impossible d'annuler la conversion"
+    },
+    "ledger": {
+      "title": "Historique des conversions",
+      "undo": "Annuler",
+      "more": "Charger plus",
+      "empty": "Aucun historique de conversion.",
+      "system": "Système",
+      "unknownUser": "Utilisateur inconnu",
+      "reverted": "Annulée",
+      "deadline": "L'annulation est indisponible après la suppression du moteur source par le retrait des alertes héritées."
+    },
+    "errorCodes": {
+      "preview_stale": "La politique a changé depuis cet aperçu. Générez un nouvel aperçu avant de convertir.",
+      "conversion_contended": "Des modifications simultanées ont interrompu la conversion. Rien n'a été modifié. Réessayez.",
+      "preview_failed": "L'aperçu n'a pas pu être généré. Réessayez plus tard.",
+      "equivalence_delta": "Les moniteurs convertis ne se comporteraient pas comme les règles héritées sur tous les appareils. Vérifiez l'aperçu avant de convertir.",
+      "CONVERSION_PREREQUISITE_MISSING": "Une mise à jour requise de la plateforme n'a pas encore été déployée; la conversion est donc impossible.",
+      "blocked": "Cette conversion est bloquée. Convertissez d'abord la politique parente, puis réessayez.",
+      "already_converted": "Ces règles ont déjà été converties. Actualisez pour voir l'état actuel.",
+      "partner_wide_denied": "Un accès partenaire complet est requis pour convertir les politiques à l'échelle du partenaire.",
+      "policy_not_found": "La politique est introuvable. Elle a peut-être été supprimée.",
+      "source_not_found": "La règle héritée est introuvable. Elle a peut-être déjà été convertie ou supprimée.",
+      "conversion_not_found": "Cette conversion est introuvable.",
+      "conversion_revert_unavailable": "Cette conversion ne peut plus être annulée.",
+      "invalid_reason": "Ce motif de retrait n'est pas valide.",
+      "unknown": "La conversion a échoué. Réessayez."
+    },
+    "retirement": {
+      "summary_one": "{{count}} règle héritée n’a pas pu être convertie en moniteur — à vérifier.",
+      "summary_other": "{{count}} règles héritées n’ont pas pu être converties en moniteurs — à vérifier.",
+      "review": "Vérifier",
+      "dismiss": "Ignorer",
+      "openAlertsNote": "Ces règles ne se déclenchent plus. Leurs alertes ouvertes le restent jusqu’à ce que quelqu’un les résolve ; recréez la condition sous forme de moniteur si elle est encore nécessaire.",
+      "reasons": {
+        "custom_condition": "condition personnalisée",
+        "nested_group": "groupe de conditions imbriqué",
+        "no_condition": "aucune condition évaluable",
+        "equivalence_delta": "la conversion changerait ce qui se déclenche sur certains appareils",
+        "escalation_policy_axis": "la politique d’escalade appartient à une seule organisation",
+        "parent_unconverted": "la politique parente n’a pas été convertie",
+        "policy_inactive": "la politique est inactive ou archivée",
+        "prerequisite_missing": "un correctif préalable manque sur ce serveur",
+        "metric_without_kind": "aucun type de moniteur pour cette métrique",
+        "child_kind_not_composable": "condition incompatible avec un moniteur composite",
+        "too_many_conditions": "trop de conditions",
+        "too_many_responses": "plus de dix réponses seraient nécessaires",
+        "auto_resolve_conditions": "les conditions de résolution personnalisées ne peuvent pas être conservées",
+        "target_unconvertible": "la cible de la réponse ne peut pas être convertie",
+        "already_managed": "déjà gérée par un moniteur",
+        "no_org": "la vérification n’appartient à aucune organisation",
+        "asset_missing": "l’actif découvert associé n’existe plus",
+        "condition_invalid": "les paramètres de la vérification ne forment pas une condition de moniteur valide",
+        "no_active_rules": "la vérification n’a aucune règle d’alerte active",
+        "multiple_network_rules": "la vérification a plus d’une règle d’alerte active",
+        "network_predicate_unsupported": "la condition d’alerte n’a pas d’équivalent dans les moniteurs",
+        "network_threshold_out_of_range": "le seuil d’échec est hors limites (100 échecs consécutifs au maximum)",
+        "site_binding_unrepresentable": "la vérification liée à un site n’est associée à aucun actif découvert",
+        "config_override_unrepresentable": "la cible ou le délai personnalisé ne peut pas être conservé",
+        "built_in": "règle système intégrée ; elle continue d’alerter d’elle-même",
+        "no_rules": "le modèle n’a aucune règle à convertir",
+        "target_or_owner": "la cible ou le propriétaire d’une règle diffère de son modèle",
+        "blocked": "la conversion est bloquée",
+        "disabled_response_automation": "l’automatisation de réponse est désactivée",
+        "alert_workflow_kept": "le flux d’alerte est conservé tel quel",
+        "unknown": "conversion refusée ; vérifiez la source"
+      }
+    }
+  },
+  "device": {
+    "title": "Moniteurs effectifs",
+    "empty": "Aucun moniteur ne s'applique à cet appareil.",
+    "error": "Impossible de charger les moniteurs effectifs.",
+    "monitor": "Moniteur",
+    "kind": "Type",
+    "policy": "Politique source",
+    "state": "État",
+    "episode": "Épisode ouvert",
+    "escalation": "Escalade"
+  },
+  "monitors": {
+    "fields": {
+      "hardware_health": {
+        "componentTypes": "Composants",
+        "minHealth": "État minimal",
+        "includePredictiveFailure": "Inclure les défaillances prédites",
+        "consecutiveSnapshots": "Instantanés consécutifs",
+        "componentTypeOptions": {
+          "controller": "Contrôleurs",
+          "virtual_disk": "Disques virtuels",
+          "physical_disk": "Disques physiques",
+          "cache_battery": "Batteries de cache",
+          "enclosure": "Boîtiers",
+          "collector": "Outils de surveillance"
+        },
+        "minHealthOptions": {
+          "warning": "Avertissement",
+          "critical": "Critique"
+        }
+      },
+      "time_sync": {
+        "findings": "Constats",
+        "consecutiveSnapshots": "Instantanés consécutifs",
+        "findingOptions": {
+          "pdc_no_external_source": "Le PDC racine de la forêt n’a pas de source externe",
+          "source_local_clock": "Utilisation de l’horloge locale",
+          "dc_vm_host_sync": "Le contrôleur de domaine se synchronise avec l’hôte de la machine virtuelle",
+          "ntp_server_unresolvable": "Le nom du serveur NTP est invalide ou non résolu",
+          "ntp_peer_unreachable": "Le pair NTP est injoignable",
+          "domain_source_unavailable": "La source de temps du domaine est indisponible",
+          "member_not_on_hierarchy": "La hiérarchie du domaine n’est pas utilisée",
+          "sync_disabled": "La synchronisation de l’heure est désactivée",
+          "sync_stale": "Aucune synchronisation réussie récemment",
+          "correction_refused": "La correction de l’heure a été refusée",
+          "timezone_mismatch": "Le fuseau horaire diffère de celui attendu",
+          "policy_not_applied": "La stratégie horaire n’a pas été appliquée",
+          "policy_conflict_gpo": "Une stratégie de groupe contrôle les paramètres horaires"
+        }
+      },
+      "container_image_currency": {
+        "minDaysBehind": "Nombre minimal de jours de retard"
+      }
+    }
+  },
+  "httpMethods": {
+    "GET": "GET (récupérer)",
+    "HEAD": "HEAD (en-têtes seulement)",
+    "POST": "POST (envoyer)",
+    "PUT": "PUT (remplacer)",
+    "OPTIONS": "OPTIONS (capacités)"
+  },
+  "dnsRecordTypes": {
+    "A": "A (adresse IPv4)",
+    "AAAA": "AAAA (adresse IPv6)",
+    "MX": "MX (serveur de messagerie)",
+    "CNAME": "CNAME (nom alternatif)",
+    "TXT": "TXT (texte)",
+    "NS": "NS (serveur de noms)"
   }
 }

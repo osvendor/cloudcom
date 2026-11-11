@@ -23,6 +23,7 @@ jobs:
       source_short: ${{ steps.validate.outputs.source_short }}
       build_version: ${{ steps.validate.outputs.build_version }}
       baseline_tag: ${{ steps.validate.outputs.baseline_tag }}
+      binaries_version: ${{ steps.validate.outputs.binaries_version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -57,10 +58,9 @@ jobs:
             echo "::error::No successful push-triggered CloudCom CI run exists for $SOURCE_COMMIT on $default_branch."
             exit 1
           }
-          baseline_tag="$(git show "$SOURCE_COMMIT:.github/cloudcom-baseline.json" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).tag))')"
-          build_version="${baseline_tag#v}"
-          printf 'source_commit=%s\nsource_short=%s\nbuild_version=%s\nbaseline_tag=%s\n' \
-            "$SOURCE_COMMIT" "${SOURCE_COMMIT:0:12}" "$build_version" "$baseline_tag" >> "$GITHUB_OUTPUT"
+          git show "$SOURCE_COMMIT:.github/cloudcom-baseline.json" | node scripts/release/cloudcom-release-versions.mjs >> "$GITHUB_OUTPUT"
+          printf 'source_commit=%s\nsource_short=%s\n' \
+            "$SOURCE_COMMIT" "${SOURCE_COMMIT:0:12}" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build ${{ matrix.component }} candidate
@@ -95,22 +95,38 @@ jobs:
           SOURCE_SHORT: ${{ needs.validate.outputs.source_short }}
           BUILD_VERSION: ${{ needs.validate.outputs.build_version }}
           BASELINE_TAG: ${{ needs.validate.outputs.baseline_tag }}
+          BINARIES_VERSION: ${{ needs.validate.outputs.binaries_version }}
         run: |
           set -euo pipefail
           image="cloudcom-candidate/${COMPONENT}:sha-${SOURCE_SHORT}"
           args=()
           case "$COMPONENT" in
             migration) args+=(--target builder) ;;
-            api) args+=(--build-arg "APP_VERSION=$BUILD_VERSION") ;;
+            api) args+=(--build-arg "APP_VERSION=$BUILD_VERSION" --build-arg "BREEZE_BINARIES_VERSION=$BINARIES_VERSION") ;;
             web) args+=(--build-arg "PUBLIC_APP_VERSION=$BUILD_VERSION" --build-arg 'PUBLIC_API_URL=') ;;
             portal) args+=(--build-arg 'PORTAL_BASE_PATH=/portal' --build-arg 'PUBLIC_API_URL=') ;;
             exchange-worker) ;;
             *) echo "::error::Unknown component $COMPONENT"; exit 1 ;;
           esac
-          docker build --pull --platform linux/amd64 --label "org.opencontainers.image.revision=$SOURCE_COMMIT" --file "$DOCKERFILE" --tag "$image" "${args[@]}" .
+          docker build --pull --platform linux/amd64 --label "org.opencontainers.image.revision=$SOURCE_COMMIT" --label "org.opencontainers.image.version=$BUILD_VERSION" --file "$DOCKERFILE" --tag "$image" "${args[@]}" .
           docker save "$image" | gzip -1 > "${COMPONENT}.tar.gz"
           sha256sum "${COMPONENT}.tar.gz" > SHA256SUMS
-          IMAGE="$image" SOURCE="$SOURCE_COMMIT" COMPONENT="$COMPONENT" node -e "const fs=require('fs'); const image=JSON.parse(require('child_process').execFileSync('docker',['image','inspect',process.env.IMAGE],{encoding:'utf8'}))[0]; fs.writeFileSync('metadata.json', JSON.stringify({component:process.env.COMPONENT, sourceCommit:process.env.SOURCE, baselineTag:process.env.BASELINE_TAG, imageId:image.Id, repoTags:image.RepoTags, created:image.Created}, null, 2)+'\\n');"
+          docker image inspect "$image" > image-inspect.json
+          python3 scripts/release/inspect-candidate-archive.py "${COMPONENT}.tar.gz" "$SOURCE_COMMIT" "$BUILD_VERSION" "$(docker image inspect --format '{{.Id}}' "$image")" oci-provenance.json
+          IMAGE="$image" SOURCE="$SOURCE_COMMIT" COMPONENT="$COMPONENT" node <<'NODE'
+          const fs = require('node:fs');
+          const image = JSON.parse(fs.readFileSync('image-inspect.json', 'utf8'))[0];
+          const metadata = {
+            component: process.env.COMPONENT,
+            sourceCommit: process.env.SOURCE,
+            baselineTag: process.env.BASELINE_TAG,
+            version: process.env.BUILD_VERSION,
+            imageId: image.Id,
+            repoTags: image.RepoTags,
+            created: image.Created,
+          };
+          fs.writeFileSync('metadata.json', JSON.stringify(metadata, null, 2) + '\n');
+          NODE
       - name: Upload candidate image archive
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -119,5 +135,7 @@ jobs:
             ${{ matrix.component }}.tar.gz
             SHA256SUMS
             metadata.json
+            image-inspect.json
+            oci-provenance.json
           retention-days: 7
           compression-level: 0

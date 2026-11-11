@@ -10,6 +10,18 @@ import path from 'node:path';
 // full module graph.
 // -------------------------------------------------------------------
 
+// Existing route cases exercise the non-isolated ICE plan.
+vi.mock('./remote/desktopRelayPolicy', async () => {
+  const { getIceServers } = await import('./remote/helpers');
+  return {
+    resolveDesktopIcePlan: async (_deviceId: string, scope: import('./remote/helpers').TurnCredentialScope) => ({
+      ok: true,
+      relayOnly: false,
+      iceServers: getIceServers(scope),
+    }),
+  };
+});
+
 vi.mock('../db', () => ({
   runOutsideDbContext: vi.fn((fn: () => unknown) => fn()),
   withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn()),
@@ -83,6 +95,7 @@ vi.mock('../services/rate-limit', () => ({
 }));
 
 vi.mock('./remote/helpers', () => ({
+  createDesktopStartCommandId: vi.fn((id: string) => `desk-start-${id}-${crypto.randomUUID()}`),
   logSessionAudit: vi.fn(async () => undefined),
   getIceServers: vi.fn(() => []),
   buildRemoteSessionPromptPayload: vi.fn(async () => undefined),
@@ -150,10 +163,18 @@ function readViewerEmittedInputKinds(): string[] {
 
   const desktopViewerSource = readFileSync(path.join(viewerRoot, 'components/DesktopViewer.tsx'), 'utf8');
   // Quote- and property-order-agnostic within each sendInputFn({...}) call.
+  // The optional `[^{}]*?` prefix admits a conditional argument such as the
+  // wheel handler's `sendInputFn(stepsX !== 0 ? { type: 'mouse_scroll', ... }
+  // : { ... })` (W03 added horizontal wheel), whose object literal is not the
+  // first token after the paren.
   const directKinds = readTypeLiterals(
     desktopViewerSource,
-    /sendInputFn\(\{[^}]*?\btype:\s*['"]([a-zA-Z_]+)['"]/g
+    /sendInputFn\((?:[^{}]*?)\{[^}]*?\btype:\s*['"]([a-zA-Z_]+)['"]/g
   );
+  // Not scanned on purpose: `input_reset` (inputSequencer.ts). It is built by
+  // the reliable-input router and only travels on the WebRTC `input-r`
+  // channel; the WS fallback sends raw events via inputChannel.send and never
+  // emits it, so desktopInputEvent has no reason to accept it.
 
   const pasteSource = readFileSync(path.join(viewerRoot, 'lib/paste.ts'), 'utf8');
   const pasteKinds = readTypeLiterals(pasteSource, /type:\s*['"]([a-zA-Z_]+)['"]/g);

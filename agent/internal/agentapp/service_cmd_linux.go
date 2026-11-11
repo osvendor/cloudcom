@@ -12,6 +12,7 @@ import (
 	"sync"
 
 	"github.com/breeze-rmm/agent/internal/config"
+	"github.com/breeze-rmm/agent/internal/procspawn"
 	"github.com/spf13/cobra"
 )
 
@@ -101,7 +102,7 @@ func reconcileServiceUnitIfNeeded() {
 		// unit's ProtectSystem or CapabilityBoundingSet — so it can write
 		// /etc/systemd/system; being a child of PID 1 it also survives the agent
 		// restart it triggers. See reconcileTransientArgs for the flag invariants.
-		out, err := exec.Command(
+		out, err := procspawn.Command(
 			"systemd-run", reconcileTransientArgs(os.Getpid(), linuxBinaryPath)...).CombinedOutput()
 		if err != nil {
 			fmt.Fprintf(os.Stderr,
@@ -121,7 +122,9 @@ func init() {
 	serviceCmd.AddCommand(serviceStatusCmd)
 	serviceCmd.AddCommand(serviceReconcileUnitCmd)
 	serviceInstallCmd.Flags().BoolVar(&withUserHelper, "with-user-helper", false, "Also install the per-user desktop helper systemd unit")
-	serviceInstallCmd.Flags().BoolVar(&noWatchdog, "no-watchdog", false, "Skip automatic watchdog installation")
+	serviceInstallCmd.Flags().BoolVar(&noWatchdog, "no-watchdog", false, "Skip automatic watchdog installation and remember the choice (the running agent will not install it either)")
+	serviceInstallCmd.Flags().BoolVar(&watchdogOptIn, "watchdog", false, watchdogOptInUsage)
+	serviceInstallCmd.Flags().BoolVar(&strictWatchdog, "strict-watchdog", false, strictWatchdogUsage)
 	// A failed start returns an error from RunE; usage text would bury it.
 	serviceInstallCmd.SilenceUsage = true
 }
@@ -146,6 +149,13 @@ var serviceInstallCmd = &cobra.Command{
 			return fmt.Errorf("failed to set permissions on %s: %w", linuxConfigDir, err)
 		}
 
+		// Persist --no-watchdog / --watchdog (or honour a standing opt-out)
+		// before any install side effect: a failed marker write aborts here.
+		skipWatchdog, err := applyWatchdogFlags(defaultWatchdogFlagDeps(nil), noWatchdog, watchdogOptIn)
+		if err != nil {
+			return err
+		}
+
 		// Stop existing service before replacing binary (safe for upgrades).
 		//
 		// Whether it was RUNNING must be sampled BEFORE the stop: this command
@@ -157,7 +167,7 @@ var serviceInstallCmd = &cobra.Command{
 		wasRunning := false
 		if _, err := os.Stat(linuxUnitDst); err == nil {
 			wasRunning = isSystemServiceRunning()
-			if stopErr := exec.Command("systemctl", "stop", linuxServiceName).Run(); stopErr != nil {
+			if stopErr := procspawn.Command("systemctl", "stop", linuxServiceName).Run(); stopErr != nil {
 				fmt.Fprintf(os.Stderr, "Warning: failed to stop existing service: %v\n", stopErr)
 			} else {
 				fmt.Println("Stopped existing Breeze Agent service.")
@@ -186,7 +196,7 @@ var serviceInstallCmd = &cobra.Command{
 		}
 
 		// Write systemd unit file
-		if err := os.WriteFile(linuxUnitDst, []byte(linuxUnit), 0644); err != nil {
+		if err := os.WriteFile(linuxUnitDst, []byte(currentLinuxUnit()), 0644); err != nil {
 			return fmt.Errorf("failed to write unit file: %w", err)
 		}
 		fmt.Printf("Systemd unit installed to %s\n", linuxUnitDst)
@@ -206,9 +216,9 @@ var serviceInstallCmd = &cobra.Command{
 		// agent opens its IPC socket in /var/run/breeze owned by the breeze
 		// group at startup, so an agent started ahead of them comes up
 		// without a usable socket. Best-effort and idempotent.
-		if err := exec.Command("getent", "group", "breeze").Run(); err != nil {
+		if err := procspawn.Command("getent", "group", "breeze").Run(); err != nil {
 			// Group doesn't exist — create it
-			if createErr := exec.Command("groupadd", "--system", "breeze").Run(); createErr != nil {
+			if createErr := procspawn.Command("groupadd", "--system", "breeze").Run(); createErr != nil {
 				fmt.Fprintf(os.Stderr, "Warning: failed to create 'breeze' group: %v\n", createErr)
 			} else {
 				fmt.Println("Created 'breeze' group for IPC socket access.")
@@ -220,7 +230,7 @@ var serviceInstallCmd = &cobra.Command{
 		if err := os.MkdirAll(ipcDir, 0770); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to create IPC directory %s: %v\n", ipcDir, err)
 		}
-		if err := exec.Command("chown", "root:breeze", ipcDir).Run(); err != nil {
+		if err := procspawn.Command("chown", "root:breeze", ipcDir).Run(); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to set IPC directory ownership: %v\n", err)
 		}
 
@@ -252,7 +262,7 @@ var serviceInstallCmd = &cobra.Command{
 		if started {
 			// Show current status automatically.
 			fmt.Println()
-			statusCmd := exec.Command(linuxBinaryPath, "status")
+			statusCmd := procspawn.Command(linuxBinaryPath, "status")
 			statusCmd.Stdout = os.Stdout
 			statusCmd.Stderr = os.Stderr
 			statusCmd.Run() // best-effort; ignore error
@@ -276,7 +286,8 @@ var serviceInstallCmd = &cobra.Command{
 			fmt.Println("  4. Logs:    journalctl -u breeze-agent -f")
 		}
 
-		if !noWatchdog {
+		var watchdogExit error
+		if !skipWatchdog {
 			// Describe the service state we actually left behind. This line
 			// used to assert "installed and running" unconditionally, which
 			// before #5252 was never true on this platform and is still not
@@ -301,15 +312,18 @@ var serviceInstallCmd = &cobra.Command{
 						"  1. Re-run `sudo breeze-agent service install` (will retry the download).\n"+
 						"  2. Download %s manually, place it next to breeze-agent,\n"+
 						"     then run `sudo breeze-watchdog service install`.\n"+
-						"  3. To skip the watchdog entirely, use `--no-watchdog`.\n",
+						"  3. To skip the watchdog entirely, use `--no-watchdog`.\n"+
+						watchdogSelfHealHint,
 					err, agentStateLine, watchdogManualDownloadURL(version, runtime.GOOS, runtime.GOARCH, serverURL))
 			}
+			watchdogExit = reportWatchdogBootstrap(err, strictWatchdog, os.Stdout)
 		}
 
 		// Reported last so the watchdog still gets bootstrapped, but reported:
 		// a silent exit 0 on a host whose agent is down is exactly how #5252
-		// went unnoticed until the device showed Offline.
-		return startErr
+		// went unnoticed until the device showed Offline. The agent's start
+		// failure wins over the watchdog outcome (--strict-watchdog → 78).
+		return installExitError(startErr, watchdogExit)
 	},
 }
 
@@ -322,12 +336,12 @@ var serviceUninstallCmd = &cobra.Command{
 		}
 
 		// Stop the service
-		if err := exec.Command("systemctl", "stop", linuxServiceName).Run(); err != nil {
+		if err := procspawn.Command("systemctl", "stop", linuxServiceName).Run(); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to stop service: %v\n", err)
 		}
 
 		// Disable the service
-		if err := exec.Command("systemctl", "disable", linuxServiceName).Run(); err != nil {
+		if err := procspawn.Command("systemctl", "disable", linuxServiceName).Run(); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to disable service: %v\n", err)
 		}
 
@@ -342,7 +356,7 @@ var serviceUninstallCmd = &cobra.Command{
 		}
 
 		// Reload systemd
-		if err := exec.Command("systemctl", "daemon-reload").Run(); err != nil {
+		if err := procspawn.Command("systemctl", "daemon-reload").Run(); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to reload systemd: %v\n", err)
 		}
 
@@ -359,10 +373,10 @@ var serviceUninstallCmd = &cobra.Command{
 }
 
 func uninstallLinuxWatchdog() {
-	if err := exec.Command("systemctl", "stop", linuxWatchdogServiceName).Run(); err != nil {
+	if err := procspawn.Command("systemctl", "stop", linuxWatchdogServiceName).Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to stop watchdog service: %v\n", err)
 	}
-	if err := exec.Command("systemctl", "disable", linuxWatchdogServiceName).Run(); err != nil {
+	if err := procspawn.Command("systemctl", "disable", linuxWatchdogServiceName).Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to disable watchdog service: %v\n", err)
 	}
 	if err := os.Remove(linuxWatchdogUnitDst); err != nil && !os.IsNotExist(err) {
@@ -386,14 +400,14 @@ var serviceStartCmd = &cobra.Command{
 		}
 
 		// Reload systemd so any updated unit file on disk is recognized before enabling.
-		exec.Command("systemctl", "daemon-reload").Run() //nolint:errcheck — best-effort
+		_ = procspawn.Command("systemctl", "daemon-reload").Run() // best-effort
 
 		// Enable the service for auto-start on reboot before starting it.
-		if out, err := exec.Command("systemctl", "enable", linuxServiceName).CombinedOutput(); err != nil {
+		if out, err := procspawn.Command("systemctl", "enable", linuxServiceName).CombinedOutput(); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to enable service for auto-start: %s\n", strings.TrimSpace(string(out)))
 		}
 
-		out, err := exec.Command("systemctl", "start", linuxServiceName).CombinedOutput()
+		out, err := procspawn.Command("systemctl", "start", linuxServiceName).CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("failed to start service: %s", strings.TrimSpace(string(out)))
 		}
@@ -412,7 +426,7 @@ var serviceStopCmd = &cobra.Command{
 			return fmt.Errorf("must run as root (sudo breeze-agent service stop)")
 		}
 
-		out, err := exec.Command("systemctl", "stop", linuxServiceName).CombinedOutput()
+		out, err := procspawn.Command("systemctl", "stop", linuxServiceName).CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("failed to stop service: %s", strings.TrimSpace(string(out)))
 		}
@@ -431,7 +445,7 @@ var serviceStatusCmd = &cobra.Command{
 			return nil
 		}
 
-		out, err := exec.Command("systemctl", "status", linuxServiceName, "--no-pager").CombinedOutput()
+		out, err := procspawn.Command("systemctl", "status", linuxServiceName, "--no-pager").CombinedOutput()
 		if err != nil {
 			// systemctl status returns exit code 3 if service is stopped — not an error
 			if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 3 {
@@ -456,11 +470,11 @@ var serviceReconcileUnitCmd = &cobra.Command{
 		// Best-effort heal: if a later step fails the unit is already v2 on disk,
 		// so the next startup won't re-attempt the restart — the relaxed sandbox
 		// then applies on the following natural service restart rather than now.
-		if err := os.WriteFile(linuxUnitDst, []byte(linuxUnit), 0644); err != nil {
+		if err := os.WriteFile(linuxUnitDst, []byte(currentLinuxUnit()), 0644); err != nil {
 			recordReconcileFailure(fmt.Sprintf("reconcile subcommand: write unit: %v", err))
 			return fmt.Errorf("write unit: %w", err)
 		}
-		if out, err := exec.Command("systemctl", "daemon-reload").CombinedOutput(); err != nil {
+		if out, err := procspawn.Command("systemctl", "daemon-reload").CombinedOutput(); err != nil {
 			recordReconcileFailure(fmt.Sprintf("reconcile subcommand: daemon-reload: %s", strings.TrimSpace(string(out))))
 			return fmt.Errorf("daemon-reload: %w: %s", err, strings.TrimSpace(string(out)))
 		}
@@ -468,7 +482,7 @@ var serviceReconcileUnitCmd = &cobra.Command{
 		// Restart so the relaxed sandbox applies to the live process. This kills
 		// the old agent; we run as a systemd-run transient service whose parent
 		// is PID 1 (not the agent), so this child survives to finish the restart.
-		if out, err := exec.Command("systemctl", "restart", linuxServiceName).CombinedOutput(); err != nil {
+		if out, err := procspawn.Command("systemctl", "restart", linuxServiceName).CombinedOutput(); err != nil {
 			// The unit is v2 on disk but the live process is still sandboxed and
 			// won't re-attempt on its own — this is the silent worst case #1201
 			// exists to surface. The still-running old agent's reporter ships it.

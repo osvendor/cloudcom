@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { securityScanPathSchema } from '@breeze/shared';
 import type { SecurityPostureItem } from '../../services/securityPosture';
 
 export const providerCatalog = {
@@ -11,7 +12,18 @@ export const providerCatalog = {
   eset: { id: 'eset', name: 'ESET', vendor: 'ESET' },
   kaspersky: { id: 'kaspersky', name: 'Kaspersky', vendor: 'Kaspersky' },
   elastic_defend: { id: 'elastic_defend', name: 'Elastic Defend', vendor: 'Elastic' },
-  other: { id: 'other', name: 'Other', vendor: 'Other' }
+  emsisoft: { id: 'emsisoft', name: 'Emsisoft', vendor: 'Emsisoft' },
+  webroot: { id: 'webroot', name: 'Webroot SecureAnywhere', vendor: 'OpenText' },
+  withsecure: { id: 'withsecure', name: 'WithSecure Elements', vendor: 'WithSecure' },
+  // Rebranded from CylancePROTECT; the old name stays so either search finds it (#9178).
+  cylance: { id: 'cylance', name: 'Aurora Endpoint Defense (CylancePROTECT)', vendor: 'Arctic Wolf' },
+  trend_micro: { id: 'trend_micro', name: 'Trend Micro', vendor: 'Trend Micro' },
+  other: { id: 'other', name: 'Other', vendor: 'Other' },
+  // Failed / not-collected provider (#8538). The web client localizes this
+  // bucket by id; `name` is the English fallback.
+  unknown: { id: 'unknown', name: 'Unknown', vendor: 'Unknown' },
+  // Breeze's own IOC scanner (#6263 W02).
+  breeze: { id: 'breeze', name: 'Breeze IOC scan', vendor: 'Breeze' }
 } as const;
 
 export type ProviderKey = keyof typeof providerCatalog;
@@ -29,9 +41,11 @@ export type StatusRow = {
   providerVersion: string | null;
   definitionsVersion: string | null;
   definitionsDate: Date | null;
-  realTimeProtection: boolean;
+  // null = unknown: the agent's collector failed (#8043) or the device has no
+  // security_status row yet. Never coerce to false — that reads as "off" (#8252).
+  realTimeProtection: boolean | null;
   threatCount: number;
-  firewallEnabled: boolean;
+  firewallEnabled: boolean | null;
   encryptionStatus: string;
   encryptionDetails: unknown;
   localAdminSummary: unknown;
@@ -148,7 +162,8 @@ export const listThreatsQuerySchema = z.object({
 
 export const scanRequestSchema = z.object({
   scanType: z.enum(['quick', 'full', 'custom']),
-  paths: z.array(z.string().min(1)).optional()
+  // One path element definition, shared with IOC sweeps (#6263 W05): non-empty, ≤ 1024 chars.
+  paths: z.array(securityScanPathSchema).optional()
 });
 
 export const listScansQuerySchema = z.object({
@@ -156,7 +171,9 @@ export const listScansQuerySchema = z.object({
   limit: z.string().optional(),
   // 'timed_out' (#6263 W01): a scan that hit its policy deadline. Threats found
   // before the deadline are still ingested, so it is an outcome, not a failure.
-  status: z.enum(['queued', 'running', 'completed', 'failed', 'timed_out']).optional(),
+  // 'cancelled' / 'expired' (#6263 W05): sweep scans cancelled with their sweep,
+  // or never delivered before the sweep expired.
+  status: z.enum(['queued', 'running', 'completed', 'failed', 'timed_out', 'cancelled', 'expired']).optional(),
   scanType: z.enum(['quick', 'full', 'custom']).optional(),
   startDate: z.string().optional(),
   endDate: z.string().optional()
@@ -231,8 +248,15 @@ export const recommendationActionSchema = z.object({
   id: z.string()
 });
 
+// Selected org for complete/dismiss — required in practice for multi-org
+// partner users, whose auth.orgId is null (#8086).
+export const recommendationActionQuerySchema = z.object({
+  orgId: z.string().guid().optional()
+});
+
 export const trendsQuerySchema = z.object({
-  period: z.enum(['7d', '30d', '90d']).optional().default('30d')
+  period: z.enum(['7d', '30d', '90d']).optional().default('30d'),
+  orgId: z.string().guid().optional()
 });
 
 export const postureQuerySchema = z.object({

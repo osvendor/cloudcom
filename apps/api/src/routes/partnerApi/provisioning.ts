@@ -21,10 +21,11 @@ import { ensureDefaultProfile } from '../../services/billingProfileService';
  * context per operation, mirroring the human write routes.
  */
 import { Hono } from 'hono';
-import { and, eq, isNull, ne, sql } from 'drizzle-orm';
+import { and, eq, isNull, sql } from 'drizzle-orm';
 import { z } from 'zod';
 import { isValidIanaTimezone } from '@breeze/shared';
 import { zValidator } from '../../lib/validation';
+import { refuseReservedBrandName } from '../../lib/reservedBrandName';
 import { createHash } from 'node:crypto';
 import {
   db,
@@ -72,6 +73,7 @@ import {
   type PartnerExportResource,
 } from './schemas';
 
+import { notHiddenOrgType } from '../../services/unassignedPool/visibility';
 // Same 365-day ceiling as the human enrollment-key routes (enrollmentKeys.ts
 // MAX_TTL_MINUTES / devices/core.ts ENROLL_TOKEN_MAX_TTL_MINUTES).
 const ENROLLMENT_KEY_MAX_TTL_MINUTES = 525_600;
@@ -132,7 +134,7 @@ function partnerEnrollmentKeyMaxTtlMinutes(): number {
 // partner always wins, and zod strips unrecognized keys on non-strict objects,
 // so a caller-supplied `partnerId` is silently ignored rather than trusted.
 const createOrganizationBodySchema = z.object({
-  name: z.string().min(1).max(255),
+  name: refuseReservedBrandName(z.string().min(1).max(255)),
   slug: z.string().min(1).max(100),
   type: z.enum(['customer', 'internal']).optional(),
   // Narrower than the human create schema on purpose: an unattended
@@ -290,7 +292,7 @@ partnerProvisioningRoutes.post(
         .where(and(
           eq(organizations.partnerId, partnerId),
           isNull(organizations.deletedAt),
-          ne(organizations.type, 'quick_support'),
+          notHiddenOrgType(),
         ));
       return tally?.value ?? 0;
     }
@@ -444,6 +446,8 @@ partnerProvisioningRoutes.post(
       name: organization.name,
       slug: organization.slug,
       type: organization.type,
+      // Same record shape as the org export; a just-created org has no links.
+      externalLinks: [],
     });
     return c.json(organizationCreateResponseSchema.parse({
       schemaVersion: '1' as const,

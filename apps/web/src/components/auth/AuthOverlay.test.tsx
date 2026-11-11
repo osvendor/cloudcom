@@ -659,3 +659,20 @@ describe('AuthOverlay refresh-throttle mask (#3696)', () => {
     expect(screen.queryByTestId('auth-throttled-overlay')).not.toBeInTheDocument();
   });
 });
+
+
+describe('AuthOverlay deferred cookie recovery', () => {
+  afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
+  it('redirects a rejected cookie even after the recovery effect rerenders', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    useAuthStore.setState({ ...AUTHENTICATED, tokens: null, authThrottledUntil: null });
+    let finish!: (value: 'auth-failed') => void;
+    vi.spyOn(authStoreModule, 'restoreAccessTokenFromCookieDetailed').mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+    const { navigateTo } = await import('../../lib/navigation');
+    vi.mocked(navigateTo).mockClear();
+    render(<AuthOverlay />);
+    await act(async () => { vi.advanceTimersByTime(60); });
+    await act(async () => { finish('auth-failed'); });
+    expect(navigateTo).toHaveBeenCalledWith('/login', { replace: true });
+  });
+});

@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -124,5 +125,46 @@ func TestRebuildCommand_TokenModeRequiresServer(t *testing.T) {
 	err := cmd.Execute()
 	if err == nil || !strings.Contains(err.Error(), "--server is required") {
 		t.Fatalf("expected the --server-required error, got: %v", err)
+	}
+}
+
+func TestRebuildCommand_WindowsFlags(t *testing.T) {
+	cmd := newRebuildCommand()
+	if err := cmd.ParseFlags([]string{"--drivers", `X:\a`, "--drivers", `X:\b`, "--force-disk", "--allow-domain-controller", "--work-root", `D:\scratch`}); err != nil {
+		t.Fatal(err)
+	}
+	dirs, err := cmd.Flags().GetStringArray("drivers")
+	if err != nil || len(dirs) != 2 || dirs[0] != `X:\a` || dirs[1] != `X:\b` {
+		t.Fatalf("drivers = %v, %v", dirs, err)
+	}
+	for _, name := range []string{"force-disk", "allow-domain-controller"} {
+		if v, err := cmd.Flags().GetBool(name); err != nil || !v {
+			t.Fatalf("%s = %v, %v", name, v, err)
+		}
+	}
+	if v, err := cmd.Flags().GetString("work-root"); err != nil || v != `D:\scratch` {
+		t.Fatalf("work-root = %q, %v", v, err)
+	}
+}
+
+// D20: --drivers stays parseable (an old script gets the clear refusal,
+// not "unknown flag"), but any value fails fast — before the provider
+// config is even read — with the engine's own operator-facing reason.
+func TestRebuildCommand_DriversRefusedFast(t *testing.T) {
+	dir := t.TempDir()
+	cmd := newRebuildCommand()
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs([]string{
+		"--drivers", `X:\a`,
+		"--provider-config", filepath.Join(dir, "missing.json"), "--snapshot", "s1",
+		"--target", "vhdx:" + filepath.Join(dir, "t.vhdx"),
+	})
+	err := cmd.Execute()
+	if err == nil || err.Error() != rebuild.DriverInjectionUnsupportedReason {
+		t.Fatalf("err = %v, want %q", err, rebuild.DriverInjectionUnsupportedReason)
+	}
+	if usage := cmd.Flags().Lookup("drivers").Usage; !strings.Contains(usage, "not supported yet") {
+		t.Fatalf("--drivers help = %q, want it to say driver injection is not supported yet", usage)
 	}
 }

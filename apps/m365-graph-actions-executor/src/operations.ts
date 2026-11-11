@@ -1,16 +1,18 @@
 import {
-  completeConsentResultSchema,
   retestResultSchema,
+  verifyConsentIdentityResultSchema,
   writeActionResultSchema,
-  type CompleteConsentRequest,
-  type CompleteConsentResult,
   type ExecutorFailureCode,
+  type IdentityFailureCode,
   type RetestRequest,
   type RetestResult,
+  type VerifyConsentIdentityRequest,
+  type VerifyConsentIdentityResult,
   type WriteActionRequest,
   type WriteActionResult,
 } from '@breeze/shared/m365';
 import type { PinnedCertificateProvider } from './credentials/types';
+import { ORGANIZATIONS_AUTHORITY } from './microsoft/clientAssertion';
 import { GraphClientError, type MicrosoftGraphClient } from './microsoft/graphClient';
 import {
   MicrosoftIdentityFailure,
@@ -117,54 +119,111 @@ async function fetchCredential(
   }
 }
 
-export async function completeConsentOperation(
-  request: CompleteConsentRequest,
+type IdentityFailureResult = { success: false; errorCode: IdentityFailureCode };
+
+function identityFailed(errorCode: IdentityFailureCode): IdentityFailureResult {
+  return { success: false, errorCode };
+}
+
+/** Only the two administrator-actionable identity outcomes survive; all else is invalid. */
+function identityFailureCode(error: unknown): IdentityFailureCode {
+  if (
+    error instanceof MicrosoftIdentityFailure
+    && (error.code === 'tenant_mismatch' || error.code === 'admin_role_required')
+  ) {
+    return error.code;
+  }
+  return 'identity_token_invalid';
+}
+
+/**
+ * Identity proof: redeem the v2 OIDC code at the expected tenant's authority
+ * (or `organizations` when none is expected) and verify the id_token. Throws
+ * the token-client / identity failure for the caller to map.
+ */
+async function proveAdministratorIdentity(
+  tokenClient: MicrosoftTokenClient,
+  input: { expectedTenantId: string | null; code: string; codeVerifier: string; nonce: string },
   dependencies: ExecutorOperationDependencies,
-): Promise<CompleteConsentResult> {
-  if (request.redirectUri !== dependencies.callbackUrl) return failed('identity_token_invalid');
+): Promise<VerifiedMicrosoftAdminIdentity> {
+  const idToken: OpaqueIdentityToken = await tokenClient.exchangeAuthorizationCode({
+    authority: input.expectedTenantId ?? ORGANIZATIONS_AUTHORITY,
+    code: input.code,
+    codeVerifier: input.codeVerifier,
+  });
+  return await dependencies.verifyIdentity(idToken, {
+    expectedTenantId: input.expectedTenantId,
+    clientId: dependencies.clientId,
+    nonce: input.nonce,
+  });
+}
+
+/**
+ * Application proof: app-only token for exactly `tenantId`, organization probe,
+ * and grant reconciliation. `finish` runs inside the same failure mapping so a
+ * result-schema rejection is still reported as a probe failure.
+ */
+async function proveApplication<T>(
+  tokenClient: MicrosoftTokenClient,
+  tenantId: string,
+  dependencies: ExecutorOperationDependencies,
+  finish: (verified: ReturnType<typeof verifiedResult>) => T,
+): Promise<T | ReturnType<typeof failed>> {
+  try {
+    const accessToken = await tokenClient.acquireGraphAppToken({ tenantId });
+    const observation = await dependencies.graphClient.probeTenant({ tenantId, accessToken });
+    const proofError = proofFailure(observation, {
+      tenantId,
+      applicationId: dependencies.clientId,
+    });
+    if (proofError) return failed(proofError);
+    return finish(verifiedResult(observation));
+  } catch (error) {
+    return failed(mappedFailure(error, error instanceof MicrosoftTokenClientError ? 'application' : 'probe'));
+  }
+}
+
+/**
+ * Identity-first consent, phase 1. Proves who the administrator is and which
+ * tenant they belong to; never acquires an application token or touches Graph,
+ * and returns no token material.
+ */
+export async function verifyIdentityOperation(
+  request: VerifyConsentIdentityRequest,
+  dependencies: ExecutorOperationDependencies,
+): Promise<VerifyConsentIdentityResult> {
+  if (request.redirectUri !== dependencies.callbackUrl) return identityFailed('identity_token_invalid');
+  if (request.expectedTenantId !== null && !CANONICAL_UUID.test(request.expectedTenantId)) {
+    return identityFailed('identity_token_invalid');
+  }
   const credential = await fetchCredential(dependencies);
-  if (typeof credential === 'string') return failed(credential);
+  if (typeof credential === 'string') return identityFailed('credential_unavailable');
   let tokenClient: MicrosoftTokenClient | undefined;
-  let identity: VerifiedMicrosoftAdminIdentity;
   try {
     try {
       tokenClient = dependencies.createTokenClient(credential);
     } catch {
-      return failed('credential_unavailable');
+      return identityFailed('credential_unavailable');
     }
-    let idToken: OpaqueIdentityToken;
+    let identity: VerifiedMicrosoftAdminIdentity;
     try {
-      idToken = await tokenClient.exchangeAuthorizationCode({
-        tenantId: request.tenantHint,
+      identity = await proveAdministratorIdentity(tokenClient, {
+        expectedTenantId: request.expectedTenantId,
         code: request.authorizationCode,
         codeVerifier: request.codeVerifier,
-      });
-      identity = await dependencies.verifyIdentity(idToken, {
-        tenantHint: request.tenantHint,
-        clientId: dependencies.clientId,
         nonce: request.nonce,
-      });
+      }, dependencies);
     } catch (error) {
-      return failed(mappedFailure(error, 'identity'));
+      return identityFailed(identityFailureCode(error));
     }
-    try {
-      const accessToken = await tokenClient.acquireGraphAppToken({ tenantId: identity.tenantId });
-      const observation = await dependencies.graphClient.probeTenant({
-        tenantId: identity.tenantId,
-        accessToken,
-      });
-      const proofError = proofFailure(observation, {
-        tenantId: identity.tenantId,
-        applicationId: dependencies.clientId,
-      });
-      if (proofError) return failed(proofError);
-      return completeConsentResultSchema.parse({
-        ...verifiedResult(observation),
-        administratorObjectId: identity.administratorObjectId,
-      });
-    } catch (error) {
-      return failed(mappedFailure(error, error instanceof MicrosoftTokenClientError ? 'application' : 'probe'));
-    }
+    const result = verifyConsentIdentityResultSchema.safeParse({
+      success: true,
+      tenantId: identity.tenantId,
+      administratorObjectId: identity.administratorObjectId,
+      administratorUsername: identity.administratorUsername,
+      verifiedAt: new Date().toISOString(),
+    });
+    return result.success ? result.data : identityFailed('identity_token_invalid');
   } finally {
     tokenClient = undefined;
     credential.certificatePem = '';
@@ -186,21 +245,9 @@ export async function retestOperation(
     } catch {
       return failed('credential_unavailable');
     }
-    try {
-      const accessToken = await tokenClient.acquireGraphAppToken({ tenantId: request.tenantId });
-      const observation = await dependencies.graphClient.probeTenant({
-        tenantId: request.tenantId,
-        accessToken,
-      });
-      const proofError = proofFailure(observation, {
-        tenantId: request.tenantId,
-        applicationId: dependencies.clientId,
-      });
-      if (proofError) return failed(proofError);
-      return retestResultSchema.parse(verifiedResult(observation));
-    } catch (error) {
-      return failed(mappedFailure(error, error instanceof MicrosoftTokenClientError ? 'application' : 'probe'));
-    }
+    return await proveApplication(tokenClient, request.tenantId, dependencies, (verified) => (
+      retestResultSchema.parse(verified)
+    ));
   } finally {
     tokenClient = undefined;
     credential.certificatePem = '';
@@ -262,7 +309,7 @@ export function createExecutorOperations(config: {
     verifyIdentity: verifyMicrosoftAdminIdentity,
   };
   return {
-    completeConsent: (request: CompleteConsentRequest) => completeConsentOperation(request, dependencies),
+    verifyIdentity: (request: VerifyConsentIdentityRequest) => verifyIdentityOperation(request, dependencies),
     retest: (request: RetestRequest) => retestOperation(request, dependencies),
     executeAction: (request: WriteActionRequest) => executeActionOperation(request, dependencies),
   };

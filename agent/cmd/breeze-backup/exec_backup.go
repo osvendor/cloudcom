@@ -5,12 +5,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/breeze-rmm/agent/internal/backup"
 	"github.com/breeze-rmm/agent/internal/backup/bmr"
+	"github.com/breeze-rmm/agent/internal/backup/integrity"
 	"github.com/breeze-rmm/agent/internal/backup/providers"
 	"github.com/breeze-rmm/agent/internal/backup/systemstate"
 	"github.com/breeze-rmm/agent/internal/backup/vss"
@@ -124,6 +127,11 @@ func (c *backupRunProviderConfig) credentials() (accessKey, secretKey string) {
 // command's VSS-by-default flip) is excluded from the Windows CI job, so a
 // runtime.GOOS-only assertion would be vacuous on the Linux runners that
 // actually run these tests.
+//
+// This decides the run-wide session only. Windows system-state collection
+// takes its own short-lived shadow copy of the system volume when no session
+// covers it, so a pathless system_image run still captures the registry hives
+// from a shadow copy rather than `reg.exe save` (#5397).
 func defaultVSS(goos string, systemImage bool, hasPaths bool) bool {
 	return goos == "windows" && (!systemImage || hasPaths)
 }
@@ -136,83 +144,41 @@ func defaultVSS(goos string, systemImage bool, hasPaths bool) bool {
 // dedupe only ever references this device's own previous snapshot (D6).
 var helperAgentID string
 
+// helperStagingDir is agent.yaml's backup_staging_dir, resolved at startup by
+// resolveBackupStagingDir (main.go). Empty means the OS temp dir. Carried into
+// the payload-built managers so the operator's staging override applies to
+// policy-managed devices too (#5460) — not only to the agent.yaml manager.
+var helperStagingDir string
+
+// resolveBackupStagingDir validates agent.yaml's backup_staging_dir: it
+// creates the directory and returns it, or returns "" (the OS temp dir) when
+// it is unset or cannot be created.
+func resolveBackupStagingDir(dir string) string {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return ""
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		slog.Error("configured backup staging dir cannot be created, falling back to OS temp dir", "dir", dir, "error", err.Error())
+		return ""
+	}
+	return dir
+}
+
 func managerFromBackupRunPayload(payload json.RawMessage) (*backup.BackupManager, error) {
 	if len(payload) == 0 {
 		return nil, nil
 	}
-	var p struct {
-		Provider       string                   `json:"provider"`
-		ProviderConfig *backupRunProviderConfig `json:"providerConfig"`
-		Paths          []string                 `json:"paths"`
-		// Excludes is only consumed here for the wholeMachine system_image
-		// branch below. Plain file-mode runs ignore this field on the
-		// manager config — their excludes flow through main.go's separate
-		// parseBackupRunExcludes + RunBackupContext(ctx, excludes) call,
-		// which takes precedence whenever the payload's top-level "excludes"
-		// key is present (see RunBackupContext's excludes==nil fallback).
-		Excludes    []string `json:"excludes"`
-		SystemImage bool     `json:"systemImage"`
-		// BaseSnapshotID/PublishLeaseExpiresAt implement the D18 §3.1
-		// server-owned-base protocol. BaseSnapshotID's presence in the JSON
-		// (vs. entirely absent) is the protocol switch: a *string stays nil
-		// when the field is omitted (older server, legacy bucket-listing
-		// mode) and becomes non-nil (possibly pointing at "") when present.
-		BaseSnapshotID        *string `json:"baseSnapshotId"`
-		PublishLeaseExpiresAt string  `json:"publishLeaseExpiresAt"`
-		// Vss lets the server force VSS on/off for this run. Not currently sent
-		// by apps/api/src/jobs/backupWorker.ts (a future policy toggle can); when
-		// absent the agent defaults it itself below.
-		Vss *bool `json:"vss,omitempty"`
-	}
-	if err := json.Unmarshal(payload, &p); err != nil {
-		return nil, fmt.Errorf("invalid backup_run payload: %w", err)
+	p, err := decodeBackupRunPayload(payload)
+	if err != nil {
+		return nil, err
 	}
 	if p.ProviderConfig == nil || p.Provider == "" {
 		return nil, nil
 	}
-	var publishLeaseExpiresAt time.Time
-	if p.PublishLeaseExpiresAt != "" {
-		parsed, parseErr := time.Parse(time.RFC3339, p.PublishLeaseExpiresAt)
-		if parseErr != nil {
-			return nil, fmt.Errorf("invalid backup_run payload: publishLeaseExpiresAt %q: %w", p.PublishLeaseExpiresAt, parseErr)
-		}
-		publishLeaseExpiresAt = parsed
-	}
-	// D18 §3.1 (P1 fix): publishLeaseExpiresAt is sent for EVERY
-	// server-owned-mode run — base or an explicit full run — never only
-	// when a base was actually chosen. A present baseSnapshotId (server-
-	// owned mode is ON, even if it points at "") with a missing, empty, or
-	// unparseable-to-zero lease means the dispatching server is violating
-	// its own protocol. Reject the WHOLE payload here rather than silently
-	// running server-owned mode ungated: main.go's caller turns this error
-	// into `fail(err.Error())`, so the backup_run command fails outright
-	// and uploads nothing.
-	if p.BaseSnapshotID != nil && publishLeaseExpiresAt.IsZero() {
-		return nil, fmt.Errorf("invalid backup_run payload: baseSnapshotId is present (server-owned mode) but publishLeaseExpiresAt is missing, empty, or zero")
-	}
-	// Symmetric defense-in-depth (review finding): the leaseGate installs
-	// on BaseSnapshotID != nil alone (backup.go), never on the lease value,
-	// so a payload that sent a non-zero lease WITHOUT baseSnapshotId would
-	// otherwise silently fall back to fully-unfenced legacy mode instead of
-	// getting the publish fence its own lease implies it wants. This can
-	// only happen if a dispatching server has a bug (the protocol ties the
-	// two together — baseSnapshotId's presence, even as "", IS the
-	// server-owned-mode switch per D18 §3.1), but reject it loudly here
-	// rather than silently downgrading to legacy/ungated.
-	if p.BaseSnapshotID == nil && !publishLeaseExpiresAt.IsZero() {
-		return nil, fmt.Errorf("invalid backup_run payload: publishLeaseExpiresAt is present but baseSnapshotId is absent (server-owned mode requires both fields together)")
-	}
-	// vssEnabled defaults to on for server-dispatched Windows file backups so
-	// locked files (open documents, DB files) aren't silently skipped — VSS
-	// failure is already non-fatal (backup.go's RunBackupWithExcludes proceeds
-	// without it), so this can't newly break Linux/macOS or Windows hosts
-	// without VSS. system_image mode manages its own consistency via system
-	// state collection, so it stays off there unless the payload overrides it.
-	// The server can force it either way via the optional `vss` field (not
-	// currently sent by apps/api/src/jobs/backupWorker.ts).
-	vssEnabled := defaultVSS(runtime.GOOS, p.SystemImage, len(p.Paths) > 0)
-	if p.Vss != nil {
-		vssEnabled = *p.Vss
+	publishLeaseExpiresAt, vssEnabled, err := p.runSettings()
+	if err != nil {
+		return nil, err
 	}
 	var provider providers.BackupProvider
 	switch p.Provider {
@@ -237,6 +203,122 @@ func managerFromBackupRunPayload(payload json.RawMessage) (*backup.BackupManager
 	default:
 		return nil, fmt.Errorf("unsupported backup provider %q", p.Provider)
 	}
+	return backupRunManager(p, publishLeaseExpiresAt, vssEnabled, provider)
+}
+
+// brokeredBackupRunManager builds the backup_run manager for a payload that
+// carries a write-scoped storage session: provider is the session's writer
+// and the ONLY storage the run uses. A brokered run must be in server-owned
+// mode (a server-selected base, possibly none, plus a publish lease); a
+// payload without one fails closed instead of listing storage for a base.
+func brokeredBackupRunManager(payload json.RawMessage, provider providers.BackupProvider) (*backup.BackupManager, error) {
+	p, err := decodeBackupRunPayload(payload)
+	if err != nil {
+		return nil, err
+	}
+	publishLeaseExpiresAt, vssEnabled, err := p.runSettings()
+	if err != nil {
+		return nil, err
+	}
+	if p.BaseSnapshotID == nil {
+		return nil, fmt.Errorf("storage session: a brokered backup requires a server-selected base (baseSnapshotId)")
+	}
+	return backupRunManager(p, publishLeaseExpiresAt, vssEnabled, provider)
+}
+
+// backupRunPayload is the part of a backup_run payload the run manager is
+// built from.
+type backupRunPayload struct {
+	Provider       string                   `json:"provider"`
+	ProviderConfig *backupRunProviderConfig `json:"providerConfig"`
+	Paths          []string                 `json:"paths"`
+	// Excludes is only consumed here for the wholeMachine system_image
+	// branch below. Plain file-mode runs ignore this field on the
+	// manager config — their excludes flow through main.go's separate
+	// parseBackupRunExcludes + RunBackupContext(ctx, excludes) call,
+	// which takes precedence whenever the payload's top-level "excludes"
+	// key is present (see RunBackupContext's excludes==nil fallback).
+	Excludes    []string `json:"excludes"`
+	SystemImage bool     `json:"systemImage"`
+	// BaseSnapshotID/PublishLeaseExpiresAt implement the D18 §3.1
+	// server-owned-base protocol. BaseSnapshotID's presence in the JSON
+	// (vs. entirely absent) is the protocol switch: a *string stays nil
+	// when the field is omitted (older server, legacy bucket-listing
+	// mode) and becomes non-nil (possibly pointing at "") when present.
+	BaseSnapshotID        *string `json:"baseSnapshotId"`
+	PublishLeaseExpiresAt string  `json:"publishLeaseExpiresAt"`
+	// JobID is the dispatched backup job; a snapshot attestation names
+	// it. BaseAttestation is the server's record of the pinned base's
+	// manifest, which the run checks the downloaded base against.
+	JobID           string                  `json:"jobId"`
+	BaseAttestation *backup.BaseAttestation `json:"baseAttestation"`
+	// Vss lets the server force VSS on/off for this run. Not currently sent
+	// by apps/api/src/jobs/backupWorker.ts (a future policy toggle can); when
+	// absent the agent defaults it itself below.
+	Vss *bool `json:"vss,omitempty"`
+}
+
+// decodeBackupRunPayload decodes a backup_run payload.
+func decodeBackupRunPayload(payload json.RawMessage) (backupRunPayload, error) {
+	var p backupRunPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return p, fmt.Errorf("invalid backup_run payload: %w", err)
+	}
+	return p, nil
+}
+
+// runSettings validates the payload's server-owned-base fields and returns
+// the publish lease and the VSS choice.
+func (p backupRunPayload) runSettings() (publishLeaseExpiresAt time.Time, vssEnabled bool, err error) {
+	if p.PublishLeaseExpiresAt != "" {
+		parsed, parseErr := time.Parse(time.RFC3339, p.PublishLeaseExpiresAt)
+		if parseErr != nil {
+			return time.Time{}, false, fmt.Errorf("invalid backup_run payload: publishLeaseExpiresAt %q: %w", p.PublishLeaseExpiresAt, parseErr)
+		}
+		publishLeaseExpiresAt = parsed
+	}
+	// D18 §3.1 (P1 fix): publishLeaseExpiresAt is sent for EVERY
+	// server-owned-mode run — base or an explicit full run — never only
+	// when a base was actually chosen. A present baseSnapshotId (server-
+	// owned mode is ON, even if it points at "") with a missing, empty, or
+	// unparseable-to-zero lease means the dispatching server is violating
+	// its own protocol. Reject the WHOLE payload here rather than silently
+	// running server-owned mode ungated: main.go's caller turns this error
+	// into `fail(err.Error())`, so the backup_run command fails outright
+	// and uploads nothing.
+	if p.BaseSnapshotID != nil && publishLeaseExpiresAt.IsZero() {
+		return time.Time{}, false, fmt.Errorf("invalid backup_run payload: baseSnapshotId is present (server-owned mode) but publishLeaseExpiresAt is missing, empty, or zero")
+	}
+	// Symmetric defense-in-depth (review finding): the leaseGate installs
+	// on BaseSnapshotID != nil alone (backup.go), never on the lease value,
+	// so a payload that sent a non-zero lease WITHOUT baseSnapshotId would
+	// otherwise silently fall back to fully-unfenced legacy mode instead of
+	// getting the publish fence its own lease implies it wants. This can
+	// only happen if a dispatching server has a bug (the protocol ties the
+	// two together — baseSnapshotId's presence, even as "", IS the
+	// server-owned-mode switch per D18 §3.1), but reject it loudly here
+	// rather than silently downgrading to legacy/ungated.
+	if p.BaseSnapshotID == nil && !publishLeaseExpiresAt.IsZero() {
+		return time.Time{}, false, fmt.Errorf("invalid backup_run payload: publishLeaseExpiresAt is present but baseSnapshotId is absent (server-owned mode requires both fields together)")
+	}
+	// vssEnabled defaults to on for server-dispatched Windows file backups so
+	// locked files (open documents, DB files) aren't silently skipped — VSS
+	// failure is already non-fatal (backup.go's RunBackupWithExcludes proceeds
+	// without it), so this can't newly break Linux/macOS or Windows hosts
+	// without VSS. system_image mode manages its own consistency via system
+	// state collection, so it stays off there unless the payload overrides it.
+	// The server can force it either way via the optional `vss` field (not
+	// currently sent by apps/api/src/jobs/backupWorker.ts).
+	vssEnabled = defaultVSS(runtime.GOOS, p.SystemImage, len(p.Paths) > 0)
+	if p.Vss != nil {
+		vssEnabled = *p.Vss
+	}
+	return publishLeaseExpiresAt, vssEnabled, nil
+}
+
+// backupRunManager builds the manager for a parsed backup_run payload writing
+// through provider.
+func backupRunManager(p backupRunPayload, publishLeaseExpiresAt time.Time, vssEnabled bool, provider providers.BackupProvider) (*backup.BackupManager, error) {
 	// system_image mode carries no file paths: the backup content is the
 	// collected system-state staging dir. The server fans a `system_image`
 	// selection out as a backup_run with `systemImage:true` and no `paths`
@@ -255,6 +337,8 @@ func managerFromBackupRunPayload(payload json.RawMessage) (*backup.BackupManager
 			AgentVersion:          version,
 			BaseSnapshotID:        p.BaseSnapshotID,
 			PublishLeaseExpiresAt: publishLeaseExpiresAt,
+			JobID:                 p.JobID,
+			BaseAttestation:       p.BaseAttestation,
 		}
 		// #5493: a wholeMachine system_image selection fans out with Paths
 		// set (backupWorker.ts resolveBackupTargets), so this run ALSO walks
@@ -264,6 +348,11 @@ func managerFromBackupRunPayload(payload json.RawMessage) (*backup.BackupManager
 		if len(p.Paths) > 0 {
 			cfg.Paths = p.Paths
 			cfg.Excludes = p.Excludes
+			// W06: a whole-machine snapshot must carry every file's and
+			// directory's NTFS security descriptor, or a bare-metal rebuild
+			// lands the OS with inherited ACLs only. No-op off Windows.
+			// Plain file-mode backups (below) leave it off.
+			cfg.CaptureSecurityDescriptors = true
 		}
 		return backup.NewBackupManager(cfg), nil
 	}
@@ -286,6 +375,8 @@ func managerFromBackupRunPayload(payload json.RawMessage) (*backup.BackupManager
 		AgentVersion:          version,
 		BaseSnapshotID:        p.BaseSnapshotID,
 		PublishLeaseExpiresAt: publishLeaseExpiresAt,
+		JobID:                 p.JobID,
+		BaseAttestation:       p.BaseAttestation,
 	}), nil
 }
 
@@ -353,8 +444,10 @@ func restoreProviderFromPayload(payload json.RawMessage) (providers.BackupProvid
 // execHypervRestore, etc.) — never mgr.RunBackupContext — so unlike
 // managerFromBackupRunPayload (which requires paths, or systemImage,
 // because backup_run actually drives a full backup through the manager)
-// this builder needs nothing but a provider. GetStagingDir() on a
-// zero-value StagingDir returns "", and every remaining GetStagingDir()
+// this builder needs nothing but a provider — plus agent.yaml's
+// backup_staging_dir (helperStagingDir), so a Hyper-V export stages where the
+// operator pointed it (#5460). GetStagingDir() on an unset
+// StagingDir returns "", and every remaining GetStagingDir()
 // caller already passes that straight to os.MkdirTemp, which treats "" as
 // "use the OS default temp dir" — so an unset StagingDir here is safe, not
 // a bug.
@@ -379,8 +472,9 @@ func managerFromProviderPayload(payload json.RawMessage) (*backup.BackupManager,
 		return nil, nil
 	}
 	return backup.NewBackupManager(backup.BackupConfig{
-		Provider: provider,
-		AgentID:  helperAgentID,
+		Provider:   provider,
+		AgentID:    helperAgentID,
+		StagingDir: helperStagingDir,
 	}), nil
 }
 
@@ -391,22 +485,35 @@ func managerFromProviderPayload(payload json.RawMessage) (*backup.BackupManager,
 // preserved: when a vault provider is configured it still wraps the resolved
 // primary via NewFallbackProvider, whether the primary came from the payload
 // or from mgr.
-func restoreProviderForCommand(payload json.RawMessage, mgr *backup.BackupManager, vaultState *vaultManagerRef) (providers.BackupProvider, error) {
+//
+// A payload carrying a storageSession is served through that session ONLY:
+// no vault wrapping, no agent.yaml manager, no providerConfig. Any session
+// problem is returned as an error. The returned release func (never nil)
+// must be called when the command is done.
+func restoreProviderForCommand(ctx context.Context, payload json.RawMessage, mgr *backup.BackupManager, vaultState *vaultManagerRef) (providers.BackupProvider, func(), error) {
+	noop := func() {}
+	session, err := storageSessionProvider(ctx, payload)
+	if err != nil {
+		return nil, noop, err
+	}
+	if session != nil {
+		return session, session.Close, nil
+	}
 	payloadProvider, err := restoreProviderFromPayload(payload)
 	if err != nil {
-		return nil, err
+		return nil, noop, err
 	}
 	if payloadProvider == nil {
-		return resolveRestoreProvider(mgr, vaultState), nil
+		return resolveRestoreProvider(mgr, vaultState), noop, nil
 	}
 	if vaultState != nil {
 		if vaultMgr := vaultState.Get(); vaultMgr != nil {
 			if vaultProvider := vaultMgr.GetProvider(); vaultProvider != nil {
-				return providers.NewFallbackProvider(vaultProvider, payloadProvider), nil
+				return providers.NewFallbackProvider(vaultProvider, payloadProvider), noop, nil
 			}
 		}
 	}
-	return payloadProvider, nil
+	return payloadProvider, noop, nil
 }
 
 func resolveRestoreProvider(mgr *backup.BackupManager, vaultState *vaultManagerRef) providers.BackupProvider {
@@ -436,10 +543,16 @@ func execBackupRestore(payload json.RawMessage, mgr *backup.BackupManager, vault
 }
 
 func execBackupRestoreWithProgress(ctx context.Context, commandID string, payload json.RawMessage, mgr *backup.BackupManager, vaultState *vaultManagerRef, conn *ipc.Conn) backupipc.BackupCommandResult {
-	restoreProvider, err := restoreProviderForCommand(payload, mgr, vaultState)
+	// The integrity block is read before storage is touched.
+	expectation, err := integrity.FromPayload(payload)
 	if err != nil {
 		return fail(err.Error())
 	}
+	restoreProvider, releaseProvider, err := restoreProviderForCommand(ctx, payload, mgr, vaultState)
+	if err != nil {
+		return fail(err.Error())
+	}
+	defer releaseProvider()
 	if restoreProvider == nil {
 		return fail("backup not configured on this device")
 	}
@@ -459,6 +572,7 @@ func execBackupRestoreWithProgress(ctx context.Context, commandID string, payloa
 		TargetPath:    p.TargetPath,
 		SelectedPaths: p.SelectedPaths,
 		WorkRoot:      backupRestoreWorkRoot(),
+		Integrity:     expectation,
 	}
 
 	var progressFn backup.ProgressFunc
@@ -485,15 +599,42 @@ func execBackupRestoreWithProgress(ctx context.Context, commandID string, payloa
 	return marshalRestoreResult(result, err)
 }
 
-func execBackupVerify(payload json.RawMessage, mgr *backup.BackupManager, vaultState *vaultManagerRef) backupipc.BackupCommandResult {
-	return execBackupVerifyContext(context.Background(), payload, mgr, vaultState)
+// verifyRunBudget bounds each backup_verify / backup_test_restore run so it
+// reports its partial counts before the agent's forward wait expires (see
+// backupipc.VerifyRunBudget, #6598). A var so tests can shorten it.
+var verifyRunBudget = backupipc.VerifyRunBudget
+
+// verifyOptions builds the run options for a verify or test restore:
+// the run budget, and progress over conn (nil conn = log-only progress).
+func verifyOptions(conn *ipc.Conn, commandID, phase string) backup.VerifyOptions {
+	var send func(backupipc.BackupProgress)
+	if conn != nil {
+		send = func(p backupipc.BackupProgress) { sendBackupRunProgress(conn, commandID, p) }
+	}
+	return backup.VerifyOptions{
+		TimeBudget: verifyRunBudget,
+		Progress:   newVerifyProgressReporter(send, commandID, phase, verifyProgressInterval, time.Now),
+	}
 }
 
-func execBackupVerifyContext(ctx context.Context, payload json.RawMessage, mgr *backup.BackupManager, vaultState *vaultManagerRef) backupipc.BackupCommandResult {
-	restoreProvider, err := restoreProviderForCommand(payload, mgr, vaultState)
+func execBackupVerify(payload json.RawMessage, mgr *backup.BackupManager, vaultState *vaultManagerRef) backupipc.BackupCommandResult {
+	return execBackupVerifyContext(context.Background(), "", payload, mgr, vaultState, nil)
+}
+
+// execBackupVerifyContext runs a backup_verify. When the run budget elapses
+// the result is still a successful command whose body carries the partial
+// counts and a `partial`/`failed` status — the API reads the verification
+// body only from a completed command. conn may be nil.
+func execBackupVerifyContext(ctx context.Context, commandID string, payload json.RawMessage, mgr *backup.BackupManager, vaultState *vaultManagerRef, conn *ipc.Conn) backupipc.BackupCommandResult {
+	expectation, err := integrity.FromPayload(payload)
 	if err != nil {
 		return fail(err.Error())
 	}
+	restoreProvider, releaseProvider, err := restoreProviderForCommand(ctx, payload, mgr, vaultState)
+	if err != nil {
+		return fail(err.Error())
+	}
+	defer releaseProvider()
 	if restoreProvider == nil {
 		return fail("backup not configured on this device")
 	}
@@ -503,19 +644,28 @@ func execBackupVerifyContext(ctx context.Context, payload json.RawMessage, mgr *
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return fail("invalid verify payload: " + err.Error())
 	}
-	result, err := backup.VerifyIntegrityContext(ctx, restoreProvider, p.SnapshotID)
+	opts := verifyOptions(conn, commandID, "verifying")
+	opts.Integrity = expectation
+	result, err := backup.VerifyIntegrityWithOptions(ctx, restoreProvider, p.SnapshotID, opts)
 	return marshalResult(result, err)
 }
 
 func execBackupTestRestore(payload json.RawMessage, mgr *backup.BackupManager, vaultState *vaultManagerRef) backupipc.BackupCommandResult {
-	return execBackupTestRestoreContext(context.Background(), payload, mgr, vaultState)
+	return execBackupTestRestoreContext(context.Background(), "", payload, mgr, vaultState, nil)
 }
 
-func execBackupTestRestoreContext(ctx context.Context, payload json.RawMessage, mgr *backup.BackupManager, vaultState *vaultManagerRef) backupipc.BackupCommandResult {
-	restoreProvider, err := restoreProviderForCommand(payload, mgr, vaultState)
+// execBackupTestRestoreContext runs a backup_test_restore; see
+// execBackupVerifyContext for the budget and progress behaviour.
+func execBackupTestRestoreContext(ctx context.Context, commandID string, payload json.RawMessage, mgr *backup.BackupManager, vaultState *vaultManagerRef, conn *ipc.Conn) backupipc.BackupCommandResult {
+	expectation, err := integrity.FromPayload(payload)
 	if err != nil {
 		return fail(err.Error())
 	}
+	restoreProvider, releaseProvider, err := restoreProviderForCommand(ctx, payload, mgr, vaultState)
+	if err != nil {
+		return fail(err.Error())
+	}
+	defer releaseProvider()
 	if restoreProvider == nil {
 		return fail("backup not configured on this device")
 	}
@@ -525,7 +675,9 @@ func execBackupTestRestoreContext(ctx context.Context, payload json.RawMessage, 
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return fail("invalid test restore payload: " + err.Error())
 	}
-	result, err := backup.TestRestoreContext(ctx, restoreProvider, p.SnapshotID, backupRestoreWorkRoot(), nil)
+	opts := verifyOptions(conn, commandID, "test_restore")
+	opts.Integrity = expectation
+	result, err := backup.TestRestoreWithOptions(ctx, restoreProvider, p.SnapshotID, backupRestoreWorkRoot(), opts)
 	return marshalResult(result, err)
 }
 
@@ -594,7 +746,8 @@ func execVSS(cmdType string) backupipc.BackupCommandResult {
 // --- system state & BMR ---
 
 func execSystemStateCollect() backupipc.BackupCommandResult {
-	manifest, stagingDir, err := systemstate.CollectSystemState()
+	// No caller context on this IPC path; the collector's own deadlines bound it.
+	manifest, stagingDir, err := systemstate.CollectSystemState(context.Background())
 	if err != nil {
 		return fail(err.Error())
 	}
@@ -602,7 +755,7 @@ func execSystemStateCollect() backupipc.BackupCommandResult {
 }
 
 func execHardwareProfile() backupipc.BackupCommandResult {
-	profile, err := systemstate.CollectHardwareOnly()
+	profile, err := systemstate.CollectHardwareOnly(context.Background())
 	return marshalResult(profile, err)
 }
 
@@ -614,6 +767,14 @@ func execBMRRecover(ctx context.Context, payload json.RawMessage, _ *backup.Back
 	if cfg.RecoveryToken == "" || cfg.ServerURL == "" {
 		return fail("bmr recovery requires recoveryToken and serverUrl")
 	}
+	// The payload's `integrity` block; the recovery resolves it with the
+	// bootstrap's (bmr.ResolveIntegrity). A block this helper cannot read
+	// fails the command before anything is contacted or written.
+	expectation, err := integrity.FromPayload(payload)
+	if err != nil {
+		return fail("bmr recovery: " + err.Error())
+	}
+	cfg.Integrity = expectation
 	result, err := runBMRRecovery(ctx, cfg)
 	return marshalResult(result, err)
 }

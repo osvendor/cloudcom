@@ -137,6 +137,11 @@ test('routes the enumerated customer portal remote surface to focused real-DB co
   const configuration = classify(['docker-compose.yml']);
   assert.equal(configuration.portalRemote, true);
   assert.equal(configuration.infra, true);
+  const developmentConfiguration = classify(['docker-compose.dev.yml']);
+  assert.equal(developmentConfiguration.api, true);
+  assert.equal(developmentConfiguration.portalRemote, true);
+  assert.equal(developmentConfiguration.infra, true);
+  assert.deepEqual(developmentConfiguration.unsupported, []);
   assert.deepEqual(classify(['apps/api/src/routes/portal/reports.ts']).unsupported, ['apps/api/src/routes/portal/reports.ts']);
 });
 
@@ -144,6 +149,8 @@ test('routes the intake guard and installer checksum through infrastructure chec
   for (const path of [
     'scripts/release/require-upstream-intake.mjs',
     'scripts/release/require-upstream-intake.test.mjs',
+    'scripts/release/inspect-candidate-archive.py',
+    'scripts/release/inspect-candidate-archive.test.mjs',
     'apps/web/public/scripts/SHA256SUMS',
   ]) {
     const result = classify([path]);

@@ -1,3 +1,4 @@
+import { useRecordPageContext } from '@/hooks/useRecordPageContext';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import '../../../lib/i18n';
@@ -14,6 +15,9 @@ import { MarginToggle } from '../billingUi';
 import { useShowInternalMargin } from './quoteEditorShared';
 import { useOrgStore } from '../../../stores/orgStore';
 import { STATUS_ROLES, type QuoteDetail as QuoteDetailData, resolveQuoteOrgName } from './quoteTypes';
+import { useStableT } from '@/lib/i18n/useStableT';
+import { usePageItemName } from '../../layout/usePageItemName';
+import WispTalkButton from '@/components/wisp/WispTalkButton';
 
 const UNAUTHORIZED = () => void navigateTo('/login', { replace: true });
 
@@ -38,8 +42,11 @@ function readTab(isDraft: boolean): Tab {
 
 export default function QuoteWorkspace({ id }: Props) {
   const { t } = useTranslation('billing');
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   const organizations = useOrgStore((s) => s.organizations);
   const [detail, setDetail] = useState<QuoteDetailData | null>(null);
+  usePageItemName(detail ? [detail.quote.quoteNumber, detail.quote.title?.trim()].filter(Boolean).join(' ') : undefined);
+  useRecordPageContext(detail ? { kind: 'quote', id: detail.quote.id, orgId: detail.quote.orgId, label: detail.quote.quoteNumber ?? (detail.quote.title?.trim() || t('quotes.workspace.draftTitle')) } : null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
   const [tab, setTab] = useState<Tab>('editor');
@@ -99,7 +106,7 @@ export default function QuoteWorkspace({ id }: Props) {
   // canvas. A quiet failure still stays silent HERE — reporting it is the
   // caller's job, since only the caller knows what the user was promised.
   const fetchDetail = useCallback(async (quiet = false): Promise<boolean> => {
-    if (!id) { setError(t('quotes.workspace.errors.missingId')); setLoading(false); return false; }
+    if (!id) { setError(stableT('quotes.workspace.errors.missingId')); setLoading(false); return false; }
     const seq = ++fetchSeq.current;
     try {
       if (!quiet) setLoading(true);
@@ -109,8 +116,8 @@ export default function QuoteWorkspace({ id }: Props) {
       // contract runAction follows), so this counts as handled, not as a stale
       // view the caller should warn about on top of a navigation.
       if (res.status === 401) { UNAUTHORIZED(); return true; }
-      if (res.status === 404) { if (!quiet) setError(t('quotes.workspace.errors.notFound')); return false; }
-      if (!res.ok) throw new Error(t('quotes.workspace.errors.loadFailed'));
+      if (res.status === 404) { if (!quiet) setError(stableT('quotes.workspace.errors.notFound')); return false; }
+      if (!res.ok) throw new Error(stableT('quotes.workspace.errors.loadFailed'));
       const body = (await res.json()) as { data: QuoteDetailData };
       // Superseded by a newer refetch that already landed: dropping this stale
       // payload is the correct outcome, and the view IS fresh — the newer
@@ -122,12 +129,12 @@ export default function QuoteWorkspace({ id }: Props) {
     } catch (err) {
       // A failed quiet reload leaves the editor intact and mounted; the caller
       // decides whether the user needs to hear about the stale view.
-      if (!quiet) setError(err instanceof Error ? err.message : t('quotes.workspace.errors.loadFailed'));
+      if (!quiet) setError(err instanceof Error ? err.message : stableT('quotes.workspace.errors.loadFailed'));
       return false;
     } finally {
       if (!quiet) setLoading(false);
     }
-  }, [id, t]);
+  }, [id, stableT]);
 
   const load = useCallback(() => fetchDetail(false), [fetchDetail]);
   const reload = useCallback(() => fetchDetail(true), [fetchDetail]);
@@ -248,6 +255,7 @@ export default function QuoteWorkspace({ id }: Props) {
           {isDraft && activeTab === 'editor' && (
             <MarginToggle show={showInternal} onToggle={toggleShowInternal} testId="quote-editor-toggle-internal" size="md" />
           )}
+          <WispTalkButton kind="quote" id={detail.quote.id} orgId={detail.quote.orgId} label={detail.quote.quoteNumber ?? (detail.quote.title?.trim() || t('quotes.workspace.draftTitle'))} />
           <QuoteActions detail={detail} onChanged={reload} variant="header" savePending={editorSavePending || titleSavePending || customerSavePending} unsavedFieldLabel={editorUnsavedField ?? titleUnsavedField} saveFailureNonce={saveFailureNonce} onSendWhilePending={flushEditorPendingDeletes} />
         </>
       }

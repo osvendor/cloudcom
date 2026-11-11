@@ -37,7 +37,10 @@ vi.mock('bullmq', () => ({
   Worker: class {},
   Job: class {},
   UnrecoverableError: class extends Error {},
+  DelayedError: class extends Error {},
 }));
+
+vi.mock('../services/capacityGuard', () => ({ canRunBackgroundWork: () => true }));
 
 vi.mock('../db', () => ({
   db: mockDb,

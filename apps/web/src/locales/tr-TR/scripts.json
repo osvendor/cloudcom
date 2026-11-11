@@ -3,7 +3,8 @@
     "errors": {
       "fetch": "Otomasyon getirilemedi",
       "generic": "Bir hata oluştu",
-      "save": "Otomasyon kaydedilemedi"
+      "save": "Otomasyon kaydedilemedi",
+      "invalidTarget": "Cihaz hedefi geçersiz: {{detail}}"
     },
     "loading": "Otomasyon yükleniyor...",
     "breadcrumb": {
@@ -25,7 +26,8 @@
     },
     "actions": {
       "create": "Otomasyon Oluşturun",
-      "saveChanges": "Değişiklikleri Kaydet"
+      "saveChanges": "Değişiklikleri Kaydet",
+      "backToAutomations": "İşlere Dön"
     }
   },
   "automationForm": {
@@ -51,6 +53,11 @@
         "weekdaysNine": "Hafta içi sabah 9'da",
         "weeklySunday": "Haftalık Pazar"
       }
+    },
+    "alertWorkflow": {
+      "severity": "Önem dereceleri",
+      "kind": "Monitör türleri",
+      "hint": "Her değeri eşleştirmek için grubu boş bırakın. Mevcut gelişmiş filtreler korunur."
     },
     "validation": {
       "valueRequired": "Değer gerekli",
@@ -158,7 +165,8 @@
       "command": "Komut",
       "whenOffline": "Cihaz çevrimdışıysa",
       "software": "Yazılım",
-      "failureNotificationChannel": "Arıza Bildirim Kanalı"
+      "failureNotificationChannel": "Arıza Bildirim Kanalı",
+      "actionType": "Eylem türü"
     },
     "options": {
       "whenOffline": {
@@ -203,7 +211,9 @@
     },
     "empty": {
       "noActions": "Tanımlanmış eylem yok. Bir tane oluşturmak için \"Eylem Ekle\"yi tıklayın."
-    }
+    },
+    "partnerGroupsNote": "Ortak geneli otomasyonlar belirli cihaz gruplarını veya cihazları hedefleyemez, çünkü her biri tek bir kuruluşa aittir. Tüm Cihazlar veya Gelişmiş Filtre kullanın.",
+    "partnerTargetBlocked": "Bu ortak geneli otomasyon belirli cihaz gruplarını veya cihazları hedefliyor; bu desteklenmez. Kaydetmeden önce hedefi Tüm Cihazlar veya Gelişmiş Filtre olarak değiştirin."
   },
   "automationList": {
     "elevated": "Yükseltilmiş yetkiler",
@@ -218,7 +228,9 @@
     "searchPlaceholder": "Arama otomasyonları...",
     "filters": {
       "allTriggers": "Tüm Tetikleyiciler",
-      "allStatus": "Tüm Durumlar"
+      "allStatus": "Tüm Durumlar",
+      "triggerLabel": "Tetikleyici",
+      "statusLabel": "Durum"
     },
     "trigger": {
       "schedule": "Program",
@@ -327,6 +339,14 @@
       "awaiting": "Temsilcinin rapor vermesi bekleniyor…",
       "truncated": "Çıktı kesildi — tam metin için cihazın komut dosyası geçmişine bakın."
     },
+    "commandOutput": {
+      "show_one": "Komut çıktısını göster",
+      "show_other": "Komut çıktısını göster ({{count}})",
+      "hide_one": "Komut çıktısını gizle",
+      "hide_other": "Komut çıktısını gizle ({{count}})",
+      "label": "Komut (eylem {{index}})",
+      "truncated": "Çıktı kısaltıldı — tam metin bu görünümde gösterilmez."
+    },
     "errors": {
       "cancelRun": "Çalıştırma iptal edilemedi."
     }
@@ -361,7 +381,7 @@
       "scheduled": "Zamanlanmış",
       "on-demand": "İsteğe bağlı",
       "webhooks": "Webhook'lar",
-      "event-rules": "Olay kuralları"
+      "event-rules": "Uyarı iş akışları"
     }
   },
   "complianceDashboard": {
@@ -403,12 +423,17 @@
     "empty": {
       "noPolicies": "Hiçbir politika yapılandırılmadı",
       "allCompliant": "Tüm cihazlar uyumludur!",
+      "notEvaluated": "Henüz hiçbir cihaz değerlendirilmedi.",
+      "noViolationsPending_one": "İhlal bulunamadı; {{count}} cihazın değerlendirmesi hâlâ bekliyor.",
+      "noViolationsPending_other": "İhlal bulunamadı; {{count}} cihazın değerlendirmesi hâlâ bekliyor.",
       "noMatchingDevices": "Eşleşen cihaz bulunamadı."
     },
     "policyComplianceRatio": "{{compliant}} / {{total}} uyumlu",
     "searchDevices": "Cihazları arayın...",
-    "violationCount": "{{count}} ihlali",
-    "moreViolations": "+{{count}} daha fazla ihlal",
+    "violationCount_one": "{{count}} ihlal",
+    "violationCount_other": "{{count}} ihlal",
+    "moreViolations_one": "+{{count}} ihlal daha",
+    "moreViolations_other": "+{{count}} ihlal daha",
     "lastChecked": "Son kontrol: {{date}}",
     "pagination": {
       "showing": "{{start}} ila {{end}} / {{total}} gösteriliyor",
@@ -421,6 +446,7 @@
       "generic": "Bir hata oluştu"
     },
     "loading": "Uyumluluk verileri yükleniyor...",
+    "backToPolicies": "Politikalara Dön",
     "policyTitle": "Uyumluluk: {{policy}}",
     "policyFallback": "Politika",
     "title": "Uyumluluk Kontrol Paneli",
@@ -478,7 +504,8 @@
     },
     "actions": {
       "create": "Politika Oluştur",
-      "saveChanges": "Değişiklikleri Kaydet"
+      "saveChanges": "Değişiklikleri Kaydet",
+      "backToPolicies": "Politikalara Dön"
     }
   },
   "policyForm": {
@@ -537,7 +564,8 @@
     },
     "actions": {
       "savePolicy": "Kaydetme politikası",
-      "addRule": "Kural Ekle"
+      "addRule": "Kural Ekle",
+      "removeRule": "Kuralı Kaldır"
     },
     "fields": {
       "name": "Politika adı",
@@ -555,7 +583,8 @@
       "configFilePath": "Yapılandırma Dosyası Yolu",
       "configKey": "Yapılandırma Anahtarı",
       "remediationScript": "Düzeltme Komut Dosyası",
-      "evaluateEvery": "Her Şeyi Değerlendirin"
+      "evaluateEvery": "Her Şeyi Değerlendirin",
+      "ruleType": "Kural türü"
     },
     "placeholders": {
       "name": "Güvenlik temel politikası",
@@ -612,7 +641,9 @@
     "searchPlaceholder": "Arama politikaları...",
     "filters": {
       "allEnforcement": "Tüm Yaptırımlar",
-      "allStatus": "Tüm Durumlar"
+      "allStatus": "Tüm Durumlar",
+      "enforcementLabel": "Uygulama",
+      "statusLabel": "Durum"
     },
     "enforcement": {
       "monitor": {
@@ -689,6 +720,8 @@
       "timeout": "Komut dosyası yürütme zaman aşımına uğradı",
       "pending": "Komut dosyası çalıştırılmayı bekliyor",
       "queued": "Komut dosyası cihaza gönderilmek üzere sırada",
+      "queuedAwaitingPickup": "Henüz etkin bir ajan oturumu bunu almadı. Betik, cihazın ajanı bir sonraki bağlantısında teslim edilir.",
+      "deviceOffline": "Cihaz çevrimdışı. Betik, cihaz yeniden bağlandığında teslim edilir.",
       "cancelling": "Durdurma istendi — cihazdan onay bekleniyor.",
       "cancelled": "Komut dosyası cihazda durduruldu"
     },
@@ -712,7 +745,8 @@
       "failedCancelTooLate": "Başarısız — durdurma isteğiniz çok geç geldi",
       "timeoutCancelTooLate": "Zaman aşımına uğradı — durdurma isteğiniz çok geç geldi",
       "cancelFailed": "Durdurma başarısız — cihaz işlemi durduramadı",
-      "queuedOffline": "Sırada — cihaz çevrimdışı"
+      "queuedOffline": "Sırada — cihaz çevrimdışı",
+      "queuedAwaitingPickup": "Kuyrukta — cihazın almasını bekliyor"
     }
   },
   "executionHistory": {
@@ -726,7 +760,9 @@
       "lastHour": "Son Saat",
       "lastDay": "Son 24 Saat",
       "lastWeek": "Son 7 Gün",
-      "lastMonth": "Son 30 Gün"
+      "lastMonth": "Son 30 Gün",
+      "statusLabel": "Durum",
+      "dateLabel": "Tarih aralığı"
     },
     "status": {
       "pending": "Beklemede",
@@ -741,7 +777,8 @@
       "failedCancelTooLate": "Başarısız — durdurma isteğiniz çok geç geldi",
       "timeoutCancelTooLate": "Zaman aşımına uğradı — durdurma isteğiniz çok geç geldi",
       "cancelFailed": "Durdurma başarısız — cihaz işlemi durduramadı",
-      "queuedOffline": "Sırada — cihaz çevrimdışı"
+      "queuedOffline": "Sırada — cihaz çevrimdışı",
+      "queuedAwaitingPickup": "Kuyrukta — alınmayı bekliyor"
     },
     "summary": "{{shown}} / {{total}}",
     "headers": {
@@ -770,7 +807,7 @@
   "scriptAiInput": {
     "placeholder": {
       "ready": "İhtiyacınız olan komut dosyasını açıklayın...",
-      "opening": "Yapay zeka asistanı açılıyor..."
+      "opening": "Breeze AI açılıyor..."
     },
     "actions": {
       "stopGenerating": "Oluşturmayı durdur",
@@ -789,12 +826,12 @@
       "reject": "Reddet"
     },
     "empty": {
-      "title": "Komut Dosyası Yapay Zekası Asistanı",
-      "description": "Neye ihtiyacınız olduğunu açıklayın, ben de sizin için senaryoyu yazayım."
+      "title": "Breeze AI",
+      "description": "Breeze AI'dan bu komut dosyasını yazmasını veya incelemesini isteyin."
     }
   },
   "scriptAiPanel": {
-    "title": "AI Komut Dosyası Yardımcısı",
+    "title": "Breeze AI",
     "actions": {
       "redoTitle": "AI değişikliğini yeniden uygulayın",
       "redo": "Yinele",
@@ -933,13 +970,23 @@
       "allAdmitted": "Seçilen tüm cihazlar kabul edildi ve kuyruğa alındı.",
       "partiallyAdmitted": "Bazı cihazlar kabul edildi ve kuyruğa alındı. Kalan hedefleri inceleyin.",
       "rejected": "Hiçbir cihaz kabul edilmedi. Aşağıdaki nedenleri inceleyin.",
-      "queued": "Kuyruğa alındı"
+      "queued": "Kuyruğa alındı",
+      "reasons": {
+        "not_found_or_inaccessible": "Cihaz bulunamadı veya erişilemiyor",
+        "site_access_denied": "Bu cihazın sitesine erişiminiz yok",
+        "script_org_mismatch": "Komut dosyası, cihazdan farklı bir kuruluşa ait",
+        "os_incompatible": "Komut dosyası bu cihazın işletim sistemiyle uyumlu değil",
+        "device_decommissioned": "Cihaz hizmet dışı bırakıldı",
+        "maintenance_suppressed": "Atlandı: cihaz bir bakım penceresinde"
+      }
     },
     "confirm": {
       "title": "Yürütmeyi Onayla",
-      "description": "{{count}} cihaz(lar)ında {{runAs}} olarak “{{name}}” komutunu çalıştırın. Komut dosyaları sıraya alınır ve hemen yürütülmeye başlar."
+      "description": "{{count}} cihaz(lar)ında {{runAs}} olarak “{{name}}” komutunu çalıştırın. Komut dosyaları sıraya alınır ve hemen yürütülmeye başlar.",
+      "descriptionOffline": "“{{name}}” betiğini {{count}} cihazda {{runAs}} olarak çalıştırın. Betikler şimdi sıraya alınır: çevrimiçi cihazlar hemen başlar, {{offline}} çevrimdışı cihaz tekrar çevrimiçi olduğunda çalışır."
     },
     "selectedCount": "{{count}} cihaz seçildi",
+    "executeBlocked": "Çalıştırma kullanılamıyor: seçili bir cihaz bu betiği burada çalıştıramıyor (gösterilenden farklı bir kuruluşa ait olabilir veya artık erişilebilir değil).",
     "languages": {
       "powershell": "PowerShell",
       "bash": "Bash",
@@ -953,6 +1000,44 @@
     },
     "toasts": {
       "runsWhenOnline": "Cihaz çevrimiçi olduğunda çalışır"
+    },
+    "targetMode": {
+      "label": "Çalıştırılacak yer",
+      "devices": "Cihazlar",
+      "groups": "Cihaz grupları"
+    },
+    "groups": {
+      "title": "Cihaz gruplarını seçin",
+      "searchPlaceholder": "Gruplarda ara",
+      "selectedCount": "{{count}} grup seçildi",
+      "dynamic": "Dinamik",
+      "deviceCount": "{{count}} cihaz",
+      "refusedReason": "Yürütme hedefi olarak kullanılamaz: bu grubun kuralları cihazın kendisinin bildirdiği alanlara dayanıyor ({{fields}}).",
+      "loading": "Cihaz grupları yükleniyor...",
+      "loadFailed": "Cihaz grupları yüklenemedi.",
+      "retry": "Yeniden dene",
+      "empty": "Cihaz grubu bulunamadı.",
+      "tooManyGroups": "Bir çalıştırma en fazla {{max}} grubu hedefleyebilir.",
+      "countingMembers": "Üyeler sayılıyor...",
+      "countFailed": "Seçilen grupların üyeleri sayılamadı. Sunucu, çalıştırma sırasında sınırı denetler.",
+      "summaryUnique": "Seçilen gruplarda {{count}} benzersiz cihaz",
+      "summaryCompatible": "{{count}} cihaz bu betiği çalıştırabilir (uyumlu işletim sistemi)",
+      "summaryOffline": "Bunlardan {{count}} tanesi çevrimdışı ve cihaz çevrimiçi olduğunda çalışacak",
+      "membershipNote": "Dinamik grup üyeliği son değerlendirmeye göredir ve çalıştırma başlarken yeniden okunur.",
+      "overCap": "Bu gruplar {{count}} benzersiz cihaz içeriyor; bu, çalıştırma başına {{max}} sınırını aşıyor. Bir grubun seçimini kaldırın veya çalıştırmayı bölün.",
+      "submitting": "{{count}} gruba gönderiliyor...",
+      "warningsTitle": "Sunucudan notlar",
+      "confirmDescription": "“{{name}}” betiğini {{groups}} cihaz grubunda {{runAs}} olarak çalıştırın. Betikler sıraya alınır ve hemen çalışmaya başlar.",
+      "confirmDescriptionOffline": "“{{name}}” betiğini {{groups}} cihaz grubunda {{runAs}} olarak çalıştırın. Betikler şimdi sıraya alınır: çevrimiçi cihazlar hemen başlar, {{offline}} çevrimdışı cihaz tekrar çevrimiçi olduğunda çalışır.",
+      "confirmMembers": "Şu anda bu gruplarda {{count}} benzersiz cihaz var; üyelik onayladığınızda yeniden okunur.",
+      "confirmMembersUnknown": "Cihaz sayısı henüz bilinmiyor; üyelik onayladığınızda okunur.",
+      "errors": {
+        "selectGroup": "Lütfen en az bir cihaz grubu seçin",
+        "tooManyTargets": "Bu gruplar {{count}} cihaza karşılık geliyor; bu, çalıştırma başına {{max}} sınırını aşıyor. Bir grubun seçimini kaldırın veya çalıştırmayı bölün.",
+        "perGroup": "Grup başına cihazlar: {{groups}}.",
+        "groupNotFound": "Seçilen {{count}} grup artık mevcut değil veya erişilemiyor. Listeyi yeniden yükleyip tekrar deneyin.",
+        "noTargets": "Seçilen gruplar bu çalıştırmanın hedefleyebileceği hiçbir cihaz içermiyor; hiçbir şey çalıştırılmadı."
+      }
     }
   },
   "secretParameters": {
@@ -968,6 +1053,7 @@
     "loading": "Yürütmeler yükleniyor...",
     "actions": {
       "backToScripts": "Komut Dosyalarına Geri Dön",
+      "backToScript": "Komut Dosyasına Geri Dön",
       "runScript": "Komut Dosyasını Çalıştır"
     },
     "breadcrumb": {
@@ -1050,8 +1136,8 @@
       "exitCodeSeverity": "Çıkış Kodu Önem Derecesi"
     },
     "ai": {
-      "toggleTitle": "AI Komut Dosyası Yardımcısını Aç/Kapat (⌘⇧I)",
-      "button": "Yapay Zeka Asistanı"
+      "toggleTitle": "Breeze AI'ı Aç/Kapat (⌘⇧I)",
+      "button": "Breeze AI"
     },
     "parameters": {
       "emptyPrefix": "Henüz parametre yok. Parametreler, kullanıcıların çalışma zamanında değerler sağlamasına olanak tanır; komut dosyanızda bunlara şu şekilde başvurun:",
@@ -1094,9 +1180,9 @@
       "elevatedHint": "macOS/Linux'ta sudo'yu, Windows'de runas'ı kullanır."
     },
     "exitCodeSeverity": {
-      "emptyPrefix": "Önem derecelerini uyarmak için belirli çıkış kodlarını eşleyin. Betik bu kodlardan birini döndürdüğünde, yapılandırılan önem derecesine göre bir uyarı verilir. Seç",
-      "suppressAlert": "Uyarıyı bastır\nBir kodu bilgi amaçlı olarak işaretlemek için ",
-      "emptySuffix": "(hiçbir olay yaşanmadı). Burada listelemediğiniz çıkış kodları, varsayılan sonuç işlemeyi kullanır.",
+      "emptyPrefix": "Çıkış kodlarını uyarı önem derecelerine eşleyin. Gözetimsiz bir çalıştırma (zamanlanmış, otomasyon, ilke veya uyarı tetiklemeli) bu kodlardan birini döndürdüğünde, yapılandırılan önem derecesinde bir uyarı oluşturulur; el ile çalıştırmalar hiçbir zaman uyarı oluşturmaz. Daha sonra başarıyla biten bir çalıştırma uyarıyı çözer. Bir kodu bilgi amaçlı işaretlemek için",
+      "suppressAlert": "Uyarıyı bastır",
+      "emptySuffix": "seçeneğini seçin (uyarı oluşturulmaz). Listelemediğiniz sıfır dışı bir kod, listelenen en yakın düşük kodun önem derecesini veya orta derecesini kullanır.",
       "suppressHint": "Uyarıyı gizle — çıkış kodu bilgi amaçlı olarak değerlendirilir, herhangi bir olay ortaya çıkmaz."
     },
     "keyboardSave": "{{shortcut}} kaydetmek için",
@@ -1437,7 +1523,8 @@
       "pollDeadline": "Hâlâ sonuç yok — sonucu görmek için çalıştırma geçmişini kontrol edin.",
       "pollFailed": "Çalıştırma sonucu okunamadı — silinmiş olabilir veya erişiminiz değişmiş olabilir."
     },
-    "devicesLoadFailed": "Cihazlar yüklenemedi"
+    "devicesLoadFailed": "Cihazlar yüklenemedi",
+    "deviceSelectLabel": "Test cihazı"
   },
   "provenance": {
     "origin": "Köken",
@@ -1465,6 +1552,22 @@
     "riskLow": "Düşük",
     "riskMedium": "Orta",
     "riskHigh": "Yüksek",
-    "riskCritical": "Kritik"
+    "riskCritical": "Kritik",
+    "reviewInApprovals": "Onaylar’da incele",
+    "status": {
+      "proposed": "İnceleme bekliyor",
+      "scan_rejected": "Güvenlik taramasında reddedildi",
+      "review_failed": "Yapay zekâ incelemesi başarısız",
+      "reviewed": "İncelendi",
+      "approved": "Onaylandı",
+      "rejected": "Reddedildi",
+      "changes_requested": "Değişiklik istendi",
+      "expired": "Süresi doldu",
+      "superseded": "Yerine yenisi geçti",
+      "executed": "Çalıştırıldı",
+      "verified": "Doğrulandı",
+      "verification_failed": "Doğrulama başarısız",
+      "promoted": "Kütüphaneye kaydedildi"
+    }
   }
 }

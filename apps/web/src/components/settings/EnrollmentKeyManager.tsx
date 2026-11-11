@@ -1,25 +1,42 @@
 import { useState, useEffect, useCallback } from 'react';
-import { fetchWithAuth } from '../../stores/auth';
+import { fetchWithAuth, handleSessionExpired } from '../../stores/auth';
 import { useOrgStore, type Site } from '../../stores/orgStore';
 import { fallbackInstallerFilename, filenameFromContentDisposition } from '@/lib/downloadFilename';
-import { extractApiError } from '@/lib/apiError';
 import { navigateTo } from '@/lib/navigation';
 import { fetchAllSites } from '@/lib/fetchAllSites';
+import AccessDenied from '../shared/AccessDenied';
 import { ConfirmDialog } from '../shared/ConfirmDialog';
 import { showToast } from '../shared/Toast';
 import { runAction, ActionError } from '../../lib/runAction';
 import { Trans, useTranslation } from 'react-i18next';
 import '@/lib/i18n';
 import { formatDate } from '@/lib/dateTimeFormat';
-import { PRODUCT_DEFAULT_ENROLLMENT_DEVICE_COUNT } from '@breeze/shared';
+import {
+  PRODUCT_DEFAULT_ENROLLMENT_DEVICE_COUNT,
+  PRODUCT_DEFAULT_ENROLLMENT_TTL_MINUTES,
+} from '@breeze/shared';
+import { useStableT } from '@/lib/i18n/useStableT';
+import InstallerDownloadDialog, {
+  type InstallerDownloadTarget,
+  type InstallerPlatform,
+} from './InstallerDownloadDialog';
 
 interface EnrollmentKey {
   id: string;
   orgId: string;
   siteId: string | null;
+  /** Name of the bound site (#7217) — what tells same-named Add Device keys apart. */
+  siteName?: string | null;
   name: string;
   key?: string | null;
+  /**
+   * Redacted (null) by the API for a caller who lacks organizations:write —
+   * shortCode is an enrollment-capable secret, so a read-only role never
+   * receives its value. `hasShortLink` still reports whether the underlying
+   * link exists, so the row can distinguish "hidden" from "never created".
+   */
   shortCode?: string | null;
+  hasShortLink?: boolean;
   usageCount: number;
   maxUsage: number | null;
   expiresAt: string | null;
@@ -77,12 +94,49 @@ interface CreateFormValues {
 
 type ModalMode = 'closed' | 'create' | 'delete';
 
+/** "7 days" / "12 hours" / "90 minutes" in the user's locale. */
+function formatDefaultDuration(minutes: number, locale: string): string {
+  const [value, unit] =
+    minutes % 1440 === 0
+      ? [minutes / 1440, 'day']
+      : minutes % 60 === 0
+        ? [minutes / 60, 'hour']
+        : [minutes, 'minute'];
+  try {
+    return new Intl.NumberFormat(locale, { style: 'unit', unit: unit as string, unitDisplay: 'long' }).format(value as number);
+  } catch {
+    return `${value} ${unit}${value === 1 ? '' : 's'}`;
+  }
+}
+
 export default function EnrollmentKeyManager() {
-  const { t } = useTranslation('settings');
-  const { currentOrgId, organizations } = useOrgStore();
+  const { t, i18n } = useTranslation('settings');
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
+  const { currentOrgId, organizations, enrollmentDefaults: storeDefaults } = useOrgStore();
+  // #9876: the store only fills `enrollmentDefaults` on an org-switcher
+  // fetchSites, so a direct page load sees null. Fetch them here in that case.
+  const [fetchedDefaults, setFetchedDefaults] = useState<{
+    orgId: string;
+    defaults: NonNullable<typeof storeDefaults>;
+  } | null>(null);
+  const enrollmentDefaults =
+    storeDefaults ?? (fetchedDefaults?.orgId === currentOrgId ? fetchedDefaults.defaults : null);
+  // #9616: the partner->org resolved enrollment defaults ride on the sites
+  // response (same source as Add Device). Until they load, or if the API
+  // soft-failed the read, fall back to the product defaults.
+  const defaultDeviceCount =
+    enrollmentDefaults?.deviceCount ?? PRODUCT_DEFAULT_ENROLLMENT_DEVICE_COUNT;
+  const defaultTtlMinutes =
+    enrollmentDefaults?.ttlMinutes ?? PRODUCT_DEFAULT_ENROLLMENT_TTL_MINUTES;
+  // Keys created this session whose device limit came from the default (the
+  // API doesn't record provenance, so the hint can't outlive the page).
+  const [defaultedKeyIds, setDefaultedKeyIds] = useState<Set<string>>(() => new Set());
   const [keys, setKeys] = useState<EnrollmentKey[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
+  // A 403 on the list is a permission state, not a transient failure: render
+  // AccessDenied instead of an error with a Retry that can only 403 again.
+  const [accessDenied, setAccessDenied] = useState(false);
   const [modalMode, setModalMode] = useState<ModalMode>('closed');
   const [selectedKey, setSelectedKey] = useState<EnrollmentKey | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -93,6 +147,7 @@ export default function EnrollmentKeyManager() {
   const [rotateTarget, setRotateTarget] = useState<EnrollmentKey | null>(null);
   const [downloadDropdownId, setDownloadDropdownId] = useState<string | null>(null);
   const [downloading, setDownloading] = useState(false);
+  const [installerTarget, setInstallerTarget] = useState<InstallerDownloadTarget | null>(null);
   const [hideExpired, setHideExpired] = useState(false);
   const [purgeConfirmOpen, setPurgeConfirmOpen] = useState(false);
 
@@ -128,8 +183,13 @@ export default function EnrollmentKeyManager() {
           void navigateTo('/login', { replace: true });
           return;
         }
-        throw new Error(t('enrollmentKeys.fetchFailed'));
+        if (response.status === 403) {
+          setAccessDenied(true);
+          return;
+        }
+        throw new Error(stableT('enrollmentKeys.fetchFailed'));
       }
+      setAccessDenied(false);
       const data = await response.json();
       setKeys(data.data ?? []);
       const total = data.pagination?.total ?? 0;
@@ -137,15 +197,38 @@ export default function EnrollmentKeyManager() {
       setTotalPages(Math.max(1, Math.ceil(total / limit)));
       setCurrentPage(data.pagination?.page ?? page);
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('enrollmentKeys.genericError'));
+      setError(err instanceof Error ? err.message : stableT('enrollmentKeys.genericError'));
     } finally {
       setLoading(false);
     }
-  }, [hideExpired, t]);
+  }, [hideExpired, stableT]);
 
   useEffect(() => {
     fetchKeys();
   }, [fetchKeys]);
+
+  useEffect(() => {
+    if (storeDefaults || !currentOrgId) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetchWithAuth(
+          `/orgs/sites?organizationId=${currentOrgId}&includeEnrollmentDefaults=1&page=1&limit=1`,
+        );
+        if (!res.ok) return;
+        const body = await res.json();
+        if (!cancelled && body?.enrollmentDefaults) {
+          setFetchedDefaults({ orgId: currentOrgId, defaults: body.enrollmentDefaults });
+        }
+      } catch {
+        // Soft-fail: the form falls back to product defaults and omits the
+        // fields so the server resolves them.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [storeDefaults, currentOrgId]);
 
   useEffect(() => {
     if (!downloadDropdownId) return;
@@ -223,9 +306,27 @@ export default function EnrollmentKeyManager() {
     setSelectedKey(null);
   };
 
+  // Standard runAction catch: 401 is the session-expiry redirect, a non-401
+  // ActionError was already toasted, anything else gets the fallback toast.
+  const reportActionFailure = (err: unknown, fallback: string) => {
+    if (err instanceof ActionError && err.status === 401) return;
+    if (!(err instanceof ActionError)) {
+      showToast({ type: 'error', message: err instanceof Error ? err.message : fallback });
+    }
+  };
+
+  // datetime-local values are local wall-clock time without a zone, which is
+  // exactly how `new Date(value)` parses them. `min` uses the same format.
+  const expiryMin = (() => {
+    const now = new Date();
+    const pad = (n: number) => String(n).padStart(2, '0');
+    return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}T${pad(now.getHours())}:${pad(now.getMinutes())}`;
+  })();
+  const expiryInPast = formExpiresAt !== '' && new Date(formExpiresAt).getTime() <= Date.now();
+
   const handleCreateSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!formSiteId) return;
+    if (!formSiteId || expiryInPast) return;
     setSubmitting(true);
     try {
       const body: Record<string, unknown> = { name: formName, siteId: formSiteId };
@@ -249,32 +350,53 @@ export default function EnrollmentKeyManager() {
       // such bootstrap token, so an unset field here IS the enrollment budget,
       // and the "Unlimited"-styled placeholder must resolve to the product
       // default device count (#4126), not a single-use key.
-      body.maxUsage = formMaxUsage
-        ? parseInt(formMaxUsage, 10)
-        : PRODUCT_DEFAULT_ENROLLMENT_DEVICE_COUNT;
+      // #9616: blank resolves to the partner/org default (what the field's
+      // placeholder says), falling back to the product default.
+      // When the resolved defaults haven't loaded (or the read soft-failed) the
+      // fields are OMITTED so the server resolves them: posting product values
+      // would be treated as an explicit choice (and 400 against a lower
+      // partner TTL cap) and would ignore the real partner/org defaults.
+      // The store's defaults belong to the org switcher's org; a partner admin
+      // can aim the form at another org, whose defaults we don't have: omit and
+      // let the server resolve for the right org.
+      const defaultsApply =
+        enrollmentDefaults != null && (!body.orgId || body.orgId === currentOrgId);
+      const usedDefaultCount = !formMaxUsage;
+      if (formMaxUsage) {
+        body.maxUsage = parseInt(formMaxUsage, 10);
+      } else if (defaultsApply) {
+        body.maxUsage = defaultDeviceCount;
+      }
       if (formExpiresAt) {
         body.expiresAt = new Date(formExpiresAt).toISOString();
+      } else if (defaultsApply) {
+        // ttlMinutes, not a computed expiresAt: the server does the time math
+        // and applies the partner cap to it.
+        body.ttlMinutes = defaultTtlMinutes;
       }
 
-      const response = await fetchWithAuth('/enrollment-keys', {
-        method: 'POST',
-        body: JSON.stringify(body)
+      const created = await runAction<Record<string, unknown> | null>({
+        request: () =>
+          fetchWithAuth('/enrollment-keys', {
+            method: 'POST',
+            body: JSON.stringify(body)
+          }),
+        errorFallback: t('enrollmentKeys.createFailed'),
+        onUnauthorized: handleSessionExpired,
       });
-
-      if (!response.ok) {
-        const data = await response.json().catch(() => ({}));
-        throw new Error(extractApiError(data, t('enrollmentKeys.createFailed')));
-      }
-
-      const created = await response.json().catch(() => ({} as Record<string, unknown>));
-      if (typeof created.key === 'string' && created.key.length > 0) {
+      if (created && typeof created.key === 'string' && created.key.length > 0) {
         setNewlyCreatedKey(created.key);
+      }
+      if (usedDefaultCount && created && typeof created.id === 'string') {
+        const createdId = created.id;
+        setDefaultedKeyIds((prev) => new Set(prev).add(createdId));
       }
 
       await fetchKeys(currentPage);
       handleCloseModal();
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('enrollmentKeys.genericError'));
+      // runAction toasted; the create modal stays open for a retry (#3531).
+      reportActionFailure(err, t('enrollmentKeys.createFailed'));
     } finally {
       setSubmitting(false);
     }
@@ -284,20 +406,24 @@ export default function EnrollmentKeyManager() {
     if (!selectedKey) return;
     setSubmitting(true);
     try {
-      const response = await fetchWithAuth(`/enrollment-keys/${selectedKey.id}`, {
-        method: 'DELETE'
+      await runAction({
+        request: () =>
+          fetchWithAuth(`/enrollment-keys/${selectedKey.id}`, {
+            method: 'DELETE'
+          }),
+        errorFallback: t('enrollmentKeys.deleteFailed'),
+        onUnauthorized: handleSessionExpired,
       });
-
-      if (!response.ok) {
-        throw new Error(t('enrollmentKeys.deleteFailed'));
-      }
 
       const deletedName = selectedKey.name;
       await fetchKeys(currentPage);
       handleCloseModal();
       showToast({ message: t('enrollmentKeys.deleted', { name: deletedName }), type: 'success' });
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('enrollmentKeys.genericError'));
+      // The delete modal is a fixed z-50 overlay and stays open on failure, so
+      // the page `error` banner would render behind it (#3531); runAction's
+      // toast is the visible outcome, and the list is not refetched.
+      reportActionFailure(err, t('enrollmentKeys.deleteFailed'));
     } finally {
       setSubmitting(false);
     }
@@ -313,23 +439,26 @@ export default function EnrollmentKeyManager() {
     setRotateTarget(null);
     setSubmitting(true);
     try {
-      const response = await fetchWithAuth(`/enrollment-keys/${rotateTarget.id}/rotate`, {
-        method: 'POST',
-        body: JSON.stringify({})
+      const rotated = await runAction<Record<string, unknown> | null>({
+        request: () =>
+          fetchWithAuth(`/enrollment-keys/${rotateTarget.id}/rotate`, {
+            method: 'POST',
+            body: JSON.stringify({})
+          }),
+        errorFallback: t('enrollmentKeys.rotateFailed'),
+        onUnauthorized: handleSessionExpired,
       });
-
-      if (!response.ok) {
-        const data = await response.json().catch(() => ({}));
-        throw new Error(extractApiError(data, t('enrollmentKeys.rotateFailed')));
-      }
-
-      const rotated = await response.json().catch(() => ({} as Record<string, unknown>));
-      if (typeof rotated.key === 'string' && rotated.key.length > 0) {
+      if (rotated && typeof rotated.key === 'string' && rotated.key.length > 0) {
         setNewlyCreatedKey(rotated.key);
       }
       await fetchKeys(currentPage);
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('enrollmentKeys.genericError'));
+      // The rotate dialog has already closed, so the page banner is visible
+      // here; keep it alongside runAction's toast.
+      reportActionFailure(err, t('enrollmentKeys.rotateFailed'));
+      if (!(err instanceof ActionError && err.status === 401)) {
+        setError(err instanceof Error ? err.message : t('enrollmentKeys.rotateFailed'));
+      }
     } finally {
       setSubmitting(false);
     }
@@ -363,11 +492,25 @@ export default function EnrollmentKeyManager() {
     }
   };
 
-  const handleDownloadInstaller = async (keyId: string, platform: 'windows' | 'macos') => {
+  // #9615: the installer route sizes the embedded credential from `count`
+  // and defaults to ONE device without it, so the row asks first (the same
+  // device-count question Add Device asks) instead of downloading directly.
+  const openInstallerDialog = (key: EnrollmentKey, platform: InstallerPlatform) => {
+    setInstallerTarget({
+      keyId: key.id,
+      keyName: key.name,
+      platform,
+      remainingUses: key.maxUsage === null ? null : Math.max(0, key.maxUsage - key.usageCount),
+    });
+  };
+
+  const handleDownloadInstaller = async (keyId: string, platform: InstallerPlatform, count: number) => {
     if (downloading) return;
     setDownloading(true);
+    setError(undefined);
     try {
-      const response = await fetchWithAuth(`/enrollment-keys/${keyId}/installer/${platform}`);
+      const params = new URLSearchParams({ count: String(count) });
+      const response = await fetchWithAuth(`/enrollment-keys/${keyId}/installer/${platform}?${params.toString()}`);
 
       if (!response.ok) {
         const body = await response.json().catch(() => ({ error: t('enrollmentKeys.downloadFailed') }));
@@ -392,6 +535,9 @@ export default function EnrollmentKeyManager() {
       setError(t('enrollmentKeys.installerFailed', { message }));
     } finally {
       setDownloading(false);
+      // The dialog stays open (showing "Downloading...") until the request
+      // settles; any failure then surfaces in the page's error banner.
+      setInstallerTarget(null);
     }
   };
 
@@ -470,6 +616,10 @@ export default function EnrollmentKeyManager() {
         </div>
       </div>
     );
+  }
+
+  if (accessDenied) {
+    return <AccessDenied testId="enrollment-keys-denied" />;
   }
 
   if (error && keys.length === 0) {
@@ -590,6 +740,7 @@ export default function EnrollmentKeyManager() {
             <thead className="bg-muted/40">
               <tr className="text-left text-xs font-semibold uppercase tracking-wide text-muted-foreground">
                 <th className="px-4 py-3">{t('common:labels.name')}</th>
+                <th className="px-4 py-3">{t('common:labels.site')}</th>
                 <th className="px-4 py-3">{t('enrollmentKeys.shortCode')}</th>
                 <th className="px-4 py-3">{t('common:labels.status')}</th>
                 <th className="px-4 py-3">{t('enrollmentKeys.usage')}</th>
@@ -601,7 +752,7 @@ export default function EnrollmentKeyManager() {
             <tbody>
               {keys.length === 0 ? (
                 <tr>
-                  <td colSpan={7} className="px-4 py-8 text-center text-muted-foreground">
+                  <td colSpan={8} className="px-4 py-8 text-center text-muted-foreground">
                     {t('enrollmentKeys.empty')}
                   </td>
                 </tr>
@@ -611,6 +762,9 @@ export default function EnrollmentKeyManager() {
                   return (
                     <tr key={key.id} className="border-b last:border-b-0 hover:bg-muted/50">
                       <td className="px-4 py-3 font-medium">{key.name}</td>
+                      <td className="px-4 py-3" data-testid={`key-site-${key.id}`}>
+                        {key.siteName ?? '—'}
+                      </td>
                       <td className="px-4 py-3">
                         {key.shortCode ? (
                           <div className="flex items-center gap-2">
@@ -634,6 +788,13 @@ export default function EnrollmentKeyManager() {
                               )}
                             </button>
                           </div>
+                        ) : key.hasShortLink ? (
+                          <span
+                            className="text-xs text-muted-foreground italic"
+                            title={t('enrollmentKeys.shortCodeHidden')}
+                          >
+                            {t('enrollmentKeys.shortCodeHidden')}
+                          </span>
                         ) : (
                           <span className="text-xs text-muted-foreground">—</span>
                         )}
@@ -647,6 +808,15 @@ export default function EnrollmentKeyManager() {
                         <div data-testid={`key-usage-${key.id}`}>
                           {key.usageCount}{key.maxUsage !== null ? ` / ${key.maxUsage}` : ''}
                         </div>
+                        {defaultedKeyIds.has(key.id) && (
+                          <div
+                            data-testid={`key-usage-default-${key.id}`}
+                            className="text-xs text-muted-foreground"
+                            title={t('enrollmentKeys.usageFromDefaultTitle')}
+                          >
+                            {t('enrollmentKeys.usageFromDefault')}
+                          </div>
+                        )}
                         {/*
                           #2992 — device slots across the installers minted from
                           this key. A second line rather than a replacement for
@@ -738,7 +908,7 @@ export default function EnrollmentKeyManager() {
                                   <button
                                     type="button"
                                     onClick={() => {
-                                      handleDownloadInstaller(key.id, 'windows');
+                                      openInstallerDialog(key, 'windows');
                                       setDownloadDropdownId(null);
                                     }}
                                     className="w-full px-3 py-1.5 text-left text-xs hover:bg-muted"
@@ -748,7 +918,7 @@ export default function EnrollmentKeyManager() {
                                   <button
                                     type="button"
                                     onClick={() => {
-                                      handleDownloadInstaller(key.id, 'macos');
+                                      openInstallerDialog(key, 'macos');
                                       setDownloadDropdownId(null);
                                     }}
                                     className="w-full px-3 py-1.5 text-left text-xs hover:bg-muted"
@@ -899,7 +1069,7 @@ export default function EnrollmentKeyManager() {
                   type="number"
                   value={formMaxUsage}
                   onChange={(e) => setFormMaxUsage(e.target.value)}
-                  placeholder={t('enrollmentKeys.defaultDeviceLimit')}
+                  placeholder={t('enrollmentKeys.defaultDeviceLimit', { count: defaultDeviceCount })}
                   min={1}
                   className="mt-1 w-full rounded-md border bg-background px-3 py-2 text-sm focus:outline-hidden focus:ring-2 focus:ring-primary"
                 />
@@ -911,10 +1081,23 @@ export default function EnrollmentKeyManager() {
                 <label className="text-sm font-medium">{t('enrollmentKeys.expiresAt')}</label>
                 <input
                   type="datetime-local"
+                  data-testid="enrollment-key-expires-at"
                   value={formExpiresAt}
+                  min={expiryMin}
+                  aria-invalid={expiryInPast}
                   onChange={(e) => setFormExpiresAt(e.target.value)}
                   className="mt-1 w-full rounded-md border bg-background px-3 py-2 text-sm focus:outline-hidden focus:ring-2 focus:ring-primary"
                 />
+                <p className="mt-1 text-xs text-muted-foreground">
+                  {t('enrollmentKeys.expiresAtHelp', {
+                    duration: formatDefaultDuration(defaultTtlMinutes, i18n.language),
+                  })}
+                </p>
+                {expiryInPast && (
+                  <p role="alert" className="mt-1 text-xs text-destructive">
+                    {t('enrollmentKeys.expiresAtPast')}
+                  </p>
+                )}
               </div>
               <div className="flex justify-end gap-3 pt-2">
                 <button
@@ -926,7 +1109,7 @@ export default function EnrollmentKeyManager() {
                 </button>
                 <button
                   type="submit"
-                  disabled={submitting || !formName.trim() || !formSiteId || sitesLoading}
+                  disabled={submitting || !formName.trim() || !formSiteId || sitesLoading || expiryInPast}
                   className="inline-flex h-10 items-center justify-center rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
                 >
                   {submitting ? t('enrollmentKeys.creating') : t('enrollmentKeys.createKey')}
@@ -970,6 +1153,14 @@ export default function EnrollmentKeyManager() {
           </div>
         </div>
       )}
+      <InstallerDownloadDialog
+        target={installerTarget}
+        downloading={downloading}
+        onCancel={() => setInstallerTarget(null)}
+        onConfirm={(target, count) => {
+          void handleDownloadInstaller(target.keyId, target.platform, count);
+        }}
+      />
       <ConfirmDialog
         open={rotateTarget !== null}
         onClose={() => setRotateTarget(null)}

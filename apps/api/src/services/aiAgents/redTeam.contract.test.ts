@@ -97,6 +97,7 @@ import {
   type OrgRef,
 } from './agentAuthContext';
 import {
+  createAgentRunCallPairing,
   createAgentRunPreToolUse,
   PROPOSAL_RECORDED_TEXT,
   type AgentRunOutcome,
@@ -267,6 +268,12 @@ const _agentGuardrailCheckFields: Record<keyof ReturnType<typeof checkAgentGuard
   reason: true,
   approvalScope: true,
   readOnly: true,
+  // #7906: the payload a chat read-only event_logs_query dispatches with.
+  // Never set for an agent run (checkAgentGuardrails strips the chat opt-in).
+  pinnedEventLogsQuery: true,
+  // #10973: a chat-only Security query under the grant switch. Never set for an
+  // agent run (checkAgentGuardrails strips the flag).
+  wispUnattendedRead: true,
   // Human-readable approval blurb only — see TOOLS_ECHOING_PROSE_INTO_APPROVAL_TEXT.
   description: false,
 };
@@ -308,7 +315,13 @@ function authorityVerdict(verdict: ReturnType<typeof checkAgentGuardrails>): {
  * screen — a reviewed decision, never a silent one. Authority is unaffected
  * either way; that is what the parity sweep above proves.
  */
-const TOOLS_ECHOING_PROSE_INTO_APPROVAL_TEXT: string[] = ['manage_startup_items'];
+const TOOLS_ECHOING_PROSE_INTO_APPROVAL_TEXT: string[] = [
+  'manage_startup_items',
+  // Wisp W07: the approval text quotes the request's reason and, for a bulk
+  // ticket reply, the EXACT message that will be sent — the approver must read
+  // it (w00 A30). Agents are denied launch_specialist outright anyway.
+  'launch_specialist',
+];
 
 beforeEach(() => {
   vi.stubEnv('BREEZE_AI_AGENTS_ENABLED', 'true');
@@ -608,7 +621,6 @@ describe('F. a device-less run never proposes', () => {
   it('keeps proposals and action intents empty through the real runner pre-hook', async () => {
     const outcome = emptyOutcome();
     const intentIds: string[] = [];
-    const allowedPending = new Map<string, number>();
     const agentAuth = agentAuthFor(null);
 
     for (const mode of ['shadow', 'act'] as const) {
@@ -634,10 +646,8 @@ describe('F. a device-less run never proposes', () => {
         guardrailPolicy,
         outcome,
         intentIds,
-        allowedPending,
         sessionId: null,
-        executionIdPending: new Map(),
-        actPinPending: new Map(),
+        pairing: createAgentRunCallPairing(),
         actReservation: { count: 0 },
       runTargets: [],
       stagedBytesRemaining: 256 * 1024 * 1024,
@@ -783,7 +793,6 @@ describe('I. the runner pre-hook never touches user RBAC', () => {
     const agentAuth = agentAuthFor('dev-1');
     const outcome = emptyOutcome();
     const intentIds: string[] = [];
-    const allowedPending = new Map<string, number>();
     const allToolsAllowlist = Object.keys(TOOL_TIERS).flatMap((toolName) => {
       const { action } = toolCallFor(toolName);
       return allowlistFor(toolName, action);
@@ -802,10 +811,8 @@ describe('I. the runner pre-hook never touches user RBAC', () => {
       guardrailPolicy: policyWith({ mode: 'shadow', toolAllowlist: allToolsAllowlist }),
       outcome,
       intentIds,
-      allowedPending,
       sessionId: null,
-      executionIdPending: new Map(),
-      actPinPending: new Map(),
+      pairing: createAgentRunCallPairing(),
       actReservation: { count: 0 },
       runTargets: [],
       stagedBytesRemaining: 256 * 1024 * 1024,
@@ -832,10 +839,8 @@ describe('I. the runner pre-hook never touches user RBAC', () => {
       guardrailPolicy: policyWith({ mode: 'shadow', toolAllowlist: [] }),
       outcome,
       intentIds,
-      allowedPending,
       sessionId: null,
-      executionIdPending: new Map(),
-      actPinPending: new Map(),
+      pairing: createAgentRunCallPairing(),
       actReservation: { count: 0 },
       runTargets: [],
       stagedBytesRemaining: 256 * 1024 * 1024,
@@ -867,10 +872,8 @@ describe('I. the runner pre-hook never touches user RBAC', () => {
       }),
       outcome,
       intentIds,
-      allowedPending,
       sessionId: null,
-      executionIdPending: new Map(),
-      actPinPending: new Map(),
+      pairing: createAgentRunCallPairing(),
       actReservation: { count: 0 },
       runTargets: [],
       stagedBytesRemaining: 256 * 1024 * 1024,
@@ -973,6 +976,7 @@ describe('K. hostile ticket content — bounded context and device-less shadow d
           + PII_MARKER,
         status: 'open',
         priority: 'urgent',
+        ticketType: 'incident',
         category: 'security',
         tags: ['injection-attempt'],
         dueDate: null,

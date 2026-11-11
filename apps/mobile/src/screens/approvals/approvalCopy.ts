@@ -108,6 +108,18 @@ export function humanizeRawActionLabel(
   return detail.length > 0 ? `${head}: ${detail.join(' ')}` : head;
 }
 
+/** Server cap on an approval decision reason (z.string().max(500)). */
+export const DENY_REASON_MAX_LENGTH = 500;
+
+/** Shown under the deny field when the reason is relayed to the end user. */
+export const DENY_REASON_SHOWN_TO_END_USER_HINT =
+  'The end user sees this in their notification (first 500 characters).';
+
+/** A PAM elevation (uac_intercept) deny reason is shown to the end user. */
+export function denyReasonShownToEndUser(approval: ApprovalCopyInput): boolean {
+  return resolveApprovalFlowType(approval) === 'uac_intercept';
+}
+
 export function getApprovalCopy(approval: ApprovalCopyInput): ApprovalCopy {
   if (resolveApprovalFlowType(approval) === 'uac_intercept') {
     const name = executableName(extractUacDetails(approval.actionArguments).exePath);
@@ -124,4 +136,18 @@ export function getApprovalCopy(approval: ApprovalCopyInput): ApprovalCopy {
     approveLabel: 'Approve',
     holdLabel: 'Hold to approve',
   };
+}
+
+/**
+ * The toast shown once an approve returns, read from the row the server sent
+ * back. The server can refuse to apply an approve (a PAM elevation whose
+ * target could not be verified); it then returns the row as `denied` with a
+ * `refusalReason`, and that must never be confirmed as "Approved".
+ */
+export function approveOutcomeToast(
+  decided: { status: string; refusalReason?: string | null },
+  actionLabel: string,
+): { kind: 'success' | 'error'; text: string } {
+  if (decided.status === 'approved') return { kind: 'success', text: `Approved · ${actionLabel}` };
+  return { kind: 'error', text: `Not approved · ${str(decided.refusalReason) ?? actionLabel}` };
 }

@@ -1,7 +1,8 @@
 {
   "aiInitiator": {
-    "assistant": "KI-Assistent",
+    "assistant": "Breeze AI",
     "agent": "KI-Agent",
+    "flow": "Ablauf",
     "originUnavailable": "Ursprung nicht verfügbar",
     "openSession": "Unterhaltung öffnen",
     "openAgentRun": "Agentenlauf öffnen",
@@ -15,21 +16,22 @@
     "fleetPosture": "Flottenstatus",
     "dashboard": "Dashboard",
     "devices": "Geräte & Assets",
-    "alerts": "Warnmeldungen",
+    "alerts": "Warnungen",
     "approvals": "Genehmigungen",
     "pendingApprovals": "{{count}} ausstehende Genehmigungen",
     "pendingApprovals_one": "{{count}} ausstehende Genehmigung",
     "pendingApprovals_other": "{{count}} ausstehende Genehmigungen",
     "tickets": "Tickets",
-    "incidents": "Vorfälle",
+    "incidents": "Sicherheitsvorfälle",
     "remoteAccess": "Fernzugriff",
     "scripts": "Skripte",
     "patches": "Patches",
     "vulnerabilities": "Schwachstellen",
     "oneDrive": "OneDrive",
-    "aiForOffice": "KI für Office",
-    "networkMonitor": "Netzwerküberwachung",
+    "aiForOffice": "Breeze AI for Office",
+    "networkMonitor": "Netzwerk",
     "jobs": "Aufträge",
+    "flows": "Abläufe",
     "monitoring": "Überwachung",
     "networkDiscovery": "Netzwerkerkennung",
     "edr": "EDR",
@@ -47,6 +49,8 @@
     "timesheets": "Zeiterfassungen",
     "productCatalog": "Produktkatalog",
     "deviceGroups": "Gerätegruppen",
+    "sites": "Standorte",
+    "unassignedDevices": "Nicht zugewiesene Geräte",
     "configPolicies": "Konfigurationsrichtlinien",
     "integrations": "Integrationen",
     "cloudBackup": "Cloud-Backup",
@@ -59,14 +63,13 @@
     "billing": "Abrechnung",
     "organizations": "Organisationen",
     "aiUsage": "KI-Nutzung",
+    "aiProvidersModels": "KI-Anbieter und -Modelle",
     "scriptAuthoring": "Skripterstellung",
     "toolSources": "Tool-Quellen",
     "aiAgents": "KI-Agenten",
-    "aiAgentRuns": "KI-Agenten-Läufe",
-    "aiImpact": "KI-Wirkung",
-    "fleetDesign": "Flottendesign",
     "customFields": "Benutzerdefinierte Felder",
     "savedFilters": "Gespeicherte Filter",
+    "moreSettings": "Weitere Einstellungen",
     "users": "Benutzer",
     "roles": "Rollen",
     "sso": "SSO",
@@ -84,13 +87,14 @@
     "variables": "Variablen",
     "llmProviderCatalog": "LLM-Anbieterkatalog",
     "aiKillSwitch": "KI-Notausschalter",
+    "wisp": "Wisp",
     "sectionAi": "KI",
     "sectionFleetManagement": "Flottenverwaltung",
     "sectionBilling": "Abrechnung",
     "sectionAdministration": "Administration",
-    "fleetOrchestration": "Flottenorchestrierung",
-    "aiAssistant": "KI-Assistent",
     "software": "Software",
+    "softwareInventory": "Software-Inventar",
+    "softwarePolicies": "Software-Richtlinien",
     "securityOverview": "Übersicht",
     "aiRisk": "KI-Risiko",
     "deviceBackup": "Gerätesicherung",
@@ -98,7 +102,29 @@
     "serviceManagement": "Service-Management",
     "ticketing": "Ticketing",
     "deliverableTemplates": "Liefervorlagen",
-    "securityScans": "IOC-Scans"
+    "securityScans": "IOC-Scans",
+    "system": "System",
+    "monitorConversion": "Monitor-Konvertierung",
+    "timeSync": "Zeitsynchronisierung",
+    "aiModels": "KI-Modelle",
+    "autopay": "Autopay",
+    "payments": "Zahlungen",
+    "ticketsIncidents": "Störungen",
+    "ticketsServiceRequests": "Serviceanfragen",
+    "ticketsProblems": "Probleme",
+    "ticketsChanges": "Änderungen",
+    "endpointMessages": "Nachrichten",
+    "securityDetectionRules": "Erkennungsregeln",
+    "planAndFeatures": "Tarif & Funktionen",
+    "breezeAi": "Breeze AI",
+    "workersHeading": "Worker",
+    "agents": "Agenten",
+    "runs": "Läufe",
+    "aiTasks": "KI-Aufgaben",
+    "findings": "Erkenntnisse",
+    "impact": "Wirkung",
+    "aiKnowledgeSources": "Wissensquellen",
+    "wispLockedServer": "Wisp läuft in der Breeze Cloud. Auf diesem Server ist es nicht verfügbar."
   },
   "documentTitles": {
     "dashboard": "Dashboard",
@@ -218,7 +244,7 @@
     "mcp": {
       "connecting": "Möchten Sie einen KI-Agenten verbinden?",
       "title": "KI-Agenten hierher weiterleiten",
-      "description": "Fügen Sie diese URL in Ihren MCP-Client (Claude.ai, ChatGPT, Cursor, …) ein. Sie werden hierher zurückgeleitet, um die Verbindung über OAuth zu autorisieren."
+      "description": "Fügen Sie diese URL in Ihren MCP-Client (Claude.ai, ChatGPT, Cursor, …) ein. Sie werden hierher zurückgeleitet, um die Verbindung über OAuth zu autorisieren. Bevorzugen Sie einen API-Schlüssel? Senden Sie einen X-API-Key-Header mit dem Bereich ai:read/ai:write."
     },
     "progress": {
       "count": "{{current}} von {{total}}",
@@ -298,6 +324,17 @@
       "action": "Aktion",
       "target": "Ziel",
       "time": "Zeit"
+    },
+    "recentlyViewed": {
+      "title": "Weitermachen, wo Sie aufgehört haben",
+      "kind": {
+        "device": "Gerät",
+        "org": "Organisation",
+        "ticket": "Vorgang",
+        "alert": "Alarm",
+        "site": "Standort",
+        "page": "Seite"
+      }
     },
     "alerts": {
       "title": "Letzte Warnmeldungen",
@@ -396,13 +433,23 @@
       "unratedPending": "{{count}} unbewertete Patches ausstehend (werden nicht automatisch genehmigt)",
       "unratedPending_one": "{{count}} unbewerteter Patch ausstehend (wird nicht automatisch genehmigt)",
       "unratedPending_other": "{{count}} unbewertete Patches ausstehend (werden nicht automatisch genehmigt)",
-      "empty": "Noch keine Patch-Daten"
+      "empty": "Noch keine Patch-Daten",
+      "imagesNotChecked_one": "{{count}} Container-Image nicht geprüft",
+      "imagesNotChecked_other": "{{count}} Container-Images nicht geprüft",
+      "devicesNeedPatches_one": "{{count}} Gerät benötigt Patches",
+      "devicesNeedPatches_other": "{{count}} Geräte benötigen Patches",
+      "viewPendingDevices": "Geräte mit ausstehenden Patches anzeigen",
+      "viewFailedDevices": "Geräte mit fehlgeschlagenen Patches anzeigen",
+      "viewCriticalDevices": "Geräte mit kritischen Patches anzeigen"
     },
     "vuln": {
       "title": "Schwachstellen",
       "criticalOpen": "Kritisch offen",
       "kev": "Bekannt ausgenutzt",
       "patchReady": "Patch verfügbar",
+      "viewCritical": "Kritische CVEs anzeigen",
+      "viewPatchReady": "CVEs mit verfügbarem Patch anzeigen",
+      "viewOpen": "Offene CVEs anzeigen",
       "totalOpen": "{{count}} offene Funde",
       "totalOpen_one": "{{count}} offener Fund",
       "totalOpen_other": "{{count}} offene Funde",
@@ -464,7 +511,10 @@
       "createFirst": "Ersten Filter erstellen",
       "created": "Erstellt am {{date}}",
       "deleteConfirm": "Diesen Filter löschen?",
-      "duplicate": "Duplizieren"
+      "duplicate": "Duplizieren",
+      "saveFailed": "Filter konnte nicht gespeichert werden",
+      "deleteFailed": "Filter konnte nicht gelöscht werden",
+      "ownerOrgHint": "Gespeicherte Filter gehören zu einer Organisation. Wählen Sie die Organisation aus, der dieser Filter gehört."
     },
     "targets": {
       "modes": {
@@ -482,7 +532,9 @@
       "noGroups": "Keine Gerätegruppen verfügbar",
       "deviceCount": "{{count}} Geräte",
       "loadSaved": "Gespeicherten Filter laden:",
-      "select": "Auswählen"
+      "select": "Auswählen",
+      "dynamic": "Dynamisch",
+      "refusedGroup": "Als Ziel nicht verfügbar: Die Regeln dieser Gruppe beruhen auf Feldern, die ein Gerät selbst meldet ({{fields}})."
     },
     "preview": {
       "title": "Übereinstimmende Geräte",
@@ -517,7 +569,9 @@
       "after": "liegt nach",
       "between": "liegt zwischen",
       "withinLast": "innerhalb der letzten",
-      "notWithinLast": "nicht innerhalb der letzten"
+      "notWithinLast": "nicht innerhalb der letzten",
+      "below": "niedriger als",
+      "atLeast": "mindestens"
     },
     "value": {
       "noValue": "Kein Wert erforderlich",
@@ -539,7 +593,9 @@
       },
       "enumOverrides": {
         "decommissioned": "Entfernt"
-      }
+      },
+      "softwareName": "Softwarename",
+      "softwareVersion": "Softwareversion"
     }
   },
   "account": {
@@ -623,7 +679,7 @@
     },
     "apps": {
       "title": "Verbundene Apps",
-      "description": "KI-Assistenten und andere MCP-Clients (Claude.ai, ChatGPT, Cursor, …), die Sie autorisiert haben, in Ihrem Namen zu handeln. Der Zugriff kann jederzeit widerrufen werden; die Token funktionieren innerhalb von 10 Minuten nicht mehr.",
+      "description": "KI-Clients (Claude.ai, ChatGPT, Cursor, …), die Sie autorisiert haben, in Ihrem Namen zu handeln. Der Zugriff kann jederzeit widerrufen werden – Tokens funktionieren dann nach spätestens 10 Minuten nicht mehr.",
       "empty": "Keine verbundenen Apps",
       "emptyDescription": "Wenn Sie einen Claude.ai-Chat, ChatGPT, Cursor oder einen anderen MCP-Client autorisieren, wird dieser hier angezeigt und kann später widerrufen werden.",
       "authorized": "Autorisiert",
@@ -633,7 +689,7 @@
       "revokeTitle": "{{app}} widerrufen?",
       "revokeDescription": "Alle Berechtigungen und Refresh-Token für diesen Client werden gelöscht. Die Token funktionieren innerhalb von 10 Minuten nicht mehr. Bei der nächsten Verwendung ist eine erneute Autorisierung erforderlich.",
       "onlyAppTitle": "Dies ist Ihre einzige autorisierte App.",
-      "onlyAppDescription": "Nach dem Widerruf müssen Sie erneut autorisieren, bevor ein KI-Assistent in Ihrem Mandanten handeln kann.",
+      "onlyAppDescription": "Nach dem Widerrufen müssen Sie erneut autorisieren, bevor ein KI-Client in Ihrem Mandanten handeln kann.",
       "reasonPlaceholder": "Nicht mehr benötigt, verdächtige Aktivität, …",
       "revokeAction": "Zugriff widerrufen"
     }
@@ -662,19 +718,36 @@
       "toast": {
         "showingAll": "Alle Organisationen werden angezeigt",
         "showing": "{{name}} wird angezeigt",
-        "switched": "Zu {{name}} gewechselt"
+        "switched": "Zu {{name}} gewechselt",
+        "linkedOrgUnavailable": "Die verlinkte Organisation ist nicht verfügbar. Stattdessen wird Ihre aktuelle Auswahl angezeigt."
       },
       "fleetView": "Flottenansicht · {{count}} Organisationen",
       "noSelection": "Organisation auswählen",
       "searchOrganizations": "Organisationen durchsuchen…",
       "noMatches": "Keine passenden Organisationen",
-      "legacyFilterNotice": "Die Organisationsfilterung folgt jetzt der Kopfzeilen-Auswahl."
+      "legacyFilterNotice": "Die Organisationsfilterung folgt jetzt der Kopfzeilen-Auswahl.",
+      "recent": "Zuletzt",
+      "pane": {
+        "destinations": {
+          "overview": "Übersicht",
+          "devices": "Geräte",
+          "tickets": "Support-Tickets",
+          "alerts": "Warnungen",
+          "sites": "Standorte",
+          "billing": "Abrechnung"
+        },
+        "offlineCount": "{{count}} nicht erreichbar",
+        "openCount": "{{count}} offen",
+        "criticalCount": "{{count}} kritisch",
+        "noCritical": "keine",
+        "hint": "Namen anklicken zum Wechseln · Seite anklicken zum Wechseln und Öffnen"
+      }
     },
     "header": {
       "menu": "Menü",
       "openMenu": "Navigationsmenü öffnen",
-      "ai": "KI-Assistent",
-      "aiTitle": "KI-Assistent (Cmd+Shift+A)",
+      "ai": "Breeze AI",
+      "aiTitle": "Breeze AI (⌘⇧A)",
       "help": "Hilfe und Dokumentation",
       "helpTitle": "Hilfe und Dokumentation (Cmd+Shift+H)",
       "theme": "Design",
@@ -718,9 +791,9 @@
     },
     "search": {
       "prompt": "Breeze durchsuchen",
-      "placeholder": "Geräte, Skripte, Warnmeldungen, Benutzer und Einstellungen durchsuchen…",
+      "placeholder": "Geräte, Skripte, Warnmeldungen und Einstellungen durchsuchen…",
       "searching": "Wird gesucht…",
-      "startTyping": "Beginnen Sie mit der Eingabe, um Geräte, Skripte, Warnmeldungen, Benutzer und Einstellungen zu durchsuchen.",
+      "startTyping": "Beginnen Sie mit der Eingabe, um Geräte, Skripte, Warnmeldungen und Einstellungen zu durchsuchen.",
       "noResults": "Keine Ergebnisse gefunden. Versuchen Sie eine andere Suchanfrage.",
       "navigationHint": "Mit den Pfeiltasten navigieren, mit Enter öffnen",
       "closeHint": "Mit Esc schließen",
@@ -743,8 +816,13 @@
         "alertRules": "Alarmregeln",
         "alertRulesDescription": "Alarmierung in Konfigurationsrichtlinien verwalten",
         "keyboardShortcuts": "Tastenkürzel",
-        "keyboardShortcutsDescription": "Alle Tasten und Tastenfolgen auf einer Karte"
-      }
+        "keyboardShortcutsDescription": "Alle Tasten und Tastenfolgen auf einer Karte",
+        "askBreezeAi": "Breeze AI fragen",
+        "askBreezeAiDescription": "Den Breeze AI-Seitenbereich öffnen",
+        "wispHome": "Wisp öffnen",
+        "wispHomeDescription": "Zu Ihrer Wisp-Startseite wechseln"
+      },
+      "numberHint": "{{mod}}1–9 zum Öffnen"
     },
     "notifications": {
       "title": "Benachrichtigungen",
@@ -784,9 +862,9 @@
       "expand": "Seitenleiste ausklappen",
       "collapseSections": "Alle Bereiche einklappen",
       "closeMenu": "Menü schließen",
-      "recentDevices": "Zuletzt geöffnete Geräte",
-      "hideRecentDevices": "Zuletzt geöffnete Geräte ausblenden",
-      "showRecentDevices": "Zuletzt geöffnete Geräte anzeigen"
+      "recent": "Zuletzt",
+      "hideRecent": "Zuletzt geöffnete ausblenden",
+      "showRecent": "Zuletzt geöffnete anzeigen"
     },
     "orgRequired": {
       "title": "Organisation auswählen",
@@ -809,8 +887,35 @@
       "cycleSidebar": "Seitenleisten-Modus wechseln",
       "help": "Hilfebereich öffnen",
       "showThis": "Diese Karte anzeigen",
+      "orgSwitcher": "Organisationsauswahl öffnen",
+      "aiSidebar": "Breeze AI ein- oder ausblenden",
       "close": "Dialog oder Menü schließen",
-      "typingNote": "Einzeltasten-Kürzel pausieren, während Sie in ein Feld tippen."
+      "typingNote": "Einzeltasten-Kürzel pausieren, während Sie in ein Feld tippen.",
+      "create": "Erstellen",
+      "createHint": "Drücke c, lass los, dann die Taste.",
+      "paletteNumber": "Suchergebnis über seine Nummer öffnen",
+      "newItems": {
+        "ticket": "Neues Ticket",
+        "quote": "Neues Angebot",
+        "invoice": "Neue Rechnung",
+        "contract": "Neuer Vertrag",
+        "script": "Neues Skript"
+      },
+      "charKeysOn": "Einzeltasten-Kürzel sind aktiviert.",
+      "charKeysOff": "Einzeltasten-Kürzel sind deaktiviert. Nur Strg/Cmd-Kürzel funktionieren.",
+      "charKeysManage": "In den Profileinstellungen ändern",
+      "queueTitle": "Ticketwarteschlange",
+      "queueHint": "Auf der Ticketseite, außerhalb eines Textfelds.",
+      "queue": {
+        "next": "Nächstes Ticket",
+        "previous": "Vorheriges Ticket",
+        "open": "Ticket als ganze Seite öffnen",
+        "toggleBulk": "Zur Mehrfachauswahl hinzufügen oder daraus entfernen",
+        "assignMe": "Mir zuweisen",
+        "reply": "Antwort schreiben",
+        "internal": "Internen Hinweis schreiben",
+        "resolve": "Mit Notiz lösen"
+      }
     }
   },
   "migrationBanner": {
@@ -871,97 +976,18 @@
       }
     },
     "monitors": {
-      "CreateMonitorForm": {
-        "actions": {
-          "createMonitor": "Monitor erstellen",
-          "creating": "Wird erstellt..."
-        },
-        "errors": {
-          "createMonitor": "Monitor konnte nicht erstellt werden",
-          "generic": "Ein Fehler ist aufgetreten",
-          "nameRequired": "Der Name ist erforderlich",
-          "targetRequired": "Das Ziel ist erforderlich"
-        },
-        "fields": {
-          "expectedBanner": "Erwartetes Banner (optional)",
-          "expectedBody": "Erwarteter Body-Inhalt (optional)",
-          "expectedStatus": "Erwarteter Status",
-          "expectedValue": "Erwarteter Wert (optional)",
-          "followRedirects": "Weiterleitungen folgen",
-          "hostname": "Aufzulösender Hostname",
-          "method": "Methode",
-          "monitorType": "Monitortyp",
-          "nameserver": "Benutzerdefinierter Nameserver (optional)",
-          "pingCount": "Anzahl der Pings",
-          "pollingInterval": "Abfrageintervall (Sekunden)",
-          "port": "Port",
-          "recordType": "Eintragstyp",
-          "target": "Ziel (IP/Hostname)",
-          "timeout": "Zeitüberschreitung (Sekunden)",
-          "url": "URL",
-          "verifySsl": "SSL prüfen"
-        },
-        "monitorTypes": {
-          "dnsCheck": {
-            "description": "Korrekte Auflösung von DNS-Einträgen prüfen",
-            "label": "DNS-Prüfung"
-          },
-          "httpCheck": {
-            "description": "HTTP-/HTTPS-Endpunkte überwachen",
-            "label": "HTTP-Prüfung"
-          },
-          "icmpPing": {
-            "description": "Erreichbarkeit eines Hosts per Ping prüfen",
-            "label": "ICMP-Ping"
-          },
-          "tcpPort": {
-            "description": "Prüfen, ob ein TCP-Port geöffnet ist und antwortet",
-            "label": "TCP-Port"
-          }
-        },
-        "placeholders": {
-          "expectedBanner": "z. B. SSH-",
-          "expectedBody": "z. B. \"status\":\"ok\"",
-          "expectedValue": "z. B. 93.184.216.34",
-          "hostname": "example.com",
-          "name": "z. B. Produktions-Webserver",
-          "nameserver": "8.8.8.8",
-          "target": "192.168.1.1 oder server.example.com",
-          "url": "https://example.com/health"
-        },
-        "subtitle": "Richten Sie eine neue Überwachungsprüfung für ein Netzwerkziel ein.",
-        "title": "Netzwerkmonitor erstellen"
-      },
       "MonitorDetailModal": {
         "actions": {
-          "cancelEdit": "Bearbeitung abbrechen",
-          "checkNow": "Jetzt prüfen",
-          "deleteMonitor": "Monitor löschen",
-          "deleting": "Wird gelöscht...",
-          "yesDelete": "Ja, löschen"
-        },
-        "alertRules": {
-          "disabled": "(deaktiviert)",
-          "title": "Warnmeldungsregeln"
+          "checkNow": "Jetzt prüfen"
         },
         "consecutiveFailures": "{{count}} aufeinanderfolgender Fehler",
         "consecutiveFailures_plural": "{{count}} aufeinanderfolgende Fehler",
-        "delete": {
-          "confirmShort": "Sind Sie sicher?"
-        },
         "errors": {
-          "deleteMonitor": "Monitor konnte nicht gelöscht werden",
           "generic": "Ein Fehler ist aufgetreten",
           "loadDetails": "Monitordetails konnten nicht geladen werden",
-          "triggerCheck": "Prüfung konnte nicht ausgelöst werden",
-          "updateMonitor": "Monitor konnte nicht aktualisiert werden"
+          "triggerCheck": "Prüfung konnte nicht ausgelöst werden"
         },
         "fallbackTitle": "Überwachen",
-        "fields": {
-          "interval": "Intervall (s)",
-          "timeout": "Zeitüberschreitung (s)",
-          "target": "Ziel-URL"
-        },
         "labels": {
           "lastChecked": "Zuletzt geprüft: {{time}}",
           "response": "Antwort: {{response}}",
@@ -989,8 +1015,6 @@
           "icmpPing": "ICMP-Ping",
           "tcpPort": "TCP-Port"
         },
-        "targetResetNote": "Wenn Sie die URL ändern, wird die TLS-Beobachtung zurückgesetzt.",
-        "saved": "Monitor aktualisiert",
         "certificate": {
           "title": "Zertifikat",
           "issuer": "Aussteller",
@@ -1002,27 +1026,22 @@
             "handshakeFailed": "TLS-Handshake fehlgeschlagen",
             "notTls": "Kein TLS"
           }
-        }
+        },
+        "openMonitor": "Monitor dieser Prüfung öffnen",
+        "notConverted": "Konvertierung im Tab Ergebnisse prüfen."
       },
       "NetworkMonitorList": {
         "actions": {
-          "addMonitor": "Monitor hinzufügen",
-          "deleteMonitor": "Monitor löschen",
           "runCheckNow": "Prüfung jetzt ausführen",
-          "viewDetails": "Details anzeigen"
+          "viewDetails": "Details anzeigen",
+          "newCheck": "Neue Prüfung"
         },
         "assetFilter": "Monitore werden nach dem ausgewählten Asset gefiltert.",
-        "delete": {
-          "confirmLabel": "Monitor löschen",
-          "message": "Möchten Sie diesen Monitor wirklich löschen? Dadurch werden auch alle Ergebnisse und Warnmeldungsregeln entfernt. Diese Aktion kann nicht rückgängig gemacht werden.",
-          "title": "Netzwerkmonitor löschen"
-        },
         "empty": {
-          "action": "Jetzt einen erstellen.",
-          "prefix": "Keine Netzwerkmonitore konfiguriert."
+          "action": "Monitor erstellen.",
+          "prefix": "Noch keine Netzwerkprüfungen."
         },
         "errors": {
-          "deleteMonitor": "Monitor konnte nicht gelöscht werden",
           "fetchMonitors": "Monitore konnten nicht abgerufen werden",
           "generic": "Ein Fehler ist aufgetreten",
           "triggerCheck": "Prüfung konnte nicht ausgelöst werden"
@@ -1035,11 +1054,13 @@
           "interval": "Intervall",
           "lastChecked": "Zuletzt geprüft",
           "response": "Antwort",
-          "target": "Ziel"
+          "target": "Ziel",
+          "monitor": "Monitor",
+          "openMonitor": "Monitor öffnen"
         },
         "loading": "Monitore werden geladen...",
         "messages": {
-          "monitorDeleted": "Monitor gelöscht"
+          "checkQueued": "Netzwerkprüfung in die Warteschlange gestellt"
         },
         "status": {
           "degraded": "Beeinträchtigt"
@@ -1056,10 +1077,87 @@
           "httpCheck": "HTTP-Prüfung",
           "icmpPing": "ICMP-Ping",
           "tcpPort": "TCP-Port"
+        },
+        "notConverted": "Nicht konvertiert"
+      },
+      "NetworkCheckConversionBanner": {
+        "pending_one": "{{count}} Netzwerkprüfung erfordert eine Prüfung.",
+        "pending_other": "{{count}} Netzwerkprüfungen erfordern eine Prüfung.",
+        "review": "Konvertierung prüfen",
+        "title": "Netzwerkprüfungen konvertieren",
+        "convert": "{{count}} konvertieren",
+        "converted_one": "{{count}} Netzwerkprüfung konvertiert",
+        "converted_other": "{{count}} Netzwerkprüfungen konvertiert",
+        "failed": "Netzwerkprüfungen konnten nicht konvertiert werden",
+        "outcome": {
+          "convertible": "Konvertierbar",
+          "unconvertible": "Nicht konvertierbar"
         }
       }
     },
     "psa": {
+      "PsaAlertTicketingCard": {
+        "title": "Alarm-Tickets",
+        "scopeNote": "Partnerweit; keine Überschreibung pro Organisation.",
+        "pausedBanner": "Pausiert: Das PSA hat die Zugangsdaten abgelehnt. Führen Sie „Verbindung testen“ aus, um fortzufahren.",
+        "yes": "An",
+        "no": "Aus",
+        "selectPlaceholder": "Auswählen …",
+        "priorityDefault": "PSA-Standard",
+        "closedSuffix": "{{name}} (geschlossen)",
+        "saved": "Einstellungen für Alarm-Tickets gespeichert",
+        "saving": "Wird gespeichert …",
+        "save": "Speichern",
+        "conflict": "Diese Einstellungen wurden an anderer Stelle geändert. Die aktuellen Werte wurden geladen; prüfen Sie sie und speichern Sie erneut.",
+        "errors": {
+          "save": "Einstellungen für Alarm-Tickets konnten nicht gespeichert werden"
+        },
+        "status": {
+          "active": "Alarm-Tickets sind für diese Verbindung aktiviert.",
+          "notExternal": "Binden Sie diese Verbindung als Service-Management-PSA (externer Modus), um Alarm-Tickets zu verwenden.",
+          "disabled": "Alarm-Tickets sind deaktiviert.",
+          "paused": "Alarm-Tickets sind pausiert, bis die PSA-Verbindung wieder funktioniert.",
+          "companyLinksUnverified": "Bestätigen Sie die Firmenzuordnungen für diese PSA-Instanz.",
+          "invalidConfig": "Die gespeicherten Einstellungen für Alarm-Tickets sind ungültig. Prüfen Sie sie und speichern Sie erneut.",
+          "unsupportedProvider": "Alarm-Tickets sind für diesen PSA-Anbieter nicht verfügbar.",
+          "credentialsUnusable": "Die Zugangsdaten dieser Verbindung sind unvollständig oder nicht lesbar. Bearbeiten Sie die Verbindung und geben Sie sie erneut ein."
+        },
+        "fields": {
+          "enabled": "Alarm-Tickets aktivieren",
+          "board": "Service-Board",
+          "openStatus": "Status neuer Tickets",
+          "closedStatus": "Status „Geschlossen“",
+          "priorityHeading": "PSA-Priorität nach Alarm-Schweregrad",
+          "minSeverity": "Minimaler Schweregrad",
+          "minSeverityHelp": "„Niedrig“ umfasst Monitore auf Warnstufe",
+          "closeOnResolve": "Ticket schließen, wenn der Alarm behoben ist",
+          "noteOnAcknowledge": "Notiz hinzufügen, wenn der Alarm bestätigt wird",
+          "confirmCompanyLinks": "Die Firmenzuordnungen der Organisationen stimmen mit dieser PSA-Instanz überein"
+        },
+        "severity": {
+          "critical": "Kritisch",
+          "high": "Hoch",
+          "medium": "Mittel",
+          "low": "Niedrig",
+          "info": "Information"
+        },
+        "options": {
+          "error": "Optionen konnten nicht aus dem PSA geladen werden",
+          "retry": "Erneut versuchen",
+          "truncated": "Es werden nur die ersten Ergebnisse aus dem PSA angezeigt."
+        },
+        "readOnly": {
+          "enabled": "Alarm-Tickets"
+        },
+        "loadError": {
+          "message": "Einstellungen für Alarm-Tickets konnten nicht geladen werden",
+          "retry": "Erneut versuchen"
+        },
+        "configInvalid": {
+          "warning": "Die gespeicherten Einstellungen für Alarm-Tickets konnten nicht gelesen werden. Beim Speichern werden sie ersetzt.",
+          "confirm": "Die unlesbaren Einstellungen ersetzen"
+        }
+      },
       "PsaCompanyImport": {
         "title": "Firmen importieren",
         "subtitle": "Erstellen Sie Organisationen aus den Firmen in {{name}}.",
@@ -1153,27 +1251,10 @@
           "basicInformation": "Grundlegende Informationen",
           "connectionDetails": "Verbindungsdetails",
           "credentials": "Zugangsdaten",
-          "syncSettings": "Synchronisierungseinstellungen"
+          "syncSettings": "Ticket-Synchronisierung"
         },
         "sync": {
-          "autoClose": "PSA-Tickets automatisch schließen",
-          "autoCloseHelp": "Verknüpfte Tickets schließen, wenn Breeze-Warnmeldungen behoben wurden.",
-          "enable": "Synchronisierung aktivieren",
-          "enableHelp": "Tickets und Warnmeldungsverknüpfungen nach Zeitplan aktuell halten.",
-          "notes": "Warnmeldungsnotizen synchronisieren",
-          "notesHelp": "Breeze-Kommentare und -Aktualisierungen an die PSA-Ticket-Zeitleiste übertragen."
-        },
-        "syncDirections": {
-          "bidirectional": "Bidirektional",
-          "inbound": "PSA → Breeze",
-          "outbound": "Breeze → PSA"
-        },
-        "syncIntervals": {
-          "daily": "Täglich",
-          "every15Minutes": "Alle 15 Minuten",
-          "every30Minutes": "Alle 30 Minuten",
-          "every6Hours": "Alle 6 Stunden",
-          "everyHour": "Stündlich"
+          "unavailable": "Die Ticket-Synchronisierung ist noch nicht verfügbar. Verbindungen können getestet und zum Importieren von Unternehmen als Organisationen verwendet werden; es werden keine Ticketdaten zwischen Breeze und Ihrem PSA ausgetauscht."
         },
         "testDirtyHint": "Zuerst speichern – der Test prüft die gespeicherten Zugangsdaten, nicht Ihre ungespeicherten Änderungen.",
         "validation": {
@@ -1197,12 +1278,13 @@
         },
         "connectionCount": "{{filtered}} von {{total}} Verbindungen",
         "empty": {
-          "noConnections": "Verbinden Sie einen PSA-Anbieter, um Tickets zu synchronisieren.",
+          "noConnections": "Verbinden Sie einen PSA-Anbieter, um ihn zu testen und seine Unternehmen zu importieren.",
           "noMatches": "Keine Verbindungen entsprechen Ihrer Suche oder den Filtern.",
           "title": "Keine PSA-Verbindungen konfiguriert"
         },
         "filters": {
-          "allStatuses": "Alle Status"
+          "allStatuses": "Alle Status",
+          "statusFilterLabel": "Verbindungsstatus"
         },
         "headers": {
           "connection": "Verbindung",
@@ -1230,7 +1312,7 @@
           "tryAgain": "Erneut versuchen"
         },
         "delete": {
-          "activeWarning": "Diese Verbindung ist aktiv. Die Ticket-Synchronisierung wird sofort beendet.",
+          "activeWarning": "Diese Verbindung ist aktiv. Beim Löschen wird die Verbindung sofort entfernt.",
           "confirm": "Möchten Sie {{name}} wirklich löschen?",
           "irreversible": "Diese Aktion kann nicht rückgängig gemacht werden.",
           "title": "PSA-Verbindung löschen",
@@ -1249,10 +1331,10 @@
         "modal": {
           "addDescription": "Richten Sie eine neue PSA-Verbindung für Ihre Organisation ein.",
           "addTitle": "PSA-Verbindung hinzufügen",
-          "editDescription": "Aktualisieren Sie die Details und Synchronisierungseinstellungen der PSA-Verbindung.",
+          "editDescription": "Aktualisieren Sie die Details der PSA-Verbindung.",
           "editTitle": "PSA-Verbindung bearbeiten"
         },
-        "subtitle": "Verbinden Sie Ihr PSA-System, um Tickets zu synchronisieren und Warnmeldungen zu verknüpfen.",
+        "subtitle": "Testen Sie PSA-Verbindungen und importieren Sie Unternehmen als Organisationen.",
         "test": {
           "failedMessage": "Verbindung mit dem PSA-Anbieter nicht möglich.",
           "failedTitle": "Verbindung fehlgeschlagen",
@@ -1267,11 +1349,12 @@
       "PsaTicketList": {
         "empty": {
           "noMatches": "Keine Tickets entsprechen Ihrer Suche oder den Filtern.",
-          "noTickets": "Synchronisieren Sie Ihre erste PSA-Verbindung, damit hier Tickets angezeigt werden.",
-          "title": "Keine PSA-Tickets synchronisiert"
+          "noTickets": "Noch keine Alarmtickets. Aktivieren Sie Alarmtickets für die zugeordnete ConnectWise-Manage-Verbindung.",
+          "title": "Keine PSA-Tickets"
         },
         "filters": {
-          "allStatuses": "Alle Status"
+          "allStatuses": "Alle Status",
+          "statusFilterLabel": "Ticketstatus"
         },
         "headers": {
           "linkedAlert": "Verknüpfte Warnmeldung",
@@ -1279,19 +1362,53 @@
           "updated": "Aktualisiert"
         },
         "searchPlaceholder": "Tickets suchen",
-        "status": {
-          "closed": "Geschlossen",
-          "inProgress": "In Bearbeitung",
-          "open": "Offen",
-          "resolved": "Gelöst",
-          "waiting": "Wartend"
-        },
         "ticketCount": "{{filtered}} von {{total}} Tickets",
-        "title": "Synchronisierte Tickets",
+        "title": "Alarmtickets",
         "unlinked": "Nicht verknüpft"
+      },
+      "PsaAlertTicketingActivity": {
+        "title": "Ticketaktivität",
+        "refresh": "Aktualisieren",
+        "redrive": "Erneut anstoßen",
+        "loading": "Ticketaktivität wird geladen…",
+        "loadFailed": "Ticketaktivität konnte nicht geladen werden. Bitte aktualisieren.",
+        "actionFailed": "Ticketaktivität konnte nicht aktualisiert werden.",
+        "actionSucceeded": "Ticketaktivität aktualisiert.",
+        "help": "Erneutes Anstoßen wiederholt fehlgeschlagene Erstellungen und Alarme ohne Firmenverknüpfung. Als erledigt markieren beendet die Verarbeitung, ohne das PSA-Ticket zu ändern.",
+        "empty": "Keine Tickets erfordern Aufmerksamkeit.",
+        "viewAlert": "Alarm anzeigen",
+        "createAnyway": "Trotzdem erstellen",
+        "markHandled": "Als erledigt markieren",
+        "duplicateWarning": "Möglicherweise existiert bereits ein Ticket im PSA. Prüfen Sie dies zuerst: Dieser einmalige Wiederholungsversuch kann ein Duplikat erstellen.",
+        "confirmCreate": "Ein weiteres Ticket erstellen",
+        "cancel": "Abbrechen",
+        "previous": "Zurück",
+        "next": "Weiter",
+        "page": "Seite {{page}} von {{total}}",
+        "states": {
+          "never_attempted": "In Warteschlange",
+          "create_in_flight": "Wird erstellt",
+          "created": "Erstellt",
+          "create_outcome_unknown": "Erstellungsergebnis unbekannt",
+          "rejected": "Abgelehnt",
+          "failed": "Fehlgeschlagen",
+          "needs_attention": "Aufmerksamkeit erforderlich",
+          "handled": "Erledigt",
+          "skipped_no_company": "Keine Firmenverknüpfung",
+          "skipped_ambiguous_company": "Mehrdeutige Firmenverknüpfung",
+          "skipped_resolved_before_create": "Vor Erstellung behoben"
+        }
       }
     },
     "webhooks": {
+      "ownership": {
+        "label": "Zuständigkeit",
+        "allOrganizations": "Alle Organisationen",
+        "thisOrganizationOnly": "Nur diese Organisation",
+        "all": "Alle",
+        "organization": "Organisation",
+        "test": "Testzustellung"
+      },
       "WebhookDeliveryHistory": {
         "deliveryAttempts": "{{count}} Zustellversuche",
         "empty": "Noch keine Zustellversuche.",
@@ -1344,6 +1461,10 @@
             "description": "Wird ausgelöst, wenn ein Gerät eine Verbindung herstellt.",
             "label": "Gerät online"
           },
+          "deviceReinstalled": {
+            "description": "Wird ausgelöst, wenn ein neu installierter Rechner wieder mit seinem bestehenden Gerätedatensatz verknüpft wird.",
+            "label": "Gerät neu installiert"
+          },
           "scriptCompleted": {
             "description": "Wird ausgelöst, wenn ein Skript abgeschlossen ist.",
             "label": "Skript abgeschlossen"
@@ -1351,6 +1472,50 @@
           "ticketCreated": {
             "description": "Wird ausgelöst, wenn ein Ticket erstellt wird.",
             "label": "Ticket erstellt"
+          },
+          "ticketMerged": {
+            "description": "Wird ausgelöst, wenn ein Ticket mit einem anderen Ticket zusammengeführt wird.",
+            "label": "Ticket zusammengeführt"
+          },
+          "ticketCommented": {
+            "description": "Wird ausgelöst, wenn ein Kommentar oder eine Notiz zu einem Ticket hinzugefügt wird.",
+            "label": "Ticket kommentiert"
+          },
+          "ticketStatusChanged": {
+            "description": "Wird ausgelöst, wenn sich der Status eines Tickets ändert.",
+            "label": "Ticketstatus geändert"
+          },
+          "ticketUpdated": {
+            "description": "Wird ausgelöst, wenn Ticketfelder bearbeitet werden.",
+            "label": "Ticket aktualisiert"
+          },
+          "ticketAssigned": {
+            "description": "Wird ausgelöst, wenn ein Ticket zugewiesen oder die Zuweisung aufgehoben wird.",
+            "label": "Ticket zugewiesen"
+          },
+          "migrationWindowClosed": {
+            "description": "Wird einmal pro Organisation ausgelöst, wenn ein Ticket-Migrationsfenster geschlossen wird, mit den importierten Zählungen.",
+            "label": "Migrationsfenster geschlossen"
+          },
+          "integrationHealthOpened": {
+            "description": "Wird ausgelöst, wenn für die Verbindung einer Organisation ein Integritätsvorfall eröffnet wird.",
+            "label": "Integritätsvorfall bei Verbindung eröffnet"
+          },
+          "integrationHealthResolved": {
+            "description": "Wird ausgelöst, wenn ein Integritätsvorfall einer Verbindung behoben wird.",
+            "label": "Integritätsvorfall bei Verbindung behoben"
+          },
+          "alertAcknowledged": {
+            "label": "Alarm bestätigt",
+            "description": "Wird ausgelöst, wenn ein Alarm bestätigt wird."
+          },
+          "alertSuppressed": {
+            "label": "Alarm unterdrückt",
+            "description": "Wird ausgelöst, wenn ein Alarm unterdrückt wird."
+          },
+          "alertEscalated": {
+            "label": "Alarm eskaliert",
+            "description": "Wird ausgelöst, wenn ein Schritt einer Eskalationsrichtlinie für einen noch aktiven Alarm ausgeführt wird."
           }
         },
         "fields": {
@@ -1372,6 +1537,12 @@
           "signingSecret": "Verwenden Sie dieses Geheimnis, um Webhook-Signaturen zu prüfen."
         },
         "invalidJsonPreview": "Ungültiges JSON in der Vorlage.",
+        "otherEvents": {
+          "allEvents": "Alle Ereignisse (*)",
+          "allEventsHint": "Dieser Webhook abonniert alle Ereignisse, daher werden die einzelnen Ereignisse unten nicht verwendet. Entfernen Sie „Alle Ereignisse“, um bestimmte auszuwählen.",
+          "remove": "{{event}} entfernen",
+          "title": "Weitere abonnierte Ereignisse"
+        },
         "payload": {
           "previewEmpty": "Die Vorschau wird angezeigt, sobald das JSON gültig ist.",
           "subtitle": "Definieren Sie die Struktur der JSON-Nutzdaten, die an das Ziel gesendet werden.",
@@ -1385,7 +1556,7 @@
           "name": "Produktions-Webhook",
           "signingSecret": "Signaturgeheimnis eingeben"
         },
-        "subtitle": "Konfigurieren Sie Zustellung, Authentifizierung und Nutzdatenverhalten.",
+        "subtitle": "Legen Sie Ziel, Ereignisse, Authentifizierung und Header fest.",
         "title": "Webhook-Konfiguration",
         "validation": {
           "eventRequired": "Wählen Sie mindestens ein Ereignis aus",
@@ -1396,6 +1567,22 @@
           "secretRequired": "Für die HMAC-Authentifizierung ist ein Geheimnis erforderlich",
           "tokenRequired": "Für die Bearer-Authentifizierung ist ein Token erforderlich",
           "urlRequired": "Die URL ist erforderlich"
+        },
+        "neverDelivered": {
+          "marker": "Nie zugestellt",
+          "explanation": "Breeze sendet dieses Ereignis nie. Es wird beim Speichern dieses Webhooks entfernt.",
+          "banner": "Breeze sendet dieses Ereignis nie. Dieser Webhook hat daher noch nie etwas zugestellt. Wählen Sie vor dem Speichern ein anderes Ereignis."
+        },
+        "payloadVersion": {
+          "title": "Version der Nutzdaten",
+          "v2": {
+            "label": "v2 (empfohlen)",
+            "description": "Alarmereignisse enthalten Hostname, Standort, Organisation, Status und einen Link zum Alarm."
+          },
+          "v1": {
+            "label": "v1 (Original)",
+            "description": "Die ursprünglichen Alarmdaten für bestehende Integrationen."
+          }
         }
       },
       "WebhookList": {
@@ -1407,7 +1594,8 @@
         "empty": "Keine Webhooks gefunden.",
         "failedCount": "{{count}} fehlgeschlagen",
         "filters": {
-          "allStatuses": "Alle Status"
+          "allStatuses": "Alle Status",
+          "statusFilterLabel": "Webhook-Status"
         },
         "headers": {
           "events": "Ereignisse",
@@ -1446,7 +1634,7 @@
           "noPayloadTemplate": "Noch keine Payload-Vorlage gespeichert.",
           "payloadPreview": "Vorschau der Nutzlastvorlage",
           "testEvent": "Testereignis",
-          "testEventHelp": "Tests verwenden das ausgewählte Ereignis und Ihre Nutzlastvorlage.",
+          "testEventHelp": "Sendet eine Beispiel-Nutzlast für das ausgewählte Ereignis an diesen Endpunkt.",
           "title": "Webhook-Details"
         },
         "emptySelection": "Wählen Sie einen Webhook aus, um den Übermittlungsverlauf und die Testtools anzuzeigen.",
@@ -1470,6 +1658,15 @@
           "editTitle": "Webhook bearbeiten"
         },
         "subtitle": "Übermitteln Sie Ereignisse an externe Systeme.",
+        "success": {
+          "created": "Webhook erstellt",
+          "disabled": "Webhook deaktiviert",
+          "enabled": "Webhook aktiviert",
+          "retryQueued": "Erneute Zustellung in die Warteschlange gestellt",
+          "testQueued": "Testzustellung in die Warteschlange gestellt",
+          "updated": "Webhook aktualisiert",
+          "deleted": "Webhook \"{{name}}\" gelöscht"
+        },
         "title": "Webhooks"
       }
     },
@@ -1678,18 +1875,24 @@
         "friendly": {
           "adminRequired": "Für die Genehmigung von Stundenzetteln ist eine Administratorrolle erforderlich.",
           "approvedImmutable": "Genehmigte Einträge können nur von einem Administrator geändert werden.",
-          "notOwnEntry": "Sie können nur Ihre eigenen Zeiteinträge bearbeiten."
+          "notOwnEntry": "Sie können nur Ihre eigenen Zeiteinträge bearbeiten.",
+          "entryBilled": "Dieser Eintrag wurde bereits abgerechnet und kann nicht gelöscht werden. Stornieren Sie zuerst die Rechnung.",
+          "notOwnEntryDelete": "Sie können nur Ihre eigenen Zeiteinträge löschen.",
+          "entryDeleteLost": "Der Eintrag wurde während des Löschens geändert. Neu laden und erneut versuchen.",
+          "entryNotFound": "Dieser Eintrag existiert nicht mehr."
         },
         "errors": {
           "bulkApprovalFailed": "Die Massengenehmigung ist fehlgeschlagen. Wiederholen.",
           "saveEntryFailed": "Eintrag konnte nicht gespeichert werden. Wiederholen.",
-          "loadTimesheetFailed": "Die Arbeitszeittabelle konnte nicht geladen werden. Wiederholen."
+          "loadTimesheetFailed": "Die Arbeitszeittabelle konnte nicht geladen werden. Wiederholen.",
+          "deleteEntryFailed": "Eintrag konnte nicht gelöscht werden. Wiederholen."
         },
         "toasts": {
           "bulkSkipped": "{{updated}} aktualisiert, {{skipped}} übersprungen ({{reasons}})",
           "bulkApproved": "{{count}} genehmigt",
           "bulkUnapproved": "{{count}} nicht genehmigt",
-          "entryUpdated": "Eintrag aktualisiert"
+          "entryUpdated": "Eintrag aktualisiert",
+          "entryDeleted": "Eintrag gelöscht"
         },
         "title": "Stundenzettel",
         "selectTechnician": "Techniker auswählen",
@@ -1714,7 +1917,12 @@
         "editEntry": "Eintrag {{id}} bearbeiten",
         "total": "Gesamt: {{duration}}",
         "billableTotal": "Abrechnungsfähig: {{duration}}",
-        "billedVsWorked": "{{worked}} Std. gearbeitet · {{billed}} Std. abgerechnet"
+        "billedVsWorked": "{{worked}} Std. gearbeitet · {{billed}} Std. abgerechnet",
+        "deleteEntry": "Eintrag {{id}} löschen",
+        "deleteConfirmTitle": "Zeiteintrag löschen?",
+        "deleteConfirmMessage": "Damit wird der Eintrag über {{duration}} im Ticket {{ticket}} endgültig entfernt. Dies kann nicht rückgängig gemacht werden.",
+        "deleteConfirmMessageNoTicket": "Damit wird der Eintrag über {{duration}} endgültig entfernt. Dies kann nicht rückgängig gemacht werden.",
+        "noteInvoiceCue": "Kunden sehen diese Notiz auf ihrer Rechnung, sofern Ihre Abrechnungseinstellungen Notizen nicht ausblenden."
       },
       "sourceBadge": {
         "timer": "Timer",
@@ -1838,7 +2046,7 @@
         "configureMonitoring": "Konfigurieren Sie die Überwachung",
         "pauseSnmpPolling": "SNMP-Abfrage pausieren",
         "resumeSnmpPolling": "Setzen Sie die SNMP-Abfrage fort",
-        "disableAllActiveMonitoring": "Deaktivieren Sie alle aktiven Überwachungen für dieses Asset",
+        "disableSnmpMonitoring": "SNMP-Überwachung deaktivieren",
         "needsOrgSelection": "Netzwerküberwachungs-Assets sind auf eine einzelne Organisation beschränkt.",
         "loadingAssets": "Überwachungs-Assets werden geladen...",
         "showingAllDiscoveredAssets": "Alle entdeckten Assets werden angezeigt",
@@ -1934,11 +2142,12 @@
       "MonitoringPage": {
         "tabs": {
           "assets": "Assets",
-          "checks": "Netzwerkprüfungen",
-          "templates": "SNMP Vorlagen"
+          "templates": "SNMP Vorlagen",
+          "results": "Ergebnisse"
         },
-        "title": "Überwachung",
-        "description": "SNMP-Abfragen und Netzwerkprüfungen. Die Erkennung kann in die Überwachung einfließen, aber die Überwachung wird hier verwaltet."
+        "title": "Netzwerk",
+        "description": "Assets, SNMP-Vorlagen und Ergebnisse der Netzwerkprüfungen. Prüfungen werden als Monitore unter Warnungen erstellt.",
+        "newCheck": "Neue Prüfung"
       }
     },
     "fleet": {
@@ -1946,8 +2155,8 @@
         "errors": {
           "loadFailed": "Die Flottenstatistiken konnten nicht geladen werden"
         },
-        "title": "Flottenorchestrierung",
-        "description": "Verwalten Sie Richtlinien, Bereitstellungen, Patches und Automatisierungen in Ihrer gesamten Flotte",
+        "title": "Erkenntnisse",
+        "description": "Geräteübergreifende Muster, die die Worker gefunden haben – eine Aktion statt vieler",
         "partialWarning": "Einige Daten sind möglicherweise unvollständig. Fehler beim Laden: {{endpoints}}",
         "cards": {
           "policies": "Richtlinien",
@@ -1961,7 +2170,7 @@
           "reports": "Berichte"
         },
         "aiFleetActions": "KI-Flottenaktionen",
-        "aiFleetActionsHint": "Klicken Sie hier, um den KI-Assistenten zu fragen",
+        "aiFleetActionsHint": "Klicken, um Breeze AI zu fragen",
         "quickActions": {
           "checkCompliance": "Überprüfen Sie die Einhaltung",
           "activeDeployments": "Aktive Bereitstellungen",
@@ -2174,11 +2383,12 @@
         },
         "loading": "Vorfälle werden geladen...",
         "tryAgain": "Versuchen Sie es erneut",
-        "title": "Vorfälle",
+        "title": "Sicherheitsvorfälle",
         "description": "Verfolgen Sie Vorfälle und EDR-Befunde in all Ihren Organisationen.",
         "filters": {
           "tracked": "Verfolgt",
-          "findings": "Befunde"
+          "findings": "Befunde",
+          "kindLabel": "Art"
         },
         "emptyTitle": "Keine Vorfälle gefunden",
         "emptyFiltered": "Keine Vorfälle entsprechen den aktuellen Filtern.",
@@ -2199,9 +2409,15 @@
         "viewInSource": "Ansicht in {{source}}",
         "promoteFromEdr": "Aus EDR-Ansicht übernehmen",
         "pagination": "Seite {{page}} von {{totalPages}} ({{total}} insgesamt)",
-        "previous": "Zurück"
+        "previous": "Zurück",
+        "genericEdrProvider": "EDR-Anbieter"
       },
       "IncidentDetailPage": {
+        "actors": {
+          "brain": "Breeze AI",
+          "user": "Techniker",
+          "system": "System"
+        },
         "errors": {
           "notFound": "Vorfall nicht gefunden",
           "fetchFailed": "Vorfall konnte nicht abgerufen werden"
@@ -2305,6 +2521,8 @@
         "clientId": "Kunden-ID: {{clientId}}",
         "unverifiedLabel": "Nicht verifizierte Integration",
         "unverifiedDescription": "Breeze hat diese Integration nicht überprüft. Sein Name ist selbst gemeldet und könnte eine vertrauenswürdige App imitieren. Genehmigen Sie nur, wenn Sie diese Verbindung gestartet haben und das unten stehende Rückrufziel kennen.",
+        "metadataHostedAt": "App-Details veröffentlicht von {{host}}",
+        "localhostRedirectWarning": "Diese App erhält den Zugriff auf diesem Computer. Fahren Sie nur fort, wenn Sie diese Verbindung selbst gestartet haben.",
         "callbackLabel": "Der Autorisierungscode wird gesendet an:",
         "missingRedirectTitle": "Das Rückrufziel kann nicht überprüft werden",
         "missingRedirectDescription": "Diese Autorisierungsanfrage enthielt kein Rückrufziel und kann daher nicht sicher genehmigt werden. Kehren Sie zu Ihrem MCP-Client zurück und starten Sie die Verbindung erneut.",
@@ -2332,15 +2550,15 @@
           },
           "search": {
             "title": "Alles durchsuchen",
-            "description": "Drücken Sie Cmd+K, um Geräte, Skripte, Warnungen, Benutzer oder Einstellungen sofort zu finden."
+            "description": "Drücken Sie Cmd+K, um Geräte, Skripte, Warnungen oder Einstellungen sofort zu finden."
           },
           "switchOrgs": {
             "title": "Wechseln Sie die Organisation",
             "description": "Mehrere Kunden verwalten? Wechseln Sie hier zwischen Organisationen."
           },
           "aiHelp": {
-            "title": "KI-gestützte Hilfe",
-            "description": "Stellen Sie Fragen zu Ihrer Flotte, beheben Sie Probleme oder erstellen Sie Berichte. Drücken Sie jederzeit Befehl+Umschalt+A."
+            "title": "Breeze AI",
+            "description": "Fragen Sie in einfacher Sprache nach Ihrer Flotte, beheben Sie Probleme oder erstellen Sie Berichte. Drücken Sie überall ⌘⇧A."
           }
         },
         "skipTour": "Tour überspringen",
@@ -2401,7 +2619,9 @@
           "unknown": "Unbekannt"
         },
         "lastSeen": "Zuletzt gesehen",
-        "noDeviceInventory": "Noch kein Gerätebestand von Kunden verfügbar."
+        "noDeviceInventory": "Noch kein Gerätebestand von Kunden verfügbar.",
+        "healthFilterLabel": "Gesundheit",
+        "sortFilterLabel": "Sortieren nach"
       }
     },
     "remediation": {
@@ -2410,7 +2630,10 @@
           "script": "Skript",
           "template": "Vorlage",
           "playbook": "Spielbuch",
-          "diagnostic": "Diagnose"
+          "diagnostic": "Diagnose",
+          "builtin": "Integrierte Aktion",
+          "manualSteps": "Manuelle Schritte",
+          "scriptDraft": "Skriptentwurf"
         },
         "targetIdentifiers": {
           "script": "Skript {{id}}",
@@ -2419,7 +2642,8 @@
           "templateMissing": "Vorlage ohne Vorlagen-ID",
           "playbook": "Spielbuch {{id}}",
           "playbookMissing": "Playbook ohne Playbook-ID",
-          "diagnostic": "diagnostische Maßnahme"
+          "diagnostic": "diagnostische Maßnahme",
+          "builtin": "integrierte Aktion {{action}}"
         },
         "targetDevices": {
           "none": "In diesem Vorschlag ist kein Zielgerät enthalten",
@@ -2431,9 +2655,12 @@
           "generateFailed": "Vorgeschlagene Korrekturen konnten nicht generiert werden",
           "updateFailed": "Der vorgeschlagene Fix konnte nicht aktualisiert werden",
           "executeFailed": "Der vorgeschlagene Fix konnte nicht ausgeführt werden",
-          "approvalFailed": "Die Genehmigung konnte nicht angefordert werden"
+          "approvalFailed": "Die Genehmigung konnte nicht angefordert werden",
+          "researchFailed": "Recherche konnte nicht gestartet werden",
+          "draftFailed": "Der Skriptentwurf konnte nicht geöffnet werden."
         },
         "messages": {
+          "draftCopied": "Speicher ist blockiert — der Auftrag wurde kopiert; füge ihn im Skript-Builder ein.",
           "disabled": "Vorgeschlagene Korrekturen sind deaktiviert",
           "generated": "Vorgeschlagene Korrekturen generiert",
           "accepted": "Vorgeschlagener Fix akzeptiert",
@@ -2445,7 +2672,7 @@
         },
         "title": "Vorgeschlagene Korrekturen",
         "refresh": "Aktualisieren Sie die vorgeschlagenen Korrekturen",
-        "disabledTitle": "Vorgeschlagene Korrekturen sind für diese Organisation deaktiviert",
+        "disabledTitle": "Vorgeschlagene Korrekturen sind für diese Organisation deaktiviert. Aktivieren Sie sie unter Einstellungen → Partner → KI-Funktionen oder für eine einzelne Organisation auf ihrer KI-Registerkarte.",
         "suggestionsDisabled": "Vorschläge deaktiviert",
         "generate": "Generieren",
         "empty": "Noch keine Lösungsvorschläge.",
@@ -2488,7 +2715,82 @@
         "requesting": "Anfrage...",
         "requestApproval": "Bitte um Genehmigung",
         "waitingApprovalTitle": "Warten auf PAM-Genehmigung",
-        "approvalPending": "Genehmigung steht aus"
+        "approvalPending": "Genehmigung steht aus",
+        "proven": {
+          "badge": "Bewährte Lösung",
+          "trackAllClients": "Hat {{verified}} von {{attempts}} Mal bei Ihren Kunden funktioniert",
+          "trackThisClient": "Hat {{verified}} von {{attempts}} Mal bei diesem Kunden funktioniert"
+        },
+        "feedback": {
+          "worked": "Hat funktioniert",
+          "didNotWork": "Hat nicht funktioniert",
+          "recorded": "Rückmeldung gespeichert",
+          "failed": "Rückmeldung konnte nicht gespeichert werden"
+        },
+        "done": {
+          "button": "Erledigt",
+          "recorded": "Als erledigt markiert — Wiederherstellung wird beobachtet",
+          "failed": "Konnte nicht als erledigt markiert werden"
+        },
+        "outcome": {
+          "label": "Ergebnis: {{state}}",
+          "state": {
+            "pending": "läuft",
+            "awaitingRecovery": "Wiederherstellung wird beobachtet",
+            "holding": "behoben — Stabilität wird bestätigt",
+            "verified": "Behebung bestätigt",
+            "failed": "hat das Problem nicht behoben",
+            "recurred": "ist zurückgekehrt",
+            "inconclusive": "nicht eindeutig",
+            "cancelled": "abgebrochen"
+          }
+        },
+        "groups": {
+          "proven": "Bewährte Lösungen",
+          "ai": "KI-Vorschläge",
+          "similar": "Ähnliche Lösungen",
+          "legacy": "Frühere Stichwort-Treffer"
+        },
+        "badges": {
+          "aiResearched": "KI-recherchiert",
+          "aiWritten": "Von KI verfasst — vor dem Befolgen prüfen"
+        },
+        "track": {
+          "lastVerified": "zuletzt vor {{days}} Tagen bestätigt",
+          "neverVerified": "noch nicht bestätigt"
+        },
+        "research": {
+          "running": "Recherche läuft…",
+          "runningDeep": "Ausführliche Recherche läuft…",
+          "stalled": "Recherche läuft noch — schauen Sie in einigen Minuten wieder vorbei.",
+          "failed": "Recherche fehlgeschlagen.",
+          "noSafeFix": "Die KI hat für dieses Problem keine sichere Lösung gefunden.",
+          "checkBudget": "KI-Budget prüfen",
+          "deeper": "Tiefer recherchieren",
+          "retry": "Erneut versuchen",
+          "denial": {
+            "credits": "Die KI-Guthaben für diesen Abrechnungszeitraum sind aufgebraucht.",
+            "dailyBudget": "Das tägliche KI-Budget für Recherchen ist erreicht.",
+            "orgBudget": "Das KI-Budget dieser Organisation ist erreicht.",
+            "autoCap": "Das Limit für automatische Recherchen ist erreicht. Sie können weiterhin manuell recherchieren.",
+            "busy": "Die Recherche ist gerade ausgelastet. Versuchen Sie es in einigen Minuten erneut.",
+            "permission": "Sie haben keine Berechtigung, eine KI-Recherche zu starten.",
+            "unavailable": "Die KI-Recherche ist vorübergehend nicht verfügbar.",
+            "modelUnavailable": "Das KI-Modell für die Recherche ist nicht verfügbar.",
+            "notProvisioned": "Die KI-Recherche ist für diese Installation noch nicht eingerichtet."
+          }
+        },
+        "runBuiltin": "{{action}} ausführen",
+        "draftScript": "Skript entwerfen",
+        "emptyHint": "„Generieren“ prüft zuerst bewährte Lösungen und fragt dann die KI.",
+        "reviewed": {
+          "pickerLabel": "Geprüfte Schritte",
+          "asWritten": "Schritte wie geschrieben (nicht geteilt)",
+          "save": "Als geprüfte Schritte speichern",
+          "saved": "Als geprüfte Schritte gespeichert",
+          "failed": "Geprüfte Schritte konnten nicht gespeichert werden",
+          "stepsLabel": "Schritte (einer pro Zeile)"
+        }
       }
     },
     "support": {
@@ -2514,6 +2816,34 @@
         "sending": "Senden…",
         "send": "Senden"
       }
+    },
+    "mcpDomains": {
+      "legend": "Werkzeugzugriff",
+      "allLabel": "Alle Werkzeuge (einschließlich später hinzugefügter Bereiche)",
+      "selectedLabel": "Nur diese Bereiche",
+      "coreLabel": "Kern (immer enthalten)",
+      "error": "Wählen Sie mindestens einen Bereich oder „Alle Werkzeuge“.",
+      "allEquivalentNote": "Alle Bereiche sind ausgewählt. Das entspricht „Alle Werkzeuge“, einschließlich später hinzugefügter Bereiche.",
+      "reconnectNote": "Gilt für diese Verbindung. Um eine bestehende Verbindung einzuschränken, widerrufen Sie sie unter „Verbundene Apps“ und verbinden Sie sich erneut.",
+      "apiKeyHint": "Legen Sie fest, welche Werkzeugbereiche dieser Schlüssel über die KI-/MCP-Schnittstelle nutzen darf.",
+      "allTools": "Alle Werkzeuge",
+      "areaCount_one": "{{count}} Bereich",
+      "areaCount_other": "{{count}} Bereiche",
+      "labels": {
+        "devices": "Geräte",
+        "scripts": "Skripte & Automatisierung",
+        "patching": "Patching & Software",
+        "monitoring": "Überwachung & Warnungen",
+        "network": "Netzwerk",
+        "security": "Sicherheit & Compliance",
+        "backup": "Backup & Wiederherstellung",
+        "tickets": "Tickets & Zeiterfassung",
+        "billing": "Abrechnung",
+        "accounts": "Konten",
+        "integrations": "Integrationen",
+        "admin": "Verwaltung",
+        "ai": "KI-Agenten"
+      }
     }
   },
   "whatsNew": {
@@ -2537,7 +2867,8 @@
     "dismiss": "Erinnerung an die Zwei-Faktor-Authentifizierung schließen"
   },
   "mfaPolicyOffBanner": {
-    "message": "Für Ihr Team ist keine Multi-Faktor-Authentifizierung erforderlich. Sitzungen nur mit Passwort können Skripte ausführen, Geräte verschieben und Richtlinien ändern.",
+    "label": "MFA-Erinnerung",
+    "message": "MFA ist für Ihr Team nicht Pflicht. Reine Passwort-Sitzungen können Skripte ausführen.",
     "cta": "MFA erzwingen",
     "dismiss": "Erinnerung an die MFA-Richtlinie für heute schließen"
   },
@@ -2546,5 +2877,78 @@
     "noneConfigured": "Kein {{source}} konfiguriert",
     "overriding": "Überschreibt {{source}}",
     "overridingWithValue": "Überschreibt {{source}} ({{value}})"
+  },
+  "fixMemoryPage": {
+    "title": "Fix-Gedächtnis",
+    "subtitle": "Fixes, die Ihr Team ausgeführt hat, und wie oft sie tatsächlich behoben blieben.",
+    "tabs": {
+      "fixes": "Fixes",
+      "steps": "Geprüfte Schritte"
+    },
+    "filters": {
+      "os": "Betriebssystem",
+      "anyOs": "Beliebiges Betriebssystem",
+      "status": "Status",
+      "anyStatus": "Beliebiger Status",
+      "scope": "Geltungsbereich",
+      "anyScope": "Beliebiger Geltungsbereich",
+      "condition": "Nach Bedingung suchen"
+    },
+    "columns": {
+      "fix": "Fix",
+      "record": "Erfolgsbilanz",
+      "rate": "Erfolgsquote",
+      "scope": "Geltungsbereich",
+      "os": "BS",
+      "condition": "Bedingung",
+      "lastVerified": "Zuletzt verifiziert",
+      "status": "Status",
+      "actions": "Aktionen"
+    },
+    "status": {
+      "active": "Aktiv",
+      "demoted": "Herabgestuft",
+      "retired": "Zurückgezogen",
+      "stale": "Veraltet"
+    },
+    "scope": {
+      "everyClient": "Alle Kunden",
+      "oneClient": "Dieser Kunde"
+    },
+    "signature": "Signatur {{prefix}}",
+    "retire": {
+      "action": "Zurückziehen",
+      "confirmTitle": "Diesen Fix zurückziehen?",
+      "confirmBody": "Zurückgezogene Fixes werden nicht mehr vorgeschlagen. Ihr Verlauf bleibt erhalten.",
+      "confirm": "Fix zurückziehen",
+      "success": "Fix zurückgezogen.",
+      "failed": "Der Fix konnte nicht zurückgezogen werden."
+    },
+    "steps": {
+      "heading": "Schritte",
+      "retire": "Schritte zurückziehen",
+      "success": "Schritte zurückgezogen.",
+      "failed": "Die Schritte konnten nicht zurückgezogen werden.",
+      "empty": "Noch keine geprüften Schritte. Speichern Sie Schritte aus einem Vorschlag, damit sie hier erscheinen."
+    },
+    "empty": "Noch keine Fixes gespeichert. Fixes erscheinen hier, nachdem sie ausgeführt und ihr Ergebnis beobachtet wurde.",
+    "loadMore": "Mehr laden",
+    "never": "Nie",
+    "retry": "Erneut versuchen",
+    "errors": {
+      "loadFailed": "Fix-Gedächtnis konnte nicht geladen werden."
+    }
+  },
+  "islandError": {
+    "title": "Dieser Bereich ist abgestürzt",
+    "description": "Ein Darstellungsfehler hat die Anzeige dieser Seite verhindert. Versuche es erneut und gib bei wiederholtem Auftreten die folgende Meldung in deiner Fehlermeldung an.",
+    "retry": "Erneut versuchen"
+  },
+  "featureLock": {
+    "lockedLabel": "Gesperrt",
+    "upgrade": "Tarife ansehen"
+  },
+  "inheritChoice": {
+    "inherit": "Erben — {{value}} ({{source}})"
   }
 }

@@ -16,6 +16,8 @@ import { Hono } from 'hono';
 
 vi.mock('../../db', () => ({
   runOutsideDbContext: vi.fn((fn) => fn()),
+  // Decommission/restore enqueue a dynamic-group re-evaluation after commit (#9933).
+  runAfterDbContextCommit: vi.fn(),
   withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn()),
   withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
   db: {
@@ -132,8 +134,26 @@ vi.mock('../../services/remoteSessionTeardown', () => ({
   TEARDOWN_FAILED: -1,
 }));
 
+// Restore admits against the partner device limit (services/partnerDeviceCapacity.ts,
+// covered on its own and against real Postgres). Here only the ROUTE's wiring:
+// admitted by default; a case flips it to refused.
+vi.mock('../../services/partnerDeviceCapacity', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../services/partnerDeviceCapacity')>();
+  return {
+    ...actual,
+    deviceTakesLicensedSlot: vi.fn(async () => true),
+    admitPartnerDeviceCapacity: vi.fn(async () => ({
+      allowed: true,
+      partnerId: 'partner-1',
+      maxDevices: null,
+      activeCount: null,
+    })),
+  };
+});
+
 import { coreRoutes } from './core';
-import { db } from '../../db';
+import { db, runOutsideDbContext, withSystemDbAccessContext } from '../../db';
+import { admitPartnerDeviceCapacity } from '../../services/partnerDeviceCapacity';
 import { terminateDeviceRemoteSessions } from '../../services/remoteSessionTeardown';
 import { disconnectAgent } from '../agentWs';
 import { disconnectAgentCredentialGeneration } from '../agentWs';
@@ -143,6 +163,7 @@ import { queueDeviceUninstall, releaseDeviceRemoveReason } from '../../services/
 import { ne } from 'drizzle-orm';
 import { deviceCommands } from '../../db/schema';
 import { propagateCancelledDeviceCommands } from '../../services/commandCancelPropagation';
+import { NetworkIsolationUnresolvedError } from '../../services/networkIsolation/lifecycle';
 
 const DEVICE_ID = '11111111-1111-4111-8111-111111111111';
 
@@ -211,11 +232,24 @@ describe('DELETE /devices/:id (decommission) — remote-session teardown wiring'
     const txSelect = vi.fn().mockReturnValue({
       from: vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue(pendingCommandRows) }),
     });
-    const tx = { update: vi.fn().mockReturnValue({ set }), select: txSelect };
+    const tx = { execute: vi.fn().mockResolvedValue([]), update: vi.fn().mockReturnValue({ set }), select: txSelect };
     vi.mocked(db.transaction).mockImplementation(async (cb: any) => cb(tx));
 
     return { set, updWhere, tx, txSelect };
   }
+
+  it('returns an isolation refusal without disconnecting or tearing down the device', async () => {
+    rigDecommission(ONLINE_DEVICE);
+    vi.mocked(db.transaction).mockRejectedValueOnce(new NetworkIsolationUnresolvedError('decommission', [
+      { deviceId: DEVICE_ID, isolationId: '22222222-2222-4222-8222-222222222222' },
+    ]));
+    const res = await app.request(`/devices/${DEVICE_ID}`, { method: 'DELETE' });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ error: 'isolation_unresolved', message: 'Release network isolation first' });
+    expect(terminateDeviceRemoteSessions).not.toHaveBeenCalled();
+    expect(disconnectAgent).not.toHaveBeenCalled();
+    expect(db.update).not.toHaveBeenCalled();
+  });
 
   it('calls terminateDeviceRemoteSessions with the decommissioned device id', async () => {
     rigDecommission(ONLINE_DEVICE);
@@ -566,6 +600,94 @@ describe('POST /devices/:id/agent-token/rotate — live socket revocation', () =
       details: { agentWsDisconnect: 'closed' },
     }));
   });
+
+  it('tells the caller watchdog/helper recovery is unavailable until the agent reconnects', async () => {
+    const device = {
+      ...ONLINE_DEVICE,
+      agentId: 'agent-abc-123',
+      agentTokenHash: 'a'.repeat(64),
+      previousTokenHash: 'b'.repeat(64),
+      pendingTokenHash: 'c'.repeat(64),
+    };
+    const limit = vi.fn().mockResolvedValue([device]);
+    vi.mocked(db.select).mockReturnValue({
+      from: vi.fn().mockReturnValue({
+        where: vi.fn().mockReturnValue({ limit }),
+      }),
+    } as never);
+    vi.mocked(db.update).mockReturnValue({
+      set: vi.fn().mockReturnValue({
+        where: vi.fn().mockReturnValue({
+          returning: vi.fn().mockResolvedValue([device]),
+        }),
+      }),
+    } as never);
+
+    const res = await app.request(`/devices/${DEVICE_ID}/agent-token/rotate`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer t' },
+    });
+
+    const body = await res.json();
+    expect(body.watchdogHelperRecovery).toEqual({
+      status: 'pending_agent_reconnect',
+      message: expect.stringMatching(/watchdog.*unavailable.*(reconnect|next heartbeat)/i),
+    });
+  });
+
+  it('also re-keys (nulls) the live watchdog and helper credentials, and includes their hashes in the revocation', async () => {
+    const device = {
+      ...ONLINE_DEVICE,
+      agentId: 'agent-abc-123',
+      agentTokenHash: 'a'.repeat(64),
+      previousTokenHash: 'b'.repeat(64),
+      pendingTokenHash: 'c'.repeat(64),
+      watchdogTokenHash: 'd'.repeat(64),
+      previousWatchdogTokenHash: 'e'.repeat(64),
+      helperTokenHash: 'f'.repeat(64),
+      previousHelperTokenHash: '1'.repeat(64),
+    };
+    const limit = vi.fn().mockResolvedValue([device]);
+    vi.mocked(db.select).mockReturnValue({
+      from: vi.fn().mockReturnValue({
+        where: vi.fn().mockReturnValue({ limit }),
+      }),
+    } as never);
+    const setSpy = vi.fn().mockReturnValue({
+      where: vi.fn().mockReturnValue({
+        returning: vi.fn().mockResolvedValue([device]),
+      }),
+    });
+    vi.mocked(db.update).mockReturnValue({ set: setSpy } as never);
+
+    const res = await app.request(`/devices/${DEVICE_ID}/agent-token/rotate`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer t' },
+    });
+
+    expect(res.status).toBe(200);
+    expect(setSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        watchdogTokenHash: null,
+        watchdogTokenIssuedAt: null,
+        previousWatchdogTokenHash: null,
+        previousWatchdogTokenExpiresAt: null,
+        helperTokenHash: null,
+        helperTokenIssuedAt: null,
+        previousHelperTokenHash: null,
+        previousHelperTokenExpiresAt: null,
+      }),
+    );
+    expect(disconnectAgentCredentialGeneration).toHaveBeenCalledWith(
+      'agent-abc-123',
+      expect.arrayContaining(['d'.repeat(64), 'e'.repeat(64), 'f'.repeat(64), '1'.repeat(64)]),
+      'Agent credentials rotated',
+    );
+    expect(publishAgentCredentialRevocation).toHaveBeenCalledWith({
+      agentId: 'agent-abc-123',
+      revokedTokenHashes: expect.arrayContaining(['d'.repeat(64), 'e'.repeat(64), 'f'.repeat(64), '1'.repeat(64)]),
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -599,15 +721,27 @@ describe('POST /devices/:id/restore — uninstall release wiring', () => {
    * those land in relative to the drizzle writes.
    */
   function rigLifecycleExecute(
-    lockRow: Record<string, unknown> | null,
+    device: Record<string, unknown> | null,
     onExecute?: (kind: string) => void,
   ) {
+    // The service reads raw rows (snake_case), not the drizzle fixture shape.
+    const row = device && {
+      id: device.id,
+      status: device.status,
+      org_id: device.orgId,
+      site_id: device.siteId,
+      is_ephemeral: false,
+      link_group_id: null,
+    };
     return vi.fn(async (q: unknown) => {
       const text = JSON.stringify(q);
       if (text.includes('pg_settings')) return [{ prior_ms: '0' }];
       if (text.includes('FOR UPDATE')) {
         onExecute?.('lock-devices-row');
-        return lockRow ? [lockRow] : [];
+        return row ? [row] : [];
+      }
+      if (text.includes('partner_id')) {
+        return row ? [{ ...row, partner_id: 'partner-1' }] : [];
       }
       return [];
     });
@@ -732,6 +866,87 @@ describe('POST /devices/:id/restore — uninstall release wiring', () => {
     expect(body.success).toBe(true);
     expect(body.uninstallAlreadyDispatched).toBe(false);
     expect(releaseDeviceRemoveReason).toHaveBeenCalledWith(tx, DEVICE_ID, 'device_restored');
+  });
+
+  it('refuses at the partner device limit with the same body enrollment returns (403)', async () => {
+    rigRestore(DECOMMISSIONED_DEVICE);
+    vi.mocked(admitPartnerDeviceCapacity).mockResolvedValueOnce({
+      allowed: false,
+      partnerId: 'partner-1',
+      maxDevices: 5,
+      activeCount: 5,
+    });
+
+    const res = await app.request(`/devices/${DEVICE_ID}/restore`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer t' },
+    });
+
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({
+      error: 'Device limit reached',
+      code: 'DEVICE_LIMIT_REACHED',
+      currentDevices: 5,
+      maxDevices: 5,
+    });
+    expect(releaseDeviceRemoveReason).not.toHaveBeenCalled();
+    expect(writeRouteAudit).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ action: 'device.restore' }),
+    );
+  });
+
+  // The partner row is invisible to a tenant-scoped caller under RLS, and the
+  // count spans every org of the partner — admission only works from a system
+  // context, entered AFTER the tenant-scoped authorization above it.
+  it('restores in a system-scoped transaction outside the request context, pinned to the authorized org', async () => {
+    rigRestore(DECOMMISSIONED_DEVICE);
+    vi.mocked(releaseDeviceRemoveReason).mockResolvedValueOnce({
+      cancelled: 0,
+      retainedOtherOwner: 0,
+      alreadyDispatched: 0,
+    });
+
+    const res = await app.request(`/devices/${DEVICE_ID}/restore`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer t' },
+    });
+
+    expect(res.status).toBe(200);
+    expect(runOutsideDbContext).toHaveBeenCalled();
+    expect(withSystemDbAccessContext).toHaveBeenCalledWith(expect.any(Function), 'devices.restore');
+    expect(admitPartnerDeviceCapacity).toHaveBeenCalledWith(expect.anything(), {
+      orgId: 'org-123',
+      expectedPartnerId: 'partner-1',
+      excludeDeviceId: DEVICE_ID,
+    });
+  });
+
+  it('answers a bounded lock wait with a retryable 409, not a 500', async () => {
+    const { tx } = rigRestore(DECOMMISSIONED_DEVICE);
+    tx.execute.mockImplementation(async (q: unknown) => {
+      const text = JSON.stringify(q);
+      if (text.includes('pg_settings')) return [{ prior_ms: '0' }];
+      if (text.includes('partner_id')) {
+        return [{
+          id: DEVICE_ID, status: 'decommissioned', org_id: 'org-123', site_id: 'site-1',
+          is_ephemeral: false, link_group_id: null, partner_id: 'partner-1',
+        }];
+      }
+      if (text.includes('FOR UPDATE')) {
+        throw Object.assign(new Error('Failed query'), { cause: { code: '55P03' } });
+      }
+      return [];
+    });
+
+    const res = await app.request(`/devices/${DEVICE_ID}/restore`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer t' },
+    });
+
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toMatch(/busy/i);
+    expect(releaseDeviceRemoveReason).not.toHaveBeenCalled();
   });
 
   it('does not call releaseDeviceRemoveReason when the device is not decommissioned (400)', async () => {
